@@ -1,7 +1,7 @@
 # OxiBonsai TODO
 
 > Pure Rust 1-bit LLM inference engine for PrismML Bonsai models
-> 408 source files, ~139,012 lines of Rust code, 3,560 tests passing across workspace — verified 2026-05-03
+> 412 source files, ~152,615 lines of Rust code, 3,589+ tests passing across workspace — verified 2026-05-03 (0.1.4)
 
 ## Phase Status
 
@@ -22,6 +22,7 @@
 | Phase 12: Native CUDA backend | ✅ Complete | NVRTC kernels, fused Q1 + TQ2 full-forward; ~21.9 tok/s on Ternary-Bonsai-1.7B |
 | Phase 13.x: Fused Metal TQ2 full-forward | ✅ Complete | Single command buffer per token, ~13× speedup; ~50 tok/s on Ternary-Bonsai-1.7B |
 | Phase 13.y: Ternary LM head on GPU | ✅ Complete | All 7 `OutputWeight::Ternary` guard sites closed (4 Metal + 3 CUDA); Metal ~54.5 tok/s avg on Ternary-Bonsai-1.7B |
+| Phase 14: Runtime controllers (0.1.4) | ✅ Complete | `KvCachePolicy`, `AdaptiveLookahead`, `RequestRateTracker`, `RequestId`, expanded Prometheus surface |
 
 ## Phase 4 — Complete
 
@@ -236,6 +237,17 @@ Closes all 7 `OutputWeight::Ternary(_)` CPU-fallback guard sites in `crates/oxib
   - **Files:** `crates/oxibonsai-kernels/src/gpu_backend/cuda_full_layer/encode_ternary.rs` (implemented); `crates/oxibonsai-model/src/model/types/forward_cuda.rs` (3 guards removed).
   - **Tests:** `test_encode_lm_head_gemv_ternary_matches_reference`, `test_encode_full_forward_ternary_matches_reference` (CI-GPU-gated). `cargo check --all-features` + clippy + 140 non-CUDA tests all green.
   - **Risk:** `CuGraphHolder` captured-graph pattern — capture+replay must be tested end-to-end, not just isolated kernel launches. Post-merge validation on CUDA hardware required.
+
+## Phase 14 — Runtime Controllers (0.1.4)
+
+- [x] **`KvCachePolicy`** — runtime KV-cache compression policy: FP16 → Q8 → Q4 transitions driven by EWMA pressure with hysteresis to prevent thrashing; configurable thresholds and `[min, max]` clamps; thread-safe via atomics
+- [x] **`AdaptiveLookahead`** — speculative-decoding draft-length controller; updates `k` from a running EWMA of accepted tokens per step; cooldown to suppress oscillation; clamped to a configured `[min, max]`
+- [x] **`RequestRateTracker` + `RequestRateAggregator`** — per-request EWMA tokens/sec, p50/p95 inter-token latency (TBT), queue-wait time; workload rollup aggregator with sliding-window ring buffer
+- [x] **`RequestId`** — RFC 4122 UUIDv4-style 128-bit identifiers with thread-safe SplitMix64 generator (no external dependencies); hex / UUID / display formatting; round-trip parse
+- [x] **Prometheus surface expansion** — five new gauges: `oxibonsai_request_tokens_per_second`, `oxibonsai_inter_token_latency_p50/p95_seconds`, `oxibonsai_queue_wait_seconds`, `oxibonsai_kv_cache_compression_level`
+- [x] **`InferenceMetrics::update_request_rate(...)` and `update_kv_cache_level(...)` helpers** — wire the workload aggregator + KV policy directly into Prometheus output
+- [x] **`SpeculativeDecoder::with_adaptive(...)`** — wires `AdaptiveLookahead` into the speculative loop; lookahead updates after every step
+- [x] **CI re-enabled** — `.github/workflows/ci.yml` restored from `.disabled`; branches updated to `main` / `master` / `0.1.*`
 
 ## Performance Targets
 

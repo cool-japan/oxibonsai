@@ -32,18 +32,26 @@ use std::sync::Arc;
 /// To get a reasonably "interesting" weight matrix we vary both the qs pattern
 /// and the scale across blocks based on a 64-bit linear-congruential PRNG seed.
 fn tq2_0_g128_pattern(num_weights: usize, seed: u64) -> Vec<u8> {
-    assert_eq!(num_weights % 128, 0, "num_weights must be a multiple of 128");
+    assert_eq!(
+        num_weights % 128,
+        0,
+        "num_weights must be a multiple of 128"
+    );
     let num_blocks = num_weights / 128;
     let mut data = Vec::with_capacity(num_blocks * 34);
     let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     for _ in 0..num_blocks {
         // 32 bytes of qs (128 weights × 2 bits).
         for _ in 0..32 {
-            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
             data.push((state >> 33) as u8);
         }
         // FP16 scale in (0.25, 0.75] so RMSNorm output stays in a sane range.
-        state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
         let scale_f32 = 0.25_f32 + ((state >> 33) as u32 as f32) / (u32::MAX as f32) * 0.5_f32;
         let scale_bytes = f16::from_f32(scale_f32).to_le_bytes();
         data.extend_from_slice(&scale_bytes);
@@ -461,7 +469,5 @@ fn test_batched_ternary_prefill_chunked() {
             "logit[{i}] mismatch single-shot={a:.6} chunked={b:.6} abs_err={abs_err:.3e}"
         );
     }
-    eprintln!(
-        "test_batched_ternary_prefill_chunked: max_abs={max_abs:.3e}, max_rel={max_rel:.3e}"
-    );
+    eprintln!("test_batched_ternary_prefill_chunked: max_abs={max_abs:.3e}, max_rel={max_rel:.3e}");
 }

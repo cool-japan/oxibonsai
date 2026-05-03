@@ -1171,8 +1171,7 @@ impl<'a> BonsaiModel<'a> {
             );
         }
 
-        let mut layer_params: Vec<FullForwardLayerParamsTernary<'_>> =
-            Vec::with_capacity(n_layers);
+        let mut layer_params: Vec<FullForwardLayerParamsTernary<'_>> = Vec::with_capacity(n_layers);
         for (i, block) in self.blocks.iter().enumerate() {
             let norm_handle_base = 5_000_000u64 + (block.layer_index() as u64) * 10;
             let weight_handle_base = 6_000_000u64 + (block.layer_index() as u64) * 10;
@@ -1356,8 +1355,7 @@ impl<'a> BonsaiModel<'a> {
             );
         }
 
-        let mut layer_params: Vec<FullForwardLayerParamsTernary<'_>> =
-            Vec::with_capacity(n_layers);
+        let mut layer_params: Vec<FullForwardLayerParamsTernary<'_>> = Vec::with_capacity(n_layers);
         for (i, block) in self.blocks.iter().enumerate() {
             let norm_handle_base = 5_000_000u64 + (block.layer_index() as u64) * 10;
             let weight_handle_base = 6_000_000u64 + (block.layer_index() as u64) * 10;

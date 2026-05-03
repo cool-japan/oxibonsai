@@ -5,9 +5,9 @@
 //! - `functions` — `MetalGraph` impl: encoder helpers + `encode_full_forward_prefill*`
 //! - `functions_2` — public `try_metal_full_forward_prefill*` entry points
 
-pub(crate) mod types;
 pub(crate) mod functions;
 pub(crate) mod functions_2;
+pub(crate) mod types;
 
 pub(crate) use types::*;
 

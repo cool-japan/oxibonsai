@@ -2,9 +2,8 @@
 //!
 //! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
 
-use metal::{Buffer, MTLResourceOptions};
 use super::super::metal_graph::{alloc_buf, MetalGraphError};
-
+use metal::{Buffer, MTLResourceOptions};
 
 /// Intermediate buffers for batch prefill (processing multiple tokens at once).
 ///
@@ -72,27 +71,11 @@ impl PrefillBuffers {
         let private = MTLResourceOptions::StorageModePrivate;
         let qkv_dim = nq * head_dim + 2 * nkv * head_dim;
         Ok(Self {
-            hidden_buf: alloc_buf(
-                device,
-                (batch_size * hidden_size * f) as u64,
-                shared,
-            )?,
-            normed_buf: alloc_buf(
-                device,
-                (batch_size * hidden_size * f) as u64,
-                private,
-            )?,
+            hidden_buf: alloc_buf(device, (batch_size * hidden_size * f) as u64, shared)?,
+            normed_buf: alloc_buf(device, (batch_size * hidden_size * f) as u64, private)?,
             qkv_buf: alloc_buf(device, (batch_size * qkv_dim * f) as u64, private)?,
-            attn_out_buf: alloc_buf(
-                device,
-                (batch_size * nq * head_dim * f) as u64,
-                private,
-            )?,
-            swiglu_buf: alloc_buf(
-                device,
-                (batch_size * intermediate_size * f) as u64,
-                private,
-            )?,
+            attn_out_buf: alloc_buf(device, (batch_size * nq * head_dim * f) as u64, private)?,
+            swiglu_buf: alloc_buf(device, (batch_size * intermediate_size * f) as u64, private)?,
             gate_up_buf: alloc_buf(
                 device,
                 (batch_size * 2 * intermediate_size * f) as u64,
@@ -103,16 +86,8 @@ impl PrefillBuffers {
             q_rope_buf: alloc_buf(device, (nq * head_dim * f) as u64, private)?,
             k_rope_buf: alloc_buf(device, (nkv * head_dim * f) as u64, private)?,
             scores_buf: alloc_buf(device, (nq * max_seq * f) as u64, private)?,
-            cos_buf: alloc_buf(
-                device,
-                (batch_size * (head_dim / 2) * f) as u64,
-                shared,
-            )?,
-            sin_buf: alloc_buf(
-                device,
-                (batch_size * (head_dim / 2) * f) as u64,
-                shared,
-            )?,
+            cos_buf: alloc_buf(device, (batch_size * (head_dim / 2) * f) as u64, shared)?,
+            sin_buf: alloc_buf(device, (batch_size * (head_dim / 2) * f) as u64, shared)?,
             batch_size,
             hidden_size,
             intermediate_size,
@@ -134,9 +109,13 @@ impl PrefillBuffers {
         head_dim: usize,
         max_seq: usize,
     ) -> bool {
-        self.batch_size == batch_size && self.hidden_size == hidden_size
-            && self.intermediate_size == intermediate_size && self.nq == nq
-            && self.nkv == nkv && self.head_dim == head_dim && self.max_seq == max_seq
+        self.batch_size == batch_size
+            && self.hidden_size == hidden_size
+            && self.intermediate_size == intermediate_size
+            && self.nq == nq
+            && self.nkv == nkv
+            && self.head_dim == head_dim
+            && self.max_seq == max_seq
     }
 }
 /// Model configuration for a single transformer layer.

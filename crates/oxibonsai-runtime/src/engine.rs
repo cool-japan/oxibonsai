@@ -20,6 +20,8 @@ use crate::error::{RuntimeError, RuntimeResult};
 use crate::metrics::InferenceMetrics;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use crate::ngram_cache::NgramCache;
+use crate::request_id::RequestId;
+use crate::request_metrics::{RequestRateAggregator, RequestRateSnapshot, RequestRateTracker};
 use crate::sampling::{Sampler, SamplingParams};
 
 /// EOS token for Qwen3 models.
@@ -107,6 +109,12 @@ pub struct InferenceEngine<'a> {
     /// re-fed into prefill, so a repeated prompt should increment this
     /// counter by strictly fewer tokens than its full length.
     prefill_token_count: u64,
+    /// Optional workload-level rate aggregator. When attached, every
+    /// `generate_tracked` call records its [`RequestRateSnapshot`] here on
+    /// completion, allowing the operator to surface workload-level p50/p95
+    /// inter-token latency, EWMA tokens-per-second, and queue-wait gauges
+    /// (see [`InferenceMetrics::update_request_rate`]).
+    rate_aggregator: Option<Arc<RequestRateAggregator>>,
 }
 
 impl<'a> InferenceEngine<'a> {
@@ -125,6 +133,7 @@ impl<'a> InferenceEngine<'a> {
             metrics: None,
             stats: Arc::new(EngineStats::new()),
             prefill_token_count: 0,
+            rate_aggregator: None,
         }
     }
 
@@ -162,6 +171,7 @@ impl<'a> InferenceEngine<'a> {
             metrics: None,
             stats: Arc::new(EngineStats::new()),
             prefill_token_count: 0,
+            rate_aggregator: None,
         }
     }
 
@@ -234,12 +244,29 @@ impl<'a> InferenceEngine<'a> {
             metrics: None,
             stats: Arc::new(EngineStats::new()),
             prefill_token_count: 0,
+            rate_aggregator: None,
         })
     }
 
     /// Attach shared metrics to this engine for recording inference telemetry.
     pub fn set_metrics(&mut self, metrics: Arc<InferenceMetrics>) {
         self.metrics = Some(metrics);
+    }
+
+    /// Attach a workload-level [`RequestRateAggregator`] to this engine.
+    ///
+    /// Once attached, every call to [`InferenceEngine::generate_tracked`] (or
+    /// [`InferenceEngine::generate_with_request_id`]) will push its
+    /// per-request [`RequestRateSnapshot`] into the aggregator on completion.
+    /// The aggregator is reference-counted, so the same instance can be shared
+    /// with the Prometheus metrics layer or the admin endpoints.
+    pub fn set_rate_aggregator(&mut self, aggregator: Arc<RequestRateAggregator>) {
+        self.rate_aggregator = Some(aggregator);
+    }
+
+    /// Read-only access to the attached rate aggregator, if any.
+    pub fn rate_aggregator(&self) -> Option<&Arc<RequestRateAggregator>> {
+        self.rate_aggregator.as_ref()
     }
 
     /// Get a reference to the model.
@@ -415,6 +442,107 @@ impl<'a> InferenceEngine<'a> {
         );
 
         Ok(output_tokens)
+    }
+
+    /// Generate tokens from a prompt while populating a [`RequestRateTracker`].
+    ///
+    /// Behaves identically to [`InferenceEngine::generate`] but additionally:
+    /// - records `record_admission()` immediately on entry,
+    /// - records `record_first_token()` for the first sampled token,
+    /// - records `record_token()` for every subsequent sampled token,
+    /// - on success, pushes the resulting [`RequestRateSnapshot`] into the
+    ///   engine's attached [`RequestRateAggregator`] (if any).
+    ///
+    /// The tracker is borrowed mutably so callers can inspect intermediate
+    /// state via [`RequestRateTracker::snapshot`] after the call returns.
+    #[tracing::instrument(skip(self, prompt_tokens, tracker), fields(prompt_len = prompt_tokens.len()))]
+    pub fn generate_tracked(
+        &mut self,
+        prompt_tokens: &[u32],
+        max_tokens: usize,
+        tracker: &mut RequestRateTracker,
+    ) -> RuntimeResult<Vec<u32>> {
+        if prompt_tokens.is_empty() {
+            return Ok(vec![]);
+        }
+        tracker.record_admission();
+
+        let prefill_start = std::time::Instant::now();
+        let mut last_logits = self.model.forward_prefill(prompt_tokens, 0, &self.kernel)?;
+        if let Some(m) = &self.metrics {
+            m.prefill_duration_seconds
+                .observe(prefill_start.elapsed().as_secs_f64());
+        }
+
+        let decode_start = std::time::Instant::now();
+        let mut output_tokens = Vec::with_capacity(max_tokens);
+        let mut first_token_recorded = false;
+
+        for (pos, _) in (prompt_tokens.len()..).zip(0..max_tokens) {
+            let step_start = std::time::Instant::now();
+            let next_token = self.sampler.sample(&last_logits)?;
+            if next_token == EOS_TOKEN_ID {
+                tracing::debug!(pos, "EOS token generated");
+                break;
+            }
+            output_tokens.push(next_token);
+            if !first_token_recorded {
+                tracker.record_first_token();
+                first_token_recorded = true;
+            } else {
+                tracker.record_token();
+            }
+            last_logits = self.model.forward(next_token, pos, &self.kernel)?;
+
+            if let Some(m) = &self.metrics {
+                m.decode_token_duration_seconds
+                    .observe(step_start.elapsed().as_secs_f64());
+            }
+        }
+
+        if let Some(m) = &self.metrics {
+            let decode_elapsed = decode_start.elapsed().as_secs_f64();
+            if decode_elapsed > 0.0 && !output_tokens.is_empty() {
+                let tok_per_sec = output_tokens.len() as f64 / decode_elapsed;
+                m.tokens_per_second.observe(tok_per_sec);
+            }
+            m.tokens_generated_total.inc_by(output_tokens.len() as u64);
+            m.update_memory_from_rss();
+        }
+        self.stats.record_request(output_tokens.len());
+
+        if let Some(agg) = &self.rate_aggregator {
+            let snap: RequestRateSnapshot = tracker.snapshot();
+            agg.record(snap);
+        }
+
+        tracing::info!(
+            prompt_len = prompt_tokens.len(),
+            generated = output_tokens.len(),
+            "tracked generation complete"
+        );
+
+        Ok(output_tokens)
+    }
+
+    /// Generate tokens from a prompt with a [`RequestId`] tagging the
+    /// surrounding tracing span and an internally-managed
+    /// [`RequestRateTracker`].
+    ///
+    /// Returns both the generated tokens and the final tracker so callers
+    /// can extract per-request metrics (e.g. queue-wait, p95 inter-token
+    /// latency) for client-side observability.
+    pub fn generate_with_request_id(
+        &mut self,
+        request_id: RequestId,
+        prompt_tokens: &[u32],
+        max_tokens: usize,
+    ) -> RuntimeResult<(Vec<u32>, RequestRateTracker)> {
+        let span = tracing::info_span!("generate_request", request_id = %request_id);
+        let _enter = span.enter();
+        let mut tracker = RequestRateTracker::new();
+        let tokens = self.generate_tracked(prompt_tokens, max_tokens, &mut tracker)?;
+        Ok((tokens, tracker))
     }
 
     /// Generate tokens from a prompt using a specific seed for this run.

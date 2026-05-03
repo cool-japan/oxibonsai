@@ -26,40 +26,32 @@ impl MetalGraph {
         head_dim: usize,
         max_seq: usize,
     ) -> Result<std::sync::MutexGuard<'_, Option<PrefillBuffers>>, MetalGraphError> {
-        let mut guard = self
-            .prefill_buffers
-            .lock()
-            .map_err(|_| {
-                MetalGraphError::ExecutionFailed("prefill_buffers lock poisoned".into())
-            })?;
+        let mut guard = self.prefill_buffers.lock().map_err(|_| {
+            MetalGraphError::ExecutionFailed("prefill_buffers lock poisoned".into())
+        })?;
         let needs_alloc = match guard.as_ref() {
-            Some(b) => {
-                !b
-                    .matches(
-                        batch_size,
-                        hidden_size,
-                        intermediate_size,
-                        nq,
-                        nkv,
-                        head_dim,
-                        max_seq,
-                    )
-            }
+            Some(b) => !b.matches(
+                batch_size,
+                hidden_size,
+                intermediate_size,
+                nq,
+                nkv,
+                head_dim,
+                max_seq,
+            ),
             None => true,
         };
         if needs_alloc {
-            *guard = Some(
-                PrefillBuffers::allocate(
-                    &self.device,
-                    batch_size,
-                    hidden_size,
-                    intermediate_size,
-                    nq,
-                    nkv,
-                    head_dim,
-                    max_seq,
-                )?,
-            );
+            *guard = Some(PrefillBuffers::allocate(
+                &self.device,
+                batch_size,
+                hidden_size,
+                intermediate_size,
+                nq,
+                nkv,
+                head_dim,
+                max_seq,
+            )?);
         }
         Ok(guard)
     }
@@ -107,66 +99,48 @@ impl MetalGraph {
         let half_dim = head_dim / 2;
         let f = std::mem::size_of::<f32>();
         if hidden_batch.len() < batch_size * hidden_size {
-            return Err(
-                MetalGraphError::EncodingFailed(
-                    format!(
-                        "hidden_batch too short: need {}, got {}", batch_size *
-                        hidden_size, hidden_batch.len()
-                    ),
-                ),
-            );
+            return Err(MetalGraphError::EncodingFailed(format!(
+                "hidden_batch too short: need {}, got {}",
+                batch_size * hidden_size,
+                hidden_batch.len()
+            )));
         }
         if cos_table.len() < batch_size * half_dim {
-            return Err(
-                MetalGraphError::EncodingFailed(
-                    format!(
-                        "cos_table too short: need {}, got {}", batch_size * half_dim,
-                        cos_table.len()
-                    ),
-                ),
-            );
+            return Err(MetalGraphError::EncodingFailed(format!(
+                "cos_table too short: need {}, got {}",
+                batch_size * half_dim,
+                cos_table.len()
+            )));
         }
         if sin_table.len() < batch_size * half_dim {
-            return Err(
-                MetalGraphError::EncodingFailed(
-                    format!(
-                        "sin_table too short: need {}, got {}", batch_size * half_dim,
-                        sin_table.len()
-                    ),
-                ),
-            );
+            return Err(MetalGraphError::EncodingFailed(format!(
+                "sin_table too short: need {}, got {}",
+                batch_size * half_dim,
+                sin_table.len()
+            )));
         }
         if layer_weights.len() != n_layers {
-            return Err(
-                MetalGraphError::EncodingFailed(
-                    format!(
-                        "layer_weights length mismatch: need {n_layers}, got {}",
-                        layer_weights.len()
-                    ),
-                ),
-            );
+            return Err(MetalGraphError::EncodingFailed(format!(
+                "layer_weights length mismatch: need {n_layers}, got {}",
+                layer_weights.len()
+            )));
         }
-        let pb_guard = self
-            .acquire_prefill_buffers(
-                batch_size,
-                hidden_size,
-                intermediate_size,
-                nq,
-                nkv,
-                head_dim,
-                max_seq_len,
-            )?;
-        let bufs = pb_guard
-            .as_ref()
-            .ok_or_else(|| {
-                MetalGraphError::ExecutionFailed("prefill_buffers not allocated".into())
-            })?;
+        let pb_guard = self.acquire_prefill_buffers(
+            batch_size,
+            hidden_size,
+            intermediate_size,
+            nq,
+            nkv,
+            head_dim,
+            max_seq_len,
+        )?;
+        let bufs = pb_guard.as_ref().ok_or_else(|| {
+            MetalGraphError::ExecutionFailed("prefill_buffers not allocated".into())
+        })?;
         let kv_guard = self.acquire_kv_cache(n_layers, nkv, max_seq_len, head_dim)?;
         let kv = kv_guard
             .as_ref()
-            .ok_or_else(|| MetalGraphError::ExecutionFailed(
-                "kv_cache not allocated".into(),
-            ))?;
+            .ok_or_else(|| MetalGraphError::ExecutionFailed("kv_cache not allocated".into()))?;
         unsafe {
             upload_f32(&bufs.hidden_buf, &hidden_batch[..batch_size * hidden_size]);
             upload_f32(&bufs.cos_buf, &cos_table[..batch_size * half_dim]);
@@ -217,32 +191,19 @@ impl MetalGraph {
                     set_scalar(encoder, 3, &final_norm_eps);
                     set_scalar(encoder, 4, &h);
                 }
-                encoder
-                    .dispatch_thread_groups(
-                        MTLSize::new(1, 1, 1),
-                        MTLSize::new(256, 1, 1),
-                    );
-                let mut lg = self
-                    .logits_buf
-                    .lock()
-                    .map_err(|_| {
-                        MetalGraphError::ExecutionFailed(
-                            "logits_buf lock poisoned".into(),
-                        )
-                    })?;
+                encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
+                let mut lg = self.logits_buf.lock().map_err(|_| {
+                    MetalGraphError::ExecutionFailed("logits_buf lock poisoned".into())
+                })?;
                 let needed_bytes = (lm_head_out_features * f) as u64;
                 if lg.as_ref().is_none_or(|b| b.length() < needed_bytes) {
-                    *lg = Some(
-                        alloc_buf(
-                            &self.device,
-                            needed_bytes,
-                            MTLResourceOptions::StorageModeShared,
-                        )?,
-                    );
+                    *lg = Some(alloc_buf(
+                        &self.device,
+                        needed_bytes,
+                        MTLResourceOptions::StorageModeShared,
+                    )?);
                 }
-                let logits_buf = lg
-                    .as_ref()
-                    .ok_or(MetalGraphError::BufferCreationFailed)?;
+                let logits_buf = lg.as_ref().ok_or(MetalGraphError::BufferCreationFailed)?;
                 self.dispatch_gemv_q1(
                     encoder,
                     &lm_w.buffer,
@@ -252,23 +213,16 @@ impl MetalGraph {
                     h,
                 );
                 if greedy_token_id_out.is_some() {
-                    let mut tid_guard = self
-                        .token_id_buf
-                        .lock()
-                        .map_err(|_| {
-                            MetalGraphError::ExecutionFailed(
-                                "token_id_buf lock poisoned".into(),
-                            )
-                        })?;
+                    let mut tid_guard = self.token_id_buf.lock().map_err(|_| {
+                        MetalGraphError::ExecutionFailed("token_id_buf lock poisoned".into())
+                    })?;
                     let needed = std::mem::size_of::<u32>() as u64;
                     if tid_guard.as_ref().is_none_or(|b| b.length() < needed) {
-                        *tid_guard = Some(
-                            alloc_buf(
-                                &self.device,
-                                needed,
-                                MTLResourceOptions::StorageModeShared,
-                            )?,
-                        );
+                        *tid_guard = Some(alloc_buf(
+                            &self.device,
+                            needed,
+                            MTLResourceOptions::StorageModeShared,
+                        )?);
                     }
                     let token_id_buf_ref = tid_guard
                         .as_ref()
@@ -282,9 +236,7 @@ impl MetalGraph {
                     encoder.end_encoding();
                     cmd_buf.commit();
                     cmd_buf.wait_until_completed();
-                    let token_id = unsafe {
-                        *(token_id_buf_ref.contents() as *const u32)
-                    };
+                    let token_id = unsafe { *(token_id_buf_ref.contents() as *const u32) };
                     if let Some(out) = greedy_token_id_out {
                         *out = token_id;
                     }
@@ -346,66 +298,48 @@ impl MetalGraph {
         let half_dim = head_dim / 2;
         let f = std::mem::size_of::<f32>();
         if hidden_batch.len() < batch_size * hidden_size {
-            return Err(
-                MetalGraphError::EncodingFailed(
-                    format!(
-                        "hidden_batch too short: need {}, got {}", batch_size *
-                        hidden_size, hidden_batch.len()
-                    ),
-                ),
-            );
+            return Err(MetalGraphError::EncodingFailed(format!(
+                "hidden_batch too short: need {}, got {}",
+                batch_size * hidden_size,
+                hidden_batch.len()
+            )));
         }
         if cos_table.len() < batch_size * half_dim {
-            return Err(
-                MetalGraphError::EncodingFailed(
-                    format!(
-                        "cos_table too short: need {}, got {}", batch_size * half_dim,
-                        cos_table.len()
-                    ),
-                ),
-            );
+            return Err(MetalGraphError::EncodingFailed(format!(
+                "cos_table too short: need {}, got {}",
+                batch_size * half_dim,
+                cos_table.len()
+            )));
         }
         if sin_table.len() < batch_size * half_dim {
-            return Err(
-                MetalGraphError::EncodingFailed(
-                    format!(
-                        "sin_table too short: need {}, got {}", batch_size * half_dim,
-                        sin_table.len()
-                    ),
-                ),
-            );
+            return Err(MetalGraphError::EncodingFailed(format!(
+                "sin_table too short: need {}, got {}",
+                batch_size * half_dim,
+                sin_table.len()
+            )));
         }
         if layer_weights.len() != n_layers {
-            return Err(
-                MetalGraphError::EncodingFailed(
-                    format!(
-                        "layer_weights length mismatch: need {n_layers}, got {}",
-                        layer_weights.len()
-                    ),
-                ),
-            );
+            return Err(MetalGraphError::EncodingFailed(format!(
+                "layer_weights length mismatch: need {n_layers}, got {}",
+                layer_weights.len()
+            )));
         }
-        let pb_guard = self
-            .acquire_prefill_buffers(
-                batch_size,
-                hidden_size,
-                intermediate_size,
-                nq,
-                nkv,
-                head_dim,
-                max_seq_len,
-            )?;
-        let bufs = pb_guard
-            .as_ref()
-            .ok_or_else(|| {
-                MetalGraphError::ExecutionFailed("prefill_buffers not allocated".into())
-            })?;
+        let pb_guard = self.acquire_prefill_buffers(
+            batch_size,
+            hidden_size,
+            intermediate_size,
+            nq,
+            nkv,
+            head_dim,
+            max_seq_len,
+        )?;
+        let bufs = pb_guard.as_ref().ok_or_else(|| {
+            MetalGraphError::ExecutionFailed("prefill_buffers not allocated".into())
+        })?;
         let kv_guard = self.acquire_kv_cache(n_layers, nkv, max_seq_len, head_dim)?;
         let kv = kv_guard
             .as_ref()
-            .ok_or_else(|| MetalGraphError::ExecutionFailed(
-                "kv_cache not allocated".into(),
-            ))?;
+            .ok_or_else(|| MetalGraphError::ExecutionFailed("kv_cache not allocated".into()))?;
         unsafe {
             upload_f32(&bufs.hidden_buf, &hidden_batch[..batch_size * hidden_size]);
             upload_f32(&bufs.cos_buf, &cos_table[..batch_size * half_dim]);
@@ -456,27 +390,18 @@ impl MetalGraph {
                     h,
                     batch_size as u32,
                 );
-                let mut lg = self
-                    .logits_buf
-                    .lock()
-                    .map_err(|_| {
-                        MetalGraphError::ExecutionFailed(
-                            "logits_buf lock poisoned".into(),
-                        )
-                    })?;
+                let mut lg = self.logits_buf.lock().map_err(|_| {
+                    MetalGraphError::ExecutionFailed("logits_buf lock poisoned".into())
+                })?;
                 let needed_bytes = (batch_size * lm_head_out_features * f) as u64;
                 if lg.as_ref().is_none_or(|b| b.length() < needed_bytes) {
-                    *lg = Some(
-                        alloc_buf(
-                            &self.device,
-                            needed_bytes,
-                            MTLResourceOptions::StorageModeShared,
-                        )?,
-                    );
+                    *lg = Some(alloc_buf(
+                        &self.device,
+                        needed_bytes,
+                        MTLResourceOptions::StorageModeShared,
+                    )?);
                 }
-                let logits_buf = lg
-                    .as_ref()
-                    .ok_or(MetalGraphError::BufferCreationFailed)?;
+                let logits_buf = lg.as_ref().ok_or(MetalGraphError::BufferCreationFailed)?;
                 self.dispatch_gemm_q1_v7(
                     encoder,
                     &lm_w.buffer,
@@ -486,23 +411,16 @@ impl MetalGraph {
                     h,
                     batch_size as u32,
                 );
-                let mut tid_guard = self
-                    .token_id_buf
-                    .lock()
-                    .map_err(|_| {
-                        MetalGraphError::ExecutionFailed(
-                            "token_id_buf lock poisoned".into(),
-                        )
-                    })?;
+                let mut tid_guard = self.token_id_buf.lock().map_err(|_| {
+                    MetalGraphError::ExecutionFailed("token_id_buf lock poisoned".into())
+                })?;
                 let needed = (batch_size * std::mem::size_of::<u32>()) as u64;
                 if tid_guard.as_ref().is_none_or(|b| b.length() < needed) {
-                    *tid_guard = Some(
-                        alloc_buf(
-                            &self.device,
-                            needed,
-                            MTLResourceOptions::StorageModeShared,
-                        )?,
-                    );
+                    *tid_guard = Some(alloc_buf(
+                        &self.device,
+                        needed,
+                        MTLResourceOptions::StorageModeShared,
+                    )?);
                 }
                 let token_id_buf_ref = tid_guard
                     .as_ref()
@@ -519,11 +437,7 @@ impl MetalGraph {
                     unsafe {
                         set_scalar(encoder, 2, &vocab);
                     }
-                    encoder
-                        .dispatch_thread_groups(
-                            MTLSize::new(1, 1, 1),
-                            MTLSize::new(1024, 1, 1),
-                        );
+                    encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(1024, 1, 1));
                 }
                 encoder.end_encoding();
                 cmd_buf.commit();
@@ -633,11 +547,10 @@ impl MetalGraph {
                     set_scalar(encoder, 8, &(half_dim as u32));
                 }
                 let tg_x = div_ceil(half_dim, 64) as u64;
-                encoder
-                    .dispatch_thread_groups(
-                        MTLSize::new(tg_x, (nq + nkv) as u64, 1),
-                        MTLSize::new(64, 1, 1),
-                    );
+                encoder.dispatch_thread_groups(
+                    MTLSize::new(tg_x, (nq + nkv) as u64, 1),
+                    MTLSize::new(64, 1, 1),
+                );
             }
             self.dispatch_fused_kv_store(
                 encoder,
@@ -677,17 +590,11 @@ impl MetalGraph {
                     set_scalar(encoder, 3, &seq_len);
                 }
                 encoder
-                    .dispatch_thread_groups(
-                        MTLSize::new(nq as u64, 1, 1),
-                        MTLSize::new(256, 1, 1),
-                    );
+                    .dispatch_thread_groups(MTLSize::new(nq as u64, 1, 1), MTLSize::new(256, 1, 1));
             }
             {
                 let attn_col_byte_offset = (t * nq * hd * f) as u64;
-                encoder
-                    .set_compute_pipeline_state(
-                        &self.pipelines.batched_attention_weighted_sum,
-                    );
+                encoder.set_compute_pipeline_state(&self.pipelines.batched_attention_weighted_sum);
                 encoder.set_buffer(0, Some(&bufs.scores_buf), 0);
                 encoder.set_buffer(1, Some(&kv.v_cache), 0);
                 encoder.set_buffer(2, Some(&bufs.attn_out_buf), attn_col_byte_offset);
@@ -701,11 +608,10 @@ impl MetalGraph {
                     set_scalar(encoder, 9, &cache_layer_offset);
                 }
                 let tg_x = div_ceil(hd, 64) as u64;
-                encoder
-                    .dispatch_thread_groups(
-                        MTLSize::new(tg_x, nq as u64, 1),
-                        MTLSize::new(64, 1, 1),
-                    );
+                encoder.dispatch_thread_groups(
+                    MTLSize::new(tg_x, nq as u64, 1),
+                    MTLSize::new(64, 1, 1),
+                );
             }
         }
         self.dispatch_gemm_q1_v7_residual(
@@ -847,11 +753,10 @@ impl MetalGraph {
                     set_scalar(encoder, 8, &(half_dim as u32));
                 }
                 let tg_x = div_ceil(half_dim, 64) as u64;
-                encoder
-                    .dispatch_thread_groups(
-                        MTLSize::new(tg_x, (nq + nkv) as u64, 1),
-                        MTLSize::new(64, 1, 1),
-                    );
+                encoder.dispatch_thread_groups(
+                    MTLSize::new(tg_x, (nq + nkv) as u64, 1),
+                    MTLSize::new(64, 1, 1),
+                );
             }
             self.dispatch_fused_kv_store(
                 encoder,
@@ -889,17 +794,11 @@ impl MetalGraph {
                     set_scalar(encoder, 3, &seq_len);
                 }
                 encoder
-                    .dispatch_thread_groups(
-                        MTLSize::new(nq as u64, 1, 1),
-                        MTLSize::new(256, 1, 1),
-                    );
+                    .dispatch_thread_groups(MTLSize::new(nq as u64, 1, 1), MTLSize::new(256, 1, 1));
             }
             {
                 let attn_col_byte_offset = (t * nq * hd * f) as u64;
-                encoder
-                    .set_compute_pipeline_state(
-                        &self.pipelines.batched_attention_weighted_sum,
-                    );
+                encoder.set_compute_pipeline_state(&self.pipelines.batched_attention_weighted_sum);
                 encoder.set_buffer(0, Some(&bufs.scores_buf), 0);
                 encoder.set_buffer(1, Some(&kv.v_cache), 0);
                 encoder.set_buffer(2, Some(&bufs.attn_out_buf), attn_col_byte_offset);
@@ -913,11 +812,10 @@ impl MetalGraph {
                     set_scalar(encoder, 9, &cache_layer_offset);
                 }
                 let tg_x = div_ceil(hd, 64) as u64;
-                encoder
-                    .dispatch_thread_groups(
-                        MTLSize::new(tg_x, nq as u64, 1),
-                        MTLSize::new(64, 1, 1),
-                    );
+                encoder.dispatch_thread_groups(
+                    MTLSize::new(tg_x, nq as u64, 1),
+                    MTLSize::new(64, 1, 1),
+                );
             }
         }
         self.dispatch_gemm_tq2_v7(
@@ -1019,66 +917,48 @@ impl MetalGraph {
         let half_dim = head_dim / 2;
         let f = std::mem::size_of::<f32>();
         if hidden_batch.len() < batch_size * hidden_size {
-            return Err(
-                MetalGraphError::EncodingFailed(
-                    format!(
-                        "hidden_batch too short: need {}, got {}", batch_size *
-                        hidden_size, hidden_batch.len()
-                    ),
-                ),
-            );
+            return Err(MetalGraphError::EncodingFailed(format!(
+                "hidden_batch too short: need {}, got {}",
+                batch_size * hidden_size,
+                hidden_batch.len()
+            )));
         }
         if cos_table.len() < batch_size * half_dim {
-            return Err(
-                MetalGraphError::EncodingFailed(
-                    format!(
-                        "cos_table too short: need {}, got {}", batch_size * half_dim,
-                        cos_table.len()
-                    ),
-                ),
-            );
+            return Err(MetalGraphError::EncodingFailed(format!(
+                "cos_table too short: need {}, got {}",
+                batch_size * half_dim,
+                cos_table.len()
+            )));
         }
         if sin_table.len() < batch_size * half_dim {
-            return Err(
-                MetalGraphError::EncodingFailed(
-                    format!(
-                        "sin_table too short: need {}, got {}", batch_size * half_dim,
-                        sin_table.len()
-                    ),
-                ),
-            );
+            return Err(MetalGraphError::EncodingFailed(format!(
+                "sin_table too short: need {}, got {}",
+                batch_size * half_dim,
+                sin_table.len()
+            )));
         }
         if layer_weights.len() != n_layers {
-            return Err(
-                MetalGraphError::EncodingFailed(
-                    format!(
-                        "layer_weights length mismatch: need {n_layers}, got {}",
-                        layer_weights.len()
-                    ),
-                ),
-            );
+            return Err(MetalGraphError::EncodingFailed(format!(
+                "layer_weights length mismatch: need {n_layers}, got {}",
+                layer_weights.len()
+            )));
         }
-        let pb_guard = self
-            .acquire_prefill_buffers(
-                batch_size,
-                hidden_size,
-                intermediate_size,
-                nq,
-                nkv,
-                head_dim,
-                max_seq_len,
-            )?;
-        let bufs = pb_guard
-            .as_ref()
-            .ok_or_else(|| {
-                MetalGraphError::ExecutionFailed("prefill_buffers not allocated".into())
-            })?;
+        let pb_guard = self.acquire_prefill_buffers(
+            batch_size,
+            hidden_size,
+            intermediate_size,
+            nq,
+            nkv,
+            head_dim,
+            max_seq_len,
+        )?;
+        let bufs = pb_guard.as_ref().ok_or_else(|| {
+            MetalGraphError::ExecutionFailed("prefill_buffers not allocated".into())
+        })?;
         let kv_guard = self.acquire_kv_cache(n_layers, nkv, max_seq_len, head_dim)?;
         let kv = kv_guard
             .as_ref()
-            .ok_or_else(|| MetalGraphError::ExecutionFailed(
-                "kv_cache not allocated".into(),
-            ))?;
+            .ok_or_else(|| MetalGraphError::ExecutionFailed("kv_cache not allocated".into()))?;
         unsafe {
             upload_f32(&bufs.hidden_buf, &hidden_batch[..batch_size * hidden_size]);
             upload_f32(&bufs.cos_buf, &cos_table[..batch_size * half_dim]);
@@ -1129,32 +1009,19 @@ impl MetalGraph {
                     set_scalar(encoder, 3, &final_norm_eps);
                     set_scalar(encoder, 4, &h);
                 }
-                encoder
-                    .dispatch_thread_groups(
-                        MTLSize::new(1, 1, 1),
-                        MTLSize::new(256, 1, 1),
-                    );
-                let mut lg = self
-                    .logits_buf
-                    .lock()
-                    .map_err(|_| {
-                        MetalGraphError::ExecutionFailed(
-                            "logits_buf lock poisoned".into(),
-                        )
-                    })?;
+                encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
+                let mut lg = self.logits_buf.lock().map_err(|_| {
+                    MetalGraphError::ExecutionFailed("logits_buf lock poisoned".into())
+                })?;
                 let needed_bytes = (lm_head_out_features * f) as u64;
                 if lg.as_ref().is_none_or(|b| b.length() < needed_bytes) {
-                    *lg = Some(
-                        alloc_buf(
-                            &self.device,
-                            needed_bytes,
-                            MTLResourceOptions::StorageModeShared,
-                        )?,
-                    );
+                    *lg = Some(alloc_buf(
+                        &self.device,
+                        needed_bytes,
+                        MTLResourceOptions::StorageModeShared,
+                    )?);
                 }
-                let logits_buf = lg
-                    .as_ref()
-                    .ok_or(MetalGraphError::BufferCreationFailed)?;
+                let logits_buf = lg.as_ref().ok_or(MetalGraphError::BufferCreationFailed)?;
                 self.dispatch_gemv_tq2(
                     encoder,
                     &lm_w.buffer,
@@ -1164,23 +1031,16 @@ impl MetalGraph {
                     h,
                 );
                 if greedy_token_id_out.is_some() {
-                    let mut tid_guard = self
-                        .token_id_buf
-                        .lock()
-                        .map_err(|_| {
-                            MetalGraphError::ExecutionFailed(
-                                "token_id_buf lock poisoned".into(),
-                            )
-                        })?;
+                    let mut tid_guard = self.token_id_buf.lock().map_err(|_| {
+                        MetalGraphError::ExecutionFailed("token_id_buf lock poisoned".into())
+                    })?;
                     let needed = std::mem::size_of::<u32>() as u64;
                     if tid_guard.as_ref().is_none_or(|b| b.length() < needed) {
-                        *tid_guard = Some(
-                            alloc_buf(
-                                &self.device,
-                                needed,
-                                MTLResourceOptions::StorageModeShared,
-                            )?,
-                        );
+                        *tid_guard = Some(alloc_buf(
+                            &self.device,
+                            needed,
+                            MTLResourceOptions::StorageModeShared,
+                        )?);
                     }
                     let token_id_buf_ref = tid_guard
                         .as_ref()
@@ -1194,9 +1054,7 @@ impl MetalGraph {
                     encoder.end_encoding();
                     cmd_buf.commit();
                     cmd_buf.wait_until_completed();
-                    let token_id = unsafe {
-                        *(token_id_buf_ref.contents() as *const u32)
-                    };
+                    let token_id = unsafe { *(token_id_buf_ref.contents() as *const u32) };
                     if let Some(out) = greedy_token_id_out {
                         *out = token_id;
                     }
@@ -1261,66 +1119,48 @@ impl MetalGraph {
         let half_dim = head_dim / 2;
         let f = std::mem::size_of::<f32>();
         if hidden_batch.len() < batch_size * hidden_size {
-            return Err(
-                MetalGraphError::EncodingFailed(
-                    format!(
-                        "hidden_batch too short: need {}, got {}", batch_size *
-                        hidden_size, hidden_batch.len()
-                    ),
-                ),
-            );
+            return Err(MetalGraphError::EncodingFailed(format!(
+                "hidden_batch too short: need {}, got {}",
+                batch_size * hidden_size,
+                hidden_batch.len()
+            )));
         }
         if cos_table.len() < batch_size * half_dim {
-            return Err(
-                MetalGraphError::EncodingFailed(
-                    format!(
-                        "cos_table too short: need {}, got {}", batch_size * half_dim,
-                        cos_table.len()
-                    ),
-                ),
-            );
+            return Err(MetalGraphError::EncodingFailed(format!(
+                "cos_table too short: need {}, got {}",
+                batch_size * half_dim,
+                cos_table.len()
+            )));
         }
         if sin_table.len() < batch_size * half_dim {
-            return Err(
-                MetalGraphError::EncodingFailed(
-                    format!(
-                        "sin_table too short: need {}, got {}", batch_size * half_dim,
-                        sin_table.len()
-                    ),
-                ),
-            );
+            return Err(MetalGraphError::EncodingFailed(format!(
+                "sin_table too short: need {}, got {}",
+                batch_size * half_dim,
+                sin_table.len()
+            )));
         }
         if layer_weights.len() != n_layers {
-            return Err(
-                MetalGraphError::EncodingFailed(
-                    format!(
-                        "layer_weights length mismatch: need {n_layers}, got {}",
-                        layer_weights.len()
-                    ),
-                ),
-            );
+            return Err(MetalGraphError::EncodingFailed(format!(
+                "layer_weights length mismatch: need {n_layers}, got {}",
+                layer_weights.len()
+            )));
         }
-        let pb_guard = self
-            .acquire_prefill_buffers(
-                batch_size,
-                hidden_size,
-                intermediate_size,
-                nq,
-                nkv,
-                head_dim,
-                max_seq_len,
-            )?;
-        let bufs = pb_guard
-            .as_ref()
-            .ok_or_else(|| {
-                MetalGraphError::ExecutionFailed("prefill_buffers not allocated".into())
-            })?;
+        let pb_guard = self.acquire_prefill_buffers(
+            batch_size,
+            hidden_size,
+            intermediate_size,
+            nq,
+            nkv,
+            head_dim,
+            max_seq_len,
+        )?;
+        let bufs = pb_guard.as_ref().ok_or_else(|| {
+            MetalGraphError::ExecutionFailed("prefill_buffers not allocated".into())
+        })?;
         let kv_guard = self.acquire_kv_cache(n_layers, nkv, max_seq_len, head_dim)?;
         let kv = kv_guard
             .as_ref()
-            .ok_or_else(|| MetalGraphError::ExecutionFailed(
-                "kv_cache not allocated".into(),
-            ))?;
+            .ok_or_else(|| MetalGraphError::ExecutionFailed("kv_cache not allocated".into()))?;
         unsafe {
             upload_f32(&bufs.hidden_buf, &hidden_batch[..batch_size * hidden_size]);
             upload_f32(&bufs.cos_buf, &cos_table[..batch_size * half_dim]);
@@ -1371,32 +1211,22 @@ impl MetalGraph {
                     h,
                     batch_size as u32,
                 );
-                let mut lg = self
-                    .logits_buf
-                    .lock()
-                    .map_err(|_| {
-                        MetalGraphError::ExecutionFailed(
-                            "logits_buf lock poisoned".into(),
-                        )
-                    })?;
+                let mut lg = self.logits_buf.lock().map_err(|_| {
+                    MetalGraphError::ExecutionFailed("logits_buf lock poisoned".into())
+                })?;
                 let needed_bytes = (batch_size * lm_head_out_features * f) as u64;
                 if lg.as_ref().is_none_or(|b| b.length() < needed_bytes) {
-                    *lg = Some(
-                        alloc_buf(
-                            &self.device,
-                            needed_bytes,
-                            MTLResourceOptions::StorageModeShared,
-                        )?,
-                    );
+                    *lg = Some(alloc_buf(
+                        &self.device,
+                        needed_bytes,
+                        MTLResourceOptions::StorageModeShared,
+                    )?);
                 }
-                let logits_buf = lg
-                    .as_ref()
-                    .ok_or(MetalGraphError::BufferCreationFailed)?;
+                let logits_buf = lg.as_ref().ok_or(MetalGraphError::BufferCreationFailed)?;
                 let f32_size = std::mem::size_of::<f32>() as u64;
                 for col in 0..batch_size {
                     let normed_offset = col as u64 * h as u64 * f32_size;
-                    let logit_offset = col as u64 * lm_head_out_features as u64
-                        * f32_size;
+                    let logit_offset = col as u64 * lm_head_out_features as u64 * f32_size;
                     encoder.set_compute_pipeline_state(&self.pipelines.gemv_tq2_g128_v1);
                     encoder.set_buffer(0, Some(&lm_w.buffer), 0);
                     encoder.set_buffer(1, Some(&bufs.normed_buf), normed_offset);
@@ -1406,29 +1236,21 @@ impl MetalGraph {
                         set_scalar(encoder, 4, &h);
                     }
                     let tg_count = div_ceil(lm_head_out_features, 8);
-                    encoder
-                        .dispatch_thread_groups(
-                            MTLSize::new(tg_count as u64, 1, 1),
-                            MTLSize::new(256, 1, 1),
-                        );
+                    encoder.dispatch_thread_groups(
+                        MTLSize::new(tg_count as u64, 1, 1),
+                        MTLSize::new(256, 1, 1),
+                    );
                 }
-                let mut tid_guard = self
-                    .token_id_buf
-                    .lock()
-                    .map_err(|_| {
-                        MetalGraphError::ExecutionFailed(
-                            "token_id_buf lock poisoned".into(),
-                        )
-                    })?;
+                let mut tid_guard = self.token_id_buf.lock().map_err(|_| {
+                    MetalGraphError::ExecutionFailed("token_id_buf lock poisoned".into())
+                })?;
                 let needed = (batch_size * std::mem::size_of::<u32>()) as u64;
                 if tid_guard.as_ref().is_none_or(|b| b.length() < needed) {
-                    *tid_guard = Some(
-                        alloc_buf(
-                            &self.device,
-                            needed,
-                            MTLResourceOptions::StorageModeShared,
-                        )?,
-                    );
+                    *tid_guard = Some(alloc_buf(
+                        &self.device,
+                        needed,
+                        MTLResourceOptions::StorageModeShared,
+                    )?);
                 }
                 let token_id_buf_ref = tid_guard
                     .as_ref()
@@ -1444,11 +1266,7 @@ impl MetalGraph {
                     unsafe {
                         set_scalar(encoder, 2, &vocab);
                     }
-                    encoder
-                        .dispatch_thread_groups(
-                            MTLSize::new(1, 1, 1),
-                            MTLSize::new(1024, 1, 1),
-                        );
+                    encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(1024, 1, 1));
                 }
                 encoder.end_encoding();
                 cmd_buf.commit();

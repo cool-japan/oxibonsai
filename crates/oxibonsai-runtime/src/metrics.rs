@@ -323,6 +323,17 @@ pub struct InferenceMetrics {
     pub kv_cache_utilization: Gauge,
     /// Total model memory usage in bytes.
     pub model_memory_bytes: Gauge,
+    /// Smoothed average tokens-per-second across recent requests.
+    pub request_tokens_per_second: Gauge,
+    /// p50 inter-token latency across recent requests, in seconds.
+    pub inter_token_latency_p50_seconds: Gauge,
+    /// p95 inter-token latency across recent requests, in seconds.
+    pub inter_token_latency_p95_seconds: Gauge,
+    /// Mean queue-wait time (admission → first token) in seconds.
+    pub queue_wait_seconds: Gauge,
+    /// Effective tier of the runtime KV-cache compression policy:
+    /// 0 = FP16, 1 = Q8, 2 = Q4.
+    pub kv_cache_compression_level: Gauge,
 }
 
 impl InferenceMetrics {
@@ -382,7 +393,43 @@ impl InferenceMetrics {
                 "oxibonsai_model_memory_bytes",
                 "Model memory usage in bytes",
             ),
+            request_tokens_per_second: Gauge::new(
+                "oxibonsai_request_tokens_per_second",
+                "EWMA tokens-per-second across recent requests",
+            ),
+            inter_token_latency_p50_seconds: Gauge::new(
+                "oxibonsai_inter_token_latency_p50_seconds",
+                "Median inter-token latency across recent requests (seconds)",
+            ),
+            inter_token_latency_p95_seconds: Gauge::new(
+                "oxibonsai_inter_token_latency_p95_seconds",
+                "p95 inter-token latency across recent requests (seconds)",
+            ),
+            queue_wait_seconds: Gauge::new(
+                "oxibonsai_queue_wait_seconds",
+                "Mean queue-wait (admission to first token) across recent requests (seconds)",
+            ),
+            kv_cache_compression_level: Gauge::new(
+                "oxibonsai_kv_cache_compression_level",
+                "KV cache compression tier: 0=FP16, 1=Q8, 2=Q4",
+            ),
         }
+    }
+
+    /// Update the per-request rate gauges from a [`crate::request_metrics::AggregateRateSnapshot`].
+    pub fn update_request_rate(&self, snap: &crate::request_metrics::AggregateRateSnapshot) {
+        self.request_tokens_per_second
+            .set(snap.mean_tokens_per_second);
+        self.inter_token_latency_p50_seconds
+            .set(snap.tbt_p50_seconds);
+        self.inter_token_latency_p95_seconds
+            .set(snap.tbt_p95_seconds);
+        self.queue_wait_seconds.set(snap.mean_queue_wait_seconds);
+    }
+
+    /// Update the KV-cache compression-level gauge from a [`crate::kv_cache_policy::KvCacheLevel`].
+    pub fn update_kv_cache_level(&self, level: crate::kv_cache_policy::KvCacheLevel) {
+        self.kv_cache_compression_level.set(level.ordinal() as f64);
     }
 
     /// Render all metrics in Prometheus text exposition format.
@@ -405,6 +452,11 @@ impl InferenceMetrics {
         render_gauge(&mut out, &self.active_requests);
         render_gauge(&mut out, &self.kv_cache_utilization);
         render_gauge(&mut out, &self.model_memory_bytes);
+        render_gauge(&mut out, &self.request_tokens_per_second);
+        render_gauge(&mut out, &self.inter_token_latency_p50_seconds);
+        render_gauge(&mut out, &self.inter_token_latency_p95_seconds);
+        render_gauge(&mut out, &self.queue_wait_seconds);
+        render_gauge(&mut out, &self.kv_cache_compression_level);
 
         out
     }
@@ -698,8 +750,52 @@ mod tests {
         let type_count = output.lines().filter(|l| l.starts_with("# TYPE")).count();
         assert_eq!(help_count, type_count);
 
-        // Should have exactly 11 metric families (4 counters + 4 histograms + 3 gauges)
-        assert_eq!(help_count, 11);
+        // 4 counters + 4 histograms + 8 gauges = 16 metric families.
+        // Gauges added in 0.1.4: request_tokens_per_second,
+        // inter_token_latency_p50/p95_seconds, queue_wait_seconds,
+        // kv_cache_compression_level (5 new) plus the original 3.
+        assert_eq!(help_count, 16);
+    }
+
+    #[test]
+    fn update_request_rate_writes_gauges() {
+        use crate::request_metrics::AggregateRateSnapshot;
+        let m = InferenceMetrics::new();
+        let snap = AggregateRateSnapshot {
+            completed_requests: 10,
+            mean_tokens_per_second: 42.5,
+            tbt_p50_seconds: 0.020,
+            tbt_p95_seconds: 0.080,
+            mean_queue_wait_seconds: 0.005,
+        };
+        m.update_request_rate(&snap);
+        assert!((m.request_tokens_per_second.get() - 42.5).abs() < 1e-6);
+        assert!((m.inter_token_latency_p50_seconds.get() - 0.020).abs() < 1e-6);
+        assert!((m.inter_token_latency_p95_seconds.get() - 0.080).abs() < 1e-6);
+        assert!((m.queue_wait_seconds.get() - 0.005).abs() < 1e-6);
+    }
+
+    #[test]
+    fn update_kv_cache_level_writes_gauge() {
+        use crate::kv_cache_policy::KvCacheLevel;
+        let m = InferenceMetrics::new();
+        m.update_kv_cache_level(KvCacheLevel::Fp16);
+        assert!(m.kv_cache_compression_level.get().abs() < 1e-6);
+        m.update_kv_cache_level(KvCacheLevel::Q8);
+        assert!((m.kv_cache_compression_level.get() - 1.0).abs() < 1e-6);
+        m.update_kv_cache_level(KvCacheLevel::Q4);
+        assert!((m.kv_cache_compression_level.get() - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn render_prometheus_includes_new_gauges() {
+        let m = InferenceMetrics::new();
+        let output = m.render_prometheus();
+        assert!(output.contains("oxibonsai_request_tokens_per_second"));
+        assert!(output.contains("oxibonsai_inter_token_latency_p50_seconds"));
+        assert!(output.contains("oxibonsai_inter_token_latency_p95_seconds"));
+        assert!(output.contains("oxibonsai_queue_wait_seconds"));
+        assert!(output.contains("oxibonsai_kv_cache_compression_level"));
     }
 
     #[test]

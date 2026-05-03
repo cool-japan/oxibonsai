@@ -10,14 +10,14 @@ OxiBonsai is a zero-FFI, zero-C/C++ inference engine for PrismML's sub-2-bit Bon
 
 ## Status
 
-**Version 0.1.3** — released 2026-05-03 · **3,560 tests passing** · ~139k lines of Rust · Pure Rust
+**Version 0.1.4** — released 2026-05-03 · **3,650+ tests passing** · ~152k lines of Rust · Pure Rust
 
 | Crate | Status | Tests |
 |-------|--------|-------|
 | oxibonsai-core     | Stable | 243   |
 | oxibonsai-kernels  | Stable | 291   |
 | oxibonsai-model    | Stable | 1,048 |
-| oxibonsai-runtime  | Stable | 1,044 |
+| oxibonsai-runtime  | Stable | 1,094 |
 | oxibonsai-tokenizer| Stable | 268   |
 | oxibonsai-rag      | Stable | 206   |
 | oxibonsai-eval     | Stable | 151   |
@@ -76,6 +76,31 @@ Both the 1-bit and ternary forward passes are encoded into a **single GPU comman
 - Inference metrics: tokens/sec, prefill/decode latency, request counts
 - Health endpoint (`/health`) with readiness checks
 - Circuit breaker for overload protection
+- **Per-request tracing IDs** via `RequestId` (RFC 4122 UUIDv4, no `uuid` crate dependency)
+- **Per-request rate metrics** via `RequestRateTracker` — TBT p50/p95, EWMA tokens/sec, queue-wait
+- **Workload aggregator** — `RequestRateAggregator` rolls per-request snapshots into `oxibonsai_request_tokens_per_second`, `oxibonsai_inter_token_latency_p50/p95_seconds`, and `oxibonsai_queue_wait_seconds` Prometheus gauges
+
+### Runtime Controllers (0.1.4)
+
+Two adaptive controllers shipped in 0.1.4 let the runtime self-tune as the workload changes:
+
+```rust
+use oxibonsai_runtime::{KvCachePolicy, AdaptiveLookahead, AdaptiveLookaheadConfig};
+
+// KV cache policy: FP16 ↔ Q8 ↔ Q4 driven by EWMA pressure with hysteresis.
+let kv = KvCachePolicy::default();
+let level = kv.observe(0.92);  // → escalates to Q8 once smoothed pressure crosses 0.80
+
+// Speculative-decoding draft length: continuously updated from acceptance EWMA.
+let mut k = AdaptiveLookahead::new(AdaptiveLookaheadConfig::default());
+k.observe_step(5, 4);  // proposed=5, accepted=4 → k drifts toward 5
+```
+
+A worked end-to-end example lives in `examples/runtime_controllers.rs`:
+
+```bash
+cargo run --example runtime_controllers
+```
 
 ### OpenAI-Compatible API
 

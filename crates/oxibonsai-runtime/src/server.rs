@@ -13,7 +13,7 @@
 //! the Axum router, then serve it with `axum::serve`.
 
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{
     sse::{Event, Sse},
     IntoResponse, Json, Response,
@@ -27,7 +27,41 @@ use tokio_stream::StreamExt;
 
 use crate::engine::InferenceEngine;
 use crate::metrics::InferenceMetrics;
+use crate::request_id::RequestId;
 use crate::tokenizer_bridge::TokenizerBridge;
+
+/// Header name used for end-to-end request correlation. Request handlers
+/// echo whatever the client supplied in the response, or generate a fresh
+/// UUIDv4-style id when the header is absent.
+pub const REQUEST_ID_HEADER: &str = "x-request-id";
+
+/// Resolve a [`RequestId`] from an incoming request header, falling back to
+/// a freshly generated id when none is supplied or when the supplied value
+/// is malformed (in either case we still want a usable id to thread through
+/// tracing spans and the response).
+///
+/// Accepts both the 32-hex form (no dashes) and the 36-char UUID form
+/// (`8-4-4-4-12`).
+pub fn resolve_request_id(headers: &HeaderMap) -> RequestId {
+    if let Some(v) = headers.get(REQUEST_ID_HEADER) {
+        if let Ok(s) = v.to_str() {
+            if let Some(id) = RequestId::from_uuid(s).or_else(|| RequestId::from_hex(s)) {
+                return id;
+            }
+        }
+    }
+    RequestId::new()
+}
+
+/// Build response headers for a [`RequestId`]. Returns a `HeaderMap` with the
+/// `X-Request-ID` set to the canonical 36-char UUID form.
+pub fn request_id_header_map(id: RequestId) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if let Ok(value) = HeaderValue::from_str(&id.as_uuid()) {
+        headers.insert(REQUEST_ID_HEADER, value);
+    }
+    headers
+}
 
 /// Server state.
 pub struct AppState {
@@ -200,11 +234,15 @@ async fn list_models() -> Json<serde_json::Value> {
     }))
 }
 
-#[tracing::instrument(skip(state))]
+#[tracing::instrument(skip(state, headers, body), fields(request_id))]
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(body): Json<ChatCompletionRequest>,
 ) -> Result<Response, StatusCode> {
+    let request_id = resolve_request_id(&headers);
+    tracing::Span::current().record("request_id", tracing::field::display(&request_id));
+
     let request_start = std::time::Instant::now();
     state.metrics.requests_total.inc();
     state.metrics.active_requests.inc();
@@ -231,10 +269,22 @@ async fn chat_completions(
 
     let result = if body.stream {
         // ── SSE streaming mode ──
-        chat_completions_stream(Arc::clone(&state), prompt_tokens, body.max_tokens).await
+        chat_completions_stream(
+            Arc::clone(&state),
+            prompt_tokens,
+            body.max_tokens,
+            request_id,
+        )
+        .await
     } else {
         // ── Non-streaming mode ──
-        chat_completions_non_stream(Arc::clone(&state), prompt_tokens, body.max_tokens).await
+        chat_completions_non_stream(
+            Arc::clone(&state),
+            prompt_tokens,
+            body.max_tokens,
+            request_id,
+        )
+        .await
     };
 
     let elapsed = request_start.elapsed().as_secs_f64();
@@ -253,6 +303,7 @@ async fn chat_completions_non_stream(
     state: Arc<AppState>,
     prompt_tokens: Vec<u32>,
     max_tokens: usize,
+    request_id: RequestId,
 ) -> Result<Response, StatusCode> {
     let prompt_len = prompt_tokens.len();
 
@@ -296,7 +347,8 @@ async fn chat_completions_non_stream(
         },
     };
 
-    Ok(Json(response).into_response())
+    let headers = request_id_header_map(request_id);
+    Ok((headers, Json(response)).into_response())
 }
 
 /// SSE streaming chat completion handler.
@@ -304,6 +356,7 @@ async fn chat_completions_stream(
     state: Arc<AppState>,
     prompt_tokens: Vec<u32>,
     max_tokens: usize,
+    request_id: RequestId,
 ) -> Result<Response, StatusCode> {
     let completion_id = format!("chatcmpl-{}", rand_id());
     let created = std::time::SystemTime::now()
@@ -415,7 +468,8 @@ async fn chat_completions_stream(
         .map(|json_str| -> Result<Event, Infallible> { Ok(Event::default().data(json_str)) })
         .chain(tokio_stream::once(Ok(Event::default().data("[DONE]"))));
 
-    Ok(Sse::new(full_stream).into_response())
+    let headers = request_id_header_map(request_id);
+    Ok((headers, Sse::new(full_stream)).into_response())
 }
 
 /// Build a simple prompt from chat messages.

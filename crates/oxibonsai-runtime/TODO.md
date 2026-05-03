@@ -1,9 +1,33 @@
 # oxibonsai-runtime TODO
 
 > Inference engine, sampling, tokenizer, OpenAI-compatible server
-> Version 0.1.3 — 1,044 tests passing (all-features, 2026-05-03)
+> Version 0.1.4 — 1,090+ tests passing (all-features, 2026-05-03)
 
 ## Status: ✅ All Features Complete (Stable)
+
+## 0.1.4 — New Modules
+
+- [x] **`kv_cache_policy`** — `KvCachePolicy` runtime controller; FP16/Q8/Q4 tier transitions driven by EWMA pressure with hysteresis (`kv_cache_policy.rs`, 14 tests)
+- [x] **`adaptive_lookahead`** — speculative-decoding draft-length controller with cooldown + clamped `[min,max]` window (`adaptive_lookahead.rs`, 16 tests); wired into `SpeculativeDecoder::with_adaptive(...)`
+- [x] **`request_metrics`** — per-request `RequestRateTracker` (TBT p50/p95, EWMA tok/s, queue-wait) plus `RequestRateAggregator` workload rollup (`request_metrics.rs`, 13 tests)
+- [x] **`request_id`** — UUIDv4-style 128-bit identifier with thread-safe SplitMix64 generator (`request_id.rs`, 11 tests)
+- [x] **Prometheus surface** — `oxibonsai_request_tokens_per_second`, `oxibonsai_inter_token_latency_p{50,95}_seconds`, `oxibonsai_queue_wait_seconds`, `oxibonsai_kv_cache_compression_level` gauges added to `InferenceMetrics`
+
+## 0.1.4 — Engine Integration
+
+- [x] **`InferenceEngine::generate_tracked(...)`** — populates a `RequestRateTracker` during generation, pushes the snapshot to an attached `RequestRateAggregator`
+- [x] **`InferenceEngine::generate_with_request_id(...)`** — emits a tracing span tagged `request_id = <uuid>`, returns `(Vec<u32>, RequestRateTracker)` for client-side telemetry
+- [x] **`InferenceEngine::set_rate_aggregator(Arc<RequestRateAggregator>)`** — workload-aggregator setter
+- [x] **`tests/engine_controllers_tests.rs`** — 8 integration tests covering tracked generate, request-id propagation, aggregator push semantics
+- [x] **`examples/runtime_controllers.rs`** — end-to-end demo (in workspace root)
+- [x] **`benches/controllers_bench.rs`** — criterion microbenchmarks (in workspace root)
+
+## 0.1.4 — Server / Admin Integration
+
+- [x] **`GET /admin/workload-stats`** — combines `RequestRateAggregator` snapshot (TBT p50/p95, EWMA tokens/sec, queue-wait, completed requests) with `KvCachePolicy` state (level, pressure, upgrades, downgrades) into a single operator-friendly JSON document
+- [x] **`AdminState::with_rate_aggregator(Arc<RequestRateAggregator>)`** + **`AdminState::with_kv_cache_policy(Arc<KvCachePolicy>)`** — builder-style attachment of workload sources to admin
+- [x] **`RequestId::as_bytes() / from_bytes()`** — 16-byte big-endian round-trip for binary protocols
+- [x] **`X-Request-ID` HTTP header propagation** in the OpenAI server: client-supplied ids are echoed; missing/malformed → auto-generated. Public helpers `resolve_request_id` / `request_id_header_map` and `REQUEST_ID_HEADER` constant. Streaming + non-streaming both carry the header; server tracing spans now record `request_id` for end-to-end correlation. 8 integration tests in `tests/request_id_propagation_tests.rs`
 
 Observability, TOML config, streaming SSE, circuit breaker, health checks, builders, presets, batch engine, async engine, continuous batching, prefix/semantic caches, speculative decoding, beam search, token healing, advanced/adaptive sampling, quality metrics, memory profiling, RAG server, and WASM support all implemented.
 

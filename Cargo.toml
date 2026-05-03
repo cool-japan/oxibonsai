@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/cool-japan/oxibonsai"
@@ -26,15 +26,15 @@ categories = ["science", "algorithms", "command-line-utilities"]
 
 [workspace.dependencies]
 # ── Internal crates ──
-oxibonsai-core = { path = "crates/oxibonsai-core", version = "0.1.3" }
-oxibonsai-kernels = { path = "crates/oxibonsai-kernels", version = "0.1.3" }
-oxibonsai-model = { path = "crates/oxibonsai-model", version = "0.1.3" }
-oxibonsai-runtime = { path = "crates/oxibonsai-runtime", version = "0.1.3", default-features = false }
-oxibonsai-tokenizer = { path = "crates/oxibonsai-tokenizer", version = "0.1.3" }
-oxibonsai-serve = { path = "crates/oxibonsai-serve", version = "0.1.3" }
-oxibonsai-rag = { path = "crates/oxibonsai-rag", version = "0.1.3" }
-oxibonsai-eval = { path = "crates/oxibonsai-eval", version = "0.1.3" }
-oxibonsai = { path = "crates/oxibonsai", version = "0.1.3" }
+oxibonsai-core = { path = "crates/oxibonsai-core", version = "0.1.4" }
+oxibonsai-kernels = { path = "crates/oxibonsai-kernels", version = "0.1.4" }
+oxibonsai-model = { path = "crates/oxibonsai-model", version = "0.1.4" }
+oxibonsai-runtime = { path = "crates/oxibonsai-runtime", version = "0.1.4", default-features = false }
+oxibonsai-tokenizer = { path = "crates/oxibonsai-tokenizer", version = "0.1.4" }
+oxibonsai-serve = { path = "crates/oxibonsai-serve", version = "0.1.4" }
+oxibonsai-rag = { path = "crates/oxibonsai-rag", version = "0.1.4" }
+oxibonsai-eval = { path = "crates/oxibonsai-eval", version = "0.1.4" }
+oxibonsai = { path = "crates/oxibonsai", version = "0.1.4" }
 
 # ── COOLJAPAN Ecosystem (Pure Rust Policy) ──
 scirs2-core = { version = "0.4.2", default-features = false }
@@ -198,6 +198,10 @@ path = "examples/metrics_demo.rs"
 name = "server_client"
 path = "examples/server_client.rs"
 
+[[example]]
+name = "runtime_controllers"
+path = "examples/runtime_controllers.rs"
+
 [[bench]]
 name = "kernel_benchmarks"
 harness = false
@@ -208,6 +212,10 @@ harness = false
 
 [[bench]]
 name = "memory_benchmarks"
+harness = false
+
+[[bench]]
+name = "controllers_bench"
 harness = false
 
 [profile.release]

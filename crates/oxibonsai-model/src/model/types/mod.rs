@@ -288,6 +288,16 @@ impl<'a> BonsaiModel<'a> {
         if token_ids.len() == 1 {
             return self.forward(token_ids[0], pos_start, kernel);
         }
+        #[cfg_attr(
+            not(any(
+                all(feature = "metal", target_os = "macos"),
+                all(
+                    feature = "native-cuda",
+                    any(target_os = "linux", target_os = "windows")
+                )
+            )),
+            allow(unused_variables)
+        )]
         let gpu_kernel = kernel.is_gpu_accelerated();
         #[cfg(all(
             feature = "native-cuda",
@@ -361,6 +371,16 @@ impl<'a> BonsaiModel<'a> {
         if token_ids.is_empty() {
             return Ok(vec![]);
         }
+        #[cfg_attr(
+            not(any(
+                all(feature = "metal", target_os = "macos"),
+                all(
+                    feature = "native-cuda",
+                    any(target_os = "linux", target_os = "windows")
+                )
+            )),
+            allow(unused_variables)
+        )]
         let gpu_kernel = kernel.is_gpu_accelerated();
         #[cfg(all(feature = "metal", target_os = "macos"))]
         if gpu_kernel {
@@ -437,6 +457,16 @@ impl<'a> BonsaiModel<'a> {
         }
         let mut hidden = self.token_embd[embd_start..embd_end].to_vec();
         let t_blocks_start = std::time::Instant::now();
+        #[cfg_attr(
+            not(any(
+                all(feature = "metal", target_os = "macos"),
+                all(
+                    feature = "native-cuda",
+                    any(target_os = "linux", target_os = "windows")
+                )
+            )),
+            allow(unused_variables)
+        )]
         let gpu_kernel = kernel.is_gpu_accelerated();
         #[cfg(all(feature = "metal", target_os = "macos"))]
         if gpu_kernel {
