@@ -513,7 +513,7 @@ mod cli {
                         (p_len, tokens.len())
                     }
                     #[cfg(not(all(feature = "metal", target_os = "macos")))]
-                    unreachable!()
+                    unreachable!("use_greedy_gpu was set true outside the Metal+macOS feature path; check cfg-gate consistency in the use_greedy_gpu computation above")
                 } else {
                     // CUDA direct path (Linux / Windows): call engine.generate() directly on the
                     // main thread, bypassing std::thread::scope and its ~107ms OS scheduling

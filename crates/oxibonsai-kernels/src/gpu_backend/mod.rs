@@ -83,7 +83,10 @@ pub use metal_full_layer::{
 };
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
-pub use metal_prefill::{try_metal_full_forward_prefill, try_metal_full_forward_prefill_verify};
+pub use metal_prefill::{
+    try_metal_full_forward_prefill, try_metal_full_forward_prefill_ternary,
+    try_metal_full_forward_prefill_verify, try_metal_full_forward_prefill_verify_ternary,
+};
 
 #[cfg(all(
     feature = "native-cuda",

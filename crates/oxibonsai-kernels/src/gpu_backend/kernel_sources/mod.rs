@@ -113,6 +113,8 @@ mod tests {
         assert!(
             MSL_FUSED_GATE_UP_SWIGLU_GEMM_Q1.contains("kernel void fused_gate_up_swiglu_gemm_q1")
         );
+        // Ternary V7-based GEMM batch prefill kernel
+        assert!(MSL_GEMM_TQ2_G128_V7.contains("kernel void gemm_tq2_g128_v7"));
     }
 
     #[test]

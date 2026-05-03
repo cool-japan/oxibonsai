@@ -265,6 +265,41 @@ impl MetalGraph {
         encoder.dispatch_thread_groups(MTLSize::new(tg_x, 1, 1), MTLSize::new(256, 1, 1));
     }
 
+    /// Dispatch V7-style **TQ2** GEMM (batched ternary): `outputs[col][row] = decode_tq2(weights[row]) · inputs[col]`.
+    ///
+    /// Column-major layout: `inputs[col * k + elem]`, `outputs[col * n_rows + row]`.
+    /// 1D grid: `[ceil(n_rows/8), 1, 1]` threadgroups — batch columns processed
+    /// inside the kernel via 8-column outer chunks (handles arbitrary
+    /// `batch_size` correctly, unlike `dispatch_gemm_q1_v7` whose kernel
+    /// silently caps at 8 columns).
+    ///
+    /// Buffer layout matches `dispatch_gemv_tq2`'s SoA conventions:
+    /// `[N×2B FP16 scales][N×32B 2-bit qs]`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dispatch_gemm_tq2_v7(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        blocks: &Buffer,
+        inputs: &Buffer,
+        outputs: &Buffer,
+        n_rows: u32,
+        k: u32,
+        batch_size: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.pipelines.gemm_tq2_g128_v7);
+        encoder.set_buffer(0, Some(blocks), 0);
+        encoder.set_buffer(1, Some(inputs), 0);
+        encoder.set_buffer(2, Some(outputs), 0);
+        unsafe {
+            set_scalar(encoder, 3, &n_rows);
+            set_scalar(encoder, 4, &batch_size);
+            set_scalar(encoder, 5, &k);
+        }
+
+        let tg_x = div_ceil(n_rows as usize, 8) as u64;
+        encoder.dispatch_thread_groups(MTLSize::new(tg_x, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
     /// Dispatch fused gate+up+SwiGLU GEMM for batch prefill.
     ///
     /// 1D grid: `[ceil(inter_size/8), 1, 1]` threadgroups — batch columns processed inside kernel.

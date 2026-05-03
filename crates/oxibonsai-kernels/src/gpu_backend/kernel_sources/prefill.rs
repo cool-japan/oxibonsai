@@ -544,3 +544,170 @@ kernel void batched_rmsnorm_v2(
     }
 }
 "#;
+
+/// V7-style GEMM for **TQ2_0_g128 (ternary)** weights, batched prefill.
+///
+/// Each simdgroup processes one weight row × ALL batch columns (in 8-column
+/// outer chunks so arbitrary batch sizes are supported, unlike the Q1 V7
+/// kernel which silently caps `cols` at 8). Loads each TQ2 block once per
+/// outer chunk so the L1 cache retains weights across columns. Decode lives
+/// in `decode_tq2` / `decode_byte_tq2` — copied **byte-for-byte** from
+/// `MSL_GEMV_TQ2_G128_V1` so the batched kernel produces bit-identical
+/// results to the per-position GEMV path.
+///
+/// Weight buffer uses SoA layout (same as the Q1 prefill kernels):
+/// `[scales: total_blocks × 2 bytes][data: total_blocks × 32 bytes]`
+///
+/// Buffers:
+/// - buffer(0) = soa_raw    (u8, TQ2_0_g128 weight data, SoA layout)
+/// - buffer(1) = inputs     (f32, batch × k, column-major)
+/// - buffer(2) = outputs    (f32, batch × n_rows, column-major)
+/// - buffer(3) = n_rows     (u32)
+/// - buffer(4) = batch_size (u32)
+/// - buffer(5) = k          (u32)
+///
+/// Dispatch: `[ceil(n_rows/8), 1, 1]` threadgroups, `[256, 1, 1]` threads
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub const MSL_GEMM_TQ2_G128_V7: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+inline float pf_decode_tq2(uint code) {
+    return select(select(0.0f, -1.0f, code == 0u), 1.0f, code == 2u);
+}
+
+inline float4 pf_decode_byte_tq2(uint b) {
+    return float4(
+        pf_decode_tq2((b     ) & 3u),
+        pf_decode_tq2((b >> 2) & 3u),
+        pf_decode_tq2((b >> 4) & 3u),
+        pf_decode_tq2((b >> 6) & 3u)
+    );
+}
+
+kernel void gemm_tq2_g128_v7(
+    device const uchar*  soa_raw    [[buffer(0)]],
+    device const float*  inputs     [[buffer(1)]],
+    device       float*  outputs    [[buffer(2)]],
+    constant uint&       n_rows     [[buffer(3)]],
+    constant uint&       batch_size [[buffer(4)]],
+    constant uint&       k          [[buffer(5)]],
+    uint tgid  [[threadgroup_position_in_grid]],
+    uint sgid  [[simdgroup_index_in_threadgroup]],
+    uint lane  [[thread_index_in_simdgroup]])
+{
+    const uint row = tgid * 8u + sgid;
+    if (row >= n_rows) return;
+
+    const uint blocks_per_row = k / 128u;
+    const uint total_blocks   = n_rows * blocks_per_row;
+    const uint qs_offset      = total_blocks * 2u;
+
+    // Iterate over batch columns in groups of up to 8 so the kernel handles
+    // arbitrary batch sizes correctly (unlike the Q1 V7 kernel which is
+    // capped at 8 columns).  Each outer iteration reloads weights once and
+    // accumulates dot products against up to 8 input columns.
+    for (uint col_base = 0u; col_base < batch_size; col_base += 8u) {
+        const uint cols_remaining = batch_size - col_base;
+        const uint cols = cols_remaining < 8u ? cols_remaining : 8u;
+
+        float col_sums[8] = {0,0,0,0,0,0,0,0};
+
+        for (uint b = lane; b < blocks_per_row; b += 32u) {
+            const uint block_idx = row * blocks_per_row + b;
+            const float scale = float(*(device const half*)(soa_raw + block_idx * 2u));
+            const uint qs_base = qs_offset + block_idx * 32u;
+
+            // Pack 32 quantised bytes into eight 32-bit words (LSB-first
+            // byte order, identical to the GEMV reference).
+            uint w0 = (uint)(soa_raw[qs_base +  0]) | ((uint)(soa_raw[qs_base +  1]) << 8) | ((uint)(soa_raw[qs_base +  2]) << 16) | ((uint)(soa_raw[qs_base +  3]) << 24);
+            uint w1 = (uint)(soa_raw[qs_base +  4]) | ((uint)(soa_raw[qs_base +  5]) << 8) | ((uint)(soa_raw[qs_base +  6]) << 16) | ((uint)(soa_raw[qs_base +  7]) << 24);
+            uint w2 = (uint)(soa_raw[qs_base +  8]) | ((uint)(soa_raw[qs_base +  9]) << 8) | ((uint)(soa_raw[qs_base + 10]) << 16) | ((uint)(soa_raw[qs_base + 11]) << 24);
+            uint w3 = (uint)(soa_raw[qs_base + 12]) | ((uint)(soa_raw[qs_base + 13]) << 8) | ((uint)(soa_raw[qs_base + 14]) << 16) | ((uint)(soa_raw[qs_base + 15]) << 24);
+            uint w4 = (uint)(soa_raw[qs_base + 16]) | ((uint)(soa_raw[qs_base + 17]) << 8) | ((uint)(soa_raw[qs_base + 18]) << 16) | ((uint)(soa_raw[qs_base + 19]) << 24);
+            uint w5 = (uint)(soa_raw[qs_base + 20]) | ((uint)(soa_raw[qs_base + 21]) << 8) | ((uint)(soa_raw[qs_base + 22]) << 16) | ((uint)(soa_raw[qs_base + 23]) << 24);
+            uint w6 = (uint)(soa_raw[qs_base + 24]) | ((uint)(soa_raw[qs_base + 25]) << 8) | ((uint)(soa_raw[qs_base + 26]) << 16) | ((uint)(soa_raw[qs_base + 27]) << 24);
+            uint w7 = (uint)(soa_raw[qs_base + 28]) | ((uint)(soa_raw[qs_base + 29]) << 8) | ((uint)(soa_raw[qs_base + 30]) << 16) | ((uint)(soa_raw[qs_base + 31]) << 24);
+
+            // Decode the 32 bytes (= 128 weights) into 32 float4 lanes.
+            float4 d00 = pf_decode_byte_tq2((w0      ) & 0xFFu);
+            float4 d01 = pf_decode_byte_tq2((w0 >>  8) & 0xFFu);
+            float4 d02 = pf_decode_byte_tq2((w0 >> 16) & 0xFFu);
+            float4 d03 = pf_decode_byte_tq2((w0 >> 24) & 0xFFu);
+            float4 d04 = pf_decode_byte_tq2((w1      ) & 0xFFu);
+            float4 d05 = pf_decode_byte_tq2((w1 >>  8) & 0xFFu);
+            float4 d06 = pf_decode_byte_tq2((w1 >> 16) & 0xFFu);
+            float4 d07 = pf_decode_byte_tq2((w1 >> 24) & 0xFFu);
+            float4 d08 = pf_decode_byte_tq2((w2      ) & 0xFFu);
+            float4 d09 = pf_decode_byte_tq2((w2 >>  8) & 0xFFu);
+            float4 d10 = pf_decode_byte_tq2((w2 >> 16) & 0xFFu);
+            float4 d11 = pf_decode_byte_tq2((w2 >> 24) & 0xFFu);
+            float4 d12 = pf_decode_byte_tq2((w3      ) & 0xFFu);
+            float4 d13 = pf_decode_byte_tq2((w3 >>  8) & 0xFFu);
+            float4 d14 = pf_decode_byte_tq2((w3 >> 16) & 0xFFu);
+            float4 d15 = pf_decode_byte_tq2((w3 >> 24) & 0xFFu);
+            float4 d16 = pf_decode_byte_tq2((w4      ) & 0xFFu);
+            float4 d17 = pf_decode_byte_tq2((w4 >>  8) & 0xFFu);
+            float4 d18 = pf_decode_byte_tq2((w4 >> 16) & 0xFFu);
+            float4 d19 = pf_decode_byte_tq2((w4 >> 24) & 0xFFu);
+            float4 d20 = pf_decode_byte_tq2((w5      ) & 0xFFu);
+            float4 d21 = pf_decode_byte_tq2((w5 >>  8) & 0xFFu);
+            float4 d22 = pf_decode_byte_tq2((w5 >> 16) & 0xFFu);
+            float4 d23 = pf_decode_byte_tq2((w5 >> 24) & 0xFFu);
+            float4 d24 = pf_decode_byte_tq2((w6      ) & 0xFFu);
+            float4 d25 = pf_decode_byte_tq2((w6 >>  8) & 0xFFu);
+            float4 d26 = pf_decode_byte_tq2((w6 >> 16) & 0xFFu);
+            float4 d27 = pf_decode_byte_tq2((w6 >> 24) & 0xFFu);
+            float4 d28 = pf_decode_byte_tq2((w7      ) & 0xFFu);
+            float4 d29 = pf_decode_byte_tq2((w7 >>  8) & 0xFFu);
+            float4 d30 = pf_decode_byte_tq2((w7 >> 16) & 0xFFu);
+            float4 d31 = pf_decode_byte_tq2((w7 >> 24) & 0xFFu);
+
+            const uint inp_base = b * 32u;
+            for (uint cc = 0u; cc < cols; cc++) {
+                const uint col = col_base + cc;
+                device const float4* in4 = (device const float4*)(inputs + col * k);
+                float block_sum = 0.0f;
+                block_sum += dot(d00, in4[inp_base +  0u]);
+                block_sum += dot(d01, in4[inp_base +  1u]);
+                block_sum += dot(d02, in4[inp_base +  2u]);
+                block_sum += dot(d03, in4[inp_base +  3u]);
+                block_sum += dot(d04, in4[inp_base +  4u]);
+                block_sum += dot(d05, in4[inp_base +  5u]);
+                block_sum += dot(d06, in4[inp_base +  6u]);
+                block_sum += dot(d07, in4[inp_base +  7u]);
+                block_sum += dot(d08, in4[inp_base +  8u]);
+                block_sum += dot(d09, in4[inp_base +  9u]);
+                block_sum += dot(d10, in4[inp_base + 10u]);
+                block_sum += dot(d11, in4[inp_base + 11u]);
+                block_sum += dot(d12, in4[inp_base + 12u]);
+                block_sum += dot(d13, in4[inp_base + 13u]);
+                block_sum += dot(d14, in4[inp_base + 14u]);
+                block_sum += dot(d15, in4[inp_base + 15u]);
+                block_sum += dot(d16, in4[inp_base + 16u]);
+                block_sum += dot(d17, in4[inp_base + 17u]);
+                block_sum += dot(d18, in4[inp_base + 18u]);
+                block_sum += dot(d19, in4[inp_base + 19u]);
+                block_sum += dot(d20, in4[inp_base + 20u]);
+                block_sum += dot(d21, in4[inp_base + 21u]);
+                block_sum += dot(d22, in4[inp_base + 22u]);
+                block_sum += dot(d23, in4[inp_base + 23u]);
+                block_sum += dot(d24, in4[inp_base + 24u]);
+                block_sum += dot(d25, in4[inp_base + 25u]);
+                block_sum += dot(d26, in4[inp_base + 26u]);
+                block_sum += dot(d27, in4[inp_base + 27u]);
+                block_sum += dot(d28, in4[inp_base + 28u]);
+                block_sum += dot(d29, in4[inp_base + 29u]);
+                block_sum += dot(d30, in4[inp_base + 30u]);
+                block_sum += dot(d31, in4[inp_base + 31u]);
+                col_sums[cc] += scale * block_sum;
+            }
+        }
+
+        for (uint cc = 0u; cc < cols; cc++) {
+            float row_sum = simd_sum(col_sums[cc]);
+            if (lane == 0u) outputs[(col_base + cc) * n_rows + row] = row_sum;
+        }
+    }
+}
+"#;

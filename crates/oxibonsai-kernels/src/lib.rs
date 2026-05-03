@@ -49,10 +49,11 @@ pub use gpu_backend::{
     build_cached_weights, build_cached_weights_ternary_only, print_gpu_profile_summary,
     try_metal_ffn, try_metal_forward_greedy_ternary, try_metal_full_forward,
     try_metal_full_forward_cached, try_metal_full_forward_prefill,
-    try_metal_full_forward_prefill_verify, try_metal_full_forward_ternary, try_metal_full_layer,
-    try_metal_prefill_ternary, try_metal_prefill_verify_ternary, try_metal_qkv, CachedLayerWeights,
-    CachedModelWeights, FullForwardLayerParams, FullForwardLayerParamsTernary, MetalGraph,
-    MetalGraphError, MetalWeightHandle,
+    try_metal_full_forward_prefill_ternary, try_metal_full_forward_prefill_verify,
+    try_metal_full_forward_prefill_verify_ternary, try_metal_full_forward_ternary,
+    try_metal_full_layer, try_metal_prefill_ternary, try_metal_prefill_verify_ternary,
+    try_metal_qkv, CachedLayerWeights, CachedModelWeights, FullForwardLayerParams,
+    FullForwardLayerParamsTernary, MetalGraph, MetalGraphError, MetalWeightHandle,
 };
 
 #[cfg(all(

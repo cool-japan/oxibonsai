@@ -216,6 +216,10 @@ pub(crate) struct MetalPipelines {
 
     // ── Ternary (TQ2_0_g128) ────────────────────────────────────────
     pub(crate) gemv_tq2_g128_v1: ComputePipelineState,
+    /// Batched ternary GEMM (prefill path).  Mirrors `gemm_q1_g128_v7`'s
+    /// dispatch shape but decodes TQ2_0_g128 weights and supports arbitrary
+    /// batch sizes (Q1's V7 silently caps at 8 columns).
+    pub(crate) gemm_tq2_g128_v7: ComputePipelineState,
 }
 
 impl MetalPipelines {
@@ -255,6 +259,7 @@ impl MetalPipelines {
         let fused_gate_up_swiglu_gemm_q1 =
             pipeline_for(&library, device, "fused_gate_up_swiglu_gemm_q1")?;
         let gemv_tq2_g128_v1 = pipeline_for(&library, device, "gemv_tq2_g128_v1")?;
+        let gemm_tq2_g128_v7 = pipeline_for(&library, device, "gemm_tq2_g128_v7")?;
 
         Ok(Self {
             gemv_q1_g128_v7,
@@ -276,6 +281,7 @@ impl MetalPipelines {
             gemm_q1_g128_v7_residual,
             fused_gate_up_swiglu_gemm_q1,
             gemv_tq2_g128_v1,
+            gemm_tq2_g128_v7,
         })
     }
 }
@@ -343,6 +349,8 @@ fn build_combined_msl() -> String {
     src.push('\n');
     // ── Ternary (TQ2_0_g128) ────────────────────────────────────────────
     src.push_str(kernel_sources::MSL_GEMV_TQ2_G128_V1);
+    src.push('\n');
+    src.push_str(kernel_sources::MSL_GEMM_TQ2_G128_V7);
     src.push('\n');
     src
 }
