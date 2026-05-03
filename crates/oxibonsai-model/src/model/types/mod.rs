@@ -288,23 +288,13 @@ impl<'a> BonsaiModel<'a> {
         if token_ids.len() == 1 {
             return self.forward(token_ids[0], pos_start, kernel);
         }
-        #[cfg_attr(
-            not(any(
-                all(feature = "metal", target_os = "macos"),
-                all(
-                    feature = "native-cuda",
-                    any(target_os = "linux", target_os = "windows")
-                )
-            )),
-            allow(unused_variables)
-        )]
-        let gpu_kernel = kernel.is_gpu_accelerated();
+        let _gpu_kernel = kernel.is_gpu_accelerated();
         #[cfg(all(
             feature = "native-cuda",
             not(all(feature = "metal", target_os = "macos")),
             any(target_os = "linux", target_os = "windows")
         ))]
-        if gpu_kernel && token_ids.len() <= 16 {
+        if _gpu_kernel && token_ids.len() <= 16 {
             let mut last_logits = Vec::new();
             for (i, &token_id) in token_ids.iter().enumerate() {
                 last_logits = self.forward(token_id, pos_start + i, kernel)?;
@@ -312,7 +302,7 @@ impl<'a> BonsaiModel<'a> {
             return Ok(last_logits);
         }
         #[cfg(all(feature = "metal", target_os = "macos"))]
-        if gpu_kernel {
+        if _gpu_kernel {
             match self.try_metal_prefill_with_lm_head(token_ids, pos_start) {
                 Ok(logits) => return Ok(logits),
                 Err(e) => {
@@ -328,7 +318,7 @@ impl<'a> BonsaiModel<'a> {
             not(all(feature = "metal", target_os = "macos")),
             any(target_os = "linux", target_os = "windows")
         ))]
-        if gpu_kernel {
+        if _gpu_kernel {
             match self.try_cuda_prefill_with_lm_head(token_ids, pos_start) {
                 Ok(logits) => return Ok(logits),
                 Err(e) => {
@@ -371,19 +361,9 @@ impl<'a> BonsaiModel<'a> {
         if token_ids.is_empty() {
             return Ok(vec![]);
         }
-        #[cfg_attr(
-            not(any(
-                all(feature = "metal", target_os = "macos"),
-                all(
-                    feature = "native-cuda",
-                    any(target_os = "linux", target_os = "windows")
-                )
-            )),
-            allow(unused_variables)
-        )]
-        let gpu_kernel = kernel.is_gpu_accelerated();
+        let _gpu_kernel = kernel.is_gpu_accelerated();
         #[cfg(all(feature = "metal", target_os = "macos"))]
-        if gpu_kernel {
+        if _gpu_kernel {
             match self.try_metal_prefill_verify(token_ids, pos_start) {
                 Ok(ids) => return Ok(ids),
                 Err(e) => {
@@ -399,7 +379,7 @@ impl<'a> BonsaiModel<'a> {
             not(all(feature = "metal", target_os = "macos")),
             any(target_os = "linux", target_os = "windows")
         ))]
-        if gpu_kernel {
+        if _gpu_kernel {
             match self.try_cuda_prefill_verify(token_ids, pos_start) {
                 Ok(ids) => return Ok(ids),
                 Err(e) => {
@@ -457,19 +437,9 @@ impl<'a> BonsaiModel<'a> {
         }
         let mut hidden = self.token_embd[embd_start..embd_end].to_vec();
         let t_blocks_start = std::time::Instant::now();
-        #[cfg_attr(
-            not(any(
-                all(feature = "metal", target_os = "macos"),
-                all(
-                    feature = "native-cuda",
-                    any(target_os = "linux", target_os = "windows")
-                )
-            )),
-            allow(unused_variables)
-        )]
-        let gpu_kernel = kernel.is_gpu_accelerated();
+        let _gpu_kernel = kernel.is_gpu_accelerated();
         #[cfg(all(feature = "metal", target_os = "macos"))]
-        if gpu_kernel {
+        if _gpu_kernel {
             let mut fused_logits = vec![0.0f32; vocab];
             if self
                 .try_metal_full_forward_with_lm_head(&mut hidden, pos, &mut fused_logits)
@@ -489,13 +459,13 @@ impl<'a> BonsaiModel<'a> {
             not(all(feature = "metal", target_os = "macos")),
             any(target_os = "linux", target_os = "windows")
         ))]
-        if gpu_kernel {
+        if _gpu_kernel {
             if let Ok(fused_logits) = self.try_cuda_full_forward_with_lm_head(&hidden, pos) {
                 return Ok(fused_logits);
             }
         }
         #[cfg(all(feature = "metal", target_os = "macos"))]
-        let did_full_forward = if gpu_kernel {
+        let did_full_forward = if _gpu_kernel {
             let q1_ok = self.try_metal_full_forward_inner(&mut hidden, pos).is_ok();
             if q1_ok {
                 true
@@ -511,7 +481,7 @@ impl<'a> BonsaiModel<'a> {
             not(all(feature = "metal", target_os = "macos")),
             any(target_os = "linux", target_os = "windows")
         ))]
-        let did_full_forward = if gpu_kernel {
+        let did_full_forward = if _gpu_kernel {
             match self.try_cuda_full_forward_inner(&hidden, pos) {
                 Ok(new_hidden) => {
                     hidden = new_hidden;

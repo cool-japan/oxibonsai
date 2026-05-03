@@ -405,8 +405,12 @@ impl<'a> BonsaiModel<'a> {
     /// ternary path delegates to a separate helper that builds
     /// `FullForwardLayerParamsTernary` and dispatches the new TQ2 batched
     /// GEMM kernel across all layers.
+    ///
+    /// Marked `pub` so parity tests can invoke this **strict** path
+    /// directly, bypassing the silent fallback in [`Self::forward_prefill`]
+    /// that masks GPU dispatch failures.
     #[cfg(all(feature = "metal", target_os = "macos"))]
-    pub(super) fn try_metal_prefill_with_lm_head(
+    pub fn try_metal_prefill_with_lm_head(
         &self,
         token_ids: &[u32],
         pos_start: usize,
@@ -572,8 +576,12 @@ impl<'a> BonsaiModel<'a> {
     /// ternary path delegates to
     /// [`Self::try_metal_prefill_verify_ternary_path`] which dispatches the
     /// new TQ2 batched GEMM kernel and per-position TQ2 LM-head GEMV.
+    ///
+    /// Marked `pub` so parity tests can invoke this **strict** path
+    /// directly, bypassing the silent fallback in
+    /// [`Self::forward_prefill_verify`] that masks GPU dispatch failures.
     #[cfg(all(feature = "metal", target_os = "macos"))]
-    pub(super) fn try_metal_prefill_verify(
+    pub fn try_metal_prefill_verify(
         &self,
         token_ids: &[u32],
         pos_start: usize,

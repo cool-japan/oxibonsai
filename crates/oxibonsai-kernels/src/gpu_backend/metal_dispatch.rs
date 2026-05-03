@@ -270,8 +270,7 @@ impl MetalGraph {
     /// Column-major layout: `inputs[col * k + elem]`, `outputs[col * n_rows + row]`.
     /// 1D grid: `[ceil(n_rows/8), 1, 1]` threadgroups — batch columns processed
     /// inside the kernel via 8-column outer chunks (handles arbitrary
-    /// `batch_size` correctly, unlike `dispatch_gemm_q1_v7` whose kernel
-    /// silently caps at 8 columns).
+    /// `batch_size` correctly).
     ///
     /// Buffer layout matches `dispatch_gemv_tq2`'s SoA conventions:
     /// `[N×2B FP16 scales][N×32B 2-bit qs]`.

@@ -56,7 +56,8 @@ static __device__ __forceinline__ float silu(float x) {
    Kernel 1 — gemm_q1_g128_v7
    Batch Q1_0_G128 GEMM.
 
-   Each warp processes 1 weight row × up to batch_size batch columns.
+   Each warp processes 1 weight row × all batch_size batch columns
+   (in 8-column outer chunks to handle any batch_size).
    Weights are loaded once per block iteration (L1 cache retains them
    across columns), following the Metal MSL gemm_q1_g128_v7 pattern.
 
@@ -83,8 +84,7 @@ extern "C" __global__ void gemm_q1_g128_v7(
     const unsigned int row     = blockIdx.x * 8u + warp_id;
     if (row >= n_rows) return;
 
-    const unsigned int n_blocks   = k >> 7u;   /* k / 128 */
-    const unsigned int cols       = batch_size < 8u ? batch_size : 8u;
+    const unsigned int n_blocks = k >> 7u;   /* k / 128 */
 
     /* SoA weight pointers */
     const unsigned short* __restrict__ scales =
@@ -92,46 +92,50 @@ extern "C" __global__ void gemm_q1_g128_v7(
     const unsigned int* __restrict__ data =
         (const unsigned int* __restrict__)(blocks + (unsigned long long)n_rows * n_blocks * 2u);
 
-    /* Accumulator array: one partial sum per batch column */
-    float col_sums[8];
-    #pragma unroll
-    for (unsigned int c = 0u; c < 8u; ++c) col_sums[c] = 0.0f;
+    /* Process batch columns in 8-column outer chunks so any batch_size is handled correctly.
+       This mirrors the MSL gemm_q1_g128_v7 fix (prefill.rs lines 59-86). */
+    for (unsigned int col_base = 0u; col_base < batch_size; col_base += 8u) {
+        const unsigned int cols_remaining = batch_size - col_base;
+        const unsigned int cols = cols_remaining < 8u ? cols_remaining : 8u;
 
-    for (unsigned int b = lane; b < n_blocks; b += 32u) {
-        const unsigned int  g     = row * n_blocks + b;
-        const float         scale = fast_fp16_to_float(scales[g]);
-        const unsigned int* bp    = data + (unsigned long long)g * 4u;
-        const unsigned int  w0 = bp[0u], w1 = bp[1u], w2 = bp[2u], w3 = bp[3u];
-        const unsigned int  base  = b * 128u;
+        float col_sums[8];
+        #pragma unroll
+        for (unsigned int c = 0u; c < 8u; ++c) col_sums[c] = 0.0f;
 
-        /* Process all batch columns for this (row, block) pair.
-           inner-loop unrolled over bits, outer loop over columns. */
-        for (unsigned int col = 0u; col < cols; ++col) {
-            const float* inp = inputs + (unsigned long long)col * k;
-            float block_sum = 0.0f;
+        for (unsigned int b = lane; b < n_blocks; b += 32u) {
+            const unsigned int  g     = row * n_blocks + b;
+            const float         scale = fast_fp16_to_float(scales[g]);
+            const unsigned int* bp    = data + (unsigned long long)g * 4u;
+            const unsigned int  w0 = bp[0u], w1 = bp[1u], w2 = bp[2u], w3 = bp[3u];
+            const unsigned int  base  = b * 128u;
 
-            #pragma unroll
-            for (unsigned int bit = 0u; bit < 32u; ++bit) {
-                block_sum +=
-                    (((w0 >> bit) & 1u) ? 1.0f : -1.0f) * inp[base        + bit]
-                  + (((w1 >> bit) & 1u) ? 1.0f : -1.0f) * inp[base + 32u  + bit]
-                  + (((w2 >> bit) & 1u) ? 1.0f : -1.0f) * inp[base + 64u  + bit]
-                  + (((w3 >> bit) & 1u) ? 1.0f : -1.0f) * inp[base + 96u  + bit];
+            for (unsigned int col = 0u; col < cols; ++col) {
+                const float* inp = inputs + (unsigned long long)(col_base + col) * k;
+                float block_sum = 0.0f;
+
+                #pragma unroll
+                for (unsigned int bit = 0u; bit < 32u; ++bit) {
+                    block_sum +=
+                        (((w0 >> bit) & 1u) ? 1.0f : -1.0f) * inp[base        + bit]
+                      + (((w1 >> bit) & 1u) ? 1.0f : -1.0f) * inp[base + 32u  + bit]
+                      + (((w2 >> bit) & 1u) ? 1.0f : -1.0f) * inp[base + 64u  + bit]
+                      + (((w3 >> bit) & 1u) ? 1.0f : -1.0f) * inp[base + 96u  + bit];
+                }
+                col_sums[col] += scale * block_sum;
             }
-            col_sums[col] += scale * block_sum;
         }
-    }
 
-    /* Warp-shuffle reduction and write outputs (column-major) */
-    for (unsigned int col = 0u; col < cols; ++col) {
-        float s = col_sums[col];
-        s += __shfl_down_sync(0xffffffffu, s, 16u);
-        s += __shfl_down_sync(0xffffffffu, s,  8u);
-        s += __shfl_down_sync(0xffffffffu, s,  4u);
-        s += __shfl_down_sync(0xffffffffu, s,  2u);
-        s += __shfl_down_sync(0xffffffffu, s,  1u);
+        /* Warp-shuffle reduction and write outputs (column-major) */
+        for (unsigned int col = 0u; col < cols; ++col) {
+            float s = col_sums[col];
+            s += __shfl_down_sync(0xffffffffu, s, 16u);
+            s += __shfl_down_sync(0xffffffffu, s,  8u);
+            s += __shfl_down_sync(0xffffffffu, s,  4u);
+            s += __shfl_down_sync(0xffffffffu, s,  2u);
+            s += __shfl_down_sync(0xffffffffu, s,  1u);
 
-        if (lane == 0u) outputs[(unsigned long long)col * n_rows + row] += s;
+            if (lane == 0u) outputs[(unsigned long long)(col_base + col) * n_rows + row] += s;
+        }
     }
 }
 
@@ -158,51 +162,55 @@ extern "C" __global__ void gemm_q1_g128_v7_residual(
     if (row >= n_rows) return;
 
     const unsigned int n_blocks = k >> 7u;
-    const unsigned int cols     = batch_size < 8u ? batch_size : 8u;
 
     const unsigned short* __restrict__ scales =
         (const unsigned short* __restrict__)blocks;
     const unsigned int* __restrict__ data =
         (const unsigned int* __restrict__)(blocks + (unsigned long long)n_rows * n_blocks * 2u);
 
-    float col_sums[8];
-    #pragma unroll
-    for (unsigned int c = 0u; c < 8u; ++c) col_sums[c] = 0.0f;
+    for (unsigned int col_base = 0u; col_base < batch_size; col_base += 8u) {
+        const unsigned int cols_remaining = batch_size - col_base;
+        const unsigned int cols = cols_remaining < 8u ? cols_remaining : 8u;
 
-    for (unsigned int b = lane; b < n_blocks; b += 32u) {
-        const unsigned int  g     = row * n_blocks + b;
-        const float         scale = fast_fp16_to_float(scales[g]);
-        const unsigned int* bp    = data + (unsigned long long)g * 4u;
-        const unsigned int  w0 = bp[0u], w1 = bp[1u], w2 = bp[2u], w3 = bp[3u];
-        const unsigned int  base  = b * 128u;
+        float col_sums[8];
+        #pragma unroll
+        for (unsigned int c = 0u; c < 8u; ++c) col_sums[c] = 0.0f;
+
+        for (unsigned int b = lane; b < n_blocks; b += 32u) {
+            const unsigned int  g     = row * n_blocks + b;
+            const float         scale = fast_fp16_to_float(scales[g]);
+            const unsigned int* bp    = data + (unsigned long long)g * 4u;
+            const unsigned int  w0 = bp[0u], w1 = bp[1u], w2 = bp[2u], w3 = bp[3u];
+            const unsigned int  base  = b * 128u;
+
+            for (unsigned int col = 0u; col < cols; ++col) {
+                const float* inp = inputs + (unsigned long long)(col_base + col) * k;
+                float block_sum = 0.0f;
+
+                #pragma unroll
+                for (unsigned int bit = 0u; bit < 32u; ++bit) {
+                    block_sum +=
+                        (((w0 >> bit) & 1u) ? 1.0f : -1.0f) * inp[base        + bit]
+                      + (((w1 >> bit) & 1u) ? 1.0f : -1.0f) * inp[base + 32u  + bit]
+                      + (((w2 >> bit) & 1u) ? 1.0f : -1.0f) * inp[base + 64u  + bit]
+                      + (((w3 >> bit) & 1u) ? 1.0f : -1.0f) * inp[base + 96u  + bit];
+                }
+                col_sums[col] += scale * block_sum;
+            }
+        }
 
         for (unsigned int col = 0u; col < cols; ++col) {
-            const float* inp = inputs + (unsigned long long)col * k;
-            float block_sum = 0.0f;
+            float s = col_sums[col];
+            s += __shfl_down_sync(0xffffffffu, s, 16u);
+            s += __shfl_down_sync(0xffffffffu, s,  8u);
+            s += __shfl_down_sync(0xffffffffu, s,  4u);
+            s += __shfl_down_sync(0xffffffffu, s,  2u);
+            s += __shfl_down_sync(0xffffffffu, s,  1u);
 
-            #pragma unroll
-            for (unsigned int bit = 0u; bit < 32u; ++bit) {
-                block_sum +=
-                    (((w0 >> bit) & 1u) ? 1.0f : -1.0f) * inp[base        + bit]
-                  + (((w1 >> bit) & 1u) ? 1.0f : -1.0f) * inp[base + 32u  + bit]
-                  + (((w2 >> bit) & 1u) ? 1.0f : -1.0f) * inp[base + 64u  + bit]
-                  + (((w3 >> bit) & 1u) ? 1.0f : -1.0f) * inp[base + 96u  + bit];
+            if (lane == 0u) {
+                const unsigned long long idx = (unsigned long long)(col_base + col) * n_rows + row;
+                outputs[idx] = residual[idx] + s;
             }
-            col_sums[col] += scale * block_sum;
-        }
-    }
-
-    for (unsigned int col = 0u; col < cols; ++col) {
-        float s = col_sums[col];
-        s += __shfl_down_sync(0xffffffffu, s, 16u);
-        s += __shfl_down_sync(0xffffffffu, s,  8u);
-        s += __shfl_down_sync(0xffffffffu, s,  4u);
-        s += __shfl_down_sync(0xffffffffu, s,  2u);
-        s += __shfl_down_sync(0xffffffffu, s,  1u);
-
-        if (lane == 0u) {
-            const unsigned long long idx = (unsigned long long)col * n_rows + row;
-            outputs[idx] = residual[idx] + s;
         }
     }
 }
@@ -238,76 +246,80 @@ extern "C" __global__ void fused_gate_up_swiglu_gemm_q1(
 
     const unsigned int total_rows = 2u * n_rows;
     const unsigned int n_blocks   = k >> 7u;
-    const unsigned int cols       = batch_size < 8u ? batch_size : 8u;
 
     const unsigned short* __restrict__ scales =
         (const unsigned short* __restrict__)blocks;
     const unsigned int* __restrict__ data =
         (const unsigned int* __restrict__)(blocks + (unsigned long long)total_rows * n_blocks * 2u);
 
-    float gate_sums[8];
-    float up_sums[8];
-    #pragma unroll
-    for (unsigned int c = 0u; c < 8u; ++c) { gate_sums[c] = 0.0f; up_sums[c] = 0.0f; }
+    for (unsigned int col_base = 0u; col_base < batch_size; col_base += 8u) {
+        const unsigned int cols_remaining = batch_size - col_base;
+        const unsigned int cols = cols_remaining < 8u ? cols_remaining : 8u;
 
-    for (unsigned int b = lane; b < n_blocks; b += 32u) {
-        /* ── Gate block (row r) ─────────────────────────────────────────── */
-        const unsigned int  g_gate  = row * n_blocks + b;
-        const float         sg      = fast_fp16_to_float(scales[g_gate]);
-        const unsigned int* bp_g    = data + (unsigned long long)g_gate * 4u;
-        const unsigned int  wg0 = bp_g[0u], wg1 = bp_g[1u], wg2 = bp_g[2u], wg3 = bp_g[3u];
+        float gate_sums[8];
+        float up_sums[8];
+        #pragma unroll
+        for (unsigned int c = 0u; c < 8u; ++c) { gate_sums[c] = 0.0f; up_sums[c] = 0.0f; }
 
-        /* ── Up block (row r + n_rows) ──────────────────────────────────── */
-        const unsigned int  g_up    = (row + n_rows) * n_blocks + b;
-        const float         su      = fast_fp16_to_float(scales[g_up]);
-        const unsigned int* bp_u    = data + (unsigned long long)g_up * 4u;
-        const unsigned int  wu0 = bp_u[0u], wu1 = bp_u[1u], wu2 = bp_u[2u], wu3 = bp_u[3u];
+        for (unsigned int b = lane; b < n_blocks; b += 32u) {
+            /* ── Gate block (row r) ─────────────────────────────────────────── */
+            const unsigned int  g_gate  = row * n_blocks + b;
+            const float         sg      = fast_fp16_to_float(scales[g_gate]);
+            const unsigned int* bp_g    = data + (unsigned long long)g_gate * 4u;
+            const unsigned int  wg0 = bp_g[0u], wg1 = bp_g[1u], wg2 = bp_g[2u], wg3 = bp_g[3u];
 
-        const unsigned int base = b * 128u;
+            /* ── Up block (row r + n_rows) ──────────────────────────────────── */
+            const unsigned int  g_up    = (row + n_rows) * n_blocks + b;
+            const float         su      = fast_fp16_to_float(scales[g_up]);
+            const unsigned int* bp_u    = data + (unsigned long long)g_up * 4u;
+            const unsigned int  wu0 = bp_u[0u], wu1 = bp_u[1u], wu2 = bp_u[2u], wu3 = bp_u[3u];
+
+            const unsigned int base = b * 128u;
+
+            for (unsigned int col = 0u; col < cols; ++col) {
+                const float* inp = inputs + (unsigned long long)(col_base + col) * k;
+                float gate_sum = 0.0f;
+                float up_sum   = 0.0f;
+
+                #pragma unroll
+                for (unsigned int bit = 0u; bit < 32u; ++bit) {
+                    const float i0 = inp[base        + bit];
+                    const float i1 = inp[base + 32u  + bit];
+                    const float i2 = inp[base + 64u  + bit];
+                    const float i3 = inp[base + 96u  + bit];
+                    gate_sum += (((wg0 >> bit) & 1u) ? 1.0f : -1.0f) * i0
+                              + (((wg1 >> bit) & 1u) ? 1.0f : -1.0f) * i1
+                              + (((wg2 >> bit) & 1u) ? 1.0f : -1.0f) * i2
+                              + (((wg3 >> bit) & 1u) ? 1.0f : -1.0f) * i3;
+                    up_sum   += (((wu0 >> bit) & 1u) ? 1.0f : -1.0f) * i0
+                              + (((wu1 >> bit) & 1u) ? 1.0f : -1.0f) * i1
+                              + (((wu2 >> bit) & 1u) ? 1.0f : -1.0f) * i2
+                              + (((wu3 >> bit) & 1u) ? 1.0f : -1.0f) * i3;
+                }
+                gate_sums[col] += sg * gate_sum;
+                up_sums[col]   += su * up_sum;
+            }
+        }
 
         for (unsigned int col = 0u; col < cols; ++col) {
-            const float* inp = inputs + (unsigned long long)col * k;
-            float gate_sum = 0.0f;
-            float up_sum   = 0.0f;
+            float gs = gate_sums[col];
+            float us = up_sums[col];
 
-            #pragma unroll
-            for (unsigned int bit = 0u; bit < 32u; ++bit) {
-                const float i0 = inp[base        + bit];
-                const float i1 = inp[base + 32u  + bit];
-                const float i2 = inp[base + 64u  + bit];
-                const float i3 = inp[base + 96u  + bit];
-                gate_sum += (((wg0 >> bit) & 1u) ? 1.0f : -1.0f) * i0
-                          + (((wg1 >> bit) & 1u) ? 1.0f : -1.0f) * i1
-                          + (((wg2 >> bit) & 1u) ? 1.0f : -1.0f) * i2
-                          + (((wg3 >> bit) & 1u) ? 1.0f : -1.0f) * i3;
-                up_sum   += (((wu0 >> bit) & 1u) ? 1.0f : -1.0f) * i0
-                          + (((wu1 >> bit) & 1u) ? 1.0f : -1.0f) * i1
-                          + (((wu2 >> bit) & 1u) ? 1.0f : -1.0f) * i2
-                          + (((wu3 >> bit) & 1u) ? 1.0f : -1.0f) * i3;
+            gs += __shfl_down_sync(0xffffffffu, gs, 16u);
+            gs += __shfl_down_sync(0xffffffffu, gs,  8u);
+            gs += __shfl_down_sync(0xffffffffu, gs,  4u);
+            gs += __shfl_down_sync(0xffffffffu, gs,  2u);
+            gs += __shfl_down_sync(0xffffffffu, gs,  1u);
+
+            us += __shfl_down_sync(0xffffffffu, us, 16u);
+            us += __shfl_down_sync(0xffffffffu, us,  8u);
+            us += __shfl_down_sync(0xffffffffu, us,  4u);
+            us += __shfl_down_sync(0xffffffffu, us,  2u);
+            us += __shfl_down_sync(0xffffffffu, us,  1u);
+
+            if (lane == 0u) {
+                outputs[(unsigned long long)(col_base + col) * n_rows + row] = silu(gs) * us;
             }
-            gate_sums[col] += sg * gate_sum;
-            up_sums[col]   += su * up_sum;
-        }
-    }
-
-    for (unsigned int col = 0u; col < cols; ++col) {
-        float gs = gate_sums[col];
-        float us = up_sums[col];
-
-        gs += __shfl_down_sync(0xffffffffu, gs, 16u);
-        gs += __shfl_down_sync(0xffffffffu, gs,  8u);
-        gs += __shfl_down_sync(0xffffffffu, gs,  4u);
-        gs += __shfl_down_sync(0xffffffffu, gs,  2u);
-        gs += __shfl_down_sync(0xffffffffu, gs,  1u);
-
-        us += __shfl_down_sync(0xffffffffu, us, 16u);
-        us += __shfl_down_sync(0xffffffffu, us,  8u);
-        us += __shfl_down_sync(0xffffffffu, us,  4u);
-        us += __shfl_down_sync(0xffffffffu, us,  2u);
-        us += __shfl_down_sync(0xffffffffu, us,  1u);
-
-        if (lane == 0u) {
-            outputs[(unsigned long long)col * n_rows + row] = silu(gs) * us;
         }
     }
 }
