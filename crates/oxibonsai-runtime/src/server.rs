@@ -352,12 +352,23 @@ async fn chat_completions_stream(
     // Convert token receiver into a stream of SSE events
     let token_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(token_rx);
 
-    let content_stream = token_stream.map(move |token_id| {
-        let text = if let Some(tok) = &state_for_stream.tokenizer {
-            tok.decode(&[token_id])
-                .unwrap_or_else(|_| format!("[{token_id}]"))
-        } else {
-            format!("[{token_id}]")
+    // Per-request streaming-decode state.  BPE tokens may straddle UTF-8
+    // codepoint boundaries (CJK, emoji), so we buffer through HF's
+    // step_decode_stream and only emit a chunk when a complete UTF-8 piece is
+    // ready.  Mid-codepoint tokens yield `Ok(None)` and are filtered out.
+    let mut stream_state = state_for_stream
+        .tokenizer
+        .as_ref()
+        .map(|t| t.new_decode_stream(true));
+
+    let content_stream = token_stream.filter_map(move |token_id| {
+        let text = match (&state_for_stream.tokenizer, stream_state.as_mut()) {
+            (Some(tok), Some(state)) => match tok.step_decode(state, token_id) {
+                Ok(Some(txt)) => txt,
+                Ok(None) => return None,
+                Err(_) => format!("[{token_id}]"),
+            },
+            _ => format!("[{token_id}]"),
         };
 
         let chunk = ChatCompletionChunk {
@@ -375,7 +386,7 @@ async fn chat_completions_stream(
             }],
         };
 
-        serde_json::to_string(&chunk).unwrap_or_default()
+        Some(serde_json::to_string(&chunk).unwrap_or_default())
     });
 
     // Build finish chunk

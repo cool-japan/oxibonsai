@@ -978,7 +978,7 @@ mod tests {
         let mut blocks = Vec::new();
         for row in 0..n_rows {
             for bi in 0..blocks_per_row {
-                let bits = [(row as u8 * 37 + bi as u8 * 13) & 0xFF; 16];
+                let bits = [row as u8 * 37 + bi as u8 * 13; 16];
                 blocks.push(make_block(0.5 + row as f32 * 0.1, bits));
             }
         }
@@ -1126,11 +1126,10 @@ mod tests {
                 .expect("avx2 ternary all-negative gemv should succeed");
         }
 
-        for i in 0..2 {
+        for (i, &val) in output.iter().enumerate() {
             assert!(
-                (output[i] + 128.0).abs() < 1e-4,
-                "row {i}: expected -128.0, got {}",
-                output[i]
+                (val + 128.0).abs() < 1e-4,
+                "row {i}: expected -128.0, got {val}",
             );
         }
     }

@@ -1,6 +1,6 @@
 # oxibonsai-rag
 
-[![Version](https://img.shields.io/badge/version-0.1.2-blue)](https://crates.io/crates/oxibonsai-rag)
+[![Version](https://img.shields.io/badge/version-0.1.3-blue)](https://crates.io/crates/oxibonsai-rag)
 [![Status](https://img.shields.io/badge/status-stable-brightgreen)](https://github.com/cool-japan/oxibonsai)
 [![Tests](https://img.shields.io/badge/tests-206_passing-brightgreen)](https://github.com/cool-japan/oxibonsai)
 
@@ -15,7 +15,7 @@ Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 
 ## Status
 
-**Stable** — version 0.1.2, 206 tests passing (`cargo nextest run -p oxibonsai-rag`). Uplifted from Alpha in 0.1.2.
+**Stable** — version 0.1.3, 206 tests passing (`cargo nextest run -p oxibonsai-rag`). Uplifted from Alpha in 0.1.2.
 
 ## Features
 
@@ -34,7 +34,7 @@ Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 
 ```toml
 [dependencies]
-oxibonsai-rag = "0.1.2"
+oxibonsai-rag = "0.1.3"
 ```
 
 ```rust

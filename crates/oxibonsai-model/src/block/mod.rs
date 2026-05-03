@@ -12,6 +12,12 @@ pub mod types;
     )
 ))]
 pub(crate) use functions::blocks_as_bytes;
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(any(
+    all(feature = "metal", target_os = "macos"),
+    all(
+        feature = "native-cuda",
+        any(target_os = "linux", target_os = "windows")
+    )
+))]
 pub(crate) use functions::blocks_as_bytes_ternary;
 pub use types::*;

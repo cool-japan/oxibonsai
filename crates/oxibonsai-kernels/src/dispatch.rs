@@ -129,16 +129,59 @@ impl KernelDispatcher {
     }
 
     /// Select best tier based on detected capabilities.
+    ///
+    /// On x86_64, validates scirs2_core detection against Rust's built-in
+    /// `is_x86_feature_detected!` macros to ensure correct tier selection.
+    /// This prevents issues where scirs2_core might incorrectly detect
+    /// CPU features on certain platforms (e.g., Windows AMD CPUs).
     fn select_tier(caps: &scirs2_core::simd::detect::CpuFeatures) -> KernelTier {
         #[cfg(target_arch = "x86_64")]
         {
-            // AVX-512 has higher priority than AVX2
-            if caps.has_avx512f {
+            // Use Rust's built-in feature detection as the source of truth.
+            // scirs2_core detection may be unreliable on some platforms.
+            let has_avx512f = is_x86_feature_detected!("avx512f");
+            let has_avx512bw = is_x86_feature_detected!("avx512bw");
+            let has_avx512vl = is_x86_feature_detected!("avx512vl");
+            let has_avx2 = is_x86_feature_detected!("avx2");
+            let has_fma = is_x86_feature_detected!("fma");
+
+            // Log if there's a mismatch between scirs2_core and std detection
+            if caps.has_avx512f != has_avx512f {
+                tracing::warn!(
+                    scirs2_avx512f = caps.has_avx512f,
+                    std_avx512f = has_avx512f,
+                    "CPU feature detection mismatch for AVX-512F, using std detection"
+                );
+            }
+            if caps.has_avx2 != has_avx2 || caps.has_fma != has_fma {
+                tracing::warn!(
+                    scirs2_avx2 = caps.has_avx2,
+                    scirs2_fma = caps.has_fma,
+                    std_avx2 = has_avx2,
+                    std_fma = has_fma,
+                    "CPU feature detection mismatch for AVX2/FMA, using std detection"
+                );
+            }
+
+            // AVX-512 requires all three: avx512f, avx512bw, and avx512vl
+            if has_avx512f && has_avx512bw && has_avx512vl {
+                tracing::debug!("AVX-512 (F+BW+VL) detected, selecting AVX-512 tier");
                 return KernelTier::Avx512;
             }
-            if caps.has_avx2 && caps.has_fma {
+            if has_avx2 && has_fma {
+                tracing::debug!("AVX2 + FMA detected, selecting AVX2 tier");
                 return KernelTier::Avx2;
             }
+
+            // Log fallback to reference tier
+            tracing::warn!(
+                has_avx512f,
+                has_avx512bw,
+                has_avx512vl,
+                has_avx2,
+                has_fma,
+                "No SIMD acceleration available, falling back to reference tier (this will be slow)"
+            );
         }
 
         #[cfg(target_arch = "aarch64")]
@@ -163,10 +206,36 @@ const GPU_MIN_ROWS: usize = 1024;
 
 impl KernelDispatcher {
     /// Return the best CPU-only tier for use as GPU fallback.
+    ///
+    /// Uses Rust's built-in `is_x86_feature_detected!` macros directly
+    /// for reliable detection, bypassing scirs2_core which may have issues
+    /// on certain platforms.
     #[cfg(feature = "gpu")]
     fn cpu_tier() -> KernelTier {
-        let caps = scirs2_core::simd::detect::get_cpu_features();
-        Self::select_tier(caps)
+        #[cfg(target_arch = "x86_64")]
+        {
+            let has_avx512f = is_x86_feature_detected!("avx512f");
+            let has_avx512bw = is_x86_feature_detected!("avx512bw");
+            let has_avx512vl = is_x86_feature_detected!("avx512vl");
+            let has_avx2 = is_x86_feature_detected!("avx2");
+            let has_fma = is_x86_feature_detected!("fma");
+
+            if has_avx512f && has_avx512bw && has_avx512vl {
+                return KernelTier::Avx512;
+            }
+            if has_avx2 && has_fma {
+                return KernelTier::Avx2;
+            }
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            // NEON is always available on AArch64
+            return KernelTier::Neon;
+        }
+
+        #[allow(unreachable_code)]
+        KernelTier::Reference
     }
 
     /// Dispatch a `dequant` call using the best *CPU* tier.
@@ -477,6 +546,14 @@ impl OneBitKernel for KernelDispatcher {
         }
     }
 
+    fn is_gpu_accelerated(&self) -> bool {
+        #[cfg(feature = "gpu")]
+        let answer = self.tier == KernelTier::Gpu;
+        #[cfg(not(feature = "gpu"))]
+        let answer = false;
+        answer
+    }
+
     fn upload_weights(&self, blocks: &[BlockQ1_0G128]) -> Option<GpuWeightHandle> {
         #[cfg(feature = "gpu")]
         {
@@ -758,6 +835,43 @@ mod tests {
         // On x86-64 with AVX2, it should pick Avx2; otherwise Reference
         let _tier = dispatcher.tier();
         let _name = dispatcher.name();
+    }
+
+    /// Verify that CPU feature detection uses std's is_x86_feature_detected!
+    /// and not scirs2_core, which may have issues on some platforms.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn cpu_feature_detection_uses_std() {
+        // This test verifies the fix for GitHub issue #4:
+        // Token generation hangs at 100% CPU on Windows AMD CPUs.
+        //
+        // The issue was that scirs2_core might incorrectly detect CPU features,
+        // causing the wrong kernel tier to be selected.
+
+        let has_avx2 = is_x86_feature_detected!("avx2");
+        let has_fma = is_x86_feature_detected!("fma");
+
+        let dispatcher = KernelDispatcher::auto_detect();
+        let tier = dispatcher.tier();
+
+        // If std detects AVX2+FMA, tier should be at least Avx2 (or GPU if available).
+        // The original bug (#4) was the dispatcher falling back to Reference on
+        // AVX2+FMA hardware; GPU is acceptable since it's strictly faster than AVX2
+        // for the workloads where dispatch matters.
+        if has_avx2 && has_fma {
+            #[cfg(feature = "gpu")]
+            let acceptable = matches!(
+                tier,
+                KernelTier::Avx2 | KernelTier::Avx512 | KernelTier::Gpu
+            );
+            #[cfg(not(feature = "gpu"))]
+            let acceptable = matches!(tier, KernelTier::Avx2 | KernelTier::Avx512);
+            assert!(
+                acceptable,
+                "Expected AVX2/AVX-512/GPU tier when AVX2+FMA detected, got {:?}",
+                tier
+            );
+        }
     }
 
     #[test]

@@ -1268,95 +1268,6 @@ impl MetalGraph {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Public convenience entry point for block.rs
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Attempt to run the FFN phase via direct Metal dispatch.
-///
-/// This is the main entry point for `block.rs`. It:
-/// 1. Gets the global `MetalGraph` singleton
-/// 2. Uploads/caches weights lazily (first call per layer uploads, subsequent calls reuse)
-/// 3. Encodes the full 7-op FFN pipeline in one command buffer
-///
-/// Returns `Ok(())` if the Metal dispatch succeeded.
-/// Returns `Err(...)` if Metal is not available or dispatch failed.
-#[allow(clippy::too_many_arguments)]
-pub fn try_metal_ffn(
-    hidden: &mut [f32],
-    attn_out: &[f32],
-    norm_weight: &[f32],
-    eps: f32,
-    attn_proj_handle_id: u64,
-    attn_proj_bytes: &[u8],
-    gate_up_handle_id: u64,
-    gate_bytes: &[u8],
-    up_bytes: &[u8],
-    down_handle_id: u64,
-    down_bytes: &[u8],
-    hidden_size: usize,
-    intermediate_size: usize,
-) -> Result<(), MetalGraphError> {
-    let graph = MetalGraph::global()?;
-
-    // Get or upload attn_proj weight (SoA layout for GPU coalescing)
-    let attn_proj_w = graph.get_or_upload_q1_weight_soa(attn_proj_handle_id, attn_proj_bytes)?;
-
-    // Get or upload fused gate+up weight (concatenate gate+up on first use, SoA layout)
-    let gate_up_w = graph.get_or_upload_q1_weight_soa_lazy(gate_up_handle_id, || {
-        let mut fused = Vec::with_capacity(gate_bytes.len() + up_bytes.len());
-        fused.extend_from_slice(gate_bytes);
-        fused.extend_from_slice(up_bytes);
-        fused
-    })?;
-
-    // Get or upload down weight (SoA layout for GPU coalescing)
-    let down_w = graph.get_or_upload_q1_weight_soa(down_handle_id, down_bytes)?;
-
-    graph.encode_ffn_phase(
-        hidden,
-        attn_out,
-        norm_weight,
-        &attn_proj_w,
-        &gate_up_w,
-        &down_w,
-        hidden_size,
-        intermediate_size,
-        eps,
-    )
-}
-
-/// Attempt to run a fused QKV projection via direct Metal dispatch.
-///
-/// This is the main entry point for `block.rs` QKV acceleration. It:
-/// 1. Gets the global `MetalGraph` singleton
-/// 2. Uploads/caches the fused Q+K+V weight lazily (first call concatenates and uploads)
-/// 3. Encodes a single GEMV dispatch in one command buffer
-///
-/// Returns `Ok(())` if the Metal dispatch succeeded.
-/// Returns `Err(...)` if Metal is not available or dispatch failed.
-#[allow(clippy::too_many_arguments)]
-pub fn try_metal_qkv(
-    input: &[f32],
-    output: &mut [f32],
-    weight_handle_id: u64,
-    q_bytes: &[u8],
-    k_bytes: &[u8],
-    v_bytes: &[u8],
-    n_rows: usize,
-    k: usize,
-) -> Result<(), MetalGraphError> {
-    let graph = MetalGraph::global()?;
-    let weight = graph.get_or_upload_q1_weight_soa_lazy(weight_handle_id, || {
-        let mut fused = Vec::with_capacity(q_bytes.len() + k_bytes.len() + v_bytes.len());
-        fused.extend_from_slice(q_bytes);
-        fused.extend_from_slice(k_bytes);
-        fused.extend_from_slice(v_bytes);
-        fused
-    })?;
-    graph.encode_qkv_phase(input, output, &weight, n_rows, k)
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1885,5 +1796,145 @@ mod tests {
                 (a - b).abs()
             );
         }
+    }
+
+    /// Correctness test: `encode_tail_and_commit_ternary` must produce the same
+    /// greedy token ID as the CPU scalar reference (RMSNorm → TQ2 GEMV → argmax).
+    ///
+    /// Synthetic geometry: hidden_size = 128, vocab_size = 256.
+    /// The LM head has 256 rows × 128 columns (2 TQ2_0_g128 blocks per row).
+    #[test]
+    fn test_encode_tail_ternary_matches_reference() {
+        if Device::system_default().is_none() {
+            return;
+        }
+        use super::super::metal_full_layer::FullLayerBuffers;
+        use half::f16;
+        use oxibonsai_core::BlockTQ2_0_g128;
+
+        let hidden_size = 128usize;
+        let vocab_size = 256usize;
+        let blocks_per_row = hidden_size / 128; // = 1
+
+        let graph = MetalGraph::new().expect("MetalGraph::new failed");
+
+        // ── Build deterministic hidden vector ──────────────────────────────
+        let hidden_vec: Vec<f32> = (0..hidden_size)
+            .map(|i| (i as f32) * 0.005 - 0.32)
+            .collect();
+
+        // ── Build deterministic RMSNorm weight (all ones for simplicity) ──
+        let norm_weight: Vec<f32> = vec![1.0f32; hidden_size];
+        let norm_eps = 1e-5f32;
+
+        // ── Build deterministic TQ2 LM-head weight blocks ─────────────────
+        let total_blocks = vocab_size * blocks_per_row;
+        let mut lm_blocks: Vec<BlockTQ2_0_g128> = Vec::with_capacity(total_blocks);
+        for row in 0..vocab_size {
+            for bk in 0..blocks_per_row {
+                let mut qs = [0u8; 32];
+                for (byte_idx, byte) in qs.iter_mut().enumerate() {
+                    let seed = row * 37 + bk * 13 + byte_idx;
+                    let c0 = (seed % 3) as u8;
+                    let c1 = ((seed / 3) % 3) as u8;
+                    let c2 = ((seed / 9) % 3) as u8;
+                    let c3 = ((seed / 27) % 3) as u8;
+                    *byte = c0 | (c1 << 2) | (c2 << 4) | (c3 << 6);
+                }
+                lm_blocks.push(BlockTQ2_0_g128 {
+                    qs,
+                    d: f16::from_f32(0.0625 + 0.015625 * (row as f32 * 0.5 + bk as f32)),
+                });
+            }
+        }
+
+        // ── CPU reference: RMSNorm → scalar TQ2 GEMV → argmax ─────────────
+        // RMSNorm: out_i = (x_i / sqrt(mean(x^2) + eps)) * weight_i
+        let sq_mean: f32 = hidden_vec.iter().map(|&x| x * x).sum::<f32>() / hidden_size as f32;
+        let rms_scale = 1.0 / (sq_mean + norm_eps).sqrt();
+        let normed_ref: Vec<f32> = hidden_vec
+            .iter()
+            .zip(norm_weight.iter())
+            .map(|(&x, &w)| x * rms_scale * w)
+            .collect();
+
+        let mut logits_ref = vec![0.0f32; vocab_size];
+        crate::gemv_ternary::gemv_tq2_0_g128(
+            &lm_blocks,
+            &normed_ref,
+            &mut logits_ref,
+            vocab_size,
+            hidden_size,
+        )
+        .expect("scalar gemv_tq2_0_g128 failed");
+
+        let expected_token: u32 = logits_ref
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(idx, _)| idx as u32)
+            .expect("logits_ref is empty");
+
+        // ── Upload norm weight and LM head to GPU ─────────────────────────
+        let norm_handle = graph
+            .get_or_upload_f32_weight(9_000_001u64, &norm_weight)
+            .expect("upload norm_weight failed");
+
+        let lm_aos_bytes: &[u8] = {
+            let ptr = lm_blocks.as_ptr() as *const u8;
+            let len = std::mem::size_of_val(lm_blocks.as_slice());
+            unsafe { std::slice::from_raw_parts(ptr, len) }
+        };
+        let lm_handle = graph
+            .get_or_upload_tq2_weight_soa(9_000_002u64, lm_aos_bytes)
+            .expect("upload_tq2_weight_soa failed");
+
+        // ── Allocate FullLayerBuffers with minimal dimensions ──────────────
+        // We only need hidden_buf and normed_buf for the tail; set the other
+        // dimensions to their minimum viable values.
+        let bufs = FullLayerBuffers::allocate(
+            &graph.device,
+            hidden_size,
+            hidden_size, // intermediate_size — any positive value
+            1,           // nq
+            1,           // nkv
+            64,          // head_dim — must be even
+            1,           // max_seq
+        )
+        .expect("FullLayerBuffers::allocate failed");
+
+        // Upload hidden vector into hidden_buf.
+        unsafe { upload_f32(&bufs.hidden_buf, &hidden_vec) };
+
+        // ── Run the GPU ternary tail ───────────────────────────────────────
+        let mut got_token: u32 = u32::MAX;
+        let mut hidden_mut = hidden_vec.clone();
+
+        let cmd_buf = graph.command_queue.new_command_buffer();
+        let encoder = cmd_buf.new_compute_command_encoder();
+
+        graph
+            .encode_tail_and_commit_ternary(
+                encoder,
+                cmd_buf,
+                &bufs,
+                &mut hidden_mut,
+                hidden_size,
+                Some(&norm_handle),
+                norm_eps,
+                Some(&lm_handle),
+                vocab_size,
+                None,
+                Some(&mut got_token),
+                false,
+                None,
+            )
+            .expect("encode_tail_and_commit_ternary failed");
+
+        // ── Verify token IDs match bit-exactly ────────────────────────────
+        assert_eq!(
+            got_token, expected_token,
+            "GPU greedy token {got_token} != CPU reference token {expected_token}"
+        );
     }
 }

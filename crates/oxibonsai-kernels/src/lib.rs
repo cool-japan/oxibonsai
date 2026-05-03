@@ -46,11 +46,13 @@ pub use gpu_backend::{
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub use gpu_backend::{
-    build_cached_weights, print_gpu_profile_summary, try_metal_ffn, try_metal_full_forward,
+    build_cached_weights, build_cached_weights_ternary_only, print_gpu_profile_summary,
+    try_metal_ffn, try_metal_forward_greedy_ternary, try_metal_full_forward,
     try_metal_full_forward_cached, try_metal_full_forward_prefill,
     try_metal_full_forward_prefill_verify, try_metal_full_forward_ternary, try_metal_full_layer,
-    try_metal_qkv, CachedLayerWeights, CachedModelWeights, FullForwardLayerParams,
-    FullForwardLayerParamsTernary, MetalGraph, MetalGraphError, MetalWeightHandle,
+    try_metal_prefill_ternary, try_metal_prefill_verify_ternary, try_metal_qkv, CachedLayerWeights,
+    CachedModelWeights, FullForwardLayerParams, FullForwardLayerParamsTernary, MetalGraph,
+    MetalGraphError, MetalWeightHandle,
 };
 
 #[cfg(all(
@@ -58,9 +60,11 @@ pub use gpu_backend::{
     any(target_os = "linux", target_os = "windows")
 ))]
 pub use gpu_backend::{
-    try_cuda_ffn, try_cuda_full_forward, try_cuda_full_forward_with_gpu_lm_head,
+    try_cuda_ffn, try_cuda_full_forward, try_cuda_full_forward_ternary,
+    try_cuda_full_forward_ternary_with_gpu_lm_head, try_cuda_full_forward_with_gpu_lm_head,
     try_cuda_full_layer, try_cuda_prefill, try_cuda_qkv, CudaCachedLayerWeights,
-    CudaFullForwardLayerParams, CudaGraph, CudaGraphError, NativeCudaBackend,
+    CudaFullForwardLayerParams, CudaFullForwardLayerParamsTernary, CudaGraph, CudaGraphError,
+    NativeCudaBackend,
 };
 
 pub mod dequant;
@@ -90,7 +94,7 @@ pub mod simd_float_ops;
 pub mod tuning;
 
 pub use aligned::{AlignedBlocks, AlignedBuffer};
-pub use dispatch::KernelDispatcher;
+pub use dispatch::{KernelDispatcher, KernelTier};
 pub use error::{KernelError, KernelResult};
 pub use parallel::{gemm_ternary_g128_par, gemv_ternary_g128_par};
 pub use parallel_tiled::{gemm_adaptive_ternary, gemv_adaptive, gemv_adaptive_ternary};

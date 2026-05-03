@@ -35,14 +35,20 @@ pub(crate) fn blocks_as_bytes(blocks: &[oxibonsai_core::BlockQ1_0G128]) -> &[u8]
 }
 /// Reinterpret a slice of ternary blocks as raw bytes (zero-copy).
 ///
-/// Only used by the Metal full-forward path to feed AoS bytes into the
-/// GPU weight cache — gated on `metal` to avoid dead-code warnings on
-/// CPU-only builds.
+/// Used by the Metal and CUDA ternary full-forward paths to feed AoS bytes
+/// into the GPU weight cache — gated on GPU features to avoid dead-code
+/// warnings on CPU-only builds.
 ///
 /// # Safety
 /// `BlockTQ2_0_g128` is `#[repr(C)]` with a 34-byte layout `(qs: [u8;32], d: f16)`,
 /// so the cast is valid.
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(any(
+    all(feature = "metal", target_os = "macos"),
+    all(
+        feature = "native-cuda",
+        any(target_os = "linux", target_os = "windows")
+    )
+))]
 pub(crate) fn blocks_as_bytes_ternary(blocks: &[oxibonsai_core::BlockTQ2_0_g128]) -> &[u8] {
     let ptr = blocks.as_ptr() as *const u8;
     let len = std::mem::size_of_val(blocks);

@@ -2,17 +2,17 @@
 
 Pure Rust 1-bit LLM inference engine for PrismML Bonsai models — umbrella crate.
 
-**Status:** Stable (thin re-export facade) · **Version:** 0.1.2 · **Updated:** 2026-04-19
+**Status:** Stable (thin re-export facade) · **Version:** 0.1.3 · **Updated:** 2026-05-03
 
 Re-exports all OxiBonsai subcrates for convenience. Add this single dependency
 to get access to the entire OxiBonsai ecosystem:
 
 ```toml
 [dependencies]
-oxibonsai = "0.1.2"
+oxibonsai = "0.1.3"
 
 # Enable optional subsystems:
-oxibonsai = { version = "0.1.2", features = ["full"] }
+oxibonsai = { version = "0.1.3", features = ["full"] }
 ```
 
 ## Subcrates

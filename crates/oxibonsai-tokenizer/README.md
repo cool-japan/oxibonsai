@@ -1,6 +1,6 @@
 # oxibonsai-tokenizer
 
-**Version:** 0.1.2 · **Status:** Stable · **Tests:** 268 passing
+**Version:** 0.1.3 · **Status:** Stable · **Tests:** 268 passing
 
 Pure Rust BPE tokenizer for OxiBonsai — WASM-safe, zero FFI.
 
@@ -30,7 +30,7 @@ Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 
 ```toml
 [dependencies]
-oxibonsai-tokenizer = "0.1.2"
+oxibonsai-tokenizer = "0.1.3"
 ```
 
 ```rust

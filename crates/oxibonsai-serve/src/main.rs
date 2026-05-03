@@ -110,6 +110,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
 
     // ── 6. Load tokenizer (optional) ──────────────────────────────────────
+    //
+    // Resolution order:
+    //   (a) explicit `config.tokenizer.path` (CLI / TOML / env)
+    //   (b) auto-detect alongside the configured model
+    //   (c) give up but tell the user *exactly* where we looked and how to fix it
     let tokenizer = match config.tokenizer.path.as_ref() {
         Some(path) => match TokenizerBridge::from_file(&path.display().to_string()) {
             Ok(t) => {
@@ -122,8 +127,31 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         },
         None => {
-            info!("no tokenizer path supplied; server will fall back to raw token-IDs");
-            None
+            // Try auto-detection only if we know the model path.  Otherwise
+            // there is nothing to derive candidate paths from.
+            let lookup = match config.model.path.as_ref() {
+                Some(model_path) => tokenizer_lookup::resolve_tokenizer_for_model(model_path),
+                None => tokenizer_lookup::TokenizerLookup::default(),
+            };
+            match lookup.found {
+                Some(found) => match TokenizerBridge::from_file(&found) {
+                    Ok(t) => {
+                        info!(path = %found, "auto-detected tokenizer alongside model");
+                        Some(t)
+                    }
+                    Err(err) => {
+                        error!(path = %found, %err, "failed to load auto-detected tokenizer");
+                        return Err(format!("failed to load tokenizer: {err}").into());
+                    }
+                },
+                None => {
+                    warn!(
+                        "{}",
+                        tokenizer_lookup::missing_tokenizer_warning(&lookup.searched)
+                    );
+                    None
+                }
+            }
         }
     };
 
@@ -155,6 +183,142 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     info!("oxibonsai-serve exited cleanly");
     Ok(())
+}
+
+/// Tokenizer auto-discovery used when the operator does not pass an explicit
+/// `--tokenizer` / `tokenizer.path`.  Mirrors the helper in the `oxibonsai`
+/// CLI binary so both surfaces present the same searched-paths list and the
+/// same "to fix" instructions.
+mod tokenizer_lookup {
+    use std::path::{Path, PathBuf};
+
+    /// Result of attempting to locate a `tokenizer.json` for a given model.
+    #[derive(Debug, Default)]
+    pub struct TokenizerLookup {
+        /// Resolved tokenizer path (UTF-8 `String` so the existing
+        /// `TokenizerBridge::from_file(&str)` API can consume it directly).
+        pub found: Option<String>,
+        /// Every candidate path that was inspected during auto-detection,
+        /// in the order they were probed.
+        pub searched: Vec<PathBuf>,
+    }
+
+    /// Strip a trailing GGUF quantization suffix (e.g. `-Q2_0`, `-Q4_K_M`,
+    /// `-F16`, `-BF16`, `-F32`) from a model basename.
+    fn strip_quant_suffix(basename: &str) -> &str {
+        let Some(dash_pos) = basename.rfind('-') else {
+            return basename;
+        };
+        let suffix = &basename[dash_pos + 1..];
+        if suffix.is_empty() {
+            return basename;
+        }
+        let is_float = matches!(suffix, "F16" | "BF16" | "F32");
+        let is_quant = {
+            let mut chars = suffix.chars();
+            match chars.next() {
+                Some('Q') => {
+                    let rest: String = chars.collect();
+                    if rest.is_empty() {
+                        false
+                    } else {
+                        let mut parts = rest.split('_');
+                        let first = parts.next().unwrap_or("");
+                        if first.is_empty() || !first.chars().all(|c| c.is_ascii_digit()) {
+                            false
+                        } else {
+                            parts.all(|p| {
+                                !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric())
+                            })
+                        }
+                    }
+                }
+                _ => false,
+            }
+        };
+        if is_float || is_quant {
+            &basename[..dash_pos]
+        } else {
+            basename
+        }
+    }
+
+    /// Build the ordered list of candidate `tokenizer.json` paths to probe
+    /// for a given model file.  Duplicates are removed so the warning stays
+    /// compact.
+    fn tokenizer_candidates(model_path: &Path) -> Vec<PathBuf> {
+        let parent = model_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        let mut out: Vec<PathBuf> = Vec::new();
+        let push_unique = |p: PathBuf, out: &mut Vec<PathBuf>| {
+            if !out.iter().any(|existing| existing == &p) {
+                out.push(p);
+            }
+        };
+
+        push_unique(parent.join("tokenizer.json"), &mut out);
+        push_unique(parent.join("..").join("tokenizer.json"), &mut out);
+
+        if let Some(stem) = model_path.file_stem().and_then(|s| s.to_str()) {
+            let base = strip_quant_suffix(stem);
+            for variant in [
+                base.to_string(),
+                format!("{base}-unpacked"),
+                format!("{base}-ONNX"),
+            ] {
+                push_unique(parent.join(&variant).join("tokenizer.json"), &mut out);
+            }
+        }
+
+        for ancestor in model_path.ancestors().skip(1) {
+            if ancestor.file_name().and_then(|n| n.to_str()) == Some("models") {
+                push_unique(ancestor.join("tokenizer.json"), &mut out);
+                break;
+            }
+        }
+
+        out
+    }
+
+    /// Resolve a tokenizer next to a configured model path.
+    pub fn resolve_tokenizer_for_model(model_path: &Path) -> TokenizerLookup {
+        let candidates = tokenizer_candidates(model_path);
+        for candidate in &candidates {
+            if candidate.exists() {
+                return TokenizerLookup {
+                    found: Some(candidate.to_string_lossy().into_owned()),
+                    searched: candidates,
+                };
+            }
+        }
+        TokenizerLookup {
+            found: None,
+            searched: candidates,
+        }
+    }
+
+    /// Build the multi-line "no tokenizer found" warning message.
+    pub fn missing_tokenizer_warning(searched: &[PathBuf]) -> String {
+        let mut msg = String::from("no tokenizer found. Searched:\n");
+        if searched.is_empty() {
+            msg.push_str("  (no candidate paths — model path was not provided)\n");
+        } else {
+            for path in searched {
+                msg.push_str(&format!("  - {}\n", path.display()));
+            }
+        }
+        msg.push_str("To fix:\n");
+        msg.push_str("  - Pass --tokenizer <path/to/tokenizer.json>, OR\n");
+        msg.push_str(
+            "  - Run ./scripts/download_tokenizer.sh to fetch the Qwen3 tokenizer to models/tokenizer.json\n",
+        );
+        msg.push_str("Continuing with raw token IDs in output.");
+        msg
+    }
 }
 
 /// Bearer-auth middleware.

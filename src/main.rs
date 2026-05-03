@@ -12,7 +12,8 @@ fn main() {}
 mod cli {
     use clap::{Parser, Subcommand};
     use std::io::{self, BufRead, Write};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
     use oxibonsai_runtime::OxiBonsaiConfig;
@@ -202,6 +203,40 @@ mod cli {
             #[arg(long, default_value_t = false)]
             onnx: bool,
         },
+
+        /// Manage the Qwen3 tokenizer (download / inspect).
+        Tokenizer {
+            #[command(subcommand)]
+            cmd: TokenizerCmd,
+        },
+    }
+
+    #[derive(Subcommand)]
+    pub enum TokenizerCmd {
+        /// Download tokenizer.json from HuggingFace and save it next to the model.
+        ///
+        /// Example:
+        ///   oxibonsai tokenizer download --output models/tokenizer.json
+        Download {
+            /// Destination path (default: models/tokenizer.json in the current directory).
+            #[arg(long, default_value = "models/tokenizer.json")]
+            output: String,
+
+            /// HuggingFace repo to download from (must contain tokenizer.json).
+            #[arg(long, default_value = "Qwen/Qwen3-8B")]
+            repo: String,
+
+            /// Overwrite an existing tokenizer.json without prompting.
+            #[arg(long, default_value_t = false)]
+            force: bool,
+        },
+
+        /// Show the vocabulary size and model type stored in tokenizer.json.
+        Info {
+            /// Path to tokenizer.json.
+            #[arg(long, default_value = "models/tokenizer.json")]
+            path: String,
+        },
     }
 
     pub fn read_prompt_stdin() -> String {
@@ -214,6 +249,162 @@ mod cli {
             }
         }
         lines.join("\n")
+    }
+
+    /// Result of attempting to locate a `tokenizer.json` for a given model.
+    ///
+    /// `found` is `Some(path)` when either an explicit override was supplied
+    /// or auto-detection succeeded.  `searched` lists every candidate path
+    /// inspected during auto-detection so the user can see exactly where we
+    /// looked when nothing turned up.
+    pub(crate) struct TokenizerLookup {
+        pub(crate) found: Option<String>,
+        pub(crate) searched: Vec<PathBuf>,
+    }
+
+    /// Strip a trailing GGUF quantization suffix (e.g. `-Q2_0`, `-Q4_K_M`,
+    /// `-F16`, `-BF16`, `-F32`) from a model basename without pulling in the
+    /// `regex` crate.  Returns the basename unchanged when no recognized
+    /// suffix is present.
+    pub(crate) fn strip_quant_suffix(basename: &str) -> &str {
+        // Locate the last '-' segment; only that segment is a quant suffix
+        // candidate.
+        let Some(dash_pos) = basename.rfind('-') else {
+            return basename;
+        };
+        let suffix = &basename[dash_pos + 1..];
+        if suffix.is_empty() {
+            return basename;
+        }
+
+        let is_float = matches!(suffix, "F16" | "BF16" | "F32");
+        let is_quant = {
+            let mut chars = suffix.chars();
+            match chars.next() {
+                Some('Q') => {
+                    // Accept Q<digits>(_<alnum>+)*  e.g. Q1_0, Q2_K, Q4_K_M, Q8_0.
+                    let rest: String = chars.collect();
+                    if rest.is_empty() {
+                        false
+                    } else {
+                        let mut parts = rest.split('_');
+                        let first = parts.next().unwrap_or("");
+                        if first.is_empty() || !first.chars().all(|c| c.is_ascii_digit()) {
+                            false
+                        } else {
+                            parts.all(|p| {
+                                !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric())
+                            })
+                        }
+                    }
+                }
+                _ => false,
+            }
+        };
+
+        if is_float || is_quant {
+            &basename[..dash_pos]
+        } else {
+            basename
+        }
+    }
+
+    /// Build the ordered list of candidate `tokenizer.json` paths to probe
+    /// for a given model file.  Duplicates (after canonical lexical form)
+    /// are removed so the warning message stays compact.
+    pub(crate) fn tokenizer_candidates(model_path: &Path) -> Vec<PathBuf> {
+        let parent = model_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        let mut out: Vec<PathBuf> = Vec::new();
+        let push_unique = |p: PathBuf, out: &mut Vec<PathBuf>| {
+            if !out.iter().any(|existing| existing == &p) {
+                out.push(p);
+            }
+        };
+
+        // 1. Same directory as the model.
+        push_unique(parent.join("tokenizer.json"), &mut out);
+
+        // 2. Parent of the model directory.
+        push_unique(parent.join("..").join("tokenizer.json"), &mut out);
+
+        // 3. Sibling directories derived from the model basename.
+        if let Some(stem) = model_path.file_stem().and_then(|s| s.to_str()) {
+            let base = strip_quant_suffix(stem);
+            for variant in [
+                base.to_string(),
+                format!("{base}-unpacked"),
+                format!("{base}-ONNX"),
+            ] {
+                push_unique(parent.join(&variant).join("tokenizer.json"), &mut out);
+            }
+        }
+
+        // 4. Top-level `models/` directory if the model lives anywhere under it.
+        for ancestor in model_path.ancestors().skip(1) {
+            if ancestor.file_name().and_then(|n| n.to_str()) == Some("models") {
+                push_unique(ancestor.join("tokenizer.json"), &mut out);
+                break;
+            }
+        }
+
+        out
+    }
+
+    /// Resolve the tokenizer path: use the explicit path if given, otherwise
+    /// auto-detect `tokenizer.json` in a small set of conventional locations
+    /// derived from the model path.
+    pub(crate) fn resolve_tokenizer(tokenizer: Option<&str>, model_path: &str) -> TokenizerLookup {
+        if let Some(p) = tokenizer {
+            return TokenizerLookup {
+                found: Some(p.to_string()),
+                searched: Vec::new(),
+            };
+        }
+
+        let model = Path::new(model_path);
+        let candidates = tokenizer_candidates(model);
+        for candidate in &candidates {
+            if candidate.exists() {
+                tracing::info!(
+                    path = %candidate.display(),
+                    "auto-detected tokenizer alongside model"
+                );
+                return TokenizerLookup {
+                    found: Some(candidate.to_string_lossy().into_owned()),
+                    searched: candidates,
+                };
+            }
+        }
+
+        TokenizerLookup {
+            found: None,
+            searched: candidates,
+        }
+    }
+
+    /// Build the multi-line "no tokenizer found" warning shown by the run /
+    /// chat / serve paths.  Centralized so all three surfaces stay in sync.
+    pub(crate) fn missing_tokenizer_warning(searched: &[PathBuf]) -> String {
+        let mut msg = String::from("no tokenizer found. Searched:\n");
+        if searched.is_empty() {
+            msg.push_str("  (no candidate paths — model path was not provided)\n");
+        } else {
+            for path in searched {
+                msg.push_str(&format!("  - {}\n", path.display()));
+            }
+        }
+        msg.push_str("To fix:\n");
+        msg.push_str("  - Pass --tokenizer <path/to/tokenizer.json>, OR\n");
+        msg.push_str(
+            "  - Run ./scripts/download_tokenizer.sh to fetch the Qwen3 tokenizer to models/tokenizer.json\n",
+        );
+        msg.push_str("Continuing with raw token IDs in output.");
+        msg
     }
 
     pub async fn run() -> anyhow::Result<()> {
@@ -272,12 +463,13 @@ mod cli {
                 )?;
 
                 // Tokenize prompt and retain the bridge for streaming decode
-                let (prompt_tokens, tok_bridge) = if let Some(tok_path) = &tokenizer {
+                let lookup = resolve_tokenizer(tokenizer.as_deref(), &model);
+                let (prompt_tokens, tok_bridge) = if let Some(tok_path) = &lookup.found {
                     let tok = oxibonsai_runtime::TokenizerBridge::from_file(tok_path)?;
                     let tokens = tok.encode(&prompt_text)?;
                     (tokens, Some(tok))
                 } else {
-                    tracing::warn!("no tokenizer specified — using dummy token");
+                    tracing::warn!("{}", missing_tokenizer_warning(&lookup.searched));
                     (vec![151644], None) // <|im_start|>
                 };
 
@@ -299,13 +491,22 @@ mod cli {
                         tracing::info!("using greedy GPU path (argmax on Metal, 4-byte download)");
                         let p_len = prompt_tokens.len();
                         let tokens = engine.generate_greedy_gpu(&prompt_tokens, max_tokens)?;
-                        // Print tokens
+                        // Print tokens via the streaming decoder so multi-byte
+                        // UTF-8 characters that span more than one token (CJK,
+                        // emoji, etc.) round-trip correctly instead of
+                        // surfacing as U+FFFD replacement chars.
+                        let mut stream_state =
+                            tok_bridge.as_ref().map(|t| t.new_decode_stream(true));
                         for &token_id in &tokens {
-                            if let Some(tok) = &tok_bridge {
-                                let text = tok.decode(&[token_id]).unwrap_or_default();
-                                print!("{text}");
-                            } else {
-                                print!(" {token_id}");
+                            match (&tok_bridge, stream_state.as_mut()) {
+                                (Some(tok), Some(state)) => {
+                                    if let Some(text) = tok.step_decode(state, token_id)? {
+                                        print!("{text}");
+                                    }
+                                }
+                                _ => {
+                                    print!(" {token_id}");
+                                }
                             }
                             let _ = io::stdout().flush();
                         }
@@ -326,12 +527,18 @@ mod cli {
                     {
                         let p_len = prompt_tokens.len();
                         let tokens = engine.generate(&prompt_tokens, max_tokens)?;
+                        let mut stream_state =
+                            tok_bridge.as_ref().map(|t| t.new_decode_stream(true));
                         for &token_id in &tokens {
-                            if let Some(tok) = &tok_bridge {
-                                let text = tok.decode(&[token_id]).unwrap_or_default();
-                                print!("{text}");
-                            } else {
-                                print!(" {token_id}");
+                            match (&tok_bridge, stream_state.as_mut()) {
+                                (Some(tok), Some(state)) => {
+                                    if let Some(text) = tok.step_decode(state, token_id)? {
+                                        print!("{text}");
+                                    }
+                                }
+                                _ => {
+                                    print!(" {token_id}");
+                                }
                             }
                             let _ = io::stdout().flush();
                         }
@@ -360,17 +567,23 @@ mod cli {
                             });
                             drop(tx);
 
+                            let mut stream_state =
+                                tok_bridge.as_ref().map(|t| t.new_decode_stream(true));
                             let mut count = 0usize;
                             for token_id in rx {
                                 count += 1;
-                                if let Some(tok) = &tok_bridge {
-                                    let text = tok.decode(&[token_id]).unwrap_or_default();
-                                    print!("{text}");
-                                } else {
-                                    if count == 1 {
-                                        print!("Tokens:");
+                                match (&tok_bridge, stream_state.as_mut()) {
+                                    (Some(tok), Some(state)) => {
+                                        if let Some(text) = tok.step_decode(state, token_id)? {
+                                            print!("{text}");
+                                        }
                                     }
-                                    print!(" {token_id}");
+                                    _ => {
+                                        if count == 1 {
+                                            print!("Tokens:");
+                                        }
+                                        print!(" {token_id}");
+                                    }
                                 }
                                 let _ = io::stdout().flush();
                             }
@@ -445,15 +658,34 @@ mod cli {
                     max_seq_len,
                 )?;
 
-                let tok = if let Some(tok_path) = &tokenizer {
-                    Some(oxibonsai_runtime::TokenizerBridge::from_file(tok_path)?)
-                } else {
-                    tracing::warn!("no tokenizer specified — token IDs will be printed");
-                    None
+                let tok = {
+                    let lookup = resolve_tokenizer(tokenizer.as_deref(), &model);
+                    if let Some(tok_path) = lookup.found {
+                        Some(oxibonsai_runtime::TokenizerBridge::from_file(&tok_path)?)
+                    } else {
+                        tracing::warn!("{}", missing_tokenizer_warning(&lookup.searched));
+                        None
+                    }
                 };
 
                 println!("OxiBonsai Interactive Chat (type 'quit' or Ctrl-D to exit)");
+                println!(
+                    "Tip: press Ctrl-C during generation to interrupt output without exiting."
+                );
                 println!("---");
+
+                // Shared cancellation flag.  The ctrlc handler sets this to true;
+                // the generation receive loop checks it and drops the receiver,
+                // which causes tx.send() in generate_streaming_sync to fail and
+                // stop the generation thread naturally.
+                let interrupted = Arc::new(AtomicBool::new(false));
+                {
+                    let flag = Arc::clone(&interrupted);
+                    ctrlc::set_handler(move || {
+                        flag.store(true, Ordering::SeqCst);
+                    })
+                    .map_err(|e| anyhow::anyhow!("failed to install Ctrl-C handler: {e}"))?;
+                }
 
                 let stdin = io::stdin();
                 loop {
@@ -461,13 +693,26 @@ mod cli {
                     io::stdout().flush()?;
 
                     let mut input = String::new();
-                    if stdin.lock().read_line(&mut input)? == 0 {
-                        // EOF
-                        println!();
-                        break;
+                    match stdin.lock().read_line(&mut input) {
+                        Ok(0) => {
+                            // EOF (Ctrl-D)
+                            println!();
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                            // Ctrl-C while waiting for input (not during generation).
+                            interrupted.store(false, Ordering::SeqCst);
+                            println!();
+                            eprintln!("[Ctrl-C: type 'quit' or press Ctrl-D to exit]");
+                            continue;
+                        }
+                        Err(e) => return Err(e.into()),
                     }
                     let input = input.trim();
                     if input.is_empty() {
+                        // Reset stale interrupt flag that fired just before the prompt
+                        interrupted.store(false, Ordering::SeqCst);
                         continue;
                     }
                     if input == "quit" || input == "exit" {
@@ -485,10 +730,21 @@ mod cli {
                         vec![151644]
                     };
 
+                    // Clear any stale interrupt before starting generation
+                    interrupted.store(false, Ordering::SeqCst);
+
                     let start = std::time::Instant::now();
                     let (tx, rx) = std::sync::mpsc::channel::<u32>();
 
-                    // Use std::thread::scope so engine's borrow stays valid
+                    // Use std::thread::scope so engine's borrow stays valid.
+                    // The receive loop breaks (dropping rx) when the interrupted flag
+                    // is set; generate_streaming_sync detects tx.send() failure and
+                    // returns cleanly, so gen_handle.join() never blocks indefinitely.
+                    let interrupted_ref = Arc::clone(&interrupted);
+                    // Fresh decode-stream state per chat turn: each `> ` cycle is an
+                    // independent generation request, so multi-byte UTF-8 buffering
+                    // must NOT carry across turns.
+                    let mut stream_state = tok.as_ref().map(|t| t.new_decode_stream(true));
                     let output_count = std::thread::scope(|s| -> anyhow::Result<usize> {
                         let thread_tx = tx.clone();
                         let engine_ref = &mut engine;
@@ -500,18 +756,30 @@ mod cli {
 
                         let mut count = 0usize;
                         for token_id in rx {
+                            // Check cancellation before printing each token.
+                            // Breaking here drops the Receiver, which makes the
+                            // next tx.send() in the generation thread return Err,
+                            // stopping generation after at most one more forward pass.
+                            if interrupted_ref.load(Ordering::SeqCst) {
+                                break;
+                            }
                             count += 1;
-                            if let Some(tok) = &tok {
-                                let text = tok.decode(&[token_id]).unwrap_or_default();
-                                print!("{text}");
-                            } else {
-                                if count == 1 {
-                                    print!("Tokens:");
+                            match (&tok, stream_state.as_mut()) {
+                                (Some(tok), Some(state)) => {
+                                    if let Some(text) = tok.step_decode(state, token_id)? {
+                                        print!("{text}");
+                                    }
                                 }
-                                print!(" {token_id}");
+                                _ => {
+                                    if count == 1 {
+                                        print!("Tokens:");
+                                    }
+                                    print!(" {token_id}");
+                                }
                             }
                             let _ = io::stdout().flush();
                         }
+                        // rx is dropped here; gen_handle will stop within one token step
 
                         match gen_handle.join() {
                             Ok(Ok(_)) => {}
@@ -524,17 +792,21 @@ mod cli {
                     let elapsed = start.elapsed();
                     println!(); // newline after streamed output
 
-                    let tok_per_sec = if elapsed.as_secs_f64() > 0.0 {
-                        output_count as f64 / elapsed.as_secs_f64()
+                    if interrupted.swap(false, Ordering::SeqCst) {
+                        eprintln!("[interrupted after {} tokens]", output_count);
                     } else {
-                        0.0
-                    };
-                    eprintln!(
-                        "[{} tokens in {:.2}s, {:.1} tok/s]",
-                        output_count,
-                        elapsed.as_secs_f64(),
-                        tok_per_sec
-                    );
+                        let tok_per_sec = if elapsed.as_secs_f64() > 0.0 {
+                            output_count as f64 / elapsed.as_secs_f64()
+                        } else {
+                            0.0
+                        };
+                        eprintln!(
+                            "[{} tokens in {:.2}s, {:.1} tok/s]",
+                            output_count,
+                            elapsed.as_secs_f64(),
+                            tok_per_sec
+                        );
+                    }
                 }
             }
 
@@ -562,10 +834,16 @@ mod cli {
                     oxibonsai_runtime::InferenceEngine::from_gguf(gguf, params, 42, max_seq_len)?;
                 engine.set_metrics(Arc::clone(&metrics));
 
-                let tok = tokenizer
-                    .as_ref()
-                    .map(|p| oxibonsai_runtime::TokenizerBridge::from_file(p))
-                    .transpose()?;
+                let tok = {
+                    let lookup = resolve_tokenizer(tokenizer.as_deref(), &model);
+                    match lookup.found {
+                        Some(p) => Some(oxibonsai_runtime::TokenizerBridge::from_file(&p)?),
+                        None => {
+                            tracing::warn!("{}", missing_tokenizer_warning(&lookup.searched));
+                            None
+                        }
+                    }
+                };
 
                 let router =
                     oxibonsai_runtime::server::create_router_with_metrics(engine, tok, metrics);
@@ -800,9 +1078,273 @@ mod cli {
                     }
                 }
             }
+
+            Commands::Tokenizer { cmd: tok_cmd } => match tok_cmd {
+                TokenizerCmd::Download {
+                    output,
+                    repo,
+                    force,
+                } => {
+                    let out_path = std::path::Path::new(&output);
+                    if out_path.exists() && !force {
+                        println!("tokenizer.json already exists at {output}");
+                        println!("Use --force to overwrite.");
+                        return Ok(());
+                    }
+                    if let Some(parent) = out_path.parent() {
+                        if !parent.as_os_str().is_empty() {
+                            std::fs::create_dir_all(parent).map_err(|e| {
+                                anyhow::anyhow!(
+                                    "failed to create directory {}: {e}",
+                                    parent.display()
+                                )
+                            })?;
+                        }
+                    }
+                    let url = format!("https://huggingface.co/{repo}/resolve/main/tokenizer.json");
+                    println!("Downloading tokenizer.json from {url}");
+                    let response = reqwest::blocking::get(&url)
+                        .map_err(|e| anyhow::anyhow!("HTTP request failed: {e}"))?;
+                    if !response.status().is_success() {
+                        anyhow::bail!("server returned {} for {url}", response.status());
+                    }
+                    let bytes = response
+                        .bytes()
+                        .map_err(|e| anyhow::anyhow!("failed to read response body: {e}"))?;
+                    std::fs::write(out_path, &bytes)
+                        .map_err(|e| anyhow::anyhow!("failed to write {output}: {e}"))?;
+                    println!("Saved to {output} ({} KB)", bytes.len() / 1024);
+                }
+
+                TokenizerCmd::Info { path } => {
+                    let data = std::fs::read_to_string(&path)
+                        .map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
+                    let v: serde_json::Value = serde_json::from_str(&data)
+                        .map_err(|e| anyhow::anyhow!("invalid JSON in {path}: {e}"))?;
+                    let model_type = v
+                        .get("model")
+                        .and_then(|m| m.get("type"))
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("unknown");
+                    let vocab_size = v
+                        .get("model")
+                        .and_then(|m| m.get("vocab"))
+                        .map(|vocab| {
+                            if let Some(obj) = vocab.as_object() {
+                                obj.len()
+                            } else {
+                                0
+                            }
+                        })
+                        .unwrap_or(0);
+                    let added_tokens = v
+                        .get("added_tokens")
+                        .and_then(|t| t.as_array())
+                        .map(|a| a.len())
+                        .unwrap_or(0);
+                    println!("Tokenizer: {path}");
+                    println!("  Type:         {model_type}");
+                    println!("  Vocab size:   {vocab_size}");
+                    println!("  Added tokens: {added_tokens}");
+                }
+            },
         }
 
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{
+            missing_tokenizer_warning, resolve_tokenizer, strip_quant_suffix, tokenizer_candidates,
+        };
+        use std::fs;
+        use std::path::PathBuf;
+        use tempfile::TempDir;
+
+        /// Helper: write an empty `tokenizer.json` at the given path, creating
+        /// any missing parent directories.
+        fn touch_tokenizer(path: &std::path::Path) {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("create_dir_all");
+            }
+            fs::write(path, b"{}").expect("write tokenizer.json");
+        }
+
+        #[test]
+        fn resolve_tokenizer_finds_in_same_dir() {
+            let tmp = TempDir::new().expect("tempdir");
+            let model_dir = tmp.path().join("models");
+            fs::create_dir_all(&model_dir).expect("create model_dir");
+            let model_path = model_dir.join("Foo-Q2_0.gguf");
+            fs::write(&model_path, b"").expect("touch model");
+            touch_tokenizer(&model_dir.join("tokenizer.json"));
+
+            let lookup = resolve_tokenizer(None, model_path.to_str().expect("utf8"));
+            let found = lookup.found.as_deref().expect("expected to find tokenizer");
+            assert_eq!(
+                PathBuf::from(found),
+                model_dir.join("tokenizer.json"),
+                "should locate tokenizer in the same dir as the model"
+            );
+        }
+
+        #[test]
+        fn resolve_tokenizer_finds_in_parent_dir() {
+            let tmp = TempDir::new().expect("tempdir");
+            let model_dir = tmp.path().join("models").join("variant");
+            fs::create_dir_all(&model_dir).expect("create model_dir");
+            let model_path = model_dir.join("Foo-Q2_0.gguf");
+            fs::write(&model_path, b"").expect("touch model");
+            // Place tokenizer in the parent directory only.
+            let parent_tokenizer = tmp.path().join("models").join("tokenizer.json");
+            touch_tokenizer(&parent_tokenizer);
+
+            let lookup = resolve_tokenizer(None, model_path.to_str().expect("utf8"));
+            let found = lookup.found.as_deref().expect("expected to find tokenizer");
+            // Either the literal `..` candidate or the canonicalized `models/tokenizer.json`
+            // candidate is acceptable; both refer to the same file.
+            let found_path = PathBuf::from(found);
+            let canon_found = fs::canonicalize(&found_path).expect("canonicalize found");
+            let canon_target = fs::canonicalize(&parent_tokenizer).expect("canonicalize target");
+            assert_eq!(
+                canon_found, canon_target,
+                "should locate tokenizer in the model's parent directory"
+            );
+        }
+
+        #[test]
+        fn resolve_tokenizer_finds_via_unpacked_sibling() {
+            let tmp = TempDir::new().expect("tempdir");
+            let model_dir = tmp.path().join("models");
+            fs::create_dir_all(&model_dir).expect("create model_dir");
+            let model_path = model_dir.join("Ternary-Bonsai-8B-Q2_0.gguf");
+            fs::write(&model_path, b"").expect("touch model");
+            // Tokenizer only lives in the sibling unpacked directory.
+            let unpacked = model_dir.join("Ternary-Bonsai-8B-unpacked");
+            touch_tokenizer(&unpacked.join("tokenizer.json"));
+
+            let lookup = resolve_tokenizer(None, model_path.to_str().expect("utf8"));
+            let found = lookup.found.as_deref().expect("expected to find tokenizer");
+            assert_eq!(
+                PathBuf::from(found),
+                unpacked.join("tokenizer.json"),
+                "should locate tokenizer via <base>-unpacked sibling directory"
+            );
+        }
+
+        #[test]
+        fn resolve_tokenizer_strips_quant_suffix_for_sibling_lookup() {
+            // Verifies the candidate list (without filesystem) for the
+            // `Foo-Q2_0.gguf` case includes Foo/, Foo-unpacked/, Foo-ONNX/.
+            let model_path = PathBuf::from("models/Foo-Q2_0.gguf");
+            let candidates = tokenizer_candidates(&model_path);
+            let candidate_strs: Vec<String> = candidates
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
+
+            let expected = [
+                "models/Foo/tokenizer.json",
+                "models/Foo-unpacked/tokenizer.json",
+                "models/Foo-ONNX/tokenizer.json",
+            ];
+            for needle in expected {
+                assert!(
+                    candidate_strs.iter().any(|c| c == needle),
+                    "missing expected candidate {needle}; got {candidate_strs:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn resolve_tokenizer_records_searched_paths_when_missing() {
+            let tmp = TempDir::new().expect("tempdir");
+            let model_dir = tmp.path().join("models");
+            fs::create_dir_all(&model_dir).expect("create model_dir");
+            let model_path = model_dir.join("Ternary-Bonsai-8B-Q2_0.gguf");
+            fs::write(&model_path, b"").expect("touch model");
+
+            let lookup = resolve_tokenizer(None, model_path.to_str().expect("utf8"));
+            assert!(
+                lookup.found.is_none(),
+                "should not find tokenizer in empty tree"
+            );
+            assert!(
+                !lookup.searched.is_empty(),
+                "searched list must be populated when nothing is found"
+            );
+            // Confirm at least the "same dir" candidate is recorded.
+            assert!(
+                lookup
+                    .searched
+                    .iter()
+                    .any(|p| p == &model_dir.join("tokenizer.json")),
+                "searched list should include the same-directory candidate"
+            );
+            // Warning text must mention every searched path and both remedies.
+            let warning = missing_tokenizer_warning(&lookup.searched);
+            for path in &lookup.searched {
+                assert!(
+                    warning.contains(&path.display().to_string()),
+                    "warning should list {}, got: {warning}",
+                    path.display()
+                );
+            }
+            assert!(
+                warning.contains("--tokenizer"),
+                "warning must mention --tokenizer remedy"
+            );
+            assert!(
+                warning.contains("download_tokenizer.sh"),
+                "warning must mention download_tokenizer.sh remedy"
+            );
+        }
+
+        #[test]
+        fn resolve_tokenizer_explicit_override_skips_search() {
+            let lookup = resolve_tokenizer(Some("/custom/path/tokenizer.json"), "models/foo.gguf");
+            assert_eq!(
+                lookup.found.as_deref(),
+                Some("/custom/path/tokenizer.json"),
+                "explicit override must be returned verbatim"
+            );
+            assert!(
+                lookup.searched.is_empty(),
+                "explicit override must not trigger a filesystem search"
+            );
+        }
+
+        #[test]
+        fn strip_quant_suffix_handles_known_formats() {
+            assert_eq!(
+                strip_quant_suffix("Ternary-Bonsai-8B-Q2_0"),
+                "Ternary-Bonsai-8B"
+            );
+            assert_eq!(strip_quant_suffix("Foo-Q1_0"), "Foo");
+            assert_eq!(strip_quant_suffix("Foo-Q4_K_M"), "Foo");
+            assert_eq!(strip_quant_suffix("Foo-Q8_0"), "Foo");
+            assert_eq!(strip_quant_suffix("Foo-F16"), "Foo");
+            assert_eq!(strip_quant_suffix("Foo-BF16"), "Foo");
+            assert_eq!(strip_quant_suffix("Foo-F32"), "Foo");
+            // Non-quant suffix should be left alone.
+            assert_eq!(strip_quant_suffix("Foo-bar"), "Foo-bar");
+            assert_eq!(strip_quant_suffix("Foo"), "Foo");
+        }
+
+        #[test]
+        fn tokenizer_candidates_includes_top_level_models_dir() {
+            let model_path = PathBuf::from("models/sub/dir/Foo-Q2_0.gguf");
+            let candidates = tokenizer_candidates(&model_path);
+            let candidate_strs: Vec<String> = candidates
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                candidate_strs.iter().any(|c| c == "models/tokenizer.json"),
+                "expected top-level models/tokenizer.json candidate, got {candidate_strs:?}"
+            );
+        }
     }
 }
 

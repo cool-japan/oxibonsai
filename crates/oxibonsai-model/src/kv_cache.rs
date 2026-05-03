@@ -148,6 +148,93 @@ impl KvCache {
     pub fn head_dim(&self) -> usize {
         self.head_dim
     }
+
+    /// Manually set the cached sequence length.
+    ///
+    /// Used by the prefix-cache integration when restoring previously
+    /// computed KV blocks: after [`inject_block`](Self::inject_block) writes
+    /// the block contents, the consumer must call this to advertise the
+    /// number of valid positions to subsequent attention computations.
+    ///
+    /// `n` is clamped to `max_seq_len`.
+    pub fn set_seq_len(&mut self, n: usize) {
+        self.seq_len = n.min(self.max_seq_len);
+    }
+
+    /// Extract one prefix-cache block worth of KV for a single layer.
+    ///
+    /// Reads `block_size` consecutive positions starting at `start_pos` for
+    /// every KV head in `layer` and returns them in `[head][pos_in_block][dim]`
+    /// order, packed as a flat `Vec<f32>` of length
+    /// `num_kv_heads * block_size * head_dim`.
+    ///
+    /// Mirrors the layout used by [`crate::prefix_cache::CacheBlock`].
+    ///
+    /// Returns `(keys, values)`. If the requested range exceeds
+    /// `max_seq_len`, the trailing positions are returned as zeros.
+    pub fn extract_block(
+        &self,
+        layer: usize,
+        start_pos: usize,
+        block_size: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        debug_assert!(layer < self.num_layers);
+        let per_layer = self.num_kv_heads * block_size * self.head_dim;
+        let mut keys = vec![0.0f32; per_layer];
+        let mut values = vec![0.0f32; per_layer];
+
+        for head in 0..self.num_kv_heads {
+            for off in 0..block_size {
+                let pos = start_pos + off;
+                if pos >= self.max_seq_len {
+                    continue;
+                }
+                let src = self.cache_offset(layer, head, pos);
+                let dst = (head * block_size + off) * self.head_dim;
+                keys[dst..dst + self.head_dim]
+                    .copy_from_slice(&self.keys[src..src + self.head_dim]);
+                values[dst..dst + self.head_dim]
+                    .copy_from_slice(&self.values[src..src + self.head_dim]);
+            }
+        }
+
+        (keys, values)
+    }
+
+    /// Inject a previously extracted block back into the cache for a single layer.
+    ///
+    /// `keys` and `values` must have the same `[head][pos_in_block][dim]`
+    /// layout produced by [`extract_block`](Self::extract_block); they are
+    /// expected to be of length `num_kv_heads * block_size * head_dim`.
+    /// Positions outside `max_seq_len` are silently skipped.
+    pub fn inject_block(
+        &mut self,
+        layer: usize,
+        start_pos: usize,
+        block_size: usize,
+        keys: &[f32],
+        values: &[f32],
+    ) {
+        debug_assert!(layer < self.num_layers);
+        let per_layer = self.num_kv_heads * block_size * self.head_dim;
+        debug_assert_eq!(keys.len(), per_layer);
+        debug_assert_eq!(values.len(), per_layer);
+
+        for head in 0..self.num_kv_heads {
+            for off in 0..block_size {
+                let pos = start_pos + off;
+                if pos >= self.max_seq_len {
+                    continue;
+                }
+                let src = (head * block_size + off) * self.head_dim;
+                let dst = self.cache_offset(layer, head, pos);
+                self.keys[dst..dst + self.head_dim]
+                    .copy_from_slice(&keys[src..src + self.head_dim]);
+                self.values[dst..dst + self.head_dim]
+                    .copy_from_slice(&values[src..src + self.head_dim]);
+            }
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -469,6 +556,94 @@ mod tests {
     fn kv_cache_policy_default() {
         let policy = KvCachePolicy::default();
         assert_eq!(policy, KvCachePolicy::Standard);
+    }
+
+    #[test]
+    fn kv_cache_set_seq_len_clamps_to_max() {
+        let mut cache = KvCache::new(1, 1, 4, 8);
+        cache.set_seq_len(4);
+        assert_eq!(cache.seq_len(), 4);
+        cache.set_seq_len(100);
+        assert_eq!(cache.seq_len(), 8); // clamped
+    }
+
+    #[test]
+    fn kv_cache_extract_inject_roundtrip() {
+        // Two layers, two KV heads, head_dim=4, block_size=4 → per_layer = 32 floats.
+        let num_layers = 2;
+        let num_kv_heads = 2;
+        let head_dim = 4;
+        let block_size = 4;
+        let max_seq = 16;
+        let mut cache = KvCache::new(num_layers, num_kv_heads, head_dim, max_seq);
+
+        // Populate layer 1 at positions 0..4 with deterministic key/value patterns.
+        for head in 0..num_kv_heads {
+            for pos in 0..block_size {
+                let key: Vec<f32> = (0..head_dim)
+                    .map(|d| (head as f32 + 1.0) * 100.0 + pos as f32 * 10.0 + d as f32)
+                    .collect();
+                let value: Vec<f32> = (0..head_dim)
+                    .map(|d| (head as f32 + 1.0) * 1000.0 + pos as f32 * 10.0 + d as f32)
+                    .collect();
+                cache.store_key(1, head, pos, &key);
+                cache.store_value(1, head, pos, &value);
+            }
+        }
+
+        // Extract, then inject into a fresh cache and re-extract.
+        let (k_block, v_block) = cache.extract_block(1, 0, block_size);
+        let per_layer = num_kv_heads * block_size * head_dim;
+        assert_eq!(k_block.len(), per_layer);
+        assert_eq!(v_block.len(), per_layer);
+
+        let mut fresh = KvCache::new(num_layers, num_kv_heads, head_dim, max_seq);
+        fresh.inject_block(1, 0, block_size, &k_block, &v_block);
+        fresh.set_seq_len(block_size);
+
+        let (k_block_2, v_block_2) = fresh.extract_block(1, 0, block_size);
+        assert_eq!(k_block_2, k_block);
+        assert_eq!(v_block_2, v_block);
+
+        // Re-read via keys_for / values_for to verify the position-major layout.
+        for head in 0..num_kv_heads {
+            let original_keys = cache.keys_for(1, head, block_size);
+            let restored_keys = fresh.keys_for(1, head, block_size);
+            assert_eq!(
+                original_keys, restored_keys,
+                "head {head} keys must round-trip"
+            );
+            let original_values = cache.values_for(1, head, block_size);
+            let restored_values = fresh.values_for(1, head, block_size);
+            assert_eq!(
+                original_values, restored_values,
+                "head {head} values must round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn kv_cache_extract_inject_at_offset() {
+        // Verify extract/inject behave correctly for non-zero start_pos.
+        let mut cache = KvCache::new(1, 1, 2, 16);
+        // Write a recognisable pattern at positions 4..8.
+        for pos in 0..4 {
+            let key = vec![pos as f32, pos as f32 + 0.5];
+            let value = vec![-(pos as f32), -(pos as f32) - 0.5];
+            cache.store_key(0, 0, 4 + pos, &key);
+            cache.store_value(0, 0, 4 + pos, &value);
+        }
+        let (k, v) = cache.extract_block(0, 4, 4);
+        let mut other = KvCache::new(1, 1, 2, 16);
+        other.inject_block(0, 4, 4, &k, &v);
+        for pos in 0..4 {
+            let original_k = cache.keys_for(0, 0, 8);
+            let restored_k = other.keys_for(0, 0, 8);
+            // positions 0..4 are zeros in both; positions 4..8 must match.
+            let off = (4 + pos) * 2;
+            assert!((restored_k[off] - original_k[off]).abs() < 1e-6);
+            assert!((restored_k[off + 1] - original_k[off + 1]).abs() < 1e-6);
+        }
     }
 
     // ── Paged KV Cache tests ──

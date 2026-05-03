@@ -9,6 +9,82 @@ use super::types::{
     CachedLayerWeights, CachedModelWeights, FullForwardLayerParams, FullForwardLayerParamsTernary,
 };
 
+/// Attempt to run the FFN phase via direct Metal dispatch.
+///
+/// This is the main entry point for `block.rs`. It:
+/// 1. Gets the global `MetalGraph` singleton
+/// 2. Uploads/caches weights lazily (first call per layer uploads, subsequent calls reuse)
+/// 3. Encodes the full 7-op FFN pipeline in one command buffer
+///
+/// Returns `Ok(())` if the Metal dispatch succeeded.
+/// Returns `Err(...)` if Metal is not available or dispatch failed.
+#[allow(clippy::too_many_arguments)]
+pub fn try_metal_ffn(
+    hidden: &mut [f32],
+    attn_out: &[f32],
+    norm_weight: &[f32],
+    eps: f32,
+    attn_proj_handle_id: u64,
+    attn_proj_bytes: &[u8],
+    gate_up_handle_id: u64,
+    gate_bytes: &[u8],
+    up_bytes: &[u8],
+    down_handle_id: u64,
+    down_bytes: &[u8],
+    hidden_size: usize,
+    intermediate_size: usize,
+) -> Result<(), MetalGraphError> {
+    let graph = MetalGraph::global()?;
+    let attn_proj_w = graph.get_or_upload_q1_weight_soa(attn_proj_handle_id, attn_proj_bytes)?;
+    let gate_up_w = graph.get_or_upload_q1_weight_soa_lazy(gate_up_handle_id, || {
+        let mut fused = Vec::with_capacity(gate_bytes.len() + up_bytes.len());
+        fused.extend_from_slice(gate_bytes);
+        fused.extend_from_slice(up_bytes);
+        fused
+    })?;
+    let down_w = graph.get_or_upload_q1_weight_soa(down_handle_id, down_bytes)?;
+    graph.encode_ffn_phase(
+        hidden,
+        attn_out,
+        norm_weight,
+        &attn_proj_w,
+        &gate_up_w,
+        &down_w,
+        hidden_size,
+        intermediate_size,
+        eps,
+    )
+}
+/// Attempt to run a fused QKV projection via direct Metal dispatch.
+///
+/// This is the main entry point for `block.rs` QKV acceleration. It:
+/// 1. Gets the global `MetalGraph` singleton
+/// 2. Uploads/caches the fused Q+K+V weight lazily (first call concatenates and uploads)
+/// 3. Encodes a single GEMV dispatch in one command buffer
+///
+/// Returns `Ok(())` if the Metal dispatch succeeded.
+/// Returns `Err(...)` if Metal is not available or dispatch failed.
+#[allow(clippy::too_many_arguments)]
+pub fn try_metal_qkv(
+    input: &[f32],
+    output: &mut [f32],
+    weight_handle_id: u64,
+    q_bytes: &[u8],
+    k_bytes: &[u8],
+    v_bytes: &[u8],
+    n_rows: usize,
+    k: usize,
+) -> Result<(), MetalGraphError> {
+    let graph = MetalGraph::global()?;
+    let weight = graph.get_or_upload_q1_weight_soa_lazy(weight_handle_id, || {
+        let mut fused = Vec::with_capacity(q_bytes.len() + k_bytes.len() + v_bytes.len());
+        fused.extend_from_slice(q_bytes);
+        fused.extend_from_slice(k_bytes);
+        fused.extend_from_slice(v_bytes);
+        fused
+    })?;
+    graph.encode_qkv_phase(input, output, &weight, n_rows, k)
+}
 /// Attempt to run a full transformer layer via direct Metal dispatch.
 ///
 /// This encodes the complete attention + FFN pipeline for one transformer
@@ -216,11 +292,10 @@ pub fn try_metal_full_forward(
 /// dispatches through the TQ2 Metal kernel and the whole forward pass is
 /// encoded into a single command buffer.
 ///
-/// The final-norm / LM-head tail follows the same convention as the 1-bit
-/// twin: an LM head is always treated as a Q1 weight for now (ternary LM
-/// head is out of scope on this path). Pass `None` for both `final_norm_*`
-/// and `lm_head_*` parameters to skip the tail — the caller then runs the
-/// CPU final-norm + LM-head path.
+/// The final-norm / LM-head tail uses `encode_tail_and_commit_ternary`,
+/// dispatching the LM head via `dispatch_gemv_tq2` (TQ2_0_g128 ternary weight).
+/// Pass `None` for both `final_norm_*` and `lm_head_*` parameters to skip
+/// the tail — the caller then runs the CPU final-norm + LM-head path.
 #[allow(clippy::too_many_arguments)]
 pub fn try_metal_full_forward_ternary(
     hidden: &mut [f32],
@@ -302,7 +377,7 @@ pub fn try_metal_full_forward_ternary(
         _ => None,
     };
     let lm_head_cached = match (lm_head_handle, lm_head_bytes) {
-        (Some(handle), Some(bytes)) => Some(graph.get_or_upload_q1_weight_soa(handle, bytes)?),
+        (Some(handle), Some(bytes)) => Some(graph.get_or_upload_tq2_weight_soa(handle, bytes)?),
         _ => None,
     };
     graph.encode_full_forward_ternary(
@@ -373,6 +448,53 @@ pub fn build_cached_weights(
         layers,
         final_norm,
         lm_head,
+        // Q1 path: ternary fields are unused.
+        ternary_qkv_concats: Vec::new(),
+        ternary_attn_proj_bytes: Vec::new(),
+        ternary_gate_bytes: Vec::new(),
+        ternary_up_bytes: Vec::new(),
+        ternary_down_bytes: Vec::new(),
+        ternary_lm_head_bytes: Vec::new(),
+        ternary_lm_head_out_features: 0,
+    })
+}
+/// Build a `CachedModelWeights` shell for ternary (TQ2_0_g128) models.
+///
+/// Ternary models do **not** use the Q1 `layers` / `final_norm` / `lm_head`
+/// handles at runtime — those fields exist on the struct only because it is
+/// shared with the Q1 path.  This constructor avoids calling
+/// `get_or_upload_q1_weight_soa` (which enforces 18-byte block alignment) by
+/// uploading trivial f32 placeholders under dedicated handle IDs in the
+/// ternary-reserved namespace (`4_000_000` / `4_000_001`).
+///
+/// The real ternary weights are stored in the `ternary_*` Vec fields and
+/// rebuilt into `FullForwardLayerParamsTernary` structs on every decode call.
+pub fn build_cached_weights_ternary_only(
+    ternary_qkv_concats: Vec<Vec<u8>>,
+    ternary_attn_proj_bytes: Vec<Vec<u8>>,
+    ternary_gate_bytes: Vec<Vec<u8>>,
+    ternary_up_bytes: Vec<Vec<u8>>,
+    ternary_down_bytes: Vec<Vec<u8>>,
+    ternary_lm_head_bytes: Vec<u8>,
+    ternary_lm_head_out_features: usize,
+) -> Result<CachedModelWeights, MetalGraphError> {
+    let graph = MetalGraph::global()?;
+    // Trivial f32 placeholder uploads — no block-size constraint, never used
+    // for actual inference on the ternary path.
+    let dummy_f32 = [0.0_f32];
+    let final_norm = graph.get_or_upload_f32_weight(4_000_000u64, &dummy_f32)?;
+    let lm_head_placeholder = graph.get_or_upload_f32_weight(4_000_001u64, &dummy_f32)?;
+    Ok(CachedModelWeights {
+        layers: Vec::new(),
+        final_norm,
+        lm_head: lm_head_placeholder,
+        ternary_qkv_concats,
+        ternary_attn_proj_bytes,
+        ternary_gate_bytes,
+        ternary_up_bytes,
+        ternary_down_bytes,
+        ternary_lm_head_bytes,
+        ternary_lm_head_out_features,
     })
 }
 /// Like `try_metal_full_forward`, but uses pre-cached GPU weight handles.
@@ -434,5 +556,166 @@ pub fn try_metal_full_forward_cached(
         lm_head_out_features,
         logits_out,
         greedy_token_id_out,
+    )
+}
+/// Ternary prefill wrapper: runs all layers + final norm + TQ2 LM head, returning the logits.
+///
+/// This is a thin convenience wrapper around [`try_metal_full_forward_ternary`] that
+/// presets the output mode for prefill (logits returned, no greedy argmax). The caller
+/// receives the full `lm_head_out_features`-length logits vector in `logits_out`.
+///
+/// Use when the model needs sampling (top-p / top-k) after the forward pass.
+#[allow(clippy::too_many_arguments)]
+pub fn try_metal_prefill_ternary(
+    hidden: &mut [f32],
+    pos: usize,
+    n_layers: usize,
+    layer_params: &[FullForwardLayerParamsTernary<'_>],
+    rope_cos: &[f32],
+    rope_sin: &[f32],
+    hidden_size: usize,
+    intermediate_size: usize,
+    nq: usize,
+    nkv: usize,
+    head_dim: usize,
+    eps: f32,
+    max_seq_len: usize,
+    final_norm_handle: Option<u64>,
+    final_norm_bytes: Option<&[f32]>,
+    final_norm_eps: f32,
+    lm_head_handle: Option<u64>,
+    lm_head_bytes: Option<&[u8]>,
+    lm_head_out_features: usize,
+    logits_out: &mut Vec<f32>,
+) -> Result<(), MetalGraphError> {
+    try_metal_full_forward_ternary(
+        hidden,
+        pos,
+        n_layers,
+        layer_params,
+        rope_cos,
+        rope_sin,
+        hidden_size,
+        intermediate_size,
+        nq,
+        nkv,
+        head_dim,
+        eps,
+        max_seq_len,
+        final_norm_handle,
+        final_norm_bytes,
+        final_norm_eps,
+        lm_head_handle,
+        lm_head_bytes,
+        lm_head_out_features,
+        Some(logits_out),
+        None,
+    )
+}
+/// Ternary prefill-verify wrapper: runs all layers + final norm + TQ2 LM head + GPU argmax.
+///
+/// Thin convenience wrapper around [`try_metal_full_forward_ternary`] that presets the
+/// output mode for speculative-decoding verification: greedy argmax is performed on the
+/// GPU and only the 4-byte token ID is downloaded, rather than the full logits vector.
+///
+/// Use when verifying a speculative draft token — only the winning token ID is needed.
+#[allow(clippy::too_many_arguments)]
+pub fn try_metal_prefill_verify_ternary(
+    hidden: &mut [f32],
+    pos: usize,
+    n_layers: usize,
+    layer_params: &[FullForwardLayerParamsTernary<'_>],
+    rope_cos: &[f32],
+    rope_sin: &[f32],
+    hidden_size: usize,
+    intermediate_size: usize,
+    nq: usize,
+    nkv: usize,
+    head_dim: usize,
+    eps: f32,
+    max_seq_len: usize,
+    final_norm_handle: Option<u64>,
+    final_norm_bytes: Option<&[f32]>,
+    final_norm_eps: f32,
+    lm_head_handle: Option<u64>,
+    lm_head_bytes: Option<&[u8]>,
+    lm_head_out_features: usize,
+    greedy_token_id_out: &mut u32,
+) -> Result<(), MetalGraphError> {
+    try_metal_full_forward_ternary(
+        hidden,
+        pos,
+        n_layers,
+        layer_params,
+        rope_cos,
+        rope_sin,
+        hidden_size,
+        intermediate_size,
+        nq,
+        nkv,
+        head_dim,
+        eps,
+        max_seq_len,
+        final_norm_handle,
+        final_norm_bytes,
+        final_norm_eps,
+        lm_head_handle,
+        lm_head_bytes,
+        lm_head_out_features,
+        None,
+        Some(greedy_token_id_out),
+    )
+}
+/// Ternary greedy-decoding wrapper: runs all layers + final norm + TQ2 LM head + GPU argmax.
+///
+/// Thin convenience wrapper around [`try_metal_full_forward_ternary`] that presets the
+/// output mode for greedy (temperature = 0) autoregressive decoding: argmax is performed
+/// on the GPU and only the winning token ID (4 bytes) is downloaded, dramatically reducing
+/// PCIe / memory-bandwidth overhead compared to downloading the full logits vector.
+#[allow(clippy::too_many_arguments)]
+pub fn try_metal_forward_greedy_ternary(
+    hidden: &mut [f32],
+    pos: usize,
+    n_layers: usize,
+    layer_params: &[FullForwardLayerParamsTernary<'_>],
+    rope_cos: &[f32],
+    rope_sin: &[f32],
+    hidden_size: usize,
+    intermediate_size: usize,
+    nq: usize,
+    nkv: usize,
+    head_dim: usize,
+    eps: f32,
+    max_seq_len: usize,
+    final_norm_handle: Option<u64>,
+    final_norm_bytes: Option<&[f32]>,
+    final_norm_eps: f32,
+    lm_head_handle: Option<u64>,
+    lm_head_bytes: Option<&[u8]>,
+    lm_head_out_features: usize,
+    greedy_token_id_out: &mut u32,
+) -> Result<(), MetalGraphError> {
+    try_metal_full_forward_ternary(
+        hidden,
+        pos,
+        n_layers,
+        layer_params,
+        rope_cos,
+        rope_sin,
+        hidden_size,
+        intermediate_size,
+        nq,
+        nkv,
+        head_dim,
+        eps,
+        max_seq_len,
+        final_norm_handle,
+        final_norm_bytes,
+        final_norm_eps,
+        lm_head_handle,
+        lm_head_bytes,
+        lm_head_out_features,
+        None,
+        Some(greedy_token_id_out),
     )
 }

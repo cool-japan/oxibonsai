@@ -25,8 +25,9 @@ fn test_kv_cache_layer_offset_arithmetic() {
     let n_kv = 8usize;
     let max_seq = 512usize;
     let head_dim = 128usize;
-    let layer_0 = (0 * n_kv * max_seq * head_dim) as u32;
-    let layer_1 = (1 * n_kv * max_seq * head_dim) as u32;
+    let layer_offset = |layer_idx: usize| (layer_idx * n_kv * max_seq * head_dim) as u32;
+    let layer_0 = layer_offset(0);
+    let layer_1 = layer_offset(1);
     assert_eq!(layer_0, 0);
     assert_eq!(layer_1, 8 * 512 * 128);
 }

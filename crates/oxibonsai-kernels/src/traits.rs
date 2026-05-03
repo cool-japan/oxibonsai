@@ -59,6 +59,16 @@ pub trait OneBitKernel: Send + Sync {
     /// Display name for this kernel implementation.
     fn name(&self) -> &'static str;
 
+    /// Whether this kernel routes ops through GPU hardware.
+    ///
+    /// CPU-only tiers (Reference, AVX2, AVX-512, NEON) return `false`. The
+    /// GPU tier returns `true`. Higher-level code (e.g. `BonsaiModel::forward`)
+    /// uses this to decide whether to take fused-GPU shortcuts that bypass
+    /// the per-block kernel calls.
+    fn is_gpu_accelerated(&self) -> bool {
+        false
+    }
+
     /// Upload weight blocks to GPU memory for future cached GEMV/GEMM calls.
     ///
     /// Returns `Some(handle)` if the kernel supports GPU caching (i.e. the

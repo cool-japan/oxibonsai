@@ -42,7 +42,7 @@ mod decode_ternary;
 mod prefill;
 mod utility;
 
-#[cfg(any(feature = "metal", feature = "cuda"))]
+#[cfg(any(all(feature = "metal", target_os = "macos"), feature = "cuda"))]
 pub use archive::*;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub use attention::*;

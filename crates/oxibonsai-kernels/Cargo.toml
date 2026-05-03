@@ -21,6 +21,7 @@ simd-neon = []
 wasm = []
 cuda = ["gpu", "scirs2-core/gpu", "scirs2-core/cuda"]
 native-cuda = ["gpu", "dep:cudarc"]
+native-cuda-11 = ["native-cuda"]  # alias for CUDA 11.x environments (same code path)
 metal = ["gpu", "scirs2-core/gpu", "scirs2-core/metal", "dep:metal", "dep:objc"]
 gpu = ["scirs2-core/gpu"]
 avx2 = []

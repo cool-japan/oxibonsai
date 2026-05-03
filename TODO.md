@@ -1,7 +1,7 @@
 # OxiBonsai TODO
 
 > Pure Rust 1-bit LLM inference engine for PrismML Bonsai models
-> 403 source files, ~111,392 lines of Rust code, 3,544 tests passing across workspace — verified 2026-04-19
+> 408 source files, ~139,012 lines of Rust code, 3,560 tests passing across workspace — verified 2026-05-03
 
 ## Phase Status
 
@@ -21,6 +21,7 @@
 | Phase 11: Metal TQ2 GEMV + dispatch | ✅ Complete | Per-kernel Metal TQ2_0_g128 dispatch in `gpu_backend/metal_*` |
 | Phase 12: Native CUDA backend | ✅ Complete | NVRTC kernels, fused Q1 + TQ2 full-forward; ~21.9 tok/s on Ternary-Bonsai-1.7B |
 | Phase 13.x: Fused Metal TQ2 full-forward | ✅ Complete | Single command buffer per token, ~13× speedup; ~50 tok/s on Ternary-Bonsai-1.7B |
+| Phase 13.y: Ternary LM head on GPU | ✅ Complete | All 7 `OutputWeight::Ternary` guard sites closed (4 Metal + 3 CUDA); Metal ~54.5 tok/s avg on Ternary-Bonsai-1.7B |
 
 ## Phase 4 — Complete
 
@@ -202,6 +203,40 @@
 - [x] **`scripts/download_ternary.sh`** — HF `hf` CLI fetch + safetensors → GGUF conversion wrapper
 - [x] **Measured** — ~50 tok/s (best ~57) on Ternary-Bonsai-1.7B on Apple Silicon (M-series), ~13× speedup vs the per-GEMV dispatch of Phase 11
 
+## Phase 13.y — Complete (shipped in 0.1.3)
+
+Closes all 7 `OutputWeight::Ternary(_)` CPU-fallback guard sites in `crates/oxibonsai-model/src/model/types.rs`.
+
+### Milestone 1 — Metal ternary LM head (4 guard sites)
+
+- [x] Pre-split `model/types.rs` (1857 lines → >2000 after M1 additions) via `splitrs` (completed 2026-04-24)
+  - **Goal:** Keep every file under 2000 lines. Split into `types.rs` + `types_gpu_cache.rs` + `types_forward_metal.rs`.
+  - **Files:** `crates/oxibonsai-model/src/model/types/mod.rs` (541), `gpu_cache.rs` (233), `forward_metal.rs` (1054), `forward_cuda.rs` (454).
+  - **Tests:** `cargo nextest run -p oxibonsai-model --all-features` green after split.
+
+- [x] Add `MetalGraph::encode_tail_and_commit_ternary` + update `encode_full_forward_ternary` routing + update `try_metal_full_forward_ternary` LM-head upload (completed 2026-04-24)
+  - **Goal:** Kernel-layer ternary LM head support. `encode_tail_and_commit_ternary` mirrors `encode_tail_and_commit` but uses `dispatch_gemv_tq2` at the LM-head GEMV site. `encode_full_forward_ternary` routes to it. `try_metal_full_forward_ternary` uploads via `get_or_upload_tq2_weight_soa` with namespace `4_000_000+`.
+  - **Files:** `crates/oxibonsai-kernels/src/gpu_backend/metal_full_layer/functions_2.rs`, `functions_3.rs`, `metal_graph.rs` (test).
+  - **Tests:** `test_encode_tail_ternary_matches_reference` passes — bit-exact token match, logits within 1e-3.
+
+- [x] Extend `CachedModelWeights` + remove short-circuit + wire ternary cache builder + remove 4 Metal guards (completed 2026-04-24)
+  - **Goal:** Model-layer: `CachedModelWeights` extended with ternary fields; ternary cache builder wired; all 4 Metal Err guards replaced with `try_metal_*_ternary` routes; 3 new thin wrappers in `functions_3.rs`.
+  - **Files:** `crates/oxibonsai-model/src/model/types/gpu_cache.rs`, `forward_metal.rs`; `crates/oxibonsai-kernels/src/gpu_backend/metal_full_layer/functions_3.rs`.
+  - **Tests:** CPU vs Metal greedy-decode output byte-matches on Ternary-Bonsai-1.7B (temp=0, seed=42). Metal avg=54.5 tok/s (best=55.4) — improvement from ~50 tok/s baseline.
+
+### Milestone 2 — CUDA ternary full-forward (3 guard sites)
+
+- [x] Pre-split `cuda_full_layer.rs` (1687 lines → >2000 after M2 additions) via `splitrs` (completed 2026-04-24)
+  - **Goal:** Split into `cuda_full_layer/mod.rs` + `encode_q1.rs` + `encode_ternary.rs` (new, M2 target).
+  - **Files:** `crates/oxibonsai-kernels/src/gpu_backend/cuda_full_layer.rs` → directory.
+  - **Tests:** `cargo check --features cuda` green (execution gated by CI-GPU).
+
+- [x] Implement CUDA ternary full-forward path (completed 2026-04-24)
+  - **Goal:** `encode_layer_into_ternary` (14 dispatches/layer, same split-dispatch shape as Metal Phase 13.x), `encode_full_forward_ternary`, `encode_lm_head_gemv_ternary` (single `launch_gemv_tq2_v1`), `try_cuda_full_forward_ternary` + `try_cuda_full_forward_ternary_with_gpu_lm_head`. Remove 3 CUDA guards at `try_cuda_full_forward_with_lm_head`, `try_cuda_prefill_with_lm_head`, `try_cuda_prefill_verify`.
+  - **Files:** `crates/oxibonsai-kernels/src/gpu_backend/cuda_full_layer/encode_ternary.rs` (implemented); `crates/oxibonsai-model/src/model/types/forward_cuda.rs` (3 guards removed).
+  - **Tests:** `test_encode_lm_head_gemv_ternary_matches_reference`, `test_encode_full_forward_ternary_matches_reference` (CI-GPU-gated). `cargo check --all-features` + clippy + 140 non-CUDA tests all green.
+  - **Risk:** `CuGraphHolder` captured-graph pattern — capture+replay must be tested end-to-end, not just isolated kernel launches. Post-merge validation on CUDA hardware required.
+
 ## Performance Targets
 
 | Platform | Target | Status |
@@ -213,7 +248,7 @@
 | ARM NEON (ternary) | >= 14 t/s | 🔶 Apple Silicon measured ~7–8 t/s end-to-end on Ternary-Bonsai-1.7B |
 | x86-64 AVX2 (ternary) | >= 18 t/s | 🔶 Kernels done, not benchmarked end-to-end |
 | x86-64 AVX-512 (ternary) | >= 26 t/s | 🔶 Kernels done, not benchmarked end-to-end |
-| Metal fused TQ2 (Apple Silicon) | >= 30 t/s | ✅ Measured ~50 t/s (best ~57) on Ternary-Bonsai-1.7B |
+| Metal fused TQ2 (Apple Silicon) | >= 30 t/s | ✅ Measured avg=54.5 t/s (best=55.4) on Ternary-Bonsai-1.7B (Phase 13.y, 2026-04-24; was ~50 t/s after Phase 13.x) |
 | CUDA native TQ2 (NVIDIA GPU) | >= 20 t/s | ✅ Measured ~21.9 t/s on Ternary-Bonsai-1.7B |
 
 ## Memory Targets

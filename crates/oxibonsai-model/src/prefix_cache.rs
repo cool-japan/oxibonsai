@@ -349,6 +349,17 @@ impl PrefixCache {
         self.block_size
     }
 
+    /// Borrow a cached block by its index in the underlying arena.
+    ///
+    /// Block indices are returned by [`CacheSession::block_indices`] when a
+    /// session is prepared via
+    /// [`PrefixAwarePrefill::prepare`](crate::prefix_cache::PrefixAwarePrefill::prepare).
+    /// `None` means the index is out of bounds (e.g. the sentinel
+    /// `usize::MAX` placed for trie path failures).
+    pub fn get_block(&self, idx: usize) -> Option<&CacheBlock> {
+        self.blocks.get(idx)
+    }
+
     /// Remove all cached blocks, resetting the trie to an empty root.
     pub fn clear(&mut self) {
         self.nodes.clear();

@@ -205,4 +205,25 @@ pub struct CachedModelWeights {
     pub layers: Vec<CachedLayerWeights>,
     pub final_norm: Arc<MetalWeightHandle>,
     pub lm_head: Arc<MetalWeightHandle>,
+
+    // ── Ternary (TQ2_0_g128) cache fields ───────────────────────────────────
+    //
+    // These are populated only for ternary models. For Q1 models they remain
+    // empty/zero.  Layer params are NOT stored here (they borrow from these
+    // vecs); callers rebuild `FullForwardLayerParamsTernary` each decode call
+    // by referencing the slices below — cheap struct literals, no leaks.
+    //
+    // Handle ID allocation (distinct from the Q1 namespace):
+    //   norm    handles: 5_000_000 + layer * 10 + offset
+    //   weight  handles: 6_000_000 + layer * 10 + offset
+    //   lm_head handle : 7_000_000
+    pub ternary_qkv_concats: Vec<Vec<u8>>,
+    pub ternary_attn_proj_bytes: Vec<Vec<u8>>,
+    /// Gate projection bytes per layer (separate from up, kernel concatenates lazily).
+    pub ternary_gate_bytes: Vec<Vec<u8>>,
+    /// Up projection bytes per layer.
+    pub ternary_up_bytes: Vec<Vec<u8>>,
+    pub ternary_down_bytes: Vec<Vec<u8>>,
+    pub ternary_lm_head_bytes: Vec<u8>,
+    pub ternary_lm_head_out_features: usize,
 }

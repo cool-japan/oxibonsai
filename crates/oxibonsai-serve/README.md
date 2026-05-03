@@ -1,6 +1,6 @@
 # oxibonsai-serve
 
-**Status:** Stable — **Version:** 0.1.2 — **Tests:** 161 passing
+**Status:** Stable — **Version:** 0.1.3 — **Tests:** 161 passing
 
 Standalone OpenAI-compatible inference server for OxiBonsai.
 

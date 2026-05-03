@@ -395,11 +395,13 @@ fn acquire_single_token_buffers(
     Ok(guard)
 }
 
+type PrefillLogitsGuard = std::sync::MutexGuard<'static, Option<(CudaSlice<f32>, usize)>>;
+
 /// Acquire or (re-)allocate the LM-head logits buffer.
 fn acquire_prefill_logits(
     graph: &CudaGraph,
     n: usize,
-) -> Result<std::sync::MutexGuard<'static, Option<(CudaSlice<f32>, usize)>>, CudaGraphError> {
+) -> Result<PrefillLogitsGuard, CudaGraphError> {
     let state = prefill_state();
     let mut guard = state
         .prefill_logits

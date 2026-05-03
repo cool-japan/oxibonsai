@@ -852,10 +852,9 @@ impl MetalGraph {
     ///
     /// Transformer layers dispatch through `Self::encode_layer_into_ternary`,
     /// so every attention/FFN projection is a TQ2 GEMV. The trailing
-    /// `final_norm + lm_head + (optional argmax)` block is forwarded to the
-    /// shared `Self::encode_tail_and_commit` helper unchanged — the LM head
-    /// is expected to be a Q1 weight handle (ternary LM head is out of scope
-    /// for this path). Pass `None` for both `final_norm_w` and `lm_head_w`
+    /// `final_norm + TQ2 LM head + (optional argmax)` block is forwarded to
+    /// `Self::encode_tail_and_commit_ternary` which dispatches the LM head via
+    /// `dispatch_gemv_tq2`. Pass `None` for both `final_norm_w` and `lm_head_w`
     /// to skip the tail (the caller then runs its own final-norm + LM-head
     /// path on CPU).
     #[allow(dead_code)]
@@ -989,7 +988,7 @@ impl MetalGraph {
             );
             let tail_cmd = self.command_queue.new_command_buffer();
             let tail_enc = tail_cmd.new_compute_command_encoder();
-            self.encode_tail_and_commit(
+            self.encode_tail_and_commit_ternary(
                 tail_enc,
                 tail_cmd,
                 bufs,
@@ -1036,7 +1035,7 @@ impl MetalGraph {
                     max_seq_len,
                 )?;
             }
-            self.encode_tail_and_commit(
+            self.encode_tail_and_commit_ternary(
                 encoder,
                 cmd_buf,
                 bufs,
@@ -1177,6 +1176,148 @@ impl MetalGraph {
                 if profiling {
                     eprintln!(
                         "[profile] tail (no lmhead) = {:.3}ms",
+                        t.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+                if let Some(ws) = gpu_profile_wall_start {
+                    let (gs, ge) = unsafe { gpu_profile::gpu_cmd_times(cmd_buf) };
+                    gpu_profile::record_and_print(ws, encode_end, gs, ge);
+                }
+                unsafe {
+                    download_f32(&bufs.hidden_buf, &mut hidden[..hidden_size]);
+                }
+            }
+        }
+        Ok(())
+    }
+    /// Ternary tail: final RMSNorm + TQ2 LM head + optional argmax, then commit + wait + download.
+    ///
+    /// Identical to `encode_tail_and_commit` in control flow and all steps
+    /// except the LM-head GEMV, which is dispatched via `dispatch_gemv_tq2`
+    /// instead of `dispatch_gemv_q1`. Use this when the LM head is stored as
+    /// a TQ2_0_g128 quantised weight (ternary models).
+    ///
+    /// When `profiling` is true, prints timing for the tail section.
+    /// When `gpu_profile_wall_start` is Some, captures GPU timing breakdown.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_tail_and_commit_ternary(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        cmd_buf: &metal::CommandBufferRef,
+        bufs: &FullLayerBuffers,
+        hidden: &mut [f32],
+        hidden_size: usize,
+        final_norm_w: Option<&Arc<MetalWeightHandle>>,
+        final_norm_eps: f32,
+        lm_head_w: Option<&Arc<MetalWeightHandle>>,
+        lm_head_out_features: usize,
+        logits_out: Option<&mut Vec<f32>>,
+        greedy_token_id_out: Option<&mut u32>,
+        profiling: bool,
+        gpu_profile_wall_start: Option<std::time::Instant>,
+    ) -> Result<(), MetalGraphError> {
+        match (final_norm_w, lm_head_w) {
+            (Some(fnorm_w), Some(lm_w)) if lm_head_out_features > 0 => {
+                let h = hidden_size as u32;
+                self.dispatch_rmsnorm(
+                    encoder,
+                    &bufs.hidden_buf,
+                    &fnorm_w.buffer,
+                    &bufs.normed_buf,
+                    final_norm_eps,
+                    h,
+                );
+                let mut lg = self.logits_buf.lock().map_err(|_| {
+                    MetalGraphError::ExecutionFailed("logits_buf lock poisoned".into())
+                })?;
+                let needed_bytes = (lm_head_out_features * std::mem::size_of::<f32>()) as u64;
+                if lg.as_ref().is_none_or(|b| b.length() < needed_bytes) {
+                    *lg = Some(alloc_buf(
+                        &self.device,
+                        needed_bytes,
+                        MTLResourceOptions::StorageModeShared,
+                    )?);
+                }
+                let logits_buf = lg.as_ref().ok_or(MetalGraphError::BufferCreationFailed)?;
+                self.dispatch_gemv_tq2(
+                    encoder,
+                    &lm_w.buffer,
+                    &bufs.normed_buf,
+                    logits_buf,
+                    lm_head_out_features as u32,
+                    h,
+                );
+                if greedy_token_id_out.is_some() {
+                    let mut tid_guard = self.token_id_buf.lock().map_err(|_| {
+                        MetalGraphError::ExecutionFailed("token_id_buf lock poisoned".into())
+                    })?;
+                    let needed = std::mem::size_of::<u32>() as u64;
+                    if tid_guard.as_ref().is_none_or(|b| b.length() < needed) {
+                        *tid_guard = Some(alloc_buf(
+                            &self.device,
+                            needed,
+                            MTLResourceOptions::StorageModeShared,
+                        )?);
+                    }
+                    let token_id_buf_ref = tid_guard
+                        .as_ref()
+                        .ok_or(MetalGraphError::BufferCreationFailed)?;
+                    self.dispatch_argmax(
+                        encoder,
+                        logits_buf,
+                        token_id_buf_ref,
+                        lm_head_out_features as u32,
+                    );
+                    let encode_end = std::time::Instant::now();
+                    encoder.end_encoding();
+                    cmd_buf.commit();
+                    let t = std::time::Instant::now();
+                    cmd_buf.wait_until_completed();
+                    if profiling {
+                        eprintln!(
+                            "[profile] tail ternary (norm+lmhead+argmax) = {:.3}ms",
+                            t.elapsed().as_secs_f64() * 1000.0
+                        );
+                    }
+                    if let Some(ws) = gpu_profile_wall_start {
+                        let (gs, ge) = unsafe { gpu_profile::gpu_cmd_times(cmd_buf) };
+                        gpu_profile::record_and_print(ws, encode_end, gs, ge);
+                    }
+                    let token_id = unsafe { *(token_id_buf_ref.contents() as *const u32) };
+                    if let Some(out) = greedy_token_id_out {
+                        *out = token_id;
+                    }
+                } else {
+                    let encode_end = std::time::Instant::now();
+                    encoder.end_encoding();
+                    cmd_buf.commit();
+                    let t = std::time::Instant::now();
+                    cmd_buf.wait_until_completed();
+                    if profiling {
+                        eprintln!(
+                            "[profile] tail ternary (norm+lmhead) = {:.3}ms",
+                            t.elapsed().as_secs_f64() * 1000.0
+                        );
+                    }
+                    if let Some(ws) = gpu_profile_wall_start {
+                        let (gs, ge) = unsafe { gpu_profile::gpu_cmd_times(cmd_buf) };
+                        gpu_profile::record_and_print(ws, encode_end, gs, ge);
+                    }
+                    if let Some(out) = logits_out {
+                        out.resize(lm_head_out_features, 0.0);
+                        unsafe { download_f32(logits_buf, out) };
+                    }
+                }
+            }
+            _ => {
+                let encode_end = std::time::Instant::now();
+                encoder.end_encoding();
+                cmd_buf.commit();
+                let t = std::time::Instant::now();
+                cmd_buf.wait_until_completed();
+                if profiling {
+                    eprintln!(
+                        "[profile] tail ternary (no lmhead) = {:.3}ms",
                         t.elapsed().as_secs_f64() * 1000.0
                     );
                 }

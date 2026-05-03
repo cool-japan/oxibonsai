@@ -7,8 +7,8 @@ Implements the full autoregressive forward pass for the Qwen3 architecture famil
 embedding, Grouped Query Attention with RoPE, SwiGLU MLP, RMSNorm, paged
 KV-cache, and Metal/CUDA full-forward integration via `oxibonsai-kernels`.
 
-**Status:** Stable — 1,045 tests passing (`cargo nextest run -p oxibonsai-model`)
-**Version:** 0.1.2
+**Status:** Stable — 1,048 tests passing (`cargo nextest run -p oxibonsai-model`)
+**Version:** 0.1.3
 
 Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 
@@ -85,7 +85,7 @@ Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 
 ```toml
 [dependencies]
-oxibonsai-model = "0.1.2"
+oxibonsai-model = "0.1.3"
 ```
 
 ## License

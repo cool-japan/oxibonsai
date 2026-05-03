@@ -3,9 +3,9 @@
 > Pure Rust RAG pipeline: document chunking, embedding, vector store, retrieval
 > 9 files, ~2,450 lines, 58 tests passing
 
-**Version:** 0.1.1
+**Version:** 0.1.3
 **Status:** Alpha — all core features complete
-**Last updated:** 2026-04-18
+**Last updated:** 2026-05-03
 
 Full retrieval-augmented generation pipeline implemented with multiple chunking strategies, pure Rust embedders, and in-memory vector search.
 

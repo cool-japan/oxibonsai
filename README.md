@@ -10,14 +10,14 @@ OxiBonsai is a zero-FFI, zero-C/C++ inference engine for PrismML's sub-2-bit Bon
 
 ## Status
 
-**Version 0.1.2** — released 2026-04-19 · **3,544 tests passing** · ~111k lines of Rust · Pure Rust
+**Version 0.1.3** — released 2026-05-03 · **3,560 tests passing** · ~139k lines of Rust · Pure Rust
 
 | Crate | Status | Tests |
 |-------|--------|-------|
 | oxibonsai-core     | Stable | 243   |
-| oxibonsai-kernels  | Stable | 290   |
-| oxibonsai-model    | Stable | 1,045 |
-| oxibonsai-runtime  | Stable | 1,040 |
+| oxibonsai-kernels  | Stable | 291   |
+| oxibonsai-model    | Stable | 1,048 |
+| oxibonsai-runtime  | Stable | 1,044 |
 | oxibonsai-tokenizer| Stable | 268   |
 | oxibonsai-rag      | Stable | 206   |
 | oxibonsai-eval     | Stable | 151   |
@@ -122,22 +122,43 @@ Ternary weights trade roughly +600 MB (at 8B scale) for ~5 additional benchmark 
 
 ## Installation
 
-Add OxiBonsai to your `Cargo.toml`:
+### CLI (recommended for end users)
+
+```bash
+cargo install oxibonsai-cli
+```
+
+This installs the `oxibonsai` binary. Rust 1.86+ required.
+
+### Library (for Rust projects)
 
 ```toml
 [dependencies]
-oxibonsai = "0.1.2"
+oxibonsai = "0.1.3"
+```
+
+### Build from source (for development)
+
+```bash
+git clone https://github.com/cool-japan/oxibonsai
+cd oxibonsai
+cargo build --release
+# binary at: target/release/oxibonsai
 ```
 
 ## Quick Start
 
-### 1. Build
+> **If you installed via `cargo install oxibonsai-cli`**, start from Step 2.
+> The `oxibonsai` binary is already on your PATH.
+
+### Step 1 — (source builds only) Build
 
 ```bash
 cargo build --release
+export PATH="$PWD/target/release:$PATH"
 ```
 
-### 2. Get a model
+### Step 2 — Get a model
 
 Pick **one** of the two families (or grab both):
 
@@ -156,7 +177,20 @@ curl -L -o models/Bonsai-8B.gguf \
 > **Ternary prerequisite:** `scripts/download_ternary.sh` uses the
 > HuggingFace `hf` CLI — install with `pip install huggingface_hub`.
 
-### 3. Run inference
+### Step 3 — Get the tokenizer
+
+A tokenizer is required for all inference commands.
+Option B above already downloads it automatically.
+For **Option A** (or `cargo install` users):
+
+```bash
+oxibonsai tokenizer download          # saves to models/tokenizer.json
+```
+
+The tokenizer is pulled from `Qwen/Qwen3-8B` on HuggingFace (~2.7 MB).
+Use `--output` to save elsewhere, `--repo` to use a different HF repo.
+
+### Step 4 — Run inference
 
 ```bash
 # 1-bit Bonsai-8B
@@ -329,6 +363,7 @@ All default-feature dependencies are Pure Rust — zero C/C++/Fortran, zero FFI.
 | Phase 11 | Metal TQ2 GEMV + per-kernel dispatch | ✅ |
 | Phase 12 | Native CUDA backend (NVRTC, fused Q1 + TQ2 full-forward) | ✅ |
 | Phase 13.x | Fused Metal TQ2 full-forward (single command buffer, ~13× speedup on 1.7B) | ✅ |
+| Phase 13.y | Ternary LM head on GPU — closes all 7 `OutputWeight::Ternary` guard sites (4 Metal + 3 CUDA); +5 tok/s on Metal | ✅ |
 
 ## Sponsorship
 

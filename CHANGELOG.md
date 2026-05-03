@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-05-03
+
+### Added
+- Prefix-cache–aware inference engine (`PrefixCachedEngine`) — KV-cache reuse across requests with cold/warm path parity
+- Tokenizer auto-detection at runtime (sentencepiece vs. HF tokenizers) with a tokenizer bridge
+- GPU weight cache management for `BonsaiModel` — single upload, reuse across decode steps
+- CUDA ternary (TQ2) encoding kernels in `oxibonsai-kernels` (`encode_ternary` path) and full-forward CUDA fused layer
+- Metal full-forward layer split into `forward_metal.rs` / `forward_cuda.rs` modules with shared `gpu_cache.rs`
+- `oxibonsai-tokenizer` upgrades and CLI tokenizer management commands
+
+### Changed
+- Workspace version bump to 0.1.3 across all nine subcrates and `[workspace.dependencies]`
+- Upgraded `oxifft` workspace dependency to 0.3
+- Updated CUDA dependencies (`cudarc`) for better CUDA 11.x / 12.x compatibility
+- `oxibonsai-runtime` server and engine refactored to thread the prefix-cache and tokenizer-bridge plumbing
+- `download_ternary.sh` script: parallel downloads and improved error messages
+- Refactored `oxibonsai-model::model::types` (1857 lines) into a `types/` directory with `mod.rs`, `forward_cuda.rs`, `forward_metal.rs`, `gpu_cache.rs` (under-2000-lines policy)
+
+### Fixed
+- `PrefixCachedEngine` cached-path output now matches cold-cache path byte-for-byte in tests
+- LF line-ending enforcement for shell scripts via `.gitattributes`
+
 ## [0.1.2] - 2026-04-19
 
 ### Added

@@ -2,8 +2,8 @@
 
 > Model evaluation harness: perplexity, accuracy, ROUGE, throughput metrics
 > 17 source files, 9 test files, 151 integration + proptest tests passing
-> Version: 0.1.2 — Status: Stable
-> Last updated: 2026-04-19
+> Version: 0.1.3 — Status: Stable
+> Last updated: 2026-05-03
 
 ## Status: Stable — BLEU / chrF / METEOR / SQuAD / calibration / bootstrap / streaming added
 

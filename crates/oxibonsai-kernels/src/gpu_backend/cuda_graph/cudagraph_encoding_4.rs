@@ -41,6 +41,25 @@ impl CudaGraph {
             .map(|_| ())
             .map_err(|e| CudaGraphError::DriverError(format!("gemv_tq2_v1 launch: {e}")))
     }
+    /// Public wrapper — launch `gemv_tq2_g128_v1` directly from cached device slices.
+    ///
+    /// Used by the full-forward ternary path (`encode_layer_into_ternary`) where the
+    /// weight is already on device and the input/output slices live in the shared
+    /// `CudaFullLayerBuffers` — no H2D/D2H or pool allocation is needed.
+    ///
+    /// # Safety
+    /// All slices must be valid device pointers allocated on `self.stream`.
+    pub unsafe fn launch_gemv_tq2_v1_pub(
+        &self,
+        d_weight: &Arc<CudaSlice<u8>>,
+        d_input: &CudaSlice<f32>,
+        d_output: &mut CudaSlice<f32>,
+        n_rows: u32,
+        k: u32,
+    ) -> Result<(), CudaGraphError> {
+        self.launch_gemv_tq2_v1(d_weight, d_input, d_output, n_rows, k)
+    }
+
     /// Execute a TQ2 (ternary) GEMV using a pre-cached SoA weight handle.
     ///
     /// Uses a process-wide reusable input/output buffer pool that grows to fit

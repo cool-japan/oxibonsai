@@ -23,7 +23,7 @@ use crate::ngram_cache::NgramCache;
 use crate::sampling::{Sampler, SamplingParams};
 
 /// EOS token for Qwen3 models.
-const EOS_TOKEN_ID: u32 = 151645;
+pub const EOS_TOKEN_ID: u32 = 151645;
 
 /// Statistics about engine usage, accumulated over the engine's lifetime.
 #[derive(Debug)]
@@ -99,6 +99,14 @@ pub struct InferenceEngine<'a> {
     sampler: Sampler,
     metrics: Option<Arc<InferenceMetrics>>,
     stats: Arc<EngineStats>,
+    /// Cumulative number of tokens that have been processed by
+    /// [`InferenceEngine::prefill_from_pos`] across the engine's lifetime.
+    ///
+    /// Used by the prefix-cache integration to verify that cached prefixes
+    /// actually reduce prefill work — the cached portion of a prompt is not
+    /// re-fed into prefill, so a repeated prompt should increment this
+    /// counter by strictly fewer tokens than its full length.
+    prefill_token_count: u64,
 }
 
 impl<'a> InferenceEngine<'a> {
@@ -116,6 +124,44 @@ impl<'a> InferenceEngine<'a> {
             sampler,
             metrics: None,
             stats: Arc::new(EngineStats::new()),
+            prefill_token_count: 0,
+        }
+    }
+
+    /// Wrap an already-constructed [`BonsaiModel`] in an inference engine.
+    ///
+    /// Lets tests (and future custom-model paths) build a model with
+    /// non-trivial weights and then attach the standard sampler/kernel
+    /// machinery without going through the GGUF loader.
+    pub fn from_model(model: BonsaiModel<'a>, sampling_params: SamplingParams, seed: u64) -> Self {
+        Self::from_model_with_kernel(
+            model,
+            KernelDispatcher::auto_detect(),
+            sampling_params,
+            seed,
+        )
+    }
+
+    /// Wrap an already-constructed [`BonsaiModel`] using a caller-supplied
+    /// kernel dispatcher.
+    ///
+    /// Use this when you need to pin the engine to a specific kernel tier
+    /// (e.g. a CPU-only `KernelTier::Reference` for tests that exercise the
+    /// CPU KV-cache path on a host that would otherwise auto-detect a GPU).
+    pub fn from_model_with_kernel(
+        model: BonsaiModel<'a>,
+        kernel: KernelDispatcher,
+        sampling_params: SamplingParams,
+        seed: u64,
+    ) -> Self {
+        let sampler = Sampler::new(sampling_params, seed);
+        Self {
+            model,
+            kernel,
+            sampler,
+            metrics: None,
+            stats: Arc::new(EngineStats::new()),
+            prefill_token_count: 0,
         }
     }
 
@@ -187,6 +233,7 @@ impl<'a> InferenceEngine<'a> {
             sampler,
             metrics: None,
             stats: Arc::new(EngineStats::new()),
+            prefill_token_count: 0,
         })
     }
 
@@ -200,9 +247,55 @@ impl<'a> InferenceEngine<'a> {
         &self.model
     }
 
+    /// Get a mutable reference to the model.
+    ///
+    /// Used by the prefix-cache integration to inject restored KV blocks
+    /// before running the abbreviated prefill.
+    pub fn model_mut(&mut self) -> &mut BonsaiModel<'a> {
+        &mut self.model
+    }
+
     /// Get a reference to the kernel dispatcher.
     pub fn kernel(&self) -> &KernelDispatcher {
         &self.kernel
+    }
+
+    /// Run prefill at a given KV-cache offset.
+    ///
+    /// Unlike [`InferenceEngine::generate`], this does **not** reset the
+    /// model's KV cache before execution: callers (e.g. the prefix-cache
+    /// engine) are expected to have prepared the cache state explicitly.
+    ///
+    /// Increments the [`prefill_token_count`](Self::prefill_token_count)
+    /// counter by `prompt_tokens.len()` on success.
+    pub fn prefill_from_pos(
+        &mut self,
+        prompt_tokens: &[u32],
+        pos_start: usize,
+    ) -> RuntimeResult<Vec<f32>> {
+        let logits = self
+            .model
+            .forward_prefill(prompt_tokens, pos_start, &self.kernel)?;
+        self.prefill_token_count = self
+            .prefill_token_count
+            .saturating_add(prompt_tokens.len() as u64);
+        Ok(logits)
+    }
+
+    /// Forward one token at the given absolute position.
+    pub fn decode_step(&mut self, token: u32, pos: usize) -> RuntimeResult<Vec<f32>> {
+        Ok(self.model.forward(token, pos, &self.kernel)?)
+    }
+
+    /// Sample one token from `logits` using the engine's current sampler.
+    pub fn sample(&mut self, logits: &[f32]) -> RuntimeResult<u32> {
+        self.sampler.sample(logits)
+    }
+
+    /// Cumulative number of tokens that have been processed by
+    /// [`InferenceEngine::prefill_from_pos`] over this engine's lifetime.
+    pub fn prefill_token_count(&self) -> u64 {
+        self.prefill_token_count
     }
 
     /// Reset the model state for a new conversation.

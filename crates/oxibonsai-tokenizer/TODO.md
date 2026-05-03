@@ -2,7 +2,7 @@
 
 > Pure Rust BPE tokenizer: encode, decode, training, serialization
 > 12 src files + 5 integration test files, ~6,700 lines, 260+ tests (all passing)
-> Version: 0.1.2 · Last updated: 2026-04-19
+> Version: 0.1.3 · Last updated: 2026-05-03
 
 ## Status: Stable — HuggingFace-Compatible BPE
 

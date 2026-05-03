@@ -32,6 +32,7 @@ use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use memmap2::Mmap;
 use safetensors::{Dtype, SafeTensors};
 use serde_json::Value;
 
@@ -78,19 +79,23 @@ pub fn convert_hf_to_gguf(
     // ── 2. Collect shard paths ───────────────────────────────────────────────
     let shard_paths = discover_shard_paths(from_dir)?;
 
-    // ── 3. Load all raw tensor bytes from shards ─────────────────────────────
-    // We store each shard's raw bytes so that SafeTensors can borrow from them.
-    let shard_bytes_list: Vec<Vec<u8>> = shard_paths
+    // ── 3. Memory-map shards (no copying into RAM) ───────────────────────────
+    // Using mmap avoids loading the entire safetensors file (≥3 GB) into RAM.
+    let shard_files: Vec<std::fs::File> = shard_paths
         .iter()
-        .map(|p| std::fs::read(p).with_context(|| format!("reading shard {:?}", p)))
+        .map(|p| std::fs::File::open(p).with_context(|| format!("opening shard {:?}", p)))
+        .collect::<anyhow::Result<_>>()?;
+    let shard_mmaps: Vec<Mmap> = shard_files
+        .iter()
+        .map(|f| unsafe { Mmap::map(f) }.with_context(|| "memory-mapping shard failed"))
         .collect::<anyhow::Result<_>>()?;
 
-    // Parse SafeTensors views from each shard (borrows from shard_bytes_list).
-    let parsed_shards: Vec<SafeTensors<'_>> = shard_bytes_list
+    // Parse SafeTensors views from mmap'd bytes.
+    let parsed_shards: Vec<SafeTensors<'_>> = shard_mmaps
         .iter()
         .enumerate()
-        .map(|(i, bytes)| {
-            SafeTensors::deserialize(bytes)
+        .map(|(i, m)| {
+            SafeTensors::deserialize(m.as_ref())
                 .with_context(|| format!("parsing shard {:?}", shard_paths[i]))
         })
         .collect::<anyhow::Result<_>>()?;
@@ -119,10 +124,10 @@ pub fn convert_hf_to_gguf(
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    // ── 6. Collect and sort tensor names so output is deterministic ──────────
+    // ── 6. Collect tensor metadata only (no f32 data) ───────────────────────
+    // Storing only names/shapes avoids accumulating gigabytes of f32 data.
     // Sort by GGUF name to get a canonical ordering (blk.0 before blk.1 etc.).
-    let mut gguf_entries: BTreeMap<String, TensorEntryPending> = BTreeMap::new();
-    let mut embed_tokens_f32: Option<Vec<f32>> = None;
+    let mut meta_entries: BTreeMap<String, TensorMetaOnly> = BTreeMap::new();
 
     for (hf_name, &shard_idx) in &name_to_shard {
         let mapped = match hf_to_gguf_name(hf_name) {
@@ -138,90 +143,94 @@ pub fn convert_hf_to_gguf(
             .tensor(hf_name)
             .with_context(|| format!("tensor '{}' not found in shard", hf_name))?;
 
-        let f32_data = to_f32_vec(view.dtype(), view.data());
-        if f32_data.is_empty() && !view.data().is_empty() {
-            tracing::warn!(hf_name, dtype = ?view.dtype(), "unsupported dtype — skipping tensor");
-            continue;
-        }
-
-        // Keep embed_tokens for tied embedding duplication if needed.
-        if mapped.gguf_name == "token_embd.weight" && tie_word_embeddings {
-            embed_tokens_f32 = Some(f32_data.clone());
-        }
-
         let shape_hf = view.shape();
         // GGUF shape = reversed HF shape (outermost dimension last).
         let gguf_shape: Vec<u64> = shape_hf.iter().rev().map(|&d| d as u64).collect();
 
-        gguf_entries.insert(
+        meta_entries.insert(
             mapped.gguf_name.clone(),
-            TensorEntryPending {
+            TensorMetaOnly {
                 gguf_name: mapped.gguf_name,
                 is_norm: mapped.is_norm,
                 gguf_shape,
-                f32_data,
+                hf_name: hf_name.to_string(),
+                shard_idx,
             },
         );
     }
 
-    // ── 7. Handle tied embeddings ────────────────────────────────────────────
+    // ── 7. Handle tied embeddings (metadata only) ────────────────────────────
     // If tie_word_embeddings is true and output.weight is absent, duplicate
     // token_embd.weight as output.weight (the loader hard-requires it).
-    if tie_word_embeddings && !gguf_entries.contains_key("output.weight") {
-        if let Some(embed_f32) = embed_tokens_f32 {
-            let embed_entry = gguf_entries
-                .get("token_embd.weight")
-                .with_context(|| "tie_word_embeddings=true but token_embd.weight not found")?;
-            let shape = embed_entry.gguf_shape.clone();
+    if tie_word_embeddings && !meta_entries.contains_key("output.weight") {
+        if let Some(embed_meta) = meta_entries.get("token_embd.weight") {
+            let shape = embed_meta.gguf_shape.clone();
+            let embed_hf = embed_meta.hf_name.clone();
+            let embed_shard = embed_meta.shard_idx;
             tracing::info!("tie_word_embeddings=true: duplicating token_embd as output.weight");
-            gguf_entries.insert(
+            meta_entries.insert(
                 "output.weight".to_string(),
-                TensorEntryPending {
+                TensorMetaOnly {
                     gguf_name: "output.weight".to_string(),
                     is_norm: false,
                     gguf_shape: shape,
-                    f32_data: embed_f32,
+                    hf_name: embed_hf,
+                    shard_idx: embed_shard,
                 },
             );
         }
     }
 
-    // ── 8. Quantize and add tensors to writer ────────────────────────────────
+    // ── 8. Quantize one tensor at a time (no accumulation of f32 data) ───────
+    // Each f32_data Vec is dropped at the end of its loop iteration, so peak
+    // memory = (largest single tensor as f32) + accumulated quantised output.
     let mut stats = ConvertStats::default();
 
-    for pending in gguf_entries.values() {
-        let (raw_bytes, tensor_type) = if pending.is_norm {
+    for meta in meta_entries.values() {
+        let view = parsed_shards[meta.shard_idx]
+            .tensor(&meta.hf_name)
+            .with_context(|| format!("tensor '{}' not found in shard", meta.hf_name))?;
+
+        let f32_data = to_f32_vec(view.dtype(), view.data());
+        if f32_data.is_empty() && !view.data().is_empty() {
+            tracing::warn!(
+                hf_name = meta.hf_name.as_str(),
+                dtype = ?view.dtype(),
+                "unsupported dtype — skipping tensor"
+            );
+            continue;
+        }
+
+        let (raw_bytes, tensor_type) = if meta.is_norm {
             // FP32 norm tensor
-            let raw: Vec<u8> = pending
-                .f32_data
-                .iter()
-                .flat_map(|f| f.to_le_bytes())
-                .collect();
+            let raw: Vec<u8> = f32_data.iter().flat_map(|f| f.to_le_bytes()).collect();
             (raw, TensorType::F32)
         } else {
-            // TQ2_0_g128 quantised tensor
-            let f32_data = pad_to_multiple_of_128(&pending.f32_data);
-            let blocks = BlockTQ2_0_g128::quantize(&f32_data)
-                .with_context(|| format!("quantizing tensor '{}'", pending.gguf_name))?;
+            // TQ2_0_g128 quantised tensor — f32_data dropped after this block
+            let f32_padded = pad_to_multiple_of_128(&f32_data);
+            let blocks = BlockTQ2_0_g128::quantize(&f32_padded)
+                .with_context(|| format!("quantizing tensor '{}'", meta.gguf_name))?;
             let raw = blocks_to_bytes(&blocks);
             (raw, TensorType::TQ2_0_g128)
         };
+        // f32_data is dropped here (end of binding scope)
+        drop(f32_data);
 
         println!(
             "  converting {} {:?} -> {}",
-            pending.gguf_name,
-            pending.gguf_shape,
-            if pending.is_norm { "F32" } else { "TQ2_0_g128" }
+            meta.gguf_name,
+            meta.gguf_shape,
+            if meta.is_norm { "F32" } else { "TQ2_0_g128" }
         );
 
         writer.add_tensor(TensorEntry {
-            name: pending.gguf_name.clone(),
-            shape: pending.gguf_shape.clone(),
+            name: meta.gguf_name.clone(),
+            shape: meta.gguf_shape.clone(),
             tensor_type,
             data: raw_bytes,
         });
 
-        if pending.is_norm {
+        if meta.is_norm {
             stats.n_fp32 += 1;
         } else {
             stats.n_ternary += 1;
@@ -243,12 +252,15 @@ pub fn convert_hf_to_gguf(
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
-/// A pending tensor entry before quantization.
-struct TensorEntryPending {
+/// Tensor metadata collected in pass 1 (no f32 data stored).
+struct TensorMetaOnly {
     gguf_name: String,
     is_norm: bool,
     gguf_shape: Vec<u64>,
-    f32_data: Vec<f32>,
+    /// Source HuggingFace tensor name (needed to retrieve data from the shard).
+    hf_name: String,
+    /// Index into `parsed_shards` where this tensor lives.
+    shard_idx: usize,
 }
 
 /// Discover shard file paths from the model directory.

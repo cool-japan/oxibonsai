@@ -71,15 +71,15 @@ use tracing::warn;
 pub use scirs2_backend::Scirs2Backend;
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
-pub use metal_graph::{
-    try_metal_ffn, try_metal_qkv, MetalGraph, MetalGraphError, MetalWeightHandle,
-};
+pub use metal_graph::{MetalGraph, MetalGraphError, MetalWeightHandle};
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub use metal_full_layer::{
-    build_cached_weights, print_gpu_profile_summary, try_metal_full_forward,
+    build_cached_weights, build_cached_weights_ternary_only, print_gpu_profile_summary,
+    try_metal_ffn, try_metal_forward_greedy_ternary, try_metal_full_forward,
     try_metal_full_forward_cached, try_metal_full_forward_ternary, try_metal_full_layer,
-    CachedLayerWeights, CachedModelWeights, FullForwardLayerParams, FullForwardLayerParamsTernary,
+    try_metal_prefill_ternary, try_metal_prefill_verify_ternary, try_metal_qkv, CachedLayerWeights,
+    CachedModelWeights, FullForwardLayerParams, FullForwardLayerParamsTernary,
 };
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -96,8 +96,10 @@ pub use cuda_graph::{try_cuda_ffn, try_cuda_qkv, CudaGraph, CudaGraphError, Nati
     any(target_os = "linux", target_os = "windows")
 ))]
 pub use cuda_full_layer::{
-    try_cuda_full_forward, try_cuda_full_forward_with_gpu_lm_head, try_cuda_full_layer,
-    CudaCachedLayerWeights, CudaFullForwardLayerParams,
+    try_cuda_full_forward, try_cuda_full_forward_ternary,
+    try_cuda_full_forward_ternary_with_gpu_lm_head, try_cuda_full_forward_with_gpu_lm_head,
+    try_cuda_full_layer, CudaCachedLayerWeights, CudaFullForwardLayerParams,
+    CudaFullForwardLayerParamsTernary,
 };
 
 #[cfg(all(

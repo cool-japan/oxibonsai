@@ -55,18 +55,9 @@ impl CudaGraph {
     ) -> Result<(), CudaGraphError> {
         let d_residual = &*(d_inout as *const CudaSlice<f32>);
         match Self::v8_shared_bytes(k as usize) {
-            Some(smem) => self.launch_gemv_v8_residual(
-                &**d_weight,
-                d_input,
-                d_residual,
-                d_inout,
-                n_rows,
-                k,
-                smem,
-            ),
-            None => {
-                self.launch_gemv_v9_residual(&**d_weight, d_input, d_residual, d_inout, n_rows, k)
-            }
+            Some(smem) => self
+                .launch_gemv_v8_residual(d_weight, d_input, d_residual, d_inout, n_rows, k, smem),
+            None => self.launch_gemv_v9_residual(d_weight, d_input, d_residual, d_inout, n_rows, k),
         }
     }
 }
