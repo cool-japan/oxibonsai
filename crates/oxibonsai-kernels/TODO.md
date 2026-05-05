@@ -33,6 +33,15 @@ fused Metal TQ2 full-forward, and native CUDA NVRTC paths all shipped.
 - [x] **Cache-line alignment** — `aligned.rs` with AlignedBuffer/AlignedBlocks, 64-byte aligned allocations for SIMD loads
 - [x] **Prefetch hints** — `prefetch.rs` with PrefetchConfig, software prefetch via x86 _mm_prefetch / ARM _prefetch, platform-specific dispatch
 
+## Phase 15 — FP8 Kernels
+
+- [x] `dequant_fp8.rs` — `dequant_fp8_e4m3/e5m2` scalar reference kernels (11 tests each)
+- [x] `gemv_fp8.rs` — `gemv_fp8_e4m3/e5m2` scalar reference GEMV, `k % 32 == 0` alignment check (11 tests each)
+- [x] `gemm_fp8.rs` — `gemm_fp8_e4m3/e5m2` scalar GEMM via decomposed GEMV (10 tests each)
+- [x] `Fp8Kernel` trait in `traits.rs` — mirrors `TernaryKernel` shape
+- [x] `impl Fp8Kernel for KernelDispatcher` in `dispatch.rs` — all tiers route to scalar reference; SIMD specialization deferred to Phase 15.x
+- [x] `tests/fp8_kernels.rs` — 35 integration tests (dispatcher round-trips, error paths, FP32 reference comparison)
+
 ## Ternary Bonsai
 
 - [x] Scalar ternary kernels: `dequant_ternary.rs`, `gemv_ternary.rs`, `gemm_ternary.rs`

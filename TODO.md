@@ -1,7 +1,7 @@
 # OxiBonsai TODO
 
 > Pure Rust 1-bit LLM inference engine for PrismML Bonsai models
-> 412 source files, ~152,615 lines of Rust code, 3,589+ tests passing across workspace — verified 2026-05-03 (0.1.4)
+> 412 source files, ~152,615 lines of Rust code, 3,946 tests passing across workspace — verified 2026-05-03 (0.1.4 + Phase 15)
 
 ## Phase Status
 
@@ -23,6 +23,7 @@
 | Phase 13.x: Fused Metal TQ2 full-forward | ✅ Complete | Single command buffer per token, ~13× speedup; ~50 tok/s on Ternary-Bonsai-1.7B |
 | Phase 13.y: Ternary LM head on GPU | ✅ Complete | All 7 `OutputWeight::Ternary` guard sites closed (4 Metal + 3 CUDA); Metal ~54.5 tok/s avg on Ternary-Bonsai-1.7B |
 | Phase 14: Runtime controllers (0.1.4) | ✅ Complete | `KvCachePolicy`, `AdaptiveLookahead`, `RequestRateTracker`, `RequestId`, expanded Prometheus surface |
+| Phase 15: Advanced Inference Capabilities | ✅ Complete | FP8 quantization (E4M3/E5M2), FP8 kernels + `Fp8Kernel` trait, `AllowList`/`Sequence`/`LengthConstraint`, BNF grammar engine + Earley-based `GrammarConstraint` |
 
 ## Phase 4 — Complete
 
@@ -79,6 +80,23 @@
 - [x] **Continuous batching** -- `ContinuousBatchScheduler` for in-flight request management
 - [x] **Model registry** -- `ModelVariant`, `ModelSpec`, `CapabilityProfile`; auto-detection from config dimensions
 - [x] **Comprehensive integration tests** -- `tests/full_pipeline_tests.rs` (25 tests), `tests/quantization_pipeline_tests.rs` (10 tests), `tests/server_integration_tests.rs` (8 tests)
+
+## Phase 15 — Advanced Inference Capabilities
+
+- [x] **FP8 E4M3FN quantization** — `BlockFP8E4M3` (32 weights × 1 FP8 byte + FP16 scale = 34 bytes/block); `fp8_e4m3_encode/decode` with bit-exact RNE rounding, saturation to ±448, NaN=0x7f; GGUF type ID 43 (PrismML extension); 56 tests in `oxibonsai-core`
+- [x] **FP8 E5M2 quantization** — `BlockFP8E5M2` (same 34 bytes/block); `fp8_e5m2_encode/decode` with ±infinity support; GGUF type ID 44 (PrismML extension)
+- [x] **FP8 GGUF surface** — `GgufTensorType::F8_E4M3/F8_E5M2`, `TensorType::F8_E4M3/F8_E5M2`, `ExtendedQuantType::F8_E4M3/F8_E5M2` (8.5 bits/weight), `is_fp8()` predicate
+- [x] **FP8 reference kernels** — `dequant_fp8_e4m3/e5m2`, `gemv_fp8_e4m3/e5m2`, `gemm_fp8_e4m3/e5m2` (scalar reference); `Fp8Kernel` trait; `impl Fp8Kernel for KernelDispatcher`; 349 tests in `oxibonsai-kernels`
+- [x] **`AllowListConstraint`** — finite-set token-sequence constraint for multiple-choice output; candidate activation bitmask with prefix tracking; 32 tests in `oxibonsai-runtime`
+- [x] **`SequenceConstraint`** — exact token-sequence forcing constraint; unconstrained after sequence consumed
+- [x] **`LengthConstraint`** — hard `[min_len, max_len]` bounds with optional stop token enforcement
+- [x] **BNF grammar engine** (`oxibonsai-runtime/src/grammar/`):
+  - `ast.rs` — `Grammar`, `Rule`, `Symbol` (byte-level terminals), `normalise_terminals()` single-byte chain expansion
+  - `bnf_parser.rs` — hand-rolled two-phase BNF parser (lexer + parser); forward references, line continuation, escape sequences, `BnfParseError`
+  - `earley.rs` — full Earley recognizer; FIRST set computation; predict/complete/scan; `next_byte_set()` lookahead; `clone_state()` for speculative token probing; left-recursive grammar support via set-based memoization
+  - `constraint.rs` — `GrammarConstraint` implementing `TokenConstraint`; byte-level probe via `clone_state()` per candidate token; EOS handling
+  - `examples.rs` — `arithmetic_grammar()`, `simple_ab_grammar()`, `csv_row_grammar()`, `json_lite_grammar()`, `palindrome_grammar()`
+  - 93 tests in `oxibonsai-runtime`
 
 ## CI / Publish
 

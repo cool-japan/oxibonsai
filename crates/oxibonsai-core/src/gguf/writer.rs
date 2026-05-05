@@ -80,6 +80,10 @@ pub enum TensorType {
     Q1_0G128 = 41,
     /// PrismML ternary quantization: 128 sign-2 bits + FP16 group scale (type ID 42).
     TQ2_0_g128 = 42,
+    /// PrismML FP8 E4M3FN quantization (type ID 43).
+    F8_E4M3 = 43,
+    /// PrismML FP8 E5M2 quantization (type ID 44).
+    F8_E5M2 = 44,
 }
 
 impl TensorType {
@@ -91,6 +95,7 @@ impl TensorType {
             Self::Q1_0G128 => 128,
             Self::TQ2_0_g128 => 128,
             Self::TQ2_0 => 256,
+            Self::F8_E4M3 | Self::F8_E5M2 => 32,
         }
     }
 
@@ -103,6 +108,7 @@ impl TensorType {
             Self::Q1_0G128 => 18,   // 2 (FP16 scale) + 16 (128 sign bits)
             Self::TQ2_0_g128 => 34, // 2 (FP16 scale) + 32 (128 ternary-2bit packed)
             Self::TQ2_0 => 66,      // 2 (FP16 scale) + 64 (256 ternary-2bit packed)
+            Self::F8_E4M3 | Self::F8_E5M2 => 34, // 32 bytes qs + 2 bytes FP16 scale
         }
     }
 

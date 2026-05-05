@@ -22,6 +22,10 @@ All Phase 0–1 functionality implemented and tested, including fuzz/property te
 - [x] **Additional quant formats** — Q2_K, Q4_K support implemented in `quant_k.rs` with BlockQ2K/BlockQ4K structs, dequant/quantize, 21 tests
 - [x] **Streaming GGUF reader** — `gguf/streaming.rs` with GgufStreamParser state machine, progressive parsing, 22 tests
 
+## Phase 15 — FP8 Quantization
+
+- [x] `quant_fp8.rs` — `BlockFP8E4M3`/`BlockFP8E5M2` (32w × 1B + f16 scale = 34B); `fp8_e4m3_encode/decode`; `fp8_e5m2_encode/decode`; `quantize`/`dequant`/`slice_from_bytes`; GGUF IDs 43/44; forward-compat `ExtendedQuantType::F8_E4M3/F8_E5M2`; 56 tests
+
 ## Ternary Bonsai
 
 - [x] Ternary block types (`BlockTQ2_0_g128`, `BlockTQ2_0`, `TernaryCode`) in `quant_ternary.rs`

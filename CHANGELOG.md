@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - Phase 15 (0.1.5 preview)
+
+### Added
+- **FP8 quantization family** (`oxibonsai-core`): `BlockFP8E4M3` and `BlockFP8E5M2` block types (32 weights + FP16 scale = 34 bytes/block); bit-exact IEEE 754-style encode/decode with RNE rounding; GGUF type IDs 43/44 (PrismML FP8 extension); `is_fp8()` predicate in `GgufTensorType`; `F8_E4M3`/`F8_E5M2` forward-compat entries in `ExtendedQuantType` (8.5 bits/weight). Includes `fp8_e4m3_encode/decode` and `fp8_e5m2_encode/decode` public helpers.
+- **FP8 reference kernels** (`oxibonsai-kernels`): scalar `dequant_fp8_e4m3/e5m2`, `gemv_fp8_e4m3/e5m2`, `gemm_fp8_e4m3/e5m2`; new `Fp8Kernel` trait mirroring `TernaryKernel`; `impl Fp8Kernel for KernelDispatcher` (all tiers currently route to scalar reference; SIMD specialization deferred to Phase 15.x).
+- **`AllowListConstraint`** (`oxibonsai-runtime`): constrains output to a finite set of token-id sequences; candidate prefix tracking with activation bitmask; `active_count()` inspector. Useful for multiple-choice forced answers.
+- **`SequenceConstraint`** (`oxibonsai-runtime`): forces output to follow a specific token-id sequence exactly; `is_failed()` inspector; returns `None` (unconstrained) once the full sequence is consumed.
+- **`LengthConstraint`** (`oxibonsai-runtime`): hard `[min_len, max_len]` output length bounds with optional `stop_token`; excludes stop token before `min_len`, forces only stop token at `max_len`; `count()` inspector.
+- **BNF grammar engine** (`oxibonsai-runtime`, new `grammar/` module): full context-free grammar support with an Earley recognizer (handles arbitrary CFG including left-recursive and ambiguous grammars via set-based memoization); hand-rolled BNF text parser supporting alternation, recursion, comments, line continuation, and escape sequences; `GrammarConstraint` implementing `TokenConstraint` for grammar-constrained token generation; pre-computed FIRST sets for O(1) next-byte lookahead; `next_byte_set()` API for direct byte-level constraint inspection. Pre-canned grammars: arithmetic, `a^n b^n`, CSV row, minimal JSON.
+
+### Changed
+- `GgufTensorType::from_id` now recognises IDs 43 (`F8_E4M3`) and 44 (`F8_E5M2`); tests updated to use ID 45 as the "unknown" probe.
+
+---
+
 ## [0.1.4] - 2026-05-03
 
 ### Added

@@ -69,12 +69,15 @@ pub use gpu_backend::{
 };
 
 pub mod dequant;
+pub mod dequant_fp8;
 pub mod dequant_ternary;
 pub mod dispatch;
 pub mod error;
 pub mod gemm;
+pub mod gemm_fp8;
 pub mod gemm_ternary;
 pub mod gemv;
+pub mod gemv_fp8;
 pub mod gemv_ternary;
 pub mod packing;
 pub mod parallel;
@@ -101,6 +104,6 @@ pub use parallel::{gemm_ternary_g128_par, gemv_ternary_g128_par};
 pub use parallel_tiled::{gemm_adaptive_ternary, gemv_adaptive, gemv_adaptive_ternary};
 pub use prefetch::{PrefetchConfig, PrefetchLocality, PrefetchStrategy};
 pub use simd_float_ops::{rms_norm_simd, rope_apply_simd, silu_simd, softmax_simd, swiglu_simd};
-pub use traits::{OneBitKernel, TernaryKernel};
+pub use traits::{Fp8Kernel, OneBitKernel, TernaryKernel};
 pub use tuning::{PlatformProfile, TunedThresholds, TuningSummary};
 pub use weight_cache::GpuWeightHandle;

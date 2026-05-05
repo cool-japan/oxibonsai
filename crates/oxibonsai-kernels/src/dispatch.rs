@@ -14,9 +14,10 @@ use crate::dequant;
 use crate::error::KernelResult;
 use crate::gemm;
 use crate::gemv;
-use crate::traits::{OneBitKernel, TernaryKernel};
+use crate::traits::{Fp8Kernel, OneBitKernel, TernaryKernel};
 use crate::weight_cache::GpuWeightHandle;
 use oxibonsai_core::tensor::BlockQ1_0G128;
+use oxibonsai_core::{BlockFP8E4M3, BlockFP8E5M2};
 #[cfg(feature = "gpu")]
 use std::sync::Arc;
 
@@ -822,6 +823,83 @@ impl TernaryKernel for KernelDispatcher {
         Err(crate::error::KernelError::UnsupportedOperation(
             "gemv_ternary_g128_cached requires GPU tier".into(),
         ))
+    }
+}
+
+impl Fp8Kernel for KernelDispatcher {
+    /// Dequantize FP8 E4M3FN blocks.
+    ///
+    /// All tiers use the scalar reference implementation for now;
+    /// SIMD specializations are a follow-on Slice.
+    fn dequant_fp8_e4m3(
+        &self,
+        blocks: &[BlockFP8E4M3],
+        output: &mut [f32],
+    ) -> KernelResult<()> {
+        crate::dequant_fp8::dequant_fp8_e4m3(blocks, output)
+    }
+
+    /// Dequantize FP8 E5M2 blocks.
+    fn dequant_fp8_e5m2(
+        &self,
+        blocks: &[BlockFP8E5M2],
+        output: &mut [f32],
+    ) -> KernelResult<()> {
+        crate::dequant_fp8::dequant_fp8_e5m2(blocks, output)
+    }
+
+    /// FP8 E4M3FN GEMV — scalar reference for all tiers.
+    fn gemv_fp8_e4m3(
+        &self,
+        blocks: &[BlockFP8E4M3],
+        input: &[f32],
+        output: &mut [f32],
+        n_rows: usize,
+        k: usize,
+    ) -> KernelResult<()> {
+        crate::gemv_fp8::gemv_fp8_e4m3(blocks, input, output, n_rows, k)
+    }
+
+    /// FP8 E5M2 GEMV — scalar reference for all tiers.
+    fn gemv_fp8_e5m2(
+        &self,
+        blocks: &[BlockFP8E5M2],
+        input: &[f32],
+        output: &mut [f32],
+        n_rows: usize,
+        k: usize,
+    ) -> KernelResult<()> {
+        crate::gemv_fp8::gemv_fp8_e5m2(blocks, input, output, n_rows, k)
+    }
+
+    /// FP8 E4M3FN GEMM — scalar reference for all tiers.
+    fn gemm_fp8_e4m3(
+        &self,
+        blocks: &[BlockFP8E4M3],
+        inputs: &[f32],
+        outputs: &mut [f32],
+        n_rows: usize,
+        k: usize,
+        batch: usize,
+    ) -> KernelResult<()> {
+        crate::gemm_fp8::gemm_fp8_e4m3(blocks, inputs, outputs, n_rows, k, batch)
+    }
+
+    /// FP8 E5M2 GEMM — scalar reference for all tiers.
+    fn gemm_fp8_e5m2(
+        &self,
+        blocks: &[BlockFP8E5M2],
+        inputs: &[f32],
+        outputs: &mut [f32],
+        n_rows: usize,
+        k: usize,
+        batch: usize,
+    ) -> KernelResult<()> {
+        crate::gemm_fp8::gemm_fp8_e5m2(blocks, inputs, outputs, n_rows, k, batch)
+    }
+
+    fn name_fp8(&self) -> &'static str {
+        "fp8_reference"
     }
 }
 

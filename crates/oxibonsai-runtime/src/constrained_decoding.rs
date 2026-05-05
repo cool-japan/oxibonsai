@@ -1424,6 +1424,341 @@ impl ConstrainedSamplerBuilder {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// AllowListConstraint — force output to be one of a finite set of sequences
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A constraint that forces the generated token sequence to exactly match one
+/// of a finite set of allowed token-id sequences (e.g., multiple-choice answers).
+///
+/// At each step only the union of next tokens across all still-active candidates
+/// is permitted.  A candidate becomes inactive the moment any token in the prefix
+/// fails to match.  Generation is considered complete once the full token sequence
+/// of at least one candidate has been consumed.
+///
+/// # Example
+/// ```rust
+/// use oxibonsai_runtime::constrained_decoding::{AllowListConstraint, TokenConstraint};
+///
+/// // Two candidates: [10, 20] and [10, 30]
+/// let mut c = AllowListConstraint::new(vec![vec![10, 20], vec![10, 30]]);
+/// // First token: only 10 is allowed (shared prefix)
+/// let mask = c.allowed_tokens(&[], 50).unwrap();
+/// assert!(mask[10]);
+/// assert!(!mask[20]);
+/// assert!(!mask[30]);
+/// ```
+pub struct AllowListConstraint {
+    /// All allowed sequences.
+    candidates: Vec<Vec<u32>>,
+    /// Which candidates still match the current prefix.
+    active: Vec<bool>,
+    /// Number of tokens consumed so far.
+    position: usize,
+}
+
+impl AllowListConstraint {
+    /// Create a new `AllowListConstraint` from a list of allowed token sequences.
+    pub fn new(candidates: Vec<Vec<u32>>) -> Self {
+        let n = candidates.len();
+        Self {
+            candidates,
+            active: vec![true; n],
+            position: 0,
+        }
+    }
+
+    /// Returns the number of candidate sequences that are still active.
+    pub fn active_count(&self) -> usize {
+        self.active.iter().filter(|&&a| a).count()
+    }
+}
+
+impl TokenConstraint for AllowListConstraint {
+    /// Returns a bitmask of tokens that are valid next tokens across all still-active
+    /// candidates at the current position.  Always returns `Some` (never unconstrained).
+    fn allowed_tokens(&self, _generated: &[u32], vocab_size: usize) -> Option<Vec<bool>> {
+        let mut mask = vec![false; vocab_size];
+        for (i, active) in self.active.iter().enumerate() {
+            if !active {
+                continue;
+            }
+            let seq = &self.candidates[i];
+            if self.position < seq.len() {
+                let tok = seq[self.position] as usize;
+                if tok < vocab_size {
+                    mask[tok] = true;
+                }
+            }
+        }
+        Some(mask)
+    }
+
+    /// Commits `token` at the current position.
+    ///
+    /// Any candidate where `candidates[i][position] != token` (or the candidate is
+    /// already exhausted) is deactivated.  Returns `true` when at least one candidate
+    /// remains active **or** a candidate was just completed at this position.
+    fn advance(&mut self, token: u32) -> bool {
+        let mut just_completed = false;
+        for (i, active) in self.active.iter_mut().enumerate() {
+            if !*active {
+                continue;
+            }
+            let seq = &self.candidates[i];
+            if self.position >= seq.len() {
+                // Candidate was already completed; further tokens deactivate it.
+                *active = false;
+            } else if seq[self.position] == token {
+                // Token matches; check if this completes the candidate.
+                if self.position + 1 == seq.len() {
+                    just_completed = true;
+                }
+                // Keep active — will be filtered by is_complete / future advance calls.
+            } else {
+                *active = false;
+            }
+        }
+        self.position += 1;
+        // Return true if at least one candidate is still active or one just completed.
+        just_completed || self.active.iter().any(|&a| a)
+    }
+
+    /// Returns `true` when the consumed token sequence fully matches at least one
+    /// candidate, i.e. `position == candidates[i].len()` for some active `i`.
+    fn is_complete(&self) -> bool {
+        self.candidates
+            .iter()
+            .enumerate()
+            .any(|(i, seq)| self.active[i] && self.position == seq.len())
+    }
+
+    /// Reset to initial state (all candidates active, position zero).
+    fn reset(&mut self) {
+        self.active.fill(true);
+        self.position = 0;
+    }
+
+    fn name(&self) -> &str {
+        "AllowListConstraint"
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SequenceConstraint — force output to follow a specific token sequence exactly
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A constraint that forces the generated output to reproduce a specific,
+/// pre-determined token sequence.
+///
+/// While `position < target.len()`, only `target[position]` is allowed.
+/// Once the target has been fully reproduced (`position >= target.len()`) the
+/// constraint is satisfied and all tokens become allowed again (returns `None`).
+///
+/// # Example
+/// ```rust
+/// use oxibonsai_runtime::constrained_decoding::{SequenceConstraint, TokenConstraint};
+///
+/// let mut c = SequenceConstraint::new(vec![5, 6, 7]);
+/// let mask = c.allowed_tokens(&[], 10).unwrap();
+/// assert!(mask[5]);
+/// assert!(!mask[6]);
+/// assert_eq!(c.advance(5), true);
+/// ```
+pub struct SequenceConstraint {
+    /// The token sequence that must be reproduced.
+    target: Vec<u32>,
+    /// Number of tokens consumed (next expected index into `target`).
+    position: usize,
+    /// Set to `true` if a mismatched token was ever committed.
+    failed: bool,
+}
+
+impl SequenceConstraint {
+    /// Create a new `SequenceConstraint` for the given target sequence.
+    pub fn new(target: Vec<u32>) -> Self {
+        Self {
+            target,
+            position: 0,
+            failed: false,
+        }
+    }
+
+    /// Whether the constraint has been violated (a wrong token was committed).
+    pub fn is_failed(&self) -> bool {
+        self.failed
+    }
+}
+
+impl TokenConstraint for SequenceConstraint {
+    /// Returns a bitmask allowing only the next expected token, or `None` once the
+    /// full sequence has been reproduced.
+    fn allowed_tokens(&self, _generated: &[u32], vocab_size: usize) -> Option<Vec<bool>> {
+        if self.position >= self.target.len() {
+            // Sequence fully consumed — no further restriction.
+            return None;
+        }
+        let mut mask = vec![false; vocab_size];
+        let next = self.target[self.position] as usize;
+        if next < vocab_size {
+            mask[next] = true;
+        }
+        Some(mask)
+    }
+
+    /// Commits `token`.  Returns `false` (and sets the failed flag) if `token`
+    /// does not match the expected token at the current position.
+    fn advance(&mut self, token: u32) -> bool {
+        if self.position < self.target.len() && token != self.target[self.position] {
+            self.failed = true;
+            self.position += 1;
+            return false;
+        }
+        self.position += 1;
+        true
+    }
+
+    /// Returns `true` once all tokens in the target sequence have been consumed.
+    fn is_complete(&self) -> bool {
+        self.position >= self.target.len()
+    }
+
+    /// Reset to initial state.
+    fn reset(&mut self) {
+        self.position = 0;
+        self.failed = false;
+    }
+
+    fn name(&self) -> &str {
+        "SequenceConstraint"
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LengthConstraint — enforce hard minimum and maximum generation lengths
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A constraint that enforces hard minimum and maximum token-count limits.
+///
+/// - While `count < min_len`: if a `stop_token` is configured it is excluded from
+///   the mask (cannot stop early).
+/// - While `count >= max_len`: if a `stop_token` is configured only that token is
+///   allowed; otherwise an all-`false` mask is returned, signalling the caller to
+///   halt generation externally.
+/// - Between `min_len` and `max_len`: all tokens are allowed (`None`).
+///
+/// Completion is defined as either reaching `max_len` OR generating `min_len` or
+/// more tokens followed by the `stop_token`.
+///
+/// # Example
+/// ```rust
+/// use oxibonsai_runtime::constrained_decoding::{LengthConstraint, TokenConstraint};
+///
+/// // Must generate at least 2 tokens, stop token is 1 (EOS), max 10.
+/// let mut c = LengthConstraint::new(2, 10, Some(1));
+/// // Before min_len: stop_token excluded
+/// let mask = c.allowed_tokens(&[], 4).unwrap();
+/// assert!(!mask[1]);  // stop token blocked
+/// assert!(mask[0]);   // other tokens allowed
+/// ```
+pub struct LengthConstraint {
+    /// Minimum number of tokens that must be generated before stopping.
+    min_len: usize,
+    /// Hard upper bound on generated token count.
+    max_len: usize,
+    /// Optional end-of-sequence token; treated specially for early-stop control.
+    stop_token: Option<u32>,
+    /// Number of tokens committed via `advance` so far.
+    count: usize,
+    /// True once the `stop_token` has been committed.
+    stop_seen: bool,
+}
+
+impl LengthConstraint {
+    /// Create a new `LengthConstraint`.
+    ///
+    /// `min_len` must be `<= max_len`.
+    pub fn new(min_len: usize, max_len: usize, stop_token: Option<u32>) -> Self {
+        Self {
+            min_len,
+            max_len,
+            stop_token,
+            count: 0,
+            stop_seen: false,
+        }
+    }
+
+    /// Current token count.
+    pub fn count(&self) -> usize {
+        self.count
+    }
+}
+
+impl TokenConstraint for LengthConstraint {
+    fn allowed_tokens(&self, _generated: &[u32], vocab_size: usize) -> Option<Vec<bool>> {
+        if self.count < self.min_len {
+            // Cannot stop early — exclude stop_token if one is configured.
+            if let Some(stop) = self.stop_token {
+                let mut mask = vec![true; vocab_size];
+                let stop_idx = stop as usize;
+                if stop_idx < vocab_size {
+                    mask[stop_idx] = false;
+                }
+                return Some(mask);
+            }
+            // No stop token: no restriction below min_len.
+            return None;
+        }
+
+        if self.count >= self.max_len {
+            // Must stop now.
+            if let Some(stop) = self.stop_token {
+                let mut mask = vec![false; vocab_size];
+                let stop_idx = stop as usize;
+                if stop_idx < vocab_size {
+                    mask[stop_idx] = true;
+                }
+                return Some(mask);
+            }
+            // No stop token: emit an all-false mask to force external termination.
+            return Some(vec![false; vocab_size]);
+        }
+
+        // Between min and max: unconstrained.
+        None
+    }
+
+    /// Commits `token`, updating `count` and `stop_seen`.  Always returns `true`.
+    fn advance(&mut self, token: u32) -> bool {
+        if let Some(stop) = self.stop_token {
+            if token == stop {
+                self.stop_seen = true;
+            }
+        }
+        self.count += 1;
+        true
+    }
+
+    /// Returns `true` when at least `min_len` tokens have been generated AND either
+    /// the `stop_token` was seen or `max_len` has been reached.
+    fn is_complete(&self) -> bool {
+        if self.count < self.min_len {
+            return false;
+        }
+        self.count >= self.max_len || self.stop_seen
+    }
+
+    /// Reset to initial state.
+    fn reset(&mut self) {
+        self.count = 0;
+        self.stop_seen = false;
+    }
+
+    fn name(&self) -> &str {
+        "LengthConstraint"
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Unit tests
 // ─────────────────────────────────────────────────────────────────────────────
 

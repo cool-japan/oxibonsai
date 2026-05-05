@@ -1,4 +1,4 @@
-//! Trait definition for 1-bit compute kernels.
+//! Trait definitions for 1-bit, ternary, and FP8 compute kernels.
 //!
 //! [`OneBitKernel`] is the common interface implemented by every kernel tier
 //! (reference, AVX2, AVX-512, NEON). The [`KernelDispatcher`](crate::KernelDispatcher)
@@ -7,6 +7,7 @@
 use crate::error::KernelResult;
 use crate::weight_cache::GpuWeightHandle;
 use oxibonsai_core::tensor::BlockQ1_0G128;
+use oxibonsai_core::{BlockFP8E4M3, BlockFP8E5M2};
 
 /// Trait for Q1\_0\_g128 compute kernel implementations.
 ///
@@ -232,5 +233,140 @@ pub trait TernaryKernel: Send + Sync {
         Err(crate::error::KernelError::UnsupportedOperation(
             "gemv_ternary_g128_cached not supported by this kernel tier".into(),
         ))
+    }
+}
+
+/// FP8 (E4M3FN and E5M2) weight matrix kernel operations.
+///
+/// Parallel to [`TernaryKernel`] and [`OneBitKernel`] for FP8-quantized weight
+/// matrices. Each block holds 32 weights (one byte each) plus a FP16 block
+/// scale. The dequantized weight at slot `i` in block `b` is:
+/// `d_b × fp8_decode(qs_b[i])`.
+///
+/// All tiers initially route to the scalar reference implementation. SIMD
+/// specializations are a follow-on Slice.
+pub trait Fp8Kernel: Send + Sync {
+    /// Dequantize FP8 E4M3FN blocks to FP32 values.
+    ///
+    /// For each block and each slot `i`:
+    /// `output[b * QK_FP8 + i] = block.d × fp8_e4m3_decode(block.qs[i])`
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::KernelError::BufferTooSmall`] if
+    /// `output.len() < blocks.len() * QK_FP8`.
+    fn dequant_fp8_e4m3(
+        &self,
+        blocks: &[BlockFP8E4M3],
+        output: &mut [f32],
+    ) -> KernelResult<()>;
+
+    /// Dequantize FP8 E5M2 blocks to FP32 values.
+    ///
+    /// For each block and each slot `i`:
+    /// `output[b * QK_FP8 + i] = block.d × fp8_e5m2_decode(block.qs[i])`
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::KernelError::BufferTooSmall`] if
+    /// `output.len() < blocks.len() * QK_FP8`.
+    fn dequant_fp8_e5m2(
+        &self,
+        blocks: &[BlockFP8E5M2],
+        output: &mut [f32],
+    ) -> KernelResult<()>;
+
+    /// Fused FP8 E4M3FN matrix × FP32 vector product (GEMV).
+    ///
+    /// Computes `output[row] = dot(weight_row[row], input)` using FP8 E4M3FN
+    /// quantized weights.
+    ///
+    /// - `blocks`: Row-major packed weight blocks, `n_rows * (k / QK_FP8)` blocks total.
+    /// - `input`: FP32 input vector of length `k`.
+    /// - `output`: FP32 output vector of length `n_rows`.
+    /// - `n_rows`: Number of output rows (N dimension).
+    /// - `k`: Inner dimension (must be multiple of `QK_FP8 = 32`).
+    ///
+    /// # Errors
+    ///
+    /// - [`crate::error::KernelError::NotBlockAligned`] if `k % QK_FP8 != 0`.
+    /// - [`crate::error::KernelError::DimensionMismatch`] if `input` or `blocks` are too short.
+    /// - [`crate::error::KernelError::BufferTooSmall`] if `output` is too short.
+    fn gemv_fp8_e4m3(
+        &self,
+        blocks: &[BlockFP8E4M3],
+        input: &[f32],
+        output: &mut [f32],
+        n_rows: usize,
+        k: usize,
+    ) -> KernelResult<()>;
+
+    /// Fused FP8 E5M2 matrix × FP32 vector product (GEMV).
+    ///
+    /// Same contract as [`Self::gemv_fp8_e4m3`] but for E5M2-quantized weights.
+    ///
+    /// # Errors
+    ///
+    /// - [`crate::error::KernelError::NotBlockAligned`] if `k % QK_FP8 != 0`.
+    /// - [`crate::error::KernelError::DimensionMismatch`] if `input` or `blocks` are too short.
+    /// - [`crate::error::KernelError::BufferTooSmall`] if `output` is too short.
+    fn gemv_fp8_e5m2(
+        &self,
+        blocks: &[BlockFP8E5M2],
+        input: &[f32],
+        output: &mut [f32],
+        n_rows: usize,
+        k: usize,
+    ) -> KernelResult<()>;
+
+    /// Fused FP8 E4M3FN matrix × FP32 matrix product (GEMM).
+    ///
+    /// Computes `output[b, r] = dot(weight_row[r], input[b])` for all
+    /// batch rows `b` and weight rows `r`.
+    ///
+    /// - `blocks`: Weight blocks in row-major order, `n_rows * (k / QK_FP8)` blocks.
+    /// - `inputs`: Row-major FP32 input \[batch × k\].
+    /// - `outputs`: Row-major FP32 output \[batch × n\_rows\].
+    /// - `n_rows`: Number of weight matrix rows.
+    /// - `k`: Inner dimension (must be multiple of `QK_FP8 = 32`).
+    /// - `batch`: Batch/sequence dimension.
+    ///
+    /// # Errors
+    ///
+    /// - [`crate::error::KernelError::NotBlockAligned`] if `k % QK_FP8 != 0`.
+    /// - [`crate::error::KernelError::DimensionMismatch`] if dimensions mismatch.
+    /// - [`crate::error::KernelError::BufferTooSmall`] if any buffer is too small.
+    fn gemm_fp8_e4m3(
+        &self,
+        blocks: &[BlockFP8E4M3],
+        inputs: &[f32],
+        outputs: &mut [f32],
+        n_rows: usize,
+        k: usize,
+        batch: usize,
+    ) -> KernelResult<()>;
+
+    /// Fused FP8 E5M2 matrix × FP32 matrix product (GEMM).
+    ///
+    /// Same contract as [`Self::gemm_fp8_e4m3`] but for E5M2-quantized weights.
+    ///
+    /// # Errors
+    ///
+    /// - [`crate::error::KernelError::NotBlockAligned`] if `k % QK_FP8 != 0`.
+    /// - [`crate::error::KernelError::DimensionMismatch`] if dimensions mismatch.
+    /// - [`crate::error::KernelError::BufferTooSmall`] if any buffer is too small.
+    fn gemm_fp8_e5m2(
+        &self,
+        blocks: &[BlockFP8E5M2],
+        inputs: &[f32],
+        outputs: &mut [f32],
+        n_rows: usize,
+        k: usize,
+        batch: usize,
+    ) -> KernelResult<()>;
+
+    /// Display name for this FP8 kernel implementation.
+    fn name_fp8(&self) -> &'static str {
+        "fp8_reference"
     }
 }

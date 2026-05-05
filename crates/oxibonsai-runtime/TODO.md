@@ -5,6 +5,14 @@
 
 ## Status: ✅ All Features Complete (Stable)
 
+## Phase 15 — Extended Constraints + Grammar Engine
+
+- [x] **`AllowListConstraint`** — finite-set token-sequence constraint (multiple-choice forcing); candidate bitmask + prefix tracking; `active_count()` accessor
+- [x] **`SequenceConstraint`** — exact sequence forcing; `is_failed()` accessor; unconstrained after sequence consumed
+- [x] **`LengthConstraint`** — hard `[min_len, max_len]` with optional stop token enforcement; `count()` accessor
+- [x] **BNF grammar engine** (`src/grammar/`): `ast.rs` (Grammar AST, terminal normalisation), `bnf_parser.rs` (hand-rolled two-phase parser), `earley.rs` (full Earley recognizer with FIRST sets, `next_byte_set()`, `clone_state()`), `constraint.rs` (`GrammarConstraint` implementing `TokenConstraint`), `examples.rs` (5 pre-canned grammars)
+- [x] **93 grammar tests** + **32 constraint tests** in `tests/`
+
 ## 0.1.4 — New Modules
 
 - [x] **`kv_cache_policy`** — `KvCachePolicy` runtime controller; FP16/Q8/Q4 tier transitions driven by EWMA pressure with hysteresis (`kv_cache_policy.rs`, 14 tests)

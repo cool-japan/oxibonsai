@@ -121,6 +121,10 @@ pub enum ExtendedQuantType {
     Q8_K,
     /// OxiBonsai native 1-bit format: 128 sign-bits + FP16 group scale (type id 41).
     Q1_0_G128,
+    /// PrismML FP8 E4M3FN quantization (type id 43).
+    F8_E4M3,
+    /// PrismML FP8 E5M2 quantization (type id 44).
+    F8_E5M2,
     /// An unrecognised quantization type ID encountered in a GGUF file.
     ///
     /// Carrying the raw ID rather than failing allows forward-compatible
@@ -150,6 +154,8 @@ impl ExtendedQuantType {
             14 => Self::Q6_K,
             15 => Self::Q8_K,
             41 => Self::Q1_0_G128,
+            43 => Self::F8_E4M3,
+            44 => Self::F8_E5M2,
             other => Self::Unknown(other),
         }
     }
@@ -172,6 +178,8 @@ impl ExtendedQuantType {
             Self::Q6_K => 14,
             Self::Q8_K => 15,
             Self::Q1_0_G128 => 41,
+            Self::F8_E4M3 => 43,
+            Self::F8_E5M2 => 44,
             Self::Unknown(id) => id,
         }
     }
@@ -219,6 +227,10 @@ impl ExtendedQuantType {
             // Q1_0_G128: 128 weights, 1 bit each + 16-bit scale
             // block = 2 + 16 = 18 bytes; bits_per_w = 18*8/128 = 1.125
             Self::Q1_0_G128 => 1.125,
+            // F8_E4M3 / F8_E5M2: 32 weights × 1 byte + 16-bit scale
+            // block = 32 + 2 = 34 bytes; bits_per_w = 34*8/32 = 8.5
+            Self::F8_E4M3 => 8.5,
+            Self::F8_E5M2 => 8.5,
             Self::Unknown(_) => 0.0,
         }
     }
@@ -250,6 +262,8 @@ impl ExtendedQuantType {
             Self::Q6_K => "Q6_K",
             Self::Q8_K => "Q8_K",
             Self::Q1_0_G128 => "Q1_0_G128",
+            Self::F8_E4M3 => "F8_E4M3",
+            Self::F8_E5M2 => "F8_E5M2",
             // Cannot return dynamic &'static str, so return the generic label.
             Self::Unknown(_) => "Unknown",
         }

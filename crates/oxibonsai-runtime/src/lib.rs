@@ -30,6 +30,7 @@
 //!     .expect("generation should succeed");
 //! ```
 
+pub mod grammar;
 pub mod adaptive_lookahead;
 pub mod adaptive_sampling;
 #[cfg(feature = "server")]
@@ -113,8 +114,12 @@ pub use builders::{ConfigBuilder, EngineBuilder, SamplerBuilder};
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
 pub use config::OxiBonsaiConfig;
 pub use constrained_decoding::{
-    ConstrainedSampler, ConstrainedSamplerBuilder, ConstraintError, JsonConstraint, JsonParseState,
-    NoConstraint, RegexConstraint, TokenConstraint,
+    AllowListConstraint, ConstrainedSampler, ConstrainedSamplerBuilder, ConstraintError,
+    JsonConstraint, JsonParseState, LengthConstraint, NoConstraint, RegexConstraint,
+    SequenceConstraint, TokenConstraint,
+};
+pub use grammar::{
+    parse_bnf, BnfParseError, Grammar, GrammarConstraint, EarleyRecognizer, Rule, Symbol,
 };
 pub use convenience::{GenerationResult, MemoryEstimate, ModelFileInfo, TokenStats};
 pub use dedup::{DedupCache, DedupStats, RequestKey};
