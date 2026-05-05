@@ -79,6 +79,10 @@ pub mod gemm_fp8;
 pub mod gemm_ternary;
 pub mod gemv;
 pub mod gemv_fp8;
+pub mod gemv_q4_0;
+pub mod gemv_q5k;
+pub mod gemv_q6k;
+pub mod gemv_q8_0;
 pub mod gemv_ternary;
 pub mod packing;
 pub mod parallel;
@@ -111,6 +115,10 @@ pub use parallel::{
     gemm_fp8_e4m3_par, gemm_fp8_e5m2_par, gemm_ternary_g128_par, gemv_fp8_e4m3_par,
     gemv_fp8_e5m2_par, gemv_ternary_g128_par,
 };
+pub use gemv_q4_0::gemv_q4_0;
+pub use gemv_q5k::gemv_q5k;
+pub use gemv_q6k::gemv_q6k;
+pub use gemv_q8_0::gemv_q8_0;
 pub use parallel_tiled::{gemm_adaptive_ternary, gemv_adaptive, gemv_adaptive_ternary};
 pub use prefetch::{PrefetchConfig, PrefetchLocality, PrefetchStrategy};
 pub use simd_float_ops::{rms_norm_simd, rope_apply_simd, silu_simd, softmax_simd, swiglu_simd};

@@ -34,6 +34,7 @@
 pub mod accuracy;
 pub mod arc;
 pub mod bleu;
+pub mod boolq;
 pub mod bootstrap;
 pub mod calibration;
 pub mod chrf;
@@ -47,6 +48,7 @@ pub mod report;
 pub mod rouge;
 pub mod streaming;
 pub mod throughput;
+pub mod winogrande;
 
 #[cfg(test)]
 mod tests;
@@ -59,7 +61,9 @@ pub use accuracy::{
     AccuracyResult, ExactMatchEvaluator, LogitMcResult, McEvaluator, McLogitEvaluator,
 };
 pub use arc::{ArcEvaluator, ArcResult, ArcSplit};
+pub use boolq::{BoolQDataset, BoolQEvaluator, BoolQItem, BoolQResult};
 pub use gsm8k::{Gsm8kEvaluator, Gsm8kResult};
+pub use winogrande::{WinoGrandeDataset, WinoGrandeEvaluator, WinoGrandeItem, WinoGrandeResult};
 pub use bleu::{corpus_bleu, sentence_bleu, BleuConfig, BleuScore, SmoothingMethod};
 pub use bootstrap::{bootstrap_ci, ConfidenceInterval};
 pub use calibration::{

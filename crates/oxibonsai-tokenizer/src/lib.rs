@@ -63,6 +63,7 @@ pub mod trainer;
 pub mod unigram;
 pub mod utils;
 pub mod vocab;
+pub mod wordpiece;
 
 // Re-export the most commonly used types at the crate root.
 pub use bpe::{bpe_encode, byte_fallback_id, pretokenize, BpeMerges};
@@ -81,3 +82,4 @@ pub use trainer::{
 };
 pub use unigram::{UnigramError, UnigramVocab};
 pub use vocab::Vocabulary;
+pub use wordpiece::{WordPieceError, WordPieceVocab, WORDPIECE_CONTINUATION_PREFIX};

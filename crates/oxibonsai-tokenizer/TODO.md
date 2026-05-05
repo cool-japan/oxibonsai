@@ -1,12 +1,12 @@
 # oxibonsai-tokenizer TODO
 
-> Pure Rust BPE tokenizer: encode, decode, training, serialization
-> 12 src files + 5 integration test files, ~6,700 lines, 260+ tests (all passing)
-> Version: 0.1.3 · Last updated: 2026-05-03
+> Pure Rust BPE/Unigram/WordPiece tokenizer: encode, decode, training, serialization
+> 14 src files + 7 integration test files, ~7,000 lines, 351+ tests (all passing)
+> Version: 0.1.4 · Last updated: 2026-05-05
 
-## Status: Stable — HuggingFace-Compatible BPE
+## Status: Stable — Phase 18: WordPiece tokenizer added
 
-Full BPE tokenizer with HuggingFace `tokenizer.json` support, chat templates for five model families, UTF-8-safe streaming decoder, training, encoding/decoding, batch operations, special token handling, and JSON serialization.
+Full BPE/Unigram/WordPiece tokenizer with HuggingFace `tokenizer.json` support, chat templates for five model families, UTF-8-safe streaming decoder, training, encoding/decoding, batch operations, special token handling, and JSON serialization.
 
 ## Done
 
@@ -30,3 +30,15 @@ Full BPE tokenizer with HuggingFace `tokenizer.json` support, chat templates for
 - [x] `#[non_exhaustive]` on public config + error enums for forward compatibility
 - [x] No-unwrap compliance in production code (policy)
 - [x] Comprehensive tests — 130+ in-module unit tests + 130+ integration tests spread across `hf_format_tests`, `chat_template_tests`, `streaming_tests`, `unicode_edge_tests`, `property_tests` (proptest), `serialization_tests`, `trainer_tests`
+
+## Phase 17 — Unigram Tokenizer
+
+- [x] **`UnigramVocab`** — Viterbi best-path segmentation over token lattice; `(token, log_prob)` entries; single-byte UNK fallback with `UNK_PENALTY`; `UnigramError::{EmptyVocab, UnkOutOfRange, DuplicateToken}` 
+- [x] **HF format Unigram branch** — `HfModelType::Unigram`; parses `model.vocab` as `[[token, score]]`; `model.unk_id`; 6 integration tests in `tests/unigram_integration_tests.rs`; 4 tests in `hf_format_tests.rs`
+- [x] **`OxiTokenizer::with_unigram`** — constructor + `is_unigram()` predicate; encode dispatches to Viterbi path
+
+## Phase 18 — WordPiece Tokenizer
+
+- [x] **`WordPieceVocab`** — greedy longest-match-first with `##`-prefixed continuation tokens; Unicode-safe char-boundary iteration (not byte offsets); `max_input_chars_per_word` limit (default 200); `with_max_input_chars()` builder; `WordPieceError::{EmptyVocab, UnkOutOfRange, DuplicateToken}`; `WORDPIECE_CONTINUATION_PREFIX` constant; 20 inline unit tests
+- [x] **HF format WordPiece branch** — `HfModelType::WordPiece`; parses `model.vocab` as object (same shape as BPE); `wordpiece_max_chars: Option<usize>` field; `build_wordpiece_vocab_from_map` helper; 8 integration tests in `hf_format_tests.rs`
+- [x] **`OxiTokenizer::with_wordpiece`** — constructor + `is_wordpiece()` predicate; encode dispatches WordPiece before BPE/Unigram; 15 integration tests in `tests/wordpiece_integration_tests.rs`

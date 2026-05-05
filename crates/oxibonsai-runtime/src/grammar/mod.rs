@@ -44,6 +44,7 @@ pub mod constraint;
 pub mod earley;
 pub mod examples;
 pub mod json_schema_compiler;
+pub mod regex_compiler;
 
 // ── Public re-exports ─────────────────────────────────────────────────────────
 
@@ -58,3 +59,4 @@ pub use examples::{
 pub use json_schema_compiler::{
     compile_json_schema, compile_json_schema_str, JsonSchemaCompileError,
 };
+pub use regex_compiler::{compile_regex, RegexCompileError};

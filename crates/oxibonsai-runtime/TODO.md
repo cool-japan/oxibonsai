@@ -1,7 +1,7 @@
 # oxibonsai-runtime TODO
 
 > Inference engine, sampling, tokenizer, OpenAI-compatible server
-> Version 0.1.4 — 1,090+ tests passing (all-features, 2026-05-03)
+> Version 0.1.4 — 1,130+ tests passing (all-features, 2026-05-05)
 
 ## Status: ✅ All Features Complete (Stable)
 
@@ -13,6 +13,10 @@
 - [x] **BNF grammar engine** (`src/grammar/`): `ast.rs` (Grammar AST, terminal normalisation), `bnf_parser.rs` (hand-rolled two-phase parser), `earley.rs` (full Earley recognizer with FIRST sets, `next_byte_set()`, `clone_state()`), `constraint.rs` (`GrammarConstraint` implementing `TokenConstraint`), `examples.rs` (5 pre-canned grammars)
 - [x] **93 grammar tests** + **32 constraint tests** in `tests/`
 - [x] **`AllowedTokensCache`** — LRU memoization cache for Earley `allowed_tokens` (Phase 15.x); `grammar/cache.rs`; `state_hash()` on `EarleyRecognizer`; `Mutex<AllowedTokensCache>` in `GrammarConstraint`; configurable capacity via `with_cache_capacity`; `cache_stats()` for observability; 12 tests in `tests/grammar_cache_tests.rs`
+
+## Phase 18 — Regex → BNF Compiler
+
+- [x] **Regex → BNF compiler** — `grammar/regex_compiler.rs` (1,233 lines): `compile_regex(pattern) -> Result<Grammar, RegexCompileError>`; `ByteSet` (256-bit bitset, 4×u64); `RegexParser` (hand-rolled recursive descent); Thompson NFA construction; Subset DFA via powerset construction (2,048-state limit); DFA states → Grammar NTs with ε-productions for accepting states; supports literals, `.`, `[...]`/`[^...]` classes, `*`/`+`/`?`, `{n,m}`, `|`, grouping, `\d\w\s` escapes, `^$` anchors (ignored); `RegexCompileError::{InvalidSyntax, UnsupportedFeature, DepthExceeded, EmptyPattern, InvalidUtf8}`; re-exported from `grammar::` and `lib.rs`; 38 tests in `tests/regex_compile_tests.rs`
 
 ## Phase 17 — JSON Schema BNF + KV Cache Level
 

@@ -5,6 +5,8 @@ use crate::block::TransformerBlock;
 use crate::error::{ModelError, ModelResult};
 use crate::kv_cache::KvCache;
 use crate::layers::linear::{Linear1Bit, LinearFP8E4M3, LinearFP8E5M2, LinearTernary};
+use crate::layers::linear_kquant_ext::{LinearQ5K, LinearQ6K};
+use crate::layers::linear_standard::{LinearQ4_0, LinearQ8_0};
 use crate::layers::rms_norm::RmsNorm;
 use crate::layers::rope::RopeTable;
 use crate::model_registry::ModelVariant;
@@ -211,7 +213,12 @@ impl<'a> BonsaiModel<'a> {
         match self.output_weight {
             OutputWeight::OneBit(ref mut linear) => linear.upload_to_gpu(),
             OutputWeight::Ternary(ref mut linear) => linear.upload_to_gpu(),
-            OutputWeight::FP8E4M3(_) | OutputWeight::FP8E5M2(_) => {}
+            OutputWeight::FP8E4M3(_)
+            | OutputWeight::FP8E5M2(_)
+            | OutputWeight::Q4_0(_)
+            | OutputWeight::Q8_0(_)
+            | OutputWeight::Q5K(_)
+            | OutputWeight::Q6K(_) => {}
             OutputWeight::Fp32 { .. } => {}
         }
         tracing::info!("GPU weight upload complete");
@@ -527,6 +534,18 @@ impl<'a> BonsaiModel<'a> {
             OutputWeight::FP8E5M2(linear) => {
                 linear.forward(&normed, &mut logits)?;
             }
+            OutputWeight::Q4_0(linear) => {
+                linear.forward(&normed, &mut logits)?;
+            }
+            OutputWeight::Q8_0(linear) => {
+                linear.forward(&normed, &mut logits)?;
+            }
+            OutputWeight::Q5K(linear) => {
+                linear.forward(&normed, &mut logits)?;
+            }
+            OutputWeight::Q6K(linear) => {
+                linear.forward(&normed, &mut logits)?;
+            }
             OutputWeight::Fp32 {
                 weights,
                 out_features,
@@ -553,12 +572,20 @@ impl<'a> BonsaiModel<'a> {
     }
 }
 
-/// Output projection can be 1-bit, ternary, FP8, or FP32 depending on the model.
+/// Output projection can be 1-bit, ternary, FP8, Q4_0, Q8_0, Q5_K, Q6_K, or FP32.
 pub(super) enum OutputWeight<'a> {
     OneBit(Linear1Bit<'a>),
     Ternary(LinearTernary<'a>),
     FP8E4M3(LinearFP8E4M3<'a>),
     FP8E5M2(LinearFP8E5M2<'a>),
+    /// 4-bit symmetric (Q4_0) output projection.
+    Q4_0(LinearQ4_0<'a>),
+    /// 8-bit symmetric (Q8_0) output projection.
+    Q8_0(LinearQ8_0<'a>),
+    /// 5-bit K-quant (Q5_K) output projection.
+    Q5K(LinearQ5K<'a>),
+    /// 6-bit K-quant (Q6_K) output projection.
+    Q6K(LinearQ6K<'a>),
     Fp32 {
         weights: Vec<f32>,
         out_features: usize,

@@ -1,4 +1,4 @@
-//! HuggingFace `tokenizer.json` format parser (BPE and Unigram models).
+//! HuggingFace `tokenizer.json` format parser (BPE, Unigram, and WordPiece models).
 //!
 //! This module provides a faithful, dependency-free parser for the tokenizer
 //! JSON format emitted by the HuggingFace `tokenizers` library.  It supports:
@@ -6,6 +6,8 @@
 //! - BPE `model` with `vocab` and `merges` (both string `"a b"` form and
 //!   array `["a","b"]` form)
 //! - Unigram `model` with `vocab` as `[[token, score], ...]` and `unk_id`
+//! - WordPiece `model` with `vocab` as `{"token": id, ...}`, `unk_token`, and
+//!   optional `max_input_chars_per_word` (BERT/RoBERTa/DeBERTa family)
 //! - `added_tokens` (marked special if `special == true`)
 //! - `pre_tokenizer` type detection (GPT-2 ByteLevel vs. Whitespace)
 //! - `decoder` type detection (ByteLevel is the default for modern models)
@@ -37,6 +39,7 @@ use crate::{
     error::{TokenizerError, TokenizerResult},
     tokenizer::{OxiTokenizer, TokenizerConfig},
     vocab::Vocabulary,
+    wordpiece::WordPieceVocab,
 };
 
 // ── Bytes-to-unicode map ─────────────────────────────────────────────────────
@@ -130,6 +133,9 @@ pub enum HfModelType {
     /// Unigram language model — uses `vocab` as `[[token, score], ...]` and
     /// `unk_id`.
     Unigram,
+    /// WordPiece model (BERT/RoBERTa/DeBERTa family) — uses `vocab` (object),
+    /// `unk_token`, and optional `max_input_chars_per_word`.
+    WordPiece,
     /// Any other (currently unrecognised) model type.  Stored for diagnostics.
     Other(String),
 }
@@ -139,6 +145,7 @@ impl HfModelType {
         match s {
             "BPE" => Self::Bpe,
             "Unigram" => Self::Unigram,
+            "WordPiece" => Self::WordPiece,
             other => Self::Other(other.to_owned()),
         }
     }
@@ -159,21 +166,26 @@ pub struct HfTokenizerJson {
     /// For BPE models this is populated from `model.vocab` (an object).
     /// For Unigram models this is derived from the ordered `model.vocab` array
     /// so that decode (ID → string) continues to work via the standard path.
+    /// For WordPiece models this is populated from `model.vocab` (an object).
     pub vocab: HashMap<String, u32>,
     /// Ordered list of BPE merge pairs `(left, right)`.
     ///
     /// Order defines priority — first pair is highest priority.
-    /// Always empty for Unigram models.
+    /// Always empty for Unigram and WordPiece models.
     pub merges: Vec<(String, String)>,
     /// For Unigram models: ordered `(token, log_prob)` pairs from `model.vocab`.
     ///
     /// The position of each pair in the vector determines its token ID.
-    /// `None` for BPE models.
+    /// `None` for BPE and WordPiece models.
     pub unigram_vocab: Option<Vec<(String, f64)>>,
     /// For Unigram models: the UNK token ID from `model.unk_id`.
     ///
-    /// `None` for BPE models.
+    /// `None` for BPE and WordPiece models.
     pub unigram_unk_id: Option<u32>,
+    /// For WordPiece models: the `max_input_chars_per_word` from `model`.
+    ///
+    /// `None` for BPE and Unigram models (defaults to 100 when absent).
+    pub wordpiece_max_chars: Option<usize>,
     /// Tokens flagged as `special == true` in `added_tokens`.
     pub special_tokens: HashMap<String, u32>,
     /// BOS token string, if present.
@@ -210,6 +222,33 @@ impl HfTokenizerJson {
             HfModelType::Unigram => {
                 let (v, m, uv, uid) = parse_unigram_model(model)?;
                 (v, m, uv, uid)
+            }
+            HfModelType::WordPiece => {
+                // WordPiece vocab is an object {"token": id, ...} — re-use the
+                // BPE object-vocab parser for the model.vocab field; merges are
+                // not used by WordPiece so we accept an empty/absent merges list.
+                let vocab_val = model
+                    .get("vocab")
+                    .ok_or_else(|| TokenizerError::HfFormat("WordPiece model.vocab missing".into()))?;
+                let mut wp_vocab: HashMap<String, u32> = HashMap::new();
+                match vocab_val {
+                    Value::Object(map) => {
+                        for (token, id_val) in map {
+                            let id = id_val.as_u64().ok_or_else(|| {
+                                TokenizerError::HfFormat(format!(
+                                    "WordPiece vocab id for '{token}' is not an integer"
+                                ))
+                            })? as u32;
+                            wp_vocab.insert(token.clone(), id);
+                        }
+                    }
+                    _ => {
+                        return Err(TokenizerError::HfFormat(
+                            "WordPiece model.vocab must be an object".into(),
+                        ));
+                    }
+                }
+                (wp_vocab, vec![], None, None)
             }
             HfModelType::Bpe | HfModelType::Other(_) => {
                 let (v, m) = parse_bpe_model(model)?;
@@ -258,12 +297,23 @@ impl HfTokenizerJson {
         // ── 4. ByteLevel detection ───────────────────────────────────────────
         let byte_level = detect_byte_level(&root);
 
+        // ── 5. WordPiece-specific: max_input_chars_per_word ─────────────────
+        let wordpiece_max_chars = if model_type == HfModelType::WordPiece {
+            model
+                .get("max_input_chars_per_word")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize)
+        } else {
+            None
+        };
+
         Ok(Self {
             model_type,
             vocab,
             merges,
             unigram_vocab,
             unigram_unk_id,
+            wordpiece_max_chars,
             special_tokens,
             bos_token,
             eos_token,
@@ -277,7 +327,9 @@ impl HfTokenizerJson {
     ///
     /// For `"BPE"` (and unrecognised) model types the existing BPE path is
     /// used.  For `"Unigram"` a [`crate::unigram::UnigramVocab`] is built and
-    /// [`OxiTokenizer::with_unigram`] is called.
+    /// [`OxiTokenizer::with_unigram`] is called.  For `"WordPiece"` a
+    /// [`WordPieceVocab`] is built and [`OxiTokenizer::with_wordpiece`] is
+    /// called.
     pub fn into_tokenizer(self) -> TokenizerResult<OxiTokenizer> {
         // Build the shared vocabulary used for decode in all paths.
         let mut vocabulary = Vocabulary::new();
@@ -362,11 +414,69 @@ impl HfTokenizerJson {
                     })?;
                 Ok(OxiTokenizer::with_unigram(vocabulary, unigram_vocab, config))
             }
+            HfModelType::WordPiece => {
+                // Build the ordered token list from the vocab map.
+                let wp_vocab = build_wordpiece_vocab_from_map(
+                    &self.vocab,
+                    self.unk_token.as_deref(),
+                    self.wordpiece_max_chars,
+                    config.unk_token_id,
+                )?;
+                Ok(OxiTokenizer::with_wordpiece(vocabulary, wp_vocab, config))
+            }
         }
     }
 }
 
 // ── Private parse helpers ────────────────────────────────────────────────────
+
+/// Build a [`WordPieceVocab`] from the flat token→id map obtained during
+/// parsing of a WordPiece `model` section.
+///
+/// The map may come from the parsed `model.vocab` object.  This function:
+/// 1. Sorts entries by ID to produce a contiguous, ordered token list.
+/// 2. Validates that IDs are contiguous starting from 0.
+/// 3. Resolves the UNK token ID from `unk_token_str` (falling back to
+///    `fallback_unk_id` from the config if the string is absent or not found).
+/// 4. Applies the optional `max_chars` limit.
+fn build_wordpiece_vocab_from_map(
+    vocab_map: &HashMap<String, u32>,
+    unk_token_str: Option<&str>,
+    max_chars: Option<usize>,
+    fallback_unk_id: u32,
+) -> TokenizerResult<WordPieceVocab> {
+    // Sort by ID so that `tokens[id] == token_string`.
+    let mut pairs: Vec<(&str, u32)> = vocab_map
+        .iter()
+        .map(|(k, &v)| (k.as_str(), v))
+        .collect();
+    pairs.sort_by_key(|(_, id)| *id);
+
+    // Validate contiguity.
+    for (i, (_, id)) in pairs.iter().enumerate() {
+        if *id as usize != i {
+            return Err(TokenizerError::HfFormat(format!(
+                "WordPiece vocab IDs are not contiguous: expected {i}, found {id}"
+            )));
+        }
+    }
+
+    let tokens: Vec<String> = pairs.into_iter().map(|(t, _)| t.to_owned()).collect();
+
+    // Resolve the UNK token ID.
+    let unk_id: u32 = unk_token_str
+        .and_then(|s| vocab_map.get(s).copied())
+        .unwrap_or(fallback_unk_id);
+
+    let wp = WordPieceVocab::new(tokens, unk_id)
+        .map_err(|e| TokenizerError::HfFormat(format!("invalid WordPiece vocab: {e}")))?;
+
+    Ok(if let Some(max) = max_chars {
+        wp.with_max_input_chars(max)
+    } else {
+        wp
+    })
+}
 
 /// Parse a BPE `model` section: returns `(vocab_map, merges)`.
 #[allow(clippy::type_complexity)]

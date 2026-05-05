@@ -348,6 +348,15 @@ impl<'a> BonsaiModel<'a> {
             OutputWeight::FP8E4M3(_) | OutputWeight::FP8E5M2(_) => {
                 return Err("FP8 GPU inference not yet supported; use CPU path".into());
             }
+            OutputWeight::Q4_0(_)
+            | OutputWeight::Q8_0(_)
+            | OutputWeight::Q5K(_)
+            | OutputWeight::Q6K(_) => {
+                return Err(
+                    "LM head not supported on CUDA fused GPU path for this quant type; use CPU path"
+                        .into(),
+                );
+            }
             OutputWeight::Fp32 { .. } => {
                 return Err("FP32 LM head not supported on CUDA fused GPU path".into());
             }
@@ -427,6 +436,14 @@ impl<'a> BonsaiModel<'a> {
             OutputWeight::Ternary(_) => unreachable!("handled above"),
             OutputWeight::FP8E4M3(_) | OutputWeight::FP8E5M2(_) => {
                 return Err("FP8 GPU inference not yet supported; use CPU path".into());
+            }
+            OutputWeight::Q4_0(_)
+            | OutputWeight::Q8_0(_)
+            | OutputWeight::Q5K(_)
+            | OutputWeight::Q6K(_) => {
+                return Err(
+                    "LM head not supported on CUDA prefill path for this quant type".into(),
+                );
             }
             OutputWeight::Fp32 { .. } => {
                 return Err("FP32 LM head not supported on CUDA prefill path".into());
@@ -537,6 +554,14 @@ impl<'a> BonsaiModel<'a> {
             OutputWeight::Ternary(_) => unreachable!("handled above"),
             OutputWeight::FP8E4M3(_) | OutputWeight::FP8E5M2(_) => {
                 return Err("FP8 GPU inference not yet supported; use CPU path".into());
+            }
+            OutputWeight::Q4_0(_)
+            | OutputWeight::Q8_0(_)
+            | OutputWeight::Q5K(_)
+            | OutputWeight::Q6K(_) => {
+                return Err(
+                    "LM head not supported on CUDA prefill verify path for this quant type".into(),
+                );
             }
             OutputWeight::Fp32 { .. } => {
                 return Err("FP32 LM head not supported on CUDA prefill verify path".into());

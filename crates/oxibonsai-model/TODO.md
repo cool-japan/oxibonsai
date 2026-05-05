@@ -1,7 +1,7 @@
 # oxibonsai-model TODO
 
 > Qwen3 transformer model: layers, blocks, forward pass, KV cache, weight loaders
-> ~38,000 lines across `src/`, 1,048 tests (2026-05-03)
+> ~38,000 lines across `src/`, 1,060+ tests (2026-05-05)
 
 ## Status: All Features Complete
 
@@ -79,6 +79,11 @@ merging, and numerical stability tests all implemented and green.
 - [x] Ternary quantization export (`quantize_ternary.rs`)
 - [x] Checkpoint save/load — OXCK binary format (`checkpoint.rs`)
 - [x] Compression utilities (`compression.rs`)
+
+## Phase 18 — Standard GGUF Formats + K-quant Extensions
+
+- [x] **Q4_0 + Q8_0 full stack** — `BlockQ4_0` (18 bytes/32w) + `BlockQ8_0` (34 bytes/32w) in `oxibonsai-core::quant_std`; scalar GEMV kernels; `LinearQ4_0<'a>` + `LinearQ8_0<'a>` in `layers/linear_standard.rs`; `LinearLayer::{Q4_0, Q8_0}` + `OutputWeight::{Q4_0, Q8_0}` variants; Q4_0/Q8_0 weight loaders; 25 block + 8 kernel tests each
+- [x] **Q5_K + Q6_K K-quant extensions** — `BlockQ5K` (176 bytes/256w, 5-bit sub-blocks, K-quant scale/min encoding) + `BlockQ6K` (210 bytes/256w, 6-bit symmetric) in `oxibonsai-core::quant_k_ext`; GEMV kernels; `LinearQ5K<'a>` + `LinearQ6K<'a>` in `layers/linear_kquant_ext.rs`; full model integration; 12 tests in `tests/q5k_q6k_model_tests.rs`
 
 ## Phase 17 — FP8 KV Cache + SmoothQuant FP8
 

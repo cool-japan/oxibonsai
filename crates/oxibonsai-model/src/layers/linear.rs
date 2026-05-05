@@ -1,12 +1,17 @@
-//! 1-bit Linear layer using Q1\_0\_g128 weights.
+//! 1-bit, ternary, FP8, Q4_0, and Q8_0 Linear layer implementations.
 //!
-//! Wraps the kernel GEMV/GEMM operations with a layer abstraction.
+//! Wraps the kernel GEMV/GEMM operations with a unified layer abstraction
+//! that dispatches to the appropriate quantization-specific kernel.
 
 use oxibonsai_core::tensor::BlockQ1_0G128;
 use oxibonsai_kernels::traits::OneBitKernel;
 use oxibonsai_kernels::GpuWeightHandle;
 
 use crate::error::ModelResult;
+
+// Re-export standard quant types so callers can use `layers::linear::LinearQ4_0`.
+pub use crate::layers::linear_kquant_ext::{LinearQ5K, LinearQ6K};
+pub use crate::layers::linear_standard::{LinearQ4_0, LinearQ8_0};
 
 /// A linear layer with Q1\_0\_g128 (1-bit) weights.
 ///
@@ -522,7 +527,7 @@ impl<'a> LinearFP8E5M2<'a> {
     }
 }
 
-/// Sum type dispatching to Q1\_0\_g128, TQ2\_0\_g128, FP8 E4M3FN, or FP8 E5M2 linear layers.
+/// Sum type dispatching to Q1\_0\_g128, TQ2\_0\_g128, FP8, Q4_0, Q8_0, Q5_K, or Q6_K linear layers.
 #[derive(Debug)]
 pub enum LinearLayer<'a> {
     /// 1-bit (Q1\_0\_g128) linear layer.
@@ -533,6 +538,14 @@ pub enum LinearLayer<'a> {
     FP8E4M3(LinearFP8E4M3<'a>),
     /// FP8 E5M2 (8-bit float) linear layer.
     FP8E5M2(LinearFP8E5M2<'a>),
+    /// 4-bit symmetric (Q4_0) linear layer.
+    Q4_0(LinearQ4_0<'a>),
+    /// 8-bit symmetric (Q8_0) linear layer.
+    Q8_0(LinearQ8_0<'a>),
+    /// 5-bit K-quant (Q5_K) linear layer.
+    Q5K(LinearQ5K<'a>),
+    /// 6-bit K-quant (Q6_K) linear layer.
+    Q6K(LinearQ6K<'a>),
 }
 
 impl<'a> LinearLayer<'a> {
@@ -543,6 +556,10 @@ impl<'a> LinearLayer<'a> {
             Self::Ternary(l) => l.out_features(),
             Self::FP8E4M3(l) => l.out_features(),
             Self::FP8E5M2(l) => l.out_features(),
+            Self::Q4_0(l) => l.out_features(),
+            Self::Q8_0(l) => l.out_features(),
+            Self::Q5K(l) => l.out_features(),
+            Self::Q6K(l) => l.out_features(),
         }
     }
 
@@ -553,17 +570,26 @@ impl<'a> LinearLayer<'a> {
             Self::Ternary(l) => l.in_features(),
             Self::FP8E4M3(l) => l.in_features(),
             Self::FP8E5M2(l) => l.in_features(),
+            Self::Q4_0(l) => l.in_features(),
+            Self::Q8_0(l) => l.in_features(),
+            Self::Q5K(l) => l.in_features(),
+            Self::Q6K(l) => l.in_features(),
         }
     }
 
     /// Returns the GPU weight handle, if the layer has been uploaded to GPU.
     ///
-    /// FP8 variants do not yet support GPU caching — returns `None`.
+    /// FP8, Q4_0, Q8_0, Q5_K, and Q6_K variants do not support GPU caching — returns `None`.
     pub fn gpu_handle(&self) -> Option<oxibonsai_kernels::GpuWeightHandle> {
         match self {
             Self::OneBit(l) => l.gpu_handle(),
             Self::Ternary(l) => l.gpu_handle(),
-            Self::FP8E4M3(_) | Self::FP8E5M2(_) => None,
+            Self::FP8E4M3(_)
+            | Self::FP8E5M2(_)
+            | Self::Q4_0(_)
+            | Self::Q8_0(_)
+            | Self::Q5K(_)
+            | Self::Q6K(_) => None,
         }
     }
 
@@ -571,15 +597,27 @@ impl<'a> LinearLayer<'a> {
     pub fn blocks_1bit(&self) -> Option<&[oxibonsai_core::tensor::BlockQ1_0G128]> {
         match self {
             Self::OneBit(l) => Some(l.blocks()),
-            Self::Ternary(_) | Self::FP8E4M3(_) | Self::FP8E5M2(_) => None,
+            Self::Ternary(_)
+            | Self::FP8E4M3(_)
+            | Self::FP8E5M2(_)
+            | Self::Q4_0(_)
+            | Self::Q8_0(_)
+            | Self::Q5K(_)
+            | Self::Q6K(_) => None,
         }
     }
 
     /// Returns the TQ2\_0\_g128 blocks if this is a ternary layer, `None` otherwise.
     pub fn blocks_ternary(&self) -> Option<&[oxibonsai_core::BlockTQ2_0_g128]> {
         match self {
-            Self::OneBit(_) | Self::FP8E4M3(_) | Self::FP8E5M2(_) => None,
             Self::Ternary(l) => Some(l.blocks()),
+            Self::OneBit(_)
+            | Self::FP8E4M3(_)
+            | Self::FP8E5M2(_)
+            | Self::Q4_0(_)
+            | Self::Q8_0(_)
+            | Self::Q5K(_)
+            | Self::Q6K(_) => None,
         }
     }
 
@@ -599,14 +637,51 @@ impl<'a> LinearLayer<'a> {
         }
     }
 
+    /// Returns the Q4_0 blocks if this is a Q4_0 layer, `None` otherwise.
+    pub fn blocks_q4_0(&self) -> Option<&[oxibonsai_core::BlockQ4_0]> {
+        match self {
+            Self::Q4_0(l) => Some(l.blocks()),
+            _ => None,
+        }
+    }
+
+    /// Returns the Q8_0 blocks if this is a Q8_0 layer, `None` otherwise.
+    pub fn blocks_q8_0(&self) -> Option<&[oxibonsai_core::BlockQ8_0]> {
+        match self {
+            Self::Q8_0(l) => Some(l.blocks()),
+            _ => None,
+        }
+    }
+
+    /// Returns the Q5_K blocks if this is a Q5_K layer, `None` otherwise.
+    pub fn blocks_q5k(&self) -> Option<&[oxibonsai_core::BlockQ5K]> {
+        match self {
+            Self::Q5K(l) => Some(l.blocks()),
+            _ => None,
+        }
+    }
+
+    /// Returns the Q6_K blocks if this is a Q6_K layer, `None` otherwise.
+    pub fn blocks_q6k(&self) -> Option<&[oxibonsai_core::BlockQ6K]> {
+        match self {
+            Self::Q6K(l) => Some(l.blocks()),
+            _ => None,
+        }
+    }
+
     /// Upload weights to GPU.
     ///
-    /// FP8 variants are no-ops (GPU FP8 inference not yet implemented).
+    /// FP8, Q4_0, Q8_0, Q5_K, and Q6_K variants are no-ops (GPU inference not yet implemented).
     pub fn upload_to_gpu(&mut self) {
         match self {
             Self::OneBit(l) => l.upload_to_gpu(),
             Self::Ternary(l) => l.upload_to_gpu(),
-            Self::FP8E4M3(_) | Self::FP8E5M2(_) => {}
+            Self::FP8E4M3(_)
+            | Self::FP8E5M2(_)
+            | Self::Q4_0(_)
+            | Self::Q8_0(_)
+            | Self::Q5K(_)
+            | Self::Q6K(_) => {}
         }
     }
 
@@ -617,6 +692,10 @@ impl<'a> LinearLayer<'a> {
             Self::Ternary(l) => l.forward(input, output),
             Self::FP8E4M3(l) => l.forward(input, output),
             Self::FP8E5M2(l) => l.forward(input, output),
+            Self::Q4_0(l) => l.forward(input, output),
+            Self::Q8_0(l) => l.forward(input, output),
+            Self::Q5K(l) => l.forward(input, output),
+            Self::Q6K(l) => l.forward(input, output),
         }
     }
 
@@ -627,6 +706,10 @@ impl<'a> LinearLayer<'a> {
             Self::Ternary(l) => l.forward_batch(input, output, m),
             Self::FP8E4M3(l) => l.forward_batch(input, output, m),
             Self::FP8E5M2(l) => l.forward_batch(input, output, m),
+            Self::Q4_0(l) => l.forward_batch(input, output, m),
+            Self::Q8_0(l) => l.forward_batch(input, output, m),
+            Self::Q5K(l) => l.forward_batch(input, output, m),
+            Self::Q6K(l) => l.forward_batch(input, output, m),
         }
     }
 }
@@ -652,6 +735,30 @@ impl<'a> From<LinearFP8E4M3<'a>> for LinearLayer<'a> {
 impl<'a> From<LinearFP8E5M2<'a>> for LinearLayer<'a> {
     fn from(l: LinearFP8E5M2<'a>) -> Self {
         Self::FP8E5M2(l)
+    }
+}
+
+impl<'a> From<LinearQ4_0<'a>> for LinearLayer<'a> {
+    fn from(l: LinearQ4_0<'a>) -> Self {
+        Self::Q4_0(l)
+    }
+}
+
+impl<'a> From<LinearQ8_0<'a>> for LinearLayer<'a> {
+    fn from(l: LinearQ8_0<'a>) -> Self {
+        Self::Q8_0(l)
+    }
+}
+
+impl<'a> From<LinearQ5K<'a>> for LinearLayer<'a> {
+    fn from(l: LinearQ5K<'a>) -> Self {
+        Self::Q5K(l)
+    }
+}
+
+impl<'a> From<LinearQ6K<'a>> for LinearLayer<'a> {
+    fn from(l: LinearQ6K<'a>) -> Self {
+        Self::Q6K(l)
     }
 }
 

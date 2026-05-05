@@ -1,7 +1,7 @@
 # OxiBonsai TODO
 
 > Pure Rust 1-bit LLM inference engine for PrismML Bonsai models
-> 420+ source files, ~154,000+ lines of Rust code, 4,206+ tests passing across workspace — verified 2026-05-05 (0.1.4 + Phase 17)
+> 420+ source files, ~154,000+ lines of Rust code, 4,200+ tests passing across workspace — verified 2026-05-05 (0.1.4 + Phase 18)
 
 ## Phase Status
 
@@ -29,6 +29,7 @@
 | Phase 16A: FP8 Model Layers + Integration | ✅ Complete | `LinearFP8E4M3<'a>` + `LinearFP8E5M2<'a>` in `oxibonsai-model`; `OutputWeight::FP8E4M3/E5M2` variants; `ModelVariant::FP8Bonsai8B/4B/1_7B` with spec builders; FP8 block loaders in `weight_loaders.rs`; GPU paths return graceful Err; 6 integration tests |
 | Phase 16B: Token-byte precomputation + first-byte index | ✅ Complete | `GrammarConstraint` precomputes all token byte sequences at construction; `first_byte_index: Box<[Vec<u32>; 256]>` eliminates per-step decode calls; `empty_token_ids` for EOS/special tokens; `vocab_size()` + `index_memory_bytes()` accessors; 5 new integration tests |
 | Phase 17: FP8 KV cache + JSON Schema BNF + ARC/GSM8K + SmoothQuant + Unigram | ✅ Complete | `Fp8KvLayer`/`Fp8KvCache`/`KvCacheLevel::Fp8`; JSON Schema→Grammar compiler; ARC/GSM8K evaluators; SmoothQuant FP8 calibrator + channel-aware quant; Unigram tokenizer with HF format support |
+| Phase 18: Standard GGUF formats + K-quant ext + WordPiece + WinoGrande/BoolQ + Regex→BNF | ✅ Complete | Q4_0/Q8_0 full stack; Q5_K/Q6_K K-quant layers; WordPiece tokenizer; WinoGrande/BoolQ evaluators; Regex→BNF compiler (Thompson NFA→Subset DFA→Grammar) |
 
 ## Phase 4 — Complete
 
@@ -276,6 +277,14 @@ Closes all 7 `OutputWeight::Ternary(_)` CPU-fallback guard sites in `crates/oxib
   - **Files:** `crates/oxibonsai-kernels/src/gpu_backend/cuda_full_layer/encode_ternary.rs` (implemented); `crates/oxibonsai-model/src/model/types/forward_cuda.rs` (3 guards removed).
   - **Tests:** `test_encode_lm_head_gemv_ternary_matches_reference`, `test_encode_full_forward_ternary_matches_reference` (CI-GPU-gated). `cargo check --all-features` + clippy + 140 non-CUDA tests all green.
   - **Risk:** `CuGraphHolder` captured-graph pattern — capture+replay must be tested end-to-end, not just isolated kernel launches. Post-merge validation on CUDA hardware required.
+
+## Phase 18 — Standard GGUF Formats + K-quant Extensions + WordPiece + WinoGrande/BoolQ + Regex→BNF
+
+- [x] **Q4_0 + Q8_0 full stack** — `BlockQ4_0` (18 bytes/32w, nibble dequant) + `BlockQ8_0` (34 bytes/32w, i8 dequant) in `oxibonsai-core::quant_std`; scalar GEMV kernels in `oxibonsai-kernels::{gemv_q4_0, gemv_q8_0}`; `LinearQ4_0<'a>` + `LinearQ8_0<'a>` layers in `oxibonsai-model::layers::linear_standard`; `LinearLayer::{Q4_0, Q8_0}` + `OutputWeight::{Q4_0, Q8_0}` variants; Q4_0/Q8_0 paths in `weight_loaders.rs`; 25 block tests + 8 kernel tests each
+- [x] **Q5_K + Q6_K K-quant extensions** — `BlockQ5K` (176 bytes/256w, 8 sub-blocks, 5-bit q, K-quant scale/min encoding) + `BlockQ6K` (210 bytes/256w, 16 sub-blocks, 6-bit q, symmetric centered) in `oxibonsai-core::quant_k_ext`; GEMV kernels in `oxibonsai-kernels::{gemv_q5k, gemv_q6k}`; `LinearQ5K<'a>` + `LinearQ6K<'a>` layers; full model integration; 12 integration tests in `tests/q5k_q6k_model_tests.rs`
+- [x] **WordPiece tokenizer** — `WordPieceVocab` with greedy longest-match-first segmentation + `##`-prefixed continuation tokens; Unicode-safe char-boundary iteration; `WordPieceError`; `HfModelType::WordPiece` parsing branch in `hf_format.rs`; `OxiTokenizer::with_wordpiece` constructor + dispatch; 20 unit tests + 15 integration tests
+- [x] **WinoGrande + BoolQ evaluators** — `WinoGrandeEvaluator` delegating to `McEvaluator`/`McLogitEvaluator` via `as_mc_dataset()` (1-based→0-based answer mapping); `BoolQEvaluator` with `extract_answer()` case-insensitive yes/no prefix matching; 12 WinoGrande + 16 BoolQ integration tests in `crates/oxibonsai-eval/tests/`
+- [x] **Regex → BNF compiler** — `compile_regex(pattern) -> Result<Grammar, RegexCompileError>` via full Thompson NFA → Subset DFA (2048-state limit) → Grammar pipeline; `ByteSet` (256-bit bitset); supports literals, `.`, `[...]`/`[^...]`, `*`/`+`/`?`, `{n,m}`, `|`, grouping, `\d\w\s` classes, anchors (silently ignored); unsupported features (backreferences, lookahead, named groups) return `UnsupportedFeature`; re-exported from `grammar::` and `lib.rs`; 38 integration tests
 
 ## Phase 14 — Runtime Controllers (0.1.4)
 
