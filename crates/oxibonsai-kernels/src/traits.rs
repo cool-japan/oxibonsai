@@ -255,11 +255,7 @@ pub trait Fp8Kernel: Send + Sync {
     ///
     /// Returns [`crate::error::KernelError::BufferTooSmall`] if
     /// `output.len() < blocks.len() * QK_FP8`.
-    fn dequant_fp8_e4m3(
-        &self,
-        blocks: &[BlockFP8E4M3],
-        output: &mut [f32],
-    ) -> KernelResult<()>;
+    fn dequant_fp8_e4m3(&self, blocks: &[BlockFP8E4M3], output: &mut [f32]) -> KernelResult<()>;
 
     /// Dequantize FP8 E5M2 blocks to FP32 values.
     ///
@@ -270,11 +266,7 @@ pub trait Fp8Kernel: Send + Sync {
     ///
     /// Returns [`crate::error::KernelError::BufferTooSmall`] if
     /// `output.len() < blocks.len() * QK_FP8`.
-    fn dequant_fp8_e5m2(
-        &self,
-        blocks: &[BlockFP8E5M2],
-        output: &mut [f32],
-    ) -> KernelResult<()>;
+    fn dequant_fp8_e5m2(&self, blocks: &[BlockFP8E5M2], output: &mut [f32]) -> KernelResult<()>;
 
     /// Fused FP8 E4M3FN matrix × FP32 vector product (GEMV).
     ///

@@ -831,20 +831,12 @@ impl Fp8Kernel for KernelDispatcher {
     ///
     /// All tiers use the scalar reference implementation for now;
     /// SIMD specializations are a follow-on Slice.
-    fn dequant_fp8_e4m3(
-        &self,
-        blocks: &[BlockFP8E4M3],
-        output: &mut [f32],
-    ) -> KernelResult<()> {
+    fn dequant_fp8_e4m3(&self, blocks: &[BlockFP8E4M3], output: &mut [f32]) -> KernelResult<()> {
         crate::dequant_fp8::dequant_fp8_e4m3(blocks, output)
     }
 
     /// Dequantize FP8 E5M2 blocks.
-    fn dequant_fp8_e5m2(
-        &self,
-        blocks: &[BlockFP8E5M2],
-        output: &mut [f32],
-    ) -> KernelResult<()> {
+    fn dequant_fp8_e5m2(&self, blocks: &[BlockFP8E5M2], output: &mut [f32]) -> KernelResult<()> {
         crate::dequant_fp8::dequant_fp8_e5m2(blocks, output)
     }
 

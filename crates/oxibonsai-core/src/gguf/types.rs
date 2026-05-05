@@ -88,21 +88,21 @@ impl GgufTensorType {
         match self {
             Self::F32 => 4,
             Self::F16 | Self::BF16 => 2,
-            Self::Q4_0 => 18,       // 2 + 16
-            Self::Q4_1 => 20,       // 2 + 2 + 16
-            Self::Q5_0 => 22,       // 2 + 4 + 16
-            Self::Q5_1 => 24,       // 2 + 2 + 4 + 16
-            Self::Q8_0 => 34,       // 2 + 32
-            Self::Q8_1 => 40,       // 4 + 4 + 32
-            Self::Q2_K => 84,       // 256/4 + 256/16 + 2+2
-            Self::Q3_K => 110,      // 256/4 + 256/8 + 12+2
-            Self::Q4_K => 144,      // 2+2+12+4*32
-            Self::Q5_K => 176,      // 2+2+12+4*32+256/8
-            Self::Q6_K => 210,      // 256/2+256/4+256/16+2
-            Self::Q8_K => 292,      // 4+256+256/16
-            Self::Q1_0_g128 => 18,  // 2 (FP16 scale) + 16 (128 sign bits)
-            Self::TQ2_0_g128 => 34, // 2 (FP16 scale) + 32 (128 ternary-2bit packed)
-            Self::TQ2_0 => 66,      // 2 (FP16 scale) + 64 (256 ternary-2bit packed)
+            Self::Q4_0 => 18,                    // 2 + 16
+            Self::Q4_1 => 20,                    // 2 + 2 + 16
+            Self::Q5_0 => 22,                    // 2 + 4 + 16
+            Self::Q5_1 => 24,                    // 2 + 2 + 4 + 16
+            Self::Q8_0 => 34,                    // 2 + 32
+            Self::Q8_1 => 40,                    // 4 + 4 + 32
+            Self::Q2_K => 84,                    // 256/4 + 256/16 + 2+2
+            Self::Q3_K => 110,                   // 256/4 + 256/8 + 12+2
+            Self::Q4_K => 144,                   // 2+2+12+4*32
+            Self::Q5_K => 176,                   // 2+2+12+4*32+256/8
+            Self::Q6_K => 210,                   // 256/2+256/4+256/16+2
+            Self::Q8_K => 292,                   // 4+256+256/16
+            Self::Q1_0_g128 => 18,               // 2 (FP16 scale) + 16 (128 sign bits)
+            Self::TQ2_0_g128 => 34,              // 2 (FP16 scale) + 32 (128 ternary-2bit packed)
+            Self::TQ2_0 => 66,                   // 2 (FP16 scale) + 64 (256 ternary-2bit packed)
             Self::F8_E4M3 | Self::F8_E5M2 => 34, // 32 bytes qs + 2 bytes FP16 scale
         }
     }

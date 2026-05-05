@@ -6,7 +6,7 @@
 //! These are pure scalar Rust correctness-reference implementations — no SIMD,
 //! no unsafe. SIMD specializations are a follow-on Slice.
 
-use oxibonsai_core::{BlockFP8E4M3, BlockFP8E5M2, QK_FP8, fp8_e4m3_decode, fp8_e5m2_decode};
+use oxibonsai_core::{fp8_e4m3_decode, fp8_e5m2_decode, BlockFP8E4M3, BlockFP8E5M2, QK_FP8};
 
 use crate::error::{KernelError, KernelResult};
 
@@ -120,10 +120,7 @@ mod tests {
         let mut output = vec![0.0f32; QK_FP8];
         dequant_fp8_e4m3(&[block], &mut output).expect("dequant should succeed");
         for (i, &v) in output.iter().enumerate() {
-            assert!(
-                (v - 3.0).abs() < 0.02,
-                "index {i}: expected ~3.0, got {v}"
-            );
+            assert!((v - 3.0).abs() < 0.02, "index {i}: expected ~3.0, got {v}");
         }
     }
 
@@ -134,10 +131,7 @@ mod tests {
         let mut output = vec![0.0f32; QK_FP8];
         dequant_fp8_e4m3(&[block], &mut output).expect("dequant should succeed");
         for (i, &v) in output.iter().enumerate() {
-            assert!(
-                (v + 1.0).abs() < 0.02,
-                "index {i}: expected ~-1.0, got {v}"
-            );
+            assert!((v + 1.0).abs() < 0.02, "index {i}: expected ~-1.0, got {v}");
         }
     }
 
@@ -215,10 +209,7 @@ mod tests {
         let mut output = vec![0.0f32; QK_FP8];
         dequant_fp8_e4m3(&[block], &mut output).expect("dequant should succeed");
         for (i, &v) in output.iter().enumerate() {
-            assert!(
-                (v + 1.0).abs() < 0.02,
-                "index {i}: expected ~-1.0, got {v}"
-            );
+            assert!((v + 1.0).abs() < 0.02, "index {i}: expected ~-1.0, got {v}");
         }
     }
 
@@ -243,10 +234,7 @@ mod tests {
         let mut output = vec![0.0f32; QK_FP8];
         dequant_fp8_e5m2(&[block], &mut output).expect("dequant should succeed");
         for (i, &v) in output.iter().enumerate() {
-            assert!(
-                (v - 2.0).abs() < 0.02,
-                "index {i}: expected ~2.0, got {v}"
-            );
+            assert!((v - 2.0).abs() < 0.02, "index {i}: expected ~2.0, got {v}");
         }
     }
 

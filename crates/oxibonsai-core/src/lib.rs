@@ -56,8 +56,8 @@ pub use gguf::types::{GgufTensorType, GgufValueType};
 pub use gguf::writer::MetadataWriteValue;
 pub use gguf::writer::{GgufWriter, TensorEntry, TensorType, WriteError};
 pub use quant_fp8::{
-    fp8_e4m3_decode, fp8_e4m3_encode, fp8_e5m2_decode, fp8_e5m2_encode,
-    BlockFP8E4M3, BlockFP8E5M2, BLOCK_FP8_BYTES, FP8_E4M3_MAX, FP8_E5M2_MAX, QK_FP8,
+    fp8_e4m3_decode, fp8_e4m3_encode, fp8_e5m2_decode, fp8_e5m2_encode, BlockFP8E4M3, BlockFP8E5M2,
+    BLOCK_FP8_BYTES, FP8_E4M3_MAX, FP8_E5M2_MAX, QK_FP8,
 };
 pub use quant_k::{BlockQ2K, BlockQ4K};
 pub use quant_ternary::{

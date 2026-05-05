@@ -166,7 +166,10 @@ impl Grammar {
 
     /// Return a human-readable name for a non-terminal, or `"<unknown>"`.
     pub fn nt_name(&self, id: NonTerminalId) -> &str {
-        self.nt_names.get(&id).map(|s| s.as_str()).unwrap_or("<unknown>")
+        self.nt_names
+            .get(&id)
+            .map(|s| s.as_str())
+            .unwrap_or("<unknown>")
     }
 
     /// Allocate a fresh `NonTerminalId` with the given debug name.
@@ -214,8 +217,7 @@ impl Grammar {
                     Symbol::Terminal(bytes) if bytes.len() > 1 => {
                         changed = true;
                         // Expand the multi-byte terminal into a chain NT.
-                        let chain_nt =
-                            Self::intern_byte_chain(self, bytes.clone(), &mut cache);
+                        let chain_nt = Self::intern_byte_chain(self, bytes.clone(), &mut cache);
                         new_rhs.push(Symbol::NonTerminal(chain_nt));
                     }
                     other => {

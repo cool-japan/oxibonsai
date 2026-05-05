@@ -9,7 +9,7 @@
 //! These are pure scalar Rust correctness-reference implementations — no SIMD,
 //! no unsafe. SIMD specializations are a follow-on Slice.
 
-use oxibonsai_core::{BlockFP8E4M3, BlockFP8E5M2, QK_FP8, fp8_e4m3_decode, fp8_e5m2_decode};
+use oxibonsai_core::{fp8_e4m3_decode, fp8_e5m2_decode, BlockFP8E4M3, BlockFP8E5M2, QK_FP8};
 
 use crate::error::{KernelError, KernelResult};
 

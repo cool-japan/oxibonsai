@@ -8,11 +8,11 @@
 
 use std::sync::Arc;
 
-use oxibonsai_runtime::grammar::{
-    arithmetic_grammar, csv_row_grammar, simple_ab_grammar,
-    parse_bnf, BnfParseError, Grammar, GrammarConstraint, EarleyRecognizer, Rule, Symbol,
-};
 use oxibonsai_runtime::constrained_decoding::TokenConstraint;
+use oxibonsai_runtime::grammar::{
+    arithmetic_grammar, csv_row_grammar, parse_bnf, simple_ab_grammar, BnfParseError,
+    EarleyRecognizer, Grammar, GrammarConstraint, Rule, Symbol,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -70,26 +70,35 @@ fn bnf_parse_recursion() {
     // Two rules: one recursive, one base case.
     assert_eq!(g.rules.len(), 2);
     // First rule has a NonTerminal in its rhs.
-    assert!(g.rules[0].rhs.iter().any(|s| matches!(s, Symbol::NonTerminal(_))));
+    assert!(g.rules[0]
+        .rhs
+        .iter()
+        .any(|s| matches!(s, Symbol::NonTerminal(_))));
 }
 
 #[test]
 fn bnf_parse_multi_line() {
-    let g = parse_bnf(r#"
+    let g = parse_bnf(
+        r#"
         <expr> ::= <term> "+" <expr>
         <expr> ::= <term>
         <term> ::= "x"
-    "#).expect("valid multi-line BNF");
+    "#,
+    )
+    .expect("valid multi-line BNF");
     // 3 separate rules
     assert_eq!(g.rules.len(), 3);
 }
 
 #[test]
 fn bnf_parse_comments() {
-    let g = parse_bnf(r#"
+    let g = parse_bnf(
+        r#"
         # This is a comment
         <S> ::= "a" # another comment
-    "#).expect("valid with comments");
+    "#,
+    )
+    .expect("valid with comments");
     assert_eq!(g.rules.len(), 1);
     assert_eq!(g.rules[0].rhs[0], Symbol::Terminal(b"a".to_vec()));
 }
@@ -97,7 +106,10 @@ fn bnf_parse_comments() {
 #[test]
 fn bnf_parse_empty_input_error() {
     assert!(matches!(parse_bnf(""), Err(BnfParseError::EmptyInput)));
-    assert!(matches!(parse_bnf("  # only comment\n"), Err(BnfParseError::EmptyInput)));
+    assert!(matches!(
+        parse_bnf("  # only comment\n"),
+        Err(BnfParseError::EmptyInput)
+    ));
 }
 
 #[test]
@@ -135,10 +147,13 @@ fn bnf_parse_string_escapes() {
 
 #[test]
 fn bnf_parse_start_symbol_is_first_lhs() {
-    let g = parse_bnf(r#"
+    let g = parse_bnf(
+        r#"
         <first> ::= "a"
         <second> ::= "b"
-    "#).expect("valid");
+    "#,
+    )
+    .expect("valid");
     assert_eq!(g.nt_name(g.start()), "first");
 }
 
@@ -155,48 +170,56 @@ fn bnf_parse_epsilon_alternative() {
 
 #[test]
 fn earley_accepts_arithmetic_1plus2() {
-    let mut r = recognizer_from_bnf(r#"
+    let mut r = recognizer_from_bnf(
+        r#"
         <expr>   ::= <term> "+" <expr> | <term>
         <term>   ::= <factor> "*" <term> | <factor>
         <factor> ::= "(" <expr> ")" | <number>
         <number> ::= "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"
-    "#);
+    "#,
+    );
     assert!(feed_str(&mut r, "1+2"));
     assert!(r.is_accepting());
 }
 
 #[test]
 fn earley_accepts_arithmetic_9() {
-    let mut r = recognizer_from_bnf(r#"
+    let mut r = recognizer_from_bnf(
+        r#"
         <expr>   ::= <term> "+" <expr> | <term>
         <term>   ::= <factor> "*" <term> | <factor>
         <factor> ::= "(" <expr> ")" | <number>
         <number> ::= "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"
-    "#);
+    "#,
+    );
     assert!(feed_str(&mut r, "9"));
     assert!(r.is_accepting());
 }
 
 #[test]
 fn earley_accepts_arithmetic_1times2plus3() {
-    let mut r = recognizer_from_bnf(r#"
+    let mut r = recognizer_from_bnf(
+        r#"
         <expr>   ::= <term> "+" <expr> | <term>
         <term>   ::= <factor> "*" <term> | <factor>
         <factor> ::= "(" <expr> ")" | <number>
         <number> ::= "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"
-    "#);
+    "#,
+    );
     assert!(feed_str(&mut r, "1*2+3"));
     assert!(r.is_accepting());
 }
 
 #[test]
 fn earley_rejects_arithmetic_plus_at_start() {
-    let mut r = recognizer_from_bnf(r#"
+    let mut r = recognizer_from_bnf(
+        r#"
         <expr>   ::= <term> "+" <expr> | <term>
         <term>   ::= <factor> "*" <term> | <factor>
         <factor> ::= "(" <expr> ")" | <number>
         <number> ::= "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"
-    "#);
+    "#,
+    );
     let ok = feed_str(&mut r, "+1");
     // Either the first byte fails or the recognizer ends up not accepting.
     assert!(!ok || !r.is_accepting());
@@ -204,49 +227,72 @@ fn earley_rejects_arithmetic_plus_at_start() {
 
 #[test]
 fn earley_rejects_arithmetic_double_plus() {
-    let mut r = recognizer_from_bnf(r#"
+    let mut r = recognizer_from_bnf(
+        r#"
         <expr>   ::= <term> "+" <expr> | <term>
         <term>   ::= <factor> "*" <term> | <factor>
         <factor> ::= "(" <expr> ")" | <number>
         <number> ::= "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"
-    "#);
+    "#,
+    );
     let ok = feed_str(&mut r, "1++2");
     assert!(!ok || !r.is_accepting());
 }
 
 #[test]
 fn earley_next_byte_set_at_start() {
-    let mut g = parse_bnf(r#"
+    let mut g = parse_bnf(
+        r#"
         <expr>   ::= <term> "+" <expr> | <term>
         <term>   ::= <factor> "*" <term> | <factor>
         <factor> ::= "(" <expr> ")" | <number>
         <number> ::= "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"
-    "#).expect("valid");
+    "#,
+    )
+    .expect("valid");
     g.normalise_terminals();
     let r = EarleyRecognizer::new(Arc::new(g));
     let nbs = r.next_byte_set();
     for d in b'0'..=b'9' {
-        assert!(nbs.contains(&d), "digit {d} should be in next_byte_set at start");
+        assert!(
+            nbs.contains(&d),
+            "digit {d} should be in next_byte_set at start"
+        );
     }
-    assert!(nbs.contains(&b'('), "'(' should be in next_byte_set at start");
-    assert!(!nbs.contains(&b'+'), "'+' should NOT be in next_byte_set at start");
+    assert!(
+        nbs.contains(&b'('),
+        "'(' should be in next_byte_set at start"
+    );
+    assert!(
+        !nbs.contains(&b'+'),
+        "'+' should NOT be in next_byte_set at start"
+    );
 }
 
 #[test]
 fn earley_next_byte_set_after_number() {
-    let mut g = parse_bnf(r#"
+    let mut g = parse_bnf(
+        r#"
         <expr>   ::= <term> "+" <expr> | <term>
         <term>   ::= <factor> "*" <term> | <factor>
         <factor> ::= "(" <expr> ")" | <number>
         <number> ::= "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"
-    "#).expect("valid");
+    "#,
+    )
+    .expect("valid");
     g.normalise_terminals();
     let mut r = EarleyRecognizer::new(Arc::new(g));
     r.feed_byte(b'1');
     let nbs = r.next_byte_set();
     // After a number, operators should be valid next bytes.
-    assert!(nbs.contains(&b'+'), "'+' should be in next_byte_set after a digit");
-    assert!(nbs.contains(&b'*'), "'*' should be in next_byte_set after a digit");
+    assert!(
+        nbs.contains(&b'+'),
+        "'+' should be in next_byte_set after a digit"
+    );
+    assert!(
+        nbs.contains(&b'*'),
+        "'*' should be in next_byte_set after a digit"
+    );
 }
 
 #[test]
@@ -266,10 +312,12 @@ fn earley_not_accepting_mid_input() {
 
 #[test]
 fn earley_reset_restores_initial_state() {
-    let mut r = recognizer_from_bnf(r#"
+    let mut r = recognizer_from_bnf(
+        r#"
         <expr>   ::= <term> "+" <expr> | <term>
         <term>   ::= "0" | "1" | "2"
-    "#);
+    "#,
+    );
     feed_str(&mut r, "1+2");
     assert!(r.is_accepting());
     r.reset();
@@ -305,10 +353,12 @@ fn earley_rejects_ab_grammar_wrong() {
 
 #[test]
 fn earley_clone_state_is_independent() {
-    let mut r = recognizer_from_bnf(r#"
+    let mut r = recognizer_from_bnf(
+        r#"
         <expr>   ::= <term> "+" <expr> | <term>
         <term>   ::= "0" | "1" | "2"
-    "#);
+    "#,
+    );
     feed_str(&mut r, "1");
     let pos_before = r.input_pos;
     let mut clone = r.clone_state();
@@ -333,17 +383,21 @@ fn earley_clone_state_is_independent() {
 //   0='0', 1='1', 2='+', 3='*', 4='(', 5=')', 6='\n', 7=<eos (empty)>
 fn make_mini_vocab_constraint(bnf: &str) -> GrammarConstraint {
     let g = parse_bnf(bnf).expect("valid BNF");
-    GrammarConstraint::new(g, |id| match id {
-        0 => vec![b'0'],
-        1 => vec![b'1'],
-        2 => vec![b'+'],
-        3 => vec![b'*'],
-        4 => vec![b'('],
-        5 => vec![b')'],
-        6 => vec![b'\n'],
-        7 => vec![], // EOS
-        _ => vec![],
-    }, 8)
+    GrammarConstraint::new(
+        g,
+        |id| match id {
+            0 => vec![b'0'],
+            1 => vec![b'1'],
+            2 => vec![b'+'],
+            3 => vec![b'*'],
+            4 => vec![b'('],
+            5 => vec![b')'],
+            6 => vec![b'\n'],
+            7 => vec![], // EOS
+            _ => vec![],
+        },
+        8,
+    )
 }
 
 const MINI_ARITH_BNF: &str = r#"
@@ -395,7 +449,10 @@ fn grammar_constraint_complete_when_accepting() {
     let mut c = make_mini_vocab_constraint(MINI_ARITH_BNF);
     assert!(!c.is_complete(), "should not be complete initially");
     c.advance(0); // '0'
-    assert!(c.is_complete(), "single digit should be a complete expression");
+    assert!(
+        c.is_complete(),
+        "single digit should be a complete expression"
+    );
 }
 
 #[test]
@@ -508,7 +565,10 @@ fn grammar_constraint_all_false_after_live_rejection() {
     let mut c = ascii_constraint(arithmetic_grammar());
     c.advance(b'+' as u32); // invalid first token
     let mask = c.allowed_tokens(&[], 128).unwrap();
-    assert!(mask.iter().all(|&b| !b), "all tokens blocked after violation");
+    assert!(
+        mask.iter().all(|&b| !b),
+        "all tokens blocked after violation"
+    );
 }
 
 #[test]
@@ -529,7 +589,11 @@ fn grammar_constraint_paren_expression() {
     let mut c = ascii_constraint(arithmetic_grammar());
     // "(1+2)*3" should be fully accepted.
     for &b in b"(1+2)*3" {
-        assert!(c.advance(b as u32), "byte '{}' should be accepted", b as char);
+        assert!(
+            c.advance(b as u32),
+            "byte '{}' should be accepted",
+            b as char
+        );
     }
     assert!(c.is_complete());
 }
@@ -538,11 +602,7 @@ fn grammar_constraint_paren_expression() {
 fn grammar_constraint_multi_char_terminal_normalisation() {
     // Use a grammar with a 2-char terminal to test normalisation.
     let g = parse_bnf(r#"<S> ::= "ab" | "cd""#).expect("valid");
-    let mut c = GrammarConstraint::new(
-        g,
-        |id| if id < 128 { vec![id as u8] } else { vec![] },
-        128,
-    );
+    let mut c = GrammarConstraint::new(g, |id| if id < 128 { vec![id as u8] } else { vec![] }, 128);
     // 'a' should be allowed.
     let mask = c.allowed_tokens(&[], 128).unwrap();
     assert!(mask[b'a' as usize]);
@@ -562,18 +622,18 @@ fn grammar_constraint_multi_char_terminal_normalisation() {
 fn grammar_constraint_left_recursive_language() {
     // E ::= E "+" "1" | "1"   (left-recursive)
     let g = parse_bnf(r#"<E> ::= <E> "+" "1" | "1""#).expect("valid");
-    let mut c = GrammarConstraint::new(
-        g,
-        |id| if id < 128 { vec![id as u8] } else { vec![] },
-        128,
-    );
+    let mut c = GrammarConstraint::new(g, |id| if id < 128 { vec![id as u8] } else { vec![] }, 128);
     // "1" is accepted.
     c.advance(b'1' as u32);
     assert!(c.is_complete());
     c.reset();
     // "1+1+1" is accepted.
     for &b in b"1+1+1" {
-        assert!(c.advance(b as u32), "byte '{}' should be accepted", b as char);
+        assert!(
+            c.advance(b as u32),
+            "byte '{}' should be accepted",
+            b as char
+        );
     }
     assert!(c.is_complete());
 }
@@ -582,15 +642,14 @@ fn grammar_constraint_left_recursive_language() {
 fn grammar_constraint_nullable_nt_in_sequence() {
     // S ::= <A> "x"
     // A ::= "" | "a"
-    let g = parse_bnf(r#"
+    let g = parse_bnf(
+        r#"
         <S> ::= <A> "x"
         <A> ::= "" | "a"
-    "#).expect("valid");
-    let mut c = GrammarConstraint::new(
-        g,
-        |id| if id < 128 { vec![id as u8] } else { vec![] },
-        128,
-    );
+    "#,
+    )
+    .expect("valid");
+    let mut c = GrammarConstraint::new(g, |id| if id < 128 { vec![id as u8] } else { vec![] }, 128);
     // "x" should be accepted (A → ε).
     c.advance(b'x' as u32);
     assert!(c.is_complete());

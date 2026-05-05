@@ -9,12 +9,10 @@
 
 use half::f16;
 use oxibonsai_core::{
-    BlockFP8E4M3, BlockFP8E5M2, QK_FP8, fp8_e4m3_decode, fp8_e4m3_encode, fp8_e5m2_decode,
-    fp8_e5m2_encode,
+    fp8_e4m3_decode, fp8_e4m3_encode, fp8_e5m2_decode, fp8_e5m2_encode, BlockFP8E4M3, BlockFP8E5M2,
+    QK_FP8,
 };
-use oxibonsai_kernels::{
-    Fp8Kernel, KernelDispatcher, KernelError, KernelTier,
-};
+use oxibonsai_kernels::{Fp8Kernel, KernelDispatcher, KernelError, KernelTier};
 
 // ---------------------------------------------------------------------------
 // Helper constructors
@@ -36,14 +34,22 @@ fn e5m2_block(scale: f32, qs: [u8; 32]) -> BlockFP8E5M2 {
 
 /// Build a BlockFP8E4M3 by quantizing a uniform f32 weight value into all slots.
 fn e4m3_block_uniform(weight: f32, scale: f32) -> BlockFP8E4M3 {
-    let scaled = if scale.abs() < 1e-12 { 0.0 } else { weight / scale };
+    let scaled = if scale.abs() < 1e-12 {
+        0.0
+    } else {
+        weight / scale
+    };
     let q = fp8_e4m3_encode(scaled);
     e4m3_block(scale, [q; 32])
 }
 
 /// Build a BlockFP8E5M2 by quantizing a uniform f32 weight value into all slots.
 fn e5m2_block_uniform(weight: f32, scale: f32) -> BlockFP8E5M2 {
-    let scaled = if scale.abs() < 1e-12 { 0.0 } else { weight / scale };
+    let scaled = if scale.abs() < 1e-12 {
+        0.0
+    } else {
+        weight / scale
+    };
     let q = fp8_e5m2_encode(scaled);
     e5m2_block(scale, [q; 32])
 }
@@ -106,10 +112,7 @@ fn dispatcher_dequant_fp8_e5m2_matches_reference() {
 fn dispatcher_gemv_fp8_e4m3_basic() {
     let dispatcher = make_dispatcher();
     let q_one = fp8_e4m3_encode(1.0);
-    let blocks = vec![
-        e4m3_block(1.0, [q_one; 32]),
-        e4m3_block(1.0, [q_one; 32]),
-    ];
+    let blocks = vec![e4m3_block(1.0, [q_one; 32]), e4m3_block(1.0, [q_one; 32])];
     let input = vec![1.0f32; 32];
     let mut output = vec![0.0f32; 2];
     dispatcher
@@ -129,10 +132,7 @@ fn dispatcher_gemv_fp8_e4m3_basic() {
 fn dispatcher_gemv_fp8_e5m2_basic() {
     let dispatcher = make_dispatcher();
     let q_one = fp8_e5m2_encode(1.0);
-    let blocks = vec![
-        e5m2_block(1.0, [q_one; 32]),
-        e5m2_block(1.0, [q_one; 32]),
-    ];
+    let blocks = vec![e5m2_block(1.0, [q_one; 32]), e5m2_block(1.0, [q_one; 32])];
     let input = vec![1.0f32; 32];
     let mut output = vec![0.0f32; 2];
     dispatcher
@@ -304,10 +304,7 @@ fn gemv_e4m3_dimension_mismatch() {
 #[test]
 fn gemv_e5m2_dimension_mismatch() {
     let dispatcher = make_dispatcher();
-    let blocks = vec![
-        e5m2_block(1.0, [0x3Cu8; 32]),
-        e5m2_block(1.0, [0x3Cu8; 32]),
-    ];
+    let blocks = vec![e5m2_block(1.0, [0x3Cu8; 32]), e5m2_block(1.0, [0x3Cu8; 32])];
     let input = vec![1.0f32; 32];
     let mut output = vec![0.0f32; 3];
     let result = dispatcher.gemv_fp8_e5m2(&blocks, &input, &mut output, 3, 32);
@@ -321,10 +318,7 @@ fn gemv_e5m2_dimension_mismatch() {
 #[test]
 fn gemm_e4m3_wrong_batch_size() {
     let dispatcher = make_dispatcher();
-    let blocks = vec![
-        e4m3_block(1.0, [0x38u8; 32]),
-        e4m3_block(1.0, [0x38u8; 32]),
-    ];
+    let blocks = vec![e4m3_block(1.0, [0x38u8; 32]), e4m3_block(1.0, [0x38u8; 32])];
     let inputs = vec![1.0f32; 64]; // batch=2, k=32
     let mut outputs = vec![0.0f32; 3]; // need batch*n_rows = 4, supply 3
     let result = dispatcher.gemm_fp8_e4m3(&blocks, &inputs, &mut outputs, 2, 32, 2);
@@ -339,10 +333,7 @@ fn gemm_e4m3_wrong_batch_size() {
 fn gemm_e4m3_dimension_mismatch_blocks() {
     let dispatcher = make_dispatcher();
     // n_rows=3 k=32 → need 3 blocks, supply 2
-    let blocks = vec![
-        e4m3_block(1.0, [0x38u8; 32]),
-        e4m3_block(1.0, [0x38u8; 32]),
-    ];
+    let blocks = vec![e4m3_block(1.0, [0x38u8; 32]), e4m3_block(1.0, [0x38u8; 32])];
     let inputs = vec![1.0f32; 32];
     let mut outputs = vec![0.0f32; 3];
     let result = dispatcher.gemm_fp8_e4m3(&blocks, &inputs, &mut outputs, 3, 32, 1);
@@ -356,10 +347,7 @@ fn gemm_e4m3_dimension_mismatch_blocks() {
 #[test]
 fn gemm_e5m2_buffer_too_small() {
     let dispatcher = make_dispatcher();
-    let blocks = vec![
-        e5m2_block(1.0, [0x3Cu8; 32]),
-        e5m2_block(1.0, [0x3Cu8; 32]),
-    ];
+    let blocks = vec![e5m2_block(1.0, [0x3Cu8; 32]), e5m2_block(1.0, [0x3Cu8; 32])];
     let inputs = vec![1.0f32; 64]; // batch=2, k=32
     let mut outputs = vec![0.0f32; 1]; // need 4, supply 1
     let result = dispatcher.gemm_fp8_e5m2(&blocks, &inputs, &mut outputs, 2, 32, 2);
@@ -381,9 +369,7 @@ fn fp8_e4m3_gemv_vs_fp32_reference() {
     let k = 64; // 2 blocks per row
 
     // Build random-ish FP32 weight matrix and input
-    let raw_weights: Vec<f32> = (0..n_rows * k)
-        .map(|i| (i as f32).sin() * 3.0)
-        .collect();
+    let raw_weights: Vec<f32> = (0..n_rows * k).map(|i| (i as f32).sin() * 3.0).collect();
     let input: Vec<f32> = (0..k).map(|i| (i as f32).cos()).collect();
 
     // Quantize each row into E4M3 blocks
@@ -442,10 +428,7 @@ fn fp8_e5m2_gemv_vs_fp32_reference() {
     let q = fp8_e5m2_encode(1.0);
     // Each row uses a different scale so values differ between rows
     let scales = [0.5f32, 1.0, 2.0];
-    let blocks: Vec<BlockFP8E5M2> = scales
-        .iter()
-        .map(|&s| e5m2_block(s, [q; 32]))
-        .collect();
+    let blocks: Vec<BlockFP8E5M2> = scales.iter().map(|&s| e5m2_block(s, [q; 32])).collect();
 
     // Input: ascending small values, all finite
     let input: Vec<f32> = (0..k).map(|i| (i as f32) * 0.01).collect();
@@ -464,7 +447,10 @@ fn fp8_e5m2_gemv_vs_fp32_reference() {
     let fp32_ref: Vec<f32> = (0..n_rows)
         .map(|r| {
             let row = &dequant_weights[r * k..(r + 1) * k];
-            row.iter().zip(input.iter()).map(|(w, x)| w * x).sum::<f32>()
+            row.iter()
+                .zip(input.iter())
+                .map(|(w, x)| w * x)
+                .sum::<f32>()
         })
         .collect();
 

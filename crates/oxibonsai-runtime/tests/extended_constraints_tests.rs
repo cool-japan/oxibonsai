@@ -28,7 +28,10 @@ fn allow_list_single_candidate_matches() {
     assert!(!c.is_complete());
     let ok = c.advance(42);
     assert!(ok, "advance should return true on correct token");
-    assert!(c.is_complete(), "should be complete after consuming the sole token");
+    assert!(
+        c.is_complete(),
+        "should be complete after consuming the sole token"
+    );
 }
 
 #[test]
@@ -119,11 +122,7 @@ fn allow_list_is_complete_on_match() {
 fn allow_list_prefix_overlap() {
     // Three candidates sharing the prefix [1, 2]:
     //   [1, 2, 3], [1, 2, 4], [1, 5]
-    let mut c = AllowListConstraint::new(vec![
-        vec![1u32, 2, 3],
-        vec![1, 2, 4],
-        vec![1, 5],
-    ]);
+    let mut c = AllowListConstraint::new(vec![vec![1u32, 2, 3], vec![1, 2, 4], vec![1, 5]]);
     // pos 0 → only 1 allowed
     let m0 = c.allowed_tokens(&[], 10).unwrap();
     assert!(m0[1]);
@@ -175,7 +174,10 @@ fn seq_constraint_forces_exact_sequence() {
     for (pos, &expected) in [10u32, 20, 30].iter().enumerate() {
         let mask = c.allowed_tokens(&[], 50).unwrap();
         // Only expected token allowed
-        assert!(mask[expected as usize], "pos {pos}: expected token {expected}");
+        assert!(
+            mask[expected as usize],
+            "pos {pos}: expected token {expected}"
+        );
         for (i, &b) in mask.iter().enumerate() {
             if i != expected as usize {
                 assert!(!b, "pos {pos}: token {i} should be blocked");
@@ -250,7 +252,10 @@ fn seq_constraint_is_complete_after_full_sequence() {
     let tokens: Vec<u32> = (0..8).collect();
     let mut c = SequenceConstraint::new(tokens.clone());
     for &t in &tokens {
-        assert!(!c.is_complete(), "not yet complete before consuming all tokens");
+        assert!(
+            !c.is_complete(),
+            "not yet complete before consuming all tokens"
+        );
         c.advance(t);
     }
     assert!(c.is_complete(), "all tokens consumed → complete");
@@ -302,11 +307,21 @@ fn length_constraint_forces_stop_at_max() {
     c.advance(1);
     c.advance(1);
     c.advance(1); // count == max_len == 3
-    // At max_len → only stop token allowed
+                  // At max_len → only stop token allowed
     let mask = c.allowed_tokens(&[], 200).unwrap();
-    assert!(mask[99], "stop token must be the only allowed token at max_len");
-    let non_stop_count = mask.iter().enumerate().filter(|&(i, &b)| i != 99 && b).count();
-    assert_eq!(non_stop_count, 0, "no other token should be allowed at max_len");
+    assert!(
+        mask[99],
+        "stop token must be the only allowed token at max_len"
+    );
+    let non_stop_count = mask
+        .iter()
+        .enumerate()
+        .filter(|&(i, &b)| i != 99 && b)
+        .count();
+    assert_eq!(
+        non_stop_count, 0,
+        "no other token should be allowed at max_len"
+    );
 }
 
 #[test]
@@ -368,7 +383,10 @@ fn length_constraint_reset() {
     assert!(!c.is_complete());
     // After reset, stop token should be blocked again (count=0 < min=1)
     let mask = c.allowed_tokens(&[], 20).unwrap();
-    assert!(!mask[9], "stop token blocked after reset because count < min_len");
+    assert!(
+        !mask[9],
+        "stop token blocked after reset because count < min_len"
+    );
 }
 
 #[test]
@@ -404,8 +422,7 @@ fn constraint_boxed_trait_object_allow_list() {
 
 #[test]
 fn constraint_boxed_trait_object_sequence() {
-    let mut c: Box<dyn TokenConstraint> =
-        Box::new(SequenceConstraint::new(vec![8u32, 9, 10]));
+    let mut c: Box<dyn TokenConstraint> = Box::new(SequenceConstraint::new(vec![8u32, 9, 10]));
     assert_eq!(c.name(), "SequenceConstraint");
     assert!(!c.is_complete());
     c.advance(8);
@@ -418,8 +435,7 @@ fn constraint_boxed_trait_object_sequence() {
 
 #[test]
 fn constraint_boxed_trait_object_length() {
-    let mut c: Box<dyn TokenConstraint> =
-        Box::new(LengthConstraint::new(1, 3, Some(0u32)));
+    let mut c: Box<dyn TokenConstraint> = Box::new(LengthConstraint::new(1, 3, Some(0u32)));
     assert_eq!(c.name(), "LengthConstraint");
     assert!(!c.is_complete());
     c.advance(5); // count=1, min satisfied but stop not seen

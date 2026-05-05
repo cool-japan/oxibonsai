@@ -51,18 +51,27 @@ pub enum BnfParseError {
 impl std::fmt::Display for BnfParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnexpectedChar { line, col, got, expected } =>
-                write!(f, "line {line}:{col}: unexpected `{got}`, expected {expected}"),
-            Self::UnterminatedString { line, col } =>
-                write!(f, "line {line}:{col}: unterminated string literal"),
-            Self::MissingDefinitionSeparator { line, col } =>
-                write!(f, "line {line}:{col}: expected `::=` after non-terminal name"),
-            Self::EmptyNonTerminalName { line, col } =>
-                write!(f, "line {line}:{col}: empty non-terminal name `<>`"),
-            Self::UndefinedNonTerminal { name } =>
-                write!(f, "undefined non-terminal `{name}`"),
-            Self::EmptyInput =>
-                write!(f, "grammar input is empty (no rules found)"),
+            Self::UnexpectedChar {
+                line,
+                col,
+                got,
+                expected,
+            } => write!(
+                f,
+                "line {line}:{col}: unexpected `{got}`, expected {expected}"
+            ),
+            Self::UnterminatedString { line, col } => {
+                write!(f, "line {line}:{col}: unterminated string literal")
+            }
+            Self::MissingDefinitionSeparator { line, col } => write!(
+                f,
+                "line {line}:{col}: expected `::=` after non-terminal name"
+            ),
+            Self::EmptyNonTerminalName { line, col } => {
+                write!(f, "line {line}:{col}: empty non-terminal name `<>`")
+            }
+            Self::UndefinedNonTerminal { name } => write!(f, "undefined non-terminal `{name}`"),
+            Self::EmptyInput => write!(f, "grammar input is empty (no rules found)"),
         }
     }
 }
@@ -77,9 +86,17 @@ impl std::error::Error for BnfParseError {}
 #[derive(Debug, Clone, PartialEq)]
 enum Token {
     /// `<name>`
-    NonTerminal { name: String, line: usize, col: usize },
+    NonTerminal {
+        name: String,
+        line: usize,
+        col: usize,
+    },
     /// `"bytes"` — the bytes are the actual UTF-8 encoding of the escape-processed string.
-    Terminal { bytes: Vec<u8>, line: usize, col: usize },
+    Terminal {
+        bytes: Vec<u8>,
+        line: usize,
+        col: usize,
+    },
     /// `::=`
     Assign { line: usize, col: usize },
     /// `|`
@@ -455,7 +472,8 @@ impl Parser {
 
         // ── Pass 2: parse rules ───────────────────────────────────────────
         // Track which NTs have been defined with at least one rule.
-        let mut defined_nts: std::collections::HashSet<NonTerminalId> = std::collections::HashSet::new();
+        let mut defined_nts: std::collections::HashSet<NonTerminalId> =
+            std::collections::HashSet::new();
 
         while !self.is_eof() {
             // Expect: <lhs> ::= alternative ( | alternative )*
@@ -545,7 +563,7 @@ impl Parser {
                 match self.peek() {
                     Token::Pipe { .. } => {
                         self.advance(); // consume `|`
-                        // Continue parsing alternatives for the same lhs.
+                                        // Continue parsing alternatives for the same lhs.
                     }
                     _ => break,
                 }
@@ -625,10 +643,13 @@ mod tests {
 
     #[test]
     fn parse_multi_rule_same_nt() {
-        let g = parse_bnf(r#"
+        let g = parse_bnf(
+            r#"
             <S> ::= "x" <S>
             <S> ::= "y"
-        "#).expect("valid");
+        "#,
+        )
+        .expect("valid");
         assert_eq!(g.rules.len(), 2);
         assert_eq!(g.rules[0].lhs, g.rules[1].lhs);
     }
@@ -655,10 +676,13 @@ mod tests {
     fn parse_multi_rule_alternation_and_sequence() {
         // expr  ::= term "+" expr | term
         // term  ::= "0" | "1"
-        let g = parse_bnf(r#"
+        let g = parse_bnf(
+            r#"
             <expr> ::= <term> "+" <expr> | <term>
             <term> ::= "0" | "1"
-        "#).expect("valid");
+        "#,
+        )
+        .expect("valid");
 
         // 4 rules total: 2 for expr, 2 for term
         assert_eq!(g.rules.len(), 4);
@@ -666,10 +690,13 @@ mod tests {
 
     #[test]
     fn parse_start_symbol_is_first_rule_lhs() {
-        let g = parse_bnf(r#"
+        let g = parse_bnf(
+            r#"
             <first> ::= "a"
             <second> ::= "b"
-        "#).expect("valid");
+        "#,
+        )
+        .expect("valid");
         let start_name = g.nt_name(g.start()).to_string();
         assert_eq!(start_name, "first");
     }
@@ -679,7 +706,10 @@ mod tests {
     #[test]
     fn error_empty_input() {
         assert!(matches!(parse_bnf(""), Err(BnfParseError::EmptyInput)));
-        assert!(matches!(parse_bnf("   # only a comment\n"), Err(BnfParseError::EmptyInput)));
+        assert!(matches!(
+            parse_bnf("   # only a comment\n"),
+            Err(BnfParseError::EmptyInput)
+        ));
     }
 
     #[test]

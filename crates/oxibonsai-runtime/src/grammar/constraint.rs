@@ -199,17 +199,25 @@ impl TokenConstraint for GrammarConstraint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grammar::{arithmetic_grammar, simple_ab_grammar, csv_row_grammar};
     use crate::constrained_decoding::TokenConstraint;
+    use crate::grammar::{arithmetic_grammar, csv_row_grammar, simple_ab_grammar};
 
     // ── Minimal ASCII byte-level vocab helper ───────────────────────────────
 
     /// Build a `GrammarConstraint` with a simple byte-level vocabulary
     /// where token id == ASCII code point (0..128).
     fn ascii_constraint(grammar: Grammar) -> GrammarConstraint {
-        GrammarConstraint::new(grammar, |id| {
-            if id < 128 { vec![id as u8] } else { vec![] }
-        }, 128)
+        GrammarConstraint::new(
+            grammar,
+            |id| {
+                if id < 128 {
+                    vec![id as u8]
+                } else {
+                    vec![]
+                }
+            },
+            128,
+        )
     }
 
     // ── Arithmetic grammar ──────────────────────────────────────────────────
@@ -241,7 +249,10 @@ mod tests {
     fn grammar_constraint_advance_digit_and_operator() {
         let mut c = ascii_constraint(arithmetic_grammar());
         assert!(c.advance(b'1' as u32), "advancing '1' should succeed");
-        assert!(c.advance(b'+' as u32), "advancing '+' after '1' should succeed");
+        assert!(
+            c.advance(b'+' as u32),
+            "advancing '+' after '1' should succeed"
+        );
     }
 
     #[test]
@@ -294,7 +305,10 @@ mod tests {
         // After a rejection the recognizer is dead.
         if !ok {
             let mask = c.allowed_tokens(&[], 128).unwrap();
-            assert!(mask.iter().all(|&b| !b), "all tokens should be blocked after rejection");
+            assert!(
+                mask.iter().all(|&b| !b),
+                "all tokens should be blocked after rejection"
+            );
         }
     }
 
@@ -363,25 +377,46 @@ mod tests {
     fn grammar_constraint_empty_token_only_when_accepting() {
         // Build a vocab where token 200 maps to empty bytes (special token).
         let g = arithmetic_grammar();
-        let c = GrammarConstraint::new(g, |id| {
-            if id < 128 { vec![id as u8] }
-            else if id == 200 { vec![] }  // special EOS token
-            else { vec![] }
-        }, 201);
+        let c = GrammarConstraint::new(
+            g,
+            |id| {
+                if id < 128 {
+                    vec![id as u8]
+                } else if id == 200 {
+                    vec![]
+                }
+                // special EOS token
+                else {
+                    vec![]
+                }
+            },
+            201,
+        );
 
         // Initially not accepting, so token 200 should be blocked.
         let mask = c.allowed_tokens(&[], 201).unwrap();
-        assert!(!mask[200], "EOS token should not be allowed when not accepting");
+        assert!(
+            !mask[200],
+            "EOS token should not be allowed when not accepting"
+        );
     }
 
     #[test]
     fn grammar_constraint_empty_token_allowed_when_accepting() {
         let g = arithmetic_grammar();
-        let mut c = GrammarConstraint::new(g, |id| {
-            if id < 128 { vec![id as u8] }
-            else if id == 200 { vec![] }
-            else { vec![] }
-        }, 201);
+        let mut c = GrammarConstraint::new(
+            g,
+            |id| {
+                if id < 128 {
+                    vec![id as u8]
+                } else if id == 200 {
+                    vec![]
+                } else {
+                    vec![]
+                }
+            },
+            201,
+        );
 
         // After generating "9" (a complete expression) we are accepting.
         c.advance(b'9' as u32);

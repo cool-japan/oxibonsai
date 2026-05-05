@@ -30,7 +30,6 @@
 //!     .expect("generation should succeed");
 //! ```
 
-pub mod grammar;
 pub mod adaptive_lookahead;
 pub mod adaptive_sampling;
 #[cfg(feature = "server")]
@@ -61,6 +60,7 @@ pub mod embedding_index;
 pub mod embeddings;
 pub mod engine;
 pub mod error;
+pub mod grammar;
 pub mod health;
 pub mod hot_reload;
 pub mod json_schema;
@@ -118,9 +118,6 @@ pub use constrained_decoding::{
     JsonConstraint, JsonParseState, LengthConstraint, NoConstraint, RegexConstraint,
     SequenceConstraint, TokenConstraint,
 };
-pub use grammar::{
-    parse_bnf, BnfParseError, Grammar, GrammarConstraint, EarleyRecognizer, Rule, Symbol,
-};
 pub use convenience::{GenerationResult, MemoryEstimate, ModelFileInfo, TokenStats};
 pub use dedup::{DedupCache, DedupStats, RequestKey};
 #[cfg(feature = "server")]
@@ -129,6 +126,9 @@ pub use distributed::{
 };
 pub use engine::InferenceEngine;
 pub use error::{RuntimeError, RuntimeResult};
+pub use grammar::{
+    parse_bnf, BnfParseError, EarleyRecognizer, Grammar, GrammarConstraint, Rule, Symbol,
+};
 pub use health::{HealthReport, HealthStatus};
 pub use hot_reload::{HotReloadCoordinator, ModelVersion, ReloadLog};
 pub use json_schema::{

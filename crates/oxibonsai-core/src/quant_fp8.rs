@@ -137,7 +137,11 @@ pub fn fp8_e4m3_encode(x: f32) -> u8 {
             man_int + 1
         } else if (frac - 0.5).abs() < 1e-9 {
             // Exactly half: round to even
-            if man_int & 1 == 1 { man_int + 1 } else { man_int }
+            if man_int & 1 == 1 {
+                man_int + 1
+            } else {
+                man_int
+            }
         } else {
             man_int
         };
@@ -276,7 +280,11 @@ pub fn fp8_e5m2_encode(x: f32) -> u8 {
         let man_rounded = if frac > 0.5 {
             man_int + 1
         } else if (frac - 0.5).abs() < 1e-9 {
-            if man_int & 1 == 1 { man_int + 1 } else { man_int }
+            if man_int & 1 == 1 {
+                man_int + 1
+            } else {
+                man_int
+            }
         } else {
             man_int
         };
@@ -306,7 +314,11 @@ pub fn fp8_e5m2_decode(byte: u8) -> f32 {
     if exp == 31 {
         if man == 0 {
             // ±infinity
-            return if sign < 0.0 { f32::NEG_INFINITY } else { f32::INFINITY };
+            return if sign < 0.0 {
+                f32::NEG_INFINITY
+            } else {
+                f32::INFINITY
+            };
         }
         // NaN
         return f32::NAN;
@@ -412,7 +424,11 @@ impl BlockFP8E4M3 {
 
             let mut qs = [0u8; 32];
             for (j, &val) in chunk.iter().enumerate() {
-                let scaled = if d_f32_actual == 0.0 { 0.0 } else { val / d_f32_actual };
+                let scaled = if d_f32_actual == 0.0 {
+                    0.0
+                } else {
+                    val / d_f32_actual
+                };
                 qs[j] = fp8_e4m3_encode(scaled);
             }
 
@@ -536,7 +552,11 @@ impl BlockFP8E5M2 {
 
             let mut qs = [0u8; 32];
             for (j, &val) in chunk.iter().enumerate() {
-                let scaled = if d_f32_actual == 0.0 { 0.0 } else { val / d_f32_actual };
+                let scaled = if d_f32_actual == 0.0 {
+                    0.0
+                } else {
+                    val / d_f32_actual
+                };
                 qs[j] = fp8_e5m2_encode(scaled);
             }
 
@@ -679,17 +699,25 @@ mod tests {
     fn e4m3_decode_max() {
         // 0x7e: exp=0b1111=15, man=0b110=6 → 2^8 × (1 + 6/8) = 256 × 1.75 = 448
         let v = fp8_e4m3_decode(0x7e);
-        assert!((v - 448.0).abs() < 0.01, "0x7e should decode to 448.0, got {v}");
+        assert!(
+            (v - 448.0).abs() < 0.01,
+            "0x7e should decode to 448.0, got {v}"
+        );
     }
 
     #[test]
     fn e4m3_round_trip_values() {
-        for &v in &[0.0f32, 0.5, 1.0, -1.0, 2.0, -2.0, 100.0, 448.0, -448.0, 0.125] {
+        for &v in &[
+            0.0f32, 0.5, 1.0, -1.0, 2.0, -2.0, 100.0, 448.0, -448.0, 0.125,
+        ] {
             let enc = fp8_e4m3_encode(v);
             let dec = fp8_e4m3_decode(enc);
             let err = (dec - v).abs();
             let eps = 1.0_f32.max(v.abs()) * 0.25; // E4M3 has limited precision
-            assert!(err <= eps, "e4m3 round-trip for {v}: enc={enc:#04x}, dec={dec}, err={err}");
+            assert!(
+                err <= eps,
+                "e4m3 round-trip for {v}: enc={enc:#04x}, dec={dec}, err={err}"
+            );
         }
     }
 
@@ -701,7 +729,10 @@ mod tests {
         let dec = fp8_e4m3_decode(enc);
         // Should round-trip to the denormal value (man=1, exp=0 → 0x01)
         assert_eq!(enc, 0x01, "smallest denormal should be 0x01");
-        assert!((dec - min_denorm).abs() < min_denorm * 0.01, "denormal round-trip: got {dec}");
+        assert!(
+            (dec - min_denorm).abs() < min_denorm * 0.01,
+            "denormal round-trip: got {dec}"
+        );
     }
 
     #[test]
@@ -765,7 +796,10 @@ mod tests {
         // max E5M2 normal: exp=30, man=11 → 2^15 × 1.75 = 57344.0
         let enc = fp8_e5m2_encode(57344.0);
         let dec = fp8_e5m2_decode(enc);
-        assert!((dec - 57344.0).abs() < 1.0, "57344.0 should encode/decode correctly: got {dec}");
+        assert!(
+            (dec - 57344.0).abs() < 1.0,
+            "57344.0 should encode/decode correctly: got {dec}"
+        );
     }
 
     #[test]
@@ -775,7 +809,10 @@ mod tests {
             let dec = fp8_e5m2_decode(enc);
             let err = (dec - v).abs();
             let eps = 1.0_f32.max(v.abs()) * 0.5;
-            assert!(err <= eps, "e5m2 round-trip for {v}: enc={enc:#04x}, dec={dec}, err={err}");
+            assert!(
+                err <= eps,
+                "e5m2 round-trip for {v}: enc={enc:#04x}, dec={dec}, err={err}"
+            );
         }
     }
 

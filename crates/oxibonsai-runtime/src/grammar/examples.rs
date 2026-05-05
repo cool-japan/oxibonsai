@@ -25,12 +25,14 @@ use super::bnf_parser::parse_bnf;
 /// The grammar is right-recursive (as is typical for BNF) and handles standard
 /// arithmetic precedence implicitly through the rule structure.
 pub fn arithmetic_grammar() -> Grammar {
-    parse_bnf(r#"
+    parse_bnf(
+        r#"
         <expr>   ::= <term> "+" <expr> | <term> "-" <expr> | <term>
         <term>   ::= <factor> "*" <term> | <factor> "/" <term> | <factor>
         <factor> ::= "(" <expr> ")" | <number>
         <number> ::= "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"
-    "#)
+    "#,
+    )
     .expect("arithmetic grammar is valid BNF")
 }
 
@@ -47,9 +49,11 @@ pub fn arithmetic_grammar() -> Grammar {
 /// This grammar is right-recursive and tests balanced nesting of 'a's and 'b's.
 /// It is **not** regular — it cannot be expressed as a regular expression.
 pub fn simple_ab_grammar() -> Grammar {
-    parse_bnf(r#"
+    parse_bnf(
+        r#"
         <S> ::= "a" <S> "b" | "ab"
-    "#)
+    "#,
+    )
     .expect("ab grammar is valid BNF")
 }
 
@@ -114,9 +118,11 @@ pub fn json_lite_grammar() -> Grammar {
 /// This is an inherently ambiguous grammar (the empty string can always be
 /// parsed as an epsilon palindrome), but Earley handles ambiguity correctly.
 pub fn palindrome_grammar() -> Grammar {
-    parse_bnf(r#"
+    parse_bnf(
+        r#"
         <P> ::= "a" <P> "a" | "b" <P> "b" | "a" | "b" | ""
-    "#)
+    "#,
+    )
     .expect("palindrome grammar is valid BNF")
 }
 
@@ -131,7 +137,10 @@ mod tests {
     #[test]
     fn examples_arithmetic_grammar_parses() {
         let g = arithmetic_grammar();
-        assert!(g.rules.len() >= 10, "arithmetic grammar should have many rules");
+        assert!(
+            g.rules.len() >= 10,
+            "arithmetic grammar should have many rules"
+        );
         let start_name = g.nt_name(g.start()).to_string();
         assert_eq!(start_name, "expr");
     }
@@ -171,6 +180,10 @@ mod tests {
         g.normalise_terminals();
         // No new rules should be added since all terminals are single chars.
         // (All terminals in the arithmetic grammar are single characters.)
-        assert_eq!(g.rules.len(), count_before, "single-char terminals need no splitting");
+        assert_eq!(
+            g.rules.len(),
+            count_before,
+            "single-char terminals need no splitting"
+        );
     }
 }

@@ -312,8 +312,7 @@ fn test_batched_q1_prefill_matches_per_position_batch8() {
     // ── Batched Q1 prefill — STRICT path (no fallback masking) ────────────
     let prefill_logits = {
         let gguf = parse_synthetic_gguf(&gguf_bytes);
-        let mut model =
-            BonsaiModel::from_gguf(&gguf, 512).expect("BonsaiModel::from_gguf prefill");
+        let mut model = BonsaiModel::from_gguf(&gguf, 512).expect("BonsaiModel::from_gguf prefill");
         model.upload_weights_to_gpu(kernel.as_ref());
         model
             .try_metal_prefill_with_lm_head(&token_ids, 0)

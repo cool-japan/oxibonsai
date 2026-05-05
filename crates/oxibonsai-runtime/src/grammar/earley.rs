@@ -82,8 +82,7 @@ impl FirstSets {
         let n = grammar.nt_count;
         let mut first: HashMap<NonTerminalId, HashSet<u8>> =
             (0..n).map(|i| (i, HashSet::new())).collect();
-        let mut nullable: HashMap<NonTerminalId, bool> =
-            (0..n).map(|i| (i, false)).collect();
+        let mut nullable: HashMap<NonTerminalId, bool> = (0..n).map(|i| (i, false)).collect();
 
         // Fixed-point iteration: keep looping until nothing changes.
         loop {
@@ -121,8 +120,7 @@ impl FirstSets {
                         }
                         Symbol::NonTerminal(nt) => {
                             // Add FIRST(nt) \ {ε} to FIRST(lhs).
-                            let first_nt: HashSet<u8> =
-                                first.get(nt).cloned().unwrap_or_default();
+                            let first_nt: HashSet<u8> = first.get(nt).cloned().unwrap_or_default();
                             for &b in &first_nt {
                                 if first.get_mut(&lhs).unwrap().insert(b) {
                                     changed = true;
@@ -152,10 +150,7 @@ impl FirstSets {
     }
 
     /// Return the set of bytes that can start strings derivable from symbol `sym`.
-    pub fn first_of_symbol(
-        &self,
-        sym: &Symbol,
-    ) -> HashSet<u8> {
+    pub fn first_of_symbol(&self, sym: &Symbol) -> HashSet<u8> {
         match sym {
             Symbol::Terminal(bytes) => {
                 if let Some(&b) = bytes.first() {
@@ -166,9 +161,7 @@ impl FirstSets {
                     HashSet::new() // empty terminal contributes nothing to FIRST
                 }
             }
-            Symbol::NonTerminal(nt) => {
-                self.first.get(nt).cloned().unwrap_or_default()
-            }
+            Symbol::NonTerminal(nt) => self.first.get(nt).cloned().unwrap_or_default(),
         }
     }
 }
@@ -351,9 +344,7 @@ impl EarleyRecognizer {
         let k = self.input_pos;
         self.chart[k].iter().any(|item| {
             let rule = &self.grammar.rules[item.rule];
-            rule.lhs == start
-                && item.origin == 0
-                && item.dot == rule.rhs.len()
+            rule.lhs == start && item.origin == 0 && item.dot == rule.rhs.len()
         })
     }
 
@@ -385,12 +376,7 @@ impl EarleyRecognizer {
                         }
                     }
                     Symbol::NonTerminal(nt) => {
-                        let first_nt = self
-                            .first_sets
-                            .first
-                            .get(nt)
-                            .cloned()
-                            .unwrap_or_default();
+                        let first_nt = self.first_sets.first.get(nt).cloned().unwrap_or_default();
                         result.extend(first_nt);
                     }
                 }
@@ -577,12 +563,14 @@ mod tests {
     // ── Arithmetic grammar ──────────────────────────────────────────────────
 
     fn arithmetic_recognizer() -> EarleyRecognizer {
-        recognizer_from_bnf(r#"
+        recognizer_from_bnf(
+            r#"
             <expr>   ::= <term> "+" <expr> | <term> "-" <expr> | <term>
             <term>   ::= <factor> "*" <term> | <factor> "/" <term> | <factor>
             <factor> ::= "(" <expr> ")" | <number>
             <number> ::= "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"
-        "#)
+        "#,
+        )
     }
 
     #[test]
@@ -640,7 +628,10 @@ mod tests {
             assert!(nbs.contains(&d), "digit {d} should be in next_byte_set");
         }
         assert!(nbs.contains(&b'('), "'(' should be in next_byte_set");
-        assert!(!nbs.contains(&b'+'), "'+' should not be in next_byte_set at start");
+        assert!(
+            !nbs.contains(&b'+'),
+            "'+' should not be in next_byte_set at start"
+        );
     }
 
     #[test]
@@ -722,10 +713,12 @@ mod tests {
     fn earley_handles_nullable_productions() {
         // S ::= <A> "x"
         // A ::= "" | "a"
-        let mut r = recognizer_from_bnf(r#"
+        let mut r = recognizer_from_bnf(
+            r#"
             <S> ::= <A> "x"
             <A> ::= "" | "a"
-        "#);
+        "#,
+        );
         // "x" should be accepted (A → ε).
         assert!(feed_str(&mut r, "x"));
         assert!(r.is_accepting());
