@@ -39,7 +39,8 @@ fused Metal TQ2 full-forward, and native CUDA NVRTC paths all shipped.
 - [x] `gemv_fp8.rs` — `gemv_fp8_e4m3/e5m2` scalar reference GEMV, `k % 32 == 0` alignment check (11 tests each)
 - [x] `gemm_fp8.rs` — `gemm_fp8_e4m3/e5m2` scalar GEMM via decomposed GEMV (10 tests each)
 - [x] `Fp8Kernel` trait in `traits.rs` — mirrors `TernaryKernel` shape
-- [x] `impl Fp8Kernel for KernelDispatcher` in `dispatch.rs` — all tiers route to scalar reference; SIMD specialization deferred to Phase 15.x
+- [x] `impl Fp8Kernel for KernelDispatcher` in `dispatch.rs` — tier-aware dispatch to AVX2/AVX-512/NEON/Reference
+- [x] **FP8 SIMD kernels (Phase 15.x)** — `simd_fp8_avx2.rs` (AVX2 gather, 8-wide), `simd_fp8_avx512.rs` (AVX-512 gather, 16-wide), `simd_fp8_neon.rs` (LUT + vfmaq, 4-wide); `fp8_lut.rs` (OnceLock LUTs); tier-aware dispatch in `dispatch.rs`; parallel paths in `parallel.rs`; parity tests in `tests/fp8_simd_parity.rs`
 - [x] `tests/fp8_kernels.rs` — 35 integration tests (dispatcher round-trips, error paths, FP32 reference comparison)
 
 ## Ternary Bonsai

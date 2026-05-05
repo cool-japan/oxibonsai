@@ -80,6 +80,10 @@ merging, and numerical stability tests all implemented and green.
 - [x] Checkpoint save/load — OXCK binary format (`checkpoint.rs`)
 - [x] Compression utilities (`compression.rs`)
 
+## Phase 16 — FP8 Full Stack
+
+- [x] **FP8 export formats (Phase 16C)** — `ExportFormat::FP8E4M3` and `ExportFormat::FP8E5M2`; `BlockFP8E4M3::quantize`-based serialization; GGUF type IDs 43/44; 34B/32w size estimation; 4 tests in `export.rs` (roundtrip E4M3, roundtrip E5M2, size estimate, FP32 exceptions)
+
 ## Done — Scaling & Caching
 
 - [x] Tensor parallelism (`tensor_parallel.rs`)

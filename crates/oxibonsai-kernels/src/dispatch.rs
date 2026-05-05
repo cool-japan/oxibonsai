@@ -827,20 +827,45 @@ impl TernaryKernel for KernelDispatcher {
 }
 
 impl Fp8Kernel for KernelDispatcher {
-    /// Dequantize FP8 E4M3FN blocks.
-    ///
-    /// All tiers use the scalar reference implementation for now;
-    /// SIMD specializations are a follow-on Slice.
+    /// Dequantize FP8 E4M3FN blocks — tier-aware SIMD dispatch.
     fn dequant_fp8_e4m3(&self, blocks: &[BlockFP8E4M3], output: &mut [f32]) -> KernelResult<()> {
-        crate::dequant_fp8::dequant_fp8_e4m3(blocks, output)
+        match self.tier {
+            #[cfg(target_arch = "x86_64")]
+            KernelTier::Avx512 => unsafe {
+                crate::simd_fp8_avx512::dequant_fp8_e4m3_avx512(blocks, output)
+            },
+            #[cfg(target_arch = "x86_64")]
+            KernelTier::Avx2 => unsafe {
+                crate::simd_fp8_avx2::dequant_fp8_e4m3_avx2(blocks, output)
+            },
+            #[cfg(target_arch = "aarch64")]
+            KernelTier::Neon => unsafe {
+                crate::simd_fp8_neon::dequant_fp8_e4m3_neon(blocks, output)
+            },
+            _ => crate::dequant_fp8::dequant_fp8_e4m3(blocks, output),
+        }
     }
 
-    /// Dequantize FP8 E5M2 blocks.
+    /// Dequantize FP8 E5M2 blocks — tier-aware SIMD dispatch.
     fn dequant_fp8_e5m2(&self, blocks: &[BlockFP8E5M2], output: &mut [f32]) -> KernelResult<()> {
-        crate::dequant_fp8::dequant_fp8_e5m2(blocks, output)
+        match self.tier {
+            #[cfg(target_arch = "x86_64")]
+            KernelTier::Avx512 => unsafe {
+                crate::simd_fp8_avx512::dequant_fp8_e5m2_avx512(blocks, output)
+            },
+            #[cfg(target_arch = "x86_64")]
+            KernelTier::Avx2 => unsafe {
+                crate::simd_fp8_avx2::dequant_fp8_e5m2_avx2(blocks, output)
+            },
+            #[cfg(target_arch = "aarch64")]
+            KernelTier::Neon => unsafe {
+                crate::simd_fp8_neon::dequant_fp8_e5m2_neon(blocks, output)
+            },
+            _ => crate::dequant_fp8::dequant_fp8_e5m2(blocks, output),
+        }
     }
 
-    /// FP8 E4M3FN GEMV — scalar reference for all tiers.
+    /// FP8 E4M3FN GEMV — tier-aware SIMD dispatch.
     fn gemv_fp8_e4m3(
         &self,
         blocks: &[BlockFP8E4M3],
@@ -849,10 +874,24 @@ impl Fp8Kernel for KernelDispatcher {
         n_rows: usize,
         k: usize,
     ) -> KernelResult<()> {
-        crate::gemv_fp8::gemv_fp8_e4m3(blocks, input, output, n_rows, k)
+        match self.tier {
+            #[cfg(target_arch = "x86_64")]
+            KernelTier::Avx512 => unsafe {
+                crate::simd_fp8_avx512::gemv_fp8_e4m3_avx512(blocks, input, output, n_rows, k)
+            },
+            #[cfg(target_arch = "x86_64")]
+            KernelTier::Avx2 => unsafe {
+                crate::simd_fp8_avx2::gemv_fp8_e4m3_avx2(blocks, input, output, n_rows, k)
+            },
+            #[cfg(target_arch = "aarch64")]
+            KernelTier::Neon => unsafe {
+                crate::simd_fp8_neon::gemv_fp8_e4m3_neon(blocks, input, output, n_rows, k)
+            },
+            _ => crate::gemv_fp8::gemv_fp8_e4m3(blocks, input, output, n_rows, k),
+        }
     }
 
-    /// FP8 E5M2 GEMV — scalar reference for all tiers.
+    /// FP8 E5M2 GEMV — tier-aware SIMD dispatch.
     fn gemv_fp8_e5m2(
         &self,
         blocks: &[BlockFP8E5M2],
@@ -861,10 +900,24 @@ impl Fp8Kernel for KernelDispatcher {
         n_rows: usize,
         k: usize,
     ) -> KernelResult<()> {
-        crate::gemv_fp8::gemv_fp8_e5m2(blocks, input, output, n_rows, k)
+        match self.tier {
+            #[cfg(target_arch = "x86_64")]
+            KernelTier::Avx512 => unsafe {
+                crate::simd_fp8_avx512::gemv_fp8_e5m2_avx512(blocks, input, output, n_rows, k)
+            },
+            #[cfg(target_arch = "x86_64")]
+            KernelTier::Avx2 => unsafe {
+                crate::simd_fp8_avx2::gemv_fp8_e5m2_avx2(blocks, input, output, n_rows, k)
+            },
+            #[cfg(target_arch = "aarch64")]
+            KernelTier::Neon => unsafe {
+                crate::simd_fp8_neon::gemv_fp8_e5m2_neon(blocks, input, output, n_rows, k)
+            },
+            _ => crate::gemv_fp8::gemv_fp8_e5m2(blocks, input, output, n_rows, k),
+        }
     }
 
-    /// FP8 E4M3FN GEMM — scalar reference for all tiers.
+    /// FP8 E4M3FN GEMM — tier-aware SIMD dispatch.
     fn gemm_fp8_e4m3(
         &self,
         blocks: &[BlockFP8E4M3],
@@ -874,10 +927,30 @@ impl Fp8Kernel for KernelDispatcher {
         k: usize,
         batch: usize,
     ) -> KernelResult<()> {
-        crate::gemm_fp8::gemm_fp8_e4m3(blocks, inputs, outputs, n_rows, k, batch)
+        match self.tier {
+            #[cfg(target_arch = "x86_64")]
+            KernelTier::Avx512 => unsafe {
+                crate::simd_fp8_avx512::gemm_fp8_e4m3_avx512(
+                    blocks, inputs, outputs, n_rows, k, batch,
+                )
+            },
+            #[cfg(target_arch = "x86_64")]
+            KernelTier::Avx2 => unsafe {
+                crate::simd_fp8_avx2::gemm_fp8_e4m3_avx2(
+                    blocks, inputs, outputs, n_rows, k, batch,
+                )
+            },
+            #[cfg(target_arch = "aarch64")]
+            KernelTier::Neon => unsafe {
+                crate::simd_fp8_neon::gemm_fp8_e4m3_neon(
+                    blocks, inputs, outputs, n_rows, k, batch,
+                )
+            },
+            _ => crate::gemm_fp8::gemm_fp8_e4m3(blocks, inputs, outputs, n_rows, k, batch),
+        }
     }
 
-    /// FP8 E5M2 GEMM — scalar reference for all tiers.
+    /// FP8 E5M2 GEMM — tier-aware SIMD dispatch.
     fn gemm_fp8_e5m2(
         &self,
         blocks: &[BlockFP8E5M2],
@@ -887,11 +960,39 @@ impl Fp8Kernel for KernelDispatcher {
         k: usize,
         batch: usize,
     ) -> KernelResult<()> {
-        crate::gemm_fp8::gemm_fp8_e5m2(blocks, inputs, outputs, n_rows, k, batch)
+        match self.tier {
+            #[cfg(target_arch = "x86_64")]
+            KernelTier::Avx512 => unsafe {
+                crate::simd_fp8_avx512::gemm_fp8_e5m2_avx512(
+                    blocks, inputs, outputs, n_rows, k, batch,
+                )
+            },
+            #[cfg(target_arch = "x86_64")]
+            KernelTier::Avx2 => unsafe {
+                crate::simd_fp8_avx2::gemm_fp8_e5m2_avx2(
+                    blocks, inputs, outputs, n_rows, k, batch,
+                )
+            },
+            #[cfg(target_arch = "aarch64")]
+            KernelTier::Neon => unsafe {
+                crate::simd_fp8_neon::gemm_fp8_e5m2_neon(
+                    blocks, inputs, outputs, n_rows, k, batch,
+                )
+            },
+            _ => crate::gemm_fp8::gemm_fp8_e5m2(blocks, inputs, outputs, n_rows, k, batch),
+        }
     }
 
     fn name_fp8(&self) -> &'static str {
-        "fp8_reference"
+        match self.tier {
+            #[cfg(target_arch = "x86_64")]
+            KernelTier::Avx512 => "fp8_avx512",
+            #[cfg(target_arch = "x86_64")]
+            KernelTier::Avx2 => "fp8_avx2",
+            #[cfg(target_arch = "aarch64")]
+            KernelTier::Neon => "fp8_neon",
+            _ => "fp8_reference",
+        }
     }
 }
 

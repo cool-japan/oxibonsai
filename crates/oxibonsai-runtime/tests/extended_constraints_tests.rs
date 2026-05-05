@@ -296,8 +296,8 @@ fn length_constraint_prevents_stop_before_min() {
     // count=0 < min=3 → stop token (0) should be blocked
     let mask = c.allowed_tokens(&[], 8).unwrap();
     assert!(!mask[0], "stop token must be blocked before min_len");
-    for i in 1..8usize {
-        assert!(mask[i], "non-stop token {i} should be allowed");
+    for (i, &allowed) in mask.iter().enumerate().skip(1).take(7) {
+        assert!(allowed, "non-stop token {i} should be allowed");
     }
 }
 
@@ -355,8 +355,8 @@ fn length_constraint_exact_min_eq_max() {
     // count=2 == max=2 → only stop allowed
     let m2 = c.allowed_tokens(&[3, 3], 5).unwrap();
     assert!(m2[0]);
-    for i in 1..5usize {
-        assert!(!m2[i]);
+    for (_, &allowed) in m2.iter().enumerate().skip(1).take(4) {
+        assert!(!allowed);
     }
 }
 

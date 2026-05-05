@@ -12,6 +12,7 @@
 - [x] **`LengthConstraint`** — hard `[min_len, max_len]` with optional stop token enforcement; `count()` accessor
 - [x] **BNF grammar engine** (`src/grammar/`): `ast.rs` (Grammar AST, terminal normalisation), `bnf_parser.rs` (hand-rolled two-phase parser), `earley.rs` (full Earley recognizer with FIRST sets, `next_byte_set()`, `clone_state()`), `constraint.rs` (`GrammarConstraint` implementing `TokenConstraint`), `examples.rs` (5 pre-canned grammars)
 - [x] **93 grammar tests** + **32 constraint tests** in `tests/`
+- [x] **`AllowedTokensCache`** — LRU memoization cache for Earley `allowed_tokens` (Phase 15.x); `grammar/cache.rs`; `state_hash()` on `EarleyRecognizer`; `Mutex<AllowedTokensCache>` in `GrammarConstraint`; configurable capacity via `with_cache_capacity`; `cache_stats()` for observability; 12 tests in `tests/grammar_cache_tests.rs`
 
 ## 0.1.4 — New Modules
 

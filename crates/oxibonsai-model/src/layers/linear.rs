@@ -308,13 +308,231 @@ impl<'a> LinearTernary<'a> {
     }
 }
 
-/// Sum type dispatching to either Q1\_0\_g128 or TQ2\_0\_g128 linear layers.
+/// A linear layer with FP8 E4M3FN (8-bit float) weights.
+///
+/// Computes `output = weights @ input` using FP8 GEMV/GEMM kernels.
+/// Each block holds 32 weights (QK_FP8 = 32) + one FP16 scale.
+#[derive(Debug)]
+pub struct LinearFP8E4M3<'a> {
+    blocks: &'a [oxibonsai_core::BlockFP8E4M3],
+    out_features: usize,
+    in_features: usize,
+    kernel: std::sync::Arc<oxibonsai_kernels::KernelDispatcher>,
+}
+
+impl<'a> LinearFP8E4M3<'a> {
+    /// Create an FP8 E4M3FN linear layer, validating block count at construction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::ModelError::ShapeMismatch`] if `in_features % QK_FP8 != 0`
+    /// or `blocks.len() != out_features * (in_features / QK_FP8)`.
+    pub fn new(
+        blocks: &'a [oxibonsai_core::BlockFP8E4M3],
+        out_features: usize,
+        in_features: usize,
+        kernel: std::sync::Arc<oxibonsai_kernels::KernelDispatcher>,
+    ) -> crate::error::ModelResult<Self> {
+        use crate::error::ModelError;
+        use oxibonsai_core::QK_FP8;
+
+        if in_features == 0 || in_features % QK_FP8 != 0 {
+            return Err(ModelError::ShapeMismatch {
+                name: "LinearFP8E4M3".into(),
+                expected: vec![out_features, in_features],
+                actual: vec![out_features, in_features],
+            });
+        }
+        let blocks_per_row = in_features / QK_FP8;
+        let expected_blocks = out_features * blocks_per_row;
+        if blocks.len() != expected_blocks {
+            return Err(ModelError::ShapeMismatch {
+                name: "LinearFP8E4M3".into(),
+                expected: vec![expected_blocks],
+                actual: vec![blocks.len()],
+            });
+        }
+        Ok(Self {
+            blocks,
+            out_features,
+            in_features,
+            kernel,
+        })
+    }
+
+    /// Number of output features (rows).
+    pub fn out_features(&self) -> usize {
+        self.out_features
+    }
+
+    /// Number of input features (columns).
+    pub fn in_features(&self) -> usize {
+        self.in_features
+    }
+
+    /// Raw FP8 E4M3FN block references.
+    pub fn blocks(&self) -> &[oxibonsai_core::BlockFP8E4M3] {
+        self.blocks
+    }
+
+    /// Forward pass: vector input (GEMV).
+    ///
+    /// - `input`: FP32 vector of length `in_features`.
+    /// - `output`: FP32 vector of length `out_features`.
+    pub fn forward(&self, input: &[f32], output: &mut [f32]) -> crate::error::ModelResult<()> {
+        oxibonsai_kernels::gemv_fp8_e4m3_par(
+            &self.kernel,
+            self.blocks,
+            input,
+            output,
+            self.out_features,
+            self.in_features,
+        )
+        .map_err(crate::error::ModelError::Kernel)
+    }
+
+    /// Forward pass: matrix input (GEMM) for batched/prefill operation.
+    ///
+    /// - `input`: Row-major FP32 matrix [batch × in_features].
+    /// - `output`: Row-major FP32 matrix [batch × out_features].
+    /// - `batch`: Batch/sequence dimension.
+    pub fn forward_batch(
+        &self,
+        input: &[f32],
+        output: &mut [f32],
+        batch: usize,
+    ) -> crate::error::ModelResult<()> {
+        oxibonsai_kernels::gemm_fp8_e4m3_par(
+            &self.kernel,
+            self.blocks,
+            input,
+            output,
+            self.out_features,
+            self.in_features,
+            batch,
+        )
+        .map_err(crate::error::ModelError::Kernel)
+    }
+}
+
+/// A linear layer with FP8 E5M2 (8-bit float) weights.
+///
+/// Computes `output = weights @ input` using FP8 GEMV/GEMM kernels.
+/// Each block holds 32 weights (QK_FP8 = 32) + one FP16 scale.
+#[derive(Debug)]
+pub struct LinearFP8E5M2<'a> {
+    blocks: &'a [oxibonsai_core::BlockFP8E5M2],
+    out_features: usize,
+    in_features: usize,
+    kernel: std::sync::Arc<oxibonsai_kernels::KernelDispatcher>,
+}
+
+impl<'a> LinearFP8E5M2<'a> {
+    /// Create an FP8 E5M2 linear layer, validating block count at construction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::ModelError::ShapeMismatch`] if `in_features % QK_FP8 != 0`
+    /// or `blocks.len() != out_features * (in_features / QK_FP8)`.
+    pub fn new(
+        blocks: &'a [oxibonsai_core::BlockFP8E5M2],
+        out_features: usize,
+        in_features: usize,
+        kernel: std::sync::Arc<oxibonsai_kernels::KernelDispatcher>,
+    ) -> crate::error::ModelResult<Self> {
+        use crate::error::ModelError;
+        use oxibonsai_core::QK_FP8;
+
+        if in_features == 0 || in_features % QK_FP8 != 0 {
+            return Err(ModelError::ShapeMismatch {
+                name: "LinearFP8E5M2".into(),
+                expected: vec![out_features, in_features],
+                actual: vec![out_features, in_features],
+            });
+        }
+        let blocks_per_row = in_features / QK_FP8;
+        let expected_blocks = out_features * blocks_per_row;
+        if blocks.len() != expected_blocks {
+            return Err(ModelError::ShapeMismatch {
+                name: "LinearFP8E5M2".into(),
+                expected: vec![expected_blocks],
+                actual: vec![blocks.len()],
+            });
+        }
+        Ok(Self {
+            blocks,
+            out_features,
+            in_features,
+            kernel,
+        })
+    }
+
+    /// Number of output features (rows).
+    pub fn out_features(&self) -> usize {
+        self.out_features
+    }
+
+    /// Number of input features (columns).
+    pub fn in_features(&self) -> usize {
+        self.in_features
+    }
+
+    /// Raw FP8 E5M2 block references.
+    pub fn blocks(&self) -> &[oxibonsai_core::BlockFP8E5M2] {
+        self.blocks
+    }
+
+    /// Forward pass: vector input (GEMV).
+    ///
+    /// - `input`: FP32 vector of length `in_features`.
+    /// - `output`: FP32 vector of length `out_features`.
+    pub fn forward(&self, input: &[f32], output: &mut [f32]) -> crate::error::ModelResult<()> {
+        oxibonsai_kernels::gemv_fp8_e5m2_par(
+            &self.kernel,
+            self.blocks,
+            input,
+            output,
+            self.out_features,
+            self.in_features,
+        )
+        .map_err(crate::error::ModelError::Kernel)
+    }
+
+    /// Forward pass: matrix input (GEMM) for batched/prefill operation.
+    ///
+    /// - `input`: Row-major FP32 matrix [batch × in_features].
+    /// - `output`: Row-major FP32 matrix [batch × out_features].
+    /// - `batch`: Batch/sequence dimension.
+    pub fn forward_batch(
+        &self,
+        input: &[f32],
+        output: &mut [f32],
+        batch: usize,
+    ) -> crate::error::ModelResult<()> {
+        oxibonsai_kernels::gemm_fp8_e5m2_par(
+            &self.kernel,
+            self.blocks,
+            input,
+            output,
+            self.out_features,
+            self.in_features,
+            batch,
+        )
+        .map_err(crate::error::ModelError::Kernel)
+    }
+}
+
+/// Sum type dispatching to Q1\_0\_g128, TQ2\_0\_g128, FP8 E4M3FN, or FP8 E5M2 linear layers.
 #[derive(Debug)]
 pub enum LinearLayer<'a> {
     /// 1-bit (Q1\_0\_g128) linear layer.
     OneBit(Linear1Bit<'a>),
     /// Ternary (TQ2\_0\_g128) linear layer.
     Ternary(LinearTernary<'a>),
+    /// FP8 E4M3FN (8-bit float) linear layer.
+    FP8E4M3(LinearFP8E4M3<'a>),
+    /// FP8 E5M2 (8-bit float) linear layer.
+    FP8E5M2(LinearFP8E5M2<'a>),
 }
 
 impl<'a> LinearLayer<'a> {
@@ -323,6 +541,8 @@ impl<'a> LinearLayer<'a> {
         match self {
             Self::OneBit(l) => l.out_features(),
             Self::Ternary(l) => l.out_features(),
+            Self::FP8E4M3(l) => l.out_features(),
+            Self::FP8E5M2(l) => l.out_features(),
         }
     }
 
@@ -331,14 +551,19 @@ impl<'a> LinearLayer<'a> {
         match self {
             Self::OneBit(l) => l.in_features(),
             Self::Ternary(l) => l.in_features(),
+            Self::FP8E4M3(l) => l.in_features(),
+            Self::FP8E5M2(l) => l.in_features(),
         }
     }
 
     /// Returns the GPU weight handle, if the layer has been uploaded to GPU.
+    ///
+    /// FP8 variants do not yet support GPU caching — returns `None`.
     pub fn gpu_handle(&self) -> Option<oxibonsai_kernels::GpuWeightHandle> {
         match self {
             Self::OneBit(l) => l.gpu_handle(),
             Self::Ternary(l) => l.gpu_handle(),
+            Self::FP8E4M3(_) | Self::FP8E5M2(_) => None,
         }
     }
 
@@ -346,48 +571,62 @@ impl<'a> LinearLayer<'a> {
     pub fn blocks_1bit(&self) -> Option<&[oxibonsai_core::tensor::BlockQ1_0G128]> {
         match self {
             Self::OneBit(l) => Some(l.blocks()),
-            Self::Ternary(_) => None,
+            Self::Ternary(_) | Self::FP8E4M3(_) | Self::FP8E5M2(_) => None,
         }
     }
 
     /// Returns the TQ2\_0\_g128 blocks if this is a ternary layer, `None` otherwise.
     pub fn blocks_ternary(&self) -> Option<&[oxibonsai_core::BlockTQ2_0_g128]> {
         match self {
-            Self::OneBit(_) => None,
+            Self::OneBit(_) | Self::FP8E4M3(_) | Self::FP8E5M2(_) => None,
             Self::Ternary(l) => Some(l.blocks()),
+        }
+    }
+
+    /// Returns the FP8 E4M3FN blocks if this is an FP8 E4M3 layer, `None` otherwise.
+    pub fn blocks_fp8_e4m3(&self) -> Option<&[oxibonsai_core::BlockFP8E4M3]> {
+        match self {
+            Self::FP8E4M3(l) => Some(l.blocks()),
+            _ => None,
+        }
+    }
+
+    /// Returns the FP8 E5M2 blocks if this is an FP8 E5M2 layer, `None` otherwise.
+    pub fn blocks_fp8_e5m2(&self) -> Option<&[oxibonsai_core::BlockFP8E5M2]> {
+        match self {
+            Self::FP8E5M2(l) => Some(l.blocks()),
+            _ => None,
         }
     }
 
     /// Upload weights to GPU.
     ///
-    /// Both 1-bit and ternary variants use their stored `Arc<KernelDispatcher>` —
-    /// no external kernel argument is required.
+    /// FP8 variants are no-ops (GPU FP8 inference not yet implemented).
     pub fn upload_to_gpu(&mut self) {
         match self {
             Self::OneBit(l) => l.upload_to_gpu(),
             Self::Ternary(l) => l.upload_to_gpu(),
+            Self::FP8E4M3(_) | Self::FP8E5M2(_) => {}
         }
     }
 
     /// Forward pass (GEMV) for a single input vector.
-    ///
-    /// Both 1-bit and ternary variants use their embedded `Arc<KernelDispatcher>` —
-    /// no external kernel argument is required.
     pub fn forward_vec(&self, input: &[f32], output: &mut [f32]) -> ModelResult<()> {
         match self {
             Self::OneBit(l) => l.forward_vec(input, output),
             Self::Ternary(l) => l.forward(input, output),
+            Self::FP8E4M3(l) => l.forward(input, output),
+            Self::FP8E5M2(l) => l.forward(input, output),
         }
     }
 
     /// Forward pass (GEMM) for a batched input.
-    ///
-    /// Both 1-bit and ternary variants use their embedded `Arc<KernelDispatcher>` —
-    /// no external kernel argument is required.
     pub fn forward_mat(&self, input: &[f32], output: &mut [f32], m: usize) -> ModelResult<()> {
         match self {
             Self::OneBit(l) => l.forward_mat(input, output, m),
             Self::Ternary(l) => l.forward_batch(input, output, m),
+            Self::FP8E4M3(l) => l.forward_batch(input, output, m),
+            Self::FP8E5M2(l) => l.forward_batch(input, output, m),
         }
     }
 }
@@ -401,6 +640,18 @@ impl<'a> From<Linear1Bit<'a>> for LinearLayer<'a> {
 impl<'a> From<LinearTernary<'a>> for LinearLayer<'a> {
     fn from(l: LinearTernary<'a>) -> Self {
         Self::Ternary(l)
+    }
+}
+
+impl<'a> From<LinearFP8E4M3<'a>> for LinearLayer<'a> {
+    fn from(l: LinearFP8E4M3<'a>) -> Self {
+        Self::FP8E4M3(l)
+    }
+}
+
+impl<'a> From<LinearFP8E5M2<'a>> for LinearLayer<'a> {
+    fn from(l: LinearFP8E5M2<'a>) -> Self {
+        Self::FP8E5M2(l)
     }
 }
 

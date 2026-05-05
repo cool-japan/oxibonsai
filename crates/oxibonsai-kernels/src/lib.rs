@@ -73,6 +73,7 @@ pub mod dequant_fp8;
 pub mod dequant_ternary;
 pub mod dispatch;
 pub mod error;
+pub mod fp8_lut;
 pub mod gemm;
 pub mod gemm_fp8;
 pub mod gemm_ternary;
@@ -86,6 +87,12 @@ pub mod parallel_tiled;
 pub mod simd_avx2;
 #[cfg(target_arch = "x86_64")]
 pub mod simd_avx512;
+#[cfg(target_arch = "x86_64")]
+pub mod simd_fp8_avx2;
+#[cfg(target_arch = "x86_64")]
+pub mod simd_fp8_avx512;
+#[cfg(target_arch = "aarch64")]
+pub mod simd_fp8_neon;
 #[cfg(target_arch = "aarch64")]
 pub mod simd_neon;
 pub mod tiled;
@@ -100,7 +107,10 @@ pub mod tuning;
 pub use aligned::{AlignedBlocks, AlignedBuffer};
 pub use dispatch::{KernelDispatcher, KernelTier};
 pub use error::{KernelError, KernelResult};
-pub use parallel::{gemm_ternary_g128_par, gemv_ternary_g128_par};
+pub use parallel::{
+    gemm_fp8_e4m3_par, gemm_fp8_e5m2_par, gemm_ternary_g128_par, gemv_fp8_e4m3_par,
+    gemv_fp8_e5m2_par, gemv_ternary_g128_par,
+};
 pub use parallel_tiled::{gemm_adaptive_ternary, gemv_adaptive, gemv_adaptive_ternary};
 pub use prefetch::{PrefetchConfig, PrefetchLocality, PrefetchStrategy};
 pub use simd_float_ops::{rms_norm_simd, rope_apply_simd, silu_simd, softmax_simd, swiglu_simd};

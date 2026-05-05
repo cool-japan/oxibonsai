@@ -427,6 +427,27 @@ impl EarleyRecognizer {
     pub fn active_item_count(&self) -> usize {
         self.chart[self.input_pos].len()
     }
+
+    /// Compute a 64-bit hash of the current Earley chart state.
+    ///
+    /// Collects all items from `chart[input_pos]`, sorts them deterministically,
+    /// and hashes them using `DefaultHasher`. The resulting hash is used as a
+    /// cache key in `GrammarConstraint::allowed_tokens`.
+    pub fn state_hash(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut items: Vec<(usize, usize, usize)> = self.chart[self.input_pos]
+            .iter()
+            .map(|item| (item.rule, item.dot, item.origin))
+            .collect();
+        items.sort_unstable();
+
+        let mut hasher = DefaultHasher::new();
+        items.hash(&mut hasher);
+        self.input_pos.hash(&mut hasher);
+        hasher.finish()
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -4,7 +4,7 @@ use super::weight_loaders::{load_f32_tensor, load_output_weight, load_transforme
 use crate::block::TransformerBlock;
 use crate::error::{ModelError, ModelResult};
 use crate::kv_cache::KvCache;
-use crate::layers::linear::{Linear1Bit, LinearTernary};
+use crate::layers::linear::{Linear1Bit, LinearFP8E4M3, LinearFP8E5M2, LinearTernary};
 use crate::layers::rms_norm::RmsNorm;
 use crate::layers::rope::RopeTable;
 use crate::model_registry::ModelVariant;
@@ -211,6 +211,7 @@ impl<'a> BonsaiModel<'a> {
         match self.output_weight {
             OutputWeight::OneBit(ref mut linear) => linear.upload_to_gpu(),
             OutputWeight::Ternary(ref mut linear) => linear.upload_to_gpu(),
+            OutputWeight::FP8E4M3(_) | OutputWeight::FP8E5M2(_) => {}
             OutputWeight::Fp32 { .. } => {}
         }
         tracing::info!("GPU weight upload complete");
@@ -520,6 +521,12 @@ impl<'a> BonsaiModel<'a> {
             OutputWeight::Ternary(linear) => {
                 linear.forward(&normed, &mut logits)?;
             }
+            OutputWeight::FP8E4M3(linear) => {
+                linear.forward(&normed, &mut logits)?;
+            }
+            OutputWeight::FP8E5M2(linear) => {
+                linear.forward(&normed, &mut logits)?;
+            }
             OutputWeight::Fp32 {
                 weights,
                 out_features,
@@ -546,10 +553,12 @@ impl<'a> BonsaiModel<'a> {
     }
 }
 
-/// Output projection can be 1-bit, ternary, or FP32 depending on the model.
+/// Output projection can be 1-bit, ternary, FP8, or FP32 depending on the model.
 pub(super) enum OutputWeight<'a> {
     OneBit(Linear1Bit<'a>),
     Ternary(LinearTernary<'a>),
+    FP8E4M3(LinearFP8E4M3<'a>),
+    FP8E5M2(LinearFP8E5M2<'a>),
     Fp32 {
         weights: Vec<f32>,
         out_features: usize,

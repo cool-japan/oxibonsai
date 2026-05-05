@@ -14,25 +14,17 @@ use std::path::PathBuf;
 use oxibonsai_serve::config::{ConfigError, PartialServerConfig, ServerConfig};
 
 fn temp_toml(contents: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let mut p = std::env::temp_dir();
-    // Use a process-unique name so tests can run in parallel.
     let name = format!(
         "oxibonsai-serve-config-{}-{}.toml",
         std::process::id(),
-        fastrand_like()
+        COUNTER.fetch_add(1, Ordering::Relaxed)
     );
     p.push(name);
     std::fs::write(&p, contents).expect("write temp toml");
     p
-}
-
-/// Tiny pseudo-random helper (process-pid + nanosecond timestamp).
-fn fastrand_like() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
 }
 
 // ─── Default + roundtrip ──────────────────────────────────────────────────

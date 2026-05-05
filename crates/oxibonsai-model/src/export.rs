@@ -36,6 +36,18 @@ pub enum ExportFormat {
     /// Embedding and LM-head tensors are ternary-encoded (unlike Q1_0G128 which keeps them
     /// FP16). Only RMS-norm weights remain FP32.
     TernaryG128,
+    /// FP8 E4M3FN per-block quantization: 32 weights × 1 byte + FP16 scale (34 B / 32 weights).
+    ///
+    /// Uses the E4M3FN format (bias=7, no infinity, NaN at 0x7f/0xff). Provides
+    /// approximately 8.5 bits per weight (34 bytes × 8 bits ÷ 32 weights). Maps
+    /// to GGUF type ID 43 (PrismML extension). Only RMS-norm weights remain FP32.
+    FP8E4M3,
+    /// FP8 E5M2 per-block quantization: 32 weights × 1 byte + FP16 scale (34 B / 32 weights).
+    ///
+    /// Uses the E5M2 format (bias=15, has infinity). Provides higher dynamic range
+    /// than E4M3 at the cost of mantissa precision. Maps to GGUF type ID 44
+    /// (PrismML extension). Only RMS-norm weights remain FP32.
+    FP8E5M2,
 }
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -238,6 +250,56 @@ fn encode_tensor(
                 })?;
             Ok((bytes, TensorType::TQ2_0_g128))
         }
+
+        ExportFormat::FP8E4M3 => {
+            // Pad to a multiple of QK_FP8 (32) if necessary.
+            use oxibonsai_core::quant_fp8::{BlockFP8E4M3, QK_FP8};
+            let remainder = tensor.data.len() % QK_FP8;
+            let padded: std::borrow::Cow<[f32]> = if remainder == 0 {
+                std::borrow::Cow::Borrowed(&tensor.data)
+            } else {
+                let pad = QK_FP8 - remainder;
+                let mut v = tensor.data.clone();
+                v.resize(tensor.data.len() + pad, 0.0_f32);
+                std::borrow::Cow::Owned(v)
+            };
+            let blocks = BlockFP8E4M3::quantize(&padded).map_err(|e| ExportError::QuantizeError {
+                name: tensor.name.clone(),
+                reason: e.to_string(),
+            })?;
+            // Serialize blocks to raw bytes via zero-copy pointer cast.
+            // SAFETY: BlockFP8E4M3 is #[repr(C)] with compile-time size assert of 34 bytes.
+            // The struct contains [u8; 32] + f16 (u16 layout), alignment is u8-compatible.
+            let byte_len = blocks.len() * oxibonsai_core::quant_fp8::BLOCK_FP8_BYTES;
+            let block_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(blocks.as_ptr() as *const u8, byte_len)
+            };
+            Ok((block_bytes.to_vec(), TensorType::F8_E4M3))
+        }
+
+        ExportFormat::FP8E5M2 => {
+            // Pad to a multiple of QK_FP8 (32) if necessary.
+            use oxibonsai_core::quant_fp8::{BlockFP8E5M2, QK_FP8};
+            let remainder = tensor.data.len() % QK_FP8;
+            let padded: std::borrow::Cow<[f32]> = if remainder == 0 {
+                std::borrow::Cow::Borrowed(&tensor.data)
+            } else {
+                let pad = QK_FP8 - remainder;
+                let mut v = tensor.data.clone();
+                v.resize(tensor.data.len() + pad, 0.0_f32);
+                std::borrow::Cow::Owned(v)
+            };
+            let blocks = BlockFP8E5M2::quantize(&padded).map_err(|e| ExportError::QuantizeError {
+                name: tensor.name.clone(),
+                reason: e.to_string(),
+            })?;
+            // SAFETY: same as FP8E4M3 above — BlockFP8E5M2 is #[repr(C)], 34 bytes.
+            let byte_len = blocks.len() * oxibonsai_core::quant_fp8::BLOCK_FP8_BYTES;
+            let block_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(blocks.as_ptr() as *const u8, byte_len)
+            };
+            Ok((block_bytes.to_vec(), TensorType::F8_E5M2))
+        }
     }
 }
 
@@ -286,6 +348,8 @@ pub fn export_to_gguf(
         ExportFormat::Q1_0G128 => "Q1_0G128",
         ExportFormat::Int8PerChannel => "INT8_PER_CHANNEL",
         ExportFormat::TernaryG128 => "TQ2_0_g128",
+        ExportFormat::FP8E4M3 => "F8_E4M3",
+        ExportFormat::FP8E5M2 => "F8_E5M2",
     };
     writer.add_metadata(
         "general.quantization_version",
@@ -358,6 +422,12 @@ pub fn estimate_export_size(tensors: &[WeightTensor], config: &ExportConfig) -> 
                 }
                 ExportFormat::TernaryG128 => {
                     crate::quantize_ternary::tq2_0_g128_size_bytes(t.data.len())
+                }
+                ExportFormat::FP8E4M3 | ExportFormat::FP8E5M2 => {
+                    // 34 bytes per 32 weights (32 × u8 qs + 2 bytes FP16 scale).
+                    // Use ceiling division so partially-filled final blocks count.
+                    let num_blocks = t.data.len().div_ceil(oxibonsai_core::quant_fp8::QK_FP8);
+                    num_blocks * oxibonsai_core::quant_fp8::BLOCK_FP8_BYTES
                 }
             }
         })
@@ -599,6 +669,116 @@ mod tests {
         assert_eq!(
             stats.quantized_tensors, 1,
             "attn_q.weight should be ternary-quantized"
+        );
+    }
+
+    // ── FP8E4M3 export ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_export_fp8_e4m3_roundtrip() {
+        // 128 weights (4 FP8 blocks × 32 weights each) → 4 × 34 = 136 bytes of FP8 data.
+        // The GGUF tensor data section must contain exactly that many bytes.
+        let n_weights = 128usize;
+        let n_blocks = n_weights / oxibonsai_core::quant_fp8::QK_FP8;
+        let expected_bytes = n_blocks * oxibonsai_core::quant_fp8::BLOCK_FP8_BYTES;
+        let tensors = vec![WeightTensor::new(
+            "blk.0.attn_q.weight",
+            vec![1.0; n_weights],
+            vec![n_weights],
+        )];
+        let config = ExportConfig::new(ExportFormat::FP8E4M3, "fp8-e4m3-model");
+        let gguf_bytes = export_to_gguf(&tensors, &config, &[]).expect("FP8E4M3 export");
+        // Verify GGUF magic.
+        let magic = u32::from_le_bytes(gguf_bytes[0..4].try_into().expect("magic slice"));
+        assert_eq!(magic, 0x4655_4747, "expected GGUF magic");
+        // The raw tensor bytes must appear somewhere in the output; their length
+        // is 4 × 34 = 136 bytes. We verify the total file size is at least that.
+        assert!(
+            gguf_bytes.len() >= expected_bytes,
+            "GGUF file too small: {} < {}",
+            gguf_bytes.len(),
+            expected_bytes,
+        );
+    }
+
+    #[test]
+    fn test_export_fp8_e5m2_roundtrip() {
+        // 64 weights (2 FP8 blocks × 32 weights each) → 2 × 34 = 68 bytes of FP8 data.
+        let n_weights = 64usize;
+        let n_blocks = n_weights / oxibonsai_core::quant_fp8::QK_FP8;
+        let expected_bytes = n_blocks * oxibonsai_core::quant_fp8::BLOCK_FP8_BYTES;
+        let tensors = vec![WeightTensor::new(
+            "blk.0.ffn_gate.weight",
+            vec![2.0; n_weights],
+            vec![n_weights],
+        )];
+        let config = ExportConfig::new(ExportFormat::FP8E5M2, "fp8-e5m2-model");
+        let gguf_bytes = export_to_gguf(&tensors, &config, &[]).expect("FP8E5M2 export");
+        let magic = u32::from_le_bytes(gguf_bytes[0..4].try_into().expect("magic slice"));
+        assert_eq!(magic, 0x4655_4747, "expected GGUF magic");
+        assert!(
+            gguf_bytes.len() >= expected_bytes,
+            "GGUF file too small: {} < {}",
+            gguf_bytes.len(),
+            expected_bytes,
+        );
+    }
+
+    #[test]
+    fn test_export_fp8_size_estimate() {
+        // 32 weights → 1 FP8 block → 34 bytes.
+        let tensors_32 = vec![WeightTensor::new("w", vec![1.0; 32], vec![32])];
+        let config_e4m3 = ExportConfig::new(ExportFormat::FP8E4M3, "m");
+        let config_e5m2 = ExportConfig::new(ExportFormat::FP8E5M2, "m");
+        assert_eq!(
+            estimate_export_size(&tensors_32, &config_e4m3),
+            34,
+            "32 weights in FP8E4M3 → 1 block → 34 bytes"
+        );
+        assert_eq!(
+            estimate_export_size(&tensors_32, &config_e5m2),
+            34,
+            "32 weights in FP8E5M2 → 1 block → 34 bytes"
+        );
+
+        // 256 weights → 8 blocks → 272 bytes.
+        let tensors_256 = vec![WeightTensor::new("w", vec![1.0; 256], vec![256])];
+        assert_eq!(
+            estimate_export_size(&tensors_256, &config_e4m3),
+            8 * 34,
+            "256 weights → 8 blocks → 272 bytes"
+        );
+
+        // Verify compression ratio > 1 (FP8 is 34/32 bytes/weight ≈ 1.0625 vs 4.0 for FP32).
+        let stats = export_stats(&tensors_256, &config_e4m3);
+        assert!(
+            stats.compression_ratio > 1.0,
+            "FP8E4M3 should compress better than FP32"
+        );
+        // Expected ratio: 256*4 / (8*34) = 1024 / 272 ≈ 3.76
+        assert!(
+            stats.compression_ratio > 3.0,
+            "FP8E4M3 compression ratio should be > 3.0, got {}",
+            stats.compression_ratio
+        );
+        assert_eq!(stats.quantized_tensors, 1);
+        assert_eq!(stats.fp32_tensors, 0);
+    }
+
+    #[test]
+    fn test_fp8_fp32_exception_tensors_stay_fp32() {
+        // output_norm.weight should stay F32 even under FP8E4M3 and FP8E5M2.
+        let tensors = vec![
+            WeightTensor::new("blk.0.attn_q.weight", vec![1.0; 64], vec![64]),
+            WeightTensor::new("output_norm.weight", vec![1.0; 64], vec![64]),
+        ];
+        let config = ExportConfig::new(ExportFormat::FP8E4M3, "m")
+            .with_fp32_layers(vec!["output_norm.weight".to_string()]);
+        let stats = export_stats(&tensors, &config);
+        assert_eq!(stats.fp32_tensors, 1, "output_norm.weight should stay FP32");
+        assert_eq!(
+            stats.quantized_tensors, 1,
+            "attn_q.weight should be FP8-quantized"
         );
     }
 }

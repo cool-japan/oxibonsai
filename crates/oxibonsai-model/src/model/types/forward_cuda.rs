@@ -345,6 +345,9 @@ impl<'a> BonsaiModel<'a> {
         let lm_head_linear = match &self.output_weight {
             OutputWeight::OneBit(linear) => linear,
             OutputWeight::Ternary(_) => unreachable!("handled above"),
+            OutputWeight::FP8E4M3(_) | OutputWeight::FP8E5M2(_) => {
+                return Err("FP8 GPU inference not yet supported; use CPU path".into());
+            }
             OutputWeight::Fp32 { .. } => {
                 return Err("FP32 LM head not supported on CUDA fused GPU path".into());
             }
@@ -422,6 +425,9 @@ impl<'a> BonsaiModel<'a> {
         let lm_head_linear = match &self.output_weight {
             OutputWeight::OneBit(linear) => linear,
             OutputWeight::Ternary(_) => unreachable!("handled above"),
+            OutputWeight::FP8E4M3(_) | OutputWeight::FP8E5M2(_) => {
+                return Err("FP8 GPU inference not yet supported; use CPU path".into());
+            }
             OutputWeight::Fp32 { .. } => {
                 return Err("FP32 LM head not supported on CUDA prefill path".into());
             }
@@ -529,6 +535,9 @@ impl<'a> BonsaiModel<'a> {
         let lm_head_linear = match &self.output_weight {
             OutputWeight::OneBit(linear) => linear,
             OutputWeight::Ternary(_) => unreachable!("handled above"),
+            OutputWeight::FP8E4M3(_) | OutputWeight::FP8E5M2(_) => {
+                return Err("FP8 GPU inference not yet supported; use CPU path".into());
+            }
             OutputWeight::Fp32 { .. } => {
                 return Err("FP32 LM head not supported on CUDA prefill verify path".into());
             }

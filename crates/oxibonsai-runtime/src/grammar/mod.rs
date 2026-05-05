@@ -39,6 +39,7 @@
 
 pub mod ast;
 pub mod bnf_parser;
+pub mod cache;
 pub mod constraint;
 pub mod earley;
 pub mod examples;
@@ -47,6 +48,7 @@ pub mod examples;
 
 pub use ast::{Grammar, NonTerminalId, Rule, RuleId, Symbol, NULL_NT};
 pub use bnf_parser::{parse_bnf, BnfParseError};
+pub use cache::AllowedTokensCache;
 pub use constraint::GrammarConstraint;
 pub use earley::EarleyRecognizer;
 pub use examples::{

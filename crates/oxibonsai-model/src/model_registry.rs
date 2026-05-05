@@ -21,6 +21,12 @@ pub enum ModelVariant {
     TernaryBonsai4B,
     /// Ternary-Bonsai-1.7B: same Qwen3-1.7B architecture, {-1,0,+1} weights (TQ2_0_g128).
     TernaryBonsai1_7B,
+    /// FP8-Bonsai-8B: same Qwen3-8B architecture, FP8 weights (F8_E4M3 or F8_E5M2).
+    FP8Bonsai8B,
+    /// FP8-Bonsai-4B: same Qwen3-4B architecture, FP8 weights.
+    FP8Bonsai4B,
+    /// FP8-Bonsai-1.7B: same Qwen3-1.7B architecture, FP8 weights.
+    FP8Bonsai1_7B,
     /// Custom or unrecognized architecture
     Custom,
 }
@@ -55,6 +61,13 @@ impl ModelVariant {
                 Self::Bonsai1_7B => Self::TernaryBonsai1_7B,
                 other => other, // Custom or already-ternary → unchanged
             }
+        } else if sample_tensor_type.is_fp8() {
+            match base {
+                Self::Bonsai8B => Self::FP8Bonsai8B,
+                Self::Bonsai4B => Self::FP8Bonsai4B,
+                Self::Bonsai1_7B => Self::FP8Bonsai1_7B,
+                other => other, // Custom or already-fp8 → unchanged
+            }
         } else {
             base
         }
@@ -72,6 +85,10 @@ impl ModelVariant {
             ModelVariant::TernaryBonsai8B => Qwen3Config::ternary_bonsai_8b(),
             ModelVariant::TernaryBonsai4B => Qwen3Config::ternary_bonsai_4b(),
             ModelVariant::TernaryBonsai1_7B => Qwen3Config::ternary_bonsai_1_7b(),
+            // FP8 variants share the same Qwen3 architecture as their 1-bit siblings.
+            ModelVariant::FP8Bonsai8B => Qwen3Config::bonsai_8b(),
+            ModelVariant::FP8Bonsai4B => Qwen3Config::bonsai_4b(),
+            ModelVariant::FP8Bonsai1_7B => Qwen3Config::bonsai_1_7b(),
             ModelVariant::Custom => Qwen3Config::bonsai_8b(),
         }
     }
@@ -85,6 +102,9 @@ impl ModelVariant {
             ModelVariant::TernaryBonsai8B => "Ternary-Bonsai-8B",
             ModelVariant::TernaryBonsai4B => "Ternary-Bonsai-4B",
             ModelVariant::TernaryBonsai1_7B => "Ternary-Bonsai-1.7B",
+            ModelVariant::FP8Bonsai8B => "FP8-Bonsai-8B",
+            ModelVariant::FP8Bonsai4B => "FP8-Bonsai-4B",
+            ModelVariant::FP8Bonsai1_7B => "FP8-Bonsai-1.7B",
             ModelVariant::Custom => "Custom",
         }
     }
@@ -97,7 +117,7 @@ impl ModelVariant {
     /// as their 1-bit siblings; only the storage format differs.
     pub fn param_count(&self) -> u64 {
         match self {
-            ModelVariant::Bonsai8B | ModelVariant::TernaryBonsai8B => {
+            ModelVariant::Bonsai8B | ModelVariant::TernaryBonsai8B | ModelVariant::FP8Bonsai8B => {
                 // Qwen3-8B: ~8.03B parameters
                 // Embedding: 151936 * 4096 = 622M
                 // Per layer: Q(4096*4096) + K(4096*1024) + V(4096*1024) + O(4096*4096)
@@ -108,14 +128,16 @@ impl ModelVariant {
                 // + embedding(622M) + output(622M) + final norm(4K)
                 8_030_000_000
             }
-            ModelVariant::Bonsai4B | ModelVariant::TernaryBonsai4B => {
+            ModelVariant::Bonsai4B | ModelVariant::TernaryBonsai4B | ModelVariant::FP8Bonsai4B => {
                 // 24 layers, hidden=2560, intermediate=6912
                 // Per layer: Q(2560*2560) + K(2560*512) + V(2560*512) + O(2560*2560)
                 //          + gate(2560*6912) + up(2560*6912) + down(6912*2560) + norms
                 // Embedding: 151936 * 2560
                 4_020_000_000
             }
-            ModelVariant::Bonsai1_7B | ModelVariant::TernaryBonsai1_7B => {
+            ModelVariant::Bonsai1_7B
+            | ModelVariant::TernaryBonsai1_7B
+            | ModelVariant::FP8Bonsai1_7B => {
                 // 16 layers, hidden=1536, intermediate=4096
                 1_720_000_000
             }
@@ -169,6 +191,21 @@ impl ModelVariant {
                 // + embeddings (FP16): 151936 * 1536 * 2 ≈ 0.47 GB → ~0.39 GB total
                 390_000_000
             }
+            ModelVariant::FP8Bonsai8B => {
+                // FP8: 1 byte/weight + FP16 scale per 32-weight block ≈ 1.0625 bytes/weight
+                // Transformer weights: ~7.88B × 1.0625 ≈ 8.37 GB — but embeddings in FP16
+                // Embeddings (FP16): 151936 × 4096 × 2 ≈ 1.24 GB
+                // Rough total: ~8.5 GB (FP8 is closer to FP16 in size)
+                8_500_000_000
+            }
+            ModelVariant::FP8Bonsai4B => {
+                // Transformer: ~3.63B × 1.0625 ≈ 3.86 GB + embeddings 0.78 GB → ~5.0 GB
+                5_000_000_000
+            }
+            ModelVariant::FP8Bonsai1_7B => {
+                // Transformer: ~1.49B × 1.0625 ≈ 1.58 GB + embeddings 0.47 GB → ~2.3 GB
+                2_300_000_000
+            }
             ModelVariant::Custom => 0,
         }
     }
@@ -182,6 +219,9 @@ impl ModelVariant {
             ModelVariant::TernaryBonsai8B,
             ModelVariant::TernaryBonsai4B,
             ModelVariant::TernaryBonsai1_7B,
+            ModelVariant::FP8Bonsai8B,
+            ModelVariant::FP8Bonsai4B,
+            ModelVariant::FP8Bonsai1_7B,
         ]
     }
 
@@ -291,13 +331,16 @@ mod tests {
     #[test]
     fn known_variants_list() {
         let variants = ModelVariant::known_variants();
-        assert_eq!(variants.len(), 6);
+        assert_eq!(variants.len(), 9);
         assert!(variants.contains(&ModelVariant::Bonsai8B));
         assert!(variants.contains(&ModelVariant::Bonsai4B));
         assert!(variants.contains(&ModelVariant::Bonsai1_7B));
         assert!(variants.contains(&ModelVariant::TernaryBonsai8B));
         assert!(variants.contains(&ModelVariant::TernaryBonsai4B));
         assert!(variants.contains(&ModelVariant::TernaryBonsai1_7B));
+        assert!(variants.contains(&ModelVariant::FP8Bonsai8B));
+        assert!(variants.contains(&ModelVariant::FP8Bonsai4B));
+        assert!(variants.contains(&ModelVariant::FP8Bonsai1_7B));
     }
 
     #[test]
@@ -430,5 +473,55 @@ mod tests {
             oxibonsai_core::GgufTensorType::TQ2_0_g128,
         );
         assert_eq!(variant, ModelVariant::Custom);
+    }
+
+    #[test]
+    fn detect_fp8_e4m3_8b_by_tensor_type() {
+        let cfg = Qwen3Config::bonsai_8b();
+        let variant = ModelVariant::from_config_and_sample_tensor_type(
+            &cfg,
+            oxibonsai_core::GgufTensorType::F8_E4M3,
+        );
+        assert_eq!(variant, ModelVariant::FP8Bonsai8B);
+    }
+
+    #[test]
+    fn detect_fp8_e5m2_1_7b_by_tensor_type() {
+        let cfg = Qwen3Config::bonsai_1_7b();
+        let variant = ModelVariant::from_config_and_sample_tensor_type(
+            &cfg,
+            oxibonsai_core::GgufTensorType::F8_E5M2,
+        );
+        assert_eq!(variant, ModelVariant::FP8Bonsai1_7B);
+    }
+
+    #[test]
+    fn fp8_variant_param_counts_match_bonsai() {
+        assert_eq!(
+            ModelVariant::FP8Bonsai8B.param_count(),
+            ModelVariant::Bonsai8B.param_count()
+        );
+        assert_eq!(
+            ModelVariant::FP8Bonsai4B.param_count(),
+            ModelVariant::Bonsai4B.param_count()
+        );
+        assert_eq!(
+            ModelVariant::FP8Bonsai1_7B.param_count(),
+            ModelVariant::Bonsai1_7B.param_count()
+        );
+    }
+
+    #[test]
+    fn fp8_variant_names() {
+        assert_eq!(ModelVariant::FP8Bonsai8B.name(), "FP8-Bonsai-8B");
+        assert_eq!(ModelVariant::FP8Bonsai4B.name(), "FP8-Bonsai-4B");
+        assert_eq!(ModelVariant::FP8Bonsai1_7B.name(), "FP8-Bonsai-1.7B");
+    }
+
+    #[test]
+    fn fp8_variants_are_known() {
+        assert!(ModelVariant::FP8Bonsai8B.is_known());
+        assert!(ModelVariant::FP8Bonsai4B.is_known());
+        assert!(ModelVariant::FP8Bonsai1_7B.is_known());
     }
 }

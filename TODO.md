@@ -1,7 +1,7 @@
 # OxiBonsai TODO
 
 > Pure Rust 1-bit LLM inference engine for PrismML Bonsai models
-> 412 source files, ~152,615 lines of Rust code, 3,946 tests passing across workspace — verified 2026-05-03 (0.1.4 + Phase 15)
+> 420+ source files, ~154,000+ lines of Rust code, 3,976+ tests passing across workspace — verified 2026-05-05 (0.1.4 + Phase 15.x)
 
 ## Phase Status
 
@@ -24,6 +24,10 @@
 | Phase 13.y: Ternary LM head on GPU | ✅ Complete | All 7 `OutputWeight::Ternary` guard sites closed (4 Metal + 3 CUDA); Metal ~54.5 tok/s avg on Ternary-Bonsai-1.7B |
 | Phase 14: Runtime controllers (0.1.4) | ✅ Complete | `KvCachePolicy`, `AdaptiveLookahead`, `RequestRateTracker`, `RequestId`, expanded Prometheus surface |
 | Phase 15: Advanced Inference Capabilities | ✅ Complete | FP8 quantization (E4M3/E5M2), FP8 kernels + `Fp8Kernel` trait, `AllowList`/`Sequence`/`LengthConstraint`, BNF grammar engine + Earley-based `GrammarConstraint` |
+| Phase 15.x: FP8 SIMD + Grammar Cache | ✅ Complete | AVX2/AVX-512/NEON gather-based FP8 kernels; parallel FP8; LUT decode tables; Earley `allowed_tokens` LRU cache (O(1) on repeated state) |
+| Phase 16: FP8 Export + Criterion Benchmarks | ✅ Complete | `ExportFormat::FP8E4M3/E5M2` in `oxibonsai-model`; 4 export tests; `bench_fp8_kernels` in `kernel_benchmarks.rs`; 14 benchmark cases |
+| Phase 16A: FP8 Model Layers + Integration | ✅ Complete | `LinearFP8E4M3<'a>` + `LinearFP8E5M2<'a>` in `oxibonsai-model`; `OutputWeight::FP8E4M3/E5M2` variants; `ModelVariant::FP8Bonsai8B/4B/1_7B` with spec builders; FP8 block loaders in `weight_loaders.rs`; GPU paths return graceful Err; 6 integration tests |
+| Phase 16B: Token-byte precomputation + first-byte index | ✅ Complete | `GrammarConstraint` precomputes all token byte sequences at construction; `first_byte_index: Box<[Vec<u32>; 256]>` eliminates per-step decode calls; `empty_token_ids` for EOS/special tokens; `vocab_size()` + `index_memory_bytes()` accessors; 5 new integration tests |
 
 ## Phase 4 — Complete
 
@@ -81,12 +85,20 @@
 - [x] **Model registry** -- `ModelVariant`, `ModelSpec`, `CapabilityProfile`; auto-detection from config dimensions
 - [x] **Comprehensive integration tests** -- `tests/full_pipeline_tests.rs` (25 tests), `tests/quantization_pipeline_tests.rs` (10 tests), `tests/server_integration_tests.rs` (8 tests)
 
+## Phase 16 — FP8 Full Stack + Grammar Acceleration
+
+- [x] **FP8 export formats** — `ExportFormat::FP8E4M3/E5M2` in `oxibonsai-model/src/export.rs`; size estimate 34/32 bytes/weight using `div_ceil`; GGUF type ID 43/44 mapping; zero-copy `repr(C)` block serialization via raw pointer cast; 4 tests (roundtrip E4M3, roundtrip E5M2, size estimate, FP32 exceptions)
+- [x] **FP8 kernel criterion benchmarks** — `bench_fp8_kernels` in `benches/kernel_benchmarks.rs`; 4 benchmark groups: dequant 8192w, GEMV 128×256, GEMV 512×512 (sequential vs parallel), GEMV dispatch sweep 32/256/1024 rows; throughput reporting in element-ops/sec; E4M3 and E5M2 coverage; scalar vs simd_auto vs rayon-parallel
+- [x] **Token-byte precomputation + first-byte index (Phase 16B)** — `GrammarConstraint` now precomputes byte sequences for all vocab tokens at construction time; `first_byte_index: Box<[Vec<u32>; 256]>` accelerates `allowed_tokens` by skipping non-first-byte tokens without calling the decode fn or checking HashSet; `empty_token_ids` handles EOS/special tokens; `vocab_size()` accessor; `index_memory_bytes()` for observability; `advance()` uses precomputed `token_bytes` (no decode call per token); combined with Phase 15.x state cache for O(1) repeated-state hits; 5 new integration tests in `tests/grammar_cache_tests.rs` + 8 new unit tests in `src/grammar/constraint.rs`
+
 ## Phase 15 — Advanced Inference Capabilities
 
 - [x] **FP8 E4M3FN quantization** — `BlockFP8E4M3` (32 weights × 1 FP8 byte + FP16 scale = 34 bytes/block); `fp8_e4m3_encode/decode` with bit-exact RNE rounding, saturation to ±448, NaN=0x7f; GGUF type ID 43 (PrismML extension); 56 tests in `oxibonsai-core`
 - [x] **FP8 E5M2 quantization** — `BlockFP8E5M2` (same 34 bytes/block); `fp8_e5m2_encode/decode` with ±infinity support; GGUF type ID 44 (PrismML extension)
 - [x] **FP8 GGUF surface** — `GgufTensorType::F8_E4M3/F8_E5M2`, `TensorType::F8_E4M3/F8_E5M2`, `ExtendedQuantType::F8_E4M3/F8_E5M2` (8.5 bits/weight), `is_fp8()` predicate
 - [x] **FP8 reference kernels** — `dequant_fp8_e4m3/e5m2`, `gemv_fp8_e4m3/e5m2`, `gemm_fp8_e4m3/e5m2` (scalar reference); `Fp8Kernel` trait; `impl Fp8Kernel for KernelDispatcher`; 349 tests in `oxibonsai-kernels`
+- [x] **FP8 SIMD kernels (Phase 15.x)** — `fp8_lut.rs` (OnceLock 256-entry decode LUTs); `simd_fp8_avx2.rs` (gather-based 8-wide, `_mm256_i32gather_ps`); `simd_fp8_avx512.rs` (16-wide, `_mm512_i32gather_ps`); `simd_fp8_neon.rs` (LUT + `vfmaq_f32`, 4-wide); tier-aware dispatch in `KernelDispatcher`; parallel FP8 GEMV/GEMM in `parallel.rs`; 18 parity tests in `tests/fp8_simd_parity.rs`
+- [x] **Earley `allowed_tokens` cache (Phase 15.x)** — `grammar/cache.rs` `AllowedTokensCache` (LRU, 256-entry default, `Arc<[bool]>` masks); `state_hash()` on `EarleyRecognizer` (sorted chart items → `DefaultHasher`); `Mutex<AllowedTokensCache>` in `GrammarConstraint`; `with_cache_capacity` constructor; `cache_stats()` for observability; 12 integration tests in `tests/grammar_cache_tests.rs`
 - [x] **`AllowListConstraint`** — finite-set token-sequence constraint for multiple-choice output; candidate activation bitmask with prefix tracking; 32 tests in `oxibonsai-runtime`
 - [x] **`SequenceConstraint`** — exact token-sequence forcing constraint; unconstrained after sequence consumed
 - [x] **`LengthConstraint`** — hard `[min_len, max_len]` bounds with optional stop token enforcement

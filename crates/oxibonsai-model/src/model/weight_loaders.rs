@@ -9,7 +9,7 @@ use oxibonsai_core::tensor::{BlockQ1_0G128, QK1_0_G128};
 
 use crate::block::TransformerBlock;
 use crate::error::{ModelError, ModelResult};
-use crate::layers::linear::{Linear1Bit, LinearTernary};
+use crate::layers::linear::{Linear1Bit, LinearFP8E4M3, LinearFP8E5M2, LinearTernary};
 use crate::layers::rms_norm::RmsNorm;
 
 use super::types::OutputWeight;
@@ -107,6 +107,30 @@ pub(super) fn load_ternary_embedding(gguf: &GgufFile<'_>, name: &str) -> ModelRe
     Ok(out)
 }
 
+/// Load FP8 E4M3FN weight blocks from GGUF (zero-copy).
+///
+/// Returns a borrowed slice of `BlockFP8E4M3` pointing directly into the
+/// memory-mapped GGUF data. The lifetime is tied to the `GgufFile`.
+pub(super) fn load_fp8_e4m3_blocks<'a>(
+    gguf: &'a GgufFile<'a>,
+    name: &str,
+) -> ModelResult<&'a [oxibonsai_core::BlockFP8E4M3]> {
+    let data = gguf.tensor_data(name).map_err(ModelError::Core)?;
+    oxibonsai_core::BlockFP8E4M3::slice_from_bytes(data).map_err(ModelError::Core)
+}
+
+/// Load FP8 E5M2 weight blocks from GGUF (zero-copy).
+///
+/// Returns a borrowed slice of `BlockFP8E5M2` pointing directly into the
+/// memory-mapped GGUF data. The lifetime is tied to the `GgufFile`.
+pub(super) fn load_fp8_e5m2_blocks<'a>(
+    gguf: &'a GgufFile<'a>,
+    name: &str,
+) -> ModelResult<&'a [oxibonsai_core::BlockFP8E5M2]> {
+    let data = gguf.tensor_data(name).map_err(ModelError::Core)?;
+    oxibonsai_core::BlockFP8E5M2::slice_from_bytes(data).map_err(ModelError::Core)
+}
+
 /// Load a single Transformer block's weights from GGUF.
 ///
 /// Automatically detects whether the model uses Q1\_0\_g128 (1-bit) or
@@ -132,6 +156,8 @@ pub(super) fn load_transformer_block<'a>(
         .require(&sample_name)
         .map_err(ModelError::Core)?;
     let is_ternary = sample_info.tensor_type == GgufTensorType::TQ2_0_g128;
+    let is_fp8_e4m3 = sample_info.tensor_type == GgufTensorType::F8_E4M3;
+    let is_fp8_e5m2 = sample_info.tensor_type == GgufTensorType::F8_E5M2;
 
     // RMSNorm weights (always FP32).
     let attn_norm_w = load_f32_tensor(gguf, &blk(tensor_names::ATTN_NORM))?;
@@ -167,6 +193,66 @@ pub(super) fn load_transformer_block<'a>(
             h,
         );
         tracing::trace!(layer = layer_idx, "loaded ternary transformer block");
+        Ok(block)
+    } else if is_fp8_e4m3 {
+        // FP8 E4M3FN path.
+        let q_blocks = load_fp8_e4m3_blocks(gguf, &blk(tensor_names::ATTN_Q))?;
+        let k_blocks = load_fp8_e4m3_blocks(gguf, &blk(tensor_names::ATTN_K))?;
+        let v_blocks = load_fp8_e4m3_blocks(gguf, &blk(tensor_names::ATTN_V))?;
+        let o_blocks = load_fp8_e4m3_blocks(gguf, &blk(tensor_names::ATTN_OUTPUT))?;
+        let gate_blocks = load_fp8_e4m3_blocks(gguf, &blk(tensor_names::FFN_GATE))?;
+        let up_blocks = load_fp8_e4m3_blocks(gguf, &blk(tensor_names::FFN_UP))?;
+        let down_blocks = load_fp8_e4m3_blocks(gguf, &blk(tensor_names::FFN_DOWN))?;
+
+        let block = TransformerBlock::new(
+            layer_idx,
+            RmsNorm::new(attn_norm_w, config.rms_norm_eps),
+            LinearFP8E4M3::new(q_blocks, nq * hd, h, kernel.clone())?.into(),
+            LinearFP8E4M3::new(k_blocks, nkv * hd, h, kernel.clone())?.into(),
+            LinearFP8E4M3::new(v_blocks, nkv * hd, h, kernel.clone())?.into(),
+            LinearFP8E4M3::new(o_blocks, h, nq * hd, kernel.clone())?.into(),
+            RmsNorm::new(q_norm_w, config.rms_norm_eps),
+            RmsNorm::new(k_norm_w, config.rms_norm_eps),
+            RmsNorm::new(ffn_norm_w, config.rms_norm_eps),
+            LinearFP8E4M3::new(gate_blocks, inter, h, kernel.clone())?.into(),
+            LinearFP8E4M3::new(up_blocks, inter, h, kernel.clone())?.into(),
+            LinearFP8E4M3::new(down_blocks, h, inter, kernel.clone())?.into(),
+            nq,
+            nkv,
+            hd,
+            h,
+        );
+        tracing::trace!(layer = layer_idx, "loaded FP8 E4M3FN transformer block");
+        Ok(block)
+    } else if is_fp8_e5m2 {
+        // FP8 E5M2 path.
+        let q_blocks = load_fp8_e5m2_blocks(gguf, &blk(tensor_names::ATTN_Q))?;
+        let k_blocks = load_fp8_e5m2_blocks(gguf, &blk(tensor_names::ATTN_K))?;
+        let v_blocks = load_fp8_e5m2_blocks(gguf, &blk(tensor_names::ATTN_V))?;
+        let o_blocks = load_fp8_e5m2_blocks(gguf, &blk(tensor_names::ATTN_OUTPUT))?;
+        let gate_blocks = load_fp8_e5m2_blocks(gguf, &blk(tensor_names::FFN_GATE))?;
+        let up_blocks = load_fp8_e5m2_blocks(gguf, &blk(tensor_names::FFN_UP))?;
+        let down_blocks = load_fp8_e5m2_blocks(gguf, &blk(tensor_names::FFN_DOWN))?;
+
+        let block = TransformerBlock::new(
+            layer_idx,
+            RmsNorm::new(attn_norm_w, config.rms_norm_eps),
+            LinearFP8E5M2::new(q_blocks, nq * hd, h, kernel.clone())?.into(),
+            LinearFP8E5M2::new(k_blocks, nkv * hd, h, kernel.clone())?.into(),
+            LinearFP8E5M2::new(v_blocks, nkv * hd, h, kernel.clone())?.into(),
+            LinearFP8E5M2::new(o_blocks, h, nq * hd, kernel.clone())?.into(),
+            RmsNorm::new(q_norm_w, config.rms_norm_eps),
+            RmsNorm::new(k_norm_w, config.rms_norm_eps),
+            RmsNorm::new(ffn_norm_w, config.rms_norm_eps),
+            LinearFP8E5M2::new(gate_blocks, inter, h, kernel.clone())?.into(),
+            LinearFP8E5M2::new(up_blocks, inter, h, kernel.clone())?.into(),
+            LinearFP8E5M2::new(down_blocks, h, inter, kernel.clone())?.into(),
+            nq,
+            nkv,
+            hd,
+            h,
+        );
+        tracing::trace!(layer = layer_idx, "loaded FP8 E5M2 transformer block");
         Ok(block)
     } else {
         // Q1_0_g128 (1-bit) path.
@@ -236,6 +322,16 @@ pub(super) fn load_output_weight<'a>(
             let blocks = load_ternary_blocks(gguf, tensor_names::OUTPUT)?;
             let linear = LinearTernary::new(blocks, out_features, in_features, kernel.clone())?;
             Ok(OutputWeight::Ternary(linear))
+        }
+        GgufTensorType::F8_E4M3 => {
+            let blocks = load_fp8_e4m3_blocks(gguf, tensor_names::OUTPUT)?;
+            let linear = LinearFP8E4M3::new(blocks, out_features, in_features, kernel.clone())?;
+            Ok(OutputWeight::FP8E4M3(linear))
+        }
+        GgufTensorType::F8_E5M2 => {
+            let blocks = load_fp8_e5m2_blocks(gguf, tensor_names::OUTPUT)?;
+            let linear = LinearFP8E5M2::new(blocks, out_features, in_features, kernel.clone())?;
+            Ok(OutputWeight::FP8E5M2(linear))
         }
         GgufTensorType::F32 | GgufTensorType::F16 => {
             let weights = load_f32_tensor(gguf, tensor_names::OUTPUT)?;

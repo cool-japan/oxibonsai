@@ -288,11 +288,88 @@ pub fn ternary_bonsai_1_7b_spec() -> ModelSpec {
     }
 }
 
-/// Return a static slice containing specs for all six known variants,
-/// ordered from largest (8B) to smallest (1.7B), 1-bit variants first then ternary.
+/// Build the [`ModelSpec`] for FP8-Bonsai-8B (Qwen3-8B architecture, FP8 weights).
+///
+/// Architecture is identical to Bonsai-8B; only the weight storage format differs (F8_E4M3 or F8_E5M2).
+pub fn fp8_bonsai_8b_spec() -> ModelSpec {
+    let config = Qwen3Config::bonsai_8b();
+    let param_count: u64 = 8_030_000_000;
+
+    // FP8: 1 byte/weight + 2 bytes FP16 scale per 32-weight block ≈ 1.0625 bytes/weight.
+    // Transformer weights: ~7.88B × 1.0625 ≈ 8.37 GB
+    // Embeddings (FP16): 151936 × 4096 × 2 ≈ 1.24 GB
+    // Approximate total: ~8.5 GB
+    let weights_size_bytes: u64 = 8_500_000_000;
+    let kv_cache_4k_bytes: u64 = kv_cache_size_bytes(&config, 4096);
+    let min_ram_bytes = weights_size_bytes + kv_cache_4k_bytes + 64 * 1024 * 1024;
+
+    ModelSpec {
+        name: "FP8-Bonsai-8B",
+        variant: ModelVariant::FP8Bonsai8B,
+        config,
+        param_count,
+        weights_size_bytes,
+        kv_cache_4k_bytes,
+        min_ram_bytes,
+        description: "FP8-Bonsai-8B uses the same Qwen3-8B architecture as Bonsai-8B, \
+            but stores transformer weights in FP8 format (E4M3FN or E5M2). \
+            Approximately 1.0625 bytes/weight — higher precision than 1-bit or ternary, \
+            closer to FP16 quality with half the storage.",
+    }
+}
+
+/// Build the [`ModelSpec`] for FP8-Bonsai-4B (Qwen3-4B architecture, FP8 weights).
+pub fn fp8_bonsai_4b_spec() -> ModelSpec {
+    let config = Qwen3Config::bonsai_4b();
+    let param_count: u64 = 4_020_000_000;
+
+    // ~3.63B transformer params × 1.0625 ≈ 3.86 GB + embeddings 0.78 GB → ~5.0 GB
+    let weights_size_bytes: u64 = 5_000_000_000;
+    let kv_cache_4k_bytes: u64 = kv_cache_size_bytes(&config, 4096);
+    let min_ram_bytes = weights_size_bytes + kv_cache_4k_bytes + 48 * 1024 * 1024;
+
+    ModelSpec {
+        name: "FP8-Bonsai-4B",
+        variant: ModelVariant::FP8Bonsai4B,
+        config,
+        param_count,
+        weights_size_bytes,
+        kv_cache_4k_bytes,
+        min_ram_bytes,
+        description: "FP8-Bonsai-4B uses the same Qwen3-4B architecture as Bonsai-4B, \
+            but stores transformer weights in FP8 format (E4M3FN or E5M2).",
+    }
+}
+
+/// Build the [`ModelSpec`] for FP8-Bonsai-1.7B (Qwen3-1.7B architecture, FP8 weights).
+pub fn fp8_bonsai_1_7b_spec() -> ModelSpec {
+    let config = Qwen3Config::bonsai_1_7b();
+    let param_count: u64 = 1_720_000_000;
+
+    // ~1.49B transformer params × 1.0625 ≈ 1.58 GB + embeddings 0.47 GB → ~2.3 GB
+    let weights_size_bytes: u64 = 2_300_000_000;
+    let kv_cache_4k_bytes: u64 = kv_cache_size_bytes(&config, 4096);
+    let min_ram_bytes = weights_size_bytes + kv_cache_4k_bytes + 32 * 1024 * 1024;
+
+    ModelSpec {
+        name: "FP8-Bonsai-1.7B",
+        variant: ModelVariant::FP8Bonsai1_7B,
+        config,
+        param_count,
+        weights_size_bytes,
+        kv_cache_4k_bytes,
+        min_ram_bytes,
+        description: "FP8-Bonsai-1.7B uses the same Qwen3-1.7B architecture as Bonsai-1.7B, \
+            but stores transformer weights in FP8 format (E4M3FN or E5M2). \
+            Designed for resource-constrained environments where FP8 precision is preferred.",
+    }
+}
+
+/// Return a static slice containing specs for all nine known variants,
+/// ordered from largest (8B) to smallest (1.7B): 1-bit, ternary, then FP8.
 pub fn all_specs() -> &'static [ModelSpec] {
     use std::sync::OnceLock;
-    static SPECS: OnceLock<[ModelSpec; 6]> = OnceLock::new();
+    static SPECS: OnceLock<[ModelSpec; 9]> = OnceLock::new();
     SPECS.get_or_init(|| {
         [
             bonsai_8b_spec(),
@@ -301,6 +378,9 @@ pub fn all_specs() -> &'static [ModelSpec] {
             ternary_bonsai_8b_spec(),
             ternary_bonsai_4b_spec(),
             ternary_bonsai_1_7b_spec(),
+            fp8_bonsai_8b_spec(),
+            fp8_bonsai_4b_spec(),
+            fp8_bonsai_1_7b_spec(),
         ]
     })
 }
@@ -476,6 +556,54 @@ pub fn capability_profile(v: ModelVariant) -> CapabilityProfile {
                 "WASM browser deployment",
             ],
         },
+        ModelVariant::FP8Bonsai8B => CapabilityProfile {
+            max_context_len: 65536,
+            supports_system_prompt: true,
+            supports_streaming: true,
+            recommended_temperature: 0.7,
+            recommended_top_p: 0.9,
+            languages: LANGUAGES,
+            use_cases: &[
+                "Long-document summarisation (FP8 weights)",
+                "Complex multi-turn dialogue",
+                "Code generation and debugging",
+                "Structured data extraction",
+                "Creative writing and story-telling",
+                "Multilingual translation",
+                "Retrieval-augmented generation (RAG)",
+            ],
+        },
+        ModelVariant::FP8Bonsai4B => CapabilityProfile {
+            max_context_len: 65536,
+            supports_system_prompt: true,
+            supports_streaming: true,
+            recommended_temperature: 0.72,
+            recommended_top_p: 0.9,
+            languages: LANGUAGES,
+            use_cases: &[
+                "Short-to-medium document summarisation (FP8 weights)",
+                "Conversational chat assistants",
+                "Code completion and review",
+                "Data extraction and classification",
+                "On-device inference with moderate hardware",
+            ],
+        },
+        ModelVariant::FP8Bonsai1_7B => CapabilityProfile {
+            max_context_len: 65536,
+            supports_system_prompt: true,
+            supports_streaming: true,
+            recommended_temperature: 0.75,
+            recommended_top_p: 0.85,
+            languages: LANGUAGES,
+            use_cases: &[
+                "Edge / IoT on-device inference (FP8 weights)",
+                "Low-latency chatbot responses",
+                "Simple Q&A over short documents",
+                "Keyword extraction",
+                "Fast text classification",
+                "WASM browser deployment",
+            ],
+        },
         ModelVariant::Custom => CapabilityProfile {
             max_context_len: 65536,
             supports_system_prompt: true,
@@ -496,7 +624,7 @@ mod tests {
 
     // ── helper ───────────────────────────────────────────────────────────────
 
-    fn all_known_variants() -> [ModelVariant; 6] {
+    fn all_known_variants() -> [ModelVariant; 9] {
         [
             ModelVariant::Bonsai8B,
             ModelVariant::Bonsai4B,
@@ -504,6 +632,9 @@ mod tests {
             ModelVariant::TernaryBonsai8B,
             ModelVariant::TernaryBonsai4B,
             ModelVariant::TernaryBonsai1_7B,
+            ModelVariant::FP8Bonsai8B,
+            ModelVariant::FP8Bonsai4B,
+            ModelVariant::FP8Bonsai1_7B,
         ]
     }
 
@@ -682,8 +813,8 @@ mod tests {
     // ── all_specs / spec_for_variant ─────────────────────────────────────────
 
     #[test]
-    fn all_specs_returns_six_entries() {
-        assert_eq!(all_specs().len(), 6);
+    fn all_specs_returns_nine_entries() {
+        assert_eq!(all_specs().len(), 9);
     }
 
     #[test]

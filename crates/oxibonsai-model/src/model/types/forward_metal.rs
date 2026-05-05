@@ -286,6 +286,9 @@ impl<'a> BonsaiModel<'a> {
         let lm_head_linear = match &self.output_weight {
             OutputWeight::OneBit(linear) => linear,
             OutputWeight::Ternary(_) => unreachable!("handled above"),
+            OutputWeight::FP8E4M3(_) | OutputWeight::FP8E5M2(_) => {
+                return Err("FP8 GPU inference not yet supported; use CPU path".into());
+            }
             OutputWeight::Fp32 { .. } => {
                 return Err("FP32 LM head not supported on fused GPU path".into());
             }
@@ -426,6 +429,9 @@ impl<'a> BonsaiModel<'a> {
             OutputWeight::Ternary(_) => {
                 // Ternary batch prefill (TQ2_0_g128 weights end-to-end).
                 return self.try_metal_prefill_with_lm_head_ternary(token_ids, pos_start);
+            }
+            OutputWeight::FP8E4M3(_) | OutputWeight::FP8E5M2(_) => {
+                return Err("FP8 GPU inference not yet supported; use CPU path".into());
             }
             OutputWeight::Fp32 { .. } => {
                 return Err("FP32 LM head not supported on GPU prefill path".into());
@@ -597,6 +603,9 @@ impl<'a> BonsaiModel<'a> {
             OutputWeight::Ternary(_) => {
                 // Ternary batch prefill verify (TQ2_0_g128 weights end-to-end).
                 return self.try_metal_prefill_verify_ternary_path(token_ids, pos_start);
+            }
+            OutputWeight::FP8E4M3(_) | OutputWeight::FP8E5M2(_) => {
+                return Err("FP8 GPU inference not yet supported; use CPU path".into());
             }
             OutputWeight::Fp32 { .. } => {
                 return Err("FP32 LM head not supported on GPU prefill verify path".into());
@@ -783,6 +792,9 @@ impl<'a> BonsaiModel<'a> {
         let lm_head_out_features = match &self.output_weight {
             OutputWeight::OneBit(linear) => linear.out_features(),
             OutputWeight::Ternary(_) => unreachable!("handled above"),
+            OutputWeight::FP8E4M3(_) | OutputWeight::FP8E5M2(_) => {
+                return Err("FP8 GPU inference not yet supported; use CPU path".into());
+            }
             OutputWeight::Fp32 { .. } => {
                 return Err("FP32 LM head not supported on greedy GPU path".into());
             }
