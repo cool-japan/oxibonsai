@@ -1,10 +1,11 @@
-//! HuggingFace `tokenizer.json` format parser (BPE models).
+//! HuggingFace `tokenizer.json` format parser (BPE and Unigram models).
 //!
 //! This module provides a faithful, dependency-free parser for the tokenizer
 //! JSON format emitted by the HuggingFace `tokenizers` library.  It supports:
 //!
 //! - BPE `model` with `vocab` and `merges` (both string `"a b"` form and
 //!   array `["a","b"]` form)
+//! - Unigram `model` with `vocab` as `[[token, score], ...]` and `unk_id`
 //! - `added_tokens` (marked special if `special == true`)
 //! - `pre_tokenizer` type detection (GPT-2 ByteLevel vs. Whitespace)
 //! - `decoder` type detection (ByteLevel is the default for modern models)
@@ -118,6 +119,31 @@ pub fn bytes_to_unicode_string(s: &str) -> String {
     out
 }
 
+// ── HfModelType ──────────────────────────────────────────────────────────────
+
+/// Model type discriminator parsed from `model.type` in a HuggingFace
+/// `tokenizer.json` file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HfModelType {
+    /// BPE (Byte-Pair Encoding) model — uses `vocab` (object) + `merges`.
+    Bpe,
+    /// Unigram language model — uses `vocab` as `[[token, score], ...]` and
+    /// `unk_id`.
+    Unigram,
+    /// Any other (currently unrecognised) model type.  Stored for diagnostics.
+    Other(String),
+}
+
+impl HfModelType {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "BPE" => Self::Bpe,
+            "Unigram" => Self::Unigram,
+            other => Self::Other(other.to_owned()),
+        }
+    }
+}
+
 // ── HfTokenizerJson ──────────────────────────────────────────────────────────
 
 /// Parsed representation of a HuggingFace `tokenizer.json` file.
@@ -126,12 +152,28 @@ pub fn bytes_to_unicode_string(s: &str) -> String {
 /// tricks beyond what `serde_json` already handles.
 #[derive(Debug, Clone)]
 pub struct HfTokenizerJson {
+    /// Discriminator for the model type declared in `model.type`.
+    pub model_type: HfModelType,
     /// Token string → integer ID (includes added/special tokens).
+    ///
+    /// For BPE models this is populated from `model.vocab` (an object).
+    /// For Unigram models this is derived from the ordered `model.vocab` array
+    /// so that decode (ID → string) continues to work via the standard path.
     pub vocab: HashMap<String, u32>,
     /// Ordered list of BPE merge pairs `(left, right)`.
     ///
     /// Order defines priority — first pair is highest priority.
+    /// Always empty for Unigram models.
     pub merges: Vec<(String, String)>,
+    /// For Unigram models: ordered `(token, log_prob)` pairs from `model.vocab`.
+    ///
+    /// The position of each pair in the vector determines its token ID.
+    /// `None` for BPE models.
+    pub unigram_vocab: Option<Vec<(String, f64)>>,
+    /// For Unigram models: the UNK token ID from `model.unk_id`.
+    ///
+    /// `None` for BPE models.
+    pub unigram_unk_id: Option<u32>,
     /// Tokens flagged as `special == true` in `added_tokens`.
     pub special_tokens: HashMap<String, u32>,
     /// BOS token string, if present.
@@ -156,54 +198,26 @@ impl HfTokenizerJson {
             .get("model")
             .ok_or_else(|| TokenizerError::HfFormat("missing `model` field".to_owned()))?;
 
-        // ── 1. vocab ────────────────────────────────────────────────────────
-        let vocab_val = model
-            .get("vocab")
-            .ok_or_else(|| TokenizerError::HfFormat("missing `model.vocab` field".to_owned()))?;
-        let mut vocab: HashMap<String, u32> = HashMap::new();
-        match vocab_val {
-            Value::Object(map) => {
-                for (token, id_val) in map {
-                    let id = id_val.as_u64().ok_or_else(|| {
-                        TokenizerError::HfFormat(format!(
-                            "vocab entry {token:?} has non-integer id"
-                        ))
-                    })? as u32;
-                    vocab.insert(token.clone(), id);
-                }
-            }
-            _ => {
-                return Err(TokenizerError::HfFormat(
-                    "`model.vocab` must be an object".to_owned(),
-                ));
-            }
-        }
+        // ── 0. model type ────────────────────────────────────────────────────
+        let model_type = model
+            .get("type")
+            .and_then(Value::as_str)
+            .map(HfModelType::from_str)
+            .unwrap_or(HfModelType::Bpe);
 
-        // ── 2. merges ───────────────────────────────────────────────────────
-        // HF supports two shapes:
-        //   "merges": ["a b", "c d"]
-        //   "merges": [["a","b"], ["c","d"]]
-        let merges_val = model
-            .get("merges")
-            .ok_or_else(|| TokenizerError::HfFormat("missing `model.merges` field".to_owned()))?;
-        let mut merges: Vec<(String, String)> = Vec::new();
-        match merges_val {
-            Value::Array(list) => {
-                for (idx, entry) in list.iter().enumerate() {
-                    let pair = parse_merge_entry(entry).ok_or_else(|| {
-                        TokenizerError::HfFormat(format!("malformed merge entry #{idx}: {entry:?}"))
-                    })?;
-                    merges.push(pair);
-                }
+        // ── 1. vocab + merges (dispatched by model type) ─────────────────────
+        let (mut vocab, merges, unigram_vocab, unigram_unk_id) = match &model_type {
+            HfModelType::Unigram => {
+                let (v, m, uv, uid) = parse_unigram_model(model)?;
+                (v, m, uv, uid)
             }
-            _ => {
-                return Err(TokenizerError::HfFormat(
-                    "`model.merges` must be an array".to_owned(),
-                ));
+            HfModelType::Bpe | HfModelType::Other(_) => {
+                let (v, m) = parse_bpe_model(model)?;
+                (v, m, None, None)
             }
-        }
+        };
 
-        // ── 3. added_tokens → special_tokens ───────────────────────────────
+        // ── 2. added_tokens → special_tokens ────────────────────────────────
         let mut special_tokens: HashMap<String, u32> = HashMap::new();
         if let Some(added) = root.get("added_tokens").and_then(Value::as_array) {
             for token_obj in added {
@@ -230,7 +244,7 @@ impl HfTokenizerJson {
             }
         }
 
-        // ── 4. BOS/EOS/UNK/PAD hints ───────────────────────────────────────
+        // ── 3. BOS/EOS/UNK/PAD hints ────────────────────────────────────────
         let bos_token = extract_special_token(&root, "bos_token");
         let eos_token = extract_special_token(&root, "eos_token");
         let unk_token = extract_special_token(&root, "unk_token").or_else(|| {
@@ -241,12 +255,15 @@ impl HfTokenizerJson {
         });
         let pad_token = extract_special_token(&root, "pad_token");
 
-        // ── 5. ByteLevel detection ─────────────────────────────────────────
+        // ── 4. ByteLevel detection ───────────────────────────────────────────
         let byte_level = detect_byte_level(&root);
 
         Ok(Self {
+            model_type,
             vocab,
             merges,
+            unigram_vocab,
+            unigram_unk_id,
             special_tokens,
             bos_token,
             eos_token,
@@ -257,8 +274,12 @@ impl HfTokenizerJson {
     }
 
     /// Convert the parsed document into a ready-to-use [`OxiTokenizer`].
+    ///
+    /// For `"BPE"` (and unrecognised) model types the existing BPE path is
+    /// used.  For `"Unigram"` a [`crate::unigram::UnigramVocab`] is built and
+    /// [`OxiTokenizer::with_unigram`] is called.
     pub fn into_tokenizer(self) -> TokenizerResult<OxiTokenizer> {
-        // Build the vocabulary.
+        // Build the shared vocabulary used for decode in all paths.
         let mut vocabulary = Vocabulary::new();
         for (token, id) in &self.vocab {
             if self.special_tokens.contains_key(token) {
@@ -268,24 +289,7 @@ impl HfTokenizerJson {
             }
         }
 
-        // Build the merge table.  For each (a, b) in priority order we need
-        // the merged token's ID — by HF convention this is `vocab[a ++ b]`.
-        let mut merges = BpeMerges::new();
-        for (a, b) in &self.merges {
-            let merged = format!("{a}{b}");
-            let merged_id = match self.vocab.get(&merged) {
-                Some(&id) => id,
-                None => {
-                    // Some HF dumps omit the final merged token from the vocab
-                    // (e.g. when the merge never actually applies in the
-                    // training corpus).  Skip silently rather than error.
-                    continue;
-                }
-            };
-            merges.add_merge(a, b, merged_id);
-        }
-
-        // Build the config.
+        // Resolve BOS/EOS/UNK/PAD IDs.
         let bos_id = self
             .bos_token
             .as_ref()
@@ -294,7 +298,7 @@ impl HfTokenizerJson {
             .eos_token
             .as_ref()
             .and_then(|t| self.vocab.get(t).copied());
-        let unk_id = self
+        let unk_id_from_token = self
             .unk_token
             .as_ref()
             .and_then(|t| self.vocab.get(t).copied());
@@ -313,18 +317,173 @@ impl HfTokenizerJson {
         if let Some(id) = eos_id {
             config.eos_token_id = id;
         }
-        if let Some(id) = unk_id {
+        if let Some(id) = unk_id_from_token {
             config.unk_token_id = id;
         }
         if let Some(id) = pad_id {
             config.pad_token_id = id;
         }
 
-        Ok(OxiTokenizer::new(vocabulary, merges, config))
+        match self.model_type {
+            HfModelType::Bpe | HfModelType::Other(_) => {
+                // Build the merge table.  For each (a, b) in priority order
+                // we need the merged token's ID — by HF convention this is
+                // `vocab[a ++ b]`.
+                let mut merges = BpeMerges::new();
+                for (a, b) in &self.merges {
+                    let merged = format!("{a}{b}");
+                    let merged_id = match self.vocab.get(&merged) {
+                        Some(&id) => id,
+                        None => {
+                            // Some HF dumps omit the final merged token from
+                            // the vocab (e.g. when the merge never actually
+                            // applies in the training corpus).  Skip silently.
+                            continue;
+                        }
+                    };
+                    merges.add_merge(a, b, merged_id);
+                }
+                Ok(OxiTokenizer::new(vocabulary, merges, config))
+            }
+            HfModelType::Unigram => {
+                let entries = self.unigram_vocab.ok_or_else(|| {
+                    TokenizerError::HfFormat(
+                        "Unigram model requires `model.vocab` array".to_owned(),
+                    )
+                })?;
+                // Prefer unk_id from `model.unk_id`; fall back to the id
+                // resolved from the `unk_token` string.
+                let effective_unk_id = self
+                    .unigram_unk_id
+                    .unwrap_or(config.unk_token_id);
+                let unigram_vocab = crate::unigram::UnigramVocab::new(entries, effective_unk_id)
+                    .map_err(|e| {
+                        TokenizerError::HfFormat(format!("invalid Unigram vocab: {e}"))
+                    })?;
+                Ok(OxiTokenizer::with_unigram(vocabulary, unigram_vocab, config))
+            }
+        }
     }
 }
 
 // ── Private parse helpers ────────────────────────────────────────────────────
+
+/// Parse a BPE `model` section: returns `(vocab_map, merges)`.
+#[allow(clippy::type_complexity)]
+fn parse_bpe_model(
+    model: &Value,
+) -> TokenizerResult<(HashMap<String, u32>, Vec<(String, String)>)> {
+    // vocab: required, must be an object.
+    let vocab_val = model
+        .get("vocab")
+        .ok_or_else(|| TokenizerError::HfFormat("missing `model.vocab` field".to_owned()))?;
+    let mut vocab: HashMap<String, u32> = HashMap::new();
+    match vocab_val {
+        Value::Object(map) => {
+            for (token, id_val) in map {
+                let id = id_val.as_u64().ok_or_else(|| {
+                    TokenizerError::HfFormat(format!(
+                        "vocab entry {token:?} has non-integer id"
+                    ))
+                })? as u32;
+                vocab.insert(token.clone(), id);
+            }
+        }
+        _ => {
+            return Err(TokenizerError::HfFormat(
+                "`model.vocab` must be an object".to_owned(),
+            ));
+        }
+    }
+
+    // merges: required, must be an array.
+    // HF supports two shapes:
+    //   "merges": ["a b", "c d"]
+    //   "merges": [["a","b"], ["c","d"]]
+    let merges_val = model
+        .get("merges")
+        .ok_or_else(|| TokenizerError::HfFormat("missing `model.merges` field".to_owned()))?;
+    let mut merges: Vec<(String, String)> = Vec::new();
+    match merges_val {
+        Value::Array(list) => {
+            for (idx, entry) in list.iter().enumerate() {
+                let pair = parse_merge_entry(entry).ok_or_else(|| {
+                    TokenizerError::HfFormat(format!("malformed merge entry #{idx}: {entry:?}"))
+                })?;
+                merges.push(pair);
+            }
+        }
+        _ => {
+            return Err(TokenizerError::HfFormat(
+                "`model.merges` must be an array".to_owned(),
+            ));
+        }
+    }
+
+    Ok((vocab, merges))
+}
+
+/// Parse a Unigram `model` section.
+///
+/// Returns `(vocab_map, merges=[], unigram_entries, unk_id)`.
+/// `vocab_map` maps token → ID derived from the position in `model.vocab` so
+/// that decode (ID → string) continues to work through the standard
+/// [`Vocabulary`] path.
+#[allow(clippy::type_complexity)]
+fn parse_unigram_model(
+    model: &Value,
+) -> TokenizerResult<(
+    HashMap<String, u32>,
+    Vec<(String, String)>,
+    Option<Vec<(String, f64)>>,
+    Option<u32>,
+)> {
+    let vocab_val = model
+        .get("vocab")
+        .ok_or_else(|| TokenizerError::HfFormat("missing `model.vocab` field".to_owned()))?;
+
+    let arr = vocab_val.as_array().ok_or_else(|| {
+        TokenizerError::HfFormat(
+            "Unigram `model.vocab` must be an array of [token, score] pairs".to_owned(),
+        )
+    })?;
+
+    let mut entries: Vec<(String, f64)> = Vec::with_capacity(arr.len());
+    let mut vocab_map: HashMap<String, u32> = HashMap::with_capacity(arr.len());
+
+    for (idx, item) in arr.iter().enumerate() {
+        let pair = item.as_array().ok_or_else(|| {
+            TokenizerError::HfFormat(format!(
+                "Unigram vocab entry #{idx} must be a [token, score] array"
+            ))
+        })?;
+        if pair.len() != 2 {
+            return Err(TokenizerError::HfFormat(format!(
+                "Unigram vocab entry #{idx} must have exactly 2 elements, got {}",
+                pair.len()
+            )));
+        }
+        let token = pair[0].as_str().ok_or_else(|| {
+            TokenizerError::HfFormat(format!(
+                "Unigram vocab entry #{idx}: first element must be a string"
+            ))
+        })?;
+        let score = pair[1].as_f64().ok_or_else(|| {
+            TokenizerError::HfFormat(format!(
+                "Unigram vocab entry #{idx}: second element must be a number"
+            ))
+        })?;
+        vocab_map.insert(token.to_owned(), idx as u32);
+        entries.push((token.to_owned(), score));
+    }
+
+    let unk_id = model
+        .get("unk_id")
+        .and_then(Value::as_u64)
+        .map(|n| n as u32);
+
+    Ok((vocab_map, vec![], Some(entries), unk_id))
+}
 
 /// Parse a single `model.merges` entry into a `(left, right)` pair.
 fn parse_merge_entry(entry: &Value) -> Option<(String, String)> {

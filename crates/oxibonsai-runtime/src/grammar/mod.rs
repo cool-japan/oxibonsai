@@ -43,6 +43,7 @@ pub mod cache;
 pub mod constraint;
 pub mod earley;
 pub mod examples;
+pub mod json_schema_compiler;
 
 // ── Public re-exports ─────────────────────────────────────────────────────────
 
@@ -53,4 +54,7 @@ pub use constraint::GrammarConstraint;
 pub use earley::EarleyRecognizer;
 pub use examples::{
     arithmetic_grammar, csv_row_grammar, json_lite_grammar, palindrome_grammar, simple_ab_grammar,
+};
+pub use json_schema_compiler::{
+    compile_json_schema, compile_json_schema_str, JsonSchemaCompileError,
 };

@@ -14,6 +14,11 @@
 - [x] **93 grammar tests** + **32 constraint tests** in `tests/`
 - [x] **`AllowedTokensCache`** — LRU memoization cache for Earley `allowed_tokens` (Phase 15.x); `grammar/cache.rs`; `state_hash()` on `EarleyRecognizer`; `Mutex<AllowedTokensCache>` in `GrammarConstraint`; configurable capacity via `with_cache_capacity`; `cache_stats()` for observability; 12 tests in `tests/grammar_cache_tests.rs`
 
+## Phase 17 — JSON Schema BNF + KV Cache Level
+
+- [x] **JSON Schema → BNF compiler** — `grammar/json_schema_compiler.rs`: two-pass compiler; supports object/array/primitives/enum/anyOf/oneOf/allOf/$ref; `JsonSchemaCompileError`; re-exported from `grammar::` and `lib.rs`; 30 integration tests in `tests/json_schema_compile_tests.rs`
+- [x] **`KvCacheLevel::Fp8`** — new variant (ordinal 2, between Q8 and Q4, `memory_factor=0.5`, `tag="fp8"`); all 4 match arms extended; 3 tests in `tests/kv_cache_policy_fp8_tests.rs`; existing metrics test updated to expect ordinal 3 for Q4
+
 ## 0.1.4 — New Modules
 
 - [x] **`kv_cache_policy`** — `KvCachePolicy` runtime controller; FP16/Q8/Q4 tier transitions driven by EWMA pressure with hysteresis (`kv_cache_policy.rs`, 14 tests)

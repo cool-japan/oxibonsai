@@ -1,8 +1,12 @@
-//! High-level OxiBonsai tokenizer: BPE + char-level fallback.
+//! High-level OxiBonsai tokenizer: BPE + Unigram + char-level fallback.
 //!
 //! [`OxiTokenizer`] ties together a [`Vocabulary`], a [`BpeMerges`] table, and
 //! a [`TokenizerConfig`] into a complete encode/decode API that is
 //! `no_std`-friendly and WASM-compatible.
+//!
+//! When a [`crate::unigram::UnigramVocab`] is attached via
+//! [`OxiTokenizer::with_unigram`], encoding switches to Viterbi segmentation
+//! instead of BPE.
 
 use std::collections::HashSet;
 
@@ -66,10 +70,11 @@ impl Default for TokenizerConfig {
 
 // ── OxiTokenizer ─────────────────────────────────────────────────────────────
 
-/// Pure Rust BPE tokenizer compatible with MeCrab and the WASM target.
+/// Pure Rust BPE / Unigram tokenizer compatible with MeCrab and the WASM target.
 ///
 /// The tokenizer supports:
 /// - Standard BPE encoding via a merge table
+/// - Viterbi Unigram encoding (HuggingFace `"Unigram"` model type)
 /// - Optional BOS/EOS injection
 /// - Byte-fallback for out-of-vocabulary bytes
 /// - Character-level mode (no trained vocab needed — useful in tests)
@@ -79,10 +84,17 @@ pub struct OxiTokenizer {
     config: TokenizerConfig,
     /// The set of special token IDs for quick membership tests.
     special_ids: HashSet<u32>,
+    /// Optional Unigram vocabulary for Viterbi-based segmentation.
+    ///
+    /// When `Some`, the tokenizer dispatches to Unigram encoding instead of
+    /// BPE.  When `None`, the BPE path is used.
+    unigram: Option<crate::unigram::UnigramVocab>,
 }
 
 impl OxiTokenizer {
     /// Construct a tokenizer from pre-built components.
+    ///
+    /// Sets `unigram` to `None` — the BPE path is used for encoding.
     pub fn new(vocab: Vocabulary, merges: BpeMerges, config: TokenizerConfig) -> Self {
         let special_ids = build_special_ids(&config);
         Self {
@@ -90,14 +102,40 @@ impl OxiTokenizer {
             merges,
             config,
             special_ids,
+            unigram: None,
         }
+    }
+
+    /// Construct a Unigram tokenizer from pre-built components.
+    ///
+    /// The `unigram_vocab` is used for Viterbi-based segmentation; the `vocab`
+    /// is kept for decode operations (ID → token string).  An empty
+    /// [`BpeMerges`] table is stored for API consistency.
+    pub fn with_unigram(
+        vocab: Vocabulary,
+        unigram_vocab: crate::unigram::UnigramVocab,
+        config: TokenizerConfig,
+    ) -> Self {
+        let special_ids = build_special_ids(&config);
+        Self {
+            vocab,
+            merges: BpeMerges::new(),
+            config,
+            special_ids,
+            unigram: Some(unigram_vocab),
+        }
+    }
+
+    /// Return `true` if this tokenizer uses Unigram (Viterbi) segmentation.
+    pub fn is_unigram(&self) -> bool {
+        self.unigram.is_some()
     }
 
     /// Encode a single text string into a sequence of token IDs.
     ///
     /// Steps:
     /// 1. Pre-tokenize into words.
-    /// 2. BPE-encode each word.
+    /// 2. Encode each word via Unigram Viterbi (if attached) or BPE.
     /// 3. Optionally prepend BOS and append EOS.
     /// 4. Optionally truncate to `config.max_length`.
     pub fn encode(&self, text: &str) -> TokenizerResult<Vec<u32>> {
@@ -111,16 +149,23 @@ impl OxiTokenizer {
 
         let words = pretokenize(text);
         for word in &words {
-            let word_ids = bpe_encode(word, &self.vocab, &self.merges);
-            if word_ids.is_empty() {
-                // Byte-fallback path: encode each UTF-8 byte explicitly.
-                for byte in word.as_bytes() {
-                    let fallback = byte_fallback_id(*byte);
-                    let fallback_id = self.vocab.get_id(&fallback);
-                    ids.push(fallback_id.unwrap_or(self.config.unk_token_id));
-                }
-            } else {
+            if let Some(unigram) = &self.unigram {
+                // Unigram path: Viterbi segmentation directly on the word.
+                let word_ids = unigram.encode(word);
                 ids.extend_from_slice(&word_ids);
+            } else {
+                // BPE path: apply merge table.
+                let word_ids = bpe_encode(word, &self.vocab, &self.merges);
+                if word_ids.is_empty() {
+                    // Byte-fallback path: encode each UTF-8 byte explicitly.
+                    for byte in word.as_bytes() {
+                        let fallback = byte_fallback_id(*byte);
+                        let fallback_id = self.vocab.get_id(&fallback);
+                        ids.push(fallback_id.unwrap_or(self.config.unk_token_id));
+                    }
+                } else {
+                    ids.extend_from_slice(&word_ids);
+                }
             }
         }
 
@@ -517,5 +562,11 @@ mod tests {
         // Encoding "ab" should produce a single merged token 20.
         let ids = tok.encode("ab").expect("encode should succeed");
         assert!(ids.contains(&20));
+    }
+
+    #[test]
+    fn is_unigram_false_for_bpe() {
+        let tok = OxiTokenizer::char_level_stub(200);
+        assert!(!tok.is_unigram());
     }
 }

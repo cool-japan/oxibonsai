@@ -127,7 +127,8 @@ pub use distributed::{
 pub use engine::InferenceEngine;
 pub use error::{RuntimeError, RuntimeResult};
 pub use grammar::{
-    parse_bnf, BnfParseError, EarleyRecognizer, Grammar, GrammarConstraint, Rule, Symbol,
+    compile_json_schema, compile_json_schema_str, parse_bnf, BnfParseError, EarleyRecognizer,
+    Grammar, GrammarConstraint, JsonSchemaCompileError, Rule, Symbol,
 };
 pub use health::{HealthReport, HealthStatus};
 pub use hot_reload::{HotReloadCoordinator, ModelVersion, ReloadLog};

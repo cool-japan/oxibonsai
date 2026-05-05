@@ -43,6 +43,8 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 ///
 /// Lower variants are higher precision, larger memory footprint; higher
 /// variants are lower precision, smaller memory footprint.
+///
+/// Compactness ordering (ordinal): `Fp16 (0) < Q8 (1) < Fp8 (2) < Q4 (3)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum KvCacheLevel {
@@ -50,26 +52,43 @@ pub enum KvCacheLevel {
     Fp16,
     /// INT8 quantized — half the memory of FP16.
     Q8,
+    /// FP8 quantized — half of FP32, same byte width as INT8 but floating-point
+    /// distribution preserves more dynamic range for attention activations.
+    Fp8,
     /// INT4 quantized — quarter the memory of FP16.
     Q4,
 }
 
 impl KvCacheLevel {
     /// Memory factor relative to FP16.
+    ///
+    /// | Level | Factor |
+    /// |-------|--------|
+    /// | Fp16  | 1.0    |
+    /// | Q8    | 0.5    |
+    /// | Fp8   | 0.5    |
+    /// | Q4    | 0.25   |
     pub const fn memory_factor(self) -> f32 {
         match self {
             Self::Fp16 => 1.0,
             Self::Q8 => 0.5,
+            Self::Fp8 => 0.5,
             Self::Q4 => 0.25,
         }
     }
 
     /// Compactness order: higher = more compact (more aggressive).
+    ///
+    /// Ordering: `Fp16=0 < Q8=1 < Fp8=2 < Q4=3`.
+    /// `Fp8` sits between `Q8` and `Q4` because both use 1 byte per value but
+    /// FP8's floating-point distribution makes it preferable to INT8 for KV
+    /// cache activations while still being intermediate before INT4.
     pub const fn ordinal(self) -> u8 {
         match self {
             Self::Fp16 => 0,
             Self::Q8 => 1,
-            Self::Q4 => 2,
+            Self::Fp8 => 2,
+            Self::Q4 => 3,
         }
     }
 
@@ -78,6 +97,7 @@ impl KvCacheLevel {
         match self {
             Self::Fp16 => "fp16",
             Self::Q8 => "q8",
+            Self::Fp8 => "fp8",
             Self::Q4 => "q4",
         }
     }
@@ -86,6 +106,7 @@ impl KvCacheLevel {
         match o {
             0 => Self::Fp16,
             1 => Self::Q8,
+            2 => Self::Fp8,
             _ => Self::Q4,
         }
     }

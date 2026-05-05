@@ -32,12 +32,14 @@
 //! ```
 
 pub mod accuracy;
+pub mod arc;
 pub mod bleu;
 pub mod bootstrap;
 pub mod calibration;
 pub mod chrf;
 pub mod dataset;
 pub mod error;
+pub mod gsm8k;
 pub mod meteor;
 pub mod perplexity;
 pub mod qa;
@@ -56,6 +58,8 @@ mod tests;
 pub use accuracy::{
     AccuracyResult, ExactMatchEvaluator, LogitMcResult, McEvaluator, McLogitEvaluator,
 };
+pub use arc::{ArcEvaluator, ArcResult, ArcSplit};
+pub use gsm8k::{Gsm8kEvaluator, Gsm8kResult};
 pub use bleu::{corpus_bleu, sentence_bleu, BleuConfig, BleuScore, SmoothingMethod};
 pub use bootstrap::{bootstrap_ci, ConfidenceInterval};
 pub use calibration::{

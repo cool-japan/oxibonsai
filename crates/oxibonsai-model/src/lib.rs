@@ -58,6 +58,7 @@ pub mod pruning;
 pub mod quantize;
 pub mod quantize_int8;
 pub mod quantize_ternary;
+pub mod smoothquant;
 pub mod tensor_parallel;
 pub mod weight_tying;
 
@@ -84,6 +85,9 @@ pub use dynamic_quant::{
     SmoothQuantConfig,
 };
 pub use error::{ModelError, ModelResult};
+pub use smoothquant::{
+    quantize_fp8_e4m3_smooth, quantize_fp8_e5m2_smooth, SmoothQuantCalibrator, SmoothQuantError,
+};
 pub use gguf_loader::{
     estimate_memory_bytes, fits_in_budget, load_tensor_metadata, validate_gguf_file, LoadConfig,
     LoadError, LoadStats, TensorChunkIter, TensorEntry,
@@ -96,8 +100,8 @@ pub use gradient_checkpoint::{
 pub use kv_cache::KvCache;
 pub use kv_cache_fp16::KvCacheFp16;
 pub use kv_cache_quant::{
-    dequantize_row_i8, quant_error_mae, quantize_row_i8, QuantKvError, QuantizedKvCache,
-    QuantizedKvLayer,
+    dequantize_row_i8, quant_error_mae, quantize_row_i8, Fp8KvCache, Fp8KvFormat, Fp8KvLayer,
+    QuantKvError, QuantizedKvCache, QuantizedKvLayer,
 };
 pub use layers::attention_sink::{
     AttentionSinkCache, AttentionSinkConfig, AttentionSinkLayer, SinkError, SinkSlot,

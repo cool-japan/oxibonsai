@@ -783,8 +783,10 @@ mod tests {
         assert!(m.kv_cache_compression_level.get().abs() < 1e-6);
         m.update_kv_cache_level(KvCacheLevel::Q8);
         assert!((m.kv_cache_compression_level.get() - 1.0).abs() < 1e-6);
-        m.update_kv_cache_level(KvCacheLevel::Q4);
+        m.update_kv_cache_level(KvCacheLevel::Fp8);
         assert!((m.kv_cache_compression_level.get() - 2.0).abs() < 1e-6);
+        m.update_kv_cache_level(KvCacheLevel::Q4);
+        assert!((m.kv_cache_compression_level.get() - 3.0).abs() < 1e-6);
     }
 
     #[test]

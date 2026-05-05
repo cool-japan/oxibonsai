@@ -1,7 +1,7 @@
 # OxiBonsai TODO
 
 > Pure Rust 1-bit LLM inference engine for PrismML Bonsai models
-> 420+ source files, ~154,000+ lines of Rust code, 3,976+ tests passing across workspace — verified 2026-05-05 (0.1.4 + Phase 15.x)
+> 420+ source files, ~154,000+ lines of Rust code, 4,206+ tests passing across workspace — verified 2026-05-05 (0.1.4 + Phase 17)
 
 ## Phase Status
 
@@ -28,6 +28,7 @@
 | Phase 16: FP8 Export + Criterion Benchmarks | ✅ Complete | `ExportFormat::FP8E4M3/E5M2` in `oxibonsai-model`; 4 export tests; `bench_fp8_kernels` in `kernel_benchmarks.rs`; 14 benchmark cases |
 | Phase 16A: FP8 Model Layers + Integration | ✅ Complete | `LinearFP8E4M3<'a>` + `LinearFP8E5M2<'a>` in `oxibonsai-model`; `OutputWeight::FP8E4M3/E5M2` variants; `ModelVariant::FP8Bonsai8B/4B/1_7B` with spec builders; FP8 block loaders in `weight_loaders.rs`; GPU paths return graceful Err; 6 integration tests |
 | Phase 16B: Token-byte precomputation + first-byte index | ✅ Complete | `GrammarConstraint` precomputes all token byte sequences at construction; `first_byte_index: Box<[Vec<u32>; 256]>` eliminates per-step decode calls; `empty_token_ids` for EOS/special tokens; `vocab_size()` + `index_memory_bytes()` accessors; 5 new integration tests |
+| Phase 17: FP8 KV cache + JSON Schema BNF + ARC/GSM8K + SmoothQuant + Unigram | ✅ Complete | `Fp8KvLayer`/`Fp8KvCache`/`KvCacheLevel::Fp8`; JSON Schema→Grammar compiler; ARC/GSM8K evaluators; SmoothQuant FP8 calibrator + channel-aware quant; Unigram tokenizer with HF format support |
 
 ## Phase 4 — Complete
 
@@ -84,6 +85,14 @@
 - [x] **Continuous batching** -- `ContinuousBatchScheduler` for in-flight request management
 - [x] **Model registry** -- `ModelVariant`, `ModelSpec`, `CapabilityProfile`; auto-detection from config dimensions
 - [x] **Comprehensive integration tests** -- `tests/full_pipeline_tests.rs` (25 tests), `tests/quantization_pipeline_tests.rs` (10 tests), `tests/server_integration_tests.rs` (8 tests)
+
+## Phase 17 — FP8 KV Cache + JSON Schema BNF + Eval + SmoothQuant + Unigram
+
+- [x] **FP8 KV cache (Slice A)** — `Fp8KvLayer`/`Fp8KvFormat`/`Fp8KvCache` in `kv_cache_quant.rs`; per-row abs-max scale (`max|row|/448.0` E4M3, `/57344.0` E5M2); `push`, `get_key`, `get_value`, `get_keys_at`, `get_values_at`, `memory_bytes`, `memory_bytes_fp32_equivalent`, `clear`; `KvCacheLevel::Fp8` variant (ordinal 2, between Q8 and Q4, `memory_factor=0.5`, `tag="fp8"`); all `ordinal`/`tag`/`memory_factor`/`from_ordinal` match arms extended; 11 model tests + 3 runtime tests; clippy clean
+- [x] **JSON Schema → BNF compiler (Slice B)** — `grammar/json_schema_compiler.rs` in `oxibonsai-runtime`; two-pass compiler (pre-allocate `$defs` NTs in pass 1, compile rules in pass 2); supports `string`/`integer`/`number`/`boolean`/`null`, `object` (required properties), `array` (items), `enum`, `anyOf`/`oneOf`/`allOf`, `$ref` to `#/$defs/...` and `#/definitions/...`, empty/boolean schemas; lazy shared NTs for digit/string rules; max depth 32; `JsonSchemaCompileError` (`InvalidSchema`, `UnsupportedKeyword`, `DanglingRef`, `DepthExceeded`, `InvalidJson`); 30 integration tests; re-exported from `grammar::` and `lib.rs`
+- [x] **ARC + GSM8K evaluators (Slice C)** — `arc.rs` (ArcEvaluator with `ArcSplit::Easy/Challenge`, delegates to `McEvaluator`/`McLogitEvaluator`, `ArcResult`; handles 4- and 5-choice questions); `gsm8k.rs` (regex-free `extract_final_answer` scanning for `####` + trailing numeric, 1e-6 relative tolerance, `Gsm8kResult` with `accuracy_pct`/`no_answer_rate`; `gsm8k_example` builder); 10 ARC tests + 15 GSM8K tests; re-exported from `oxibonsai-eval::lib`
+- [x] **SmoothQuant FP8 calibrator (Slice D)** — `smoothquant.rs` in `oxibonsai-model`: `SmoothQuantCalibrator` with per-channel `running_max_abs` accumulator, `record_activation`, `smooth_factors`, `layer_count`, `has_layer`; `SmoothQuantError` enum; `quantize_fp8_e4m3_smooth` / `quantize_fp8_e5m2_smooth` (apply `smooth_weights` then standard block quantize); `BlockFP8E4M3::quantize_with_channel_scales` / `BlockFP8E5M2::quantize_with_channel_scales` in `oxibonsai-core` (channel-wise divisor before block packing, zero-divisor guards); 12 tests; re-exported from model and core
+- [x] **Unigram tokenizer (Slice E)** — `unigram.rs` in `oxibonsai-tokenizer`: `UnigramVocab` (Viterbi forward-pass lattice, `token_to_id` HashMap, UNK_PENALTY=-1e6, UTF-8 char-boundary safe, per-byte UNK fallback, `encode`/`decode`/`token_count`/`unk_id`); `UnigramError` (`EmptyVocab`, `UnkOutOfRange`, `DuplicateToken`); `OxiTokenizer::with_unigram` constructor + `is_unigram()` + `Option<UnigramVocab>` dispatch in `encode()`; `HfModelType` enum + `model.type` branch in `hf_format.rs` (`parse_bpe_model`/`parse_unigram_model` helpers, `into_tokenizer` branches on type); 14 inline tests + 8 integration tests + 4 hf_format tests
 
 ## Phase 16 — FP8 Full Stack + Grammar Acceleration
 
