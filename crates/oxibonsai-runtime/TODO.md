@@ -14,6 +14,11 @@
 - [x] **93 grammar tests** + **32 constraint tests** in `tests/`
 - [x] **`AllowedTokensCache`** — LRU memoization cache for Earley `allowed_tokens` (Phase 15.x); `grammar/cache.rs`; `state_hash()` on `EarleyRecognizer`; `Mutex<AllowedTokensCache>` in `GrammarConstraint`; configurable capacity via `with_cache_capacity`; `cache_stats()` for observability; 12 tests in `tests/grammar_cache_tests.rs`
 
+## Phase 19 — GBNF Parser + Tool Calling API
+
+- [x] **GBNF parser** — `grammar/gbnf_parser.rs`: `parse_gbnf(src) -> Result<Grammar, GbnfParseError>`; two-pass (NT allocation then rule fill); expands `*`/`+`/`?` quantifiers to synthetic NTs; handles string literals, char classes `[...]`/`[^...]`, alternation `|`, grouping `(...)`; `GbnfParseError::{EmptyGrammar, MissingRootRule, UndefinedNonTerminal, DuplicateRule, UnexpectedChar, InvalidEscape, UnclosedGroup}`; re-exported from `grammar::` and `lib.rs`; 26 tests in `tests/gbnf_parse_tests.rs`
+- [x] **Tool calling API** — `tool_calling.rs` (server-feature-gated): `select_tool(output, tools)` (XML tag parser + name registry check + JSON arg validation); `build_tool_constraint(tools)` (compile each tool schema → Grammar, merge with per-tool root rules); `make_tool_call(id, name, args)` convenience constructor; `new_tool_call_id()` alias; `ToolRegistry<'a>` for O(1) tool lookup; `validate_tool_arguments(args, tool)` structural required-field validator; `ToolCallError::{NoToolCallFound, UnknownTool, MalformedArguments, GrammarCompileError, EmptyToolList}`; 33 tests in `tests/tool_calling_tests.rs` + inline tests
+
 ## Phase 18 — Regex → BNF Compiler
 
 - [x] **Regex → BNF compiler** — `grammar/regex_compiler.rs` (1,233 lines): `compile_regex(pattern) -> Result<Grammar, RegexCompileError>`; `ByteSet` (256-bit bitset, 4×u64); `RegexParser` (hand-rolled recursive descent); Thompson NFA construction; Subset DFA via powerset construction (2,048-state limit); DFA states → Grammar NTs with ε-productions for accepting states; supports literals, `.`, `[...]`/`[^...]` classes, `*`/`+`/`?`, `{n,m}`, `|`, grouping, `\d\w\s` escapes, `^$` anchors (ignored); `RegexCompileError::{InvalidSyntax, UnsupportedFeature, DepthExceeded, EmptyPattern, InvalidUtf8}`; re-exported from `grammar::` and `lib.rs`; 38 tests in `tests/regex_compile_tests.rs`

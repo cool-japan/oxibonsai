@@ -41,13 +41,16 @@ pub mod chrf;
 pub mod dataset;
 pub mod error;
 pub mod gsm8k;
+pub mod hellaswag;
 pub mod meteor;
+pub mod mmlu;
 pub mod perplexity;
 pub mod qa;
 pub mod report;
 pub mod rouge;
 pub mod streaming;
 pub mod throughput;
+pub mod truthfulqa;
 pub mod winogrande;
 
 #[cfg(test)]
@@ -63,6 +66,11 @@ pub use accuracy::{
 pub use arc::{ArcEvaluator, ArcResult, ArcSplit};
 pub use boolq::{BoolQDataset, BoolQEvaluator, BoolQItem, BoolQResult};
 pub use gsm8k::{Gsm8kEvaluator, Gsm8kResult};
+pub use hellaswag::{HellaSwagDataset, HellaSwagEvaluator, HellaSwagItem, HellaSwagResult};
+pub use mmlu::{MmluEvaluator, MmluResult};
+pub use truthfulqa::{
+    TruthfulQaDataset, TruthfulQaEvaluator, TruthfulQaItem, TruthfulQaMode, TruthfulQaResult,
+};
 pub use winogrande::{WinoGrandeDataset, WinoGrandeEvaluator, WinoGrandeItem, WinoGrandeResult};
 pub use bleu::{corpus_bleu, sentence_bleu, BleuConfig, BleuScore, SmoothingMethod};
 pub use bootstrap::{bootstrap_ci, ConfidenceInterval};

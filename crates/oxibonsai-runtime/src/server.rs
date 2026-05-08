@@ -87,23 +87,57 @@ impl AppState {
     }
 }
 
-/// Chat message.
+/// Chat message (OpenAI-compatible).
+///
+/// `content` is `Option<String>` so that it can be `null` when `tool_calls`
+/// is set (the model produced a tool call instead of a text reply).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
+    /// Role of the message sender: `"system"`, `"user"`, `"assistant"`, `"tool"`.
     pub role: String,
-    pub content: String,
+    /// Text content of the message.  `null` when the assistant returns tool calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// Tool calls produced by the model (assistant role only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<crate::api_types::ToolCallResult>>,
+    /// ID of the tool call being responded to (tool role only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+impl ChatMessage {
+    /// Construct a plain text assistant or user message.
+    pub fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
 }
 
 /// Chat completion request.
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
+    /// Conversation history.
     pub messages: Vec<ChatMessage>,
+    /// Maximum tokens to generate.
     #[serde(default = "default_max_tokens")]
     pub max_tokens: usize,
+    /// Sampling temperature.
     #[serde(default = "default_temperature")]
     pub temperature: f32,
+    /// Whether to stream the response as SSE.
     #[serde(default)]
     pub stream: bool,
+    /// Tools available to the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<crate::api_types::ToolDefinition>>,
+    /// Tool choice: `"auto"`, `"none"`, or a specific function selector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
 }
 
 fn default_max_tokens() -> usize {
@@ -336,7 +370,9 @@ async fn chat_completions_non_stream(
             index: 0,
             message: ChatMessage {
                 role: "assistant".to_string(),
-                content,
+                content: Some(content),
+                tool_calls: None,
+                tool_call_id: None,
             },
             finish_reason: "stop".to_string(),
         }],
@@ -473,27 +509,33 @@ async fn chat_completions_stream(
 }
 
 /// Build a simple prompt from chat messages.
+///
+/// Messages with `content = None` (e.g. tool-call turns) are skipped.
 fn build_prompt(messages: &[ChatMessage]) -> String {
     let mut prompt = String::new();
     for msg in messages {
+        let text = match msg.content.as_deref() {
+            Some(t) => t,
+            None => continue,
+        };
         match msg.role.as_str() {
             "system" => {
                 prompt.push_str("<|im_start|>system\n");
-                prompt.push_str(&msg.content);
+                prompt.push_str(text);
                 prompt.push_str("<|im_end|>\n");
             }
             "user" => {
                 prompt.push_str("<|im_start|>user\n");
-                prompt.push_str(&msg.content);
+                prompt.push_str(text);
                 prompt.push_str("<|im_end|>\n");
             }
             "assistant" => {
                 prompt.push_str("<|im_start|>assistant\n");
-                prompt.push_str(&msg.content);
+                prompt.push_str(text);
                 prompt.push_str("<|im_end|>\n");
             }
             _ => {
-                prompt.push_str(&msg.content);
+                prompt.push_str(text);
                 prompt.push('\n');
             }
         }
@@ -668,7 +710,9 @@ mod tests {
     fn build_prompt_simple() {
         let msgs = vec![ChatMessage {
             role: "user".to_string(),
-            content: "Hello".to_string(),
+            content: Some("Hello".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
         }];
         let p = build_prompt(&msgs);
         assert!(p.contains("<|im_start|>user\nHello<|im_end|>"));
@@ -680,11 +724,15 @@ mod tests {
         let msgs = vec![
             ChatMessage {
                 role: "system".to_string(),
-                content: "You are a helpful assistant.".to_string(),
+                content: Some("You are a helpful assistant.".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
             },
             ChatMessage {
                 role: "user".to_string(),
-                content: "Hi".to_string(),
+                content: Some("Hi".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
             },
         ];
         let p = build_prompt(&msgs);
@@ -697,15 +745,21 @@ mod tests {
         let msgs = vec![
             ChatMessage {
                 role: "user".to_string(),
-                content: "What is 2+2?".to_string(),
+                content: Some("What is 2+2?".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
             },
             ChatMessage {
                 role: "assistant".to_string(),
-                content: "4".to_string(),
+                content: Some("4".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
             },
             ChatMessage {
                 role: "user".to_string(),
-                content: "And 3+3?".to_string(),
+                content: Some("And 3+3?".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
             },
         ];
         let p = build_prompt(&msgs);

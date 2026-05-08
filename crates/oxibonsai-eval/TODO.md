@@ -42,6 +42,12 @@ throughput benchmarking, and dataset loading.
 - [x] **`ArcEvaluator`** — ARC-Easy/Challenge 4/5-way MC via `McEvaluator`/`McLogitEvaluator`; `ArcSplit::{Easy, Challenge}`; both completion and logit scoring paths; 10 integration tests
 - [x] **`Gsm8kEvaluator`** — `extract_final_answer` scans from end for `#### N`, supports negative + decimal; numeric exact-match with 1e-6 tolerance; `GsmkResult` with `no_answer_extracted` counter; 15 integration tests
 
+## Phase 19 — MMLU + HellaSwag + TruthfulQA Evaluators
+
+- [x] **`MmluEvaluator`** — 57-subject 4-choice MMLU benchmark; delegates to `McEvaluator`/`McLogitEvaluator`; `MmluResult` with `by_subject: HashMap<String, AccuracyResult>`; subject extracted from `question.subject` or `question.id` (before first `/`); `evaluate_completions`, `evaluate_logits`, `evaluate_by_subject_completions`, `evaluate_by_subject_logits`; 20 tests in `tests/mmlu_tests.rs`
+- [x] **`HellaSwagEvaluator`** — 4-choice sentence completion; reuses `McEvaluator`/`McLogitEvaluator` via `as_mc_dataset()`; `HellaSwagDataset`/`HellaSwagItem`/`HellaSwagResult`; 12+ integration tests
+- [x] **`TruthfulQaEvaluator`** — MC1 (single-correct argmax) + MC2 (fraction of probability mass on correct answers); `TruthfulQaMode::{Mc1, Mc2}`; `TruthfulQaResult`; 12+ integration tests
+
 ## Phase 18 — WinoGrande + BoolQ Evaluators
 
 - [x] **`WinoGrandeEvaluator`** — 2-choice commonsense fill-in-the-blank; delegates to `McEvaluator`/`McLogitEvaluator` via `as_mc_dataset()` (1-based answer → 0-based index mapping); `WinoGrandeResult` with accuracy_pct; 12 integration tests

@@ -162,4 +162,5 @@ pub use weight_tying::{TiedEmbedding, TyingError};
 pub use convert::onnx::{convert_onnx_to_gguf, DequantError as OnnxDequantError, OnnxImportError};
 pub use convert::ConvertStats;
 pub use layers::linear_kquant_ext::{LinearQ5K, LinearQ6K};
+pub use layers::linear_kquant_full::{LinearQ2K, LinearQ3K, LinearQ4K, LinearQ8K};
 pub use layers::linear_standard::{LinearQ4_0, LinearQ8_0};

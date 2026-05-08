@@ -96,6 +96,8 @@ pub mod streaming;
 pub mod token_budget;
 pub mod token_healing;
 pub mod tokenizer_bridge;
+#[cfg(feature = "server")]
+pub mod tool_calling;
 pub mod tracing_setup;
 pub mod wasm_api;
 #[cfg(feature = "server")]
@@ -127,9 +129,9 @@ pub use distributed::{
 pub use engine::InferenceEngine;
 pub use error::{RuntimeError, RuntimeResult};
 pub use grammar::{
-    compile_json_schema, compile_json_schema_str, compile_regex, parse_bnf, BnfParseError,
-    EarleyRecognizer, Grammar, GrammarConstraint, JsonSchemaCompileError, RegexCompileError,
-    Rule, Symbol,
+    compile_json_schema, compile_json_schema_str, compile_regex, parse_bnf, parse_gbnf,
+    BnfParseError, EarleyRecognizer, GbnfParseError, Grammar, GrammarConstraint,
+    JsonSchemaCompileError, RegexCompileError, Rule, Symbol,
 };
 pub use health::{HealthReport, HealthStatus};
 pub use hot_reload::{HotReloadCoordinator, ModelVersion, ReloadLog};
@@ -167,6 +169,11 @@ pub use token_budget::{
     BudgetConfig, BudgetError, BudgetPolicy, GlobalTokenBudget, RequestBudget, TokenCostEstimate,
 };
 pub use tokenizer_bridge::TokenizerBridge;
+#[cfg(feature = "server")]
+pub use tool_calling::{
+    build_tool_constraint, make_tool_call, new_tool_call_id, select_tool, ToolCallError,
+    ToolRegistry, validate_tool_arguments,
+};
 pub use tracing_setup::{init_tracing, TracingConfig};
 #[cfg(feature = "server")]
 pub use web_ui::create_ui_router;

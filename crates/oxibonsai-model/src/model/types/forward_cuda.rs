@@ -351,7 +351,11 @@ impl<'a> BonsaiModel<'a> {
             OutputWeight::Q4_0(_)
             | OutputWeight::Q8_0(_)
             | OutputWeight::Q5K(_)
-            | OutputWeight::Q6K(_) => {
+            | OutputWeight::Q6K(_)
+            | OutputWeight::Q2K(_)
+            | OutputWeight::Q3K(_)
+            | OutputWeight::Q4K(_)
+            | OutputWeight::Q8K(_) => {
                 return Err(
                     "LM head not supported on CUDA fused GPU path for this quant type; use CPU path"
                         .into(),
@@ -440,7 +444,11 @@ impl<'a> BonsaiModel<'a> {
             OutputWeight::Q4_0(_)
             | OutputWeight::Q8_0(_)
             | OutputWeight::Q5K(_)
-            | OutputWeight::Q6K(_) => {
+            | OutputWeight::Q6K(_)
+            | OutputWeight::Q2K(_)
+            | OutputWeight::Q3K(_)
+            | OutputWeight::Q4K(_)
+            | OutputWeight::Q8K(_) => {
                 return Err(
                     "LM head not supported on CUDA prefill path for this quant type".into(),
                 );
@@ -558,7 +566,11 @@ impl<'a> BonsaiModel<'a> {
             OutputWeight::Q4_0(_)
             | OutputWeight::Q8_0(_)
             | OutputWeight::Q5K(_)
-            | OutputWeight::Q6K(_) => {
+            | OutputWeight::Q6K(_)
+            | OutputWeight::Q2K(_)
+            | OutputWeight::Q3K(_)
+            | OutputWeight::Q4K(_)
+            | OutputWeight::Q8K(_) => {
                 return Err(
                     "LM head not supported on CUDA prefill verify path for this quant type".into(),
                 );

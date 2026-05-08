@@ -67,13 +67,25 @@ pub use MetadataWriteValue as MetadataValue;
 /// throughout the existing OxiBonsai reader).  `TQ2_0_g128` maps to type
 /// ID **42** (PrismML ternary extension) and `TQ2_0` maps to type ID **35**
 /// (llama.cpp upstream ternary quantization).
+///
+/// Standard GGML/GGUF type IDs for K-quant formats follow the upstream spec:
+/// Q8_0 = 8, Q4_K = 12, Q5_K = 13, Q6_K = 14.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 #[allow(non_camel_case_types)]
 pub enum TensorType {
     F32 = 0,
     F16 = 1,
+    /// 4-bit quantization, 32 weights per block, FP16 scale (GGML type 2, 18 bytes/block).
     Q4_0 = 2,
+    /// 8-bit quantization, 32 weights per block, FP16 scale (GGML type 8, 34 bytes/block).
+    Q8_0 = 8,
+    /// 4-bit K-quant, 256 weights per super-block, 6-bit sub-scales (GGML type 12, 144 bytes/block).
+    Q4_K = 12,
+    /// 5-bit K-quant, 256 weights per super-block, 6-bit sub-scales (GGML type 13, 176 bytes/block).
+    Q5_K = 13,
+    /// 6-bit K-quant, 256 weights per super-block, int8 sub-scales (GGML type 14, 210 bytes/block).
+    Q6_K = 14,
     /// llama.cpp ternary quantization: 256 sign-2 bits + FP16 group scale (upstream ID 35).
     TQ2_0 = 35,
     /// 1-bit, 128-element groups (OxiBonsai custom; type ID 41).
@@ -91,10 +103,10 @@ impl TensorType {
     pub fn block_size(self) -> usize {
         match self {
             Self::F32 | Self::F16 => 1,
-            Self::Q4_0 => 32,
+            Self::Q4_0 | Self::Q8_0 => 32,
             Self::Q1_0G128 => 128,
             Self::TQ2_0_g128 => 128,
-            Self::TQ2_0 => 256,
+            Self::TQ2_0 | Self::Q4_K | Self::Q5_K | Self::Q6_K => 256,
             Self::F8_E4M3 | Self::F8_E5M2 => 32,
         }
     }
@@ -105,6 +117,10 @@ impl TensorType {
             Self::F32 => 4,
             Self::F16 => 2,
             Self::Q4_0 => 18,
+            Self::Q8_0 => 34,   // 2 (FP16 scale) + 32 (i8 weights)
+            Self::Q4_K => 144,  // 2+2+12+128 (FP16 d+dmin, packed 6-bit scales, 4-bit nibbles)
+            Self::Q5_K => 176,  // 2+2+12+32+128 (FP16 d+dmin, scales, qh high bits, qs nibbles)
+            Self::Q6_K => 210,  // 128+64+16+2 (ql low nibbles, qh high bits, i8 scales, FP16 d)
             Self::Q1_0G128 => 18,   // 2 (FP16 scale) + 16 (128 sign bits)
             Self::TQ2_0_g128 => 34, // 2 (FP16 scale) + 32 (128 ternary-2bit packed)
             Self::TQ2_0 => 66,      // 2 (FP16 scale) + 64 (256 ternary-2bit packed)

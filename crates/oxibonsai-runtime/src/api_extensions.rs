@@ -176,7 +176,9 @@ pub async fn extended_chat_completions(
                     index: idx,
                     message: ChatMessage {
                         role: "assistant".to_string(),
-                        content: final_text,
+                        content: Some(final_text),
+                        tool_calls: None,
+                        tool_call_id: None,
                     },
                     finish_reason,
                     logprobs,
@@ -214,27 +216,33 @@ pub async fn extended_chat_completions(
 }
 
 /// Build a prompt string from a slice of chat messages (ChatML format).
+///
+/// Messages with `content = None` are skipped (they represent tool-call turns).
 fn build_extended_prompt(messages: &[ChatMessage]) -> String {
     let mut prompt = String::new();
     for msg in messages {
+        let text = match msg.content.as_deref() {
+            Some(t) => t,
+            None => continue,
+        };
         match msg.role.as_str() {
             "system" => {
                 prompt.push_str("<|im_start|>system\n");
-                prompt.push_str(&msg.content);
+                prompt.push_str(text);
                 prompt.push_str("<|im_end|>\n");
             }
             "user" => {
                 prompt.push_str("<|im_start|>user\n");
-                prompt.push_str(&msg.content);
+                prompt.push_str(text);
                 prompt.push_str("<|im_end|>\n");
             }
             "assistant" => {
                 prompt.push_str("<|im_start|>assistant\n");
-                prompt.push_str(&msg.content);
+                prompt.push_str(text);
                 prompt.push_str("<|im_end|>\n");
             }
             _ => {
-                prompt.push_str(&msg.content);
+                prompt.push_str(text);
                 prompt.push('\n');
             }
         }

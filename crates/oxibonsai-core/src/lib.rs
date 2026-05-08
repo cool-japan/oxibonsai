@@ -61,7 +61,10 @@ pub use quant_fp8::{
     fp8_e4m3_decode, fp8_e4m3_encode, fp8_e5m2_decode, fp8_e5m2_encode, BlockFP8E4M3, BlockFP8E5M2,
     BLOCK_FP8_BYTES, FP8_E4M3_MAX, FP8_E5M2_MAX, QK_FP8,
 };
-pub use quant_k::{BlockQ2K, BlockQ4K};
+pub use quant_k::{
+    BlockQ2K, BlockQ3K, BlockQ4K, BlockQ8K, BLOCK_Q2_K_BYTES, BLOCK_Q3K_BYTES, BLOCK_Q4_K_BYTES,
+    BLOCK_Q8K_BYTES,
+};
 pub use quant_k_ext::{BlockQ5K, BlockQ6K, BLOCK_Q5K_BYTES, BLOCK_Q6K_BYTES};
 pub use quant_std::{
     BlockQ4_0, BlockQ8_0, BLOCK_Q4_0_BYTES, BLOCK_Q8_0_BYTES, QK_Q4_0, QK_Q8_0,

@@ -6,6 +6,82 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+// ── Phase 19: Tool calling types ──────────────────────────────────────────────
+
+/// A function definition for tool use.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolFunction {
+    /// The name of the function.
+    pub name: String,
+    /// An optional description of the function.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// JSON Schema object describing the function parameters.
+    pub parameters: serde_json::Value,
+}
+
+/// A tool available to the model (OpenAI-compatible format).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolDefinition {
+    /// Must be `"function"`.
+    #[serde(rename = "type")]
+    pub r#type: String,
+    /// The function definition.
+    pub function: ToolFunction,
+}
+
+impl ToolDefinition {
+    /// Convenience constructor for a function-type tool.
+    pub fn function(
+        name: impl Into<String>,
+        description: Option<String>,
+        parameters: serde_json::Value,
+    ) -> Self {
+        Self {
+            r#type: "function".to_string(),
+            function: ToolFunction {
+                name: name.into(),
+                description,
+                parameters,
+            },
+        }
+    }
+}
+
+/// A function call made by the model (name + serialised arguments).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolFunctionCall {
+    /// Name of the function invoked.
+    pub name: String,
+    /// JSON-encoded arguments string.
+    pub arguments: String,
+}
+
+/// A tool call produced by the model in a chat completion response.
+///
+/// Uses `r#type` (serialised as `"type"`) to avoid the reserved keyword.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolCallResult {
+    /// Unique identifier for this tool call (prefix `call_`).
+    pub id: String,
+    /// Type of tool call — always `"function"`.
+    #[serde(rename = "type")]
+    pub r#type: String,
+    /// The function invoked.
+    pub function: ToolFunctionCall,
+}
+
+impl ToolCallResult {
+    /// Construct a `ToolCallResult` for a function call.
+    pub fn new_function(id: String, name: String, arguments: String) -> Self {
+        Self {
+            id,
+            r#type: "function".to_string(),
+            function: ToolFunctionCall { name, arguments },
+        }
+    }
+}
+
 // ── Function calling ──────────────────────────────────────────────────────────
 
 /// A function that can be called by the model.

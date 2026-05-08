@@ -1,7 +1,7 @@
 # OxiBonsai TODO
 
 > Pure Rust 1-bit LLM inference engine for PrismML Bonsai models
-> 420+ source files, ~154,000+ lines of Rust code, 4,200+ tests passing across workspace — verified 2026-05-05 (0.1.4 + Phase 18)
+> 430+ source files, ~160,000+ lines of Rust code, 4,630+ tests passing across workspace — verified 2026-05-05 (0.1.4 + Phase 19)
 
 ## Phase Status
 
@@ -30,6 +30,7 @@
 | Phase 16B: Token-byte precomputation + first-byte index | ✅ Complete | `GrammarConstraint` precomputes all token byte sequences at construction; `first_byte_index: Box<[Vec<u32>; 256]>` eliminates per-step decode calls; `empty_token_ids` for EOS/special tokens; `vocab_size()` + `index_memory_bytes()` accessors; 5 new integration tests |
 | Phase 17: FP8 KV cache + JSON Schema BNF + ARC/GSM8K + SmoothQuant + Unigram | ✅ Complete | `Fp8KvLayer`/`Fp8KvCache`/`KvCacheLevel::Fp8`; JSON Schema→Grammar compiler; ARC/GSM8K evaluators; SmoothQuant FP8 calibrator + channel-aware quant; Unigram tokenizer with HF format support |
 | Phase 18: Standard GGUF formats + K-quant ext + WordPiece + WinoGrande/BoolQ + Regex→BNF | ✅ Complete | Q4_0/Q8_0 full stack; Q5_K/Q6_K K-quant layers; WordPiece tokenizer; WinoGrande/BoolQ evaluators; Regex→BNF compiler (Thompson NFA→Subset DFA→Grammar) |
+| Phase 19: Q2_K/Q3_K/Q4_K/Q8_K + MMLU + GBNF + HellaSwag/TruthfulQA + Tool Calling | ✅ Complete | Full Q2_K/Q3_K/Q4_K/Q8_K block types, GEMV kernels, linear layers, model integration; MMLU evaluator with per-subject breakdown; GBNF parser (two-pass, `*`/`+`/`?` expansion); HellaSwag/TruthfulQA evaluators; Tool calling API (select_tool, build_tool_constraint, ToolRegistry, validate_tool_arguments) |
 
 ## Phase 4 — Complete
 

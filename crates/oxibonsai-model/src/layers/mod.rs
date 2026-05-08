@@ -16,6 +16,7 @@ pub mod cross_attention;
 pub mod flash_decode;
 pub mod linear;
 pub mod linear_kquant_ext;
+pub mod linear_kquant_full;
 pub mod linear_standard;
 pub mod mixture_of_depths;
 pub mod moe_expert;

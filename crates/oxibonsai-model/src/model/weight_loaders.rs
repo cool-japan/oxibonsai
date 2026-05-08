@@ -6,12 +6,13 @@ use oxibonsai_core::gguf::reader::GgufFile;
 use oxibonsai_core::gguf::tensor_info::tensor_names;
 use oxibonsai_core::gguf::types::GgufTensorType;
 use oxibonsai_core::tensor::{BlockQ1_0G128, QK1_0_G128};
-use oxibonsai_core::{BlockQ4_0, BlockQ5K, BlockQ6K, BlockQ8_0};
+use oxibonsai_core::{BlockQ2K, BlockQ3K, BlockQ4K, BlockQ4_0, BlockQ5K, BlockQ6K, BlockQ8K, BlockQ8_0};
 
 use crate::block::TransformerBlock;
 use crate::error::{ModelError, ModelResult};
 use crate::layers::linear::{Linear1Bit, LinearFP8E4M3, LinearFP8E5M2, LinearTernary};
 use crate::layers::linear_kquant_ext::{LinearQ5K, LinearQ6K};
+use crate::layers::linear_kquant_full::{LinearQ2K, LinearQ3K, LinearQ4K, LinearQ8K};
 use crate::layers::linear_standard::{LinearQ4_0, LinearQ8_0};
 use crate::layers::rms_norm::RmsNorm;
 
@@ -212,6 +213,19 @@ pub(super) fn load_q6k_blocks<'a>(
     BlockQ6K::slice_from_bytes(data).map_err(ModelError::Core)
 }
 
+pub(super) fn load_q2k_blocks<'a>(gguf: &'a GgufFile<'a>, name: &str) -> ModelResult<&'a [BlockQ2K]> {
+    BlockQ2K::slice_from_bytes(gguf.tensor_data(name).map_err(ModelError::Core)?).map_err(ModelError::Core)
+}
+pub(super) fn load_q3k_blocks<'a>(gguf: &'a GgufFile<'a>, name: &str) -> ModelResult<&'a [BlockQ3K]> {
+    BlockQ3K::slice_from_bytes(gguf.tensor_data(name).map_err(ModelError::Core)?).map_err(ModelError::Core)
+}
+pub(super) fn load_q4k_blocks<'a>(gguf: &'a GgufFile<'a>, name: &str) -> ModelResult<&'a [BlockQ4K]> {
+    BlockQ4K::slice_from_bytes(gguf.tensor_data(name).map_err(ModelError::Core)?).map_err(ModelError::Core)
+}
+pub(super) fn load_q8k_blocks<'a>(gguf: &'a GgufFile<'a>, name: &str) -> ModelResult<&'a [BlockQ8K]> {
+    BlockQ8K::slice_from_bytes(gguf.tensor_data(name).map_err(ModelError::Core)?).map_err(ModelError::Core)
+}
+
 /// Load a single Transformer block's weights from GGUF.
 ///
 /// Automatically detects whether the model uses Q1\_0\_g128 (1-bit) or
@@ -243,6 +257,10 @@ pub(super) fn load_transformer_block<'a>(
     let is_q8_0 = sample_info.tensor_type == GgufTensorType::Q8_0;
     let is_q5k = sample_info.tensor_type == GgufTensorType::Q5_K;
     let is_q6k = sample_info.tensor_type == GgufTensorType::Q6_K;
+    let is_q2k = sample_info.tensor_type == GgufTensorType::Q2_K;
+    let is_q3k = sample_info.tensor_type == GgufTensorType::Q3_K;
+    let is_q4k = sample_info.tensor_type == GgufTensorType::Q4_K;
+    let is_q8k = sample_info.tensor_type == GgufTensorType::Q8_K;
 
     // RMSNorm weights (always FP32).
     let attn_norm_w = load_f32_tensor(gguf, &blk(tensor_names::ATTN_NORM))?;
@@ -459,6 +477,74 @@ pub(super) fn load_transformer_block<'a>(
         );
         tracing::trace!(layer = layer_idx, "loaded Q6_K transformer block");
         Ok(block)
+    } else if is_q2k {
+        let q_b = load_q2k_blocks(gguf, &blk(tensor_names::ATTN_Q))?;
+        let k_b = load_q2k_blocks(gguf, &blk(tensor_names::ATTN_K))?;
+        let v_b = load_q2k_blocks(gguf, &blk(tensor_names::ATTN_V))?;
+        let o_b = load_q2k_blocks(gguf, &blk(tensor_names::ATTN_OUTPUT))?;
+        let gate_b = load_q2k_blocks(gguf, &blk(tensor_names::FFN_GATE))?;
+        let up_b = load_q2k_blocks(gguf, &blk(tensor_names::FFN_UP))?;
+        let down_b = load_q2k_blocks(gguf, &blk(tensor_names::FFN_DOWN))?;
+        let block = TransformerBlock::new(layer_idx, RmsNorm::new(attn_norm_w, config.rms_norm_eps),
+            LinearQ2K::new(q_b, nq*hd, h)?.into(), LinearQ2K::new(k_b, nkv*hd, h)?.into(),
+            LinearQ2K::new(v_b, nkv*hd, h)?.into(), LinearQ2K::new(o_b, h, nq*hd)?.into(),
+            RmsNorm::new(q_norm_w, config.rms_norm_eps), RmsNorm::new(k_norm_w, config.rms_norm_eps),
+            RmsNorm::new(ffn_norm_w, config.rms_norm_eps),
+            LinearQ2K::new(gate_b, inter, h)?.into(), LinearQ2K::new(up_b, inter, h)?.into(),
+            LinearQ2K::new(down_b, h, inter)?.into(), nq, nkv, hd, h);
+        tracing::trace!(layer = layer_idx, "loaded Q2_K transformer block");
+        Ok(block)
+    } else if is_q3k {
+        let q_b = load_q3k_blocks(gguf, &blk(tensor_names::ATTN_Q))?;
+        let k_b = load_q3k_blocks(gguf, &blk(tensor_names::ATTN_K))?;
+        let v_b = load_q3k_blocks(gguf, &blk(tensor_names::ATTN_V))?;
+        let o_b = load_q3k_blocks(gguf, &blk(tensor_names::ATTN_OUTPUT))?;
+        let gate_b = load_q3k_blocks(gguf, &blk(tensor_names::FFN_GATE))?;
+        let up_b = load_q3k_blocks(gguf, &blk(tensor_names::FFN_UP))?;
+        let down_b = load_q3k_blocks(gguf, &blk(tensor_names::FFN_DOWN))?;
+        let block = TransformerBlock::new(layer_idx, RmsNorm::new(attn_norm_w, config.rms_norm_eps),
+            LinearQ3K::new(q_b, nq*hd, h)?.into(), LinearQ3K::new(k_b, nkv*hd, h)?.into(),
+            LinearQ3K::new(v_b, nkv*hd, h)?.into(), LinearQ3K::new(o_b, h, nq*hd)?.into(),
+            RmsNorm::new(q_norm_w, config.rms_norm_eps), RmsNorm::new(k_norm_w, config.rms_norm_eps),
+            RmsNorm::new(ffn_norm_w, config.rms_norm_eps),
+            LinearQ3K::new(gate_b, inter, h)?.into(), LinearQ3K::new(up_b, inter, h)?.into(),
+            LinearQ3K::new(down_b, h, inter)?.into(), nq, nkv, hd, h);
+        tracing::trace!(layer = layer_idx, "loaded Q3_K transformer block");
+        Ok(block)
+    } else if is_q4k {
+        let q_b = load_q4k_blocks(gguf, &blk(tensor_names::ATTN_Q))?;
+        let k_b = load_q4k_blocks(gguf, &blk(tensor_names::ATTN_K))?;
+        let v_b = load_q4k_blocks(gguf, &blk(tensor_names::ATTN_V))?;
+        let o_b = load_q4k_blocks(gguf, &blk(tensor_names::ATTN_OUTPUT))?;
+        let gate_b = load_q4k_blocks(gguf, &blk(tensor_names::FFN_GATE))?;
+        let up_b = load_q4k_blocks(gguf, &blk(tensor_names::FFN_UP))?;
+        let down_b = load_q4k_blocks(gguf, &blk(tensor_names::FFN_DOWN))?;
+        let block = TransformerBlock::new(layer_idx, RmsNorm::new(attn_norm_w, config.rms_norm_eps),
+            LinearQ4K::new(q_b, nq*hd, h)?.into(), LinearQ4K::new(k_b, nkv*hd, h)?.into(),
+            LinearQ4K::new(v_b, nkv*hd, h)?.into(), LinearQ4K::new(o_b, h, nq*hd)?.into(),
+            RmsNorm::new(q_norm_w, config.rms_norm_eps), RmsNorm::new(k_norm_w, config.rms_norm_eps),
+            RmsNorm::new(ffn_norm_w, config.rms_norm_eps),
+            LinearQ4K::new(gate_b, inter, h)?.into(), LinearQ4K::new(up_b, inter, h)?.into(),
+            LinearQ4K::new(down_b, h, inter)?.into(), nq, nkv, hd, h);
+        tracing::trace!(layer = layer_idx, "loaded Q4_K transformer block");
+        Ok(block)
+    } else if is_q8k {
+        let q_b = load_q8k_blocks(gguf, &blk(tensor_names::ATTN_Q))?;
+        let k_b = load_q8k_blocks(gguf, &blk(tensor_names::ATTN_K))?;
+        let v_b = load_q8k_blocks(gguf, &blk(tensor_names::ATTN_V))?;
+        let o_b = load_q8k_blocks(gguf, &blk(tensor_names::ATTN_OUTPUT))?;
+        let gate_b = load_q8k_blocks(gguf, &blk(tensor_names::FFN_GATE))?;
+        let up_b = load_q8k_blocks(gguf, &blk(tensor_names::FFN_UP))?;
+        let down_b = load_q8k_blocks(gguf, &blk(tensor_names::FFN_DOWN))?;
+        let block = TransformerBlock::new(layer_idx, RmsNorm::new(attn_norm_w, config.rms_norm_eps),
+            LinearQ8K::new(q_b, nq*hd, h)?.into(), LinearQ8K::new(k_b, nkv*hd, h)?.into(),
+            LinearQ8K::new(v_b, nkv*hd, h)?.into(), LinearQ8K::new(o_b, h, nq*hd)?.into(),
+            RmsNorm::new(q_norm_w, config.rms_norm_eps), RmsNorm::new(k_norm_w, config.rms_norm_eps),
+            RmsNorm::new(ffn_norm_w, config.rms_norm_eps),
+            LinearQ8K::new(gate_b, inter, h)?.into(), LinearQ8K::new(up_b, inter, h)?.into(),
+            LinearQ8K::new(down_b, h, inter)?.into(), nq, nkv, hd, h);
+        tracing::trace!(layer = layer_idx, "loaded Q8_K transformer block");
+        Ok(block)
     } else {
         // Q1_0_g128 (1-bit) path.
         let q_blocks = load_1bit_blocks(gguf, &blk(tensor_names::ATTN_Q))?;
@@ -557,6 +643,26 @@ pub(super) fn load_output_weight<'a>(
             let blocks = load_q6k_blocks(gguf, tensor_names::OUTPUT)?;
             let linear = LinearQ6K::new(blocks, out_features, in_features)?;
             Ok(OutputWeight::Q6K(linear))
+        }
+        GgufTensorType::Q2_K => {
+            let blocks = load_q2k_blocks(gguf, tensor_names::OUTPUT)?;
+            let linear = LinearQ2K::new(blocks, out_features, in_features)?;
+            Ok(OutputWeight::Q2K(linear))
+        }
+        GgufTensorType::Q3_K => {
+            let blocks = load_q3k_blocks(gguf, tensor_names::OUTPUT)?;
+            let linear = LinearQ3K::new(blocks, out_features, in_features)?;
+            Ok(OutputWeight::Q3K(linear))
+        }
+        GgufTensorType::Q4_K => {
+            let blocks = load_q4k_blocks(gguf, tensor_names::OUTPUT)?;
+            let linear = LinearQ4K::new(blocks, out_features, in_features)?;
+            Ok(OutputWeight::Q4K(linear))
+        }
+        GgufTensorType::Q8_K => {
+            let blocks = load_q8k_blocks(gguf, tensor_names::OUTPUT)?;
+            let linear = LinearQ8K::new(blocks, out_features, in_features)?;
+            Ok(OutputWeight::Q8K(linear))
         }
         GgufTensorType::F32 | GgufTensorType::F16 => {
             let weights = load_f32_tensor(gguf, tensor_names::OUTPUT)?;

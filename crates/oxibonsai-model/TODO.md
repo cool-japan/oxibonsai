@@ -80,6 +80,14 @@ merging, and numerical stability tests all implemented and green.
 - [x] Checkpoint save/load — OXCK binary format (`checkpoint.rs`)
 - [x] Compression utilities (`compression.rs`)
 
+## Phase 19 — Q2_K / Q3_K / Q4_K / Q8_K Full Stack
+
+- [x] **Q2_K block type** — `BlockQ2K` (84 bytes/256w, 2-bit super-block with 16 K-quant scale nibbles + delta f16) in `oxibonsai-core::quant_k`; `gemv_q2k.rs` scalar GEMV kernel; `LinearQ2K<'a>` in `layers/linear_kquant_full.rs`; `LinearLayer::Q2K` + `OutputWeight::Q2K` variants; Q2_K weight loaders in `weight_loaders.rs`; `forward_cuda.rs` exhaustive match arms
+- [x] **Q3_K block type** — `BlockQ3K` (110 bytes/256w, 3-bit with 4-bit signed scale nibbles + hmask high-bit array + d f16) in `oxibonsai-core::quant_k`; `gemv_q3k.rs` scalar GEMV kernel; `LinearQ3K<'a>`; full model integration
+- [x] **Q4_K block type** — `BlockQ4K` (144 bytes/256w, 4-bit K-quant with 2-level super-block scale+min; `d`/`dmin` f16) in `oxibonsai-core::quant_k`; `gemv_q4k.rs` scalar GEMV kernel; `LinearQ4K<'a>`; full model integration
+- [x] **Q8_K block type** — `BlockQ8K` (292 bytes/256w, 8-bit with f32 scale + precomputed `bsums` i16 block sums) in `oxibonsai-core::quant_k`; `gemv_q8k.rs` scalar GEMV kernel; `LinearQ8K<'a>`; full model integration
+- [x] **Lib re-exports** — `pub use layers::linear_kquant_full::{LinearQ2K, LinearQ3K, LinearQ4K, LinearQ8K}` in `lib.rs`
+
 ## Phase 18 — Standard GGUF Formats + K-quant Extensions
 
 - [x] **Q4_0 + Q8_0 full stack** — `BlockQ4_0` (18 bytes/32w) + `BlockQ8_0` (34 bytes/32w) in `oxibonsai-core::quant_std`; scalar GEMV kernels; `LinearQ4_0<'a>` + `LinearQ8_0<'a>` in `layers/linear_standard.rs`; `LinearLayer::{Q4_0, Q8_0}` + `OutputWeight::{Q4_0, Q8_0}` variants; Q4_0/Q8_0 weight loaders; 25 block + 8 kernel tests each

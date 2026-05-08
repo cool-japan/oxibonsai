@@ -6,6 +6,7 @@ use crate::error::{ModelError, ModelResult};
 use crate::kv_cache::KvCache;
 use crate::layers::linear::{Linear1Bit, LinearFP8E4M3, LinearFP8E5M2, LinearTernary};
 use crate::layers::linear_kquant_ext::{LinearQ5K, LinearQ6K};
+use crate::layers::linear_kquant_full::{LinearQ2K, LinearQ3K, LinearQ4K, LinearQ8K};
 use crate::layers::linear_standard::{LinearQ4_0, LinearQ8_0};
 use crate::layers::rms_norm::RmsNorm;
 use crate::layers::rope::RopeTable;
@@ -218,7 +219,11 @@ impl<'a> BonsaiModel<'a> {
             | OutputWeight::Q4_0(_)
             | OutputWeight::Q8_0(_)
             | OutputWeight::Q5K(_)
-            | OutputWeight::Q6K(_) => {}
+            | OutputWeight::Q6K(_)
+            | OutputWeight::Q2K(_)
+            | OutputWeight::Q3K(_)
+            | OutputWeight::Q4K(_)
+            | OutputWeight::Q8K(_) => {}
             OutputWeight::Fp32 { .. } => {}
         }
         tracing::info!("GPU weight upload complete");
@@ -546,6 +551,18 @@ impl<'a> BonsaiModel<'a> {
             OutputWeight::Q6K(linear) => {
                 linear.forward(&normed, &mut logits)?;
             }
+            OutputWeight::Q2K(linear) => {
+                linear.forward(&normed, &mut logits)?;
+            }
+            OutputWeight::Q3K(linear) => {
+                linear.forward(&normed, &mut logits)?;
+            }
+            OutputWeight::Q4K(linear) => {
+                linear.forward(&normed, &mut logits)?;
+            }
+            OutputWeight::Q8K(linear) => {
+                linear.forward(&normed, &mut logits)?;
+            }
             OutputWeight::Fp32 {
                 weights,
                 out_features,
@@ -586,6 +603,14 @@ pub(super) enum OutputWeight<'a> {
     Q5K(LinearQ5K<'a>),
     /// 6-bit K-quant (Q6_K) output projection.
     Q6K(LinearQ6K<'a>),
+    /// 2-bit K-quant (Q2_K) output projection.
+    Q2K(LinearQ2K<'a>),
+    /// 3-bit K-quant (Q3_K) output projection.
+    Q3K(LinearQ3K<'a>),
+    /// 4-bit K-quant (Q4_K) output projection.
+    Q4K(LinearQ4K<'a>),
+    /// 8-bit K-quant (Q8_K) output projection.
+    Q8K(LinearQ8K<'a>),
     Fp32 {
         weights: Vec<f32>,
         out_features: usize,

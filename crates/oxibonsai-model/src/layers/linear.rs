@@ -11,6 +11,7 @@ use crate::error::ModelResult;
 
 // Re-export standard quant types so callers can use `layers::linear::LinearQ4_0`.
 pub use crate::layers::linear_kquant_ext::{LinearQ5K, LinearQ6K};
+pub use crate::layers::linear_kquant_full::{LinearQ2K, LinearQ3K, LinearQ4K, LinearQ8K};
 pub use crate::layers::linear_standard::{LinearQ4_0, LinearQ8_0};
 
 /// A linear layer with Q1\_0\_g128 (1-bit) weights.
@@ -546,6 +547,14 @@ pub enum LinearLayer<'a> {
     Q5K(LinearQ5K<'a>),
     /// 6-bit K-quant (Q6_K) linear layer.
     Q6K(LinearQ6K<'a>),
+    /// 2-bit K-quant (Q2_K) linear layer.
+    Q2K(LinearQ2K<'a>),
+    /// 3-bit K-quant (Q3_K) linear layer.
+    Q3K(LinearQ3K<'a>),
+    /// 4-bit K-quant (Q4_K) linear layer.
+    Q4K(LinearQ4K<'a>),
+    /// 8-bit K-quant (Q8_K) linear layer.
+    Q8K(LinearQ8K<'a>),
 }
 
 impl<'a> LinearLayer<'a> {
@@ -560,6 +569,10 @@ impl<'a> LinearLayer<'a> {
             Self::Q8_0(l) => l.out_features(),
             Self::Q5K(l) => l.out_features(),
             Self::Q6K(l) => l.out_features(),
+            Self::Q2K(l) => l.out_features(),
+            Self::Q3K(l) => l.out_features(),
+            Self::Q4K(l) => l.out_features(),
+            Self::Q8K(l) => l.out_features(),
         }
     }
 
@@ -574,12 +587,16 @@ impl<'a> LinearLayer<'a> {
             Self::Q8_0(l) => l.in_features(),
             Self::Q5K(l) => l.in_features(),
             Self::Q6K(l) => l.in_features(),
+            Self::Q2K(l) => l.in_features(),
+            Self::Q3K(l) => l.in_features(),
+            Self::Q4K(l) => l.in_features(),
+            Self::Q8K(l) => l.in_features(),
         }
     }
 
     /// Returns the GPU weight handle, if the layer has been uploaded to GPU.
     ///
-    /// FP8, Q4_0, Q8_0, Q5_K, and Q6_K variants do not support GPU caching — returns `None`.
+    /// FP8, Q4_0, Q8_0, Q5_K, Q6_K, and K-quant variants do not support GPU caching.
     pub fn gpu_handle(&self) -> Option<oxibonsai_kernels::GpuWeightHandle> {
         match self {
             Self::OneBit(l) => l.gpu_handle(),
@@ -589,7 +606,11 @@ impl<'a> LinearLayer<'a> {
             | Self::Q4_0(_)
             | Self::Q8_0(_)
             | Self::Q5K(_)
-            | Self::Q6K(_) => None,
+            | Self::Q6K(_)
+            | Self::Q2K(_)
+            | Self::Q3K(_)
+            | Self::Q4K(_)
+            | Self::Q8K(_) => None,
         }
     }
 
@@ -603,7 +624,11 @@ impl<'a> LinearLayer<'a> {
             | Self::Q4_0(_)
             | Self::Q8_0(_)
             | Self::Q5K(_)
-            | Self::Q6K(_) => None,
+            | Self::Q6K(_)
+            | Self::Q2K(_)
+            | Self::Q3K(_)
+            | Self::Q4K(_)
+            | Self::Q8K(_) => None,
         }
     }
 
@@ -617,6 +642,10 @@ impl<'a> LinearLayer<'a> {
             | Self::Q4_0(_)
             | Self::Q8_0(_)
             | Self::Q5K(_)
+            | Self::Q2K(_)
+            | Self::Q3K(_)
+            | Self::Q4K(_)
+            | Self::Q8K(_)
             | Self::Q6K(_) => None,
         }
     }
@@ -669,9 +698,29 @@ impl<'a> LinearLayer<'a> {
         }
     }
 
+    /// Returns Q2_K blocks if this is a Q2_K layer, `None` otherwise.
+    pub fn blocks_q2k(&self) -> Option<&[oxibonsai_core::BlockQ2K]> {
+        match self { Self::Q2K(l) => Some(l.blocks()), _ => None }
+    }
+
+    /// Returns Q3_K blocks if this is a Q3_K layer, `None` otherwise.
+    pub fn blocks_q3k(&self) -> Option<&[oxibonsai_core::BlockQ3K]> {
+        match self { Self::Q3K(l) => Some(l.blocks()), _ => None }
+    }
+
+    /// Returns Q4_K blocks if this is a Q4_K layer, `None` otherwise.
+    pub fn blocks_q4k(&self) -> Option<&[oxibonsai_core::BlockQ4K]> {
+        match self { Self::Q4K(l) => Some(l.blocks()), _ => None }
+    }
+
+    /// Returns Q8_K blocks if this is a Q8_K layer, `None` otherwise.
+    pub fn blocks_q8k(&self) -> Option<&[oxibonsai_core::BlockQ8K]> {
+        match self { Self::Q8K(l) => Some(l.blocks()), _ => None }
+    }
+
     /// Upload weights to GPU.
     ///
-    /// FP8, Q4_0, Q8_0, Q5_K, and Q6_K variants are no-ops (GPU inference not yet implemented).
+    /// K-quant variants are no-ops (GPU inference not yet implemented).
     pub fn upload_to_gpu(&mut self) {
         match self {
             Self::OneBit(l) => l.upload_to_gpu(),
@@ -681,7 +730,11 @@ impl<'a> LinearLayer<'a> {
             | Self::Q4_0(_)
             | Self::Q8_0(_)
             | Self::Q5K(_)
-            | Self::Q6K(_) => {}
+            | Self::Q6K(_)
+            | Self::Q2K(_)
+            | Self::Q3K(_)
+            | Self::Q4K(_)
+            | Self::Q8K(_) => {}
         }
     }
 
@@ -696,6 +749,10 @@ impl<'a> LinearLayer<'a> {
             Self::Q8_0(l) => l.forward(input, output),
             Self::Q5K(l) => l.forward(input, output),
             Self::Q6K(l) => l.forward(input, output),
+            Self::Q2K(l) => l.forward(input, output),
+            Self::Q3K(l) => l.forward(input, output),
+            Self::Q4K(l) => l.forward(input, output),
+            Self::Q8K(l) => l.forward(input, output),
         }
     }
 
@@ -710,6 +767,10 @@ impl<'a> LinearLayer<'a> {
             Self::Q8_0(l) => l.forward_batch(input, output, m),
             Self::Q5K(l) => l.forward_batch(input, output, m),
             Self::Q6K(l) => l.forward_batch(input, output, m),
+            Self::Q2K(l) => l.forward_batch(input, output, m),
+            Self::Q3K(l) => l.forward_batch(input, output, m),
+            Self::Q4K(l) => l.forward_batch(input, output, m),
+            Self::Q8K(l) => l.forward_batch(input, output, m),
         }
     }
 }
@@ -757,9 +818,19 @@ impl<'a> From<LinearQ5K<'a>> for LinearLayer<'a> {
 }
 
 impl<'a> From<LinearQ6K<'a>> for LinearLayer<'a> {
-    fn from(l: LinearQ6K<'a>) -> Self {
-        Self::Q6K(l)
-    }
+    fn from(l: LinearQ6K<'a>) -> Self { Self::Q6K(l) }
+}
+impl<'a> From<LinearQ2K<'a>> for LinearLayer<'a> {
+    fn from(l: LinearQ2K<'a>) -> Self { Self::Q2K(l) }
+}
+impl<'a> From<LinearQ3K<'a>> for LinearLayer<'a> {
+    fn from(l: LinearQ3K<'a>) -> Self { Self::Q3K(l) }
+}
+impl<'a> From<LinearQ4K<'a>> for LinearLayer<'a> {
+    fn from(l: LinearQ4K<'a>) -> Self { Self::Q4K(l) }
+}
+impl<'a> From<LinearQ8K<'a>> for LinearLayer<'a> {
+    fn from(l: LinearQ8K<'a>) -> Self { Self::Q8K(l) }
 }
 
 #[cfg(test)]
