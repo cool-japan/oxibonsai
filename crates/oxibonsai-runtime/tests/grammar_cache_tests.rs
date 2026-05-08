@@ -306,7 +306,7 @@ fn cache_thread_safety() {
     let handle = {
         let constraint = Arc::clone(&constraint);
         thread::spawn(move || {
-            let c = constraint.lock().unwrap();
+            let c = constraint.lock().unwrap_or_else(|e| e.into_inner());
             let mask = c.allowed_tokens(&[], 128).unwrap();
             // Digits must be allowed at the start.
             for d in b'0'..=b'9' {
@@ -322,7 +322,7 @@ fn cache_thread_safety() {
 
     // Back on main thread: the cache already has the initial state, so this
     // call is a hit.
-    let c = constraint.lock().unwrap();
+    let c = constraint.lock().unwrap_or_else(|e| e.into_inner());
     c.allowed_tokens(&[], 128).unwrap();
     let (hits, _) = c.cache_stats();
     assert_eq!(hits, 1, "main thread call is a cache hit");
