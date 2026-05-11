@@ -1,9 +1,10 @@
 //! Standard GGUF linear layers for Q4_0 and Q8_0 quantization formats.
 //!
 //! These layers implement the full `forward` / `forward_batch` interface
-//! using the scalar GEMV kernels from `oxibonsai-kernels`.  They do not
-//! yet have GPU-specific paths — GPU inference for Q4_0/Q8_0 is a follow-on
-//! slice.
+//! using the scalar GEMV kernels from `oxibonsai-kernels`.  When the
+//! `native-cuda` feature is enabled and a CUDA device is available, `forward`
+//! dispatches to the NVRTC GEMV kernels; on failure it falls back to the
+//! scalar CPU path.
 //!
 //! # Layout
 //!
@@ -17,6 +18,20 @@ use oxibonsai_core::{BlockQ4_0, BlockQ8_0, QK_Q4_0, QK_Q8_0};
 use oxibonsai_kernels::{gemv_q4_0, gemv_q8_0};
 
 use crate::error::{ModelError, ModelResult};
+
+// ---------------------------------------------------------------------------
+// Compile-time size assertions (documenting the SAFETY invariants used in the
+// unsafe `from_raw_parts` casts inside the CUDA dispatch paths below).
+// ---------------------------------------------------------------------------
+
+#[cfg(all(feature = "native-cuda", any(target_os = "linux", target_os = "windows")))]
+const _: () = assert!(
+    std::mem::size_of::<oxibonsai_core::BlockQ4_0>() == oxibonsai_core::BLOCK_Q4_0_BYTES,
+);
+#[cfg(all(feature = "native-cuda", any(target_os = "linux", target_os = "windows")))]
+const _: () = assert!(
+    std::mem::size_of::<oxibonsai_core::BlockQ8_0>() == oxibonsai_core::BLOCK_Q8_0_BYTES,
+);
 
 // ---------------------------------------------------------------------------
 // LinearQ4_0
@@ -89,7 +104,42 @@ impl<'a> LinearQ4_0<'a> {
     ///
     /// - `input`: FP32 vector of length `in_features`.
     /// - `output`: FP32 vector of length `out_features`.
+    ///
+    /// When the `native-cuda` feature is enabled and a CUDA device is present
+    /// the NVRTC Q4_0 GEMV kernel is tried first; any failure other than
+    /// "no CUDA device" is logged as a warning and the CPU scalar path runs
+    /// instead.
     pub fn forward(&self, input: &[f32], output: &mut [f32]) -> ModelResult<()> {
+        #[cfg(all(feature = "native-cuda", any(target_os = "linux", target_os = "windows")))]
+        if oxibonsai_kernels::CudaGraph::global().is_ok() {
+            // SAFETY: BlockQ4_0 is #[repr(C)] with size BLOCK_Q4_0_BYTES (= 18).
+            // The compile-time assert above and the one in oxibonsai_core::quant_std
+            // both guarantee this layout.
+            let raw = unsafe {
+                std::slice::from_raw_parts(
+                    self.blocks.as_ptr().cast::<u8>(),
+                    self.blocks.len() * oxibonsai_core::BLOCK_Q4_0_BYTES,
+                )
+            };
+            match oxibonsai_kernels::cuda_gemv_q4_0(
+                raw,
+                input,
+                output,
+                self.out_features,
+                self.in_features,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let msg = format!("{e}");
+                    if !msg.contains("no CUDA device") {
+                        tracing::warn!(
+                            error = %e,
+                            "CUDA Q4_0 GEMV failed, falling back to CPU scalar"
+                        );
+                    }
+                }
+            }
+        }
         gemv_q4_0(self.blocks, input, output, self.out_features, self.in_features)
             .map_err(ModelError::Kernel)
     }
@@ -180,7 +230,42 @@ impl<'a> LinearQ8_0<'a> {
     ///
     /// - `input`: FP32 vector of length `in_features`.
     /// - `output`: FP32 vector of length `out_features`.
+    ///
+    /// When the `native-cuda` feature is enabled and a CUDA device is present
+    /// the NVRTC Q8_0 GEMV kernel is tried first; any failure other than
+    /// "no CUDA device" is logged as a warning and the CPU scalar path runs
+    /// instead.
     pub fn forward(&self, input: &[f32], output: &mut [f32]) -> ModelResult<()> {
+        #[cfg(all(feature = "native-cuda", any(target_os = "linux", target_os = "windows")))]
+        if oxibonsai_kernels::CudaGraph::global().is_ok() {
+            // SAFETY: BlockQ8_0 is #[repr(C)] with size BLOCK_Q8_0_BYTES (= 34).
+            // The compile-time assert above and the one in oxibonsai_core::quant_std
+            // both guarantee this layout.
+            let raw = unsafe {
+                std::slice::from_raw_parts(
+                    self.blocks.as_ptr().cast::<u8>(),
+                    self.blocks.len() * oxibonsai_core::BLOCK_Q8_0_BYTES,
+                )
+            };
+            match oxibonsai_kernels::cuda_gemv_q8_0(
+                raw,
+                input,
+                output,
+                self.out_features,
+                self.in_features,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let msg = format!("{e}");
+                    if !msg.contains("no CUDA device") {
+                        tracing::warn!(
+                            error = %e,
+                            "CUDA Q8_0 GEMV failed, falling back to CPU scalar"
+                        );
+                    }
+                }
+            }
+        }
         gemv_q8_0(self.blocks, input, output, self.out_features, self.in_features)
             .map_err(ModelError::Kernel)
     }

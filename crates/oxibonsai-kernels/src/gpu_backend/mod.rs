@@ -31,6 +31,16 @@ pub mod cuda_attn_kernels;
     feature = "native-cuda",
     any(target_os = "linux", target_os = "windows")
 ))]
+pub mod cuda_fp8_kernels;
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub mod cuda_q_std_kernels;
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
 pub mod cuda_full_layer;
 #[cfg(all(
     feature = "native-cuda",
@@ -109,7 +119,19 @@ pub use cuda_full_layer::{
     feature = "native-cuda",
     any(target_os = "linux", target_os = "windows")
 ))]
-pub use cuda_prefill::try_cuda_prefill;
+pub use cuda_prefill::{try_cuda_prefill, try_cuda_prefill_ternary};
+
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub use cuda_fp8_kernels::{cuda_gemv_fp8_e4m3, cuda_gemv_fp8_e5m2};
+
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub use cuda_q_std_kernels::{cuda_gemv_q4_0, cuda_gemv_q8_0};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // DeviceBuffer

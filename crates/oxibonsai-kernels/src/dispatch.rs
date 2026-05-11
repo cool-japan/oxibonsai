@@ -826,6 +826,17 @@ impl TernaryKernel for KernelDispatcher {
     }
 }
 
+// Compile-time size checks: BlockFP8E4M3/E5M2 must be exactly BLOCK_FP8_BYTES (34).
+// This ensures the raw-pointer cast in the CUDA GPU dispatch is sound.
+const _: () = assert!(
+    std::mem::size_of::<oxibonsai_core::BlockFP8E4M3>()
+        == oxibonsai_core::BLOCK_FP8_BYTES
+);
+const _: () = assert!(
+    std::mem::size_of::<oxibonsai_core::BlockFP8E5M2>()
+        == oxibonsai_core::BLOCK_FP8_BYTES
+);
+
 impl Fp8Kernel for KernelDispatcher {
     /// Dequantize FP8 E4M3FN blocks — tier-aware SIMD dispatch.
     fn dequant_fp8_e4m3(&self, blocks: &[BlockFP8E4M3], output: &mut [f32]) -> KernelResult<()> {
@@ -865,7 +876,12 @@ impl Fp8Kernel for KernelDispatcher {
         }
     }
 
-    /// FP8 E4M3FN GEMV — tier-aware SIMD dispatch.
+    /// FP8 E4M3FN GEMV — tier-aware SIMD dispatch with optional CUDA GPU acceleration.
+    ///
+    /// When the `native-cuda` feature is enabled and a CUDA device is available,
+    /// this function dispatches to the CUDA FP8 GEMV kernel before falling back to
+    /// CPU SIMD.  The raw-byte cast of `blocks` to `*const u8` is sound because
+    /// `BlockFP8E4M3` is `#[repr(C)]` with size `BLOCK_FP8_BYTES = 34`.
     fn gemv_fp8_e4m3(
         &self,
         blocks: &[BlockFP8E4M3],
@@ -874,6 +890,37 @@ impl Fp8Kernel for KernelDispatcher {
         n_rows: usize,
         k: usize,
     ) -> KernelResult<()> {
+        // GPU dispatch via CUDA NVRTC — Linux/Windows only, native-cuda feature.
+        #[cfg(all(
+            feature = "native-cuda",
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        {
+            // SAFETY: BlockFP8E4M3 is repr(C) with size BLOCK_FP8_BYTES (= 34),
+            // validated by the compile-time assert above.  The slice lifetime is
+            // tied to `blocks` which outlives this call.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    blocks.as_ptr().cast::<u8>(),
+                    blocks.len() * oxibonsai_core::BLOCK_FP8_BYTES,
+                )
+            };
+            match crate::gpu_backend::cuda_gemv_fp8_e4m3(bytes, input, output, n_rows, k) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    // No CUDA device — fall through to CPU SIMD path silently.
+                    // Any other error is logged at warn level and we fall through.
+                    let msg = e.to_string();
+                    if !msg.contains("no CUDA device") {
+                        tracing::warn!(
+                            error = %e,
+                            "CUDA FP8 E4M3 GEMV failed, falling back to CPU SIMD"
+                        );
+                    }
+                }
+            }
+        }
+
         match self.tier {
             #[cfg(target_arch = "x86_64")]
             KernelTier::Avx512 => unsafe {
@@ -891,7 +938,11 @@ impl Fp8Kernel for KernelDispatcher {
         }
     }
 
-    /// FP8 E5M2 GEMV — tier-aware SIMD dispatch.
+    /// FP8 E5M2 GEMV — tier-aware SIMD dispatch with optional CUDA GPU acceleration.
+    ///
+    /// Mirrors [`gemv_fp8_e4m3`](Self::gemv_fp8_e4m3) in dispatch strategy.
+    /// The raw-byte cast is sound because `BlockFP8E5M2` is `#[repr(C)]` with
+    /// size `BLOCK_FP8_BYTES = 34`.
     fn gemv_fp8_e5m2(
         &self,
         blocks: &[BlockFP8E5M2],
@@ -900,6 +951,34 @@ impl Fp8Kernel for KernelDispatcher {
         n_rows: usize,
         k: usize,
     ) -> KernelResult<()> {
+        // GPU dispatch via CUDA NVRTC — Linux/Windows only, native-cuda feature.
+        #[cfg(all(
+            feature = "native-cuda",
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        {
+            // SAFETY: BlockFP8E5M2 is repr(C) with size BLOCK_FP8_BYTES (= 34),
+            // validated by the compile-time assert above.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    blocks.as_ptr().cast::<u8>(),
+                    blocks.len() * oxibonsai_core::BLOCK_FP8_BYTES,
+                )
+            };
+            match crate::gpu_backend::cuda_gemv_fp8_e5m2(bytes, input, output, n_rows, k) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.contains("no CUDA device") {
+                        tracing::warn!(
+                            error = %e,
+                            "CUDA FP8 E5M2 GEMV failed, falling back to CPU SIMD"
+                        );
+                    }
+                }
+            }
+        }
+
         match self.tier {
             #[cfg(target_arch = "x86_64")]
             KernelTier::Avx512 => unsafe {

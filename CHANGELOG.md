@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - Phase 22
+
+### Added
+- **Q4_0/Q8_0 CUDA full-forward dispatch** (`oxibonsai-model`, `oxibonsai-kernels`): `LinearQ4_0::forward` and `LinearQ8_0::forward` now dispatch to `cuda_gemv_q4_0`/`cuda_gemv_q8_0` NVRTC kernels when a CUDA device is available (Linux/Windows, `native-cuda` feature), falling back silently to CPU scalar on error. `BonsaiModel::forward` and `forward_prefill` detect `OutputWeight::Q4_0/Q8_0` + CUDA availability and route directly through the block dispatch loop, bypassing the Q1-only CUDA graph attempt. Includes `tracing::debug!` profile logging and compile-time `BlockQ4_0`/`BlockQ8_0` layout assertions.
+
+---
+
+## [Unreleased] - Phase 21
+
+### Added
+- **FP8 CUDA early-dispatch** (`oxibonsai-model`): `BonsaiModel::forward` and `forward_prefill` now detect `OutputWeight::FP8E4M3/E5M2` + CUDA availability and route directly through the block dispatch loop (which calls `cuda_gemv_fp8_e4m3/e5m2` via `KernelTier::Gpu`), bypassing the Q1-only CUDA graph attempt entirely. Includes `tracing::debug!` profile logging.
+- **Block accessor methods** (`oxibonsai-model`): 14 FP8 E4M3/E5M2 block accessors (`attn_q/k/v/output_blocks_fp8e4m3`, `ffn_gate/up/down_blocks_fp8e4m3`, same for E5M2) and 14 Q4_0/Q8_0 block accessors added to `TransformerBlock`, delegating to the existing `LinearLayer::blocks_*` methods.
+- **CUDA Q4_0 / Q8_0 GEMV kernels** (`oxibonsai-kernels`): `cuda_gemv_q4_0` and `cuda_gemv_q8_0` NVRTC kernels with warp-per-row reduction. Q4_0: 18-byte AoS blocks (FP16 scale + nibble-packed int4); Q8_0: 34-byte AoS blocks (FP16 scale + int8). Public functions callable from the forward dispatch in a future phase.
+
+---
+
+## [Unreleased] - Phase 20
+
+### Added
+- **CUDA ternary batch prefill** (`oxibonsai-kernels`): three new NVRTC kernels (`gemm_tq2_g128_v7`, `gemm_tq2_g128_v7_residual`, `fused_gate_up_swiglu_gemm_tq2`) enabling fused TQ2_0_g128 batch GEMM on CUDA. Replaces the sequential single-token fallback for Ternary models on CUDA hosts. Cap-of-8 outer loop prevents silent batch-size truncation (kernel_pattern_capof8). New `try_cuda_prefill_ternary` entry point; per-token `encode_attn_phase_tq2` for sequential attention within the batched prefill.
+- **CUDA FP8 GEMV** (`oxibonsai-kernels`): `cuda_gemv_fp8_e4m3` and `cuda_gemv_fp8_e5m2` NVRTC kernels with warp-per-row warp-shuffle reduction and AoS block decode (32-weight blocks, FP16 scale at byte offset 32). `KernelDispatcher` with `KernelTier::Gpu` now routes `Fp8Kernel::gemv_fp8_e4m3/e5m2` calls to the GPU path on Linux/Windows.
+
+---
+
 ## [Unreleased] - Phase 15 (0.1.5 preview)
 
 ### Added

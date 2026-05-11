@@ -61,11 +61,12 @@ pub use gpu_backend::{
     any(target_os = "linux", target_os = "windows")
 ))]
 pub use gpu_backend::{
-    try_cuda_ffn, try_cuda_full_forward, try_cuda_full_forward_ternary,
+    cuda_gemv_fp8_e4m3, cuda_gemv_fp8_e5m2, cuda_gemv_q4_0, cuda_gemv_q8_0, try_cuda_ffn,
+    try_cuda_full_forward, try_cuda_full_forward_ternary,
     try_cuda_full_forward_ternary_with_gpu_lm_head, try_cuda_full_forward_with_gpu_lm_head,
-    try_cuda_full_layer, try_cuda_prefill, try_cuda_qkv, CudaCachedLayerWeights,
-    CudaFullForwardLayerParams, CudaFullForwardLayerParamsTernary, CudaGraph, CudaGraphError,
-    NativeCudaBackend,
+    try_cuda_full_layer, try_cuda_prefill, try_cuda_prefill_ternary, try_cuda_qkv,
+    CudaCachedLayerWeights, CudaFullForwardLayerParams, CudaFullForwardLayerParamsTernary,
+    CudaGraph, CudaGraphError, NativeCudaBackend,
 };
 
 pub mod dequant;

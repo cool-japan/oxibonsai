@@ -776,6 +776,148 @@ pub unsafe fn encode_attn_phase(
 }
 
 // =============================================================================
+// encode_attn_phase_tq2
+// =============================================================================
+
+/// Encode the full attention sublayer using TQ2 (ternary) QKV GEMV on the CUDA stream (steps 1-7).
+///
+/// Identical to `encode_attn_phase` but uses `graph.launch_gemv_tq2_v1_pub` for step 2
+/// instead of `graph.launch_gemv_pub` (Q1). Required by the ternary prefill path
+/// (`encode_prefill_layer_ternary`) which runs sequential per-token attention with TQ2 weights.
+///
+/// On return `bufs.d_attn_out` holds `[nq * head_dim]` attention output values.
+///
+/// # Safety
+/// The function launches CUDA kernels.  The caller must ensure all GPU state
+/// is valid and the stream is not concurrently used.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn encode_attn_phase_tq2(
+    graph: &CudaGraph,
+    mods: &CudaAttnModules,
+    d_pre_norm_weight: &CudaSlice<f32>,
+    d_fused_qkv_weight: &Arc<CudaSlice<u8>>,
+    d_q_norm_weight: &CudaSlice<f32>,
+    d_k_norm_weight: &CudaSlice<f32>,
+    kv: &mut CudaKvCache,
+    layer_idx: usize,
+    nq: usize,
+    nkv: usize,
+    head_dim: usize,
+    heads_per_group: usize,
+    norm_eps: f32,
+    hidden_size: usize,
+    bufs: &mut CudaFullLayerBuffers,
+) -> Result<(), CudaGraphError> {
+    let h_u32 = hidden_size as u32;
+    let nq_u32 = nq as u32;
+    let nkv_u32 = nkv as u32;
+    let hd_u32 = head_dim as u32;
+    let qkv_total_rows = (nq * head_dim + 2 * nkv * head_dim) as u32;
+    let heads_per_group_u32 = heads_per_group as u32;
+    let max_seq_u32 = bufs.max_seq as u32;
+    let inv_sqrt_hd = 1.0f32 / (head_dim as f32).sqrt();
+    let layer_offset = kv.layer_offset_elements(layer_idx);
+
+    // Step 1: RMSNorm(d_hidden, norm_weight -> d_normed)
+    graph.launch_rmsnorm_pub(
+        &bufs.d_hidden,
+        d_pre_norm_weight,
+        &mut bufs.d_normed,
+        h_u32,
+        norm_eps,
+    )?;
+
+    // Step 2: Fused QKV TQ2 GEMV (normed -> d_qkv)
+    graph.launch_gemv_tq2_v1_pub(
+        d_fused_qkv_weight,
+        &bufs.d_normed,
+        &mut bufs.d_qkv,
+        qkv_total_rows,
+        h_u32,
+    )?;
+
+    // Step 3: Fused QK-Norm + RoPE
+    let k_offset = nq * head_dim;
+    let k_in_view = bufs.d_qkv.slice(k_offset..);
+    launch_fused_qk_norm_rope(
+        graph,
+        mods,
+        &bufs.d_qkv,
+        &k_in_view,
+        &mut bufs.d_q_rope,
+        &mut bufs.d_k_rope,
+        d_q_norm_weight,
+        d_k_norm_weight,
+        &bufs.d_cos,
+        &bufs.d_sin,
+        nq_u32,
+        nkv_u32,
+        hd_u32,
+        norm_eps,
+    )?;
+
+    // Step 4: Fused KV-Store — pos read from d_pos_seqlen[0] by the kernel
+    let v_offset = (nq + nkv) * head_dim;
+    let v_view = bufs.d_qkv.slice(v_offset..);
+    launch_fused_kv_store(
+        graph,
+        mods,
+        &bufs.d_k_rope,
+        &v_view,
+        &mut kv.k_cache,
+        &mut kv.v_cache,
+        hd_u32,
+        nkv_u32,
+        max_seq_u32,
+        &bufs.d_pos_seqlen,
+        layer_offset,
+    )?;
+
+    // Step 5: Batched attention scores V2 — seq_len read from d_pos_seqlen[1]
+    launch_batched_attn_scores_v2(
+        graph,
+        mods,
+        &bufs.d_q_rope,
+        &kv.k_cache,
+        &mut bufs.d_scores,
+        hd_u32,
+        nq_u32,
+        nkv_u32,
+        heads_per_group_u32,
+        max_seq_u32,
+        &bufs.d_pos_seqlen,
+        inv_sqrt_hd,
+        layer_offset,
+    )?;
+
+    // Step 6: Softmax — seq_len read from d_pos_seqlen[1]
+    launch_batched_softmax(
+        graph,
+        mods,
+        &mut bufs.d_scores,
+        nq_u32,
+        max_seq_u32,
+        &bufs.d_pos_seqlen,
+    )?;
+
+    // Step 7: Weighted sum — seq_len read from d_pos_seqlen[1]
+    launch_batched_attn_weighted_sum(
+        graph,
+        mods,
+        &bufs.d_scores,
+        &kv.v_cache,
+        &mut bufs.d_attn_out,
+        hd_u32,
+        nq_u32,
+        nkv_u32,
+        heads_per_group_u32,
+        max_seq_u32,
+        &bufs.d_pos_seqlen,
+        layer_offset,
+    )
+}
+
+// =============================================================================
 // Re-exports from encode_q1
 // =============================================================================
 

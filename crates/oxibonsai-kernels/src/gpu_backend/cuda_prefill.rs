@@ -30,8 +30,9 @@ use cudarc::driver::{CudaFunction, CudaSlice, CudaView, LaunchConfig, PushKernel
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::cuda_full_layer::{
-    encode_attn_phase, init_attn_modules, CudaAttnModules, CudaFullForwardLayerParams,
-    CudaFullLayerBuffers, CudaKvCache,
+    encode_attn_phase, encode_attn_phase_tq2, init_attn_modules, CudaAttnModules,
+    CudaFullForwardLayerParams, CudaFullForwardLayerParamsTernary, CudaFullLayerBuffers,
+    CudaKvCache,
 };
 use super::cuda_graph::{compile_or_load_ptx, CudaGraph, CudaGraphError};
 use super::cuda_prefill_kernels::CUDA_PREFILL_KERNELS_SRC;
@@ -117,13 +118,19 @@ impl CudaPrefillBuffers {
 // Compiled prefill CUDA modules
 // =============================================================================
 
-/// Compiled CUDA function handles for the 5 prefill kernels.
+/// Compiled CUDA function handles for the 8 prefill kernels (5 Q1 + 3 TQ2).
 pub struct CudaPrefillModules {
     pub gemm_v7: CudaFunction,
     pub gemm_v7_residual: CudaFunction,
     pub fused_gate_up_swiglu_gemm: CudaFunction,
     pub batched_swiglu: CudaFunction,
     pub batched_rmsnorm: CudaFunction,
+    /// TQ2 batch GEMM — accumulates into output with `+=`.
+    pub gemm_tq2_v7: CudaFunction,
+    /// TQ2 batch GEMM + fused in-place residual add.
+    pub gemm_tq2_v7_residual: CudaFunction,
+    /// TQ2 fused gate+up+SwiGLU batch GEMM.
+    pub fused_gate_up_swiglu_gemm_tq2: CudaFunction,
 }
 
 // SAFETY: CudaFunction is Send in cudarc.
@@ -197,6 +204,9 @@ pub fn init_prefill_modules(graph: &CudaGraph) -> Result<Arc<CudaPrefillModules>
         fused_gate_up_swiglu_gemm: load("fused_gate_up_swiglu_gemm_q1")?,
         batched_swiglu: load("batched_swiglu")?,
         batched_rmsnorm: load("batched_rmsnorm_v2")?,
+        gemm_tq2_v7: load("gemm_tq2_g128_v7")?,
+        gemm_tq2_v7_residual: load("gemm_tq2_g128_v7_residual")?,
+        fused_gate_up_swiglu_gemm_tq2: load("fused_gate_up_swiglu_gemm_tq2")?,
     });
 
     *guard = Some(Arc::clone(&modules));
@@ -567,6 +577,119 @@ unsafe fn launch_batched_rmsnorm(
 }
 
 // =============================================================================
+// TQ2 prefill kernel launchers
+// =============================================================================
+
+/// Launch `gemm_tq2_g128_v7` (batch TQ2 GEMM, accumulate into outputs with `+=`).
+///
+/// # Safety
+/// All slices must be valid device pointers allocated on `graph.stream_arc()`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_gemm_tq2_v7(
+    graph: &CudaGraph,
+    mods: &CudaPrefillModules,
+    d_soa_raw: &CudaSlice<u8>,
+    d_inputs: &CudaSlice<f32>,
+    d_outputs: &mut CudaSlice<f32>,
+    n_rows: u32,
+    k: u32,
+    batch_size: u32,
+) -> Result<(), CudaGraphError> {
+    let grid_x = n_rows.div_ceil(8);
+    let cfg = LaunchConfig {
+        grid_dim: (grid_x, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    graph
+        .stream_arc()
+        .launch_builder(&mods.gemm_tq2_v7)
+        .arg(d_soa_raw)
+        .arg(d_inputs)
+        .arg(d_outputs)
+        .arg(&n_rows)
+        .arg(&k)
+        .arg(&batch_size)
+        .launch(cfg)
+        .map(|_| ())
+        .map_err(|e| CudaGraphError::DriverError(format!("gemm_tq2_v7 launch: {e}")))
+}
+
+/// Launch `gemm_tq2_g128_v7_residual` (batch TQ2 GEMM + fused residual overwrite).
+///
+/// # Safety
+/// All slices must be valid device pointers allocated on `graph.stream_arc()`.
+#[allow(clippy::too_many_arguments, dead_code)]
+unsafe fn launch_gemm_tq2_v7_residual(
+    graph: &CudaGraph,
+    mods: &CudaPrefillModules,
+    d_soa_raw: &CudaSlice<u8>,
+    d_inputs: &CudaSlice<f32>,
+    d_outputs: &mut CudaSlice<f32>,
+    n_rows: u32,
+    k: u32,
+    batch_size: u32,
+    d_residual: &CudaSlice<f32>,
+) -> Result<(), CudaGraphError> {
+    let grid_x = n_rows.div_ceil(8);
+    let cfg = LaunchConfig {
+        grid_dim: (grid_x, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    graph
+        .stream_arc()
+        .launch_builder(&mods.gemm_tq2_v7_residual)
+        .arg(d_soa_raw)
+        .arg(d_inputs)
+        .arg(d_outputs)
+        .arg(&n_rows)
+        .arg(&k)
+        .arg(&batch_size)
+        .arg(d_residual)
+        .launch(cfg)
+        .map(|_| ())
+        .map_err(|e| CudaGraphError::DriverError(format!("gemm_tq2_v7_residual launch: {e}")))
+}
+
+/// Launch `fused_gate_up_swiglu_gemm_tq2` (batch fused TQ2 gate+up+SwiGLU GEMM).
+///
+/// # Safety
+/// All slices must be valid device pointers allocated on `graph.stream_arc()`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_fused_gate_up_swiglu_gemm_tq2(
+    graph: &CudaGraph,
+    mods: &CudaPrefillModules,
+    d_soa_raw: &CudaSlice<u8>,
+    d_inputs: &CudaSlice<f32>,
+    d_outputs: &mut CudaSlice<f32>,
+    n_rows: u32,
+    k: u32,
+    batch_size: u32,
+) -> Result<(), CudaGraphError> {
+    let grid_x = n_rows.div_ceil(8);
+    let cfg = LaunchConfig {
+        grid_dim: (grid_x, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    graph
+        .stream_arc()
+        .launch_builder(&mods.fused_gate_up_swiglu_gemm_tq2)
+        .arg(d_soa_raw)
+        .arg(d_inputs)
+        .arg(d_outputs)
+        .arg(&n_rows)
+        .arg(&k)
+        .arg(&batch_size)
+        .launch(cfg)
+        .map(|_| ())
+        .map_err(|e| {
+            CudaGraphError::DriverError(format!("fused_gate_up_swiglu_gemm_tq2 launch: {e}"))
+        })
+}
+
+// =============================================================================
 // encode_prefill_ffn_phase
 // =============================================================================
 
@@ -645,6 +768,79 @@ pub unsafe fn encode_prefill_ffn_phase(
     )?;
 
     // residual add: d_input[i] += d_normed[i]  (total = bs * hidden_size elements)
+    let total_bh = (pb.actual_batch_size * pb.hidden_size) as u32;
+    graph.launch_residual_add_pub(&mut pb.d_input, &pb.d_normed, total_bh)?;
+
+    Ok(())
+}
+
+// =============================================================================
+// encode_prefill_ffn_phase_ternary
+// =============================================================================
+
+/// Batched FFN sublayer for TQ2 models: RMSNorm → TQ2 fused gate+up+SwiGLU → TQ2 down + residual.
+///
+/// # Safety
+/// All device buffers must be valid on `graph.stream_arc()`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn encode_prefill_ffn_phase_ternary(
+    graph: &CudaGraph,
+    pmods: &CudaPrefillModules,
+    d_ffn_norm_weight: &CudaSlice<f32>,
+    d_gate_up_weight: &Arc<CudaSlice<u8>>,
+    d_down_weight: &Arc<CudaSlice<u8>>,
+    pb: &mut CudaPrefillBuffers,
+    eps: f32,
+) -> Result<(), CudaGraphError> {
+    let bs = pb.actual_batch_size as u32;
+    let h = pb.hidden_size as u32;
+    let inter = pb.intermediate_size as u32;
+
+    // Step 1: Batched RMSNorm (all tokens)
+    launch_batched_rmsnorm(
+        graph,
+        pmods,
+        &pb.d_input,
+        d_ffn_norm_weight,
+        &mut pb.d_normed,
+        h,
+        bs,
+        eps,
+    )?;
+
+    // Step 2: Fused TQ2 gate+up+SwiGLU GEMM (all tokens)
+    //   d_normed [bs × h, col-major] → d_swiglu [bs × inter, col-major]
+    launch_fused_gate_up_swiglu_gemm_tq2(
+        graph,
+        pmods,
+        d_gate_up_weight,
+        &pb.d_normed,
+        &mut pb.d_swiglu,
+        inter,
+        h,
+        bs,
+    )?;
+
+    // Step 3: TQ2 Down GEMM into d_normed (scratch), then in-place residual add.
+    {
+        let n = pb.actual_batch_size * pb.hidden_size;
+        let mut dst_view = pb.d_normed.slice_mut(0..n);
+        graph
+            .stream_arc()
+            .memset_zeros(&mut dst_view)
+            .map_err(|e| CudaGraphError::DriverError(format!("zero d_normed tq2 down: {e}")))?;
+    }
+    launch_gemm_tq2_v7(
+        graph,
+        pmods,
+        d_down_weight,
+        &pb.d_swiglu,
+        &mut pb.d_normed,
+        h,
+        inter,
+        bs,
+    )?;
+
     let total_bh = (pb.actual_batch_size * pb.hidden_size) as u32;
     graph.launch_residual_add_pub(&mut pb.d_input, &pb.d_normed, total_bh)?;
 
@@ -882,6 +1078,228 @@ pub unsafe fn encode_prefill_layer(
     // 5. Batched FFN (RMSNorm → fused gate+up+SwiGLU → down + residual)
     // ════════════════════════════════════════════════════════════════════
     encode_prefill_ffn_phase(
+        graph,
+        pmods,
+        d_ffn_norm_weight,
+        d_gate_up_weight,
+        d_down_weight,
+        pb,
+        eps,
+    )?;
+
+    Ok(())
+}
+
+// =============================================================================
+// encode_prefill_layer_ternary
+// =============================================================================
+
+/// Encode one full transformer layer for batch prefill using TQ2 (ternary) weights.
+///
+/// Non-attention batch operations use TQ2 GEMM kernels.  Attention is processed
+/// sequentially per token using `encode_attn_phase_tq2` (TQ2-aware single-token
+/// attention that runs its own RMSNorm + TQ2 QKV GEMV).
+///
+/// On entry / exit, `pb.d_input` holds the batched residual stream
+/// `[batch_size × hidden_size]` in column-major layout.
+///
+/// # Safety
+/// All device buffers and weight slices must be valid on `graph.stream_arc()`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn encode_prefill_layer_ternary(
+    graph: &CudaGraph,
+    pmods: &CudaPrefillModules,
+    attn_mods: &CudaAttnModules,
+    d_attn_norm_weight: &CudaSlice<f32>,
+    d_fused_qkv_weight: &Arc<CudaSlice<u8>>,
+    d_q_norm_weight: &CudaSlice<f32>,
+    d_k_norm_weight: &CudaSlice<f32>,
+    d_attn_proj_weight: &Arc<CudaSlice<u8>>,
+    d_ffn_norm_weight: &CudaSlice<f32>,
+    d_gate_up_weight: &Arc<CudaSlice<u8>>,
+    d_down_weight: &Arc<CudaSlice<u8>>,
+    kv: &mut CudaKvCache,
+    layer_idx: usize,
+    pos_start: usize,
+    pb: &mut CudaPrefillBuffers,
+    st_bufs: &mut CudaFullLayerBuffers,
+    cos_table: &[f32],
+    sin_table: &[f32],
+    heads_per_group: usize,
+    eps: f32,
+) -> Result<(), CudaGraphError> {
+    let bs = pb.actual_batch_size;
+    let h = pb.hidden_size;
+    let nq = pb.nq;
+    let nkv = pb.nkv;
+    let hd = pb.head_dim;
+    let half_dim = hd / 2;
+    let h_u32 = h as u32;
+    let bs_u32 = bs as u32;
+    let qkv_total = nq * hd + 2 * nkv * hd;
+
+    // ════════════════════════════════════════════════════════════════════
+    // 1. Batched RMSNorm (attn norm): d_input → d_normed
+    // ════════════════════════════════════════════════════════════════════
+    launch_batched_rmsnorm(
+        graph,
+        pmods,
+        &pb.d_input,
+        d_attn_norm_weight,
+        &mut pb.d_normed,
+        h_u32,
+        bs_u32,
+        eps,
+    )?;
+
+    // ════════════════════════════════════════════════════════════════════
+    // 2. Batched TQ2 QKV GEMM: d_normed → d_qkv (all tokens at once)
+    //    Zero-init d_qkv first so accumulate (+=) is correct.
+    // ════════════════════════════════════════════════════════════════════
+    {
+        let n = bs * qkv_total;
+        let mut dst_view = pb.d_qkv.slice_mut(0..n);
+        graph
+            .stream_arc()
+            .memset_zeros(&mut dst_view)
+            .map_err(|e| CudaGraphError::DriverError(format!("zero d_qkv tq2: {e}")))?;
+    }
+    launch_gemm_tq2_v7(
+        graph,
+        pmods,
+        d_fused_qkv_weight,
+        &pb.d_normed,
+        &mut pb.d_qkv,
+        qkv_total as u32,
+        h_u32,
+        bs_u32,
+    )?;
+
+    // ════════════════════════════════════════════════════════════════════
+    // 3. Sequential attention for each token (TQ2-aware)
+    //
+    // For each token t at sequence position (pos_start + t):
+    //   a) Copy this token's hidden state into st_bufs.d_hidden
+    //   b) Upload pos/seqlen to st_bufs.d_pos_seqlen
+    //   c) Upload RoPE cos/sin for this token's position
+    //   d) Call encode_attn_phase_tq2: runs rmsnorm + TQ2 QKV GEMV +
+    //      qk-norm+rope + kv-store + scores + softmax + weighted sum
+    //   e) Copy attention output for this token → pb.d_attn_out column t
+    // ════════════════════════════════════════════════════════════════════
+    {
+        let n = bs * nq * hd;
+        let mut dst_view = pb.d_attn_out.slice_mut(0..n);
+        graph
+            .stream_arc()
+            .memset_zeros(&mut dst_view)
+            .map_err(|e| CudaGraphError::DriverError(format!("zero d_attn_out tq2: {e}")))?;
+    }
+
+    for t in 0..bs {
+        let pos = pos_start + t;
+
+        // Copy token t's hidden state column into st_bufs.d_hidden
+        {
+            let src_view: CudaView<f32> = pb.d_input.slice(t * h..(t + 1) * h);
+            graph
+                .stream_arc()
+                .memcpy_dtod(&src_view, &mut st_bufs.d_hidden)
+                .map_err(|e| {
+                    CudaGraphError::DriverError(format!("copy hidden tq2 t={t}: {e}"))
+                })?;
+        }
+
+        // Upload pos/seqlen [pos, pos+1] into st_bufs.d_pos_seqlen
+        let pos_seqlen = [pos as u32, (pos + 1) as u32];
+        graph
+            .stream_arc()
+            .memcpy_htod(&pos_seqlen, &mut st_bufs.d_pos_seqlen)
+            .map_err(|e| {
+                CudaGraphError::DriverError(format!("upload pos_seqlen tq2 t={t}: {e}"))
+            })?;
+
+        // Upload RoPE cos/sin for this token's position.
+        let rope_off = t * half_dim;
+        graph
+            .stream_arc()
+            .memcpy_htod(
+                &cos_table[rope_off..rope_off + half_dim],
+                &mut st_bufs.d_cos,
+            )
+            .map_err(|e| CudaGraphError::DriverError(format!("upload cos tq2 t={t}: {e}")))?;
+        graph
+            .stream_arc()
+            .memcpy_htod(
+                &sin_table[rope_off..rope_off + half_dim],
+                &mut st_bufs.d_sin,
+            )
+            .map_err(|e| CudaGraphError::DriverError(format!("upload sin tq2 t={t}: {e}")))?;
+
+        // Run TQ2-aware single-token attention pipeline (RMSNorm + TQ2 GEMV + attention).
+        encode_attn_phase_tq2(
+            graph,
+            attn_mods,
+            d_attn_norm_weight,
+            d_fused_qkv_weight,
+            d_q_norm_weight,
+            d_k_norm_weight,
+            kv,
+            layer_idx,
+            nq,
+            nkv,
+            hd,
+            heads_per_group,
+            eps,
+            h,
+            st_bufs,
+        )?;
+
+        // Copy attention output for this token from st_bufs.d_attn_out into
+        // the column of pb.d_attn_out [t * nq*hd .. (t+1)*nq*hd]
+        {
+            let src_view: CudaView<f32> = st_bufs.d_attn_out.slice(..nq * hd);
+            let mut dst_view = pb.d_attn_out.slice_mut(t * nq * hd..(t + 1) * nq * hd);
+            graph
+                .stream_arc()
+                .memcpy_dtod(&src_view, &mut dst_view)
+                .map_err(|e| {
+                    CudaGraphError::DriverError(format!("copy attn_out tq2 t={t}: {e}"))
+                })?;
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // 4. TQ2 Output projection GEMM + residual (all tokens at once)
+    //    attn_out_proj: [h × nq*hd], maps d_attn_out → d_normed (scratch)
+    //    then: d_input += d_normed  (residual add)
+    // ════════════════════════════════════════════════════════════════════
+    {
+        let n = bs * h;
+        let mut dst_view = pb.d_normed.slice_mut(0..n);
+        graph
+            .stream_arc()
+            .memset_zeros(&mut dst_view)
+            .map_err(|e| {
+                CudaGraphError::DriverError(format!("zero d_normed tq2 oproj: {e}"))
+            })?;
+    }
+    launch_gemm_tq2_v7(
+        graph,
+        pmods,
+        d_attn_proj_weight,
+        &pb.d_attn_out,
+        &mut pb.d_normed,
+        h_u32,
+        (nq * hd) as u32,
+        bs_u32,
+    )?;
+    let total_oproj = (bs * h) as u32;
+    graph.launch_residual_add_pub(&mut pb.d_input, &pb.d_normed, total_oproj)?;
+
+    // ════════════════════════════════════════════════════════════════════
+    // 5. Batched TQ2 FFN
+    // ════════════════════════════════════════════════════════════════════
+    encode_prefill_ffn_phase_ternary(
         graph,
         pmods,
         d_ffn_norm_weight,
@@ -1177,6 +1595,287 @@ pub fn try_cuda_prefill(
 }
 
 // =============================================================================
+// Ternary public entry point
+// =============================================================================
+
+/// Batch prefill (ALL transformer layers + LM head) via CUDA for TQ2 ternary models.
+///
+/// Mirrors [`try_cuda_prefill`] but uses TQ2 GEMM/GEMV launchers throughout.
+/// Caller-supplied handles are used as-is (same namespace as ternary decode 5M–7M).
+#[allow(clippy::too_many_arguments)]
+pub fn try_cuda_prefill_ternary(
+    hidden_batch: &[f32],
+    batch_size: usize,
+    pos_start: usize,
+    n_layers: usize,
+    layer_params: &[CudaFullForwardLayerParamsTernary<'_>],
+    cos_table: &[f32],
+    sin_table: &[f32],
+    hidden_size: usize,
+    intermediate_size: usize,
+    nq: usize,
+    nkv: usize,
+    head_dim: usize,
+    heads_per_group: usize,
+    eps: f32,
+    max_seq_len: usize,
+    final_norm_handle: Option<u64>,
+    final_norm_bytes: Option<&[f32]>,
+    final_norm_eps: f32,
+    lm_head_handle: Option<u64>,
+    lm_head_bytes: Option<&[u8]>,
+    lm_head_out_features: usize,
+    logits_out: Option<&mut Vec<f32>>,
+    greedy_token_id_out: Option<&mut u32>,
+) -> Result<(), CudaGraphError> {
+    if layer_params.len() != n_layers {
+        return Err(CudaGraphError::WeightLayoutError(format!(
+            "layer_params length mismatch (ternary prefill): need {n_layers}, got {}",
+            layer_params.len()
+        )));
+    }
+
+    let half_dim = head_dim / 2;
+
+    if hidden_batch.len() < batch_size * hidden_size {
+        return Err(CudaGraphError::WeightLayoutError(format!(
+            "hidden_batch too short (ternary): need {}, got {}",
+            batch_size * hidden_size,
+            hidden_batch.len()
+        )));
+    }
+    if cos_table.len() < batch_size * half_dim {
+        return Err(CudaGraphError::WeightLayoutError(format!(
+            "cos_table too short (ternary): need {}, got {}",
+            batch_size * half_dim,
+            cos_table.len()
+        )));
+    }
+    if sin_table.len() < batch_size * half_dim {
+        return Err(CudaGraphError::WeightLayoutError(format!(
+            "sin_table too short (ternary): need {}, got {}",
+            batch_size * half_dim,
+            sin_table.len()
+        )));
+    }
+
+    let graph = CudaGraph::global()?;
+    let _t_prefill = super::cuda_full_layer::profiling().then(std::time::Instant::now);
+    let pmods = init_prefill_modules(&graph)?;
+    let attn_mods = init_attn_modules(&graph)?;
+
+    // ── Upload / cache all per-layer TQ2 weights ────────────────────────
+    // Use same type as Q1 path but with TQ2 upload functions.
+    let mut layer_weight_arcs: Vec<LayerWeightArcs> = Vec::with_capacity(n_layers);
+
+    for lp in layer_params {
+        let attn_norm_w =
+            graph.get_or_upload_f32_weight(lp.attn_norm_handle, lp.attn_norm_bytes)?;
+        let q_norm_w = graph.get_or_upload_f32_weight(lp.q_norm_handle, lp.q_norm_bytes)?;
+        let k_norm_w = graph.get_or_upload_f32_weight(lp.k_norm_handle, lp.k_norm_bytes)?;
+        let ffn_norm_w = graph.get_or_upload_f32_weight(lp.ffn_norm_handle, lp.ffn_norm_bytes)?;
+
+        let fused_qkv_w =
+            graph.get_or_upload_weight_tq2_soa(lp.fused_qkv_handle, lp.fused_qkv_bytes)?;
+        let attn_proj_w =
+            graph.get_or_upload_weight_tq2_soa(lp.attn_proj_handle, lp.attn_proj_bytes)?;
+
+        let gate_bytes = lp.gate_bytes;
+        let up_bytes = lp.up_bytes;
+        let gate_up_w = graph.get_or_upload_weight_tq2_soa_lazy(lp.gate_up_handle, || {
+            let mut fused = Vec::with_capacity(gate_bytes.len() + up_bytes.len());
+            fused.extend_from_slice(gate_bytes);
+            fused.extend_from_slice(up_bytes);
+            fused
+        })?;
+
+        let down_w = graph.get_or_upload_weight_tq2_soa(lp.down_handle, lp.down_bytes)?;
+
+        layer_weight_arcs.push((
+            attn_norm_w,
+            fused_qkv_w,
+            q_norm_w,
+            k_norm_w,
+            attn_proj_w,
+            ffn_norm_w,
+            gate_up_w,
+            down_w,
+        ));
+    }
+
+    // ── Acquire activation buffers ───────────────────────────────────────
+    let mut pb_guard = acquire_prefill_buffers(
+        &graph,
+        batch_size,
+        hidden_size,
+        intermediate_size,
+        nq,
+        nkv,
+        head_dim,
+        max_seq_len,
+    )?;
+    let pb = pb_guard
+        .as_mut()
+        .ok_or_else(|| CudaGraphError::DriverError("prefill_buffers not allocated".into()))?;
+
+    let mut kv_guard = acquire_prefill_kv_cache(&graph, n_layers, nkv, max_seq_len, head_dim)?;
+    let kv = kv_guard
+        .as_mut()
+        .ok_or_else(|| CudaGraphError::DriverError("kv_cache not allocated".into()))?;
+
+    let mut st_guard = acquire_single_token_buffers(
+        &graph,
+        hidden_size,
+        nq,
+        nkv,
+        head_dim,
+        max_seq_len,
+        intermediate_size,
+    )?;
+    let st_bufs = st_guard
+        .as_mut()
+        .ok_or_else(|| CudaGraphError::DriverError("st_buffers not allocated".into()))?;
+
+    // ── Upload hidden batch → GPU ────────────────────────────────────────
+    graph
+        .stream_arc()
+        .memcpy_htod(&hidden_batch[..batch_size * hidden_size], &mut pb.d_input)
+        .map_err(|e| CudaGraphError::DriverError(format!("upload hidden_batch tq2: {e}")))?;
+
+    // ── Encode all layers ────────────────────────────────────────────────
+    for (layer_idx, lwa) in layer_weight_arcs.iter().enumerate() {
+        unsafe {
+            encode_prefill_layer_ternary(
+                &graph,
+                &pmods,
+                &attn_mods,
+                &lwa.0, // attn_norm
+                &lwa.1, // fused_qkv (TQ2)
+                &lwa.2, // q_norm
+                &lwa.3, // k_norm
+                &lwa.4, // attn_proj (TQ2)
+                &lwa.5, // ffn_norm
+                &lwa.6, // gate_up (TQ2)
+                &lwa.7, // down (TQ2)
+                kv,
+                layer_idx,
+                pos_start,
+                pb,
+                st_bufs,
+                cos_table,
+                sin_table,
+                heads_per_group,
+                eps,
+            )?;
+        }
+    }
+
+    // ── Final norm + TQ2 LM head on last token ───────────────────────────
+    if let (Some(fn_handle), Some(fn_bytes)) = (final_norm_handle, final_norm_bytes) {
+        let d_final_norm_w = graph.get_or_upload_f32_weight(fn_handle, fn_bytes)?;
+
+        if let (Some(lm_handle), Some(lm_bytes), true) =
+            (lm_head_handle, lm_head_bytes, lm_head_out_features > 0)
+        {
+            let d_lm_head_w = graph.get_or_upload_weight_tq2_soa(lm_handle, lm_bytes)?;
+
+            // Extract last token's hidden state (column batch_size-1)
+            let last_col_start = (batch_size - 1) * hidden_size;
+            let last_col_end = last_col_start + hidden_size;
+
+            {
+                let src_view: CudaView<f32> = pb.d_input.slice(last_col_start..last_col_end);
+                graph
+                    .stream_arc()
+                    .memcpy_dtod(&src_view, &mut st_bufs.d_hidden)
+                    .map_err(|e| {
+                        CudaGraphError::DriverError(format!("copy last hidden tq2: {e}"))
+                    })?;
+            }
+
+            // Single-token final RMSNorm
+            unsafe {
+                graph.launch_rmsnorm_pub(
+                    &st_bufs.d_hidden,
+                    &d_final_norm_w,
+                    &mut st_bufs.d_normed,
+                    hidden_size as u32,
+                    final_norm_eps,
+                )?;
+            }
+
+            // Acquire (or reuse) the cached logits buffer.
+            let mut logits_guard = acquire_prefill_logits(&graph, lm_head_out_features)?;
+            let d_logits = &mut logits_guard
+                .as_mut()
+                .ok_or_else(|| {
+                    CudaGraphError::DriverError("logits buf not allocated".into())
+                })?
+                .0;
+
+            // TQ2 LM head GEMV (single token)
+            unsafe {
+                graph.launch_gemv_tq2_v1_pub(
+                    &d_lm_head_w,
+                    &st_bufs.d_normed,
+                    d_logits,
+                    lm_head_out_features as u32,
+                    hidden_size as u32,
+                )?;
+            }
+
+            // Synchronise stream before D2H
+            graph
+                .stream_arc()
+                .synchronize()
+                .map_err(|e| CudaGraphError::DriverError(format!("tq2 prefill sync: {e}")))?;
+
+            if let Some(out) = greedy_token_id_out {
+                let logits_host = graph
+                    .stream_arc()
+                    .clone_dtoh(d_logits)
+                    .map_err(|e| CudaGraphError::DriverError(format!("dtoh tq2 logits: {e}")))?;
+                *out = logits_host
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, _)| i as u32)
+                    .unwrap_or(0);
+            } else if let Some(out) = logits_out {
+                let logits_host = graph
+                    .stream_arc()
+                    .clone_dtoh(d_logits)
+                    .map_err(|e| CudaGraphError::DriverError(format!("dtoh tq2 logits: {e}")))?;
+                *out = logits_host;
+            }
+
+            if super::cuda_full_layer::profiling() {
+                eprintln!(
+                    "[cuda-prof] tq2 prefill batch={batch_size} pos_start={pos_start}: {:.1}ms (with lm_head)",
+                    _t_prefill.expect("profiling").elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            return Ok(());
+        }
+    }
+
+    // No final norm / LM head requested — just synchronise and return.
+    graph
+        .stream_arc()
+        .synchronize()
+        .map_err(|e| CudaGraphError::DriverError(format!("tq2 prefill sync end: {e}")))?;
+
+    if super::cuda_full_layer::profiling() {
+        eprintln!(
+            "[cuda-prof] tq2 prefill batch={batch_size} pos_start={pos_start}: {:.1}ms",
+            _t_prefill.expect("profiling").elapsed().as_secs_f64() * 1000.0
+        );
+    }
+
+    Ok(())
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -1243,5 +1942,54 @@ mod tests {
             "prefill module init failed: {:?}",
             result.err()
         );
+    }
+
+    /// Host-only: verify kernel source contains all three TQ2 GEMM kernel names.
+    #[test]
+    fn test_prefill_kernel_source_has_gemm_tq2() {
+        assert!(
+            CUDA_PREFILL_KERNELS_SRC.contains("gemm_tq2_g128_v7"),
+            "must contain gemm_tq2_g128_v7"
+        );
+        assert!(
+            CUDA_PREFILL_KERNELS_SRC.contains("gemm_tq2_g128_v7_residual"),
+            "must contain gemm_tq2_g128_v7_residual"
+        );
+        assert!(
+            CUDA_PREFILL_KERNELS_SRC.contains("fused_gate_up_swiglu_gemm_tq2"),
+            "must contain fused_gate_up_swiglu_gemm_tq2"
+        );
+    }
+
+    /// Host-only: verify TQ2 helper functions are present in kernel source.
+    #[test]
+    fn test_prefill_kernel_source_has_tq2_helpers() {
+        assert!(
+            CUDA_PREFILL_KERNELS_SRC.contains("pf_decode_tq2"),
+            "must contain pf_decode_tq2 helper"
+        );
+        assert!(
+            CUDA_PREFILL_KERNELS_SRC.contains("pf_byte_dot_tq2"),
+            "must contain pf_byte_dot_tq2 helper"
+        );
+    }
+
+    /// CI-GPU-gated: compile TQ2 prefill kernels and verify module loads.
+    #[test]
+    fn test_cuda_prefill_tq2_modules_compile() {
+        let graph_result = CudaGraph::global();
+        if graph_result.is_err() {
+            eprintln!("SKIP: test_cuda_prefill_tq2_modules_compile — no CUDA device");
+            return;
+        }
+        let graph = graph_result.expect("tq2 prefill graph init should succeed");
+        let result = init_prefill_modules(&graph);
+        assert!(
+            result.is_ok(),
+            "TQ2 prefill module init failed (kernel compile error?): {:?}",
+            result.err()
+        );
+        // Verify the TQ2 modules are accessible (they are fields of CudaPrefillModules).
+        // If we got Ok, all 8 kernels (5 Q1 + 3 TQ2) compiled and loaded successfully.
     }
 }

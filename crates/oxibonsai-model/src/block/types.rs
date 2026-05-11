@@ -1497,6 +1497,118 @@ impl<'a> TransformerBlock<'a> {
     pub fn ffn_down_blocks_ternary(&self) -> Option<&[oxibonsai_core::BlockTQ2_0_g128]> {
         self.ffn_down.blocks_ternary()
     }
+    /// Q projection FP8 E4M3 block slice — `None` for non-FP8-E4M3 layers.
+    pub fn attn_q_blocks_fp8e4m3(&self) -> Option<&[oxibonsai_core::BlockFP8E4M3]> {
+        self.attn_q.blocks_fp8_e4m3()
+    }
+    /// K projection FP8 E4M3 block slice — `None` for non-FP8-E4M3 layers.
+    pub fn attn_k_blocks_fp8e4m3(&self) -> Option<&[oxibonsai_core::BlockFP8E4M3]> {
+        self.attn_k.blocks_fp8_e4m3()
+    }
+    /// V projection FP8 E4M3 block slice — `None` for non-FP8-E4M3 layers.
+    pub fn attn_v_blocks_fp8e4m3(&self) -> Option<&[oxibonsai_core::BlockFP8E4M3]> {
+        self.attn_v.blocks_fp8_e4m3()
+    }
+    /// Output projection FP8 E4M3 block slice — `None` for non-FP8-E4M3 layers.
+    pub fn attn_output_blocks_fp8e4m3(&self) -> Option<&[oxibonsai_core::BlockFP8E4M3]> {
+        self.attn_output.blocks_fp8_e4m3()
+    }
+    /// FFN gate FP8 E4M3 block slice — `None` for non-FP8-E4M3 layers.
+    pub fn ffn_gate_blocks_fp8e4m3(&self) -> Option<&[oxibonsai_core::BlockFP8E4M3]> {
+        self.ffn_gate.blocks_fp8_e4m3()
+    }
+    /// FFN up FP8 E4M3 block slice — `None` for non-FP8-E4M3 layers.
+    pub fn ffn_up_blocks_fp8e4m3(&self) -> Option<&[oxibonsai_core::BlockFP8E4M3]> {
+        self.ffn_up.blocks_fp8_e4m3()
+    }
+    /// FFN down FP8 E4M3 block slice — `None` for non-FP8-E4M3 layers.
+    pub fn ffn_down_blocks_fp8e4m3(&self) -> Option<&[oxibonsai_core::BlockFP8E4M3]> {
+        self.ffn_down.blocks_fp8_e4m3()
+    }
+    /// Q projection FP8 E5M2 block slice — `None` for non-FP8-E5M2 layers.
+    pub fn attn_q_blocks_fp8e5m2(&self) -> Option<&[oxibonsai_core::BlockFP8E5M2]> {
+        self.attn_q.blocks_fp8_e5m2()
+    }
+    /// K projection FP8 E5M2 block slice — `None` for non-FP8-E5M2 layers.
+    pub fn attn_k_blocks_fp8e5m2(&self) -> Option<&[oxibonsai_core::BlockFP8E5M2]> {
+        self.attn_k.blocks_fp8_e5m2()
+    }
+    /// V projection FP8 E5M2 block slice — `None` for non-FP8-E5M2 layers.
+    pub fn attn_v_blocks_fp8e5m2(&self) -> Option<&[oxibonsai_core::BlockFP8E5M2]> {
+        self.attn_v.blocks_fp8_e5m2()
+    }
+    /// Output projection FP8 E5M2 block slice — `None` for non-FP8-E5M2 layers.
+    pub fn attn_output_blocks_fp8e5m2(&self) -> Option<&[oxibonsai_core::BlockFP8E5M2]> {
+        self.attn_output.blocks_fp8_e5m2()
+    }
+    /// FFN gate FP8 E5M2 block slice — `None` for non-FP8-E5M2 layers.
+    pub fn ffn_gate_blocks_fp8e5m2(&self) -> Option<&[oxibonsai_core::BlockFP8E5M2]> {
+        self.ffn_gate.blocks_fp8_e5m2()
+    }
+    /// FFN up FP8 E5M2 block slice — `None` for non-FP8-E5M2 layers.
+    pub fn ffn_up_blocks_fp8e5m2(&self) -> Option<&[oxibonsai_core::BlockFP8E5M2]> {
+        self.ffn_up.blocks_fp8_e5m2()
+    }
+    /// FFN down FP8 E5M2 block slice — `None` for non-FP8-E5M2 layers.
+    pub fn ffn_down_blocks_fp8e5m2(&self) -> Option<&[oxibonsai_core::BlockFP8E5M2]> {
+        self.ffn_down.blocks_fp8_e5m2()
+    }
+    /// Q projection Q4_0 block slice — `None` for non-Q4_0 layers.
+    pub fn attn_q_blocks_q4_0(&self) -> Option<&[oxibonsai_core::BlockQ4_0]> {
+        self.attn_q.blocks_q4_0()
+    }
+    /// K projection Q4_0 block slice — `None` for non-Q4_0 layers.
+    pub fn attn_k_blocks_q4_0(&self) -> Option<&[oxibonsai_core::BlockQ4_0]> {
+        self.attn_k.blocks_q4_0()
+    }
+    /// V projection Q4_0 block slice — `None` for non-Q4_0 layers.
+    pub fn attn_v_blocks_q4_0(&self) -> Option<&[oxibonsai_core::BlockQ4_0]> {
+        self.attn_v.blocks_q4_0()
+    }
+    /// Output projection Q4_0 block slice — `None` for non-Q4_0 layers.
+    pub fn attn_output_blocks_q4_0(&self) -> Option<&[oxibonsai_core::BlockQ4_0]> {
+        self.attn_output.blocks_q4_0()
+    }
+    /// FFN gate Q4_0 block slice — `None` for non-Q4_0 layers.
+    pub fn ffn_gate_blocks_q4_0(&self) -> Option<&[oxibonsai_core::BlockQ4_0]> {
+        self.ffn_gate.blocks_q4_0()
+    }
+    /// FFN up Q4_0 block slice — `None` for non-Q4_0 layers.
+    pub fn ffn_up_blocks_q4_0(&self) -> Option<&[oxibonsai_core::BlockQ4_0]> {
+        self.ffn_up.blocks_q4_0()
+    }
+    /// FFN down Q4_0 block slice — `None` for non-Q4_0 layers.
+    pub fn ffn_down_blocks_q4_0(&self) -> Option<&[oxibonsai_core::BlockQ4_0]> {
+        self.ffn_down.blocks_q4_0()
+    }
+    /// Q projection Q8_0 block slice — `None` for non-Q8_0 layers.
+    pub fn attn_q_blocks_q8_0(&self) -> Option<&[oxibonsai_core::BlockQ8_0]> {
+        self.attn_q.blocks_q8_0()
+    }
+    /// K projection Q8_0 block slice — `None` for non-Q8_0 layers.
+    pub fn attn_k_blocks_q8_0(&self) -> Option<&[oxibonsai_core::BlockQ8_0]> {
+        self.attn_k.blocks_q8_0()
+    }
+    /// V projection Q8_0 block slice — `None` for non-Q8_0 layers.
+    pub fn attn_v_blocks_q8_0(&self) -> Option<&[oxibonsai_core::BlockQ8_0]> {
+        self.attn_v.blocks_q8_0()
+    }
+    /// Output projection Q8_0 block slice — `None` for non-Q8_0 layers.
+    pub fn attn_output_blocks_q8_0(&self) -> Option<&[oxibonsai_core::BlockQ8_0]> {
+        self.attn_output.blocks_q8_0()
+    }
+    /// FFN gate Q8_0 block slice — `None` for non-Q8_0 layers.
+    pub fn ffn_gate_blocks_q8_0(&self) -> Option<&[oxibonsai_core::BlockQ8_0]> {
+        self.ffn_gate.blocks_q8_0()
+    }
+    /// FFN up Q8_0 block slice — `None` for non-Q8_0 layers.
+    pub fn ffn_up_blocks_q8_0(&self) -> Option<&[oxibonsai_core::BlockQ8_0]> {
+        self.ffn_up.blocks_q8_0()
+    }
+    /// FFN down Q8_0 block slice — `None` for non-Q8_0 layers.
+    pub fn ffn_down_blocks_q8_0(&self) -> Option<&[oxibonsai_core::BlockQ8_0]> {
+        self.ffn_down.blocks_q8_0()
+    }
 }
 /// Pre-allocated scratch buffers for a single TransformerBlock's forward pass.
 /// Eliminates per-token heap allocations in the hot path.
