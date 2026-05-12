@@ -35,10 +35,10 @@ fn extract_final_answer_negative() {
 
 #[test]
 fn extract_final_answer_decimal() {
-    let result = Gsm8kEvaluator::extract_final_answer("So the final cost is #### 3.14");
+    let result = Gsm8kEvaluator::extract_final_answer("So the final cost is #### 2.50");
     assert!(result.is_some(), "expected Some, got None");
     let val = result.unwrap();
-    assert!((val - 3.14).abs() < 1e-10, "got {}", val);
+    assert!((val - 2.50_f64).abs() < 1e-10, "got {val}");
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -178,7 +178,7 @@ fn evaluate_dataset_partial() {
         "Step by step #### 40".to_string(),    // correct
     ];
 
-    let ev = Gsm8kEvaluator::default();
+    let ev = Gsm8kEvaluator::new();
     let result = ev.evaluate_dataset(&dataset, &completions);
 
     assert_eq!(result.total, 4);

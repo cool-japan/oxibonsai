@@ -36,6 +36,16 @@ pub mod cuda_fp8_kernels;
     feature = "native-cuda",
     any(target_os = "linux", target_os = "windows")
 ))]
+pub mod cuda_fp8_prefill;
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub mod cuda_fp8_prefill_kernels;
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
 pub mod cuda_full_layer;
 #[cfg(all(
     feature = "native-cuda",
@@ -47,6 +57,16 @@ pub mod cuda_graph;
     any(target_os = "linux", target_os = "windows")
 ))]
 pub mod cuda_k_quant_kernels;
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub mod cuda_k_quant_prefill;
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub mod cuda_k_quant_prefill_kernels;
 #[cfg(all(
     feature = "native-cuda",
     any(target_os = "linux", target_os = "windows")
@@ -160,6 +180,20 @@ pub use cuda_q_std_kernels::{cuda_gemv_q4_0, cuda_gemv_q8_0};
     any(target_os = "linux", target_os = "windows")
 ))]
 pub use cuda_q_std_prefill::{try_cuda_prefill_q_std, CudaQStdPrefillLayerParams};
+
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub use cuda_k_quant_prefill::{
+    try_cuda_prefill_k_quant, CudaKQuantPrefillLayerParams, KQuantFormat,
+};
+
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub use cuda_fp8_prefill::{try_cuda_prefill_fp8, CudaFP8PrefillLayerParams};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // DeviceBuffer

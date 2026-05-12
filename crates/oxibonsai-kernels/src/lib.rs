@@ -78,6 +78,18 @@ pub use gpu_backend::{
     NativeCudaBackend,
 };
 
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub use gpu_backend::{try_cuda_prefill_k_quant, CudaKQuantPrefillLayerParams, KQuantFormat};
+
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub use gpu_backend::{try_cuda_prefill_fp8, CudaFP8PrefillLayerParams};
+
 pub mod dequant;
 pub mod dequant_fp8;
 pub mod dequant_ternary;

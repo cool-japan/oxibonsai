@@ -744,10 +744,11 @@ fn dequant_e4m3_oversized_output_not_clobbered() {
     dispatcher
         .dequant_fp8_e4m3(&[block], &mut output)
         .expect("dequant should succeed");
-    for i in QK_FP8..output.len() {
+    for (i, &v) in output[QK_FP8..].iter().enumerate() {
+        let gi = QK_FP8 + i;
         assert_eq!(
-            output[i], sentinel,
-            "element {i} should not be modified (was sentinel)"
+            v, sentinel,
+            "element {gi} should not be modified (was sentinel)"
         );
     }
 }

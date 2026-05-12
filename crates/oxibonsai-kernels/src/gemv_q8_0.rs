@@ -130,8 +130,8 @@ mod tests {
     #[test]
     fn q8_0_positive_negative_mix() {
         let mut qs = [0i8; 32];
-        for j in 0..32 {
-            qs[j] = if j % 2 == 0 { 1 } else { -1 };
+        for (j, q) in qs.iter_mut().enumerate() {
+            *q = if j % 2 == 0 { 1 } else { -1 };
         }
         // All-1 input → dot = 16*(+1) + 16*(-1) = 0
         let block = make_q8_block(1.0, qs);

@@ -855,7 +855,7 @@ mod tests {
 
     #[test]
     fn e4m3_dequant_too_small_buffer() {
-        let blocks = BlockFP8E4M3::quantize(&vec![0.0f32; 32]).unwrap();
+        let blocks = BlockFP8E4M3::quantize(&[0.0f32; 32]).unwrap();
         let mut out = vec![0.0f32; 10];
         assert!(BlockFP8E4M3::dequant(&blocks, &mut out).is_err());
     }
@@ -913,7 +913,7 @@ mod tests {
 
     #[test]
     fn e5m2_dequant_too_small_buffer() {
-        let blocks = BlockFP8E5M2::quantize(&vec![0.0f32; 32]).unwrap();
+        let blocks = BlockFP8E5M2::quantize(&[0.0f32; 32]).unwrap();
         let mut out = vec![0.0f32; 5];
         assert!(BlockFP8E5M2::dequant(&blocks, &mut out).is_err());
     }

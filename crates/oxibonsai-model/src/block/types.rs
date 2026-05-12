@@ -1609,6 +1609,186 @@ impl<'a> TransformerBlock<'a> {
     pub fn ffn_down_blocks_q8_0(&self) -> Option<&[oxibonsai_core::BlockQ8_0]> {
         self.ffn_down.blocks_q8_0()
     }
+
+    // ── Q2_K block accessors (BlockQ2K, 84 bytes/block) ──────────────────────
+    /// Q projection Q2_K block slice — `None` for non-Q2_K layers.
+    pub fn attn_q_blocks_q2k(&self) -> Option<&[oxibonsai_core::BlockQ2K]> {
+        self.attn_q.blocks_q2k()
+    }
+    /// K projection Q2_K block slice — `None` for non-Q2_K layers.
+    pub fn attn_k_blocks_q2k(&self) -> Option<&[oxibonsai_core::BlockQ2K]> {
+        self.attn_k.blocks_q2k()
+    }
+    /// V projection Q2_K block slice — `None` for non-Q2_K layers.
+    pub fn attn_v_blocks_q2k(&self) -> Option<&[oxibonsai_core::BlockQ2K]> {
+        self.attn_v.blocks_q2k()
+    }
+    /// Output projection Q2_K block slice — `None` for non-Q2_K layers.
+    pub fn attn_output_blocks_q2k(&self) -> Option<&[oxibonsai_core::BlockQ2K]> {
+        self.attn_output.blocks_q2k()
+    }
+    /// FFN gate Q2_K block slice — `None` for non-Q2_K layers.
+    pub fn ffn_gate_blocks_q2k(&self) -> Option<&[oxibonsai_core::BlockQ2K]> {
+        self.ffn_gate.blocks_q2k()
+    }
+    /// FFN up Q2_K block slice — `None` for non-Q2_K layers.
+    pub fn ffn_up_blocks_q2k(&self) -> Option<&[oxibonsai_core::BlockQ2K]> {
+        self.ffn_up.blocks_q2k()
+    }
+    /// FFN down Q2_K block slice — `None` for non-Q2_K layers.
+    pub fn ffn_down_blocks_q2k(&self) -> Option<&[oxibonsai_core::BlockQ2K]> {
+        self.ffn_down.blocks_q2k()
+    }
+
+    // ── Q3_K block accessors (BlockQ3K, 110 bytes/block) ─────────────────────
+    /// Q projection Q3_K block slice — `None` for non-Q3_K layers.
+    pub fn attn_q_blocks_q3k(&self) -> Option<&[oxibonsai_core::BlockQ3K]> {
+        self.attn_q.blocks_q3k()
+    }
+    /// K projection Q3_K block slice — `None` for non-Q3_K layers.
+    pub fn attn_k_blocks_q3k(&self) -> Option<&[oxibonsai_core::BlockQ3K]> {
+        self.attn_k.blocks_q3k()
+    }
+    /// V projection Q3_K block slice — `None` for non-Q3_K layers.
+    pub fn attn_v_blocks_q3k(&self) -> Option<&[oxibonsai_core::BlockQ3K]> {
+        self.attn_v.blocks_q3k()
+    }
+    /// Output projection Q3_K block slice — `None` for non-Q3_K layers.
+    pub fn attn_output_blocks_q3k(&self) -> Option<&[oxibonsai_core::BlockQ3K]> {
+        self.attn_output.blocks_q3k()
+    }
+    /// FFN gate Q3_K block slice — `None` for non-Q3_K layers.
+    pub fn ffn_gate_blocks_q3k(&self) -> Option<&[oxibonsai_core::BlockQ3K]> {
+        self.ffn_gate.blocks_q3k()
+    }
+    /// FFN up Q3_K block slice — `None` for non-Q3_K layers.
+    pub fn ffn_up_blocks_q3k(&self) -> Option<&[oxibonsai_core::BlockQ3K]> {
+        self.ffn_up.blocks_q3k()
+    }
+    /// FFN down Q3_K block slice — `None` for non-Q3_K layers.
+    pub fn ffn_down_blocks_q3k(&self) -> Option<&[oxibonsai_core::BlockQ3K]> {
+        self.ffn_down.blocks_q3k()
+    }
+
+    // ── Q4_K block accessors (BlockQ4K, 144 bytes/block) ─────────────────────
+    /// Q projection Q4_K block slice — `None` for non-Q4_K layers.
+    pub fn attn_q_blocks_q4k(&self) -> Option<&[oxibonsai_core::BlockQ4K]> {
+        self.attn_q.blocks_q4k()
+    }
+    /// K projection Q4_K block slice — `None` for non-Q4_K layers.
+    pub fn attn_k_blocks_q4k(&self) -> Option<&[oxibonsai_core::BlockQ4K]> {
+        self.attn_k.blocks_q4k()
+    }
+    /// V projection Q4_K block slice — `None` for non-Q4_K layers.
+    pub fn attn_v_blocks_q4k(&self) -> Option<&[oxibonsai_core::BlockQ4K]> {
+        self.attn_v.blocks_q4k()
+    }
+    /// Output projection Q4_K block slice — `None` for non-Q4_K layers.
+    pub fn attn_output_blocks_q4k(&self) -> Option<&[oxibonsai_core::BlockQ4K]> {
+        self.attn_output.blocks_q4k()
+    }
+    /// FFN gate Q4_K block slice — `None` for non-Q4_K layers.
+    pub fn ffn_gate_blocks_q4k(&self) -> Option<&[oxibonsai_core::BlockQ4K]> {
+        self.ffn_gate.blocks_q4k()
+    }
+    /// FFN up Q4_K block slice — `None` for non-Q4_K layers.
+    pub fn ffn_up_blocks_q4k(&self) -> Option<&[oxibonsai_core::BlockQ4K]> {
+        self.ffn_up.blocks_q4k()
+    }
+    /// FFN down Q4_K block slice — `None` for non-Q4_K layers.
+    pub fn ffn_down_blocks_q4k(&self) -> Option<&[oxibonsai_core::BlockQ4K]> {
+        self.ffn_down.blocks_q4k()
+    }
+
+    // ── Q5_K block accessors (BlockQ5K, 176 bytes/block) ─────────────────────
+    /// Q projection Q5_K block slice — `None` for non-Q5_K layers.
+    pub fn attn_q_blocks_q5k(&self) -> Option<&[oxibonsai_core::BlockQ5K]> {
+        self.attn_q.blocks_q5k()
+    }
+    /// K projection Q5_K block slice — `None` for non-Q5_K layers.
+    pub fn attn_k_blocks_q5k(&self) -> Option<&[oxibonsai_core::BlockQ5K]> {
+        self.attn_k.blocks_q5k()
+    }
+    /// V projection Q5_K block slice — `None` for non-Q5_K layers.
+    pub fn attn_v_blocks_q5k(&self) -> Option<&[oxibonsai_core::BlockQ5K]> {
+        self.attn_v.blocks_q5k()
+    }
+    /// Output projection Q5_K block slice — `None` for non-Q5_K layers.
+    pub fn attn_output_blocks_q5k(&self) -> Option<&[oxibonsai_core::BlockQ5K]> {
+        self.attn_output.blocks_q5k()
+    }
+    /// FFN gate Q5_K block slice — `None` for non-Q5_K layers.
+    pub fn ffn_gate_blocks_q5k(&self) -> Option<&[oxibonsai_core::BlockQ5K]> {
+        self.ffn_gate.blocks_q5k()
+    }
+    /// FFN up Q5_K block slice — `None` for non-Q5_K layers.
+    pub fn ffn_up_blocks_q5k(&self) -> Option<&[oxibonsai_core::BlockQ5K]> {
+        self.ffn_up.blocks_q5k()
+    }
+    /// FFN down Q5_K block slice — `None` for non-Q5_K layers.
+    pub fn ffn_down_blocks_q5k(&self) -> Option<&[oxibonsai_core::BlockQ5K]> {
+        self.ffn_down.blocks_q5k()
+    }
+
+    // ── Q6_K block accessors (BlockQ6K, 210 bytes/block) ─────────────────────
+    /// Q projection Q6_K block slice — `None` for non-Q6_K layers.
+    pub fn attn_q_blocks_q6k(&self) -> Option<&[oxibonsai_core::BlockQ6K]> {
+        self.attn_q.blocks_q6k()
+    }
+    /// K projection Q6_K block slice — `None` for non-Q6_K layers.
+    pub fn attn_k_blocks_q6k(&self) -> Option<&[oxibonsai_core::BlockQ6K]> {
+        self.attn_k.blocks_q6k()
+    }
+    /// V projection Q6_K block slice — `None` for non-Q6_K layers.
+    pub fn attn_v_blocks_q6k(&self) -> Option<&[oxibonsai_core::BlockQ6K]> {
+        self.attn_v.blocks_q6k()
+    }
+    /// Output projection Q6_K block slice — `None` for non-Q6_K layers.
+    pub fn attn_output_blocks_q6k(&self) -> Option<&[oxibonsai_core::BlockQ6K]> {
+        self.attn_output.blocks_q6k()
+    }
+    /// FFN gate Q6_K block slice — `None` for non-Q6_K layers.
+    pub fn ffn_gate_blocks_q6k(&self) -> Option<&[oxibonsai_core::BlockQ6K]> {
+        self.ffn_gate.blocks_q6k()
+    }
+    /// FFN up Q6_K block slice — `None` for non-Q6_K layers.
+    pub fn ffn_up_blocks_q6k(&self) -> Option<&[oxibonsai_core::BlockQ6K]> {
+        self.ffn_up.blocks_q6k()
+    }
+    /// FFN down Q6_K block slice — `None` for non-Q6_K layers.
+    pub fn ffn_down_blocks_q6k(&self) -> Option<&[oxibonsai_core::BlockQ6K]> {
+        self.ffn_down.blocks_q6k()
+    }
+
+    // ── Q8_K block accessors (BlockQ8K, 292 bytes/block) ─────────────────────
+    /// Q projection Q8_K block slice — `None` for non-Q8_K layers.
+    pub fn attn_q_blocks_q8k(&self) -> Option<&[oxibonsai_core::BlockQ8K]> {
+        self.attn_q.blocks_q8k()
+    }
+    /// K projection Q8_K block slice — `None` for non-Q8_K layers.
+    pub fn attn_k_blocks_q8k(&self) -> Option<&[oxibonsai_core::BlockQ8K]> {
+        self.attn_k.blocks_q8k()
+    }
+    /// V projection Q8_K block slice — `None` for non-Q8_K layers.
+    pub fn attn_v_blocks_q8k(&self) -> Option<&[oxibonsai_core::BlockQ8K]> {
+        self.attn_v.blocks_q8k()
+    }
+    /// Output projection Q8_K block slice — `None` for non-Q8_K layers.
+    pub fn attn_output_blocks_q8k(&self) -> Option<&[oxibonsai_core::BlockQ8K]> {
+        self.attn_output.blocks_q8k()
+    }
+    /// FFN gate Q8_K block slice — `None` for non-Q8_K layers.
+    pub fn ffn_gate_blocks_q8k(&self) -> Option<&[oxibonsai_core::BlockQ8K]> {
+        self.ffn_gate.blocks_q8k()
+    }
+    /// FFN up Q8_K block slice — `None` for non-Q8_K layers.
+    pub fn ffn_up_blocks_q8k(&self) -> Option<&[oxibonsai_core::BlockQ8K]> {
+        self.ffn_up.blocks_q8k()
+    }
+    /// FFN down Q8_K block slice — `None` for non-Q8_K layers.
+    pub fn ffn_down_blocks_q8k(&self) -> Option<&[oxibonsai_core::BlockQ8K]> {
+        self.ffn_down.blocks_q8k()
+    }
 }
 /// Pre-allocated scratch buffers for a single TransformerBlock's forward pass.
 /// Eliminates per-token heap allocations in the hot path.

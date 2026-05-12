@@ -205,7 +205,7 @@ fn boolq_empty_dataset() {
 
 #[test]
 fn boolq_default_impl() {
-    let _ = BoolQEvaluator::default();
+    let _ = BoolQEvaluator::new();
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

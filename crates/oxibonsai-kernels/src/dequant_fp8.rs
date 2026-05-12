@@ -146,18 +146,17 @@ mod tests {
         ];
         let mut output = vec![0.0f32; QK_FP8 * 2];
         dequant_fp8_e4m3(&blocks, &mut output).expect("dequant should succeed");
-        for i in 0..QK_FP8 {
+        for (i, &v) in output[..QK_FP8].iter().enumerate() {
             assert!(
-                (output[i] - 1.0).abs() < 0.02,
-                "block0[{i}]: expected ~1.0, got {}",
-                output[i]
+                (v - 1.0).abs() < 0.02,
+                "block0[{i}]: expected ~1.0, got {v}"
             );
         }
-        for i in QK_FP8..2 * QK_FP8 {
+        for (i, &v) in output[QK_FP8..2 * QK_FP8].iter().enumerate() {
+            let gi = QK_FP8 + i;
             assert!(
-                (output[i] - 2.0).abs() < 0.02,
-                "block1[{i}]: expected ~2.0, got {}",
-                output[i]
+                (v - 2.0).abs() < 0.02,
+                "block1[{gi}]: expected ~2.0, got {v}"
             );
         }
     }
@@ -196,8 +195,9 @@ mod tests {
         let mut output = vec![99.0f32; QK_FP8 + 10];
         dequant_fp8_e4m3(&[block], &mut output).expect("oversized buffer should succeed");
         // Trailing elements should be untouched
-        for i in QK_FP8..output.len() {
-            assert_eq!(output[i], 99.0, "trailing element {i} was modified");
+        for (i, &v) in output[QK_FP8..].iter().enumerate() {
+            let gi = QK_FP8 + i;
+            assert_eq!(v, 99.0, "trailing element {gi} was modified");
         }
     }
 
@@ -259,18 +259,17 @@ mod tests {
         ];
         let mut output = vec![0.0f32; QK_FP8 * 2];
         dequant_fp8_e5m2(&blocks, &mut output).expect("dequant should succeed");
-        for i in 0..QK_FP8 {
+        for (i, &v) in output[..QK_FP8].iter().enumerate() {
             assert!(
-                (output[i] - 1.0).abs() < 0.02,
-                "block0[{i}]: expected ~1.0, got {}",
-                output[i]
+                (v - 1.0).abs() < 0.02,
+                "block0[{i}]: expected ~1.0, got {v}"
             );
         }
-        for i in QK_FP8..2 * QK_FP8 {
+        for (i, &v) in output[QK_FP8..2 * QK_FP8].iter().enumerate() {
+            let gi = QK_FP8 + i;
             assert!(
-                (output[i] - 4.0).abs() < 0.02,
-                "block1[{i}]: expected ~4.0, got {}",
-                output[i]
+                (v - 4.0).abs() < 0.02,
+                "block1[{gi}]: expected ~4.0, got {v}"
             );
         }
     }

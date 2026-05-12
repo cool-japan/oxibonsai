@@ -21,6 +21,11 @@ use oxibonsai_kernels::traits::OneBitKernel;
     any(target_os = "linux", target_os = "windows")
 ))]
 mod forward_cuda;
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+mod forward_cuda_fp8;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod forward_metal;
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -338,8 +343,18 @@ impl<'a> BonsaiModel<'a> {
             )
             && oxibonsai_kernels::CudaGraph::global().is_ok()
         {
-            // FP8 models: skip the Q1 fused CUDA graph prefill path.
-            // Each token uses CUDA-accelerated GEMV via KernelTier::Gpu block dispatch in forward().
+            // FP8 batch GEMM prefill (Phase 26).
+            let is_e4m3 = matches!(&self.output_weight, OutputWeight::FP8E4M3(_));
+            match self.try_cuda_prefill_with_lm_head_fp8(token_ids, pos_start, is_e4m3) {
+                Ok(logits) => return Ok(logits),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "cuda FP8 batch prefill failed, falling back to sequential"
+                    );
+                }
+            }
+            // Fallback: sequential token-by-token CUDA GEMV.
             let mut last_logits = Vec::new();
             for (i, &token_id) in token_ids.iter().enumerate() {
                 last_logits = self.forward(token_id, pos_start + i, kernel)?;
@@ -392,8 +407,24 @@ impl<'a> BonsaiModel<'a> {
             )
             && oxibonsai_kernels::CudaGraph::global().is_ok()
         {
-            // K-quant models: skip the Q1 fused CUDA graph prefill path.
-            // Sequential token-by-token forward using CUDA-accelerated K-quant GEMV.
+            // K-quant batch GEMM prefill (Phase 25).
+            let fmt = match &self.output_weight {
+                OutputWeight::Q2K(_) => oxibonsai_kernels::KQuantFormat::Q2K,
+                OutputWeight::Q3K(_) => oxibonsai_kernels::KQuantFormat::Q3K,
+                OutputWeight::Q4K(_) => oxibonsai_kernels::KQuantFormat::Q4K,
+                OutputWeight::Q5K(_) => oxibonsai_kernels::KQuantFormat::Q5K,
+                OutputWeight::Q6K(_) => oxibonsai_kernels::KQuantFormat::Q6K,
+                OutputWeight::Q8K(_) => oxibonsai_kernels::KQuantFormat::Q8K,
+                _ => unreachable!(),
+            };
+            match self.try_cuda_prefill_with_lm_head_k_quant(token_ids, pos_start, fmt) {
+                Ok(logits) => return Ok(logits),
+                Err(e) => {
+                    tracing::warn!(error = %e,
+                        "cuda K-quant batch prefill failed, falling back to sequential");
+                }
+            }
+            // Fallback: sequential token-by-token forward using CUDA GEMV.
             let mut last_logits = Vec::new();
             for (i, &token_id) in token_ids.iter().enumerate() {
                 last_logits = self.forward(token_id, pos_start + i, kernel)?;
@@ -460,6 +491,92 @@ impl<'a> BonsaiModel<'a> {
                     );
                 }
             }
+        }
+        #[cfg(all(
+            feature = "native-cuda",
+            not(all(feature = "metal", target_os = "macos")),
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        if _gpu_kernel
+            && matches!(
+                &self.output_weight,
+                OutputWeight::FP8E4M3(_) | OutputWeight::FP8E5M2(_)
+            )
+            && oxibonsai_kernels::CudaGraph::global().is_ok()
+        {
+            // FP8 batch GEMM prefill verify (Phase 26).
+            let is_e4m3 = matches!(&self.output_weight, OutputWeight::FP8E4M3(_));
+            match self.try_cuda_prefill_verify_fp8(token_ids, pos_start, is_e4m3) {
+                Ok(ids) => return Ok(ids),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "cuda FP8 batch prefill verify failed, falling back to sequential"
+                    );
+                }
+            }
+            let mut token_ids_out = Vec::with_capacity(token_ids.len());
+            for (i, &token_id) in token_ids.iter().enumerate() {
+                let logits = self.forward(token_id, pos_start + i, kernel)?;
+                let best_idx = logits
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(j, _)| j as u32)
+                    .unwrap_or(0);
+                token_ids_out.push(best_idx);
+            }
+            return Ok(token_ids_out);
+        }
+        #[cfg(all(
+            feature = "native-cuda",
+            not(all(feature = "metal", target_os = "macos")),
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        if _gpu_kernel
+            && matches!(
+                &self.output_weight,
+                OutputWeight::Q2K(_)
+                    | OutputWeight::Q3K(_)
+                    | OutputWeight::Q4K(_)
+                    | OutputWeight::Q5K(_)
+                    | OutputWeight::Q6K(_)
+                    | OutputWeight::Q8K(_)
+            )
+            && oxibonsai_kernels::CudaGraph::global().is_ok()
+        {
+            // K-quant batch GEMM prefill verify (Phase 25).
+            let fmt = match &self.output_weight {
+                OutputWeight::Q2K(_) => oxibonsai_kernels::KQuantFormat::Q2K,
+                OutputWeight::Q3K(_) => oxibonsai_kernels::KQuantFormat::Q3K,
+                OutputWeight::Q4K(_) => oxibonsai_kernels::KQuantFormat::Q4K,
+                OutputWeight::Q5K(_) => oxibonsai_kernels::KQuantFormat::Q5K,
+                OutputWeight::Q6K(_) => oxibonsai_kernels::KQuantFormat::Q6K,
+                OutputWeight::Q8K(_) => oxibonsai_kernels::KQuantFormat::Q8K,
+                _ => unreachable!(),
+            };
+            match self.try_cuda_prefill_verify_k_quant(token_ids, pos_start, fmt) {
+                Ok(ids) => return Ok(ids),
+                Err(e) => {
+                    tracing::warn!(error = %e,
+                        "cuda K-quant batch prefill verify failed, falling back to sequential");
+                }
+            }
+            // Fallback: sequential token-by-token with argmax.
+            let mut token_ids_out = Vec::with_capacity(token_ids.len());
+            for (i, &token_id) in token_ids.iter().enumerate() {
+                let logits = self.forward(token_id, pos_start + i, kernel)?;
+                let mut best_idx = 0u32;
+                let mut best_val = f32::NEG_INFINITY;
+                for (j, &v) in logits.iter().enumerate() {
+                    if v > best_val {
+                        best_val = v;
+                        best_idx = j as u32;
+                    }
+                }
+                token_ids_out.push(best_idx);
+            }
+            return Ok(token_ids_out);
         }
         #[cfg(all(
             feature = "native-cuda",

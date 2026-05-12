@@ -499,9 +499,7 @@ mod tests {
             b[1] = 0x3C;
             // All nibbles = 8 → weight = 1.0 * (8 - 8) = 0.0
             // nibble_low=8 (0x8), nibble_high=8 (0x8) → byte = 0x88
-            for i in 2..18 {
-                b[i] = 0x88;
-            }
+            b[2..18].fill(0x88);
         }
 
         let input = vec![1.0f32; k];
@@ -541,9 +539,7 @@ mod tests {
             b[1] = 0x3C;
             // int8 weights: first = 1, rest = 0
             b[2] = 1u8;
-            for i in 3..34 {
-                b[i] = 0u8;
-            }
+            b[3..34].fill(0u8);
         }
 
         let input = vec![1.0f32; k];

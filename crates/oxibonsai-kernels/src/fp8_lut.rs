@@ -72,9 +72,8 @@ mod tests {
     #[test]
     fn lut_matches_scalar_decode_e4m3() {
         let lut = fp8_e4m3_lut();
-        for i in 0_usize..256 {
+        for (i, &lut_val) in lut.iter().enumerate() {
             let scalar = fp8_e4m3_decode(i as u8);
-            let lut_val = lut[i];
             // NaN != NaN, handle separately
             if scalar.is_nan() {
                 assert!(
@@ -94,18 +93,16 @@ mod tests {
     #[test]
     fn lut_matches_scalar_decode_e5m2() {
         let lut = fp8_e5m2_lut();
-        for i in 0_usize..256 {
+        for (i, &lut_val) in lut.iter().enumerate() {
             let scalar = fp8_e5m2_decode(i as u8);
-            let lut_val = lut[i];
             if scalar.is_nan() {
                 assert!(
                     lut_val.is_nan(),
                     "byte {i:#04x}: expected NaN, got {lut_val}"
                 );
             } else if scalar.is_infinite() {
-                assert_eq!(
+                assert!(
                     lut_val.is_infinite(),
-                    true,
                     "byte {i:#04x}: expected Inf, got {lut_val}"
                 );
                 assert_eq!(

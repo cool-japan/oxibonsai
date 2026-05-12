@@ -463,7 +463,7 @@ mod tests {
 
     #[test]
     fn q4_0_dequant_too_small_buffer() {
-        let blocks = BlockQ4_0::quantize(&vec![1.0f32; 32]).unwrap();
+        let blocks = BlockQ4_0::quantize(&[1.0f32; 32]).unwrap();
         let mut out = vec![0.0f32; 10];
         assert!(
             BlockQ4_0::dequant(&blocks, &mut out).is_err(),
@@ -582,7 +582,7 @@ mod tests {
 
     #[test]
     fn q8_0_dequant_too_small_buffer() {
-        let blocks = BlockQ8_0::quantize(&vec![0.0f32; 32]).unwrap();
+        let blocks = BlockQ8_0::quantize(&[0.0f32; 32]).unwrap();
         let mut out = vec![0.0f32; 5];
         assert!(BlockQ8_0::dequant(&blocks, &mut out).is_err());
     }

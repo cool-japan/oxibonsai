@@ -438,7 +438,7 @@ fn test_byte_index_skips_non_matching_tokens() {
 
     // Tokens whose first byte is definitively not in the start FIRST set
     // must be rejected by the first-byte index (never probed).
-    let non_start_bytes: &[u8] = &[b'+', b'-', b'*', b'/', b')', b' ', b'a', b'z', b'\n'];
+    let non_start_bytes: &[u8] = b"+-*/) az\n";
     for &b in non_start_bytes {
         assert!(
             !mask[b as usize],
@@ -484,7 +484,7 @@ fn test_precomputed_bytes_match_decode_fn() {
         // it should be allowed; otherwise it shouldn't.
         let first_byte_opt = direct.first().copied();
         let should_be_allowed = match first_byte_opt {
-            Some(b) => (b'0'..=b'9').contains(&b) || b == b'(',
+            Some(b) => b.is_ascii_digit() || b == b'(',
             None => false, // empty = EOS, not allowed (not accepting at start)
         };
         assert_eq!(

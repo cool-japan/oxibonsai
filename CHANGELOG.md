@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - Phase 26
+
+### Added
+- **CUDA FP8 E4M3/E5M2 batch prefill** (`oxibonsai-kernels`, `oxibonsai-model`): `try_cuda_prefill_fp8` replaces sequential single-token CUDA GEMV loop for FP8E4M3 and FP8E5M2 models. 8 new NVRTC kernels (gemm, gemm_residual, fused_gate_up_swiglu, gemv_pf × E4M3/E5M2) with cap-of-8 outer loop and correct FP8 block layout (weights at bytes 0-31, FP16 scale at bytes 32-33). New `forward_cuda_fp8.rs` module with `try_cuda_prefill_with_lm_head_fp8` / `try_cuda_prefill_verify_fp8`; handle namespaces E4M3 26M-31M, E5M2 28M-33M. `BonsaiModel::forward_prefill` and `forward_prefill_verify` now route FP8 models through batch GEMM (with sequential CUDA GEMV fallback on error). 4 host-only kernel-source-string tests added.
+
+---
+
+## [Unreleased] - Phase 25
+
+### Added
+- **K-quant CUDA batch prefill** (`oxibonsai-kernels`, `oxibonsai-model`): `try_cuda_prefill_k_quant` replaces sequential single-token CUDA GEMV loop for Q2K, Q3K, Q4K, Q5K, Q6K, and Q8K models. 18 new NVRTC kernels (3 per format: `gemm_q{fmt}`, `gemm_q{fmt}_residual`, `fused_gate_up_swiglu_gemm_q{fmt}`) with cap-of-8 outer loop preventing silent batch-size truncation. `KQuantFormat` enum for dispatch. `BonsaiModel::forward_prefill` and `forward_prefill_verify` now route K-quant models through `try_cuda_prefill_with_lm_head_k_quant` / `try_cuda_prefill_verify_k_quant` on CUDA hosts (with sequential fallback on error). Handle namespaces: Q2K norms `12M`, weights `13M`; Q3K `14M/15M`; Q4K `16M/17M`; Q5K `18M/19M`; Q6K `20M/21M`; Q8K `22M/23M`; final-norm `24M+fmt_offset`; LM-head `25M+fmt_offset`. 42 K-quant block accessor methods added to `TransformerBlock`. Runtime validation: `hidden_size % 256 == 0` required for all K-quant batch GEMM.
+
+---
+
 ## [Unreleased] - Phase 24
 
 ### Added
