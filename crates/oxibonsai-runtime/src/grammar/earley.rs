@@ -94,7 +94,9 @@ impl FirstSets {
                 if rule.rhs.is_empty() {
                     // Epsilon production: lhs is nullable.
                     if !nullable[&lhs] {
-                        *nullable.get_mut(&lhs).unwrap() = true;
+                        *nullable
+                            .get_mut(&lhs)
+                            .expect("lhs key inserted during initialization") = true;
                         changed = true;
                     }
                     continue;
@@ -107,7 +109,11 @@ impl FirstSets {
                     match sym {
                         Symbol::Terminal(bytes) => {
                             if let Some(&b) = bytes.first() {
-                                if first.get_mut(&lhs).unwrap().insert(b) {
+                                if first
+                                    .get_mut(&lhs)
+                                    .expect("lhs key inserted during initialization")
+                                    .insert(b)
+                                {
                                     changed = true;
                                 }
                             }
@@ -122,7 +128,11 @@ impl FirstSets {
                             // Add FIRST(nt) \ {ε} to FIRST(lhs).
                             let first_nt: HashSet<u8> = first.get(nt).cloned().unwrap_or_default();
                             for &b in &first_nt {
-                                if first.get_mut(&lhs).unwrap().insert(b) {
+                                if first
+                                    .get_mut(&lhs)
+                                    .expect("lhs key inserted during initialization")
+                                    .insert(b)
+                                {
                                     changed = true;
                                 }
                             }
@@ -136,7 +146,9 @@ impl FirstSets {
                 }
 
                 if all_nullable && !nullable[&lhs] {
-                    *nullable.get_mut(&lhs).unwrap() = true;
+                    *nullable
+                        .get_mut(&lhs)
+                        .expect("lhs key inserted during initialization") = true;
                     changed = true;
                 }
             }

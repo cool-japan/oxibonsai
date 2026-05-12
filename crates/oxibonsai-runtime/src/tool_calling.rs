@@ -304,7 +304,7 @@ pub fn validate_tool_arguments(
     // Validate required properties if defined in the schema.
     if let Some(required) = tool.function.parameters.get("required") {
         if let Some(req_arr) = required.as_array() {
-            let obj = parsed.as_object().unwrap();
+            let obj = parsed.as_object().expect("parsed is_object checked above");
             for req_field in req_arr {
                 if let Some(field_name) = req_field.as_str() {
                     if !obj.contains_key(field_name) {
