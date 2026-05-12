@@ -328,10 +328,7 @@ impl BlockQ5K {
         let align = std::mem::align_of::<Self>();
         if data.as_ptr().align_offset(align) != 0 {
             return Err(BonsaiError::KQuantError {
-                reason: format!(
-                    "Q5_K slice_from_bytes: pointer not {}-byte aligned",
-                    align
-                ),
+                reason: format!("Q5_K slice_from_bytes: pointer not {}-byte aligned", align),
             });
         }
         let count = data.len() / BLOCK_Q5K_BYTES;
@@ -462,10 +459,7 @@ impl BlockQ6K {
             for (sub, slot) in sub_max_abs.iter_mut().enumerate() {
                 let sub_offset = sub * 16;
                 let sub_chunk = &chunk[sub_offset..sub_offset + 16];
-                let max_abs = sub_chunk
-                    .iter()
-                    .map(|&v| v.abs())
-                    .fold(0.0f32, f32::max);
+                let max_abs = sub_chunk.iter().map(|&v| v.abs()).fold(0.0f32, f32::max);
                 *slot = max_abs;
             }
 
@@ -552,10 +546,7 @@ impl BlockQ6K {
         let align = std::mem::align_of::<Self>();
         if data.as_ptr().align_offset(align) != 0 {
             return Err(BonsaiError::KQuantError {
-                reason: format!(
-                    "Q6_K slice_from_bytes: pointer not {}-byte aligned",
-                    align
-                ),
+                reason: format!("Q6_K slice_from_bytes: pointer not {}-byte aligned", align),
             });
         }
         let count = data.len() / BLOCK_Q6K_BYTES;

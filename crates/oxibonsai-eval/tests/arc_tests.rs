@@ -200,9 +200,9 @@ fn arc_evaluate_logits_picks_max() {
 
     // Provide per-choice logits where the highest value == correct_answer index.
     let logits: Vec<Vec<f32>> = vec![
-        vec![-1.0, -2.0, 0.5, -0.5],  // argmax = 2 → correct (C)
-        vec![1.0, 0.0, -1.0, -2.0],   // argmax = 0 → correct (A)
-        vec![-3.0, -2.0, -1.0, 2.0],  // argmax = 3 → correct (D)
+        vec![-1.0, -2.0, 0.5, -0.5], // argmax = 2 → correct (C)
+        vec![1.0, 0.0, -1.0, -2.0],  // argmax = 0 → correct (A)
+        vec![-3.0, -2.0, -1.0, 2.0], // argmax = 3 → correct (D)
     ];
 
     let ev = ArcEvaluator::challenge();

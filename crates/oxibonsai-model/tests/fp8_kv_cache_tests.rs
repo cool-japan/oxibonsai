@@ -92,8 +92,7 @@ fn quantize_row_fp8_e5m2_roundtrip_small_error() {
 fn fp8_kv_layer_e4m3_push_get_key_roundtrip() {
     let num_kv_heads = 4;
     let head_dim = 64;
-    let mut layer =
-        Fp8KvLayer::with_capacity(num_kv_heads, head_dim, 16, Fp8KvFormat::E4M3);
+    let mut layer = Fp8KvLayer::with_capacity(num_kv_heads, head_dim, 16, Fp8KvFormat::E4M3);
 
     let keys = make_kv_row(num_kv_heads, head_dim, -6.4, 0.05);
     let values = vec![0.0_f32; num_kv_heads * head_dim];
@@ -136,8 +135,7 @@ fn fp8_kv_layer_e4m3_push_get_key_roundtrip() {
 fn fp8_kv_layer_e4m3_push_get_value_roundtrip() {
     let num_kv_heads = 4;
     let head_dim = 64;
-    let mut layer =
-        Fp8KvLayer::with_capacity(num_kv_heads, head_dim, 16, Fp8KvFormat::E4M3);
+    let mut layer = Fp8KvLayer::with_capacity(num_kv_heads, head_dim, 16, Fp8KvFormat::E4M3);
 
     let keys = vec![0.0_f32; num_kv_heads * head_dim];
     let values = make_kv_row(num_kv_heads, head_dim, -8.0, 0.07);
@@ -202,12 +200,12 @@ fn fp8_kv_layer_capacity_overflow_errors() {
     let mut layer = Fp8KvLayer::with_capacity(num_kv_heads, head_dim, 1, Fp8KvFormat::E4M3);
 
     let keys: Vec<f32> = (0..num_kv_heads * head_dim).map(|i| i as f32).collect();
-    let values: Vec<f32> = (0..num_kv_heads * head_dim)
-        .map(|i| -(i as f32))
-        .collect();
+    let values: Vec<f32> = (0..num_kv_heads * head_dim).map(|i| -(i as f32)).collect();
 
     // capacity = 1: first push succeeds, second fails
-    layer.push(&keys, &values).expect("first push within capacity");
+    layer
+        .push(&keys, &values)
+        .expect("first push within capacity");
 
     let result = layer.push(&keys, &values);
     assert!(
@@ -255,8 +253,7 @@ fn fp8_kv_cache_get_keys_at_multiple_positions() {
     let head_dim = 16;
     let n_tokens = 5;
 
-    let mut layer =
-        Fp8KvLayer::with_capacity(num_kv_heads, head_dim, n_tokens, Fp8KvFormat::E4M3);
+    let mut layer = Fp8KvLayer::with_capacity(num_kv_heads, head_dim, n_tokens, Fp8KvFormat::E4M3);
 
     // Push 5 tokens, each with a unique large-magnitude key so heads are separable.
     let mut pushed_keys: Vec<Vec<f32>> = Vec::new();
@@ -299,8 +296,7 @@ fn fp8_kv_cache_get_keys_at_multiple_positions() {
 fn fp8_kv_layer_e5m2_get_value_roundtrip() {
     let num_kv_heads = 2;
     let head_dim = 32;
-    let mut layer =
-        Fp8KvLayer::with_capacity(num_kv_heads, head_dim, 4, Fp8KvFormat::E5M2);
+    let mut layer = Fp8KvLayer::with_capacity(num_kv_heads, head_dim, 4, Fp8KvFormat::E5M2);
 
     let keys = vec![0.0_f32; num_kv_heads * head_dim];
     // Use a spread matching E5M2's wider range
@@ -348,12 +344,19 @@ fn fp8_kv_cache_multi_layer_basic() {
     let head_dim = 16;
     let capacity = 8;
 
-    let mut cache =
-        Fp8KvCache::new(num_layers, num_kv_heads, head_dim, capacity, Fp8KvFormat::E4M3);
+    let mut cache = Fp8KvCache::new(
+        num_layers,
+        num_kv_heads,
+        head_dim,
+        capacity,
+        Fp8KvFormat::E4M3,
+    );
 
     assert_eq!(cache.num_layers(), num_layers);
 
-    let keys: Vec<f32> = (0..num_kv_heads * head_dim).map(|i| i as f32 * 0.5).collect();
+    let keys: Vec<f32> = (0..num_kv_heads * head_dim)
+        .map(|i| i as f32 * 0.5)
+        .collect();
     let values: Vec<f32> = (0..num_kv_heads * head_dim)
         .map(|i| -(i as f32) * 0.5)
         .collect();
@@ -384,8 +387,7 @@ fn fp8_kv_cache_clear_all_resets_all_layers() {
     let num_layers = 3;
     let num_kv_heads = 1;
     let head_dim = 8;
-    let mut cache =
-        Fp8KvCache::new(num_layers, num_kv_heads, head_dim, 4, Fp8KvFormat::E5M2);
+    let mut cache = Fp8KvCache::new(num_layers, num_kv_heads, head_dim, 4, Fp8KvFormat::E5M2);
 
     let keys: Vec<f32> = (0..num_kv_heads * head_dim).map(|i| i as f32).collect();
     let values = vec![0.0_f32; num_kv_heads * head_dim];

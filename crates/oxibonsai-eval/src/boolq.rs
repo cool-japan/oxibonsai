@@ -186,11 +186,7 @@ impl BoolQEvaluator {
     /// otherwise `false` (no). The prediction is compared to `dataset.items[i].answer`.
     ///
     /// Only the first `min(dataset.len(), logit_pairs.len())` items are scored.
-    pub fn evaluate_logits(
-        &self,
-        dataset: &BoolQDataset,
-        logit_pairs: &[[f32; 2]],
-    ) -> BoolQResult {
+    pub fn evaluate_logits(&self, dataset: &BoolQDataset, logit_pairs: &[[f32; 2]]) -> BoolQResult {
         let n = dataset.items.len().min(logit_pairs.len());
         let mut correct = 0usize;
         let mut yes_predicted = 0usize;

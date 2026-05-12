@@ -117,10 +117,7 @@ fn score_float_vs_integer() {
 #[test]
 fn score_wrong_answer() {
     let ev = Gsm8kEvaluator::new();
-    assert!(
-        !ev.score("#### 41", "#### 42"),
-        "41 vs 42 should not match"
-    );
+    assert!(!ev.score("#### 41", "#### 42"), "41 vs 42 should not match");
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -175,10 +172,10 @@ fn evaluate_dataset_partial() {
     dataset.add(gsm8k_example("g3", "Q4", "#### 40")); // completion correct
 
     let completions = vec![
-        "#### 10".to_string(),              // correct
-        "#### 99".to_string(),              // wrong
+        "#### 10".to_string(),                 // correct
+        "#### 99".to_string(),                 // wrong
         "I don't know the answer".to_string(), // no marker
-        "Step by step #### 40".to_string(), // correct
+        "Step by step #### 40".to_string(),    // correct
     ];
 
     let ev = Gsm8kEvaluator::default();
@@ -252,10 +249,10 @@ fn gsm8k_result_helper_methods() {
     dataset.add(gsm8k_example("g3", "Q4", "#### 4"));
 
     let completions = vec![
-        "#### 1".to_string(), // correct
+        "#### 1".to_string(),         // correct
         "no answer here".to_string(), // no marker
         "no answer here".to_string(), // no marker
-        "#### 4".to_string(), // correct
+        "#### 4".to_string(),         // correct
     ];
 
     let ev = Gsm8kEvaluator::new();

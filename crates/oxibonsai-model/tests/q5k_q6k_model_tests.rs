@@ -101,7 +101,9 @@ fn test_linear_q5k_batch_forward() {
 
     let input = vec![1.0f32; 3 * 256]; // m=3 tokens
     let mut output = vec![0.0f32; 3 * 2];
-    layer.forward_batch(&input, &mut output, 3).expect("batch forward ok");
+    layer
+        .forward_batch(&input, &mut output, 3)
+        .expect("batch forward ok");
 
     // Each row should have output[row_batch × 2 + col] ≈ 256.0
     for token in 0..3 {
@@ -164,7 +166,9 @@ fn test_linear_q6k_batch_forward() {
 
     let input = vec![1.0f32; 2 * 256];
     let mut output = vec![0.0f32; 2 * 3];
-    layer.forward_batch(&input, &mut output, 2).expect("batch forward ok");
+    layer
+        .forward_batch(&input, &mut output, 2)
+        .expect("batch forward ok");
 
     for token in 0..2 {
         for feat in 0..3 {
@@ -189,7 +193,10 @@ fn test_linear_layer_from_q5k() {
 
     assert_eq!(layer.out_features(), 2);
     assert_eq!(layer.in_features(), 256);
-    assert!(layer.gpu_handle().is_none(), "Q5K should have no GPU handle");
+    assert!(
+        layer.gpu_handle().is_none(),
+        "Q5K should have no GPU handle"
+    );
     assert!(
         layer.blocks_1bit().is_none(),
         "Q5K should not expose 1-bit blocks"
@@ -207,10 +214,7 @@ fn test_linear_layer_from_q5k() {
         "Q5K should not expose FP8 E5M2 blocks"
     );
     // Q5K blocks should be accessible
-    assert!(
-        layer.blocks_q5k().is_some(),
-        "Q5K should expose Q5K blocks"
-    );
+    assert!(layer.blocks_q5k().is_some(), "Q5K should expose Q5K blocks");
     assert!(
         layer.blocks_q6k().is_none(),
         "Q5K should not expose Q6K blocks"
@@ -225,11 +229,11 @@ fn test_linear_layer_from_q6k() {
 
     assert_eq!(layer.out_features(), 2);
     assert_eq!(layer.in_features(), 256);
-    assert!(layer.gpu_handle().is_none(), "Q6K should have no GPU handle");
     assert!(
-        layer.blocks_q6k().is_some(),
-        "Q6K should expose Q6K blocks"
+        layer.gpu_handle().is_none(),
+        "Q6K should have no GPU handle"
     );
+    assert!(layer.blocks_q6k().is_some(), "Q6K should expose Q6K blocks");
     assert!(
         layer.blocks_q5k().is_none(),
         "Q6K should not expose Q5K blocks"
@@ -244,7 +248,9 @@ fn test_linear_layer_q5k_forward_vec() {
 
     let input = vec![1.0f32; 256];
     let mut output = vec![0.0f32; 2];
-    layer.forward_vec(&input, &mut output).expect("forward_vec ok");
+    layer
+        .forward_vec(&input, &mut output)
+        .expect("forward_vec ok");
 
     for (i, &v) in output.iter().enumerate() {
         assert!(
@@ -262,7 +268,9 @@ fn test_linear_layer_q6k_forward_vec() {
 
     let input = vec![1.0f32; 256];
     let mut output = vec![0.0f32; 2];
-    layer.forward_vec(&input, &mut output).expect("forward_vec ok");
+    layer
+        .forward_vec(&input, &mut output)
+        .expect("forward_vec ok");
 
     for (i, &v) in output.iter().enumerate() {
         assert!(
@@ -281,7 +289,9 @@ fn test_linear_layer_q5k_forward_mat() {
 
     let input = vec![1.0f32; 2 * 256]; // m=2
     let mut output = vec![0.0f32; 2 * 2];
-    layer.forward_mat(&input, &mut output, 2).expect("forward_mat ok");
+    layer
+        .forward_mat(&input, &mut output, 2)
+        .expect("forward_mat ok");
 
     for token in 0..2 {
         for feat in 0..2 {

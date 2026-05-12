@@ -85,7 +85,6 @@ pub struct GrammarConstraint {
     cache: Mutex<AllowedTokensCache>,
 
     // ── Phase 16B: Precomputed token index ──────────────────────────────────
-
     /// Precomputed byte sequences for every token in `0..vocab_size`.
     ///
     /// `token_bytes[id]` is the byte sequence for token `id`, precomputed once
@@ -291,11 +290,7 @@ impl GrammarConstraint {
         // 24 = size_of::<Vec<u8>>() on 64-bit platforms (ptr + len + cap).
         let token_bytes_mem: usize = self.token_bytes.iter().map(|b| b.len() + 24).sum();
         // 24 = size_of::<Vec<u32>>(); 4 = size_of::<u32>().
-        let index_mem: usize = self
-            .first_byte_index
-            .iter()
-            .map(|v| v.len() * 4 + 24)
-            .sum();
+        let index_mem: usize = self.first_byte_index.iter().map(|v| v.len() * 4 + 24).sum();
         token_bytes_mem + index_mem + self.empty_token_ids.len() * 4
     }
 }
@@ -741,7 +736,10 @@ mod tests {
         // At initial state, recognizer is NOT accepting → out-of-range token returns false.
         let mut c_mut = ascii_constraint(arithmetic_grammar());
         let ok = c_mut.advance(999); // well beyond vocab_size=128
-        assert!(!ok, "out-of-range token should return false when not accepting");
+        assert!(
+            !ok,
+            "out-of-range token should return false when not accepting"
+        );
 
         drop(c);
 

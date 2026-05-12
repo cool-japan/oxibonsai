@@ -24,14 +24,18 @@ use crate::error::{ModelError, ModelResult};
 // unsafe `from_raw_parts` casts inside the CUDA dispatch paths below).
 // ---------------------------------------------------------------------------
 
-#[cfg(all(feature = "native-cuda", any(target_os = "linux", target_os = "windows")))]
-const _: () = assert!(
-    std::mem::size_of::<oxibonsai_core::BlockQ4_0>() == oxibonsai_core::BLOCK_Q4_0_BYTES,
-);
-#[cfg(all(feature = "native-cuda", any(target_os = "linux", target_os = "windows")))]
-const _: () = assert!(
-    std::mem::size_of::<oxibonsai_core::BlockQ8_0>() == oxibonsai_core::BLOCK_Q8_0_BYTES,
-);
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+const _: () =
+    assert!(std::mem::size_of::<oxibonsai_core::BlockQ4_0>() == oxibonsai_core::BLOCK_Q4_0_BYTES,);
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+const _: () =
+    assert!(std::mem::size_of::<oxibonsai_core::BlockQ8_0>() == oxibonsai_core::BLOCK_Q8_0_BYTES,);
 
 // ---------------------------------------------------------------------------
 // LinearQ4_0
@@ -110,7 +114,10 @@ impl<'a> LinearQ4_0<'a> {
     /// "no CUDA device" is logged as a warning and the CPU scalar path runs
     /// instead.
     pub fn forward(&self, input: &[f32], output: &mut [f32]) -> ModelResult<()> {
-        #[cfg(all(feature = "native-cuda", any(target_os = "linux", target_os = "windows")))]
+        #[cfg(all(
+            feature = "native-cuda",
+            any(target_os = "linux", target_os = "windows")
+        ))]
         if oxibonsai_kernels::CudaGraph::global().is_ok() {
             // SAFETY: BlockQ4_0 is #[repr(C)] with size BLOCK_Q4_0_BYTES (= 18).
             // The compile-time assert above and the one in oxibonsai_core::quant_std
@@ -140,8 +147,14 @@ impl<'a> LinearQ4_0<'a> {
                 }
             }
         }
-        gemv_q4_0(self.blocks, input, output, self.out_features, self.in_features)
-            .map_err(ModelError::Kernel)
+        gemv_q4_0(
+            self.blocks,
+            input,
+            output,
+            self.out_features,
+            self.in_features,
+        )
+        .map_err(ModelError::Kernel)
     }
 
     /// Forward pass: batched input (loop-over-tokens GEMM).
@@ -236,7 +249,10 @@ impl<'a> LinearQ8_0<'a> {
     /// "no CUDA device" is logged as a warning and the CPU scalar path runs
     /// instead.
     pub fn forward(&self, input: &[f32], output: &mut [f32]) -> ModelResult<()> {
-        #[cfg(all(feature = "native-cuda", any(target_os = "linux", target_os = "windows")))]
+        #[cfg(all(
+            feature = "native-cuda",
+            any(target_os = "linux", target_os = "windows")
+        ))]
         if oxibonsai_kernels::CudaGraph::global().is_ok() {
             // SAFETY: BlockQ8_0 is #[repr(C)] with size BLOCK_Q8_0_BYTES (= 34).
             // The compile-time assert above and the one in oxibonsai_core::quant_std
@@ -266,8 +282,14 @@ impl<'a> LinearQ8_0<'a> {
                 }
             }
         }
-        gemv_q8_0(self.blocks, input, output, self.out_features, self.in_features)
-            .map_err(ModelError::Kernel)
+        gemv_q8_0(
+            self.blocks,
+            input,
+            output,
+            self.out_features,
+            self.in_features,
+        )
+        .map_err(ModelError::Kernel)
     }
 
     /// Forward pass: batched input (loop-over-tokens GEMM).

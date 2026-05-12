@@ -268,11 +268,7 @@ impl Nfa {
     }
 
     /// Alternation: `a | b`.
-    fn build_alternation(
-        &mut self,
-        a: NfaFrag,
-        b: NfaFrag,
-    ) -> Result<NfaFrag, RegexCompileError> {
+    fn build_alternation(&mut self, a: NfaFrag, b: NfaFrag) -> Result<NfaFrag, RegexCompileError> {
         let start = self.alloc()?;
         let end = self.alloc()?;
         self.add_epsilon(start, a.start);
@@ -530,9 +526,8 @@ impl<'a> RegexParser<'a> {
         }
         let digits = &self.input[start..self.pos];
         // SAFETY: we verified all bytes are ASCII digits.
-        let s = std::str::from_utf8(digits).map_err(|e| {
-            RegexCompileError::InvalidUtf8(format!("non-UTF8 in decimal: {e}"))
-        })?;
+        let s = std::str::from_utf8(digits)
+            .map_err(|e| RegexCompileError::InvalidUtf8(format!("non-UTF8 in decimal: {e}")))?;
         s.parse::<usize>().map_err(|e| {
             RegexCompileError::InvalidSyntax(format!("overflow in decimal number: {e}"))
         })
@@ -796,8 +791,20 @@ fn space_set() -> ByteSet {
 fn is_meta_escapable(b: u8) -> bool {
     matches!(
         b,
-        b'.' | b'\\' | b'[' | b']' | b'(' | b')' | b'*' | b'+' | b'?' | b'{' | b'}' | b'|'
-            | b'^' | b'$' | b'0'
+        b'.' | b'\\'
+            | b'['
+            | b']'
+            | b'('
+            | b')'
+            | b'*'
+            | b'+'
+            | b'?'
+            | b'{'
+            | b'}'
+            | b'|'
+            | b'^'
+            | b'$'
+            | b'0'
     )
 }
 
@@ -1012,10 +1019,7 @@ fn build_dfa(
 ///   `<__regex_s{s}> ::= Terminal([b]) <__regex_s{t}>`
 /// For each accept state `s`, we emit an ε-production:
 ///   `<__regex_s{s}> ::=`
-fn dfa_to_grammar(
-    dfa_states: &[DfaState],
-    start_idx: usize,
-) -> Result<Grammar, RegexCompileError> {
+fn dfa_to_grammar(dfa_states: &[DfaState], start_idx: usize) -> Result<Grammar, RegexCompileError> {
     let num_states = dfa_states.len();
 
     // We must pre-allocate all NT ids first, then set the start.

@@ -173,9 +173,9 @@ fn test_dot_any() {
     assert_accepts("a.b", "axb");
     assert_accepts("a.b", "a1b");
     assert_accepts("a.b", "a b");
-    assert_rejects("a.b", "ab");   // dot requires exactly one char
+    assert_rejects("a.b", "ab"); // dot requires exactly one char
     assert_rejects("a.b", "axxb"); // too many chars
-    // dot does NOT match newline
+                                   // dot does NOT match newline
     assert_rejects("a.b", "a\nb");
 }
 
@@ -218,7 +218,7 @@ fn test_negated_class() {
     assert_rejects("[^abc]+", "a");
     assert_rejects("[^abc]+", "b");
     assert_rejects("[^abc]+", "c");
-    assert_rejects("[^abc]+", "xya");  // 'a' breaks it
+    assert_rejects("[^abc]+", "xya"); // 'a' breaks it
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -460,7 +460,10 @@ fn test_anchors_ignored() {
 
     // Just an anchor alone compiles and matches the empty string.
     let g = compile_regex("^").expect("^ should compile");
-    assert!(!g.rules.is_empty(), "anchors-only pattern should produce a grammar");
+    assert!(
+        !g.rules.is_empty(),
+        "anchors-only pattern should produce a grammar"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -474,7 +477,7 @@ fn test_nested_groups() {
     assert_accepts(pattern, "ab");
     assert_accepts(pattern, "ac");
     assert_accepts(pattern, "abac");
-    assert_accepts(pattern, "acabac");  // ac + ab + ac
+    assert_accepts(pattern, "acabac"); // ac + ab + ac
     assert_rejects(pattern, "a");
     assert_rejects(pattern, "b");
     assert_rejects(pattern, "");
@@ -558,7 +561,10 @@ fn test_lookbehind_unsupported() {
 #[test]
 fn test_grammar_has_rules() {
     let grammar = compile_regex(r"[a-z]+").expect("should compile");
-    assert!(!grammar.rules.is_empty(), "compiled grammar must have rules");
+    assert!(
+        !grammar.rules.is_empty(),
+        "compiled grammar must have rules"
+    );
     assert!(grammar.nt_count > 0, "must allocate at least one NT");
 }
 
@@ -637,7 +643,7 @@ fn test_mixed_quantifiers() {
     assert_accepts(pattern, "Hello");
     assert_accepts(pattern, "A");
     assert_accepts(pattern, "World");
-    assert_rejects(pattern, "hello");  // must start with capital
+    assert_rejects(pattern, "hello"); // must start with capital
     assert_rejects(pattern, "");
     assert_rejects(pattern, "123");
 }
@@ -681,7 +687,10 @@ fn test_error_display() {
 
     let e4 = RegexCompileError::UnsupportedFeature("lookahead".to_string());
     let s4 = e4.to_string();
-    assert!(s4.contains("lookahead"), "Display should include the feature name");
+    assert!(
+        s4.contains("lookahead"),
+        "Display should include the feature name"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

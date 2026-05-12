@@ -828,14 +828,10 @@ impl TernaryKernel for KernelDispatcher {
 
 // Compile-time size checks: BlockFP8E4M3/E5M2 must be exactly BLOCK_FP8_BYTES (34).
 // This ensures the raw-pointer cast in the CUDA GPU dispatch is sound.
-const _: () = assert!(
-    std::mem::size_of::<oxibonsai_core::BlockFP8E4M3>()
-        == oxibonsai_core::BLOCK_FP8_BYTES
-);
-const _: () = assert!(
-    std::mem::size_of::<oxibonsai_core::BlockFP8E5M2>()
-        == oxibonsai_core::BLOCK_FP8_BYTES
-);
+const _: () =
+    assert!(std::mem::size_of::<oxibonsai_core::BlockFP8E4M3>() == oxibonsai_core::BLOCK_FP8_BYTES);
+const _: () =
+    assert!(std::mem::size_of::<oxibonsai_core::BlockFP8E5M2>() == oxibonsai_core::BLOCK_FP8_BYTES);
 
 impl Fp8Kernel for KernelDispatcher {
     /// Dequantize FP8 E4M3FN blocks — tier-aware SIMD dispatch.
@@ -1015,15 +1011,11 @@ impl Fp8Kernel for KernelDispatcher {
             },
             #[cfg(target_arch = "x86_64")]
             KernelTier::Avx2 => unsafe {
-                crate::simd_fp8_avx2::gemm_fp8_e4m3_avx2(
-                    blocks, inputs, outputs, n_rows, k, batch,
-                )
+                crate::simd_fp8_avx2::gemm_fp8_e4m3_avx2(blocks, inputs, outputs, n_rows, k, batch)
             },
             #[cfg(target_arch = "aarch64")]
             KernelTier::Neon => unsafe {
-                crate::simd_fp8_neon::gemm_fp8_e4m3_neon(
-                    blocks, inputs, outputs, n_rows, k, batch,
-                )
+                crate::simd_fp8_neon::gemm_fp8_e4m3_neon(blocks, inputs, outputs, n_rows, k, batch)
             },
             _ => crate::gemm_fp8::gemm_fp8_e4m3(blocks, inputs, outputs, n_rows, k, batch),
         }
@@ -1048,15 +1040,11 @@ impl Fp8Kernel for KernelDispatcher {
             },
             #[cfg(target_arch = "x86_64")]
             KernelTier::Avx2 => unsafe {
-                crate::simd_fp8_avx2::gemm_fp8_e5m2_avx2(
-                    blocks, inputs, outputs, n_rows, k, batch,
-                )
+                crate::simd_fp8_avx2::gemm_fp8_e5m2_avx2(blocks, inputs, outputs, n_rows, k, batch)
             },
             #[cfg(target_arch = "aarch64")]
             KernelTier::Neon => unsafe {
-                crate::simd_fp8_neon::gemm_fp8_e5m2_neon(
-                    blocks, inputs, outputs, n_rows, k, batch,
-                )
+                crate::simd_fp8_neon::gemm_fp8_e5m2_neon(blocks, inputs, outputs, n_rows, k, batch)
             },
             _ => crate::gemm_fp8::gemm_fp8_e5m2(blocks, inputs, outputs, n_rows, k, batch),
         }

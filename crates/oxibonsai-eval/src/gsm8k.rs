@@ -105,11 +105,7 @@ impl Gsm8kEvaluator {
     /// wrong).  The returned [`Gsm8kResult`] records accuracy, the count of
     /// correct answers, the total number of evaluated examples, and how many
     /// completions had no extractable `"####"` marker.
-    pub fn evaluate_dataset(
-        &self,
-        dataset: &EvalDataset,
-        completions: &[String],
-    ) -> Gsm8kResult {
+    pub fn evaluate_dataset(&self, dataset: &EvalDataset, completions: &[String]) -> Gsm8kResult {
         let mut correct: usize = 0;
         let mut total: usize = 0;
         let mut no_answer_extracted: usize = 0;

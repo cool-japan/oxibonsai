@@ -172,9 +172,7 @@ mod tests {
         // Row 1: [zero, unit] → 32
         // Row 2: [unit, unit] → 64
         let blocks = vec![
-            unit_block, zero_block,
-            zero_block, unit_block,
-            unit_block, unit_block,
+            unit_block, zero_block, zero_block, unit_block, unit_block, unit_block,
         ];
         let input = vec![1.0f32; 64];
         let mut output = vec![0.0f32; 3];

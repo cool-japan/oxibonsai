@@ -90,8 +90,7 @@ pub struct MmluEvaluator {
 impl MmluEvaluator {
     /// Create a new evaluator with the standard 4-choice MMLU prompt template.
     pub fn new() -> Self {
-        let template =
-            "{question}\nA) {a}\nB) {b}\nC) {c}\nD) {d}\nAnswer:".to_string();
+        let template = "{question}\nA) {a}\nB) {b}\nC) {c}\nD) {d}\nAnswer:".to_string();
         Self {
             mc: McEvaluator {
                 prompt_template: template.clone(),
@@ -108,11 +107,7 @@ impl MmluEvaluator {
     ///
     /// Each `completions[i]` must begin with the letter of the chosen answer
     /// (A–D). The by-subject breakdown is computed in the same pass.
-    pub fn evaluate_completions(
-        &self,
-        dataset: &McDataset,
-        completions: &[String],
-    ) -> MmluResult {
+    pub fn evaluate_completions(&self, dataset: &McDataset, completions: &[String]) -> MmluResult {
         let overall = self.mc.evaluate_dataset(dataset, completions);
         let by_subject = self.evaluate_by_subject_completions(dataset, completions);
         MmluResult {

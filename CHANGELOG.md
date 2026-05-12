@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - Phase 24
+
+### Added
+- **CUDA Q4_0/Q8_0 batch prefill** (`oxibonsai-kernels`, `oxibonsai-model`): `try_cuda_prefill_q_std` replaces sequential single-token prefill with fused batch GEMM for Q4_0 and Q8_0 models. `BonsaiModel::forward_prefill` now routes Q4_0/Q8_0 through `try_cuda_prefill_with_lm_head_q_std` (with sequential fallback on error). `try_cuda_prefill_verify` routes Q4_0/Q8_0 through `try_cuda_prefill_verify_q_std`. Handle namespaces: norm `8M/10M`, weight `9M/11M` (Q4_0/Q8_0 respectively), final-norm `8.9M/10.9M`, LM-head `9.9M/11.9M`.
+
+---
+
+## [Unreleased] - Phase 23
+
+### Added
+- **K-quant CUDA GEMV kernels** (`oxibonsai-kernels`, `oxibonsai-model`): Six new NVRTC GEMV kernels for Q2K, Q3K, Q4K, Q5K, Q6K, and Q8K K-quant formats. `LinearQ2K/Q3K/Q4K/Q5K/Q6K/Q8K::forward` now dispatch to `cuda_gemv_q*k` NVRTC kernels when a CUDA device is available (Linux/Windows, `native-cuda` feature), falling back to CPU scalar on error. `BonsaiModel::forward` and `forward_prefill` detect `OutputWeight::Q2K/Q3K/Q4K/Q5K/Q6K/Q8K` + CUDA availability and route through the block dispatch loop, bypassing the Q1-only CUDA graph attempt. Compile-time `Block*` layout assertions added.
+
+---
+
 ## [Unreleased] - Phase 22
 
 ### Added

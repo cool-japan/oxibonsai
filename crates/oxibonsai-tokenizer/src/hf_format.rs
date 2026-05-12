@@ -227,9 +227,9 @@ impl HfTokenizerJson {
                 // WordPiece vocab is an object {"token": id, ...} — re-use the
                 // BPE object-vocab parser for the model.vocab field; merges are
                 // not used by WordPiece so we accept an empty/absent merges list.
-                let vocab_val = model
-                    .get("vocab")
-                    .ok_or_else(|| TokenizerError::HfFormat("WordPiece model.vocab missing".into()))?;
+                let vocab_val = model.get("vocab").ok_or_else(|| {
+                    TokenizerError::HfFormat("WordPiece model.vocab missing".into())
+                })?;
                 let mut wp_vocab: HashMap<String, u32> = HashMap::new();
                 match vocab_val {
                     Value::Object(map) => {
@@ -405,14 +405,14 @@ impl HfTokenizerJson {
                 })?;
                 // Prefer unk_id from `model.unk_id`; fall back to the id
                 // resolved from the `unk_token` string.
-                let effective_unk_id = self
-                    .unigram_unk_id
-                    .unwrap_or(config.unk_token_id);
+                let effective_unk_id = self.unigram_unk_id.unwrap_or(config.unk_token_id);
                 let unigram_vocab = crate::unigram::UnigramVocab::new(entries, effective_unk_id)
-                    .map_err(|e| {
-                        TokenizerError::HfFormat(format!("invalid Unigram vocab: {e}"))
-                    })?;
-                Ok(OxiTokenizer::with_unigram(vocabulary, unigram_vocab, config))
+                    .map_err(|e| TokenizerError::HfFormat(format!("invalid Unigram vocab: {e}")))?;
+                Ok(OxiTokenizer::with_unigram(
+                    vocabulary,
+                    unigram_vocab,
+                    config,
+                ))
             }
             HfModelType::WordPiece => {
                 // Build the ordered token list from the vocab map.
@@ -446,10 +446,7 @@ fn build_wordpiece_vocab_from_map(
     fallback_unk_id: u32,
 ) -> TokenizerResult<WordPieceVocab> {
     // Sort by ID so that `tokens[id] == token_string`.
-    let mut pairs: Vec<(&str, u32)> = vocab_map
-        .iter()
-        .map(|(k, &v)| (k.as_str(), v))
-        .collect();
+    let mut pairs: Vec<(&str, u32)> = vocab_map.iter().map(|(k, &v)| (k.as_str(), v)).collect();
     pairs.sort_by_key(|(_, id)| *id);
 
     // Validate contiguity.
@@ -492,9 +489,7 @@ fn parse_bpe_model(
         Value::Object(map) => {
             for (token, id_val) in map {
                 let id = id_val.as_u64().ok_or_else(|| {
-                    TokenizerError::HfFormat(format!(
-                        "vocab entry {token:?} has non-integer id"
-                    ))
+                    TokenizerError::HfFormat(format!("vocab entry {token:?} has non-integer id"))
                 })? as u32;
                 vocab.insert(token.clone(), id);
             }

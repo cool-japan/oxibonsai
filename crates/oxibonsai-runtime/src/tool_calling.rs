@@ -93,10 +93,7 @@ pub fn make_tool_call(id: String, name: String, arguments: String) -> ToolCall {
 /// - [`ToolCallError::NoToolCallFound`] — no `<tool_call>` tag found.
 /// - [`ToolCallError::UnknownTool`]    — name not in `tools` registry.
 /// - [`ToolCallError::MalformedArguments`] — argument payload is not valid JSON.
-pub fn select_tool(
-    output: &str,
-    tools: &[ToolDefinition],
-) -> Result<ToolCall, ToolCallError> {
+pub fn select_tool(output: &str, tools: &[ToolDefinition]) -> Result<ToolCall, ToolCallError> {
     let call_id = new_tool_call_id();
 
     // Use the low-level parser from api_types.
@@ -105,7 +102,9 @@ pub fn select_tool(
 
     // Validate the name against the registered tools (if any).
     if !tools.is_empty() {
-        let known = tools.iter().any(|t| t.function.name == tool_call.function.name);
+        let known = tools
+            .iter()
+            .any(|t| t.function.name == tool_call.function.name);
         if !known {
             return Err(ToolCallError::UnknownTool {
                 name: tool_call.function.name.clone(),
@@ -180,18 +179,14 @@ fn merge_tool_grammars(
     // next_nt tracks how many NTs we have allocated so far (root = 1).
     let mut next_nt: usize = 1;
 
-    for (tool_idx, (tool, arg_grammar)) in
-        tools.iter().zip(args_grammars.iter()).enumerate()
-    {
+    for (tool_idx, (tool, arg_grammar)) in tools.iter().zip(args_grammars.iter()).enumerate() {
         // Determine the NT count of arg_grammar by finding the maximum NT id
         // referenced across all rules (lhs and rhs), then +1.
         let arg_nt_count = arg_grammar
             .rules
             .iter()
             .flat_map(|r| {
-                std::iter::once(r.lhs).chain(
-                    r.rhs.iter().filter_map(|s| s.non_terminal_id()),
-                )
+                std::iter::once(r.lhs).chain(r.rhs.iter().filter_map(|s| s.non_terminal_id()))
             })
             .max()
             .map(|m| m + 1)
@@ -295,11 +290,10 @@ pub fn validate_tool_arguments(
     arguments: &str,
     tool: &ToolDefinition,
 ) -> Result<serde_json::Value, ToolCallError> {
-    let parsed: serde_json::Value = serde_json::from_str(arguments).map_err(|e| {
-        ToolCallError::MalformedArguments {
+    let parsed: serde_json::Value =
+        serde_json::from_str(arguments).map_err(|e| ToolCallError::MalformedArguments {
             reason: e.to_string(),
-        }
-    })?;
+        })?;
 
     if !parsed.is_object() {
         return Err(ToolCallError::MalformedArguments {
@@ -514,8 +508,12 @@ mod tests {
         let errors = [
             ToolCallError::NoToolCallFound,
             ToolCallError::UnknownTool { name: "foo".into() },
-            ToolCallError::MalformedArguments { reason: "bad".into() },
-            ToolCallError::GrammarCompileError { reason: "oops".into() },
+            ToolCallError::MalformedArguments {
+                reason: "bad".into(),
+            },
+            ToolCallError::GrammarCompileError {
+                reason: "oops".into(),
+            },
             ToolCallError::EmptyToolList,
         ];
         for e in &errors {

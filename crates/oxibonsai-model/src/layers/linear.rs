@@ -700,22 +700,34 @@ impl<'a> LinearLayer<'a> {
 
     /// Returns Q2_K blocks if this is a Q2_K layer, `None` otherwise.
     pub fn blocks_q2k(&self) -> Option<&[oxibonsai_core::BlockQ2K]> {
-        match self { Self::Q2K(l) => Some(l.blocks()), _ => None }
+        match self {
+            Self::Q2K(l) => Some(l.blocks()),
+            _ => None,
+        }
     }
 
     /// Returns Q3_K blocks if this is a Q3_K layer, `None` otherwise.
     pub fn blocks_q3k(&self) -> Option<&[oxibonsai_core::BlockQ3K]> {
-        match self { Self::Q3K(l) => Some(l.blocks()), _ => None }
+        match self {
+            Self::Q3K(l) => Some(l.blocks()),
+            _ => None,
+        }
     }
 
     /// Returns Q4_K blocks if this is a Q4_K layer, `None` otherwise.
     pub fn blocks_q4k(&self) -> Option<&[oxibonsai_core::BlockQ4K]> {
-        match self { Self::Q4K(l) => Some(l.blocks()), _ => None }
+        match self {
+            Self::Q4K(l) => Some(l.blocks()),
+            _ => None,
+        }
     }
 
     /// Returns Q8_K blocks if this is a Q8_K layer, `None` otherwise.
     pub fn blocks_q8k(&self) -> Option<&[oxibonsai_core::BlockQ8K]> {
-        match self { Self::Q8K(l) => Some(l.blocks()), _ => None }
+        match self {
+            Self::Q8K(l) => Some(l.blocks()),
+            _ => None,
+        }
     }
 
     /// Upload weights to GPU.
@@ -818,19 +830,29 @@ impl<'a> From<LinearQ5K<'a>> for LinearLayer<'a> {
 }
 
 impl<'a> From<LinearQ6K<'a>> for LinearLayer<'a> {
-    fn from(l: LinearQ6K<'a>) -> Self { Self::Q6K(l) }
+    fn from(l: LinearQ6K<'a>) -> Self {
+        Self::Q6K(l)
+    }
 }
 impl<'a> From<LinearQ2K<'a>> for LinearLayer<'a> {
-    fn from(l: LinearQ2K<'a>) -> Self { Self::Q2K(l) }
+    fn from(l: LinearQ2K<'a>) -> Self {
+        Self::Q2K(l)
+    }
 }
 impl<'a> From<LinearQ3K<'a>> for LinearLayer<'a> {
-    fn from(l: LinearQ3K<'a>) -> Self { Self::Q3K(l) }
+    fn from(l: LinearQ3K<'a>) -> Self {
+        Self::Q3K(l)
+    }
 }
 impl<'a> From<LinearQ4K<'a>> for LinearLayer<'a> {
-    fn from(l: LinearQ4K<'a>) -> Self { Self::Q4K(l) }
+    fn from(l: LinearQ4K<'a>) -> Self {
+        Self::Q4K(l)
+    }
 }
 impl<'a> From<LinearQ8K<'a>> for LinearLayer<'a> {
-    fn from(l: LinearQ8K<'a>) -> Self { Self::Q8K(l) }
+    fn from(l: LinearQ8K<'a>) -> Self {
+        Self::Q8K(l)
+    }
 }
 
 #[cfg(test)]

@@ -477,7 +477,10 @@ mod tests {
     /// which dequantizes to `1.0 * (8 - 8) = 0.0`.  With an all-ones input the
     /// output must be all-zeros.
     #[test]
-    #[cfg(all(feature = "native-cuda", any(target_os = "linux", target_os = "windows")))]
+    #[cfg(all(
+        feature = "native-cuda",
+        any(target_os = "linux", target_os = "windows")
+    ))]
     fn test_cuda_gemv_q4_0_matches_cpu() {
         use crate::gpu_backend::cuda_graph::CudaGraph;
         if CudaGraph::global().is_err() {
@@ -516,7 +519,10 @@ mod tests {
     /// the rest are zero.  With scale=1.0 and all-ones input, each output row
     /// should equal `1.0 * 1 * 1.0 = 1.0`.
     #[test]
-    #[cfg(all(feature = "native-cuda", any(target_os = "linux", target_os = "windows")))]
+    #[cfg(all(
+        feature = "native-cuda",
+        any(target_os = "linux", target_os = "windows")
+    ))]
     fn test_cuda_gemv_q8_0_matches_cpu() {
         use crate::gpu_backend::cuda_graph::CudaGraph;
         if CudaGraph::global().is_err() {

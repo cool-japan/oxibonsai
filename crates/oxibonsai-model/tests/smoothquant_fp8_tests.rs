@@ -12,8 +12,8 @@
 
 use oxibonsai_core::quant_fp8::{BlockFP8E4M3, BlockFP8E5M2, QK_FP8};
 use oxibonsai_model::{
-    quantize_fp8_e4m3_smooth, quantize_fp8_e5m2_smooth, SmoothQuantCalibrator, SmoothQuantError,
-    SmoothQuantConfig,
+    quantize_fp8_e4m3_smooth, quantize_fp8_e5m2_smooth, SmoothQuantCalibrator, SmoothQuantConfig,
+    SmoothQuantError,
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -64,7 +64,11 @@ fn calibrator_records_per_channel_max_abs() {
 
     // For col 2 (all-zero activations), factor must still be finite and > 0
     // (epsilon prevents division by zero in compute_smooth_factors).
-    assert!(factors[2].is_finite() && factors[2] > 0.0, "col 2 factor: {}", factors[2]);
+    assert!(
+        factors[2].is_finite() && factors[2] > 0.0,
+        "col 2 factor: {}",
+        factors[2]
+    );
 
     // col 3 has the largest activation max (3.0), so its factor should dominate.
     // With equal weight maxes (all 1.0), alpha=0.5:
@@ -73,7 +77,8 @@ fn calibrator_records_per_channel_max_abs() {
     assert!(
         factors[3] > factors[0],
         "factor[3]={} should be > factor[0]={} (col 3 has larger act_max)",
-        factors[3], factors[0]
+        factors[3],
+        factors[0]
     );
 }
 
@@ -105,7 +110,8 @@ fn calibrator_accumulates_across_batches() {
     assert!(
         factors[1] > factors[0],
         "factor[1]={} should be > factor[0]={} after accumulation",
-        factors[1], factors[0]
+        factors[1],
+        factors[0]
     );
 }
 
@@ -137,13 +143,15 @@ fn calibrator_different_layers() {
     assert!(
         factors_a[0] > factors_a[1],
         "layer_a: factor[0]={} should > factor[1]={}",
-        factors_a[0], factors_a[1]
+        factors_a[0],
+        factors_a[1]
     );
     // layer B: col1 dominates → factor[1] > factor[0]
     assert!(
         factors_b[1] > factors_b[0],
         "layer_b: factor[1]={} should > factor[0]={}",
-        factors_b[1], factors_b[0]
+        factors_b[1],
+        factors_b[0]
     );
 }
 
@@ -272,7 +280,11 @@ fn quantize_fp8_e4m3_smooth_reduces_outlier_error() {
         .map(|(idx, &v)| {
             let col = idx % in_features;
             let s = smooth_factors[col];
-            if s == 0.0 { v } else { v / s }
+            if s == 0.0 {
+                v
+            } else {
+                v / s
+            }
         })
         .collect();
 
@@ -351,7 +363,11 @@ fn quantize_fp8_e5m2_smooth_reduces_outlier_error() {
         .map(|(idx, &v)| {
             let col = idx % in_features;
             let s = smooth_factors[col];
-            if s == 0.0 { v } else { v / s }
+            if s == 0.0 {
+                v
+            } else {
+                v / s
+            }
         })
         .collect();
     let err_smooth_other: f32 = weights
@@ -398,7 +414,11 @@ fn layer_count_tracks_unique_layers() {
 
     // Re-recording an existing layer must not increase count.
     calib.record_activation("layer_x", &[0.2_f32, 0.4], 2);
-    assert_eq!(calib.layer_count(), 3, "re-recording existing layer should not increase count");
+    assert_eq!(
+        calib.layer_count(),
+        3,
+        "re-recording existing layer should not increase count"
+    );
 }
 
 // ─── Test 10: has_layer returns true after recording ──────────────────────────
@@ -407,7 +427,10 @@ fn layer_count_tracks_unique_layers() {
 fn has_layer_returns_true_after_recording() {
     let mut calib = SmoothQuantCalibrator::new(SmoothQuantConfig::default_alpha());
     calib.record_activation("my_layer", &[1.0_f32, -1.0], 2);
-    assert!(calib.has_layer("my_layer"), "has_layer should be true after recording");
+    assert!(
+        calib.has_layer("my_layer"),
+        "has_layer should be true after recording"
+    );
 }
 
 // ─── Test 11: has_layer returns false before recording ────────────────────────
@@ -415,7 +438,10 @@ fn has_layer_returns_true_after_recording() {
 #[test]
 fn has_layer_returns_false_before_recording() {
     let calib = SmoothQuantCalibrator::new(SmoothQuantConfig::default_alpha());
-    assert!(!calib.has_layer("not_recorded"), "has_layer should be false for unrecorded layer");
+    assert!(
+        !calib.has_layer("not_recorded"),
+        "has_layer should be false for unrecorded layer"
+    );
 }
 
 // ─── Test 12: quantize_fp8_e4m3_smooth output block count ────────────────────

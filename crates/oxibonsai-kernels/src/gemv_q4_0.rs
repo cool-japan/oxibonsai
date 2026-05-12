@@ -158,21 +158,9 @@ mod tests {
         let input = vec![1.0f32; 64];
         let mut output = vec![0.0f32; 3];
         gemv_q4_0(&blocks, &input, &mut output, 3, 64).unwrap();
-        assert!(
-            (output[0] - 32.0).abs() < 1.0,
-            "row0: {}",
-            output[0]
-        );
-        assert!(
-            (output[1] - 32.0).abs() < 1.0,
-            "row1: {}",
-            output[1]
-        );
-        assert!(
-            (output[2] - 64.0).abs() < 1.0,
-            "row2: {}",
-            output[2]
-        );
+        assert!((output[0] - 32.0).abs() < 1.0, "row0: {}", output[0]);
+        assert!((output[1] - 32.0).abs() < 1.0, "row1: {}", output[1]);
+        assert!((output[2] - 64.0).abs() < 1.0, "row2: {}", output[2]);
     }
 
     /// in_features not a multiple of 32 → NotBlockAligned error.

@@ -85,9 +85,6 @@ pub use dynamic_quant::{
     SmoothQuantConfig,
 };
 pub use error::{ModelError, ModelResult};
-pub use smoothquant::{
-    quantize_fp8_e4m3_smooth, quantize_fp8_e5m2_smooth, SmoothQuantCalibrator, SmoothQuantError,
-};
 pub use gguf_loader::{
     estimate_memory_bytes, fits_in_budget, load_tensor_metadata, validate_gguf_file, LoadConfig,
     LoadError, LoadStats, TensorChunkIter, TensorEntry,
@@ -156,6 +153,9 @@ pub use pruning::{
     compute_importance, model_sparsity_report, prune_model, prune_tensor, prune_tensor_inplace,
     ImportanceMetric, ImportanceScores, ModelSparsitySummary, PruningConfig, PruningError,
     PruningGranularity, ScoreStats, SparsityReport,
+};
+pub use smoothquant::{
+    quantize_fp8_e4m3_smooth, quantize_fp8_e5m2_smooth, SmoothQuantCalibrator, SmoothQuantError,
 };
 pub use weight_tying::{TiedEmbedding, TyingError};
 

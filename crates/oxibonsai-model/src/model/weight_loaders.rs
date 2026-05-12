@@ -6,7 +6,9 @@ use oxibonsai_core::gguf::reader::GgufFile;
 use oxibonsai_core::gguf::tensor_info::tensor_names;
 use oxibonsai_core::gguf::types::GgufTensorType;
 use oxibonsai_core::tensor::{BlockQ1_0G128, QK1_0_G128};
-use oxibonsai_core::{BlockQ2K, BlockQ3K, BlockQ4K, BlockQ4_0, BlockQ5K, BlockQ6K, BlockQ8K, BlockQ8_0};
+use oxibonsai_core::{
+    BlockQ2K, BlockQ3K, BlockQ4K, BlockQ4_0, BlockQ5K, BlockQ6K, BlockQ8K, BlockQ8_0,
+};
 
 use crate::block::TransformerBlock;
 use crate::error::{ModelError, ModelResult};
@@ -213,17 +215,33 @@ pub(super) fn load_q6k_blocks<'a>(
     BlockQ6K::slice_from_bytes(data).map_err(ModelError::Core)
 }
 
-pub(super) fn load_q2k_blocks<'a>(gguf: &'a GgufFile<'a>, name: &str) -> ModelResult<&'a [BlockQ2K]> {
-    BlockQ2K::slice_from_bytes(gguf.tensor_data(name).map_err(ModelError::Core)?).map_err(ModelError::Core)
+pub(super) fn load_q2k_blocks<'a>(
+    gguf: &'a GgufFile<'a>,
+    name: &str,
+) -> ModelResult<&'a [BlockQ2K]> {
+    BlockQ2K::slice_from_bytes(gguf.tensor_data(name).map_err(ModelError::Core)?)
+        .map_err(ModelError::Core)
 }
-pub(super) fn load_q3k_blocks<'a>(gguf: &'a GgufFile<'a>, name: &str) -> ModelResult<&'a [BlockQ3K]> {
-    BlockQ3K::slice_from_bytes(gguf.tensor_data(name).map_err(ModelError::Core)?).map_err(ModelError::Core)
+pub(super) fn load_q3k_blocks<'a>(
+    gguf: &'a GgufFile<'a>,
+    name: &str,
+) -> ModelResult<&'a [BlockQ3K]> {
+    BlockQ3K::slice_from_bytes(gguf.tensor_data(name).map_err(ModelError::Core)?)
+        .map_err(ModelError::Core)
 }
-pub(super) fn load_q4k_blocks<'a>(gguf: &'a GgufFile<'a>, name: &str) -> ModelResult<&'a [BlockQ4K]> {
-    BlockQ4K::slice_from_bytes(gguf.tensor_data(name).map_err(ModelError::Core)?).map_err(ModelError::Core)
+pub(super) fn load_q4k_blocks<'a>(
+    gguf: &'a GgufFile<'a>,
+    name: &str,
+) -> ModelResult<&'a [BlockQ4K]> {
+    BlockQ4K::slice_from_bytes(gguf.tensor_data(name).map_err(ModelError::Core)?)
+        .map_err(ModelError::Core)
 }
-pub(super) fn load_q8k_blocks<'a>(gguf: &'a GgufFile<'a>, name: &str) -> ModelResult<&'a [BlockQ8K]> {
-    BlockQ8K::slice_from_bytes(gguf.tensor_data(name).map_err(ModelError::Core)?).map_err(ModelError::Core)
+pub(super) fn load_q8k_blocks<'a>(
+    gguf: &'a GgufFile<'a>,
+    name: &str,
+) -> ModelResult<&'a [BlockQ8K]> {
+    BlockQ8K::slice_from_bytes(gguf.tensor_data(name).map_err(ModelError::Core)?)
+        .map_err(ModelError::Core)
 }
 
 /// Load a single Transformer block's weights from GGUF.
@@ -485,13 +503,24 @@ pub(super) fn load_transformer_block<'a>(
         let gate_b = load_q2k_blocks(gguf, &blk(tensor_names::FFN_GATE))?;
         let up_b = load_q2k_blocks(gguf, &blk(tensor_names::FFN_UP))?;
         let down_b = load_q2k_blocks(gguf, &blk(tensor_names::FFN_DOWN))?;
-        let block = TransformerBlock::new(layer_idx, RmsNorm::new(attn_norm_w, config.rms_norm_eps),
-            LinearQ2K::new(q_b, nq*hd, h)?.into(), LinearQ2K::new(k_b, nkv*hd, h)?.into(),
-            LinearQ2K::new(v_b, nkv*hd, h)?.into(), LinearQ2K::new(o_b, h, nq*hd)?.into(),
-            RmsNorm::new(q_norm_w, config.rms_norm_eps), RmsNorm::new(k_norm_w, config.rms_norm_eps),
+        let block = TransformerBlock::new(
+            layer_idx,
+            RmsNorm::new(attn_norm_w, config.rms_norm_eps),
+            LinearQ2K::new(q_b, nq * hd, h)?.into(),
+            LinearQ2K::new(k_b, nkv * hd, h)?.into(),
+            LinearQ2K::new(v_b, nkv * hd, h)?.into(),
+            LinearQ2K::new(o_b, h, nq * hd)?.into(),
+            RmsNorm::new(q_norm_w, config.rms_norm_eps),
+            RmsNorm::new(k_norm_w, config.rms_norm_eps),
             RmsNorm::new(ffn_norm_w, config.rms_norm_eps),
-            LinearQ2K::new(gate_b, inter, h)?.into(), LinearQ2K::new(up_b, inter, h)?.into(),
-            LinearQ2K::new(down_b, h, inter)?.into(), nq, nkv, hd, h);
+            LinearQ2K::new(gate_b, inter, h)?.into(),
+            LinearQ2K::new(up_b, inter, h)?.into(),
+            LinearQ2K::new(down_b, h, inter)?.into(),
+            nq,
+            nkv,
+            hd,
+            h,
+        );
         tracing::trace!(layer = layer_idx, "loaded Q2_K transformer block");
         Ok(block)
     } else if is_q3k {
@@ -502,13 +531,24 @@ pub(super) fn load_transformer_block<'a>(
         let gate_b = load_q3k_blocks(gguf, &blk(tensor_names::FFN_GATE))?;
         let up_b = load_q3k_blocks(gguf, &blk(tensor_names::FFN_UP))?;
         let down_b = load_q3k_blocks(gguf, &blk(tensor_names::FFN_DOWN))?;
-        let block = TransformerBlock::new(layer_idx, RmsNorm::new(attn_norm_w, config.rms_norm_eps),
-            LinearQ3K::new(q_b, nq*hd, h)?.into(), LinearQ3K::new(k_b, nkv*hd, h)?.into(),
-            LinearQ3K::new(v_b, nkv*hd, h)?.into(), LinearQ3K::new(o_b, h, nq*hd)?.into(),
-            RmsNorm::new(q_norm_w, config.rms_norm_eps), RmsNorm::new(k_norm_w, config.rms_norm_eps),
+        let block = TransformerBlock::new(
+            layer_idx,
+            RmsNorm::new(attn_norm_w, config.rms_norm_eps),
+            LinearQ3K::new(q_b, nq * hd, h)?.into(),
+            LinearQ3K::new(k_b, nkv * hd, h)?.into(),
+            LinearQ3K::new(v_b, nkv * hd, h)?.into(),
+            LinearQ3K::new(o_b, h, nq * hd)?.into(),
+            RmsNorm::new(q_norm_w, config.rms_norm_eps),
+            RmsNorm::new(k_norm_w, config.rms_norm_eps),
             RmsNorm::new(ffn_norm_w, config.rms_norm_eps),
-            LinearQ3K::new(gate_b, inter, h)?.into(), LinearQ3K::new(up_b, inter, h)?.into(),
-            LinearQ3K::new(down_b, h, inter)?.into(), nq, nkv, hd, h);
+            LinearQ3K::new(gate_b, inter, h)?.into(),
+            LinearQ3K::new(up_b, inter, h)?.into(),
+            LinearQ3K::new(down_b, h, inter)?.into(),
+            nq,
+            nkv,
+            hd,
+            h,
+        );
         tracing::trace!(layer = layer_idx, "loaded Q3_K transformer block");
         Ok(block)
     } else if is_q4k {
@@ -519,13 +559,24 @@ pub(super) fn load_transformer_block<'a>(
         let gate_b = load_q4k_blocks(gguf, &blk(tensor_names::FFN_GATE))?;
         let up_b = load_q4k_blocks(gguf, &blk(tensor_names::FFN_UP))?;
         let down_b = load_q4k_blocks(gguf, &blk(tensor_names::FFN_DOWN))?;
-        let block = TransformerBlock::new(layer_idx, RmsNorm::new(attn_norm_w, config.rms_norm_eps),
-            LinearQ4K::new(q_b, nq*hd, h)?.into(), LinearQ4K::new(k_b, nkv*hd, h)?.into(),
-            LinearQ4K::new(v_b, nkv*hd, h)?.into(), LinearQ4K::new(o_b, h, nq*hd)?.into(),
-            RmsNorm::new(q_norm_w, config.rms_norm_eps), RmsNorm::new(k_norm_w, config.rms_norm_eps),
+        let block = TransformerBlock::new(
+            layer_idx,
+            RmsNorm::new(attn_norm_w, config.rms_norm_eps),
+            LinearQ4K::new(q_b, nq * hd, h)?.into(),
+            LinearQ4K::new(k_b, nkv * hd, h)?.into(),
+            LinearQ4K::new(v_b, nkv * hd, h)?.into(),
+            LinearQ4K::new(o_b, h, nq * hd)?.into(),
+            RmsNorm::new(q_norm_w, config.rms_norm_eps),
+            RmsNorm::new(k_norm_w, config.rms_norm_eps),
             RmsNorm::new(ffn_norm_w, config.rms_norm_eps),
-            LinearQ4K::new(gate_b, inter, h)?.into(), LinearQ4K::new(up_b, inter, h)?.into(),
-            LinearQ4K::new(down_b, h, inter)?.into(), nq, nkv, hd, h);
+            LinearQ4K::new(gate_b, inter, h)?.into(),
+            LinearQ4K::new(up_b, inter, h)?.into(),
+            LinearQ4K::new(down_b, h, inter)?.into(),
+            nq,
+            nkv,
+            hd,
+            h,
+        );
         tracing::trace!(layer = layer_idx, "loaded Q4_K transformer block");
         Ok(block)
     } else if is_q8k {
@@ -536,13 +587,24 @@ pub(super) fn load_transformer_block<'a>(
         let gate_b = load_q8k_blocks(gguf, &blk(tensor_names::FFN_GATE))?;
         let up_b = load_q8k_blocks(gguf, &blk(tensor_names::FFN_UP))?;
         let down_b = load_q8k_blocks(gguf, &blk(tensor_names::FFN_DOWN))?;
-        let block = TransformerBlock::new(layer_idx, RmsNorm::new(attn_norm_w, config.rms_norm_eps),
-            LinearQ8K::new(q_b, nq*hd, h)?.into(), LinearQ8K::new(k_b, nkv*hd, h)?.into(),
-            LinearQ8K::new(v_b, nkv*hd, h)?.into(), LinearQ8K::new(o_b, h, nq*hd)?.into(),
-            RmsNorm::new(q_norm_w, config.rms_norm_eps), RmsNorm::new(k_norm_w, config.rms_norm_eps),
+        let block = TransformerBlock::new(
+            layer_idx,
+            RmsNorm::new(attn_norm_w, config.rms_norm_eps),
+            LinearQ8K::new(q_b, nq * hd, h)?.into(),
+            LinearQ8K::new(k_b, nkv * hd, h)?.into(),
+            LinearQ8K::new(v_b, nkv * hd, h)?.into(),
+            LinearQ8K::new(o_b, h, nq * hd)?.into(),
+            RmsNorm::new(q_norm_w, config.rms_norm_eps),
+            RmsNorm::new(k_norm_w, config.rms_norm_eps),
             RmsNorm::new(ffn_norm_w, config.rms_norm_eps),
-            LinearQ8K::new(gate_b, inter, h)?.into(), LinearQ8K::new(up_b, inter, h)?.into(),
-            LinearQ8K::new(down_b, h, inter)?.into(), nq, nkv, hd, h);
+            LinearQ8K::new(gate_b, inter, h)?.into(),
+            LinearQ8K::new(up_b, inter, h)?.into(),
+            LinearQ8K::new(down_b, h, inter)?.into(),
+            nq,
+            nkv,
+            hd,
+            h,
+        );
         tracing::trace!(layer = layer_idx, "loaded Q8_K transformer block");
         Ok(block)
     } else {

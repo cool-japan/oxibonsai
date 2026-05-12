@@ -16,6 +16,36 @@ use oxibonsai_kernels::{gemv_q2k, gemv_q3k, gemv_q4k, gemv_q8k};
 use crate::error::{ModelError, ModelResult};
 
 // ---------------------------------------------------------------------------
+// Compile-time size assertions (documenting the SAFETY invariants used in the
+// unsafe `from_raw_parts` casts inside the CUDA dispatch paths below).
+// ---------------------------------------------------------------------------
+
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+const _: () =
+    assert!(std::mem::size_of::<oxibonsai_core::BlockQ2K>() == oxibonsai_core::BLOCK_Q2_K_BYTES,);
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+const _: () =
+    assert!(std::mem::size_of::<oxibonsai_core::BlockQ3K>() == oxibonsai_core::BLOCK_Q3K_BYTES,);
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+const _: () =
+    assert!(std::mem::size_of::<oxibonsai_core::BlockQ4K>() == oxibonsai_core::BLOCK_Q4_K_BYTES,);
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+const _: () =
+    assert!(std::mem::size_of::<oxibonsai_core::BlockQ8K>() == oxibonsai_core::BLOCK_Q8K_BYTES,);
+
+// ---------------------------------------------------------------------------
 // LinearQ2K
 // ---------------------------------------------------------------------------
 
@@ -95,9 +125,52 @@ impl<'a> LinearQ2K<'a> {
     ///
     /// - `input`:  FP32 vector of length `in_features`.
     /// - `output`: FP32 vector of length `out_features`.
+    ///
+    /// When the `native-cuda` feature is enabled and a CUDA device is present
+    /// the NVRTC Q2_K GEMV kernel is tried first; any failure other than
+    /// "no CUDA device" is logged as a warning and the CPU scalar path runs
+    /// instead.
     pub fn forward(&self, input: &[f32], output: &mut [f32]) -> ModelResult<()> {
-        gemv_q2k(self.blocks, input, output, self.out_features, self.in_features)
-            .map_err(ModelError::Kernel)
+        #[cfg(all(
+            feature = "native-cuda",
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        if oxibonsai_kernels::CudaGraph::global().is_ok() {
+            // SAFETY: BlockQ2K is #[repr(C)] with size BLOCK_Q2_K_BYTES (= 84).
+            // The compile-time assert above guarantees this layout.
+            let raw = unsafe {
+                std::slice::from_raw_parts(
+                    self.blocks.as_ptr().cast::<u8>(),
+                    self.blocks.len() * oxibonsai_core::BLOCK_Q2_K_BYTES,
+                )
+            };
+            match oxibonsai_kernels::cuda_gemv_q2k(
+                raw,
+                input,
+                output,
+                self.out_features,
+                self.in_features,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let msg = format!("{e}");
+                    if !msg.contains("no CUDA device") {
+                        tracing::warn!(
+                            error = %e,
+                            "CUDA Q2K GEMV failed, falling back to CPU scalar"
+                        );
+                    }
+                }
+            }
+        }
+        gemv_q2k(
+            self.blocks,
+            input,
+            output,
+            self.out_features,
+            self.in_features,
+        )
+        .map_err(ModelError::Kernel)
     }
 
     /// Forward pass: batched input (GEMM via sequential GEMV).
@@ -110,14 +183,7 @@ impl<'a> LinearQ2K<'a> {
             let input_row = &input[batch * self.in_features..(batch + 1) * self.in_features];
             let output_row =
                 &mut output[batch * self.out_features..(batch + 1) * self.out_features];
-            gemv_q2k(
-                self.blocks,
-                input_row,
-                output_row,
-                self.out_features,
-                self.in_features,
-            )
-            .map_err(ModelError::Kernel)?;
+            self.forward(input_row, output_row)?;
         }
         Ok(())
     }
@@ -203,9 +269,52 @@ impl<'a> LinearQ3K<'a> {
     ///
     /// - `input`:  FP32 vector of length `in_features`.
     /// - `output`: FP32 vector of length `out_features`.
+    ///
+    /// When the `native-cuda` feature is enabled and a CUDA device is present
+    /// the NVRTC Q3_K GEMV kernel is tried first; any failure other than
+    /// "no CUDA device" is logged as a warning and the CPU scalar path runs
+    /// instead.
     pub fn forward(&self, input: &[f32], output: &mut [f32]) -> ModelResult<()> {
-        gemv_q3k(self.blocks, input, output, self.out_features, self.in_features)
-            .map_err(ModelError::Kernel)
+        #[cfg(all(
+            feature = "native-cuda",
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        if oxibonsai_kernels::CudaGraph::global().is_ok() {
+            // SAFETY: BlockQ3K is #[repr(C)] with size BLOCK_Q3K_BYTES (= 110).
+            // The compile-time assert above guarantees this layout.
+            let raw = unsafe {
+                std::slice::from_raw_parts(
+                    self.blocks.as_ptr().cast::<u8>(),
+                    self.blocks.len() * oxibonsai_core::BLOCK_Q3K_BYTES,
+                )
+            };
+            match oxibonsai_kernels::cuda_gemv_q3k(
+                raw,
+                input,
+                output,
+                self.out_features,
+                self.in_features,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let msg = format!("{e}");
+                    if !msg.contains("no CUDA device") {
+                        tracing::warn!(
+                            error = %e,
+                            "CUDA Q3K GEMV failed, falling back to CPU scalar"
+                        );
+                    }
+                }
+            }
+        }
+        gemv_q3k(
+            self.blocks,
+            input,
+            output,
+            self.out_features,
+            self.in_features,
+        )
+        .map_err(ModelError::Kernel)
     }
 
     /// Forward pass: batched input (GEMM via sequential GEMV).
@@ -218,14 +327,7 @@ impl<'a> LinearQ3K<'a> {
             let input_row = &input[batch * self.in_features..(batch + 1) * self.in_features];
             let output_row =
                 &mut output[batch * self.out_features..(batch + 1) * self.out_features];
-            gemv_q3k(
-                self.blocks,
-                input_row,
-                output_row,
-                self.out_features,
-                self.in_features,
-            )
-            .map_err(ModelError::Kernel)?;
+            self.forward(input_row, output_row)?;
         }
         Ok(())
     }
@@ -311,9 +413,52 @@ impl<'a> LinearQ4K<'a> {
     ///
     /// - `input`:  FP32 vector of length `in_features`.
     /// - `output`: FP32 vector of length `out_features`.
+    ///
+    /// When the `native-cuda` feature is enabled and a CUDA device is present
+    /// the NVRTC Q4_K GEMV kernel is tried first; any failure other than
+    /// "no CUDA device" is logged as a warning and the CPU scalar path runs
+    /// instead.
     pub fn forward(&self, input: &[f32], output: &mut [f32]) -> ModelResult<()> {
-        gemv_q4k(self.blocks, input, output, self.out_features, self.in_features)
-            .map_err(ModelError::Kernel)
+        #[cfg(all(
+            feature = "native-cuda",
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        if oxibonsai_kernels::CudaGraph::global().is_ok() {
+            // SAFETY: BlockQ4K is #[repr(C)] with size BLOCK_Q4_K_BYTES (= 144).
+            // The compile-time assert above guarantees this layout.
+            let raw = unsafe {
+                std::slice::from_raw_parts(
+                    self.blocks.as_ptr().cast::<u8>(),
+                    self.blocks.len() * oxibonsai_core::BLOCK_Q4_K_BYTES,
+                )
+            };
+            match oxibonsai_kernels::cuda_gemv_q4k(
+                raw,
+                input,
+                output,
+                self.out_features,
+                self.in_features,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let msg = format!("{e}");
+                    if !msg.contains("no CUDA device") {
+                        tracing::warn!(
+                            error = %e,
+                            "CUDA Q4K GEMV failed, falling back to CPU scalar"
+                        );
+                    }
+                }
+            }
+        }
+        gemv_q4k(
+            self.blocks,
+            input,
+            output,
+            self.out_features,
+            self.in_features,
+        )
+        .map_err(ModelError::Kernel)
     }
 
     /// Forward pass: batched input (GEMM via sequential GEMV).
@@ -326,14 +471,7 @@ impl<'a> LinearQ4K<'a> {
             let input_row = &input[batch * self.in_features..(batch + 1) * self.in_features];
             let output_row =
                 &mut output[batch * self.out_features..(batch + 1) * self.out_features];
-            gemv_q4k(
-                self.blocks,
-                input_row,
-                output_row,
-                self.out_features,
-                self.in_features,
-            )
-            .map_err(ModelError::Kernel)?;
+            self.forward(input_row, output_row)?;
         }
         Ok(())
     }
@@ -422,9 +560,52 @@ impl<'a> LinearQ8K<'a> {
     ///
     /// - `input`:  FP32 vector of length `in_features`.
     /// - `output`: FP32 vector of length `out_features`.
+    ///
+    /// When the `native-cuda` feature is enabled and a CUDA device is present
+    /// the NVRTC Q8_K GEMV kernel is tried first; any failure other than
+    /// "no CUDA device" is logged as a warning and the CPU scalar path runs
+    /// instead.
     pub fn forward(&self, input: &[f32], output: &mut [f32]) -> ModelResult<()> {
-        gemv_q8k(self.blocks, input, output, self.out_features, self.in_features)
-            .map_err(ModelError::Kernel)
+        #[cfg(all(
+            feature = "native-cuda",
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        if oxibonsai_kernels::CudaGraph::global().is_ok() {
+            // SAFETY: BlockQ8K is #[repr(C)] with size BLOCK_Q8K_BYTES (= 292).
+            // The compile-time assert above guarantees this layout.
+            let raw = unsafe {
+                std::slice::from_raw_parts(
+                    self.blocks.as_ptr().cast::<u8>(),
+                    self.blocks.len() * oxibonsai_core::BLOCK_Q8K_BYTES,
+                )
+            };
+            match oxibonsai_kernels::cuda_gemv_q8k(
+                raw,
+                input,
+                output,
+                self.out_features,
+                self.in_features,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let msg = format!("{e}");
+                    if !msg.contains("no CUDA device") {
+                        tracing::warn!(
+                            error = %e,
+                            "CUDA Q8K GEMV failed, falling back to CPU scalar"
+                        );
+                    }
+                }
+            }
+        }
+        gemv_q8k(
+            self.blocks,
+            input,
+            output,
+            self.out_features,
+            self.in_features,
+        )
+        .map_err(ModelError::Kernel)
     }
 
     /// Forward pass: batched input (GEMM via sequential GEMV).
@@ -437,14 +618,7 @@ impl<'a> LinearQ8K<'a> {
             let input_row = &input[batch * self.in_features..(batch + 1) * self.in_features];
             let output_row =
                 &mut output[batch * self.out_features..(batch + 1) * self.out_features];
-            gemv_q8k(
-                self.blocks,
-                input_row,
-                output_row,
-                self.out_features,
-                self.in_features,
-            )
-            .map_err(ModelError::Kernel)?;
+            self.forward(input_row, output_row)?;
         }
         Ok(())
     }

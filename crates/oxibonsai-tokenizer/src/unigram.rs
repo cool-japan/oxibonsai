@@ -263,10 +263,7 @@ mod tests {
 
     fn make_vocab(entries: &[(&str, f64)], unk_id: u32) -> UnigramVocab {
         UnigramVocab::new(
-            entries
-                .iter()
-                .map(|(s, p)| (s.to_string(), *p))
-                .collect(),
+            entries.iter().map(|(s, p)| (s.to_string(), *p)).collect(),
             unk_id,
         )
         .unwrap()
@@ -342,7 +339,13 @@ mod tests {
         // Vocabulary knows "é" but not the individual bytes — UNK fallback must
         // not split the 2-byte sequence of 'é'.
         let vocab = make_vocab(
-            &[("<unk>", 0.0), ("c", -1.0), ("a", -1.0), ("f", -1.0), ("é", -1.0)],
+            &[
+                ("<unk>", 0.0),
+                ("c", -1.0),
+                ("a", -1.0),
+                ("f", -1.0),
+                ("é", -1.0),
+            ],
             0,
         );
         let ids = vocab.encode("café");
@@ -364,7 +367,12 @@ mod tests {
     #[test]
     fn decode_roundtrip() {
         let vocab = make_vocab(
-            &[("<unk>", 0.0), ("hello", -1.0), (" ", -0.5), ("world", -1.0)],
+            &[
+                ("<unk>", 0.0),
+                ("hello", -1.0),
+                (" ", -0.5),
+                ("world", -1.0),
+            ],
             0,
         );
         let text = "hello world";

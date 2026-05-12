@@ -42,9 +42,21 @@ fn kv_cache_policy_fp8_from_ordinal_roundtrip() {
     let ordinal = fp8.ordinal();
 
     // Verify the full set so no ordinal collides with Fp8's.
-    assert_ne!(ordinal, KvCacheLevel::Fp16.ordinal(), "Fp8 ordinal must not collide with Fp16");
-    assert_ne!(ordinal, KvCacheLevel::Q8.ordinal(), "Fp8 ordinal must not collide with Q8");
-    assert_ne!(ordinal, KvCacheLevel::Q4.ordinal(), "Fp8 ordinal must not collide with Q4");
+    assert_ne!(
+        ordinal,
+        KvCacheLevel::Fp16.ordinal(),
+        "Fp8 ordinal must not collide with Fp16"
+    );
+    assert_ne!(
+        ordinal,
+        KvCacheLevel::Q8.ordinal(),
+        "Fp8 ordinal must not collide with Q8"
+    );
+    assert_ne!(
+        ordinal,
+        KvCacheLevel::Q4.ordinal(),
+        "Fp8 ordinal must not collide with Q4"
+    );
 
     // Tag uniqueness
     assert_ne!(fp8.tag(), KvCacheLevel::Fp16.tag());

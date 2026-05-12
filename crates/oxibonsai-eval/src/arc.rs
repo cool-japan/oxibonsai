@@ -82,8 +82,7 @@ impl ArcEvaluator {
         // McEvaluator::extract_answer also handles 'E' if we extend the template.
         // For now, use the same standard template as MMLU — callers that need
         // five-option support can inject a custom template via McEvaluator::with_template.
-        let template =
-            "{question}\nA) {a}\nB) {b}\nC) {c}\nD) {d}\nAnswer:".to_string();
+        let template = "{question}\nA) {a}\nB) {b}\nC) {c}\nD) {d}\nAnswer:".to_string();
 
         Self {
             split,

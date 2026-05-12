@@ -257,7 +257,10 @@ fn test_string_escape_sequences() {
         .iter()
         .map(|(_, r)| r.rhs.iter().filter(|s| s.is_terminal()).count())
         .sum();
-    assert_eq!(total_terminals, 4, "expected 4 terminal bytes (\\n, \\t, \\r, \\\\)");
+    assert_eq!(
+        total_terminals, 4,
+        "expected 4 terminal bytes (\\n, \\t, \\r, \\\\)"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -314,14 +317,22 @@ fn test_nested_alternation() {
     let g = parse_ok(r#"root ::= "a" | ("b" | "c")"#);
     // Root has 2 alternatives: "a" and the group.
     let root_rules: Vec<_> = g.rules_for(g.start()).collect();
-    assert_eq!(root_rules.len(), 2, "expected 2 root rules for nested alternation");
+    assert_eq!(
+        root_rules.len(),
+        2,
+        "expected 2 root rules for nested alternation"
+    );
     // The group NT should have 2 alternatives.
     let group_nt_id = match &root_rules[1].1.rhs[..] {
         [oxibonsai_runtime::grammar::Symbol::NonTerminal(id)] => *id,
         _ => panic!("second alternative should be a NonTerminal group reference"),
     };
     let group_rules: Vec<_> = g.rules_for(group_nt_id).collect();
-    assert_eq!(group_rules.len(), 2, "group should have 2 alternatives (b | c)");
+    assert_eq!(
+        group_rules.len(),
+        2,
+        "group should have 2 alternatives (b | c)"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -349,8 +360,16 @@ fn test_multiword_sequence() {
     let root_rules: Vec<_> = g.rules_for(g.start()).collect();
     assert_eq!(root_rules.len(), 1);
     // "hello" + " " + "world" = 11 bytes → 11 terminal symbols in the sequence.
-    let terminal_count = root_rules[0].1.rhs.iter().filter(|s| s.is_terminal()).count();
-    assert_eq!(terminal_count, 11, "expected 11 terminal bytes for \"hello\" \" \" \"world\"");
+    let terminal_count = root_rules[0]
+        .1
+        .rhs
+        .iter()
+        .filter(|s| s.is_terminal())
+        .count();
+    assert_eq!(
+        terminal_count, 11,
+        "expected 11 terminal bytes for \"hello\" \" \" \"world\""
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -416,10 +435,15 @@ fn test_constraint_integration() {
 
 #[test]
 fn test_multiple_rules() {
-    let src = "root ::= noun verb noun\nnoun ::= \"cat\" | \"dog\"\nverb ::= \"chases\" | \"sees\"\n";
+    let src =
+        "root ::= noun verb noun\nnoun ::= \"cat\" | \"dog\"\nverb ::= \"chases\" | \"sees\"\n";
     let g = parse_ok(src);
     // Should have 3 named NTs (root, noun, verb) + synthetic ones.
-    assert!(g.nt_count >= 3, "expected at least 3 NTs, got {}", g.nt_count);
+    assert!(
+        g.nt_count >= 3,
+        "expected at least 3 NTs, got {}",
+        g.nt_count
+    );
     // Root has 1 rule (the sequence noun verb noun).
     let root_rules: Vec<_> = g.rules_for(g.start()).collect();
     assert_eq!(root_rules.len(), 1);
@@ -443,7 +467,10 @@ fn test_digit_word_pattern() {
     let root_name = g.nt_name(g.start()).to_string();
     assert_eq!(root_name, "root");
     // Should contain ε rules (from the star helper inside plus).
-    assert!(g.rules.iter().any(|r| r.is_epsilon()), "plus quantifier must introduce ε rule");
+    assert!(
+        g.rules.iter().any(|r| r.is_epsilon()),
+        "plus quantifier must introduce ε rule"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -456,7 +483,11 @@ fn test_error_display_coverage() {
         GbnfParseError::EmptyGrammar,
         GbnfParseError::MissingRootRule,
         GbnfParseError::UnknownRule("foo".to_string()),
-        GbnfParseError::UnexpectedChar { line: 1, col: 2, ch: '!' },
+        GbnfParseError::UnexpectedChar {
+            line: 1,
+            col: 2,
+            ch: '!',
+        },
         GbnfParseError::UnterminatedString,
         GbnfParseError::UnterminatedCharClass,
         GbnfParseError::InvalidEscape('z'),

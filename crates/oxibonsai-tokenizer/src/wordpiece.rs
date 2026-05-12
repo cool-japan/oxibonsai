@@ -336,7 +336,13 @@ mod tests {
     fn error_unk_out_of_range() {
         let err = WordPieceVocab::new(vec!["a".into()], 5).unwrap_err();
         assert!(
-            matches!(err, WordPieceError::UnkOutOfRange { unk_id: 5, vocab_len: 1 }),
+            matches!(
+                err,
+                WordPieceError::UnkOutOfRange {
+                    unk_id: 5,
+                    vocab_len: 1
+                }
+            ),
             "unexpected variant: {err:?}"
         );
     }
@@ -512,10 +518,7 @@ mod tests {
 
     #[test]
     fn display_duplicate_token_error() {
-        let s = format!(
-            "{}",
-            WordPieceError::DuplicateToken("hello".to_string())
-        );
+        let s = format!("{}", WordPieceError::DuplicateToken("hello".to_string()));
         assert!(s.contains("hello"));
     }
 }

@@ -61,12 +61,21 @@ pub use gpu_backend::{
     any(target_os = "linux", target_os = "windows")
 ))]
 pub use gpu_backend::{
+    cuda_gemv_q2k, cuda_gemv_q3k, cuda_gemv_q4k, cuda_gemv_q5k, cuda_gemv_q6k, cuda_gemv_q8k,
+};
+
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub use gpu_backend::{
     cuda_gemv_fp8_e4m3, cuda_gemv_fp8_e5m2, cuda_gemv_q4_0, cuda_gemv_q8_0, try_cuda_ffn,
     try_cuda_full_forward, try_cuda_full_forward_ternary,
     try_cuda_full_forward_ternary_with_gpu_lm_head, try_cuda_full_forward_with_gpu_lm_head,
-    try_cuda_full_layer, try_cuda_prefill, try_cuda_prefill_ternary, try_cuda_qkv,
-    CudaCachedLayerWeights, CudaFullForwardLayerParams, CudaFullForwardLayerParamsTernary,
-    CudaGraph, CudaGraphError, NativeCudaBackend,
+    try_cuda_full_layer, try_cuda_prefill, try_cuda_prefill_q_std, try_cuda_prefill_ternary,
+    try_cuda_qkv, CudaCachedLayerWeights, CudaFullForwardLayerParams,
+    CudaFullForwardLayerParamsTernary, CudaGraph, CudaGraphError, CudaQStdPrefillLayerParams,
+    NativeCudaBackend,
 };
 
 pub mod dequant;
@@ -116,10 +125,6 @@ pub mod tuning;
 pub use aligned::{AlignedBlocks, AlignedBuffer};
 pub use dispatch::{KernelDispatcher, KernelTier};
 pub use error::{KernelError, KernelResult};
-pub use parallel::{
-    gemm_fp8_e4m3_par, gemm_fp8_e5m2_par, gemm_ternary_g128_par, gemv_fp8_e4m3_par,
-    gemv_fp8_e5m2_par, gemv_ternary_g128_par,
-};
 pub use gemv_q2k::gemv_q2k;
 pub use gemv_q3k::gemv_q3k;
 pub use gemv_q4_0::gemv_q4_0;
@@ -128,6 +133,10 @@ pub use gemv_q5k::gemv_q5k;
 pub use gemv_q6k::gemv_q6k;
 pub use gemv_q8_0::gemv_q8_0;
 pub use gemv_q8k::gemv_q8k;
+pub use parallel::{
+    gemm_fp8_e4m3_par, gemm_fp8_e5m2_par, gemm_ternary_g128_par, gemv_fp8_e4m3_par,
+    gemv_fp8_e5m2_par, gemv_ternary_g128_par,
+};
 pub use parallel_tiled::{gemm_adaptive_ternary, gemv_adaptive, gemv_adaptive_ternary};
 pub use prefetch::{PrefetchConfig, PrefetchLocality, PrefetchStrategy};
 pub use simd_float_ops::{rms_norm_simd, rope_apply_simd, silu_simd, softmax_simd, swiglu_simd};

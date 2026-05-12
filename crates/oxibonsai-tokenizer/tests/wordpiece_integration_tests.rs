@@ -76,13 +76,19 @@ fn make_oxi_tokenizer() -> OxiTokenizer {
 #[test]
 fn oxi_tokenizer_with_wordpiece_reports_is_wordpiece() {
     let tok = make_oxi_tokenizer();
-    assert!(tok.is_wordpiece(), "tokenizer should report is_wordpiece = true");
+    assert!(
+        tok.is_wordpiece(),
+        "tokenizer should report is_wordpiece = true"
+    );
 }
 
 #[test]
 fn oxi_tokenizer_with_wordpiece_is_not_unigram() {
     let tok = make_oxi_tokenizer();
-    assert!(!tok.is_unigram(), "wordpiece tokenizer should not be unigram");
+    assert!(
+        !tok.is_unigram(),
+        "wordpiece tokenizer should not be unigram"
+    );
 }
 
 #[test]
@@ -160,7 +166,10 @@ fn wordpiece_vocab_roundtrip_encode_decode() {
     let text = "hello world";
     let ids = vocab.encode(text);
     let decoded = vocab.decode(&ids);
-    assert_eq!(decoded, text, "encode→decode must be identity for known words");
+    assert_eq!(
+        decoded, text,
+        "encode→decode must be identity for known words"
+    );
 }
 
 #[test]

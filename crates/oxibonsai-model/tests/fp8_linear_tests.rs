@@ -28,7 +28,7 @@ fn make_e4m3_blocks_ones(num_blocks: usize) -> Vec<BlockFP8E4M3> {
     (0..num_blocks)
         .map(|_| BlockFP8E4M3 {
             qs: [0x38u8; QK_FP8], // all weights decode to +1.0 in E4M3FN
-            d: f16::ONE,           // scale = 1.0
+            d: f16::ONE,          // scale = 1.0
         })
         .collect()
 }
@@ -40,7 +40,7 @@ fn make_e5m2_blocks_ones(num_blocks: usize) -> Vec<BlockFP8E5M2> {
     (0..num_blocks)
         .map(|_| BlockFP8E5M2 {
             qs: [0x3Cu8; QK_FP8], // all weights decode to +1.0 in E5M2
-            d: f16::ONE,           // scale = 1.0
+            d: f16::ONE,          // scale = 1.0
         })
         .collect()
 }
@@ -140,7 +140,11 @@ fn test_linear_fp8_e4m3_gemm() {
         .forward_batch(&input, &mut output, BATCH)
         .expect("LinearFP8E4M3::forward_batch should succeed");
 
-    assert_eq!(output.len(), BATCH * OUT, "output length = batch * out_features");
+    assert_eq!(
+        output.len(),
+        BATCH * OUT,
+        "output length = batch * out_features"
+    );
     for (idx, &val) in output.iter().enumerate() {
         let expected = 32.0f32;
         let tol = expected * 0.05 + 0.5;
@@ -170,7 +174,10 @@ fn test_linear_layer_fp8_dispatch() {
     assert_eq!(layer.out_features(), OUT);
     assert_eq!(layer.in_features(), IN);
     // FP8 variants have no GPU handle.
-    assert!(layer.gpu_handle().is_none(), "FP8 layer should have no GPU handle");
+    assert!(
+        layer.gpu_handle().is_none(),
+        "FP8 layer should have no GPU handle"
+    );
 
     let input = vec![1.0f32; IN];
     let mut output = vec![0.0f32; OUT];
@@ -196,10 +203,8 @@ fn test_linear_layer_fp8_dispatch() {
 #[test]
 fn test_model_variant_fp8_detection() {
     let config_1_7b = Qwen3Config::bonsai_1_7b();
-    let variant = ModelVariant::from_config_and_sample_tensor_type(
-        &config_1_7b,
-        GgufTensorType::F8_E4M3,
-    );
+    let variant =
+        ModelVariant::from_config_and_sample_tensor_type(&config_1_7b, GgufTensorType::F8_E4M3);
     assert_eq!(
         variant,
         ModelVariant::FP8Bonsai1_7B,
@@ -208,10 +213,8 @@ fn test_model_variant_fp8_detection() {
 
     // Also verify E5M2 variant upgrades correctly.
     let config_8b = Qwen3Config::bonsai_8b();
-    let variant_8b = ModelVariant::from_config_and_sample_tensor_type(
-        &config_8b,
-        GgufTensorType::F8_E5M2,
-    );
+    let variant_8b =
+        ModelVariant::from_config_and_sample_tensor_type(&config_8b, GgufTensorType::F8_E5M2);
     assert_eq!(
         variant_8b,
         ModelVariant::FP8Bonsai8B,
@@ -219,10 +222,8 @@ fn test_model_variant_fp8_detection() {
     );
 
     // Sanity: non-FP8 tensor type should NOT yield an FP8 variant.
-    let variant_q1 = ModelVariant::from_config_and_sample_tensor_type(
-        &config_1_7b,
-        GgufTensorType::Q1_0_g128,
-    );
+    let variant_q1 =
+        ModelVariant::from_config_and_sample_tensor_type(&config_1_7b, GgufTensorType::Q1_0_g128);
     assert_ne!(
         variant_q1,
         ModelVariant::FP8Bonsai1_7B,

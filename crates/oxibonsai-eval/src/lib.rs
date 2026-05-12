@@ -64,15 +64,8 @@ pub use accuracy::{
     AccuracyResult, ExactMatchEvaluator, LogitMcResult, McEvaluator, McLogitEvaluator,
 };
 pub use arc::{ArcEvaluator, ArcResult, ArcSplit};
-pub use boolq::{BoolQDataset, BoolQEvaluator, BoolQItem, BoolQResult};
-pub use gsm8k::{Gsm8kEvaluator, Gsm8kResult};
-pub use hellaswag::{HellaSwagDataset, HellaSwagEvaluator, HellaSwagItem, HellaSwagResult};
-pub use mmlu::{MmluEvaluator, MmluResult};
-pub use truthfulqa::{
-    TruthfulQaDataset, TruthfulQaEvaluator, TruthfulQaItem, TruthfulQaMode, TruthfulQaResult,
-};
-pub use winogrande::{WinoGrandeDataset, WinoGrandeEvaluator, WinoGrandeItem, WinoGrandeResult};
 pub use bleu::{corpus_bleu, sentence_bleu, BleuConfig, BleuScore, SmoothingMethod};
+pub use boolq::{BoolQDataset, BoolQEvaluator, BoolQItem, BoolQResult};
 pub use bootstrap::{bootstrap_ci, ConfidenceInterval};
 pub use calibration::{
     brier_score, calibration_all, expected_calibration_error, nll_from_logits, BinStat,
@@ -81,7 +74,10 @@ pub use calibration::{
 pub use chrf::{chrf, chrf_plus_plus, chrf_with, ChrfScore};
 pub use dataset::{EvalDataset, EvalExample, McDataset, MultipleChoiceQuestion};
 pub use error::EvalError;
+pub use gsm8k::{Gsm8kEvaluator, Gsm8kResult};
+pub use hellaswag::{HellaSwagDataset, HellaSwagEvaluator, HellaSwagItem, HellaSwagResult};
 pub use meteor::{align_tokens, meteor, meteor_multi, MeteorConfig, MeteorScore};
+pub use mmlu::{MmluEvaluator, MmluResult};
 pub use perplexity::{PerplexityEvaluator, PerplexityResult};
 pub use qa::{
     corpus_em_f1, exact_match as qa_exact_match, f1_score as qa_f1_score, normalize_answer,
@@ -93,3 +89,7 @@ pub use rouge::{
 };
 pub use streaming::{OnlineAccuracy, OnlinePerplexity};
 pub use throughput::{percentile, time_fn, ThroughputBenchmark, ThroughputResult};
+pub use truthfulqa::{
+    TruthfulQaDataset, TruthfulQaEvaluator, TruthfulQaItem, TruthfulQaMode, TruthfulQaResult,
+};
+pub use winogrande::{WinoGrandeDataset, WinoGrandeEvaluator, WinoGrandeItem, WinoGrandeResult};

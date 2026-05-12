@@ -185,11 +185,7 @@ impl Compiler {
     // ─────────────────────────────────────────────────────────────────────────
 
     /// Compile the body of definition `key` into rules for the pre-allocated NT.
-    fn pass2_compile_def(
-        &mut self,
-        key: &str,
-        root: &Value,
-    ) -> Result<(), JsonSchemaCompileError> {
+    fn pass2_compile_def(&mut self, key: &str, root: &Value) -> Result<(), JsonSchemaCompileError> {
         // Guard: only compile once.
         if *self.defs_compiled.get(key).unwrap_or(&false) {
             return Ok(());
@@ -212,10 +208,8 @@ impl Compiler {
         // then add a bridging rule `def_nt ::= intermediate_nt` if they differ.
         let compiled_nt = self.compile_schema(body_value, 0)?;
         if compiled_nt != def_nt {
-            self.grammar.add_rule(Rule::new(
-                def_nt,
-                vec![Symbol::NonTerminal(compiled_nt)],
-            ));
+            self.grammar
+                .add_rule(Rule::new(def_nt, vec![Symbol::NonTerminal(compiled_nt)]));
         }
 
         Ok(())
@@ -344,9 +338,10 @@ impl Compiler {
             )));
         };
 
-        self.defs_nt.get(key).copied().ok_or_else(|| {
-            JsonSchemaCompileError::DanglingRef(ref_str.to_string())
-        })
+        self.defs_nt
+            .get(key)
+            .copied()
+            .ok_or_else(|| JsonSchemaCompileError::DanglingRef(ref_str.to_string()))
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -359,9 +354,7 @@ impl Compiler {
         _depth: usize,
     ) -> Result<NonTerminalId, JsonSchemaCompileError> {
         let values = enum_val.as_array().ok_or_else(|| {
-            JsonSchemaCompileError::InvalidSchema(
-                "\"enum\" value must be a JSON array".to_string(),
-            )
+            JsonSchemaCompileError::InvalidSchema("\"enum\" value must be a JSON array".to_string())
         })?;
 
         if values.is_empty() {
@@ -375,10 +368,8 @@ impl Compiler {
         for v in values {
             let literal = json_value_to_literal(v)?;
             // Each alternative: enum_nt ::= <literal bytes>
-            self.grammar.add_rule(Rule::new(
-                enum_nt,
-                vec![Symbol::Terminal(literal)],
-            ));
+            self.grammar
+                .add_rule(Rule::new(enum_nt, vec![Symbol::Terminal(literal)]));
         }
 
         Ok(enum_nt)
@@ -394,9 +385,7 @@ impl Compiler {
         depth: usize,
     ) -> Result<NonTerminalId, JsonSchemaCompileError> {
         let variants = arr.as_array().ok_or_else(|| {
-            JsonSchemaCompileError::InvalidSchema(
-                "anyOf/oneOf must be an array".to_string(),
-            )
+            JsonSchemaCompileError::InvalidSchema("anyOf/oneOf must be an array".to_string())
         })?;
 
         if variants.is_empty() {
@@ -410,10 +399,8 @@ impl Compiler {
         for variant in variants {
             let var_nt = self.compile_schema(variant, depth + 1)?;
             // any_nt ::= <variant_nt>
-            self.grammar.add_rule(Rule::new(
-                any_nt,
-                vec![Symbol::NonTerminal(var_nt)],
-            ));
+            self.grammar
+                .add_rule(Rule::new(any_nt, vec![Symbol::NonTerminal(var_nt)]));
         }
 
         Ok(any_nt)
@@ -527,10 +514,7 @@ impl Compiler {
         // __string ::= '"' '"'
         self.grammar.add_rule(Rule::new(
             str_nt,
-            vec![
-                Symbol::Terminal(vec![b'"']),
-                Symbol::Terminal(vec![b'"']),
-            ],
+            vec![Symbol::Terminal(vec![b'"']), Symbol::Terminal(vec![b'"'])],
         ));
         // __string ::= '"' __string_chars '"'
         self.grammar.add_rule(Rule::new(
@@ -543,38 +527,27 @@ impl Compiler {
         ));
 
         // __string_chars ::= __string_char
-        self.grammar.add_rule(Rule::new(
-            chars_nt,
-            vec![Symbol::NonTerminal(char_nt)],
-        ));
+        self.grammar
+            .add_rule(Rule::new(chars_nt, vec![Symbol::NonTerminal(char_nt)]));
         // __string_chars ::= __string_char __string_chars
         self.grammar.add_rule(Rule::new(
             chars_nt,
-            vec![
-                Symbol::NonTerminal(char_nt),
-                Symbol::NonTerminal(chars_nt),
-            ],
+            vec![Symbol::NonTerminal(char_nt), Symbol::NonTerminal(chars_nt)],
         ));
 
         // __string_char ::= 0x20 | 0x21 | 0x23..=0x5B | 0x5D..=0x7E
         // (printable ASCII excluding '"' (0x22) and '\' (0x5C))
         for b in 0x20u8..=0x21u8 {
-            self.grammar.add_rule(Rule::new(
-                char_nt,
-                vec![Symbol::Terminal(vec![b])],
-            ));
+            self.grammar
+                .add_rule(Rule::new(char_nt, vec![Symbol::Terminal(vec![b])]));
         }
         for b in 0x23u8..=0x5Bu8 {
-            self.grammar.add_rule(Rule::new(
-                char_nt,
-                vec![Symbol::Terminal(vec![b])],
-            ));
+            self.grammar
+                .add_rule(Rule::new(char_nt, vec![Symbol::Terminal(vec![b])]));
         }
         for b in 0x5Du8..=0x7Eu8 {
-            self.grammar.add_rule(Rule::new(
-                char_nt,
-                vec![Symbol::Terminal(vec![b])],
-            ));
+            self.grammar
+                .add_rule(Rule::new(char_nt, vec![Symbol::Terminal(vec![b])]));
         }
 
         self.string_nt = Some(str_nt);
@@ -588,10 +561,8 @@ impl Compiler {
         }
         let digit_nt = self.grammar.alloc_nt("__digit");
         for b in b'0'..=b'9' {
-            self.grammar.add_rule(Rule::new(
-                digit_nt,
-                vec![Symbol::Terminal(vec![b])],
-            ));
+            self.grammar
+                .add_rule(Rule::new(digit_nt, vec![Symbol::Terminal(vec![b])]));
         }
         self.digit_nt = Some(digit_nt);
         digit_nt
@@ -610,10 +581,8 @@ impl Compiler {
 
         let digits_nt = self.grammar.alloc_nt("__digits");
         // __digits ::= __digit
-        self.grammar.add_rule(Rule::new(
-            digits_nt,
-            vec![Symbol::NonTerminal(digit_nt)],
-        ));
+        self.grammar
+            .add_rule(Rule::new(digits_nt, vec![Symbol::NonTerminal(digit_nt)]));
         // __digits ::= __digit __digits
         self.grammar.add_rule(Rule::new(
             digits_nt,
@@ -625,17 +594,12 @@ impl Compiler {
 
         let int_nt = self.grammar.alloc_nt("__integer");
         // __integer ::= __digits
-        self.grammar.add_rule(Rule::new(
-            int_nt,
-            vec![Symbol::NonTerminal(digits_nt)],
-        ));
+        self.grammar
+            .add_rule(Rule::new(int_nt, vec![Symbol::NonTerminal(digits_nt)]));
         // __integer ::= '-' __digits
         self.grammar.add_rule(Rule::new(
             int_nt,
-            vec![
-                Symbol::Terminal(vec![b'-']),
-                Symbol::NonTerminal(digits_nt),
-            ],
+            vec![Symbol::Terminal(vec![b'-']), Symbol::NonTerminal(digits_nt)],
         ));
 
         Ok(int_nt)
@@ -670,10 +634,8 @@ impl Compiler {
 
         let num_nt = self.grammar.alloc_nt("__number");
         // __number ::= __integer
-        self.grammar.add_rule(Rule::new(
-            num_nt,
-            vec![Symbol::NonTerminal(int_nt)],
-        ));
+        self.grammar
+            .add_rule(Rule::new(num_nt, vec![Symbol::NonTerminal(int_nt)]));
         // __number ::= __integer '.' __frac_digits
         self.grammar.add_rule(Rule::new(
             num_nt,
@@ -690,10 +652,8 @@ impl Compiler {
     /// Compile `{"type":"boolean"}`.  Returns an NT with two rules: `true` and `false`.
     fn compile_boolean_type(&mut self) -> NonTerminalId {
         let bool_nt = self.grammar.alloc_nt("__boolean");
-        self.grammar.add_rule(Rule::new(
-            bool_nt,
-            vec![Symbol::Terminal(b"true".to_vec())],
-        ));
+        self.grammar
+            .add_rule(Rule::new(bool_nt, vec![Symbol::Terminal(b"true".to_vec())]));
         self.grammar.add_rule(Rule::new(
             bool_nt,
             vec![Symbol::Terminal(b"false".to_vec())],
@@ -704,10 +664,8 @@ impl Compiler {
     /// Compile `{"type":"null"}`.  Returns an NT with one rule: `null`.
     fn compile_null_type(&mut self) -> NonTerminalId {
         let null_nt = self.grammar.alloc_nt("__null");
-        self.grammar.add_rule(Rule::new(
-            null_nt,
-            vec![Symbol::Terminal(b"null".to_vec())],
-        ));
+        self.grammar
+            .add_rule(Rule::new(null_nt, vec![Symbol::Terminal(b"null".to_vec())]));
         null_nt
     }
 
@@ -731,10 +689,8 @@ impl Compiler {
         // For integer and number, allocate digits NT first.
         let digit_nt = self.ensure_digit_nt();
         let digits_nt = self.grammar.alloc_nt("__any_val_digits");
-        self.grammar.add_rule(Rule::new(
-            digits_nt,
-            vec![Symbol::NonTerminal(digit_nt)],
-        ));
+        self.grammar
+            .add_rule(Rule::new(digits_nt, vec![Symbol::NonTerminal(digit_nt)]));
         self.grammar.add_rule(Rule::new(
             digits_nt,
             vec![
@@ -744,63 +700,40 @@ impl Compiler {
         ));
 
         let num_nt = self.grammar.alloc_nt("__any_val_num");
+        self.grammar
+            .add_rule(Rule::new(num_nt, vec![Symbol::NonTerminal(digits_nt)]));
         self.grammar.add_rule(Rule::new(
             num_nt,
-            vec![Symbol::NonTerminal(digits_nt)],
-        ));
-        self.grammar.add_rule(Rule::new(
-            num_nt,
-            vec![
-                Symbol::Terminal(vec![b'-']),
-                Symbol::NonTerminal(digits_nt),
-            ],
+            vec![Symbol::Terminal(vec![b'-']), Symbol::NonTerminal(digits_nt)],
         ));
 
         // Empty object stub: `{}`
         let obj_stub_nt = self.grammar.alloc_nt("__any_val_obj");
         self.grammar.add_rule(Rule::new(
             obj_stub_nt,
-            vec![
-                Symbol::Terminal(vec![b'{']),
-                Symbol::Terminal(vec![b'}']),
-            ],
+            vec![Symbol::Terminal(vec![b'{']), Symbol::Terminal(vec![b'}'])],
         ));
 
         // Empty array stub: `[]`
         let arr_stub_nt = self.grammar.alloc_nt("__any_val_arr");
         self.grammar.add_rule(Rule::new(
             arr_stub_nt,
-            vec![
-                Symbol::Terminal(vec![b'[']),
-                Symbol::Terminal(vec![b']']),
-            ],
+            vec![Symbol::Terminal(vec![b'[']), Symbol::Terminal(vec![b']'])],
         ));
 
         // __any_value ::= __string | __boolean | __null | __any_val_num | {} | []
-        self.grammar.add_rule(Rule::new(
-            val_nt,
-            vec![Symbol::NonTerminal(str_nt)],
-        ));
-        self.grammar.add_rule(Rule::new(
-            val_nt,
-            vec![Symbol::NonTerminal(bool_nt)],
-        ));
-        self.grammar.add_rule(Rule::new(
-            val_nt,
-            vec![Symbol::NonTerminal(null_nt)],
-        ));
-        self.grammar.add_rule(Rule::new(
-            val_nt,
-            vec![Symbol::NonTerminal(num_nt)],
-        ));
-        self.grammar.add_rule(Rule::new(
-            val_nt,
-            vec![Symbol::NonTerminal(obj_stub_nt)],
-        ));
-        self.grammar.add_rule(Rule::new(
-            val_nt,
-            vec![Symbol::NonTerminal(arr_stub_nt)],
-        ));
+        self.grammar
+            .add_rule(Rule::new(val_nt, vec![Symbol::NonTerminal(str_nt)]));
+        self.grammar
+            .add_rule(Rule::new(val_nt, vec![Symbol::NonTerminal(bool_nt)]));
+        self.grammar
+            .add_rule(Rule::new(val_nt, vec![Symbol::NonTerminal(null_nt)]));
+        self.grammar
+            .add_rule(Rule::new(val_nt, vec![Symbol::NonTerminal(num_nt)]));
+        self.grammar
+            .add_rule(Rule::new(val_nt, vec![Symbol::NonTerminal(obj_stub_nt)]));
+        self.grammar
+            .add_rule(Rule::new(val_nt, vec![Symbol::NonTerminal(arr_stub_nt)]));
 
         val_nt
     }
@@ -857,10 +790,7 @@ impl Compiler {
             // Empty object: `{}`
             self.grammar.add_rule(Rule::new(
                 obj_nt,
-                vec![
-                    Symbol::Terminal(vec![b'{']),
-                    Symbol::Terminal(vec![b'}']),
-                ],
+                vec![Symbol::Terminal(vec![b'{']), Symbol::Terminal(vec![b'}'])],
             ));
             return Ok(obj_nt);
         }
@@ -930,10 +860,8 @@ impl Compiler {
 
         let items_nt = self.grammar.alloc_nt("__array_items");
         // __array_items ::= <item_nt>
-        self.grammar.add_rule(Rule::new(
-            items_nt,
-            vec![Symbol::NonTerminal(item_nt)],
-        ));
+        self.grammar
+            .add_rule(Rule::new(items_nt, vec![Symbol::NonTerminal(item_nt)]));
         // __array_items ::= <item_nt> ',' __array_items
         self.grammar.add_rule(Rule::new(
             items_nt,
@@ -948,10 +876,7 @@ impl Compiler {
         // __array ::= '[' ']'
         self.grammar.add_rule(Rule::new(
             arr_nt,
-            vec![
-                Symbol::Terminal(vec![b'[']),
-                Symbol::Terminal(vec![b']']),
-            ],
+            vec![Symbol::Terminal(vec![b'[']), Symbol::Terminal(vec![b']'])],
         ));
         // __array ::= '[' __array_items ']'
         self.grammar.add_rule(Rule::new(

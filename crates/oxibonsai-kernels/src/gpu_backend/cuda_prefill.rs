@@ -1204,9 +1204,7 @@ pub unsafe fn encode_prefill_layer_ternary(
             graph
                 .stream_arc()
                 .memcpy_dtod(&src_view, &mut st_bufs.d_hidden)
-                .map_err(|e| {
-                    CudaGraphError::DriverError(format!("copy hidden tq2 t={t}: {e}"))
-                })?;
+                .map_err(|e| CudaGraphError::DriverError(format!("copy hidden tq2 t={t}: {e}")))?;
         }
 
         // Upload pos/seqlen [pos, pos+1] into st_bufs.d_pos_seqlen
@@ -1279,9 +1277,7 @@ pub unsafe fn encode_prefill_layer_ternary(
         graph
             .stream_arc()
             .memset_zeros(&mut dst_view)
-            .map_err(|e| {
-                CudaGraphError::DriverError(format!("zero d_normed tq2 oproj: {e}"))
-            })?;
+            .map_err(|e| CudaGraphError::DriverError(format!("zero d_normed tq2 oproj: {e}")))?;
     }
     launch_gemm_tq2_v7(
         graph,
@@ -1808,9 +1804,7 @@ pub fn try_cuda_prefill_ternary(
             let mut logits_guard = acquire_prefill_logits(&graph, lm_head_out_features)?;
             let d_logits = &mut logits_guard
                 .as_mut()
-                .ok_or_else(|| {
-                    CudaGraphError::DriverError("logits buf not allocated".into())
-                })?
+                .ok_or_else(|| CudaGraphError::DriverError("logits buf not allocated".into()))?
                 .0;
 
             // TQ2 LM head GEMV (single token)

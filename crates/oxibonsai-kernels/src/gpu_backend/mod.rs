@@ -36,17 +36,17 @@ pub mod cuda_fp8_kernels;
     feature = "native-cuda",
     any(target_os = "linux", target_os = "windows")
 ))]
-pub mod cuda_q_std_kernels;
-#[cfg(all(
-    feature = "native-cuda",
-    any(target_os = "linux", target_os = "windows")
-))]
 pub mod cuda_full_layer;
 #[cfg(all(
     feature = "native-cuda",
     any(target_os = "linux", target_os = "windows")
 ))]
 pub mod cuda_graph;
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub mod cuda_k_quant_kernels;
 #[cfg(all(
     feature = "native-cuda",
     any(target_os = "linux", target_os = "windows")
@@ -62,6 +62,21 @@ pub mod cuda_prefill;
     any(target_os = "linux", target_os = "windows")
 ))]
 pub mod cuda_prefill_kernels;
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub mod cuda_q_std_kernels;
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub mod cuda_q_std_prefill;
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub mod cuda_q_std_prefill_kernels;
 pub mod kernel_sources;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod metal_dispatch;
@@ -131,7 +146,20 @@ pub use cuda_fp8_kernels::{cuda_gemv_fp8_e4m3, cuda_gemv_fp8_e5m2};
     feature = "native-cuda",
     any(target_os = "linux", target_os = "windows")
 ))]
+pub use cuda_k_quant_kernels::{
+    cuda_gemv_q2k, cuda_gemv_q3k, cuda_gemv_q4k, cuda_gemv_q5k, cuda_gemv_q6k, cuda_gemv_q8k,
+};
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
 pub use cuda_q_std_kernels::{cuda_gemv_q4_0, cuda_gemv_q8_0};
+
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub use cuda_q_std_prefill::{try_cuda_prefill_q_std, CudaQStdPrefillLayerParams};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // DeviceBuffer

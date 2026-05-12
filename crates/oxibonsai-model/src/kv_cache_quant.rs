@@ -532,14 +532,8 @@ fn quantize_row_fp8(row: &[f32], format: Fp8KvFormat) -> (Vec<u8>, f32) {
     let scale = (max_abs / fp8_max).max(f32::EPSILON);
 
     let quantized = match format {
-        Fp8KvFormat::E4M3 => row
-            .iter()
-            .map(|&x| fp8_e4m3_encode(x / scale))
-            .collect(),
-        Fp8KvFormat::E5M2 => row
-            .iter()
-            .map(|&x| fp8_e5m2_encode(x / scale))
-            .collect(),
+        Fp8KvFormat::E4M3 => row.iter().map(|&x| fp8_e4m3_encode(x / scale)).collect(),
+        Fp8KvFormat::E5M2 => row.iter().map(|&x| fp8_e5m2_encode(x / scale)).collect(),
     };
 
     (quantized, scale)

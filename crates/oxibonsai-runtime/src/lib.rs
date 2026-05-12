@@ -171,8 +171,8 @@ pub use token_budget::{
 pub use tokenizer_bridge::TokenizerBridge;
 #[cfg(feature = "server")]
 pub use tool_calling::{
-    build_tool_constraint, make_tool_call, new_tool_call_id, select_tool, ToolCallError,
-    ToolRegistry, validate_tool_arguments,
+    build_tool_constraint, make_tool_call, new_tool_call_id, select_tool, validate_tool_arguments,
+    ToolCallError, ToolRegistry,
 };
 pub use tracing_setup::{init_tracing, TracingConfig};
 #[cfg(feature = "server")]

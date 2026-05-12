@@ -77,7 +77,10 @@ mod tests {
             let lut_val = lut[i];
             // NaN != NaN, handle separately
             if scalar.is_nan() {
-                assert!(lut_val.is_nan(), "byte {i:#04x}: expected NaN, got {lut_val}");
+                assert!(
+                    lut_val.is_nan(),
+                    "byte {i:#04x}: expected NaN, got {lut_val}"
+                );
             } else {
                 assert_eq!(
                     lut_val, scalar,
@@ -95,7 +98,10 @@ mod tests {
             let scalar = fp8_e5m2_decode(i as u8);
             let lut_val = lut[i];
             if scalar.is_nan() {
-                assert!(lut_val.is_nan(), "byte {i:#04x}: expected NaN, got {lut_val}");
+                assert!(
+                    lut_val.is_nan(),
+                    "byte {i:#04x}: expected NaN, got {lut_val}"
+                );
             } else if scalar.is_infinite() {
                 assert_eq!(
                     lut_val.is_infinite(),

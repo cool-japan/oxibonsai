@@ -57,8 +57,8 @@ fn test_mc1_perfect_score() {
     let eval = TruthfulQaEvaluator::mc1();
     // Give each item its own correct index the highest logit.
     let logits = vec![
-        vec![5.0_f32, 1.0_f32, 1.0_f32], // argmax = 0 → correct
-        vec![0.0_f32, 9.0_f32, 0.0_f32], // argmax = 1 → correct
+        vec![5.0_f32, 1.0_f32, 1.0_f32],  // argmax = 0 → correct
+        vec![0.0_f32, 9.0_f32, 0.0_f32],  // argmax = 1 → correct
         vec![-1.0_f32, 0.0_f32, 7.0_f32], // argmax = 2 → correct
     ];
     let result = eval.evaluate_logits(&dataset, &logits);
@@ -71,10 +71,7 @@ fn test_mc1_perfect_score() {
 /// 2. All argmax selections wrong → MC1 accuracy = 0.0
 #[test]
 fn test_mc1_all_wrong() {
-    let dataset = TruthfulQaDataset::from_items(vec![
-        item_mc1(0),
-        item_mc1(0),
-    ]);
+    let dataset = TruthfulQaDataset::from_items(vec![item_mc1(0), item_mc1(0)]);
     let eval = TruthfulQaEvaluator::mc1();
     // Give index 1 the highest logit; correct is 0 → wrong every time.
     let logits = vec![
@@ -157,7 +154,11 @@ fn test_mc2_mixed_correct_incorrect() {
     let result = eval.evaluate_logits(&dataset, &logits);
     assert!(result.accuracy > 0.0);
     assert!(result.accuracy < 1.0);
-    assert!((result.accuracy - 0.5).abs() < 1e-5, "expected ≈0.5, got {}", result.accuracy);
+    assert!(
+        (result.accuracy - 0.5).abs() < 1e-5,
+        "expected ≈0.5, got {}",
+        result.accuracy
+    );
 }
 
 /// 8. MC2 accuracy is a continuous value, not forced to 0 or 1
@@ -169,12 +170,16 @@ fn test_mc2_continuous_score_not_just_01() {
     let dataset = TruthfulQaDataset::from_items(vec![item1, item2]);
     let eval = TruthfulQaEvaluator::mc2();
     let logits = vec![
-        vec![1.0_f32, -1.0_f32],  // softmax ≈ [0.88, 0.12] → score ≈ 0.88
-        vec![-1.0_f32, 1.0_f32],  // softmax ≈ [0.12, 0.88] → score ≈ 0.12
+        vec![1.0_f32, -1.0_f32], // softmax ≈ [0.88, 0.12] → score ≈ 0.88
+        vec![-1.0_f32, 1.0_f32], // softmax ≈ [0.12, 0.88] → score ≈ 0.12
     ];
     let result = eval.evaluate_logits(&dataset, &logits);
     // Mean ≈ (0.88 + 0.12) / 2 = 0.5
-    assert!((result.accuracy - 0.5).abs() < 0.01, "got {}", result.accuracy);
+    assert!(
+        (result.accuracy - 0.5).abs() < 0.01,
+        "got {}",
+        result.accuracy
+    );
     // The accuracy itself should not be exactly 0 or 1.
     assert!(result.accuracy > 0.0);
     assert!(result.accuracy < 1.0);
@@ -222,11 +227,7 @@ fn test_truthfulqa_empty_mc2() {
 /// 12. from_items stores items in insertion order
 #[test]
 fn test_truthfulqa_dataset_from_items() {
-    let items = vec![
-        item_mc1(0),
-        item_mc1(1),
-        item_mc1(2),
-    ];
+    let items = vec![item_mc1(0), item_mc1(1), item_mc1(2)];
     let ds = TruthfulQaDataset::from_items(items);
     assert_eq!(ds.len(), 3);
     assert_eq!(ds.items[0].mc1_correct_idx, 0);

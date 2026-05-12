@@ -238,10 +238,7 @@ impl BlockQ2K {
         let align = std::mem::align_of::<Self>();
         if data.as_ptr().align_offset(align) != 0 {
             return Err(BonsaiError::KQuantError {
-                reason: format!(
-                    "Q2_K slice_from_bytes: pointer not {}-byte aligned",
-                    align
-                ),
+                reason: format!("Q2_K slice_from_bytes: pointer not {}-byte aligned", align),
             });
         }
         let count = data.len() / BLOCK_Q2_K_BYTES;
@@ -368,10 +365,7 @@ impl BlockQ3K {
             let mut sub_max_abs = [0.0f32; 16];
             for (sub, slot) in sub_max_abs.iter_mut().enumerate() {
                 let sub_chunk = &chunk[sub * 16..(sub + 1) * 16];
-                *slot = sub_chunk
-                    .iter()
-                    .map(|&v| v.abs())
-                    .fold(0.0f32, f32::max);
+                *slot = sub_chunk.iter().map(|&v| v.abs()).fold(0.0f32, f32::max);
             }
 
             // Super-block scale: d * max_scale_nibble * 4 ≈ overall max abs
@@ -469,10 +463,7 @@ impl BlockQ3K {
         let align = std::mem::align_of::<Self>();
         if data.as_ptr().align_offset(align) != 0 {
             return Err(BonsaiError::KQuantError {
-                reason: format!(
-                    "Q3_K slice_from_bytes: pointer not {}-byte aligned",
-                    align
-                ),
+                reason: format!("Q3_K slice_from_bytes: pointer not {}-byte aligned", align),
             });
         }
         let count = data.len() / BLOCK_Q3K_BYTES;
@@ -763,10 +754,7 @@ impl BlockQ4K {
         let align = std::mem::align_of::<Self>();
         if data.as_ptr().align_offset(align) != 0 {
             return Err(BonsaiError::KQuantError {
-                reason: format!(
-                    "Q4_K slice_from_bytes: pointer not {}-byte aligned",
-                    align
-                ),
+                reason: format!("Q4_K slice_from_bytes: pointer not {}-byte aligned", align),
             });
         }
         let count = data.len() / BLOCK_Q4_K_BYTES;
@@ -864,10 +852,7 @@ impl BlockQ8K {
             let chunk = &input[block_idx * QK_K..block_idx * QK_K + QK_K];
 
             // Find max absolute value across all 256 weights
-            let max_abs = chunk
-                .iter()
-                .map(|&v| v.abs())
-                .fold(0.0f32, f32::max);
+            let max_abs = chunk.iter().map(|&v| v.abs()).fold(0.0f32, f32::max);
 
             let d = if max_abs > 0.0 { max_abs / 127.0 } else { 0.0 };
             let inv_d = if d > 0.0 { 1.0 / d } else { 0.0 };
@@ -914,10 +899,7 @@ impl BlockQ8K {
         let align = std::mem::align_of::<Self>();
         if data.as_ptr().align_offset(align) != 0 {
             return Err(BonsaiError::KQuantError {
-                reason: format!(
-                    "Q8_K slice_from_bytes: pointer not {}-byte aligned",
-                    align
-                ),
+                reason: format!("Q8_K slice_from_bytes: pointer not {}-byte aligned", align),
             });
         }
         let count = data.len() / BLOCK_Q8K_BYTES;
@@ -1065,7 +1047,10 @@ mod tests {
         BlockQ3K::dequant(&blocks, &mut out).expect("dequant ok");
         for &v in &out {
             let err = (v - 1.0).abs() / 1.0;
-            assert!(err < 0.5, "uniform round-trip rel error {err} too high, got {v}");
+            assert!(
+                err < 0.5,
+                "uniform round-trip rel error {err} too high, got {v}"
+            );
         }
     }
 
@@ -1210,13 +1195,19 @@ mod tests {
         let input_pos = vec![0.5f32; 256];
         let blocks_pos = BlockQ8K::quantize(&input_pos).expect("quantize ok");
         for &bs in &blocks_pos[0].bsums {
-            assert!(bs > 0, "positive input should yield positive bsums, got {bs}");
+            assert!(
+                bs > 0,
+                "positive input should yield positive bsums, got {bs}"
+            );
         }
 
         let input_neg = vec![-0.5f32; 256];
         let blocks_neg = BlockQ8K::quantize(&input_neg).expect("quantize ok");
         for &bs in &blocks_neg[0].bsums {
-            assert!(bs < 0, "negative input should yield negative bsums, got {bs}");
+            assert!(
+                bs < 0,
+                "negative input should yield negative bsums, got {bs}"
+            );
         }
     }
 }

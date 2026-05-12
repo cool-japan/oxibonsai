@@ -26,6 +26,7 @@ pub mod cudagraph_reformat_tq2_blocks_to_soa_group;
 pub mod cudagraph_stream_arc_group;
 pub mod cudagraph_traits;
 pub mod cudagraph_type;
+pub mod cudagraph_upload_weight_aos_raw_group;
 pub mod cudagraph_upload_weight_soa_new_group;
 pub mod cudagraph_v8_shared_bytes_group;
 pub mod cudagrapherror_traits;

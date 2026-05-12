@@ -288,17 +288,17 @@ fn encode_tensor(
                 v.resize(tensor.data.len() + pad, 0.0_f32);
                 std::borrow::Cow::Owned(v)
             };
-            let blocks = BlockFP8E4M3::quantize(&padded).map_err(|e| ExportError::QuantizeError {
-                name: tensor.name.clone(),
-                reason: e.to_string(),
-            })?;
+            let blocks =
+                BlockFP8E4M3::quantize(&padded).map_err(|e| ExportError::QuantizeError {
+                    name: tensor.name.clone(),
+                    reason: e.to_string(),
+                })?;
             // Serialize blocks to raw bytes via zero-copy pointer cast.
             // SAFETY: BlockFP8E4M3 is #[repr(C)] with compile-time size assert of 34 bytes.
             // The struct contains [u8; 32] + f16 (u16 layout), alignment is u8-compatible.
             let byte_len = blocks.len() * oxibonsai_core::quant_fp8::BLOCK_FP8_BYTES;
-            let block_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(blocks.as_ptr() as *const u8, byte_len)
-            };
+            let block_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(blocks.as_ptr() as *const u8, byte_len) };
             Ok((block_bytes.to_vec(), TensorType::F8_E4M3))
         }
 
@@ -314,15 +314,15 @@ fn encode_tensor(
                 v.resize(tensor.data.len() + pad, 0.0_f32);
                 std::borrow::Cow::Owned(v)
             };
-            let blocks = BlockFP8E5M2::quantize(&padded).map_err(|e| ExportError::QuantizeError {
-                name: tensor.name.clone(),
-                reason: e.to_string(),
-            })?;
+            let blocks =
+                BlockFP8E5M2::quantize(&padded).map_err(|e| ExportError::QuantizeError {
+                    name: tensor.name.clone(),
+                    reason: e.to_string(),
+                })?;
             // SAFETY: same as FP8E4M3 above — BlockFP8E5M2 is #[repr(C)], 34 bytes.
             let byte_len = blocks.len() * oxibonsai_core::quant_fp8::BLOCK_FP8_BYTES;
-            let block_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(blocks.as_ptr() as *const u8, byte_len)
-            };
+            let block_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(blocks.as_ptr() as *const u8, byte_len) };
             Ok((block_bytes.to_vec(), TensorType::F8_E5M2))
         }
 
@@ -345,9 +345,8 @@ fn encode_tensor(
             // SAFETY: BlockQ4_0 is #[repr(C)] with compile-time size assert of 18 bytes.
             // Contains f16 (u16 layout, 2 bytes) + [u8; 16]; alignment is 2 bytes.
             let byte_len = blocks.len() * BLOCK_Q4_0_BYTES;
-            let block_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(blocks.as_ptr() as *const u8, byte_len)
-            };
+            let block_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(blocks.as_ptr() as *const u8, byte_len) };
             Ok((block_bytes.to_vec(), TensorType::Q4_0))
         }
 
@@ -370,9 +369,8 @@ fn encode_tensor(
             // SAFETY: BlockQ8_0 is #[repr(C)] with compile-time size assert of 34 bytes.
             // Contains f16 (2 bytes) + [i8; 32]; alignment is 2 bytes (from f16).
             let byte_len = blocks.len() * BLOCK_Q8_0_BYTES;
-            let block_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(blocks.as_ptr() as *const u8, byte_len)
-            };
+            let block_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(blocks.as_ptr() as *const u8, byte_len) };
             Ok((block_bytes.to_vec(), TensorType::Q8_0))
         }
 
@@ -395,9 +393,8 @@ fn encode_tensor(
             // SAFETY: BlockQ4K is #[repr(C)] with compile-time size assert of 144 bytes.
             // Contains two f16 fields (d, dmin), [u8; 12] scales, [u8; 128] qs; alignment 2.
             let byte_len = blocks.len() * BLOCK_Q4_K_BYTES;
-            let block_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(blocks.as_ptr() as *const u8, byte_len)
-            };
+            let block_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(blocks.as_ptr() as *const u8, byte_len) };
             Ok((block_bytes.to_vec(), TensorType::Q4_K))
         }
 
@@ -421,9 +418,8 @@ fn encode_tensor(
             // SAFETY: BlockQ5K is #[repr(C)] with compile-time size assert of 176 bytes.
             // Contains two f16 fields, [u8; 12] scales, [u8; 32] qh, [u8; 128] qs; alignment 2.
             let byte_len = blocks.len() * BLOCK_Q5K_BYTES;
-            let block_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(blocks.as_ptr() as *const u8, byte_len)
-            };
+            let block_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(blocks.as_ptr() as *const u8, byte_len) };
             Ok((block_bytes.to_vec(), TensorType::Q5_K))
         }
 
@@ -447,9 +443,8 @@ fn encode_tensor(
             // SAFETY: BlockQ6K is #[repr(C)] with compile-time size assert of 210 bytes.
             // Contains [u8; 128] ql, [u8; 64] qh, [i8; 16] scales, f16 d; alignment 2.
             let byte_len = blocks.len() * BLOCK_Q6K_BYTES;
-            let block_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(blocks.as_ptr() as *const u8, byte_len)
-            };
+            let block_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(blocks.as_ptr() as *const u8, byte_len) };
             Ok((block_bytes.to_vec(), TensorType::Q6_K))
         }
     }
@@ -588,32 +583,27 @@ pub fn estimate_export_size(tensors: &[WeightTensor], config: &ExportConfig) -> 
                 }
                 ExportFormat::Q4_0 => {
                     // 18 bytes per 32 weights (2-byte f16 scale + 16 bytes nibble-packed).
-                    let num_blocks =
-                        t.data.len().div_ceil(oxibonsai_core::quant_std::QK_Q4_0);
+                    let num_blocks = t.data.len().div_ceil(oxibonsai_core::quant_std::QK_Q4_0);
                     num_blocks * oxibonsai_core::quant_std::BLOCK_Q4_0_BYTES
                 }
                 ExportFormat::Q8_0 => {
                     // 34 bytes per 32 weights (2-byte f16 scale + 32 i8 weights).
-                    let num_blocks =
-                        t.data.len().div_ceil(oxibonsai_core::quant_std::QK_Q8_0);
+                    let num_blocks = t.data.len().div_ceil(oxibonsai_core::quant_std::QK_Q8_0);
                     num_blocks * oxibonsai_core::quant_std::BLOCK_Q8_0_BYTES
                 }
                 ExportFormat::Q4K => {
                     // 144 bytes per 256 weights.
-                    let num_blocks =
-                        t.data.len().div_ceil(oxibonsai_core::quant_k::QK_K);
+                    let num_blocks = t.data.len().div_ceil(oxibonsai_core::quant_k::QK_K);
                     num_blocks * oxibonsai_core::quant_k::BLOCK_Q4_K_BYTES
                 }
                 ExportFormat::Q5K => {
                     // 176 bytes per 256 weights.
-                    let num_blocks =
-                        t.data.len().div_ceil(oxibonsai_core::quant_k::QK_K);
+                    let num_blocks = t.data.len().div_ceil(oxibonsai_core::quant_k::QK_K);
                     num_blocks * oxibonsai_core::quant_k_ext::BLOCK_Q5K_BYTES
                 }
                 ExportFormat::Q6K => {
                     // 210 bytes per 256 weights.
-                    let num_blocks =
-                        t.data.len().div_ceil(oxibonsai_core::quant_k::QK_K);
+                    let num_blocks = t.data.len().div_ceil(oxibonsai_core::quant_k::QK_K);
                     num_blocks * oxibonsai_core::quant_k_ext::BLOCK_Q6K_BYTES
                 }
             }
@@ -978,7 +968,11 @@ mod tests {
         let n = 64usize;
         let input: Vec<f32> = (0..n).map(|i| (i as f32) * 0.25 - 8.0).collect();
         let config = ExportConfig::new(ExportFormat::Q4_0, "q4-0-model");
-        let tensors = vec![WeightTensor::new("blk.0.attn_q.weight", input.clone(), vec![n])];
+        let tensors = vec![WeightTensor::new(
+            "blk.0.attn_q.weight",
+            input.clone(),
+            vec![n],
+        )];
         let gguf_bytes = export_to_gguf(&tensors, &config, &[]).expect("Q4_0 export");
 
         // Validate GGUF magic.
@@ -1019,7 +1013,11 @@ mod tests {
         let n = 64usize;
         let input: Vec<f32> = (0..n).map(|i| (i as f32) * 0.5 - 16.0).collect();
         let config = ExportConfig::new(ExportFormat::Q8_0, "q8-0-model");
-        let tensors = vec![WeightTensor::new("blk.0.attn_q.weight", input.clone(), vec![n])];
+        let tensors = vec![WeightTensor::new(
+            "blk.0.attn_q.weight",
+            input.clone(),
+            vec![n],
+        )];
         let gguf_bytes = export_to_gguf(&tensors, &config, &[]).expect("Q8_0 export");
 
         let magic = u32::from_le_bytes(gguf_bytes[0..4].try_into().expect("magic"));
@@ -1060,7 +1058,11 @@ mod tests {
         let n = 512usize;
         let input: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.1 - 25.6).sin()).collect();
         let config = ExportConfig::new(ExportFormat::Q4K, "q4k-model");
-        let tensors = vec![WeightTensor::new("blk.0.attn_q.weight", input.clone(), vec![n])];
+        let tensors = vec![WeightTensor::new(
+            "blk.0.attn_q.weight",
+            input.clone(),
+            vec![n],
+        )];
         let gguf_bytes = export_to_gguf(&tensors, &config, &[]).expect("Q4K export");
 
         let magic = u32::from_le_bytes(gguf_bytes[0..4].try_into().expect("magic"));
@@ -1102,7 +1104,11 @@ mod tests {
         let n = 512usize;
         let input: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.07 - 17.9).cos()).collect();
         let config = ExportConfig::new(ExportFormat::Q5K, "q5k-model");
-        let tensors = vec![WeightTensor::new("blk.0.attn_q.weight", input.clone(), vec![n])];
+        let tensors = vec![WeightTensor::new(
+            "blk.0.attn_q.weight",
+            input.clone(),
+            vec![n],
+        )];
         let gguf_bytes = export_to_gguf(&tensors, &config, &[]).expect("Q5K export");
 
         let magic = u32::from_le_bytes(gguf_bytes[0..4].try_into().expect("magic"));
@@ -1144,7 +1150,11 @@ mod tests {
         let n = 512usize;
         let input: Vec<f32> = (0..n).map(|i| (i as f32) * 0.05 - 12.8).collect();
         let config = ExportConfig::new(ExportFormat::Q6K, "q6k-model");
-        let tensors = vec![WeightTensor::new("blk.0.attn_q.weight", input.clone(), vec![n])];
+        let tensors = vec![WeightTensor::new(
+            "blk.0.attn_q.weight",
+            input.clone(),
+            vec![n],
+        )];
         let gguf_bytes = export_to_gguf(&tensors, &config, &[]).expect("Q6K export");
 
         let magic = u32::from_le_bytes(gguf_bytes[0..4].try_into().expect("magic"));
@@ -1202,7 +1212,11 @@ mod tests {
         let tensors = vec![WeightTensor::new("w", vec![1.0; 512], vec![512])];
         let config = ExportConfig::new(ExportFormat::Q4K, "m");
         let size = estimate_export_size(&tensors, &config);
-        assert_eq!(size, 2 * 144, "Q4K: 512 weights → 2 super-blocks → 288 bytes");
+        assert_eq!(
+            size,
+            2 * 144,
+            "Q4K: 512 weights → 2 super-blocks → 288 bytes"
+        );
     }
 
     #[test]
@@ -1211,7 +1225,11 @@ mod tests {
         let tensors = vec![WeightTensor::new("w", vec![1.0; 512], vec![512])];
         let config = ExportConfig::new(ExportFormat::Q5K, "m");
         let size = estimate_export_size(&tensors, &config);
-        assert_eq!(size, 2 * 176, "Q5K: 512 weights → 2 super-blocks → 352 bytes");
+        assert_eq!(
+            size,
+            2 * 176,
+            "Q5K: 512 weights → 2 super-blocks → 352 bytes"
+        );
     }
 
     #[test]
@@ -1220,7 +1238,11 @@ mod tests {
         let tensors = vec![WeightTensor::new("w", vec![1.0; 512], vec![512])];
         let config = ExportConfig::new(ExportFormat::Q6K, "m");
         let size = estimate_export_size(&tensors, &config);
-        assert_eq!(size, 2 * 210, "Q6K: 512 weights → 2 super-blocks → 420 bytes");
+        assert_eq!(
+            size,
+            2 * 210,
+            "Q6K: 512 weights → 2 super-blocks → 420 bytes"
+        );
     }
 
     // ── GGUF type name tests ──────────────────────────────────────────────────
@@ -1235,7 +1257,10 @@ mod tests {
         // "Q4_0" string should appear somewhere in the metadata section.
         let needle = b"Q4_0";
         let found = bytes.windows(needle.len()).any(|w| w == needle);
-        assert!(found, "GGUF metadata should contain \"Q4_0\" quantization string");
+        assert!(
+            found,
+            "GGUF metadata should contain \"Q4_0\" quantization string"
+        );
     }
 
     #[test]
@@ -1246,7 +1271,10 @@ mod tests {
         let bytes = export_to_gguf(&tensors, &config, &[]).expect("Q4K export");
         let needle = b"Q4_K";
         let found = bytes.windows(needle.len()).any(|w| w == needle);
-        assert!(found, "GGUF metadata should contain \"Q4_K\" quantization string");
+        assert!(
+            found,
+            "GGUF metadata should contain \"Q4_K\" quantization string"
+        );
     }
 
     #[test]
@@ -1257,7 +1285,10 @@ mod tests {
         let bytes = export_to_gguf(&tensors, &config, &[]).expect("Q5K export");
         let needle = b"Q5_K";
         let found = bytes.windows(needle.len()).any(|w| w == needle);
-        assert!(found, "GGUF metadata should contain \"Q5_K\" quantization string");
+        assert!(
+            found,
+            "GGUF metadata should contain \"Q5_K\" quantization string"
+        );
     }
 
     #[test]
@@ -1268,7 +1299,10 @@ mod tests {
         let bytes = export_to_gguf(&tensors, &config, &[]).expect("Q6K export");
         let needle = b"Q6_K";
         let found = bytes.windows(needle.len()).any(|w| w == needle);
-        assert!(found, "GGUF metadata should contain \"Q6_K\" quantization string");
+        assert!(
+            found,
+            "GGUF metadata should contain \"Q6_K\" quantization string"
+        );
     }
 
     #[test]
@@ -1279,7 +1313,10 @@ mod tests {
         let bytes = export_to_gguf(&tensors, &config, &[]).expect("Q8_0 export");
         let needle = b"Q8_0";
         let found = bytes.windows(needle.len()).any(|w| w == needle);
-        assert!(found, "GGUF metadata should contain \"Q8_0\" quantization string");
+        assert!(
+            found,
+            "GGUF metadata should contain \"Q8_0\" quantization string"
+        );
     }
 
     // ── Compression sanity tests ──────────────────────────────────────────────
@@ -1329,8 +1366,7 @@ mod tests {
             ExportFormat::Q5K,
             ExportFormat::Q6K,
         ] {
-            let config = ExportConfig::new(*fmt, "m")
-                .with_fp32_layers(fp32_exceptions.clone());
+            let config = ExportConfig::new(*fmt, "m").with_fp32_layers(fp32_exceptions.clone());
             let stats = export_stats(&tensors, &config);
             assert_eq!(
                 stats.fp32_tensors, 1,

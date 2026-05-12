@@ -15,8 +15,8 @@ use crate::error::{KernelError, KernelResult};
 use crate::traits::Fp8Kernel;
 use crate::traits::OneBitKernel;
 use crate::traits::TernaryKernel;
-use oxibonsai_core::{BlockFP8E4M3, BlockFP8E5M2, QK_FP8};
 use oxibonsai_core::QK_TQ2_0_G128;
+use oxibonsai_core::{BlockFP8E4M3, BlockFP8E5M2, QK_FP8};
 
 /// Minimum number of rows before engaging parallel GEMV.
 /// Below this threshold, the overhead of thread spawning exceeds the benefit.

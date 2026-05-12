@@ -16,7 +16,9 @@
 
 use std::collections::HashMap;
 
-use crate::dynamic_quant::{compute_smooth_factors, smooth_weights, DynQuantError, SmoothQuantConfig};
+use crate::dynamic_quant::{
+    compute_smooth_factors, smooth_weights, DynQuantError, SmoothQuantConfig,
+};
 use oxibonsai_core::quant_fp8::{BlockFP8E4M3, BlockFP8E5M2};
 
 // ─── Error ────────────────────────────────────────────────────────────────────
@@ -127,12 +129,7 @@ impl SmoothQuantCalibrator {
     /// # Panics
     ///
     /// Panics if `in_features` changes between calls for the same `layer_name`.
-    pub fn record_activation(
-        &mut self,
-        layer_name: &str,
-        activations: &[f32],
-        in_features: usize,
-    ) {
+    pub fn record_activation(&mut self, layer_name: &str, activations: &[f32], in_features: usize) {
         if in_features == 0 || activations.is_empty() {
             return;
         }
@@ -182,7 +179,7 @@ impl SmoothQuantCalibrator {
             &stats.running_max_abs,
             weights,
             in_features,
-            1,         // tokens = 1 (running_max_abs is already the global max)
+            1, // tokens = 1 (running_max_abs is already the global max)
             out_features,
             &self.config,
         );

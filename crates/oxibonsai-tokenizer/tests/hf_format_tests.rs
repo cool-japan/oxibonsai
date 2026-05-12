@@ -542,7 +542,10 @@ fn hf_format_unigram_vocab_and_unk_id() {
     assert_eq!(p.unigram_unk_id, Some(0));
 
     // unigram_vocab should contain 3 entries.
-    let uv = p.unigram_vocab.as_ref().expect("unigram_vocab must be Some");
+    let uv = p
+        .unigram_vocab
+        .as_ref()
+        .expect("unigram_vocab must be Some");
     assert_eq!(uv.len(), 3);
     assert_eq!(uv[0].0, "<unk>");
     assert!((uv[0].1 - 0.0_f64).abs() < 1e-9);
@@ -672,7 +675,10 @@ fn hf_bpe_unaffected_by_wordpiece_branch() {
     }"#;
     let p = HfTokenizerJson::parse(json).expect("BPE parse must still work");
     assert_eq!(p.model_type, HfModelType::Bpe);
-    assert!(p.wordpiece_max_chars.is_none(), "BPE must not set wordpiece_max_chars");
+    assert!(
+        p.wordpiece_max_chars.is_none(),
+        "BPE must not set wordpiece_max_chars"
+    );
     let tok = p.into_tokenizer().expect("into_tokenizer for BPE");
     assert!(!tok.is_wordpiece(), "BPE tokenizer must not be WordPiece");
     assert!(!tok.is_unigram(), "BPE tokenizer must not be Unigram");
@@ -710,7 +716,11 @@ fn hf_wordpiece_max_input_chars_respected() {
     let tok = p.into_tokenizer().expect("into_tokenizer");
     // "abc" = 3 chars > max 2 → entire word becomes UNK (id=0)
     let ids = tok.encode("abc").expect("encode");
-    assert_eq!(ids, vec![0u32], "word exceeding max_input_chars_per_word must be UNK");
+    assert_eq!(
+        ids,
+        vec![0u32],
+        "word exceeding max_input_chars_per_word must be UNK"
+    );
     // "ab" = 2 chars == max 2 → normal encoding, id=1
     let ids2 = tok.encode("ab").expect("encode");
     assert_eq!(ids2, vec![1u32]);

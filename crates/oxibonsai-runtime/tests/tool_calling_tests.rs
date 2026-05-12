@@ -1,4 +1,4 @@
-use oxibonsai_runtime::api_types::{ToolDefinition, ToolCall};
+use oxibonsai_runtime::api_types::{ToolCall, ToolDefinition};
 use oxibonsai_runtime::tool_calling::{
     build_tool_constraint, make_tool_call, new_tool_call_id, select_tool, validate_tool_arguments,
     ToolCallError, ToolRegistry,
@@ -67,7 +67,10 @@ fn wrap_tool_call(name: &str, args: &serde_json::Value) -> String {
 #[test]
 fn tool_call_id_starts_with_call_prefix() {
     let id = new_tool_call_id();
-    assert!(id.starts_with("call_"), "expected 'call_' prefix, got '{id}'");
+    assert!(
+        id.starts_with("call_"),
+        "expected 'call_' prefix, got '{id}'"
+    );
 }
 
 #[test]
@@ -141,8 +144,11 @@ fn select_tool_with_surrounding_text() {
 
 #[test]
 fn select_tool_no_tag_returns_no_tool_call_found() {
-    let err = select_tool("I'll get the weather for you right away!", &[weather_tool()])
-        .expect_err("should fail");
+    let err = select_tool(
+        "I'll get the weather for you right away!",
+        &[weather_tool()],
+    )
+    .expect_err("should fail");
     assert!(matches!(err, ToolCallError::NoToolCallFound), "{err}");
 }
 
@@ -191,8 +197,8 @@ fn select_tool_returns_valid_arguments_json() {
         &json!({"location": "Tokyo", "unit": "celsius"}),
     );
     let tc = select_tool(&output, &[weather_tool()]).unwrap();
-    let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)
-        .expect("arguments should be valid JSON");
+    let args: serde_json::Value =
+        serde_json::from_str(&tc.function.arguments).expect("arguments should be valid JSON");
     assert_eq!(args["location"], "Tokyo");
     assert_eq!(args["unit"], "celsius");
 }
@@ -207,10 +213,8 @@ fn validate_accepts_all_required_fields_present() {
 
 #[test]
 fn validate_accepts_required_plus_optional() {
-    let result = validate_tool_arguments(
-        r#"{"location":"Madrid","unit":"celsius"}"#,
-        &weather_tool(),
-    );
+    let result =
+        validate_tool_arguments(r#"{"location":"Madrid","unit":"celsius"}"#, &weather_tool());
     assert!(result.is_ok());
 }
 
@@ -218,7 +222,10 @@ fn validate_accepts_required_plus_optional() {
 fn validate_rejects_missing_required_field() {
     let err = validate_tool_arguments(r#"{"unit":"fahrenheit"}"#, &weather_tool())
         .expect_err("should fail: 'location' missing");
-    assert!(matches!(err, ToolCallError::MalformedArguments { .. }), "{err}");
+    assert!(
+        matches!(err, ToolCallError::MalformedArguments { .. }),
+        "{err}"
+    );
 }
 
 #[test]
@@ -235,22 +242,16 @@ fn validate_rejects_json_array_not_object() {
 
 #[test]
 fn validate_accepts_empty_object_for_no_required_fields() {
-    let no_required = ToolDefinition::function(
-        "ping",
-        None,
-        json!({"type": "object", "properties": {}}),
-    );
+    let no_required =
+        ToolDefinition::function("ping", None, json!({"type": "object", "properties": {}}));
     let result = validate_tool_arguments("{}", &no_required);
     assert!(result.is_ok());
 }
 
 #[test]
 fn validate_returns_parsed_value_on_success() {
-    let parsed = validate_tool_arguments(
-        r#"{"query":"hello","max_results":5}"#,
-        &search_tool(),
-    )
-    .expect("should succeed");
+    let parsed = validate_tool_arguments(r#"{"query":"hello","max_results":5}"#, &search_tool())
+        .expect("should succeed");
     assert!(parsed.is_object());
     assert_eq!(parsed["query"], "hello");
     assert_eq!(parsed["max_results"], 5);
@@ -334,8 +335,12 @@ fn tool_call_error_display_variants_non_empty() {
     let variants: Vec<Box<dyn std::error::Error>> = vec![
         Box::new(ToolCallError::NoToolCallFound),
         Box::new(ToolCallError::UnknownTool { name: "fn".into() }),
-        Box::new(ToolCallError::MalformedArguments { reason: "bad".into() }),
-        Box::new(ToolCallError::GrammarCompileError { reason: "oops".into() }),
+        Box::new(ToolCallError::MalformedArguments {
+            reason: "bad".into(),
+        }),
+        Box::new(ToolCallError::GrammarCompileError {
+            reason: "oops".into(),
+        }),
         Box::new(ToolCallError::EmptyToolList),
     ];
     for e in &variants {

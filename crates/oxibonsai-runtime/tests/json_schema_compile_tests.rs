@@ -186,7 +186,10 @@ fn compile_object_with_required_props() {
 
     // Grammar must reference NTs for integer and string.
     // At minimum: start NT + object NT + integer NT + string NT + digit NT etc.
-    assert!(g.nt_count >= 3, "must have multiple NTs for object with properties");
+    assert!(
+        g.nt_count >= 3,
+        "must have multiple NTs for object with properties"
+    );
 
     // Check grammar has at least 2 rules (object body + value NTs).
     assert!(g.rules.len() >= 2);
@@ -444,8 +447,7 @@ fn unsupported_keyword_if_then() {
 
 #[test]
 fn invalid_json_str() {
-    let err =
-        compile_json_schema_str("not json at all }{").expect_err("invalid JSON must fail");
+    let err = compile_json_schema_str("not json at all }{").expect_err("invalid JSON must fail");
     assert!(
         matches!(err, JsonSchemaCompileError::InvalidJson(_)),
         "expected InvalidJson, got: {err:?}"
@@ -481,8 +483,8 @@ fn depth_exceeded() {
         schema = serde_json::json!({"anyOf": [schema]});
     }
     let schema_str = serde_json::to_string(&schema).unwrap();
-    let err = compile_json_schema_str(&schema_str)
-        .expect_err("depth > 32 must return DepthExceeded");
+    let err =
+        compile_json_schema_str(&schema_str).expect_err("depth > 32 must return DepthExceeded");
     assert!(
         matches!(err, JsonSchemaCompileError::DepthExceeded { limit: 32 }),
         "expected DepthExceeded {{ limit: 32 }}, got: {err:?}"
@@ -577,10 +579,17 @@ fn end_to_end_integer_constraint_advance() {
     // Digits must be allowed at start.
     let mask = c.allowed_tokens(&[], 128).unwrap();
     for d in b'0'..=b'9' {
-        assert!(mask[d as usize], "digit '{}' must be allowed at start", d as char);
+        assert!(
+            mask[d as usize],
+            "digit '{}' must be allowed at start",
+            d as char
+        );
     }
     // '-' is also valid at start (negative integer).
-    assert!(mask[b'-' as usize], "'-' must be allowed at start of integer");
+    assert!(
+        mask[b'-' as usize],
+        "'-' must be allowed at start of integer"
+    );
 
     // Feed "123" and check we are accepting.
     assert!(feed_str_constraint(&mut c, "123"));
@@ -660,8 +669,7 @@ fn compile_definitions_alias() {
 #[test]
 fn all_of_rejects_non_object() {
     let schema = r#"{"allOf":[{"type":"string"},{"type":"integer"}]}"#;
-    let err = compile_json_schema_str(schema)
-        .expect_err("allOf of non-objects must fail");
+    let err = compile_json_schema_str(schema).expect_err("allOf of non-objects must fail");
     assert!(
         matches!(err, JsonSchemaCompileError::UnsupportedKeyword(_)),
         "expected UnsupportedKeyword for allOf of non-objects, got: {err:?}"

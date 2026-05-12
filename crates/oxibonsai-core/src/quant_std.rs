@@ -168,10 +168,7 @@ impl BlockQ4_0 {
         let align = std::mem::align_of::<Self>();
         if data.as_ptr().align_offset(align) != 0 {
             return Err(BonsaiError::KQuantError {
-                reason: format!(
-                    "Q4_0 slice_from_bytes: pointer not {}-byte aligned",
-                    align
-                ),
+                reason: format!("Q4_0 slice_from_bytes: pointer not {}-byte aligned", align),
             });
         }
         let count = data.len() / BLOCK_Q4_0_BYTES;
@@ -321,10 +318,7 @@ impl BlockQ8_0 {
         let align = std::mem::align_of::<Self>();
         if data.as_ptr().align_offset(align) != 0 {
             return Err(BonsaiError::KQuantError {
-                reason: format!(
-                    "Q8_0 slice_from_bytes: pointer not {}-byte aligned",
-                    align
-                ),
+                reason: format!("Q8_0 slice_from_bytes: pointer not {}-byte aligned", align),
             });
         }
         let count = data.len() / BLOCK_Q8_0_BYTES;
@@ -436,10 +430,7 @@ mod tests {
             qs: [0x88u8; 16],
         };
         let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                (&block as *const BlockQ4_0).cast::<u8>(),
-                BLOCK_Q4_0_BYTES,
-            )
+            std::slice::from_raw_parts((&block as *const BlockQ4_0).cast::<u8>(), BLOCK_Q4_0_BYTES)
         };
         let result = BlockQ4_0::slice_from_bytes(bytes).expect("aligned slice should succeed");
         assert_eq!(result.len(), 1);
@@ -559,10 +550,7 @@ mod tests {
             qs: [0i8; 32],
         };
         let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                (&block as *const BlockQ8_0).cast::<u8>(),
-                BLOCK_Q8_0_BYTES,
-            )
+            std::slice::from_raw_parts((&block as *const BlockQ8_0).cast::<u8>(), BLOCK_Q8_0_BYTES)
         };
         let result = BlockQ8_0::slice_from_bytes(bytes).expect("aligned slice should succeed");
         assert_eq!(result.len(), 1);
@@ -622,10 +610,18 @@ mod tests {
         BlockQ8_0::dequant(&blocks, &mut out).unwrap();
         // Signs must be preserved
         for i in (2..32).step_by(2) {
-            assert!(out[i] >= 0.0, "even index should be non-negative: {}", out[i]);
+            assert!(
+                out[i] >= 0.0,
+                "even index should be non-negative: {}",
+                out[i]
+            );
         }
         for i in (1..32).step_by(2) {
-            assert!(out[i] <= 0.0, "odd index should be non-positive: {}", out[i]);
+            assert!(
+                out[i] <= 0.0,
+                "odd index should be non-positive: {}",
+                out[i]
+            );
         }
     }
 

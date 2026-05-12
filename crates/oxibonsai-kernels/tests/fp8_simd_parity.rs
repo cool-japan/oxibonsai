@@ -69,9 +69,7 @@ fn make_e5m2_blocks(n: usize, rng: &mut u64) -> Vec<BlockFP8E5M2> {
 }
 
 fn make_input(len: usize, rng: &mut u64) -> Vec<f32> {
-    (0..len)
-        .map(|_| (lcg_rand_f32(rng) - 0.5) * 4.0)
-        .collect()
+    (0..len).map(|_| (lcg_rand_f32(rng) - 0.5) * 4.0).collect()
 }
 
 // ─── Parity assertion helpers ─────────────────────────────────────────────
@@ -226,7 +224,11 @@ fn e4m3_gemv_avx2_matches_scalar() {
         let mut avx2_out = vec![0.0_f32; n_rows];
         unsafe {
             oxibonsai_kernels::simd_fp8_avx2::gemv_fp8_e4m3_avx2(
-                &blocks, &input, &mut avx2_out, n_rows, k,
+                &blocks,
+                &input,
+                &mut avx2_out,
+                n_rows,
+                k,
             )
             .expect("avx2 gemv e4m3 should succeed");
         }
@@ -258,7 +260,11 @@ fn e4m3_gemv_avx512_matches_scalar() {
         let mut avx512_out = vec![0.0_f32; n_rows];
         unsafe {
             oxibonsai_kernels::simd_fp8_avx512::gemv_fp8_e4m3_avx512(
-                &blocks, &input, &mut avx512_out, n_rows, k,
+                &blocks,
+                &input,
+                &mut avx512_out,
+                n_rows,
+                k,
             )
             .expect("avx512 gemv e4m3 should succeed");
         }
@@ -289,7 +295,11 @@ fn e5m2_gemv_avx2_matches_scalar() {
         let mut avx2_out = vec![0.0_f32; n_rows];
         unsafe {
             oxibonsai_kernels::simd_fp8_avx2::gemv_fp8_e5m2_avx2(
-                &blocks, &input, &mut avx2_out, n_rows, k,
+                &blocks,
+                &input,
+                &mut avx2_out,
+                n_rows,
+                k,
             )
             .expect("avx2 gemv e5m2 should succeed");
         }
@@ -321,7 +331,11 @@ fn e5m2_gemv_avx512_matches_scalar() {
         let mut avx512_out = vec![0.0_f32; n_rows];
         unsafe {
             oxibonsai_kernels::simd_fp8_avx512::gemv_fp8_e5m2_avx512(
-                &blocks, &input, &mut avx512_out, n_rows, k,
+                &blocks,
+                &input,
+                &mut avx512_out,
+                n_rows,
+                k,
             )
             .expect("avx512 gemv e5m2 should succeed");
         }
@@ -353,7 +367,12 @@ fn e4m3_gemm_avx2_matches_scalar() {
         let mut avx2_out = vec![0.0_f32; batch * n_rows];
         unsafe {
             oxibonsai_kernels::simd_fp8_avx2::gemm_fp8_e4m3_avx2(
-                &blocks, &inputs, &mut avx2_out, n_rows, k, batch,
+                &blocks,
+                &inputs,
+                &mut avx2_out,
+                n_rows,
+                k,
+                batch,
             )
             .expect("avx2 gemm e4m3 should succeed");
         }
@@ -386,7 +405,12 @@ fn e4m3_gemm_avx512_matches_scalar() {
         let mut avx512_out = vec![0.0_f32; batch * n_rows];
         unsafe {
             oxibonsai_kernels::simd_fp8_avx512::gemm_fp8_e4m3_avx512(
-                &blocks, &inputs, &mut avx512_out, n_rows, k, batch,
+                &blocks,
+                &inputs,
+                &mut avx512_out,
+                n_rows,
+                k,
+                batch,
             )
             .expect("avx512 gemm e4m3 should succeed");
         }
@@ -418,7 +442,12 @@ fn e5m2_gemm_avx2_matches_scalar() {
         let mut avx2_out = vec![0.0_f32; batch * n_rows];
         unsafe {
             oxibonsai_kernels::simd_fp8_avx2::gemm_fp8_e5m2_avx2(
-                &blocks, &inputs, &mut avx2_out, n_rows, k, batch,
+                &blocks,
+                &inputs,
+                &mut avx2_out,
+                n_rows,
+                k,
+                batch,
             )
             .expect("avx2 gemm e5m2 should succeed");
         }
@@ -451,7 +480,12 @@ fn e5m2_gemm_avx512_matches_scalar() {
         let mut avx512_out = vec![0.0_f32; batch * n_rows];
         unsafe {
             oxibonsai_kernels::simd_fp8_avx512::gemm_fp8_e5m2_avx512(
-                &blocks, &inputs, &mut avx512_out, n_rows, k, batch,
+                &blocks,
+                &inputs,
+                &mut avx512_out,
+                n_rows,
+                k,
+                batch,
             )
             .expect("avx512 gemm e5m2 should succeed");
         }
@@ -463,7 +497,7 @@ fn e5m2_gemm_avx512_matches_scalar() {
 
 #[test]
 fn dispatcher_fp8_e4m3_gemv_matches_scalar() {
-    use oxibonsai_kernels::{KernelDispatcher, traits::Fp8Kernel};
+    use oxibonsai_kernels::{traits::Fp8Kernel, KernelDispatcher};
 
     let mut rng = 0x0102_0304_0506_0708_u64;
     let n_rows = 8;
@@ -487,7 +521,7 @@ fn dispatcher_fp8_e4m3_gemv_matches_scalar() {
 
 #[test]
 fn dispatcher_fp8_e5m2_gemm_matches_scalar() {
-    use oxibonsai_kernels::{KernelDispatcher, traits::Fp8Kernel};
+    use oxibonsai_kernels::{traits::Fp8Kernel, KernelDispatcher};
 
     let mut rng = 0xF0F0_F0F0_0F0F_0F0F_u64;
     let n_rows = 3;
@@ -538,7 +572,7 @@ fn lut_e5m2_spot_check_byte_0x3c() {
 
 #[test]
 fn par_fp8_e4m3_gemv_matches_sequential() {
-    use oxibonsai_kernels::{KernelDispatcher, gemv_fp8_e4m3_par};
+    use oxibonsai_kernels::{gemv_fp8_e4m3_par, KernelDispatcher};
 
     let mut rng = 0x1357_2468_9BDF_0ACE_u64;
     let n_rows = 128; // above PAR_GEMV_MIN_ROWS
@@ -565,7 +599,7 @@ fn par_fp8_e4m3_gemv_matches_sequential() {
 
 #[test]
 fn par_fp8_e5m2_gemm_matches_sequential() {
-    use oxibonsai_kernels::{KernelDispatcher, gemm_fp8_e5m2_par};
+    use oxibonsai_kernels::{gemm_fp8_e5m2_par, KernelDispatcher};
 
     let mut rng = 0xECEB_EDED_EFEF_FAFA_u64;
     let n_rows = 4;
@@ -585,8 +619,16 @@ fn par_fp8_e5m2_gemm_matches_sequential() {
         .gemm_fp8_e5m2(&blocks, &inputs, &mut seq_out, n_rows, k, batch)
         .expect("sequential gemm should succeed");
 
-    gemm_fp8_e5m2_par(&dispatcher, &blocks, &inputs, &mut par_out, n_rows, k, batch)
-        .expect("parallel gemm should succeed");
+    gemm_fp8_e5m2_par(
+        &dispatcher,
+        &blocks,
+        &inputs,
+        &mut par_out,
+        n_rows,
+        k,
+        batch,
+    )
+    .expect("parallel gemm should succeed");
 
     assert_close(&seq_out, &par_out, 1e-4, "par e5m2 gemm");
 }

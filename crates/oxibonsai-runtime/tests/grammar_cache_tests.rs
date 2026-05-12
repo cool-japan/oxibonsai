@@ -152,7 +152,11 @@ fn mask_correctness_vs_uncached_multi_step() {
     for &b in tokens_to_advance {
         let m_cached = cached.allowed_tokens(&[], 128).unwrap();
         let m_ref = reference.allowed_tokens(&[], 128).unwrap();
-        assert_eq!(m_cached, m_ref, "masks differ before advancing '{}'", b as char);
+        assert_eq!(
+            m_cached, m_ref,
+            "masks differ before advancing '{}'",
+            b as char
+        );
 
         cached.advance(b as u32);
         reference.advance(b as u32);
@@ -204,9 +208,18 @@ fn grammar_cache_json_lite() {
     assert_eq!(m1, m2, "json_lite initial masks must match");
 
     // The json_lite grammar starts with '{', '[', '"', digits, or literal chars.
-    assert!(m1[b'{' as usize], "{{}} must be allowed at start of json_lite");
-    assert!(m1[b'[' as usize], "[] must be allowed at start of json_lite");
-    assert!(m1[b'"' as usize], "quote must be allowed at start of json_lite");
+    assert!(
+        m1[b'{' as usize],
+        "{{}} must be allowed at start of json_lite"
+    );
+    assert!(
+        m1[b'[' as usize],
+        "[] must be allowed at start of json_lite"
+    );
+    assert!(
+        m1[b'"' as usize],
+        "quote must be allowed at start of json_lite"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -240,7 +253,10 @@ fn cache_does_not_affect_advance() {
     // We don't assert the negative here since the grammar is right-recursive
     // and may or may not allow '(' after a digit in prefix position;
     // the important thing is that advance() works after cache use.
-    assert!(c.advance(b'+' as u32), "advancing '+' after '1' should succeed");
+    assert!(
+        c.advance(b'+' as u32),
+        "advancing '+' after '1' should succeed"
+    );
     assert!(!c.is_complete(), "incomplete after '1+'");
 }
 
@@ -415,8 +431,7 @@ fn test_byte_index_skips_non_matching_tokens() {
         assert!(
             mask[d as usize],
             "digit token '{}' (0x{:02x}) should be allowed at start",
-            d as char,
-            d
+            d as char, d
         );
     }
     assert!(mask[b'(' as usize], "'(' should be allowed at start");
@@ -428,8 +443,7 @@ fn test_byte_index_skips_non_matching_tokens() {
         assert!(
             !mask[b as usize],
             "byte '{}' (0x{:02x}) should not be allowed at start of arithmetic",
-            b as char,
-            b
+            b as char, b
         );
     }
 }

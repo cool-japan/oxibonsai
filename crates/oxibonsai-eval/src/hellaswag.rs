@@ -112,11 +112,7 @@ impl HellaSwagDataset {
             }
 
             let record: HellaSwagRecord = serde_json::from_str(trimmed).map_err(|e| {
-                EvalError::ParseError(format!(
-                    "hellaswag: line {}: {}",
-                    line_no + 1,
-                    e
-                ))
+                EvalError::ParseError(format!("hellaswag: line {}: {}", line_no + 1, e))
             })?;
 
             // `ind` may be a string or an integer in the wild.
@@ -256,8 +252,7 @@ pub struct HellaSwagEvaluator {
 impl HellaSwagEvaluator {
     /// Create a new evaluator with the standard 4-choice prompt template.
     pub fn new() -> Self {
-        let template =
-            "{question}\nA) {a}\nB) {b}\nC) {c}\nD) {d}\nAnswer:".to_string();
+        let template = "{question}\nA) {a}\nB) {b}\nC) {c}\nD) {d}\nAnswer:".to_string();
         Self {
             mc: McEvaluator {
                 prompt_template: template.clone(),
@@ -296,7 +291,9 @@ impl HellaSwagEvaluator {
         per_choice_logits: &[Vec<f32>],
     ) -> HellaSwagResult {
         let mc_dataset = dataset.as_mc_dataset();
-        let acc = self.mc_logit.evaluate_dataset(&mc_dataset, per_choice_logits);
+        let acc = self
+            .mc_logit
+            .evaluate_dataset(&mc_dataset, per_choice_logits);
         HellaSwagResult::from_accuracy(acc)
     }
 }

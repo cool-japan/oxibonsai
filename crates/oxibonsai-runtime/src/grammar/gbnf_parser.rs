@@ -182,19 +182,13 @@ impl Lexer {
 
     /// Parse `\xNN` hex escape, consuming the two hex digits.
     fn parse_hex_escape(&mut self) -> Result<u8, GbnfParseError> {
-        let hi = self
-            .advance()
-            .ok_or(GbnfParseError::UnterminatedString)?;
-        let lo = self
-            .advance()
-            .ok_or(GbnfParseError::UnterminatedString)?;
+        let hi = self.advance().ok_or(GbnfParseError::UnterminatedString)?;
+        let lo = self.advance().ok_or(GbnfParseError::UnterminatedString)?;
         let hex = format!("{hi}{lo}");
-        u8::from_str_radix(&hex, 16).map_err(|_| {
-            GbnfParseError::UnexpectedChar {
-                line: self.line,
-                col: self.col,
-                ch: hi,
-            }
+        u8::from_str_radix(&hex, 16).map_err(|_| GbnfParseError::UnexpectedChar {
+            line: self.line,
+            col: self.col,
+            ch: hi,
         })
     }
 
@@ -360,11 +354,7 @@ impl Lexer {
                         self.col += 3;
                         tokens.push(Token::Assign);
                     } else {
-                        return Err(GbnfParseError::UnexpectedChar {
-                            line,
-                            col,
-                            ch: ':',
-                        });
+                        return Err(GbnfParseError::UnexpectedChar { line, col, ch: ':' });
                     }
                 }
                 // `|` alternation.
@@ -481,7 +471,11 @@ struct Parser<'g> {
 }
 
 impl<'g> Parser<'g> {
-    fn new(tokens: Vec<Token>, nt_map: HashMap<String, NonTerminalId>, grammar: &'g mut Grammar) -> Self {
+    fn new(
+        tokens: Vec<Token>,
+        nt_map: HashMap<String, NonTerminalId>,
+        grammar: &'g mut Grammar,
+    ) -> Self {
         Self {
             tokens,
             pos: 0,
@@ -607,7 +601,7 @@ impl<'g> Parser<'g> {
             // If next token is `|`, consume it and continue to next alternative.
             if matches!(self.peek(), Token::Pipe) {
                 self.advance(); // consume `|`
-                // Skip newlines after `|` (continuation lines).
+                                // Skip newlines after `|` (continuation lines).
                 self.skip_newlines();
                 continue;
             }
@@ -706,10 +700,8 @@ impl<'g> Parser<'g> {
                 // Create a fresh synthetic NT for the char class.
                 let class_nt = self.alloc_synthetic("gbnf_class");
                 for b in &bytes {
-                    self.grammar.add_rule(Rule::new(
-                        class_nt,
-                        vec![Symbol::Terminal(vec![*b])],
-                    ));
+                    self.grammar
+                        .add_rule(Rule::new(class_nt, vec![Symbol::Terminal(vec![*b])]));
                 }
                 Ok(AtomResult::Single(Symbol::NonTerminal(class_nt)))
             }
@@ -720,7 +712,7 @@ impl<'g> Parser<'g> {
             }
             Token::LParen => {
                 self.advance(); // consume `(`
-                // Parse body inside the group.
+                                // Parse body inside the group.
                 let group_nt = self.alloc_synthetic("gbnf_group");
                 self.parse_body_into(group_nt, depth + 1)?;
                 // Expect `)`.
@@ -891,7 +883,9 @@ pub fn parse_gbnf(src: &str) -> Result<Grammar, GbnfParseError> {
     let tokens = lexer.tokenise()?;
 
     // Check for completely empty input.
-    let has_content = tokens.iter().any(|t| !matches!(t, Token::Newline | Token::Eof));
+    let has_content = tokens
+        .iter()
+        .any(|t| !matches!(t, Token::Newline | Token::Eof));
     if !has_content {
         return Err(GbnfParseError::EmptyGrammar);
     }

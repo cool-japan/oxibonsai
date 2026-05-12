@@ -71,11 +71,7 @@ pub fn gemv_q8k(
         BlockQ8K::dequant(row_blocks, &mut row_buf).map_err(KernelError::Core)?;
 
         // Dot product with the input vector.
-        let acc: f32 = row_buf
-            .iter()
-            .zip(input.iter())
-            .map(|(w, x)| w * x)
-            .sum();
+        let acc: f32 = row_buf.iter().zip(input.iter()).map(|(w, x)| w * x).sum();
         output[row] = acc;
     }
     Ok(())

@@ -24,10 +24,25 @@ fn make_item(id: &str, ctx: &str, endings: Vec<&str>, label: usize) -> HellaSwag
 /// by mapping label index → answer letter.
 fn four_item_dataset() -> HellaSwagDataset {
     HellaSwagDataset::from_items(vec![
-        make_item("0", "The cat sat on the mat.", vec!["A1", "B1", "C1", "D1"], 0),
+        make_item(
+            "0",
+            "The cat sat on the mat.",
+            vec!["A1", "B1", "C1", "D1"],
+            0,
+        ),
         make_item("1", "She opened the door.", vec!["A2", "B2", "C2", "D2"], 1),
-        make_item("2", "He picked up the phone.", vec!["A3", "B3", "C3", "D3"], 2),
-        make_item("3", "They walked to school.", vec!["A4", "B4", "C4", "D4"], 3),
+        make_item(
+            "2",
+            "He picked up the phone.",
+            vec!["A3", "B3", "C3", "D3"],
+            2,
+        ),
+        make_item(
+            "3",
+            "They walked to school.",
+            vec!["A4", "B4", "C4", "D4"],
+            3,
+        ),
     ])
 }
 
@@ -166,7 +181,12 @@ fn test_hellaswag_4_choices_enforced() {
     let item = make_item(
         "0",
         "A chef is preparing dinner.",
-        vec!["He chops vegetables.", "He eats breakfast.", "He goes to bed.", "He reads a book."],
+        vec![
+            "He chops vegetables.",
+            "He eats breakfast.",
+            "He goes to bed.",
+            "He reads a book.",
+        ],
         0,
     );
     assert_eq!(item.endings.len(), 4);

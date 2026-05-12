@@ -25,7 +25,7 @@ fn dataset_with_subjects() -> McDataset {
     ds.add(make_q("math/0", Some("math"), 0)); // A correct
     ds.add(make_q("math/1", Some("math"), 1)); // B correct
     ds.add(make_q("math/2", Some("math"), 2)); // C correct
-    // subject: "history" (2 questions)
+                                               // subject: "history" (2 questions)
     ds.add(make_q("history/0", Some("history"), 0)); // A correct
     ds.add(make_q("history/1", Some("history"), 3)); // D correct
     ds
@@ -214,7 +214,10 @@ fn by_subject_completions_correct_subjects() {
     assert_eq!(math.total, 3);
     assert!((math.accuracy - 1.0).abs() < 1e-6);
 
-    let history = result.by_subject.get("history").expect("history subject missing");
+    let history = result
+        .by_subject
+        .get("history")
+        .expect("history subject missing");
     assert_eq!(history.correct, 2);
     assert_eq!(history.total, 2);
     assert!((history.accuracy - 1.0).abs() < 1e-6);
@@ -247,7 +250,12 @@ fn subject_extracted_from_id_when_field_absent() {
     ds.add(MultipleChoiceQuestion {
         id: "physics/0".to_string(),
         question: "Which is correct?".to_string(),
-        choices: vec!["A) a".to_string(), "B) b".to_string(), "C) c".to_string(), "D) d".to_string()],
+        choices: vec![
+            "A) a".to_string(),
+            "B) b".to_string(),
+            "C) c".to_string(),
+            "D) d".to_string(),
+        ],
         correct_answer: 0,
         subject: None,
         difficulty: None,
@@ -255,7 +263,12 @@ fn subject_extracted_from_id_when_field_absent() {
     ds.add(MultipleChoiceQuestion {
         id: "physics/1".to_string(),
         question: "Another question?".to_string(),
-        choices: vec!["A) a".to_string(), "B) b".to_string(), "C) c".to_string(), "D) d".to_string()],
+        choices: vec![
+            "A) a".to_string(),
+            "B) b".to_string(),
+            "C) c".to_string(),
+            "D) d".to_string(),
+        ],
         correct_answer: 1,
         subject: None,
         difficulty: None,
@@ -263,7 +276,10 @@ fn subject_extracted_from_id_when_field_absent() {
     let eval = MmluEvaluator::new();
     let completions = vec!["A".to_string(), "B".to_string()];
     let result = eval.evaluate_completions(&ds, &completions);
-    assert!(result.by_subject.contains_key("physics"), "expected 'physics' subject");
+    assert!(
+        result.by_subject.contains_key("physics"),
+        "expected 'physics' subject"
+    );
     let phys = result.by_subject.get("physics").unwrap();
     assert_eq!(phys.total, 2);
     assert_eq!(phys.correct, 2);
@@ -276,7 +292,12 @@ fn subject_extracted_from_id_no_slash() {
     ds.add(MultipleChoiceQuestion {
         id: "chemistry".to_string(),
         question: "Atoms?".to_string(),
-        choices: vec!["A) a".to_string(), "B) b".to_string(), "C) c".to_string(), "D) d".to_string()],
+        choices: vec![
+            "A) a".to_string(),
+            "B) b".to_string(),
+            "C) c".to_string(),
+            "D) d".to_string(),
+        ],
         correct_answer: 2,
         subject: None,
         difficulty: None,
@@ -294,14 +315,22 @@ fn subject_field_takes_priority_over_id() {
     ds.add(MultipleChoiceQuestion {
         id: "biology/0".to_string(),
         question: "DNA?".to_string(),
-        choices: vec!["A) a".to_string(), "B) b".to_string(), "C) c".to_string(), "D) d".to_string()],
+        choices: vec![
+            "A) a".to_string(),
+            "B) b".to_string(),
+            "C) c".to_string(),
+            "D) d".to_string(),
+        ],
         correct_answer: 0,
         subject: Some("molecular_biology".to_string()),
         difficulty: None,
     });
     let eval = MmluEvaluator::new();
     let result = eval.evaluate_completions(&ds, &["A".to_string()]);
-    assert!(!result.by_subject.contains_key("biology"), "id prefix should be ignored when subject field is set");
+    assert!(
+        !result.by_subject.contains_key("biology"),
+        "id prefix should be ignored when subject field is set"
+    );
     assert!(result.by_subject.contains_key("molecular_biology"));
 }
 
@@ -314,7 +343,12 @@ fn multiple_subjects_independent_breakdown() {
             ds.add(MultipleChoiceQuestion {
                 id: format!("{subj}/{j}"),
                 question: format!("Q {subj} {j}"),
-                choices: vec!["A) a".to_string(), "B) b".to_string(), "C) c".to_string(), "D) d".to_string()],
+                choices: vec![
+                    "A) a".to_string(),
+                    "B) b".to_string(),
+                    "C) c".to_string(),
+                    "D) d".to_string(),
+                ],
                 correct_answer: i % 4,
                 subject: Some(subj.to_string()),
                 difficulty: None,
@@ -350,10 +384,7 @@ fn fewer_completions_than_questions_only_annotated_scored() {
 fn fewer_logits_than_questions_only_annotated_scored() {
     let eval = MmluEvaluator::new();
     let ds = dataset_with_subjects();
-    let per_choice_logits = vec![
-        vec![1.0f32, 0.0, 0.0, 0.0],
-        vec![0.0, 1.0, 0.0, 0.0],
-    ];
+    let per_choice_logits = vec![vec![1.0f32, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]];
     let result = eval.evaluate_logits(&ds, &per_choice_logits);
     assert_eq!(result.total, 2);
 }

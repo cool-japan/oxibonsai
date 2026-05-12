@@ -66,9 +66,7 @@ pub use quant_k::{
     BLOCK_Q8K_BYTES,
 };
 pub use quant_k_ext::{BlockQ5K, BlockQ6K, BLOCK_Q5K_BYTES, BLOCK_Q6K_BYTES};
-pub use quant_std::{
-    BlockQ4_0, BlockQ8_0, BLOCK_Q4_0_BYTES, BLOCK_Q8_0_BYTES, QK_Q4_0, QK_Q8_0,
-};
+pub use quant_std::{BlockQ4_0, BlockQ8_0, BLOCK_Q4_0_BYTES, BLOCK_Q8_0_BYTES, QK_Q4_0, QK_Q8_0};
 pub use quant_ternary::{
     BlockTQ2_0, BlockTQ2_0_g128, TernaryCode, BLOCK_TQ2_0_BYTES, BLOCK_TQ2_0_G128_BYTES, QK_TQ2_0,
     QK_TQ2_0_G128,

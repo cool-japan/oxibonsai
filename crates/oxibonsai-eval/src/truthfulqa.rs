@@ -116,14 +116,9 @@ impl TruthfulQaDataset {
                 continue;
             }
 
-            let v: serde_json::Value =
-                serde_json::from_str(trimmed).map_err(|e| {
-                    EvalError::ParseError(format!(
-                        "truthfulqa: line {}: {}",
-                        line_no + 1,
-                        e
-                    ))
-                })?;
+            let v: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
+                EvalError::ParseError(format!("truthfulqa: line {}: {}", line_no + 1, e))
+            })?;
 
             let item = parse_truthfulqa_record(&v, line_no + 1)?;
             items.push(item);
@@ -169,14 +164,11 @@ fn parse_truthfulqa_record(
     let (mc2_choices, mc2_labels) = parse_targets(obj, "mc2_targets", line_no)?;
 
     // MC1: index of the first label == 1
-    let mc1_correct_idx = mc1_labels
-        .iter()
-        .position(|&l| l == 1)
-        .ok_or_else(|| {
-            EvalError::ParseError(format!(
-                "truthfulqa: line {line_no}: mc1_targets has no correct label (label == 1)"
-            ))
-        })?;
+    let mc1_correct_idx = mc1_labels.iter().position(|&l| l == 1).ok_or_else(|| {
+        EvalError::ParseError(format!(
+            "truthfulqa: line {line_no}: mc1_targets has no correct label (label == 1)"
+        ))
+    })?;
 
     // MC2: all indices where label == 1
     let mc2_correct_indices: Vec<usize> = mc2_labels
@@ -259,10 +251,7 @@ fn softmax(logits: &[f32]) -> Vec<f32> {
     if logits.is_empty() {
         return Vec::new();
     }
-    let max = logits
-        .iter()
-        .copied()
-        .fold(f32::NEG_INFINITY, f32::max);
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let exps: Vec<f32> = logits.iter().map(|&x| (x - max).exp()).collect();
     let sum: f32 = exps.iter().sum();
     exps.iter().map(|&e| e / sum).collect()

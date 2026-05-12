@@ -186,7 +186,9 @@ impl WinoGrandeEvaluator {
         per_choice_logits: &[Vec<f32>],
     ) -> WinoGrandeResult {
         let mc_dataset = dataset.as_mc_dataset();
-        let acc = self.mc_logit.evaluate_dataset(&mc_dataset, per_choice_logits);
+        let acc = self
+            .mc_logit
+            .evaluate_dataset(&mc_dataset, per_choice_logits);
         WinoGrandeResult::from_accuracy(acc)
     }
 

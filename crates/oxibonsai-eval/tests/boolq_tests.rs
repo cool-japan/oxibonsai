@@ -19,7 +19,11 @@ fn sky_yes() -> BoolQItem {
 }
 
 fn sky_no() -> BoolQItem {
-    make_item("The sky turns red at sunset.", "Is the sky always blue?", false)
+    make_item(
+        "The sky turns red at sunset.",
+        "Is the sky always blue?",
+        false,
+    )
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -31,7 +35,10 @@ fn boolq_extract_yes_variants() {
     assert_eq!(BoolQEvaluator::extract_answer("Yes"), Some(true));
     assert_eq!(BoolQEvaluator::extract_answer("YES"), Some(true));
     assert_eq!(BoolQEvaluator::extract_answer("yes"), Some(true));
-    assert_eq!(BoolQEvaluator::extract_answer("Yes, that is correct."), Some(true));
+    assert_eq!(
+        BoolQEvaluator::extract_answer("Yes, that is correct."),
+        Some(true)
+    );
     assert_eq!(BoolQEvaluator::extract_answer("yes."), Some(true));
 }
 
@@ -44,7 +51,10 @@ fn boolq_extract_no_variants() {
     assert_eq!(BoolQEvaluator::extract_answer("No"), Some(false));
     assert_eq!(BoolQEvaluator::extract_answer("NO"), Some(false));
     assert_eq!(BoolQEvaluator::extract_answer("no"), Some(false));
-    assert_eq!(BoolQEvaluator::extract_answer("No, it is not."), Some(false));
+    assert_eq!(
+        BoolQEvaluator::extract_answer("No, it is not."),
+        Some(false)
+    );
     assert_eq!(BoolQEvaluator::extract_answer("no."), Some(false));
 }
 
@@ -217,7 +227,10 @@ fn boolq_short_string_no_panic() {
 fn boolq_leading_whitespace() {
     assert_eq!(BoolQEvaluator::extract_answer("  Yes"), Some(true));
     assert_eq!(BoolQEvaluator::extract_answer("\t\nNo"), Some(false));
-    assert_eq!(BoolQEvaluator::extract_answer("   YES, definitely"), Some(true));
+    assert_eq!(
+        BoolQEvaluator::extract_answer("   YES, definitely"),
+        Some(true)
+    );
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

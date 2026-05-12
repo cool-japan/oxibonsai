@@ -69,15 +69,10 @@ pub fn gemv_q5k(
 
         // Dequantize the entire row into a temporary FP32 buffer.
         // The only error path is buffer-too-small, which cannot occur here.
-        BlockQ5K::dequant(row_blocks, &mut row_buf)
-            .map_err(KernelError::Core)?;
+        BlockQ5K::dequant(row_blocks, &mut row_buf).map_err(KernelError::Core)?;
 
         // Dot product with the input vector.
-        let acc: f32 = row_buf
-            .iter()
-            .zip(input.iter())
-            .map(|(w, x)| w * x)
-            .sum();
+        let acc: f32 = row_buf.iter().zip(input.iter()).map(|(w, x)| w * x).sum();
         output[row] = acc;
     }
     Ok(())
