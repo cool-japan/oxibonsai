@@ -872,11 +872,14 @@ impl Fp8Kernel for KernelDispatcher {
         }
     }
 
-    /// FP8 E4M3FN GEMV — tier-aware SIMD dispatch with optional CUDA GPU acceleration.
+    /// FP8 E4M3FN GEMV — tier-aware SIMD dispatch with optional GPU acceleration.
     ///
-    /// When the `native-cuda` feature is enabled and a CUDA device is available,
-    /// this function dispatches to the CUDA FP8 GEMV kernel before falling back to
-    /// CPU SIMD.  The raw-byte cast of `blocks` to `*const u8` is sound because
+    /// Dispatch priority on the `KernelTier::Gpu` path:
+    /// 1. Metal (macOS + `metal` feature) — `metal_gemv_fp8_e4m3`.
+    /// 2. CUDA (Linux/Windows + `native-cuda` feature) — `cuda_gemv_fp8_e4m3`.
+    /// 3. CPU SIMD fallback (AVX-512 / AVX2 / NEON / scalar).
+    ///
+    /// The raw-byte cast of `blocks` to `*const u8` is sound because
     /// `BlockFP8E4M3` is `#[repr(C)]` with size `BLOCK_FP8_BYTES = 34`.
     fn gemv_fp8_e4m3(
         &self,
@@ -886,6 +889,31 @@ impl Fp8Kernel for KernelDispatcher {
         n_rows: usize,
         k: usize,
     ) -> KernelResult<()> {
+        // GPU dispatch via Metal — macOS only, `metal` feature.
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            // SAFETY: BlockFP8E4M3 is repr(C) with size BLOCK_FP8_BYTES (= 34).
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    blocks.as_ptr().cast::<u8>(),
+                    blocks.len() * oxibonsai_core::BLOCK_FP8_BYTES,
+                )
+            };
+            match crate::gpu_backend::metal_gemv_fp8_e4m3(bytes, input, output, n_rows, k) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    // No Metal device or compile failure: fall through to CPU SIMD path.
+                    let msg = e.to_string();
+                    if !msg.contains("no Metal-capable GPU device") {
+                        tracing::warn!(
+                            error = %e,
+                            "Metal FP8 E4M3 GEMV failed, falling back to CPU SIMD"
+                        );
+                    }
+                }
+            }
+        }
+
         // GPU dispatch via CUDA NVRTC — Linux/Windows only, native-cuda feature.
         #[cfg(all(
             feature = "native-cuda",
@@ -934,9 +962,9 @@ impl Fp8Kernel for KernelDispatcher {
         }
     }
 
-    /// FP8 E5M2 GEMV — tier-aware SIMD dispatch with optional CUDA GPU acceleration.
+    /// FP8 E5M2 GEMV — tier-aware SIMD dispatch with optional GPU acceleration.
     ///
-    /// Mirrors [`gemv_fp8_e4m3`](Self::gemv_fp8_e4m3) in dispatch strategy.
+    /// Mirrors [`gemv_fp8_e4m3`](Self::gemv_fp8_e4m3): Metal → CUDA → CPU SIMD.
     /// The raw-byte cast is sound because `BlockFP8E5M2` is `#[repr(C)]` with
     /// size `BLOCK_FP8_BYTES = 34`.
     fn gemv_fp8_e5m2(
@@ -947,6 +975,30 @@ impl Fp8Kernel for KernelDispatcher {
         n_rows: usize,
         k: usize,
     ) -> KernelResult<()> {
+        // GPU dispatch via Metal — macOS only, `metal` feature.
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            // SAFETY: BlockFP8E5M2 is repr(C) with size BLOCK_FP8_BYTES (= 34).
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    blocks.as_ptr().cast::<u8>(),
+                    blocks.len() * oxibonsai_core::BLOCK_FP8_BYTES,
+                )
+            };
+            match crate::gpu_backend::metal_gemv_fp8_e5m2(bytes, input, output, n_rows, k) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.contains("no Metal-capable GPU device") {
+                        tracing::warn!(
+                            error = %e,
+                            "Metal FP8 E5M2 GEMV failed, falling back to CPU SIMD"
+                        );
+                    }
+                }
+            }
+        }
+
         // GPU dispatch via CUDA NVRTC — Linux/Windows only, native-cuda feature.
         #[cfg(all(
             feature = "native-cuda",

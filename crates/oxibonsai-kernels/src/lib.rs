@@ -46,9 +46,11 @@ pub use gpu_backend::{
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub use gpu_backend::{
-    build_cached_weights, build_cached_weights_ternary_only, print_gpu_profile_summary,
-    try_metal_ffn, try_metal_forward_greedy_ternary, try_metal_full_forward,
-    try_metal_full_forward_cached, try_metal_full_forward_prefill,
+    build_cached_weights, build_cached_weights_ternary_only, metal_fused_gate_up_swiglu_fp8_e4m3,
+    metal_fused_gate_up_swiglu_fp8_e5m2, metal_gemm_fp8_e4m3, metal_gemm_fp8_e4m3_residual,
+    metal_gemm_fp8_e5m2, metal_gemm_fp8_e5m2_residual, metal_gemv_fp8_e4m3, metal_gemv_fp8_e5m2,
+    print_gpu_profile_summary, try_metal_ffn, try_metal_forward_greedy_ternary,
+    try_metal_full_forward, try_metal_full_forward_cached, try_metal_full_forward_prefill,
     try_metal_full_forward_prefill_ternary, try_metal_full_forward_prefill_verify,
     try_metal_full_forward_prefill_verify_ternary, try_metal_full_forward_ternary,
     try_metal_full_layer, try_metal_prefill_ternary, try_metal_prefill_verify_ternary,

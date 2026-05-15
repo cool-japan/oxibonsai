@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - Phase 28
+
+### Added
+- **Metal FP8 batch GEMM primitives** (`oxibonsai-kernels`): 8 new MSL kernels mirror the Phase 26 CUDA FP8 batch prefill design on Apple Silicon Metal. `kernel_sources/fp8_prefill.rs` adds `MSL_GEMM_FP8_E4M3_V1`, `MSL_GEMM_FP8_E4M3_RESIDUAL_V1`, `MSL_FUSED_GATE_UP_SWIGLU_GEMM_FP8_E4M3_V1`, `MSL_GEMV_FP8_E4M3_PF_V1`, and their E5M2 counterparts. All batch kernels use column-major I/O (`buf[col * dim + element]`), AoS 34-byte FP8 blocks (`qs[32] + d:f16`), one simdgroup per output row, and the cap-of-8 outer-loop pattern (`for col_base in 0..batch_size step 8u`) so arbitrary batch sizes are processed correctly. Fused gate+up kernel reads gate rows `[0..n_ffn_rows)` and up rows `[n_ffn_rows..2*n_ffn_rows)` from a single concatenated FP8 weight buffer and emits `SiLU(gate_dot) * up_dot` per (row, col). New `gpu_backend/metal_fp8_prefill.rs` module compiles all 6 batch pipelines lazily into its own singleton (Device + CommandQueue, `OnceLock`-guarded, kept separate from Phase 27's GEMV singleton so processes that never touch prefill pay no init cost) and exposes 6 public host fns: `metal_gemm_fp8_e4m3` / `metal_gemm_fp8_e5m2`, `metal_gemm_fp8_e4m3_residual` / `metal_gemm_fp8_e5m2_residual`, `metal_fused_gate_up_swiglu_fp8_e4m3` / `metal_fused_gate_up_swiglu_fp8_e5m2`. 7 CI-GPU-gated CPU↔Metal parity tests (including a `batch_size = 12` cap-of-8 discriminator and a non-multiple-of-8 row-count boundary), plus host-only kernel-source-string assertions and shape-rejection tests. Forward-path integration (5-stage encoder, LM-head dispatch) is deferred to Phase 28.B.
+
+---
+
+## [Unreleased] - Phase 27
+
+### Added
+- **Metal FP8 GEMV** (`oxibonsai-kernels`, `oxibonsai-model`): first-class FP8 E4M3FN and E5M2 GEMV on Apple Silicon Metal GPUs. Two new MSL kernels (`MSL_GEMV_FP8_E4M3_V1`, `MSL_GEMV_FP8_E5M2_V1`) with AoS 34-byte blocks (`qs[32] + d:f16`), one simdgroup per output row, fully unrolled 32-weight inner loop, and `simd_sum` warp reduction. New `gpu_backend/metal_fp8_kernels.rs` module holds its own singleton (Device + CommandQueue + 2 pipelines) so `metal_graph.rs` stays under the 2000-line policy. Public host functions `metal_gemv_fp8_e4m3` / `metal_gemv_fp8_e5m2`. `impl Fp8Kernel for KernelDispatcher` now dispatches Metal → CUDA → CPU SIMD on the `Gpu` tier. `BonsaiModel::forward_prefill` and `forward_prefill_verify` skip the fused Metal prefill for FP8 models (Metal FP8 falls through to per-token sequential, which now uses Metal GEMV via the dispatcher). Includes 2 CI-GPU-gated CPU↔Metal parity tests + host-only MSL source-string assertions.
+
+---
+
 ## [Unreleased] - Phase 26
 
 ### Added

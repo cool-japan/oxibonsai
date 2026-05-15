@@ -320,7 +320,15 @@ impl<'a> BonsaiModel<'a> {
             return Ok(last_logits);
         }
         #[cfg(all(feature = "metal", target_os = "macos"))]
-        if _gpu_kernel {
+        if _gpu_kernel
+            && !matches!(
+                &self.output_weight,
+                OutputWeight::FP8E4M3(_) | OutputWeight::FP8E5M2(_)
+            )
+        {
+            // Fused Metal prefill supports OneBit + Ternary today; FP8 falls
+            // through to the per-token sequential path, which dispatches through
+            // `KernelDispatcher::gemv_fp8_*` (Metal GPU via Phase 27).
             match self.try_metal_prefill_with_lm_head(token_ids, pos_start) {
                 Ok(logits) => return Ok(logits),
                 Err(e) => {
@@ -481,7 +489,15 @@ impl<'a> BonsaiModel<'a> {
         }
         let _gpu_kernel = kernel.is_gpu_accelerated();
         #[cfg(all(feature = "metal", target_os = "macos"))]
-        if _gpu_kernel {
+        if _gpu_kernel
+            && !matches!(
+                &self.output_weight,
+                OutputWeight::FP8E4M3(_) | OutputWeight::FP8E5M2(_)
+            )
+        {
+            // Fused Metal prefill verify supports OneBit + Ternary today; FP8
+            // falls through to per-token sequential, which dispatches through
+            // `KernelDispatcher::gemv_fp8_*` (Metal GPU via Phase 27).
             match self.try_metal_prefill_verify(token_ids, pos_start) {
                 Ok(ids) => return Ok(ids),
                 Err(e) => {

@@ -39,6 +39,8 @@ mod archive;
 mod attention;
 mod decode;
 mod decode_ternary;
+mod fp8;
+mod fp8_prefill;
 mod prefill;
 mod utility;
 
@@ -50,6 +52,10 @@ pub use attention::*;
 pub use decode::*;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub use decode_ternary::*;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub use fp8::*;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub use fp8_prefill::*;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub use prefill::*;
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -115,6 +121,22 @@ mod tests {
         );
         // Ternary V7-based GEMM batch prefill kernel
         assert!(MSL_GEMM_TQ2_G128_V7.contains("kernel void gemm_tq2_g128_v7"));
+
+        // FP8 single-token GEMV kernels (Phase 27)
+        assert!(MSL_GEMV_FP8_E4M3_V1.contains("kernel void gemv_fp8_e4m3"));
+        assert!(MSL_GEMV_FP8_E5M2_V1.contains("kernel void gemv_fp8_e5m2"));
+
+        // FP8 batch prefill kernels (Phase 28)
+        assert!(MSL_GEMM_FP8_E4M3_V1.contains("kernel void gemm_fp8_e4m3"));
+        assert!(MSL_GEMM_FP8_E4M3_RESIDUAL_V1.contains("kernel void gemm_fp8_e4m3_residual"));
+        assert!(MSL_FUSED_GATE_UP_SWIGLU_GEMM_FP8_E4M3_V1
+            .contains("kernel void fused_gate_up_swiglu_gemm_fp8_e4m3"));
+        assert!(MSL_GEMV_FP8_E4M3_PF_V1.contains("kernel void gemv_fp8_e4m3_pf"));
+        assert!(MSL_GEMM_FP8_E5M2_V1.contains("kernel void gemm_fp8_e5m2"));
+        assert!(MSL_GEMM_FP8_E5M2_RESIDUAL_V1.contains("kernel void gemm_fp8_e5m2_residual"));
+        assert!(MSL_FUSED_GATE_UP_SWIGLU_GEMM_FP8_E5M2_V1
+            .contains("kernel void fused_gate_up_swiglu_gemm_fp8_e5m2"));
+        assert!(MSL_GEMV_FP8_E5M2_PF_V1.contains("kernel void gemv_fp8_e5m2_pf"));
     }
 
     #[test]

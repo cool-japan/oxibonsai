@@ -101,6 +101,10 @@ pub mod kernel_sources;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod metal_dispatch;
 #[cfg(all(feature = "metal", target_os = "macos"))]
+pub mod metal_fp8_kernels;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub mod metal_fp8_prefill;
+#[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal_full_layer;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal_graph;
@@ -114,6 +118,15 @@ use tracing::warn;
 
 #[cfg(feature = "gpu")]
 pub use scirs2_backend::Scirs2Backend;
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub use metal_fp8_kernels::{metal_gemv_fp8_e4m3, metal_gemv_fp8_e5m2};
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub use metal_fp8_prefill::{
+    metal_fused_gate_up_swiglu_fp8_e4m3, metal_fused_gate_up_swiglu_fp8_e5m2, metal_gemm_fp8_e4m3,
+    metal_gemm_fp8_e4m3_residual, metal_gemm_fp8_e5m2, metal_gemm_fp8_e5m2_residual,
+};
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub use metal_graph::{MetalGraph, MetalGraphError, MetalWeightHandle};
