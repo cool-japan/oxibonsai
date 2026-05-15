@@ -196,6 +196,7 @@ pub mod keys {
     pub const LLM_FEED_FORWARD_LENGTH: &str = "llm.feed_forward_length";
     pub const LLM_ATTENTION_HEAD_COUNT: &str = "llm.attention.head_count";
     pub const LLM_ATTENTION_HEAD_COUNT_KV: &str = "llm.attention.head_count_kv";
+    pub const LLM_ATTENTION_KEY_LENGTH: &str = "llm.attention.key_length";
     pub const LLM_ATTENTION_LAYER_NORM_RMS_EPSILON: &str = "llm.attention.layer_norm_rms_epsilon";
     pub const LLM_ROPE_FREQ_BASE: &str = "llm.rope.freq_base";
     pub const LLM_VOCAB_SIZE: &str = "llm.vocab_size";
