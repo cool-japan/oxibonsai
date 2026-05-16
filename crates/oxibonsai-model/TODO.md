@@ -1,7 +1,7 @@
 # oxibonsai-model TODO
 
 > Qwen3 transformer model: layers, blocks, forward pass, KV cache, weight loaders
-> ~38,000 lines across `src/`, 1,048 tests (2026-05-03)
+> ~38,000 lines across `src/`, 1,060+ tests (2026-05-05)
 
 ## Status: All Features Complete
 
@@ -79,6 +79,28 @@ merging, and numerical stability tests all implemented and green.
 - [x] Ternary quantization export (`quantize_ternary.rs`)
 - [x] Checkpoint save/load — OXCK binary format (`checkpoint.rs`)
 - [x] Compression utilities (`compression.rs`)
+
+## Phase 19 — Q2_K / Q3_K / Q4_K / Q8_K Full Stack
+
+- [x] **Q2_K block type** — `BlockQ2K` (84 bytes/256w, 2-bit super-block with 16 K-quant scale nibbles + delta f16) in `oxibonsai-core::quant_k`; `gemv_q2k.rs` scalar GEMV kernel; `LinearQ2K<'a>` in `layers/linear_kquant_full.rs`; `LinearLayer::Q2K` + `OutputWeight::Q2K` variants; Q2_K weight loaders in `weight_loaders.rs`; `forward_cuda.rs` exhaustive match arms
+- [x] **Q3_K block type** — `BlockQ3K` (110 bytes/256w, 3-bit with 4-bit signed scale nibbles + hmask high-bit array + d f16) in `oxibonsai-core::quant_k`; `gemv_q3k.rs` scalar GEMV kernel; `LinearQ3K<'a>`; full model integration
+- [x] **Q4_K block type** — `BlockQ4K` (144 bytes/256w, 4-bit K-quant with 2-level super-block scale+min; `d`/`dmin` f16) in `oxibonsai-core::quant_k`; `gemv_q4k.rs` scalar GEMV kernel; `LinearQ4K<'a>`; full model integration
+- [x] **Q8_K block type** — `BlockQ8K` (292 bytes/256w, 8-bit with f32 scale + precomputed `bsums` i16 block sums) in `oxibonsai-core::quant_k`; `gemv_q8k.rs` scalar GEMV kernel; `LinearQ8K<'a>`; full model integration
+- [x] **Lib re-exports** — `pub use layers::linear_kquant_full::{LinearQ2K, LinearQ3K, LinearQ4K, LinearQ8K}` in `lib.rs`
+
+## Phase 18 — Standard GGUF Formats + K-quant Extensions
+
+- [x] **Q4_0 + Q8_0 full stack** — `BlockQ4_0` (18 bytes/32w) + `BlockQ8_0` (34 bytes/32w) in `oxibonsai-core::quant_std`; scalar GEMV kernels; `LinearQ4_0<'a>` + `LinearQ8_0<'a>` in `layers/linear_standard.rs`; `LinearLayer::{Q4_0, Q8_0}` + `OutputWeight::{Q4_0, Q8_0}` variants; Q4_0/Q8_0 weight loaders; 25 block + 8 kernel tests each
+- [x] **Q5_K + Q6_K K-quant extensions** — `BlockQ5K` (176 bytes/256w, 5-bit sub-blocks, K-quant scale/min encoding) + `BlockQ6K` (210 bytes/256w, 6-bit symmetric) in `oxibonsai-core::quant_k_ext`; GEMV kernels; `LinearQ5K<'a>` + `LinearQ6K<'a>` in `layers/linear_kquant_ext.rs`; full model integration; 12 tests in `tests/q5k_q6k_model_tests.rs`
+
+## Phase 17 — FP8 KV Cache + SmoothQuant FP8
+
+- [x] **FP8 KV cache** — `Fp8KvLayer`/`Fp8KvFormat`/`Fp8KvCache` in `kv_cache_quant.rs`; per-row abs-max scale encoding; mirrors `QuantizedKvLayer` API; 11 tests in `tests/fp8_kv_cache_tests.rs`; `KvCacheLevel::Fp8` (ordinal 2) in `oxibonsai-runtime`
+- [x] **SmoothQuant FP8 calibrator** — `smoothquant.rs`: `SmoothQuantCalibrator` (per-channel `running_max_abs` accumulator across batches), `SmoothQuantError`, `quantize_fp8_e4m3_smooth` / `quantize_fp8_e5m2_smooth`; `BlockFP8E4M3::quantize_with_channel_scales` / `BlockFP8E5M2::quantize_with_channel_scales` in `oxibonsai-core`; 12 tests in `tests/smoothquant_fp8_tests.rs`
+
+## Phase 16 — FP8 Full Stack
+
+- [x] **FP8 export formats (Phase 16C)** — `ExportFormat::FP8E4M3` and `ExportFormat::FP8E5M2`; `BlockFP8E4M3::quantize`-based serialization; GGUF type IDs 43/44; 34B/32w size estimation; 4 tests in `export.rs` (roundtrip E4M3, roundtrip E5M2, size estimate, FP32 exceptions)
 
 ## Done — Scaling & Caching
 

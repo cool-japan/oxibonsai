@@ -12,9 +12,11 @@ use rayon::prelude::*;
 
 use crate::dispatch::KernelDispatcher;
 use crate::error::{KernelError, KernelResult};
+use crate::traits::Fp8Kernel;
 use crate::traits::OneBitKernel;
 use crate::traits::TernaryKernel;
 use oxibonsai_core::QK_TQ2_0_G128;
+use oxibonsai_core::{BlockFP8E4M3, BlockFP8E5M2, QK_FP8};
 
 /// Minimum number of rows before engaging parallel GEMV.
 /// Below this threshold, the overhead of thread spawning exceeds the benefit.
@@ -273,6 +275,257 @@ pub fn gemm_ternary_g128_par(
             .try_for_each(|(mi, out_row)| {
                 let input_row = &input[mi * k..(mi + 1) * k];
                 dispatcher.gemm_ternary_g128(blocks, input_row, out_row, 1, n_rows, k)
+            })?;
+
+        Ok(())
+    }
+}
+
+// ─── FP8 parallel entry points ────────────────────────────────────────────
+
+/// Parallel row-wise FP8 E4M3FN GEMV.
+///
+/// Row-parallel split: each output row is an independent dot product.
+/// Falls back to sequential for small `n_rows` to avoid thread-spawn overhead.
+/// On WASM, always sequential.
+pub fn gemv_fp8_e4m3_par(
+    dispatcher: &KernelDispatcher,
+    blocks: &[BlockFP8E4M3],
+    input: &[f32],
+    output: &mut [f32],
+    n_rows: usize,
+    k: usize,
+) -> KernelResult<()> {
+    if k % QK_FP8 != 0 {
+        return Err(KernelError::NotBlockAligned {
+            count: k,
+            block_size: QK_FP8,
+        });
+    }
+    if input.len() < k {
+        return Err(KernelError::DimensionMismatch {
+            expected: k,
+            got: input.len(),
+        });
+    }
+    if output.len() < n_rows {
+        return Err(KernelError::BufferTooSmall {
+            needed: n_rows,
+            available: output.len(),
+        });
+    }
+    let blocks_per_row = k / QK_FP8;
+    let expected_blocks = n_rows * blocks_per_row;
+    if blocks.len() < expected_blocks {
+        return Err(KernelError::DimensionMismatch {
+            expected: expected_blocks,
+            got: blocks.len(),
+        });
+    }
+
+    if n_rows < PAR_GEMV_MIN_ROWS {
+        return dispatcher.gemv_fp8_e4m3(blocks, input, output, n_rows, k);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        return dispatcher.gemv_fp8_e4m3(blocks, input, output, n_rows, k);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        output[..n_rows]
+            .par_chunks_mut(1)
+            .enumerate()
+            .try_for_each(|(row, out_chunk)| {
+                let row_blocks = &blocks[row * blocks_per_row..(row + 1) * blocks_per_row];
+                dispatcher.gemv_fp8_e4m3(row_blocks, input, out_chunk, 1, k)
+            })?;
+
+        Ok(())
+    }
+}
+
+/// Parallel row-wise FP8 E5M2 GEMV.
+///
+/// Falls back to sequential for small `n_rows`.  On WASM, always sequential.
+pub fn gemv_fp8_e5m2_par(
+    dispatcher: &KernelDispatcher,
+    blocks: &[BlockFP8E5M2],
+    input: &[f32],
+    output: &mut [f32],
+    n_rows: usize,
+    k: usize,
+) -> KernelResult<()> {
+    if k % QK_FP8 != 0 {
+        return Err(KernelError::NotBlockAligned {
+            count: k,
+            block_size: QK_FP8,
+        });
+    }
+    if input.len() < k {
+        return Err(KernelError::DimensionMismatch {
+            expected: k,
+            got: input.len(),
+        });
+    }
+    if output.len() < n_rows {
+        return Err(KernelError::BufferTooSmall {
+            needed: n_rows,
+            available: output.len(),
+        });
+    }
+    let blocks_per_row = k / QK_FP8;
+    let expected_blocks = n_rows * blocks_per_row;
+    if blocks.len() < expected_blocks {
+        return Err(KernelError::DimensionMismatch {
+            expected: expected_blocks,
+            got: blocks.len(),
+        });
+    }
+
+    if n_rows < PAR_GEMV_MIN_ROWS {
+        return dispatcher.gemv_fp8_e5m2(blocks, input, output, n_rows, k);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        return dispatcher.gemv_fp8_e5m2(blocks, input, output, n_rows, k);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        output[..n_rows]
+            .par_chunks_mut(1)
+            .enumerate()
+            .try_for_each(|(row, out_chunk)| {
+                let row_blocks = &blocks[row * blocks_per_row..(row + 1) * blocks_per_row];
+                dispatcher.gemv_fp8_e5m2(row_blocks, input, out_chunk, 1, k)
+            })?;
+
+        Ok(())
+    }
+}
+
+/// Parallel batch-wise FP8 E4M3FN GEMM.
+///
+/// Each batch element is an independent GEMV call.
+/// Falls back to sequential for small `batch`.  On WASM, always sequential.
+pub fn gemm_fp8_e4m3_par(
+    dispatcher: &KernelDispatcher,
+    blocks: &[BlockFP8E4M3],
+    inputs: &[f32],
+    outputs: &mut [f32],
+    n_rows: usize,
+    k: usize,
+    batch: usize,
+) -> KernelResult<()> {
+    if k % QK_FP8 != 0 {
+        return Err(KernelError::NotBlockAligned {
+            count: k,
+            block_size: QK_FP8,
+        });
+    }
+    if inputs.len() < batch * k {
+        return Err(KernelError::DimensionMismatch {
+            expected: batch * k,
+            got: inputs.len(),
+        });
+    }
+    if outputs.len() < batch * n_rows {
+        return Err(KernelError::BufferTooSmall {
+            needed: batch * n_rows,
+            available: outputs.len(),
+        });
+    }
+    let blocks_per_row = k / QK_FP8;
+    let expected_blocks = n_rows * blocks_per_row;
+    if blocks.len() < expected_blocks {
+        return Err(KernelError::DimensionMismatch {
+            expected: expected_blocks,
+            got: blocks.len(),
+        });
+    }
+
+    if batch < PAR_GEMM_MIN_BATCH {
+        return dispatcher.gemm_fp8_e4m3(blocks, inputs, outputs, n_rows, k, batch);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        return dispatcher.gemm_fp8_e4m3(blocks, inputs, outputs, n_rows, k, batch);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        outputs[..batch * n_rows]
+            .par_chunks_mut(n_rows)
+            .enumerate()
+            .try_for_each(|(bi, out_row)| {
+                let input_row = &inputs[bi * k..(bi + 1) * k];
+                dispatcher.gemm_fp8_e4m3(blocks, input_row, out_row, n_rows, k, 1)
+            })?;
+
+        Ok(())
+    }
+}
+
+/// Parallel batch-wise FP8 E5M2 GEMM.
+///
+/// Falls back to sequential for small `batch`.  On WASM, always sequential.
+pub fn gemm_fp8_e5m2_par(
+    dispatcher: &KernelDispatcher,
+    blocks: &[BlockFP8E5M2],
+    inputs: &[f32],
+    outputs: &mut [f32],
+    n_rows: usize,
+    k: usize,
+    batch: usize,
+) -> KernelResult<()> {
+    if k % QK_FP8 != 0 {
+        return Err(KernelError::NotBlockAligned {
+            count: k,
+            block_size: QK_FP8,
+        });
+    }
+    if inputs.len() < batch * k {
+        return Err(KernelError::DimensionMismatch {
+            expected: batch * k,
+            got: inputs.len(),
+        });
+    }
+    if outputs.len() < batch * n_rows {
+        return Err(KernelError::BufferTooSmall {
+            needed: batch * n_rows,
+            available: outputs.len(),
+        });
+    }
+    let blocks_per_row = k / QK_FP8;
+    let expected_blocks = n_rows * blocks_per_row;
+    if blocks.len() < expected_blocks {
+        return Err(KernelError::DimensionMismatch {
+            expected: expected_blocks,
+            got: blocks.len(),
+        });
+    }
+
+    if batch < PAR_GEMM_MIN_BATCH {
+        return dispatcher.gemm_fp8_e5m2(blocks, inputs, outputs, n_rows, k, batch);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        return dispatcher.gemm_fp8_e5m2(blocks, inputs, outputs, n_rows, k, batch);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        outputs[..batch * n_rows]
+            .par_chunks_mut(n_rows)
+            .enumerate()
+            .try_for_each(|(bi, out_row)| {
+                let input_row = &inputs[bi * k..(bi + 1) * k];
+                dispatcher.gemm_fp8_e5m2(blocks, input_row, out_row, n_rows, k, 1)
             })?;
 
         Ok(())

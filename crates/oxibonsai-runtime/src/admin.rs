@@ -9,6 +9,7 @@
 //! | GET    | `/admin/config`         | Current configuration snapshot     |
 //! | POST   | `/admin/reset-metrics`  | Reset all metric counters to zero  |
 //! | GET    | `/admin/cache-stats`    | KV/inference cache statistics      |
+//! | GET    | `/admin/workload-stats` | Workload aggregator + KV policy    |
 //!
 //! # Example
 //!
@@ -33,7 +34,9 @@ use serde::Serialize;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::kv_cache_policy::KvCachePolicy;
 use crate::metrics::InferenceMetrics;
+use crate::request_metrics::RequestRateAggregator;
 
 // ─── Server status response ─────────────────────────────────────────────────
 
@@ -81,15 +84,38 @@ pub struct AdminState {
     pub started_at: Instant,
     /// Shared metrics instance.
     pub metrics: Arc<InferenceMetrics>,
+    /// Optional workload aggregator surfaced via `/admin/workload-stats`.
+    pub rate_aggregator: Option<Arc<RequestRateAggregator>>,
+    /// Optional KV-cache compression policy surfaced via `/admin/workload-stats`.
+    pub kv_cache_policy: Option<Arc<KvCachePolicy>>,
 }
 
 impl AdminState {
-    /// Create a new `AdminState` with the given metrics.
+    /// Create a new `AdminState` with the given metrics. Workload sources
+    /// (rate aggregator and KV-cache policy) start unset; attach them with
+    /// [`AdminState::with_rate_aggregator`] and
+    /// [`AdminState::with_kv_cache_policy`].
     pub fn new(metrics: Arc<InferenceMetrics>) -> Self {
         Self {
             started_at: Instant::now(),
             metrics,
+            rate_aggregator: None,
+            kv_cache_policy: None,
         }
+    }
+
+    /// Attach a workload [`RequestRateAggregator`] to surface via
+    /// `/admin/workload-stats`. Builder-style consuming setter.
+    pub fn with_rate_aggregator(mut self, aggregator: Arc<RequestRateAggregator>) -> Self {
+        self.rate_aggregator = Some(aggregator);
+        self
+    }
+
+    /// Attach a [`KvCachePolicy`] to surface via `/admin/workload-stats`.
+    /// Builder-style consuming setter.
+    pub fn with_kv_cache_policy(mut self, policy: Arc<KvCachePolicy>) -> Self {
+        self.kv_cache_policy = Some(policy);
+        self
     }
 
     /// Return the number of whole seconds the server has been running.
@@ -194,6 +220,46 @@ pub async fn reset_metrics(State(state): State<Arc<AdminState>>) -> impl IntoRes
     (StatusCode::OK, Json(body))
 }
 
+/// `GET /admin/workload-stats` — return runtime workload telemetry.
+///
+/// Combines the [`RequestRateAggregator`]'s sliding-window snapshot
+/// (TBT p50/p95, EWMA tokens/sec, queue-wait, completed requests) with the
+/// [`KvCachePolicy`] state (current tier, smoothed pressure, transition
+/// counters) into one operator-friendly JSON document.
+///
+/// Either source may be `null` if it wasn't attached to the [`AdminState`].
+pub async fn get_workload_stats(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
+    let request_rate = state.rate_aggregator.as_ref().map(|agg| {
+        let snap = agg.snapshot();
+        serde_json::json!({
+            "completed_requests": snap.completed_requests,
+            "mean_tokens_per_second": snap.mean_tokens_per_second,
+            "tbt_p50_seconds": snap.tbt_p50_seconds,
+            "tbt_p95_seconds": snap.tbt_p95_seconds,
+            "mean_queue_wait_seconds": snap.mean_queue_wait_seconds,
+        })
+    });
+
+    let kv_cache = state.kv_cache_policy.as_ref().map(|policy| {
+        let level = policy.current_level();
+        serde_json::json!({
+            "level": level.tag(),
+            "memory_factor": level.memory_factor(),
+            "pressure_ewma": policy.pressure(),
+            "samples": policy.samples(),
+            "upgrades": policy.upgrades(),
+            "downgrades": policy.downgrades(),
+        })
+    });
+
+    let body = serde_json::json!({
+        "request_rate": request_rate,
+        "kv_cache": kv_cache,
+        "status": "ok",
+    });
+    (StatusCode::OK, Json(body))
+}
+
 /// `GET /admin/cache-stats` — return placeholder cache statistics.
 pub async fn get_cache_stats(_state: State<Arc<AdminState>>) -> impl IntoResponse {
     let body = serde_json::json!({
@@ -225,6 +291,7 @@ pub fn create_admin_router(state: Arc<AdminState>) -> Router<Arc<AdminState>> {
         .route("/admin/config", get(get_config))
         .route("/admin/reset-metrics", post(reset_metrics))
         .route("/admin/cache-stats", get(get_cache_stats))
+        .route("/admin/workload-stats", get(get_workload_stats))
         .with_state(state)
 }
 
@@ -275,6 +342,49 @@ mod tests {
             uptime < 5,
             "uptime should be nearly 0 at creation; got {uptime}"
         );
+    }
+
+    #[test]
+    fn test_admin_state_with_rate_aggregator() {
+        let metrics = Arc::new(InferenceMetrics::new());
+        let agg = Arc::new(RequestRateAggregator::new());
+        let state = AdminState::new(metrics).with_rate_aggregator(Arc::clone(&agg));
+        assert!(state.rate_aggregator.is_some());
+        assert!(state.kv_cache_policy.is_none());
+    }
+
+    #[test]
+    fn test_admin_state_with_kv_cache_policy() {
+        let metrics = Arc::new(InferenceMetrics::new());
+        let policy = Arc::new(KvCachePolicy::default());
+        let state = AdminState::new(metrics).with_kv_cache_policy(Arc::clone(&policy));
+        assert!(state.kv_cache_policy.is_some());
+        assert!(state.rate_aggregator.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_workload_stats_empty() {
+        let metrics = Arc::new(InferenceMetrics::new());
+        let state = Arc::new(AdminState::new(metrics));
+        // Without aggregator or policy, both fields should serialize as null.
+        let response = get_workload_stats(State(Arc::clone(&state))).await;
+        let response = response.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_get_workload_stats_with_sources() {
+        let metrics = Arc::new(InferenceMetrics::new());
+        let agg = Arc::new(RequestRateAggregator::new());
+        let policy = Arc::new(KvCachePolicy::default());
+        let state = Arc::new(
+            AdminState::new(metrics)
+                .with_rate_aggregator(Arc::clone(&agg))
+                .with_kv_cache_policy(Arc::clone(&policy)),
+        );
+        let response = get_workload_stats(State(Arc::clone(&state))).await;
+        let response = response.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[test]

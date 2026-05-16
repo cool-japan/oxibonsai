@@ -4,7 +4,10 @@ use super::weight_loaders::{load_f32_tensor, load_output_weight, load_transforme
 use crate::block::TransformerBlock;
 use crate::error::{ModelError, ModelResult};
 use crate::kv_cache::KvCache;
-use crate::layers::linear::{Linear1Bit, LinearTernary};
+use crate::layers::linear::{Linear1Bit, LinearFP8E4M3, LinearFP8E5M2, LinearTernary};
+use crate::layers::linear_kquant_ext::{LinearQ5K, LinearQ6K};
+use crate::layers::linear_kquant_full::{LinearQ2K, LinearQ3K, LinearQ4K, LinearQ8K};
+use crate::layers::linear_standard::{LinearQ4_0, LinearQ8_0};
 use crate::layers::rms_norm::RmsNorm;
 use crate::layers::rope::RopeTable;
 use crate::model_registry::ModelVariant;
@@ -18,6 +21,11 @@ use oxibonsai_kernels::traits::OneBitKernel;
     any(target_os = "linux", target_os = "windows")
 ))]
 mod forward_cuda;
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+mod forward_cuda_fp8;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod forward_metal;
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -211,6 +219,16 @@ impl<'a> BonsaiModel<'a> {
         match self.output_weight {
             OutputWeight::OneBit(ref mut linear) => linear.upload_to_gpu(),
             OutputWeight::Ternary(ref mut linear) => linear.upload_to_gpu(),
+            OutputWeight::FP8E4M3(_)
+            | OutputWeight::FP8E5M2(_)
+            | OutputWeight::Q4_0(_)
+            | OutputWeight::Q8_0(_)
+            | OutputWeight::Q5K(_)
+            | OutputWeight::Q6K(_)
+            | OutputWeight::Q2K(_)
+            | OutputWeight::Q3K(_)
+            | OutputWeight::Q4K(_)
+            | OutputWeight::Q8K(_) => {}
             OutputWeight::Fp32 { .. } => {}
         }
         tracing::info!("GPU weight upload complete");
@@ -288,13 +306,13 @@ impl<'a> BonsaiModel<'a> {
         if token_ids.len() == 1 {
             return self.forward(token_ids[0], pos_start, kernel);
         }
-        let gpu_kernel = kernel.is_gpu_accelerated();
+        let _gpu_kernel = kernel.is_gpu_accelerated();
         #[cfg(all(
             feature = "native-cuda",
             not(all(feature = "metal", target_os = "macos")),
             any(target_os = "linux", target_os = "windows")
         ))]
-        if gpu_kernel && token_ids.len() <= 16 {
+        if _gpu_kernel && token_ids.len() <= 16 {
             let mut last_logits = Vec::new();
             for (i, &token_id) in token_ids.iter().enumerate() {
                 last_logits = self.forward(token_id, pos_start + i, kernel)?;
@@ -302,7 +320,15 @@ impl<'a> BonsaiModel<'a> {
             return Ok(last_logits);
         }
         #[cfg(all(feature = "metal", target_os = "macos"))]
-        if gpu_kernel {
+        if _gpu_kernel
+            && !matches!(
+                &self.output_weight,
+                OutputWeight::FP8E4M3(_) | OutputWeight::FP8E5M2(_)
+            )
+        {
+            // Fused Metal prefill supports OneBit + Ternary today; FP8 falls
+            // through to the per-token sequential path, which dispatches through
+            // `KernelDispatcher::gemv_fp8_*` (Metal GPU via Phase 27).
             match self.try_metal_prefill_with_lm_head(token_ids, pos_start) {
                 Ok(logits) => return Ok(logits),
                 Err(e) => {
@@ -318,7 +344,107 @@ impl<'a> BonsaiModel<'a> {
             not(all(feature = "metal", target_os = "macos")),
             any(target_os = "linux", target_os = "windows")
         ))]
-        if gpu_kernel {
+        if _gpu_kernel
+            && matches!(
+                &self.output_weight,
+                OutputWeight::FP8E4M3(_) | OutputWeight::FP8E5M2(_)
+            )
+            && oxibonsai_kernels::CudaGraph::global().is_ok()
+        {
+            // FP8 batch GEMM prefill (Phase 26).
+            let is_e4m3 = matches!(&self.output_weight, OutputWeight::FP8E4M3(_));
+            match self.try_cuda_prefill_with_lm_head_fp8(token_ids, pos_start, is_e4m3) {
+                Ok(logits) => return Ok(logits),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "cuda FP8 batch prefill failed, falling back to sequential"
+                    );
+                }
+            }
+            // Fallback: sequential token-by-token CUDA GEMV.
+            let mut last_logits = Vec::new();
+            for (i, &token_id) in token_ids.iter().enumerate() {
+                last_logits = self.forward(token_id, pos_start + i, kernel)?;
+            }
+            return Ok(last_logits);
+        }
+        #[cfg(all(
+            feature = "native-cuda",
+            not(all(feature = "metal", target_os = "macos")),
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        if _gpu_kernel
+            && matches!(
+                &self.output_weight,
+                OutputWeight::Q4_0(_) | OutputWeight::Q8_0(_)
+            )
+            && oxibonsai_kernels::CudaGraph::global().is_ok()
+        {
+            let q4_0 = matches!(&self.output_weight, OutputWeight::Q4_0(_));
+            match self.try_cuda_prefill_with_lm_head_q_std(token_ids, pos_start, q4_0) {
+                Ok(logits) => return Ok(logits),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "cuda Q4_0/Q8_0 batch prefill failed, falling back to sequential"
+                    );
+                }
+            }
+            // Fallback: sequential token-by-token
+            let mut last_logits = Vec::new();
+            for (i, &token_id) in token_ids.iter().enumerate() {
+                last_logits = self.forward(token_id, pos_start + i, kernel)?;
+            }
+            return Ok(last_logits);
+        }
+        #[cfg(all(
+            feature = "native-cuda",
+            not(all(feature = "metal", target_os = "macos")),
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        if _gpu_kernel
+            && matches!(
+                &self.output_weight,
+                OutputWeight::Q2K(_)
+                    | OutputWeight::Q3K(_)
+                    | OutputWeight::Q4K(_)
+                    | OutputWeight::Q5K(_)
+                    | OutputWeight::Q6K(_)
+                    | OutputWeight::Q8K(_)
+            )
+            && oxibonsai_kernels::CudaGraph::global().is_ok()
+        {
+            // K-quant batch GEMM prefill (Phase 25).
+            let fmt = match &self.output_weight {
+                OutputWeight::Q2K(_) => oxibonsai_kernels::KQuantFormat::Q2K,
+                OutputWeight::Q3K(_) => oxibonsai_kernels::KQuantFormat::Q3K,
+                OutputWeight::Q4K(_) => oxibonsai_kernels::KQuantFormat::Q4K,
+                OutputWeight::Q5K(_) => oxibonsai_kernels::KQuantFormat::Q5K,
+                OutputWeight::Q6K(_) => oxibonsai_kernels::KQuantFormat::Q6K,
+                OutputWeight::Q8K(_) => oxibonsai_kernels::KQuantFormat::Q8K,
+                _ => unreachable!(),
+            };
+            match self.try_cuda_prefill_with_lm_head_k_quant(token_ids, pos_start, fmt) {
+                Ok(logits) => return Ok(logits),
+                Err(e) => {
+                    tracing::warn!(error = %e,
+                        "cuda K-quant batch prefill failed, falling back to sequential");
+                }
+            }
+            // Fallback: sequential token-by-token forward using CUDA GEMV.
+            let mut last_logits = Vec::new();
+            for (i, &token_id) in token_ids.iter().enumerate() {
+                last_logits = self.forward(token_id, pos_start + i, kernel)?;
+            }
+            return Ok(last_logits);
+        }
+        #[cfg(all(
+            feature = "native-cuda",
+            not(all(feature = "metal", target_os = "macos")),
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        if _gpu_kernel {
             match self.try_cuda_prefill_with_lm_head(token_ids, pos_start) {
                 Ok(logits) => return Ok(logits),
                 Err(e) => {
@@ -361,9 +487,17 @@ impl<'a> BonsaiModel<'a> {
         if token_ids.is_empty() {
             return Ok(vec![]);
         }
-        let gpu_kernel = kernel.is_gpu_accelerated();
+        let _gpu_kernel = kernel.is_gpu_accelerated();
         #[cfg(all(feature = "metal", target_os = "macos"))]
-        if gpu_kernel {
+        if _gpu_kernel
+            && !matches!(
+                &self.output_weight,
+                OutputWeight::FP8E4M3(_) | OutputWeight::FP8E5M2(_)
+            )
+        {
+            // Fused Metal prefill verify supports OneBit + Ternary today; FP8
+            // falls through to per-token sequential, which dispatches through
+            // `KernelDispatcher::gemv_fp8_*` (Metal GPU via Phase 27).
             match self.try_metal_prefill_verify(token_ids, pos_start) {
                 Ok(ids) => return Ok(ids),
                 Err(e) => {
@@ -379,7 +513,93 @@ impl<'a> BonsaiModel<'a> {
             not(all(feature = "metal", target_os = "macos")),
             any(target_os = "linux", target_os = "windows")
         ))]
-        if gpu_kernel {
+        if _gpu_kernel
+            && matches!(
+                &self.output_weight,
+                OutputWeight::FP8E4M3(_) | OutputWeight::FP8E5M2(_)
+            )
+            && oxibonsai_kernels::CudaGraph::global().is_ok()
+        {
+            // FP8 batch GEMM prefill verify (Phase 26).
+            let is_e4m3 = matches!(&self.output_weight, OutputWeight::FP8E4M3(_));
+            match self.try_cuda_prefill_verify_fp8(token_ids, pos_start, is_e4m3) {
+                Ok(ids) => return Ok(ids),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "cuda FP8 batch prefill verify failed, falling back to sequential"
+                    );
+                }
+            }
+            let mut token_ids_out = Vec::with_capacity(token_ids.len());
+            for (i, &token_id) in token_ids.iter().enumerate() {
+                let logits = self.forward(token_id, pos_start + i, kernel)?;
+                let best_idx = logits
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(j, _)| j as u32)
+                    .unwrap_or(0);
+                token_ids_out.push(best_idx);
+            }
+            return Ok(token_ids_out);
+        }
+        #[cfg(all(
+            feature = "native-cuda",
+            not(all(feature = "metal", target_os = "macos")),
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        if _gpu_kernel
+            && matches!(
+                &self.output_weight,
+                OutputWeight::Q2K(_)
+                    | OutputWeight::Q3K(_)
+                    | OutputWeight::Q4K(_)
+                    | OutputWeight::Q5K(_)
+                    | OutputWeight::Q6K(_)
+                    | OutputWeight::Q8K(_)
+            )
+            && oxibonsai_kernels::CudaGraph::global().is_ok()
+        {
+            // K-quant batch GEMM prefill verify (Phase 25).
+            let fmt = match &self.output_weight {
+                OutputWeight::Q2K(_) => oxibonsai_kernels::KQuantFormat::Q2K,
+                OutputWeight::Q3K(_) => oxibonsai_kernels::KQuantFormat::Q3K,
+                OutputWeight::Q4K(_) => oxibonsai_kernels::KQuantFormat::Q4K,
+                OutputWeight::Q5K(_) => oxibonsai_kernels::KQuantFormat::Q5K,
+                OutputWeight::Q6K(_) => oxibonsai_kernels::KQuantFormat::Q6K,
+                OutputWeight::Q8K(_) => oxibonsai_kernels::KQuantFormat::Q8K,
+                _ => unreachable!(),
+            };
+            match self.try_cuda_prefill_verify_k_quant(token_ids, pos_start, fmt) {
+                Ok(ids) => return Ok(ids),
+                Err(e) => {
+                    tracing::warn!(error = %e,
+                        "cuda K-quant batch prefill verify failed, falling back to sequential");
+                }
+            }
+            // Fallback: sequential token-by-token with argmax.
+            let mut token_ids_out = Vec::with_capacity(token_ids.len());
+            for (i, &token_id) in token_ids.iter().enumerate() {
+                let logits = self.forward(token_id, pos_start + i, kernel)?;
+                let mut best_idx = 0u32;
+                let mut best_val = f32::NEG_INFINITY;
+                for (j, &v) in logits.iter().enumerate() {
+                    if v > best_val {
+                        best_val = v;
+                        best_idx = j as u32;
+                    }
+                }
+                token_ids_out.push(best_idx);
+            }
+            return Ok(token_ids_out);
+        }
+        #[cfg(all(
+            feature = "native-cuda",
+            not(all(feature = "metal", target_os = "macos")),
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        if _gpu_kernel {
             match self.try_cuda_prefill_verify(token_ids, pos_start) {
                 Ok(ids) => return Ok(ids),
                 Err(e) => {
@@ -437,9 +657,9 @@ impl<'a> BonsaiModel<'a> {
         }
         let mut hidden = self.token_embd[embd_start..embd_end].to_vec();
         let t_blocks_start = std::time::Instant::now();
-        let gpu_kernel = kernel.is_gpu_accelerated();
+        let _gpu_kernel = kernel.is_gpu_accelerated();
         #[cfg(all(feature = "metal", target_os = "macos"))]
-        if gpu_kernel {
+        if _gpu_kernel {
             let mut fused_logits = vec![0.0f32; vocab];
             if self
                 .try_metal_full_forward_with_lm_head(&mut hidden, pos, &mut fused_logits)
@@ -459,13 +679,151 @@ impl<'a> BonsaiModel<'a> {
             not(all(feature = "metal", target_os = "macos")),
             any(target_os = "linux", target_os = "windows")
         ))]
-        if gpu_kernel {
+        if _gpu_kernel
+            && matches!(
+                &self.output_weight,
+                OutputWeight::FP8E4M3(_) | OutputWeight::FP8E5M2(_)
+            )
+            && oxibonsai_kernels::CudaGraph::global().is_ok()
+        {
+            // FP8 models use CUDA-accelerated GEMV via KernelTier::Gpu block dispatch.
+            // Skip the Q1/TQ2 fused CUDA graph paths (they only handle 1-bit/ternary weights).
+            for block in &self.blocks {
+                block.forward(&mut hidden, pos, &mut self.kv_cache, &self.rope, kernel)?;
+            }
+            let t_blocks_elapsed = t_blocks_start.elapsed();
+            tracing::debug!(
+                target: "fwd_profile",
+                "pos={pos} fp8_cuda_dispatch={:.1}ms (cuda gemv via block dispatch)",
+                t_blocks_elapsed.as_secs_f64() * 1000.0,
+            );
+            let t_norm_start = std::time::Instant::now();
+            let mut normed = vec![0.0f32; h];
+            self.output_norm.forward(&hidden, &mut normed)?;
+            let t_norm_elapsed = t_norm_start.elapsed();
+            let t_lm_start = std::time::Instant::now();
+            let mut logits = vec![0.0f32; vocab];
+            match &self.output_weight {
+                OutputWeight::FP8E4M3(lm_head) => lm_head.forward(&normed, &mut logits)?,
+                OutputWeight::FP8E5M2(lm_head) => lm_head.forward(&normed, &mut logits)?,
+                _ => unreachable!("checked above"),
+            }
+            let t_lm_elapsed = t_lm_start.elapsed();
+            tracing::debug!(
+                target: "fwd_profile",
+                "pos={pos} norm={:.2}ms lm_head={:.2}ms",
+                t_norm_elapsed.as_secs_f64() * 1000.0,
+                t_lm_elapsed.as_secs_f64() * 1000.0,
+            );
+            return Ok(logits);
+        }
+        #[cfg(all(
+            feature = "native-cuda",
+            not(all(feature = "metal", target_os = "macos")),
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        if _gpu_kernel
+            && matches!(
+                &self.output_weight,
+                OutputWeight::Q4_0(_) | OutputWeight::Q8_0(_)
+            )
+            && oxibonsai_kernels::CudaGraph::global().is_ok()
+        {
+            // Q4_0/Q8_0 models: skip the Q1 fused CUDA graph path.
+            // Each layer GEMV dispatches to CUDA via LinearQ4_0/Q8_0::forward().
+            for block in &self.blocks {
+                block.forward(&mut hidden, pos, &mut self.kv_cache, &self.rope, kernel)?;
+            }
+            let t_blocks_elapsed = t_blocks_start.elapsed();
+            tracing::debug!(
+                target: "fwd_profile",
+                "pos={pos} q4q8_cuda_dispatch={:.1}ms (cuda gemv via block dispatch)",
+                t_blocks_elapsed.as_secs_f64() * 1000.0,
+            );
+            let t_norm_start = std::time::Instant::now();
+            let mut normed = vec![0.0f32; h];
+            self.output_norm.forward(&hidden, &mut normed)?;
+            let t_norm_elapsed = t_norm_start.elapsed();
+            let t_lm_start = std::time::Instant::now();
+            let mut logits = vec![0.0f32; vocab];
+            match &self.output_weight {
+                OutputWeight::Q4_0(lm_head) => lm_head.forward(&normed, &mut logits)?,
+                OutputWeight::Q8_0(lm_head) => lm_head.forward(&normed, &mut logits)?,
+                _ => unreachable!("checked above"),
+            }
+            let t_lm_elapsed = t_lm_start.elapsed();
+            tracing::debug!(
+                target: "fwd_profile",
+                "pos={pos} norm={:.2}ms lm_head={:.2}ms",
+                t_norm_elapsed.as_secs_f64() * 1000.0,
+                t_lm_elapsed.as_secs_f64() * 1000.0,
+            );
+            return Ok(logits);
+        }
+        #[cfg(all(
+            feature = "native-cuda",
+            not(all(feature = "metal", target_os = "macos")),
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        if _gpu_kernel
+            && matches!(
+                &self.output_weight,
+                OutputWeight::Q2K(_)
+                    | OutputWeight::Q3K(_)
+                    | OutputWeight::Q4K(_)
+                    | OutputWeight::Q5K(_)
+                    | OutputWeight::Q6K(_)
+                    | OutputWeight::Q8K(_)
+            )
+            && oxibonsai_kernels::CudaGraph::global().is_ok()
+        {
+            // K-quant models: skip the Q1 fused CUDA graph path.
+            // Each layer GEMV dispatches to CUDA via LinearQ*K::forward().
+            for block in &self.blocks {
+                block.forward(&mut hidden, pos, &mut self.kv_cache, &self.rope, kernel)?;
+            }
+            let t_blocks_elapsed = t_blocks_start.elapsed();
+            tracing::debug!(
+                target: "fwd_profile",
+                "pos={pos} kquant_cuda_dispatch={:.1}ms (cuda gemv via block dispatch)",
+                t_blocks_elapsed.as_secs_f64() * 1000.0,
+            );
+            let t_norm_start = std::time::Instant::now();
+            let mut normed = vec![0.0f32; h];
+            self.output_norm.forward(&hidden, &mut normed)?;
+            let t_norm_elapsed = t_norm_start.elapsed();
+            let t_lm_start = std::time::Instant::now();
+            let mut logits = vec![0.0f32; vocab];
+            match &self.output_weight {
+                OutputWeight::Q2K(lm_head) => lm_head.forward(&normed, &mut logits)?,
+                OutputWeight::Q3K(lm_head) => lm_head.forward(&normed, &mut logits)?,
+                OutputWeight::Q4K(lm_head) => lm_head.forward(&normed, &mut logits)?,
+                OutputWeight::Q5K(lm_head) => lm_head.forward(&normed, &mut logits)?,
+                OutputWeight::Q6K(lm_head) => lm_head.forward(&normed, &mut logits)?,
+                OutputWeight::Q8K(lm_head) => lm_head.forward(&normed, &mut logits)?,
+                _ => unreachable!("checked above"),
+            }
+            let t_lm_elapsed = t_lm_start.elapsed();
+            tracing::debug!(
+                target: "fwd_profile",
+                "pos={pos} norm={:.2}ms lm_head={:.2}ms",
+                t_norm_elapsed.as_secs_f64() * 1000.0,
+                t_lm_elapsed.as_secs_f64() * 1000.0,
+            );
+            return Ok(logits);
+        }
+        #[cfg(all(
+            feature = "native-cuda",
+            not(all(feature = "metal", target_os = "macos")),
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        if _gpu_kernel {
             if let Ok(fused_logits) = self.try_cuda_full_forward_with_lm_head(&hidden, pos) {
                 return Ok(fused_logits);
             }
         }
         #[cfg(all(feature = "metal", target_os = "macos"))]
-        let did_full_forward = if gpu_kernel {
+        let did_full_forward = if _gpu_kernel {
             let q1_ok = self.try_metal_full_forward_inner(&mut hidden, pos).is_ok();
             if q1_ok {
                 true
@@ -481,7 +839,7 @@ impl<'a> BonsaiModel<'a> {
             not(all(feature = "metal", target_os = "macos")),
             any(target_os = "linux", target_os = "windows")
         ))]
-        let did_full_forward = if gpu_kernel {
+        let did_full_forward = if _gpu_kernel {
             match self.try_cuda_full_forward_inner(&hidden, pos) {
                 Ok(new_hidden) => {
                     hidden = new_hidden;
@@ -520,6 +878,36 @@ impl<'a> BonsaiModel<'a> {
             OutputWeight::Ternary(linear) => {
                 linear.forward(&normed, &mut logits)?;
             }
+            OutputWeight::FP8E4M3(linear) => {
+                linear.forward(&normed, &mut logits)?;
+            }
+            OutputWeight::FP8E5M2(linear) => {
+                linear.forward(&normed, &mut logits)?;
+            }
+            OutputWeight::Q4_0(linear) => {
+                linear.forward(&normed, &mut logits)?;
+            }
+            OutputWeight::Q8_0(linear) => {
+                linear.forward(&normed, &mut logits)?;
+            }
+            OutputWeight::Q5K(linear) => {
+                linear.forward(&normed, &mut logits)?;
+            }
+            OutputWeight::Q6K(linear) => {
+                linear.forward(&normed, &mut logits)?;
+            }
+            OutputWeight::Q2K(linear) => {
+                linear.forward(&normed, &mut logits)?;
+            }
+            OutputWeight::Q3K(linear) => {
+                linear.forward(&normed, &mut logits)?;
+            }
+            OutputWeight::Q4K(linear) => {
+                linear.forward(&normed, &mut logits)?;
+            }
+            OutputWeight::Q8K(linear) => {
+                linear.forward(&normed, &mut logits)?;
+            }
             OutputWeight::Fp32 {
                 weights,
                 out_features,
@@ -546,10 +934,28 @@ impl<'a> BonsaiModel<'a> {
     }
 }
 
-/// Output projection can be 1-bit, ternary, or FP32 depending on the model.
+/// Output projection can be 1-bit, ternary, FP8, Q4_0, Q8_0, Q5_K, Q6_K, or FP32.
 pub(super) enum OutputWeight<'a> {
     OneBit(Linear1Bit<'a>),
     Ternary(LinearTernary<'a>),
+    FP8E4M3(LinearFP8E4M3<'a>),
+    FP8E5M2(LinearFP8E5M2<'a>),
+    /// 4-bit symmetric (Q4_0) output projection.
+    Q4_0(LinearQ4_0<'a>),
+    /// 8-bit symmetric (Q8_0) output projection.
+    Q8_0(LinearQ8_0<'a>),
+    /// 5-bit K-quant (Q5_K) output projection.
+    Q5K(LinearQ5K<'a>),
+    /// 6-bit K-quant (Q6_K) output projection.
+    Q6K(LinearQ6K<'a>),
+    /// 2-bit K-quant (Q2_K) output projection.
+    Q2K(LinearQ2K<'a>),
+    /// 3-bit K-quant (Q3_K) output projection.
+    Q3K(LinearQ3K<'a>),
+    /// 4-bit K-quant (Q4_K) output projection.
+    Q4K(LinearQ4K<'a>),
+    /// 8-bit K-quant (Q8_K) output projection.
+    Q8K(LinearQ8K<'a>),
     Fp32 {
         weights: Vec<f32>,
         out_features: usize,

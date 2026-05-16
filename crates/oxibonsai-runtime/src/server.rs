@@ -13,7 +13,7 @@
 //! the Axum router, then serve it with `axum::serve`.
 
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{
     sse::{Event, Sse},
     IntoResponse, Json, Response,
@@ -27,7 +27,41 @@ use tokio_stream::StreamExt;
 
 use crate::engine::InferenceEngine;
 use crate::metrics::InferenceMetrics;
+use crate::request_id::RequestId;
 use crate::tokenizer_bridge::TokenizerBridge;
+
+/// Header name used for end-to-end request correlation. Request handlers
+/// echo whatever the client supplied in the response, or generate a fresh
+/// UUIDv4-style id when the header is absent.
+pub const REQUEST_ID_HEADER: &str = "x-request-id";
+
+/// Resolve a [`RequestId`] from an incoming request header, falling back to
+/// a freshly generated id when none is supplied or when the supplied value
+/// is malformed (in either case we still want a usable id to thread through
+/// tracing spans and the response).
+///
+/// Accepts both the 32-hex form (no dashes) and the 36-char UUID form
+/// (`8-4-4-4-12`).
+pub fn resolve_request_id(headers: &HeaderMap) -> RequestId {
+    if let Some(v) = headers.get(REQUEST_ID_HEADER) {
+        if let Ok(s) = v.to_str() {
+            if let Some(id) = RequestId::from_uuid(s).or_else(|| RequestId::from_hex(s)) {
+                return id;
+            }
+        }
+    }
+    RequestId::new()
+}
+
+/// Build response headers for a [`RequestId`]. Returns a `HeaderMap` with the
+/// `X-Request-ID` set to the canonical 36-char UUID form.
+pub fn request_id_header_map(id: RequestId) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if let Ok(value) = HeaderValue::from_str(&id.as_uuid()) {
+        headers.insert(REQUEST_ID_HEADER, value);
+    }
+    headers
+}
 
 /// Server state.
 pub struct AppState {
@@ -53,23 +87,57 @@ impl AppState {
     }
 }
 
-/// Chat message.
+/// Chat message (OpenAI-compatible).
+///
+/// `content` is `Option<String>` so that it can be `null` when `tool_calls`
+/// is set (the model produced a tool call instead of a text reply).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
+    /// Role of the message sender: `"system"`, `"user"`, `"assistant"`, `"tool"`.
     pub role: String,
-    pub content: String,
+    /// Text content of the message.  `null` when the assistant returns tool calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// Tool calls produced by the model (assistant role only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<crate::api_types::ToolCallResult>>,
+    /// ID of the tool call being responded to (tool role only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+impl ChatMessage {
+    /// Construct a plain text assistant or user message.
+    pub fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
 }
 
 /// Chat completion request.
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
+    /// Conversation history.
     pub messages: Vec<ChatMessage>,
+    /// Maximum tokens to generate.
     #[serde(default = "default_max_tokens")]
     pub max_tokens: usize,
+    /// Sampling temperature.
     #[serde(default = "default_temperature")]
     pub temperature: f32,
+    /// Whether to stream the response as SSE.
     #[serde(default)]
     pub stream: bool,
+    /// Tools available to the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<crate::api_types::ToolDefinition>>,
+    /// Tool choice: `"auto"`, `"none"`, or a specific function selector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
 }
 
 fn default_max_tokens() -> usize {
@@ -200,11 +268,15 @@ async fn list_models() -> Json<serde_json::Value> {
     }))
 }
 
-#[tracing::instrument(skip(state))]
+#[tracing::instrument(skip(state, headers, body), fields(request_id))]
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(body): Json<ChatCompletionRequest>,
 ) -> Result<Response, StatusCode> {
+    let request_id = resolve_request_id(&headers);
+    tracing::Span::current().record("request_id", tracing::field::display(&request_id));
+
     let request_start = std::time::Instant::now();
     state.metrics.requests_total.inc();
     state.metrics.active_requests.inc();
@@ -231,10 +303,22 @@ async fn chat_completions(
 
     let result = if body.stream {
         // ── SSE streaming mode ──
-        chat_completions_stream(Arc::clone(&state), prompt_tokens, body.max_tokens).await
+        chat_completions_stream(
+            Arc::clone(&state),
+            prompt_tokens,
+            body.max_tokens,
+            request_id,
+        )
+        .await
     } else {
         // ── Non-streaming mode ──
-        chat_completions_non_stream(Arc::clone(&state), prompt_tokens, body.max_tokens).await
+        chat_completions_non_stream(
+            Arc::clone(&state),
+            prompt_tokens,
+            body.max_tokens,
+            request_id,
+        )
+        .await
     };
 
     let elapsed = request_start.elapsed().as_secs_f64();
@@ -253,6 +337,7 @@ async fn chat_completions_non_stream(
     state: Arc<AppState>,
     prompt_tokens: Vec<u32>,
     max_tokens: usize,
+    request_id: RequestId,
 ) -> Result<Response, StatusCode> {
     let prompt_len = prompt_tokens.len();
 
@@ -285,7 +370,9 @@ async fn chat_completions_non_stream(
             index: 0,
             message: ChatMessage {
                 role: "assistant".to_string(),
-                content,
+                content: Some(content),
+                tool_calls: None,
+                tool_call_id: None,
             },
             finish_reason: "stop".to_string(),
         }],
@@ -296,7 +383,8 @@ async fn chat_completions_non_stream(
         },
     };
 
-    Ok(Json(response).into_response())
+    let headers = request_id_header_map(request_id);
+    Ok((headers, Json(response)).into_response())
 }
 
 /// SSE streaming chat completion handler.
@@ -304,6 +392,7 @@ async fn chat_completions_stream(
     state: Arc<AppState>,
     prompt_tokens: Vec<u32>,
     max_tokens: usize,
+    request_id: RequestId,
 ) -> Result<Response, StatusCode> {
     let completion_id = format!("chatcmpl-{}", rand_id());
     let created = std::time::SystemTime::now()
@@ -415,31 +504,38 @@ async fn chat_completions_stream(
         .map(|json_str| -> Result<Event, Infallible> { Ok(Event::default().data(json_str)) })
         .chain(tokio_stream::once(Ok(Event::default().data("[DONE]"))));
 
-    Ok(Sse::new(full_stream).into_response())
+    let headers = request_id_header_map(request_id);
+    Ok((headers, Sse::new(full_stream)).into_response())
 }
 
 /// Build a simple prompt from chat messages.
+///
+/// Messages with `content = None` (e.g. tool-call turns) are skipped.
 fn build_prompt(messages: &[ChatMessage]) -> String {
     let mut prompt = String::new();
     for msg in messages {
+        let text = match msg.content.as_deref() {
+            Some(t) => t,
+            None => continue,
+        };
         match msg.role.as_str() {
             "system" => {
                 prompt.push_str("<|im_start|>system\n");
-                prompt.push_str(&msg.content);
+                prompt.push_str(text);
                 prompt.push_str("<|im_end|>\n");
             }
             "user" => {
                 prompt.push_str("<|im_start|>user\n");
-                prompt.push_str(&msg.content);
+                prompt.push_str(text);
                 prompt.push_str("<|im_end|>\n");
             }
             "assistant" => {
                 prompt.push_str("<|im_start|>assistant\n");
-                prompt.push_str(&msg.content);
+                prompt.push_str(text);
                 prompt.push_str("<|im_end|>\n");
             }
             _ => {
-                prompt.push_str(&msg.content);
+                prompt.push_str(text);
                 prompt.push('\n');
             }
         }
@@ -614,7 +710,9 @@ mod tests {
     fn build_prompt_simple() {
         let msgs = vec![ChatMessage {
             role: "user".to_string(),
-            content: "Hello".to_string(),
+            content: Some("Hello".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
         }];
         let p = build_prompt(&msgs);
         assert!(p.contains("<|im_start|>user\nHello<|im_end|>"));
@@ -626,11 +724,15 @@ mod tests {
         let msgs = vec![
             ChatMessage {
                 role: "system".to_string(),
-                content: "You are a helpful assistant.".to_string(),
+                content: Some("You are a helpful assistant.".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
             },
             ChatMessage {
                 role: "user".to_string(),
-                content: "Hi".to_string(),
+                content: Some("Hi".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
             },
         ];
         let p = build_prompt(&msgs);
@@ -643,15 +745,21 @@ mod tests {
         let msgs = vec![
             ChatMessage {
                 role: "user".to_string(),
-                content: "What is 2+2?".to_string(),
+                content: Some("What is 2+2?".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
             },
             ChatMessage {
                 role: "assistant".to_string(),
-                content: "4".to_string(),
+                content: Some("4".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
             },
             ChatMessage {
                 role: "user".to_string(),
-                content: "And 3+3?".to_string(),
+                content: Some("And 3+3?".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
             },
         ];
         let p = build_prompt(&msgs);

@@ -60,14 +60,18 @@ pub mod streaming;
 pub mod tests;
 pub mod tokenizer;
 pub mod trainer;
+pub mod unigram;
 pub mod utils;
 pub mod vocab;
+pub mod wordpiece;
 
 // Re-export the most commonly used types at the crate root.
 pub use bpe::{bpe_encode, byte_fallback_id, pretokenize, BpeMerges};
 pub use chat_templates::{ChatMessage, ChatTemplateKind};
 pub use error::{TokenizerError, TokenizerResult};
-pub use hf_format::{byte_to_unicode, bytes_to_unicode_map, unicode_to_byte, HfTokenizerJson};
+pub use hf_format::{
+    byte_to_unicode, bytes_to_unicode_map, unicode_to_byte, HfModelType, HfTokenizerJson,
+};
 pub use serialization::{
     base64_decode, base64_encode, SerializationError, TokenizerState, FORMAT_MAGIC,
 };
@@ -76,4 +80,6 @@ pub use tokenizer::{OxiTokenizer, TokenizerConfig};
 pub use trainer::{
     BpeTrainer, MergeRule, SymbolPair, TrainedTokenizer, TrainerConfig, TrainerError, TrainingStats,
 };
+pub use unigram::{UnigramError, UnigramVocab};
 pub use vocab::Vocabulary;
+pub use wordpiece::{WordPieceError, WordPieceVocab, WORDPIECE_CONTINUATION_PREFIX};

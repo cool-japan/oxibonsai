@@ -1,9 +1,9 @@
 # oxibonsai-rag TODO
 
 > Pure Rust RAG pipeline: document chunking, embedding, vector store, retrieval
-> 9 files, ~2,450 lines, 58 tests passing
+> 9 files, ~2,450 lines, 871 tests passing
 
-**Version:** 0.1.3
+**Version:** 0.1.4
 **Status:** Alpha — all core features complete
 **Last updated:** 2026-05-03
 

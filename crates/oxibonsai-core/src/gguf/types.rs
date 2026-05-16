@@ -36,6 +36,10 @@ pub enum GgufTensorType {
     Q1_0_g128 = 41,
     /// PrismML ternary quantization: 128 sign-2 bits + FP16 group scale.
     TQ2_0_g128 = 42,
+    /// PrismML FP8 E4M3FN: 32 weights × 1 byte + FP16 scale (type ID 43).
+    F8_E4M3 = 43,
+    /// PrismML FP8 E5M2: 32 weights × 1 byte + FP16 scale (type ID 44).
+    F8_E5M2 = 44,
 }
 
 impl GgufTensorType {
@@ -60,6 +64,8 @@ impl GgufTensorType {
             35 => Ok(Self::TQ2_0),
             41 => Ok(Self::Q1_0_g128),
             42 => Ok(Self::TQ2_0_g128),
+            43 => Ok(Self::F8_E4M3),
+            44 => Ok(Self::F8_E5M2),
             _ => Err(BonsaiError::UnsupportedQuantType { type_id: id }),
         }
     }
@@ -73,6 +79,7 @@ impl GgufTensorType {
             Self::Q1_0_g128 => 128,
             Self::TQ2_0_g128 => 128,
             Self::TQ2_0 => 256,
+            Self::F8_E4M3 | Self::F8_E5M2 => 32,
         }
     }
 
@@ -81,21 +88,22 @@ impl GgufTensorType {
         match self {
             Self::F32 => 4,
             Self::F16 | Self::BF16 => 2,
-            Self::Q4_0 => 18,       // 2 + 16
-            Self::Q4_1 => 20,       // 2 + 2 + 16
-            Self::Q5_0 => 22,       // 2 + 4 + 16
-            Self::Q5_1 => 24,       // 2 + 2 + 4 + 16
-            Self::Q8_0 => 34,       // 2 + 32
-            Self::Q8_1 => 40,       // 4 + 4 + 32
-            Self::Q2_K => 84,       // 256/4 + 256/16 + 2+2
-            Self::Q3_K => 110,      // 256/4 + 256/8 + 12+2
-            Self::Q4_K => 144,      // 2+2+12+4*32
-            Self::Q5_K => 176,      // 2+2+12+4*32+256/8
-            Self::Q6_K => 210,      // 256/2+256/4+256/16+2
-            Self::Q8_K => 292,      // 4+256+256/16
-            Self::Q1_0_g128 => 18,  // 2 (FP16 scale) + 16 (128 sign bits)
-            Self::TQ2_0_g128 => 34, // 2 (FP16 scale) + 32 (128 ternary-2bit packed)
-            Self::TQ2_0 => 66,      // 2 (FP16 scale) + 64 (256 ternary-2bit packed)
+            Self::Q4_0 => 18,                    // 2 + 16
+            Self::Q4_1 => 20,                    // 2 + 2 + 16
+            Self::Q5_0 => 22,                    // 2 + 4 + 16
+            Self::Q5_1 => 24,                    // 2 + 2 + 4 + 16
+            Self::Q8_0 => 34,                    // 2 + 32
+            Self::Q8_1 => 40,                    // 4 + 4 + 32
+            Self::Q2_K => 84,                    // 256/4 + 256/16 + 2+2
+            Self::Q3_K => 110,                   // 256/4 + 256/8 + 12+2
+            Self::Q4_K => 144,                   // 2+2+12+4*32
+            Self::Q5_K => 176,                   // 2+2+12+4*32+256/8
+            Self::Q6_K => 210,                   // 256/2+256/4+256/16+2
+            Self::Q8_K => 292,                   // 4+256+256/16
+            Self::Q1_0_g128 => 18,               // 2 (FP16 scale) + 16 (128 sign bits)
+            Self::TQ2_0_g128 => 34,              // 2 (FP16 scale) + 32 (128 ternary-2bit packed)
+            Self::TQ2_0 => 66,                   // 2 (FP16 scale) + 64 (256 ternary-2bit packed)
+            Self::F8_E4M3 | Self::F8_E5M2 => 34, // 32 bytes qs + 2 bytes FP16 scale
         }
     }
 
@@ -107,6 +115,11 @@ impl GgufTensorType {
     /// Returns true if this is a ternary ({-1, 0, +1}) quantization type.
     pub fn is_ternary(&self) -> bool {
         matches!(self, Self::TQ2_0 | Self::TQ2_0_g128)
+    }
+
+    /// Returns true if this is an FP8 quantization type.
+    pub fn is_fp8(self) -> bool {
+        matches!(self, Self::F8_E4M3 | Self::F8_E5M2)
     }
 
     /// Display name for this quantization type.
@@ -130,6 +143,8 @@ impl GgufTensorType {
             Self::TQ2_0 => "TQ2_0",
             Self::Q1_0_g128 => "Q1_0_g128",
             Self::TQ2_0_g128 => "TQ2_0_g128",
+            Self::F8_E4M3 => "F8_E4M3",
+            Self::F8_E5M2 => "F8_E5M2",
         }
     }
 }
@@ -260,5 +275,41 @@ mod tests {
     fn one_bit_is_not_ternary() {
         assert!(!GgufTensorType::Q1_0_g128.is_ternary());
         assert!(GgufTensorType::Q1_0_g128.is_one_bit());
+    }
+
+    #[test]
+    fn f8_e4m3_properties() {
+        let ty = GgufTensorType::F8_E4M3;
+        assert_eq!(ty.block_size(), 32);
+        assert_eq!(ty.block_bytes(), 34);
+        assert!(ty.is_fp8());
+        assert!(!ty.is_ternary());
+        assert!(!ty.is_one_bit());
+        assert_eq!(ty.name(), "F8_E4M3");
+        assert_eq!(ty as u32, 43);
+    }
+
+    #[test]
+    fn f8_e5m2_properties() {
+        let ty = GgufTensorType::F8_E5M2;
+        assert_eq!(ty.block_size(), 32);
+        assert_eq!(ty.block_bytes(), 34);
+        assert!(ty.is_fp8());
+        assert!(!ty.is_ternary());
+        assert!(!ty.is_one_bit());
+        assert_eq!(ty.name(), "F8_E5M2");
+        assert_eq!(ty as u32, 44);
+    }
+
+    #[test]
+    fn parse_fp8_type_ids() {
+        assert_eq!(
+            GgufTensorType::from_id(43).expect("43 valid"),
+            GgufTensorType::F8_E4M3
+        );
+        assert_eq!(
+            GgufTensorType::from_id(44).expect("44 valid"),
+            GgufTensorType::F8_E5M2
+        );
     }
 }

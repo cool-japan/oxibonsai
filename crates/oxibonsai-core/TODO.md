@@ -1,8 +1,8 @@
 # oxibonsai-core TODO
 
 > GGUF loader, quant block types, tensor types, model config, error types
-> 16 files, ~5,215 lines, 243 tests
-> Version: 0.1.3 — Last updated: 2026-05-03
+> 16 files, ~5,215 lines, 207 tests
+> Version: 0.1.4 — Last updated: 2026-05-16
 
 ## Status: ✅ All Features Complete
 
@@ -21,6 +21,10 @@ All Phase 0–1 functionality implemented and tested, including fuzz/property te
 - [x] **Fuzz testing** — Malformed GGUF headers, truncated files, invalid tensor offsets (`fuzz_gguf.rs`, `gguf_edge_cases.rs`)
 - [x] **Additional quant formats** — Q2_K, Q4_K support implemented in `quant_k.rs` with BlockQ2K/BlockQ4K structs, dequant/quantize, 21 tests
 - [x] **Streaming GGUF reader** — `gguf/streaming.rs` with GgufStreamParser state machine, progressive parsing, 22 tests
+
+## Phase 15 — FP8 Quantization
+
+- [x] `quant_fp8.rs` — `BlockFP8E4M3`/`BlockFP8E5M2` (32w × 1B + f16 scale = 34B); `fp8_e4m3_encode/decode`; `fp8_e5m2_encode/decode`; `quantize`/`dequant`/`slice_from_bytes`; GGUF IDs 43/44; forward-compat `ExtendedQuantType::F8_E4M3/F8_E5M2`; 56 tests
 
 ## Ternary Bonsai
 

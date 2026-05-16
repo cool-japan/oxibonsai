@@ -4,8 +4,8 @@
 > environment-variable mapping, validation, Prometheus-text metrics, and a
 > bearer-auth middleware around the Axum router from `oxibonsai-runtime`.
 >
-> 9 source files + 6 integration test files, ~160 tests (all passing).
-> Version 0.1.3 — last reviewed 2026-05-03.
+> 9 source files + 6 integration test files, 260 tests (all passing).
+> Version 0.1.4 — last reviewed 2026-05-16.
 
 ## Status: Stable (Alpha → Stable uplift complete)
 

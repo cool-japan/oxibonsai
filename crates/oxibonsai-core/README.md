@@ -1,7 +1,7 @@
 # oxibonsai-core
 
-[![Version](https://img.shields.io/badge/version-0.1.3-blue.svg)](https://crates.io/crates/oxibonsai-core)
-[![Tests](https://img.shields.io/badge/tests-243%20passing-brightgreen.svg)]()
+[![Version](https://img.shields.io/badge/version-0.1.4-blue.svg)](https://crates.io/crates/oxibonsai-core)
+[![Tests](https://img.shields.io/badge/tests-207%20passing-brightgreen.svg)]()
 [![Status](https://img.shields.io/badge/status-stable-brightgreen.svg)]()
 
 GGUF parser, quant block types, tensor types, and model configuration for OxiBonsai.
@@ -24,7 +24,7 @@ Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 - K-quant formats: `BlockQ2K`, `BlockQ4K`
 - `ModelCard` — structured model card (author, license, tags) embedded in GGUF
 - `mmap` feature for zero-copy model file access
-- 243 tests passing (unit, integration, fuzz, property)
+- 207 tests passing (unit, integration, fuzz, property)
 
 ## Feature Flags
 
@@ -37,7 +37,7 @@ Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 
 ```toml
 [dependencies]
-oxibonsai-core = "0.1.3"
+oxibonsai-core = "0.1.4"
 ```
 
 ## License

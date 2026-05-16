@@ -58,6 +58,7 @@ pub mod pruning;
 pub mod quantize;
 pub mod quantize_int8;
 pub mod quantize_ternary;
+pub mod smoothquant;
 pub mod tensor_parallel;
 pub mod weight_tying;
 
@@ -96,8 +97,8 @@ pub use gradient_checkpoint::{
 pub use kv_cache::KvCache;
 pub use kv_cache_fp16::KvCacheFp16;
 pub use kv_cache_quant::{
-    dequantize_row_i8, quant_error_mae, quantize_row_i8, QuantKvError, QuantizedKvCache,
-    QuantizedKvLayer,
+    dequantize_row_i8, quant_error_mae, quantize_row_i8, Fp8KvCache, Fp8KvFormat, Fp8KvLayer,
+    QuantKvError, QuantizedKvCache, QuantizedKvLayer,
 };
 pub use layers::attention_sink::{
     AttentionSinkCache, AttentionSinkConfig, AttentionSinkLayer, SinkError, SinkSlot,
@@ -153,7 +154,13 @@ pub use pruning::{
     ImportanceMetric, ImportanceScores, ModelSparsitySummary, PruningConfig, PruningError,
     PruningGranularity, ScoreStats, SparsityReport,
 };
+pub use smoothquant::{
+    quantize_fp8_e4m3_smooth, quantize_fp8_e5m2_smooth, SmoothQuantCalibrator, SmoothQuantError,
+};
 pub use weight_tying::{TiedEmbedding, TyingError};
 
 pub use convert::onnx::{convert_onnx_to_gguf, DequantError as OnnxDequantError, OnnxImportError};
 pub use convert::ConvertStats;
+pub use layers::linear_kquant_ext::{LinearQ5K, LinearQ6K};
+pub use layers::linear_kquant_full::{LinearQ2K, LinearQ3K, LinearQ4K, LinearQ8K};
+pub use layers::linear_standard::{LinearQ4_0, LinearQ8_0};

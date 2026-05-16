@@ -1,6 +1,7 @@
-//! Quantized KV cache: INT8 per-row quantization for keys and values.
+//! Quantized KV cache: INT8 and FP8 per-row quantization for keys and values.
 //!
-//! Memory reduction: 4× vs FP32, 2× vs FP16.
+//! INT8 memory reduction: 4× vs FP32, 2× vs FP16.
+//! FP8 memory reduction: 4× vs FP32, 2× vs FP16 (with floating-point distribution).
 //! Accuracy: ~0.1% error vs FP32 for typical activation ranges.
 //!
 //! # Layout
@@ -9,6 +10,10 @@
 //!   - key_scales: [seq_len, num_kv_heads] as f32  (per-row scale)
 //!   - values_i8: [seq_len, num_kv_heads, head_dim] as i8
 //!   - value_scales: [seq_len, num_kv_heads] as f32
+
+use oxibonsai_core::quant_fp8::{
+    fp8_e4m3_decode, fp8_e4m3_encode, fp8_e5m2_decode, fp8_e5m2_encode, FP8_E4M3_MAX, FP8_E5M2_MAX,
+};
 
 /// Error types for quantized KV cache operations.
 #[derive(Debug, thiserror::Error)]
@@ -482,5 +487,364 @@ impl QuantizedKvCache {
             });
         }
         Ok(())
+    }
+}
+
+// ─── FP8 KV cache ─────────────────────────────────────────────────────────────
+
+/// FP8 encoding format variant for KV cache quantization.
+///
+/// - `E4M3` uses 4-bit exponent, 3-bit mantissa (max representable ≈ 448.0).
+///   Better accuracy for typical attention activations with bounded range.
+/// - `E5M2` uses 5-bit exponent, 2-bit mantissa (max representable ≈ 57344.0).
+///   Wider dynamic range, useful for outlier-heavy distributions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Fp8KvFormat {
+    /// E4M3FN format: 4-bit exponent, 3-bit mantissa, bias=7.
+    /// Max representable value: 448.0. No infinities; NaN = 0x7f/0xff.
+    E4M3,
+    /// E5M2 format: 5-bit exponent, 2-bit mantissa, bias=15.
+    /// Max representable value: 57344.0. Supports infinities; NaN = 0x7e.
+    E5M2,
+}
+
+/// Quantize a row of f32 values to FP8 using per-row absolute-max scaling.
+///
+/// Returns `(quantized_bytes: Vec<u8>, scale: f32)` where
+/// `scale = max(|row|) / FP8_MAX`. One scale per head-row is stored; all
+/// values are encoded relative to that scale.
+///
+/// For an all-zero row the scale is clamped to [`f32::EPSILON`] and all output
+/// bytes are `0x00`.
+fn quantize_row_fp8(row: &[f32], format: Fp8KvFormat) -> (Vec<u8>, f32) {
+    if row.is_empty() {
+        return (Vec::new(), f32::EPSILON);
+    }
+
+    let max_abs = row.iter().map(|x| x.abs()).fold(0.0_f32, f32::max);
+
+    let fp8_max = match format {
+        Fp8KvFormat::E4M3 => FP8_E4M3_MAX,
+        Fp8KvFormat::E5M2 => FP8_E5M2_MAX,
+    };
+
+    // Clamp scale to at least EPSILON to avoid division by zero for all-zero rows.
+    let scale = (max_abs / fp8_max).max(f32::EPSILON);
+
+    let quantized = match format {
+        Fp8KvFormat::E4M3 => row.iter().map(|&x| fp8_e4m3_encode(x / scale)).collect(),
+        Fp8KvFormat::E5M2 => row.iter().map(|&x| fp8_e5m2_encode(x / scale)).collect(),
+    };
+
+    (quantized, scale)
+}
+
+/// Dequantize FP8 bytes back to f32 using the stored row scale.
+///
+/// Each element is decoded from FP8 then multiplied by `scale`.
+fn dequantize_row_fp8(quantized: &[u8], scale: f32, format: Fp8KvFormat) -> Vec<f32> {
+    match format {
+        Fp8KvFormat::E4M3 => quantized
+            .iter()
+            .map(|&b| fp8_e4m3_decode(b) * scale)
+            .collect(),
+        Fp8KvFormat::E5M2 => quantized
+            .iter()
+            .map(|&b| fp8_e5m2_decode(b) * scale)
+            .collect(),
+    }
+}
+
+/// A single transformer layer's FP8-quantized KV cache.
+///
+/// Memory layout is token-major: `[token_pos][head][dim]` for data and
+/// `[token_pos][head]` for scales. Append-only; `clear` resets `len` to 0
+/// without reallocating.
+///
+/// Per-row scaling: one `f32` scale per `(token_pos, head)` pair, computed as
+/// `scale = max(|row|) / FP8_MAX`. This mirrors the INT8 implementation but
+/// uses FP8 byte encodings rather than i8.
+#[derive(Debug)]
+pub struct Fp8KvLayer {
+    /// FP8-encoded key data: `[capacity * num_kv_heads * head_dim]` as u8.
+    keys_fp8: Vec<u8>,
+    /// Per-head-row key scales: `[capacity * num_kv_heads]` as f32.
+    key_scales: Vec<f32>,
+    /// FP8-encoded value data: `[capacity * num_kv_heads * head_dim]` as u8.
+    values_fp8: Vec<u8>,
+    /// Per-head-row value scales: `[capacity * num_kv_heads]` as f32.
+    value_scales: Vec<f32>,
+    /// Number of KV attention heads per token position.
+    pub num_kv_heads: usize,
+    /// Dimension of each attention head.
+    pub head_dim: usize,
+    /// Maximum token positions pre-allocated.
+    pub capacity: usize,
+    /// Token positions actually stored.
+    pub len: usize,
+    /// FP8 encoding format (E4M3 or E5M2).
+    pub format: Fp8KvFormat,
+}
+
+impl Fp8KvLayer {
+    /// Allocate an FP8 KV layer for `num_kv_heads` heads of dimension `head_dim`,
+    /// holding up to `capacity` token positions in the given `format`.
+    ///
+    /// All storage is pre-allocated so subsequent [`push`](Self::push) calls
+    /// perform no heap allocation.
+    pub fn with_capacity(
+        num_kv_heads: usize,
+        head_dim: usize,
+        capacity: usize,
+        format: Fp8KvFormat,
+    ) -> Self {
+        let data_len = capacity * num_kv_heads * head_dim;
+        let scale_len = capacity * num_kv_heads;
+        Self {
+            keys_fp8: vec![0u8; data_len],
+            key_scales: vec![0.0_f32; scale_len],
+            values_fp8: vec![0u8; data_len],
+            value_scales: vec![0.0_f32; scale_len],
+            num_kv_heads,
+            head_dim,
+            capacity,
+            len: 0,
+            format,
+        }
+    }
+
+    /// Append FP8-quantized keys and values for the next token position.
+    ///
+    /// `key` and `value` must each be a flat slice of length
+    /// `num_kv_heads * head_dim` (heads first, then dims within each head).
+    /// Each head-row is quantized independently with its own scale.
+    ///
+    /// # Errors
+    /// - [`QuantKvError::CapacityExceeded`] if `self.len == self.capacity`.
+    /// - [`QuantKvError::ShapeMismatch`] if `key` or `value` length is wrong.
+    pub fn push(&mut self, key: &[f32], value: &[f32]) -> Result<(), QuantKvError> {
+        let expected = self.num_kv_heads * self.head_dim;
+
+        if key.len() != expected {
+            return Err(QuantKvError::ShapeMismatch {
+                expected,
+                actual: key.len(),
+            });
+        }
+        if value.len() != expected {
+            return Err(QuantKvError::ShapeMismatch {
+                expected,
+                actual: value.len(),
+            });
+        }
+        if self.len >= self.capacity {
+            return Err(QuantKvError::CapacityExceeded {
+                capacity: self.capacity,
+                pos: self.len,
+            });
+        }
+
+        let token_pos = self.len;
+        let format = self.format;
+
+        for head in 0..self.num_kv_heads {
+            let row_start = head * self.head_dim;
+            let row_end = row_start + self.head_dim;
+
+            let data_off = self.data_offset(token_pos, head);
+            let scale_off = self.scale_offset(token_pos, head);
+
+            // Keys
+            let key_row = &key[row_start..row_end];
+            let (kq, ks) = quantize_row_fp8(key_row, format);
+            self.keys_fp8[data_off..data_off + self.head_dim].copy_from_slice(&kq);
+            self.key_scales[scale_off] = ks;
+
+            // Values
+            let val_row = &value[row_start..row_end];
+            let (vq, vs) = quantize_row_fp8(val_row, format);
+            self.values_fp8[data_off..data_off + self.head_dim].copy_from_slice(&vq);
+            self.value_scales[scale_off] = vs;
+        }
+
+        self.len += 1;
+        Ok(())
+    }
+
+    /// Dequantize and return all keys for a token position as a flat
+    /// `Vec<f32>` of length `num_kv_heads * head_dim`.
+    ///
+    /// Layout: `[head_0_dims..., head_1_dims..., ...]`
+    ///
+    /// # Panics
+    /// Panics if `pos >= self.len` (index out of bounds on the pre-allocated slab).
+    pub fn get_key(&self, pos: usize) -> Vec<f32> {
+        let mut out = Vec::with_capacity(self.num_kv_heads * self.head_dim);
+        for head in 0..self.num_kv_heads {
+            let data_off = self.data_offset(pos, head);
+            let scale = self.key_scales[self.scale_offset(pos, head)];
+            out.extend(dequantize_row_fp8(
+                &self.keys_fp8[data_off..data_off + self.head_dim],
+                scale,
+                self.format,
+            ));
+        }
+        out
+    }
+
+    /// Dequantize and return all values for a token position as a flat
+    /// `Vec<f32>` of length `num_kv_heads * head_dim`.
+    ///
+    /// # Panics
+    /// Panics if `pos >= self.len`.
+    pub fn get_value(&self, pos: usize) -> Vec<f32> {
+        let mut out = Vec::with_capacity(self.num_kv_heads * self.head_dim);
+        for head in 0..self.num_kv_heads {
+            let data_off = self.data_offset(pos, head);
+            let scale = self.value_scales[self.scale_offset(pos, head)];
+            out.extend(dequantize_row_fp8(
+                &self.values_fp8[data_off..data_off + self.head_dim],
+                scale,
+                self.format,
+            ));
+        }
+        out
+    }
+
+    /// Dequantize keys for a subset of token positions.
+    ///
+    /// Returns a `Vec` of flat key vectors, one per position in `positions`.
+    /// Positions must be < `self.len`; out-of-range positions will panic
+    /// (index-out-of-bounds on the pre-allocated slab).
+    pub fn get_keys_at(&self, positions: &[usize]) -> Vec<Vec<f32>> {
+        positions.iter().map(|&pos| self.get_key(pos)).collect()
+    }
+
+    /// Dequantize values for a subset of token positions.
+    ///
+    /// Returns a `Vec` of flat value vectors, one per position in `positions`.
+    pub fn get_values_at(&self, positions: &[usize]) -> Vec<Vec<f32>> {
+        positions.iter().map(|&pos| self.get_value(pos)).collect()
+    }
+
+    /// Number of token positions currently stored.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns `true` if no token positions have been stored yet.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Maximum token positions this layer can hold.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Bytes occupied by FP8 data and f32 scales for this layer.
+    ///
+    /// `keys_fp8 + values_fp8` (1 byte/element) + `key_scales + value_scales`
+    /// (4 bytes/element).
+    pub fn memory_bytes(&self) -> usize {
+        let data_bytes = self.keys_fp8.len() + self.values_fp8.len();
+        let scale_bytes = (self.key_scales.len() + self.value_scales.len()) * 4;
+        data_bytes + scale_bytes
+    }
+
+    /// Equivalent memory if the same data were stored as FP32 with no scales.
+    ///
+    /// `2 * capacity * num_kv_heads * head_dim * 4`
+    pub fn memory_bytes_fp32_equivalent(&self) -> usize {
+        2 * self.capacity * self.num_kv_heads * self.head_dim * 4
+    }
+
+    /// Reset stored length to zero, making the layer appear empty.
+    ///
+    /// Does not free or zero memory; existing bytes are overwritten on the next
+    /// series of [`push`](Self::push) calls.
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    // ── Internal helpers ──────────────────────────────────────────────────────
+
+    /// Flat index into the FP8 data arrays for `(token_pos, head, 0)`.
+    #[inline]
+    fn data_offset(&self, token_pos: usize, head: usize) -> usize {
+        (token_pos * self.num_kv_heads + head) * self.head_dim
+    }
+
+    /// Flat index into the scale arrays for `(token_pos, head)`.
+    #[inline]
+    fn scale_offset(&self, token_pos: usize, head: usize) -> usize {
+        token_pos * self.num_kv_heads + head
+    }
+}
+
+// ─── Multi-layer FP8 KV cache ─────────────────────────────────────────────────
+
+/// Full multi-layer FP8-quantized KV cache for autoregressive decoding.
+///
+/// Wraps one [`Fp8KvLayer`] per transformer layer and exposes per-layer
+/// mutable and immutable accessors. All layers share the same `format`,
+/// `num_kv_heads`, `head_dim`, and `capacity`.
+#[derive(Debug)]
+pub struct Fp8KvCache {
+    /// Per-transformer-layer FP8 KV stores.
+    pub layers: Vec<Fp8KvLayer>,
+}
+
+impl Fp8KvCache {
+    /// Allocate a new FP8 KV cache for `num_layers` transformer layers.
+    ///
+    /// Each layer is pre-allocated for `capacity` token positions.
+    pub fn new(
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        capacity: usize,
+        format: Fp8KvFormat,
+    ) -> Self {
+        let layers = (0..num_layers)
+            .map(|_| Fp8KvLayer::with_capacity(num_kv_heads, head_dim, capacity, format))
+            .collect();
+        Self { layers }
+    }
+
+    /// Immutable reference to a specific layer.
+    ///
+    /// # Panics
+    /// Panics if `layer_idx >= self.num_layers()`.
+    pub fn layer(&self, layer_idx: usize) -> &Fp8KvLayer {
+        &self.layers[layer_idx]
+    }
+
+    /// Mutable reference to a specific layer.
+    ///
+    /// # Panics
+    /// Panics if `layer_idx >= self.num_layers()`.
+    pub fn layer_mut(&mut self, layer_idx: usize) -> &mut Fp8KvLayer {
+        &mut self.layers[layer_idx]
+    }
+
+    /// Number of transformer layers in this cache.
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Total memory used across all layers in bytes.
+    pub fn total_memory_bytes(&self) -> usize {
+        self.layers.iter().map(|l| l.memory_bytes()).sum()
+    }
+
+    /// Clear all layers, resetting stored lengths to zero.
+    pub fn clear_all(&mut self) {
+        for layer in &mut self.layers {
+            layer.clear();
+        }
     }
 }

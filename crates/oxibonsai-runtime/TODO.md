@@ -1,9 +1,56 @@
 # oxibonsai-runtime TODO
 
 > Inference engine, sampling, tokenizer, OpenAI-compatible server
-> Version 0.1.3 — 1,044 tests passing (all-features, 2026-05-03)
+> Version 0.1.4 — 1,130+ tests passing (all-features, 2026-05-05)
 
 ## Status: ✅ All Features Complete (Stable)
+
+## Phase 15 — Extended Constraints + Grammar Engine
+
+- [x] **`AllowListConstraint`** — finite-set token-sequence constraint (multiple-choice forcing); candidate bitmask + prefix tracking; `active_count()` accessor
+- [x] **`SequenceConstraint`** — exact sequence forcing; `is_failed()` accessor; unconstrained after sequence consumed
+- [x] **`LengthConstraint`** — hard `[min_len, max_len]` with optional stop token enforcement; `count()` accessor
+- [x] **BNF grammar engine** (`src/grammar/`): `ast.rs` (Grammar AST, terminal normalisation), `bnf_parser.rs` (hand-rolled two-phase parser), `earley.rs` (full Earley recognizer with FIRST sets, `next_byte_set()`, `clone_state()`), `constraint.rs` (`GrammarConstraint` implementing `TokenConstraint`), `examples.rs` (5 pre-canned grammars)
+- [x] **93 grammar tests** + **32 constraint tests** in `tests/`
+- [x] **`AllowedTokensCache`** — LRU memoization cache for Earley `allowed_tokens` (Phase 15.x); `grammar/cache.rs`; `state_hash()` on `EarleyRecognizer`; `Mutex<AllowedTokensCache>` in `GrammarConstraint`; configurable capacity via `with_cache_capacity`; `cache_stats()` for observability; 12 tests in `tests/grammar_cache_tests.rs`
+
+## Phase 19 — GBNF Parser + Tool Calling API
+
+- [x] **GBNF parser** — `grammar/gbnf_parser.rs`: `parse_gbnf(src) -> Result<Grammar, GbnfParseError>`; two-pass (NT allocation then rule fill); expands `*`/`+`/`?` quantifiers to synthetic NTs; handles string literals, char classes `[...]`/`[^...]`, alternation `|`, grouping `(...)`; `GbnfParseError::{EmptyGrammar, MissingRootRule, UndefinedNonTerminal, DuplicateRule, UnexpectedChar, InvalidEscape, UnclosedGroup}`; re-exported from `grammar::` and `lib.rs`; 26 tests in `tests/gbnf_parse_tests.rs`
+- [x] **Tool calling API** — `tool_calling.rs` (server-feature-gated): `select_tool(output, tools)` (XML tag parser + name registry check + JSON arg validation); `build_tool_constraint(tools)` (compile each tool schema → Grammar, merge with per-tool root rules); `make_tool_call(id, name, args)` convenience constructor; `new_tool_call_id()` alias; `ToolRegistry<'a>` for O(1) tool lookup; `validate_tool_arguments(args, tool)` structural required-field validator; `ToolCallError::{NoToolCallFound, UnknownTool, MalformedArguments, GrammarCompileError, EmptyToolList}`; 33 tests in `tests/tool_calling_tests.rs` + inline tests
+
+## Phase 18 — Regex → BNF Compiler
+
+- [x] **Regex → BNF compiler** — `grammar/regex_compiler.rs` (1,233 lines): `compile_regex(pattern) -> Result<Grammar, RegexCompileError>`; `ByteSet` (256-bit bitset, 4×u64); `RegexParser` (hand-rolled recursive descent); Thompson NFA construction; Subset DFA via powerset construction (2,048-state limit); DFA states → Grammar NTs with ε-productions for accepting states; supports literals, `.`, `[...]`/`[^...]` classes, `*`/`+`/`?`, `{n,m}`, `|`, grouping, `\d\w\s` escapes, `^$` anchors (ignored); `RegexCompileError::{InvalidSyntax, UnsupportedFeature, DepthExceeded, EmptyPattern, InvalidUtf8}`; re-exported from `grammar::` and `lib.rs`; 38 tests in `tests/regex_compile_tests.rs`
+
+## Phase 17 — JSON Schema BNF + KV Cache Level
+
+- [x] **JSON Schema → BNF compiler** — `grammar/json_schema_compiler.rs`: two-pass compiler; supports object/array/primitives/enum/anyOf/oneOf/allOf/$ref; `JsonSchemaCompileError`; re-exported from `grammar::` and `lib.rs`; 30 integration tests in `tests/json_schema_compile_tests.rs`
+- [x] **`KvCacheLevel::Fp8`** — new variant (ordinal 2, between Q8 and Q4, `memory_factor=0.5`, `tag="fp8"`); all 4 match arms extended; 3 tests in `tests/kv_cache_policy_fp8_tests.rs`; existing metrics test updated to expect ordinal 3 for Q4
+
+## 0.1.4 — New Modules
+
+- [x] **`kv_cache_policy`** — `KvCachePolicy` runtime controller; FP16/Q8/Q4 tier transitions driven by EWMA pressure with hysteresis (`kv_cache_policy.rs`, 14 tests)
+- [x] **`adaptive_lookahead`** — speculative-decoding draft-length controller with cooldown + clamped `[min,max]` window (`adaptive_lookahead.rs`, 16 tests); wired into `SpeculativeDecoder::with_adaptive(...)`
+- [x] **`request_metrics`** — per-request `RequestRateTracker` (TBT p50/p95, EWMA tok/s, queue-wait) plus `RequestRateAggregator` workload rollup (`request_metrics.rs`, 13 tests)
+- [x] **`request_id`** — UUIDv4-style 128-bit identifier with thread-safe SplitMix64 generator (`request_id.rs`, 11 tests)
+- [x] **Prometheus surface** — `oxibonsai_request_tokens_per_second`, `oxibonsai_inter_token_latency_p{50,95}_seconds`, `oxibonsai_queue_wait_seconds`, `oxibonsai_kv_cache_compression_level` gauges added to `InferenceMetrics`
+
+## 0.1.4 — Engine Integration
+
+- [x] **`InferenceEngine::generate_tracked(...)`** — populates a `RequestRateTracker` during generation, pushes the snapshot to an attached `RequestRateAggregator`
+- [x] **`InferenceEngine::generate_with_request_id(...)`** — emits a tracing span tagged `request_id = <uuid>`, returns `(Vec<u32>, RequestRateTracker)` for client-side telemetry
+- [x] **`InferenceEngine::set_rate_aggregator(Arc<RequestRateAggregator>)`** — workload-aggregator setter
+- [x] **`tests/engine_controllers_tests.rs`** — 8 integration tests covering tracked generate, request-id propagation, aggregator push semantics
+- [x] **`examples/runtime_controllers.rs`** — end-to-end demo (in workspace root)
+- [x] **`benches/controllers_bench.rs`** — criterion microbenchmarks (in workspace root)
+
+## 0.1.4 — Server / Admin Integration
+
+- [x] **`GET /admin/workload-stats`** — combines `RequestRateAggregator` snapshot (TBT p50/p95, EWMA tokens/sec, queue-wait, completed requests) with `KvCachePolicy` state (level, pressure, upgrades, downgrades) into a single operator-friendly JSON document
+- [x] **`AdminState::with_rate_aggregator(Arc<RequestRateAggregator>)`** + **`AdminState::with_kv_cache_policy(Arc<KvCachePolicy>)`** — builder-style attachment of workload sources to admin
+- [x] **`RequestId::as_bytes() / from_bytes()`** — 16-byte big-endian round-trip for binary protocols
+- [x] **`X-Request-ID` HTTP header propagation** in the OpenAI server: client-supplied ids are echoed; missing/malformed → auto-generated. Public helpers `resolve_request_id` / `request_id_header_map` and `REQUEST_ID_HEADER` constant. Streaming + non-streaming both carry the header; server tracing spans now record `request_id` for end-to-end correlation. 8 integration tests in `tests/request_id_propagation_tests.rs`
 
 Observability, TOML config, streaming SSE, circuit breaker, health checks, builders, presets, batch engine, async engine, continuous batching, prefix/semantic caches, speculative decoding, beam search, token healing, advanced/adaptive sampling, quality metrics, memory profiling, RAG server, and WASM support all implemented.
 

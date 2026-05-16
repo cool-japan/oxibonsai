@@ -30,6 +30,7 @@
 //! let mut decoder = SpeculativeDecoder::new(draft_engine, spec_config);
 //! ```
 
+use crate::adaptive_lookahead::{AdaptiveLookahead, AdaptiveLookaheadConfig};
 use crate::engine::InferenceEngine;
 use crate::sampling::SamplingParams;
 
@@ -123,6 +124,9 @@ pub struct SpeculativeDecoder<'a> {
     /// Internal PRNG for rejection sampling decisions (available for subtype use).
     #[allow(dead_code)]
     rng: Xorshift64,
+    /// Optional adaptive controller — when present, the lookahead is
+    /// updated after each step from the running acceptance EWMA.
+    adaptive: Option<AdaptiveLookahead>,
 }
 
 impl<'a> SpeculativeDecoder<'a> {
@@ -135,7 +139,40 @@ impl<'a> SpeculativeDecoder<'a> {
             total_draft_tokens: 0,
             total_accepted_tokens: 0,
             rng: Xorshift64::new(0xfeed1234_5678abcd),
+            adaptive: None,
         }
+    }
+
+    /// Create a speculative decoder with an [`AdaptiveLookahead`] controller
+    /// active. The initial lookahead is taken from `adaptive_config.initial`
+    /// and overrides `config.lookahead` for the first step.
+    pub fn with_adaptive(
+        draft_engine: InferenceEngine<'a>,
+        config: SpeculativeConfig,
+        adaptive_config: AdaptiveLookaheadConfig,
+    ) -> Result<Self, crate::adaptive_lookahead::AdaptiveLookaheadError> {
+        let adaptive = AdaptiveLookahead::try_new(adaptive_config)?;
+        let mut config = config;
+        config.lookahead = adaptive.lookahead();
+        Ok(Self {
+            draft_engine,
+            config,
+            total_steps: 0,
+            total_draft_tokens: 0,
+            total_accepted_tokens: 0,
+            rng: Xorshift64::new(0xfeed1234_5678abcd),
+            adaptive: Some(adaptive),
+        })
+    }
+
+    /// Read the current adaptive controller, if any.
+    pub fn adaptive(&self) -> Option<&AdaptiveLookahead> {
+        self.adaptive.as_ref()
+    }
+
+    /// Mutable access to the adaptive controller, if any.
+    pub fn adaptive_mut(&mut self) -> Option<&mut AdaptiveLookahead> {
+        self.adaptive.as_mut()
     }
 
     /// Generate up to `config.lookahead` draft tokens from the draft model.
@@ -258,6 +295,14 @@ impl<'a> SpeculativeDecoder<'a> {
         self.total_draft_tokens += n_drafted as u64;
         self.total_accepted_tokens += n_accepted as u64;
 
+        // Feed the adaptive controller (if any) and apply its lookahead update.
+        if let Some(adaptive) = self.adaptive.as_mut() {
+            adaptive.observe_step(n_drafted, n_accepted);
+            // The controller may have changed `lookahead` — propagate it to
+            // `config.lookahead` so the next `step` drafts the new amount.
+            self.config.lookahead = adaptive.lookahead();
+        }
+
         let acceptance_rate = if n_drafted > 0 {
             n_accepted as f32 / n_drafted as f32
         } else {
@@ -374,10 +419,15 @@ impl<'a> SpeculativeDecoder<'a> {
     }
 
     /// Reset all accumulated statistics (steps, tokens, acceptance counts).
+    /// If an adaptive controller is attached, its EWMA is also reset.
     pub fn reset_stats(&mut self) {
         self.total_steps = 0;
         self.total_draft_tokens = 0;
         self.total_accepted_tokens = 0;
+        if let Some(adaptive) = self.adaptive.as_mut() {
+            adaptive.reset();
+            self.config.lookahead = adaptive.lookahead();
+        }
     }
 
     /// Determine whether a draft token should be accepted.
@@ -631,6 +681,101 @@ mod tests {
         assert!(
             speedup <= decoder.config.lookahead as f32 + 1.0,
             "speedup cannot exceed lookahead+1"
+        );
+    }
+
+    #[test]
+    fn test_with_adaptive_starts_with_initial_lookahead() {
+        let config = Qwen3Config::tiny_test();
+        let params = SamplingParams::default();
+        let engine = InferenceEngine::new(config, params, 42);
+        let spec_cfg = SpeculativeConfig {
+            lookahead: 99,
+            acceptance_threshold: 0.0,
+        };
+        let adapt_cfg = AdaptiveLookaheadConfig {
+            initial: 4,
+            min: 2,
+            max: 10,
+            alpha: 0.5,
+            cooldown_steps: 1,
+        };
+        let decoder =
+            SpeculativeDecoder::with_adaptive(engine, spec_cfg, adapt_cfg).expect("valid");
+        // Adaptive overrides the spec config's lookahead.
+        assert_eq!(decoder.config.lookahead, 4);
+        assert!(decoder.adaptive().is_some());
+    }
+
+    #[test]
+    fn test_adaptive_decreases_lookahead_on_low_acceptance() {
+        let config = Qwen3Config::tiny_test();
+        let params = SamplingParams::default();
+        let engine = InferenceEngine::new(config, params, 42);
+        let spec_cfg = SpeculativeConfig {
+            lookahead: 8,
+            acceptance_threshold: 0.0,
+        };
+        let adapt_cfg = AdaptiveLookaheadConfig {
+            initial: 8,
+            min: 2,
+            max: 12,
+            alpha: 0.7,
+            cooldown_steps: 1,
+        };
+        let mut decoder =
+            SpeculativeDecoder::with_adaptive(engine, spec_cfg, adapt_cfg).expect("valid");
+        let context = vec![1u32, 2, 3];
+        let params = SamplingParams::default();
+        // Provide logits with no peaked target — most rejections.
+        let vocab = 100usize;
+        let logits: Vec<Vec<f32>> = (0..decoder.config.lookahead)
+            .map(|_| {
+                let mut l = vec![10.0f32; vocab];
+                l[0] = -50.0; // bias away from typical draft tokens
+                l
+            })
+            .collect();
+        for _ in 0..30 {
+            decoder.step(&context, &logits, &params);
+        }
+        // With low acceptance, lookahead should have fallen toward the min.
+        let final_la = decoder.config.lookahead;
+        assert!(
+            final_la <= 8,
+            "lookahead should not increase, got {final_la}"
+        );
+    }
+
+    #[test]
+    fn test_reset_stats_resets_adaptive() {
+        let config = Qwen3Config::tiny_test();
+        let params = SamplingParams::default();
+        let engine = InferenceEngine::new(config, params, 42);
+        let spec_cfg = SpeculativeConfig {
+            lookahead: 5,
+            acceptance_threshold: 0.0,
+        };
+        let adapt_cfg = AdaptiveLookaheadConfig {
+            initial: 5,
+            min: 2,
+            max: 12,
+            alpha: 0.5,
+            cooldown_steps: 1,
+        };
+        let mut decoder =
+            SpeculativeDecoder::with_adaptive(engine, spec_cfg, adapt_cfg).expect("valid");
+        // Drive the adaptive controller into a different state.
+        for _ in 0..30 {
+            let logits = make_peaked_logits(64, 5, decoder.config.lookahead);
+            decoder.step(&[1, 2, 3], &logits, &SamplingParams::default());
+        }
+        decoder.reset_stats();
+        assert_eq!(decoder.total_steps, 0);
+        assert_eq!(decoder.config.lookahead, 5);
+        assert_eq!(
+            decoder.adaptive().expect("adaptive present").observations(),
+            0
         );
     }
 }
