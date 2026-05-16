@@ -329,7 +329,8 @@ mod tests {
 
         // CPU reference path.
         let mut cpu_out = vec![0.0f32; n_rows];
-        crate::gemv_fp8::gemv_fp8_e4m3(&blocks_storage, &input, &mut cpu_out, n_rows, k);
+        crate::gemv_fp8::gemv_fp8_e4m3(&blocks_storage, &input, &mut cpu_out, n_rows, k)
+            .expect("CPU FP8 E4M3 GEMV reference should succeed");
 
         // GPU path.
         let block_bytes: &[u8] = unsafe {
@@ -391,7 +392,8 @@ mod tests {
         let input: Vec<f32> = (0..k).map(|i| (i as f32).sin()).collect();
 
         let mut cpu_out = vec![0.0f32; n_rows];
-        crate::gemv_fp8::gemv_fp8_e5m2(&blocks_storage, &input, &mut cpu_out, n_rows, k);
+        crate::gemv_fp8::gemv_fp8_e5m2(&blocks_storage, &input, &mut cpu_out, n_rows, k)
+            .expect("CPU FP8 E5M2 GEMV reference should succeed");
 
         let block_bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(

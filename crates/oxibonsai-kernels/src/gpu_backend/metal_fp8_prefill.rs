@@ -699,7 +699,8 @@ mod tests {
                 &mut row_out,
                 n_rows,
                 k,
-            );
+            )
+            .expect("CPU FP8 E4M3 GEMV reference should succeed");
             let _ = blocks_per_row;
             for row in 0..n_rows {
                 let idx = col * n_rows + row;
@@ -730,7 +731,8 @@ mod tests {
                 &mut row_out,
                 n_rows,
                 k,
-            );
+            )
+            .expect("CPU FP8 E5M2 GEMV reference should succeed");
             for row in 0..n_rows {
                 let idx = col * n_rows + row;
                 if accumulate {
@@ -952,14 +954,16 @@ mod tests {
                 &mut gate_out,
                 n_ffn_rows,
                 k,
-            );
+            )
+            .expect("CPU FP8 E4M3 gate GEMV reference should succeed");
             crate::gemv_fp8::gemv_fp8_e4m3(
                 up_blocks,
                 &inputs[in_off..in_off + k],
                 &mut up_out,
                 n_ffn_rows,
                 k,
-            );
+            )
+            .expect("CPU FP8 E4M3 up GEMV reference should succeed");
             for row in 0..n_ffn_rows {
                 let g = gate_out[row];
                 let u = up_out[row];
@@ -1013,14 +1017,16 @@ mod tests {
                 &mut gate_out,
                 n_ffn_rows,
                 k,
-            );
+            )
+            .expect("CPU FP8 E5M2 gate GEMV reference should succeed");
             crate::gemv_fp8::gemv_fp8_e5m2(
                 up_blocks,
                 &inputs[in_off..in_off + k],
                 &mut up_out,
                 n_ffn_rows,
                 k,
-            );
+            )
+            .expect("CPU FP8 E5M2 up GEMV reference should succeed");
             for row in 0..n_ffn_rows {
                 let g = gate_out[row];
                 let u = up_out[row];
