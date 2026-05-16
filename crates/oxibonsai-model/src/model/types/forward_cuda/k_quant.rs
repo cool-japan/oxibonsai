@@ -1,11 +1,11 @@
 //! K-quant (Q2K / Q3K / Q4K / Q5K / Q6K / Q8K) CUDA batch-prefill helpers and
 //! entry points (Phase 25).
 
+use super::super::{BonsaiModel, OutputWeight};
 use super::byte_helpers::{
     blocks_q2k_as_bytes, blocks_q3k_as_bytes, blocks_q4k_as_bytes, blocks_q5k_as_bytes,
     blocks_q6k_as_bytes, blocks_q8k_as_bytes,
 };
-use super::super::{BonsaiModel, OutputWeight};
 
 impl<'a> BonsaiModel<'a> {
     // ── Phase 25: K-quant batch GEMM prefill ─────────────────────────────────

@@ -15,9 +15,7 @@ use crate::gpu_backend::cuda_full_layer::{
 };
 use crate::gpu_backend::cuda_graph::{CudaGraph, CudaGraphError};
 
-use super::launchers::{
-    launch_batched_rmsnorm, launch_fused_gate_up_swiglu_gemm, launch_gemm_v7,
-};
+use super::launchers::{launch_batched_rmsnorm, launch_fused_gate_up_swiglu_gemm, launch_gemm_v7};
 use super::state::{CudaPrefillBuffers, CudaPrefillModules};
 
 // =============================================================================

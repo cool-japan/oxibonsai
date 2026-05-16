@@ -1,7 +1,7 @@
 //! Q4_0 / Q8_0 standard-quant CUDA batch-prefill helpers and entry points.
 
-use super::byte_helpers::{blocks_q4_0_as_bytes, blocks_q8_0_as_bytes};
 use super::super::{BonsaiModel, OutputWeight};
+use super::byte_helpers::{blocks_q4_0_as_bytes, blocks_q8_0_as_bytes};
 
 impl<'a> BonsaiModel<'a> {
     /// Convert a Q4_0 block slice to raw bytes (zero-copy, file-level fn below).

@@ -303,8 +303,7 @@ pub(super) fn acquire_k_quant_kv_cache(
     Ok(guard)
 }
 
-pub(super) type KQuantLogitsGuard =
-    std::sync::MutexGuard<'static, Option<(CudaSlice<f32>, usize)>>;
+pub(super) type KQuantLogitsGuard = std::sync::MutexGuard<'static, Option<(CudaSlice<f32>, usize)>>;
 
 /// Acquire or (re-)allocate the LM-head logits buffer.
 pub(super) fn acquire_k_quant_logits(

@@ -62,31 +62,23 @@ impl MetalFp8State {
 
         let lib_e4m3 = device
             .new_library_with_source(MSL_GEMV_FP8_E4M3_V1, &options)
-            .map_err(|e| {
-                MetalGraphError::CompilationFailed(format!("FP8 E4M3 library: {e}"))
-            })?;
-        let func_e4m3 = lib_e4m3.get_function("gemv_fp8_e4m3", None).map_err(|e| {
-            MetalGraphError::CompilationFailed(format!("FP8 E4M3 function: {e}"))
-        })?;
+            .map_err(|e| MetalGraphError::CompilationFailed(format!("FP8 E4M3 library: {e}")))?;
+        let func_e4m3 = lib_e4m3
+            .get_function("gemv_fp8_e4m3", None)
+            .map_err(|e| MetalGraphError::CompilationFailed(format!("FP8 E4M3 function: {e}")))?;
         let pipeline_e4m3 = device
             .new_compute_pipeline_state_with_function(&func_e4m3)
-            .map_err(|e| {
-                MetalGraphError::CompilationFailed(format!("FP8 E4M3 pipeline: {e}"))
-            })?;
+            .map_err(|e| MetalGraphError::CompilationFailed(format!("FP8 E4M3 pipeline: {e}")))?;
 
         let lib_e5m2 = device
             .new_library_with_source(MSL_GEMV_FP8_E5M2_V1, &options)
-            .map_err(|e| {
-                MetalGraphError::CompilationFailed(format!("FP8 E5M2 library: {e}"))
-            })?;
-        let func_e5m2 = lib_e5m2.get_function("gemv_fp8_e5m2", None).map_err(|e| {
-            MetalGraphError::CompilationFailed(format!("FP8 E5M2 function: {e}"))
-        })?;
+            .map_err(|e| MetalGraphError::CompilationFailed(format!("FP8 E5M2 library: {e}")))?;
+        let func_e5m2 = lib_e5m2
+            .get_function("gemv_fp8_e5m2", None)
+            .map_err(|e| MetalGraphError::CompilationFailed(format!("FP8 E5M2 function: {e}")))?;
         let pipeline_e5m2 = device
             .new_compute_pipeline_state_with_function(&func_e5m2)
-            .map_err(|e| {
-                MetalGraphError::CompilationFailed(format!("FP8 E5M2 pipeline: {e}"))
-            })?;
+            .map_err(|e| MetalGraphError::CompilationFailed(format!("FP8 E5M2 pipeline: {e}")))?;
 
         Ok(Self {
             device,
@@ -224,11 +216,7 @@ fn dispatch_metal_fp8_gemv(
     );
     // Zero-initialise output (some Metal drivers leave new buffers uninitialised).
     unsafe {
-        std::ptr::write_bytes(
-            output_buf.contents() as *mut f32,
-            0u8,
-            n_rows,
-        );
+        std::ptr::write_bytes(output_buf.contents() as *mut f32, 0u8, n_rows);
     }
 
     let n_rows_u32 = u32::try_from(n_rows).map_err(|_| {
@@ -385,7 +373,9 @@ mod tests {
                 let scale_bits = ((row as u16 * 11) ^ (b as u16 * 5)) | 0x3800;
                 let mut qs = [0u8; 32];
                 for (i, q) in qs.iter_mut().enumerate() {
-                    *q = ((row * 5 + b * 3 + i) as u8).wrapping_mul(7).wrapping_add(3);
+                    *q = ((row * 5 + b * 3 + i) as u8)
+                        .wrapping_mul(7)
+                        .wrapping_add(3);
                     // Avoid inf/NaN exponent (exp = 31): force bit 6 of exponent low when all set
                     if (*q & 0x7C) == 0x7C {
                         *q ^= 0x04;

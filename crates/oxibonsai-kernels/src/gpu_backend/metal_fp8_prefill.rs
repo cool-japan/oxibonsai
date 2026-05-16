@@ -132,7 +132,9 @@ fn compile_pipeline(
     })?;
     device
         .new_compute_pipeline_state_with_function(&func)
-        .map_err(|e| MetalGraphError::CompilationFailed(format!("FP8 prefill pipeline `{entry}`: {e}")))
+        .map_err(|e| {
+            MetalGraphError::CompilationFailed(format!("FP8 prefill pipeline `{entry}`: {e}"))
+        })
 }
 
 /// Lazy process-wide singleton (separate from the Phase 27 GEMV singleton).
@@ -203,7 +205,16 @@ pub fn metal_gemm_fp8_e4m3(
     k: usize,
     batch_size: usize,
 ) -> Result<(), MetalGraphError> {
-    dispatch_gemm(blocks, inputs, outputs, n_rows, k, batch_size, None, Fp8Variant::E4M3)
+    dispatch_gemm(
+        blocks,
+        inputs,
+        outputs,
+        n_rows,
+        k,
+        batch_size,
+        None,
+        Fp8Variant::E4M3,
+    )
 }
 
 /// Batch FP8 E5M2 GEMM. See [`metal_gemm_fp8_e4m3`].
@@ -215,7 +226,16 @@ pub fn metal_gemm_fp8_e5m2(
     k: usize,
     batch_size: usize,
 ) -> Result<(), MetalGraphError> {
-    dispatch_gemm(blocks, inputs, outputs, n_rows, k, batch_size, None, Fp8Variant::E5M2)
+    dispatch_gemm(
+        blocks,
+        inputs,
+        outputs,
+        n_rows,
+        k,
+        batch_size,
+        None,
+        Fp8Variant::E5M2,
+    )
 }
 
 /// Batch FP8 E4M3 GEMM with fused residual add.
@@ -593,7 +613,11 @@ mod tests {
     // Each test calls `state()` first and returns silently on hosts without a
     // Metal device. On Apple Silicon CI this exercises the real GPU dispatch.
 
-    fn make_fp8_e4m3_blocks(n_rows: usize, k: usize, seed: u64) -> Vec<oxibonsai_core::BlockFP8E4M3> {
+    fn make_fp8_e4m3_blocks(
+        n_rows: usize,
+        k: usize,
+        seed: u64,
+    ) -> Vec<oxibonsai_core::BlockFP8E4M3> {
         let blocks_per_row = k / oxibonsai_core::QK_FP8;
         let mut blocks = Vec::with_capacity(n_rows * blocks_per_row);
         for row in 0..n_rows {
@@ -622,7 +646,11 @@ mod tests {
         blocks
     }
 
-    fn make_fp8_e5m2_blocks(n_rows: usize, k: usize, seed: u64) -> Vec<oxibonsai_core::BlockFP8E5M2> {
+    fn make_fp8_e5m2_blocks(
+        n_rows: usize,
+        k: usize,
+        seed: u64,
+    ) -> Vec<oxibonsai_core::BlockFP8E5M2> {
         let blocks_per_row = k / oxibonsai_core::QK_FP8;
         let mut blocks = Vec::with_capacity(n_rows * blocks_per_row);
         for row in 0..n_rows {
@@ -735,8 +763,9 @@ mod tests {
         let k = 128usize;
         let batch_size = 4usize;
         let blocks = make_fp8_e4m3_blocks(n_rows, k, 1234);
-        let inputs: Vec<f32> =
-            (0..batch_size * k).map(|i| (i as f32 * 0.013).sin() * 0.5).collect();
+        let inputs: Vec<f32> = (0..batch_size * k)
+            .map(|i| (i as f32 * 0.013).sin() * 0.5)
+            .collect();
 
         let mut cpu_out = vec![0.0f32; batch_size * n_rows];
         cpu_batch_gemm_e4m3(&blocks, &inputs, &mut cpu_out, n_rows, k, batch_size, true);
@@ -792,8 +821,9 @@ mod tests {
         let k = 96usize;
         let batch_size = 3usize;
         let blocks = make_fp8_e4m3_blocks(n_rows, k, 42);
-        let inputs: Vec<f32> =
-            (0..batch_size * k).map(|i| ((i as f32 * 0.011) % 1.0) - 0.5).collect();
+        let inputs: Vec<f32> = (0..batch_size * k)
+            .map(|i| ((i as f32 * 0.011) % 1.0) - 0.5)
+            .collect();
         let residual: Vec<f32> = (0..batch_size * n_rows)
             .map(|i| (i as f32 * 0.05).sin() * 0.25)
             .collect();
@@ -833,8 +863,9 @@ mod tests {
         let k = 96usize;
         let batch_size = 5usize;
         let blocks = make_fp8_e5m2_blocks(n_rows, k, 2024);
-        let inputs: Vec<f32> =
-            (0..batch_size * k).map(|i| ((i as f32 * 0.019).cos()) * 0.3).collect();
+        let inputs: Vec<f32> = (0..batch_size * k)
+            .map(|i| ((i as f32 * 0.019).cos()) * 0.3)
+            .collect();
 
         let mut cpu_out = vec![0.0f32; batch_size * n_rows];
         cpu_batch_gemm_e5m2(&blocks, &inputs, &mut cpu_out, n_rows, k, batch_size, true);
@@ -860,8 +891,9 @@ mod tests {
         let k = 64usize;
         let batch_size = 7usize;
         let blocks = make_fp8_e5m2_blocks(n_rows, k, 7);
-        let inputs: Vec<f32> =
-            (0..batch_size * k).map(|i| (i as f32 * 0.007).tan().clamp(-1.0, 1.0)).collect();
+        let inputs: Vec<f32> = (0..batch_size * k)
+            .map(|i| (i as f32 * 0.007).tan().clamp(-1.0, 1.0))
+            .collect();
         let residual: Vec<f32> = (0..batch_size * n_rows)
             .map(|i| (i as f32 * 0.03).cos() * 0.1)
             .collect();
@@ -943,8 +975,15 @@ mod tests {
             )
         };
         let mut gpu_out = vec![0.0f32; batch_size * n_ffn_rows];
-        metal_fused_gate_up_swiglu_fp8_e4m3(bytes, &inputs, &mut gpu_out, n_ffn_rows, k, batch_size)
-            .expect("metal FP8 E4M3 fused gate+up should succeed");
+        metal_fused_gate_up_swiglu_fp8_e4m3(
+            bytes,
+            &inputs,
+            &mut gpu_out,
+            n_ffn_rows,
+            k,
+            batch_size,
+        )
+        .expect("metal FP8 E4M3 fused gate+up should succeed");
         assert_close(&cpu_out, &gpu_out, 5e-3, "fused_gate_up_swiglu_fp8_e4m3");
     }
 
@@ -997,8 +1036,15 @@ mod tests {
             )
         };
         let mut gpu_out = vec![0.0f32; batch_size * n_ffn_rows];
-        metal_fused_gate_up_swiglu_fp8_e5m2(bytes, &inputs, &mut gpu_out, n_ffn_rows, k, batch_size)
-            .expect("metal FP8 E5M2 fused gate+up should succeed");
+        metal_fused_gate_up_swiglu_fp8_e5m2(
+            bytes,
+            &inputs,
+            &mut gpu_out,
+            n_ffn_rows,
+            k,
+            batch_size,
+        )
+        .expect("metal FP8 E5M2 fused gate+up should succeed");
         assert_close(&cpu_out, &gpu_out, 5e-2, "fused_gate_up_swiglu_fp8_e5m2");
     }
 
@@ -1008,10 +1054,22 @@ mod tests {
         let blocks = vec![0u8; 34];
         let inputs = vec![0.0f32; 33];
         let mut outputs = vec![0.0f32; 1];
-        let err = dispatch_gemm(&blocks, &inputs, &mut outputs, 1, 33, 1, None, Fp8Variant::E4M3);
+        let err = dispatch_gemm(
+            &blocks,
+            &inputs,
+            &mut outputs,
+            1,
+            33,
+            1,
+            None,
+            Fp8Variant::E4M3,
+        );
         match err {
             Err(MetalGraphError::EncodingFailed(msg)) => {
-                assert!(msg.contains("must be a non-zero multiple of 32"), "msg = {msg}");
+                assert!(
+                    msg.contains("must be a non-zero multiple of 32"),
+                    "msg = {msg}"
+                );
             }
             other => panic!("expected EncodingFailed, got {other:?}"),
         }
