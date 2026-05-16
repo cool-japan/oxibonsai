@@ -1,6 +1,6 @@
 # oxibonsai-eval
 
-[![Version](https://img.shields.io/badge/version-0.1.3-blue.svg)](https://crates.io/crates/oxibonsai-eval)
+[![Version](https://img.shields.io/badge/version-0.1.4-blue.svg)](https://crates.io/crates/oxibonsai-eval)
 [![Status](https://img.shields.io/badge/status-stable-brightgreen.svg)]()
 [![Tests](https://img.shields.io/badge/tests-151%20passing-brightgreen.svg)]()
 
@@ -14,7 +14,7 @@ Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 
 ## Status
 
-**Stable** (v0.1.3) — 151 tests passing.
+**Stable** (v0.1.4) — 151 tests passing.
 
 ## Features
 
@@ -35,7 +35,7 @@ Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 
 ```toml
 [dependencies]
-oxibonsai-eval = "0.1.3"
+oxibonsai-eval = "0.1.4"
 ```
 
 ```rust

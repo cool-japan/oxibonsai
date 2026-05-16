@@ -1,7 +1,7 @@
 # oxibonsai-kernels TODO
 
 > 1-bit + ternary quantized compute kernels with SIMD dispatch, parallelism, and GPU backends
-> Version 0.1.3 — 291 tests passing
+> Version 0.1.4 — 291 tests passing
 > Last updated: 2026-05-03
 
 ## Status: Stable (mature, complete)

@@ -159,7 +159,7 @@ This installs the `oxibonsai` binary. Rust 1.86+ required.
 
 ```toml
 [dependencies]
-oxibonsai = "0.1.3"
+oxibonsai = "0.1.4"
 ```
 
 ### Build from source (for development)
