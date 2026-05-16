@@ -2,7 +2,7 @@
 
 [![Version](https://img.shields.io/badge/version-0.1.4-blue.svg)](https://crates.io/crates/oxibonsai-eval)
 [![Status](https://img.shields.io/badge/status-stable-brightgreen.svg)]()
-[![Tests](https://img.shields.io/badge/tests-151%20passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-513%20passing-brightgreen.svg)]()
 
 Model evaluation harness for OxiBonsai — ROUGE, perplexity, accuracy, throughput.
 
@@ -14,7 +14,7 @@ Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 
 ## Status
 
-**Stable** (v0.1.4) — 151 tests passing.
+**Stable** (v0.1.4) — 513 tests passing.
 
 ## Features
 

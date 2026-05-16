@@ -1,7 +1,7 @@
 # OxiBonsai TODO
 
 > Pure Rust 1-bit LLM inference engine for PrismML Bonsai models
-> 430+ source files, ~160,000+ lines of Rust code, 4,630+ tests passing across workspace — verified 2026-05-05 (0.1.4 + Phase 19)
+> 430+ source files, ~156,000+ lines of Rust code, 4,553 tests passing across workspace — verified 2026-05-16 (0.1.4 + Phase 33)
 
 ## Phase Status
 

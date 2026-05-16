@@ -11,7 +11,7 @@ cache-blocked GEMM, parallel Rayon dispatch, and production GPU backends
 
 Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 
-**Status:** Stable (mature, complete) — 291 tests passing.
+**Status:** Stable (mature, complete) — 675 tests passing.
 
 ## Features
 

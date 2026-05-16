@@ -1,8 +1,8 @@
 # oxibonsai-core TODO
 
 > GGUF loader, quant block types, tensor types, model config, error types
-> 16 files, ~5,215 lines, 243 tests
-> Version: 0.1.4 — Last updated: 2026-05-03
+> 16 files, ~5,215 lines, 207 tests
+> Version: 0.1.4 — Last updated: 2026-05-16
 
 ## Status: ✅ All Features Complete
 

@@ -10,19 +10,19 @@ OxiBonsai is a zero-FFI, zero-C/C++ inference engine for PrismML's sub-2-bit Bon
 
 ## Status
 
-**Version 0.1.4** — released 2026-05-03 · **3,650+ tests passing** · ~152k lines of Rust · Pure Rust
+**Version 0.1.4** — released 2026-05-16 · **4,553 tests passing** · ~156k lines of Rust · Pure Rust
 
 | Crate | Status | Tests |
 |-------|--------|-------|
-| oxibonsai-core     | Stable | 243   |
-| oxibonsai-kernels  | Stable | 291   |
-| oxibonsai-model    | Stable | 1,048 |
-| oxibonsai-runtime  | Stable | 1,094 |
-| oxibonsai-tokenizer| Stable | 268   |
-| oxibonsai-rag      | Stable | 206   |
-| oxibonsai-eval     | Stable | 151   |
-| oxibonsai-serve    | Stable | 161   |
-| oxibonsai (facade) | Stable | —     |
+| oxibonsai-core     | Stable | 207   |
+| oxibonsai-kernels  | Stable | 675   |
+| oxibonsai-model    | Stable | 673   |
+| oxibonsai-runtime  | Stable | 796   |
+| oxibonsai-tokenizer| Stable | 206   |
+| oxibonsai-rag      | Stable | 871   |
+| oxibonsai-eval     | Stable | 513   |
+| oxibonsai-serve    | Stable | 260   |
+| oxibonsai (facade) | Stable | 352   |
 
 ## Features
 
