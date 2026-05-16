@@ -39,6 +39,22 @@ impl<'a> BonsaiModel<'a> {
             OutputWeight::OneBit(ref linear) => linear,
             OutputWeight::Fp32 { .. } => return Err("FP32 LM head not supported".into()),
             OutputWeight::Ternary(_) => unreachable!("handled above"),
+            OutputWeight::FP8E4M3(_) | OutputWeight::FP8E5M2(_) => {
+                return Err("FP8 LM head not supported on Metal GPU cache path".into());
+            }
+            OutputWeight::Q4_0(_)
+            | OutputWeight::Q8_0(_)
+            | OutputWeight::Q5K(_)
+            | OutputWeight::Q6K(_)
+            | OutputWeight::Q2K(_)
+            | OutputWeight::Q3K(_)
+            | OutputWeight::Q4K(_)
+            | OutputWeight::Q8K(_) => {
+                return Err(
+                    "K-quant / Q-type LM head not yet supported on Metal GPU cache path; use CPU path"
+                        .into(),
+                );
+            }
         };
         let mut qkv_concats: Vec<Vec<u8>> = Vec::with_capacity(n_layers);
         for block in &self.blocks {
