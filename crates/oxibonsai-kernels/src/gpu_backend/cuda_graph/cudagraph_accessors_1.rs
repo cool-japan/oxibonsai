@@ -45,4 +45,24 @@ impl CudaGraph {
         cache.insert(key, Arc::clone(&arc));
         Ok(arc)
     }
+
+    /// Evict a previously-uploaded `f32` weight from the cache.
+    ///
+    /// Dropping the cached [`Arc`] frees the device buffer once no other handle
+    /// is outstanding. Intended for callers whose host weight buffers are
+    /// **transient** — e.g. the dequantise-on-demand text encoder, which
+    /// allocates a fresh f32 buffer per Linear so its base pointer (the cache
+    /// `key`) is recycled across calls and is therefore unsafe as a long-lived
+    /// identity. Evicting right after the GEMM forces the next
+    /// [`get_or_upload_f32_weight`](Self::get_or_upload_f32_weight) to re-upload
+    /// fresh data instead of returning a stale buffer that merely shares a
+    /// recycled address. A `key` that is not present is a no-op.
+    pub fn evict_f32_weight(&self, key: u64) -> Result<(), CudaGraphError> {
+        let mut cache = self
+            .f32_weight_cache
+            .lock()
+            .map_err(|_| CudaGraphError::LockPoisoned)?;
+        cache.remove(&key);
+        Ok(())
+    }
 }

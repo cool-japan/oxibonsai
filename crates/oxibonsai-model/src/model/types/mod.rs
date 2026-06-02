@@ -37,7 +37,13 @@ mod gpu_cache;
 pub struct BonsaiModel<'a> {
     config: Qwen3Config,
     /// Token embedding table: [vocab_size × hidden_size] as FP32.
-    token_embd: Vec<f32>,
+    ///
+    /// Immutable, load-once data shared across engine-pool replicas via
+    /// [`Arc`](std::sync::Arc): all replicas built off one GGUF clone a single
+    /// `Arc<[f32]>` (one ~1.16 GiB allocation for the 1.7B), rather than each
+    /// re-dequantizing its own copy. `Arc<[f32]>` derefs to `[f32]`, so
+    /// indexing / `.len()` / `.iter()` / slicing all work unchanged.
+    token_embd: std::sync::Arc<[f32]>,
     /// 36 Transformer blocks.
     pub(crate) blocks: Vec<TransformerBlock<'a>>,
     /// Final output RMSNorm.
@@ -69,6 +75,37 @@ impl<'a> BonsaiModel<'a> {
     /// Extracts configuration from metadata, then maps all tensor data
     /// into the layer structures (zero-copy for 1-bit weights).
     pub fn from_gguf(gguf: &'a GgufFile<'a>, max_seq_len: usize) -> ModelResult<Self> {
+        // Single implementation lives in `from_gguf_with_embd`; here we simply
+        // dequantize the token-embedding table into an `Arc<[f32]>` and hand it
+        // off. The engine-pool builder instead loads it once and shares the
+        // `Arc` across all replicas via `from_gguf_with_embd`.
+        let token_embd: std::sync::Arc<[f32]> =
+            load_f32_tensor(gguf, tensor_names::TOKEN_EMBD)?.into();
+        Self::from_gguf_with_embd(gguf, max_seq_len, token_embd)
+    }
+
+    /// Load a model from a parsed GGUF file, reusing a pre-loaded, shared token
+    /// embedding table.
+    ///
+    /// Identical to [`from_gguf`](Self::from_gguf) in every respect (blocks,
+    /// output weight, RMSNorms, RoPE, KV cache, config) **except** that the
+    /// caller supplies the `token_embd` table instead of it being dequantized
+    /// from the GGUF. This is the seam the engine pool uses to share one
+    /// `Arc<[f32]>` across all replicas — collapsing N duplicate ~1.16 GiB
+    /// allocations (for the 1.7B) into one, and skipping the redundant
+    /// re-dequantization on replicas `2..N`.
+    ///
+    /// The passed `token_embd` MUST be the dequantized
+    /// [`token_embd.weight`](tensor_names::TOKEN_EMBD) tensor for this exact
+    /// GGUF (`vocab_size × hidden_size` FP32, row-major); passing any other
+    /// data would change the model output. The vocab-size reconciliation below
+    /// still reads the GGUF tensor shape (not the slice) so the resolved
+    /// `config.vocab_size` is identical to `from_gguf`.
+    pub fn from_gguf_with_embd(
+        gguf: &'a GgufFile<'a>,
+        max_seq_len: usize,
+        token_embd: std::sync::Arc<[f32]>,
+    ) -> ModelResult<Self> {
         let mut config = Qwen3Config::from_metadata(&gguf.metadata)?;
         if let Some(embd_info) = gguf.tensors.get(tensor_names::TOKEN_EMBD) {
             if embd_info.shape.len() >= 2 {
@@ -99,7 +136,6 @@ impl<'a> BonsaiModel<'a> {
             vocab = config.vocab_size,
             "loading BonsaiModel from GGUF"
         );
-        let token_embd = load_f32_tensor(gguf, tensor_names::TOKEN_EMBD)?;
         let output_norm_w = load_f32_tensor(gguf, tensor_names::OUTPUT_NORM)?;
         let output_norm = RmsNorm::new(output_norm_w, config.rms_norm_eps);
         let kernel = std::sync::Arc::new(oxibonsai_kernels::KernelDispatcher::auto_detect());
@@ -152,7 +188,7 @@ impl<'a> BonsaiModel<'a> {
         );
         let rope = RopeTable::new(config.head_dim, 4096, config.rope_freq_base);
         Self {
-            token_embd: vec![0.0; config.vocab_size * h],
+            token_embd: std::sync::Arc::from(vec![0.0; config.vocab_size * h]),
             blocks: Vec::new(),
             output_norm: RmsNorm::new(vec![1.0; h], config.rms_norm_eps),
             output_weight: OutputWeight::Fp32 {
@@ -177,6 +213,18 @@ impl<'a> BonsaiModel<'a> {
     /// Get model configuration.
     pub fn config(&self) -> &Qwen3Config {
         &self.config
+    }
+
+    /// Cheaply clone a handle to the shared token-embedding table.
+    ///
+    /// Returns an [`Arc`](std::sync::Arc) pointing at the *same* immutable
+    /// `[f32]` allocation this model uses. The engine pool calls this on
+    /// replica `#1` to obtain the one shared table, then passes the clone to
+    /// [`from_gguf_with_embd`](Self::from_gguf_with_embd) when building further
+    /// replicas — so all replicas share a single allocation. This is an atomic
+    /// refcount bump, not a data copy.
+    pub fn shared_token_embd(&self) -> std::sync::Arc<[f32]> {
+        std::sync::Arc::clone(&self.token_embd)
     }
 
     /// Get mutable reference to KV cache.
@@ -1089,7 +1137,7 @@ impl BonsaiModel<'static> {
         }
 
         Self {
-            token_embd: vec![0.01; config.vocab_size * h],
+            token_embd: std::sync::Arc::from(vec![0.01; config.vocab_size * h]),
             blocks,
             output_norm: RmsNorm::new(vec![1.0; h], config.rms_norm_eps),
             output_weight: OutputWeight::Fp32 {

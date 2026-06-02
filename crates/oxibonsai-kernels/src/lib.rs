@@ -1,4 +1,7 @@
-#![cfg_attr(target_arch = "aarch64", feature(stdarch_aarch64_prefetch))]
+#![cfg_attr(
+    all(target_arch = "aarch64", nightly_aarch64_prefetch),
+    feature(stdarch_aarch64_prefetch)
+)]
 
 //! # oxibonsai-kernels
 //!
@@ -31,6 +34,43 @@
 //!
 //! All tiers implement [`OneBitKernel`] so callers are agnostic to the
 //! underlying SIMD level.
+
+/// Emit an AArch64 software-prefetch hint, degrading to a no-op off-nightly.
+///
+/// `core::arch::aarch64::_prefetch` is gated behind the `stdarch_aarch64_prefetch`
+/// nightly feature. On nightly AArch64 this expands to the real intrinsic
+/// (identical codegen); on stable — or any non-AArch64 target — it expands to a
+/// no-op that merely consumes `$ptr`. Prefetch is a pure performance hint, so
+/// dropping it never changes any computed result (correctness/parity unaffected).
+///
+/// `$ptr` must be `*const i8`; `$rw` (0 = read, 1 = write) and `$loc`
+/// (0..=3 cache locality) must be const expressions, matching the intrinsic ABI.
+///
+/// `allow(unused_macros)`: every invocation lives in `#[cfg(target_arch =
+/// "aarch64")]` code (`prefetch.rs`, `simd_neon.rs`), so on x86_64 / other
+/// targets the macro is defined-but-unused. It is kept defined on all targets
+/// (rather than cfg-gated away) to preserve its cross-platform no-op contract.
+#[allow(unused_macros)]
+macro_rules! aarch64_prefetch {
+    ($ptr:expr, $rw:expr, $loc:expr) => {{
+        // SAFETY: prefetch is always safe — invalid addresses are silently
+        // ignored on ARM. `$rw`/`$loc` are const as required by the intrinsic.
+        // The macro is invoked from both safe fns (where the `unsafe` block is
+        // required) and `unsafe fn` bodies (where it is redundant), so
+        // `unused_unsafe` is allowed to keep both call sites warning-free.
+        #[cfg(all(target_arch = "aarch64", nightly_aarch64_prefetch))]
+        #[allow(unused_unsafe)]
+        unsafe {
+            core::arch::aarch64::_prefetch($ptr, $rw, $loc);
+        }
+        #[cfg(not(all(target_arch = "aarch64", nightly_aarch64_prefetch)))]
+        {
+            let _ = $ptr;
+        }
+    }};
+}
+#[allow(unused_imports)] // re-export unused on non-aarch64 targets (see macro doc above)
+pub(crate) use aarch64_prefetch;
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[macro_use]
@@ -77,7 +117,7 @@ pub use gpu_backend::{
     try_cuda_full_layer, try_cuda_prefill, try_cuda_prefill_q_std, try_cuda_prefill_ternary,
     try_cuda_qkv, CudaCachedLayerWeights, CudaFullForwardLayerParams,
     CudaFullForwardLayerParamsTernary, CudaGraph, CudaGraphError, CudaQStdPrefillLayerParams,
-    NativeCudaBackend,
+    DitSingleBlockWeights, NativeCudaBackend,
 };
 
 #[cfg(all(

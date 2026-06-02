@@ -159,6 +159,10 @@ pub use smoothquant::{
 };
 pub use weight_tying::{TiedEmbedding, TyingError};
 
+pub use convert::mlx_image::{
+    convert_mlx_image_to_gguf, convert_mlx_image_to_gguf_with_arch, DitArch, MlxImageImportError,
+    MlxImagePackError,
+};
 pub use convert::onnx::{convert_onnx_to_gguf, DequantError as OnnxDequantError, OnnxImportError};
 pub use convert::ConvertStats;
 pub use layers::linear_kquant_ext::{LinearQ5K, LinearQ6K};

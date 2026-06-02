@@ -187,8 +187,13 @@ pub async fn create_completion(
 
     // Generate
     let output_tokens = {
-        let mut engine = state.engine_lock().await;
-        engine.generate(&prompt_tokens, max_tokens).map_err(|e| {
+        let mut lease = state.acquire_engine().await.map_err(|e| {
+            tracing::error!(error = %e, "engine pool acquire failed");
+            state.metrics().errors_total.inc();
+            state.metrics().active_requests.dec();
+            StatusCode::SERVICE_UNAVAILABLE
+        })?;
+        lease.generate(&prompt_tokens, max_tokens).map_err(|e| {
             tracing::error!(error = %e, "generation failed");
             state.metrics().errors_total.inc();
             state.metrics().active_requests.dec();

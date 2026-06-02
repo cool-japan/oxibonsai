@@ -37,9 +37,9 @@ mod cli {
     pub enum Commands {
         /// Run inference on a GGUF model.
         Run {
-            /// Path to the GGUF model file.
+            /// Path to the GGUF model file (default: env OXI_MODEL).
             #[arg(short, long)]
-            model: String,
+            model: Option<String>,
 
             /// Prompt text. Use "-" for stdin.
             #[arg(short, long)]
@@ -74,11 +74,60 @@ mod cli {
             tokenizer: Option<String>,
         },
 
+        /// Generate an image from a text prompt (Bonsai-Image: TE → DiT → VAE → PNG).
+        Image {
+            /// Text prompt. Use "-" for stdin.
+            #[arg(short, long)]
+            prompt: String,
+
+            /// Output PNG path.
+            #[arg(short, long)]
+            out: String,
+
+            /// RNG seed for the initial noise.
+            #[arg(long, default_value_t = 42)]
+            seed: u64,
+
+            /// Number of Euler sampler steps.
+            #[arg(long, default_value_t = 4)]
+            steps: usize,
+
+            /// Image width in pixels.
+            #[arg(long, default_value_t = 512)]
+            width: usize,
+
+            /// Image height in pixels.
+            #[arg(long, default_value_t = 512)]
+            height: usize,
+
+            /// Guidance scale.
+            #[arg(long, default_value_t = 1.0)]
+            guidance: f32,
+
+            /// DiT GGUF path (default: env OXI_DIT_GGUF or /tmp/parity.gguf).
+            #[arg(long)]
+            dit: Option<String>,
+
+            /// VAE weights dir (default: env OXI_VAE_WEIGHTS or /tmp/bonsai_golden/vae/weights).
+            #[arg(long)]
+            vae: Option<String>,
+
+            /// Text-encoder weights: a 4-bit model.safetensors file or an f32 .npy dir
+            /// (default: env OXI_TE_4BIT, else env OXI_TE_WEIGHTS, else /tmp/bonsai_golden/te/weights).
+            #[arg(long)]
+            te: Option<String>,
+
+            /// Tokenizer dir containing tokenizer.json
+            /// (default: env OXI_TE_TOKENIZER_DIR, else the TE dir).
+            #[arg(long)]
+            tokenizer: Option<String>,
+        },
+
         /// Interactive multi-turn conversation.
         Chat {
-            /// Path to the GGUF model file.
+            /// Path to the GGUF model file (default: env OXI_MODEL).
             #[arg(short, long)]
-            model: String,
+            model: Option<String>,
 
             /// Maximum number of tokens to generate per turn.
             #[arg(long, default_value_t = 512)]
@@ -112,9 +161,9 @@ mod cli {
         /// Start an OpenAI-compatible API server.
         #[cfg(feature = "server")]
         Serve {
-            /// Path to the GGUF model file.
+            /// Path to the GGUF model file (default: env OXI_MODEL).
             #[arg(short, long)]
-            model: String,
+            model: Option<String>,
 
             /// Host to bind to.
             #[arg(long, default_value = "127.0.0.1")]
@@ -131,13 +180,19 @@ mod cli {
             /// Path to tokenizer.json file.
             #[arg(long)]
             tokenizer: Option<String>,
+
+            /// Number of engine replicas (default: min(4, CPU cores);
+            /// auto-clamped to 1 on GPU/Metal). Replicas share one token-embedding
+            /// table, so each adds only a KV cache.
+            #[arg(long)]
+            pool_size: Option<usize>,
         },
 
         /// Display model info from a GGUF file.
         Info {
-            /// Path to the GGUF model file.
+            /// Path to the GGUF model file (default: env OXI_MODEL).
             #[arg(short, long)]
-            model: String,
+            model: Option<String>,
 
             /// Emit info as JSON instead of human-readable text.
             #[arg(long, default_value_t = false)]
@@ -429,6 +484,19 @@ mod cli {
                 max_seq_len,
                 tokenizer,
             } => {
+                let model = model
+                    .or_else(|| std::env::var("OXI_MODEL").ok().filter(|s| !s.is_empty()))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "no model: pass --model <gguf> or set OXI_MODEL (e.g. in .env)"
+                        )
+                    })?;
+                let tokenizer = tokenizer.or_else(|| {
+                    std::env::var("OXI_TOKENIZER")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                });
+
                 let prompt_text = if prompt == "-" {
                     read_prompt_stdin()
                 } else {
@@ -628,6 +696,114 @@ mod cli {
                 }
             }
 
+            Commands::Image {
+                prompt,
+                out,
+                seed,
+                steps,
+                width,
+                height,
+                guidance,
+                dit,
+                vae,
+                te,
+                tokenizer,
+            } => {
+                use oxibonsai_image::pipeline::{text_to_image, TeSource, TextToImageCfg};
+
+                let prompt_text = if prompt == "-" {
+                    read_prompt_stdin()
+                } else {
+                    prompt
+                };
+
+                // Resolve paths: explicit arg → env → default.
+                let resolve = |arg: Option<String>, env: &str, default: &str| -> String {
+                    arg.or_else(|| std::env::var(env).ok().filter(|s| !s.is_empty()))
+                        .unwrap_or_else(|| default.to_string())
+                };
+
+                let dit_path = resolve(dit, "OXI_DIT_GGUF", "/tmp/parity.gguf");
+                let vae_path = resolve(vae, "OXI_VAE_WEIGHTS", "/tmp/bonsai_golden/vae/weights");
+
+                // TE source: a `.safetensors` path → 4-bit MLX loader; otherwise a
+                // directory of f32 `.npy` dumps. Resolution order: --te → OXI_TE_4BIT
+                // → OXI_TE_WEIGHTS → default npy dir.
+                let te_path = te
+                    .or_else(|| std::env::var("OXI_TE_4BIT").ok().filter(|s| !s.is_empty()))
+                    .or_else(|| {
+                        std::env::var("OXI_TE_WEIGHTS")
+                            .ok()
+                            .filter(|s| !s.is_empty())
+                    })
+                    .unwrap_or_else(|| "/tmp/bonsai_golden/te/weights".to_string());
+                let te_source = if te_path.ends_with(".safetensors") {
+                    TeSource::Mlx4bit(PathBuf::from(&te_path))
+                } else {
+                    TeSource::NpyDir(PathBuf::from(&te_path))
+                };
+
+                // Tokenizer dir: --tokenizer → OXI_TE_TOKENIZER_DIR → the TE dir
+                // (its parent if the TE is a safetensors file).
+                let tokenizer_dir = tokenizer
+                    .or_else(|| {
+                        std::env::var("OXI_TE_TOKENIZER_DIR")
+                            .ok()
+                            .filter(|s| !s.is_empty())
+                    })
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| {
+                        let p = PathBuf::from(&te_path);
+                        if te_path.ends_with(".safetensors") {
+                            p.parent().map(Path::to_path_buf).unwrap_or(p)
+                        } else {
+                            p
+                        }
+                    });
+
+                let cfg = TextToImageCfg {
+                    prompt: prompt_text,
+                    seed,
+                    steps,
+                    width,
+                    height,
+                    guidance,
+                    dit_gguf: PathBuf::from(&dit_path),
+                    vae_weights_dir: PathBuf::from(&vae_path),
+                    te_source,
+                    tokenizer_dir,
+                    golden_override: None,
+                };
+
+                tracing::info!(
+                    seed,
+                    steps,
+                    width,
+                    height,
+                    dit = %dit_path,
+                    "starting text-to-image generation"
+                );
+
+                let start = std::time::Instant::now();
+                let result = text_to_image(&cfg)
+                    .map_err(|e| anyhow::anyhow!("text-to-image generation failed: {e}"))?;
+                let elapsed = start.elapsed();
+
+                std::fs::write(&out, &result.png)
+                    .map_err(|e| anyhow::anyhow!("failed to write {out}: {e}"))?;
+
+                println!(
+                    "Wrote {}x{} RGB PNG ({} bytes) to {out}",
+                    result.width,
+                    result.height,
+                    result.png.len()
+                );
+                println!(
+                    "  seed={seed} steps={steps} guidance={guidance} in {:.1}s",
+                    elapsed.as_secs_f64()
+                );
+            }
+
             Commands::Chat {
                 model,
                 max_tokens,
@@ -638,6 +814,19 @@ mod cli {
                 max_seq_len,
                 tokenizer,
             } => {
+                let model = model
+                    .or_else(|| std::env::var("OXI_MODEL").ok().filter(|s| !s.is_empty()))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "no model: pass --model <gguf> or set OXI_MODEL (e.g. in .env)"
+                        )
+                    })?;
+                let tokenizer = tokenizer.or_else(|| {
+                    std::env::var("OXI_TOKENIZER")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                });
+
                 // Memory-map the GGUF file
                 let mmap =
                     oxibonsai_core::gguf::reader::mmap_gguf_file(std::path::Path::new(&model))?;
@@ -817,22 +1006,50 @@ mod cli {
                 port,
                 max_seq_len,
                 tokenizer,
+                pool_size,
             } => {
-                tracing::info!(model = %model, host = %host, port, "starting server");
+                let model = model
+                    .or_else(|| std::env::var("OXI_MODEL").ok().filter(|s| !s.is_empty()))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "no model: pass --model <gguf> or set OXI_MODEL (e.g. in .env)"
+                        )
+                    })?;
+                let tokenizer = tokenizer.or_else(|| {
+                    std::env::var("OXI_TOKENIZER")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                });
 
-                let mmap =
-                    oxibonsai_core::gguf::reader::mmap_gguf_file(std::path::Path::new(&model))?;
-                // Leak the mmap to get 'static lifetime for the server
-                let mmap: &'static memmap2::Mmap = Box::leak(Box::new(mmap));
-                let gguf = oxibonsai_core::gguf::reader::GgufFile::parse(mmap)?;
-                let gguf: &'static oxibonsai_core::gguf::reader::GgufFile<'static> =
-                    Box::leak(Box::new(gguf));
+                // Engine-pool size precedence: --pool-size flag > env
+                // OXIBONSAI_ENGINE_POOL_SIZE > unset. When unset we pass `None`
+                // so `build_pool_from_gguf`/`resolve_pool_size` apply the CPU
+                // default of `min(4, cores)` — replicas now share one `Arc<[f32]>`
+                // token-embedding table, so the extra per-replica cost is just a
+                // KV cache. GPU/Metal is always clamped back to 1 by the resolver.
+                let requested_pool_size: Option<usize> = pool_size.or_else(|| {
+                    std::env::var("OXIBONSAI_ENGINE_POOL_SIZE")
+                        .ok()
+                        .and_then(|s| s.parse::<usize>().ok())
+                });
+
+                tracing::info!(model = %model, host = %host, port, "starting server");
 
                 let params = oxibonsai_runtime::sampling::SamplingParams::default();
                 let metrics = Arc::new(oxibonsai_runtime::InferenceMetrics::new());
-                let mut engine =
-                    oxibonsai_runtime::InferenceEngine::from_gguf(gguf, params, 42, max_seq_len)?;
-                engine.set_metrics(Arc::clone(&metrics));
+
+                // Build a pool of engine replicas sharing one leaked `'static`
+                // GGUF (replica #1 mmaps + leaks; the rest reuse it zero-copy).
+                let (pool, _tier, _size) = oxibonsai_runtime::engine_pool::build_pool_from_gguf(
+                    &model,
+                    params,
+                    42,
+                    max_seq_len,
+                    requested_pool_size,
+                )?;
+                // Wire the shared metrics onto every replica, preserving the
+                // per-engine telemetry the single-engine path recorded.
+                pool.set_metrics_all(&metrics)?;
 
                 let tok = {
                     let lookup = resolve_tokenizer(tokenizer.as_deref(), &model);
@@ -845,8 +1062,7 @@ mod cli {
                     }
                 };
 
-                let router =
-                    oxibonsai_runtime::server::create_router_with_metrics(engine, tok, metrics);
+                let router = oxibonsai_runtime::server::create_router_with_pool(pool, tok, metrics);
                 let addr = format!("{host}:{port}");
                 let listener = tokio::net::TcpListener::bind(&addr).await?;
                 tracing::info!("listening on {addr}");
@@ -854,6 +1070,14 @@ mod cli {
             }
 
             Commands::Info { model, json } => {
+                let model = model
+                    .or_else(|| std::env::var("OXI_MODEL").ok().filter(|s| !s.is_empty()))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "no model: pass --model <gguf> or set OXI_MODEL (e.g. in .env)"
+                        )
+                    })?;
+
                 let mmap =
                     oxibonsai_core::gguf::reader::mmap_gguf_file(std::path::Path::new(&model))?;
                 let gguf = oxibonsai_core::gguf::reader::GgufFile::parse(&mmap)?;
@@ -1351,6 +1575,16 @@ mod cli {
 /// Native (non-WASM) entry point.
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> anyhow::Result<()> {
+    // Auto-load `.env` (cwd or any parent dir) as the very first thing, before
+    // the tokio runtime, tracing, or any `std::env::var` read. `dotenvy::dotenv`
+    // does NOT override already-set real env vars, so precedence stays
+    // explicit --flag > shell env > .env file > built-in default. A missing
+    // `.env` is a silent no-op via `.ok()`, so behavior is unchanged without one.
+    match dotenvy::dotenv() {
+        Ok(path) => tracing::debug!(path = %path.display(), "loaded .env"),
+        Err(_) => { /* no .env found (or unreadable): silently continue */ }
+    }
+
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

@@ -1,7 +1,46 @@
 # OxiBonsai TODO
 
 > Pure Rust 1-bit LLM inference engine for PrismML Bonsai models
-> 430+ source files, ~156,000+ lines of Rust code, 4,553 tests passing across workspace — verified 2026-05-16 (0.1.4 + Phase 33)
+> 619 source files, ~177,000 lines of Rust code, 4,680 tests passing across workspace — verified 2026-06-02 (0.1.5)
+
+## Bonsai-Image Port (FLUX.2 Text-to-Image, Pure Rust) — COMPLETE
+
+> **Status: ✅ DONE (shipped in 0.1.5)** — full pure-Rust text→image pipeline works end-to-end and is GPU-accelerated (CUDA steps=4 ≈31.7s on A4000-class, Metal ≈52–62s on Apple Silicon M3, cos≥0.999 throughout). Runs natively via `pipeline::text_to_image` and the `oxibonsai image` CLI subcommand.
+
+**Overview** — Bonsai-Image 4B is PrismML's text-to-image diffusion model (same team as Bonsai LLM). It is based on Black Forest Labs' FLUX.2 Klein 4B (rectified-flow DiT). The DiT's matmul-heavy layers are quantized to ternary g128 `{-1,0,+1}` (128-weight groups with bf16 scale per group), which maps exactly to OxiBonsai's native `BlockTQ2_0_g128` format. The text encoder is Qwen3-4B (already supported by OxiBonsai — reused). The VAE is `AutoencoderKLFlux2` (convolution-based; the largest new subsystem).
+
+### Confirmed Architecture (config.json)
+
+- **DiT (`Flux2Transformer2DModel`)** — hidden 3072 = 24 heads × 128 head_dim; 5 double-stream + 20 single-stream blocks; `mlp_ratio` 3.0 (intermediate 9216); `in_channels` 128 (latent 32ch × 2×2 patch); `joint_attention_dim` 7680 (= 3×2560); `axes_dims_rope` [32,32,32,32] (4-axis RoPE = 128 total; differs from FLUX.1's 3-axis); `rope_theta` 2000; `guidance_embeds` false (no CFG → one forward per step); `timestep_guidance_channels` 256; `eps` 1e-6.
+- **VAE (`AutoencoderKLFlux2`)** — `latent_channels` 32; in/out 3/3; `block_out_channels` [128,256,512,512]; 4× UpDecoderBlock2D; `layers_per_block` 2; `norm_num_groups` 32 (GroupNorm); `mid_block_add_attention` true; `patch_size` [2,2]; `act_fn` silu; `force_upcast` true (fp32 execution); spatial downsampling ×8 + patch ×2 = ×16 (512px → 32×32 = 1024 tokens).
+- **Scheduler (`FlowMatchEulerDiscreteScheduler`)** — `num_train_timesteps` 1000; `shift` 3.0; `use_dynamic_shifting` true (resolution-dependent); `base_shift`/`max_shift` 0.5/1.15; `base/max_image_seq_len` 256/4096; `time_shift_type` exponential. Default inference: 4 denoising steps, guidance 1.0.
+- **Text encoder** — standard Qwen3-4B (hidden 2560, 36 layers, 32 heads, 8 kv_heads GQA, head_dim 128, intermediate 9728, rope_theta 1e6). Existing Qwen3 implementation reused as a hidden-state extractor.
+
+### Source Format
+
+- Conversion source: `prism-ml/bonsai-image-ternary-4B-mlx-2bit` (all safetensors). PyTorch `.pt` (pickle) rejected per COOLJAPAN Pure Rust policy. Safetensors supported via existing dependency (Pure Rust).
+- Quantization metadata (`quantization_config.json`): `format = "mlx-packed-affine"`, `bits 2`, `group_size 128`, `scale_dtype = "bfloat16"` (bf16, not FP16 — important for the converter).
+- Skip patterns (kept bf16, < 5% params): `proj_out, x_embedder, context_embedder, time_text_embed, time_guidance_embed, norm_out, double_stream_modulation_{img,txt}, single_stream_modulation`. Quantized targets are attn/MLP linears in double/single blocks (matches whitepaper Figure 3).
+
+### Phased Bring-Up Checklist (historical record)
+
+- [x] **Phase 0 — Golden reference & harness** — DiT/VAE/scheduler/TE config confirmed; MLX ternary model downloaded; Python golden dumper created (text embeddings → per-step latents → decoded image saved as `.npy`).
+- [x] **Phase 1 — Converter + single-tensor dequant parity [primary gate]** — MLX `mlx-packed-affine` 2-bit bit layout identified from mflux/MLX source → converter (MLX safetensors → GGUF; quantized layers = `BlockTQ2_0_g128`, skip/VAE/TE = bf16) → Rust dequant validated against Python dequant dump.
+- [x] **Phase 2 — Text encoder (Qwen3-4B feature extraction)** — existing Qwen3 forward adapted for hidden-state extraction (LM head / sampling removed); 7680-wide conditioning vector assembled; TE weights loaded from MLX int4 affine format; hidden states compared against Python dump (te_parity cos≥0.999999).
+- [x] **Phase 3 — DiT forward (1 block → 25 blocks)** — double-stream (×5): AdaLN → QKV (img/txt separate) → joint attention (concat→split) → out proj → AdaLN → MLP; single-stream (×20): AdaLN → fused QKV+MLP-in → attn ∥ MLP act → cat → fused out; 4-axis RoPE / RMSNorm / mlp_ratio 3.0; quantized linears reuse ternary GEMM; skip_patterns use bf16 dense; velocity prediction compared vs Python dump (dit_parity 59 taps cos≥0.999).
+- [x] **Phase 4 — Flow-match sampler** — `FlowMatchEulerDiscreteScheduler` + dynamic shift (seq_len→μ, base 0.5/max 1.15, exponential); 4 steps, no CFG (`guidance_embeds=false`); initial bring-up injected Python latents to isolate cross-framework RNG differences.
+- [x] **Phase 5 — VAE decoder (`AutoencoderKLFlux2`) [largest new subsystem]** — Conv2d (im2col+GEMM), GroupNorm(32), SiLU, ResNet blocks (layers_per_block 2), mid-block attention, 4-stage upsample (128/256/512/512), post_quant_conv, patch[2,2] unpack; latent(32ch)→RGB, fp32 (force_upcast); decoded image compared against Python dump (vae_parity 11 taps cos≥0.999).
+- [x] **Phase 6 — PNG output + CLI (end-to-end)** — oxiarc-deflate Pure Rust PNG (COOLJAPAN compression policy; no flate2/zstd/zip); `oxibonsai image --prompt … --seed N --out x.png`; native Threefry RNG byte-matches MLX/mflux reference at `--seed 42`.
+- [x] **Phase 7 — GPU acceleration & optimization** — Metal (default-on): DiT flash-attention 5.47×, ternary GEMM v10 1.89×, VAE GPU 3.2×; CUDA (native-cuda): total 3.2× (gemm_tq2 ~6×, flash-attn ~6.3×, stage0 context_embedder 59×); all cos≥0.999.
+
+### Open Questions (resolved during bring-up)
+
+All open questions from the planning phase were resolved during implementation:
+- `joint_attention_dim=7680` = concatenated hidden states from 3 Qwen3 layers (×2560 each).
+- 4-axis RoPE position IDs: `[0, h//32, w%32, 0]` for image tokens; `[0, 0, 0, j]` for text tokens.
+- AdaLN modulation: double-stream blocks use 6 parameters (scale/shift/gate × 2 paths); single-stream blocks use 3.
+- VAE `scaling_factor`/`shift_factor`: applied at pipeline level (latent packing/unpacking), not inside the VAE decoder.
+- Latent token order: `noise[c, s] = packed[s, c]` where s = h*32+w (raster scan).
 
 ## Phase Status
 
@@ -31,6 +70,7 @@
 | Phase 17: FP8 KV cache + JSON Schema BNF + ARC/GSM8K + SmoothQuant + Unigram | ✅ Complete | `Fp8KvLayer`/`Fp8KvCache`/`KvCacheLevel::Fp8`; JSON Schema→Grammar compiler; ARC/GSM8K evaluators; SmoothQuant FP8 calibrator + channel-aware quant; Unigram tokenizer with HF format support |
 | Phase 18: Standard GGUF formats + K-quant ext + WordPiece + WinoGrande/BoolQ + Regex→BNF | ✅ Complete | Q4_0/Q8_0 full stack; Q5_K/Q6_K K-quant layers; WordPiece tokenizer; WinoGrande/BoolQ evaluators; Regex→BNF compiler (Thompson NFA→Subset DFA→Grammar) |
 | Phase 19: Q2_K/Q3_K/Q4_K/Q8_K + MMLU + GBNF + HellaSwag/TruthfulQA + Tool Calling | ✅ Complete | Full Q2_K/Q3_K/Q4_K/Q8_K block types, GEMV kernels, linear layers, model integration; MMLU evaluator with per-subject breakdown; GBNF parser (two-pass, `*`/`+`/`?` expansion); HellaSwag/TruthfulQA evaluators; Tool calling API (select_tool, build_tool_constraint, ToolRegistry, validate_tool_arguments) |
+| Bonsai-Image Phases 0–7: text-to-image pipeline | ✅ Complete | oxibonsai-image crate; DiT TQ2 + VAE + TE 4-bit + PNG + MLX RNG; Metal ≈52–62s, CUDA ≈31.7s, steps=4 512² |
 | Phase 33: Split block/types.rs (Policy Compliance Milestone) | ✅ Complete | Split `crates/oxibonsai-model/src/block/types.rs` (1853 lines, 147-line margin) into `block/types/` directory module with 10 sub-files (max 424 lines): `mod.rs` (35), `upload.rs` (41), `layer_stats.rs` (48), `scratch.rs` (67), `block_def.rs` (104, `pub struct TransformerBlock<'a>` + `new()`), `forward_stats.rs` (283), `helpers.rs` (283, layer_idx + try_full_layer_gpu/cuda), `forward_sw.rs` (330, sliding-window forward), `forward.rs` (419, main forward), `accessors.rs` (424, all ~85 quant-family accessor methods grouped by family). The single big `impl<'a> TransformerBlock<'a>` block split across 5 sub-files. Visibility widened: 19 `TransformerBlock` fields + 16 `ScratchBuffers` fields from private to `pub(super)` (siblings destructure them); 2 cfg-gated helpers (`try_full_layer_gpu`, `try_full_layer_cuda`) from `fn` to `pub(super) fn`. **Milestone**: after Phase 33, every Rust source file in the workspace has ≥ 227 lines of margin to the 2000-line policy ceiling. Top file is now `cuda_k_quant_prefill_kernels.rs` at 1773 (kernel-source-string container, no host code). 4625 tests pass; clippy clean. |
 | Phase 32: Split forward_cuda.rs (Policy Compliance) | ✅ Complete | Split `crates/oxibonsai-model/src/model/types/forward_cuda.rs` (1801 lines, 199-line margin) into `forward_cuda/` directory module with 6 sub-files: `mod.rs` (34, cfg-gate + decls), `byte_helpers.rs` (119, 8 free byte-cast helpers), `q1.rs` (580, Q1 builders + 4 top-level dispatch entry points), `ternary.rs` (285, TQ2 prefill methods), `q_std.rs` (328, Q4_0/Q8_0 methods), `k_quant.rs` (424, K-quant methods). Max sub-file 580. The single big `impl<'a> BonsaiModel<'a>` block split into 5 sibling impl blocks; private inherent methods widened to `pub(super)` (sibling-sub-module helpers) or `pub(in super::super)` (entry points called from `types/mod.rs`). Inner-attribute `#![cfg(...)]` on `mod.rs` eliminates 19 repeated per-method cfg attributes. After Phase 32: every CUDA-related file at policy edge is now split (cuda_prefill, cuda_k_quant_prefill, forward_cuda all done). New top of file ranking is `block/types.rs` at 1853 (147-line margin). 4625 tests pass; clippy clean. |
 | Phase 31: Cap-of-8 Batch-Kernel Regression Audit | ✅ Complete | New `tests/capof8_audit.rs` integration test in `oxibonsai-kernels` enumerates every batch-GEMM kernel by name and asserts both (a) the kernel entry-point appears in its source string and (b) the source contains the `col_base += 8` (CUDA) / `col_base += 8u` (MSL) outer-loop pattern. Audits 36 CUDA batch kernels (6 in `cuda_prefill_kernels` for Q1+TQ2 × {gemm, gemm_residual, fused_gate_up_swiglu}; 18 in `cuda_k_quant_prefill_kernels` for Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K × 3 variants; 6 in `cuda_fp8_prefill_kernels` for E4M3/E5M2 × 3 variants; 6 in `cuda_q_std_prefill_kernels` for Q4_0/Q8_0 × 3 variants) plus 10 Metal MSL batch kernels (4 in `kernel_sources::prefill` for Q1+TQ2; 6 in `kernel_sources::fp8_prefill` for E4M3/E5M2 × 3 variants). Two defensive host-only sanity tests confirm the assertion helper rejects sources missing the pattern or the kernel name. All 46 batch kernels currently audit-clean. Host-only; no GPU required; the assertions run on every CI build that enables `native-cuda` (Linux/Windows) or `metal` (macOS) features. Phase Status: 4625 workspace tests passing (4619 + 6). |
@@ -337,3 +377,46 @@ Closes all 7 `OutputWeight::Ternary(_)` CPU-fallback guard sites in `crates/oxib
 | Ternary-Bonsai-8B | ~1.75 GB | TQ2_0_g128 (34B/128w) |
 | Ternary-Bonsai-4B | ~900 MB | TQ2_0_g128 (34B/128w) |
 | Ternary-Bonsai-1.7B | ~390 MB | TQ2_0_g128 (34B/128w) |
+
+## Deferred follow-ups from the 2026-06-01 external blog review
+
+Source: technical review at https://nazquadri.com/blog/everyday-thoughts/oxibonsai-1-bit-pure-rust/
+
+All 5 blog-flagged issues were verified against the code; the in-scope ones are fixed (temperature-discard bug, SIMD docs accuracy, CPU↔Metal parity guard, base-server engine pool — plus token_embd Arc-share + CPU default `min(4, cores)`). The 3 items below were deferred: none were raised by the blog, and each is a new feature or large architectural change whose effort + parity risk is disproportionate to a review fix.
+
+### 1. De-singletonize `MetalGraph` for true GPU concurrency — LOW priority / high effort / high risk
+- **What**: `GLOBAL_METAL_GRAPH` (`crates/oxibonsai-kernels/src/gpu_backend/metal_graph/graph.rs:23`) is a process-global singleton owning ONE `kv_cache` Mutex + shared scratch buffers, so the engine pool clamps GPU→1. True parallel GPU decode would need N command queues / N KV caches / N scratch-buffer sets.
+- **Why deferred**: Core Metal-backend rewrite, not a fix. A single GPU serializes compute anyway → the only win is overlapping CPU-side glue / async submission, not matmul throughput (the CPU pool already covers real N-way deployment). Re-architecting KV/scratch risks the byte-identity determinism just validated. High cost, low marginal benefit on single-GPU hardware.
+
+### 2. AVX-VNNI / NEON-UDOT INT8 dot-product kernel tier — LOW priority / medium effort
+- **What**: All 1-bit/ternary kernels currently expand weights to ±scale and accumulate in FP32 FMA. An INT8 dot-product tier (AVX-VNNI on x86, NEON-UDOT on ARM) could speed up CPU decode.
+- **Why deferred**: New kernel + dispatch entry + parity validation (INT8 accumulation differs numerically from FP32 FMA → risks the `cos≥0.999` gate), not a fix. The blog only asked for accurate SIMD docs (DONE). x86 VNNI can't be benchmarked on this ARM Mac (NEON-UDOT could). Noted as a possible future enhancement.
+- **Best entry if pursued**: the NEON-UDOT path first (testable on this Mac).
+
+### 3. Pool the `rag_server` `RagState` for concurrent RAG serving — LOW priority / low effort
+- **What**: `crates/oxibonsai-runtime/src/rag_server.rs` has its own separate `RagState` Mutex (distinct from the base `/v1/chat/completions` path that was pooled). Apply the same `EnginePool` pattern.
+- **Why deferred**: Separate subsystem, outside the blog's scope. Not a pure copy-paste — RAG adds a retrieval / vector-store stage with its own concurrency considerations. The same GPU-singleton clamp applies → CPU-only benefit on this Mac. Lowest-risk of the three; do it when RAG concurrency is actually needed.
+
+## imagen CUDA GPU optimization follow-ups (2026-06-02)
+
+Context: this session optimized the `oxibonsai image` (FLUX.2 Klein) CUDA path from steps=4 ≈101s → ≈31.7s (**3.2×**), cos=1.0 throughout (FP32, **no tensor cores**): TE attention AVX2 + 4-bit dequant parallelised; DiT `gemm_tq2` retiled 32×32/2×2 → 128×128/8×8 transposed-shared (~6× kernel); DiT flash-attention rewritten warp-cooperative (lane-split head_dim + `__shfl_xor_sync`, ~6.3× kernel); DiT stage0 `context_embedder` ported CPU→GPU (`encode_gemm_f32`, ~59× on that op). The two items below are **deferred levers**, each established by a code-read (no benchmark). Both are recorded so a future session need not re-derive them.
+
+### TE persistent GPU weight cache — design-confirmed lever; implement only when multi-image throughput can be benchmarked
+- **Static finding (code-read, no bench): the TE (Qwen3-4B 4-bit, ~2.1 GB) re-dequantises (CPU) AND re-uploads (HtoD) every Linear weight on EVERY image — nothing persists across `text_to_image` calls.**
+  - `te::cuda_gpu::te_matmul_gpu` (`crates/oxibonsai-image/src/te/cuda_gpu.rs:93`): `get_or_upload_f32_weight(key, weight)` (`:115`) → `encode_gemm_f32` (`:116`) → **`evict_f32_weight(key)` (`:117`)**. The evict drops the device-weight cache entry after every GEMM, so the next call re-uploads. (The evict exists to fix a pointer-key collision — the 4-bit dequant yields transient host buffers whose address is recycled across Linears.) Called per Linear from `matmul` (`crates/oxibonsai-image/src/te/forward.rs:494`, GPU branch `:544`).
+  - `TeWeights::get` (`crates/oxibonsai-image/src/te/weights.rs:157`), `Source::Mlx4bit` arm (`:174`): returns `Rc::new(model.load_tensor(name)?)` — a **fresh CPU dequant** (`mlx4bit::dequantize_mlx_4bit_affine`) on every call, explicitly **No-cache** (`:173`). `linear()` (`:182`) wraps `get()`. (The `NpyDir` source *does* cache (`:160`–`:170`); the 4-bit MLX source we actually use does not.)
+  - Path is **per-image, not one-time init**: `pipeline::compute_cond` (`crates/oxibonsai-image/src/pipeline.rs:325`) opens `TeWeights::open_mlx_4bit` (`:334`) + `encoder.forward` (`:338`), invoked once per `text_to_image` generation (`:355`, cond arm `:417`); `TeWeights` is constructed fresh each call (no process-lifetime persistence).
+- **Conclusion: YES — the lever structurally exists.** A process-lifetime cache of the dequantised-f32 + GPU-resident TE weights would let the **2nd-and-later image's TE skip both the CPU dequant and the HtoD upload (GEMM only)**.
+- **Caveat / why not now**: **no gain for a single image** — each weight is used exactly once per forward, so it is uploaded once either way; the win is purely **multi-image throughput** (batch/server), which this single-image CLI cannot benchmark. A real implementation must also (a) restore stable cache keys — cache the dequantised f32 with a stable identity and drop the per-call `evict_f32_weight` — and (b) trade back the no-cache policy's ~16 GB → ~2.5 GB RAM frugality plus GPU residency of the f32 weights. **Implement when a multi-image throughput benchmark environment exists.**
+
+### VAE back-stage residency — net-new, large; revisit only when VAE latency is the priority
+- **2026-06-02 evaluation**: after the kernel + stage0 wins, nsys (steps=1) shows the imagen GPU time is now **transfer-bound** (cuMemcpyDtoH ≈5.0 s + HtoD ≈4.0 s ≫ all kernels ≈4.3 s). The VAE decode (~7.8 s) bounces its large 512×512 feature maps (up to ~400 MB) CPU↔GPU **per op**: the per-op `conv2d_gpu` / `groupnorm_gpu` / `silu_gpu` / `upsample_gpu` are all host-in/host-out (`crates/oxibonsai-image/src/vae/cuda_gpu.rs`). The conv itself already keeps im2col+GEMM device-resident (`CudaGraph::encode_conv2d_f32_im2col`), so the per-op cost is the input-HtoD + output-DtoH + host bias-scatter between ops.
+- **Right fix = residency, NOT implicit-GEMM** (the conv compute / im2col is small): keep the map device-resident across the whole decode (upload latents + weights once, download RGB once). This is the discrete-GPU inversion of Metal's unified-memory wash — and unlike the DiT residual `h` (small ⇒ residency measured WASH this session), VAE maps are huge ⇒ a real ~4–5 s win.
+- **Why deferred = net-new, no template**: both `vae/gpu.rs` (Metal) and `vae/cuda_gpu.rs` (CUDA) are per-op; there is **no resident VAE decode to mirror**. It needs new device kernels (conv-output transpose+bias scatter, residual-add) + device-in/out conv (tiled) / groupnorm / silu / upsample + a resnet/upsample/conv-norm/conv-out orchestration = the session's largest single implementation. ROI is **one-shot** (~12 % of steps=4: 7.8 → ~4 s). **Revisit only when VAE / low-step-count latency becomes the priority.**
+
+### DiT — parity-safe (FP32) floor reached this session; negative results (do not re-derive)
+- **DiT residual `h` / q/k/v residency = measured WASH.** The resident tensors are small (≪ the VAE's ~400 MB maps), so the PCIe bounce is cheap; the real stage0 glue was the CPU `context_embedder` GEMM (now on GPU, 59×). Full single-block residency moved steps=4 only **45.6 → 45.4 s** (within noise). **Do not re-attempt DiT residency** — the discrete-GPU residency lever pays off ∝ resident-tensor size, and the DiT's tensors are too small (the opposite of the VAE maps in the subsection above).
+- **gemm_tq2 (6×) + flash-attention (6.3×) are at the FP32 ceiling** (~2.3 s kernels/step; DiT sample ~3.3 s/step, the remaining glue ~0.5 s/step is small). Further kernel speedup would require **TF32/FP16 tensor cores — deliberately NOT used** to hold cos≥0.999 parity. So ~3.3 s/step is the parity-safe DiT floor; **don't re-attempt FP32 kernel micro-opt** (mirrors the Metal v10→v11 "local optimum" result).
+
+### Cross-backend note (macOS side)
+- The TE per-image **re-dequant** (`crates/oxibonsai-image/src/te/weights.rs:173`, `Source::Mlx4bit` No-cache) is **backend-agnostic** — it re-runs on Metal too. So the *dequant-cache* half of the TE lever above would also help **Metal** multi-image throughput; only the *HtoD GPU-residency* half is CUDA-specific (on Metal the upload is free via unified memory, so Metal's multi-image win from this lever would be dequant-only).

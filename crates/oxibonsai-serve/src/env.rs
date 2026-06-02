@@ -14,6 +14,7 @@
 //! | `OXIBONSAI_TOP_P`              | `sampling.default_top_p`               | f32    |
 //! | `OXIBONSAI_MAX_INPUT_TOKENS`   | `limits.max_input_tokens`              | usize  |
 //! | `OXIBONSAI_MAX_CONCURRENT`     | `limits.max_concurrent_requests`       | usize  |
+//! | `OXIBONSAI_ENGINE_POOL_SIZE`   | `limits.engine_pool_size`              | usize  |
 //! | `OXIBONSAI_REQUEST_TIMEOUT_MS` | `limits.per_request_timeout_ms`        | u64    |
 //! | `OXIBONSAI_BEARER_TOKEN`       | `auth.bearer_token`                    | string |
 //! | `OXIBONSAI_LOG_LEVEL`          | `observability.log_level`              | string |
@@ -83,6 +84,9 @@ where
     }
     if let Some(v) = map.get("OXIBONSAI_MAX_CONCURRENT") {
         out.max_concurrent_requests = Some(parse_usize("OXIBONSAI_MAX_CONCURRENT", v)?);
+    }
+    if let Some(v) = map.get("OXIBONSAI_ENGINE_POOL_SIZE") {
+        out.engine_pool_size = Some(parse_usize("OXIBONSAI_ENGINE_POOL_SIZE", v)?);
     }
     if let Some(v) = map.get("OXIBONSAI_REQUEST_TIMEOUT_MS") {
         out.per_request_timeout_ms = Some(parse_u64("OXIBONSAI_REQUEST_TIMEOUT_MS", v)?);

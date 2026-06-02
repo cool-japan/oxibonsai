@@ -228,10 +228,10 @@ pub fn unpack_blocks_from_gemv(
 pub fn prefetch_read<T>(ptr: *const T) {
     #[cfg(target_arch = "aarch64")]
     {
-        // SAFETY: prefetch is always safe, it's just a hint
-        unsafe {
-            core::arch::aarch64::_prefetch(ptr as *const i8, 0, 3);
-        }
+        // SAFETY: prefetch is always safe, it's just a hint. The
+        // `aarch64_prefetch!` macro supplies the `unsafe` block and degrades to
+        // a no-op off-nightly (where the intrinsic is unavailable).
+        crate::aarch64_prefetch!(ptr as *const i8, 0, 3);
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -257,11 +257,10 @@ pub fn prefetch_read<T>(ptr: *const T) {
 pub fn prefetch_write<T>(ptr: *const T) {
     #[cfg(target_arch = "aarch64")]
     {
-        // SAFETY: prefetch is always safe
-        unsafe {
-            // _prefetch with pst=1 means prefetch for store
-            core::arch::aarch64::_prefetch(ptr as *const i8, 1, 3);
-        }
+        // SAFETY: prefetch is always safe. The `aarch64_prefetch!` macro supplies
+        // the `unsafe` block and degrades to a no-op off-nightly.
+        // _prefetch with pst=1 means prefetch for store.
+        crate::aarch64_prefetch!(ptr as *const i8, 1, 3);
     }
 
     #[cfg(target_arch = "x86_64")]

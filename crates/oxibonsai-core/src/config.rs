@@ -97,7 +97,16 @@ impl Qwen3Config {
             .or_else(|_| metadata.get_f32(keys::LLM_ROPE_FREQ_BASE))
             .unwrap_or(1_000_000.0);
 
-        let head_dim = hidden_size / num_attention_heads;
+        // head_dim is read explicitly from metadata when present, since for some
+        // Qwen3 sizes (notably Qwen3-4B: hidden=2560, heads=32, head_dim=128)
+        // the value is not hidden_size / num_attention_heads. Older GGUFs that
+        // omit the key fall back to the derivation, which still holds for the
+        // 8B and 1.7B variants in this project.
+        let head_dim = metadata
+            .get_u32(&format!("{arch_prefix}.attention.key_length"))
+            .or_else(|_| metadata.get_u32(keys::LLM_ATTENTION_KEY_LENGTH))
+            .map(|v| v as usize)
+            .unwrap_or(hidden_size / num_attention_heads);
 
         Ok(Qwen3Config {
             hidden_size,

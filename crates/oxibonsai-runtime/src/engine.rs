@@ -12,7 +12,7 @@ use std::time::Instant;
 use oxibonsai_core::config::Qwen3Config;
 use oxibonsai_core::gguf::reader::GgufFile;
 use oxibonsai_kernels::traits::OneBitKernel;
-use oxibonsai_kernels::KernelDispatcher;
+use oxibonsai_kernels::{KernelDispatcher, KernelTier};
 use oxibonsai_model::model::BonsaiModel;
 
 use crate::batch_engine::{self, BatchResult};
@@ -175,6 +175,27 @@ impl<'a> InferenceEngine<'a> {
         }
     }
 
+    /// Wrap a [`BonsaiModel`], pinning the engine to a specific [`KernelTier`].
+    ///
+    /// Thin wrapper over [`from_model_with_kernel`](Self::from_model_with_kernel)
+    /// using [`KernelDispatcher::with_tier`]. Used by the cross-backend
+    /// determinism guard to build one engine on `KernelTier::Reference` (scalar
+    /// CPU) and one on `KernelTier::Gpu` (Metal) from the same model bytes and
+    /// assert byte-identical greedy output. `new`/auto-detect are left untouched.
+    pub fn from_model_with_tier(
+        model: BonsaiModel<'a>,
+        tier: KernelTier,
+        sampling_params: SamplingParams,
+        seed: u64,
+    ) -> Self {
+        Self::from_model_with_kernel(
+            model,
+            KernelDispatcher::with_tier(tier),
+            sampling_params,
+            seed,
+        )
+    }
+
     /// Create a new inference engine from a loaded GGUF file.
     pub fn from_gguf(
         gguf: &'a GgufFile<'a>,
@@ -182,7 +203,44 @@ impl<'a> InferenceEngine<'a> {
         seed: u64,
         max_seq_len: usize,
     ) -> RuntimeResult<Self> {
-        let mut model = BonsaiModel::from_gguf(gguf, max_seq_len)?;
+        let model = BonsaiModel::from_gguf(gguf, max_seq_len)?;
+        Self::from_model_with_gpu_warmup(model, sampling_params, seed)
+    }
+
+    /// Create an engine from a loaded GGUF file, reusing a pre-loaded, shared
+    /// token-embedding table.
+    ///
+    /// Identical to [`from_gguf`](Self::from_gguf) except the `token_embd`
+    /// table is supplied by the caller (via
+    /// [`BonsaiModel::from_gguf_with_embd`]) rather than re-dequantized from the
+    /// GGUF. The engine pool uses this to share one `Arc<[f32]>` across all
+    /// replicas (see [`build_pool_from_gguf`](crate::engine_pool::build_pool_from_gguf)).
+    ///
+    /// `token_embd` MUST be the dequantized `token_embd.weight` for this exact
+    /// GGUF; see [`BonsaiModel::from_gguf_with_embd`] for the contract.
+    pub fn from_gguf_with_embd(
+        gguf: &'a GgufFile<'a>,
+        sampling_params: SamplingParams,
+        seed: u64,
+        max_seq_len: usize,
+        token_embd: std::sync::Arc<[f32]>,
+    ) -> RuntimeResult<Self> {
+        let model = BonsaiModel::from_gguf_with_embd(gguf, max_seq_len, token_embd)?;
+        Self::from_model_with_gpu_warmup(model, sampling_params, seed)
+    }
+
+    /// Shared core of [`from_gguf`](Self::from_gguf) and
+    /// [`from_gguf_with_embd`](Self::from_gguf_with_embd): given an
+    /// already-constructed [`BonsaiModel`], auto-detect the kernel, upload
+    /// weights to GPU, run the per-tier warmups, and assemble the engine.
+    ///
+    /// Factored out so the (substantial) GPU/CUDA warmup logic has exactly one
+    /// implementation regardless of how `token_embd` was obtained.
+    fn from_model_with_gpu_warmup(
+        mut model: BonsaiModel<'a>,
+        sampling_params: SamplingParams,
+        seed: u64,
+    ) -> RuntimeResult<Self> {
         let kernel = KernelDispatcher::auto_detect();
 
         // Upload all model weights to GPU memory once (no-op on CPU-only tiers).
@@ -274,6 +332,17 @@ impl<'a> InferenceEngine<'a> {
         &self.model
     }
 
+    /// Cheaply clone a handle to this engine's shared token-embedding table.
+    ///
+    /// Thin delegate to [`BonsaiModel::shared_token_embd`]. The engine pool
+    /// calls this on replica `#1` to extract the one shared `Arc<[f32]>`, which
+    /// it then hands to [`InferenceEngine::from_gguf_static_with_embd`] when
+    /// building replicas `2..N` — so every replica's `token_embd` is a clone of
+    /// the same allocation (one ~1.16 GiB table for the 1.7B, not N).
+    pub fn model_token_embd(&self) -> std::sync::Arc<[f32]> {
+        self.model.shared_token_embd()
+    }
+
     /// Get a mutable reference to the model.
     ///
     /// Used by the prefix-cache integration to inject restored KV blocks
@@ -285,6 +354,15 @@ impl<'a> InferenceEngine<'a> {
     /// Get a reference to the kernel dispatcher.
     pub fn kernel(&self) -> &KernelDispatcher {
         &self.kernel
+    }
+
+    /// Kernel tier this engine dispatches to.
+    ///
+    /// Feature-agnostic convenience used by the engine pool to decide how many
+    /// replicas may safely run in parallel (GPU tiers funnel through a
+    /// process-global singleton and are pinned to a single replica).
+    pub fn kernel_tier(&self) -> KernelTier {
+        self.kernel.tier()
     }
 
     /// Run prefill at a given KV-cache offset.
@@ -568,6 +646,29 @@ impl<'a> InferenceEngine<'a> {
         result
     }
 
+    /// Generate tokens from a prompt using caller-supplied sampling parameters
+    /// for the duration of this call only.
+    ///
+    /// Swaps in `params` (temperature, top-k, top-p, repetition penalty) on the
+    /// engine's existing sampler, runs [`InferenceEngine::generate`], then
+    /// restores the previous parameters. Crucially, the sampler's PRNG state is
+    /// **not** reset — only the parameters change — so the RNG sequence for the
+    /// next request is identical to what it would have been had this call used
+    /// the engine's default parameters. This makes the default-parameter case
+    /// bit-identical to calling `generate` directly.
+    pub fn generate_with_params(
+        &mut self,
+        prompt_tokens: &[u32],
+        max_tokens: usize,
+        params: &crate::sampling::SamplingParams,
+    ) -> RuntimeResult<Vec<u32>> {
+        let prev_params = self.sampler.params().clone();
+        self.sampler.set_params(params.clone());
+        let result = self.generate(prompt_tokens, max_tokens);
+        self.sampler.set_params(prev_params);
+        result
+    }
+
     /// Generate tokens one at a time, sending each through the channel.
     /// Returns the total count of generated tokens.
     ///
@@ -637,6 +738,30 @@ impl<'a> InferenceEngine<'a> {
         );
 
         Ok(generated)
+    }
+
+    /// Streaming generation using caller-supplied sampling parameters for the
+    /// duration of this call only.
+    ///
+    /// Swaps in `params` on the engine's existing sampler, runs
+    /// [`InferenceEngine::generate_streaming`], then restores the previous
+    /// parameters. As with [`InferenceEngine::generate_with_params`], the
+    /// sampler's PRNG state is preserved (only the parameters change), so the
+    /// default-parameter case is bit-identical to calling
+    /// `generate_streaming` directly.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn generate_streaming_with_params(
+        &mut self,
+        prompt_tokens: &[u32],
+        max_tokens: usize,
+        params: &crate::sampling::SamplingParams,
+        tx: &tokio::sync::mpsc::UnboundedSender<u32>,
+    ) -> RuntimeResult<usize> {
+        let prev_params = self.sampler.params().clone();
+        self.sampler.set_params(params.clone());
+        let result = self.generate_streaming(prompt_tokens, max_tokens, tx);
+        self.sampler.set_params(prev_params);
+        result
     }
 
     /// Streaming generation using a synchronous `std::sync::mpsc::Sender`.
@@ -1006,6 +1131,91 @@ impl<'a> InferenceEngine<'a> {
 }
 
 impl InferenceEngine<'static> {
+    /// Build an engine from an already-`'static` [`GgufFile`].
+    ///
+    /// This is the shared core used both by [`from_gguf_path`](Self::from_gguf_path)
+    /// (after it has leaked the mmap + parsed container to `'static`) and by the
+    /// engine pool when constructing additional replicas off a single leaked
+    /// GGUF — every replica borrows the *same* `&'static GgufFile` zero-copy, so
+    /// only per-replica state (KV cache, light wrappers) is duplicated. The
+    /// immutable `token_embd` table is shared across replicas via one
+    /// `Arc<[f32]>` when the pool builder uses
+    /// [`from_gguf_static_with_embd`](Self::from_gguf_static_with_embd).
+    ///
+    /// Performs no leaking itself; the caller owns the `'static` lifetime.
+    ///
+    /// # Errors
+    ///
+    /// Propagates model-init / GPU-cache errors through [`RuntimeError`].
+    pub fn from_gguf_static(
+        gguf: &'static GgufFile<'static>,
+        sampling_params: SamplingParams,
+        seed: u64,
+        max_seq_len: usize,
+    ) -> RuntimeResult<Self> {
+        // `from_gguf` is generic over the GGUF borrow lifetime; instantiating it
+        // at `'static` yields an `InferenceEngine<'static>` directly.
+        Self::from_gguf(gguf, sampling_params, seed, max_seq_len)
+    }
+
+    /// Build an engine from an already-`'static` [`GgufFile`], reusing a
+    /// pre-loaded, shared token-embedding table.
+    ///
+    /// The `'static`-lifetime twin of
+    /// [`from_gguf_with_embd`](Self::from_gguf_with_embd). The engine pool calls
+    /// this for replicas `2..N`, passing the `Arc<[f32]>` extracted from replica
+    /// `#1` (via [`InferenceEngine::model_token_embd`]) so every replica shares a
+    /// single token-embedding allocation instead of re-dequantizing its own
+    /// copy. KV caches and light wrappers remain per-replica.
+    ///
+    /// `token_embd` MUST be the dequantized `token_embd.weight` for this exact
+    /// GGUF; see [`BonsaiModel::from_gguf_with_embd`] for the contract.
+    pub fn from_gguf_static_with_embd(
+        gguf: &'static GgufFile<'static>,
+        sampling_params: SamplingParams,
+        seed: u64,
+        max_seq_len: usize,
+        token_embd: std::sync::Arc<[f32]>,
+    ) -> RuntimeResult<Self> {
+        Self::from_gguf_with_embd(gguf, sampling_params, seed, max_seq_len, token_embd)
+    }
+
+    /// Memory-map + parse a GGUF file and leak both allocations to `'static`,
+    /// returning the constructed engine *and* the leaked `&'static GgufFile`.
+    ///
+    /// The leaked reference lets callers (e.g. the engine pool) build additional
+    /// engine replicas off the *same* weights via [`from_gguf_static`](Self::from_gguf_static)
+    /// without a second mmap or weight copy. The leaked memory is intentional —
+    /// the GGUF is expected to live for the process lifetime.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::FileNotFound`] if `path` does not exist.  Other
+    /// IO / parse / model-init errors propagate through [`RuntimeError`].
+    pub fn from_gguf_path_leaked(
+        path: impl AsRef<std::path::Path>,
+        sampling_params: SamplingParams,
+        seed: u64,
+        max_seq_len: usize,
+    ) -> RuntimeResult<(Self, &'static GgufFile<'static>)> {
+        let path_ref = path.as_ref();
+        if !path_ref.exists() {
+            return Err(RuntimeError::FileNotFound {
+                path: path_ref.display().to_string(),
+            });
+        }
+
+        // Memory-map and parse, then leak both so the resulting `GgufFile`
+        // can live for `'static` without RAII concerns.
+        let mmap = oxibonsai_core::gguf::reader::mmap_gguf_file(path_ref)?;
+        let mmap: &'static memmap2::Mmap = Box::leak(Box::new(mmap));
+        let gguf = oxibonsai_core::gguf::reader::GgufFile::parse(mmap)?;
+        let gguf: &'static GgufFile<'static> = Box::leak(Box::new(gguf));
+
+        let engine = Self::from_gguf_static(gguf, sampling_params, seed, max_seq_len)?;
+        Ok((engine, gguf))
+    }
+
     /// Load an [`InferenceEngine`] directly from a path to a GGUF file.
     ///
     /// This is a convenience wrapper intended for server/CLI entry points that
@@ -1026,22 +1236,8 @@ impl InferenceEngine<'static> {
         seed: u64,
         max_seq_len: usize,
     ) -> RuntimeResult<Self> {
-        let path_ref = path.as_ref();
-        if !path_ref.exists() {
-            return Err(RuntimeError::FileNotFound {
-                path: path_ref.display().to_string(),
-            });
-        }
-
-        // Memory-map and parse, then leak both so the resulting `GgufFile`
-        // can live for `'static` without RAII concerns.
-        let mmap = oxibonsai_core::gguf::reader::mmap_gguf_file(path_ref)?;
-        let mmap: &'static memmap2::Mmap = Box::leak(Box::new(mmap));
-        let gguf = oxibonsai_core::gguf::reader::GgufFile::parse(mmap)?;
-        let gguf: &'static oxibonsai_core::gguf::reader::GgufFile<'static> =
-            Box::leak(Box::new(gguf));
-
-        Self::from_gguf(gguf, sampling_params, seed, max_seq_len)
+        Self::from_gguf_path_leaked(path, sampling_params, seed, max_seq_len)
+            .map(|(engine, _gguf)| engine)
     }
 }
 

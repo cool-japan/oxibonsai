@@ -105,6 +105,7 @@ fn clone_err(e: &MetalGraphError) -> MetalGraphError {
         MetalGraphError::BufferCreationFailed => MetalGraphError::BufferCreationFailed,
         MetalGraphError::EncodingFailed(s) => MetalGraphError::EncodingFailed(s.clone()),
         MetalGraphError::ExecutionFailed(s) => MetalGraphError::ExecutionFailed(s.clone()),
+        MetalGraphError::InvalidDimensions(s) => MetalGraphError::InvalidDimensions(s.clone()),
     }
 }
 
@@ -207,7 +208,7 @@ fn dispatch_metal_fp8_gemv(
     );
     let input_buf = s.device.new_buffer_with_data(
         input.as_ptr() as *const std::ffi::c_void,
-        (input.len() * std::mem::size_of::<f32>()) as u64,
+        std::mem::size_of_val(input) as u64,
         MTLResourceOptions::StorageModeShared,
     );
     let output_buf = s.device.new_buffer(

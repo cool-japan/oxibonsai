@@ -199,17 +199,17 @@ fn prefetch_write_x86(ptr: *const i8, locality: PrefetchLocality) {
 fn prefetch_read_aarch64(ptr: *const i8, locality: PrefetchLocality) {
     // SAFETY: __prefetch is safe — invalid addresses are silently ignored on ARM.
     // AArch64 _prefetch requires const arguments, so we match and call separately.
-    unsafe {
-        match locality {
-            PrefetchLocality::High => {
-                core::arch::aarch64::_prefetch(ptr, 0, 3); // keep in all caches
-            }
-            PrefetchLocality::Medium => {
-                core::arch::aarch64::_prefetch(ptr, 0, 2); // keep in L2+
-            }
-            PrefetchLocality::Low => {
-                core::arch::aarch64::_prefetch(ptr, 0, 0); // non-temporal
-            }
+    // The `aarch64_prefetch!` macro supplies the `unsafe` block (and degrades to
+    // a no-op off-nightly, where the intrinsic is unavailable).
+    match locality {
+        PrefetchLocality::High => {
+            crate::aarch64_prefetch!(ptr, 0, 3); // keep in all caches
+        }
+        PrefetchLocality::Medium => {
+            crate::aarch64_prefetch!(ptr, 0, 2); // keep in L2+
+        }
+        PrefetchLocality::Low => {
+            crate::aarch64_prefetch!(ptr, 0, 0); // non-temporal
         }
     }
 }
@@ -218,17 +218,16 @@ fn prefetch_read_aarch64(ptr: *const i8, locality: PrefetchLocality) {
 #[inline(always)]
 fn prefetch_write_aarch64(ptr: *const i8, locality: PrefetchLocality) {
     // SAFETY: rw=1 for write/store prefetch. Const arguments required.
-    unsafe {
-        match locality {
-            PrefetchLocality::High => {
-                core::arch::aarch64::_prefetch(ptr, 1, 3);
-            }
-            PrefetchLocality::Medium => {
-                core::arch::aarch64::_prefetch(ptr, 1, 2);
-            }
-            PrefetchLocality::Low => {
-                core::arch::aarch64::_prefetch(ptr, 1, 0);
-            }
+    // The `aarch64_prefetch!` macro supplies the `unsafe` block.
+    match locality {
+        PrefetchLocality::High => {
+            crate::aarch64_prefetch!(ptr, 1, 3);
+        }
+        PrefetchLocality::Medium => {
+            crate::aarch64_prefetch!(ptr, 1, 2);
+        }
+        PrefetchLocality::Low => {
+            crate::aarch64_prefetch!(ptr, 1, 0);
         }
     }
 }

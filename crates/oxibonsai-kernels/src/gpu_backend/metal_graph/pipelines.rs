@@ -57,6 +57,71 @@ pub(crate) struct MetalPipelines {
     /// dispatch shape but decodes TQ2_0_g128 weights and supports arbitrary
     /// batch sizes (Q1's V7 silently caps at 8 columns).
     pub(crate) gemm_tq2_g128_v7: ComputePipelineState,
+    /// Tiled batched ternary GEMM for the **large-M** path (DiT, `M` up to
+    /// 1536).  2-D grid `[ceil(N/8), ceil(M/32)]` with register-blocked
+    /// `TN×TM` micro-tiles; parallelizes `M` and decodes each weight block
+    /// once per M-tile (vs `v7`'s serial `M/8` re-decodes).  Numerically
+    /// equivalent to `gemm_tq2_g128_v7`.  Retained as a fallback now that
+    /// `encode_gemm_tq2` dispatches the faster `simdgroup_matrix`
+    /// `gemm_tq2_g128_v9_simdgroup`; still compiled (and exercised by the v8/v9
+    /// benches), hence `#[allow(dead_code)]`.
+    #[allow(dead_code)]
+    pub(crate) gemm_tq2_g128_v8_tiled: ComputePipelineState,
+    /// `simdgroup_matrix` (8×8×8 HW MAC) batched ternary GEMM for the
+    /// **large-M** path (DiT).  Same op / SoA weight buffer as `v8`, but
+    /// dequantizes the weight transposed into threadgroup memory and drives
+    /// Apple's `simdgroup_float8x8` matrix units (f32 accumulate, f16 staged
+    /// operands).  Numerically equivalent to `v7` / `v8` within the
+    /// `dit_parity` cosine gate; used only by `encode_gemm_tq2`.
+    pub(crate) gemm_tq2_g128_v9_simdgroup: ComputePipelineState,
+    /// Staging-optimized `simdgroup_matrix` batched ternary GEMM (`v10`) for the
+    /// **large-M** path (DiT).  Same op / SoA weight buffer / decode bits as
+    /// `v9`, but stages the dequantized weight as `half` (exact for ternary
+    /// `code×scale`), vectorizes the dequant-scatter across all 128 threads, and
+    /// double-buffers the K-tile staging so the matrix units overlap the staging
+    /// latency.  Numerically equivalent to `v7`/`v8`/`v9` within the `dit_parity`
+    /// cosine gate; dispatched by `encode_gemm_tq2` only when it both passes
+    /// parity and beats `v9` on the back-to-back ratio.
+    pub(crate) gemm_tq2_g128_v10_simdgroup: ComputePipelineState,
+
+    // ── f32-exact (text encoder, Qwen3-4B) ──────────────────────────
+    /// f32-exact `simdgroup_matrix` GEMM for the large-M **text-encoder** path.
+    /// Computes `out[M,N] = A[M,K] · W[N,K]ᵀ` over pure-f32 weights (the FLUX.2
+    /// TE has no quantized format), reusing `v9`'s tile geometry / A-staging /
+    /// matrix-MAC structure but loading the f32 weight tile directly (no
+    /// dequant). Numerically equivalent to the CPU `gemm_abt` (cos ≈ 1.0);
+    /// dispatched by `encode_gemm_f32` only.
+    pub(crate) gemm_f32_simdgroup: ComputePipelineState,
+
+    // ── FLUX.2 VAE decoder per-op f32 primitives ────────────────────
+    /// im2col patch extraction `[rows, kH·kW·C_in]` in `(kH,kW,C_in)` order
+    /// (feeds `gemm_f32_simdgroup` for the k≥3 VAE convs). Dispatched by
+    /// `encode_conv2d_f32`.
+    pub(crate) im2col_f32: ComputePipelineState,
+    /// PyTorch-compatible GroupNorm (32 groups, eps 1e-6, per-channel affine,
+    /// Kahan-compensated f32 reduction). Dispatched by `encode_groupnorm_f32`.
+    pub(crate) groupnorm_f32: ComputePipelineState,
+    /// Element-wise SiLU. Dispatched by `encode_silu_f32`.
+    pub(crate) silu_f32: ComputePipelineState,
+    /// Nearest ×2 upsample `[C,H,W] → [C,2H,2W]`. Dispatched by
+    /// `encode_upsample_nearest_f32`.
+    pub(crate) upsample_nearest_f32: ComputePipelineState,
+    /// **im2col-free implicit-GEMM** Conv2d (`k=3, pad=1, stride=1`): gathers conv
+    /// patches on-the-fly into threadgroup memory and drives `simdgroup_float8x8`
+    /// HW MACs (f32 accumulate), so the im2col patch matrix never hits global
+    /// memory. Dispatched by `encode_conv2d_f32` for the high-res VAE convs;
+    /// numerically equivalent to the `im2col_f32` + `gemm_f32_simdgroup` path
+    /// (reassociated sums only), which is retained as a fallback.
+    pub(crate) conv2d_f32_implicit: ComputePipelineState,
+
+    // ── FLUX.2 DiT joint attention ──────────────────────────────────
+    /// Flash-attention (online-softmax) DiT joint (txt+img) attention driving
+    /// `simdgroup_float8x8` HW matrix units for both attention matmuls (`Q·Kᵀ`
+    /// and `P·V`), f32 accumulate, writing the token-major transposed output.
+    /// Built to beat the rayon+NEON CPU at the DiT shape; the shipping path.
+    /// Dispatched by `dispatch_joint_attention_flash` (`encode_joint_attention_flash`
+    /// / `encode_joint_attention_flash_pooled`).
+    pub(crate) joint_attention_flash_f32: ComputePipelineState,
 }
 
 impl MetalPipelines {
@@ -97,6 +162,21 @@ impl MetalPipelines {
             pipeline_for(&library, device, "fused_gate_up_swiglu_gemm_q1")?;
         let gemv_tq2_g128_v1 = pipeline_for(&library, device, "gemv_tq2_g128_v1")?;
         let gemm_tq2_g128_v7 = pipeline_for(&library, device, "gemm_tq2_g128_v7")?;
+        let gemm_tq2_g128_v8_tiled = pipeline_for(&library, device, "gemm_tq2_g128_v8_tiled")?;
+        let gemm_tq2_g128_v9_simdgroup =
+            pipeline_for(&library, device, "gemm_tq2_g128_v9_simdgroup")?;
+        let gemm_tq2_g128_v10_simdgroup =
+            pipeline_for(&library, device, "gemm_tq2_g128_v10_simdgroup")?;
+        let gemm_f32_simdgroup = pipeline_for(&library, device, "gemm_f32_simdgroup")?;
+        // VAE decoder per-op f32 primitives
+        let im2col_f32 = pipeline_for(&library, device, "im2col_f32")?;
+        let groupnorm_f32 = pipeline_for(&library, device, "groupnorm_f32")?;
+        let silu_f32 = pipeline_for(&library, device, "silu_f32")?;
+        let upsample_nearest_f32 = pipeline_for(&library, device, "upsample_nearest_f32")?;
+        let conv2d_f32_implicit = pipeline_for(&library, device, "conv2d_f32_implicit")?;
+        // DiT joint attention (flash-attention simdgroup_matrix — shipping path)
+        let joint_attention_flash_f32 =
+            pipeline_for(&library, device, "joint_attention_flash_f32")?;
 
         Ok(Self {
             gemv_q1_g128_v7,
@@ -119,6 +199,16 @@ impl MetalPipelines {
             fused_gate_up_swiglu_gemm_q1,
             gemv_tq2_g128_v1,
             gemm_tq2_g128_v7,
+            gemm_tq2_g128_v8_tiled,
+            gemm_tq2_g128_v9_simdgroup,
+            gemm_tq2_g128_v10_simdgroup,
+            gemm_f32_simdgroup,
+            im2col_f32,
+            groupnorm_f32,
+            silu_f32,
+            upsample_nearest_f32,
+            conv2d_f32_implicit,
+            joint_attention_flash_f32,
         })
     }
 }
@@ -188,6 +278,29 @@ fn build_combined_msl() -> String {
     src.push_str(kernel_sources::MSL_GEMV_TQ2_G128_V1);
     src.push('\n');
     src.push_str(kernel_sources::MSL_GEMM_TQ2_G128_V7);
+    src.push('\n');
+    src.push_str(kernel_sources::MSL_GEMM_TQ2_G128_V8_TILED);
+    src.push('\n');
+    src.push_str(kernel_sources::MSL_GEMM_TQ2_G128_V9_SIMDGROUP);
+    src.push('\n');
+    src.push_str(kernel_sources::MSL_GEMM_TQ2_G128_V10_SIMDGROUP);
+    src.push('\n');
+    // ── f32-exact (text encoder) ────────────────────────────────────────
+    src.push_str(kernel_sources::MSL_GEMM_F32_SIMDGROUP);
+    src.push('\n');
+    // ── FLUX.2 VAE decoder per-op f32 primitives ─────────────────────────
+    src.push_str(kernel_sources::MSL_IM2COL_F32);
+    src.push('\n');
+    src.push_str(kernel_sources::MSL_GROUPNORM_F32);
+    src.push('\n');
+    src.push_str(kernel_sources::MSL_SILU_F32);
+    src.push('\n');
+    src.push_str(kernel_sources::MSL_UPSAMPLE_NEAREST_F32);
+    src.push('\n');
+    src.push_str(kernel_sources::MSL_CONV2D_F32_IMPLICIT);
+    src.push('\n');
+    // ── FLUX.2 DiT joint attention (flash-attention simdgroup_matrix) ─────
+    src.push_str(kernel_sources::MSL_DIT_JOINT_ATTENTION_FLASH);
     src.push('\n');
     src
 }

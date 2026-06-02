@@ -22,10 +22,10 @@ use axum::Router;
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tokio_stream::StreamExt;
 
 use crate::engine::InferenceEngine;
+use crate::engine_pool::{EngineLease, EnginePool, PoolError};
 use crate::metrics::InferenceMetrics;
 use crate::request_id::RequestId;
 use crate::tokenizer_bridge::TokenizerBridge;
@@ -64,16 +64,30 @@ pub fn request_id_header_map(id: RequestId) -> HeaderMap {
 }
 
 /// Server state.
+///
+/// Holds a *pool* of inference-engine replicas behind a semaphore rather than a
+/// single mutex, so up to `pool.size()` requests can generate concurrently. The
+/// default path (a 1-element pool) is byte-identical to the previous
+/// single-mutex design.
 pub struct AppState {
-    engine: Mutex<InferenceEngine<'static>>,
+    engines: Arc<EnginePool>,
     tokenizer: Option<TokenizerBridge>,
     metrics: Arc<InferenceMetrics>,
 }
 
 impl AppState {
-    /// Acquire a mutable guard over the inference engine.
-    pub async fn engine_lock(&self) -> tokio::sync::MutexGuard<'_, InferenceEngine<'static>> {
-        self.engine.lock().await
+    /// Acquire an exclusive lease on one engine replica from the pool, waiting
+    /// asynchronously if every replica is currently busy.
+    ///
+    /// The returned [`EngineLease`] derefs to the engine (so callers invoke the
+    /// usual `generate*` methods) and returns it to the pool on drop.
+    pub async fn acquire_engine(&self) -> Result<EngineLease, PoolError> {
+        self.engines.acquire().await
+    }
+
+    /// Access the underlying engine pool.
+    pub fn engines(&self) -> &Arc<EnginePool> {
+        &self.engines
     }
 
     /// Access the optional tokenizer.
@@ -200,6 +214,10 @@ struct ChunkDelta {
 }
 
 /// Create the Axum router.
+///
+/// Wraps the single `engine` in a 1-element [`EnginePool`], preserving
+/// byte-identical single-request behavior. Use
+/// [`create_router_with_pool`] to serve from a multi-replica pool.
 pub fn create_router(
     engine: InferenceEngine<'static>,
     tokenizer: Option<TokenizerBridge>,
@@ -208,13 +226,30 @@ pub fn create_router(
 }
 
 /// Create the Axum router with a shared metrics instance.
+///
+/// Wraps the single `engine` in a 1-element [`EnginePool`] and delegates to
+/// [`create_router_with_pool`].
 pub fn create_router_with_metrics(
     engine: InferenceEngine<'static>,
     tokenizer: Option<TokenizerBridge>,
     metrics: Arc<InferenceMetrics>,
 ) -> Router {
+    create_router_with_pool(EnginePool::new(vec![engine]), tokenizer, metrics)
+}
+
+/// Create the Axum router from a pre-built [`EnginePool`].
+///
+/// This is the shared core behind [`create_router`] and
+/// [`create_router_with_metrics`]; it lets server entry points serve from a
+/// multi-replica pool so independent requests generate concurrently instead of
+/// serializing on a single engine mutex.
+pub fn create_router_with_pool(
+    engines: Arc<EnginePool>,
+    tokenizer: Option<TokenizerBridge>,
+    metrics: Arc<InferenceMetrics>,
+) -> Router {
     let state = Arc::new(AppState {
-        engine: Mutex::new(engine),
+        engines,
         tokenizer,
         metrics,
     });
@@ -307,6 +342,7 @@ async fn chat_completions(
             Arc::clone(&state),
             prompt_tokens,
             body.max_tokens,
+            body.temperature,
             request_id,
         )
         .await
@@ -316,6 +352,7 @@ async fn chat_completions(
             Arc::clone(&state),
             prompt_tokens,
             body.max_tokens,
+            body.temperature,
             request_id,
         )
         .await
@@ -337,15 +374,33 @@ async fn chat_completions_non_stream(
     state: Arc<AppState>,
     prompt_tokens: Vec<u32>,
     max_tokens: usize,
+    temperature: f32,
     request_id: RequestId,
 ) -> Result<Response, StatusCode> {
     let prompt_len = prompt_tokens.len();
 
-    let mut engine = state.engine.lock().await;
-    let output_tokens = engine.generate(&prompt_tokens, max_tokens).map_err(|e| {
-        tracing::error!(error = %e, "generation failed");
-        StatusCode::INTERNAL_SERVER_ERROR
+    // Honor the request's temperature while keeping every other sampling knob
+    // (top-k / top-p / repetition penalty) at the engine's startup defaults, so
+    // a request that omits `temperature` is bit-identical to the previous
+    // behavior. The engine's PRNG state is preserved across the swap.
+    let params = crate::sampling::SamplingParams {
+        temperature,
+        ..crate::sampling::SamplingParams::default()
+    };
+
+    let mut lease = state.acquire_engine().await.map_err(|e| {
+        tracing::error!(error = %e, "engine pool acquire failed");
+        StatusCode::SERVICE_UNAVAILABLE
     })?;
+    let output_tokens = lease
+        .generate_with_params(&prompt_tokens, max_tokens, &params)
+        .map_err(|e| {
+            tracing::error!(error = %e, "generation failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    // Return the engine to the pool as soon as generation is done, before the
+    // (potentially slow) decode/serialization below.
+    drop(lease);
 
     let completion_len = output_tokens.len();
 
@@ -392,6 +447,7 @@ async fn chat_completions_stream(
     state: Arc<AppState>,
     prompt_tokens: Vec<u32>,
     max_tokens: usize,
+    temperature: f32,
     request_id: RequestId,
 ) -> Result<Response, StatusCode> {
     let completion_id = format!("chatcmpl-{}", rand_id());
@@ -402,13 +458,26 @@ async fn chat_completions_stream(
 
     let (token_tx, token_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
 
-    // Spawn generation task that locks the engine and streams tokens
-    let gen_state = Arc::clone(&state);
+    // Honor the request's temperature while keeping the other sampling knobs at
+    // the engine's startup defaults (see the non-streaming handler), so omitting
+    // `temperature` is bit-identical to the previous streaming behavior.
+    let params = crate::sampling::SamplingParams {
+        temperature,
+        ..crate::sampling::SamplingParams::default()
+    };
+
+    // Acquire an engine lease in async context, then move it into the blocking
+    // generation task. The lease's Drop (a synchronous std-mutex push) runs at
+    // the closure's end — no async in Drop, so this is safe off the runtime.
+    let mut lease = state.acquire_engine().await.map_err(|e| {
+        tracing::error!(error = %e, "engine pool acquire failed");
+        StatusCode::SERVICE_UNAVAILABLE
+    })?;
     tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Handle::current();
-        let mut engine = rt.block_on(gen_state.engine.lock());
-        let _result = engine.generate_streaming(&prompt_tokens, max_tokens, &token_tx);
-        // token_tx is dropped here, closing the channel
+        let _result =
+            lease.generate_streaming_with_params(&prompt_tokens, max_tokens, &params, &token_tx);
+        // lease (and thus token_tx) is dropped here: the engine returns to the
+        // pool and the channel closes.
     });
 
     // Build SSE stream from the token receiver

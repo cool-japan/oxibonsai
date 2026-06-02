@@ -1,0 +1,50 @@
+[package]
+name = "oxibonsai-image"
+description = "FLUX.2 DiT (bonsai-image) GGUF weight loader and configuration for OxiBonsai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/oxibonsai-image"
+keywords = ["gguf", "flux", "diffusion", "ternary", "text-to-image"]
+categories = ["science", "algorithms"]
+
+[features]
+# GPU-accelerated ternary (TQ2_0_g128) DiT matmuls via the fused Metal kernel in
+# `oxibonsai-kernels`. Opt-in; the default build stays Pure-Rust CPU. The GPU path
+# is only compiled on macOS (the kernels-crate re-exports are
+# `cfg(all(feature = "metal", target_os = "macos"))`); on other targets enabling
+# this feature is a no-op for the DiT dispatch. `oxibonsai-kernels` is already a
+# non-optional dependency (for `softmax_simd`), so this only forwards its `metal`
+# feature rather than gating the dependency itself.
+metal = ["oxibonsai-kernels/metal"]
+
+# CUDA GPU backend, the `target_os`-disjoint sibling of `metal` (Linux/Windows).
+# `cuda` is a compile-only stub (forwards the kernels-crate `cuda` feature); the
+# image-crate CUDA hooks gate on `native-cuda`, so with `cuda` alone the dispatch
+# stays a no-op (CPU path). `native-cuda` enables the real cudarc backend and the
+# CUDA hooks. CANNOT build on macOS (cudarc needs the CUDA toolkit) — the hooks
+# are `cfg`'d out there. Like `metal`, this only forwards the kernels-crate
+# feature rather than gating the (already non-optional) dependency itself.
+cuda = ["oxibonsai-kernels/cuda"]
+native-cuda = ["oxibonsai-kernels/native-cuda"]
+
+[dependencies]
+oxibonsai-core.workspace = true
+oxibonsai-kernels.workspace = true
+half.workspace = true
+thiserror.workspace = true
+memmap2.workspace = true
+safetensors.workspace = true
+oxiarc-deflate.workspace = true
+crc32fast.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+oxibonsai-kernels.workspace = true

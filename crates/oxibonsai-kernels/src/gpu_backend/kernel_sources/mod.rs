@@ -39,10 +39,17 @@ mod archive;
 mod attention;
 mod decode;
 mod decode_ternary;
+mod dit_attention_flash;
 mod fp8;
 mod fp8_prefill;
 mod prefill;
+mod prefill_f32_simdgroup;
+mod prefill_simdgroup;
+mod prefill_simdgroup_v10;
+mod prefill_tiled;
 mod utility;
+mod vae;
+mod vae_conv_implicit;
 
 #[cfg(any(all(feature = "metal", target_os = "macos"), feature = "cuda"))]
 pub use archive::*;
@@ -53,13 +60,27 @@ pub use decode::*;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub use decode_ternary::*;
 #[cfg(all(feature = "metal", target_os = "macos"))]
+pub use dit_attention_flash::*;
+#[cfg(all(feature = "metal", target_os = "macos"))]
 pub use fp8::*;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub use fp8_prefill::*;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub use prefill::*;
 #[cfg(all(feature = "metal", target_os = "macos"))]
+pub use prefill_f32_simdgroup::*;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub use prefill_simdgroup::*;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub use prefill_simdgroup_v10::*;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub use prefill_tiled::*;
+#[cfg(all(feature = "metal", target_os = "macos"))]
 pub use utility::*;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub use vae::*;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub use vae_conv_implicit::*;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Tests
@@ -121,6 +142,12 @@ mod tests {
         );
         // Ternary V7-based GEMM batch prefill kernel
         assert!(MSL_GEMM_TQ2_G128_V7.contains("kernel void gemm_tq2_g128_v7"));
+        // Ternary V8 tiled GEMM batch prefill kernel (large-M / DiT path)
+        assert!(MSL_GEMM_TQ2_G128_V8_TILED.contains("kernel void gemm_tq2_g128_v8_tiled"));
+        // Ternary V9 simdgroup_matrix GEMM batch prefill kernel (large-M / DiT path)
+        assert!(MSL_GEMM_TQ2_G128_V9_SIMDGROUP.contains("kernel void gemm_tq2_g128_v9_simdgroup"));
+        // Ternary V10 staging-optimized simdgroup_matrix GEMM (large-M / DiT path)
+        assert!(MSL_GEMM_TQ2_G128_V10_SIMDGROUP.contains("kernel void gemm_tq2_g128_v10_simdgroup"));
 
         // FP8 single-token GEMV kernels (Phase 27)
         assert!(MSL_GEMV_FP8_E4M3_V1.contains("kernel void gemv_fp8_e4m3"));
@@ -137,6 +164,17 @@ mod tests {
         assert!(MSL_FUSED_GATE_UP_SWIGLU_GEMM_FP8_E5M2_V1
             .contains("kernel void fused_gate_up_swiglu_gemm_fp8_e5m2"));
         assert!(MSL_GEMV_FP8_E5M2_PF_V1.contains("kernel void gemv_fp8_e5m2_pf"));
+
+        // VAE decoder per-op f32 primitives (FLUX.2 VAE on GPU)
+        assert!(MSL_IM2COL_F32.contains("kernel void im2col_f32"));
+        assert!(MSL_GROUPNORM_F32.contains("kernel void groupnorm_f32"));
+        assert!(MSL_SILU_F32.contains("kernel void silu_f32"));
+        assert!(MSL_UPSAMPLE_NEAREST_F32.contains("kernel void upsample_nearest_f32"));
+        // VAE im2col-free implicit-GEMM conv (high-res k=3 convs)
+        assert!(MSL_CONV2D_F32_IMPLICIT.contains("kernel void conv2d_f32_implicit"));
+
+        // FLUX.2 DiT flash-attention simdgroup_matrix kernel (the shipping path)
+        assert!(MSL_DIT_JOINT_ATTENTION_FLASH.contains("kernel void joint_attention_flash_f32"));
     }
 
     #[test]

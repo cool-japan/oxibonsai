@@ -13,6 +13,16 @@ use std::path::Path;
 fn main() {
     println!("cargo:rerun-if-changed=src/gpu_backend/kernel_sources.rs");
 
+    // Detect a nightly (or dev) compiler so the AArch64 software-prefetch
+    // intrinsic (`core::arch::aarch64::_prefetch`, gated behind the
+    // `stdarch_aarch64_prefetch` nightly feature) can be enabled. On stable
+    // the feature attribute would error (E0554), so we gracefully degrade the
+    // prefetch to a no-op — it is a pure perf hint and never affects results.
+    //
+    // Always declare the cfg via `rustc-check-cfg` so the `unexpected_cfgs`
+    // lint stays quiet (required on current Rust); only *set* it on nightly.
+    detect_nightly_aarch64_prefetch();
+
     let out_dir = match std::env::var("OUT_DIR") {
         Ok(d) => d,
         Err(_) => return,
@@ -29,6 +39,39 @@ fn main() {
 
     // Write empty stub if compilation was not attempted or failed
     let _ = std::fs::write(&metallib_path, b"");
+}
+
+/// Detect whether the active compiler is a nightly/dev build and, if so, emit
+/// the `nightly_aarch64_prefetch` cfg so `lib.rs` may enable the
+/// `stdarch_aarch64_prefetch` feature and the prefetch intrinsic stays active.
+///
+/// Detection uses `$RUSTC -vV` (falling back to `rustc`) and inspects the
+/// `release:` line: a nightly toolchain reports e.g. `release: 1.96.0-nightly`,
+/// while dev builds report `-dev`. No external crates are required.
+fn detect_nightly_aarch64_prefetch() {
+    // Declare the cfg unconditionally so `unexpected_cfgs` never fires, even on
+    // stable where the cfg is never set.
+    println!("cargo:rustc-check-cfg=cfg(nightly_aarch64_prefetch)");
+
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let output = match std::process::Command::new(&rustc).arg("-vV").output() {
+        Ok(o) if o.status.success() => o,
+        _ => return,
+    };
+    let version_info = String::from_utf8_lossy(&output.stdout);
+
+    let is_nightly = version_info.lines().any(|line| {
+        line.strip_prefix("release:")
+            .map(|rest| {
+                let rest = rest.trim();
+                rest.contains("nightly") || rest.contains("dev")
+            })
+            .unwrap_or(false)
+    });
+
+    if is_nightly {
+        println!("cargo:rustc-cfg=nightly_aarch64_prefetch");
+    }
 }
 
 #[cfg(target_os = "macos")]

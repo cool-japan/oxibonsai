@@ -16,6 +16,14 @@ keywords = ["llm", "inference", "server", "openai", "bonsai"]
 name = "oxibonsai-serve"
 path = "src/main.rs"
 
+[features]
+# Forward the GPU backend to the runtime. The engine pool auto-clamps to a
+# single replica on the Metal tier (the GPU decode path is a process-global
+# singleton), so this only changes the kernel backend, not the server surface.
+metal = ["oxibonsai-runtime/metal"]
+# Mirror of `metal` for CUDA hosts.
+native-cuda = ["oxibonsai-runtime/native-cuda"]
+
 [dependencies]
 oxibonsai-core.workspace = true
 oxibonsai-runtime = { workspace = true, features = ["server"] }

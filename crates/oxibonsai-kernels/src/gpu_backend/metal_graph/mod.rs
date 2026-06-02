@@ -32,7 +32,9 @@
 //!     upload/download, and dispatch helpers.
 //!   - [`graph`]: [`MetalGraph`] struct, weight cache, single GEMV dispatch,
 //!     and the fused FFN phase.
-//!   - [`tests`]: Compile- and runtime correctness tests (no-op on non-Metal hosts).
+//!   - [`tests`] (+ `tests_gemv_tq2`, `tests_gemm_tq2`, `tests_gemm_f32`,
+//!     `tests_vae`, `tests_dit_attention`): Compile- and runtime correctness
+//!     tests, grouped by concern (no-op on non-Metal hosts).
 
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
@@ -41,6 +43,7 @@ mod error;
 mod graph;
 mod pipelines;
 mod reformat;
+mod vae;
 
 pub use error::{MetalGraphError, MetalWeightHandle};
 pub use graph::MetalGraph;
@@ -51,3 +54,13 @@ pub(crate) use buffers::{alloc_buf, div_ceil, download_f32, set_scalar, upload_f
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_dit_attention;
+#[cfg(test)]
+mod tests_gemm_f32;
+#[cfg(test)]
+mod tests_gemm_tq2;
+#[cfg(test)]
+mod tests_gemv_tq2;
+#[cfg(test)]
+mod tests_vae;

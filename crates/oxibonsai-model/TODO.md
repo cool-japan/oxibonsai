@@ -1,7 +1,7 @@
 # oxibonsai-model TODO
 
 > Qwen3 transformer model: layers, blocks, forward pass, KV cache, weight loaders
-> ~38,000 lines across `src/`, 1,060+ tests (2026-05-05)
+> ~38,000 lines across `src/`, 1,060+ tests (2026-06-02)
 
 ## Status: All Features Complete
 

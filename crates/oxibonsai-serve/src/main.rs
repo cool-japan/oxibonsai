@@ -7,11 +7,14 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use oxibonsai_core::config::Qwen3Config;
 use oxibonsai_runtime::engine::InferenceEngine;
+use oxibonsai_runtime::engine_pool::{build_pool_from_gguf, EnginePool};
+use oxibonsai_runtime::metrics::InferenceMetrics;
 use oxibonsai_runtime::sampling::SamplingParams;
-use oxibonsai_runtime::server::{create_router, serve_with_shutdown, shutdown_signal};
+use oxibonsai_runtime::server::{create_router_with_pool, serve_with_shutdown, shutdown_signal};
 use oxibonsai_runtime::tokenizer_bridge::TokenizerBridge;
 use oxibonsai_serve::{
     args::parse_args_from,
@@ -79,18 +82,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ..SamplingParams::default()
     };
 
-    let engine: InferenceEngine<'static> = match config.model.path.as_ref() {
+    // Engine-pool size precedence: config value (set via TOML / env /
+    // OXIBONSAI_ENGINE_POOL_SIZE, all already merged into `config.limits` by the
+    // layered loader) if present, else unset. We pass `None` through when unset
+    // so the pool builder applies the CPU default of `min(4, cores)`; replicas
+    // share one `Arc<[f32]>` token-embedding table, so each extra replica only
+    // adds a KV cache. The GPU/Metal tier is clamped back to 1 by the builder.
+    let requested_pool_size: Option<usize> = config.limits.engine_pool_size;
+
+    let pool: Arc<EnginePool> = match config.model.path.as_ref() {
         Some(path) => {
             info!(path = %path.display(), "loading GGUF model");
-            match InferenceEngine::from_gguf_path(
+            match build_pool_from_gguf(
                 path,
                 sampling.clone(),
                 config.seed,
                 config.limits.max_input_tokens,
+                requested_pool_size,
             ) {
-                Ok(e) => {
-                    info!("GGUF model loaded");
-                    e
+                Ok((pool, _tier, size)) => {
+                    info!(pool_size = size, "GGUF model loaded");
+                    pool
                 }
                 Err(err) => {
                     error!(
@@ -105,7 +117,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None => {
             warn!("no --model path supplied; falling back to tiny_test engine");
             let tiny = Qwen3Config::tiny_test();
-            InferenceEngine::new(tiny, sampling, config.seed)
+            let engine = InferenceEngine::new(tiny, sampling, config.seed);
+            // No GGUF to share across replicas; wrap the single in-memory engine
+            // in a 1-element pool (byte-identical to the prior single-engine
+            // fallback).
+            EnginePool::new(vec![engine])
         }
     };
 
@@ -156,7 +172,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
 
     // ── 7. Build router (with optional bearer auth) ───────────────────────
-    let base_router = create_router(engine, tokenizer);
+    //
+    // A fresh `InferenceMetrics` is created here, matching the previous
+    // `create_router(engine, tokenizer)` path (which built one internally). The
+    // pool serves the configured number of replicas (default min(4, cores) on
+    // CPU, clamped to 1 on GPU/Metal); a 1-element pool is byte-identical to the
+    // prior single-engine router.
+    let metrics = Arc::new(InferenceMetrics::new());
+    let base_router = create_router_with_pool(pool, tokenizer, metrics);
     let router = if let Some(ref token) = config.auth.bearer_token {
         let state = middleware::BearerAuthState {
             token: token.clone(),

@@ -56,6 +56,26 @@ pub mod cuda_graph;
     feature = "native-cuda",
     any(target_os = "linux", target_os = "windows")
 ))]
+pub mod cuda_imagen_attn_kernels;
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub mod cuda_imagen_dit_glue_kernels;
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub mod cuda_imagen_gemm_kernels;
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub mod cuda_imagen_vae_kernels;
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
 pub mod cuda_k_quant_kernels;
 #[cfg(all(
     feature = "native-cuda",
@@ -150,7 +170,9 @@ pub use metal_prefill::{
     feature = "native-cuda",
     any(target_os = "linux", target_os = "windows")
 ))]
-pub use cuda_graph::{try_cuda_ffn, try_cuda_qkv, CudaGraph, CudaGraphError, NativeCudaBackend};
+pub use cuda_graph::{
+    try_cuda_ffn, try_cuda_qkv, CudaGraph, CudaGraphError, DitSingleBlockWeights, NativeCudaBackend,
+};
 
 #[cfg(all(
     feature = "native-cuda",

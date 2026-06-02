@@ -153,6 +153,7 @@ fn clone_err(e: &MetalGraphError) -> MetalGraphError {
         MetalGraphError::BufferCreationFailed => MetalGraphError::BufferCreationFailed,
         MetalGraphError::EncodingFailed(s) => MetalGraphError::EncodingFailed(s.clone()),
         MetalGraphError::ExecutionFailed(s) => MetalGraphError::ExecutionFailed(s.clone()),
+        MetalGraphError::InvalidDimensions(s) => MetalGraphError::InvalidDimensions(s.clone()),
     }
 }
 
@@ -376,18 +377,18 @@ fn dispatch_gemm(
     );
     let input_buf = s.device.new_buffer_with_data(
         inputs.as_ptr() as *const std::ffi::c_void,
-        (inputs.len() * std::mem::size_of::<f32>()) as u64,
+        std::mem::size_of_val(inputs) as u64,
         MTLResourceOptions::StorageModeShared,
     );
     let output_buf = s.device.new_buffer_with_data(
         outputs.as_ptr() as *const std::ffi::c_void,
-        (outputs.len() * std::mem::size_of::<f32>()) as u64,
+        std::mem::size_of_val(outputs) as u64,
         MTLResourceOptions::StorageModeShared,
     );
     let residual_buf = residual.map(|r| {
         s.device.new_buffer_with_data(
             r.as_ptr() as *const std::ffi::c_void,
-            (r.len() * std::mem::size_of::<f32>()) as u64,
+            std::mem::size_of_val(r) as u64,
             MTLResourceOptions::StorageModeShared,
         )
     });
@@ -491,11 +492,11 @@ fn dispatch_fused_gate_up_swiglu(
     );
     let input_buf = s.device.new_buffer_with_data(
         inputs.as_ptr() as *const std::ffi::c_void,
-        (inputs.len() * std::mem::size_of::<f32>()) as u64,
+        std::mem::size_of_val(inputs) as u64,
         MTLResourceOptions::StorageModeShared,
     );
     let output_buf = s.device.new_buffer(
-        (outputs.len() * std::mem::size_of::<f32>()) as u64,
+        std::mem::size_of_val(outputs) as u64,
         MTLResourceOptions::StorageModeShared,
     );
 
@@ -702,12 +703,12 @@ mod tests {
             )
             .expect("CPU FP8 E4M3 GEMV reference should succeed");
             let _ = blocks_per_row;
-            for row in 0..n_rows {
+            for (row, out_elem) in row_out.iter().enumerate() {
                 let idx = col * n_rows + row;
                 if accumulate {
-                    outputs[idx] += row_out[row];
+                    outputs[idx] += *out_elem;
                 } else {
-                    outputs[idx] = row_out[row];
+                    outputs[idx] = *out_elem;
                 }
             }
         }
@@ -733,12 +734,12 @@ mod tests {
                 k,
             )
             .expect("CPU FP8 E5M2 GEMV reference should succeed");
-            for row in 0..n_rows {
+            for (row, out_elem) in row_out.iter().enumerate() {
                 let idx = col * n_rows + row;
                 if accumulate {
-                    outputs[idx] += row_out[row];
+                    outputs[idx] += *out_elem;
                 } else {
-                    outputs[idx] = row_out[row];
+                    outputs[idx] = *out_elem;
                 }
             }
         }

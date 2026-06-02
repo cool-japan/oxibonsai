@@ -61,10 +61,12 @@ fi
 # ── Download from HuggingFace ────────────────────────────────────────────────
 echo "Downloading $REPO  (using: $HF_CMD)..."
 hf_download() {
+    # The new `hf` CLI's argparse requires positional `filenames` to appear
+    # before optional flags; older `huggingface-cli` was order-agnostic.
     "$HF_CMD" download "$REPO" \
+        "$@" \
         --local-dir "$LOCAL_DIR" \
-        "${HF_PARALLEL_ARGS[@]}" \
-        "$@"
+        "${HF_PARALLEL_ARGS[@]}"
 }
 
 # Download metadata files first (always present).

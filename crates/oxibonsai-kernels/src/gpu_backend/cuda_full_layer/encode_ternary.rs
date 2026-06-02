@@ -838,6 +838,7 @@ mod ternary_cuda_tests {
     /// NOTE: CI-GPU-gated — requires CUDA hardware to run.
     #[test]
     fn test_encode_lm_head_gemv_ternary_matches_reference() {
+        let _serial = crate::gpu_backend::cuda_graph::types::gpu_parity_test_guard();
         use oxibonsai_core::{BlockTQ2_0_g128, QK_TQ2_0_G128};
 
         let hidden_size: usize = 128;
@@ -893,10 +894,15 @@ mod ternary_cuda_tests {
         let aos_bytes: Vec<u8> = blocks
             .iter()
             .flat_map(|b| {
+                // AoS bytes in BlockTQ2_0_g128 `#[repr(C)]` field order: the 32 qs
+                // bytes FIRST, then the FP16 scale (qs first, scale last) — the
+                // exact layout a raw reinterpret of `&[BlockTQ2_0_g128]`
+                // (`blocks_as_bytes_ternary`) produces and that
+                // `get_or_upload_weight_tq2_soa` / the proven Metal reformat consume.
                 let scale_bits = b.d.to_bits().to_le_bytes();
                 let mut v = Vec::with_capacity(34);
-                v.extend_from_slice(&scale_bits);
                 v.extend_from_slice(&b.qs);
+                v.extend_from_slice(&scale_bits);
                 v
             })
             .collect();
@@ -964,6 +970,7 @@ mod ternary_cuda_tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn test_encode_full_forward_ternary_matches_reference() {
+        let _serial = crate::gpu_backend::cuda_graph::types::gpu_parity_test_guard();
         use oxibonsai_core::{BlockTQ2_0_g128, BLOCK_TQ2_0_G128_BYTES};
 
         // ── GPU availability gate ─────────────────────────────────────────────
@@ -1005,14 +1012,15 @@ mod ternary_cuda_tests {
             }
         }
 
-        // Serialise a slice of BlockTQ2_0_g128 to AoS bytes (scale LE u16 first,
-        // then 32 qs bytes = 34 bytes/block total, matching AoS layout expected
-        // by get_or_upload_weight_tq2_soa).
+        // Serialise a slice of BlockTQ2_0_g128 to AoS bytes in `#[repr(C)]` field
+        // order: 32 qs bytes first, then the scale LE u16 (= 34 bytes/block),
+        // matching the AoS layout expected by get_or_upload_weight_tq2_soa (qs
+        // first, scale last — identical to a raw `&[BlockTQ2_0_g128]` reinterpret).
         let to_aos_bytes = |blocks: &[BlockTQ2_0_g128]| -> Vec<u8> {
             let mut out = Vec::with_capacity(blocks.len() * BLOCK_TQ2_0_G128_BYTES);
             for b in blocks {
-                out.extend_from_slice(&b.d.to_bits().to_le_bytes());
                 out.extend_from_slice(&b.qs);
+                out.extend_from_slice(&b.d.to_bits().to_le_bytes());
             }
             out
         };

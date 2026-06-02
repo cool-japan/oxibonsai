@@ -3,6 +3,8 @@
 pub mod cudagraph_accessors;
 pub mod cudagraph_accessors_1;
 pub mod cudagraph_context_arc_group;
+pub mod cudagraph_dit_block_group;
+pub mod cudagraph_dit_double_block_group;
 pub mod cudagraph_encoding;
 pub mod cudagraph_encoding_1;
 pub mod cudagraph_encoding_2;
@@ -10,6 +12,10 @@ pub mod cudagraph_encoding_3;
 pub mod cudagraph_encoding_4;
 pub mod cudagraph_encoding_5;
 pub mod cudagraph_global_group;
+pub mod cudagraph_imagen_attn_group;
+pub mod cudagraph_imagen_dit_glue_group;
+pub mod cudagraph_imagen_gemm_group;
+pub mod cudagraph_imagen_vae_group;
 pub mod cudagraph_launch_fused_gate_up_swiglu_group;
 pub mod cudagraph_launch_gemv_v7_residual_group;
 pub mod cudagraph_launch_gemv_v8_group;
@@ -35,6 +41,7 @@ pub mod nativecudabackend_traits;
 pub mod types;
 
 // Re-export public types and functions
+pub use cudagraph_dit_block_group::*;
 pub use cudagraph_type::*;
 pub use functions::*;
 pub use types::*;

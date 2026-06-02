@@ -8,9 +8,16 @@
 
 OxiBonsai is a zero-FFI, zero-C/C++ inference engine for PrismML's sub-2-bit Bonsai family — both the **1-bit** line (Q1\_0\_g128) and the **ternary** line (TQ2\_0\_g128). It runs on CPU (SIMD), Apple Silicon (Metal), and NVIDIA (CUDA) without depending on llama.cpp, BLAS, or any C/Fortran runtime. Built entirely on the COOLJAPAN ecosystem — SciRS2, OxiBLAS, OxiFFT — it delivers sovereign AI inference in Pure Rust.
 
+To our knowledge, OxiBonsai is the first pure-Rust — C/C++/Fortran-free, zero-FFI — inference engine for the Bonsai 1-bit/ternary model family, and the first to bring its FLUX.2-Klein text-to-image (Bonsai-Image) to pure Rust, built entirely on the COOLJAPAN ecosystem.
+
+## Documentation
+
+- [CLI reference](docs/CLI.md) — every `oxibonsai` and `oxibonsai-serve` subcommand, flag, and environment variable.
+- [Image-generation guide](docs/IMAGEN.md) — end-to-end Bonsai-Image (FLUX.2-Klein) text-to-image walkthrough.
+
 ## Status
 
-**Version 0.1.4** — released 2026-05-16 · **4,553 tests passing** · ~156k lines of Rust · Pure Rust
+**Version 0.1.5** — released 2026-06-02 · **4,680 tests passing** · ~177k lines of Rust · Pure Rust
 
 | Crate | Status | Tests |
 |-------|--------|-------|
@@ -22,6 +29,7 @@ OxiBonsai is a zero-FFI, zero-C/C++ inference engine for PrismML's sub-2-bit Bon
 | oxibonsai-rag      | Stable | 871   |
 | oxibonsai-eval     | Stable | 513   |
 | oxibonsai-serve    | Stable | 260   |
+| oxibonsai-image    | Stable | see oxibonsai-image/ |
 | oxibonsai (facade) | Stable | 352   |
 
 ## Features
@@ -52,6 +60,12 @@ Two native quantization families, each with dedicated dequant / GEMV / full-forw
 | **CUDA (scirs2)** | NVIDIA GPU | GPU via scirs2-core | `cuda` |
 
 Auto-detection via `KernelDispatcher::auto_detect()` selects the best CPU tier at runtime. GPU backends are opt-in at build time.
+
+> **Note on CPU tiers:** The CPU tier is chosen *entirely at runtime* via `is_x86_feature_detected!` — the dispatcher picks AVX-512 only when AVX-512F+BW+VL are all present, otherwise AVX2+FMA, otherwise the scalar reference path. Each SIMD function carries a per-function `#[target_feature(...)]` attribute, so a single x86-64 binary is safe on every x86-64 CPU and automatically falls back (AVX-512 → AVX-2 → scalar) with no SIGILL. The `simd-avx2` / `simd-avx512` / `simd-neon` Feature Flags above are accepted for compatibility but do **not** gate tier selection — all tiers are always compiled in and chosen at runtime.
+>
+> AVX-512 has been absent from Intel *consumer* CPUs since Alder Lake (Raptor Lake, Meteor Lake, Arrow Lake and Lunar Lake have none); it mainly benefits Xeon / HEDT and AMD Zen 4+. On consumer hardware the AVX-2 tier is selected automatically.
+>
+> There is currently no INT8 dot-product tier (AVX-VNNI `vpdpbusd` / NEON-UDOT `vdotq_s32`): the 1-bit and ternary kernels expand weights to ±scale and accumulate in FP32 FMA. An INT8 dot-product tier — which would require quantizing activations to INT8 — is a possible future enhancement.
 
 ### Fused GPU Full-Forward Path
 
@@ -159,7 +173,7 @@ This installs the `oxibonsai` binary. Rust 1.86+ required.
 
 ```toml
 [dependencies]
-oxibonsai = "0.1.4"
+oxibonsai = "0.1.5"
 ```
 
 ### Build from source (for development)
@@ -169,6 +183,38 @@ git clone https://github.com/cool-japan/oxibonsai
 cd oxibonsai
 cargo build --release
 # binary at: target/release/oxibonsai
+```
+
+## Configuration (`.env`)
+
+The CLI auto-loads a `.env` file from the current directory (or any parent), so you can
+omit the model/path flags. Precedence: `--flag` > shell env var > `.env` > built-in default.
+
+```bash
+# Fetch the template from GitHub …
+curl -fsSL https://raw.githubusercontent.com/cool-japan/oxibonsai/master/.env.example -o .env
+# … or, in a source checkout:  cp .env.example .env
+
+# Edit .env to point at your model files
+$EDITOR .env
+```
+
+Keys:
+
+| Key | Used by | Purpose |
+|-----|---------|---------|
+| `OXI_MODEL` | `run` / `chat` / `serve` / `info` | GGUF model path (omit `--model`) |
+| `OXI_TOKENIZER` | `run` / `chat` / `serve` | tokenizer.json/dir (optional) |
+| `OXI_DIT_GGUF` | `image` | FLUX.2 Klein ternary DiT GGUF |
+| `OXI_VAE_WEIGHTS` | `image` | VAE decoder weights dir |
+| `OXI_TE_4BIT` | `image` | 2.1 GB 4-bit MLX text-encoder `model.safetensors` |
+| `OXI_TE_TOKENIZER_DIR` | `image` | text-encoder tokenizer dir |
+
+With `.env` in place, the flags become optional:
+
+```bash
+oxibonsai run   --prompt "Explain ternary quantization in one sentence."
+oxibonsai image --prompt "a tiny bonsai tree in a ceramic pot" --out bonsai.png
 ```
 
 ## Quick Start
@@ -216,6 +262,9 @@ The tokenizer is pulled from `Qwen/Qwen3-8B` on HuggingFace (~2.7 MB).
 Use `--output` to save elsewhere, `--repo` to use a different HF repo.
 
 ### Step 4 — Run inference
+
+> **Tip:** set `OXI_MODEL` (and optionally `OXI_TOKENIZER`) in `.env`
+> (see [Configuration](#configuration-env)) to omit `--model`.
 
 ```bash
 # 1-bit Bonsai-8B

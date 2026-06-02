@@ -32,6 +32,10 @@ pub struct ConvertStats {
     pub n_ternary: usize,
     /// Number of tensors stored as FP32.
     pub n_fp32: usize,
+    /// Number of tensors stored verbatim as BF16 (e.g. MLX skip-pattern tensors).
+    pub n_bf16: usize,
+    /// Number of tensors stored verbatim as F16.
+    pub n_f16: usize,
     /// Total size of the output GGUF file in bytes.
     pub output_bytes: usize,
 }
@@ -77,7 +81,7 @@ pub fn write_metadata(
         MetadataWriteValue::Str("TQ2_0_G128".to_string()),
     );
 
-    // Integer keys (u32)
+    // Integer keys (u32) - required.
     let u32_keys = [
         (keys::LLM_BLOCK_COUNT, "num_hidden_layers"),
         (keys::LLM_EMBEDDING_LENGTH, "hidden_size"),
@@ -93,6 +97,18 @@ pub fn write_metadata(
         } else {
             tracing::warn!(json_key, "missing or non-u64 field in config.json");
         }
+    }
+
+    // head_dim is optional in config.json: Qwen3 (1.7B/4B/8B/14B) sets it
+    // explicitly because head_dim is decoupled from hidden_size/num_heads
+    // (notably Qwen3-4B has hidden=2560, heads=32, head_dim=128, so the
+    // derived hidden/heads=80 is wrong). Older Qwen2 configs omit it and
+    // the reader falls back to the hidden/heads derivation.
+    if let Some(val) = config.get("head_dim").and_then(Value::as_u64) {
+        writer.add_metadata(
+            keys::LLM_ATTENTION_KEY_LENGTH,
+            MetadataWriteValue::U32(val as u32),
+        );
     }
 
     // rms_norm_eps → F32

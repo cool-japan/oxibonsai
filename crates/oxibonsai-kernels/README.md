@@ -1,6 +1,6 @@
 # oxibonsai-kernels
 
-[![Version](https://img.shields.io/badge/version-0.1.4-blue.svg)](https://crates.io/crates/oxibonsai-kernels)
+[![Version](https://img.shields.io/badge/version-0.1.5-blue.svg)](https://crates.io/crates/oxibonsai-kernels)
 
 Q1_0_g128 (1-bit) and TQ2_0_g128 (ternary) compute kernels for OxiBonsai — dequantization, GEMV, GEMM, fused full-forward.
 
@@ -37,14 +37,20 @@ Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 | AVX-512 | `simd-avx512` | 512-bit | x86-64 |
 | NEON | `simd-neon` | 128-bit | AArch64 |
 
+> **Tiers are selected at runtime, not at build time.** `KernelDispatcher` uses `is_x86_feature_detected!` to pick AVX-512 only when AVX-512F+BW+VL are all present, otherwise AVX2+FMA, otherwise the scalar reference. Every SIMD function carries a per-function `#[target_feature(...)]` attribute, so all tiers are always compiled into a single x86-64 binary that is safe on every x86-64 CPU and falls back automatically (AVX-512 → AVX-2 → scalar) with no SIGILL. The `Feature Flag` column above is therefore informational: the `simd-avx2` / `simd-avx512` / `simd-neon` features do **not** gate tier selection (see below).
+>
+> AVX-512 is absent from Intel *consumer* CPUs since Alder Lake (Raptor Lake / Meteor Lake / Arrow Lake / Lunar Lake have none) and mainly benefits Xeon / HEDT and AMD Zen 4+; consumer hardware auto-selects the AVX-2 tier.
+>
+> There is no INT8 dot-product tier (AVX-VNNI `vpdpbusd` / NEON-UDOT `vdotq_s32`): the 1-bit and ternary kernels expand weights to ±scale and accumulate in FP32 FMA. An INT8 dot-product tier (requiring INT8-quantized activations) is a possible future enhancement.
+
 ## Cargo Features
 
 | Feature | Purpose |
 |---------|---------|
-| `simd-avx2` | Enable AVX2+FMA SIMD kernels (x86-64) |
+| `simd-avx2` | No-op, accepted for compatibility — the AVX2+FMA tier is always compiled and auto-selected at runtime (does not gate the tier) |
 | `avx2` | Alias for `simd-avx2` (Cargo shorthand) |
-| `simd-avx512` | Enable AVX-512 SIMD kernels (x86-64) |
-| `simd-neon` | Enable NEON SIMD kernels (AArch64) |
+| `simd-avx512` | No-op, accepted for compatibility — the AVX-512 tier is always compiled and auto-selected at runtime when AVX-512F+BW+VL are present (does not gate the tier) |
+| `simd-neon` | No-op, accepted for compatibility — the NEON tier is always compiled and auto-selected at runtime on AArch64 (does not gate the tier) |
 | `neon` | Alias for `simd-neon` (Cargo shorthand) |
 | `metal` | Metal GPU backend + fused full-forward (macOS only) |
 | `native-cuda` | Native CUDA NVRTC backend via `cudarc` (Linux/Windows) |
@@ -57,7 +63,7 @@ Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 ```toml
 [dependencies]
 # Auto-detect at runtime:
-oxibonsai-kernels = { version = "0.1.4", features = ["simd-avx2"] }
+oxibonsai-kernels = { version = "0.1.5", features = ["simd-avx2"] }
 ```
 
 ```rust

@@ -24,6 +24,7 @@
 //! ```
 
 pub mod common;
+pub mod mlx_image;
 pub mod name_map;
 pub mod onnx;
 

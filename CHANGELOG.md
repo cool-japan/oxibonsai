@@ -5,6 +5,75 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5] - 2026-06-02
+
+### Added
+
+- **New crate: `oxibonsai-image`** — complete Pure-Rust text-to-image pipeline for PrismML Bonsai-Image (FLUX.2-Klein 4B); first pure-Rust, C/C++/Fortran-free, zero-FFI implementation of the Bonsai-Image FLUX.2-Klein text-to-image pipeline, built entirely on the COOLJAPAN ecosystem.
+
+- **DiT: `Flux2Transformer2DModel`** (`oxibonsai-image`): 5 double-stream + 20 single-stream blocks, TQ2_0_g128 ternary weights, 128-channel latents. 4-axis RoPE, AdaLN modulation, fused gate+up+SwiGLU, joint/single attention. Parity gate: `dit_parity` 59 taps cos≥0.999.
+
+- **Ternary GEMM v10 kernel** (`oxibonsai-kernels`): f16-D-EXACT staging (code×scale∈{−s,0,+s}), vectorized dequant-scatter. ~1.89× over v9 end-to-end DiT on Apple Silicon Metal. All 59 dit_parity taps cos≥0.999.
+
+- **Flash-attention Metal kernel** (`oxibonsai-image`, `oxibonsai-kernels`): `dit_attention_flash.rs` — simdgroup f32 MACs, flash-v2 online-softmax. 5.47× vs CPU rayon+NEON reference (59ms vs 323ms per step); parity cos=1.0 (59 taps cos≥0.999). Default-on for DiT inference.
+
+- **`AutoencoderKLFlux2` VAE decoder** (`oxibonsai-image`): Pure-Rust Conv2d (im2col + GEMM), GroupNorm(32), SiLU, ResNet blocks (layers_per_block=2), 4-stage upsample (128/256/512/512), post_quant_conv, patch[2,2] unpack, fp32 (force_upcast). Parity gate: `vae_parity` 11 taps cos≥0.999.
+
+- **Metal GPU VAE** (`oxibonsai-image`): default-on GPU VAE decode (`OXI_VAE_GPU`, opt-out env="0"). 22.5s → 6.9s (~3.2× over CPU); 11/11 cos≥0.999.
+
+- **Implicit GEMM im2col-free conv** (`oxibonsai-image`, `src/vae/vae_conv_implicit.rs`): routed in `encode_conv2d_f32` for k≥3; eliminates im2col allocation for convolutions; VAE 9.1s → 6.9s.
+
+- **Native VAE safetensors loader** (`oxibonsai-image`, `src/vae/safetensors.rs`): reads FLUX.2 `.safetensors` directly — bf16→f32 lossless decode (bit-shift, zero rounding error), conv weight transpose [O,I,kH,kW]→[O,kH,kW,I], `to_out.0` ModuleList un-nesting. Eliminates the Python `.npy` export step entirely. Parity gate: `vae_safetensors_parity` (bit-identity + determinism).
+
+- **Qwen3-4B Text Encoder (4-bit)** (`oxibonsai-image`): `open_mlx_4bit` loads native 2.1 GB MLX 4-bit safetensors directly (was 15 GB f32 `.npy`). Dequantizes `mlx-packed-affine` 4-bit weights to f32 on demand. Real Bonsai-Image footprint ≈3.5 GB. Parity gate: `te_parity` cos≥0.999999 vs MLX oracle.
+
+- **MLX-exact Threefry-2×32 RNG port** (`oxibonsai-image`, `src/sample/mlx_rng.rs`): byte-exact reproduction of MLX C++ (5 rounds, exact rotation constants and per-round key-inject, `primitives.cpp` fill layout). `--seed 42` byte-matches official mflux reference.
+
+- **Flow-match Euler scheduler** (`oxibonsai-image`): dynamic μ-shift (seq_len-dependent, exponential time-shift type), native init noise, `img_ids`, `txt_ids`, sigmas/timesteps generation.
+
+- **PNG output** (`oxibonsai-image`): oxiarc-deflate Pure-Rust DEFLATE (COOLJAPAN ecosystem; no flate2/zstd/zip). Parity-validated vs reference PNG at 512×512.
+
+- **`oxibonsai image` CLI subcommand**: `oxibonsai image --prompt … --seed N --out x.png` standalone text-to-image command. Env vars: `OXI_DIT_GGUF`, `OXI_VAE_WEIGHTS` (dir OR `.safetensors`), `OXI_TE_4BIT`, `OXI_TE_TOKENIZER_DIR`.
+
+- **CUDA imagen acceleration** (`oxibonsai-kernels`, `oxibonsai-image`): CUDA native-GPU backend for imagen on Linux/Windows (authored as a blind mirror of the Metal path; parity-first plain-FP32, cap-of-8-safe, additive — Metal byte-unchanged). Steps=4 benchmark on A4000-class GPU: ~101s → ~31.7s (3.2×); cos=1.0 throughout (FP32, no tensor cores). Three acceleration tiers:
+  - **`gemm_tq2` kernel retile** (32×32/2×2 → 128×128/8×8 transposed-shared): ~6× kernel speedup.
+  - **Flash-attention warp-cooperative** (lane-split head_dim + `__shfl_xor_sync`): ~6.3× kernel speedup.
+  - **Stage-0 context_embedder GPU port** (`encode_gemm_f32`): 2.838s → 0.048s = 59× on that operation; DiT sample 6.17s → 3.32s; steps=4 45.4s → 31.7s.
+
+- **Engine pool + CPU↔Metal parity guard** (`oxibonsai-runtime`, `src/engine_pool.rs`): `EnginePool` wrapping `Vec<InferenceEngine>` with `Arc<Semaphore>` permits. CPU tier = N replicas sharing one `Arc<[f32]>` token-embedding table (eliminates N duplicate ~1.16 GB allocations); GPU tier = clamped to 1 (Metal process-global singleton). `build_pool_from_gguf` API. `InferenceEngine` validates byte-identical greedy output across backends at startup. Default CPU pool size: `min(4, num_cpus)`.
+
+- **`.env` / dotenvy auto-load**: all CLI subcommands now auto-load a `.env` file from the current directory or any parent directory (via `dotenvy`). Precedence: CLI flag > shell env > `.env` > built-in default. `.env.example` updated with all imagen-specific keys.
+
+- **`docs/IMAGEN.md`** (new): end-to-end asset acquisition (DiT download → GGUF convert; TE 4-bit direct-load; VAE safetensors direct-load; tokenizer), environment setup, full CLI flag reference, build-per-GPU instructions, performance table (CUDA/Metal), parity validation harnesses, provenance declaration.
+
+- **`docs/CLI.md`** (new): exhaustive flag and environment variable reference for all `oxibonsai` and `oxibonsai-serve` subcommands.
+
+- **Stable+Nightly Rust build compatibility** (`oxibonsai-kernels`): previously required nightly Rust for `#[feature(stdarch_aarch64_prefetch)]`. Now builds cleanly on stable (1.86+) and nightly via:
+  - `build.rs` nightly-detect: sets `cfg(nightly_aarch64_prefetch)` when nightly toolchain is detected.
+  - `aarch64_prefetch!` macro: no-op on stable Rust, active prefetch on nightly (zero new warnings either way).
+
+### Changed
+
+- **Metal GPU default-on for imagen** (`oxibonsai-image`): DiT flash-attention and VAE GPU kernels are now default-on (opt-out via env vars); full pipeline ~52–62s on Apple Silicon M3 (steps=4, 512×512, vs ~10–15 min CPU-only). DiT sampler: 64.7s → 34.2s = 1.89×; VAE decode: 22.5s → 6.9s = 3.2×.
+
+- **README.md**: Pure-Rust world-first declaration ("first pure-Rust, C/C++/Fortran-free, zero-FFI implementation of the Bonsai-Image FLUX.2-Klein text-to-image pipeline, built entirely on the COOLJAPAN ecosystem"); Documentation section linking `docs/IMAGEN.md` and `docs/CLI.md`.
+
+- **`oxiarc-deflate`** workspace dependency: 0.3.1 → 0.3.2 (DEFLATE bug fix, affects PNG output correctness).
+
+- **`serde_json`** workspace dependency: 1.0.149 → 1.0.150.
+
+- **`tower-http`** workspace dependency: 0.6.10 → 0.6.11.
+
+### Fixed
+
+- **`fix(model): read head_dim from GGUF metadata for Qwen3-4B`** (`oxibonsai-model`): Qwen3-4B sets `head_dim=128` explicitly (`hidden_size / num_attention_heads = 2560 / 32 = 80 ≠ 128`). Deriving head_dim arithmetically caused `LinearTernary` shape mismatch (`expected [51200], got [81920]`) when loading Ternary-Bonsai-4B.gguf. Now reads `qwen3.attention.key_length` from GGUF metadata; falls back to arithmetic only when the key is absent.
+
+- **`fix(completions): temperature-discard bug`** (`oxibonsai-runtime`, `src/completions.rs`): temperature was being silently discarded from `SamplingParams` on the streaming completions path. Now threaded correctly.
+
+- **`fix(scripts): hf download arg order`** (`scripts/`): `hf` CLI argument order changed in newer releases; download scripts updated to match new `hf` CLI interface.
+
+---
+
 ## [0.1.4] - 2026-05-16 - Phase 33
 
 ### Changed

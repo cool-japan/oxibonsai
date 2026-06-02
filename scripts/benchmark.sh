@@ -5,7 +5,9 @@
 #
 
 OXIBONSAI="./target/release/oxibonsai"
-LLAMA_CLI="/Users/kitasan/work/refs/Bonsai-demo/bin/mac/llama-cli"
+# Optional llama.cpp comparison; point LLAMA_CLI at your llama-cli binary
+# (skipped automatically if not found / not executable).
+LLAMA_CLI="${LLAMA_CLI:-llama-cli}"
 MODEL="models/Bonsai-8B.gguf"
 TOKENIZER="models/tokenizer.json"
 TOKENS=50

@@ -47,8 +47,15 @@ impl CudaGraph {
 
     /// Reformat raw TQ2_0_g128 AoS bytes to SoA layout.
     ///
-    /// Each AoS block is 34 bytes: `[d: f16 LE (2 bytes)][qs: [u8; 32]]`.
-    /// SoA output is `[N×2 bytes FP16 scales][N×32 bytes qs]`.
+    /// Each AoS block is 34 bytes in `BlockTQ2_0_g128` `#[repr(C)]` field order:
+    /// `[qs: [u8; 32]][d: f16 LE (2 bytes)]` — i.e. the 32 quant-code bytes
+    /// FIRST, the FP16 scale LAST. This is exactly the byte layout produced by a
+    /// raw reinterpret of `&[BlockTQ2_0_g128]` (`blocks_as_bytes` /
+    /// `blocks_as_bytes_ternary`), and matches the input convention of the proven
+    /// Metal `reformat_tq2_aos_to_soa`.
+    ///
+    /// SoA output is `[N×2 bytes FP16 scales][N×32 bytes qs]` (all scales first,
+    /// then all qs) — the layout consumed by the TQ2 GEMV/GEMM kernels.
     ///
     /// Returns `None` when `aos_bytes.len()` is not a multiple of 34.
     fn reformat_tq2_aos_bytes_to_soa(aos_bytes: &[u8]) -> Option<Vec<u8>> {
@@ -60,14 +67,15 @@ impl CudaGraph {
         }
         let n = aos_bytes.len() / BLOCK_BYTES;
         let mut soa = Vec::with_capacity(aos_bytes.len());
-        // Scales pass
+        // Scales pass: the FP16 scale is the LAST 2 bytes of each block (after the
+        // 32 qs bytes), matching the `{ qs, d }` field order.
         for i in 0..n {
-            let src = i * BLOCK_BYTES;
+            let src = i * BLOCK_BYTES + QS_BYTES;
             soa.extend_from_slice(&aos_bytes[src..src + SCALE_BYTES]);
         }
-        // Quant codes pass
+        // Quant codes pass: the 32 qs bytes are the FIRST 32 bytes of each block.
         for i in 0..n {
-            let src = i * BLOCK_BYTES + SCALE_BYTES;
+            let src = i * BLOCK_BYTES;
             soa.extend_from_slice(&aos_bytes[src..src + QS_BYTES]);
         }
         Some(soa)

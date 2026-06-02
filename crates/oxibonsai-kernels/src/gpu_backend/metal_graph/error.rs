@@ -20,6 +20,9 @@ pub enum MetalGraphError {
     EncodingFailed(String),
     /// A command buffer execution failed or timed out.
     ExecutionFailed(String),
+    /// Supplied dimensions or buffer lengths are inconsistent (e.g. `k` not a
+    /// multiple of 128, or a slice length mismatching `m*k` / `m*n_rows`).
+    InvalidDimensions(String),
 }
 
 impl fmt::Display for MetalGraphError {
@@ -30,6 +33,7 @@ impl fmt::Display for MetalGraphError {
             Self::BufferCreationFailed => write!(f, "Metal buffer allocation failed"),
             Self::EncodingFailed(msg) => write!(f, "Metal encoding failed: {msg}"),
             Self::ExecutionFailed(msg) => write!(f, "Metal execution failed: {msg}"),
+            Self::InvalidDimensions(msg) => write!(f, "Metal invalid dimensions: {msg}"),
         }
     }
 }

@@ -6,6 +6,7 @@ use super::*;
 /// `Err` when no CUDA device is present (CI environment).
 #[test]
 fn test_try_cuda_full_layer_no_gpu_graceful() {
+    let _serial = crate::gpu_backend::cuda_graph::types::gpu_parity_test_guard();
     let graph_result = CudaGraph::global();
     if graph_result.is_err() {
         return; // No GPU -- skip.

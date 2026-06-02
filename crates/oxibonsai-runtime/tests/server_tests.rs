@@ -427,3 +427,99 @@ fn create_router_delegates_to_metrics_variant() {
     let _router = create_router(engine, None);
     // Construction alone verifies the delegation — no panic = success.
 }
+
+// ══════════════════════════════════════════════════════════════
+// Temperature is honored by the base /v1/chat/completions endpoint
+// ══════════════════════════════════════════════════════════════
+
+/// Request → SamplingParams mapping (b): an explicit `temperature` in the body
+/// is carried through, and omitting it falls back to the engine/server default
+/// of 0.7 — matching `SamplingParams::default().temperature`, which is what the
+/// shipped `oxibonsai serve` constructs its engine with.
+#[test]
+fn request_temperature_maps_into_sampling_params() {
+    // Explicit temperature is preserved verbatim.
+    let raw = serde_json::json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "temperature": 0.0
+    });
+    let parsed: oxibonsai_runtime::server::ChatCompletionRequest =
+        serde_json::from_value(raw).expect("deserialize request with temperature");
+    assert_eq!(parsed.temperature, 0.0, "explicit temperature must be kept");
+
+    let explicit = SamplingParams {
+        temperature: parsed.temperature,
+        ..SamplingParams::default()
+    };
+    assert_eq!(explicit.temperature, 0.0);
+    // Every other knob must equal today's effective default so omitting them is
+    // behavior-preserving.
+    let def = SamplingParams::default();
+    assert_eq!(explicit.top_k, def.top_k);
+    assert_eq!(explicit.top_p, def.top_p);
+    assert_eq!(explicit.repetition_penalty, def.repetition_penalty);
+
+    // Omitting temperature falls back to 0.7 (== SamplingParams::default()).
+    let raw_omitted = serde_json::json!({
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let parsed_omitted: oxibonsai_runtime::server::ChatCompletionRequest =
+        serde_json::from_value(raw_omitted).expect("deserialize request without temperature");
+    assert!(
+        (parsed_omitted.temperature - 0.7).abs() < f32::EPSILON,
+        "omitted temperature must default to 0.7, got {}",
+        parsed_omitted.temperature
+    );
+    assert!(
+        (parsed_omitted.temperature - SamplingParams::default().temperature).abs() < f32::EPSILON,
+        "default temperature must match SamplingParams::default()"
+    );
+}
+
+/// End-to-end (a): two identical `temperature: 0.0` requests through the base
+/// endpoint must produce byte-identical content. Before the fix the handler
+/// discarded `temperature` and always used the startup sampler (effective
+/// temp 0.7 → stochastic), so this would be flaky/non-greedy. Now temp=0 routes
+/// to deterministic greedy argmax, so the two completions must match exactly.
+#[tokio::test]
+async fn base_endpoint_temperature_zero_is_deterministic() {
+    async fn run_once() -> String {
+        // Fresh engine per call so RNG/KV state cannot leak between the two runs;
+        // greedy (temp=0) output must be identical regardless.
+        let engine = InferenceEngine::new(Qwen3Config::tiny_test(), SamplingParams::default(), 42);
+        let app = create_router(engine, None);
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 8,
+            "temperature": 0.0
+        });
+        let req = Request::post("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+            .expect("request");
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("parse json");
+        json["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("content should be a string")
+            .to_string()
+    }
+
+    let first = run_once().await;
+    let second = run_once().await;
+    // Non-trivial: greedy decoding on the tiny model emits real tokens, so the
+    // comparison below isn't just "" == "".
+    assert!(
+        !first.is_empty(),
+        "temperature=0 greedy run should produce content, got empty"
+    );
+    assert_eq!(
+        first, second,
+        "temperature=0 through the base endpoint must be deterministic (greedy); \
+         got {first:?} vs {second:?}"
+    );
+}

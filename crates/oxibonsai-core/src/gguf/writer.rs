@@ -78,6 +78,12 @@ pub enum TensorType {
     F16 = 1,
     /// 4-bit quantization, 32 weights per block, FP16 scale (GGML type 2, 18 bytes/block).
     Q4_0 = 2,
+    /// IEEE 754 bfloat16: 1 element per "block", 2 bytes (GGML/GGUF type 30).
+    ///
+    /// Used to store tensors that the source model keeps in bfloat16 at full
+    /// fidelity (e.g. FLUX.2 DiT skip-pattern tensors). The reader already
+    /// recognises type ID 30 generically, so such tensors round-trip exactly.
+    BF16 = 30,
     /// 8-bit quantization, 32 weights per block, FP16 scale (GGML type 8, 34 bytes/block).
     Q8_0 = 8,
     /// 4-bit K-quant, 256 weights per super-block, 6-bit sub-scales (GGML type 12, 144 bytes/block).
@@ -102,7 +108,7 @@ impl TensorType {
     /// Block size in elements for this quantisation type.
     pub fn block_size(self) -> usize {
         match self {
-            Self::F32 | Self::F16 => 1,
+            Self::F32 | Self::F16 | Self::BF16 => 1,
             Self::Q4_0 | Self::Q8_0 => 32,
             Self::Q1_0G128 => 128,
             Self::TQ2_0_g128 => 128,
@@ -115,7 +121,7 @@ impl TensorType {
     pub fn block_bytes(self) -> usize {
         match self {
             Self::F32 => 4,
-            Self::F16 => 2,
+            Self::F16 | Self::BF16 => 2,
             Self::Q4_0 => 18,
             Self::Q8_0 => 34,                    // 2 (FP16 scale) + 32 (i8 weights)
             Self::Q4_K => 144, // 2+2+12+128 (FP16 d+dmin, packed 6-bit scales, 4-bit nibbles)
@@ -544,5 +550,65 @@ mod tests {
             w.to_bytes(),
             Err(WriteError::DataSizeMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn bf16_tensor_type_block_geometry() {
+        // BF16 is 1 element per "block" of 2 bytes (GGUF type ID 30).
+        assert_eq!(TensorType::BF16 as u32, 30);
+        assert_eq!(TensorType::BF16.block_size(), 1);
+        assert_eq!(TensorType::BF16.block_bytes(), 2);
+        assert_eq!(TensorType::BF16.expected_bytes(6), 12);
+    }
+
+    #[test]
+    fn bf16_tensor_roundtrips_through_reader() {
+        use crate::gguf::reader::GgufFile;
+        use crate::gguf::types::GgufTensorType;
+
+        // Six bf16 bit patterns (values 1.0, -1.0, 0.0, 0.5, -0.0625, 2000.0).
+        let bits: [u16; 6] = [
+            half::bf16::from_f32(1.0).to_bits(),
+            half::bf16::from_f32(-1.0).to_bits(),
+            half::bf16::from_f32(0.0).to_bits(),
+            half::bf16::from_f32(0.5).to_bits(),
+            half::bf16::from_f32(-0.0625).to_bits(),
+            half::bf16::from_f32(2000.0).to_bits(),
+        ];
+        let mut data = Vec::new();
+        for b in bits {
+            data.extend_from_slice(&b.to_le_bytes());
+        }
+
+        let mut w = GgufWriter::new();
+        w.add_tensor(TensorEntry {
+            name: "norm_out.weight".to_string(),
+            shape: vec![2, 3], // 6 elements
+            tensor_type: TensorType::BF16,
+            data: data.clone(),
+        });
+        let file_bytes = w.to_bytes().expect("write bf16 gguf");
+
+        let parsed = GgufFile::parse(&file_bytes).expect("parse bf16 gguf");
+        let info = parsed
+            .tensors
+            .require("norm_out.weight")
+            .expect("tensor present");
+        assert_eq!(info.tensor_type, GgufTensorType::BF16);
+        assert_eq!(info.shape, vec![2, 3]);
+
+        let read_back = parsed.tensor_data("norm_out.weight").expect("data");
+        assert_eq!(
+            read_back,
+            data.as_slice(),
+            "bf16 bytes must round-trip exactly"
+        );
+
+        // And decode to f32 to confirm the values survive.
+        let decoded: Vec<f32> = read_back
+            .chunks_exact(2)
+            .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect();
+        assert_eq!(decoded, vec![1.0, -1.0, 0.0, 0.5, -0.0625, 2000.0]);
     }
 }

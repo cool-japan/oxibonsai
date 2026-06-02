@@ -283,6 +283,89 @@ fn ternary_gguf_loads_and_runs_forward() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Test 1b: shared token-embedding Arc across replicas
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Prove that the engine-pool sharing seam works at the model level: building
+/// several [`BonsaiModel`]s via [`BonsaiModel::from_gguf_with_embd`] from one
+/// `Arc<[f32]>` token-embedding table yields models that all point at the
+/// *same* allocation (ptr-equal), each with its own independent KV cache, and
+/// that the shared `Arc`'s strong count equals the number of live replicas.
+///
+/// This is the whole point of Part A/B: collapse N duplicate ~1.16 GiB
+/// embedding tables (for the 1.7B) into one shared allocation.
+#[test]
+fn shared_token_embd_arc_is_one_allocation_across_replicas() {
+    use oxibonsai_model::model::BonsaiModel;
+    use std::sync::Arc;
+
+    let bytes = build_tiny_ternary_gguf();
+    let gguf = GgufFile::parse(&bytes).expect("GgufFile::parse on synthetic GGUF");
+    let max_seq_len = 512;
+
+    // Load the token-embedding table ONCE via the canonical `from_gguf` path,
+    // then extract its shared handle. This mirrors what the pool builder does
+    // with replica #1.
+    let replica1 = BonsaiModel::from_gguf(&gguf, max_seq_len).expect("replica #1 from_gguf");
+    let shared = replica1.shared_token_embd();
+
+    // Build two more replicas that REUSE the same Arc, exactly as the pool
+    // builder does for replicas 2..N via `from_gguf_static_with_embd`.
+    let replica2 = BonsaiModel::from_gguf_with_embd(&gguf, max_seq_len, Arc::clone(&shared))
+        .expect("replica #2 from_gguf_with_embd");
+    let replica3 = BonsaiModel::from_gguf_with_embd(&gguf, max_seq_len, Arc::clone(&shared))
+        .expect("replica #3 from_gguf_with_embd");
+
+    let e1 = replica1.shared_token_embd();
+    let e2 = replica2.shared_token_embd();
+    let e3 = replica3.shared_token_embd();
+
+    // The whole point: all replicas share ONE token_embd allocation.
+    assert!(
+        Arc::ptr_eq(&e1, &e2),
+        "replica #1 and #2 token_embd must be the SAME allocation"
+    );
+    assert!(
+        Arc::ptr_eq(&e2, &e3),
+        "replica #2 and #3 token_embd must be the SAME allocation"
+    );
+
+    // Same values, obviously (it is literally the same memory).
+    assert_eq!(e1.len(), e2.len());
+    assert_eq!(&e1[..], &e2[..]);
+
+    // Each replica must own a DISTINCT, independent KV cache (the per-request
+    // mutable state that must NOT be shared).
+    let kv1 = replica1.kv_cache() as *const _;
+    let kv2 = replica2.kv_cache() as *const _;
+    let kv3 = replica3.kv_cache() as *const _;
+    assert_ne!(kv1, kv2, "replicas #1 and #2 must have distinct KV caches");
+    assert_ne!(kv2, kv3, "replicas #2 and #3 must have distinct KV caches");
+    assert_ne!(kv1, kv3, "replicas #1 and #3 must have distinct KV caches");
+
+    // Strong count: 3 replica-held clones + `shared` + the 3 freshly-pulled
+    // handles (e1/e2/e3) all alias one allocation.
+    drop(e1);
+    drop(e2);
+    drop(e3);
+    // After dropping the temporary handles, exactly the 3 replicas + `shared`
+    // hold the Arc.
+    assert_eq!(
+        Arc::strong_count(&shared),
+        4,
+        "expected 3 replicas + the shared handle to alias one allocation"
+    );
+
+    // Dropping a replica decrements the count, proving they really share it.
+    drop(replica3);
+    assert_eq!(
+        Arc::strong_count(&shared),
+        3,
+        "dropping a replica must release one reference to the shared embd"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Test 2: ternary export round-trip through temp_dir()
 // ─────────────────────────────────────────────────────────────────────────────
 

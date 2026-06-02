@@ -59,6 +59,7 @@ pub mod embedding_index;
 #[cfg(feature = "server")]
 pub mod embeddings;
 pub mod engine;
+pub mod engine_pool;
 pub mod error;
 pub mod grammar;
 pub mod health;

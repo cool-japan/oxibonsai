@@ -176,6 +176,17 @@ impl Sampler {
     pub fn params(&self) -> &SamplingParams {
         &self.params
     }
+
+    /// Replace the sampling parameters in place, preserving the PRNG state and
+    /// the reusable `probs_buf` allocation.
+    ///
+    /// Unlike constructing a fresh [`Sampler`], this leaves `rng_state`
+    /// untouched, so a caller can temporarily adjust (e.g.) the temperature for
+    /// one request without perturbing the RNG sequence that subsequent requests
+    /// on the same engine would observe.
+    pub fn set_params(&mut self, params: SamplingParams) {
+        self.params = params;
+    }
 }
 
 /// Return the index of the maximum element.

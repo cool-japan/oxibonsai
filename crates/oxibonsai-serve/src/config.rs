@@ -128,6 +128,17 @@ pub struct LimitsConfig {
     pub max_concurrent_requests: usize,
     /// Per-request timeout, in milliseconds.
     pub per_request_timeout_ms: u64,
+    /// Number of inference-engine replicas for concurrent CPU serving.
+    ///
+    /// `None` (the default) resolves to `min(4, CPU cores)` on CPU tiers, so a
+    /// few requests can generate in parallel out of the box. Replicas share one
+    /// `Arc<[f32]>` token-embedding table, so each extra replica only costs a KV
+    /// cache. An explicit value overrides this; the value is auto-clamped to `1`
+    /// on the GPU/Metal tier (a process-global singleton). Distinct from
+    /// [`Self::max_concurrent_requests`], which bounds HTTP-level admission
+    /// rather than the number of generation engines.
+    #[serde(default)]
+    pub engine_pool_size: Option<usize>,
 }
 
 impl Default for LimitsConfig {
@@ -136,6 +147,7 @@ impl Default for LimitsConfig {
             max_input_tokens: 8192,
             max_concurrent_requests: 32,
             per_request_timeout_ms: 60_000,
+            engine_pool_size: None,
         }
     }
 }
@@ -259,6 +271,8 @@ pub struct PartialServerConfig {
     pub max_input_tokens: Option<usize>,
     /// Maximum concurrent requests.
     pub max_concurrent_requests: Option<usize>,
+    /// Number of inference-engine replicas for concurrent CPU serving.
+    pub engine_pool_size: Option<usize>,
     /// Per-request timeout, milliseconds.
     pub per_request_timeout_ms: Option<u64>,
     /// Bearer token.
@@ -295,6 +309,7 @@ impl PartialServerConfig {
         merge_field!(default_top_p);
         merge_field!(max_input_tokens);
         merge_field!(max_concurrent_requests);
+        merge_field!(engine_pool_size);
         merge_field!(per_request_timeout_ms);
         merge_field!(bearer_token);
         merge_field!(log_level);
@@ -365,6 +380,7 @@ struct SamplingPartial {
 struct LimitsPartial {
     max_input_tokens: Option<usize>,
     max_concurrent_requests: Option<usize>,
+    engine_pool_size: Option<usize>,
     per_request_timeout_ms: Option<u64>,
 }
 #[derive(Debug, Default, Deserialize)]
@@ -399,6 +415,7 @@ impl TomlHelper {
             default_top_p: samp.default_top_p,
             max_input_tokens: lim.max_input_tokens,
             max_concurrent_requests: lim.max_concurrent_requests,
+            engine_pool_size: lim.engine_pool_size,
             per_request_timeout_ms: lim.per_request_timeout_ms,
             bearer_token: auth.bearer_token,
             log_level: obs.log_level,
@@ -455,6 +472,9 @@ impl ServerConfig {
         }
         if let Some(v) = p.max_concurrent_requests {
             out.limits.max_concurrent_requests = v;
+        }
+        if let Some(v) = p.engine_pool_size {
+            out.limits.engine_pool_size = Some(v);
         }
         if let Some(v) = p.per_request_timeout_ms {
             out.limits.per_request_timeout_ms = v;

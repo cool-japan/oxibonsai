@@ -77,8 +77,19 @@ pub async fn extended_chat_completions(
         ..SamplingParams::default()
     };
 
-    // Generate n completions
-    let mut engine = state.engine_lock().await;
+    // Generate n completions. One lease serves all `n` runs (they reset KV
+    // between runs, as before), so the replica is held for the whole batch.
+    let mut engine = match state.acquire_engine().await {
+        Ok(lease) => lease,
+        Err(e) => {
+            tracing::error!(error = %e, "engine pool acquire failed");
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "engine pool unavailable"})),
+            )
+                .into_response();
+        }
+    };
 
     let raw_completions: Vec<String> = {
         let mut results = Vec::with_capacity(n);
