@@ -2,7 +2,7 @@
 
 > Pure Rust BPE/Unigram/WordPiece tokenizer: encode, decode, training, serialization
 > 14 src files + 7 integration test files, ~7,000 lines, 351+ tests (all passing)
-> Version: 0.1.5 · Last updated: 2026-06-02
+> Version: 0.2.0 · Last updated: 2026-06-02
 
 ## Status: Stable — Phase 18: WordPiece tokenizer added
 

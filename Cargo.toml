@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.5"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/cool-japan/oxibonsai"
@@ -27,21 +27,21 @@ categories = ["science", "algorithms", "command-line-utilities"]
 
 [workspace.dependencies]
 # ── Internal crates ──
-oxibonsai-core = { path = "crates/oxibonsai-core", version = "0.1.5" }
-oxibonsai-image = { path = "crates/oxibonsai-image", version = "0.1.5" }
-oxibonsai-kernels = { path = "crates/oxibonsai-kernels", version = "0.1.5" }
-oxibonsai-model = { path = "crates/oxibonsai-model", version = "0.1.5" }
-oxibonsai-runtime = { path = "crates/oxibonsai-runtime", version = "0.1.5", default-features = false }
-oxibonsai-tokenizer = { path = "crates/oxibonsai-tokenizer", version = "0.1.5" }
-oxibonsai-serve = { path = "crates/oxibonsai-serve", version = "0.1.5" }
-oxibonsai-rag = { path = "crates/oxibonsai-rag", version = "0.1.5" }
-oxibonsai-eval = { path = "crates/oxibonsai-eval", version = "0.1.5" }
-oxibonsai = { path = "crates/oxibonsai", version = "0.1.5" }
+oxibonsai-core = { path = "crates/oxibonsai-core", version = "0.2.0" }
+oxibonsai-image = { path = "crates/oxibonsai-image", version = "0.2.0" }
+oxibonsai-kernels = { path = "crates/oxibonsai-kernels", version = "0.2.0" }
+oxibonsai-model = { path = "crates/oxibonsai-model", version = "0.2.0" }
+oxibonsai-runtime = { path = "crates/oxibonsai-runtime", version = "0.2.0", default-features = false }
+oxibonsai-tokenizer = { path = "crates/oxibonsai-tokenizer", version = "0.2.0" }
+oxibonsai-serve = { path = "crates/oxibonsai-serve", version = "0.2.0" }
+oxibonsai-rag = { path = "crates/oxibonsai-rag", version = "0.2.0" }
+oxibonsai-eval = { path = "crates/oxibonsai-eval", version = "0.2.0" }
+oxibonsai = { path = "crates/oxibonsai", version = "0.2.0" }
 
 # ── COOLJAPAN Ecosystem (Pure Rust Policy) ──
-scirs2-core = { version = "0.4.4", default-features = false }
-scirs2-linalg = { version = "0.4.4", default-features = false }
-scirs2-neural = { version = "0.4.4", default-features = false }
+scirs2-core = { version = "0.5.0", default-features = false }
+scirs2-linalg = { version = "0.5.0", default-features = false }
+scirs2-neural = { version = "0.5.0", default-features = false }
 oxifft = "0.3.2"
 oxiarc-deflate = "0.3.2"
 

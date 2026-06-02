@@ -1,6 +1,6 @@
 # oxibonsai TODO
 
-> v0.1.5 — 2026-06-02
+> v0.2.0 — 2026-06-02
 > **STABLE** — umbrella facade crate, re-exports all oxibonsai-* subcrates.
 
 ## Status

@@ -1,6 +1,6 @@
 # oxibonsai-kernels
 
-[![Version](https://img.shields.io/badge/version-0.1.5-blue.svg)](https://crates.io/crates/oxibonsai-kernels)
+[![Version](https://img.shields.io/badge/version-0.2.0-blue.svg)](https://crates.io/crates/oxibonsai-kernels)
 
 Q1_0_g128 (1-bit) and TQ2_0_g128 (ternary) compute kernels for OxiBonsai — dequantization, GEMV, GEMM, fused full-forward.
 
@@ -63,7 +63,7 @@ Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 ```toml
 [dependencies]
 # Auto-detect at runtime:
-oxibonsai-kernels = { version = "0.1.5", features = ["simd-avx2"] }
+oxibonsai-kernels = { version = "0.2.0", features = ["simd-avx2"] }
 ```
 
 ```rust

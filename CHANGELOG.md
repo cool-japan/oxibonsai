@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-06-02
+
+### Added
+
+- **Concurrent engine pool for `/serve`** (`oxibonsai-runtime`, `src/engine_pool.rs`): `EnginePool` wrapping `Vec<InferenceEngine>` with `Arc<Semaphore>` permits. CPU tier = N replicas sharing one `Arc<[f32]>` token-embedding table (eliminates N duplicate ~1.16 GB allocations); GPU tier = clamped to 1 (Metal process-global singleton). `build_pool_from_gguf` API. Default CPU pool size: `min(4, num_cpus)`.
+
+- **CPU-vs-Metal parity guard** (`oxibonsai-runtime`): `InferenceEngine` validates byte-identical greedy output across CPU and Metal backends at startup. Validated byte-identical on real 1.7B Ternary-Bonsai model.
+
+- **CUDA imagen backend** (`oxibonsai-kernels`, `oxibonsai-image`): native CUDA GPU backend for imagen on Linux/Windows, authored as a blind mirror of the Metal path; parity-first plain-FP32, cap-of-8-safe, additive (Metal byte-unchanged). Three acceleration tiers: `gemm_tq2` kernel retile (32×32 → 128×128 transposed-shared, ~6× kernel speedup); flash-attention warp-cooperative (lane-split head_dim + `__shfl_xoc_sync`, ~6.3× kernel speedup); Stage-0 context_embedder GPU port (`encode_gemm_f32`, 59× on that operation). Steps=4 benchmark projection on A4000-class hardware: ~101s → ~31.7s (3.2×). Compile + cos≥0.999 parity validation deferred to Linux/CUDA hardware.
+
+- **Text Encoder 4-bit** (`oxibonsai-image`): `open_mlx_4bit` loads native 2.1 GB MLX 4-bit safetensors directly (was 15 GB f32 `.npy`). Dequantizes `mlx-packed-affine` 4-bit weights to f32 on demand. Real Bonsai-Image footprint ≈3.5 GB. Parity gate: `te_parity` cos≥0.999999 vs MLX oracle. Activated via `OXI_TE_4BIT` env var.
+
+- **`oxibonsai image` CLI subcommand with `--seed` reproducibility** (`oxibonsai-image`): `oxibonsai image --prompt … --seed N --out x.png` standalone text-to-image command. MLX-exact Threefry-2×32 RNG port (`src/sample/mlx_rng.rs`) — byte-exact vs official mflux reference with `--seed 42`. Env vars: `OXI_DIT_GGUF`, `OXI_VAE_WEIGHTS`, `OXI_TE_4BIT`, `OXI_TE_TOKENIZER_DIR`.
+
+- **Stable-toolchain compatibility for `oxibonsai-kernels`**: previously required nightly Rust for `#[feature(stdarch_aarch64_prefetch)]`. Now builds cleanly on stable (1.86+) and nightly via `build.rs` nightly-detect setting `cfg(nightly_aarch64_prefetch)`, and `aarch64_prefetch!` macro (no-op on stable, active prefetch on nightly; zero new warnings either way).
+
+### Fixed
+
+- **Temperature-discard bug** (`oxibonsai-runtime`, `src/completions.rs`): temperature was being silently discarded from `SamplingParams` on the streaming completions path. Now threaded correctly through to sampling.
+
+---
+
 ## [0.1.5] - 2026-06-02
 
 ### Added
@@ -292,6 +314,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Comprehensive test suite (140 tests)
 - Cross-platform support (macOS, Linux, Windows, WASM)
 
+[0.2.0]: https://github.com/cool-japan/oxibonsai/compare/v0.1.5...v0.2.0
 [0.1.2]: https://github.com/cool-japan/oxibonsai/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/cool-japan/oxibonsai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/cool-japan/oxibonsai/releases/tag/v0.1.0

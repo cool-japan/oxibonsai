@@ -1,6 +1,6 @@
 # oxibonsai-core
 
-[![Version](https://img.shields.io/badge/version-0.1.5-blue.svg)](https://crates.io/crates/oxibonsai-core)
+[![Version](https://img.shields.io/badge/version-0.2.0-blue.svg)](https://crates.io/crates/oxibonsai-core)
 [![Tests](https://img.shields.io/badge/tests-207%20passing-brightgreen.svg)]()
 [![Status](https://img.shields.io/badge/status-stable-brightgreen.svg)]()
 
@@ -37,7 +37,7 @@ Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 
 ```toml
 [dependencies]
-oxibonsai-core = "0.1.5"
+oxibonsai-core = "0.2.0"
 ```
 
 ## License
