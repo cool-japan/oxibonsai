@@ -1,6 +1,6 @@
 # oxibonsai-image TODO
 
-> v0.2.1 — 2026-06-06
+> v0.2.2 — 2026-06-06
 > **STABLE** — imagen pipeline complete, GPU-accelerated, parity-validated.
 
 ## Completed
