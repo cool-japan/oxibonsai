@@ -69,10 +69,10 @@ pip install huggingface_hub      # provides the `hf` CLI
 
 | Asset | Source repo | File(s) | Convert? | Points at |
 | --- | --- | --- | --- | --- |
-| DiT | `prism-ml/bonsai-image-ternary-4B-mlx-2bit` | `diffusion_pytorch_model.safetensors` | yes → GGUF (`mlx_image_convert`) | `--dit` / `OXI_DIT_GGUF` |
-| Text encoder | `prism-ml/text_encoder-mlx-4bit` | `model.safetensors`, `tokenizer.json` | no (native 4-bit loader) | `--te` / `OXI_TE_4BIT` |
-| VAE | `black-forest-labs/FLUX.2-dev` | `vae/diffusion_pytorch_model.safetensors` | no (native safetensors loader) | `--vae` / `OXI_VAE_WEIGHTS` |
-| Tokenizer | (ships in the TE repo) | `tokenizer.json` | no | `--tokenizer` / `OXI_TE_TOKENIZER_DIR` |
+| DiT | `prism-ml/bonsai-image-ternary-4B-mlx-2bit` | `transformer-packed-mflux/diffusion_pytorch_model.safetensors` | yes → GGUF (`mlx_image_convert`) | `--dit` / `OXI_DIT_GGUF` |
+| Text encoder | `prism-ml/bonsai-image-ternary-4B-mlx-2bit` | `text_encoder-mlx-4bit/model.safetensors`, `text_encoder-mlx-4bit/tokenizer.json` | no (native 4-bit loader) | `--te` / `OXI_TE_4BIT` |
+| VAE | `prism-ml/bonsai-image-ternary-4B-mlx-2bit` (bundled, non-gated) or `black-forest-labs/FLUX.2-dev` (gated) | `vae/diffusion_pytorch_model.safetensors` | no (native safetensors loader) | `--vae` / `OXI_VAE_WEIGHTS` |
+| Tokenizer | `prism-ml/bonsai-image-ternary-4B-mlx-2bit` (ships with the TE) | `text_encoder-mlx-4bit/tokenizer.json` | no | `--tokenizer` / `OXI_TE_TOKENIZER_DIR` |
 
 ### 1. DiT (the ternary transformer)
 
@@ -81,14 +81,15 @@ is Pure Rust (it quantizes the linears to `TQ2_0_g128` and passes the
 skip-pattern tensors through as BF16):
 
 ```bash
-# Download the MLX 2-bit ternary DiT
+# Download the MLX 2-bit ternary DiT. `hf download` preserves the repo subfolder,
+# so the file lands at ./bonsai-dit/transformer-packed-mflux/diffusion_pytorch_model.safetensors.
 hf download prism-ml/bonsai-image-ternary-4B-mlx-2bit \
-    diffusion_pytorch_model.safetensors --local-dir ./bonsai-dit
+    transformer-packed-mflux/diffusion_pytorch_model.safetensors --local-dir ./bonsai-dit
 
 # Convert safetensors → GGUF (Pure Rust). The trailing quant arg is optional and
 # defaults to tq2_0_g128 (the only format supported today).
 cargo run -p oxibonsai-model --example mlx_image_convert --release -- \
-    ./bonsai-dit/diffusion_pytorch_model.safetensors ./bonsai-dit.gguf tq2_0_g128
+    ./bonsai-dit/transformer-packed-mflux/diffusion_pytorch_model.safetensors ./bonsai-dit.gguf tq2_0_g128
 ```
 
 The example's argument order is `<model.safetensors> <output.gguf> [quant]`.
@@ -100,14 +101,18 @@ Download the 4-bit MLX text encoder. **No conversion** — the native Rust loade
 reads the MLX `.safetensors` directly:
 
 ```bash
-hf download prism-ml/text_encoder-mlx-4bit \
-    model.safetensors tokenizer.json --local-dir ./bonsai-te
+hf download prism-ml/bonsai-image-ternary-4B-mlx-2bit \
+    text_encoder-mlx-4bit/model.safetensors text_encoder-mlx-4bit/tokenizer.json \
+    --local-dir ./bonsai-te
 ```
 
-- Point `--te` / `OXI_TE_4BIT` at `./bonsai-te/model.safetensors`.
+`hf download` preserves the repo subfolder, so the files land under
+`./bonsai-te/text_encoder-mlx-4bit/`.
+
+- Point `--te` / `OXI_TE_4BIT` at `./bonsai-te/text_encoder-mlx-4bit/model.safetensors`.
 - Point `--tokenizer` / `OXI_TE_TOKENIZER_DIR` at its **directory**
-  (`./bonsai-te`). When `--te` is a `.safetensors` file, the tokenizer dir
-  auto-defaults to that file's parent, so you can usually omit it.
+  (`./bonsai-te/text_encoder-mlx-4bit`). When `--te` is a `.safetensors` file, the
+  tokenizer dir auto-defaults to that file's parent, so you can usually omit it.
 
 A `--te` path ending in `.safetensors` selects the native 4-bit MLX loader;
 anything else is treated as a legacy f32 `.npy` directory.
@@ -117,14 +122,33 @@ anything else is treated as a legacy f32 `.npy` directory.
 
 ### 3. VAE decoder (AutoencoderKLFlux2)
 
-Download the standard FLUX.2 VAE. **No conversion needed** — the native
-Pure-Rust safetensors loader reads the diffusers checkpoint directly. This is the
-new path added this release
+The VAE is the standard FLUX.2 `AutoencoderKLFlux2`. **No conversion needed** —
+the native Pure-Rust safetensors loader reads the diffusers checkpoint directly.
+This is the new path added this release
 ([`crates/oxibonsai-image/src/vae/safetensors.rs`](../crates/oxibonsai-image/src/vae/safetensors.rs)):
 it resolves every weight key the decoder asks for, applies the layout/name
 transforms in-engine (bf16→f32 lossless decode, conv-weight transpose
 `[O,I,kH,kW] → [O,kH,kW,I]`, and the `to_out.0` ModuleList un-nesting), and feeds
 the decoder f32 values byte-identical to the old `.npy` path.
+
+You have **two equivalent sources** for this file — pick whichever is easier:
+
+**Option A — bundled PrismML VAE (simplest, non-gated).** The main Bonsai-Image
+repo ships its own `vae/` subfolder, so you can grab it from the same repo as the
+DiT and text encoder, with no HuggingFace login or license acceptance:
+
+```bash
+hf download prism-ml/bonsai-image-ternary-4B-mlx-2bit \
+    vae/diffusion_pytorch_model.safetensors --local-dir ./bonsai-vae
+```
+
+Point `--vae` / `OXI_VAE_WEIGHTS` at
+`./bonsai-vae/vae/diffusion_pytorch_model.safetensors`.
+
+**Option B — canonical FLUX.2-dev VAE (gated).** The identical
+`AutoencoderKLFlux2` checkpoint also lives in the upstream FLUX.2 repo. This repo
+is **gated**: it requires a `huggingface-cli login` and accepting the model
+license on the repo page first.
 
 ```bash
 hf download black-forest-labs/FLUX.2-dev \
@@ -134,17 +158,15 @@ hf download black-forest-labs/FLUX.2-dev \
 Point `--vae` / `OXI_VAE_WEIGHTS` at
 `./flux2/vae/diffusion_pytorch_model.safetensors`.
 
+> **Which one?** They are the same `AutoencoderKLFlux2` weights
+> (`_class_name = "AutoencoderKLFlux2"`). Option A is recommended because it is
+> not gated and lives alongside the other Bonsai-Image assets; Option B is the
+> canonical upstream source if you already have FLUX.2-dev access.
+>
 > **No more Python export.** The previous workflow required a dev-time Python
 > `.npy` export of the VAE weights (`/tmp/bonsai_vae_export_weights.py`); that
 > step is now eliminated — the engine reads the `.safetensors` checkpoint
 > directly.
->
-> **Which VAE source?** The canonical file is
-> `black-forest-labs/FLUX.2-dev` → `vae/diffusion_pytorch_model.safetensors`
-> (`_class_name = "AutoencoderKLFlux2"`), as documented in the loader. If the
-> Bonsai-Image checkpoint you are using ships its **own** `vae/` subfolder
-> (e.g. a `bonsai-image-*-mlx` repo bundling `vae/diffusion_pytorch_model.safetensors`),
-> that matching file is the equivalent source and can be used directly.
 >
 > `--vae` also still accepts a **directory of per-tensor `.npy` tensors** for the
 > legacy path. The loader auto-detects: a `.safetensors` *file* selects the
@@ -152,18 +174,19 @@ Point `--vae` / `OXI_VAE_WEIGHTS` at
 
 ### 4. Tokenizer
 
-The Qwen3 tokenizer (`tokenizer.json`) ships inside the text-encoder repo
-(`prism-ml/text_encoder-mlx-4bit`), so the `hf download` in step 2 already fetches
-it. Point `--tokenizer` / `OXI_TE_TOKENIZER_DIR` at the directory that contains
-it; when `--te` is a `.safetensors` file this defaults to that file's parent, so
-it is usually omitted.
+The Qwen3 tokenizer (`tokenizer.json`) ships in the main repo alongside the text
+encoder (`prism-ml/bonsai-image-ternary-4B-mlx-2bit`, under `text_encoder-mlx-4bit/`),
+so the `hf download` in step 2 already fetches it — no separate download needed.
+Point `--tokenizer` / `OXI_TE_TOKENIZER_DIR` at the directory that contains it
+(`./bonsai-te/text_encoder-mlx-4bit`); when `--te` is a `.safetensors` file this
+defaults to that file's parent, so it is usually omitted.
 
-If you need to fetch a tokenizer separately, `oxibonsai tokenizer download` pulls
-`tokenizer.json` from a HuggingFace repo (defaults: repo `Qwen/Qwen3-8B`, output
-`models/tokenizer.json`):
+If you ever need to fetch a tokenizer separately, `oxibonsai tokenizer download`
+pulls `tokenizer.json` from a HuggingFace repo (defaults: repo `Qwen/Qwen3-8B`,
+output `models/tokenizer.json`):
 
 ```bash
-oxibonsai tokenizer download --output ./bonsai-te/tokenizer.json
+oxibonsai tokenizer download --output ./bonsai-te/text_encoder-mlx-4bit/tokenizer.json
 ```
 
 ---
@@ -178,14 +201,15 @@ so you can set the asset paths once. Create a `.env`:
 OXI_DIT_GGUF=./bonsai-dit.gguf
 
 # Text encoder: 4-bit MLX model.safetensors
-OXI_TE_4BIT=./bonsai-te/model.safetensors
+OXI_TE_4BIT=./bonsai-te/text_encoder-mlx-4bit/model.safetensors
 
 # Tokenizer directory containing tokenizer.json
 # (omit to default to the TE .safetensors' parent dir)
-OXI_TE_TOKENIZER_DIR=./bonsai-te
+OXI_TE_TOKENIZER_DIR=./bonsai-te/text_encoder-mlx-4bit
 
-# VAE decoder weights (.safetensors file, or a legacy .npy directory)
-OXI_VAE_WEIGHTS=./flux2/vae/diffusion_pytorch_model.safetensors
+# VAE decoder weights (.safetensors file, or a legacy .npy directory).
+# Bundled PrismML VAE (Option A); for FLUX.2-dev use ./flux2/vae/diffusion_pytorch_model.safetensors
+OXI_VAE_WEIGHTS=./bonsai-vae/vae/diffusion_pytorch_model.safetensors
 ```
 
 **Precedence** (highest wins): `--flag` > shell environment variable > `.env`
@@ -262,8 +286,8 @@ of relying on `.env`:
 oxibonsai image \
     --prompt "a tiny bonsai tree in a ceramic pot" --out bonsai.png \
     --dit ./bonsai-dit.gguf \
-    --te ./bonsai-te/model.safetensors \
-    --vae ./flux2/vae/diffusion_pytorch_model.safetensors \
+    --te ./bonsai-te/text_encoder-mlx-4bit/model.safetensors \
+    --vae ./bonsai-vae/vae/diffusion_pytorch_model.safetensors \
     --seed 42 --steps 4
 ```
 

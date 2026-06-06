@@ -2,7 +2,7 @@
 
 Pure-Rust text-to-image pipeline: FLUX.2-Klein DiT (TQ2_0_g128 ternary) + AutoencoderKLFlux2 VAE + Qwen3-4B 4-bit text encoder + PNG output, all parity-validated against the MLX reference at cosine ≥ 0.999.
 
-**Version:** 0.2.0
+**Version:** 0.2.1
 
 Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 
@@ -59,7 +59,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxibonsai-image = { version = "0.2.0", features = ["metal"] }  # or "native-cuda"
+oxibonsai-image = { version = "0.2.1", features = ["metal"] }  # or "native-cuda"
 ```
 
 Build with the matching GPU feature:
@@ -91,9 +91,9 @@ let cfg = TextToImageCfg {
     height: 512,
     guidance: 1.0,
     dit_gguf: PathBuf::from("./bonsai-dit.gguf"),
-    vae_weights_dir: PathBuf::from("./flux2/vae/diffusion_pytorch_model.safetensors"),
-    te_source: TeSource::Mlx4bit(PathBuf::from("./bonsai-te/model.safetensors")),
-    tokenizer_dir: PathBuf::from("./bonsai-te"),
+    vae_weights_dir: PathBuf::from("./bonsai-vae/vae/diffusion_pytorch_model.safetensors"),
+    te_source: TeSource::Mlx4bit(PathBuf::from("./bonsai-te/text_encoder-mlx-4bit/model.safetensors")),
+    tokenizer_dir: PathBuf::from("./bonsai-te/text_encoder-mlx-4bit"),
     golden_override: None,
 };
 
@@ -119,14 +119,14 @@ flags take precedence). Create a `.env` in your working directory:
 OXI_DIT_GGUF=./bonsai-dit.gguf
 
 # Text encoder: 4-bit MLX model.safetensors (≈2.1 GB)
-OXI_TE_4BIT=./bonsai-te/model.safetensors
+OXI_TE_4BIT=./bonsai-te/text_encoder-mlx-4bit/model.safetensors
 
 # Tokenizer directory containing tokenizer.json
 # (defaults to the TE .safetensors parent when omitted)
-OXI_TE_TOKENIZER_DIR=./bonsai-te
+OXI_TE_TOKENIZER_DIR=./bonsai-te/text_encoder-mlx-4bit
 
 # VAE weights: .safetensors file or legacy .npy directory
-OXI_VAE_WEIGHTS=./flux2/vae/diffusion_pytorch_model.safetensors
+OXI_VAE_WEIGHTS=./bonsai-vae/vae/diffusion_pytorch_model.safetensors
 ```
 
 **GPU stage toggles** (default on; set to `"0"` to opt out):
@@ -149,18 +149,24 @@ You need three model assets plus a tokenizer. Downloads use the HuggingFace CLI
 
 ```bash
 # 1. DiT: download ternary MLX checkpoint and convert to GGUF
+#    (hf download keeps the repo subfolder, so files land under ./bonsai-dit/transformer-packed-mflux/)
 hf download prism-ml/bonsai-image-ternary-4B-mlx-2bit \
-    diffusion_pytorch_model.safetensors --local-dir ./bonsai-dit
+    transformer-packed-mflux/diffusion_pytorch_model.safetensors --local-dir ./bonsai-dit
 cargo run -p oxibonsai-model --example mlx_image_convert --release -- \
-    ./bonsai-dit/diffusion_pytorch_model.safetensors ./bonsai-dit.gguf tq2_0_g128
+    ./bonsai-dit/transformer-packed-mflux/diffusion_pytorch_model.safetensors ./bonsai-dit.gguf tq2_0_g128
 
-# 2. Text encoder (no conversion — native 4-bit Rust loader)
-hf download prism-ml/text_encoder-mlx-4bit \
-    model.safetensors tokenizer.json --local-dir ./bonsai-te
+# 2. Text encoder + tokenizer (same repo; no conversion — native 4-bit Rust loader)
+hf download prism-ml/bonsai-image-ternary-4B-mlx-2bit \
+    text_encoder-mlx-4bit/model.safetensors text_encoder-mlx-4bit/tokenizer.json \
+    --local-dir ./bonsai-te
 
-# 3. VAE (no conversion — native safetensors Rust loader)
-hf download black-forest-labs/FLUX.2-dev \
-    vae/diffusion_pytorch_model.safetensors --local-dir ./flux2
+# 3. VAE (no conversion — native safetensors Rust loader).
+#    Option A (simplest, non-gated): the VAE bundled in the same PrismML repo
+hf download prism-ml/bonsai-image-ternary-4B-mlx-2bit \
+    vae/diffusion_pytorch_model.safetensors --local-dir ./bonsai-vae
+#    Option B (canonical, gated — needs huggingface-cli login + license):
+# hf download black-forest-labs/FLUX.2-dev \
+#     vae/diffusion_pytorch_model.safetensors --local-dir ./flux2
 ```
 
 For the full step-by-step walkthrough see [`docs/IMAGEN.md`](../../docs/IMAGEN.md).

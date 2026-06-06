@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/cool-japan/oxibonsai"
@@ -27,23 +27,23 @@ categories = ["science", "algorithms", "command-line-utilities"]
 
 [workspace.dependencies]
 # ── Internal crates ──
-oxibonsai-core = { path = "crates/oxibonsai-core", version = "0.2.0" }
-oxibonsai-image = { path = "crates/oxibonsai-image", version = "0.2.0" }
-oxibonsai-kernels = { path = "crates/oxibonsai-kernels", version = "0.2.0" }
-oxibonsai-model = { path = "crates/oxibonsai-model", version = "0.2.0" }
-oxibonsai-runtime = { path = "crates/oxibonsai-runtime", version = "0.2.0", default-features = false }
-oxibonsai-tokenizer = { path = "crates/oxibonsai-tokenizer", version = "0.2.0" }
-oxibonsai-serve = { path = "crates/oxibonsai-serve", version = "0.2.0" }
-oxibonsai-rag = { path = "crates/oxibonsai-rag", version = "0.2.0" }
-oxibonsai-eval = { path = "crates/oxibonsai-eval", version = "0.2.0" }
-oxibonsai = { path = "crates/oxibonsai", version = "0.2.0" }
+oxibonsai-core = { path = "crates/oxibonsai-core", version = "0.2.1" }
+oxibonsai-image = { path = "crates/oxibonsai-image", version = "0.2.1" }
+oxibonsai-kernels = { path = "crates/oxibonsai-kernels", version = "0.2.1" }
+oxibonsai-model = { path = "crates/oxibonsai-model", version = "0.2.1" }
+oxibonsai-runtime = { path = "crates/oxibonsai-runtime", version = "0.2.1", default-features = false }
+oxibonsai-tokenizer = { path = "crates/oxibonsai-tokenizer", version = "0.2.1" }
+oxibonsai-serve = { path = "crates/oxibonsai-serve", version = "0.2.1" }
+oxibonsai-rag = { path = "crates/oxibonsai-rag", version = "0.2.1" }
+oxibonsai-eval = { path = "crates/oxibonsai-eval", version = "0.2.1" }
+oxibonsai = { path = "crates/oxibonsai", version = "0.2.1" }
 
 # ── COOLJAPAN Ecosystem (Pure Rust Policy) ──
 scirs2-core = { version = "0.5.0", default-features = false }
 scirs2-linalg = { version = "0.5.0", default-features = false }
 scirs2-neural = { version = "0.5.0", default-features = false }
 oxifft = "0.3.2"
-oxiarc-deflate = "0.3.2"
+oxiarc-deflate = "0.3.3"
 
 # ── GPU backends ──
 metal = "0.33.0"
@@ -228,4 +228,22 @@ harness = false
 [profile.release]
 lto = true
 codegen-units = 1
+opt-level = 3
+
+# Test/dev runtime performance. This workspace's tests run real numeric work
+# (parity golden references, model forward passes). At the default dev/test
+# opt-level=0 those are unoptimized + non-autovectorized, so some tests take
+# *minutes* (e.g. the DiT-shape joint-attention CPU reference ~14.5 GFLOP, and
+# the speculative decoder's ~240 forward passes over the 151936-row vocab).
+# Float results are unchanged: Rust does not enable fast-math, so opt-level does
+# not reassociate reductions — parity gates (cos>=0.999) stay bit-stable.
+[profile.test]
+opt-level = 2
+
+# Dependencies (incl. workspace path-deps like oxibonsai-model/-kernels when
+# built as deps of another crate's tests) compile under the `dev` profile during
+# `cargo test`/`nextest`. Optimize them so the model forward in the runtime tests
+# isn't the bottleneck. The crate you're actively editing stays at dev
+# opt-level=0, so incremental compiles of your own code remain fast.
+[profile.dev.package."*"]
 opt-level = 3

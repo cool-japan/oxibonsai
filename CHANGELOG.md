@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-06-06
+
+### Changed
+
+- **Raised compile optimization for the `test` and `dev` profiles** (`Cargo.toml`): added `[profile.test] opt-level = 2` and `[profile.dev.package."*"] opt-level = 3`, so test binaries and all dependencies (including workspace path-deps like `oxibonsai-model` / `oxibonsai-kernels` when built as deps of another crate's tests) are optimized and autovectorized. At the default `opt-level = 0` the workspace's tests run real numeric work unoptimized — the parity golden references and model forward passes took *minutes* (e.g. the DiT-shape joint-attention CPU reference ~14.5 GFLOP, and the speculative decoder's ~240 forward passes over the 151936-row vocab). The crate under active edit stays at `dev` opt-level 0, so incremental compiles of your own code remain fast. Float results are unchanged: Rust does not enable fast-math, so `opt-level` does not reassociate reductions — parity gates (cos≥0.999) stay bit-stable.
+- **Bumped `oxiarc-deflate` 0.3.2 → 0.3.3** (`Cargo.toml`, `[workspace.dependencies]`): tracks the latest OxiARC release per the COOLJAPAN Latest-crates policy. `oxiarc-deflate` provides the Pure-Rust DEFLATE backend for PNG output in `oxibonsai-image`; the substantive fixes in the 0.3.3 OxiARC release land in sibling crates (`oxiarc-brotli` high-entropy round-trip), so for OxiBonsai this is a version-tracking bump with no change to DEFLATE/PNG behavior.
+
+### Fixed
+
+- **VAE precheck rejected a valid `.safetensors` file** (`oxibonsai-image`, `src/pipeline.rs`): the text-to-image precheck used `is_dir()`, so a valid `.safetensors` FILE passed via `--vae` / `OXI_VAE_WEIGHTS` was rejected with "VAE weights dir not found" before any loading — even though `VaeWeights::open` and the docs both accept a file. The precheck now accepts a file **or** a directory (`is_file() || is_dir()`), error wording is corrected, and the stale doc-comment is fixed. Added regression tests `test_issue_9_*`. (#9)
+
+### Documentation
+
+- **Corrected stale HuggingFace asset paths** (`docs/IMAGEN.md`, `crates/oxibonsai-image/README.md`): the DiT lives under `transformer-packed-mflux/`, and the text encoder + tokenizer ship inside the main `prism-ml/bonsai-image-ternary-4B-mlx-2bit` repo under `text_encoder-mlx-4bit/` (the standalone `prism-ml/text_encoder-mlx-4bit` repo does not exist). Consumer paths updated to match `hf download --local-dir` layout, and the bundled vs. gated `black-forest-labs/FLUX.2-dev` VAE choice is clarified. Verified against the live HF API. (#8)
+
+---
+
 ## [0.2.0] - 2026-06-02
 
 ### Added
@@ -314,6 +331,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Comprehensive test suite (140 tests)
 - Cross-platform support (macOS, Linux, Windows, WASM)
 
+[0.2.1]: https://github.com/cool-japan/oxibonsai/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/cool-japan/oxibonsai/compare/v0.1.5...v0.2.0
 [0.1.2]: https://github.com/cool-japan/oxibonsai/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/cool-japan/oxibonsai/compare/v0.1.0...v0.1.1

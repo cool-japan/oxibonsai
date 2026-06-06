@@ -82,7 +82,9 @@ pub struct TextToImageCfg {
     pub guidance: f32,
     /// Path to the DiT GGUF file.
     pub dit_gguf: PathBuf,
-    /// Directory of exported VAE weights.
+    /// VAE weights source: either a `.safetensors` file (the native FLUX.2
+    /// `AutoencoderKLFlux2` checkpoint) or a directory of exported `.npy`
+    /// tensors — [`VaeWeights::open`] auto-detects which.
     pub vae_weights_dir: PathBuf,
     /// Where the text-encoder weights come from.
     pub te_source: TeSource,
@@ -346,6 +348,18 @@ fn compute_cond(
     Ok(cond)
 }
 
+/// Whether a VAE weights `path` can be loaded by [`VaeWeights::open`].
+///
+/// [`VaeWeights::open`] accepts **either** a `.safetensors` file (the native
+/// FLUX.2 `AutoencoderKLFlux2` checkpoint) **or** a directory of exported `.npy`
+/// tensors, so the pipeline precheck must accept both (mirroring the loader,
+/// rather than the stricter `is_dir` that rejected a documented file path —
+/// see issue #9). Any existing path passes here; the loader then validates the
+/// contents.
+fn vae_path_present(path: &std::path::Path) -> bool {
+    path.is_file() || path.is_dir()
+}
+
 /// Run the whole text→image pipeline and return the encoded PNG.
 ///
 /// See the [module docs](self) for the stage-by-stage flow.
@@ -363,9 +377,9 @@ pub fn text_to_image(cfg: &TextToImageCfg) -> Result<TextToImageOut, PipelineErr
             cfg.dit_gguf.display()
         )));
     }
-    if !cfg.vae_weights_dir.is_dir() {
+    if !vae_path_present(&cfg.vae_weights_dir) {
         return Err(PipelineError::MissingInput(format!(
-            "VAE weights dir not found: {}",
+            "VAE weights not found: {}",
             cfg.vae_weights_dir.display()
         )));
     }
@@ -568,4 +582,83 @@ pub fn text_to_image(cfg: &TextToImageCfg) -> Result<TextToImageOut, PipelineErr
         height: h,
         stage_cosines,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::vae_path_present;
+    use std::path::PathBuf;
+
+    /// Build a unique scratch path under the system temp dir (policy: tests must
+    /// use `std::env::temp_dir()`), tagged by `label` and the test's process id
+    /// + nanos so concurrent / repeated runs never collide.
+    fn scratch(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "oxibonsai_issue9_{label}_{}_{nanos}",
+            std::process::id()
+        ))
+    }
+
+    /// Regression test for issue #9: passing `--vae` as a `.safetensors` FILE
+    /// (exactly as docs/CLI.md and docs/IMAGEN.md instruct, and exactly what
+    /// `VaeWeights::open` accepts) must be accepted by the pipeline precheck.
+    ///
+    /// Before the fix the precheck was `cfg.vae_weights_dir.is_dir()`, so a real
+    /// `.safetensors` file returned `false` here → the pipeline aborted with
+    /// "VAE weights dir not found" before any loading. This asserts the predicate
+    /// now returns `true` for such a file.
+    #[test]
+    fn test_issue_9_vae_safetensors_file_accepted() -> std::io::Result<()> {
+        let file = scratch("vae").with_extension("safetensors");
+        // A real, existing file on disk (contents irrelevant to the precheck —
+        // the precheck only gates existence; `VaeWeights::open` validates bytes).
+        std::fs::write(&file, b"not-a-real-safetensors-but-a-real-file")?;
+
+        let present = vae_path_present(&file);
+        std::fs::remove_file(&file)?;
+
+        assert!(
+            present,
+            "issue #9: a .safetensors FILE must pass the VAE precheck (got false), \
+             path = {}",
+            file.display()
+        );
+        Ok(())
+    }
+
+    /// Companion: a directory of exported `.npy` weights (the original dev-time
+    /// source) must still be accepted — the fix widens the predicate, it must not
+    /// regress the directory case.
+    #[test]
+    fn test_issue_9_vae_directory_still_accepted() -> std::io::Result<()> {
+        let dir = scratch("vae_dir");
+        std::fs::create_dir_all(&dir)?;
+
+        let present = vae_path_present(&dir);
+        std::fs::remove_dir_all(&dir)?;
+
+        assert!(
+            present,
+            "a VAE weights directory must still pass the precheck, path = {}",
+            dir.display()
+        );
+        Ok(())
+    }
+
+    /// Companion: a path that exists as neither a file nor a directory must still
+    /// be rejected, so a genuine typo / missing input is still caught early.
+    #[test]
+    fn test_issue_9_vae_nonexistent_rejected() {
+        let missing = scratch("vae_missing").with_extension("safetensors");
+        // Deliberately never created.
+        assert!(
+            !vae_path_present(&missing),
+            "a nonexistent path must be rejected by the precheck, path = {}",
+            missing.display()
+        );
+    }
 }
