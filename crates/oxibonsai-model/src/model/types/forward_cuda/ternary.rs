@@ -103,6 +103,11 @@ impl<'a> BonsaiModel<'a> {
     ///
     /// Returns the last token's logits.  Mirrors `try_cuda_prefill_with_lm_head` but
     /// uses TQ2 GEMM/GEMV kernels throughout.
+    ///
+    /// Currently unused: the caller (`try_cuda_prefill_with_lm_head`) disables this
+    /// path because of a prefill→decode KV-cache handoff bug (see the dispatcher in
+    /// `forward_cuda/q1.rs`). Kept so it can be re-enabled once fixed.
+    #[allow(dead_code)]
     pub(super) fn try_cuda_prefill_with_lm_head_ternary(
         &self,
         token_ids: &[u32],
