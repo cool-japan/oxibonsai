@@ -18,6 +18,9 @@ mod cli {
 
     use oxibonsai_runtime::OxiBonsaiConfig;
 
+    mod repl;
+    mod term;
+
     #[derive(Parser)]
     #[command(
         name = "oxibonsai",
@@ -114,6 +117,56 @@ mod cli {
 
             /// Text-encoder weights: a 4-bit model.safetensors file or an f32 .npy dir
             /// (default: env OXI_TE_4BIT, else env OXI_TE_WEIGHTS, else /tmp/bonsai_golden/te/weights).
+            #[arg(long)]
+            te: Option<String>,
+
+            /// Tokenizer dir containing tokenizer.json
+            /// (default: env OXI_TE_TOKENIZER_DIR, else the TE dir).
+            #[arg(long)]
+            tokenizer: Option<String>,
+        },
+
+        /// Interactive image REPL: load the pipeline once, render many prompts.
+        ///
+        /// Keeps the DiT, VAE, and (resident) text encoder in memory so each
+        /// prompt skips the load/dequant cost. On Ghostty the image is shown
+        /// inline; elsewhere it is written to a file. Model paths resolve the
+        /// same way as `image` (flag → env → default).
+        Repl {
+            /// Initial RNG seed (changeable at runtime with :seed).
+            #[arg(long, default_value_t = 42)]
+            seed: u64,
+
+            /// Initial sampler steps (changeable with :steps / :fast / :hq).
+            #[arg(long, default_value_t = 4)]
+            steps: usize,
+
+            /// Initial image width in pixels.
+            #[arg(long, default_value_t = 512)]
+            width: usize,
+
+            /// Initial image height in pixels.
+            #[arg(long, default_value_t = 512)]
+            height: usize,
+
+            /// Guidance scale.
+            #[arg(long, default_value_t = 1.0)]
+            guidance: f32,
+
+            /// Run the text-encoder GEMM on the CPU instead of the Metal GPU.
+            #[arg(long)]
+            cpu_te: bool,
+
+            /// DiT GGUF path (default: env OXI_DIT_GGUF or /tmp/parity.gguf).
+            #[arg(long)]
+            dit: Option<String>,
+
+            /// VAE weights path (default: env OXI_VAE_WEIGHTS).
+            #[arg(long)]
+            vae: Option<String>,
+
+            /// Text-encoder weights: a 4-bit model.safetensors file or an f32
+            /// .npy dir (default: env OXI_TE_4BIT, else OXI_TE_WEIGHTS).
             #[arg(long)]
             te: Option<String>,
 
@@ -802,6 +855,77 @@ mod cli {
                     "  seed={seed} steps={steps} guidance={guidance} in {:.1}s",
                     elapsed.as_secs_f64()
                 );
+            }
+
+            Commands::Repl {
+                seed,
+                steps,
+                width,
+                height,
+                guidance,
+                cpu_te,
+                dit,
+                vae,
+                te,
+                tokenizer,
+            } => {
+                use oxibonsai_image::pipeline::TeSource;
+                use oxibonsai_image::RenderParams;
+
+                // Same resolution as `image`: explicit arg → env → default.
+                let resolve = |arg: Option<String>, env: &str, default: &str| -> String {
+                    arg.or_else(|| std::env::var(env).ok().filter(|s| !s.is_empty()))
+                        .unwrap_or_else(|| default.to_string())
+                };
+
+                let dit_path = resolve(dit, "OXI_DIT_GGUF", "/tmp/parity.gguf");
+                let vae_path = resolve(vae, "OXI_VAE_WEIGHTS", "/tmp/bonsai_golden/vae/weights");
+
+                let te_path = te
+                    .or_else(|| std::env::var("OXI_TE_4BIT").ok().filter(|s| !s.is_empty()))
+                    .or_else(|| {
+                        std::env::var("OXI_TE_WEIGHTS")
+                            .ok()
+                            .filter(|s| !s.is_empty())
+                    })
+                    .unwrap_or_else(|| "/tmp/bonsai_golden/te/weights".to_string());
+                let te_source = if te_path.ends_with(".safetensors") {
+                    TeSource::Mlx4bit(PathBuf::from(&te_path))
+                } else {
+                    TeSource::NpyDir(PathBuf::from(&te_path))
+                };
+
+                let tokenizer_dir = tokenizer
+                    .or_else(|| {
+                        std::env::var("OXI_TE_TOKENIZER_DIR")
+                            .ok()
+                            .filter(|s| !s.is_empty())
+                    })
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| {
+                        let p = PathBuf::from(&te_path);
+                        if te_path.ends_with(".safetensors") {
+                            p.parent().map(Path::to_path_buf).unwrap_or(p)
+                        } else {
+                            p
+                        }
+                    });
+
+                let params = RenderParams {
+                    prompt: String::new(),
+                    seed,
+                    steps,
+                    width,
+                    height,
+                    guidance,
+                };
+                let paths = repl::ReplPaths {
+                    dit: dit_path,
+                    vae: vae_path,
+                    te_source,
+                    tokenizer_dir,
+                };
+                repl::run(paths, params, !cpu_te)?;
             }
 
             Commands::Chat {
