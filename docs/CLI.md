@@ -120,6 +120,60 @@ oxibonsai image --prompt "a tiny bonsai tree in a ceramic pot" --out bonsai.png
 
 ---
 
+### `repl`
+
+Interactive image generation. Loads the DiT, VAE, and text encoder **once** into
+a resident session, then renders prompts you type without re-loading or
+re-dequantising weights. The text encoder is held resident (its dequantised f32
+weights, ~16 GB, stay cached across prompts), so this is meant for high-memory
+machines — it trades RAM for not re-paying the per-prompt warm-up. On a
+kitty-graphics terminal (Ghostty) each image is shown **inline**; elsewhere it is
+written to a file (and optionally opened in a viewer).
+
+Model paths resolve exactly like [`image`](#image) (flag → env → default).
+
+| Flag | Type | Default | Help |
+|------|------|---------|------|
+| `--seed <N>` | u64 | `42` | Initial RNG seed (change at runtime with `:seed`). |
+| `--steps <N>` | usize | `4` | Initial sampler steps (`:steps` / `:fast` / `:hq`). |
+| `--width <N>` | usize | `512` | Initial width in pixels. |
+| `--height <N>` | usize | `512` | Initial height in pixels. |
+| `--guidance <F>` | f32 | `1.0` | Guidance scale. |
+| `--cpu-te` | flag | off | Run the text-encoder GEMM on the CPU instead of the Metal GPU. |
+| `--dit <PATH>` | string | env `OXI_DIT_GGUF`, else `/tmp/parity.gguf` | DiT GGUF path. |
+| `--vae <PATH>` | string | env `OXI_VAE_WEIGHTS` | VAE weights (file or `.npy` dir). |
+| `--te <PATH>` | string | env `OXI_TE_4BIT`, else env `OXI_TE_WEIGHTS` | Text-encoder weights. |
+| `--tokenizer <PATH>` | string | env `OXI_TE_TOKENIZER_DIR`, else the TE dir | Tokenizer directory. |
+
+Inside the REPL, a bare line is a prompt; `:`-prefixed lines are commands:
+
+| Command | Effect |
+|---------|--------|
+| `:fast` | Preset: 2 steps, 384×384 (snappy preview). |
+| `:hq` | Preset: 8 steps, 512×512 (higher quality). |
+| `:steps N` / `:seed N` / `:guidance G` | Set a single parameter. |
+| `:size WxH` | Set output size (or `:size N` for square). |
+| `:out PATH` | Write to `PATH` (no arg → auto `oxibonsai-repl-NNN.png`). |
+| `:open on\|off` | Open each image in a viewer (non-inline terminals). |
+| `:show` | Print current settings. |
+| `:help` | Command reference. |
+| `:quit` | Exit (also Ctrl-D). |
+
+```bash
+# With OXI_DIT_GGUF / OXI_VAE_WEIGHTS / OXI_TE_4BIT set in the environment:
+oxibonsai repl
+oxibonsai> :fast
+oxibonsai> a red fox in the snow
+oxibonsai> :hq
+oxibonsai> a red fox in the snow
+```
+
+After loading, each render reuses the resident weights, so per-prompt time is
+just compute (text-encode + DiT sampling + VAE decode); the one-time load and
+encoder warm-up are paid once at startup.
+
+---
+
 ### `chat`
 
 Interactive multi-turn conversation. Type `quit` / `exit` or press Ctrl-D to

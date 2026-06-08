@@ -76,6 +76,8 @@ pub mod png;
 /// position-id, and flow-match schedule generators. Makes the text-to-image
 /// pipeline self-sufficient (no golden `.npy` dump for scaffolding).
 pub mod sample;
+/// Resident multi-prompt session: load the pipeline once, render many prompts.
+pub mod session;
 pub mod te;
 pub mod vae;
 pub mod weights;
@@ -87,4 +89,5 @@ pub use pipeline::{
     text_to_image, GoldenOverride, PipelineError, TeSource, TextToImageCfg, TextToImageOut,
 };
 pub use png::{encode_rgb8, PngError, PngResult};
+pub use session::{ImageSession, RenderOutcome, RenderParams, StageTimings};
 pub use weights::{Bf16Tensor, DitWeights, QuantizedLinear};
