@@ -2,7 +2,7 @@
 
 Pure-Rust text-to-image pipeline: FLUX.2-Klein DiT (TQ2_0_g128 ternary) + AutoencoderKLFlux2 VAE + Qwen3-4B 4-bit text encoder + PNG output, all parity-validated against the MLX reference at cosine ≥ 0.999.
 
-**Version:** 0.2.2
+**Version:** 0.2.3
 
 Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 
@@ -59,7 +59,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxibonsai-image = { version = "0.2.2", features = ["metal"] }  # or "native-cuda"
+oxibonsai-image = { version = "0.2.3", features = ["metal"] }  # or "native-cuda"
 ```
 
 Build with the matching GPU feature:
