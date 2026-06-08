@@ -17,7 +17,7 @@
 //! so the only differences from the decoder's `.npy` key contract are:
 //!
 //! 1. **Conv weights are transposed.** PyTorch `nn.Conv2d` stores
-//!    `[out, in, kH, kW]`; the decoder's [`super::conv::Conv2d`] (and the MLX
+//!    `[out, in, kH, kW]`; the decoder's `Conv2d` (and the MLX
 //!    `.npy` dump) want `[out, kH, kW, in]`. So every 4-D `*.weight` tensor is
 //!    permuted with axes `(0, 2, 3, 1)` — exactly mflux's
 //!    `WeightTransforms.transpose_conv2d_weight` (`tensor.transpose(0, 2, 3, 1)`).
@@ -49,11 +49,11 @@
 //!
 //! # Ownership model
 //!
-//! [`VaeSafetensors`] owns the [`memmap2::Mmap`] for the file's lifetime and
-//! re-runs the (cheap, header-only) [`SafeTensors::deserialize`] on each
-//! [`Self::load_tensor`] access — the same pattern (and rationale) as
+//! [`crate::vae::safetensors::VaeSafetensors`] owns the [`memmap2::Mmap`] for the file's lifetime and
+//! re-runs the (cheap, header-only) `SafeTensors::deserialize` on each
+//! `load_tensor` access — the same pattern (and rationale) as
 //! [`crate::te::mlx4bit::Mlx4bitModel`]. The VAE decoder loads each of its ~142
-//! tensors once and [`super::weights::VaeWeights`] caches the result, so the
+//! tensors once and [`crate::vae::weights::VaeWeights`] caches the result, so the
 //! per-access header re-parse is negligible and the mmap is never copied.
 
 use std::path::{Path, PathBuf};
@@ -82,7 +82,7 @@ fn bf16_to_f32(bits: u16) -> f32 {
 /// A memory-mapped FLUX.2 `AutoencoderKLFlux2` VAE safetensors file.
 ///
 /// Owns the [`Mmap`] and re-parses the safetensors header per access (see the
-/// module docs). [`Self::load_tensor`] takes the decoder's dotted `.npy`-style
+/// module docs). `load_tensor` takes the decoder's dotted `.npy`-style
 /// key and returns the f32 [`Tensor`] in exactly the layout the decoder expects.
 pub struct VaeSafetensors {
     path: PathBuf,

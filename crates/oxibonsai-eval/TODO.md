@@ -2,7 +2,7 @@
 
 > Model evaluation harness: perplexity, accuracy, ROUGE, throughput metrics
 > 19 source files, 11 test files, 219 integration + proptest tests passing
-> Version: 0.2.1 — Status: Stable
+> Version: 0.2.2 — Status: Stable
 > Last updated: 2026-06-06
 
 ## Status: Stable — Phase 18: WinoGrande + BoolQ evaluators added

@@ -2,7 +2,7 @@
 //!
 //! This module routes the dominant per-layer Linears of the Qwen3-4B text
 //! encoder (Q/K/V/o_proj + gate/up/down across 36 layers) onto the project's
-//! f32-exact Metal GEMM kernel ([`MetalGraph::encode_gemm_f32`] in
+//! f32-exact Metal GEMM kernel (`MetalGraph::encode_gemm_f32` in
 //! `oxibonsai-kernels`), keeping each weight's row-major f32 bytes resident on
 //! the GPU and crossing the bus only with the (small) f32 activations per
 //! matmul.
@@ -16,14 +16,14 @@
 //!
 //! The whole module is gated on `cfg(all(feature = "metal", target_os =
 //! "macos"))` — the same gate under which `oxibonsai-kernels` re-exports
-//! [`MetalGraph`] — so a non-Metal / non-macOS build never references it and the
+//! `MetalGraph` — so a non-Metal / non-macOS build never references it and the
 //! default Pure-Rust CPU path is entirely unaffected.
 //!
 //! Default OFF: unlike the DiT (`OXI_DIT_GPU`, default ON), the TE GPU path is
 //! opt-in via `OXI_TE_GPU=1`. The CPU TE already tracks the goldens; the GPU
 //! path is a speed optimization, enabled explicitly for A/B and production use.
 //!
-//! On *any* error this module returns a [`TeGpuMatmulError`]; the caller (the
+//! On *any* error this module returns a `TeGpuMatmulError`; the caller (the
 //! `matmul` helper in [`crate::te::forward`]) swallows it and falls back to the
 //! CPU [`crate::gemm::gemm_abt`], so a GPU failure can never break a forward
 //! pass (no `unwrap`/`expect`/`panic!`).
@@ -40,7 +40,7 @@
 //! outlive every GPU use. The `TeWeights` weights are ordinary `Vec<f32>`
 //! allocations from `.npy` parsing — not page-aligned — so a no-copy wrap would
 //! be unsound/unreliable for them. We therefore use the existing
-//! **upload-once-cache** path ([`MetalGraph::get_or_upload_f32_weight`]): each
+//! **upload-once-cache** path (`MetalGraph::get_or_upload_f32_weight`): each
 //! weight is blitted to a `StorageModeShared` buffer the first time it is seen
 //! and cached by its slice pointer for all subsequent forwards (the 36-layer
 //! weight set uploads exactly once, ~16 GB resident on Apple unified memory).

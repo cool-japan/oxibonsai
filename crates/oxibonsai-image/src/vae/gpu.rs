@@ -5,8 +5,8 @@
 //! convolutions (the prize: ~60% of the decode FLOPs and CPU-im2col-bound),
 //! GroupNorm, SiLU, and nearest ×2 upsample — onto the project's parity-clean
 //! f32 Metal primitives in `oxibonsai-kernels`
-//! ([`MetalGraph::encode_conv2d_f32`], [`MetalGraph::encode_groupnorm_f32`],
-//! [`MetalGraph::encode_silu_f32`], [`MetalGraph::encode_upsample_nearest_f32`]).
+//! (`MetalGraph::encode_conv2d_f32`, `MetalGraph::encode_groupnorm_f32`,
+//! `MetalGraph::encode_silu_f32`, `MetalGraph::encode_upsample_nearest_f32`).
 //!
 //! Like the TE GPU path ([`crate::te::gpu`]) the VAE weights are **pure f32**
 //! (the exported `.npy` conv/affine tensors), so every op is a plain f32
@@ -23,7 +23,7 @@
 //!
 //! The whole module is gated on `cfg(all(feature = "metal", target_os =
 //! "macos"))` — the same gate under which `oxibonsai-kernels` re-exports
-//! [`MetalGraph`] — so a non-Metal / non-macOS build never references it and the
+//! `MetalGraph` — so a non-Metal / non-macOS build never references it and the
 //! default Pure-Rust CPU path is entirely unaffected.
 //!
 //! Default **ON** when the `metal` feature is compiled (mirrors `OXI_DIT_GPU`):
@@ -32,7 +32,7 @@
 //! (for A/B parity testing without recompiling). Default-on is only safe because
 //! every op silently falls back to the CPU path on any GPU error (below).
 //!
-//! On *any* error each wrapper returns a [`VaeGpuError`]; the call sites in
+//! On *any* error each wrapper returns a `VaeGpuError`; the call sites in
 //! `conv.rs` / `norm.rs` / `ops.rs` swallow it and fall back to the CPU path, so
 //! a GPU failure can never break a decode (no `unwrap`/`expect`/`panic!`).
 

@@ -17,7 +17,7 @@ To our knowledge, OxiBonsai is the first pure-Rust — C/C++/Fortran-free, zero-
 
 ## Status
 
-**Version 0.2.1** — released 2026-06-06 · **4,667 tests passing** · ~177k lines of Rust · Pure Rust
+**Version 0.2.2** — 2026-06-08 · **4,671 tests passing** · ~177k lines of Rust · Pure Rust
 
 | Crate | Status | Tests |
 |-------|--------|-------|
@@ -29,7 +29,7 @@ To our knowledge, OxiBonsai is the first pure-Rust — C/C++/Fortran-free, zero-
 | oxibonsai-rag      | Stable | 871   |
 | oxibonsai-eval     | Stable | 513   |
 | oxibonsai-serve    | Stable | 260   |
-| oxibonsai-image    | Stable | see oxibonsai-image/ |
+| oxibonsai-image    | Stable | 72                   |
 | oxibonsai (facade) | Stable | 352   |
 
 ## Features
@@ -173,7 +173,7 @@ This installs the `oxibonsai` binary. Rust 1.86+ required.
 
 ```toml
 [dependencies]
-oxibonsai = "0.2.1"
+oxibonsai = "0.2.2"
 ```
 
 ### Build from source (for development)
@@ -209,6 +209,9 @@ Keys:
 | `OXI_VAE_WEIGHTS` | `image` | VAE decoder weights dir |
 | `OXI_TE_4BIT` | `image` | 2.1 GB 4-bit MLX text-encoder `model.safetensors` |
 | `OXI_TE_TOKENIZER_DIR` | `image` | text-encoder tokenizer dir |
+| `OXI_DIT_ATTN_GPU`     | `image` / `repl` | Enable Metal/CUDA DiT flash-attention (default: on for Metal) |
+| `OXI_VAE_GPU`          | `image` / `repl` | Enable Metal/CUDA VAE decode (default: on for Metal) |
+| `OXI_TE_GPU`           | `image` / `repl` | Enable GPU text-encoder (experimental; default off) |
 
 With `.env` in place, the flags become optional:
 
@@ -282,6 +285,9 @@ oxibonsai chat   --model models/Bonsai-8B.gguf
 oxibonsai info   --model models/Ternary-Bonsai-1.7B.gguf
 oxibonsai serve  --model models/Ternary-Bonsai-1.7B.gguf \
                  --host 127.0.0.1 --port 8080
+
+# Interactive image REPL — loads DiT/VAE/TE once, renders many prompts
+oxibonsai repl   --seed 42 --steps 4 --width 512 --height 512
 
 # Convert safetensors → GGUF (HuggingFace unpacked safetensors dir)
 oxibonsai convert \
@@ -384,7 +390,12 @@ oxibonsai/
 │   ├── oxibonsai-eval/        Evaluation harness (ROUGE, perplexity, MMLU)
 │   └── oxibonsai-serve/       Standalone server binary
 ├── src/main.rs                CLI entry point (run, chat, serve, info, benchmark,
-│                              convert, quantize, validate)
+│                              convert, quantize, validate, image, repl)
+├── src/cli/
+│   ├── repl.rs                `oxibonsai repl` — resident `ImageSession` (loads
+│   │                          DiT/VAE/TE once, renders many prompts); Kitty
+│   │                          graphics protocol inline display (Ghostty detection)
+│   └── term.rs                Terminal detection helpers (Ghostty / Kitty protocol)
 ├── benches/                   Criterion kernel benchmarks
 ├── examples/                  Usage examples
 ├── tests/                     Integration + feature flag tests

@@ -18,7 +18,7 @@
 //!
 //! For a ternary solver (`q ∈ {0,1,2}`, `bias == -scale`) the dequantized
 //! weight is `w = scale·(q-1) ∈ {-s, 0, +s}`, which maps bit-identically to
-//! OxiBonsai's [`BlockTQ2_0_g128`]. The actual packing (and its parity guards)
+//! OxiBonsai's `BlockTQ2_0_g128`. The actual packing (and its parity guards)
 //! lives in [`pack::pack_quantized_module`]; this module handles safetensors
 //! I/O, module classification, and GGUF emission.
 //!

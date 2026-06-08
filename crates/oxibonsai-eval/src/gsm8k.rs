@@ -76,7 +76,7 @@ impl Gsm8kEvaluator {
 
     /// Score a single model completion against a gold answer string.
     ///
-    /// Both strings are passed through [`extract_final_answer`]; the function
+    /// Both strings are passed through [`Self::extract_final_answer`]; the function
     /// returns `true` iff both succeed and the values agree within tolerance:
     ///
     /// ```text

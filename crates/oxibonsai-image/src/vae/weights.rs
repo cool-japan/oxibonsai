@@ -1,15 +1,15 @@
 //! Weight registry for the FLUX.2 `AutoencoderKLFlux2` VAE decoder.
 //!
-//! Weights come from one of two interchangeable [`Source`]s, both yielding the
+//! Weights come from one of two interchangeable sources, both yielding the
 //! same f32 row-major [`Tensor`] for a given dotted name (so the entire
 //! downstream decode is source-agnostic):
 //!
-//! - [`Source::Safetensors`] — the canonical diffusers
+//! - `Safetensors` — the canonical diffusers
 //!   `vae/diffusion_pytorch_model.safetensors` (FLUX.2 `AutoencoderKLFlux2`),
 //!   read directly in Pure Rust via [`crate::vae::safetensors::VaeSafetensors`]
 //!   (bf16→f32, conv-weight transpose, `to_out.0` un-nesting). This is the
 //!   self-serve path — no Python dump step.
-//! - [`Source::NpyDir`] — the per-tensor f32 `.npy` files exported by
+//! - `NpyDir` — the per-tensor f32 `.npy` files exported by
 //!   `/tmp/bonsai_vae_export_weights.py` (the original dev-time golden dump).
 //!
 //! [`VaeWeights::open`] **auto-detects** the source from the path: a file ending
@@ -63,7 +63,7 @@ enum Source {
 
 /// A lazily-loaded, cached registry over the VAE decode-path weights.
 ///
-/// The weights come from one of two interchangeable [`Source`]s, auto-detected
+/// The weights come from one of two interchangeable sources, auto-detected
 /// by [`Self::open`]; every loaded tensor is cached, so each is read/decoded at
 /// most once and the downstream decode is source-agnostic.
 pub struct VaeWeights {

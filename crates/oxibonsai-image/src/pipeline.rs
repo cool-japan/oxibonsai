@@ -5,18 +5,18 @@
 //! CLI subcommand share one code path (DRY):
 //!
 //! 1. Load the DiT GGUF ([`DitWeights::open`]), the SMALL VAE weights
-//!    ([`VaeWeights::open`]/[`VaeDecoder::from_weights`]), and the Qwen3-4B text
-//!    encoder ([`TeWeights`] + [`TextEncoder`]).
-//! 2. Tokenize the prompt ([`Qwen3Tokenizer`]) → TE forward → `cond_7680()`
+//!    ([`crate::vae::VaeWeights::open`]/[`crate::vae::VaeDecoder::from_weights`]), and the Qwen3-4B text
+//!    encoder ([`crate::te::TeWeights`] + [`crate::te::TextEncoder`]).
+//! 2. Tokenize the prompt ([`crate::te::Qwen3Tokenizer`]) → TE forward → `cond_7680()`
 //!    `[seq_txt, joint_dim]` conditioning.
 //! 3. Native sampling scaffolding from [`crate::sample`]: seeded initial noise
-//!    ([`sample::create_noise`]), the `img_ids` / `txt_ids` RoPE grids, and the
+//!    (`sample::create_noise`), the `img_ids` / `txt_ids` RoPE grids, and the
 //!    flow-match `(timesteps, sigmas)` schedule — or, in parity mode
 //!    ([`GoldenOverride`]), load those from a golden `.npy` dump instead.
 //! 4. Euler sample ([`DitForward::sample`]) → final latent `[seq_img,
 //!    in_channels]`.
-//! 5. Reshape to packed NCHW ([`latent_seq_to_packed_nchw`]) → VAE decode
-//!    ([`VaeDecoder::decode_packed_latents`]) → `clip(x/2 + 0.5)` → `u8`
+//! 5. Reshape to packed NCHW (`latent_seq_to_packed_nchw`) → VAE decode
+//!    ([`crate::vae::VaeDecoder::decode_packed_latents`]) → `clip(x/2 + 0.5)` → `u8`
 //!    (NCHW → HWC) → PNG ([`encode_rgb8`]).
 //!
 //! All failures are surfaced as [`PipelineError`] (no `unwrap`/`expect`/`panic`).
@@ -360,6 +360,40 @@ fn vae_path_present(path: &std::path::Path) -> bool {
     path.is_file() || path.is_dir()
 }
 
+/// Convert a VAE-decoded planar CHW f32 tensor into a row-major HWC u8 RGB
+/// buffer: `px = clip(x / 2 + 0.5, 0, 1) * 255`.
+///
+/// Shared by [`text_to_image`] and [`crate::session::ImageSession`] so both
+/// produce byte-identical pixels. Returns `(width, height, rgb)`.
+///
+/// # Errors
+/// [`PipelineError::Shape`] if `c != 3`.
+pub(crate) fn decoded_chw_to_rgb8(
+    c: usize,
+    h: usize,
+    w: usize,
+    data: &[f32],
+) -> Result<(usize, usize, Vec<u8>), PipelineError> {
+    if c != 3 {
+        return Err(PipelineError::Shape(format!(
+            "expected 3 output channels, got {c}"
+        )));
+    }
+    let plane = h * w;
+    let mut rgb = vec![0u8; data.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let hw = y * w + x;
+            let dst = (y * w + x) * 3;
+            for ch in 0..3 {
+                let v = (data[ch * plane + hw] / 2.0 + 0.5).clamp(0.0, 1.0);
+                rgb[dst + ch] = (v * 255.0).round() as u8;
+            }
+        }
+    }
+    Ok((w, h, rgb))
+}
+
 /// Run the whole text→image pipeline and return the encoded PNG.
 ///
 /// See the [module docs](self) for the stage-by-stage flow.
@@ -548,26 +582,7 @@ pub fn text_to_image(cfg: &TextToImageCfg) -> Result<TextToImageOut, PipelineErr
     }
 
     // ── 6. px = clip(x/2 + 0.5, 0, 1); NCHW → HWC; u8 ──
-    let c = decoded.c;
-    let h = decoded.h;
-    let w = decoded.w;
-    if c != 3 {
-        return Err(PipelineError::Shape(format!(
-            "expected 3 output channels, got {c}"
-        )));
-    }
-    let plane = h * w;
-    let mut rgb = vec![0u8; decoded.data.len()];
-    for y in 0..h {
-        for x in 0..w {
-            let hw = y * w + x;
-            let dst = (y * w + x) * 3;
-            for ch in 0..3 {
-                let v = (decoded.data[ch * plane + hw] / 2.0 + 0.5).clamp(0.0, 1.0);
-                rgb[dst + ch] = (v * 255.0).round() as u8;
-            }
-        }
-    }
+    let (w, h, rgb) = decoded_chw_to_rgb8(decoded.c, decoded.h, decoded.w, &decoded.data)?;
 
     // ── 7. PNG-encode ──
     let t_png = std::time::Instant::now();

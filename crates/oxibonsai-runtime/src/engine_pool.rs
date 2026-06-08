@@ -104,7 +104,7 @@ impl EnginePool {
         self.size
     }
 
-    /// Attach a shared [`InferenceMetrics`] to every replica in the pool.
+    /// Attach a shared [`crate::metrics::InferenceMetrics`] to every replica in the pool.
     ///
     /// This wires the per-engine telemetry (prefill / decode-token /
     /// tokens-per-second histograms recorded inside `generate*`) onto each

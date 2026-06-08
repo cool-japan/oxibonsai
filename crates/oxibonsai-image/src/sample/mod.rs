@@ -2,7 +2,7 @@
 //! flow-match Euler sigma/timestep schedule — all Pure-Rust and byte-exact
 //! against the MLX (`mflux-prism`) FLUX.2 pipeline.
 //!
-//! Together with [`mlx_rng`] this makes the OxiBonsai text-to-image pipeline
+//! Together with [`mlx_rng`](crate::sample::mlx_rng) this makes the OxiBonsai text-to-image pipeline
 //! self-sufficient: the initial noise, the `img_ids` / `txt_ids` RoPE position
 //! grids, and the sampler schedule are reproduced from the model definition
 //! rather than loaded from a golden `.npy` dump.
@@ -23,7 +23,7 @@
 //!
 //! ## Precision / byte-exactness
 //!
-//! [`create_noise`] returns the **f32** packed normal values. The golden
+//! `create_noise` returns the **f32** packed normal values. The golden
 //! `init_latents.npy` (seed 42, 512²) was dumped pre-`bfloat16`-cast, so the
 //! f32 output byte-matches it exactly (`max-abs == 0`, cosine `== 1.0`). The
 //! real mflux runtime casts the latents to `bfloat16` (`ModelConfig.precision`)

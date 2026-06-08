@@ -28,14 +28,14 @@
 //! focused sub-modules; all external `crate::constrained_decoding::*` access
 //! paths are preserved through the re-exports below.
 //!
-//!   - [`error_trait`][] — [`ConstraintError`], the [`TokenConstraint`] trait,
+//!   - `error_trait` — [`ConstraintError`], the [`TokenConstraint`] trait,
 //!     and the passthrough [`NoConstraint`].
-//!   - [`regex`][] — NFA-based [`RegexConstraint`].
-//!   - [`json`][] — JSON-grammar [`JsonConstraint`] and its [`JsonParseState`].
-//!   - [`sampler`][] — [`ConstrainedSampler`] and [`ConstrainedSamplerBuilder`].
-//!   - [`allow_list`][] — [`AllowListConstraint`].
-//!   - [`sequence`][] — [`SequenceConstraint`].
-//!   - [`length`][] — [`LengthConstraint`].
+//!   - `regex` — NFA-based [`RegexConstraint`].
+//!   - `json` — JSON-grammar [`JsonConstraint`] and its [`JsonParseState`].
+//!   - `sampler` — [`ConstrainedSampler`] and [`ConstrainedSamplerBuilder`].
+//!   - `allow_list` — [`AllowListConstraint`].
+//!   - `sequence` — [`SequenceConstraint`].
+//!   - `length` — [`LengthConstraint`].
 
 mod allow_list;
 mod error_trait;

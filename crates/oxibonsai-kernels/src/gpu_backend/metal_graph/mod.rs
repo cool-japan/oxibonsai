@@ -25,14 +25,14 @@
 //! sub-modules; all external `super::metal_graph::*` access paths are
 //! preserved through the re-exports below.
 //!
-//!   - [`error`]: [`MetalGraphError`] enum and [`MetalWeightHandle`] handle type.
-//!   - [`reformat`]: Q1/TQ2 weight block AoS→SoA reformatters.
-//!   - [`pipelines`]: MSL compilation, metallib caching, and `MetalPipelines`.
-//!   - [`buffers`]: Intermediate buffer set plus crate-shared allocation,
+//!   - `error`: [`MetalGraphError`] enum and [`MetalWeightHandle`] handle type.
+//!   - `reformat`: Q1/TQ2 weight block AoS→SoA reformatters.
+//!   - `pipelines`: MSL compilation, metallib caching, and `MetalPipelines`.
+//!   - `buffers`: Intermediate buffer set plus crate-shared allocation,
 //!     upload/download, and dispatch helpers.
-//!   - [`graph`]: [`MetalGraph`] struct, weight cache, single GEMV dispatch,
+//!   - `graph`: [`MetalGraph`] struct, weight cache, single GEMV dispatch,
 //!     and the fused FFN phase.
-//!   - [`tests`] (+ `tests_gemv_tq2`, `tests_gemm_tq2`, `tests_gemm_f32`,
+//!   - `tests` (+ `tests_gemv_tq2`, `tests_gemm_tq2`, `tests_gemm_f32`,
 //!     `tests_vae`, `tests_dit_attention`): Compile- and runtime correctness
 //!     tests, grouped by concern (no-op on non-Metal hosts).
 

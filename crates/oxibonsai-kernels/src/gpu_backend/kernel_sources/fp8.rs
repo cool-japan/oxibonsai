@@ -26,7 +26,7 @@
 
 /// Metal MSL kernel: FP8 E4M3FN GEMV.
 ///
-/// Format: s[7] exp[6:3] man[2:0], bias=7
+/// Format: s\[7\] exp\[6:3\] man\[2:0\], bias=7
 /// - Normal: `(-1)^s * 2^(exp - 7) * (1 + man/8)`
 /// - Denorm: `(-1)^s * 2^(-6) * (man/8)`
 /// - NaN patterns (0x7F, 0xFF) → 0 for inference
@@ -102,7 +102,7 @@ kernel void gemv_fp8_e4m3(
 
 /// Metal MSL kernel: FP8 E5M2 GEMV.
 ///
-/// Format: s[7] exp[6:2] man[1:0], bias=15
+/// Format: s\[7\] exp\[6:2\] man\[1:0\], bias=15
 /// - Normal: `(-1)^s * 2^(exp - 15) * (1 + man/4)`
 /// - Denorm: `(-1)^s * 2^(-14) * (man/4)`
 /// - Inf/NaN (exp=31) → 0 for inference

@@ -20,7 +20,7 @@
 //! shared [`crate::gemm::gemm_abt`] (`out[m,n] = Σ_k in[m,k] · w[n,k]`) directly,
 //! computing `x · Wᵀ` — the same contraction the DiT linears use.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -61,7 +61,7 @@ enum Source {
 /// A lazily-loaded, cached registry over the Qwen3 text-encoder weights, plus
 /// the parsed [`TeConfig`].
 ///
-/// The weights come from one of two interchangeable [`Source`]s — the f32
+/// The weights come from one of two interchangeable sources — the f32
 /// `.npy` dump ([`Self::open`]) or the 4-bit MLX safetensors
 /// ([`Self::open_mlx_4bit`]) — both yielding identical f32 tensors by dotted
 /// name. Every loaded tensor is cached, so dequant happens at most once per
@@ -70,6 +70,13 @@ pub struct TeWeights {
     source: Source,
     config: TeConfig,
     cache: RefCell<HashMap<String, Rc<Tensor>>>,
+    /// When set, the [`Source::Mlx4bit`] path also caches its dequantised f32
+    /// tensors (like the `.npy` path always does), trading RAM for speed so a
+    /// long-lived registry pays the dequant cost once instead of once per
+    /// forward. Default off: the one-shot CLI keeps its ~2.5 GB low-RAM
+    /// profile; [`crate::session::ImageSession`] flips it on to keep the
+    /// ~16 GB of f32 encoder weights resident across REPL prompts.
+    resident: Cell<bool>,
 }
 
 impl TeWeights {
@@ -96,6 +103,7 @@ impl TeWeights {
             source: Source::NpyDir(dir.to_path_buf()),
             config,
             cache: RefCell::new(HashMap::new()),
+            resident: Cell::new(false),
         })
     }
 
@@ -116,6 +124,7 @@ impl TeWeights {
             source: Source::Mlx4bit(Box::new(model)),
             config: TeConfig::default(),
             cache: RefCell::new(HashMap::new()),
+            resident: Cell::new(false),
         })
     }
 
@@ -124,13 +133,28 @@ impl TeWeights {
         &self.config
     }
 
+    /// Keep dequantised f32 weights resident across forwards.
+    ///
+    /// Off by default. The `.npy` source already caches every tensor; this only
+    /// changes the `Mlx4bit` source path, which otherwise re-dequantises each
+    /// weight on every [`Self::get`] (the deliberate low-RAM policy). Turning it
+    /// on holds the full f32 encoder (~16 GB) resident so repeated forwards skip
+    /// the dequant. Intended for a long-lived [`crate::session::ImageSession`] on
+    /// a high-memory machine, not the one-shot CLI.
+    pub fn set_resident(&self, on: bool) {
+        self.resident.set(on);
+        if !on {
+            self.cache.borrow_mut().clear();
+        }
+    }
+
     /// Fetch a tensor by dotted name.
     ///
-    /// Dispatches on the registry's [`Source`]:
-    /// - [`Source::NpyDir`] reads `<name>.npy` and **caches** the parsed f32
+    /// Dispatches on the registry's source variant:
+    /// - `NpyDir` reads `<name>.npy` and **caches** the parsed f32
     ///   tensor (byte-unchanged behaviour: the f32 path keeps every loaded
     ///   tensor resident, so a tensor is read at most once).
-    /// - [`Source::Mlx4bit`] dequantises `model.{name}` on the fly and
+    /// - `Mlx4bit` dequantises `model.{name}` on the fly and
     ///   deliberately **does not cache** the result. Each returned `Rc<Tensor>`
     ///   owns a transient f32 buffer that is freed as soon as the caller drops
     ///   it — so over a forward, layer weights are released as the layer loop
@@ -140,7 +164,7 @@ impl TeWeights {
     /// Both sources still yield the same f32 row-major [`Tensor`] for a given
     /// name, so the downstream forward is source-agnostic.
     ///
-    /// Caveat (GPU TE path): [`crate::te::cuda_gpu::te_matmul_gpu`] keys the
+    /// Caveat (GPU TE path): `te_matmul_gpu` keys the
     /// resident device-weight cache by `weight.as_ptr()`. Under this Mlx4bit
     /// no-cache policy the dequantised buffer is freed as soon as the caller drops
     /// its `Rc`, and the allocator **recycles that address** for the next Linear —
@@ -170,8 +194,21 @@ impl TeWeights {
                 self.cache.borrow_mut().insert(name.to_string(), t.clone());
                 Ok(t)
             }
-            // No-cache: the dequantised f32 is transient (the core RAM win).
-            Source::Mlx4bit(model) => Ok(Rc::new(model.load_tensor(name)?)),
+            // Default: no-cache, the dequantised f32 is transient (the core RAM
+            // win). When `resident` is set, cache like the `.npy` path so a
+            // long-lived registry dequantises each tensor at most once.
+            Source::Mlx4bit(model) => {
+                if self.resident.get() {
+                    if let Some(t) = self.cache.borrow().get(name) {
+                        return Ok(t.clone());
+                    }
+                    let t = Rc::new(model.load_tensor(name)?);
+                    self.cache.borrow_mut().insert(name.to_string(), t.clone());
+                    Ok(t)
+                } else {
+                    Ok(Rc::new(model.load_tensor(name)?))
+                }
+            }
         }
     }
 
@@ -209,12 +246,12 @@ impl TeWeights {
     /// into a flat row-major `[ids.len() * cols]` f32 buffer (one row per id, in
     /// `ids` order).
     ///
-    /// This is the RAM-frugal embedding lookup. For [`Source::Mlx4bit`] it
+    /// This is the RAM-frugal embedding lookup. For the `Mlx4bit` source it
     /// dequantises **only** the requested rows via
     /// [`Mlx4bitModel::gather_quant_rows`] — avoiding the 1.5 GB f32 spike of
     /// dequantising the full `[151936, 2560]` table just to keep `seq` rows —
     /// and the per-row values are byte-identical to a full-table dequant. For
-    /// [`Source::NpyDir`] it falls back to the current behaviour
+    /// the `NpyDir` source it falls back to the current behaviour
     /// (`self.get(name)?` full load, then gather the rows), so the f32 path is
     /// byte-unchanged.
     ///

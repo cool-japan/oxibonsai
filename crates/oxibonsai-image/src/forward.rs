@@ -4,7 +4,7 @@
 //! `Flux2KleinFastTransformer` math: embeddings → time embedding → 4-axis RoPE →
 //! 5 dual-stream blocks → 20 single-stream blocks → `AdaLayerNormContinuous`
 //! head → `proj_out`. It also exposes a Euler sampler loop ([`DitForward::sample`])
-//! over golden sigmas, and per-stage taps ([`Stage0`], [`run_stage0`]) used by the
+//! over golden sigmas, and per-stage taps ([`Stage0`], `run_stage0`) used by the
 //! parity harness to localise discrepancies.
 //!
 //! All linear layers are bias-free; the 100 listed projections are ternary
@@ -49,7 +49,7 @@ pub struct Stage0 {
     pub mod_txt: DoubleMod,
     /// Single-stream modulation triple.
     pub mod_single: ModTriple,
-    /// Time embedding `temb` ([hidden]).
+    /// Time embedding `temb` (`hidden`).
     pub temb: Vec<f32>,
 }
 
@@ -64,7 +64,7 @@ impl<'w> DitForward<'w> {
         self.weights.config().hidden_size() as usize
     }
 
-    /// Compute the timestep embedding `temb` ([hidden]) from a scalar `t`.
+    /// Compute the timestep embedding `temb` (`hidden`) from a scalar `t`.
     ///
     /// `t` is fed directly (the goldens are already on the [0, 1000] scale).
     /// `temb = linear_2(silu(linear_1(sinusoidal(t))))`.

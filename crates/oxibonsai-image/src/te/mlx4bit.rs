@@ -37,12 +37,12 @@
 //! # Ownership model
 //!
 //! [`Mlx4bitModel`] owns the [`memmap2::Mmap`] for the file's lifetime and
-//! re-runs the (cheap, header-only) [`SafeTensors::deserialize`] on each
+//! re-runs the (cheap, header-only) `SafeTensors::deserialize` on each
 //! `load_tensor` access. This sidesteps the self-referential lifetime that a
 //! stored `SafeTensors<'a>` borrowing the owned `Mmap` would create, at the
 //! negligible cost of re-parsing the JSON header per loaded tensor (there are
 //! ~253 quantized + ~37 plain tensors total, each loaded once and then cached
-//! by [`super::weights::TeWeights`]). The mmap itself is never copied.
+//! by [`crate::te::weights::TeWeights`]). The mmap itself is never copied.
 
 use std::path::{Path, PathBuf};
 

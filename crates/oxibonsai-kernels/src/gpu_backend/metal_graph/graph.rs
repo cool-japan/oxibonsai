@@ -622,7 +622,7 @@ impl MetalGraph {
     /// format). Dispatches the `gemm_f32_simdgroup` kernel (Apple
     /// `simdgroup_float8x8` 8×8×8 HW MACs, f32 accumulate), which is numerically
     /// equivalent to the CPU `gemm_abt` (cos ≈ 1.0 — reassociated sums only).
-    /// Reuses the same process-wide [`GemmIoPool`] as the ternary path, so there
+    /// Reuses the same process-wide `GemmIoPool` as the ternary path, so there
     /// is no per-call big I/O allocation.
     ///
     /// # Layout
@@ -955,7 +955,7 @@ impl MetalGraph {
     /// **Resident-scenario** entry point: upload q/k/v into the pooled GPU
     /// buffers **once**, before a kernel-only timing loop.
     ///
-    /// Allocates/grows the [`JointAttnIoPool`] to the requested shape and copies
+    /// Allocates/grows the `JointAttnIoPool` to the requested shape and copies
     /// q/k/v into the resident shared buffers. Pair with
     /// [`Self::joint_attn_flash_resident_dispatch`] (the per-iteration encode+wait,
     /// with **no** upload/download) and [`Self::joint_attn_resident_download`]
@@ -1128,7 +1128,7 @@ impl MetalGraph {
     }
 
     /// Pooled / resident-buffer variant of [`Self::encode_joint_attention_flash`],
-    /// reusing the process-wide [`JointAttnIoPool`] instead of allocating four
+    /// reusing the process-wide `JointAttnIoPool` instead of allocating four
     /// fresh buffers per call. Still uploads q/k/v and downloads out each call, but
     /// pays zero per-call allocation after the pool warms up.
     ///

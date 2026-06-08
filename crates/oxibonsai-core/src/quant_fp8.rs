@@ -346,7 +346,7 @@ pub fn fp8_e5m2_decode(byte: u8) -> f32 {
 /// FP8 E4M3FN block: 32 weights × 1 byte + FP16 block scale.
 ///
 /// Layout (34 bytes): `qs[32]` E4M3FN-encoded weights + `d` FP16 block scale.
-/// Actual value of weight i = d × fp8_e4m3_decode(qs[i]).
+/// Actual value of weight i = d × fp8_e4m3_decode(qs\[i\]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(C)]
 pub struct BlockFP8E4M3 {
@@ -475,7 +475,7 @@ impl BlockFP8E4M3 {
 /// FP8 E5M2 block: 32 weights × 1 byte + FP16 block scale.
 ///
 /// Layout (34 bytes): `qs[32]` E5M2-encoded weights + `d` FP16 block scale.
-/// Actual value of weight i = d × fp8_e5m2_decode(qs[i]).
+/// Actual value of weight i = d × fp8_e5m2_decode(qs\[i\]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(C)]
 pub struct BlockFP8E5M2 {

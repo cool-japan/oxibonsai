@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-06-08
+
+### Added
+- **`oxibonsai repl` interactive image REPL** (`oxibonsai-image`, `oxibonsai-cli`): `ImageSession`
+  loads the DiT, VAE, and text encoder **once** and renders many prompts without re-paying the
+  load/dequant cost. `StageTimings` and `RenderOutcome` surface per-stage wall-clock splits.
+  The session puts the text encoder in resident mode (`TeWeights::set_resident`) so the
+  dequantised f32 weights (~16 GB) stay cached across renders on high-memory machines.
+  On Ghostty the rendered image is shown inline via the kitty graphics protocol; on other
+  terminals the PNG is written to a file. Runtime commands: `:steps`, `:seed`, `:size`,
+  `:fast` (2-step 384×384 preview), `:hq` (8-step 512×512), `:out`, `:open`, `:help`, `:quit`.
+- **`TeWeights::set_resident(on: bool)`** (`oxibonsai-image`): controls whether the Mlx4bit
+  source caches dequantised f32 tensors across forwards. Off by default (preserves the one-shot
+  CLI low-RAM profile); turned on by `ImageSession` for the REPL use-case.
+- **Kitty graphics protocol support** (`src/cli/term.rs`): pure-Rust base64 encoder and inline
+  PNG display for Ghostty terminals (`kitty_supported()` auto-detects via `GHOSTTY_*` env vars
+  and `TERM`/`TERM_PROGRAM`).
+- **GPU acceleration flags documented in `.env.example`**: `OXI_DIT_ATTN_GPU` (flash-attention,
+  default-ON on Apple Silicon), `OXI_VAE_GPU` (convolutions, default-ON on Apple Silicon), and
+  `OXI_TE_GPU` (text-encoder GPU, default-OFF — CPU SIMD wins on Apple Silicon; may help on
+  Windows/NVIDIA CUDA) with platform-specific comments.
+- **CUDA TQ2 GEMV parity test** (`oxibonsai-kernels`): isolated probe `cuda_tq2_gemv_parity.rs`
+  for Blackwell GPU output validation; compile-gated behind `cfg(feature = "cuda")`.
+
+### Changed
+- **`decoded_chw_to_rgb8` extracted as shared helper** (`oxibonsai-image/pipeline.rs`): CHW→HWC
+  f32-to-u8 conversion factored into a `pub(crate)` function, shared by both `text_to_image` and
+  `ImageSession::render` to guarantee byte-identical pixel output from both paths.
+- **`oxionnx-proto` bumped 0.1.3 → 0.1.4** (`Cargo.toml` workspace dependencies).
+
+---
+
 ## [0.2.1] - 2026-06-06
 
 ### Changed
@@ -331,6 +363,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Comprehensive test suite (140 tests)
 - Cross-platform support (macOS, Linux, Windows, WASM)
 
+[0.2.2]: https://github.com/cool-japan/oxibonsai/releases/tag/v0.2.2
 [0.2.1]: https://github.com/cool-japan/oxibonsai/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/cool-japan/oxibonsai/compare/v0.1.5...v0.2.0
 [0.1.2]: https://github.com/cool-japan/oxibonsai/compare/v0.1.1...v0.1.2
