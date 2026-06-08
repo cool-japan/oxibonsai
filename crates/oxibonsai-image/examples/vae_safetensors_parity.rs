@@ -110,8 +110,9 @@ fn resolve_safetensors() -> Option<PathBuf> {
             return p.is_file().then_some(p);
         }
     }
-    let refs = PathBuf::from(
-        "/Users/kitasan/work/refs/Bonsai-Image-Demo/models/bonsai-image-4B-ternary-mlx/\
+    let home = std::env::var_os("HOME")?;
+    let refs = PathBuf::from(home).join(
+        "work/refs/Bonsai-Image-Demo/models/bonsai-image-4B-ternary-mlx/\
          vae/diffusion_pytorch_model.safetensors",
     );
     refs.is_file().then_some(refs)

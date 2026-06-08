@@ -314,7 +314,7 @@ fn cpu_reference_and_metal_agree_greedy_temp0_seed42() {
 ///
 /// Run with:
 /// ```text
-/// OXI_MODEL=/Users/kitasan/work/oxibonsai/models/Ternary-Bonsai-1.7B.gguf \
+/// OXI_MODEL=/path/to/Ternary-Bonsai-1.7B.gguf \
 ///   cargo test -p oxibonsai-runtime --features metal \
 ///   --test cross_backend_determinism_tests \
 ///   real_model_cpu_metal_byte_identical -- --ignored --nocapture
