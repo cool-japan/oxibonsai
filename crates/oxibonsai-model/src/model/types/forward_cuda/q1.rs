@@ -317,9 +317,21 @@ impl<'a> BonsaiModel<'a> {
         if n_layers == 0 {
             return Err("no blocks".into());
         }
-        // Ternary batch prefill: route to dedicated TQ2 batch GEMM path (Phase 20A).
+        // Ternary batch prefill is DISABLED on CUDA: it writes the prompt KV into
+        // the prefill-private GPU KV cache (`prefill_state().kv_cache`) while the
+        // per-token decode path reads a *different* cache (`FULL_LAYER_STATE`),
+        // so prompts longer than ~16 tokens make decode attend over stale KV and
+        // produce corrupted output (measured decode logit Δ vs CPU ≈ 7.3 at a
+        // 17-token prompt; ≈ 0.002 via the sequential fallback). This path was
+        // never validated on CUDA hardware. Returning Err makes the caller fall
+        // back to the proven, bit-correct sequential per-token prefill (which
+        // shares the decode KV cache). The Q1 (1-bit) batch path below is fine.
+        // TODO: re-enable once the prefill→decode KV handoff is fixed and a
+        // CPU↔CUDA parity gate (see cuda_ternary_forward_parity.rs) covers it.
         if matches!(&self.output_weight, OutputWeight::Ternary(_)) {
-            return self.try_cuda_prefill_with_lm_head_ternary(token_ids, pos_start);
+            return Err(
+                "ternary CUDA batch prefill disabled (KV-cache handoff bug); using sequential".into(),
+            );
         }
         // Q4_0/Q8_0 batch prefill: route to dedicated Q-std batch GEMM path (Phase 24B).
         if matches!(
