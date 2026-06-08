@@ -34,3 +34,12 @@ Thumbs.db
 
 # DL models
 models/*
+
+# Image-gen assets (HuggingFace downloads + converted GGUF) and generated output
+# See docs/IMAGEN.md. These land in the repo root and would otherwise dirty the tree.
+bonsai-assets/
+bonsai-dit/
+bonsai-te/
+bonsai-vae/
+flux2/
+*.png
