@@ -93,6 +93,13 @@ pub(crate) struct MetalPipelines {
     /// dispatched by `encode_gemm_f32` only.
     pub(crate) gemm_f32_simdgroup: ComputePipelineState,
 
+    /// bf16-input / f32-accumulate sibling of `gemm_f32_simdgroup` for the TE.
+    /// Same shape and buffers; stages the operands as `bfloat` (M3+/Metal 3.1)
+    /// for ~2× throughput at the model's native precision. Dispatched by
+    /// `encode_gemm_bf16`; the GPU TE path uses it by default (cos ≈ 1.0), with
+    /// `OXI_TE_GEMM_F32=1` to force the exact f32 kernel.
+    pub(crate) gemm_bf16_simdgroup: ComputePipelineState,
+
     // ── FLUX.2 VAE decoder per-op f32 primitives ────────────────────
     /// im2col patch extraction `[rows, kH·kW·C_in]` in `(kH,kW,C_in)` order
     /// (feeds `gemm_f32_simdgroup` for the k≥3 VAE convs). Dispatched by
@@ -168,6 +175,7 @@ impl MetalPipelines {
         let gemm_tq2_g128_v10_simdgroup =
             pipeline_for(&library, device, "gemm_tq2_g128_v10_simdgroup")?;
         let gemm_f32_simdgroup = pipeline_for(&library, device, "gemm_f32_simdgroup")?;
+        let gemm_bf16_simdgroup = pipeline_for(&library, device, "gemm_bf16_simdgroup")?;
         // VAE decoder per-op f32 primitives
         let im2col_f32 = pipeline_for(&library, device, "im2col_f32")?;
         let groupnorm_f32 = pipeline_for(&library, device, "groupnorm_f32")?;
@@ -203,6 +211,7 @@ impl MetalPipelines {
             gemm_tq2_g128_v9_simdgroup,
             gemm_tq2_g128_v10_simdgroup,
             gemm_f32_simdgroup,
+            gemm_bf16_simdgroup,
             im2col_f32,
             groupnorm_f32,
             silu_f32,
@@ -287,6 +296,9 @@ fn build_combined_msl() -> String {
     src.push('\n');
     // ── f32-exact (text encoder) ────────────────────────────────────────
     src.push_str(kernel_sources::MSL_GEMM_F32_SIMDGROUP);
+    src.push('\n');
+    // ── half-input / f32-accumulate (text encoder fast path) ─────────────
+    src.push_str(kernel_sources::MSL_GEMM_BF16_SIMDGROUP);
     src.push('\n');
     // ── FLUX.2 VAE decoder per-op f32 primitives ─────────────────────────
     src.push_str(kernel_sources::MSL_IM2COL_F32);

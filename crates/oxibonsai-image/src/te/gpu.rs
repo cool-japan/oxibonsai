@@ -86,6 +86,19 @@ pub fn te_gpu_enabled() -> bool {
     *TE_GPU_ENABLED.get_or_init(|| matches!(std::env::var("OXI_TE_GPU").ok().as_deref(), Some("1")))
 }
 
+/// Cached toggle for the GEMM precision on the GPU TE path. The **bf16** kernel
+/// is the default (the model is natively bf16, so it is parity-clean — cos ≈ 1.0
+/// — and ~3× faster than the f32 kernel on Apple GPUs). Set env
+/// `OXI_TE_GEMM_F32=1` to force the bit-exact f32 kernel instead. Only consulted
+/// when [`te_gpu_enabled`] is also true.
+static TE_GEMM_BF16: OnceLock<bool> = OnceLock::new();
+
+/// Whether the GPU TE path should use the bf16 GEMM kernel (default `true`).
+pub fn te_gemm_bf16_enabled() -> bool {
+    *TE_GEMM_BF16
+        .get_or_init(|| !matches!(std::env::var("OXI_TE_GEMM_F32").ok().as_deref(), Some("1")))
+}
+
 /// Compute `out[m, n] = Σ_k input[m, k] · weight[n, k]` (`x · Wᵀ`) on the GPU.
 ///
 /// - `weight`: row-major f32 `[n, k]` (the dequantized TE Linear weight,
@@ -117,7 +130,11 @@ pub fn te_matmul_gpu(
     // with the DiT's pointer keys or the LLM's small key space.
     let key = weight.as_ptr() as u64;
     let handle = graph.get_or_upload_f32_weight(key, weight)?;
-    graph.encode_gemm_f32(&handle, input, out, m, n, k)?;
+    if te_gemm_bf16_enabled() {
+        graph.encode_gemm_bf16(&handle, input, out, m, n, k)?;
+    } else {
+        graph.encode_gemm_f32(&handle, input, out, m, n, k)?;
+    }
     TE_GPU_USED.store(true, Ordering::Relaxed);
     Ok(())
 }

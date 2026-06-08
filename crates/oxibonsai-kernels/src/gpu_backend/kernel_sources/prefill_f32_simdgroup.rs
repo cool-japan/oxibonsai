@@ -221,3 +221,155 @@ kernel void gemm_f32_simdgroup(
     }
 }
 "#;
+
+/// **bf16-input / f32-accumulate** variant of [`MSL_GEMM_F32_SIMDGROUP`].
+///
+/// Identical tiling, buffers, and dispatch geometry as `gemm_f32_simdgroup`
+/// (so [`dispatch_gemm_bf16`](crate::gpu_backend::metal_dispatch) reuses the same
+/// shape), but stages the input and weight tiles as `bfloat` and runs the matrix
+/// MACs with `simdgroup_matrix<bfloat,8,8>` fragments into an `simdgroup_float8x8`
+/// accumulator. Apple-GPU `bfloat` `simdgroup_matrix` (M3+/Metal 3.1) throughput
+/// is ~2× the `float` path and the staged tiles are half the bytes, so this is a
+/// large speedup. bf16 is deliberate over `half`: it has f32's full exponent
+/// range (the TE activations/weights overflow `half`'s ±65504, which corrupts the
+/// conditioning) and it is the model's **native** precision — the reference TE
+/// runs in bf16 — so rounding the operands to bf16 is parity-clean (cos ≈ 1.0),
+/// not lossy. Inputs/outputs/weights stay f32 in global memory; only the internal
+/// compute precision is bf16. Use `gemm_f32_simdgroup` where bit-exactness is
+/// required (e.g. the VAE conv path).
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub const MSL_GEMM_BF16_SIMDGROUP: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant constexpr uint H_TM = 64u;
+constant constexpr uint H_TN = 64u;
+constant constexpr uint H_TK = 32u;
+constant constexpr uint H_SIMDGROUPS = 4u;
+constant constexpr uint H_THREADS = H_SIMDGROUPS * 32u;   // 128
+constant constexpr uint H_SG_M = 32u;
+constant constexpr uint H_SG_N = 32u;
+constant constexpr uint H_FRAG = 8u;
+constant constexpr uint H_MFRAGS = H_SG_M / H_FRAG;       // 4
+constant constexpr uint H_NFRAGS = H_SG_N / H_FRAG;       // 4
+constant constexpr uint H_KFRAGS = H_TK / H_FRAG;         // 4
+constant constexpr uint H_AELEMS = H_TM * H_TK;           // 2048
+
+kernel void gemm_bf16_simdgroup(
+    device const float*  weights    [[buffer(0)]],
+    device const float*  inputs     [[buffer(1)]],
+    device       float*  outputs    [[buffer(2)]],
+    constant uint&       n_rows     [[buffer(3)]],
+    constant uint&       batch_size [[buffer(4)]],
+    constant uint&       k          [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  lid  [[thread_index_in_threadgroup]],
+    uint  sgid [[simdgroup_index_in_threadgroup]])
+{
+    const uint row_base = tgid.x * H_TN;
+    const uint col_base = tgid.y * H_TM;
+
+    const uint sg_mi = sgid / (H_TN / H_SG_N);
+    const uint sg_ni = sgid % (H_TN / H_SG_N);
+    const uint sg_m0 = sg_mi * H_SG_M;
+    const uint sg_n0 = sg_ni * H_SG_N;
+
+    const uint k_tiles = (k + H_TK - 1u) / H_TK;
+
+    // bf16 staging: 4 KiB + 4 KiB (half the f32 kernel's threadgroup memory).
+    threadgroup bfloat Ash[H_TM * H_TK];
+    threadgroup bfloat Dsh[H_TK * H_TN];
+
+    // f32 accumulators (the MACs read bf16 fragments, accumulate in float).
+    simdgroup_float8x8 acc[H_MFRAGS][H_NFRAGS];
+    for (uint mi = 0u; mi < H_MFRAGS; mi++) {
+        for (uint ni = 0u; ni < H_NFRAGS; ni++) {
+            acc[mi][ni] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+    }
+
+    const uint valid_rows = (row_base < n_rows)     ? min(H_TN, n_rows - row_base)     : 0u;
+    const uint valid_cols = (col_base < batch_size) ? min(H_TM, batch_size - col_base) : 0u;
+
+    for (uint kt = 0u; kt < k_tiles; kt++) {
+        const uint k_off  = kt * H_TK;
+        const uint k_span = (k_off < k) ? min(H_TK, k - k_off) : 0u;
+
+        if (lid < H_TN) {
+            const uint n_local = lid;
+            if (n_local < valid_rows) {
+                const uint w_row = row_base + n_local;
+                const device float* wrow = weights + (ulong)w_row * (ulong)k + (ulong)k_off;
+                for (uint kk = 0u; kk < H_TK; kk++) {
+                    Dsh[kk * H_TN + n_local] = (kk < k_span) ? (bfloat)wrow[kk] : (bfloat)0.0f;
+                }
+            } else {
+                for (uint kk = 0u; kk < H_TK; kk++) {
+                    Dsh[kk * H_TN + n_local] = (bfloat)0.0f;
+                }
+            }
+        }
+
+        for (uint i = lid; i < H_AELEMS; i += H_THREADS) {
+            const uint a_row = i / H_TK;
+            const uint a_kk  = i % H_TK;
+            bfloat v = (bfloat)0.0f;
+            if (a_row < valid_cols && a_kk < k_span) {
+                const uint a_col = col_base + a_row;
+                v = (bfloat)inputs[(ulong)a_col * (ulong)k + (ulong)k_off + (ulong)a_kk];
+            }
+            Ash[a_row * H_TK + a_kk] = v;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kf = 0u; kf < H_KFRAGS; kf++) {
+            simdgroup_matrix<bfloat, 8, 8> afrag[H_MFRAGS];
+            simdgroup_matrix<bfloat, 8, 8> dfrag[H_NFRAGS];
+            for (uint mi = 0u; mi < H_MFRAGS; mi++) {
+                const uint a_off = (sg_m0 + mi * H_FRAG) * H_TK + kf * H_FRAG;
+                simdgroup_load(afrag[mi], Ash + a_off, H_TK);
+            }
+            for (uint ni = 0u; ni < H_NFRAGS; ni++) {
+                const uint d_off = (kf * H_FRAG) * H_TN + (sg_n0 + ni * H_FRAG);
+                simdgroup_load(dfrag[ni], Dsh + d_off, H_TN);
+            }
+            for (uint mi = 0u; mi < H_MFRAGS; mi++) {
+                for (uint ni = 0u; ni < H_NFRAGS; ni++) {
+                    simdgroup_multiply_accumulate(acc[mi][ni], afrag[mi], dfrag[ni], acc[mi][ni]);
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    threadgroup float Csh[H_SG_M * H_SG_N];
+
+    for (uint sg = 0u; sg < H_SIMDGROUPS; sg++) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == sgid) {
+            for (uint mi = 0u; mi < H_MFRAGS; mi++) {
+                for (uint ni = 0u; ni < H_NFRAGS; ni++) {
+                    const uint c_off = (mi * H_FRAG) * H_SG_N + ni * H_FRAG;
+                    simdgroup_store(acc[mi][ni], Csh + c_off, H_SG_N);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == sgid) {
+            for (uint idx = lid % 32u; idx < H_SG_M * H_SG_N; idx += 32u) {
+                const uint mm = idx / H_SG_N;
+                const uint nn = idx % H_SG_N;
+                const uint m_local = sg_m0 + mm;
+                const uint n_local = sg_n0 + nn;
+                if (m_local < valid_cols && n_local < valid_rows) {
+                    const uint col = col_base + m_local;
+                    const uint row = row_base + n_local;
+                    outputs[(ulong)col * (ulong)n_rows + (ulong)row] = Csh[mm * H_SG_N + nn];
+                }
+            }
+        }
+    }
+}
+"#;

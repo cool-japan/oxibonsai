@@ -507,6 +507,41 @@ impl MetalGraph {
         encoder.dispatch_thread_groups(MTLSize::new(tg_x, tg_y, 1), MTLSize::new(THREADS, 1, 1));
     }
 
+    /// Dispatch the bf16-input / f32-accumulate `gemm_bf16_simdgroup` GEMM. Same
+    /// buffers, scalars, tile shape, and grid as [`Self::dispatch_gemm_f32`] —
+    /// only the pipeline (and thus the internal staging precision) differs.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dispatch_gemm_bf16(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        weights: &Buffer,
+        inputs: &Buffer,
+        outputs: &Buffer,
+        n_rows: u32,
+        k: u32,
+        batch_size: u32,
+    ) {
+        // Tile sizes / simdgroup shape — keep in sync with MSL_GEMM_BF16_SIMDGROUP.
+        const TN: usize = 64;
+        const TM: usize = 64;
+        const SIMDGROUPS: u64 = 4;
+        const THREADS: u64 = SIMDGROUPS * 32; // 128
+
+        encoder.set_compute_pipeline_state(&self.pipelines.gemm_bf16_simdgroup);
+        encoder.set_buffer(0, Some(weights), 0);
+        encoder.set_buffer(1, Some(inputs), 0);
+        encoder.set_buffer(2, Some(outputs), 0);
+        unsafe {
+            set_scalar(encoder, 3, &n_rows);
+            set_scalar(encoder, 4, &batch_size);
+            set_scalar(encoder, 5, &k);
+        }
+
+        let tg_x = div_ceil(n_rows as usize, TN) as u64;
+        let tg_y = div_ceil(batch_size as usize, TM) as u64;
+        encoder.dispatch_thread_groups(MTLSize::new(tg_x, tg_y, 1), MTLSize::new(THREADS, 1, 1));
+    }
+
     /// Dispatch fused gate+up+SwiGLU GEMM for batch prefill.
     ///
     /// 1D grid: `[ceil(inter_size/8), 1, 1]` threadgroups — batch columns processed inside kernel.

@@ -663,6 +663,44 @@ impl MetalGraph {
         n_rows: usize,
         k: usize,
     ) -> Result<(), MetalGraphError> {
+        self.encode_gemm_simdgroup(weight, input, output, m, n_rows, k, false)
+    }
+
+    /// bf16-input / f32-accumulate sibling of [`Self::encode_gemm_f32`]. Same
+    /// buffers and result shape; the operands are rounded to `bfloat` inside the
+    /// `gemm_bf16_simdgroup` kernel for ~2× throughput. bf16 is the model's
+    /// native precision, so parity is render-level (cos ≈ 1.0). Used for the
+    /// text encoder; see `OXI_TE_GEMM_F32` to force the exact f32 path.
+    ///
+    /// # Errors
+    /// As [`Self::encode_gemm_f32`].
+    pub fn encode_gemm_bf16(
+        &self,
+        weight: &MetalWeightHandle,
+        input: &[f32],
+        output: &mut [f32],
+        m: usize,
+        n_rows: usize,
+        k: usize,
+    ) -> Result<(), MetalGraphError> {
+        self.encode_gemm_simdgroup(weight, input, output, m, n_rows, k, true)
+    }
+
+    /// Shared encode for the f32 and bf16 text-encoder GEMM kernels; `bf16`
+    /// selects the staging precision (`gemm_bf16_simdgroup` vs
+    /// `gemm_f32_simdgroup`). Everything else — validation, the resident I/O
+    /// pool, and the f32 host buffers — is identical.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_gemm_simdgroup(
+        &self,
+        weight: &MetalWeightHandle,
+        input: &[f32],
+        output: &mut [f32],
+        m: usize,
+        n_rows: usize,
+        k: usize,
+        bf16: bool,
+    ) -> Result<(), MetalGraphError> {
         // ── Validate ─────────────────────────────────────────────────────
         let expected_in = m.checked_mul(k).ok_or_else(|| {
             MetalGraphError::InvalidDimensions(format!(
@@ -743,20 +781,33 @@ impl MetalGraph {
         let cmd_buf = self.command_queue.new_command_buffer();
         let encoder = cmd_buf.new_compute_command_encoder();
 
-        // Text-encoder large-M path: the f32-exact simdgroup_matrix GEMM. Same
-        // 64×64-tile / 4-simdgroup shape as the ternary v9/v10, but stages the
-        // f32 weight tile directly (no dequant). f32 accumulate → numerically
-        // equivalent to the CPU gemm_abt (unit parity max-abs ≲ 1e-4; te_parity
-        // cos ≥ 0.999).
-        self.dispatch_gemm_f32(
-            encoder,
-            &weight.buffer,
-            &pool.input,
-            &pool.output,
-            n_rows as u32,
-            k as u32,
-            m as u32,
-        );
+        // Text-encoder large-M path: the simdgroup_matrix GEMM. Same 64×64-tile /
+        // 4-simdgroup shape as the ternary v9/v10, staging the f32 weight tile
+        // directly (no dequant). The f32 kernel accumulates in f32 (parity with
+        // the CPU gemm_abt, cos ≥ 0.999); the bf16 kernel rounds the operands to
+        // bf16 — the model's native precision — for ~2× throughput at
+        // render-level parity (cos ≈ 1.0).
+        if bf16 {
+            self.dispatch_gemm_bf16(
+                encoder,
+                &weight.buffer,
+                &pool.input,
+                &pool.output,
+                n_rows as u32,
+                k as u32,
+                m as u32,
+            );
+        } else {
+            self.dispatch_gemm_f32(
+                encoder,
+                &weight.buffer,
+                &pool.input,
+                &pool.output,
+                n_rows as u32,
+                k as u32,
+                m as u32,
+            );
+        }
 
         encoder.end_encoding();
         cmd_buf.commit();
