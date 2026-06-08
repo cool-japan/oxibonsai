@@ -397,6 +397,18 @@ impl<'w> TextEncoder<'w> {
                 let q_row = &q[q_off + qi * head_dim..q_off + (qi + 1) * head_dim];
                 let mrow = &mask[qi * seq..(qi + 1) * seq];
                 for (ki, score) in scores.iter_mut().enumerate() {
+                    // A masked key (causal future or padding) carries an additive
+                    // `-inf`, so its softmax weight is `exp(-inf) = 0` no matter
+                    // the score. Skip the dot entirely and stamp `-inf` directly —
+                    // byte-identical to computing it. For the fixed 512-token
+                    // padded sequence this is the bulk of the work on a short
+                    // prompt (only the real, non-future keys survive). `mask` only
+                    // ever holds `0.0` or `-inf`, so `is_infinite()` is exactly the
+                    // masked set.
+                    if mrow[ki].is_infinite() {
+                        *score = f32::NEG_INFINITY;
+                        continue;
+                    }
                     let k_row = &k[kv_off + ki * head_dim..kv_off + (ki + 1) * head_dim];
                     *score = dot(q_row, k_row, head_dim) * scale + mrow[ki];
                 }
