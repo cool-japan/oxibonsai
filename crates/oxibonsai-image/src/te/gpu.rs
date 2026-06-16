@@ -130,7 +130,7 @@ pub fn te_matmul_gpu(
     // with the DiT's pointer keys or the LLM's small key space.
     let key = weight.as_ptr() as u64;
     let handle = graph.get_or_upload_f32_weight(key, weight)?;
-    if te_gemm_bf16_enabled() {
+    if te_gemm_bf16_enabled() && graph.bf16_gemm_available() {
         graph.encode_gemm_bf16(&handle, input, out, m, n, k)?;
     } else {
         graph.encode_gemm_f32(&handle, input, out, m, n, k)?;
@@ -149,6 +149,15 @@ mod tests {
         // (env `OXI_TE_GPU` unset → disabled). It does not mutate the env.
         if std::env::var("OXI_TE_GPU").is_err() {
             assert!(!te_gpu_enabled());
+        }
+    }
+
+    #[test]
+    fn te_gemm_bf16_enabled_by_default_when_env_unset() {
+        // Note: OnceLock caches the first read; this asserts the default policy
+        // (env `OXI_TE_GEMM_F32` unset → bf16 enabled). It does not mutate the env.
+        if std::env::var("OXI_TE_GEMM_F32").is_err() {
+            assert!(te_gemm_bf16_enabled());
         }
     }
 }

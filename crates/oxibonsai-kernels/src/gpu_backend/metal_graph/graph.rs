@@ -672,6 +672,10 @@ impl MetalGraph {
     /// native precision, so parity is render-level (cos ≈ 1.0). Used for the
     /// text encoder; see `OXI_TE_GEMM_F32` to force the exact f32 path.
     ///
+    /// If the bf16 kernel is unavailable on this device (M1/M2 or macOS < 14,
+    /// see [`Self::bf16_gemm_available`]) the dispatch transparently uses the
+    /// exact f32 kernel instead.
+    ///
     /// # Errors
     /// As [`Self::encode_gemm_f32`].
     pub fn encode_gemm_bf16(
@@ -684,6 +688,17 @@ impl MetalGraph {
         k: usize,
     ) -> Result<(), MetalGraphError> {
         self.encode_gemm_simdgroup(weight, input, output, m, n_rows, k, true)
+    }
+
+    /// Whether the optional bf16 TE GEMM kernel compiled on this device.
+    ///
+    /// `false` on a device/toolchain without `bfloat` simdgroup_matrix support
+    /// (M1/M2 or macOS < 14); callers (the TE GPU path) then route to
+    /// [`Self::encode_gemm_f32`]. Even when this returns `true`,
+    /// [`Self::encode_gemm_bf16`] independently re-checks and falls back, so a
+    /// stale `true` can never produce a wrong result.
+    pub fn bf16_gemm_available(&self) -> bool {
+        self.pipelines.gemm_bf16_simdgroup.is_some()
     }
 
     /// Shared encode for the f32 and bf16 text-encoder GEMM kernels; `bf16`
@@ -787,18 +802,19 @@ impl MetalGraph {
         // the CPU gemm_abt, cos ≥ 0.999); the bf16 kernel rounds the operands to
         // bf16 — the model's native precision — for ~2× throughput at
         // render-level parity (cos ≈ 1.0).
-        if bf16 {
-            self.dispatch_gemm_bf16(
-                encoder,
-                &weight.buffer,
-                &pool.input,
-                &pool.output,
-                n_rows as u32,
-                k as u32,
-                m as u32,
-            );
+        // bf16 is dispatched only when it was requested *and* the optional bf16
+        // kernel actually compiled on this device (M3+/Metal 3.1). On M1/M2 or an
+        // older toolchain `gemm_bf16_simdgroup` is `None`, so this transparently
+        // falls back to the exact f32 kernel — same result shape, f32 numerics.
+        let use_bf16 = bf16_dispatch_selected(bf16, self.pipelines.gemm_bf16_simdgroup.is_some());
+        let bf16_pso = if use_bf16 {
+            self.pipelines.gemm_bf16_simdgroup.as_ref()
         } else {
-            self.dispatch_gemm_f32(
+            None
+        };
+        match bf16_pso {
+            Some(pso) => self.dispatch_gemm_bf16(
+                pso,
                 encoder,
                 &weight.buffer,
                 &pool.input,
@@ -806,7 +822,16 @@ impl MetalGraph {
                 n_rows as u32,
                 k as u32,
                 m as u32,
-            );
+            ),
+            None => self.dispatch_gemm_f32(
+                encoder,
+                &weight.buffer,
+                &pool.input,
+                &pool.output,
+                n_rows as u32,
+                k as u32,
+                m as u32,
+            ),
         }
 
         encoder.end_encoding();
@@ -1549,5 +1574,33 @@ impl MetalGraph {
     /// Expose the device reference for external buffer allocation.
     pub fn device(&self) -> &Device {
         &self.device
+    }
+}
+
+/// Pure selection for the TE GEMM staging precision: bf16 is dispatched only
+/// when it was both requested (`OXI_TE_GEMM_F32` unset) *and* the optional
+/// `gemm_bf16_simdgroup` pipeline compiled on this device (M3+/Metal 3.1). On a
+/// device/toolchain without `bfloat` simdgroup support the pipeline is `None`
+/// and the TE GEMM falls back to the exact f32 kernel. Factored out so the
+/// fallback (the unsupported-device invariant) is unit-testable without a GPU.
+#[inline]
+fn bf16_dispatch_selected(bf16_requested: bool, bf16_available: bool) -> bool {
+    bf16_requested && bf16_available
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bf16_dispatch_selected;
+
+    #[test]
+    fn bf16_dispatch_selects_f32_when_pipeline_unavailable() {
+        // The unsupported-device invariant: bf16 requested but the optional
+        // kernel did not compile on this device → select the f32 kernel.
+        assert!(!bf16_dispatch_selected(true, false));
+        // bf16 requested and available → bf16.
+        assert!(bf16_dispatch_selected(true, true));
+        // f32 forced (OXI_TE_GEMM_F32=1) → f32 regardless of availability.
+        assert!(!bf16_dispatch_selected(false, true));
+        assert!(!bf16_dispatch_selected(false, false));
     }
 }

@@ -98,7 +98,13 @@ pub(crate) struct MetalPipelines {
     /// for ~2× throughput at the model's native precision. Dispatched by
     /// `encode_gemm_bf16`; the GPU TE path uses it by default (cos ≈ 1.0), with
     /// `OXI_TE_GEMM_F32=1` to force the exact f32 kernel.
-    pub(crate) gemm_bf16_simdgroup: ComputePipelineState,
+    ///
+    /// `None` when the device/toolchain lacks `bfloat` simdgroup_matrix support
+    /// (M1/M2 or macOS < 14): the kernel is compiled best-effort in its **own**
+    /// library, kept OUT of the combined metallib so the rest of the backend
+    /// (DiT/VAE/TE-f32, which only need M1-class half/f32 simdgroup) always
+    /// compiles. When `None` the TE GEMM transparently uses `gemm_f32_simdgroup`.
+    pub(crate) gemm_bf16_simdgroup: Option<ComputePipelineState>,
 
     // ── FLUX.2 VAE decoder per-op f32 primitives ────────────────────
     /// im2col patch extraction `[rows, kH·kW·C_in]` in `(kH,kW,C_in)` order
@@ -175,7 +181,10 @@ impl MetalPipelines {
         let gemm_tq2_g128_v10_simdgroup =
             pipeline_for(&library, device, "gemm_tq2_g128_v10_simdgroup")?;
         let gemm_f32_simdgroup = pipeline_for(&library, device, "gemm_f32_simdgroup")?;
-        let gemm_bf16_simdgroup = pipeline_for(&library, device, "gemm_bf16_simdgroup")?;
+        // Optional bf16 TE GEMM: compiled best-effort in its OWN library so a
+        // device/toolchain without `bfloat` simdgroup support (M1/M2, macOS<14)
+        // can never fail `compile()`. `None` ⇒ the TE GEMM uses the f32 kernel.
+        let gemm_bf16_simdgroup = try_compile_bf16_pipeline(device);
         // VAE decoder per-op f32 primitives
         let im2col_f32 = pipeline_for(&library, device, "im2col_f32")?;
         let groupnorm_f32 = pipeline_for(&library, device, "groupnorm_f32")?;
@@ -296,9 +305,6 @@ fn build_combined_msl() -> String {
     src.push('\n');
     // ── f32-exact (text encoder) ────────────────────────────────────────
     src.push_str(kernel_sources::MSL_GEMM_F32_SIMDGROUP);
-    src.push('\n');
-    // ── half-input / f32-accumulate (text encoder fast path) ─────────────
-    src.push_str(kernel_sources::MSL_GEMM_BF16_SIMDGROUP);
     src.push('\n');
     // ── FLUX.2 VAE decoder per-op f32 primitives ─────────────────────────
     src.push_str(kernel_sources::MSL_IM2COL_F32);
@@ -480,4 +486,53 @@ fn load_or_compile_library(device: &Device, msl_source: &str) -> Result<Library,
 
     // 4. Final fallback: runtime compilation (no caching possible)
     compile_msl_runtime(device, msl_source)
+}
+
+/// Compile the **optional** bf16 TE GEMM kernel into its own small library and
+/// extract its pipeline, returning `None` on any failure.
+///
+/// `gemm_bf16_simdgroup` uses `simdgroup_matrix<bfloat,8,8>`, which needs
+/// Apple-GPU `bfloat` simdgroup support (M3+/Metal 3.1). Keeping it OUT of the
+/// combined metallib means the rest of the backend (DiT/VAE/TE-f32 — only
+/// M1-class `half`/f32 simdgroup) always compiles; here a missing `bfloat`
+/// feature simply yields `None` (the source fails to compile on an old SDK, or
+/// pipeline creation fails on an old GPU) and the TE GEMM falls back to the
+/// exact f32 kernel. The failure is therefore never propagated out of
+/// [`MetalPipelines::compile`].
+fn try_compile_bf16_pipeline(device: &Device) -> Option<ComputePipelineState> {
+    let library = load_bf16_library(device)?;
+    let func = library.get_function("gemm_bf16_simdgroup", None).ok()?;
+    match device.new_compute_pipeline_state_with_function(&func) {
+        Ok(pso) => Some(pso),
+        Err(e) => {
+            tracing::info!("bf16 TE GEMM unavailable on this device ({e}); using the f32 GEMM");
+            None
+        }
+    }
+}
+
+/// Load the standalone bf16-kernel library: disk cache → `xcrun` → runtime MSL
+/// compilation. Mirrors [`load_or_compile_library`] but (a) omits the embedded
+/// (combined) metallib, and (b) returns `Option` because the bf16 kernel is
+/// optional — any failure (e.g. no `bfloat` support in the toolchain) is a
+/// silent `None`, not an error.
+fn load_bf16_library(device: &Device) -> Option<Library> {
+    let src = kernel_sources::MSL_GEMM_BF16_SIMDGROUP;
+    let hash = msl_hash(src);
+    let cache_filename = format!("bf16_{hash:016x}.metallib");
+
+    if let Some(cache_dir) = metallib_cache_dir() {
+        let cache_path = cache_dir.join(&cache_filename);
+        if let Some(lib) = try_load_cached_metallib(device, &cache_path) {
+            return Some(lib);
+        }
+        if let Some(lib) = compile_msl_via_xcrun(device, src, &cache_path) {
+            return Some(lib);
+        }
+    }
+
+    // Runtime fallback (no caching). `new_library_with_source` fails on a
+    // toolchain without `bfloat` simdgroup support → `None`.
+    let options = CompileOptions::new();
+    device.new_library_with_source(src, &options).ok()
 }

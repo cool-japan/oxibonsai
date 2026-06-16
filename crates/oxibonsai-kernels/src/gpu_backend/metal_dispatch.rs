@@ -513,6 +513,7 @@ impl MetalGraph {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch_gemm_bf16(
         &self,
+        pso: &metal::ComputePipelineState,
         encoder: &metal::ComputeCommandEncoderRef,
         weights: &Buffer,
         inputs: &Buffer,
@@ -527,7 +528,7 @@ impl MetalGraph {
         const SIMDGROUPS: u64 = 4;
         const THREADS: u64 = SIMDGROUPS * 32; // 128
 
-        encoder.set_compute_pipeline_state(&self.pipelines.gemm_bf16_simdgroup);
+        encoder.set_compute_pipeline_state(pso);
         encoder.set_buffer(0, Some(weights), 0);
         encoder.set_buffer(1, Some(inputs), 0);
         encoder.set_buffer(2, Some(outputs), 0);
