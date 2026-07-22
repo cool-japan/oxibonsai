@@ -386,6 +386,44 @@ pub unsafe fn gemm_1bit_g128_avx512(
 
 // ─── AVX-512 Streaming GEMV ─────────────────────────────────────────────
 
+/// Minimum output-row count at which the AVX-512 GEMV tier switches from the
+/// prefetch kernel to the non-temporal *streaming-store* kernel.
+///
+/// Below this, the output vector still fits comfortably in cache and the
+/// regular (cache-allocating) stores of the prefetch kernel win. Above it —
+/// e.g. an LM-head projection over a large vocabulary — the output is big
+/// enough that writing it through the cache would evict live weight/input
+/// data, so `_mm512_stream_ps` non-temporal stores are the better choice.
+#[cfg(target_arch = "x86_64")]
+pub const AVX512_STREAMING_MIN_ROWS: usize = 4096;
+
+/// AVX-512 1-bit GEMV tier entry point: picks the prefetch or streaming-store
+/// kernel based on `n_rows`.
+///
+/// This is the function the [`crate::dispatch::KernelDispatcher`] AVX-512 tier
+/// routes through. For `n_rows < AVX512_STREAMING_MIN_ROWS` it uses the
+/// double-buffered [`gemv_1bit_g128_avx512_prefetch`]; for larger outputs it
+/// uses [`gemv_1bit_g128_avx512_streaming`] (non-temporal stores). Both compute
+/// the same dot products; only the output store strategy differs.
+///
+/// # Safety
+/// Requires AVX-512F + AVX-512BW + AVX-512VL CPU support.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
+pub unsafe fn gemv_1bit_g128_avx512_auto(
+    blocks: &[BlockQ1_0G128],
+    input: &[f32],
+    output: &mut [f32],
+    n_rows: usize,
+    k: usize,
+) -> KernelResult<()> {
+    if n_rows >= AVX512_STREAMING_MIN_ROWS {
+        gemv_1bit_g128_avx512_streaming(blocks, input, output, n_rows, k)
+    } else {
+        gemv_1bit_g128_avx512_prefetch(blocks, input, output, n_rows, k)
+    }
+}
+
 /// AVX-512 1-bit GEMV with streaming stores for large output vectors.
 ///
 /// Uses `_mm512_stream_ps` for non-temporal stores to bypass the cache
@@ -523,42 +561,6 @@ pub unsafe fn gemv_1bit_g128_avx512_streaming(
     let _ = remainder; // used implicitly in the remainder loop
 
     Ok(())
-}
-
-/// AVX-512 gather-based input loading for non-contiguous KV cache access.
-///
-/// When accessing KV cache entries at non-sequential positions (e.g.,
-/// during attention with sparse or reordered sequences), standard
-/// sequential loads waste bandwidth loading unused data.
-///
-/// This function uses `_mm512_i32gather_ps` to load 16 non-contiguous
-/// f32 values in a single operation, specified by an index vector.
-///
-/// # Safety
-/// Requires AVX-512F CPU support.
-/// All gathered indices must be valid within the `data` buffer.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-pub unsafe fn gather_f32_avx512(data: *const f32, indices: &[i32; 16]) -> __m512 {
-    let idx = _mm512_loadu_si512(indices.as_ptr() as *const __m512i);
-    // Scale=4 because each index represents an f32 (4 bytes)
-    _mm512_i32gather_ps::<4>(idx, data)
-}
-
-/// AVX-512 scatter-based output storing for non-contiguous write patterns.
-///
-/// Inverse of gather: writes 16 f32 values to non-contiguous locations
-/// specified by an index vector.
-///
-/// # Safety
-/// Requires AVX-512F CPU support.
-/// All scatter indices must be valid within the `data` buffer.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-pub unsafe fn scatter_f32_avx512(data: *mut f32, indices: &[i32; 16], values: __m512) {
-    let idx = _mm512_loadu_si512(indices.as_ptr() as *const __m512i);
-    // Scale=4 because each index represents an f32 (4 bytes)
-    _mm512_i32scatter_ps::<4>(data, idx, values);
 }
 
 /// AVX-512 GEMV with prefetch and double-buffered accumulation.
@@ -1062,6 +1064,87 @@ mod tests {
                 "row {i}: ref={}, avx512={}",
                 out_ref[i],
                 out_avx512[i]
+            );
+        }
+    }
+
+    #[test]
+    fn avx512_gemv_streaming_matches_reference() {
+        if !has_avx512() {
+            return;
+        }
+        // 37 rows = 2 full streaming groups of 16 + a 5-row remainder tail,
+        // exercising both the `_mm512_stream_ps` group path and the scalar
+        // remainder-store path of the streaming kernel.
+        let n_rows = 37;
+        let k = 256;
+        let blocks_per_row = k / QK1_0_G128;
+        let mut blocks = Vec::with_capacity(n_rows * blocks_per_row);
+        for row in 0..n_rows {
+            for bi in 0..blocks_per_row {
+                let bits = [(row as u8).wrapping_mul(37).wrapping_add(bi as u8 * 13); 16];
+                blocks.push(make_block(0.5 + row as f32 * 0.05, bits));
+            }
+        }
+        let input: Vec<f32> = (0..k).map(|i| (i as f32 * 0.01) - 1.28).collect();
+
+        let mut out_ref = vec![0.0f32; n_rows];
+        let mut out_stream = vec![0.0f32; n_rows];
+
+        crate::gemv::gemv_1bit_g128(&blocks, &input, &mut out_ref, n_rows, k)
+            .expect("reference gemv should succeed");
+        unsafe {
+            gemv_1bit_g128_avx512_streaming(&blocks, &input, &mut out_stream, n_rows, k)
+                .expect("avx512 streaming gemv should succeed");
+        }
+
+        for i in 0..n_rows {
+            let tol = 1e-3 * out_ref[i].abs().max(1.0);
+            assert!(
+                (out_ref[i] - out_stream[i]).abs() <= tol,
+                "row {i}: ref={}, stream={}",
+                out_ref[i],
+                out_stream[i]
+            );
+        }
+    }
+
+    #[test]
+    fn avx512_gemv_auto_routes_streaming_above_threshold() {
+        if !has_avx512() {
+            return;
+        }
+        // Above AVX512_STREAMING_MIN_ROWS the auto entry point routes to the
+        // streaming kernel; its result must still match the scalar reference.
+        let n_rows = AVX512_STREAMING_MIN_ROWS + 5;
+        let k = 128;
+        let blocks_per_row = k / QK1_0_G128;
+        let mut blocks = Vec::with_capacity(n_rows * blocks_per_row);
+        for row in 0..n_rows {
+            for bi in 0..blocks_per_row {
+                let bits = [(row as u8).wrapping_mul(11).wrapping_add(bi as u8 * 7); 16];
+                blocks.push(make_block(0.25 + (row % 8) as f32 * 0.1, bits));
+            }
+        }
+        let input: Vec<f32> = (0..k).map(|i| (i as f32 * 0.02) - 1.28).collect();
+
+        let mut out_ref = vec![0.0f32; n_rows];
+        let mut out_auto = vec![0.0f32; n_rows];
+
+        crate::gemv::gemv_1bit_g128(&blocks, &input, &mut out_ref, n_rows, k)
+            .expect("reference gemv should succeed");
+        unsafe {
+            gemv_1bit_g128_avx512_auto(&blocks, &input, &mut out_auto, n_rows, k)
+                .expect("auto gemv should succeed");
+        }
+
+        for i in 0..n_rows {
+            let tol = 1e-3 * out_ref[i].abs().max(1.0);
+            assert!(
+                (out_ref[i] - out_auto[i]).abs() <= tol,
+                "row {i}: ref={}, auto={}",
+                out_ref[i],
+                out_auto[i]
             );
         }
     }

@@ -2,7 +2,7 @@
 
 Pure-Rust text-to-image pipeline: FLUX.2-Klein DiT (TQ2_0_g128 ternary) + AutoencoderKLFlux2 VAE + Qwen3-4B 4-bit text encoder + PNG output, all parity-validated against the MLX reference at cosine ≥ 0.999.
 
-**Version:** 0.2.2
+**Version:** 0.2.3
 
 Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 
@@ -59,7 +59,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxibonsai-image = { version = "0.2.2", features = ["metal"] }  # or "native-cuda"
+oxibonsai-image = { version = "0.2.3", features = ["metal"] }  # or "native-cuda"
 ```
 
 Build with the matching GPU feature:
@@ -97,7 +97,7 @@ let cfg = TextToImageCfg {
     golden_override: None,
 };
 
-let out = text_to_image(cfg).expect("pipeline failed");
+let out = text_to_image(&cfg).expect("pipeline failed");
 std::fs::write("bonsai.png", &out.png).expect("write png");
 println!("Generated {}×{} PNG", out.width, out.height);
 ```
@@ -129,13 +129,20 @@ OXI_TE_TOKENIZER_DIR=./bonsai-te/text_encoder-mlx-4bit
 OXI_VAE_WEIGHTS=./bonsai-vae/vae/diffusion_pytorch_model.safetensors
 ```
 
-**GPU stage toggles** (default on; set to `"0"` to opt out):
+**GPU stage toggles** (`OXI_DIT_ATTN_GPU` / `OXI_VAE_GPU` default on, set to
+`"0"` to opt out; `OXI_TE_GPU` defaults **off**, set to `"1"` to opt in):
 
 | Variable | Stage |
 |----------|-------|
 | `OXI_DIT_ATTN_GPU` | DiT joint flash-attention (Metal / CUDA) |
 | `OXI_VAE_GPU` | VAE decode (Metal / CUDA) |
-| `OXI_TE_GPU` | Text-encoder GEMM (Metal; dormant — set `OXI_TE_GPU=1`) |
+| `OXI_TE_GPU` | Text-encoder GEMM (Metal / CUDA; opt-in — set `OXI_TE_GPU=1`) |
+
+On CUDA, `OXI_TE_GPU_RESIDENT_BUDGET_MB` (default `0`, i.e. evict-after-every-GEMM)
+sets a VRAM budget in MB for a bounded LRU cache of resident text-encoder device
+weights, amortizing upload cost across prompts in `oxibonsai repl` / multi-image
+sessions (the ~16 GB f32 encoder can't stay fully resident on a discrete GPU the
+way it does under Metal's unified memory).
 
 See [`docs/IMAGEN.md`](../../docs/IMAGEN.md) for the full environment-variable
 and flag reference, including the complete asset-acquisition walkthrough.

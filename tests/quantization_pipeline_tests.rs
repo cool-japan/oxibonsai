@@ -190,7 +190,9 @@ fn test_lora_adapter_apply_and_merge() {
     let adapter = LoraAdapter::new(d_in, d_out, config);
 
     let x: Vec<f32> = (0..d_in).map(|i| i as f32 * 0.1).collect();
-    let out = adapter.apply(&x);
+    let out = adapter
+        .apply(&x)
+        .expect("apply with correctly-sized input should succeed");
     // B is zero-initialized so output should be all zeros.
     assert_eq!(out.len(), d_out);
     for &v in &out {
@@ -202,7 +204,9 @@ fn test_lora_adapter_apply_and_merge() {
 
     // After merge the weight delta should still be zero.
     let mut weights = vec![1.0_f32; d_out * d_in];
-    adapter.merge_into_weights(&mut weights);
+    adapter
+        .merge_into_weights(&mut weights)
+        .expect("merge with correctly-sized weights should succeed");
     // Weights unchanged since delta = B * A = 0.
     for &w in &weights {
         assert!(

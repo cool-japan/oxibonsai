@@ -36,7 +36,7 @@ fn main() -> anyhow::Result<()> {
             "{:15} => {} tokens: {:?}",
             preset.name(),
             tokens.len(),
-            &tokens,
+            tokens,
         );
     }
 
@@ -68,7 +68,7 @@ fn main() -> anyhow::Result<()> {
     };
     let mut engine = InferenceEngine::new(config.clone(), custom_params, 999);
     let tokens = engine.generate(&prompt_tokens, max_tokens)?;
-    println!("Generated: {:?}\n", &tokens);
+    println!("Generated: {:?}\n", tokens);
 
     // ─── 3. Validation demo ──────────────────────────────────────
     println!("--- Builder Validation ---\n");
@@ -115,7 +115,7 @@ fn main() -> anyhow::Result<()> {
             rp,
             tokens.len(),
             unique.len(),
-            &tokens,
+            tokens,
         );
     }
 

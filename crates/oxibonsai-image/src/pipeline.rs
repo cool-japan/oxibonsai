@@ -565,7 +565,14 @@ pub fn text_to_image(cfg: &TextToImageCfg) -> Result<TextToImageOut, PipelineErr
     let (ph, pw) = (lat_h, lat_w);
     let packed = latent_seq_to_packed_nchw(&final_latent, seq_img, in_channels, ph, pw)?;
     let t_vae = std::time::Instant::now();
-    let decoded = vae.decode_packed_latents(&packed, ph, pw, None)?;
+    // Auto-tile when the output exceeds 512 px (16 * ph > 512 means lat grid > 32
+    // which corresponds to output dimension > 512). For 512×512 the standard
+    // untiled path is used so there is no regression on the common case.
+    let decoded = if 16 * ph > 512 {
+        vae.decode_packed_latents_tiled(&packed, ph, pw, crate::vae::tiling::TileConfig::default())?
+    } else {
+        vae.decode_packed_latents(&packed, ph, pw, None)?
+    };
     if timing {
         eprintln!("[timing] VAE decode: {:.2}s", t_vae.elapsed().as_secs_f64());
     }

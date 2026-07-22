@@ -507,6 +507,42 @@ impl MetalGraph {
         encoder.dispatch_thread_groups(MTLSize::new(tg_x, tg_y, 1), MTLSize::new(THREADS, 1, 1));
     }
 
+    /// Dispatch the bf16-input / f32-accumulate `gemm_bf16_simdgroup` GEMM. Same
+    /// buffers, scalars, tile shape, and grid as [`Self::dispatch_gemm_f32`] —
+    /// only the pipeline (and thus the internal staging precision) differs.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dispatch_gemm_bf16(
+        &self,
+        pso: &metal::ComputePipelineState,
+        encoder: &metal::ComputeCommandEncoderRef,
+        weights: &Buffer,
+        inputs: &Buffer,
+        outputs: &Buffer,
+        n_rows: u32,
+        k: u32,
+        batch_size: u32,
+    ) {
+        // Tile sizes / simdgroup shape — keep in sync with MSL_GEMM_BF16_SIMDGROUP.
+        const TN: usize = 64;
+        const TM: usize = 64;
+        const SIMDGROUPS: u64 = 4;
+        const THREADS: u64 = SIMDGROUPS * 32; // 128
+
+        encoder.set_compute_pipeline_state(pso);
+        encoder.set_buffer(0, Some(weights), 0);
+        encoder.set_buffer(1, Some(inputs), 0);
+        encoder.set_buffer(2, Some(outputs), 0);
+        unsafe {
+            set_scalar(encoder, 3, &n_rows);
+            set_scalar(encoder, 4, &batch_size);
+            set_scalar(encoder, 5, &k);
+        }
+
+        let tg_x = div_ceil(n_rows as usize, TN) as u64;
+        let tg_y = div_ceil(batch_size as usize, TM) as u64;
+        encoder.dispatch_thread_groups(MTLSize::new(tg_x, tg_y, 1), MTLSize::new(THREADS, 1, 1));
+    }
+
     /// Dispatch fused gate+up+SwiGLU GEMM for batch prefill.
     ///
     /// 1D grid: `[ceil(inter_size/8), 1, 1]` threadgroups — batch columns processed inside kernel.
@@ -1064,9 +1100,9 @@ impl MetalGraph {
     /// One threadgroup computes a whole **query-tile** of `FA_BQ` (= 64) output
     /// rows for a head, driving the hardware 8×8 matrix units for both `Q·Kᵀ` and
     /// `P·V`. The grid is `[ceil(seq/FA_BQ), num_heads, 1]` and each threadgroup
-    /// runs `FA_SIMDGROUPS·32` (= 128) threads (4 simdgroups).
+    /// runs `FA_SIMDGROUPS·32` (= 256) threads (8 simdgroups).
     ///
-    /// The `FA_BQ` / `FA_BK` tile constants and the 4-simdgroup (128-thread)
+    /// The `FA_BQ` / `FA_BK` tile constants and the 8-simdgroup (256-thread)
     /// shape here MUST match the `joint_attention_flash_f32` MSL kernel
     /// (`DIT_FLASH_BQ` / `DIT_FLASH_BK`).
     #[allow(clippy::too_many_arguments)]
@@ -1098,7 +1134,7 @@ impl MetalGraph {
             set_scalar(encoder, 7, &scale);
         }
 
-        // One threadgroup per (query-tile of FA_BQ rows, head); 128 threads each.
+        // One threadgroup per (query-tile of FA_BQ rows, head); 256 threads each.
         let tg_x = div_ceil(seq as usize, DIT_FLASH_BQ) as u64;
         encoder.dispatch_thread_groups(
             MTLSize::new(tg_x, num_heads as u64, 1),

@@ -12,6 +12,7 @@
 //! | `observability.log_level`                  | ∈ { error, warn, info, debug, trace, off } |
 //! | `model.path`                               | Must exist on disk if set              |
 //! | `tokenizer.path`                           | Must exist on disk if set              |
+//! | `tokenizer.kind`                           | ∈ [`VALID_TOKENIZER_KINDS`] if set     |
 //! | `auth.bearer_token`                        | ≥ 16 characters if set                 |
 //! | `observability.metrics_path`               | Non-empty; must start with `/`         |
 //! | `limits.max_concurrent_requests`           | ≥ 1                                    |
@@ -28,6 +29,18 @@ pub const MIN_BEARER_TOKEN_LEN: usize = 16;
 
 /// Upper bound on `default_max_tokens`.
 pub const MAX_DEFAULT_MAX_TOKENS: usize = 8192;
+
+/// Whitelist of `tokenizer.kind` values this build can actually honor.
+///
+/// `TokenizerBridge::from_file` (in `oxibonsai-runtime`) always loads the file
+/// through the HuggingFace `tokenizers` crate — there is no alternate backend
+/// selectable by any code path. Rather than silently accepting (and ignoring)
+/// a value such as `"oxitok"` that the doc comment on
+/// [`crate::config::TokenizerConfigSection::kind`] gestures at but which is
+/// not actually implemented, `validate` rejects anything outside this list so
+/// the mismatch surfaces at startup instead of as a confusing runtime
+/// behavior gap.
+pub const VALID_TOKENIZER_KINDS: &[&str] = &["huggingface", "hf"];
 
 impl ServerConfig {
     /// Validate the configuration, returning a [`ConfigError::Validation`] on
@@ -134,6 +147,19 @@ impl ServerConfig {
             }
         }
 
+        // ─── Tokenizer kind ──────────────────────────────────────────────
+        if let Some(ref kind) = self.tokenizer.kind {
+            if !VALID_TOKENIZER_KINDS
+                .iter()
+                .any(|k| k.eq_ignore_ascii_case(kind))
+            {
+                return Err(ConfigError::Validation(format!(
+                    "tokenizer.kind {kind:?} is not supported by this build (no such backend \
+                     is implemented); expected one of {VALID_TOKENIZER_KINDS:?}"
+                )));
+            }
+        }
+
         Ok(())
     }
 }
@@ -174,5 +200,43 @@ mod tests {
         let mut cfg = ServerConfig::default();
         cfg.auth.bearer_token = Some("short".to_string());
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn unsupported_tokenizer_kind_rejected() {
+        let mut cfg = ServerConfig::default();
+        cfg.tokenizer.kind = Some("oxitok".to_string());
+        let err = cfg
+            .validate()
+            .expect_err("unsupported kind must be rejected");
+        match err {
+            ConfigError::Validation(msg) => assert!(
+                msg.contains("tokenizer.kind"),
+                "error should mention tokenizer.kind, got: {msg}"
+            ),
+            other => panic!("expected ConfigError::Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn supported_tokenizer_kind_accepted() {
+        let mut cfg = ServerConfig::default();
+        cfg.tokenizer.kind = Some("huggingface".to_string());
+        cfg.validate().expect("huggingface kind should validate");
+
+        // Case-insensitive and the short alias both accepted.
+        cfg.tokenizer.kind = Some("HuggingFace".to_string());
+        cfg.validate()
+            .expect("case-insensitive kind should validate");
+
+        cfg.tokenizer.kind = Some("hf".to_string());
+        cfg.validate().expect("hf alias should validate");
+    }
+
+    #[test]
+    fn unset_tokenizer_kind_accepted() {
+        let cfg = ServerConfig::default();
+        assert!(cfg.tokenizer.kind.is_none());
+        cfg.validate().expect("unset kind should validate");
     }
 }

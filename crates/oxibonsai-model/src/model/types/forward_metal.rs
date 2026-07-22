@@ -437,6 +437,21 @@ impl<'a> BonsaiModel<'a> {
         if n_layers == 0 {
             return Err("no blocks".into());
         }
+        // Context-length guard (mirrors the single-token `forward()` check at
+        // model/types/mod.rs and the CUDA prefill guards in forward_cuda/*).
+        // The batched RoPE gather below indexes `self.rope.cos_at(pos_start + t)`
+        // with no bound, and `RopeTable` is sized to exactly `max_seq_len` rows —
+        // a prompt that overflows the context would slice out of bounds and panic
+        // inside the request task. Returning Err makes `forward_prefill` fall back
+        // to the sequential path, whose per-token `forward()` returns a clean
+        // `ModelError::SequenceTooLong`.
+        if pos_start + batch_size > self.kv_cache.max_seq_len() {
+            return Err(format!(
+                "prefill sequence too long: {batch_size} tokens at pos {pos_start} exceeds max_seq_len {}",
+                self.kv_cache.max_seq_len()
+            )
+            .into());
+        }
         let lm_head_linear = match &self.output_weight {
             OutputWeight::OneBit(linear) => linear,
             OutputWeight::Ternary(_) => {
@@ -624,6 +639,16 @@ impl<'a> BonsaiModel<'a> {
         if n_layers == 0 {
             return Err("no blocks".into());
         }
+        // Context-length guard: prevents an out-of-bounds RoPE slice panic on
+        // prompts longer than the context (mirrors `forward()` and the CUDA
+        // prefill-verify guards).
+        if pos_start + batch_size > self.kv_cache.max_seq_len() {
+            return Err(format!(
+                "prefill-verify sequence too long: {batch_size} tokens at pos {pos_start} exceeds max_seq_len {}",
+                self.kv_cache.max_seq_len()
+            )
+            .into());
+        }
         let lm_head_linear = match &self.output_weight {
             OutputWeight::OneBit(linear) => linear,
             OutputWeight::Ternary(_) => {
@@ -809,6 +834,18 @@ impl<'a> BonsaiModel<'a> {
         token_id: u32,
         pos: usize,
     ) -> Result<u32, Box<dyn std::error::Error>> {
+        // Context-length guard (mirrors the single-token `forward()` check at
+        // model/types/mod.rs). `self.rope.cos_at(pos)` below does an unchecked
+        // slice into a `RopeTable` sized to exactly `max_seq_len` rows, so
+        // `pos >= max_seq_len` would panic; returning Err instead lets the
+        // engine's decode loop fall back to the guarded sequential path.
+        if pos >= self.kv_cache.max_seq_len() {
+            return Err(format!(
+                "greedy sequence too long: pos {pos} exceeds max_seq_len {}",
+                self.kv_cache.max_seq_len()
+            )
+            .into());
+        }
         let h = self.config.hidden_size;
         let inter = self.config.intermediate_size;
         let nq = self.config.num_attention_heads;
@@ -908,7 +945,17 @@ impl<'a> BonsaiModel<'a> {
         token_id: u32,
         pos: usize,
     ) -> Result<u32, Box<dyn std::error::Error>> {
-        use oxibonsai_kernels::FullForwardLayerParamsTernary;
+        use oxibonsai_kernels::{CachedModelWeights, FullForwardLayerParamsTernary};
+        // Context-length guard: `self.rope.cos_at(pos)` below indexes a
+        // `RopeTable` sized to exactly `max_seq_len` rows; `pos >= max_seq_len`
+        // would panic. Mirrors the single-token `forward()` check.
+        if pos >= self.kv_cache.max_seq_len() {
+            return Err(format!(
+                "ternary greedy sequence too long: pos {pos} exceeds max_seq_len {}",
+                self.kv_cache.max_seq_len()
+            )
+            .into());
+        }
         let n_layers = self.blocks.len();
         let h = self.config.hidden_size;
         let inter = self.config.intermediate_size;
@@ -945,11 +992,17 @@ impl<'a> BonsaiModel<'a> {
             .lock()
             .map_err(|e| format!("gpu_weight_cache lock: {e}"))?;
         let cached = guard.as_ref().ok_or("GPU weight cache not populated")?;
+        let cached = match cached {
+            CachedModelWeights::Ternary(tern) => tern,
+            CachedModelWeights::Q1(_) => {
+                return Err("ternary greedy GPU path invoked with a Q1 weight cache".into());
+            }
+        };
 
-        if cached.ternary_qkv_concats.len() != n_layers {
+        if cached.qkv_concats.len() != n_layers {
             return Err(format!(
                 "ternary cache layer count mismatch: expected {n_layers}, got {}",
-                cached.ternary_qkv_concats.len()
+                cached.qkv_concats.len()
             )
             .into());
         }
@@ -964,27 +1017,27 @@ impl<'a> BonsaiModel<'a> {
                 attn_norm_handle: norm_handle_base,
                 attn_norm_bytes: block.attn_norm_weight(),
                 fused_qkv_handle: weight_handle_base,
-                fused_qkv_bytes: &cached.ternary_qkv_concats[i],
+                fused_qkv_bytes: &cached.qkv_concats[i],
                 q_norm_handle: norm_handle_base + 1,
                 q_norm_bytes: block.q_norm_weight(),
                 k_norm_handle: norm_handle_base + 2,
                 k_norm_bytes: block.k_norm_weight(),
                 attn_proj_handle: weight_handle_base + 1,
-                attn_proj_bytes: &cached.ternary_attn_proj_bytes[i],
+                attn_proj_bytes: &cached.attn_proj_bytes[i],
                 ffn_norm_handle: norm_handle_base + 3,
                 ffn_norm_bytes: block.ffn_norm_weight(),
                 gate_up_handle: weight_handle_base + 2,
-                gate_bytes: &cached.ternary_gate_bytes[i],
-                up_bytes: &cached.ternary_up_bytes[i],
+                gate_bytes: &cached.gate_bytes[i],
+                up_bytes: &cached.up_bytes[i],
                 down_handle: weight_handle_base + 3,
-                down_bytes: &cached.ternary_down_bytes[i],
+                down_bytes: &cached.down_bytes[i],
             });
         }
         let final_norm_handle = 5_900_000u64;
         let final_norm_bytes = self.output_norm.weight();
         let lm_head_handle = 7_000_000u64;
-        let lm_head_bytes = &cached.ternary_lm_head_bytes;
-        let lm_head_out_features = cached.ternary_lm_head_out_features;
+        let lm_head_bytes = &cached.lm_head_bytes;
+        let lm_head_out_features = cached.lm_head_out_features;
 
         oxibonsai_kernels::try_metal_forward_greedy_ternary(
             &mut hidden,
@@ -1026,7 +1079,7 @@ impl<'a> BonsaiModel<'a> {
         pos: usize,
         logits: &mut Vec<f32>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        use oxibonsai_kernels::FullForwardLayerParamsTernary;
+        use oxibonsai_kernels::{CachedModelWeights, FullForwardLayerParamsTernary};
         let n_layers = self.blocks.len();
         let h = self.config.hidden_size;
         let inter = self.config.intermediate_size;
@@ -1048,11 +1101,17 @@ impl<'a> BonsaiModel<'a> {
             .lock()
             .map_err(|e| format!("gpu_weight_cache lock: {e}"))?;
         let cached = guard.as_ref().ok_or("GPU weight cache not populated")?;
+        let cached = match cached {
+            CachedModelWeights::Ternary(tern) => tern,
+            CachedModelWeights::Q1(_) => {
+                return Err("ternary fused GPU path invoked with a Q1 weight cache".into());
+            }
+        };
 
-        if cached.ternary_qkv_concats.len() != n_layers {
+        if cached.qkv_concats.len() != n_layers {
             return Err(format!(
                 "ternary cache layer count mismatch: expected {n_layers}, got {}",
-                cached.ternary_qkv_concats.len()
+                cached.qkv_concats.len()
             )
             .into());
         }
@@ -1065,20 +1124,20 @@ impl<'a> BonsaiModel<'a> {
                 attn_norm_handle: norm_handle_base,
                 attn_norm_bytes: block.attn_norm_weight(),
                 fused_qkv_handle: weight_handle_base,
-                fused_qkv_bytes: &cached.ternary_qkv_concats[i],
+                fused_qkv_bytes: &cached.qkv_concats[i],
                 q_norm_handle: norm_handle_base + 1,
                 q_norm_bytes: block.q_norm_weight(),
                 k_norm_handle: norm_handle_base + 2,
                 k_norm_bytes: block.k_norm_weight(),
                 attn_proj_handle: weight_handle_base + 1,
-                attn_proj_bytes: &cached.ternary_attn_proj_bytes[i],
+                attn_proj_bytes: &cached.attn_proj_bytes[i],
                 ffn_norm_handle: norm_handle_base + 3,
                 ffn_norm_bytes: block.ffn_norm_weight(),
                 gate_up_handle: weight_handle_base + 2,
-                gate_bytes: &cached.ternary_gate_bytes[i],
-                up_bytes: &cached.ternary_up_bytes[i],
+                gate_bytes: &cached.gate_bytes[i],
+                up_bytes: &cached.up_bytes[i],
                 down_handle: weight_handle_base + 3,
-                down_bytes: &cached.ternary_down_bytes[i],
+                down_bytes: &cached.down_bytes[i],
             });
         }
         let rope_cos = self.rope.cos_at(pos);
@@ -1086,8 +1145,8 @@ impl<'a> BonsaiModel<'a> {
         let final_norm_handle = 5_900_000u64;
         let final_norm_bytes = self.output_norm.weight();
         let lm_head_handle = 7_000_000u64;
-        let lm_head_bytes = &cached.ternary_lm_head_bytes;
-        let lm_head_out_features = cached.ternary_lm_head_out_features;
+        let lm_head_bytes = &cached.lm_head_bytes;
+        let lm_head_out_features = cached.lm_head_out_features;
 
         oxibonsai_kernels::try_metal_prefill_ternary(
             hidden,
@@ -1139,6 +1198,16 @@ impl<'a> BonsaiModel<'a> {
         let n_layers = self.blocks.len();
         if n_layers == 0 {
             return Err("no blocks".into());
+        }
+        // Context-length guard: prevents an out-of-bounds RoPE slice panic on
+        // prompts longer than the context (mirrors `forward()` and the CUDA
+        // ternary prefill guard).
+        if pos_start + batch_size > self.kv_cache.max_seq_len() {
+            return Err(format!(
+                "ternary prefill sequence too long: {batch_size} tokens at pos {pos_start} exceeds max_seq_len {}",
+                self.kv_cache.max_seq_len()
+            )
+            .into());
         }
         let lm_head_linear = match &self.output_weight {
             OutputWeight::Ternary(linear) => linear,
@@ -1327,6 +1396,16 @@ impl<'a> BonsaiModel<'a> {
         let n_layers = self.blocks.len();
         if n_layers == 0 {
             return Err("no blocks".into());
+        }
+        // Context-length guard: prevents an out-of-bounds RoPE slice panic on
+        // prompts longer than the context (mirrors `forward()` and the CUDA
+        // ternary prefill-verify guard).
+        if pos_start + batch_size > self.kv_cache.max_seq_len() {
+            return Err(format!(
+                "ternary prefill-verify sequence too long: {batch_size} tokens at pos {pos_start} exceeds max_seq_len {}",
+                self.kv_cache.max_seq_len()
+            )
+            .into());
         }
         let lm_head_linear = match &self.output_weight {
             OutputWeight::Ternary(linear) => linear,

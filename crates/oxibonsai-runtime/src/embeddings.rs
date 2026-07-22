@@ -15,8 +15,11 @@
 //! # Encoding formats
 //!
 //! - `"float"` (default) — embedding returned as a JSON array of `f32` values.
-//! - `"base64"` — embedding encoded as a hex string; each `f32` is serialised
-//!   as four little-endian bytes rendered as lowercase hex.
+//! - `"base64"` — embedding encoded as RFC 4648 base64 (standard alphabet,
+//!   `=` padding), matching the OpenAI API contract: each `f32` is
+//!   serialised as four little-endian bytes and the resulting byte string is
+//!   base64-encoded. A real OpenAI-SDK client's `base64.b64decode(...)` call
+//!   round-trips this correctly.
 //!
 //! # Dimensions
 //!
@@ -34,6 +37,25 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use oxibonsai_rag::embedding::{Embedder, IdentityEmbedder, TfIdfEmbedder};
+
+/// Lock `mutex`, recovering from lock poisoning instead of panicking.
+///
+/// `EmbedderRegistry` backs the live, server-reachable `POST /v1/embeddings`
+/// route. `std::sync::Mutex` poisons permanently once *any* thread panics
+/// while holding it, so an `.expect(...)` here would turn one unrelated
+/// panic into a process-lifetime outage for every subsequent embeddings
+/// request. The guarded state (an `Option<TfIdfEmbedder>`) has no invariant
+/// that a mid-mutation panic could leave unsafe to keep using, so recovering
+/// the inner value and logging a warning is preferable to a permanent 500.
+fn lock_or_recover<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        tracing::warn!(
+            "EmbedderRegistry mutex was poisoned by a prior panic; recovering inner state \
+             instead of propagating the panic to this request"
+        );
+        poisoned.into_inner()
+    })
+}
 
 // ─── Request / Response types ─────────────────────────────────────────────────
 
@@ -129,7 +151,7 @@ pub struct EmbeddingRequest {
 pub enum EmbeddingData {
     /// Embedding as a JSON array of `f32` values.
     Float(Vec<f32>),
-    /// Embedding encoded as a hex string (see [`EmbedderRegistry::encode_base64`]).
+    /// Embedding encoded as RFC 4648 base64 (see [`EmbedderRegistry::encode_base64`]).
     Base64(String),
 }
 
@@ -207,7 +229,7 @@ impl EmbedderRegistry {
     /// `IdentityEmbedder` otherwise.  Texts that fail to embed are silently
     /// replaced with a zero vector of the appropriate dimension.
     pub fn embed_texts(&self, texts: &[String]) -> Vec<Vec<f32>> {
-        let guard = self.tfidf.lock().expect("embedder registry mutex poisoned");
+        let guard = lock_or_recover(&self.tfidf);
         if let Some(ref tfidf) = *guard {
             texts
                 .iter()
@@ -239,7 +261,7 @@ impl EmbedderRegistry {
         }
         let refs: Vec<&str> = corpus.iter().map(String::as_str).collect();
         let fitted = TfIdfEmbedder::fit(&refs, self.default_dim);
-        let mut guard = self.tfidf.lock().expect("embedder registry mutex poisoned");
+        let mut guard = lock_or_recover(&self.tfidf);
         *guard = Some(fitted);
     }
 
@@ -248,7 +270,7 @@ impl EmbedderRegistry {
     /// Returns the TF-IDF vocabulary size when a fitted model is present,
     /// otherwise the configured `default_dim`.
     pub fn embedding_dim(&self) -> usize {
-        let guard = self.tfidf.lock().expect("embedder registry mutex poisoned");
+        let guard = lock_or_recover(&self.tfidf);
         if let Some(ref tfidf) = *guard {
             tfidf.embedding_dim()
         } else {
@@ -256,22 +278,56 @@ impl EmbedderRegistry {
         }
     }
 
-    /// Encode an embedding vector as a hex string (pure Rust, no external deps).
+    /// Encode an embedding vector as RFC 4648 base64 (pure Rust, no external
+    /// deps).
     ///
-    /// Each `f32` is serialised as four bytes in little-endian order, with each
-    /// byte represented as two lowercase hex digits.  The result is therefore
-    /// `8 * embedding.len()` characters long.
+    /// Each `f32` is serialised as four bytes in little-endian order; the
+    /// resulting byte string is then base64-encoded with the standard
+    /// alphabet and `=` padding, exactly as the OpenAI `encoding_format:
+    /// "base64"` contract expects (a real client's `base64.b64decode(...)`
+    /// round-trips this back to the original little-endian `f32` bytes).
+    ///
+    /// This previously emitted lowercase hex (a self-consistent but
+    /// non-standard format that silently corrupts data for any real
+    /// OpenAI-SDK client) — see finding `serve-api-08`.
     pub fn encode_base64(embedding: &[f32]) -> String {
-        let mut out = String::with_capacity(embedding.len() * 8);
+        let mut bytes = Vec::with_capacity(embedding.len() * 4);
         for value in embedding {
-            let bytes = value.to_le_bytes();
-            for byte in bytes {
-                use std::fmt::Write as _;
-                let _ = write!(out, "{byte:02x}");
-            }
+            bytes.extend_from_slice(&value.to_le_bytes());
         }
-        out
+        base64_encode_bytes(&bytes)
     }
+}
+
+/// RFC 4648 standard base64 alphabet.
+const BASE64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Encode an arbitrary byte slice as RFC 4648 base64 (standard alphabet,
+/// `=` padding). Pure Rust, no external dependencies.
+fn base64_encode_bytes(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+
+        let packed = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
+
+        out.push(BASE64_ALPHABET[((packed >> 18) & 0x3f) as usize] as char);
+        out.push(BASE64_ALPHABET[((packed >> 12) & 0x3f) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            BASE64_ALPHABET[((packed >> 6) & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            BASE64_ALPHABET[(packed & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 // ─── App state ────────────────────────────────────────────────────────────────
@@ -303,7 +359,15 @@ pub async fn create_embeddings(
     Json(req): Json<EmbeddingRequest>,
 ) -> Result<Response, StatusCode> {
     if req.input.is_empty() {
-        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+        // Return the shared OpenAI-style error envelope (with a JSON body)
+        // instead of a body-less status code, so `/v1/embeddings` validation
+        // errors are parseable in the same shape as every other route
+        // (finding `serve-api-10`).
+        return Ok(crate::http_error::error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "input must not be empty",
+            Some("input"),
+        ));
     }
 
     let texts = req.input.as_strings();
@@ -483,20 +547,75 @@ mod tests {
         }
     }
 
-    // ── encode_base64 ─────────────────────────────────────────────────────────
+    // ── Poisoned-lock recovery (finding #70) ─────────────────────────────────
+
+    /// Regression test: a panic on another thread while holding
+    /// `EmbedderRegistry`'s internal `tfidf` mutex must not turn every
+    /// subsequent `POST /v1/embeddings` request into a permanent panic.
+    /// Before the fix, `embed_texts`/`fit_tfidf`/`embedding_dim` all used
+    /// `.lock().expect("... poisoned")`, so a single unrelated panic while
+    /// holding the lock would wedge this (server-reachable) route for the
+    /// rest of the process lifetime.
+    #[test]
+    fn embedder_registry_recovers_from_poisoned_tfidf_lock() {
+        let registry = Arc::new(EmbedderRegistry::new(16));
+
+        // Poison the `tfidf` mutex from a background thread that panics
+        // while holding the lock.
+        {
+            let registry = Arc::clone(&registry);
+            let handle = std::thread::spawn(move || {
+                let _guard = registry.tfidf.lock().expect("lock for poisoning");
+                panic!("intentional panic to poison the tfidf mutex");
+            });
+            let result = handle.join();
+            assert!(result.is_err(), "background thread should have panicked");
+        }
+
+        // The mutex is now poisoned. Operations that touch it must recover
+        // instead of panicking.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let corpus: Vec<String> = vec![
+                "the quick brown fox".to_string(),
+                "jumped over the lazy dog".to_string(),
+            ];
+            registry.fit_tfidf(&corpus);
+            let embeddings = registry.embed_texts(&corpus);
+            let dim = registry.embedding_dim();
+            (embeddings, dim)
+        }));
+
+        assert!(
+            outcome.is_ok(),
+            "operations on an EmbedderRegistry with a poisoned `tfidf` mutex must not panic"
+        );
+        let (embeddings, dim) = outcome.expect("checked is_ok above");
+        assert_eq!(embeddings.len(), 2);
+        assert!(
+            dim > 0,
+            "embedding_dim should still be usable after poison recovery"
+        );
+    }
+
+    // ── encode_base64 (finding serve-api-08: must be real RFC 4648 base64,
+    //    not hex) ──────────────────────────────────────────────────────────
 
     #[test]
     fn encode_base64_non_empty() {
         let vec = vec![1.0f32, 0.5f32, -1.0f32];
         let encoded = EmbedderRegistry::encode_base64(&vec);
-        // Each f32 → 4 bytes → 8 hex chars; 3 values → 24 chars.
+        // 3 f32 values → 12 bytes → 12/3*4 = 16 base64 chars, no padding.
         assert_eq!(
             encoded.len(),
-            24,
-            "expected 24 hex chars for 3 f32 values, got {}",
+            16,
+            "expected 16 base64 chars for 3 f32 values (12 bytes), got {}",
             encoded.len()
         );
         assert!(!encoded.is_empty());
+        // Every character must be a valid RFC 4648 base64 alphabet character.
+        assert!(encoded
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'='));
     }
 
     #[test]
@@ -513,12 +632,95 @@ mod tests {
         assert_eq!(a, b, "encoding must be deterministic");
     }
 
+    /// Regression test for finding `serve-api-08`: the previous
+    /// implementation emitted lowercase hex ("0000803f") under the
+    /// `encoding_format: "base64"` contract. The expected string below was
+    /// computed independently with Python's standard `base64` module
+    /// (`base64.b64encode(struct.pack("<f", 1.0))` == `b"AACAPw=="`), so this
+    /// test verifies interoperability with a real RFC 4648 base64 decoder,
+    /// not just internal self-consistency.
     #[test]
-    fn encode_base64_known_value() {
-        // f32::from_le_bytes([0x00, 0x00, 0x80, 0x3f]) == 1.0
+    fn encode_base64_known_value_matches_real_base64_decoder() {
+        // f32::to_le_bytes(1.0) == [0x00, 0x00, 0x80, 0x3f]
         let vec = vec![1.0f32];
         let encoded = EmbedderRegistry::encode_base64(&vec);
-        assert_eq!(encoded, "0000803f");
+        assert_eq!(encoded, "AACAPw==");
+    }
+
+    /// Second independently-computed known vector: `base64.b64encode(
+    /// struct.pack("<2f", 1.0, 0.5))` == `b"AACAPwAAAD8="`.
+    #[test]
+    fn encode_base64_known_value_two_floats() {
+        let vec = vec![1.0f32, 0.5f32];
+        let encoded = EmbedderRegistry::encode_base64(&vec);
+        assert_eq!(encoded, "AACAPwAAAD8=");
+    }
+
+    /// Full round-trip: encode with the production encoder, decode with an
+    /// independent, standard-conformant base64 decoder (implemented here
+    /// for the test only), and confirm the reconstructed `f32` bytes match
+    /// the originals exactly. This is the "real decoder" check the finding
+    /// asked for: any RFC 4648-conformant decoder (including a real
+    /// `base64.b64decode`) must be able to reverse our output.
+    #[test]
+    fn encode_base64_round_trips_through_independent_decoder() {
+        let original = vec![1.0f32, -2.5f32, 0.0f32, std::f32::consts::PI, -999.125f32];
+        let encoded = EmbedderRegistry::encode_base64(&original);
+        let decoded_bytes = test_base64_decode(&encoded);
+
+        let mut expected_bytes = Vec::with_capacity(original.len() * 4);
+        for v in &original {
+            expected_bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        assert_eq!(
+            decoded_bytes, expected_bytes,
+            "round-trip through an independent base64 decoder must reproduce \
+             the exact little-endian f32 byte sequence"
+        );
+
+        // Reinterpret the decoded bytes as f32 values and confirm they match.
+        let decoded_floats: Vec<f32> = decoded_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(decoded_floats, original);
+    }
+
+    /// Minimal standard-conformant RFC 4648 base64 decoder, used only to
+    /// independently verify [`EmbedderRegistry::encode_base64`]'s output in
+    /// tests (kept separate from the production encoder so the test does
+    /// not just check the encoder against itself).
+    fn test_base64_decode(s: &str) -> Vec<u8> {
+        fn value_of(c: u8) -> u32 {
+            match c {
+                b'A'..=b'Z' => (c - b'A') as u32,
+                b'a'..=b'z' => (c - b'a' + 26) as u32,
+                b'0'..=b'9' => (c - b'0' + 52) as u32,
+                b'+' => 62,
+                b'/' => 63,
+                _ => 0, // padding '=' contributes no bits
+            }
+        }
+        let bytes = s.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+        for chunk in bytes.chunks(4) {
+            let pad = chunk.iter().filter(|&&b| b == b'=').count();
+            let c0 = value_of(chunk[0]);
+            let c1 = value_of(*chunk.get(1).unwrap_or(&b'A'));
+            let c2 = value_of(*chunk.get(2).unwrap_or(&b'A'));
+            let c3 = value_of(*chunk.get(3).unwrap_or(&b'A'));
+            let packed = (c0 << 18) | (c1 << 12) | (c2 << 6) | c3;
+            let b0 = ((packed >> 16) & 0xff) as u8;
+            let b1 = ((packed >> 8) & 0xff) as u8;
+            let b2 = (packed & 0xff) as u8;
+            match pad {
+                0 => out.extend_from_slice(&[b0, b1, b2]),
+                1 => out.extend_from_slice(&[b0, b1]),
+                2 => out.push(b0),
+                _ => {}
+            }
+        }
+        out
     }
 
     // ── EmbeddingResponse serialisation ──────────────────────────────────────

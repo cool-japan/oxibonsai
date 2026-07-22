@@ -28,6 +28,45 @@
 use std::collections::HashMap;
 
 // ──────────────────────────────────────────────────────────────────
+// Errors
+// ──────────────────────────────────────────────────────────────────
+
+/// Errors produced by [`LoraAdapter`] operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoraError {
+    /// A supplied buffer's length did not match the adapter's expected
+    /// dimension.
+    ///
+    /// `context` names which buffer/dimension failed the check (e.g.
+    /// `"apply: input length"` or `"merge_into_weights: weights length"`).
+    DimensionMismatch {
+        /// Human-readable description of what was being validated.
+        context: &'static str,
+        /// The length the adapter's dimensions require.
+        expected: usize,
+        /// The length actually supplied.
+        got: usize,
+    },
+}
+
+impl std::fmt::Display for LoraError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DimensionMismatch {
+                context,
+                expected,
+                got,
+            } => write!(
+                f,
+                "LoRA dimension mismatch ({context}): expected length {expected}, got {got}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LoraError {}
+
+// ──────────────────────────────────────────────────────────────────
 // Configuration
 // ──────────────────────────────────────────────────────────────────
 
@@ -148,7 +187,22 @@ impl LoraAdapter {
     /// - Returns vector of shape `[d_out]`
     ///
     /// This output should be *added* to the base layer output.
-    pub fn apply(&self, x: &[f32]) -> Vec<f32> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoraError::DimensionMismatch`] if `x.len() != self.d_in`.
+    /// Without this check a shorter-than-expected `x` would silently sum over
+    /// fewer terms than the adapter was trained for, producing a
+    /// plausible-looking but numerically wrong result with no error signal.
+    pub fn apply(&self, x: &[f32]) -> Result<Vec<f32>, LoraError> {
+        if x.len() != self.d_in {
+            return Err(LoraError::DimensionMismatch {
+                context: "apply: input length",
+                expected: self.d_in,
+                got: x.len(),
+            });
+        }
+
         let rank = self.config.rank;
 
         // Step 1: intermediate = A * x  (shape: [rank])
@@ -173,7 +227,7 @@ impl LoraAdapter {
             *slot = sum * self.scaling;
         }
 
-        output
+        Ok(output)
     }
 
     /// Total number of trainable parameters: `(d_in * rank) + (rank * d_out)`.
@@ -192,7 +246,23 @@ impl LoraAdapter {
     /// `weights` must be row-major with shape `[d_out × d_in]`.
     ///
     /// After merging, this adapter is no longer needed for inference.
-    pub fn merge_into_weights(&self, weights: &mut [f32]) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoraError::DimensionMismatch`] if
+    /// `weights.len() != d_out * d_in`. Without this check an undersized
+    /// buffer would index past its end and panic instead of returning a
+    /// typed error.
+    pub fn merge_into_weights(&self, weights: &mut [f32]) -> Result<(), LoraError> {
+        let expected_len = self.d_out * self.d_in;
+        if weights.len() != expected_len {
+            return Err(LoraError::DimensionMismatch {
+                context: "merge_into_weights: weights length",
+                expected: expected_len,
+                got: weights.len(),
+            });
+        }
+
         let rank = self.config.rank;
         for i in 0..self.d_out {
             for j in 0..self.d_in {
@@ -203,6 +273,7 @@ impl LoraAdapter {
                 weights[i * self.d_in + j] += self.scaling * delta;
             }
         }
+        Ok(())
     }
 }
 
@@ -237,8 +308,14 @@ impl LoraRegistry {
 
     /// Apply the named adapter to input vector `x`.
     ///
-    /// Returns `None` if no adapter is registered for that module.
-    pub fn apply_adapter(&self, module_name: &str, x: &[f32]) -> Option<Vec<f32>> {
+    /// Returns `None` if no adapter is registered for that module, or
+    /// `Some(Err(LoraError::DimensionMismatch))` if `x.len()` does not match
+    /// the registered adapter's `d_in`.
+    pub fn apply_adapter(
+        &self,
+        module_name: &str,
+        x: &[f32],
+    ) -> Option<Result<Vec<f32>, LoraError>> {
         self.adapters.get(module_name).map(|a| a.apply(x))
     }
 
@@ -408,13 +485,45 @@ mod tests {
         let config = make_config(4);
         let adapter = LoraAdapter::new(8, 16, config);
         let x = vec![1.0f32; 8];
-        let out = adapter.apply(&x);
+        let out = adapter.apply(&x).expect("apply should succeed");
         assert_eq!(out.len(), 16, "output must have d_out elements");
         for (i, v) in out.iter().enumerate() {
             assert!(
                 v.abs() < 1e-6,
                 "output[{i}] = {v} but B is zero so output must be zero"
             );
+        }
+    }
+
+    #[test]
+    fn test_lora_adapter_apply_undersized_input_errors() {
+        // x shorter than d_in must return a typed error instead of silently
+        // summing over fewer terms and returning a wrong-but-plausible result.
+        let config = make_config(4);
+        let adapter = LoraAdapter::new(8, 16, config);
+        let x = vec![1.0f32; 5]; // too short: d_in = 8
+        let result = adapter.apply(&x);
+        match result {
+            Err(LoraError::DimensionMismatch { expected, got, .. }) => {
+                assert_eq!(expected, 8);
+                assert_eq!(got, 5);
+            }
+            other => panic!("expected DimensionMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_lora_adapter_apply_oversized_input_errors() {
+        let config = make_config(4);
+        let adapter = LoraAdapter::new(8, 16, config);
+        let x = vec![1.0f32; 12]; // too long: d_in = 8
+        let result = adapter.apply(&x);
+        match result {
+            Err(LoraError::DimensionMismatch { expected, got, .. }) => {
+                assert_eq!(expected, 8);
+                assert_eq!(got, 12);
+            }
+            other => panic!("expected DimensionMismatch, got {other:?}"),
         }
     }
 
@@ -465,10 +574,30 @@ mod tests {
             out.is_some(),
             "apply should return Some for registered module"
         );
-        assert_eq!(out.expect("output must be Some").len(), 16);
+        let out_vec = out
+            .expect("output must be Some")
+            .expect("apply should succeed for matching dimensions");
+        assert_eq!(out_vec.len(), 16);
 
         // Non-existent module returns None
         assert!(registry.apply_adapter("missing", &x).is_none());
+    }
+
+    #[test]
+    fn test_lora_registry_apply_adapter_dimension_mismatch() {
+        let mut registry = LoraRegistry::new(make_config(4));
+        let adapter = LoraAdapter::new(8, 16, make_config(4));
+        registry.add("q_proj", adapter);
+
+        let x = vec![0.5f32; 3]; // wrong length: d_in = 8
+        let out = registry.apply_adapter("q_proj", &x);
+        match out {
+            Some(Err(LoraError::DimensionMismatch { expected, got, .. })) => {
+                assert_eq!(expected, 8);
+                assert_eq!(got, 3);
+            }
+            other => panic!("expected Some(Err(DimensionMismatch)), got {other:?}"),
+        }
     }
 
     #[test]
@@ -494,12 +623,46 @@ mod tests {
         let config = make_config(4);
         let adapter = LoraAdapter::new(4, 4, config);
         let mut weights = vec![1.0f32; 16]; // 4×4 identity-like
-        adapter.merge_into_weights(&mut weights);
+        adapter
+            .merge_into_weights(&mut weights)
+            .expect("merge_into_weights should succeed for matching dimensions");
         for (i, w) in weights.iter().enumerate() {
             assert!(
                 (w - 1.0).abs() < 1e-6,
                 "weights[{i}] = {w}, expected 1.0 (B is zero so no change)"
             );
+        }
+    }
+
+    #[test]
+    fn test_lora_merge_into_weights_undersized_buffer_errors() {
+        // weights shorter than d_out * d_in must return a typed error instead
+        // of panicking with an out-of-bounds index.
+        let config = make_config(4);
+        let adapter = LoraAdapter::new(4, 4, config);
+        let mut weights = vec![1.0f32; 10]; // needs 16 (4*4)
+        let result = adapter.merge_into_weights(&mut weights);
+        match result {
+            Err(LoraError::DimensionMismatch { expected, got, .. }) => {
+                assert_eq!(expected, 16);
+                assert_eq!(got, 10);
+            }
+            other => panic!("expected DimensionMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_lora_merge_into_weights_oversized_buffer_errors() {
+        let config = make_config(4);
+        let adapter = LoraAdapter::new(4, 4, config);
+        let mut weights = vec![1.0f32; 20]; // more than 16 (4*4)
+        let result = adapter.merge_into_weights(&mut weights);
+        match result {
+            Err(LoraError::DimensionMismatch { expected, got, .. }) => {
+                assert_eq!(expected, 16);
+                assert_eq!(got, 20);
+            }
+            other => panic!("expected DimensionMismatch, got {other:?}"),
         }
     }
 

@@ -99,7 +99,7 @@ impl QkvBuffers {
 }
 /// Thin `GpuBackendTrait` wrapper around `CudaGraph`.
 ///
-/// Returned by [`select_backend`](super::select_backend) when a CUDA device
+/// Returned by [`select_backend`](super::super::select_backend) when a CUDA device
 /// is present and the `native-cuda` feature is enabled.
 pub struct NativeCudaBackend {
     pub(super) graph: Arc<CudaGraph>,

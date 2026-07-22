@@ -13,12 +13,33 @@
 //! The [`ConstrainedSampler`] wraps a [`crate::sampling_advanced::SamplerChain`] and
 //! applies a mask to logits before sampling so that only valid continuations are drawn.
 //!
+//! ## Real tokenizers vs. the demonstration path
+//!
+//! [`RegexConstraint`] and [`JsonConstraint`] restrict generation based on the
+//! **text** a token decodes to, so they need a decode function
+//! (`Fn(u32) -> Option<String>`) that maps each token id to the text it emits.
+//! Use the `*_with_decoder` builder methods (or the `with_decoder` constructors)
+//! for any real tokenizer.  The no-argument
+//! [`with_json_constraint`](ConstrainedSamplerBuilder::with_json_constraint) /
+//! [`with_regex_constraint`](ConstrainedSamplerBuilder::with_regex_constraint) and
+//! the [`JsonConstraint::new`] / [`RegexConstraint::new`] constructors are
+//! **demonstration-only**: they treat each raw token id as a Unicode code point,
+//! which is meaningful *only* for a synthetic vocabulary where
+//! `token_id == codepoint`.  For byte-exact CFG constraints see
+//! [`crate::grammar::GrammarConstraint`].
+//!
 //! ## Example
 //! ```rust
 //! use oxibonsai_runtime::constrained_decoding::{ConstrainedSamplerBuilder, TokenConstraint};
 //!
-//! let mut sampler = ConstrainedSamplerBuilder::new(128, 42)
-//!     .with_json_constraint();
+//! // A real tokenizer supplies `decode_fn`; here a tiny toy vocab stands in.
+//! let decode = |id: u32| match id {
+//!     0 => Some("{".to_string()),
+//!     1 => Some("}".to_string()),
+//!     _ => None,
+//! };
+//! let mut sampler = ConstrainedSamplerBuilder::new(2, 42)
+//!     .with_json_constraint_decoder(decode);
 //! assert!(!sampler.is_complete());
 //! ```
 //!
@@ -38,6 +59,7 @@
 //!   - `length` — [`LengthConstraint`].
 
 mod allow_list;
+mod decoder;
 mod error_trait;
 mod json;
 mod length;

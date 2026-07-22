@@ -79,7 +79,12 @@ impl<'a> BonsaiModel<'a> {
                 fused_qkv_handle: block
                     .fused_qkv_gpu_handle()
                     .map(|hnd| hnd.id())
-                    .unwrap_or(0),
+                    .ok_or_else(|| {
+                        format!(
+                            "missing GPU handle for layer {} fused_qkv",
+                            block.layer_index()
+                        )
+                    })?,
                 fused_qkv_bytes: &qkv_concats[i],
                 q_norm_handle: norm_handle_base + 1,
                 q_norm_bytes: block.q_norm_weight(),
@@ -88,7 +93,12 @@ impl<'a> BonsaiModel<'a> {
                 attn_proj_handle: block
                     .attn_output_gpu_handle()
                     .map(|hnd| hnd.id())
-                    .unwrap_or(0),
+                    .ok_or_else(|| {
+                        format!(
+                            "missing GPU handle for layer {} attn_proj",
+                            block.layer_index()
+                        )
+                    })?,
                 attn_proj_bytes: blocks_as_bytes(
                     block
                         .attn_output_blocks()
@@ -99,7 +109,12 @@ impl<'a> BonsaiModel<'a> {
                 gate_up_handle: block
                     .fused_gate_up_gpu_handle()
                     .map(|hnd| hnd.id())
-                    .unwrap_or(0),
+                    .ok_or_else(|| {
+                        format!(
+                            "missing GPU handle for layer {} gate_up",
+                            block.layer_index()
+                        )
+                    })?,
                 gate_bytes: blocks_as_bytes(
                     block
                         .ffn_gate_blocks()
@@ -108,7 +123,12 @@ impl<'a> BonsaiModel<'a> {
                 up_bytes: blocks_as_bytes(
                     block.ffn_up_blocks().ok_or("ffn_up: not a 1-bit layer")?,
                 ),
-                down_handle: block.ffn_down_gpu_handle().map(|hnd| hnd.id()).unwrap_or(0),
+                down_handle: block
+                    .ffn_down_gpu_handle()
+                    .map(|hnd| hnd.id())
+                    .ok_or_else(|| {
+                        format!("missing GPU handle for layer {} down", block.layer_index())
+                    })?,
                 down_bytes: blocks_as_bytes(
                     block
                         .ffn_down_blocks()
@@ -220,9 +240,9 @@ impl<'a> BonsaiModel<'a> {
 
         // Use the dedicated ternary-only builder, which avoids any Q1 block-size
         // validation (18-byte alignment) that `build_cached_weights` imposes on
-        // `lm_head_bytes`. The resulting `CachedModelWeights` has trivial f32
-        // placeholders for the Q1 `final_norm` / `lm_head` handles; those fields
-        // are never accessed on the ternary forward path.
+        // `lm_head_bytes`. It returns a `CachedModelWeights::Ternary` variant
+        // carrying only the raw ternary byte blobs — no Q1 GPU handles exist on
+        // the ternary path.
         let cached = oxibonsai_kernels::build_cached_weights_ternary_only(
             ternary_qkv_concats,
             ternary_attn_proj_bytes,

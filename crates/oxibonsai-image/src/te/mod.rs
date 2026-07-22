@@ -37,7 +37,7 @@
 
 pub mod config;
 /// GPU (CUDA) f32 matmul backend for the TE Linears. The `target_os`-disjoint
-/// sibling of [`gpu`]; gated on `cfg(all(feature = "native-cuda", any(target_os =
+/// sibling of `gpu` (the Metal module, macOS-only); gated on `cfg(all(feature = "native-cuda", any(target_os =
 /// "linux", target_os = "windows")))`. Reuses the same `OXI_TE_GPU` env var as
 /// the Metal path (opt-in `=1`).
 #[cfg(all(

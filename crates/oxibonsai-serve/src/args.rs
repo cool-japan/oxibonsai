@@ -23,6 +23,7 @@
 //! can be added in a future release without breaking downstream crates
 //! pattern-matching over it.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use thiserror::Error;
@@ -83,6 +84,18 @@ pub struct ServerArgs {
     pub log_level: String,
     /// Optional bearer token to require on protected endpoints.
     pub bearer_token: Option<String>,
+    /// Names of value-bearing flags that were *literally present* on the
+    /// command line, as opposed to left at their built-in default.
+    ///
+    /// `to_partial()` consults this set (rather than comparing the parsed
+    /// value against [`ServerArgs::default()`]) so that an operator who
+    /// explicitly passes e.g. `--port 8080` — which happens to equal the
+    /// built-in default — still overrides a non-default value set by a lower
+    /// layer (TOML file / `OXIBONSAI_*` env var). Comparing against the
+    /// default alone cannot distinguish "not passed" from "passed and
+    /// happens to match the default", which silently breaks the documented
+    /// CLI-highest-precedence guarantee for exactly that case.
+    explicit_flags: BTreeSet<&'static str>,
 }
 
 impl Default for ServerArgs {
@@ -98,6 +111,7 @@ impl Default for ServerArgs {
             seed: 42,
             log_level: "info".to_string(),
             bearer_token: None,
+            explicit_flags: BTreeSet::new(),
         }
     }
 }
@@ -106,9 +120,16 @@ impl ServerArgs {
     /// Produce a [`PartialServerConfig`] carrying only the values that the user
     /// *explicitly* specified on the command line.
     ///
-    /// A value is considered "explicit" when it differs from the default.  This
-    /// keeps the CLI layer from accidentally overriding lower layers with
-    /// default values.
+    /// A flag is considered "explicit" when it was literally present in argv
+    /// (tracked via `explicit_flags`, populated by [`parse_args_from`]) — not
+    /// merely when its parsed value differs from [`ServerArgs::default()`].
+    /// The latter would silently drop a flag such as `--port 8080` (the
+    /// built-in default) when the operator passes it specifically to force
+    /// the port back down from a non-default TOML/env value, breaking the
+    /// documented CLI-highest-precedence layering for that case. `Option<T>`
+    /// fields (`model_path`, `tokenizer_path`, `bearer_token`) have no
+    /// ambiguous "default" value to collide with, so they are still checked
+    /// via `.is_some()`.
     ///
     /// # Examples
     ///
@@ -120,13 +141,12 @@ impl ServerArgs {
     /// assert!(partial.port.is_none());
     /// ```
     pub fn to_partial(&self) -> PartialServerConfig {
-        let defaults = Self::default();
         let mut partial = PartialServerConfig::default();
 
-        if self.host != defaults.host {
+        if self.explicit_flags.contains("host") {
             partial.host = Some(self.host.clone());
         }
-        if self.port != defaults.port {
+        if self.explicit_flags.contains("port") {
             partial.port = Some(self.port);
         }
         if self.model_path.is_some() {
@@ -135,16 +155,16 @@ impl ServerArgs {
         if self.tokenizer_path.is_some() {
             partial.tokenizer_path = self.tokenizer_path.as_ref().map(PathBuf::from);
         }
-        if self.max_tokens != defaults.max_tokens {
+        if self.explicit_flags.contains("max-tokens") {
             partial.default_max_tokens = Some(self.max_tokens);
         }
-        if (self.temperature - defaults.temperature).abs() > f32::EPSILON {
+        if self.explicit_flags.contains("temperature") {
             partial.default_temperature = Some(self.temperature);
         }
-        if self.seed != defaults.seed {
+        if self.explicit_flags.contains("seed") {
             partial.seed = Some(self.seed);
         }
-        if self.log_level != defaults.log_level {
+        if self.explicit_flags.contains("log-level") {
             partial.log_level = Some(self.log_level.clone());
         }
         if self.bearer_token.is_some() {
@@ -194,6 +214,7 @@ pub fn parse_args_from(argv: &[String]) -> Result<Option<ServerArgs>, ParseError
             "--host" => {
                 let val = next_value(&mut iter, "--host")?;
                 args.host = val.to_string();
+                args.explicit_flags.insert("host");
             }
             "--port" => {
                 let val = next_value(&mut iter, "--port")?;
@@ -202,6 +223,7 @@ pub fn parse_args_from(argv: &[String]) -> Result<Option<ServerArgs>, ParseError
                     value: val.to_string(),
                     reason: "must be an integer in 1–65535".to_string(),
                 })?;
+                args.explicit_flags.insert("port");
             }
             "--model" => {
                 let val = next_value(&mut iter, "--model")?;
@@ -218,6 +240,7 @@ pub fn parse_args_from(argv: &[String]) -> Result<Option<ServerArgs>, ParseError
                     value: val.to_string(),
                     reason: "must be a non-negative integer".to_string(),
                 })?;
+                args.explicit_flags.insert("max-tokens");
             }
             "--temperature" => {
                 let val = next_value(&mut iter, "--temperature")?;
@@ -226,6 +249,7 @@ pub fn parse_args_from(argv: &[String]) -> Result<Option<ServerArgs>, ParseError
                     value: val.to_string(),
                     reason: "must be a floating-point number".to_string(),
                 })?;
+                args.explicit_flags.insert("temperature");
             }
             "--seed" => {
                 let val = next_value(&mut iter, "--seed")?;
@@ -234,11 +258,13 @@ pub fn parse_args_from(argv: &[String]) -> Result<Option<ServerArgs>, ParseError
                     value: val.to_string(),
                     reason: "must be a non-negative integer".to_string(),
                 })?;
+                args.explicit_flags.insert("seed");
             }
             "--log-level" => {
                 let val = next_value(&mut iter, "--log-level")?;
                 validate_log_level(val)?;
                 args.log_level = val.to_string();
+                args.explicit_flags.insert("log-level");
             }
             "--bearer-token" => {
                 let val = next_value(&mut iter, "--bearer-token")?;
@@ -456,5 +482,71 @@ mod tests {
         let partial = parsed.to_partial();
         assert_eq!(partial.host.as_deref(), Some("127.0.0.1"));
         assert_eq!(partial.port, Some(9000));
+    }
+
+    /// Regression test for the CLI-highest-precedence bug: passing a flag
+    /// whose value happens to equal `ServerArgs::default()` must still be
+    /// forwarded as an explicit `Some(..)` override, not dropped as if the
+    /// flag were never passed. See finding: "ServerArgs::to_partial()
+    /// silently drops CLI overrides that equal the built-in default".
+    #[test]
+    fn to_partial_forwards_explicit_default_valued_flags() {
+        // Every one of these equals `ServerArgs::default()`'s value, but was
+        // *typed* on the command line and must therefore win over a
+        // lower-precedence (TOML/env) layer that set something else.
+        let parsed = parse_args_from(&args(&[
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "8080",
+            "--max-tokens",
+            "256",
+            "--temperature",
+            "0.7",
+            "--seed",
+            "42",
+            "--log-level",
+            "info",
+        ]))
+        .expect("should parse")
+        .expect("should not be help/version");
+
+        // Sanity: the parsed *values* really do equal the struct defaults —
+        // only the (private) explicit-flags bookkeeping differs, which is
+        // exactly the distinction this test is verifying `to_partial()`
+        // respects.
+        let defaults = ServerArgs::default();
+        assert_eq!(parsed.host, defaults.host);
+        assert_eq!(parsed.port, defaults.port);
+        assert_eq!(parsed.max_tokens, defaults.max_tokens);
+        assert!((parsed.temperature - defaults.temperature).abs() < f32::EPSILON);
+        assert_eq!(parsed.seed, defaults.seed);
+        assert_eq!(parsed.log_level, defaults.log_level);
+
+        let partial = parsed.to_partial();
+        assert_eq!(partial.host.as_deref(), Some("0.0.0.0"));
+        assert_eq!(partial.port, Some(8080));
+        assert_eq!(partial.default_max_tokens, Some(256));
+        assert_eq!(partial.default_temperature, Some(0.7));
+        assert_eq!(partial.seed, Some(42));
+        assert_eq!(partial.log_level.as_deref(), Some("info"));
+    }
+
+    /// The flip side of the regression above: a flag that was *not* passed
+    /// at all must still merge to `None`, even though `ServerArgs` no longer
+    /// derives this from comparing against `Self::default()`.
+    #[test]
+    fn to_partial_omits_flags_never_passed() {
+        let parsed = parse_args_from(&args(&["--port", "9001"]))
+            .expect("should parse")
+            .expect("should not be help/version");
+        let partial = parsed.to_partial();
+
+        assert_eq!(partial.port, Some(9001));
+        assert!(partial.host.is_none());
+        assert!(partial.default_max_tokens.is_none());
+        assert!(partial.default_temperature.is_none());
+        assert!(partial.seed.is_none());
+        assert!(partial.log_level.is_none());
     }
 }

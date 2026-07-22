@@ -31,6 +31,7 @@
 //! canonical reference.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use serde_json::Value;
 
@@ -89,16 +90,25 @@ pub fn byte_to_unicode(b: u8) -> char {
     bytes_to_unicode_map()[b as usize]
 }
 
+/// Process-wide cache for the `char -> byte` inverse map, built once on
+/// first use. This backs [`unicode_to_byte`], which is called once per
+/// decoded `char` on the server's per-token streaming decode hot path
+/// (see [`crate::tokenizer::OxiTokenizer::decode_id_into`] /
+/// [`crate::streaming::StreamingDecoder::push_token`]); rebuilding the
+/// 256-entry table (itself an O(256×188) linear-scan construction) on every
+/// call would make that hot path needlessly quadratic.
+static UNICODE_TO_BYTE_CACHE: OnceLock<HashMap<char, u8>> = OnceLock::new();
+
 /// Inverse of [`byte_to_unicode`]: return the byte value for a Unicode char,
 /// or `None` if `ch` is not part of the 256-entry table.
+///
+/// O(1) after the first call in the process (the inverse map is built once
+/// and cached in `UNICODE_TO_BYTE_CACHE`).
 pub fn unicode_to_byte(ch: char) -> Option<u8> {
-    let table = bytes_to_unicode_map();
-    for (idx, &c) in table.iter().enumerate() {
-        if c == ch {
-            return Some(idx as u8);
-        }
-    }
-    None
+    UNICODE_TO_BYTE_CACHE
+        .get_or_init(bytes_to_unicode_inverse)
+        .get(&ch)
+        .copied()
 }
 
 /// Build a `HashMap<char, u8>` inverse map (faster for long decode paths).
@@ -188,6 +198,16 @@ pub struct HfTokenizerJson {
     pub wordpiece_max_chars: Option<usize>,
     /// Tokens flagged as `special == true` in `added_tokens`.
     pub special_tokens: HashMap<String, u32>,
+    /// ALL tokens present in `added_tokens`, regardless of the JSON
+    /// `special` flag — a superset of `special_tokens`.
+    ///
+    /// HuggingFace's `AddedVocabulary` atomically protects *every* added
+    /// token from pre-tokenization/model segmentation during encode, not
+    /// just the ones marked `special == true` (e.g. Qwen's `<tool_call>`,
+    /// `<|fim_prefix|>` are `special == false` yet must still encode
+    /// atomically). `special_tokens` remains the narrower set used for
+    /// decode-skip / BOS-EOS-style semantics.
+    pub protected_tokens: HashMap<String, u32>,
     /// BOS token string, if present.
     pub bos_token: Option<String>,
     /// EOS token string, if present.
@@ -256,8 +276,14 @@ impl HfTokenizerJson {
             }
         };
 
-        // ── 2. added_tokens → special_tokens ────────────────────────────────
+        // ── 2. added_tokens → special_tokens / protected_tokens ─────────────
+        // Every entry in `added_tokens` — special or not — must be tracked in
+        // `protected_tokens` so it gets atomic leftmost-longest carve-out
+        // protection during encode (HF `AddedVocabulary` semantics). Only
+        // entries with `special == true` additionally go into the narrower
+        // `special_tokens` set.
         let mut special_tokens: HashMap<String, u32> = HashMap::new();
+        let mut protected_tokens: HashMap<String, u32> = HashMap::new();
         if let Some(added) = root.get("added_tokens").and_then(Value::as_array) {
             for token_obj in added {
                 let content = token_obj
@@ -276,6 +302,7 @@ impl HfTokenizerJson {
                     // Even non-special added tokens go into the vocab if
                     // missing, so that encode/decode can see them.
                     vocab.entry(content.clone()).or_insert(id);
+                    protected_tokens.insert(content.clone(), id);
                     if is_special {
                         special_tokens.insert(content, id);
                     }
@@ -315,6 +342,7 @@ impl HfTokenizerJson {
             unigram_unk_id,
             wordpiece_max_chars,
             special_tokens,
+            protected_tokens,
             bos_token,
             eos_token,
             unk_token,
@@ -336,6 +364,12 @@ impl HfTokenizerJson {
         for (token, id) in &self.vocab {
             if self.special_tokens.contains_key(token) {
                 vocabulary.add_special(token, *id);
+            } else if self.protected_tokens.contains_key(token) {
+                // Non-special added token (e.g. `<tool_call>`,
+                // `<|fim_prefix|>`): still protected from pre-tokenization
+                // during encode, but not treated as "special" for
+                // decode-skip purposes.
+                vocabulary.add_protected(token, *id);
             } else {
                 vocabulary.insert(token, *id);
             }
@@ -485,12 +519,27 @@ fn parse_bpe_model(
         .get("vocab")
         .ok_or_else(|| TokenizerError::HfFormat("missing `model.vocab` field".to_owned()))?;
     let mut vocab: HashMap<String, u32> = HashMap::new();
+    // Track which token string first claimed each ID so that a malformed
+    // vocab with two distinct token strings sharing one numeric ID is
+    // rejected up front, rather than silently picking a non-deterministic
+    // "winner" later based on `HashMap` iteration order (which uses a
+    // randomized `RandomState` and is not stable across process runs).
+    let mut seen_ids: HashMap<u32, String> =
+        HashMap::with_capacity(vocab_val.as_object().map(|m| m.len()).unwrap_or(0));
     match vocab_val {
         Value::Object(map) => {
             for (token, id_val) in map {
                 let id = id_val.as_u64().ok_or_else(|| {
                     TokenizerError::HfFormat(format!("vocab entry {token:?} has non-integer id"))
                 })? as u32;
+                if let Some(prev_token) = seen_ids.get(&id) {
+                    if prev_token != token {
+                        return Err(TokenizerError::HfFormat(format!(
+                            "BPE vocab id {id} is assigned to both {prev_token:?} and {token:?}; vocab IDs must be unique"
+                        )));
+                    }
+                }
+                seen_ids.insert(id, token.clone());
                 vocab.insert(token.clone(), id);
             }
         }
@@ -625,25 +674,56 @@ fn extract_special_token(root: &Value, key: &str) -> Option<String> {
     None
 }
 
-/// Return `true` if the tokenizer pre-tokenizer or decoder is ByteLevel.
-fn detect_byte_level(root: &Value) -> bool {
-    let has_bl = |field: &str| -> bool {
-        match root.get(field) {
-            Some(Value::Object(map)) => map
+/// Return `true` if `value`'s `type` field equals `"ByteLevel"`.
+fn is_byte_level_entry(value: &Value) -> bool {
+    value
+        .get("type")
+        .and_then(Value::as_str)
+        .map(|t| t == "ByteLevel")
+        .unwrap_or(false)
+}
+
+/// Return `true` if `value` is (or, when `Sequence`-wrapped, nests) a
+/// `ByteLevel` pre_tokenizer/decoder entry.
+///
+/// In the real HuggingFace `tokenizers` schema a `Sequence` pre_tokenizer or
+/// decoder is always a JSON **object** of the shape
+/// `{"type":"Sequence","pretokenizers":[...]}` (pre-tokenizers) or
+/// `{"type":"Sequence","decoders":[...]}` (decoders) — never a bare
+/// top-level array. This recurses into that nested array (checked under
+/// both possible field names since callers pass either shape) before
+/// giving up.
+fn contains_byte_level(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            if is_byte_level_entry(value) {
+                return true;
+            }
+            let is_sequence = map
                 .get("type")
                 .and_then(Value::as_str)
-                .map(|t| t == "ByteLevel")
-                .unwrap_or(false),
-            Some(Value::Array(list)) => list.iter().any(|entry| {
-                entry
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .map(|t| t == "ByteLevel")
-                    .unwrap_or(false)
-            }),
-            _ => false,
+                .map(|t| t == "Sequence")
+                .unwrap_or(false);
+            if is_sequence {
+                for nested_field in ["pretokenizers", "decoders"] {
+                    if let Some(Value::Array(list)) = map.get(nested_field) {
+                        if list.iter().any(contains_byte_level) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
         }
-    };
+        Value::Array(list) => list.iter().any(contains_byte_level),
+        _ => false,
+    }
+}
+
+/// Return `true` if the tokenizer pre-tokenizer or decoder is ByteLevel.
+fn detect_byte_level(root: &Value) -> bool {
+    let has_bl =
+        |field: &str| -> bool { root.get(field).map(contains_byte_level).unwrap_or(false) };
     has_bl("pre_tokenizer") || has_bl("decoder")
 }
 
@@ -783,6 +863,11 @@ mod tests {
         assert!(!parsed.special_tokens.contains_key("foo"));
         // But `foo` should still be in the vocab.
         assert_eq!(parsed.vocab.get("foo"), Some(&101));
+        // And, per HF `AddedVocabulary` semantics, `foo` (special: false)
+        // must still land in the broader protected-tokens set so it gets
+        // atomic encode-time carve-out even though it is not "special".
+        assert!(parsed.protected_tokens.contains_key("<|im_start|>"));
+        assert!(parsed.protected_tokens.contains_key("foo"));
     }
 
     #[test]

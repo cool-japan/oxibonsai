@@ -17,8 +17,8 @@
 //! ```text
 //! [scales:16u8][qs:64u8][d:f16 @80][dmin:f16 @82]
 //! ```
-//! 16 sub-blocks × 16 weights. scales[sub] low nibble = sub_sc, high nibble = sub_mn.
-//! qs: 2 bits/weight, 4/byte LSB-first. dequant: d*sc*q - dmin*mn (q ∈ [0,3]).
+//! 16 sub-blocks × 16 weights. scales\[sub\] low nibble = sub_sc, high nibble = sub_mn.
+//! qs: 2 bits/weight, 4/byte LSB-first. dequant: d*sc*q - dmin*mn (q ∈ \[0,3\]).
 //!
 //! **Q3_K** (110 bytes):
 //! ```text
@@ -32,14 +32,14 @@
 //! [d:f16 @0][dmin:f16 @2][scales:12u8 @4][qs:128u8 @16]
 //! ```
 //! 8 sub-blocks × 32 weights. qs: 4 bits/weight, 2/byte. 6-bit scale decode.
-//! dequant: d*sc[sub]*q - dmin*mn[sub] (sc, mn ∈ [0,63]).
+//! dequant: d*sc\[sub\]*q - dmin*mn\[sub\] (sc, mn ∈ \[0,63\]).
 //!
 //! **Q5_K** (176 bytes):
 //! ```text
 //! [d:f16 @0][dmin:f16 @2][scales:12u8 @4][qh:32u8 @16][qs:128u8 @48]
 //! ```
 //! Same 6-bit scales as Q4_K. q5 = nibble | (high_bit<<4), range [0..31].
-//! dequant: d*sc[sub]*q5 - dmin*mn[sub].
+//! dequant: d*sc\[sub\]*q5 - dmin*mn\[sub\].
 //!
 //! **Q6_K** (210 bytes):
 //! ```text
@@ -47,13 +47,13 @@
 //! ```
 //! 16 sub-blocks × 16 weights. ql: low 4 bits, qh: high 2 bits.
 //! q6 = nibble|(hi2<<4), centered: q6-32. scales_i8: signed per sub-block.
-//! dequant: d*scales_i8[sub]*q6_signed.
+//! dequant: d*scales_i8\[sub\]*q6_signed.
 //!
 //! **Q8_K** (292 bytes):
 //! ```text
 //! [d:f32 @0][qs:256 i8 @4][bsums:16 i16 @260]
 //! ```
-//! d is f32 (not f16!). dequant: d_f32 * qs[i]. bsums not needed for GEMV.
+//! d is f32 (not f16!). dequant: d_f32 * qs\[i\]. bsums not needed for GEMV.
 //!
 //! # Grid / block dimensions (same for all 6 kernels)
 //!

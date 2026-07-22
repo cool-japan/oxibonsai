@@ -774,15 +774,17 @@ fn e4m3_quantize_then_dequant_max_error() {
     );
 }
 
-/// Quantize then dequant E5M2: max absolute error should be bounded.
+/// Quantize then dequant E5M2: output must stay finite and max absolute error
+/// should be bounded.
 ///
-/// Uses values within a moderate range to avoid Infinity in dequant output
-/// (E5M2 max ≈ 57344; values that would require a scale > 57344/448 ≈ 128 as
-/// a dequant factor can produce Inf when multiplied by the block scale).
+/// `BlockFP8E5M2::quantize` now clamps each finite scaled value into the
+/// representable E5M2 range, so f16-rounding the block scale down can no longer
+/// push the block's own max-magnitude element to ±Inf. Every finite input
+/// therefore dequantizes to a finite value, which this test now asserts
+/// directly instead of filtering non-finite pairs out.
 #[test]
 fn e5m2_quantize_then_dequant_max_error() {
     let dispatcher = make_dispatcher();
-    // Keep values within a range that round-trips cleanly through E5M2.
     // E5M2 can represent values up to 57344 with about 25% relative error.
     let values: Vec<f32> = (0..64).map(|i| (i as f32) * 2.0 - 64.0).collect();
     let blocks = BlockFP8E5M2::quantize(&values).unwrap();
@@ -790,11 +792,13 @@ fn e5m2_quantize_then_dequant_max_error() {
     dispatcher
         .dequant_fp8_e5m2(&blocks, &mut output)
         .expect("dequant should succeed");
-    // Only compare finite-valued pairs to handle any residual Inf/NaN from decode
+    assert!(
+        output.iter().all(|v| v.is_finite()),
+        "E5M2 quantize-dequant produced a non-finite value: {output:?}"
+    );
     let max_err: f32 = values
         .iter()
         .zip(output.iter())
-        .filter(|(a, b)| a.is_finite() && b.is_finite())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0, f32::max);
     // E5M2 has 2-bit mantissa; allow generous tolerance (~50% of max abs value ≈ 32)

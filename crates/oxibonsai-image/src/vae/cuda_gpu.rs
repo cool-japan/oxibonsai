@@ -1,13 +1,13 @@
 //! GPU (CUDA) backend for the FLUX.2 SMALL **VAE decoder** per-op f32
 //! primitives.
 //!
-//! CUDA sibling of [`crate::vae::gpu`] (the Metal backend), authored as a
+//! CUDA sibling of `crate::vae::gpu` (the Metal backend), authored as a
 //! line-for-line mirror. It routes the heavy ops of the VAE decode path — the
 //! 2-D convolutions (the prize: ~60% of the decode FLOPs and CPU-im2col-bound),
 //! GroupNorm, SiLU, and nearest ×2 upsample — onto the project's parity-clean
 //! f32 CUDA primitives in `oxibonsai-kernels`
-//! ([`CudaGraph::encode_conv2d_f32`], [`CudaGraph::encode_groupnorm_f32`],
-//! [`CudaGraph::encode_silu_f32`], [`CudaGraph::encode_upsample_nearest_f32`]).
+//! (`CudaGraph::encode_conv2d_f32`, `CudaGraph::encode_groupnorm_f32`,
+//! `CudaGraph::encode_silu_f32`, `CudaGraph::encode_upsample_nearest_f32`).
 //!
 //! Like the TE GPU path ([`crate::te::cuda_gpu`]) the VAE weights are **pure
 //! f32** (the exported `.npy` conv/affine tensors), so every op is a plain f32
@@ -24,7 +24,7 @@
 //!
 //! The whole module is gated on `cfg(all(feature = "native-cuda", any(target_os
 //! = "linux", target_os = "windows")))` — the same gate under which
-//! `oxibonsai-kernels` re-exports [`CudaGraph`] — and is `target_os`-DISJOINT
+//! `oxibonsai-kernels` re-exports `CudaGraph` — and is `target_os`-DISJOINT
 //! from the Metal gate (macOS), so a non-CUDA build never references it and the
 //! default Pure-Rust CPU path is entirely unaffected.
 //!
@@ -35,7 +35,7 @@
 //! CPU reference (for A/B parity testing without recompiling). Default-on is only
 //! safe because every op silently falls back to the CPU path on any GPU error.
 //!
-//! On *any* error each wrapper returns a [`CudaVaeGpuError`]; the call sites in
+//! On *any* error each wrapper returns a `CudaVaeGpuError`; the call sites in
 //! `conv.rs` / `norm.rs` / `ops.rs` swallow it and fall back to the CPU path, so
 //! a GPU failure can never break a decode (no `unwrap`/`expect`/`panic!`).
 
@@ -96,7 +96,7 @@ pub fn vae_gpu_enabled() -> bool {
 /// - `c_in` / `c_out` / `h` / `w` / `k` / `pad`: layer geometry.
 ///
 /// # Errors
-/// [`CudaVaeGpuError`] if the CUDA graph is unavailable or the kernel
+/// `CudaVaeGpuError` if the CUDA graph is unavailable or the kernel
 /// upload/encode fails (e.g. a length/shape mismatch). The caller falls back to
 /// the CPU path on any error.
 #[allow(clippy::too_many_arguments)]
@@ -147,7 +147,7 @@ pub struct ConvGpuOut {
 /// - `num_groups`: 32 in the VAE; `eps`: 1e-6 in the VAE.
 ///
 /// # Errors
-/// [`CudaVaeGpuError`] if the CUDA graph is unavailable or the kernel
+/// `CudaVaeGpuError` if the CUDA graph is unavailable or the kernel
 /// upload/encode fails. The caller falls back to the CPU path on any error.
 pub fn groupnorm_gpu(
     x: &mut [f32],
@@ -168,7 +168,7 @@ pub fn groupnorm_gpu(
 /// Apply element-wise SiLU (`x · sigmoid(x)`) on the GPU, in place.
 ///
 /// # Errors
-/// [`CudaVaeGpuError`] if the CUDA graph is unavailable or the kernel
+/// `CudaVaeGpuError` if the CUDA graph is unavailable or the kernel
 /// upload/encode fails. The caller falls back to the CPU path on any error.
 pub fn silu_gpu(x: &mut [f32]) -> Result<(), CudaVaeGpuError> {
     let graph =
@@ -184,7 +184,7 @@ pub fn silu_gpu(x: &mut [f32]) -> Result<(), CudaVaeGpuError> {
 /// - `input`: NCHW `[c, h, w]`.
 ///
 /// # Errors
-/// [`CudaVaeGpuError`] if the CUDA graph is unavailable or the kernel
+/// `CudaVaeGpuError` if the CUDA graph is unavailable or the kernel
 /// upload/encode fails. The caller falls back to the CPU path on any error.
 pub fn upsample_gpu(
     input: &[f32],

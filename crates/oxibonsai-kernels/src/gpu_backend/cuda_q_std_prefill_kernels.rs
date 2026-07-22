@@ -4,11 +4,11 @@
 //!
 //! | Kernel                            | Description                                              |
 //! |-----------------------------------|----------------------------------------------------------|
-//! | `gemm_q4_0`                       | Batch GEMM: Q4_0 AoS, col-major I/O, col_sums[8]       |
+//! | `gemm_q4_0`                       | Batch GEMM: Q4_0 AoS, col-major I/O, col_sums\[8\]       |
 //! | `gemm_q4_0_residual`              | GEMM + fused residual add                               |
 //! | `fused_gate_up_swiglu_gemm_q4_0`  | Fused gate+up Q4_0 GEMM with SwiGLU epilogue            |
 //! | `gemv_q4_0_pf`                    | Single-token Q4_0 GEMV (for sequential attention pass)  |
-//! | `gemm_q8_0`                       | Batch GEMM: Q8_0 AoS, col-major I/O, col_sums[8]       |
+//! | `gemm_q8_0`                       | Batch GEMM: Q8_0 AoS, col-major I/O, col_sums\[8\]       |
 //! | `gemm_q8_0_residual`              | Q8_0 GEMM + fused residual add                          |
 //! | `fused_gate_up_swiglu_gemm_q8_0`  | Fused gate+up Q8_0 GEMM with SwiGLU epilogue            |
 //! | `gemv_q8_0_pf`                    | Single-token Q8_0 GEMV (for sequential attention pass)  |
@@ -20,7 +20,7 @@
 //! bytes 0-1:   FP16 LE scale (d)
 //! bytes 2-17:  16 nibble bytes → 32 int4 weights
 //! Dequant: w[j] = d * (nibble[j] - 8)
-//!   even j → qs[j/2] & 0x0F, odd j → (qs[j/2] >> 4) & 0x0F
+//!   lo-hi split: elements 0–15 from lower nibbles of bytes 0–15; elements 16–31 from upper nibbles
 //! ```
 //!
 //! **Q8_0** (34 bytes/block, 32 weights):
@@ -55,8 +55,8 @@ pub const CUDA_Q_STD_PREFILL_KERNELS_SRC: &str = r#"
    OxiBonsai CUDA Q4_0 / Q8_0 prefill (batch GEMM) kernels.
 
    Q4_0 AoS block (18 bytes): [d_lo, d_hi, qs[0]..qs[15]]
-     scale = FP16 LE, 16 nibble bytes → 32 int4 weights
-     w[j] = scale * (nibble[j] - 8)
+     scale = FP16 LE, 16 nibble bytes → 32 int4 weights (lo-hi split)
+     w[j] = scale * (nibble[j] - 8)  where elements 0-15 use lower nibbles, 16-31 upper nibbles
 
    Q8_0 AoS block (34 bytes): [d_lo, d_hi, qs[0]..qs[31]]
      scale = FP16 LE, 32 signed int8 weights
@@ -125,9 +125,10 @@ extern "C" __global__ void gemm_q4_0(
                 #pragma unroll 16
                 for (unsigned int nb = 0u; nb < 16u; ++nb) {
                     const unsigned int byte = bptr[2u + nb];
+                    /* lo-hi split: lower nibble → element nb, upper nibble → element nb+16 */
                     const float w0 = (float)((int)(byte & 0x0Fu) - 8);
                     const float w1 = (float)((int)((byte >> 4u) & 0x0Fu) - 8);
-                    bsum += w0 * xbase[nb * 2u] + w1 * xbase[nb * 2u + 1u];
+                    bsum += w0 * xbase[nb] + w1 * xbase[nb + 16u];
                 }
                 col_sums[col] += scale * bsum;
             }
@@ -189,9 +190,10 @@ extern "C" __global__ void gemm_q4_0_residual(
                 #pragma unroll 16
                 for (unsigned int nb = 0u; nb < 16u; ++nb) {
                     const unsigned int byte = bptr[2u + nb];
+                    /* lo-hi split: lower nibble → element nb, upper nibble → element nb+16 */
                     const float w0 = (float)((int)(byte & 0x0Fu) - 8);
                     const float w1 = (float)((int)((byte >> 4u) & 0x0Fu) - 8);
-                    bsum += w0 * xbase[nb * 2u] + w1 * xbase[nb * 2u + 1u];
+                    bsum += w0 * xbase[nb] + w1 * xbase[nb + 16u];
                 }
                 col_sums[col] += scale * bsum;
             }
@@ -270,9 +272,10 @@ extern "C" __global__ void fused_gate_up_swiglu_gemm_q4_0(
                 float gsum = 0.0f;
                 float usum = 0.0f;
                 #pragma unroll 16
+                /* lo-hi split: lower nibble → element nb, upper nibble → element nb+16 */
                 for (unsigned int nb = 0u; nb < 16u; ++nb) {
-                    const float x0 = xbase[nb * 2u];
-                    const float x1 = xbase[nb * 2u + 1u];
+                    const float x0 = xbase[nb];
+                    const float x1 = xbase[nb + 16u];
                     const float gw0 = (float)((int)(gbptr[2u + nb] & 0x0Fu) - 8);
                     const float gw1 = (float)((int)((gbptr[2u + nb] >> 4u) & 0x0Fu) - 8);
                     const float uw0 = (float)((int)(ubptr[2u + nb] & 0x0Fu) - 8);

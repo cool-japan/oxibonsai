@@ -15,6 +15,16 @@ pub struct Vocabulary {
     token_to_id: HashMap<String, u32>,
     id_to_token: HashMap<u32, String>,
     special_tokens: HashMap<String, u32>,
+    /// Tokens that must be atomically carved out of the input *before*
+    /// pre-tokenization/model segmentation runs during `encode`, mirroring
+    /// HuggingFace's `AddedVocabulary` semantics: **every** added token —
+    /// whether flagged `special` in `tokenizer.json` or not — is protected
+    /// from being shredded by generic segmentation (e.g. `<tool_call>`,
+    /// `<|fim_prefix|>`).  This is a **superset** of `special_tokens`: every
+    /// special token is also protected, but not every protected token is
+    /// "special" (only `special_tokens` drives decode-skip / BOS-EOS-style
+    /// semantics).
+    protected_tokens: HashMap<String, u32>,
 }
 
 impl Vocabulary {
@@ -37,6 +47,24 @@ impl Vocabulary {
     /// looked up by the standard `get_id` / `get_token` interface.
     pub fn add_special(&mut self, token: &str, id: u32) {
         self.special_tokens.insert(token.to_owned(), id);
+        self.protected_tokens.insert(token.to_owned(), id);
+        self.insert(token, id);
+    }
+
+    /// Register a non-special "added token" that must still be atomically
+    /// protected from pre-tokenization during `encode` (e.g. `<tool_call>`,
+    /// `<|fim_prefix|>`), per HuggingFace `AddedVocabulary` semantics: every
+    /// added token — special or not — is carved out before model
+    /// segmentation runs; only the `special` flag governs default
+    /// decode-skipping and similar normalization behaviour.
+    ///
+    /// Inserted into the main token↔id maps (so lookups work) and into the
+    /// protected-token registry consulted by the encoder's leftmost-longest
+    /// carve-out, but **not** into the narrower [`Self::special_tokens`]
+    /// registry — so [`Self::is_special_token`] / [`Self::is_special_id`]
+    /// keep reflecting only genuinely `special == true` tokens.
+    pub fn add_protected(&mut self, token: &str, id: u32) {
+        self.protected_tokens.insert(token.to_owned(), id);
         self.insert(token, id);
     }
 
@@ -77,6 +105,26 @@ impl Vocabulary {
     /// Iterate over all (token, id) pairs (regular + special).
     pub fn iter(&self) -> impl Iterator<Item = (&str, u32)> {
         self.token_to_id.iter().map(|(k, &v)| (k.as_str(), v))
+    }
+
+    /// Iterate over the registered special tokens as `(token, id)` pairs.
+    ///
+    /// These are the tokens promoted via [`Self::add_special`] (e.g. the HF
+    /// `added_tokens` marked `special == true`, such as `<|im_start|>`).  They
+    /// are used by the encoder to carve out atomic special-token substrings
+    /// before generic pre-tokenization.
+    pub fn special_tokens(&self) -> impl Iterator<Item = (&str, u32)> {
+        self.special_tokens.iter().map(|(k, &v)| (k.as_str(), v))
+    }
+
+    /// Iterate over ALL atomically-protected added tokens: the union of
+    /// [`Self::special_tokens`] and any tokens registered via
+    /// [`Self::add_protected`].  This is the set the encoder's
+    /// leftmost-longest carve-out draws from, matching HuggingFace's
+    /// `AddedVocabulary` (every added token is protected from
+    /// pre-tokenization, not just `special == true` ones).
+    pub fn protected_tokens(&self) -> impl Iterator<Item = (&str, u32)> {
+        self.protected_tokens.iter().map(|(k, &v)| (k.as_str(), v))
     }
 
     /// Deserialize a vocabulary from a JSON object mapping token → id.

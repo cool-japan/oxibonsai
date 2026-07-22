@@ -14,16 +14,32 @@ use crate::dispatch::KernelDispatcher;
 use crate::error::{KernelError, KernelResult};
 use crate::traits::Fp8Kernel;
 use crate::traits::OneBitKernel;
+use crate::traits::StandardQuantKernel;
 use crate::traits::TernaryKernel;
 use oxibonsai_core::QK_TQ2_0_G128;
 use oxibonsai_core::{BlockFP8E4M3, BlockFP8E5M2, QK_FP8};
+use oxibonsai_core::{BlockQ4_0, BlockQ8_0, QK_Q4_0, QK_Q8_0};
 
-/// Minimum number of rows before engaging parallel GEMV.
-/// Below this threshold, the overhead of thread spawning exceeds the benefit.
-const PAR_GEMV_MIN_ROWS: usize = 64;
+use crate::tuning::PlatformProfile;
 
-/// Minimum batch size before engaging parallel GEMM.
-const PAR_GEMM_MIN_BATCH: usize = 4;
+/// Minimum number of output rows before engaging parallel GEMV.
+///
+/// Sourced from the platform-tuned [`crate::tuning::TunedThresholds`]
+/// (auto-detected once per process from core count, cache sizes and SIMD tier)
+/// rather than a fixed constant, so a low-core laptop and a many-core server
+/// each pick their own break-even point. Below the threshold, thread-spawn
+/// overhead exceeds the per-row compute parallelism saves.
+#[inline]
+fn par_gemv_min_rows() -> usize {
+    PlatformProfile::global_thresholds().par_gemv_min_rows
+}
+
+/// Minimum batch size before engaging parallel GEMM (platform-tuned; see
+/// [`par_gemv_min_rows`]).
+#[inline]
+fn par_gemm_min_batch() -> usize {
+    PlatformProfile::global_thresholds().par_gemm_min_batch
+}
 
 /// Parallel row-wise 1-bit GEMV.
 ///
@@ -67,7 +83,7 @@ pub fn gemv_1bit_g128_par(
     }
 
     // Sequential fallback for small row counts
-    if n_rows < PAR_GEMV_MIN_ROWS {
+    if n_rows < par_gemv_min_rows() {
         return dispatcher.gemv(blocks, input, output, n_rows, k);
     }
 
@@ -127,7 +143,7 @@ pub fn gemm_1bit_g128_par(
     }
 
     // Sequential fallback for small batches
-    if m < PAR_GEMM_MIN_BATCH {
+    if m < par_gemm_min_batch() {
         return dispatcher.gemm(blocks, input, output, m, n_rows, k);
     }
 
@@ -194,7 +210,7 @@ pub fn gemv_ternary_g128_par(
         });
     }
 
-    if n_rows < PAR_GEMV_MIN_ROWS {
+    if n_rows < par_gemv_min_rows() {
         return dispatcher.gemv_ternary_g128(blocks, input, output, n_rows, k);
     }
 
@@ -258,7 +274,7 @@ pub fn gemm_ternary_g128_par(
         });
     }
 
-    if m < PAR_GEMM_MIN_BATCH {
+    if m < par_gemm_min_batch() {
         return dispatcher.gemm_ternary_g128(blocks, input, output, m, n_rows, k);
     }
 
@@ -323,7 +339,7 @@ pub fn gemv_fp8_e4m3_par(
         });
     }
 
-    if n_rows < PAR_GEMV_MIN_ROWS {
+    if n_rows < par_gemv_min_rows() {
         return dispatcher.gemv_fp8_e4m3(blocks, input, output, n_rows, k);
     }
 
@@ -384,7 +400,7 @@ pub fn gemv_fp8_e5m2_par(
         });
     }
 
-    if n_rows < PAR_GEMV_MIN_ROWS {
+    if n_rows < par_gemv_min_rows() {
         return dispatcher.gemv_fp8_e5m2(blocks, input, output, n_rows, k);
     }
 
@@ -447,7 +463,7 @@ pub fn gemm_fp8_e4m3_par(
         });
     }
 
-    if batch < PAR_GEMM_MIN_BATCH {
+    if batch < par_gemm_min_batch() {
         return dispatcher.gemm_fp8_e4m3(blocks, inputs, outputs, n_rows, k, batch);
     }
 
@@ -509,7 +525,7 @@ pub fn gemm_fp8_e5m2_par(
         });
     }
 
-    if batch < PAR_GEMM_MIN_BATCH {
+    if batch < par_gemm_min_batch() {
         return dispatcher.gemm_fp8_e5m2(blocks, inputs, outputs, n_rows, k, batch);
     }
 
@@ -530,6 +546,191 @@ pub fn gemm_fp8_e5m2_par(
 
         Ok(())
     }
+}
+
+// ─── Standard GGUF quant (Q4_0 / Q8_0) parallel entry points ────────────────
+
+/// Validate a standard-quant GEMV and return `blocks_per_row`.
+///
+/// Mirrors the error semantics of the scalar reference kernels so that routing
+/// through the parallel/SIMD path does not change which error a caller sees.
+fn validate_std_gemv(
+    n_blocks: usize,
+    input_len: usize,
+    output_len: usize,
+    n_rows: usize,
+    in_features: usize,
+    block_len: usize,
+) -> KernelResult<usize> {
+    if in_features % block_len != 0 {
+        return Err(KernelError::NotBlockAligned {
+            count: in_features,
+            block_size: block_len,
+        });
+    }
+    let blocks_per_row = in_features / block_len;
+    let expected_blocks = n_rows * blocks_per_row;
+    if n_blocks < expected_blocks {
+        return Err(KernelError::DimensionMismatch {
+            expected: expected_blocks,
+            got: n_blocks,
+        });
+    }
+    if input_len < in_features {
+        return Err(KernelError::DimensionMismatch {
+            expected: in_features,
+            got: input_len,
+        });
+    }
+    if output_len < n_rows {
+        return Err(KernelError::BufferTooSmall {
+            needed: n_rows,
+            available: output_len,
+        });
+    }
+    Ok(blocks_per_row)
+}
+
+/// Parallel row-wise Q4_0 GEMV.
+///
+/// Each output row is an independent dot product. Below the platform-tuned
+/// `par_gemv_min_rows` threshold (and on WASM) it falls back to a single
+/// tier-dispatched [`StandardQuantKernel::gemv_q4_0`] call; above it, rows are
+/// split across Rayon threads with each row processed by the best SIMD tier.
+pub fn gemv_q4_0_par(
+    dispatcher: &KernelDispatcher,
+    blocks: &[BlockQ4_0],
+    input: &[f32],
+    output: &mut [f32],
+    n_rows: usize,
+    in_features: usize,
+) -> KernelResult<()> {
+    let blocks_per_row = validate_std_gemv(
+        blocks.len(),
+        input.len(),
+        output.len(),
+        n_rows,
+        in_features,
+        QK_Q4_0,
+    )?;
+
+    if n_rows < par_gemv_min_rows() {
+        return dispatcher.gemv_q4_0(blocks, input, output, n_rows, in_features);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = blocks_per_row;
+        return dispatcher.gemv_q4_0(blocks, input, output, n_rows, in_features);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        output[..n_rows]
+            .par_chunks_mut(1)
+            .enumerate()
+            .try_for_each(|(row, out_chunk)| {
+                let row_blocks = &blocks[row * blocks_per_row..(row + 1) * blocks_per_row];
+                dispatcher.gemv_q4_0(row_blocks, input, out_chunk, 1, in_features)
+            })?;
+        Ok(())
+    }
+}
+
+/// Parallel row-wise Q8_0 GEMV. See [`gemv_q4_0_par`] for the strategy.
+pub fn gemv_q8_0_par(
+    dispatcher: &KernelDispatcher,
+    blocks: &[BlockQ8_0],
+    input: &[f32],
+    output: &mut [f32],
+    n_rows: usize,
+    in_features: usize,
+) -> KernelResult<()> {
+    let blocks_per_row = validate_std_gemv(
+        blocks.len(),
+        input.len(),
+        output.len(),
+        n_rows,
+        in_features,
+        QK_Q8_0,
+    )?;
+
+    if n_rows < par_gemv_min_rows() {
+        return dispatcher.gemv_q8_0(blocks, input, output, n_rows, in_features);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = blocks_per_row;
+        return dispatcher.gemv_q8_0(blocks, input, output, n_rows, in_features);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        output[..n_rows]
+            .par_chunks_mut(1)
+            .enumerate()
+            .try_for_each(|(row, out_chunk)| {
+                let row_blocks = &blocks[row * blocks_per_row..(row + 1) * blocks_per_row];
+                dispatcher.gemv_q8_0(row_blocks, input, out_chunk, 1, in_features)
+            })?;
+        Ok(())
+    }
+}
+
+// ─── K-quant (Q2_K..Q8_K) row-parallel driver ──────────────────────────────
+
+/// Dot product of two equal-length f32 slices (matches the scalar K-quant loop).
+#[inline]
+fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+/// Row-parallel scalar GEMV driver shared by the K-quant formats (Q2_K..Q8_K).
+///
+/// `dequant_row(row, row_buf)` must fill `row_buf[..in_features]` with the
+/// dequantized weights of output row `row`; the driver then dots that against
+/// `input[..in_features]`. Results are numerically **identical** to a plain
+/// sequential loop — every output row is independent, so only the row iteration
+/// is distributed across Rayon threads (above the platform-tuned
+/// [`par_gemv_min_rows`] threshold). Each worker reuses a single scratch buffer.
+///
+/// The caller must validate dimensions (so `input.len() >= in_features` and
+/// `output.len() >= n_rows`) before invoking this driver.
+pub(crate) fn gemv_kquant_row_parallel<F>(
+    input: &[f32],
+    output: &mut [f32],
+    n_rows: usize,
+    in_features: usize,
+    dequant_row: F,
+) -> KernelResult<()>
+where
+    F: Fn(usize, &mut [f32]) -> KernelResult<()> + Sync,
+{
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if n_rows >= par_gemv_min_rows() {
+            return output[..n_rows]
+                .par_iter_mut()
+                .enumerate()
+                .try_for_each_init(
+                    || vec![0.0f32; in_features],
+                    |row_buf, (row, out)| {
+                        dequant_row(row, row_buf)?;
+                        *out = dot_f32(row_buf, &input[..in_features]);
+                        Ok(())
+                    },
+                );
+        }
+    }
+
+    // Sequential fallback (also the WASM path): one reused scratch buffer.
+    let mut row_buf = vec![0.0f32; in_features];
+    for (row, out) in output[..n_rows].iter_mut().enumerate() {
+        dequant_row(row, &mut row_buf)?;
+        *out = dot_f32(&row_buf, &input[..in_features]);
+    }
+    Ok(())
 }
 
 // ─── Layer-parallel utilities ──────────────────────────────────────────
@@ -722,8 +923,22 @@ mod tests {
     }
 
     #[test]
+    fn parallel_thresholds_are_platform_tuned() {
+        // Regression guard for the tuning-wiring fix: the parallel dispatch
+        // thresholds must be sourced from the auto-detected `TunedThresholds`,
+        // not a hardcoded constant, so they adapt per platform (core count /
+        // cache / SIMD tier).
+        let tuned = PlatformProfile::global_thresholds();
+        assert_eq!(par_gemv_min_rows(), tuned.par_gemv_min_rows);
+        assert_eq!(par_gemm_min_batch(), tuned.par_gemm_min_batch);
+    }
+
+    #[test]
     fn par_gemv_matches_sequential() {
-        let n_rows = 128; // Above PAR_GEMV_MIN_ROWS threshold
+        // 512 rows is above the platform-tuned `par_gemv_min_rows()` on every
+        // supported platform (max tuned threshold is 448), guaranteeing the
+        // parallel path — not the sequential fallback — is exercised here.
+        let n_rows = 512;
         let k = 256;
         let (blocks, input) = make_test_data(n_rows, k);
         let dispatcher = KernelDispatcher::auto_detect();
@@ -775,7 +990,10 @@ mod tests {
 
     #[test]
     fn par_gemm_matches_sequential() {
-        let m = 8; // Above PAR_GEMM_MIN_BATCH threshold
+        // 16 is above the platform-tuned `par_gemm_min_batch()` on every
+        // supported platform (max tuned threshold is 16), exercising the
+        // parallel batch path.
+        let m = 16;
         let n_rows = 16;
         let k = 128;
         let blocks_per_row = k / QK1_0_G128;
@@ -1023,5 +1241,134 @@ mod tests {
         let mut output = vec![0.0f32; 10]; // Too small: need 4 * 128 = 512
         let result = dequant_1bit_g128_par(&dispatcher, &blocks, &mut output);
         assert!(result.is_err());
+    }
+
+    // ── Standard-quant (Q4_0 / Q8_0) parallel wrappers ──
+
+    fn std_input(k: usize, seed: u32) -> Vec<f32> {
+        (0..k)
+            .map(|i| {
+                let x = (i as u32).wrapping_mul(2654435761).wrapping_add(seed);
+                ((x >> 8) as f32 / u32::MAX as f32) * 4.0 - 2.0
+            })
+            .collect()
+    }
+
+    #[test]
+    fn par_q4_0_matches_scalar_large() {
+        // 600 rows is above every platform's tuned `par_gemv_min_rows()` (max
+        // 448), so the parallel + SIMD path is exercised, not the fallback.
+        let n_rows = 600;
+        let in_features = 128;
+        let raw: Vec<f32> = std_input(n_rows * in_features, 3);
+        let blocks = BlockQ4_0::quantize(&raw).expect("quantize q4_0");
+        let input = std_input(in_features, 9);
+        let dispatcher = KernelDispatcher::auto_detect();
+
+        let mut out_ref = vec![0.0f32; n_rows];
+        let mut out_par = vec![0.0f32; n_rows];
+        crate::gemv_q4_0::gemv_q4_0_scalar(&blocks, &input, &mut out_ref, n_rows, in_features)
+            .expect("scalar q4_0");
+        gemv_q4_0_par(
+            &dispatcher,
+            &blocks,
+            &input,
+            &mut out_par,
+            n_rows,
+            in_features,
+        )
+        .expect("parallel q4_0");
+
+        for r in 0..n_rows {
+            let tol = 1e-3 * out_ref[r].abs().max(1.0);
+            assert!(
+                (out_ref[r] - out_par[r]).abs() <= tol,
+                "row {r}: scalar={}, par={}",
+                out_ref[r],
+                out_par[r]
+            );
+        }
+    }
+
+    #[test]
+    fn par_q8_0_matches_scalar_large() {
+        let n_rows = 600;
+        let in_features = 128;
+        let raw: Vec<f32> = std_input(n_rows * in_features, 4);
+        let blocks = BlockQ8_0::quantize(&raw).expect("quantize q8_0");
+        let input = std_input(in_features, 8);
+        let dispatcher = KernelDispatcher::auto_detect();
+
+        let mut out_ref = vec![0.0f32; n_rows];
+        let mut out_par = vec![0.0f32; n_rows];
+        crate::gemv_q8_0::gemv_q8_0_scalar(&blocks, &input, &mut out_ref, n_rows, in_features)
+            .expect("scalar q8_0");
+        gemv_q8_0_par(
+            &dispatcher,
+            &blocks,
+            &input,
+            &mut out_par,
+            n_rows,
+            in_features,
+        )
+        .expect("parallel q8_0");
+
+        for r in 0..n_rows {
+            let tol = 1e-3 * out_ref[r].abs().max(1.0);
+            assert!(
+                (out_ref[r] - out_par[r]).abs() <= tol,
+                "row {r}: scalar={}, par={}",
+                out_ref[r],
+                out_par[r]
+            );
+        }
+    }
+
+    #[test]
+    fn par_q4_0_propagates_dim_errors() {
+        let dispatcher = KernelDispatcher::with_tier(crate::KernelTier::Reference);
+        let blocks = BlockQ4_0::quantize(&std_input(32, 1)).unwrap();
+        let input = std_input(32, 1);
+        let mut output = vec![0.0f32; 1];
+        // in_features not a multiple of 32.
+        assert!(gemv_q4_0_par(&dispatcher, &blocks, &input, &mut output, 1, 31).is_err());
+    }
+
+    #[test]
+    fn kquant_driver_parallel_matches_sequential() {
+        // The K-quant row-parallel driver must be bit-identical to the plain
+        // sequential loop (rows are independent). 600 rows forces the parallel
+        // branch on all platforms.
+        let n_rows = 600;
+        let in_features = 64;
+        let input = std_input(in_features, 2);
+
+        // Deterministic synthetic per-row "dequant".
+        let fill = |row: usize, buf: &mut [f32]| -> KernelResult<()> {
+            for (i, v) in buf.iter_mut().enumerate() {
+                *v = ((row * 31 + i * 7) % 17) as f32 * 0.125 - 1.0;
+            }
+            Ok(())
+        };
+
+        // Expected = independent sequential computation.
+        let mut expected = vec![0.0f32; n_rows];
+        let mut buf = vec![0.0f32; in_features];
+        for (row, e) in expected.iter_mut().enumerate() {
+            fill(row, &mut buf).unwrap();
+            *e = buf.iter().zip(input.iter()).map(|(w, x)| w * x).sum();
+        }
+
+        let mut got = vec![0.0f32; n_rows];
+        gemv_kquant_row_parallel(&input, &mut got, n_rows, in_features, fill).unwrap();
+
+        for r in 0..n_rows {
+            assert!(
+                (expected[r] - got[r]).abs() < f32::EPSILON,
+                "row {r}: expected={}, got={}",
+                expected[r],
+                got[r]
+            );
+        }
     }
 }

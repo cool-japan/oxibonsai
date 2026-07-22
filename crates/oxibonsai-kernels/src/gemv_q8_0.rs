@@ -1,20 +1,27 @@
-//! Scalar Q8_0 GEMV reference kernel.
+//! Q8_0 GEMV kernel (tiered SIMD + row-parallel).
 //!
 //! Computes `output[row] = dot(W_row, input)` for each row of the weight matrix
 //! `W`, where weights are stored as Q8_0 blocks (32 weights per block, 34 bytes).
 //!
-//! This is a pure scalar Rust correctness-reference implementation — no SIMD,
-//! no unsafe. The inner loop dequantizes one block at a time into a 32-element
-//! stack buffer to keep stack pressure predictable.
+//! [`gemv_q8_0`] is the public entry point: it routes through the runtime
+//! [`KernelDispatcher`] (AVX-512 / AVX2 int8-decode +
+//! FMA on x86-64, scalar elsewhere) and Rayon row-parallelism for large output
+//! counts, exactly like the Q1_0 / ternary / FP8 formats. `gemv_q8_0_scalar`
+//! is the pure-scalar correctness reference the SIMD tiers are checked against.
 
 use oxibonsai_core::{BlockQ8_0, QK_Q8_0};
 
+use crate::dispatch::{cpu_kernel_tier, KernelDispatcher};
 use crate::error::{KernelError, KernelResult};
 
-/// Scalar GEMV for Q8_0-quantized weight matrix.
+/// Q8_0 GEMV: `output = W × input` with automatic SIMD-tier + row-parallel
+/// dispatch.
 ///
-/// Computes `output[row] = dot(weight_row, input)` for each row, where the
-/// weight matrix is stored row-major as Q8_0 blocks.
+/// This is the production entry point. It selects the best CPU kernel tier for
+/// the current machine (cached) and, for large `n_rows`, splits the independent
+/// output rows across Rayon threads — mirroring the Q1_0 / ternary / FP8
+/// dispatch paths. The numeric result equals `gemv_q8_0_scalar` within f32
+/// rounding.
 ///
 /// - `blocks`: Row-major weight blocks.  Row `r` occupies
 ///   `blocks[r * blocks_per_row .. (r+1) * blocks_per_row]`
@@ -31,6 +38,23 @@ use crate::error::{KernelError, KernelResult};
 ///   or `input.len() < in_features`.
 /// - [`KernelError::BufferTooSmall`] if `output.len() < n_rows`.
 pub fn gemv_q8_0(
+    blocks: &[BlockQ8_0],
+    input: &[f32],
+    output: &mut [f32],
+    n_rows: usize,
+    in_features: usize,
+) -> KernelResult<()> {
+    let dispatcher = KernelDispatcher::with_tier(cpu_kernel_tier());
+    crate::parallel::gemv_q8_0_par(&dispatcher, blocks, input, output, n_rows, in_features)
+}
+
+/// Scalar reference GEMV for a Q8_0-quantized weight matrix.
+///
+/// Pure scalar Rust — no SIMD, no unsafe. The inner loop dequantizes one block
+/// at a time into a 32-element stack buffer. Used as the correctness reference
+/// for the SIMD tiers and as the fallback on targets without an SIMD kernel.
+/// See [`gemv_q8_0`] for the parameter contract.
+pub(crate) fn gemv_q8_0_scalar(
     blocks: &[BlockQ8_0],
     input: &[f32],
     output: &mut [f32],

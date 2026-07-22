@@ -4,8 +4,10 @@
 //! weight data, including:
 //! - 64-byte aligned buffers for optimal SIMD load/store operations
 //! - Block reordering for sequential cache-line access during GEMV
-//! - Software prefetch wrappers for all supported architectures
 //! - Working set size estimation for cache-aware scheduling
+//!
+//! Software prefetch hints live in [`crate::prefetch`] — this module does
+//! not duplicate them.
 
 use oxibonsai_core::tensor::{BlockQ1_0G128, QK1_0_G128};
 
@@ -43,10 +45,22 @@ impl AlignedBuffer {
     /// Create a new zero-initialized aligned buffer holding `size` f32 values.
     ///
     /// The buffer is aligned to 64 bytes (cache line boundary).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `size * 4 + CACHE_LINE_BYTES` would overflow `usize`. This
+    /// mirrors the guard in [`crate::aligned::AlignedBuffer::new`]: without
+    /// it, an oversized `size` would silently wrap the byte total to a tiny
+    /// allocation while `self.len` stayed at the huge caller-supplied value,
+    /// making `as_slice`/`as_mut_slice` build an out-of-bounds slice.
     pub fn new(size: usize) -> Self {
-        let byte_len = size * 4;
-        // Allocate extra bytes for alignment padding
-        let total = byte_len + CACHE_LINE_BYTES;
+        // Guard against `usize` wraparound: see the `# Panics` note above.
+        let byte_len = size
+            .checked_mul(4)
+            .expect("AlignedBuffer allocation size overflows usize");
+        let total = byte_len
+            .checked_add(CACHE_LINE_BYTES)
+            .expect("AlignedBuffer allocation size overflows usize");
         let storage = vec![0u8; total];
 
         // Find the aligned offset within the allocation
@@ -214,70 +228,6 @@ pub fn unpack_blocks_from_gemv(
     Ok(unpacked)
 }
 
-// ─── Prefetch hints ────────────────────────────────────────────────────
-
-/// Emit a software prefetch hint for read access.
-///
-/// On AArch64: uses `__prefetch` intrinsic for data read into L1.
-/// On x86_64: uses `_mm_prefetch` with `_MM_HINT_T0` (all cache levels).
-/// On other targets: no-op (compiler may still generate prefetch if it sees fit).
-///
-/// This is a *hint* — the CPU is free to ignore it. The benefit comes
-/// from overlapping prefetch latency with computation in inner loops.
-#[inline(always)]
-pub fn prefetch_read<T>(ptr: *const T) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        // SAFETY: prefetch is always safe, it's just a hint. The
-        // `aarch64_prefetch!` macro supplies the `unsafe` block and degrades to
-        // a no-op off-nightly (where the intrinsic is unavailable).
-        crate::aarch64_prefetch!(ptr as *const i8, 0, 3);
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        // SAFETY: prefetch is always safe, it's just a hint
-        unsafe {
-            core::arch::x86_64::_mm_prefetch(ptr as *const i8, core::arch::x86_64::_MM_HINT_T0);
-        }
-    }
-
-    // No-op fallback for other architectures
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        let _ = ptr;
-    }
-}
-
-/// Emit a software prefetch hint for write access.
-///
-/// Similar to [`prefetch_read`] but hints that the cache line will
-/// be written to, potentially triggering an exclusive prefetch.
-#[inline(always)]
-pub fn prefetch_write<T>(ptr: *const T) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        // SAFETY: prefetch is always safe. The `aarch64_prefetch!` macro supplies
-        // the `unsafe` block and degrades to a no-op off-nightly.
-        // _prefetch with pst=1 means prefetch for store.
-        crate::aarch64_prefetch!(ptr as *const i8, 1, 3);
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        // SAFETY: prefetch is always safe
-        unsafe {
-            // _MM_HINT_ET0: exclusive prefetch to all cache levels
-            core::arch::x86_64::_mm_prefetch(ptr as *const i8, core::arch::x86_64::_MM_HINT_T0);
-        }
-    }
-
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        let _ = ptr;
-    }
-}
-
 // ─── Working set estimation ────────────────────────────────────────────
 
 /// Estimate the working set size in bytes for a GEMV/GEMM computation.
@@ -442,10 +392,13 @@ mod tests {
     }
 
     #[test]
-    fn prefetch_does_not_crash() {
-        // Just verify prefetch hints don't cause issues
-        let data = vec![1.0f32; 64];
-        prefetch_read(data.as_ptr());
-        prefetch_write(data.as_ptr());
+    #[should_panic(expected = "overflows usize")]
+    fn aligned_buffer_new_guards_against_size_overflow() {
+        // `size * 4 + CACHE_LINE_BYTES` must not silently wrap on a
+        // near-usize::MAX request -- it must panic instead of allocating a
+        // tiny buffer while `self.len` stays huge (which would make
+        // `as_slice`/`as_mut_slice` build an out-of-bounds slice). Mirrors
+        // the regression test for `aligned::AlignedBuffer::new`.
+        let _ = AlignedBuffer::new(usize::MAX);
     }
 }

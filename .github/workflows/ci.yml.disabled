@@ -1,0 +1,198 @@
+name: CI
+
+# Branches actually used in this repo: `master` is the trunk, `0.2.x` are
+# short-lived release-prep branches (see `git branch -a`).
+on:
+  push:
+    branches: [master, "0.2.*"]
+  pull_request:
+    branches: [master, "0.2.*"]
+  workflow_dispatch:
+    inputs:
+      run_gpu_tests:
+        description: >-
+          Run the CUDA-execution test suite on the self-hosted A4000 runner.
+          Requires a runner registered with the `[self-hosted, cuda, a4000]`
+          labels; the workflow queues harmlessly (no false-positive pass) if
+          none is registered. Leave unchecked for a normal manual re-run of
+          the compile-only jobs.
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy (all features, -D warnings)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+
+  deny:
+    name: cargo-deny (bans, licenses, sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Gates the COOLJAPAN dependency policy (see deny.toml at the
+      # workspace root): banned C/C++/Fortran-backed or oxi*-superseded
+      # crates (openblas, bincode, rustfft, z3, rusqlite, zip/flate2/zstd/
+      # bzip2/lz4/tar/snap/brotli/miniz_oxide) may never enter the
+      # dependency graph, and only the approved OSS license set may be
+      # pulled in transitively. `advisories` is intentionally excluded here
+      # (network-dependent RustSec DB fetch); run it separately/offline as
+      # needed.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check bans licenses sources
+
+  test:
+    name: Build + Test (ubuntu, all features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      # `--all-features` enables `native-cuda`, but every native-cuda-gated
+      # test in this workspace probes for a real CUDA device at runtime and
+      # skips itself (eprintln + early return) when none is present, so this
+      # is safe on a GPU-less GitHub-hosted runner. See the `native-cuda`
+      # job below for the (separate) compile-only CUDA check, and the
+      # `gpu-self-hosted` job for the manually-triggered real-hardware run.
+      - run: cargo nextest run --workspace --all-features --profile ci
+
+  wasm:
+    name: WASM compile check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      # This is the exact command the `oxibonsai` umbrella crate's `wasm`
+      # feature is meant to validate: it aggregates
+      # `oxibonsai-core/wasm`, `oxibonsai-kernels/wasm`, `oxibonsai-model/wasm`
+      # and `oxibonsai-runtime/wasm` (see crates/oxibonsai/Cargo.toml).
+      # `--no-default-features` is required because the default feature set
+      # pulls in `mmap` (memmap2) and other non-wasm32 dependencies.
+      - run: cargo check -p oxibonsai --target wasm32-unknown-unknown --no-default-features --features wasm
+
+  macos-metal:
+    name: macOS build (metal, compile only)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Build only — no GPU tests. GitHub-hosted macos-latest runners do not
+      # expose a discrete/Metal-capable GPU suitable for kernel execution,
+      # so this job validates that the `metal` feature (and everything it
+      # pulls in transitively: oxibonsai-kernels -> oxibonsai-model ->
+      # oxibonsai-runtime) compiles cleanly against the real `metal`/`objc`
+      # crates, which are only buildable on macOS (see the
+      # `[target.'cfg(target_os = "macos")'.dependencies]` section of
+      # crates/oxibonsai-kernels/Cargo.toml). Metal *execution* parity is
+      # covered by crates/oxibonsai-runtime/tests/cross_backend_determinism_tests.rs,
+      # which must be run on real Apple Silicon hardware outside of CI.
+      - run: cargo build -p oxibonsai-kernels -p oxibonsai-model -p oxibonsai-runtime --features metal
+
+  native-cuda:
+    name: native-cuda compile check (no CUDA toolkit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Deliberately runs on a plain ubuntu-latest runner with NO CUDA
+      # toolkit / container image: `cudarc` (crates/oxibonsai-kernels
+      # `native-cuda` feature) is built with the `nvrtc` +
+      # `cuda-version-from-build-system` + `fallback-latest` feature set
+      # (see workspace Cargo.toml), which makes it a *dynamic-loading*
+      # NVRTC/CUDA-driver binding: libcuda.so / libnvrtc.so are dlopen'd at
+      # process start, not linked at build time, and when no CUDA toolkit
+      # is detected on the build host it silently falls back to assuming
+      # the latest known CUDA version instead of erroring
+      # (see cudarc's build.rs: detect_version_from_env /
+      # detect_version_from_feature / the `cuda-version-from-build-system`
+      # fallback path). That means `cargo check --features native-cuda`
+      # genuinely exercises the full native-cuda code path (FFI signatures,
+      # kernel dispatch, error types) without needing real CUDA headers,
+      # nvcc, or a GPU-having runner. GPU *execution* is covered separately
+      # by the manually-triggered `gpu-self-hosted` job below, which runs on
+      # this project's real A4000 hardware.
+      - run: cargo check -p oxibonsai-kernels -p oxibonsai-model -p oxibonsai-runtime --features native-cuda
+
+  # Manually-triggered GPU-execution job. Runs the native-cuda test suites
+  # that require a real CUDA device, on a self-hosted runner registered on
+  # the project's A4000 box. Trigger via:
+  #   gh workflow run ci.yml -f run_gpu_tests=true
+  # or the "Run workflow" button in the Actions UI with the
+  # "run_gpu_tests" checkbox enabled.
+  #
+  # If no runner carrying the `[self-hosted, cuda, a4000]` labels is
+  # registered, this job simply stays queued (GitHub Actions does not
+  # fabricate a pass) — register one via:
+  #   ./config.sh --url <repo-url> --token <token> --labels self-hosted,cuda,a4000
+  # and `./run.sh` on the A4000 host before dispatching.
+  #
+  # The exact commands below are also the ones to run by hand, locally on
+  # the A4000 box, as a pre-release GPU checklist (no runner required):
+  #   cargo test -p oxibonsai-kernels --features native-cuda --test capof8_audit
+  #   cargo test -p oxibonsai-kernels --features native-cuda --test cuda_tq2_gemv_parity -- --nocapture
+  #   cargo test -p oxibonsai-model   --features native-cuda --test cuda_inference_tests
+  #   ./scripts/download_ternary.sh   # once, to fetch the multi-GB ternary GGUF
+  #   OXI_MODEL=/abs/path/Ternary-Bonsai-8B.gguf \
+  #     cargo test -p oxibonsai-runtime --features native-cuda \
+  #     --test cuda_ternary_forward_parity -- --ignored --nocapture
+  gpu-self-hosted:
+    name: GPU execution tests (self-hosted A4000, manual)
+    if: github.event_name == 'workflow_dispatch' && inputs.run_gpu_tests == true
+    runs-on: [self-hosted, cuda, a4000]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: capof8 batch-kernel regression audit (host-only, no GPU needed)
+        run: cargo test -p oxibonsai-kernels --features native-cuda --test capof8_audit
+
+      - name: TQ2_0_g128 GEMV CPU<->CUDA parity
+        run: cargo test -p oxibonsai-kernels --features native-cuda --test cuda_tq2_gemv_parity -- --nocapture
+
+      - name: CUDA inference dispatch tests
+        run: cargo test -p oxibonsai-model --features native-cuda --test cuda_inference_tests
+
+      # This is the fix-verification gate for the documented prefill->decode
+      # KV-cache handoff bug in oxibonsai-model's ternary CUDA batch-prefill
+      # path (see crates/oxibonsai-model/src/model/types/forward_cuda/q1.rs).
+      # It needs the real multi-GB ternary GGUF, which is not committed to
+      # the repo, so it is #[ignore]'d by default and only run here.
+      - name: Download ternary GGUF (if not already cached on this runner)
+        run: |
+          if [ ! -f "${OXI_MODEL_PATH}" ]; then
+            ./scripts/download_ternary.sh
+          fi
+        env:
+          OXI_MODEL_PATH: ${{ vars.OXI_TERNARY_MODEL_PATH || 'models/Ternary-Bonsai-8B.gguf' }}
+
+      - name: Real ternary CPU<->CUDA forward parity (ignored by default)
+        run: cargo test -p oxibonsai-runtime --features native-cuda --test cuda_ternary_forward_parity -- --ignored --nocapture
+        env:
+          OXI_MODEL: ${{ vars.OXI_TERNARY_MODEL_PATH || 'models/Ternary-Bonsai-8B.gguf' }}

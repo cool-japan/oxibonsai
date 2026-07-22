@@ -2,7 +2,8 @@
 //!
 //! Converts a HuggingFace model directory (containing `model.safetensors` or
 //! sharded safetensors files and `config.json`) into an OxiBonsai GGUF file
-//! with TQ2_0_g128 quantisation for weight tensors and FP32 for norm tensors.
+//! with TQ2_0_g128 (default) or Q1_0_g128 quantisation for weight tensors and
+//! FP32 for norm tensors.
 //!
 //! A sibling [`onnx`] module provides the same output format from HuggingFace
 //! MatMulNBits-quantized ONNX models (e.g. `onnx-community/Ternary-Bonsai-1.7B-ONNX`).
@@ -44,6 +45,7 @@ use crate::convert::common::{
     blocks_to_bytes, pad_to_multiple_of_128, read_config_json, write_metadata,
 };
 use crate::convert::name_map::hf_to_gguf_name;
+use crate::quantize::quantize_q1_0_g128;
 
 pub use crate::convert::common::ConvertStats;
 
@@ -56,20 +58,24 @@ pub use crate::convert::common::ConvertStats;
 /// * `from_dir` — Directory containing `model.safetensors` (or sharded files
 ///   plus `model.safetensors.index.json`) and `config.json`.
 /// * `to_path` — Destination path for the GGUF file.
-/// * `quant` — Quantisation format; only `"tq2_0_g128"` is currently supported.
+/// * `quant` — Quantisation format: `"tq2_0_g128"` (ternary, {-1,0,+1}) or
+///   `"q1_0_g128"` (1-bit sign + FP16 group scale). Both use 128-element
+///   groups; norm tensors are always kept FP32 regardless of format.
 ///
 /// # Errors
 ///
 /// Returns an error if the directory does not contain the expected files, if
-/// any tensor cannot be converted, or if the output file cannot be written.
+/// `quant` names an unsupported format, if any tensor cannot be converted, or
+/// if the output file cannot be written.
 pub fn convert_hf_to_gguf(
     from_dir: &Path,
     to_path: &Path,
     quant: &str,
 ) -> anyhow::Result<ConvertStats> {
-    if quant != "tq2_0_g128" {
+    if quant != "tq2_0_g128" && quant != "q1_0_g128" {
         anyhow::bail!(
-            "unsupported quantisation format '{}'; only 'tq2_0_g128' is supported",
+            "unsupported quantisation format '{}'; supported formats are 'tq2_0_g128' and \
+             'q1_0_g128'",
             quant
         );
     }
@@ -117,7 +123,7 @@ pub fn convert_hf_to_gguf(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("unknown");
-    write_metadata(&mut writer, &config, model_name)?;
+    write_metadata(&mut writer, &config, model_name, quant)?;
 
     // ── 5. Determine tied-embedding flag ────────────────────────────────────
     let tie_word_embeddings = config
@@ -206,6 +212,16 @@ pub fn convert_hf_to_gguf(
             // FP32 norm tensor
             let raw: Vec<u8> = f32_data.iter().flat_map(|f| f.to_le_bytes()).collect();
             (raw, TensorType::F32)
+        } else if quant == "q1_0_g128" {
+            // Q1_0_g128 quantised tensor — 1-bit sign + FP16 group scale.
+            // Same 128-element group size as TQ2_0_g128, and the same
+            // padding helper applies. Uses the canonical sign convention
+            // shared with `oxibonsai_core::tensor::BlockQ1_0G128` (see
+            // `crate::quantize` module docs): bit=1 -> +scale, bit=0 -> -scale.
+            let f32_padded = pad_to_multiple_of_128(&f32_data);
+            let raw = quantize_q1_0_g128(&f32_padded)
+                .with_context(|| format!("quantizing tensor '{}'", meta.gguf_name))?;
+            (raw, TensorType::Q1_0G128)
         } else {
             // TQ2_0_g128 quantised tensor — f32_data dropped after this block
             let f32_padded = pad_to_multiple_of_128(&f32_data);
@@ -221,7 +237,13 @@ pub fn convert_hf_to_gguf(
             "  converting {} {:?} -> {}",
             meta.gguf_name,
             meta.gguf_shape,
-            if meta.is_norm { "F32" } else { "TQ2_0_g128" }
+            if meta.is_norm {
+                "F32"
+            } else if quant == "q1_0_g128" {
+                "Q1_0_g128"
+            } else {
+                "TQ2_0_g128"
+            }
         );
 
         writer.add_tensor(TensorEntry {

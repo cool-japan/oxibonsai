@@ -17,7 +17,7 @@ impl CudaGraph {
     /// On the first call for `key`, the slice is copied to a device buffer and
     /// stored in `f32_weight_cache`.  Subsequent calls clone the cached `Arc`.
     ///
-    /// Unlike [`get_or_upload_weight_soa`], no SoA reformatting is performed;
+    /// Unlike [`Self::get_or_upload_weight_soa`], no SoA reformatting is performed;
     /// the data is uploaded verbatim as typed `f32` device memory.
     pub fn get_or_upload_f32_weight(
         &self,

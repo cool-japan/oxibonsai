@@ -1,9 +1,21 @@
 # oxibonsai-runtime TODO
 
 > Inference engine, sampling, tokenizer, OpenAI-compatible server
-> Version 0.2.2 — 1,130+ tests passing (all-features, 2026-06-02)
+> Version 0.2.3 — 1,667 tests passing (all-features, 2026-07-21)
 
 ## Status: ✅ All Features Complete (Stable)
+
+## 0.2.3 — Real Penalties/Logprobs, OpenAI-Compat Hardening, Two-Engine Speculative Decoding
+
+- [x] **Real repetition/frequency/presence penalties** — `PenaltyParams` + `apply_frequency_presence_penalty` (OpenAI-style formula, range `[-2.0, 2.0]`); `Sampler::sample_with_history` applies the penalties over recent-token history; wired into `/v1/chat/completions`, the extended chat endpoint, and `/v1/completions` (previously `repetition_penalty` was a silent no-op and `frequency_penalty`/`presence_penalty` were honestly-400-rejected for lack of a seam) (`sampling.rs`, `server.rs`, `api_extensions.rs`, `completions.rs`)
+- [x] **Real per-token `logprobs`/`top_logprobs`** — `InferenceEngine::generate_with_logprobs` captures per-step logits; wired into the extended chat endpoint, replacing the previous validated-but-null placeholder (`engine.rs`, `api_extensions.rs`)
+- [x] **`/v1/completions` hardening** — honors `temperature`/`top_p`/penalties, reports the real loaded-model id (was hardcoded), batch `"prompt": [...]` now generates all prompts instead of effectively only the first, capped at `MAX_COMPLETION_BATCH_SIZE = 8` (`completions.rs`)
+- [x] **Streaming/server-surface hardening** — mid-stream SSE failures emit a terminal `{"error":...}` event instead of a bogus clean finish (`stream_terminal_json`, `streaming.rs`); base `/v1/chat/completions` now parses `tool_calls` from generated text via `parse_base_tool_calls` (previously extended-endpoint-only); `<|...|>` ChatML markers in message content are stripped by default (`neutralize_special_markers`, opt-out `OXI_DISABLE_PROMPT_SANITIZATION`) to close a prompt-injection/turn-boundary-forgery gap; unified OpenAI-style `{"error":{...}}` envelope on every route (`http_error.rs`); real peer `ConnectInfo` + `RateLimitConfig::trusted_proxies` allowlist closes an `X-Forwarded-For`/`X-Real-IP` spoofing bypass in per-peer rate limiting (`server.rs`, `middleware.rs`, `rate_limiter.rs`)
+- [x] **Grammar / JSON-Schema engine fixes** — previously-silently-ignored keywords (`minimum`/`maximum`/`minLength`/`maxLength`/etc.) now reject with `JsonSchemaCompileError::UnsupportedKeyword` instead of being ignored; real `const` support; optional (non-required) object properties are represented in the compiled grammar; `select_tool` now validates call arguments against the tool's schema via `validate_tool_arguments` (`grammar/json_schema_compiler.rs`, `tool_calling.rs`)
+- [x] **Speculative decoding: real two-engine production path** — `SpeculativeDecoder::generate_verified` drafts against the draft engine's own KV and verifies against a **separate target `InferenceEngine`** (`verify_batch` / `forward_prefill_verify`), losslessly matching plain greedy decoding of the target; the old mock `generate_speculative` / harness `verify` are now `#[doc(hidden)]` / test-only primitives — no longer described as production APIs (`speculative.rs`)
+- [x] **Prefix-cache / semantic-cache fixes** — `PrefixCachedEngine` keeps a persistent seeded sampler instead of discarding RNG state on every call; `SemanticCache::refit_embedder` re-embeds existing entries; `max_entries == 0` is clamped instead of silently disabling eviction; mutex sites recover from poisoning instead of panicking (`prefix_cache_engine.rs`, `semantic_cache.rs`)
+
+**Known limitation (unchanged):** the OpenAI-compatible server always assembles a hardcoded ChatML prompt (`build_prompt` in `server.rs`) regardless of the loaded model. `oxibonsai-tokenizer`'s real multi-family `ChatTemplateKind` (ChatML/Llama-3/Mistral/Gemma/Qwen) exists but the server never calls it — fine for the Qwen3-based models this project ships today, but a documented gap for non-ChatML fine-tunes.
 
 ## Phase 15 — Extended Constraints + Grammar Engine
 
@@ -56,7 +68,7 @@ Observability, TOML config, streaming SSE, circuit breaker, health checks, build
 
 ## Done
 
-- [x] `Engine` / `InferenceEngine` — prefill + autoregressive decode loop
+- [x] `InferenceEngine` — prefill + autoregressive decode loop
 - [x] `InferenceEngine::from_gguf()` — load model from GGUF file
 - [x] `Sampler` — temperature, top-k, top-p, repetition penalty, `LcgRng`
 - [x] `TokenizerBridge` — HuggingFace tokenizers wrapper (encode/decode)

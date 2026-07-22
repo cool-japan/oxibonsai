@@ -132,12 +132,14 @@ pub enum OnnxImportError {
         source: DequantError,
     },
 
-    /// Re-quantization to TQ2_0_g128 failed.
-    #[error("TQ2_0_g128 quantization failed for tensor '{tensor}': {msg}")]
+    /// Re-quantization to the requested output format (TQ2_0_g128 or
+    /// Q1_0_g128) failed.
+    #[error("quantization failed for tensor '{tensor}': {msg}")]
     Requantize {
         /// Target GGUF tensor name.
         tensor: String,
-        /// Human-readable message from `BlockTQ2_0_g128::quantize`.
+        /// Human-readable message from the underlying quantizer
+        /// (`BlockTQ2_0_g128::quantize` or `quantize_q1_0_g128`).
         msg: String,
     },
 

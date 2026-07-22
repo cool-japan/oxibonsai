@@ -14,12 +14,13 @@ use crate::dequant;
 use crate::error::KernelResult;
 use crate::gemm;
 use crate::gemv;
-use crate::traits::{Fp8Kernel, OneBitKernel, TernaryKernel};
+use crate::traits::{Fp8Kernel, OneBitKernel, StandardQuantKernel, TernaryKernel};
 use crate::weight_cache::GpuWeightHandle;
 use oxibonsai_core::tensor::BlockQ1_0G128;
-use oxibonsai_core::{BlockFP8E4M3, BlockFP8E5M2};
+use oxibonsai_core::{BlockFP8E4M3, BlockFP8E5M2, BlockQ4_0, BlockQ8_0};
 #[cfg(feature = "gpu")]
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 /// Kernel implementation tier, ordered from slowest to fastest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,6 +199,20 @@ impl KernelDispatcher {
     }
 }
 
+/// Best **CPU** kernel tier for the current machine, detected once and cached.
+///
+/// Unlike [`KernelDispatcher::auto_detect`], this never selects the GPU tier and
+/// never logs, so it is cheap enough to call on every kernel invocation. It is
+/// used by the standard-quant (Q4_0 / Q8_0) free-function entry points to build
+/// a lightweight CPU dispatcher per call without repeating feature detection.
+pub fn cpu_kernel_tier() -> KernelTier {
+    static TIER: OnceLock<KernelTier> = OnceLock::new();
+    *TIER.get_or_init(|| {
+        let caps = scirs2_core::simd::detect::get_cpu_features();
+        KernelDispatcher::select_tier(caps)
+    })
+}
+
 /// Minimum number of rows before the GPU path is worthwhile.
 ///
 /// Below this threshold the overhead of host-to-device transfer exceeds the
@@ -274,7 +289,7 @@ impl KernelDispatcher {
             },
             #[cfg(target_arch = "x86_64")]
             KernelTier::Avx512 => unsafe {
-                crate::simd_avx512::gemv_1bit_g128_avx512_prefetch(blocks, input, output, n_rows, k)
+                crate::simd_avx512::gemv_1bit_g128_avx512_auto(blocks, input, output, n_rows, k)
             },
             #[cfg(target_arch = "aarch64")]
             KernelTier::Neon => unsafe {
@@ -455,7 +470,7 @@ impl OneBitKernel for KernelDispatcher {
             },
             #[cfg(target_arch = "x86_64")]
             KernelTier::Avx512 => unsafe {
-                crate::simd_avx512::gemv_1bit_g128_avx512_prefetch(blocks, input, output, n_rows, k)
+                crate::simd_avx512::gemv_1bit_g128_avx512_auto(blocks, input, output, n_rows, k)
             },
             #[cfg(target_arch = "aarch64")]
             KernelTier::Neon => unsafe {
@@ -1112,6 +1127,173 @@ impl Fp8Kernel for KernelDispatcher {
             KernelTier::Neon => "fp8_neon",
             _ => "fp8_reference",
         }
+    }
+}
+
+impl StandardQuantKernel for KernelDispatcher {
+    fn gemv_q4_0(
+        &self,
+        blocks: &[BlockQ4_0],
+        input: &[f32],
+        output: &mut [f32],
+        n_rows: usize,
+        in_features: usize,
+    ) -> KernelResult<()> {
+        match self.tier {
+            #[cfg(target_arch = "x86_64")]
+            KernelTier::Avx512 => unsafe {
+                crate::simd_q_std_avx512::gemv_q4_0_avx512(
+                    blocks,
+                    input,
+                    output,
+                    n_rows,
+                    in_features,
+                )
+            },
+            #[cfg(target_arch = "x86_64")]
+            KernelTier::Avx2 => unsafe {
+                crate::simd_q_std_avx2::gemv_q4_0_avx2(blocks, input, output, n_rows, in_features)
+            },
+            // GPU tier: route to the Metal kernel on macOS; fall back to scalar
+            // on any failure (no device, shape mismatch, compile error).
+            #[cfg(feature = "gpu")]
+            KernelTier::Gpu => {
+                #[cfg(all(feature = "metal", target_os = "macos"))]
+                {
+                    if let Some(bytes) = q_std_gpu_bytes(
+                        blocks,
+                        input,
+                        output,
+                        n_rows,
+                        in_features,
+                        oxibonsai_core::BLOCK_Q4_0_BYTES,
+                    ) {
+                        match crate::gpu_backend::metal_gemv_q4_0(
+                            bytes,
+                            &input[..in_features],
+                            &mut output[..n_rows],
+                            n_rows,
+                            in_features,
+                        ) {
+                            Ok(()) => return Ok(()),
+                            Err(e) => warn_metal_gemv_fallback("Q4_0", &e),
+                        }
+                    }
+                }
+                crate::gemv_q4_0::gemv_q4_0_scalar(blocks, input, output, n_rows, in_features)
+            }
+            #[cfg(target_arch = "aarch64")]
+            KernelTier::Neon => unsafe {
+                crate::simd_q_std_neon::gemv_q4_0_neon(blocks, input, output, n_rows, in_features)
+            },
+            // No Q4_0 SIMD kernel for other tiers (Reference): use scalar.
+            _ => crate::gemv_q4_0::gemv_q4_0_scalar(blocks, input, output, n_rows, in_features),
+        }
+    }
+
+    fn gemv_q8_0(
+        &self,
+        blocks: &[BlockQ8_0],
+        input: &[f32],
+        output: &mut [f32],
+        n_rows: usize,
+        in_features: usize,
+    ) -> KernelResult<()> {
+        match self.tier {
+            #[cfg(target_arch = "x86_64")]
+            KernelTier::Avx512 => unsafe {
+                crate::simd_q_std_avx512::gemv_q8_0_avx512(
+                    blocks,
+                    input,
+                    output,
+                    n_rows,
+                    in_features,
+                )
+            },
+            #[cfg(target_arch = "x86_64")]
+            KernelTier::Avx2 => unsafe {
+                crate::simd_q_std_avx2::gemv_q8_0_avx2(blocks, input, output, n_rows, in_features)
+            },
+            // GPU tier: route to the Metal kernel on macOS; fall back to scalar
+            // on any failure (no device, shape mismatch, compile error).
+            #[cfg(feature = "gpu")]
+            KernelTier::Gpu => {
+                #[cfg(all(feature = "metal", target_os = "macos"))]
+                {
+                    if let Some(bytes) = q_std_gpu_bytes(
+                        blocks,
+                        input,
+                        output,
+                        n_rows,
+                        in_features,
+                        oxibonsai_core::BLOCK_Q8_0_BYTES,
+                    ) {
+                        match crate::gpu_backend::metal_gemv_q8_0(
+                            bytes,
+                            &input[..in_features],
+                            &mut output[..n_rows],
+                            n_rows,
+                            in_features,
+                        ) {
+                            Ok(()) => return Ok(()),
+                            Err(e) => warn_metal_gemv_fallback("Q8_0", &e),
+                        }
+                    }
+                }
+                crate::gemv_q8_0::gemv_q8_0_scalar(blocks, input, output, n_rows, in_features)
+            }
+            #[cfg(target_arch = "aarch64")]
+            KernelTier::Neon => unsafe {
+                crate::simd_q_std_neon::gemv_q8_0_neon(blocks, input, output, n_rows, in_features)
+            },
+            _ => crate::gemv_q8_0::gemv_q8_0_scalar(blocks, input, output, n_rows, in_features),
+        }
+    }
+}
+
+/// Reinterpret the leading `n_rows * (in_features / 32)` quant blocks as a raw
+/// byte slice for the Metal GEMV kernels, or `None` if the buffers are too small
+/// or `in_features` is not block-aligned (in which case the scalar reference
+/// runs and reports the precise error).
+///
+/// `block_bytes` is the `#[repr(C)]` size of the block type (18 for `Q4_0`,
+/// 34 for `Q8_0`); it equals `size_of::<Block>()` so the leading `expected`
+/// blocks occupy exactly `expected * block_bytes` contiguous, unpadded bytes.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn q_std_gpu_bytes<'a, T>(
+    blocks: &'a [T],
+    input: &[f32],
+    output: &[f32],
+    n_rows: usize,
+    in_features: usize,
+    block_bytes: usize,
+) -> Option<&'a [u8]> {
+    const QK_STD: usize = 32;
+    if in_features == 0 || in_features % QK_STD != 0 {
+        return None;
+    }
+    let blocks_per_row = in_features / QK_STD;
+    let expected = n_rows.checked_mul(blocks_per_row)?;
+    if blocks.len() < expected || input.len() < in_features || output.len() < n_rows {
+        return None;
+    }
+    debug_assert_eq!(std::mem::size_of::<T>(), block_bytes);
+    // SAFETY: `T` is a `#[repr(C)]` quant block whose size equals `block_bytes`
+    // with no inter-element padding, so the leading `expected` blocks form a
+    // contiguous `expected * block_bytes` byte run within `blocks`. The returned
+    // slice borrows `blocks` (lifetime `'a`) and is never longer than it.
+    let bytes =
+        unsafe { std::slice::from_raw_parts(blocks.as_ptr().cast::<u8>(), expected * block_bytes) };
+    Some(bytes)
+}
+
+/// Log a one-line warning when a Metal GEMV falls back to the CPU scalar path,
+/// suppressing the benign "no Metal-capable GPU device" case.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn warn_metal_gemv_fallback(format: &str, e: &crate::gpu_backend::MetalGraphError) {
+    let msg = e.to_string();
+    if !msg.contains("no Metal-capable GPU device") {
+        tracing::warn!(error = %e, "Metal {format} GEMV failed, falling back to CPU scalar");
     }
 }
 

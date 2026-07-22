@@ -18,7 +18,6 @@
 use oxibonsai_core::gguf::writer::{GgufWriter, MetadataWriteValue, TensorEntry, TensorType};
 
 use crate::quantize::{q1_0_g128_size_bytes, quantize_q1_0_g128};
-use crate::quantize_int8::quantize_per_channel;
 
 // ─── Export format ────────────────────────────────────────────────────────────
 
@@ -30,6 +29,16 @@ pub enum ExportFormat {
     /// Quantize to Q1\_0\_g128 (1-bit sign + FP16 scale per 128-element group).
     Q1_0G128,
     /// Quantize to INT8 per output channel.
+    ///
+    /// **Export-only / not loadable.** There is no GGUF tensor-type id for
+    /// packed per-channel INT8 in the current [`TensorType`] enum and no
+    /// corresponding loader arm anywhere in this workspace. Attempting to
+    /// use this format with [`export_to_gguf`] returns
+    /// [`ExportError::NoLoaderForFormat`] rather than silently writing bytes
+    /// tagged `TensorType::F32` that a standard loader would misinterpret as
+    /// raw floats. Use [`crate::quantize_int8::quantize_per_channel`]
+    /// directly if you only need the in-memory quantized representation
+    /// (e.g. for offline error analysis), not a round-trippable GGUF file.
     Int8PerChannel,
     /// Ternary quantization: {-1, 0, +1} weights packed as TQ2_0_g128 (34 B / 128 weights).
     ///
@@ -183,6 +192,17 @@ pub enum ExportError {
     /// The tensor list is empty — nothing to export.
     #[error("No tensors to export")]
     Empty,
+
+    /// The requested [`ExportFormat`] has no corresponding GGUF tensor-type
+    /// id and no loader anywhere in this workspace can read it back.
+    /// Exporting would silently produce a file that a standard loader
+    /// misinterprets (e.g. packed INT8 bytes tagged as raw `F32`), so the
+    /// export is refused instead.
+    #[error(
+        "tensor '{name}': {format:?} has no matching GGUF tensor-type id or loader in this \
+         workspace — refusing to export a file that would be silently misread"
+    )]
+    NoLoaderForFormat { name: String, format: ExportFormat },
 }
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
@@ -241,26 +261,19 @@ fn encode_tensor(
         }
 
         ExportFormat::Int8PerChannel => {
-            // Use the first shape dimension as the number of channels.
-            let num_channels = tensor.shape.first().copied().unwrap_or(1).max(1);
-            let int8 = quantize_per_channel(&tensor.data, num_channels).map_err(|e| {
-                ExportError::QuantizeError {
-                    name: tensor.name.clone(),
-                    reason: e.to_string(),
-                }
-            })?;
-            // Serialise: raw i8 data followed by f32 scales.
-            let mut bytes: Vec<u8> = Vec::with_capacity(int8.data.len() + int8.scales.len() * 4);
-            for &q in &int8.data {
-                bytes.push(q as u8);
-            }
-            for &s in &int8.scales {
-                bytes.extend_from_slice(&s.to_le_bytes());
-            }
-            // We store INT8 as F32 type in GGUF (custom packing) since there is
-            // no INT8 type code in the current TensorType enum. The format field
-            // in the GGUF metadata conveys the actual quantization used.
-            Ok((bytes, TensorType::F32))
+            // There is no INT8 tensor-type id in the GGUF `TensorType` enum
+            // and no loader in this workspace can read packed per-channel
+            // INT8 bytes back. Previously this arm tagged the packed
+            // `[i8 data][f32 scales]` bytes as `TensorType::F32`, which a
+            // standard loader would silently reinterpret as raw floats
+            // (garbage values, no error). Refuse instead of producing an
+            // unloadable / silently-corrupt GGUF file — see
+            // `ExportFormat::Int8PerChannel` docs for the supported
+            // in-memory alternative.
+            Err(ExportError::NoLoaderForFormat {
+                name: tensor.name.clone(),
+                format: ExportFormat::Int8PerChannel,
+            })
         }
 
         ExportFormat::TernaryG128 => {
@@ -523,16 +536,11 @@ pub fn export_to_gguf(
         let (bytes, tensor_type) = encode_tensor(tensor, config)?;
 
         // GGUF shape convention: outermost (slowest-varying) dimension first.
-        let shape: Vec<u64> = if config.format == ExportFormat::Int8PerChannel
-            && !should_keep_fp32(&tensor.name, config)
-        {
-            // For INT8 the serialized blob is flat (i8 data + scales), so we
-            // report the element count as a 1-D shape to satisfy the writer's
-            // size check for F32 type (4 bytes each).
-            vec![(bytes.len() / 4) as u64]
-        } else {
-            tensor.shape.iter().map(|&d| d as u64).collect()
-        };
+        // (`ExportFormat::Int8PerChannel` never reaches this point for
+        // non-FP32-exception tensors — `encode_tensor` refuses it above via
+        // `ExportError::NoLoaderForFormat` — so no special-cased shape
+        // encoding is needed here anymore.)
+        let shape: Vec<u64> = tensor.shape.iter().map(|&d| d as u64).collect();
 
         writer.add_tensor(TensorEntry {
             name: tensor.name.clone(),
@@ -552,6 +560,10 @@ pub fn export_to_gguf(
 /// Estimate the total exported byte count without actually encoding anything.
 ///
 /// This is an approximation — metadata and tensor info headers are not included.
+///
+/// Note: for [`ExportFormat::Int8PerChannel`] this reports the theoretical
+/// packed size for planning/comparison purposes only; [`export_to_gguf`]
+/// refuses to actually produce a file in that format (see the format's docs).
 pub fn estimate_export_size(tensors: &[WeightTensor], config: &ExportConfig) -> usize {
     tensors
         .iter()
@@ -1349,6 +1361,54 @@ mod tests {
             q8_size < f32_size,
             "Q8_0 ({q8_size} bytes) must be smaller than Float32 ({f32_size} bytes)"
         );
+    }
+
+    // ── Q1_0_g128 sign-convention round-trip ────────────────────────────────
+    //
+    // Regression test for a bug where the exporter used the inverse sign-bit
+    // convention of every reader/kernel in the workspace, silently negating
+    // every 1-bit weight after export→load. Uses non-uniform, mixed-sign
+    // data (a uniform test vector cannot expose a global sign inversion) and
+    // decodes the exported bytes through the SAME public types the real GGUF
+    // loader (`oxibonsai-model::model::weight_loaders::load_f32_tensor`) and
+    // the CPU/CUDA/Metal kernels use: `GgufFile::parse` +
+    // `oxibonsai_core::tensor::BlockQ1_0G128::weight`.
+    #[test]
+    fn test_export_q1_0_g128_sign_convention_roundtrip_via_real_loader() {
+        use crate::quantize::GROUP_SIZE;
+        use oxibonsai_core::gguf::reader::GgufFile;
+        use oxibonsai_core::tensor::BlockQ1_0G128;
+
+        // 128 mixed-sign, varying-magnitude weights (one full Q1_0_g128 group).
+        // Deliberately avoid exact zero (sign of zero is convention-arbitrary).
+        let original: Vec<f32> = (0..GROUP_SIZE).map(|i| ((i as f32) - 63.5) * 0.1).collect();
+        assert_eq!(original.len(), GROUP_SIZE);
+
+        let tensors = vec![WeightTensor::new(
+            "blk.0.attn_q.weight",
+            original.clone(),
+            vec![GROUP_SIZE],
+        )];
+        let config = ExportConfig::new(ExportFormat::Q1_0G128, "sign-roundtrip-model");
+        let gguf_bytes = export_to_gguf(&tensors, &config, &[]).expect("export Q1_0_g128");
+
+        // Parse the exported GGUF bytes with the SAME reader the model loader uses.
+        let gguf = GgufFile::parse(&gguf_bytes).expect("parse exported GGUF");
+        let data = gguf
+            .tensor_data("blk.0.attn_q.weight")
+            .expect("tensor_data");
+        let blocks = BlockQ1_0G128::slice_from_bytes(data).expect("slice_from_bytes");
+        assert_eq!(blocks.len(), 1, "128 weights should be exactly one block");
+
+        for (i, &orig) in original.iter().enumerate() {
+            let decoded = blocks[0].weight(i);
+            assert_eq!(
+                decoded.is_sign_positive(),
+                orig.is_sign_positive(),
+                "weight[{i}]: original={orig}, decoded={decoded} — sign mismatch \
+                 (export used the wrong Q1_0_g128 sign-bit convention)"
+            );
+        }
     }
 
     #[test]

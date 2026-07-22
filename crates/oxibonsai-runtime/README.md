@@ -10,24 +10,24 @@ Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 
 ## Status
 
-**Stable** — 796 tests passing (`cargo nextest run -p oxibonsai-runtime --all-features`), version 0.2.2.
+**Stable** — 1,667 tests passing (`cargo nextest run -p oxibonsai-runtime --all-features`), version 0.2.3.
 
 ## Features
 
-- `Engine` / `InferenceEngine` — prefill + autoregressive decode loop
+- `InferenceEngine` — prefill + autoregressive decode loop
 - `EngineBuilder` / `ConfigBuilder` / `SamplerBuilder` — ergonomic builder API
-- Sampling: greedy, top-k, top-p, temperature, repetition penalty, `LcgRng`
+- Sampling: greedy, top-k, top-p, temperature, repetition/frequency/presence penalty, `LcgRng`
 - Sampling presets: Greedy, Balanced, Creative, Code
 - Advanced samplers: Mirostat v1/v2, Locally Typical, Eta, Min-P, adaptive
 - `SamplerChain` — composable sampling pipeline
-- Speculative decoding with draft/verify loop
+- Speculative decoding with a real two-engine draft/verify loop (`SpeculativeDecoder::generate_verified`)
 - Beam search with configurable width, length penalty, n-gram blocking
 - Token healing, constrained decoding, JSON schema guidance
 - Context window management and token budget tracking
 - Continuous batching, prefix cache engine, semantic cache
 - `InferencePipeline` — high-level generation API with stop reasons
 - Streaming generation (`generate_streaming`) with SSE delivery
-- OpenAI-compatible `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`
+- OpenAI-compatible `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models` — `frequency_penalty`/`presence_penalty` and real per-token `logprobs`/`top_logprobs` are genuinely applied (not stubbed)
 - RAG endpoints (`/v1/rag/*`) and admin API (`/admin/*`)
 - Rate limiting, circuit breaker, CORS, tower middleware
 - Prometheus metrics (`/metrics`): tokens/s, latency, request counts
@@ -50,17 +50,14 @@ Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 
 ```toml
 [dependencies]
-oxibonsai-runtime = "0.2.2"
+oxibonsai-runtime = "0.2.3"
 ```
 
 ```rust
-use oxibonsai_runtime::{EngineBuilder, SamplingPreset};
+use oxibonsai_runtime::{InferenceEngine, SamplingPreset};
 
-let engine = EngineBuilder::new()
-    .model_path("models/Bonsai-8B.gguf")
-    .preset(SamplingPreset::Balanced)
-    .max_seq_len(4096)
-    .build()?;
+let params = SamplingPreset::Balanced.params();
+let engine = InferenceEngine::from_gguf_path("models/Bonsai-8B.gguf", params, 42, 4096)?;
 ```
 
 ## License

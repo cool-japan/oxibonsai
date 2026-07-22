@@ -44,8 +44,6 @@ pub struct RenderParams {
     pub width: usize,
     /// Target height in pixels.
     pub height: usize,
-    /// Guidance scale (surfaced for parity; the DiT forward is unconditional).
-    pub guidance: f32,
 }
 
 impl Default for RenderParams {
@@ -56,7 +54,6 @@ impl Default for RenderParams {
             steps: 4,
             width: 512,
             height: 512,
-            guidance: 1.0,
         }
     }
 }
@@ -210,9 +207,18 @@ impl ImageSession {
         // ── 3. VAE decode ──
         let t_vae = Instant::now();
         let packed = latent_seq_to_packed_nchw(&latent, seq_img, self.in_channels, lat_h, lat_w)?;
-        let decoded = self
-            .vae
-            .decode_packed_latents(&packed, lat_h, lat_w, None)?;
+        // Auto-tile when the output exceeds 512 px (same threshold as pipeline.rs).
+        let decoded = if 16 * lat_h > 512 {
+            self.vae.decode_packed_latents_tiled(
+                &packed,
+                lat_h,
+                lat_w,
+                crate::vae::tiling::TileConfig::default(),
+            )?
+        } else {
+            self.vae
+                .decode_packed_latents(&packed, lat_h, lat_w, None)?
+        };
         let vae_decode = t_vae.elapsed();
 
         // ── 4. Pixels + PNG ──

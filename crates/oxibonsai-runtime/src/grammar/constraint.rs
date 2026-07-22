@@ -331,9 +331,14 @@ impl TokenConstraint for GrammarConstraint {
         }
 
         // ── Cache lookup ─────────────────────────────────────────────────────
+        // Keyed by (state_hash, vocab_size): `vocab_size` is a per-call
+        // parameter of this trait method (not fixed at construction), so it
+        // must be part of the cache key — otherwise a mask built for one
+        // vocab_size could be handed back to a caller requesting a different
+        // one, silently under/over-masking. See `AllowedTokensCache` doc.
         let state_hash = self.recognizer.state_hash();
         if let Ok(mut cache) = self.cache.lock() {
-            if let Some(cached) = cache.get(state_hash) {
+            if let Some(cached) = cache.get(state_hash, vocab_size) {
                 return Some(cached.to_vec());
             }
         }
@@ -384,7 +389,7 @@ impl TokenConstraint for GrammarConstraint {
 
         // ── Store in cache ───────────────────────────────────────────────────
         if let Ok(mut cache) = self.cache.lock() {
-            cache.insert(state_hash, mask.clone());
+            cache.insert(state_hash, vocab_size, mask.clone());
         }
 
         Some(mask)
@@ -752,6 +757,70 @@ mod tests {
     }
 
     // ── Phase 16B: precomputed bytes match decode fn ─────────────────────────
+
+    // ── Regression test for issue #82 ────────────────────────────────────────
+    //
+    // The `TokenConstraint::allowed_tokens` trait signature takes `vocab_size`
+    // per call. If the cache were keyed only by Earley `state_hash`, calling
+    // `allowed_tokens` twice at the same recognizer state but with two
+    // different `vocab_size` values would return a mask sized for the wrong
+    // vocabulary on the second call. Verify both call shapes return correctly
+    // sized, and correctly populated, masks — including on the cache-hit path
+    // (the recognizer state does not change between the two calls, so the
+    // second call is guaranteed to hit whatever the first call inserted).
+
+    #[test]
+    fn grammar_constraint_allowed_tokens_respects_per_call_vocab_size() {
+        // vocab_size=64 still covers ASCII digit token ids ('0'..'9' == 48..57
+        // under the id==byte-value `ascii_constraint` decode fn), so digit
+        // assertions remain meaningful for both mask sizes below.
+        let c = ascii_constraint(arithmetic_grammar());
+
+        // First call with a smaller vocab_size than the constraint's own
+        // (128), populating the cache for this Earley state.
+        let small_mask = c.allowed_tokens(&[], 64).expect("mask for vocab_size=64");
+        assert_eq!(
+            small_mask.len(),
+            64,
+            "mask length must equal requested vocab_size"
+        );
+        for d in b'0'..=b'9' {
+            assert!(
+                small_mask[d as usize],
+                "digit {d} should be allowed in the small-vocab mask"
+            );
+        }
+
+        // Second call at the SAME recognizer state (nothing advanced) but a
+        // larger vocab_size. If the cache incorrectly keyed on state_hash
+        // alone, this would return the 64-length mask from above instead of
+        // a fresh 128-length mask (or worse, panic on an out-of-range index
+        // downstream when a caller assumes the mask matches its vocab_size).
+        let large_mask = c.allowed_tokens(&[], 128).expect("mask for vocab_size=128");
+        assert_eq!(
+            large_mask.len(),
+            128,
+            "mask length must equal the second call's vocab_size, not the first"
+        );
+        for d in b'0'..=b'9' {
+            assert!(
+                large_mask[d as usize],
+                "digit {d} should be allowed in the large-vocab mask"
+            );
+        }
+        assert!(
+            large_mask[b'(' as usize],
+            "'(' should be allowed at start in the large-vocab mask"
+        );
+
+        // Re-querying the small vocab_size again must still return the
+        // correctly sized mask (proves both entries coexist in the cache).
+        let small_mask_again = c
+            .allowed_tokens(&[], 64)
+            .expect("mask for vocab_size=64 again");
+        assert_eq!(small_mask_again.len(), 64);
+        assert_eq!(small_mask_again, small_mask);
+    }
 
     #[test]
     fn grammar_constraint_precomputed_bytes_match_decode_fn() {

@@ -5,6 +5,8 @@
 //!
 //! - **Q4_0** (GGML type 2): 32 weights per block, 18 bytes total.
 //!   Block scale `d: f16` + 16 bytes of packed 4-bit nibbles (2 per byte).
+//!   **lo-hi split**: elements 0–15 come from lower nibbles of bytes 0–15;
+//!   elements 16–31 come from upper nibbles of bytes 0–15. (llama.cpp-compatible.)
 //!   Dequant: `w[j] = d × (nibble[j] − 8)`.
 //!
 //! - **Q8_0** (GGML type 8): 32 weights per block, 34 bytes total.
@@ -40,7 +42,12 @@ pub const BLOCK_Q8_0_BYTES: usize = 34;
 /// Layout (18 bytes):
 /// - `d`: FP16 block scale.
 /// - `qs`: 16 bytes — 32 × 4-bit quantized weights, 2 per byte.
-///   Even index `j` → low nibble `qs[j/2] & 0x0F`; odd → high nibble `qs[j/2] >> 4`.
+///
+/// **llama.cpp-compatible byte ordering** (`dequantize_row_q4_0` in `ggml-quants.c`):
+/// - Elements 0..16  come from the **lower nibbles** of bytes 0..16 (`qs[j] & 0x0F`).
+/// - Elements 16..32 come from the **upper nibbles** of bytes 0..16 (`qs[j] >> 4`).
+///
+/// This is a "lo-hi split" layout — NOT an interleaved (even/odd) layout.
 ///
 /// Dequant: `w[j] = d × (nibble[j] as f32 − 8.0)` — symmetric around zero.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -48,7 +55,7 @@ pub const BLOCK_Q8_0_BYTES: usize = 34;
 pub struct BlockQ4_0 {
     /// Block scale (FP16).
     pub d: f16,
-    /// 32 × 4-bit quantized weights, 2 per byte (low nibble = even index).
+    /// 16 bytes: byte `j` packs `elements[j]` in lower nibble and `elements[j+16]` in upper nibble.
     pub qs: [u8; 16],
 }
 
@@ -56,6 +63,12 @@ const _: () = assert!(std::mem::size_of::<BlockQ4_0>() == BLOCK_Q4_0_BYTES);
 
 impl BlockQ4_0 {
     /// Dequantize a slice of Q4_0 blocks into f32 output.
+    ///
+    /// Uses the llama.cpp-compatible byte layout:
+    /// - Elements 0..QK_Q4_0/2  ← lower nibbles of bytes 0..QK_Q4_0/2
+    /// - Elements QK_Q4_0/2..QK_Q4_0 ← upper nibbles of bytes 0..QK_Q4_0/2
+    ///
+    /// This matches `dequantize_row_q4_0` in `ggml-quants.c`.
     ///
     /// `output` must have length >= `blocks.len() * QK_Q4_0`.
     pub fn dequant(blocks: &[Self], output: &mut [f32]) -> BonsaiResult<()> {
@@ -69,16 +82,17 @@ impl BlockQ4_0 {
                 ),
             });
         }
+        let half = QK_Q4_0 / 2; // = 16
         for (block_idx, block) in blocks.iter().enumerate() {
             let d = block.d.to_f32();
             let base = block_idx * QK_Q4_0;
-            for j in 0..QK_Q4_0 {
-                let nibble = if j % 2 == 0 {
-                    (block.qs[j / 2] & 0x0F) as f32
-                } else {
-                    ((block.qs[j / 2] >> 4) & 0x0F) as f32
-                };
-                output[base + j] = d * (nibble - 8.0);
+            for j in 0..half {
+                // Lower nibble of byte j → element j.
+                let x0 = (block.qs[j] & 0x0F) as f32 - 8.0;
+                // Upper nibble of byte j → element j + half.
+                let x1 = ((block.qs[j] >> 4) & 0x0F) as f32 - 8.0;
+                output[base + j] = d * x0;
+                output[base + j + half] = d * x1;
             }
         }
         Ok(())
@@ -131,16 +145,17 @@ impl BlockQ4_0 {
                 1.0 / scale_actual
             };
 
+            let half = QK_Q4_0 / 2; // = 16
             let mut qs = [0u8; 16];
-            for j in 0..QK_Q4_0 {
-                let v = chunk[j];
-                // Shift by 8 to make unsigned 0..15; clamp to 4-bit range.
-                let nibble = (v * inv_scale + 8.5).clamp(0.0, 15.0) as u8;
-                if j % 2 == 0 {
-                    qs[j / 2] = nibble & 0x0F;
-                } else {
-                    qs[j / 2] |= (nibble & 0x0F) << 4;
-                }
+            for j in 0..half {
+                let v0 = chunk[j];
+                let v1 = chunk[j + half];
+                // Lower nibble ← element j, upper nibble ← element j + half.
+                // This mirrors llama.cpp `quantize_row_q4_0`:
+                //   qs[j] = nibble(v0) | (nibble(v1) << 4)
+                let n0 = (v0 * inv_scale + 8.5).clamp(0.0, 15.0) as u8 & 0x0F;
+                let n1 = (v1 * inv_scale + 8.5).clamp(0.0, 15.0) as u8 & 0x0F;
+                qs[j] = n0 | (n1 << 4);
             }
 
             blocks.push(BlockQ4_0 { d, qs });
@@ -180,17 +195,18 @@ impl BlockQ4_0 {
 
     /// Dequantize this single block into a 32-element f32 buffer.
     ///
+    /// Uses the llama.cpp-compatible byte layout (same as [`Self::dequant`]):
+    /// elements 0..16 from lower nibbles, elements 16..32 from upper nibbles.
+    ///
     /// Used by the GEMV kernel to avoid heap allocation on the hot path.
     #[inline]
     pub fn dequant_to_buf(&self, buf: &mut [f32; 32]) {
         let d = self.d.to_f32();
-        for (j, out) in buf.iter_mut().enumerate() {
-            let nibble = if j % 2 == 0 {
-                (self.qs[j / 2] & 0x0F) as f32
-            } else {
-                ((self.qs[j / 2] >> 4) & 0x0F) as f32
-            };
-            *out = d * (nibble - 8.0);
+        for j in 0..16_usize {
+            // Lower nibble of byte j → element j.
+            buf[j] = d * ((self.qs[j] & 0x0F) as f32 - 8.0);
+            // Upper nibble of byte j → element j + 16.
+            buf[j + 16] = d * (((self.qs[j] >> 4) & 0x0F) as f32 - 8.0);
         }
     }
 }

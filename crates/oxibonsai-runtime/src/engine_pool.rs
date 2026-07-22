@@ -255,7 +255,7 @@ pub fn default_cpu_pool_size() -> usize {
 ///   [`default_cpu_pool_size`].
 ///
 /// Pure and unit-testable. The GPU comparison is gated behind the GPU-enabling
-/// features (`metal` / `native-cuda`) because [`oxibonsai_kernels::KernelTier::Gpu`]
+/// features (`metal` / `native-cuda`) because `oxibonsai_kernels::KernelTier::Gpu`
 /// only exists when one of them is compiled in; non-GPU builds always take the
 /// CPU branch.
 pub fn resolve_pool_size(requested: Option<usize>, tier: oxibonsai_kernels::KernelTier) -> usize {

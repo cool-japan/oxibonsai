@@ -18,6 +18,7 @@ All flags and defaults below are taken directly from the source
 - [`oxibonsai` — global usage](#oxibonsai--global-usage)
   - [`run`](#run)
   - [`image`](#image)
+  - [`repl`](#repl)
   - [`chat`](#chat)
   - [`serve`](#serve)
   - [`info`](#info)
@@ -25,6 +26,7 @@ All flags and defaults below are taken directly from the source
   - [`quantize`](#quantize)
   - [`validate`](#validate)
   - [`convert`](#convert)
+  - [`eval`](#eval)
   - [`tokenizer`](#tokenizer)
 - [`oxibonsai-serve` — standalone server](#oxibonsai-serve--standalone-server)
 - [Environment variables](#environment-variables)
@@ -93,7 +95,6 @@ text-encoder → DiT → VAE → PNG. The pipeline runs end-to-end in pure Rust.
 | `--steps <N>` | | usize | `4` | Number of Euler (flow-matching) sampler steps. |
 | `--width <N>` | | usize | `512` | Image width in pixels. |
 | `--height <N>` | | usize | `512` | Image height in pixels. |
-| `--guidance <F>` | | f32 | `1.0` | Guidance scale. |
 | `--dit <PATH>` | | string | env `OXI_DIT_GGUF`, else `/tmp/parity.gguf` | DiT (FLUX.2-Klein ternary) GGUF path. |
 | `--vae <PATH>` | | string | env `OXI_VAE_WEIGHTS`, else `/tmp/bonsai_golden/vae/weights` | VAE decoder weights. Accepts either a `.safetensors` file or a directory of `.npy` tensors (see note below). |
 | `--te <PATH>` | | string | env `OXI_TE_4BIT`, else env `OXI_TE_WEIGHTS`, else `/tmp/bonsai_golden/te/weights` | Text-encoder weights: a 4-bit MLX `model.safetensors` file or an f32 `.npy` directory. A path ending in `.safetensors` selects the 4-bit MLX loader; anything else is treated as an `.npy` directory. |
@@ -138,7 +139,6 @@ Model paths resolve exactly like [`image`](#image) (flag → env → default).
 | `--steps <N>` | usize | `4` | Initial sampler steps (`:steps` / `:fast` / `:hq`). |
 | `--width <N>` | usize | `512` | Initial width in pixels. |
 | `--height <N>` | usize | `512` | Initial height in pixels. |
-| `--guidance <F>` | f32 | `1.0` | Guidance scale. |
 | `--cpu-te` | flag | off | Run the text-encoder GEMM on the CPU instead of the Metal GPU. |
 | `--dit <PATH>` | string | env `OXI_DIT_GGUF`, else `/tmp/parity.gguf` | DiT GGUF path. |
 | `--vae <PATH>` | string | env `OXI_VAE_WEIGHTS` | VAE weights (file or `.npy` dir). |
@@ -151,7 +151,7 @@ Inside the REPL, a bare line is a prompt; `:`-prefixed lines are commands:
 |---------|--------|
 | `:fast` | Preset: 2 steps, 384×384 (snappy preview). |
 | `:hq` | Preset: 8 steps, 512×512 (higher quality). |
-| `:steps N` / `:seed N` / `:guidance G` | Set a single parameter. |
+| `:steps N` / `:seed N` | Set a single parameter. |
 | `:size WxH` | Set output size (or `:size N` for square). |
 | `:out PATH` | Write to `PATH` (no arg → auto `oxibonsai-repl-NNN.png`). |
 | `:open on\|off` | Open each image in a viewer (non-inline terminals). |
@@ -212,15 +212,33 @@ subcommand is gated behind the `server` build feature.
 | `--max-seq-len <N>` | | usize | `4096` | Maximum sequence length. |
 | `--tokenizer <PATH>` | | string | env `OXI_TOKENIZER`, else auto-detect | Path to `tokenizer.json`. |
 | `--pool-size <N>` | | usize | env `OXIBONSAI_ENGINE_POOL_SIZE`, else `min(4, CPU cores)` | Number of engine replicas. Auto-clamped to `1` on the GPU/Metal tier. Replicas share one token-embedding table, so each extra replica only costs a KV cache. |
+| `--bearer-token <TOK>` | | string | env `OXIBONSAI_BEARER_TOKEN` | Require this bearer token (constant-time comparison) on every endpoint except `/health` and `/metrics` — this also gates the mutating `/admin/*` endpoints. When unset, the server logs an explicit warning and runs unauthenticated; only safe behind `--host 127.0.0.1` or another trusted network boundary. |
+| `--max-concurrent-requests <N>` | | usize | `32` | Maximum number of requests admitted concurrently; requests beyond this bound are rejected with `503` instead of queuing unbounded. |
+| `--request-timeout-ms <N>` | | u64 | `60000` | Per-request timeout in milliseconds before a request is aborted with `408`. |
+| `--rag` | | bool | `false` | Also mount the RAG HTTP API (`/rag/index`, `/rag/query`, `/rag/stats`) alongside the OpenAI-compatible endpoints. Requires building with the `rag` Cargo feature. |
 
 ```bash
 oxibonsai serve \
   --model models/Ternary-Bonsai-1.7B.gguf \
   --host 127.0.0.1 --port 8080
+
+# With bearer-token auth + admission limits (production hardening):
+oxibonsai serve --model models/Ternary-Bonsai-1.7B.gguf \
+  --bearer-token "$(openssl rand -hex 32)" \
+  --max-concurrent-requests 32 --request-timeout-ms 60000
+
+# With RAG endpoints mounted (requires --features rag):
+oxibonsai serve --model models/Ternary-Bonsai-1.7B.gguf --rag
 ```
 
-> For the standalone server binary (richer config, TOML layering, metrics,
-> bearer-token auth) see [`oxibonsai-serve`](#oxibonsai-serve--standalone-server).
+> `oxibonsai serve` mounts the same bearer-auth + admission-control hardening
+> shape as the standalone `oxibonsai-serve` binary (`src/cli/admission.rs`).
+> For a richer, TOML-file-layered configuration surface (`[limits]`,
+> `[auth]`, `[observability]`, etc. — useful when you
+> want config-as-a-file rather than flags) see
+> [`oxibonsai-serve`](#oxibonsai-serve--standalone-server). See also the
+> [deployment guide](DEPLOYMENT.md) for reverse-proxy/TLS and production
+> hardening guidance shared by both binaries.
 
 ---
 
@@ -261,15 +279,19 @@ oxibonsai benchmark --tokens 200 --warmup 20
 
 ### `quantize`
 
-Quantize a GGUF model to a lower-precision format. This command currently
-**simulates** the operation: it validates the format string and reports the
-estimated output size and compression ratio.
+Quantize a GGUF model to a lower-precision format. This command performs the
+**real** conversion end-to-end: it mmaps and parses the input GGUF, dequantizes
+every source tensor to f32, re-encodes through the same
+`oxibonsai_model::export::export_to_gguf` pipeline used by `oxibonsai convert`,
+and writes the actual output bytes to `--output`. Reported tensor counts,
+output size, and compression ratio are measured from the real write, not
+estimated.
 
 | Flag | Short | Type | Default | Help |
 |------|-------|------|---------|------|
 | `--input <PATH>` | | string | *(required)* | Path to the input GGUF model file. |
 | `--output <PATH>` | | string | *(required)* | Destination path for the quantized file. |
-| `--format <FMT>` | | string | `q1_0` | Target quantization format. Known: `q1_0`, `q2_k`, `q4_0`, `q4_1`, `q8_0`, `f16`, `f32` (an unknown value warns but proceeds). |
+| `--format <FMT>` | | string | `q1_0` | Target quantization format. Supported: `f32`, `q1_0`/`q1_0_g128`, `tq2_0_g128`/`ternary`, `fp8_e4m3`, `fp8_e5m2`, `q4_0`, `q8_0`, `q4_k`, `q5_k`, `q6_k`. An unrecognized value (e.g. `q2_k`, `q4_1`, `f16` output — not yet supported as export targets) fails fast with an error and no file is written. |
 
 ```bash
 oxibonsai quantize --input models/model-f16.gguf --output models/model-q1_0.gguf --format q1_0
@@ -315,6 +337,38 @@ oxibonsai convert \
 oxibonsai convert --onnx \
   --from path/to/model.onnx \
   --to models/Ternary-Bonsai-1.7B.gguf
+```
+
+---
+
+### `eval`
+
+Evaluate a model's generation quality (ROUGE-1/2/L) against a JSONL dataset
+of `{"input": <prompt>, "expected_output": <reference>}` examples. Gated
+behind the `eval` Cargo feature (`cargo build --features eval`; not part of
+the default feature set).
+
+The dataset is loaded and validated **before** the model is opened, so a
+malformed `--dataset` fails fast without paying the GGUF load cost. Each
+example is generated greedily (temperature 0) up to `--max-tokens`, then the
+whole corpus is scored with `oxibonsai_eval::CorpusRouge`.
+
+| Flag | Short | Type | Default | Help |
+|------|-------|------|---------|------|
+| `--model <PATH>` | `-m` | string | env `OXI_MODEL` | Path to the GGUF model file. Required unless `OXI_MODEL` is set. |
+| `--dataset <PATH>` | | string | *(required)* | JSONL dataset path: one `{"input": "...", "expected_output": "..."}` object per line. |
+| `--limit <N>` | | usize | all | Only evaluate the first N examples. |
+| `--max-tokens <N>` | | usize | `128` | Maximum tokens generated per example. |
+| `--max-seq-len <N>` | | usize | `4096` | Maximum sequence length (prompt + generated). |
+| `--tokenizer <PATH>` | | string | env `OXI_TOKENIZER`, else auto-detect | Path to `tokenizer.json`. |
+| `--report-json <PATH>` | | string | — | Also write the report as JSON to this path. |
+| `--report-markdown <PATH>` | | string | — | Also write the report as Markdown to this path. |
+
+```bash
+oxibonsai eval --model models/Ternary-Bonsai-1.7B.gguf \
+  --dataset eval_data.jsonl \
+  --max-tokens 128 \
+  --report-json report.json --report-markdown report.md
 ```
 
 ---

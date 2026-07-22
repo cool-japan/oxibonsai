@@ -165,13 +165,6 @@ fn handle_command(
             }
             None => eprintln!("  usage: :seed N"),
         },
-        "guidance" => match arg.and_then(|a| a.parse().ok()) {
-            Some(v) => {
-                params.guidance = v;
-                println!("  guidance = {v}");
-            }
-            None => eprintln!("  usage: :guidance G"),
-        },
         "size" => set_size(arg, params),
         "fast" => {
             params.steps = 2;
@@ -262,7 +255,6 @@ fn print_help() {
   :steps N        set sampler steps
   :seed N         set RNG seed
   :size WxH       set output size (or :size N for square)
-  :guidance G     set guidance scale
   :out PATH       write to PATH (no arg → auto oxibonsai-repl-NNN.png)
   :open on|off    open each image in a viewer (non-inline terminals)
   :show           print current settings
@@ -274,12 +266,11 @@ fn print_help() {
 /// Print the current render settings.
 fn print_settings(params: &RenderParams, out_template: &Option<String>, open_fallback: bool) {
     println!(
-        "  steps={}  seed={}  size={}x{}  guidance={}  out={}  open={}",
+        "  steps={}  seed={}  size={}x{}  out={}  open={}",
         params.steps,
         params.seed,
         params.width,
         params.height,
-        params.guidance,
         out_template.as_deref().unwrap_or("auto"),
         if open_fallback { "on" } else { "off" },
     );

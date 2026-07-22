@@ -488,6 +488,11 @@ async fn test_extended_endpoint_with_n_completions() {
     assert_eq!(choices[1]["index"], 1);
 }
 
+/// Regression test for finding 30: real per-token logprobs are not available
+/// at this layer (`generate_with_seed` does not expose per-step logits), so
+/// the handler must honestly report `logprobs: null` — mirroring
+/// `completions.rs` — instead of fabricating a non-null-but-empty
+/// `{"content": []}` that looks like a successful-but-token-less response.
 #[tokio::test]
 async fn test_extended_endpoint_with_logprobs() {
     let app = test_router();
@@ -515,11 +520,23 @@ async fn test_extended_endpoint_with_logprobs() {
 
     let choices = json["choices"].as_array().expect("choices");
     assert!(!choices.is_empty());
-    // logprobs field should be present when requested
-    assert!(
-        !choices[0]["logprobs"].is_null(),
-        "logprobs should be present when requested"
-    );
+    // Wave-2: real per-token logprobs are now captured via the engine's
+    // logits-capturing variant and returned in the OpenAI shape
+    // (`logprobs.content` is an array of {token, logprob, top_logprobs}).
+    let content = choices[0]["logprobs"]["content"]
+        .as_array()
+        .expect("logprobs.content must be an array");
+    for entry in content {
+        assert!(entry["token"].is_string(), "each entry has a token string");
+        assert!(
+            entry["logprob"].is_number(),
+            "each entry has a numeric logprob"
+        );
+        assert!(
+            entry["top_logprobs"].is_array(),
+            "each entry has a top_logprobs array"
+        );
+    }
 }
 
 #[tokio::test]
@@ -540,6 +557,179 @@ async fn test_extended_endpoint_with_stop_sequences() {
 
     let resp = app.oneshot(req).await.expect("send request");
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// ── Regression: real loaded-model id (finding serve-api-04) ──────────────────
+
+/// The response `model` field and the `system_fingerprint` must reflect the
+/// actually-loaded model (`Qwen3Config::tiny_test()` names it
+/// `"Bonsai-Tiny-Test"`), not the hardcoded `"bonsai-8b"` literal.
+#[tokio::test]
+async fn test_extended_endpoint_reports_real_model_id() {
+    let app = test_router();
+    let body = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": "What model are you?"}
+        ],
+        "max_tokens": 3
+    });
+
+    let req = Request::post("/v1/chat/completions/extended")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+        .expect("build request");
+
+    let resp = app.oneshot(req).await.expect("send request");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: serde_json::Value = serde_json::from_slice(&bytes).expect("parse JSON");
+
+    assert_eq!(
+        json["model"], "Bonsai-Tiny-Test",
+        "model field must reflect the real loaded model, not a hardcoded literal, got: {json}"
+    );
+    assert_ne!(
+        json["model"], "bonsai-8b",
+        "model field must not be the old hardcoded literal"
+    );
+}
+
+// ── Regression: stream: true (finding serve-api-05) ───────────────────────────
+
+/// `stream: true` with no tools/n/json-mode must produce a real SSE response
+/// (not a silently-ignored buffered JSON one): `text/event-stream`
+/// content-type, `data:` chunks, and a terminal `[DONE]` marker.
+#[tokio::test]
+async fn test_extended_endpoint_stream_returns_sse() {
+    let app = test_router();
+    let body = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": "Stream this"}
+        ],
+        "max_tokens": 5,
+        "stream": true
+    });
+
+    let req = Request::post("/v1/chat/completions/extended")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+        .expect("build request");
+
+    let resp = app.oneshot(req).await.expect("send request");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "stream:true must respond with SSE, got content-type: {content_type}"
+    );
+
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let body_str = String::from_utf8(bytes.to_vec()).expect("SSE body must be UTF-8");
+
+    assert!(
+        body_str.contains("chat.completion.chunk"),
+        "SSE body should contain chat.completion.chunk events, got: {body_str}"
+    );
+    assert!(
+        body_str.contains("\"role\":\"assistant\""),
+        "first SSE event should carry the assistant role delta, got: {body_str}"
+    );
+    assert!(
+        body_str.trim_end().ends_with("data: [DONE]"),
+        "SSE stream must terminate with a [DONE] marker, got: {body_str}"
+    );
+    assert!(
+        body_str.contains("\"finish_reason\":\"stop\"")
+            || body_str.contains("\"finish_reason\":\"length\""),
+        "SSE stream must carry a real finish_reason, got: {body_str}"
+    );
+}
+
+/// `stream: true` combined with `tools` must be honestly rejected with `400`
+/// (tool-call parsing needs the complete text) rather than silently ignoring
+/// either field.
+#[tokio::test]
+async fn test_extended_endpoint_stream_with_tools_rejected() {
+    let app = test_router();
+    let body = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": "Call a tool"}
+        ],
+        "max_tokens": 5,
+        "stream": true,
+        "tools": [
+            {"type": "function", "function": {"name": "get_weather"}}
+        ]
+    });
+
+    let req = Request::post("/v1/chat/completions/extended")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+        .expect("build request");
+
+    let resp = app.oneshot(req).await.expect("send request");
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "stream:true + tools must be rejected honestly, not silently ignored"
+    );
+}
+
+/// `stream: true` combined with `n > 1` must be honestly rejected with `400`.
+#[tokio::test]
+async fn test_extended_endpoint_stream_with_n_rejected() {
+    let app = test_router();
+    let body = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": "Multiple please"}
+        ],
+        "max_tokens": 5,
+        "stream": true,
+        "n": 2
+    });
+
+    let req = Request::post("/v1/chat/completions/extended")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+        .expect("build request");
+
+    let resp = app.oneshot(req).await.expect("send request");
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// `stream: true` combined with a JSON-mode `response_format` must be
+/// honestly rejected with `400` (JSON extraction/wrapping needs the complete
+/// text).
+#[tokio::test]
+async fn test_extended_endpoint_stream_with_json_mode_rejected() {
+    let app = test_router();
+    let body = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": "Return JSON"}
+        ],
+        "max_tokens": 5,
+        "stream": true,
+        "response_format": {"type": "json_object"}
+    });
+
+    let req = Request::post("/v1/chat/completions/extended")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+        .expect("build request");
+
+    let resp = app.oneshot(req).await.expect("send request");
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

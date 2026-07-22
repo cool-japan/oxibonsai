@@ -1,8 +1,8 @@
 # oxibonsai-kernels TODO
 
-> 1-bit + ternary quantized compute kernels with SIMD dispatch, parallelism, and GPU backends
-> Version 0.2.2 — 675 tests passing
-> Last updated: 2026-06-06
+> 1-bit + ternary + standard-quant (Q4_0/Q8_0) + K-quant (Q2_K–Q8_K) compute kernels with SIMD dispatch, parallelism, and GPU backends
+> Version 0.2.3 — 508 tests passing
+> Last updated: 2026-07-21
 
 ## Status: Stable (mature, complete)
 
@@ -57,6 +57,19 @@ fused Metal TQ2 full-forward, and native CUDA NVRTC paths all shipped.
 - [x] **Phase 12 — Native CUDA NVRTC backend** (`cuda_full_layer.rs`, `cuda_graph/`, `cuda_kernels.rs`, `cuda_prefill*.rs`, `cuda_attn_kernels.rs`) with CUDA Graph execution
 - [x] **Phase 13.x — Fused Metal TQ2 full-forward** (`metal_full_layer/`) — single command buffer, ~50 tok/s on 1.7B ternary (~13× speedup)
 - [x] Runtime NVRTC kernel sources (`kernel_sources/`: attention, decode, decode_ternary, prefill, utility, archive)
+
+## Standard-Quant (Q4_0/Q8_0) + K-quant (Q2_K–Q8_K) Kernels
+
+- [x] Q4_0/Q8_0 tiered CPU GEMV — scalar reference + AVX2 + AVX-512 SIMD tiers via `StandardQuantKernel` (`simd_q_std_avx2.rs`, `simd_q_std_avx512.rs`), Rayon row-parallel (`gemv_q4_0_par` / `gemv_q8_0_par` in `parallel.rs`)
+- [x] NEON GEMV kernels for Q4_0/Q8_0 (`simd_q_std_neon.rs`: `gemv_q4_0_neon` / `gemv_q8_0_neon`)
+- [x] K-quant (Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K) scalar GEMV kernels (`gemv_q2k.rs`, `gemv_q3k.rs`, `gemv_q4k.rs`, `gemv_q5k.rs`, `gemv_q6k.rs`, `gemv_q8k.rs`) sharing one Rayon row-parallel driver (`gemv_kquant_row_parallel` in `parallel.rs`)
+- [x] Metal GEMV dispatch for Q4_0/Q8_0 (`gpu_backend/metal_q_std_kernels.rs`) and K-quant (`gpu_backend/metal_k_quant_kernels.rs`)
+- [x] Native CUDA per-position GEMV kernels for Q4_0/Q8_0 (`gpu_backend/cuda_q_std_kernels.rs`) and K-quant (`gpu_backend/cuda_k_quant_kernels.rs`)
+- [ ] CUDA batched-prefill kernels also exist for Q4_0/Q8_0 (`cuda_q_std_prefill*.rs`), K-quant (`cuda_k_quant_prefill*.rs`), and FP8 (`cuda_fp8_prefill*.rs`), but are **intentionally not called by default**: the `oxibonsai-model` caller gates them behind a split-KV-cache guard (GPU-private KV cache not readable by the CPU decode path) and uses the sequential per-position path instead — same class of gap as the Q1/ternary cap-of-8 issue below, and not the kind of thing hardware access alone resolves (needs KV-cache-unification design work first). Do not check this off until that lands.
+
+## Hardening
+
+- [x] `AlignedBuffer` / `AlignedBlocks` allocation-size overflow guards — `checked_mul` + explicit panic instead of a silent wrapping allocation (`aligned.rs`)
 
 ## Deferred (CUDA hardware required)
 

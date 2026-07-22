@@ -6,7 +6,8 @@ use super::super::metal_graph::{MetalGraph, MetalGraphError, MetalWeightHandle};
 use std::sync::Arc;
 
 use super::types::{
-    CachedLayerWeights, CachedModelWeights, FullForwardLayerParams, FullForwardLayerParamsTernary,
+    CachedLayerWeights, CachedModelWeights, CachedQ1Weights, CachedTernaryWeights,
+    FullForwardLayerParams, FullForwardLayerParamsTernary,
 };
 
 /// Attempt to run the FFN phase via direct Metal dispatch.
@@ -444,31 +445,24 @@ pub fn build_cached_weights(
     }
     let final_norm = graph.get_or_upload_f32_weight(final_norm_handle, final_norm_bytes)?;
     let lm_head = graph.get_or_upload_q1_weight_soa(lm_head_handle, lm_head_bytes)?;
-    Ok(CachedModelWeights {
+    Ok(CachedModelWeights::Q1(CachedQ1Weights {
         layers,
         final_norm,
         lm_head,
-        // Q1 path: ternary fields are unused.
-        ternary_qkv_concats: Vec::new(),
-        ternary_attn_proj_bytes: Vec::new(),
-        ternary_gate_bytes: Vec::new(),
-        ternary_up_bytes: Vec::new(),
-        ternary_down_bytes: Vec::new(),
-        ternary_lm_head_bytes: Vec::new(),
-        ternary_lm_head_out_features: 0,
-    })
+    }))
 }
-/// Build a `CachedModelWeights` shell for ternary (TQ2_0_g128) models.
+/// Build a [`CachedModelWeights::Ternary`] cache for ternary (TQ2_0_g128) models.
 ///
-/// Ternary models do **not** use the Q1 `layers` / `final_norm` / `lm_head`
-/// handles at runtime — those fields exist on the struct only because it is
-/// shared with the Q1 path.  This constructor avoids calling
-/// `get_or_upload_q1_weight_soa` (which enforces 18-byte block alignment) by
-/// uploading trivial f32 placeholders under dedicated handle IDs in the
-/// ternary-reserved namespace (`4_000_000` / `4_000_001`).
+/// The real ternary weights are stored as raw byte blobs in the
+/// [`CachedTernaryWeights`] fields and rebuilt into `FullForwardLayerParamsTernary`
+/// structs on every decode call. Unlike the Q1 builder this uploads nothing to
+/// the GPU up front — the TQ2 kernel-side weight cache is populated lazily on the
+/// first dispatch — so no Q1 18-byte block-alignment constraint applies and no
+/// placeholder handles are needed.
 ///
-/// The real ternary weights are stored in the `ternary_*` Vec fields and
-/// rebuilt into `FullForwardLayerParamsTernary` structs on every decode call.
+/// The `Result` return type is retained for symmetry with
+/// [`build_cached_weights`] (and its call site's `?`); construction itself is
+/// infallible.
 pub fn build_cached_weights_ternary_only(
     ternary_qkv_concats: Vec<Vec<u8>>,
     ternary_attn_proj_bytes: Vec<Vec<u8>>,
@@ -478,24 +472,15 @@ pub fn build_cached_weights_ternary_only(
     ternary_lm_head_bytes: Vec<u8>,
     ternary_lm_head_out_features: usize,
 ) -> Result<CachedModelWeights, MetalGraphError> {
-    let graph = MetalGraph::global()?;
-    // Trivial f32 placeholder uploads — no block-size constraint, never used
-    // for actual inference on the ternary path.
-    let dummy_f32 = [0.0_f32];
-    let final_norm = graph.get_or_upload_f32_weight(4_000_000u64, &dummy_f32)?;
-    let lm_head_placeholder = graph.get_or_upload_f32_weight(4_000_001u64, &dummy_f32)?;
-    Ok(CachedModelWeights {
-        layers: Vec::new(),
-        final_norm,
-        lm_head: lm_head_placeholder,
-        ternary_qkv_concats,
-        ternary_attn_proj_bytes,
-        ternary_gate_bytes,
-        ternary_up_bytes,
-        ternary_down_bytes,
-        ternary_lm_head_bytes,
-        ternary_lm_head_out_features,
-    })
+    Ok(CachedModelWeights::Ternary(CachedTernaryWeights {
+        qkv_concats: ternary_qkv_concats,
+        attn_proj_bytes: ternary_attn_proj_bytes,
+        gate_bytes: ternary_gate_bytes,
+        up_bytes: ternary_up_bytes,
+        down_bytes: ternary_down_bytes,
+        lm_head_bytes: ternary_lm_head_bytes,
+        lm_head_out_features: ternary_lm_head_out_features,
+    }))
 }
 /// Like `try_metal_full_forward`, but uses pre-cached GPU weight handles.
 /// Eliminates ALL per-token weight lookup, upload, and allocation overhead.
@@ -518,9 +503,19 @@ pub fn try_metal_full_forward_cached(
     logits_out: Option<&mut Vec<f32>>,
     greedy_token_id_out: Option<&mut u32>,
 ) -> Result<(), MetalGraphError> {
-    let n_layers = cached.layers.len();
+    let q1 = match cached {
+        CachedModelWeights::Q1(q1) => q1,
+        CachedModelWeights::Ternary(_) => {
+            return Err(MetalGraphError::EncodingFailed(
+                "try_metal_full_forward_cached invoked with a ternary weight cache; \
+                 use the ternary forward path"
+                    .to_string(),
+            ));
+        }
+    };
+    let n_layers = q1.layers.len();
     let graph = MetalGraph::global()?;
-    let weight_refs: Vec<_> = cached
+    let weight_refs: Vec<_> = q1
         .layers
         .iter()
         .map(|lw| {
@@ -550,9 +545,9 @@ pub fn try_metal_full_forward_cached(
         head_dim,
         eps,
         max_seq_len,
-        Some(&cached.final_norm),
+        Some(&q1.final_norm),
         final_norm_eps,
-        Some(&cached.lm_head),
+        Some(&q1.lm_head),
         lm_head_out_features,
         logits_out,
         greedy_token_id_out,

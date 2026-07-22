@@ -191,6 +191,11 @@ pub struct BlockTable {
     blocks: Vec<Vec<usize>>,
     /// Number of transformer layers.
     num_layers: usize,
+    /// Highest `token_pos + 1` actually written via [`PagedKvCache::write_kv`]
+    /// across any layer. Distinct from [`token_capacity`](Self::token_capacity),
+    /// which reports *allocated* (block-rounded) capacity, not the number of
+    /// positions that hold real data.
+    written_len: usize,
 }
 
 impl BlockTable {
@@ -200,7 +205,15 @@ impl BlockTable {
             block_size,
             blocks: vec![Vec::new(); num_layers],
             num_layers,
+            written_len: 0,
         }
+    }
+
+    /// Record that `token_pos` has been written to, extending the table's
+    /// externally-visible write cursor (see [`PagedKvCache::sequence_length`])
+    /// if `token_pos` is the highest position written so far.
+    fn record_write(&mut self, token_pos: usize) {
+        self.written_len = self.written_len.max(token_pos + 1);
     }
 
     /// Append a newly-allocated physical page to `layer`'s block list.
@@ -230,6 +243,10 @@ impl BlockTable {
     }
 
     /// Total token capacity (may include unused trailing slots) for `layer`.
+    ///
+    /// This is the *allocated* capacity rounded up to `block_size`, **not**
+    /// the number of positions actually written — use
+    /// [`PagedKvCache::sequence_length`] for the real write cursor.
     pub fn token_capacity(&self, layer: usize) -> usize {
         self.num_blocks(layer) * self.block_size
     }
@@ -477,14 +494,17 @@ impl PagedKvCache {
         let phys = {
             let table = self
                 .sequences
-                .get(&seq_id)
+                .get_mut(&seq_id)
                 .ok_or(PagedKvError::SequenceNotFound(seq_id))?;
-            table
-                .get_block(layer, logical_block)
-                .ok_or(PagedKvError::PositionOutOfRange {
-                    seq_id,
-                    pos: token_pos,
-                })?
+            let phys =
+                table
+                    .get_block(layer, logical_block)
+                    .ok_or(PagedKvError::PositionOutOfRange {
+                        seq_id,
+                        pos: token_pos,
+                    })?;
+            table.record_write(token_pos);
+            phys
         };
 
         let offset = slot_in_block * slot_len;
@@ -545,13 +565,13 @@ impl PagedKvCache {
         self.pool.utilization()
     }
 
-    /// Number of token positions written to `seq_id` (across **all** layers,
-    /// using layer 0 as the canonical length).
+    /// Number of token positions actually written to `seq_id` via
+    /// [`write_kv`](Self::write_kv) (the highest `token_pos + 1` seen across
+    /// any layer), **not** the block-rounded allocated capacity.
     ///
-    /// Returns `0` for unknown sequences.
+    /// Returns `0` for unknown sequences or sequences that have not had any
+    /// tokens written yet.
     pub fn sequence_length(&self, seq_id: u64) -> usize {
-        self.sequences
-            .get(&seq_id)
-            .map_or(0, |t| t.token_capacity(0))
+        self.sequences.get(&seq_id).map_or(0, |t| t.written_len)
     }
 }

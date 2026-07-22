@@ -37,6 +37,13 @@ const _: () =
 const _: () =
     assert!(std::mem::size_of::<oxibonsai_core::BlockQ8_0>() == oxibonsai_core::BLOCK_Q8_0_BYTES,);
 
+#[cfg(all(feature = "metal", target_os = "macos"))]
+const _: () =
+    assert!(std::mem::size_of::<oxibonsai_core::BlockQ4_0>() == oxibonsai_core::BLOCK_Q4_0_BYTES,);
+#[cfg(all(feature = "metal", target_os = "macos"))]
+const _: () =
+    assert!(std::mem::size_of::<oxibonsai_core::BlockQ8_0>() == oxibonsai_core::BLOCK_Q8_0_BYTES,);
+
 // ---------------------------------------------------------------------------
 // LinearQ4_0
 // ---------------------------------------------------------------------------
@@ -112,7 +119,8 @@ impl<'a> LinearQ4_0<'a> {
     /// When the `native-cuda` feature is enabled and a CUDA device is present
     /// the NVRTC Q4_0 GEMV kernel is tried first; any failure other than
     /// "no CUDA device" is logged as a warning and the CPU scalar path runs
-    /// instead.
+    /// instead. When the `metal` feature is enabled on macOS instead, the
+    /// Metal Q4_0 GEMV kernel is tried first with the same fallback contract.
     pub fn forward(&self, input: &[f32], output: &mut [f32]) -> ModelResult<()> {
         #[cfg(all(
             feature = "native-cuda",
@@ -145,6 +153,28 @@ impl<'a> LinearQ4_0<'a> {
                         );
                     }
                 }
+            }
+        }
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            // SAFETY: BlockQ4_0 is #[repr(C)] with size BLOCK_Q4_0_BYTES (= 18).
+            // The compile-time assert above and the one in oxibonsai_core::quant_std
+            // both guarantee this layout.
+            let raw = unsafe {
+                std::slice::from_raw_parts(
+                    self.blocks.as_ptr().cast::<u8>(),
+                    self.blocks.len() * oxibonsai_core::BLOCK_Q4_0_BYTES,
+                )
+            };
+            match oxibonsai_kernels::metal_gemv_q4_0(
+                raw,
+                input,
+                output,
+                self.out_features,
+                self.in_features,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(e) => warn_metal_gemv_fallback("Q4_0", &e),
             }
         }
         gemv_q4_0(
@@ -247,7 +277,8 @@ impl<'a> LinearQ8_0<'a> {
     /// When the `native-cuda` feature is enabled and a CUDA device is present
     /// the NVRTC Q8_0 GEMV kernel is tried first; any failure other than
     /// "no CUDA device" is logged as a warning and the CPU scalar path runs
-    /// instead.
+    /// instead. When the `metal` feature is enabled on macOS instead, the
+    /// Metal Q8_0 GEMV kernel is tried first with the same fallback contract.
     pub fn forward(&self, input: &[f32], output: &mut [f32]) -> ModelResult<()> {
         #[cfg(all(
             feature = "native-cuda",
@@ -282,6 +313,28 @@ impl<'a> LinearQ8_0<'a> {
                 }
             }
         }
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            // SAFETY: BlockQ8_0 is #[repr(C)] with size BLOCK_Q8_0_BYTES (= 34).
+            // The compile-time assert above and the one in oxibonsai_core::quant_std
+            // both guarantee this layout.
+            let raw = unsafe {
+                std::slice::from_raw_parts(
+                    self.blocks.as_ptr().cast::<u8>(),
+                    self.blocks.len() * oxibonsai_core::BLOCK_Q8_0_BYTES,
+                )
+            };
+            match oxibonsai_kernels::metal_gemv_q8_0(
+                raw,
+                input,
+                output,
+                self.out_features,
+                self.in_features,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(e) => warn_metal_gemv_fallback("Q8_0", &e),
+            }
+        }
         gemv_q8_0(
             self.blocks,
             input,
@@ -304,5 +357,17 @@ impl<'a> LinearQ8_0<'a> {
             self.forward(inp, out)?;
         }
         Ok(())
+    }
+}
+
+/// Log a warning for a failed Metal GEMV dispatch, unless the failure is the
+/// benign "no Metal device on this system" case (in which every subsequent
+/// call would also fail identically, so the CPU fallback is the expected
+/// steady state rather than an anomaly worth logging every call).
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn warn_metal_gemv_fallback(format: &str, e: &oxibonsai_kernels::MetalGraphError) {
+    let msg = e.to_string();
+    if !msg.contains("no Metal-capable GPU device") {
+        tracing::warn!(error = %e, "Metal {format} GEMV failed, falling back to CPU scalar");
     }
 }

@@ -106,7 +106,15 @@ impl ConstrainedSamplerBuilder {
         crate::sampling_advanced::SamplerChain::new(self.seed)
     }
 
-    /// Build a `ConstrainedSampler` with a `JsonConstraint`.
+    /// Build a `ConstrainedSampler` with a **demonstration-only** `JsonConstraint`.
+    ///
+    /// # Warning: not for real tokenizers
+    ///
+    /// This wires in the token-id-as-codepoint [`JsonConstraint::new`] toy mode,
+    /// which is only meaningful for a synthetic vocabulary where
+    /// `token_id == codepoint`.  For a real tokenizer use
+    /// [`with_json_constraint_decoder`](Self::with_json_constraint_decoder), which
+    /// masks and advances on the tokens' decoded text.
     pub fn with_json_constraint(self) -> ConstrainedSampler {
         ConstrainedSampler::new(
             self.default_chain(),
@@ -115,7 +123,31 @@ impl ConstrainedSamplerBuilder {
         )
     }
 
-    /// Build a `ConstrainedSampler` with a `RegexConstraint`.
+    /// Build a `ConstrainedSampler` with a real, decoder-driven `JsonConstraint`.
+    ///
+    /// `decode_fn` maps a token id to the text it emits (`None` for EOS / special
+    /// tokens).  The resulting sampler masks and advances on the decoded token
+    /// text, so JSON constraining is correct for any real tokenizer.
+    pub fn with_json_constraint_decoder(
+        self,
+        decode_fn: impl Fn(u32) -> Option<String>,
+    ) -> ConstrainedSampler {
+        let vocab_size = self.vocab_size;
+        ConstrainedSampler::new(
+            self.default_chain(),
+            Box::new(JsonConstraint::with_decoder(decode_fn, vocab_size)),
+            vocab_size,
+        )
+    }
+
+    /// Build a `ConstrainedSampler` with a **demonstration-only** `RegexConstraint`.
+    ///
+    /// # Warning: not for real tokenizers
+    ///
+    /// This wires in the token-id-as-codepoint [`RegexConstraint::new`] toy mode,
+    /// whose mask allows all tokens and whose `advance` treats each id as a code
+    /// point.  For a real tokenizer use
+    /// [`with_regex_constraint_decoder`](Self::with_regex_constraint_decoder).
     pub fn with_regex_constraint(
         self,
         pattern: &str,
@@ -126,6 +158,26 @@ impl ConstrainedSamplerBuilder {
             chain,
             Box::new(constraint),
             self.vocab_size,
+        ))
+    }
+
+    /// Build a `ConstrainedSampler` with a real, decoder-driven `RegexConstraint`.
+    ///
+    /// `decode_fn` maps a token id to the text it emits (`None` for EOS / special
+    /// tokens).  The resulting sampler masks and advances on the decoded token
+    /// text, so regex constraining is correct for any real tokenizer.
+    pub fn with_regex_constraint_decoder(
+        self,
+        pattern: &str,
+        decode_fn: impl Fn(u32) -> Option<String>,
+    ) -> Result<ConstrainedSampler, ConstraintError> {
+        let vocab_size = self.vocab_size;
+        let constraint = RegexConstraint::with_decoder(pattern, decode_fn, vocab_size)?;
+        let chain = self.default_chain();
+        Ok(ConstrainedSampler::new(
+            chain,
+            Box::new(constraint),
+            vocab_size,
         ))
     }
 
@@ -213,5 +265,60 @@ mod tests {
         let sampler = ConstrainedSamplerBuilder::new(256, 42).unconstrained();
         assert_eq!(sampler.constraint_name(), "NoConstraint");
         assert!(sampler.is_complete());
+    }
+
+    #[test]
+    fn constrained_sampler_builder_json_decoder_masks_real_tokens() {
+        // Vocab whose ids are NOT code points; at each step exactly one token is
+        // valid, so the (stochastic) default chain still has a deterministic
+        // outcome once masking has zeroed everything else.
+        let decode = |id: u32| match id {
+            5 => Some("{".to_string()),
+            6 => Some("}".to_string()),
+            7 => Some("garbage".to_string()),
+            _ => None,
+        };
+        let mut sampler =
+            ConstrainedSamplerBuilder::new(8, 42).with_json_constraint_decoder(decode);
+        assert_eq!(sampler.constraint_name(), "JsonConstraint");
+        assert!(!sampler.is_complete());
+
+        // At start only "{" (id 5) is valid; give the invalid "garbage" the top
+        // logit and confirm masking forces the single valid opener.
+        let mut logits = vec![0.0_f32; 8];
+        logits[7] = 100.0; // "garbage" — highest, but invalid at start
+        logits[5] = 1.0; // "{" — the only valid opener
+        let tok = sampler.sample(&mut logits);
+        assert_eq!(tok, 5, "masking must reject invalid tokens and pick '{{'");
+
+        // After "{" only "}" (id 6) is valid (empty object).
+        let mut logits = vec![0.0_f32; 8];
+        logits[7] = 100.0; // still invalid
+        logits[6] = 1.0; // "}"
+        let tok = sampler.sample(&mut logits);
+        assert_eq!(tok, 6);
+        assert!(sampler.is_complete(), "{{}} is a complete document");
+    }
+
+    #[test]
+    fn constrained_sampler_builder_regex_decoder_masks_real_tokens() {
+        // Only "2024" (id 0) can start the pattern; "-" and "nope" cannot, and
+        // no other token begins with a digit, so the outcome is deterministic.
+        let decode = |id: u32| match id {
+            0 => Some("2024".to_string()),
+            1 => Some("-".to_string()),
+            2 => Some("nope".to_string()),
+            _ => None,
+        };
+        let mut sampler = ConstrainedSamplerBuilder::new(3, 7)
+            .with_regex_constraint_decoder(r"\d\d\d\d-\d\d", decode)
+            .expect("valid pattern");
+
+        // Give the invalid "nope" token the highest logit; masking must pick "2024".
+        let mut logits = vec![0.0_f32; 3];
+        logits[2] = 100.0;
+        logits[0] = 1.0;
+        let tok = sampler.sample(&mut logits);
+        assert_eq!(tok, 0, "masking must reject 'nope' and pick '2024'");
     }
 }

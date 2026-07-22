@@ -126,6 +126,23 @@ impl<'a> BonsaiModel<'a> {
         if n_layers == 0 {
             return Err("no blocks".into());
         }
+        // SPLIT-CACHE GUARD (disabled by default).
+        //
+        // This CUDA path writes the prompt K/V into a GPU-private KV cache
+        // (`acquire_q_std_kv_cache` in `cuda_q_std_prefill.rs`), but Q4_0/Q8_0
+        // DECODE runs CPU attention over `self.kv_cache` (see the Q4_0/Q8_0 branch
+        // in `BonsaiModel::forward`).  The two caches are never synced, so after a
+        // successful GPU batch prefill decode would attend over all-zero prompt
+        // KV and silently corrupt generation.  Unlike the Q1/ternary path — whose
+        // prefill and decode now share one GPU KV cache — there is no safe handoff
+        // here without a GPU→CPU KV read-back, so the path is disabled and
+        // `forward_prefill` falls back to the bit-correct sequential per-token
+        // path (which populates `self.kv_cache`).  Set
+        // `OXIBONSAI_FORCE_CUDA_SPLIT_PREFILL=1` to force the (decode-incorrect)
+        // GPU path for throughput microbenchmarks only.
+        if std::env::var_os("OXIBONSAI_FORCE_CUDA_SPLIT_PREFILL").is_none() {
+            return Err("Q4_0/Q8_0 CUDA batch prefill disabled (GPU-private KV cache not read by CPU decode); using sequential fallback".into());
+        }
         let eps = self.blocks[0].attn_norm_eps();
         let h = self.config.hidden_size;
         let inter = self.config.intermediate_size;
@@ -237,6 +254,13 @@ impl<'a> BonsaiModel<'a> {
         let n_layers = self.blocks.len();
         if n_layers == 0 {
             return Err("no blocks".into());
+        }
+        // SPLIT-CACHE GUARD (disabled by default) — see
+        // `try_cuda_prefill_with_lm_head_q_std`.  The GPU-private KV cache this
+        // path writes is not the CPU `self.kv_cache` that decode reads, so it is
+        // disabled by default and the caller falls back to the sequential path.
+        if std::env::var_os("OXIBONSAI_FORCE_CUDA_SPLIT_PREFILL").is_none() {
+            return Err("Q4_0/Q8_0 CUDA batch prefill verify disabled (GPU-private KV cache not read by CPU decode); using sequential fallback".into());
         }
         let eps = self.blocks[0].attn_norm_eps();
         let h = self.config.hidden_size;

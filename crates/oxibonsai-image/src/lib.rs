@@ -52,7 +52,7 @@
 pub mod blocks;
 pub mod config;
 /// GPU (CUDA) backend for the DiT ternary matmuls + joint flash-attention. The
-/// `target_os`-disjoint sibling of [`gpu`]; gated on `cfg(all(feature =
+/// `target_os`-disjoint sibling of `gpu`; gated on `cfg(all(feature =
 /// "native-cuda", any(target_os = "linux", target_os = "windows")))`. Reuses the
 /// same `OXI_DIT_GPU` / `OXI_DIT_ATTN_GPU` env vars as the Metal path.
 #[cfg(all(

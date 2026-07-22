@@ -27,6 +27,29 @@
 //!
 //! assert!(!result.best().is_empty());
 //! ```
+//!
+//! # Constrained beam search
+//!
+//! [`BeamSearchEngine::search_with_constraint`] applies a [`TokenConstraint`]
+//! to every live beam before top-k expansion (masking disallowed tokens) and
+//! stops a beam early once the constraint reports completion, mirroring the
+//! masking [`crate::pipeline::InferencePipeline::run`] already applies on the
+//! autoregressive path. Because a [`TokenConstraint`] is stateful and cannot
+//! generally be cloned, each beam's state is rebuilt from scratch (`reset` +
+//! `advance` over that beam's own generated-so-far tokens) rather than being
+//! tracked incrementally -- see the method docs for details.
+
+use crate::constrained_decoding::TokenConstraint;
+
+/// A [`TokenConstraint`] trait-object reference, with its object-lifetime
+/// bound pinned to `'static` (matching the default bound `Box<dyn
+/// TokenConstraint>` already carries -- every real implementation owns its
+/// state rather than borrowing). Writing this out explicitly, instead of
+/// relying on `&mut dyn TokenConstraint` elision (which ties the object bound
+/// to the *reference's* lifetime instead), lets callers reborrow a boxed
+/// constraint and pass it through multiple function boundaries without the
+/// resulting invariance forcing every intermediate borrow to be `'static`.
+type ConstraintRef<'a> = &'a mut (dyn TokenConstraint + 'static);
 
 // ─── Config ────────────────────────────────────────────────────────────────
 
@@ -59,8 +82,35 @@ impl Default for BeamSearchConfig {
             length_penalty: 0.6,
             no_repeat_ngram_size: 0,
             early_stopping: true,
-            eos_token_id: 2,
+            // Matches `crate::engine::EOS_TOKEN_ID`, the engine-wide fallback
+            // EOS id used by every other decode path. Callers that know the
+            // real (GGUF-resolved) EOS id should still set it explicitly;
+            // `InferencePipeline::run` overrides this default with the live
+            // engine's resolved EOS id automatically.
+            eos_token_id: crate::engine::EOS_TOKEN_ID,
         }
+    }
+}
+
+impl BeamSearchConfig {
+    /// Returns this config with `eos_token_id` replaced by `engine_eos`, but
+    /// *only* when it is still sitting at the library default sentinel
+    /// (i.e. the caller never customised it). An explicit caller override --
+    /// including one that happens to equal the default's numeric value by
+    /// coincidence -- is always preserved.
+    ///
+    /// This is how [`crate::pipeline::InferencePipeline`] lets
+    /// `BeamSearchConfig::default()` pick up the engine's real,
+    /// GGUF-resolved EOS id (via [`InferenceEngine::eos_token_id`]) instead
+    /// of silently decoding against the wrong id, while still letting a
+    /// caller who knows better pin an explicit value.
+    ///
+    /// [`InferenceEngine::eos_token_id`]: crate::engine::InferenceEngine::eos_token_id
+    pub fn inherit_eos_if_default(mut self, engine_eos: u32) -> Self {
+        if self.eos_token_id == Self::default().eos_token_id {
+            self.eos_token_id = engine_eos;
+        }
+        self
     }
 }
 
@@ -161,21 +211,62 @@ impl BeamSearchEngine {
         Self { config }
     }
 
-    /// Run beam search.
+    /// Run beam search with no [`TokenConstraint`] attached.
     ///
     /// `get_logits(beam_tokens, step)` is called for every live beam at every
     /// step and must return a logit vector of length `vocab_size`.
+    ///
+    /// Equivalent to [`search_with_constraint`](Self::search_with_constraint)
+    /// with `constraint = None`.
     pub fn search<F>(
         &self,
         initial_tokens: Vec<u32>,
-        _vocab_size: usize,
+        vocab_size: usize,
+        get_logits: F,
+    ) -> BeamSearchResult
+    where
+        F: FnMut(&[u32], usize) -> Vec<f32>,
+    {
+        self.search_with_constraint(initial_tokens, vocab_size, get_logits, None)
+    }
+
+    /// Run beam search, optionally honouring an attached [`TokenConstraint`].
+    ///
+    /// `get_logits(beam_tokens, step)` is called for every live beam at every
+    /// step and must return a logit vector of length `vocab_size`.
+    ///
+    /// When `constraint` is `Some`, every live beam's logits are masked
+    /// (disallowed tokens forced to a large negative value) *before* top-k
+    /// expansion, and a beam stops growing as soon as its candidate extension
+    /// makes the constraint report completion -- exactly mirroring the
+    /// masking + [`ConstraintComplete`](crate::pipeline::StopReason::ConstraintComplete)
+    /// behaviour of the autoregressive path.
+    ///
+    /// Because beams genuinely diverge (each explores a different token
+    /// sequence) and [`TokenConstraint`] is stateful but not `Clone`, the
+    /// constraint's state is *not* tracked incrementally per beam. Instead,
+    /// for every mask/completion check the constraint is `reset()` and
+    /// replayed (`advance()`) over that beam's own generated-so-far tokens
+    /// from scratch. This is O(depth) extra work per beam per step, which is
+    /// negligible next to the full-sequence `get_logits` re-prefill already
+    /// paid per beam per step by every caller in this crate.
+    pub fn search_with_constraint<F>(
+        &self,
+        initial_tokens: Vec<u32>,
+        vocab_size: usize,
         mut get_logits: F,
+        mut constraint: Option<ConstraintRef<'_>>,
     ) -> BeamSearchResult
     where
         F: FnMut(&[u32], usize) -> Vec<f32>,
     {
         let cfg = &self.config;
         let bw = cfg.beam_width.max(1);
+        // Every beam's `tokens` is `initial_tokens` (the prompt) followed by
+        // whatever it has generated; this never shrinks, so `prompt_len` is a
+        // stable split point for the "generated so far" suffix the
+        // constraint operates on.
+        let prompt_len = initial_tokens.len();
 
         // Initialise with a single beam
         let mut beams: Vec<Beam> = vec![Beam::new(initial_tokens)];
@@ -208,13 +299,34 @@ impl BeamSearchEngine {
                     );
                 }
 
+                // Apply the constraint mask (if any) before top-k expansion.
+                if let Some(bc) = constraint.as_deref_mut() {
+                    let suffix = &beam.tokens[prompt_len..];
+                    if let Some(mask) = Self::replay_constraint_mask(bc, suffix, vocab_size) {
+                        for (i, &allowed) in mask.iter().enumerate() {
+                            if !allowed && i < logits.len() {
+                                logits[i] = -1e9;
+                            }
+                        }
+                    }
+                }
+
                 // Get top-k (token, log_prob) candidates from this beam
                 let top = Self::top_k_log_probs(&logits, bw);
 
                 for (token, lp) in top {
                     let mut new_beam = beam.extend(token, lp);
+                    let mut done = token == cfg.eos_token_id;
 
-                    if token == cfg.eos_token_id {
+                    if !done {
+                        if let Some(bc) = constraint.as_deref_mut() {
+                            let mut ext_suffix: Vec<u32> = beam.tokens[prompt_len..].to_vec();
+                            ext_suffix.push(token);
+                            done = Self::replay_constraint_complete(bc, &ext_suffix);
+                        }
+                    }
+
+                    if done {
                         new_beam.is_done = true;
                         if cfg.early_stopping {
                             completed.push(new_beam);
@@ -290,6 +402,44 @@ impl BeamSearchEngine {
             scores,
             num_steps: steps,
         }
+    }
+
+    /// Rebuild constraint state from scratch and compute the allowed-token
+    /// mask for `suffix` (a beam's generated-so-far tokens, prompt excluded).
+    ///
+    /// Returns `None` when the constraint reports itself unconstrained at
+    /// this position (mirrors [`TokenConstraint::allowed_tokens`]).
+    fn replay_constraint_mask(
+        constraint: ConstraintRef<'_>,
+        suffix: &[u32],
+        vocab_size: usize,
+    ) -> Option<Vec<bool>> {
+        constraint.reset();
+        for &t in suffix {
+            if !constraint.advance(t) {
+                // The beam's own history already violates the constraint
+                // (should not happen in practice since violating tokens are
+                // never committed -- see `search_with_constraint`'s
+                // completion check) -- forbid every token defensively rather
+                // than silently falling back to "unconstrained".
+                return Some(vec![false; vocab_size]);
+            }
+        }
+        constraint.allowed_tokens(suffix, vocab_size)
+    }
+
+    /// Rebuild constraint state from scratch and report whether `suffix` (a
+    /// beam's generated-so-far tokens, prompt excluded, including the
+    /// candidate token under consideration) is now a complete, valid
+    /// terminal sequence.
+    fn replay_constraint_complete(constraint: ConstraintRef<'_>, suffix: &[u32]) -> bool {
+        constraint.reset();
+        for &t in suffix {
+            if !constraint.advance(t) {
+                return false;
+            }
+        }
+        constraint.is_complete()
     }
 
     /// Zero out (set to −∞) any token that would create a repeated n-gram.
@@ -609,6 +759,157 @@ mod tests {
             result.num_steps
         );
         assert!(!result.sequences.is_empty());
+    }
+
+    // ── BeamSearchConfig::default() EOS regression (runtime-engine-04) ─────
+
+    #[test]
+    fn test_beam_search_config_default_eos_matches_engine_wide_constant() {
+        // Regression: BeamSearchConfig::default() used to hardcode
+        // eos_token_id = 2, which never matches any real model's resolved
+        // EOS (e.g. 151645), so default-config beam search never recognized
+        // EOS and always ran to `max_tokens`. It must track the same
+        // engine-wide fallback every other decode path uses.
+        assert_eq!(
+            BeamSearchConfig::default().eos_token_id,
+            crate::engine::EOS_TOKEN_ID
+        );
+        assert_ne!(
+            BeamSearchConfig::default().eos_token_id,
+            2,
+            "must not regress to the old hardcoded default"
+        );
+    }
+
+    #[test]
+    fn test_inherit_eos_if_default_overrides_the_sentinel() {
+        // A config left at its default sentinel picks up the engine's real,
+        // GGUF-resolved EOS id.
+        let cfg = BeamSearchConfig::default().inherit_eos_if_default(151_643);
+        assert_eq!(cfg.eos_token_id, 151_643);
+    }
+
+    #[test]
+    fn test_inherit_eos_if_default_preserves_explicit_override() {
+        // A caller who explicitly pinned a (non-default) eos_token_id keeps
+        // it -- the inheritance must never clobber an intentional override.
+        let cfg = BeamSearchConfig {
+            eos_token_id: 999_999,
+            ..Default::default()
+        }
+        .inherit_eos_if_default(151_643);
+        assert_eq!(
+            cfg.eos_token_id, 999_999,
+            "explicit eos_token_id override must not be replaced"
+        );
+    }
+
+    // ── Constrained beam search (runtime-engine-01) ─────────────────────────
+
+    #[test]
+    fn test_beam_search_with_constraint_masks_disallowed_tokens() {
+        use crate::constrained_decoding::{JsonConstraint, TokenConstraint};
+
+        // Toy-mode JsonConstraint: token id == ASCII code point.
+        let vocab_size = 128usize;
+        let config = BeamSearchConfig {
+            beam_width: 3,
+            max_tokens: 3,
+            length_penalty: 0.6,
+            no_repeat_ngram_size: 0,
+            early_stopping: false,
+            eos_token_id: 999_999, // never generated; isolates constraint behaviour
+        };
+        let engine = BeamSearchEngine::new(config);
+
+        // Always most strongly prefer '}' -- a character that is *never*
+        // valid as the opening character of a JSON document. An
+        // unconstrained search would immediately emit it; a genuinely
+        // applied constraint must mask it out of the top-k selection.
+        let mut constraint = JsonConstraint::new();
+        let result = engine.search_with_constraint(
+            Vec::new(),
+            vocab_size,
+            |_tokens, _step| {
+                let mut logits = vec![0.0f32; vocab_size];
+                logits['}' as usize] = 100.0;
+                logits['{' as usize] = 50.0;
+                logits
+            },
+            Some(&mut constraint),
+        );
+
+        assert!(
+            !result.sequences.is_empty(),
+            "constrained beam search must still produce sequences"
+        );
+        for seq in &result.sequences {
+            assert_ne!(
+                seq.first().copied(),
+                Some(b'}' as u32),
+                "constraint must mask '}}' as an opening token: {seq:?}"
+            );
+
+            // Replay every returned beam through a fresh constraint instance:
+            // every returned sequence must be a genuinely valid JSON prefix,
+            // i.e. `advance` must never report a violation.
+            let mut replay = JsonConstraint::new();
+            for &tok in seq {
+                assert!(
+                    replay.advance(tok),
+                    "beam {seq:?} contains a token the JSON constraint rejects"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_beam_search_with_constraint_stops_beam_on_completion() {
+        use crate::constrained_decoding::JsonConstraint;
+
+        // `{}` is a complete JSON document after two tokens. With
+        // early_stopping the beam must stop growing right there instead of
+        // being forced to keep emitting (whitespace-only-valid) tokens up to
+        // max_tokens.
+        let vocab_size = 128usize;
+        let config = BeamSearchConfig {
+            beam_width: 1,
+            max_tokens: 10,
+            length_penalty: 0.6,
+            no_repeat_ngram_size: 0,
+            early_stopping: true,
+            eos_token_id: 999_999, // never generated; isolates constraint behaviour
+        };
+        let engine = BeamSearchEngine::new(config);
+
+        let mut constraint = JsonConstraint::new();
+        let result = engine.search_with_constraint(
+            Vec::new(),
+            vocab_size,
+            |tokens, _step| {
+                let mut logits = vec![0.0f32; vocab_size];
+                // Prefer '{' first, then '}' -- both always the single
+                // strongest signal, so beam_width=1 greedily builds `{}`.
+                if tokens.is_empty() {
+                    logits['{' as usize] = 100.0;
+                } else {
+                    logits['}' as usize] = 100.0;
+                }
+                logits
+            },
+            Some(&mut constraint),
+        );
+
+        assert_eq!(
+            result.best(),
+            &[b'{' as u32, b'}' as u32],
+            "beam must stop as soon as the constraint reports `{{}}` complete, not run to max_tokens"
+        );
+        assert!(
+            result.num_steps < 10,
+            "expected constraint-driven early stop, got {} steps",
+            result.num_steps
+        );
     }
 
     #[test]

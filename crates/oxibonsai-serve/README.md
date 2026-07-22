@@ -1,6 +1,6 @@
 # oxibonsai-serve
 
-**Status:** Stable — **Version:** 0.2.2 — **Tests:** 161 passing
+**Status:** Stable — **Version:** 0.2.3 — **Tests:** 178 passing
 
 Standalone OpenAI-compatible inference server for OxiBonsai.
 
@@ -40,7 +40,7 @@ oxibonsai-serve \
 | `--temperature <F>` | `0.7` | Sampling temperature |
 | `--seed <N>` | `42` | RNG seed |
 | `--log-level <LEVEL>` | `info` | error/warn/info/debug/trace |
-| `--auth-token <TOKEN>` | optional | Bearer auth token for request authentication |
+| `--bearer-token <TOKEN>` | optional | Bearer auth token for request authentication |
 
 ## License
 

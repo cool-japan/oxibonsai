@@ -8,14 +8,18 @@
 //! required; the focus is on HTTP plumbing (auth, CORS-free defaults, health
 //! checks, metrics, JSON error shape), not on generation quality.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
+use axum::error_handling::HandleErrorLayer;
+use axum::extract::Query;
 use axum::http::{header, Request, StatusCode};
 use axum::middleware::{from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
+use axum::BoxError;
 use axum::Json;
 use axum::Router;
 use oxibonsai_core::config::Qwen3Config;
@@ -23,6 +27,7 @@ use oxibonsai_runtime::engine::InferenceEngine;
 use oxibonsai_runtime::sampling::SamplingParams;
 use oxibonsai_runtime::server::{create_router, serve_with_shutdown};
 use tokio::sync::oneshot;
+use tower::ServiceBuilder;
 
 // ─── Shared helpers ───────────────────────────────────────────────────────
 
@@ -392,6 +397,149 @@ async fn bearer_auth_rejects_malformed_header() {
         .await
         .expect("basic auth");
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let _ = shutdown.send(());
+}
+
+// ─── Admission control (concurrency limit + timeout) ──────────────────────
+//
+// Mirrors the `ServiceBuilder` admission stack assembled in `src/main.rs`
+// ("── 7b. Admission control") so these can be exercised without booting the
+// binary — the same pattern already used for `bearer_auth` above. Verifies
+// that `limits.max_concurrent_requests` / `limits.per_request_timeout_ms` are
+// enforced HTTP-level controls, not just validated-but-inert config fields.
+
+/// Sleeps for `ms` (query param, default 200) then returns `200 OK`. Lets
+/// tests control exactly how long a request stays in flight.
+async fn slow_handler(Query(params): Query<HashMap<String, String>>) -> StatusCode {
+    let ms: u64 = params.get("ms").and_then(|s| s.parse().ok()).unwrap_or(200);
+    tokio::time::sleep(Duration::from_millis(ms)).await;
+    StatusCode::OK
+}
+
+/// Mirror of `main.rs`'s `handle_admission_error`.
+async fn handle_admission_error(err: BoxError) -> (StatusCode, Json<serde_json::Value>) {
+    let (status, kind) = if err.is::<tower::load_shed::error::Overloaded>() {
+        (StatusCode::SERVICE_UNAVAILABLE, "overloaded_error")
+    } else if err.is::<tower::timeout::error::Elapsed>() {
+        (StatusCode::REQUEST_TIMEOUT, "timeout_error")
+    } else {
+        (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "error": { "message": err.to_string(), "type": kind, "param": null, "code": null }
+        })),
+    )
+}
+
+/// Mirror of `main.rs`'s "── 7b. Admission control" `ServiceBuilder` stack.
+///
+/// Must use `GlobalConcurrencyLimitLayer` (pre-built `Arc<Semaphore>`), not
+/// `ServiceBuilder::concurrency_limit`/`tower::limit::ConcurrencyLimitLayer` —
+/// `axum::Router::layer` applies the given layer once *per route*
+/// (`PathRouter::layer` clones and re-applies it per registered route), so a
+/// bare `ConcurrencyLimitLayer` would silently allocate one independent
+/// semaphore per route instead of a single budget shared across the whole
+/// router. `admission_concurrency_limit_sheds_excess_requests` below is the
+/// regression test that catches a reintroduction of that bug.
+fn with_admission_layer(
+    router: Router,
+    max_concurrent_requests: usize,
+    per_request_timeout_ms: u64,
+) -> Router {
+    let concurrency_semaphore =
+        tower::limit::GlobalConcurrencyLimitLayer::new(max_concurrent_requests);
+    let admission = ServiceBuilder::new()
+        .layer(HandleErrorLayer::new(handle_admission_error))
+        .load_shed()
+        .layer(concurrency_semaphore)
+        .timeout(Duration::from_millis(per_request_timeout_ms));
+    router.layer(admission)
+}
+
+#[tokio::test]
+async fn admission_timeout_aborts_slow_request_with_408() {
+    let router = create_router(tiny_engine(30), None)
+        .route("/__test_slow", axum::routing::get(slow_handler));
+    let router = with_admission_layer(
+        router, /* max_concurrent_requests */ 10, /* per_request_timeout_ms */ 50,
+    );
+    let (addr, shutdown) = spawn_server(router).await;
+    let client = client_with_timeout();
+
+    let resp = client
+        .get(format!("http://{addr}/__test_slow?ms=400"))
+        .send()
+        .await
+        .expect("slow request");
+    assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
+    let body: serde_json::Value = resp.json().await.expect("json");
+    assert_eq!(body["error"]["type"], "timeout_error");
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn admission_fast_request_within_timeout_succeeds() {
+    let router = create_router(tiny_engine(31), None)
+        .route("/__test_slow", axum::routing::get(slow_handler));
+    let router = with_admission_layer(
+        router, /* max_concurrent_requests */ 10, /* per_request_timeout_ms */ 500,
+    );
+    let (addr, shutdown) = spawn_server(router).await;
+    let client = client_with_timeout();
+
+    let resp = client
+        .get(format!("http://{addr}/__test_slow?ms=20"))
+        .send()
+        .await
+        .expect("fast-enough request");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn admission_concurrency_limit_sheds_excess_requests() {
+    let router = create_router(tiny_engine(32), None)
+        .route("/__test_slow", axum::routing::get(slow_handler));
+    let router = with_admission_layer(
+        router, /* max_concurrent_requests */ 1, /* per_request_timeout_ms */ 5_000,
+    );
+    let (addr, shutdown) = spawn_server(router).await;
+
+    // Occupy the single concurrency slot with a long-running request.
+    let first = tokio::spawn(async move {
+        let c = client_with_timeout();
+        c.get(format!("http://{addr}/__test_slow?ms=300"))
+            .send()
+            .await
+    });
+    // Give the first request time to actually be admitted (acquire the
+    // semaphore permit and start sleeping inside the handler) before firing
+    // the second — otherwise both could race for the single slot.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // With max_concurrent_requests == 1, the in-flight first request holds
+    // the only slot; the second must be shed immediately (503) rather than
+    // queued until the first completes.
+    let client = client_with_timeout();
+    let second = client
+        .get(format!("http://{addr}/__test_slow?ms=10"))
+        .send()
+        .await
+        .expect("second request");
+    assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = second.json().await.expect("json");
+    assert_eq!(body["error"]["type"], "overloaded_error");
+
+    let first_resp = first
+        .await
+        .expect("join first request task")
+        .expect("first request");
+    assert_eq!(first_resp.status(), StatusCode::OK);
 
     let _ = shutdown.send(());
 }

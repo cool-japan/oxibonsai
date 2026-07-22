@@ -25,7 +25,7 @@ use super::cudagraph_type::CudaGraph;
 pub const DIT_ATTN_MAX_SEQ: usize = 8192;
 
 /// Compile-time cap on `head_dim` accepted by the *general* joint-attention
-/// validation. The flash kernel caps `head_dim` at [`DIT_FLASH_HEAD_DIM_CAP`]
+/// validation. The flash kernel caps `head_dim` at `DIT_FLASH_HEAD_DIM_CAP`
 /// (its `FA_DMAX` register-array bound) and requires `head_dim % 8 == 0` —
 /// see [`CudaGraph::encode_joint_attention_flash`].
 pub const DIT_ATTN_MAX_HEAD_DIM: usize = 384;

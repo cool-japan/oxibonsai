@@ -55,6 +55,16 @@ impl ChunkConfig {
                 self.overlap, self.chunk_size
             ));
         }
+        if self.min_chunk_size > self.chunk_size {
+            // `chunk_document` never produces a window longer than
+            // `chunk_size`, so if `min_chunk_size` exceeds it, every window
+            // is discarded by the min-length filter and every document
+            // silently yields zero chunks forever.
+            return Err(format!(
+                "min_chunk_size ({}) must be <= chunk_size ({})",
+                self.min_chunk_size, self.chunk_size
+            ));
+        }
         Ok(())
     }
 

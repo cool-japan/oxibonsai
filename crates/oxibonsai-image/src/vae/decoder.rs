@@ -55,6 +55,12 @@ impl Map {
     fn new(data: Vec<f32>, c: usize, h: usize, w: usize) -> Self {
         Self { data, c, h, w }
     }
+
+    /// Crate-visible constructor, used by the tiling helpers in
+    /// [`crate::vae::tiling`].
+    pub(crate) fn new_pub(data: Vec<f32>, c: usize, h: usize, w: usize) -> Self {
+        Self { data, c, h, w }
+    }
 }
 
 /// Optional capture of every per-stage intermediate (for parity validation).
@@ -222,6 +228,159 @@ impl VaeDecoder {
         let out = self.conv_out.forward(&cur.data, cur.h, cur.w)?;
         Ok(Map::new(out.data, self.conv_out.out_ch, out.h, out.w))
     }
+
+    /// Run the decode prologue through the mid block: `bn_denorm → unpatchify →
+    /// post_quant_conv → conv_in → mid_block`. The mid block runs whole (it has
+    /// global attention, so it cannot be spatially tiled), returning the map
+    /// `[C, H, W]` that enters the up-block stack.
+    ///
+    /// # Errors
+    /// [`VaeError::Shape`] on a length mismatch or a propagated layer error.
+    fn decode_through_mid(&self, packed: &[f32], ph: usize, pw: usize) -> VaeResult<Map> {
+        let packed_ch = 4 * LATENT_CH; // 128
+        if packed.len() != packed_ch * ph * pw {
+            return Err(VaeError::Shape(format!(
+                "decode_packed input len {} != 128*{ph}*{pw}",
+                packed.len()
+            )));
+        }
+        // 1. BatchNorm-stats denorm.
+        let denorm = bn_denorm(
+            packed,
+            &self.bn_mean,
+            &self.bn_var,
+            packed_ch,
+            ph,
+            pw,
+            BN_EPS,
+        )?;
+        // 2. Unpatchify [128,h,w] → [32, 2h, 2w].
+        let up = unpatchify(&denorm, packed_ch, ph, pw)?;
+        let mut cur = Map::new(up.data, up.c, up.h, up.w);
+        // 3. post_quant_conv (k=1).
+        let pqc = self.post_quant_conv.forward(&cur.data, cur.h, cur.w)?;
+        cur = Map::new(pqc.data, self.post_quant_conv.out_ch, pqc.h, pqc.w);
+        // 4. conv_in (k=3).
+        let ci = self.conv_in.forward(&cur.data, cur.h, cur.w)?;
+        cur = Map::new(ci.data, self.conv_in.out_ch, ci.h, ci.w);
+        // 5. mid block (whole — global attention).
+        self.mid_block.forward(&cur)
+    }
+
+    /// Run decode through `conv_norm_out` (GroupNorm applied), stopping **before**
+    /// the final `silu_inplace + conv_out.forward`, with the up-blocks run
+    /// **whole**. Returns the post-GroupNorm plane `[96, H, W]` (or whatever the
+    /// actual output-stage channel count is).
+    ///
+    /// Shared entry-point used by [`Self::decode_packed_latents_tiled`] so the
+    /// `AfterConvNormOut` boundary can be tiled without duplicating the decode
+    /// prologue.
+    ///
+    /// # Errors
+    /// [`VaeError::Shape`] on a length mismatch or a propagated layer error.
+    fn decode_before_conv_out(&self, packed: &[f32], ph: usize, pw: usize) -> VaeResult<Map> {
+        let mut cur = self.decode_through_mid(packed, ph, pw)?;
+        // 6. up blocks (whole).
+        for ub in &self.up_blocks {
+            cur = ub.forward(&cur)?;
+        }
+        // 7. conv_norm_out (GroupNorm — global).
+        self.conv_norm_out
+            .forward_inplace(&mut cur.data, cur.h, cur.w)?;
+        // Caller applies silu + conv_out (tiled or not).
+        Ok(cur)
+    }
+
+    /// `AfterMid` variant of [`Self::decode_before_conv_out`]: the up-blocks run
+    /// through [`UpBlock::forward_tiled`], which bounds each up-block convolution's
+    /// im2col scratch to `max_tile_pixels` output pixels. The activation planes
+    /// between blocks stay whole (they are small relative to the im2col) so the
+    /// GroupNorm statistics remain exactly global and the output is **bit-identical
+    /// to the untiled CPU decode** — only the multi-GB up-block im2col peak is
+    /// capped (from the untiled ~3.6 GB up-block peak at 512² down to
+    /// `O(max_tile_pixels · k·k·in_ch)`, e.g. ≈1 GB at a 256²-pixel budget).
+    ///
+    /// `conv_norm_out` runs whole (global GroupNorm stats). The up-block convs run
+    /// on the CPU, matching [`Conv2d::forward_tiled`] (the GPU conv path has no
+    /// host im2col to bound); vs a GPU untiled decode the result matches to
+    /// `cos ≈ 1`, like the `AfterConvNormOut` tail tiling.
+    ///
+    /// # Errors
+    /// [`VaeError::Shape`] on a length mismatch or a propagated layer error.
+    fn decode_before_conv_out_tiled(
+        &self,
+        packed: &[f32],
+        ph: usize,
+        pw: usize,
+        max_tile_pixels: usize,
+    ) -> VaeResult<Map> {
+        let mut cur = self.decode_through_mid(packed, ph, pw)?;
+        // 6. up blocks (im2col bounded per conv; planes whole → stats global).
+        for ub in &self.up_blocks {
+            cur = ub.forward_tiled(&cur, max_tile_pixels)?;
+        }
+        // 7. conv_norm_out (GroupNorm — global).
+        self.conv_norm_out
+            .forward_inplace(&mut cur.data, cur.h, cur.w)?;
+        Ok(cur)
+    }
+
+    /// Tiled decode: numerically equivalent to [`Self::decode_packed_latents`]
+    /// (bit-exact on the CPU path; `cos ≈ 1` vs the GPU path, whose sum
+    /// reassociation depends on tile size), with peak scratch memory bounded by
+    /// `cfg.tile_px` instead of the full output size.
+    ///
+    /// Two boundaries (see [`crate::vae::tiling::TileBoundary`]):
+    ///
+    /// * [`AfterConvNormOut`](crate::vae::tiling::TileBoundary::AfterConvNormOut)
+    ///   (default): everything through `conv_norm_out` runs whole, then only the
+    ///   final `silu → conv_out` is tiled (halo = 1 px). Per-op Metal/CUDA dispatch
+    ///   of the upstream ops is unchanged.
+    /// * [`AfterMid`](crate::vae::tiling::TileBoundary::AfterMid): additionally bounds the up-block convolution
+    ///   im2col — the real ~3.6 GB up-block peak at 512² — by running each
+    ///   up-block conv through [`Conv2d::forward_tiled`] with a
+    ///   `cfg.tile_px²`-pixel budget. Activation planes stay whole (GroupNorm
+    ///   stats global), so it is bit-identical to the untiled CPU decode. The
+    ///   up-block convs run on the CPU under this boundary (the host im2col is the
+    ///   thing being bounded); `conv_norm_out` and the `silu → conv_out` tail are
+    ///   handled as in `AfterConvNormOut`.
+    ///
+    /// Auto-tiling in [`crate::pipeline`] and [`crate::session`] activates only
+    /// when `16 * ph > 512` (i.e., output width > 512 px), so 512-px renders
+    /// are unaffected.
+    ///
+    /// # Errors
+    /// [`VaeError::Shape`] on a length mismatch or a propagated layer error.
+    pub fn decode_packed_latents_tiled(
+        &self,
+        packed: &[f32],
+        ph: usize,
+        pw: usize,
+        cfg: crate::vae::tiling::TileConfig,
+    ) -> VaeResult<Map> {
+        use crate::vae::tiling::{tile_silu_conv_out, TileBoundary};
+        // Both boundaries share the tiled `silu → conv_out` tail; they differ only
+        // in whether the up-blocks are run whole (`AfterConvNormOut`) or with the
+        // im2col bounded (`AfterMid`). `conv_norm_out` always runs whole so the
+        // final GroupNorm keeps globally-correct per-group statistics.
+        let pre_silu = match cfg.boundary {
+            TileBoundary::AfterConvNormOut => self.decode_before_conv_out(packed, ph, pw)?,
+            TileBoundary::AfterMid => {
+                // Budget the up-block im2col to ~`tile_px²` output pixels, matching
+                // the spatial-tile memory scale of the `silu → conv_out` tail.
+                let max_tile_pixels = cfg.tile_px.saturating_mul(cfg.tile_px).max(1);
+                self.decode_before_conv_out_tiled(packed, ph, pw, max_tile_pixels)?
+            }
+        };
+        tile_silu_conv_out(
+            &pre_silu.data,
+            pre_silu.c,
+            pre_silu.h,
+            pre_silu.w,
+            &self.conv_out,
+            cfg.tile_px,
+        )
+    }
 }
 
 impl MidBlock {
@@ -245,6 +404,26 @@ impl UpBlock {
         if let Some(conv) = self.upsampler.as_ref() {
             let upsampled = upsample_nearest2x(&cur.data, cur.c, cur.h, cur.w)?;
             let out = conv.forward(&upsampled.data, upsampled.h, upsampled.w)?;
+            cur = Map::new(out.data, conv.out_ch, out.h, out.w);
+        }
+        Ok(cur)
+    }
+
+    /// Memory-bounded variant of [`Self::forward`]: each resnet and the upsampler
+    /// convolution run with their im2col scratch capped at `max_tile_pixels`
+    /// output pixels ([`crate::vae::resnet::ResnetBlock2D::forward_tiled`] /
+    /// [`Conv2d::forward_tiled`]). Activation planes stay whole, so the result is
+    /// bit-identical to [`Self::forward`]. Used by the `AfterMid` tiling path.
+    fn forward_tiled(&self, x: &Map, max_tile_pixels: usize) -> VaeResult<Map> {
+        let mut cur = x.clone();
+        for resnet in &self.resnets {
+            let data = resnet.forward_tiled(&cur.data, cur.h, cur.w, max_tile_pixels)?;
+            cur = Map::new(data, resnet.out_ch, cur.h, cur.w);
+        }
+        if let Some(conv) = self.upsampler.as_ref() {
+            let upsampled = upsample_nearest2x(&cur.data, cur.c, cur.h, cur.w)?;
+            let out =
+                conv.forward_tiled(&upsampled.data, upsampled.h, upsampled.w, max_tile_pixels)?;
             cur = Map::new(out.data, conv.out_ch, out.h, out.w);
         }
         Ok(cur)
@@ -347,4 +526,78 @@ fn load_up_block(
         None
     };
     Ok(UpBlock { resnets, upsampler })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a tiny same-channel ResnetBlock2D (no shortcut) with `groups`-group
+    /// GroupNorms, for the up-block tiling parity check.
+    fn tiny_resnet(ch: usize, groups: usize, seed: f32) -> ResnetBlock2D {
+        let gn = |off: f32| {
+            let weight: Vec<f32> = (0..ch).map(|i| 1.0 + 0.02 * (i as f32 + off)).collect();
+            let bias: Vec<f32> = (0..ch).map(|i| -0.01 * (i as f32 + off)).collect();
+            GroupNorm::new(&weight, &bias, groups, GN_EPS).expect("groupnorm")
+        };
+        let conv = |off: f32| {
+            let weight: Vec<f32> = (0..ch * 3 * 3 * ch)
+                .map(|n| ((n as f32 + off) * 0.011).sin() * 0.25)
+                .collect();
+            let bias: Vec<f32> = (0..ch).map(|n| 0.005 * n as f32).collect();
+            Conv2d::from_weights(&weight, &[ch, 3, 3, ch], &bias, 1).expect("conv")
+        };
+        ResnetBlock2D {
+            norm1: gn(seed),
+            conv1: conv(seed + 1.0),
+            norm2: gn(seed + 2.0),
+            conv2: conv(seed + 3.0),
+            conv_shortcut: None,
+            in_ch: ch,
+            out_ch: ch,
+        }
+    }
+
+    /// `UpBlock::forward_tiled` (the `AfterMid` per-block lever) must give a
+    /// bit-identical result at every pixel budget — including through the
+    /// nearest-2× upsampler convolution. The whole-plane `forward_tiled` reference
+    /// runs the same CPU im2col + GEMM as the untiled `UpBlock::forward` (which
+    /// routes its convs to the GPU under `native-cuda`), so the row-blocking
+    /// contract is validated CPU-side, independent of `OXI_VAE_GPU`.
+    #[test]
+    fn up_block_forward_tiled_matches_forward() {
+        let ch = 32usize; // divisible by NUM_GROUPS
+        let upsampler_weight: Vec<f32> = (0..ch * 3 * 3 * ch)
+            .map(|n| (n as f32 * 0.007).cos() * 0.2)
+            .collect();
+        let upsampler =
+            Conv2d::from_weights(&upsampler_weight, &[ch, 3, 3, ch], &vec![0.0f32; ch], 1)
+                .expect("upsampler");
+        let block = UpBlock {
+            resnets: vec![
+                tiny_resnet(ch, NUM_GROUPS, 0.0),
+                tiny_resnet(ch, NUM_GROUPS, 10.0),
+            ],
+            upsampler: Some(upsampler),
+        };
+        let (h, w) = (5usize, 4usize);
+        let data: Vec<f32> = (0..ch * h * w)
+            .map(|i| (i as f32 * 0.019).sin() * 0.9 + 0.05)
+            .collect();
+        let x = Map::new(data, ch, h, w);
+        // Whole-plane reference: a budget past the upsampled 2h×2w resolution runs
+        // every conv in a single chunk (== the untiled CPU im2col path).
+        let reference = block
+            .forward_tiled(&x, (2 * h) * (2 * w))
+            .expect("whole-plane reference");
+        for &budget in &[1usize, w, 4 * w, (2 * h) * (2 * w)] {
+            let tiled = block.forward_tiled(&x, budget).expect("forward_tiled");
+            assert_eq!(tiled.c, reference.c);
+            assert_eq!((tiled.h, tiled.w), (reference.h, reference.w));
+            assert_eq!(
+                tiled.data, reference.data,
+                "UpBlock forward_tiled(budget={budget}) diverged from whole-plane"
+            );
+        }
+    }
 }

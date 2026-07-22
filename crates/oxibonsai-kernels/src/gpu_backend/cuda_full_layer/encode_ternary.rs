@@ -57,7 +57,7 @@ use super::launchers::{
 
 /// Per-layer parameters for the CUDA ternary full-forward path.
 ///
-/// Mirrors [`CudaFullForwardLayerParams`] but carries TQ2_0_g128 block bytes
+/// Mirrors `CudaFullForwardLayerParams` but carries TQ2_0_g128 block bytes
 /// (34 bytes/block) for every GEMV weight instead of Q1_0_g128.
 pub struct CudaFullForwardLayerParamsTernary<'a> {
     /// Handle ID for the pre-attention RMSNorm weight (FP32).
@@ -294,24 +294,89 @@ pub unsafe fn encode_layer_into_ternary(
 // get_or_build_ternary_model_weights
 // =============================================================================
 
+/// Cheap content-and-identity fingerprint of a ternary (TQ2) model's whole
+/// weight set.
+///
+/// Mirrors [`super::model_weights_fingerprint`] (the Q1 slot's fingerprint):
+/// combines each layer's weight/norm source-slice base pointer + length into an
+/// FNV-1a hash.  The pointers are stable for the lifetime of a loaded model
+/// (they reference the model's owned / mmap'd bytes or its cached QKV concats)
+/// and differ across concurrently-loaded models, so a same-`n_layers` model swap
+/// (e.g. two same-depth finetunes) produces a different fingerprint.  Cost is
+/// O(n_layers) with a tiny constant, cheap enough to run on every decode token.
+fn ternary_model_weights_fingerprint(
+    layer_params: &[CudaFullForwardLayerParamsTernary<'_>],
+) -> u64 {
+    let mut h = 0xcbf29ce484222325u64; // FNV-1a offset basis
+    let mut mix = |v: u64| {
+        h ^= v;
+        h = h.wrapping_mul(0x100000001b3);
+    };
+    mix(layer_params.len() as u64);
+    for lp in layer_params {
+        let parts: [(u64, u64); 7] = [
+            (
+                lp.attn_norm_bytes.as_ptr() as usize as u64,
+                lp.attn_norm_bytes.len() as u64,
+            ),
+            (
+                lp.fused_qkv_bytes.as_ptr() as usize as u64,
+                lp.fused_qkv_bytes.len() as u64,
+            ),
+            (
+                lp.attn_proj_bytes.as_ptr() as usize as u64,
+                lp.attn_proj_bytes.len() as u64,
+            ),
+            (
+                lp.gate_bytes.as_ptr() as usize as u64,
+                lp.gate_bytes.len() as u64,
+            ),
+            (
+                lp.up_bytes.as_ptr() as usize as u64,
+                lp.up_bytes.len() as u64,
+            ),
+            (
+                lp.down_bytes.as_ptr() as usize as u64,
+                lp.down_bytes.len() as u64,
+            ),
+            (
+                lp.ffn_norm_bytes.as_ptr() as usize as u64,
+                lp.ffn_norm_bytes.len() as u64,
+            ),
+        ];
+        for (ptr, len) in parts {
+            mix(ptr);
+            mix(len);
+        }
+    }
+    h
+}
+
 /// Build (or return cached) GPU weight handles for all ternary transformer layers.
 ///
 /// Uses `6_000_000 + layer * 10 + offset` for weight handles and
 /// `5_000_000 + layer * 10 + offset` for norm handles, keeping them separate
 /// from Q1 CUDA handles (1M–4M) and the Metal ternary handles.
+///
+/// The cache is validated by BOTH the layer count and a content fingerprint
+/// ([`ternary_model_weights_fingerprint`]) so a same-depth ternary model swap
+/// rebuilds rather than silently reusing another model's uploaded GPU buffers.
+/// The ternary slot (`cached_model_weights`) is disjoint from the Q1 slot
+/// (`cached_q1_model_weights`), so Q1 and TQ2 weight sets can never alias.
 fn get_or_build_ternary_model_weights(
     layer_params: &[CudaFullForwardLayerParamsTernary<'_>],
 ) -> Option<(Arc<CudaGraph>, Arc<Vec<CudaCachedLayerWeights>>)> {
     let n_layers = layer_params.len();
+    let fingerprint = ternary_model_weights_fingerprint(layer_params);
     let state = full_layer_state();
 
-    // Fast path: check if the ternary model weights are already cached.
-    // We reuse the cached_model_weights slot (same slot as Q1) but distinguish
-    // by layer count; models cannot switch between Q1 and ternary at runtime.
+    // Fast path: cache hit — both the fingerprint AND the layer count must match
+    // to reuse the cached buffers, so a same-depth model swap rebuilds instead of
+    // returning stale GPU weights.
     {
         let guard = state.cached_model_weights.lock().ok()?;
-        if let Some(ref cmw) = *guard {
-            if cmw.n_layers == n_layers {
+        if let Some((fp, cmw)) = guard.as_ref() {
+            if *fp == fingerprint && cmw.n_layers == n_layers {
                 return Some((Arc::clone(&cmw.graph), Arc::clone(&cmw.layers)));
             }
         }
@@ -374,8 +439,10 @@ fn get_or_build_ternary_model_weights(
         layers: Arc::clone(&layers),
         n_layers,
     };
+    // Store fingerprint + weights together (atomic under one lock) so a stale
+    // fingerprint can never be paired with the wrong cached buffers.
     if let Ok(mut guard) = state.cached_model_weights.lock() {
-        *guard = Some(cmw);
+        *guard = Some((fingerprint, cmw));
     }
     Some((graph, layers))
 }
@@ -921,13 +988,13 @@ mod ternary_cuda_tests {
         let expected_token = expected_logits
             .iter()
             .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(i, _)| i)
             .unwrap_or(0);
         let gpu_token = gpu_logits
             .iter()
             .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(i, _)| i)
             .unwrap_or(0);
         assert_eq!(

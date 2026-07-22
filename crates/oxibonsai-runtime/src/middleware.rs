@@ -368,6 +368,210 @@ impl IdempotencyCache {
     }
 }
 
+// ─── MiddlewareConfig ────────────────────────────────────────────────────────
+
+/// Declarative configuration for the request middleware applied to the served
+/// router by [`apply_middleware`].
+///
+/// This is the type the server assembles from its own configuration to decide
+/// which of the building blocks in this module (CORS, request logging) and the
+/// [`crate::rate_limiter::RateLimiter`] to attach. It is inert data — applying
+/// it (which requires `axum`) lives behind the `server` feature.
+#[derive(Debug, Clone)]
+pub struct MiddlewareConfig {
+    /// CORS policy to apply. `None` disables CORS header injection entirely.
+    pub cors: Option<CorsConfig>,
+    /// Whether to emit a structured request/response log line per request.
+    pub enable_request_logging: bool,
+    /// Optional per-client token-bucket rate limit. `None` disables rate
+    /// limiting (the default — a rate cap is opt-in so it never silently
+    /// throttles a deployment that did not ask for it).
+    pub rate_limit: Option<crate::rate_limiter::RateLimitConfig>,
+}
+
+impl Default for MiddlewareConfig {
+    fn default() -> Self {
+        Self {
+            cors: Some(CorsConfig::default()),
+            enable_request_logging: true,
+            rate_limit: None,
+        }
+    }
+}
+
+impl MiddlewareConfig {
+    /// A configuration that applies no middleware at all.
+    pub fn none() -> Self {
+        Self {
+            cors: None,
+            enable_request_logging: false,
+            rate_limit: None,
+        }
+    }
+
+    /// Enable per-client rate limiting with the given config (builder style).
+    pub fn with_rate_limit(mut self, config: crate::rate_limiter::RateLimitConfig) -> Self {
+        self.rate_limit = Some(config);
+        self
+    }
+}
+
+// ─── Axum layer wiring (server feature) ───────────────────────────────────────
+
+#[cfg(feature = "server")]
+mod layer {
+    use super::{CorsConfig, MiddlewareConfig, RequestContext, RequestLogger};
+    use crate::rate_limiter::{extract_client_id, RateLimitDecision, RateLimiter};
+    use axum::body::Body;
+    use axum::extract::{ConnectInfo, FromRequestParts, State};
+    use axum::http::{request::Parts, HeaderName, HeaderValue, Method, Request, StatusCode};
+    use axum::middleware::Next;
+    use axum::response::{IntoResponse, Response};
+    use axum::{Json, Router};
+    use std::convert::Infallible;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    /// Best-effort [`ConnectInfo`] extractor that degrades to `None` instead
+    /// of rejecting the request when the router was not served via
+    /// [`axum::routing::Router::into_make_service_with_connect_info`] (the
+    /// case for the plain `axum::serve(listener, router)` this crate's
+    /// server currently uses).
+    ///
+    /// `axum`'s own `Option<ConnectInfo<T>>` cannot be used here: as of
+    /// axum-core 0.5 an extractor must opt in to `OptionalFromRequestParts`
+    /// to be wrapped in `Option<..>`, and [`ConnectInfo`] does not. This
+    /// thin wrapper implements [`FromRequestParts`] directly instead, so
+    /// [`rate_limit_mw`] can consult the real peer address *when available*
+    /// without hard-requiring connect-info wiring everywhere
+    /// [`apply_middleware`] with rate limiting enabled is used.
+    struct MaybePeerAddr(Option<SocketAddr>);
+
+    impl<S> FromRequestParts<S> for MaybePeerAddr
+    where
+        S: Send + Sync,
+    {
+        type Rejection = Infallible;
+
+        async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+            match ConnectInfo::<SocketAddr>::from_request_parts(parts, state).await {
+                Ok(ConnectInfo(addr)) => Ok(Self(Some(addr))),
+                Err(_) => Ok(Self(None)),
+            }
+        }
+    }
+
+    /// Attach the configured middleware to `router`.
+    ///
+    /// Layers are applied outermost-first at request time: CORS wraps the rate
+    /// limiter (so even a `429` carries CORS headers), which wraps request
+    /// logging, which wraps the routes.
+    pub fn apply_middleware(mut router: Router, config: MiddlewareConfig) -> Router {
+        if config.enable_request_logging {
+            let logger = Arc::new(RequestLogger::new());
+            router = router.layer(axum::middleware::from_fn_with_state(logger, logging_mw));
+        }
+        if let Some(rate_config) = config.rate_limit {
+            let limiter = Arc::new(RateLimiter::new(rate_config));
+            router = router.layer(axum::middleware::from_fn_with_state(limiter, rate_limit_mw));
+        }
+        if let Some(cors) = config.cors {
+            let cors = Arc::new(cors);
+            router = router.layer(axum::middleware::from_fn_with_state(cors, cors_mw));
+        }
+        router
+    }
+
+    /// Inject the configured `Access-Control-*` headers on every response and
+    /// short-circuit `OPTIONS` preflight requests with `204 No Content`.
+    async fn cors_mw(
+        State(cors): State<Arc<CorsConfig>>,
+        req: Request<Body>,
+        next: Next,
+    ) -> Response {
+        let is_preflight = req.method() == Method::OPTIONS;
+        let mut response = if is_preflight {
+            StatusCode::NO_CONTENT.into_response()
+        } else {
+            next.run(req).await
+        };
+        let headers = response.headers_mut();
+        for (name, value) in cors.access_control_headers() {
+            if let (Ok(header_name), Ok(header_value)) = (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(&value),
+            ) {
+                headers.insert(header_name, header_value);
+            }
+        }
+        response
+    }
+
+    /// Emit a structured request/response log line via the shared logger.
+    async fn logging_mw(
+        State(logger): State<Arc<RequestLogger>>,
+        req: Request<Body>,
+        next: Next,
+    ) -> Response {
+        let ctx = RequestContext::new(req.uri().path(), req.method().as_str(), "");
+        logger.log_request(&ctx);
+        let response = next.run(req).await;
+        logger.log_response(&ctx, response.status().as_u16(), 0);
+        response
+    }
+
+    /// Enforce the per-client rate limit, returning `429 Too Many Requests`
+    /// (with a `Retry-After` header) when a client exceeds its budget. The
+    /// liveness (`/health`) and metrics (`/metrics`) probes are always exempt.
+    ///
+    /// Client identity is derived via [`extract_client_id`]: `X-Forwarded-For`
+    /// / `X-Real-IP` are honored only when the real TCP peer (via
+    /// [`MaybePeerAddr`]) is present in
+    /// [`RateLimitConfig::trusted_proxies`]; otherwise the real peer address
+    /// is used directly. [`MaybePeerAddr`] degrades gracefully (falls back to
+    /// the peer-less `"unknown"` bucket, matching the historical behavior)
+    /// rather than rejecting every request when the router is served without
+    /// `into_make_service_with_connect_info`.
+    ///
+    /// [`RateLimitConfig::trusted_proxies`]: crate::rate_limiter::RateLimitConfig::trusted_proxies
+    async fn rate_limit_mw(
+        State(limiter): State<Arc<RateLimiter>>,
+        MaybePeerAddr(peer): MaybePeerAddr,
+        req: Request<Body>,
+        next: Next,
+    ) -> Response {
+        let path = req.uri().path();
+        if path == "/health" || path == "/metrics" {
+            return next.run(req).await;
+        }
+        let peer_ip = peer.map(|addr| addr.ip());
+        let client_id = extract_client_id(req.headers(), peer_ip, limiter.trusted_proxies());
+        match limiter.check_and_consume(&client_id) {
+            RateLimitDecision::Allow => next.run(req).await,
+            RateLimitDecision::Deny { retry_after_ms } => {
+                let retry_secs = (retry_after_ms.saturating_add(999) / 1000).max(1);
+                let body = Json(serde_json::json!({
+                    "error": {
+                        "message": "rate limit exceeded",
+                        "type": "rate_limit_error",
+                        "retry_after_ms": retry_after_ms,
+                    }
+                }));
+                let mut response = (StatusCode::TOO_MANY_REQUESTS, body).into_response();
+                if let Ok(header_value) = HeaderValue::from_str(&retry_secs.to_string()) {
+                    response
+                        .headers_mut()
+                        .insert(HeaderName::from_static("retry-after"), header_value);
+                }
+                response
+            }
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+pub use layer::apply_middleware;
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -500,6 +704,146 @@ mod tests {
         assert!(
             cache.get("ttl-key").is_none(),
             "stale cache entry must not be returned"
+        );
+    }
+}
+
+// ─── Rate-limit trusted-proxy integration tests (findings serve-api-07 /
+//     security-05) ──────────────────────────────────────────────────────────
+
+#[cfg(all(test, feature = "server"))]
+mod rate_limit_trusted_proxy_tests {
+    use super::apply_middleware;
+    use crate::rate_limiter::RateLimitConfig;
+    use axum::body::Body;
+    use axum::extract::connect_info::MockConnectInfo;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use axum::Router;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use tower::ServiceExt;
+
+    async fn handler() -> &'static str {
+        "ok"
+    }
+
+    /// Regression test for findings `serve-api-07` / `security-05`: with the
+    /// default (empty) `trusted_proxies` allowlist and no real connect-info
+    /// available (mirroring how `oxibonsai-serve` currently serves its
+    /// router via plain `axum::serve`, without connect-info wiring), a
+    /// spoofed `X-Forwarded-For` must NOT grant a fresh rate-limit bucket:
+    /// two requests carrying different claimed origins must land in the
+    /// same ("unknown") bucket, so the second one is rate-limited exactly as
+    /// it would be if the header were absent entirely.
+    #[tokio::test]
+    async fn spoofed_forwarded_header_is_ignored_by_default() {
+        let config = super::MiddlewareConfig::none().with_rate_limit(RateLimitConfig {
+            rps: 1.0,
+            burst: 1.0,
+            ..Default::default()
+        });
+        let router = apply_middleware(Router::new().route("/", get(handler)), config);
+
+        let req1 = Request::builder()
+            .uri("/")
+            .header("x-forwarded-for", "1.1.1.1")
+            .body(Body::empty())
+            .expect("request 1");
+        let resp1 = router.clone().oneshot(req1).await.expect("response 1");
+        assert_eq!(
+            resp1.status(),
+            StatusCode::OK,
+            "first request should be allowed"
+        );
+
+        let req2 = Request::builder()
+            .uri("/")
+            .header("x-forwarded-for", "2.2.2.2")
+            .body(Body::empty())
+            .expect("request 2");
+        let resp2 = router.clone().oneshot(req2).await.expect("response 2");
+        assert_eq!(
+            resp2.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a spoofed X-Forwarded-For claiming a different origin must not \
+             bypass the rate limit by default -- got {:?}",
+            resp2.status()
+        );
+    }
+
+    /// When the real TCP peer *is* present (via `ConnectInfo`, mocked here
+    /// with `MockConnectInfo` since the test harness has no real socket) and
+    /// explicitly listed in `trusted_proxies`, the forwarded header is
+    /// honored -- distinct claimed clients behind that proxy get
+    /// independent buckets (the legitimate reverse-proxy deployment case).
+    #[tokio::test]
+    async fn forwarded_header_from_trusted_proxy_grants_independent_buckets() {
+        let proxy_addr: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let config = super::MiddlewareConfig::none().with_rate_limit(RateLimitConfig {
+            rps: 1.0,
+            burst: 1.0,
+            trusted_proxies: vec![proxy_addr],
+            ..Default::default()
+        });
+        let router = apply_middleware(Router::new().route("/", get(handler)), config)
+            .layer(MockConnectInfo(SocketAddr::new(proxy_addr, 4000)));
+
+        let req1 = Request::builder()
+            .uri("/")
+            .header("x-forwarded-for", "1.1.1.1")
+            .body(Body::empty())
+            .expect("request 1");
+        let resp1 = router.clone().oneshot(req1).await.expect("response 1");
+        assert_eq!(resp1.status(), StatusCode::OK);
+
+        let req2 = Request::builder()
+            .uri("/")
+            .header("x-forwarded-for", "2.2.2.2")
+            .body(Body::empty())
+            .expect("request 2");
+        let resp2 = router.clone().oneshot(req2).await.expect("response 2");
+        assert_eq!(
+            resp2.status(),
+            StatusCode::OK,
+            "a distinct forwarded client behind a trusted proxy should get \
+             its own bucket, not share the first client's"
+        );
+    }
+
+    /// An untrusted peer (not in `trusted_proxies`) must not have its
+    /// forwarded header honored even when `ConnectInfo` is available --
+    /// the allowlist match must be exact.
+    #[tokio::test]
+    async fn forwarded_header_from_untrusted_peer_is_still_ignored() {
+        let untrusted_peer: IpAddr = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+        let trusted: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let config = super::MiddlewareConfig::none().with_rate_limit(RateLimitConfig {
+            rps: 1.0,
+            burst: 1.0,
+            trusted_proxies: vec![trusted],
+            ..Default::default()
+        });
+        let router = apply_middleware(Router::new().route("/", get(handler)), config)
+            .layer(MockConnectInfo(SocketAddr::new(untrusted_peer, 4000)));
+
+        let req1 = Request::builder()
+            .uri("/")
+            .header("x-forwarded-for", "1.1.1.1")
+            .body(Body::empty())
+            .expect("request 1");
+        let resp1 = router.clone().oneshot(req1).await.expect("response 1");
+        assert_eq!(resp1.status(), StatusCode::OK);
+
+        let req2 = Request::builder()
+            .uri("/")
+            .header("x-forwarded-for", "2.2.2.2")
+            .body(Body::empty())
+            .expect("request 2");
+        let resp2 = router.clone().oneshot(req2).await.expect("response 2");
+        assert_eq!(
+            resp2.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "an untrusted peer's forwarded header must not grant a fresh bucket"
         );
     }
 }

@@ -16,7 +16,7 @@
 //!             FP16 LE    16 nibble bytes → 32 weights
 //! ```
 //! Dequant: `weight[j] = d_f32 * (nibble[j] as f32 - 8.0)` where
-//! even `j → qs[j/2] & 0x0F`, odd `j → (qs[j/2] >> 4) & 0x0F`.
+//! lo-hi split: elements 0–15 from lower nibbles of bytes 0–15; elements 16–31 from upper nibbles.
 //!
 //! **Q8_0** (34 bytes/block, 32 weights):
 //! ```text
@@ -62,9 +62,9 @@ pub const CUDA_Q_STD_KERNELS_SRC: &str = r#"
 
    Q4_0 block layout (AoS, 18 bytes/block):
      bytes 0-1:   FP16 LE scale (d)
-     bytes 2-17:  16 nibble bytes → 32 int4 weights
+     bytes 2-17:  16 nibble bytes → 32 int4 weights (llama.cpp lo-hi split)
      Dequant: w[j] = d * (nibble[j] - 8)
-     nibble[j]: even j → qs[j/2] & 0x0F, odd j → (qs[j/2] >> 4) & 0x0F
+     nibble[j]: elements 0-15 use lower nibbles of bytes 0-15; elements 16-31 use upper nibbles
 
    Q8_0 block layout (AoS, 34 bytes/block):
      bytes 0-1:   FP16 LE scale (d)
@@ -113,14 +113,15 @@ extern "C" __global__ void gemv_q4_0(
         /* Scale: first 2 bytes = FP16 little-endian */
         const unsigned short d_raw = (unsigned short)bptr[0] | ((unsigned short)bptr[1] << 8u);
         const float scale = q_fast_fp16_to_float(d_raw);
-        /* 16 nibble bytes = 32 weights */
+        /* 16 nibble bytes = 32 weights (llama.cpp-compatible lo-hi split):
+           byte nb encodes element[nb] in lower nibble and element[nb+16] in upper nibble */
         const float* xbase = input + (b << 5u);  /* b * 32 */
         #pragma unroll 16
         for (unsigned int nb = 0u; nb < 16u; ++nb) {
             const unsigned int byte = bptr[2u + nb];
-            const float w0 = scale * (float)((int)(byte & 0x0Fu) - 8);
-            const float w1 = scale * (float)((int)((byte >> 4u) & 0x0Fu) - 8);
-            acc += w0 * xbase[nb * 2u] + w1 * xbase[nb * 2u + 1u];
+            const float w0 = scale * (float)((int)(byte & 0x0Fu) - 8);      /* element nb */
+            const float w1 = scale * (float)((int)((byte >> 4u) & 0x0Fu) - 8); /* element nb+16 */
+            acc += w0 * xbase[nb] + w1 * xbase[nb + 16u];
         }
     }
 

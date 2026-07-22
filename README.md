@@ -13,24 +13,27 @@ To our knowledge, OxiBonsai is the first pure-Rust — C/C++/Fortran-free, zero-
 ## Documentation
 
 - [CLI reference](docs/CLI.md) — every `oxibonsai` and `oxibonsai-serve` subcommand, flag, and environment variable.
+- [Deployment guide](docs/DEPLOYMENT.md) — which binary to run in production, reverse-proxy/TLS setup, bearer auth, admission limits, and Prometheus scraping.
 - [Image-generation guide](docs/IMAGEN.md) — end-to-end Bonsai-Image (FLUX.2-Klein) text-to-image walkthrough.
+- [Known Limitations](#known-limitations) — honest current-reality notes on GPU-tier coverage, standalone (not-yet-wired) building blocks, and a mitigated CUDA/FP8 batch-prefill note (disabled-by-default, no correctness impact).
 
 ## Status
 
-**Version 0.2.2** — 2026-06-08 · **4,671 tests passing** · ~177k lines of Rust · Pure Rust
+**Version 0.2.3** — 2026-07-21 · **5,158 tests passing** · ~197k lines of Rust · Pure Rust
 
 | Crate | Status | Tests |
 |-------|--------|-------|
-| oxibonsai-core     | Stable | 207   |
-| oxibonsai-kernels  | Stable | 675   |
-| oxibonsai-model    | Stable | 673   |
-| oxibonsai-runtime  | Stable | 796   |
-| oxibonsai-tokenizer| Stable | 206   |
-| oxibonsai-rag      | Stable | 871   |
-| oxibonsai-eval     | Stable | 513   |
-| oxibonsai-serve    | Stable | 260   |
-| oxibonsai-image    | Stable | 72                   |
-| oxibonsai (facade) | Stable | 352   |
+| oxibonsai-core     | Stable | 465   |
+| oxibonsai-kernels  | Stable | 508   |
+| oxibonsai-model    | Stable | 1,209 |
+| oxibonsai-runtime  | Stable | 1,667 |
+| oxibonsai-tokenizer| Stable | 375   |
+| oxibonsai-rag      | Stable | 212   |
+| oxibonsai-eval     | Stable | 274   |
+| oxibonsai-serve    | Stable | 178   |
+| oxibonsai-image    | Stable | 86    |
+| oxibonsai (facade) | Stable | 1     |
+| oxibonsai-cli      | Stable | 183   |
 
 ## Features
 
@@ -57,7 +60,9 @@ Two native quantization families, each with dedicated dequant / GEMV / full-forw
 | NEON | AArch64 | 128-bit | `simd-neon` |
 | **Metal** | Apple Silicon | GPU, fused full-forward | `metal` |
 | **CUDA (native)** | NVIDIA GPU | GPU, NVRTC kernels | `native-cuda` |
-| **CUDA (scirs2)** | NVIDIA GPU | GPU via scirs2-core | `cuda` |
+| **CUDA (scirs2)** | NVIDIA GPU | CPU SIMD fallback † | `cuda` |
+
+> † **The `cuda` (scirs2-core) tier currently runs on CPU, not GPU.** scirs2-core retired its cudarc-based CUDA backend in 0.6.x, so `is_accelerated()` always returns `false` for this tier and the dispatcher transparently falls back to CPU SIMD — output is correct, just not GPU-accelerated. Use `native-cuda` for real NVIDIA GPU acceleration. See [Known Limitations](#known-limitations).
 
 Auto-detection via `KernelDispatcher::auto_detect()` selects the best CPU tier at runtime. GPU backends are opt-in at build time.
 
@@ -101,9 +106,13 @@ Two adaptive controllers shipped in 0.1.4 let the runtime self-tune as the workl
 ```rust
 use oxibonsai_runtime::{KvCachePolicy, AdaptiveLookahead, AdaptiveLookaheadConfig};
 
-// KV cache policy: FP16 ↔ Q8 ↔ Q4 driven by EWMA pressure with hysteresis.
+// KV cache policy: computes a target FP16 / Q8 / Q4 level from EWMA pressure
+// with hysteresis. NOTE: this is advisory/telemetry only today — `observe()`
+// drives the `/admin/*` JSON endpoint and a Prometheus gauge, it does not
+// itself change the model's actual KV-cache storage precision (see
+// "Known Limitations").
 let kv = KvCachePolicy::default();
-let level = kv.observe(0.92);  // → escalates to Q8 once smoothed pressure crosses 0.80
+let level = kv.observe(0.92);  // → target escalates to Q8 once smoothed pressure crosses 0.80
 
 // Speculative-decoding draft length: continuously updated from acceptance EWMA.
 let mut k = AdaptiveLookahead::new(AdaptiveLookaheadConfig::default());
@@ -173,7 +182,7 @@ This installs the `oxibonsai` binary. Rust 1.86+ required.
 
 ```toml
 [dependencies]
-oxibonsai = "0.2.2"
+oxibonsai = "0.2.3"
 ```
 
 ### Build from source (for development)
@@ -440,7 +449,7 @@ All default-feature dependencies are Pure Rust — zero C/C++/Fortran, zero FFI.
 | Phase 3 | Inference Runtime (KV cache, sampling, CLI) | ✅ |
 | Phase 4 | Production Hardening (SIMD, parallel, tests, observability) | ✅ |
 | Phase 5 | Ecosystem Integration (SSE streaming, WASM, API, Bonsai family) | ✅ |
-| Phase 6 | Advanced Infrastructure (Multi-GPU, CUDA/Metal, PagedAttention) | ✅ |
+| Phase 6 | Advanced Infrastructure (Multi-GPU, CUDA/Metal, PagedAttention) | ✅ * |
 | Phase 7 | Production Features (model merging, flash decoding, RAG, eval) | ✅ |
 | Phase 8 | Final Polish (K-quant, streaming GGUF, kernel tuning, tests) | ✅ |
 | Phase 9 | Ternary Bonsai (TQ2\_0\_g128 kernels, model variants, GGUF surface, export) | ✅ |
@@ -449,6 +458,42 @@ All default-feature dependencies are Pure Rust — zero C/C++/Fortran, zero FFI.
 | Phase 12 | Native CUDA backend (NVRTC, fused Q1 + TQ2 full-forward) | ✅ |
 | Phase 13.x | Fused Metal TQ2 full-forward (single command buffer, ~13× speedup on 1.7B) | ✅ |
 | Phase 13.y | Ternary LM head on GPU — closes all 7 `OutputWeight::Ternary` guard sites (4 Metal + 3 CUDA); +5 tok/s on Metal | ✅ |
+
+\* Phase 6 items marked complete are implemented and tested, but several are standalone building blocks not yet wired into the default inference path, or are honestly-labeled simulations rather than the literal capability their name suggests — see [Known Limitations](#known-limitations) immediately below for the itemized, current-reality breakdown.
+
+## Known Limitations
+
+Everything below is implemented, tested, and either self-documented in its own module doc comments or tracked in [`TODO.md`](TODO.md)'s Production-Release Audit section — nothing here is a secret, but several roadmap/README lines elsewhere in this document are easy to over-read as "fully wired into inference." This section is the honest, consolidated version.
+
+**Acceleration & scaling**
+
+- **`cuda` (scirs2-core) tier is a CPU fallback, not GPU acceleration.** `is_accelerated()` always returns `false` for CUDA because scirs2-core retired its cudarc-based backend in 0.6.x; the dispatcher silently falls back to CPU SIMD. Output is correct — there is no garbage-token risk — it is simply not GPU-accelerated. Use `native-cuda` for real NVIDIA GPU throughput.
+- **"True multi-GPU inference" is a rayon CPU simulation of NCCL-style collectives**, not real inter-GPU communication. `multi_gpu.rs`'s own doc comment says as much ("a real GPU backend would swap in NCCL/cuBLAS calls"). `DeviceMesh`/`multi_gpu.rs` is not wired into any actual multi-device dispatch path.
+- **"Distributed serving" is an in-memory routing topology, not a networked serving layer.** `distributed.rs` implements consistent-hash-ring request routing and a node registry entirely in-process; its own doc comment states "no actual TCP connections are made." There is no cross-node request forwarding anywhere in this codebase.
+
+**GPU platform coverage**
+
+- **Metal now has full Q4_0/Q8_0/K-quant (Q2_K–Q8_K) and FP8 batch-prefill coverage (closed 2026-07-21).** Two gaps that shipped as documented limitations through 0.2.3's first hardening pass are now resolved: (1) Metal GEMV kernels + host dispatch exist for all 8 standard/K-quant formats, and the corresponding model-layer `Linear*::forward()` implementations now try Metal first (mirroring the pre-existing CUDA short-circuit) before falling back to CPU on any error — macOS users loading Q4_0/K-quant GGUFs now get real GPU acceleration, not silent CPU-only execution. (2) Metal FP8 batch prefill is implemented as a hybrid design: the heavy linear projections (fused QKV, attn-output, fused gate/up SwiGLU, FFN down) run as batched FP8 GEMMs on the GPU, while q/k-norm, RoPE, attention, and the K/V store stay on the CPU against the same cache per-token decode reads — this avoids the split-KV-cache bug class described below *by construction* (contrast the CUDA FP8 note immediately below, which took the split-cache route and stays disabled). Both are parity-validated on Apple-Silicon M3 (GEMV ≤1e-4 rel / 5e-3 abs; FP8 prefill logit cos=1.000000 + identical greedy continuation).
+- **FP8 CUDA batch prefill is intentionally disabled-by-default (KV-cache-handoff bug fixed 2026-07-20).** The FP8 batch-prefill path wrote the prompt K/V into its own private GPU KV cache, separate from the CPU cache per-token CUDA decode reads — the same bug class found and fixed for Q1/ternary and disabled-by-default for Q4_0/Q8_0/K-quant. It now carries the identical split-cache guard: FP8 CUDA batch prefill returns early so `forward_prefill` falls back to the bit-correct sequential per-token path (which populates the CPU KV cache decode reads), plus a context-length guard that turns an over-long prompt into a clean `SequenceTooLong` instead of a panic. **Practical impact: none for correctness** — FP8 E4M3/E5M2 CUDA models now decode correctly at any prompt length (verified by a CPU↔CUDA synthetic-model prefill→decode parity gate). The one cost is that FP8 CUDA prompt prefill runs the sequential per-token path rather than the fused batch GEMM; setting `OXIBONSAI_FORCE_CUDA_SPLIT_PREFILL=1` re-enables the fused (decode-incorrect) path for throughput microbenchmarks only. Note the Metal FP8 path above deliberately avoided this bug class rather than mitigating it after the fact — it never writes a GPU-private cache. Tracked in `TODO.md`.
+
+**Building blocks implemented and tested, but not wired into the default forward path**
+
+`BonsaiModel::forward`/`forward_prefill` run a single dense GQA-attention + dense-SwiGLU-FFN Qwen3 layer stack. The following are complete, unit-tested library primitives usable by external consumers of the crates, but none of them execute inside that default forward path today:
+
+- **PagedAttention** (`PagedKvCache`/`BlockPool`/`BlockTable`/`KvPage`, `oxibonsai-model/src/paged_kv_cache.rs`) — the shipping engine uses the contiguous `KvCache` instead.
+- **KV-cache quantization** (`QuantizedKvCache`, `Fp8KvCache`, `kv_cache_quant.rs`) — never constructed by the model or runtime. Separately, `oxibonsai-runtime`'s `KvCachePolicy` computes an adaptive FP16/Q8/Q4 *target level* from memory pressure, but only feeds a Prometheus gauge and an admin endpoint — it does not reconfigure the actual cache. Its `Fp8` tier is additionally unreachable (no threshold selects it).
+- **Attention-variant layers** — attention sink / StreamingLLM, sparse attention (local/strided/BigBird/Longformer/dilated), flash decoding's alternate path, cross-attention, Mixture-of-Depths, and the MoE router/expert modules all have zero call sites in `TransformerBlock::forward` outside their own test suites.
+- **Sliding-window attention** (`TransformerBlock::forward_with_sliding_window`, `block/types/forward_sw.rs`) — a complete, unit-tested ~330-line implementation (RoPE, QK-norm, windowed KV lookup, parallel/sequential attention, fused FFN) with the same integration gap as the attention variants above: `BonsaiModel::forward`/`forward_prefill` call only the dense/full-attention `block.forward(...)`, and `Qwen3Config` has no `sliding_window` field at all, so no shipped GGUF metadata can currently select it.
+- **RoPE-scaling variants** — YaRN (`yarn_rope.rs`) and the linear/DynamicNTK/LLaMA-3.1/LongRoPE strategies (`rope_scaling.rs`) are fully implemented, but the production `RopeTable` only ever builds plain unscaled RoPE; no shipped native Bonsai GGUF metadata currently selects a scaling strategy.
+
+**Chat prompt template**
+
+- **The OpenAI-compatible server always assembles a hardcoded ChatML prompt** (`<|im_start|>role\ncontent<|im_end|>`, in `build_prompt` in `oxibonsai-runtime/src/server.rs` and `build_extended_prompt` in `oxibonsai-runtime/src/api_extensions.rs`), regardless of which model is loaded. `oxibonsai-tokenizer` separately implements a real multi-family `ChatTemplateKind` (ChatML, Llama-3, Mistral, Gemma, Qwen) with a `render`/`render_with_generation_prompt` API, but the server never calls into it, and no code path reads a per-model `chat_template` field from `tokenizer.json` to auto-select the right family. All shipped Bonsai models use Qwen3 (ChatML-compatible), so this is not a correctness bug for the models this project ships — but serving a non-ChatML fine-tune through the OpenAI-compatible API today gets the wrong prompt format with no warning.
+
+**Speculative decoding**
+
+- The production two-engine path is `SpeculativeDecoder::generate_verified(&mut target_engine, ...)` — it drafts against the delta-KV path and verifies against a real, separate target `InferenceEngine`, and its accepted output is token-identical to plain greedy decoding of the target model.
+- The originally-shipped `generate_speculative`/`verify` API is retained only as a `#[doc(hidden)]` synthetic test harness (mock draft probability, synthesized target logits) — it is not exposed as a production entry point.
 
 ## Sponsorship
 

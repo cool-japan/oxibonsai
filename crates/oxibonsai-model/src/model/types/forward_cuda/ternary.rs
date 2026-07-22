@@ -104,10 +104,10 @@ impl<'a> BonsaiModel<'a> {
     /// Returns the last token's logits.  Mirrors `try_cuda_prefill_with_lm_head` but
     /// uses TQ2 GEMM/GEMV kernels throughout.
     ///
-    /// Currently unused: the caller (`try_cuda_prefill_with_lm_head`) disables this
-    /// path because of a prefill→decode KV-cache handoff bug (see the dispatcher in
-    /// `forward_cuda/q1.rs`). Kept so it can be re-enabled once fixed.
-    #[allow(dead_code)]
+    /// Enabled via the dispatcher in `forward_cuda/q1.rs`: the CUDA prefill KV
+    /// cache is unified with the decode KV cache (`cuda_prefill` delegates to
+    /// `cuda_full_layer::acquire_kv_cache`), so the prompt K/V written here is the
+    /// same buffer per-token decode reads.
     pub(super) fn try_cuda_prefill_with_lm_head_ternary(
         &self,
         token_ids: &[u32],
@@ -117,6 +117,15 @@ impl<'a> BonsaiModel<'a> {
         let n_layers = self.blocks.len();
         if n_layers == 0 {
             return Err("no blocks".into());
+        }
+        // Context-length guard: prevents an out-of-bounds RoPE slice panic on
+        // prompts longer than the context (mirrors `forward()`).
+        if pos_start + batch_size > self.kv_cache.max_seq_len() {
+            return Err(format!(
+                "ternary prefill sequence too long: {batch_size} tokens at pos {pos_start} exceeds max_seq_len {}",
+                self.kv_cache.max_seq_len()
+            )
+            .into());
         }
         let lm_head_ternary = match &self.output_weight {
             OutputWeight::Ternary(ref t) => t,
@@ -213,6 +222,15 @@ impl<'a> BonsaiModel<'a> {
         let n_layers = self.blocks.len();
         if n_layers == 0 {
             return Err("no blocks".into());
+        }
+        // Context-length guard: prevents an out-of-bounds RoPE slice panic on
+        // prompts longer than the context (mirrors `forward()`).
+        if pos_start + batch_size > self.kv_cache.max_seq_len() {
+            return Err(format!(
+                "ternary prefill-verify sequence too long: {batch_size} tokens at pos {pos_start} exceeds max_seq_len {}",
+                self.kv_cache.max_seq_len()
+            )
+            .into());
         }
         let lm_head_ternary = match &self.output_weight {
             OutputWeight::Ternary(ref t) => t,

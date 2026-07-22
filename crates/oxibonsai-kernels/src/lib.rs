@@ -12,8 +12,8 @@
 //! tiered dispatch architecture that auto-selects the fastest implementation
 //! available on the current CPU:
 //!
-//! | Tier | Feature gate | Instruction set |
-//! |------|-------------|-----------------|
+//! | Tier | Cargo feature (informational) | Instruction set |
+//! |------|-------------------------------|-----------------|
 //! | **Reference** | always | Pure scalar Rust (correctness baseline) |
 //! | **AVX2+FMA** | `simd-avx2` | 256-bit SIMD (x86-64) |
 //! | **AVX-512** | `simd-avx512` | 512-bit SIMD (x86-64) |
@@ -21,6 +21,12 @@
 //!
 //! Runtime dispatch is handled by [`KernelDispatcher`] which queries
 //! SciRS2-Core's SIMD capability cache on construction.
+//!
+//! **The `simd-avx2` / `simd-avx512` / `simd-neon` Cargo features do NOT gate
+//! tier selection.** They are empty no-op features kept for compatibility; every
+//! tier is always compiled in and chosen purely at runtime via CPU feature
+//! detection. Omitting `simd-avx2`, for example, does not disable the AVX2 tier.
+//! The middle column above is therefore informational only.
 //!
 //! ## Key Kernels
 //!
@@ -89,13 +95,15 @@ pub use gpu_backend::{
     build_cached_weights, build_cached_weights_ternary_only, metal_fused_gate_up_swiglu_fp8_e4m3,
     metal_fused_gate_up_swiglu_fp8_e5m2, metal_gemm_fp8_e4m3, metal_gemm_fp8_e4m3_residual,
     metal_gemm_fp8_e5m2, metal_gemm_fp8_e5m2_residual, metal_gemv_fp8_e4m3, metal_gemv_fp8_e5m2,
-    print_gpu_profile_summary, try_metal_ffn, try_metal_forward_greedy_ternary,
-    try_metal_full_forward, try_metal_full_forward_cached, try_metal_full_forward_prefill,
-    try_metal_full_forward_prefill_ternary, try_metal_full_forward_prefill_verify,
-    try_metal_full_forward_prefill_verify_ternary, try_metal_full_forward_ternary,
-    try_metal_full_layer, try_metal_prefill_ternary, try_metal_prefill_verify_ternary,
-    try_metal_qkv, CachedLayerWeights, CachedModelWeights, FullForwardLayerParams,
-    FullForwardLayerParamsTernary, MetalGraph, MetalGraphError, MetalWeightHandle,
+    metal_gemv_q2k, metal_gemv_q3k, metal_gemv_q4_0, metal_gemv_q4k, metal_gemv_q5k,
+    metal_gemv_q6k, metal_gemv_q8_0, metal_gemv_q8k, print_gpu_profile_summary, try_metal_ffn,
+    try_metal_forward_greedy_ternary, try_metal_full_forward, try_metal_full_forward_cached,
+    try_metal_full_forward_prefill, try_metal_full_forward_prefill_ternary,
+    try_metal_full_forward_prefill_verify, try_metal_full_forward_prefill_verify_ternary,
+    try_metal_full_forward_ternary, try_metal_full_layer, try_metal_prefill_ternary,
+    try_metal_prefill_verify_ternary, try_metal_qkv, CachedLayerWeights, CachedModelWeights,
+    FullForwardLayerParams, FullForwardLayerParamsTernary, MetalGraph, MetalGraphError,
+    MetalWeightHandle,
 };
 
 #[cfg(all(
@@ -167,6 +175,12 @@ pub mod simd_fp8_avx512;
 pub mod simd_fp8_neon;
 #[cfg(target_arch = "aarch64")]
 pub mod simd_neon;
+#[cfg(target_arch = "x86_64")]
+pub mod simd_q_std_avx2;
+#[cfg(target_arch = "x86_64")]
+pub mod simd_q_std_avx512;
+#[cfg(target_arch = "aarch64")]
+pub mod simd_q_std_neon;
 pub mod tiled;
 pub mod traits;
 pub mod weight_cache;
@@ -177,7 +191,7 @@ pub mod simd_float_ops;
 pub mod tuning;
 
 pub use aligned::{AlignedBlocks, AlignedBuffer};
-pub use dispatch::{KernelDispatcher, KernelTier};
+pub use dispatch::{cpu_kernel_tier, KernelDispatcher, KernelTier};
 pub use error::{KernelError, KernelResult};
 pub use gemv_q2k::gemv_q2k;
 pub use gemv_q3k::gemv_q3k;
@@ -189,11 +203,11 @@ pub use gemv_q8_0::gemv_q8_0;
 pub use gemv_q8k::gemv_q8k;
 pub use parallel::{
     gemm_fp8_e4m3_par, gemm_fp8_e5m2_par, gemm_ternary_g128_par, gemv_fp8_e4m3_par,
-    gemv_fp8_e5m2_par, gemv_ternary_g128_par,
+    gemv_fp8_e5m2_par, gemv_q4_0_par, gemv_q8_0_par, gemv_ternary_g128_par,
 };
 pub use parallel_tiled::{gemm_adaptive_ternary, gemv_adaptive, gemv_adaptive_ternary};
 pub use prefetch::{PrefetchConfig, PrefetchLocality, PrefetchStrategy};
 pub use simd_float_ops::{rms_norm_simd, rope_apply_simd, silu_simd, softmax_simd, swiglu_simd};
-pub use traits::{Fp8Kernel, OneBitKernel, TernaryKernel};
+pub use traits::{Fp8Kernel, OneBitKernel, StandardQuantKernel, TernaryKernel};
 pub use tuning::{PlatformProfile, TunedThresholds, TuningSummary};
 pub use weight_cache::GpuWeightHandle;

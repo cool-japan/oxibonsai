@@ -7,7 +7,7 @@
 use crate::error::KernelResult;
 use crate::weight_cache::GpuWeightHandle;
 use oxibonsai_core::tensor::BlockQ1_0G128;
-use oxibonsai_core::{BlockFP8E4M3, BlockFP8E5M2};
+use oxibonsai_core::{BlockFP8E4M3, BlockFP8E5M2, BlockQ4_0, BlockQ8_0};
 
 /// Trait for Q1\_0\_g128 compute kernel implementations.
 ///
@@ -361,4 +361,47 @@ pub trait Fp8Kernel: Send + Sync {
     fn name_fp8(&self) -> &'static str {
         "fp8_reference"
     }
+}
+
+/// Standard GGUF quant-format (Q4_0, Q8_0) weight matrix kernel operations.
+///
+/// Parallel to [`OneBitKernel`] / [`TernaryKernel`] / [`Fp8Kernel`] for the two
+/// most common distributed GGUF weight formats. [`crate::KernelDispatcher`]
+/// implements this and delegates each GEMV to the best available CPU tier
+/// (AVX-512 / AVX2 SIMD decode + FMA on x86-64, scalar reference otherwise).
+///
+/// The free functions `crate::gemv_q4_0` / `crate::gemv_q8_0` route through
+/// this trait (plus Rayon row-parallelism), so callers get tiered SIMD without
+/// constructing a dispatcher themselves.
+pub trait StandardQuantKernel: Send + Sync {
+    /// Fused Q4_0 matrix × FP32 vector product (GEMV).
+    ///
+    /// `output[row] = dot(weight_row[row], input)` for a row-major Q4_0 weight
+    /// matrix (`n_rows * (in_features / QK_Q4_0)` blocks).
+    ///
+    /// # Errors
+    ///
+    /// - [`crate::error::KernelError::NotBlockAligned`] if `in_features % QK_Q4_0 != 0`.
+    /// - [`crate::error::KernelError::DimensionMismatch`] if `input` or `blocks` are too short.
+    /// - [`crate::error::KernelError::BufferTooSmall`] if `output` is too short.
+    fn gemv_q4_0(
+        &self,
+        blocks: &[BlockQ4_0],
+        input: &[f32],
+        output: &mut [f32],
+        n_rows: usize,
+        in_features: usize,
+    ) -> KernelResult<()>;
+
+    /// Fused Q8_0 matrix × FP32 vector product (GEMV).
+    ///
+    /// Same contract as [`Self::gemv_q4_0`] but for Q8_0 (8-bit) weights.
+    fn gemv_q8_0(
+        &self,
+        blocks: &[BlockQ8_0],
+        input: &[f32],
+        output: &mut [f32],
+        n_rows: usize,
+        in_features: usize,
+    ) -> KernelResult<()>;
 }

@@ -356,7 +356,7 @@ fn cache_direct_lru_stress() {
     let mut cache = AllowedTokensCache::with_capacity(cap);
 
     for i in 0u64..32 {
-        cache.insert(i, vec![true; 16]);
+        cache.insert(i, 16, vec![true; 16]);
         assert!(
             cache.len() <= cap,
             "cache len {} exceeded capacity {cap}",
@@ -369,7 +369,7 @@ fn cache_direct_lru_stress() {
     // The last `cap` keys (24..31) should be present; earlier ones evicted.
     for i in 24u64..32 {
         assert!(
-            cache.get(i).is_some(),
+            cache.get(i, 16).is_some(),
             "key {i} should still be present in LRU"
         );
     }

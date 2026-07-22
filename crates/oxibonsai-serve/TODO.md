@@ -4,8 +4,8 @@
 > environment-variable mapping, validation, Prometheus-text metrics, and a
 > bearer-auth middleware around the Axum router from `oxibonsai-runtime`.
 >
-> 9 source files + 6 integration test files, 260 tests (all passing).
-> Version 0.2.2 — last reviewed 2026-06-06.
+> 8 source files + 7 integration test files, 178 tests (all passing).
+> Version 0.2.3 — last reviewed 2026-07-21.
 
 ## Status: Stable (Alpha → Stable uplift complete)
 
@@ -45,6 +45,19 @@ The binary now:
 - [x] Canonical `examples/server_config.toml`
 - [x] Integration tests for config, env, validation, metrics, property-
   based invariants, and HTTP server surface (ephemeral-port booting)
+- [x] **Admission control** — `tower::limit::GlobalConcurrencyLimitLayer`
+  (`limits.max_concurrent_requests`) + `.timeout(limits.per_request_timeout_ms)`
+  genuinely enforced via a `load_shed` + `HandleErrorLayer` stack; an
+  overloaded request gets `503`, a timed-out one gets `408` (`main.rs`)
+- [x] **`tokenizer.kind` backend whitelist** — rejected at validation time if
+  not one of the backends this build can actually honor
+  (`validation::VALID_TOKENIZER_KINDS`)
+- [x] **CLI-flag-precedence fix** — a flag explicitly passed on the command
+  line (even when its value equals the built-in default) now always
+  outranks a lower-precedence TOML/env value, via `ServerArgs::explicit_flags`
+  (`args.rs`)
+- [x] **Constant-time bearer-token comparison** — local `constant_time_eq`
+  helper (no `subtle` dependency) guards the bearer-auth check in `main.rs`
 
 ## Done (Alpha milestone, preserved)
 

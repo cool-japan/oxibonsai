@@ -118,7 +118,7 @@ pub const DIT_ATTN_MAX_HEAD_DIM: usize = 256;
 ///   - `scale`     (f32 scalar) `[[buffer(7)]]`
 ///
 /// Dispatch: `[ceil(seq/FA_BQ), num_heads, 1]` threadgroups,
-/// `[FA_SIMDGROUPS·32, 1, 1] = [128, 1, 1]` threads.
+/// `[FA_SIMDGROUPS·32, 1, 1] = [256, 1, 1]` threads.
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub const MSL_DIT_JOINT_ATTENTION_FLASH: &str = r#"
 #include <metal_stdlib>

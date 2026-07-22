@@ -12,7 +12,7 @@ use super::types::CudaGraphError;
 use super::cudagraph_type::CudaGraph;
 
 impl CudaGraph {
-    /// Like [`get_or_upload_weight_soa`] but accepts a lazy byte producer.
+    /// Like [`Self::get_or_upload_weight_soa`] but accepts a lazy byte producer.
     ///
     /// The closure is only called on the first use of `handle_id`.  Useful when
     /// the caller needs to concatenate gate+up bytes without computing them on

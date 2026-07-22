@@ -84,7 +84,11 @@ pub fn make_tool_call(id: String, name: String, arguments: String) -> ToolCall {
 ///
 /// 1. That a `name` field is present.
 /// 2. That the name appears in `tools` (when `tools` is non-empty).
-/// 3. That the `arguments` value, if present, is a valid JSON object.
+/// 3. That the `arguments` value satisfies the matched tool's parameter
+///    schema — i.e. it parses as a JSON object and every property listed in
+///    the schema's `required` array is present (via
+///    [`validate_tool_arguments`]). When `tools` is empty there is no schema
+///    to validate against, so only a bare JSON-parse check is performed.
 ///
 /// On success the returned [`ToolCall`] carries a freshly generated ID.
 ///
@@ -92,7 +96,8 @@ pub fn make_tool_call(id: String, name: String, arguments: String) -> ToolCall {
 ///
 /// - [`ToolCallError::NoToolCallFound`] — no `<tool_call>` tag found.
 /// - [`ToolCallError::UnknownTool`]    — name not in `tools` registry.
-/// - [`ToolCallError::MalformedArguments`] — argument payload is not valid JSON.
+/// - [`ToolCallError::MalformedArguments`] — argument payload is not valid
+///   JSON, is not a JSON object, or is missing a required property.
 pub fn select_tool(output: &str, tools: &[ToolDefinition]) -> Result<ToolCall, ToolCallError> {
     let call_id = new_tool_call_id();
 
@@ -100,25 +105,40 @@ pub fn select_tool(output: &str, tools: &[ToolDefinition]) -> Result<ToolCall, T
     let tool_call = crate::api_types::parse_tool_call(output, &call_id)
         .ok_or(ToolCallError::NoToolCallFound)?;
 
-    // Validate the name against the registered tools (if any).
-    if !tools.is_empty() {
-        let known = tools
+    // Validate the name against the registered tools (if any), keeping a
+    // reference to the matched tool so its parameter schema can be used to
+    // validate the arguments below.
+    let matched_tool = if tools.is_empty() {
+        None
+    } else {
+        let matched = tools
             .iter()
-            .any(|t| t.function.name == tool_call.function.name);
-        if !known {
-            return Err(ToolCallError::UnknownTool {
-                name: tool_call.function.name.clone(),
-            });
+            .find(|t| t.function.name == tool_call.function.name);
+        match matched {
+            Some(tool) => Some(tool),
+            None => {
+                return Err(ToolCallError::UnknownTool {
+                    name: tool_call.function.name.clone(),
+                });
+            }
+        }
+    };
+
+    match matched_tool {
+        // A registered tool was matched: enforce its full parameter schema
+        // (JSON object + all required properties present), not just
+        // "parses as JSON".
+        Some(tool) => {
+            validate_tool_arguments(&tool_call.function.arguments, tool)?;
+        }
+        // No registry to validate against — fall back to a bare JSON parse.
+        None => {
+            let _parsed: serde_json::Value = serde_json::from_str(&tool_call.function.arguments)
+                .map_err(|e| ToolCallError::MalformedArguments {
+                    reason: e.to_string(),
+                })?;
         }
     }
-
-    // Validate that the arguments string is valid JSON.
-    let _parsed: serde_json::Value =
-        serde_json::from_str(&tool_call.function.arguments).map_err(|e| {
-            ToolCallError::MalformedArguments {
-                reason: e.to_string(),
-            }
-        })?;
 
     Ok(tool_call)
 }
@@ -424,6 +444,28 @@ mod tests {
         let output = r#"<tool_call>{"name":"any_function","arguments":{}}</tool_call>"#;
         let tc = select_tool(output, &[]).expect("should accept any tool");
         assert_eq!(tc.function.name, "any_function");
+    }
+
+    // Regression test for issue #56: select_tool must reject a tool call whose
+    // arguments are missing a required property, not just check "is valid JSON".
+    #[test]
+    fn select_tool_missing_required_argument_returns_malformed_arguments() {
+        let output = r#"<tool_call>{"name":"get_weather","arguments":{}}</tool_call>"#;
+        let tools = vec![weather_tool()];
+        assert!(matches!(
+            select_tool(output, &tools),
+            Err(ToolCallError::MalformedArguments { .. })
+        ));
+    }
+
+    #[test]
+    fn select_tool_non_object_arguments_returns_malformed_arguments() {
+        let output = r#"<tool_call>{"name":"get_weather","arguments":"not-an-object"}</tool_call>"#;
+        let tools = vec![weather_tool()];
+        assert!(matches!(
+            select_tool(output, &tools),
+            Err(ToolCallError::MalformedArguments { .. })
+        ));
     }
 
     // ── validate_tool_arguments ───────────────────────────────────────────────

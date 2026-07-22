@@ -12,9 +12,12 @@
 //! `/tmp/bonsai_vae_export_weights.py` via [`weights::VaeWeights`]. The conv
 //! weight layout is the MLX `[out, kH, kW, in]` (see [`weights`]).
 //!
-//! The decoder is **untiled** (single forward pass). Tiling + cosine-blend (for
-//! a byte-exact match to the pipeline's auto-tiled output at ≥256px) is
-//! deliberately out of scope here.
+//! The decoder supports both **untiled** (single forward pass,
+//! `decode_packed_latents`) and **tiled** (`decode_packed_latents_tiled`)
+//! modes. The tiled path tiles only the final `silu→conv_out` stage with a
+//! 1-pixel halo (TileBoundary::AfterConvNormOut) so peak activation is
+//! O(tile_size) instead of O(output_resolution²). Results are numerically
+//! identical (cos ≥ 0.999 vs the untiled path). See [`tiling`] for details.
 //!
 //! # Example
 //!
@@ -36,7 +39,7 @@
 pub mod attention;
 pub mod conv;
 /// GPU (CUDA) f32 backend for the VAE decoder convs/norms/silu/upsample. The
-/// `target_os`-disjoint sibling of [`gpu`]; gated on `cfg(all(feature =
+/// `target_os`-disjoint sibling of `gpu`; gated on `cfg(all(feature =
 /// "native-cuda", any(target_os = "linux", target_os = "windows")))`. Reuses the
 /// same `OXI_VAE_GPU` env var as the Metal path.
 #[cfg(all(
@@ -60,8 +63,20 @@ pub mod resnet;
 /// golden dump; selected automatically by [`weights::VaeWeights::open`] for a
 /// `.safetensors` path.
 pub mod safetensors;
+/// Spatial tiling helpers for memory-bounded VAE decode at resolutions > 512 px.
+///
+/// The tiled path (`VaeDecoder::decode_packed_latents_tiled`) has two boundaries.
+/// The default (`TileBoundary::AfterConvNormOut`) tiles only the final
+/// `silu → conv_out` stage (k=3, pad=1, halo=1 px). `TileBoundary::AfterMid`
+/// additionally bounds the up-block convolution im2col (the real multi-GB peak)
+/// via `Conv2d::forward_tiled`. Both keep every GroupNorm plane whole (correct
+/// global per-group statistics), so results are bit-identical to the untiled CPU
+/// path (and `cos ≈ 1` vs the GPU path, whose sum reassociation depends on tile
+/// size).
+pub mod tiling;
 pub mod weights;
 
 pub use decoder::{DecodeTaps, Map, VaeDecoder};
 pub use error::{VaeError, VaeResult};
+pub use tiling::{TileBoundary, TileConfig};
 pub use weights::{Tensor, VaeWeights};

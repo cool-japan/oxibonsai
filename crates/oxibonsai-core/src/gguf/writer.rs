@@ -135,12 +135,35 @@ impl TensorType {
     }
 
     /// Expected byte count for a tensor with `element_count` elements.
+    ///
+    /// `block_bytes` is a small fixed constant from a closed set of known
+    /// formats, but `num_blocks` can in principle already be huge for a
+    /// pathological (if arithmetically valid) `element_count`, so the final
+    /// multiplication uses `saturating_mul` — mirroring
+    /// `TensorInfo::data_size` on the reader side — rather than risking a
+    /// silent wrap to a small, plausible-looking byte count.
     pub fn expected_bytes(self, element_count: u64) -> u64 {
         let block_size = self.block_size() as u64;
         let block_bytes = self.block_bytes() as u64;
         let num_blocks = element_count.div_ceil(block_size);
-        num_blocks * block_bytes
+        num_blocks.saturating_mul(block_bytes)
     }
+}
+
+/// Total element count for `shape`, computed with checked multiplication.
+///
+/// Unlike the reader's `TensorInfo::element_count` (which saturates to
+/// `u64::MAX` on overflow, because it must still return *some* value for a
+/// file it cannot refuse to have already read), the writer controls
+/// whether to proceed at all: a `TensorEntry.shape` whose product overflows
+/// `u64` is malformed input from the caller, so this returns `None` and lets
+/// `GgufWriter::write` fail cleanly with `WriteError::ShapeOverflow` instead
+/// of silently wrapping to a small, plausible-looking element count in a
+/// release build (`overflow-checks = false` is the Cargo default).
+fn checked_element_count(shape: &[u64]) -> Option<u64> {
+    shape
+        .iter()
+        .try_fold(1u64, |acc, &dim| acc.checked_mul(dim))
 }
 
 // ─── Tensor entry ─────────────────────────────────────────────────────────────
@@ -216,6 +239,17 @@ impl GgufWriter {
     /// Serialise the GGUF file into `out`, returning the total number of bytes
     /// written on success.
     pub fn write<W: Write>(&self, out: &mut W) -> Result<usize, WriteError> {
+        // The reader (`GgufFile::parse` / `GgufStreamParser::finalize`)
+        // unconditionally rejects `alignment == 0` or a non-power-of-two
+        // alignment with `AlignmentError`. Validate here rather than
+        // silently emitting a syntactically-valid file the project's own
+        // reader will always refuse to load.
+        if self.alignment == 0 || !self.alignment.is_power_of_two() {
+            return Err(WriteError::InvalidAlignment {
+                alignment: self.alignment,
+            });
+        }
+
         let mut pos: usize = 0;
 
         // ── Build effective metadata list ───────────────────────────────────
@@ -275,14 +309,25 @@ impl GgufWriter {
         let mut running_offset: u64 = 0;
         for entry in &self.tensors {
             data_offsets.push(running_offset);
-            let element_count: u64 = entry.shape.iter().product();
+            let element_count =
+                checked_element_count(&entry.shape).ok_or_else(|| WriteError::ShapeOverflow {
+                    name: entry.name.clone(),
+                })?;
             let expected = entry.tensor_type.expected_bytes(element_count);
-            running_offset += expected;
+            running_offset =
+                running_offset
+                    .checked_add(expected)
+                    .ok_or_else(|| WriteError::ShapeOverflow {
+                        name: entry.name.clone(),
+                    })?;
         }
 
         for (idx, entry) in self.tensors.iter().enumerate() {
             // Validate data size
-            let element_count: u64 = entry.shape.iter().product();
+            let element_count =
+                checked_element_count(&entry.shape).ok_or_else(|| WriteError::ShapeOverflow {
+                    name: entry.name.clone(),
+                })?;
             let expected = entry.tensor_type.expected_bytes(element_count) as usize;
             if entry.data.len() != expected {
                 return Err(WriteError::DataSizeMismatch {
@@ -491,6 +536,19 @@ pub enum WriteError {
         expected: usize,
         got: usize,
     },
+
+    /// The configured alignment is zero or not a power of two.
+    ///
+    /// The reader (`GgufFile::parse` / `GgufStreamParser::finalize`)
+    /// unconditionally rejects such an alignment, so refusing to write one
+    /// avoids silently producing a file no reader in this project can load.
+    #[error("invalid alignment {alignment}: must be a nonzero power of two")]
+    InvalidAlignment { alignment: usize },
+
+    /// A tensor's `shape` produced an element count, or its contribution to
+    /// the cumulative tensor-data offset, that overflows `u64`.
+    #[error("tensor '{name}' shape/offset arithmetic overflows u64")]
+    ShapeOverflow { name: String },
 }
 
 #[cfg(test)]
@@ -535,6 +593,53 @@ mod tests {
             u64::from_le_bytes(bytes[16..24].try_into().expect("slice")),
             0
         );
+    }
+
+    /// `set_alignment(0)` used to silently produce a syntactically-valid
+    /// GGUF file that `GgufFile::parse` unconditionally refuses to load
+    /// (`AlignmentError`) — `write`/`to_bytes` must now reject it up front
+    /// instead.
+    #[test]
+    fn zero_alignment_is_rejected_at_write_time() {
+        let mut w = GgufWriter::new();
+        w.set_alignment(0);
+        assert!(matches!(
+            w.to_bytes(),
+            Err(WriteError::InvalidAlignment { alignment: 0 })
+        ));
+    }
+
+    /// Same as `zero_alignment_is_rejected_at_write_time` but for a
+    /// non-power-of-two alignment (3), which the reader also unconditionally
+    /// rejects.
+    #[test]
+    fn non_power_of_two_alignment_is_rejected_at_write_time() {
+        let mut w = GgufWriter::new();
+        w.set_alignment(3);
+        assert!(matches!(
+            w.to_bytes(),
+            Err(WriteError::InvalidAlignment { alignment: 3 })
+        ));
+    }
+
+    /// A shape whose element-count product overflows `u64` must fail
+    /// cleanly with `ShapeOverflow` rather than silently wrapping to a
+    /// small, plausible-looking element count (the writer's own arithmetic
+    /// previously used a plain unchecked `.iter().product()`, unlike the
+    /// reader's checked/saturating `TensorInfo::element_count`).
+    #[test]
+    fn shape_product_overflow_is_rejected_not_silently_wrapped() {
+        let mut w = GgufWriter::new();
+        w.add_tensor(TensorEntry {
+            name: "overflow".to_string(),
+            shape: vec![u64::MAX, 2],
+            tensor_type: TensorType::F32,
+            data: vec![0u8; 8],
+        });
+        assert!(matches!(
+            w.to_bytes(),
+            Err(WriteError::ShapeOverflow { name }) if name == "overflow"
+        ));
     }
 
     #[test]

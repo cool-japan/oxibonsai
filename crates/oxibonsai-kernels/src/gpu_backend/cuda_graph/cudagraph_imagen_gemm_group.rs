@@ -105,7 +105,7 @@ impl CudaGraph {
 
     /// Execute a batched **f32-exact** GEMM: `output = input × weightᵀ`.
     ///
-    /// CUDA-core sibling of the Metal [`MetalGraph::encode_gemm_f32`] — the
+    /// CUDA-core sibling of the Metal `MetalGraph::encode_gemm_f32` — the
     /// image-generation (FLUX.2) text-encoder f32 path. Dispatches the `gemm_f32`
     /// kernel (plain CUDA-core 4×4 micro-tile, f32 accumulate), numerically
     /// equivalent to the CPU `oxibonsai-image::gemm::gemm_abt` (cos ≈ 1.0).
@@ -201,7 +201,7 @@ impl CudaGraph {
 
     /// Execute a batched **ternary (TQ2_0_g128)** GEMM: `output = input × dequant(weight)ᵀ`.
     ///
-    /// CUDA-core sibling of the Metal [`MetalGraph::encode_gemm_tq2`] — the
+    /// CUDA-core sibling of the Metal `MetalGraph::encode_gemm_tq2` — the
     /// image-generation (FLUX.2) DiT ternary path. Dispatches the `gemm_tq2`
     /// kernel (plain CUDA-core 2×2 micro-tile, f16-exact `code×scale` decode,
     /// f32 accumulate), numerically equivalent to the CPU dequant + `gemm_abt`.

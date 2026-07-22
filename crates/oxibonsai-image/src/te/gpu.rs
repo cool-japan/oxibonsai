@@ -86,16 +86,46 @@ pub fn te_gpu_enabled() -> bool {
     *TE_GPU_ENABLED.get_or_init(|| matches!(std::env::var("OXI_TE_GPU").ok().as_deref(), Some("1")))
 }
 
+/// Cached toggle for the GEMM precision on the GPU TE path. The **bf16** kernel
+/// is the default (the model is natively bf16, so it is parity-clean — cos ≈ 1.0
+/// — and ~3× faster than the f32 kernel on Apple GPUs). Set env
+/// `OXI_TE_GEMM_F32=1` to force the bit-exact f32 kernel instead. Only consulted
+/// when [`te_gpu_enabled`] is also true.
+static TE_GEMM_BF16: OnceLock<bool> = OnceLock::new();
+
+/// Whether the GPU TE path should use the bf16 GEMM kernel (default `true`).
+pub fn te_gemm_bf16_enabled() -> bool {
+    *TE_GEMM_BF16
+        .get_or_init(|| !matches!(std::env::var("OXI_TE_GEMM_F32").ok().as_deref(), Some("1")))
+}
+
+/// Returns `true` when a weight should be persisted in the GPU cache across calls.
+///
+/// This is only safe when the weight pointer is stable (resident weights).
+/// For non-resident weights (default `Mlx4bit` no-cache policy), the dequant
+/// buffer is freed after use and the allocator recycles the address, so the
+/// `as_ptr()` key is unstable. Persisting the key in that case would return a
+/// stale GPU buffer on the next GEMM for a different weight at the same recycled
+/// address → corrupted conditioning. Non-resident callers must evict after each
+/// GEMM to prevent this.
+#[inline]
+fn should_persist_weight(resident: bool) -> bool {
+    resident
+}
+
 /// Compute `out[m, n] = Σ_k input[m, k] · weight[n, k]` (`x · Wᵀ`) on the GPU.
 ///
 /// - `weight`: row-major f32 `[n, k]` (the dequantized TE Linear weight,
 ///   borrowed from the long-lived [`crate::te::weights::TeWeights`] registry).
 /// - `input`: row-major `[m, k]`.
 /// - `out`: row-major `[m, n]` (written in full).
-///
-/// The weight is uploaded to the GPU **once** and cached by its (stable,
-/// per-weight-unique) slice pointer key, so subsequent layers/forwards reuse the
-/// resident buffer and only the activations cross the bus.
+/// - `resident`: whether the host weight buffer is held resident (stable
+///   `as_ptr()` identity). When `true`, the uploaded GPU buffer is kept in the
+///   weight cache across calls (amortizes upload cost across prompts). When
+///   `false`, the cache entry is evicted after each GEMM to prevent a stale-handle
+///   hazard: the dequant buffer is freed between calls, and the allocator can
+///   recycle its address so the next `get_or_upload_f32_weight` for a different
+///   weight would collide with the stale key and return the wrong GPU buffer.
 ///
 /// # Errors
 /// Returns [`TeGpuMatmulError`] if the Metal graph is unavailable or the kernel
@@ -108,16 +138,31 @@ pub fn te_matmul_gpu(
     m: usize,
     n: usize,
     k: usize,
+    resident: bool,
 ) -> Result<(), TeGpuMatmulError> {
     let graph =
         MetalGraph::global().map_err(|e| TeGpuMatmulError::GraphUnavailable(e.to_string()))?;
     // `weight` is borrowed from the run-long TeWeights registry; its base
-    // address is stable and unique per weight, so it doubles as a cache key with
-    // no per-Linear bookkeeping. Pointer addresses are huge and won't collide
-    // with the DiT's pointer keys or the LLM's small key space.
+    // address is stable and unique per weight when resident, so it doubles as a
+    // cache key with no per-Linear bookkeeping. Pointer addresses are huge and
+    // won't collide with the DiT's pointer keys or the LLM's small key space.
     let key = weight.as_ptr() as u64;
     let handle = graph.get_or_upload_f32_weight(key, weight)?;
-    graph.encode_gemm_f32(&handle, input, out, m, n, k)?;
+    if te_gemm_bf16_enabled() && graph.bf16_gemm_available() {
+        graph.encode_gemm_bf16(&handle, input, out, m, n, k)?;
+    } else {
+        graph.encode_gemm_f32(&handle, input, out, m, n, k)?;
+    }
+    // Non-resident weights have an unstable as_ptr() identity: the dequant
+    // buffer is freed after this call, and the allocator can recycle the address
+    // for a different weight on the next matmul. Evict now so the next
+    // get_or_upload_f32_weight for a new weight at that recycled address always
+    // gets a fresh upload rather than a stale handle. Eviction failure is
+    // non-fatal (the next upload will simply overwrite the stale entry), so
+    // errors are silently discarded here.
+    if !should_persist_weight(resident) {
+        let _ = graph.evict_f32_weight(key);
+    }
     TE_GPU_USED.store(true, Ordering::Relaxed);
     Ok(())
 }
@@ -133,5 +178,23 @@ mod tests {
         if std::env::var("OXI_TE_GPU").is_err() {
             assert!(!te_gpu_enabled());
         }
+    }
+
+    #[test]
+    fn te_gemm_bf16_enabled_by_default_when_env_unset() {
+        // Note: OnceLock caches the first read; this asserts the default policy
+        // (env `OXI_TE_GEMM_F32` unset → bf16 enabled). It does not mutate the env.
+        if std::env::var("OXI_TE_GEMM_F32").is_err() {
+            assert!(te_gemm_bf16_enabled());
+        }
+    }
+
+    #[test]
+    fn test_should_persist_weight_logic() {
+        assert!(
+            !should_persist_weight(false),
+            "non-resident must not persist"
+        );
+        assert!(should_persist_weight(true), "resident must persist");
     }
 }

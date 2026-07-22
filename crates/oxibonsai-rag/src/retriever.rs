@@ -131,6 +131,10 @@ impl<E: Embedder> Retriever<E> {
         if text.trim().is_empty() {
             return Err(RagError::EmptyDocument);
         }
+        chunk_config
+            .validate()
+            .map_err(RagError::InvalidChunkConfig)?;
+
         let doc_id = self.doc_count;
         self.doc_count += 1;
 

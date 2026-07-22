@@ -55,7 +55,8 @@ fn bench_te_gemm_f32_cpu_vs_gpu_ratio() {
         let w = build_weight(64, 256);
         let x = vec![0.01f32; 256];
         let mut o = vec![0f32; 64];
-        if te_matmul_gpu(&w, &x, &mut o, 1, 64, 256).is_err() {
+        // Weight is alive for the probe duration → stable pointer → resident=true.
+        if te_matmul_gpu(&w, &x, &mut o, 1, 64, 256, true).is_err() {
             eprintln!("no usable Metal GPU — skipping TE f32 GEMM ratio bench");
             return;
         }
@@ -88,8 +89,9 @@ fn bench_te_gemm_f32_cpu_vs_gpu_ratio() {
         let (m, n, k) = (*m, *n, *k);
 
         // Parity guard: GPU vs CPU on this exact shape.
+        // Weights are alive for the whole bench loop → stable pointers → resident=true.
         let mut gpu_out = vec![0f32; m * n];
-        te_matmul_gpu(weight, input, &mut gpu_out, m, n, k).expect("GPU matmul failed");
+        te_matmul_gpu(weight, input, &mut gpu_out, m, n, k, true).expect("GPU matmul failed");
         let mut cpu_out = vec![0f32; m * n];
         gemm_abt(input, weight, &mut cpu_out, m, n, k);
         let max_abs = gpu_out
@@ -104,7 +106,8 @@ fn bench_te_gemm_f32_cpu_vs_gpu_ratio() {
 
         let gpu_once = || {
             let mut out = vec![0f32; m * n];
-            te_matmul_gpu(weight, input, &mut out, m, n, k).expect("GPU matmul failed");
+            // Weights are alive for the bench loop → stable pointers → resident=true.
+            te_matmul_gpu(weight, input, &mut out, m, n, k, true).expect("GPU matmul failed");
         };
         let cpu_once = || {
             let mut out = vec![0f32; m * n];

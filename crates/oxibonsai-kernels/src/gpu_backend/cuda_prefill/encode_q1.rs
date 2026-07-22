@@ -150,57 +150,29 @@ pub(super) unsafe fn encode_prefill_layer(
     let half_dim = hd / 2;
     let h_u32 = h as u32;
     let bs_u32 = bs as u32;
-    let qkv_total = nq * hd + 2 * nkv * hd;
 
     // ════════════════════════════════════════════════════════════════════
-    // 1. Batched RMSNorm (attn norm): d_input → d_normed
+    // Attention QKV projection is computed PER TOKEN inside `encode_attn_phase`
+    // (which runs its own RMSNorm + fused-QKV GEMV on `st_bufs.d_hidden`).  A
+    // batched attn-RMSNorm + batched-QKV GEMM was previously run here into
+    // `pb.d_normed` / `pb.d_qkv`, but their outputs were never consumed by the
+    // per-token attention loop below — they were pure wasted device work.  They
+    // are intentionally omitted (see finding: "batched prefill QKV GEMM
+    // discarded").  The batched GEMM kernels are still used for the O-projection
+    // and the FFN sublayer further down.
     // ════════════════════════════════════════════════════════════════════
-    launch_batched_rmsnorm(
-        graph,
-        pmods,
-        &pb.d_input,
-        d_attn_norm_weight,
-        &mut pb.d_normed,
-        h_u32,
-        bs_u32,
-        eps,
-    )?;
 
     // ════════════════════════════════════════════════════════════════════
-    // 2. Batched QKV GEMM: d_normed → d_qkv
-    //    n_rows = (nq + 2*nkv) * head_dim, k = hidden_size
-    //    Zero-init d_qkv first so accumulate (+=) is correct.
-    // ════════════════════════════════════════════════════════════════════
-    // Zero out d_qkv so the += in gemm_v7 starts from zero.
-    {
-        let n = bs * qkv_total;
-        let mut dst_view = pb.d_qkv.slice_mut(0..n);
-        graph
-            .stream_arc()
-            .memset_zeros(&mut dst_view)
-            .map_err(|e| CudaGraphError::DriverError(format!("zero d_qkv: {e}")))?;
-    }
-
-    launch_gemm_v7(
-        graph,
-        pmods,
-        d_fused_qkv_weight,
-        &pb.d_normed,
-        &mut pb.d_qkv,
-        qkv_total as u32,
-        h_u32,
-        bs_u32,
-    )?;
-
-    // ════════════════════════════════════════════════════════════════════
-    // 3. Sequential attention for each token
+    // Sequential attention for each token
     //
     // For each token t at sequence position (pos_start + t), we:
     //   a) Copy this token's hidden state into st_bufs.d_hidden
-    //   b) Copy this token's QKV into st_bufs.d_qkv (extracted from batched)
+    //   b) Upload pos/seqlen [pos, pos+1] into st_bufs.d_pos_seqlen so the
+    //      fused KV-store writes at the correct position and attention spans
+    //      exactly positions 0..=pos
     //   c) Copy this token's RoPE cos/sin into st_bufs.d_cos/d_sin
-    //   d) Run the standard single-token attention kernels (qk-norm+rope,
-    //      kv-store, scores, softmax, weighted sum)
+    //   d) Run the standard single-token attention kernels (rmsnorm, qkv gemv,
+    //      qk-norm+rope, kv-store, scores, softmax, weighted sum)
     //   e) Copy attention output back into the column of pb.d_attn_out
     // ════════════════════════════════════════════════════════════════════
     let f_size = std::mem::size_of::<f32>();
@@ -228,15 +200,19 @@ pub(super) unsafe fn encode_prefill_layer(
                 .map_err(|e| CudaGraphError::DriverError(format!("copy hidden t={t}: {e}")))?;
         }
 
-        // Copy token t's QKV column into st_bufs.d_qkv
-        // Column-major: token t's QKV is at pb.d_qkv[t * qkv_total .. (t+1)*qkv_total]
-        {
-            let src_view: CudaView<f32> = pb.d_qkv.slice(t * qkv_total..(t + 1) * qkv_total);
-            graph
-                .stream_arc()
-                .memcpy_dtod(&src_view, &mut st_bufs.d_qkv)
-                .map_err(|e| CudaGraphError::DriverError(format!("copy qkv t={t}: {e}")))?;
-        }
+        // Upload pos/seqlen [pos, pos+1] into st_bufs.d_pos_seqlen.
+        //
+        // The fused KV-store kernel reads the write position from
+        // d_pos_seqlen[0] and the attention span (seq_len) from d_pos_seqlen[1].
+        // Without this per-token upload the Q1 batch-prefill path would write
+        // every token's K/V at a stale/zero position and attend over the wrong
+        // span, corrupting the shared decode KV cache (the ternary loop already
+        // does this — mirror it here).
+        let pos_seqlen = [pos as u32, (pos + 1) as u32];
+        graph
+            .stream_arc()
+            .memcpy_htod(&pos_seqlen, &mut st_bufs.d_pos_seqlen)
+            .map_err(|e| CudaGraphError::DriverError(format!("upload pos_seqlen t={t}: {e}")))?;
 
         // Upload RoPE cos/sin for this token's position.
         let rope_off = t * half_dim;
@@ -255,16 +231,13 @@ pub(super) unsafe fn encode_prefill_layer(
             )
             .map_err(|e| CudaGraphError::DriverError(format!("upload sin t={t}: {e}")))?;
 
-        // Run the 7-step single-token attention pipeline.
-        // encode_attn_phase reads from st_bufs.d_hidden (already set above)
-        // and uses st_bufs.d_qkv as Q (it skips the internal GEMV and
-        // goes straight to QK-norm+RoPE using the provided QKV data).
-        //
-        // However, encode_attn_phase always runs a full RMSNorm + QKV GEMV
-        // on d_hidden.  For the prefill path, the normed hidden and QKV are
-        // already computed in the batched steps above.  We pass the attn_norm
-        // weight and fused_qkv weight again; the redundant RMSNorm + GEMV
-        // overhead is acceptable given the sequential attention constraint.
+        // Run the single-token attention pipeline (rmsnorm → QKV GEMV →
+        // qk-norm+rope → kv-store → scores → softmax → weighted sum).
+        // encode_attn_phase reads from st_bufs.d_hidden (set above) and computes
+        // its own RMSNorm + fused-QKV GEMV — there is no batched QKV to reuse,
+        // which is why the previously-dead batched attn RMSNorm/QKV GEMM above
+        // was removed.  The KV-store and attention steps read the token position
+        // and span from st_bufs.d_pos_seqlen (uploaded above).
         encode_attn_phase(
             graph,
             attn_mods,

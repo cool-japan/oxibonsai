@@ -4,6 +4,8 @@
 //! during token-by-token generation. Provides both a standard contiguous
 //! cache and a page-based cache for memory-efficient allocation.
 
+use crate::error::{ModelError, ModelResult};
+
 /// Policy for KV cache storage format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum KvCachePolicy {
@@ -65,26 +67,99 @@ impl KvCache {
         self.max_seq_len
     }
 
-    /// Store a key vector for a specific layer, head, and position.
-    pub fn store_key(&mut self, layer: usize, head: usize, pos: usize, key: &[f32]) {
-        debug_assert!(layer < self.num_layers);
-        debug_assert!(head < self.num_kv_heads);
-        debug_assert!(pos < self.max_seq_len);
-        debug_assert_eq!(key.len(), self.head_dim);
+    /// Validate a `store_key`/`store_value` call before it touches the
+    /// underlying buffers.
+    ///
+    /// Mirrors the checks performed by [`crate::kv_cache_fp16::KvCacheFp16::store`]
+    /// so both caches fail the same way for the same inputs.
+    fn validate_store(&self, layer: usize, head: usize, pos: usize, len: usize) -> ModelResult<()> {
+        if layer >= self.num_layers {
+            return Err(ModelError::ShapeMismatch {
+                name: "kv_cache layer".to_string(),
+                expected: vec![self.num_layers],
+                actual: vec![layer],
+            });
+        }
+        if head >= self.num_kv_heads {
+            return Err(ModelError::ShapeMismatch {
+                name: "kv_cache head".to_string(),
+                expected: vec![self.num_kv_heads],
+                actual: vec![head],
+            });
+        }
+        if pos >= self.max_seq_len {
+            return Err(ModelError::SequenceTooLong {
+                seq_len: pos + 1,
+                max_ctx: self.max_seq_len,
+            });
+        }
+        if len != self.head_dim {
+            return Err(ModelError::ShapeMismatch {
+                name: "kv_cache key/value dim".to_string(),
+                expected: vec![self.head_dim],
+                actual: vec![len],
+            });
+        }
+        Ok(())
+    }
 
+    /// Store a key vector for a specific layer, head, and position.
+    ///
+    /// Bounds- and shape-checked: an out-of-range `layer`/`head`/`pos`, or a
+    /// `key` whose length doesn't match `head_dim`, leaves the cache
+    /// unchanged instead of indexing past the end of the pre-allocated
+    /// buffer (which would panic even in release builds). Use
+    /// [`try_store_key`](Self::try_store_key) when the caller needs to
+    /// detect and react to such errors (e.g. to surface a graceful
+    /// "context length exceeded" response).
+    pub fn store_key(&mut self, layer: usize, head: usize, pos: usize, key: &[f32]) {
+        let _ = self.try_store_key(layer, head, pos, key);
+    }
+
+    /// Fallible counterpart of [`store_key`](Self::store_key).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::ShapeMismatch`] for an out-of-range `layer`,
+    /// `head`, or a `key` length that doesn't match `head_dim`; returns
+    /// [`ModelError::SequenceTooLong`] when `pos >= max_seq_len`.
+    pub fn try_store_key(
+        &mut self,
+        layer: usize,
+        head: usize,
+        pos: usize,
+        key: &[f32],
+    ) -> ModelResult<()> {
+        self.validate_store(layer, head, pos, key.len())?;
         let offset = self.cache_offset(layer, head, pos);
         self.keys[offset..offset + self.head_dim].copy_from_slice(key);
+        Ok(())
     }
 
     /// Store a value vector for a specific layer, head, and position.
+    ///
+    /// See [`store_key`](Self::store_key) for the bounds-checking contract;
+    /// out-of-range calls are silently ignored rather than panicking.
     pub fn store_value(&mut self, layer: usize, head: usize, pos: usize, value: &[f32]) {
-        debug_assert!(layer < self.num_layers);
-        debug_assert!(head < self.num_kv_heads);
-        debug_assert!(pos < self.max_seq_len);
-        debug_assert_eq!(value.len(), self.head_dim);
+        let _ = self.try_store_value(layer, head, pos, value);
+    }
 
+    /// Fallible counterpart of [`store_value`](Self::store_value).
+    ///
+    /// # Errors
+    ///
+    /// Same error contract as [`try_store_key`](Self::try_store_key).
+    pub fn try_store_value(
+        &mut self,
+        layer: usize,
+        head: usize,
+        pos: usize,
+        value: &[f32],
+    ) -> ModelResult<()> {
+        self.validate_store(layer, head, pos, value.len())?;
         let offset = self.cache_offset(layer, head, pos);
         self.values[offset..offset + self.head_dim].copy_from_slice(value);
+        Ok(())
     }
 
     /// Get all cached keys for a layer and head up to `seq_len`.
@@ -112,6 +187,16 @@ impl KvCache {
     pub fn clear(&mut self) {
         self.seq_len = 0;
         // Optionally zero out for security, but not required for correctness
+    }
+
+    /// Roll the cache cursor back to `new_len`, logically discarding all cached
+    /// positions at or beyond `new_len`. Positions `0..new_len` are retained.
+    /// `new_len` is clamped down to the current `seq_len` (never grows).
+    /// No buffer zeroing — identical convention to `clear`.
+    pub fn truncate(&mut self, new_len: usize) {
+        if new_len < self.seq_len {
+            self.seq_len = new_len;
+        }
     }
 
     /// Compute flat offset into cache arrays.
@@ -497,6 +582,95 @@ impl PagedKvCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn store_key_out_of_range_pos_does_not_panic_and_leaves_cache_untouched() {
+        // Regression test for a release-build panic: previously the only
+        // bounds check was `debug_assert!`, which is compiled out in
+        // release, so an out-of-range `pos` computed an offset past the
+        // end of the pre-allocated `keys` Vec and panicked on the slice
+        // index. `store_key`/`store_value` must now be no-ops instead.
+        let mut cache = KvCache::new(1, 1, 4, 8);
+        cache.store_key(0, 0, 100, &[1.0, 2.0, 3.0, 4.0]);
+        cache.store_value(0, 0, 100, &[5.0, 6.0, 7.0, 8.0]);
+
+        // The cache must remain entirely zeroed: nothing was written.
+        cache.set_seq_len(8);
+        let keys = cache.keys_for(0, 0, 8);
+        let values = cache.values_for(0, 0, 8);
+        assert!(keys.iter().all(|&x| x == 0.0));
+        assert!(values.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn store_key_out_of_range_layer_head_and_bad_len_does_not_panic() {
+        let mut cache = KvCache::new(2, 2, 4, 8);
+        // Out-of-range layer, out-of-range head, and mismatched slice length
+        // must all be silently rejected rather than panicking.
+        cache.store_key(99, 0, 0, &[1.0, 2.0, 3.0, 4.0]);
+        cache.store_value(0, 99, 0, &[1.0, 2.0, 3.0, 4.0]);
+        cache.store_key(0, 0, 0, &[1.0, 2.0]); // wrong length (expects 4)
+
+        let keys = cache.keys_for(0, 0, 1);
+        assert!(keys.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn try_store_key_reports_sequence_too_long() {
+        let mut cache = KvCache::new(1, 1, 4, 8);
+        let err = cache
+            .try_store_key(0, 0, 8, &[1.0, 2.0, 3.0, 4.0])
+            .expect_err("pos == max_seq_len must be rejected");
+        match err {
+            ModelError::SequenceTooLong { seq_len, max_ctx } => {
+                assert_eq!(seq_len, 9);
+                assert_eq!(max_ctx, 8);
+            }
+            other => panic!("expected SequenceTooLong, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_store_value_reports_shape_mismatch_for_bad_layer_head_and_len() {
+        let mut cache = KvCache::new(2, 2, 4, 8);
+
+        let layer_err = cache
+            .try_store_value(5, 0, 0, &[0.0; 4])
+            .expect_err("out-of-range layer must be rejected");
+        assert!(matches!(layer_err, ModelError::ShapeMismatch { .. }));
+
+        let head_err = cache
+            .try_store_value(0, 5, 0, &[0.0; 4])
+            .expect_err("out-of-range head must be rejected");
+        assert!(matches!(head_err, ModelError::ShapeMismatch { .. }));
+
+        let len_err = cache
+            .try_store_value(0, 0, 0, &[0.0; 3])
+            .expect_err("wrong-length value must be rejected");
+        assert!(matches!(len_err, ModelError::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn try_store_key_succeeds_and_is_readable() {
+        let mut cache = KvCache::new(1, 1, 4, 8);
+        cache
+            .try_store_key(0, 0, 2, &[1.0, 2.0, 3.0, 4.0])
+            .expect("in-range store must succeed");
+        cache.set_seq_len(3);
+        let keys = cache.keys_for(0, 0, 3);
+        assert_eq!(&keys[8..12], &[1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn truncate_clamps_down_never_grows() {
+        let mut c = KvCache::new(1, 1, 4, 16);
+        c.set_seq_len(10);
+        c.truncate(6);
+        assert_eq!(c.seq_len(), 6);
+        // truncate past current len is a no-op
+        c.truncate(20);
+        assert_eq!(c.seq_len(), 6);
+    }
 
     #[test]
     fn kv_cache_store_and_retrieve() {

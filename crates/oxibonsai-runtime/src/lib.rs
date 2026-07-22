@@ -59,11 +59,15 @@ pub mod embedding_index;
 #[cfg(feature = "server")]
 pub mod embeddings;
 pub mod engine;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod engine_pool;
 pub mod error;
 pub mod grammar;
 pub mod health;
 pub mod hot_reload;
+/// Shared OpenAI-style HTTP error envelope, used by every served route.
+#[cfg(any(feature = "server", feature = "rag"))]
+pub mod http_error;
 pub mod json_schema;
 pub mod kv_cache_policy;
 pub mod memory;
@@ -160,7 +164,7 @@ pub use request_id::RequestId;
 pub use request_metrics::{
     AggregateRateSnapshot, RequestRateAggregator, RequestRateSnapshot, RequestRateTracker,
 };
-pub use sampling::Sampler;
+pub use sampling::{apply_frequency_presence_penalty, PenaltyParams, Sampler};
 pub use sampling_advanced::{
     EtaSampler, LcgRng, MinPSampler, MirostatV1Sampler, MirostatV2Sampler, SamplerChain,
     SamplerStep, TypicalSampler,

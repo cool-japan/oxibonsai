@@ -4,6 +4,7 @@
 //! This sub-module hosts the NFA compiler/simulator (`NfaState`, `RegexNfa`,
 //! `Fragment`) plus the public [`RegexConstraint`] type.
 
+use super::decoder::TokenTextIndex;
 use super::error_trait::{ConstraintError, TokenConstraint};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -587,15 +588,41 @@ impl RegexNfa {
 /// - Grouping `(...)`
 /// - Character classes `[abc]`, `[a-z]`, `[^x]`
 /// - Escapes: `\d`, `\D`, `\w`, `\W`, `\s`, `\S`, `\n`, `\r`, `\t`
+///
+/// # Two operating modes
+///
+/// * [`RegexConstraint::with_decoder`] — **the real mode.** The caller supplies a
+///   `decode_fn: Fn(u32) -> Option<String>` mapping each token id to the text it
+///   emits.  `allowed_tokens` returns a byte-correct per-token mask and `advance`
+///   feeds a committed token's decoded text through the NFA, so the constraint is
+///   correct for any real subword tokenizer.
+/// * [`RegexConstraint::new`] — **demonstration / toy mode only.** With no decoder,
+///   `allowed_tokens` returns `None` (allow all — enforcement is deferred to
+///   `advance`) and `advance` treats each raw token id as a Unicode code point
+///   (`char::from_u32(id)`).  This is only meaningful for a synthetic vocabulary
+///   where `token_id == codepoint`; for a real tokenizer it does not constrain the
+///   generated text at all.  Prefer [`RegexConstraint::with_decoder`], or the
+///   byte-correct [`crate::grammar::GrammarConstraint`] compiled from a regex.
 pub struct RegexConstraint {
     pattern: String,
     nfa: RegexNfa,
     current_states: Vec<usize>,
     matched_so_far: String,
+    /// Precomputed token→text index.  `Some` in real mode
+    /// ([`with_decoder`](Self::with_decoder)); `None` in demonstration/toy mode
+    /// ([`new`](Self::new)).
+    index: Option<TokenTextIndex>,
 }
 
 impl RegexConstraint {
-    /// Build a new constraint from `pattern`.
+    /// Build a new **demonstration / toy** constraint from `pattern`.
+    ///
+    /// # Warning: not for real tokenizers
+    ///
+    /// With no decoder, `allowed_tokens` allows all tokens and `advance` treats
+    /// each raw token id as a Unicode code point.  Use
+    /// [`RegexConstraint::with_decoder`] for a constraint that is correct for a
+    /// real tokenizer.
     pub fn new(pattern: &str) -> Result<Self, ConstraintError> {
         let nfa = RegexNfa::from_pattern(pattern)?;
         let current_states = nfa.epsilon_closure(vec![nfa.start]);
@@ -604,7 +631,85 @@ impl RegexConstraint {
             nfa,
             current_states,
             matched_so_far: String::new(),
+            index: None,
         })
+    }
+
+    /// Build a real constraint from `pattern`, driven by a token decode function.
+    ///
+    /// `decode_fn` maps a token id to the text it emits (`None` for
+    /// EOS / padding / special tokens).  It is invoked once per token id in
+    /// `0..vocab_size` at construction time and is not retained.
+    ///
+    /// ```rust
+    /// use oxibonsai_runtime::constrained_decoding::{RegexConstraint, TokenConstraint};
+    ///
+    /// // Toy vocab whose ids bear no relation to code points.
+    /// let decode = |id: u32| match id {
+    ///     0 => Some("2024".to_string()),
+    ///     1 => Some("-".to_string()),
+    ///     2 => Some("hello".to_string()),
+    ///     _ => None,
+    /// };
+    /// let c = RegexConstraint::with_decoder(r"\d\d\d\d-\d\d", decode, 3)
+    ///     .expect("valid pattern");
+    /// let mask = c.allowed_tokens(&[], 3).unwrap();
+    /// assert!(mask[0]);  // "2024" matches the leading \d\d\d\d
+    /// assert!(!mask[2]); // "hello" does not
+    /// ```
+    pub fn with_decoder(
+        pattern: &str,
+        decode_fn: impl Fn(u32) -> Option<String>,
+        vocab_size: usize,
+    ) -> Result<Self, ConstraintError> {
+        let mut constraint = Self::new(pattern)?;
+        constraint.index = Some(TokenTextIndex::build(decode_fn, vocab_size));
+        Ok(constraint)
+    }
+
+    /// Real-mode mask: probe candidate tokens' decoded text against the NFA.
+    fn allowed_tokens_real(&self, index: &TokenTextIndex, vocab_size: usize) -> Vec<bool> {
+        let mut mask = vec![false; vocab_size];
+        if self.current_states.is_empty() {
+            return mask;
+        }
+        // Empty-text tokens (EOS / special): allowed only when accepting.
+        if self.nfa.is_accepting(&self.current_states) {
+            for &id in index.empty_token_ids() {
+                if (id as usize) < vocab_size {
+                    mask[id as usize] = true;
+                }
+            }
+        }
+        // Test each distinct first character once against the NFA, then probe
+        // only the tokens sharing a viable first character.
+        for (&first_char, ids) in index.first_char_groups() {
+            let after_first = self.nfa.step(&self.current_states, first_char);
+            if after_first.is_empty() {
+                continue;
+            }
+            for &id in ids {
+                let idx = id as usize;
+                if idx >= vocab_size {
+                    continue;
+                }
+                let chars = index.token_chars(id);
+                // chars[0] == first_char by construction; feed the remainder.
+                let mut states = after_first.clone();
+                let mut ok = true;
+                for &ch in &chars[1..] {
+                    states = self.nfa.step(&states, ch);
+                    if states.is_empty() {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    mask[idx] = true;
+                }
+            }
+        }
+        mask
     }
 
     /// Test whether `text` fully matches `pattern`.
@@ -629,27 +734,58 @@ impl RegexConstraint {
 
 impl TokenConstraint for RegexConstraint {
     fn allowed_tokens(&self, _generated: &[u32], vocab_size: usize) -> Option<Vec<bool>> {
-        // If already in a dead state, nothing is allowed.
-        if self.current_states.is_empty() {
-            return Some(vec![false; vocab_size]);
+        match &self.index {
+            // Real mode: byte-correct per-token mask from decoded text.
+            Some(index) => Some(self.allowed_tokens_real(index, vocab_size)),
+            None => {
+                // Toy/demonstration mode: if already in a dead state, nothing is
+                // allowed; otherwise we cannot map token ids to characters without
+                // a decoder, so return None (allow all).  Enforcement is deferred
+                // to `advance`, which rejects invalid codepoints.
+                if self.current_states.is_empty() {
+                    Some(vec![false; vocab_size])
+                } else {
+                    None
+                }
+            }
         }
-        // We cannot map token ids to characters without a real vocabulary table,
-        // so we return None (allow all) as a safe conservative choice.
-        // The constraint is enforced via `advance` which rejects invalid tokens.
-        None
     }
 
     fn advance(&mut self, token: u32) -> bool {
-        // Treat the token id as a codepoint for demonstration purposes.
-        // In a real integration the caller would pass token bytes/text.
-        let ch = char::from_u32(token).unwrap_or('\u{FFFD}');
-        let next = self.nfa.step(&self.current_states, ch);
-        if next.is_empty() {
-            return false;
+        match &self.index {
+            // Real mode: feed the token's decoded text through the NFA.
+            Some(index) => {
+                let chars = index.token_chars(token).to_vec();
+                if chars.is_empty() {
+                    // EOS / special / out-of-range: valid only when accepting.
+                    return self.nfa.is_accepting(&self.current_states);
+                }
+                let mut states = self.current_states.clone();
+                for &ch in &chars {
+                    let next = self.nfa.step(&states, ch);
+                    if next.is_empty() {
+                        return false;
+                    }
+                    states = next;
+                }
+                self.current_states = states;
+                for ch in chars {
+                    self.matched_so_far.push(ch);
+                }
+                true
+            }
+            None => {
+                // Toy mode: treat the token id as a codepoint.
+                let ch = char::from_u32(token).unwrap_or('\u{FFFD}');
+                let next = self.nfa.step(&self.current_states, ch);
+                if next.is_empty() {
+                    return false;
+                }
+                self.current_states = next;
+                self.matched_so_far.push(ch);
+                true
+            }
         }
-        self.current_states = next;
-        self.matched_so_far.push(ch);
-        true
     }
 
     fn is_complete(&self) -> bool {
@@ -720,5 +856,102 @@ mod tests {
         // 'a' (97) should be valid as first char
         assert!(rc.char_is_valid('a'));
         assert!(!rc.char_is_valid('b')); // 'b' is not valid before 'a'
+    }
+
+    // ── RegexConstraint with a real decoder (id != codepoint) ────────────────
+
+    /// Vocabulary of multi-character tokens whose ids bear no relation to code
+    /// points — the realistic case the toy path silently mishandles.
+    fn date_vocab(id: u32) -> Option<String> {
+        match id {
+            0 => Some("2024".to_string()),
+            1 => Some("-".to_string()),
+            2 => Some("12".to_string()),
+            3 => Some("hello".to_string()),
+            4 => Some("20".to_string()),
+            5 => Some("24".to_string()),
+            9 => None, // EOS
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn regex_decoder_masks_multichar_tokens() {
+        // Pattern: YYYY-MM  (four digits, dash, two digits).
+        let c =
+            RegexConstraint::with_decoder(r"\d\d\d\d-\d\d", date_vocab, 10).expect("valid pattern");
+        let mask = c.allowed_tokens(&[], 10).unwrap();
+        assert!(mask[0], "'2024' matches leading \\d\\d\\d\\d");
+        // "20" (id 4) matches the first two digits and stays live.
+        assert!(mask[4], "'20' is a viable prefix");
+        // "hello" cannot match a leading digit.
+        assert!(!mask[3], "'hello' cannot start a date");
+        // "-" cannot come before the digits.
+        assert!(!mask[1], "'-' cannot start the pattern");
+    }
+
+    #[test]
+    fn regex_decoder_advance_full_sequence() {
+        let mut c =
+            RegexConstraint::with_decoder(r"\d\d\d\d-\d\d", date_vocab, 10).expect("valid pattern");
+        assert!(c.advance(0), "'2024'");
+        assert!(!c.is_complete(), "not complete after year");
+        assert!(c.advance(1), "'-'");
+        assert!(c.advance(2), "'12'");
+        assert!(c.is_complete(), "'2024-12' fully matches YYYY-MM");
+        assert_eq!(c.current_partial(), "2024-12");
+    }
+
+    #[test]
+    fn regex_decoder_advance_rejects_invalid_token() {
+        let mut c =
+            RegexConstraint::with_decoder(r"\d\d\d\d-\d\d", date_vocab, 10).expect("valid pattern");
+        assert!(c.advance(0), "'2024'");
+        // A dash is required next; committing "hello" (id 3) must be rejected.
+        assert!(!c.advance(3), "'hello' after '2024' must be rejected");
+    }
+
+    #[test]
+    fn regex_decoder_eos_only_when_accepting() {
+        let decode = |id: u32| match id {
+            0 => Some("a".to_string()),
+            1 => Some("b".to_string()),
+            9 => None, // EOS
+            _ => None,
+        };
+        let mut c = RegexConstraint::with_decoder("ab*", decode, 10).expect("valid pattern");
+        // Initially not accepting → EOS blocked.
+        let mask = c.allowed_tokens(&[], 10).unwrap();
+        assert!(!mask[9], "EOS blocked before any match");
+        // After 'a' the NFA is accepting → EOS allowed.
+        assert!(c.advance(0), "'a'");
+        assert!(c.is_complete());
+        let mask = c.allowed_tokens(&[], 10).unwrap();
+        assert!(mask[9], "EOS allowed once accepting");
+    }
+
+    #[test]
+    fn regex_decoder_masks_out_invalid_continuation() {
+        let decode = |id: u32| match id {
+            0 => Some("a".to_string()),
+            1 => Some("z".to_string()),
+            2 => Some("b".to_string()),
+            _ => None,
+        };
+        let mut c = RegexConstraint::with_decoder("abc", decode, 3).expect("valid pattern");
+        // At the start only "a" is a viable continuation.
+        let mask = c.allowed_tokens(&[], 3).unwrap();
+        assert!(mask[0], "'a' valid at start");
+        assert!(!mask[1], "'z' invalid at start");
+        assert!(!mask[2], "'b' invalid at start");
+        // A rejected advance leaves the live state intact (token not committed),
+        // so the constraint keeps masking correctly rather than dying.
+        assert!(!c.advance(1), "'z' rejected without committing");
+        assert!(c.advance(0), "'a' committed");
+        // After "a" only "b" continues the match.
+        let mask = c.allowed_tokens(&[], 3).unwrap();
+        assert!(mask[2], "'b' valid after 'a'");
+        assert!(!mask[0], "'a' invalid after 'a'");
+        assert!(!mask[1], "'z' invalid after 'a'");
     }
 }

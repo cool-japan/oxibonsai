@@ -1,9 +1,9 @@
 # oxibonsai-eval TODO
 
 > Model evaluation harness: perplexity, accuracy, ROUGE, throughput metrics
-> 19 source files, 11 test files, 219 integration + proptest tests passing
-> Version: 0.2.2 — Status: Stable
-> Last updated: 2026-06-06
+> 23 source files, 17 test files, 274 tests passing (nextest --all-features)
+> Version: 0.2.3 — Status: Stable
+> Last updated: 2026-07-21
 
 ## Status: Stable — Phase 18: WinoGrande + BoolQ evaluators added
 

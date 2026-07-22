@@ -201,26 +201,42 @@ fn test_embedder_registry_basic() {
     );
 }
 
-/// `encode_base64` must return a non-empty hex string for non-empty input.
+/// `encode_base64` must return a non-empty RFC 4648 base64 string for
+/// non-empty input (finding `serve-api-08`: this endpoint previously emitted
+/// lowercase hex, which silently corrupts data for real OpenAI-SDK clients
+/// that `base64.b64decode(...)` the result per the API contract).
 #[test]
 fn test_encode_base64_non_empty() {
     let vec = vec![0.0f32, 1.0f32, -1.0f32, 0.5f32];
     let encoded = EmbedderRegistry::encode_base64(&vec);
-    // 4 values × 4 bytes × 2 hex chars = 32 characters
-    assert_eq!(encoded.len(), 32, "expected 32 hex chars for 4 f32 values");
+    // 4 values × 4 bytes = 16 bytes → ceil(16/3)*4 = 24 base64 chars.
+    assert_eq!(
+        encoded.len(),
+        24,
+        "expected 24 base64 chars for 4 f32 values (16 bytes)"
+    );
     assert!(!encoded.is_empty());
-    // Must be valid lowercase hex
+    // Must be valid RFC 4648 base64 alphabet characters (+ padding).
     assert!(
-        encoded.chars().all(|c| c.is_ascii_hexdigit()),
-        "encoding must only contain hex characters, got: {encoded}"
+        encoded
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'='),
+        "encoding must only contain RFC 4648 base64 characters, got: {encoded}"
     );
 }
 
-/// `encode_base64` round-trip: the encoding of `1.0f32` must be `"0000803f"`.
+/// `encode_base64` known-vector test: the RFC 4648 base64 encoding of
+/// `[0.0f32, 1.0f32, -1.0f32, 0.5f32]` must match a real base64 decoder's
+/// expectation. Expected string independently computed via Python's
+/// standard `base64` module: `base64.b64encode(struct.pack("<4f", 0.0, 1.0,
+/// -1.0, 0.5))` == `b"AAAAAAAAgD8AAIC/AAAAPw=="`.
 #[test]
 fn test_encode_base64_known_value() {
-    let encoded = EmbedderRegistry::encode_base64(&[1.0f32]);
-    assert_eq!(encoded, "0000803f", "little-endian encoding of 1.0f32");
+    let encoded = EmbedderRegistry::encode_base64(&[0.0f32, 1.0f32, -1.0f32, 0.5f32]);
+    assert_eq!(
+        encoded, "AAAAAAAAgD8AAIC/AAAAPw==",
+        "RFC 4648 base64 encoding of [0.0, 1.0, -1.0, 0.5] as little-endian f32 bytes"
+    );
 }
 
 /// Fitting TF-IDF then embedding must return vectors of the vocabulary dimension.

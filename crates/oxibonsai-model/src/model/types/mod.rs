@@ -29,6 +29,8 @@ mod forward_cuda_fp8;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod forward_metal;
 #[cfg(all(feature = "metal", target_os = "macos"))]
+mod forward_metal_fp8;
+#[cfg(all(feature = "metal", target_os = "macos"))]
 mod gpu_cache;
 
 /// The complete Bonsai-8B model (Qwen3 architecture) with loaded weights.
@@ -374,15 +376,36 @@ impl<'a> BonsaiModel<'a> {
                 OutputWeight::FP8E4M3(_) | OutputWeight::FP8E5M2(_)
             )
         {
-            // Fused Metal prefill supports OneBit + Ternary today; FP8 falls
-            // through to the per-token sequential path, which dispatches through
-            // `KernelDispatcher::gemv_fp8_*` (Metal GPU via Phase 27).
+            // Fused Metal prefill supports OneBit + Ternary today.
             match self.try_metal_prefill_with_lm_head(token_ids, pos_start) {
                 Ok(logits) => return Ok(logits),
                 Err(e) => {
                     tracing::warn!(
                         error = % e,
                         "metal batch prefill failed, falling back to sequential"
+                    );
+                }
+            }
+        }
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if _gpu_kernel
+            && matches!(
+                &self.output_weight,
+                OutputWeight::FP8E4M3(_) | OutputWeight::FP8E5M2(_)
+            )
+        {
+            // FP8 hybrid batch prefill (Phase 28.B): batched FP8 GEMM projections
+            // on the GPU, attention + K/V store on the CPU against `self.kv_cache`
+            // — the same cache the per-token FP8 decode path reads. Correct by
+            // construction (no split KV cache); on any failure the sequential
+            // per-token path below still populates `self.kv_cache`.
+            let is_e4m3 = matches!(&self.output_weight, OutputWeight::FP8E4M3(_));
+            match self.try_metal_prefill_with_lm_head_fp8(token_ids, pos_start, is_e4m3) {
+                Ok(logits) => return Ok(logits),
+                Err(e) => {
+                    tracing::warn!(
+                        error = % e,
+                        "metal FP8 batch prefill failed, falling back to sequential"
                     );
                 }
             }

@@ -53,6 +53,11 @@ pub enum RagError {
     #[error("invalid metadata filter: {0}")]
     InvalidFilter(String),
 
+    /// The chunker configuration was ill-formed (e.g. `min_chunk_size` larger
+    /// than `chunk_size`, which would silently discard every produced chunk).
+    #[error("invalid chunk config: {0}")]
+    InvalidChunkConfig(String),
+
     /// I/O error (wraps [`std::io::Error`]).
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),

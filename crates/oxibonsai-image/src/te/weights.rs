@@ -133,6 +133,17 @@ impl TeWeights {
         &self.config
     }
 
+    /// Returns `true` if this registry's weights are held resident in memory
+    /// (stable `as_ptr()` identity), enabling safe cross-call GPU weight caching.
+    ///
+    /// When `false` (the default for `Source::Mlx4bit`), the dequantised f32
+    /// buffer is freed after each use, so the allocator can recycle its address.
+    /// The GPU weight cache must not persist keys across calls in that case —
+    /// use the evict-after-GEMM strategy to prevent stale-handle hazards.
+    pub fn is_resident(&self) -> bool {
+        self.resident.get()
+    }
+
     /// Keep dequantised f32 weights resident across forwards.
     ///
     /// Off by default. The `.npy` source already caches every tensor; this only

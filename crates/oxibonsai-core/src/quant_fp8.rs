@@ -429,6 +429,21 @@ impl BlockFP8E4M3 {
                 } else {
                     val / d_f32_actual
                 };
+                // Clamp finite scaled values into the representable E4M3FN range.
+                // Rounding the block scale to f16 can round it *down*, which pushes
+                // the block's own max-magnitude element just past FP8_E4M3_MAX.
+                // `fp8_e4m3_encode` already saturates overflow to ±448.0 (E4M3FN has
+                // no Infinity encoding, so there is no incorrect-NaN risk here), so
+                // this clamp is a no-op on today's encoder — it is kept to make the
+                // "finite input never encodes to NaN/Inf" invariant explicit and to
+                // stay symmetric with the E5M2 sibling, where the same scale-rounding
+                // slip would otherwise emit IEEE Infinity. Genuinely non-finite input
+                // is left untouched so it flows through the encoder's own handling.
+                let scaled = if scaled.is_finite() {
+                    scaled.clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
+                } else {
+                    scaled
+                };
                 qs[j] = fp8_e4m3_encode(scaled);
             }
 
@@ -556,6 +571,23 @@ impl BlockFP8E5M2 {
                     0.0
                 } else {
                     val / d_f32_actual
+                };
+                // Clamp finite scaled values into the representable E5M2 range.
+                // f16-rounding the block scale can round it *down* below the true
+                // ratio `max_abs / FP8_E5M2_MAX`; the block's own max-magnitude
+                // element then computes `scaled > FP8_E5M2_MAX`, which
+                // `fp8_e5m2_encode` maps to IEEE ±Infinity (0x7c / 0xfc) via its
+                // overflow path — corrupting a finite weight to `inf` for ~half of
+                // random blocks. Saturating to ±FP8_E5M2_MAX here mirrors the E4M3
+                // sibling (whose encoder saturates to a finite max) and keeps the
+                // round-to-nearest scale, which is optimal for the block's bulk, so
+                // roundtrip error stays as tight as possible. Genuinely non-finite
+                // input is left untouched so real ±Inf still encodes to ±Inf through
+                // `fp8_e5m2_encode`'s documented infinity handling.
+                let scaled = if scaled.is_finite() {
+                    scaled.clamp(-FP8_E5M2_MAX, FP8_E5M2_MAX)
+                } else {
+                    scaled
                 };
                 qs[j] = fp8_e5m2_encode(scaled);
             }
@@ -1035,5 +1067,99 @@ mod tests {
         let values = vec![100.0f32; 32];
         let blocks = BlockFP8E5M2::quantize(&values).unwrap();
         assert_ne!(blocks[0].d, f16::ZERO);
+    }
+
+    // ── Block-scale rounding overflow regression ───────────────────────────
+
+    /// Reproducible LCG PRNG (no rand dependency) matching the style used by
+    /// the quant test suites, for generating many pseudo-random blocks.
+    fn lcg_next(state: &mut u64) -> f32 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((*state >> 33) as f32) / (u32::MAX as f32) * 2.0 - 1.0
+    }
+
+    #[test]
+    fn e5m2_block_finite_input_never_dequants_to_inf_or_nan() {
+        // Historical defect: f16-rounding the block scale down let the block's
+        // own max-magnitude element encode to ±Infinity (~49% of random
+        // blocks). Sweep many seeds — including seed 42, which reproduced the
+        // original failure — and assert every finite input stays finite.
+        for seed in 0u64..512 {
+            let mut state = seed;
+            let input: Vec<f32> = (0..QK_FP8).map(|_| lcg_next(&mut state)).collect();
+            let blocks = BlockFP8E5M2::quantize(&input).expect("quantize should succeed");
+            let mut output = vec![0.0f32; QK_FP8];
+            BlockFP8E5M2::dequant(&blocks, &mut output).expect("dequant should succeed");
+            for (i, &y) in output.iter().enumerate() {
+                assert!(
+                    y.is_finite(),
+                    "E5M2 seed {seed} produced non-finite output at index {i}: {y}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn e4m3_block_finite_input_never_dequants_to_inf_or_nan() {
+        // E4M3FN has no Infinity and encodes NaN as 0x7f; the same scale-round
+        // -down class must never surface as an incorrect NaN or non-finite
+        // dequant. Sweep the same seed range as the E5M2 sibling.
+        for seed in 0u64..512 {
+            let mut state = seed;
+            let input: Vec<f32> = (0..QK_FP8).map(|_| lcg_next(&mut state)).collect();
+            let blocks = BlockFP8E4M3::quantize(&input).expect("quantize should succeed");
+            let mut output = vec![0.0f32; QK_FP8];
+            BlockFP8E4M3::dequant(&blocks, &mut output).expect("dequant should succeed");
+            for (i, &y) in output.iter().enumerate() {
+                assert!(
+                    y.is_finite(),
+                    "E4M3 seed {seed} produced non-finite output at index {i}: {y}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn e5m2_block_scale_rounddown_max_element_saturates_finite() {
+        // Seed 42 reproduced the original overflow-to-Infinity defect on the
+        // block's max-magnitude element (input ≈ -0.978 → -inf). After the fix
+        // it must saturate to a finite value close to the input instead.
+        let mut state = 42u64;
+        let input: Vec<f32> = (0..QK_FP8).map(|_| lcg_next(&mut state)).collect();
+        let blocks = BlockFP8E5M2::quantize(&input).expect("quantize should succeed");
+        let mut output = vec![0.0f32; QK_FP8];
+        BlockFP8E5M2::dequant(&blocks, &mut output).expect("dequant should succeed");
+
+        let max_abs = input.iter().copied().fold(0.0f32, |a, x| a.max(x.abs()));
+        for (i, (&x, &y)) in input.iter().zip(output.iter()).enumerate() {
+            assert!(y.is_finite(), "index {i}: input {x} decoded non-finite {y}");
+            assert_eq!(
+                x.signum(),
+                y.signum(),
+                "index {i}: sign flipped, input {x}, output {y}"
+            );
+            // The saturated max element decodes to d_actual × 57344, which is at
+            // most a couple of f16-ULPs below |max_abs|; a generous absolute
+            // bound of 25% of max_abs (E5M2 has only 2 mantissa bits) confirms it
+            // did not blow up.
+            assert!(
+                (x - y).abs() <= 0.25 * max_abs + f32::EPSILON,
+                "index {i}: input {x}, output {y} exceeds saturation error bound"
+            );
+        }
+    }
+
+    #[test]
+    fn e5m2_genuine_infinite_input_still_encodes_infinity() {
+        // The scale-rounding fix must not disturb the scalar encoder's
+        // documented behavior: a genuinely infinite *scalar* input encodes to
+        // ±Inf (0x7c / 0xfc). (Block quantize never feeds Inf to the encoder,
+        // but the scalar contract must remain intact.)
+        assert_eq!(fp8_e5m2_encode(f32::INFINITY), 0x7c);
+        assert_eq!(fp8_e5m2_encode(f32::NEG_INFINITY), 0xfc);
+        assert_eq!(fp8_e5m2_decode(0x7c), f32::INFINITY);
+        assert_eq!(fp8_e5m2_decode(0xfc), f32::NEG_INFINITY);
     }
 }

@@ -2,8 +2,8 @@
 //!
 //! Mirrors the safetensors pipeline in [`crate::convert`] but sources
 //! projection weights from `com.microsoft::MatMulNBits` nodes whose packed
-//! 2-bit codes are dequantized to f32 in memory before being re-quantized
-//! to TQ2_0_g128.
+//! 2-bit codes are dequantized to f32 in memory before being re-quantized to
+//! the requested output format (TQ2_0_g128 by default, or Q1_0_g128).
 //!
 //! # Pipeline summary
 //!
@@ -13,10 +13,9 @@
 //!    Qwen3 hyper-parameters.
 //! 4. Enumerate graph initializers and classify them:
 //!    * Norm tensors (f32 or f16 → f32) flow straight through.
-//!    * `model.embed_tokens.weight` → `token_embd.weight` (re-quantized to
-//!      TQ2).
+//!    * `model.embed_tokens.weight` → `token_embd.weight` (re-quantized).
 //!    * `lm_head.weight` (present iff `tie_word_embeddings = false`) →
-//!      `output.weight` (re-quantized to TQ2).
+//!      `output.weight` (re-quantized).
 //! 5. Enumerate MatMulNBits nodes and for each one:
 //!    * Look up the packed, scales, and zero-points initializers via the
 //!      node's `inputs[1..=3]`.
@@ -27,8 +26,9 @@
 //!      [`role_map::matmul_node_to_gguf`].
 //! 6. Handle `tie_word_embeddings` (duplicate token_embd as output.weight
 //!    if lm_head is absent).
-//! 7. Sort by GGUF name, pad to TQ2 block size, re-quantize norms as f32 /
-//!    weights as TQ2_0_g128, and write the GGUF file.
+//! 7. Sort by GGUF name, pad to the 128-element group size, re-quantize
+//!    norms as f32 / weights as TQ2_0_g128 or Q1_0_g128 (per `quant`), and
+//!    write the GGUF file.
 
 pub mod dequant;
 pub mod error;
@@ -48,6 +48,7 @@ use oxionnx_proto::types::{NodeProto, TensorProto};
 use crate::convert::common::{
     blocks_to_bytes, pad_to_multiple_of_128, read_config_json, write_metadata, ConvertStats,
 };
+use crate::quantize::quantize_q1_0_g128;
 
 pub use self::error::{DequantError, OnnxImportError};
 pub use self::role_map::OnnxRole;
@@ -61,20 +62,23 @@ pub use self::role_map::OnnxRole;
 ///   sidecar (if any) is located automatically via the `external_data`
 ///   `"location"` entries of the individual initializers.
 /// * `to_path` — destination GGUF file path.
-/// * `quant` — target quantisation format. Only `"tq2_0_g128"` is
-///   currently supported.
+/// * `quant` — target quantisation format: `"tq2_0_g128"` (ternary, default)
+///   or `"q1_0_g128"` (1-bit sign + FP16 group scale). Both use 128-element
+///   groups; norm/embedding-role tensors are always kept FP32.
 ///
 /// # Errors
 ///
-/// Returns an [`OnnxImportError`] on any I/O, parse, or conversion failure.
+/// Returns an [`OnnxImportError`] on any I/O, parse, unsupported `quant`
+/// value, or conversion failure.
 pub fn convert_onnx_to_gguf(
     onnx_path: &Path,
     to_path: &Path,
     quant: &str,
 ) -> Result<ConvertStats, OnnxImportError> {
-    if quant != "tq2_0_g128" {
+    if quant != "tq2_0_g128" && quant != "q1_0_g128" {
         return Err(OnnxImportError::Other(format!(
-            "unsupported quantisation format '{quant}'; only 'tq2_0_g128' is supported"
+            "unsupported quantisation format '{quant}'; supported formats are 'tq2_0_g128' and \
+             'q1_0_g128'"
         )));
     }
 
@@ -95,7 +99,7 @@ pub fn convert_onnx_to_gguf(
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("unknown");
-    write_metadata(&mut writer, &config, model_name)
+    write_metadata(&mut writer, &config, model_name, quant)
         .map_err(|e| OnnxImportError::Other(format!("writing metadata: {e}")))?;
 
     let tie_word_embeddings = config
@@ -462,6 +466,19 @@ pub fn convert_onnx_to_gguf(
                     .collect();
                 (raw, TensorType::F32)
             }
+            TensorKind::Weight if quant == "q1_0_g128" => {
+                // Q1_0_g128: 1-bit sign + FP16 group scale, same 128-element
+                // group size and padding as TQ2_0_g128. Uses the canonical
+                // sign convention shared with
+                // `oxibonsai_core::tensor::BlockQ1_0G128` (see
+                // `crate::quantize` module docs): bit=1 -> +scale, bit=0 -> -scale.
+                let padded = pad_to_multiple_of_128(&pending.f32_data);
+                let raw = quantize_q1_0_g128(&padded).map_err(|e| OnnxImportError::Requantize {
+                    tensor: pending.gguf_name.clone(),
+                    msg: format!("{e}"),
+                })?;
+                (raw, TensorType::Q1_0G128)
+            }
             TensorKind::Weight => {
                 let padded = pad_to_multiple_of_128(&pending.f32_data);
                 let blocks = BlockTQ2_0_g128::quantize(&padded).map_err(|e| {
@@ -481,6 +498,7 @@ pub fn convert_onnx_to_gguf(
             pending.gguf_shape,
             match pending.kind {
                 TensorKind::Norm => "F32",
+                TensorKind::Weight if quant == "q1_0_g128" => "Q1_0_g128",
                 TensorKind::Weight => "TQ2_0_g128",
             }
         );

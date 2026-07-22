@@ -105,6 +105,22 @@ pub struct RateLimitConfig {
     pub client_ttl: Duration,
     /// Optional global rate limit across all clients combined.
     pub global_rps: Option<f64>,
+    /// IP addresses of upstream reverse proxies trusted to set
+    /// `X-Forwarded-For` / `X-Real-IP` on requests they pass through.
+    ///
+    /// Defaults to empty, meaning **no** proxy is trusted: those headers are
+    /// never honored, and the client identity used for rate limiting is
+    /// derived from the actual TCP peer address instead (or the literal
+    /// `"unknown"` string if the peer address is unavailable to the caller).
+    /// This closes the trivial bypass where a client talking directly to the
+    /// server sets an arbitrary/rotating `X-Forwarded-For` value to obtain a
+    /// fresh token bucket on every request (findings `serve-api-07` /
+    /// `security-05`).
+    ///
+    /// Only add an address here when `oxibonsai-serve` genuinely sits behind
+    /// a reverse proxy or load balancer at that address which you control
+    /// and which overwrites (rather than blindly appends to) these headers.
+    pub trusted_proxies: Vec<std::net::IpAddr>,
 }
 
 impl Default for RateLimitConfig {
@@ -115,6 +131,7 @@ impl Default for RateLimitConfig {
             max_clients: 10_000,
             client_ttl: Duration::from_secs(300),
             global_rps: None,
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -289,6 +306,12 @@ impl RateLimiter {
             .remove(client_id);
     }
 
+    /// The configured trusted-proxy allowlist (see
+    /// [`RateLimitConfig::trusted_proxies`]).
+    pub fn trusted_proxies(&self) -> &[std::net::IpAddr] {
+        &self.config.trusted_proxies
+    }
+
     /// Returns `true` if the global rate limit is currently saturated.
     pub fn is_global_limited(&self) -> bool {
         match &self.global {
@@ -316,20 +339,57 @@ pub fn rate_limit_middleware(
     limiter.check_and_consume(client_id)
 }
 
-/// Extract a client identifier from HTTP headers.
+/// Extract a client identifier from HTTP headers, the real TCP peer address,
+/// and a trusted-proxy allowlist.
+///
+/// `X-Forwarded-For` / `X-Real-IP` are client-suppliable and therefore
+/// trivially spoofable: a direct (non-reverse-proxied) client can rotate
+/// them on every request to obtain a fresh rate-limit bucket each time, or
+/// omit them to pile onto a shared fallback bucket with every other
+/// header-less client (findings `serve-api-07` / `security-05`). To close
+/// that bypass, those headers are honored **only** when `peer_addr` is
+/// present *and* is a member of `trusted_proxies` -- i.e. only when the
+/// immediate connection really did come from an operator-configured reverse
+/// proxy that is expected to set them.
 ///
 /// Priority order:
-/// 1. `X-Forwarded-For` (first IP in the list)
-/// 2. `X-Real-IP`
-/// 3. Fallback string `"unknown"`
+/// 1. If `peer_addr` is a trusted proxy: `X-Forwarded-For` (first hop), then
+///    `X-Real-IP`.
+/// 2. The real peer address (`peer_addr`), when known.
+/// 3. Fallback string `"unknown"`.
 #[cfg(feature = "server")]
-pub fn extract_client_id(headers: &axum::http::HeaderMap) -> String {
+pub fn extract_client_id(
+    headers: &axum::http::HeaderMap,
+    peer_addr: Option<std::net::IpAddr>,
+    trusted_proxies: &[std::net::IpAddr],
+) -> String {
+    let peer_is_trusted_proxy = peer_addr
+        .map(|ip| trusted_proxies.contains(&ip))
+        .unwrap_or(false);
+
+    if peer_is_trusted_proxy {
+        if let Some(id) = forwarded_client_id(headers) {
+            return id;
+        }
+    }
+
+    match peer_addr {
+        Some(ip) => ip.to_string(),
+        None => "unknown".to_owned(),
+    }
+}
+
+/// Read a client-supplied forwarding header (`X-Forwarded-For`, then
+/// `X-Real-IP`). Only meaningful when the immediate peer is a configured
+/// trusted proxy -- see [`extract_client_id`].
+#[cfg(feature = "server")]
+fn forwarded_client_id(headers: &axum::http::HeaderMap) -> Option<String> {
     // X-Forwarded-For: client, proxy1, proxy2
     if let Some(xff) = headers.get("x-forwarded-for") {
         if let Ok(val) = xff.to_str() {
             let first = val.split(',').next().unwrap_or("").trim();
             if !first.is_empty() {
-                return first.to_owned();
+                return Some(first.to_owned());
             }
         }
     }
@@ -339,12 +399,12 @@ pub fn extract_client_id(headers: &axum::http::HeaderMap) -> String {
         if let Ok(val) = real_ip.to_str() {
             let trimmed = val.trim();
             if !trimmed.is_empty() {
-                return trimmed.to_owned();
+                return Some(trimmed.to_owned());
             }
         }
     }
 
-    "unknown".to_owned()
+    None
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -460,26 +520,94 @@ mod tests {
         assert_eq!(denied.retry_after_ms(), Some(500));
     }
 
+    /// Regression test for findings `serve-api-07` / `security-05`: when the
+    /// immediate peer is *not* a configured trusted proxy (the default), a
+    /// client-supplied `X-Forwarded-For` header must be completely ignored
+    /// -- otherwise any direct client could rotate the header on every
+    /// request to obtain a fresh rate-limit bucket each time.
     #[test]
-    fn test_extract_client_id_x_forwarded_for() {
+    fn test_extract_client_id_ignores_untrusted_forwarded_header() {
         use axum::http::HeaderMap;
         use axum::http::HeaderValue;
+        use std::net::IpAddr;
 
         let mut headers = HeaderMap::new();
         headers.insert(
             "x-forwarded-for",
             HeaderValue::from_static("203.0.113.42, 10.0.0.1"),
         );
-        let id = extract_client_id(&headers);
+        let peer: IpAddr = "198.51.100.7".parse().expect("valid ip");
+        // No trusted proxies configured -- the spoofed header must be
+        // ignored and the real peer address used instead.
+        let id = extract_client_id(&headers, Some(peer), &[]);
+        assert_eq!(
+            id, "198.51.100.7",
+            "an untrusted peer's X-Forwarded-For must not override the real peer address"
+        );
+    }
+
+    /// When the immediate peer *is* a configured trusted proxy, the
+    /// forwarded header is honored (the legitimate reverse-proxy case).
+    #[test]
+    fn test_extract_client_id_honors_forwarded_header_from_trusted_proxy() {
+        use axum::http::HeaderMap;
+        use axum::http::HeaderValue;
+        use std::net::IpAddr;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("203.0.113.42, 10.0.0.1"),
+        );
+        let peer: IpAddr = "10.0.0.1".parse().expect("valid ip");
+        let trusted = [peer];
+        let id = extract_client_id(&headers, Some(peer), &trusted);
         assert_eq!(id, "203.0.113.42");
     }
 
+    /// With no trusted proxies and no forwarded headers, a known peer
+    /// address is used directly as the client identifier.
+    #[test]
+    fn test_extract_client_id_uses_real_peer_when_no_headers() {
+        use axum::http::HeaderMap;
+        use std::net::IpAddr;
+
+        let headers = HeaderMap::new();
+        let peer: IpAddr = "203.0.113.9".parse().expect("valid ip");
+        let id = extract_client_id(&headers, Some(peer), &[]);
+        assert_eq!(id, "203.0.113.9");
+    }
+
+    /// With neither a known peer address nor headers, fall back to the
+    /// literal `"unknown"` string (unchanged legacy behavior for callers
+    /// that cannot supply connection info).
     #[test]
     fn test_extract_client_id_fallback() {
         use axum::http::HeaderMap;
         let headers = HeaderMap::new();
-        let id = extract_client_id(&headers);
+        let id = extract_client_id(&headers, None, &[]);
         assert_eq!(id, "unknown");
+    }
+
+    /// A trusted-proxy allowlist entry that does not match the actual peer
+    /// must not grant header trust (exact-match only, no accidental prefix
+    /// or subnet matching).
+    #[test]
+    fn test_extract_client_id_trusted_proxies_list_is_exact_match() {
+        use axum::http::HeaderMap;
+        use axum::http::HeaderValue;
+        use std::net::IpAddr;
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.42"));
+        let peer: IpAddr = "10.0.0.2".parse().expect("valid ip");
+        let other_trusted: IpAddr = "10.0.0.1".parse().expect("valid ip");
+        let id = extract_client_id(&headers, Some(peer), &[other_trusted]);
+        assert_eq!(
+            id, "10.0.0.2",
+            "a peer not exactly in the trusted_proxies list must not have its \
+             forwarded header honored"
+        );
     }
 
     #[test]

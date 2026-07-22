@@ -34,6 +34,27 @@ const MAX_ARRAY_COUNT: u64 = 16 * 1024 * 1024;
 /// Maximum tensor dimensions.
 const MAX_TENSOR_DIMS: u32 = 1024;
 
+/// Maximum nesting depth for `Array`-of-`Array` metadata values.
+///
+/// Mirrors the cap in `metadata.rs`: each nesting level costs only 12 bytes
+/// on disk, so without a limit a small crafted stream can drive
+/// `try_read_value` tens of thousands of stack frames deep and abort the
+/// process. No legitimate GGUF file nests arrays anywhere close to this
+/// deep.
+const MAX_ARRAY_NESTING_DEPTH: u32 = 32;
+
+/// Bound on the eager `Vec` capacity reservation for an `Array` value.
+///
+/// Mirrors the identical cap in `metadata.rs`: the declared element `count`
+/// is attacker-controlled and only bounded against [`MAX_ARRAY_COUNT`] (16
+/// M), so reserving `count` elements of capacity up front — before a single
+/// element has actually arrived over the wire — defeats this module's own
+/// purpose of not requiring the full data to be present in memory.
+/// Reserving only a small bounded amount and letting the `Vec` grow
+/// amortized as elements actually arrive keeps peak allocation proportional
+/// to real progress instead of a declared-but-undelivered count.
+const ARRAY_EAGER_RESERVE_CAP: usize = 4096;
+
 /// Default alignment for tensor data in GGUF files (32 bytes).
 const DEFAULT_ALIGNMENT: usize = 32;
 
@@ -115,6 +136,10 @@ pub struct GgufStreamParser {
     // Cached header counts for progress estimation
     total_metadata: u64,
     total_tensors: u64,
+    // Track keys/names seen so far so a duplicate can be rejected as a hard
+    // parse error instead of silently accumulating twice in `result`.
+    seen_metadata_keys: std::collections::HashSet<String>,
+    seen_tensor_names: std::collections::HashSet<String>,
 }
 
 impl GgufStreamParser {
@@ -132,6 +157,8 @@ impl GgufStreamParser {
             bytes_consumed: 0,
             total_metadata: 0,
             total_tensors: 0,
+            seen_metadata_keys: std::collections::HashSet::new(),
+            seen_tensor_names: std::collections::HashSet::new(),
         }
     }
 
@@ -167,7 +194,7 @@ impl GgufStreamParser {
                 }
                 StreamState::ReadingTensorInfo { remaining } => {
                     if *remaining == 0 {
-                        self.finalize();
+                        self.finalize()?;
                         break;
                     }
                     if !self.try_parse_one_tensor_info()? {
@@ -302,11 +329,22 @@ impl GgufStreamParser {
         pos += 4;
 
         // Parse value
-        let (value, new_pos) = match try_read_value(&self.buffer, pos, value_type)? {
+        let (value, new_pos) = match try_read_value(&self.buffer, pos, value_type, 0)? {
             Some(v) => v,
             None => return Ok(false),
         };
         pos = new_pos;
+
+        // A duplicate key would otherwise silently accumulate a second
+        // entry in `result.metadata` with no error or warning — reject it
+        // as a hard parse error instead (mirrors the batch `MetadataStore`
+        // parser in `metadata.rs`).
+        if !self.seen_metadata_keys.insert(key.clone()) {
+            return Err(BonsaiError::InvalidMetadata {
+                key,
+                reason: "duplicate metadata key".to_string(),
+            });
+        }
 
         self.bytes_consumed += pos as u64;
         self.buffer.drain(..pos);
@@ -381,6 +419,17 @@ impl GgufStreamParser {
         let offset = read_u64_le(&self.buffer, pos);
         pos += 8;
 
+        // A duplicate tensor name would otherwise silently accumulate a
+        // second `StreamedTensorInfo` entry with no error or warning —
+        // reject it as a hard parse error instead (mirrors the batch
+        // `TensorStore` parser in `tensor_info.rs`).
+        if !self.seen_tensor_names.insert(name.clone()) {
+            return Err(BonsaiError::InvalidMetadata {
+                key: name,
+                reason: "duplicate tensor name".to_string(),
+            });
+        }
+
         self.bytes_consumed += pos as u64;
         self.buffer.drain(..pos);
 
@@ -401,7 +450,11 @@ impl GgufStreamParser {
     }
 
     /// Finalize parsing: compute data offset with alignment and transition to complete state.
-    fn finalize(&mut self) {
+    ///
+    /// Returns an error if `general.alignment` was present but is zero or not
+    /// a power of two, rather than silently mis-locating the tensor data
+    /// section (see [`AlignmentError`](BonsaiError::AlignmentError)).
+    fn finalize(&mut self) -> Result<(), BonsaiError> {
         // Check for alignment override in metadata
         let alignment = self
             .result
@@ -414,11 +467,19 @@ impl GgufStreamParser {
             })
             .unwrap_or(DEFAULT_ALIGNMENT);
 
+        if alignment == 0 || !alignment.is_power_of_two() {
+            return Err(BonsaiError::AlignmentError {
+                expected: DEFAULT_ALIGNMENT,
+                offset: self.bytes_consumed,
+            });
+        }
+
         let offset = self.bytes_consumed as usize;
         let aligned = (offset + alignment - 1) & !(alignment - 1);
         self.result.data_offset = aligned as u64;
 
         self.state = StreamState::ReadingTensorData;
+        Ok(())
     }
 }
 
@@ -508,10 +569,15 @@ fn try_read_gguf_string(buf: &[u8], offset: usize) -> Result<Option<(String, usi
 
 /// Try to read a typed GGUF value from the buffer at `offset`.
 /// Returns `Some((value, new_offset))` if enough data, `None` otherwise.
+///
+/// `depth` tracks how many `Array` values enclose this call and is bounded
+/// by [`MAX_ARRAY_NESTING_DEPTH`] so a maliciously nested `Array`-of-`Array`
+/// chain fails cleanly instead of overflowing the stack.
 fn try_read_value(
     buf: &[u8],
     offset: usize,
     value_type: GgufValueType,
+    depth: u32,
 ) -> Result<Option<(GgufValue, usize)>, BonsaiError> {
     match value_type {
         GgufValueType::Uint8 => {
@@ -582,6 +648,15 @@ fn try_read_value(
             None => Ok(None),
         },
         GgufValueType::Array => {
+            let next_depth = depth + 1;
+            if next_depth > MAX_ARRAY_NESTING_DEPTH {
+                return Err(BonsaiError::InvalidMetadata {
+                    key: String::new(),
+                    reason: format!(
+                        "array nesting depth {next_depth} exceeds maximum of {MAX_ARRAY_NESTING_DEPTH}"
+                    ),
+                });
+            }
             // Need element type (u32) + count (u64) = 12 bytes minimum
             if offset + 12 > buf.len() {
                 return Ok(None);
@@ -597,9 +672,9 @@ fn try_read_value(
             }
 
             let mut pos = offset + 12;
-            let mut values = Vec::with_capacity(count as usize);
+            let mut values = Vec::with_capacity((count as usize).min(ARRAY_EAGER_RESERVE_CAP));
             for _ in 0..count {
-                match try_read_value(buf, pos, elem_type)? {
+                match try_read_value(buf, pos, elem_type, next_depth)? {
                     Some((v, new_pos)) => {
                         values.push(v);
                         pos = new_pos;
@@ -643,11 +718,171 @@ fn try_read_value(
 mod tests {
     use super::*;
 
+    fn push_gguf_string(bytes: &mut Vec<u8>, s: &str) {
+        bytes.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(s.as_bytes());
+    }
+
+    /// Build a minimal GGUF byte stream with a single `general.alignment`
+    /// (Uint32) metadata entry and zero tensors.
+    fn gguf_bytes_with_alignment(alignment: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes()); // version
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // metadata_kv_count
+
+        push_gguf_string(&mut bytes, "general.alignment");
+        bytes.extend_from_slice(&(GgufValueType::Uint32 as u32).to_le_bytes());
+        bytes.extend_from_slice(&alignment.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn zero_alignment_returns_error_not_silent_zero_offset() {
+        let mut parser = GgufStreamParser::new();
+        let data = gguf_bytes_with_alignment(0);
+        let result = parser.feed(&data);
+        match result {
+            Err(BonsaiError::AlignmentError { .. }) => {}
+            other => panic!("expected AlignmentError for zero alignment, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_power_of_two_alignment_returns_error() {
+        let mut parser = GgufStreamParser::new();
+        let data = gguf_bytes_with_alignment(3);
+        let result = parser.feed(&data);
+        match result {
+            Err(BonsaiError::AlignmentError { .. }) => {}
+            other => {
+                panic!("expected AlignmentError for non-power-of-two alignment, got: {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn valid_power_of_two_alignment_completes_successfully() {
+        let mut parser = GgufStreamParser::new();
+        let data = gguf_bytes_with_alignment(64);
+        parser.feed(&data).expect("valid alignment should parse");
+        assert!(parser.is_complete());
+        let result = parser.finish().expect("finish should succeed");
+        assert_eq!(result.data_offset % 64, 0);
+    }
+
     #[test]
     fn default_creates_new_parser() {
         let parser = GgufStreamParser::default();
         assert_eq!(*parser.state(), StreamState::ReadingHeader);
         assert_eq!(parser.bytes_consumed(), 0);
         assert!(!parser.is_complete());
+    }
+
+    /// Build a minimal GGUF byte stream with two metadata entries sharing
+    /// the same key.
+    fn gguf_bytes_with_duplicate_metadata_key() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes()); // version
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        bytes.extend_from_slice(&2u64.to_le_bytes()); // metadata_kv_count
+
+        for value in [1u32, 2u32] {
+            push_gguf_string(&mut bytes, "dup.key");
+            bytes.extend_from_slice(&(GgufValueType::Uint32 as u32).to_le_bytes());
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn duplicate_metadata_key_returns_error_not_silent_last_wins() {
+        let mut parser = GgufStreamParser::new();
+        let data = gguf_bytes_with_duplicate_metadata_key();
+        match parser.feed(&data) {
+            Err(BonsaiError::InvalidMetadata { key, reason }) => {
+                assert_eq!(key, "dup.key");
+                assert!(reason.contains("duplicate"), "reason: {reason}");
+            }
+            other => panic!("expected InvalidMetadata for duplicate key, got: {other:?}"),
+        }
+    }
+
+    /// Build a minimal GGUF byte stream with two tensor-info entries
+    /// sharing the same name.
+    fn gguf_bytes_with_duplicate_tensor_name() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes()); // version
+        bytes.extend_from_slice(&2u64.to_le_bytes()); // tensor_count
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // metadata_kv_count
+
+        for offset in [0u64, 16u64] {
+            push_gguf_string(&mut bytes, "dup.weight");
+            bytes.extend_from_slice(&1u32.to_le_bytes()); // n_dims
+            bytes.extend_from_slice(&4u64.to_le_bytes()); // dims[0]
+            bytes.extend_from_slice(&0u32.to_le_bytes()); // tensor type (F32)
+            bytes.extend_from_slice(&offset.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn duplicate_tensor_name_returns_error_not_silent_last_wins() {
+        let mut parser = GgufStreamParser::new();
+        let data = gguf_bytes_with_duplicate_tensor_name();
+        match parser.feed(&data) {
+            Err(BonsaiError::InvalidMetadata { key, reason }) => {
+                assert_eq!(key, "dup.weight");
+                assert!(reason.contains("duplicate"), "reason: {reason}");
+            }
+            other => panic!("expected InvalidMetadata for duplicate tensor name, got: {other:?}"),
+        }
+    }
+
+    /// A chain of nested `Array` headers well beyond
+    /// `MAX_ARRAY_NESTING_DEPTH`, each declaring `count = MAX_ARRAY_COUNT`
+    /// (16 M) elements, from a stream prefix only a few hundred bytes long.
+    /// Before the eager-allocation cap, recursing down through each level
+    /// forced a `Vec::with_capacity(16M)` reservation purely from the
+    /// declared count — before a single element arrived over the wire,
+    /// defeating this module's purpose of not requiring the full data up
+    /// front. Walking `MAX_ARRAY_NESTING_DEPTH` such levels (each now
+    /// capped) must still complete and fail cleanly via the depth check
+    /// (bounded memory, no OOM abort, no hang), not just eventually stall
+    /// waiting for more data.
+    #[test]
+    fn nested_max_count_arrays_on_tiny_prefix_bounded_memory_clean_error() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes()); // version
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // metadata_kv_count
+
+        push_gguf_string(&mut bytes, "bomb.key");
+        bytes.extend_from_slice(&(GgufValueType::Array as u32).to_le_bytes());
+
+        // Well beyond MAX_ARRAY_NESTING_DEPTH so the depth check fires
+        // deterministically (it runs before the insufficient-data check),
+        // while still exercising a `Vec::with_capacity(MAX_ARRAY_COUNT)`
+        // attempt at every level along the way down.
+        let levels = (MAX_ARRAY_NESTING_DEPTH as usize) * 2;
+        for _ in 0..levels {
+            bytes.extend_from_slice(&(GgufValueType::Array as u32).to_le_bytes());
+            bytes.extend_from_slice(&MAX_ARRAY_COUNT.to_le_bytes());
+        }
+
+        assert!(bytes.len() < 1024, "crafted input must stay tiny");
+
+        let mut parser = GgufStreamParser::new();
+        let result = parser.feed(&bytes);
+        match result {
+            Err(BonsaiError::InvalidMetadata { reason, .. }) => {
+                assert!(reason.contains("nesting depth"), "reason: {reason}");
+            }
+            other => panic!("expected InvalidMetadata (nesting depth), got: {other:?}"),
+        }
     }
 }

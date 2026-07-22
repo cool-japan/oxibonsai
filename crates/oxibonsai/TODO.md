@@ -1,6 +1,6 @@
 # oxibonsai TODO
 
-> v0.2.2 — 2026-06-06
+> v0.2.3 — 2026-07-21
 > **STABLE** — umbrella facade crate, re-exports all oxibonsai-* subcrates.
 
 ## Status
@@ -21,7 +21,7 @@ for the full phase history and `/crates/*/TODO.md` for per-crate status.
 | `server`             | Stable       | OpenAI-compatible HTTP server          |
 | `rag`                | Stable       | Retrieval-augmented generation         |
 | `native-tokenizer`   | Stable       | oxibonsai-tokenizer integration        |
-| `eval`               | Stable       | ARC/GSM8K evaluators                   |
+| `eval`               | Stable       | Perplexity, MC benchmarks (MMLU/ARC/GSM8K/…), ROUGE/BLEU/chrF/METEOR |
 | `full`               | Stable       | All of the above                       |
 | `wasm`               | Stable       | WASM32 target (no GPU)                 |
 | `simd-avx2/avx512`   | Stable       | x86_64 SIMD tiers                      |

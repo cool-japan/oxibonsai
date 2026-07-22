@@ -10,7 +10,7 @@ use super::types::{
     CudaActivationBuffers, CudaModules, LmHeadBuffers, QkvBuffers, TernaryGemvBuffers,
 };
 
-/// Direct CUDA dispatch engine, mirroring [`MetalGraph`] for Linux/Windows.
+/// Direct CUDA dispatch engine, mirroring `MetalGraph` for Linux/Windows.
 ///
 /// Owns the CUDA context, stream, compiled kernels, weight cache, and
 /// activation buffer pool. All state is protected by `Mutex` to satisfy

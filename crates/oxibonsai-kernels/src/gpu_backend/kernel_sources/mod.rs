@@ -42,11 +42,13 @@ mod decode_ternary;
 mod dit_attention_flash;
 mod fp8;
 mod fp8_prefill;
+mod k_quant;
 mod prefill;
 mod prefill_f32_simdgroup;
 mod prefill_simdgroup;
 mod prefill_simdgroup_v10;
 mod prefill_tiled;
+mod q_std;
 mod utility;
 mod vae;
 mod vae_conv_implicit;
@@ -66,6 +68,8 @@ pub use fp8::*;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub use fp8_prefill::*;
 #[cfg(all(feature = "metal", target_os = "macos"))]
+pub use k_quant::*;
+#[cfg(all(feature = "metal", target_os = "macos"))]
 pub use prefill::*;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub use prefill_f32_simdgroup::*;
@@ -75,6 +79,8 @@ pub use prefill_simdgroup::*;
 pub use prefill_simdgroup_v10::*;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub use prefill_tiled::*;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub use q_std::*;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub use utility::*;
 #[cfg(all(feature = "metal", target_os = "macos"))]

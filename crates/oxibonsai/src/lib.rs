@@ -23,7 +23,7 @@
 //! | [`oxibonsai-core`](https://crates.io/crates/oxibonsai-core) | GGUF loader, tensor types, quantization, configuration |
 //! | [`oxibonsai-kernels`](https://crates.io/crates/oxibonsai-kernels) | Optimized compute kernels (SIMD, matmul, softmax) |
 //! | [`oxibonsai-model`](https://crates.io/crates/oxibonsai-model) | Transformer model definitions, KV cache, attention |
-//! | [`oxibonsai-runtime`](https://crates.io/crates/oxibonsai-runtime) | Inference engine, sampling, speculative decoding |
+//! | [`oxibonsai-runtime`](https://crates.io/crates/oxibonsai-runtime) | Inference engine, sampling, speculative decoding (`SpeculativeDecoder::generate_verified`, two real engines) |
 //! | [`oxibonsai-tokenizer`](https://crates.io/crates/oxibonsai-tokenizer) | HuggingFace tokenizer integration |
 //! | [`oxibonsai-rag`](https://crates.io/crates/oxibonsai-rag) | Retrieval-augmented generation pipeline |
 //! | [`oxibonsai-eval`](https://crates.io/crates/oxibonsai-eval) | Model evaluation and benchmarking |
@@ -56,7 +56,13 @@ pub use oxibonsai_kernels as kernels;
 /// Transformer model definitions, KV cache, paged attention.
 pub use oxibonsai_model as model;
 
-/// Inference engine, sampling strategies, speculative decoding.
+/// Inference engine, sampling strategies, speculative decoding. The production
+/// speculative-decoding entry point is
+/// `runtime::speculative::SpeculativeDecoder::generate_verified`, which drafts
+/// against a delta-KV draft engine and verifies against a real, separate
+/// target [`InferenceEngine`](oxibonsai_runtime::engine::InferenceEngine) —
+/// its accepted output is token-identical to plain greedy decoding of the
+/// target model.
 pub use oxibonsai_runtime as runtime;
 
 /// Retrieval-augmented generation pipeline.

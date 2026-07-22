@@ -10,6 +10,8 @@
 //! - Output block counts
 //! - Layer tracking helpers
 
+use proptest::prelude::*;
+
 use oxibonsai_core::quant_fp8::{BlockFP8E4M3, BlockFP8E5M2, QK_FP8};
 use oxibonsai_model::{
     quantize_fp8_e4m3_smooth, quantize_fp8_e5m2_smooth, SmoothQuantCalibrator, SmoothQuantConfig,
@@ -51,7 +53,9 @@ fn calibrator_records_per_channel_max_abs() {
     ];
 
     let mut calib = SmoothQuantCalibrator::new(SmoothQuantConfig::default_alpha());
-    calib.record_activation("layer0", &activations, in_features);
+    calib
+        .record_activation("layer0", &activations, in_features)
+        .expect("record_activation failed");
 
     // Compute smooth_factors with a dummy all-ones weight matrix (4 rows, 4 cols).
     let out_features = 4usize;
@@ -93,8 +97,12 @@ fn calibrator_accumulates_across_batches() {
     let batch2 = vec![0.2_f32, -2.0, 0.1, 0.9];
 
     let mut calib = SmoothQuantCalibrator::new(SmoothQuantConfig::default_alpha());
-    calib.record_activation("layer_acc", &batch1, in_features);
-    calib.record_activation("layer_acc", &batch2, in_features);
+    calib
+        .record_activation("layer_acc", &batch1, in_features)
+        .expect("record_activation failed");
+    calib
+        .record_activation("layer_acc", &batch2, in_features)
+        .expect("record_activation failed");
 
     // After two batches:
     //   col0 running_max_abs = max(1.0, 0.2, 0.2, 0.1) = 1.0
@@ -126,8 +134,12 @@ fn calibrator_different_layers() {
     let acts_b = vec![1.0_f32, 10.0];
 
     let mut calib = SmoothQuantCalibrator::new(SmoothQuantConfig::default_alpha());
-    calib.record_activation("layer_a", &acts_a, in_features);
-    calib.record_activation("layer_b", &acts_b, in_features);
+    calib
+        .record_activation("layer_a", &acts_a, in_features)
+        .expect("record_activation failed");
+    calib
+        .record_activation("layer_b", &acts_b, in_features)
+        .expect("record_activation failed");
 
     let out_features = 2usize;
     let weights = vec![1.0_f32; out_features * in_features];
@@ -171,7 +183,9 @@ fn smooth_factors_returns_finite_nonzero() {
     }
 
     let mut calib = SmoothQuantCalibrator::new(SmoothQuantConfig::new(0.5));
-    calib.record_activation("fc1", &activations, in_features);
+    calib
+        .record_activation("fc1", &activations, in_features)
+        .expect("record_activation failed");
 
     let weights: Vec<f32> = (0..(out_features * in_features))
         .map(|i| (i as f32 + 1.0) * 0.1)
@@ -255,7 +269,9 @@ fn quantize_fp8_e4m3_smooth_reduces_outlier_error() {
 
     // --- Smoothed path ---
     let mut calib = SmoothQuantCalibrator::new(SmoothQuantConfig::new(0.5));
-    calib.record_activation("linear_e4m3", &activations, in_features);
+    calib
+        .record_activation("linear_e4m3", &activations, in_features)
+        .expect("record_activation failed");
 
     let smooth_factors = calib
         .smooth_factors("linear_e4m3", &weights, out_features)
@@ -340,7 +356,9 @@ fn quantize_fp8_e5m2_smooth_reduces_outlier_error() {
 
     // Smoothed
     let mut calib = SmoothQuantCalibrator::new(SmoothQuantConfig::new(0.5));
-    calib.record_activation("linear5m2", &activations, in_features);
+    calib
+        .record_activation("linear5m2", &activations, in_features)
+        .expect("record_activation failed");
     let smooth_factors = calib
         .smooth_factors("linear5m2", &weights, out_features)
         .expect("smooth_factors failed");
@@ -384,16 +402,26 @@ fn quantize_fp8_e5m2_smooth_reduces_outlier_error() {
     );
 }
 
-// ─── Test 8: record_activation panics on in_features mismatch ────────────────
+// ─── Test 8: record_activation returns Err on in_features mismatch ───────────
 
 #[test]
-#[should_panic(expected = "in_features mismatch")]
 fn calibrator_in_features_mismatch() {
     let mut calib = SmoothQuantCalibrator::new(SmoothQuantConfig::default_alpha());
     // First recording establishes in_features = 4
-    calib.record_activation("layer_mismatch", &[1.0_f32; 4], 4);
-    // Second recording with different in_features should panic
-    calib.record_activation("layer_mismatch", &[1.0_f32; 6], 6);
+    calib
+        .record_activation("layer_mismatch", &[1.0_f32; 4], 4)
+        .expect("first record_activation should succeed");
+    // Second recording with a different in_features must return a typed error,
+    // not panic — this is a normal calibration-loop entry point and a caller
+    // bug feeding a mismatched batch width must be catchable.
+    let result = calib.record_activation("layer_mismatch", &[1.0_f32; 6], 6);
+    match result {
+        Err(SmoothQuantError::InFeaturesMismatch { expected, got }) => {
+            assert_eq!(expected, 4);
+            assert_eq!(got, 6);
+        }
+        other => panic!("expected InFeaturesMismatch, got: {other:?}"),
+    }
 }
 
 // ─── Test 9: layer_count tracks unique layers ─────────────────────────────────
@@ -403,17 +431,25 @@ fn layer_count_tracks_unique_layers() {
     let mut calib = SmoothQuantCalibrator::new(SmoothQuantConfig::default_alpha());
     assert_eq!(calib.layer_count(), 0);
 
-    calib.record_activation("layer_x", &[1.0_f32, 2.0], 2);
+    calib
+        .record_activation("layer_x", &[1.0_f32, 2.0], 2)
+        .expect("record_activation failed");
     assert_eq!(calib.layer_count(), 1);
 
-    calib.record_activation("layer_y", &[0.5_f32, 0.3], 2);
+    calib
+        .record_activation("layer_y", &[0.5_f32, 0.3], 2)
+        .expect("record_activation failed");
     assert_eq!(calib.layer_count(), 2);
 
-    calib.record_activation("layer_z", &[0.1_f32, 0.9], 2);
+    calib
+        .record_activation("layer_z", &[0.1_f32, 0.9], 2)
+        .expect("record_activation failed");
     assert_eq!(calib.layer_count(), 3);
 
     // Re-recording an existing layer must not increase count.
-    calib.record_activation("layer_x", &[0.2_f32, 0.4], 2);
+    calib
+        .record_activation("layer_x", &[0.2_f32, 0.4], 2)
+        .expect("record_activation failed");
     assert_eq!(
         calib.layer_count(),
         3,
@@ -426,7 +462,9 @@ fn layer_count_tracks_unique_layers() {
 #[test]
 fn has_layer_returns_true_after_recording() {
     let mut calib = SmoothQuantCalibrator::new(SmoothQuantConfig::default_alpha());
-    calib.record_activation("my_layer", &[1.0_f32, -1.0], 2);
+    calib
+        .record_activation("my_layer", &[1.0_f32, -1.0], 2)
+        .expect("record_activation failed");
     assert!(
         calib.has_layer("my_layer"),
         "has_layer should be true after recording"
@@ -460,7 +498,9 @@ fn quantize_fp8_e4m3_smooth_output_size() {
         .collect();
 
     let mut calib = SmoothQuantCalibrator::new(SmoothQuantConfig::default_alpha());
-    calib.record_activation("size_test", &activations, in_features);
+    calib
+        .record_activation("size_test", &activations, in_features)
+        .expect("record_activation failed");
     let factors = calib
         .smooth_factors("size_test", &weights, out_features)
         .expect("smooth_factors failed");
@@ -474,4 +514,55 @@ fn quantize_fp8_e4m3_smooth_output_size() {
         "expected {expected_blocks} blocks for {n} weights, got {}",
         blocks.len()
     );
+}
+
+// ─── Finite-input finiteness invariant for the channel-scale variants ─────────
+//
+// Both SmoothQuant channel-aware quantizers apply per-column smoothing and then
+// delegate to `BlockFP8E{4M3,5M2}::quantize`. The core block quantizers clamp
+// each finite scaled value into the representable FP8 range so that f16-rounding
+// the block scale downward can never push the block's own max-magnitude element
+// past the format max and encode it as ±Inf (E5M2) or an incorrect NaN (E4M3).
+// These proptests assert that invariant end-to-end through the channel-scale API.
+
+const SMOOTH_OUT: usize = 4;
+const SMOOTH_IN: usize = QK_FP8; // 32 → out*in = 128 = 4 blocks
+
+proptest! {
+    /// Finite weights and finite positive smoothing factors must quantize +
+    /// dequantize through `quantize_fp8_e5m2_smooth` to an entirely finite
+    /// output — no channel-scaled element may overflow to ±Inf.
+    #[test]
+    fn quantize_fp8_e5m2_smooth_finite_input_never_produces_non_finite(
+        weights in prop::collection::vec(-100.0f32..100.0f32, SMOOTH_OUT * SMOOTH_IN),
+        factors in prop::collection::vec(0.01f32..100.0f32, SMOOTH_IN),
+    ) {
+        let blocks = quantize_fp8_e5m2_smooth(&weights, SMOOTH_OUT, SMOOTH_IN, &factors)
+            .expect("smooth E5M2 quantize should succeed");
+        let out = dequant_e5m2(&blocks, SMOOTH_OUT * SMOOTH_IN);
+        for (i, &y) in out.iter().enumerate() {
+            prop_assert!(
+                y.is_finite(),
+                "E5M2 smooth quantize produced non-finite output at index {i}: {y}"
+            );
+        }
+    }
+
+    /// E4M3FN counterpart: finite channel-scaled input must never dequantize to
+    /// a non-finite value (E4M3FN has no Infinity and encodes NaN as 0x7f).
+    #[test]
+    fn quantize_fp8_e4m3_smooth_finite_input_never_produces_non_finite(
+        weights in prop::collection::vec(-100.0f32..100.0f32, SMOOTH_OUT * SMOOTH_IN),
+        factors in prop::collection::vec(0.01f32..100.0f32, SMOOTH_IN),
+    ) {
+        let blocks = quantize_fp8_e4m3_smooth(&weights, SMOOTH_OUT, SMOOTH_IN, &factors)
+            .expect("smooth E4M3 quantize should succeed");
+        let out = dequant_e4m3(&blocks, SMOOTH_OUT * SMOOTH_IN);
+        for (i, &y) in out.iter().enumerate() {
+            prop_assert!(
+                y.is_finite(),
+                "E4M3 smooth quantize produced non-finite output at index {i}: {y}"
+            );
+        }
+    }
 }

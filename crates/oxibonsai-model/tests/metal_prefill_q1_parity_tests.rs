@@ -413,3 +413,60 @@ fn test_batched_q1_prefill_matches_per_position_batch12() {
         "test_batched_q1_prefill_matches_per_position_batch12: max_abs={max_abs:.3e}, max_rel={max_rel:.3e}"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Context-length guard regression tests (P1 no-panic-on-long-prompt)
+//
+// The Q1 Metal prefill / prefill-verify / greedy entry points must reject a
+// prompt that overruns `max_seq_len` with a clean `Err` rather than panicking on
+// an out-of-bounds `RopeTable::cos_at` slice. We build the model with a tiny
+// context so a modest batch/position overflows it. The guard runs *before* the
+// GPU-handle check, so these need no `upload_weights_to_gpu`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Tiny context so a 16-token batch (or `pos == max_seq`) overflows it.
+const GUARD_MAX_SEQ: usize = 8;
+
+#[test]
+fn test_q1_prefill_context_guard_returns_err() {
+    let gguf_bytes = build_synthetic_q1_gguf();
+    let gguf = parse_synthetic_gguf(&gguf_bytes);
+    let model = BonsaiModel::from_gguf(&gguf, GUARD_MAX_SEQ).expect("BonsaiModel::from_gguf");
+    let token_ids: Vec<u32> = (0..16_u32).map(|i| i % 32).collect();
+    let err = model
+        .try_metal_prefill_with_lm_head(&token_ids, 0)
+        .expect_err("over-long Q1 prefill must return Err, not Ok/panic");
+    assert!(
+        err.to_string().contains("too long"),
+        "expected a context-length error, got: {err}"
+    );
+}
+
+#[test]
+fn test_q1_prefill_verify_context_guard_returns_err() {
+    let gguf_bytes = build_synthetic_q1_gguf();
+    let gguf = parse_synthetic_gguf(&gguf_bytes);
+    let model = BonsaiModel::from_gguf(&gguf, GUARD_MAX_SEQ).expect("BonsaiModel::from_gguf");
+    let token_ids: Vec<u32> = (0..16_u32).map(|i| i % 32).collect();
+    let err = model
+        .try_metal_prefill_verify(&token_ids, 0)
+        .expect_err("over-long Q1 prefill-verify must return Err, not Ok/panic");
+    assert!(
+        err.to_string().contains("too long"),
+        "expected a context-length error, got: {err}"
+    );
+}
+
+#[test]
+fn test_q1_greedy_gpu_context_guard_returns_err() {
+    let gguf_bytes = build_synthetic_q1_gguf();
+    let gguf = parse_synthetic_gguf(&gguf_bytes);
+    let model = BonsaiModel::from_gguf(&gguf, GUARD_MAX_SEQ).expect("BonsaiModel::from_gguf");
+    let err = model
+        .forward_greedy_gpu(1, GUARD_MAX_SEQ)
+        .expect_err("greedy decode at pos == max_seq must return Err, not panic");
+    assert!(
+        err.to_string().contains("too long"),
+        "expected a context-length error, got: {err}"
+    );
+}

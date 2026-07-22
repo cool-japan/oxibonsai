@@ -4,7 +4,7 @@
 //! accuracy (MSE, SNR), compression ratio, and round-trip export fidelity.
 
 use oxibonsai_model::export::{
-    export_stats, export_to_gguf, ExportConfig, ExportFormat, WeightTensor,
+    export_stats, export_to_gguf, ExportConfig, ExportError, ExportFormat, WeightTensor,
 };
 use oxibonsai_model::quantize::{analyze_quantization_error, quantize_q1_0_g128, GROUP_SIZE};
 use oxibonsai_model::quantize_int8::{
@@ -179,7 +179,10 @@ fn test_export_and_reimport_tensor() {
     let found = bytes.windows(4).any(|w| w == needle.as_slice());
     assert!(found, "f32 value 0.0 should be present in the GGUF payload");
 
-    // Verify INT8 per-channel path also exports correctly.
+    // INT8 per-channel has no GGUF tensor-type id and no loader anywhere in
+    // this workspace, so `export_to_gguf` refuses it (see
+    // `ExportFormat::Int8PerChannel` docs) rather than silently writing
+    // packed bytes mislabeled as `TensorType::F32`.
     let data_q: Vec<f32> = (0..256).map(|i| (i as f32 - 128.0) * 0.01).collect();
     let tensors_q = vec![WeightTensor::new(
         "blk.0.attn_k.weight",
@@ -187,10 +190,10 @@ fn test_export_and_reimport_tensor() {
         vec![4, 64],
     )];
     let config_q = ExportConfig::new(ExportFormat::Int8PerChannel, "reimport-int8");
-    let bytes_q = export_to_gguf(&tensors_q, &config_q, &[]).expect("export int8");
-    assert_eq!(
-        u32::from_le_bytes(bytes_q[0..4].try_into().expect("s")),
-        0x4655_4747
+    let result_q = export_to_gguf(&tensors_q, &config_q, &[]);
+    assert!(
+        matches!(result_q, Err(ExportError::NoLoaderForFormat { .. })),
+        "Int8PerChannel export should be refused (no matching GGUF loader), got {result_q:?}"
     );
 
     // Verify Q1_0 path.

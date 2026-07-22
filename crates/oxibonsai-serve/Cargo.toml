@@ -36,7 +36,7 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 axum.workspace = true
-tower.workspace = true
+tower = { workspace = true, features = ["limit", "load-shed", "timeout", "util"] }
 tower-http.workspace = true
 
 [dev-dependencies]

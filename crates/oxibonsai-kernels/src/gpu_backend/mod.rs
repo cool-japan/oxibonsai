@@ -2,9 +2,9 @@
 //!
 //! This module defines the [`GpuBackendTrait`] trait and provides:
 //! - [`CpuBackend`]: Always-available CPU implementation (baseline)
-//! - [`CudaBackend`]: CUDA stub (feature = "cuda", compile-only placeholder)
-//! - [`MetalBackend`]: Metal stub (feature = "metal", compile-only placeholder)
-//! - [`Scirs2Backend`]: **Real** GPU backend via scirs2-core (feature = "gpu")
+//! - `CudaBackend`: CUDA stub (feature = "cuda", compile-only placeholder)
+//! - `MetalBackend`: Metal stub (feature = "metal", target_os = "macos", compile-only placeholder)
+//! - `Scirs2Backend`: **Real** GPU backend via scirs2-core (feature = "gpu")
 //!
 //! # Architecture
 //! All GPU operations follow the same pattern:
@@ -13,7 +13,7 @@
 //! 3. Execute kernel
 //! 4. Copy device → host
 //!
-//! The [`Scirs2Backend`] compiles Metal/CUDA kernels at runtime through
+//! The `Scirs2Backend` compiles Metal/CUDA kernels at runtime through
 //! scirs2-core and dispatches real GPU work.  Stub backends delegate to
 //! CPU operations.
 //!
@@ -129,7 +129,11 @@ pub mod metal_full_layer;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal_graph;
 #[cfg(all(feature = "metal", target_os = "macos"))]
+pub mod metal_k_quant_kernels;
+#[cfg(all(feature = "metal", target_os = "macos"))]
 mod metal_prefill;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub mod metal_q_std_kernels;
 pub mod scirs2_backend;
 
 use thiserror::Error;
@@ -141,6 +145,14 @@ pub use scirs2_backend::Scirs2Backend;
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub use metal_fp8_kernels::{metal_gemv_fp8_e4m3, metal_gemv_fp8_e5m2};
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub use metal_q_std_kernels::{metal_gemv_q4_0, metal_gemv_q8_0};
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub use metal_k_quant_kernels::{
+    metal_gemv_q2k, metal_gemv_q3k, metal_gemv_q4k, metal_gemv_q5k, metal_gemv_q6k, metal_gemv_q8k,
+};
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub use metal_fp8_prefill::{
@@ -430,7 +442,7 @@ pub trait GpuBackendTrait: Send + Sync {
     /// Q1_0_g128 matrix-vector product.
     ///
     /// Default implementation falls back to CPU dequant + scalar GEMV.
-    /// [`Scirs2Backend`] overrides this with a real GPU kernel.
+    /// `Scirs2Backend` overrides this with a real GPU kernel.
     fn gemv_q1_g128(
         &self,
         block_bytes: &[u8],
@@ -1062,7 +1074,7 @@ impl GpuBackendTrait for Scirs2BackendHandle {
 /// Select the best available backend automatically.
 ///
 /// Priority order (highest to lowest):
-/// 1. [`Scirs2Backend`] (feature = "gpu") — Metal-accelerated via scirs2-core
+/// 1. `Scirs2Backend` (feature = "gpu") — Metal-accelerated via scirs2-core
 /// 2. `NativeCudaBackend` (feature = "native-cuda") — direct cudarc CUDA
 /// 3. CUDA stub (feature = "cuda", no "native-cuda") — falls back to CPU
 /// 4. Metal stub (feature = "metal", macOS only) — falls back to CPU

@@ -1,8 +1,8 @@
 # oxibonsai-kernels
 
-[![Version](https://img.shields.io/badge/version-0.2.2-blue.svg)](https://crates.io/crates/oxibonsai-kernels)
+[![Version](https://img.shields.io/badge/version-0.2.3-blue.svg)](https://crates.io/crates/oxibonsai-kernels)
 
-Q1_0_g128 (1-bit) and TQ2_0_g128 (ternary) compute kernels for OxiBonsai — dequantization, GEMV, GEMM, fused full-forward.
+Q1_0_g128 (1-bit) and TQ2_0_g128 (ternary) compute kernels for OxiBonsai — dequantization, GEMV, GEMM, fused full-forward — plus GEMV kernels for standard GGUF quant (Q4_0/Q8_0) and K-quant (Q2_K–Q8_K).
 
 Implements the full compute stack for 1-bit and ternary inference: scalar
 reference kernels, SIMD-accelerated tiers (AVX2+FMA, AVX-512, NEON), tiled
@@ -11,21 +11,23 @@ cache-blocked GEMM, parallel Rayon dispatch, and production GPU backends
 
 Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 
-**Status:** Stable (mature, complete) — 675 tests passing.
+**Status:** Stable (mature, complete) — 508 tests passing.
 
 ## Features
 
 - `dequant_1bit_g128` / `dequant_tq2_0_g128` — dequantize Q1_0_g128 / TQ2_0_g128 blocks to f32
 - `gemv_1bit_g128` / `gemv_tq2_0_g128` — fused 1-bit / ternary GEMV (matrix-vector multiply)
 - `gemm_1bit_g128` / `gemm_tq2_0_g128` — fused 1-bit / ternary GEMM (batched matrix multiply)
+- `gemv_q4_0` / `gemv_q8_0` — standard GGUF quant GEMV (Q4_0 4-bit / Q8_0 8-bit): scalar reference + AVX2 + AVX-512 SIMD tiers, NEON (`simd_q_std_neon`), and Rayon row-parallel (`gemv_q4_0_par` / `gemv_q8_0_par`)
+- `gemv_q2k` / `gemv_q3k` / `gemv_q4k` / `gemv_q5k` / `gemv_q6k` / `gemv_q8k` — K-quant (Q2_K–Q8_K) GEMV kernels sharing one Rayon row-parallel driver
 - `KernelDispatcher::auto_detect()` — selects the best SIMD tier at runtime
 - Tiled GEMM with cache-line alignment and software prefetch hints
 - Parallel dispatch via Rayon (`gemv_*_par`, `gemm_*_par`, tiled parallel paths)
 - Platform tuning: `PlatformProfile`, `TunedThresholds`
 - `OneBitKernel` and `TernaryKernel` traits unified through `KernelDispatcher`
 - GPU backend trait (`GpuBackendTrait`) with three concrete paths:
-  - **Metal**: fused full-forward TQ2 path (single command buffer) — ~50 tok/s on 1.7B ternary (~13× speedup)
-  - **Native CUDA**: NVRTC-compiled kernels with CUDA Graph execution (multi-encoding pass); prefill path with dedicated attention kernels for KV-cache population
+  - **Metal**: fused full-forward TQ2 path (single command buffer) — ~50 tok/s on 1.7B ternary (~13× speedup); standalone GEMV kernels for Q4_0/Q8_0 and K-quant (Q2_K–Q8_K), dispatched per layer by `oxibonsai-model`'s `Linear*::forward()` before it falls back to CPU
+  - **Native CUDA**: NVRTC-compiled kernels with CUDA Graph execution (multi-encoding pass); prefill path with dedicated attention kernels for KV-cache population; per-position GEMV kernels also cover Q4_0/Q8_0, K-quant, and FP8 — batched-prefill kernels exist for these formats too, but are not called by default (split-KV-cache gap, same class as the Q1/ternary cap-of-8 issue in the TODO), so the sequential per-position path runs instead
   - **scirs2-core backend**: portable CUDA/Metal via `scirs2-core::gpu`
 
 ## SIMD Tiers
@@ -63,7 +65,7 @@ Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 ```toml
 [dependencies]
 # Auto-detect at runtime:
-oxibonsai-kernels = { version = "0.2.2", features = ["simd-avx2"] }
+oxibonsai-kernels = { version = "0.2.3", features = ["simd-avx2"] }
 ```
 
 ```rust

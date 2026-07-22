@@ -24,6 +24,20 @@ impl<'a> BonsaiModel<'a> {
         if n_layers == 0 {
             return Err("no blocks".into());
         }
+        // SPLIT-CACHE GUARD (disabled by default).
+        //
+        // K-quant DECODE runs CPU attention over `self.kv_cache` (see the K-quant
+        // branch in `BonsaiModel::forward`), but this GPU batch-prefill path
+        // writes a GPU-private KV cache that is never synced back to the CPU
+        // cache.  A successful GPU prefill would therefore leave decode attending
+        // over all-zero prompt KV and silently corrupt generation.  The path is
+        // disabled so `forward_prefill` falls back to the bit-correct sequential
+        // per-token path (which populates `self.kv_cache`).  Set
+        // `OXIBONSAI_FORCE_CUDA_SPLIT_PREFILL=1` to force the (decode-incorrect)
+        // GPU path for throughput microbenchmarks only.
+        if std::env::var_os("OXIBONSAI_FORCE_CUDA_SPLIT_PREFILL").is_none() {
+            return Err("K-quant CUDA batch prefill disabled (GPU-private KV cache not read by CPU decode); using sequential fallback".into());
+        }
         let eps = self.blocks[0].attn_norm_eps();
         let h = self.config.hidden_size;
         let inter = self.config.intermediate_size;
@@ -137,6 +151,13 @@ impl<'a> BonsaiModel<'a> {
         let n_layers = self.blocks.len();
         if n_layers == 0 {
             return Err("no blocks".into());
+        }
+        // SPLIT-CACHE GUARD (disabled by default) — see
+        // `try_cuda_prefill_with_lm_head_k_quant`.  The GPU-private KV cache this
+        // path writes is not the CPU `self.kv_cache` that decode reads, so it is
+        // disabled by default and the caller falls back to the sequential path.
+        if std::env::var_os("OXIBONSAI_FORCE_CUDA_SPLIT_PREFILL").is_none() {
+            return Err("K-quant CUDA batch prefill verify disabled (GPU-private KV cache not read by CPU decode); using sequential fallback".into());
         }
         let eps = self.blocks[0].attn_norm_eps();
         let h = self.config.hidden_size;

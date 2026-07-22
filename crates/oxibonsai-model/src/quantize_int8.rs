@@ -237,7 +237,8 @@ pub fn quantize_per_tensor(weights: &[f32]) -> Int8Tensor {
 /// Quantize a flat `f32` tensor to INT8 using one scale per output channel.
 ///
 /// `num_channels` is the number of rows (output neurons) of the weight matrix.
-/// `weights.len()` must be divisible by `num_channels`.
+/// `weights.len()` must be divisible by `num_channels`, and `num_channels`
+/// must be non-zero (returns [`Int8QuantizeError::ChannelMismatch`] otherwise).
 pub fn quantize_per_channel(
     weights: &[f32],
     num_channels: usize,
@@ -245,7 +246,7 @@ pub fn quantize_per_channel(
     if weights.is_empty() {
         return Err(Int8QuantizeError::EmptyTensor);
     }
-    if weights.len() % num_channels != 0 {
+    if num_channels == 0 || weights.len() % num_channels != 0 {
         return Err(Int8QuantizeError::ChannelMismatch {
             total: weights.len(),
             channels: num_channels,
@@ -592,6 +593,40 @@ mod tests {
                 })
             ),
             "expected ChannelMismatch error, got {result:?}"
+        );
+    }
+
+    // ── quantize_per_channel_zero_channels_returns_error ──────────────────
+    //
+    // Regression test: `num_channels == 0` used to panic (integer division
+    // / modulo by zero) instead of returning a `Result`, since the divisibility
+    // check ran `weights.len() % num_channels` without first checking for zero.
+
+    #[test]
+    fn test_quantize_per_channel_zero_channels_returns_error() {
+        let weights = vec![1.0_f32; 100];
+        let result = quantize_per_channel(&weights, 0);
+        assert!(
+            matches!(
+                result,
+                Err(Int8QuantizeError::ChannelMismatch {
+                    total: 100,
+                    channels: 0
+                })
+            ),
+            "expected ChannelMismatch error for num_channels=0, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_compare_quantization_methods_zero_channels_returns_error() {
+        // compare_quantization_methods forwards num_channels to
+        // quantize_per_channel; Some(0) must not panic either.
+        let weights = vec![1.0_f32; 128];
+        let result = compare_quantization_methods(&weights, Some(0));
+        assert!(
+            result.is_err(),
+            "compare_quantization_methods with num_channels=Some(0) should error, not panic"
         );
     }
 }

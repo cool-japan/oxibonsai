@@ -3,7 +3,7 @@
 
 use metal::{Buffer, CommandQueue, Device, MTLResourceOptions};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -128,6 +128,14 @@ pub struct MetalGraph {
     /// across calls — the *resident* analogue of the per-call fresh-buffer
     /// `encode_joint_attention_flash`.
     pub(super) joint_attn_pool: Mutex<Option<JointAttnIoPool>>,
+    /// Running count of f32 weight uploads via [`get_or_upload_f32_weight`].
+    ///
+    /// Incremented once each time a key is not found in `weight_cache` and a
+    /// fresh GPU buffer is actually allocated and inserted. Used to verify that
+    /// multi-prompt resident workflows amortize uploads (counter stays flat after
+    /// the first forward) and that non-resident evict-after-GEMM workflows stay
+    /// correct (counter increments on every call, no stale-cache collisions).
+    f32_upload_count: AtomicUsize,
 }
 
 // Metal objects (Device, CommandQueue, etc.) are Send+Sync in the metal crate.
@@ -161,6 +169,7 @@ impl MetalGraph {
             prefill_buffers: Mutex::new(None),
             gemm_io_pool: Mutex::new(None),
             joint_attn_pool: Mutex::new(None),
+            f32_upload_count: AtomicUsize::new(0),
         })
     }
 
@@ -211,7 +220,36 @@ impl MetalGraph {
         }
         let handle = Arc::new(self.upload_weight(raw_bytes)?);
         cache.insert(key, Arc::clone(&handle));
+        self.f32_upload_count.fetch_add(1, Ordering::Relaxed);
         Ok(handle)
+    }
+
+    /// Evict a previously-uploaded f32 weight from the cache by key.
+    ///
+    /// Dropping the cached [`Arc`] frees the GPU buffer once no other handle is
+    /// outstanding. Called after each GEMM when weights are **non-resident**
+    /// (the host dequant buffer is freed after use so its `as_ptr()` key is
+    /// unstable — the allocator will recycle the address, causing a stale cache
+    /// hit on the next call). Mirrors the CUDA `evict_f32_weight` on `CudaGraph`.
+    /// A key that is not present is a no-op.
+    pub fn evict_f32_weight(&self, key: u64) -> Result<(), MetalGraphError> {
+        let mut cache = self
+            .weight_cache
+            .lock()
+            .map_err(|_| MetalGraphError::ExecutionFailed("weight cache lock poisoned".into()))?;
+        cache.remove(&key);
+        Ok(())
+    }
+
+    /// Returns the total number of f32 weight uploads since this graph was created.
+    ///
+    /// Counts each distinct cache miss in [`Self::get_or_upload_weight`] where a fresh
+    /// GPU buffer was actually allocated. Useful for asserting that multi-image
+    /// resident forwards amortize uploads (counter stays flat after the first
+    /// forward) and that non-resident evict-after-GEMM forwards stay correct (no
+    /// stale-cache collision, counter increments on every call as expected).
+    pub fn weight_upload_count(&self) -> usize {
+        self.f32_upload_count.load(Ordering::Relaxed)
     }
 
     /// Like `get_or_upload_weight`, but accepts a closure that produces the bytes.
@@ -663,6 +701,59 @@ impl MetalGraph {
         n_rows: usize,
         k: usize,
     ) -> Result<(), MetalGraphError> {
+        self.encode_gemm_simdgroup(weight, input, output, m, n_rows, k, false)
+    }
+
+    /// bf16-input / f32-accumulate sibling of [`Self::encode_gemm_f32`]. Same
+    /// buffers and result shape; the operands are rounded to `bfloat` inside the
+    /// `gemm_bf16_simdgroup` kernel for ~2× throughput. bf16 is the model's
+    /// native precision, so parity is render-level (cos ≈ 1.0). Used for the
+    /// text encoder; see `OXI_TE_GEMM_F32` to force the exact f32 path.
+    ///
+    /// If the bf16 kernel is unavailable on this device (M1/M2 or macOS < 14,
+    /// see [`Self::bf16_gemm_available`]) the dispatch transparently uses the
+    /// exact f32 kernel instead.
+    ///
+    /// # Errors
+    /// As [`Self::encode_gemm_f32`].
+    pub fn encode_gemm_bf16(
+        &self,
+        weight: &MetalWeightHandle,
+        input: &[f32],
+        output: &mut [f32],
+        m: usize,
+        n_rows: usize,
+        k: usize,
+    ) -> Result<(), MetalGraphError> {
+        self.encode_gemm_simdgroup(weight, input, output, m, n_rows, k, true)
+    }
+
+    /// Whether the optional bf16 TE GEMM kernel compiled on this device.
+    ///
+    /// `false` on a device/toolchain without `bfloat` simdgroup_matrix support
+    /// (M1/M2 or macOS < 14); callers (the TE GPU path) then route to
+    /// [`Self::encode_gemm_f32`]. Even when this returns `true`,
+    /// [`Self::encode_gemm_bf16`] independently re-checks and falls back, so a
+    /// stale `true` can never produce a wrong result.
+    pub fn bf16_gemm_available(&self) -> bool {
+        self.pipelines.gemm_bf16_simdgroup.is_some()
+    }
+
+    /// Shared encode for the f32 and bf16 text-encoder GEMM kernels; `bf16`
+    /// selects the staging precision (`gemm_bf16_simdgroup` vs
+    /// `gemm_f32_simdgroup`). Everything else — validation, the resident I/O
+    /// pool, and the f32 host buffers — is identical.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_gemm_simdgroup(
+        &self,
+        weight: &MetalWeightHandle,
+        input: &[f32],
+        output: &mut [f32],
+        m: usize,
+        n_rows: usize,
+        k: usize,
+        bf16: bool,
+    ) -> Result<(), MetalGraphError> {
         // ── Validate ─────────────────────────────────────────────────────
         let expected_in = m.checked_mul(k).ok_or_else(|| {
             MetalGraphError::InvalidDimensions(format!(
@@ -743,20 +834,43 @@ impl MetalGraph {
         let cmd_buf = self.command_queue.new_command_buffer();
         let encoder = cmd_buf.new_compute_command_encoder();
 
-        // Text-encoder large-M path: the f32-exact simdgroup_matrix GEMM. Same
-        // 64×64-tile / 4-simdgroup shape as the ternary v9/v10, but stages the
-        // f32 weight tile directly (no dequant). f32 accumulate → numerically
-        // equivalent to the CPU gemm_abt (unit parity max-abs ≲ 1e-4; te_parity
-        // cos ≥ 0.999).
-        self.dispatch_gemm_f32(
-            encoder,
-            &weight.buffer,
-            &pool.input,
-            &pool.output,
-            n_rows as u32,
-            k as u32,
-            m as u32,
-        );
+        // Text-encoder large-M path: the simdgroup_matrix GEMM. Same 64×64-tile /
+        // 4-simdgroup shape as the ternary v9/v10, staging the f32 weight tile
+        // directly (no dequant). The f32 kernel accumulates in f32 (parity with
+        // the CPU gemm_abt, cos ≥ 0.999); the bf16 kernel rounds the operands to
+        // bf16 — the model's native precision — for ~2× throughput at
+        // render-level parity (cos ≈ 1.0).
+        // bf16 is dispatched only when it was requested *and* the optional bf16
+        // kernel actually compiled on this device (M3+/Metal 3.1). On M1/M2 or an
+        // older toolchain `gemm_bf16_simdgroup` is `None`, so this transparently
+        // falls back to the exact f32 kernel — same result shape, f32 numerics.
+        let use_bf16 = bf16_dispatch_selected(bf16, self.pipelines.gemm_bf16_simdgroup.is_some());
+        let bf16_pso = if use_bf16 {
+            self.pipelines.gemm_bf16_simdgroup.as_ref()
+        } else {
+            None
+        };
+        match bf16_pso {
+            Some(pso) => self.dispatch_gemm_bf16(
+                pso,
+                encoder,
+                &weight.buffer,
+                &pool.input,
+                &pool.output,
+                n_rows as u32,
+                k as u32,
+                m as u32,
+            ),
+            None => self.dispatch_gemm_f32(
+                encoder,
+                &weight.buffer,
+                &pool.input,
+                &pool.output,
+                n_rows as u32,
+                k as u32,
+                m as u32,
+            ),
+        }
 
         encoder.end_encoding();
         cmd_buf.commit();
@@ -1498,5 +1612,33 @@ impl MetalGraph {
     /// Expose the device reference for external buffer allocation.
     pub fn device(&self) -> &Device {
         &self.device
+    }
+}
+
+/// Pure selection for the TE GEMM staging precision: bf16 is dispatched only
+/// when it was both requested (`OXI_TE_GEMM_F32` unset) *and* the optional
+/// `gemm_bf16_simdgroup` pipeline compiled on this device (M3+/Metal 3.1). On a
+/// device/toolchain without `bfloat` simdgroup support the pipeline is `None`
+/// and the TE GEMM falls back to the exact f32 kernel. Factored out so the
+/// fallback (the unsupported-device invariant) is unit-testable without a GPU.
+#[inline]
+fn bf16_dispatch_selected(bf16_requested: bool, bf16_available: bool) -> bool {
+    bf16_requested && bf16_available
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bf16_dispatch_selected;
+
+    #[test]
+    fn bf16_dispatch_selects_f32_when_pipeline_unavailable() {
+        // The unsupported-device invariant: bf16 requested but the optional
+        // kernel did not compile on this device → select the f32 kernel.
+        assert!(!bf16_dispatch_selected(true, false));
+        // bf16 requested and available → bf16.
+        assert!(bf16_dispatch_selected(true, true));
+        // f32 forced (OXI_TE_GEMM_F32=1) → f32 regardless of availability.
+        assert!(!bf16_dispatch_selected(false, true));
+        assert!(!bf16_dispatch_selected(false, false));
     }
 }

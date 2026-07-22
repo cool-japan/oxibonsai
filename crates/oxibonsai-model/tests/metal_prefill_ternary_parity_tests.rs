@@ -471,3 +471,78 @@ fn test_batched_ternary_prefill_chunked() {
     }
     eprintln!("test_batched_ternary_prefill_chunked: max_abs={max_abs:.3e}, max_rel={max_rel:.3e}");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Context-length guard regression tests (P1 no-panic-on-long-prompt)
+//
+// Every Metal prefill / greedy entry point must reject a prompt that overruns
+// the model's `max_seq_len` with a clean `Err` rather than panicking on an
+// out-of-bounds `RopeTable::cos_at` slice (mirrors the single-token `forward()`
+// guard and the CUDA prefill guards). We build the model with a deliberately
+// tiny context so a modest batch/position overflows it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Tiny context so a 16-token batch (or `pos == max_seq`) overflows it.
+const GUARD_MAX_SEQ: usize = 8;
+
+#[test]
+fn test_ternary_prefill_context_guard_returns_err() {
+    let gguf_bytes = build_synthetic_ternary_gguf();
+    let gguf = parse_synthetic_gguf(&gguf_bytes);
+    let model = BonsaiModel::from_gguf(&gguf, GUARD_MAX_SEQ).expect("BonsaiModel::from_gguf");
+    // 16 tokens at pos 0 → 16 > max_seq (8): must be rejected, not panic.
+    let token_ids: Vec<u32> = (0..16_u32).map(|i| i % 32).collect();
+    let err = model
+        .try_metal_prefill_with_lm_head_ternary(&token_ids, 0)
+        .expect_err("over-long ternary prefill must return Err, not Ok/panic");
+    assert!(
+        err.to_string().contains("too long"),
+        "expected a context-length error, got: {err}"
+    );
+}
+
+#[test]
+fn test_ternary_prefill_verify_context_guard_returns_err() {
+    let gguf_bytes = build_synthetic_ternary_gguf();
+    let gguf = parse_synthetic_gguf(&gguf_bytes);
+    let model = BonsaiModel::from_gguf(&gguf, GUARD_MAX_SEQ).expect("BonsaiModel::from_gguf");
+    let token_ids: Vec<u32> = (0..16_u32).map(|i| i % 32).collect();
+    let err = model
+        .try_metal_prefill_verify_ternary_path(&token_ids, 0)
+        .expect_err("over-long ternary prefill-verify must return Err, not Ok/panic");
+    assert!(
+        err.to_string().contains("too long"),
+        "expected a context-length error, got: {err}"
+    );
+}
+
+#[test]
+fn test_ternary_greedy_gpu_context_guard_returns_err() {
+    let gguf_bytes = build_synthetic_ternary_gguf();
+    let gguf = parse_synthetic_gguf(&gguf_bytes);
+    let model = BonsaiModel::from_gguf(&gguf, GUARD_MAX_SEQ).expect("BonsaiModel::from_gguf");
+    // Valid positions are 0..GUARD_MAX_SEQ; pos == GUARD_MAX_SEQ is out of range.
+    let err = model
+        .forward_greedy_gpu(1, GUARD_MAX_SEQ)
+        .expect_err("greedy decode at pos == max_seq must return Err, not panic");
+    assert!(
+        err.to_string().contains("too long"),
+        "expected a context-length error, got: {err}"
+    );
+}
+
+/// A within-context greedy call is NOT rejected by the guard: `pos == max_seq-1`
+/// is the last valid position, so the guard must let it through (it may still
+/// fail later for GPU-availability reasons, which is a *different* error class).
+#[test]
+fn test_ternary_greedy_gpu_last_valid_pos_not_guarded() {
+    let gguf_bytes = build_synthetic_ternary_gguf();
+    let gguf = parse_synthetic_gguf(&gguf_bytes);
+    let model = BonsaiModel::from_gguf(&gguf, GUARD_MAX_SEQ).expect("BonsaiModel::from_gguf");
+    if let Err(e) = model.forward_greedy_gpu(1, GUARD_MAX_SEQ - 1) {
+        assert!(
+            !e.to_string().contains("too long"),
+            "last valid position must not trip the context-length guard, got: {e}"
+        );
+    }
+}

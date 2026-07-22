@@ -1,7 +1,7 @@
 # oxibonsai-model TODO
 
 > Qwen3 transformer model: layers, blocks, forward pass, KV cache, weight loaders
-> ~38,000 lines across `src/`, 1,060+ tests (2026-06-02)
+> ~45,000 lines across `src/`, 1,209 tests (2026-07-21)
 
 ## Status: All Features Complete
 
@@ -79,6 +79,18 @@ merging, and numerical stability tests all implemented and green.
 - [x] Ternary quantization export (`quantize_ternary.rs`)
 - [x] Checkpoint save/load — OXCK binary format (`checkpoint.rs`)
 - [x] Compression utilities (`compression.rs`)
+
+## Done — Linear-Layer GPU Dispatch + LoRA/Checkpoint Hardening
+
+- [x] **Metal + native-CUDA GEMV dispatch in `Linear*::forward()`** — `LinearQ4_0` / `LinearQ8_0` (`layers/linear_standard.rs`) and `LinearQ2K` / `LinearQ3K` / `LinearQ4K` / `LinearQ5K` / `LinearQ6K` / `LinearQ8K` (`layers/linear_kquant_full.rs`, `layers/linear_kquant_ext.rs`) try the native-CUDA GEMV kernel first, then Metal, then fall back to the CPU scalar/SIMD kernel from `oxibonsai-kernels` on any non-"device absent" error
+- [x] **LoRA fallible API** — `LoraAdapter::apply` / `merge_into_weights` (`lora.rs`) now return `Result<_, LoraError>` (e.g. `LoraError::DimensionMismatch`) instead of panicking on shape mismatch — API-signature hardening only; LoRA is still not wired into the live `BonsaiModel` forward path, so this is not a runtime behavior change
+- [x] **Checkpoint shape validation** — `Checkpoint::read_from` (`checkpoint.rs`) cross-validates each tensor's declared `shape` against its actual `data` length and rejects the file with `CheckpointError::ShapeDataMismatch` instead of admitting an inconsistent tensor that could later index out of bounds
+- [x] **Context-length guards on GPU batched entry points** — `forward_metal.rs` (prefill + prefill-verify) and the CUDA equivalents (`forward_cuda/*`, `forward_cuda_fp8.rs`) now check `pos_start + batch_size` against `max_seq_len` before touching the fixed-size RoPE table / KV cache, returning `Err` (falling back to the sequential per-token path, whose `forward()` already raised a clean `ModelError::SequenceTooLong`) instead of risking an out-of-bounds slice panic
+- [x] **Q1_0_g128 export sign-bit fix** — `export.rs` corrected an exporter bug that used the inverse sign-bit convention from every reader/kernel in the workspace (silently negating 1-bit weights after export→load); regression test decodes the exported bytes through the real GGUF reader + `BlockQ1_0G128`
+
+## Known Limitation — CUDA Batch-Prefill Still Disabled for Newer Formats
+
+- [ ] Q4_0/Q8_0 (`model/types/forward_cuda/q_std.rs`), K-quant Q2_K–Q8_K (`model/types/forward_cuda/k_quant.rs`), and FP8 (`model/types/forward_cuda_fp8.rs`) batched CUDA prefill/verify entry points intentionally return `Err` ("... CUDA batch prefill disabled (GPU-private KV cache not read by CPU decode); using sequential fallback") and are not called by default — same split-KV-cache gap class as the Q1/ternary cap-of-8 issue. The sequential per-position path is bit-correct; only GPU-batch acceleration is unavailable. Leave unchecked until KV-cache unification lands.
 
 ## Phase 19 — Q2_K / Q3_K / Q4_K / Q8_K Full Stack
 

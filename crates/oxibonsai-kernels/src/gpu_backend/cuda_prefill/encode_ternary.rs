@@ -141,47 +141,20 @@ pub(super) unsafe fn encode_prefill_layer_ternary(
     let half_dim = hd / 2;
     let h_u32 = h as u32;
     let bs_u32 = bs as u32;
-    let qkv_total = nq * hd + 2 * nkv * hd;
 
     // ════════════════════════════════════════════════════════════════════
-    // 1. Batched RMSNorm (attn norm): d_input → d_normed
+    // Attention QKV projection is computed PER TOKEN inside
+    // `encode_attn_phase_tq2` (which runs its own RMSNorm + TQ2 fused-QKV GEMV
+    // on `st_bufs.d_hidden`).  A batched attn-RMSNorm + batched-TQ2-QKV GEMM was
+    // previously run here into `pb.d_normed` / `pb.d_qkv`, but those outputs were
+    // never consumed by the per-token attention loop below — they were pure
+    // wasted device work (see finding: "batched prefill QKV GEMM discarded").
+    // They are intentionally omitted.  The batched TQ2 GEMM kernels are still
+    // used for the O-projection and the FFN sublayer further down.
     // ════════════════════════════════════════════════════════════════════
-    launch_batched_rmsnorm(
-        graph,
-        pmods,
-        &pb.d_input,
-        d_attn_norm_weight,
-        &mut pb.d_normed,
-        h_u32,
-        bs_u32,
-        eps,
-    )?;
 
     // ════════════════════════════════════════════════════════════════════
-    // 2. Batched TQ2 QKV GEMM: d_normed → d_qkv (all tokens at once)
-    //    Zero-init d_qkv first so accumulate (+=) is correct.
-    // ════════════════════════════════════════════════════════════════════
-    {
-        let n = bs * qkv_total;
-        let mut dst_view = pb.d_qkv.slice_mut(0..n);
-        graph
-            .stream_arc()
-            .memset_zeros(&mut dst_view)
-            .map_err(|e| CudaGraphError::DriverError(format!("zero d_qkv tq2: {e}")))?;
-    }
-    launch_gemm_tq2_v7(
-        graph,
-        pmods,
-        d_fused_qkv_weight,
-        &pb.d_normed,
-        &mut pb.d_qkv,
-        qkv_total as u32,
-        h_u32,
-        bs_u32,
-    )?;
-
-    // ════════════════════════════════════════════════════════════════════
-    // 3. Sequential attention for each token (TQ2-aware)
+    // Sequential attention for each token (TQ2-aware)
     //
     // For each token t at sequence position (pos_start + t):
     //   a) Copy this token's hidden state into st_bufs.d_hidden

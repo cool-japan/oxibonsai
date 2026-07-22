@@ -355,15 +355,21 @@ pub fn gemm_tiled_par(
 ///
 /// Returns the recommended tile row count for the given dimensions,
 /// considering both L1 and L2 cache sizes.
+///
+/// The L1 budget is read from the platform-tuned
+/// [`crate::tuning::PlatformProfile::global`] (e.g. 64 KB on AArch64/Apple
+/// Silicon vs 32 KB on typical x86-64) rather than a hardcoded 32 KB
+/// assumption, so the tile size actually reflects the detected hardware.
 pub fn optimal_tile_rows(k: usize) -> usize {
     // Estimate bytes per row of weight data
     let blocks_per_row = k / QK1_0_G128;
     // Each block is 18 bytes (2 for f16 scale + 16 for qs)
     let bytes_per_row = blocks_per_row * 18;
 
-    // Target: fit tile weight data in L1 (~32 KB effective)
-    // Plus input vector: k * 4 bytes
-    let l1_available = (32_usize * 1024).saturating_sub(k * 4);
+    // Target: fit tile weight data in the platform's detected L1 cache,
+    // minus the shared input vector: k * 4 bytes.
+    let l1_bytes = crate::tuning::PlatformProfile::global().l1_cache_bytes;
+    let l1_available = l1_bytes.saturating_sub(k * 4);
     let l1_rows = l1_available
         .checked_div(bytes_per_row)
         .unwrap_or(L1_TILE_ROWS);

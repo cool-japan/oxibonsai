@@ -55,7 +55,12 @@ impl AlignedBuffer {
             };
         }
 
-        let byte_size = len * std::mem::size_of::<f32>();
+        // Guard against `usize` wraparound: an oversized `len` must not silently
+        // wrap to a small `byte_size` (which would allocate too little memory while
+        // `self.len` stays large, making `as_slice` produce an out-of-bounds slice).
+        let byte_size = len
+            .checked_mul(std::mem::size_of::<f32>())
+            .expect("AlignedBuffer allocation size overflows usize");
         let layout = Layout::from_size_align(byte_size, ALIGNMENT)
             .expect("layout should be valid for reasonable buffer sizes");
 
@@ -180,7 +185,11 @@ impl AlignedBlocks {
             };
         }
 
-        let byte_size = len * std::mem::size_of::<BlockQ1_0G128>();
+        // Guard against `usize` wraparound (see `AlignedBuffer::new`): an oversized
+        // `len` must not silently wrap to an undersized `byte_size`.
+        let byte_size = len
+            .checked_mul(std::mem::size_of::<BlockQ1_0G128>())
+            .expect("AlignedBlocks allocation size overflows usize");
         let layout = Layout::from_size_align(byte_size, ALIGNMENT)
             .expect("layout should be valid for reasonable buffer sizes");
 
@@ -427,5 +436,22 @@ mod tests {
         let blocks = AlignedBlocks::new(8);
         let dbg = format!("{blocks:?}");
         assert!(dbg.contains("AlignedBlocks"));
+    }
+
+    #[test]
+    #[should_panic(expected = "overflows usize")]
+    fn aligned_buffer_size_overflow_panics() {
+        // `len * size_of::<f32>()` (= 4) overflows `usize`. The constructor must
+        // panic loudly instead of silently wrapping to a tiny allocation while
+        // `self.len` records the huge original length (which would make
+        // `as_slice()` hand out an out-of-bounds slice — undefined behavior).
+        let _ = AlignedBuffer::new(usize::MAX / 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "overflows usize")]
+    fn aligned_blocks_size_overflow_panics() {
+        // Same wraparound guard for the block buffer (`size_of::<BlockQ1_0G128>()`).
+        let _ = AlignedBlocks::new(usize::MAX / 2);
     }
 }

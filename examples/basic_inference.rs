@@ -68,7 +68,7 @@ fn main() -> anyhow::Result<()> {
     println!(
         "\nPrompt ({} tokens): {:?}",
         prompt_tokens.len(),
-        &prompt_tokens
+        prompt_tokens
     );
     println!("Generating up to {} tokens...\n", max_tokens);
 
@@ -85,7 +85,7 @@ fn main() -> anyhow::Result<()> {
 
     println!("Generated {} tokens in {:.2?}", generated.len(), elapsed);
     println!("Speed: {}", format_tokens_per_second(tokens_per_sec));
-    println!("Token IDs: {:?}", &generated);
+    println!("Token IDs: {:?}", generated);
 
     // ─── 6. Engine statistics ────────────────────────────────────
     let stats = engine.stats();

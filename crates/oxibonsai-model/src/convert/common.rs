@@ -5,8 +5,11 @@
 //!
 //! * Parsing of the sibling `config.json`.
 //! * Writing Qwen3 metadata (architecture, dimensions, norm epsilon, rope base).
-//! * Padding `f32` weights to a multiple of the TQ2_0_g128 block size.
-//! * Serialising `BlockTQ2_0_g128` blocks into raw GGUF tensor bytes.
+//! * Padding `f32` weights to a multiple of the 128-element group size shared
+//!   by both TQ2_0_g128 and Q1_0_g128.
+//! * Serialising `BlockTQ2_0_g128` blocks into raw GGUF tensor bytes (the
+//!   Q1_0_g128 path uses [`crate::quantize::quantize_q1_0_g128`] directly,
+//!   which already returns raw bytes).
 //! * A single `ConvertStats` result struct so callers can report progress
 //!   uniformly.
 
@@ -28,7 +31,8 @@ use oxibonsai_core::quant_ternary::{BlockTQ2_0_g128, BLOCK_TQ2_0_G128_BYTES};
 pub struct ConvertStats {
     /// Total number of tensors written to the GGUF file.
     pub n_tensors: usize,
-    /// Number of tensors quantized to TQ2_0_g128.
+    /// Number of tensors quantized to the requested format (TQ2_0_g128 or
+    /// Q1_0_g128, per the `quant` argument the converter was called with).
     pub n_ternary: usize,
     /// Number of tensors stored as FP32.
     pub n_fp32: usize,
@@ -57,11 +61,16 @@ pub fn read_config_json(config_path: &Path) -> anyhow::Result<Value> {
 ///
 /// The caller provides the human-readable model name; for HF this is usually
 /// the directory basename, and for ONNX the `.onnx` file stem or repository
-/// identifier.
+/// identifier. `quant` is the target quantisation format string (as accepted
+/// by [`crate::convert::convert_hf_to_gguf`] / `convert_onnx_to_gguf`, e.g.
+/// `"tq2_0_g128"` or `"q1_0_g128"`) — it is recorded verbatim (uppercased) in
+/// the `general.quantization_version` metadata field so `oxibonsai info`
+/// reports the format that was actually written, not a hard-coded one.
 pub fn write_metadata(
     writer: &mut GgufWriter,
     config: &Value,
     model_name: &str,
+    quant: &str,
 ) -> anyhow::Result<()> {
     // Architecture constant
     writer.add_metadata(
@@ -75,10 +84,16 @@ pub fn write_metadata(
         MetadataWriteValue::Str(model_name.to_string()),
     );
 
-    // Quantisation version string
+    // Quantisation version string — reflects the actual format written for
+    // this conversion (each caller validates `quant` before reaching here).
+    let quant_version = match quant {
+        "tq2_0_g128" => "TQ2_0_G128".to_string(),
+        "q1_0_g128" => "Q1_0_G128".to_string(),
+        other => other.to_uppercase(),
+    };
     writer.add_metadata(
         "general.quantization_version",
-        MetadataWriteValue::Str("TQ2_0_G128".to_string()),
+        MetadataWriteValue::Str(quant_version),
     );
 
     // Integer keys (u32) - required.

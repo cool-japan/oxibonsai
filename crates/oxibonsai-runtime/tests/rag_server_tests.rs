@@ -97,9 +97,11 @@ mod tests {
         );
 
         let json = body_json(resp).await;
+        // `/rag/*` errors now use the shared OpenAI-style nested envelope
+        // (finding serve-api-10): `{"error": {"message", ...}}`.
         assert!(
-            json["error"].is_string(),
-            "response should contain an error field; got {json}"
+            json["error"]["message"].is_string(),
+            "response should contain a nested error.message field; got {json}"
         );
     }
 
@@ -418,9 +420,235 @@ mod tests {
         );
 
         let json = body_json(resp).await;
+        // Shared nested error envelope (finding serve-api-10).
         assert!(
-            json["error"].is_string(),
-            "error field should be present; got {json}"
+            json["error"]["message"].is_string(),
+            "nested error.message field should be present; got {json}"
+        );
+    }
+
+    // ── Regression tests for findings serve-api-06 / rag-eval-01: `top_k`
+    //    must actually drive both the reported chunk count and the prompt
+    //    fed to the model, not just be truncated after a fixed retrieval. ──
+
+    #[tokio::test]
+    async fn test_rag_query_top_k_drives_retrieved_count_and_prompt() {
+        let config = Qwen3Config::tiny_test();
+        let engine = InferenceEngine::new(config, SamplingParams::default(), 42);
+        let router = create_rag_router(engine);
+
+        let index_req = json_request(
+            Method::POST,
+            "/rag/index",
+            serde_json::json!({
+                "documents": [
+                    "Alpha document about apples and orchards.",
+                    "Beta document about bicycles and gears.",
+                    "Gamma document about galaxies and stars.",
+                    "Delta document about deltas and rivers.",
+                    "Epsilon document about epsilon particles."
+                ]
+            }),
+        );
+        let resp = router
+            .clone()
+            .oneshot(index_req)
+            .await
+            .expect("index response");
+        assert_eq!(resp.status(), StatusCode::OK, "indexing should succeed");
+
+        // top_k = 1 must retrieve exactly one chunk.
+        let query1 = json_request(
+            Method::POST,
+            "/rag/query",
+            serde_json::json!({
+                "query": "apples orchards bicycles gears galaxies deltas rivers",
+                "max_tokens": 1,
+                "top_k": 1,
+                "include_context": true
+            }),
+        );
+        let resp1 = router.clone().oneshot(query1).await.expect("query1 resp");
+        assert_eq!(resp1.status(), StatusCode::OK);
+        let json1 = body_json(resp1).await;
+        let chunks1 = json1["retrieved_chunks"]
+            .as_array()
+            .expect("retrieved_chunks array");
+        assert_eq!(
+            chunks1.len(),
+            1,
+            "top_k=1 should retrieve exactly 1 chunk; got {json1}"
+        );
+        assert_eq!(
+            json1["usage"]["chunks_retrieved"], 1,
+            "usage.chunks_retrieved must match the actual retrieved_chunks length"
+        );
+
+        // top_k = 5 (all indexed chunks) must retrieve more than top_k=1,
+        // and every one of those chunks must actually appear in the prompt
+        // fed to the model -- the reported count and the generation context
+        // must never diverge (the core defect in serve-api-06 / rag-eval-01).
+        let query5 = json_request(
+            Method::POST,
+            "/rag/query",
+            serde_json::json!({
+                "query": "apples orchards bicycles gears galaxies deltas rivers",
+                "max_tokens": 1,
+                "top_k": 5,
+                "include_context": true
+            }),
+        );
+        let resp5 = router.clone().oneshot(query5).await.expect("query5 resp");
+        assert_eq!(resp5.status(), StatusCode::OK);
+        let json5 = body_json(resp5).await;
+        let chunks5 = json5["retrieved_chunks"]
+            .as_array()
+            .expect("retrieved_chunks array");
+        assert!(
+            chunks5.len() > chunks1.len(),
+            "top_k=5 should retrieve strictly more chunks than top_k=1; got {} vs {}",
+            chunks5.len(),
+            chunks1.len()
+        );
+        assert_eq!(
+            json5["usage"]["chunks_retrieved"].as_u64().expect("number"),
+            chunks5.len() as u64
+        );
+
+        let prompt5 = json5["prompt_used"].as_str().expect("prompt_used string");
+        for chunk in chunks5 {
+            let text = chunk.as_str().expect("chunk text is a string");
+            assert!(
+                prompt5.contains(text),
+                "prompt_used must contain every chunk reported as retrieved \
+                 under the requested top_k; missing chunk: {text:?}\nprompt_used: {prompt5:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rag_query_top_k_zero_rejected_with_400() {
+        let app = test_rag_router();
+        let req = json_request(
+            Method::POST,
+            "/rag/query",
+            serde_json::json!({ "query": "test query", "top_k": 0 }),
+        );
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "top_k=0 must be rejected honestly instead of silently clamped"
+        );
+        let json = body_json(resp).await;
+        assert!(json["error"]["message"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_rag_query_top_k_over_max_rejected_with_400() {
+        let app = test_rag_router();
+        let req = json_request(
+            Method::POST,
+            "/rag/query",
+            serde_json::json!({ "query": "test query", "top_k": 51 }),
+        );
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "top_k above the allowed bound must be rejected honestly"
+        );
+        let json = body_json(resp).await;
+        assert!(json["error"]["message"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_rag_query_top_k_at_max_bound_is_accepted() {
+        let app = test_rag_router();
+        let req = json_request(
+            Method::POST,
+            "/rag/query",
+            serde_json::json!({ "query": "test query", "top_k": 50, "max_tokens": 1 }),
+        );
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "top_k=50 is the inclusive max"
+        );
+    }
+
+    // ── Regression tests for finding security-04: chunk_size/chunk_overlap
+    //    combinations that would amplify storage must be rejected. ─────────
+
+    #[tokio::test]
+    async fn test_index_documents_rejects_near_equal_chunk_overlap_amplification() {
+        let app = test_rag_router();
+        let req = json_request(
+            Method::POST,
+            "/rag/index",
+            serde_json::json!({
+                "documents": ["some document text long enough to matter for this test"],
+                "chunk_size": 512,
+                "chunk_overlap": 511
+            }),
+        );
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "near-equal chunk_size/chunk_overlap must be rejected to bound \
+             per-document storage amplification"
+        );
+        let json = body_json(resp).await;
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("chunk_overlap"),
+            "error should explain the chunk_overlap rejection; got {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_index_documents_rejects_overlap_at_or_above_chunk_size() {
+        let app = test_rag_router();
+        let req = json_request(
+            Method::POST,
+            "/rag/index",
+            serde_json::json!({
+                "documents": ["doc text"],
+                "chunk_size": 100,
+                "chunk_overlap": 100
+            }),
+        );
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "chunk_overlap >= chunk_size must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_index_documents_accepts_overlap_at_half_chunk_size_boundary() {
+        let app = test_rag_router();
+        let req = json_request(
+            Method::POST,
+            "/rag/index",
+            serde_json::json!({
+                "documents": [
+                    "a document long enough to be chunked with a fifty percent overlap ratio for this boundary test case"
+                ],
+                "chunk_size": 100,
+                "chunk_overlap": 50
+            }),
+        );
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "overlap exactly at half of chunk_size is the accepted boundary"
         );
     }
 }

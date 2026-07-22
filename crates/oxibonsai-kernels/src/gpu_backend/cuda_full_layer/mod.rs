@@ -1,6 +1,6 @@
 //! Full-layer GPU dispatch for OxiBonsai — CUDA backend.
 //!
-//! Mirrors [`metal_full_layer`] for Linux/Windows, encoding the complete
+//! Mirrors `metal_full_layer` for Linux/Windows, encoding the complete
 //! attention + FFN pipeline for one transformer layer on a single CUDA stream.
 //! This eliminates CPU–GPU round-trips between the attention and FFN sublayers.
 //!
@@ -147,9 +147,9 @@ impl CudaKvCache {
 /// All buffers are allocated once and reused across forward passes.
 /// Lazily resized when model dimensions change.
 pub struct CudaFullLayerBuffers {
-    /// [hidden_size] residual stream
+    /// `[hidden_size]` residual stream
     pub d_hidden: CudaSlice<f32>,
-    /// [hidden_size] RMSNorm output / O-proj scratch
+    /// `[hidden_size]` RMSNorm output / O-proj scratch
     pub d_normed: CudaSlice<f32>,
     /// [nq*hd + 2*nkv*hd] fused QKV GEMV output
     pub d_qkv: CudaSlice<f32>,
@@ -157,9 +157,9 @@ pub struct CudaFullLayerBuffers {
     pub d_q_rope: CudaSlice<f32>,
     /// [nkv * head_dim] K after norm+RoPE
     pub d_k_rope: CudaSlice<f32>,
-    /// [half_dim] RoPE cosines
+    /// `[half_dim]` RoPE cosines
     pub d_cos: CudaSlice<f32>,
-    /// [half_dim] RoPE sines
+    /// `[half_dim]` RoPE sines
     pub d_sin: CudaSlice<f32>,
     /// [nq * max_seq] attention scores
     pub d_scores: CudaSlice<f32>,
@@ -167,9 +167,9 @@ pub struct CudaFullLayerBuffers {
     pub d_attn_out: CudaSlice<f32>,
     /// [2 * intermediate_size] gate+up GEMV
     pub d_gate_up: CudaSlice<f32>,
-    /// [intermediate_size] SwiGLU output
+    /// `[intermediate_size]` SwiGLU output
     pub d_swiglu: CudaSlice<f32>,
-    /// [2] pos/seq_len for CUDA-graph-captured attention kernels: [pos, seq_len]
+    /// `[2]` pos/seq_len for CUDA-graph-captured attention kernels: `[pos, seq_len]`
     pub d_pos_seqlen: CudaSlice<u32>,
     /// Dimension tracking.
     pub hidden_size: usize,
@@ -245,7 +245,7 @@ unsafe impl Sync for CudaCachedLayerWeights {}
 
 /// Per-layer parameters for the CUDA full-forward path.
 ///
-/// Mirrors [`FullForwardLayerParams`] in `metal_full_layer` so callers can
+/// Mirrors `FullForwardLayerParams` in `metal_full_layer` so callers can
 /// build params in a backend-agnostic fashion.
 pub struct CudaFullForwardLayerParams<'a> {
     pub attn_norm_handle: u64,
@@ -301,8 +301,19 @@ struct CudaFullLayerState {
     kv_cache: Mutex<Option<CudaKvCache>>,
     /// Cache for FP32 norm weights (separate from the Q1 u8 weight cache).
     f32_weight_cache: Mutex<HashMap<u64, Arc<CudaSlice<f32>>>>,
-    /// Cached GPU model weights — rebuilt only when the model changes.
-    cached_model_weights: Mutex<Option<CudaCachedModelWeights>>,
+    /// Cached GPU model weights for the ternary (TQ2) decode path, paired with a
+    /// content fingerprint of the source weight bytes — rebuilt only when the
+    /// model changes.  Validated by BOTH the fingerprint AND the layer count so a
+    /// same-depth ternary model swap rebuilds rather than silently reusing another
+    /// model's uploaded GPU buffers (see
+    /// `encode_ternary::get_or_build_ternary_model_weights`).
+    cached_model_weights: Mutex<Option<(u64, CudaCachedModelWeights)>>,
+    /// Cached GPU model weights for the Q1 decode path, paired with a content
+    /// fingerprint of the source weight bytes.  Distinct slot from
+    /// `cached_model_weights` so Q1 and TQ2 can never alias, and the fingerprint
+    /// guards against returning a *different* same-depth model's uploaded buffers
+    /// (e.g. two same-`n_layers` finetunes) — see `get_or_build_model_weights`.
+    cached_q1_model_weights: Mutex<Option<(u64, CudaCachedModelWeights)>>,
     /// Captured CUDA driver graph for replaying the 36-layer pipeline.
     ///
     /// Three-state:
@@ -327,6 +338,7 @@ fn full_layer_state() -> &'static CudaFullLayerState {
         kv_cache: Mutex::new(None),
         f32_weight_cache: Mutex::new(HashMap::new()),
         cached_model_weights: Mutex::new(None),
+        cached_q1_model_weights: Mutex::new(None),
         // None = not yet attempted; Some(None) = tried & failed; Some(Some(h)) = active
         cuda_driver_graph: Mutex::new(None),
     })
@@ -386,6 +398,66 @@ pub fn get_or_upload_f32_weight(
 // Per-process model weight cache
 // =============================================================================
 
+/// Cheap content-and-identity fingerprint of a Q1 model's whole weight set.
+///
+/// Combines each layer's weight/norm source-slice base pointer + length into an
+/// FNV-1a hash.  The pointers are stable for the lifetime of a loaded model
+/// (they reference the model's owned / mmap'd bytes or its cached QKV concats)
+/// and differ across concurrently-loaded models, so a same-`n_layers` model swap
+/// (e.g. two same-depth finetunes) produces a different fingerprint.  Cost is
+/// O(n_layers) with a tiny constant, cheap enough to run on every decode token.
+///
+/// Residual edge case (accepted for this defense-in-depth check): if one model is
+/// dropped and a different one is loaded that happens to reuse the *exact* same
+/// base addresses and lengths for every layer, the fingerprints collide.  This is
+/// effectively impossible in practice and only matters in a (currently
+/// unsupported) multi-model-per-process configuration.
+fn model_weights_fingerprint(layer_params: &[CudaFullForwardLayerParams<'_>]) -> u64 {
+    let mut h = 0xcbf29ce484222325u64; // FNV-1a offset basis
+    let mut mix = |v: u64| {
+        h ^= v;
+        h = h.wrapping_mul(0x100000001b3);
+    };
+    mix(layer_params.len() as u64);
+    for lp in layer_params {
+        let parts: [(u64, u64); 7] = [
+            (
+                lp.attn_norm_bytes.as_ptr() as usize as u64,
+                lp.attn_norm_bytes.len() as u64,
+            ),
+            (
+                lp.fused_qkv_bytes.as_ptr() as usize as u64,
+                lp.fused_qkv_bytes.len() as u64,
+            ),
+            (
+                lp.attn_proj_bytes.as_ptr() as usize as u64,
+                lp.attn_proj_bytes.len() as u64,
+            ),
+            (
+                lp.gate_bytes.as_ptr() as usize as u64,
+                lp.gate_bytes.len() as u64,
+            ),
+            (
+                lp.up_bytes.as_ptr() as usize as u64,
+                lp.up_bytes.len() as u64,
+            ),
+            (
+                lp.down_bytes.as_ptr() as usize as u64,
+                lp.down_bytes.len() as u64,
+            ),
+            (
+                lp.ffn_norm_bytes.as_ptr() as usize as u64,
+                lp.ffn_norm_bytes.len() as u64,
+            ),
+        ];
+        for (ptr, len) in parts {
+            mix(ptr);
+            mix(len);
+        }
+    }
+    h
+}
+
 /// Build (or return the already-cached) GPU weight handles for all transformer layers.
 ///
 /// On the **first call** this uploads all Q1/FP32 weights to GPU memory, wraps them in
@@ -395,17 +467,25 @@ pub fn get_or_upload_f32_weight(
 /// `Arc::clone()` operations are performed (O(1)).  This replaces the previous
 /// `try_cuda_full_forward` behaviour of doing 288+ `HashMap` lookups + mutex
 /// acquisitions every token.
+///
+/// The cache is validated by BOTH the layer count and a content fingerprint
+/// ([`model_weights_fingerprint`]) so a same-depth model swap rebuilds rather than
+/// silently reusing another model's uploaded GPU buffers.  It uses a Q1-only slot
+/// (`cached_q1_model_weights`), disjoint from the ternary slot, so Q1 and TQ2
+/// weight sets can never alias even at equal `n_layers`.
 pub(super) fn get_or_build_model_weights(
     layer_params: &[CudaFullForwardLayerParams<'_>],
 ) -> Option<(Arc<CudaGraph>, Arc<Vec<CudaCachedLayerWeights>>)> {
     let n_layers = layer_params.len();
+    let fingerprint = model_weights_fingerprint(layer_params);
     let state = full_layer_state();
 
-    // Fast path: cache hit — three Arc::clones, no HashMap access.
+    // Fast path: cache hit — three Arc::clones, no HashMap access.  Both the
+    // fingerprint AND the layer count must match to reuse the cached buffers.
     {
-        let guard = state.cached_model_weights.lock().ok()?;
-        if let Some(ref cmw) = *guard {
-            if cmw.n_layers == n_layers {
+        let guard = state.cached_q1_model_weights.lock().ok()?;
+        if let Some((fp, cmw)) = guard.as_ref() {
+            if *fp == fingerprint && cmw.n_layers == n_layers {
                 return Some((Arc::clone(&cmw.graph), Arc::clone(&cmw.layers)));
             }
         }
@@ -465,8 +545,10 @@ pub(super) fn get_or_build_model_weights(
         n_layers,
     };
 
-    if let Ok(mut guard) = state.cached_model_weights.lock() {
-        *guard = Some(cmw);
+    // Store fingerprint + weights together (atomic under one lock) so a stale
+    // fingerprint can never be paired with the wrong cached buffers.
+    if let Ok(mut guard) = state.cached_q1_model_weights.lock() {
+        *guard = Some((fingerprint, cmw));
     }
 
     Some((graph, layers))

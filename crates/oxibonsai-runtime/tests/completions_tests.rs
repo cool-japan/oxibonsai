@@ -9,6 +9,7 @@ use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
 use oxibonsai_core::config::Qwen3Config;
+use oxibonsai_runtime::completions::MAX_COMPLETION_BATCH_SIZE;
 use oxibonsai_runtime::engine::InferenceEngine;
 use oxibonsai_runtime::sampling::SamplingParams;
 use oxibonsai_runtime::server::create_router;
@@ -137,20 +138,108 @@ async fn test_completions_usage_fields() {
     assert!(prompt > 0, "prompt_tokens must be > 0");
 }
 
-/// A batch prompt should still return a valid response with at least one choice.
+/// Regression test for finding serve-api-09: every prompt in a batch request
+/// must be generated and returned as its own choice, not just the first one.
 #[tokio::test]
-async fn test_completions_batch_prompt_single_returned() {
+async fn test_completions_batch_prompt_all_returned() {
     let app = test_router();
     let body = serde_json::json!({
-        "prompt": ["First prompt", "Second prompt"],
+        "prompt": ["First prompt", "Second prompt", "Third prompt"],
         "max_tokens": 4
     });
     let json = post_completions(app, body).await;
     let choices = json["choices"].as_array().expect("choices array");
-    assert!(
-        !choices.is_empty(),
-        "batch prompt must produce at least one choice"
+    assert_eq!(
+        choices.len(),
+        3,
+        "batch of 3 prompts must produce 3 choices, got: {json}"
     );
+    for (i, choice) in choices.iter().enumerate() {
+        assert_eq!(choice["index"], i, "choice index must match its position");
+        assert!(
+            choice["text"].is_string(),
+            "choice {i} must have generated text"
+        );
+        assert!(
+            choice["finish_reason"].is_string(),
+            "choice {i} must have a finish_reason"
+        );
+    }
+}
+
+/// Batch usage must be the sum across every prompt in the batch, not just
+/// the first one.
+#[tokio::test]
+async fn test_completions_batch_prompt_usage_is_aggregated() {
+    let app = test_router();
+    let single_body = serde_json::json!({
+        "prompt": "First prompt",
+        "max_tokens": 4
+    });
+    let single_json = post_completions(app.clone(), single_body).await;
+    let single_prompt_tokens = single_json["usage"]["prompt_tokens"]
+        .as_u64()
+        .expect("prompt_tokens");
+
+    let batch_body = serde_json::json!({
+        "prompt": ["First prompt", "First prompt"],
+        "max_tokens": 4
+    });
+    let batch_json = post_completions(app, batch_body).await;
+    let batch_prompt_tokens = batch_json["usage"]["prompt_tokens"]
+        .as_u64()
+        .expect("prompt_tokens");
+
+    assert_eq!(
+        batch_prompt_tokens,
+        single_prompt_tokens * 2,
+        "two identical prompts in a batch must double the aggregated prompt_tokens"
+    );
+}
+
+/// A batch larger than `MAX_COMPLETION_BATCH_SIZE` must be rejected with an
+/// honest `400`, not silently truncated.
+#[tokio::test]
+async fn test_completions_batch_over_cap_rejected() {
+    let app = test_router();
+    let prompts: Vec<String> = (0..(MAX_COMPLETION_BATCH_SIZE + 1))
+        .map(|i| format!("prompt {i}"))
+        .collect();
+    let body = serde_json::json!({
+        "prompt": prompts,
+        "max_tokens": 4
+    });
+    let req = Request::post("/v1/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&body).expect("body serialisation"),
+        ))
+        .expect("request build");
+    let resp = app.oneshot(req).await.expect("response");
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "batch over the cap must be rejected with 400, not silently truncated"
+    );
+}
+
+/// An empty prompt batch (`"prompt": []`) must be rejected with `400` rather
+/// than silently generating from an empty string.
+#[tokio::test]
+async fn test_completions_empty_batch_rejected() {
+    let app = test_router();
+    let body = serde_json::json!({
+        "prompt": [],
+        "max_tokens": 4
+    });
+    let req = Request::post("/v1/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&body).expect("body serialisation"),
+        ))
+        .expect("request build");
+    let resp = app.oneshot(req).await.expect("response");
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 // ── PromptInput unit tests ─────────────────────────────────────────────────────

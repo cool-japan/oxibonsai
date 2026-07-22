@@ -51,6 +51,12 @@ pub struct TunedThresholds {
     pub par_gemv_min_rows: usize,
     /// Minimum batch size before parallel GEMM is engaged.
     pub par_gemm_min_batch: usize,
+    /// Minimum number of output rows before cache-tiled parallel dispatch
+    /// (L1/L2-aware) is preferred over flat row-parallel dispatch.
+    /// Always >= [`Self::par_gemv_min_rows`], so the Direct -> ParallelRow ->
+    /// ParallelTiled tiers used by [`crate::parallel_tiled::select_gemv_strategy`]
+    /// stay correctly ordered regardless of platform.
+    pub par_tiled_min_rows: usize,
     /// Block size along M (rows) for tiled GEMM.
     pub tiled_gemm_block_m: usize,
     /// Block size along N (columns) for tiled GEMM.
@@ -106,11 +112,13 @@ impl PlatformProfile {
     pub fn compute_thresholds(&self) -> TunedThresholds {
         let par_gemv_min_rows = self.compute_gemv_threshold();
         let par_gemm_min_batch = self.compute_gemm_threshold();
+        let par_tiled_min_rows = self.compute_tiled_min_rows(par_gemv_min_rows);
         let (block_m, block_n, block_k) = self.compute_tile_sizes();
 
         TunedThresholds {
             par_gemv_min_rows,
             par_gemm_min_batch,
+            par_tiled_min_rows,
             tiled_gemm_block_m: block_m,
             tiled_gemm_block_n: block_n,
             tiled_gemm_block_k: block_k,
@@ -276,6 +284,32 @@ impl PlatformProfile {
         }
     }
 
+    /// Compute the minimum row count to prefer cache-tiled parallel dispatch
+    /// (parallel L2 tiles, each internally L1-tiled) over flat row-parallel
+    /// dispatch.
+    ///
+    /// Historically this was a flat constant of 256 rows, sized for a
+    /// ~256 KB L2 slice per core. We scale that baseline by the platform's
+    /// actual detected L2 cache size, so a chip with a larger L2 (e.g.
+    /// Apple Silicon) delays the switch into tiling until there are enough
+    /// rows to justify it, while a smaller-cache chip switches sooner.
+    ///
+    /// The result is clamped to never fall below `par_gemv_min_rows`, which
+    /// keeps the Direct -> ParallelRow -> ParallelTiled tiers correctly
+    /// ordered even for unusual platform profiles (e.g. very small cache,
+    /// many cores).
+    fn compute_tiled_min_rows(&self, par_gemv_min_rows: usize) -> usize {
+        /// Legacy fixed threshold this scaling is anchored to.
+        const BASELINE_TILED_MIN_ROWS: usize = 256;
+        /// L2 size the legacy threshold assumed (typical x86-64 per-core L2).
+        const BASELINE_L2_BYTES: usize = 256 * 1024;
+
+        let scaled = (BASELINE_TILED_MIN_ROWS as u128 * self.l2_cache_bytes as u128
+            / BASELINE_L2_BYTES as u128) as usize;
+        let scaled = round_up_to(scaled.max(1), 8);
+        scaled.max(par_gemv_min_rows)
+    }
+
     /// Compute tiled GEMM block sizes to fit in L1 cache.
     ///
     /// Strategy: for a tile of size block_m x block_n, we need:
@@ -377,6 +411,11 @@ impl std::fmt::Display for TuningSummary {
             f,
             "    par_gemm_min_batch: {}",
             self.thresholds.par_gemm_min_batch
+        )?;
+        writeln!(
+            f,
+            "    par_tiled_min_rows: {}",
+            self.thresholds.par_tiled_min_rows
         )?;
         writeln!(
             f,
@@ -551,6 +590,50 @@ mod tests {
         // Above threshold => parallelize
         assert!(t.should_parallelize_gemv(t.par_gemv_min_rows));
         assert!(t.should_parallelize_gemv(t.par_gemv_min_rows + 1));
+    }
+
+    #[test]
+    fn tiled_min_rows_never_below_gemv_min_rows() {
+        // Across a spread of core counts and cache sizes, the tiled-dispatch
+        // boundary must never sit below the plain-parallel boundary, or the
+        // Direct -> ParallelRow -> ParallelTiled tiers would invert.
+        for cores in [1usize, 2, 3, 4, 5, 8, 9, 16, 32] {
+            for (l1, l2) in [
+                (16 * 1024, 64 * 1024),
+                (32 * 1024, 256 * 1024),
+                (64 * 1024, 512 * 1024),
+                (128 * 1024, 2 * 1024 * 1024),
+            ] {
+                let mut p = PlatformProfile::with_cores(cores, cores);
+                p.l1_cache_bytes = l1;
+                p.l2_cache_bytes = l2;
+                let t = p.compute_thresholds();
+                assert!(
+                    t.par_tiled_min_rows >= t.par_gemv_min_rows,
+                    "cores={cores} l2={l2}: par_tiled_min_rows ({}) < par_gemv_min_rows ({})",
+                    t.par_tiled_min_rows,
+                    t.par_gemv_min_rows
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tiled_min_rows_scales_with_l2_cache() {
+        // Baseline: 256 KB L2 (the historical hardcoded-constant's assumption)
+        // should reproduce the historical default of 256 when it doesn't get
+        // clamped up by a high par_gemv_min_rows.
+        let p_baseline = PlatformProfile::with_cores(4, 4); // with_cores uses 32KB/256KB
+        let t_baseline = p_baseline.compute_thresholds();
+        assert_eq!(
+            t_baseline.par_tiled_min_rows,
+            256.max(t_baseline.par_gemv_min_rows)
+        );
+
+        // Doubling L2 should not decrease the threshold.
+        let p_bigger = PlatformProfile::with_cache(32 * 1024, 512 * 1024);
+        let t_bigger = p_bigger.compute_thresholds();
+        assert!(t_bigger.par_tiled_min_rows >= t_baseline.par_tiled_min_rows);
     }
 
     #[test]

@@ -1,15 +1,15 @@
 //! GPU (CUDA) backend for the DiT ternary (`TQ2_0_g128`) matmuls.
 //!
-//! CUDA sibling of [`crate::gpu`] (the Metal backend), authored as a
+//! CUDA sibling of `crate::gpu` (the Metal backend), authored as a
 //! line-for-line mirror. It routes the 100 ternary Linears of the FLUX.2 Klein
-//! DiT forward onto the CUDA TQ2 GEMM kernel ([`CudaGraph::encode_gemm_tq2`] in
+//! DiT forward onto the CUDA TQ2 GEMM kernel (`CudaGraph::encode_gemm_tq2` in
 //! `oxibonsai-kernels`), keeping the per-weight 2-bit codes resident on the GPU
 //! and only crossing the bus with the (small) f32 activations per matmul, plus
-//! the DiT joint flash-attention ([`CudaGraph::encode_joint_attention_flash_pooled`]).
+//! the DiT joint flash-attention (`CudaGraph::encode_joint_attention_flash_pooled`).
 //!
 //! The whole module is gated on `cfg(all(feature = "native-cuda", any(target_os
 //! = "linux", target_os = "windows")))` — the same gate under which
-//! `oxibonsai-kernels` re-exports [`CudaGraph`] — and is `target_os`-DISJOINT
+//! `oxibonsai-kernels` re-exports `CudaGraph` — and is `target_os`-DISJOINT
 //! from the Metal gate (macOS), so at most one of the two GPU backends ever
 //! compiles and the default Pure-Rust CPU path is entirely unaffected. The same
 //! env vars as the Metal path are reused (`OXI_DIT_GPU` / `OXI_DIT_ATTN_GPU`):
@@ -23,7 +23,7 @@
 //! [`crate::gemm::gemm_abt`], with no transpose and the identical AoS block
 //! layout the kernel's reformat expects.
 //!
-//! On *any* error this module returns a [`CudaGpuMatmulError`]; the caller
+//! On *any* error this module returns a `CudaGpuMatmulError`; the caller
 //! ([`crate::math::ternary_matmul`]) swallows it and falls back to the CPU path,
 //! so a GPU failure can never break a forward pass (no `unwrap`/`expect`/`panic!`).
 
@@ -137,12 +137,12 @@ pub fn dit_attn_gpu_enabled() -> bool {
 /// `scale = 1/sqrt(head_dim)` and a non-causal softmax over keys.
 ///
 /// Uses the **pooled** flash entry point
-/// ([`CudaGraph::encode_joint_attention_flash_pooled`]). The CPU↔GPU transfers
+/// (`CudaGraph::encode_joint_attention_flash_pooled`). The CPU↔GPU transfers
 /// are negligible at the DiT shape, so this captures the full flash-kernel win
 /// over the rayon+NEON CPU attention without needing q/k/v residency.
 ///
 /// # Errors
-/// Returns [`CudaGpuMatmulError`] if the CUDA graph is unavailable or the kernel
+/// Returns `CudaGpuMatmulError` if the CUDA graph is unavailable or the kernel
 /// encode fails (e.g. `head_dim` not a multiple of 8, `head_dim > 128`, or
 /// `seq` over the kernel's compile-time cap). The caller
 /// ([`crate::math::joint_attention`]) falls back to the CPU path on any error.
@@ -175,7 +175,7 @@ pub fn joint_attention_gpu(
 /// buffer and only the activations cross the bus.
 ///
 /// # Errors
-/// Returns [`CudaGpuMatmulError`] if the CUDA graph is unavailable or the kernel
+/// Returns `CudaGpuMatmulError` if the CUDA graph is unavailable or the kernel
 /// upload/encode fails (incl. `k % 128 != 0` or a length mismatch). The caller
 /// falls back to the CPU path on any error.
 pub fn ternary_matmul_gpu(
@@ -200,7 +200,7 @@ pub fn ternary_matmul_gpu(
 }
 
 /// Dense **f32** matmul `out[m,n] = Σ_k input[m,k]·weight[n,k]` on the GPU via
-/// [`CudaGraph::encode_gemm_f32`] — for the DiT's bf16-decoded *dense* Linears
+/// `CudaGraph::encode_gemm_f32` — for the DiT's bf16-decoded *dense* Linears
 /// (`x_embedder`, `context_embedder`, `proj_out`, `norm_out`). The stage0
 /// `context_embedder` `[512×7680→3072]` dominates the DiT wall on the CPU
 /// (~2.8 s/step), so routing it here is the largest stage0 win.
@@ -211,7 +211,7 @@ pub fn ternary_matmul_gpu(
 /// a stale-pointer collision; each call therefore re-uploads its weight.
 ///
 /// # Errors
-/// [`CudaGpuMatmulError`] if the CUDA graph is unavailable or the upload / encode
+/// `CudaGpuMatmulError` if the CUDA graph is unavailable or the upload / encode
 /// fails. The caller ([`crate::math::dense_matmul`]) falls back to the CPU SIMD
 /// `gemm_abt` on any `Err`.
 pub fn dense_matmul_gpu(
@@ -280,7 +280,7 @@ pub fn dit_fused_enabled() -> bool {
 /// the per-op CPU/GPU block with no corruption.
 ///
 /// # Errors
-/// [`CudaGpuMatmulError`] if the CUDA graph is unavailable, a required weight
+/// `CudaGpuMatmulError` if the CUDA graph is unavailable, a required weight
 /// (`to_qkv_mlp_proj` / `to_out`) is missing or the wrong quant type, or the
 /// resident encode fails.
 #[allow(clippy::too_many_arguments)]
@@ -435,7 +435,7 @@ pub fn single_blocks_gpu(
 /// corruption.
 ///
 /// # Errors
-/// [`CudaGpuMatmulError`] if the CUDA graph is unavailable, a required weight is
+/// `CudaGpuMatmulError` if the CUDA graph is unavailable, a required weight is
 /// missing / the wrong quant type, or the resident encode fails.
 #[allow(clippy::too_many_arguments)]
 pub fn double_block_gpu(

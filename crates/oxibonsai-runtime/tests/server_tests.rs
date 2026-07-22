@@ -60,9 +60,20 @@ async fn models_returns_json_with_model_list() {
     assert_eq!(json["object"], "list");
     let data = json["data"].as_array().expect("data should be array");
     assert!(!data.is_empty(), "should have at least one model");
-    assert_eq!(data[0]["id"], "bonsai-8b");
+    // `/v1/models` must report the actually-loaded model, not a hard-coded
+    // literal. `test_router` loads the `tiny_test` config whose real model name
+    // is "Bonsai-Tiny-Test"; the endpoint reflects that plus a real `created`
+    // timestamp.
+    assert_eq!(
+        data[0]["id"], "Bonsai-Tiny-Test",
+        "id should be the real loaded model name; got {json}"
+    );
     assert_eq!(data[0]["object"], "model");
     assert_eq!(data[0]["owned_by"], "oxibonsai");
+    assert!(
+        data[0]["created"].is_number(),
+        "each model entry should carry a real `created` timestamp; got {json}"
+    );
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -188,7 +199,16 @@ async fn chat_completions_choice_has_message() {
     assert_eq!(choice["index"], 0);
     assert_eq!(choice["message"]["role"], "assistant");
     assert!(choice["message"]["content"].is_string());
-    assert_eq!(choice["finish_reason"], "stop");
+    // With max_tokens=1 the run either stops naturally on EOS ("stop") or is
+    // truncated at the limit ("length"); both are honest now that
+    // finish_reason is no longer hard-coded to "stop" (finding serve-api-01).
+    let reason = choice["finish_reason"]
+        .as_str()
+        .expect("finish_reason must be a string");
+    assert!(
+        matches!(reason, "stop" | "length"),
+        "unexpected finish_reason: {reason}"
+    );
 }
 
 // ══════════════════════════════════════════════════════════════

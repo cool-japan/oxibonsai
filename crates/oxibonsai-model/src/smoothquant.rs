@@ -126,12 +126,18 @@ impl SmoothQuantCalibrator {
     /// If this is the first call for `layer_name`, a new per-channel accumulator
     /// is created. For subsequent calls the running per-channel max-abs is updated.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `in_features` changes between calls for the same `layer_name`.
-    pub fn record_activation(&mut self, layer_name: &str, activations: &[f32], in_features: usize) {
+    /// Returns [`SmoothQuantError::InFeaturesMismatch`] if `in_features` differs
+    /// from the value recorded on a previous call for the same `layer_name`.
+    pub fn record_activation(
+        &mut self,
+        layer_name: &str,
+        activations: &[f32],
+        in_features: usize,
+    ) -> Result<(), SmoothQuantError> {
         if in_features == 0 || activations.is_empty() {
-            return;
+            return Ok(());
         }
 
         let stats = self
@@ -140,14 +146,14 @@ impl SmoothQuantCalibrator {
             .or_insert_with(|| ChannelStats::new(in_features));
 
         if stats.in_features != in_features {
-            panic!(
-                "SmoothQuantCalibrator::record_activation: in_features mismatch for layer '{}' \
-                 — expected {}, got {}",
-                layer_name, stats.in_features, in_features
-            );
+            return Err(SmoothQuantError::InFeaturesMismatch {
+                expected: stats.in_features,
+                got: in_features,
+            });
         }
 
         stats.update(activations, in_features);
+        Ok(())
     }
 
     /// Compute SmoothQuant smoothing factors for a named layer.

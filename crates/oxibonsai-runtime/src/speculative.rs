@@ -16,7 +16,15 @@
 //! 4. If rejected at position `i`, resample from adjusted distribution
 //! 5. Always append one bonus target-sampled token after full acceptance
 //!
-//! ## Usage
+//! ## Two-engine production API
+//!
+//! [`SpeculativeDecoder::generate_verified`] is the real, end-to-end entry
+//! point: it drafts K tokens with the decoder's own draft engine and verifies
+//! them against a **separate target [`InferenceEngine`]** using the model
+//! layer's batched [`InferenceEngine::verify_batch`]
+//! (`forward_prefill_verify`) greedy scoring. It performs no synthetic /
+//! mock scoring and its accepted output is token-identical to plain greedy
+//! autoregressive decoding of the target model (lossless acceleration).
 //!
 //! ```rust,no_run
 //! use oxibonsai_core::config::Qwen3Config;
@@ -25,13 +33,24 @@
 //! use oxibonsai_runtime::speculative::{SpeculativeConfig, SpeculativeDecoder};
 //!
 //! let config = Qwen3Config::tiny_test();
-//! let draft_engine = InferenceEngine::new(config, SamplingParams::default(), 42);
-//! let spec_config = SpeculativeConfig::default();
-//! let mut decoder = SpeculativeDecoder::new(draft_engine, spec_config);
+//! let params = SamplingParams { temperature: 0.0, ..SamplingParams::default() };
+//! let draft_engine = InferenceEngine::new(config.clone(), params.clone(), 42);
+//! let mut target = InferenceEngine::new(config, params.clone(), 42);
+//! let mut decoder = SpeculativeDecoder::new(draft_engine, SpeculativeConfig::default());
+//! let _output = decoder.generate_verified(&mut target, &[1u32, 2, 3], 16, &params);
 //! ```
+//!
+//! ## Verification harness (test-only)
+//!
+//! [`SpeculativeDecoder::verify`], [`SpeculativeDecoder::step`] and the
+//! `#[doc(hidden)]` `generate_speculative` operate on **caller-supplied**
+//! target logits (or, in `generate_speculative`, a deterministic synthesized
+//! target) and exist to unit-test the draft/verify plumbing in isolation.
+//! They are not a production generator — use `generate_verified` for that.
 
 use crate::adaptive_lookahead::{AdaptiveLookahead, AdaptiveLookaheadConfig};
-use crate::engine::InferenceEngine;
+use crate::engine::{InferenceEngine, EOS_TOKEN_ID, MAX_PREALLOC_TOKENS};
+use crate::error::RuntimeResult;
 use crate::sampling::SamplingParams;
 
 // ──────────────────────────────────────────────────────────────────
@@ -127,6 +146,9 @@ pub struct SpeculativeDecoder<'a> {
     /// Optional adaptive controller — when present, the lookahead is
     /// updated after each step from the running acceptance EWMA.
     adaptive: Option<AdaptiveLookahead>,
+    /// Number of tokens whose KV is committed in the draft engine's cache.
+    /// Tracks the speculative delta-KV rollback cursor.
+    committed_len: usize,
 }
 
 impl<'a> SpeculativeDecoder<'a> {
@@ -140,6 +162,7 @@ impl<'a> SpeculativeDecoder<'a> {
             total_accepted_tokens: 0,
             rng: Xorshift64::new(0xfeed1234_5678abcd),
             adaptive: None,
+            committed_len: 0,
         }
     }
 
@@ -162,6 +185,7 @@ impl<'a> SpeculativeDecoder<'a> {
             total_accepted_tokens: 0,
             rng: Xorshift64::new(0xfeed1234_5678abcd),
             adaptive: Some(adaptive),
+            committed_len: 0,
         })
     }
 
@@ -182,30 +206,156 @@ impl<'a> SpeculativeDecoder<'a> {
     /// for target-model verification.
     pub fn draft(&mut self, context: &[u32], _params: &SamplingParams) -> Vec<u32> {
         let k = self.config.lookahead;
-        let mut draft_tokens = Vec::with_capacity(k);
-
-        // Build a combined context + generated so far
-        let mut current_context: Vec<u32> = context.to_vec();
-
-        for _ in 0..k {
-            // Generate one token using the draft engine
-            match self.draft_engine.generate(&current_context, 1) {
-                Ok(generated) if !generated.is_empty() => {
-                    let token = generated[0];
-                    draft_tokens.push(token);
-                    current_context.push(token);
-                }
-                _ => {
-                    // Draft generation failed or returned empty — stop drafting
-                    break;
-                }
-            }
-        }
-
-        draft_tokens
+        // Treat a direct `draft` call as "context is fully committed"; prime from scratch.
+        // This preserves the semantics of the public API (returns ≤ k tokens, errors as empty)
+        // while using the incremental delta path internally. Sampler-driven (`greedy = false`).
+        self.draft_delta(context, k, false).unwrap_or_default()
     }
 
-    /// Verify draft tokens against target-model logits.
+    /// Commit the delta (context tokens not yet in the cache) then draft k tokens
+    /// incrementally. After drafting, rewinds the cache to the committed prefix so
+    /// speculative KV is logically discarded.
+    ///
+    /// When `greedy` is `true`, draft tokens are chosen by first-max argmax
+    /// (matching [`InferenceEngine::verify_batch`]'s convention, so a
+    /// draft-equals-target run accepts every token); otherwise the draft
+    /// engine's configured sampler is used.
+    ///
+    /// On success, returns the drafted tokens and updates `self.committed_len` to
+    /// equal `context.len()` (the delta is now committed).
+    fn draft_delta(
+        &mut self,
+        context: &[u32],
+        k: usize,
+        greedy: bool,
+    ) -> Result<Vec<u32>, Box<dyn std::error::Error + Send + Sync>> {
+        if context.is_empty() {
+            return Ok(vec![]);
+        }
+        // Robustness: if this decoder instance is reused on a *shorter* (or
+        // otherwise divergent-length) context than the one that produced the
+        // current `committed_len` — without an intervening `reset()` — the
+        // cached prefix no longer matches `context`. Rewind the draft cache and
+        // re-prime from scratch instead of indexing past the end of `context`
+        // (which previously panicked with an out-of-bounds slice access).
+        if context.len() < self.committed_len {
+            self.draft_engine.reset();
+            self.committed_len = 0;
+        }
+        let max_ctx = self.draft_engine.model().kv_cache().max_seq_len();
+
+        // (a) Commit the delta: tokens in context not yet in the cache.
+        let committed = self.committed_len;
+        let mut last_logits = if context.len() > committed {
+            let logits = self
+                .draft_engine
+                .prefill_from_pos(&context[committed..], committed)?;
+            // Advance the cache's seq_len to the committed prefix length so
+            // committed_position() == kv_cache().seq_len() is a testable invariant.
+            self.draft_engine
+                .model_mut()
+                .kv_cache_mut()
+                .set_seq_len(context.len());
+            logits
+        } else {
+            // Nothing new to commit: re-derive logits by forwarding the last
+            // committed token. `committed == context.len()` here (the shorter
+            // case was rewound above), so `last_pos` is always in bounds; guard
+            // with `get` regardless so a future caller can never index OOB.
+            let last_pos = committed.saturating_sub(1);
+            let last_token = *context
+                .get(last_pos)
+                .ok_or("draft_delta: committed cursor past context length")?;
+            self.draft_engine.decode_step(last_token, last_pos)?
+        };
+        self.committed_len = context.len();
+
+        // (b) Draft k tokens incrementally.
+        let mut draft_tokens = Vec::with_capacity(k);
+        for (step_idx, _) in (0..k).enumerate() {
+            let pos = context.len() + step_idx;
+            if pos >= max_ctx {
+                break;
+            }
+            let token = if greedy {
+                argmax_first(&last_logits)
+            } else {
+                match self.draft_engine.sample(&last_logits) {
+                    Ok(t) => t,
+                    Err(_) => break,
+                }
+            };
+            draft_tokens.push(token);
+            last_logits = match self.draft_engine.decode_step(token, pos) {
+                Ok(l) => l,
+                Err(_) => {
+                    draft_tokens.pop();
+                    break;
+                }
+            };
+        }
+
+        // (c) Rewind: drop speculative KV past the committed prefix.
+        self.draft_engine.rewind_cache(context.len());
+
+        Ok(draft_tokens)
+    }
+
+    /// Commit the delta, decode exactly one bonus token and KEEP its KV (it becomes
+    /// committed). Used as the empty-acceptance fallback in `generate_speculative`.
+    fn draft_one_committed(
+        &mut self,
+        context: &[u32],
+    ) -> Result<Option<u32>, Box<dyn std::error::Error + Send + Sync>> {
+        if context.is_empty() {
+            return Ok(None);
+        }
+        // Same reuse-on-shorter-context guard as `draft_delta`: rewind rather
+        // than index past the end of `context`.
+        if context.len() < self.committed_len {
+            self.draft_engine.reset();
+            self.committed_len = 0;
+        }
+        let max_ctx = self.draft_engine.model().kv_cache().max_seq_len();
+        let committed = self.committed_len;
+
+        let last_logits = if context.len() > committed {
+            let logits = self
+                .draft_engine
+                .prefill_from_pos(&context[committed..], committed)?;
+            self.draft_engine
+                .model_mut()
+                .kv_cache_mut()
+                .set_seq_len(context.len());
+            logits
+        } else {
+            let last_pos = committed.saturating_sub(1);
+            let last_token = *context
+                .get(last_pos)
+                .ok_or("draft_one_committed: committed cursor past context length")?;
+            self.draft_engine.decode_step(last_token, last_pos)?
+        };
+        self.committed_len = context.len();
+
+        let pos = context.len();
+        if pos >= max_ctx {
+            return Ok(None);
+        }
+
+        let token = self.draft_engine.sample(&last_logits)?;
+        // Forward the bonus token and KEEP its KV (no rewind).
+        self.draft_engine.decode_step(token, pos)?;
+        self.draft_engine
+            .model_mut()
+            .kv_cache_mut()
+            .set_seq_len(pos + 1);
+        self.committed_len = pos + 1;
+        Ok(Some(token))
+    }
+
+    /// Verify draft tokens against **caller-supplied** target-model logits
+    /// (test/harness primitive; the production path is
+    /// [`Self::generate_verified`], which sources these from a real target).
     ///
     /// For each draft position `i`, the target's probability `p_t(t_i)` is
     /// compared against a mock draft probability `p_d(t_i)` derived from
@@ -316,22 +466,28 @@ impl<'a> SpeculativeDecoder<'a> {
         }
     }
 
-    /// Generate up to `max_tokens` tokens using speculative decoding.
+    /// **Test harness only — not a production generator.**
     ///
-    /// Each step drafts `lookahead` candidates, verifies them, and appends
-    /// accepted tokens. The loop continues until `max_tokens` are collected
-    /// or generation stalls (no tokens accepted/generated).
+    /// This drafts `lookahead` candidates each step and verifies them against a
+    /// *synthesized* deterministic target distribution (a peaked distribution
+    /// keyed on `context.last() + step`), NOT a real target model. It exists to
+    /// exercise the draft → verify → commit plumbing (and the adaptive-lookahead
+    /// controller) end-to-end without loading a second model; the emitted token
+    /// values and the resulting acceptance-rate / speedup statistics are
+    /// therefore meaningless as a real speculative-decoding result.
     ///
-    /// In this mock implementation, target logits are synthesised from the
-    /// draft engine's perspective — in production the target model would
-    /// score all positions in one batched forward pass.
+    /// For real speculative decoding against an actual target model, use
+    /// [`SpeculativeDecoder::generate_verified`], which scores draft tokens with
+    /// [`InferenceEngine::verify_batch`] (`forward_prefill_verify`).
+    #[doc(hidden)]
     pub fn generate_speculative(
         &mut self,
         prompt_tokens: &[u32],
         max_tokens: usize,
         params: &SamplingParams,
     ) -> Vec<u32> {
-        let mut output: Vec<u32> = Vec::with_capacity(max_tokens);
+        self.reset();
+        let mut output: Vec<u32> = Vec::with_capacity(max_tokens.min(MAX_PREALLOC_TOKENS));
         let mut context: Vec<u32> = prompt_tokens.to_vec();
 
         while output.len() < max_tokens {
@@ -362,12 +518,11 @@ impl<'a> SpeculativeDecoder<'a> {
             let step_result = self.step(&context, &target_logits, params);
 
             if step_result.accepted_tokens.is_empty() {
-                // No tokens accepted — try generating one greedily to avoid infinite loop
-                match self.draft_engine.generate(&context, 1) {
-                    Ok(t) if !t.is_empty() => {
-                        let token = t[0];
-                        output.push(token);
-                        context.push(token);
+                // No tokens accepted — try generating one committed token to avoid infinite loop
+                match self.draft_one_committed(&context) {
+                    Ok(Some(tok)) => {
+                        output.push(tok);
+                        context.push(tok);
                     }
                     _ => break,
                 }
@@ -389,6 +544,161 @@ impl<'a> SpeculativeDecoder<'a> {
         }
 
         output
+    }
+
+    /// Generate up to `max_tokens` tokens with **real two-engine speculative
+    /// decoding**: this decoder's draft engine proposes up to `lookahead` tokens
+    /// which the supplied `target` engine verifies in a single batched forward
+    /// pass via [`InferenceEngine::verify_batch`] (`forward_prefill_verify`).
+    ///
+    /// This is greedy (argmax) speculative decoding — the standard mode for
+    /// prefill-based verification. Draft tokens are proposed with the same
+    /// first-max argmax convention the target uses to verify, so the accepted
+    /// output is **token-identical to plain greedy autoregressive decoding of
+    /// the target model**: speculative decoding accelerates that decode without
+    /// changing its result. Only the first *rejected* draft token per step is
+    /// replaced by the target's own prediction (the "bonus" token), and any
+    /// draft suffix after it is discarded. When the draft and target are the
+    /// same model the acceptance rate is ~100%.
+    ///
+    /// Both engines' per-sequence state (KV caches, committed cursor) is reset
+    /// on entry. Running acceptance statistics ([`Self::acceptance_rate`],
+    /// [`Self::speedup_estimate`]) are updated against the *real* target
+    /// verification, and the adaptive controller (if any) is driven from them.
+    ///
+    /// `_params` is reserved: prefill-based verification is inherently greedy
+    /// (argmax), so sampling parameters (temperature / top-k / top-p) do not
+    /// affect the result and are ignored.
+    ///
+    /// # Errors
+    ///
+    /// Propagates target/draft forward-pass failures as [`RuntimeError`].
+    ///
+    /// [`RuntimeError`]: crate::error::RuntimeError
+    pub fn generate_verified(
+        &mut self,
+        target: &mut InferenceEngine<'_>,
+        prompt_tokens: &[u32],
+        max_tokens: usize,
+        _params: &SamplingParams,
+    ) -> RuntimeResult<Vec<u32>> {
+        if prompt_tokens.is_empty() || max_tokens == 0 {
+            return Ok(Vec::new());
+        }
+        self.reset();
+        target.reset();
+
+        let max_ctx = target.model().kv_cache().max_seq_len();
+        let mut output: Vec<u32> = Vec::with_capacity(max_tokens.min(MAX_PREALLOC_TOKENS));
+        let mut context: Vec<u32> = prompt_tokens.to_vec();
+
+        // Prime the target over the prompt. The argmax of the final prompt
+        // logits is the target's first continuation token (position `P`).
+        let prompt_logits = target.prefill_from_pos(prompt_tokens, 0)?;
+        let mut next_token = argmax_first(&prompt_logits);
+        if next_token == EOS_TOKEN_ID {
+            return Ok(output);
+        }
+        output.push(next_token);
+        context.push(next_token);
+
+        // Absolute position of the *next* token to be produced (the one that
+        // follows `next_token`). `next_token` itself lives at position `pos - 1`.
+        let mut pos = prompt_tokens.len() + 1;
+
+        while output.len() < max_tokens {
+            if pos >= max_ctx {
+                break;
+            }
+            let remaining = max_tokens - output.len();
+            let k = self.config.lookahead.min(remaining);
+
+            // (1) Draft up to `k` tokens greedily from the draft engine given the
+            //     current context (which ends in `next_token`). `draft_delta`
+            //     commits the context delta into the draft cache and rewinds the
+            //     speculative suffix, keeping the draft cache consistent.
+            let draft = if k == 0 {
+                Vec::new()
+            } else {
+                self.draft_delta(&context, k, true).unwrap_or_default()
+            };
+
+            // (2) Verify: the target scores `[next_token, draft...]` in one
+            //     batched pass, returning its greedy prediction at each position.
+            //     Cap the batch so a write never runs past the target KV cache.
+            let room = max_ctx.saturating_sub(pos - 1);
+            if room == 0 {
+                break;
+            }
+            let mut batch = Vec::with_capacity((1 + draft.len()).min(room));
+            batch.push(next_token);
+            for &d in draft.iter() {
+                if batch.len() >= room {
+                    break;
+                }
+                batch.push(d);
+            }
+            let model_preds = target.verify_batch(&batch, pos - 1)?;
+
+            // Number of draft tokens that were actually forwarded (post-cap).
+            let n_draft_in_batch = batch.len() - 1;
+
+            // (3) Accept the longest prefix of draft tokens that match the
+            //     target's greedy prediction at each position.
+            let mut accepted = 0usize;
+            while accepted < n_draft_in_batch
+                && accepted < model_preds.len()
+                && draft[accepted] == model_preds[accepted]
+            {
+                accepted += 1;
+            }
+
+            // Update running statistics against the REAL verification.
+            self.total_steps += 1;
+            self.total_draft_tokens += n_draft_in_batch as u64;
+            self.total_accepted_tokens += accepted as u64;
+            if let Some(adaptive) = self.adaptive.as_mut() {
+                adaptive.observe_step(n_draft_in_batch, accepted);
+                self.config.lookahead = adaptive.lookahead();
+            }
+
+            // (4) Commit accepted draft tokens (stopping at EOS / max_tokens).
+            let take = accepted.min(max_tokens - output.len());
+            let mut hit_eos = false;
+            for &tok in draft.iter().take(take) {
+                if tok == EOS_TOKEN_ID {
+                    hit_eos = true;
+                    break;
+                }
+                output.push(tok);
+                context.push(tok);
+            }
+            if hit_eos || output.len() >= max_tokens {
+                break;
+            }
+
+            // (5) Bonus: the target's own prediction at the accept/reject
+            //     boundary. This is the first non-drafted token and guarantees
+            //     forward progress even when nothing was accepted.
+            let bonus = if accepted < model_preds.len() {
+                model_preds[accepted]
+            } else {
+                match model_preds.last() {
+                    Some(&t) => t,
+                    None => break,
+                }
+            };
+            if bonus == EOS_TOKEN_ID {
+                break;
+            }
+            output.push(bonus);
+            context.push(bonus);
+            next_token = bonus;
+            pos += accepted + 1;
+        }
+
+        target.stats().record_request(output.len());
+        Ok(output)
     }
 
     /// Overall acceptance rate: accepted tokens / draft tokens, across all steps.
@@ -416,6 +726,18 @@ impl<'a> SpeculativeDecoder<'a> {
         let avg_accepted = self.total_accepted_tokens as f32 / self.total_steps as f32;
         // Speedup is bounded by lookahead + 1 (the bonus token)
         avg_accepted.max(1.0)
+    }
+
+    /// Returns the number of tokens whose KV is committed in the draft engine's cache.
+    pub fn committed_position(&self) -> usize {
+        self.committed_len
+    }
+
+    /// Reset per-sequence state: clears the draft engine's KV cache and the
+    /// committed-position cursor. Does NOT touch acceptance statistics.
+    pub fn reset(&mut self) {
+        self.draft_engine.reset();
+        self.committed_len = 0;
     }
 
     /// Reset all accumulated statistics (steps, tokens, acceptance counts).
@@ -455,6 +777,26 @@ impl<'a> SpeculativeDecoder<'a> {
 // Utility: softmax over f32 slice
 // ──────────────────────────────────────────────────────────────────
 
+/// First-max argmax over a logit slice.
+///
+/// Ties are broken toward the **lowest** index, matching the convention used by
+/// [`crate::engine::InferenceEngine::verify_batch`] /
+/// `BonsaiModel::forward_prefill_verify`. Using the identical convention on both
+/// the draft and verify sides is what makes a draft-equals-target greedy run
+/// accept every token (rather than diverging on exact logit ties). Returns `0`
+/// for an empty slice.
+fn argmax_first(logits: &[f32]) -> u32 {
+    let mut best_idx = 0u32;
+    let mut best_val = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > best_val {
+            best_val = v;
+            best_idx = i as u32;
+        }
+    }
+    best_idx
+}
+
 /// Compute numerically stable softmax over a logit slice.
 fn softmax(logits: &[f32]) -> Vec<f32> {
     if logits.is_empty() {
@@ -478,6 +820,7 @@ fn softmax(logits: &[f32]) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::InferenceEngine;
     use oxibonsai_core::config::Qwen3Config;
 
     fn make_decoder(lookahead: usize) -> SpeculativeDecoder<'static> {
@@ -777,5 +1120,262 @@ mod tests {
             decoder.adaptive().expect("adaptive present").observations(),
             0
         );
+    }
+
+    #[test]
+    fn test_delta_draft_token_identical_to_full_reprefill() {
+        let cfg = Qwen3Config::tiny_test();
+        let params = SamplingParams {
+            temperature: 0.0,
+            ..SamplingParams::default()
+        };
+        let k = 4;
+        let context = vec![1u32, 2, 3, 4, 5];
+
+        // Baseline: old behaviour — loop generate(ctx, 1) growing ctx.
+        let mut base_eng = InferenceEngine::new(cfg.clone(), params.clone(), 42);
+        let mut baseline = Vec::new();
+        let mut cur = context.clone();
+        for _ in 0..k {
+            match base_eng.generate(&cur, 1) {
+                Ok(g) if !g.is_empty() => {
+                    baseline.push(g[0]);
+                    cur.push(g[0]);
+                }
+                _ => break,
+            }
+        }
+
+        // New delta path.
+        let draft_eng = InferenceEngine::new(cfg, params.clone(), 42);
+        let mut dec = SpeculativeDecoder::new(
+            draft_eng,
+            SpeculativeConfig {
+                lookahead: k,
+                ..SpeculativeConfig::default()
+            },
+        );
+        let got = dec.draft(&context, &params);
+
+        assert_eq!(
+            got, baseline,
+            "delta draft must be token-identical to full re-prefill"
+        );
+    }
+
+    #[test]
+    fn test_delta_draft_commits_incrementally() {
+        let cfg = Qwen3Config::tiny_test();
+        let params = SamplingParams {
+            temperature: 0.0,
+            ..SamplingParams::default()
+        };
+        let draft_eng = InferenceEngine::new(cfg, params.clone(), 42);
+        let mut dec = SpeculativeDecoder::new(
+            draft_eng,
+            SpeculativeConfig {
+                lookahead: 3,
+                ..SpeculativeConfig::default()
+            },
+        );
+        let prompt = vec![1u32, 2, 3];
+        let _ = dec.generate_speculative(&prompt, 6, &params);
+        assert!(
+            dec.committed_position() >= prompt.len(),
+            "committed cursor must advance past the prompt"
+        );
+        assert_eq!(
+            dec.committed_position(),
+            dec.draft_engine.model().kv_cache().seq_len(),
+            "committed_position must mirror kv_cache seq_len"
+        );
+    }
+
+    #[test]
+    fn test_reject_all_rolls_back_and_next_round_correct() {
+        let cfg = Qwen3Config::tiny_test();
+        let params = SamplingParams {
+            temperature: 0.0,
+            ..SamplingParams::default()
+        };
+        let draft_eng = InferenceEngine::new(cfg, params.clone(), 42);
+        let mut dec = SpeculativeDecoder::new(
+            draft_eng,
+            SpeculativeConfig {
+                lookahead: 4,
+                ..SpeculativeConfig::default()
+            },
+        );
+        let context = vec![7u32, 8, 9];
+
+        // Round 1: draft k tokens.
+        let draft1 = dec.draft(&context, &params);
+
+        // After draft(), rewind is called internally; cursor must be at context.len().
+        assert_eq!(
+            dec.committed_position(),
+            context.len(),
+            "after draft(), cursor must be at committed prefix, not prefix+k"
+        );
+
+        // Round 2 from the same committed context must reproduce round-1 draft exactly.
+        let draft2 = dec.draft(&context, &params);
+        assert_eq!(
+            draft1, draft2,
+            "after rollback, redrafting identical context yields identical tokens"
+        );
+    }
+
+    // ── Finding 16: reuse-on-shorter-context OOB panic ──────────────────────
+
+    #[test]
+    fn test_draft_reuse_on_shorter_context_does_not_panic() {
+        // Regression: reusing a decoder on a SHORTER context than the one that
+        // set `committed_len`, without an intervening reset(), used to panic
+        // with an out-of-bounds slice index in `draft_delta`'s else branch.
+        let cfg = Qwen3Config::tiny_test();
+        let params = SamplingParams {
+            temperature: 0.0,
+            ..SamplingParams::default()
+        };
+        let draft_eng = InferenceEngine::new(cfg, params.clone(), 42);
+        let mut dec = SpeculativeDecoder::new(
+            draft_eng,
+            SpeculativeConfig {
+                lookahead: 3,
+                ..SpeculativeConfig::default()
+            },
+        );
+
+        // Long context first ⇒ committed cursor advances to 5.
+        let _ = dec.draft(&[1u32, 2, 3, 4, 5], &params);
+        assert_eq!(dec.committed_position(), 5);
+
+        // Reuse on a shorter context WITHOUT reset(): must auto-rewind, not panic.
+        let out = dec.draft(&[1u32, 2], &params);
+        assert!(out.len() <= 3, "draft must not exceed lookahead");
+        assert_eq!(
+            dec.committed_position(),
+            2,
+            "committed cursor must track the new shorter context after auto-rewind"
+        );
+
+        // The decoder must remain usable for a subsequent (growing) context.
+        let _ = dec.draft(&[1u32, 2, 3], &params);
+        assert_eq!(dec.committed_position(), 3);
+    }
+
+    // ── Findings 25 & 36: real two-engine verified speculative decoding ─────
+
+    /// Build a CPU-`Reference`-tier engine so verification and drafting use the
+    /// identical (first-max) argmax convention deterministically, regardless of
+    /// the build's GPU feature flags.
+    fn reference_engine(cfg: &Qwen3Config, params: &SamplingParams) -> InferenceEngine<'static> {
+        use oxibonsai_kernels::KernelTier;
+        use oxibonsai_model::model::BonsaiModel;
+        let model = BonsaiModel::new(cfg.clone());
+        InferenceEngine::from_model_with_tier(model, KernelTier::Reference, params.clone(), 42)
+    }
+
+    /// Plain greedy autoregressive decode of the target (first-max argmax),
+    /// used as the ground truth the speculative decoder must reproduce exactly.
+    fn plain_greedy_reference(
+        cfg: &Qwen3Config,
+        params: &SamplingParams,
+        prompt: &[u32],
+        max: usize,
+    ) -> Vec<u32> {
+        let mut eng = reference_engine(cfg, params);
+        let logits = eng.prefill_from_pos(prompt, 0).expect("prefill");
+        let mut out = Vec::new();
+        let mut tok = argmax_first(&logits);
+        let mut pos = prompt.len();
+        while out.len() < max {
+            if tok == EOS_TOKEN_ID {
+                break;
+            }
+            out.push(tok);
+            let logits = eng.decode_step(tok, pos).expect("decode_step");
+            pos += 1;
+            tok = argmax_first(&logits);
+        }
+        out
+    }
+
+    #[test]
+    fn test_generate_verified_matches_plain_greedy_and_accepts_all() {
+        let cfg = Qwen3Config::tiny_test();
+        let params = SamplingParams {
+            temperature: 0.0,
+            ..SamplingParams::default()
+        };
+        let prompt = vec![1u32, 2, 3];
+        let max = 12usize;
+
+        // Two engines from the SAME model ⇒ draft == target.
+        let draft_eng = reference_engine(&cfg, &params);
+        let mut target = reference_engine(&cfg, &params);
+        let mut dec = SpeculativeDecoder::new(
+            draft_eng,
+            SpeculativeConfig {
+                lookahead: 4,
+                ..SpeculativeConfig::default()
+            },
+        );
+
+        let spec_out = dec
+            .generate_verified(&mut target, &prompt, max, &params)
+            .expect("generate_verified");
+
+        // Lossless-acceleration invariant: identical to plain greedy target decode.
+        let reference = plain_greedy_reference(&cfg, &params, &prompt, max);
+        assert_eq!(
+            spec_out, reference,
+            "verified speculative output must equal plain greedy target decode"
+        );
+        assert_eq!(
+            spec_out.len(),
+            max,
+            "should produce exactly max_tokens tokens"
+        );
+
+        // draft == target ⇒ every drafted token is verified ⇒ ~100% acceptance.
+        assert!(
+            dec.total_draft_tokens > 0,
+            "some tokens must have been drafted"
+        );
+        assert!(
+            dec.acceptance_rate() > 0.99,
+            "draft==target must accept ~all drafts, got {}",
+            dec.acceptance_rate()
+        );
+        assert!(
+            dec.speedup_estimate() > 1.0,
+            "accepting multiple tokens per step must show speedup, got {}",
+            dec.speedup_estimate()
+        );
+    }
+
+    #[test]
+    fn test_generate_verified_edge_cases() {
+        let cfg = Qwen3Config::tiny_test();
+        let params = SamplingParams {
+            temperature: 0.0,
+            ..SamplingParams::default()
+        };
+        let draft_eng = reference_engine(&cfg, &params);
+        let mut target = reference_engine(&cfg, &params);
+        let mut dec = SpeculativeDecoder::new(draft_eng, SpeculativeConfig::default());
+
+        // Empty prompt ⇒ empty output.
+        assert!(dec
+            .generate_verified(&mut target, &[], 8, &params)
+            .expect("empty prompt")
+            .is_empty());
+        // Zero max_tokens ⇒ empty output.
+        assert!(dec
+            .generate_verified(&mut target, &[1u32, 2, 3], 0, &params)
+            .expect("zero max")
+            .is_empty());
     }
 }

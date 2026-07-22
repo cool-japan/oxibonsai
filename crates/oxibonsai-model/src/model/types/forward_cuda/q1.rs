@@ -317,22 +317,29 @@ impl<'a> BonsaiModel<'a> {
         if n_layers == 0 {
             return Err("no blocks".into());
         }
-        // Ternary batch prefill is DISABLED on CUDA: it writes the prompt KV into
-        // the prefill-private GPU KV cache (`prefill_state().kv_cache`) while the
-        // per-token decode path reads a *different* cache (`FULL_LAYER_STATE`),
-        // so prompts longer than ~16 tokens make decode attend over stale KV and
-        // produce corrupted output (measured decode logit Δ vs CPU ≈ 7.3 at a
-        // 17-token prompt; ≈ 0.002 via the sequential fallback). This path was
-        // never validated on CUDA hardware. Returning Err makes the caller fall
-        // back to the proven, bit-correct sequential per-token prefill (which
-        // shares the decode KV cache). The Q1 (1-bit) batch path below is fine.
-        // TODO: re-enable once the prefill→decode KV handoff is fixed and a
-        // CPU↔CUDA parity gate (see cuda_ternary_forward_parity.rs) covers it.
+        // Context-length guard (mirrors the single-token `forward()` check at
+        // model/types/mod.rs).  The batched RoPE gather below indexes
+        // `self.rope.cos_at(pos_start + t)` with no bound, and `RopeTable` is
+        // sized to exactly `max_seq_len` rows — a prompt that overflows the
+        // context would slice out of bounds and panic inside the request task.
+        // Returning Err makes `forward_prefill` fall back to the sequential path,
+        // whose per-token `forward()` returns a clean SequenceTooLong error.
+        if pos_start + batch_size > self.kv_cache.max_seq_len() {
+            return Err(format!(
+                "prefill sequence too long: {batch_size} tokens at pos {pos_start} exceeds max_seq_len {}",
+                self.kv_cache.max_seq_len()
+            )
+            .into());
+        }
+        // Ternary batch prefill: route to the dedicated TQ2 batch-GEMM path.
+        // The prefill KV cache is now unified with the decode KV cache — the
+        // CUDA prefill path delegates to `cuda_full_layer::acquire_kv_cache`, so
+        // the prompt K/V that batch prefill writes is exactly what per-token
+        // decode later reads.  This fixes the prefill→decode KV handoff bug that
+        // previously forced the sequential fallback, and is covered by a
+        // synthetic-model CPU↔CUDA parity gate.
         if matches!(&self.output_weight, OutputWeight::Ternary(_)) {
-            return Err(
-                "ternary CUDA batch prefill disabled (KV-cache handoff bug); using sequential"
-                    .into(),
-            );
+            return self.try_cuda_prefill_with_lm_head_ternary(token_ids, pos_start);
         }
         // Q4_0/Q8_0 batch prefill: route to dedicated Q-std batch GEMM path (Phase 24B).
         if matches!(
@@ -460,6 +467,15 @@ impl<'a> BonsaiModel<'a> {
         let n_layers = self.blocks.len();
         if n_layers == 0 {
             return Err("no blocks".into());
+        }
+        // Context-length guard (see `try_cuda_prefill_with_lm_head`): prevents an
+        // out-of-bounds RoPE slice panic on prompts longer than the context.
+        if pos_start + batch_size > self.kv_cache.max_seq_len() {
+            return Err(format!(
+                "prefill-verify sequence too long: {batch_size} tokens at pos {pos_start} exceeds max_seq_len {}",
+                self.kv_cache.max_seq_len()
+            )
+            .into());
         }
         // Ternary batch prefill verify: route to dedicated TQ2 batch GEMM path (Phase 20A).
         if matches!(&self.output_weight, OutputWeight::Ternary(_)) {

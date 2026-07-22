@@ -8,8 +8,13 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
+use axum::error_handling::HandleErrorLayer;
+use axum::http::StatusCode;
+use axum::{BoxError, Json};
 use oxibonsai_core::config::Qwen3Config;
+use oxibonsai_core::GgufTensorType;
 use oxibonsai_runtime::engine::InferenceEngine;
 use oxibonsai_runtime::engine_pool::{build_pool_from_gguf, EnginePool};
 use oxibonsai_runtime::metrics::InferenceMetrics;
@@ -22,6 +27,7 @@ use oxibonsai_serve::{
     config::{PartialServerConfig, ServerConfig},
     env::parse_process_env,
 };
+use tower::ServiceBuilder;
 use tracing::{error, info, warn};
 
 #[tokio::main]
@@ -116,6 +122,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         None => {
             warn!("no --model path supplied; falling back to tiny_test engine");
+            if config.model.quantization_hint.is_some() {
+                warn!(
+                    "model.quantization_hint is set but no --model path was supplied; \
+                     ignoring (there is no GGUF file to associate it with)"
+                );
+            }
             let tiny = Qwen3Config::tiny_test();
             let engine = InferenceEngine::new(tiny, sampling, config.seed);
             // No GGUF to share across replicas; wrap the single in-memory engine
@@ -124,6 +136,36 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             EnginePool::new(vec![engine])
         }
     };
+
+    // `model.quantization_hint` is documented (`examples/server_config.toml`)
+    // as an *informational* label — "the loader picks the real quantization
+    // from the file" — so it deliberately does not gate model loading here.
+    // What it *must not* do is disappear silently: surface it in the log at
+    // `info` level when it looks like a real OxiBonsai/GGUF quant-type name,
+    // and `warn` when it looks like a typo, so operators get feedback either
+    // way instead of a config value that is parsed, validated and then never
+    // read again.
+    if let (Some(hint), Some(path)) = (
+        config.model.quantization_hint.as_deref(),
+        config.model.path.as_ref(),
+    ) {
+        if quantization_hint_recognized(hint) {
+            info!(
+                quantization_hint = hint,
+                path = %path.display(),
+                "quantization hint recorded (informational; actual quantization is \
+                 auto-detected from the GGUF file's own tensor metadata)"
+            );
+        } else {
+            warn!(
+                quantization_hint = hint,
+                known = ?known_quant_type_names(),
+                "model.quantization_hint does not resemble any known OxiBonsai/GGUF \
+                 quantization type name — likely a typo. This field is informational only \
+                 and does not affect model loading."
+            );
+        }
+    }
 
     // ── 6. Load tokenizer (optional) ──────────────────────────────────────
     //
@@ -193,6 +235,44 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         base_router
     };
 
+    // ── 7b. Admission control: enforce `limits.max_concurrent_requests` and
+    //        `limits.per_request_timeout_ms` ───────────────────────────────
+    //
+    // Both fields are validated to be ≥ 1 by `ServerConfig::validate` (called
+    // inside `ServerConfig::load` above), so unwrapping them into `Duration`
+    // / `usize` here is always well-formed.
+    //
+    // Layer order (outermost first, matching axum's documented
+    // `HandleErrorLayer` + `ServiceBuilder` pattern): `HandleErrorLayer` wraps
+    // everything below so both kinds of admission failure — an overloaded
+    // `load_shed` and an elapsed `timeout` — become proper HTTP responses
+    // instead of tearing down the connection (axum requires an `Infallible`
+    // error type on the outermost service). `load_shed` turns "concurrency
+    // limit reached" from a queue (which a bare concurrency-limit layer would
+    // do on its own) into an immediate rejection, matching "bounds HTTP-level
+    // admission" from the `limits.max_concurrent_requests` doc comment.
+    //
+    // `GlobalConcurrencyLimitLayer` (not `ServiceBuilder::concurrency_limit`,
+    // i.e. `tower::limit::ConcurrencyLimitLayer`) is required here:
+    // `axum::Router::layer` applies the given `Layer` independently to *every
+    // registered route* (`PathRouter::layer` calls `layer.clone().layer(..)`
+    // once per route, not once for the router as a whole), so a bare
+    // `ConcurrencyLimitLayer` — which allocates a fresh `Arc<Semaphore>`
+    // inside its own `Layer::layer()` — would silently create one
+    // independent semaphore *per route* instead of one shared budget across
+    // the whole HTTP surface. `GlobalConcurrencyLimitLayer` pre-builds the
+    // `Arc<Semaphore>` once, before any `.layer()` call, and every per-route
+    // clone shares that same semaphore, giving the process-wide admission
+    // bound `limits.max_concurrent_requests` documents.
+    let concurrency_semaphore =
+        tower::limit::GlobalConcurrencyLimitLayer::new(config.limits.max_concurrent_requests);
+    let admission = ServiceBuilder::new()
+        .layer(HandleErrorLayer::new(handle_admission_error))
+        .load_shed()
+        .layer(concurrency_semaphore)
+        .timeout(Duration::from_millis(config.limits.per_request_timeout_ms));
+    let router = router.layer(admission);
+
     // ── 8. Resolve bind address ───────────────────────────────────────────
     let addr_str = format!("{}:{}", config.bind.host, config.bind.port);
     let addr: SocketAddr = addr_str
@@ -206,6 +286,79 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     info!("oxibonsai-serve exited cleanly");
     Ok(())
+}
+
+/// Every quantization-type name the current build of OxiBonsai actually
+/// knows how to decode, sourced from [`GgufTensorType`] (type IDs 0..=44 is a
+/// generous upper bound — `from_id` rejects unregistered IDs) rather than a
+/// hand-maintained string list that could drift out of sync with the real
+/// enum.
+fn known_quant_type_names() -> Vec<&'static str> {
+    (0u32..=44)
+        .filter_map(|id| GgufTensorType::from_id(id).ok())
+        .map(|t| t.name())
+        .collect()
+}
+
+/// Best-effort sanity check for an operator-supplied `model.quantization_hint`.
+///
+/// Accepts an exact (case-insensitive) match against a known type name, and
+/// also a prefix match in either direction so that a deliberately-abbreviated
+/// hint (the shipped example config uses `quantization_hint = "TQ2"` for the
+/// `TQ2_0` / `TQ2_0_g128` types) is not flagged as a typo.
+fn quantization_hint_recognized(hint: &str) -> bool {
+    let hint_upper = hint.to_ascii_uppercase();
+    if hint_upper.is_empty() {
+        return false;
+    }
+    known_quant_type_names().into_iter().any(|name| {
+        let name_upper = name.to_ascii_uppercase();
+        name_upper == hint_upper
+            || name_upper.starts_with(&hint_upper)
+            || hint_upper.starts_with(&name_upper)
+    })
+}
+
+/// Convert an admission-layer error (an overloaded `load_shed` or an elapsed
+/// `timeout`) into an OpenAI-style JSON error response.
+///
+/// Required because axum's `Router` demands an `Infallible` error type on the
+/// outermost service; `HandleErrorLayer` is the documented bridge from the
+/// `tower::BoxError` the admission stack produces back into a `Response`. See
+/// <https://docs.rs/axum/latest/axum/error_handling/index.html>.
+async fn handle_admission_error(err: BoxError) -> (StatusCode, Json<serde_json::Value>) {
+    let (status, kind, message) = if err.is::<tower::load_shed::error::Overloaded>() {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "overloaded_error",
+            "server is at its configured limits.max_concurrent_requests capacity; \
+             retry after a short backoff"
+                .to_string(),
+        )
+    } else if err.is::<tower::timeout::error::Elapsed>() {
+        (
+            StatusCode::REQUEST_TIMEOUT,
+            "timeout_error",
+            "request exceeded the configured limits.per_request_timeout_ms budget".to_string(),
+        )
+    } else {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            format!("unhandled admission-layer error: {err}"),
+        )
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "error": {
+                "message": message,
+                "type": kind,
+                "param": null,
+                "code": null,
+            }
+        })),
+    )
 }
 
 /// Tokenizer auto-discovery used when the operator does not pass an explicit
@@ -389,11 +542,42 @@ mod middleware {
             }
         };
 
-        if presented != state.token {
+        if !constant_time_eq(presented.as_bytes(), state.token.as_bytes()) {
             return unauthorized("invalid bearer token").into_response();
         }
 
         next.run(req).await
+    }
+
+    /// Constant-time byte-string comparison.
+    ///
+    /// Plain `PartialEq`/`!=` on `&str`/`String` short-circuits on the first
+    /// mismatching byte, which leaks a timing signal proportional to the
+    /// length of the correct-token prefix a caller has guessed so far — an
+    /// attacker who can measure request latency precisely enough could in
+    /// principle recover the bearer token byte-by-byte. This walks every byte
+    /// of both inputs unconditionally and folds the differences with `|=` so
+    /// the number of set bits (and therefore, modulo compiler
+    /// vectorization/optimization, the *shape* of the work performed) does
+    /// not depend on where the first mismatch occurs.
+    ///
+    /// Deliberately implemented locally (no `subtle` dependency) per the
+    /// no-new-dependency policy — this is the same fixed-time XOR-fold
+    /// technique `subtle::ConstantTimeEq` uses internally for byte slices.
+    ///
+    /// Note: an early return on length mismatch does leak *length* via
+    /// timing, not content. This mirrors `subtle`'s own behavior for
+    /// differently-sized slices and is standard practice for secret
+    /// comparisons — token length is not itself treated as a secret here.
+    fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut diff: u8 = 0;
+        for (x, y) in a.iter().zip(b.iter()) {
+            diff |= x ^ y;
+        }
+        diff == 0
     }
 
     fn unauthorized(msg: &str) -> (StatusCode, Json<serde_json::Value>) {
@@ -408,5 +592,80 @@ mod middleware {
                 }
             })),
         )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::constant_time_eq;
+
+        #[test]
+        fn equal_bytes_are_equal() {
+            assert!(constant_time_eq(b"my-secret-token", b"my-secret-token"));
+        }
+
+        #[test]
+        fn different_bytes_are_unequal() {
+            assert!(!constant_time_eq(b"my-secret-token", b"not-the-token!!"));
+        }
+
+        #[test]
+        fn different_lengths_are_unequal() {
+            assert!(!constant_time_eq(b"short", b"a-much-longer-token"));
+            assert!(!constant_time_eq(b"a-much-longer-token", b"short"));
+        }
+
+        #[test]
+        fn empty_slices_are_equal() {
+            assert!(constant_time_eq(b"", b""));
+        }
+
+        #[test]
+        fn single_byte_difference_at_any_position_is_detected() {
+            let base = b"0123456789abcdef";
+            for i in 0..base.len() {
+                let mut mutated = *base;
+                mutated[i] ^= 0xFF;
+                assert!(
+                    !constant_time_eq(base, &mutated),
+                    "failed to detect mismatch at byte {i}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod quant_hint_tests {
+    use super::{known_quant_type_names, quantization_hint_recognized};
+
+    #[test]
+    fn known_quant_type_names_is_non_empty_and_stable_examples_present() {
+        let names = known_quant_type_names();
+        assert!(names.contains(&"TQ2_0"));
+        assert!(names.contains(&"TQ2_0_g128"));
+        assert!(names.contains(&"Q1_0_g128"));
+        assert!(names.contains(&"F8_E4M3"));
+        assert!(names.contains(&"Q4_K"));
+    }
+
+    #[test]
+    fn exact_case_insensitive_match_is_recognized() {
+        assert!(quantization_hint_recognized("Q8_0"));
+        assert!(quantization_hint_recognized("q8_0"));
+        assert!(quantization_hint_recognized("TQ2_0_g128"));
+    }
+
+    #[test]
+    fn abbreviated_hint_from_example_config_is_recognized() {
+        // `examples/server_config.toml` ships `quantization_hint = "TQ2"` as
+        // the canonical example — it must not be flagged as an unrecognized
+        // typo.
+        assert!(quantization_hint_recognized("TQ2"));
+    }
+
+    #[test]
+    fn garbage_hint_is_not_recognized() {
+        assert!(!quantization_hint_recognized("NOT_A_REAL_QUANT_TYPE"));
+        assert!(!quantization_hint_recognized(""));
     }
 }

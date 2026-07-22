@@ -418,31 +418,27 @@ unsafe fn dot4_neon(
     let p1 = w1.as_ptr();
     let p2 = w2.as_ptr();
     let p3 = w3.as_ptr();
-    let k16 = k - (k % 16);
+    // 4-wide steps — deliberately matching `micro4x4_neon`'s and
+    // `dot1_neon`'s per-lane grouping and horizontal-sum exactly (not a
+    // wider unroll). `gemm_ncols` routes a given output row through this
+    // function (the `m % 4` tail) or through `micro4x4_neon` (the batched
+    // `m4` rows) depending solely on the caller's row-chunk size `m` — an
+    // artifact of how the caller tiled its `m` dimension, unrelated to the
+    // row's data. Float addition isn't associative, so if this reduced `k`
+    // in a different order than `micro4x4_neon`, the same logical dot
+    // product would round differently depending on which kernel happened to
+    // compute it, breaking bit-identity across tile budgets (see
+    // `Conv2d::forward_tiled`'s doc contract). Keep this in lockstep with
+    // `micro4x4_neon`/`dot1_neon` if either changes.
+    let k4 = k - (k % 4);
     let mut i = 0;
-    // 16-wide unroll (4 NEON vectors) per accumulator.
-    while i < k16 {
-        let x0 = vld1q_f32(ip.add(i));
-        let x1 = vld1q_f32(ip.add(i + 4));
-        let x2 = vld1q_f32(ip.add(i + 8));
-        let x3 = vld1q_f32(ip.add(i + 12));
-        acc0 = vfmaq_f32(acc0, x0, vld1q_f32(p0.add(i)));
-        acc0 = vfmaq_f32(acc0, x1, vld1q_f32(p0.add(i + 4)));
-        acc0 = vfmaq_f32(acc0, x2, vld1q_f32(p0.add(i + 8)));
-        acc0 = vfmaq_f32(acc0, x3, vld1q_f32(p0.add(i + 12)));
-        acc1 = vfmaq_f32(acc1, x0, vld1q_f32(p1.add(i)));
-        acc1 = vfmaq_f32(acc1, x1, vld1q_f32(p1.add(i + 4)));
-        acc1 = vfmaq_f32(acc1, x2, vld1q_f32(p1.add(i + 8)));
-        acc1 = vfmaq_f32(acc1, x3, vld1q_f32(p1.add(i + 12)));
-        acc2 = vfmaq_f32(acc2, x0, vld1q_f32(p2.add(i)));
-        acc2 = vfmaq_f32(acc2, x1, vld1q_f32(p2.add(i + 4)));
-        acc2 = vfmaq_f32(acc2, x2, vld1q_f32(p2.add(i + 8)));
-        acc2 = vfmaq_f32(acc2, x3, vld1q_f32(p2.add(i + 12)));
-        acc3 = vfmaq_f32(acc3, x0, vld1q_f32(p3.add(i)));
-        acc3 = vfmaq_f32(acc3, x1, vld1q_f32(p3.add(i + 4)));
-        acc3 = vfmaq_f32(acc3, x2, vld1q_f32(p3.add(i + 8)));
-        acc3 = vfmaq_f32(acc3, x3, vld1q_f32(p3.add(i + 12)));
-        i += 16;
+    while i < k4 {
+        let x = vld1q_f32(ip.add(i));
+        acc0 = vfmaq_f32(acc0, x, vld1q_f32(p0.add(i)));
+        acc1 = vfmaq_f32(acc1, x, vld1q_f32(p1.add(i)));
+        acc2 = vfmaq_f32(acc2, x, vld1q_f32(p2.add(i)));
+        acc3 = vfmaq_f32(acc3, x, vld1q_f32(p3.add(i)));
+        i += 4;
     }
     let mut a0 = vaddvq_f32(acc0);
     let mut a1 = vaddvq_f32(acc1);

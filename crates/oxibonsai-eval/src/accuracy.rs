@@ -215,29 +215,35 @@ impl McLogitEvaluator {
     /// Score one question given per-choice log-probabilities.
     ///
     /// `per_choice[i]` is the total log-probability for choice `i`. The picked
-    /// choice is the argmax (ties → lowest index). An empty slice returns a
-    /// result with `picked = 0` and `correct = false` — callers should
-    /// pre-validate that the slice is non-empty for meaningful scoring.
+    /// choice is the argmax (ties → lowest index, `NaN` entries are never
+    /// picked). An empty slice, or a slice whose entries are all `NaN` (no
+    /// comparable value to base a pick on), returns a result with
+    /// `picked = 0` and `correct = false` unconditionally — never routed
+    /// through the argmax fallback, which would otherwise silently credit
+    /// index 0 as "correct" whenever `correct_answer == 0`. Callers should
+    /// still pre-validate that the slice is non-empty for meaningful scoring.
     pub fn score(&self, per_choice: &[f32], correct_answer: usize) -> LogitMcResult {
-        if per_choice.is_empty() {
-            return LogitMcResult {
-                picked: 0,
-                correct: false,
-                per_choice: Vec::new(),
-            };
-        }
-        let mut best_idx = 0usize;
-        let mut best_val = f32::NEG_INFINITY;
+        let mut best: Option<(usize, f32)> = None;
         for (i, &v) in per_choice.iter().enumerate() {
-            if v > best_val {
-                best_val = v;
-                best_idx = i;
+            if v.is_nan() {
+                continue;
+            }
+            match best {
+                Some((_, best_val)) if v <= best_val => {}
+                _ => best = Some((i, v)),
             }
         }
-        LogitMcResult {
-            picked: best_idx,
-            correct: best_idx == correct_answer,
-            per_choice: per_choice.to_vec(),
+        match best {
+            Some((best_idx, _)) => LogitMcResult {
+                picked: best_idx,
+                correct: best_idx == correct_answer,
+                per_choice: per_choice.to_vec(),
+            },
+            None => LogitMcResult {
+                picked: 0,
+                correct: false,
+                per_choice: per_choice.to_vec(),
+            },
         }
     }
 

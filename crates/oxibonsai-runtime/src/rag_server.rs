@@ -30,12 +30,27 @@ use axum::response::{IntoResponse, Json, Response};
 use axum::Router;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
-use tokio::sync::Mutex as TokioMutex;
 
-use oxibonsai_rag::embedding::TfIdfEmbedder;
+use oxibonsai_rag::embedding::{Embedder, TfIdfEmbedder};
 use oxibonsai_rag::pipeline::{RagConfig, RagPipeline};
 
 use crate::engine::InferenceEngine;
+use crate::engine_pool::EnginePool;
+use crate::sampling::SamplingParams;
+use crate::tokenizer_bridge::TokenizerBridge;
+
+/// Hard upper bound on the number of tokens a single `/rag/query` request may
+/// ask the engine to generate, mirroring the chat server's output ceiling so an
+/// oversized `max_tokens` cannot drive an unbounded allocation.
+const MAX_RAG_OUTPUT_TOKENS: usize = 8192;
+
+/// Inclusive bounds on the client-supplied `top_k` for `/rag/query`. Values
+/// outside this range are rejected with `400 Bad Request` rather than
+/// silently clamped, so callers get honest feedback instead of a
+/// mismatch between the requested and actual retrieval depth (finding
+/// `serve-api-06`/`rag-eval-01`).
+const MIN_RAG_TOP_K: usize = 1;
+const MAX_RAG_TOP_K: usize = 50;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Default corpus used to bootstrap the TF-IDF vocabulary.
@@ -92,8 +107,8 @@ pub struct RagQueryRequest {
     pub max_tokens: Option<usize>,
     /// Number of context chunks to retrieve (default: 3).
     pub top_k: Option<usize>,
-    /// Sampling temperature forwarded to the inference engine (not yet wired
-    /// into `InferenceEngine::generate`; stored for future use).
+    /// Sampling temperature forwarded to the inference engine when a tokenizer
+    /// is configured. Applied only when finite and within `[0.0, 2.0]`.
     pub temperature: Option<f32>,
     /// When `true`, the retrieved chunks are included in the response.
     pub include_context: Option<bool>,
@@ -107,7 +122,9 @@ pub struct RagQueryResponse {
     /// The context chunks that were retrieved (present when
     /// `include_context: true` was requested).
     pub retrieved_chunks: Option<Vec<String>>,
-    /// The full prompt that was built and sent to the model.
+    /// The full prompt that was built from the retrieved context and the query.
+    /// When a tokenizer is configured this prompt is encoded and sent to the
+    /// model; without a tokenizer it is returned for inspection only.
     pub prompt_used: String,
     /// Token / retrieval usage statistics.
     pub usage: RagUsage,
@@ -146,9 +163,14 @@ pub struct RagStatsResponse {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Build a JSON error response.
+///
+/// Delegates to the shared [`crate::http_error`] envelope so `/rag/*` errors use
+/// the same `{"error": {message, type, param, code}}` shape as the
+/// OpenAI-compatible chat/embeddings routes mounted on the same router
+/// (finding `serve-api-10`), instead of the previous flat
+/// `{"error": "<string>"}`.
 fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
-    let body = serde_json::json!({ "error": message.into() });
-    (status, Json(body)).into_response()
+    crate::http_error::error_response(status, message, None)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -186,27 +208,36 @@ fn rough_token_count(text: &str) -> usize {
 /// Shared state for the RAG server.
 ///
 /// Holds the RAG pipeline (protected by a `std::sync::Mutex` for blocking
-/// operations) and the inference engine (protected by a `tokio::sync::Mutex`
-/// for async generation).
+/// operations) and an [`EnginePool`] of inference-engine replicas — the same
+/// pooling pattern the base `/v1/chat/completions` server uses, so RAG requests
+/// can generate concurrently up to `pool.size()` instead of serializing on a
+/// single mutex. An optional [`TokenizerBridge`] enables real text generation
+/// from the retrieved-context prompt.
 pub struct RagState {
     /// The RAG pipeline.  Uses a `std::sync::Mutex` because all RAG operations
     /// are synchronous (no `.await` points inside the lock).
     pipeline: Mutex<RagPipeline<TfIdfEmbedder>>,
-    /// The inference engine wrapped in a tokio async mutex.
-    engine: Arc<TokioMutex<InferenceEngine<'static>>>,
+    /// Pool of inference-engine replicas shared across all RAG requests.
+    engines: Arc<EnginePool>,
+    /// Optional tokenizer. When present, the RAG prompt is encoded, generated,
+    /// and decoded to real text; when absent, generation is skipped honestly
+    /// (see [`rag_query`]).
+    tokenizer: Option<TokenizerBridge>,
 }
 
 impl RagState {
-    /// Create a new [`RagState`] wrapping the provided engine.
+    /// Create a new [`RagState`] backed by the provided engine pool and an
+    /// optional tokenizer.
     ///
     /// The RAG pipeline is initialised with a bootstrap corpus so the
     /// `TfIdfEmbedder` vocabulary is non-empty from the start.
-    pub fn new(engine: Arc<TokioMutex<InferenceEngine<'static>>>) -> Self {
+    pub fn new(engines: Arc<EnginePool>, tokenizer: Option<TokenizerBridge>) -> Self {
         let embedder = TfIdfEmbedder::fit(BOOTSTRAP_CORPUS, DEFAULT_MAX_FEATURES);
         let pipeline = RagPipeline::new(embedder, RagConfig::default());
         Self {
             pipeline: Mutex::new(pipeline),
-            engine,
+            engines,
+            tokenizer,
         }
     }
 }
@@ -229,11 +260,6 @@ pub async fn index_documents(
         return error_response(StatusCode::BAD_REQUEST, "documents list must not be empty");
     }
 
-    // Build a fresh TF-IDF embedder fitted on the new corpus so that
-    // vocabulary is always in-domain.
-    let doc_refs: Vec<&str> = req.documents.iter().map(String::as_str).collect();
-    let embedder = TfIdfEmbedder::fit(&doc_refs, DEFAULT_MAX_FEATURES);
-
     // Build chunk config, honouring optional overrides.
     let mut chunk_config = oxibonsai_rag::chunker::ChunkConfig::default();
     if let Some(size) = req.chunk_size {
@@ -242,6 +268,43 @@ pub async fn index_documents(
     if let Some(overlap) = req.chunk_overlap {
         chunk_config.overlap = overlap;
     }
+
+    // Reject chunk_size/chunk_overlap combinations that would blow up the
+    // indexed corpus (finding `security-04`). `chunk_document`'s sliding
+    // window steps by `chunk_size - overlap` characters; a near-equal
+    // chunk_size/overlap pair (e.g. size=512, overlap=511) drives the step
+    // toward 1, so an N-character document yields up to ~chunk_size × N
+    // stored characters — durably retained in the in-process vector store.
+    // Capping overlap at half of chunk_size bounds worst-case amplification
+    // to ~2×, in addition to `ChunkConfig::validate()`'s existing (weaker)
+    // `overlap < chunk_size` check performed later during indexing.
+    if chunk_config.chunk_size == 0 {
+        return error_response(StatusCode::BAD_REQUEST, "chunk_size must be > 0");
+    }
+    if chunk_config.overlap >= chunk_config.chunk_size {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "chunk_overlap ({}) must be < chunk_size ({})",
+                chunk_config.overlap, chunk_config.chunk_size
+            ),
+        );
+    }
+    if chunk_config.overlap > chunk_config.chunk_size / 2 {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "chunk_overlap ({}) must be <= half of chunk_size ({}) to bound \
+                 per-document storage amplification",
+                chunk_config.overlap, chunk_config.chunk_size
+            ),
+        );
+    }
+
+    // Build a fresh TF-IDF embedder fitted on the new corpus so that
+    // vocabulary is always in-domain.
+    let doc_refs: Vec<&str> = req.documents.iter().map(String::as_str).collect();
+    let embedder = TfIdfEmbedder::fit(&doc_refs, DEFAULT_MAX_FEATURES);
 
     let rag_config = RagConfig::default().with_chunk_config(chunk_config);
 
@@ -307,11 +370,36 @@ pub async fn rag_query(
         return error_response(StatusCode::BAD_REQUEST, "query must not be empty");
     }
 
-    let max_tokens = req.max_tokens.unwrap_or(256);
-    let top_k = req.top_k.unwrap_or(3);
+    let max_tokens = req
+        .max_tokens
+        .unwrap_or(256)
+        .clamp(1, MAX_RAG_OUTPUT_TOKENS);
+    let top_k = match req.top_k {
+        None => 3,
+        Some(k) if (MIN_RAG_TOP_K..=MAX_RAG_TOP_K).contains(&k) => k,
+        Some(k) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "top_k ({k}) must be between {MIN_RAG_TOP_K} and {MAX_RAG_TOP_K} inclusive"
+                ),
+            );
+        }
+    };
     let include_context = req.include_context.unwrap_or(false);
 
     // ── 1. Build prompt via RAG pipeline ────────────────────────────────────
+    //
+    // The pipeline's own `Retriever` is always constructed with a *fixed*
+    // `RetrieverConfig` (top_k baked in at pipeline-construction time), so
+    // `RagPipeline::build_prompt` cannot be asked to use a different top_k
+    // per request. To make the client-supplied `top_k` genuinely drive both
+    // the reported chunk count *and* the generation prompt (finding
+    // `serve-api-06`/`rag-eval-01`), we perform retrieval ourselves against
+    // the pipeline's embedder + vector store directly, then assemble the
+    // context/prompt using the exact same defaults `RagState` constructs its
+    // pipelines with (`RagConfig::default()`), and finally feed that same
+    // context into the generation step below.
     let (prompt, retrieved_chunks, docs_searched, chunks_retrieved) = {
         let pipeline_guard = match state.pipeline.lock() {
             Ok(g) => g,
@@ -323,79 +411,141 @@ pub async fn rag_query(
             }
         };
 
-        // Temporarily override the retriever's top_k via a config tweak.
-        // We do this by obtaining the pipeline stats before retrieval.
         let stats = pipeline_guard.stats();
         let docs_searched = stats.documents_indexed;
 
-        // Retrieve context chunks directly from the retriever so we can also
-        // capture the raw chunk texts (needed for `include_context`).
-        let retrieved_texts: Vec<String> = if stats.chunks_indexed == 0 {
-            // No documents indexed yet — the pipeline will still build a
-            // prompt with an empty context.
-            Vec::new()
-        } else {
-            match pipeline_guard.retriever().retrieve_text(&req.query) {
-                Ok(texts) => texts.into_iter().take(top_k).collect(),
-                Err(oxibonsai_rag::RagError::NoDocumentsIndexed) => Vec::new(),
-                Err(e) => {
-                    return error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("retrieval failed: {e}"),
-                    );
-                }
-            }
-        };
+        let retriever = pipeline_guard.retriever();
+        let default_retriever_config = oxibonsai_rag::retriever::RetrieverConfig::default();
 
-        let chunks_retrieved = retrieved_texts.len();
-
-        // Build the full RAG prompt.
-        let prompt = match pipeline_guard.build_prompt(&req.query) {
-            Ok(p) => p,
+        let query_vec = match retriever.embedder().embed(&req.query) {
+            Ok(v) => v,
             Err(e) => {
                 return error_response(
-                    StatusCode::BAD_REQUEST,
-                    format!("prompt build failed: {e}"),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("query embedding failed: {e}"),
                 );
             }
         };
+
+        // `search_with_threshold` returns an empty Vec (never errors) when
+        // the store is empty, so no separate "no documents yet" branch is
+        // needed here.
+        let results = retriever.store().search_with_threshold(
+            &query_vec,
+            top_k,
+            default_retriever_config.min_score,
+        );
+
+        let retrieved_texts: Vec<String> = results.iter().map(|r| r.chunk.text.clone()).collect();
+        let chunks_retrieved = retrieved_texts.len();
+
+        // Assemble the context block the same way
+        // `RagPipeline::retrieve_context` does: concatenate chunk texts with
+        // the configured separator, dropping chunks that would exceed
+        // `max_context_chars`.
+        let rag_defaults = RagConfig::default();
+        let sep = &rag_defaults.context_separator;
+        let mut parts: Vec<&str> = Vec::with_capacity(results.len());
+        let mut total_chars = 0usize;
+        for result in &results {
+            let text_len = result.chunk.text.len();
+            let sep_len = if parts.is_empty() { 0 } else { sep.len() };
+            if total_chars + sep_len + text_len > rag_defaults.max_context_chars
+                && !parts.is_empty()
+            {
+                break;
+            }
+            total_chars += sep_len + text_len;
+            parts.push(&result.chunk.text);
+        }
+        let context = parts.join(sep.as_str());
+
+        let prompt = rag_defaults
+            .prompt_template
+            .replace("{context}", &context)
+            .replace("{query}", &req.query);
 
         (prompt, retrieved_texts, docs_searched, chunks_retrieved)
     };
 
-    // ── 2. Tokenise prompt (simple whitespace tokenisation for now) ──────────
-    // The engine exposes a token-level API.  We convert the prompt to a
-    // minimal single-token representation (start token) because the full
-    // tokenizer is optional.  We record prompt word count as `prompt_tokens`.
-    let prompt_tokens_count = rough_token_count(&prompt);
+    // ── 2. Generate an answer from the real RAG prompt ───────────────────────
+    // When a tokenizer is configured we encode the *actual* context+query
+    // prompt, run the engine on those tokens, and decode the output back to
+    // text — so the answer genuinely depends on the retrieved context and the
+    // query. Without a tokenizer we cannot map the prompt text onto the model's
+    // vocabulary, so we skip generation and say so honestly rather than
+    // fabricating an answer from a fixed start token.
+    let (answer, completion_tokens, prompt_tokens_count) = match &state.tokenizer {
+        Some(tokenizer) => {
+            let input_tokens = match tokenizer.encode(&prompt) {
+                Ok(tokens) if !tokens.is_empty() => tokens,
+                Ok(_) => {
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "prompt encoded to an empty token sequence",
+                    );
+                }
+                Err(e) => {
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("prompt tokenisation failed: {e}"),
+                    );
+                }
+            };
+            let prompt_tokens_count = input_tokens.len();
 
-    // Use start token 151644 (Qwen3 BOS) as a single-token prompt.
-    // This mirrors the fallback path in the main chat completions handler.
-    let input_tokens: Vec<u32> = vec![151644];
-
-    // ── 3. Run inference ─────────────────────────────────────────────────────
-    let output_tokens = {
-        let mut engine = state.engine.lock().await;
-        match engine.generate(&input_tokens, max_tokens) {
-            Ok(tokens) => tokens,
-            Err(e) => {
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("generation failed: {e}"),
-                );
+            // Honor the request temperature when it is a valid value.
+            let mut params = SamplingParams::default();
+            if let Some(temperature) = req.temperature {
+                if temperature.is_finite() && (0.0..=2.0).contains(&temperature) {
+                    params.temperature = temperature;
+                }
             }
+
+            let output_tokens = {
+                let mut lease = match state.engines.acquire().await {
+                    Ok(lease) => lease,
+                    Err(e) => {
+                        return error_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            format!("engine pool acquire failed: {e}"),
+                        );
+                    }
+                };
+                match lease.generate_with_params(&input_tokens, max_tokens, &params) {
+                    Ok(tokens) => tokens,
+                    Err(e) => {
+                        return error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("generation failed: {e}"),
+                        );
+                    }
+                }
+            };
+
+            let completion_tokens = output_tokens.len();
+            let answer = match tokenizer.decode(&output_tokens) {
+                Ok(text) => text,
+                Err(e) => {
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("decoding generated tokens failed: {e}"),
+                    );
+                }
+            };
+            (answer, completion_tokens, prompt_tokens_count)
+        }
+        None => {
+            // No tokenizer: retrieval succeeded and the prompt was built, but we
+            // cannot run the model on raw text. Be transparent instead of
+            // returning numeric token IDs dressed up as an answer.
+            let answer = "[no tokenizer configured: retrieval succeeded and the \
+                          prompt was built, but text generation is unavailable on \
+                          this server]"
+                .to_string();
+            (answer, 0usize, rough_token_count(&prompt))
         }
     };
-
-    let completion_tokens = output_tokens.len();
-
-    // Decode generated tokens to a string (use the numeric fallback since we
-    // may not have a tokenizer attached to RagState).
-    let answer = output_tokens
-        .iter()
-        .map(|t| t.to_string())
-        .collect::<Vec<_>>()
-        .join(" ");
 
     // ── 4. Build response ────────────────────────────────────────────────────
     let resp = RagQueryResponse {
@@ -479,11 +629,24 @@ pub async fn clear_index(State(state): State<Arc<RagState>>) -> impl IntoRespons
 
 /// Build and return the Axum router for all RAG endpoints.
 ///
-/// The provided `engine` is wrapped in an `Arc<TokioMutex<_>>` and shared
-/// across all handlers via [`RagState`].
+/// The provided `engine` is wrapped in a single-replica [`EnginePool`] with no
+/// tokenizer attached. Use [`create_rag_router_with_pool`] to serve from a
+/// multi-replica pool and to attach a tokenizer for real text generation.
 pub fn create_rag_router(engine: InferenceEngine<'static>) -> Router {
-    let engine_arc = Arc::new(TokioMutex::new(engine));
-    let state = Arc::new(RagState::new(engine_arc));
+    create_rag_router_with_pool(EnginePool::new(vec![engine]), None)
+}
+
+/// Build the RAG router from a pre-built [`EnginePool`] and optional tokenizer.
+///
+/// This mirrors the base server's `create_router_with_pool`: requests generate
+/// concurrently up to `pool.size()`. When a tokenizer is supplied, `/rag/query`
+/// encodes the retrieved-context prompt, runs the engine, and decodes the
+/// output to real text.
+pub fn create_rag_router_with_pool(
+    engines: Arc<EnginePool>,
+    tokenizer: Option<TokenizerBridge>,
+) -> Router {
+    let state = Arc::new(RagState::new(engines, tokenizer));
 
     Router::new()
         .route("/rag/index", axum::routing::post(index_documents))
@@ -519,12 +682,11 @@ mod tests {
 
     #[test]
     fn rag_state_creates_without_panic() {
-        use crate::sampling::SamplingParams;
         use oxibonsai_core::config::Qwen3Config;
 
         let config = Qwen3Config::tiny_test();
         let engine = InferenceEngine::new(config, SamplingParams::default(), 42);
-        let engine_arc = Arc::new(TokioMutex::new(engine));
-        let _state = RagState::new(engine_arc);
+        let pool = EnginePool::new(vec![engine]);
+        let _state = RagState::new(pool, None);
     }
 }

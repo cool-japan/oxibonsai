@@ -8,9 +8,12 @@
 //! # Supported JSON Schema v1 features
 //!
 //! - **Primitives:** `string`, `integer`, `number`, `boolean`, `null`
-//! - **Composites:** `object` (with `properties`, `required`,
+//! - **Composites:** `object` (with `properties` — both required *and*
+//!   optional properties are represented in the grammar, `required`,
 //!   `additionalProperties: false`), `array` (with `items`)
-//! - **Constraints:** `enum` (string/integer/boolean/null values)
+//! - **Constraints:** `enum` (string/integer/boolean/null values), `const`
+//!   (compiled as a single-alternative literal, identical to a one-element
+//!   `enum`; string/integer/boolean/null values only)
 //! - **Composition:** `anyOf`, `oneOf` (compiled identically; Earley handles
 //!   ambiguity), `allOf` (merge when all branches are object schemas)
 //! - **References:** `$ref` pointing to `"#/$defs/..."` or `"#/definitions/..."`,
@@ -21,7 +24,12 @@
 //! `not`, `if`, `then`, `else`, `patternProperties`,
 //! `additionalProperties: <subschema>` (only `false` is allowed),
 //! `pattern`, `format`, `multipleOf`, `minimum`, `maximum`,
-//! `exclusiveMinimum`, `exclusiveMaximum`.
+//! `exclusiveMinimum`, `exclusiveMaximum`, `minLength`, `maxLength`,
+//! `minItems`, `maxItems`, `uniqueItems`. These are rejected rather than
+//! silently ignored because this compiler cannot express numeric/length/
+//! cardinality bounds in the generated context-free grammar; letting a
+//! schema with one of these keywords compile silently would produce a
+//! grammar that is *more permissive* than the schema actually allows.
 
 use std::collections::HashMap;
 
@@ -253,6 +261,12 @@ impl Compiler {
         };
 
         // ── Reject unsupported top-level keywords ────────────────────────────
+        // This list must stay in sync with the "Out of scope" section of the
+        // module doc comment above. Any keyword this compiler cannot express
+        // in the generated context-free grammar (numeric/length/cardinality
+        // bounds in particular) MUST be rejected here rather than silently
+        // ignored — silently ignoring a constraint keyword would make the
+        // compiled grammar strictly more permissive than the schema allows.
         for unsupported in &[
             "not",
             "if",
@@ -262,8 +276,15 @@ impl Compiler {
             "pattern",
             "format",
             "multipleOf",
+            "minimum",
+            "maximum",
             "exclusiveMinimum",
             "exclusiveMaximum",
+            "minLength",
+            "maxLength",
+            "minItems",
+            "maxItems",
+            "uniqueItems",
         ] {
             if obj.contains_key(*unsupported) {
                 return Err(JsonSchemaCompileError::UnsupportedKeyword(
@@ -275,6 +296,15 @@ impl Compiler {
         // ── $ref ─────────────────────────────────────────────────────────────
         if let Some(ref_val) = obj.get("$ref") {
             return self.compile_ref(ref_val);
+        }
+
+        // ── const ────────────────────────────────────────────────────────────
+        // `const` restricts the instance to a single fixed value, regardless of
+        // any sibling `type`/`enum` keywords. Compiled as a one-alternative
+        // grammar (equivalent to a one-element `enum`), so it must be checked
+        // before `enum` and the `type` dispatch below.
+        if let Some(const_val) = obj.get("const") {
+            return self.compile_const(const_val);
         }
 
         // ── enum ─────────────────────────────────────────────────────────────
@@ -342,6 +372,26 @@ impl Compiler {
             .get(key)
             .copied()
             .ok_or_else(|| JsonSchemaCompileError::DanglingRef(ref_str.to_string()))
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // const
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Compile `{"const": <value>}` as a single-alternative literal grammar —
+    /// equivalent to a one-element `enum`. Supports the same value kinds as
+    /// `enum` (string, integer, boolean, null); floats/arrays/objects are
+    /// rejected via [`json_value_to_literal`]'s `UnsupportedKeyword` error,
+    /// consistent with `enum`'s own limitations.
+    fn compile_const(
+        &mut self,
+        const_val: &Value,
+    ) -> Result<NonTerminalId, JsonSchemaCompileError> {
+        let literal = json_value_to_literal(const_val)?;
+        let const_nt = self.grammar.alloc_nt("__const");
+        self.grammar
+            .add_rule(Rule::new(const_nt, vec![Symbol::Terminal(literal)]));
+        Ok(const_nt)
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -744,13 +794,37 @@ impl Compiler {
 
     /// Compile `{"type":"object","properties":{...},"required":[...]}`.
     ///
-    /// In v1, only required properties are included in the grammar body.
-    /// Optional properties are silently omitted when `additionalProperties: false`.
+    /// Both required *and* optional properties are represented in the
+    /// generated grammar: every key in `properties` may appear in the
+    /// output, but only keys listed in `required` are mandatory. Properties
+    /// are emitted in the canonical order given by iterating `properties`
+    /// (a `serde_json::Map`, which — absent the `preserve_order` cargo
+    /// feature — iterates in sorted-key order), independent of the order
+    /// keys appear in `required`.
     ///
-    /// The grammar shape (for required props `[p1, p2]`) is:
+    /// Unlisted ("additional") properties are never emitted regardless of
+    /// `additionalProperties`'s value — this compiler has no way to express
+    /// "any extra key" in a finite grammar, so in effect only
+    /// `additionalProperties: false` is *exactly* honored; `true` (or
+    /// omitted, the JSON Schema default) is honored as far as it can be
+    /// (listed properties may appear) but does not allow unlisted keys.
+    ///
+    /// # Grammar shape
+    ///
+    /// For properties `[p0 (required), p1 (optional), p2 (required)]`, the
+    /// grammar is built as a right-recursive "tail" chain threading two
+    /// pieces of state through each position: which property comes next,
+    /// and whether a leading `,` is needed (i.e. whether anything has been
+    /// emitted so far). Each *optional* property contributes a skip/include
+    /// alternative; each *required* property contributes only the include
+    /// alternative. Conceptually (not the literal NT structure) this compiles
+    /// to the same language as:
     /// ```text
-    /// <obj> ::= '{' '"p1"' ':' <S1> ',' '"p2"' ':' <S2> '}'
-    ///         | '{' '}'        ← only when there are no required properties
+    /// <obj> ::= '{' <p0> ',' <p1>? ',' <p2> '}'      (schematic; comma
+    ///                                                  placement is exact
+    ///                                                  around whichever
+    ///                                                  optional properties
+    ///                                                  are actually present)
     /// ```
     fn compile_object_type(
         &mut self,
@@ -783,11 +857,19 @@ impl Compiler {
             })
             .unwrap_or_default();
 
-        // Only compile required properties in v1.
+        // Every name in `required` must actually be declared in `properties`.
+        for name in &required {
+            if !properties.contains_key(name) {
+                return Err(JsonSchemaCompileError::InvalidSchema(format!(
+                    "required property '{name}' not found in 'properties'"
+                )));
+            }
+        }
+
         let obj_nt = self.grammar.alloc_nt("__object");
 
-        if required.is_empty() {
-            // Empty object: `{}`
+        if properties.is_empty() {
+            // No properties declared at all: only `{}`.
             self.grammar.add_rule(Rule::new(
                 obj_nt,
                 vec![Symbol::Terminal(vec![b'{']), Symbol::Terminal(vec![b'}'])],
@@ -795,38 +877,112 @@ impl Compiler {
             return Ok(obj_nt);
         }
 
-        // Compile the value NT for each required property.
-        // We must compile these before building the rule body to avoid
-        // borrow issues with self.grammar.
-        let mut prop_nts: Vec<(String, NonTerminalId)> = Vec::new();
-        for prop_name in &required {
-            let sub_schema = properties.get(prop_name).ok_or_else(|| {
-                JsonSchemaCompileError::InvalidSchema(format!(
-                    "required property '{prop_name}' not found in 'properties'"
-                ))
-            })?;
+        let required_set: std::collections::HashSet<&str> =
+            required.iter().map(|s| s.as_str()).collect();
+
+        // Compile the value NT for every declared property (required and
+        // optional alike) before building the tail chain, to avoid borrow
+        // conflicts with `self.grammar`.
+        let mut entries: Vec<(String, NonTerminalId, bool)> = Vec::with_capacity(properties.len());
+        for (prop_name, sub_schema) in properties.iter() {
             let val_nt = self.compile_schema(sub_schema, depth + 1)?;
-            prop_nts.push((prop_name.clone(), val_nt));
+            let is_required = required_set.contains(prop_name.as_str());
+            entries.push((prop_name.clone(), val_nt, is_required));
         }
 
-        // Build the rule body:
-        // '{' key0 ':' <val0> ',' key1 ':' <val1> ... '}'
-        let mut body: Vec<Symbol> = Vec::new();
-        body.push(Symbol::Terminal(vec![b'{']));
+        // ── Build the tail chain, from the last property backward ──────────
+        //
+        // Two NTs per position: `tail_false` is entered when nothing has
+        // been emitted yet at this point in the chain (no leading comma
+        // needed if the next thing emitted is a property); `tail_true` is
+        // entered when something was already emitted earlier (a leading
+        // comma is needed before the next emitted property, if any).
+        //
+        // A shared epsilon NT terminates both chains: once we run out of
+        // properties, nothing more is emitted regardless of which flavor of
+        // tail we are in.
+        let empty_tail_nt = self.grammar.alloc_nt("__object_tail_end");
+        self.grammar.add_rule(Rule::new(empty_tail_nt, Vec::new()));
 
-        for (i, (prop_name, val_nt)) in prop_nts.iter().enumerate() {
-            if i > 0 {
-                body.push(Symbol::Terminal(vec![b',']));
-            }
-            // Property key as a JSON string literal: '"propname"'
+        let mut tail_false = empty_tail_nt;
+        let mut tail_true = empty_tail_nt;
+
+        for (prop_name, val_nt, is_required) in entries.iter().rev() {
             let key_bytes = json_string_literal_bytes(prop_name);
-            body.push(Symbol::Terminal(key_bytes));
-            body.push(Symbol::Terminal(vec![b':']));
-            body.push(Symbol::NonTerminal(*val_nt));
+
+            let pos_false = self
+                .grammar
+                .alloc_nt(format!("__object_tail_{prop_name}_nc"));
+            let pos_true = self
+                .grammar
+                .alloc_nt(format!("__object_tail_{prop_name}_c"));
+
+            if *is_required {
+                // Mandatory: exactly one alternative per comma flavor —
+                // the property must be emitted.
+                self.grammar.add_rule(Rule::new(
+                    pos_false,
+                    vec![
+                        Symbol::Terminal(key_bytes.clone()),
+                        Symbol::Terminal(vec![b':']),
+                        Symbol::NonTerminal(*val_nt),
+                        Symbol::NonTerminal(tail_true),
+                    ],
+                ));
+                self.grammar.add_rule(Rule::new(
+                    pos_true,
+                    vec![
+                        Symbol::Terminal(vec![b',']),
+                        Symbol::Terminal(key_bytes),
+                        Symbol::Terminal(vec![b':']),
+                        Symbol::NonTerminal(*val_nt),
+                        Symbol::NonTerminal(tail_true),
+                    ],
+                ));
+            } else {
+                // Optional: either skip straight to the next position
+                // (same comma flavor, since nothing new was emitted here),
+                // or emit this property and continue with "a comma is now
+                // needed" for whatever follows.
+                self.grammar
+                    .add_rule(Rule::new(pos_false, vec![Symbol::NonTerminal(tail_false)]));
+                self.grammar.add_rule(Rule::new(
+                    pos_false,
+                    vec![
+                        Symbol::Terminal(key_bytes.clone()),
+                        Symbol::Terminal(vec![b':']),
+                        Symbol::NonTerminal(*val_nt),
+                        Symbol::NonTerminal(tail_true),
+                    ],
+                ));
+
+                self.grammar
+                    .add_rule(Rule::new(pos_true, vec![Symbol::NonTerminal(tail_true)]));
+                self.grammar.add_rule(Rule::new(
+                    pos_true,
+                    vec![
+                        Symbol::Terminal(vec![b',']),
+                        Symbol::Terminal(key_bytes),
+                        Symbol::Terminal(vec![b':']),
+                        Symbol::NonTerminal(*val_nt),
+                        Symbol::NonTerminal(tail_true),
+                    ],
+                ));
+            }
+
+            tail_false = pos_false;
+            tail_true = pos_true;
         }
 
-        body.push(Symbol::Terminal(vec![b'}']));
-        self.grammar.add_rule(Rule::new(obj_nt, body));
+        // __object ::= '{' <tail starting at position 0, no comma needed> '}'
+        self.grammar.add_rule(Rule::new(
+            obj_nt,
+            vec![
+                Symbol::Terminal(vec![b'{']),
+                Symbol::NonTerminal(tail_false),
+                Symbol::Terminal(vec![b'}']),
+            ],
+        ));
 
         Ok(obj_nt)
     }
@@ -994,5 +1150,219 @@ mod tests {
     fn json_string_literal_bytes_simple() {
         let b = json_string_literal_bytes("name");
         assert_eq!(b, br#""name""#);
+    }
+
+    // ── Helpers for Earley round-trip tests ─────────────────────────────────
+
+    fn recognizer_from(schema_json: &str) -> crate::grammar::EarleyRecognizer {
+        let mut g = compile_json_schema_str(schema_json).expect("schema must compile");
+        g.normalise_terminals();
+        crate::grammar::EarleyRecognizer::new(std::sync::Arc::new(g))
+    }
+
+    fn feed(rec: &mut crate::grammar::EarleyRecognizer, s: &str) -> bool {
+        for b in s.bytes() {
+            if !rec.feed_byte(b) {
+                return false;
+            }
+        }
+        true
+    }
+
+    // ── const (issue #32) ────────────────────────────────────────────────────
+
+    #[test]
+    fn compile_const_string_accepts_exact_value() {
+        let mut rec = recognizer_from(r#"{"const":"active"}"#);
+        assert!(feed(&mut rec, r#""active""#));
+        assert!(rec.is_accepting());
+    }
+
+    #[test]
+    fn compile_const_string_rejects_other_values() {
+        let mut rec = recognizer_from(r#"{"const":"active"}"#);
+        let ok = feed(&mut rec, r#""inactive""#);
+        assert!(
+            !ok || !rec.is_accepting(),
+            "\"inactive\" must not match const \"active\""
+        );
+    }
+
+    #[test]
+    fn compile_const_integer_round_trips() {
+        let mut rec = recognizer_from(r#"{"const":7}"#);
+        assert!(feed(&mut rec, "7"));
+        assert!(rec.is_accepting());
+
+        let mut rec_bad = recognizer_from(r#"{"const":7}"#);
+        let ok = feed(&mut rec_bad, "8");
+        assert!(!ok || !rec_bad.is_accepting(), "8 must not match const 7");
+    }
+
+    #[test]
+    fn compile_const_bool_and_null() {
+        let mut rec_true = recognizer_from(r#"{"const":true}"#);
+        assert!(feed(&mut rec_true, "true"));
+        assert!(rec_true.is_accepting());
+
+        let mut rec_null = recognizer_from(r#"{"const":null}"#);
+        assert!(feed(&mut rec_null, "null"));
+        assert!(rec_null.is_accepting());
+    }
+
+    #[test]
+    fn compile_const_ignores_no_other_alternatives() {
+        // const restricts to exactly one literal — no other values (even
+        // ones matching a sibling "type") should be reachable.
+        let g = compile_json_schema_str(r#"{"type":"string","const":"ok"}"#)
+            .expect("const with sibling type should compile");
+        // Exactly one alternative on the start NT (the const literal).
+        let start_rules: Vec<_> = g.rules_for(g.start()).collect();
+        assert_eq!(
+            start_rules.len(),
+            1,
+            "const must produce exactly one grammar alternative"
+        );
+    }
+
+    // ── minimum/maximum now honestly rejected (issue #32) ────────────────────
+
+    #[test]
+    fn minimum_keyword_is_unsupported() {
+        let err = compile_json_schema_str(r#"{"type":"integer","minimum":0}"#)
+            .expect_err("'minimum' must be rejected, not silently dropped");
+        assert!(
+            matches!(err, JsonSchemaCompileError::UnsupportedKeyword(ref kw) if kw == "minimum"),
+            "expected UnsupportedKeyword(\"minimum\"), got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn maximum_keyword_is_unsupported() {
+        let err = compile_json_schema_str(r#"{"type":"integer","maximum":100}"#)
+            .expect_err("'maximum' must be rejected, not silently dropped");
+        assert!(
+            matches!(err, JsonSchemaCompileError::UnsupportedKeyword(ref kw) if kw == "maximum"),
+            "expected UnsupportedKeyword(\"maximum\"), got: {err:?}"
+        );
+    }
+
+    // ── optional object properties (issue #57) ───────────────────────────────
+
+    #[test]
+    fn compile_object_optional_property_can_be_omitted() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer"}
+            },
+            "required": ["name"]
+        }"#;
+        let mut rec = recognizer_from(schema);
+        // Optional "age" omitted entirely — must still be accepted.
+        assert!(feed(&mut rec, r#"{"name":"Ann"}"#));
+        assert!(rec.is_accepting());
+    }
+
+    #[test]
+    fn compile_object_optional_property_can_be_present() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer"}
+            },
+            "required": ["name"]
+        }"#;
+        let mut rec = recognizer_from(schema);
+        // Optional "age" present alongside required "name" — also valid.
+        // Property order follows the compiler's canonical (sorted-key) order,
+        // which for {"age", "name"} is "age" before "name".
+        assert!(feed(&mut rec, r#"{"age":30,"name":"Ann"}"#));
+        assert!(rec.is_accepting());
+    }
+
+    #[test]
+    fn compile_object_missing_required_property_is_rejected() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer"}
+            },
+            "required": ["name"]
+        }"#;
+        // Only the optional property present, required "name" missing.
+        let mut rec = recognizer_from(schema);
+        let ok = feed(&mut rec, r#"{"age":30}"#);
+        assert!(
+            !ok || !rec.is_accepting(),
+            "object missing required 'name' must not be accepted"
+        );
+    }
+
+    #[test]
+    fn compile_object_all_optional_permits_empty_object() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "nickname": {"type": "string"}
+            }
+        }"#;
+        let mut rec = recognizer_from(schema);
+        assert!(feed(&mut rec, "{}"));
+        assert!(rec.is_accepting());
+    }
+
+    #[test]
+    fn compile_object_all_optional_permits_property_present() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "nickname": {"type": "string"}
+            }
+        }"#;
+        let mut rec = recognizer_from(schema);
+        assert!(feed(&mut rec, r#"{"nickname":"Bo"}"#));
+        assert!(rec.is_accepting());
+    }
+
+    #[test]
+    fn compile_object_three_properties_mixed_required_optional() {
+        // required: "id"; optional: "email", "phone".
+        // Canonical (sorted-key) order: email, id, phone.
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer"},
+                "email": {"type": "string"},
+                "phone": {"type": "string"}
+            },
+            "required": ["id"]
+        }"#;
+
+        // Only required property present.
+        let mut rec_min = recognizer_from(schema);
+        assert!(feed(&mut rec_min, r#"{"id":1}"#));
+        assert!(rec_min.is_accepting());
+
+        // Required + first optional (in canonical order).
+        let mut rec_email = recognizer_from(schema);
+        assert!(feed(&mut rec_email, r#"{"email":"a@b.com","id":1}"#));
+        assert!(rec_email.is_accepting());
+
+        // Required + second optional (in canonical order).
+        let mut rec_phone = recognizer_from(schema);
+        assert!(feed(&mut rec_phone, r#"{"id":1,"phone":"555"}"#));
+        assert!(rec_phone.is_accepting());
+
+        // All three present, in canonical order.
+        let mut rec_all = recognizer_from(schema);
+        assert!(feed(
+            &mut rec_all,
+            r#"{"email":"a@b.com","id":1,"phone":"555"}"#
+        ));
+        assert!(rec_all.is_accepting());
     }
 }

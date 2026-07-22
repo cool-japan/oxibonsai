@@ -140,6 +140,35 @@ impl<'a> BonsaiModel<'a> {
         if n_layers == 0 {
             return Err("no blocks".into());
         }
+        // Context-length guard: prevents an out-of-bounds RoPE slice panic on
+        // prompts longer than the context (mirrors `forward()`).  On overflow
+        // `forward_prefill` falls back to the sequential per-token path, whose
+        // `forward()` returns a clean SequenceTooLong error rather than panicking.
+        if pos_start + batch_size > self.kv_cache.max_seq_len() {
+            return Err(format!(
+                "FP8 prefill sequence too long: {batch_size} tokens at pos {pos_start} exceeds max_seq_len {}",
+                self.kv_cache.max_seq_len()
+            )
+            .into());
+        }
+        // SPLIT-CACHE GUARD (disabled by default).
+        //
+        // FP8 E4M3/E5M2 DECODE runs CPU attention over `self.kv_cache` (the
+        // per-token FP8 path dispatches through `self.forward`), but this GPU
+        // batch-prefill path writes a GPU-private KV cache (`acquire_fp8_kv_cache`
+        // in `cuda_fp8_prefill.rs`, backed by the module-level `FP8_PREFILL_STATE`
+        // singleton) that is never synced back to the CPU cache.  A successful GPU
+        // prefill would therefore leave decode attending over all-zero prompt KV
+        // and silently corrupt generation.  Unlike the Q1/ternary path — whose
+        // prefill and decode now share one GPU KV cache — there is no safe handoff
+        // here without a GPU→CPU KV read-back, so the path is disabled and
+        // `forward_prefill` falls back to the bit-correct sequential per-token path
+        // (which populates `self.kv_cache`).  Set
+        // `OXIBONSAI_FORCE_CUDA_SPLIT_PREFILL=1` to force the (decode-incorrect)
+        // GPU path for throughput microbenchmarks only.
+        if std::env::var_os("OXIBONSAI_FORCE_CUDA_SPLIT_PREFILL").is_none() {
+            return Err("FP8 CUDA batch prefill disabled (GPU-private KV cache not read by CPU decode); using sequential fallback".into());
+        }
         let eps = self.blocks[0].attn_norm_eps();
         let h = self.config.hidden_size;
         let inter = self.config.intermediate_size;
@@ -305,6 +334,22 @@ impl<'a> BonsaiModel<'a> {
         let n_layers = self.blocks.len();
         if n_layers == 0 {
             return Err("no blocks".into());
+        }
+        // Context-length guard: prevents an out-of-bounds RoPE slice panic on
+        // prompts longer than the context (mirrors `forward()`).
+        if pos_start + batch_size > self.kv_cache.max_seq_len() {
+            return Err(format!(
+                "FP8 prefill-verify sequence too long: {batch_size} tokens at pos {pos_start} exceeds max_seq_len {}",
+                self.kv_cache.max_seq_len()
+            )
+            .into());
+        }
+        // SPLIT-CACHE GUARD (disabled by default) — see
+        // `try_cuda_prefill_with_lm_head_fp8`.  The GPU-private KV cache this path
+        // writes is not the CPU `self.kv_cache` that decode reads, so it is disabled
+        // by default and the caller falls back to the sequential path.
+        if std::env::var_os("OXIBONSAI_FORCE_CUDA_SPLIT_PREFILL").is_none() {
+            return Err("FP8 CUDA batch prefill verify disabled (GPU-private KV cache not read by CPU decode); using sequential fallback".into());
         }
         let eps = self.blocks[0].attn_norm_eps();
         let h = self.config.hidden_size;

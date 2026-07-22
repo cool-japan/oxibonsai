@@ -60,7 +60,11 @@ mod server_tests {
     // ── Models endpoint ───────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_models_endpoint_returns_bonsai_8b() {
+    async fn test_models_endpoint_reports_loaded_model() {
+        // `/v1/models` reports the *actually-loaded* model, reading its `id`
+        // from the engine's real configuration — never a hard-coded literal.
+        // `make_server` loads `Qwen3Config::tiny_test()`, whose `model_name` is
+        // `"Bonsai-Tiny-Test"`, so that is the id the endpoint must return.
         let app = make_server();
         let req = Request::builder()
             .method(Method::GET)
@@ -72,12 +76,18 @@ mod server_tests {
         assert_eq!(resp.status(), StatusCode::OK, "/v1/models must return 200");
 
         let json = body_json(resp.into_body()).await;
+        assert_eq!(
+            json["object"].as_str(),
+            Some("list"),
+            "object must be 'list'"
+        );
         let models = json["data"].as_array().expect("data must be an array");
         let ids: Vec<&str> = models.iter().filter_map(|m| m["id"].as_str()).collect();
 
+        let expected = Qwen3Config::tiny_test().model_name;
         assert!(
-            ids.contains(&"bonsai-8b"),
-            "models list must include bonsai-8b; got: {ids:?}"
+            ids.contains(&expected.as_str()),
+            "models list must report the loaded model {expected:?}; got: {ids:?}"
         );
     }
 

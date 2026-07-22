@@ -18,8 +18,12 @@ use std::collections::HashSet;
 use tracing::debug;
 
 use crate::{
-    bpe::{bpe_encode, byte_fallback_id, pretokenize, BpeMerges},
+    bpe::{
+        bpe_encode, bpe_encode_bytelevel, byte_fallback_id, pretokenize, pretokenize_gpt2,
+        BpeMerges,
+    },
     error::{TokenizerError, TokenizerResult},
+    hf_format::bytes_to_unicode_map,
     vocab::Vocabulary,
 };
 
@@ -90,6 +94,17 @@ pub struct OxiTokenizer {
     config: TokenizerConfig,
     /// The set of special token IDs for quick membership tests.
     special_ids: HashSet<u32>,
+    /// Registered special/added-token strings (e.g. `<|im_start|>`) paired with
+    /// their trained IDs, sorted by **descending byte length** so that the
+    /// left-most **longest** match wins during the pre-split.
+    ///
+    /// These substrings are carved out of the input atomically before any
+    /// model-specific segmentation runs, so chat-template markers map to their
+    /// trained IDs instead of being shredded into UNK by pre-tokenization.
+    special_pieces: Vec<(String, u32)>,
+    /// GPT-2 byte→unicode table, precomputed once so the ByteLevel encode path
+    /// does not rebuild the 256-entry map for every byte.
+    byte_to_unicode: [char; 256],
     /// Optional Unigram vocabulary for Viterbi-based segmentation.
     ///
     /// When `Some`, the tokenizer dispatches to Unigram encoding instead of
@@ -110,11 +125,14 @@ impl OxiTokenizer {
     /// encoding.
     pub fn new(vocab: Vocabulary, merges: BpeMerges, config: TokenizerConfig) -> Self {
         let special_ids = build_special_ids(&config);
+        let special_pieces = build_special_pieces(&vocab);
         Self {
             vocab,
             merges,
             config,
             special_ids,
+            special_pieces,
+            byte_to_unicode: bytes_to_unicode_map(),
             unigram: None,
             wordpiece: None,
         }
@@ -131,11 +149,14 @@ impl OxiTokenizer {
         config: TokenizerConfig,
     ) -> Self {
         let special_ids = build_special_ids(&config);
+        let special_pieces = build_special_pieces(&vocab);
         Self {
             vocab,
             merges: BpeMerges::new(),
             config,
             special_ids,
+            special_pieces,
+            byte_to_unicode: bytes_to_unicode_map(),
             unigram: Some(unigram_vocab),
             wordpiece: None,
         }
@@ -153,11 +174,14 @@ impl OxiTokenizer {
         config: TokenizerConfig,
     ) -> Self {
         let special_ids = build_special_ids(&config);
+        let special_pieces = build_special_pieces(&vocab);
         Self {
             vocab,
             merges: BpeMerges::new(),
             config,
             special_ids,
+            special_pieces,
+            byte_to_unicode: bytes_to_unicode_map(),
             unigram: None,
             wordpiece: Some(wordpiece_vocab),
         }
@@ -176,10 +200,13 @@ impl OxiTokenizer {
     /// Encode a single text string into a sequence of token IDs.
     ///
     /// Steps:
-    /// 1. Pre-tokenize into words.
-    /// 2. Encode each word via Unigram Viterbi (if attached) or BPE.
-    /// 3. Optionally prepend BOS and append EOS.
-    /// 4. Optionally truncate to `config.max_length`.
+    /// 1. Carve out any registered special/added tokens (e.g. `<|im_start|>`)
+    ///    as atomic IDs, so chat-template markers are not shredded by generic
+    ///    pre-tokenization.
+    /// 2. Pre-tokenize each remaining segment into words.
+    /// 3. Encode each word via WordPiece, Unigram Viterbi, or BPE.
+    /// 4. Optionally prepend BOS and append EOS.
+    /// 5. Optionally truncate to `config.max_length`.
     pub fn encode(&self, text: &str) -> TokenizerResult<Vec<u32>> {
         debug!(text_len = text.len(), "encoding text");
 
@@ -189,34 +216,7 @@ impl OxiTokenizer {
             ids.push(self.config.bos_token_id);
         }
 
-        if let Some(wp) = &self.wordpiece {
-            // WordPiece path: greedy longest-match-first segmentation of the
-            // full text (the WordPieceVocab splits on whitespace internally).
-            let wp_ids = wp.encode(text);
-            ids.extend_from_slice(&wp_ids);
-        } else {
-            let words = pretokenize(text);
-            for word in &words {
-                if let Some(unigram) = &self.unigram {
-                    // Unigram path: Viterbi segmentation directly on the word.
-                    let word_ids = unigram.encode(word);
-                    ids.extend_from_slice(&word_ids);
-                } else {
-                    // BPE path: apply merge table.
-                    let word_ids = bpe_encode(word, &self.vocab, &self.merges);
-                    if word_ids.is_empty() {
-                        // Byte-fallback path: encode each UTF-8 byte explicitly.
-                        for byte in word.as_bytes() {
-                            let fallback = byte_fallback_id(*byte);
-                            let fallback_id = self.vocab.get_id(&fallback);
-                            ids.push(fallback_id.unwrap_or(self.config.unk_token_id));
-                        }
-                    } else {
-                        ids.extend_from_slice(&word_ids);
-                    }
-                }
-            }
-        }
+        self.encode_with_special_tokens(text, &mut ids);
 
         if self.config.add_eos {
             ids.push(self.config.eos_token_id);
@@ -228,6 +228,116 @@ impl OxiTokenizer {
         }
 
         Ok(ids)
+    }
+
+    /// Split `text` on registered special/added tokens (longest-match-first)
+    /// and encode the non-special segments with the active model path.
+    ///
+    /// Special tokens are emitted verbatim as their trained IDs; only the
+    /// segments *between* them are handed to the pre-tokenizer / BPE / Unigram /
+    /// WordPiece encoder.  When no special tokens are registered this collapses
+    /// to a single call on the whole input.
+    fn encode_with_special_tokens(&self, text: &str, ids: &mut Vec<u32>) {
+        if self.special_pieces.is_empty() {
+            self.encode_segment(text, ids);
+            return;
+        }
+
+        let mut rest = text;
+        while !rest.is_empty() {
+            match self.find_leftmost_special(rest) {
+                Some((start, len, special_id)) => {
+                    if start > 0 {
+                        self.encode_segment(&rest[..start], ids);
+                    }
+                    ids.push(special_id);
+                    rest = &rest[start + len..];
+                }
+                None => {
+                    self.encode_segment(rest, ids);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Find the left-most (and, at a tie, longest) registered special token in
+    /// `hay`, returning `(byte_start, byte_len, id)`.
+    fn find_leftmost_special(&self, hay: &str) -> Option<(usize, usize, u32)> {
+        let mut best: Option<(usize, usize, u32)> = None;
+        for (piece, id) in &self.special_pieces {
+            if let Some(pos) = hay.find(piece.as_str()) {
+                let len = piece.len();
+                let better = match best {
+                    None => true,
+                    Some((best_start, best_len, _)) => {
+                        pos < best_start || (pos == best_start && len > best_len)
+                    }
+                };
+                if better {
+                    best = Some((pos, len, *id));
+                }
+            }
+        }
+        best
+    }
+
+    /// Encode a single non-special segment with the active model path.
+    fn encode_segment(&self, text: &str, ids: &mut Vec<u32>) {
+        if text.is_empty() {
+            return;
+        }
+
+        if let Some(wp) = &self.wordpiece {
+            // WordPiece path: greedy longest-match-first segmentation of the
+            // full text (the WordPieceVocab splits on whitespace internally).
+            ids.extend_from_slice(&wp.encode(text));
+        } else if let Some(unigram) = &self.unigram {
+            // Unigram / SentencePiece path: Viterbi segmentation on the
+            // *full* text without any GPT-2-style pretokenisation.
+            //
+            // SentencePiece callers (e.g. GemmaTokenizer) perform their own
+            // ▁-normalisation before calling `encode`; splitting on whitespace
+            // would silently discard newlines and other control characters that
+            // have explicit vocabulary entries (e.g. token 107 = `\n`).
+            ids.extend_from_slice(&unigram.encode(text));
+        } else if self.config.byte_level_decode {
+            // ByteLevel BPE path (GPT-2 / Qwen3 / Llama-3): whitespace-preserving
+            // pre-tokenization, then remap every UTF-8 byte through the GPT-2
+            // bytes→unicode table before running the merge table.  This is the
+            // only path that correctly encodes non-ASCII text (CJK, emoji,
+            // accented Latin) and non-space whitespace (tabs, newlines, repeated
+            // spaces) against a byte-level vocabulary.
+            for piece in pretokenize_gpt2(text) {
+                let mut byte_level = String::with_capacity(piece.len());
+                for &byte in piece.as_bytes() {
+                    byte_level.push(self.byte_to_unicode[byte as usize]);
+                }
+                let piece_ids = bpe_encode_bytelevel(
+                    &byte_level,
+                    &self.vocab,
+                    &self.merges,
+                    self.config.unk_token_id,
+                );
+                ids.extend_from_slice(&piece_ids);
+            }
+        } else {
+            // Legacy (non-byte-level) BPE path: GPT-2-lookalike pretokenisation
+            // + merge-table encoding with `<0xHH>` byte fallback.
+            for word in &pretokenize(text) {
+                let word_ids = bpe_encode(word, &self.vocab, &self.merges);
+                if word_ids.is_empty() {
+                    // Byte-fallback path: encode each UTF-8 byte explicitly.
+                    for byte in word.as_bytes() {
+                        let fallback = byte_fallback_id(*byte);
+                        let fallback_id = self.vocab.get_id(&fallback);
+                        ids.push(fallback_id.unwrap_or(self.config.unk_token_id));
+                    }
+                } else {
+                    ids.extend_from_slice(&word_ids);
+                }
+            }
+        }
     }
 
     /// Encode a batch of texts in sequence (returns one `Vec<u32>` per input).
@@ -481,6 +591,28 @@ fn build_special_ids(config: &TokenizerConfig) -> HashSet<u32> {
     set.insert(config.unk_token_id);
     set.insert(config.pad_token_id);
     set
+}
+
+/// Build the ordered list of atomically-protected token substrings used by
+/// the encoder to carve out added tokens (e.g. `<|im_start|>`,
+/// `<tool_call>`, `<|fim_prefix|>`) before segmentation.
+///
+/// Draws from [`Vocabulary::protected_tokens`] — the union of `special ==
+/// true` tokens and non-special `added_tokens` — matching HuggingFace's
+/// `AddedVocabulary` semantics where *every* added token is protected from
+/// pre-tokenization, not just the ones flagged `special`.
+///
+/// The list is sorted by **descending byte length** so that a longest-match
+/// wins when two protected tokens share a common prefix.
+fn build_special_pieces(vocab: &Vocabulary) -> Vec<(String, u32)> {
+    let mut pieces: Vec<(String, u32)> = vocab
+        .protected_tokens()
+        .filter(|(tok, _)| !tok.is_empty())
+        .map(|(tok, id)| (tok.to_owned(), id))
+        .collect();
+    // Longest first; ties broken by token string for deterministic ordering.
+    pieces.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
+    pieces
 }
 
 /// Parse a byte-fallback token like `<0x41>` and return the byte value.

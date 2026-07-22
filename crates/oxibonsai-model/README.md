@@ -7,8 +7,8 @@ Implements the full autoregressive forward pass for the Qwen3 architecture famil
 embedding, Grouped Query Attention with RoPE, SwiGLU MLP, RMSNorm, paged
 KV-cache, and Metal/CUDA full-forward integration via `oxibonsai-kernels`.
 
-**Status:** Stable — 673 tests passing (`cargo nextest run -p oxibonsai-model`)
-**Version:** 0.2.2
+**Status:** Stable — 1,209 tests passing (`cargo nextest run -p oxibonsai-model`)
+**Version:** 0.2.3
 
 Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 
@@ -19,7 +19,7 @@ Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 - `TransformerBlock` — attention sublayer + SwiGLU FFN sublayer with residual connections (`block/`)
 - RMSNorm, RoPE (base=1M), Grouped Query Attention (32 Q / 8 KV heads, head_dim=128)
 - SwiGLU FFN (gate/up → SiLU × gate → down projection)
-- `CausalMask` and sliding-window attention
+- `CausalMask` — causal attention masking
 
 ### Model Variants & Registry
 - `ModelVariant::Bonsai{8B, 4B, 1_7B}` — Q1_0_g128 1-bit weights
@@ -32,6 +32,7 @@ Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 - GGUF loader with tensor-name mapping (`gguf_loader.rs`, `convert/name_map.rs`)
 - Q1 loader path via `oxibonsai-kernels` blocks
 - `LinearTernary` layer + `load_ternary_blocks` + `load_ternary_embedding` + `OutputWeight::Ternary` (TQ2)
+- Q4_0/Q8_0 (standard GGUF) + K-quant (Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K) weight loading — `LinearQ4_0`/`LinearQ8_0` (`layers/linear_standard.rs`), `LinearQ2K`/`LinearQ3K`/`LinearQ4K`/`LinearQ5K`/`LinearQ6K`/`LinearQ8K` (`layers/linear_kquant_full.rs`, `layers/linear_kquant_ext.rs`); `forward()` tries the native-CUDA / Metal GEMV kernel first (via `oxibonsai-kernels`), then falls back to CPU
 - Safetensors loading support
 
 ### KV Cache
@@ -48,6 +49,7 @@ Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 - Sparse attention: local window, BigBird, Longformer, dilated (`sparse_attention.rs`)
 - ALiBi and YaRN RoPE variants
 - RoPE scaling: YaRN, linear, DynamicNTK, LLaMA 3.1, LongRoPE
+- Sliding-window attention (`layers/sliding_window.rs`)
 
 ### Training & Fine-tuning Utilities
 - LoRA + LoRA trainer (`lora.rs`, `lora_trainer.rs`)
@@ -85,7 +87,7 @@ Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 
 ```toml
 [dependencies]
-oxibonsai-model = "0.2.2"
+oxibonsai-model = "0.2.3"
 ```
 
 ## License

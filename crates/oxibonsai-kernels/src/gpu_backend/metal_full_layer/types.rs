@@ -199,31 +199,47 @@ impl FullLayerBuffers {
             && self.max_seq == max_seq
     }
 }
-/// Pre-cached GPU weight handles for the entire model.
-/// After initial creation, no weight data needs to be copied or uploaded.
-pub struct CachedModelWeights {
+/// Pre-cached GPU weight handles for a Q1 (1-bit) model.
+///
+/// After initial creation, no weight data needs to be copied or uploaded —
+/// [`try_metal_full_forward_cached`](super::functions_3::try_metal_full_forward_cached)
+/// dispatches straight from these handles.
+pub struct CachedQ1Weights {
     pub layers: Vec<CachedLayerWeights>,
     pub final_norm: Arc<MetalWeightHandle>,
     pub lm_head: Arc<MetalWeightHandle>,
-
-    // ── Ternary (TQ2_0_g128) cache fields ───────────────────────────────────
-    //
-    // These are populated only for ternary models. For Q1 models they remain
-    // empty/zero.  Layer params are NOT stored here (they borrow from these
-    // vecs); callers rebuild `FullForwardLayerParamsTernary` each decode call
-    // by referencing the slices below — cheap struct literals, no leaks.
-    //
-    // Handle ID allocation (distinct from the Q1 namespace):
-    //   norm    handles: 5_000_000 + layer * 10 + offset
-    //   weight  handles: 6_000_000 + layer * 10 + offset
-    //   lm_head handle : 7_000_000
-    pub ternary_qkv_concats: Vec<Vec<u8>>,
-    pub ternary_attn_proj_bytes: Vec<Vec<u8>>,
+}
+/// Pre-cached raw ternary (TQ2_0_g128) weight bytes for a ternary model.
+///
+/// Layer params are NOT stored here (they borrow from these vecs); callers
+/// rebuild `FullForwardLayerParamsTernary` each decode call by referencing the
+/// slices below — cheap struct literals, no leaks.
+///
+/// Handle ID allocation (distinct from the Q1 namespace):
+///   norm    handles: 5_000_000 + layer * 10 + offset
+///   weight  handles: 6_000_000 + layer * 10 + offset
+///   lm_head handle : 7_000_000
+pub struct CachedTernaryWeights {
+    pub qkv_concats: Vec<Vec<u8>>,
+    pub attn_proj_bytes: Vec<Vec<u8>>,
     /// Gate projection bytes per layer (separate from up, kernel concatenates lazily).
-    pub ternary_gate_bytes: Vec<Vec<u8>>,
+    pub gate_bytes: Vec<Vec<u8>>,
     /// Up projection bytes per layer.
-    pub ternary_up_bytes: Vec<Vec<u8>>,
-    pub ternary_down_bytes: Vec<Vec<u8>>,
-    pub ternary_lm_head_bytes: Vec<u8>,
-    pub ternary_lm_head_out_features: usize,
+    pub up_bytes: Vec<Vec<u8>>,
+    pub down_bytes: Vec<Vec<u8>>,
+    pub lm_head_bytes: Vec<u8>,
+    pub lm_head_out_features: usize,
+}
+/// Pre-cached GPU weights for the whole model — one variant per weight format.
+///
+/// The Q1 and ternary decode paths cache fundamentally different data
+/// (pre-uploaded GPU handles vs. raw re-referenced byte blobs), so each is its
+/// own variant rather than a single struct with half its fields perpetually
+/// unused.
+pub enum CachedModelWeights {
+    /// 1-bit (Q1_0_g128) cache: pre-uploaded per-layer + LM-head GPU handles.
+    Q1(CachedQ1Weights),
+    /// Ternary (TQ2_0_g128) cache: raw per-layer weight bytes, re-referenced
+    /// into `FullForwardLayerParamsTernary` on every decode step.
+    Ternary(CachedTernaryWeights),
 }

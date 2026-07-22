@@ -96,9 +96,33 @@ pub(super) fn load_f32_tensor(gguf: &GgufFile<'_>, name: &str) -> ModelResult<Ve
             BlockQ6K::dequant(blocks, &mut out).map_err(ModelError::Core)?;
             Ok(out)
         }
+        GgufTensorType::Q4_K => {
+            let blocks = BlockQ4K::slice_from_bytes(data).map_err(ModelError::Core)?;
+            let n = blocks.len() * 256;
+            let mut out = vec![0.0f32; n];
+            BlockQ4K::dequant(blocks, &mut out).map_err(ModelError::Core)?;
+            Ok(out)
+        }
+        GgufTensorType::F8_E4M3 => {
+            let blocks =
+                oxibonsai_core::BlockFP8E4M3::slice_from_bytes(data).map_err(ModelError::Core)?;
+            let n = blocks.len() * oxibonsai_core::quant_fp8::QK_FP8;
+            let mut out = vec![0.0f32; n];
+            oxibonsai_core::BlockFP8E4M3::dequant(blocks, &mut out).map_err(ModelError::Core)?;
+            Ok(out)
+        }
+        GgufTensorType::F8_E5M2 => {
+            let blocks =
+                oxibonsai_core::BlockFP8E5M2::slice_from_bytes(data).map_err(ModelError::Core)?;
+            let n = blocks.len() * oxibonsai_core::quant_fp8::QK_FP8;
+            let mut out = vec![0.0f32; n];
+            oxibonsai_core::BlockFP8E5M2::dequant(blocks, &mut out).map_err(ModelError::Core)?;
+            Ok(out)
+        }
         other => Err(ModelError::MissingTensor {
             name: format!(
-                "{name}: expected F32, F16, Q1_0_g128, TQ2_0_g128, Q4_0, Q8_0, Q5_K, or Q6_K, got {other}"
+                "{name}: expected F32, F16, Q1_0_g128, TQ2_0_g128, Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, \
+                 F8_E4M3, or F8_E5M2, got {other}"
             ),
         }),
     }
@@ -737,5 +761,123 @@ pub(super) fn load_output_weight<'a>(
         other => Err(ModelError::MissingTensor {
             name: format!("output.weight: unsupported type {other}"),
         }),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::export::{export_to_gguf, ExportConfig, ExportFormat, WeightTensor};
+
+    // Regression tests for a gap where `load_f32_tensor` (used to load
+    // TOKEN_EMBD / OUTPUT_NORM) could not dequantize Q4_K, F8_E4M3, or
+    // F8_E5M2 tensors, even though `export.rs`'s public `with_fp32_layers`
+    // override lets a caller quantize exactly those tensor names into those
+    // formats (by supplying an FP32-exception list that omits them). The
+    // export<->load pair must be closed under round-trip for every format
+    // `encode_tensor` can actually produce for these tensor names.
+
+    #[test]
+    fn load_f32_tensor_dequantizes_q4_k() {
+        let n = 512usize;
+        let data: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.05 - 12.8).sin()).collect();
+        let tensors = vec![WeightTensor::new(
+            "token_embd.weight",
+            data.clone(),
+            vec![n],
+        )];
+        // Empty fp32_layers list: token_embd.weight is NOT protected here, so
+        // it gets quantized to Q4_K like every other tensor under this format.
+        let config = ExportConfig::new(ExportFormat::Q4K, "m").with_fp32_layers(vec![]);
+        let bytes = export_to_gguf(&tensors, &config, &[]).expect("export Q4_K");
+
+        let gguf = GgufFile::parse(&bytes).expect("parse exported GGUF");
+        let loaded = load_f32_tensor(&gguf, "token_embd.weight")
+            .expect("load_f32_tensor should support Q4_K");
+        assert_eq!(loaded.len(), n);
+
+        let max_range = data.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let max_err = data
+            .iter()
+            .zip(loaded.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let threshold = (max_range * 0.08).max(0.1);
+        assert!(
+            max_err <= threshold,
+            "Q4_K roundtrip max error {max_err} > threshold {threshold}"
+        );
+    }
+
+    #[test]
+    fn load_f32_tensor_dequantizes_fp8_e4m3() {
+        let n = 64usize;
+        let data: Vec<f32> = (0..n).map(|i| (i as f32) * 0.1 - 3.2).collect();
+        let tensors = vec![WeightTensor::new(
+            "output_norm.weight",
+            data.clone(),
+            vec![n],
+        )];
+        let config = ExportConfig::new(ExportFormat::FP8E4M3, "m").with_fp32_layers(vec![]);
+        let bytes = export_to_gguf(&tensors, &config, &[]).expect("export FP8E4M3");
+
+        let gguf = GgufFile::parse(&bytes).expect("parse exported GGUF");
+        let loaded = load_f32_tensor(&gguf, "output_norm.weight")
+            .expect("load_f32_tensor should support F8_E4M3");
+        assert_eq!(loaded.len(), n);
+
+        let max_err = data
+            .iter()
+            .zip(loaded.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_err <= 0.5,
+            "FP8 E4M3 roundtrip max error {max_err} unexpectedly large"
+        );
+    }
+
+    #[test]
+    fn load_f32_tensor_dequantizes_fp8_e5m2() {
+        let n = 64usize;
+        let data: Vec<f32> = (0..n).map(|i| (i as f32) * 0.1 - 3.2).collect();
+        let tensors = vec![WeightTensor::new(
+            "output_norm.weight",
+            data.clone(),
+            vec![n],
+        )];
+        let config = ExportConfig::new(ExportFormat::FP8E5M2, "m").with_fp32_layers(vec![]);
+        let bytes = export_to_gguf(&tensors, &config, &[]).expect("export FP8E5M2");
+
+        let gguf = GgufFile::parse(&bytes).expect("parse exported GGUF");
+        let loaded = load_f32_tensor(&gguf, "output_norm.weight")
+            .expect("load_f32_tensor should support F8_E5M2");
+        assert_eq!(loaded.len(), n);
+    }
+
+    #[test]
+    fn load_f32_tensor_unsupported_type_still_errors_clearly() {
+        // A tensor type load_f32_tensor genuinely cannot handle (e.g. TQ2_0,
+        // the llama.cpp upstream ternary format, distinct from the
+        // TQ2_0_g128 PrismML extension this loader does support) must still
+        // produce a clear, honest error rather than panicking or silently
+        // misreading bytes.
+        let tensors = vec![WeightTensor::new(
+            "blk.0.attn_q.weight",
+            vec![1.0_f32; 256],
+            vec![256],
+        )];
+        let config = ExportConfig::new(ExportFormat::TernaryG128, "m");
+        let bytes = export_to_gguf(&tensors, &config, &[]).expect("export ternary");
+        let gguf = GgufFile::parse(&bytes).expect("parse exported GGUF");
+        // TQ2_0_g128 (the PrismML extension actually produced) IS supported;
+        // sanity-check the happy path still works alongside the new arms.
+        let loaded =
+            load_f32_tensor(&gguf, "blk.0.attn_q.weight").expect("TQ2_0_g128 should still load");
+        assert_eq!(loaded.len(), 256);
     }
 }

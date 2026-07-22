@@ -8,9 +8,16 @@
 //! ┌──────────────────┬──────────────────────────────────────────────────────┐
 //! │  2 bytes         │  16 bytes                                            │
 //! │  FP16 scale      │  128 sign bits (1 bit per weight)                   │
-//! │  = max(|w_i|)    │  bit=0 → +scale, bit=1 → −scale                     │
+//! │  = max(|w_i|)    │  bit=1 → +scale, bit=0 → −scale                     │
 //! └──────────────────┴──────────────────────────────────────────────────────┘
 //! ```
+//!
+//! This is the canonical Q1\_0\_g128 sign convention shared by every reader
+//! and kernel in the workspace: [`oxibonsai_core::tensor::BlockQ1_0G128`]
+//! (`w[i] = bit[i] ? +d : -d`), the CPU/CUDA/Metal GEMV and GEMM kernels in
+//! `oxibonsai-kernels`, and `oxibonsai-model`'s GGUF weight loaders. The
+//! encoder and decoder below MUST stay in lock-step with that convention —
+//! a mismatch silently negates every 1-bit weight after export→load.
 //!
 //! Total block size: **18 bytes** per 128 weights → ~1.125 bits/weight.
 
@@ -70,9 +77,13 @@ pub fn quantize_group(weights: &[f32]) -> [u8; BLOCK_BYTES] {
     block[1] = (scale_bits >> 8) as u8;
 
     // ── Encode sign bits ─────────────────────────────────────────────────
-    // bit = 0 → positive (≥ 0), bit = 1 → negative (< 0)
+    // bit = 1 → positive (≥ 0), bit = 0 → negative (< 0).
+    //
+    // This MUST match the canonical convention used by
+    // `oxibonsai_core::tensor::BlockQ1_0G128::weight` and every consumer of
+    // GGUF tensor type 41 (kernels, weight loaders) — see module docs.
     for (i, &w) in weights.iter().enumerate() {
-        if w < 0.0 {
+        if w >= 0.0 {
             let byte_idx = i / 8 + 2; // +2 to skip the scale bytes
             let bit_idx = i % 8;
             block[byte_idx] |= 1 << bit_idx;
@@ -92,7 +103,7 @@ pub fn dequantize_block(block: &[u8; BLOCK_BYTES]) -> [f32; GROUP_SIZE] {
         let byte_idx = i / 8 + 2;
         let bit_idx = i % 8;
         let sign_bit = (block[byte_idx] >> bit_idx) & 1;
-        *slot = if sign_bit == 0 { scale } else { -scale };
+        *slot = if sign_bit != 0 { scale } else { -scale };
     }
     out
 }
@@ -365,10 +376,10 @@ mod tests {
             "scale should be ~2.0, got {scale}"
         );
 
-        // index 1 is negative → bit 1 of byte 2 should be set
-        assert_ne!(block[2] & (1 << 1), 0, "weight[1] is negative");
-        // index 0 is positive → bit 0 of byte 2 should be clear
-        assert_eq!(block[2] & 1, 0, "weight[0] is positive");
+        // index 1 is negative → bit 1 of byte 2 should be clear
+        assert_eq!(block[2] & (1 << 1), 0, "weight[1] is negative");
+        // index 0 is positive → bit 0 of byte 2 should be set
+        assert_ne!(block[2] & 1, 0, "weight[0] is positive");
     }
 
     #[test]
@@ -376,9 +387,12 @@ mod tests {
         let weights = uniform_group(3.0);
         let block = quantize_group(&weights);
 
-        // All sign bits should be 0 (positive)
+        // All sign bits should be 1 (positive)
         for byte in &block[2..] {
-            assert_eq!(*byte, 0u8, "all sign bits should be 0 for positive weights");
+            assert_eq!(
+                *byte, 0xFFu8,
+                "all sign bits should be 1 for positive weights"
+            );
         }
     }
 
@@ -387,11 +401,11 @@ mod tests {
         let weights = uniform_group(-1.5);
         let block = quantize_group(&weights);
 
-        // All sign bits should be 1 (negative)
+        // All sign bits should be 0 (negative)
         for byte in &block[2..] {
             assert_eq!(
-                *byte, 0xFF,
-                "all sign bits should be 1 for negative weights"
+                *byte, 0x00,
+                "all sign bits should be 0 for negative weights"
             );
         }
     }

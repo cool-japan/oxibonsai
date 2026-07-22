@@ -25,14 +25,46 @@ impl RopeTable {
     /// - `max_seq_len`: Maximum sequence length to precompute.
     /// - `freq_base`: RoPE frequency base (default: 1000000.0 for Qwen3).
     pub fn new(head_dim: usize, max_seq_len: usize, freq_base: f32) -> Self {
+        Self::new_with_freqs(head_dim, max_seq_len, freq_base, &[])
+    }
+
+    /// Precompute RoPE rotation table with optional frequency scaling factors.
+    ///
+    /// Implements the `rope_freqs` / `freq_factors` pattern used by some models
+    /// (e.g. Gemma 4) to implement partial / NoPE (No Position Embedding) RoPE.
+    ///
+    /// The effective inverse frequency for dimension `i` is:
+    /// ```text
+    /// inv_freq[i] = (1 / freq_base^(2*i/head_dim)) / freq_factors[i]
+    /// ```
+    ///
+    /// When `freq_factors[i] = 1.0` the dimension behaves like standard RoPE.
+    /// When `freq_factors[i]` is very large (e.g. `1e30`) the inverse frequency
+    /// approaches zero, so the angle ≈ 0 for all positions → `cos ≈ 1, sin ≈ 0`
+    /// (identity rotation = no positional encoding for that dimension).
+    ///
+    /// - `freq_factors`: Per-dimension scaling factors of length `≥ half_dim`.
+    ///   Pass an empty slice to use standard RoPE (all factors = 1.0).
+    pub fn new_with_freqs(
+        head_dim: usize,
+        max_seq_len: usize,
+        freq_base: f32,
+        freq_factors: &[f32],
+    ) -> Self {
         let half_dim = head_dim / 2;
         let mut cos = vec![0.0f32; max_seq_len * half_dim];
         let mut sin = vec![0.0f32; max_seq_len * half_dim];
 
         for pos in 0..max_seq_len {
             for i in 0..half_dim {
-                let freq = 1.0 / freq_base.powf(2.0 * i as f32 / head_dim as f32);
-                let angle = pos as f32 * freq;
+                let base_inv_freq = 1.0 / freq_base.powf(2.0 * i as f32 / head_dim as f32);
+                // Apply freq_factor divisor if provided.
+                let inv_freq = if i < freq_factors.len() && freq_factors[i] > 1.0 {
+                    base_inv_freq / freq_factors[i]
+                } else {
+                    base_inv_freq
+                };
+                let angle = pos as f32 * inv_freq;
                 cos[pos * half_dim + i] = angle.cos();
                 sin[pos * half_dim + i] = angle.sin();
             }

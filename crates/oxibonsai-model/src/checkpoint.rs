@@ -216,6 +216,15 @@ impl Checkpoint {
     }
 
     /// Deserialise a checkpoint from `reader`.
+    ///
+    /// Length-prefixed fields (`num_tensors`, `metadata_len`, `name_len`,
+    /// `ndim`, `data_len`) are read from the untrusted stream but are never
+    /// used to eagerly pre-allocate more than `MAX_EAGER_CAPACITY`
+    /// elements/bytes of capacity up front — see `read_bytes_bounded` and
+    /// the bounded loops below. This turns a truncated or maliciously large
+    /// length field into an ordinary [`CheckpointError::TruncatedData`] once
+    /// the stream actually runs out, instead of an immediate multi-gigabyte
+    /// allocation attempt driven entirely by attacker-controlled input.
     pub fn read_from<R: Read>(reader: &mut R) -> Result<Self, CheckpointError> {
         // ── magic ──
         let mut magic = [0u8; 4];
@@ -238,36 +247,66 @@ impl Checkpoint {
 
         // ── metadata ──
         let meta_len = read_u32_le(reader)? as usize;
-        let mut meta_bytes = vec![0u8; meta_len];
-        read_exact(reader, &mut meta_bytes)?;
+        let meta_bytes = read_bytes_bounded(reader, meta_len)?;
         let meta_str = std::str::from_utf8(&meta_bytes)
             .map_err(|e| CheckpointError::MetadataParse(e.to_string()))?;
         let metadata = deserialize_metadata(meta_str)?;
 
         // ── tensors ──
-        let mut tensors = Vec::with_capacity(num_tensors);
+        let mut tensors = Vec::with_capacity(num_tensors.min(MAX_EAGER_CAPACITY));
         for _ in 0..num_tensors {
             // name
             let name_len = read_u32_le(reader)? as usize;
-            let mut name_bytes = vec![0u8; name_len];
-            read_exact(reader, &mut name_bytes)?;
+            let name_bytes = read_bytes_bounded(reader, name_len)?;
             let name = String::from_utf8(name_bytes)
                 .map_err(|e| CheckpointError::MetadataParse(e.to_string()))?;
 
             // shape
             let ndim = read_u32_le(reader)? as usize;
-            let mut shape = Vec::with_capacity(ndim);
+            let mut shape = Vec::with_capacity(ndim.min(MAX_EAGER_CAPACITY));
             for _ in 0..ndim {
                 shape.push(read_u64_le(reader)?);
             }
 
             // data
             let data_len = read_u64_le(reader)? as usize;
-            let mut data = Vec::with_capacity(data_len);
+            let mut data = Vec::with_capacity(data_len.min(MAX_EAGER_CAPACITY));
             for _ in 0..data_len {
                 let mut buf = [0u8; 4];
                 read_exact(reader, &mut buf)?;
                 data.push(f32::from_le_bytes(buf));
+            }
+
+            // Cross-validate the shape/data invariant documented on
+            // `CheckpointTensor::shape` ("product must equal data.len()")
+            // *before* the tensor is accepted. `shape` and `data` are read as
+            // two independent length-prefixed fields above, so a malformed or
+            // adversarial checkpoint can otherwise construct a tensor whose
+            // shape disagrees with its data length; that inconsistent tensor
+            // would then flow — unvalidated — into `to_weight_tensor()` /
+            // `WeightTensor::new` and on into shape-driven indexing such as
+            // structured pruning, which would panic instead of surfacing a
+            // typed error. Reject it here instead.
+            // Mirror `CheckpointTensor::element_count()`'s convention: an
+            // empty shape (no dimensions recorded) denotes zero elements,
+            // not the empty product (1).
+            let shape_product = if shape.is_empty() {
+                Some(0u64)
+            } else {
+                shape
+                    .iter()
+                    .try_fold(1u64, |acc, &dim| acc.checked_mul(dim))
+            };
+            let shape_matches_data = matches!(
+                shape_product,
+                Some(product) if product == data.len() as u64
+            );
+            if !shape_matches_data {
+                return Err(CheckpointError::ShapeDataMismatch {
+                    name,
+                    shape,
+                    data_len: data.len(),
+                });
             }
 
             tensors.push(CheckpointTensor { name, shape, data });
@@ -463,6 +502,39 @@ fn skip_ws(chars: &[char], pos: &mut usize) {
 // Low-level I/O helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Upper bound on how much capacity [`Checkpoint::read_from`] eagerly
+/// pre-allocates for any single length-prefixed field, regardless of the
+/// value the untrusted stream claims. Chosen generously (64 Ki
+/// elements/bytes — a few hundred KiB at most per field) so that ordinary
+/// checkpoints never grow their `Vec`s via the slower incremental path,
+/// while a corrupted or adversarial header cannot force a large allocation
+/// before the corresponding bytes have actually been observed in the
+/// stream.
+const MAX_EAGER_CAPACITY: usize = 1 << 16;
+
+/// Read exactly `len` bytes from `reader` into a freshly allocated `Vec<u8>`,
+/// without ever pre-reserving more than [`MAX_EAGER_CAPACITY`] bytes of
+/// capacity ahead of what has already been confirmed present in the stream.
+///
+/// Bytes are consumed in bounded chunks so that a `len` far larger than the
+/// remaining input (e.g. a corrupted or adversarial length field) fails via
+/// the normal [`CheckpointError::TruncatedData`] path — from [`read_exact`]
+/// hitting EOF — rather than triggering an immediate attacker-controlled
+/// allocation of `len` bytes.
+fn read_bytes_bounded<R: Read>(reader: &mut R, len: usize) -> Result<Vec<u8>, CheckpointError> {
+    const CHUNK_LEN: usize = 8192;
+    let mut out = Vec::with_capacity(len.min(MAX_EAGER_CAPACITY));
+    let mut remaining = len;
+    let mut chunk = [0u8; CHUNK_LEN];
+    while remaining > 0 {
+        let take = remaining.min(CHUNK_LEN);
+        read_exact(reader, &mut chunk[..take])?;
+        out.extend_from_slice(&chunk[..take]);
+        remaining -= take;
+    }
+    Ok(out)
+}
+
 fn write_u32_le<W: Write>(w: &mut W, v: u32) -> Result<(), CheckpointError> {
     w.write_all(&v.to_le_bytes())?;
     Ok(())
@@ -534,4 +606,136 @@ pub enum CheckpointError {
     /// A tensor name exceeds 65 535 bytes (the 16-bit length field limit).
     #[error("tensor name too long: {0} bytes (max 65535)")]
     NameTooLong(usize),
+
+    /// A tensor's declared `shape` and its actual `data` length disagree
+    /// (`shape.iter().product() != data.len()`), or the shape's element
+    /// product overflows `u64`. This indicates a corrupted or adversarial
+    /// checkpoint file — accepting the tensor anyway would let a downstream
+    /// shape-driven consumer (e.g. structured pruning) index past the end of
+    /// `data` and panic.
+    #[error(
+        "tensor '{name}' shape {shape:?} does not match data length {data_len} \
+         (product of shape must equal data.len())"
+    )]
+    ShapeDataMismatch {
+        /// Name of the offending tensor.
+        name: String,
+        /// The declared shape that produced the mismatch.
+        shape: Vec<u64>,
+        /// The actual number of `f32` elements read for this tensor.
+        data_len: usize,
+    },
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── read_from resource-limit regression tests ──────────────────────────
+    //
+    // `Checkpoint::read_from` used to allocate directly from untrusted
+    // length fields (`Vec::with_capacity(data_len)` etc.) before validating
+    // that many bytes were actually present in the stream, so a tiny
+    // corrupted/adversarial header claiming an enormous `data_len` (or
+    // `meta_len` / `ndim` / `num_tensors`) could force a multi-gigabyte
+    // allocation attempt. These tests build short headers that claim huge
+    // lengths and confirm read_from fails fast with `TruncatedData` instead
+    // of attempting to honor the claimed size.
+
+    /// Build a minimal valid `OXCK` header (magic + version + flags) as bytes.
+    fn header_bytes() -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"OXCK");
+        b.extend_from_slice(&1u32.to_le_bytes()); // version
+        b.extend_from_slice(&0u64.to_le_bytes()); // flags
+        b
+    }
+
+    #[test]
+    fn read_from_huge_meta_len_fails_fast_not_oom() {
+        let mut bytes = header_bytes();
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // num_tensors = 0
+                                                      // meta_len claims ~4 GiB but the stream has no more bytes.
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        // No metadata bytes actually follow.
+
+        let result = Checkpoint::read_from(&mut bytes.as_slice());
+        assert!(
+            matches!(result, Err(CheckpointError::TruncatedData { .. })),
+            "expected TruncatedData for a huge meta_len with no backing bytes, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn read_from_huge_data_len_fails_fast_not_oom() {
+        let mut bytes = header_bytes();
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // num_tensors = 1
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // meta_len = 0 (no metadata)
+
+        // Tensor 0: short valid name, no shape dims, but an enormous data_len.
+        let name = b"x";
+        bytes.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(name);
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // ndim = 0
+                                                      // data_len claims ~4.6e18 f32 elements (~18 exabytes) but nothing follows.
+        bytes.extend_from_slice(&(u64::MAX / 4).to_le_bytes());
+
+        let result = Checkpoint::read_from(&mut bytes.as_slice());
+        assert!(
+            matches!(result, Err(CheckpointError::TruncatedData { .. })),
+            "expected TruncatedData for a huge data_len with no backing bytes, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn read_from_huge_ndim_fails_fast_not_oom() {
+        let mut bytes = header_bytes();
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // num_tensors = 1
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // meta_len = 0
+
+        let name = b"x";
+        bytes.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(name);
+        // ndim claims ~4 billion dimensions but no shape data follows.
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+
+        let result = Checkpoint::read_from(&mut bytes.as_slice());
+        assert!(
+            matches!(result, Err(CheckpointError::TruncatedData { .. })),
+            "expected TruncatedData for a huge ndim with no backing bytes, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn read_from_huge_num_tensors_fails_fast_not_oom() {
+        let mut bytes = header_bytes();
+        // num_tensors claims ~1.8e19 tensors but the stream ends immediately after.
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // meta_len = 0
+
+        let result = Checkpoint::read_from(&mut bytes.as_slice());
+        assert!(
+            matches!(result, Err(CheckpointError::TruncatedData { .. })),
+            "expected TruncatedData for a huge num_tensors with no backing bytes, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn read_bytes_bounded_reads_exact_content() {
+        let payload = b"hello checkpoint world".to_vec();
+        let mut reader = payload.as_slice();
+        let out = read_bytes_bounded(&mut reader, payload.len()).expect("read_bytes_bounded");
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn read_bytes_bounded_zero_length_is_empty() {
+        let mut reader: &[u8] = &[];
+        let out = read_bytes_bounded(&mut reader, 0).expect("read_bytes_bounded");
+        assert!(out.is_empty());
+    }
 }

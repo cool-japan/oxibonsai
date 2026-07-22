@@ -64,22 +64,27 @@ echo ""
 # ── CI checks ────────────────────────────────────────────────────────────────
 
 if [[ -z "$SKIP_CI" ]]; then
-    echo ">> Step 1/5: cargo fmt --check"
+    echo ">> Step 1/6: cargo fmt --check"
     cargo fmt --all -- --check
     echo "   OK"
     echo ""
 
-    echo ">> Step 2/5: cargo clippy (deny warnings)"
-    cargo clippy --all-features --workspace -- -D warnings
+    echo ">> Step 2/6: cargo deny check bans licenses sources"
+    cargo deny check bans licenses sources
     echo "   OK"
     echo ""
 
-    echo ">> Step 3/5: cargo nextest run"
+    echo ">> Step 3/6: cargo clippy (all targets, deny warnings)"
+    cargo clippy --all-features --all-targets --workspace -- -D warnings
+    echo "   OK"
+    echo ""
+
+    echo ">> Step 4/6: cargo nextest run"
     cargo nextest run --all-features --workspace
     echo "   OK"
     echo ""
 
-    echo ">> Step 4/5: cargo doc"
+    echo ">> Step 5/6: cargo doc"
     cargo doc --all-features --workspace --no-deps
     echo "   OK"
     echo ""
@@ -94,6 +99,7 @@ CRATES=(
     oxibonsai-core
     oxibonsai-tokenizer
     oxibonsai-kernels
+    oxibonsai-image
     oxibonsai-rag
     oxibonsai-model
     oxibonsai-runtime
@@ -103,7 +109,7 @@ CRATES=(
     oxibonsai-cli
 )
 
-echo ">> Step 5/5: Publishing crates"
+echo ">> Step 6/6: Publishing crates"
 echo ""
 
 for crate in "${CRATES[@]}"; do

@@ -128,6 +128,71 @@ mod tests {
         assert!(chunks.is_empty(), "short text should produce no chunks");
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // ChunkConfig::validate() tests
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_chunk_config_validate_accepts_default() {
+        assert!(ChunkConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn test_chunk_config_validate_rejects_zero_chunk_size() {
+        let config = ChunkConfig {
+            chunk_size: 0,
+            overlap: 0,
+            min_chunk_size: 0,
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_chunk_config_validate_rejects_overlap_ge_chunk_size() {
+        let config = ChunkConfig {
+            chunk_size: 32,
+            overlap: 32,
+            min_chunk_size: 8,
+        };
+        assert!(config.validate().is_err());
+    }
+
+    /// Regression: `min_chunk_size > chunk_size` guarantees every produced
+    /// window is discarded by `chunk_document`'s min-length filter, so
+    /// `validate()` must reject it rather than let ingestion silently yield
+    /// zero chunks forever.
+    #[test]
+    fn test_chunk_config_validate_rejects_min_chunk_size_gt_chunk_size() {
+        let config = ChunkConfig {
+            chunk_size: 16,
+            overlap: 4,
+            min_chunk_size: 32,
+        };
+        let err = config.validate().expect_err("must reject min > chunk_size");
+        assert!(
+            err.contains("min_chunk_size"),
+            "error message should mention min_chunk_size: {err}"
+        );
+
+        // Cross-check the invariant `validate()` is protecting against: with
+        // this config every non-empty document yields zero chunks.
+        let text = "x".repeat(1000);
+        assert!(
+            chunk_document(&text, 0, &config).is_empty(),
+            "min_chunk_size > chunk_size must always discard every window"
+        );
+    }
+
+    #[test]
+    fn test_chunk_config_validate_accepts_min_chunk_size_eq_chunk_size() {
+        let config = ChunkConfig {
+            chunk_size: 32,
+            overlap: 4,
+            min_chunk_size: 32,
+        };
+        assert!(config.validate().is_ok());
+    }
+
     #[test]
     fn test_chunk_by_sentences() {
         let text = "Hello world. This is a test. Another sentence here.";
@@ -357,6 +422,27 @@ mod tests {
         let ret = Retriever::new(emb, RetrieverConfig::default());
         let result = ret.retrieve("anything");
         assert!(matches!(result, Err(RagError::NoDocumentsIndexed)));
+    }
+
+    /// Regression: a `ChunkConfig` with `min_chunk_size > chunk_size` must be
+    /// rejected up front by `add_document` with an explicit error, rather
+    /// than silently returning `Ok(0)` for every document forever.
+    #[test]
+    fn test_retriever_add_document_rejects_invalid_chunk_config() {
+        let emb = IdentityEmbedder::new(16).expect("valid dim");
+        let mut ret = Retriever::new(emb, RetrieverConfig::default());
+        let bad_config = ChunkConfig {
+            chunk_size: 16,
+            overlap: 4,
+            min_chunk_size: 32,
+        };
+        let result = ret.add_document("plenty of content to chunk here", &bad_config);
+        assert!(
+            matches!(result, Err(RagError::InvalidChunkConfig(_))),
+            "expected InvalidChunkConfig, got {result:?}"
+        );
+        // No document should have been counted as indexed on error.
+        assert_eq!(ret.document_count(), 0);
     }
 
     #[test]

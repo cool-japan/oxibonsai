@@ -4,22 +4,22 @@
 //!
 //! | Kernel                               | Description                                              |
 //! |--------------------------------------|----------------------------------------------------------|
-//! | `gemm_q2k`                           | Batch GEMM: Q2_K AoS, col-major I/O, col_sums[8]       |
+//! | `gemm_q2k`                           | Batch GEMM: Q2_K AoS, col-major I/O, col_sums\[8\]       |
 //! | `gemm_q2k_residual`                  | Q2_K GEMM + fused residual add                          |
 //! | `fused_gate_up_swiglu_gemm_q2k`      | Fused gate+up Q2_K GEMM with SwiGLU epilogue            |
-//! | `gemm_q3k`                           | Batch GEMM: Q3_K AoS, col-major I/O, col_sums[8]       |
+//! | `gemm_q3k`                           | Batch GEMM: Q3_K AoS, col-major I/O, col_sums\[8\]       |
 //! | `gemm_q3k_residual`                  | Q3_K GEMM + fused residual add                          |
 //! | `fused_gate_up_swiglu_gemm_q3k`      | Fused gate+up Q3_K GEMM with SwiGLU epilogue            |
-//! | `gemm_q4k`                           | Batch GEMM: Q4_K AoS, col-major I/O, col_sums[8]       |
+//! | `gemm_q4k`                           | Batch GEMM: Q4_K AoS, col-major I/O, col_sums\[8\]       |
 //! | `gemm_q4k_residual`                  | Q4_K GEMM + fused residual add                          |
 //! | `fused_gate_up_swiglu_gemm_q4k`      | Fused gate+up Q4_K GEMM with SwiGLU epilogue            |
-//! | `gemm_q5k`                           | Batch GEMM: Q5_K AoS, col-major I/O, col_sums[8]       |
+//! | `gemm_q5k`                           | Batch GEMM: Q5_K AoS, col-major I/O, col_sums\[8\]       |
 //! | `gemm_q5k_residual`                  | Q5_K GEMM + fused residual add                          |
 //! | `fused_gate_up_swiglu_gemm_q5k`      | Fused gate+up Q5_K GEMM with SwiGLU epilogue            |
-//! | `gemm_q6k`                           | Batch GEMM: Q6_K AoS, col-major I/O, col_sums[8]       |
+//! | `gemm_q6k`                           | Batch GEMM: Q6_K AoS, col-major I/O, col_sums\[8\]       |
 //! | `gemm_q6k_residual`                  | Q6_K GEMM + fused residual add                          |
 //! | `fused_gate_up_swiglu_gemm_q6k`      | Fused gate+up Q6_K GEMM with SwiGLU epilogue            |
-//! | `gemm_q8k`                           | Batch GEMM: Q8_K AoS, col-major I/O, col_sums[8]       |
+//! | `gemm_q8k`                           | Batch GEMM: Q8_K AoS, col-major I/O, col_sums\[8\]       |
 //! | `gemm_q8k_residual`                  | Q8_K GEMM + fused residual add                          |
 //! | `fused_gate_up_swiglu_gemm_q8k`      | Fused gate+up Q8_K GEMM with SwiGLU epilogue            |
 //!

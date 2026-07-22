@@ -314,6 +314,145 @@ fn checkpoint_from_to_weight_tensor() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 19. checkpoint_shape_data_mismatch_undersized_data
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn checkpoint_shape_data_mismatch_undersized_data() {
+    // Hand-craft a stream whose tensor declares shape [4, 4] (16 elements) but
+    // only actually carries 3 f32 values. Without cross-validation this would
+    // construct a `CheckpointTensor` whose data is shorter than its shape
+    // implies, which later panics with an out-of-bounds slice index in
+    // shape-driven consumers (e.g. structured pruning) instead of surfacing a
+    // typed error.
+    let mut bytes = Vec::<u8>::new();
+    bytes.extend_from_slice(b"OXCK");
+    bytes.extend_from_slice(&1u32.to_le_bytes()); // version
+    bytes.extend_from_slice(&0u64.to_le_bytes()); // flags
+    bytes.extend_from_slice(&1u64.to_le_bytes()); // num_tensors = 1
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // metadata_len = 0
+
+    let name = b"bad_tensor";
+    bytes.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(name);
+
+    // shape = [4, 4] -> claims 16 elements
+    bytes.extend_from_slice(&2u32.to_le_bytes()); // ndim = 2
+    bytes.extend_from_slice(&4u64.to_le_bytes());
+    bytes.extend_from_slice(&4u64.to_le_bytes());
+
+    // data_len = 3, only 3 f32 values actually follow
+    bytes.extend_from_slice(&3u64.to_le_bytes());
+    for v in [1.0f32, 2.0, 3.0] {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+
+    let result = Checkpoint::read_from(&mut bytes.as_slice());
+    match result {
+        Err(CheckpointError::ShapeDataMismatch {
+            name,
+            shape,
+            data_len,
+        }) => {
+            assert_eq!(name, "bad_tensor");
+            assert_eq!(shape, vec![4u64, 4]);
+            assert_eq!(data_len, 3);
+        }
+        other => panic!("expected ShapeDataMismatch, got {other:?}"),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 20. checkpoint_shape_data_mismatch_oversized_data
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn checkpoint_shape_data_mismatch_oversized_data() {
+    // Same idea but in the other direction: shape claims [2] (2 elements) while
+    // 4 f32 values actually follow. Must also be rejected, not silently
+    // truncated/ignored.
+    let mut bytes = Vec::<u8>::new();
+    bytes.extend_from_slice(b"OXCK");
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.extend_from_slice(&1u64.to_le_bytes()); // num_tensors = 1
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // metadata_len = 0
+
+    let name = b"oversized";
+    bytes.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(name);
+
+    bytes.extend_from_slice(&1u32.to_le_bytes()); // ndim = 1
+    bytes.extend_from_slice(&2u64.to_le_bytes()); // shape = [2]
+
+    bytes.extend_from_slice(&4u64.to_le_bytes()); // data_len = 4
+    for v in [1.0f32, 2.0, 3.0, 4.0] {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+
+    let result = Checkpoint::read_from(&mut bytes.as_slice());
+    assert!(
+        matches!(result, Err(CheckpointError::ShapeDataMismatch { .. })),
+        "expected ShapeDataMismatch for oversized data, got {result:?}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 21. checkpoint_shape_data_mismatch_empty_shape_nonempty_data
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn checkpoint_shape_data_mismatch_empty_shape_nonempty_data() {
+    // An empty shape (ndim = 0) denotes zero elements per
+    // `CheckpointTensor::element_count()`'s documented convention, so any
+    // non-empty data for a shapeless tensor must also be rejected.
+    let mut bytes = Vec::<u8>::new();
+    bytes.extend_from_slice(b"OXCK");
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.extend_from_slice(&1u64.to_le_bytes()); // num_tensors = 1
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // metadata_len = 0
+
+    let name = b"shapeless";
+    bytes.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(name);
+
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // ndim = 0 (no shape dims)
+
+    bytes.extend_from_slice(&1u64.to_le_bytes()); // data_len = 1
+    bytes.extend_from_slice(&1.0f32.to_le_bytes());
+
+    let result = Checkpoint::read_from(&mut bytes.as_slice());
+    assert!(
+        matches!(result, Err(CheckpointError::ShapeDataMismatch { .. })),
+        "expected ShapeDataMismatch for empty shape with non-empty data, got {result:?}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 22. checkpoint_shape_data_match_round_trips_cleanly
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn checkpoint_shape_data_match_round_trips_cleanly() {
+    // Sanity check: well-formed tensors (shape product == data.len()) must
+    // still read back successfully after adding the cross-validation guard.
+    let mut ck = Checkpoint::new();
+    ck.add_tensor(CheckpointTensor::new(
+        "ok_tensor",
+        vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0],
+        vec![2, 3],
+    ));
+
+    let mut buf = Vec::<u8>::new();
+    ck.write_to(&mut buf).expect("write failed");
+
+    let loaded = Checkpoint::read_from(&mut buf.as_slice()).expect("read failed");
+    assert_eq!(loaded.tensors.len(), 1);
+    assert_eq!(loaded.tensors[0].data.len(), 6);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 18. metadata_serialize_deserialize
 // ─────────────────────────────────────────────────────────────────────────────
 

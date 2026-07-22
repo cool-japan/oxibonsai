@@ -326,13 +326,23 @@ fn metadata_multiple_entries() {
 }
 
 #[test]
-fn metadata_duplicate_keys_last_wins() {
+fn metadata_duplicate_keys_rejected() {
+    // A duplicate metadata key used to be silently collapsed via
+    // `HashMap::insert` ("last wins"), discarding the earlier value with no
+    // error, warning, or trace anywhere. That is a hardening gap for a
+    // corrupted/adversarial file: parsing must fail loudly instead of
+    // silently loading with data quietly dropped.
     let mut data = Vec::new();
     data.extend_from_slice(&make_kv_u32("dup", 1));
     data.extend_from_slice(&make_kv_u32("dup", 2));
-    let (store, _) = MetadataStore::parse(&data, 0, 2).expect("should parse duplicates");
-    assert_eq!(store.len(), 1); // HashMap deduplicates
-    assert_eq!(store.get_u32("dup").expect("dup key"), 2);
+    let result = MetadataStore::parse(&data, 0, 2);
+    match result {
+        Err(BonsaiError::InvalidMetadata { key, reason }) => {
+            assert_eq!(key, "dup");
+            assert!(reason.contains("duplicate"), "reason: {reason}");
+        }
+        other => panic!("expected InvalidMetadata for duplicate key, got: {other:?}"),
+    }
 }
 
 #[test]

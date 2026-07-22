@@ -16,19 +16,21 @@ use crate::error::{KernelError, KernelResult};
 use crate::tiled::{optimal_tile_rows, L2_TILE_ROWS};
 use crate::traits::OneBitKernel;
 use crate::traits::TernaryKernel;
+use crate::tuning::{PlatformProfile, TunedThresholds};
 use oxibonsai_core::tensor::{BlockQ1_0G128, QK1_0_G128};
 
 /// Minimum rows to justify parallelism overhead for parallel tiled GEMV.
+///
+/// Fallback default only: live dispatch decisions read
+/// [`TunedThresholds::par_tiled_min_rows`] via [`PlatformProfile::global_thresholds`]
+/// instead, so this constant is exercised only by [`ParallelConfig::default`]'s
+/// diagnostic snapshot, not by the hot dispatch path.
 const PAR_TILED_MIN_ROWS: usize = 128;
 
 /// Minimum batch size for parallel tiled GEMM.
+///
+/// Fallback default only; see [`PAR_TILED_MIN_ROWS`].
 const PAR_TILED_MIN_BATCH: usize = 4;
-
-/// Threshold below which direct (non-tiled, non-parallel) dispatch is fastest.
-const DIRECT_DISPATCH_MAX_ROWS: usize = 32;
-
-/// Threshold for medium-sized problems: parallel row but no tiling.
-const MEDIUM_PARALLEL_MAX_ROWS: usize = 256;
 
 // ─── Validation helpers ────────────────────────────────────────────────
 
@@ -112,8 +114,9 @@ fn validate_gemm(
 /// Parallel tiled GEMV: distribute L2 tiles across threads.
 ///
 /// Each thread receives an L2-sized chunk of output rows and processes it
-/// using L1 tiling internally. For problems below `PAR_TILED_MIN_ROWS`,
-/// falls back to sequential tiled execution via [`crate::tiled::gemv_tiled`].
+/// using L1 tiling internally. For problems below the platform-tuned
+/// `par_tiled_min_rows` threshold, falls back to sequential tiled execution
+/// via [`crate::tiled::gemv_tiled`].
 ///
 /// The L1 tile size is dynamically computed via [`optimal_tile_rows`] to
 /// account for the actual working set size at the given `k`.
@@ -130,8 +133,8 @@ pub fn gemv_parallel_tiled(
     #[cfg(target_arch = "wasm32")]
     let _blocks_per_row = validate_gemv(blocks, input, output, n_rows, k)?;
 
-    // Sequential fallback for small row counts
-    if n_rows < PAR_TILED_MIN_ROWS {
+    // Sequential fallback for small row counts (platform-tuned threshold).
+    if n_rows < PlatformProfile::global_thresholds().par_tiled_min_rows {
         return crate::tiled::gemv_tiled(dispatcher, blocks, input, output, n_rows, k);
     }
 
@@ -187,7 +190,8 @@ pub fn gemv_parallel_tiled(
 ///
 /// Parallelizes over the batch dimension at the outer level, then applies
 /// L1 tiling on the weight rows within each parallel task. For small
-/// batches (below `PAR_TILED_MIN_BATCH`), falls back to sequential tiled.
+/// batches (below the platform-tuned `par_gemm_min_batch` threshold),
+/// falls back to sequential tiled.
 pub fn gemm_parallel_tiled(
     dispatcher: &KernelDispatcher,
     blocks: &[BlockQ1_0G128],
@@ -202,8 +206,8 @@ pub fn gemm_parallel_tiled(
     #[cfg(target_arch = "wasm32")]
     let _blocks_per_row = validate_gemm(blocks, input, output, m, n_rows, k)?;
 
-    // Sequential fallback for small batch sizes
-    if m < PAR_TILED_MIN_BATCH {
+    // Sequential fallback for small batch sizes (platform-tuned threshold).
+    if m < PlatformProfile::global_thresholds().par_gemm_min_batch {
         return crate::tiled::gemm_tiled(dispatcher, blocks, input, output, m, n_rows, k);
     }
 
@@ -265,22 +269,44 @@ pub enum AdaptiveStrategy {
     ParallelTiled,
 }
 
-/// Determine the best strategy for a GEMV of the given dimensions.
-pub fn select_gemv_strategy(n_rows: usize, _k: usize) -> AdaptiveStrategy {
-    if n_rows <= DIRECT_DISPATCH_MAX_ROWS {
+/// Determine the best strategy for a GEMV of the given dimensions, using the
+/// live platform-tuned thresholds ([`PlatformProfile::global_thresholds`]).
+///
+/// This is the real production entry point; see
+/// [`select_gemv_strategy_with_thresholds`] for the pure, injectable form
+/// used in tests.
+pub fn select_gemv_strategy(n_rows: usize, k: usize) -> AdaptiveStrategy {
+    select_gemv_strategy_with_thresholds(n_rows, k, PlatformProfile::global_thresholds())
+}
+
+/// Determine the best strategy for a GEMV of the given dimensions against an
+/// explicit set of tuned thresholds.
+///
+/// Pulled out from [`select_gemv_strategy`] so tests can install a synthetic
+/// [`TunedThresholds`] (e.g. from [`PlatformProfile::with_cores`] /
+/// [`PlatformProfile::with_cache`]) and assert the decision changes
+/// accordingly, without touching the process-global cached profile.
+pub fn select_gemv_strategy_with_thresholds(
+    n_rows: usize,
+    _k: usize,
+    thresholds: &TunedThresholds,
+) -> AdaptiveStrategy {
+    if n_rows < thresholds.par_gemv_min_rows {
         AdaptiveStrategy::Direct
-    } else if n_rows <= MEDIUM_PARALLEL_MAX_ROWS {
+    } else if n_rows < thresholds.par_tiled_min_rows {
         AdaptiveStrategy::ParallelRow
     } else {
         AdaptiveStrategy::ParallelTiled
     }
 }
 
-/// Adaptive parallelism: choose the best strategy based on dimensions.
+/// Adaptive parallelism: choose the best strategy based on dimensions and
+/// the live platform-tuned thresholds (see [`select_gemv_strategy`]).
 ///
-/// - **Small** (`n_rows` <= 32): direct dispatch, no overhead.
-/// - **Medium** (33..=256): parallel row-wise via [`crate::parallel::gemv_1bit_g128_par`].
-/// - **Large** (>256): parallel tiled via [`gemv_parallel_tiled`].
+/// - **Small** (`n_rows` < `par_gemv_min_rows`): direct dispatch, no overhead.
+/// - **Medium** (`par_gemv_min_rows..par_tiled_min_rows`): parallel row-wise
+///   via [`crate::parallel::gemv_1bit_g128_par`].
+/// - **Large** (>= `par_tiled_min_rows`): parallel tiled via [`gemv_parallel_tiled`].
 pub fn gemv_adaptive(
     dispatcher: &KernelDispatcher,
     blocks: &[BlockQ1_0G128],
@@ -325,7 +351,7 @@ pub fn gemm_adaptive_ternary(
     n_rows: usize,
     k: usize,
 ) -> KernelResult<()> {
-    if m < PAR_TILED_MIN_BATCH {
+    if m < PlatformProfile::global_thresholds().par_gemm_min_batch {
         dispatcher.gemm_ternary_g128(blocks, input, output, m, n_rows, k)
     } else {
         crate::parallel::gemm_ternary_g128_par(dispatcher, blocks, input, output, m, n_rows, k)
@@ -504,22 +530,151 @@ mod tests {
         }
     }
 
+    // These three tests exercise the live, platform-tuned `select_gemv_strategy`
+    // (backed by `PlatformProfile::global_thresholds()`), so they use row
+    // counts far outside any plausible tuned threshold range rather than the
+    // old fixed 32/256 breakpoints, keeping them host-independent.
     #[test]
     fn adaptive_selects_direct_for_small() {
-        let strategy = select_gemv_strategy(16, 128);
+        let strategy = select_gemv_strategy(1, 128);
         assert_eq!(strategy, AdaptiveStrategy::Direct);
     }
 
     #[test]
-    fn adaptive_selects_parallel_row_for_medium() {
-        let strategy = select_gemv_strategy(128, 256);
-        assert_eq!(strategy, AdaptiveStrategy::ParallelRow);
+    fn adaptive_selects_parallel_tiled_for_large() {
+        let strategy = select_gemv_strategy(10_000_000, 4096);
+        assert_eq!(strategy, AdaptiveStrategy::ParallelTiled);
     }
 
+    /// Pure-function form of the strategy selector, tested against an
+    /// explicit synthetic [`TunedThresholds`] so the tier boundaries are
+    /// exercised deterministically regardless of the host machine's real
+    /// platform profile.
     #[test]
-    fn adaptive_selects_parallel_tiled_for_large() {
-        let strategy = select_gemv_strategy(512, 4096);
-        assert_eq!(strategy, AdaptiveStrategy::ParallelTiled);
+    fn select_gemv_strategy_with_thresholds_respects_tiers() {
+        let thresholds = TunedThresholds {
+            par_gemv_min_rows: 32,
+            par_gemm_min_batch: 4,
+            par_tiled_min_rows: 256,
+            tiled_gemm_block_m: 8,
+            tiled_gemm_block_n: 8,
+            tiled_gemm_block_k: 128,
+        };
+
+        assert_eq!(
+            select_gemv_strategy_with_thresholds(31, 128, &thresholds),
+            AdaptiveStrategy::Direct
+        );
+        assert_eq!(
+            select_gemv_strategy_with_thresholds(32, 128, &thresholds),
+            AdaptiveStrategy::ParallelRow
+        );
+        assert_eq!(
+            select_gemv_strategy_with_thresholds(255, 128, &thresholds),
+            AdaptiveStrategy::ParallelRow
+        );
+        assert_eq!(
+            select_gemv_strategy_with_thresholds(256, 128, &thresholds),
+            AdaptiveStrategy::ParallelTiled
+        );
+    }
+
+    /// Installing a synthetic tuned profile (many cores, large cache) must
+    /// change the strategy decision for a fixed `n_rows`/`k`, proving the
+    /// dispatcher genuinely consults tuned thresholds rather than hardcoded
+    /// constants.
+    #[test]
+    fn synthetic_tuned_profile_changes_strategy_decision() {
+        let n_rows = 200;
+        let k = 256;
+
+        // Low-core, small-cache profile: high par_gemv_min_rows and a
+        // par_tiled_min_rows anchored near the 256-row legacy baseline —
+        // 200 rows lands below both, i.e. Direct.
+        let low_core_profile = PlatformProfile::with_cores(1, 1);
+        let low_core_thresholds = low_core_profile.compute_thresholds();
+        assert_eq!(
+            select_gemv_strategy_with_thresholds(n_rows, k, &low_core_thresholds),
+            AdaptiveStrategy::Direct,
+            "expected Direct for n_rows={n_rows} under a 1-core synthetic profile (par_gemv_min_rows={})",
+            low_core_thresholds.par_gemv_min_rows
+        );
+
+        // Many-core profile: par_gemv_min_rows drops well below 200, but
+        // par_tiled_min_rows (anchored to L2 size) stays above it, so the
+        // same n_rows now lands in ParallelRow.
+        let many_core_profile = PlatformProfile::with_cores(32, 32);
+        let many_core_thresholds = many_core_profile.compute_thresholds();
+        assert_eq!(
+            select_gemv_strategy_with_thresholds(n_rows, k, &many_core_thresholds),
+            AdaptiveStrategy::ParallelRow,
+            "expected ParallelRow for n_rows={n_rows} under a 32-core synthetic profile (par_gemv_min_rows={}, par_tiled_min_rows={})",
+            many_core_thresholds.par_gemv_min_rows,
+            many_core_thresholds.par_tiled_min_rows
+        );
+
+        assert_ne!(
+            select_gemv_strategy_with_thresholds(n_rows, k, &low_core_thresholds),
+            select_gemv_strategy_with_thresholds(n_rows, k, &many_core_thresholds),
+            "strategy decision must change when the tuned profile changes"
+        );
+    }
+
+    /// Every strategy computes each output row as an independent dot
+    /// product via the same underlying [`OneBitKernel::gemv`] call, so
+    /// forcing Direct, ParallelRow, and ParallelTiled dispatch on identical
+    /// inputs must produce bit-for-bit identical outputs -- this is a
+    /// perf-routing change, not a numerics change, and this test pins that
+    /// invariant exactly (no epsilon tolerance).
+    #[test]
+    fn strategy_forced_bit_parity_gemv() {
+        let n_rows = 512;
+        let k = 512;
+        let (blocks, input) = make_test_data(n_rows, k);
+        let dispatcher = KernelDispatcher::auto_detect();
+
+        // Direct: single call covering all rows.
+        let mut out_direct = vec![0.0f32; n_rows];
+        dispatcher
+            .gemv(&blocks, &input, &mut out_direct, n_rows, k)
+            .expect("direct gemv should succeed");
+
+        // ParallelRow: forced via crate::parallel::gemv_1bit_g128_par.
+        let mut out_parallel_row = vec![0.0f32; n_rows];
+        crate::parallel::gemv_1bit_g128_par(
+            &dispatcher,
+            &blocks,
+            &input,
+            &mut out_parallel_row,
+            n_rows,
+            k,
+        )
+        .expect("parallel row gemv should succeed");
+
+        // ParallelTiled: forced directly, bypassing the strategy selector.
+        let mut out_parallel_tiled = vec![0.0f32; n_rows];
+        gemv_parallel_tiled(
+            &dispatcher,
+            &blocks,
+            &input,
+            &mut out_parallel_tiled,
+            n_rows,
+            k,
+        )
+        .expect("parallel tiled gemv should succeed");
+
+        for i in 0..n_rows {
+            assert_eq!(
+                out_direct[i].to_bits(),
+                out_parallel_row[i].to_bits(),
+                "row {i}: Direct vs ParallelRow diverged bit-exactly"
+            );
+            assert_eq!(
+                out_direct[i].to_bits(),
+                out_parallel_tiled[i].to_bits(),
+                "row {i}: Direct vs ParallelTiled diverged bit-exactly"
+            );
+        }
     }
 
     #[test]

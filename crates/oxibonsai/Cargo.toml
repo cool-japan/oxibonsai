@@ -15,7 +15,7 @@ categories = ["science", "algorithms", "command-line-utilities"]
 
 [features]
 default = []
-server = ["oxibonsai-runtime/server"]
+server = ["oxibonsai-runtime/server", "dep:oxibonsai-serve"]
 rag = ["dep:oxibonsai-rag"]
 simd-avx2 = ["oxibonsai-kernels/simd-avx2"]
 simd-avx512 = ["oxibonsai-kernels/simd-avx512"]

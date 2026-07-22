@@ -1,6 +1,6 @@
 //! scirs2-core GPU backend implementation.
 //!
-//! [`Scirs2Backend`] wraps a [`scirs2_core::gpu::GpuContext`] and implements
+//! `Scirs2Backend` wraps a `scirs2_core::gpu::GpuContext` and implements
 //! the [`GpuBackend`](super::GpuBackendTrait) trait, providing real GPU
 //! acceleration via Metal (macOS) or CUDA kernels.
 //!

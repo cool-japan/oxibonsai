@@ -63,18 +63,13 @@ pub fn gemv_q8k(
         });
     }
 
-    let mut row_buf = vec![0.0f32; in_features];
-    for row in 0..n_rows {
+    // Row-parallel scalar GEMV: each output row is an independent
+    // dequantize-then-dot, so the row loop is split across Rayon threads for
+    // large `n_rows` (numerically identical to sequential — see the driver).
+    crate::parallel::gemv_kquant_row_parallel(input, output, n_rows, in_features, |row, row_buf| {
         let row_blocks = &blocks[row * blocks_per_row..(row + 1) * blocks_per_row];
-
-        // Dequantize the entire row into a temporary FP32 buffer.
-        BlockQ8K::dequant(row_blocks, &mut row_buf).map_err(KernelError::Core)?;
-
-        // Dot product with the input vector.
-        let acc: f32 = row_buf.iter().zip(input.iter()).map(|(w, x)| w * x).sum();
-        output[row] = acc;
-    }
-    Ok(())
+        BlockQ8K::dequant(row_blocks, row_buf).map_err(KernelError::Core)
+    })
 }
 
 // ---------------------------------------------------------------------------

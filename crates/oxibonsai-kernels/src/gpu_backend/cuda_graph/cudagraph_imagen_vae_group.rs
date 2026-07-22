@@ -54,7 +54,7 @@ impl CudaGraph {
     /// - **otherwise (`k ≥ 1`, `pad ≥ 0`)** — build the im2col patch matrix
     ///   `[rows, kH·kW·C_in]` on-device in the `(kH,kW,C_in)` order that matches
     ///   the weight flattening (`im2col_f32`), tiled over output rows so the
-    ///   patch buffer stays ≤ [`IM2COL_TILE_CAP_BYTES`]; each tile's patches are
+    ///   patch buffer stays ≤ `IM2COL_TILE_CAP_BYTES`; each tile's patches are
     ///   downloaded and fed to [`encode_gemm_f32`](CudaGraph::encode_gemm_f32),
     ///   then the `[rows, C_out]` result is scattered into the NCHW output with
     ///   the bias.
@@ -209,7 +209,7 @@ impl CudaGraph {
     /// the parity-clean `gemm_f32` kernel straight off those device patches
     /// ([`launch_gemm_f32`](Self::launch_gemm_f32)); scatter each tile's
     /// `[rows, C_out]` result into the NCHW output with the bias. Output rows are
-    /// tiled so the patch buffer stays ≤ [`IM2COL_TILE_CAP_BYTES`]. Mirrors
+    /// tiled so the patch buffer stays ≤ `IM2COL_TILE_CAP_BYTES`. Mirrors
     /// `metal_graph/vae.rs::encode_conv2d_f32_im2col`.
     ///
     /// Preconditions (validated by the caller [`encode_conv2d_f32`]): `spatial =
@@ -218,7 +218,7 @@ impl CudaGraph {
     /// `c_out·spatial`.
     ///
     /// The im2col patches stay RESIDENT on the device — `im2col_f32` and the GEMM
-    /// run back-to-back on `self.stream`, so the (up to [`IM2COL_TILE_CAP_BYTES`])
+    /// run back-to-back on `self.stream`, so the (up to `IM2COL_TILE_CAP_BYTES`)
     /// patch matrix is never round-tripped to the host; only the much smaller
     /// per-tile `[rows, C_out]` result is downloaded. (PERF still open: pool the
     /// input/patch/output device buffers across calls.)

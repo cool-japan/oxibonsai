@@ -1,0 +1,92 @@
+# cargo-deny configuration for OxiBonsai.
+#
+# Enforces the COOLJAPAN policy: no banned C/C++/Fortran-backed or
+# oxi*-superseded crates may enter the dependency graph (see the
+# "Dependency Replacements" table in the workspace's CLAUDE.md), and only
+# an approved set of OSS licenses may be pulled in transitively.
+#
+# Run before any release:
+#   cargo deny check bans licenses sources
+#
+# `advisories` is intentionally left as a permissive default (not part of
+# the gating command above) since it requires network access to the RustSec
+# advisory database and this workspace's release gate must stay usable
+# offline; run `cargo deny check advisories` separately when online.
+
+[graph]
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-apple-darwin" },
+    { triple = "x86_64-apple-darwin" },
+    { triple = "wasm32-unknown-unknown" },
+]
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "Zlib",
+    "CC0-1.0",
+    "0BSD",
+    "BSL-1.0",
+    # webpki-root-certs ships the Mozilla CA root bundle under this
+    # permissive (non-copyleft) data license — not source code.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+deny = [
+    # C/C++/Fortran-backed BLAS — use oxiblas instead.
+    { name = "openblas-src" },
+    { name = "openblas-sys" },
+    { name = "blas-src" },
+    # Non-Rust or superseded serialization — use oxicode instead.
+    { name = "bincode" },
+    # C-backed FFT — use oxifft instead.
+    { name = "rustfft" },
+    # C++-backed SMT solver — use oxiz instead.
+    { name = "z3" },
+    { name = "z3-sys" },
+    # C-backed SQLite bindings — use oxisql-sqlite-compat instead.
+    { name = "rusqlite" },
+    { name = "libsqlite3-sys" },
+    # Compression / archive formats with C dependencies — use oxiarc-*
+    # instead.
+    { name = "zip" },
+    { name = "flate2" },
+    { name = "zstd" },
+    { name = "zstd-sys" },
+    { name = "zstd-safe" },
+    { name = "bzip2" },
+    { name = "bzip2-sys" },
+    { name = "lz4" },
+    { name = "lz4-sys" },
+    { name = "lz4_flex" },
+    { name = "tar" },
+    { name = "snap" },
+    { name = "brotli" },
+    { name = "brotli-sys" },
+    { name = "miniz_oxide" },
+]
+skip = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

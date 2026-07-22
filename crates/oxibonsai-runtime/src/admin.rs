@@ -86,8 +86,12 @@ pub struct AdminState {
     pub metrics: Arc<InferenceMetrics>,
     /// Optional workload aggregator surfaced via `/admin/workload-stats`.
     pub rate_aggregator: Option<Arc<RequestRateAggregator>>,
-    /// Optional KV-cache compression policy surfaced via `/admin/workload-stats`.
+    /// Optional KV-cache compression policy surfaced via `/admin/workload-stats`
+    /// and `/admin/cache-stats`.
     pub kv_cache_policy: Option<Arc<KvCachePolicy>>,
+    /// Optional handle to the served model's descriptor, so `/admin/config` can
+    /// report the real loaded model rather than only the sampling defaults.
+    pub model_info: Option<Arc<crate::server::ServedModelInfo>>,
 }
 
 impl AdminState {
@@ -101,6 +105,7 @@ impl AdminState {
             metrics,
             rate_aggregator: None,
             kv_cache_policy: None,
+            model_info: None,
         }
     }
 
@@ -115,6 +120,13 @@ impl AdminState {
     /// Builder-style consuming setter.
     pub fn with_kv_cache_policy(mut self, policy: Arc<KvCachePolicy>) -> Self {
         self.kv_cache_policy = Some(policy);
+        self
+    }
+
+    /// Attach the served-model descriptor so `/admin/config` reports the real
+    /// loaded model. Builder-style consuming setter.
+    pub fn with_model_info(mut self, info: Arc<crate::server::ServedModelInfo>) -> Self {
+        self.model_info = Some(info);
         self
     }
 
@@ -154,17 +166,37 @@ pub async fn get_status(State(state): State<Arc<AdminState>>) -> impl IntoRespon
     (StatusCode::OK, Json(status))
 }
 
-/// `GET /admin/config` — return current configuration snapshot.
-pub async fn get_config(_state: State<Arc<AdminState>>) -> impl IntoResponse {
+/// `GET /admin/config` — return the server's real running configuration.
+///
+/// The sampling defaults are read from the runtime chat handler's single source
+/// of truth (the same functions that supply the request `serde` defaults), not
+/// duplicated literals. When a served-model descriptor is attached, the loaded
+/// model's real identity/context length is included under `model`.
+pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
     let snapshot = ConfigSnapshot {
-        max_tokens_default: 256,
-        temperature_default: 0.7,
-        top_p_default: 0.9,
+        max_tokens_default: crate::server::default_max_tokens_value(),
+        temperature_default: crate::server::default_temperature_value(),
+        top_p_default: crate::sampling::SamplingParams::default().top_p,
         server_version: env!("CARGO_PKG_VERSION"),
         features: features_enabled(),
     };
 
-    (StatusCode::OK, Json(snapshot))
+    let mut body = serde_json::to_value(&snapshot).unwrap_or_else(|_| serde_json::json!({}));
+    if let (Some(info), serde_json::Value::Object(map)) = (&state.model_info, &mut body) {
+        let descriptor = info.descriptor().await;
+        map.insert(
+            "model".to_string(),
+            serde_json::json!({
+                "id": descriptor.id,
+                "architecture": descriptor.architecture,
+                "max_context_length": descriptor.max_context_length,
+                "vocab_size": descriptor.vocab_size,
+                "created": descriptor.created,
+            }),
+        );
+    }
+
+    (StatusCode::OK, Json(body))
 }
 
 /// `POST /admin/reset-metrics` — reset all metric counters to zero.
@@ -260,20 +292,36 @@ pub async fn get_workload_stats(State(state): State<Arc<AdminState>>) -> impl In
     (StatusCode::OK, Json(body))
 }
 
-/// `GET /admin/cache-stats` — return placeholder cache statistics.
-pub async fn get_cache_stats(_state: State<Arc<AdminState>>) -> impl IntoResponse {
+/// `GET /admin/cache-stats` — report cache statistics for the caches actually
+/// wired into this server.
+///
+/// Only sources that are attached to the [`AdminState`] are reported with real
+/// numbers. A cache that is not wired in is reported as `null` (and flagged via
+/// an `*_enabled: false` field) rather than as a fabricated all-zero object an
+/// operator could mistake for a genuinely empty-but-healthy cache. The default
+/// server engine pool runs neither an adaptive KV-cache policy nor a prefix
+/// cache, so both are reported as `not enabled` there.
+pub async fn get_cache_stats(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
+    let kv_cache_enabled = state.kv_cache_policy.is_some();
+    let kv_cache = state.kv_cache_policy.as_ref().map(|policy| {
+        let level = policy.current_level();
+        serde_json::json!({
+            "level": level.tag(),
+            "memory_factor": level.memory_factor(),
+            "pressure_ewma": policy.pressure(),
+            "samples": policy.samples(),
+            "upgrades": policy.upgrades(),
+            "downgrades": policy.downgrades(),
+        })
+    });
+
     let body = serde_json::json!({
-        "kv_cache": {
-            "capacity_blocks": 0,
-            "used_blocks": 0,
-            "utilization": 0.0,
-            "evictions_total": 0,
-        },
-        "prefix_cache": {
-            "entries": 0,
-            "hit_rate": 0.0,
-        },
-        "status": "ok",
+        "kv_cache": kv_cache,
+        "kv_cache_enabled": kv_cache_enabled,
+        // The base chat server serves from a plain engine pool with no prefix
+        // cache attached; report that honestly instead of faking zeros.
+        "prefix_cache": serde_json::Value::Null,
+        "prefix_cache_enabled": false,
     });
 
     (StatusCode::OK, Json(body))

@@ -1,20 +1,27 @@
-//! Scalar Q4_0 GEMV reference kernel.
+//! Q4_0 GEMV kernel (tiered SIMD + row-parallel).
 //!
 //! Computes `output[row] = dot(W_row, input)` for each row of the weight matrix
 //! `W`, where weights are stored as Q4_0 blocks (32 weights per block, 18 bytes).
 //!
-//! This is a pure scalar Rust correctness-reference implementation — no SIMD,
-//! no unsafe. The inner loop dequantizes one block at a time into a 32-element
-//! stack buffer to keep stack pressure predictable.
+//! [`gemv_q4_0`] is the public entry point: it routes through the runtime
+//! [`KernelDispatcher`] (AVX-512 / AVX2 nibble-decode +
+//! FMA on x86-64, scalar elsewhere) and Rayon row-parallelism for large output
+//! counts, exactly like the Q1_0 / ternary / FP8 formats. `gemv_q4_0_scalar`
+//! is the pure-scalar correctness reference the SIMD tiers are checked against.
 
 use oxibonsai_core::{BlockQ4_0, QK_Q4_0};
 
+use crate::dispatch::{cpu_kernel_tier, KernelDispatcher};
 use crate::error::{KernelError, KernelResult};
 
-/// Scalar GEMV for Q4_0-quantized weight matrix.
+/// Q4_0 GEMV: `output = W × input` with automatic SIMD-tier + row-parallel
+/// dispatch.
 ///
-/// Computes `output[row] = dot(weight_row, input)` for each row, where the
-/// weight matrix is stored row-major as Q4_0 blocks.
+/// This is the production entry point. It selects the best CPU kernel tier for
+/// the current machine (cached, no per-call feature-detection cost) and, for
+/// large `n_rows`, splits the independent output rows across Rayon threads —
+/// mirroring the Q1_0 / ternary / FP8 dispatch paths. The numeric result equals
+/// `gemv_q4_0_scalar` within f32 rounding.
 ///
 /// - `blocks`: Row-major weight blocks.  Row `r` occupies
 ///   `blocks[r * blocks_per_row .. (r+1) * blocks_per_row]`
@@ -31,6 +38,23 @@ use crate::error::{KernelError, KernelResult};
 ///   or `input.len() < in_features`.
 /// - [`KernelError::BufferTooSmall`] if `output.len() < n_rows`.
 pub fn gemv_q4_0(
+    blocks: &[BlockQ4_0],
+    input: &[f32],
+    output: &mut [f32],
+    n_rows: usize,
+    in_features: usize,
+) -> KernelResult<()> {
+    let dispatcher = KernelDispatcher::with_tier(cpu_kernel_tier());
+    crate::parallel::gemv_q4_0_par(&dispatcher, blocks, input, output, n_rows, in_features)
+}
+
+/// Scalar reference GEMV for a Q4_0-quantized weight matrix.
+///
+/// Pure scalar Rust — no SIMD, no unsafe. The inner loop dequantizes one block
+/// at a time into a 32-element stack buffer to keep stack pressure predictable.
+/// Used as the correctness reference for the SIMD tiers and as the fallback on
+/// targets without an SIMD kernel. See [`gemv_q4_0`] for the parameter contract.
+pub(crate) fn gemv_q4_0_scalar(
     blocks: &[BlockQ4_0],
     input: &[f32],
     output: &mut [f32],
@@ -90,15 +114,14 @@ mod tests {
     use half::f16;
 
     fn make_q4_block(scale: f32, nibbles: [u8; 32]) -> BlockQ4_0 {
-        // Pack 32 nibbles into 16 bytes (low nibble = even index).
+        // Pack 32 nibbles into 16 bytes using the llama.cpp-compatible lo-hi
+        // split ordering: nibbles[0..16] → lower nibbles, nibbles[16..32] → upper.
+        // byte j = nibbles[j] | (nibbles[j+16] << 4)
         let mut qs = [0u8; 16];
-        for j in 0..32 {
-            let n = nibbles[j] & 0x0F;
-            if j % 2 == 0 {
-                qs[j / 2] = n;
-            } else {
-                qs[j / 2] |= n << 4;
-            }
+        for j in 0..16 {
+            let lo = nibbles[j] & 0x0F;
+            let hi = nibbles[j + 16] & 0x0F;
+            qs[j] = lo | (hi << 4);
         }
         BlockQ4_0 {
             d: f16::from_f32(scale),

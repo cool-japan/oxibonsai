@@ -312,20 +312,50 @@ fn paged_cache_multi_layer() {
 
 #[test]
 fn paged_cache_sequence_length() {
+    // sequence_length() must report the number of positions actually
+    // *written*, not the block-rounded allocated capacity (regression test:
+    // it used to return `token_capacity(0)`, e.g. 4 after writing a single
+    // token with block_size=4).
     let mut cache = PagedKvCache::new_with_block_size(16, 4, 2, 2, 4);
     let seq = cache.create_sequence();
 
     assert_eq!(cache.sequence_length(seq), 0);
 
-    // Write token 0 → allocates 1 block → capacity = 4.
+    // Write token 0 → allocates 1 block (capacity 4) but only 1 position written.
     cache
         .write_kv(seq, 0, 0, &kv_vec(1.0), &kv_vec(1.0))
         .expect("write 0");
-    assert_eq!(cache.sequence_length(seq), 4);
+    assert_eq!(cache.sequence_length(seq), 1);
 
-    // Write token 4 → crosses into second block → capacity = 8.
+    // Write token 4 → crosses into second block (capacity 8) but only 5 positions written.
     cache
         .write_kv(seq, 0, 4, &kv_vec(2.0), &kv_vec(2.0))
         .expect("write 4");
-    assert_eq!(cache.sequence_length(seq), 8);
+    assert_eq!(cache.sequence_length(seq), 5);
+}
+
+#[test]
+fn paged_cache_sequence_length_tracks_max_across_out_of_order_writes_and_layers() {
+    // sequence_length() must track the highest `token_pos + 1` written, even
+    // when writes arrive out of order or on a layer other than layer 0.
+    let mut cache = PagedKvCache::new_with_block_size(16, 4, 2, 2, 4);
+    let seq = cache.create_sequence();
+
+    // Write position 6 on layer 1 first, then position 2 on layer 0.
+    cache
+        .write_kv(seq, 1, 6, &kv_vec(3.0), &kv_vec(3.0))
+        .expect("write layer 1 pos 6");
+    assert_eq!(cache.sequence_length(seq), 7);
+
+    cache
+        .write_kv(seq, 0, 2, &kv_vec(4.0), &kv_vec(4.0))
+        .expect("write layer 0 pos 2");
+    // The later, lower-position write must not shrink the reported length.
+    assert_eq!(cache.sequence_length(seq), 7);
+}
+
+#[test]
+fn paged_cache_sequence_length_unknown_sequence_is_zero() {
+    let cache = small_cache();
+    assert_eq!(cache.sequence_length(999), 0);
 }

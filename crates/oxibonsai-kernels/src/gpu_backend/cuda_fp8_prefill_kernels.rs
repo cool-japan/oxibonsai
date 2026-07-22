@@ -4,11 +4,11 @@
 //!
 //! | Kernel                                    | Description                                                   |
 //! |-------------------------------------------|---------------------------------------------------------------|
-//! | `gemm_fp8_e4m3`                           | Batch GEMM: FP8 E4M3 AoS, col-major I/O, col_sums[8]        |
+//! | `gemm_fp8_e4m3`                           | Batch GEMM: FP8 E4M3 AoS, col-major I/O, col_sums\[8\]        |
 //! | `gemm_fp8_e4m3_residual`                  | FP8 E4M3 GEMM + fused residual add                          |
 //! | `fused_gate_up_swiglu_gemm_fp8_e4m3`      | Fused gate+up FP8 E4M3 GEMM with SwiGLU epilogue            |
 //! | `gemv_fp8_e4m3_pf`                        | Single-token FP8 E4M3 GEMV (for sequential attention pass)  |
-//! | `gemm_fp8_e5m2`                           | Batch GEMM: FP8 E5M2 AoS, col-major I/O, col_sums[8]        |
+//! | `gemm_fp8_e5m2`                           | Batch GEMM: FP8 E5M2 AoS, col-major I/O, col_sums\[8\]        |
 //! | `gemm_fp8_e5m2_residual`                  | FP8 E5M2 GEMM + fused residual add                          |
 //! | `fused_gate_up_swiglu_gemm_fp8_e5m2`      | Fused gate+up FP8 E5M2 GEMM with SwiGLU epilogue            |
 //! | `gemv_fp8_e5m2_pf`                        | Single-token FP8 E5M2 GEMV (for sequential attention pass)  |

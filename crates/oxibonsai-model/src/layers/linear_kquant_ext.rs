@@ -32,6 +32,25 @@ const _: () =
 const _: () =
     assert!(std::mem::size_of::<oxibonsai_core::BlockQ6K>() == oxibonsai_core::BLOCK_Q6K_BYTES,);
 
+#[cfg(all(feature = "metal", target_os = "macos"))]
+const _: () =
+    assert!(std::mem::size_of::<oxibonsai_core::BlockQ5K>() == oxibonsai_core::BLOCK_Q5K_BYTES,);
+#[cfg(all(feature = "metal", target_os = "macos"))]
+const _: () =
+    assert!(std::mem::size_of::<oxibonsai_core::BlockQ6K>() == oxibonsai_core::BLOCK_Q6K_BYTES,);
+
+/// Log a warning for a failed Metal K-quant GEMV dispatch, unless the failure
+/// is the benign "no Metal device on this system" case (in which every
+/// subsequent call would also fail identically, so the CPU fallback is the
+/// expected steady state rather than an anomaly worth logging every call).
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn warn_metal_gemv_fallback(format: &str, e: &oxibonsai_kernels::MetalGraphError) {
+    let msg = e.to_string();
+    if !msg.contains("no Metal-capable GPU device") {
+        tracing::warn!(error = %e, "Metal {format} GEMV failed, falling back to CPU scalar");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // LinearQ5K
 // ---------------------------------------------------------------------------
@@ -143,6 +162,27 @@ impl<'a> LinearQ5K<'a> {
                         );
                     }
                 }
+            }
+        }
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            // SAFETY: BlockQ5K is #[repr(C)] with size BLOCK_Q5K_BYTES (= 176).
+            // The compile-time assert above guarantees this layout.
+            let raw = unsafe {
+                std::slice::from_raw_parts(
+                    self.blocks.as_ptr().cast::<u8>(),
+                    self.blocks.len() * oxibonsai_core::BLOCK_Q5K_BYTES,
+                )
+            };
+            match oxibonsai_kernels::metal_gemv_q5k(
+                raw,
+                input,
+                output,
+                self.out_features,
+                self.in_features,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(e) => warn_metal_gemv_fallback("Q5K", &e),
             }
         }
         gemv_q5k(
@@ -282,6 +322,27 @@ impl<'a> LinearQ6K<'a> {
                         );
                     }
                 }
+            }
+        }
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            // SAFETY: BlockQ6K is #[repr(C)] with size BLOCK_Q6K_BYTES (= 210).
+            // The compile-time assert above guarantees this layout.
+            let raw = unsafe {
+                std::slice::from_raw_parts(
+                    self.blocks.as_ptr().cast::<u8>(),
+                    self.blocks.len() * oxibonsai_core::BLOCK_Q6K_BYTES,
+                )
+            };
+            match oxibonsai_kernels::metal_gemv_q6k(
+                raw,
+                input,
+                output,
+                self.out_features,
+                self.in_features,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(e) => warn_metal_gemv_fallback("Q6K", &e),
             }
         }
         gemv_q6k(

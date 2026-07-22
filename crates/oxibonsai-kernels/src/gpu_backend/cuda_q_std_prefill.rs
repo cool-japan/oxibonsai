@@ -1,6 +1,6 @@
 //! Batch prefill (GEMM) dispatch for OxiBonsai — Q4_0 and Q8_0 CUDA backend.
 //!
-//! This module mirrors [`cuda_prefill`] for Q4_0/Q8_0 quantised models.
+//! This module mirrors `cuda_prefill` for Q4_0/Q8_0 quantised models.
 //! Handles batch processing of multiple tokens during prompt prefill using
 //! real fused batch GEMM kernels (not sequential single-token loops).
 //!

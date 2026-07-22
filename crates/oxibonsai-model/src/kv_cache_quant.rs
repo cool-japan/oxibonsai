@@ -508,6 +508,31 @@ pub enum Fp8KvFormat {
     E5M2,
 }
 
+/// Clamp a finite scaled value into `[-fp8_max, fp8_max]` before FP8 encoding.
+///
+/// `quantize_row_fp8` computes `scale = max_abs / fp8_max` as a full-precision
+/// f32 (unlike the f16 block scale in `quant_fp8.rs`, there is no coarse
+/// rounding step) — but f32 division still rounds to the nearest
+/// representable value in *both* `max_abs / fp8_max` and `x / scale`, so the
+/// row's own max-magnitude element can come out marginally *above* `fp8_max`
+/// (a slip of one or two f32 ULPs). For E5M2, `fp8_e5m2_encode` maps any
+/// `scaled > FP8_E5M2_MAX` straight to IEEE ±Infinity via its overflow path,
+/// silently corrupting a finite KV-cache entry into `inf`. E4M3FN has no
+/// Infinity encoding and already saturates overflow to ±448.0, so this clamp
+/// is a no-op there — it is kept anyway to make the "finite input never
+/// encodes to a non-finite value" invariant explicit and to stay symmetric
+/// with the E5M2 arm. Genuinely non-finite input (`scaled` itself `±Inf` or
+/// `NaN`, e.g. from a non-finite row element) is left untouched so it still
+/// flows through each encoder's own documented Inf/NaN handling.
+#[inline]
+fn clamp_scaled_fp8(scaled: f32, fp8_max: f32) -> f32 {
+    if scaled.is_finite() {
+        scaled.clamp(-fp8_max, fp8_max)
+    } else {
+        scaled
+    }
+}
+
 /// Quantize a row of f32 values to FP8 using per-row absolute-max scaling.
 ///
 /// Returns `(quantized_bytes: Vec<u8>, scale: f32)` where
@@ -532,8 +557,14 @@ fn quantize_row_fp8(row: &[f32], format: Fp8KvFormat) -> (Vec<u8>, f32) {
     let scale = (max_abs / fp8_max).max(f32::EPSILON);
 
     let quantized = match format {
-        Fp8KvFormat::E4M3 => row.iter().map(|&x| fp8_e4m3_encode(x / scale)).collect(),
-        Fp8KvFormat::E5M2 => row.iter().map(|&x| fp8_e5m2_encode(x / scale)).collect(),
+        Fp8KvFormat::E4M3 => row
+            .iter()
+            .map(|&x| fp8_e4m3_encode(clamp_scaled_fp8(x / scale, fp8_max)))
+            .collect(),
+        Fp8KvFormat::E5M2 => row
+            .iter()
+            .map(|&x| fp8_e5m2_encode(clamp_scaled_fp8(x / scale, fp8_max)))
+            .collect(),
     };
 
     (quantized, scale)
@@ -846,5 +877,196 @@ impl Fp8KvCache {
         for layer in &mut self.layers {
             layer.clear();
         }
+    }
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reproducible LCG PRNG (no rand dependency), matching the style used by
+    /// `oxibonsai-core::quant_fp8`'s own regression tests, for generating
+    /// pseudo-random rows deterministically across seeds.
+    fn lcg_next(state: &mut u64) -> f32 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((*state >> 33) as f32) / (u32::MAX as f32) * 2.0 - 1.0
+    }
+
+    /// Build an 8-element row from an LCG seed, scaled to `[-1000, 1000]` so
+    /// `max_abs / fp8_max` lands on scale values whose f32 rounding error is
+    /// large enough (relative to `fp8_max`) to push the row's own max element
+    /// back above `fp8_max` after re-dividing by the rounded scale.
+    fn seeded_row(seed: u64, len: usize) -> Vec<f32> {
+        let mut state = seed;
+        (0..len).map(|_| lcg_next(&mut state) * 1000.0).collect()
+    }
+
+    /// Index of the max-magnitude element in `row`. Written as a plain fold
+    /// (no `partial_cmp().unwrap()`) so it never panics even if a caller ever
+    /// passes a NaN; returns `0` for an empty row (unreachable in these tests,
+    /// which always use non-empty seeded rows).
+    fn argmax_abs(row: &[f32]) -> usize {
+        let mut best_idx = 0usize;
+        let mut best_abs = 0.0f32;
+        for (i, &v) in row.iter().enumerate() {
+            let a = v.abs();
+            if a > best_abs {
+                best_abs = a;
+                best_idx = i;
+            }
+        }
+        best_idx
+    }
+
+    // ── Crafted scale-rounding overflow regression ─────────────────────────
+
+    #[test]
+    fn e5m2_row_scale_rounding_overflow_saturates_finite() {
+        // Seed 1 reproduces the defect directly against `quantize_row_fp8`:
+        // `scale = max_abs / FP8_E5M2_MAX` rounds down just enough that
+        // `x / scale` for the row's own max-magnitude element computes to
+        // -57344.004 (over FP8_E5M2_MAX by 0.0039), which the unfixed
+        // `fp8_e5m2_encode` overflow path maps straight to IEEE -Infinity.
+        let row = seeded_row(1, 8);
+        let max_abs = row.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        let (quantized, scale) = quantize_row_fp8(&row, Fp8KvFormat::E5M2);
+
+        // Confirm this seed actually exercises the over-`fp8_max` slip before
+        // any clamping, so the regression test is not vacuous.
+        let max_idx = argmax_abs(&row);
+        let unclamped_scaled = row[max_idx] / scale;
+        assert!(
+            unclamped_scaled.abs() > FP8_E5M2_MAX,
+            "seed 1 should reproduce the over-max scaled value; got {unclamped_scaled}"
+        );
+
+        let deq = dequantize_row_fp8(&quantized, scale, Fp8KvFormat::E5M2);
+        for (i, (&x, &y)) in row.iter().zip(deq.iter()).enumerate() {
+            assert!(
+                y.is_finite(),
+                "index {i}: input {x} dequantized to non-finite {y}"
+            );
+            assert_eq!(
+                x.signum(),
+                y.signum(),
+                "index {i}: sign flipped, input {x}, output {y}"
+            );
+        }
+        // The saturated max element should decode close to |max_abs| (within
+        // one FP8 quantization step); a generous 1% bound confirms it did not
+        // blow up while still tolerating E5M2's 2-mantissa-bit coarseness.
+        let y_max = deq[max_idx].abs();
+        assert!(
+            (y_max - max_abs).abs() <= 0.01 * max_abs,
+            "max element should saturate near max_abs={max_abs}, got {y_max}"
+        );
+    }
+
+    #[test]
+    fn e4m3_row_scale_rounding_overflow_saturates_finite() {
+        // Same seed/shape as the E5M2 case above: `x / scale` for the row's
+        // max element computes to -448.00003 (over FP8_E4M3_MAX by ~3e-5).
+        // `fp8_e4m3_encode` already saturates E4M3FN overflow to a finite
+        // ±448.0 (no Infinity encoding exists), so this assertion holds even
+        // pre-fix — it is kept to prove the clamp is a true no-op here and to
+        // guard the symmetric invariant against future encoder changes.
+        let row = seeded_row(1, 8);
+        let max_abs = row.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        let (quantized, scale) = quantize_row_fp8(&row, Fp8KvFormat::E4M3);
+
+        let max_idx = argmax_abs(&row);
+        let unclamped_scaled = row[max_idx] / scale;
+        assert!(
+            unclamped_scaled.abs() > FP8_E4M3_MAX,
+            "seed 1 should reproduce the over-max scaled value; got {unclamped_scaled}"
+        );
+
+        let deq = dequantize_row_fp8(&quantized, scale, Fp8KvFormat::E4M3);
+        for (i, (&x, &y)) in row.iter().zip(deq.iter()).enumerate() {
+            assert!(
+                y.is_finite(),
+                "index {i}: input {x} dequantized to non-finite {y}"
+            );
+            assert_eq!(
+                x.signum(),
+                y.signum(),
+                "index {i}: sign flipped, input {x}, output {y}"
+            );
+        }
+        let y_max = deq[max_idx].abs();
+        assert!(
+            (y_max - max_abs).abs() <= 0.01 * max_abs,
+            "max element should saturate near max_abs={max_abs}, got {y_max}"
+        );
+    }
+
+    // ── Seeded random sweep: no non-finite dequant for finite input ────────
+
+    #[test]
+    fn e5m2_row_finite_input_never_dequants_to_inf_or_nan() {
+        // Sweep many seeds — including seed 1, which reproduces the original
+        // failure above — and assert every finite row dequantizes finite.
+        for seed in 0u64..512 {
+            let row = seeded_row(seed, 16);
+            let (quantized, scale) = quantize_row_fp8(&row, Fp8KvFormat::E5M2);
+            let deq = dequantize_row_fp8(&quantized, scale, Fp8KvFormat::E5M2);
+            for (i, &y) in deq.iter().enumerate() {
+                assert!(
+                    y.is_finite(),
+                    "E5M2 seed {seed} produced non-finite output at index {i}: {y}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn e4m3_row_finite_input_never_dequants_to_inf_or_nan() {
+        // E4M3FN has no Infinity and encodes NaN as 0x7f/0xff; the same
+        // scale-rounding class must never surface as an incorrect NaN or
+        // other non-finite dequant. Sweep the same seed range as E5M2.
+        for seed in 0u64..512 {
+            let row = seeded_row(seed, 16);
+            let (quantized, scale) = quantize_row_fp8(&row, Fp8KvFormat::E4M3);
+            let deq = dequantize_row_fp8(&quantized, scale, Fp8KvFormat::E4M3);
+            for (i, &y) in deq.iter().enumerate() {
+                assert!(
+                    y.is_finite(),
+                    "E4M3 seed {seed} produced non-finite output at index {i}: {y}"
+                );
+            }
+        }
+    }
+
+    // ── clamp_scaled_fp8 unit checks ────────────────────────────────────────
+
+    #[test]
+    fn clamp_scaled_fp8_clamps_finite_overflow() {
+        assert_eq!(
+            clamp_scaled_fp8(FP8_E5M2_MAX + 100.0, FP8_E5M2_MAX),
+            FP8_E5M2_MAX
+        );
+        assert_eq!(
+            clamp_scaled_fp8(-(FP8_E5M2_MAX + 100.0), FP8_E5M2_MAX),
+            -FP8_E5M2_MAX
+        );
+    }
+
+    #[test]
+    fn clamp_scaled_fp8_leaves_in_range_values_untouched() {
+        assert_eq!(clamp_scaled_fp8(1.0, FP8_E5M2_MAX), 1.0);
+        assert_eq!(clamp_scaled_fp8(-1.0, FP8_E4M3_MAX), -1.0);
+    }
+
+    #[test]
+    fn clamp_scaled_fp8_passes_through_genuine_non_finite() {
+        // Genuinely non-finite input (e.g. from a non-finite row element) must
+        // flow through untouched so the encoder's own Inf/NaN handling runs.
+        assert!(clamp_scaled_fp8(f32::INFINITY, FP8_E5M2_MAX).is_infinite());
+        assert!(clamp_scaled_fp8(f32::NEG_INFINITY, FP8_E5M2_MAX).is_infinite());
+        assert!(clamp_scaled_fp8(f32::NAN, FP8_E5M2_MAX).is_nan());
     }
 }

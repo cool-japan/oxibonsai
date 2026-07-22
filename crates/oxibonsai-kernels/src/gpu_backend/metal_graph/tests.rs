@@ -463,3 +463,43 @@ fn test_batched_rmsnorm() {
         }
     }
 }
+
+/// Test that `weight_upload_count` increments on a new key and that
+/// `evict_f32_weight` removes the entry (enabling safe key reuse for
+/// non-resident callers).
+///
+/// Ignored by default: requires a Metal GPU and must not run concurrently
+/// with other tests that share the global `MetalGraph` singleton's weight cache.
+#[test]
+#[ignore = "requires Metal GPU; run with --test-threads=1"]
+fn test_weight_upload_count_increments_on_new_key() {
+    let graph = MetalGraph::global().expect("Metal not available");
+    let before = graph.weight_upload_count();
+    let data = vec![1.0f32; 16];
+    // Use an address offset unlikely to collide with any live weight.
+    let key = data.as_ptr() as u64 ^ 0xDEAD_BEEF_0000_0001;
+    // Ensure the key is not already cached (clean slate).
+    graph
+        .evict_f32_weight(key)
+        .expect("evict_f32_weight failed");
+    graph
+        .get_or_upload_f32_weight(key, &data)
+        .expect("upload failed");
+    let after = graph.weight_upload_count();
+    assert_eq!(
+        after,
+        before + 1,
+        "upload count must increment on first upload of a new key"
+    );
+    // A second upload of the same key must be a cache hit (no increment).
+    graph
+        .get_or_upload_f32_weight(key, &data)
+        .expect("second upload failed");
+    assert_eq!(
+        graph.weight_upload_count(),
+        before + 1,
+        "upload count must NOT increment on a cache hit"
+    );
+    // Cleanup: evict so the test leaves no residue in the global singleton.
+    graph.evict_f32_weight(key).expect("cleanup evict failed");
+}

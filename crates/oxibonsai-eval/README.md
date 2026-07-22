@@ -1,8 +1,8 @@
 # oxibonsai-eval
 
-[![Version](https://img.shields.io/badge/version-0.2.2-blue.svg)](https://crates.io/crates/oxibonsai-eval)
+[![Version](https://img.shields.io/badge/version-0.2.3-blue.svg)](https://crates.io/crates/oxibonsai-eval)
 [![Status](https://img.shields.io/badge/status-stable-brightgreen.svg)]()
-[![Tests](https://img.shields.io/badge/tests-513%20passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-274%20passing-brightgreen.svg)]()
 
 Model evaluation harness for OxiBonsai — ROUGE, perplexity, accuracy, throughput.
 
@@ -14,7 +14,7 @@ Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 
 ## Status
 
-**Stable** (v0.2.2) — 513 tests passing.
+**Stable** (v0.2.3) — 274 tests passing.
 
 ## Features
 
@@ -35,22 +35,22 @@ Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 
 ```toml
 [dependencies]
-oxibonsai-eval = "0.2.2"
+oxibonsai-eval = "0.2.3"
 ```
 
 ```rust
-use oxibonsai_eval::{PerplexityEvaluator, BleuScore};
+use oxibonsai_eval::{corpus_bleu, BleuConfig, PerplexityEvaluator};
 
 // Perplexity from token log-probabilities
 let log_probs = vec![-1.2, -0.8, -2.1, -1.5];
-let ppl = PerplexityEvaluator::from_log_probs(&log_probs);
-println!("Perplexity: {:.2}", ppl.perplexity());
+let ppl = PerplexityEvaluator::new().compute(&log_probs);
+println!("Perplexity: {:.2}", ppl);
 
 // Corpus BLEU
-let hypotheses = vec!["the cat sat on the mat".to_string()];
-let references = vec![vec!["the cat is on the mat".to_string()]];
-let bleu = BleuScore::corpus_bleu(&hypotheses, &references);
-println!("BLEU: {:.4}", bleu.score());
+let hypotheses = vec!["the cat sat on the mat"];
+let references = vec![vec!["the cat is on the mat"]];
+let bleu = corpus_bleu(&hypotheses, &references, &BleuConfig::default());
+println!("BLEU: {:.4}", bleu.bleu);
 ```
 
 ## License

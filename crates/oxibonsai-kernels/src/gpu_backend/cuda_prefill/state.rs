@@ -122,8 +122,11 @@ unsafe impl Sync for CudaPrefillModules {}
 struct CudaPrefillState {
     prefill_modules: Mutex<Option<Arc<CudaPrefillModules>>>,
     prefill_buffers: Mutex<Option<CudaPrefillBuffers>>,
-    /// Shared KV cache (same singleton as the decode path).
-    kv_cache: Mutex<Option<CudaKvCache>>,
+    // NOTE: there is deliberately **no** private KV cache here.  Batch prefill and
+    // per-token decode must share the SAME device KV buffer, otherwise decode
+    // attends over stale (all-zero) KV for the prompt positions.  The prefill KV
+    // cache is therefore delegated to the decode-path singleton via
+    // [`acquire_prefill_kv_cache`] → `cuda_full_layer::acquire_kv_cache`.
     /// Reuse the single-token full-layer buffers for per-token attention.
     full_layer_buffers: Mutex<Option<CudaFullLayerBuffers>>,
     /// Cached logits buffer: (buffer, out_features_count).
@@ -139,7 +142,6 @@ fn prefill_state() -> &'static CudaPrefillState {
     PREFILL_STATE.get_or_init(|| CudaPrefillState {
         prefill_modules: Mutex::new(None),
         prefill_buffers: Mutex::new(None),
-        kv_cache: Mutex::new(None),
         full_layer_buffers: Mutex::new(None),
         prefill_logits: Mutex::new(None),
     })
@@ -277,7 +279,16 @@ pub(super) fn acquire_prefill_buffers(
     Ok(guard)
 }
 
-/// Acquire or (re-)allocate the shared GPU KV cache.
+/// Acquire the GPU KV cache **shared with the decode path**.
+///
+/// This delegates to [`cuda_full_layer::acquire_kv_cache`] so that batch prefill
+/// writes K/V into exactly the same device buffer that per-token decode
+/// (`try_cuda_full_forward*`) later reads.  Keeping a separate prefill-private
+/// cache here would make decode attend over stale (all-zero) KV for every prompt
+/// position past the first — silently corrupting all generated output after a
+/// multi-token CUDA prompt.  Because both functions return a
+/// `MutexGuard<'static, Option<CudaKvCache>>` over the identical `CudaKvCache`
+/// type, callers in [`super::try_apis`] need no change.
 pub(super) fn acquire_prefill_kv_cache(
     graph: &CudaGraph,
     n_layers: usize,
@@ -285,39 +296,7 @@ pub(super) fn acquire_prefill_kv_cache(
     max_seq: usize,
     head_dim: usize,
 ) -> Result<std::sync::MutexGuard<'static, Option<CudaKvCache>>, CudaGraphError> {
-    let state = prefill_state();
-    let mut guard = state
-        .kv_cache
-        .lock()
-        .map_err(|_| CudaGraphError::LockPoisoned)?;
-
-    let needs_alloc = match guard.as_ref() {
-        Some(c) => !c.matches(n_layers, n_kv, max_seq, head_dim),
-        None => true,
-    };
-
-    if needs_alloc {
-        let total = n_layers * n_kv * max_seq * head_dim;
-        let k_cache = graph
-            .stream_arc()
-            .alloc_zeros::<u16>(total)
-            .map_err(|e| CudaGraphError::DriverError(format!("alloc kv k: {e}")))?;
-        let v_cache = graph
-            .stream_arc()
-            .alloc_zeros::<u16>(total)
-            .map_err(|e| CudaGraphError::DriverError(format!("alloc kv v: {e}")))?;
-
-        *guard = Some(CudaKvCache {
-            k_cache,
-            v_cache,
-            n_layers,
-            n_kv,
-            max_seq,
-            head_dim,
-        });
-    }
-
-    Ok(guard)
+    crate::gpu_backend::cuda_full_layer::acquire_kv_cache(graph, n_layers, n_kv, max_seq, head_dim)
 }
 
 /// Acquire or (re-)allocate single-token full-layer buffers for per-token attention.

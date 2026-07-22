@@ -22,10 +22,34 @@ use crate::metrics::InferenceMetrics;
 use crate::ngram_cache::NgramCache;
 use crate::request_id::RequestId;
 use crate::request_metrics::{RequestRateAggregator, RequestRateSnapshot, RequestRateTracker};
-use crate::sampling::{Sampler, SamplingParams};
+use crate::sampling::{PenaltyParams, Sampler, SamplingParams};
 
-/// EOS token for Qwen3 models.
+/// Default EOS token id for Qwen3 / Bonsai models.
+///
+/// Used as a fallback when an engine is built without GGUF metadata (the
+/// synthetic-config test paths) or when the loaded GGUF omits the
+/// `tokenizer.ggml.eos_token_id` key. GGUF-loaded engines resolve their EOS
+/// from that metadata key at construction time; see
+/// [`InferenceEngine::eos_token_id`].
 pub const EOS_TOKEN_ID: u32 = 151645;
+
+/// Resolve the end-of-sequence token id from a loaded GGUF's tokenizer
+/// metadata (`tokenizer.ggml.eos_token_id`), falling back to
+/// [`EOS_TOKEN_ID`] when the key is absent.
+fn resolve_eos_token_id(gguf: &GgufFile<'_>) -> u32 {
+    gguf.metadata
+        .get_u32(oxibonsai_core::gguf::tensor_info::keys::TOKENIZER_EOS_TOKEN_ID)
+        .unwrap_or(EOS_TOKEN_ID)
+}
+
+/// Upper bound on the initial capacity reserved for a generation output buffer.
+///
+/// Generation still runs all the way to the caller's `max_tokens`; this only
+/// caps the *up-front* `Vec::with_capacity` hint so that a hostile or
+/// mistaken `max_tokens` (e.g. `usize::MAX`) cannot drive a multi-gigabyte
+/// eager allocation before a single token has been produced. The buffer grows
+/// on demand past this bound as real tokens are appended.
+pub(crate) const MAX_PREALLOC_TOKENS: usize = 65_536;
 
 /// Statistics about engine usage, accumulated over the engine's lifetime.
 #[derive(Debug)]
@@ -115,6 +139,13 @@ pub struct InferenceEngine<'a> {
     /// inter-token latency, EWMA tokens-per-second, and queue-wait gauges
     /// (see [`InferenceMetrics::update_request_rate`]).
     rate_aggregator: Option<Arc<RequestRateAggregator>>,
+    /// End-of-sequence token id this engine treats as a stop condition.
+    ///
+    /// Resolved from the loaded GGUF's `tokenizer.ggml.eos_token_id` metadata
+    /// key at construction time, falling back to [`EOS_TOKEN_ID`] for the
+    /// synthetic-config paths ([`InferenceEngine::new`], the `from_model*`
+    /// constructors) and for GGUFs that omit the key.
+    eos_token_id: u32,
 }
 
 impl<'a> InferenceEngine<'a> {
@@ -134,6 +165,7 @@ impl<'a> InferenceEngine<'a> {
             stats: Arc::new(EngineStats::new()),
             prefill_token_count: 0,
             rate_aggregator: None,
+            eos_token_id: EOS_TOKEN_ID,
         }
     }
 
@@ -172,6 +204,7 @@ impl<'a> InferenceEngine<'a> {
             stats: Arc::new(EngineStats::new()),
             prefill_token_count: 0,
             rate_aggregator: None,
+            eos_token_id: EOS_TOKEN_ID,
         }
     }
 
@@ -203,8 +236,9 @@ impl<'a> InferenceEngine<'a> {
         seed: u64,
         max_seq_len: usize,
     ) -> RuntimeResult<Self> {
+        let eos_token_id = resolve_eos_token_id(gguf);
         let model = BonsaiModel::from_gguf(gguf, max_seq_len)?;
-        Self::from_model_with_gpu_warmup(model, sampling_params, seed)
+        Self::from_model_with_gpu_warmup(model, sampling_params, seed, eos_token_id)
     }
 
     /// Create an engine from a loaded GGUF file, reusing a pre-loaded, shared
@@ -225,8 +259,9 @@ impl<'a> InferenceEngine<'a> {
         max_seq_len: usize,
         token_embd: std::sync::Arc<[f32]>,
     ) -> RuntimeResult<Self> {
+        let eos_token_id = resolve_eos_token_id(gguf);
         let model = BonsaiModel::from_gguf_with_embd(gguf, max_seq_len, token_embd)?;
-        Self::from_model_with_gpu_warmup(model, sampling_params, seed)
+        Self::from_model_with_gpu_warmup(model, sampling_params, seed, eos_token_id)
     }
 
     /// Shared core of [`from_gguf`](Self::from_gguf) and
@@ -240,6 +275,7 @@ impl<'a> InferenceEngine<'a> {
         mut model: BonsaiModel<'a>,
         sampling_params: SamplingParams,
         seed: u64,
+        eos_token_id: u32,
     ) -> RuntimeResult<Self> {
         let kernel = KernelDispatcher::auto_detect();
 
@@ -303,6 +339,7 @@ impl<'a> InferenceEngine<'a> {
             stats: Arc::new(EngineStats::new()),
             prefill_token_count: 0,
             rate_aggregator: None,
+            eos_token_id,
         })
     }
 
@@ -392,9 +429,61 @@ impl<'a> InferenceEngine<'a> {
         Ok(self.model.forward(token, pos, &self.kernel)?)
     }
 
+    /// Speculative-verify a batch of tokens starting at `pos_start`.
+    ///
+    /// Runs the tokens through the model in a single batched forward pass and
+    /// returns the model's greedy (argmax) prediction for **every** position,
+    /// i.e. `out[i]` is the token the model would generate after `tokens[i]`.
+    /// This is the target-side scoring primitive used by the two-engine
+    /// speculative decoder ([`crate::speculative::SpeculativeDecoder::generate_verified`]).
+    ///
+    /// Like [`prefill_from_pos`](Self::prefill_from_pos), this does **not**
+    /// reset the KV cache: the caller manages committed positions and is
+    /// responsible for having primed the cache up to `pos_start`.
+    pub fn verify_batch(&mut self, tokens: &[u32], pos_start: usize) -> RuntimeResult<Vec<u32>> {
+        Ok(self
+            .model
+            .forward_prefill_verify(tokens, pos_start, &self.kernel)?)
+    }
+
+    /// Roll the model's KV cache back to `committed_len`, discarding any
+    /// speculative KV written beyond that position. Companion to
+    /// `prefill_from_pos`: a speculative-decoding driver prefills a delta,
+    /// drafts past it, then calls this to drop the rejected suffix so the
+    /// next committed write targets `committed_len`.
+    pub fn rewind_cache(&mut self, committed_len: usize) {
+        self.model.kv_cache_mut().truncate(committed_len);
+    }
+
     /// Sample one token from `logits` using the engine's current sampler.
     pub fn sample(&mut self, logits: &[f32]) -> RuntimeResult<u32> {
         self.sampler.sample(logits)
+    }
+
+    /// The end-of-sequence token id this engine treats as a stop condition.
+    ///
+    /// Resolved from the loaded GGUF's `tokenizer.ggml.eos_token_id` metadata
+    /// key (falling back to [`EOS_TOKEN_ID`] when built from a synthetic config
+    /// or when the key is absent).
+    pub fn eos_token_id(&self) -> u32 {
+        self.eos_token_id
+    }
+
+    /// Current frequency / presence penalty parameters
+    /// ([`crate::sampling::PenaltyParams`]).
+    pub fn penalties(&self) -> PenaltyParams {
+        *self.sampler.penalties()
+    }
+
+    /// Set the frequency / presence penalties applied during generation.
+    ///
+    /// Together with [`SamplingParams::repetition_penalty`] this is the seam
+    /// through which the OpenAI `frequency_penalty` / `presence_penalty`
+    /// request fields reach the decode loop. Penalties are applied over the
+    /// generated-token history before sampling (see
+    /// [`crate::sampling::Sampler::sample_with_history`]).
+    pub fn set_penalties(&mut self, penalties: PenaltyParams) {
+        self.sampler.set_penalties(penalties);
     }
 
     /// Cumulative number of tokens that have been processed by
@@ -474,16 +563,19 @@ impl<'a> InferenceEngine<'a> {
         // 2. Decode: sample and generate
         // ═══════════════════════════════════════════════════════
         let decode_start = std::time::Instant::now();
-        let mut output_tokens = Vec::with_capacity(max_tokens);
+        let mut output_tokens = Vec::with_capacity(max_tokens.min(MAX_PREALLOC_TOKENS));
 
         for (pos, _) in (prompt_tokens.len()..).zip(0..max_tokens) {
             let step_start = std::time::Instant::now();
 
-            // Sample next token
-            let next_token = self.sampler.sample(&last_logits)?;
+            // Sample next token, applying repetition/frequency/presence
+            // penalties over the generated-token history so far.
+            let next_token = self
+                .sampler
+                .sample_with_history(&last_logits, &output_tokens)?;
 
             // Check for EOS
-            if next_token == EOS_TOKEN_ID {
+            if next_token == self.eos_token_id {
                 tracing::debug!(pos, "EOS token generated");
                 break;
             }
@@ -553,13 +645,15 @@ impl<'a> InferenceEngine<'a> {
         }
 
         let decode_start = std::time::Instant::now();
-        let mut output_tokens = Vec::with_capacity(max_tokens);
+        let mut output_tokens = Vec::with_capacity(max_tokens.min(MAX_PREALLOC_TOKENS));
         let mut first_token_recorded = false;
 
         for (pos, _) in (prompt_tokens.len()..).zip(0..max_tokens) {
             let step_start = std::time::Instant::now();
-            let next_token = self.sampler.sample(&last_logits)?;
-            if next_token == EOS_TOKEN_ID {
+            let next_token = self
+                .sampler
+                .sample_with_history(&last_logits, &output_tokens)?;
+            if next_token == self.eos_token_id {
                 tracing::debug!(pos, "EOS token generated");
                 break;
             }
@@ -635,11 +729,12 @@ impl<'a> InferenceEngine<'a> {
         seed: u64,
         params: &crate::sampling::SamplingParams,
     ) -> RuntimeResult<Vec<u32>> {
-        // Swap in a fresh sampler with the given seed
-        let old_sampler = std::mem::replace(
-            &mut self.sampler,
-            crate::sampling::Sampler::new(params.clone(), seed),
-        );
+        // Swap in a fresh sampler with the given seed, carrying over any
+        // configured frequency/presence penalties so seeded multi-completion
+        // generation honours them just like the primary path.
+        let mut fresh = crate::sampling::Sampler::new(params.clone(), seed);
+        fresh.set_penalties(*self.sampler.penalties());
+        let old_sampler = std::mem::replace(&mut self.sampler, fresh);
         let result = self.generate(prompt_tokens, max_tokens);
         // Restore the original sampler
         self.sampler = old_sampler;
@@ -669,6 +764,105 @@ impl<'a> InferenceEngine<'a> {
         result
     }
 
+    /// Generate tokens using caller-supplied sampling parameters *and*
+    /// frequency / presence penalties for the duration of this call only.
+    ///
+    /// Behaves like [`InferenceEngine::generate_with_params`] but additionally
+    /// swaps in `penalties` (OpenAI `frequency_penalty` / `presence_penalty`),
+    /// then restores both the previous parameters and penalties on return.
+    /// This is the one-call seam intended for the OpenAI-compatible server:
+    /// combined with `params.repetition_penalty`, it applies all three penalty
+    /// families over the generated-token history. The PRNG state is preserved,
+    /// so the all-default (no-penalty) case is bit-identical to
+    /// [`InferenceEngine::generate`].
+    pub fn generate_with_params_and_penalties(
+        &mut self,
+        prompt_tokens: &[u32],
+        max_tokens: usize,
+        params: &crate::sampling::SamplingParams,
+        penalties: &PenaltyParams,
+    ) -> RuntimeResult<Vec<u32>> {
+        let prev_params = self.sampler.params().clone();
+        let prev_penalties = *self.sampler.penalties();
+        self.sampler.set_params(params.clone());
+        self.sampler.set_penalties(*penalties);
+        let result = self.generate(prompt_tokens, max_tokens);
+        self.sampler.set_params(prev_params);
+        self.sampler.set_penalties(prev_penalties);
+        result
+    }
+
+    /// Generate tokens while capturing per-step top-k log probabilities.
+    ///
+    /// Mirrors [`InferenceEngine::generate`] (prefill → token-by-token decode,
+    /// penalties applied over the generated-token history), but for every
+    /// emitted token it also records a
+    /// [`LogprobsContent`](crate::api_types::LogprobsContent) computed from the
+    /// model's raw output logits at that step: the chosen token's log
+    /// probability plus the `top_k` highest-probability alternatives (OpenAI
+    /// `top_logprobs`, clamped to 20).
+    ///
+    /// `id_to_token` maps a token id to its string form (typically the
+    /// tokenizer's single-id decode); the engine has no tokenizer of its own,
+    /// so the caller supplies it. The returned logprobs vector has exactly one
+    /// entry per generated token, aligned with the returned token ids.
+    ///
+    /// Available only with the `server` feature, where the logprob types live.
+    #[cfg(feature = "server")]
+    pub fn generate_with_logprobs(
+        &mut self,
+        prompt_tokens: &[u32],
+        max_tokens: usize,
+        top_k: usize,
+        id_to_token: &dyn Fn(u32) -> String,
+    ) -> RuntimeResult<(Vec<u32>, Vec<crate::api_types::LogprobsContent>)> {
+        if prompt_tokens.is_empty() {
+            return Ok((vec![], vec![]));
+        }
+
+        // OpenAI caps top_logprobs at 20.
+        let top_k = top_k.min(20);
+
+        let mut last_logits = self.model.forward_prefill(prompt_tokens, 0, &self.kernel)?;
+        let cap = max_tokens.min(MAX_PREALLOC_TOKENS);
+        let mut output_tokens = Vec::with_capacity(cap);
+        let mut logprobs: Vec<crate::api_types::LogprobsContent> = Vec::with_capacity(cap);
+
+        for (pos, _) in (prompt_tokens.len()..).zip(0..max_tokens) {
+            let next_token = self
+                .sampler
+                .sample_with_history(&last_logits, &output_tokens)?;
+
+            if next_token == self.eos_token_id {
+                tracing::debug!(pos, "EOS token generated (logprobs)");
+                break;
+            }
+
+            // Capture logprobs from the model's raw (pre-penalty) output
+            // distribution — the reported logprob is the model's, while the
+            // chosen token already reflects any active penalties.
+            logprobs.push(crate::api_types::compute_logprobs(
+                &last_logits,
+                next_token,
+                top_k,
+                id_to_token,
+            ));
+            output_tokens.push(next_token);
+
+            last_logits = self.model.forward(next_token, pos, &self.kernel)?;
+        }
+
+        self.stats.record_request(output_tokens.len());
+
+        tracing::info!(
+            prompt_len = prompt_tokens.len(),
+            generated = output_tokens.len(),
+            "logprobs generation complete"
+        );
+
+        Ok((output_tokens, logprobs))
+    }
+
     /// Generate tokens one at a time, sending each through the channel.
     /// Returns the total count of generated tokens.
     ///
@@ -695,12 +889,14 @@ impl<'a> InferenceEngine<'a> {
 
         let decode_start = std::time::Instant::now();
         let mut generated = 0;
+        // Generated-token history for repetition/frequency/presence penalties.
+        let mut history: Vec<u32> = Vec::new();
 
         for (pos, _) in (prompt_tokens.len()..).zip(0..max_tokens) {
             let step_start = std::time::Instant::now();
-            let next_token = self.sampler.sample(&logits)?;
+            let next_token = self.sampler.sample_with_history(&logits, &history)?;
 
-            if next_token == EOS_TOKEN_ID {
+            if next_token == self.eos_token_id {
                 tracing::debug!(pos, "EOS token generated (streaming)");
                 break;
             }
@@ -710,6 +906,7 @@ impl<'a> InferenceEngine<'a> {
                 tracing::debug!(pos, "receiver dropped, stopping generation");
                 break;
             }
+            history.push(next_token);
 
             logits = self.model.forward(next_token, pos, &self.kernel)?;
             generated += 1;
@@ -789,13 +986,15 @@ impl<'a> InferenceEngine<'a> {
 
         let decode_start = std::time::Instant::now();
         let mut generated = 0;
+        // Generated-token history for repetition/frequency/presence penalties.
+        let mut history: Vec<u32> = Vec::new();
 
         for (pos, _) in (prompt_tokens.len()..).zip(0..max_tokens) {
             let step_start = std::time::Instant::now();
 
-            let next_token = self.sampler.sample(&logits)?;
+            let next_token = self.sampler.sample_with_history(&logits, &history)?;
 
-            if next_token == EOS_TOKEN_ID {
+            if next_token == self.eos_token_id {
                 tracing::debug!(pos, "EOS token generated (streaming_sync)");
                 break;
             }
@@ -804,6 +1003,7 @@ impl<'a> InferenceEngine<'a> {
                 tracing::debug!(pos, "receiver dropped, stopping generation");
                 break;
             }
+            history.push(next_token);
 
             logits = self.model.forward(next_token, pos, &self.kernel)?;
             generated += 1;
@@ -833,12 +1033,90 @@ impl<'a> InferenceEngine<'a> {
         Ok(generated)
     }
 
+    /// Decode one greedy token, preferring the Metal GPU path and falling back
+    /// to a **coherent** CPU forward when the GPU path fails (or is disabled via
+    /// `force_cpu`).
+    ///
+    /// The Metal decode path ([`BonsaiModel::forward_greedy_gpu`]) maintains only
+    /// the GPU-resident KV cache and never writes `self.model`'s CPU cache, so a
+    /// naive CPU `forward()` after a GPU failure would attend over an all-zero
+    /// cache and silently corrupt the continuation. The first time we fall through
+    /// to the CPU, this rebuilds the CPU KV cache by replaying the committed token
+    /// sequence (`committed`, covering positions `0..committed.len()`) through the
+    /// scalar-CPU forward, then latches `cpu_fallback_active` so every subsequent
+    /// token decodes on the CPU directly and never reads the now-stale GPU cache.
+    ///
+    /// `cpu_kernel` MUST be a non-GPU dispatcher: `self.kernel` may be
+    /// GPU-accelerated, in which case `BonsaiModel::forward` would re-enter the
+    /// Metal path and leave the CPU cache empty. A `KernelTier::Reference`
+    /// dispatcher forces the CPU block path and is byte-identical to the canonical
+    /// CPU reference (see the cross-backend determinism guard).
+    ///
+    /// Returns the greedy argmax token id.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    fn greedy_decode_token_with_fallback(
+        &mut self,
+        committed: &[u32],
+        next_token: u32,
+        pos: usize,
+        cpu_kernel: &KernelDispatcher,
+        cpu_fallback_active: &mut bool,
+        force_cpu: bool,
+    ) -> RuntimeResult<u32> {
+        if !*cpu_fallback_active && !force_cpu {
+            match self.model.forward_greedy_gpu(next_token, pos - 1) {
+                Ok(token_id) => return Ok(token_id),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e, pos,
+                        "Metal greedy GPU decode failed; rebuilding the CPU KV cache from the \
+                         committed sequence and continuing on the CPU"
+                    );
+                }
+            }
+        }
+        let logits = if *cpu_fallback_active {
+            // Cache already coherent from an earlier rebuild — normal CPU forward.
+            self.model.forward(next_token, pos - 1, cpu_kernel)?
+        } else {
+            // First CPU fall-through: reconstruct the CPU KV cache from scratch by
+            // replaying the committed tokens (positions 0..committed.len()) — this
+            // reproduces exactly the cache a pure-CPU generation would have built.
+            // The final replayed forward yields the logits for the next token.
+            if force_cpu {
+                tracing::warn!(
+                    pos,
+                    committed = committed.len(),
+                    "forcing CPU greedy decode; rebuilding the CPU KV cache from the committed sequence"
+                );
+            }
+            self.model.reset();
+            let mut last = Vec::new();
+            for (p, &tok) in committed.iter().enumerate() {
+                last = self.model.forward(tok, p, cpu_kernel)?;
+            }
+            *cpu_fallback_active = true;
+            last
+        };
+        let mut best_idx = 0u32;
+        let mut best_val = f32::NEG_INFINITY;
+        for (i, &v) in logits.iter().enumerate() {
+            if v > best_val {
+                best_val = v;
+                best_idx = i as u32;
+            }
+        }
+        Ok(best_idx)
+    }
+
     /// Greedy generation entirely on GPU (temperature=0, argmax on Metal).
     ///
     /// Runs the full forward pass + argmax in a single GPU command buffer per
     /// token, downloading only the 4-byte token ID instead of the ~607KB logits
-    /// vector. Falls back to the normal `generate` path if the GPU greedy path
-    /// is not available.
+    /// vector. On a Metal GPU dispatch failure mid-generation the decode
+    /// transparently rebuilds the CPU KV cache and continues on the CPU (see
+    /// `Self::greedy_decode_token_with_fallback`) rather than emitting a
+    /// corrupted continuation.
     ///
     /// Returns the generated token IDs (not including the prompt).
     #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -879,9 +1157,9 @@ impl<'a> InferenceEngine<'a> {
         // 2. Decode: speculative greedy with n-gram drafting
         // ═══════════════════════════════════════════════════════
         let decode_start = std::time::Instant::now();
-        let mut output_tokens = Vec::with_capacity(max_tokens);
+        let mut output_tokens = Vec::with_capacity(max_tokens.min(MAX_PREALLOC_TOKENS));
 
-        if first_token == EOS_TOKEN_ID {
+        if first_token == self.eos_token_id {
             self.stats.record_request(0);
             return Ok(vec![]);
         }
@@ -903,6 +1181,23 @@ impl<'a> InferenceEngine<'a> {
             .unwrap_or(false);
         let spec_warmup = 15_usize; // build cache before speculating
 
+        // Metal→CPU fallback machinery. `forward_greedy_gpu` maintains only the
+        // GPU-resident KV cache; if it fails mid-generation we must NOT continue
+        // on the CPU with the all-zero CPU cache (silent corruption). Instead we
+        // rebuild the CPU cache from the committed sequence once, then decode the
+        // remainder on the CPU. `cpu_fallback_kernel` is pinned to the scalar CPU
+        // reference so `BonsaiModel::forward` takes the CPU block path (a
+        // GPU-accelerated `self.kernel` would re-enter Metal and never populate
+        // the CPU cache).
+        let cpu_fallback_kernel = KernelDispatcher::with_tier(KernelTier::Reference);
+        let mut cpu_fallback_active = false;
+        // Optional debug / test seam: after this many committed tokens, force the
+        // remainder of the decode onto the CPU path (exercises the KV-cache
+        // rebuild without a real GPU fault). Read once; unset = never force.
+        let force_cpu_after: Option<usize> = std::env::var("OXIBONSAI_FORCE_CPU_DECODE_AFTER")
+            .ok()
+            .and_then(|v| v.parse().ok());
+
         let mut next_token = first_token;
         let mut pos = prompt_tokens.len() + 1;
         let max_pos = prompt_tokens.len() + max_tokens;
@@ -910,9 +1205,16 @@ impl<'a> InferenceEngine<'a> {
         while pos < max_pos && output_tokens.len() < max_tokens {
             let step_start = std::time::Instant::now();
             let tokens_generated = output_tokens.len();
+            let force_cpu = force_cpu_after.is_some_and(|k| tokens_generated >= k);
 
-            // Try n-gram draft — skip warmup phase unless explicitly enabled
-            let draft = if !spec_enabled || tokens_generated < spec_warmup {
+            // Try n-gram draft — skip warmup phase unless explicitly enabled.
+            // Speculation relies on the GPU KV cache, so it is disabled once we
+            // fall back to (or are forced onto) the CPU decode path.
+            let draft = if !spec_enabled
+                || cpu_fallback_active
+                || force_cpu
+                || tokens_generated < spec_warmup
+            {
                 Vec::new()
             } else {
                 ngram_cache.draft(&context, speculation_k)
@@ -955,7 +1257,7 @@ impl<'a> InferenceEngine<'a> {
                         // Collect accepted draft tokens + bonus
                         let mut eos_seen = false;
                         for &token in draft.iter().take(accepted) {
-                            if token == EOS_TOKEN_ID {
+                            if token == self.eos_token_id {
                                 eos_seen = true;
                                 break;
                             }
@@ -975,7 +1277,7 @@ impl<'a> InferenceEngine<'a> {
                                 }
                             };
 
-                            if bonus == EOS_TOKEN_ID {
+                            if bonus == self.eos_token_id {
                                 tracing::debug!(pos, accepted, "EOS from speculative bonus");
                                 break;
                             }
@@ -994,91 +1296,49 @@ impl<'a> InferenceEngine<'a> {
                         }
                     }
                     Err(_e) => {
-                        // Speculative verify failed — fall through to single-token decode
+                        // Speculative verify failed — fall through to single-token
+                        // decode (GPU, or a coherent CPU fallback).
                         tracing::debug!("speculative verify failed, using single-token decode");
-                        match self.model.forward_greedy_gpu(next_token, pos - 1) {
-                            Ok(token_id) => {
-                                if token_id == EOS_TOKEN_ID {
-                                    tracing::debug!(pos, "EOS token generated (greedy GPU)");
-                                    break;
-                                }
-                                output_tokens.push(token_id);
-                                context.push(token_id);
-                                let window_start = context.len().saturating_sub(3);
-                                ngram_cache.record(&context[window_start..]);
-                                next_token = token_id;
-                                pos += 1;
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e, pos,
-                                    "greedy GPU path failed, falling back to normal forward"
-                                );
-                                let logits =
-                                    self.model.forward(next_token, pos - 1, &self.kernel)?;
-                                let mut best_idx = 0u32;
-                                let mut best_val = f32::NEG_INFINITY;
-                                for (i, &v) in logits.iter().enumerate() {
-                                    if v > best_val {
-                                        best_val = v;
-                                        best_idx = i as u32;
-                                    }
-                                }
-                                if best_idx == EOS_TOKEN_ID {
-                                    tracing::debug!(pos, "EOS from CPU fallback");
-                                    break;
-                                }
-                                output_tokens.push(best_idx);
-                                context.push(best_idx);
-                                let window_start = context.len().saturating_sub(3);
-                                ngram_cache.record(&context[window_start..]);
-                                next_token = best_idx;
-                                pos += 1;
-                            }
+                        let tok = self.greedy_decode_token_with_fallback(
+                            &context,
+                            next_token,
+                            pos,
+                            &cpu_fallback_kernel,
+                            &mut cpu_fallback_active,
+                            force_cpu,
+                        )?;
+                        if tok == self.eos_token_id {
+                            tracing::debug!(pos, "EOS token generated");
+                            break;
                         }
+                        output_tokens.push(tok);
+                        context.push(tok);
+                        let window_start = context.len().saturating_sub(3);
+                        ngram_cache.record(&context[window_start..]);
+                        next_token = tok;
+                        pos += 1;
                     }
                 }
             } else {
-                // ── Single-token decode (no draft or accuracy too low) ──
-                match self.model.forward_greedy_gpu(next_token, pos - 1) {
-                    Ok(token_id) => {
-                        if token_id == EOS_TOKEN_ID {
-                            tracing::debug!(pos, "EOS token generated (greedy GPU)");
-                            break;
-                        }
-                        output_tokens.push(token_id);
-                        context.push(token_id);
-                        let window_start = context.len().saturating_sub(3);
-                        ngram_cache.record(&context[window_start..]);
-                        next_token = token_id;
-                        pos += 1;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e, pos,
-                            "greedy GPU path failed, falling back to normal forward"
-                        );
-                        let logits = self.model.forward(next_token, pos - 1, &self.kernel)?;
-                        let mut best_idx = 0u32;
-                        let mut best_val = f32::NEG_INFINITY;
-                        for (i, &v) in logits.iter().enumerate() {
-                            if v > best_val {
-                                best_val = v;
-                                best_idx = i as u32;
-                            }
-                        }
-                        if best_idx == EOS_TOKEN_ID {
-                            tracing::debug!(pos, "EOS from CPU fallback");
-                            break;
-                        }
-                        output_tokens.push(best_idx);
-                        context.push(best_idx);
-                        let window_start = context.len().saturating_sub(3);
-                        ngram_cache.record(&context[window_start..]);
-                        next_token = best_idx;
-                        pos += 1;
-                    }
+                // ── Single-token decode (GPU, or a coherent CPU fallback) ──
+                let tok = self.greedy_decode_token_with_fallback(
+                    &context,
+                    next_token,
+                    pos,
+                    &cpu_fallback_kernel,
+                    &mut cpu_fallback_active,
+                    force_cpu,
+                )?;
+                if tok == self.eos_token_id {
+                    tracing::debug!(pos, "EOS token generated");
+                    break;
                 }
+                output_tokens.push(tok);
+                context.push(tok);
+                let window_start = context.len().saturating_sub(3);
+                ngram_cache.record(&context[window_start..]);
+                next_token = tok;
+                pos += 1;
             }
 
             if let Some(m) = &self.metrics {
@@ -1087,7 +1347,7 @@ impl<'a> InferenceEngine<'a> {
             }
 
             // Check for EOS from single-token path
-            if output_tokens.last() == Some(&EOS_TOKEN_ID) {
+            if output_tokens.last() == Some(&self.eos_token_id) {
                 output_tokens.pop(); // Don't include EOS in output
                 break;
             }
@@ -1310,5 +1570,162 @@ mod tests {
         let stats = EngineStats::default();
         assert_eq!(stats.tokens_generated(), 0);
         assert_eq!(stats.requests_completed(), 0);
+    }
+
+    // ── EOS resolution ────────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_eos_from_gguf_metadata() {
+        use oxibonsai_core::gguf::reader::GgufFile;
+        use oxibonsai_core::gguf::writer::{GgufWriter, MetadataWriteValue};
+
+        // A base Qwen3 tokenizer, for instance, assigns 151643 rather than the
+        // instruct EOS 151645 — the engine must honour the model's own key.
+        let mut w = GgufWriter::new();
+        w.add_metadata(
+            "tokenizer.ggml.eos_token_id",
+            MetadataWriteValue::U32(151643),
+        );
+        let bytes = w.to_bytes().expect("write synthetic gguf");
+        let gguf = GgufFile::parse(&bytes).expect("parse synthetic gguf");
+        assert_eq!(resolve_eos_token_id(&gguf), 151643);
+        assert_ne!(resolve_eos_token_id(&gguf), EOS_TOKEN_ID);
+    }
+
+    #[test]
+    fn resolve_eos_falls_back_when_absent() {
+        use oxibonsai_core::gguf::reader::GgufFile;
+        use oxibonsai_core::gguf::writer::GgufWriter;
+
+        // No eos metadata key → fall back to the hardcoded Qwen3 default.
+        let w = GgufWriter::new();
+        let bytes = w.to_bytes().expect("write synthetic gguf");
+        let gguf = GgufFile::parse(&bytes).expect("parse synthetic gguf");
+        assert_eq!(resolve_eos_token_id(&gguf), EOS_TOKEN_ID);
+    }
+
+    #[test]
+    fn synthetic_engine_uses_default_eos() {
+        let config = Qwen3Config::tiny_test();
+        let engine = InferenceEngine::new(config, SamplingParams::default(), 42);
+        assert_eq!(engine.eos_token_id(), EOS_TOKEN_ID);
+    }
+
+    // ── Penalty seam wiring ───────────────────────────────────────────────
+
+    #[test]
+    fn penalties_default_off_and_settable() {
+        let config = Qwen3Config::tiny_test();
+        let mut engine = InferenceEngine::new(config, SamplingParams::default(), 42);
+        assert!(!engine.penalties().is_active(), "penalties default off");
+        engine.set_penalties(PenaltyParams::new(0.5, 0.25));
+        assert!(engine.penalties().is_active());
+        assert_eq!(engine.penalties().frequency_penalty, 0.5);
+        assert_eq!(engine.penalties().presence_penalty, 0.25);
+    }
+
+    #[test]
+    fn generate_is_deterministic_with_penalties() {
+        let params = SamplingParams {
+            temperature: 0.8,
+            top_k: 40,
+            top_p: 0.95,
+            repetition_penalty: 1.3,
+            max_tokens: 128,
+        };
+        let prompt = vec![151644u32, 872, 1234];
+
+        let mut e1 = InferenceEngine::new(Qwen3Config::tiny_test(), params.clone(), 7);
+        e1.set_penalties(PenaltyParams::new(0.5, 0.5));
+        let o1 = e1.generate(&prompt, 16).expect("gen1");
+
+        let mut e2 = InferenceEngine::new(Qwen3Config::tiny_test(), params, 7);
+        e2.set_penalties(PenaltyParams::new(0.5, 0.5));
+        let o2 = e2.generate(&prompt, 16).expect("gen2");
+
+        assert_eq!(
+            o1, o2,
+            "same seed + params + penalties must be deterministic"
+        );
+    }
+
+    #[test]
+    fn generate_with_params_and_penalties_restores_state() {
+        let prompt = vec![151644u32, 872, 1234];
+        let base = SamplingParams::default();
+        let mut engine = InferenceEngine::new(Qwen3Config::tiny_test(), base.clone(), 11);
+
+        let temp_params = SamplingParams {
+            temperature: 0.5,
+            repetition_penalty: 1.5,
+            ..base.clone()
+        };
+        let penalties = PenaltyParams::new(0.8, 0.2);
+        let _ = engine
+            .generate_with_params_and_penalties(&prompt, 8, &temp_params, &penalties)
+            .expect("scoped generate");
+
+        // Both params and penalties are restored to their pre-call values.
+        assert_eq!(engine.penalties(), PenaltyParams::default());
+        assert!((engine.sampler.params().temperature - base.temperature).abs() < f32::EPSILON);
+        assert!(
+            (engine.sampler.params().repetition_penalty - base.repetition_penalty).abs()
+                < f32::EPSILON
+        );
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn generate_with_logprobs_returns_sane_values() {
+        let params = SamplingParams {
+            temperature: 0.0, // greedy for a stable emitted token
+            top_k: 0,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+            max_tokens: 128,
+        };
+        let prompt = vec![151644u32, 872, 1234];
+        let mut engine = InferenceEngine::new(Qwen3Config::tiny_test(), params, 3);
+
+        let (tokens, logprobs) = engine
+            .generate_with_logprobs(&prompt, 6, 5, &|id| format!("tok{id}"))
+            .expect("generate_with_logprobs");
+
+        assert_eq!(
+            tokens.len(),
+            logprobs.len(),
+            "one logprob entry per emitted token"
+        );
+        assert!(!tokens.is_empty(), "greedy tiny model should emit tokens");
+
+        for lp in &logprobs {
+            // A log-probability is always <= 0.
+            assert!(
+                lp.logprob <= 1e-4,
+                "chosen-token logprob must be <= 0, got {}",
+                lp.logprob
+            );
+            // top_logprobs is clamped to k (<= 20) and sorted descending.
+            assert!(lp.top_logprobs.len() <= 5);
+            assert!(!lp.top_logprobs.is_empty());
+            for pair in lp.top_logprobs.windows(2) {
+                assert!(
+                    pair[0].logprob >= pair[1].logprob,
+                    "top_logprobs must be sorted descending"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn generate_with_logprobs_empty_prompt() {
+        let mut engine =
+            InferenceEngine::new(Qwen3Config::tiny_test(), SamplingParams::default(), 1);
+        let (tokens, logprobs) = engine
+            .generate_with_logprobs(&[], 4, 3, &|id| format!("t{id}"))
+            .expect("empty prompt ok");
+        assert!(tokens.is_empty());
+        assert!(logprobs.is_empty());
     }
 }

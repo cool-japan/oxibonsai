@@ -16,7 +16,7 @@
 //!
 //! let config = Qwen3Config::tiny_test();
 //! let engine = InferenceEngine::new(config, SamplingParams::default(), 42);
-//! let mut cached = PrefixCachedEngine::new(engine, 64);
+//! let mut cached = PrefixCachedEngine::new(engine, 64, 42);
 //!
 //! let tokens = cached.generate(&[1, 2, 3, 4], &SamplingParams::default());
 //! let stats = cached.cache_stats();
@@ -37,8 +37,8 @@ use oxibonsai_model::prefix_cache::{
     KvBlockPair, PrefixAwarePrefill, PrefixCache, PrefixCacheStats,
 };
 
-use crate::engine::{InferenceEngine, EOS_TOKEN_ID};
-use crate::sampling::SamplingParams;
+use crate::engine::InferenceEngine;
+use crate::sampling::{Sampler, SamplingParams};
 
 /// Tokens per cache block — must divide evenly into most prompt lengths.
 const BLOCK_SIZE: usize = 16;
@@ -61,6 +61,11 @@ pub struct PrefixCachedEngine<'a> {
     pub inner: InferenceEngine<'a>,
     /// Prefix-cache-aware prefill helper with the block trie.
     pub prefix_cache: PrefixAwarePrefill,
+    /// Per-request decode sampler, seeded once at construction and reused
+    /// (state-advancing) across every `generate()` call — mirrors
+    /// [`InferenceEngine::generate_with_params`]'s "swap params, keep RNG
+    /// state" pattern rather than re-seeding on every call.
+    sampler: Sampler,
 }
 
 impl<'a> PrefixCachedEngine<'a> {
@@ -76,7 +81,12 @@ impl<'a> PrefixCachedEngine<'a> {
     ///   blocks.  Each block holds `BLOCK_SIZE` (16) tokens of KV data for
     ///   every layer; memory per block is approximately
     ///   `2 × num_layers × num_kv_heads × head_dim × 16 × 4` bytes.
-    pub fn new(engine: InferenceEngine<'a>, max_cache_blocks: usize) -> Self {
+    /// - `seed` — RNG seed for the wrapper's own decode sampler. `0` is
+    ///   remapped to a fixed nonzero constant because the sampler's xorshift64
+    ///   PRNG has `0` as a fixed point (it would otherwise generate the same
+    ///   "random" value forever), matching the precedent in
+    ///   `crate::speculative`.
+    pub fn new(engine: InferenceEngine<'a>, max_cache_blocks: usize, seed: u64) -> Self {
         let cfg = engine.model().config();
         let cache = PrefixCache::new(
             max_cache_blocks,
@@ -86,9 +96,12 @@ impl<'a> PrefixCachedEngine<'a> {
             cfg.head_dim,
         );
         let prefix_cache = PrefixAwarePrefill::new(cache);
+        let effective_seed = if seed == 0 { 0xdeadbeef_cafebabe } else { seed };
+        let sampler = Sampler::new(SamplingParams::default(), effective_seed);
         Self {
             inner: engine,
             prefix_cache,
+            sampler,
         }
     }
 
@@ -207,20 +220,24 @@ impl<'a> PrefixCachedEngine<'a> {
         }
 
         // ── Step 7: decode loop ──────────────────────────────────────────────
-        // Swap in a per-request sampler matching `params` so that the wrapper
-        // honours per-call sampling while leaving the engine's persistent
-        // sampler unchanged.
+        // Swap `params` onto the wrapper's own seeded sampler (constructed
+        // once in `new()` from the caller-supplied seed) so that per-call
+        // sampling parameters are honoured while the PRNG state keeps
+        // advancing across calls — the same "swap params, keep RNG state"
+        // pattern `InferenceEngine::generate_with_params` uses, rather than
+        // discarding the configured seed and re-seeding at 0 every call.
+        let prev_params = self.sampler.params().clone();
+        self.sampler.set_params(params.clone());
         let mut output = Vec::with_capacity(params.max_tokens);
-        let mut sampler = crate::sampling::Sampler::new(params.clone(), 0);
         for (pos, _) in (prompt_tokens.len()..).zip(0..params.max_tokens) {
-            let next_token = match sampler.sample(&last_logits) {
+            let next_token = match self.sampler.sample(&last_logits) {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::warn!(error = %e, "prefix-cache sampler error");
                     break;
                 }
             };
-            if next_token == EOS_TOKEN_ID {
+            if next_token == self.inner.eos_token_id() {
                 break;
             }
             output.push(next_token);
@@ -232,6 +249,7 @@ impl<'a> PrefixCachedEngine<'a> {
                 }
             };
         }
+        self.sampler.set_params(prev_params);
 
         // ── Step 8: release session ──────────────────────────────────────────
         self.prefix_cache.release_session(session);
@@ -264,7 +282,7 @@ mod tests {
     fn make_engine_no_blocks(max_blocks: usize) -> PrefixCachedEngine<'static> {
         let config = Qwen3Config::tiny_test();
         let engine = InferenceEngine::new(config, SamplingParams::default(), 42);
-        PrefixCachedEngine::new(engine, max_blocks)
+        PrefixCachedEngine::new(engine, max_blocks, 42)
     }
 
     /// Build a config small enough to keep test runtimes tight while still
@@ -297,7 +315,7 @@ mod tests {
         let kernel = KernelDispatcher::with_tier(KernelTier::Reference);
         let engine =
             InferenceEngine::from_model_with_kernel(model, kernel, SamplingParams::default(), 42);
-        PrefixCachedEngine::new(engine, max_blocks)
+        PrefixCachedEngine::new(engine, max_blocks, 42)
     }
 
     #[test]
@@ -408,6 +426,81 @@ mod tests {
             out1, out2,
             "AC #3: cached path must produce identical output ({:?} vs {:?})",
             out1, out2
+        );
+    }
+
+    fn make_engine_with_real_blocks_and_seed(
+        max_blocks: usize,
+        seed: u64,
+    ) -> PrefixCachedEngine<'static> {
+        use oxibonsai_kernels::{KernelDispatcher, KernelTier};
+        let config = small_real_config();
+        let model = BonsaiModel::new_for_testing_with_blocks(config);
+        let kernel = KernelDispatcher::with_tier(KernelTier::Reference);
+        let engine =
+            InferenceEngine::from_model_with_kernel(model, kernel, SamplingParams::default(), 42);
+        PrefixCachedEngine::new(engine, max_blocks, seed)
+    }
+
+    /// Regression test for the "hardcoded seed=0" bug: `generate()` used to
+    /// build a fresh `Sampler::new(params.clone(), 0)` on *every* call,
+    /// discarding whatever seed the wrapper was constructed with. Because the
+    /// sampler's xorshift64 PRNG has `0` as a fixed point, `rng_state=0`
+    /// makes `next_u64()` return `0` forever, so `rand_val` is always `0.0`.
+    /// With `top_k=0` (no truncation) and `top_p=1.0` (no re-sorting),
+    /// `probs_buf` keeps its natural insertion order (token id 0 first), so
+    /// the weighted-selection loop deterministically always picked token 0 —
+    /// *regardless of the model's logits or the configured seed*. This test
+    /// asserts the (fixed) real, model-driven behavior is not that constant
+    /// all-token-0 sequence.
+    #[test]
+    fn prefix_cached_engine_does_not_collapse_to_seed_zero_fixed_point() {
+        let mut engine = make_engine_with_real_blocks_and_seed(64, 0xC0FFEE);
+        let prompt: Vec<u32> = (0..32).collect();
+        let full_vocab_params = SamplingParams {
+            max_tokens: 8,
+            top_k: 0,
+            top_p: 1.0,
+            temperature: 2.0,
+            repetition_penalty: 1.0,
+        };
+
+        let out = engine.generate(&prompt, &full_vocab_params);
+        assert_eq!(out.len(), 8, "expected a full max_tokens decode run");
+        assert!(
+            out.iter().any(|&t| t != 0),
+            "output collapsed to all-zero tokens {out:?}; this is the exact signature of the \
+             seed=0 xorshift64 fixed-point bug (rand_val always 0.0 picks index 0 every step)",
+        );
+    }
+
+    /// Regression test: two wrappers constructed with different explicit
+    /// seeds, run against the identical prompt/model/params, must diverge.
+    /// Before the fix every call built an ephemeral `Sampler::new(_, 0)`
+    /// inside `generate()`, so the seed passed to `PrefixCachedEngine::new`
+    /// was silently discarded and both wrappers would have produced
+    /// byte-identical output.
+    #[test]
+    fn prefix_cached_engine_honours_configured_seed() {
+        let prompt: Vec<u32> = (0..32).collect();
+        let full_vocab_params = SamplingParams {
+            max_tokens: 8,
+            top_k: 0,
+            top_p: 1.0,
+            temperature: 2.0,
+            repetition_penalty: 1.0,
+        };
+
+        let mut engine_a = make_engine_with_real_blocks_and_seed(64, 7);
+        let mut engine_b = make_engine_with_real_blocks_and_seed(64, 424_242);
+
+        let out_a = engine_a.generate(&prompt, &full_vocab_params);
+        let out_b = engine_b.generate(&prompt, &full_vocab_params);
+
+        assert_ne!(
+            out_a, out_b,
+            "two different configured seeds produced identical output; the wrapper is not \
+             using the caller-supplied seed"
         );
     }
 }

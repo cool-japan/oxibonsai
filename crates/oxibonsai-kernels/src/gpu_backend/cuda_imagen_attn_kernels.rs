@@ -23,12 +23,14 @@
 //!
 //! # The op (matches the CPU reference bit-for-bit in behaviour)
 //!
-//!   per head `h` (`num_heads = 24` in the DiT):
+//! ```text
+//!   per head h (num_heads = 24 in the DiT):
 //!     S[qi,ki] = scale · Σ_d q[h,qi,d]·k[h,ki,d],  scale = 1/sqrt(head_dim)
-//!     softmax over `ki` (FULL ROW, NON-causal/bidirectional, max-subtracted)
+//!     softmax over ki (FULL ROW, NON-causal/bidirectional, max-subtracted)
 //!     O[qi,d]  = Σ_ki softmax(S)[qi,ki] · v[h,ki,d]
 //!   then transpose to token-major:
 //!     out[qi*(num_heads*head_dim) + h*head_dim + d] = O[h,qi,d]
+//! ```
 //!
 //! Layout (identical to the Metal kernel):
 //!   - `q`/`k`/`v`: head-major `[num_heads, seq, head_dim]` f32 (RoPE already

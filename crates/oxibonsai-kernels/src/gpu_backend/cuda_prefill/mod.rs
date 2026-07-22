@@ -1,6 +1,6 @@
 //! Prefill (batch) GPU dispatch for OxiBonsai — CUDA backend.
 //!
-//! Mirrors [`metal_prefill`] for Linux/Windows.  Handles batch processing of
+//! Mirrors `metal_prefill` for Linux/Windows.  Handles batch processing of
 //! multiple tokens during prompt prefill using GEMM kernels.
 //!
 //! # Architecture
@@ -17,14 +17,14 @@
 //! sub-modules; all external `super::cuda_prefill::*` access paths are
 //! preserved through the re-exports below.
 //!
-//!   - [`state`]: types ([`CudaPrefillBuffers`], [`CudaPrefillModules`]),
+//!   - `state`: types ([`CudaPrefillBuffers`], [`CudaPrefillModules`]),
 //!     singleton state, [`init_prefill_modules`], and buffer-acquisition
 //!     helpers.
-//!   - [`launchers`]: thin `unsafe fn` wrappers around `launch_builder()`
+//!   - `launchers`: thin `unsafe fn` wrappers around `launch_builder()`
 //!     for the 7 prefill kernels (4 Q1 + 3 TQ2).
-//!   - [`encode_q1`]: Q1 (1-bit) FFN + full-layer encoders.
-//!   - [`encode_ternary`]: TQ2 (ternary) FFN + full-layer encoders.
-//!   - [`try_apis`]: public [`try_cuda_prefill`] / [`try_cuda_prefill_ternary`]
+//!   - `encode_q1`: Q1 (1-bit) FFN + full-layer encoders.
+//!   - `encode_ternary`: TQ2 (ternary) FFN + full-layer encoders.
+//!   - `try_apis`: public [`try_cuda_prefill`] / [`try_cuda_prefill_ternary`]
 //!     entry points.
 //!
 //! # Batch tensor layout

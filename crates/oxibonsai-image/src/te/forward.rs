@@ -271,9 +271,10 @@ impl<'w> TextEncoder<'w> {
             .linear(&format!("{pfx}.self_attn.v_proj"), kv_dim, hidden)?;
         // [seq, q_dim] / [seq, kv_dim], token-major (heads concatenated).
         // nn.Linear outputs bf16.
-        let mut q = matmul(&x, &wq.data, seq, q_dim, hidden)?;
-        let mut k = matmul(&x, &wk.data, seq, kv_dim, hidden)?;
-        let mut v = matmul(&x, &wv.data, seq, kv_dim, hidden)?;
+        let resident = self.weights.is_resident();
+        let mut q = matmul(&x, &wq.data, seq, q_dim, hidden, resident)?;
+        let mut k = matmul(&x, &wk.data, seq, kv_dim, hidden, resident)?;
+        let mut v = matmul(&x, &wv.data, seq, kv_dim, hidden, resident)?;
         self.quantize(&mut q);
         self.quantize(&mut k);
         self.quantize(&mut v);
@@ -315,7 +316,7 @@ impl<'w> TextEncoder<'w> {
         let wo = self
             .weights
             .linear(&format!("{pfx}.self_attn.o_proj"), hidden, q_dim)?;
-        let mut attn_out = matmul(&attn, &wo.data, seq, hidden, q_dim)?;
+        let mut attn_out = matmul(&attn, &wo.data, seq, hidden, q_dim, resident)?;
         self.quantize(&mut attn_out);
         for (hv, av) in h.iter_mut().zip(attn_out.iter()) {
             *hv += *av;
@@ -337,8 +338,8 @@ impl<'w> TextEncoder<'w> {
         let wup = self
             .weights
             .linear(&format!("{pfx}.mlp.up_proj"), inter, hidden)?;
-        let mut gate = matmul(&x, &wgate.data, seq, inter, hidden)?;
-        let mut up = matmul(&x, &wup.data, seq, inter, hidden)?;
+        let mut gate = matmul(&x, &wgate.data, seq, inter, hidden, resident)?;
+        let mut up = matmul(&x, &wup.data, seq, inter, hidden, resident)?;
         // nn.Linear outputs bf16.
         self.quantize(&mut gate);
         self.quantize(&mut up);
@@ -355,7 +356,7 @@ impl<'w> TextEncoder<'w> {
         let wdown = self
             .weights
             .linear(&format!("{pfx}.mlp.down_proj"), hidden, inter)?;
-        let mut down = matmul(&act, &wdown.data, seq, hidden, inter)?;
+        let mut down = matmul(&act, &wdown.data, seq, hidden, inter, resident)?;
         self.quantize(&mut down);
         for (hv, dv) in h.iter_mut().zip(down.iter()) {
             *hv += *dv;
@@ -397,6 +398,18 @@ impl<'w> TextEncoder<'w> {
                 let q_row = &q[q_off + qi * head_dim..q_off + (qi + 1) * head_dim];
                 let mrow = &mask[qi * seq..(qi + 1) * seq];
                 for (ki, score) in scores.iter_mut().enumerate() {
+                    // A masked key (causal future or padding) carries an additive
+                    // `-inf`, so its softmax weight is `exp(-inf) = 0` no matter
+                    // the score. Skip the dot entirely and stamp `-inf` directly —
+                    // byte-identical to computing it. For the fixed 512-token
+                    // padded sequence this is the bulk of the work on a short
+                    // prompt (only the real, non-future keys survive). `mask` only
+                    // ever holds `0.0` or `-inf`, so `is_infinite()` is exactly the
+                    // masked set.
+                    if mrow[ki].is_infinite() {
+                        *score = f32::NEG_INFINITY;
+                        continue;
+                    }
                     let k_row = &k[kv_off + ki * head_dim..kv_off + (ki + 1) * head_dim];
                     *score = dot(q_row, k_row, head_dim) * scale + mrow[ki];
                 }
@@ -488,12 +501,24 @@ fn build_mask(attention_mask: &[i32], seq: usize) -> Vec<f32> {
 /// it silently falls through to the CPU [`gemm_abt`] path (never panics), so a
 /// GPU failure can never break a forward pass. Applied to every TE Linear
 /// (Q/K/V, o_proj, gate/up/down) since all call this helper.
+///
+/// `resident` controls the GPU weight cache residency policy: when `true`, the
+/// uploaded GPU buffer is kept across calls (amortizes upload cost across
+/// prompts); when `false`, it is evicted after each GEMM to prevent a
+/// stale-handle hazard from pointer-key recycling (see [`crate::te::gpu::te_matmul_gpu`]).
 static TE_MATMUL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static TE_ATTN_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn matmul(input: &[f32], weight: &[f32], m: usize, n: usize, k: usize) -> TeResult<Vec<f32>> {
+fn matmul(
+    input: &[f32],
+    weight: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    resident: bool,
+) -> TeResult<Vec<f32>> {
     let t = std::time::Instant::now();
-    let r = matmul_inner(input, weight, m, n, k);
+    let r = matmul_inner(input, weight, m, n, k, resident);
     TE_MATMUL_NS.fetch_add(
         t.elapsed().as_nanos() as u64,
         std::sync::atomic::Ordering::Relaxed,
@@ -501,7 +526,14 @@ fn matmul(input: &[f32], weight: &[f32], m: usize, n: usize, k: usize) -> TeResu
     r
 }
 
-fn matmul_inner(input: &[f32], weight: &[f32], m: usize, n: usize, k: usize) -> TeResult<Vec<f32>> {
+fn matmul_inner(
+    input: &[f32],
+    weight: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    _resident: bool,
+) -> TeResult<Vec<f32>> {
     if input.len() != m * k {
         return Err(TeError::Shape(format!(
             "matmul input len {} != m*k {}",
@@ -521,10 +553,12 @@ fn matmul_inner(input: &[f32], weight: &[f32], m: usize, n: usize, k: usize) -> 
     // identical `out[m,n] = Σ_k input[m,k]·weight[n,k]` contraction; on any GPU
     // error we fall through to the CPU path below — never panic. `out` is reused
     // (overwritten in full by `gemm_abt`), so a partial GPU write is harmless.
+    // `resident` is threaded through so the GPU path can evict non-resident keys
+    // from the weight cache after each GEMM (preventing stale-handle hazards).
     #[cfg(all(feature = "metal", target_os = "macos"))]
     {
         if crate::te::gpu::te_gpu_enabled() {
-            match crate::te::gpu::te_matmul_gpu(weight, input, &mut out, m, n, k) {
+            match crate::te::gpu::te_matmul_gpu(weight, input, &mut out, m, n, k, _resident) {
                 Ok(()) => return Ok(out),
                 Err(_e) => {
                     // Fall through to the CPU GEMM.
@@ -541,7 +575,7 @@ fn matmul_inner(input: &[f32], weight: &[f32], m: usize, n: usize, k: usize) -> 
     ))]
     {
         if crate::te::cuda_gpu::te_gpu_enabled() {
-            match crate::te::cuda_gpu::te_matmul_gpu(weight, input, &mut out, m, n, k) {
+            match crate::te::cuda_gpu::te_matmul_gpu(weight, input, &mut out, m, n, k, _resident) {
                 Ok(()) => return Ok(out),
                 Err(_e) => {
                     // Fall through to the CPU GEMM.
