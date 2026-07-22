@@ -19,7 +19,7 @@ To our knowledge, OxiBonsai is the first pure-Rust — C/C++/Fortran-free, zero-
 
 ## Status
 
-**Version 0.2.3** — 2026-07-21 · **5,158 tests passing** · ~197k lines of Rust · Pure Rust
+**Version 0.2.4** — 2026-07-22 · **5,158 tests passing** · ~197k lines of Rust · Pure Rust
 
 | Crate | Status | Tests |
 |-------|--------|-------|
@@ -182,7 +182,7 @@ This installs the `oxibonsai` binary. Rust 1.86+ required.
 
 ```toml
 [dependencies]
-oxibonsai = "0.2.3"
+oxibonsai = "0.2.4"
 ```
 
 ### Build from source (for development)

@@ -8,7 +8,7 @@ embedding, Grouped Query Attention with RoPE, SwiGLU MLP, RMSNorm, paged
 KV-cache, and Metal/CUDA full-forward integration via `oxibonsai-kernels`.
 
 **Status:** Stable — 1,209 tests passing (`cargo nextest run -p oxibonsai-model`)
-**Version:** 0.2.3
+**Version:** 0.2.4
 
 Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 
@@ -87,7 +87,7 @@ Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 
 ```toml
 [dependencies]
-oxibonsai-model = "0.2.3"
+oxibonsai-model = "0.2.4"
 ```
 
 ## License

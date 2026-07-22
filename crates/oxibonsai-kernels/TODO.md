@@ -1,8 +1,8 @@
 # oxibonsai-kernels TODO
 
 > 1-bit + ternary + standard-quant (Q4_0/Q8_0) + K-quant (Q2_K–Q8_K) compute kernels with SIMD dispatch, parallelism, and GPU backends
-> Version 0.2.3 — 508 tests passing
-> Last updated: 2026-07-21
+> Version 0.2.4 — 508 tests passing
+> Last updated: 2026-07-22
 
 ## Status: Stable (mature, complete)
 

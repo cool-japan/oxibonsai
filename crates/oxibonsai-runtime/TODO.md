@@ -1,7 +1,7 @@
 # oxibonsai-runtime TODO
 
 > Inference engine, sampling, tokenizer, OpenAI-compatible server
-> Version 0.2.3 — 1,667 tests passing (all-features, 2026-07-21)
+> Version 0.2.4 — 1,667 tests passing (all-features, 2026-07-22)
 
 ## Status: ✅ All Features Complete (Stable)
 

@@ -2,7 +2,7 @@
 
 > GGUF loader, quant block types, tensor types, model config, error types
 > 16 files, ~5,215 lines, 465 tests
-> Version: 0.2.3 — Last updated: 2026-07-21
+> Version: 0.2.4 — Last updated: 2026-07-22
 
 ## Status: ✅ All Features Complete
 

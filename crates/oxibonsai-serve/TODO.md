@@ -5,7 +5,7 @@
 > bearer-auth middleware around the Axum router from `oxibonsai-runtime`.
 >
 > 8 source files + 7 integration test files, 178 tests (all passing).
-> Version 0.2.3 — last reviewed 2026-07-21.
+> Version 0.2.4 — last reviewed 2026-07-22.
 
 ## Status: Stable (Alpha → Stable uplift complete)
 
