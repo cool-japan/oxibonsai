@@ -42,7 +42,7 @@ oxibonsai = { path = "crates/oxibonsai", version = "0.2.4" }
 scirs2-core = { version = "0.6.2", default-features = false }
 scirs2-linalg = { version = "0.6.2", default-features = false }
 scirs2-neural = { version = "0.6.2", default-features = false }
-oxifft = "0.3.2"
+oxifft = "0.4.0"
 oxiarc-deflate = "0.3.6"
 
 # ── GPU backends ──
