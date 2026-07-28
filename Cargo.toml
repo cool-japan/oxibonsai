@@ -39,9 +39,9 @@ oxibonsai-eval = { path = "crates/oxibonsai-eval", version = "0.2.4" }
 oxibonsai = { path = "crates/oxibonsai", version = "0.2.4" }
 
 # ── COOLJAPAN Ecosystem (Pure Rust Policy) ──
-scirs2-core = { version = "0.6.3", default-features = false }
-scirs2-linalg = { version = "0.6.3", default-features = false }
-scirs2-neural = { version = "0.6.3", default-features = false }
+scirs2-core = { version = "0.6.4", default-features = false }
+scirs2-linalg = { version = "0.6.4", default-features = false }
+scirs2-neural = { version = "0.6.4", default-features = false }
 oxifft = "0.4.1"
 oxiarc-deflate = "0.3.6"
 
