@@ -43,7 +43,7 @@ scirs2-core = { version = "0.6.4", default-features = false }
 scirs2-linalg = { version = "0.6.4", default-features = false }
 scirs2-neural = { version = "0.6.4", default-features = false }
 oxifft = "0.4.1"
-oxiarc-deflate = "0.3.6"
+oxiarc-deflate = "0.4.0"
 
 # ── GPU backends ──
 metal = "0.33.0"
