@@ -93,7 +93,7 @@ tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-
 
 # ── Model conversion ──
 safetensors = "0.8.0"
-oxionnx-proto = "0.1.6"
+oxionnx-proto = "0.1.7"
 
 # ── HTTP client ──
 reqwest = { version = "0.13", features = ["json", "blocking"] }
