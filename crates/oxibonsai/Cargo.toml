@@ -14,6 +14,23 @@ keywords = ["llm", "inference", "gguf", "bonsai", "1-bit"]
 categories = ["science", "algorithms", "command-line-utilities"]
 
 [features]
+# `hf-tokenizer` used to default on so this umbrella crate kept the
+# behaviour its users already depended on:
+# `oxibonsai_runtime::TokenizerBridge::from_file` returned the
+# HuggingFace-backed variant. Since FIX-01-BUILD gated every `tokenizers`
+# call site (deps-07/TOK-13), `--no-default-features` was already a
+# supported configuration: the bridge falls back to the Pure-Rust native BPE
+# backend (`oxibonsai-tokenizer`) and the crate builds C-free.
+#
+# FLIPPED OFF DEFAULT (BENCHES, wave 3, RT-ADMIN-CFG blocking-1 / decision
+# D-5): see `crates/oxibonsai-runtime/Cargo.toml`'s matching comment for the
+# two preconditions (cross-backend parity + the `is_special_id` benchmark)
+# that are now satisfied, including the window-scaled figure that decision
+# actually turns on (`native_step_decode` rescans the whole decode window
+# per streamed token, not one call: ~41-82 us/token at a realistic
+# 2048-4096 token window, still far below a token's decode cost).
+# `from_file` now returns the Native-backed variant by default; pass
+# `--features hf-tokenizer` to keep the HuggingFace path.
 default = []
 server = ["oxibonsai-runtime/server", "dep:oxibonsai-serve"]
 rag = ["dep:oxibonsai-rag"]
@@ -21,8 +38,56 @@ simd-avx2 = ["oxibonsai-kernels/simd-avx2"]
 simd-avx512 = ["oxibonsai-kernels/simd-avx512"]
 simd-neon = ["oxibonsai-kernels/simd-neon"]
 native-tokenizer = ["dep:oxibonsai-tokenizer"]
+hf-tokenizer = ["oxibonsai-runtime/hf-tokenizer"]
 eval = ["dep:oxibonsai-eval"]
-full = ["server", "rag", "native-tokenizer", "eval"]
+# RAG-EVAL-IMG-17 (P1): text-to-image (Bonsai-Image / FLUX.2 Klein DiT) via
+# `oxibonsai-image`. Optional, same shape as `rag`/`eval`/`native-tokenizer`
+# above.
+image = ["dep:oxibonsai-image"]
+# GPU acceleration, forwarded from the root `oxibonsai-cli` manifest's
+# `gpu`/`metal`/`cuda`/`native-cuda` features (root Cargo.toml's `[features]`
+# block) so this facade can finally turn on the same acceleration its CLI
+# binary already ships. `metal`/`native-cuda` imply `gpu`, matching the
+# root's semantics exactly; plain `cuda` does not (it is a compile-only
+# stub — see `oxibonsai-image/Cargo.toml`'s `cuda` doc comment — and root
+# does not imply `gpu` from it either).
+#
+# `oxibonsai-image` is *optional* here (unlike in `oxibonsai-cli`, where it
+# is a mandatory dependency), so `metal`/`native-cuda` forward to it with the
+# weak-dependency-feature syntax (`oxibonsai-image?/...`) rather than the
+# plain `oxibonsai-image/...` root uses: the plain form on an optional
+# dependency implicitly turns the dependency itself on (RAG-EVAL-IMG-17's
+# verifier correction flagged exactly this trap), which would make
+# `--features metal` alone silently pull in the entire imaging stack. The
+# weak form only forwards the feature *if* `image` was separately requested
+# (`--features image,metal`), matching the five independently-toggleable
+# combinations this crate's feature matrix tests
+# (`tests/feature_matrix.rs`) exercise. `cargo tree -p oxibonsai --features
+# metal` must never show `oxibonsai-image`; `--features image,metal` must.
+gpu = ["oxibonsai-kernels/gpu"]
+cuda = ["oxibonsai-kernels/cuda"]
+native-cuda = [
+    "gpu",
+    "oxibonsai-kernels/native-cuda",
+    "oxibonsai-model/native-cuda",
+    "oxibonsai-runtime/native-cuda",
+    "oxibonsai-image?/native-cuda",
+]
+metal = [
+    "gpu",
+    "oxibonsai-kernels/metal",
+    "oxibonsai-model/metal",
+    "oxibonsai-runtime/metal",
+    "oxibonsai-image?/metal",
+]
+# `full` gains `image` (it is as much a first-class optional crate as
+# `rag`/`eval`) but deliberately NOT `gpu`/`metal`/`cuda`/`native-cuda`
+# (RAG-EVAL-IMG-17 verifier correction: `cuda`/`native-cuda` cannot build on
+# macOS at all — `oxibonsai-image/Cargo.toml` documents `cudarc` needing the
+# CUDA toolkit — so pulling any GPU feature into `full` would make `--features
+# full` non-portable). GPU stays opt-in even under `full`; see this crate's
+# top-level doc comment's Feature Flags table for the same promise.
+full = ["server", "rag", "native-tokenizer", "hf-tokenizer", "eval", "image"]
 wasm = [
     "oxibonsai-core/wasm",
     "oxibonsai-kernels/wasm",
@@ -39,3 +104,4 @@ oxibonsai-rag = { workspace = true, optional = true }
 oxibonsai-eval = { workspace = true, optional = true }
 oxibonsai-tokenizer = { workspace = true, optional = true }
 oxibonsai-serve = { workspace = true, optional = true }
+oxibonsai-image = { workspace = true, optional = true }

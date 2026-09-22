@@ -2,6 +2,8 @@
 //!
 //! This module contains method implementations for `CudaGraph`.
 //!
+//! **UNVALIDATED on hardware** — compile-checked only (no CUDA device here).
+//!
 //! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
 
 use cudarc::driver::CudaSlice;
@@ -12,6 +14,43 @@ use super::types::{CudaGraphError, QkvBuffers};
 use super::cudagraph_type::CudaGraph;
 
 impl CudaGraph {
+    /// Copy exactly `dst.len()` elements out of a **capacity-based** device
+    /// buffer.
+    ///
+    /// Findings F2 and F8. The pooled QKV and LM-head buffers grow to the
+    /// largest request seen and are never shrunk, while cudarc's
+    /// `memcpy_dtoh` asserts `dst.len() >= src.len()` and `clone_dtoh` returns
+    /// `src.len()` elements. Copying the *whole* device buffer therefore
+    /// panicked outright on a later, smaller QKV request, and returned a logits
+    /// vector padded with the previous model's tail from the LM head — both
+    /// reachable by running two differently shaped models (multi-model or a
+    /// draft model) through the process-global singleton. Sizing the copy by
+    /// the current request fixes both, and is the only correct D2H shape for a
+    /// pooled buffer.
+    pub(crate) fn dtoh_exact(
+        &self,
+        src: &CudaSlice<f32>,
+        dst: &mut [f32],
+        what: &str,
+    ) -> Result<(), CudaGraphError> {
+        debug_assert!(
+            src.len() >= dst.len(),
+            "{what}: device buffer holds {} elements, {} requested",
+            src.len(),
+            dst.len()
+        );
+        let view = src.try_slice(0..dst.len()).ok_or_else(|| {
+            CudaGraphError::DriverError(format!(
+                "{what}: device buffer holds {} elements, {} requested",
+                src.len(),
+                dst.len()
+            ))
+        })?;
+        self.stream
+            .memcpy_dtoh(&view, dst)
+            .map_err(|e| CudaGraphError::DriverError(format!("download {what}: {e}")))
+    }
+
     /// Ensure QKV projection buffers are allocated for `(input_len, output_len)`.
     /// Re-allocates if the existing buffers are too small.
     fn acquire_qkv_buffers(
@@ -83,9 +122,9 @@ impl CudaGraph {
         self.stream
             .synchronize()
             .map_err(|e| CudaGraphError::DriverError(format!("qkv stream sync: {e}")))?;
-        self.stream
-            .memcpy_dtoh(&qkv.d_output, &mut output[..n_rows])
-            .map_err(|e| CudaGraphError::DriverError(format!("download qkv_output: {e}")))?;
+        // F2: `d_output` has *capacity* `output_capacity >= n_rows`; the copy
+        // must be sized by this request, not by the buffer.
+        self.dtoh_exact(&qkv.d_output, &mut output[..n_rows], "qkv_output")?;
         self.stream
             .synchronize()
             .map_err(|e| CudaGraphError::DriverError(format!("qkv D2H sync: {e}")))?;

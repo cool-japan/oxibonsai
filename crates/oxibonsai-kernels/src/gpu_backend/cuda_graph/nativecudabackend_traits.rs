@@ -13,6 +13,7 @@ use cudarc::driver::CudaSlice;
 use std::sync::Arc;
 use tracing::warn;
 
+use super::cudagraph_type::CudaGraph;
 use super::functions::alloc_handle_id;
 use super::types::NativeCudaBackend;
 
@@ -23,8 +24,19 @@ impl GpuBackendTrait for NativeCudaBackend {
     fn is_accelerated(&self) -> bool {
         true
     }
+    /// Real device count from the driver (finding **F-M4**).
+    ///
+    /// This was a hardcoded `1` — and it is the *only* `device_count` any caller
+    /// can reach through `GpuBackendTrait`, so `CudaGraph::device_count` (added
+    /// by CUDA-SAFETY) had no consumer at all and a multi-GPU host still
+    /// reported one device.
+    ///
+    /// Floored at `1`: this backend only exists once `CudaGraph::global()` has
+    /// built a context, which proves a device is present, so a driver query that
+    /// fails here must not make the backend advertise zero devices while it is
+    /// actively serving one.
     fn device_count(&self) -> usize {
-        1
+        CudaGraph::device_count().max(1)
     }
     fn alloc(&self, size: usize, device_id: usize) -> Result<DeviceBuffer, GpuError> {
         self.cpu_fallback.alloc(size, device_id)

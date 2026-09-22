@@ -44,8 +44,18 @@ pub struct CudaPrefillBuffers {
     pub d_qkv: CudaSlice<f32>,
     /// Batched attention output: `[capacity * nq*head_dim]` f32 (column-major).
     pub d_attn_out: CudaSlice<f32>,
-    /// Batched gate+up GEMM output: `[capacity * intermediate_size]` f32.
-    /// Layout: `[gate: bs*inter | up: bs*inter]` for `batched_swiglu`.
+    /// Batched gate+up GEMM output: `[capacity * intermediate_size]` f32,
+    /// laid out `[gate: bs*inter | up: bs*inter]`.
+    ///
+    /// Staging only. Both shipping prefill paths
+    /// (`encode_q1.rs` / `encode_ternary.rs`) use the fused
+    /// `fused_gate_up_swiglu_gemm_{q1,tq2}` kernels, which apply the SwiGLU
+    /// epilogue in-kernel and write straight to [`Self::d_swiglu`], so nothing
+    /// currently reads this buffer. It was the input of the separate
+    /// `batched_swiglu` kernel, deleted as dead in finding **F15** (the fused
+    /// kernels are strictly faster, so the verdict prefers deletion to wiring).
+    /// The allocation is kept so a future unfused format that needs a two-step
+    /// gate+up → SwiGLU has the staging slot already sized.
     pub d_gate_up: CudaSlice<f32>,
     /// Batched SwiGLU output: `[capacity * intermediate_size]` f32 (column-major).
     pub d_swiglu: CudaSlice<f32>,
@@ -96,12 +106,11 @@ impl CudaPrefillBuffers {
 // Compiled prefill CUDA modules
 // =============================================================================
 
-/// Compiled CUDA function handles for the 8 prefill kernels (5 Q1 + 3 TQ2).
+/// Compiled CUDA function handles for the 7 prefill kernels (4 Q1 + 3 TQ2).
 pub struct CudaPrefillModules {
     pub gemm_v7: CudaFunction,
     pub gemm_v7_residual: CudaFunction,
     pub fused_gate_up_swiglu_gemm: CudaFunction,
-    pub batched_swiglu: CudaFunction,
     pub batched_rmsnorm: CudaFunction,
     /// TQ2 batch GEMM — accumulates into output with `+=`.
     pub gemm_tq2_v7: CudaFunction,
@@ -182,7 +191,6 @@ pub fn init_prefill_modules(graph: &CudaGraph) -> Result<Arc<CudaPrefillModules>
         gemm_v7: load("gemm_q1_g128_v7")?,
         gemm_v7_residual: load("gemm_q1_g128_v7_residual")?,
         fused_gate_up_swiglu_gemm: load("fused_gate_up_swiglu_gemm_q1")?,
-        batched_swiglu: load("batched_swiglu")?,
         batched_rmsnorm: load("batched_rmsnorm_v2")?,
         gemm_tq2_v7: load("gemm_tq2_g128_v7")?,
         gemm_tq2_v7_residual: load("gemm_tq2_g128_v7_residual")?,

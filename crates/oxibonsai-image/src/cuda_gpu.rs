@@ -26,6 +26,39 @@
 //! On *any* error this module returns a `CudaGpuMatmulError`; the caller
 //! ([`crate::math::ternary_matmul`]) swallows it and falls back to the CPU path,
 //! so a GPU failure can never break a forward pass (no `unwrap`/`expect`/`panic!`).
+//!
+//! That fallback used to be completely silent (RAG-EVAL-IMG-18) on the Metal
+//! sibling ([`crate::gpu`]) before it was fixed there; every function below
+//! now gets the same one-time-latch treatment (an `AtomicBool` per function,
+//! `tracing::warn!` naming the op and the underlying error the first time it
+//! fails, silent thereafter for the life of the process). Unlike
+//! `crate::gpu` — which still uses `eprintln!` because it predates this
+//! crate's `tracing` dependency and is out of this fix's scope to touch — this
+//! (owned) file uses `tracing::warn!` directly.
+//!
+//! **No CUDA hardware on the reference macOS/Apple-Silicon development
+//! machine**, so this module has never *run*, and this crate's own gate
+//! commands never compile it (`target_os`-gated to Linux/Windows). It has,
+//! however, been type-checked for real: `cargo check`/`cargo clippy -- -D
+//! warnings -p oxibonsai-image --target x86_64-unknown-linux-gnu --features
+//! native-cuda` (both `--all-features` and `native-cuda`-only) succeed
+//! cleanly, including this module's `#[cfg(test)]` code — cross-compiling
+//! resolves every type and runs every lint without needing a CUDA toolkit,
+//! since `cargo check` only type-checks and never links. What is *not*
+//! verified is linking or execution (this workstation has no Linux
+//! cross-linker configured and no CUDA runtime/device either way), so a
+//! logic bug that only manifests at the kernel-call boundary (e.g. an actual
+//! `CudaGraph`/`CudaGraphError` behavioural mismatch) would not be caught
+//! here. The two functions with a direct Metal analogue
+//! (`ternary_matmul_gpu`, `joint_attention_gpu`) mirror `crate::gpu`'s
+//! already-compiling, already-tested per-step `.inspect_err(..)` placement
+//! exactly; the CUDA-only fused-resident functions below them
+//! (`dense_matmul_gpu`, `single_block_gpu`, `single_blocks_gpu`,
+//! `double_block_gpu`, which have no Metal-file counterpart to mirror)
+//! instead wrap their unchanged original body in a thin `_impl` + outer
+//! `.inspect_err(..)`, which is equivalent for a function's-worth of internal
+//! `?`s without threading a closure through each one of their many individual
+//! fallible steps by hand.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
@@ -90,7 +123,7 @@ static GPU_ENABLED: OnceLock<bool> = OnceLock::new();
 /// Whether the DiT should use the GPU ternary path.
 ///
 /// `true` unless the environment variable `OXI_DIT_GPU` is set to `0`. The env
-/// read is cached in a [`OnceLock`] on first call.
+/// read is cached in a `OnceLock` on first call.
 pub fn dit_gpu_enabled() -> bool {
     *GPU_ENABLED.get_or_init(|| !matches!(std::env::var("OXI_DIT_GPU").ok().as_deref(), Some("0")))
 }
@@ -117,7 +150,7 @@ static ATTN_GPU_ENABLED: OnceLock<bool> = OnceLock::new();
 /// Whether the DiT should use the GPU flash-attention path for joint attention.
 ///
 /// `true` unless the environment variable `OXI_DIT_ATTN_GPU` is set to `0`. The
-/// env read is cached in a [`OnceLock`] on first call. Kept a *separate* toggle
+/// env read is cached in a `OnceLock` on first call. Kept a *separate* toggle
 /// from [`dit_gpu_enabled`] (which gates the ternary matmuls) so the attention
 /// contribution can be measured independently for A/B parity + timing. The
 /// per-op CPU fallback in [`crate::math::joint_attention`] (a silent fall-through
@@ -125,6 +158,40 @@ static ATTN_GPU_ENABLED: OnceLock<bool> = OnceLock::new();
 pub fn dit_attn_gpu_enabled() -> bool {
     *ATTN_GPU_ENABLED
         .get_or_init(|| !matches!(std::env::var("OXI_DIT_ATTN_GPU").ok().as_deref(), Some("0")))
+}
+
+/// Latch for [`ternary_matmul_gpu`]'s one-time fallback warning.
+static TERNARY_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+/// Latch for [`joint_attention_gpu`]'s one-time fallback warning.
+static ATTN_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+/// Latch for [`dense_matmul_gpu`]'s one-time fallback warning.
+static DENSE_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+/// Latch for [`single_block_gpu`]'s one-time fallback warning.
+static SINGLE_BLOCK_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+/// Latch for [`single_blocks_gpu`]'s one-time fallback warning.
+static SINGLE_BLOCKS_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+/// Latch for [`double_block_gpu`]'s one-time fallback warning.
+static DOUBLE_BLOCK_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Emit a one-time `tracing::warn!` the first time `flag`'s GPU op fails and
+/// the caller falls back to the CPU reference path.
+///
+/// `flag.swap(true, ..)` returns the *previous* value, so the message prints
+/// exactly once per process per call site — every subsequent failure (e.g. a
+/// GPU that stays unavailable for the life of the process) is silently
+/// dropped, matching a "warn once" contract without spamming the log on the
+/// DiT's ~100 per-step matmul calls. Mirrors `crate::gpu`'s already-shipped
+/// latch pattern (see the module docs for why this uses `tracing::warn!`
+/// where that one still uses `eprintln!`).
+fn warn_gpu_fallback_once(flag: &'static AtomicBool, op: &str, reason: &str) {
+    if !flag.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            op,
+            reason,
+            "oxibonsai-image: GPU op failed, falling back to CPU; further \
+             occurrences in this process are not logged"
+        );
+    }
 }
 
 /// Compute FLUX.2 DiT joint multi-head scaled-dot-product attention on the GPU
@@ -154,11 +221,18 @@ pub fn joint_attention_gpu(
     seq: usize,
     head_dim: usize,
 ) -> Result<Vec<f32>, CudaGpuMatmulError> {
-    let graph =
-        CudaGraph::global().map_err(|e| CudaGpuMatmulError::GraphUnavailable(e.to_string()))?;
+    let graph = CudaGraph::global()
+        .map_err(|e| CudaGpuMatmulError::GraphUnavailable(e.to_string()))
+        .inspect_err(|e| {
+            warn_gpu_fallback_once(&ATTN_FALLBACK_WARNED, "joint attention", &e.to_string())
+        })?;
     // The kernel writes the token-major transposed result `[seq, num_heads*head_dim]`.
     let mut out = vec![0.0f32; seq * num_heads * head_dim];
-    graph.encode_joint_attention_flash_pooled(q, k, v, &mut out, num_heads, seq, head_dim)?;
+    graph
+        .encode_joint_attention_flash_pooled(q, k, v, &mut out, num_heads, seq, head_dim)
+        .inspect_err(|e| {
+            warn_gpu_fallback_once(&ATTN_FALLBACK_WARNED, "joint attention", &e.to_string())
+        })?;
     DIT_ATTN_GPU_USED.store(true, Ordering::Relaxed);
     Ok(out)
 }
@@ -186,15 +260,25 @@ pub fn ternary_matmul_gpu(
     n: usize,
     k: usize,
 ) -> Result<(), CudaGpuMatmulError> {
-    let graph =
-        CudaGraph::global().map_err(|e| CudaGpuMatmulError::GraphUnavailable(e.to_string()))?;
+    let graph = CudaGraph::global()
+        .map_err(|e| CudaGpuMatmulError::GraphUnavailable(e.to_string()))
+        .inspect_err(|e| {
+            warn_gpu_fallback_once(&TERNARY_FALLBACK_WARNED, "ternary matmul", &e.to_string())
+        })?;
     // `blocks` is borrowed from the run-long mmap; its base address is stable and
     // unique per weight, so it doubles as a cache key with no per-Linear bookkeeping.
     // Pointer addresses are huge and won't collide with the LLM's small key space.
     let key = blocks.as_ptr() as u64;
-    let handle =
-        graph.get_or_upload_weight_tq2_soa_lazy(key, || blocks_as_bytes(blocks).to_vec())?;
-    graph.encode_gemm_tq2(&handle, input, out, m, n, k)?;
+    let handle = graph
+        .get_or_upload_weight_tq2_soa_lazy(key, || blocks_as_bytes(blocks).to_vec())
+        .inspect_err(|e| {
+            warn_gpu_fallback_once(&TERNARY_FALLBACK_WARNED, "ternary matmul", &e.to_string())
+        })?;
+    graph
+        .encode_gemm_tq2(&handle, input, out, m, n, k)
+        .inspect_err(|e| {
+            warn_gpu_fallback_once(&TERNARY_FALLBACK_WARNED, "ternary matmul", &e.to_string())
+        })?;
     GPU_USED.store(true, Ordering::Relaxed);
     Ok(())
 }
@@ -222,12 +306,25 @@ pub fn dense_matmul_gpu(
     n: usize,
     k: usize,
 ) -> Result<(), CudaGpuMatmulError> {
-    let graph =
-        CudaGraph::global().map_err(|e| CudaGpuMatmulError::GraphUnavailable(e.to_string()))?;
+    let graph = CudaGraph::global()
+        .map_err(|e| CudaGpuMatmulError::GraphUnavailable(e.to_string()))
+        .inspect_err(|e| {
+            warn_gpu_fallback_once(&DENSE_FALLBACK_WARNED, "dense matmul", &e.to_string())
+        })?;
     let key = weight.as_ptr() as u64;
-    let handle = graph.get_or_upload_f32_weight(key, weight)?;
-    graph.encode_gemm_f32(&handle, input, out, m, n, k)?;
-    graph.evict_f32_weight(key)?;
+    let handle = graph
+        .get_or_upload_f32_weight(key, weight)
+        .inspect_err(|e| {
+            warn_gpu_fallback_once(&DENSE_FALLBACK_WARNED, "dense matmul", &e.to_string())
+        })?;
+    graph
+        .encode_gemm_f32(&handle, input, out, m, n, k)
+        .inspect_err(|e| {
+            warn_gpu_fallback_once(&DENSE_FALLBACK_WARNED, "dense matmul", &e.to_string())
+        })?;
+    graph.evict_f32_weight(key).inspect_err(|e| {
+        warn_gpu_fallback_once(&DENSE_FALLBACK_WARNED, "dense matmul", &e.to_string())
+    })?;
     GPU_USED.store(true, Ordering::Relaxed);
     Ok(())
 }
@@ -260,7 +357,7 @@ static DIT_FUSED_ENABLED: OnceLock<bool> = OnceLock::new();
 /// Whether DiT blocks should use the fused resident GPU forward.
 ///
 /// `true` unless the environment variable `OXI_DIT_FUSED` is set to `0`. The env
-/// read is cached in a [`OnceLock`] on first call.
+/// read is cached in a `OnceLock` on first call.
 pub fn dit_fused_enabled() -> bool {
     *DIT_FUSED_ENABLED
         .get_or_init(|| !matches!(std::env::var("OXI_DIT_FUSED").ok().as_deref(), Some("0")))
@@ -282,9 +379,53 @@ pub fn dit_fused_enabled() -> bool {
 /// # Errors
 /// `CudaGpuMatmulError` if the CUDA graph is unavailable, a required weight
 /// (`to_qkv_mlp_proj` / `to_out`) is missing or the wrong quant type, or the
-/// resident encode fails.
+/// resident encode fails. On failure, a one-time `tracing::warn!` fires first
+/// — see `warn_gpu_fallback_once`.
 #[allow(clippy::too_many_arguments)]
 pub fn single_block_gpu(
+    weights: &DitWeights,
+    index: u32,
+    h: &mut [f32],
+    seq: usize,
+    hidden_size: usize,
+    num_heads: usize,
+    head_dim: usize,
+    ffn_inner: usize,
+    eps: f32,
+    rope: &RopeTables,
+    mod_single: &ModTriple,
+    norms: &QkvNorm,
+) -> Result<(), CudaGpuMatmulError> {
+    single_block_gpu_impl(
+        weights,
+        index,
+        h,
+        seq,
+        hidden_size,
+        num_heads,
+        head_dim,
+        ffn_inner,
+        eps,
+        rope,
+        mod_single,
+        norms,
+    )
+    .inspect_err(|e| {
+        warn_gpu_fallback_once(
+            &SINGLE_BLOCK_FALLBACK_WARNED,
+            "single block (fused)",
+            &e.to_string(),
+        )
+    })
+}
+
+/// The unwarned body of [`single_block_gpu`], factored out so the public
+/// function's only job is dispatching to it and attaching the one-time
+/// fallback warning — see this file's module docs for why the CUDA-only fused
+/// functions use this `_impl` + outer `.inspect_err(..)` shape instead of
+/// threading the warning through each individual internal `?`.
+#[allow(clippy::too_many_arguments)]
+fn single_block_gpu_impl(
     weights: &DitWeights,
     index: u32,
     h: &mut [f32],
@@ -345,9 +486,51 @@ pub fn single_block_gpu(
 /// per-block PCIe round-trip + device sync that dominate the DiT wall on a
 /// discrete GPU. The per-block ternary weights are cached by their mmap pointer;
 /// only the tiny QK-norm vectors are re-staged. On any `Err` the caller falls
-/// back to the per-block path (and `joint` is written back only on success).
+/// back to the per-block path (and `joint` is written back only on success). A
+/// one-time `tracing::warn!` fires first — see `warn_gpu_fallback_once`.
 #[allow(clippy::too_many_arguments)]
 pub fn single_blocks_gpu(
+    weights: &DitWeights,
+    num_single: usize,
+    joint: &mut [f32],
+    seq: usize,
+    hidden_size: usize,
+    num_heads: usize,
+    head_dim: usize,
+    ffn_inner: usize,
+    eps: f32,
+    rope: &RopeTables,
+    mod_single: &ModTriple,
+    norms: &[QkvNorm],
+) -> Result<(), CudaGpuMatmulError> {
+    single_blocks_gpu_impl(
+        weights,
+        num_single,
+        joint,
+        seq,
+        hidden_size,
+        num_heads,
+        head_dim,
+        ffn_inner,
+        eps,
+        rope,
+        mod_single,
+        norms,
+    )
+    .inspect_err(|e| {
+        warn_gpu_fallback_once(
+            &SINGLE_BLOCKS_FALLBACK_WARNED,
+            "single blocks (fused, whole stack)",
+            &e.to_string(),
+        )
+    })
+}
+
+/// The unwarned body of [`single_blocks_gpu`] — see this file's module docs
+/// for why the CUDA-only fused functions use this `_impl` + outer
+/// `.inspect_err(..)` shape.
+#[allow(clippy::too_many_arguments)]
+fn single_blocks_gpu_impl(
     weights: &DitWeights,
     num_single: usize,
     joint: &mut [f32],
@@ -436,9 +619,55 @@ pub fn single_blocks_gpu(
 ///
 /// # Errors
 /// `CudaGpuMatmulError` if the CUDA graph is unavailable, a required weight is
-/// missing / the wrong quant type, or the resident encode fails.
+/// missing / the wrong quant type, or the resident encode fails. A one-time
+/// `tracing::warn!` fires first — see `warn_gpu_fallback_once`.
 #[allow(clippy::too_many_arguments)]
 pub fn double_block_gpu(
+    weights: &DitWeights,
+    index: u32,
+    hidden: &mut [f32],
+    enc: &mut [f32],
+    seq_img: usize,
+    seq_txt: usize,
+    hidden_size: usize,
+    num_heads: usize,
+    head_dim: usize,
+    ffn_inner: usize,
+    eps: f32,
+    rope: &RopeTables,
+    mod_img: &DoubleMod,
+    mod_txt: &DoubleMod,
+) -> Result<(), CudaGpuMatmulError> {
+    double_block_gpu_impl(
+        weights,
+        index,
+        hidden,
+        enc,
+        seq_img,
+        seq_txt,
+        hidden_size,
+        num_heads,
+        head_dim,
+        ffn_inner,
+        eps,
+        rope,
+        mod_img,
+        mod_txt,
+    )
+    .inspect_err(|e| {
+        warn_gpu_fallback_once(
+            &DOUBLE_BLOCK_FALLBACK_WARNED,
+            "double block (fused)",
+            &e.to_string(),
+        )
+    })
+}
+
+/// The unwarned body of [`double_block_gpu`] — see this file's module docs for
+/// why the CUDA-only fused functions use this `_impl` + outer
+/// `.inspect_err(..)` shape.
+#[allow(clippy::too_many_arguments)]
+fn double_block_gpu_impl(
     weights: &DitWeights,
     index: u32,
     hidden: &mut [f32],
@@ -577,5 +806,26 @@ mod tests {
         if std::env::var("OXI_DIT_FUSED").is_err() {
             assert!(dit_fused_enabled());
         }
+    }
+
+    #[test]
+    fn warn_gpu_fallback_once_fires_exactly_once_per_flag() {
+        // A private, test-local latch (never touched by any other test or by
+        // the real GPU call sites), so this is deterministic regardless of
+        // process/thread scheduling — mirrors `crate::gpu`'s Metal sibling
+        // test of the same name.
+        static LOCAL_WARNED: AtomicBool = AtomicBool::new(false);
+        assert!(
+            !LOCAL_WARNED.load(Ordering::Relaxed),
+            "fresh static must start false"
+        );
+        warn_gpu_fallback_once(&LOCAL_WARNED, "test op", "first reason");
+        assert!(
+            LOCAL_WARNED.load(Ordering::Relaxed),
+            "the first call must latch the flag"
+        );
+        warn_gpu_fallback_once(&LOCAL_WARNED, "test op", "second reason");
+        warn_gpu_fallback_once(&LOCAL_WARNED, "test op", "third reason");
+        assert!(LOCAL_WARNED.load(Ordering::Relaxed));
     }
 }

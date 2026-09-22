@@ -5,9 +5,42 @@
 
 #![cfg(feature = "metal")]
 
-use metal::{Buffer, MTLSize};
+use metal::{Buffer, ComputePipelineState, MTLSize};
 
-use super::metal_graph::{div_ceil, set_scalar, MetalGraph};
+use super::metal_graph::{div_ceil, set_scalar, MetalGraph, MetalGraphError};
+
+/// Largest `head_dim` the `batched_attention_scores_v2` MSL kernel computes a
+/// *complete* dot product for.
+///
+/// The kernel stages the query row into `threadgroup float shared_q[128]` and
+/// accumulates over exactly 128 dims with no bound check
+/// (`kernel_sources/attention.rs`), so a larger `head_dim` silently scores on
+/// the first 128 dims — measured on this M3 as 4.13628 vs the CPU's 7.43115 at
+/// `head_dim 256`, with `MTLCommandBufferStatus == Completed` (MET-01).
+///
+/// Every shipping model here uses `head_dim` 64 or 128. Bonsai 2 uses 256, so
+/// B2-15 makes the kernel `head_dim`-generic (staging sized to
+/// `MAX_HEAD_DIM = 256`) and raises this constant with it.
+pub(crate) const ATTENTION_SCORES_V2_MAX_HEAD_DIM: u32 = 128;
+
+/// Largest `k` [`MetalGraph::dispatch_topk_f32`] accepts.
+///
+/// The `topk_f32` MSL kernel (`kernel_sources/utility.rs`) tracks its `k`
+/// already-picked winners in a fixed-size `threadgroup uint picked[256]`
+/// array, so this bound is a hard ceiling shared by both sides: the kernel
+/// itself additionally clamps to it in case a caller ever bypasses this
+/// dispatcher, but `dispatch_topk_f32` rejects a larger `k` outright with a
+/// typed error rather than silently truncating the caller's request to
+/// fewer winners than asked for. 256 comfortably covers every realistic
+/// `top_k` sampling value (Bonsai 2's recommended sampling config uses
+/// `top_k = 20`).
+///
+/// Wiring a sampled decode request through `dispatch_topk_f32` is
+/// METAL-CONCURRENCY's (wave 4; see the `topk_f32` field doc on
+/// `MetalPipelines`), so nothing in the non-test build reads this constant
+/// yet — this crate's own tests do, hence `#[allow(dead_code)]`.
+#[allow(dead_code)]
+pub(crate) const MAX_TOPK_F32: u32 = 256;
 
 impl MetalGraph {
     // ─────────────────────────────────────────────────────────────────────
@@ -875,6 +908,16 @@ impl MetalGraph {
     ///
     /// Replaces two separate `kv_cache_store` dispatches.
     ///
+    /// `layer_offset` is the `u64` element offset produced by
+    /// [`GpuKvCache::layer_offset_elements`](crate::gpu_backend::metal_full_layer::GpuKvCache::layer_offset_elements)
+    /// (MET-07). The MSL parameter is still `constant uint&`, so the scalar is
+    /// bound as 8 bytes of which the kernel reads the low 4 — exact for every
+    /// geometry `GpuKvCache::allocate` admits, because that guard rejects any
+    /// cache whose total element count leaves the 32-bit range
+    /// (`metal_full_layer::types::KV_CACHE_MAX_ELEMENTS`). B2-15 widens the MSL
+    /// binding to `constant ulong&`, after which no cap is needed and this
+    /// binding needs no change.
+    ///
     /// Dispatch: `[ceil(head_dim/64), nkv, 1]` threadgroups, `[64, 1, 1]` threads
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch_fused_kv_store(
@@ -889,7 +932,7 @@ impl MetalGraph {
         head_dim: u32,
         max_seq: u32,
         pos: u32,
-        layer_offset: u32,
+        layer_offset: u64,
     ) {
         encoder.set_compute_pipeline_state(&self.pipelines.fused_kv_store);
         encoder.set_buffer(0, Some(k_data), 0);
@@ -933,6 +976,102 @@ impl MetalGraph {
         }
         // Single threadgroup — 1024 threads cooperate to find max
         encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(1024, 1, 1));
+    }
+
+    /// Dispatch `topk_f32` — the `k` highest `(id, value)` pairs of a float
+    /// array, sorted descending, first-index tie-break (`perf-11`; see the
+    /// kernel doc in `kernel_sources/utility.rs` for the full algorithm and
+    /// why the cap below is safe rather than a silent truncation).
+    ///
+    /// This dispatcher only encodes the kernel invocation — it does not
+    /// download or interpret `out_ids`/`out_vals`, matching every other
+    /// `dispatch_*` method in this file. Wiring a sampled decode request
+    /// through this (upload logits → dispatch → download `k` pairs instead
+    /// of the full row) is METAL-CONCURRENCY's (wave 4), per the
+    /// `topk_f32` field doc on `MetalPipelines`.
+    ///
+    /// **Before wiring that consumer, read the `-INFINITY` contract** on the
+    /// `MSL_TOPK_F32` doc comment (`kernel_sources/utility.rs`): a real,
+    /// grammar-masked `-INFINITY` logit and an exhausted pad slot are
+    /// indistinguishable in `out_vals`/`out_ids` BY DESIGN — the consumer
+    /// must treat `out_vals[i] == -INFINITY` as "no candidate" and ignore
+    /// the paired `out_ids[i]`, never sample or rank on it.
+    ///
+    /// Buffer layout:
+    /// - buffer(0) = data     (f32, input values)
+    /// - buffer(1) = out_ids  (uint32, `k` winning indices, descending by value)
+    /// - buffer(2) = out_vals (f32, `k` winning values, same order)
+    /// - buffer(3) = count    (uint32, scalar — length of `data`)
+    /// - buffer(4) = k        (uint32, scalar — number of winners requested)
+    ///
+    /// Dispatch: `[1, 1, 1]` threadgroups, `[1024, 1, 1]` threads — identical
+    /// geometry to `dispatch_argmax`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MetalGraphError::InvalidDimensions`] if `k` exceeds
+    /// [`MAX_TOPK_F32`], rather than silently clamping the caller's request
+    /// down to fewer winners than asked for. `out_ids`/`out_vals` must each
+    /// be sized for at least `k` elements — same convention as every other
+    /// `dispatch_*` buffer-sizing precondition in this file.
+    ///
+    /// The engine-side caller is METAL-CONCURRENCY's (wave 4), so nothing in
+    /// the non-test build calls this yet — this file's own
+    /// `topk_f32_*`/`dispatch_topk_f32_*` tests do, dispatching the real
+    /// kernel and checking its output against a CPU oracle, hence
+    /// `#[allow(dead_code)]` (matching `MetalPipelines::
+    /// gemm_tq2_g128_v8_tiled`'s precedent for "compiled and tested, not yet
+    /// wired into the shipping call path").
+    #[allow(dead_code)]
+    pub(crate) fn dispatch_topk_f32(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        data: &Buffer,
+        out_ids: &Buffer,
+        out_vals: &Buffer,
+        count: u32,
+        k: u32,
+    ) -> Result<(), MetalGraphError> {
+        if k > MAX_TOPK_F32 {
+            return Err(MetalGraphError::InvalidDimensions(format!(
+                "dispatch_topk_f32: k={k} exceeds MAX_TOPK_F32={MAX_TOPK_F32}"
+            )));
+        }
+        encoder.set_compute_pipeline_state(&self.pipelines.topk_f32);
+        encoder.set_buffer(0, Some(data), 0);
+        encoder.set_buffer(1, Some(out_ids), 0);
+        encoder.set_buffer(2, Some(out_vals), 0);
+        unsafe {
+            set_scalar(encoder, 3, &count);
+            set_scalar(encoder, 4, &k);
+        }
+        // Single threadgroup — 1024 threads cooperate, exactly as `argmax`.
+        encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(1024, 1, 1));
+        Ok(())
+    }
+
+    /// Resolve (and cache) a compute pipeline for `name` from the shared
+    /// embedded metallib.
+    ///
+    /// Convenience wrapper around [`MetalPipelines::pipeline_for`] for a
+    /// caller that already holds a `&MetalGraph` (e.g. via
+    /// `MetalGraph::global()`) and so has both the library and the device it
+    /// needs without threading the device through separately. This is the
+    /// MET-10 escape hatch: `metal_fp8_prefill.rs`, `metal_k_quant_kernels.rs`
+    /// and `metal_q_std_kernels.rs` (not owned by this package) can port
+    /// their per-kernel `device.new_library_with_source(...)` call sites onto
+    /// `graph.pipeline_for("gemv_q4k")` (etc.) one at a time, reusing this
+    /// `MetalGraph`'s device, command queue and the embedded/disk-cached
+    /// metallib instead of compiling their own library from source on first
+    /// use.
+    ///
+    /// Those three ports are someone else's follow-up, so nothing in the
+    /// non-test build calls this yet —
+    /// `pipeline_for_resolves_and_dispatches_a_kquant_kernel_by_name` below
+    /// does, end to end, hence `#[allow(dead_code)]`.
+    #[allow(dead_code)]
+    pub(crate) fn pipeline_for(&self, name: &str) -> Result<ComputePipelineState, MetalGraphError> {
+        self.pipelines.pipeline_for(&self.device, name)
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -1040,6 +1179,17 @@ impl MetalGraph {
 
     /// Dispatch batched attention scores V2: 128-thread TGs with position batching.
     /// Each TG processes `batch_stride` positions instead of 1, reducing TG scheduling overhead.
+    ///
+    /// # Preconditions
+    ///
+    /// * `head_dim <= ATTENTION_SCORES_V2_MAX_HEAD_DIM` — see that constant.
+    ///   This is the single entry point shared by decode
+    ///   (`metal_full_layer::functions_2`) and prefill (`metal_prefill::functions`),
+    ///   so the check lives here rather than at each call site.
+    /// * `cache_layer_offset` is the `u64` element offset from
+    ///   `GpuKvCache::layer_offset_elements`; see
+    ///   [`Self::dispatch_fused_kv_store`] for why binding it against the
+    ///   kernel's `constant uint&` is exact for every admitted geometry.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch_attention_scores_v2(
         &self,
@@ -1054,8 +1204,22 @@ impl MetalGraph {
         max_seq: u32,
         seq_len: u32,
         inv_sqrt_hd: f32,
-        cache_layer_offset: u32,
+        cache_layer_offset: u64,
     ) {
+        debug_assert!(
+            head_dim <= ATTENTION_SCORES_V2_MAX_HEAD_DIM,
+            "batched_attention_scores_v2 stages only {ATTENTION_SCORES_V2_MAX_HEAD_DIM} query \
+             dims; head_dim {head_dim} would silently score on a partial dot product"
+        );
+        if head_dim > ATTENTION_SCORES_V2_MAX_HEAD_DIM {
+            tracing::error!(
+                head_dim,
+                max_head_dim = ATTENTION_SCORES_V2_MAX_HEAD_DIM,
+                "batched_attention_scores_v2 staging array is too small for this head_dim; \
+                 scores will be computed over the first {ATTENTION_SCORES_V2_MAX_HEAD_DIM} dims \
+                 only (MET-01 — kernel widening lands with B2-15)"
+            );
+        }
         let batch_stride: u32 = 16; // Process 16 positions per TG
         encoder.set_compute_pipeline_state(&self.pipelines.batched_attention_scores_v2);
         encoder.set_buffer(0, Some(queries), 0);
@@ -1140,5 +1304,577 @@ impl MetalGraph {
             MTLSize::new(tg_x, num_heads as u64, 1),
             MTLSize::new(THREADS, 1, 1),
         );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests — u64 KV layer offset binding (MET-07)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(all(test, feature = "metal", target_os = "macos"))]
+mod tests {
+    use super::*;
+    use crate::gpu_backend::metal_full_layer::types::kv_layer_offset_elements;
+    use metal::{Device, MTLResourceOptions};
+
+    /// The Rust side now hands `fused_kv_store` a `u64` layer offset while the
+    /// MSL parameter is still `constant uint&`. Prove on the device that the
+    /// store lands at the intended address for a *non-zero* layer — i.e. that
+    /// the 8-byte `set_bytes` against a 4-byte kernel parameter is accepted and
+    /// read as the low word.
+    #[test]
+    fn fused_kv_store_honours_a_u64_layer_offset() {
+        if Device::system_default().is_none() {
+            return;
+        }
+        let graph = MetalGraph::global().expect("MetalGraph::global");
+
+        let (n_layers, nkv, max_seq, head_dim) = (4usize, 2usize, 8usize, 16usize);
+        let layer_idx = 3usize;
+        let pos = 5usize;
+        let total = n_layers * nkv * max_seq * head_dim;
+
+        let shared = MTLResourceOptions::StorageModeShared;
+        let k_data: Vec<f32> = (0..nkv * head_dim).map(|i| i as f32 + 1.0).collect();
+        let v_data: Vec<f32> = (0..nkv * head_dim).map(|i| -(i as f32) - 1.0).collect();
+        let k_buf = graph.device.new_buffer((k_data.len() * 4) as u64, shared);
+        let v_buf = graph.device.new_buffer((v_data.len() * 4) as u64, shared);
+        // SAFETY: both buffers are StorageModeShared and sized for the slices.
+        unsafe {
+            super::super::metal_graph::upload_f32(&k_buf, &k_data);
+            super::super::metal_graph::upload_f32(&v_buf, &v_data);
+        }
+        let k_cache = graph.device.new_buffer((total * 2) as u64, shared);
+        let v_cache = graph.device.new_buffer((total * 2) as u64, shared);
+        // REQUIRED #5 (wave-1+1.5 gatekeeper review): Metal does NOT
+        // zero-initialise newly allocated buffers — `newBufferWithLength:
+        // options:` makes no such guarantee, so the "untouched" assertions
+        // below need an explicit known-zero baseline instead of relying on
+        // allocator/driver behaviour that merely happened to read as zero.
+        // SAFETY: both buffers are freshly allocated, `StorageModeShared`
+        // (CPU- and GPU-visible with no synchronization needed before the
+        // command buffer that writes them runs), and `total * 2` is exactly
+        // their allocated byte length (`total` `half::f16` elements each).
+        unsafe {
+            std::ptr::write_bytes(k_cache.contents() as *mut u8, 0u8, total * 2);
+            std::ptr::write_bytes(v_cache.contents() as *mut u8, 0u8, total * 2);
+        }
+
+        let layer_offset = kv_layer_offset_elements(layer_idx, nkv, max_seq, head_dim);
+        assert_eq!(layer_offset, (3 * 2 * 8 * 16) as u64);
+
+        let cmd = graph.command_queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+        graph.dispatch_fused_kv_store(
+            encoder,
+            &k_buf,
+            &v_buf,
+            0,
+            &k_cache,
+            &v_cache,
+            nkv as u32,
+            head_dim as u32,
+            max_seq as u32,
+            pos as u32,
+            layer_offset,
+        );
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let k_ptr = k_cache.contents() as *const half::f16;
+        let v_ptr = v_cache.contents() as *const half::f16;
+        for head in 0..nkv {
+            for d in 0..head_dim {
+                let dst = layer_offset as usize + (head * max_seq + pos) * head_dim + d;
+                let src = head * head_dim + d;
+                // SAFETY: `dst < total` and the buffer is shared and initialised.
+                let got_k = unsafe { std::ptr::read(k_ptr.add(dst)) }.to_f32();
+                let got_v = unsafe { std::ptr::read(v_ptr.add(dst)) }.to_f32();
+                assert_eq!(got_k, k_data[src], "K at head {head} dim {d}");
+                assert_eq!(got_v, v_data[src], "V at head {head} dim {d}");
+            }
+        }
+        // Nothing outside the addressed slab was touched.
+        let first_of_layer = layer_offset as usize;
+        for idx in [0usize, first_of_layer - 1, first_of_layer + head_dim - 1] {
+            // SAFETY: indices are inside the allocated cache.
+            let stray = unsafe { std::ptr::read(k_ptr.add(idx)) }.to_f32();
+            assert_eq!(stray, 0.0, "cache element {idx} must be untouched");
+        }
+    }
+
+    /// The staging-array cap that `batched_attention_scores_v2` relies on must
+    /// stay in sync with the MSL text until B2-15 widens it.
+    #[test]
+    fn attention_scores_v2_head_dim_cap_matches_the_msl_staging_array() {
+        use crate::gpu_backend::kernel_sources::MSL_BATCHED_ATTENTION_SCORES_V2;
+        assert!(
+            MSL_BATCHED_ATTENTION_SCORES_V2.contains(&format!(
+                "threadgroup float shared_q[{ATTENTION_SCORES_V2_MAX_HEAD_DIM}]"
+            )),
+            "MSL staging array size changed; update ATTENTION_SCORES_V2_MAX_HEAD_DIM"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // `topk_f32` (perf-11 sampled-decode partial reduction)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Deterministic xorshift64* — failures are reproducible from the seed
+    /// alone (same construction as `tests/gpu_argmax_tiebreak.rs`).
+    struct TopkRng(u64);
+
+    impl TopkRng {
+        fn new(seed: u64) -> Self {
+            Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        fn f32_range(&mut self, lo: f32, hi: f32) -> f32 {
+            let unit = (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32;
+            lo + unit * (hi - lo)
+        }
+    }
+
+    /// CPU oracle for `topk_f32`: repeatedly select the arg-max over the
+    /// elements not yet chosen, using the same first-index tie-break rule as
+    /// the kernel (and `argmax`/`argmax_first`) — an exact value tie is won
+    /// by the smaller original index. Pads with `(0, -INFINITY)` once every
+    /// real element has been picked, mirroring the kernel's own `k > count`
+    /// padding.
+    fn cpu_topk_reference(data: &[f32], k: usize) -> (Vec<u32>, Vec<f32>) {
+        let mut remaining: Vec<u32> = (0..data.len() as u32).collect();
+        let mut ids = Vec::with_capacity(k);
+        let mut vals = Vec::with_capacity(k);
+        for _ in 0..k {
+            if remaining.is_empty() {
+                ids.push(0);
+                vals.push(f32::NEG_INFINITY);
+                continue;
+            }
+            let mut best_pos = 0usize;
+            for p in 1..remaining.len() {
+                let best_idx = remaining[best_pos];
+                let cand_idx = remaining[p];
+                let (bv, cv) = (data[best_idx as usize], data[cand_idx as usize]);
+                if cv > bv || (cv == bv && cand_idx < best_idx) {
+                    best_pos = p;
+                }
+            }
+            let idx = remaining.remove(best_pos);
+            ids.push(idx);
+            vals.push(data[idx as usize]);
+        }
+        (ids, vals)
+    }
+
+    /// Round-trip `data` through the real `topk_f32` GPU kernel and return
+    /// the `k` `(id, value)` pairs it wrote.
+    fn gpu_topk(graph: &MetalGraph, data: &[f32], k: u32) -> (Vec<u32>, Vec<f32>) {
+        let shared = MTLResourceOptions::StorageModeShared;
+        let data_buf = graph.device.new_buffer((data.len() * 4) as u64, shared);
+        // SAFETY: freshly allocated, `StorageModeShared`, sized for `data`.
+        unsafe {
+            super::super::metal_graph::upload_f32(&data_buf, data);
+        }
+        let slot_count = k.max(1) as u64;
+        let ids_buf = graph.device.new_buffer(slot_count * 4, shared);
+        let vals_buf = graph.device.new_buffer(slot_count * 4, shared);
+
+        let cmd = graph.command_queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+        graph
+            .dispatch_topk_f32(
+                encoder,
+                &data_buf,
+                &ids_buf,
+                &vals_buf,
+                data.len() as u32,
+                k,
+            )
+            .expect("dispatch_topk_f32 must accept k <= MAX_TOPK_F32 in this test");
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let ids_ptr = ids_buf.contents() as *const u32;
+        let vals_ptr = vals_buf.contents() as *const f32;
+        let mut ids = Vec::with_capacity(k as usize);
+        let mut vals = Vec::with_capacity(k as usize);
+        for i in 0..k as usize {
+            // SAFETY: `ids_buf`/`vals_buf` hold exactly `k` elements each and
+            // the command buffer above has completed.
+            unsafe {
+                ids.push(std::ptr::read(ids_ptr.add(i)));
+                vals.push(std::ptr::read(vals_ptr.add(i)));
+            }
+        }
+        (ids, vals)
+    }
+
+    /// The GPU kernel must agree with the CPU oracle across a spread of
+    /// vocab sizes (including one that is not a multiple of the 1024-thread
+    /// threadgroup) and `k` values, on data with no exact ties — so this
+    /// pins the core reduction, independent of the tie-break rule (covered
+    /// separately below).
+    #[test]
+    fn topk_f32_matches_cpu_reference_on_random_data() {
+        if Device::system_default().is_none() {
+            return;
+        }
+        let graph = MetalGraph::global().expect("MetalGraph::global");
+
+        for &n in &[500usize, 4096] {
+            for &k in &[1u32, 5, 20] {
+                for seed in 0u64..3 {
+                    let mut rng = TopkRng::new(n as u64 * 1_000_003 + k as u64 * 97 + seed + 1);
+                    let data: Vec<f32> = (0..n).map(|_| rng.f32_range(-100.0, 100.0)).collect();
+
+                    let (got_ids, got_vals) = gpu_topk(&graph, &data, k);
+                    let (want_ids, want_vals) = cpu_topk_reference(&data, k as usize);
+
+                    assert_eq!(got_ids, want_ids, "n={n} k={k} seed={seed}: id mismatch");
+                    for (g, w) in got_vals.iter().zip(want_vals.iter()) {
+                        assert!(
+                            (g - w).abs() < 1e-4,
+                            "n={n} k={k} seed={seed}: value mismatch {g} vs {w}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Bonsai 2's real vocabulary size (248 320, not a multiple of the
+    /// 1024-thread threadgroup) at the recommended sampling `top_k = 20`.
+    #[test]
+    fn topk_f32_handles_the_real_bonsai2_vocab_size() {
+        if Device::system_default().is_none() {
+            return;
+        }
+        let graph = MetalGraph::global().expect("MetalGraph::global");
+
+        let n = 248_320usize;
+        let k = 20u32;
+        let mut rng = TopkRng::new(0x0B0A_5A12);
+        let data: Vec<f32> = (0..n).map(|_| rng.f32_range(-50.0, 50.0)).collect();
+
+        let (got_ids, got_vals) = gpu_topk(&graph, &data, k);
+        let (want_ids, want_vals) = cpu_topk_reference(&data, k as usize);
+        assert_eq!(got_ids, want_ids);
+        for (g, w) in got_vals.iter().zip(want_vals.iter()) {
+            assert!((g - w).abs() < 1e-4, "{g} vs {w}");
+        }
+    }
+
+    /// Multiple exact ties at the maximum: the smaller original index must
+    /// win every one of the tied slots, in ascending order — the same
+    /// `argmax_first` rule `gpu_argmax_tiebreak.rs` pins for plain `argmax`,
+    /// exercised here across `k` winners instead of one.
+    #[test]
+    fn topk_f32_breaks_ties_by_smallest_index_ascending() {
+        if Device::system_default().is_none() {
+            return;
+        }
+        let graph = MetalGraph::global().expect("MetalGraph::global");
+
+        const TIE_VALUE: f32 = 42.0;
+        let tied_indices = [50u32, 800, 1200, 1500, 1900];
+        let n = 2000usize;
+        let mut rng = TopkRng::new(0x7113);
+        let mut data: Vec<f32> = (0..n).map(|_| rng.f32_range(-8.0, 8.0)).collect();
+        for &idx in &tied_indices {
+            data[idx as usize] = TIE_VALUE;
+        }
+
+        for &k in &[1u32, 3, 5] {
+            let (got_ids, got_vals) = gpu_topk(&graph, &data, k);
+            let expected_ids: Vec<u32> = tied_indices[..k as usize].to_vec();
+            assert_eq!(
+                got_ids, expected_ids,
+                "k={k}: must return ties ascending-index-first"
+            );
+            assert!(
+                got_vals.iter().all(|&v| v == TIE_VALUE),
+                "k={k}: every returned value must be the tied maximum"
+            );
+        }
+    }
+
+    /// `k > count`: once every real element is exhausted, the remaining
+    /// slots must be padded with `(0, -INFINITY)`, not a repeated winner or
+    /// an out-of-bounds read.
+    #[test]
+    fn topk_f32_pads_when_k_exceeds_count() {
+        if Device::system_default().is_none() {
+            return;
+        }
+        let graph = MetalGraph::global().expect("MetalGraph::global");
+
+        let data = [3.0f32, 1.0, 4.0, 1.5, 0.5];
+        let k = 8u32;
+        let (got_ids, got_vals) = gpu_topk(&graph, &data, k);
+        let (want_ids, want_vals) = cpu_topk_reference(&data, k as usize);
+
+        assert_eq!(got_ids, want_ids);
+        for (i, (&g, &w)) in got_vals.iter().zip(want_vals.iter()).enumerate() {
+            if i < data.len() {
+                assert!((g - w).abs() < 1e-4, "slot {i}: {g} vs {w}");
+                assert!(g.is_finite(), "slot {i}: real element must be finite");
+            } else {
+                assert!(
+                    g.is_infinite() && g.is_sign_negative(),
+                    "padding slot {i} must be -INFINITY, got {g}"
+                );
+                assert_eq!(got_ids[i], 0, "padding slot {i} must carry id 0");
+            }
+        }
+    }
+
+    /// A `k` above [`MAX_TOPK_F32`] must be a typed, catchable error — never
+    /// a silently truncated result and never an out-of-bounds `picked[256]`
+    /// write in the kernel.
+    #[test]
+    fn dispatch_topk_f32_rejects_k_above_the_documented_cap() {
+        if Device::system_default().is_none() {
+            return;
+        }
+        let graph = MetalGraph::global().expect("MetalGraph::global");
+
+        let shared = MTLResourceOptions::StorageModeShared;
+        let data_buf = graph.device.new_buffer(4 * 4, shared);
+        let ids_buf = graph.device.new_buffer(4, shared);
+        let vals_buf = graph.device.new_buffer(4, shared);
+
+        let cmd = graph.command_queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+        let result =
+            graph.dispatch_topk_f32(encoder, &data_buf, &ids_buf, &vals_buf, 4, MAX_TOPK_F32 + 1);
+        encoder.end_encoding();
+
+        match result {
+            Err(MetalGraphError::InvalidDimensions(msg)) => {
+                assert!(msg.contains("MAX_TOPK_F32"), "{msg}");
+            }
+            other => panic!("expected InvalidDimensions, got {other:?}"),
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // `pipeline_for` (MET-10 escape hatch)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// End-to-end proof that [`MetalGraph::pipeline_for`] (MET-10's escape
+    /// hatch) resolves a *working*, *correct* pipeline for a kernel that
+    /// rides the combined metallib only through this on-demand lookup —
+    /// `gemv_q4k` is never extracted into a named `MetalPipelines` field.
+    /// Dispatches it entirely by name and checks the output against the
+    /// crate's own scalar `gemv_q4k` CPU reference.
+    ///
+    /// This doubles as a regression guard for the `kq_scale_min_k4` ->
+    /// `kq_scale_min_k4_q4k`/`_q5k` rename this package made in
+    /// `kernel_sources/k_quant.rs`: both kernels used to define
+    /// `kq_scale_min_k4` identically, which was legal only because each
+    /// compiled into its own separate `MTLLibrary`; concatenated into one
+    /// combined library (as `build_combined_msl` now does for both) an
+    /// unrenamed duplicate would be an MSL redefinition error, so a passing
+    /// dispatch here proves the combined library actually compiled AND that
+    /// the rename did not perturb `gemv_q4k`'s numerics.
+    #[test]
+    fn pipeline_for_resolves_and_dispatches_a_kquant_kernel_by_name() {
+        if Device::system_default().is_none() {
+            return;
+        }
+        let graph = MetalGraph::global().expect("MetalGraph::global");
+
+        // One Q4_K super-block (256 weights). Every byte pattern is a valid
+        // Q4_K block (no reserved codes to avoid, unlike ternary), so a
+        // simple deterministic fill exercises the real decode path.
+        let mut scales = [0u8; 12];
+        let mut qs = [0u8; 128];
+        for (i, s) in scales.iter_mut().enumerate() {
+            *s = 3u8.wrapping_add((i as u8).wrapping_mul(7));
+        }
+        for (i, q) in qs.iter_mut().enumerate() {
+            *q = 5u8.wrapping_add((i as u8).wrapping_mul(13));
+        }
+        let block = oxibonsai_core::BlockQ4K {
+            d: half::f16::from_f32(0.073),
+            dmin: half::f16::from_f32(0.019),
+            scales,
+            qs,
+        };
+        let k = 256usize;
+        let input: Vec<f32> = (0..k).map(|i| (i as f32) * 0.01 - 1.28).collect();
+
+        let mut expected = [0f32; 1];
+        crate::gemv_q4k::gemv_q4k(std::slice::from_ref(&block), &input, &mut expected, 1, k)
+            .expect("scalar gemv_q4k reference");
+
+        let shared = MTLResourceOptions::StorageModeShared;
+        // SAFETY: `block` is a valid, fully initialised `#[repr(C)]`
+        // `BlockQ4K`, and `size_of::<BlockQ4K>()` is exactly the kernel's
+        // documented 144-byte stride.
+        let block_bytes = unsafe {
+            std::slice::from_raw_parts(
+                std::ptr::from_ref(&block).cast::<u8>(),
+                std::mem::size_of::<oxibonsai_core::BlockQ4K>(),
+            )
+        };
+        let block_buf = graph.device.new_buffer_with_data(
+            block_bytes.as_ptr() as *const std::ffi::c_void,
+            block_bytes.len() as u64,
+            shared,
+        );
+        let input_buf = graph.device.new_buffer_with_data(
+            input.as_ptr() as *const std::ffi::c_void,
+            std::mem::size_of_val(input.as_slice()) as u64,
+            shared,
+        );
+        let output_buf = graph.device.new_buffer(4, shared);
+        // SAFETY: freshly allocated, `StorageModeShared`, exactly the 4
+        // bytes of the one `f32` this dispatch writes.
+        unsafe {
+            std::ptr::write_bytes(output_buf.contents() as *mut u8, 0u8, 4);
+        }
+
+        let pso = graph
+            .pipeline_for("gemv_q4k")
+            .expect("pipeline_for must resolve gemv_q4k from the combined metallib");
+        // A second lookup must hit the cache and still resolve.
+        graph
+            .pipeline_for("gemv_q4k")
+            .expect("pipeline_for must be idempotent on a cache hit");
+
+        let n_rows: u32 = 1;
+        let k_u32 = k as u32;
+        let cmd = graph.command_queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&pso);
+        encoder.set_buffer(0, Some(&block_buf), 0);
+        encoder.set_buffer(1, Some(&input_buf), 0);
+        encoder.set_buffer(2, Some(&output_buf), 0);
+        // SAFETY: `encoder` is active with buffers 0-2 already bound above.
+        unsafe {
+            set_scalar(encoder, 3, &n_rows);
+            set_scalar(encoder, 4, &k_u32);
+        }
+        // Per the kernel's own doc: grid `[ceil(n_rows/8), 1, 1]`, block
+        // `[256, 1, 1]` (8 simdgroups x 32 lanes, one row per simdgroup).
+        encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let got = unsafe { std::ptr::read(output_buf.contents() as *const f32) };
+        assert!(
+            (got - expected[0]).abs() < 1e-2,
+            "gemv_q4k via pipeline_for: got {got}, scalar reference {}",
+            expected[0]
+        );
+        assert!(
+            got.abs() > 1e-6,
+            "degenerate fixture: output must be non-zero"
+        );
+
+        // An unknown name must be a typed, catchable error.
+        match graph.pipeline_for("not_a_real_kernel_name") {
+            Err(MetalGraphError::EncodingFailed(_)) => {}
+            other => panic!("expected EncodingFailed for an unknown name, got {other:?}"),
+        }
+    }
+
+    /// MET-10 first-use latency: `metal_k_quant_kernels.rs` (not owned by
+    /// this package) still calls `device.new_library_with_source(...)`,
+    /// once per kernel, uncached, on first use of that kernel — the finding
+    /// cites ~0.3-1s per library for this class of call. `pipeline_for`
+    /// instead resolves the same kernel against the combined
+    /// embedded/disk-cached metallib `MetalGraph::global()` already loaded
+    /// once for every other kernel family, so once that singleton exists, a
+    /// first `pipeline_for` call for a K-quant/Q-std/FP8 kernel is a
+    /// `get_function` + pipeline-state creation against an *already-loaded*
+    /// library, not a fresh `MTLLibrary` compile from source text — that
+    /// structural difference (no separate compile call at all) holds
+    /// regardless of the exact timing below.
+    ///
+    /// **On the numbers this prints**: macOS's Metal stack keeps its own
+    /// shader-compilation cache (compiled AIR/binary keyed by source),
+    /// persisted outside this process. By the time this test runs, this
+    /// exact `MSL_GEMV_Q4K_V1` source text has typically already been
+    /// compiled many times over in this session alone (every `cargo build`
+    /// re-runs `build.rs`'s `xcrun` compile of the combined MSL, which
+    /// contains this same text) — so the "before" measurement below is very
+    /// likely a warm system-cache hit, not the finder's cited cold-start
+    /// cost, and this test cannot reproduce or refute that ~0.3-1s figure.
+    /// Treat the printed numbers as "same-process relative cost of the two
+    /// call shapes on whatever cache state the host happens to be in", not
+    /// as an absolute or cold-start measurement.
+    ///
+    /// **Deliberately prints, never asserts, on the two durations** (wave-3
+    /// re-review): an earlier version of this test ended in
+    /// `assert!(after < before)`, a wall-clock comparison between two
+    /// `Instant::elapsed()` values on a shared, load-dependent host. Because
+    /// this test is `#[ignore]`d it never runs in the gate, but a wall-clock
+    /// `assert!` left in an `#[ignore]`d test is still a flake trap for
+    /// whoever un-ignores it later — the doc comment above already explains
+    /// why `before` can legitimately land either side of `after` depending on
+    /// system shader-cache state. Do not restore the assertion; `eprintln!`
+    /// the numbers instead, exactly as below.
+    ///
+    /// `#[ignore]`d: a wall-clock measurement, not a correctness assertion —
+    /// same convention this package's wave-2.5 addendum cites for the
+    /// KERN-PARALLEL / B2-03 in-crate timing tests. Run explicitly with
+    /// `cargo test -p oxibonsai-kernels --features metal \
+    /// met_10_first_use_latency_before_vs_after -- --ignored --nocapture`
+    /// to reproduce the numbers recorded in this package's notes.
+    #[test]
+    #[ignore = "wall-clock measurement, not a correctness gate — see doc comment"]
+    fn met_10_first_use_latency_before_vs_after() {
+        if Device::system_default().is_none() {
+            eprintln!("no Metal device; skipping MET-10 latency measurement");
+            return;
+        }
+        let device = Device::system_default().expect("checked is_none() above");
+
+        // BEFORE: `new_library_with_source` on one K-quant kernel's MSL
+        // alone — exactly the call shape `metal_k_quant_kernels.rs` still
+        // uses per kernel (see the doc above for why "before" here may be
+        // warm rather than truly cold).
+        let src = crate::gpu_backend::kernel_sources::MSL_GEMV_Q4K_V1;
+        let before_start = std::time::Instant::now();
+        let lib = device
+            .new_library_with_source(src, &metal::CompileOptions::new())
+            .expect("compiling a single K-quant kernel from source must succeed");
+        lib.get_function("gemv_q4k", None)
+            .expect("gemv_q4k must be the kernel's entry point");
+        let before = before_start.elapsed();
+
+        // AFTER: `MetalGraph::global()` first — whatever it costs (a fresh
+        // process-wide load, or nothing if another test already triggered
+        // it) happens before the timer starts, so `after` measures only the
+        // by-name resolution against an *already-resident* library.
+        let graph = MetalGraph::global().expect("MetalGraph::global");
+        let after_start = std::time::Instant::now();
+        graph
+            .pipeline_for("gemv_q4k")
+            .expect("gemv_q4k must resolve from the combined metallib");
+        let after = after_start.elapsed();
+
+        eprintln!(
+            "[MET-10] new_library_with_source for one kernel: {before:?}; \
+             pipeline_for against the already-loaded combined metallib: {after:?} \
+             (see this test's doc comment: 'before' may be a warm system \
+             shader-cache hit, not the finder's cited cold-start cost)"
+        );
+        // No `assert!` here by design — see the doc comment above.
     }
 }

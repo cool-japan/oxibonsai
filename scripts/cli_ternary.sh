@@ -130,7 +130,7 @@ echo ""
 # ── Run inference ────────────────────────────────────────────────────────────
 
 BIN="./target/release/oxibonsai"
-RUN_LOG=$(mktemp /tmp/oxibonsai_ternary_run.XXXXXX)
+RUN_LOG=$(mktemp "${TMPDIR:-/tmp}/oxibonsai_ternary_run.XXXXXX")
 trap 'rm -f "$RUN_LOG"' EXIT
 
 echo "── run: basic inference (ternary) ──────────────────────────"

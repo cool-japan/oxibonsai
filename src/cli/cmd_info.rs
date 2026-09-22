@@ -1,4 +1,16 @@
 //! `oxibonsai info` — display model info from a GGUF file.
+//!
+//! cli-02 / gatekeeper REQUIRED #1: prints only values actually present in
+//! the file's metadata — never `Qwen3Config::from_metadata`'s fabricated
+//! defaults standing in for a key a non-language-model GGUF (e.g. a CLIP
+//! vision projector) never had in the first place. Every numeric field is
+//! probed independently and rendered `"-"` (or `null` in `--json`) when
+//! absent.
+
+use oxibonsai_core::gguf::reader::GgufFile;
+use oxibonsai_core::gguf::tensor_info::keys;
+
+use super::model_desc;
 
 pub(crate) fn run(model: Option<String>, json: bool) -> anyhow::Result<()> {
     let model = model
@@ -9,19 +21,123 @@ pub(crate) fn run(model: Option<String>, json: bool) -> anyhow::Result<()> {
 
     let mmap = oxibonsai_core::gguf::reader::mmap_gguf_file(std::path::Path::new(&model))
         .map_err(|e| anyhow::anyhow!("failed to open model '{model}': {e}"))?;
-    let gguf = oxibonsai_core::gguf::reader::GgufFile::parse(&mmap)?;
-    let config = oxibonsai_core::config::Qwen3Config::from_metadata(&gguf.metadata)?;
+    let gguf = match GgufFile::parse(&mmap) {
+        Ok(gguf) => gguf,
+        Err(parse_err) => {
+            // cli-02 / cli-15: a file the strict parser rejects (e.g. an
+            // unrecognised quant id on an otherwise forward-compatible
+            // file, such as the Bonsai 2 27B GGUFs before their loaders
+            // land) used to surface only an opaque parse error here, with
+            // no way to see anything about the file at all — unlike
+            // `validate`, which already falls back to the tolerant
+            // `probe_compat` scan. Do the same here.
+            return report_probe_compat_fallback(&mmap, &model, json, &parse_err);
+        }
+    };
+
+    let arch = gguf
+        .metadata
+        .get_string(keys::GENERAL_ARCHITECTURE)
+        .unwrap_or("-")
+        .to_string();
+    let known_arch = model_desc::is_known_language_model_architecture(&arch);
+    // Honest, present-only display of a couple of extra identifying
+    // fields the old fixed field list never showed at all.
+    let general_name = model_desc::display_metadata_value(&gguf.metadata, keys::GENERAL_NAME);
+    let tokenizer_model = model_desc::display_metadata_value(&gguf.metadata, keys::TOKENIZER_MODEL);
+
     let type_counts = gguf.tensors.count_by_type();
+    let unsupported_types = model_desc::unsupported_tensor_types(&type_counts);
 
-    // Determine dominant quant type from tensor counts for accurate variant detection.
-    let dominant_type = type_counts
-        .iter()
-        .max_by_key(|(_, count)| *count)
-        .map(|(ty, _)| *ty)
-        .unwrap_or(oxibonsai_core::GgufTensorType::Q1_0_g128);
+    // Every numeric field is probed independently against the model's
+    // real `general.architecture` (falling back to the generic `llm.*`
+    // key) — never through `Qwen3Config::from_metadata`, whose
+    // `.unwrap_or(<default>)` chain is exactly what fabricated the 8B
+    // numbers for a non-Qwen3 file.
+    let layers = model_desc::display_arch_scoped_u32(
+        &gguf.metadata,
+        &arch,
+        "block_count",
+        keys::LLM_BLOCK_COUNT,
+    );
+    let hidden_size = model_desc::display_arch_scoped_u32(
+        &gguf.metadata,
+        &arch,
+        "embedding_length",
+        keys::LLM_EMBEDDING_LENGTH,
+    );
+    let q_heads = model_desc::display_arch_scoped_u32(
+        &gguf.metadata,
+        &arch,
+        "attention.head_count",
+        keys::LLM_ATTENTION_HEAD_COUNT,
+    );
+    let kv_heads = model_desc::display_arch_scoped_u32(
+        &gguf.metadata,
+        &arch,
+        "attention.head_count_kv",
+        keys::LLM_ATTENTION_HEAD_COUNT_KV,
+    );
+    let head_dim = model_desc::display_arch_scoped_u32(
+        &gguf.metadata,
+        &arch,
+        "attention.key_length",
+        keys::LLM_ATTENTION_KEY_LENGTH,
+    );
+    let intermediate_size = model_desc::display_arch_scoped_u32(
+        &gguf.metadata,
+        &arch,
+        "feed_forward_length",
+        keys::LLM_FEED_FORWARD_LENGTH,
+    );
+    let max_context_length = model_desc::display_arch_scoped_u32(
+        &gguf.metadata,
+        &arch,
+        "context_length",
+        keys::LLM_CONTEXT_LENGTH,
+    );
+    // Vocab: the tokenizer's own token array length is authoritative (per
+    // gatekeeper REQUIRED #1) when present; otherwise fall back to the
+    // arch-scoped `vocab_size` metadata key, honestly "-" if neither
+    // exists.
+    let vocab_size = gguf
+        .metadata
+        .get_array(keys::TOKENIZER_TOKENS)
+        .ok()
+        .map(|arr| arr.len().to_string())
+        .unwrap_or_else(|| {
+            model_desc::display_arch_scoped_u32(
+                &gguf.metadata,
+                &arch,
+                "vocab_size",
+                keys::LLM_VOCAB_SIZE,
+            )
+        });
 
-    let variant =
-        oxibonsai_model::ModelVariant::from_config_and_sample_tensor_type(&config, dominant_type);
+    // The variant classifier needs a full `Qwen3Config` (num_layers +
+    // hidden_size at minimum); only attempt it for a known language-model
+    // architecture with both values genuinely present, so a CLIP file (or
+    // any file missing those keys) never gets a variant guess built from
+    // silently-substituted defaults.
+    let variant_name = if known_arch && layers != "-" && hidden_size != "-" {
+        oxibonsai_core::config::Qwen3Config::from_metadata(&gguf.metadata)
+            .ok()
+            .map(|config| {
+                let dominant_type = type_counts
+                    .iter()
+                    .max_by_key(|(_, count)| *count)
+                    .map(|(ty, _)| *ty)
+                    .unwrap_or(oxibonsai_core::GgufTensorType::Q1_0_g128);
+                oxibonsai_model::ModelVariant::from_config_and_sample_tensor_type(
+                    &config,
+                    dominant_type,
+                )
+                .name()
+                .to_string()
+            })
+    } else {
+        None
+    };
 
     if json {
         let tensor_types: std::collections::HashMap<String, usize> = type_counts
@@ -34,17 +150,21 @@ pub(crate) fn run(model: Option<String>, json: bool) -> anyhow::Result<()> {
             "gguf_version": gguf.header.version,
             "tensor_count": gguf.header.tensor_count,
             "metadata_entries": gguf.header.metadata_kv_count,
-            "architecture": format!("Qwen3 ({})", variant.name()),
-            "variant": variant.name(),
-            "num_layers": config.num_layers,
-            "hidden_size": config.hidden_size,
-            "num_attention_heads": config.num_attention_heads,
-            "num_kv_heads": config.num_kv_heads,
-            "head_dim": config.head_dim,
-            "vocab_size": config.vocab_size,
-            "max_context_length": config.max_context_length,
-            "intermediate_size": config.intermediate_size,
+            "architecture": arch,
+            "known_language_model_architecture": known_arch,
+            "general_name": null_if_dash(&general_name),
+            "tokenizer_model": null_if_dash(&tokenizer_model),
+            "variant": variant_name,
+            "num_layers": null_if_dash(&layers),
+            "hidden_size": null_if_dash(&hidden_size),
+            "num_attention_heads": null_if_dash(&q_heads),
+            "num_kv_heads": null_if_dash(&kv_heads),
+            "head_dim": null_if_dash(&head_dim),
+            "vocab_size": null_if_dash(&vocab_size),
+            "max_context_length": null_if_dash(&max_context_length),
+            "intermediate_size": null_if_dash(&intermediate_size),
             "tensor_types": tensor_types,
+            "unsupported_tensor_types": unsupported_types.iter().map(ToString::to_string).collect::<Vec<_>>(),
         });
         println!("{}", serde_json::to_string_pretty(&info)?);
     } else {
@@ -54,22 +174,116 @@ pub(crate) fn run(model: Option<String>, json: bool) -> anyhow::Result<()> {
         println!("Metadata entries: {}", gguf.header.metadata_kv_count);
         println!();
 
-        println!("Architecture: Qwen3 ({})", variant.name());
-        println!("  Layers:       {}", config.num_layers);
-        println!("  Hidden size:  {}", config.hidden_size);
-        println!("  Q heads:      {}", config.num_attention_heads);
-        println!("  KV heads:     {}", config.num_kv_heads);
-        println!("  Head dim:     {}", config.head_dim);
-        println!("  Vocab:        {}", config.vocab_size);
-        println!("  Max context:  {}", config.max_context_length);
-        println!("  Intermediate: {}", config.intermediate_size);
+        println!(
+            "Architecture: {arch}{}",
+            if known_arch {
+                String::new()
+            } else {
+                " (not a recognized language-model architecture)".to_string()
+            }
+        );
+        if let Some(variant) = &variant_name {
+            println!("  Variant:      {variant}");
+        }
+        println!("  Name:         {general_name}");
+        println!("  Tokenizer:    {tokenizer_model}");
+        println!("  Layers:       {layers}");
+        println!("  Hidden size:  {hidden_size}");
+        println!("  Q heads:      {q_heads}");
+        println!("  KV heads:     {kv_heads}");
+        println!("  Head dim:     {head_dim}");
+        println!("  Vocab:        {vocab_size}");
+        println!("  Max context:  {max_context_length}");
+        println!("  Intermediate: {intermediate_size}");
         println!();
 
         println!("Tensor types:");
         for (tensor_type, count) in &type_counts {
             println!("  {tensor_type}: {count}");
         }
+        if !unsupported_types.is_empty() {
+            println!();
+            println!(
+                "NOTE: this build's model loader has no execution path for: {} \
+                 (present in the file, but `run`/`chat`/`serve` cannot load it yet).",
+                unsupported_types
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
     }
 
+    Ok(())
+}
+
+/// Convert the honest `"-"` display sentinel into JSON `null` for
+/// `--json` output, so a machine consumer can test for absence with
+/// `!= null` instead of string-comparing against `"-"`.
+fn null_if_dash(value: &str) -> Option<&str> {
+    if value == "-" {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+/// `GgufFile::parse` rejected this file: report `GgufFile::probe_compat`'s
+/// tolerant scan instead of letting the opaque parse error stand alone
+/// (mirrors `cmd_validate::report_probe_compat_fallback`). Unlike
+/// `validate`, `info` is a pure describe-what-you-can command (it already
+/// returns `Ok` for a well-formed-but-unsupported-architecture file, such
+/// as a CLIP vision projector), so a file the strict parser rejects but
+/// the tolerant probe can still describe is reported and returns `Ok` too
+/// — only a file neither pass can make any sense of is a hard error.
+fn report_probe_compat_fallback(
+    mmap: &[u8],
+    model: &str,
+    json: bool,
+    parse_err: &oxibonsai_core::BonsaiError,
+) -> anyhow::Result<()> {
+    let report = GgufFile::probe_compat(mmap).map_err(|probe_err| {
+        anyhow::anyhow!(
+            "failed to parse model '{model}': {parse_err}; the tolerant compatibility probe \
+             also failed: {probe_err}"
+        )
+    })?;
+
+    if json {
+        let info = serde_json::json!({
+            "model": model,
+            "strict_parse_error": parse_err.to_string(),
+            "gguf_version": report.version.to_string(),
+            "tensor_count": report.tensor_count,
+            "metadata_entries": report.metadata_count,
+            "believed_loadable": report.is_loadable,
+            "unknown_quant_type_ids": report.unknown_quant_types,
+            "warnings": report.warnings,
+        });
+        println!("{}", serde_json::to_string_pretty(&info)?);
+    } else {
+        println!("Model: {model}");
+        println!("  Strict parse failed: {parse_err}");
+        println!();
+        println!("Compatibility probe (structural scan only):");
+        println!("  GGUF version:      {}", report.version);
+        println!("  Tensor count:      {}", report.tensor_count);
+        println!("  Metadata entries:  {}", report.metadata_count);
+        println!(
+            "  Believed loadable: {} (does not confirm this build can execute every tensor \
+             type)",
+            report.is_loadable
+        );
+        if !report.unknown_quant_types.is_empty() {
+            println!(
+                "  Unrecognized quantization type id(s): {:?}",
+                report.unknown_quant_types
+            );
+        }
+        for warning in &report.warnings {
+            println!("  - {warning}");
+        }
+    }
     Ok(())
 }

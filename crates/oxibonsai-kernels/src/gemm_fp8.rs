@@ -47,7 +47,7 @@ pub fn gemm_fp8_e4m3(
     k: usize,
     batch: usize,
 ) -> KernelResult<()> {
-    if k % QK_FP8 != 0 {
+    if !k.is_multiple_of(QK_FP8) {
         return Err(KernelError::NotBlockAligned {
             count: k,
             block_size: QK_FP8,
@@ -116,7 +116,7 @@ pub fn gemm_fp8_e5m2(
     k: usize,
     batch: usize,
 ) -> KernelResult<()> {
-    if k % QK_FP8 != 0 {
+    if !k.is_multiple_of(QK_FP8) {
         return Err(KernelError::NotBlockAligned {
             count: k,
             block_size: QK_FP8,

@@ -49,4 +49,15 @@ pub enum EvalError {
         /// Human-readable description of what was actually provided.
         got: String,
     },
+
+    /// Serialisation to (or deserialisation from) JSON failed.
+    ///
+    /// Preferred over stuffing a `serde_json::Error`'s `Display` output
+    /// into [`EvalError::InvalidFormat`] (RAG-M6): `#[from]` lets `?`
+    /// convert a `serde_json::Error` directly, and a caller that needs to
+    /// distinguish "malformed input" from "the serialisation layer itself
+    /// failed" can match on this variant instead of parsing a formatted
+    /// string.
+    #[error("serialisation failed: {0}")]
+    Serialization(#[from] serde_json::Error),
 }

@@ -148,7 +148,7 @@ pub fn ternary_matmul(
             m * k
         )));
     }
-    if k % 128 != 0 {
+    if !k.is_multiple_of(128) {
         return Err(DitError::Shape(format!(
             "ternary_matmul k {k} not a multiple of 128"
         )));

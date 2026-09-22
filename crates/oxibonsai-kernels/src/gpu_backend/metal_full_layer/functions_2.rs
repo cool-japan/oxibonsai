@@ -3,8 +3,8 @@
 //! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
 
 use super::super::metal_graph::{
-    alloc_buf, div_ceil, download_f32, set_scalar, upload_f32, MetalGraph, MetalGraphError,
-    MetalWeightHandle,
+    alloc_buf, commit_and_wait, div_ceil, download_f32, set_scalar, upload_f32, MetalGraph,
+    MetalGraphError, MetalWeightHandle,
 };
 use super::functions::gpu_profile;
 use super::types::{FullLayerBuffers, GpuKvCache};
@@ -536,8 +536,7 @@ impl MetalGraph {
             max_seq_len,
         )?;
         encoder.end_encoding();
-        cmd_buf.commit();
-        cmd_buf.wait_until_completed();
+        commit_and_wait(cmd_buf, "encode_full_layer")?;
         unsafe {
             download_f32(&bufs.hidden_buf, &mut hidden[..hidden_size]);
         }
@@ -638,8 +637,7 @@ impl MetalGraph {
             max_seq_len,
         )?;
         encoder.end_encoding();
-        cmd_buf.commit();
-        cmd_buf.wait_until_completed();
+        commit_and_wait(cmd_buf, "encode_full_layer_ternary")?;
         unsafe {
             download_f32(&bufs.hidden_buf, &mut hidden[..hidden_size]);
         }
@@ -731,7 +729,7 @@ impl MetalGraph {
             upload_f32(&bufs.cos_buf, &rope_cos[..half_dim]);
             upload_f32(&bufs.sin_buf, &rope_sin[..half_dim]);
         }
-        let profiling = std::env::var("OXIBONSAI_PROFILE").is_ok();
+        let profiling = gpu_profile::full_profiling_enabled();
         let gpu_profiling = gpu_profile::is_enabled();
         if profiling {
             let mut layer_times = Vec::with_capacity(n_layers);
@@ -761,9 +759,8 @@ impl MetalGraph {
                     max_seq_len,
                 )?;
                 layer_enc.end_encoding();
-                layer_cmd.commit();
                 let t = std::time::Instant::now();
-                layer_cmd.wait_until_completed();
+                commit_and_wait(layer_cmd, "encode_full_forward layer")?;
                 let elapsed_ms = t.elapsed().as_secs_f64() * 1000.0;
                 layer_times.push(elapsed_ms);
                 eprintln!("[profile] layer {:2} = {:.3}ms", layer_idx, elapsed_ms);
@@ -936,7 +933,7 @@ impl MetalGraph {
             upload_f32(&bufs.cos_buf, &rope_cos[..half_dim]);
             upload_f32(&bufs.sin_buf, &rope_sin[..half_dim]);
         }
-        let profiling = std::env::var("OXIBONSAI_PROFILE").is_ok();
+        let profiling = gpu_profile::full_profiling_enabled();
         let gpu_profiling = gpu_profile::is_enabled();
         if profiling {
             let mut layer_times = Vec::with_capacity(n_layers);
@@ -966,9 +963,8 @@ impl MetalGraph {
                     max_seq_len,
                 )?;
                 layer_enc.end_encoding();
-                layer_cmd.commit();
                 let t = std::time::Instant::now();
-                layer_cmd.wait_until_completed();
+                commit_and_wait(layer_cmd, "encode_full_forward_ternary layer")?;
                 let elapsed_ms = t.elapsed().as_secs_f64() * 1000.0;
                 layer_times.push(elapsed_ms);
                 eprintln!("[profile] layer {:2} = {:.3}ms", layer_idx, elapsed_ms);
@@ -1128,9 +1124,8 @@ impl MetalGraph {
                     );
                     let encode_end = std::time::Instant::now();
                     encoder.end_encoding();
-                    cmd_buf.commit();
                     let t = std::time::Instant::now();
-                    cmd_buf.wait_until_completed();
+                    commit_and_wait(cmd_buf, "encode_tail_and_commit (argmax)")?;
                     if profiling {
                         eprintln!(
                             "[profile] tail (norm+lmhead+argmax) = {:.3}ms",
@@ -1148,9 +1143,8 @@ impl MetalGraph {
                 } else {
                     let encode_end = std::time::Instant::now();
                     encoder.end_encoding();
-                    cmd_buf.commit();
                     let t = std::time::Instant::now();
-                    cmd_buf.wait_until_completed();
+                    commit_and_wait(cmd_buf, "encode_tail_and_commit (no argmax)")?;
                     if profiling {
                         eprintln!(
                             "[profile] tail (norm+lmhead) = {:.3}ms",
@@ -1170,9 +1164,8 @@ impl MetalGraph {
             _ => {
                 let encode_end = std::time::Instant::now();
                 encoder.end_encoding();
-                cmd_buf.commit();
                 let t = std::time::Instant::now();
-                cmd_buf.wait_until_completed();
+                commit_and_wait(cmd_buf, "encode_tail_and_commit (no lm head)")?;
                 if profiling {
                     eprintln!(
                         "[profile] tail (no lmhead) = {:.3}ms",
@@ -1270,9 +1263,8 @@ impl MetalGraph {
                     );
                     let encode_end = std::time::Instant::now();
                     encoder.end_encoding();
-                    cmd_buf.commit();
                     let t = std::time::Instant::now();
-                    cmd_buf.wait_until_completed();
+                    commit_and_wait(cmd_buf, "encode_tail_and_commit_ternary (argmax)")?;
                     if profiling {
                         eprintln!(
                             "[profile] tail ternary (norm+lmhead+argmax) = {:.3}ms",
@@ -1290,9 +1282,8 @@ impl MetalGraph {
                 } else {
                     let encode_end = std::time::Instant::now();
                     encoder.end_encoding();
-                    cmd_buf.commit();
                     let t = std::time::Instant::now();
-                    cmd_buf.wait_until_completed();
+                    commit_and_wait(cmd_buf, "encode_tail_and_commit_ternary (no argmax)")?;
                     if profiling {
                         eprintln!(
                             "[profile] tail ternary (norm+lmhead) = {:.3}ms",
@@ -1312,9 +1303,8 @@ impl MetalGraph {
             _ => {
                 let encode_end = std::time::Instant::now();
                 encoder.end_encoding();
-                cmd_buf.commit();
                 let t = std::time::Instant::now();
-                cmd_buf.wait_until_completed();
+                commit_and_wait(cmd_buf, "encode_tail_and_commit_ternary (no lm head)")?;
                 if profiling {
                     eprintln!(
                         "[profile] tail ternary (no lmhead) = {:.3}ms",

@@ -460,10 +460,32 @@ fn tensor_type_properties() {
 
 #[test]
 fn tensor_type_unknown_id_returns_error() {
-    // Note: 35=TQ2_0, 41=Q1_0_g128, 42=TQ2_0_g128, 43=F8_E4M3, 44=F8_E5M2 are valid; excluded here.
-    for bad_id in [4, 5, 16, 20, 29, 31, 40, 45, 100, u32::MAX] {
+    // Only ids that are not ggml types at all are rejected: 4/5 (Q4_2/Q4_3)
+    // and 31..33/36..38 were removed upstream, 45..141 are unassigned, and
+    // 144+ is past GGML_TYPE_COUNT.
+    for bad_id in [4, 5, 31, 32, 33, 36, 37, 38, 45, 100, 141, 144, u32::MAX] {
         let result = GgufTensorType::from_id(bad_id);
         assert!(result.is_err(), "type id {bad_id} should be unsupported");
+    }
+}
+
+/// Ids the ggml type table *does* define must parse even when this build has
+/// no kernel for them, so `info`/`validate` can still read the header of an
+/// IQ4_XS / MXFP4 / TQ1_0 / IQ1_M GGUF instead of failing the whole file
+/// (core-gguf-12). The loader — not the parser — refuses them.
+#[test]
+fn upstream_types_without_a_kernel_parse_but_are_not_executable() {
+    for id in [
+        16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 34, 39, 40,
+    ] {
+        let ty = GgufTensorType::from_id(id)
+            .unwrap_or_else(|e| panic!("ggml type id {id} must parse: {e}"));
+        assert_eq!(ty.wire_id(), id);
+        assert!(ty.block_size() > 0 && ty.block_bytes() > 0);
+        assert!(
+            !ty.is_executable(),
+            "{ty} has no kernel in this build and must report so"
+        );
     }
 }
 

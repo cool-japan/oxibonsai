@@ -7,6 +7,45 @@
 //! - [`RequestLogger`] — structured request/response logging with optional body capture
 //! - [`CorsConfig`] — configurable CORS policy with header generation helpers
 //! - [`IdempotencyCache`] — idempotency-key cache for safe request deduplication
+//! - [`MiddlewareConfig`] + [`apply_middleware`] — assemble and attach the
+//!   above (plus, optionally, [`crate::rate_limiter::rate_limit_layer`]) to a
+//!   served router in one call
+//!
+//! # CORS default (findings sec-06 / sec-09 / SV-20)
+//!
+//! [`MiddlewareConfig::default()`] emits **no** `Access-Control-*` header on
+//! any route. CORS is strictly opt-in: build a policy with
+//! [`CorsConfig::from_origins`] and attach it via
+//! [`MiddlewareConfig::with_cors`]. When a policy is attached, the exact
+//! response header set is documented on [`CorsConfig::response_headers`];
+//! `/admin/*` never receives CORS headers regardless of configuration.
+//!
+//! # Layer order (findings sec-06/sec-07/SV-06/SV-10/cli-18)
+//!
+//! A server that also enforces bearer auth and an admission/concurrency
+//! limit (both live outside this crate — see `oxibonsai-serve` and the CLI's
+//! `admission` module) must compose its layers in this order, outermost
+//! first:
+//!
+//! ```text
+//! cors -> auth -> rate-limit -> admission -> routes
+//! ```
+//!
+//! - **cors outside auth**: a CORS preflight (`OPTIONS`) carries no
+//!   credentials by specification, so if auth were outside CORS every
+//!   preflight would be rejected and a browser could never use an
+//!   authenticated server (finding SV-06). [`apply_middleware`]'s `cors_mw`
+//!   short-circuits `OPTIONS` with `200 OK` before any nested layer runs.
+//! - **auth outside rate-limit**: an unauthenticated request must never
+//!   consume a rate-limit token.
+//! - **rate-limit outside admission**: a rate-limited request must never
+//!   consume an admission/concurrency permit (cli-18).
+//!
+//! [`apply_middleware`] bundles CORS + rate limiting + logging for the
+//! common case with no auth layer to interpose; a caller that needs auth
+//! *between* CORS and rate limiting mounts
+//! [`crate::rate_limiter::rate_limit_layer`] directly instead (see that
+//! function's docs for the exact `.layer()` call sequence).
 //!
 //! # Example
 //!
@@ -18,6 +57,9 @@
 //! logger.log_request(&ctx);
 //! logger.log_response(&ctx, 200, 512);
 //!
+//! // `CorsConfig::default()` is intentionally permissive (see its docs);
+//! // production configuration should use `CorsConfig::from_origins` and
+//! // `MiddlewareConfig::with_cors` instead.
 //! let cors = CorsConfig::default();
 //! assert!(cors.is_origin_allowed("*"));
 //! ```
@@ -203,18 +245,40 @@ impl Default for RequestLogger {
 
 /// Cross-Origin Resource Sharing (CORS) policy configuration.
 ///
-/// Used to generate `Access-Control-*` headers for preflight and main requests.
+/// Used to generate `Access-Control-*` headers for preflight and main
+/// requests via [`CorsConfig::response_headers`]. A `CorsConfig` only takes
+/// effect when installed via [`MiddlewareConfig::cors`]
+/// (`Some(CorsConfig{..})`) — the crate-wide default,
+/// [`MiddlewareConfig::default()`], sets `cors: None`, i.e. **no**
+/// `Access-Control-*` header is emitted on any route unless a caller
+/// explicitly opts in (findings sec-06 / SV-20).
 #[derive(Debug, Clone)]
 pub struct CorsConfig {
     /// Allowed origins. Use `["*"]` to permit all origins.
+    ///
+    /// # Warning
+    /// [`CorsConfig::default()`] sets this to `["*"]` so that existing code
+    /// which explicitly asks for the [`Default`] impl keeps a permissive
+    /// policy. That is almost never the right starting point for a policy
+    /// built from *operator-supplied* configuration (a `--cors-origin` CLI
+    /// flag, a `[cors]` TOML section, ...) — use
+    /// [`CorsConfig::from_origins`] there instead, so an empty/unset
+    /// configuration cannot silently widen into a wildcard.
     pub allowed_origins: Vec<String>,
-    /// Allowed HTTP methods.
+    /// Allowed HTTP methods, sent as a comma-joined
+    /// `Access-Control-Allow-Methods` value on a matched request.
     pub allowed_methods: Vec<String>,
-    /// Allowed request headers.
+    /// Allowed request headers, sent as a comma-joined
+    /// `Access-Control-Allow-Headers` value on a matched request.
     pub allowed_headers: Vec<String>,
     /// `Access-Control-Max-Age` in seconds (how long browsers may cache the preflight).
     pub max_age_secs: u64,
-    /// Whether to allow credentials (cookies, auth headers).
+    /// Whether to allow credentials (cookies, auth headers). When `true`,
+    /// [`CorsConfig::response_headers`] never emits the literal wildcard
+    /// `Access-Control-Allow-Origin: *` (the Fetch spec forbids combining
+    /// it with `Access-Control-Allow-Credentials: true`, and every browser
+    /// rejects the response) — it echoes the exact matched origin instead,
+    /// even when `"*"` is present in `allowed_origins`.
     pub allow_credentials: bool,
 }
 
@@ -231,6 +295,20 @@ impl Default for CorsConfig {
 }
 
 impl CorsConfig {
+    /// Build a policy that allows exactly `origins` (never a wildcard),
+    /// keeping the [`Default`] methods/headers/max-age and credentials
+    /// disabled.
+    ///
+    /// Prefer this over `CorsConfig::default()` when building a policy from
+    /// operator-supplied configuration — see the `allowed_origins` field
+    /// docs for why.
+    pub fn from_origins(origins: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            allowed_origins: origins.into_iter().collect(),
+            ..Self::default()
+        }
+    }
+
     /// Returns `true` if the given `origin` is permitted by this policy.
     ///
     /// An entry of `"*"` in `allowed_origins` permits all origins.
@@ -238,34 +316,64 @@ impl CorsConfig {
         self.allowed_origins.iter().any(|o| o == "*" || o == origin)
     }
 
-    /// Generate `Access-Control-*` response headers as `(name, value)` pairs.
-    ///
-    /// Returns headers suitable for both preflight (`OPTIONS`) and actual responses.
-    pub fn access_control_headers(&self) -> Vec<(String, String)> {
-        let mut headers = Vec::with_capacity(5);
+    /// Returns `true` when this policy's `allowed_origins` contains the
+    /// literal wildcard `"*"` *and* credentials are disabled — the only
+    /// case in which `Access-Control-Allow-Origin: *` may legally be sent
+    /// (see the `allow_credentials` field docs).
+    fn is_unrestricted_wildcard(&self) -> bool {
+        !self.allow_credentials && self.allowed_origins.iter().any(|o| o == "*")
+    }
 
-        let origin_value = if self.allowed_origins.iter().any(|o| o == "*") {
+    /// Compute the exact `Access-Control-*` / `Vary` response headers for a
+    /// request whose `Origin` header was `request_origin` (`None` when the
+    /// request carried no `Origin` header at all — a same-origin or
+    /// non-browser request).
+    ///
+    /// Contract (findings sec-06 / sec-09 / SV-20):
+    /// - `Vary: Origin` is **always** present, regardless of whether
+    ///   `request_origin` is present or matches, because whether the other
+    ///   headers below appear depends on it — a cache that ignored this
+    ///   could replay one origin's grant (or denial) to a different origin.
+    /// - `Access-Control-Allow-Origin` is present **only** when
+    ///   `request_origin` is `Some` and [`CorsConfig::is_origin_allowed`]
+    ///   returns `true` for it. Its value is the *exact* origin, echoed back
+    ///   verbatim, **except** when the policy is the unrestricted wildcard
+    ///   (`allowed_origins` contains `"*"` and `allow_credentials` is
+    ///   `false`), in which case it is the literal `"*"`. Multiple
+    ///   configured origins are **never** comma-joined into this header —
+    ///   that value is invalid per the Fetch spec and every browser rejects
+    ///   it.
+    /// - `Access-Control-Allow-Methods` / `-Headers` / `-Max-Age` /
+    ///   `-Credentials` accompany the allow decision only on a match.
+    pub fn response_headers(&self, request_origin: Option<&str>) -> Vec<(String, String)> {
+        let mut headers = Vec::with_capacity(6);
+        headers.push(("Vary".to_owned(), "Origin".to_owned()));
+
+        let Some(origin) = request_origin else {
+            return headers;
+        };
+        if !self.is_origin_allowed(origin) {
+            return headers;
+        }
+
+        let allow_origin_value = if self.is_unrestricted_wildcard() {
             "*".to_owned()
         } else {
-            self.allowed_origins.join(", ")
+            origin.to_owned()
         };
-        headers.push(("Access-Control-Allow-Origin".to_owned(), origin_value));
-
+        headers.push(("Access-Control-Allow-Origin".to_owned(), allow_origin_value));
         headers.push((
             "Access-Control-Allow-Methods".to_owned(),
             self.allowed_methods.join(", "),
         ));
-
         headers.push((
             "Access-Control-Allow-Headers".to_owned(),
             self.allowed_headers.join(", "),
         ));
-
         headers.push((
             "Access-Control-Max-Age".to_owned(),
             self.max_age_secs.to_string(),
         ));
-
         if self.allow_credentials {
             headers.push((
                 "Access-Control-Allow-Credentials".to_owned(),
@@ -379,7 +487,9 @@ impl IdempotencyCache {
 /// it (which requires `axum`) lives behind the `server` feature.
 #[derive(Debug, Clone)]
 pub struct MiddlewareConfig {
-    /// CORS policy to apply. `None` disables CORS header injection entirely.
+    /// CORS policy to apply. `None` (the default — see below) disables CORS
+    /// header injection entirely: no route, including `/admin/*`, emits any
+    /// `Access-Control-*` header.
     pub cors: Option<CorsConfig>,
     /// Whether to emit a structured request/response log line per request.
     pub enable_request_logging: bool,
@@ -390,9 +500,18 @@ pub struct MiddlewareConfig {
 }
 
 impl Default for MiddlewareConfig {
+    /// The production default: **no** CORS header on any route (`cors:
+    /// None`), request logging on, and no rate limit. Earlier versions
+    /// defaulted `cors` to `Some(CorsConfig::default())` — an unconditional
+    /// `Access-Control-Allow-Origin: *` on every route including
+    /// `/admin/*` — which let any web page a browser visited read
+    /// inference results from a server reachable from that browser
+    /// (findings sec-06 / SV-20). CORS is now strictly opt-in: build a
+    /// policy with [`CorsConfig::from_origins`] and attach it with
+    /// [`MiddlewareConfig::with_cors`].
     fn default() -> Self {
         Self {
-            cors: Some(CorsConfig::default()),
+            cors: None,
             enable_request_logging: true,
             rate_limit: None,
         }
@@ -409,6 +528,14 @@ impl MiddlewareConfig {
         }
     }
 
+    /// Enable CORS with the given policy (builder style). See
+    /// [`CorsConfig::from_origins`] for building `config` from an
+    /// operator-supplied allow-list.
+    pub fn with_cors(mut self, config: CorsConfig) -> Self {
+        self.cors = Some(config);
+        self
+    }
+
     /// Enable per-client rate limiting with the given config (builder style).
     pub fn with_rate_limit(mut self, config: crate::rate_limiter::RateLimitConfig) -> Self {
         self.rate_limit = Some(config);
@@ -421,59 +548,32 @@ impl MiddlewareConfig {
 #[cfg(feature = "server")]
 mod layer {
     use super::{CorsConfig, MiddlewareConfig, RequestContext, RequestLogger};
-    use crate::rate_limiter::{extract_client_id, RateLimitDecision, RateLimiter};
     use axum::body::Body;
-    use axum::extract::{ConnectInfo, FromRequestParts, State};
-    use axum::http::{request::Parts, HeaderName, HeaderValue, Method, Request, StatusCode};
+    use axum::extract::State;
+    use axum::http::{header, HeaderName, HeaderValue, Method, Request, StatusCode};
     use axum::middleware::Next;
     use axum::response::{IntoResponse, Response};
-    use axum::{Json, Router};
-    use std::convert::Infallible;
-    use std::net::SocketAddr;
+    use axum::Router;
     use std::sync::Arc;
-
-    /// Best-effort [`ConnectInfo`] extractor that degrades to `None` instead
-    /// of rejecting the request when the router was not served via
-    /// [`axum::routing::Router::into_make_service_with_connect_info`] (the
-    /// case for the plain `axum::serve(listener, router)` this crate's
-    /// server currently uses).
-    ///
-    /// `axum`'s own `Option<ConnectInfo<T>>` cannot be used here: as of
-    /// axum-core 0.5 an extractor must opt in to `OptionalFromRequestParts`
-    /// to be wrapped in `Option<..>`, and [`ConnectInfo`] does not. This
-    /// thin wrapper implements [`FromRequestParts`] directly instead, so
-    /// [`rate_limit_mw`] can consult the real peer address *when available*
-    /// without hard-requiring connect-info wiring everywhere
-    /// [`apply_middleware`] with rate limiting enabled is used.
-    struct MaybePeerAddr(Option<SocketAddr>);
-
-    impl<S> FromRequestParts<S> for MaybePeerAddr
-    where
-        S: Send + Sync,
-    {
-        type Rejection = Infallible;
-
-        async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-            match ConnectInfo::<SocketAddr>::from_request_parts(parts, state).await {
-                Ok(ConnectInfo(addr)) => Ok(Self(Some(addr))),
-                Err(_) => Ok(Self(None)),
-            }
-        }
-    }
 
     /// Attach the configured middleware to `router`.
     ///
     /// Layers are applied outermost-first at request time: CORS wraps the rate
     /// limiter (so even a `429` carries CORS headers), which wraps request
-    /// logging, which wraps the routes.
+    /// logging, which wraps the routes. This mirrors (and, for rate limiting,
+    /// shares an implementation with — see
+    /// [`crate::rate_limiter::rate_limit_layer`]) the standalone
+    /// `cors -> auth -> rate-limit -> admission` order documented on
+    /// [`crate::rate_limiter`] for callers that need to interleave their own
+    /// auth layer between CORS and rate limiting instead of using this
+    /// all-in-one convenience function.
     pub fn apply_middleware(mut router: Router, config: MiddlewareConfig) -> Router {
         if config.enable_request_logging {
             let logger = Arc::new(RequestLogger::new());
             router = router.layer(axum::middleware::from_fn_with_state(logger, logging_mw));
         }
         if let Some(rate_config) = config.rate_limit {
-            let limiter = Arc::new(RateLimiter::new(rate_config));
-            router = router.layer(axum::middleware::from_fn_with_state(limiter, rate_limit_mw));
+            router = router.layer(crate::rate_limiter::rate_limit_layer(rate_config));
         }
         if let Some(cors) = config.cors {
             let cors = Arc::new(cors);
@@ -482,26 +582,55 @@ mod layer {
         router
     }
 
-    /// Inject the configured `Access-Control-*` headers on every response and
-    /// short-circuit `OPTIONS` preflight requests with `204 No Content`.
+    /// Inject the configured `Access-Control-*` / `Vary` headers per
+    /// [`CorsConfig::response_headers`] and short-circuit `OPTIONS` preflight
+    /// requests with `200 OK` *before* they reach any downstream layer —
+    /// including a caller-supplied auth layer nested inside this one — since
+    /// a browser sends preflight without credentials and would otherwise
+    /// always be rejected by auth (finding SV-06). `/admin/*` never receives
+    /// CORS headers regardless of configuration (finding sec-06): mount this
+    /// as the outermost layer (see [`crate::rate_limiter`]'s "Ready-to-mount
+    /// layer" docs) so it also wraps the admin router.
     async fn cors_mw(
         State(cors): State<Arc<CorsConfig>>,
         req: Request<Body>,
         next: Next,
     ) -> Response {
+        let path = req.uri().path().to_owned();
+        let is_admin_path = path == "/admin" || path.starts_with("/admin/");
         let is_preflight = req.method() == Method::OPTIONS;
+        let request_origin = req
+            .headers()
+            .get(header::ORIGIN)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+
         let mut response = if is_preflight {
-            StatusCode::NO_CONTENT.into_response()
+            StatusCode::OK.into_response()
         } else {
             next.run(req).await
         };
-        let headers = response.headers_mut();
-        for (name, value) in cors.access_control_headers() {
+
+        if is_admin_path {
+            return response;
+        }
+
+        for (name, value) in cors.response_headers(request_origin.as_deref()) {
             if let (Ok(header_name), Ok(header_value)) = (
                 HeaderName::from_bytes(name.as_bytes()),
                 HeaderValue::from_str(&value),
             ) {
-                headers.insert(header_name, header_value);
+                if header_name == header::VARY {
+                    // `Vary` is a genuinely multi-valued header (e.g. a
+                    // handler or a compression layer may already have set
+                    // `Vary: Accept-Encoding`); `insert` would silently
+                    // replace it with just `Origin` and destroy that
+                    // cache-variance declaration. `append` adds this as an
+                    // additional value instead.
+                    response.headers_mut().append(header_name, header_value);
+                } else {
+                    response.headers_mut().insert(header_name, header_value);
+                }
             }
         }
         response
@@ -518,54 +647,6 @@ mod layer {
         let response = next.run(req).await;
         logger.log_response(&ctx, response.status().as_u16(), 0);
         response
-    }
-
-    /// Enforce the per-client rate limit, returning `429 Too Many Requests`
-    /// (with a `Retry-After` header) when a client exceeds its budget. The
-    /// liveness (`/health`) and metrics (`/metrics`) probes are always exempt.
-    ///
-    /// Client identity is derived via [`extract_client_id`]: `X-Forwarded-For`
-    /// / `X-Real-IP` are honored only when the real TCP peer (via
-    /// [`MaybePeerAddr`]) is present in
-    /// [`RateLimitConfig::trusted_proxies`]; otherwise the real peer address
-    /// is used directly. [`MaybePeerAddr`] degrades gracefully (falls back to
-    /// the peer-less `"unknown"` bucket, matching the historical behavior)
-    /// rather than rejecting every request when the router is served without
-    /// `into_make_service_with_connect_info`.
-    ///
-    /// [`RateLimitConfig::trusted_proxies`]: crate::rate_limiter::RateLimitConfig::trusted_proxies
-    async fn rate_limit_mw(
-        State(limiter): State<Arc<RateLimiter>>,
-        MaybePeerAddr(peer): MaybePeerAddr,
-        req: Request<Body>,
-        next: Next,
-    ) -> Response {
-        let path = req.uri().path();
-        if path == "/health" || path == "/metrics" {
-            return next.run(req).await;
-        }
-        let peer_ip = peer.map(|addr| addr.ip());
-        let client_id = extract_client_id(req.headers(), peer_ip, limiter.trusted_proxies());
-        match limiter.check_and_consume(&client_id) {
-            RateLimitDecision::Allow => next.run(req).await,
-            RateLimitDecision::Deny { retry_after_ms } => {
-                let retry_secs = (retry_after_ms.saturating_add(999) / 1000).max(1);
-                let body = Json(serde_json::json!({
-                    "error": {
-                        "message": "rate limit exceeded",
-                        "type": "rate_limit_error",
-                        "retry_after_ms": retry_after_ms,
-                    }
-                }));
-                let mut response = (StatusCode::TOO_MANY_REQUESTS, body).into_response();
-                if let Ok(header_value) = HeaderValue::from_str(&retry_secs.to_string()) {
-                    response
-                        .headers_mut()
-                        .insert(HeaderName::from_static("retry-after"), header_value);
-                }
-                response
-            }
-        }
     }
 }
 
@@ -645,7 +726,7 @@ mod tests {
     #[test]
     fn test_cors_access_control_headers() {
         let cors = CorsConfig::default();
-        let headers = cors.access_control_headers();
+        let headers = cors.response_headers(Some("https://example.com"));
 
         // Should contain Access-Control-Allow-Origin
         let has_origin = headers
@@ -667,6 +748,156 @@ mod tests {
             !has_creds,
             "should not include credentials header by default"
         );
+    }
+
+    /// Helper: look up a header's value in a `response_headers()` result.
+    fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Table-driven coverage of the exact `CorsConfig::response_headers`
+    /// contract (findings sec-06 / sec-09 / SV-20): echo-on-match, always
+    /// `Vary: Origin`, never a comma-joined `Access-Control-Allow-Origin`,
+    /// and no grant at all on a non-match or a missing `Origin` header.
+    #[test]
+    fn test_cors_response_headers_table() {
+        struct Case {
+            name: &'static str,
+            config: CorsConfig,
+            request_origin: Option<&'static str>,
+            expect_acao: Option<&'static str>,
+        }
+
+        let two_origins = CorsConfig::from_origins([
+            "https://a.example".to_string(),
+            "https://b.example".to_string(),
+        ]);
+
+        let cases = vec![
+            Case {
+                name: "no Origin header at all -> no ACAO",
+                config: CorsConfig::from_origins(["https://a.example".to_string()]),
+                request_origin: None,
+                expect_acao: None,
+            },
+            Case {
+                name: "single configured origin, matching request -> echoed",
+                config: CorsConfig::from_origins(["https://a.example".to_string()]),
+                request_origin: Some("https://a.example"),
+                expect_acao: Some("https://a.example"),
+            },
+            Case {
+                name: "single configured origin, non-matching request -> no ACAO",
+                config: CorsConfig::from_origins(["https://a.example".to_string()]),
+                request_origin: Some("https://evil.example"),
+                expect_acao: None,
+            },
+            Case {
+                name: "two configured origins, first matches -> echoed (not joined)",
+                config: two_origins.clone(),
+                request_origin: Some("https://a.example"),
+                expect_acao: Some("https://a.example"),
+            },
+            Case {
+                name: "two configured origins, second matches -> echoed (not joined)",
+                config: two_origins.clone(),
+                request_origin: Some("https://b.example"),
+                expect_acao: Some("https://b.example"),
+            },
+            Case {
+                name: "two configured origins, non-match -> no ACAO",
+                config: two_origins,
+                request_origin: Some("https://evil.example"),
+                expect_acao: None,
+            },
+            Case {
+                name: "literal wildcard policy, credentials off -> literal *",
+                config: CorsConfig::default(),
+                request_origin: Some("https://anything.example"),
+                expect_acao: Some("*"),
+            },
+            Case {
+                name: "wildcard + credentials on -> exact origin, never literal *",
+                config: CorsConfig {
+                    allow_credentials: true,
+                    ..CorsConfig::default()
+                },
+                request_origin: Some("https://anything.example"),
+                expect_acao: Some("https://anything.example"),
+            },
+        ];
+
+        for case in cases {
+            let headers = case.config.response_headers(case.request_origin);
+
+            // The comma-joined value the pre-fix code emitted for a
+            // multi-origin config is never valid per the Fetch spec.
+            if let Some(acao) = header_value(&headers, "Access-Control-Allow-Origin") {
+                assert!(
+                    !acao.contains(','),
+                    "case '{}': Access-Control-Allow-Origin must never be comma-joined; got {acao:?}",
+                    case.name
+                );
+            }
+
+            assert_eq!(
+                header_value(&headers, "Access-Control-Allow-Origin"),
+                case.expect_acao,
+                "case '{}': unexpected Access-Control-Allow-Origin",
+                case.name
+            );
+
+            // "always emit Vary: Origin" (sec-06 fix text) whenever a
+            // policy is installed at all, matched or not.
+            assert_eq!(
+                header_value(&headers, "Vary"),
+                Some("Origin"),
+                "case '{}': Vary: Origin must always be present when a CORS policy runs",
+                case.name
+            );
+
+            // Allow-Methods/-Headers/-Max-Age travel with a grant only.
+            let has_methods = header_value(&headers, "Access-Control-Allow-Methods").is_some();
+            assert_eq!(
+                has_methods,
+                case.expect_acao.is_some(),
+                "case '{}': Allow-Methods presence must match the ACAO grant",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_cors_credentials_and_wildcard_never_combined() {
+        // allow_credentials=true must never coincide with a literal "*"
+        // Access-Control-Allow-Origin, even if "*" is (mis)configured into
+        // allowed_origins -- browsers reject that exact combination.
+        let cors = CorsConfig {
+            allowed_origins: vec!["*".to_string()],
+            allow_credentials: true,
+            ..Default::default()
+        };
+        let headers = cors.response_headers(Some("https://client.example"));
+        assert_eq!(
+            header_value(&headers, "Access-Control-Allow-Origin"),
+            Some("https://client.example")
+        );
+        assert_eq!(
+            header_value(&headers, "Access-Control-Allow-Credentials"),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn test_cors_from_origins_builder() {
+        let cors = CorsConfig::from_origins(["https://a.example".to_string()]);
+        assert!(cors.is_origin_allowed("https://a.example"));
+        assert!(!cors.is_origin_allowed("*"));
+        assert!(!cors.allow_credentials);
+        assert_eq!(cors.max_age_secs, CorsConfig::default().max_age_secs);
     }
 
     #[test]
@@ -844,6 +1075,289 @@ mod rate_limit_trusted_proxy_tests {
             resp2.status(),
             StatusCode::TOO_MANY_REQUESTS,
             "an untrusted peer's forwarded header must not grant a fresh bucket"
+        );
+    }
+}
+
+// ─── CORS header-contract integration tests (findings sec-06 / sec-09 /
+//     SV-06 / SV-20) ──────────────────────────────────────────────────────────
+
+#[cfg(all(test, feature = "server"))]
+mod cors_header_contract_tests {
+    use super::{apply_middleware, CorsConfig, MiddlewareConfig};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::middleware::{self, Next};
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::get;
+    use axum::Router;
+    use tower::ServiceExt;
+
+    async fn handler() -> &'static str {
+        "ok"
+    }
+
+    fn get_request(path: &str, origin: Option<&str>) -> Request<Body> {
+        let mut builder = Request::get(path);
+        if let Some(origin) = origin {
+            builder = builder.header("origin", origin);
+        }
+        builder.body(Body::empty()).expect("request")
+    }
+
+    fn options_request(path: &str) -> Request<Body> {
+        Request::builder()
+            .method("OPTIONS")
+            .uri(path)
+            .body(Body::empty())
+            .expect("preflight request")
+    }
+
+    fn header<'a>(resp: &'a Response, name: &str) -> Option<&'a str> {
+        resp.headers().get(name).and_then(|v| v.to_str().ok())
+    }
+
+    fn base_router() -> Router {
+        Router::new().route("/", get(handler)).route(
+            "/admin/status",
+            get(|| async { "admin: super-secret config" }),
+        )
+    }
+
+    /// The no-config case: [`MiddlewareConfig::none()`] (and, equivalently,
+    /// [`MiddlewareConfig::default()`] as of the sec-06 fix) installs no
+    /// CORS layer at all, so **no** `Access-Control-*` or `Vary` header
+    /// appears on any response, matched origin or not.
+    #[tokio::test]
+    async fn no_cors_config_emits_no_header_at_all() {
+        let router = apply_middleware(base_router(), MiddlewareConfig::none());
+        let resp = router
+            .oneshot(get_request("/", Some("https://example.com")))
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(header(&resp, "access-control-allow-origin").is_none());
+        assert!(
+            header(&resp, "vary").is_none(),
+            "no CORS layer at all means no Vary either"
+        );
+    }
+
+    /// `MiddlewareConfig::default()` is the production default and must
+    /// behave identically to `none()` for CORS: no header on any route.
+    #[tokio::test]
+    async fn default_middleware_config_emits_no_cors_header() {
+        let router = apply_middleware(base_router(), MiddlewareConfig::default());
+        let resp = router
+            .oneshot(get_request("/", Some("https://example.com")))
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            header(&resp, "access-control-allow-origin").is_none(),
+            "MiddlewareConfig::default() must not restore the old wildcard-by-default CORS"
+        );
+    }
+
+    /// The single-match case: a request whose `Origin` matches the
+    /// configured allow-list gets the origin echoed back plus `Vary:
+    /// Origin`.
+    #[tokio::test]
+    async fn matching_origin_is_echoed_with_vary() {
+        let cors = CorsConfig::from_origins(["https://app.example.com".to_string()]);
+        let router = apply_middleware(base_router(), MiddlewareConfig::none().with_cors(cors));
+
+        let resp = router
+            .oneshot(get_request("/", Some("https://app.example.com")))
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            header(&resp, "access-control-allow-origin"),
+            Some("https://app.example.com")
+        );
+        assert_eq!(header(&resp, "vary"), Some("Origin"));
+    }
+
+    /// The non-match case: a request whose `Origin` does **not** match the
+    /// configured allow-list gets no grant header, but `Vary: Origin` is
+    /// still present because the decision to withhold the grant itself
+    /// depended on the `Origin` header (sec-06 fix text: "always emit
+    /// Vary: Origin").
+    #[tokio::test]
+    async fn non_matching_origin_gets_no_acao_but_still_vary() {
+        let cors = CorsConfig::from_origins(["https://app.example.com".to_string()]);
+        let router = apply_middleware(base_router(), MiddlewareConfig::none().with_cors(cors));
+
+        let resp = router
+            .oneshot(get_request("/", Some("https://evil.example.com")))
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            header(&resp, "access-control-allow-origin").is_none(),
+            "a non-matching origin must never be granted access"
+        );
+        assert_eq!(header(&resp, "vary"), Some("Origin"));
+        assert!(
+            header(&resp, "access-control-allow-methods").is_none(),
+            "no grant headers should accompany a non-match"
+        );
+    }
+
+    /// A config listing multiple origins must never comma-join them into a
+    /// single (invalid) `Access-Control-Allow-Origin` value -- each request
+    /// gets exactly its own matched origin echoed back.
+    #[tokio::test]
+    async fn multi_origin_config_never_comma_joins() {
+        let cors = CorsConfig::from_origins([
+            "https://a.example.com".to_string(),
+            "https://b.example.com".to_string(),
+        ]);
+        let router = apply_middleware(base_router(), MiddlewareConfig::none().with_cors(cors));
+
+        let resp_a = router
+            .clone()
+            .oneshot(get_request("/", Some("https://a.example.com")))
+            .await
+            .expect("response a");
+        assert_eq!(
+            header(&resp_a, "access-control-allow-origin"),
+            Some("https://a.example.com")
+        );
+
+        let resp_b = router
+            .oneshot(get_request("/", Some("https://b.example.com")))
+            .await
+            .expect("response b");
+        assert_eq!(
+            header(&resp_b, "access-control-allow-origin"),
+            Some("https://b.example.com")
+        );
+    }
+
+    /// `cors_mw` must not clobber a `Vary` header a handler (or another
+    /// layer, e.g. compression) already set: `Vary: Origin` must be added
+    /// *alongside* an existing `Vary: Accept-Encoding`, not replace it --
+    /// `HeaderMap::insert` on a genuinely multi-valued header would destroy
+    /// the handler's own cache-variance declaration.
+    #[tokio::test]
+    async fn vary_from_a_handler_is_preserved_alongside_origin() {
+        async fn handler_with_vary() -> Response {
+            (
+                StatusCode::OK,
+                [(axum::http::header::VARY, "Accept-Encoding")],
+                "ok",
+            )
+                .into_response()
+        }
+
+        let cors = CorsConfig::from_origins(["https://app.example.com".to_string()]);
+        let inner = Router::new().route("/", get(handler_with_vary));
+        let router = apply_middleware(inner, MiddlewareConfig::none().with_cors(cors));
+
+        let resp = router
+            .oneshot(get_request("/", Some("https://app.example.com")))
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let vary_values: Vec<&str> = resp
+            .headers()
+            .get_all("vary")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert!(
+            vary_values.contains(&"Accept-Encoding"),
+            "the handler's own Vary: Accept-Encoding must survive; got {vary_values:?}"
+        );
+        assert!(
+            vary_values.contains(&"Origin"),
+            "cors_mw must still add Vary: Origin; got {vary_values:?}"
+        );
+    }
+
+    /// `/admin/*` must never receive a CORS grant, even when the configured
+    /// policy would otherwise allow the request's origin on a normal route
+    /// (finding sec-06: "Never apply permissive CORS to /admin/*").
+    #[tokio::test]
+    async fn admin_routes_never_get_cors_headers() {
+        let cors = CorsConfig::from_origins(["https://app.example.com".to_string()]);
+        let router = apply_middleware(base_router(), MiddlewareConfig::none().with_cors(cors));
+
+        // Sanity: the same origin IS granted on a non-admin route.
+        let resp = router
+            .clone()
+            .oneshot(get_request("/", Some("https://app.example.com")))
+            .await
+            .expect("non-admin response");
+        assert!(header(&resp, "access-control-allow-origin").is_some());
+
+        let admin_resp = router
+            .oneshot(get_request(
+                "/admin/status",
+                Some("https://app.example.com"),
+            ))
+            .await
+            .expect("admin response");
+        assert_eq!(admin_resp.status(), StatusCode::OK);
+        assert!(
+            header(&admin_resp, "access-control-allow-origin").is_none(),
+            "/admin/* must never receive a CORS grant regardless of configuration"
+        );
+    }
+
+    /// A stand-in "deny-all" auth layer, mirroring the shape of the real
+    /// bearer-auth middleware this crate does not own (`oxibonsai-serve`'s
+    /// `middleware::bearer_auth` / the CLI's `admission::bearer_auth`):
+    /// rejects every request with `401` regardless of path or method.
+    async fn deny_all_auth(_req: Request<Body>, _next: Next) -> Response {
+        StatusCode::UNAUTHORIZED.into_response()
+    }
+
+    /// The layer-order contract (module docs, "Layer order"): CORS must be
+    /// the outermost layer relative to auth, and its `OPTIONS` preflight
+    /// short-circuit must return success *before* reaching a nested auth
+    /// layer (finding SV-06) -- while a normal `GET` still reaches (and is
+    /// rejected by) that same auth layer, proving the short-circuit is
+    /// preflight-specific, not a blanket auth bypass.
+    #[tokio::test]
+    async fn preflight_bypasses_a_nested_auth_layer_but_get_does_not() {
+        let cors = CorsConfig::from_origins(["https://app.example.com".to_string()]);
+        // `apply_middleware` mounts CORS as the outermost of its own
+        // bundle; layering the deny-all auth stand-in on the *base* router
+        // first places it *inside* CORS once `apply_middleware` wraps it,
+        // exactly matching the required `cors -> auth -> ...` order.
+        let inner = Router::new()
+            .route("/v1/chat/completions", get(handler))
+            .layer(middleware::from_fn(deny_all_auth));
+        let router = apply_middleware(inner, MiddlewareConfig::none().with_cors(cors));
+
+        let get_resp = router
+            .clone()
+            .oneshot(get_request(
+                "/v1/chat/completions",
+                Some("https://app.example.com"),
+            ))
+            .await
+            .expect("get response");
+        assert_eq!(
+            get_resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "a normal GET must still reach and be rejected by the nested auth layer"
+        );
+
+        let preflight_resp = router
+            .oneshot(options_request("/v1/chat/completions"))
+            .await
+            .expect("preflight response");
+        assert_eq!(
+            preflight_resp.status(),
+            StatusCode::OK,
+            "an OPTIONS preflight must bypass the nested auth layer entirely \
+             (finding SV-06) -- a browser could otherwise never use an \
+             authenticated server"
         );
     }
 }

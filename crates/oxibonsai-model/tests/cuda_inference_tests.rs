@@ -15,9 +15,10 @@
     any(target_os = "linux", target_os = "windows")
 ))]
 mod cuda_tests {
-    use oxibonsai_core::config::Qwen3Config;
+    use oxibonsai_core::config::{Qwen3Config, RopeScaling};
     use oxibonsai_kernels::dispatch::{KernelDispatcher, KernelTier};
     use oxibonsai_model::model::BonsaiModel;
+    use oxibonsai_testkit::capability::{record as record_capability, Capability};
 
     fn ref_kernel() -> KernelDispatcher {
         KernelDispatcher::with_tier(KernelTier::Reference)
@@ -29,6 +30,13 @@ mod cuda_tests {
         oxibonsai_kernels::CudaGraph::global().is_ok()
     }
 
+    // ── T-05 capability-report producer ──────────────────────────────────
+    //
+    // T-07 FIX (verifier wave 3): this used to be an inline copy of
+    // `oxibonsai_testkit::capability::record`; `oxibonsai-model` now takes
+    // `oxibonsai-testkit` as a dev-dependency (imported above), so the copy
+    // is deleted in favour of the shared implementation.
+
     /// Minimal model config used across all CUDA tests.
     fn small_config() -> Qwen3Config {
         Qwen3Config {
@@ -38,10 +46,13 @@ mod cuda_tests {
             num_attention_heads: 2,
             num_kv_heads: 1,
             head_dim: 64,
+            value_length: 64,
             vocab_size: 100,
             max_context_length: 64,
             rms_norm_eps: 1e-6,
             rope_freq_base: 10000.0,
+            rope_scaling: RopeScaling::None,
+            sliding_window: None,
             architecture: "test".to_string(),
             model_name: "test".to_string(),
         }
@@ -70,13 +81,13 @@ mod cuda_tests {
     /// with the CPU reference path.
     #[test]
     fn cuda_forward_zero_weights_matches_cpu() {
-        // Skip if no CUDA — the test logic is valid on CPU too, but this file
-        // focuses on exercising the CUDA dispatch; document the skip explicitly.
-        if !cuda_available() {
-            // No GPU present.  The dispatch will transparently fall back to CPU,
-            // so we can still assert the CPU result is deterministic here.
-        }
-
+        // This test's assertions hold regardless of CUDA availability: with
+        // no GPU the dispatch transparently falls back to CPU, and the
+        // determinism check below is still meaningful either way — so,
+        // unlike the GPU-device-specific tests further down, this one is
+        // never skipped (it was previously an `if !cuda_available() {}`
+        // with an empty body that branched on nothing; removed as dead
+        // code rather than left to look like a real skip guard it was not).
         let mut model_a = BonsaiModel::new(small_config());
         let mut model_b = BonsaiModel::new(small_config());
         let kernel = ref_kernel();
@@ -228,12 +239,25 @@ mod cuda_tests {
     // ──────────────────────────────────────────────────────────────────────────
 
     /// When a CUDA device IS present, `try_cuda_full_forward` with an empty
-    /// layer_params slice returns None without panicking (graceful no-op).
+    /// layer_params slice does not panic (graceful no-op).
+    ///
+    /// T-09: this used to be named `..._returns_none_gracefully` and end in
+    /// `let _ = result;` — a name promising a specific `None` return that
+    /// the body never actually checked (its own comment already hedged:
+    /// "either None or Some ... either way must not panic", so `None` was
+    /// never guaranteed). Renamed to match what is actually asserted, and
+    /// "must not panic" is now a real, explicit assertion via
+    /// `catch_unwind` instead of an implicit property no `assert*` ever
+    /// tested.
     #[test]
-    fn cuda_full_forward_empty_params_returns_none_gracefully() {
+    fn cuda_full_forward_empty_params_does_not_panic() {
+        const TEST: &str =
+            "oxibonsai-model::cuda_inference_tests::cuda_full_forward_empty_params_does_not_panic";
         if !cuda_available() {
+            record_capability(Capability::Cuda, false, TEST);
             return; // No GPU — skip.
         }
+        record_capability(Capability::Cuda, true, TEST);
 
         // Build a trivially small hidden vector matching the smallest legal hidden
         // size (must be > 0 for the kernel to accept it, but can be synthetic).
@@ -241,38 +265,45 @@ mod cuda_tests {
         let rope_cos = vec![1.0f32; 32];
         let rope_sin = vec![0.0f32; 32];
 
-        let result = oxibonsai_kernels::try_cuda_full_forward(
-            &hidden,
-            &[], // zero layers — should return None without crash
-            &rope_cos,
-            &rope_sin,
-            0,  // pos
-            1,  // nq
-            1,  // nkv
-            64, // head_dim
-            1,  // heads_per_group
-            1e-6,
-            64,  // hidden_size
-            128, // intermediate_size
-            128, // max_seq_len
-            None,
-            0,
+        let outcome = std::panic::catch_unwind(|| {
+            oxibonsai_kernels::try_cuda_full_forward(
+                &hidden,
+                &[], // zero layers — should return None without crash
+                &rope_cos,
+                &rope_sin,
+                0,  // pos
+                1,  // nq
+                1,  // nkv
+                64, // head_dim
+                1,  // heads_per_group
+                1e-6,
+                64,  // hidden_size
+                128, // intermediate_size
+                128, // max_seq_len
+                None,
+                0,
+            )
+        });
+        assert!(
+            outcome.is_ok(),
+            "try_cuda_full_forward must not panic on an empty layer_params slice"
         );
-
-        // An empty layer_params is either None (graceful no-op) or Some (if the
-        // kernel still uploads the final norm and returns the input unchanged).
-        // Either way must not panic.
-        let _ = result;
     }
 
     /// When a CUDA device IS present, `try_cuda_prefill` with an empty
-    /// layer_params slice does not panic and either succeeds (0 layers processed)
-    /// or returns an Err from early validation / kernel compilation failure.
+    /// layer_params slice does not panic.
+    ///
+    /// T-09: see `cuda_full_forward_empty_params_does_not_panic`'s doc
+    /// comment — same rename-and-assert-what-is-actually-checked fix.
     #[test]
-    fn cuda_prefill_empty_params_returns_err_gracefully() {
+    fn cuda_prefill_empty_params_does_not_panic() {
+        const TEST: &str =
+            "oxibonsai-model::cuda_inference_tests::cuda_prefill_empty_params_does_not_panic";
         if !cuda_available() {
+            record_capability(Capability::Cuda, false, TEST);
             return; // No GPU — skip.
         }
+        record_capability(Capability::Cuda, true, TEST);
 
         let hidden_batch = vec![0.0f32; 64];
         let cos_table = vec![1.0f32; 32];
@@ -281,34 +312,36 @@ mod cuda_tests {
         // The important property is that this does NOT panic regardless of the
         // outcome.  On a machine with CUDA SDK headers the call returns Ok(()); on
         // machines without SDK headers kernel compilation fails and returns Err.
-        let result = oxibonsai_kernels::try_cuda_prefill(
-            &hidden_batch,
-            1,   // batch_size
-            0,   // pos_start
-            0,   // n_layers
-            &[], // layer_params — matches n_layers
-            &cos_table,
-            &sin_table,
-            64,  // hidden_size
-            128, // intermediate_size
-            1,   // nq
-            1,   // nkv
-            64,  // head_dim
-            1,   // heads_per_group
-            1e-6,
-            128, // max_seq_len
-            None,
-            None,
-            1e-6,
-            None,
-            None,
-            0,
-            None,
-            None,
+        let outcome = std::panic::catch_unwind(|| {
+            oxibonsai_kernels::try_cuda_prefill(
+                &hidden_batch,
+                1,   // batch_size
+                0,   // pos_start
+                0,   // n_layers
+                &[], // layer_params — matches n_layers
+                &cos_table,
+                &sin_table,
+                64,  // hidden_size
+                128, // intermediate_size
+                1,   // nq
+                1,   // nkv
+                64,  // head_dim
+                1,   // heads_per_group
+                1e-6,
+                128, // max_seq_len
+                None,
+                None,
+                1e-6,
+                None,
+                None,
+                0,
+                None,
+                None,
+            )
+        });
+        assert!(
+            outcome.is_ok(),
+            "try_cuda_prefill must not panic on an empty layer_params slice (0 n_layers)"
         );
-
-        // Either outcome (Ok or Err from missing SDK headers) is acceptable;
-        // what matters is that no panic occurred.
-        let _ = result;
     }
 }

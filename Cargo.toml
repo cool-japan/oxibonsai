@@ -11,6 +11,7 @@ members = [
     "crates/oxibonsai-tokenizer",
     "crates/oxibonsai-eval",
     "crates/oxibonsai-serve",
+    "crates/oxibonsai-testkit",
 ]
 
 [workspace.package]
@@ -19,7 +20,7 @@ edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/cool-japan/oxibonsai"
 authors = ["COOLJAPAN OU (Team KitaSan)"]
-rust-version = "1.86"
+rust-version = "1.89"
 homepage = "https://github.com/cool-japan/oxibonsai"
 readme = "README.md"
 keywords = ["llm", "inference", "gguf", "bonsai", "1-bit"]
@@ -37,12 +38,19 @@ oxibonsai-serve = { path = "crates/oxibonsai-serve", version = "0.2.4" }
 oxibonsai-rag = { path = "crates/oxibonsai-rag", version = "0.2.4" }
 oxibonsai-eval = { path = "crates/oxibonsai-eval", version = "0.2.4" }
 oxibonsai = { path = "crates/oxibonsai", version = "0.2.4" }
+# T-07 fix (verifier wave 3): dev-only, `publish = false`, and never on
+# crates.io — deliberately NO `version` key. A `[dev-dependencies]` path
+# entry that also carries `version` is rewritten to a registry dependency at
+# `cargo package` time (Cargo strips path-only dev-deps instead), which would
+# make every publishable consumer below declare a dev-dependency on a crate
+# that can never exist on crates.io. Path-only is publish-safe and is still
+# "managed at the workspace level" per COOLJAPAN policy.
+oxibonsai-testkit = { path = "crates/oxibonsai-testkit" }
 
 # ── COOLJAPAN Ecosystem (Pure Rust Policy) ──
+# deps-14: scirs2-linalg, scirs2-neural and oxifft were declared here but never
+# consumed by any workspace member; removed rather than kept as unused surface.
 scirs2-core = { version = "0.6.5", default-features = false }
-scirs2-linalg = { version = "0.6.5", default-features = false }
-scirs2-neural = { version = "0.6.5", default-features = false }
-oxifft = "0.4.2"
 oxiarc-deflate = "0.4.2"
 
 # ── GPU backends ──
@@ -51,52 +59,81 @@ cudarc = { version = "0.19", features = ["nvrtc", "cuda-version-from-build-syste
 objc = "0.2"
 
 # ── Error handling ──
-thiserror = "2.0.18"
-anyhow = "1.0.103"
+thiserror = "2.0.20"
+anyhow = "1.0.104"
 
 # ── Observability ──
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 
 # ── Serialization ──
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
-toml = "1.1.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+toml = "1.1.6"
 
 # ── Async runtime ──
-tokio = { version = "1.52.3", features = ["full"] }
-tokio-stream = "0.1.18"
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-stream = "0.1.19"
 
 # ── HTTP server ──
+# deps-06: `tower-http` was declared here but never imported by either
+# consumer (oxibonsai-runtime's hand-rolled CORS middleware never used
+# `tower_http::cors::CorsLayer`, and oxibonsai-serve just forwarded it
+# unused); removed along with both `optional = true` edges.
 axum = "0.8.9"
 tower = "0.5.3"
-tower-http = { version = "0.7.0", features = ["cors", "trace"] }
-http-body-util = "0.1.3"
+http-body-util = "0.1.5"
 
 # ── CLI ──
-clap = { version = "4.6.1", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive"] }
 dotenvy = "0.15.7"
 
 # ── Binary / memory / numerics ──
 memmap2 = "0.9.11"
 byteorder = "1.5.0"
 half = { version = "2.7.1", features = ["serde"] }
-libc = "0.2.186"
-mach2 = "0.6.0"
-crc32fast = "1.5.0"
+libc = "0.2.189"
+mach2 = "0.7.0"
+crc32fast = "1.5.2"
 
 # ── Parallelism ──
 rayon = "1.12.0"
 
 # ── Tokenizer ──
-tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
+# Pure-Rust regex engine for the native GPT-2/qwen35 `Split` pre-tokenizer
+# pattern (TOK-M4; consumed by B2-08, wave 2). Declared here ahead of that
+# consumer landing so B2-08 only needs to add `fancy-regex = { workspace =
+# true }` to `oxibonsai-tokenizer`'s own manifest, not edit the workspace
+# root. The crate-level edge itself was removed again in FIX-01-BUILD: an
+# unused *crate* dependency forced a `cargo-machete` ignore entry and a
+# `[[bans.skip]]` exception (tokenizers pins fancy-regex 0.17.0), both of
+# which would have masked real regressions until wave 2. An unreferenced
+# `[workspace.dependencies]` entry costs nothing: Cargo never resolves it.
+fancy-regex = "0.19.2"
+# Pure Rust, no_std-capable Unicode normalization (TOK-09, B2-08 wave 2):
+# `oxibonsai-tokenizer`'s `tokenizer.json` loader silently skipped the
+# `normalizer` field, causing a proven divergence from HF on decomposed
+# input. Latest crates.io version as of this session.
+unicode-normalization = "0.1.25"
 
 # ── Model conversion ──
 safetensors = "0.8.0"
 oxionnx-proto = "0.1.7"
 
 # ── HTTP client ──
+# deps-01: `reqwest`'s default TLS backend (hyper-rustls -> rustls -> aws-lc-rs
+# -> aws-lc-sys) compiles BoringSSL C + aarch64 assembly into the default
+# shipping binary. The one production call site (src/cli/cmd_tokenizer.rs) now
+# uses the Pure-Rust COOLJAPAN `oxihttp` client instead (verified: resolves
+# with no `aws-lc-sys`/`ring`/`cc` in its dependency tree; TLS via
+# rustls+rustcrypto through `oxitls`). `reqwest` itself stays declared here
+# only for the dev-dependency edges below (test-only HTTP clients hitting a
+# local server in `oxibonsai-cli`'s and `oxibonsai-serve`'s integration
+# tests) — dev-dependencies never reach a shipped artifact, so the C-touching
+# TLS stack they pull in is out of policy scope (same class as deps-16).
 reqwest = { version = "0.13", features = ["json", "blocking"] }
+oxihttp = { version = "0.2.1", default-features = false, features = ["client", "tls"] }
 ctrlc = { version = "3.5.2", features = ["termination"] }
 
 # ── Benchmarking (dev) ──
@@ -105,7 +142,7 @@ criterion = { version = "0.8.2", features = ["html_reports"] }
 # ── Testing (dev) ──
 proptest = "1.11.0"
 tempfile = "3.27.0"
-bytes = "1.12.0"
+bytes = "1.12.1"
 
 [package]
 name = "oxibonsai-cli"
@@ -119,11 +156,15 @@ homepage.workspace = true
 documentation = "https://docs.rs/oxibonsai-cli"
 keywords.workspace = true
 categories.workspace = true
-description = "Pure Rust 1-bit LLM inference engine for PrismML Bonsai models — CLI"
+description = "Pure Rust sub-2-bit LLM inference engine for PrismML Bonsai models — CLI"
 
 [[bin]]
 name = "oxibonsai"
 path = "src/main.rs"
+# deps-12: the bin target shares its name with the `oxibonsai` library crate;
+# `cargo doc --workspace` would otherwise emit two `oxibonsai/index.html`
+# targets and non-deterministically overwrite one with the other.
+doc = false
 
 [features]
 default = ["server"]
@@ -133,11 +174,55 @@ simd-avx2 = ["oxibonsai-kernels/simd-avx2"]
 simd-avx512 = ["oxibonsai-kernels/simd-avx512"]
 simd-neon = ["oxibonsai-kernels/simd-neon"]
 native-tokenizer = ["dep:oxibonsai-tokenizer"]
+# Forwards to oxibonsai-runtime's HF `tokenizers`-backed TokenizerBridge
+# backend (deps-07/TOK-13). Every `tokenizers` call site is now gated
+# (FIX-01-BUILD), so `--no-default-features` builds and runs on the
+# Pure-Rust native backend instead.
+#
+# FLIPPED OFF DEFAULT (BENCHES, wave 3, RT-ADMIN-CFG blocking-1 / decision
+# D-5): the native backend's `Vocabulary::is_special_id` linear-scan
+# precondition has now been benchmarked (~20 ns/call at the real 33-entry
+# special-token count on Apple M3, release profile, idle machine — see
+# `crates/oxibonsai-tokenizer/benches/tokenizer_bench.rs`'s
+# `special_id_lookup` group's `miss` arm, the reliable full-scan number
+# this decision relies on; `hit`'s own timing is not reproducible run to
+# run, since `HashMap`'s default hasher is randomly re-seeded per process —
+# see that bench's doc comment). The actual risk this decision must clear
+# is not one call: `native_step_decode` re-runs the scan over the WHOLE
+# decode window per streamed token (O(window x |specials|)), so at a
+# realistic 2048-4096 token window that is ~41-82 us/token (window x
+# ~20 ns/call) — re-measured just now on this shared, multi-agent build
+# machine under heavy concurrent load (session CONTEXT.md's documented
+# caveat that wall-clock numbers here are noisy) at up to ~100 ns/call,
+# i.e. still only ~0.2-0.4 ms/token worst case — several orders of
+# magnitude below a token's actual decode/sampling cost either way, so
+# streaming throughput is not regressed. Cross-backend parity is also
+# proven
+# (`tokenizer_bridge.rs::is_special_and_piece_agree_across_backends_on_the_real_fixture`),
+# so the Pure-Rust native tokenizer is now the default and `hf-tokenizer`
+# is opt-in only. `cargo install oxibonsai-cli` (default features) no
+# longer pulls in the `tokenizers` crate.
+hf-tokenizer = ["oxibonsai-runtime/hf-tokenizer"]
 eval = ["dep:oxibonsai-eval"]
 cuda = ["oxibonsai-kernels/cuda"]
 native-cuda = ["gpu", "oxibonsai-kernels/native-cuda", "oxibonsai-model/native-cuda", "oxibonsai-runtime/native-cuda", "oxibonsai-image/native-cuda"]
 metal = ["gpu", "oxibonsai-kernels/metal", "oxibonsai-model/metal", "oxibonsai-runtime/metal", "oxibonsai-image/metal"]
 gpu = ["oxibonsai-kernels/gpu"]
+# deps-16/FIX-01-BUILD (wave 1/1.5 addendum): gates every `[[bench]]` TARGET
+# below so a default `cargo build`/`cargo test`/`cargo check` never builds
+# or runs the bench binaries themselves without `--features bench`. Run
+# benchmarks with `cargo bench --features bench` (or
+# `--bench <name> --features bench`).
+#
+# CORRECTION (FIX3-BUILD, wave 3.5): this does NOT keep `criterion` (hence
+# `alloca` -> `cc`, a C build) out of a default `cargo test`/`cargo check
+# --all-targets` invocation, despite an earlier version of this comment
+# claiming so — `criterion` is an ordinary, always-resolved
+# `[dev-dependencies]` entry above; only the bench *targets* using it are
+# feature-gated. See `deny.toml`'s deps-16 entry for the full measurement
+# (this session's own `cargo check -p oxibonsai-cli --tests` run compiled
+# `criterion` v0.8.2) and the still-open cross-target-lint consequence.
+bench = []
 wasm = [
     "oxibonsai-core/wasm",
     "oxibonsai-kernels/wasm",
@@ -156,17 +241,22 @@ oxibonsai-image.workspace = true
 oxibonsai-runtime = { workspace = true, default-features = false }
 tracing.workspace = true
 anyhow.workspace = true
-serde.workspace = true
 serde_json.workspace = true
-toml.workspace = true
+
+# cli-09 (wave-2.5 item 2c) attempted default Metal-on-macOS via a
+# `[target.'cfg(target_os = "macos")'.dependencies]` union onto
+# oxibonsai-kernels/-model/-runtime's `metal`+`gpu` features; measured to
+# move the default decode tier NEON -> Metal (GPU-concurrency ceiling of 1)
+# and break the default-feature build of a test target — REVERTED wave 3.5
+# (D-1). Payoff re-homed to B2-14 (wave 4) as `--backend auto|cpu|metal`,
+# never making `gpu` default via hidden feature unification; do not re-add
+# a platform-gated union here without a dispatcher-side gating change first.
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-memmap2.workspace = true
 axum.workspace = true
 clap.workspace = true
 dotenvy.workspace = true
-tracing-subscriber.workspace = true
-reqwest = { workspace = true, features = ["blocking"] }
+oxihttp.workspace = true
 ctrlc.workspace = true
 tokio.workspace = true
 tower = { workspace = true, features = ["limit", "load-shed", "timeout", "util"] }
@@ -218,18 +308,22 @@ path = "examples/runtime_controllers.rs"
 [[bench]]
 name = "kernel_benchmarks"
 harness = false
+required-features = ["bench"]
 
 [[bench]]
 name = "inference_throughput"
 harness = false
+required-features = ["bench"]
 
 [[bench]]
 name = "memory_benchmarks"
 harness = false
+required-features = ["bench"]
 
 [[bench]]
 name = "controllers_bench"
 harness = false
+required-features = ["bench"]
 
 [profile.release]
 lto = true

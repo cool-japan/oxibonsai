@@ -42,6 +42,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Instant;
 
+use oxibonsai_core::bf16::bf16_to_f32;
 use oxibonsai_core::gguf::reader::GgufFile;
 use oxibonsai_core::gguf::types::GgufTensorType;
 use oxibonsai_core::quant_ternary::BlockTQ2_0_g128;
@@ -195,13 +196,13 @@ fn dequant_ternary(raw: &[u8]) -> Result<Vec<f32>, Box<dyn Error>> {
 
 /// Decode a raw BF16 byte stream (little-endian `u16` bit patterns) to `f32`.
 ///
-/// BF16 → f32 is an exact upper-half placement: `f32::from_bits(bf16 << 16)`.
+/// BF16 → f32 is an exact upper-half placement, via the single canonical
+/// [`oxibonsai_core::bf16::bf16_to_f32`] (K-12 bf16 hoist / FIX3-GGUF-WRITE
+/// item 4) rather than this example's former inline copy of the identical
+/// bit-manipulation.
 fn decode_bf16(raw: &[u8]) -> Vec<f32> {
     raw.chunks_exact(2)
-        .map(|c| {
-            let bits = u16::from_le_bytes([c[0], c[1]]);
-            f32::from_bits((bits as u32) << 16)
-        })
+        .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
         .collect()
 }
 
@@ -439,5 +440,26 @@ mod tests {
         let raw = 0x3f80u16.to_le_bytes();
         let got = decode_bf16(&raw);
         assert_eq!(got, vec![1.0f32]);
+    }
+
+    /// FIX3-GGUF-WRITE item 4: `decode_bf16`'s now-shared widening
+    /// (`oxibonsai_core::bf16::bf16_to_f32`) must agree with this example's
+    /// former inline expression over the entire `u16` domain — every
+    /// subnormal, both zeros, every infinity and every NaN payload.
+    /// Compared by `to_bits()`: under IEEE `==`, `NaN != NaN` (two
+    /// genuinely-agreeing NaN outputs would look like a mismatch) and
+    /// `-0.0 == 0.0` (a real sign-of-zero mismatch would look like
+    /// agreement).
+    #[test]
+    fn decode_bf16_matches_the_former_inline_expression_across_the_full_u16_domain() {
+        for bits in 0u16..=0xFFFF {
+            let via_decode_bf16 = decode_bf16(&bits.to_le_bytes())[0];
+            let former_inline_expression = f32::from_bits((bits as u32) << 16);
+            assert_eq!(
+                via_decode_bf16.to_bits(),
+                former_inline_expression.to_bits(),
+                "mismatch for bf16 bit pattern {bits:#06x}"
+            );
+        }
     }
 }

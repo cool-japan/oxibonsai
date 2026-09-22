@@ -9,8 +9,9 @@
 //!   read directly in Pure Rust via [`crate::vae::safetensors::VaeSafetensors`]
 //!   (bf16→f32, conv-weight transpose, `to_out.0` un-nesting). This is the
 //!   self-serve path — no Python dump step.
-//! - `NpyDir` — the per-tensor f32 `.npy` files exported by
-//!   `/tmp/bonsai_vae_export_weights.py` (the original dev-time golden dump).
+//! - `NpyDir` — the per-tensor f32 `.npy` files exported by the project's
+//!   `bonsai_vae_export_weights.py` export script (the original dev-time
+//!   golden dump).
 //!
 //! [`VaeWeights::open`] **auto-detects** the source from the path: a file ending
 //! in `.safetensors` → the safetensors loader; a directory → the `.npy` loader.
@@ -211,7 +212,7 @@ pub fn read_npy_f32(path: &Path) -> VaeResult<Tensor> {
         .collect::<Result<_, _>>()?;
     let data_start = header_start + header_len;
     let payload = &bytes[data_start..];
-    if payload.len() % 4 != 0 {
+    if !payload.len().is_multiple_of(4) {
         return Err(npy("payload not f32-aligned".to_string()));
     }
     let numel: usize = shape.iter().product();

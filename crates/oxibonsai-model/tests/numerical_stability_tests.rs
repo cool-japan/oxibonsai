@@ -13,7 +13,7 @@ use oxibonsai_model::layers::attention::{
 use oxibonsai_model::layers::linear::Linear1Bit;
 use oxibonsai_model::layers::rms_norm::RmsNorm;
 use oxibonsai_model::layers::rope::RopeTable;
-use oxibonsai_model::layers::swiglu::{silu, swiglu};
+use oxibonsai_model::layers::swiglu::{silu, try_swiglu};
 
 // ──────────────────────────────────────────────────────────────────
 // Helper utilities
@@ -453,7 +453,7 @@ fn swiglu_large_values_no_overflow() {
     let up = vec![1.0f32; n];
     let mut output = vec![0.0f32; n];
 
-    swiglu(&gate, &up, &mut output);
+    try_swiglu(&gate, &up, &mut output).expect("matching-length buffers must succeed");
     assert_no_nan(&output, "swiglu_large");
 }
 

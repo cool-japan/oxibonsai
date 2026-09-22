@@ -201,6 +201,20 @@ fn try_compile_metal_shaders(out_dir: &str) -> bool {
 /// if any of these names cannot be found in `kernel_sources/`, so a rename
 /// or deletion is caught immediately instead of silently degrading to the
 /// empty-metallib fallback.
+///
+/// This is a build-time-only check, so it can only catch a name that is
+/// pushed by `build_combined_msl()` but missing here (or renamed/deleted
+/// under `kernel_sources/`). It cannot catch the reverse — a name added here
+/// and to `kernel_sources/` but never pushed by `build_combined_msl()`, or a
+/// desync between what THIS list embeds and what `build_combined_msl()`
+/// pushes when both are edited inconsistently (MET-12). Two more checks close
+/// that gap: `tests/build_script_kernel_sources.rs` parses `pipelines.rs`
+/// textually and asserts its pushed set equals its own mirror of this list;
+/// and `pipelines.rs::load_or_compile_library` independently re-derives the
+/// full set of `kernel void` entry points straight from the freshly computed
+/// `build_combined_msl()` output at *runtime* and verifies every one resolves
+/// in the embedded metallib, falling through to disk-cache/xcrun/runtime
+/// compilation rather than failing hard if the embed silently went stale.
 #[cfg(target_os = "macos")]
 const ACTIVE_KERNELS: &[&str] = &[
     // Decode path (single-token)
@@ -239,6 +253,32 @@ const ACTIVE_KERNELS: &[&str] = &[
     "MSL_CONV2D_F32_IMPLICIT",
     // FLUX.2 DiT joint attention (flash-attention simdgroup_matrix)
     "MSL_DIT_JOINT_ATTENTION_FLASH",
+    // GPU top-k (perf-11 sampled-path partial reduction, beside MSL_ARGMAX)
+    "MSL_TOPK_F32",
+    // K-quant GEMV (MET-10: folded into the embedded metallib so these no
+    // longer compile 6 separate on-first-use MTLLibrary instances; see
+    // `pipelines.rs::MetalPipelines::pipeline_for`)
+    "MSL_GEMV_Q2K_V1",
+    "MSL_GEMV_Q3K_V1",
+    "MSL_GEMV_Q4K_V1",
+    "MSL_GEMV_Q5K_V1",
+    "MSL_GEMV_Q6K_V1",
+    "MSL_GEMV_Q8K_V1",
+    // Standard GGUF Q4_0 / Q8_0 GEMV (MET-10)
+    "MSL_GEMV_Q4_0_V1",
+    "MSL_GEMV_Q8_0_V1",
+    // FP8 single-token GEMV (MET-10)
+    "MSL_GEMV_FP8_E4M3_V1",
+    "MSL_GEMV_FP8_E5M2_V1",
+    // FP8 batch prefill GEMM / fused / gemv-pf (MET-10)
+    "MSL_GEMM_FP8_E4M3_V1",
+    "MSL_GEMM_FP8_E4M3_RESIDUAL_V1",
+    "MSL_FUSED_GATE_UP_SWIGLU_GEMM_FP8_E4M3_V1",
+    "MSL_GEMV_FP8_E4M3_PF_V1",
+    "MSL_GEMM_FP8_E5M2_V1",
+    "MSL_GEMM_FP8_E5M2_RESIDUAL_V1",
+    "MSL_FUSED_GATE_UP_SWIGLU_GEMM_FP8_E5M2_V1",
+    "MSL_GEMV_FP8_E5M2_PF_V1",
 ];
 
 /// Extract actively-used MSL raw string literals from the concatenated

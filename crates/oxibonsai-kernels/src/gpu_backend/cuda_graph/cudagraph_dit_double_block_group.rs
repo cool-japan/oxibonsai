@@ -225,11 +225,11 @@ impl CudaGraph {
                 num_heads * head_dim
             ));
         }
-        if head_dim % 2 != 0 {
+        if !head_dim.is_multiple_of(2) {
             return err("head_dim must be even".into());
         }
         // Ternary GEMM contraction dims must be multiples of 128.
-        if hidden_size % 128 != 0 || ffn_inner % 128 != 0 {
+        if !hidden_size.is_multiple_of(128) || !ffn_inner.is_multiple_of(128) {
             return err(format!(
                 "gemm_tq2 k must be %128 (hidden {hidden_size}, ffn_inner {ffn_inner})"
             ));

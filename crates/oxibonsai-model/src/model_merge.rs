@@ -12,6 +12,13 @@
 //! - **Task Vector**: `base + α*(finetuned - base)`, adds or subtracts fine-tuning direction
 //! - **DARE**: random dropout of task-vector elements with rescaling for sparse merging
 //!
+//! ## Reachability
+//!
+//! As of this writing, nothing in the CLI calls [`merge_models`] or
+//! [`merge_tensors`] — there is no `oxibonsai merge`-style entry point that
+//! runs this pipeline against real checkpoints. This module is a tested,
+//! documented primitive for that future work, not a wired feature.
+//!
 //! ## Example
 //!
 //! ```rust
@@ -56,7 +63,7 @@ pub enum MergeError {
     InvalidDensity(f32),
     /// SLERP was attempted on a zero-norm vector.
     #[error("SLERP failed: zero vector")]
-    SierpZeroVector,
+    SlerpZeroVector,
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -297,41 +304,88 @@ pub fn linear_merge(a: &[f32], b: &[f32], alpha: f32) -> Vec<f32> {
 
 /// Spherical linear interpolation (SLERP) between two real-valued vectors.
 ///
-/// Both vectors are first normalized to unit length. If either has zero norm
-/// or if they are nearly parallel (`cos_theta > 0.9995`), the function falls back
-/// to ordinary linear interpolation to avoid numerical instability.
+/// Both vectors are normalized to unit length, and the SLERP coefficients
+/// are applied to those *normalized* vectors — not the raw, differently
+/// scaled inputs — so the result actually lies on the great-circle arc
+/// between the two directions instead of being skewed toward whichever
+/// input happens to have the larger magnitude.
+///
+/// If either input has zero norm, this infallible wrapper falls back to
+/// ordinary linear interpolation over the raw vectors (there is no
+/// direction to interpolate for a zero vector); use [`slerp_checked`]
+/// instead if you need to detect that case rather than silently getting a
+/// linear blend. If the two directions are nearly parallel (`cos_theta >
+/// 0.9995`), both functions fall back to linear interpolation to avoid
+/// numerical instability from dividing by a near-zero `sin(theta)`.
+///
+/// If `a` and `b` have different lengths, only the shared prefix
+/// `[0..min(a.len(), b.len())]` is interpolated (mirroring
+/// [`linear_merge`]) — the norms used for normalization, the dot product,
+/// and the output are all computed over that same truncated prefix, so
+/// ragged inputs are never normalized against a magnitude the
+/// interpolation itself doesn't use. Concretely,
+/// `slerp(a, b, t) == slerp(&a[..n], &b[..n], t)` where `n =
+/// min(a.len(), b.len())`.
 ///
 /// ## Formula
 ///
-/// `result = sin((1-t)*θ)/sin(θ) * a + sin(t*θ)/sin(θ) * b`
+/// `result = sin((1-t)*θ)/sin(θ) * a_norm + sin(t*θ)/sin(θ) * b_norm`
 ///
-/// where `θ = acos(dot(a_norm, b_norm))`.
+/// where `θ = acos(dot(a_norm, b_norm))` and `a_norm = a / ||a||`, `b_norm
+/// = b / ||b||`.
 pub fn slerp(a: &[f32], b: &[f32], t: f32) -> Vec<f32> {
+    slerp_checked(a, b, t).unwrap_or_else(|_| {
+        let n = a.len().min(b.len());
+        linear_merge(&a[..n], &b[..n], t)
+    })
+}
+
+/// Checked variant of [`slerp`] that reports a zero-norm input as an error
+/// instead of silently falling back to linear interpolation.
+///
+/// Applies the same shared-prefix truncation as [`slerp`] for ragged
+/// inputs (see its docs). Nearly-parallel directions (`cos_theta >
+/// 0.9995`) still fall back to `Ok(linear_merge(..))` — that is a
+/// legitimate numerical-stability choice, not an error condition.
+///
+/// # Errors
+///
+/// Returns [`MergeError::SlerpZeroVector`] if `a` or `b` (restricted to
+/// the shared prefix) has zero (or near-zero, `< f32::EPSILON`) norm —
+/// there is no direction to interpolate for a zero vector.
+pub fn slerp_checked(a: &[f32], b: &[f32], t: f32) -> Result<Vec<f32>, MergeError> {
     let n = a.len().min(b.len());
     if n == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
+    let a = &a[..n];
+    let b = &b[..n];
 
-    // Compute norms
+    // Compute norms over the same truncated prefix the dot product and
+    // output use — computing them over the full, possibly longer slices
+    // (as an earlier version of this function did) mis-normalizes ragged
+    // inputs against a magnitude the interpolation never actually uses.
     let norm_a = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let norm_b = b.iter().map(|x| x * x).sum::<f32>().sqrt();
 
-    // Fall back to linear when either vector is a zero vector
+    // Zero-norm inputs have no direction to interpolate: this is an error,
+    // not something to paper over with a silent fallback.
     if norm_a < f32::EPSILON || norm_b < f32::EPSILON {
-        return linear_merge(a, b, t);
+        return Err(MergeError::SlerpZeroVector);
     }
 
     // Dot product of normalized vectors
-    let cos_theta: f32 = a[..n]
+    let cos_theta: f32 = a
         .iter()
-        .zip(b[..n].iter())
+        .zip(b.iter())
         .map(|(ai, bi)| (ai / norm_a) * (bi / norm_b))
         .sum::<f32>()
         .clamp(-1.0, 1.0);
 
-    // Nearly parallel: fall back to linear
+    // Nearly parallel: fall back to linear (numerical-stability choice,
+    // not an error — `Ok` on purpose).
     if cos_theta > 0.9995 {
-        return linear_merge(a, b, t);
+        return Ok(linear_merge(a, b, t));
     }
 
     let theta = cos_theta.acos();
@@ -339,17 +393,20 @@ pub fn slerp(a: &[f32], b: &[f32], t: f32) -> Vec<f32> {
 
     // Safety: sin_theta should be > 0 here since |cos_theta| < 0.9995
     if sin_theta.abs() < f32::EPSILON {
-        return linear_merge(a, b, t);
+        return Ok(linear_merge(a, b, t));
     }
 
     let coeff_a = ((1.0 - t) * theta).sin() / sin_theta;
     let coeff_b = (t * theta).sin() / sin_theta;
 
-    a[..n]
-        .iter()
-        .zip(b[..n].iter())
-        .map(|(ai, bi)| coeff_a * ai + coeff_b * bi)
-        .collect()
+    // Apply the coefficients to the *normalized* vectors — using the raw
+    // `ai`/`bi` here was the CQ-M6 bug: it skewed the result toward
+    // whichever input had the larger magnitude instead of interpolating
+    // pure direction.
+    Ok(a.iter()
+        .zip(b.iter())
+        .map(|(ai, bi)| coeff_a * (ai / norm_a) + coeff_b * (bi / norm_b))
+        .collect())
 }
 
 /// TIES-Merging: magnitude-based trimming followed by sign-majority election.
@@ -601,15 +658,11 @@ fn check_compatible(a: &WeightTensor, b: &WeightTensor) -> Result<(), MergeError
 fn apply_merge_method(a: &[f32], b: &[f32], config: &MergeConfig) -> Result<Vec<f32>, MergeError> {
     match &config.method {
         MergeMethod::Linear => Ok(linear_merge(a, b, config.alpha)),
-        MergeMethod::Slerp => {
-            // Validate no zero-vector before slerp
-            let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-            let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if norm_a < f32::EPSILON || norm_b < f32::EPSILON {
-                return Err(MergeError::SierpZeroVector);
-            }
-            Ok(slerp(a, b, config.alpha))
-        }
+        // `slerp_checked` performs its own zero-vector check (returning
+        // `Err(MergeError::SlerpZeroVector)`), so no separate pre-check is
+        // needed here — this also picks up the normalized-coefficient fix
+        // for every caller that goes through `merge_tensors`/`merge_models`.
+        MergeMethod::Slerp => slerp_checked(a, b, config.alpha),
         MergeMethod::Ties => Ok(ties_merge(a, b, config.alpha, config.density)),
         MergeMethod::TaskVector => Ok(task_vector_merge(a, b, config.alpha)),
         MergeMethod::Dare { seed, dropout_rate } => {
@@ -674,6 +727,84 @@ fn lcg_next(state: &mut u64) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CQ-M6 regression: `slerp` used to compute the normalizing norms over
+    /// the *full* `a`/`b` slices while the dot product and output only used
+    /// the shared `[..n]` prefix, so a ragged call was interpolated against
+    /// the wrong magnitude. `slerp(a, b, t)` on ragged inputs must be
+    /// byte-for-byte identical to calling it on the already-truncated
+    /// prefixes.
+    #[test]
+    fn slerp_ragged_inputs_match_pre_truncated_equivalent() {
+        let a = vec![1.0f32, 0.0, 100.0];
+        let b = vec![0.0f32, 1.0];
+        let ragged = slerp(&a, &b, 0.5);
+        let truncated = slerp(&a[..2], &b, 0.5);
+        assert_eq!(
+            ragged, truncated,
+            "slerp on ragged inputs must equal slerp on the pre-truncated prefix"
+        );
+    }
+
+    /// Same regression, checked against the closed-form expectation: with
+    /// the bug, the huge `100.0` tail element inflated `norm_a`, which
+    /// suppressed `cos_theta` far below the true 2-D prefix cosine (0.0 for
+    /// these orthogonal unit vectors) and produced a materially different
+    /// interpolation than the fixed, prefix-consistent computation.
+    #[test]
+    fn slerp_ragged_inputs_orthogonal_prefix_matches_expected_midpoint() {
+        let a = vec![1.0f32, 0.0, 100.0];
+        let b = vec![0.0f32, 1.0];
+        let result = slerp(&a, &b, 0.5);
+        let expected = 1.0_f32 / 2.0_f32.sqrt();
+        assert!(
+            (result[0] - expected).abs() < 1e-5,
+            "expected x ~= 1/sqrt(2) = {expected}, got {}",
+            result[0]
+        );
+        assert!(
+            (result[1] - expected).abs() < 1e-5,
+            "expected y ~= 1/sqrt(2) = {expected}, got {}",
+            result[1]
+        );
+    }
+
+    /// CQ-M6 regression: the SLERP coefficients must be applied to the
+    /// *normalized* vectors, not the raw inputs. `a = [3, 0]` and `b = [0,
+    /// 1]` are orthogonal, so their true angular midpoint at `t = 0.5` is
+    /// exactly 45 degrees off the x-axis regardless of `a`'s magnitude.
+    /// With the bug (coefficients applied to raw `a`/`b`), the result was
+    /// skewed toward the larger-magnitude `a` and landed at ~18.435
+    /// degrees instead.
+    #[test]
+    fn slerp_normalizes_before_applying_coefficients() {
+        let a = vec![3.0f32, 0.0];
+        let b = vec![0.0f32, 1.0];
+        let result = slerp(&a, &b, 0.5);
+        let angle_deg = result[1].atan2(result[0]).to_degrees();
+        assert!(
+            (angle_deg - 45.0).abs() < 1e-3,
+            "slerp midpoint of orthogonal [3,0]/[0,1] must be at 45 degrees \
+             regardless of magnitude, got {angle_deg} degrees (result={result:?})"
+        );
+    }
+
+    /// CQ-M6: a zero-norm input has no direction to interpolate, so
+    /// [`slerp_checked`] must report it as an error rather than silently
+    /// falling back to a linear blend.
+    #[test]
+    fn slerp_checked_errors_on_zero_norm_input() {
+        let zero = vec![0.0f32, 0.0];
+        let unit = vec![0.0f32, 1.0];
+        let err = slerp_checked(&zero, &unit, 0.5)
+            .expect_err("zero-norm input must be rejected, not silently linearised");
+        assert!(matches!(err, MergeError::SlerpZeroVector));
+
+        // The infallible `slerp` wrapper still degrades gracefully to the
+        // documented linear fallback for the same input.
+        let fallback = slerp(&zero, &unit, 0.5);
+        assert_eq!(fallback, linear_merge(&zero, &unit, 0.5));
+    }
 
     #[test]
     fn lcg_produces_values_in_unit_interval() {

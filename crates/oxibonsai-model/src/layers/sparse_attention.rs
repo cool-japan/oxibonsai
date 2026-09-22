@@ -150,7 +150,7 @@ fn build_local_window(
     seq_len: usize,
     window_size: usize,
 ) -> Result<Vec<Vec<usize>>, SparseAttnError> {
-    if window_size % 2 == 0 {
+    if window_size.is_multiple_of(2) {
         return Err(SparseAttnError::WindowSizeMustBeOdd);
     }
     let half = window_size / 2;
@@ -174,7 +174,7 @@ fn build_bigbird(
     num_random_connections: usize,
     seed: u64,
 ) -> Result<Vec<Vec<usize>>, SparseAttnError> {
-    if window_size % 2 == 0 {
+    if window_size.is_multiple_of(2) {
         return Err(SparseAttnError::WindowSizeMustBeOdd);
     }
     let half = window_size / 2;
@@ -236,7 +236,7 @@ fn build_strided(
     window_size: usize,
     stride: usize,
 ) -> Result<Vec<Vec<usize>>, SparseAttnError> {
-    if window_size % 2 == 0 {
+    if window_size.is_multiple_of(2) {
         return Err(SparseAttnError::WindowSizeMustBeOdd);
     }
     if stride == 0 {

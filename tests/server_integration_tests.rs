@@ -162,7 +162,24 @@ mod server_tests {
     // ── Embeddings endpoint ───────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_embeddings_endpoint_basic() {
+    async fn test_embeddings_endpoint_refuses_without_a_model_backend() {
+        // D-1 (wave 2.5, `RT-EMBEDDINGS` blocking 1; re-confirmed FIX3-BUILD,
+        // wave 3.5): `make_server()` builds its router the same way the real
+        // `oxibonsai serve` binary does (`server.rs::create_router_full`),
+        // which mounts `/v1/embeddings` via
+        // `crate::embeddings::create_embeddings_router_requiring_model`. That
+        // constructor disables the stateless TF-IDF/`IdentityEmbedder`
+        // fallback, so with no model-backed `Embedder` installed (there is no
+        // seam to build one from yet — see `oxibonsai_runtime::embeddings`'s
+        // module docs), the endpoint must refuse honestly with `501 Not
+        // Implemented` naming the missing backend rather than silently
+        // answer `200` with a non-semantic byte-hash vector. This replaces
+        // the former `test_embeddings_endpoint_basic`, which asserted `200`
+        // against this same router and went red the moment D-1 landed; the
+        // bare, unaffected `create_embeddings_router` (still `200` by its
+        // own documented, unchanged contract) is covered elsewhere, e.g.
+        // `tests/cli_surface_tests.rs`'s `embeddings_base64` module and
+        // `crates/oxibonsai-runtime/tests/embeddings_tests.rs`.
         let app = make_server();
 
         let body = serde_json::json!({
@@ -180,23 +197,19 @@ mod server_tests {
         let resp = app.oneshot(req).await.expect("oneshot should succeed");
         assert_eq!(
             resp.status(),
-            StatusCode::OK,
-            "/v1/embeddings basic request must return 200"
+            StatusCode::NOT_IMPLEMENTED,
+            "/v1/embeddings must refuse with 501 when no model-backed embedder is installed \
+             (D-1: the stateless TF-IDF/identity fallback is disabled on the running server), \
+             not silently answer 200 with a byte-hash vector"
         );
 
         let json = body_json(resp.into_body()).await;
-        let data = json["data"]
-            .as_array()
-            .expect("embeddings data must be an array");
+        let message = json["error"]["message"].as_str().unwrap_or_default();
         assert!(
-            !data.is_empty(),
-            "embeddings response must contain at least one embedding"
+            message.contains("model-backed"),
+            "the 501 body must name the missing model-backed embedder, not just carry a bare \
+             status code; got: {json}"
         );
-
-        let embedding = data[0]["embedding"]
-            .as_array()
-            .expect("each result must have an 'embedding' array");
-        assert!(!embedding.is_empty(), "embedding vector must be non-empty");
     }
 
     // ── Prometheus metrics endpoint ───────────────────────────────────────────

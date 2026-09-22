@@ -355,7 +355,8 @@ impl SemanticCache {
             all_prompts.push(prompt.to_string());
 
             // Refit when: first insertion, or every REFIT_BATCH_SIZE new prompts.
-            let should_refit = all_prompts.len() == 1 || all_prompts.len() % REFIT_BATCH_SIZE == 0;
+            let should_refit =
+                all_prompts.len() == 1 || all_prompts.len().is_multiple_of(REFIT_BATCH_SIZE);
             drop(all_prompts); // release before calling refit_embedder
 
             if should_refit {

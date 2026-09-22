@@ -8,6 +8,14 @@
 //! 3. Remove articles `a`, `an`, `the` (standalone tokens).
 //! 4. Collapse consecutive whitespace.
 //!
+//! Step 5, tokenization for the F1 score, reuses [`crate::rouge`]'s shared
+//! CJK-aware tokenizer (see [`normalize_tokens`]): a run of CJK characters
+//! (Chinese/Japanese/Korean, which do not use inter-word spaces) becomes
+//! one token per character instead of the whole run collapsing into a
+//! single, un-scoreable token (RAG-EVAL-IMG-06 also affected SQuAD F1, not
+//! only ROUGE/BLEU — the same `split_whitespace`-only tokenizer was
+//! duplicated here).
+//!
 //! Multi-reference: the final score for a prediction is `max` over all
 //! reference answers (standard protocol).
 //!
@@ -47,12 +55,17 @@ pub fn normalize_answer(s: &str) -> String {
     no_articles.join(" ")
 }
 
-/// SQuAD tokenisation after normalisation: split on ASCII whitespace.
+/// SQuAD tokenisation after normalisation.
+///
+/// Splits `normalize_answer(s)` using the same CJK-aware tokenizer as
+/// [`crate::rouge::tokenize`] (a run of Chinese/Japanese/Korean characters
+/// becomes one token per character; other scripts split on whitespace as
+/// before). Without this, an answer with no ASCII spaces at all — any
+/// Japanese or Chinese answer — collapsed to a single token, so token F1
+/// degenerated to exact match: `f1_score("東京都に住んでいます",
+/// "東京都")` was `0.0` instead of reflecting the real partial overlap.
 pub fn normalize_tokens(s: &str) -> Vec<String> {
-    normalize_answer(s)
-        .split_whitespace()
-        .map(str::to_string)
-        .collect()
+    crate::rouge::cjk_aware_tokens(&normalize_answer(s))
 }
 
 /// Compute EM between a single prediction and a single reference.

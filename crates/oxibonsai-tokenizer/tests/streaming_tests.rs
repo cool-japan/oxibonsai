@@ -177,8 +177,17 @@ fn finish_strict_on_incomplete_stream_errors() {
     let bytes = "あ".as_bytes();
     dec.push_token(4 + bytes[0] as u32);
     dec.push_token(4 + bytes[1] as u32);
-    // Third byte missing — `finish` must error.
-    let err = dec.finish().expect_err("must fail");
+    // Third byte missing — the strict counterpart must error.
+    //
+    // Recorded reason (ACCEPTANCE: "existing tokenizer tests unchanged OR
+    // UPDATED WITH A RECORDED REASON"): TOK-02 made `finish()` itself
+    // infallible (it now always returns a best-effort `Ok` string, per
+    // `crate::streaming::StreamingDecoder::finish`'s docs), so the old
+    // `dec.finish().expect_err(...)` call here now panics. This test's own
+    // name (`finish_strict_on_incomplete_stream_errors`) already names the
+    // right method — swap in `finish_strict()`, the additive opt-in
+    // counterpart that preserves the pre-TOK-02 error behaviour.
+    let err = dec.finish_strict().expect_err("must fail");
     use oxibonsai_tokenizer::TokenizerError;
     assert!(matches!(err, TokenizerError::IncompleteUtf8));
 }

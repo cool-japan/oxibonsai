@@ -62,8 +62,7 @@ fi
 
 if [[ ! -f "$OXIBONSAI" ]] || [[ "$(find src crates -name '*.rs' -newer "$OXIBONSAI" 2>/dev/null | head -1)" ]]; then
     echo -e "${CYAN}Building OxiBonsai (release + metal)...${RESET}"
-    cargo build --release --features metal 2>&1
-    if [[ $? -ne 0 ]]; then
+    if ! cargo build --release --features metal 2>&1; then
         echo -e "${RED}Build failed!${RESET}"
         exit 1
     fi
@@ -78,7 +77,7 @@ fi
 run_oxibonsai() {
     local prompt="$1"
     local tmpfile
-    tmpfile=$(mktemp /tmp/oxibonsai_bench.XXXXXX)
+    tmpfile=$(mktemp "${TMPDIR:-/tmp}/oxibonsai_bench.XXXXXX")
 
     RUST_LOG=info "$OXIBONSAI" run \
         --model "$MODEL" \
@@ -103,7 +102,7 @@ run_oxibonsai() {
 run_llama() {
     local prompt="$1"
     local tmpfile
-    tmpfile=$(mktemp /tmp/llama_bench.XXXXXX)
+    tmpfile=$(mktemp "${TMPDIR:-/tmp}/llama_bench.XXXXXX")
 
     "$LLAMA_CLI" \
         -m "$MODEL" \
@@ -156,12 +155,12 @@ for i in "${!PROMPTS[@]}"; do
     echo -e "  ${GREEN}▶ OxiBonsai (Metal)${RESET}"
     oxi_result=$(run_oxibonsai "$prompt")
     if [[ "$oxi_result" == "FAIL" ]]; then
-        OXI_TOKS[$i]="—"
-        OXI_STATUS[$i]="FAIL"
+        OXI_TOKS[i]="—"
+        OXI_STATUS[i]="FAIL"
         echo -e "  ${RED}  Failed to parse tok/s${RESET}"
     else
-        OXI_TOKS[$i]="$oxi_result"
-        OXI_STATUS[$i]="OK"
+        OXI_TOKS[i]="$oxi_result"
+        OXI_STATUS[i]="OK"
         echo -e "  ${GREEN}  ${oxi_result} tok/s${RESET}"
     fi
     echo
@@ -172,20 +171,20 @@ for i in "${!PROMPTS[@]}"; do
         llama_result=$(run_llama "$prompt")
         IFS='|' read -r eval_toks prompt_toks <<< "$llama_result"
         if [[ "$eval_toks" == "FAIL" ]]; then
-            LLAMA_EVAL_TOKS[$i]="—"
-            LLAMA_PROMPT_TOKS[$i]="—"
-            LLAMA_STATUS[$i]="FAIL"
+            LLAMA_EVAL_TOKS[i]="—"
+            LLAMA_PROMPT_TOKS[i]="—"
+            LLAMA_STATUS[i]="FAIL"
             echo -e "  ${RED}  Failed to parse tok/s${RESET}"
         else
-            LLAMA_EVAL_TOKS[$i]="$eval_toks"
-            LLAMA_PROMPT_TOKS[$i]="$prompt_toks"
-            LLAMA_STATUS[$i]="OK"
+            LLAMA_EVAL_TOKS[i]="$eval_toks"
+            LLAMA_PROMPT_TOKS[i]="$prompt_toks"
+            LLAMA_STATUS[i]="OK"
             echo -e "  ${CYAN}  Generation: ${eval_toks} tok/s | Prompt eval: ${prompt_toks} tok/s${RESET}"
         fi
     else
-        LLAMA_EVAL_TOKS[$i]="—"
-        LLAMA_PROMPT_TOKS[$i]="—"
-        LLAMA_STATUS[$i]="SKIP"
+        LLAMA_EVAL_TOKS[i]="—"
+        LLAMA_PROMPT_TOKS[i]="—"
+        LLAMA_STATUS[i]="SKIP"
     fi
     echo
 done

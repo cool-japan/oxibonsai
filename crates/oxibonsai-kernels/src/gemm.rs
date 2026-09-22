@@ -24,7 +24,7 @@ pub fn gemm_1bit_g128(
     n_rows: usize,
     k: usize,
 ) -> KernelResult<()> {
-    if k % QK1_0_G128 != 0 {
+    if !k.is_multiple_of(QK1_0_G128) {
         return Err(KernelError::NotBlockAligned {
             count: k,
             block_size: QK1_0_G128,

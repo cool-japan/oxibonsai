@@ -74,7 +74,7 @@ impl<'a> LinearQ4_0<'a> {
         out_features: usize,
         in_features: usize,
     ) -> ModelResult<Self> {
-        if in_features == 0 || in_features % QK_Q4_0 != 0 {
+        if in_features == 0 || !in_features.is_multiple_of(QK_Q4_0) {
             return Err(ModelError::ShapeMismatch {
                 name: "LinearQ4_0".into(),
                 expected: vec![out_features, in_features],
@@ -232,7 +232,7 @@ impl<'a> LinearQ8_0<'a> {
         out_features: usize,
         in_features: usize,
     ) -> ModelResult<Self> {
-        if in_features == 0 || in_features % QK_Q8_0 != 0 {
+        if in_features == 0 || !in_features.is_multiple_of(QK_Q8_0) {
             return Err(ModelError::ShapeMismatch {
                 name: "LinearQ8_0".into(),
                 expected: vec![out_features, in_features],

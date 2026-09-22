@@ -22,6 +22,17 @@
 //!
 //! The hash ring uses FNV-1a (64-bit) with virtual nodes for even distribution.
 //! All state is in-memory — no actual TCP connections are made.
+//!
+//! ## Reachability
+//!
+//! [`ConsistentHashRing`] and [`NodeRegistry`]'s hashing/bookkeeping logic
+//! is correct and exercised by this module's own tests, but as of this
+//! writing nothing else in `oxibonsai-runtime` (the server request path,
+//! the engine, the CLI) constructs a [`DistributedCoordinator`] or routes a
+//! real request through it — there is no wired multi-node serving feature
+//! today. If a README or release note describes "distributed serving", that
+//! claim must be qualified against this module being a primitive rather
+//! than a running feature.
 
 use std::collections::HashMap;
 

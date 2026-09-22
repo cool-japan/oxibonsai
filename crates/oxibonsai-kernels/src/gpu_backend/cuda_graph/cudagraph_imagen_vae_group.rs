@@ -386,7 +386,7 @@ impl CudaGraph {
         num_groups: usize,
         eps: f32,
     ) -> Result<(), CudaGraphError> {
-        if num_groups == 0 || channels % num_groups != 0 {
+        if num_groups == 0 || !channels.is_multiple_of(num_groups) {
             return Err(CudaGraphError::DriverError(format!(
                 "encode_groupnorm_f32: channels {channels} not divisible by num_groups {num_groups}"
             )));

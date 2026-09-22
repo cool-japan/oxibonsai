@@ -1,7 +1,7 @@
 //! Tests for the layered configuration system.
 
 use oxibonsai_runtime::config::{
-    ModelConfig, ObservabilityConfig, OxiBonsaiConfig, SamplingConfig, ServerConfig,
+    ImagenConfig, ModelConfig, ObservabilityConfig, OxiBonsaiConfig, SamplingConfig, ServerConfig,
 };
 
 // ═══════════════���════════════════��═════════════════════════════
@@ -235,10 +235,30 @@ fn config_roundtrip_serialize_deserialize() {
             model_path: Some("/path/to/model.gguf".to_string()),
             tokenizer_path: Some("/path/to/tokenizer.json".to_string()),
             max_seq_len: 16384,
+            // RT-ADMIN-CFG (spec item 9) added these two fields in
+            // config.rs to prepare B2-12's (wave 3) context-guard formula;
+            // this exhaustive same-crate struct literal needs them listed
+            // too. `#[non_exhaustive]` would not help here since this file
+            // is in the same crate as the struct.
+            max_context: None,
+            ctx_budget_bytes: None,
         },
         observability: ObservabilityConfig {
             log_level: "trace".to_string(),
             json_logs: true,
+        },
+        // B2-12 (wave 3) added the `imagen` field to `OxiBonsaiConfig` (the
+        // enabling half of an `[imagen]` config-file section; CLI wiring is
+        // B2-14's) — same situation as `max_context`/`ctx_budget_bytes`
+        // above: this exhaustive same-crate struct literal needs it listed.
+        imagen: ImagenConfig {
+            model_path: Some("/models/bonsai-image".to_string()),
+            width: 768,
+            height: 768,
+            steps: 12,
+            guidance_scale: 5.0,
+            seed: Some(7),
+            output_dir: Some("/tmp/imagen-out".to_string()),
         },
     };
 
@@ -266,4 +286,11 @@ fn config_roundtrip_serialize_deserialize() {
         parsed.observability.json_logs,
         original.observability.json_logs
     );
+    assert_eq!(parsed.imagen.model_path, original.imagen.model_path);
+    assert_eq!(parsed.imagen.width, original.imagen.width);
+    assert_eq!(parsed.imagen.height, original.imagen.height);
+    assert_eq!(parsed.imagen.steps, original.imagen.steps);
+    assert!((parsed.imagen.guidance_scale - original.imagen.guidance_scale).abs() < f32::EPSILON);
+    assert_eq!(parsed.imagen.seed, original.imagen.seed);
+    assert_eq!(parsed.imagen.output_dir, original.imagen.output_dir);
 }

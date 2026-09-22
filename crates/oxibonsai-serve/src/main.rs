@@ -3,31 +3,43 @@
 //! Layered configuration loader (`defaults < TOML < env < CLI`) followed by
 //! model / tokenizer wiring and an Axum-based HTTP server with OpenAI-style
 //! chat-completion endpoints.
+//!
+//! # Hardening (findings `sec-15`/`SV-07`/`sec-M2`, `sec-07`/`RT-34`/`SV-10`,
+//! `cli-18`, `SV-06`, `SV-15`/`SV-16`/`SV-23`, `sec-20`/`perf-M1`,
+//! `SV-27`/`sec-16`, `SV-24`, `SV-30`/`sec-M3`, `SV-33`, `sec-12`)
+//!
+//! The bind-safety guard, bearer/admin token resolution, checksum
+//! verification, the extra `OXIBONSAI_*` env overrides, and the fully
+//! composed router (see [`hardening::build_router`]) live in the sibling
+//! [`hardening`] module — split out to keep this file under the workspace's
+//! 2000-line-per-file policy.
+//!
+//! The bind address defaults to loopback ([`oxibonsai_serve::config::BindConfig`]);
+//! binding a non-loopback host without a bearer token requires an explicit
+//! `--insecure-no-auth` acknowledgement (see [`hardening::bind_safety_check`]).
+
+mod hardening;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
 
-use axum::error_handling::HandleErrorLayer;
-use axum::http::StatusCode;
-use axum::{BoxError, Json};
 use oxibonsai_core::config::Qwen3Config;
 use oxibonsai_core::GgufTensorType;
 use oxibonsai_runtime::engine::InferenceEngine;
 use oxibonsai_runtime::engine_pool::{build_pool_from_gguf, EnginePool};
 use oxibonsai_runtime::metrics::InferenceMetrics;
 use oxibonsai_runtime::sampling::SamplingParams;
-use oxibonsai_runtime::server::{create_router_with_pool, serve_with_shutdown, shutdown_signal};
+use oxibonsai_runtime::server::{install_shutdown_signals, serve_with_shutdown};
 use oxibonsai_runtime::tokenizer_bridge::TokenizerBridge;
 use oxibonsai_serve::{
     args::parse_args_from,
     banner,
     config::{PartialServerConfig, ServerConfig},
     env::parse_process_env,
+    metrics::MetricsRegistry,
 };
-use tower::ServiceBuilder;
 use tracing::{error, info, warn};
 
 #[tokio::main]
@@ -51,23 +63,41 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None => return Ok(()),
     };
 
-    // ── 2. Install a *temporary* tracing subscriber so config / env / CLI
-    //       parsing errors show up cleanly.  It will be replaced once the
-    //       final `log_level` is known.
-    let bootstrap_filter = tracing_subscriber::EnvFilter::try_new(&cli_args.log_level)
+    // ── 2. Load layered configuration ────────────────────────────────────
+    //
+    // No tracing subscriber exists yet at this point (see step 3 below for
+    // why that is now deliberate, not merely "not yet installed" -- finding
+    // `SV-15`(a)). A failure here propagates to `main()`, which prints it
+    // with `eprintln!` regardless of tracing state.
+    let toml_path: Option<PathBuf> = cli_args.config_path.as_ref().map(PathBuf::from);
+    let mut env_partial = parse_process_env()?;
+    hardening::apply_extra_env_overrides(&mut env_partial, std::env::vars());
+    let cli_partial: PartialServerConfig = cli_args.to_partial();
+
+    let mut config =
+        ServerConfig::load(toml_path.as_deref(), Some(env_partial), Some(cli_partial))?;
+
+    // ── 3. Install the (single, final) tracing subscriber ────────────────
+    //
+    // Finding `SV-15`(a): the previous code installed a *bootstrap*
+    // subscriber here using only `--log-level`/its built-in default, before
+    // TOML/env were merged, with a comment promising it would "be replaced
+    // once the final log_level is known" -- but `tracing`'s global
+    // subscriber can only ever be set once per process, so that promise was
+    // never kept and `observability.log_level` set via TOML or
+    // `OXIBONSAI_LOG_LEVEL` had zero effect. Nothing above this line emits a
+    // `tracing` event (config-loading errors propagate via `?` and are
+    // printed by `main()`'s `eprintln!` regardless of subscriber state), so
+    // installing the *real*, fully-merged `config.observability.log_level`
+    // as the one and only subscriber is a strict improvement with no loss
+    // of early diagnostics.
+    let filter = tracing_subscriber::EnvFilter::try_new(&config.observability.log_level)
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(bootstrap_filter)
+        .with_env_filter(filter)
         .with_target(false)
         .compact()
         .try_init();
-
-    // ── 3. Load layered configuration ────────────────────────────────────
-    let toml_path: Option<PathBuf> = cli_args.config_path.as_ref().map(PathBuf::from);
-    let env_partial = parse_process_env()?;
-    let cli_partial: PartialServerConfig = cli_args.to_partial();
-
-    let config = ServerConfig::load(toml_path.as_deref(), Some(env_partial), Some(cli_partial))?;
 
     // ── 4. Print banner ───────────────────────────────────────────────────
     banner::print_banner();
@@ -76,15 +106,84 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         banner::startup_message(&config.bind.host, config.bind.port)
     );
 
-    // ── 5. Build inference engine ─────────────────────────────────────────
+    // sec-06/SV-15(b): `observability.metrics_enabled`/`metrics_path` are
+    // read here (see `hardening::metrics_gate_mw` / the metrics-path alias
+    // route, mounted in `hardening::build_router`) instead of being
+    // validated and discarded.
+    if !config.observability.metrics_enabled {
+        info!("Prometheus metrics are disabled (observability.metrics_enabled = false)");
+    } else if config.observability.metrics_path != "/metrics" {
+        info!(
+            metrics_path = %config.observability.metrics_path,
+            "Prometheus metrics are also served at the configured observability.metrics_path"
+        );
+    }
+
+    // SV-15(c): `sampling.default_max_tokens` is threaded through
+    // `hardening::build_router` -> `RouterOptions::with_default_max_tokens`
+    // below, so the per-request fallback a client omitting `max_tokens`
+    // gets is this configured value, not a hardcoded literal. This call is
+    // now a defense-in-depth trip-wire rather than a "this is broken"
+    // report -- see its own doc comment.
+    hardening::warn_if_default_max_tokens_diverges(&config.sampling);
+
+    // ── 5. sec-15 / SV-07 / sec-M2: refuse an unsafe bind ────────────────
+    //
+    // SV-33: resolve the effective bearer token -- `auth.bearer_token_file`
+    // (ps-safe) wins over the raw `auth.bearer_token` string when both are
+    // set -- and warn loudly when the token reached us via the literal
+    // `--bearer-token` command-line flag, which is visible to any local
+    // user via `ps` (and lands in shell history).
+    if cli_args.bearer_token.is_some() {
+        warn!(
+            "--bearer-token was passed on the command line, which is visible to other local \
+             users via `ps` (and lands in shell history); prefer --bearer-token-file or the \
+             OXIBONSAI_BEARER_TOKEN environment variable instead"
+        );
+    }
+    config.auth.bearer_token = hardening::resolve_bearer_token(&config).map_err(|e| {
+        error!(%e, "failed to resolve auth.bearer_token_file");
+        e
+    })?;
+
+    let admin_auth = hardening::resolve_admin_auth(&config);
+    hardening::bind_safety_check(&config, admin_auth.admin_enabled())?;
+    if config.auth.bearer_token.is_none() {
+        warn!(
+            host = %config.bind.host,
+            "no auth.bearer_token / --bearer-token / OXIBONSAI_BEARER_TOKEN configured: the \
+             inference endpoints are unauthenticated on this listener; /admin/* is separately \
+             gated (403 unless auth.admin_token / OXI_ADMIN_TOKEN is set)"
+        );
+    }
+
+    // ── 6. sec-12: verify the model's checksum, if one is known ──────────
+    let checksums_path: PathBuf = std::env::var("OXIBONSAI_CHECKSUMS_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("scripts/checksums.sha256"));
+    if let Some(ref path) = config.model.path {
+        if let Err(msg) = hardening::verify_model_checksum(path, &checksums_path) {
+            error!(path = %path.display(), %msg, "model checksum verification failed");
+            return Err(msg.into());
+        }
+    }
+
+    // ── 7. Build inference engine ─────────────────────────────────────────
     //
     // If a GGUF model path is configured we load it eagerly via
-    // `InferenceEngine::from_gguf_path`.  Any failure is *fatal* — the
+    // `InferenceEngine::from_gguf_path`. Any failure is *fatal* — the
     // operator asked for a specific model, so silently falling back to a
     // tiny test config would be misleading.
+    // gatekeeper REQUIRED#1(b): `repetition_penalty` is named explicitly
+    // here rather than left to `..SamplingParams::default()`'s spread. The
+    // `Default` impl is already `1.0` (the same fix), so this is behaviorally
+    // a no-op today -- it exists so a *future* change to that default cannot
+    // silently reintroduce a hidden penalty at the one place that seeds
+    // every engine replica's startup sampler.
     let sampling = SamplingParams {
         temperature: config.sampling.default_temperature,
         top_p: config.sampling.default_top_p,
+        repetition_penalty: 1.0,
         ..SamplingParams::default()
     };
 
@@ -167,7 +266,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
-    // ── 6. Load tokenizer (optional) ──────────────────────────────────────
+    // ── 8. Load tokenizer (optional) ──────────────────────────────────────
     //
     // Resolution order:
     //   (a) explicit `config.tokenizer.path` (CLI / TOML / env)
@@ -213,67 +312,37 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
 
-    // ── 7. Build router (with optional bearer auth) ───────────────────────
+    // ── 9. Build the fully-hardened router ────────────────────────────────
     //
-    // A fresh `InferenceMetrics` is created here, matching the previous
-    // `create_router(engine, tokenizer)` path (which built one internally). The
-    // pool serves the configured number of replicas (default min(4, cores) on
-    // CPU, clamped to 1 on GPU/Metal); a 1-element pool is byte-identical to the
-    // prior single-engine router.
+    // A fresh `InferenceMetrics` (the runtime's own registry, actually
+    // rendered at `/metrics`) is created here, matching the previous
+    // `create_router(engine, tokenizer)` path. `serve_metrics` is this
+    // crate's own `MetricsRegistry` (finding `SV-24`): previously built and
+    // never mounted, now serving real per-route HTTP counters at
+    // `/metrics/serve`.
     let metrics = Arc::new(InferenceMetrics::new());
-    let base_router = create_router_with_pool(pool, tokenizer, metrics);
-    let router = if let Some(ref token) = config.auth.bearer_token {
-        let state = middleware::BearerAuthState {
-            token: token.clone(),
-        };
-        info!("bearer-token authentication enabled");
-        base_router.layer(axum::middleware::from_fn_with_state(
-            state,
-            middleware::bearer_auth,
-        ))
-    } else {
-        base_router
-    };
+    let serve_metrics = Arc::new(MetricsRegistry::new());
+    // sec-20/perf-M1: capture the REAL pool size before `pool` is consumed
+    // by `hardening::build_router` -> `create_router_full`.
+    let pool_size = pool.size();
+    let router = hardening::build_router(
+        Arc::clone(&pool),
+        tokenizer,
+        Arc::clone(&metrics),
+        Arc::clone(&serve_metrics),
+        &config,
+        // SV-26 / SV-28: `enable_ui` / `max_output_tokens` are
+        // `ServerArgs`-only knobs with no `ServerConfig` counterpart yet
+        // (see `build_router`'s own doc comment).
+        hardening::RouterBuildOptions::new(
+            admin_auth,
+            pool_size,
+            cli_args.enable_ui,
+            cli_args.max_output_tokens,
+        ),
+    );
 
-    // ── 7b. Admission control: enforce `limits.max_concurrent_requests` and
-    //        `limits.per_request_timeout_ms` ───────────────────────────────
-    //
-    // Both fields are validated to be ≥ 1 by `ServerConfig::validate` (called
-    // inside `ServerConfig::load` above), so unwrapping them into `Duration`
-    // / `usize` here is always well-formed.
-    //
-    // Layer order (outermost first, matching axum's documented
-    // `HandleErrorLayer` + `ServiceBuilder` pattern): `HandleErrorLayer` wraps
-    // everything below so both kinds of admission failure — an overloaded
-    // `load_shed` and an elapsed `timeout` — become proper HTTP responses
-    // instead of tearing down the connection (axum requires an `Infallible`
-    // error type on the outermost service). `load_shed` turns "concurrency
-    // limit reached" from a queue (which a bare concurrency-limit layer would
-    // do on its own) into an immediate rejection, matching "bounds HTTP-level
-    // admission" from the `limits.max_concurrent_requests` doc comment.
-    //
-    // `GlobalConcurrencyLimitLayer` (not `ServiceBuilder::concurrency_limit`,
-    // i.e. `tower::limit::ConcurrencyLimitLayer`) is required here:
-    // `axum::Router::layer` applies the given `Layer` independently to *every
-    // registered route* (`PathRouter::layer` calls `layer.clone().layer(..)`
-    // once per route, not once for the router as a whole), so a bare
-    // `ConcurrencyLimitLayer` — which allocates a fresh `Arc<Semaphore>`
-    // inside its own `Layer::layer()` — would silently create one
-    // independent semaphore *per route* instead of one shared budget across
-    // the whole HTTP surface. `GlobalConcurrencyLimitLayer` pre-builds the
-    // `Arc<Semaphore>` once, before any `.layer()` call, and every per-route
-    // clone shares that same semaphore, giving the process-wide admission
-    // bound `limits.max_concurrent_requests` documents.
-    let concurrency_semaphore =
-        tower::limit::GlobalConcurrencyLimitLayer::new(config.limits.max_concurrent_requests);
-    let admission = ServiceBuilder::new()
-        .layer(HandleErrorLayer::new(handle_admission_error))
-        .load_shed()
-        .layer(concurrency_semaphore)
-        .timeout(Duration::from_millis(config.limits.per_request_timeout_ms));
-    let router = router.layer(admission);
-
-    // ── 8. Resolve bind address ───────────────────────────────────────────
+    // ── 10. Resolve bind address ───────────────────────────────────────────
     let addr_str = format!("{}:{}", config.bind.host, config.bind.port);
     let addr: SocketAddr = addr_str
         .parse()
@@ -281,8 +350,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     info!(%addr, "starting listener");
 
-    // ── 9. Serve with graceful shutdown ───────────────────────────────────
-    serve_with_shutdown(router, addr, shutdown_signal()).await?;
+    // ── 11. Serve with graceful shutdown ───────────────────────────────────
+    //
+    // Finding `SV-29`: a failed signal-handler registration now refuses to
+    // start instead of degrading (`install_shutdown_signals` propagates the
+    // `io::Error` via `?`), rather than falling back to a silently-degraded
+    // shutdown path.
+    let signals = install_shutdown_signals()?;
+    serve_with_shutdown(router, addr, signals).await?;
 
     info!("oxibonsai-serve exited cleanly");
     Ok(())
@@ -317,48 +392,6 @@ fn quantization_hint_recognized(hint: &str) -> bool {
             || name_upper.starts_with(&hint_upper)
             || hint_upper.starts_with(&name_upper)
     })
-}
-
-/// Convert an admission-layer error (an overloaded `load_shed` or an elapsed
-/// `timeout`) into an OpenAI-style JSON error response.
-///
-/// Required because axum's `Router` demands an `Infallible` error type on the
-/// outermost service; `HandleErrorLayer` is the documented bridge from the
-/// `tower::BoxError` the admission stack produces back into a `Response`. See
-/// <https://docs.rs/axum/latest/axum/error_handling/index.html>.
-async fn handle_admission_error(err: BoxError) -> (StatusCode, Json<serde_json::Value>) {
-    let (status, kind, message) = if err.is::<tower::load_shed::error::Overloaded>() {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "overloaded_error",
-            "server is at its configured limits.max_concurrent_requests capacity; \
-             retry after a short backoff"
-                .to_string(),
-        )
-    } else if err.is::<tower::timeout::error::Elapsed>() {
-        (
-            StatusCode::REQUEST_TIMEOUT,
-            "timeout_error",
-            "request exceeded the configured limits.per_request_timeout_ms budget".to_string(),
-        )
-    } else {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal_error",
-            format!("unhandled admission-layer error: {err}"),
-        )
-    };
-    (
-        status,
-        Json(serde_json::json!({
-            "error": {
-                "message": message,
-                "type": kind,
-                "param": null,
-                "code": null,
-            }
-        })),
-    )
 }
 
 /// Tokenizer auto-discovery used when the operator does not pass an explicit
@@ -500,11 +533,12 @@ mod tokenizer_lookup {
 /// Bearer-auth middleware.
 ///
 /// Kept inline here (rather than in `oxibonsai-runtime`) because auth is a
-/// deployment concern of the server binary, not the inference core.
+/// deployment concern of the server binary, not the inference core. Used by
+/// [`hardening::build_router`] via `crate::middleware`.
 mod middleware {
     use axum::body::Body;
     use axum::extract::State;
-    use axum::http::{header, Request, StatusCode};
+    use axum::http::{header, Method, Request, StatusCode};
     use axum::middleware::Next;
     use axum::response::{IntoResponse, Response};
     use axum::Json;
@@ -523,10 +557,25 @@ mod middleware {
         req: Request<Body>,
         next: Next,
     ) -> Response {
-        // Allow `/health` and `/metrics` through unauthenticated — they are
-        // needed for load balancers and Prometheus scrapers.
+        // SV-06 (correction): an `OPTIONS` preflight carries no credentials
+        // by specification, so it must never be rejected on that basis —
+        // checked *before* the `Authorization` lookup. When CORS is also
+        // configured this is already unreachable (the outer `cors_mw`
+        // short-circuits preflight before this layer ever runs — see
+        // `hardening::build_router`), but this keeps the same guarantee
+        // even when CORS is disabled entirely.
+        if req.method() == Method::OPTIONS {
+            return next.run(req).await;
+        }
+
+        // `/health`, `/metrics` and `/metrics/serve` are needed for load
+        // balancers and Prometheus scrapers; `/ui/health` is the chat web
+        // UI's own liveness probe (finding SV-06's correction (b)).
         let path = req.uri().path();
-        if path == "/health" || path == "/metrics" {
+        if matches!(
+            path,
+            "/health" | "/metrics" | "/metrics/serve" | "/ui/health"
+        ) {
             return next.run(req).await;
         }
 

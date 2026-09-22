@@ -286,6 +286,26 @@ pub enum PagedKvError {
 /// Sequences are identified by opaque `u64` IDs assigned by
 /// [`PagedKvCache::create_sequence`].
 ///
+/// **Experimental.** `BonsaiModel` never builds this type — it always holds
+/// a single, contiguous [`oxibonsai_model::kv_cache::KvCache`](crate::kv_cache::KvCache)
+/// (dense `f32`, or sparse `f16` for a hybrid model since M-07's
+/// [`KvCache::new_sparse`](crate::kv_cache::KvCache::new_sparse)), so nothing
+/// here is on a production forward path today. Implemented and tested:
+/// `BlockPool`/`BlockTable` allocation and eviction, `write_kv`/`read_kv`,
+/// `ensure_capacity`, sequence lifecycle (`create_sequence`/
+/// `free_sequence`). **Not** implemented: PagedAttention itself — a fused
+/// attention kernel that reads KV pages directly without first gathering
+/// them into a contiguous buffer — which is the actual point of the
+/// PagedAttention design and the reason it improves on a dense cache beyond
+/// memory layout. A second, simpler paged cache with the *same* type name
+/// `PagedKvCache` lives in [`crate::kv_cache`] — the two are unrelated
+/// implementations under a name collision, not a re-export of each other; do
+/// not conflate them when reading call sites. The plan for either to become
+/// selectable lives with the M-13/RT-14
+/// [`KvCacheBacking`](crate::kv_cache::KvCacheBacking) work: wire behind a
+/// bit-exactness parity test against the dense `KvCache` before either
+/// becomes reachable from `BonsaiModel`.
+///
 /// # Example
 ///
 /// ```rust

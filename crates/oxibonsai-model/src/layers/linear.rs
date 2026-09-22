@@ -4,8 +4,9 @@
 //! that dispatches to the appropriate quantization-specific kernel.
 
 use oxibonsai_core::tensor::BlockQ1_0G128;
+use oxibonsai_core::{BlockPQ2_0, BlockPTQ1_0, BlockQ2_0G64, QK_PQ2_0, QK_PTQ1_0, QK_Q2_0_G64};
 use oxibonsai_kernels::traits::OneBitKernel;
-use oxibonsai_kernels::GpuWeightHandle;
+use oxibonsai_kernels::{GpuWeightHandle, PrismKernel};
 
 use crate::error::ModelResult;
 
@@ -53,7 +54,7 @@ impl<'a> Linear1Bit<'a> {
     ) -> crate::error::ModelResult<Self> {
         use crate::error::ModelError;
 
-        if in_features == 0 || in_features % 128 != 0 {
+        if in_features == 0 || !in_features.is_multiple_of(128) {
             return Err(ModelError::ShapeMismatch {
                 name: "Linear1Bit".into(),
                 expected: vec![out_features, in_features],
@@ -199,7 +200,7 @@ impl<'a> LinearTernary<'a> {
     ) -> crate::error::ModelResult<Self> {
         use crate::error::ModelError;
 
-        if in_features == 0 || in_features % 128 != 0 {
+        if in_features == 0 || !in_features.is_multiple_of(128) {
             return Err(ModelError::ShapeMismatch {
                 name: "LinearTernary".into(),
                 expected: vec![out_features, in_features],
@@ -342,7 +343,7 @@ impl<'a> LinearFP8E4M3<'a> {
         use crate::error::ModelError;
         use oxibonsai_core::QK_FP8;
 
-        if in_features == 0 || in_features % QK_FP8 != 0 {
+        if in_features == 0 || !in_features.is_multiple_of(QK_FP8) {
             return Err(ModelError::ShapeMismatch {
                 name: "LinearFP8E4M3".into(),
                 expected: vec![out_features, in_features],
@@ -449,7 +450,7 @@ impl<'a> LinearFP8E5M2<'a> {
         use crate::error::ModelError;
         use oxibonsai_core::QK_FP8;
 
-        if in_features == 0 || in_features % QK_FP8 != 0 {
+        if in_features == 0 || !in_features.is_multiple_of(QK_FP8) {
             return Err(ModelError::ShapeMismatch {
                 name: "LinearFP8E5M2".into(),
                 expected: vec![out_features, in_features],
@@ -528,6 +529,339 @@ impl<'a> LinearFP8E5M2<'a> {
     }
 }
 
+/// A linear layer with `PQ2_0` (PrismML Bonsai 2 ternary, ggml id 142)
+/// weights (B2-09; design §3.4).
+///
+/// Computes `output = weights @ input` using the `PQ2_0` GEMV/GEMM kernels.
+/// **Not** the Hadamard rotation hook: per design §3.4, that lives in the
+/// block forward (it is per-*activation*, memoised across several matmuls
+/// sharing one), not inside `LinearLayer::forward` — `input` here is
+/// expected to already be rotated when the model this layer belongs to
+/// declares `prism.hadamard.*`.
+#[derive(Debug)]
+pub struct LinearPQ2_0<'a> {
+    /// Weight blocks in row-major order: `[out_features × (in_features / 128)]` blocks.
+    blocks: &'a [BlockPQ2_0],
+    /// Number of output features (rows).
+    out_features: usize,
+    /// Number of input features (columns, must be a multiple of 128).
+    in_features: usize,
+    /// Kernel dispatcher stored in the layer (mirrors [`LinearTernary`]).
+    kernel: std::sync::Arc<oxibonsai_kernels::KernelDispatcher>,
+}
+
+impl<'a> LinearPQ2_0<'a> {
+    /// Create a `PQ2_0` linear layer, validating block count at construction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::ModelError::ShapeMismatch`] if
+    /// `in_features % 128 != 0` or `blocks.len() != out_features *
+    /// (in_features / 128)`.
+    pub fn new(
+        blocks: &'a [BlockPQ2_0],
+        out_features: usize,
+        in_features: usize,
+        kernel: std::sync::Arc<oxibonsai_kernels::KernelDispatcher>,
+    ) -> crate::error::ModelResult<Self> {
+        use crate::error::ModelError;
+
+        if in_features == 0 || !in_features.is_multiple_of(QK_PQ2_0) {
+            // A relationship ("in_features is a nonzero multiple of the
+            // block width"), not a tensor whose own dimensions disagree
+            // with what was asked for — `ShapeInvariant` (block/functions.rs
+            // migrated four analogous sites the same way) says so instead
+            // of a `ShapeMismatch` whose `expected`/`actual` would be
+            // byte-identical `Vec<usize>`s and convey nothing.
+            return Err(ModelError::ShapeInvariant {
+                tensor: "LinearPQ2_0".into(),
+                expected: format!("in_features a nonzero multiple of {QK_PQ2_0} (QK_PQ2_0)"),
+                actual: format!("in_features = {in_features}"),
+            });
+        }
+        let expected_blocks = out_features * (in_features / QK_PQ2_0);
+        if blocks.len() != expected_blocks {
+            return Err(ModelError::ShapeMismatch {
+                name: "LinearPQ2_0".into(),
+                expected: vec![expected_blocks],
+                actual: vec![blocks.len()],
+            });
+        }
+        Ok(Self {
+            blocks,
+            out_features,
+            in_features,
+            kernel,
+        })
+    }
+
+    /// Number of output features (rows).
+    pub fn out_features(&self) -> usize {
+        self.out_features
+    }
+
+    /// Number of input features (columns).
+    pub fn in_features(&self) -> usize {
+        self.in_features
+    }
+
+    /// Raw block references.
+    pub fn blocks(&self) -> &[BlockPQ2_0] {
+        self.blocks
+    }
+
+    /// Forward pass (GEMV): single input vector.
+    ///
+    /// - `input`: FP32 vector of length `in_features`.
+    /// - `output`: FP32 vector of length `out_features`.
+    pub fn forward(&self, input: &[f32], output: &mut [f32]) -> crate::error::ModelResult<()> {
+        self.kernel
+            .gemv_pq2_0(
+                self.blocks,
+                input,
+                output,
+                self.out_features,
+                self.in_features,
+            )
+            .map_err(crate::error::ModelError::Kernel)
+    }
+
+    /// Forward pass (GEMM): batched input.
+    ///
+    /// - `input`: Row-major FP32 matrix [batch × in_features].
+    /// - `output`: Row-major FP32 matrix [batch × out_features].
+    /// - `batch`: Batch/sequence dimension.
+    pub fn forward_batch(
+        &self,
+        input: &[f32],
+        output: &mut [f32],
+        batch: usize,
+    ) -> crate::error::ModelResult<()> {
+        self.kernel
+            .gemm_pq2_0(
+                self.blocks,
+                input,
+                output,
+                batch,
+                self.out_features,
+                self.in_features,
+            )
+            .map_err(crate::error::ModelError::Kernel)
+    }
+}
+
+/// A linear layer with `PTQ1_0` (PrismML Bonsai 2 1.75-bit, ggml id 143)
+/// weights (B2-09; design §3.4). See [`LinearPQ2_0`] for the Hadamard-hook
+/// placement note (unchanged here).
+#[derive(Debug)]
+pub struct LinearPTQ1_0<'a> {
+    /// Weight blocks in row-major order: `[out_features × (in_features / 128)]` blocks.
+    blocks: &'a [BlockPTQ1_0],
+    /// Number of output features (rows).
+    out_features: usize,
+    /// Number of input features (columns, must be a multiple of 128).
+    in_features: usize,
+    /// Kernel dispatcher stored in the layer (mirrors [`LinearTernary`]).
+    kernel: std::sync::Arc<oxibonsai_kernels::KernelDispatcher>,
+}
+
+impl<'a> LinearPTQ1_0<'a> {
+    /// Create a `PTQ1_0` linear layer, validating block count at construction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::ModelError::ShapeMismatch`] if
+    /// `in_features % 128 != 0` or `blocks.len() != out_features *
+    /// (in_features / 128)`.
+    pub fn new(
+        blocks: &'a [BlockPTQ1_0],
+        out_features: usize,
+        in_features: usize,
+        kernel: std::sync::Arc<oxibonsai_kernels::KernelDispatcher>,
+    ) -> crate::error::ModelResult<Self> {
+        use crate::error::ModelError;
+
+        if in_features == 0 || !in_features.is_multiple_of(QK_PTQ1_0) {
+            // See `LinearPQ2_0::new`'s identical branch for why this is a
+            // `ShapeInvariant`, not a `ShapeMismatch`.
+            return Err(ModelError::ShapeInvariant {
+                tensor: "LinearPTQ1_0".into(),
+                expected: format!("in_features a nonzero multiple of {QK_PTQ1_0} (QK_PTQ1_0)"),
+                actual: format!("in_features = {in_features}"),
+            });
+        }
+        let expected_blocks = out_features * (in_features / QK_PTQ1_0);
+        if blocks.len() != expected_blocks {
+            return Err(ModelError::ShapeMismatch {
+                name: "LinearPTQ1_0".into(),
+                expected: vec![expected_blocks],
+                actual: vec![blocks.len()],
+            });
+        }
+        Ok(Self {
+            blocks,
+            out_features,
+            in_features,
+            kernel,
+        })
+    }
+
+    /// Number of output features (rows).
+    pub fn out_features(&self) -> usize {
+        self.out_features
+    }
+
+    /// Number of input features (columns).
+    pub fn in_features(&self) -> usize {
+        self.in_features
+    }
+
+    /// Raw block references.
+    pub fn blocks(&self) -> &[BlockPTQ1_0] {
+        self.blocks
+    }
+
+    /// Forward pass (GEMV): single input vector.
+    pub fn forward(&self, input: &[f32], output: &mut [f32]) -> crate::error::ModelResult<()> {
+        self.kernel
+            .gemv_ptq1_0(
+                self.blocks,
+                input,
+                output,
+                self.out_features,
+                self.in_features,
+            )
+            .map_err(crate::error::ModelError::Kernel)
+    }
+
+    /// Forward pass (GEMM): batched input.
+    pub fn forward_batch(
+        &self,
+        input: &[f32],
+        output: &mut [f32],
+        batch: usize,
+    ) -> crate::error::ModelResult<()> {
+        self.kernel
+            .gemm_ptq1_0(
+                self.blocks,
+                input,
+                output,
+                batch,
+                self.out_features,
+                self.in_features,
+            )
+            .map_err(crate::error::ModelError::Kernel)
+    }
+}
+
+/// A linear layer with mainline group-64 `Q2_0` (ggml id 42, disambiguated
+/// from the legacy group-128 `TQ2_0_g128`/`PQ2_0` readings by
+/// [`oxibonsai_core::gguf::quant_resolve::resolve_type_42`]) weights
+/// (B2-09; design §3.4). See [`LinearPQ2_0`] for the Hadamard-hook placement
+/// note (unchanged here — the `Ternary-Bonsai-2-27B-Q2_0-prism-fork-required`
+/// file folds this format under `prism.hadamard.*` too).
+#[derive(Debug)]
+pub struct LinearQ2_0G64<'a> {
+    /// Weight blocks in row-major order: `[out_features × (in_features / 64)]` blocks.
+    blocks: &'a [BlockQ2_0G64],
+    /// Number of output features (rows).
+    out_features: usize,
+    /// Number of input features (columns, must be a multiple of 64).
+    in_features: usize,
+    /// Kernel dispatcher stored in the layer (mirrors [`LinearTernary`]).
+    kernel: std::sync::Arc<oxibonsai_kernels::KernelDispatcher>,
+}
+
+impl<'a> LinearQ2_0G64<'a> {
+    /// Create a group-64 `Q2_0` linear layer, validating block count at
+    /// construction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::ModelError::ShapeMismatch`] if
+    /// `in_features % 64 != 0` or `blocks.len() != out_features *
+    /// (in_features / 64)`.
+    pub fn new(
+        blocks: &'a [BlockQ2_0G64],
+        out_features: usize,
+        in_features: usize,
+        kernel: std::sync::Arc<oxibonsai_kernels::KernelDispatcher>,
+    ) -> crate::error::ModelResult<Self> {
+        use crate::error::ModelError;
+
+        if in_features == 0 || !in_features.is_multiple_of(QK_Q2_0_G64) {
+            // See `LinearPQ2_0::new`'s identical branch for why this is a
+            // `ShapeInvariant`, not a `ShapeMismatch`.
+            return Err(ModelError::ShapeInvariant {
+                tensor: "LinearQ2_0G64".into(),
+                expected: format!("in_features a nonzero multiple of {QK_Q2_0_G64} (QK_Q2_0_G64)"),
+                actual: format!("in_features = {in_features}"),
+            });
+        }
+        let expected_blocks = out_features * (in_features / QK_Q2_0_G64);
+        if blocks.len() != expected_blocks {
+            return Err(ModelError::ShapeMismatch {
+                name: "LinearQ2_0G64".into(),
+                expected: vec![expected_blocks],
+                actual: vec![blocks.len()],
+            });
+        }
+        Ok(Self {
+            blocks,
+            out_features,
+            in_features,
+            kernel,
+        })
+    }
+
+    /// Number of output features (rows).
+    pub fn out_features(&self) -> usize {
+        self.out_features
+    }
+
+    /// Number of input features (columns).
+    pub fn in_features(&self) -> usize {
+        self.in_features
+    }
+
+    /// Raw block references.
+    pub fn blocks(&self) -> &[BlockQ2_0G64] {
+        self.blocks
+    }
+
+    /// Forward pass (GEMV): single input vector.
+    pub fn forward(&self, input: &[f32], output: &mut [f32]) -> crate::error::ModelResult<()> {
+        self.kernel
+            .gemv_q2_0_g64(
+                self.blocks,
+                input,
+                output,
+                self.out_features,
+                self.in_features,
+            )
+            .map_err(crate::error::ModelError::Kernel)
+    }
+
+    /// Forward pass (GEMM): batched input.
+    pub fn forward_batch(
+        &self,
+        input: &[f32],
+        output: &mut [f32],
+        batch: usize,
+    ) -> crate::error::ModelResult<()> {
+        self.kernel
+            .gemm_q2_0_g64(
+                self.blocks,
+                input,
+                output,
+                batch,
+                self.out_features,
+                self.in_features,
+            )
+            .map_err(crate::error::ModelError::Kernel)
+    }
+}
+
 /// Sum type dispatching to Q1\_0\_g128, TQ2\_0\_g128, FP8, Q4_0, Q8_0, Q5_K, or Q6_K linear layers.
 #[derive(Debug)]
 pub enum LinearLayer<'a> {
@@ -555,6 +889,12 @@ pub enum LinearLayer<'a> {
     Q4K(LinearQ4K<'a>),
     /// 8-bit K-quant (Q8_K) linear layer.
     Q8K(LinearQ8K<'a>),
+    /// PrismML Bonsai 2 `PQ2_0` (ggml id 142) linear layer (B2-09).
+    PQ2_0(LinearPQ2_0<'a>),
+    /// PrismML Bonsai 2 `PTQ1_0` (ggml id 143) linear layer (B2-09).
+    PTQ1_0(LinearPTQ1_0<'a>),
+    /// Mainline group-64 `Q2_0` linear layer (B2-09).
+    Q2_0G64(LinearQ2_0G64<'a>),
 }
 
 impl<'a> LinearLayer<'a> {
@@ -573,6 +913,9 @@ impl<'a> LinearLayer<'a> {
             Self::Q3K(l) => l.out_features(),
             Self::Q4K(l) => l.out_features(),
             Self::Q8K(l) => l.out_features(),
+            Self::PQ2_0(l) => l.out_features(),
+            Self::PTQ1_0(l) => l.out_features(),
+            Self::Q2_0G64(l) => l.out_features(),
         }
     }
 
@@ -591,12 +934,16 @@ impl<'a> LinearLayer<'a> {
             Self::Q3K(l) => l.in_features(),
             Self::Q4K(l) => l.in_features(),
             Self::Q8K(l) => l.in_features(),
+            Self::PQ2_0(l) => l.in_features(),
+            Self::PTQ1_0(l) => l.in_features(),
+            Self::Q2_0G64(l) => l.in_features(),
         }
     }
 
     /// Returns the GPU weight handle, if the layer has been uploaded to GPU.
     ///
-    /// FP8, Q4_0, Q8_0, Q5_K, Q6_K, and K-quant variants do not support GPU caching.
+    /// FP8, Q4_0, Q8_0, Q5_K, Q6_K, K-quant, and PrismML variants do not
+    /// support GPU caching.
     pub fn gpu_handle(&self) -> Option<oxibonsai_kernels::GpuWeightHandle> {
         match self {
             Self::OneBit(l) => l.gpu_handle(),
@@ -610,7 +957,10 @@ impl<'a> LinearLayer<'a> {
             | Self::Q2K(_)
             | Self::Q3K(_)
             | Self::Q4K(_)
-            | Self::Q8K(_) => None,
+            | Self::Q8K(_)
+            | Self::PQ2_0(_)
+            | Self::PTQ1_0(_)
+            | Self::Q2_0G64(_) => None,
         }
     }
 
@@ -628,7 +978,10 @@ impl<'a> LinearLayer<'a> {
             | Self::Q2K(_)
             | Self::Q3K(_)
             | Self::Q4K(_)
-            | Self::Q8K(_) => None,
+            | Self::Q8K(_)
+            | Self::PQ2_0(_)
+            | Self::PTQ1_0(_)
+            | Self::Q2_0G64(_) => None,
         }
     }
 
@@ -646,7 +999,35 @@ impl<'a> LinearLayer<'a> {
             | Self::Q3K(_)
             | Self::Q4K(_)
             | Self::Q8K(_)
-            | Self::Q6K(_) => None,
+            | Self::Q6K(_)
+            | Self::PQ2_0(_)
+            | Self::PTQ1_0(_)
+            | Self::Q2_0G64(_) => None,
+        }
+    }
+
+    /// Returns the `PQ2_0` blocks if this is a `PQ2_0` layer, `None` otherwise.
+    pub fn blocks_pq2_0(&self) -> Option<&[BlockPQ2_0]> {
+        match self {
+            Self::PQ2_0(l) => Some(l.blocks()),
+            _ => None,
+        }
+    }
+
+    /// Returns the `PTQ1_0` blocks if this is a `PTQ1_0` layer, `None` otherwise.
+    pub fn blocks_ptq1_0(&self) -> Option<&[BlockPTQ1_0]> {
+        match self {
+            Self::PTQ1_0(l) => Some(l.blocks()),
+            _ => None,
+        }
+    }
+
+    /// Returns the group-64 `Q2_0` blocks if this is a `Q2_0G64` layer,
+    /// `None` otherwise.
+    pub fn blocks_q2_0_g64(&self) -> Option<&[BlockQ2_0G64]> {
+        match self {
+            Self::Q2_0G64(l) => Some(l.blocks()),
+            _ => None,
         }
     }
 
@@ -732,7 +1113,8 @@ impl<'a> LinearLayer<'a> {
 
     /// Upload weights to GPU.
     ///
-    /// K-quant variants are no-ops (GPU inference not yet implemented).
+    /// K-quant and PrismML variants are no-ops (GPU inference not yet
+    /// implemented for them).
     pub fn upload_to_gpu(&mut self) {
         match self {
             Self::OneBit(l) => l.upload_to_gpu(),
@@ -746,7 +1128,10 @@ impl<'a> LinearLayer<'a> {
             | Self::Q2K(_)
             | Self::Q3K(_)
             | Self::Q4K(_)
-            | Self::Q8K(_) => {}
+            | Self::Q8K(_)
+            | Self::PQ2_0(_)
+            | Self::PTQ1_0(_)
+            | Self::Q2_0G64(_) => {}
         }
     }
 
@@ -765,6 +1150,9 @@ impl<'a> LinearLayer<'a> {
             Self::Q3K(l) => l.forward(input, output),
             Self::Q4K(l) => l.forward(input, output),
             Self::Q8K(l) => l.forward(input, output),
+            Self::PQ2_0(l) => l.forward(input, output),
+            Self::PTQ1_0(l) => l.forward(input, output),
+            Self::Q2_0G64(l) => l.forward(input, output),
         }
     }
 
@@ -783,6 +1171,9 @@ impl<'a> LinearLayer<'a> {
             Self::Q3K(l) => l.forward_batch(input, output, m),
             Self::Q4K(l) => l.forward_batch(input, output, m),
             Self::Q8K(l) => l.forward_batch(input, output, m),
+            Self::PQ2_0(l) => l.forward_batch(input, output, m),
+            Self::PTQ1_0(l) => l.forward_batch(input, output, m),
+            Self::Q2_0G64(l) => l.forward_batch(input, output, m),
         }
     }
 }
@@ -852,6 +1243,24 @@ impl<'a> From<LinearQ4K<'a>> for LinearLayer<'a> {
 impl<'a> From<LinearQ8K<'a>> for LinearLayer<'a> {
     fn from(l: LinearQ8K<'a>) -> Self {
         Self::Q8K(l)
+    }
+}
+
+impl<'a> From<LinearPQ2_0<'a>> for LinearLayer<'a> {
+    fn from(l: LinearPQ2_0<'a>) -> Self {
+        Self::PQ2_0(l)
+    }
+}
+
+impl<'a> From<LinearPTQ1_0<'a>> for LinearLayer<'a> {
+    fn from(l: LinearPTQ1_0<'a>) -> Self {
+        Self::PTQ1_0(l)
+    }
+}
+
+impl<'a> From<LinearQ2_0G64<'a>> for LinearLayer<'a> {
+    fn from(l: LinearQ2_0G64<'a>) -> Self {
+        Self::Q2_0G64(l)
     }
 }
 
@@ -945,6 +1354,159 @@ mod tests {
         assert!(
             result_bad_in.is_err(),
             "should error when in_features % 128 != 0"
+        );
+    }
+
+    // ── B2-09 acceptance: LinearLayer::{PQ2_0,PTQ1_0,Q2_0G64} round-trip a
+    // fixture tensor ──────────────────────────────────────────────────────
+
+    /// `PQ2_0` fixture: `qs = 0xFF` (every 2-bit lane LSB-first is `0b11` =
+    /// code 3) decodes to `value = code - 1 = +2` at every element (the
+    /// arithmetic code map shared by `PQ2_0`/`Q2_0_g64`/`PTQ1_0`, distinct
+    /// from the legacy ternary LUT where `0b11` means something else — see
+    /// `dequant_prism`'s module doc for why the two must never be confused).
+    #[test]
+    fn linear_layer_pq2_0_forward_round_trips_a_fixture_tensor() {
+        use std::sync::Arc;
+
+        let kernel = Arc::new(KernelDispatcher::auto_detect());
+        let block = BlockPQ2_0 {
+            d: half::f16::ONE,
+            qs: [0xFFu8; 32],
+        };
+        let blocks = [block];
+        let inner = LinearPQ2_0::new(&blocks, 1, 128, kernel).expect("new should succeed");
+        let layer: LinearLayer = inner.into();
+        assert_eq!(layer.out_features(), 1);
+        assert_eq!(layer.in_features(), 128);
+
+        let input = vec![1.0f32; 128];
+        let mut output = vec![0.0f32; 1];
+        layer
+            .forward_vec(&input, &mut output)
+            .expect("forward_vec should succeed");
+        // 128 weights x +2 x input 1.0 x scale 1.0 = 256.0
+        assert!(
+            (output[0] - 256.0).abs() < 1.0,
+            "expected ~256, got {}",
+            output[0]
+        );
+
+        // Round-trip through `forward_mat` (GEMM) too, batch of 2 identical rows.
+        let batched_input = vec![1.0f32; 256];
+        let mut batched_output = vec![0.0f32; 2];
+        layer
+            .forward_mat(&batched_input, &mut batched_output, 2)
+            .expect("forward_mat should succeed");
+        for (i, v) in batched_output.iter().enumerate() {
+            assert!(
+                (v - 256.0).abs() < 1.0,
+                "batch row {i}: expected ~256, got {v}"
+            );
+        }
+    }
+
+    /// `PTQ1_0` fixture: all-zero `qs`/`qh` decodes every trit to code 0
+    /// (`value = -1`), since a zero byte's base-3 digit extraction is zero
+    /// at every stage.
+    #[test]
+    fn linear_layer_ptq1_0_forward_round_trips_a_fixture_tensor() {
+        use std::sync::Arc;
+
+        let kernel = Arc::new(KernelDispatcher::auto_detect());
+        let block = BlockPTQ1_0 {
+            d: half::f16::ONE,
+            qs: [0u8; 24],
+            qh: [0u8; 2],
+        };
+        let blocks = [block];
+        let inner = LinearPTQ1_0::new(&blocks, 1, 128, kernel).expect("new should succeed");
+        let layer: LinearLayer = inner.into();
+        assert_eq!(layer.out_features(), 1);
+        assert_eq!(layer.in_features(), 128);
+
+        let input = vec![1.0f32; 128];
+        let mut output = vec![0.0f32; 1];
+        layer
+            .forward_vec(&input, &mut output)
+            .expect("forward_vec should succeed");
+        // 128 weights x -1 x input 1.0 x scale 1.0 = -128.0
+        assert!(
+            (output[0] + 128.0).abs() < 1.0,
+            "expected ~-128, got {}",
+            output[0]
+        );
+    }
+
+    /// Group-64 `Q2_0` fixture: same arithmetic code map as `PQ2_0`, one
+    /// block covers 64 elements instead of 128.
+    #[test]
+    fn linear_layer_q2_0_g64_forward_round_trips_a_fixture_tensor() {
+        use std::sync::Arc;
+
+        let kernel = Arc::new(KernelDispatcher::auto_detect());
+        let block = BlockQ2_0G64 {
+            d: half::f16::ONE,
+            qs: [0xFFu8; 16],
+        };
+        let blocks = [block];
+        let inner = LinearQ2_0G64::new(&blocks, 1, 64, kernel).expect("new should succeed");
+        let layer: LinearLayer = inner.into();
+        assert_eq!(layer.out_features(), 1);
+        assert_eq!(layer.in_features(), 64);
+
+        let input = vec![1.0f32; 64];
+        let mut output = vec![0.0f32; 1];
+        layer
+            .forward_vec(&input, &mut output)
+            .expect("forward_vec should succeed");
+        // 64 weights x +2 x input 1.0 x scale 1.0 = 128.0
+        assert!(
+            (output[0] - 128.0).abs() < 1.0,
+            "expected ~128, got {}",
+            output[0]
+        );
+    }
+
+    #[test]
+    fn linear_pq2_0_new_validates_shape() {
+        use std::sync::Arc;
+
+        let kernel = Arc::new(KernelDispatcher::auto_detect());
+        let block = BlockPQ2_0 {
+            d: half::f16::ONE,
+            qs: [0xFFu8; 32],
+        };
+        let blocks = [block];
+        // out=2, in=128 needs 2 blocks, but only 1 supplied.
+        let result = LinearPQ2_0::new(&blocks, 2, 128, kernel.clone());
+        assert!(result.is_err(), "should error on wrong block count");
+        // in_features not a multiple of 128 — also invalid.
+        let result_bad_in = LinearPQ2_0::new(&blocks, 1, 64, kernel);
+        assert!(
+            result_bad_in.is_err(),
+            "should error when in_features % 128 != 0"
+        );
+    }
+
+    #[test]
+    fn linear_q2_0_g64_new_validates_shape() {
+        use std::sync::Arc;
+
+        let kernel = Arc::new(KernelDispatcher::auto_detect());
+        let block = BlockQ2_0G64 {
+            d: half::f16::ONE,
+            qs: [0xFFu8; 16],
+        };
+        let blocks = [block];
+        // out=2, in=64 needs 2 blocks, but only 1 supplied.
+        let result = LinearQ2_0G64::new(&blocks, 2, 64, kernel.clone());
+        assert!(result.is_err(), "should error on wrong block count");
+        // in_features not a multiple of 64 — also invalid.
+        let result_bad_in = LinearQ2_0G64::new(&blocks, 1, 32, kernel);
+        assert!(
+            result_bad_in.is_err(),
+            "should error when in_features % 64 != 0"
         );
     }
 }

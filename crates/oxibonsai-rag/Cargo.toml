@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/oxibonsai-rag"
 description = "Pure Rust RAG pipeline for OxiBonsai"
@@ -13,11 +14,29 @@ categories = ["science", "algorithms"]
 readme = "README.md"
 
 [dependencies]
-oxibonsai-core.workspace = true
 tracing = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+
+[features]
+# Opt-in gate for the `[[bench]]` TARGET only (deps-16/FIX-01-BUILD):
+# `required-features = ["bench"]` below stops cargo from building or running
+# the `rag_bench` bench binary unless `--features bench` is passed.
+#
+# CORRECTION (wave-3.5 re-review, matches oxibonsai-kernels/Cargo.toml): this
+# does NOT keep a C compiler out of the crate's dependency graph, despite an
+# earlier version of this comment claiming so. `criterion` 0.8.2 pulls in
+# `alloca` -> `cc` on unix unconditionally (`alloca`'s
+# `default-features = false` cannot drop that edge), and `criterion` is an
+# ordinary, always-resolved `[dev-dependencies]` entry — it is not itself
+# feature-gated, only the bench *target* that uses it is. A default
+# `cargo test` / `cargo check --all-targets` for this package still resolves
+# and compiles `criterion`/`alloca`/`cc`; `required-features = ["bench"]`
+# only stops the bench *sources* themselves from compiling without an
+# explicit opt-in. Run the bench with
+# `cargo bench -p oxibonsai-rag --features bench`.
+bench = []
 
 [dev-dependencies]
 proptest.workspace = true
@@ -26,3 +45,4 @@ criterion.workspace = true
 [[bench]]
 name = "rag_bench"
 harness = false
+required-features = ["bench"]

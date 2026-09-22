@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/oxibonsai-serve"
 description = "Standalone OpenAI-compatible inference server for OxiBonsai"
@@ -26,8 +27,24 @@ native-cuda = ["oxibonsai-runtime/native-cuda"]
 
 [dependencies]
 oxibonsai-core.workspace = true
+# `hf-tokenizer` was requested explicitly (not inherited) so this binary's
+# `TokenizerBridge::from_file` resolved a `tokenizer.json` through the HF
+# backend, byte-for-byte as before FIX-01-BUILD split the bridge into
+# `{ Native, Hf }`.
+#
+# FLIPPED OFF (BENCHES, wave 3, RT-ADMIN-CFG blocking-1 / decision D-5): see
+# `crates/oxibonsai-runtime/Cargo.toml`'s matching comment for the two
+# preconditions (cross-backend parity + the `is_special_id` benchmark) that
+# are now satisfied, including the window-scaled figure that decision
+# actually turns on (`native_step_decode` rescans the whole decode window
+# per streamed token, not one call: ~41-82 us/token at a realistic
+# 2048-4096 token window, still far below a token's decode cost) —
+# `oxibonsai-serve`'s config-level `kind` whitelist
+# (`config.rs`/`validation.rs`) never selected the backend at runtime
+# anyway; the backend was always this compile-time feature. Loads through
+# the Pure-Rust native backend by default now; pass `--features
+# oxibonsai-runtime/hf-tokenizer` to keep the HuggingFace path.
 oxibonsai-runtime = { workspace = true, features = ["server"] }
-oxibonsai-tokenizer.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -37,7 +54,6 @@ serde_json.workspace = true
 toml.workspace = true
 axum.workspace = true
 tower = { workspace = true, features = ["limit", "load-shed", "timeout", "util"] }
-tower-http.workspace = true
 
 [dev-dependencies]
 reqwest.workspace = true

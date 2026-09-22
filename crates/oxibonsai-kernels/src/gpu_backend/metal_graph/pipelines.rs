@@ -6,8 +6,10 @@
 
 use metal::{CompileOptions, ComputePipelineState, Device, Library};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use crate::gpu_backend::kernel_sources;
 
@@ -44,6 +46,18 @@ pub(crate) struct MetalPipelines {
 
     // GPU argmax for greedy decoding
     pub(crate) argmax: ComputePipelineState,
+    /// GPU partial top-k (`perf-11` sampled-decode path): `k` highest
+    /// `(id, value)` pairs from a logits row, so a sampled request no longer
+    /// downloads the full row (993 KB/token at Bonsai 2's 248 320 vocab) just
+    /// to run `top_k`/`top_p` on the CPU. Dispatched by
+    /// `metal_dispatch.rs::dispatch_topk_f32`; wiring it into the engine's
+    /// sampled decode arm (`engine_greedy.rs`) is METAL-CONCURRENCY's (wave
+    /// 4), so nothing in the non-test build calls `dispatch_topk_f32` yet —
+    /// same situation as `gemm_tq2_g128_v8_tiled` above, hence
+    /// `#[allow(dead_code)]`. `metal_dispatch.rs`'s own tests dispatch this
+    /// kernel for real and check its output against a CPU oracle.
+    #[allow(dead_code)]
+    pub(crate) topk_f32: ComputePipelineState,
     // ── Prefill path (batch) ────────────────────────────────────────
     pub(crate) batched_rmsnorm_v2: ComputePipelineState,
     pub(crate) batched_swiglu: ComputePipelineState,
@@ -135,6 +149,33 @@ pub(crate) struct MetalPipelines {
     /// Dispatched by `dispatch_joint_attention_flash` (`encode_joint_attention_flash`
     /// / `encode_joint_attention_flash_pooled`).
     pub(crate) joint_attention_flash_f32: ComputePipelineState,
+
+    /// The compiled Metal library backing every pipeline above, retained so
+    /// [`MetalPipelines::pipeline_for`] can resolve *additional* entry points
+    /// on demand.
+    ///
+    /// MET-10: `metal_fp8_prefill.rs`, `metal_k_quant_kernels.rs` and
+    /// `metal_q_std_kernels.rs` (not owned by this package) still compile
+    /// their own per-kernel `MTLLibrary` from source on first use — 14
+    /// separate uncached compilations. Their MSL now rides this combined,
+    /// embedded/disk-cached library too (`build_combined_msl` below), but
+    /// none of those 18 K-quant/Q-std/FP8 entry points are extracted into a
+    /// named field here: nothing in this crate calls them yet, and doing so
+    /// would add 18 fields that `-D warnings` flags as dead code until a
+    /// later package ports those three call sites over. `pipeline_for`
+    /// resolves them by name instead, against this retained library.
+    ///
+    /// Ported those three call sites are still someone else's follow-up
+    /// (see `pipeline_for`'s doc), so nothing in the non-test build reads
+    /// this field yet either — `metal_dispatch.rs`'s own tests do, hence
+    /// `#[allow(dead_code)]`.
+    #[allow(dead_code)]
+    library: Library,
+    /// Lazily-populated cache backing [`MetalPipelines::pipeline_for`], so a
+    /// repeat lookup by name is an `Arc`-free pointer-retain instead of a
+    /// fresh `get_function` + `new_compute_pipeline_state_with_function`.
+    #[allow(dead_code)]
+    by_name: Mutex<HashMap<String, ComputePipelineState>>,
 }
 
 impl MetalPipelines {
@@ -166,6 +207,7 @@ impl MetalPipelines {
         let batched_attention_weighted_sum =
             pipeline_for(&library, device, "batched_attention_weighted_sum")?;
         let argmax = pipeline_for(&library, device, "argmax")?;
+        let topk_f32 = pipeline_for(&library, device, "topk_f32")?;
         // Prefill path
         let batched_rmsnorm_v2 = pipeline_for(&library, device, "batched_rmsnorm_v2")?;
         let batched_swiglu = pipeline_for(&library, device, "batched_swiglu")?;
@@ -209,6 +251,7 @@ impl MetalPipelines {
             batched_softmax,
             batched_attention_weighted_sum,
             argmax,
+            topk_f32,
             batched_rmsnorm_v2,
             batched_swiglu,
             gemm_q1_g128_v7,
@@ -227,7 +270,67 @@ impl MetalPipelines {
             upsample_nearest_f32,
             conv2d_f32_implicit,
             joint_attention_flash_f32,
+            library,
+            by_name: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Resolve (and cache) a compute pipeline for `name` from the combined
+    /// embedded metallib, compiling it into a pipeline state on first request
+    /// and cloning the cached state on every later one.
+    ///
+    /// MET-10's escape hatch: this exists so kernel families that still
+    /// compile their own `MTLLibrary` per kernel from source —
+    /// `metal_fp8_prefill.rs`, `metal_k_quant_kernels.rs`,
+    /// `metal_q_std_kernels.rs` (not owned by this package; see the
+    /// `library` field doc) — can be ported one call site at a time onto
+    /// this shared, disk-cached, embedded metallib and the shared
+    /// `MetalGraph` device/command queue, without this struct growing an
+    /// always-dead field for every one of the 18 K-quant/Q-std/FP8 entry
+    /// points `build_combined_msl` now embeds.
+    ///
+    /// Returns [`MetalGraphError::EncodingFailed`] if `name` is not a
+    /// `kernel void` anywhere in the combined MSL, or if the cache mutex is
+    /// poisoned by an earlier panic — for any name actually listed in
+    /// `build.rs::ACTIVE_KERNELS` this cannot happen in a working build
+    /// (`combined_msl_matches_active_kernels_exactly` in
+    /// `tests/build_script_kernel_sources.rs` and the runtime entry-point
+    /// verification in [`load_or_compile_library`] both guard that).
+    ///
+    /// The three call sites this exists for have not been ported yet
+    /// (someone else's follow-up), so nothing in the non-test build calls
+    /// this method — `metal_dispatch.rs`'s
+    /// `pipeline_for_resolves_and_dispatches_a_kquant_kernel_by_name` test
+    /// dispatches a real K-quant kernel through it end-to-end, hence
+    /// `#[allow(dead_code)]`, matching `gemm_tq2_g128_v8_tiled` above.
+    ///
+    /// Not a strict single-compile guarantee under concurrent callers: the
+    /// mutex only serialises the cache read/insert, not the whole
+    /// lookup-or-compile sequence, so two threads racing on the same
+    /// still-uncached `name` can each miss, each compile their own
+    /// `ComputePipelineState` for that entry point, and each insert —
+    /// the loser's insert simply overwrites the winner's in the map. Both
+    /// pipeline states are equally valid (same function, same library), so
+    /// this is a redundant compile on a cold name under contention, never a
+    /// correctness issue; every caller still gets back a working pipeline
+    /// for `name`, including the one whose insert lost the race.
+    #[allow(dead_code)]
+    pub(crate) fn pipeline_for(
+        &self,
+        device: &Device,
+        name: &str,
+    ) -> Result<ComputePipelineState, MetalGraphError> {
+        let mut cache = self.by_name.lock().map_err(|_| {
+            MetalGraphError::EncodingFailed(format!(
+                "pipeline_for('{name}'): by-name pipeline cache mutex poisoned"
+            ))
+        })?;
+        if let Some(pso) = cache.get(name) {
+            return Ok(pso.clone());
+        }
+        let pso = pipeline_for(&self.library, device, name)?;
+        cache.insert(name.to_string(), pso.clone());
+        Ok(pso)
     }
 }
 
@@ -281,6 +384,8 @@ fn build_combined_msl() -> String {
     src.push('\n');
     src.push_str(kernel_sources::MSL_ARGMAX);
     src.push('\n');
+    src.push_str(kernel_sources::MSL_TOPK_F32);
+    src.push('\n');
     // ── Prefill path (batch) ────────────────────────────────────────────
     src.push_str(kernel_sources::MSL_BATCHED_RMSNORM_V2);
     src.push('\n');
@@ -320,7 +425,90 @@ fn build_combined_msl() -> String {
     // ── FLUX.2 DiT joint attention (flash-attention simdgroup_matrix) ─────
     src.push_str(kernel_sources::MSL_DIT_JOINT_ATTENTION_FLASH);
     src.push('\n');
+    // ── K-quant GEMV (MET-10) ─────────────────────────────────────────────
+    // Not extracted into a named `MetalPipelines` field (see the `library`
+    // field doc) — resolved on demand through `MetalPipelines::pipeline_for`.
+    src.push_str(kernel_sources::MSL_GEMV_Q2K_V1);
+    src.push('\n');
+    src.push_str(kernel_sources::MSL_GEMV_Q3K_V1);
+    src.push('\n');
+    src.push_str(kernel_sources::MSL_GEMV_Q4K_V1);
+    src.push('\n');
+    src.push_str(kernel_sources::MSL_GEMV_Q5K_V1);
+    src.push('\n');
+    src.push_str(kernel_sources::MSL_GEMV_Q6K_V1);
+    src.push('\n');
+    src.push_str(kernel_sources::MSL_GEMV_Q8K_V1);
+    src.push('\n');
+    // ── Standard GGUF Q4_0 / Q8_0 GEMV (MET-10) ────────────────────────────
+    src.push_str(kernel_sources::MSL_GEMV_Q4_0_V1);
+    src.push('\n');
+    src.push_str(kernel_sources::MSL_GEMV_Q8_0_V1);
+    src.push('\n');
+    // ── FP8 single-token GEMV (MET-10) ─────────────────────────────────────
+    src.push_str(kernel_sources::MSL_GEMV_FP8_E4M3_V1);
+    src.push('\n');
+    src.push_str(kernel_sources::MSL_GEMV_FP8_E5M2_V1);
+    src.push('\n');
+    // ── FP8 batch prefill GEMM / fused / gemv-pf (MET-10) ──────────────────
+    src.push_str(kernel_sources::MSL_GEMM_FP8_E4M3_V1);
+    src.push('\n');
+    src.push_str(kernel_sources::MSL_GEMM_FP8_E4M3_RESIDUAL_V1);
+    src.push('\n');
+    src.push_str(kernel_sources::MSL_FUSED_GATE_UP_SWIGLU_GEMM_FP8_E4M3_V1);
+    src.push('\n');
+    src.push_str(kernel_sources::MSL_GEMV_FP8_E4M3_PF_V1);
+    src.push('\n');
+    src.push_str(kernel_sources::MSL_GEMM_FP8_E5M2_V1);
+    src.push('\n');
+    src.push_str(kernel_sources::MSL_GEMM_FP8_E5M2_RESIDUAL_V1);
+    src.push('\n');
+    src.push_str(kernel_sources::MSL_FUSED_GATE_UP_SWIGLU_GEMM_FP8_E5M2_V1);
+    src.push('\n');
+    src.push_str(kernel_sources::MSL_GEMV_FP8_E5M2_PF_V1);
+    src.push('\n');
     src
+}
+
+/// Scan `msl_source` (the exact string [`build_combined_msl`] just produced)
+/// for every `kernel void <name>(` entry-point declaration, line-anchored so
+/// a mention inside a comment can never match.
+///
+/// This is deliberately **derived from the MSL text itself** rather than a
+/// hand-maintained `const` list of entry-point names: `ACTIVE_KERNELS`
+/// (`build.rs`) and the textual mirror in
+/// `tests/build_script_kernel_sources.rs` already give this whitelist two
+/// independent copies (by `MSL_*` Rust-constant name); a third, hand-typed
+/// list of the underlying Metal *entry-point* names — a different
+/// namespace — would be a fourth place to fall out of sync (MET-12 review
+/// note) instead of closing the gap. Deriving it from `msl_source` cannot
+/// desync by construction: whatever `build_combined_msl()` pushes is exactly
+/// what this scans.
+fn required_entry_points(msl_source: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for line in msl_source.lines() {
+        if let Some(rest) = line.trim_start().strip_prefix("kernel void ") {
+            if let Some(paren) = rest.find('(') {
+                let name = rest[..paren].trim();
+                if !name.is_empty() {
+                    names.insert(name.to_string());
+                }
+            }
+        }
+    }
+    names
+}
+
+/// Verify every entry point [`required_entry_points`] finds in `msl_source`
+/// actually resolves in `library` (MET-12).
+///
+/// `library.get_function` compiles nothing — it only looks up an already
+/// linked-in symbol — so this is cheap even for the ~49-kernel combined
+/// library and safe to run on every embedded-metallib load.
+fn embedded_library_has_all_required_entry_points(library: &Library, msl_source: &str) -> bool {
+    required_entry_points(msl_source)
+        .iter()
+        .all(|name| library.get_function(name, None).is_ok())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -352,21 +540,67 @@ fn try_load_cached_metallib(device: &Device, cache_path: &std::path::Path) -> Op
     device.new_library_with_data(&data).ok()
 }
 
+/// Process-local counter making [`compile_msl_via_xcrun`]'s temp build
+/// directory unique across the (up to two) calls one process makes: the
+/// primary combined library and the optional bf16 sidecar
+/// ([`load_bf16_library`]) both route through this same function.
+static TEMP_BUILD_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// RAII guard for [`compile_msl_via_xcrun`]'s per-call temp build directory:
+/// removes it (recursively) on drop, so every exit path — the successful
+/// tail expression, or any of the function's many early `?`/`return None`s —
+/// cleans up instead of leaking one throwaway directory per xcrun
+/// invocation.
+struct TempBuildDir(PathBuf);
+
+impl TempBuildDir {
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempBuildDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Compile MSL source to a `.metallib` binary via `xcrun metal` + `xcrun metallib`,
 /// cache the result to `cache_path`, and load the library.
+///
+/// # MET-M5: a per-process, per-call unique build directory
+///
+/// This used to build into a **fixed, shared** temp directory
+/// (`$TMPDIR/oxibonsai_metal_build`) with fixed file names
+/// (`combined.{metal,air,metallib}`) — on the only hardware-validated
+/// backend. Two processes compiling concurrently (this project routinely
+/// runs multi-session builds) would interleave writes to the same files, and
+/// a symlink planted at the fixed metallib path could redirect the write to
+/// an attacker-chosen location. Every call now gets its own directory named
+/// with both the process id and a process-local sequence number (this
+/// function runs up to twice per process — combined library, then the bf16
+/// sidecar), created with `create_dir` (fails if the name already exists,
+/// unlike `create_dir_all`) rather than assumed-fresh, and removed on every
+/// exit path by the [`TempBuildDir`] guard.
 fn compile_msl_via_xcrun(
     device: &Device,
     msl_source: &str,
     cache_path: &std::path::Path,
 ) -> Option<Library> {
-    let tmp_dir = std::env::temp_dir().join("oxibonsai_metal_build");
-    if std::fs::create_dir_all(&tmp_dir).is_err() {
+    let seq = TEMP_BUILD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_dir_path = std::env::temp_dir().join(format!(
+        "oxibonsai_metal_build_{}_{seq}",
+        std::process::id()
+    ));
+    if std::fs::create_dir(&tmp_dir_path).is_err() {
         return None;
     }
+    let tmp_dir = TempBuildDir(tmp_dir_path);
+    let dir = tmp_dir.path();
 
-    let metal_path = tmp_dir.join("combined.metal");
-    let air_path = tmp_dir.join("combined.air");
-    let metallib_path = tmp_dir.join("combined.metallib");
+    let metal_path = dir.join("combined.metal");
+    let air_path = dir.join("combined.air");
+    let metallib_path = dir.join("combined.metallib");
 
     if std::fs::write(&metal_path, msl_source).is_err() {
         return None;
@@ -415,19 +649,62 @@ fn compile_msl_via_xcrun(
         cache_path.display()
     );
 
-    // Cache for future runs
+    // Cache for future runs (MET-13: atomic publish — see
+    // `write_metallib_cache_atomically`).
     if let Some(parent) = cache_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(cache_path, &metallib_data);
+    write_metallib_cache_atomically(cache_path, &metallib_data);
 
-    // Clean up temp files
-    let _ = std::fs::remove_file(&metal_path);
-    let _ = std::fs::remove_file(&air_path);
-    let _ = std::fs::remove_file(&metallib_path);
-    let _ = std::fs::remove_dir(&tmp_dir);
-
+    // `tmp_dir`'s `Drop` removes the whole per-call build directory (and
+    // every file still in it) once this function returns.
     device.new_library_with_data(&metallib_data).ok()
+}
+
+/// Publish `data` to `cache_path` atomically: write to a pid-suffixed
+/// temporary file **in the same directory** as `cache_path` — required for
+/// `std::fs::rename` to be atomic, since a rename across directories/
+/// filesystems is not — then `rename` it into place. `cache_path.
+/// with_extension(..)` only rewrites the file-name component, so the
+/// temporary file is guaranteed to land next to `cache_path` regardless of
+/// what directory that is.
+///
+/// Shared by both cache slots this module writes: the primary combined
+/// metallib and the bf16 sidecar (`load_bf16_library` reaches this through
+/// `compile_msl_via_xcrun`), so fixing it here fixes both.
+///
+/// # MET-13
+///
+/// The previous `std::fs::write(cache_path, &metallib_data)` was a single
+/// non-atomic write. Two concurrent processes racing to populate the same
+/// cache slot (same MSL source hash) could each observe a partial write from
+/// the other, leaving a truncated `.metallib` on disk.
+/// `try_load_cached_metallib`'s `new_library_with_data(...).ok()?` already
+/// turns a corrupt file into a miss rather than a wrong load, so this was a
+/// cold-start performance bug, not a correctness one — but every later
+/// process would pay a full `xcrun` recompile until some process happened to
+/// win the write race cleanly. `rename` within one directory is atomic on
+/// every platform this project targets (POSIX `rename(2)`, Windows
+/// `MoveFileEx` via `std::fs::rename`), so a reader can only ever observe the
+/// old file or the fully-written new one, never a partial one.
+fn write_metallib_cache_atomically(cache_path: &std::path::Path, data: &[u8]) {
+    let tmp_path = cache_path.with_extension(format!("metallib.tmp.{}", std::process::id()));
+    if let Err(e) = std::fs::write(&tmp_path, data) {
+        tracing::debug!(
+            "failed to write metallib cache temp file {}: {e}",
+            tmp_path.display()
+        );
+        let _ = std::fs::remove_file(&tmp_path);
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, cache_path) {
+        tracing::debug!(
+            "failed to publish metallib cache {} (from {}): {e}",
+            cache_path.display(),
+            tmp_path.display()
+        );
+        let _ = std::fs::remove_file(&tmp_path);
+    }
 }
 
 /// Compile MSL source at runtime using `device.new_library_with_source()`.
@@ -460,12 +737,51 @@ fn try_load_embedded_metallib(device: &Device) -> Option<Library> {
 }
 
 /// Load a Metal library: embedded metallib → cached metallib → xcrun → runtime compilation.
+///
+/// # MET-12: the embedded metallib is verified, not trusted blindly
+///
+/// `build.rs`'s `ACTIVE_KERNELS` whitelist and `build_combined_msl()` below
+/// are two independently maintained lists that must name the exact same set
+/// of kernels; nothing enforced the direction "everything
+/// `build_combined_msl()` pushes was actually embedded" until now. Before
+/// this fix, a kernel added to `build_combined_msl()` (and `pipeline_for`)
+/// but forgotten in `ACTIVE_KERNELS` produced an embedded metallib silently
+/// missing that entry point: `try_load_embedded_metallib` would still
+/// succeed (the *library* loads fine — it is just missing one function), so
+/// this function returned `Ok` immediately, `MetalPipelines::compile()`
+/// then failed on the missing `pipeline_for(&library, device, "...")` call
+/// with no per-function fallback, `MetalGraph::global()` failed, and every
+/// caller's `.is_ok()` silently degraded the *entire* Metal backend to CPU.
+///
+/// Now, after loading the embedded library, every entry point
+/// [`required_entry_points`] finds in the freshly computed `msl_source` is
+/// checked with a cheap (non-compiling) `library.get_function` lookup; any
+/// miss logs a warning and falls through to the disk-cache/xcrun/runtime
+/// cascade below, which compiles fresh from `msl_source` and therefore
+/// cannot itself be missing anything `build_combined_msl()` just produced —
+/// turning the former hard failure into the cascade the module doc already
+/// promised.
 fn load_or_compile_library(device: &Device, msl_source: &str) -> Result<Library, MetalGraphError> {
-    // 1. Try build-time embedded metallib (fastest: no I/O, no compilation)
+    // 1. Try build-time embedded metallib (fastest: no I/O, no compilation) —
+    //    but only trust it if every kernel `msl_source` actually calls for is
+    //    present (MET-12).
     if let Some(lib) = try_load_embedded_metallib(device) {
-        return Ok(lib);
+        if embedded_library_has_all_required_entry_points(&lib, msl_source) {
+            return Ok(lib);
+        }
+        tracing::warn!(
+            "embedded metallib is missing one or more entry points required by the current \
+             kernel_sources/ (ACTIVE_KERNELS in build.rs has drifted from build_combined_msl()); \
+             falling back to disk-cache/xcrun/runtime compilation instead of shipping an \
+             incomplete library"
+        );
     }
 
+    // The disk cache below is keyed by a hash of `msl_source` itself
+    // (`kernels_<hash>.metallib`), so unlike the embedded metallib it cannot
+    // suffer this same drift: any change to `msl_source` changes the cache
+    // filename, making a stale/incomplete cache entry an ordinary miss
+    // rather than a silently-served wrong library.
     let hash = msl_hash(msl_source);
     let cache_filename = format!("kernels_{hash:016x}.metallib");
 
@@ -535,4 +851,59 @@ fn load_bf16_library(device: &Device) -> Option<Library> {
     // toolchain without `bfloat` simdgroup support → `None`.
     let options = CompileOptions::new();
     device.new_library_with_source(src, &options).ok()
+}
+
+#[cfg(test)]
+mod combined_msl_entry_point_tests {
+    use super::*;
+
+    /// MET-12 unit-level guard for [`required_entry_points`] itself.
+    ///
+    /// `tests/build_script_kernel_sources.rs` proves `build_combined_msl()`'s
+    /// pushes exactly match `ACTIVE_KERNELS` (in both `build.rs` and its own
+    /// mirror) — a *whitelist*-level check. Nothing previously exercised the
+    /// *runtime* verifier this module actually ships — [`required_entry_points`]'s
+    /// line-anchored `kernel void <name>(` scan — against the real combined
+    /// MSL text it runs on in [`load_or_compile_library`]. A future MSL
+    /// reformat (e.g. a declaration wrapping onto a second line before the
+    /// `(`, such as `kernel void\nfoo(...)`) would silently make that scan
+    /// under-count, with nothing catching it: `required_entry_points` would
+    /// just return one name short, and `embedded_library_has_all_required_
+    /// entry_points` would verify (and pass) a smaller-than-real set.
+    ///
+    /// This compares [`required_entry_points`]'s line-anchored count against
+    /// a second, independent, **not** line-anchored count of the same marker
+    /// text — deliberately not a hardcoded kernel count, so it never needs
+    /// updating when a kernel is legitimately added or removed, but it DOES
+    /// fire the moment the two extraction methods disagree, which is exactly
+    /// the reformat hazard above (the naive substring count still finds a
+    /// wrapped declaration; the line-anchored scan does not).
+    #[test]
+    fn required_entry_points_matches_a_naive_occurrence_count() {
+        let msl = build_combined_msl();
+        let scanned = required_entry_points(&msl);
+        let naive_occurrences = msl.matches("kernel void ").count();
+
+        assert_eq!(
+            scanned.len(),
+            naive_occurrences,
+            "required_entry_points() (line-anchored) found {} entry point(s) but a naive \
+             substring count of \"kernel void \" found {naive_occurrences} in the same text \
+             ({scanned:?}); this means some `kernel void <name>(` declaration is no longer at \
+             the start of its line (e.g. wrapped onto a second line before the `(`), so the \
+             MET-12 runtime verifier in `load_or_compile_library` would silently under-check \
+             the embedded metallib",
+            scanned.len(),
+        );
+
+        // Non-triviality floor: catches `build_combined_msl()` being
+        // accidentally emptied out, which would otherwise make both counts
+        // agree at 0 and pass the equality check above vacuously.
+        assert!(
+            scanned.len() >= 40,
+            "expected at least 40 Metal entry points in the combined MSL source, found {} — \
+             build_combined_msl() looks broken or emptied out, not just missing one kernel",
+            scanned.len()
+        );
+    }
 }

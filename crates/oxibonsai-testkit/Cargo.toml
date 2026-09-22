@@ -1,0 +1,39 @@
+# oxibonsai-testkit — shared, dev-only test-support crate (T-07 / T-05).
+#
+# NOT published, never a runtime dependency of any shipped crate or binary:
+# `publish = false` below, and it must never be added to any crate's
+# `[dependencies]` (only `[dev-dependencies]`).
+#
+# T-07 FIX (verifier wave 3): this crate is now a real workspace member
+# (root `Cargo.toml`'s `[workspace] members` + `[workspace.dependencies]`)
+# and every field below inherits from the root `[workspace.package]` /
+# `[workspace.dependencies]` tables, matching every other crate in this
+# repo (COOLJAPAN policy: manage deps at the workspace level; no per-crate
+# version pins). The root `[workspace.dependencies]` entry for this crate
+# deliberately carries no `version` key (dev-only path dependency, publish-
+# safe — see the comment there); this crate's own `publish = false` below
+# is what actually keeps it off crates.io.
+[package]
+name = "oxibonsai-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Dev-only shared test-support crate for OxiBonsai: one GGUF fixture builder for every quant format, hardware-capability self-skip reporting, temp-path and golden-vector helpers (not published, never a runtime dependency)"
+
+[lib]
+doctest = true
+
+[dependencies]
+oxibonsai-core.workspace = true
+half.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# Deliberately NOT a dependency: `tempfile` was removed after `rg -rn
+# 'tempfile' src/` found zero uses. `temp_path` (below) hand-rolls its own
+# collision-free, RAII-cleanup helpers directly on `std::env::temp_dir()`.
+
+[dev-dependencies]
+# Intentionally empty: this crate's own tests only need the above.

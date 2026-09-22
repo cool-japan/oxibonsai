@@ -109,7 +109,13 @@ fn test_quantization_snr_int8_above_threshold() {
 fn test_compression_ratio_q1_0() {
     // 1024 weights → 8 blocks × 18 bytes = 144 bytes; f32 = 4096 bytes.
     // ratio ≈ 28.4
-    let tensors = vec![WeightTensor::new("w", vec![1.0; 1024], vec![1024])];
+    //
+    // Shape is `[128, 8]` — a 128-wide row × 8 rows — rather than a flat
+    // `[1024]`: ggml never quantizes a 1-D tensor and neither does the
+    // exporter any more (CQ-02), so a 1-D fixture would land in F32 and this
+    // test would measure nothing. The element count, block count and
+    // therefore every assertion below are unchanged.
+    let tensors = vec![WeightTensor::new("w", vec![1.0; 1024], vec![128, 8])];
     let config = ExportConfig::new(ExportFormat::Q1_0G128, "m");
     let stats = export_stats(&tensors, &config);
     let expected_ratio = (1024.0_f32 * 4.0) / (8.0 * 18.0);

@@ -40,6 +40,8 @@ use oxibonsai_kernels::dispatch::KernelTier;
 use oxibonsai_model::model::BonsaiModel;
 use oxibonsai_runtime::engine::InferenceEngine;
 use oxibonsai_runtime::sampling::SamplingParams;
+use oxibonsai_testkit::capability::{record as record_capability, Capability};
+use oxibonsai_testkit::gguf_fixture::Lcg;
 
 // ── Synthetic model dimensions (CUDA-friendly: hidden a multiple of 128,
 //    head_dim=64, all quantised tensors a multiple of 128 weights). ──────────
@@ -57,6 +59,13 @@ fn cuda_available() -> bool {
     oxibonsai_kernels::CudaGraph::global().is_ok()
 }
 
+// ── T-05 capability-report producer ─────────────────────────────────────────
+//
+// T-07 FIX (verifier wave 3): this used to be an inline copy of
+// `oxibonsai_testkit::capability::record`; `oxibonsai-runtime` now takes
+// `oxibonsai-testkit` as a dev-dependency (imported above), so the copy is
+// deleted in favour of the shared implementation.
+
 /// Deterministic FP32 tensor whose values vary with the index.
 fn f32_pattern(n: usize, scale: f32) -> Vec<u8> {
     let mut v = Vec::with_capacity(n * 4);
@@ -69,6 +78,39 @@ fn f32_pattern(n: usize, scale: f32) -> Vec<u8> {
 }
 
 /// Build a `TQ2_0_g128` weight blob (34 bytes/block: 32B of 2-bit codes + FP16 scale).
+///
+/// CQ-14 (wave-2.5 deviation routing #7): each packed byte holds four 2-bit
+/// ternary lanes, and only `{0, 1, 2}` are valid codes — `3` (`0b11`) is
+/// reserved and rejected by `screen_ternary_codes` in
+/// `oxibonsai-model/src/weight_loaders.rs`. Pushing a raw
+/// `(state >> 33) as u8` byte directly (the previous body) lands on `0b11`
+/// in about a quarter of *lanes*, which the loader now (correctly) refuses
+/// once `screen_ternary_codes` covers the zero-copy `load_ternary_blocks`
+/// path — this fixture must never emit that pattern in the first place.
+/// Each lane is folded into `{0, 1, 2}` before packing, exactly as
+/// `crates/oxibonsai-model/src/model/types/gpu_cache.rs::tq2_pattern`
+/// already does.
+///
+/// T-07 FIX (verifier wave 3): re-pointed at
+/// `oxibonsai_testkit::gguf_fixture::Lcg::next_valid_tq2_byte`. `Lcg::new(s)`
+/// stores `s` as its state directly, so pre-adding the same golden-ratio
+/// constant this file always added before its first `next_u64()` reproduces
+/// byte-for-byte the same sequence the old hand-rolled state machine did —
+/// proven by construction (not just "functionally equivalent") and
+/// empirically confirmed on the three sibling copies of this exact function
+/// in `metal_greedy_cpu_fallback_tests.rs`, `cross_backend_determinism_tests.rs`
+/// and `generate_pipeline_tests.rs` (all re-pointed the same way, all their
+/// tests still pass unchanged). This file's own `#[cfg(all(feature =
+/// "native-cuda", any(target_os = "linux", target_os = "windows")))]` gate
+/// makes it unreachable on this session's macOS/no-CUDA host — confirmed
+/// empirically that the dependency graph does not even cross-compile today
+/// for an *unrelated*, pre-existing reason
+/// (`oxibonsai-model/src/block/types/forward.rs` calls `try_cuda_qkv`/
+/// `try_cuda_ffn` with one fewer argument than their current signatures
+/// require — not owned by this package, not touched by this session) — so
+/// this specific file's compilation is not directly re-verified here, only
+/// derived by the same byte-exact construction as its three verified
+/// siblings.
 fn tq2_0_g128_pattern(num_weights: usize, seed: u64) -> Vec<u8> {
     assert_eq!(
         num_weights % 128,
@@ -77,24 +119,25 @@ fn tq2_0_g128_pattern(num_weights: usize, seed: u64) -> Vec<u8> {
     );
     let num_blocks = num_weights / 128;
     let mut data = Vec::with_capacity(num_blocks * 34);
-    let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut lcg = Lcg::new(seed.wrapping_add(0x9E37_79B9_7F4A_7C15));
     for _ in 0..num_blocks {
         for _ in 0..32 {
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1);
-            data.push((state >> 33) as u8);
+            data.push(lcg.next_valid_tq2_byte());
         }
-        state = state
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1);
-        let scale_f32 = 0.25_f32 + ((state >> 33) as u32 as f32) / (u32::MAX as f32) * 0.5_f32;
+        let scale_f32 =
+            0.25_f32 + ((lcg.next_u64() >> 33) as u32 as f32) / (u32::MAX as f32) * 0.5_f32;
         data.extend_from_slice(&f16::from_f32(scale_f32).to_le_bytes());
     }
     data
 }
 
 /// Build a `Q1_0G128` weight blob (18 bytes/block: FP16 scale + 16B of 128 sign bits).
+///
+/// T-07 FIX (verifier wave 3): re-pointed at
+/// `oxibonsai_testkit::gguf_fixture::Lcg` (`next_u64`/`next_u8`), byte-for-byte
+/// identical to the previous hand-rolled state machine — see
+/// `tq2_0_g128_pattern`'s doc comment above for the full rationale (the same
+/// golden-ratio pre-offset makes this an exact, not approximate, match).
 fn q1_0_g128_pattern(num_weights: usize, seed: u64) -> Vec<u8> {
     assert_eq!(
         num_weights % 128,
@@ -103,18 +146,13 @@ fn q1_0_g128_pattern(num_weights: usize, seed: u64) -> Vec<u8> {
     );
     let num_blocks = num_weights / 128;
     let mut data = Vec::with_capacity(num_blocks * 18);
-    let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut lcg = Lcg::new(seed.wrapping_add(0x9E37_79B9_7F4A_7C15));
     for _ in 0..num_blocks {
-        state = state
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1);
-        let scale_f32 = 0.25_f32 + ((state >> 33) as u32 as f32) / (u32::MAX as f32) * 0.5_f32;
+        let scale_f32 =
+            0.25_f32 + ((lcg.next_u64() >> 33) as u32 as f32) / (u32::MAX as f32) * 0.5_f32;
         data.extend_from_slice(&f16::from_f32(scale_f32).to_le_bytes());
         for _ in 0..16 {
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1);
-            data.push((state >> 33) as u8);
+            data.push(lcg.next_u8());
         }
     }
     data
@@ -327,10 +365,14 @@ fn assert_cpu_cuda_agree(gguf_bytes: &[u8], prompt: &[u32], n: usize, label: &st
 /// greedy sequences must match exactly.
 #[test]
 fn cuda_ternary_short_prompt_matches_cpu_greedy_seed42() {
+    const TEST: &str =
+        "oxibonsai-runtime::cuda_cross_backend_determinism_tests::cuda_ternary_short_prompt_matches_cpu_greedy_seed42";
     if !cuda_available() {
         eprintln!("skip: no CUDA device available");
+        record_capability(Capability::Cuda, false, TEST);
         return;
     }
+    record_capability(Capability::Cuda, true, TEST);
     let gguf = build_synthetic_gguf(true);
     // 6-token prompt: well under the 16-token batch-prefill boundary.
     let prompt: Vec<u32> = vec![1, 4, 7, 10, 13, 16];
@@ -343,10 +385,14 @@ fn cuda_ternary_short_prompt_matches_cpu_greedy_seed42() {
 /// would attend over stale/zero KV for any prompt longer than 16 tokens).
 #[test]
 fn cuda_ternary_long_prompt_matches_cpu_greedy_seed42() {
+    const TEST: &str =
+        "oxibonsai-runtime::cuda_cross_backend_determinism_tests::cuda_ternary_long_prompt_matches_cpu_greedy_seed42";
     if !cuda_available() {
         eprintln!("skip: no CUDA device available");
+        record_capability(Capability::Cuda, false, TEST);
         return;
     }
+    record_capability(Capability::Cuda, true, TEST);
     let gguf = build_synthetic_gguf(true);
     // 20-token prompt: past the 16-token batch-prefill boundary.
     let prompt: Vec<u32> = (0..20u32).map(|i| (i * 7 + 3) % VOCAB as u32).collect();
@@ -359,10 +405,14 @@ fn cuda_ternary_long_prompt_matches_cpu_greedy_seed42() {
 /// need independent coverage.
 #[test]
 fn cuda_q1_short_prompt_matches_cpu_greedy_seed42() {
+    const TEST: &str =
+        "oxibonsai-runtime::cuda_cross_backend_determinism_tests::cuda_q1_short_prompt_matches_cpu_greedy_seed42";
     if !cuda_available() {
         eprintln!("skip: no CUDA device available");
+        record_capability(Capability::Cuda, false, TEST);
         return;
     }
+    record_capability(Capability::Cuda, true, TEST);
     let gguf = build_synthetic_gguf(false);
     let prompt: Vec<u32> = vec![2, 5, 9, 12, 15, 18];
     assert_cpu_cuda_agree(&gguf, &prompt, 24, "Q1 short-prompt (<=16)");
@@ -372,10 +422,14 @@ fn cuda_q1_short_prompt_matches_cpu_greedy_seed42() {
 /// fixture.
 #[test]
 fn cuda_q1_long_prompt_matches_cpu_greedy_seed42() {
+    const TEST: &str =
+        "oxibonsai-runtime::cuda_cross_backend_determinism_tests::cuda_q1_long_prompt_matches_cpu_greedy_seed42";
     if !cuda_available() {
         eprintln!("skip: no CUDA device available");
+        record_capability(Capability::Cuda, false, TEST);
         return;
     }
+    record_capability(Capability::Cuda, true, TEST);
     let gguf = build_synthetic_gguf(false);
     let prompt: Vec<u32> = (0..20u32).map(|i| (i * 11 + 5) % VOCAB as u32).collect();
     assert_cpu_cuda_agree(&gguf, &prompt, 24, "Q1 long-prompt (>=17)");

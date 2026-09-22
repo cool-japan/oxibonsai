@@ -16,7 +16,7 @@
 //! ```
 
 use crate::accuracy::{AccuracyResult, McEvaluator, McLogitEvaluator};
-use crate::dataset::McDataset;
+use crate::dataset::{McDataset, MultipleChoiceQuestion};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // ArcSplit
@@ -77,11 +77,16 @@ impl ArcEvaluator {
     /// Internal constructor shared by [`easy`](Self::easy) and
     /// [`challenge`](Self::challenge).
     fn new(split: ArcSplit) -> Self {
-        // ARC questions typically present 4 or 5 options labelled A-E.
-        // The template uses {a}..{d}; a fifth choice would be at index 4 but
-        // McEvaluator::extract_answer also handles 'E' if we extend the template.
-        // For now, use the same standard template as MMLU — callers that need
-        // five-option support can inject a custom template via McEvaluator::with_template.
+        // ARC questions present 4 *or* 5 options labelled A-E. The stored
+        // template only spells out `{a}..{d}`, but that is not a scoring
+        // limitation: `McEvaluator::evaluate_dataset` (used by
+        // `evaluate_completions` below) bounds the accepted answer letter
+        // by each question's own `q.choices.len()`, so a 5-choice item's
+        // "E" completion scores correctly (RAG-EVAL-IMG-04). For *prompt
+        // rendering*, `McEvaluator::format_question` (used by
+        // `Self::format_question` below) also appends any choice beyond
+        // the template's own `{a}..{d}` slots, so a fifth option is never
+        // silently dropped from the rendered prompt either.
         let template = "{question}\nA) {a}\nB) {b}\nC) {c}\nD) {d}\nAnswer:".to_string();
 
         Self {
@@ -98,6 +103,16 @@ impl ArcEvaluator {
     /// Which split this evaluator represents.
     pub fn split(&self) -> ArcSplit {
         self.split
+    }
+
+    /// Format an ARC item into a prompt string using the stored template.
+    ///
+    /// Delegates to [`McEvaluator::format_question`], which renders every
+    /// entry of `q.choices` — including a 5th ("E") option beyond the
+    /// template's own `{a}..{d}` slots — so building a prompt for a
+    /// 5-option ARC-Challenge item never silently loses a choice.
+    pub fn format_question(&self, q: &MultipleChoiceQuestion) -> String {
+        self.mc.format_question(q)
     }
 
     /// Evaluate by comparing model completions to answer letter choices.

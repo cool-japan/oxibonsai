@@ -11,9 +11,11 @@ use cudarc::driver::CudaSlice;
 use tracing::warn;
 
 use super::super::cuda_graph::{CudaGraph, CudaGraphError};
+use super::super::cuda_graph_slot::{CudaGraphSlotAction, CudaQuantKind};
 use super::{
-    acquire_full_layer_buffers, acquire_kv_cache, full_layer_state, get_or_build_model_weights,
-    get_or_upload_f32_weight, init_attn_modules, profiling, CuGraphHolder, CudaAttnModules,
+    acquire_full_layer_buffers, acquire_kv_cache, build_slot_key, full_layer_state,
+    get_or_build_model_weights, get_or_upload_f32_weight, get_or_upload_f32_weight_for_epoch,
+    init_attn_modules, profiling, slot_action_dropping_stale, CuGraphHolder, CudaAttnModules,
     CudaCachedLayerWeights, CudaFullForwardLayerParams, CudaFullLayerBuffers, CudaKvCache,
 };
 
@@ -123,6 +125,9 @@ pub fn encode_full_layer(
             norm_eps,
             h,
             bufs,
+            // Decode: one token in flight, its RoPE/position already uploaded
+            // into the single-token scratch slots just above (finding F9).
+            None,
         )?;
     }
 
@@ -320,6 +325,12 @@ unsafe fn encode_layer_device(
     let max_seq_u32 = bufs.max_seq as u32;
     let inv_sqrt_hd = 1.0f32 / (head_dim as f32).sqrt();
     let layer_offset = kv.layer_offset_elements(layer_idx);
+    // F9: the attention launchers take device views so the prefill path can
+    // point them at chunk-resident buffers; the decode path here always uses
+    // the single-token scratch slots.
+    let d_pos_seqlen = &bufs.d_pos_seqlen.slice(0..);
+    let d_cos = &bufs.d_cos.slice(0..);
+    let d_sin = &bufs.d_sin.slice(0..);
 
     // ── Attention sublayer ────────────────────────────────────────────────
 
@@ -353,8 +364,8 @@ unsafe fn encode_layer_device(
         &mut bufs.d_k_rope,
         &weights.q_norm,
         &weights.k_norm,
-        &bufs.d_cos,
-        &bufs.d_sin,
+        d_cos,
+        d_sin,
         nq_u32,
         nkv_u32,
         hd_u32,
@@ -374,7 +385,7 @@ unsafe fn encode_layer_device(
         hd_u32,
         nkv_u32,
         max_seq_u32,
-        &bufs.d_pos_seqlen,
+        d_pos_seqlen,
         layer_offset,
     )?;
 
@@ -390,7 +401,7 @@ unsafe fn encode_layer_device(
         nkv_u32,
         heads_per_group_u32,
         max_seq_u32,
-        &bufs.d_pos_seqlen,
+        d_pos_seqlen,
         inv_sqrt_hd,
         layer_offset,
     )?;
@@ -402,7 +413,7 @@ unsafe fn encode_layer_device(
         &mut bufs.d_scores,
         nq_u32,
         max_seq_u32,
-        &bufs.d_pos_seqlen,
+        d_pos_seqlen,
     )?;
 
     // Step 7: Weighted sum — seq_len read from d_pos_seqlen[1]
@@ -417,7 +428,7 @@ unsafe fn encode_layer_device(
         nkv_u32,
         heads_per_group_u32,
         max_seq_u32,
-        &bufs.d_pos_seqlen,
+        d_pos_seqlen,
         layer_offset,
     )?;
 
@@ -481,12 +492,22 @@ unsafe fn encode_layer_device(
 /// This eliminates ~40ms of per-kernel scheduling overhead (468 launches × ~85 µs
 /// at 300 MHz SM clock) for a projected **2× decode speedup**.
 ///
-/// # Graph validity
+/// # Graph validity (finding F-M1)
 ///
 /// The captured graph stores raw device pointers to `d_hidden`, `d_cos`,
 /// `d_sin`, `d_pos_seqlen`, `d_scores`, the KV cache, and all weight slices.
-/// `acquire_full_layer_buffers` invalidates the graph whenever buffer dimensions
-/// change (model switch), so the pointers always remain valid during replay.
+/// `acquire_full_layer_buffers` and `acquire_kv_cache` invalidate the graph
+/// whenever they reallocate, and the slot is additionally **keyed** on
+/// `(model_epoch, quant_kind, dims, weight handles)`: replay happens only on an
+/// exact key match, and a mismatch drops the holder so the exec is freed and the
+/// sequence re-captured. Without the key, `Bonsai-8B` (Q1) and
+/// `Ternary-Bonsai-8B` (TQ2) — identical dimensions, so no reallocation and no
+/// invalidation — shared one slot and the second model silently replayed the
+/// first model's weight pointers.
+///
+/// `model_epoch` and `weight_fingerprint` come from
+/// [`get_or_build_model_weights`]; they also attribute the uploaded weights for
+/// `CudaGraph::release_model_epoch` (finding F-M3).
 ///
 /// Returns the final hidden state (post-norm if `final_norm_weight` provided).
 #[allow(clippy::too_many_arguments)]
@@ -507,6 +528,8 @@ pub fn encode_full_forward(
     max_seq_len: usize,
     final_norm_weight: Option<&[f32]>,
     final_norm_handle: u64,
+    model_epoch: u64,
+    weight_fingerprint: u64,
 ) -> Result<Vec<f32>, CudaGraphError> {
     let h = hidden_size;
     let half_dim = head_dim / 2;
@@ -537,6 +560,21 @@ pub fn encode_full_forward(
         ));
     }
 
+    // F-M1: everything this capture would only be valid for.
+    let requested_key = build_slot_key(
+        CudaQuantKind::Q1G128,
+        model_epoch,
+        weight_fingerprint,
+        final_norm_handle,
+        n_layers,
+        hidden_size,
+        nq,
+        nkv,
+        head_dim,
+        max_seq_len,
+        intermediate_size,
+    );
+
     let attn_mods = init_attn_modules(graph)?;
 
     // Allocate / reuse activation buffers.
@@ -566,12 +604,21 @@ pub fn encode_full_forward(
     }
 
     // ── Fast path: replay captured CUDA graph (every token after the first) ─
+    // F-M1: only when the stored key matches this call's key. A mismatch drops
+    // the stale holder here (freeing its exec) so the slow path re-captures.
     {
-        let graph_guard = full_layer_state()
+        let mut graph_guard = full_layer_state()
             .cuda_driver_graph
             .lock()
             .map_err(|_| CudaGraphError::LockPoisoned)?;
-        if let Some(Some(ref holder)) = *graph_guard {
+        let action = slot_action_dropping_stale(&mut graph_guard, &requested_key);
+        if action == CudaGraphSlotAction::Replay {
+            let holder = graph_guard
+                .as_ref()
+                .and_then(|(_, holder)| holder.as_ref())
+                .ok_or_else(|| {
+                    CudaGraphError::DriverError("captured CUDA graph vanished".into())
+                })?;
             // Upload per-token inputs on the same stream BEFORE graph launch.
             // CUDA stream ordering ensures these H2D copies complete before the
             // first kernel node in the replayed graph begins executing.
@@ -639,7 +686,8 @@ pub fn encode_full_forward(
     // Optional final RMSNorm.
     if let Some(fnorm_data) = final_norm_weight {
         // Ensure weight is cached before capture (so capture sees only kernel launches).
-        let d_fnorm = get_or_upload_f32_weight(graph, final_norm_handle, fnorm_data)?;
+        let d_fnorm =
+            get_or_upload_f32_weight_for_epoch(graph, final_norm_handle, fnorm_data, model_epoch)?;
         unsafe {
             graph.launch_rmsnorm_pub(
                 &bufs.d_hidden,
@@ -673,16 +721,20 @@ pub fn encode_full_forward(
     // clean kernel-launch nodes and D2D memcpy nodes.
     {
         if let Ok(ref mut graph_guard) = full_layer_state().cuda_driver_graph.lock() {
-            // Only attempt capture if this is the first time (None).
-            // Some(None) means a previous attempt failed — don't retry.
-            if graph_guard.is_none() {
+            // F-M1: capture only when the slot is empty or holds a graph for a
+            // different key (in which case the stale exec is freed here).
+            // `Some((requested_key, None))` means capture already failed for
+            // THIS key — don't retry.
+            if slot_action_dropping_stale(graph_guard, &requested_key)
+                == CudaGraphSlotAction::Capture
+            {
                 let begin_ok = stream
                     .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL)
                     .is_ok();
                 if !begin_ok {
                     warn!("CUDA graph: begin_capture failed — running without graph replay");
                     // Mark as tried-but-failed so we never retry.
-                    **graph_guard = Some(None);
+                    **graph_guard = Some((requested_key, None));
                 } else {
                     // Record all layers.  Kernels are NOT executed during capture.
                     let record_ok: bool = (|| -> Result<(), CudaGraphError> {
@@ -708,8 +760,12 @@ pub fn encode_full_forward(
                         }
                         // Record final norm if present (weight already cached).
                         if let Some(fnorm_data) = final_norm_weight {
-                            let d_fnorm =
-                                get_or_upload_f32_weight(graph, final_norm_handle, fnorm_data)?;
+                            let d_fnorm = get_or_upload_f32_weight_for_epoch(
+                                graph,
+                                final_norm_handle,
+                                fnorm_data,
+                                model_epoch,
+                            )?;
                             unsafe {
                                 graph.launch_rmsnorm_pub(
                                     &bufs.d_hidden,
@@ -759,7 +815,7 @@ pub fn encode_full_forward(
                                     };
                                     match unsafe { holder.upload() } {
                                         Ok(()) => {
-                                            **graph_guard = Some(Some(holder));
+                                            **graph_guard = Some((requested_key, Some(holder)));
                                             tracing::debug!(
                                                 "CUDA graph captured and uploaded successfully"
                                             );
@@ -768,7 +824,7 @@ pub fn encode_full_forward(
                                             warn!(
                                                 "CUDA graph upload failed: {e} — disabling replay"
                                             );
-                                            **graph_guard = Some(None);
+                                            **graph_guard = Some((requested_key, None));
                                         }
                                     }
                                 }
@@ -778,17 +834,17 @@ pub fn encode_full_forward(
                                         let _ =
                                             cudarc::driver::result::graph::destroy(cu_graph_raw);
                                     }
-                                    **graph_guard = Some(None);
+                                    **graph_guard = Some((requested_key, None));
                                 }
                             }
                         }
                         Ok(_) => {
                             warn!("CUDA graph: end_capture returned no graph — disabling replay");
-                            **graph_guard = Some(None);
+                            **graph_guard = Some((requested_key, None));
                         }
                         Err(e) => {
                             warn!("CUDA graph: end_capture error: {e} — disabling replay");
-                            **graph_guard = Some(None);
+                            **graph_guard = Some((requested_key, None));
                         }
                     }
                 }
@@ -830,7 +886,9 @@ pub fn try_cuda_full_forward(
     let _t0 = profiling().then(std::time::Instant::now);
 
     // Retrieve or build the cached model weights (O(1) Arc clones on warm path).
-    let (graph, layer_weights) = get_or_build_model_weights(layer_params)?;
+    let resolved = get_or_build_model_weights(layer_params)?;
+    let graph = resolved.graph;
+    let layer_weights = resolved.layers;
 
     let _t1 = profiling().then(std::time::Instant::now);
     if profiling() {
@@ -857,6 +915,8 @@ pub fn try_cuda_full_forward(
         max_seq_len,
         final_norm_bytes,
         final_norm_handle,
+        resolved.model_epoch,
+        resolved.weight_fingerprint,
     );
     if profiling() {
         let elapsed = _t1.expect("profiling").elapsed().as_secs_f64() * 1000.0;

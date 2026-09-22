@@ -67,12 +67,13 @@ const SUFFIX_BIASES: &str = ".biases";
 
 /// Reinterpret a bfloat16 bit pattern as `f32`.
 ///
-/// bfloat16 is the top 16 bits of an IEEE-754 `f32`, so the conversion is an
-/// exact left-shift by 16 with no rounding.
-#[inline]
-pub fn bf16_to_f32(bits: u16) -> f32 {
-    f32::from_bits((bits as u32) << 16)
-}
+/// Re-exports the single canonical implementation in
+/// [`oxibonsai_core::bf16::bf16_to_f32`] (K-12 bf16 hoist / FIX3-GGUF-WRITE
+/// item 4), replacing this module's former independent copy of the
+/// identical bit-manipulation (`f32::from_bits((bits as u32) << 16)`). Kept
+/// `pub` (unchanged visibility) even though nothing outside this crate
+/// currently imports it by this path.
+pub use oxibonsai_core::bf16::bf16_to_f32;
 
 /// Dequantize one MLX 4-bit packed-affine linear into a row-major `[out * in]`
 /// f32 buffer.
@@ -95,7 +96,7 @@ pub fn dequantize_mlx_4bit_affine(
     out_features: usize,
     in_features: usize,
 ) -> TeResult<Vec<f32>> {
-    if in_features == 0 || in_features % GROUP_SIZE != 0 {
+    if in_features == 0 || !in_features.is_multiple_of(GROUP_SIZE) {
         return Err(TeError::Shape(format!(
             "mlx4bit dequant: in_features ({in_features}) must be a positive multiple of {GROUP_SIZE}"
         )));
@@ -337,7 +338,7 @@ impl Mlx4bitModel {
     /// is not a positive multiple of 64, if the on-disk `in_features` disagrees
     /// with `cols`, or if any requested row index is `>= out_features`.
     pub fn gather_quant_rows(&self, base: &str, rows: &[usize], cols: usize) -> TeResult<Vec<f32>> {
-        if cols == 0 || cols % GROUP_SIZE != 0 {
+        if cols == 0 || !cols.is_multiple_of(GROUP_SIZE) {
             return Err(TeError::Shape(format!(
                 "mlx4bit gather: cols ({cols}) must be a positive multiple of {GROUP_SIZE}"
             )));
@@ -526,6 +527,27 @@ mod tests {
     fn bf16_to_f32_exact_for_representable() {
         for &v in &[0.0f32, 1.0, -1.0, 0.5, -0.0625, 2000.0, 0.125] {
             assert_eq!(bf16_to_f32(f32_to_bf16(v)), v, "value {v}");
+        }
+    }
+
+    /// FIX3-GGUF-WRITE item 4: the now-shared `bf16_to_f32`
+    /// (`oxibonsai_core::bf16::bf16_to_f32`) must agree with this module's
+    /// former local expression over the entire `u16` domain — every
+    /// subnormal, both zeros, every infinity and every NaN payload.
+    /// Compared by `to_bits()`: under IEEE `==`, `NaN != NaN` (two
+    /// genuinely-agreeing NaN outputs would look like a mismatch) and
+    /// `-0.0 == 0.0` (a real sign-of-zero mismatch would look like
+    /// agreement).
+    #[test]
+    fn bf16_to_f32_matches_the_former_local_expression_across_the_full_u16_domain() {
+        for bits in 0u16..=0xFFFF {
+            let shared = bf16_to_f32(bits);
+            let former_local_expression = f32::from_bits((bits as u32) << 16);
+            assert_eq!(
+                shared.to_bits(),
+                former_local_expression.to_bits(),
+                "mismatch for bf16 bit pattern {bits:#06x}"
+            );
         }
     }
 

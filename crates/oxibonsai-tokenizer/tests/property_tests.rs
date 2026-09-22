@@ -4,7 +4,8 @@
 //! must hold for every valid UTF-8 input — not just the hand-crafted ones.
 
 use oxibonsai_tokenizer::{
-    bpe_encode, byte_fallback_id, pretokenize, BpeMerges, OxiTokenizer, TokenizerConfig, Vocabulary,
+    bpe_encode, byte_fallback_id, bytes_to_unicode_map, pretokenize, BpeMerges, OxiTokenizer,
+    TokenizerConfig, Vocabulary,
 };
 use proptest::prelude::*;
 
@@ -29,6 +30,42 @@ fn encode_bytes_direct(s: &str) -> Vec<u32> {
     s.bytes().map(|b| 4 + b as u32).collect()
 }
 
+// ── Fixture: byte-level BPE tokenizer with REAL merge rules ─────────────────
+//
+// T-10: `decode_encode_roundtrip_utf8` above is synthetic-only in a second
+// sense beyond not touching a real `models/tokenizer.json` — its
+// `BpeMerges::new()` is empty, so it never runs a single merge round; every
+// input takes the trivial per-byte-fallback path. This fixture is the same
+// full 0..=255 ByteLevel vocabulary (`bytes_to_unicode_map`, matching
+// `crates/oxibonsai-tokenizer/tests/native_bpe_fidelity_tests.rs`'s own
+// production-shaped fixture) but with real, chained merge rules over
+// printable ASCII (`bytes_to_unicode_map`'s GPT-2 scheme keeps printable
+// ASCII bytes — including 'a'..'d' — mapped to themselves, so plain ASCII
+// merge rules are valid byte-level merge rules), so arbitrary UTF-8 that
+// happens to contain "ab"/"cd"/"abcd" substrings actually exercises
+// `bpe_merge_symbols`'s merge loop before the round-trip is checked.
+fn byte_level_bpe_tokenizer_with_merges() -> OxiTokenizer {
+    let table = bytes_to_unicode_map();
+    let mut vocab = Vocabulary::new();
+    for b in 0u16..=255 {
+        vocab.insert(&table[b as usize].to_string(), u32::from(b));
+    }
+    // Chained two levels deep, mirroring
+    // `native_bpe_fidelity_tests.rs::qwen3_fixture_json`'s
+    // `["a b", "c d", "ab cd"]` merge table.
+    let mut merges = BpeMerges::new();
+    merges.add_merge("a", "b", 300);
+    merges.add_merge("c", "d", 301);
+    merges.add_merge("ab", "cd", 302);
+    vocab.insert("ab", 300);
+    vocab.insert("cd", 301);
+    vocab.insert("abcd", 302);
+
+    let mut config = TokenizerConfig::default();
+    config.byte_level_decode = true;
+    OxiTokenizer::new(vocab, merges, config)
+}
+
 // ── Properties ───────────────────────────────────────────────────────────────
 
 proptest! {
@@ -43,6 +80,21 @@ proptest! {
         prop_assume!(s.len() <= 256);
 
         let ids = encode_bytes_direct(&s);
+        let decoded = tok.decode(&ids).expect("decode should succeed");
+        prop_assert_eq!(decoded, s);
+    }
+
+    /// T-10: the same round-trip property, through `OxiTokenizer::encode`
+    /// itself (not a hand-built byte-fallback id list) on a tokenizer with
+    /// real merge rules — see [`byte_level_bpe_tokenizer_with_merges`]. A
+    /// byte-level BPE tokenizer's round-trip guarantee must hold regardless
+    /// of *how many* merge rounds ran, since `decode` only ever reassembles
+    /// the underlying bytes of whichever tokens `encode` chose.
+    #[test]
+    fn decode_encode_roundtrip_utf8_with_real_bpe_merges(s in "\\PC{0,64}") {
+        prop_assume!(s.len() <= 256);
+        let tok = byte_level_bpe_tokenizer_with_merges();
+        let ids = tok.encode(&s).expect("encode should succeed");
         let decoded = tok.decode(&ids).expect("decode should succeed");
         prop_assert_eq!(decoded, s);
     }

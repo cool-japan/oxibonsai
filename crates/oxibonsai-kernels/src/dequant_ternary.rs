@@ -1,9 +1,16 @@
 //! Reference (naive) dequantization kernels for ternary TQ2\_0\_g128 and TQ2\_0 formats.
 //!
 //! These are the correctness reference implementations — pure scalar Rust,
-//! no SIMD, no unsafe. Each 2-bit code maps as: `00→-1`, `01→0`, `10→+1`, `11→0` (reserved).
+//! no SIMD, no unsafe. Each 2-bit code maps as: `00→-1`, `01→0`, `10→+1`,
+//! `11→0` (reserved), via the single shared
+//! [`oxibonsai_core::ternary_code_to_i8`] table (K-01): every NEON/AVX2/
+//! AVX-512 ternary kernel in this crate, plus `BlockTQ2_0_g128::dequant` /
+//! `ternary_decode` and `BlockTQ2_0::dequant` in `oxibonsai-core`, route
+//! through that same table, so this format's decode cannot drift across the
+//! two crates or across kernel tiers. `tests/ternary_cross_tier.rs` asserts
+//! the whole matrix agrees.
 
-use oxibonsai_core::{BlockTQ2_0, BlockTQ2_0_g128, QK_TQ2_0, QK_TQ2_0_G128};
+use oxibonsai_core::{ternary_code_to_i8, BlockTQ2_0, BlockTQ2_0_g128, QK_TQ2_0, QK_TQ2_0_G128};
 
 use crate::error::{KernelError, KernelResult};
 
@@ -13,16 +20,11 @@ use crate::error::{KernelError, KernelResult};
 
 /// Decode a single 2-bit ternary code at `lane` (0..4) in `byte` to f32.
 ///
-/// Code map: `0b00→-1.0`, `0b01→0.0`, `0b10→+1.0`, `0b11→0.0` (reserved).
+/// Code map: `0b00→-1.0`, `0b01→0.0`, `0b10→+1.0`, `0b11→0.0` (reserved),
+/// via the shared [`ternary_code_to_i8`] table (K-01).
 #[inline]
 fn decode_code_f32(byte: u8, lane: usize) -> f32 {
-    let code = (byte >> (lane * 2)) & 0b11;
-    match code {
-        0b00 => -1.0_f32,
-        0b01 => 0.0_f32,
-        0b10 => 1.0_f32,
-        _ => 0.0_f32, // 0b11 reserved → zero
-    }
+    ternary_code_to_i8(byte >> (lane * 2)) as f32
 }
 
 // ---------------------------------------------------------------------------
@@ -42,10 +44,11 @@ fn decode_code_f32(byte: u8, lane: usize) -> f32 {
 pub fn dequant_tq2_0_g128(blocks: &[BlockTQ2_0_g128], output: &mut [f32]) -> KernelResult<()> {
     let needed = blocks.len() * QK_TQ2_0_G128;
     if output.len() < needed {
-        return Err(KernelError::BufferTooSmall {
+        return Err(KernelError::buffer_too_small(
+            "output",
             needed,
-            available: output.len(),
-        });
+            output.len(),
+        ));
     }
 
     for (bi, block) in blocks.iter().enumerate() {
@@ -78,10 +81,11 @@ pub fn dequant_tq2_0_g128(blocks: &[BlockTQ2_0_g128], output: &mut [f32]) -> Ker
 pub fn dequant_tq2_0(blocks: &[BlockTQ2_0], output: &mut [f32]) -> KernelResult<()> {
     let needed = blocks.len() * QK_TQ2_0;
     if output.len() < needed {
-        return Err(KernelError::BufferTooSmall {
+        return Err(KernelError::buffer_too_small(
+            "output",
             needed,
-            available: output.len(),
-        });
+            output.len(),
+        ));
     }
 
     for (bi, block) in blocks.iter().enumerate() {

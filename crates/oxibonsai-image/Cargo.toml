@@ -36,15 +36,37 @@ native-cuda = ["oxibonsai-kernels/native-cuda"]
 [dependencies]
 oxibonsai-core.workspace = true
 oxibonsai-kernels.workspace = true
+# TOK-10: `te::tokenizer::Qwen3Tokenizer` used to carry its own byte-for-byte
+# duplicate of the GPT-2 byte-level BPE pipeline (`pre_tokenize`,
+# `match_contraction`, `Qwen3Tokenizer::bpe`, `build_byte_to_unicode`,
+# `parse_merge`) rather than depending on this crate's canonical
+# implementation, so this crate's own pre-tokenizer fixes (TOK-03's
+# fancy-regex `Split` engine) never propagated here. Wired in wave 2 once
+# `oxibonsai-tokenizer`'s rewrite landed (see B2-08 wave-1/wave-1.5
+# addenda), so the duplication is removed instead of merely documented.
+oxibonsai-tokenizer.workspace = true
 half.workspace = true
 thiserror.workspace = true
 memmap2.workspace = true
 safetensors.workspace = true
 oxiarc-deflate.workspace = true
 crc32fast.workspace = true
+# Consumed by `te::config::ManifestOverrides`'s `#[derive(Deserialize)]`
+# (te/config.rs). A future "unused dependency" sweep (cargo-machete etc.) must
+# not remove this again: it looks unused only because the sole `use
+# serde::Deserialize;` call site is one derive attribute deep in a single file.
 serde.workspace = true
 serde_json.workspace = true
+# Consumed only by the `tracing::warn!` one-time GPU->CPU fallback diagnostics
+# in `session.rs`-adjacent GPU modules (`te/forward.rs`, `vae/gpu.rs`,
+# `vae/cuda_gpu.rs`, `cuda_gpu.rs`), which are themselves `#[cfg(all(feature =
+# "metal", target_os = "macos"))]` / `#[cfg(all(feature = "native-cuda", ...))]`
+# gated. A default-feature build therefore has zero unconditional `tracing::`
+# call sites, which is exactly the shape that got `serde` (above) flagged as
+# "unused" by a naive sweep — do not repeat that mistake for this entry either.
+tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 oxibonsai-kernels.workspace = true
+oxibonsai-testkit.workspace = true

@@ -18,6 +18,13 @@ mod cuda_tq2 {
     use half::f16;
     use oxibonsai_core::BlockTQ2_0_g128;
     use oxibonsai_kernels::gemv_ternary::gemv_tq2_0_g128;
+    use oxibonsai_testkit::capability::{record as record_capability, Capability};
+
+    // ── T-05 capability-report producer ──────────────────────────────────
+    //
+    // T-07 FIX (verifier wave 3): this used to be an inline copy of
+    // `oxibonsai_testkit::capability::record` (see `metal_k_quant_gemv_parity.rs`'s
+    // former copy for the historical rationale); now imported directly above.
     use oxibonsai_kernels::CudaGraph;
 
     /// Deterministic ternary blocks: vary qs codes (covering 0,1,2,3) and the
@@ -51,7 +58,7 @@ mod cuda_tq2 {
         unsafe { std::slice::from_raw_parts(ptr, len) }
     }
 
-    fn run_case(n_rows: usize, k: usize, handle_id: u64) {
+    fn run_case(n_rows: usize, k: usize, handle_id: u64, test_name: &str) {
         let blocks_per_row = k / 128;
         let blocks = make_blocks(n_rows, blocks_per_row);
         let input: Vec<f32> = (0..k).map(|i| (i as f32) * 0.001 - 0.3).collect();
@@ -65,9 +72,11 @@ mod cuda_tq2 {
             Ok(g) => g,
             Err(e) => {
                 eprintln!("no CUDA device ({e}) — skipping case n_rows={n_rows} k={k}");
+                record_capability(Capability::Cuda, false, test_name);
                 return;
             }
         };
+        record_capability(Capability::Cuda, true, test_name);
         let cuda = graph
             .encode_lm_head_gemv_tq2(&input, handle_id, aos_bytes(&blocks), n_rows, k)
             .expect("cuda gemv");
@@ -102,18 +111,33 @@ mod cuda_tq2 {
     /// Real-8B inner dimension (hidden=4096 → 32 blocks/row).
     #[test]
     fn cuda_tq2_gemv_parity_k4096() {
-        run_case(512, 4096, 0xDEAD_0001);
+        run_case(
+            512,
+            4096,
+            0xDEAD_0001,
+            "oxibonsai-kernels::cuda_tq2_gemv_parity::cuda_tq2_gemv_parity_k4096",
+        );
     }
 
     /// Small shape (k=256 → 2 blocks/row), like the Metal unit test.
     #[test]
     fn cuda_tq2_gemv_parity_k256() {
-        run_case(64, 256, 0xDEAD_0002);
+        run_case(
+            64,
+            256,
+            0xDEAD_0002,
+            "oxibonsai-kernels::cuda_tq2_gemv_parity::cuda_tq2_gemv_parity_k256",
+        );
     }
 
     /// 1.7B-ish inner dim (hidden=2048 → 16 blocks/row).
     #[test]
     fn cuda_tq2_gemv_parity_k2048() {
-        run_case(256, 2048, 0xDEAD_0003);
+        run_case(
+            256,
+            2048,
+            0xDEAD_0003,
+            "oxibonsai-kernels::cuda_tq2_gemv_parity::cuda_tq2_gemv_parity_k2048",
+        );
     }
 }

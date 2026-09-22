@@ -1,52 +1,72 @@
 //! `oxibonsai image` and `oxibonsai repl` — text-to-image generation
 //! (single-shot and interactive REPL variants).
+//!
+//! deps-08 / RAG-EVAL-IMG-02: model paths never default to `/tmp` (a
+//! world-writable directory — a shipped binary whose default is to load
+//! model weights from a predictable world-writable path lets any local
+//! user pre-plant a file there and have it silently loaded as weights).
+//! Resolution is `--flag` → env var → a path under this process's own
+//! data directory (if it already exists) → a hard error naming every
+//! source checked.
 
 use std::path::{Path, PathBuf};
 
 use super::repl;
-use super::util::read_prompt_stdin;
+use super::util::{oxibonsai_data_dir, read_prompt_stdin};
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn run_image(
-    prompt: String,
-    out: String,
-    seed: u64,
-    steps: usize,
-    width: usize,
-    height: usize,
+/// Resolve a required model path: `--flag` → the first set env var → a
+/// path under [`oxibonsai_data_dir`] IF it already exists on disk →
+/// error naming every source that was checked. Never falls back to a
+/// hardcoded absolute path, and never to `/tmp`.
+fn resolve_required_path(
+    arg: Option<String>,
+    env_names: &[&str],
+    default_relative: &str,
+    flag_name: &str,
+) -> anyhow::Result<String> {
+    if let Some(v) = arg.filter(|s| !s.is_empty()) {
+        return Ok(v);
+    }
+    for env_name in env_names {
+        if let Ok(v) = std::env::var(env_name) {
+            if !v.is_empty() {
+                return Ok(v);
+            }
+        }
+    }
+    let default_path = oxibonsai_data_dir().join(default_relative);
+    if default_path.exists() {
+        return Ok(default_path.to_string_lossy().into_owned());
+    }
+    anyhow::bail!(
+        "no path for {flag_name}: pass {flag_name} <path>, set env {} (never a hardcoded \
+         default, and never /tmp — see deps-08), or place the weights at {}",
+        env_names.join(" or "),
+        default_path.display()
+    );
+}
+
+/// Resolve the DiT / VAE / TE / tokenizer paths shared by `image` and
+/// `repl`.
+struct ResolvedImagePaths {
+    dit_path: String,
+    vae_path: String,
+    te_source: oxibonsai_image::pipeline::TeSource,
+    tokenizer_dir: PathBuf,
+}
+
+fn resolve_image_paths(
     dit: Option<String>,
     vae: Option<String>,
     te: Option<String>,
     tokenizer: Option<String>,
-) -> anyhow::Result<()> {
-    use oxibonsai_image::pipeline::{text_to_image, TeSource, TextToImageCfg};
+) -> anyhow::Result<ResolvedImagePaths> {
+    use oxibonsai_image::pipeline::TeSource;
 
-    let prompt_text = if prompt == "-" {
-        read_prompt_stdin()
-    } else {
-        prompt
-    };
-
-    // Resolve paths: explicit arg → env → default.
-    let resolve = |arg: Option<String>, env: &str, default: &str| -> String {
-        arg.or_else(|| std::env::var(env).ok().filter(|s| !s.is_empty()))
-            .unwrap_or_else(|| default.to_string())
-    };
-
-    let dit_path = resolve(dit, "OXI_DIT_GGUF", "/tmp/parity.gguf");
-    let vae_path = resolve(vae, "OXI_VAE_WEIGHTS", "/tmp/bonsai_golden/vae/weights");
-
-    // TE source: a `.safetensors` path → 4-bit MLX loader; otherwise a
-    // directory of f32 `.npy` dumps. Resolution order: --te → OXI_TE_4BIT
-    // → OXI_TE_WEIGHTS → default npy dir.
-    let te_path = te
-        .or_else(|| std::env::var("OXI_TE_4BIT").ok().filter(|s| !s.is_empty()))
-        .or_else(|| {
-            std::env::var("OXI_TE_WEIGHTS")
-                .ok()
-                .filter(|s| !s.is_empty())
-        })
-        .unwrap_or_else(|| "/tmp/bonsai_golden/te/weights".to_string());
+    let dit_path = resolve_required_path(dit, &["OXI_DIT_GGUF"], "models/dit.gguf", "--dit")?;
+    let vae_path = resolve_required_path(vae, &["OXI_VAE_WEIGHTS"], "models/vae", "--vae")?;
+    let te_path =
+        resolve_required_path(te, &["OXI_TE_4BIT", "OXI_TE_WEIGHTS"], "models/te", "--te")?;
     let te_source = if te_path.ends_with(".safetensors") {
         TeSource::Mlx4bit(PathBuf::from(&te_path))
     } else {
@@ -54,8 +74,13 @@ pub(crate) fn run_image(
     };
 
     // Tokenizer dir: --tokenizer → OXI_TE_TOKENIZER_DIR → the TE dir
-    // (its parent if the TE is a safetensors file).
+    // (its parent if the TE is a safetensors file). Unlike the three
+    // paths above, this one legitimately defaults relative to an
+    // already-resolved, user-supplied path rather than a fixed location,
+    // so it keeps its own (non-/tmp) fallback instead of
+    // `resolve_required_path`.
     let tokenizer_dir = tokenizer
+        .filter(|s| !s.is_empty())
         .or_else(|| {
             std::env::var("OXI_TE_TOKENIZER_DIR")
                 .ok()
@@ -71,6 +96,37 @@ pub(crate) fn run_image(
             }
         });
 
+    Ok(ResolvedImagePaths {
+        dit_path,
+        vae_path,
+        te_source,
+        tokenizer_dir,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_image(
+    prompt: String,
+    out: String,
+    seed: u64,
+    steps: usize,
+    width: usize,
+    height: usize,
+    dit: Option<String>,
+    vae: Option<String>,
+    te: Option<String>,
+    tokenizer: Option<String>,
+) -> anyhow::Result<()> {
+    use oxibonsai_image::pipeline::{text_to_image, TextToImageCfg};
+
+    let prompt_text = if prompt == "-" {
+        read_prompt_stdin()?
+    } else {
+        prompt
+    };
+
+    let paths = resolve_image_paths(dit, vae, te, tokenizer)?;
+
     let cfg = TextToImageCfg {
         prompt: prompt_text,
         seed,
@@ -82,10 +138,10 @@ pub(crate) fn run_image(
         // reserved field can never change the output — see
         // `TextToImageCfg::guidance`'s doc comment.
         guidance: 1.0,
-        dit_gguf: PathBuf::from(&dit_path),
-        vae_weights_dir: PathBuf::from(&vae_path),
-        te_source,
-        tokenizer_dir,
+        dit_gguf: PathBuf::from(&paths.dit_path),
+        vae_weights_dir: PathBuf::from(&paths.vae_path),
+        te_source: paths.te_source,
+        tokenizer_dir: paths.tokenizer_dir,
         golden_override: None,
     };
 
@@ -94,7 +150,7 @@ pub(crate) fn run_image(
         steps,
         width,
         height,
-        dit = %dit_path,
+        dit = %paths.dit_path,
         "starting text-to-image generation"
     );
 
@@ -131,47 +187,9 @@ pub(crate) fn run_repl(
     te: Option<String>,
     tokenizer: Option<String>,
 ) -> anyhow::Result<()> {
-    use oxibonsai_image::pipeline::TeSource;
     use oxibonsai_image::RenderParams;
 
-    // Same resolution as `image`: explicit arg → env → default.
-    let resolve = |arg: Option<String>, env: &str, default: &str| -> String {
-        arg.or_else(|| std::env::var(env).ok().filter(|s| !s.is_empty()))
-            .unwrap_or_else(|| default.to_string())
-    };
-
-    let dit_path = resolve(dit, "OXI_DIT_GGUF", "/tmp/parity.gguf");
-    let vae_path = resolve(vae, "OXI_VAE_WEIGHTS", "/tmp/bonsai_golden/vae/weights");
-
-    let te_path = te
-        .or_else(|| std::env::var("OXI_TE_4BIT").ok().filter(|s| !s.is_empty()))
-        .or_else(|| {
-            std::env::var("OXI_TE_WEIGHTS")
-                .ok()
-                .filter(|s| !s.is_empty())
-        })
-        .unwrap_or_else(|| "/tmp/bonsai_golden/te/weights".to_string());
-    let te_source = if te_path.ends_with(".safetensors") {
-        TeSource::Mlx4bit(PathBuf::from(&te_path))
-    } else {
-        TeSource::NpyDir(PathBuf::from(&te_path))
-    };
-
-    let tokenizer_dir = tokenizer
-        .or_else(|| {
-            std::env::var("OXI_TE_TOKENIZER_DIR")
-                .ok()
-                .filter(|s| !s.is_empty())
-        })
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let p = PathBuf::from(&te_path);
-            if te_path.ends_with(".safetensors") {
-                p.parent().map(Path::to_path_buf).unwrap_or(p)
-            } else {
-                p
-            }
-        });
+    let paths = resolve_image_paths(dit, vae, te, tokenizer)?;
 
     let params = RenderParams {
         prompt: String::new(),
@@ -180,13 +198,13 @@ pub(crate) fn run_repl(
         width,
         height,
     };
-    let paths = repl::ReplPaths {
-        dit: dit_path,
-        vae: vae_path,
-        te_source,
-        tokenizer_dir,
+    let repl_paths = repl::ReplPaths {
+        dit: paths.dit_path,
+        vae: paths.vae_path,
+        te_source: paths.te_source,
+        tokenizer_dir: paths.tokenizer_dir,
     };
-    repl::run(paths, params, !cpu_te)?;
+    repl::run(repl_paths, params, !cpu_te)?;
 
     Ok(())
 }

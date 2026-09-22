@@ -3,6 +3,10 @@
 //! Covers [`ConsistentHashRing`], [`NodeRegistry`], [`DistributedCoordinator`],
 //! and the [`fnv1a_hash`] helper.
 
+// The `distributed` module is only compiled with the `server` feature, so this
+// integration test must be gated the same way to keep `--no-default-features` green.
+#![cfg(feature = "server")]
+
 use oxibonsai_runtime::distributed::{
     fnv1a_hash, ConsistentHashRing, CoordinatorConfig, DistributedCoordinator, NodeInfo,
     NodeRegistry,

@@ -27,7 +27,7 @@ use super::kernel_sources::{
     MSL_GEMV_Q2K_V1, MSL_GEMV_Q3K_V1, MSL_GEMV_Q4K_V1, MSL_GEMV_Q5K_V1, MSL_GEMV_Q6K_V1,
     MSL_GEMV_Q8K_V1,
 };
-use super::metal_graph::MetalGraphError;
+use super::metal_graph::{commit_and_wait, MetalGraphError};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Constants
@@ -128,6 +128,35 @@ fn clone_err(e: &MetalGraphError) -> MetalGraphError {
         MetalGraphError::EncodingFailed(s) => MetalGraphError::EncodingFailed(s.clone()),
         MetalGraphError::ExecutionFailed(s) => MetalGraphError::ExecutionFailed(s.clone()),
         MetalGraphError::InvalidDimensions(s) => MetalGraphError::InvalidDimensions(s.clone()),
+        MetalGraphError::CommandBufferFailed {
+            what,
+            status,
+            error,
+        } => MetalGraphError::CommandBufferFailed {
+            what,
+            status: *status,
+            error: error.clone(),
+        },
+        MetalGraphError::BufferTooLarge {
+            what,
+            requested,
+            max,
+        } => MetalGraphError::BufferTooLarge {
+            what,
+            requested: *requested,
+            max: *max,
+        },
+        // FIX-06 / MET-02: `MetalGraphError` gained a typed
+        // `WeightKindMismatch` variant, and this hand-written clone is an
+        // exhaustive match, so it must name it. See the package deviations:
+        // all four copies of `clone_err` should be replaced by a `Clone`
+        // derive on `MetalGraphError` itself.
+        MetalGraphError::WeightKindMismatch { expected, found } => {
+            MetalGraphError::WeightKindMismatch {
+                expected: *expected,
+                found: *found,
+            }
+        }
     }
 }
 
@@ -292,7 +321,7 @@ fn dispatch_k_quant_gemv(
     format: &str,
 ) -> Result<(), MetalGraphError> {
     // ── Validate dimensions ─────────────────────────────────────────────────
-    if k == 0 || k % QK_K != 0 {
+    if k == 0 || !k.is_multiple_of(QK_K) {
         return Err(MetalGraphError::EncodingFailed(format!(
             "{format} GEMV: k = {k} must be a non-zero multiple of {QK_K}"
         )));
@@ -372,8 +401,7 @@ fn dispatch_k_quant_gemv(
     encoder.dispatch_thread_groups(grid, tg_size);
     encoder.end_encoding();
 
-    cmd.commit();
-    cmd.wait_until_completed();
+    commit_and_wait(cmd, "metal_gemv_k_quant")?;
 
     // ── Read output back ────────────────────────────────────────────────────
     unsafe {
@@ -391,6 +419,8 @@ fn dispatch_k_quant_gemv(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use half::f16;
+    use oxibonsai_core::{BlockQ2K, BlockQ3K, BlockQ4K, BlockQ5K, BlockQ6K};
 
     #[test]
     fn block_size_constants_match_core() {
@@ -413,5 +443,331 @@ mod tests {
         let input = vec![0.0f32; 255];
         let mut output = vec![0.0f32; 1];
         assert!(metal_gemv_q4k(&blocks, &input, &mut output, 1, 255).is_err());
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // MSL-side golden blocks (`core-gguf-K0` / `KQUANT-CPU-fallout`)
+    //
+    // The parity tests in `tests/metal_k_quant_gemv_parity.rs` compare a GPU
+    // row sum against the CPU row sum under a relative tolerance. That hid the
+    // Q6_K half of this bug at rel = 0.0119 for months. The tests below pin the
+    // *individual dequantized weights* the MSL kernels produce, so a kernel
+    // edit that re-breaks the ggml block walk fails loudly instead of drifting
+    // inside a tolerance.
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// 8-byte-aligned byte buffer so `slice_from_bytes` can reinterpret it.
+    #[repr(C, align(8))]
+    struct Aligned<const N: usize>([u8; N]);
+
+    /// Signature shared by the six public `metal_gemv_q*` entry points.
+    type GemvFn = fn(&[u8], &[f32], &mut [f32], usize, usize) -> Result<(), MetalGraphError>;
+
+    /// Recover all 256 dequantized weights of one super-block **from the GPU**,
+    /// in a single dispatch.
+    ///
+    /// Row `r` of a `256 x 65536` weight matrix holds `golden` at block slot `r`
+    /// and all-zero blocks everywhere else — an all-zero block has `d = 0`, so
+    /// it dequantizes to 256 exact zeros in every K-quant format. The input is
+    /// the concatenation of 256 one-hot vectors (`x[b * 256 + i] = (i == b)`),
+    /// hence
+    ///
+    /// ```text
+    /// out[r] = Σ_b Σ_i y_b[i] · x[b·256 + i] = y_golden[r]
+    /// ```
+    ///
+    /// i.e. the kernel's own value for element `r`, surrounded only by exact
+    /// zero terms. Returns `None` when the host has no Metal device.
+    fn gpu_dequant_block(gemv: GemvFn, golden: &[u8]) -> Option<Vec<f32>> {
+        let block_bytes = golden.len();
+        let k = QK_K * QK_K;
+        let mut blocks = vec![0u8; QK_K * QK_K * block_bytes];
+        for r in 0..QK_K {
+            let off = (r * QK_K + r) * block_bytes;
+            blocks[off..off + block_bytes].copy_from_slice(golden);
+        }
+        let mut input = vec![0.0f32; k];
+        for b in 0..QK_K {
+            input[b * QK_K + b] = 1.0;
+        }
+        let mut out = vec![0.0f32; QK_K];
+        match gemv(&blocks, &input, &mut out, QK_K, k) {
+            Ok(()) => Some(out),
+            Err(e) if e.to_string().contains("no Metal-capable GPU device") => None,
+            Err(e) => panic!("Metal K-quant golden probe failed: {e}"),
+        }
+    }
+
+    /// Element-wise comparison against a golden row. The tolerance is only a
+    /// guard against f32 noise in the (exact) zero accumulation — every layout
+    /// error moves a value by O(1).
+    fn assert_elementwise(label: &str, got: &[f32], want: &[f32]) {
+        assert_eq!(got.len(), want.len(), "{label}: length mismatch");
+        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            let tol = 1e-5f32 * w.abs().max(1.0);
+            assert!(
+                (g - w).abs() <= tol,
+                "{label}: element {i}: gpu {g} != golden {w}"
+            );
+        }
+    }
+
+    /// Deterministic byte stream for the dense blocks (no `rand` dependency).
+    fn lcg_bytes(n: usize, seed: u64) -> Vec<u8> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (s >> 33) as u8
+            })
+            .collect()
+    }
+
+    /// GPU decode of `golden` vs. the byte-exact CPU reference decode of the
+    /// same bytes — `BlockQ*K::dequant` is this package's normative oracle.
+    macro_rules! assert_gpu_matches_cpu_reference {
+        ($label:literal, $blk:ty, $metal:path, $bytes:expr) => {{
+            let buf = $bytes;
+            let Some(gpu) = gpu_dequant_block($metal, &buf.0) else {
+                return;
+            };
+            let blocks = <$blk>::slice_from_bytes(&buf.0).expect("aligned block parses");
+            assert_eq!(blocks.len(), 1);
+            let mut cpu = vec![0.0f32; QK_K];
+            <$blk>::dequant(blocks, &mut cpu).expect("cpu dequant");
+            assert_elementwise($label, &gpu, &cpu);
+            gpu
+        }};
+    }
+
+    // ── Q2_K ───────────────────────────────────────────────────────────────
+
+    /// `d = 0.5`, `dmin = 0.25`, `scales[0] = 0x12` (sc 2, mn 1),
+    /// `scales[1] = 0x31` (sc 1, mn 3), `qs[0] = 0xE4`, `qs[16] = 0x1B`.
+    /// ggml's `is++` / shift-0,2,4,6 walk emits `y[0..16]` from `qs[0..16] >> 0`
+    /// under `scales[0]` and `y[16..32]` from `qs[16..32] >> 0` under
+    /// `scales[1]`; the pre-fix element-sequential kernel produced `y[1] = 0.75`.
+    fn q2k_sparse_golden() -> Aligned<84> {
+        let mut b = [0u8; 84];
+        b[0] = 0x12;
+        b[1] = 0x31;
+        b[16] = 0xE4;
+        b[32] = 0x1B;
+        b[80..82].copy_from_slice(&f16::from_f32(0.5).to_bits().to_le_bytes());
+        b[82..84].copy_from_slice(&f16::from_f32(0.25).to_bits().to_le_bytes());
+        Aligned(b)
+    }
+
+    #[test]
+    fn metal_q2k_hand_derived_golden_block() {
+        let gpu = assert_gpu_matches_cpu_reference!(
+            "Q2_K golden vs CPU",
+            BlockQ2K,
+            metal_gemv_q2k,
+            q2k_sparse_golden()
+        );
+        let mut want = vec![0.0f32; QK_K];
+        want[0..16].fill(-0.25);
+        want[16] = 0.75;
+        want[17..32].fill(-0.75);
+        assert_elementwise("Q2_K hand golden", &gpu, &want);
+    }
+
+    #[test]
+    fn metal_q2k_dense_block_matches_cpu_reference() {
+        let mut b = [0u8; 84];
+        b[0..80].copy_from_slice(&lcg_bytes(80, 0x2ACE_0001));
+        b[80..82].copy_from_slice(&f16::from_f32(0.0137).to_bits().to_le_bytes());
+        b[82..84].copy_from_slice(&f16::from_f32(0.0091).to_bits().to_le_bytes());
+        assert_gpu_matches_cpu_reference!("Q2_K dense", BlockQ2K, metal_gemv_q2k, Aligned(b));
+    }
+
+    // ── Q3_K ───────────────────────────────────────────────────────────────
+
+    /// `d = 0.25`; sub-block 0's 6-bit code is `2 | (2 << 4) = 34` → signed
+    /// scale `+2`, every other code is `0` → `-32`. `hmask[0] = 0x01`,
+    /// `qs[0] = 0x03`. ggml subtracts 4 when the hmask bit is **clear**, and
+    /// element 32 lands in the `m = 2` step, pinning the `m <<= 1` stepping.
+    fn q3k_sparse_golden() -> Aligned<110> {
+        let mut b = [0u8; 110];
+        b[0] = 0x01;
+        b[32] = 0x03;
+        b[96] = 0x02;
+        b[104] = 0x02;
+        b[108..110].copy_from_slice(&f16::from_f32(0.25).to_bits().to_le_bytes());
+        Aligned(b)
+    }
+
+    #[test]
+    fn metal_q3k_hand_derived_golden_block() {
+        let gpu = assert_gpu_matches_cpu_reference!(
+            "Q3_K golden vs CPU",
+            BlockQ3K,
+            metal_gemv_q3k,
+            q3k_sparse_golden()
+        );
+        let mut want = vec![32.0f32; QK_K];
+        want[0] = 1.5;
+        want[1..16].fill(-2.0);
+        assert_elementwise("Q3_K hand golden", &gpu, &want);
+    }
+
+    #[test]
+    fn metal_q3k_dense_block_matches_cpu_reference() {
+        let mut b = [0u8; 110];
+        b[0..108].copy_from_slice(&lcg_bytes(108, 0x3BEE_0002));
+        b[108..110].copy_from_slice(&f16::from_f32(0.0037).to_bits().to_le_bytes());
+        assert_gpu_matches_cpu_reference!("Q3_K dense", BlockQ3K, metal_gemv_q3k, Aligned(b));
+    }
+
+    // ── Q4_K ───────────────────────────────────────────────────────────────
+
+    /// `d = 0.5`, `dmin = 0.25`, `qs[0] = 0x57`; the `scales` array exercises
+    /// both halves of `get_scale_min_k4` (`j < 4` reads a full 6-bit byte,
+    /// `j >= 4` splices in the top two bits of bytes `j - 4` / `j`):
+    ///
+    /// ```text
+    /// j = 0: sc = 132 & 63 = 4                     m = 66 & 63 = 2
+    /// j = 1: sc = 3                                m = 1
+    /// j = 4: sc = (0x31 & 0xF) | ((132 >> 6) << 4) m = (0x31 >> 4) | ((66 >> 6) << 4)
+    ///           = 33                                  = 19
+    /// ```
+    ///
+    /// and the 32-low-then-32-high nibble emission order gives `y[0] = 13.5`,
+    /// `y[32] = 7.25`, `y[128..160] = -4.75`.
+    fn q4k_sparse_golden() -> Aligned<144> {
+        let mut b = [0u8; 144];
+        b[0..2].copy_from_slice(&f16::from_f32(0.5).to_bits().to_le_bytes());
+        b[2..4].copy_from_slice(&f16::from_f32(0.25).to_bits().to_le_bytes());
+        b[4] = 132;
+        b[5] = 3;
+        b[8] = 66;
+        b[9] = 1;
+        b[12] = 0x31;
+        b[16] = 0x57;
+        Aligned(b)
+    }
+
+    #[test]
+    fn metal_q4k_hand_derived_golden_block() {
+        let gpu = assert_gpu_matches_cpu_reference!(
+            "Q4_K golden vs CPU",
+            BlockQ4K,
+            metal_gemv_q4k,
+            q4k_sparse_golden()
+        );
+        let mut want = vec![0.0f32; QK_K];
+        want[0] = 13.5;
+        want[1..32].fill(-0.5);
+        want[32] = 7.25;
+        want[33..64].fill(-0.25);
+        want[128..160].fill(-4.75);
+        assert_elementwise("Q4_K hand golden", &gpu, &want);
+    }
+
+    #[test]
+    fn metal_q4k_dense_block_matches_cpu_reference() {
+        let mut b = [0u8; 144];
+        b[0..2].copy_from_slice(&f16::from_f32(0.0211).to_bits().to_le_bytes());
+        b[2..4].copy_from_slice(&f16::from_f32(0.0074).to_bits().to_le_bytes());
+        b[4..144].copy_from_slice(&lcg_bytes(140, 0x4C0D_0003));
+        assert_gpu_matches_cpu_reference!("Q4_K dense", BlockQ4K, metal_gemv_q4k, Aligned(b));
+    }
+
+    // ── Q5_K ───────────────────────────────────────────────────────────────
+
+    /// Q4_K's scale layout plus the 5th bit: `d = 0.5`, `dmin = 0.25`,
+    /// `scales[0] = 4`, `scales[1] = 3`, `scales[4] = 2`, `scales[5] = 1`,
+    /// `qh[0] = 0x03`, `qs[0] = 0x57`. The `+16` on **both** lanes appears only
+    /// if the kernel applies the `u1`/`u2` masks (bits 0 and 1 of `qh[0]`)
+    /// rather than a per-element `qh[i / 8] >> (i % 8)` bit:
+    /// `y[0] = 45.5`, `y[32] = 31.25`.
+    fn q5k_sparse_golden() -> Aligned<176> {
+        let mut b = [0u8; 176];
+        b[0..2].copy_from_slice(&f16::from_f32(0.5).to_bits().to_le_bytes());
+        b[2..4].copy_from_slice(&f16::from_f32(0.25).to_bits().to_le_bytes());
+        b[4] = 4;
+        b[5] = 3;
+        b[8] = 2;
+        b[9] = 1;
+        b[16] = 0x03;
+        b[48] = 0x57;
+        Aligned(b)
+    }
+
+    #[test]
+    fn metal_q5k_hand_derived_golden_block() {
+        let gpu = assert_gpu_matches_cpu_reference!(
+            "Q5_K golden vs CPU",
+            BlockQ5K,
+            metal_gemv_q5k,
+            q5k_sparse_golden()
+        );
+        let mut want = vec![0.0f32; QK_K];
+        want[0] = 45.5;
+        want[1..32].fill(-0.5);
+        want[32] = 31.25;
+        want[33..64].fill(-0.25);
+        assert_elementwise("Q5_K hand golden", &gpu, &want);
+    }
+
+    #[test]
+    fn metal_q5k_dense_block_matches_cpu_reference() {
+        let mut b = [0u8; 176];
+        b[0..2].copy_from_slice(&f16::from_f32(0.0163).to_bits().to_le_bytes());
+        b[2..4].copy_from_slice(&f16::from_f32(0.0052).to_bits().to_le_bytes());
+        b[4..176].copy_from_slice(&lcg_bytes(172, 0x5D1E_0004));
+        assert_gpu_matches_cpu_reference!("Q5_K dense", BlockQ5K, metal_gemv_q5k, Aligned(b));
+    }
+
+    // ── Q6_K ───────────────────────────────────────────────────────────────
+
+    /// `d = 0.5`; `scales = [2, 0, 3, 0, -1, 0, 4, 0, …]`; `ql[0] = 0x9A`,
+    /// `ql[32] = 0x27`, `qh[0] = 0xE4`. ggml's four-lane interleave with
+    /// `sc[is + 0/2/4/6]` gives `y[0] = -22`, `y[32] = -13.5`, `y[64] = -4.5`,
+    /// `y[96] = 36`; for `l in 1..16` the zero nibbles give `q = -32`.
+    fn q6k_sparse_golden() -> Aligned<210> {
+        let mut b = [0u8; 210];
+        b[0] = 0x9A;
+        b[32] = 0x27;
+        b[128] = 0xE4;
+        b[192] = 2i8 as u8;
+        b[194] = 3i8 as u8;
+        b[196] = (-1i8) as u8;
+        b[198] = 4i8 as u8;
+        b[208..210].copy_from_slice(&f16::from_f32(0.5).to_bits().to_le_bytes());
+        Aligned(b)
+    }
+
+    #[test]
+    fn metal_q6k_hand_derived_golden_block() {
+        let gpu = assert_gpu_matches_cpu_reference!(
+            "Q6_K golden vs CPU",
+            BlockQ6K,
+            metal_gemv_q6k,
+            q6k_sparse_golden()
+        );
+        let mut want = vec![0.0f32; QK_K];
+        want[0] = -22.0;
+        want[32] = -13.5;
+        want[64] = -4.5;
+        want[96] = 36.0;
+        for l in 1..16usize {
+            want[l] = -32.0;
+            want[l + 32] = -48.0;
+            want[l + 64] = 16.0;
+            want[l + 96] = -64.0;
+        }
+        assert_elementwise("Q6_K hand golden", &gpu, &want);
+    }
+
+    #[test]
+    fn metal_q6k_dense_block_matches_cpu_reference() {
+        let mut b = [0u8; 210];
+        b[0..208].copy_from_slice(&lcg_bytes(208, 0x6E2F_0005));
+        b[208..210].copy_from_slice(&f16::from_f32(0.00042).to_bits().to_le_bytes());
+        assert_gpu_matches_cpu_reference!("Q6_K dense", BlockQ6K, metal_gemv_q6k, Aligned(b));
     }
 }

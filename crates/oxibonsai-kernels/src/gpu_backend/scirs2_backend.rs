@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::collections::HashMap;
 
 #[cfg(feature = "gpu")]
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(feature = "gpu")]
 use scirs2_core::gpu::{
@@ -123,18 +123,110 @@ pub struct Scirs2Backend {
     tq2_kernels: OnceLock<Result<TQ2Kernels, String>>,
     /// Cached GPU-resident weight buffers, keyed by [`GpuWeightHandle`] ID.
     weight_cache: Mutex<HashMap<u64, GpuBuffer<u8>>>,
-    /// Pre-allocated reusable input buffer (max_k floats).
-    io_input_buf: Mutex<Option<GpuBuffer<f32>>>,
-    /// Pre-allocated reusable output buffer (max n_rows).
-    io_output_buf: Mutex<Option<GpuBuffer<f32>>>,
-    /// Current capacity of input buffer in elements.
-    io_input_capacity: AtomicUsize,
-    /// Current capacity of output buffer in elements.
-    io_output_capacity: AtomicUsize,
+    /// Whether [`upload_weights`](Self::upload_weights) /
+    /// [`upload_weights_ternary`](Self::upload_weights_ternary) retain their
+    /// uploaded buffer in `weight_cache` for later
+    /// [`gemv_q1_g128_cached`](Self::gemv_q1_g128_cached) /
+    /// [`gemv_tq2_g128_cached`](Self::gemv_tq2_g128_cached) lookups.
+    ///
+    /// Defaults to `true` (today's behaviour, unchanged). MET-M1: this cache
+    /// is a **second**, independently-keyed, full GPU-resident copy of every
+    /// quantized tensor — the fused `MetalGraph` decode path
+    /// (`oxibonsai-model`) maintains its own weight cache (see MET-02), and
+    /// when that fused path is active for a model, `Scirs2Backend`'s copy is
+    /// redundant (measured 435.69 MB on the 1.7B, uploaded unconditionally
+    /// at engine construction). Set to `false` via
+    /// [`with_weight_cache_enabled`](Self::with_weight_cache_enabled) or
+    /// [`set_weight_cache_enabled`](Self::set_weight_cache_enabled) so the
+    /// upload site can keep calling `upload_weights{,_ternary}`
+    /// unconditionally (e.g. for its other side effects) without retaining a
+    /// second GPU-resident copy.
+    weight_cache_enabled: std::sync::atomic::AtomicBool,
+    /// Serialisation point for every `upload → bind → dispatch → read back`
+    /// critical section, and owner of the reusable I/O buffers it protects.
+    ///
+    /// Both the pooled buffers and the compiled [`GpuKernelHandle`]s are
+    /// process-global, and the handles take `&self` for `set_buffer` /
+    /// `set_u32`, so their parameter bindings are shared mutable state too;
+    /// the whole sequence must be atomic against other callers. It was not:
+    /// `get_input_buf` / `get_output_buf` released their mutex *before*
+    /// returning the buffer, so two concurrent `gemv_q1_g128` /
+    /// `gemm_q1_g128` calls on [`Scirs2Backend::global()`](Self::global)
+    /// overwrote each other's input, kernel parameters and output —
+    /// non-deterministic wrong numbers under `cargo test`'s in-process
+    /// parallelism, invisible to `cargo nextest` (one process per test).
+    ///
+    /// **Trade-off:** GPU dispatch through `Scirs2Backend` is now strictly
+    /// serial. That costs nothing today — the shipping Metal decode path is
+    /// already a process-global singleton with GPU concurrency 1
+    /// (`GLOBAL_METAL_GRAPH`) and every dispatch here ends in a synchronous
+    /// readback, so overlapping callers never had real parallelism to lose,
+    /// only corruption to gain. Per-call I/O buffers would permit
+    /// concurrency but reintroduce the allocation churn the pool exists to
+    /// remove *and* leave the kernel-parameter race untouched. Lock order:
+    /// `dispatch` is acquired **last**, after any `weight_cache` /
+    /// `pipeline_buffers` guard is dropped.
+    dispatch: Mutex<DispatchState>,
     /// Lazily compiled helper kernels (SwiGLU, residual_add, RMSNorm weighted).
     helper_kernels: OnceLock<Result<HelperKernels, String>>,
     /// Pre-allocated pipeline buffers for FFN dispatch operations.
     pipeline_buffers: Mutex<Option<PipelineBuffers>>,
+}
+
+/// Shared dispatch state: the reusable I/O buffers, behind the mutex that
+/// also serialises kernel binding and dispatch. Capacities live here rather
+/// than in atomics so "is it big enough?" and "replace it" are one
+/// indivisible decision.
+#[cfg(feature = "gpu")]
+#[derive(Default)]
+struct DispatchState {
+    /// Reusable device-side input buffer, or `None` before first use.
+    input: Option<GpuBuffer<f32>>,
+    /// Element capacity of `input`.
+    input_capacity: usize,
+    /// Reusable device-side output buffer, or `None` before first use.
+    output: Option<GpuBuffer<f32>>,
+    /// Element capacity of `output`.
+    output_capacity: usize,
+}
+
+#[cfg(feature = "gpu")]
+impl DispatchState {
+    /// Reusable input buffer holding at least `required` f32 elements,
+    /// growing (never shrinking) when it is too small.
+    fn input_buf(&mut self, ctx: &GpuContext, required: usize) -> GpuBuffer<f32> {
+        if self.input_capacity >= required {
+            if let Some(buf) = self.input.as_ref() {
+                return buf.clone();
+            }
+        }
+        let new_cap = Self::grown(self.input_capacity, required);
+        let buf = ctx.create_buffer::<f32>(new_cap);
+        self.input_capacity = new_cap;
+        self.input = Some(buf.clone());
+        buf
+    }
+
+    /// Reusable output buffer holding at least `required` f32 elements.
+    fn output_buf(&mut self, ctx: &GpuContext, required: usize) -> GpuBuffer<f32> {
+        if self.output_capacity >= required {
+            if let Some(buf) = self.output.as_ref() {
+                return buf.clone();
+            }
+        }
+        let new_cap = Self::grown(self.output_capacity, required);
+        let buf = ctx.create_buffer::<f32>(new_cap);
+        self.output_capacity = new_cap;
+        self.output = Some(buf.clone());
+        buf
+    }
+
+    /// Growth policy, unchanged from the pre-fix pool: at least 16 K
+    /// elements, otherwise `max(required, 2 × current)` so a ramping shape
+    /// reallocates O(log n) times rather than per call.
+    fn grown(current: usize, required: usize) -> usize {
+        required.max(current.saturating_mul(2)).max(16384)
+    }
 }
 
 #[cfg(feature = "gpu")]
@@ -156,10 +248,8 @@ impl Scirs2Backend {
             q1_kernels: OnceLock::new(),
             tq2_kernels: OnceLock::new(),
             weight_cache: Mutex::new(HashMap::new()),
-            io_input_buf: Mutex::new(None),
-            io_output_buf: Mutex::new(None),
-            io_input_capacity: AtomicUsize::new(0),
-            io_output_capacity: AtomicUsize::new(0),
+            weight_cache_enabled: std::sync::atomic::AtomicBool::new(true),
+            dispatch: Mutex::new(DispatchState::default()),
             helper_kernels: OnceLock::new(),
             pipeline_buffers: Mutex::new(None),
         })
@@ -196,10 +286,8 @@ impl Scirs2Backend {
             q1_kernels: OnceLock::new(),
             tq2_kernels: OnceLock::new(),
             weight_cache: Mutex::new(HashMap::new()),
-            io_input_buf: Mutex::new(None),
-            io_output_buf: Mutex::new(None),
-            io_input_capacity: AtomicUsize::new(0),
-            io_output_capacity: AtomicUsize::new(0),
+            weight_cache_enabled: std::sync::atomic::AtomicBool::new(true),
+            dispatch: Mutex::new(DispatchState::default()),
             helper_kernels: OnceLock::new(),
             pipeline_buffers: Mutex::new(None),
         })
@@ -208,6 +296,35 @@ impl Scirs2Backend {
     /// Returns the scirs2-core backend name.
     pub fn backend_name(&self) -> &str {
         self.ctx.backend_name()
+    }
+
+    // ── Weight-cache opt-in (MET-M1) ─────────────────────────────────────
+
+    /// Builder-style: set whether [`upload_weights`](Self::upload_weights) /
+    /// [`upload_weights_ternary`](Self::upload_weights_ternary) retain their
+    /// uploaded buffer for later cached-GEMV lookups (see
+    /// `weight_cache_enabled`'s field docs). Composes with [`new`](Self::new)
+    /// / [`with_backend`](Self::with_backend):
+    ///
+    /// ```ignore
+    /// let backend = Scirs2Backend::new()?.with_weight_cache_enabled(false);
+    /// ```
+    #[must_use]
+    pub fn with_weight_cache_enabled(self, enabled: bool) -> Self {
+        self.weight_cache_enabled.store(enabled, Ordering::Relaxed);
+        self
+    }
+
+    /// Enable or disable weight-cache retention on an already-constructed
+    /// (possibly shared, e.g. the [`global`](Self::global) singleton)
+    /// backend. See `weight_cache_enabled`'s field docs.
+    pub fn set_weight_cache_enabled(&self, enabled: bool) {
+        self.weight_cache_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Whether weight-cache retention is currently enabled.
+    pub fn weight_cache_enabled(&self) -> bool {
+        self.weight_cache_enabled.load(Ordering::Relaxed)
     }
 
     // ── Backend detection ────────────────────────────────────────────────
@@ -450,49 +567,16 @@ impl Scirs2Backend {
         (n_rows as u32).div_ceil(8)
     }
 
-    // ── Reusable I/O buffer management ──────────────────────────────────
+    // ── Dispatch serialisation + reusable I/O buffers ───────────────────
 
-    /// Get or grow the reusable input GPU buffer.
-    ///
-    /// Returns an `Arc`-clone of the buffer — the `Mutex` is released on return.
-    fn get_input_buf(&self, required: usize) -> Result<GpuBuffer<f32>, GpuError> {
-        let current_cap = self.io_input_capacity.load(Ordering::Relaxed);
-        let mut guard = self
-            .io_input_buf
+    /// Acquire the dispatch lock; hold the guard across the **entire**
+    /// upload → bind → dispatch → readback sequence, and acquire it last,
+    /// after any `weight_cache` / `pipeline_buffers` guard is dropped (see
+    /// [`Scirs2Backend::dispatch`]).
+    fn lock_dispatch(&self) -> Result<std::sync::MutexGuard<'_, DispatchState>, GpuError> {
+        self.dispatch
             .lock()
-            .map_err(|_| GpuError::NotAvailable("io_input_buf lock poisoned".into()))?;
-        if current_cap >= required {
-            if let Some(ref buf) = *guard {
-                return Ok(buf.clone());
-            }
-        }
-        // Grow: allocate new buffer (at least 16 K elements, or 2× current).
-        let new_cap = required.max(current_cap.saturating_mul(2)).max(16384);
-        let buf = self.ctx.create_buffer::<f32>(new_cap);
-        self.io_input_capacity.store(new_cap, Ordering::Relaxed);
-        *guard = Some(buf.clone());
-        Ok(buf)
-    }
-
-    /// Get or grow the reusable output GPU buffer.
-    ///
-    /// Returns an `Arc`-clone of the buffer — the `Mutex` is released on return.
-    fn get_output_buf(&self, required: usize) -> Result<GpuBuffer<f32>, GpuError> {
-        let current_cap = self.io_output_capacity.load(Ordering::Relaxed);
-        let mut guard = self
-            .io_output_buf
-            .lock()
-            .map_err(|_| GpuError::NotAvailable("io_output_buf lock poisoned".into()))?;
-        if current_cap >= required {
-            if let Some(ref buf) = *guard {
-                return Ok(buf.clone());
-            }
-        }
-        let new_cap = required.max(current_cap.saturating_mul(2)).max(16384);
-        let buf = self.ctx.create_buffer::<f32>(new_cap);
-        self.io_output_capacity.store(new_cap, Ordering::Relaxed);
-        *guard = Some(buf.clone());
-        Ok(buf)
+            .map_err(|_| GpuError::NotAvailable("GPU dispatch lock poisoned".into()))
     }
 
     /// Read back exactly `count` f32 elements from a (possibly oversized) GPU buffer.
@@ -676,6 +760,9 @@ impl Scirs2Backend {
         let x_buf: GpuBuffer<f32> = self.ctx.create_buffer_from_slice(&x.data);
         let out_buf: GpuBuffer<f32> = self.ctx.create_buffer::<f32>(m);
 
+        // Bind → dispatch → readback is one critical section: `kernels` is
+        // process-global and its parameter bindings are shared mutable state.
+        let _dispatch = self.lock_dispatch()?;
         kernels.matvec_f32.set_buffer("x", &a_buf);
         kernels.matvec_f32.set_buffer("y", &x_buf);
         kernels.matvec_f32.set_buffer("result", &out_buf);
@@ -695,6 +782,7 @@ impl Scirs2Backend {
         let in_buf: GpuBuffer<f32> = self.ctx.create_buffer_from_slice(&x.data);
         let out_buf: GpuBuffer<f32> = self.ctx.create_buffer::<f32>(n);
 
+        let _dispatch = self.lock_dispatch()?;
         kernels.relu.set_buffer("x", &in_buf);
         kernels.relu.set_buffer("result", &out_buf);
         kernels.relu.set_u32("n", n as u32);
@@ -711,6 +799,7 @@ impl Scirs2Backend {
         let in_buf: GpuBuffer<f32> = self.ctx.create_buffer_from_slice(&x.data);
         let out_buf: GpuBuffer<f32> = self.ctx.create_buffer::<f32>(size);
 
+        let _dispatch = self.lock_dispatch()?;
         kernels.softmax.set_buffer("x", &in_buf);
         kernels.softmax.set_buffer("result", &out_buf);
         kernels.softmax.set_u32("n", size as u32);
@@ -788,7 +877,7 @@ impl Scirs2Backend {
         n_rows: usize,
         k: usize,
     ) -> Result<Vec<f32>, GpuError> {
-        if k == 0 || k % 128 != 0 {
+        if k == 0 || !k.is_multiple_of(128) {
             return Err(GpuError::InvalidArgument(format!(
                 "k={k} must be a positive multiple of 128"
             )));
@@ -816,12 +905,17 @@ impl Scirs2Backend {
 
         let blocks_buf: GpuBuffer<u8> = self.ctx.create_buffer_from_slice(block_bytes);
 
-        // Reuse persistent I/O buffers (Mutex released before dispatch).
-        let input_buf = self.get_input_buf(input.len())?;
+        // Reuse the persistent I/O buffers, with the dispatch lock held
+        // across upload → bind → dispatch → readback: both the buffers and
+        // `kernels.gemv`'s parameter bindings are process-global, so a
+        // concurrent caller that got in between any two of these steps used
+        // to silently swap inputs or outputs with this one.
+        let mut dispatch = self.lock_dispatch()?;
+        let input_buf = dispatch.input_buf(&self.ctx, input.len());
         input_buf
             .copy_from_host(input)
             .map_err(|e| Self::convert_error(&e))?;
-        let output_buf = self.get_output_buf(n_rows)?;
+        let output_buf = dispatch.output_buf(&self.ctx, n_rows);
 
         kernels.gemv.set_buffer("x", &blocks_buf);
         kernels.gemv.set_buffer("y", &input_buf);
@@ -853,7 +947,7 @@ impl Scirs2Backend {
         n_rows: usize,
         k: usize,
     ) -> Result<Vec<f32>, GpuError> {
-        if k == 0 || k % 128 != 0 {
+        if k == 0 || !k.is_multiple_of(128) {
             return Err(GpuError::InvalidArgument(format!(
                 "k={k} must be a positive multiple of 128"
             )));
@@ -879,13 +973,16 @@ impl Scirs2Backend {
 
         let blocks_buf: GpuBuffer<u8> = self.ctx.create_buffer_from_slice(block_bytes);
 
-        // Reuse persistent I/O buffers (Mutex released before dispatch).
+        // Same critical section as `gemv_q1_g128`, and the *same* pooled
+        // buffers and kernel object — the two entry points must serialise
+        // against each other, not only against themselves.
         let out_elems = m * n_rows;
-        let input_buf = self.get_input_buf(input.len())?;
+        let mut dispatch = self.lock_dispatch()?;
+        let input_buf = dispatch.input_buf(&self.ctx, input.len());
         input_buf
             .copy_from_host(input)
             .map_err(|e| Self::convert_error(&e))?;
-        let output_buf = self.get_output_buf(out_elems)?;
+        let output_buf = dispatch.output_buf(&self.ctx, out_elems);
 
         kernels.gemm.set_buffer("x", &blocks_buf);
         kernels.gemm.set_buffer("y", &input_buf);
@@ -920,6 +1017,7 @@ impl Scirs2Backend {
         let w_buf: GpuBuffer<f32> = self.ctx.create_buffer_from_slice(weight);
         let out_buf: GpuBuffer<f32> = self.ctx.create_buffer::<f32>(n);
 
+        let _dispatch = self.lock_dispatch()?;
         kernels.rmsnorm.set_buffer("x", &in_buf);
         kernels.rmsnorm.set_buffer("y", &w_buf);
         kernels.rmsnorm.set_buffer("result", &out_buf);
@@ -941,6 +1039,7 @@ impl Scirs2Backend {
         let in_buf: GpuBuffer<f32> = self.ctx.create_buffer_from_slice(input);
         let out_buf: GpuBuffer<f32> = self.ctx.create_buffer::<f32>(n);
 
+        let _dispatch = self.lock_dispatch()?;
         kernels.silu.set_buffer("x", &in_buf);
         kernels.silu.set_buffer("result", &out_buf);
         kernels.silu.set_u32("n", n as u32);
@@ -961,23 +1060,35 @@ impl Scirs2Backend {
     ///
     /// The returned [`GpuWeightHandle`](crate::weight_cache::GpuWeightHandle) can be passed to
     /// [`gemv_q1_g128_cached`](Self::gemv_q1_g128_cached) to perform GEMV
-    /// without any host→device weight copy.
+    /// without any host→device weight copy — **unless**
+    /// [`weight_cache_enabled`](Self::weight_cache_enabled) is `false`
+    /// (MET-M1), in which case the buffer is uploaded (so the caller's other
+    /// side effects, e.g. a GPU warm-up pass, still run) but not retained,
+    /// and the returned handle will not resolve.
     pub fn upload_weights(
         &self,
         block_bytes: &[u8],
     ) -> Result<crate::weight_cache::GpuWeightHandle, GpuError> {
         let buf: GpuBuffer<u8> = self.ctx.create_buffer_from_slice(block_bytes);
         let id = NEXT_HANDLE_ID.fetch_add(1, Ordering::Relaxed);
-        let mut cache = self
-            .weight_cache
-            .lock()
-            .map_err(|_| GpuError::NotAvailable("weight cache lock poisoned".into()))?;
-        cache.insert(id, buf);
-        debug!(
-            handle = id,
-            bytes = block_bytes.len(),
-            "uploaded weights to GPU"
-        );
+        if self.weight_cache_enabled.load(Ordering::Relaxed) {
+            let mut cache = self
+                .weight_cache
+                .lock()
+                .map_err(|_| GpuError::NotAvailable("weight cache lock poisoned".into()))?;
+            cache.insert(id, buf);
+            debug!(
+                handle = id,
+                bytes = block_bytes.len(),
+                "uploaded weights to GPU"
+            );
+        } else {
+            debug!(
+                handle = id,
+                bytes = block_bytes.len(),
+                "weight cache disabled (MET-M1): upload not retained"
+            );
+        }
         Ok(crate::weight_cache::GpuWeightHandle(id))
     }
 
@@ -992,7 +1103,7 @@ impl Scirs2Backend {
         n_rows: usize,
         k: usize,
     ) -> Result<Vec<f32>, GpuError> {
-        if k == 0 || k % 128 != 0 {
+        if k == 0 || !k.is_multiple_of(128) {
             return Err(GpuError::InvalidArgument(format!(
                 "k={k} must be a positive multiple of 128"
             )));
@@ -1010,7 +1121,7 @@ impl Scirs2Backend {
             let cache = self
                 .weight_cache
                 .lock()
-                .map_err(|_| GpuError::NotAvailable("simimeight cache lock poisoned".into()))?;
+                .map_err(|_| GpuError::NotAvailable("weight cache lock poisoned".into()))?;
             cache.get(&handle.0).cloned().ok_or_else(|| {
                 GpuError::InvalidArgument(format!("invalid weight handle: {:?}", handle))
             })?
@@ -1022,6 +1133,10 @@ impl Scirs2Backend {
         let input_buf = self.ctx.create_buffer_from_slice(input);
         let output_buf: GpuBuffer<f32> = self.ctx.create_buffer(n_rows);
 
+        // Per-call buffers, but `kernels.gemv` is still shared with
+        // `gemv_q1_g128` / `gemm_q1_g128` / `batch_*_phase`, so the binding
+        // and dispatch must take the same lock.
+        let _dispatch = self.lock_dispatch()?;
         kernels.gemv.set_buffer("x", &blocks_buf);
         kernels.gemv.set_buffer("y", &input_buf);
         kernels.gemv.set_buffer("result", &output_buf);
@@ -1038,12 +1153,38 @@ impl Scirs2Backend {
         self.weight_cache.lock().map(|c| c.len()).unwrap_or(0)
     }
 
+    /// Evict every cached weight buffer, freeing its GPU memory.
+    ///
+    /// MET-M1: intended for the moment the fused `MetalGraph` decode path
+    /// (which maintains its own, separately-keyed weight cache — see MET-02)
+    /// takes over and this backend's copy becomes a redundant second
+    /// GPU-resident copy of every quantized tensor, or for when a model is
+    /// dropped and its weights should not linger GPU-resident. Combine with
+    /// [`set_weight_cache_enabled(false)`](Self::set_weight_cache_enabled)
+    /// to also stop new uploads from being retained.
+    ///
+    /// Returns the number of entries evicted.
+    pub fn clear_weight_cache(&self) -> Result<usize, GpuError> {
+        let mut cache = self
+            .weight_cache
+            .lock()
+            .map_err(|_| GpuError::NotAvailable("weight cache lock poisoned".into()))?;
+        let evicted = cache.len();
+        cache.clear();
+        debug!(evicted, "cleared Scirs2Backend GPU weight cache (MET-M1)");
+        Ok(evicted)
+    }
+
     /// Upload TQ2_0_g128 (ternary) weight blocks to GPU in SoA layout.
     ///
     /// Converts AoS block layout `[qs: [u8;32], d: f16]` (34 bytes/block) to
     /// SoA layout `[N×2B FP16 scales][N×32B qs data]` for coalesced GPU reads.
     ///
-    /// Returns a [`GpuWeightHandle`](crate::weight_cache::GpuWeightHandle) for use with [`gemv_tq2_g128_cached`](Self::gemv_tq2_g128_cached).
+    /// Returns a [`GpuWeightHandle`](crate::weight_cache::GpuWeightHandle) for use with
+    /// [`gemv_tq2_g128_cached`](Self::gemv_tq2_g128_cached) — **unless**
+    /// [`weight_cache_enabled`](Self::weight_cache_enabled) is `false`
+    /// (MET-M1), in which case the buffer is uploaded but not retained, and
+    /// the returned handle will not resolve.
     pub fn upload_weights_ternary(
         &self,
         blocks: &[oxibonsai_core::BlockTQ2_0_g128],
@@ -1063,17 +1204,26 @@ impl Scirs2Backend {
         }
         let buf: scirs2_core::gpu::GpuBuffer<u8> = self.ctx.create_buffer_from_slice(&soa);
         let id = NEXT_HANDLE_ID.fetch_add(1, Ordering::Relaxed);
-        let mut cache = self
-            .weight_cache
-            .lock()
-            .map_err(|_| GpuError::NotAvailable("weight cache lock poisoned".into()))?;
-        cache.insert(id, buf);
-        debug!(
-            handle = id,
-            blocks = n,
-            bytes = soa.len(),
-            "uploaded ternary weights to GPU (SoA)"
-        );
+        if self.weight_cache_enabled.load(Ordering::Relaxed) {
+            let mut cache = self
+                .weight_cache
+                .lock()
+                .map_err(|_| GpuError::NotAvailable("weight cache lock poisoned".into()))?;
+            cache.insert(id, buf);
+            debug!(
+                handle = id,
+                blocks = n,
+                bytes = soa.len(),
+                "uploaded ternary weights to GPU (SoA)"
+            );
+        } else {
+            debug!(
+                handle = id,
+                blocks = n,
+                bytes = soa.len(),
+                "weight cache disabled (MET-M1): ternary upload not retained"
+            );
+        }
         Ok(crate::weight_cache::GpuWeightHandle(id))
     }
 
@@ -1088,7 +1238,7 @@ impl Scirs2Backend {
         n_rows: usize,
         k: usize,
     ) -> Result<Vec<f32>, GpuError> {
-        if k == 0 || k % 128 != 0 {
+        if k == 0 || !k.is_multiple_of(128) {
             return Err(GpuError::InvalidArgument(format!(
                 "k={k} must be a positive multiple of 128"
             )));
@@ -1120,6 +1270,7 @@ impl Scirs2Backend {
         let input_buf = self.ctx.create_buffer_from_slice(input);
         let output_buf: scirs2_core::gpu::GpuBuffer<f32> = self.ctx.create_buffer(n_rows);
 
+        let _dispatch = self.lock_dispatch()?;
         tq2.gemv.set_buffer("x", &blocks_buf);
         tq2.gemv.set_buffer("y", &input_buf);
         tq2.gemv.set_buffer("result", &output_buf);
@@ -1205,6 +1356,12 @@ impl Scirs2Backend {
         let normed_buf: GpuBuffer<f32> = self.ctx.create_buffer(h);
         let qkv_buf: GpuBuffer<f32> = self.ctx.create_buffer(total_rows);
 
+        // One critical section for the whole two-kernel sequence: the
+        // intermediate `normed_buf` is produced by the first dispatch and
+        // consumed by the second, so another caller rebinding either kernel
+        // in between would corrupt both.
+        let _dispatch = self.lock_dispatch()?;
+
         // RMSNorm (no wait)
         helpers.rmsnorm_weighted.set_buffer("x", &hidden_buf);
         helpers.rmsnorm_weighted.set_buffer("y", &norm_buf);
@@ -1282,6 +1439,13 @@ impl Scirs2Backend {
                 bufs.down.clone(),
             )
         };
+
+        // The `pipeline_buffers` guard is released above; take the dispatch
+        // lock only now, so the lock order is always
+        // `pipeline_buffers` → (released) → `dispatch`. It covers the whole
+        // seven-step pipeline, whose intermediates live in those shared
+        // pipeline buffers.
+        let _dispatch = self.lock_dispatch()?;
 
         // Copy input data (memcpy to shared memory, no allocation)
         hidden_buf
@@ -1434,6 +1598,91 @@ mod tests {
         }
     }
 
+    // ── MET-M1: weight-cache opt-in + eviction ──────────────────────────
+
+    #[test]
+    fn weight_cache_enabled_defaults_to_true() {
+        if let Some(b) = make_backend() {
+            assert!(b.weight_cache_enabled());
+        }
+    }
+
+    #[test]
+    fn with_weight_cache_enabled_builder_sets_flag() {
+        if let Some(b) = make_backend() {
+            let b = b.with_weight_cache_enabled(false);
+            assert!(!b.weight_cache_enabled());
+            let b = b.with_weight_cache_enabled(true);
+            assert!(b.weight_cache_enabled());
+        }
+    }
+
+    #[test]
+    fn set_weight_cache_enabled_toggles_on_shared_instance() {
+        if let Some(b) = make_backend() {
+            assert!(b.weight_cache_enabled());
+            b.set_weight_cache_enabled(false);
+            assert!(!b.weight_cache_enabled());
+            b.set_weight_cache_enabled(true);
+            assert!(b.weight_cache_enabled());
+        }
+    }
+
+    #[test]
+    fn upload_weights_respects_disabled_cache() {
+        if let Some(b) = make_backend() {
+            if !b.is_accelerated() {
+                return;
+            }
+            b.set_weight_cache_enabled(false);
+            let handle = b
+                .upload_weights(&[0u8; 18])
+                .expect("upload should still succeed when caching is disabled");
+            // The upload happened, but nothing was retained.
+            assert_eq!(b.cached_weight_count(), 0);
+            // ...so a later cached lookup using this handle must fail, not
+            // silently resolve to someone else's buffer.
+            assert!(b
+                .gemv_q1_g128_cached(handle, &[0.0f32; 128], 1, 128)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn upload_weights_retains_when_cache_enabled() {
+        if let Some(b) = make_backend() {
+            if !b.is_accelerated() {
+                return;
+            }
+            assert!(b.weight_cache_enabled(), "default should be enabled");
+            let _handle = b.upload_weights(&[0u8; 18]).expect("upload should succeed");
+            assert_eq!(b.cached_weight_count(), 1);
+        }
+    }
+
+    #[test]
+    fn clear_weight_cache_evicts_all_entries() {
+        if let Some(b) = make_backend() {
+            if !b.is_accelerated() {
+                return;
+            }
+            b.upload_weights(&[0u8; 18]).expect("upload 1");
+            b.upload_weights(&[1u8; 18]).expect("upload 2");
+            assert_eq!(b.cached_weight_count(), 2);
+            let evicted = b.clear_weight_cache().expect("clear_weight_cache");
+            assert_eq!(evicted, 2);
+            assert_eq!(b.cached_weight_count(), 0);
+        }
+    }
+
+    #[test]
+    fn clear_weight_cache_on_empty_cache_is_a_noop() {
+        if let Some(b) = make_backend() {
+            let evicted = b.clear_weight_cache().expect("clear_weight_cache");
+            assert_eq!(evicted, 0);
+        }
+    }
+
     #[test]
     #[cfg(all(feature = "metal", target_os = "macos"))]
     fn tq2_upload_ternary_creates_handle() {
@@ -1490,5 +1739,217 @@ mod tests {
                 out[0]
             );
         }
+    }
+
+    // ── Concurrency: the shared I/O pool + shared kernel handles ─────────
+
+    /// Build a single `BlockQ1_0G128` (18 bytes: f16 scale, then 16 sign bytes).
+    fn q1_block(scale: f32, bits: [u8; 16]) -> Vec<u8> {
+        let mut block = Vec::with_capacity(18);
+        block.extend_from_slice(&half::f16::from_f32(scale).to_bits().to_le_bytes());
+        block.extend_from_slice(&bits);
+        block
+    }
+
+    /// Distinct `(weights, input)` workload for thread `t`, chosen so any
+    /// cross-talk between concurrent callers produces a grossly wrong number
+    /// rather than a near-miss: the scale, the sign pattern and the input
+    /// magnitude all differ per thread.
+    fn race_workload(t: usize) -> (Vec<u8>, Vec<f32>) {
+        // Vary the sign byte *within* the block as well as across threads: a
+        // single repeated byte can make the row sum cancel to exactly zero
+        // (0x66 does, for a linearly increasing input), which would make two
+        // workloads indistinguishable and the test vacuous.
+        let mut bits = [0u8; 16];
+        for (j, b) in bits.iter_mut().enumerate() {
+            *b = ((t * 31 + j * 17 + 5) % 251) as u8;
+        }
+        let weights = q1_block(0.5 + t as f32, bits);
+        let input: Vec<f32> = (0..128)
+            .map(|i| (i as f32 + 1.0) * (t as f32 + 1.0))
+            .collect();
+        (weights, input)
+    }
+
+    /// Join every worker and report **all** failures, not just the first: a
+    /// race that only hits one of N threads is exactly what this is for.
+    fn join_workers(handles: Vec<std::thread::JoinHandle<Result<(), String>>>) {
+        let mut failures = Vec::new();
+        for h in handles {
+            match h.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(msg)) => failures.push(msg),
+                Err(_) => failures.push("worker thread panicked".to_string()),
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Reproduces the `Scirs2Backend` shared-state data race.
+    ///
+    /// `gemv_q1_g128` used to copy the caller's input into ONE process-global
+    /// `GpuBuffer<f32>`, release the mutex, and only then bind and dispatch on
+    /// a compiled kernel handle that is also process-global — so two
+    /// concurrent callers of the public `gpu_gemv_1bit` entry point could
+    /// overwrite each other's input, each other's kernel parameters, and read
+    /// each other's output. It is invisible to `cargo nextest` (one process
+    /// per test) and shows up under `cargo test`'s in-process parallelism.
+    ///
+    /// Every thread recomputes the same workload many times and compares
+    /// against a reference captured single-threaded, so a single instance of
+    /// cross-talk fails the test. Bit-exact: identical bytes through an
+    /// identical kernel.
+    ///
+    /// Skipped (early `return`, not `#[ignore]`) when this backend is not
+    /// hardware-accelerated — `gpu_gemv_1bit` then takes the pure-CPU
+    /// fallback, which has no shared state and could not fail this.
+    #[test]
+    fn concurrent_gpu_gemv_1bit_callers_do_not_corrupt_each_other() {
+        use crate::gpu_backend::gpu_gemv_1bit;
+
+        let backend = match Scirs2Backend::global() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("no GPU backend ({e}); skipping");
+                return;
+            }
+        };
+        if !backend.is_accelerated() {
+            eprintln!("GPU backend is the CPU fallback; the shared-buffer path is not taken");
+            return;
+        }
+
+        const THREADS: usize = 6;
+        const ITERS: usize = 60;
+
+        // Single-threaded references, one per workload.
+        let expected: Vec<Vec<f32>> = (0..THREADS)
+            .map(|t| {
+                let (w, input) = race_workload(t);
+                gpu_gemv_1bit(&w, &input, 1, 128).expect("reference gemv")
+            })
+            .collect();
+        // The workloads must be distinguishable, or the test proves nothing.
+        for t in 1..THREADS {
+            assert!(
+                (expected[t][0] - expected[0][0]).abs() > 1e-3,
+                "degenerate fixture: workload {t} and 0 give the same result \
+                 ({} vs {}), so cross-talk would be undetectable",
+                expected[t][0],
+                expected[0][0]
+            );
+        }
+
+        let expected = std::sync::Arc::new(expected);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+        let mut handles = Vec::with_capacity(THREADS);
+        for t in 0..THREADS {
+            let expected = std::sync::Arc::clone(&expected);
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || -> Result<(), String> {
+                let (w, input) = race_workload(t);
+                barrier.wait();
+                for iter in 0..ITERS {
+                    let got = gpu_gemv_1bit(&w, &input, 1, 128)
+                        .map_err(|e| format!("thread {t} iter {iter}: {e}"))?;
+                    if got != expected[t] {
+                        return Err(format!(
+                            "thread {t} iter {iter}: got {got:?}, expected {:?} — a \
+                             concurrent caller clobbered the shared input/output \
+                             buffer or the shared kernel parameters",
+                            expected[t]
+                        ));
+                    }
+                }
+                Ok(())
+            }));
+        }
+        join_workers(handles);
+    }
+
+    /// The batched sibling shares the very same pool and kernel handle, so it
+    /// gets the same guarantee — and mixing the two entry points concurrently
+    /// is the case that would catch a fix applied to only one of them.
+    #[test]
+    fn concurrent_gemv_and_gemm_q1_callers_do_not_corrupt_each_other() {
+        let backend = match Scirs2Backend::global() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("no GPU backend ({e}); skipping");
+                return;
+            }
+        };
+        if !backend.is_accelerated() {
+            eprintln!("GPU backend is the CPU fallback; the shared-buffer path is not taken");
+            return;
+        }
+
+        const THREADS: usize = 6;
+        const ITERS: usize = 40;
+        const BATCH: usize = 3;
+
+        let gemv_expected: Vec<Vec<f32>> = (0..THREADS)
+            .map(|t| {
+                let (w, input) = race_workload(t);
+                backend
+                    .gemv_q1_g128(&w, &input, 1, 128)
+                    .expect("reference gemv")
+            })
+            .collect();
+        let gemm_expected: Vec<Vec<f32>> = (0..THREADS)
+            .map(|t| {
+                let (w, input) = race_workload(t);
+                let batched: Vec<f32> = (0..BATCH)
+                    .flat_map(|b| input.iter().map(move |v| v * (b as f32 + 1.0)))
+                    .collect();
+                backend
+                    .gemm_q1_g128(&w, &batched, BATCH, 1, 128)
+                    .expect("reference gemm")
+            })
+            .collect();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+        let gemv_expected = std::sync::Arc::new(gemv_expected);
+        let gemm_expected = std::sync::Arc::new(gemm_expected);
+        let mut handles = Vec::with_capacity(THREADS);
+        for t in 0..THREADS {
+            let backend = std::sync::Arc::clone(&backend);
+            let barrier = std::sync::Arc::clone(&barrier);
+            let gemv_expected = std::sync::Arc::clone(&gemv_expected);
+            let gemm_expected = std::sync::Arc::clone(&gemm_expected);
+            handles.push(std::thread::spawn(move || -> Result<(), String> {
+                let (w, input) = race_workload(t);
+                let batched: Vec<f32> = (0..BATCH)
+                    .flat_map(|b| input.iter().map(move |v| v * (b as f32 + 1.0)))
+                    .collect();
+                barrier.wait();
+                for iter in 0..ITERS {
+                    // Alternate the two entry points so they interleave.
+                    if iter % 2 == 0 {
+                        let got = backend
+                            .gemv_q1_g128(&w, &input, 1, 128)
+                            .map_err(|e| format!("thread {t} iter {iter} gemv: {e}"))?;
+                        if got != gemv_expected[t] {
+                            return Err(format!(
+                                "thread {t} iter {iter}: gemv got {got:?}, expected {:?}",
+                                gemv_expected[t]
+                            ));
+                        }
+                    } else {
+                        let got = backend
+                            .gemm_q1_g128(&w, &batched, BATCH, 1, 128)
+                            .map_err(|e| format!("thread {t} iter {iter} gemm: {e}"))?;
+                        if got != gemm_expected[t] {
+                            return Err(format!(
+                                "thread {t} iter {iter}: gemm got {got:?}, expected {:?}",
+                                gemm_expected[t]
+                            ));
+                        }
+                    }
+                }
+                Ok(())
+            }));
+        }
+        join_workers(handles);
     }
 }

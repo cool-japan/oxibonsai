@@ -14,7 +14,7 @@ use oxibonsai_model::layers::linear::Linear1Bit;
 use oxibonsai_model::layers::rms_norm::RmsNorm;
 use oxibonsai_model::layers::rms_norm::RmsNorm as RmsNormLayer;
 use oxibonsai_model::layers::rope::RopeTable;
-use oxibonsai_model::layers::swiglu::{silu, swiglu};
+use oxibonsai_model::layers::swiglu::{silu, try_swiglu};
 
 // ──────────────────────────────────────────────────────────────────
 // Helper utilities
@@ -172,7 +172,7 @@ fn swiglu_manual_computation() {
     let up = [2.0f32, 3.0, 4.0, 0.5];
     let mut output = [0.0f32; 4];
 
-    swiglu(&gate, &up, &mut output);
+    try_swiglu(&gate, &up, &mut output).expect("matching-length buffers must succeed");
 
     for i in 0..4 {
         let expected = silu(gate[i]) * up[i];
@@ -200,7 +200,7 @@ fn swiglu_zero_input() {
     let up = [0.0f32; 8];
     let mut output = [0.0f32; 8];
 
-    swiglu(&gate, &up, &mut output);
+    try_swiglu(&gate, &up, &mut output).expect("matching-length buffers must succeed");
 
     for (i, &val) in output.iter().enumerate() {
         assert_approx_eq(val, 0.0, 1e-7, &format!("swiglu_zero[{i}]"));
@@ -213,12 +213,12 @@ fn swiglu_saturation_behavior() {
     let gate = [50.0f32];
     let up = [2.0f32];
     let mut output = [0.0f32; 1];
-    swiglu(&gate, &up, &mut output);
+    try_swiglu(&gate, &up, &mut output).expect("matching-length buffers must succeed");
     assert_approx_eq(output[0], 100.0, 0.1, "swiglu_large_pos");
 
     // Large negative gate: silu(gate) ~ 0, so output ~ 0
     let gate_neg = [-50.0f32];
-    swiglu(&gate_neg, &up, &mut output);
+    try_swiglu(&gate_neg, &up, &mut output).expect("matching-length buffers must succeed");
     assert_approx_eq(output[0], 0.0, 1e-5, "swiglu_large_neg");
 }
 

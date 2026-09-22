@@ -34,30 +34,49 @@ enum Control {
 
 /// Load the session and run the read-render loop until EOF or `:quit`.
 ///
-/// `gpu_te` opts the text encoder onto the Metal GEMM path (`OXI_TE_GPU=1`),
-/// set before the first forward so the one-shot env latch takes effect.
+/// `gpu_te` opts the text encoder onto the Metal GEMM path. cli-24: the
+/// `OXI_TE_GPU=1` env-var latch this reads is no longer set here —
+/// `std::env::set_var` is safe today (edition 2021) only because nothing
+/// else has spawned a thread yet, which is no longer guaranteed once this
+/// function runs inside the CLI's multi-threaded tokio runtime, and
+/// becomes an outright `unsafe fn` under edition 2024. It is now set in
+/// `main()`, before the tokio runtime is built, by
+/// [`super::apply_pre_runtime_env`] — see that function's doc.
 pub fn run(paths: ReplPaths, mut params: RenderParams, gpu_te: bool) -> anyhow::Result<()> {
-    if gpu_te && std::env::var_os("OXI_TE_GPU").is_none() {
-        // Safe on edition 2021; set before any TE forward so the OnceCell latch
-        // in the GPU dispatch reads it.
-        std::env::set_var("OXI_TE_GPU", "1");
-    }
-
     println!("Loading models (resident)…");
     let t = std::time::Instant::now();
+    // RAG-EVAL-IMG-25 / wave-1.5 addendum: an interactive, multi-prompt
+    // REPL is exactly the scenario text-encoder residency exists for —
+    // force it on regardless of the source's own default (transient for
+    // `TeSource::Mlx4bit`), so warm-up and every render after it actually
+    // reuse the dequantised cache instead of re-paying that cost per turn.
     let session = ImageSession::load(
         Path::new(&paths.dit),
         Path::new(&paths.vae),
         &paths.te_source,
         &paths.tokenizer_dir,
-    )?;
+    )?
+    .with_te_resident(true);
     println!("  loaded in {:.1}s", t.elapsed().as_secs_f64());
 
-    print!("Warming text encoder…");
-    io::stdout().flush().ok();
-    match session.warm() {
-        Ok(d) => println!(" {:.1}s", d.as_secs_f64()),
-        Err(e) => println!(" skipped ({e})"),
+    // RAG-EVAL-IMG-25: `warm()` is a documented no-op (returns
+    // `Duration::ZERO` without encoding anything) whenever the text
+    // encoder is not resident — printing its result unconditionally would
+    // claim "warmed in 0.0s" for work that never happened. Gated on
+    // `is_te_resident()` even though residency is forced above, so this
+    // stays honest if that ever stops being true for some source.
+    if session.is_te_resident() {
+        print!("Warming text encoder…");
+        io::stdout().flush().ok();
+        match session.warm() {
+            Ok(d) => println!(" {:.1}s", d.as_secs_f64()),
+            Err(e) => println!(" skipped ({e})"),
+        }
+    } else {
+        println!(
+            "Text encoder is not resident for this session; skipping the warm-up message \
+             (each render will re-encode from scratch)."
+        );
     }
 
     let inline = term::kitty_supported();
@@ -109,7 +128,7 @@ pub fn run(paths: ReplPaths, mut params: RenderParams, gpu_te: bool) -> anyhow::
                 } else {
                     println!("  wrote {path}");
                     if open_fallback {
-                        let _ = std::process::Command::new("open").arg(&path).status();
+                        open_in_viewer(&path);
                     }
                 }
 
@@ -199,6 +218,32 @@ fn handle_command(
         other => eprintln!("  unknown command :{other}  (try :help)"),
     }
     Control::Continue
+}
+
+/// Open `path` in the platform's default image viewer, cross-platform
+/// (cli-24): the old `Command::new("open")` was macOS-only, so `:open on`
+/// was a silent no-op on Linux/Windows, and its spawn failure was
+/// discarded via `let _ = ...`. This tries the right opener per platform
+/// and always prints one line on failure instead of vanishing silently.
+fn open_in_viewer(path: &str) {
+    let result = if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(path).status()
+    } else if cfg!(target_os = "windows") {
+        // `cmd /C start "" <path>` is the standard way to invoke the
+        // registered default handler for a file on Windows; the empty
+        // `""` is the (required) window-title argument `start` expects
+        // before the file path.
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", path])
+            .status()
+    } else {
+        std::process::Command::new("xdg-open").arg(path).status()
+    };
+    match result {
+        Ok(status) if status.success() => {}
+        Ok(status) => eprintln!("  viewer for {path} exited with {status}"),
+        Err(e) => eprintln!("  failed to open a viewer for {path}: {e}"),
+    }
 }
 
 /// Parse `:size WxH` or `:size N` (square).

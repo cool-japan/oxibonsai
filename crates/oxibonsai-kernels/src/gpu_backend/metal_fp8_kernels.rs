@@ -30,7 +30,7 @@ use std::sync::OnceLock;
 use metal::{CommandQueue, CompileOptions, ComputePipelineState, Device, MTLResourceOptions};
 
 use super::kernel_sources::{MSL_GEMV_FP8_E4M3_V1, MSL_GEMV_FP8_E5M2_V1};
-use super::metal_graph::MetalGraphError;
+use super::metal_graph::{commit_and_wait, MetalGraphError};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Singleton state
@@ -106,6 +106,35 @@ fn clone_err(e: &MetalGraphError) -> MetalGraphError {
         MetalGraphError::EncodingFailed(s) => MetalGraphError::EncodingFailed(s.clone()),
         MetalGraphError::ExecutionFailed(s) => MetalGraphError::ExecutionFailed(s.clone()),
         MetalGraphError::InvalidDimensions(s) => MetalGraphError::InvalidDimensions(s.clone()),
+        MetalGraphError::CommandBufferFailed {
+            what,
+            status,
+            error,
+        } => MetalGraphError::CommandBufferFailed {
+            what,
+            status: *status,
+            error: error.clone(),
+        },
+        MetalGraphError::BufferTooLarge {
+            what,
+            requested,
+            max,
+        } => MetalGraphError::BufferTooLarge {
+            what,
+            requested: *requested,
+            max: *max,
+        },
+        // FIX-06 / MET-02: `MetalGraphError` gained a typed
+        // `WeightKindMismatch` variant, and this hand-written clone is an
+        // exhaustive match, so it must name it. See the package deviations:
+        // all four copies of `clone_err` should be replaced by a `Clone`
+        // derive on `MetalGraphError` itself.
+        MetalGraphError::WeightKindMismatch { expected, found } => {
+            MetalGraphError::WeightKindMismatch {
+                expected: *expected,
+                found: *found,
+            }
+        }
     }
 }
 
@@ -171,7 +200,7 @@ fn dispatch_metal_fp8_gemv(
     variant: Fp8Variant,
 ) -> Result<(), MetalGraphError> {
     // ── Validate dimensions ─────────────────────────────────────────────────
-    if k == 0 || k % FP8_BLOCK_K != 0 {
+    if k == 0 || !k.is_multiple_of(FP8_BLOCK_K) {
         return Err(MetalGraphError::EncodingFailed(format!(
             "k = {k} must be a non-zero multiple of {FP8_BLOCK_K}"
         )));
@@ -255,8 +284,7 @@ fn dispatch_metal_fp8_gemv(
     encoder.dispatch_thread_groups(grid, tg_size);
     encoder.end_encoding();
 
-    cmd.commit();
-    cmd.wait_until_completed();
+    commit_and_wait(cmd, "metal_gemv_fp8")?;
 
     // ── Read output back ────────────────────────────────────────────────────
     unsafe {

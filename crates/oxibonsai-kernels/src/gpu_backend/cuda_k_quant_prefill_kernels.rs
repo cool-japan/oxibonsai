@@ -23,6 +23,18 @@
 //! | `gemm_q8k_residual`                  | Q8_K GEMM + fused residual add                          |
 //! | `fused_gate_up_swiglu_gemm_q8k`      | Fused gate+up Q8_K GEMM with SwiGLU epilogue            |
 //!
+//! # The ggml walk is load-bearing
+//!
+//! Every kernel in this file reduces one super-block through the matching
+//! `kq_pf_dot_q*k` device helper, and those helpers are **fused
+//! transliterations of ggml's `dequantize_row_q*_K`**
+//! (`ggml/src/ggml-quants.c`). ggml's output cursor is decoupled from its byte
+//! cursors, so the *n*-th value it emits — the value that multiplies `x[n]` —
+//! is generally **not** read from byte lane *n*. The byte-exact CPU reference
+//! (`oxibonsai_core::BlockQ*K::dequant`) is the normative source for these
+//! loops. Keeping the block walk in exactly six helpers is deliberate: the
+//! pre-`core-gguf-K0` layout bug was copied into all 18 kernels.
+//!
 //! # Block layouts (QK_K = 256 weights per super-block)
 //!
 //! **Q2_K** (84 bytes/block, 256 weights):
@@ -31,26 +43,32 @@
 //! bytes 16-79: qs[64]      — 2 bits/weight, 4/byte (LSB-first)
 //! bytes 80-81: d (FP16 LE)
 //! bytes 82-83: dmin (FP16 LE)
-//! 16 sub-blocks × 16 weights. dequant: d*sc*q - dmin*mn (q ∈ [0,3])
+//! Per 128-element half `shift` steps 0,2,4,6 and `is` advances twice per step:
+//! output n*128 + j*32 + l     <- qs[n*32 + l]      >> 2j  under scales[is]
+//! output n*128 + j*32 + 16+l  <- qs[n*32 + 16 + l] >> 2j  under scales[is+1]
+//! dequant: d*sc*q - dmin*mn (q in [0,3])
 //! ```
 //!
 //! **Q3_K** (110 bytes/block, 256 weights):
 //! ```text
-//! bytes  0-31:  hmask[32]  — high bit/weight, 8/byte
+//! bytes  0-31:  hmask[32]  — high bit/weight, 8/byte, INVERTED sense
 //! bytes 32-95:  qs[64]     — low 2 bits/weight, 4/byte (LSB-first)
-//! bytes 96-107: scales[12] — 16×4-bit signed nibbles, 2/byte
+//! bytes 96-107: scales[12] — 16 x 6-bit via the kmask1/kmask2 aux[4] shuffle
 //! bytes 108-109: d (FP16 LE)
-//! q3 = lo2|(hi<<2), q3_signed = q3-4. signed_sc = nibble-8.
-//! dequant: d*signed_sc*q3_signed
+//! Q2_K's walk; sc carries a -32 bias; hi = (hm[l] & m) ? 0 : 4 with
+//! m = 1 << (4n + j) reusing the same 32 hmask bytes for all eight steps.
+//! dequant: d*(sc-32)*(q - hi)
 //! ```
 //!
 //! **Q4_K** (144 bytes/block, 256 weights):
 //! ```text
 //! bytes  0- 1: d (FP16 LE)
 //! bytes  2- 3: dmin (FP16 LE)
-//! bytes  4-15: scales[12]  — 6-bit sc[8] + 6-bit mn[8] (decoded by helper)
+//! bytes  4-15: scales[12]  — 6-bit sc[8] + 6-bit mn[8] via get_scale_min_k4
 //! bytes 16-143: qs[128]    — 4 bits/weight, 2/byte (nibbles)
-//! 8 sub-blocks × 32 weights. dequant: d*sc[sub]*q - dmin*mn[sub]
+//! Per 64-element group: 32 LOW nibbles under get_scale_min_k4(is), then 32
+//! HIGH nibbles under get_scale_min_k4(is + 1); is += 2 per group.
+//! dequant: d*sc*q - dmin*mn
 //! ```
 //!
 //! **Q5_K** (176 bytes/block, 256 weights):
@@ -58,9 +76,10 @@
 //! bytes  0- 1: d (FP16 LE)
 //! bytes  2- 3: dmin (FP16 LE)
 //! bytes  4-15: scales[12]  — same 6-bit packing as Q4_K
-//! bytes 16-47: qh[32]      — high bit/weight, 8/byte
+//! bytes 16-47: qh[32]      — 5th bit, indexed l in 0..32, NOT advanced
 //! bytes 48-175: qs[128]    — low 4 bits, 2/byte (nibbles)
-//! 8 sub-blocks × 32 weights. q5 = nibble|(hi<<4). dequant: d*sc[sub]*q5 - dmin*mn[sub]
+//! Q4_K's walk; the u1/u2 masks shift left by 2 per 64-element group.
+//! dequant: d*sc*(q + 16*qh_bit) - dmin*mn
 //! ```
 //!
 //! **Q6_K** (210 bytes/block, 256 weights):
@@ -69,8 +88,9 @@
 //! bytes 128-191: qh[64]     — high 2 bits/weight, 4/byte (2 bits each)
 //! bytes 192-207: scales[16] — signed int8, 1/sub-block
 //! bytes 208-209: d (FP16 LE)
-//! 16 sub-blocks × 16 weights. q6 = nibble|(hi2<<4), q6_signed = q6-32.
-//! dequant: d*scales_i8[sub]*q6_signed
+//! Per 128-element half and l in 0..32, four interleaved lanes y[l], y[l+32],
+//! y[l+64], y[l+96] with sub-scales sc[is+0,+2,+4,+6], is = l/16.
+//! dequant: d*scales_i8*(q6-32)
 //! ```
 //!
 //! **Q8_K** (292 bytes/block, 256 weights):
@@ -78,13 +98,15 @@
 //! bytes  0-3:   d (FP32 LE)    — NOTE: float, not FP16!
 //! bytes  4-259: qs[256] (i8)   — 256 signed int8 weights
 //! bytes 260-291: bsums (i16)   — not used in GEMM
-//! dequant: d_f32 * qs[i]
+//! Element-sequential in ggml too. dequant: d_f32 * qs[i]
 //! ```
 //!
 //! # Grid / block config
 //! - Grid:  `(ceil(n_rows / 8), 1, 1)` — 8 warps per CTA
 //! - Block: `(256, 1, 1)` — 8 warps × 32 lanes
 //! - `k` must be a positive multiple of 256 for all K-quant formats
+//! - One lane decodes one whole super-block: ggml's `is` / `m` / `u1` / `u2`
+//!   cursors are sequential state and must not be split across lanes.
 
 #![cfg(all(
     feature = "native-cuda",
@@ -96,6 +118,10 @@
 /// All kernels use AoS weight layout (super-blocks stored contiguously as-is from GGUF).
 /// Batch tensors use column-major layout: `buf[col * dim + element]`.
 /// The cap-of-8 outer loop prevents silent bugs when batch_size > 8.
+///
+/// Per-format block decoding lives in the six `kq_pf_dot_q*k` helpers, each a
+/// fused transliteration of ggml's `dequantize_row_q*_K`; the kernels below only
+/// stride blocks, reduce warps and apply their epilogue.
 pub const CUDA_K_QUANT_PREFILL_KERNELS_SRC: &str = r#"
 /* =========================================================================
    OxiBonsai CUDA K-quant prefill (batch GEMM) kernels.
@@ -106,6 +132,10 @@ pub const CUDA_K_QUANT_PREFILL_KERNELS_SRC: &str = r#"
    Grid:  (ceil(n_rows/8), 1, 1)  — 8 warps per CTA, 1 warp/row
    Block: (256, 1, 1)             — 8 warps × 32 lanes
    k must be a positive multiple of 256.
+
+   Every kq_pf_dot_q*k helper mirrors ggml's dequantize_row_q*_K walk
+   (ggml/src/ggml-quants.c) element for element, fused with the dot product:
+   the output cursor y indexes the input, the byte cursors index the block.
    ========================================================================= */
 
 /* ── Hardware FP16 → FP32 via PTX (SM 6.0+, 1 instruction) ─────────────── */
@@ -120,50 +150,346 @@ static __device__ __forceinline__ float kq_pf_silu(float x) {
     return x / (1.0f + expf(-x));
 }
 
-/* ── Q4_K / Q5_K: decode 12-byte scales array into 8 × 6-bit sc and mn ─── */
-static __device__ void kq_pf_decode_6bit_scales(
-    const unsigned char* s,
-    unsigned char sc_out[8],
-    unsigned char mn_out[8]
+/* ── Warp-shuffle reduction across 32 lanes ────────────────────────────── */
+static __device__ __forceinline__ float kq_pf_warp_reduce(float acc) {
+    acc += __shfl_down_sync(0xffffffffu, acc, 16u);
+    acc += __shfl_down_sync(0xffffffffu, acc,  8u);
+    acc += __shfl_down_sync(0xffffffffu, acc,  4u);
+    acc += __shfl_down_sync(0xffffffffu, acc,  2u);
+    acc += __shfl_down_sync(0xffffffffu, acc,  1u);
+    return acc;
+}
+
+/* ── ggml get_scale_min_k4 (ggml-quants.c:935) ─────────────────────────────
+   Sub-block j's 6-bit scale and 6-bit min out of the 12-byte packed `scales`
+   array shared by Q4_K and Q5_K. For j < 4 the scale is a FULL 6-bit value
+   read from byte j -- not a 4-bit nibble.                                   */
+static __device__ __forceinline__ void kq_pf_scale_min_k4(
+    const unsigned char* __restrict__ q,
+    unsigned int j,
+    unsigned char* sc_out,
+    unsigned char* m_out
 ) {
-    /* Low 4 bits of scales from bytes 0..3 (2 per byte) */
-    sc_out[0] = s[0] & 0x0Fu;  sc_out[1] = (s[0] >> 4u) & 0x0Fu;
-    sc_out[2] = s[1] & 0x0Fu;  sc_out[3] = (s[1] >> 4u) & 0x0Fu;
-    sc_out[4] = s[2] & 0x0Fu;  sc_out[5] = (s[2] >> 4u) & 0x0Fu;
-    sc_out[6] = s[3] & 0x0Fu;  sc_out[7] = (s[3] >> 4u) & 0x0Fu;
-    /* Low 4 bits of mins from bytes 4..7 */
-    mn_out[0] = s[4] & 0x0Fu;  mn_out[1] = (s[4] >> 4u) & 0x0Fu;
-    mn_out[2] = s[5] & 0x0Fu;  mn_out[3] = (s[5] >> 4u) & 0x0Fu;
-    mn_out[4] = s[6] & 0x0Fu;  mn_out[5] = (s[6] >> 4u) & 0x0Fu;
-    mn_out[6] = s[7] & 0x0Fu;  mn_out[7] = (s[7] >> 4u) & 0x0Fu;
-    /* Upper 2 bits of scales from bytes 8..9 */
-    sc_out[0] |= ((s[8] >> 0u) & 0x03u) << 4u;
-    sc_out[1] |= ((s[8] >> 2u) & 0x03u) << 4u;
-    sc_out[2] |= ((s[8] >> 4u) & 0x03u) << 4u;
-    sc_out[3] |= ((s[8] >> 6u) & 0x03u) << 4u;
-    sc_out[4] |= ((s[9] >> 0u) & 0x03u) << 4u;
-    sc_out[5] |= ((s[9] >> 2u) & 0x03u) << 4u;
-    sc_out[6] |= ((s[9] >> 4u) & 0x03u) << 4u;
-    sc_out[7] |= ((s[9] >> 6u) & 0x03u) << 4u;
-    /* Upper 2 bits of mins from bytes 10..11 */
-    mn_out[0] |= ((s[10] >> 0u) & 0x03u) << 4u;
-    mn_out[1] |= ((s[10] >> 2u) & 0x03u) << 4u;
-    mn_out[2] |= ((s[10] >> 4u) & 0x03u) << 4u;
-    mn_out[3] |= ((s[10] >> 6u) & 0x03u) << 4u;
-    mn_out[4] |= ((s[11] >> 0u) & 0x03u) << 4u;
-    mn_out[5] |= ((s[11] >> 2u) & 0x03u) << 4u;
-    mn_out[6] |= ((s[11] >> 4u) & 0x03u) << 4u;
-    mn_out[7] |= ((s[11] >> 6u) & 0x03u) << 4u;
+    if (j < 4u) {
+        *sc_out = (unsigned char)(q[j] & 63u);
+        *m_out  = (unsigned char)(q[j + 4u] & 63u);
+    } else {
+        *sc_out = (unsigned char)((q[j + 4u] & 0x0Fu) | (((unsigned int)q[j - 4u] >> 6u) << 4u));
+        *m_out  = (unsigned char)(((unsigned int)q[j + 4u] >> 4u)
+                                  | (((unsigned int)q[j] >> 6u) << 4u));
+    }
+}
+
+/* ── Q3_K: unpack the 12 packed scale bytes into 16 biased 6-bit scales ───
+   ggml-quants.c:1374-1381 (kmask1 / kmask2 aux[4] shuffle). The +32 bias is
+   removed by the caller.                                                    */
+static __device__ void kq_pf_unpack_q3k_scales(
+    const unsigned char* __restrict__ s,
+    unsigned char* out
+) {
+    const unsigned int kmask1 = 0x03030303u;
+    const unsigned int kmask2 = 0x0f0f0f0fu;
+    const unsigned int a0_in = (unsigned int)s[0] | ((unsigned int)s[1] << 8u)
+                             | ((unsigned int)s[2] << 16u) | ((unsigned int)s[3] << 24u);
+    const unsigned int a1_in = (unsigned int)s[4] | ((unsigned int)s[5] << 8u)
+                             | ((unsigned int)s[6] << 16u) | ((unsigned int)s[7] << 24u);
+    const unsigned int tmp   = (unsigned int)s[8] | ((unsigned int)s[9] << 8u)
+                             | ((unsigned int)s[10] << 16u) | ((unsigned int)s[11] << 24u);
+
+    unsigned int aux[4];
+    aux[2] = ((a0_in >> 4u) & kmask2) | (((tmp >> 4u) & kmask1) << 4u);
+    aux[3] = ((a1_in >> 4u) & kmask2) | (((tmp >> 6u) & kmask1) << 4u);
+    aux[0] = (a0_in & kmask2) | ((tmp & kmask1) << 4u);
+    aux[1] = (a1_in & kmask2) | (((tmp >> 2u) & kmask1) << 4u);
+
+    #pragma unroll
+    for (unsigned int w = 0u; w < 4u; ++w) {
+        out[4u * w + 0u] = (unsigned char)(aux[w] & 0xFFu);
+        out[4u * w + 1u] = (unsigned char)((aux[w] >> 8u) & 0xFFu);
+        out[4u * w + 2u] = (unsigned char)((aux[w] >> 16u) & 0xFFu);
+        out[4u * w + 3u] = (unsigned char)((aux[w] >> 24u) & 0xFFu);
+    }
+}
+
+/* ── Q2_K super-block · dot product (dequantize_row_q2_K) ──────────────── */
+static __device__ float kq_pf_dot_q2k(
+    const unsigned char* __restrict__ bptr,
+    const float* __restrict__ x
+) {
+    const unsigned short d_raw    = (unsigned short)bptr[80] | ((unsigned short)bptr[81] << 8u);
+    const unsigned short dmin_raw = (unsigned short)bptr[82] | ((unsigned short)bptr[83] << 8u);
+    const float d    = kq_pf_fast_fp16_to_float(d_raw);
+    const float dmin = kq_pf_fast_fp16_to_float(dmin_raw);
+    const unsigned char* qs = bptr + 16u;
+
+    float acc = 0.0f;
+    unsigned int y = 0u;      /* output cursor */
+    unsigned int is = 0u;     /* scales cursor */
+    unsigned int q_off = 0u;  /* qs byte cursor */
+
+    for (unsigned int n = 0u; n < 2u; ++n) {        /* QK_K / 128 */
+        unsigned int shift = 0u;
+        for (unsigned int j = 0u; j < 4u; ++j) {
+            for (unsigned int part = 0u; part < 2u; ++part) {
+                const unsigned int sc = bptr[is];
+                ++is;
+                const float dl = d * (float)(sc & 0x0Fu);
+                const float ml = dmin * (float)(sc >> 4u);
+                const unsigned char* qp = qs + q_off + part * 16u;
+                float qsum = 0.0f;
+                float xsum = 0.0f;
+                #pragma unroll 16
+                for (unsigned int l = 0u; l < 16u; ++l) {
+                    const float xv = x[y + l];
+                    qsum += (float)((qp[l] >> shift) & 3u) * xv;
+                    xsum += xv;
+                }
+                acc += dl * qsum - ml * xsum;
+                y += 16u;
+            }
+            shift += 2u;
+        }
+        q_off += 32u;
+    }
+    return acc;
+}
+
+/* ── Q3_K super-block · dot product (dequantize_row_q3_K) ──────────────── */
+static __device__ float kq_pf_dot_q3k(
+    const unsigned char* __restrict__ bptr,
+    const float* __restrict__ x
+) {
+    const unsigned short d_raw = (unsigned short)bptr[108] | ((unsigned short)bptr[109] << 8u);
+    const float d_all = kq_pf_fast_fp16_to_float(d_raw);
+    const unsigned char* hm = bptr;        /* hmask[32] */
+    const unsigned char* qs = bptr + 32u;  /* qs[64]    */
+
+    unsigned char sc[16];
+    kq_pf_unpack_q3k_scales(bptr + 96u, sc);
+
+    float acc = 0.0f;
+    unsigned int y = 0u;
+    unsigned int is = 0u;
+    unsigned int q_off = 0u;
+    unsigned int m = 1u;
+
+    for (unsigned int n = 0u; n < 2u; ++n) {
+        unsigned int shift = 0u;
+        for (unsigned int j = 0u; j < 4u; ++j) {
+            for (unsigned int part = 0u; part < 2u; ++part) {
+                const float dl = d_all * (float)((int)sc[is] - 32);
+                ++is;
+                const unsigned char* qp = qs + q_off + part * 16u;
+                const unsigned char* hp = hm + part * 16u;
+                float qsum = 0.0f;
+                #pragma unroll 16
+                for (unsigned int l = 0u; l < 16u; ++l) {
+                    const int hi = ((unsigned int)hp[l] & m) != 0u ? 0 : 4;
+                    const int q  = (int)((qp[l] >> shift) & 3u);
+                    qsum += (float)(q - hi) * x[y + l];
+                }
+                acc += dl * qsum;
+                y += 16u;
+            }
+            shift += 2u;
+            m <<= 1u;
+        }
+        q_off += 32u;
+    }
+    return acc;
+}
+
+/* ── Q4_K super-block · dot product (dequantize_row_q4_K) ──────────────── */
+static __device__ float kq_pf_dot_q4k(
+    const unsigned char* __restrict__ bptr,
+    const float* __restrict__ x
+) {
+    const unsigned short d_raw    = (unsigned short)bptr[0] | ((unsigned short)bptr[1] << 8u);
+    const unsigned short dmin_raw = (unsigned short)bptr[2] | ((unsigned short)bptr[3] << 8u);
+    const float d    = kq_pf_fast_fp16_to_float(d_raw);
+    const float dmin = kq_pf_fast_fp16_to_float(dmin_raw);
+    const unsigned char* scales = bptr + 4u;
+    const unsigned char* qs     = bptr + 16u;
+
+    float acc = 0.0f;
+    unsigned int y = 0u;
+    unsigned int q_off = 0u;
+    unsigned int is = 0u;
+
+    for (unsigned int g = 0u; g < 4u; ++g) {   /* (0..256).step_by(64) */
+        unsigned char sc1, mn1, sc2, mn2;
+        kq_pf_scale_min_k4(scales, is, &sc1, &mn1);
+        kq_pf_scale_min_k4(scales, is + 1u, &sc2, &mn2);
+        const float d1 = d * (float)sc1;
+        const float m1 = dmin * (float)mn1;
+        const float d2 = d * (float)sc2;
+        const float m2 = dmin * (float)mn2;
+
+        float qsum = 0.0f;
+        float xsum = 0.0f;
+        #pragma unroll 32
+        for (unsigned int l = 0u; l < 32u; ++l) {          /* 32 LOW nibbles */
+            const float xv = x[y + l];
+            qsum += (float)(qs[q_off + l] & 0x0Fu) * xv;
+            xsum += xv;
+        }
+        acc += d1 * qsum - m1 * xsum;
+        y += 32u;
+
+        qsum = 0.0f;
+        xsum = 0.0f;
+        #pragma unroll 32
+        for (unsigned int l = 0u; l < 32u; ++l) {          /* then 32 HIGH   */
+            const float xv = x[y + l];
+            qsum += (float)((unsigned int)qs[q_off + l] >> 4u) * xv;
+            xsum += xv;
+        }
+        acc += d2 * qsum - m2 * xsum;
+        y += 32u;
+
+        q_off += 32u;
+        is += 2u;
+    }
+    return acc;
+}
+
+/* ── Q5_K super-block · dot product (dequantize_row_q5_K) ──────────────── */
+static __device__ float kq_pf_dot_q5k(
+    const unsigned char* __restrict__ bptr,
+    const float* __restrict__ x
+) {
+    const unsigned short d_raw    = (unsigned short)bptr[0] | ((unsigned short)bptr[1] << 8u);
+    const unsigned short dmin_raw = (unsigned short)bptr[2] | ((unsigned short)bptr[3] << 8u);
+    const float d    = kq_pf_fast_fp16_to_float(d_raw);
+    const float dmin = kq_pf_fast_fp16_to_float(dmin_raw);
+    const unsigned char* scales = bptr + 4u;
+    const unsigned char* qh     = bptr + 16u;   /* 32 bytes, not advanced */
+    const unsigned char* ql     = bptr + 48u;
+
+    float acc = 0.0f;
+    unsigned int y = 0u;
+    unsigned int ql_off = 0u;
+    unsigned int is = 0u;
+    unsigned int u1 = 1u;
+    unsigned int u2 = 2u;
+
+    for (unsigned int g = 0u; g < 4u; ++g) {   /* (0..256).step_by(64) */
+        unsigned char sc1, mn1, sc2, mn2;
+        kq_pf_scale_min_k4(scales, is, &sc1, &mn1);
+        kq_pf_scale_min_k4(scales, is + 1u, &sc2, &mn2);
+        const float d1 = d * (float)sc1;
+        const float m1 = dmin * (float)mn1;
+        const float d2 = d * (float)sc2;
+        const float m2 = dmin * (float)mn2;
+
+        float qsum = 0.0f;
+        float xsum = 0.0f;
+        #pragma unroll 32
+        for (unsigned int l = 0u; l < 32u; ++l) {
+            const float xv = x[y + l];
+            const unsigned int hi = ((unsigned int)qh[l] & u1) != 0u ? 16u : 0u;
+            qsum += (float)((ql[ql_off + l] & 0x0Fu) + hi) * xv;
+            xsum += xv;
+        }
+        acc += d1 * qsum - m1 * xsum;
+        y += 32u;
+
+        qsum = 0.0f;
+        xsum = 0.0f;
+        #pragma unroll 32
+        for (unsigned int l = 0u; l < 32u; ++l) {
+            const float xv = x[y + l];
+            const unsigned int hi = ((unsigned int)qh[l] & u2) != 0u ? 16u : 0u;
+            qsum += (float)(((unsigned int)ql[ql_off + l] >> 4u) + hi) * xv;
+            xsum += xv;
+        }
+        acc += d2 * qsum - m2 * xsum;
+        y += 32u;
+
+        ql_off += 32u;
+        is += 2u;
+        u1 <<= 2u;
+        u2 <<= 2u;
+    }
+    return acc;
+}
+
+/* ── Q6_K super-block · dot product (dequantize_row_q6_K) ──────────────── */
+static __device__ float kq_pf_dot_q6k(
+    const unsigned char* __restrict__ bptr,
+    const float* __restrict__ x
+) {
+    const unsigned short d_raw = (unsigned short)bptr[208] | ((unsigned short)bptr[209] << 8u);
+    const float d = kq_pf_fast_fp16_to_float(d_raw);
+    const unsigned char* ql = bptr;
+    const unsigned char* qh = bptr + 128u;
+    const signed char* scales_i8 = (const signed char*)(bptr + 192u);
+
+    float acc = 0.0f;
+    unsigned int y = 0u;
+    unsigned int ql_off = 0u;
+    unsigned int qh_off = 0u;
+    unsigned int sc_off = 0u;
+
+    for (unsigned int n = 0u; n < 2u; ++n) {   /* (0..256).step_by(128) */
+        float dsc[8];
+        #pragma unroll
+        for (unsigned int t = 0u; t < 8u; ++t) {
+            dsc[t] = d * (float)(int)scales_i8[sc_off + t];
+        }
+
+        #pragma unroll 32
+        for (unsigned int l = 0u; l < 32u; ++l) {
+            const unsigned int is = l >> 4u;   /* l / 16 */
+            const unsigned int hq = qh[qh_off + l];
+            const int q1 = (int)((ql[ql_off + l] & 0x0Fu) | ((hq & 3u) << 4u)) - 32;
+            const int q2 = (int)((ql[ql_off + l + 32u] & 0x0Fu) | (((hq >> 2u) & 3u) << 4u)) - 32;
+            const int q3 = (int)(((unsigned int)ql[ql_off + l] >> 4u)
+                                 | (((hq >> 4u) & 3u) << 4u)) - 32;
+            const int q4 = (int)(((unsigned int)ql[ql_off + l + 32u] >> 4u)
+                                 | (((hq >> 6u) & 3u) << 4u)) - 32;
+
+            acc += dsc[is]      * (float)q1 * x[y + l];
+            acc += dsc[is + 2u] * (float)q2 * x[y + l + 32u];
+            acc += dsc[is + 4u] * (float)q3 * x[y + l + 64u];
+            acc += dsc[is + 6u] * (float)q4 * x[y + l + 96u];
+        }
+
+        y += 128u;
+        ql_off += 64u;
+        qh_off += 32u;
+        sc_off += 8u;
+    }
+    return acc;
+}
+
+/* ── Q8_K super-block · dot product (element-sequential) ───────────────── */
+static __device__ float kq_pf_dot_q8k(
+    const unsigned char* __restrict__ bptr,
+    const float* __restrict__ x
+) {
+    union { unsigned int u; float f; } ud;
+    ud.u = (unsigned int)bptr[0]
+         | ((unsigned int)bptr[1] << 8u)
+         | ((unsigned int)bptr[2] << 16u)
+         | ((unsigned int)bptr[3] << 24u);
+    const float d = ud.f;
+    const signed char* qs = (const signed char*)(bptr + 4u);
+
+    float acc = 0.0f;
+    #pragma unroll 32
+    for (unsigned int j = 0u; j < 256u; ++j) {
+        acc += d * (float)(int)qs[j] * x[j];
+    }
+    return acc;
 }
 
 /* =========================================================================
-   Q2_K kernels (84 bytes/block, 256 weights)
-   Block: [scales:16][qs:64][d_f16:2 @80][dmin_f16:2 @82]
-   16 sub-blocks × 16 weights. 2-bit quant, per-sub scale/min.
-   dequant: d*sc*q - dmin*mn  (q ∈ [0,3], sc=low nibble, mn=high nibble)
+   Q2_K kernels (84 bytes/block, 256 weights) — all three variants
+   reduce one super-block through kq_pf_dot_q2k().
    ========================================================================= */
 
-/* ── Kernel 1: gemm_q2k ─────────────────────────────────────────────────── */
+/* ── Kernel 1: gemm_q2k ──────────────────────────────────────────────── */
 extern "C" __global__ void gemm_q2k(
     const unsigned char* __restrict__ blocks,
     const float*         __restrict__ inputs,
@@ -177,7 +503,7 @@ extern "C" __global__ void gemm_q2k(
     const unsigned int row     = blockIdx.x * 8u + warp_id;
     if (row >= n_rows) return;
 
-    const unsigned int blocks_per_row = k >> 8u;  /* k / 256 */
+    const unsigned int blocks_per_row = k >> 8u;
 
     for (unsigned int col_base = 0u; col_base < batch_size; col_base += 8u) {
         const unsigned int cols_remaining = batch_size - col_base;
@@ -190,61 +516,23 @@ extern "C" __global__ void gemm_q2k(
         for (unsigned int b = lane; b < blocks_per_row; b += 32u) {
             const unsigned char* bptr = blocks
                 + (unsigned long long)(row * blocks_per_row + b) * 84u;
-
-            const unsigned short d_raw    = (unsigned short)bptr[80]
-                                          | ((unsigned short)bptr[81] << 8u);
-            const unsigned short dmin_raw = (unsigned short)bptr[82]
-                                          | ((unsigned short)bptr[83] << 8u);
-            const float d    = kq_pf_fast_fp16_to_float(d_raw);
-            const float dmin = kq_pf_fast_fp16_to_float(dmin_raw);
-
-            const unsigned int x_base = b << 8u;  /* b * 256 */
+            const unsigned int x_base = b << 8u;
 
             for (unsigned int col = 0u; col < cols; ++col) {
                 const float* xbase = inputs + (unsigned long long)(col_base + col) * k + x_base;
-                float bsum = 0.0f;
-
-                #pragma unroll 16
-                for (unsigned int sub = 0u; sub < 16u; ++sub) {
-                    const unsigned char sc_byte = bptr[sub];
-                    const float sub_sc = (float)(sc_byte & 0x0Fu);
-                    const float sub_mn = (float)((sc_byte >> 4u) & 0x0Fu);
-                    const unsigned int w_base = sub * 16u;
-                    const unsigned int q_base = sub * 4u;
-
-                    float sub_acc  = 0.0f;
-                    float sub_xsum = 0.0f;
-                    #pragma unroll 4
-                    for (unsigned int qb = 0u; qb < 4u; ++qb) {
-                        const unsigned char byte_val = bptr[16u + q_base + qb];
-                        #pragma unroll 4
-                        for (unsigned int bit = 0u; bit < 4u; ++bit) {
-                            const float q = (float)((byte_val >> (bit * 2u)) & 0x3u);
-                            const float x = xbase[w_base + qb * 4u + bit];
-                            sub_acc  += q * x;
-                            sub_xsum += x;
-                        }
-                    }
-                    bsum += d * sub_sc * sub_acc - dmin * sub_mn * sub_xsum;
-                }
-                col_sums[col] += bsum;
+                col_sums[col] += kq_pf_dot_q2k(bptr, xbase);
             }
         }
 
         for (unsigned int col = 0u; col < cols; ++col) {
-            float s = col_sums[col];
-            s += __shfl_down_sync(0xffffffffu, s, 16u);
-            s += __shfl_down_sync(0xffffffffu, s,  8u);
-            s += __shfl_down_sync(0xffffffffu, s,  4u);
-            s += __shfl_down_sync(0xffffffffu, s,  2u);
-            s += __shfl_down_sync(0xffffffffu, s,  1u);
+            const float s = kq_pf_warp_reduce(col_sums[col]);
             if (lane == 0u)
                 outputs[(unsigned long long)(col_base + col) * n_rows + row] += s;
         }
     }
 }
 
-/* ── Kernel 2: gemm_q2k_residual ────────────────────────────────────────── */
+/* ── Kernel 2: gemm_q2k_residual ─────────────────────────────────────── */
 extern "C" __global__ void gemm_q2k_residual(
     const unsigned char* __restrict__ blocks,
     const float*         __restrict__ inputs,
@@ -272,54 +560,16 @@ extern "C" __global__ void gemm_q2k_residual(
         for (unsigned int b = lane; b < blocks_per_row; b += 32u) {
             const unsigned char* bptr = blocks
                 + (unsigned long long)(row * blocks_per_row + b) * 84u;
-
-            const unsigned short d_raw    = (unsigned short)bptr[80]
-                                          | ((unsigned short)bptr[81] << 8u);
-            const unsigned short dmin_raw = (unsigned short)bptr[82]
-                                          | ((unsigned short)bptr[83] << 8u);
-            const float d    = kq_pf_fast_fp16_to_float(d_raw);
-            const float dmin = kq_pf_fast_fp16_to_float(dmin_raw);
-
             const unsigned int x_base = b << 8u;
 
             for (unsigned int col = 0u; col < cols; ++col) {
                 const float* xbase = inputs + (unsigned long long)(col_base + col) * k + x_base;
-                float bsum = 0.0f;
-
-                #pragma unroll 16
-                for (unsigned int sub = 0u; sub < 16u; ++sub) {
-                    const unsigned char sc_byte = bptr[sub];
-                    const float sub_sc = (float)(sc_byte & 0x0Fu);
-                    const float sub_mn = (float)((sc_byte >> 4u) & 0x0Fu);
-                    const unsigned int w_base = sub * 16u;
-                    const unsigned int q_base = sub * 4u;
-
-                    float sub_acc  = 0.0f;
-                    float sub_xsum = 0.0f;
-                    #pragma unroll 4
-                    for (unsigned int qb = 0u; qb < 4u; ++qb) {
-                        const unsigned char byte_val = bptr[16u + q_base + qb];
-                        #pragma unroll 4
-                        for (unsigned int bit = 0u; bit < 4u; ++bit) {
-                            const float q = (float)((byte_val >> (bit * 2u)) & 0x3u);
-                            const float x = xbase[w_base + qb * 4u + bit];
-                            sub_acc  += q * x;
-                            sub_xsum += x;
-                        }
-                    }
-                    bsum += d * sub_sc * sub_acc - dmin * sub_mn * sub_xsum;
-                }
-                col_sums[col] += bsum;
+                col_sums[col] += kq_pf_dot_q2k(bptr, xbase);
             }
         }
 
         for (unsigned int col = 0u; col < cols; ++col) {
-            float s = col_sums[col];
-            s += __shfl_down_sync(0xffffffffu, s, 16u);
-            s += __shfl_down_sync(0xffffffffu, s,  8u);
-            s += __shfl_down_sync(0xffffffffu, s,  4u);
-            s += __shfl_down_sync(0xffffffffu, s,  2u);
-            s += __shfl_down_sync(0xffffffffu, s,  1u);
+            const float s = kq_pf_warp_reduce(col_sums[col]);
             if (lane == 0u) {
                 const unsigned long long idx = (unsigned long long)(col_base + col) * n_rows + row;
                 outputs[idx] = residual[idx] + s;
@@ -328,7 +578,7 @@ extern "C" __global__ void gemm_q2k_residual(
     }
 }
 
-/* ── Kernel 3: fused_gate_up_swiglu_gemm_q2k ───────────────────────────── */
+/* ── Kernel 3: fused_gate_up_swiglu_gemm_q2k ─────────────────────────── */
 extern "C" __global__ void fused_gate_up_swiglu_gemm_q2k(
     const unsigned char* __restrict__ gate_up_blocks,
     const float*         __restrict__ inputs,
@@ -359,78 +609,18 @@ extern "C" __global__ void fused_gate_up_swiglu_gemm_q2k(
             const unsigned long long g_idx = (unsigned long long)(row * blocks_per_row + b);
             const unsigned char* gbptr = gate_up_blocks + g_idx * 84u;
             const unsigned char* ubptr = gate_up_blocks + (up_block_offset + g_idx) * 84u;
-
-            const unsigned short gd_raw    = (unsigned short)gbptr[80]
-                                           | ((unsigned short)gbptr[81] << 8u);
-            const unsigned short gdmin_raw = (unsigned short)gbptr[82]
-                                           | ((unsigned short)gbptr[83] << 8u);
-            const float gd    = kq_pf_fast_fp16_to_float(gd_raw);
-            const float gdmin = kq_pf_fast_fp16_to_float(gdmin_raw);
-
-            const unsigned short ud_raw    = (unsigned short)ubptr[80]
-                                           | ((unsigned short)ubptr[81] << 8u);
-            const unsigned short udmin_raw = (unsigned short)ubptr[82]
-                                           | ((unsigned short)ubptr[83] << 8u);
-            const float ud    = kq_pf_fast_fp16_to_float(ud_raw);
-            const float udmin = kq_pf_fast_fp16_to_float(udmin_raw);
-
             const unsigned int x_base = b << 8u;
 
             for (unsigned int col = 0u; col < cols; ++col) {
                 const float* xbase = inputs + (unsigned long long)(col_base + col) * k + x_base;
-                float gbsum = 0.0f;
-                float ubsum = 0.0f;
-
-                #pragma unroll 16
-                for (unsigned int sub = 0u; sub < 16u; ++sub) {
-                    const unsigned char gsc_byte = gbptr[sub];
-                    const float gsub_sc = (float)(gsc_byte & 0x0Fu);
-                    const float gsub_mn = (float)((gsc_byte >> 4u) & 0x0Fu);
-                    const unsigned char usc_byte = ubptr[sub];
-                    const float usub_sc = (float)(usc_byte & 0x0Fu);
-                    const float usub_mn = (float)((usc_byte >> 4u) & 0x0Fu);
-
-                    const unsigned int w_base = sub * 16u;
-                    const unsigned int q_base = sub * 4u;
-
-                    float gsub_acc = 0.0f; float gsub_xsum = 0.0f;
-                    float usub_acc = 0.0f; float usub_xsum = 0.0f;
-                    #pragma unroll 4
-                    for (unsigned int qb = 0u; qb < 4u; ++qb) {
-                        const unsigned char gbyte = gbptr[16u + q_base + qb];
-                        const unsigned char ubyte = ubptr[16u + q_base + qb];
-                        #pragma unroll 4
-                        for (unsigned int bit = 0u; bit < 4u; ++bit) {
-                            const float x  = xbase[w_base + qb * 4u + bit];
-                            const float gq = (float)((gbyte >> (bit * 2u)) & 0x3u);
-                            const float uq = (float)((ubyte >> (bit * 2u)) & 0x3u);
-                            gsub_acc  += gq * x;
-                            usub_acc  += uq * x;
-                            gsub_xsum += x;
-                            usub_xsum += x;
-                        }
-                    }
-                    gbsum += gd * gsub_sc * gsub_acc - gdmin * gsub_mn * gsub_xsum;
-                    ubsum += ud * usub_sc * usub_acc - udmin * usub_mn * usub_xsum;
-                }
-                gate_sums[col] += gbsum;
-                up_sums[col]   += ubsum;
+                gate_sums[col] += kq_pf_dot_q2k(gbptr, xbase);
+                up_sums[col]   += kq_pf_dot_q2k(ubptr, xbase);
             }
         }
 
         for (unsigned int col = 0u; col < cols; ++col) {
-            float gs = gate_sums[col];
-            float us = up_sums[col];
-            gs += __shfl_down_sync(0xffffffffu, gs, 16u);
-            gs += __shfl_down_sync(0xffffffffu, gs,  8u);
-            gs += __shfl_down_sync(0xffffffffu, gs,  4u);
-            gs += __shfl_down_sync(0xffffffffu, gs,  2u);
-            gs += __shfl_down_sync(0xffffffffu, gs,  1u);
-            us += __shfl_down_sync(0xffffffffu, us, 16u);
-            us += __shfl_down_sync(0xffffffffu, us,  8u);
-            us += __shfl_down_sync(0xffffffffu, us,  4u);
-            us += __shfl_down_sync(0xffffffffu, us,  2u);
-            us += __shfl_down_sync(0xffffffffu, us,  1u);
+            const float gs = kq_pf_warp_reduce(gate_sums[col]);
+            const float us = kq_pf_warp_reduce(up_sums[col]);
             if (lane == 0u) {
                 outputs[(unsigned long long)(col_base + col) * n_rows + row] =
                     kq_pf_silu(gs) * us;
@@ -440,13 +630,11 @@ extern "C" __global__ void fused_gate_up_swiglu_gemm_q2k(
 }
 
 /* =========================================================================
-   Q3_K kernels (110 bytes/block, 256 weights)
-   Block: [hmask:32 @0][qs:64 @32][scales:12 @96][d_f16:2 @108]
-   16 sub-blocks × 16 weights. q3=lo2|(hi<<2), q3_signed=q3-4.
-   signed_sc = nibble-8.  dequant: d*signed_sc*q3_signed
+   Q3_K kernels (110 bytes/block, 256 weights) — all three variants
+   reduce one super-block through kq_pf_dot_q3k().
    ========================================================================= */
 
-/* ── Kernel 4: gemm_q3k ─────────────────────────────────────────────────── */
+/* ── Kernel 4: gemm_q3k ──────────────────────────────────────────────── */
 extern "C" __global__ void gemm_q3k(
     const unsigned char* __restrict__ blocks,
     const float*         __restrict__ inputs,
@@ -473,56 +661,23 @@ extern "C" __global__ void gemm_q3k(
         for (unsigned int b = lane; b < blocks_per_row; b += 32u) {
             const unsigned char* bptr = blocks
                 + (unsigned long long)(row * blocks_per_row + b) * 110u;
-
-            const unsigned short d_raw = (unsigned short)bptr[108]
-                                       | ((unsigned short)bptr[109] << 8u);
-            const float d = kq_pf_fast_fp16_to_float(d_raw);
-
             const unsigned int x_base = b << 8u;
 
             for (unsigned int col = 0u; col < cols; ++col) {
                 const float* xbase = inputs + (unsigned long long)(col_base + col) * k + x_base;
-                float bsum = 0.0f;
-
-                #pragma unroll 16
-                for (unsigned int sub = 0u; sub < 16u; ++sub) {
-                    const unsigned char sc_byte = bptr[96u + sub / 2u];
-                    const unsigned int nibble = (sub & 1u) == 0u
-                        ? (sc_byte & 0x0Fu)
-                        : ((sc_byte >> 4u) & 0x0Fu);
-                    const float signed_sc = (float)(int)nibble - 8.0f;
-                    const unsigned int w_base = sub * 16u;
-
-                    float sub_acc = 0.0f;
-                    #pragma unroll 16
-                    for (unsigned int j = 0u; j < 16u; ++j) {
-                        const unsigned int wi = w_base + j;
-                        const unsigned int hi  = (bptr[wi >> 3u] >> (wi & 7u)) & 0x1u;
-                        const unsigned int lo2 = (bptr[32u + (wi >> 2u)] >> ((wi & 3u) * 2u)) & 0x3u;
-                        const int q3_code   = (int)(lo2 | (hi << 2u));
-                        const int q3_signed = q3_code - 4;
-                        sub_acc += (float)q3_signed * xbase[wi];
-                    }
-                    bsum += d * signed_sc * sub_acc;
-                }
-                col_sums[col] += bsum;
+                col_sums[col] += kq_pf_dot_q3k(bptr, xbase);
             }
         }
 
         for (unsigned int col = 0u; col < cols; ++col) {
-            float s = col_sums[col];
-            s += __shfl_down_sync(0xffffffffu, s, 16u);
-            s += __shfl_down_sync(0xffffffffu, s,  8u);
-            s += __shfl_down_sync(0xffffffffu, s,  4u);
-            s += __shfl_down_sync(0xffffffffu, s,  2u);
-            s += __shfl_down_sync(0xffffffffu, s,  1u);
+            const float s = kq_pf_warp_reduce(col_sums[col]);
             if (lane == 0u)
                 outputs[(unsigned long long)(col_base + col) * n_rows + row] += s;
         }
     }
 }
 
-/* ── Kernel 5: gemm_q3k_residual ────────────────────────────────────────── */
+/* ── Kernel 5: gemm_q3k_residual ─────────────────────────────────────── */
 extern "C" __global__ void gemm_q3k_residual(
     const unsigned char* __restrict__ blocks,
     const float*         __restrict__ inputs,
@@ -550,49 +705,16 @@ extern "C" __global__ void gemm_q3k_residual(
         for (unsigned int b = lane; b < blocks_per_row; b += 32u) {
             const unsigned char* bptr = blocks
                 + (unsigned long long)(row * blocks_per_row + b) * 110u;
-
-            const unsigned short d_raw = (unsigned short)bptr[108]
-                                       | ((unsigned short)bptr[109] << 8u);
-            const float d = kq_pf_fast_fp16_to_float(d_raw);
-
             const unsigned int x_base = b << 8u;
 
             for (unsigned int col = 0u; col < cols; ++col) {
                 const float* xbase = inputs + (unsigned long long)(col_base + col) * k + x_base;
-                float bsum = 0.0f;
-
-                #pragma unroll 16
-                for (unsigned int sub = 0u; sub < 16u; ++sub) {
-                    const unsigned char sc_byte = bptr[96u + sub / 2u];
-                    const unsigned int nibble = (sub & 1u) == 0u
-                        ? (sc_byte & 0x0Fu)
-                        : ((sc_byte >> 4u) & 0x0Fu);
-                    const float signed_sc = (float)(int)nibble - 8.0f;
-                    const unsigned int w_base = sub * 16u;
-
-                    float sub_acc = 0.0f;
-                    #pragma unroll 16
-                    for (unsigned int j = 0u; j < 16u; ++j) {
-                        const unsigned int wi = w_base + j;
-                        const unsigned int hi  = (bptr[wi >> 3u] >> (wi & 7u)) & 0x1u;
-                        const unsigned int lo2 = (bptr[32u + (wi >> 2u)] >> ((wi & 3u) * 2u)) & 0x3u;
-                        const int q3_code   = (int)(lo2 | (hi << 2u));
-                        const int q3_signed = q3_code - 4;
-                        sub_acc += (float)q3_signed * xbase[wi];
-                    }
-                    bsum += d * signed_sc * sub_acc;
-                }
-                col_sums[col] += bsum;
+                col_sums[col] += kq_pf_dot_q3k(bptr, xbase);
             }
         }
 
         for (unsigned int col = 0u; col < cols; ++col) {
-            float s = col_sums[col];
-            s += __shfl_down_sync(0xffffffffu, s, 16u);
-            s += __shfl_down_sync(0xffffffffu, s,  8u);
-            s += __shfl_down_sync(0xffffffffu, s,  4u);
-            s += __shfl_down_sync(0xffffffffu, s,  2u);
-            s += __shfl_down_sync(0xffffffffu, s,  1u);
+            const float s = kq_pf_warp_reduce(col_sums[col]);
             if (lane == 0u) {
                 const unsigned long long idx = (unsigned long long)(col_base + col) * n_rows + row;
                 outputs[idx] = residual[idx] + s;
@@ -601,7 +723,7 @@ extern "C" __global__ void gemm_q3k_residual(
     }
 }
 
-/* ── Kernel 6: fused_gate_up_swiglu_gemm_q3k ───────────────────────────── */
+/* ── Kernel 6: fused_gate_up_swiglu_gemm_q3k ─────────────────────────── */
 extern "C" __global__ void fused_gate_up_swiglu_gemm_q3k(
     const unsigned char* __restrict__ gate_up_blocks,
     const float*         __restrict__ inputs,
@@ -632,74 +754,18 @@ extern "C" __global__ void fused_gate_up_swiglu_gemm_q3k(
             const unsigned long long g_idx = (unsigned long long)(row * blocks_per_row + b);
             const unsigned char* gbptr = gate_up_blocks + g_idx * 110u;
             const unsigned char* ubptr = gate_up_blocks + (up_block_offset + g_idx) * 110u;
-
-            const unsigned short gd_raw = (unsigned short)gbptr[108]
-                                        | ((unsigned short)gbptr[109] << 8u);
-            const float gd = kq_pf_fast_fp16_to_float(gd_raw);
-
-            const unsigned short ud_raw = (unsigned short)ubptr[108]
-                                        | ((unsigned short)ubptr[109] << 8u);
-            const float ud = kq_pf_fast_fp16_to_float(ud_raw);
-
             const unsigned int x_base = b << 8u;
 
             for (unsigned int col = 0u; col < cols; ++col) {
                 const float* xbase = inputs + (unsigned long long)(col_base + col) * k + x_base;
-                float gbsum = 0.0f;
-                float ubsum = 0.0f;
-
-                #pragma unroll 16
-                for (unsigned int sub = 0u; sub < 16u; ++sub) {
-                    const unsigned char gsc_byte = gbptr[96u + sub / 2u];
-                    const unsigned int gnibble = (sub & 1u) == 0u
-                        ? (gsc_byte & 0x0Fu) : ((gsc_byte >> 4u) & 0x0Fu);
-                    const float g_signed_sc = (float)(int)gnibble - 8.0f;
-
-                    const unsigned char usc_byte = ubptr[96u + sub / 2u];
-                    const unsigned int unibble = (sub & 1u) == 0u
-                        ? (usc_byte & 0x0Fu) : ((usc_byte >> 4u) & 0x0Fu);
-                    const float u_signed_sc = (float)(int)unibble - 8.0f;
-
-                    const unsigned int w_base = sub * 16u;
-                    float gsub_acc = 0.0f;
-                    float usub_acc = 0.0f;
-
-                    #pragma unroll 16
-                    for (unsigned int j = 0u; j < 16u; ++j) {
-                        const unsigned int wi = w_base + j;
-                        const unsigned int ghi  = (gbptr[wi >> 3u] >> (wi & 7u)) & 0x1u;
-                        const unsigned int glo2 = (gbptr[32u + (wi >> 2u)] >> ((wi & 3u) * 2u)) & 0x3u;
-                        const int gq3  = (int)(glo2 | (ghi << 2u)) - 4;
-
-                        const unsigned int uhi  = (ubptr[wi >> 3u] >> (wi & 7u)) & 0x1u;
-                        const unsigned int ulo2 = (ubptr[32u + (wi >> 2u)] >> ((wi & 3u) * 2u)) & 0x3u;
-                        const int uq3  = (int)(ulo2 | (uhi << 2u)) - 4;
-
-                        const float x = xbase[wi];
-                        gsub_acc += (float)gq3 * x;
-                        usub_acc += (float)uq3 * x;
-                    }
-                    gbsum += gd * g_signed_sc * gsub_acc;
-                    ubsum += ud * u_signed_sc * usub_acc;
-                }
-                gate_sums[col] += gbsum;
-                up_sums[col]   += ubsum;
+                gate_sums[col] += kq_pf_dot_q3k(gbptr, xbase);
+                up_sums[col]   += kq_pf_dot_q3k(ubptr, xbase);
             }
         }
 
         for (unsigned int col = 0u; col < cols; ++col) {
-            float gs = gate_sums[col];
-            float us = up_sums[col];
-            gs += __shfl_down_sync(0xffffffffu, gs, 16u);
-            gs += __shfl_down_sync(0xffffffffu, gs,  8u);
-            gs += __shfl_down_sync(0xffffffffu, gs,  4u);
-            gs += __shfl_down_sync(0xffffffffu, gs,  2u);
-            gs += __shfl_down_sync(0xffffffffu, gs,  1u);
-            us += __shfl_down_sync(0xffffffffu, us, 16u);
-            us += __shfl_down_sync(0xffffffffu, us,  8u);
-            us += __shfl_down_sync(0xffffffffu, us,  4u);
-            us += __shfl_down_sync(0xffffffffu, us,  2u);
-            us += __shfl_down_sync(0xffffffffu, us,  1u);
+            const float gs = kq_pf_warp_reduce(gate_sums[col]);
+            const float us = kq_pf_warp_reduce(up_sums[col]);
             if (lane == 0u) {
                 outputs[(unsigned long long)(col_base + col) * n_rows + row] =
                     kq_pf_silu(gs) * us;
@@ -709,13 +775,11 @@ extern "C" __global__ void fused_gate_up_swiglu_gemm_q3k(
 }
 
 /* =========================================================================
-   Q4_K kernels (144 bytes/block, 256 weights)
-   Block: [d_f16:2 @0][dmin_f16:2 @2][scales:12 @4][qs:128 @16]
-   8 sub-blocks × 32 weights. 6-bit scale decode.
-   dequant: d*sc[sub]*q - dmin*mn[sub]
+   Q4_K kernels (144 bytes/block, 256 weights) — all three variants
+   reduce one super-block through kq_pf_dot_q4k().
    ========================================================================= */
 
-/* ── Kernel 7: gemm_q4k ─────────────────────────────────────────────────── */
+/* ── Kernel 7: gemm_q4k ──────────────────────────────────────────────── */
 extern "C" __global__ void gemm_q4k(
     const unsigned char* __restrict__ blocks,
     const float*         __restrict__ inputs,
@@ -742,62 +806,23 @@ extern "C" __global__ void gemm_q4k(
         for (unsigned int b = lane; b < blocks_per_row; b += 32u) {
             const unsigned char* bptr = blocks
                 + (unsigned long long)(row * blocks_per_row + b) * 144u;
-
-            const unsigned short d_raw    = (unsigned short)bptr[0]
-                                          | ((unsigned short)bptr[1] << 8u);
-            const unsigned short dmin_raw = (unsigned short)bptr[2]
-                                          | ((unsigned short)bptr[3] << 8u);
-            const float d    = kq_pf_fast_fp16_to_float(d_raw);
-            const float dmin = kq_pf_fast_fp16_to_float(dmin_raw);
-
-            unsigned char sc[8], mn[8];
-            kq_pf_decode_6bit_scales(bptr + 4u, sc, mn);
-
             const unsigned int x_base = b << 8u;
 
             for (unsigned int col = 0u; col < cols; ++col) {
                 const float* xbase = inputs + (unsigned long long)(col_base + col) * k + x_base;
-                float bsum = 0.0f;
-
-                #pragma unroll 8
-                for (unsigned int sub = 0u; sub < 8u; ++sub) {
-                    const float sc_f = (float)sc[sub];
-                    const float mn_f = (float)mn[sub];
-                    const unsigned char* qs_sub = bptr + 16u + sub * 16u;
-                    const float* x_sub = xbase + sub * 32u;
-
-                    float sub_acc  = 0.0f;
-                    float sub_xsum = 0.0f;
-                    #pragma unroll 16
-                    for (unsigned int nb = 0u; nb < 16u; ++nb) {
-                        const unsigned int bv = qs_sub[nb];
-                        const float q0 = (float)(bv & 0x0Fu);
-                        const float q1 = (float)((bv >> 4u) & 0x0Fu);
-                        const float x0 = x_sub[nb * 2u];
-                        const float x1 = x_sub[nb * 2u + 1u];
-                        sub_acc  += q0 * x0 + q1 * x1;
-                        sub_xsum += x0 + x1;
-                    }
-                    bsum += d * sc_f * sub_acc - dmin * mn_f * sub_xsum;
-                }
-                col_sums[col] += bsum;
+                col_sums[col] += kq_pf_dot_q4k(bptr, xbase);
             }
         }
 
         for (unsigned int col = 0u; col < cols; ++col) {
-            float s = col_sums[col];
-            s += __shfl_down_sync(0xffffffffu, s, 16u);
-            s += __shfl_down_sync(0xffffffffu, s,  8u);
-            s += __shfl_down_sync(0xffffffffu, s,  4u);
-            s += __shfl_down_sync(0xffffffffu, s,  2u);
-            s += __shfl_down_sync(0xffffffffu, s,  1u);
+            const float s = kq_pf_warp_reduce(col_sums[col]);
             if (lane == 0u)
                 outputs[(unsigned long long)(col_base + col) * n_rows + row] += s;
         }
     }
 }
 
-/* ── Kernel 8: gemm_q4k_residual ────────────────────────────────────────── */
+/* ── Kernel 8: gemm_q4k_residual ─────────────────────────────────────── */
 extern "C" __global__ void gemm_q4k_residual(
     const unsigned char* __restrict__ blocks,
     const float*         __restrict__ inputs,
@@ -825,55 +850,16 @@ extern "C" __global__ void gemm_q4k_residual(
         for (unsigned int b = lane; b < blocks_per_row; b += 32u) {
             const unsigned char* bptr = blocks
                 + (unsigned long long)(row * blocks_per_row + b) * 144u;
-
-            const unsigned short d_raw    = (unsigned short)bptr[0]
-                                          | ((unsigned short)bptr[1] << 8u);
-            const unsigned short dmin_raw = (unsigned short)bptr[2]
-                                          | ((unsigned short)bptr[3] << 8u);
-            const float d    = kq_pf_fast_fp16_to_float(d_raw);
-            const float dmin = kq_pf_fast_fp16_to_float(dmin_raw);
-
-            unsigned char sc[8], mn[8];
-            kq_pf_decode_6bit_scales(bptr + 4u, sc, mn);
-
             const unsigned int x_base = b << 8u;
 
             for (unsigned int col = 0u; col < cols; ++col) {
                 const float* xbase = inputs + (unsigned long long)(col_base + col) * k + x_base;
-                float bsum = 0.0f;
-
-                #pragma unroll 8
-                for (unsigned int sub = 0u; sub < 8u; ++sub) {
-                    const float sc_f = (float)sc[sub];
-                    const float mn_f = (float)mn[sub];
-                    const unsigned char* qs_sub = bptr + 16u + sub * 16u;
-                    const float* x_sub = xbase + sub * 32u;
-
-                    float sub_acc  = 0.0f;
-                    float sub_xsum = 0.0f;
-                    #pragma unroll 16
-                    for (unsigned int nb = 0u; nb < 16u; ++nb) {
-                        const unsigned int bv = qs_sub[nb];
-                        const float q0 = (float)(bv & 0x0Fu);
-                        const float q1 = (float)((bv >> 4u) & 0x0Fu);
-                        const float x0 = x_sub[nb * 2u];
-                        const float x1 = x_sub[nb * 2u + 1u];
-                        sub_acc  += q0 * x0 + q1 * x1;
-                        sub_xsum += x0 + x1;
-                    }
-                    bsum += d * sc_f * sub_acc - dmin * mn_f * sub_xsum;
-                }
-                col_sums[col] += bsum;
+                col_sums[col] += kq_pf_dot_q4k(bptr, xbase);
             }
         }
 
         for (unsigned int col = 0u; col < cols; ++col) {
-            float s = col_sums[col];
-            s += __shfl_down_sync(0xffffffffu, s, 16u);
-            s += __shfl_down_sync(0xffffffffu, s,  8u);
-            s += __shfl_down_sync(0xffffffffu, s,  4u);
-            s += __shfl_down_sync(0xffffffffu, s,  2u);
-            s += __shfl_down_sync(0xffffffffu, s,  1u);
+            const float s = kq_pf_warp_reduce(col_sums[col]);
             if (lane == 0u) {
                 const unsigned long long idx = (unsigned long long)(col_base + col) * n_rows + row;
                 outputs[idx] = residual[idx] + s;
@@ -882,7 +868,7 @@ extern "C" __global__ void gemm_q4k_residual(
     }
 }
 
-/* ── Kernel 9: fused_gate_up_swiglu_gemm_q4k ───────────────────────────── */
+/* ── Kernel 9: fused_gate_up_swiglu_gemm_q4k ─────────────────────────── */
 extern "C" __global__ void fused_gate_up_swiglu_gemm_q4k(
     const unsigned char* __restrict__ gate_up_blocks,
     const float*         __restrict__ inputs,
@@ -913,78 +899,18 @@ extern "C" __global__ void fused_gate_up_swiglu_gemm_q4k(
             const unsigned long long g_idx = (unsigned long long)(row * blocks_per_row + b);
             const unsigned char* gbptr = gate_up_blocks + g_idx * 144u;
             const unsigned char* ubptr = gate_up_blocks + (up_block_offset + g_idx) * 144u;
-
-            const unsigned short gd_raw    = (unsigned short)gbptr[0]
-                                           | ((unsigned short)gbptr[1] << 8u);
-            const unsigned short gdmin_raw = (unsigned short)gbptr[2]
-                                           | ((unsigned short)gbptr[3] << 8u);
-            const float gd    = kq_pf_fast_fp16_to_float(gd_raw);
-            const float gdmin = kq_pf_fast_fp16_to_float(gdmin_raw);
-
-            const unsigned short ud_raw    = (unsigned short)ubptr[0]
-                                           | ((unsigned short)ubptr[1] << 8u);
-            const unsigned short udmin_raw = (unsigned short)ubptr[2]
-                                           | ((unsigned short)ubptr[3] << 8u);
-            const float ud    = kq_pf_fast_fp16_to_float(ud_raw);
-            const float udmin = kq_pf_fast_fp16_to_float(udmin_raw);
-
-            unsigned char gsc[8], gmn[8], usc[8], umn[8];
-            kq_pf_decode_6bit_scales(gbptr + 4u, gsc, gmn);
-            kq_pf_decode_6bit_scales(ubptr + 4u, usc, umn);
-
             const unsigned int x_base = b << 8u;
 
             for (unsigned int col = 0u; col < cols; ++col) {
                 const float* xbase = inputs + (unsigned long long)(col_base + col) * k + x_base;
-                float gbsum = 0.0f;
-                float ubsum = 0.0f;
-
-                #pragma unroll 8
-                for (unsigned int sub = 0u; sub < 8u; ++sub) {
-                    const float gsc_f = (float)gsc[sub];
-                    const float gmn_f = (float)gmn[sub];
-                    const float usc_f = (float)usc[sub];
-                    const float umn_f = (float)umn[sub];
-                    const unsigned char* gqs_sub = gbptr + 16u + sub * 16u;
-                    const unsigned char* uqs_sub = ubptr + 16u + sub * 16u;
-                    const float* x_sub = xbase + sub * 32u;
-
-                    float gsub_acc = 0.0f; float gsub_xsum = 0.0f;
-                    float usub_acc = 0.0f; float usub_xsum = 0.0f;
-                    #pragma unroll 16
-                    for (unsigned int nb = 0u; nb < 16u; ++nb) {
-                        const float x0 = x_sub[nb * 2u];
-                        const float x1 = x_sub[nb * 2u + 1u];
-                        const float gq0 = (float)(gqs_sub[nb] & 0x0Fu);
-                        const float gq1 = (float)((gqs_sub[nb] >> 4u) & 0x0Fu);
-                        const float uq0 = (float)(uqs_sub[nb] & 0x0Fu);
-                        const float uq1 = (float)((uqs_sub[nb] >> 4u) & 0x0Fu);
-                        gsub_acc  += gq0 * x0 + gq1 * x1;
-                        gsub_xsum += x0 + x1;
-                        usub_acc  += uq0 * x0 + uq1 * x1;
-                        usub_xsum += x0 + x1;
-                    }
-                    gbsum += gd * gsc_f * gsub_acc - gdmin * gmn_f * gsub_xsum;
-                    ubsum += ud * usc_f * usub_acc - udmin * umn_f * usub_xsum;
-                }
-                gate_sums[col] += gbsum;
-                up_sums[col]   += ubsum;
+                gate_sums[col] += kq_pf_dot_q4k(gbptr, xbase);
+                up_sums[col]   += kq_pf_dot_q4k(ubptr, xbase);
             }
         }
 
         for (unsigned int col = 0u; col < cols; ++col) {
-            float gs = gate_sums[col];
-            float us = up_sums[col];
-            gs += __shfl_down_sync(0xffffffffu, gs, 16u);
-            gs += __shfl_down_sync(0xffffffffu, gs,  8u);
-            gs += __shfl_down_sync(0xffffffffu, gs,  4u);
-            gs += __shfl_down_sync(0xffffffffu, gs,  2u);
-            gs += __shfl_down_sync(0xffffffffu, gs,  1u);
-            us += __shfl_down_sync(0xffffffffu, us, 16u);
-            us += __shfl_down_sync(0xffffffffu, us,  8u);
-            us += __shfl_down_sync(0xffffffffu, us,  4u);
-            us += __shfl_down_sync(0xffffffffu, us,  2u);
-            us += __shfl_down_sync(0xffffffffu, us,  1u);
+            const float gs = kq_pf_warp_reduce(gate_sums[col]);
+            const float us = kq_pf_warp_reduce(up_sums[col]);
             if (lane == 0u) {
                 outputs[(unsigned long long)(col_base + col) * n_rows + row] =
                     kq_pf_silu(gs) * us;
@@ -994,13 +920,11 @@ extern "C" __global__ void fused_gate_up_swiglu_gemm_q4k(
 }
 
 /* =========================================================================
-   Q5_K kernels (176 bytes/block, 256 weights)
-   Block: [d_f16:2 @0][dmin_f16:2 @2][scales:12 @4][qh:32 @16][qs:128 @48]
-   8 sub-blocks × 32 weights. q5 = nibble|(hi<<4).
-   dequant: d*sc[sub]*q5 - dmin*mn[sub]
+   Q5_K kernels (176 bytes/block, 256 weights) — all three variants
+   reduce one super-block through kq_pf_dot_q5k().
    ========================================================================= */
 
-/* ── Kernel 10: gemm_q5k ────────────────────────────────────────────────── */
+/* ── Kernel 10: gemm_q5k ─────────────────────────────────────────────── */
 extern "C" __global__ void gemm_q5k(
     const unsigned char* __restrict__ blocks,
     const float*         __restrict__ inputs,
@@ -1027,68 +951,23 @@ extern "C" __global__ void gemm_q5k(
         for (unsigned int b = lane; b < blocks_per_row; b += 32u) {
             const unsigned char* bptr = blocks
                 + (unsigned long long)(row * blocks_per_row + b) * 176u;
-
-            const unsigned short d_raw    = (unsigned short)bptr[0]
-                                          | ((unsigned short)bptr[1] << 8u);
-            const unsigned short dmin_raw = (unsigned short)bptr[2]
-                                          | ((unsigned short)bptr[3] << 8u);
-            const float d    = kq_pf_fast_fp16_to_float(d_raw);
-            const float dmin = kq_pf_fast_fp16_to_float(dmin_raw);
-
-            unsigned char sc[8], mn[8];
-            kq_pf_decode_6bit_scales(bptr + 4u, sc, mn);
-
-            const unsigned char* qh = bptr + 16u;
-            const unsigned char* qs = bptr + 48u;
             const unsigned int x_base = b << 8u;
 
             for (unsigned int col = 0u; col < cols; ++col) {
                 const float* xbase = inputs + (unsigned long long)(col_base + col) * k + x_base;
-                float bsum = 0.0f;
-
-                #pragma unroll 8
-                for (unsigned int sub = 0u; sub < 8u; ++sub) {
-                    const float sc_f = (float)sc[sub];
-                    const float mn_f = (float)mn[sub];
-                    const unsigned char* qs_sub = qs + sub * 16u;
-                    const float* x_sub = xbase + sub * 32u;
-
-                    float sub_acc  = 0.0f;
-                    float sub_xsum = 0.0f;
-                    #pragma unroll 16
-                    for (unsigned int nb = 0u; nb < 16u; ++nb) {
-                        const unsigned int wi0 = sub * 32u + nb * 2u;
-                        const unsigned int wi1 = wi0 + 1u;
-                        const unsigned int hi0 = (qh[wi0 >> 3u] >> (wi0 & 7u)) & 0x1u;
-                        const unsigned int hi1 = (qh[wi1 >> 3u] >> (wi1 & 7u)) & 0x1u;
-                        const unsigned int bv  = qs_sub[nb];
-                        const float q0 = (float)((bv & 0x0Fu) | (hi0 << 4u));
-                        const float q1 = (float)(((bv >> 4u) & 0x0Fu) | (hi1 << 4u));
-                        const float x0 = x_sub[nb * 2u];
-                        const float x1 = x_sub[nb * 2u + 1u];
-                        sub_acc  += q0 * x0 + q1 * x1;
-                        sub_xsum += x0 + x1;
-                    }
-                    bsum += d * sc_f * sub_acc - dmin * mn_f * sub_xsum;
-                }
-                col_sums[col] += bsum;
+                col_sums[col] += kq_pf_dot_q5k(bptr, xbase);
             }
         }
 
         for (unsigned int col = 0u; col < cols; ++col) {
-            float s = col_sums[col];
-            s += __shfl_down_sync(0xffffffffu, s, 16u);
-            s += __shfl_down_sync(0xffffffffu, s,  8u);
-            s += __shfl_down_sync(0xffffffffu, s,  4u);
-            s += __shfl_down_sync(0xffffffffu, s,  2u);
-            s += __shfl_down_sync(0xffffffffu, s,  1u);
+            const float s = kq_pf_warp_reduce(col_sums[col]);
             if (lane == 0u)
                 outputs[(unsigned long long)(col_base + col) * n_rows + row] += s;
         }
     }
 }
 
-/* ── Kernel 11: gemm_q5k_residual ───────────────────────────────────────── */
+/* ── Kernel 11: gemm_q5k_residual ────────────────────────────────────── */
 extern "C" __global__ void gemm_q5k_residual(
     const unsigned char* __restrict__ blocks,
     const float*         __restrict__ inputs,
@@ -1116,61 +995,16 @@ extern "C" __global__ void gemm_q5k_residual(
         for (unsigned int b = lane; b < blocks_per_row; b += 32u) {
             const unsigned char* bptr = blocks
                 + (unsigned long long)(row * blocks_per_row + b) * 176u;
-
-            const unsigned short d_raw    = (unsigned short)bptr[0]
-                                          | ((unsigned short)bptr[1] << 8u);
-            const unsigned short dmin_raw = (unsigned short)bptr[2]
-                                          | ((unsigned short)bptr[3] << 8u);
-            const float d    = kq_pf_fast_fp16_to_float(d_raw);
-            const float dmin = kq_pf_fast_fp16_to_float(dmin_raw);
-
-            unsigned char sc[8], mn[8];
-            kq_pf_decode_6bit_scales(bptr + 4u, sc, mn);
-
-            const unsigned char* qh = bptr + 16u;
-            const unsigned char* qs = bptr + 48u;
             const unsigned int x_base = b << 8u;
 
             for (unsigned int col = 0u; col < cols; ++col) {
                 const float* xbase = inputs + (unsigned long long)(col_base + col) * k + x_base;
-                float bsum = 0.0f;
-
-                #pragma unroll 8
-                for (unsigned int sub = 0u; sub < 8u; ++sub) {
-                    const float sc_f = (float)sc[sub];
-                    const float mn_f = (float)mn[sub];
-                    const unsigned char* qs_sub = qs + sub * 16u;
-                    const float* x_sub = xbase + sub * 32u;
-
-                    float sub_acc  = 0.0f;
-                    float sub_xsum = 0.0f;
-                    #pragma unroll 16
-                    for (unsigned int nb = 0u; nb < 16u; ++nb) {
-                        const unsigned int wi0 = sub * 32u + nb * 2u;
-                        const unsigned int wi1 = wi0 + 1u;
-                        const unsigned int hi0 = (qh[wi0 >> 3u] >> (wi0 & 7u)) & 0x1u;
-                        const unsigned int hi1 = (qh[wi1 >> 3u] >> (wi1 & 7u)) & 0x1u;
-                        const unsigned int bv  = qs_sub[nb];
-                        const float q0 = (float)((bv & 0x0Fu) | (hi0 << 4u));
-                        const float q1 = (float)(((bv >> 4u) & 0x0Fu) | (hi1 << 4u));
-                        const float x0 = x_sub[nb * 2u];
-                        const float x1 = x_sub[nb * 2u + 1u];
-                        sub_acc  += q0 * x0 + q1 * x1;
-                        sub_xsum += x0 + x1;
-                    }
-                    bsum += d * sc_f * sub_acc - dmin * mn_f * sub_xsum;
-                }
-                col_sums[col] += bsum;
+                col_sums[col] += kq_pf_dot_q5k(bptr, xbase);
             }
         }
 
         for (unsigned int col = 0u; col < cols; ++col) {
-            float s = col_sums[col];
-            s += __shfl_down_sync(0xffffffffu, s, 16u);
-            s += __shfl_down_sync(0xffffffffu, s,  8u);
-            s += __shfl_down_sync(0xffffffffu, s,  4u);
-            s += __shfl_down_sync(0xffffffffu, s,  2u);
-            s += __shfl_down_sync(0xffffffffu, s,  1u);
+            const float s = kq_pf_warp_reduce(col_sums[col]);
             if (lane == 0u) {
                 const unsigned long long idx = (unsigned long long)(col_base + col) * n_rows + row;
                 outputs[idx] = residual[idx] + s;
@@ -1179,7 +1013,7 @@ extern "C" __global__ void gemm_q5k_residual(
     }
 }
 
-/* ── Kernel 12: fused_gate_up_swiglu_gemm_q5k ──────────────────────────── */
+/* ── Kernel 12: fused_gate_up_swiglu_gemm_q5k ────────────────────────── */
 extern "C" __global__ void fused_gate_up_swiglu_gemm_q5k(
     const unsigned char* __restrict__ gate_up_blocks,
     const float*         __restrict__ inputs,
@@ -1210,90 +1044,18 @@ extern "C" __global__ void fused_gate_up_swiglu_gemm_q5k(
             const unsigned long long g_idx = (unsigned long long)(row * blocks_per_row + b);
             const unsigned char* gbptr = gate_up_blocks + g_idx * 176u;
             const unsigned char* ubptr = gate_up_blocks + (up_block_offset + g_idx) * 176u;
-
-            const unsigned short gd_raw    = (unsigned short)gbptr[0]
-                                           | ((unsigned short)gbptr[1] << 8u);
-            const unsigned short gdmin_raw = (unsigned short)gbptr[2]
-                                           | ((unsigned short)gbptr[3] << 8u);
-            const float gd    = kq_pf_fast_fp16_to_float(gd_raw);
-            const float gdmin = kq_pf_fast_fp16_to_float(gdmin_raw);
-
-            const unsigned short ud_raw    = (unsigned short)ubptr[0]
-                                           | ((unsigned short)ubptr[1] << 8u);
-            const unsigned short udmin_raw = (unsigned short)ubptr[2]
-                                           | ((unsigned short)ubptr[3] << 8u);
-            const float ud    = kq_pf_fast_fp16_to_float(ud_raw);
-            const float udmin = kq_pf_fast_fp16_to_float(udmin_raw);
-
-            unsigned char gsc[8], gmn[8], usc[8], umn[8];
-            kq_pf_decode_6bit_scales(gbptr + 4u, gsc, gmn);
-            kq_pf_decode_6bit_scales(ubptr + 4u, usc, umn);
-
-            const unsigned char* gqh = gbptr + 16u;
-            const unsigned char* gqs = gbptr + 48u;
-            const unsigned char* uqh = ubptr + 16u;
-            const unsigned char* uqs = ubptr + 48u;
             const unsigned int x_base = b << 8u;
 
             for (unsigned int col = 0u; col < cols; ++col) {
                 const float* xbase = inputs + (unsigned long long)(col_base + col) * k + x_base;
-                float gbsum = 0.0f;
-                float ubsum = 0.0f;
-
-                #pragma unroll 8
-                for (unsigned int sub = 0u; sub < 8u; ++sub) {
-                    const float gsc_f = (float)gsc[sub];
-                    const float gmn_f = (float)gmn[sub];
-                    const float usc_f = (float)usc[sub];
-                    const float umn_f = (float)umn[sub];
-                    const unsigned char* gqs_sub = gqs + sub * 16u;
-                    const unsigned char* uqs_sub = uqs + sub * 16u;
-                    const float* x_sub = xbase + sub * 32u;
-
-                    float gsub_acc = 0.0f; float gsub_xsum = 0.0f;
-                    float usub_acc = 0.0f; float usub_xsum = 0.0f;
-                    #pragma unroll 16
-                    for (unsigned int nb = 0u; nb < 16u; ++nb) {
-                        const unsigned int wi0 = sub * 32u + nb * 2u;
-                        const unsigned int wi1 = wi0 + 1u;
-                        const unsigned int ghi0 = (gqh[wi0 >> 3u] >> (wi0 & 7u)) & 0x1u;
-                        const unsigned int ghi1 = (gqh[wi1 >> 3u] >> (wi1 & 7u)) & 0x1u;
-                        const unsigned int uhi0 = (uqh[wi0 >> 3u] >> (wi0 & 7u)) & 0x1u;
-                        const unsigned int uhi1 = (uqh[wi1 >> 3u] >> (wi1 & 7u)) & 0x1u;
-                        const unsigned int gbv  = gqs_sub[nb];
-                        const unsigned int ubv  = uqs_sub[nb];
-                        const float gq0 = (float)((gbv & 0x0Fu) | (ghi0 << 4u));
-                        const float gq1 = (float)(((gbv >> 4u) & 0x0Fu) | (ghi1 << 4u));
-                        const float uq0 = (float)((ubv & 0x0Fu) | (uhi0 << 4u));
-                        const float uq1 = (float)(((ubv >> 4u) & 0x0Fu) | (uhi1 << 4u));
-                        const float x0 = x_sub[nb * 2u];
-                        const float x1 = x_sub[nb * 2u + 1u];
-                        gsub_acc  += gq0 * x0 + gq1 * x1;
-                        gsub_xsum += x0 + x1;
-                        usub_acc  += uq0 * x0 + uq1 * x1;
-                        usub_xsum += x0 + x1;
-                    }
-                    gbsum += gd * gsc_f * gsub_acc - gdmin * gmn_f * gsub_xsum;
-                    ubsum += ud * usc_f * usub_acc - udmin * umn_f * usub_xsum;
-                }
-                gate_sums[col] += gbsum;
-                up_sums[col]   += ubsum;
+                gate_sums[col] += kq_pf_dot_q5k(gbptr, xbase);
+                up_sums[col]   += kq_pf_dot_q5k(ubptr, xbase);
             }
         }
 
         for (unsigned int col = 0u; col < cols; ++col) {
-            float gs = gate_sums[col];
-            float us = up_sums[col];
-            gs += __shfl_down_sync(0xffffffffu, gs, 16u);
-            gs += __shfl_down_sync(0xffffffffu, gs,  8u);
-            gs += __shfl_down_sync(0xffffffffu, gs,  4u);
-            gs += __shfl_down_sync(0xffffffffu, gs,  2u);
-            gs += __shfl_down_sync(0xffffffffu, gs,  1u);
-            us += __shfl_down_sync(0xffffffffu, us, 16u);
-            us += __shfl_down_sync(0xffffffffu, us,  8u);
-            us += __shfl_down_sync(0xffffffffu, us,  4u);
-            us += __shfl_down_sync(0xffffffffu, us,  2u);
-            us += __shfl_down_sync(0xffffffffu, us,  1u);
+            const float gs = kq_pf_warp_reduce(gate_sums[col]);
+            const float us = kq_pf_warp_reduce(up_sums[col]);
             if (lane == 0u) {
                 outputs[(unsigned long long)(col_base + col) * n_rows + row] =
                     kq_pf_silu(gs) * us;
@@ -1303,13 +1065,11 @@ extern "C" __global__ void fused_gate_up_swiglu_gemm_q5k(
 }
 
 /* =========================================================================
-   Q6_K kernels (210 bytes/block, 256 weights)
-   Block: [ql:128 @0][qh:64 @128][scales_i8:16 @192][d_f16:2 @208]
-   16 sub-blocks × 16 weights. q6=nibble|(hi2<<4), q6_signed=q6-32.
-   dequant: d*scales_i8[sub]*q6_signed
+   Q6_K kernels (210 bytes/block, 256 weights) — all three variants
+   reduce one super-block through kq_pf_dot_q6k().
    ========================================================================= */
 
-/* ── Kernel 13: gemm_q6k ────────────────────────────────────────────────── */
+/* ── Kernel 13: gemm_q6k ─────────────────────────────────────────────── */
 extern "C" __global__ void gemm_q6k(
     const unsigned char* __restrict__ blocks,
     const float*         __restrict__ inputs,
@@ -1336,55 +1096,23 @@ extern "C" __global__ void gemm_q6k(
         for (unsigned int b = lane; b < blocks_per_row; b += 32u) {
             const unsigned char* bptr = blocks
                 + (unsigned long long)(row * blocks_per_row + b) * 210u;
-
-            const unsigned short d_raw = (unsigned short)bptr[208]
-                                       | ((unsigned short)bptr[209] << 8u);
-            const float d = kq_pf_fast_fp16_to_float(d_raw);
-
-            const unsigned char*  ql        = bptr;
-            const unsigned char*  qh        = bptr + 128u;
-            const signed char*    scales_i8 = (const signed char*)(bptr + 192u);
             const unsigned int x_base = b << 8u;
 
             for (unsigned int col = 0u; col < cols; ++col) {
                 const float* xbase = inputs + (unsigned long long)(col_base + col) * k + x_base;
-                float bsum = 0.0f;
-
-                #pragma unroll 16
-                for (unsigned int sub = 0u; sub < 16u; ++sub) {
-                    const float sc = (float)(int)scales_i8[sub];
-                    const unsigned int w_base = sub * 16u;
-
-                    float sub_acc = 0.0f;
-                    #pragma unroll 16
-                    for (unsigned int j = 0u; j < 16u; ++j) {
-                        const unsigned int wi = w_base + j;
-                        const unsigned int nibble = (ql[wi >> 1u] >> ((wi & 1u) * 4u)) & 0x0Fu;
-                        const unsigned int hi2    = (qh[wi >> 2u] >> ((wi & 3u) * 2u)) & 0x03u;
-                        const int q6        = (int)(nibble | (hi2 << 4u));
-                        const int q6_signed = q6 - 32;
-                        sub_acc += (float)q6_signed * xbase[wi];
-                    }
-                    bsum += d * sc * sub_acc;
-                }
-                col_sums[col] += bsum;
+                col_sums[col] += kq_pf_dot_q6k(bptr, xbase);
             }
         }
 
         for (unsigned int col = 0u; col < cols; ++col) {
-            float s = col_sums[col];
-            s += __shfl_down_sync(0xffffffffu, s, 16u);
-            s += __shfl_down_sync(0xffffffffu, s,  8u);
-            s += __shfl_down_sync(0xffffffffu, s,  4u);
-            s += __shfl_down_sync(0xffffffffu, s,  2u);
-            s += __shfl_down_sync(0xffffffffu, s,  1u);
+            const float s = kq_pf_warp_reduce(col_sums[col]);
             if (lane == 0u)
                 outputs[(unsigned long long)(col_base + col) * n_rows + row] += s;
         }
     }
 }
 
-/* ── Kernel 14: gemm_q6k_residual ───────────────────────────────────────── */
+/* ── Kernel 14: gemm_q6k_residual ────────────────────────────────────── */
 extern "C" __global__ void gemm_q6k_residual(
     const unsigned char* __restrict__ blocks,
     const float*         __restrict__ inputs,
@@ -1412,48 +1140,16 @@ extern "C" __global__ void gemm_q6k_residual(
         for (unsigned int b = lane; b < blocks_per_row; b += 32u) {
             const unsigned char* bptr = blocks
                 + (unsigned long long)(row * blocks_per_row + b) * 210u;
-
-            const unsigned short d_raw = (unsigned short)bptr[208]
-                                       | ((unsigned short)bptr[209] << 8u);
-            const float d = kq_pf_fast_fp16_to_float(d_raw);
-
-            const unsigned char*  ql        = bptr;
-            const unsigned char*  qh        = bptr + 128u;
-            const signed char*    scales_i8 = (const signed char*)(bptr + 192u);
             const unsigned int x_base = b << 8u;
 
             for (unsigned int col = 0u; col < cols; ++col) {
                 const float* xbase = inputs + (unsigned long long)(col_base + col) * k + x_base;
-                float bsum = 0.0f;
-
-                #pragma unroll 16
-                for (unsigned int sub = 0u; sub < 16u; ++sub) {
-                    const float sc = (float)(int)scales_i8[sub];
-                    const unsigned int w_base = sub * 16u;
-
-                    float sub_acc = 0.0f;
-                    #pragma unroll 16
-                    for (unsigned int j = 0u; j < 16u; ++j) {
-                        const unsigned int wi = w_base + j;
-                        const unsigned int nibble = (ql[wi >> 1u] >> ((wi & 1u) * 4u)) & 0x0Fu;
-                        const unsigned int hi2    = (qh[wi >> 2u] >> ((wi & 3u) * 2u)) & 0x03u;
-                        const int q6        = (int)(nibble | (hi2 << 4u));
-                        const int q6_signed = q6 - 32;
-                        sub_acc += (float)q6_signed * xbase[wi];
-                    }
-                    bsum += d * sc * sub_acc;
-                }
-                col_sums[col] += bsum;
+                col_sums[col] += kq_pf_dot_q6k(bptr, xbase);
             }
         }
 
         for (unsigned int col = 0u; col < cols; ++col) {
-            float s = col_sums[col];
-            s += __shfl_down_sync(0xffffffffu, s, 16u);
-            s += __shfl_down_sync(0xffffffffu, s,  8u);
-            s += __shfl_down_sync(0xffffffffu, s,  4u);
-            s += __shfl_down_sync(0xffffffffu, s,  2u);
-            s += __shfl_down_sync(0xffffffffu, s,  1u);
+            const float s = kq_pf_warp_reduce(col_sums[col]);
             if (lane == 0u) {
                 const unsigned long long idx = (unsigned long long)(col_base + col) * n_rows + row;
                 outputs[idx] = residual[idx] + s;
@@ -1462,7 +1158,7 @@ extern "C" __global__ void gemm_q6k_residual(
     }
 }
 
-/* ── Kernel 15: fused_gate_up_swiglu_gemm_q6k ──────────────────────────── */
+/* ── Kernel 15: fused_gate_up_swiglu_gemm_q6k ────────────────────────── */
 extern "C" __global__ void fused_gate_up_swiglu_gemm_q6k(
     const unsigned char* __restrict__ gate_up_blocks,
     const float*         __restrict__ inputs,
@@ -1493,74 +1189,18 @@ extern "C" __global__ void fused_gate_up_swiglu_gemm_q6k(
             const unsigned long long g_idx = (unsigned long long)(row * blocks_per_row + b);
             const unsigned char* gbptr = gate_up_blocks + g_idx * 210u;
             const unsigned char* ubptr = gate_up_blocks + (up_block_offset + g_idx) * 210u;
-
-            const unsigned short gd_raw = (unsigned short)gbptr[208]
-                                        | ((unsigned short)gbptr[209] << 8u);
-            const float gd = kq_pf_fast_fp16_to_float(gd_raw);
-
-            const unsigned short ud_raw = (unsigned short)ubptr[208]
-                                        | ((unsigned short)ubptr[209] << 8u);
-            const float ud = kq_pf_fast_fp16_to_float(ud_raw);
-
-            const unsigned char*  gql       = gbptr;
-            const unsigned char*  gqh       = gbptr + 128u;
-            const signed char*    gsc_i8    = (const signed char*)(gbptr + 192u);
-            const unsigned char*  uql       = ubptr;
-            const unsigned char*  uqh       = ubptr + 128u;
-            const signed char*    usc_i8    = (const signed char*)(ubptr + 192u);
             const unsigned int x_base = b << 8u;
 
             for (unsigned int col = 0u; col < cols; ++col) {
                 const float* xbase = inputs + (unsigned long long)(col_base + col) * k + x_base;
-                float gbsum = 0.0f;
-                float ubsum = 0.0f;
-
-                #pragma unroll 16
-                for (unsigned int sub = 0u; sub < 16u; ++sub) {
-                    const float gsc = (float)(int)gsc_i8[sub];
-                    const float usc = (float)(int)usc_i8[sub];
-                    const unsigned int w_base = sub * 16u;
-
-                    float gsub_acc = 0.0f;
-                    float usub_acc = 0.0f;
-                    #pragma unroll 16
-                    for (unsigned int j = 0u; j < 16u; ++j) {
-                        const unsigned int wi = w_base + j;
-                        const unsigned int gnibble = (gql[wi >> 1u] >> ((wi & 1u) * 4u)) & 0x0Fu;
-                        const unsigned int ghi2    = (gqh[wi >> 2u] >> ((wi & 3u) * 2u)) & 0x03u;
-                        const int gq6        = (int)(gnibble | (ghi2 << 4u));
-                        const int gq6_signed = gq6 - 32;
-
-                        const unsigned int unibble = (uql[wi >> 1u] >> ((wi & 1u) * 4u)) & 0x0Fu;
-                        const unsigned int uhi2    = (uqh[wi >> 2u] >> ((wi & 3u) * 2u)) & 0x03u;
-                        const int uq6        = (int)(unibble | (uhi2 << 4u));
-                        const int uq6_signed = uq6 - 32;
-
-                        const float x = xbase[wi];
-                        gsub_acc += (float)gq6_signed * x;
-                        usub_acc += (float)uq6_signed * x;
-                    }
-                    gbsum += gd * gsc * gsub_acc;
-                    ubsum += ud * usc * usub_acc;
-                }
-                gate_sums[col] += gbsum;
-                up_sums[col]   += ubsum;
+                gate_sums[col] += kq_pf_dot_q6k(gbptr, xbase);
+                up_sums[col]   += kq_pf_dot_q6k(ubptr, xbase);
             }
         }
 
         for (unsigned int col = 0u; col < cols; ++col) {
-            float gs = gate_sums[col];
-            float us = up_sums[col];
-            gs += __shfl_down_sync(0xffffffffu, gs, 16u);
-            gs += __shfl_down_sync(0xffffffffu, gs,  8u);
-            gs += __shfl_down_sync(0xffffffffu, gs,  4u);
-            gs += __shfl_down_sync(0xffffffffu, gs,  2u);
-            gs += __shfl_down_sync(0xffffffffu, gs,  1u);
-            us += __shfl_down_sync(0xffffffffu, us, 16u);
-            us += __shfl_down_sync(0xffffffffu, us,  8u);
-            us += __shfl_down_sync(0xffffffffu, us,  4u);
-            us += __shfl_down_sync(0xffffffffu, us,  2u);
-            us += __shfl_down_sync(0xffffffffu, us,  1u);
+            const float gs = kq_pf_warp_reduce(gate_sums[col]);
+            const float us = kq_pf_warp_reduce(up_sums[col]);
             if (lane == 0u) {
                 outputs[(unsigned long long)(col_base + col) * n_rows + row] =
                     kq_pf_silu(gs) * us;
@@ -1570,12 +1210,11 @@ extern "C" __global__ void fused_gate_up_swiglu_gemm_q6k(
 }
 
 /* =========================================================================
-   Q8_K kernels (292 bytes/block, 256 weights)
-   Block: [d_f32:4 @0][qs:256 i8 @4][bsums:32 @260]
-   d is f32 (not f16!). dequant: d_f32 * qs[i]
+   Q8_K kernels (292 bytes/block, 256 weights) — all three variants
+   reduce one super-block through kq_pf_dot_q8k().
    ========================================================================= */
 
-/* ── Kernel 16: gemm_q8k ────────────────────────────────────────────────── */
+/* ── Kernel 16: gemm_q8k ─────────────────────────────────────────────── */
 extern "C" __global__ void gemm_q8k(
     const unsigned char* __restrict__ blocks,
     const float*         __restrict__ inputs,
@@ -1602,39 +1241,23 @@ extern "C" __global__ void gemm_q8k(
         for (unsigned int b = lane; b < blocks_per_row; b += 32u) {
             const unsigned char* bptr = blocks
                 + (unsigned long long)(row * blocks_per_row + b) * 292u;
-
-            /* d is stored as FP32 LE at bytes 0-3 */
-            const float d = *(const float*)(bptr + 0u);
-
             const unsigned int x_base = b << 8u;
 
             for (unsigned int col = 0u; col < cols; ++col) {
                 const float* xbase = inputs + (unsigned long long)(col_base + col) * k + x_base;
-                float bsum = 0.0f;
-
-                #pragma unroll 32
-                for (unsigned int j = 0u; j < 256u; ++j) {
-                    const int q = (int)(signed char)bptr[4u + j];
-                    bsum += (float)q * xbase[j];
-                }
-                col_sums[col] += d * bsum;
+                col_sums[col] += kq_pf_dot_q8k(bptr, xbase);
             }
         }
 
         for (unsigned int col = 0u; col < cols; ++col) {
-            float s = col_sums[col];
-            s += __shfl_down_sync(0xffffffffu, s, 16u);
-            s += __shfl_down_sync(0xffffffffu, s,  8u);
-            s += __shfl_down_sync(0xffffffffu, s,  4u);
-            s += __shfl_down_sync(0xffffffffu, s,  2u);
-            s += __shfl_down_sync(0xffffffffu, s,  1u);
+            const float s = kq_pf_warp_reduce(col_sums[col]);
             if (lane == 0u)
                 outputs[(unsigned long long)(col_base + col) * n_rows + row] += s;
         }
     }
 }
 
-/* ── Kernel 17: gemm_q8k_residual ───────────────────────────────────────── */
+/* ── Kernel 17: gemm_q8k_residual ────────────────────────────────────── */
 extern "C" __global__ void gemm_q8k_residual(
     const unsigned char* __restrict__ blocks,
     const float*         __restrict__ inputs,
@@ -1662,31 +1285,16 @@ extern "C" __global__ void gemm_q8k_residual(
         for (unsigned int b = lane; b < blocks_per_row; b += 32u) {
             const unsigned char* bptr = blocks
                 + (unsigned long long)(row * blocks_per_row + b) * 292u;
-
-            const float d = *(const float*)(bptr + 0u);
-
             const unsigned int x_base = b << 8u;
 
             for (unsigned int col = 0u; col < cols; ++col) {
                 const float* xbase = inputs + (unsigned long long)(col_base + col) * k + x_base;
-                float bsum = 0.0f;
-
-                #pragma unroll 32
-                for (unsigned int j = 0u; j < 256u; ++j) {
-                    const int q = (int)(signed char)bptr[4u + j];
-                    bsum += (float)q * xbase[j];
-                }
-                col_sums[col] += d * bsum;
+                col_sums[col] += kq_pf_dot_q8k(bptr, xbase);
             }
         }
 
         for (unsigned int col = 0u; col < cols; ++col) {
-            float s = col_sums[col];
-            s += __shfl_down_sync(0xffffffffu, s, 16u);
-            s += __shfl_down_sync(0xffffffffu, s,  8u);
-            s += __shfl_down_sync(0xffffffffu, s,  4u);
-            s += __shfl_down_sync(0xffffffffu, s,  2u);
-            s += __shfl_down_sync(0xffffffffu, s,  1u);
+            const float s = kq_pf_warp_reduce(col_sums[col]);
             if (lane == 0u) {
                 const unsigned long long idx = (unsigned long long)(col_base + col) * n_rows + row;
                 outputs[idx] = residual[idx] + s;
@@ -1695,7 +1303,7 @@ extern "C" __global__ void gemm_q8k_residual(
     }
 }
 
-/* ── Kernel 18: fused_gate_up_swiglu_gemm_q8k ──────────────────────────── */
+/* ── Kernel 18: fused_gate_up_swiglu_gemm_q8k ────────────────────────── */
 extern "C" __global__ void fused_gate_up_swiglu_gemm_q8k(
     const unsigned char* __restrict__ gate_up_blocks,
     const float*         __restrict__ inputs,
@@ -1726,43 +1334,18 @@ extern "C" __global__ void fused_gate_up_swiglu_gemm_q8k(
             const unsigned long long g_idx = (unsigned long long)(row * blocks_per_row + b);
             const unsigned char* gbptr = gate_up_blocks + g_idx * 292u;
             const unsigned char* ubptr = gate_up_blocks + (up_block_offset + g_idx) * 292u;
-
-            const float gd = *(const float*)(gbptr + 0u);
-            const float ud = *(const float*)(ubptr + 0u);
-
             const unsigned int x_base = b << 8u;
 
             for (unsigned int col = 0u; col < cols; ++col) {
                 const float* xbase = inputs + (unsigned long long)(col_base + col) * k + x_base;
-                float gbsum = 0.0f;
-                float ubsum = 0.0f;
-
-                #pragma unroll 32
-                for (unsigned int j = 0u; j < 256u; ++j) {
-                    const float x  = xbase[j];
-                    const int gq = (int)(signed char)gbptr[4u + j];
-                    const int uq = (int)(signed char)ubptr[4u + j];
-                    gbsum += (float)gq * x;
-                    ubsum += (float)uq * x;
-                }
-                gate_sums[col] += gd * gbsum;
-                up_sums[col]   += ud * ubsum;
+                gate_sums[col] += kq_pf_dot_q8k(gbptr, xbase);
+                up_sums[col]   += kq_pf_dot_q8k(ubptr, xbase);
             }
         }
 
         for (unsigned int col = 0u; col < cols; ++col) {
-            float gs = gate_sums[col];
-            float us = up_sums[col];
-            gs += __shfl_down_sync(0xffffffffu, gs, 16u);
-            gs += __shfl_down_sync(0xffffffffu, gs,  8u);
-            gs += __shfl_down_sync(0xffffffffu, gs,  4u);
-            gs += __shfl_down_sync(0xffffffffu, gs,  2u);
-            gs += __shfl_down_sync(0xffffffffu, gs,  1u);
-            us += __shfl_down_sync(0xffffffffu, us, 16u);
-            us += __shfl_down_sync(0xffffffffu, us,  8u);
-            us += __shfl_down_sync(0xffffffffu, us,  4u);
-            us += __shfl_down_sync(0xffffffffu, us,  2u);
-            us += __shfl_down_sync(0xffffffffu, us,  1u);
+            const float gs = kq_pf_warp_reduce(gate_sums[col]);
+            const float us = kq_pf_warp_reduce(up_sums[col]);
             if (lane == 0u) {
                 outputs[(unsigned long long)(col_base + col) * n_rows + row] =
                     kq_pf_silu(gs) * us;

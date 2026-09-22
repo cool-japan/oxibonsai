@@ -51,6 +51,23 @@ impl TernaryCode {
     }
 }
 
+/// The single decode table for the **`TQ2_0` family** (OxiBonsai's `TQ2_0_g128`
+/// and llama.cpp's 256-wide `TQ2_0`): `0b00 → -1`, `0b01 → 0`, `0b10 → +1`,
+/// `0b11 → 0`.
+///
+/// `0b11` is unreachable from any ggml encoder (`q = round(w/amax) + 1` is
+/// always in `0..=2`), and six GPU decoders plus the CPU/Metal byte-parity
+/// guard hard-code the map to zero, so it stays zero here. This is deliberately
+/// **not** the `Q2_0`/`PQ2_0` map, which is arithmetic (`code - 1`, so
+/// `0b11 → +2`) — see [`crate::quant_prism::q2_0_code_to_i32`].
+///
+/// Only the low two bits of `code` are read, so callers may pass a shifted
+/// byte directly.
+#[inline]
+pub const fn ternary_code_to_i8(code: u8) -> i8 {
+    [-1i8, 0, 1, 0][(code & 0x03) as usize]
+}
+
 // ---------------------------------------------------------------------------
 // BlockTQ2_0_g128
 // ---------------------------------------------------------------------------
@@ -102,7 +119,7 @@ impl BlockTQ2_0_g128 {
     ///
     /// Input length must be a multiple of 128.
     pub fn quantize(input: &[f32]) -> BonsaiResult<Vec<Self>> {
-        if input.len() % QK_TQ2_0_G128 != 0 {
+        if !input.len().is_multiple_of(QK_TQ2_0_G128) {
             return Err(BonsaiError::KQuantError {
                 reason: format!(
                     "TQ2_0_g128 quantize: input len {} not a multiple of {}",
@@ -160,7 +177,7 @@ impl BlockTQ2_0_g128 {
     ///
     /// Returns error if length is not a multiple of 34 or pointer is misaligned.
     pub fn slice_from_bytes(data: &[u8]) -> BonsaiResult<&[Self]> {
-        if data.len() % BLOCK_TQ2_0_G128_BYTES != 0 {
+        if !data.len().is_multiple_of(BLOCK_TQ2_0_G128_BYTES) {
             return Err(BonsaiError::KQuantError {
                 reason: format!(
                     "TQ2_0_g128 slice_from_bytes: byte len {} not a multiple of {}",
@@ -188,15 +205,10 @@ impl BlockTQ2_0_g128 {
     /// Decode a 2-bit code at `lane` (0..4) from `byte`, returning the weight as i8.
     ///
     /// Code map: `0b00→-1`, `0b01→0`, `0b10→+1`, `0b11→0` (reserved treated as zero).
+    /// Routed through the single shared [`ternary_code_to_i8`] table.
     pub fn ternary_decode(byte: u8, lane: usize) -> i8 {
         let shift = lane * 2;
-        let code = (byte >> shift) & 0x03;
-        match code {
-            0b00 => -1,
-            0b01 => 0,
-            0b10 => 1,
-            _ => 0, // 0b11 reserved → zero
-        }
+        ternary_code_to_i8(byte >> shift)
     }
 }
 
@@ -251,7 +263,7 @@ impl BlockTQ2_0 {
     ///
     /// Input length must be a multiple of 256.
     pub fn quantize(input: &[f32]) -> BonsaiResult<Vec<Self>> {
-        if input.len() % QK_TQ2_0 != 0 {
+        if !input.len().is_multiple_of(QK_TQ2_0) {
             return Err(BonsaiError::KQuantError {
                 reason: format!(
                     "TQ2_0 quantize: input len {} not a multiple of {}",
@@ -308,7 +320,7 @@ impl BlockTQ2_0 {
     ///
     /// Returns error if length is not a multiple of 66 or pointer is misaligned.
     pub fn slice_from_bytes(data: &[u8]) -> BonsaiResult<&[Self]> {
-        if data.len() % BLOCK_TQ2_0_BYTES != 0 {
+        if !data.len().is_multiple_of(BLOCK_TQ2_0_BYTES) {
             return Err(BonsaiError::KQuantError {
                 reason: format!(
                     "TQ2_0 slice_from_bytes: byte len {} not a multiple of {}",
@@ -334,14 +346,249 @@ impl BlockTQ2_0 {
 /// Decode a 2-bit code at `lane` (0..4) from `byte` for BlockTQ2_0.
 ///
 /// Code map: `0b00→-1`, `0b01→0`, `0b10→+1`, `0b11→0` (reserved treated as zero).
+/// Routed through the single shared [`ternary_code_to_i8`] table.
 fn ternary_decode_g256(byte: u8, lane: usize) -> i8 {
     let shift = lane * 2;
-    let code = (byte >> shift) & 0x03;
-    match code {
-        0b00 => -1,
-        0b01 => 0,
-        0b10 => 1,
-        _ => 0,
+    ternary_code_to_i8(byte >> shift)
+}
+
+// ---------------------------------------------------------------------------
+// Load-time 2-bit layout sniff (design §1.3)
+// ---------------------------------------------------------------------------
+
+/// The three on-disk readings a 2-bit block tensor can have.
+///
+/// ggml type id 42 ships in all three; ids 142 (`PQ2_0`) and 35 (`TQ2_0`) are
+/// unambiguous, but the same structural test is what proves it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TwoBitLayout {
+    /// 34-byte block, `d` FIRST (`block_pq2_0` / PrismML gen-1 id 42).
+    DFirst34,
+    /// 34-byte block, `qs` FIRST and `d` LAST (legacy OxiBonsai id 42).
+    QsFirst34,
+    /// 18-byte block, `d` FIRST (mainline `block_q2_0`, group 64).
+    DFirst18,
+    /// No single hypothesis is structurally clean, or more than one is.
+    ///
+    /// An all-zero or tiny sample is legitimately ambiguous; so is a genuinely
+    /// corrupt tensor. The caller decides which, and must never guess.
+    Ambiguous,
+}
+
+impl TwoBitLayout {
+    /// Bytes per block under this hypothesis.
+    pub const fn block_bytes(self) -> usize {
+        match self {
+            Self::DFirst34 | Self::QsFirst34 => 34,
+            Self::DFirst18 => 18,
+            Self::Ambiguous => 0,
+        }
+    }
+
+    /// Weights per block under this hypothesis.
+    pub const fn block_size(self) -> usize {
+        match self {
+            Self::DFirst34 | Self::QsFirst34 => 128,
+            Self::DFirst18 => 64,
+            Self::Ambiguous => 0,
+        }
+    }
+
+    /// Byte offset of the FP16 scale inside a block.
+    const fn scale_offset(self) -> usize {
+        match self {
+            Self::DFirst34 | Self::DFirst18 => 0,
+            Self::QsFirst34 => 32,
+            Self::Ambiguous => 0,
+        }
+    }
+
+    /// Byte offset of the packed codes inside a block.
+    const fn codes_offset(self) -> usize {
+        match self {
+            Self::DFirst34 | Self::DFirst18 => 2,
+            Self::QsFirst34 => 0,
+            Self::Ambiguous => 0,
+        }
+    }
+
+    /// Number of code bytes inside a block.
+    const fn codes_len(self) -> usize {
+        match self {
+            Self::DFirst34 | Self::QsFirst34 => 32,
+            Self::DFirst18 => 16,
+            Self::Ambiguous => 0,
+        }
+    }
+
+    /// Human-readable name used in error messages.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::DFirst34 => "d-first/34B/group-128",
+            Self::QsFirst34 => "qs-first/34B/group-128",
+            Self::DFirst18 => "d-first/18B/group-64",
+            Self::Ambiguous => "ambiguous",
+        }
+    }
+}
+
+/// The three hypotheses the sniff evaluates, in a stable order.
+pub const TWO_BIT_LAYOUT_CANDIDATES: [TwoBitLayout; 3] = [
+    TwoBitLayout::DFirst34,
+    TwoBitLayout::QsFirst34,
+    TwoBitLayout::DFirst18,
+];
+
+/// Structural evidence gathered for one layout hypothesis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayoutScore {
+    /// Which hypothesis this score belongs to.
+    pub candidate: TwoBitLayout,
+    /// How many blocks were actually examined.
+    pub blocks_sampled: usize,
+    /// How many 2-bit lanes decoded to the reserved `0b11` (`+2`) code.
+    ///
+    /// PrismML checkpoints are ternary, so a correct reading gives exactly 0.
+    pub lanes_eq_three: u64,
+    /// How many block scales were non-finite or negative.
+    pub bad_scales: u64,
+    /// `false` when the buffer length is not a whole number of blocks for
+    /// this hypothesis, which rules it out on its own.
+    pub length_compatible: bool,
+}
+
+impl LayoutScore {
+    /// A hypothesis is clean when it examined real blocks and found neither a
+    /// reserved code nor an implausible scale.
+    pub fn is_clean(&self) -> bool {
+        self.length_compatible
+            && self.blocks_sampled > 0
+            && self.lanes_eq_three == 0
+            && self.bad_scales == 0
+    }
+}
+
+/// Default number of blocks to sample; the design calls for `>= 2000`, which
+/// separates the real files by 0 vs 450–5153 reserved codes.
+pub const SNIFF_DEFAULT_BLOCKS: usize = 2000;
+
+/// A byte length that is an exact multiple of every [`TwoBitLayout`]
+/// candidate's block size (34, 34 and 18 bytes) — `18 * 34`.
+///
+/// `sniff_two_bit_layout_scores` only ever inspects **whole** blocks
+/// (`available = bytes.len() / blk`), so `LayoutScore::length_compatible`'s
+/// exact-multiple check is genuine evidence only when `bytes` is a tensor's
+/// real, untruncated data: a true group-64 tensor's total is `k * 18`
+/// bytes, which happens to also be a multiple of 34 only for roughly one
+/// `k` in seventeen, so a wrong-geometry candidate usually fails this check
+/// honestly. But a *caller-chosen* truncation length that is a multiple of
+/// one candidate's block size and not another's manufactures that same
+/// "fail" for a reason that has nothing to do with the bytes — only with
+/// where the cut landed. Capping any truncation at a multiple of this
+/// constant keeps every candidate's block boundary intact no matter which
+/// one is actually correct.
+const SNIFF_SAMPLE_COMMON_MULTIPLE_BYTES: usize = 612;
+
+/// Round `n_blocks` worth of the widest candidate's block size (34 bytes) up
+/// to a multiple of [`SNIFF_SAMPLE_COMMON_MULTIPLE_BYTES`], for use as a
+/// byte cap before calling [`sniff_two_bit_layout`] (or
+/// [`sniff_two_bit_layout_scores`]) on a tensor that may be far larger than
+/// the sample the sniff actually needs.
+///
+/// Rounding **up** rather than down still guarantees every candidate —
+/// including the smaller-block [`TwoBitLayout::DFirst18`] — sees at least
+/// `n_blocks` whole blocks, matching design §1.3's "over >= 2000 sampled
+/// blocks": `sniff_sample_byte_cap(2000) == 68544`, which is 2016 blocks of
+/// 34 bytes and 3808 blocks of 18 bytes, both comfortably over 2000.
+///
+/// Without this, truncating a large tensor's sample to exactly
+/// `n_blocks * 34` bytes (68 000 for the default) is not a multiple of 18,
+/// so it silently disqualifies a genuinely clean [`TwoBitLayout::DFirst18`]
+/// reading via `length_compatible` — the mandatory group-64 discriminator
+/// (design §1.3: "MANDATORY, not a backstop") would degrade to a no-op for
+/// every group-64 tensor above the cap.
+pub fn sniff_sample_byte_cap(n_blocks: usize) -> usize {
+    let widest_candidate_budget = n_blocks.saturating_mul(BLOCK_TQ2_0_G128_BYTES);
+    widest_candidate_budget
+        .div_ceil(SNIFF_SAMPLE_COMMON_MULTIPLE_BYTES)
+        .saturating_mul(SNIFF_SAMPLE_COMMON_MULTIPLE_BYTES)
+}
+
+/// Score every 2-bit layout hypothesis against a tensor's raw bytes.
+///
+/// For each of `{d-first-34, qs-first-34, d-first-18}` this counts illegal
+/// `0b11` lanes and checks that the FP16 block scale is finite and
+/// non-negative, over up to `n_blocks` blocks.
+pub fn sniff_two_bit_layout_scores(bytes: &[u8], n_blocks: usize) -> [LayoutScore; 3] {
+    let mut scores = [LayoutScore {
+        candidate: TwoBitLayout::Ambiguous,
+        blocks_sampled: 0,
+        lanes_eq_three: 0,
+        bad_scales: 0,
+        length_compatible: false,
+    }; 3];
+
+    for (slot, candidate) in TWO_BIT_LAYOUT_CANDIDATES.iter().enumerate() {
+        let blk = candidate.block_bytes();
+        let available = bytes.len() / blk;
+        let sampled = available.min(n_blocks);
+        let mut lanes_eq_three = 0u64;
+        let mut bad_scales = 0u64;
+
+        for i in 0..sampled {
+            let base = i * blk;
+            let s = base + candidate.scale_offset();
+            let d = f16::from_le_bytes([bytes[s], bytes[s + 1]]).to_f32();
+            if !d.is_finite() || d < 0.0 {
+                bad_scales += 1;
+            }
+            let c = base + candidate.codes_offset();
+            for &b in &bytes[c..c + candidate.codes_len()] {
+                for shift in [0u32, 2, 4, 6] {
+                    if (b >> shift) & 0x03 == 0x03 {
+                        lanes_eq_three += 1;
+                    }
+                }
+            }
+        }
+
+        scores[slot] = LayoutScore {
+            candidate: *candidate,
+            blocks_sampled: sampled,
+            lanes_eq_three,
+            bad_scales,
+            length_compatible: bytes.len().is_multiple_of(blk) && available > 0,
+        };
+    }
+
+    scores
+}
+
+/// Decide which 2-bit layout a tensor's raw bytes actually use.
+///
+/// Mainline llama.cpp loads a gen-2 `Q2_0` file "without a warning and outputs
+/// gibberish" (`MODEL-FORMATS.md`); this is the structural check that lets
+/// OxiBonsai fail loudly instead. It returns [`TwoBitLayout::Ambiguous`]
+/// unless **exactly one** length-compatible hypothesis is clean — an all-zero
+/// or too-small sample is genuinely undecidable and must not be guessed.
+///
+/// Measured separation on the real files (2000 blocks of the first quantized
+/// tensor): the correct reading scores 0 reserved codes and 0 bad scales; the
+/// wrong ones score 450–5153 reserved codes and 508–652 bad scales.
+pub fn sniff_two_bit_layout(bytes: &[u8], n_blocks: usize) -> TwoBitLayout {
+    let scores = sniff_two_bit_layout_scores(bytes, n_blocks);
+    let mut winner = TwoBitLayout::Ambiguous;
+    let mut clean = 0usize;
+    for score in scores.iter() {
+        if score.is_clean() {
+            clean += 1;
+            winner = score.candidate;
+        }
+    }
+    if clean == 1 {
+        winner
+    } else {
+        TwoBitLayout::Ambiguous
     }
 }
 
@@ -543,5 +790,164 @@ mod tests {
             1,
             "lane 3: 0b10 → +1"
         );
+    }
+
+    // ── Shared decode table ───────────────────────────────────────────────
+
+    /// The TQ2_0 family keeps `0b11 → 0`. Six GPU decoders and the
+    /// CPU/Metal byte-parity guard depend on it; the arithmetic `code - 1`
+    /// map (`0b11 → +2`) belongs to the Q2_0/PQ2_0 family only.
+    #[test]
+    fn ternary_code_table_is_the_three_level_lut() {
+        assert_eq!(ternary_code_to_i8(0b00), -1);
+        assert_eq!(ternary_code_to_i8(0b01), 0);
+        assert_eq!(ternary_code_to_i8(0b10), 1);
+        assert_eq!(ternary_code_to_i8(0b11), 0);
+        // Only the low two bits are read, so a shifted byte works directly.
+        assert_eq!(ternary_code_to_i8(0b1111_1110), 1);
+    }
+
+    #[test]
+    fn both_decoders_route_through_the_shared_table() {
+        for byte in 0u8..=255 {
+            for lane in 0..4usize {
+                let expect = ternary_code_to_i8(byte >> (lane * 2));
+                assert_eq!(BlockTQ2_0_g128::ternary_decode(byte, lane), expect);
+                assert_eq!(ternary_decode_g256(byte, lane), expect);
+            }
+        }
+    }
+
+    // ── Layout sniff ──────────────────────────────────────────────────────
+
+    /// Build `n` blocks of ternary codes under a chosen layout so the sniff
+    /// has something structurally clean to find.
+    fn synth_two_bit(layout: TwoBitLayout, n: usize, scale: f32) -> Vec<u8> {
+        let blk = layout.block_bytes();
+        let mut out = vec![0u8; n * blk];
+        let d = f16::from_f32(scale).to_le_bytes();
+        for i in 0..n {
+            let base = i * blk;
+            let s = base + layout.scale_offset();
+            out[s] = d[0];
+            out[s + 1] = d[1];
+            let c = base + layout.codes_offset();
+            for k in 0..layout.codes_len() {
+                // 0b10_01_00_01 — only legal ternary codes.
+                out[c + k] = 0b10_01_00_01;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn sniff_identifies_qs_first_34_layout() {
+        let buf = synth_two_bit(TwoBitLayout::QsFirst34, 256, 0.0415);
+        assert_eq!(sniff_two_bit_layout(&buf, 2000), TwoBitLayout::QsFirst34);
+    }
+
+    #[test]
+    fn sniff_identifies_d_first_34_layout() {
+        let buf = synth_two_bit(TwoBitLayout::DFirst34, 256, 0.0109);
+        assert_eq!(sniff_two_bit_layout(&buf, 2000), TwoBitLayout::DFirst34);
+    }
+
+    #[test]
+    fn sniff_identifies_d_first_18_layout() {
+        let buf = synth_two_bit(TwoBitLayout::DFirst18, 256, 0.0109);
+        assert_eq!(sniff_two_bit_layout(&buf, 2000), TwoBitLayout::DFirst18);
+    }
+
+    /// The wrong hypothesis must accumulate reserved codes and/or implausible
+    /// scales — that separation is the only discriminator the id-42 resolver
+    /// has for d-first vs qs-first.
+    #[test]
+    fn sniff_scores_separate_the_hypotheses() {
+        let buf = synth_two_bit(TwoBitLayout::QsFirst34, 256, 0.0415);
+        let scores = sniff_two_bit_layout_scores(&buf, 2000);
+        let qs = scores
+            .iter()
+            .find(|s| s.candidate == TwoBitLayout::QsFirst34)
+            .expect("candidate present");
+        let df = scores
+            .iter()
+            .find(|s| s.candidate == TwoBitLayout::DFirst34)
+            .expect("candidate present");
+        assert!(qs.is_clean(), "correct reading must be clean: {qs:?}");
+        assert!(!df.is_clean(), "wrong reading must not be clean: {df:?}");
+        assert!(df.lanes_eq_three > 0 || df.bad_scales > 0);
+    }
+
+    /// Regression guard: the naive "`n_blocks` of the widest (34-byte)
+    /// candidate" truncation is not a multiple of 18, so it silently
+    /// disqualifies an otherwise-clean [`TwoBitLayout::DFirst18`] reading via
+    /// `length_compatible` — even though every block the sniff actually
+    /// examined (`available = bytes.len() / 18`) was intact.
+    /// [`sniff_sample_byte_cap`] exists to prevent exactly this.
+    #[test]
+    fn naive_widest_candidate_cut_wrongly_disqualifies_d_first_18() {
+        // Comfortably more than 2000 blocks' worth of clean DFirst18 data at
+        // either cut below.
+        let buf = synth_two_bit(TwoBitLayout::DFirst18, 4000, 0.0109);
+        assert_eq!(buf.len(), 4000 * 18);
+
+        // The pre-fix cut: `SNIFF_DEFAULT_BLOCKS * 34` bytes.
+        let naive_cut = SNIFF_DEFAULT_BLOCKS * 34;
+        assert!(naive_cut < buf.len(), "fixture must exceed the naive cut");
+        assert_ne!(
+            naive_cut % TwoBitLayout::DFirst18.block_bytes(),
+            0,
+            "the naive cut must NOT be an 18-byte multiple, or it doesn't reproduce the bug"
+        );
+        let scores_naive = sniff_two_bit_layout_scores(&buf[..naive_cut], SNIFF_DEFAULT_BLOCKS);
+        let df18_naive = scores_naive
+            .iter()
+            .find(|s| s.candidate == TwoBitLayout::DFirst18)
+            .expect("candidate present");
+        assert!(
+            !df18_naive.length_compatible,
+            "documents the bug: the naive cut disqualifies a clean candidate on length alone: \
+             {df18_naive:?}"
+        );
+
+        // The fixed cap keeps every candidate's block size whole.
+        let safe_cut = sniff_sample_byte_cap(SNIFF_DEFAULT_BLOCKS);
+        assert!(safe_cut < buf.len(), "fixture must exceed the safe cut too");
+        assert_eq!(safe_cut % TwoBitLayout::DFirst18.block_bytes(), 0);
+        assert_eq!(safe_cut % TwoBitLayout::QsFirst34.block_bytes(), 0);
+        let scores_safe = sniff_two_bit_layout_scores(&buf[..safe_cut], SNIFF_DEFAULT_BLOCKS);
+        let df18_safe = scores_safe
+            .iter()
+            .find(|s| s.candidate == TwoBitLayout::DFirst18)
+            .expect("candidate present");
+        assert!(
+            df18_safe.is_clean(),
+            "the mandatory sniff must stay live for a large, genuinely clean group-64 sample: \
+             {df18_safe:?}"
+        );
+    }
+
+    /// An all-zero buffer is clean under every hypothesis, so the sniff must
+    /// say so rather than pick one.
+    #[test]
+    fn sniff_reports_ambiguous_when_nothing_separates() {
+        // 34*18 = 612 = 18*34, so both block sizes divide it exactly.
+        let buf = vec![0u8; 34 * 18];
+        assert_eq!(sniff_two_bit_layout(&buf, 2000), TwoBitLayout::Ambiguous);
+    }
+
+    #[test]
+    fn sniff_reports_ambiguous_on_empty_input() {
+        assert_eq!(sniff_two_bit_layout(&[], 2000), TwoBitLayout::Ambiguous);
+    }
+
+    #[test]
+    fn layout_geometry_matches_the_probe_table() {
+        assert_eq!(TwoBitLayout::DFirst34.block_bytes(), 34);
+        assert_eq!(TwoBitLayout::DFirst34.block_size(), 128);
+        assert_eq!(TwoBitLayout::QsFirst34.block_bytes(), 34);
+        assert_eq!(TwoBitLayout::QsFirst34.block_size(), 128);
+        assert_eq!(TwoBitLayout::DFirst18.block_bytes(), 18);
+        assert_eq!(TwoBitLayout::DFirst18.block_size(), 64);
     }
 }

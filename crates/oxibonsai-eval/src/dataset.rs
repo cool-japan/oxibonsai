@@ -238,9 +238,33 @@ impl McDataset {
         }
     }
 
-    /// Append a question.
+    /// Append a question, trusting the caller that it is well-formed.
+    ///
+    /// This never rejects a question — including one with empty `choices`
+    /// or a `correct_answer` outside `0..choices.len()` — so it silently
+    /// produces a question that can never be scored correct (RAG-M1).
+    /// Prefer [`Self::try_add`] for data coming from outside the current
+    /// process (dataset conversions, deserialisation); this method is kept
+    /// for in-process construction (including this crate's own tests) that
+    /// already knows its data is valid and must not start returning
+    /// `Result` (an `add(...)` call whose result is silently ignored would
+    /// trip the `unused_must_use` lint under `-D warnings`).
     pub fn add(&mut self, q: MultipleChoiceQuestion) {
         self.questions.push(q);
+    }
+
+    /// Append a question, rejecting one with empty `choices` or a
+    /// `correct_answer` outside `0..choices.len()` (RAG-M1) instead of
+    /// silently accepting a question that can never be scored correct.
+    pub fn try_add(&mut self, q: MultipleChoiceQuestion) -> Result<(), EvalError> {
+        if let Some(problem) = mc_question_problem(&q) {
+            return Err(EvalError::InvalidFormat(format!(
+                "question {:?}: {problem}",
+                q.id
+            )));
+        }
+        self.questions.push(q);
+        Ok(())
     }
 
     /// Return the number of questions.
@@ -328,14 +352,26 @@ impl McDataset {
                 .and_then(Value::as_str)
                 .map(str::to_string);
 
-            dataset.add(MultipleChoiceQuestion {
+            let q = MultipleChoiceQuestion {
                 id,
                 question,
                 choices,
                 correct_answer,
                 subject,
                 difficulty,
-            });
+            };
+            // Validate the answer key *before* accepting the line: an
+            // out-of-range `correct_answer` or empty `choices` would
+            // otherwise load successfully and then silently score 0%
+            // forever, indistinguishable from a model that answered
+            // everything wrong (RAG-M1).
+            if let Some(problem) = mc_question_problem(&q) {
+                return Err(EvalError::InvalidFormat(format!(
+                    "line {}: {problem}",
+                    line_no + 1
+                )));
+            }
+            dataset.questions.push(q);
         }
         Ok(dataset)
     }
@@ -383,4 +419,35 @@ impl McDataset {
         seen.dedup();
         seen
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Shared validation
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Check a [`MultipleChoiceQuestion`]'s answer-key invariants, returning a
+/// human-readable problem description (not yet wrapped in an
+/// [`EvalError`], so each call site can add its own context — a source
+/// line number in [`McDataset::from_jsonl`], the question id in
+/// [`McDataset::try_add`]) or `None` if the question is well-formed.
+///
+/// Used by both [`McDataset::from_jsonl`] (untrusted JSONL input) and
+/// [`McDataset::try_add`] (in-process construction) so a dataset can never
+/// silently carry an unscoreable question: a converted 5-option ARC item
+/// saved with a 1-based `correct_answer`, or an empty `choices` array,
+/// would otherwise load successfully and then score 0% forever with no
+/// diagnostic — indistinguishable from a model that answered everything
+/// wrong (RAG-M1).
+fn mc_question_problem(q: &MultipleChoiceQuestion) -> Option<String> {
+    if q.choices.is_empty() {
+        return Some("choices must not be empty".to_string());
+    }
+    if q.correct_answer >= q.choices.len() {
+        return Some(format!(
+            "correct_answer {} out of range for {} choices",
+            q.correct_answer,
+            q.choices.len()
+        ));
+    }
+    None
 }

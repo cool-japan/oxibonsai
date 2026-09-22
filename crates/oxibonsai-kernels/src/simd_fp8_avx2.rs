@@ -319,7 +319,7 @@ fn validate_gemv_args(
     k: usize,
     qk: usize,
 ) -> KernelResult<()> {
-    if k % qk != 0 {
+    if !k.is_multiple_of(qk) {
         return Err(KernelError::NotBlockAligned {
             count: k,
             block_size: qk,
@@ -359,7 +359,7 @@ fn validate_gemm_args(
     batch: usize,
     qk: usize,
 ) -> KernelResult<()> {
-    if k % qk != 0 {
+    if !k.is_multiple_of(qk) {
         return Err(KernelError::NotBlockAligned {
             count: k,
             block_size: qk,

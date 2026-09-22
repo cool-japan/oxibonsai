@@ -30,43 +30,42 @@ use oxibonsai_kernels::KernelDispatcher;
 use oxibonsai_model::export::{export_to_gguf, ExportConfig, ExportFormat, WeightTensor};
 use oxibonsai_model::layers::linear::LinearTernary;
 use oxibonsai_model::ModelVariant;
+use oxibonsai_testkit::gguf_fixture::{quantize_bytes, FixtureQuant};
 use std::sync::Arc;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Build a byte buffer for a Q1_0_g128 weight matrix.
+/// Build a byte buffer for a Q1_0_g128 weight matrix: every block uniform
+/// (all weights `+1.0`), so every sign bit is set and the scale is `1.0`.
 ///
-/// The block layout is 18 bytes each: 2-byte f16 scale + 16 bytes sign bits.
-/// We fill every block with a uniform pattern: all sign bits set (→ +scale).
+/// T-07 FIX (verifier wave 3): re-pointed at
+/// `oxibonsai_testkit::gguf_fixture::quantize_bytes`, the real
+/// `BlockQ1_0G128` packer, instead of hand-rolling the "all sign bits set,
+/// scale = f16::ONE" byte pattern directly — every test using this builder
+/// only asserts the forward pass produces finite logits / the right tensor
+/// type / a working `Arc`-shared embedding, never a specific decoded value,
+/// so the real quantizer's exact byte layout (uniform `+1.0` input encodes
+/// to precisely the same all-`0xFF`-sign-bits, `scale=1.0` pattern this used
+/// to hand-roll) is a strict improvement with no behavioral change.
 fn q1_0_g128_data(num_weights: usize) -> Vec<u8> {
     assert_eq!(num_weights % 128, 0, "num_weights must be multiple of 128");
-    let num_blocks = num_weights / 128;
-    let mut data = Vec::with_capacity(num_blocks * 18);
-    // f16::ONE = 0x3C00 in little-endian
-    let scale_bytes = f16::ONE.to_le_bytes();
-    for _ in 0..num_blocks {
-        data.extend_from_slice(&scale_bytes); // scale
-        data.extend_from_slice(&[0xFFu8; 16]); // 128 sign bits — all +1
-    }
-    data
+    quantize_bytes(FixtureQuant::Q1_0G128, &vec![1.0_f32; num_weights])
+        .expect("quantize_bytes(Q1_0G128) on a block-aligned uniform vector")
 }
 
-/// Build a byte buffer for a TQ2_0_g128 weight matrix.
+/// Build a byte buffer for a TQ2_0_g128 weight matrix: every block uniform
+/// (all weights `+1.0`), so every 2-bit lane packs the `+1` code.
 ///
-/// Each block is 34 bytes: 32-byte qs + 2-byte f16 scale (PrismML layout).
-/// `0xAA` = `0b10101010` → every 2-bit lane is `0b10` → code +1.
+/// T-07 FIX (verifier wave 3): re-pointed at
+/// `oxibonsai_testkit::gguf_fixture::quantize_bytes` (the real
+/// `BlockTQ2_0_g128` packer) — see [`q1_0_g128_data`]'s doc comment for the
+/// full rationale.
 fn tq2_0_g128_data(num_weights: usize) -> Vec<u8> {
     assert_eq!(num_weights % 128, 0, "num_weights must be multiple of 128");
-    let num_blocks = num_weights / 128;
-    let mut data = Vec::with_capacity(num_blocks * 34);
-    let scale_bytes = f16::ONE.to_le_bytes();
-    for _ in 0..num_blocks {
-        data.extend_from_slice(&[0xAAu8; 32]); // qs: all +1 codes
-        data.extend_from_slice(&scale_bytes); // scale
-    }
-    data
+    quantize_bytes(FixtureQuant::TQ2_0_g128, &vec![1.0_f32; num_weights])
+        .expect("quantize_bytes(TQ2_0_g128) on a block-aligned uniform vector")
 }
 
 /// Build a synthetic GGUF for `BonsaiModel::from_gguf`.
@@ -388,7 +387,13 @@ fn ternary_export_round_trip() {
         .collect();
 
     // Export to GGUF bytes via the production pipeline.
-    let tensor = WeightTensor::new("test.weight", weights.clone(), vec![256]);
+    //
+    // Shape is `[128, 2]` — two 128-wide rows — rather than a flat `[256]`:
+    // ggml never quantizes a 1-D tensor and neither does the exporter any
+    // more (CQ-02), so a 1-D fixture would come back as F32 and this test
+    // would stop exercising the ternary path. Element count, block count and
+    // every assertion below are unchanged.
+    let tensor = WeightTensor::new("test.weight", weights.clone(), vec![128, 2]);
     let config = ExportConfig::new(ExportFormat::TernaryG128, "round-trip-test");
     let gguf_bytes = export_to_gguf(&[tensor], &config, &[]).expect("export_to_gguf");
     assert!(!gguf_bytes.is_empty(), "exported GGUF should not be empty");
@@ -514,7 +519,7 @@ fn ternary_variant_detection_from_gguf() {
         "4B architecture + TQ2_0_g128 → TernaryBonsai4B"
     );
 
-    // 1.7B: 16 layers, hidden=1536
+    // 1.7B: 28 layers, hidden=2048 (real GGUF header shape, corrected by M-34)
     let variant_1_7b = ModelVariant::from_config_and_sample_tensor_type(
         &Qwen3Config::bonsai_1_7b(),
         dominant_type,

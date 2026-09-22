@@ -50,7 +50,9 @@ pub use graph::MetalGraph;
 
 // Crate-internal helpers used by sibling modules
 // (`metal_dispatch`, `metal_full_layer`, `metal_prefill`, `metal_fp8_*`).
-pub(crate) use buffers::{alloc_buf, div_ceil, download_f32, set_scalar, upload_f32};
+pub(crate) use buffers::{
+    alloc_buf, commit_and_wait, div_ceil, download_f32, set_scalar, upload_f32,
+};
 
 #[cfg(test)]
 mod tests;

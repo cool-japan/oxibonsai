@@ -23,7 +23,18 @@ use oxibonsai_runtime::metrics::InferenceMetrics;
 use oxibonsai_runtime::middleware::MiddlewareConfig;
 use oxibonsai_runtime::rate_limiter::RateLimitConfig;
 use oxibonsai_runtime::sampling::SamplingParams;
-use oxibonsai_runtime::server::{create_router, create_router_with_options, MAX_OUTPUT_TOKENS};
+use oxibonsai_runtime::server::{
+    create_router, create_router_full, create_router_with_auth, create_router_with_options,
+    AuthConfig, RouterOptions, MAX_OUTPUT_TOKENS,
+};
+
+/// Admin credential used by the `/admin/*` tests below (finding `sec-15`).
+const ADMIN_TOKEN: &str = "test-admin-token";
+
+/// A router whose admin surface is reachable with [`ADMIN_TOKEN`].
+fn admin_router() -> axum::Router {
+    create_router_with_auth(engine(), None, AuthConfig::with_admin_token(ADMIN_TOKEN))
+}
 
 fn engine() -> InferenceEngine<'static> {
     InferenceEngine::new(Qwen3Config::tiny_test(), SamplingParams::default(), 42)
@@ -31,6 +42,20 @@ fn engine() -> InferenceEngine<'static> {
 
 fn router() -> axum::Router {
     create_router(engine(), None)
+}
+
+/// A router with the bundled chat UI explicitly opted into (`SV-26`'s
+/// `RouterOptions::enable_ui`, default `false`). [`router()`] above (like
+/// every `create_router*` convenience constructor) leaves it at that
+/// default, so the two UI tests below need this instead --
+/// [`ui_is_not_mounted_by_default`] is what pins the default itself.
+fn ui_enabled_router() -> axum::Router {
+    create_router_full(
+        EnginePool::new(vec![engine()]),
+        None,
+        Arc::new(InferenceMetrics::new()),
+        RouterOptions::default().with_enable_ui(true),
+    )
 }
 
 fn chat_request(body: serde_json::Value) -> Request<Body> {
@@ -259,7 +284,7 @@ async fn health_is_exempt_from_rate_limiting() {
 
 #[tokio::test]
 async fn chat_ui_is_served_at_ui() {
-    let resp = router()
+    let resp = ui_enabled_router()
         .oneshot(Request::get("/ui").body(Body::empty()).expect("req"))
         .await
         .expect("response");
@@ -286,20 +311,67 @@ async fn chat_ui_is_served_at_ui() {
 
 #[tokio::test]
 async fn ui_health_is_served() {
-    let resp = router()
+    let resp = ui_enabled_router()
         .oneshot(Request::get("/ui/health").body(Body::empty()).expect("req"))
         .await
         .expect("response");
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
-// ── Admin API mounted + real config (findings 52, 90) ─────────────────────────
+/// SV-26 gate-fix triage (wave 3): the chat UI is opt-in, so the shared
+/// [`router()`] helper -- built the same way every convenience constructor
+/// builds a router, `RouterOptions::default()` -- must get a `404` at `/ui`,
+/// not the `200` the two tests above intentionally opt into via
+/// [`ui_enabled_router()`].
+#[tokio::test]
+async fn ui_is_not_mounted_by_default() {
+    let resp = router()
+        .oneshot(Request::get("/ui").body(Body::empty()).expect("req"))
+        .await
+        .expect("response");
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "the bundled chat UI must not be reachable unless --enable-ui opted in"
+    );
+}
+
+// ── Admin API mounted + authenticated + real config (findings 52, 90, sec-15) ─
+
+/// sec-15: the admin surface is gated unconditionally. A router built by the
+/// convenience constructor with no admin credential configured refuses every
+/// `/admin/*` request instead of publishing the running configuration.
+///
+/// Gatekeeper REQUIRED #10 (waves 1+1.5 review): this used to call
+/// `router()`, which builds its `AuthConfig` via `AuthConfig::from_env()` —
+/// so an operator/CI environment with `OXI_ADMIN_TOKEN` exported flips the
+/// expected 403 (`admin_auth_not_configured`) to 401 (a real, but
+/// differently-shaped, auth failure) and reds this test for a reason that
+/// has nothing to do with what it is meant to guard. Building the router
+/// explicitly with `AuthConfig::locked()` makes the "no credential
+/// configured" condition hermetic: true regardless of the process
+/// environment, exactly as this test's own name promises.
+#[tokio::test]
+async fn admin_is_refused_without_a_configured_credential() {
+    let resp = create_router_with_auth(engine(), None, AuthConfig::locked())
+        .oneshot(
+            Request::get("/admin/config")
+                .body(Body::empty())
+                .expect("req"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let json = body_json(resp).await;
+    assert_eq!(json["error"]["code"], "admin_auth_not_configured");
+}
 
 #[tokio::test]
 async fn admin_config_is_mounted_and_reports_real_model() {
-    let resp = router()
+    let resp = admin_router()
         .oneshot(
             Request::get("/admin/config")
+                .header("authorization", format!("Bearer {ADMIN_TOKEN}"))
                 .body(Body::empty())
                 .expect("req"),
         )
@@ -326,7 +398,69 @@ async fn admin_config_is_mounted_and_reports_real_model() {
 
 #[tokio::test]
 async fn admin_cache_stats_is_honest_about_unwired_caches() {
-    let resp = router()
+    let resp = admin_router()
+        .oneshot(
+            Request::get("/admin/cache-stats")
+                .header("authorization", format!("Bearer {ADMIN_TOKEN}"))
+                .body(Body::empty())
+                .expect("req"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    // No prefix cache is wired into the base server, so it must be reported
+    // as null / not-enabled — NOT as a fabricated all-zero counter presented
+    // as real data.
+    assert!(
+        json["prefix_cache"].is_null(),
+        "prefix_cache must be null when not wired; got {json}"
+    );
+    assert_eq!(json["prefix_cache_enabled"], false);
+    // SV-19 gate-fix triage (wave 3): `create_router_full` now always
+    // attaches a real `KvCachePolicy` (fed from real per-request context
+    // pressure — see `chat.rs`), so the *served* router's `/admin/cache-stats`
+    // is genuinely populated, not fabricated. The null case is exercised
+    // separately, against a bare `AdminState` with no policy attached at
+    // all, by `admin_cache_stats_reports_null_kv_cache_without_a_policy`
+    // below.
+    assert!(
+        json["kv_cache"].is_object(),
+        "kv_cache must be a populated object on the served router (a real \
+         KvCachePolicy is always attached); got {json}"
+    );
+    assert_eq!(json["kv_cache_enabled"], true);
+    assert!(
+        json["kv_cache"]["level"].is_string(),
+        "kv_cache must report a real tier level; got {json}"
+    );
+    // The old fabrication returned a blanket `"status":"ok"` alongside fake
+    // zeros; that must still be gone.
+    assert!(
+        json.get("status").is_none(),
+        "cache-stats must not claim a blanket status; got {json}"
+    );
+    assert!(
+        json.get("capacity_blocks").is_none(),
+        "no fabricated capacity_blocks should be present; got {json}"
+    );
+}
+
+/// Companion to the test above (SV-19 gate-fix triage, wave 3): a bare
+/// [`oxibonsai_runtime::admin::AdminState`] with no `KvCachePolicy` attached
+/// -- the shape every `/admin/*` test predating `create_router_full`'s
+/// unconditional `with_kv_cache_policy` wiring used -- must still report
+/// `kv_cache: null`. The served router's populated object above comes from
+/// `create_router_full` always attaching a policy, not from
+/// `/admin/cache-stats` fabricating one when none exists.
+#[tokio::test]
+async fn admin_cache_stats_reports_null_kv_cache_without_a_policy() {
+    let metrics = Arc::new(InferenceMetrics::new());
+    let state = Arc::new(oxibonsai_runtime::admin::AdminState::new(metrics));
+    let bare_admin_router =
+        oxibonsai_runtime::admin::create_admin_router(Arc::clone(&state)).with_state(state);
+
+    let resp = bare_admin_router
         .oneshot(
             Request::get("/admin/cache-stats")
                 .body(Body::empty())
@@ -336,27 +470,9 @@ async fn admin_cache_stats_is_honest_about_unwired_caches() {
         .expect("response");
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
-    // No prefix cache and no KV-cache policy are wired into the base server, so
-    // both must be reported as null / not-enabled — NOT as fabricated all-zero
-    // counters presented as real data.
-    assert!(
-        json["prefix_cache"].is_null(),
-        "prefix_cache must be null when not wired; got {json}"
-    );
-    assert_eq!(json["prefix_cache_enabled"], false);
     assert!(
         json["kv_cache"].is_null(),
         "kv_cache must be null when no policy is attached; got {json}"
     );
     assert_eq!(json["kv_cache_enabled"], false);
-    // The old fabrication returned a blanket `"status":"ok"` alongside fake
-    // zeros; that must be gone.
-    assert!(
-        json.get("status").is_none(),
-        "cache-stats must not claim a blanket status; got {json}"
-    );
-    assert!(
-        json.get("capacity_blocks").is_none() && json["kv_cache"].get("capacity_blocks").is_none(),
-        "no fabricated capacity_blocks should be present; got {json}"
-    );
 }

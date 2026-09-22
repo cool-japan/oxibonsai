@@ -5,6 +5,7 @@
 pub(super) mod gpu_profile {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
+    use std::sync::OnceLock;
     use std::time::Instant;
     static ENABLED: AtomicBool = AtomicBool::new(false);
     static INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -22,6 +23,21 @@ pub(super) mod gpu_profile {
             }
         }
         ENABLED.load(Ordering::Relaxed)
+    }
+    /// Whether full per-layer/tail profiling output (`OXIBONSAI_PROFILE`,
+    /// distinct from the GPU-timing-only `OXIBONSAI_PROFILE_GPU` behind
+    /// [`is_enabled`]) is enabled, cached on first call.
+    ///
+    /// MET-15b: `std::env::var("OXIBONSAI_PROFILE").is_ok()` used to run
+    /// **per forward call** (i.e. per decoded token) at both call sites in
+    /// `functions_2.rs::{encode_full_forward, encode_full_forward_ternary}`.
+    /// `std::env::var` takes the process-wide environment lock and
+    /// allocates a `String` on every call; hoisting it into a `OnceLock<bool>`
+    /// (mirroring [`is_enabled`]'s `AtomicBool` cache) makes steady-state
+    /// decode read a single relaxed atomic instead.
+    pub fn full_profiling_enabled() -> bool {
+        static FULL_PROFILING: OnceLock<bool> = OnceLock::new();
+        *FULL_PROFILING.get_or_init(|| std::env::var("OXIBONSAI_PROFILE").is_ok())
     }
     /// Get GPU execution start/end times from a completed command buffer.
     ///

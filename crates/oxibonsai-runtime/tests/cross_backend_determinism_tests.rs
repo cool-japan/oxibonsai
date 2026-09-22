@@ -35,6 +35,7 @@ use oxibonsai_kernels::dispatch::KernelTier;
 use oxibonsai_model::model::BonsaiModel;
 use oxibonsai_runtime::engine::InferenceEngine;
 use oxibonsai_runtime::sampling::SamplingParams;
+use oxibonsai_testkit::gguf_fixture::Lcg;
 
 /// KV-cache / context budget for the synthetic model.
 const MAX_SEQ: usize = 512;
@@ -51,10 +52,26 @@ const MAX_SEQ: usize = 512;
 ///
 /// Each block is 34 bytes: 32 bytes of 2-bit codes (4 weights/byte, LSB-first)
 /// followed by a 2-byte FP16 scale. The encoding is
-/// `00→-1, 01→0, 10→+1, 11→0`, matching the existing GEMV reference kernel.
+/// `00→-1, 01→0, 10→+1`, matching the existing GEMV reference kernel.
 ///
 /// To get a reasonably "interesting" weight matrix we vary both the qs pattern
 /// and the scale across blocks based on a 64-bit linear-congruential PRNG seed.
+///
+/// CQ-14 (wave-2.5 deviation routing #7): `11` (`0b11`) is a *reserved* code,
+/// not a fourth value — `screen_ternary_codes` in
+/// `oxibonsai-model/src/weight_loaders.rs` now rejects it outright, so this
+/// fixture must never emit it. A raw `(state >> 33) as u8` byte (the
+/// previous body) lands on `0b11` in about a quarter of *lanes*; each lane
+/// is folded into `{0, 1, 2}` before packing instead, exactly as
+/// `crates/oxibonsai-model/src/model/types/gpu_cache.rs::tq2_pattern`
+/// already does.
+///
+/// T-07 FIX (verifier wave 3): re-pointed at
+/// `oxibonsai_testkit::gguf_fixture::Lcg::next_valid_tq2_byte`, byte-for-byte
+/// identical to the previous hand-rolled state machine (`Lcg::new(s)` stores
+/// `s` as its state directly, so pre-adding the same golden-ratio constant
+/// this file always added before its first `next_u64()` reproduces the exact
+/// sequence) — confirmed by re-running this file's tests unchanged.
 fn tq2_0_g128_pattern(num_weights: usize, seed: u64) -> Vec<u8> {
     assert_eq!(
         num_weights % 128,
@@ -63,20 +80,15 @@ fn tq2_0_g128_pattern(num_weights: usize, seed: u64) -> Vec<u8> {
     );
     let num_blocks = num_weights / 128;
     let mut data = Vec::with_capacity(num_blocks * 34);
-    let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut lcg = Lcg::new(seed.wrapping_add(0x9E37_79B9_7F4A_7C15));
     for _ in 0..num_blocks {
-        // 32 bytes of qs (128 weights × 2 bits).
+        // 32 bytes of qs (128 weights × 2 bits, 4 lanes/byte).
         for _ in 0..32 {
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1);
-            data.push((state >> 33) as u8);
+            data.push(lcg.next_valid_tq2_byte());
         }
         // FP16 scale in (0.25, 0.75] so RMSNorm output stays in a sane range.
-        state = state
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1);
-        let scale_f32 = 0.25_f32 + ((state >> 33) as u32 as f32) / (u32::MAX as f32) * 0.5_f32;
+        let scale_f32 =
+            0.25_f32 + ((lcg.next_u64() >> 33) as u32 as f32) / (u32::MAX as f32) * 0.5_f32;
         let scale_bytes = f16::from_f32(scale_f32).to_le_bytes();
         data.extend_from_slice(&scale_bytes);
     }

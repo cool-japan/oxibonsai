@@ -51,6 +51,19 @@ use crate::constrained_decoding::TokenConstraint;
 /// resulting invariance forcing every intermediate borrow to be `'static`.
 type ConstraintRef<'a> = &'a mut (dyn TokenConstraint + 'static);
 
+/// Outcome of replaying a beam's generated suffix through a
+/// [`TokenConstraint`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConstraintReplay {
+    /// The suffix contains a token the constraint refused in `advance`: the
+    /// extension is illegal and must not become a beam.
+    Violated,
+    /// Legal so far, but not a valid terminal sequence yet.
+    Incomplete,
+    /// Legal and a valid terminal sequence: the beam is done.
+    Complete,
+}
+
 // ─── Config ────────────────────────────────────────────────────────────────
 
 /// Configuration for beam search decoding.
@@ -288,6 +301,13 @@ impl BeamSearchEngine {
             let mut candidates: Vec<Beam> = Vec::new();
 
             for beam in &live {
+                // Extensions this parent contributed to the round, whether
+                // they landed in `candidates` or (under `early_stopping`)
+                // straight in `completed`. A parent that contributes none is
+                // re-queued frozen below, so after this loop **every** live
+                // beam is accounted for exactly once -- which is what lets
+                // the `candidates.is_empty()` break drop the stale parents.
+                let mut produced = 0usize;
                 let mut logits = get_logits(&beam.tokens, step);
 
                 // Apply no-repeat-ngram masking if configured
@@ -303,11 +323,77 @@ impl BeamSearchEngine {
                 if let Some(bc) = constraint.as_deref_mut() {
                     let suffix = &beam.tokens[prompt_len..];
                     if let Some(mask) = Self::replay_constraint_mask(bc, suffix, vocab_size) {
-                        for (i, &allowed) in mask.iter().enumerate() {
-                            if !allowed && i < logits.len() {
-                                logits[i] = -1e9;
-                            }
+                        // Bound the "is anything still allowed" scan to
+                        // what `logits` can actually reflect (mirrors
+                        // `InferencePipeline::run_autoregressive`'s
+                        // RT-PIPELINE guard in `pipeline.rs`): a mask
+                        // longer than `logits` whose only allowed index
+                        // sits past the end can never be honoured by
+                        // masking `logits` alone, so it must be treated as
+                        // fully disallowed here too.
+                        let reachable = mask.len().min(logits.len());
+                        if !mask[..reachable].iter().any(|&allowed| allowed) {
+                            // Every token this beam could legally emit
+                            // next is disallowed. Masking to an all-`-inf`
+                            // vector and ranking it in `top_k_log_probs` is
+                            // exactly the NaN-producing path RT-21
+                            // describes for softmax (`(-inf) - (-inf)`
+                            // once the log-softmax denominator is also
+                            // `-inf`) -- and the old finite `-1e9`
+                            // sentinel was no better: with every logit
+                            // pinned to the *same* value, log-softmax
+                            // hands every token an identical, meaningless
+                            // log-probability and top-k fabricates a
+                            // continuation that violates the very
+                            // constraint that produced the mask. Detect
+                            // the dead end here, before either vector is
+                            // ever built, and freeze this beam instead of
+                            // extending it.
+                            //
+                            // Freeze, don't drop (RAG-EVAL-IMG follow-up):
+                            // an earlier version of this fix did a bare
+                            // `continue`, which contributes nothing to
+                            // `candidates` at all. That is harmless when
+                            // *every* live beam stalls in the same round --
+                            // `candidates` stays wholly empty, the "no
+                            // candidates this round" fallback below fires,
+                            // and `beams` (never reassigned) flows into
+                            // `completed` untouched. But when only *some*
+                            // live beams stall in a `beam_width > 1` round,
+                            // `candidates` is non-empty from the siblings
+                            // that did extend, so that fallback never
+                            // fires: `beams = prune_beams(candidates, ...)`
+                            // then unconditionally overwrites `beams`, and
+                            // a `continue`d beam -- which was never added
+                            // to `candidates` and is not `is_done` (so the
+                            // "already-done beams from the previous round"
+                            // drain above does not catch it either) --
+                            // vanishes for good, however good its score.
+                            //
+                            // Marking it done and pushing it into
+                            // `candidates` (rather than `completed`
+                            // directly) reuses the existing, already-
+                            // correct lifecycle a naturally-completed
+                            // (EOS) beam gets when `early_stopping` is
+                            // false: it competes fairly in this round's
+                            // `prune_beams` alongside every real
+                            // extension, then either survives into
+                            // `beams` (draining into `completed` on a
+                            // later round via the done-beams drain, or at
+                            // the final "gather all remaining live beams"
+                            // step) or is pruned out on merit like any
+                            // other candidate -- never by an unconditional,
+                            // score-blind drop. Pushing straight into
+                            // `completed` instead (skipping `prune_beams`
+                            // entirely) would lose it that fair comparison
+                            // and, before this round's per-parent
+                            // accounting existed, would also have been
+                            // re-gathered a second time by the "no
+                            // candidates this round" fallback below.
+                            candidates.push(Self::frozen(beam));
+                            continue;
                         }
+                        Self::apply_constraint_mask(&mut logits, &mask);
                     }
                 }
 
@@ -322,10 +408,26 @@ impl BeamSearchEngine {
                         if let Some(bc) = constraint.as_deref_mut() {
                             let mut ext_suffix: Vec<u32> = beam.tokens[prompt_len..].to_vec();
                             ext_suffix.push(token);
-                            done = Self::replay_constraint_complete(bc, &ext_suffix);
+                            match Self::replay_constraint_status(bc, &ext_suffix) {
+                                // The extension itself is illegal. A mask
+                                // cannot always prevent this: a constraint
+                                // may legitimately report itself
+                                // unconstrained at this position
+                                // (`allowed_tokens` -> `None`) while still
+                                // refusing a specific token in `advance`,
+                                // and the previous replay could only ask
+                                // "is this complete?", whose `false`
+                                // conflates "not yet" with "never". Reject
+                                // the candidate instead of committing a
+                                // beam the constraint has already refused.
+                                ConstraintReplay::Violated => continue,
+                                ConstraintReplay::Complete => done = true,
+                                ConstraintReplay::Incomplete => {}
+                            }
                         }
                     }
 
+                    produced += 1;
                     if done {
                         new_beam.is_done = true;
                         if cfg.early_stopping {
@@ -334,6 +436,15 @@ impl BeamSearchEngine {
                         }
                     }
                     candidates.push(new_beam);
+                }
+
+                if produced == 0 {
+                    // Nothing this beam could legally emit survived (every
+                    // top-k extension was rejected by the constraint, or
+                    // `get_logits` returned nothing to rank). Freeze it and
+                    // let it compete on merit, exactly like a beam whose
+                    // mask disallowed everything -- never drop it silently.
+                    candidates.push(Self::frozen(beam));
                 }
             }
 
@@ -351,6 +462,19 @@ impl BeamSearchEngine {
             }
 
             if candidates.is_empty() {
+                // Every live beam was expanded this round and each one
+                // either contributed an extension (to `candidates`, or --
+                // under `early_stopping` -- directly to `completed`) or was
+                // re-queued frozen by the `produced == 0` guard above. So an
+                // empty `candidates` here means the round's whole output
+                // went to `completed`, and the parents still sitting in
+                // `beams` are stale, un-extended copies whose successors are
+                // already recorded. Gathering them below would return a
+                // pre-EOS prefix *next to* its own EOS-terminated
+                // continuation -- and, carrying `log_prob == 0.0`, that
+                // prefix outscores the continuation and is returned instead
+                // of it.
+                beams.clear();
                 break;
             }
 
@@ -428,18 +552,35 @@ impl BeamSearchEngine {
         constraint.allowed_tokens(suffix, vocab_size)
     }
 
-    /// Rebuild constraint state from scratch and report whether `suffix` (a
-    /// beam's generated-so-far tokens, prompt excluded, including the
-    /// candidate token under consideration) is now a complete, valid
-    /// terminal sequence.
-    fn replay_constraint_complete(constraint: ConstraintRef<'_>, suffix: &[u32]) -> bool {
+    /// Rebuild constraint state from scratch and classify `suffix` (a beam's
+    /// generated-so-far tokens, prompt excluded, including the candidate
+    /// token under consideration).
+    ///
+    /// Three outcomes, not two: the previous boolean ("is it complete?")
+    /// made a rejected token indistinguishable from a merely-unfinished one,
+    /// so an extension the constraint refused in `advance` was still pushed
+    /// as a live beam.
+    fn replay_constraint_status(constraint: ConstraintRef<'_>, suffix: &[u32]) -> ConstraintReplay {
         constraint.reset();
         for &t in suffix {
             if !constraint.advance(t) {
-                return false;
+                return ConstraintReplay::Violated;
             }
         }
-        constraint.is_complete()
+        if constraint.is_complete() {
+            ConstraintReplay::Complete
+        } else {
+            ConstraintReplay::Incomplete
+        }
+    }
+
+    /// A done-marked clone of `beam`, used to re-queue a parent that could
+    /// not legally extend so it competes in `prune_beams` on merit instead
+    /// of vanishing.
+    fn frozen(beam: &Beam) -> Beam {
+        let mut frozen = beam.clone();
+        frozen.is_done = true;
+        frozen
     }
 
     /// Zero out (set to −∞) any token that would create a repeated n-gram.
@@ -464,6 +605,39 @@ impl BeamSearchEngine {
                 let banned_token = tokens[start + prefix_len] as usize;
                 if banned_token < logits.len() {
                     logits[banned_token] = f32::NEG_INFINITY;
+                }
+            }
+        }
+    }
+
+    /// Force every disallowed logit to `f32::NEG_INFINITY` -- an exact
+    /// exclusion that holds at any temperature, unlike a large-but-finite
+    /// sentinel such as `-1e9` (RT-20 class), which can retain nonzero
+    /// post-softmax probability at extreme logit ranges. Mirrors
+    /// `pipeline.rs`'s private `apply_constraint_mask`, exposed here as a
+    /// `pub fn` (like this struct's own [`Self::apply_no_repeat_ngram`])
+    /// so the exact write can be asserted directly in a test instead of
+    /// only inferred from `search_with_constraint`'s black-box output --
+    /// which cannot actually distinguish this sentinel from a finite one
+    /// whenever the surviving allowed logit is realistic, since `exp()`
+    /// underflows to precisely `0.0` for *either* sentinel once shifted
+    /// far enough below the max (see the direct test below).
+    ///
+    /// Bounded by `logits.get_mut(i)`, exactly like `pipeline.rs`'s
+    /// version: a `mask` longer than `logits` is handled by simply never
+    /// reaching those extra entries, never by indexing out of bounds.
+    ///
+    /// **Visibility (decided for 0.2.4):** `pub(crate)`, not `pub`. It was
+    /// extracted purely so the exact `-inf` write could be asserted in a
+    /// test; `pub(crate)` keeps all of that test value (the tests live in
+    /// this crate) without committing the project to a public API whose
+    /// sibling in `pipeline.rs` is private. No caller outside this crate
+    /// used it.
+    pub(crate) fn apply_constraint_mask(logits: &mut [f32], mask: &[bool]) {
+        for (i, &allowed) in mask.iter().enumerate() {
+            if !allowed {
+                if let Some(logit) = logits.get_mut(i) {
+                    *logit = f32::NEG_INFINITY;
                 }
             }
         }
@@ -864,6 +1038,55 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_constraint_mask_writes_exact_neg_infinity_not_finite_sentinel() {
+        // Pins the RT-20-class sentinel fix at a granularity
+        // `test_beam_search_with_constraint_masks_disallowed_tokens` (above)
+        // cannot: that test only asserts a disallowed token is *absent*
+        // from the output, which a finite `-1e9` sentinel (<< the allowed
+        // token's logit) already guaranteed just as well as an exact
+        // `-inf` does -- it passes identically under either sentinel, so it
+        // does not actually pin which one `search_with_constraint` uses.
+        // Assert directly on the masked buffer instead. The disallowed
+        // index starts from an extreme value (1e30) precisely so that *if*
+        // masking ever regressed to leaving the raw value untouched (or to
+        // a sentinel that does not dominate it), that regression would be
+        // impossible to miss.
+        let mut logits = vec![50.0f32, 1e30, 10.0, -5.0];
+        let mask = vec![true, false, true, true];
+        BeamSearchEngine::apply_constraint_mask(&mut logits, &mask);
+
+        assert_eq!(
+            logits[1],
+            f32::NEG_INFINITY,
+            "a disallowed logit -- even one starting from an extreme value -- must become \
+             exactly f32::NEG_INFINITY, not a finite sentinel such as -1e9: {logits:?}"
+        );
+        assert_eq!(logits[0], 50.0, "allowed entries must be untouched");
+        assert_eq!(logits[2], 10.0, "allowed entries must be untouched");
+        assert_eq!(logits[3], -5.0, "allowed entries must be untouched");
+
+        // Feed the masked buffer through the same log-softmax
+        // `search_with_constraint` actually ranks with: the disallowed
+        // entry must carry exactly zero probability, not merely a small
+        // one, and no NaN may appear anywhere in the ranking.
+        let ranked = BeamSearchEngine::top_k_log_probs(&logits, logits.len());
+        assert!(
+            ranked.iter().all(|(_, lp)| !lp.is_nan()),
+            "no ranked log-probability may be NaN: {ranked:?}"
+        );
+        let disallowed = ranked
+            .iter()
+            .find(|(token, _)| *token == 1)
+            .expect("k == vocab_size returns every entry, including the disallowed one");
+        assert_eq!(
+            disallowed.1.exp(),
+            0.0,
+            "log-softmax must assign the masked entry exactly zero probability, got {}",
+            disallowed.1
+        );
+    }
+
+    #[test]
     fn test_beam_search_with_constraint_stops_beam_on_completion() {
         use crate::constrained_decoding::JsonConstraint;
 
@@ -910,6 +1133,431 @@ mod tests {
             "expected constraint-driven early stop, got {} steps",
             result.num_steps
         );
+    }
+
+    // ── RT-20 class sibling: an all-disallowed mask must stop the beam ──────
+    // ── cleanly instead of ranking an all-`-inf`/uniform logit vector ───────
+
+    /// Test-only constraint that reports every token disallowed, from the
+    /// very first step, unconditionally -- gives full, deterministic
+    /// control over the "fully unsatisfiable" scenario without depending
+    /// on `JsonConstraint`'s own state machine ever reaching one.
+    struct AlwaysUnsatisfiable;
+    impl TokenConstraint for AlwaysUnsatisfiable {
+        fn allowed_tokens(&self, _generated: &[u32], vocab_size: usize) -> Option<Vec<bool>> {
+            Some(vec![false; vocab_size])
+        }
+        fn advance(&mut self, _token: u32) -> bool {
+            false
+        }
+        fn is_complete(&self) -> bool {
+            false
+        }
+        fn reset(&mut self) {}
+        fn name(&self) -> &str {
+            "always-unsatisfiable"
+        }
+    }
+
+    #[test]
+    fn test_beam_search_constraint_fully_unsatisfiable_stops_cleanly_without_garbage() {
+        // Reproduces the same finite-sentinel defect RT-20 fixed in
+        // `pipeline.rs`, here in `search_with_constraint`: the old
+        // `logits[i] = -1e9` sets every logit to the *same* finite value
+        // when the whole vocabulary is disallowed. `top_k_log_probs`'s
+        // log-softmax then hands every token an identical, meaningless
+        // log-probability, and the beam gets extended with a low-index
+        // token that the constraint never actually allowed -- a fabricated
+        // continuation, not a NaN, but "garbage" all the same. (Swapping
+        // to `f32::NEG_INFINITY` alone would be *worse*: log-softmax then
+        // computes `(-inf) - (-inf) = NaN` for every entry once the
+        // denominator is also `-inf`.) The fix must detect the
+        // all-disallowed mask before ranking anything and drop the beam
+        // from this round instead.
+        let vocab_size = 16usize;
+        let config = BeamSearchConfig {
+            beam_width: 1,
+            max_tokens: 3,
+            eos_token_id: 999_999,
+            early_stopping: false,
+            ..Default::default()
+        };
+        let engine = BeamSearchEngine::new(config);
+        let mut constraint = AlwaysUnsatisfiable;
+
+        let initial = vec![1u32, 2];
+        let result = engine.search_with_constraint(
+            initial.clone(),
+            vocab_size,
+            |_tokens, _step| {
+                // Any real-looking logits; the constraint must mask them
+                // all away regardless of what the model would have said.
+                (0..vocab_size).map(|i| i as f32).collect()
+            },
+            Some(&mut constraint),
+        );
+
+        assert!(
+            result.scores.iter().all(|s| !s.is_nan()),
+            "no score may be NaN, got {:?}",
+            result.scores
+        );
+        assert_eq!(
+            result.best(),
+            initial.as_slice(),
+            "a beam that can never legally extend must stay frozen at its last \
+             valid length, not be extended with a fabricated (disallowed) token; \
+             got {:?}",
+            result.best()
+        );
+    }
+
+    /// Test-only constraint whose allowed set is a pure function of the
+    /// generated-so-far suffix (never mutable internal state), so a single
+    /// shared instance -- reset and replayed independently per beam by
+    /// `replay_constraint_mask` -- can hand two *different* live beams in
+    /// the same round genuinely different masks: a beam that has generated
+    /// `[0]` is a dead end (nothing ever legal again); a beam that has
+    /// generated `[1]` may continue with token `2`.
+    struct StallsAfterTokenZero;
+    impl TokenConstraint for StallsAfterTokenZero {
+        fn allowed_tokens(&self, generated: &[u32], vocab_size: usize) -> Option<Vec<bool>> {
+            let mut mask = vec![false; vocab_size];
+            match generated {
+                [] => {
+                    mask[0] = true;
+                    mask[1] = true;
+                }
+                [0] => {
+                    // Dead end: no token is ever legal after `0`.
+                }
+                [1] => {
+                    mask[2] = true;
+                }
+                _ => {}
+            }
+            Some(mask)
+        }
+        fn advance(&mut self, _token: u32) -> bool {
+            true
+        }
+        fn is_complete(&self) -> bool {
+            false
+        }
+        fn reset(&mut self) {}
+        fn name(&self) -> &str {
+            "stalls-after-token-zero"
+        }
+    }
+
+    #[test]
+    fn test_beam_search_stalled_beam_survives_alongside_beams_that_keep_extending() {
+        // Reproduce first: with `beam_width > 1`, if exactly one of several
+        // *live* beams hits a fully-disallowed mask while at least one
+        // sibling does not, the old code's bare `continue` drops the
+        // stalled beam from `candidates` without marking it `is_done`, so
+        // it is neither carried into `completed` via the "already-done
+        // beams from the previous round" drain (it was never marked done)
+        // nor preserved by the "no candidates this round" fallback (that
+        // only fires when *every* live beam stalls, making `candidates`
+        // wholly empty). `beams = prune_beams(candidates, ...)` then
+        // overwrites `beams` with only the siblings that produced a
+        // candidate, and the stalled beam -- however good its score --
+        // silently vanishes from every subsequent round and from the final
+        // ranking.
+        //
+        // Round 1: both token 0 (logit 100) and token 1 (logit 50) are
+        // allowed, so with beam_width=2 both become live beams. Round 2:
+        // the `[0]`-suffixed beam's mask disallows everything (dead end);
+        // the `[1]`-suffixed beam's mask allows only token 2, so it keeps
+        // extending to `[1, 2]`. Both beams represent legally-generated,
+        // constraint-valid prefixes and must both reach the final result.
+        let vocab_size = 8usize;
+        let config = BeamSearchConfig {
+            beam_width: 2,
+            max_tokens: 2,
+            length_penalty: 0.6,
+            no_repeat_ngram_size: 0,
+            early_stopping: false,
+            eos_token_id: 999_999, // never generated; isolates constraint behaviour
+        };
+        let engine = BeamSearchEngine::new(config);
+        let mut constraint = StallsAfterTokenZero;
+
+        let result = engine.search_with_constraint(
+            Vec::new(),
+            vocab_size,
+            |tokens, _step| {
+                let mut logits = vec![0.0f32; vocab_size];
+                if tokens.is_empty() {
+                    logits[0] = 100.0;
+                    logits[1] = 50.0;
+                } else if tokens == [1] {
+                    logits[2] = 100.0;
+                }
+                // tokens == [0]: irrelevant, the mask disallows everything.
+                logits
+            },
+            Some(&mut constraint),
+        );
+
+        assert_eq!(
+            result.sequences.len(),
+            2,
+            "the beam that stalled on a fully-disallowed mask must survive to the final \
+             ranking alongside the beam that kept extending, not vanish; got {:?}",
+            result.sequences
+        );
+        assert!(
+            result.sequences.contains(&vec![0u32]),
+            "the stalled beam (frozen at its last valid length) must be present; got {:?}",
+            result.sequences
+        );
+        assert!(
+            result.sequences.contains(&vec![1u32, 2]),
+            "the beam that kept extending must also be present; got {:?}",
+            result.sequences
+        );
+    }
+
+    // ── Wave-1.5 addendum (a): an extension the constraint REJECTS must
+    // ── never become a live beam ────────────────────────────────────────
+
+    /// A constraint that masks nothing (`allowed_tokens` → `None`, i.e. "no
+    /// active restriction at this position") but refuses token `3` in
+    /// `advance`, and never reports itself complete.
+    ///
+    /// This is the shape that reaches the missing rejection path: with no
+    /// mask there is nothing to stop the token being *selected*, and a
+    /// replay that reports "not complete" says nothing about legality — so
+    /// the violating token used to be committed as a live beam.
+    struct RejectsTokenThree;
+    impl TokenConstraint for RejectsTokenThree {
+        fn allowed_tokens(&self, _generated: &[u32], _vocab_size: usize) -> Option<Vec<bool>> {
+            None
+        }
+        fn advance(&mut self, token: u32) -> bool {
+            token != 3
+        }
+        fn is_complete(&self) -> bool {
+            false
+        }
+        fn reset(&mut self) {}
+        fn name(&self) -> &str {
+            "rejects-token-three"
+        }
+    }
+
+    #[test]
+    fn test_beam_search_rejects_a_constraint_violating_extension() {
+        let vocab_size = 8usize;
+        let config = BeamSearchConfig {
+            beam_width: 1,
+            max_tokens: 3,
+            length_penalty: 1.0,
+            no_repeat_ngram_size: 0,
+            early_stopping: false,
+            eos_token_id: 999_999, // never generated; isolates constraint behaviour
+        };
+        let engine = BeamSearchEngine::new(config);
+        let mut constraint = RejectsTokenThree;
+
+        let initial = vec![1u32, 2];
+        let result = engine.search_with_constraint(
+            initial.clone(),
+            vocab_size,
+            |_tokens, _step| {
+                // The model wants token 3 above everything else.
+                let mut logits = vec![0.0f32; vocab_size];
+                logits[3] = 100.0;
+                logits[4] = 1.0;
+                logits
+            },
+            Some(&mut constraint),
+        );
+
+        for seq in &result.sequences {
+            assert!(
+                !seq[initial.len()..].contains(&3u32),
+                "a token the constraint rejected in `advance` must never be committed \
+                 to a beam; got {seq:?}"
+            );
+        }
+        assert!(
+            !result.sequences.is_empty(),
+            "the parent beam must survive as a frozen candidate, not vanish"
+        );
+        assert!(
+            result.scores.iter().all(|s| !s.is_nan()),
+            "no score may be NaN, got {:?}",
+            result.scores
+        );
+    }
+
+    #[test]
+    fn test_beam_search_rejection_keeps_the_legal_sibling_extension() {
+        // With beam_width = 2 the top-2 are {3 (illegal), 4 (legal)}: the
+        // illegal one is dropped and the legal one still extends, so the
+        // rejection path must not freeze a beam that had a valid option.
+        let vocab_size = 8usize;
+        let config = BeamSearchConfig {
+            beam_width: 2,
+            max_tokens: 1,
+            length_penalty: 1.0,
+            no_repeat_ngram_size: 0,
+            early_stopping: false,
+            eos_token_id: 999_999,
+        };
+        let engine = BeamSearchEngine::new(config);
+        let mut constraint = RejectsTokenThree;
+
+        let result = engine.search_with_constraint(
+            Vec::new(),
+            vocab_size,
+            |_tokens, _step| {
+                let mut logits = vec![0.0f32; vocab_size];
+                logits[3] = 100.0;
+                logits[4] = 50.0;
+                logits
+            },
+            Some(&mut constraint),
+        );
+
+        assert!(
+            result.sequences.contains(&vec![4u32]),
+            "the legal extension must survive; got {:?}",
+            result.sequences
+        );
+        assert!(
+            !result.sequences.iter().any(|s| s.contains(&3u32)),
+            "the illegal extension must not; got {:?}",
+            result.sequences
+        );
+    }
+
+    // ── Wave-1.5 addendum (b): when every live beam finishes in one round
+    // ── under `early_stopping`, the stale parents must not be re-gathered ─
+
+    #[test]
+    fn test_beam_search_early_stopping_does_not_duplicate_stale_parents() {
+        // beam_width = 1 and EOS ranked top: the single live beam's only
+        // extension is EOS, which `early_stopping` sends straight to
+        // `completed`. `candidates` is then empty, the loop breaks *before*
+        // `beams` is reassigned, and the trailing "gather all remaining live
+        // beams" step used to re-push the stale, un-extended, pre-EOS parent
+        // — which, carrying `log_prob == 0.0`, outscores the real
+        // EOS-terminated sequence and is returned instead of it.
+        let vocab_size = 8usize;
+        let config = BeamSearchConfig {
+            beam_width: 1,
+            max_tokens: 4,
+            length_penalty: 1.0,
+            no_repeat_ngram_size: 0,
+            early_stopping: true,
+            eos_token_id: 5,
+        };
+        let engine = BeamSearchEngine::new(config);
+
+        let initial = vec![1u32, 2];
+        // A *soft* distribution on purpose: EOS wins, but with a real
+        // (negative) log-probability. A near-deterministic distribution would
+        // give the EOS beam `log_prob ≈ 0`, tying it with the stale parent's
+        // literal `0.0` and hiding the defect behind a stable sort.
+        let result = engine.search(initial.clone(), vocab_size, |_tokens, _step| {
+            let mut logits = vec![0.0f32; vocab_size];
+            logits[5] = 2.0; // EOS wins every step
+            logits[4] = 1.0;
+            logits
+        });
+
+        assert!(
+            !result.sequences.contains(&initial),
+            "the stale pre-EOS parent must not be returned as a result; got {:?}",
+            result.sequences
+        );
+        assert_eq!(
+            result.best(),
+            &[1u32, 2, 5],
+            "the EOS-terminated sequence is the only completed beam; got {:?}",
+            result.sequences
+        );
+    }
+
+    /// A constraint that allows everything and calls any non-empty
+    /// generation complete: every extension of every beam terminates in the
+    /// round it is created.
+    struct CompleteAfterOneToken;
+    impl TokenConstraint for CompleteAfterOneToken {
+        fn allowed_tokens(&self, _generated: &[u32], _vocab_size: usize) -> Option<Vec<bool>> {
+            None
+        }
+        fn advance(&mut self, _token: u32) -> bool {
+            true
+        }
+        fn is_complete(&self) -> bool {
+            true
+        }
+        fn reset(&mut self) {}
+        fn name(&self) -> &str {
+            "complete-after-one-token"
+        }
+    }
+
+    #[test]
+    fn test_beam_search_early_stopping_all_beams_finish_without_duplicates() {
+        // The same defect at beam_width = 2, driven by a constraint that
+        // completes every extension: both of the round's candidates go
+        // straight to `completed`, `candidates` stays empty, and the stale
+        // parent used to be gathered alongside them — outscoring both, since
+        // it carries `log_prob == 0.0`.
+        let vocab_size = 8usize;
+        let config = BeamSearchConfig {
+            beam_width: 2,
+            max_tokens: 4,
+            length_penalty: 1.0,
+            no_repeat_ngram_size: 0,
+            early_stopping: true,
+            eos_token_id: 999_999, // never generated; the constraint terminates
+        };
+        let engine = BeamSearchEngine::new(config);
+        let mut constraint = CompleteAfterOneToken;
+
+        let initial = vec![7u32];
+        let result = engine.search_with_constraint(
+            initial.clone(),
+            vocab_size,
+            |_tokens, _step| {
+                let mut logits = vec![0.0f32; vocab_size];
+                logits[1] = 2.0;
+                logits[2] = 1.5;
+                logits
+            },
+            Some(&mut constraint),
+        );
+
+        assert!(
+            !result.sequences.contains(&initial),
+            "the stale, un-extended parent must not be gathered next to its own \
+             completed extensions; got {:?}",
+            result.sequences
+        );
+        let mut deduped = result.sequences.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            result.sequences.len(),
+            "no sequence may appear twice; got {:?}",
+            result.sequences
+        );
+        for seq in &result.sequences {
+            assert_eq!(
+                seq.len(),
+                initial.len() + 1,
+                "every returned sequence must be a completed extension; got {:?}",
+                result.sequences
+            );
+        }
     }
 
     #[test]

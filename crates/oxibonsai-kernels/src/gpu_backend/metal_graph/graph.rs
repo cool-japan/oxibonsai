@@ -2,18 +2,27 @@
 //! plus weight upload/caching, single-GEMV dispatch, and the fused FFN phase.
 
 use metal::{Buffer, CommandQueue, Device, MTLResourceOptions};
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
 use crate::gpu_backend::metal_full_layer;
+use crate::gpu_backend::metal_full_layer::types::{next_model_epoch, WeightKey, WeightKind};
 use crate::gpu_backend::metal_prefill;
 
-use super::buffers::{alloc_buf, download_f32, upload_bytes, upload_f32, MetalBuffers};
+use super::buffers::{
+    alloc_buf, commit_and_wait, download_f32, upload_bytes, upload_f32, MetalBuffers,
+};
 use super::error::{MetalGraphError, MetalWeightHandle};
 use super::pipelines::MetalPipelines;
-use super::reformat::{reformat_q1_aos_to_soa, reformat_tq2_aos_to_soa};
+use super::reformat::{
+    reformat_pq2_aos_to_soa, reformat_q1_aos_to_soa, reformat_tq2_aos_to_soa,
+    validate_tq2_ternary_codes, Q2_BLOCK_BYTES, Q2_QS_BYTES, Q2_SCALE_BYTES,
+};
+
+mod weight_cache;
+
+use weight_cache::WeightCache;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // MetalGraph
@@ -106,8 +115,14 @@ pub struct MetalGraph {
     /// Lazily allocated intermediate buffers, protected by a mutex for
     /// interior mutability (buffer contents are mutated on each dispatch).
     buffers: Mutex<Option<MetalBuffers>>,
-    /// Lazy cache of GPU-resident weight buffers, keyed by `GpuWeightHandle` id.
-    weight_cache: Mutex<HashMap<u64, Arc<MetalWeightHandle>>>,
+    /// Lazy cache of GPU-resident weight buffers, keyed by
+    /// [`WeightKey`] `{ model_epoch, kind, slot }` (MET-02).
+    ///
+    /// The composite key is what keeps the raw-f32, Q1, TQ2, PQ2 and PTQ1
+    /// upload paths — plus the image crate's pointer-keyed weights — from
+    /// serving each other's buffers, and what lets
+    /// [`MetalGraph::release_model`] free a model's GPU memory on unload.
+    weight_cache: Mutex<WeightCache<Arc<MetalWeightHandle>>>,
     /// Lazily allocated KV cache for all layers.
     pub(crate) kv_cache: Mutex<Option<metal_full_layer::GpuKvCache>>,
     /// Lazily allocated full-layer intermediate buffers.
@@ -117,7 +132,20 @@ pub struct MetalGraph {
     /// Persistent 4-byte buffer for GPU argmax token ID output (greedy decoding).
     pub(crate) token_id_buf: Mutex<Option<Buffer>>,
     /// Lazily allocated prefill buffers for batch processing.
-    pub(crate) prefill_buffers: Mutex<Option<metal_prefill::PrefillBuffers>>,
+    ///
+    /// Held as a [`metal_prefill::PrefillBufferCache`] — the buffer set plus
+    /// the batch capacity it was allocated for — so the cache is **bucketed
+    /// and grow-only** rather than exact-match on `batch_size`, which used to
+    /// reallocate ~172 MB on every distinct prompt length (perf-M3).
+    pub(crate) prefill_buffers: Mutex<Option<metal_prefill::PrefillBufferCache>>,
+    /// Lazily compiled batched-prefill attention pipelines (perf-01).
+    ///
+    /// `None` inside the `OnceLock` means the two kernels are unavailable on
+    /// this device/toolchain and prefill falls back to the per-token attention
+    /// loop; they live in their own Metal library so the combined metallib
+    /// shared with the image crate is untouched. See
+    /// `metal_prefill::attention`.
+    pub(crate) prefill_attn: OnceLock<Option<metal_prefill::attention::PrefillAttnPipelines>>,
     /// Resizable shared-storage I/O scratch for the DiT `encode_gemm_tq2` path.
     /// Grows to the max byte length seen and is reused across all ~100 ternary
     /// matmuls/forward to avoid the per-call 170 MB alloc/free.
@@ -128,19 +156,109 @@ pub struct MetalGraph {
     /// across calls — the *resident* analogue of the per-call fresh-buffer
     /// `encode_joint_attention_flash`.
     pub(super) joint_attn_pool: Mutex<Option<JointAttnIoPool>>,
-    /// Running count of f32 weight uploads via [`get_or_upload_f32_weight`].
+    /// Running count of **raw f32** weight uploads (norms, f32/bf16 GEMM
+    /// matrices) that actually allocated a GPU buffer.
     ///
-    /// Incremented once each time a key is not found in `weight_cache` and a
-    /// fresh GPU buffer is actually allocated and inserted. Used to verify that
-    /// multi-prompt resident workflows amortize uploads (counter stays flat after
-    /// the first forward) and that non-resident evict-after-GEMM workflows stay
-    /// correct (counter increments on every call, no stale-cache collisions).
-    f32_upload_count: AtomicUsize,
+    /// Incremented once each time a [`WeightKind::RawF32`] key is not found in
+    /// `weight_cache` and a fresh GPU buffer is allocated and inserted. Used to
+    /// verify that multi-prompt resident workflows amortize uploads (counter
+    /// stays flat after the first forward) and that non-resident
+    /// evict-after-GEMM workflows stay correct (counter increments on every
+    /// call, no stale-cache collisions).
+    norm_upload_count: AtomicUsize,
+    /// Running count of **quantized** weight uploads (Q1/TQ2/PQ2/PTQ1 SoA).
+    ///
+    /// Before MET-14 only the raw-f32 path was counted, so the upload counter
+    /// was blind to ~95 % of the bytes — every quantized matrix went uncounted.
+    quant_upload_count: AtomicUsize,
+    /// GPU weight bytes **currently resident** in `weight_cache`.
+    ///
+    /// A gauge, not a running total: it rises on every cache miss that uploads
+    /// and falls again on [`MetalGraph::evict_weight`] and
+    /// [`MetalGraph::release_model`]. This is the number that makes a duplicate
+    /// upload of a whole model (MET-02) or a second host/GPU copy of the
+    /// weights (MET-03) visible as a metric instead of a code audit.
+    bytes_uploaded: AtomicU64,
 }
 
 // Metal objects (Device, CommandQueue, etc.) are Send+Sync in the metal crate.
 unsafe impl Send for MetalGraph {}
 unsafe impl Sync for MetalGraph {}
+
+/// Debug-build cross-check: the directly-written SoA buffer must be byte-for-byte
+/// what the allocating reformatter produces.
+///
+/// `reference` is a closure and the `cfg!` test is a plain early return, so a
+/// release build never calls it (LLVM removes the branch) — the whole point of
+/// MET-03 is not to allocate that second copy — while rustc still sees the
+/// reference reformatters as used, so they cannot rot.
+fn debug_check_q2_soa(buffer: &Buffer, reference: impl FnOnce() -> Option<Vec<u8>>, what: &str) {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let Some(reference) = reference() else {
+        return;
+    };
+    // SAFETY: `write_q2_soa_into_new_buffer` produced this shared-storage
+    // buffer with a non-null `contents()` and a length of exactly the AoS byte
+    // length, which is what the reformatter also returns.
+    let written =
+        unsafe { std::slice::from_raw_parts(buffer.contents() as *const u8, reference.len()) };
+    assert_eq!(
+        written, reference,
+        "{what} direct SoA write diverged from reformat_*_aos_to_soa"
+    );
+}
+
+/// Allocate a 2-bit SoA weight buffer and write both sections straight into it
+/// (MET-03).
+///
+/// `split_block` receives one 34-byte AoS block and returns its `(qs, scale)`
+/// slices, which is the only thing that differs between `TQ2_0_g128` (qs-first)
+/// and `PQ2_0` (`d`-first). The buffer layout produced is the shared SoA one:
+/// `[N x 2 B scales][N x 32 B qs]`.
+///
+/// Returns `None` when the input is empty or not a whole number of blocks —
+/// the same rejection the allocating reformatter makes — and
+/// `Some(Err(..))` when the Metal allocation itself fails.
+#[allow(clippy::type_complexity)]
+fn write_q2_soa_into_new_buffer<'a>(
+    device: &Device,
+    aos_bytes: &'a [u8],
+    split_block: impl Fn(&'a [u8]) -> (&'a [u8], &'a [u8]),
+) -> Option<Result<Buffer, MetalGraphError>> {
+    if aos_bytes.is_empty() || !aos_bytes.len().is_multiple_of(Q2_BLOCK_BYTES) {
+        return None;
+    }
+    let n_blocks = aos_bytes.len() / Q2_BLOCK_BYTES;
+    let buf = match alloc_buf(
+        device,
+        aos_bytes.len() as u64,
+        MTLResourceOptions::StorageModeShared,
+    ) {
+        Ok(b) => b,
+        Err(e) => return Some(Err(e)),
+    };
+    // SAFETY: `alloc_buf` has already rejected a null `contents()` for a
+    // shared-storage buffer, the allocation is `aos_bytes.len()` bytes, and
+    // the two destination ranges below are disjoint and together exactly that
+    // length. Nothing else can hold this buffer yet — it was created here.
+    unsafe {
+        let base = buf.contents() as *mut u8;
+        let scales = base;
+        let qs = base.add(n_blocks * Q2_SCALE_BYTES);
+        for (i, block) in aos_bytes.chunks_exact(Q2_BLOCK_BYTES).enumerate() {
+            let (block_qs, block_scale) = split_block(block);
+            std::ptr::copy_nonoverlapping(
+                block_scale.as_ptr(),
+                scales.add(i * Q2_SCALE_BYTES),
+                Q2_SCALE_BYTES,
+            );
+            std::ptr::copy_nonoverlapping(block_qs.as_ptr(), qs.add(i * Q2_QS_BYTES), Q2_QS_BYTES);
+        }
+    }
+    Some(Ok(buf))
+}
 
 impl MetalGraph {
     // ─────────────────────────────────────────────────────────────────────
@@ -161,15 +279,18 @@ impl MetalGraph {
             command_queue,
             pipelines,
             buffers: Mutex::new(None),
-            weight_cache: Mutex::new(HashMap::new()),
+            weight_cache: Mutex::new(WeightCache::new()),
             kv_cache: Mutex::new(None),
             full_layer_buffers: Mutex::new(None),
             logits_buf: Mutex::new(None),
             token_id_buf: Mutex::new(None),
             prefill_buffers: Mutex::new(None),
+            prefill_attn: OnceLock::new(),
             gemm_io_pool: Mutex::new(None),
             joint_attn_pool: Mutex::new(None),
-            f32_upload_count: AtomicUsize::new(0),
+            norm_upload_count: AtomicUsize::new(0),
+            quant_upload_count: AtomicUsize::new(0),
+            bytes_uploaded: AtomicU64::new(0),
         })
     }
 
@@ -200,56 +321,222 @@ impl MetalGraph {
         Ok(MetalWeightHandle {
             byte_len: data.len(),
             buffer,
+            kind: WeightKind::RawF32,
         })
+    }
+
+    /// Allocate a fresh model epoch for [`WeightKey`]s.
+    ///
+    /// Re-exported on `MetalGraph` so model code can reach it without naming
+    /// the `metal_full_layer` module. One epoch per loaded model: carry it on
+    /// the model, use it in every weight key, and pass it to
+    /// [`Self::release_model`] on unload.
+    #[must_use]
+    pub fn next_model_epoch() -> u64 {
+        next_model_epoch()
+    }
+
+    /// Lock the weight cache, mapping a poisoned mutex to an error.
+    fn lock_weight_cache(
+        &self,
+    ) -> Result<MutexGuard<'_, WeightCache<Arc<MetalWeightHandle>>>, MetalGraphError> {
+        self.weight_cache
+            .lock()
+            .map_err(|_| MetalGraphError::ExecutionFailed("weight cache lock poisoned".into()))
+    }
+
+    /// Cache-aware upload: return the buffer already resident under `key`, or
+    /// run `upload` once and cache its result.
+    ///
+    /// This is the single place where the cache is consulted, so the kind
+    /// check, the upload counters and the resident-byte gauge cannot drift
+    /// between upload paths. A slot already holding a **different**
+    /// [`WeightKind`] is an error rather than a hit — serving it would feed one
+    /// quantization's bytes to another's decoder (MET-02).
+    ///
+    /// `upload` runs with the cache lock held, as before, so two threads racing
+    /// on the same key upload exactly once.
+    pub fn get_or_upload_keyed(
+        &self,
+        key: WeightKey,
+        upload: impl FnOnce() -> Result<MetalWeightHandle, MetalGraphError>,
+    ) -> Result<Arc<MetalWeightHandle>, MetalGraphError> {
+        let mut cache = self.lock_weight_cache()?;
+        let hit = match cache.lookup(key) {
+            Ok(found) => found.map(Arc::clone),
+            Err(mismatch) => {
+                // The typed variant carries only the two kinds (MET-02), so log
+                // the full key — epoch and slot — before discarding it; that
+                // context is what identifies *which* tensor collided.
+                tracing::error!("{mismatch}");
+                return Err(MetalGraphError::WeightKindMismatch {
+                    expected: mismatch.requested.kind,
+                    found: mismatch.found,
+                });
+            }
+        };
+        if let Some(handle) = hit {
+            return Ok(handle);
+        }
+        let handle = Arc::new(upload()?);
+        let added = cache.insert(key, Arc::clone(&handle));
+        self.bytes_uploaded.fetch_add(added, Ordering::Relaxed);
+        if key.kind.is_quantized() {
+            self.quant_upload_count.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.norm_upload_count.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(handle)
     }
 
     /// Get a cached `MetalWeightHandle` or upload raw bytes and cache it.
     ///
-    /// `key` is typically the `GpuWeightHandle`'s `u64` ID.
+    /// `key` is a legacy bare slot id (typically the `GpuWeightHandle`'s `u64`
+    /// ID or an mmap address); it is keyed under [`LEGACY_MODEL_EPOCH`] and
+    /// [`WeightKind::RawF32`]. Model code that owns an epoch should build a
+    /// [`WeightKey`] and call [`Self::get_or_upload_keyed`] instead, so
+    /// [`Self::release_model`] can free the buffer.
+    ///
+    /// [`LEGACY_MODEL_EPOCH`]: crate::gpu_backend::metal_full_layer::types::LEGACY_MODEL_EPOCH
     pub fn get_or_upload_weight(
         &self,
         key: u64,
         raw_bytes: &[u8],
     ) -> Result<Arc<MetalWeightHandle>, MetalGraphError> {
-        let mut cache = self
-            .weight_cache
-            .lock()
-            .map_err(|_| MetalGraphError::ExecutionFailed("weight cache lock poisoned".into()))?;
-        if let Some(w) = cache.get(&key) {
-            return Ok(Arc::clone(w));
-        }
-        let handle = Arc::new(self.upload_weight(raw_bytes)?);
-        cache.insert(key, Arc::clone(&handle));
-        self.f32_upload_count.fetch_add(1, Ordering::Relaxed);
-        Ok(handle)
+        self.get_or_upload_keyed(WeightKey::legacy(WeightKind::RawF32, key), || {
+            self.upload_weight(raw_bytes)
+        })
     }
 
-    /// Evict a previously-uploaded f32 weight from the cache by key.
+    /// Evict one cached weight by its composite key.
     ///
     /// Dropping the cached [`Arc`] frees the GPU buffer once no other handle is
-    /// outstanding. Called after each GEMM when weights are **non-resident**
-    /// (the host dequant buffer is freed after use so its `as_ptr()` key is
-    /// unstable — the allocator will recycle the address, causing a stale cache
-    /// hit on the next call). Mirrors the CUDA `evict_f32_weight` on `CudaGraph`.
-    /// A key that is not present is a no-op.
-    pub fn evict_f32_weight(&self, key: u64) -> Result<(), MetalGraphError> {
-        let mut cache = self
-            .weight_cache
-            .lock()
-            .map_err(|_| MetalGraphError::ExecutionFailed("weight cache lock poisoned".into()))?;
-        cache.remove(&key);
+    /// outstanding, and the freed bytes leave [`Self::bytes_uploaded`]. A key
+    /// that is not present is a no-op.
+    pub fn evict_weight(&self, key: WeightKey) -> Result<(), MetalGraphError> {
+        let freed = self.lock_weight_cache()?.remove(key);
+        self.bytes_uploaded.fetch_sub(freed, Ordering::Relaxed);
         Ok(())
     }
 
-    /// Returns the total number of f32 weight uploads since this graph was created.
+    /// Evict a previously-uploaded raw-f32 weight from the cache by legacy key.
     ///
-    /// Counts each distinct cache miss in [`Self::get_or_upload_weight`] where a fresh
-    /// GPU buffer was actually allocated. Useful for asserting that multi-image
-    /// resident forwards amortize uploads (counter stays flat after the first
-    /// forward) and that non-resident evict-after-GEMM forwards stay correct (no
-    /// stale-cache collision, counter increments on every call as expected).
+    /// Called after each GEMM when weights are **non-resident** (the host
+    /// dequant buffer is freed after use so its `as_ptr()` key is unstable —
+    /// the allocator will recycle the address, causing a stale cache hit on the
+    /// next call). Mirrors the CUDA `evict_f32_weight` on `CudaGraph`.
+    pub fn evict_f32_weight(&self, key: u64) -> Result<(), MetalGraphError> {
+        self.evict_weight(WeightKey::legacy(WeightKind::RawF32, key))
+    }
+
+    /// Drop every cached weight belonging to `model_epoch` and return how many
+    /// buffers were released.
+    ///
+    /// Call this when a model is unloaded (`BonsaiModel::Drop`): without it the
+    /// process-wide cache keeps every buffer of every model ever loaded, which
+    /// for the 27B is ~7.2 GB per load. Buffers still referenced elsewhere stay
+    /// alive until that last `Arc` drops; the cache stops holding them either
+    /// way and [`Self::bytes_uploaded`] falls by their size.
+    pub fn release_model(&self, model_epoch: u64) -> Result<usize, MetalGraphError> {
+        let (dropped, freed) = self.lock_weight_cache()?.release_model(model_epoch);
+        self.bytes_uploaded.fetch_sub(freed, Ordering::Relaxed);
+        Ok(dropped)
+    }
+
+    /// Release the device-resident KV cache buffers (M-Missed-3).
+    ///
+    /// The fused full-layer decode/prefill paths lazily allocate their KV
+    /// cache here (`acquire_kv_cache` in `metal_full_layer`) and never free it
+    /// on their own — it lives for the life of the process, sized for the
+    /// largest sequence any model has decoded. `BonsaiModel::reset()` calls
+    /// this so a model reset actually releases that memory instead of merely
+    /// clearing the host-side `KvCache` and leaving the device copy resident.
+    ///
+    /// Idempotent: clearing an already-empty cache is a no-op. The next
+    /// fused-GPU forward call re-allocates on demand, exactly as if this were
+    /// the first call ever made.
+    pub fn clear_kv_cache(&self) -> Result<(), MetalGraphError> {
+        *self
+            .kv_cache
+            .lock()
+            .map_err(|_| MetalGraphError::ExecutionFailed("kv_cache lock poisoned".into()))? = None;
+        Ok(())
+    }
+
+    /// Clear the device-resident KV cache of the process-global [`MetalGraph`]
+    /// singleton, **without** constructing one if it does not exist yet
+    /// (M-Missed-3).
+    ///
+    /// [`MetalGraph::global`] lazily opens the default Metal device and
+    /// compiles every MSL pipeline on first use — expensive, and pointless
+    /// for a model whose sequence never touched the fused GPU decode path. A
+    /// plain host-side (or not-yet-run) model must not pay that cost just to
+    /// discover it has nothing to clear, so this peeks at the singleton and
+    /// only calls through to [`Self::clear_kv_cache`] when one is already
+    /// resident.
+    pub fn clear_global_kv_cache_if_present() -> Result<(), MetalGraphError> {
+        let Some(mutex) = GLOBAL_METAL_GRAPH.get() else {
+            return Ok(());
+        };
+        // Clone the `Arc` and drop the `GLOBAL_METAL_GRAPH` lock before
+        // calling into the graph: `clear_kv_cache` takes its own `kv_cache`
+        // lock, and nothing here needs to prove that no path ever acquires
+        // that lock and then reaches back into `MetalGraph::global()` if this
+        // held both at once.
+        let graph = {
+            let guard = mutex
+                .lock()
+                .map_err(|_| MetalGraphError::ExecutionFailed("MetalGraph lock poisoned".into()))?;
+            guard.as_ref().map(Arc::clone)
+        };
+        match graph {
+            Some(graph) => graph.clear_kv_cache(),
+            None => Ok(()),
+        }
+    }
+
+    /// Total number of weight uploads (raw f32 **plus** quantized) since this
+    /// graph was created.
+    ///
+    /// Counts each distinct cache miss where a fresh GPU buffer was actually
+    /// allocated. Useful for asserting that multi-image resident forwards
+    /// amortize uploads (counter stays flat after the first forward) and that
+    /// non-resident evict-after-GEMM forwards stay correct (no stale-cache
+    /// collision, counter increments on every call as expected).
     pub fn weight_upload_count(&self) -> usize {
-        self.f32_upload_count.load(Ordering::Relaxed)
+        self.norm_upload_count() + self.quant_upload_count()
+    }
+
+    /// Number of raw-f32 weight uploads (norms, f32/bf16 GEMM matrices).
+    pub fn norm_upload_count(&self) -> usize {
+        self.norm_upload_count.load(Ordering::Relaxed)
+    }
+
+    /// Number of quantized weight uploads (Q1/TQ2/PQ2/PTQ1 SoA).
+    pub fn quant_upload_count(&self) -> usize {
+        self.quant_upload_count.load(Ordering::Relaxed)
+    }
+
+    /// GPU weight bytes currently resident in the cache.
+    ///
+    /// Rises on every upload and falls on [`Self::evict_weight`] /
+    /// [`Self::release_model`]; it is the observable that turns a duplicate
+    /// model upload into a number.
+    pub fn bytes_uploaded(&self) -> u64 {
+        self.bytes_uploaded.load(Ordering::Relaxed)
+    }
+
+    /// Number of weight buffers currently cached.
+    pub fn cached_weight_count(&self) -> Result<usize, MetalGraphError> {
+        Ok(self.lock_weight_cache()?.len())
+    }
+
+    /// Resident weight bytes as accounted by the cache itself, under its lock.
+    ///
+    /// The authoritative figure; [`Self::bytes_uploaded`] is its lock-free
+    /// mirror and the two must always agree (asserted in the cache tests).
+    pub fn resident_weight_bytes(&self) -> Result<u64, MetalGraphError> {
+        Ok(self.lock_weight_cache()?.resident_bytes())
     }
 
     /// Like `get_or_upload_weight`, but accepts a closure that produces the bytes.
@@ -260,17 +547,9 @@ impl MetalGraph {
         key: u64,
         data_fn: impl FnOnce() -> Vec<u8>,
     ) -> Result<Arc<MetalWeightHandle>, MetalGraphError> {
-        let mut cache = self
-            .weight_cache
-            .lock()
-            .map_err(|_| MetalGraphError::ExecutionFailed("weight cache lock poisoned".into()))?;
-        if let Some(w) = cache.get(&key) {
-            return Ok(Arc::clone(w));
-        }
-        let bytes = data_fn();
-        let handle = Arc::new(self.upload_weight(&bytes)?);
-        cache.insert(key, Arc::clone(&handle));
-        Ok(handle)
+        self.get_or_upload_keyed(WeightKey::legacy(WeightKind::RawF32, key), || {
+            self.upload_weight(&data_fn())
+        })
     }
 
     /// Upload Q1_0_g128 weight bytes in SoA layout for optimal GPU coalescing.
@@ -291,6 +570,7 @@ impl MetalGraph {
         Ok(MetalWeightHandle {
             byte_len: soa_data.len(),
             buffer,
+            kind: WeightKind::Q1Soa,
         })
     }
 
@@ -300,16 +580,9 @@ impl MetalGraph {
         key: u64,
         aos_bytes: &[u8],
     ) -> Result<Arc<MetalWeightHandle>, MetalGraphError> {
-        let mut cache = self
-            .weight_cache
-            .lock()
-            .map_err(|_| MetalGraphError::ExecutionFailed("weight cache lock poisoned".into()))?;
-        if let Some(w) = cache.get(&key) {
-            return Ok(Arc::clone(w));
-        }
-        let handle = Arc::new(self.upload_q1_weight_soa(aos_bytes)?);
-        cache.insert(key, Arc::clone(&handle));
-        Ok(handle)
+        self.get_or_upload_keyed(WeightKey::legacy(WeightKind::Q1Soa, key), || {
+            self.upload_q1_weight_soa(aos_bytes)
+        })
     }
 
     /// Like `get_or_upload_q1_weight_soa`, but accepts a closure that produces AoS bytes.
@@ -318,37 +591,55 @@ impl MetalGraph {
         key: u64,
         data_fn: impl FnOnce() -> Vec<u8>,
     ) -> Result<Arc<MetalWeightHandle>, MetalGraphError> {
-        let mut cache = self
-            .weight_cache
-            .lock()
-            .map_err(|_| MetalGraphError::ExecutionFailed("weight cache lock poisoned".into()))?;
-        if let Some(w) = cache.get(&key) {
-            return Ok(Arc::clone(w));
-        }
-        let aos_bytes = data_fn();
-        let handle = Arc::new(self.upload_q1_weight_soa(&aos_bytes)?);
-        cache.insert(key, Arc::clone(&handle));
-        Ok(handle)
+        self.get_or_upload_keyed(WeightKey::legacy(WeightKind::Q1Soa, key), || {
+            self.upload_q1_weight_soa(&data_fn())
+        })
     }
 
     /// Upload TQ2_0_g128 (ternary) weight bytes in SoA layout.
     ///
-    /// Reformats 34-byte AoS blocks `{ qs:[u8;32], d:f16 }` into SoA
-    /// `[N × 2B scales][N × 32B qs]` ready for `gemv_tq2_g128_v1`.
+    /// Reformats 34-byte AoS blocks `{ qs:[u8;32], d:f16 }` (**qs first**) into
+    /// SoA `[N × 2B scales][N × 32B qs]` ready for `gemv_tq2_g128_v1`.
+    ///
+    /// The block bytes are first screened for the reserved 2-bit code `0b11`,
+    /// which ternary data never contains but `PQ2_0` uses for `+2`: a hit means
+    /// a `PQ2_0` tensor reached the ternary path, whose `d`-first blocks would
+    /// otherwise be reformatted with `qs[0..2]` as the scale and decoded with
+    /// `0b11 → 0`, silently (MET-11). Use [`Self::upload_pq2_weight_soa`] for
+    /// those. The scan is one linear pass over bytes the reformatter is about
+    /// to read anyway.
     pub fn upload_tq2_weight_soa(
         &self,
         aos_data: &[u8],
     ) -> Result<MetalWeightHandle, MetalGraphError> {
-        let soa_data = reformat_tq2_aos_to_soa(aos_data).ok_or_else(|| {
+        if let Err(violation) = validate_tq2_ternary_codes(aos_data) {
+            return Err(MetalGraphError::ExecutionFailed(format!(
+                "TQ2 SoA upload rejected: {violation}"
+            )));
+        }
+        // MET-03: allocate the destination buffer FIRST and write the two SoA
+        // sections straight into it. The previous shape —
+        // `reformat_tq2_aos_to_soa(aos) -> Vec<u8>` then `upload_bytes` —
+        // held a full second host copy of every matrix while it was being
+        // uploaded, which for the 27B is a 7.2 GB load-time peak on top of the
+        // mmap. The allocating reformatter is kept (it is the PQ2 path's
+        // sibling and this function's unit-test oracle); only the upload path
+        // stopped using it.
+        let buffer = write_q2_soa_into_new_buffer(&self.device, aos_data, |block| {
+            // TQ2_0_g128 AoS is qs-first: qs[0..32], then the f16 scale.
+            (&block[..Q2_QS_BYTES], &block[Q2_QS_BYTES..])
+        })
+        .ok_or_else(|| {
             MetalGraphError::ExecutionFailed(format!(
                 "TQ2 SoA reformat failed: input length {} is not a multiple of 34",
                 aos_data.len()
             ))
-        })?;
-        let buffer = upload_bytes(&self.device, &soa_data)?;
+        })??;
+        debug_check_q2_soa(&buffer, || reformat_tq2_aos_to_soa(aos_data), "TQ2_0_g128");
         Ok(MetalWeightHandle {
-            byte_len: soa_data.len(),
+            byte_len: aos_data.len(),
             buffer,
+            kind: WeightKind::Tq2Soa,
         })
     }
 
@@ -358,16 +649,9 @@ impl MetalGraph {
         key: u64,
         aos_bytes: &[u8],
     ) -> Result<Arc<MetalWeightHandle>, MetalGraphError> {
-        let mut cache = self
-            .weight_cache
-            .lock()
-            .map_err(|_| MetalGraphError::ExecutionFailed("weight cache lock poisoned".into()))?;
-        if let Some(w) = cache.get(&key) {
-            return Ok(Arc::clone(w));
-        }
-        let handle = Arc::new(self.upload_tq2_weight_soa(aos_bytes)?);
-        cache.insert(key, Arc::clone(&handle));
-        Ok(handle)
+        self.get_or_upload_keyed(WeightKey::legacy(WeightKind::Tq2Soa, key), || {
+            self.upload_tq2_weight_soa(aos_bytes)
+        })
     }
 
     /// Like `get_or_upload_tq2_weight_soa`, but accepts a closure that produces AoS bytes.
@@ -376,17 +660,62 @@ impl MetalGraph {
         key: u64,
         data_fn: impl FnOnce() -> Vec<u8>,
     ) -> Result<Arc<MetalWeightHandle>, MetalGraphError> {
-        let mut cache = self
-            .weight_cache
-            .lock()
-            .map_err(|_| MetalGraphError::ExecutionFailed("weight cache lock poisoned".into()))?;
-        if let Some(w) = cache.get(&key) {
-            return Ok(Arc::clone(w));
-        }
-        let aos_bytes = data_fn();
-        let handle = Arc::new(self.upload_tq2_weight_soa(&aos_bytes)?);
-        cache.insert(key, Arc::clone(&handle));
-        Ok(handle)
+        self.get_or_upload_keyed(WeightKey::legacy(WeightKind::Tq2Soa, key), || {
+            self.upload_tq2_weight_soa(&data_fn())
+        })
+    }
+
+    /// Upload `PQ2_0` (PrismML ggml type 142) weight bytes in SoA layout.
+    ///
+    /// `PQ2_0` blocks are the mirror image of `TQ2_0_g128`: same 34 bytes and
+    /// same 128 weights, but `d` comes **first** and the code `0b11` means
+    /// `+2`. The SoA buffer this produces has the identical shape to the TQ2
+    /// one — only the kernel's decode table differs (`decode_pq2`), which is
+    /// why the two must never share a cache slot.
+    pub fn upload_pq2_weight_soa(
+        &self,
+        aos_data: &[u8],
+    ) -> Result<MetalWeightHandle, MetalGraphError> {
+        // MET-03, same direct write as the TQ2 path above — and the one that
+        // matters most, since `PQ2_0` is Bonsai 2's 7.2 GB 27B format.
+        let buffer = write_q2_soa_into_new_buffer(&self.device, aos_data, |block| {
+            // PQ2_0 AoS is d-first: the f16 scale, then qs[2..34].
+            (&block[Q2_SCALE_BYTES..], &block[..Q2_SCALE_BYTES])
+        })
+        .ok_or_else(|| {
+            MetalGraphError::ExecutionFailed(format!(
+                "PQ2 SoA reformat failed: input length {} is not a multiple of 34",
+                aos_data.len()
+            ))
+        })??;
+        debug_check_q2_soa(&buffer, || reformat_pq2_aos_to_soa(aos_data), "PQ2_0");
+        Ok(MetalWeightHandle {
+            byte_len: aos_data.len(),
+            buffer,
+            kind: WeightKind::Pq2Soa,
+        })
+    }
+
+    /// Get a cached PQ2 SoA weight handle or reformat AoS→SoA and upload.
+    pub fn get_or_upload_pq2_weight_soa(
+        &self,
+        key: u64,
+        aos_bytes: &[u8],
+    ) -> Result<Arc<MetalWeightHandle>, MetalGraphError> {
+        self.get_or_upload_keyed(WeightKey::legacy(WeightKind::Pq2Soa, key), || {
+            self.upload_pq2_weight_soa(aos_bytes)
+        })
+    }
+
+    /// Like `get_or_upload_pq2_weight_soa`, but accepts a closure that produces AoS bytes.
+    pub fn get_or_upload_pq2_weight_soa_lazy(
+        &self,
+        key: u64,
+        data_fn: impl FnOnce() -> Vec<u8>,
+    ) -> Result<Arc<MetalWeightHandle>, MetalGraphError> {
+        self.get_or_upload_keyed(WeightKey::legacy(WeightKind::Pq2Soa, key), || {
+            self.upload_pq2_weight_soa(&data_fn())
+        })
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -443,8 +772,7 @@ impl MetalGraph {
         );
 
         encoder.end_encoding();
-        cmd_buf.commit();
-        cmd_buf.wait_until_completed();
+        commit_and_wait(cmd_buf, "encode_gemv_q1")?;
 
         unsafe { download_f32(&output_buf, &mut output[..n_rows]) };
 
@@ -498,8 +826,7 @@ impl MetalGraph {
         );
 
         encoder.end_encoding();
-        cmd_buf.commit();
-        cmd_buf.wait_until_completed();
+        commit_and_wait(cmd_buf, "encode_gemv_tq2")?;
 
         unsafe { download_f32(&output_buf, &mut output[..n_rows]) };
 
@@ -551,7 +878,7 @@ impl MetalGraph {
         k: usize,
     ) -> Result<(), MetalGraphError> {
         // ── Validate ─────────────────────────────────────────────────────
-        if k % 128 != 0 {
+        if !k.is_multiple_of(128) {
             return Err(MetalGraphError::InvalidDimensions(format!(
                 "encode_gemm_tq2: k must be a multiple of 128, got {k}"
             )));
@@ -643,8 +970,7 @@ impl MetalGraph {
         );
 
         encoder.end_encoding();
-        cmd_buf.commit();
-        cmd_buf.wait_until_completed();
+        commit_and_wait(cmd_buf, "encode_gemm_tq2")?;
 
         // `output.len()` is authoritative (== expected_out); the pooled output
         // buffer may be larger after a grow, so copy exactly the requested span.
@@ -873,8 +1199,7 @@ impl MetalGraph {
         }
 
         encoder.end_encoding();
-        cmd_buf.commit();
-        cmd_buf.wait_until_completed();
+        commit_and_wait(cmd_buf, "encode_gemm_simdgroup")?;
 
         // `output.len()` is authoritative (== expected_out); the pooled output
         // buffer may be larger after a grow, so copy exactly the requested span.
@@ -1160,7 +1485,7 @@ impl MetalGraph {
     ) -> Result<(usize, usize, f32), MetalGraphError> {
         let (qkv_len, out_len, scale) =
             Self::joint_attn_validate(q, k, v, out, num_heads, seq, head_dim)?;
-        if head_dim % 8 != 0 {
+        if !head_dim.is_multiple_of(8) {
             return Err(MetalGraphError::InvalidDimensions(format!(
                 "joint_attention_flash: head_dim {head_dim} must be a multiple of 8"
             )));
@@ -1233,8 +1558,7 @@ impl MetalGraph {
             scale,
         );
         encoder.end_encoding();
-        cmd_buf.commit();
-        cmd_buf.wait_until_completed();
+        commit_and_wait(cmd_buf, "encode_joint_attention_flash")?;
 
         unsafe { download_f32(&out_buf, &mut out[..out_len]) };
 
@@ -1290,8 +1614,7 @@ impl MetalGraph {
             scale,
         );
         encoder.end_encoding();
-        cmd_buf.commit();
-        cmd_buf.wait_until_completed();
+        commit_and_wait(cmd_buf, "encode_joint_attention_flash_pooled")?;
 
         unsafe { download_f32(&pool.out, &mut out[..out_len]) };
 
@@ -1328,7 +1651,7 @@ impl MetalGraph {
                  ({DIT_ATTN_MAX_SEQ}/{DIT_ATTN_MAX_HEAD_DIM})"
             )));
         }
-        if head_dim % 8 != 0 || head_dim > 128 {
+        if !head_dim.is_multiple_of(8) || head_dim > 128 {
             return Err(MetalGraphError::InvalidDimensions(format!(
                 "joint_attention_flash: head_dim {head_dim} must be a multiple of 8 and <= 128"
             )));
@@ -1370,8 +1693,7 @@ impl MetalGraph {
             scale,
         );
         encoder.end_encoding();
-        cmd_buf.commit();
-        cmd_buf.wait_until_completed();
+        commit_and_wait(cmd_buf, "joint_attn_flash_resident_dispatch")?;
         Ok(())
     }
 
@@ -1521,9 +1843,15 @@ impl MetalGraph {
 
         // ── Commit and wait ──────────────────────────────────────────────
         encoder.end_encoding();
-        cmd_buf.commit();
+        // MET-04: `commit_and_wait` replaces the raw commit/wait pair and turns a
+        // non-`Completed` command-buffer status into a named error instead of
+        // letting the readback below hand back the previous token's bytes. The
+        // `Instant` now spans commit+wait rather than wait alone — at batch 1
+        // `commit()` is a submission, not a sync, so the measured GPU wait is
+        // unchanged in practice, and `dt_gpu_wait` remains the GPU-bound term
+        // of the per-call breakdown below.
         let t3 = Instant::now();
-        cmd_buf.wait_until_completed();
+        commit_and_wait(cmd_buf, "encode_ffn_phase")?;
         let dt_gpu_wait = t3.elapsed();
 
         // ── Step 9: Read back ────────────────────────────────────────────
@@ -1534,7 +1862,7 @@ impl MetalGraph {
         let dt_download = t4.elapsed();
 
         let dt_total = t_total.elapsed();
-        if call_num % 36 == 0 {
+        if call_num.is_multiple_of(36) {
             tracing::debug!(
                 "MetalGraph FFN #{}: acquire={}µs upload={}µs encode={}µs gpu_wait={}µs download={}µs total={}µs",
                 call_num,

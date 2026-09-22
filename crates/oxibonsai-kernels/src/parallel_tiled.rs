@@ -18,6 +18,7 @@ use crate::traits::OneBitKernel;
 use crate::traits::TernaryKernel;
 use crate::tuning::{PlatformProfile, TunedThresholds};
 use oxibonsai_core::tensor::{BlockQ1_0G128, QK1_0_G128};
+use oxibonsai_core::{BlockTQ2_0_g128, QK_TQ2_0_G128};
 
 /// Minimum rows to justify parallelism overhead for parallel tiled GEMV.
 ///
@@ -42,31 +43,66 @@ fn validate_gemv(
     n_rows: usize,
     k: usize,
 ) -> KernelResult<usize> {
-    if k % QK1_0_G128 != 0 {
+    if !k.is_multiple_of(QK1_0_G128) {
         return Err(KernelError::NotBlockAligned {
             count: k,
             block_size: QK1_0_G128,
         });
     }
     if input.len() < k {
-        return Err(KernelError::DimensionMismatch {
-            expected: k,
-            got: input.len(),
-        });
+        return Err(KernelError::dimension_mismatch("input", k, input.len()));
     }
     if output.len() < n_rows {
-        return Err(KernelError::BufferTooSmall {
-            needed: n_rows,
-            available: output.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "output",
+            n_rows,
+            output.len(),
+        ));
     }
     let blocks_per_row = k / QK1_0_G128;
     let expected_blocks = n_rows * blocks_per_row;
     if blocks.len() < expected_blocks {
-        return Err(KernelError::BufferTooSmall {
-            needed: expected_blocks,
-            available: blocks.len(),
+        return Err(KernelError::buffer_too_small(
+            "blocks",
+            expected_blocks,
+            blocks.len(),
+        ));
+    }
+    Ok(blocks_per_row)
+}
+
+/// Validate ternary GEMV parameters and return blocks_per_row (K-M2).
+fn validate_gemv_ternary(
+    blocks: &[BlockTQ2_0_g128],
+    input: &[f32],
+    output: &[f32],
+    n_rows: usize,
+    k: usize,
+) -> KernelResult<usize> {
+    if !k.is_multiple_of(QK_TQ2_0_G128) {
+        return Err(KernelError::NotBlockAligned {
+            count: k,
+            block_size: QK_TQ2_0_G128,
         });
+    }
+    if input.len() < k {
+        return Err(KernelError::dimension_mismatch("input", k, input.len()));
+    }
+    if output.len() < n_rows {
+        return Err(KernelError::buffer_too_small(
+            "output",
+            n_rows,
+            output.len(),
+        ));
+    }
+    let blocks_per_row = k / QK_TQ2_0_G128;
+    let expected_blocks = n_rows * blocks_per_row;
+    if blocks.len() < expected_blocks {
+        return Err(KernelError::buffer_too_small(
+            "blocks",
+            expected_blocks,
+            blocks.len(),
+        ));
     }
     Ok(blocks_per_row)
 }
@@ -80,31 +116,30 @@ fn validate_gemm(
     n_rows: usize,
     k: usize,
 ) -> KernelResult<usize> {
-    if k % QK1_0_G128 != 0 {
+    if !k.is_multiple_of(QK1_0_G128) {
         return Err(KernelError::NotBlockAligned {
             count: k,
             block_size: QK1_0_G128,
         });
     }
     if input.len() < m * k {
-        return Err(KernelError::DimensionMismatch {
-            expected: m * k,
-            got: input.len(),
-        });
+        return Err(KernelError::dimension_mismatch("input", m * k, input.len()));
     }
     if output.len() < m * n_rows {
-        return Err(KernelError::BufferTooSmall {
-            needed: m * n_rows,
-            available: output.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "output",
+            m * n_rows,
+            output.len(),
+        ));
     }
     let blocks_per_row = k / QK1_0_G128;
     let expected_blocks = n_rows * blocks_per_row;
     if blocks.len() < expected_blocks {
-        return Err(KernelError::BufferTooSmall {
-            needed: expected_blocks,
-            available: blocks.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "blocks",
+            expected_blocks,
+            blocks.len(),
+        ));
     }
     Ok(blocks_per_row)
 }
@@ -141,7 +176,7 @@ pub fn gemv_parallel_tiled(
     // On WASM: no rayon threads available — fall back to sequential tiled.
     #[cfg(target_arch = "wasm32")]
     {
-        return crate::tiled::gemv_tiled(dispatcher, blocks, input, output, n_rows, k);
+        crate::tiled::gemv_tiled(dispatcher, blocks, input, output, n_rows, k)
     }
 
     // Compute optimal L1 tile size for this k
@@ -214,7 +249,7 @@ pub fn gemm_parallel_tiled(
     // On WASM: no rayon threads available — fall back to sequential tiled.
     #[cfg(target_arch = "wasm32")]
     {
-        return crate::tiled::gemm_tiled(dispatcher, blocks, input, output, m, n_rows, k);
+        crate::tiled::gemm_tiled(dispatcher, blocks, input, output, m, n_rows, k)
     }
 
     // Compute optimal L1 tile size for this k
@@ -247,6 +282,174 @@ pub fn gemm_parallel_tiled(
                     )?;
 
                     row_start += tile_rows;
+                }
+
+                Ok::<(), KernelError>(())
+            })?;
+
+        Ok(())
+    }
+}
+
+// ─── Parallel tiled ternary kernel (K-M2) ──────────────────────────────
+
+/// A ternary block is `qs: [u8; 32]` + `d: f16` = 34 bytes, roughly double
+/// the 1-bit format's 18 bytes for the same 128-weight group.
+const TERNARY_BLOCK_BYTES: usize = 34;
+
+/// Minimum L1 tile size for ternary GEMV (K-M2), measured.
+///
+/// The naive L1-budget formula in [`optimal_tile_rows_ternary`] — mirroring
+/// [`crate::tiled::optimal_tile_rows`] — degenerates badly at the widths
+/// this crate actually ships: at `k=5120` (Bonsai 2's `embedding_length`)
+/// it computes 33 rows/tile, and at `k=17408` (`feed_forward_length`) the
+/// shared input vector alone (`k*4` bytes) exceeds the assumed L1 budget,
+/// saturating the available space to zero. Measuring
+/// `measure_gemv_ternary_par_efficiency` at the 33-row tile size showed
+/// *worse* throughput than the untiled K-16 path (3.31x vs 4.03x parallel
+/// speedup on 8 cores) — small enough tiles interrupt the NEON kernel's
+/// row-to-row software prefetch stream (`gemv_tq2_0_g128_neon_prefetch`)
+/// more often than the extra cache locality pays for. Flooring at 128 rows
+/// closed the gap (4.11x tiled vs 4.29x flat, adaptive routing hitting
+/// 4.29x) without materially changing the tile count at narrower `k` (a
+/// 256-wide layer already saturates at `L2_TILE_ROWS` regardless of this
+/// floor). This is the "measurement" the K-M2 finding's fallback text asks
+/// for if plain L1-budget tiling does not help — it does, once floored.
+const TERNARY_TILE_MIN_ROWS: usize = 128;
+
+/// L1-cache-target tile row count for ternary GEMV.
+///
+/// Mirrors [`crate::tiled::optimal_tile_rows`]'s L1-budget formula but with
+/// the ternary block's actual size substituted for the 1-bit format's 18
+/// bytes that function hardcodes — `crate::tiled` is not among this
+/// package's owned files, so its constant cannot be parameterized in place,
+/// and reusing it as-is would under-count a ternary row's footprint by
+/// roughly 2x, picking tiles nearly twice as large as actually fit L1. The
+/// lower clamp is [`TERNARY_TILE_MIN_ROWS`], not the 1-bit path's `4` — see
+/// its doc comment for the measurement that motivated raising it.
+///
+/// `pub` (like [`crate::tiled::optimal_tile_rows`]) rather than
+/// WASM-cfg-gated: the computation is plain arithmetic with no Rayon/thread
+/// dependency, so unlike [`gemv_parallel_tiled_ternary`] (its only current
+/// caller, from a `cfg(not(wasm32))` block) there is no platform reason to
+/// exclude it, and a public item is exempt from `dead_code` regardless of
+/// in-crate call sites.
+pub fn optimal_tile_rows_ternary(k: usize) -> usize {
+    let blocks_per_row = k / QK_TQ2_0_G128;
+    let bytes_per_row = blocks_per_row * TERNARY_BLOCK_BYTES;
+    let l1_bytes = PlatformProfile::global().l1_cache_bytes;
+    let l1_available = l1_bytes.saturating_sub(k * 4);
+    let l1_rows = l1_available
+        .checked_div(bytes_per_row)
+        .unwrap_or(crate::tiled::L1_TILE_ROWS);
+    l1_rows.clamp(TERNARY_TILE_MIN_ROWS, crate::tiled::L2_TILE_ROWS)
+}
+
+/// Sequential L1-tiled ternary GEMV: the ternary counterpart of
+/// [`crate::tiled::gemv_tiled`] (not added there because `tiled.rs` is not
+/// among this package's owned files). Used as the below-threshold and WASM
+/// fallback for [`gemv_parallel_tiled_ternary`].
+fn gemv_tiled_ternary_seq(
+    dispatcher: &KernelDispatcher,
+    blocks: &[BlockTQ2_0_g128],
+    input: &[f32],
+    output: &mut [f32],
+    n_rows: usize,
+    k: usize,
+    blocks_per_row: usize,
+) -> KernelResult<()> {
+    let mut row_start = 0;
+    while row_start < n_rows {
+        let tile_rows = (n_rows - row_start).min(crate::tiled::L1_TILE_ROWS);
+        let block_start = row_start * blocks_per_row;
+        let block_end = (row_start + tile_rows) * blocks_per_row;
+
+        dispatcher.gemv_ternary_g128(
+            &blocks[block_start..block_end],
+            input,
+            &mut output[row_start..row_start + tile_rows],
+            tile_rows,
+            k,
+        )?;
+
+        row_start += tile_rows;
+    }
+    Ok(())
+}
+
+/// Parallel tiled ternary GEMV: distribute L2 tiles across threads, with
+/// L1-cache-aware tiling inside each (K-M2).
+///
+/// Before this function existed, `gemv_adaptive_ternary` collapsed its
+/// `ParallelRow` and `ParallelTiled` arms onto the flat, row-parallel
+/// [`crate::parallel::gemv_ternary_g128_par`] — so for the ternary format
+/// (the flagship quantization this crate is named after), the cache-tiled
+/// strategy `select_gemv_strategy` picked for large matrices (including the
+/// 248,320-row Bonsai 2 LM head) was computed and then silently discarded.
+/// This mirrors [`gemv_parallel_tiled`]'s structure exactly, parameterized
+/// for the ternary block type/size instead of the 1-bit format.
+pub fn gemv_parallel_tiled_ternary(
+    dispatcher: &KernelDispatcher,
+    blocks: &[BlockTQ2_0_g128],
+    input: &[f32],
+    output: &mut [f32],
+    n_rows: usize,
+    k: usize,
+) -> KernelResult<()> {
+    let blocks_per_row = validate_gemv_ternary(blocks, input, output, n_rows, k)?;
+
+    // Sequential fallback for small row counts (platform-tuned threshold).
+    if n_rows < PlatformProfile::global_thresholds().par_tiled_min_rows {
+        return gemv_tiled_ternary_seq(
+            dispatcher,
+            blocks,
+            input,
+            output,
+            n_rows,
+            k,
+            blocks_per_row,
+        );
+    }
+
+    // On WASM: no rayon threads available — fall back to sequential tiled.
+    #[cfg(target_arch = "wasm32")]
+    {
+        gemv_tiled_ternary_seq(dispatcher, blocks, input, output, n_rows, k, blocks_per_row)
+    }
+
+    // Compute optimal L1 tile size for this k.
+    #[cfg(not(target_arch = "wasm32"))]
+    let l1_tile = optimal_tile_rows_ternary(k).max(1);
+
+    // Parallel L2 tiles, each internally using L1 tiling.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        output[..n_rows]
+            .par_chunks_mut(L2_TILE_ROWS)
+            .enumerate()
+            .try_for_each(|(tile_idx, out_chunk)| -> KernelResult<()> {
+                let tile_start = tile_idx * L2_TILE_ROWS;
+                let tile_rows = out_chunk.len();
+                let block_start = tile_start * blocks_per_row;
+                let block_end = (tile_start + tile_rows) * blocks_per_row;
+                let tile_blocks = &blocks[block_start..block_end];
+
+                // Apply L1 tiling within this L2 tile.
+                let mut l1_start = 0;
+                while l1_start < tile_rows {
+                    let l1_rows = (tile_rows - l1_start).min(l1_tile);
+                    let l1_block_start = l1_start * blocks_per_row;
+                    let l1_block_end = (l1_start + l1_rows) * blocks_per_row;
+
+                    dispatcher.gemv_ternary_g128(
+                        &tile_blocks[l1_block_start..l1_block_end],
+                        input,
+                        &mut out_chunk[l1_start..l1_start + l1_rows],
+                        l1_rows,
+                        k,
+                    )?;
+
+                    l1_start += l1_rows;
                 }
 
                 Ok::<(), KernelError>(())
@@ -326,9 +529,16 @@ pub fn gemv_adaptive(
     }
 }
 
+/// Adaptive ternary GEMV dispatch (K-M2): unlike the earlier version of this
+/// function, `ParallelTiled` now genuinely reaches the cache-tiled path
+/// ([`gemv_parallel_tiled_ternary`]) instead of being collapsed onto the
+/// flat row-parallel one — see that function's docs for why this mattered.
+/// `ParallelRow` still uses [`crate::parallel::gemv_ternary_g128_par`],
+/// which K-16 already changed from one Rayon task per row to a
+/// platform-tuned number of rows per task.
 pub fn gemv_adaptive_ternary(
     dispatcher: &KernelDispatcher,
-    blocks: &[oxibonsai_core::BlockTQ2_0_g128],
+    blocks: &[BlockTQ2_0_g128],
     input: &[f32],
     output: &mut [f32],
     n_rows: usize,
@@ -336,8 +546,11 @@ pub fn gemv_adaptive_ternary(
 ) -> KernelResult<()> {
     match select_gemv_strategy(n_rows, k) {
         AdaptiveStrategy::Direct => dispatcher.gemv_ternary_g128(blocks, input, output, n_rows, k),
-        AdaptiveStrategy::ParallelRow | AdaptiveStrategy::ParallelTiled => {
+        AdaptiveStrategy::ParallelRow => {
             crate::parallel::gemv_ternary_g128_par(dispatcher, blocks, input, output, n_rows, k)
+        }
+        AdaptiveStrategy::ParallelTiled => {
+            gemv_parallel_tiled_ternary(dispatcher, blocks, input, output, n_rows, k)
         }
     }
 }
@@ -417,6 +630,29 @@ impl ParallelConfig {
 mod tests {
     use super::*;
     use half::f16;
+
+    /// Deterministic regression guard for the measured tile-floor fix
+    /// (`TERNARY_TILE_MIN_ROWS`'s doc comment): at both of the widths this
+    /// crate actually ships (Bonsai 2's `embedding_length=5120` and
+    /// `feed_forward_length=17408`), the tile size must never fall back
+    /// below the measured floor, which is what caused the tiled path to
+    /// lose to the flat one (3.31x vs 4.03x parallel speedup) before this
+    /// fix. A future edit to the L1-budget formula that reintroduces a
+    /// tiny-tile regression fails this test immediately, without needing
+    /// the timing-based `measure_gemv_ternary_par_efficiency`.
+    #[test]
+    fn optimal_tile_rows_ternary_never_below_measured_floor() {
+        for k in [5120usize, 17408] {
+            let rows = optimal_tile_rows_ternary(k);
+            assert!(
+                rows >= TERNARY_TILE_MIN_ROWS,
+                "k={k}: optimal_tile_rows_ternary returned {rows}, below the \
+                 measured floor of {TERNARY_TILE_MIN_ROWS} that keeps the tiled \
+                 path competitive with the flat one"
+            );
+            assert!(rows <= crate::tiled::L2_TILE_ROWS);
+        }
+    }
 
     fn make_block(scale: f32, bits: [u8; 16]) -> BlockQ1_0G128 {
         BlockQ1_0G128 {
@@ -703,30 +939,223 @@ mod tests {
         }
     }
 
+    /// T-09: the original version of this test only checked that
+    /// `gemv_adaptive_ternary` returned `Ok`, which passes identically
+    /// whether `select_gevm_strategy` (sic) routes correctly, routes
+    /// backwards, or is deleted outright. It now asserts (a) the routing
+    /// decision `select_gemv_strategy` actually makes for this shape is
+    /// `Direct`, and (b) the adaptive call's output matches a direct
+    /// dispatcher call bit-for-bit (both paths reduce to the exact same
+    /// `dispatcher.gemv_ternary_g128` call for `n_rows` below every tuned
+    /// threshold, so there is no floating-point reordering to tolerate).
     #[test]
     fn adaptive_ternary_gemv_small_is_direct() -> KernelResult<()> {
         let n_rows = 16;
         let k = 128;
-        let blocks_per_row = k / oxibonsai_core::QK_TQ2_0_G128;
-        let blocks = vec![make_ternary_block([0xAAu8; 32]); n_rows * blocks_per_row];
+        assert_eq!(
+            select_gemv_strategy(n_rows, k),
+            AdaptiveStrategy::Direct,
+            "test fixture assumption: n_rows={n_rows} must be below par_gemv_min_rows on this host"
+        );
+
+        let blocks_per_row = k / QK_TQ2_0_G128;
+        let blocks: Vec<_> = (0..n_rows * blocks_per_row)
+            .map(|i| make_ternary_block([((i * 29 + 3) & 0xFF) as u8; 32]))
+            .collect();
         let input: Vec<f32> = (0..k).map(|i| (i as f32 * 0.01) - 1.28).collect();
         let dispatcher = KernelDispatcher::auto_detect();
-        let mut output = vec![0.0f32; n_rows];
 
-        gemv_adaptive_ternary(&dispatcher, &blocks, &input, &mut output, n_rows, k)
+        let mut out_direct = vec![0.0f32; n_rows];
+        dispatcher.gemv_ternary_g128(&blocks, &input, &mut out_direct, n_rows, k)?;
+
+        let mut out_adaptive = vec![0.0f32; n_rows];
+        gemv_adaptive_ternary(&dispatcher, &blocks, &input, &mut out_adaptive, n_rows, k)?;
+
+        for i in 0..n_rows {
+            assert_eq!(
+                out_direct[i].to_bits(),
+                out_adaptive[i].to_bits(),
+                "row {i}: direct={}, adaptive={}",
+                out_direct[i],
+                out_adaptive[i]
+            );
+        }
+        Ok(())
+    }
+
+    /// T-09 twin of the above for the large-matrix path: asserts the
+    /// resolved strategy is `ParallelTiled` (K-M2's new ternary tiled path,
+    /// not the flat row-parallel one it used to collapse onto) and that the
+    /// adaptive call's output matches a direct, unparallelized dispatcher
+    /// call to within the tolerance the ACCEPTANCE criterion documents for
+    /// this crate's parallel routing (rows are independent reductions, so
+    /// tiling changes no per-row summation order — see
+    /// `strategy_forced_bit_parity_gemv_ternary` below for the bit-exact
+    /// version of this same claim across all three strategies).
+    #[test]
+    fn adaptive_ternary_gemv_large_is_parallel() -> KernelResult<()> {
+        let n_rows = 10_000;
+        let k = 128;
+        assert_eq!(
+            select_gemv_strategy(n_rows, k),
+            AdaptiveStrategy::ParallelTiled,
+            "test fixture assumption: n_rows={n_rows} must be above par_tiled_min_rows on this host"
+        );
+
+        let blocks_per_row = k / QK_TQ2_0_G128;
+        let blocks: Vec<_> = (0..n_rows * blocks_per_row)
+            .map(|i| make_ternary_block([((i * 29 + 3) & 0xFF) as u8; 32]))
+            .collect();
+        let input: Vec<f32> = (0..k).map(|i| (i as f32 * 0.01) - 1.28).collect();
+        let dispatcher = KernelDispatcher::auto_detect();
+
+        let mut out_direct = vec![0.0f32; n_rows];
+        dispatcher.gemv_ternary_g128(&blocks, &input, &mut out_direct, n_rows, k)?;
+
+        let mut out_adaptive = vec![0.0f32; n_rows];
+        gemv_adaptive_ternary(&dispatcher, &blocks, &input, &mut out_adaptive, n_rows, k)?;
+
+        for i in 0..n_rows {
+            assert_eq!(
+                out_direct[i].to_bits(),
+                out_adaptive[i].to_bits(),
+                "row {i}: direct={}, adaptive(ParallelTiled)={}",
+                out_direct[i],
+                out_adaptive[i]
+            );
+        }
+        Ok(())
+    }
+
+    /// K-M2 wiring proof: forcing Direct / ParallelRow (K-16's chunked
+    /// `gemv_ternary_g128_par`) / ParallelTiled (the new
+    /// `gemv_parallel_tiled_ternary`) on identical input must produce
+    /// bit-for-bit identical output, and `select_gemv_strategy` must
+    /// actually resolve to `ParallelTiled` for the large shape — pinning
+    /// both the numeric invariant and the routing decision the way
+    /// `strategy_forced_bit_parity_gemv` already does for the 1-bit format.
+    #[test]
+    fn strategy_forced_bit_parity_gemv_ternary() -> KernelResult<()> {
+        let n_rows = 10_000;
+        let k = 256;
+        assert_eq!(
+            select_gemv_strategy(n_rows, k),
+            AdaptiveStrategy::ParallelTiled
+        );
+
+        let blocks_per_row = k / QK_TQ2_0_G128;
+        let blocks: Vec<_> = (0..n_rows * blocks_per_row)
+            .map(|i| make_ternary_block([((i * 53 + 11) & 0xFF) as u8; 32]))
+            .collect();
+        let input: Vec<f32> = (0..k).map(|i| (i as f32 * 0.003) - 0.4).collect();
+        let dispatcher = KernelDispatcher::auto_detect();
+
+        let mut out_direct = vec![0.0f32; n_rows];
+        dispatcher.gemv_ternary_g128(&blocks, &input, &mut out_direct, n_rows, k)?;
+
+        let mut out_parallel_row = vec![0.0f32; n_rows];
+        crate::parallel::gemv_ternary_g128_par(
+            &dispatcher,
+            &blocks,
+            &input,
+            &mut out_parallel_row,
+            n_rows,
+            k,
+        )?;
+
+        let mut out_parallel_tiled = vec![0.0f32; n_rows];
+        gemv_parallel_tiled_ternary(
+            &dispatcher,
+            &blocks,
+            &input,
+            &mut out_parallel_tiled,
+            n_rows,
+            k,
+        )?;
+
+        for i in 0..n_rows {
+            assert_eq!(
+                out_direct[i].to_bits(),
+                out_parallel_row[i].to_bits(),
+                "row {i}: Direct vs ParallelRow diverged bit-exactly"
+            );
+            assert_eq!(
+                out_direct[i].to_bits(),
+                out_parallel_tiled[i].to_bits(),
+                "row {i}: Direct vs ParallelTiled diverged bit-exactly"
+            );
+        }
+        Ok(())
     }
 
     #[test]
-    fn adaptive_ternary_gemv_large_is_parallel() -> KernelResult<()> {
-        let n_rows = 512;
-        let k = 128;
-        let blocks_per_row = k / oxibonsai_core::QK_TQ2_0_G128;
-        let blocks = vec![make_ternary_block([0xAAu8; 32]); n_rows * blocks_per_row];
+    fn gemv_parallel_tiled_ternary_matches_direct() -> KernelResult<()> {
+        let n_rows = 600;
+        let k = 256;
+        let blocks_per_row = k / QK_TQ2_0_G128;
+        let blocks: Vec<_> = (0..n_rows * blocks_per_row)
+            .map(|i| make_ternary_block([((i * 19 + 5) & 0xFF) as u8; 32]))
+            .collect();
         let input: Vec<f32> = (0..k).map(|i| (i as f32 * 0.01) - 1.28).collect();
         let dispatcher = KernelDispatcher::auto_detect();
-        let mut output = vec![0.0f32; n_rows];
 
-        gemv_adaptive_ternary(&dispatcher, &blocks, &input, &mut output, n_rows, k)
+        let mut out_direct = vec![0.0f32; n_rows];
+        dispatcher.gemv_ternary_g128(&blocks, &input, &mut out_direct, n_rows, k)?;
+
+        let mut out_tiled = vec![0.0f32; n_rows];
+        gemv_parallel_tiled_ternary(&dispatcher, &blocks, &input, &mut out_tiled, n_rows, k)?;
+
+        for i in 0..n_rows {
+            assert_eq!(
+                out_direct[i].to_bits(),
+                out_tiled[i].to_bits(),
+                "row {i}: direct={}, tiled={}",
+                out_direct[i],
+                out_tiled[i]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gemv_parallel_tiled_ternary_small_falls_back_to_sequential_tiled() -> KernelResult<()> {
+        let n_rows = 8;
+        let k = 128;
+        let blocks_per_row = k / QK_TQ2_0_G128;
+        let blocks: Vec<_> = (0..n_rows * blocks_per_row)
+            .map(|i| make_ternary_block([((i * 7 + 1) & 0xFF) as u8; 32]))
+            .collect();
+        let input: Vec<f32> = (0..k).map(|i| (i as f32 * 0.01) - 1.28).collect();
+        let dispatcher = KernelDispatcher::auto_detect();
+
+        let mut out_direct = vec![0.0f32; n_rows];
+        dispatcher.gemv_ternary_g128(&blocks, &input, &mut out_direct, n_rows, k)?;
+
+        let mut out_tiled = vec![0.0f32; n_rows];
+        gemv_parallel_tiled_ternary(&dispatcher, &blocks, &input, &mut out_tiled, n_rows, k)?;
+
+        for i in 0..n_rows {
+            assert_eq!(out_direct[i].to_bits(), out_tiled[i].to_bits(), "row {i}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gemv_parallel_tiled_ternary_validation_errors() {
+        let dispatcher = KernelDispatcher::auto_detect();
+        let blocks = vec![make_ternary_block([0xAAu8; 32])];
+        let input = vec![1.0f32; 128];
+        let mut output = vec![0.0f32; 1];
+
+        // Not block aligned.
+        let result = gemv_parallel_tiled_ternary(&dispatcher, &blocks, &input, &mut output, 1, 100);
+        assert!(result.is_err());
+
+        // Output too small.
+        let mut tiny_output = vec![0.0f32; 0];
+        let result =
+            gemv_parallel_tiled_ternary(&dispatcher, &blocks, &input, &mut tiny_output, 1, 128);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -757,6 +1186,45 @@ mod tests {
             assert!(!config.should_parallelize_gemm(2));
             assert!(config.should_parallelize_gemm(8));
         }
+    }
+
+    /// K-02: this file's migrated construction sites (1-bit and ternary
+    /// validators) name the buffer they complained about.
+    #[test]
+    fn migrated_errors_name_the_offending_buffer() {
+        let dispatcher = KernelDispatcher::auto_detect();
+        let blocks = vec![make_block(1.0, [0xFF; 16]); 4];
+
+        let short_input = vec![1.0f32; 10];
+        let mut output = vec![0.0f32; 4];
+        let err = gemv_parallel_tiled(&dispatcher, &blocks, &short_input, &mut output, 4, 128)
+            .unwrap_err();
+        assert_eq!(err.buffer_name(), Some("input"));
+
+        let input = vec![1.0f32; 128];
+        let mut short_output = vec![0.0f32; 0];
+        let err = gemv_parallel_tiled(&dispatcher, &blocks, &input, &mut short_output, 4, 128)
+            .unwrap_err();
+        assert_eq!(err.buffer_name(), Some("output"));
+
+        let mut output = vec![0.0f32; 8];
+        let err =
+            gemv_parallel_tiled(&dispatcher, &blocks, &input, &mut output, 8, 128).unwrap_err();
+        assert_eq!(err.buffer_name(), Some("blocks"));
+
+        let ternary_blocks = vec![make_ternary_block([0xAAu8; 32]); 4];
+        let short_input = vec![1.0f32; 10];
+        let mut output = vec![0.0f32; 4];
+        let err = gemv_parallel_tiled_ternary(
+            &dispatcher,
+            &ternary_blocks,
+            &short_input,
+            &mut output,
+            4,
+            128,
+        )
+        .unwrap_err();
+        assert_eq!(err.buffer_name(), Some("input"));
     }
 
     #[test]

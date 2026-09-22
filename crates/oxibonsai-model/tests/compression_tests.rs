@@ -1,3 +1,4 @@
+#![cfg(feature = "training")]
 //! Integration tests for the model compression pipeline.
 
 use oxibonsai_model::compression::{

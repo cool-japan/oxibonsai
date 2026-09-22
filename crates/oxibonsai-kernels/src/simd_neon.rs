@@ -39,10 +39,11 @@ pub unsafe fn dequant_1bit_g128_neon(
 ) -> KernelResult<()> {
     let expected_len = blocks.len() * QK1_0_G128;
     if output.len() < expected_len {
-        return Err(KernelError::BufferTooSmall {
-            needed: expected_len,
-            available: output.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "output",
+            expected_len,
+            output.len(),
+        ));
     }
 
     for (i, block) in blocks.iter().enumerate() {
@@ -87,32 +88,31 @@ pub unsafe fn gemv_1bit_g128_neon(
     n_rows: usize,
     k: usize,
 ) -> KernelResult<()> {
-    if k % QK1_0_G128 != 0 {
+    if !k.is_multiple_of(QK1_0_G128) {
         return Err(KernelError::NotBlockAligned {
             count: k,
             block_size: QK1_0_G128,
         });
     }
     if input.len() < k {
-        return Err(KernelError::DimensionMismatch {
-            expected: k,
-            got: input.len(),
-        });
+        return Err(KernelError::dimension_mismatch("input", k, input.len()));
     }
     if output.len() < n_rows {
-        return Err(KernelError::BufferTooSmall {
-            needed: n_rows,
-            available: output.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "output",
+            n_rows,
+            output.len(),
+        ));
     }
 
     let blocks_per_row = k / QK1_0_G128;
     let expected_blocks = n_rows * blocks_per_row;
     if blocks.len() < expected_blocks {
-        return Err(KernelError::BufferTooSmall {
-            needed: expected_blocks,
-            available: blocks.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "blocks",
+            expected_blocks,
+            blocks.len(),
+        ));
     }
 
     for row in 0..n_rows {
@@ -163,32 +163,31 @@ pub unsafe fn gemm_1bit_g128_neon(
     n_rows: usize,
     k: usize,
 ) -> KernelResult<()> {
-    if k % QK1_0_G128 != 0 {
+    if !k.is_multiple_of(QK1_0_G128) {
         return Err(KernelError::NotBlockAligned {
             count: k,
             block_size: QK1_0_G128,
         });
     }
     if input.len() < m * k {
-        return Err(KernelError::DimensionMismatch {
-            expected: m * k,
-            got: input.len(),
-        });
+        return Err(KernelError::dimension_mismatch("input", m * k, input.len()));
     }
     if output.len() < m * n_rows {
-        return Err(KernelError::BufferTooSmall {
-            needed: m * n_rows,
-            available: output.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "output",
+            m * n_rows,
+            output.len(),
+        ));
     }
 
     let blocks_per_row = k / QK1_0_G128;
     let expected_blocks = n_rows * blocks_per_row;
     if blocks.len() < expected_blocks {
-        return Err(KernelError::BufferTooSmall {
-            needed: expected_blocks,
-            available: blocks.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "blocks",
+            expected_blocks,
+            blocks.len(),
+        ));
     }
 
     for mi in 0..m {
@@ -273,25 +272,26 @@ unsafe fn hsum_neon(v: float32x4_t) -> f32 {
     vgetq_lane_f32::<0>(sum)
 }
 
+/// The ONE NEON ternary decode helper (K-01): every dequant/gemv/gemm NEON
+/// kernel below routes through this function instead of inlining its own
+/// copy, so the ISA tier physically cannot drift from the single shared
+/// [`oxibonsai_core::ternary_code_to_i8`] table (which maps the reserved
+/// `0b11` code to `0`, matching every GPU decoder and the CPU reference).
+///
+/// Decodes 4 lanes (one packed byte) via 4 scalar table lookups, then a
+/// single vector load — deliberately not a hand-rolled SIMD arithmetic
+/// re-implementation of the table, which is exactly the kind of "shadow
+/// copy" that caused K-01.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn decode_byte_neon_to_f32x4(b: u8, one: uint32x4_t) -> float32x4_t {
-    let idx_arr: [u32; 4] = [
-        (b & 3) as u32,
-        ((b >> 2) & 3) as u32,
-        ((b >> 4) & 3) as u32,
-        ((b >> 6) & 3) as u32,
+unsafe fn decode_byte_neon_to_f32x4(b: u8) -> float32x4_t {
+    let vals: [f32; 4] = [
+        oxibonsai_core::ternary_code_to_i8(b) as f32,
+        oxibonsai_core::ternary_code_to_i8(b >> 2) as f32,
+        oxibonsai_core::ternary_code_to_i8(b >> 4) as f32,
+        oxibonsai_core::ternary_code_to_i8(b >> 6) as f32,
     ];
-    let idx_v = vld1q_u32(idx_arr.as_ptr());
-    let pos_part = vshrq_n_u32::<1>(idx_v);
-    let min_part = vminq_u32(idx_v, one);
-    let neg_part = vsubq_u32(one, min_part);
-    let val_i32 = vsubq_s32(
-        vreinterpretq_s32_u32(pos_part),
-        vreinterpretq_s32_u32(neg_part),
-    );
-    let reserved = vceqq_u32(idx_v, vdupq_n_u32(3));
-    vcvtq_f32_s32(vbslq_s32(reserved, vdupq_n_s32(0), val_i32))
+    vld1q_f32(vals.as_ptr())
 }
 
 // ─── Prefetch-optimized GEMV ────────────────────────────────────────────
@@ -316,32 +316,31 @@ pub unsafe fn gemv_1bit_g128_neon_prefetch(
     n_rows: usize,
     k: usize,
 ) -> KernelResult<()> {
-    if k % QK1_0_G128 != 0 {
+    if !k.is_multiple_of(QK1_0_G128) {
         return Err(KernelError::NotBlockAligned {
             count: k,
             block_size: QK1_0_G128,
         });
     }
     if input.len() < k {
-        return Err(KernelError::DimensionMismatch {
-            expected: k,
-            got: input.len(),
-        });
+        return Err(KernelError::dimension_mismatch("input", k, input.len()));
     }
     if output.len() < n_rows {
-        return Err(KernelError::BufferTooSmall {
-            needed: n_rows,
-            available: output.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "output",
+            n_rows,
+            output.len(),
+        ));
     }
 
     let blocks_per_row = k / QK1_0_G128;
     let expected_blocks = n_rows * blocks_per_row;
     if blocks.len() < expected_blocks {
-        return Err(KernelError::BufferTooSmall {
-            needed: expected_blocks,
-            available: blocks.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "blocks",
+            expected_blocks,
+            blocks.len(),
+        ));
     }
 
     for row in 0..n_rows {
@@ -450,32 +449,31 @@ pub unsafe fn gemm_1bit_g128_neon_prefetch(
     n_rows: usize,
     k: usize,
 ) -> KernelResult<()> {
-    if k % QK1_0_G128 != 0 {
+    if !k.is_multiple_of(QK1_0_G128) {
         return Err(KernelError::NotBlockAligned {
             count: k,
             block_size: QK1_0_G128,
         });
     }
     if input.len() < m * k {
-        return Err(KernelError::DimensionMismatch {
-            expected: m * k,
-            got: input.len(),
-        });
+        return Err(KernelError::dimension_mismatch("input", m * k, input.len()));
     }
     if output.len() < m * n_rows {
-        return Err(KernelError::BufferTooSmall {
-            needed: m * n_rows,
-            available: output.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "output",
+            m * n_rows,
+            output.len(),
+        ));
     }
 
     let blocks_per_row = k / QK1_0_G128;
     let expected_blocks = n_rows * blocks_per_row;
     if blocks.len() < expected_blocks {
-        return Err(KernelError::BufferTooSmall {
-            needed: expected_blocks,
-            available: blocks.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "blocks",
+            expected_blocks,
+            blocks.len(),
+        ));
     }
 
     for mi in 0..m {
@@ -579,13 +577,12 @@ pub unsafe fn dequant_tq2_0_g128_neon(
     use oxibonsai_core::QK_TQ2_0_G128;
     let needed = blocks.len() * QK_TQ2_0_G128;
     if output.len() < needed {
-        return Err(KernelError::BufferTooSmall {
+        return Err(KernelError::buffer_too_small(
+            "output",
             needed,
-            available: output.len(),
-        });
+            output.len(),
+        ));
     }
-
-    let one = vdupq_n_u32(1);
 
     for (bi, block) in blocks.iter().enumerate() {
         let d = block.d.to_f32();
@@ -596,7 +593,7 @@ pub unsafe fn dequant_tq2_0_g128_neon(
         // 32 iterations per block
         for byte_idx in 0..32 {
             let b = block.qs[byte_idx];
-            let val_f = decode_byte_neon_to_f32x4(b, one);
+            let val_f = decode_byte_neon_to_f32x4(b);
 
             let result = vmulq_f32(scale, val_f);
             vst1q_f32(output.as_mut_ptr().add(base + byte_idx * 4), result);
@@ -625,35 +622,32 @@ pub unsafe fn gemv_tq2_0_g128_neon(
 ) -> KernelResult<()> {
     use oxibonsai_core::QK_TQ2_0_G128;
 
-    if k % QK_TQ2_0_G128 != 0 {
+    if !k.is_multiple_of(QK_TQ2_0_G128) {
         return Err(KernelError::NotBlockAligned {
             count: k,
             block_size: QK_TQ2_0_G128,
         });
     }
     if input.len() < k {
-        return Err(KernelError::DimensionMismatch {
-            expected: k,
-            got: input.len(),
-        });
+        return Err(KernelError::dimension_mismatch("input", k, input.len()));
     }
     if output.len() < n_rows {
-        return Err(KernelError::BufferTooSmall {
-            needed: n_rows,
-            available: output.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "output",
+            n_rows,
+            output.len(),
+        ));
     }
 
     let blocks_per_row = k / QK_TQ2_0_G128;
     let expected_blocks = n_rows * blocks_per_row;
     if blocks.len() < expected_blocks {
-        return Err(KernelError::BufferTooSmall {
-            needed: expected_blocks,
-            available: blocks.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "blocks",
+            expected_blocks,
+            blocks.len(),
+        ));
     }
-
-    let one = vdupq_n_u32(1);
 
     for row in 0..n_rows {
         let row_blocks = &blocks[row * blocks_per_row..(row + 1) * blocks_per_row];
@@ -668,7 +662,7 @@ pub unsafe fn gemv_tq2_0_g128_neon(
             // Each iteration consumes 1 byte of qs
             for byte_idx in 0..32 {
                 let b = block.qs[byte_idx];
-                let val_f = decode_byte_neon_to_f32x4(b, one);
+                let val_f = decode_byte_neon_to_f32x4(b);
                 let inp_vec = vld1q_f32(input.as_ptr().add(inp_base + byte_idx * 4));
                 block_acc = vfmaq_f32(block_acc, val_f, inp_vec);
             }
@@ -697,35 +691,32 @@ pub unsafe fn gemv_tq2_0_g128_neon_prefetch(
 ) -> KernelResult<()> {
     use oxibonsai_core::QK_TQ2_0_G128;
 
-    if k % QK_TQ2_0_G128 != 0 {
+    if !k.is_multiple_of(QK_TQ2_0_G128) {
         return Err(KernelError::NotBlockAligned {
             count: k,
             block_size: QK_TQ2_0_G128,
         });
     }
     if input.len() < k {
-        return Err(KernelError::DimensionMismatch {
-            expected: k,
-            got: input.len(),
-        });
+        return Err(KernelError::dimension_mismatch("input", k, input.len()));
     }
     if output.len() < n_rows {
-        return Err(KernelError::BufferTooSmall {
-            needed: n_rows,
-            available: output.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "output",
+            n_rows,
+            output.len(),
+        ));
     }
 
     let blocks_per_row = k / QK_TQ2_0_G128;
     let expected_blocks = n_rows * blocks_per_row;
     if blocks.len() < expected_blocks {
-        return Err(KernelError::BufferTooSmall {
-            needed: expected_blocks,
-            available: blocks.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "blocks",
+            expected_blocks,
+            blocks.len(),
+        ));
     }
-
-    let one = vdupq_n_u32(1);
 
     for (row, out) in output.iter_mut().enumerate().take(n_rows) {
         let row_offset = row * blocks_per_row;
@@ -754,11 +745,11 @@ pub unsafe fn gemv_tq2_0_g128_neon_prefetch(
                 let b0 = block.qs[pair * 2];
                 let b1 = block.qs[pair * 2 + 1];
 
-                let val0 = decode_byte_neon_to_f32x4(b0, one);
+                let val0 = decode_byte_neon_to_f32x4(b0);
                 let inp0 = vld1q_f32(input.as_ptr().add(inp_base + pair * 8));
                 acc0 = vfmaq_f32(acc0, val0, inp0);
 
-                let val1 = decode_byte_neon_to_f32x4(b1, one);
+                let val1 = decode_byte_neon_to_f32x4(b1);
                 let inp1 = vld1q_f32(input.as_ptr().add(inp_base + pair * 8 + 4));
                 acc1 = vfmaq_f32(acc1, val1, inp1);
             }
@@ -791,35 +782,32 @@ pub unsafe fn gemm_tq2_0_g128_neon(
 ) -> KernelResult<()> {
     use oxibonsai_core::QK_TQ2_0_G128;
 
-    if k % QK_TQ2_0_G128 != 0 {
+    if !k.is_multiple_of(QK_TQ2_0_G128) {
         return Err(KernelError::NotBlockAligned {
             count: k,
             block_size: QK_TQ2_0_G128,
         });
     }
     if input.len() < m * k {
-        return Err(KernelError::DimensionMismatch {
-            expected: m * k,
-            got: input.len(),
-        });
+        return Err(KernelError::dimension_mismatch("input", m * k, input.len()));
     }
     if output.len() < m * n_rows {
-        return Err(KernelError::BufferTooSmall {
-            needed: m * n_rows,
-            available: output.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "output",
+            m * n_rows,
+            output.len(),
+        ));
     }
 
     let blocks_per_row = k / QK_TQ2_0_G128;
     let expected_blocks = n_rows * blocks_per_row;
     if blocks.len() < expected_blocks {
-        return Err(KernelError::BufferTooSmall {
-            needed: expected_blocks,
-            available: blocks.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "blocks",
+            expected_blocks,
+            blocks.len(),
+        ));
     }
-
-    let one = vdupq_n_u32(1);
 
     for mi in 0..m {
         let input_row = &input[mi * k..];
@@ -836,21 +824,13 @@ pub unsafe fn gemm_tq2_0_g128_neon(
                 for byte_idx in 0..32 {
                     let b = block.qs[byte_idx];
 
-                    let idx_arr: [u32; 4] = [
-                        (b & 3) as u32,
-                        ((b >> 2) & 3) as u32,
-                        ((b >> 4) & 3) as u32,
-                        ((b >> 6) & 3) as u32,
-                    ];
-                    let idx_v = vld1q_u32(idx_arr.as_ptr());
-                    let pos_part = vshrq_n_u32::<1>(idx_v);
-                    let min_part = vminq_u32(idx_v, one);
-                    let neg_part = vsubq_u32(one, min_part);
-                    let val_i32 = vsubq_s32(
-                        vreinterpretq_s32_u32(pos_part),
-                        vreinterpretq_s32_u32(neg_part),
-                    );
-                    let val_f = vcvtq_f32_s32(val_i32);
+                    // K-01: this used to be an unmasked inline copy of the
+                    // decode (pos_part/min_part/neg_part with no `0b11`
+                    // guard), so a reserved code decoded to +1 here while
+                    // every other ternary kernel decoded it to 0. Routing
+                    // through the single shared helper makes that
+                    // divergence structurally impossible.
+                    let val_f = decode_byte_neon_to_f32x4(b);
 
                     let inp_vec = vld1q_f32(input_row.as_ptr().add(inp_base + byte_idx * 4));
                     block_acc = vfmaq_f32(block_acc, val_f, inp_vec);
@@ -1103,6 +1083,29 @@ mod tests {
         oxibonsai_core::BlockTQ2_0_g128 {
             qs,
             d: f16::from_f32(scale),
+        }
+    }
+
+    /// K-01 anti-drift guard: exhaustively checks every one of the 256
+    /// possible byte values against [`oxibonsai_core::ternary_code_to_i8`]
+    /// for all 4 lanes. This is what makes "physically cannot drift" true —
+    /// a future re-vectorization of `decode_byte_neon_to_f32x4` that
+    /// reintroduces hand-rolled SIMD arithmetic (instead of calling the
+    /// shared table) will fail this test the moment it disagrees on any of
+    /// the 1024 (byte, lane) pairs, including the reserved `0b11` code.
+    #[test]
+    fn decode_byte_neon_to_f32x4_matches_ternary_code_to_i8_exhaustively() {
+        for b in 0..=255u8 {
+            let decoded = unsafe { decode_byte_neon_to_f32x4(b) };
+            let mut lanes = [0.0f32; 4];
+            unsafe { vst1q_f32(lanes.as_mut_ptr(), decoded) };
+            for (lane, &got) in lanes.iter().enumerate() {
+                let expected = oxibonsai_core::ternary_code_to_i8(b >> (lane * 2)) as f32;
+                assert_eq!(
+                    got, expected,
+                    "decode_byte_neon_to_f32x4({b:#04x}) lane {lane}: got {got}, expected {expected}"
+                );
+            }
         }
     }
 

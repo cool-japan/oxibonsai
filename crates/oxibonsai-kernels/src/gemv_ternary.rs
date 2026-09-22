@@ -3,8 +3,15 @@
 //! Computes `output = weight_matrix @ input_vector` where the weight matrix
 //! is stored in ternary-quantized format. Each block contributes a scaled
 //! dot product: `block_contribution = scale * dot(ternary_weights, input_slice)`.
+//!
+//! Decode uses the single shared [`oxibonsai_core::ternary_code_to_i8`]
+//! table (K-01): every NEON/AVX2/AVX-512 ternary kernel in this crate, plus
+//! `BlockTQ2_0_g128::dequant` / `ternary_decode` and `BlockTQ2_0::dequant`
+//! in `oxibonsai-core`, route through that same table, so this format's
+//! decode cannot drift across the two crates or across kernel tiers.
+//! `tests/ternary_cross_tier.rs` asserts the whole matrix agrees.
 
-use oxibonsai_core::{BlockTQ2_0, BlockTQ2_0_g128, QK_TQ2_0, QK_TQ2_0_G128};
+use oxibonsai_core::{ternary_code_to_i8, BlockTQ2_0, BlockTQ2_0_g128, QK_TQ2_0, QK_TQ2_0_G128};
 
 use crate::error::{KernelError, KernelResult};
 
@@ -14,16 +21,11 @@ use crate::error::{KernelError, KernelResult};
 
 /// Decode a single 2-bit ternary code at `lane` (0..4) in `byte` to f32.
 ///
-/// Code map: `0b00→-1.0`, `0b01→0.0`, `0b10→+1.0`, `0b11→0.0` (reserved).
+/// Code map: `0b00→-1.0`, `0b01→0.0`, `0b10→+1.0`, `0b11→0.0` (reserved),
+/// via the shared [`ternary_code_to_i8`] table (K-01).
 #[inline]
 fn decode_weight_f32(byte: u8, lane: usize) -> f32 {
-    let code = (byte >> (lane * 2)) & 0b11;
-    match code {
-        0b00 => -1.0_f32,
-        0b01 => 0.0_f32,
-        0b10 => 1.0_f32,
-        _ => 0.0_f32, // 0b11 reserved → zero
-    }
+    ternary_code_to_i8(byte >> (lane * 2)) as f32
 }
 
 // ---------------------------------------------------------------------------
@@ -52,32 +54,31 @@ pub fn gemv_tq2_0_g128(
     n_rows: usize,
     k: usize,
 ) -> KernelResult<()> {
-    if k % QK_TQ2_0_G128 != 0 {
+    if !k.is_multiple_of(QK_TQ2_0_G128) {
         return Err(KernelError::NotBlockAligned {
             count: k,
             block_size: QK_TQ2_0_G128,
         });
     }
     if input.len() < k {
-        return Err(KernelError::DimensionMismatch {
-            expected: k,
-            got: input.len(),
-        });
+        return Err(KernelError::dimension_mismatch("input", k, input.len()));
     }
     if output.len() < n_rows {
-        return Err(KernelError::BufferTooSmall {
-            needed: n_rows,
-            available: output.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "output",
+            n_rows,
+            output.len(),
+        ));
     }
 
     let blocks_per_row = k / QK_TQ2_0_G128;
     let expected_blocks = n_rows * blocks_per_row;
     if blocks.len() < expected_blocks {
-        return Err(KernelError::DimensionMismatch {
-            expected: expected_blocks,
-            got: blocks.len(),
-        });
+        return Err(KernelError::dimension_mismatch(
+            "blocks",
+            expected_blocks,
+            blocks.len(),
+        ));
     }
 
     for row in 0..n_rows {
@@ -130,32 +131,31 @@ pub fn gemv_tq2_0(
     n_rows: usize,
     k: usize,
 ) -> KernelResult<()> {
-    if k % QK_TQ2_0 != 0 {
+    if !k.is_multiple_of(QK_TQ2_0) {
         return Err(KernelError::NotBlockAligned {
             count: k,
             block_size: QK_TQ2_0,
         });
     }
     if input.len() < k {
-        return Err(KernelError::DimensionMismatch {
-            expected: k,
-            got: input.len(),
-        });
+        return Err(KernelError::dimension_mismatch("input", k, input.len()));
     }
     if output.len() < n_rows {
-        return Err(KernelError::BufferTooSmall {
-            needed: n_rows,
-            available: output.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "output",
+            n_rows,
+            output.len(),
+        ));
     }
 
     let blocks_per_row = k / QK_TQ2_0;
     let expected_blocks = n_rows * blocks_per_row;
     if blocks.len() < expected_blocks {
-        return Err(KernelError::DimensionMismatch {
-            expected: expected_blocks,
-            got: blocks.len(),
-        });
+        return Err(KernelError::dimension_mismatch(
+            "blocks",
+            expected_blocks,
+            blocks.len(),
+        ));
     }
 
     for row in 0..n_rows {

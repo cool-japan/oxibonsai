@@ -1,3 +1,4 @@
+#![cfg(feature = "multi-device")]
 //! Tests for the multi-GPU / multi-device utilities (`oxibonsai_model::multi_gpu`).
 //!
 //! All data is deterministic — no rand crate is used.
@@ -96,11 +97,17 @@ fn device_info_has_name() {
 }
 
 #[test]
-fn device_info_memory_positive() {
+fn device_info_memory_is_honestly_unknown() {
+    // `memory_bytes` used to be a fabricated 24 GiB constant. This
+    // simulation has no real hardware to probe, so it must honestly
+    // report `None` rather than hand out a made-up number.
     let mesh = DeviceMesh::tensor_parallel(2);
     for tp in 0..2 {
         let dev = mesh.get(tp, 0).expect("device should exist");
-        assert!(dev.memory_bytes > 0, "simulated memory should be positive");
+        assert!(
+            dev.memory_bytes.is_none(),
+            "simulated device memory must be honestly None, not a fabricated number"
+        );
         assert!(
             dev.compute_units > 0,
             "simulated compute units should be positive"
@@ -178,24 +185,24 @@ fn nccl_all_gather_concatenates() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// NcclCollectives — reduce_scatter
+// NcclCollectives — scatter_equal_shards
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn nccl_reduce_scatter_correct_shard_count() {
+fn nccl_scatter_equal_shards_correct_shard_count() {
     let data: Vec<f32> = (0..12).map(|i| i as f32).collect();
-    let shards = NcclCollectives::reduce_scatter(&data, 4);
+    let shards = NcclCollectives::scatter_equal_shards(&data, 4);
     assert_eq!(
         shards.len(),
         4,
-        "reduce_scatter should produce world_size shards"
+        "scatter_equal_shards should produce world_size shards"
     );
 }
 
 #[test]
-fn nccl_reduce_scatter_covers_all_data() {
+fn nccl_scatter_equal_shards_covers_all_data() {
     let data: Vec<f32> = (0..12).map(|i| i as f32).collect();
-    let shards = NcclCollectives::reduce_scatter(&data, 3);
+    let shards = NcclCollectives::scatter_equal_shards(&data, 3);
     let total_elements: usize = shards.iter().map(|s| s.len()).sum();
     assert_eq!(total_elements, data.len(), "all elements should be covered");
 }

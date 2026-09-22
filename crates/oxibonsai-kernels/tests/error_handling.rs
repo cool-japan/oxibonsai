@@ -3,8 +3,10 @@
 
 use half::f16;
 use oxibonsai_core::tensor::BlockQ1_0G128;
+use oxibonsai_core::BlockQ2K;
 use oxibonsai_kernels::dispatch::{KernelDispatcher, KernelTier};
 use oxibonsai_kernels::error::KernelError;
+use oxibonsai_kernels::gemv_q2k;
 use oxibonsai_kernels::traits::OneBitKernel;
 use oxibonsai_kernels::{dequant, gemm, gemv};
 
@@ -225,6 +227,92 @@ fn gemm_blocks_too_few() {
             assert_eq!(available, 1);
         }
         other => panic!("expected BufferTooSmall, got: {other}"),
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
+// Named length-contract errors (wave-1.5 addendum (7)): once a real kernel
+// call site migrates from the unnamed `KernelError::BufferTooSmall` /
+// `DimensionMismatch` to the named `buffer_too_small`/`dimension_mismatch`
+// constructors, this integration test should cover it end to end (not just
+// `error.rs`'s own unit tests, which construct the enum directly rather
+// than triggering it through a real kernel call). `gemv_q2k` (a K-quant
+// GEMV, cross-platform — no `metal`/`native-cuda` feature needed) is one
+// such migrated site.
+// ──────────────────────────────────────────────────────────────
+
+/// A real kernel call (not a direct enum construction) whose undersized
+/// output buffer must surface as the NAMED `KernelError::NamedBufferTooSmall`
+/// variant, naming the buffer as `"output"`.
+#[test]
+fn gemv_q2k_named_output_too_small() {
+    let weights = vec![0.1f32; 256]; // 1 row, 256 cols -> 1 Q2_K block
+    let blocks = BlockQ2K::quantize(&weights).expect("quantize");
+    let input = vec![1.0f32; 256];
+    let mut output = vec![0.0f32; 0]; // need 1
+    let err = gemv_q2k(&blocks, &input, &mut output, 1, 256).expect_err("output too small");
+    assert_eq!(err.buffer_name(), Some("output"));
+    assert_eq!(err.error_code(), "BUFFER_TOO_SMALL");
+    match err {
+        KernelError::NamedBufferTooSmall {
+            name,
+            needed,
+            available,
+        } => {
+            assert_eq!(name, "output");
+            assert_eq!(needed, 1);
+            assert_eq!(available, 0);
+        }
+        other => panic!("expected NamedBufferTooSmall, got: {other}"),
+    }
+}
+
+/// A real kernel call whose too-short input buffer must surface as the
+/// NAMED `KernelError::NamedDimensionMismatch` variant, naming the operand
+/// as `"input"`.
+#[test]
+fn gemv_q2k_named_input_dimension_mismatch() {
+    let weights = vec![0.1f32; 256];
+    let blocks = BlockQ2K::quantize(&weights).expect("quantize");
+    let input = vec![1.0f32; 100]; // need 256
+    let mut output = vec![0.0f32; 1];
+    let err = gemv_q2k(&blocks, &input, &mut output, 1, 256).expect_err("input too short");
+    assert_eq!(err.buffer_name(), Some("input"));
+    match err {
+        KernelError::NamedDimensionMismatch {
+            name,
+            expected,
+            got,
+        } => {
+            assert_eq!(name, "input");
+            assert_eq!(expected, 256);
+            assert_eq!(got, 100);
+        }
+        other => panic!("expected NamedDimensionMismatch, got: {other}"),
+    }
+}
+
+/// Same call, undersized `blocks` this time — names the operand `"blocks"`.
+#[test]
+fn gemv_q2k_named_blocks_dimension_mismatch() {
+    let weights = vec![0.1f32; 512]; // 2 blocks' worth
+    let blocks = BlockQ2K::quantize(&weights).expect("quantize");
+    let too_few = &blocks[..1]; // caller claims 2 rows but supplies 1 block
+    let input = vec![1.0f32; 256];
+    let mut output = vec![0.0f32; 2];
+    let err = gemv_q2k(too_few, &input, &mut output, 2, 256).expect_err("not enough blocks");
+    assert_eq!(err.buffer_name(), Some("blocks"));
+    match err {
+        KernelError::NamedDimensionMismatch {
+            name,
+            expected,
+            got,
+        } => {
+            assert_eq!(name, "blocks");
+            assert_eq!(expected, 2);
+            assert_eq!(got, 1);
+        }
+        other => panic!("expected NamedDimensionMismatch, got: {other}"),
     }
 }
 

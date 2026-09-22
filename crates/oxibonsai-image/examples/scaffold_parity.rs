@@ -96,7 +96,7 @@ fn read_npy(path: &Path) -> Result<Npy, String> {
         .collect::<Result<_, _>>()?;
     let data_start = header_start + header_len;
     let payload = &bytes[data_start..];
-    if payload.len() % 4 != 0 {
+    if !payload.len().is_multiple_of(4) {
         return Err(format!("{}: payload not f32-aligned", path.display()));
     }
     let data: Vec<f32> = payload

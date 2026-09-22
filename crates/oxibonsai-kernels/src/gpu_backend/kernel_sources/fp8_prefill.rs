@@ -59,7 +59,7 @@ pub const MSL_GEMM_FP8_E4M3_V1: &str = r#"
 using namespace metal;
 
 // FP8 E4M3FN decode (bias=7, no infinity; NaN patterns 0x7F/0xFF → 0).
-static inline float pf_fp8_e4m3_to_float(uchar b) {
+static inline float pf_fp8_e4m3_to_float_gemm(uchar b) {
     if (b == 0x7Fu || b == 0xFFu) return 0.0f;
     const uint sign = (uint(b) >> 7u) & 1u;
     const uint exp  = (uint(b) >> 3u) & 15u;
@@ -108,7 +108,7 @@ kernel void gemm_fp8_e4m3(
                 device const float* xbase = inputs + (col_base + cc) * k + inp_base;
                 float bsum = 0.0f;
                 for (uint w = 0u; w < 32u; ++w) {
-                    bsum += pf_fp8_e4m3_to_float(blocks_raw[base_byte + w]) * xbase[w];
+                    bsum += pf_fp8_e4m3_to_float_gemm(blocks_raw[base_byte + w]) * xbase[w];
                 }
                 col_sums[cc] += scale * bsum;
             }
@@ -134,7 +134,7 @@ pub const MSL_GEMM_FP8_E4M3_RESIDUAL_V1: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
-static inline float pf_fp8_e4m3_to_float(uchar b) {
+static inline float pf_fp8_e4m3_to_float_gemm_residual(uchar b) {
     if (b == 0x7Fu || b == 0xFFu) return 0.0f;
     const uint sign = (uint(b) >> 7u) & 1u;
     const uint exp  = (uint(b) >> 3u) & 15u;
@@ -184,7 +184,7 @@ kernel void gemm_fp8_e4m3_residual(
                 device const float* xbase = inputs + (col_base + cc) * k + inp_base;
                 float bsum = 0.0f;
                 for (uint w = 0u; w < 32u; ++w) {
-                    bsum += pf_fp8_e4m3_to_float(blocks_raw[base_byte + w]) * xbase[w];
+                    bsum += pf_fp8_e4m3_to_float_gemm_residual(blocks_raw[base_byte + w]) * xbase[w];
                 }
                 col_sums[cc] += scale * bsum;
             }
@@ -218,7 +218,7 @@ pub const MSL_FUSED_GATE_UP_SWIGLU_GEMM_FP8_E4M3_V1: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
-static inline float pf_fp8_e4m3_to_float(uchar b) {
+static inline float pf_fp8_e4m3_to_float_fused_e4m3(uchar b) {
     if (b == 0x7Fu || b == 0xFFu) return 0.0f;
     const uint sign = (uint(b) >> 7u) & 1u;
     const uint exp  = (uint(b) >> 3u) & 15u;
@@ -234,7 +234,7 @@ static inline float pf_fp8_e4m3_to_float(uchar b) {
 }
 
 // SiLU activation: x * sigmoid(x)
-static inline float pf_silu(float x) {
+static inline float pf_silu_e4m3(float x) {
     return x / (1.0f + exp(-x));
 }
 
@@ -284,8 +284,8 @@ kernel void fused_gate_up_swiglu_gemm_fp8_e4m3(
                 float usum = 0.0f;
                 for (uint w = 0u; w < 32u; ++w) {
                     const float x = xbase[w];
-                    gsum += pf_fp8_e4m3_to_float(blocks_raw[gbase + w]) * x;
-                    usum += pf_fp8_e4m3_to_float(blocks_raw[ubase + w]) * x;
+                    gsum += pf_fp8_e4m3_to_float_fused_e4m3(blocks_raw[gbase + w]) * x;
+                    usum += pf_fp8_e4m3_to_float_fused_e4m3(blocks_raw[ubase + w]) * x;
                 }
                 gate_sums[cc] += gscale * gsum;
                 up_sums[cc]   += uscale * usum;
@@ -296,7 +296,7 @@ kernel void fused_gate_up_swiglu_gemm_fp8_e4m3(
             float gs = simd_sum(gate_sums[cc]);
             float us = simd_sum(up_sums[cc]);
             if (lane == 0u) {
-                outputs[(col_base + cc) * n_ffn_rows + row] = pf_silu(gs) * us;
+                outputs[(col_base + cc) * n_ffn_rows + row] = pf_silu_e4m3(gs) * us;
             }
         }
     }
@@ -319,7 +319,7 @@ pub const MSL_GEMV_FP8_E4M3_PF_V1: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
-static inline float pf_fp8_e4m3_to_float(uchar b) {
+static inline float pf_fp8_e4m3_to_float_gemv(uchar b) {
     if (b == 0x7Fu || b == 0xFFu) return 0.0f;
     const uint sign = (uint(b) >> 7u) & 1u;
     const uint exp  = (uint(b) >> 3u) & 15u;
@@ -358,7 +358,7 @@ kernel void gemv_fp8_e4m3_pf(
         const uint inp_base = b * 32u;
         float bsum = 0.0f;
         for (uint w = 0u; w < 32u; ++w) {
-            bsum += pf_fp8_e4m3_to_float(blocks_raw[base_byte + w]) * input[inp_base + w];
+            bsum += pf_fp8_e4m3_to_float_gemv(blocks_raw[base_byte + w]) * input[inp_base + w];
         }
         local_sum += scale * bsum;
     }
@@ -380,7 +380,7 @@ pub const MSL_GEMM_FP8_E5M2_V1: &str = r#"
 using namespace metal;
 
 // FP8 E5M2 decode (bias=15, exp=31 → 0).
-static inline float pf_fp8_e5m2_to_float(uchar b) {
+static inline float pf_fp8_e5m2_to_float_gemm(uchar b) {
     const uint exp  = (uint(b) >> 2u) & 31u;
     const uint mant = uint(b) & 3u;
     if (exp == 31u) return 0.0f;
@@ -429,7 +429,7 @@ kernel void gemm_fp8_e5m2(
                 device const float* xbase = inputs + (col_base + cc) * k + inp_base;
                 float bsum = 0.0f;
                 for (uint w = 0u; w < 32u; ++w) {
-                    bsum += pf_fp8_e5m2_to_float(blocks_raw[base_byte + w]) * xbase[w];
+                    bsum += pf_fp8_e5m2_to_float_gemm(blocks_raw[base_byte + w]) * xbase[w];
                 }
                 col_sums[cc] += scale * bsum;
             }
@@ -453,7 +453,7 @@ pub const MSL_GEMM_FP8_E5M2_RESIDUAL_V1: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
-static inline float pf_fp8_e5m2_to_float(uchar b) {
+static inline float pf_fp8_e5m2_to_float_gemm_residual(uchar b) {
     const uint exp  = (uint(b) >> 2u) & 31u;
     const uint mant = uint(b) & 3u;
     if (exp == 31u) return 0.0f;
@@ -503,7 +503,7 @@ kernel void gemm_fp8_e5m2_residual(
                 device const float* xbase = inputs + (col_base + cc) * k + inp_base;
                 float bsum = 0.0f;
                 for (uint w = 0u; w < 32u; ++w) {
-                    bsum += pf_fp8_e5m2_to_float(blocks_raw[base_byte + w]) * xbase[w];
+                    bsum += pf_fp8_e5m2_to_float_gemm_residual(blocks_raw[base_byte + w]) * xbase[w];
                 }
                 col_sums[cc] += scale * bsum;
             }
@@ -530,7 +530,7 @@ pub const MSL_FUSED_GATE_UP_SWIGLU_GEMM_FP8_E5M2_V1: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
-static inline float pf_fp8_e5m2_to_float(uchar b) {
+static inline float pf_fp8_e5m2_to_float_fused_e5m2(uchar b) {
     const uint exp  = (uint(b) >> 2u) & 31u;
     const uint mant = uint(b) & 3u;
     if (exp == 31u) return 0.0f;
@@ -545,7 +545,7 @@ static inline float pf_fp8_e5m2_to_float(uchar b) {
     return sign ? -val : val;
 }
 
-static inline float pf_silu(float x) {
+static inline float pf_silu_e5m2(float x) {
     return x / (1.0f + exp(-x));
 }
 
@@ -593,8 +593,8 @@ kernel void fused_gate_up_swiglu_gemm_fp8_e5m2(
                 float usum = 0.0f;
                 for (uint w = 0u; w < 32u; ++w) {
                     const float x = xbase[w];
-                    gsum += pf_fp8_e5m2_to_float(blocks_raw[gbase + w]) * x;
-                    usum += pf_fp8_e5m2_to_float(blocks_raw[ubase + w]) * x;
+                    gsum += pf_fp8_e5m2_to_float_fused_e5m2(blocks_raw[gbase + w]) * x;
+                    usum += pf_fp8_e5m2_to_float_fused_e5m2(blocks_raw[ubase + w]) * x;
                 }
                 gate_sums[cc] += gscale * gsum;
                 up_sums[cc]   += uscale * usum;
@@ -605,7 +605,7 @@ kernel void fused_gate_up_swiglu_gemm_fp8_e5m2(
             float gs = simd_sum(gate_sums[cc]);
             float us = simd_sum(up_sums[cc]);
             if (lane == 0u) {
-                outputs[(col_base + cc) * n_ffn_rows + row] = pf_silu(gs) * us;
+                outputs[(col_base + cc) * n_ffn_rows + row] = pf_silu_e5m2(gs) * us;
             }
         }
     }
@@ -622,7 +622,7 @@ pub const MSL_GEMV_FP8_E5M2_PF_V1: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
-static inline float pf_fp8_e5m2_to_float(uchar b) {
+static inline float pf_fp8_e5m2_to_float_gemv(uchar b) {
     const uint exp  = (uint(b) >> 2u) & 31u;
     const uint mant = uint(b) & 3u;
     if (exp == 31u) return 0.0f;
@@ -661,7 +661,7 @@ kernel void gemv_fp8_e5m2_pf(
         const uint inp_base = b * 32u;
         float bsum = 0.0f;
         for (uint w = 0u; w < 32u; ++w) {
-            bsum += pf_fp8_e5m2_to_float(blocks_raw[base_byte + w]) * input[inp_base + w];
+            bsum += pf_fp8_e5m2_to_float_gemv(blocks_raw[base_byte + w]) * input[inp_base + w];
         }
         local_sum += scale * bsum;
     }

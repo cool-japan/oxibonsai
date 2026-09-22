@@ -35,32 +35,35 @@ pub fn gemv_q5k(
 ) -> KernelResult<()> {
     const QK_K: usize = 256;
 
-    if in_features == 0 || in_features % QK_K != 0 {
+    if in_features == 0 || !in_features.is_multiple_of(QK_K) {
         return Err(KernelError::NotBlockAligned {
             count: in_features,
             block_size: QK_K,
         });
     }
     if input.len() < in_features {
-        return Err(KernelError::DimensionMismatch {
-            expected: in_features,
-            got: input.len(),
-        });
+        return Err(KernelError::dimension_mismatch(
+            "input",
+            in_features,
+            input.len(),
+        ));
     }
     if output.len() < n_rows {
-        return Err(KernelError::BufferTooSmall {
-            needed: n_rows,
-            available: output.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "output",
+            n_rows,
+            output.len(),
+        ));
     }
 
     let blocks_per_row = in_features / QK_K;
     let expected_blocks = n_rows * blocks_per_row;
     if blocks.len() < expected_blocks {
-        return Err(KernelError::DimensionMismatch {
-            expected: expected_blocks,
-            got: blocks.len(),
-        });
+        return Err(KernelError::dimension_mismatch(
+            "blocks",
+            expected_blocks,
+            blocks.len(),
+        ));
     }
 
     // Row-parallel scalar GEMV: each output row is an independent
@@ -158,5 +161,64 @@ mod tests {
             gemv_q5k(&[block], &input, &mut output, 1, 256).is_err(),
             "should error when output buffer is too small"
         );
+    }
+
+    /// Named-error migration (K-02): the production entry points now name
+    /// which buffer was wrong.
+    #[test]
+    fn gemv_q5k_errors_name_the_offending_buffer() {
+        let block = make_q5k_block(1.0);
+        let short_input = vec![1.0f32; 100];
+        let mut output = vec![0.0f32; 1];
+        let err = gemv_q5k(&[block], &short_input, &mut output, 1, 256).unwrap_err();
+        assert_eq!(err.buffer_name(), Some("input"));
+
+        let input = vec![1.0f32; 256];
+        let mut tiny_output = vec![0.0f32; 0];
+        let err = gemv_q5k(&[block], &input, &mut tiny_output, 1, 256).unwrap_err();
+        assert_eq!(err.buffer_name(), Some("output"));
+
+        let mut output = vec![0.0f32; 2];
+        let err = gemv_q5k(&[block], &input, &mut output, 2, 256).unwrap_err();
+        assert_eq!(err.buffer_name(), Some("blocks"));
+    }
+
+    /// K-15 (a)/(b) apply to Q5_K too even without a dedicated fused
+    /// kernel: pin the shared dequantize-then-dot driver against the
+    /// ggml-exact reference decoder on non-uniform, distinct-per-element
+    /// data across several shapes.
+    #[test]
+    fn gemv_q5k_matches_reference_dequant_dot_nonuniform() {
+        for (n_rows, blocks_per_row) in [(1usize, 1usize), (3, 2), (5, 1), (2, 3)] {
+            let in_features = blocks_per_row * 256;
+            let raw: Vec<f32> = (0..n_rows * in_features)
+                .map(|i| {
+                    let x = i as f32;
+                    (x * 0.041).sin() * (1.0 + (i % 89) as f32 * 0.045) - 0.05
+                })
+                .collect();
+            let blocks = BlockQ5K::quantize(&raw).expect("quantize q5k");
+            let input: Vec<f32> = (0..in_features)
+                .map(|i| ((i as f32 * 0.027).cos()) * 1.8 - 0.15)
+                .collect();
+
+            let mut got = vec![0.0f32; n_rows];
+            gemv_q5k(&blocks, &input, &mut got, n_rows, in_features).expect("gemv_q5k ok");
+
+            for row in 0..n_rows {
+                let row_blocks = &blocks[row * blocks_per_row..(row + 1) * blocks_per_row];
+                let mut buf = vec![0.0f32; row_blocks.len() * 256];
+                BlockQ5K::dequant(row_blocks, &mut buf).expect("dequant ok");
+                let expected: f32 = buf.iter().zip(input.iter()).map(|(w, x)| w * x).sum();
+                let tol = 1e-4 * expected.abs().max(1.0);
+                assert!(
+                    (got[row] - expected).abs() <= tol,
+                    "n_rows={n_rows} blocks_per_row={blocks_per_row} row={row}: \
+                     got={}, expected={}",
+                    got[row],
+                    expected
+                );
+            }
+        }
     }
 }

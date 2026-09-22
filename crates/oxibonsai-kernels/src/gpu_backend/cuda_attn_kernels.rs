@@ -8,7 +8,8 @@
 //! | `fused_qk_rope`             | `(ceil(half_dim/64), nq+nkv, 1)`         | `(64,1,1)` | Rotary position embedding for Q and K           |
 //! | `fused_qk_norm_rope`        | `(nq+nkv, 1, 1)`                         | `(256,1,1)`| Combined RMSNorm + RoPE for Q and K             |
 //! | `fused_kv_store`            | `(ceil(head_dim/64), nkv, 1)`            | `(64,1,1)` | Store K (after RoPE) and V into FP16 KV cache   |
-//! | `batched_attn_scores_v2`    | `(n_q, ceil(seq_len/batch_stride), 1)`   | `(128,1,1)`| Batched dot-product attention scores            |
+//! | `batched_attn_scores_v2`    | `(n_q, ceil(seq_len/batch_stride), 1)`   | `(128,1,1)`| Batched dot-product attention scores (dynamic shared memory — see F3) |
+
 //! | `batched_softmax`           | `(n_q, 1, 1)`                            | `(256,1,1)`| Per-head numerically-stable softmax             |
 //! | `batched_attn_weighted_sum` | `(ceil(head_dim/64), n_q, 1)`            | `(64,1,1)` | Weighted sum of V vectors by softmax weights    |
 //!
@@ -16,6 +17,14 @@
 //!
 //! K and V are stored in FP16 (u16 on the Rust side) to halve VRAM usage.
 //! `fused_kv_store` writes FP16; the score and weighted-sum kernels read FP16.
+//!
+//! The layer base offset into that cache is an `unsigned long long` in all
+//! three kernels that take one (finding **F4**). It used to be an
+//! `unsigned int` that the Rust side had *already* truncated with `as u32`, so
+//! a cache above `2^32` elements aliased two layers onto the same addresses
+//! with no error. `CudaKvCache::layer_offset_elements` now returns `u64` and
+//! the kernels consume it at full width.
+
 //!
 //! # Weight layout
 //!
@@ -234,7 +243,7 @@ extern "C" __global__ void fused_kv_store(
     unsigned int nkv,
     unsigned int max_seq,
     const unsigned int* __restrict__ d_pos_seqlen,
-    unsigned int layer_offset
+    unsigned long long layer_offset
 ) {
     const unsigned int pos  = d_pos_seqlen[0];
     const unsigned int d    = blockIdx.x * blockDim.x + threadIdx.x;
@@ -242,9 +251,10 @@ extern "C" __global__ void fused_kv_store(
     if (d >= head_dim || head >= nkv) return;
 
     const unsigned long long src_off = (unsigned long long)head * head_dim + d;
-    const unsigned long long dst_off = (unsigned long long)layer_offset
+    const unsigned long long dst_off = layer_offset
                                      + ((unsigned long long)head * max_seq + pos) * head_dim
                                      + d;
+
 
     k_cache[dst_off] = float_to_fp16(k_data[src_off]);
     v_cache[dst_off] = float_to_fp16(v_data[src_off]);
@@ -258,8 +268,30 @@ extern "C" __global__ void fused_kv_store(
    Block: (128, 1, 1)
 
    Each CTA handles one Q-head and processes `batch_stride` positions.
-   The Q vector is loaded into shared memory once and reused for each position.
-   128 threads = head_dim, so every thread is active (no idle threads).
+   The Q vector is staged in shared memory once and reused for each position.
+
+   F3 — head_dim > 128.  This kernel used to declare `__shared__ float
+   shared_q[128]` and stage/multiply exactly one element per thread
+   (`if (tid < head_dim) ...`), which silently truncated the QK dot product to
+   `min(head_dim, 128)`.  Bonsai 2 27B has `head_dim = 256`
+   (`qwen35.attention.key_length`), so every score was computed from half the
+   vector — wrong numbers, no error.  Three coupled changes fix it:
+
+     (a) the Q staging area and the cross-warp partials both live in ONE
+         dynamically-sized shared block, laid out as
+         `[head_dim floats | (blockDim.x / 32) floats]`.  The launcher
+         (`cuda_full_layer/launchers.rs`) is the single place that sizes it,
+         via `cuda_device_negotiation::attn_scores_shared_bytes`;
+     (b) staging AND accumulation are strided loops over `head_dim`, so one
+         thread covers several dimensions when `head_dim > blockDim.x`;
+     (c) the cross-warp reduction sums `blockDim.x / 32` partials instead of
+         the hardcoded four.  Simply raising the block to 256 threads — the
+         "obvious" fix — would have written `warp_sums[4..7]` out of bounds
+         AND still dropped half the partials.
+
+   No cap is baked into the kernel: the reachable `head_dim` is whatever
+   `attn_scores_shared_bytes` will size, and the launcher rejects the rest
+   with a named error rather than corrupting shared memory.
    ========================================================================= */
 extern "C" __global__ void batched_attn_scores_v2(
     const float*          __restrict__ queries,
@@ -272,7 +304,7 @@ extern "C" __global__ void batched_attn_scores_v2(
     unsigned int max_seq,
     const unsigned int* __restrict__ d_pos_seqlen,
     float        inv_sqrt_hd,
-    unsigned int cache_layer_offset,
+    unsigned long long cache_layer_offset,
     unsigned int batch_stride
 ) {
     const unsigned int seq_len  = d_pos_seqlen[1];
@@ -283,49 +315,66 @@ extern "C" __global__ void batched_attn_scores_v2(
 
     const unsigned int kv_head  = q_head / heads_per_group;
     const unsigned int pos_start = batch_id * batch_stride;
+    const unsigned int n_warps   = blockDim.x >> 5u;
 
-    /* Load Q vector into shared memory — reused across all positions */
-    __shared__ float shared_q[128];
-    if (tid < head_dim) {
-        shared_q[tid] = queries[(unsigned long long)q_head * head_dim + tid];
+    /* One dynamic shared block, split by hand (F3a):
+         shared_q  : head_dim floats
+         warp_sums : n_warps floats                                        */
+    /* No __restrict__ on these two: they are derived from one allocation, and
+       promising the compiler they never alias would be a claim about the
+       layout rather than about the accesses. */
+    extern __shared__ float attn_smem[];
+    float* shared_q  = attn_smem;
+    float* warp_sums = attn_smem + head_dim;
+
+    /* Stage Q — strided, so head_dim may exceed blockDim.x (F3b). */
+    for (unsigned int i = tid; i < head_dim; i += blockDim.x) {
+        shared_q[i] = queries[(unsigned long long)q_head * head_dim + i];
     }
     __syncthreads();
+
+    const unsigned int warp_id = tid >> 5u;
+    const unsigned int lane    = tid & 31u;
 
     for (unsigned int pos_t = pos_start;
          pos_t < pos_start + batch_stride && pos_t < seq_len;
          pos_t++)
     {
         const unsigned short* __restrict__ key =
-            k_cache + (unsigned long long)cache_layer_offset
+            k_cache + cache_layer_offset
             + ((unsigned long long)kv_head * max_seq + pos_t) * head_dim;
 
+        /* Strided accumulation over the FULL head_dim (F3b). */
         float my_prod = 0.0f;
-        if (tid < head_dim) {
-            my_prod = shared_q[tid] * fast_fp16_to_float(key[tid]);
+        for (unsigned int i = tid; i < head_dim; i += blockDim.x) {
+            my_prod = fmaf(shared_q[i], fast_fp16_to_float(key[i]), my_prod);
         }
 
-        /* Warp-level reduction using __shfl_down_sync */
+        /* Warp-level reduction using __shfl_down_sync.  Every thread of the
+           block reaches this point (the only early return is uniform over the
+           block), so the full 0xffffffff mask is correct. */
         unsigned int mask = 0xffffffffu;
         for (int offset = 16; offset > 0; offset >>= 1) {
             my_prod += __shfl_down_sync(mask, my_prod, offset);
         }
 
-        /* Cross-warp reduction: 128 threads = 4 warps */
-        __shared__ float warp_sums[4];
-        const unsigned int warp_id = tid >> 5u;
-        const unsigned int lane    = tid & 31u;
+        /* Cross-warp reduction over blockDim.x/32 warps (F3c). */
         if (lane == 0u) {
             warp_sums[warp_id] = my_prod;
         }
         __syncthreads();
 
         if (tid == 0u) {
-            float total = warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
+            float total = 0.0f;
+            for (unsigned int w = 0u; w < n_warps; ++w) {
+                total += warp_sums[w];
+            }
             all_scores[(unsigned long long)q_head * max_seq + pos_t] = total * inv_sqrt_hd;
         }
         __syncthreads();
     }
 }
+
 
 /* =========================================================================
    Kernel 6 — batched_softmax
@@ -416,7 +465,7 @@ extern "C" __global__ void batched_attn_weighted_sum(
     unsigned int heads_per_group,
     unsigned int max_seq,
     const unsigned int* __restrict__ d_pos_seqlen,
-    unsigned int cache_layer_offset
+    unsigned long long cache_layer_offset
 ) {
     const unsigned int seq_len = d_pos_seqlen[1];
     const unsigned int d      = blockIdx.x * blockDim.x + threadIdx.x;
@@ -427,8 +476,9 @@ extern "C" __global__ void batched_attn_weighted_sum(
     const float* __restrict__ scores =
         all_scores + (unsigned long long)q_head * max_seq;
     const unsigned short* __restrict__ values =
-        v_cache + (unsigned long long)cache_layer_offset
+        v_cache + cache_layer_offset
         + (unsigned long long)kv_head * max_seq * head_dim;
+
 
     float acc = 0.0f;
     for (unsigned int t = 0u; t < seq_len; t++) {

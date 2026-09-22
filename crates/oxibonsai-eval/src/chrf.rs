@@ -7,22 +7,43 @@
 //! All iteration is over Unicode `char`s — byte slicing is *not* used, so
 //! multi-byte UTF-8 sequences are handled correctly.
 //!
+//! ## Effective order
+//!
+//! An n-gram order for which *either* side has no n-grams at all — the
+//! candidate is shorter than `n`, or the reference is shorter than `n` — is
+//! not scoreable and is skipped entirely rather than counted as an F=0.0
+//! contribution. This is "effective order" chrF++ as sacreBLEU implements
+//! it for sentence-level scoring: an order counts only when `n_hyp > 0 AND
+//! n_ref > 0`. It is why `chrf("a", "a")` is `1.0` and not `0.1667`: the
+//! default order is 6, but a 1-character candidate/reference pair only has
+//! n-grams for `n=1`, so only that one order enters the average
+//! (RAG-EVAL-IMG-05). It is also why gating on the reference alone is
+//! wrong: `chrf("a", "abcdef")` under a reference-only gate is `0.033333`
+//! (orders 2..=6 stay "effective" because the 6-character reference reaches
+//! them, even though the 1-character candidate has zero n-grams there, so
+//! five of the six orders are forced to a hard `F=0.0`); gating on both
+//! sides makes it `0.200000`, sacreBLEU's computed value for this pair (see
+//! `tests/chrf_effective_order_tests.rs` for how that value was checked —
+//! this environment has no network access to run `sacrebleu` itself),
+//! because only the one order both sides actually reach is counted.
+//!
 //! ## Final score
 //!
-//! For each order `n ∈ 1..=N`:
+//! For each *effective* order `n` (both candidate and reference have ≥1
+//! n-gram of length `n`), compute that order's own F_β from its
+//! precision/recall over character (or word) n-gram multisets:
 //! ```text
 //! p_n = |cand ∩ ref| / |cand|
 //! r_n = |cand ∩ ref| / |ref|
+//! F_n = (1 + β²) · p_n · r_n / (β² · p_n + r_n)
 //! ```
-//! (multiset intersection over character / word n-grams).
-//!
-//! Averages `P = (1/N) Σ p_n`, `R = (1/N) Σ r_n`, combined via:
-//! ```text
-//! F_β = (1 + β²) · P · R / (β² · P + R)
-//! ```
-//!
-//! For chrF++, character and word contributions are averaged with equal weight
-//! over their respective orders, following the reference implementation.
+//! then average the **F_n values themselves** over the `N_eff` effective
+//! orders (character orders and, for chrF++, word orders together, equal
+//! weight per order) to get the final score. This differs slightly (order
+//! 1e-3 in the cases measured so far, not the ~1e-6 once claimed here) from
+//! first averaging `p_n`/`r_n` separately and combining once at the end,
+//! since F is a nonlinear function of (p, r); both shapes appear in the
+//! literature and the difference is not worth gating on.
 //!
 //! Empty candidate *and* empty reference → score = 1.0.
 //! Empty candidate *or* empty reference (not both) → score = 0.0.
@@ -91,15 +112,18 @@ pub fn chrf_with(
     let cand_words: Vec<&str> = candidate.split_whitespace().collect();
     let ref_words: Vec<&str> = reference.split_whitespace().collect();
 
-    // Collect per-order F-beta into a single averaged score.
+    // Collect per-order F-beta into a single averaged score. An order for
+    // which either side has no n-grams (candidate shorter than `n`, or
+    // reference shorter than `n`) is skipped outright (effective order —
+    // see the module doc) instead of forcing a 0.0 into the average, which
+    // is what made `chrf("a", "a")` score 0.1667 instead of 1.0
+    // (RAG-EVAL-IMG-05).
     let mut f_values: Vec<f32> = Vec::new();
 
     // Character orders
     for n in 1..=order {
         if let Some(f) = order_f_beta_chars(&cand_chars, &ref_chars, n, beta) {
             f_values.push(f);
-        } else {
-            f_values.push(0.0);
         }
     }
 
@@ -108,8 +132,6 @@ pub fn chrf_with(
         for n in 1..=word_order {
             if let Some(f) = order_f_beta_words(&cand_words, &ref_words, n, beta) {
                 f_values.push(f);
-            } else {
-                f_values.push(0.0);
             }
         }
     }
@@ -129,8 +151,15 @@ pub fn chrf_with(
     }
 }
 
+/// F-beta for one character n-gram order, or `None` if *either* side has no
+/// n-grams of this order (the order is not "effective" — see the module
+/// doc). sacreBLEU's effective order counts an order only when both the
+/// candidate and the reference have at least one n-gram of length `n`
+/// (`n_hyp > 0 AND n_ref > 0`); gating on the reference alone let a
+/// too-short candidate be scored as a hard `F=0.0` at every higher order
+/// instead of being excluded from the average (see the module doc).
 fn order_f_beta_chars(cand: &[char], reference: &[char], n: usize, beta: f32) -> Option<f32> {
-    if cand.len() < n || reference.len() < n {
+    if reference.len() < n || cand.len() < n {
         return None;
     }
     let cand_counts = ngram_counts_char(cand, n);
@@ -138,8 +167,10 @@ fn order_f_beta_chars(cand: &[char], reference: &[char], n: usize, beta: f32) ->
     Some(f_beta_from_counts(&cand_counts, &ref_counts, beta))
 }
 
+/// Word n-gram analogue of [`order_f_beta_chars`] (used by chrF++'s word
+/// orders); same both-sides effective-order rule.
 fn order_f_beta_words(cand: &[&str], reference: &[&str], n: usize, beta: f32) -> Option<f32> {
-    if cand.len() < n || reference.len() < n {
+    if reference.len() < n || cand.len() < n {
         return None;
     }
     let cand_counts = ngram_counts_words(cand, n);

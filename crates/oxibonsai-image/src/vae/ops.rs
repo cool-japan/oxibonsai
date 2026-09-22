@@ -61,7 +61,7 @@ pub fn bn_denorm(
 /// # Errors
 /// [`VaeError::Shape`] if `C` is not a multiple of 4 or the length is wrong.
 pub fn unpatchify(x: &[f32], c: usize, h: usize, w: usize) -> VaeResult<UnpatchOut> {
-    if c % 4 != 0 {
+    if !c.is_multiple_of(4) {
         return Err(VaeError::Shape(format!(
             "unpatchify channels {c} not a multiple of 4"
         )));

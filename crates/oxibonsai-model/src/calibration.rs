@@ -12,6 +12,15 @@
 //! - ACIQ: Analytical Clipping for Integer Quantization (Bell et al. 2019)
 //!   optimal_clip = 2.83 * std_dev for normal distributions
 //! - MSE: Mean squared error minimization (approximated via grid search)
+//!
+//! ## Reachability
+//!
+//! As of this writing, nothing in the CLI or the export/quantize pipeline
+//! (`export.rs`, `quantize.rs`) constructs a [`CalibrationDb`] or reads its
+//! scales — there is no `--calib <db>` (or equivalent) entry point yet that
+//! would let a measured calibration pass influence a real quantization run.
+//! This module is a tested, documented primitive for that future work, not
+//! a wired feature.
 
 use std::collections::HashMap;
 
@@ -454,32 +463,62 @@ fn lcg_f32(state: &mut u64) -> f32 {
     ((*state >> 32) as f32) / (u32::MAX as f32 + 1.0) * 2.0 - 1.0
 }
 
-/// Simulate a calibration pass (for testing without a real model).
+/// Synthetic calibration-data generators for tests — **not** real
+/// measurements.
 ///
-/// Generates synthetic activation patterns for each layer using a seeded LCG.
-/// Each layer gets `samples_per_layer` activation values drawn from [-1, 1],
-/// scaled by a layer-specific amplitude to simulate natural inter-layer variation.
-pub fn simulate_calibration(
-    db: &mut CalibrationDb,
-    layer_names: &[&str],
-    samples_per_layer: usize,
-    seed: u64,
-) {
-    let mut state = seed;
+/// Everything in this module produces fabricated activation statistics via
+/// a seeded LCG, never data measured from a real model. It is kept under
+/// `calibration::testing` (a `#[doc(hidden)]` alias also resolves the
+/// legacy `calibration::simulate_calibration` path) rather than re-exported
+/// from the crate root alongside the real calibration API, precisely so it
+/// cannot be mistaken for one.
+pub mod testing {
+    use super::{lcg_f32, CalibrationDb};
 
-    for (layer_idx, &layer_name) in layer_names.iter().enumerate() {
-        // Layer-specific amplitude to mimic real network activation diversity.
-        let amplitude = 1.0 + layer_idx as f32 * 0.5;
-        let mut activations = Vec::with_capacity(samples_per_layer);
+    /// Simulate a calibration pass (for testing without a real model).
+    ///
+    /// Generates synthetic activation patterns for each layer using a seeded LCG.
+    /// Each layer gets `samples_per_layer` activation values drawn from [-1, 1],
+    /// scaled by a layer-specific amplitude to simulate natural inter-layer variation.
+    ///
+    /// **This produces entirely fabricated data**, not statistics measured from
+    /// any real model. It exists so calibration-pipeline code (this module's
+    /// own tests, and the integration tests under
+    /// `crates/oxibonsai-model/tests/`) can be exercised without a real model
+    /// and real activations. A `CalibrationDb` populated this way must
+    /// never be used to quantize or ship a real model; [`validate_calibration`][super::validate_calibration]
+    /// cannot distinguish synthetic statistics from measured ones, so that
+    /// check is the caller's responsibility.
+    pub fn simulate_calibration(
+        db: &mut CalibrationDb,
+        layer_names: &[&str],
+        samples_per_layer: usize,
+        seed: u64,
+    ) {
+        let mut state = seed;
 
-        for _ in 0..samples_per_layer {
-            let v = lcg_f32(&mut state) * amplitude;
-            activations.push(v);
+        for (layer_idx, &layer_name) in layer_names.iter().enumerate() {
+            // Layer-specific amplitude to mimic real network activation diversity.
+            let amplitude = 1.0 + layer_idx as f32 * 0.5;
+            let mut activations = Vec::with_capacity(samples_per_layer);
+
+            for _ in 0..samples_per_layer {
+                let v = lcg_f32(&mut state) * amplitude;
+                activations.push(v);
+            }
+
+            db.record(layer_name, &activations);
         }
-
-        db.record(layer_name, &activations);
     }
 }
+
+/// Legacy path for [`testing::simulate_calibration`], kept resolvable for
+/// existing callers (this module's own tests and the integration tests
+/// under `crates/oxibonsai-model/tests/`). `#[doc(hidden)]` and not
+/// re-exported from the crate root — see [`testing`]'s module docs for why
+/// this is a synthetic-data generator, not part of the real calibration API.
+#[doc(hidden)]
+pub use testing::simulate_calibration;
 
 // ─── Validation ───────────────────────────────────────────────────────────────
 

@@ -8,7 +8,8 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use crate::error::{BonsaiError, BonsaiResult};
 use crate::gguf::compat::{build_compat_report, check_gguf_header, CompatError, GgufCompatReport};
 use crate::gguf::header::GgufHeader;
-use crate::gguf::metadata::MetadataStore;
+use crate::gguf::metadata::{MetadataStore, MetadataValue};
+use crate::gguf::quant_resolve::AMBIGUOUS_TYPE_ID;
 use crate::gguf::tensor_info::TensorStore;
 
 /// Default alignment for tensor data in GGUF files (32 bytes).
@@ -23,9 +24,13 @@ const HEADER_LEN: usize = 24;
 /// in `tensor_info.rs`.
 const PROBE_MAX_STRING_LEN: u64 = 256 * 1024 * 1024;
 
-/// Maximum tensor dimensions accepted while tolerantly probing, matching
-/// the limit enforced by the strict tensor-info parser in `tensor_info.rs`.
-const PROBE_MAX_TENSOR_DIMS: u32 = 1024;
+/// Maximum tensor dimensions accepted while tolerantly probing.
+///
+/// `GGML_MAX_DIMS` is 4 and llama.cpp rejects `n_dims > 4`; both strict
+/// parsers (`tensor_info.rs::MAX_TENSOR_DIMS`, `streaming.rs`) already cap
+/// at 4 (core-gguf-16). This tolerant probe path was left at a stale 1024
+/// until this fix (wave-1 addendum #3).
+const PROBE_MAX_TENSOR_DIMS: u32 = 4;
 
 /// Translate a [`CompatError`] (raised by the shared forward-compat header
 /// checker) into the equivalent [`BonsaiError`] variant already used
@@ -64,10 +69,16 @@ pub struct GgufFile<'a> {
     pub data: &'a [u8],
     /// Forward-compatibility diagnostic report computed during parsing (see
     /// [`crate::gguf::compat`]). For a successfully-parsed file this always
-    /// has `is_loadable = true` and empty `unknown_quant_types` (any unknown
-    /// quant type would have hard-failed [`GgufFile::parse`] before this
-    /// point) — use [`GgufFile::probe_compat`] to inspect a file that
-    /// `parse` would reject.
+    /// has `is_loadable = true` and empty `unknown_quant_types`: every
+    /// tensor's quantization type already passed `TensorStore::parse`
+    /// (which hard-fails on the first unrecognised type id), and
+    /// [`ExtendedQuantType::from_u32`](crate::gguf::compat::ExtendedQuantType::from_u32)
+    /// is derived from the exact same
+    /// [`GgufTensorType::from_id`](crate::gguf::types::GgufTensorType::from_id)
+    /// table `TensorStore::parse` uses (core-gguf-05) — so the two can no
+    /// longer disagree about which ids this build recognises. Use
+    /// [`GgufFile::probe_compat`] (or [`GgufFile::diagnose`]) to inspect a
+    /// file that `parse` would reject.
     pub compat: GgufCompatReport,
 }
 
@@ -105,12 +116,49 @@ impl<'a> GgufFile<'a> {
         // to DEFAULT_ALIGNMENT). Rejects a malicious/malformed alignment
         // (zero or not a power of two) instead of silently mis-locating the
         // tensor data section.
-        let alignment = metadata
-            .get("general.alignment")
-            .and_then(|v| v.as_u32())
-            .unwrap_or(DEFAULT_ALIGNMENT as u32) as usize;
+        //
+        // `general.alignment` must be spec-typed `UINT32` — llama.cpp itself
+        // rejects any other GGUF value type for this key
+        // (`ggml/src/gguf.cpp:613-618`) — so this reads the raw
+        // `MetadataValue` and matches only `Uint32` directly, rather than
+        // `MetadataValue::as_u32()` (which also *widens* `Uint64`/`Int32`/
+        // the small-integer types). Before this, a spec-invalid file
+        // spelling the key as `Uint64` parsed here with a silently
+        // different `data_offset` than
+        // [`GgufStreamParser`](crate::gguf::streaming::GgufStreamParser)
+        // would compute for the identical bytes (core-gguf-15) — the
+        // streaming parser already only accepts `Uint32` here, so this
+        // brings the strict parser in line with it instead of the other
+        // way around.
+        let alignment = match metadata.get("general.alignment") {
+            None => DEFAULT_ALIGNMENT as u32,
+            Some(MetadataValue::Uint32(v)) => *v,
+            Some(other) => {
+                return Err(BonsaiError::InvalidMetadata {
+                    key: "general.alignment".to_string(),
+                    reason: format!(
+                        "general.alignment must be stored as UINT32 per the GGUF spec; found {}",
+                        other.type_name()
+                    ),
+                });
+            }
+        } as usize;
 
         let data_offset = align_offset(offset, alignment)?;
+
+        // 4b. Validate the tensor table against the data region
+        // (core-gguf-03 / sec-13): sorted-by-offset tensors must start at
+        // 0, land on `alignment`-aligned boundaries, and each end exactly
+        // where `GGML_PAD(size, alignment)` says the next one begins — the
+        // same invariant llama.cpp enforces (`ggml/src/gguf.cpp:780-793`)
+        // and the cheapest available detector for a file whose declared
+        // group size silently disagrees with its actual byte layout.
+        validate_tensor_layout(
+            &tensors,
+            alignment as u64,
+            data_offset as u64,
+            data.len() as u64,
+        )?;
 
         // 5. Build a compat-report for logging/diagnostics. Every tensor's
         // quantization type is already known-valid at this point (the
@@ -122,7 +170,7 @@ impl<'a> GgufFile<'a> {
         // relaxed to accept versions beyond {2, 3}.
         let type_ids: Vec<u32> = tensors
             .iter()
-            .map(|(_, info)| info.tensor_type as u32)
+            .map(|(_, info)| info.tensor_type.wire_id())
             .collect();
         let compat = build_compat_report(
             header.version,
@@ -222,6 +270,70 @@ impl<'a> GgufFile<'a> {
         // fit in `usize` here.
         Ok(&self.data[start as usize..end as usize])
     }
+
+    /// Diagnose `data` as a GGUF file, degrading gracefully instead of
+    /// returning a bare parse error.
+    ///
+    /// Tries the strict [`Self::parse`] first. If that fails — e.g. because
+    /// `data` uses a quantization type this build's *parser* does not
+    /// recognise at all, an unsupported format version, or a malformed
+    /// tensor layout — falls back to the tolerant [`Self::probe_compat`],
+    /// which succeeds on far more inputs and reports *why* the file cannot
+    /// be loaded (unsupported version, N unrecognised quant types, ...)
+    /// instead of nothing.
+    ///
+    /// This is the "more valuable half" of core-gguf-05: previously nothing
+    /// in the codebase called `probe_compat` at all, so `oxibonsai info` /
+    /// `oxibonsai validate` on a file `parse` rejects died with an opaque
+    /// [`BonsaiError`] instead of the diagnostic report that already
+    /// existed. Intended as the fallback path for exactly that kind of
+    /// tooling; see [`GgufDiagnosis`] for the two possible outcomes.
+    ///
+    /// # Errors
+    /// Only when *both* the strict and the tolerant path fail — i.e. `data`
+    /// is not recoverably a GGUF file at all (bad magic, truncated header,
+    /// or malformed metadata neither parser can make sense of). Returns the
+    /// strict [`Self::parse`] error in that case.
+    pub fn diagnose(data: &'a [u8]) -> BonsaiResult<GgufDiagnosis<'a>> {
+        match Self::parse(data) {
+            Ok(file) => Ok(GgufDiagnosis::Parsed(file)),
+            Err(parse_err) => match Self::probe_compat(data) {
+                Ok(report) => Ok(GgufDiagnosis::Degraded(report)),
+                Err(_probe_err) => Err(parse_err),
+            },
+        }
+    }
+}
+
+/// Outcome of [`GgufFile::diagnose`].
+#[derive(Debug)]
+pub enum GgufDiagnosis<'a> {
+    /// Strict parsing succeeded: every [`GgufFile`] field (config
+    /// extraction, tensor loading, ...) is available.
+    Parsed(GgufFile<'a>),
+    /// Strict parsing failed; this is the best-effort tolerant scan
+    /// instead, describing *why* the file cannot be loaded (unsupported
+    /// version, unrecognised quant types, ...) rather than nothing.
+    Degraded(GgufCompatReport),
+}
+
+impl<'a> GgufDiagnosis<'a> {
+    /// The fully-parsed file, if strict parsing succeeded.
+    pub fn parsed(&self) -> Option<&GgufFile<'a>> {
+        match self {
+            Self::Parsed(file) => Some(file),
+            Self::Degraded(_) => None,
+        }
+    }
+
+    /// The compatibility report either way: the one embedded in a
+    /// successfully-parsed file, or the tolerant fallback report.
+    pub fn compat(&self) -> &GgufCompatReport {
+        match self {
+            Self::Parsed(file) => &file.compat,
+            Self::Degraded(report) => report,
+        }
+    }
 }
 
 /// Align an offset to the given alignment boundary.
@@ -240,6 +352,159 @@ fn align_offset(offset: usize, alignment: usize) -> BonsaiResult<usize> {
         });
     }
     Ok((offset + alignment - 1) & !(alignment - 1))
+}
+
+/// Validate the tensor table against the data region (core-gguf-03 /
+/// sec-13).
+///
+/// `GgufFile::parse` previously computed `data_offset` and stopped: nothing
+/// checked that tensor byte ranges covered the data section exactly, did
+/// not overlap, or landed on `alignment`-aligned boundaries —
+/// `tensor_data()` only bounds-checks one tensor, lazily, on first access.
+/// Walking the tensors in offset order and replaying llama.cpp's own
+/// invariant (`ggml/src/gguf.cpp:780-793`) is both the cheapest available
+/// check and the one with a real discriminator: exact equality against the
+/// *padded* size catches a file whose declared group size is wrong by less
+/// than one padding unit, which the weaker `offset[i] + size(i) <=
+/// offset[i+1]` inequality would silently accept.
+///
+/// Checks, per tensor `i` in ascending-offset order:
+/// 1. `offset[0] == 0`.
+/// 2. `offset[i] % alignment == 0`.
+/// 3. `offset[i] + GGML_PAD(size(i), alignment) == offset[i+1]` — exact
+///    equality, with one documented exception (see below).
+/// 4. `ne0 % block_size == 0` — re-checked here as a cheap defence-in-depth
+///    guard; `TensorStore::parse` already enforces this via
+///    `TensorInfo::validate_row_blocking`, so this can only fire for a
+///    `TensorStore` assembled by some future path other than `parse`.
+/// 5. For the last tensor: `offset[last] + GGML_PAD(size(last), alignment)
+///    <= file_len - data_offset` — skipped when `file_len <= data_offset`
+///    (the caller supplied no tensor-payload bytes at all, e.g. a
+///    deliberate metadata-only/bounded-prefix read of just the header and
+///    tensor table — the usage sec-17's fix contemplates for
+///    `oxibonsai-model`'s memory-estimation helpers). Once any payload
+///    bytes are present the check runs normally.
+///
+/// # The wire-id-42 exception
+///
+/// A tensor whose [`GgufTensorType::wire_id`](crate::gguf::types::GgufTensorType::wire_id)
+/// is [`AMBIGUOUS_TYPE_ID`] (42) has an `info.tensor_type` that is only
+/// [`GgufTensorType::from_id`](crate::gguf::types::GgufTensorType::from_id)'s
+/// historical qs-first-group-128 *guess* — never the file's actual resolved
+/// geometry (see [`crate::gguf::tensor_info::TensorInfo::data_size`]'s own
+/// doc, and [`crate::gguf::quant_resolve`], which exists precisely because
+/// id 42 has three incompatible on-disk readings). For a genuine group-64
+/// file the guessed per-row size always *undershoots* the true size (a
+/// group-64 row needs two 2-byte scales per 128 elements against one for
+/// group-128, so the true size is always >= the guess), so check 3 uses the
+/// weaker `<=` for these tensors instead of rejecting a legitimately
+/// ambiguous file before [`crate::gguf::quant_resolve::resolve_type_42`]
+/// ever gets a chance to settle it. This is a defence-in-depth complement
+/// to the direct cast-site alignment guard in `tensor.rs`
+/// (core-gguf-07/sec-02), never a substitute for it: this function is not
+/// the only way a byte slice reaches a block-cast.
+fn validate_tensor_layout(
+    tensors: &TensorStore,
+    alignment: u64,
+    data_offset: u64,
+    file_len: u64,
+) -> BonsaiResult<()> {
+    let sorted = tensors.sorted_by_offset();
+    let Some(first) = sorted.first() else {
+        return Ok(());
+    };
+
+    // Pass 1 — per-tensor checks (1, 2, 4 above), independent of any other
+    // tensor. Run to completion (in offset order) before pass 2, so a
+    // tensor's own offset/blocking defect is always reported as such
+    // instead of being masked by an earlier tensor's *chain* mismatch that
+    // would otherwise be reached first in a single combined pass.
+    if first.offset != 0 {
+        return Err(BonsaiError::tensor_layout(
+            first.name.clone(),
+            format!(
+                "first tensor in the data section must start at offset 0, got {}",
+                first.offset
+            ),
+        ));
+    }
+    for info in &sorted {
+        if !info.offset.is_multiple_of(alignment) {
+            return Err(BonsaiError::tensor_layout(
+                info.name.clone(),
+                format!(
+                    "offset {} is not a multiple of general.alignment ({alignment})",
+                    info.offset
+                ),
+            ));
+        }
+        // Defence in depth: `TensorStore::parse` already enforces this via
+        // `validate_row_blocking`, so a `TensorStore` reaching this point
+        // via `parse` can never fail it — kept for a `TensorStore` built by
+        // any other path.
+        info.validate_row_blocking()?;
+    }
+
+    // Pass 2 — the offset chain and the data-section tail (3 and 5 above).
+    for (idx, info) in sorted.iter().enumerate() {
+        let padded = info.padded_extent(alignment).ok_or_else(|| {
+            BonsaiError::tensor_layout(
+                info.name.clone(),
+                "tensor byte extent overflows u64 once padded to general.alignment".to_string(),
+            )
+        })?;
+        let end = info.offset.checked_add(padded).ok_or_else(|| {
+            BonsaiError::tensor_layout(
+                info.name.clone(),
+                "offset + padded extent overflows u64".to_string(),
+            )
+        })?;
+
+        match sorted.get(idx + 1) {
+            Some(next) => {
+                let exact_required = info.tensor_type.wire_id() != AMBIGUOUS_TYPE_ID;
+                let ok = if exact_required {
+                    end == next.offset
+                } else {
+                    end <= next.offset
+                };
+                if !ok {
+                    return Err(BonsaiError::tensor_layout(
+                        info.name.clone(),
+                        format!(
+                            "tensor occupies [{}, {end}) but the next tensor '{}' starts at {} \
+                             (expected {})",
+                            info.offset,
+                            next.name,
+                            next.offset,
+                            if exact_required {
+                                "exact equality — a gap or overlap in the data section"
+                            } else {
+                                "end <= next start (ambiguous ggml id 42 tensor)"
+                            },
+                        ),
+                    ));
+                }
+            }
+            None => {
+                if file_len > data_offset {
+                    let available = file_len - data_offset;
+                    if end > available {
+                        return Err(BonsaiError::tensor_layout(
+                            info.name.clone(),
+                            format!(
+                                "tensor extends to byte {end} of the data section, but only \
+                                 {available} bytes are available ({file_len} total file bytes, \
+                                 data starts at {data_offset})"
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Read a little-endian `u64` field from `data` at `offset` without
@@ -261,6 +526,17 @@ fn read_u64_field(data: &[u8], offset: usize) -> u64 {
 /// Read a GGUF string `[u64 length][utf8 bytes]` from a cursor without
 /// validating the resulting quantization type — used by
 /// [`scan_tensor_type_ids`] to tolerantly probe tensor names.
+///
+/// Reads the string body via the one shared, already-hardened
+/// [`crate::gguf::tensor_info::read_string_body_chunked`] (core-gguf-20 /
+/// sec-10 / wave-2.5 integration addendum, item 5) in bounded 64 KiB
+/// pieces, instead of this file's own former independent copy
+/// (`read_gguf_string_chunked` / a private `STRING_READ_CHUNK`) that
+/// allocated `vec![0u8; len]` up front — bounded only by
+/// [`PROBE_MAX_STRING_LEN`] (256 MiB) — before confirming the reader
+/// actually had that much data left. `metadata.rs` and `tensor_info.rs`
+/// itself already call the same shared function; this was the one
+/// remaining independent copy DRY was meant to remove.
 fn probe_read_gguf_string(cursor: &mut std::io::Cursor<&[u8]>) -> BonsaiResult<String> {
     let len = cursor
         .read_u64::<LittleEndian>()
@@ -270,10 +546,10 @@ fn probe_read_gguf_string(cursor: &mut std::io::Cursor<&[u8]>) -> BonsaiResult<S
             offset: cursor.position(),
         });
     }
-    let mut buf = vec![0u8; len as usize];
-    std::io::Read::read_exact(cursor, &mut buf).map_err(BonsaiError::MmapError)?;
-    String::from_utf8(buf).map_err(|_| BonsaiError::InvalidString {
-        offset: cursor.position(),
+    crate::gguf::tensor_info::read_string_body_chunked(cursor, len).map_err(|_| {
+        BonsaiError::InvalidString {
+            offset: cursor.position(),
+        }
     })
 }
 
@@ -423,7 +699,8 @@ mod tests {
         let report = GgufFile::probe_compat(&data)
             .expect("probe_compat should tolerate unknown quant types");
         assert!(!report.is_loadable);
-        assert_eq!(report.unknown_quant_types, vec![9999]);
+        assert_eq!(report.unknown_quant_types.len(), 1);
+        assert!(report.unknown_quant_types.contains(&9999));
         assert!(!report.warnings.is_empty());
     }
 
@@ -446,5 +723,200 @@ mod tests {
     fn probe_compat_rejects_bad_magic_via_shared_checker() {
         let data = gguf_header_bytes(0xDEAD_BEEF, 3, 0, 0);
         assert!(GgufFile::probe_compat(&data).is_err());
+    }
+
+    // ── core-gguf-03 / sec-13: validate_tensor_layout via GgufFile::parse ──
+
+    fn tensor_info_bytes(name: &str, shape: &[u64], type_id: u32, offset: u64) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&(name.len() as u64).to_le_bytes());
+        b.extend_from_slice(name.as_bytes());
+        b.extend_from_slice(&(shape.len() as u32).to_le_bytes());
+        for &d in shape {
+            b.extend_from_slice(&d.to_le_bytes());
+        }
+        b.extend_from_slice(&type_id.to_le_bytes());
+        b.extend_from_slice(&offset.to_le_bytes());
+        b
+    }
+
+    /// Assemble a full GGUF byte buffer: header (no metadata) + the given
+    /// tensor-info entries + alignment padding + `tensor_data_len` zero
+    /// bytes of tensor data.
+    fn assemble_gguf(tensor_infos: &[Vec<u8>], tensor_data_len: usize) -> Vec<u8> {
+        let mut data = gguf_header_bytes(GGUF_MAGIC_TEST, 3, tensor_infos.len() as u64, 0);
+        for info in tensor_infos {
+            data.extend_from_slice(info);
+        }
+        while !data.len().is_multiple_of(32) {
+            data.push(0);
+        }
+        data.extend(vec![0u8; tensor_data_len]);
+        data
+    }
+
+    #[test]
+    fn parse_accepts_a_well_formed_two_tensor_layout() {
+        // "a": 8 F32 elements = 32 bytes (already 32-aligned). "b": 4 F32
+        // elements = 16 bytes, padded to 32. Total data section: 64 bytes.
+        let infos = vec![
+            tensor_info_bytes("a", &[8], 0, 0),
+            tensor_info_bytes("b", &[4], 0, 32),
+        ];
+        let data = assemble_gguf(&infos, 64);
+        GgufFile::parse(&data).expect("well-formed two-tensor layout must parse");
+    }
+
+    #[test]
+    fn parse_rejects_first_tensor_not_at_offset_zero() {
+        let infos = vec![tensor_info_bytes("a", &[8], 0, 32)];
+        let data = assemble_gguf(&infos, 64);
+        match GgufFile::parse(&data) {
+            Err(BonsaiError::TensorLayout { name, reason }) => {
+                assert_eq!(name, "a");
+                assert!(reason.contains('0'), "reason: {reason}");
+            }
+            other => panic!("expected TensorLayout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_a_gap_between_tensors() {
+        // "a" needs exactly 32 bytes (8 F32 elements); declaring "b" at 64
+        // instead of 32 leaves an undeclared 32-byte gap.
+        let infos = vec![
+            tensor_info_bytes("a", &[8], 0, 0),
+            tensor_info_bytes("b", &[4], 0, 64),
+        ];
+        let data = assemble_gguf(&infos, 96);
+        match GgufFile::parse(&data) {
+            Err(BonsaiError::TensorLayout { name, reason }) => {
+                assert_eq!(name, "a");
+                assert!(reason.contains("gap or overlap"), "reason: {reason}");
+            }
+            other => panic!("expected TensorLayout for a gap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_overlapping_tensors() {
+        // "a" needs 64 bytes (16 F32 elements, already 32-aligned);
+        // declaring "b" at the alignment-valid offset 32 places it inside
+        // "a"'s [0, 64) span — an alignment-respecting overlap, so this
+        // exercises the offset-chain check specifically, not check (iv).
+        let infos = vec![
+            tensor_info_bytes("a", &[16], 0, 0),
+            tensor_info_bytes("b", &[4], 0, 32),
+        ];
+        let data = assemble_gguf(&infos, 64);
+        match GgufFile::parse(&data) {
+            Err(BonsaiError::TensorLayout { name, reason }) => {
+                assert_eq!(name, "a");
+                assert!(reason.contains("gap or overlap"), "reason: {reason}");
+            }
+            other => panic!("expected TensorLayout for an overlap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_an_offset_not_a_multiple_of_alignment() {
+        let infos = vec![
+            tensor_info_bytes("a", &[8], 0, 0),
+            tensor_info_bytes("b", &[4], 0, 17), // not a multiple of 32
+        ];
+        let data = assemble_gguf(&infos, 64);
+        match GgufFile::parse(&data) {
+            Err(BonsaiError::TensorLayout { name, reason }) => {
+                assert_eq!(name, "b");
+                assert!(reason.contains("alignment"), "reason: {reason}");
+            }
+            other => panic!("expected TensorLayout for a misaligned offset, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_the_last_tensor_exceeding_the_file_length() {
+        let infos = vec![tensor_info_bytes("a", &[8], 0, 0)];
+        // "a" needs 32 bytes but only 16 are actually supplied.
+        let data = assemble_gguf(&infos, 16);
+        match GgufFile::parse(&data) {
+            Err(BonsaiError::TensorLayout { name, reason }) => {
+                assert_eq!(name, "a");
+                assert!(reason.contains("available"), "reason: {reason}");
+            }
+            other => panic!("expected TensorLayout for a truncated data section, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_accepts_a_metadata_only_read_with_no_tensor_payload_bytes() {
+        // Exactly the header + tensor-info + alignment padding, and not one
+        // byte more — a deliberate bounded-prefix / "just the structure"
+        // read (sec-17's contemplated usage). Check (iii) must not reject
+        // this: there is no payload to bounds-check against.
+        let infos = vec![tensor_info_bytes("a", &[8], 0, 0)];
+        let data = assemble_gguf(&infos, 0);
+        GgufFile::parse(&data).expect("a metadata-only read must still parse");
+    }
+
+    /// The one documented exception: a wire-id-42 tensor's `data_size()` is
+    /// only `GgufTensorType::from_id`'s historical qs-first-g128 *guess*.
+    /// For a genuine group-64 file the guess always undershoots the true
+    /// size (two 2-byte scales per 128 elements vs. one), so a real file
+    /// like this must still parse even though the guessed padded extent
+    /// (544) does not exactly equal the next tensor's true offset (576).
+    #[test]
+    fn parse_tolerates_the_wire_id_42_size_guess_undershoot() {
+        let infos = vec![
+            tensor_info_bytes("a", &[128, 16], 42, 0),
+            tensor_info_bytes("b", &[1], 0, 576),
+        ];
+        let data = assemble_gguf(&infos, 608);
+        let file = GgufFile::parse(&data)
+            .expect("a genuine group-64 id-42 tensor must not be rejected by the g128 guess");
+        assert_eq!(
+            file.tensors.require("a").expect("present").tensor_type,
+            crate::gguf::types::GgufTensorType::TQ2_0_g128,
+            "the guessed type for id 42 is always the legacy qs-first g128 reading"
+        );
+    }
+
+    /// Without the wire-id-42 relaxation, the same bytes would fail exact
+    /// equality (544 != 576) — pin the fixture's numbers down directly so a
+    /// future change to either formula cannot silently make this test
+    /// vacuous.
+    #[test]
+    fn wire_id_42_fixture_actually_exercises_the_undershoot() {
+        use crate::gguf::tensor_info::{padded_size, row_size_bytes};
+        use crate::gguf::types::GgufTensorType;
+
+        let guessed = row_size_bytes(GgufTensorType::TQ2_0_g128, &[128, 16]);
+        let guessed_padded = padded_size(guessed, 32).expect("valid alignment");
+        assert_eq!(guessed_padded, 544);
+        assert_ne!(
+            guessed_padded, 576,
+            "fixture must actually diverge from the true group-64 offset"
+        );
+    }
+
+    // ── core-gguf-05: wire_id() cast in the compat type-id collection ──────
+
+    /// `type_ids` collection in `parse()` must go through `wire_id()`, not
+    /// a raw `as u32` cast — otherwise the `Q2_0G64`/`Q2_0G128DFirst`
+    /// sentinel discriminants (`0x4000_002A`/`0x4001_002A`) would leak into
+    /// the compat report instead of the wire id 42 they both serialise as.
+    /// Every real tensor `TensorStore::parse` produces uses
+    /// `GgufTensorType::from_id`, which never returns those two sentinel
+    /// variants (only `from_id_marked` can) — so this test instead pins the
+    /// invariant directly: a successfully-`parse`d file's compat report
+    /// must be `is_loadable` with zero unknown quant types, which would not
+    /// hold if the sentinel value ever leaked into `type_ids`.
+    #[test]
+    fn parse_compat_report_never_leaks_a_sentinel_discriminant() {
+        let infos = vec![tensor_info_bytes("a", &[128], 42, 0)];
+        let data = assemble_gguf(&infos, 64);
+        let file = GgufFile::parse(&data).expect("parse");
+        assert!(file.compat.is_loadable);
+        assert!(file.compat.unknown_quant_types.is_empty());
     }
 }

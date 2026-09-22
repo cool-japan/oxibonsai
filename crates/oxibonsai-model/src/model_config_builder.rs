@@ -32,7 +32,7 @@
 //! assert_eq!(config.hidden_size, 512);
 //! ```
 
-use oxibonsai_core::config::Qwen3Config;
+use oxibonsai_core::config::{Qwen3Config, RopeScaling};
 
 // ─── ConfigError ─────────────────────────────────────────────────────────────
 
@@ -80,6 +80,8 @@ pub struct ModelConfigBuilder {
     rms_norm_eps: Option<f32>,
     architecture: Option<String>,
     model_name: Option<String>,
+    head_dim: Option<usize>,
+    sliding_window: Option<usize>,
 }
 
 impl ModelConfigBuilder {
@@ -156,25 +158,66 @@ impl ModelConfigBuilder {
         self
     }
 
+    /// Explicitly set `head_dim`, independent of `hidden_size /
+    /// num_attention_heads` (M-24).
+    ///
+    /// Most architectures derive `head_dim` from `hidden_size /
+    /// num_attention_heads`, and that remains the default when this setter
+    /// is not called. Some architectures cannot be expressed that way —
+    /// e.g. Bonsai 2 (27B): `hidden_size = 5120`, `num_attention_heads =
+    /// 24`, `head_dim = 256`, and `5120 / 24` is not even an integer. Call
+    /// this to override the derived value; when set, [`Self::build`] also
+    /// skips its "hidden_size must be divisible by num_attention_heads"
+    /// check, since that check exists solely to keep the *derived* value
+    /// sane and no longer applies once `head_dim` is explicit.
+    pub fn head_dim(mut self, n: usize) -> Self {
+        self.head_dim = Some(n);
+        self
+    }
+
+    /// Restrict attention to the `n` most recent key positions (M-17).
+    ///
+    /// The builder's counterpart to the GGUF key
+    /// `<arch>.attention.sliding_window`: a model built through this builder
+    /// can now express local attention exactly as one loaded from a file
+    /// can, instead of silently being fully causal. Leaving it unset (the
+    /// default) means fully-causal attention over the whole context, which
+    /// is what every shipped model declares.
+    ///
+    /// `n == 0` is refused by [`Self::build`] (via
+    /// [`Qwen3Config::validate`]), not folded into "no window": a zero-width
+    /// window admits no key positions at all.
+    pub fn sliding_window(mut self, n: usize) -> Self {
+        self.sliding_window = Some(n);
+        self
+    }
+
     // ── Build ─────────────────────────────────────────────────────────────────
 
     /// Validate the accumulated settings and produce a [`Qwen3Config`].
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError`] when any of the following constraints are violated:
+    /// Returns [`ConfigError`] when any of the following constraints are
+    /// violated. All but the first two now live once in
+    /// [`Qwen3Config::validate`] (oxibonsai-core, M-24/M-12 consolidation)
+    /// and are shared with [`Qwen3Config::from_metadata`] -- this builder
+    /// converts that shared [`BonsaiError`](oxibonsai_core::error::BonsaiError)
+    /// into a [`ConfigError`] via [`ToString`].
     ///
     /// | Constraint | Reason |
     /// |------------|--------|
+    /// | `num_attention_heads >= 1` | checked HERE, before this builder's own `hidden_size / num_attention_heads` division |
+    /// | `hidden_size` divisible by `num_attention_heads`, *unless* `.head_dim(n)` was called (M-24) | checked HERE: only meaningful on the unmerged `Option`, which `validate()` never sees |
     /// | `num_layers >= 1` | A transformer with zero layers is meaningless |
     /// | `hidden_size >= 1` | Zero-dimensional embeddings are invalid |
-    /// | `num_attention_heads >= 1` | At least one query head is required |
     /// | `num_kv_heads >= 1` | At least one KV head is required |
-    /// | `hidden_size` divisible by `num_attention_heads` | Needed for equal head_dim split |
+    /// | `head_dim >= 1` | Zero-width heads are invalid |
     /// | `num_attention_heads` divisible by `num_kv_heads` | GQA requirement |
     /// | `intermediate_size >= 1` | FFN must have positive width |
     /// | `vocab_size >= 2` | At least 2 tokens needed for meaningful output |
-    /// | `max_position_embeddings >= 1` | Context must be at least 1 token |
+    /// | `sliding_window != Some(0)` (M-17) | A zero-width attention window admits no key positions |
+    /// | `max_context_length >= 1` (this builder's `.max_position_embeddings(n)`) | Context must be at least 1 token |
     /// | `rope_freq_base > 0` | Must be a positive real number |
     /// | `rms_norm_eps > 0` | Epsilon must be strictly positive |
     pub fn build(self) -> Result<Qwen3Config, ConfigError> {
@@ -202,67 +245,65 @@ impl ModelConfigBuilder {
             .unwrap_or_else(|| defaults.model_name.clone());
 
         // ── Validation ────────────────────────────────────────────────────────
-
-        if num_layers == 0 {
-            return Err(ConfigError::new("num_layers must be >= 1"));
-        }
-        if hidden_size == 0 {
-            return Err(ConfigError::new("hidden_size must be >= 1"));
-        }
+        //
+        // M-24/M-12 consolidation: every check that can run on a fully
+        // resolved `Qwen3Config` now lives once in `Qwen3Config::validate`
+        // (oxibonsai-core) and is shared with `Qwen3Config::from_metadata`.
+        // Exactly one check stays HERE, ahead of that call: "hidden_size
+        // divisible by num_attention_heads" only makes sense while
+        // `head_dim` is still the unmerged `Option` this builder is holding
+        // -- once `head_dim` is resolved into a plain `usize` below, whether
+        // it came from `.head_dim(n)` or from the division is no longer
+        // recoverable, so `validate()` itself deliberately does not (and
+        // cannot) re-derive this constraint.
+        //
+        // `num_attention_heads == 0` is *also* still checked here (ahead of
+        // `validate()`, which is unreachable if this panics first): the
+        // fallback division below (`hidden_size / num_attention_heads`)
+        // would divide by zero before `validate()` ever ran otherwise.
         if num_attention_heads == 0 {
             return Err(ConfigError::new("num_attention_heads must be >= 1"));
         }
-        if num_kv_heads == 0 {
-            return Err(ConfigError::new("num_kv_heads must be >= 1"));
-        }
-        if hidden_size % num_attention_heads != 0 {
+        // M-24: this check only exists to keep the *derived*
+        // `hidden_size / num_attention_heads` head_dim sane. When
+        // `.head_dim(n)` was called explicitly, the derived value is never
+        // used, so an architecture like Bonsai 2 (hidden_size=5120,
+        // num_attention_heads=24, head_dim=256; 5120 % 24 != 0) must not be
+        // rejected here.
+        if self.head_dim.is_none() && !hidden_size.is_multiple_of(num_attention_heads) {
             return Err(ConfigError::new(format!(
                 "hidden_size ({hidden_size}) must be divisible by num_attention_heads \
-                 ({num_attention_heads})"
-            )));
-        }
-        if num_attention_heads % num_kv_heads != 0 {
-            return Err(ConfigError::new(format!(
-                "num_attention_heads ({num_attention_heads}) must be divisible by \
-                 num_kv_heads ({num_kv_heads}) for Grouped Query Attention"
-            )));
-        }
-        if intermediate_size == 0 {
-            return Err(ConfigError::new("intermediate_size must be >= 1"));
-        }
-        if vocab_size < 2 {
-            return Err(ConfigError::new("vocab_size must be >= 2"));
-        }
-        if max_context_length == 0 {
-            return Err(ConfigError::new("max_position_embeddings must be >= 1"));
-        }
-        if rope_freq_base <= 0.0 || rope_freq_base.is_nan() || rope_freq_base.is_infinite() {
-            return Err(ConfigError::new(format!(
-                "rope_freq_base must be a finite positive number, got {rope_freq_base}"
-            )));
-        }
-        if rms_norm_eps <= 0.0 || rms_norm_eps.is_nan() || rms_norm_eps.is_infinite() {
-            return Err(ConfigError::new(format!(
-                "rms_norm_eps must be a finite positive number, got {rms_norm_eps}"
+                 ({num_attention_heads}) when head_dim is not set explicitly \
+                 (call `.head_dim(n)` for architectures where head_dim != \
+                 hidden_size / num_attention_heads)"
             )));
         }
 
-        let head_dim = hidden_size / num_attention_heads;
+        // M-24: an explicit `.head_dim(n)` always wins over the derived
+        // value — see the setter's doc comment.
+        let head_dim = self.head_dim.unwrap_or(hidden_size / num_attention_heads);
 
-        Ok(Qwen3Config {
+        let config = Qwen3Config {
             hidden_size,
             intermediate_size,
             num_layers,
             num_attention_heads,
             num_kv_heads,
             head_dim,
+            value_length: head_dim,
             vocab_size,
             max_context_length,
             rms_norm_eps,
             rope_freq_base,
+            rope_scaling: RopeScaling::None,
+            sliding_window: self.sliding_window,
             architecture,
             model_name,
-        })
+        };
+        config
+            .validate()
+            .map_err(|e| ConfigError::new(e.to_string()))?;
+        Ok(config)
     }
 
     // ── Convenience constructors ──────────────────────────────────────────────
@@ -298,7 +339,8 @@ mod tests {
         assert_eq!(config.hidden_size, 4096);
         assert_eq!(config.num_attention_heads, 32);
         assert_eq!(config.num_kv_heads, 8);
-        assert_eq!(config.vocab_size, 151936);
+        // Real GGUF header value (models/*Bonsai-8B.gguf): vocab 151669.
+        assert_eq!(config.vocab_size, 151_669);
     }
 
     #[test]
@@ -357,6 +399,118 @@ mod tests {
         assert_eq!(config.model_name, "My-Model");
     }
 
+    // ── M-24: explicit head_dim ────────────────────────────────────────────────
+
+    #[test]
+    fn explicit_head_dim_overrides_derived_value() {
+        // hidden_size=256, heads=4 would derive head_dim=64; explicit
+        // head_dim=100 must win instead.
+        let config = ModelConfigBuilder::new()
+            .layers(2)
+            .hidden_size(256)
+            .num_attention_heads(4)
+            .num_kv_heads(2)
+            .intermediate_size(512)
+            .vocab_size(100)
+            .head_dim(100)
+            .build()
+            .expect("explicit head_dim should build");
+        assert_eq!(config.head_dim, 100);
+    }
+
+    // ── M-17: explicit sliding window ──────────────────────────────────────────
+
+    #[test]
+    fn sliding_window_defaults_to_none() {
+        let config = ModelConfigBuilder::new()
+            .build()
+            .expect("defaults should build");
+        assert_eq!(config.sliding_window, None);
+    }
+
+    #[test]
+    fn explicit_sliding_window_is_carried_through() {
+        let config = ModelConfigBuilder::new()
+            .sliding_window(4096)
+            .build()
+            .expect("explicit sliding_window should build");
+        assert_eq!(config.sliding_window, Some(4096));
+    }
+
+    #[test]
+    fn zero_sliding_window_is_rejected() {
+        let err = ModelConfigBuilder::new()
+            .sliding_window(0)
+            .build()
+            .expect_err("a zero-width window must not build");
+        assert!(
+            err.to_string().contains("sliding_window"),
+            "error should name the offending field: {err}"
+        );
+    }
+
+    #[test]
+    fn explicit_head_dim_allows_non_divisible_hidden_size() {
+        // The real Bonsai 2 (27B) shape: hidden_size=5120,
+        // num_attention_heads=24 (5120 % 24 != 0), head_dim=256,
+        // num_kv_heads=4 (24 % 4 == 0, GQA-valid).
+        let config = ModelConfigBuilder::new()
+            .layers(64)
+            .hidden_size(5120)
+            .num_attention_heads(24)
+            .num_kv_heads(4)
+            .intermediate_size(17408)
+            .vocab_size(248320)
+            .head_dim(256)
+            .build()
+            .expect("Bonsai 2 shape should build with explicit head_dim");
+        assert_eq!(config.head_dim, 256);
+        assert_eq!(config.hidden_size, 5120);
+        assert_eq!(config.num_attention_heads, 24);
+    }
+
+    #[test]
+    fn without_explicit_head_dim_non_divisible_hidden_size_still_errors() {
+        // Unchanged pre-existing behaviour: the derived-head_dim guard still
+        // fires when `.head_dim()` was never called.
+        let err = ModelConfigBuilder::new()
+            .hidden_size(5120)
+            .num_attention_heads(24)
+            .num_kv_heads(4)
+            .build()
+            .expect_err("non-divisible hidden/heads without explicit head_dim should fail");
+        assert!(err.0.contains("divisible"), "{err}");
+    }
+
+    #[test]
+    fn explicit_head_dim_zero_returns_error() {
+        let err = ModelConfigBuilder::new()
+            .layers(2)
+            .hidden_size(64)
+            .num_attention_heads(4)
+            .num_kv_heads(2)
+            .intermediate_size(128)
+            .vocab_size(100)
+            .head_dim(0)
+            .build()
+            .expect_err("head_dim=0 should fail");
+        assert!(err.0.contains("head_dim"), "{err}");
+    }
+
+    #[test]
+    fn default_head_dim_still_derived_when_not_set() {
+        let config = ModelConfigBuilder::new()
+            .layers(2)
+            .hidden_size(256)
+            .num_attention_heads(4)
+            .num_kv_heads(2)
+            .intermediate_size(512)
+            .vocab_size(100)
+            .build()
+            .expect("default derivation should still work");
+        assert_eq!(config.head_dim, 64); // 256 / 4, unchanged pre-M-24 behaviour
+    }
+
     #[test]
     fn partial_override_inherits_defaults() {
         // Only override layers; everything else should come from Bonsai-8B defaults
@@ -366,7 +520,8 @@ mod tests {
             .expect("partial override should succeed");
         assert_eq!(config.num_layers, 12);
         assert_eq!(config.hidden_size, 4096); // default
-        assert_eq!(config.vocab_size, 151936); // default
+                                              // Real GGUF header value (models/*Bonsai-8B.gguf): vocab 151669.
+        assert_eq!(config.vocab_size, 151_669); // default
     }
 
     // ── Error cases: invalid builds ───────────────────────────────────────────
@@ -464,7 +619,12 @@ mod tests {
             .max_position_embeddings(0)
             .build()
             .expect_err("zero max_position_embeddings should fail");
-        assert!(err.0.contains("max_position_embeddings"), "{err}");
+        // M-24/M-12: this check now runs inside the shared
+        // `Qwen3Config::validate` (oxibonsai-core), which names the field by
+        // the `Qwen3Config` struct's own name (`max_context_length`) rather
+        // than this builder's setter name (`max_position_embeddings`) --
+        // both describe the same constraint on the same resolved value.
+        assert!(err.0.contains("max_context_length"), "{err}");
     }
 
     #[test]

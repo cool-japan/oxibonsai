@@ -24,9 +24,15 @@
 //! path is a speed optimization, enabled explicitly for A/B and production use.
 //!
 //! On *any* error this module returns a `TeGpuMatmulError`; the caller (the
-//! `matmul` helper in [`crate::te::forward`]) swallows it and falls back to the
-//! CPU [`crate::gemm::gemm_abt`], so a GPU failure can never break a forward
-//! pass (no `unwrap`/`expect`/`panic!`).
+//! `matmul_inner` helper in [`crate::te::forward`]) falls back to the CPU
+//! [`crate::gemm::gemm_abt`], so a GPU failure can never break a forward pass
+//! (no `unwrap`/`expect`/`panic!`). That fallback used to be silent
+//! (RAG-EVAL-IMG-18); `matmul_inner` now latches a one-time `tracing::warn!`
+//! at its catch site the first time this fails, naming the backend and the
+//! underlying error — see that function's doc for why the warning lives
+//! *there* rather than in this module: `te_matmul_gpu` has exactly one
+//! caller, so warning at the raise site here too would double-log a single
+//! failure.
 //!
 //! ## Weight residency (no-copy investigation)
 //!
@@ -67,7 +73,7 @@ pub enum TeGpuMatmulError {
 /// (used by the parity example to PROVE the GPU ran, not a silent CPU fallback).
 static TE_GPU_USED: AtomicBool = AtomicBool::new(false);
 
-/// Returns `true` once any [`te_matmul_gpu`] call has succeeded.
+/// Returns `true` once any `te_matmul_gpu` call has succeeded.
 ///
 /// Lock-free and cheap; intended for diagnostics / parity assertions.
 pub fn te_gpu_was_used() -> bool {
@@ -81,7 +87,7 @@ static TE_GPU_ENABLED: OnceLock<bool> = OnceLock::new();
 /// Whether the text encoder should use the GPU f32 path.
 ///
 /// `false` unless the environment variable `OXI_TE_GPU` is set to `1`. The env
-/// read is cached in a [`OnceLock`] on first call.
+/// read is cached in a `OnceLock` on first call.
 pub fn te_gpu_enabled() -> bool {
     *TE_GPU_ENABLED.get_or_init(|| matches!(std::env::var("OXI_TE_GPU").ok().as_deref(), Some("1")))
 }
@@ -111,6 +117,32 @@ pub fn te_gemm_bf16_enabled() -> bool {
 #[inline]
 fn should_persist_weight(resident: bool) -> bool {
     resident
+}
+
+/// Latch for a failed best-effort eviction of a non-resident weight from the
+/// GPU cache (see [`te_matmul_gpu`]'s eviction note below): the eviction
+/// itself is never fallback-worthy (the GEMM it follows already succeeded,
+/// and a failed eviction only means the next upload for that key overwrites
+/// the stale entry instead of finding it already gone), so this is not one of
+/// RAG-EVAL-IMG-18's GPU-to-CPU fallback warnings — but it is still worth a
+/// one-time diagnostic rather than a fully silent swallow.
+static EVICT_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Emit a one-time `tracing::warn!` the first time a non-resident weight's
+/// best-effort GPU-cache eviction fails — see [`EVICT_FALLBACK_WARNED`]'s doc
+/// for why this is a diagnostic rather than a GPU→CPU fallback warning.
+/// Mirrors the `warn_*_fallback_once` latch idiom used throughout this crate
+/// (e.g. `crate::vae::gpu::warn_gpu_fallback_once`) so it is unit-testable the
+/// same way, via a caller-supplied `flag`.
+fn warn_evict_fallback_once(flag: &'static AtomicBool, reason: &str) {
+    if !flag.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            reason,
+            "oxibonsai-image: TE GPU weight-cache eviction failed (non-fatal; the \
+             next upload for this key overwrites the stale entry); further \
+             occurrences in this process are not logged"
+        );
+    }
 }
 
 /// Compute `out[m, n] = Σ_k input[m, k] · weight[n, k]` (`x · Wᵀ`) on the GPU.
@@ -158,10 +190,13 @@ pub fn te_matmul_gpu(
     // for a different weight on the next matmul. Evict now so the next
     // get_or_upload_f32_weight for a new weight at that recycled address always
     // gets a fresh upload rather than a stale handle. Eviction failure is
-    // non-fatal (the next upload will simply overwrite the stale entry), so
-    // errors are silently discarded here.
+    // non-fatal (the next upload will simply overwrite the stale entry), but a
+    // one-time diagnostic still fires (see `warn_evict_fallback_once`) rather
+    // than discarding the error completely.
     if !should_persist_weight(resident) {
-        let _ = graph.evict_f32_weight(key);
+        if let Err(e) = graph.evict_f32_weight(key) {
+            warn_evict_fallback_once(&EVICT_FALLBACK_WARNED, &e.to_string());
+        }
     }
     TE_GPU_USED.store(true, Ordering::Relaxed);
     Ok(())
@@ -196,5 +231,29 @@ mod tests {
             "non-resident must not persist"
         );
         assert!(should_persist_weight(true), "resident must persist");
+    }
+
+    #[test]
+    fn warn_evict_fallback_once_fires_exactly_once_per_flag() {
+        // A private, test-local latch (never touched by any other test or by
+        // the real eviction call site), so this is deterministic regardless
+        // of process/thread scheduling — mirrors the sibling
+        // `warn_gpu_fallback_once_fires_exactly_once_per_flag` tests
+        // elsewhere in this crate.
+        static LOCAL_WARNED: AtomicBool = AtomicBool::new(false);
+        assert!(
+            !LOCAL_WARNED.load(Ordering::Relaxed),
+            "fresh static must start false"
+        );
+        warn_evict_fallback_once(&LOCAL_WARNED, "first reason");
+        assert!(
+            LOCAL_WARNED.load(Ordering::Relaxed),
+            "the first call must latch the flag"
+        );
+        // A second (and third) call must not panic, and must leave the latch
+        // set — "once per process", not spammed on every non-resident GEMM.
+        warn_evict_fallback_once(&LOCAL_WARNED, "second reason");
+        warn_evict_fallback_once(&LOCAL_WARNED, "third reason");
+        assert!(LOCAL_WARNED.load(Ordering::Relaxed));
     }
 }

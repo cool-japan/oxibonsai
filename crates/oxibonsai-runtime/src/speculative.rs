@@ -49,7 +49,7 @@
 //! They are not a production generator — use `generate_verified` for that.
 
 use crate::adaptive_lookahead::{AdaptiveLookahead, AdaptiveLookaheadConfig};
-use crate::engine::{InferenceEngine, EOS_TOKEN_ID, MAX_PREALLOC_TOKENS};
+use crate::engine::{InferenceEngine, MAX_PREALLOC_TOKENS};
 use crate::error::RuntimeResult;
 use crate::sampling::SamplingParams;
 
@@ -596,7 +596,7 @@ impl<'a> SpeculativeDecoder<'a> {
         // logits is the target's first continuation token (position `P`).
         let prompt_logits = target.prefill_from_pos(prompt_tokens, 0)?;
         let mut next_token = argmax_first(&prompt_logits);
-        if next_token == EOS_TOKEN_ID {
+        if target.is_eos(next_token) {
             return Ok(output);
         }
         output.push(next_token);
@@ -666,7 +666,7 @@ impl<'a> SpeculativeDecoder<'a> {
             let take = accepted.min(max_tokens - output.len());
             let mut hit_eos = false;
             for &tok in draft.iter().take(take) {
-                if tok == EOS_TOKEN_ID {
+                if target.is_eos(tok) {
                     hit_eos = true;
                     break;
                 }
@@ -688,7 +688,7 @@ impl<'a> SpeculativeDecoder<'a> {
                     None => break,
                 }
             };
-            if bonus == EOS_TOKEN_ID {
+            if target.is_eos(bonus) {
                 break;
             }
             output.push(bonus);
@@ -1291,7 +1291,7 @@ mod tests {
         let mut tok = argmax_first(&logits);
         let mut pos = prompt.len();
         while out.len() < max {
-            if tok == EOS_TOKEN_ID {
+            if eng.is_eos(tok) {
                 break;
             }
             out.push(tok);
@@ -1377,5 +1377,99 @@ mod tests {
             .generate_verified(&mut target, &[1u32, 2, 3], 0, &params)
             .expect("zero max")
             .is_empty());
+    }
+
+    // ── RT-18: generate_verified must honour the target's own EOS set ───────
+
+    /// Reproduces the defect first: `generate_verified`'s three EOS checks
+    /// (priming at what is now `target.is_eos(next_token)`, the draft-commit
+    /// loop, and the bonus token) used to compare against the crate-wide
+    /// `EOS_TOKEN_ID` constant (Qwen3's `151645`) instead of the *target*
+    /// engine's own configured set, so a model whose real EOS id differs
+    /// could never stop through this path.
+    ///
+    /// `Qwen3Config::tiny_test()` built via `BonsaiModel::new` (no GGUF) has
+    /// an all-zero embedding table and an all-zero LM head, so every logit
+    /// row is exactly `0.0` at every position and `argmax_first` always
+    /// returns token `0`. Arming the target's EOS set with `{0}` therefore
+    /// makes the very first primed token an EOS hit -- a genuinely
+    /// discriminating case, since the pre-fix code compared against the
+    /// hardcoded `151645` and would have run all the way to `max_tokens`
+    /// regardless of what the target's EOS set contained (the set was never
+    /// consulted at all).
+    #[test]
+    fn generate_verified_stops_on_the_targets_configured_eos_not_the_hardcoded_constant() {
+        let cfg = Qwen3Config::tiny_test();
+        let params = SamplingParams {
+            temperature: 0.0,
+            ..SamplingParams::default()
+        };
+        let draft_eng = reference_engine(&cfg, &params);
+        let mut target = reference_engine(&cfg, &params);
+        // Precondition the fixture relies on: the weightless model's argmax
+        // is always token 0.
+        let prompt_logits = target.prefill_from_pos(&[1u32, 2, 3], 0).expect("prefill");
+        assert_eq!(
+            argmax_first(&prompt_logits),
+            0,
+            "fixture precondition: the weightless model's argmax must be 0"
+        );
+        target.reset();
+        target.set_eos_token_ids([0u32]);
+
+        let mut dec = SpeculativeDecoder::new(
+            draft_eng,
+            SpeculativeConfig {
+                lookahead: 4,
+                ..SpeculativeConfig::default()
+            },
+        );
+        let out = dec
+            .generate_verified(&mut target, &[1u32, 2, 3], 12, &params)
+            .expect("generate_verified");
+        assert!(
+            out.is_empty(),
+            "priming token 0 must be recognised as EOS via the target's own \
+             configured set (RT-18), not the hardcoded EOS_TOKEN_ID, got {out:?}"
+        );
+    }
+
+    /// Sibling of the above: an EOS set holding a real Bonsai 2 id
+    /// (`248046`, distinct from the legacy Qwen3 `EOS_TOKEN_ID` this path
+    /// used to hardcode) that the weightless model's constant-zero output
+    /// never touches must NOT stop generation early -- pinning that
+    /// arbitrary ids are representable through this path. `generate_verified`
+    /// also checks EOS on every accepted draft token and on the bonus token
+    /// (the same `target.is_eos` call verified above), which this fixture
+    /// cannot separately exercise: the weightless model's argmax is always
+    /// token 0, so those checks only ever see 0 too, and their reachability
+    /// is established by code inspection rather than a distinct test case.
+    #[test]
+    fn generate_verified_runs_to_completion_when_eos_set_never_matches() {
+        let cfg = Qwen3Config::tiny_test();
+        let params = SamplingParams {
+            temperature: 0.0,
+            ..SamplingParams::default()
+        };
+        let draft_eng = reference_engine(&cfg, &params);
+        let mut target = reference_engine(&cfg, &params);
+        target.set_eos_token_ids([248_046u32]);
+
+        let mut dec = SpeculativeDecoder::new(
+            draft_eng,
+            SpeculativeConfig {
+                lookahead: 4,
+                ..SpeculativeConfig::default()
+            },
+        );
+        let out = dec
+            .generate_verified(&mut target, &[1u32, 2, 3], 12, &params)
+            .expect("generate_verified");
+        assert_eq!(
+            out.len(),
+            12,
+            "token 0 is never a member of {{248046}}, so generation must run \
+             to max_tokens, got {out:?}"
+        );
     }
 }

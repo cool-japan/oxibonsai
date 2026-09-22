@@ -339,4 +339,62 @@ mod tests {
         // We can call inner() and get a consistent vocab_size.
         assert_eq!(bridge.inner().vocab_size(), bridge.vocab_size());
     }
+
+    // ── Wave-1.5 mandatory regression test ───────────────────────────────
+    //
+    // `TokenizerConfig::default()` sets `unk=0, bos=1, eos=2, pad=3`. A real
+    // byte-level vocabulary that declares no explicit unk/bos/eos/pad token
+    // (like Qwen3's real `tokenizer.json`) routinely assigns those exact ids
+    // to ordinary punctuation ('!','"','#','$'). Before the root-cause fix
+    // in `oxibonsai_tokenizer::tokenizer::build_special_ids` (deriving the
+    // special-id set from the vocabulary rather than blindly trusting the
+    // config quartet), those four ordinary bytes were silently classified
+    // special and dropped by every decode path — including this bridge's,
+    // since `NativeTokenizerBridge::decode` (above) calls
+    // `OxiTokenizer::decode` directly. This test exercises that exact
+    // collision at BOTH the `OxiTokenizer` level (via `from_json`, which
+    // this bridge's own `from_json` constructor wraps) and the
+    // `NativeTokenizerBridge::decode` level, so the fix is validated
+    // through the actual type the qwen35 / Bonsai 2 vocabulary is routed
+    // through, not just through `oxibonsai-tokenizer`'s own test suite.
+    #[test]
+    fn decode_survives_punctuation_colliding_with_default_special_ids() {
+        // `Vocabulary::from_json`-compatible plain vocab: no `<...>`-shaped
+        // entries, so nothing is auto-promoted to "special" — matching a
+        // real byte-level vocab where '!'/'"'/'#'/'$' are ordinary tokens.
+        // Two-hash raw-string delimiter: the JSON's `"#":2` entry contains
+        // the literal byte sequence `"#`, which would otherwise prematurely
+        // close a single-hash `r#"..."#` raw string right there.
+        let vocab_json = r##"{"!":0,"\"":1,"#":2,"$":3,"a":4,"b":5}"##;
+        let merges_json = "[]";
+        let config = TokenizerConfig::default();
+        assert_eq!(config.unk_token_id, 0);
+        assert_eq!(config.bos_token_id, 1);
+        assert_eq!(config.eos_token_id, 2);
+        assert_eq!(config.pad_token_id, 3);
+
+        // Level 1: `OxiTokenizer::from_json` directly (what this bridge's
+        // `from_json` wraps).
+        let direct = OxiTokenizer::from_json(vocab_json, merges_json, TokenizerConfig::default())
+            .expect("OxiTokenizer::from_json should succeed");
+        let ids = direct.encode("!\"#$ab").expect("encode should succeed");
+        let decoded = direct.decode(&ids).expect("decode should succeed");
+        assert_eq!(
+            decoded, "!\"#$ab",
+            "OxiTokenizer::decode must not drop punctuation colliding with \
+             TokenizerConfig::default()'s unk/bos/eos/pad ids"
+        );
+
+        // Level 2: through the bridge this crate actually routes the
+        // native/GGUF-vocab tokenizer through.
+        let bridge = NativeTokenizerBridge::from_json(vocab_json, merges_json, config)
+            .expect("from_json should succeed");
+        let ids = bridge.encode("!\"#$ab").expect("encode should succeed");
+        let decoded = bridge.decode(&ids).expect("decode should succeed");
+        assert_eq!(
+            decoded, "!\"#$ab",
+            "NativeTokenizerBridge::decode must not drop punctuation \
+             colliding with the default special-id quartet"
+        );
+    }
 }

@@ -68,6 +68,21 @@ fn runtime_compiles_for_wasm32_unknown_unknown_no_default_features() {
             "--no-default-features",
         ])
         .current_dir(manifest_dir)
+        // T-18 / CI-GATE-blocking-1: a nested cross-target build must not
+        // inherit the parent process's own instrumentation flags. Under
+        // `cargo llvm-cov`, the parent test-binary process runs with
+        // `-Cinstrument-coverage` injected via `CARGO_ENCODED_RUSTFLAGS`
+        // (and llvm-cov also sets `LLVM_PROFILE_FILE`); wasm32-unknown-unknown
+        // has no `profiler_builtins` in its std, so a child `cargo check`
+        // that inherited those flags dies with `error[E0463]: can't find
+        // crate for 'profiler_builtins'` — a false failure the coverage
+        // stage manufactures, not a defect this test discovers. Scrub every
+        // flags/instrumentation env var a parent build tool might have set
+        // before spawning the nested, differently-targeted build.
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("RUSTDOCFLAGS")
+        .env_remove("LLVM_PROFILE_FILE")
         .output()
         .expect("failed to spawn `cargo check` for wasm32-unknown-unknown");
 

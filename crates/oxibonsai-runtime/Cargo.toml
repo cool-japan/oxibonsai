@@ -15,11 +15,51 @@ categories = ["science", "algorithms"]
 
 [features]
 default = ["server"]
-server = ["dep:axum", "dep:tower", "dep:tower-http"]
-rag = ["dep:axum", "dep:tower", "dep:tower-http"]
+server = ["dep:axum", "dep:tower"]
+rag = ["dep:axum", "dep:tower"]
 wasm = []
 metal = ["oxibonsai-kernels/metal", "oxibonsai-model/metal"]
 native-cuda = ["oxibonsai-kernels/native-cuda", "oxibonsai-model/native-cuda"]
+# HuggingFace `tokenizers` (deps-07/TOK-13): the project's own Pure-Rust BPE
+# (`oxibonsai-tokenizer`, always present) covers native GGUF-vocab models; this
+# feature adds `tokenizer_bridge.rs`'s HF `tokenizer.json`-compatible backend on
+# top of it. `tokenizers` itself is already configured Pure-Rust
+# (`default-features = false, features = ["fancy-regex"]` in
+# `[workspace.dependencies]`), so enabling this feature does not violate the
+# Pure-Rust policy; it exists so a consumer that only needs the native path can
+# opt out with `default-features = false` on this crate.
+#
+# FIX-01-BUILD made that opt-out real: `TokenizerBridge` is now an enum over
+# `{ Native(OxiTokenizer), Hf(tokenizers::Tokenizer) }` and every `tokenizers`
+# item is gated on `all(feature = "hf-tokenizer", not(target_arch =
+# "wasm32"))` (the dependency below is target-gated, so the feature alone does
+# not make the crate linkable). `cargo check/test -p oxibonsai-runtime
+# --no-default-features` therefore builds and passes on the native backend.
+#
+# FLIPPED OFF DEFAULT (BENCHES, wave 3, RT-ADMIN-CFG blocking-1 / decision
+# D-5): this was the remaining half of deps-07, gated on two preconditions
+# that are now both satisfied — (1) cross-backend parity is proven
+# (`tokenizer_bridge.rs::is_special_and_piece_agree_across_backends_on_the_real_fixture`)
+# and (2) the native decode hot path's only linear scan
+# (`Vocabulary::is_special_id`, a 33-entry special-token set at the real
+# Bonsai 2 vocabulary size) has been benchmarked and does not regress
+# streaming throughput: measured ~20 ns/call at 33 special tokens (miss
+# 19.7 ns, hit 19.3 ns — though `hit` alone is not reproducible run to run,
+# since `HashMap`'s default hasher is randomly re-seeded per process;
+# `miss`, the true full scan, is the reliable number and the one this
+# decision relies on; Apple M3, release profile, idle machine — see
+# `crates/oxibonsai-tokenizer/benches/tokenizer_bench.rs`'s
+# `special_id_lookup` group). The actual per-token cost is this scan
+# re-run over the WHOLE decode window by `native_step_decode`
+# (O(window x |specials|), not one call): at a realistic 2048-4096 token
+# window that is ~41-82 us/token (window x ~20 ns/call) — re-measured on
+# this shared, multi-agent build machine under heavy concurrent load
+# (session CONTEXT.md's documented wall-clock-noise caveat) at up to
+# ~100 ns/call, i.e. still only ~0.2-0.4 ms/token worst case — many orders
+# of magnitude below a token's actual decode/sampling cost either way.
+# `from_file` now returns the Native-backed variant by default; pass
+# `--features hf-tokenizer` to keep the HuggingFace-compatible backend.
+hf-tokenizer = ["dep:tokenizers"]
 
 [dependencies]
 oxibonsai-core.workspace = true
@@ -34,14 +74,13 @@ toml.workspace = true
 memmap2.workspace = true
 axum = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
-tower-http = { workspace = true, optional = true }
 oxibonsai-rag.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tracing-subscriber.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
-tokenizers.workspace = true
+tokenizers = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
@@ -56,3 +95,4 @@ axum.workspace = true
 tokio = { workspace = true, features = ["full"] }
 http-body-util.workspace = true
 half = { workspace = true }
+oxibonsai-testkit.workspace = true

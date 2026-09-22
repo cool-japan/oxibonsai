@@ -1,3 +1,6 @@
+#![cfg(feature = "training")]
+//! Integration tests for the on-disk tensor cache (`oxibonsai_model::disk_cache`).
+
 use oxibonsai_model::disk_cache::{
     CacheEntry, CacheFileInfo, CacheManager, DiskCache, DiskCacheError,
 };

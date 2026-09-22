@@ -237,7 +237,7 @@ impl CudaGraph {
         k: usize,
     ) -> Result<(), CudaGraphError> {
         // ── Validate ─────────────────────────────────────────────────────
-        if k % 128 != 0 {
+        if !k.is_multiple_of(128) {
             return Err(CudaGraphError::DriverError(format!(
                 "encode_gemm_tq2: k must be a multiple of 128, got {k}"
             )));

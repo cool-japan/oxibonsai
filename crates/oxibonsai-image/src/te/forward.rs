@@ -498,9 +498,21 @@ fn build_mask(attention_mask: &[i32], seq: usize) -> Vec<f32> {
 /// `OXI_TE_GPU=1`, the matmul is routed through the f32-exact Metal GEMM
 /// ([`crate::te::gpu::te_matmul_gpu`]), which is numerically equivalent to the
 /// CPU `gemm_abt` (cos ≈ 1.0 — reassociated f32 sums only). On *any* GPU error
-/// it silently falls through to the CPU [`gemm_abt`] path (never panics), so a
-/// GPU failure can never break a forward pass. Applied to every TE Linear
-/// (Q/K/V, o_proj, gate/up/down) since all call this helper.
+/// it falls through to the CPU [`gemm_abt`] path (never panics), so a GPU
+/// failure can never break a forward pass. Applied to every TE Linear (Q/K/V,
+/// o_proj, gate/up/down) since all call this helper.
+///
+/// That fallback used to be completely silent (RAG-EVAL-IMG-18): a flaky or
+/// absent GPU device degraded every TE matmul to the CPU path with no
+/// diagnostic anywhere in the crate. `matmul_inner`'s two GPU branches (Metal,
+/// CUDA) now each latch a one-time `tracing::warn!` naming the backend and the
+/// underlying error the first time they fall through — see
+/// `warn_te_matmul_fallback_once`. This is the catch site (unlike the DiT's
+/// `crate::gpu`/`crate::cuda_gpu`, which warn at their own raise site because
+/// *their* catch site, `crate::math`, is not owned by this fix): `te::gpu`
+/// and `te::cuda_gpu`'s `te_matmul_gpu` have exactly one caller each (here),
+/// so warning once at the point where the `Err` is actually swallowed avoids
+/// double-logging a single failure.
 ///
 /// `resident` controls the GPU weight cache residency policy: when `true`, the
 /// uploaded GPU buffer is kept across calls (amortizes upload cost across
@@ -508,6 +520,53 @@ fn build_mask(attention_mask: &[i32], seq: usize) -> Vec<f32> {
 /// stale-handle hazard from pointer-key recycling (see [`crate::te::gpu::te_matmul_gpu`]).
 static TE_MATMUL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static TE_ATTN_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Latch for `matmul_inner`'s one-time Metal GPU→CPU fallback warning.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+static TE_MATMUL_METAL_FALLBACK_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Latch for `matmul_inner`'s one-time CUDA GPU→CPU fallback warning. The
+/// `target_os`-disjoint sibling of the Metal latch above (the two `cfg`s never
+/// both hold, so at most one of the two statics ever exists in a given build).
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+static TE_MATMUL_CUDA_FALLBACK_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Emit a one-time `tracing::warn!` the first time a TE GPU matmul fails and
+/// `matmul_inner` falls through to the CPU [`gemm_abt`] path.
+///
+/// `flag.swap(true, ..)` returns the *previous* value, so the message prints
+/// exactly once per process per latch — every subsequent failure (e.g. a GPU
+/// that stays unavailable for the life of the process) is silently dropped,
+/// matching a "warn once" contract without spamming the log on every one of
+/// the TE's per-layer Linear calls. Generic over the error type so the same
+/// helper serves both the Metal (`TeGpuMatmulError`) and CUDA
+/// (`CudaTeGpuMatmulError`) branches.
+#[cfg(any(
+    all(feature = "metal", target_os = "macos"),
+    all(
+        feature = "native-cuda",
+        any(target_os = "linux", target_os = "windows")
+    )
+))]
+fn warn_te_matmul_fallback_once<E: std::fmt::Display + ?Sized>(
+    flag: &'static std::sync::atomic::AtomicBool,
+    backend: &str,
+    e: &E,
+) {
+    if !flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            backend,
+            error = %e,
+            "oxibonsai-image: TE matmul GPU failed, falling back to CPU; \
+             further occurrences in this process are not logged"
+        );
+    }
+}
 
 fn matmul(
     input: &[f32],
@@ -560,7 +619,8 @@ fn matmul_inner(
         if crate::te::gpu::te_gpu_enabled() {
             match crate::te::gpu::te_matmul_gpu(weight, input, &mut out, m, n, k, _resident) {
                 Ok(()) => return Ok(out),
-                Err(_e) => {
+                Err(e) => {
+                    warn_te_matmul_fallback_once(&TE_MATMUL_METAL_FALLBACK_WARNED, "metal", &e);
                     // Fall through to the CPU GEMM.
                 }
             }
@@ -577,7 +637,8 @@ fn matmul_inner(
         if crate::te::cuda_gpu::te_gpu_enabled() {
             match crate::te::cuda_gpu::te_matmul_gpu(weight, input, &mut out, m, n, k, _resident) {
                 Ok(()) => return Ok(out),
-                Err(_e) => {
+                Err(e) => {
+                    warn_te_matmul_fallback_once(&TE_MATMUL_CUDA_FALLBACK_WARNED, "cuda", &e);
                     // Fall through to the CPU GEMM.
                 }
             }
@@ -683,5 +744,39 @@ mod tests {
         let hm = token_to_head_major(&x, 2, 2, 2);
         // head0: tokens (0,1)->[0,1],[4,5]; head1: [2,3],[6,7]
         assert_eq!(hm, vec![0.0, 1.0, 4.0, 5.0, 2.0, 3.0, 6.0, 7.0]);
+    }
+
+    // `warn_te_matmul_fallback_once` only exists when some GPU backend is
+    // compiled (see its own `cfg`), so this test shares that gate — a
+    // default-feature build has no GPU fallback to warn about at all.
+    #[cfg(any(
+        all(feature = "metal", target_os = "macos"),
+        all(
+            feature = "native-cuda",
+            any(target_os = "linux", target_os = "windows")
+        )
+    ))]
+    #[test]
+    fn warn_te_matmul_fallback_once_fires_exactly_once_per_flag() {
+        // A private, test-local latch (never touched by any other test or by
+        // the real TE matmul call sites), so this is deterministic regardless
+        // of process/thread scheduling.
+        static LOCAL_WARNED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        assert!(
+            !LOCAL_WARNED.load(std::sync::atomic::Ordering::Relaxed),
+            "fresh static must start false"
+        );
+        warn_te_matmul_fallback_once(&LOCAL_WARNED, "test-backend", "first reason");
+        assert!(
+            LOCAL_WARNED.load(std::sync::atomic::Ordering::Relaxed),
+            "the first call must latch the flag"
+        );
+        // A second (and third) call must not panic, and must leave the latch
+        // set — this is what makes the diagnostic "once per process" rather
+        // than spamming the log on every TE Linear call.
+        warn_te_matmul_fallback_once(&LOCAL_WARNED, "test-backend", "second reason");
+        warn_te_matmul_fallback_once(&LOCAL_WARNED, "test-backend", "third reason");
+        assert!(LOCAL_WARNED.load(std::sync::atomic::Ordering::Relaxed));
     }
 }

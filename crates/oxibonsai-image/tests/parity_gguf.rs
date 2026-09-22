@@ -13,6 +13,7 @@
 use std::path::PathBuf;
 
 use oxibonsai_image::DitWeights;
+use oxibonsai_testkit::capability::{record as record_capability, Capability};
 
 /// One entry in the expected quantized-linear inventory.
 struct QuantSpec {
@@ -105,17 +106,29 @@ fn bf16_spot_checks() -> Vec<(&'static str, Vec<u64>)> {
     ]
 }
 
+// ── T-05 capability-report producer ─────────────────────────────────────────
+//
+// T-07 FIX (verifier wave 3): this used to be an inline copy of
+// `oxibonsai_testkit::capability::record`; `oxibonsai-image` now takes
+// `oxibonsai-testkit` as a dev-dependency (imported above), so the copy is
+// deleted in favour of the shared implementation.
+
+const TEST_NAME: &str = "oxibonsai-image::parity_gguf::parity_gguf_full_validation";
+
 #[test]
 fn parity_gguf_full_validation() {
     let Ok(path) = std::env::var("OXIBONSAI_DIT_GGUF") else {
         eprintln!("skipping: OXIBONSAI_DIT_GGUF not set");
+        record_capability(Capability::ImageParity, false, TEST_NAME);
         return;
     };
     let path = PathBuf::from(path);
     if !path.exists() {
         eprintln!("skipping: {} does not exist", path.display());
+        record_capability(Capability::ImageParity, false, TEST_NAME);
         return;
     }
+    record_capability(Capability::ImageParity, true, TEST_NAME);
 
     let weights = DitWeights::open(&path).expect("load real DiT GGUF");
 

@@ -182,17 +182,40 @@ impl HellaSwagDataset {
     /// - `choices`  = `item.endings` (4 elements)
     /// - `correct_answer` = `item.label`
     /// - `subject`  = `item.activity_label`
+    ///
+    /// A malformed item (empty `endings`, or `label` out of range for them
+    /// -- `from_jsonl` performs no such validation, RAG-M1) is skipped
+    /// rather than silently turned into a question that can never be
+    /// scored correct. This function has no `Result` in its signature and
+    /// neither do its callers ([`HellaSwagEvaluator::evaluate_completions`]
+    /// / `evaluate_logits`, both returning a plain [`HellaSwagResult`]), so
+    /// propagating would ripple a breaking signature change across the
+    /// public evaluator API for a condition a real HellaSwag file should
+    /// never hit; each skip is logged to stderr (with a final count) so a
+    /// malformed dataset is visible instead of silently mis-scored.
     pub fn as_mc_dataset(&self) -> McDataset {
         let mut mc = McDataset::new("hellaswag");
+        let mut skipped = 0usize;
         for item in &self.items {
-            mc.add(MultipleChoiceQuestion {
+            let question = MultipleChoiceQuestion {
                 id: item.id.clone(),
                 question: item.ctx.clone(),
                 choices: item.endings.clone(),
                 correct_answer: item.label,
                 subject: Some(item.activity_label.clone()),
                 difficulty: None,
-            });
+            };
+            if let Err(e) = mc.try_add(question) {
+                skipped += 1;
+                tracing::warn!(id = ?item.id, error = %e, "hellaswag: skipping malformed item");
+            }
+        }
+        if skipped > 0 {
+            tracing::warn!(
+                skipped,
+                total = self.items.len(),
+                "hellaswag: skipped malformed item(s) during McDataset conversion (RAG-M1)"
+            );
         }
         mc
     }
@@ -301,5 +324,84 @@ impl HellaSwagEvaluator {
 impl Default for HellaSwagEvaluator {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Inline tests
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── RAG-M1: as_mc_dataset must not silently accept a malformed item ────
+
+    #[test]
+    fn as_mc_dataset_rejects_an_item_with_no_endings() {
+        // `from_jsonl` performs no length/range validation on `endings` or
+        // `label` (RAG-M1's own evidence), so a malformed JSONL line (e.g.
+        // `{"endings": [], "label": 0}`) reaches here with `endings: vec![]`
+        // and `label: 0` -- empty choices AND an out-of-range correct
+        // answer. Before this fix `McDataset::add` accepted it
+        // unconditionally, producing a question that can never be scored
+        // correct; reproduced directly via `from_items` here (bypassing
+        // JSONL parsing) so the conversion itself is what's under test.
+        let bad = HellaSwagItem {
+            id: "bad".to_string(),
+            activity_label: "x".to_string(),
+            ctx: "y".to_string(),
+            endings: vec![],
+            label: 0,
+        };
+        let dataset = HellaSwagDataset::from_items(vec![bad]);
+        let mc = dataset.as_mc_dataset();
+        assert!(
+            mc.questions.is_empty(),
+            "a malformed (0 endings) HellaSwag item must be skipped, not silently \
+             added as an unscoreable question; got {:?}",
+            mc.questions
+        );
+    }
+
+    #[test]
+    fn as_mc_dataset_rejects_an_out_of_range_label_with_nonempty_endings() {
+        let bad = HellaSwagItem {
+            id: "bad2".to_string(),
+            activity_label: "x".to_string(),
+            ctx: "y".to_string(),
+            endings: vec!["a".to_string(), "b".to_string()],
+            label: 5, // out of range for 2 endings
+        };
+        let dataset = HellaSwagDataset::from_items(vec![bad]);
+        let mc = dataset.as_mc_dataset();
+        assert!(
+            mc.questions.is_empty(),
+            "an out-of-range label must be skipped, not silently added; got {:?}",
+            mc.questions
+        );
+    }
+
+    #[test]
+    fn as_mc_dataset_still_converts_well_formed_items() {
+        // Regression guard: the switch to `try_add` must not reject valid
+        // HellaSwag items.
+        let item = HellaSwagItem {
+            id: "42".to_string(),
+            activity_label: "Cooking".to_string(),
+            ctx: "She stirred the pot.".to_string(),
+            endings: vec![
+                "A".to_string(),
+                "B".to_string(),
+                "C".to_string(),
+                "D".to_string(),
+            ],
+            label: 2,
+        };
+        let dataset = HellaSwagDataset::from_items(vec![item]);
+        let mc = dataset.as_mc_dataset();
+        assert_eq!(mc.questions.len(), 1);
+        assert_eq!(mc.questions[0].correct_answer, 2);
+        assert_eq!(mc.questions[0].choices.len(), 4);
     }
 }

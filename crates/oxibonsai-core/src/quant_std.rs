@@ -100,11 +100,32 @@ impl BlockQ4_0 {
 
     /// Quantize f32 input into Q4_0 blocks.
     ///
-    /// Input length must be a multiple of `QK_Q4_0` (32).
+    /// Byte-exact transliteration of ggml's `quantize_row_q4_0_ref`
+    /// (`ggml/src/ggml-quants.c:148-178`):
     ///
-    /// Scale = `max(|input|) / 7.0`; nibble = `clamp(round(x / scale + 8), 0, 15)`.
+    /// ```text
+    /// amax = max|v|, remembering the SIGNED v at that position as `max`
+    /// d    = max / -8          (may be negative — the sign of d is load-bearing)
+    /// id   = d != 0 ? 1/d : 0
+    /// xi   = min(15, (int8_t)(x*id + 8.5))
+    /// ```
+    ///
+    /// The previous `scale = max_abs / 7.0` form was always non-negative and so
+    /// mapped the block onto nibbles 1..=15 only, discarding one of the sixteen
+    /// levels (~12.5 % coarser than llama.cpp for the same bits). Decoding is
+    /// unchanged — `(nibble - 8) * d` — so files stay interoperable either way.
+    ///
+    /// `id` is derived from the **f32** `d`, exactly as ggml does, not from the
+    /// f16-rounded value; deriving it from the f16 would make OxiBonsai's Q4_0
+    /// output differ from llama.cpp's on blocks whose `max / -8` is not
+    /// f16-representable.
+    ///
+    /// An all-zero block yields `d = 0` and `qs = [0x88; 16]` (nibble 8 on both
+    /// halves), which falls out of the formula rather than needing a special case.
+    ///
+    /// Input length must be a multiple of `QK_Q4_0` (32).
     pub fn quantize(input: &[f32]) -> BonsaiResult<Vec<Self>> {
-        if input.len() % QK_Q4_0 != 0 {
+        if !input.len().is_multiple_of(QK_Q4_0) {
             return Err(BonsaiError::KQuantError {
                 reason: format!(
                     "Q4_0 quantize: input len {} not a multiple of {}",
@@ -120,41 +141,32 @@ impl BlockQ4_0 {
             let base = block_idx * QK_Q4_0;
             let chunk = &input[base..base + QK_Q4_0];
 
-            let max_abs = chunk
-                .iter()
-                .filter(|v| !v.is_nan())
-                .map(|v| v.abs())
-                .fold(0.0f32, f32::max);
-
-            if max_abs == 0.0 {
-                blocks.push(BlockQ4_0 {
-                    d: f16::ZERO,
-                    qs: [0x88u8; 16], // nibble 8 → w = d*(8-8) = 0
-                });
-                continue;
+            // Track the signed extremum, not just its magnitude. NaN inputs are
+            // skipped here exactly as in C (`amax < fabsf(NaN)` is false).
+            let mut amax = 0.0f32;
+            let mut max = 0.0f32;
+            for &v in chunk {
+                if amax < v.abs() {
+                    amax = v.abs();
+                    max = v;
+                }
             }
 
-            // Scale maps range [-max_abs, +max_abs] to [-7, +7]; centroid at nibble 8.
-            let scale = max_abs / 7.0;
+            let scale = max / -8.0;
+            let inv_scale = if scale != 0.0 { 1.0 / scale } else { 0.0 };
             let d = f16::from_f32(scale);
-            // Use the f16-rounded scale for quantization consistency.
-            let scale_actual = d.to_f32();
-            let inv_scale = if scale_actual == 0.0 {
-                0.0
-            } else {
-                1.0 / scale_actual
-            };
 
             let half = QK_Q4_0 / 2; // = 16
             let mut qs = [0u8; 16];
             for j in 0..half {
-                let v0 = chunk[j];
-                let v1 = chunk[j + half];
                 // Lower nibble ← element j, upper nibble ← element j + half.
-                // This mirrors llama.cpp `quantize_row_q4_0`:
-                //   qs[j] = nibble(v0) | (nibble(v1) << 4)
-                let n0 = (v0 * inv_scale + 8.5).clamp(0.0, 15.0) as u8 & 0x0F;
-                let n1 = (v1 * inv_scale + 8.5).clamp(0.0, 15.0) as u8 & 0x0F;
+                let x0 = chunk[j] * inv_scale;
+                let x1 = chunk[j + half] * inv_scale;
+                // `(int8_t)(x + 8.5)` truncates toward zero; the argument is in
+                // [0.5, 16.5] so `as i8` (saturating in Rust, and never reached
+                // out of range here) matches the C cast bit for bit.
+                let n0 = ((x0 + 8.5) as i8).min(15) as u8 & 0x0F;
+                let n1 = ((x1 + 8.5) as i8).min(15) as u8 & 0x0F;
                 qs[j] = n0 | (n1 << 4);
             }
 
@@ -171,7 +183,7 @@ impl BlockQ4_0 {
     /// of `BLOCK_Q4_0_BYTES` or the pointer is not 2-byte aligned (required
     /// for the embedded `f16` field).
     pub fn slice_from_bytes(data: &[u8]) -> BonsaiResult<&[Self]> {
-        if data.len() % BLOCK_Q4_0_BYTES != 0 {
+        if !data.len().is_multiple_of(BLOCK_Q4_0_BYTES) {
             return Err(BonsaiError::KQuantError {
                 reason: format!(
                     "Q4_0 slice_from_bytes: byte len {} not a multiple of {}",
@@ -264,7 +276,7 @@ impl BlockQ8_0 {
     ///
     /// Scale = `max(|x|) / 127`; `qs[j] = clamp(round(x / scale), -127, 127)`.
     pub fn quantize(input: &[f32]) -> BonsaiResult<Vec<Self>> {
-        if input.len() % QK_Q8_0 != 0 {
+        if !input.len().is_multiple_of(QK_Q8_0) {
             return Err(BonsaiError::KQuantError {
                 reason: format!(
                     "Q8_0 quantize: input len {} not a multiple of {}",
@@ -322,7 +334,7 @@ impl BlockQ8_0 {
     /// of `BLOCK_Q8_0_BYTES` or the pointer is not 2-byte aligned (required
     /// for the embedded `f16` field).
     pub fn slice_from_bytes(data: &[u8]) -> BonsaiResult<&[Self]> {
-        if data.len() % BLOCK_Q8_0_BYTES != 0 {
+        if !data.len().is_multiple_of(BLOCK_Q8_0_BYTES) {
             return Err(BonsaiError::KQuantError {
                 reason: format!(
                     "Q8_0 slice_from_bytes: byte len {} not a multiple of {}",

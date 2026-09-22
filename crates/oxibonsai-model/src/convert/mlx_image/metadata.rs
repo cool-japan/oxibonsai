@@ -6,8 +6,9 @@
 //! are namespaced under `bonsai-image.*` to avoid colliding with the `llm.*`
 //! keys used by the text models.
 
-use oxibonsai_core::gguf::tensor_info::keys;
-use oxibonsai_core::gguf::writer::{GgufWriter, MetadataWriteValue};
+use oxibonsai_core::gguf::writer::{GgufWriter, MetadataWriteValue, TensorType};
+
+use crate::convert::meta::{write_general_metadata, GeneralMetadata};
 
 /// FLUX.2 DiT architecture constants (from the converter design doc).
 #[derive(Debug, Clone, Copy)]
@@ -80,18 +81,16 @@ pub mod arch_keys {
 }
 
 /// Write `bonsai-image` architecture metadata into a GGUF writer.
-pub fn write_dit_metadata(writer: &mut GgufWriter, arch: &DitArch, model_name: &str) {
-    writer.add_metadata(
-        keys::GENERAL_ARCHITECTURE,
-        MetadataWriteValue::Str(arch_keys::ARCHITECTURE.to_string()),
-    );
-    writer.add_metadata(
-        keys::GENERAL_NAME,
-        MetadataWriteValue::Str(model_name.to_string()),
-    );
-    writer.add_metadata(
-        "general.quantization_version",
-        MetadataWriteValue::Str("TQ2_0_G128".to_string()),
+///
+/// `general.quantization_version` goes through
+/// [`crate::convert::meta::write_general_metadata`], which types it as a
+/// **U32** — this was the third of the three sites that wrote it as a GGUF
+/// string, a type no spec-conforming reader (including OxiBonsai's own
+/// `get_u32`) accepts (core-gguf-02).
+pub fn write_dit_metadata(writer: &mut GgufWriter<'_>, arch: &DitArch, model_name: &str) {
+    write_general_metadata(
+        writer,
+        &GeneralMetadata::new(arch_keys::ARCHITECTURE, model_name, TensorType::TQ2_0_g128),
     );
 
     writer.add_metadata(
@@ -164,6 +163,25 @@ mod tests {
         assert_eq!(
             u32::from_le_bytes(bytes[0..4].try_into().expect("slice")),
             0x4655_4747
+        );
+    }
+
+    #[test]
+    fn quantization_version_is_a_u32_here_too() {
+        use oxibonsai_core::gguf::reader::GgufFile;
+
+        let mut w = GgufWriter::new();
+        write_dit_metadata(&mut w, &DitArch::default(), "bonsai-image-4B");
+        let bytes = w.to_bytes().expect("serialise");
+        let gguf = GgufFile::parse(&bytes).expect("parse");
+        assert_eq!(
+            gguf.metadata.get_u32("general.quantization_version").ok(),
+            Some(2),
+            "core-gguf-02: the image converter was the third site writing this as a string"
+        );
+        assert_eq!(
+            gguf.metadata.get_string("general.architecture").ok(),
+            Some("bonsai-image")
         );
     }
 }

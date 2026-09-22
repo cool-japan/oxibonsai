@@ -41,14 +41,13 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use oxibonsai_core::gguf::writer::{GgufWriter, TensorEntry, TensorType};
-use oxibonsai_core::quant_ternary::BlockTQ2_0_g128;
+use oxibonsai_core::gguf::writer::{GgufWriter, TensorEntry};
 use oxionnx_proto::types::{NodeProto, TensorProto};
 
 use crate::convert::common::{
-    blocks_to_bytes, pad_to_multiple_of_128, read_config_json, write_metadata, ConvertStats,
+    self, read_config_json, write_metadata, ConvertStats, UnmappedReport,
 };
-use crate::quantize::quantize_q1_0_g128;
+use crate::quantize::{encode_quantized_tensor, ScaleRule, SourceDtype};
 
 pub use self::error::{DequantError, OnnxImportError};
 pub use self::role_map::OnnxRole;
@@ -66,6 +65,9 @@ pub use self::role_map::OnnxRole;
 ///   or `"q1_0_g128"` (1-bit sign + FP16 group scale). Both use 128-element
 ///   groups; norm/embedding-role tensors are always kept FP32.
 ///
+/// Equivalent to [`convert_onnx_to_gguf_with_options`] with
+/// `allow_unmapped = false`.
+///
 /// # Errors
 ///
 /// Returns an [`OnnxImportError`] on any I/O, parse, unsupported `quant`
@@ -75,12 +77,42 @@ pub fn convert_onnx_to_gguf(
     to_path: &Path,
     quant: &str,
 ) -> Result<ConvertStats, OnnxImportError> {
-    if quant != "tq2_0_g128" && quant != "q1_0_g128" {
-        return Err(OnnxImportError::Other(format!(
-            "unsupported quantisation format '{quant}'; supported formats are 'tq2_0_g128' and \
-             'q1_0_g128'"
-        )));
-    }
+    convert_onnx_to_gguf_with_options(onnx_path, to_path, quant, false)
+}
+
+/// Convert a HuggingFace MatMulNBits-quantized ONNX model into an OxiBonsai
+/// GGUF file, optionally tolerating source initializers that have no
+/// mapping.
+///
+/// `allow_unmapped` corresponds to the CLI's `--allow-unmapped`, mirroring
+/// [`crate::convert::convert_hf_to_gguf_with_options`] (CQ-04): without it,
+/// an unclassified initializer that *looks like* a real weight (its name
+/// ends in `.weight`/`_weight` or `.bias`/`_bias`) is a hard error naming
+/// every such tensor, instead of a silent `continue` and a success message.
+/// Initializers that do **not** look like weights — RoPE cos/sin caches,
+/// KV-cache placeholders, opset markers, and other ONNX graph plumbing that
+/// legitimately has no GGUF counterpart — are never treated as a mapping
+/// failure: a blanket hard error on every unclassified initializer would
+/// refuse real models that legitimately carry such tensors.
+///
+/// # Errors
+///
+/// Returns an [`OnnxImportError`] on any I/O, parse, unsupported `quant`
+/// value, or conversion failure, including [`OnnxImportError::Other`] when
+/// one or more initializers that look like real weights have no mapping and
+/// `allow_unmapped` is `false`.
+pub fn convert_onnx_to_gguf_with_options(
+    onnx_path: &Path,
+    to_path: &Path,
+    quant: &str,
+    allow_unmapped: bool,
+) -> Result<ConvertStats, OnnxImportError> {
+    let target_type = common::quant_format_tensor_type(quant).ok_or_else(|| {
+        OnnxImportError::Other(format!(
+            "unsupported quantisation format '{quant}'; supported formats are {:?}",
+            common::SUPPORTED_QUANT_FORMATS
+        ))
+    })?;
 
     // ── 1. Parse ONNX and memory-map sidecar on demand ──────────────────────
     let mut reader = reader::OnnxReader::open(onnx_path)?;
@@ -99,7 +131,10 @@ pub fn convert_onnx_to_gguf(
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("unknown");
-    write_metadata(&mut writer, &config, model_name, quant)
+    // The tokenizer usually sits beside the repository root, two levels above
+    // `model.onnx`; `TokenizerMetadata::discover` walks up from here.
+    let tokenizer_dir = onnx_path.parent();
+    write_metadata(&mut writer, &config, model_name, quant, tokenizer_dir)
         .map_err(|e| OnnxImportError::Other(format!("writing metadata: {e}")))?;
 
     let tie_word_embeddings = config
@@ -146,8 +181,19 @@ pub fn convert_onnx_to_gguf(
         .map(|t| t.name.clone())
         .collect();
 
+    // Every initializer the classifier does not recognise is either graph
+    // plumbing (counted but never fatal) or a real weight with no mapping
+    // (CQ-04: reported and, unless `allow_unmapped`, a hard error below).
+    let mut report = UnmappedReport::default();
+    let mut ignored_plumbing = 0usize;
+
     for name in &init_names {
         let Some(role) = role_map::classify_initializer(name, num_hidden_layers) else {
+            if looks_like_unmapped_weight(name) {
+                report.push_unmapped(name);
+            } else {
+                ignored_plumbing += 1;
+            }
             continue;
         };
         match role {
@@ -200,6 +246,13 @@ pub fn convert_onnx_to_gguf(
             }
         }
     }
+
+    // Fail fast, before any MatMulNBits dequantization work or file I/O,
+    // naming every initializer that looks like a real weight but has no
+    // mapping — unless the caller explicitly opted out (CQ-04).
+    report
+        .check(allow_unmapped)
+        .map_err(|e| OnnxImportError::Other(e.to_string()))?;
 
     // ── 4b. MatMulNBits nodes: dequantize each into row-major [N,K] f32 ─────
     // Snapshot the node metadata we need, so we can then borrow `reader`
@@ -454,53 +507,37 @@ pub fn convert_onnx_to_gguf(
     }
 
     // ── 6. Emit tensors ─────────────────────────────────────────────────────
-    let mut stats = ConvertStats::default();
+    //
+    // The dequantized `MatMulNBits` payload is a continuous f32 tensor, so
+    // the ternary encoders use the error-minimising `AbsMean` scale rather
+    // than absmax (CQ-03); groups that are already ternary — which is what a
+    // 2-bit source dequantizes to — are detected and keep the absmax
+    // encoding, so those round-trip bit-identically.
+    let mut stats = ConvertStats {
+        n_unmapped: report.count(),
+        ..ConvertStats::default()
+    };
 
     for pending in gguf_entries.values() {
-        let (raw_bytes, tensor_type) = match pending.kind {
-            TensorKind::Norm => {
-                let raw: Vec<u8> = pending
-                    .f32_data
-                    .iter()
-                    .flat_map(|f| f.to_le_bytes())
-                    .collect();
-                (raw, TensorType::F32)
-            }
-            TensorKind::Weight if quant == "q1_0_g128" => {
-                // Q1_0_g128: 1-bit sign + FP16 group scale, same 128-element
-                // group size and padding as TQ2_0_g128. Uses the canonical
-                // sign convention shared with
-                // `oxibonsai_core::tensor::BlockQ1_0G128` (see
-                // `crate::quantize` module docs): bit=1 -> +scale, bit=0 -> -scale.
-                let padded = pad_to_multiple_of_128(&pending.f32_data);
-                let raw = quantize_q1_0_g128(&padded).map_err(|e| OnnxImportError::Requantize {
+        let is_norm = pending.kind == TensorKind::Norm;
+        let tensor_type = common::tensor_type_for(
+            &pending.gguf_name,
+            &pending.gguf_shape,
+            SourceDtype::F32,
+            target_type,
+            is_norm,
+        );
+        let ne0 = pending.gguf_shape.first().copied().unwrap_or(0) as usize;
+        let raw_bytes =
+            encode_quantized_tensor(&pending.f32_data, ne0, tensor_type, ScaleRule::AbsMean)
+                .map_err(|e| OnnxImportError::Requantize {
                     tensor: pending.gguf_name.clone(),
-                    msg: format!("{e}"),
+                    msg: format!("{}", e.with_tensor(&pending.gguf_name)),
                 })?;
-                (raw, TensorType::Q1_0G128)
-            }
-            TensorKind::Weight => {
-                let padded = pad_to_multiple_of_128(&pending.f32_data);
-                let blocks = BlockTQ2_0_g128::quantize(&padded).map_err(|e| {
-                    OnnxImportError::Requantize {
-                        tensor: pending.gguf_name.clone(),
-                        msg: format!("{e}"),
-                    }
-                })?;
-                let raw = blocks_to_bytes(&blocks);
-                (raw, TensorType::TQ2_0_g128)
-            }
-        };
 
         println!(
-            "  converting {} {:?} -> {}",
-            pending.gguf_name,
-            pending.gguf_shape,
-            match pending.kind {
-                TensorKind::Norm => "F32",
-                TensorKind::Weight if quant == "q1_0_g128" => "Q1_0_g128",
-                TensorKind::Weight => "TQ2_0_g128",
-            }
+            "  converting {} {:?} -> {:?}",
+            pending.gguf_name, pending.gguf_shape, tensor_type
         );
 
         writer.add_tensor(TensorEntry {
@@ -510,13 +547,8 @@ pub fn convert_onnx_to_gguf(
             data: raw_bytes,
         });
 
-        match pending.kind {
-            TensorKind::Norm => stats.n_fp32 += 1,
-            TensorKind::Weight => stats.n_ternary += 1,
-        }
-        stats.n_tensors += 1;
+        common::record_tensor(&mut stats, tensor_type);
     }
-
     // ── 7. Write GGUF file ──────────────────────────────────────────────────
     let out_file = std::fs::File::create(to_path).map_err(|e| OnnxImportError::Io {
         path: to_path.to_path_buf(),
@@ -528,10 +560,48 @@ pub fn convert_onnx_to_gguf(
         .map_err(|e| OnnxImportError::GgufWrite(format!("{e}")))?;
 
     stats.output_bytes = bytes_written;
+    println!(
+        "  {} source initializer(s) were not mapped to a GGUF tensor{}",
+        stats.n_unmapped,
+        if stats.n_unmapped > 0 {
+            format!(" (--allow-unmapped):\n{}", report.describe())
+        } else {
+            String::new()
+        }
+    );
+    if ignored_plumbing > 0 {
+        tracing::debug!(
+            count = ignored_plumbing,
+            "ignored non-weight ONNX initializers (RoPE caches, KV-cache placeholders, opset \
+             markers, …) with no GGUF counterpart"
+        );
+    }
     Ok(stats)
 }
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
+
+/// Whether an ONNX initializer name that [`role_map::classify_initializer`]
+/// did not recognise looks like it should nonetheless have mapped to a real
+/// GGUF weight tensor.
+///
+/// HuggingFace / PyTorch state-dict parameters are always named
+/// `<path>.weight` or `<path>.bias`; `onnx-community`-style exports flatten
+/// the path with underscores instead (`model_layers_0_..._weight`). Nothing
+/// else reaching the classifier is a parameter — RoPE cos/sin caches,
+/// KV-cache scratch buffers, opset version markers and other ONNX graph
+/// plumbing carry no such suffix. A blanket hard error on every
+/// unclassified initializer would therefore refuse real models that
+/// legitimately carry such tensors (CQ-04's ONNX half): only names that pass
+/// this check are treated as a genuine mapping failure.
+fn looks_like_unmapped_weight(name: &str) -> bool {
+    for suffix in [".weight", ".bias", "_weight", "_bias"] {
+        if name.ends_with(suffix) {
+            return true;
+        }
+    }
+    false
+}
 
 /// Tag describing how a pending tensor should be serialised.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -698,4 +768,43 @@ fn resolve_matmul_input_tensor(
     Err(OnnxImportError::MissingNamedInitializer {
         name: name.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CQ-04: the exact names `role_map::classify_initializer`'s own tests
+    /// (`classify_unknown_name_is_none`) prove are legitimately unmapped
+    /// graph plumbing must never be treated as a missing weight.
+    #[test]
+    fn graph_plumbing_is_never_treated_as_a_missing_weight() {
+        for name in [
+            "opset_version",
+            "past_key_values.0.key",
+            "cos_cache",
+            "sin_cache",
+        ] {
+            assert!(
+                !looks_like_unmapped_weight(name),
+                "{name} is graph plumbing, not a weight"
+            );
+        }
+    }
+
+    /// A real weight the classifier failed to recognise — either naming
+    /// convention — must be flagged.
+    #[test]
+    fn unrecognised_weight_names_are_flagged_in_both_naming_conventions() {
+        assert!(looks_like_unmapped_weight(
+            "model.layers.0.mystery_proj.weight"
+        ));
+        assert!(looks_like_unmapped_weight("some_module.bias"));
+        // onnx-community flattens the HF path with underscores instead of
+        // dots when no recognised MatMulNBits suffix is present.
+        assert!(looks_like_unmapped_weight(
+            "model_layers_0_attn_q_proj_MatMul_weight"
+        ));
+        assert!(looks_like_unmapped_weight("model_layers_0_mystery_bias"));
+    }
 }

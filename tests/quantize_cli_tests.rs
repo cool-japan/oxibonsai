@@ -16,6 +16,12 @@ use oxibonsai_model::export::{export_to_gguf, ExportConfig, ExportFormat, Weight
 /// Build a minimal but valid synthetic GGUF file at `path`, containing one
 /// "embedding" tensor (which the default fp32-exception list keeps in f32)
 /// and one "weight" tensor eligible for quantization.
+///
+/// `blk.0.attn_q.weight` must have a first dimension that is a whole number
+/// of Q4_0 blocks (32), because ggml quantizes each row independently and
+/// hard-rejects any other shape (`ggml/src/gguf.cpp:721-727`) — the writer
+/// now refuses to emit one too. `token_embd.weight` stays f32, so its `ne0`
+/// is unconstrained.
 fn write_synthetic_gguf(path: &std::path::Path) {
     let tensors = vec![
         WeightTensor::new(
@@ -25,8 +31,8 @@ fn write_synthetic_gguf(path: &std::path::Path) {
         ),
         WeightTensor::new(
             "blk.0.attn_q.weight",
-            (0..64).map(|i| (i as f32 * 0.037).sin()).collect(),
-            vec![8, 8],
+            (0..256).map(|i| (i as f32 * 0.037).sin()).collect(),
+            vec![32, 8],
         ),
     ];
     let config = ExportConfig::new(ExportFormat::Float32, "quantize-cli-test-source");

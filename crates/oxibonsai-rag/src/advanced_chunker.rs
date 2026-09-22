@@ -104,14 +104,20 @@ impl ChunkStrategy for SentenceChunker {
             let mut group: Vec<&str> = Vec::new();
             let mut total_chars = 0usize;
 
-            // Build a group of sentences that fit within max_chars
+            // Build a group of sentences that fit within max_chars.
+            //
+            // Counts *characters* (`RichChunk::len()`'s own unit), not
+            // bytes: `s.len()` used to be compared directly against
+            // `self.max_chars`, so a CJK sentence's multi-byte-per-char
+            // encoding made the group fill up (and stop packing further
+            // sentences in) at roughly 1/3 of the configured budget.
             let mut j = i;
             while j < sentences.len() {
                 let s = sentences[j];
                 let added = if group.is_empty() {
-                    s.len()
+                    s.chars().count()
                 } else {
-                    s.len() + 1
+                    s.chars().count() + 1
                 };
                 if !group.is_empty() && total_chars + added > self.max_chars {
                     break;
@@ -676,6 +682,51 @@ mod inline_tests {
         let text = "Hello world. This is a test. Another sentence here.";
         let chunks = chunker.chunk(text);
         assert!(!chunks.is_empty());
+    }
+
+    #[test]
+    fn sentence_chunker_packs_cjk_sentences_by_char_count_not_byte_count() {
+        // Each sentence is 8 *chars* (7 CJK codepoints, each 3 UTF-8 bytes,
+        // plus an ASCII '.') but 22 *bytes* -- the same byte-vs-char class
+        // as RAG-EVAL-IMG-20, reproduced inside `SentenceChunker::chunk`
+        // (RichChunk::len() counts chars, but the accumulation used to
+        // compare `s.len()` (bytes) against `max_chars`).
+        let sentence = "日本語のテスト.";
+        assert_eq!(sentence.chars().count(), 8, "sanity: 8 chars");
+        assert_eq!(sentence.len(), 22, "sanity: 22 bytes");
+        let text = format!("{sentence} {sentence} {sentence}");
+
+        let chunker = SentenceChunker::new(20);
+        let chunks = chunker.chunk(&text);
+
+        // Every chunk must respect the budget in CHARS (RichChunk::len()).
+        for c in &chunks {
+            assert!(
+                c.len() <= 20,
+                "chunk {:?} has {} chars, exceeds max_chars=20",
+                c.text,
+                c.len()
+            );
+        }
+
+        // With a correct char-based budget, two 8-char sentences (17 chars
+        // joined by one space) fit comfortably under 20 and must be packed
+        // into the same chunk. A byte-based accumulation instead sees ~22
+        // "chars" from the very first sentence alone -- already over
+        // budget -- and emits one sentence per chunk (3 chunks, not 2).
+        assert_eq!(
+            chunks.len(),
+            2,
+            "expected two 8-char CJK sentences to pack into one 20-char-budget \
+             chunk; got {} chunks: {:?}",
+            chunks.len(),
+            chunks.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            chunks[0].len(),
+            17,
+            "first chunk should contain both packed sentences (17 chars)"
+        );
     }
 
     #[test]

@@ -17,23 +17,85 @@ pub type TokenSeq = Vec<String>;
 // Tokenization
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Tokenize a string into words (lowercase, split on whitespace/punctuation).
+/// Tokenize a string into words (lowercase, split on whitespace/punctuation,
+/// with a character n-gram fallback for CJK scripts).
 ///
-/// Splits on whitespace, then strips leading/trailing punctuation from each
-/// token and lowercases.  Empty tokens are discarded.
+/// Non-alphanumeric characters (whitespace, punctuation, symbols) are token
+/// separators. A run of alphanumeric characters from a script that uses
+/// inter-word spaces (Latin, Cyrillic, digits, …) becomes one lowercased
+/// word token, exactly as before. A run of CJK characters (Chinese Han
+/// ideographs, Japanese Hiragana/Katakana, Korean Hangul) — scripts that do
+/// **not** use inter-word spaces — is instead split into one token per
+/// character, matching sacreBLEU's `zh`/`ja` tokenizer fallback. Without
+/// this, an entire unspaced CJK sentence collapses into a single token and
+/// every n-gram order above 1 is empty (RAG-EVAL-IMG-06: BLEU of an
+/// identical Japanese sentence was 0.0). Empty tokens are never produced.
+///
+/// This is the single shared tokenizer behind ROUGE, BLEU, METEOR
+/// ([`mod@crate::meteor`]) and SQuAD-style QA ([`crate::qa::normalize_tokens`]),
+/// so all of them gained CJK support from one fix.
 pub fn tokenize(text: &str) -> TokenSeq {
-    text.split_whitespace()
-        .filter_map(|word| {
-            // Strip non-alphanumeric characters from both ends.
-            let stripped: String = word.chars().filter(|c| c.is_alphanumeric()).collect();
-            let lower = stripped.to_lowercase();
-            if lower.is_empty() {
-                None
-            } else {
-                Some(lower)
+    cjk_aware_tokens(&text.to_lowercase())
+}
+
+/// Shared low-level tokenizer: split `s` into maximal runs of alphanumeric
+/// characters, further splitting any CJK run into individual one-character
+/// tokens (see [`tokenize`] and [`crate::qa::normalize_tokens`], the two
+/// callers that layer their own pre-processing — lowercasing, or full SQuAD
+/// normalisation — on top of this).
+pub(crate) fn cjk_aware_tokens(s: &str) -> TokenSeq {
+    let mut out = Vec::new();
+    let mut word = String::new();
+    for c in s.chars() {
+        if !c.is_alphanumeric() {
+            if !word.is_empty() {
+                out.push(std::mem::take(&mut word));
             }
-        })
-        .collect()
+            continue;
+        }
+        if is_cjk_char(c) {
+            if !word.is_empty() {
+                out.push(std::mem::take(&mut word));
+            }
+            out.push(c.to_string());
+        } else {
+            word.push(c);
+        }
+    }
+    if !word.is_empty() {
+        out.push(word);
+    }
+    out
+}
+
+/// Returns `true` for a character from a script that is conventionally
+/// written **without** spaces between words (Chinese Han ideographs,
+/// Japanese Hiragana/Katakana, Korean Hangul) — sacreBLEU's `zh`/`ja`
+/// tokenizers therefore treat every such character as its own token rather
+/// than treating an unspaced run as a single (near-meaningless) word.
+///
+/// Block ranges mirror sacreBLEU's `tokenizer_zh._is_chinese_char` (the CJK
+/// Unified Ideographs block and its extensions, plus CJK compatibility
+/// ideographs), extended to the Japanese kana blocks and Hangul so
+/// Japanese/Korean text is handled the same way. This crate cannot depend
+/// on `unicode-segmentation` (would require a `Cargo.toml` change outside
+/// this package's owned files), so the ranges are hand-coded against
+/// `char`'s already-Unicode-aware `is_alphanumeric`/`is_whitespace` rather
+/// than a full UAX #29 segmenter.
+pub(crate) fn is_cjk_char(c: char) -> bool {
+    matches!(c as u32,
+        0x1100..=0x11FF     // Hangul Jamo
+        | 0x3040..=0x309F   // Hiragana
+        | 0x30A0..=0x30FF   // Katakana
+        | 0x3400..=0x4DBF   // CJK Unified Ideographs Extension A
+        | 0x4E00..=0x9FFF   // CJK Unified Ideographs
+        | 0xAC00..=0xD7A3   // Hangul Syllables
+        | 0xF900..=0xFAFF   // CJK Compatibility Ideographs
+        | 0xFF66..=0xFF9D   // Halfwidth Katakana
+        | 0x20000..=0x2A6DF // CJK Unified Ideographs Extension B
+        | 0x2A700..=0x2EBEF // CJK Unified Ideographs Extensions C–F
+        | 0x2F800..=0x2FA1F // CJK Compatibility Ideographs Supplement
+    )
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

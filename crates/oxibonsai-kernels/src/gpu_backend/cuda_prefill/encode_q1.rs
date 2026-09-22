@@ -11,8 +11,10 @@ use std::sync::Arc;
 use cudarc::driver::{CudaSlice, CudaView};
 
 use crate::gpu_backend::cuda_full_layer::{
-    encode_attn_phase, CudaAttnModules, CudaFullLayerBuffers, CudaKvCache,
+    acquire_prefill_rope_chunk, encode_attn_phase, CudaAttnModules, CudaFullLayerBuffers,
+    CudaKvCache,
 };
+
 use crate::gpu_backend::cuda_graph::{CudaGraph, CudaGraphError};
 
 use super::launchers::{launch_batched_rmsnorm, launch_fused_gate_up_swiglu_gemm, launch_gemm_v7};
@@ -167,15 +169,32 @@ pub(super) unsafe fn encode_prefill_layer(
     //
     // For each token t at sequence position (pos_start + t), we:
     //   a) Copy this token's hidden state into st_bufs.d_hidden
-    //   b) Upload pos/seqlen [pos, pos+1] into st_bufs.d_pos_seqlen so the
-    //      fused KV-store writes at the correct position and attention spans
-    //      exactly positions 0..=pos
-    //   c) Copy this token's RoPE cos/sin into st_bufs.d_cos/d_sin
-    //   d) Run the standard single-token attention kernels (rmsnorm, qkv gemv,
-    //      qk-norm+rope, kv-store, scores, softmax, weighted sum)
-    //   e) Copy attention output back into the column of pb.d_attn_out
+    //   b) Run the standard single-token attention kernels (rmsnorm, qkv gemv,
+    //      qk-norm+rope, kv-store, scores, softmax, weighted sum), pointed at
+    //      this token's slice of the chunk-resident position/RoPE upload
+    //   c) Copy attention output back into the column of pb.d_attn_out
+    //
+    // F9 — copy count. This loop used to issue FIVE sub-kilobyte copies per
+    // token: (a), three host-to-device uploads of `[pos, pos+1]` / cos / sin,
+    // and (c). `encode_prefill_layer` runs once per layer and loops over every
+    // token inside, so those three layer-invariant uploads were also repeated
+    // `n_layers` times over — `5 x n_tokens x n_layers` transfers in total.
+    //
+    // The three uploads are now one chunk upload each, hoisted out of the loop
+    // (`acquire_prefill_rope_chunk`), and the per-token attention reads device
+    // views into that buffer. The transfer count becomes
+    // `2 x n_tokens x n_layers + 3 x n_layers`.
+    //
+    // The `[pos, pos+1]` pairs are still strictly per token: they are staged
+    // per token in the chunk and selected by view. A stale position here writes
+    // every token's K/V at the wrong slot of the SHARED decode KV cache, which
+    // is a previously-fixed correctness bug, not a tuning detail.
+    //
+    // (a) and (c) remain: `graph.launch_rmsnorm_pub` takes `&CudaSlice` for its
+    // input and `launch_batched_attn_weighted_sum` writes `bufs.d_attn_out`
+    // whole, so removing them needs signature changes in files outside this
+    // package's grant — recorded as a deviation.
     // ════════════════════════════════════════════════════════════════════
-    let f_size = std::mem::size_of::<f32>();
 
     // Zero out d_attn_out before the sequential attention loop.
     {
@@ -186,6 +205,14 @@ pub(super) unsafe fn encode_prefill_layer(
             .memset_zeros(&mut dst_view)
             .map_err(|e| CudaGraphError::DriverError(format!("zero d_attn_out: {e}")))?;
     }
+
+    // F9: one upload of the whole chunk's positions and RoPE tables, replacing
+    // `3 x bs` per-token uploads.
+    let mut chunk_guard =
+        acquire_prefill_rope_chunk(graph, pos_start, bs, half_dim, cos_table, sin_table)?;
+    let chunk = chunk_guard.as_mut().ok_or_else(|| {
+        CudaGraphError::DriverError("prefill rope chunk missing after upload".to_string())
+    })?;
 
     for t in 0..bs {
         let pos = pos_start + t;
@@ -200,44 +227,17 @@ pub(super) unsafe fn encode_prefill_layer(
                 .map_err(|e| CudaGraphError::DriverError(format!("copy hidden t={t}: {e}")))?;
         }
 
-        // Upload pos/seqlen [pos, pos+1] into st_bufs.d_pos_seqlen.
-        //
-        // The fused KV-store kernel reads the write position from
-        // d_pos_seqlen[0] and the attention span (seq_len) from d_pos_seqlen[1].
-        // Without this per-token upload the Q1 batch-prefill path would write
-        // every token's K/V at a stale/zero position and attend over the wrong
-        // span, corrupting the shared decode KV cache (the ternary loop already
-        // does this — mirror it here).
-        let pos_seqlen = [pos as u32, (pos + 1) as u32];
-        graph
-            .stream_arc()
-            .memcpy_htod(&pos_seqlen, &mut st_bufs.d_pos_seqlen)
-            .map_err(|e| CudaGraphError::DriverError(format!("upload pos_seqlen t={t}: {e}")))?;
-
-        // Upload RoPE cos/sin for this token's position.
-        let rope_off = t * half_dim;
-        graph
-            .stream_arc()
-            .memcpy_htod(
-                &cos_table[rope_off..rope_off + half_dim],
-                &mut st_bufs.d_cos,
-            )
-            .map_err(|e| CudaGraphError::DriverError(format!("upload cos t={t}: {e}")))?;
-        graph
-            .stream_arc()
-            .memcpy_htod(
-                &sin_table[rope_off..rope_off + half_dim],
-                &mut st_bufs.d_sin,
-            )
-            .map_err(|e| CudaGraphError::DriverError(format!("upload sin t={t}: {e}")))?;
+        // Views into the chunk upload: `[pos, pos+1]` plus this token's RoPE
+        // cosines and sines. The KV-store kernel reads the write position from
+        // element 0 and the attention span from element 1.
+        let token_inputs = chunk.token(t)?;
 
         // Run the single-token attention pipeline (rmsnorm → QKV GEMV →
         // qk-norm+rope → kv-store → scores → softmax → weighted sum).
         // encode_attn_phase reads from st_bufs.d_hidden (set above) and computes
         // its own RMSNorm + fused-QKV GEMV — there is no batched QKV to reuse,
         // which is why the previously-dead batched attn RMSNorm/QKV GEMM above
-        // was removed.  The KV-store and attention steps read the token position
-        // and span from st_bufs.d_pos_seqlen (uploaded above).
+        // was removed.
         encode_attn_phase(
             graph,
             attn_mods,
@@ -255,6 +255,7 @@ pub(super) unsafe fn encode_prefill_layer(
             eps,
             h,
             st_bufs,
+            Some(&token_inputs),
         )?;
 
         // Copy attention output for this token from st_bufs.d_attn_out into
@@ -267,10 +268,8 @@ pub(super) unsafe fn encode_prefill_layer(
                 .memcpy_dtod(&src_view, &mut dst_view)
                 .map_err(|e| CudaGraphError::DriverError(format!("copy attn_out t={t}: {e}")))?;
         }
-
-        // Silence f_size unused warning (used contextually in offset calculations)
-        let _ = f_size;
     }
+    drop(chunk_guard);
 
     // ════════════════════════════════════════════════════════════════════
     // 4. Output projection GEMM + residual (all tokens at once)

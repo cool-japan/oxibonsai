@@ -21,11 +21,41 @@ simd-neon = []
 wasm = []
 cuda = ["gpu", "scirs2-core/gpu"]  # scirs2-core retired its "cuda" Cargo feature in 0.6.x (CUDA now lives in oxicuda-*); GpuBackend::Cuda stays available unconditionally
 native-cuda = ["gpu", "dep:cudarc"]
-native-cuda-11 = ["native-cuda"]  # alias for CUDA 11.x environments (same code path)
+# deps-17 (objc -> objc2): DEFERRED, and this is the FOURTH pass it has been deferred in.
+# Three raw-objc sites: src/lib.rs:83 `extern crate objc;`; metal_graph/buffers.rs:255-263
+# (error / localizedDescription / UTF8String); metal_full_layer/functions.rs:50-51
+# (GPUStartTime / GPUEndTime). metal 0.33.0 has NO safe accessor for any of them:
+# `grep -rn 'gpu_start_time|gpu_end_time|GPUStartTime' ~/.cargo/registry/src/*/metal-0.33.0/src/`
+# is empty, and `localizedDescription` appears only in metal's own device.rs/lib.rs/library.rs.
+# NOT a Pure-Rust-policy item: metal 0.33 itself declares `[dependencies.objc] 0.2.4`, so
+# `cargo tree -i objc` terminates at metal either way — the port is HYGIENE ONLY (one fewer
+# direct dep), and nothing in this repo may claim it is compliance work. Resolving it is a
+# one-step orchestrator choice: grant the root Cargo.toml (an `objc2` [workspace.dependencies]
+# entry is required and no wave-3.5 package has it) to a wave>=4 package, or waive the item.
 metal = ["gpu", "scirs2-core/gpu", "scirs2-core/metal", "dep:metal", "dep:objc"]
 gpu = ["scirs2-core/gpu"]
 avx2 = []
 neon = []
+# Opt-in gate for the `[[bench]]` TARGET only (deps-16 / BENCHES, coordinated
+# naming): `required-features = ["bench"]` below stops cargo from building or
+# running the `kernel_benchmarks` bench binary unless `--features bench` is
+# passed.
+#
+# CORRECTION (this package, wave-3 re-review): this does NOT keep a C
+# compiler out of the crate's dependency graph, despite an earlier version of
+# this comment claiming so. `criterion` 0.8.2 pulls in `alloca` -> `cc` on
+# unix unconditionally (`alloca`'s `default-features = false` cannot drop
+# that edge), and `criterion` is an ordinary, always-resolved
+# `[dev-dependencies]` entry — it is not itself feature-gated, only the bench
+# *target* that uses it is. Verified empirically: with the `alloca`/`criterion`
+# build artifacts removed, `cargo test -p oxibonsai-kernels --features metal
+# --no-run` (no `--features bench`) still compiles both. `cargo tree -e
+# normal,build,dev -p oxibonsai-kernels` shows `alloca -> cc` in the graph
+# with or without this feature. The feature is still correct and worth
+# keeping — it stops the bench binary itself from being requested to build
+# or run without an explicit opt-in — it just is not a Pure-Rust escape
+# hatch for `cc`.
+bench = []
 
 [dependencies]
 oxibonsai-core.workspace = true
@@ -45,10 +75,12 @@ objc = { workspace = true, optional = true }
 [dev-dependencies]
 criterion.workspace = true
 proptest.workspace = true
+oxibonsai-testkit.workspace = true
 
 [[bench]]
 name = "kernel_benchmarks"
 harness = false
+required-features = ["bench"]
 
 [[example]]
 name = "gemv_benchmark"

@@ -8,6 +8,8 @@
 //! - [`BatchEncoder`] — batch tokenization with optional truncation and padding.
 //! - [`BatchEncoding`] — the resulting padded token ID matrix plus attention masks.
 
+use unicode_normalization::UnicodeNormalization;
+
 use crate::{error::TokenizerResult, tokenizer::OxiTokenizer};
 
 // ── TextNormalizer ────────────────────────────────────────────────────────────
@@ -84,13 +86,16 @@ impl TextNormalizer {
         };
 
         // Step 2: strip combining characters (accents).
-        // We use the Unicode general category: combining characters have code
-        // points in the ranges for Mn (Non-spacing Mark), Mc (Spacing Mark),
-        // and Me (Enclosing Mark). A lightweight pure-Rust check is to test
-        // whether the Unicode code point falls into the Combining Diacritical
-        // Marks block or any known combining range.
+        //
+        // Decompose to NFD first (TOK-09 missed-finding fix): a precomposed
+        // character like "é" (U+00E9) has no combining mark to strip at all
+        // under a raw code-point scan, while its decomposed form "e" +
+        // U+0301 does — so without decomposing first, `strip_accents`
+        // silently disagreed on the two Unicode-equivalent spellings of the
+        // same text. Decomposing unconditionally makes both forms produce
+        // the same stripped output.
         if self.strip_accents {
-            result = result.chars().filter(|&c| !is_combining(c)).collect();
+            result = result.nfd().filter(|&c| !is_combining(c)).collect();
         }
 
         // Step 3: collapse interior whitespace.
@@ -120,24 +125,22 @@ impl TextNormalizer {
     }
 }
 
-/// Returns `true` if `c` is a Unicode combining character.
+/// Returns `true` if `c` is a Unicode combining character (general category
+/// `Mn` Non-spacing Mark, `Mc` Spacing Mark, or `Me` Enclosing Mark).
 ///
-/// Covers the main combining blocks used in Latin, Greek, Hebrew, Arabic, etc.
-/// This is a lightweight approximation; a full implementation would use a
-/// Unicode database crate, but we keep it dependency-free here.
+/// TOK-09 missed-finding fix: the previous implementation was a hand-rolled
+/// 4-block range check that covered only a handful of `Mn` blocks (Latin
+/// combining diacritics) and — despite a doc comment claiming otherwise —
+/// missed `Mc` entirely and every combining mark outside those four blocks:
+/// Cyrillic (U+0483–0489), Hebrew points (U+0591–05C7), Arabic diacritics
+/// (U+064B–065F, U+0670), Devanagari matras/virama (U+0900–0903,
+/// U+093A–094F), Thai (U+0E31–0E3A), and more. `unicode-normalization`'s
+/// `is_combining_mark` is a complete, table-driven general-category check
+/// (Pure Rust, already a workspace dependency for NFC — see
+/// `crate::tokenizer::TokenizerConfig::normalize_nfc`), so this now
+/// delegates to it rather than re-deriving an incomplete range list.
 fn is_combining(c: char) -> bool {
-    let cp = c as u32;
-    matches!(
-        cp,
-        // Combining Diacritical Marks (U+0300–U+036F)
-        0x0300..=0x036F
-        // Combining Diacritical Marks Supplement (U+1DC0–U+1DFF)
-        | 0x1DC0..=0x1DFF
-        // Combining Diacritical Marks Extended (U+1AB0–U+1AFF)
-        | 0x1AB0..=0x1AFF
-        // Combining Half Marks (U+FE20–U+FE2F)
-        | 0xFE20..=0xFE2F
-    )
+    unicode_normalization::char::is_combining_mark(c)
 }
 
 // ── ChatTemplate ──────────────────────────────────────────────────────────────
@@ -691,6 +694,49 @@ mod tests {
             !result.contains('\u{0301}'),
             "combining accent should be removed"
         );
+    }
+
+    #[test]
+    fn test_text_normalizer_strip_accents_precomposed_and_decomposed_agree() {
+        // TOK-09 missed-finding fix: precomposed "é" (U+00E9) and decomposed
+        // "e" + U+0301 must strip to the SAME result now that NFD runs
+        // first — before the fix, only the decomposed form had anything to
+        // strip at all.
+        let n = TextNormalizer {
+            strip_accents: true,
+            ..TextNormalizer::new()
+        };
+        let precomposed = n.normalize("caf\u{00e9}");
+        let decomposed = n.normalize("cafe\u{0301}");
+        assert_eq!(precomposed, decomposed);
+        assert_eq!(precomposed, "cafe");
+    }
+
+    #[test]
+    fn test_text_normalizer_strip_accents_covers_non_latin_scripts() {
+        // TOK-09 missed-finding fix: the old 4-block range list covered
+        // only a few Latin-combining-mark blocks. These are the exact
+        // codepoints the finding named as missed: Devanagari virama,
+        // Arabic fatha, Hebrew qamats, Cyrillic combining breve.
+        let n = TextNormalizer {
+            strip_accents: true,
+            ..TextNormalizer::new()
+        };
+        // Devanagari "न" + U+094D (VIRAMA) -> bare "न".
+        assert_eq!(n.normalize("न\u{094d}"), "न");
+        // Arabic "ب" + U+064E (FATHA) -> bare "ب".
+        assert_eq!(n.normalize("ب\u{064e}"), "ب");
+        // Hebrew "ש" + U+05B8 (QAMATS) -> bare "ש".
+        assert_eq!(n.normalize("ש\u{05b8}"), "ש");
+        // Cyrillic "а" + U+0483 (COMBINING CYRILLIC TITLO) -> bare "а".
+        assert_eq!(n.normalize("а\u{0483}"), "а");
+    }
+
+    #[test]
+    fn test_is_combining_covers_spacing_marks_mc() {
+        // TOK-09 missed-finding fix: the old implementation missed `Mc`
+        // (Spacing Mark) entirely. U+0903 DEVANAGARI SIGN VISARGA is `Mc`.
+        assert!(is_combining('\u{0903}'));
     }
 
     #[test]

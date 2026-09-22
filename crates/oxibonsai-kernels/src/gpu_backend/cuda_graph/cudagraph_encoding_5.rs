@@ -2,6 +2,8 @@
 //!
 //! This module contains method implementations for `CudaGraph`.
 //!
+//! **UNVALIDATED on hardware** — compile-checked only (no CUDA device here).
+//!
 //! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
 
 use cudarc::driver::CudaSlice;
@@ -37,7 +39,20 @@ impl CudaGraph {
                 vocab_capacity: vocab,
             });
         }
-        Ok(guard)
+        // F8: the readback slices `d_output` to the model's real `vocab`, so
+        // the capacity invariant the pool is meant to guarantee is checked here
+        // rather than trusted — a violated one would silently truncate logits.
+        match guard.as_ref() {
+            Some(b) if b.fits(hidden, vocab) => Ok(guard),
+            Some(b) => Err(CudaGraphError::DriverError(format!(
+                "lm_head buffers too small after acquisition: capacity {}x{} < \
+                 requested {hidden}x{vocab}",
+                b.hidden_capacity, b.vocab_capacity
+            ))),
+            None => Err(CudaGraphError::DriverError(
+                "lm_head buffers not allocated".into(),
+            )),
+        }
     }
     /// Run the ternary LM-head GEMV on GPU: `logits = lm_head_tq2_weight × normed`.
     ///
@@ -69,9 +84,13 @@ impl CudaGraph {
                 hidden_size as u32,
             )?;
         }
-        let result = self.stream.clone_dtoh(&bufs.d_output).map_err(|e| {
-            CudaGraphError::DriverError(format!("download lm_head_tq2 logits: {e}"))
-        })?;
+        // F8: `d_output` has *capacity* `vocab_capacity >= vocab_size`;
+        // `clone_dtoh` returned the whole buffer, i.e. a logits vector padded
+        // with whatever a previous, larger-vocab model left in the tail — and
+        // downstream argmax/samplers iterate `logits.len()`, so a stale entry
+        // could win and emit a token id outside this model's vocabulary.
+        let mut result = vec![0f32; vocab_size];
+        self.dtoh_exact(&bufs.d_output, &mut result, "lm_head_tq2 logits")?;
         self.stream
             .synchronize()
             .map_err(|e| CudaGraphError::DriverError(format!("lm_head_tq2 D2H sync: {e}")))?;
@@ -107,10 +126,9 @@ impl CudaGraph {
                 hidden_size as u32,
             )?;
         }
-        let result = self
-            .stream
-            .clone_dtoh(&bufs.d_output)
-            .map_err(|e| CudaGraphError::DriverError(format!("download logits: {e}")))?;
+        // F8: exact-length readback — see the ternary twin above.
+        let mut result = vec![0f32; vocab_size];
+        self.dtoh_exact(&bufs.d_output, &mut result, "lm_head logits")?;
         self.stream
             .synchronize()
             .map_err(|e| CudaGraphError::DriverError(format!("lm_head D2H sync: {e}")))?;

@@ -1,8 +1,10 @@
 //! BLEU (Bilingual Evaluation Understudy) implementation.
 //!
 //! Follows Papineni et al. (2002) — *BLEU: a Method for Automatic Evaluation
-//! of Machine Translation* — with additional Chen & Cherry (2014) smoothing
-//! variants for sentence-level BLEU on sparse n-grams.
+//! of Machine Translation* — with additional smoothing variants for
+//! sentence-level BLEU on sparse n-grams, inspired by (but not verified
+//! byte-for-byte against) Chen & Cherry (2014); see [`SmoothingMethod`] for
+//! exactly what each variant computes and how confident that attribution is.
 //!
 //! ## Algorithm
 //!
@@ -33,8 +35,12 @@
 //! ## Smoothing (sparse sentence-level)
 //!
 //! - [`SmoothingMethod::None`] — unsmoothed (zero if any p_n = 0).
-//! - [`SmoothingMethod::AddOne`] — Laplace smoothing on matches > 0.
-//! - [`SmoothingMethod::ExpDecay`] — Chen & Cherry 2014 method 3.
+//! - [`SmoothingMethod::AddOne`] — add 1 to every order's numerator and
+//!   denominator (Lidstone-1 / "Laplace" smoothing, the formula commonly
+//!   cited as Chen & Cherry 2014's method 2 / NLTK's `method2`).
+//! - [`SmoothingMethod::ExpDecay`] — geometric decay `1 / (2^k · c)` on a
+//!   zero-count order (see the variant's own doc for exactly what `k` and
+//!   `c` are, and a caveat on its literature attribution).
 //!
 //! ## Empty candidate
 //!
@@ -43,7 +49,7 @@
 
 use std::collections::HashMap;
 
-use crate::rouge::{tokenize, TokenSeq};
+use crate::rouge::{ngram_counts, tokenize, TokenSeq};
 
 /// Smoothing strategy for sentence-level / sparse BLEU.
 ///
@@ -54,14 +60,39 @@ pub enum SmoothingMethod {
     /// No smoothing (classic Papineni — geometric mean may go to 0).
     #[default]
     None,
-    /// Add 1 to both numerator and denominator of each p_n.
+    /// Add 1 to both the numerator and the denominator of **every** order's
+    /// modified precision, i.e. `p_n = (matches_n + 1) / (total_n + 1)` for
+    /// every `n`, not only the orders where `matches_n == 0`.
     ///
-    /// This is Chen & Cherry 2014 method 2 (a.k.a. Laplace / Lidstone-1).
+    /// This is Lidstone-1 / "Laplace" smoothing, commonly cited as Chen &
+    /// Cherry (2014)'s method 2 / NLTK's `SmoothingFunction.method2`, by
+    /// analogy with the formula's simplicity — but, like the `ExpDecay`
+    /// variant below, this has **not** been checked against a live NLTK or
+    /// sacreBLEU install in this environment, so treat the name as a
+    /// description of what the code computes, not a verified match to the
+    /// literature.
     AddOne,
-    /// Exponentially decaying smoothing (Chen & Cherry 2014 method 3).
+    /// Exponentially decaying smoothing for a zero-count order: when
+    /// `matches_n == 0`, use `1 / (2^k · c)` instead of `0`, where `c` is the
+    /// candidate's token length and `k` is a 1-based counter of how many
+    /// zero-count orders (including this one) have been seen so far,
+    /// starting over at each fresh evaluation (`k` resets whenever a
+    /// non-zero order is seen, so it is *not* the NIST "keep counting for
+    /// the rest of the sentence" rule below).
     ///
-    /// When a modified precision is zero, fall back to `1 / (2^k · c)` for
-    /// the k-th consecutive zero, where `c` is candidate length.
+    /// This is inspired by the NIST geometric-sequence smoothing usually
+    /// cited as Chen & Cherry (2014)'s method 3 / NLTK's `method3`, but is
+    /// **not verified to be numerically identical to it**: the reference
+    /// formula's denominator is the order's own n-gram *count*
+    /// (`total_n`, so trigrams and 4-grams get different denominators), not
+    /// the flat candidate length `c` used here, and its `k` counter never
+    /// resets once a zero-count order is seen. Confirming (and, if needed,
+    /// correcting) that difference needs golden vectors from a live
+    /// NLTK/sacreBLEU install, which was not available in the environment
+    /// this was implemented in (see `deviations` in the accompanying
+    /// package report). Until then, treat the name as "an exponential
+    /// zero-order smoother", not a literal implementation of the cited
+    /// paper's method 3.
     ExpDecay,
 }
 
@@ -325,16 +356,8 @@ fn match_counts_sentence(cand: &TokenSeq, refs: &[TokenSeq], n: usize) -> (usize
     (matches, total)
 }
 
-fn ngram_counts(tokens: &TokenSeq, n: usize) -> HashMap<Vec<String>, usize> {
-    let mut counts: HashMap<Vec<String>, usize> = HashMap::new();
-    if n == 0 || tokens.len() < n {
-        return counts;
-    }
-    for w in tokens.windows(n) {
-        *counts.entry(w.to_vec()).or_insert(0) += 1;
-    }
-    counts
-}
+// `ngram_counts` itself lives in `crate::rouge` (RAG-EVAL-IMG-33's dedup
+// note: this module used to carry a byte-identical private copy).
 
 /// Find the length of the reference *closest* to the candidate (shortest tie-break).
 fn closest_ref_length(c_len: usize, refs: &[TokenSeq]) -> usize {
@@ -384,12 +407,10 @@ fn apply_smoothing(
         SmoothingMethod::AddOne => {
             if total == 0 {
                 (0.0, 0)
-            } else if matches == 0 {
-                // When matches are 0, classic add-one gives 1/(total+1). We
-                // follow Chen & Cherry method 2: add 1 to both numerator and
-                // denominator when there's a zero.
-                (1.0 / (total as f32 + 1.0), total + 1)
             } else {
+                // Uniform add-1 on every order (see `SmoothingMethod::AddOne`
+                // doc): `matches == 0` naturally falls out of this same
+                // formula as `1 / (total + 1)`, so there is no separate case.
                 ((matches as f32 + 1.0) / (total as f32 + 1.0), total + 1)
             }
         }

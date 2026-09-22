@@ -32,6 +32,66 @@ use crate::te::{Qwen3Tokenizer, TeError, TeWeights, TextEncoder};
 use crate::vae::{VaeDecoder, VaeError, VaeWeights};
 use crate::{DitError, DitForward, DitWeights, PngError, StepTap};
 
+/// Minimum accepted `width`/`height` in pixels (also the floor a multiple of
+/// 16 can take). This is already the smallest useful size: it yields exactly
+/// a 1x1 latent grid ([`crate::sample::latent_grid`], `px / 16` per axis).
+/// Anything below it degenerates to a zero-size latent grid, which the
+/// VAE/PNG stages would reject with an obscure shape error rather than
+/// surfacing the caller's actual mistake.
+pub const MIN_DIMENSION: usize = 16;
+
+/// Maximum accepted `width`/`height` in pixels. This is a sanity cap against
+/// pathological requests (an unbounded resolution allocates unbounded
+/// latent/VAE/PNG buffers), not a hardware limit: a resolution whose latent
+/// grid (`(width/16) * (height/16)`) exceeds the Metal flash-attention
+/// kernel's compile-time token cap still renders correctly, just via the
+/// slower CPU attention fallback (see `crate::gpu`).
+pub const MAX_DIMENSION: usize = 4096;
+
+/// Validate the geometry (`width`/`height`) and sampler step count shared by
+/// [`text_to_image`] and [`crate::session::ImageSession::render`].
+///
+/// # Errors
+/// [`PipelineError::InvalidParams`] if `width`/`height` are not multiples of
+/// 16, fall outside `[MIN_DIMENSION, MAX_DIMENSION]`, or `steps < 1`.
+pub(crate) fn validate_render_params(
+    width: usize,
+    height: usize,
+    steps: usize,
+) -> Result<(), PipelineError> {
+    if !width.is_multiple_of(16) || !height.is_multiple_of(16) {
+        return Err(PipelineError::InvalidParams(format!(
+            "width and height must be multiples of 16, got {width}x{height}"
+        )));
+    }
+    let range = MIN_DIMENSION..=MAX_DIMENSION;
+    if !range.contains(&width) || !range.contains(&height) {
+        return Err(PipelineError::InvalidParams(format!(
+            "width and height must be within [{MIN_DIMENSION}, {MAX_DIMENSION}], got {width}x{height}"
+        )));
+    }
+    if steps < 1 {
+        return Err(PipelineError::InvalidParams(format!(
+            "steps must be >= 1, got {steps}"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate the guidance scale: it must be a finite number (not NaN or
+/// infinite) so it can be safely embedded/logged downstream.
+///
+/// # Errors
+/// [`PipelineError::InvalidParams`] if `guidance` is not finite.
+pub(crate) fn validate_guidance(guidance: f32) -> Result<(), PipelineError> {
+    if !guidance.is_finite() {
+        return Err(PipelineError::InvalidParams(format!(
+            "guidance must be finite, got {guidance}"
+        )));
+    }
+    Ok(())
+}
+
 /// Where the text-encoder weights come from.
 #[derive(Debug, Clone)]
 pub enum TeSource {
@@ -95,6 +155,7 @@ pub struct TextToImageCfg {
 }
 
 /// The result of a generation.
+#[derive(Debug)]
 pub struct TextToImageOut {
     /// The encoded PNG byte stream.
     pub png: Vec<u8>,
@@ -137,6 +198,13 @@ pub enum PipelineError {
     /// A required input path was missing.
     #[error("missing input: {0}")]
     MissingInput(String),
+    /// A caller-supplied generation parameter (geometry, step count, guidance)
+    /// was invalid. Distinct from [`Self::Shape`] (an internal invariant),
+    /// this is a rejected *caller* input, validated eagerly by the crate's
+    /// internal `validate_render_params` / `validate_guidance` before any
+    /// model asset is loaded.
+    #[error("invalid parameter: {0}")]
+    InvalidParams(String),
 }
 
 /// A loaded `.npy` tensor (f32, C-order).
@@ -210,7 +278,7 @@ fn read_npy(path: &std::path::Path) -> Result<Npy, PipelineError> {
         })
         .collect::<Result<_, _>>()?;
     let payload = &bytes[header_end..];
-    if payload.len() % 4 != 0 {
+    if !payload.len().is_multiple_of(4) {
         return Err(PipelineError::Shape(format!(
             "{}: payload not f32-aligned",
             path.display()
@@ -396,11 +464,20 @@ pub(crate) fn decoded_chw_to_rgb8(
 
 /// Run the whole text→image pipeline and return the encoded PNG.
 ///
-/// See the [module docs](self) for the stage-by-stage flow.
+/// See the [module docs](self) for the stage-by-stage flow. `width`/`height`
+/// must be multiples of 16 within `[MIN_DIMENSION, MAX_DIMENSION]`,
+/// `steps >= 1`, and `guidance` finite — validated eagerly (before any model
+/// asset is loaded) by the crate's internal `validate_render_params` /
+/// `validate_guidance`.
 ///
 /// # Errors
-/// [`PipelineError`] wrapping whichever stage failed (DiT/TE/VAE/PNG/IO/shape).
+/// [`PipelineError`] wrapping whichever stage failed
+/// (DiT/TE/VAE/PNG/IO/shape/invalid-params).
 pub fn text_to_image(cfg: &TextToImageCfg) -> Result<TextToImageOut, PipelineError> {
+    // ── 0. Validate caller-supplied parameters before touching any asset ──
+    validate_render_params(cfg.width, cfg.height, cfg.steps)?;
+    validate_guidance(cfg.guidance)?;
+
     let mut stage_cosines: Vec<(String, f32)> = Vec::new();
     let timing = std::env::var("OXI_IMAGE_TIMING").is_ok();
 
@@ -608,7 +685,7 @@ pub fn text_to_image(cfg: &TextToImageCfg) -> Result<TextToImageOut, PipelineErr
 
 #[cfg(test)]
 mod tests {
-    use super::vae_path_present;
+    use super::*;
     use std::path::PathBuf;
 
     /// Build a unique scratch path under the system temp dir (policy: tests must
@@ -681,6 +758,114 @@ mod tests {
             !vae_path_present(&missing),
             "a nonexistent path must be rejected by the precheck, path = {}",
             missing.display()
+        );
+    }
+
+    // ── RAG-EVAL-IMG-26: geometry / sampler validation ─────────────────────
+
+    #[test]
+    fn validate_render_params_accepts_the_documented_default() {
+        // 512x512 / 4 steps is `RenderParams::default()` / the `generate`
+        // example's config — must never regress.
+        validate_render_params(512, 512, 4).expect("512x512 @ 4 steps is valid");
+    }
+
+    #[test]
+    fn validate_render_params_accepts_a_small_synthetic_size() {
+        // 32x32 is exactly what `tests/pipeline_synthetic.rs` renders through
+        // the real `text_to_image` pipeline; the floor must not regress it.
+        validate_render_params(32, 32, 2).expect("32x32 @ 2 steps is valid");
+    }
+
+    #[test]
+    fn validate_render_params_accepts_the_minimum_dimension() {
+        validate_render_params(MIN_DIMENSION, MIN_DIMENSION, 1).expect("MIN_DIMENSION is valid");
+    }
+
+    #[test]
+    fn validate_render_params_accepts_the_maximum_dimension() {
+        validate_render_params(MAX_DIMENSION, MAX_DIMENSION, 1).expect("MAX_DIMENSION is valid");
+    }
+
+    #[test]
+    fn validate_render_params_rejects_non_multiple_of_16() {
+        let err = validate_render_params(500, 512, 4).expect_err("500 is not a multiple of 16");
+        assert!(matches!(err, PipelineError::InvalidParams(_)));
+    }
+
+    #[test]
+    fn validate_render_params_rejects_below_minimum() {
+        // Regression guard: width=8 used to silently round down to a 0-cell
+        // latent grid (a degenerate/zero-size image caught only much later,
+        // obscurely, by the PNG encoder) instead of a clear caller error.
+        let err =
+            validate_render_params(8, 512, 4).expect_err("8 is below MIN_DIMENSION and not /16");
+        assert!(matches!(err, PipelineError::InvalidParams(_)));
+    }
+
+    #[test]
+    fn validate_render_params_rejects_above_maximum() {
+        let err = validate_render_params(MAX_DIMENSION + 16, 512, 4)
+            .expect_err("above MAX_DIMENSION must be rejected");
+        assert!(matches!(err, PipelineError::InvalidParams(_)));
+    }
+
+    #[test]
+    fn validate_render_params_rejects_zero_steps() {
+        // Regression guard: `steps=0` used to silently skip the sampler
+        // entirely (`forward.rs` iterates `timesteps`, which would be empty)
+        // instead of returning a clear error.
+        let err = validate_render_params(512, 512, 0).expect_err("steps=0 must be rejected");
+        assert!(matches!(err, PipelineError::InvalidParams(_)));
+    }
+
+    #[test]
+    fn validate_guidance_accepts_finite_values() {
+        validate_guidance(1.0).expect("1.0 is finite");
+        validate_guidance(0.0).expect("0.0 is finite");
+        validate_guidance(-3.5).expect("negative finite values are still finite");
+    }
+
+    #[test]
+    fn validate_guidance_rejects_nan_and_infinite() {
+        assert!(matches!(
+            validate_guidance(f32::NAN),
+            Err(PipelineError::InvalidParams(_))
+        ));
+        assert!(matches!(
+            validate_guidance(f32::INFINITY),
+            Err(PipelineError::InvalidParams(_))
+        ));
+        assert!(matches!(
+            validate_guidance(f32::NEG_INFINITY),
+            Err(PipelineError::InvalidParams(_))
+        ));
+    }
+
+    /// `text_to_image` must validate parameters *before* touching any model
+    /// asset: a bad width with a deliberately-nonexistent DiT path must fail
+    /// with `InvalidParams`, not `MissingInput` — proving the validation
+    /// really runs first (a real, model-file-free reproduction of the bug and
+    /// a durable regression guard against re-ordering the checks).
+    #[test]
+    fn text_to_image_validates_params_before_loading_assets() {
+        let cfg = TextToImageCfg {
+            prompt: "a tiny bonsai tree".to_string(),
+            seed: 42,
+            steps: 4,
+            width: 500, // not a multiple of 16
+            height: 512,
+            guidance: 1.0,
+            dit_gguf: scratch("never_created").with_extension("gguf"),
+            vae_weights_dir: scratch("never_created_vae").with_extension("safetensors"),
+            te_source: TeSource::NpyDir(scratch("never_created_te")),
+            tokenizer_dir: scratch("never_created_tok"),
+            golden_override: None,
+        };
+        let err = text_to_image(&cfg).expect_err("invalid width must be rejected");
+        assert!(
+            matches!(err, PipelineError::InvalidParams(_)),
+            "expected InvalidParams (validated before any asset load), got: {err}"
         );
     }
 }

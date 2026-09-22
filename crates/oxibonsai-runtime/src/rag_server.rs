@@ -31,7 +31,7 @@ use axum::Router;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
-use oxibonsai_rag::embedding::{Embedder, TfIdfEmbedder};
+use oxibonsai_rag::embedding::TfIdfEmbedder;
 use oxibonsai_rag::pipeline::{RagConfig, RagPipeline};
 
 use crate::engine::InferenceEngine;
@@ -415,10 +415,32 @@ pub async fn rag_query(
         let docs_searched = stats.documents_indexed;
 
         let retriever = pipeline_guard.retriever();
-        let default_retriever_config = oxibonsai_rag::retriever::RetrieverConfig::default();
 
-        let query_vec = match retriever.embedder().embed(&req.query) {
-            Ok(v) => v,
+        // Route through the retriever's own public retrieval API (RAG,
+        // unowned sibling) instead of reconstructing the search call by
+        // hand against `retriever.store()` directly, which used to bypass
+        // both the zero-norm query guard (RAG-21 /
+        // `Retriever::reject_degenerate_query`) and the retriever's own
+        // *configured* `min_score` (a freshly-built
+        // `RetrieverConfig::default()` was used instead of the pipeline's
+        // real config). `retrieve_with_top_k` exists specifically so this
+        // per-request client-supplied `top_k` can still override
+        // `RetrieverConfig::top_k` while every other guard/config applies
+        // exactly like `Retriever::retrieve`.
+        let results = match retriever.retrieve_with_top_k(&req.query, top_k) {
+            Ok(results) => results,
+            // An empty index is not a client error for this endpoint --
+            // the pipeline still answers, just with no retrieved context
+            // (matches `/rag/query`'s long-standing documented/tested
+            // behaviour against a fresh server before any `/rag/index`
+            // call).
+            Err(oxibonsai_rag::error::RagError::NoDocumentsIndexed) => Vec::new(),
+            Err(oxibonsai_rag::error::RagError::EmptyQueryVector) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "query embedding has zero norm; refusing to return an arbitrary ranking",
+                );
+            }
             Err(e) => {
                 return error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -426,15 +448,6 @@ pub async fn rag_query(
                 );
             }
         };
-
-        // `search_with_threshold` returns an empty Vec (never errors) when
-        // the store is empty, so no separate "no documents yet" branch is
-        // needed here.
-        let results = retriever.store().search_with_threshold(
-            &query_vec,
-            top_k,
-            default_retriever_config.min_score,
-        );
 
         let retrieved_texts: Vec<String> = results.iter().map(|r| r.chunk.text.clone()).collect();
         let chunks_retrieved = retrieved_texts.len();
@@ -688,5 +701,99 @@ mod tests {
         let engine = InferenceEngine::new(config, SamplingParams::default(), 42);
         let pool = EnginePool::new(vec![engine]);
         let _state = RagState::new(pool, None);
+    }
+
+    // ── RAG, unowned sibling: /rag/query must route through the
+    // retriever's own guarded retrieval API ────────────────────────────────
+
+    #[tokio::test]
+    async fn rag_query_rejects_a_fully_out_of_vocabulary_query_against_a_nonempty_index() {
+        use axum::body::Body;
+        use axum::http::{Method, Request, StatusCode};
+        use oxibonsai_core::config::Qwen3Config;
+        use tower::ServiceExt;
+
+        let config = Qwen3Config::tiny_test();
+        let engine = InferenceEngine::new(config, SamplingParams::default(), 42);
+        let app = create_rag_router(engine);
+
+        // `/rag/index` refits the TF-IDF vocabulary from exactly the
+        // submitted documents (BOOTSTRAP_CORPUS is not merged in), so the
+        // vocabulary here is precisely the union of these three documents'
+        // tokens -- several unrelated documents, so a positive-control
+        // query sharing vocabulary with only one of them still has to
+        // survive ranking against the others.
+        let index_req = Request::builder()
+            .method(Method::POST)
+            .uri("/rag/index")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "documents": [
+                        "Rust is a systems programming language with memory safety.",
+                        "Python is popular for data science and machine learning.",
+                        "Tokyo is the capital of Japan and a major travel destination."
+                    ]
+                })
+                .to_string(),
+            ))
+            .expect("build index request");
+        let index_resp = app
+            .clone()
+            .oneshot(index_req)
+            .await
+            .expect("index response");
+        assert_eq!(
+            index_resp.status(),
+            StatusCode::OK,
+            "sanity: indexing three documents must succeed"
+        );
+
+        // Positive control: an in-vocabulary query must still succeed with
+        // 200, so a 400 on the OOV query below is known to come from the
+        // zero-norm guard specifically, not from every query being
+        // rejected (e.g. a broken embedder or an over-eager guard).
+        let control_req = Request::builder()
+            .method(Method::POST)
+            .uri("/rag/query")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "query": "Rust memory safety", "max_tokens": 1 }).to_string(),
+            ))
+            .expect("build control request");
+        let control_resp = app
+            .clone()
+            .oneshot(control_req)
+            .await
+            .expect("control response");
+        assert_eq!(
+            control_resp.status(),
+            StatusCode::OK,
+            "sanity: an in-vocabulary query must still return 200"
+        );
+
+        // Every token here is out-of-vocabulary against the just-indexed
+        // documents' TF-IDF vocabulary, so the query embeds to an all-zero
+        // vector -- degenerate for the store's default Cosine metric
+        // (RAG-21 / RAG-EVAL-IMG-21). Before this fix, `/rag/query`
+        // bypassed `Retriever::retrieve`'s guard entirely (calling
+        // `retriever.store().search_with_threshold` directly) and silently
+        // returned 200 OK with an arbitrary insertion-order ranking
+        // instead.
+        let query_req = Request::builder()
+            .method(Method::POST)
+            .uri("/rag/query")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "query": "zzqvx wwpqr fjklm bbxyzq" }).to_string(),
+            ))
+            .expect("build query request");
+        let query_resp = app.oneshot(query_req).await.expect("query response");
+        assert_eq!(
+            query_resp.status(),
+            StatusCode::BAD_REQUEST,
+            "a fully out-of-vocabulary query against a non-empty Cosine-metric index must be \
+             rejected (RAG-21), not silently ranked"
+        );
     }
 }

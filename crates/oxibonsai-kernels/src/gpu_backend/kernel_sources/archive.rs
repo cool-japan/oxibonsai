@@ -1670,23 +1670,6 @@ extern "C" __global__ void matvec_f32(
 }
 "#;
 
-/// SwiGLU fused activation.
-#[cfg(feature = "cuda")]
-pub const CUDA_SWIGLU: &str = r#"
-extern "C" __global__ void swiglu(
-    const float* __restrict__ gate,
-    const float* __restrict__ up,
-    float* __restrict__ output,
-    unsigned int n)
-{
-    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (gid >= n) return;
-    float g = gate[gid];
-    float silu_g = g / (1.0f + expf(-g));
-    output[gid] = silu_g * up[gid];
-}
-"#;
-
 /// Residual add in-place.
 #[cfg(feature = "cuda")]
 pub const CUDA_RESIDUAL_ADD: &str = r#"

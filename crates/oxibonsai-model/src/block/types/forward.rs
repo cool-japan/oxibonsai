@@ -3,7 +3,7 @@
 use crate::error::ModelResult;
 use crate::kv_cache::KvCache;
 use crate::layers::rope::RopeTable;
-use crate::layers::swiglu::swiglu as swiglu_fn;
+use crate::layers::swiglu::try_swiglu;
 use oxibonsai_kernels::traits::OneBitKernel;
 use std::time::Instant;
 
@@ -15,10 +15,208 @@ use std::time::Instant;
     )
 ))]
 use crate::block::functions::blocks_as_bytes;
+#[cfg(any(
+    all(feature = "metal", target_os = "macos"),
+    all(
+        feature = "native-cuda",
+        any(target_os = "linux", target_os = "windows")
+    )
+))]
+use crate::block::functions::blocks_as_bytes_ternary;
+
 use crate::block::functions::compute_gqa_attention;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+use crate::block::functions::try_metal_gemv_ternary_fused;
+use crate::block::functions::{advance_kv_cache_to, validate_shapes};
 
 use super::block_def::TransformerBlock;
 use super::scratch::ScratchBuffers;
+
+/// Weight-cache epoch this block attributes its CUDA uploads to.
+///
+/// FIX2-CUDA (wave 2.5) added `model_epoch: u64` as the last parameter of
+/// [`oxibonsai_kernels::try_cuda_qkv`] / [`oxibonsai_kernels::try_cuda_ffn`] so
+/// a model's `Drop` can free exactly its own GPU weights (finding **F-M3**).
+/// `TransformerBlock` does not carry the owning model's epoch:
+/// `BonsaiModel::cuda_model_epoch` is minted per load in
+/// `model/types/mod.rs`, and this block borrows its weights without a back
+/// reference to the model. Until `block_def::TransformerBlock` gains an epoch
+/// field, these two call sites register **unattributed**, which the registry
+/// documents as a no-op: the upload is simply never auto-released, i.e. exactly
+/// the pre-FIX2-CUDA lifetime. That is deliberately preferred over passing a
+/// guessed epoch, which would let one model's `Drop` free another's buffers.
+#[cfg(all(
+    feature = "native-cuda",
+    not(all(feature = "metal", target_os = "macos")),
+    any(target_os = "linux", target_os = "windows")
+))]
+const CUDA_BLOCK_MODEL_EPOCH: u64 =
+    oxibonsai_kernels::gpu_backend::cuda_graph_slot::UNATTRIBUTED_CUDA_MODEL_EPOCH;
+
+/// Private CUDA weight-cache namespace for the **fused** Q‖K‖V ternary
+/// upload (finding **M-21**, blocking fix).
+///
+/// `CudaGraph::weight_cache` is a single `HashMap<u64, Arc<CudaSlice<u8>>>`
+/// shared by every TQ2 producer. The Q projection’s own per-matrix upload
+/// already owns `attn_q.gpu_handle().id()` in that map —
+/// `LinearTernary::upload_to_gpu` (`layers/linear.rs`) →
+/// `NativeCudaBackend::upload_weights_ternary`
+/// (`cuda_graph/nativecudabackend_traits.rs`) →
+/// `upload_weight_tq2_soa_for_epoch`
+/// (`cuda_graph/cudagraph_reformat_tq2_blocks_to_soa_group.rs`) inserts the
+/// **Q-only** SoA buffer under exactly that id. Setting bit 63 moves the fused
+/// concatenation into a namespace no other producer writes.
+///
+/// The tag cannot alias a real handle id: `cuda_graph::functions`’
+/// `alloc_handle_id` hands out `NEXT_HANDLE_ID: AtomicU64::new(1)` values via
+/// `fetch_add(1, Relaxed)`, so reaching `1 << 63` would need 2^63 uploads —
+/// unreachable in any process lifetime. Untagged ids therefore always have
+/// bit 63 clear, and tagged ones always have it set.
+#[cfg(any(
+    all(
+        feature = "native-cuda",
+        not(all(feature = "metal", target_os = "macos")),
+        any(target_os = "linux", target_os = "windows")
+    ),
+    test
+))]
+const CUDA_FUSED_QKV_SLOT_TAG: u64 = 1u64 << 63;
+
+/// Map a `GpuWeightHandle` id to its fused-QKV slot (see
+/// [`CUDA_FUSED_QKV_SLOT_TAG`]).
+#[cfg(any(
+    all(
+        feature = "native-cuda",
+        not(all(feature = "metal", target_os = "macos")),
+        any(target_os = "linux", target_os = "windows")
+    ),
+    test
+))]
+fn cuda_fused_qkv_slot(handle_id: u64) -> u64 {
+    handle_id | CUDA_FUSED_QKV_SLOT_TAG
+}
+
+/// Byte length a `TQ2_0_g128` SoA weight buffer must have for `total_rows`
+/// output rows and `k` input columns, or `None` when `k` is not a whole number
+/// of 128-wide quant groups.
+///
+/// The SoA layout the CUDA TQ2 kernels consume is
+/// `[N × 2 B FP16 scales][N × 32 B qs]` with `N = total_rows * (k / 128)`,
+/// i.e. 34 bytes per block — the same 34-byte stride
+/// `reformat_tq2_aos_bytes_to_soa` requires of its input.
+#[cfg(any(
+    all(
+        feature = "native-cuda",
+        not(all(feature = "metal", target_os = "macos")),
+        any(target_os = "linux", target_os = "windows")
+    ),
+    test
+))]
+fn cuda_tq2_soa_len_bytes(total_rows: usize, k: usize) -> Option<usize> {
+    const BLOCK_BYTES: usize = 34;
+    const GROUP: usize = 128;
+    if k == 0 || !k.is_multiple_of(GROUP) {
+        return None;
+    }
+    total_rows
+        .checked_mul(k / GROUP)
+        .and_then(|blocks| blocks.checked_mul(BLOCK_BYTES))
+}
+
+/// Fused ternary (TQ2_0_g128) QKV GEMV on CUDA — the twin of
+/// `block::functions::try_metal_gemv_ternary_fused` (**M-21**, wave-2.5
+/// addendum item 4).
+///
+/// Ternary models get no `fused_qkv_handle` (see `upload.rs`), so the 1-bit
+/// fused path above cannot serve them: `OneBitKernel::gemv_cached` always
+/// decodes its buffer as `Q1_0_g128` and would read a 34-byte-block tensor as
+/// 18-byte blocks. This uploads Q‖K‖V once and runs one GEMV over the
+/// concatenation, exactly as the Metal path does.
+///
+/// # Why the slot is tagged, and why the earlier argument here was wrong
+///
+/// A previous revision of this comment justified the slot as
+/// "`attn_q.gpu_handle().id()`, not the weight’s mmap address: ids come from
+/// a process-global monotonic counter, so they are never reused across model
+/// loads". That is true and it is **not** the property this call site needs.
+/// The id is unique, but it is not *private*: `weight_cache` is one flat map
+/// and the Q projection’s own per-matrix upload already occupies that id with
+/// a **Q-only** buffer. `get_or_upload_weight_tq2_soa_lazy_for_epoch` returns
+/// early on a hit, so the fused bytes were never built, and
+/// `encode_gemv_tq2_cached` then launched `gemv_tq2_g128_v1` with
+/// `n_rows = q_rows + 2 * k_rows` over a `q_rows`-sized allocation: the
+/// in-kernel `qs_offset = total_blocks * 2` is recomputed from the larger row
+/// count, so even the Q rows decode against the wrong `qs` bytes and K/V read
+/// past the end of the allocation. The Metal twin is safe only because
+/// `MetalGraph` keeps a *different* map (stated in `upload.rs`), so the port
+/// was not faithful.
+///
+/// Both halves of the fix are required and both are here:
+/// 1. [`cuda_fused_qkv_slot`] moves the fused upload into a namespace no other
+///    producer writes, and the **same** value keys the upload and the launch.
+/// 2. The cached buffer’s byte length is checked against
+///    [`cuda_tq2_soa_len_bytes`] before the launch, so any future second
+///    consumer of the map is caught as an `Err` and the caller’s existing CPU
+///    fallback engages instead of a `CUDA_ERROR_ILLEGAL_ADDRESS`.
+///
+/// The upload registers under [`CUDA_BLOCK_MODEL_EPOCH`] (unattributed) for the
+/// reason documented there.
+///
+/// **Compile-blind**: this host has no CUDA. Type-checked against the real API
+/// by cross-compiling to `x86_64-unknown-linux-gnu`; never executed.
+#[cfg(all(
+    feature = "native-cuda",
+    not(all(feature = "metal", target_os = "macos")),
+    any(target_os = "linux", target_os = "windows")
+))]
+fn try_cuda_gemv_ternary_fused(
+    input: &[f32],
+    output: &mut [f32],
+    handle_id: u64,
+    aos_parts: &[&[u8]],
+    n_rows: usize,
+    k: usize,
+) -> Result<(), oxibonsai_kernels::CudaGraphError> {
+    let graph = oxibonsai_kernels::CudaGraph::global()?;
+    // One value for both the upload and the launch — deriving it here rather
+    // than at the call site makes it impossible for them to disagree.
+    let fused_slot = cuda_fused_qkv_slot(handle_id);
+    let expected_bytes = cuda_tq2_soa_len_bytes(n_rows, k).ok_or_else(|| {
+        oxibonsai_kernels::CudaGraphError::DriverError(format!(
+            "fused ternary QKV GEMV needs k to be a multiple of 128, got k={k}"
+        ))
+    })?;
+    let d_weight = graph.get_or_upload_weight_tq2_soa_lazy_for_epoch(
+        fused_slot,
+        || {
+            let total: usize = aos_parts.iter().map(|part| part.len()).sum();
+            let mut fused = Vec::with_capacity(total);
+            for part in aos_parts {
+                fused.extend_from_slice(part);
+            }
+            fused
+        },
+        CUDA_BLOCK_MODEL_EPOCH,
+    )?;
+    if d_weight.len() != expected_bytes {
+        return Err(oxibonsai_kernels::CudaGraphError::DriverError(format!(
+            "fused ternary QKV slot {fused_slot:#018x} holds {} bytes, expected \
+             {expected_bytes} for {n_rows} rows x k={k} (TQ2_0_g128 SoA, 34 B per \
+             block); refusing to launch over a buffer this call site does not own",
+            d_weight.len()
+        )));
+    }
+    let rows = graph.encode_gemv_tq2_cached(fused_slot, input, n_rows, k)?;
+    if rows.len() < n_rows || output.len() < n_rows {
+        return Err(oxibonsai_kernels::CudaGraphError::DriverError(format!(
+            "fused ternary QKV GEMV produced {} rows into a {}-element output, expected {n_rows}",
+            rows.len(),
+            output.len()
+        )));
+    }
+    output[..n_rows].copy_from_slice(&rows[..n_rows]);
+    Ok(())
+}
 
 impl<'a> TransformerBlock<'a> {
     /// Forward pass for a single token at position `pos`.
@@ -38,6 +236,24 @@ impl<'a> TransformerBlock<'a> {
         rope: &RopeTable,
         kernel: &dyn OneBitKernel,
     ) -> ModelResult<()> {
+        // M-12: validate before any KV-cache access (including the GPU
+        // full-layer fast paths below, which compute the same
+        // `heads_per_group = nq / nkv` and index the cache with the same
+        // unchecked stride internally).
+        validate_shapes(
+            self.layer_idx,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            self.attn_q.out_features(),
+            kv_cache,
+            pos,
+        )?;
+        // M-19: maintain the cache's own sequence-length cursor so
+        // `seq_len()`/`utilization_ratio()` reflect reality; see
+        // `advance_kv_cache_to`'s doc comment for why this is safe to call
+        // once per layer per token rather than once per token.
+        advance_kv_cache_to(kv_cache, pos);
         #[cfg(all(feature = "metal", target_os = "macos"))]
         {
             if let Some(Ok(())) = self.try_full_layer_gpu(hidden, pos, rope, kv_cache) {
@@ -130,7 +346,13 @@ impl<'a> TransformerBlock<'a> {
                     not(all(feature = "metal", target_os = "macos")),
                     any(target_os = "linux", target_os = "windows")
                 ))]
-                let cuda_ok = if !metal_ok {
+                // F-M2 (wave-2.5 addendum item 2): a CPU-tier run must never
+                // reach `try_cuda_qkv` at all. `CudaGraph::global()` opens the
+                // device and compiles six NVRTC modules on first call; without
+                // this gate a `KernelTier::Reference` run on a CUDA box paid
+                // that attempt once per layer per token. Mirrors the
+                // `_gpu_kernel` gate at `model/types/mod.rs:891`.
+                let cuda_ok = if !metal_ok && kernel.is_gpu_accelerated() {
                     if let (Some(q_blk), Some(k_blk), Some(v_blk)) = (
                         self.attn_q.blocks_1bit(),
                         self.attn_k.blocks_1bit(),
@@ -148,6 +370,7 @@ impl<'a> TransformerBlock<'a> {
                             v_bytes,
                             total_rows,
                             h,
+                            CUDA_BLOCK_MODEL_EPOCH,
                         )
                         .is_ok()
                     } else {
@@ -156,6 +379,7 @@ impl<'a> TransformerBlock<'a> {
                 } else {
                     false
                 };
+
                 #[cfg(not(all(
                     feature = "native-cuda",
                     not(all(feature = "metal", target_os = "macos")),
@@ -163,15 +387,156 @@ impl<'a> TransformerBlock<'a> {
                 )))]
                 let cuda_ok = false;
                 if !metal_ok && !cuda_ok {
-                    kernel.gemv_cached(fused_handle, normed, fused_qkv, total_rows, h)?;
+                    // `fused_qkv_handle` (see `upload.rs`) is built ONLY for
+                    // 1-bit weights today, but guard explicitly rather than
+                    // relying on that invariant: `OneBitKernel::gemv_cached`
+                    // always decodes its buffer as `Q1_0_g128`, so it must
+                    // never be called with a handle built over a different
+                    // format (M-21 hardening — ternary/PQ2_0/PTQ1_0 would
+                    // silently read garbage otherwise).
+                    if self.attn_q.blocks_1bit().is_some() {
+                        kernel.gemv_cached(fused_handle, normed, fused_qkv, total_rows, h)?;
+                    } else {
+                        self.attn_q.forward_vec(normed, q_all)?;
+                        self.attn_k.forward_vec(normed, k_all)?;
+                        self.attn_v.forward_vec(normed, v_all)?;
+                    }
                 }
-                q_all[..q_rows].copy_from_slice(&fused_qkv[..q_rows]);
-                k_all[..k_rows].copy_from_slice(&fused_qkv[q_rows..q_rows + k_rows]);
-                v_all[..k_rows].copy_from_slice(&fused_qkv[q_rows + k_rows..total_rows]);
+                if metal_ok || cuda_ok || self.attn_q.blocks_1bit().is_some() {
+                    q_all[..q_rows].copy_from_slice(&fused_qkv[..q_rows]);
+                    k_all[..k_rows].copy_from_slice(&fused_qkv[q_rows..q_rows + k_rows]);
+                    v_all[..k_rows].copy_from_slice(&fused_qkv[q_rows + k_rows..total_rows]);
+                }
             } else {
-                self.attn_q.forward_vec(normed, q_all)?;
-                self.attn_k.forward_vec(normed, k_all)?;
-                self.attn_v.forward_vec(normed, v_all)?;
+                // M-21: ternary models get no `fused_qkv_handle` (see the
+                // long comment in `upload.rs` for why), so key the Metal
+                // fused-QKV fast path on `blocks_ternary()` directly,
+                // gated on `attn_q.gpu_handle()` so a model that never
+                // opted into GPU residency via `upload_to_gpu()` stays on
+                // the CPU path exactly like the 1-bit branch above does.
+                // The slot itself is that handle's own `.id()` (see the
+                // blocking-fix note on `try_metal_gemv_ternary_fused`), not
+                // the weight's mmap pointer — ids come from the same
+                // process-global monotonic counter 1-bit handles use, so
+                // they are never reused across model loads the way a freed
+                // mmap address can be.
+                #[cfg(all(feature = "metal", target_os = "macos"))]
+                let ternary_metal_ok = {
+                    if let (Some(q_blk), Some(k_blk), Some(v_blk)) = (
+                        self.attn_q.blocks_ternary(),
+                        self.attn_k.blocks_ternary(),
+                        self.attn_v.blocks_ternary(),
+                    ) {
+                        if let Some(hnd) = self.attn_q.gpu_handle() {
+                            let q_rows = nq * hd;
+                            let k_rows = nkv * hd;
+                            let total_rows = q_rows + k_rows + k_rows;
+                            let q_bytes = blocks_as_bytes_ternary(q_blk);
+                            let k_bytes = blocks_as_bytes_ternary(k_blk);
+                            let v_bytes = blocks_as_bytes_ternary(v_blk);
+                            let slot = hnd.id();
+                            if try_metal_gemv_ternary_fused(
+                                normed,
+                                fused_qkv,
+                                slot,
+                                &[q_bytes, k_bytes, v_bytes],
+                                total_rows,
+                                h,
+                            )
+                            .is_ok()
+                            {
+                                q_all[..q_rows].copy_from_slice(&fused_qkv[..q_rows]);
+                                k_all[..k_rows]
+                                    .copy_from_slice(&fused_qkv[q_rows..q_rows + k_rows]);
+                                v_all[..k_rows]
+                                    .copy_from_slice(&fused_qkv[q_rows + k_rows..total_rows]);
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                };
+                #[cfg(not(all(feature = "metal", target_os = "macos")))]
+                let ternary_metal_ok = false;
+                // M-21 (wave-2.5 addendum item 4): the CUDA twin of the Metal
+                // branch above. Same gating — real ternary blocks on all three
+                // projections, an `attn_q` GPU handle whose id seeds the upload
+                // slot, and a GPU kernel tier (F-M2) so a CPU-tier run never
+                // opens the device — and the same fall-through to the CPU
+                // projections when any of that is missing or the GEMV fails.
+                //
+                // `hnd.id()` is passed RAW: `try_cuda_gemv_ternary_fused`
+                // derives the private fused slot from it with
+                // `cuda_fused_qkv_slot`, because the raw id is already owned by
+                // the Q projection's own per-matrix upload (M-21 blocking fix).
+                #[cfg(all(
+                    feature = "native-cuda",
+                    not(all(feature = "metal", target_os = "macos")),
+                    any(target_os = "linux", target_os = "windows")
+                ))]
+                let ternary_cuda_ok = {
+                    let blocks = if kernel.is_gpu_accelerated() {
+                        (
+                            self.attn_q.blocks_ternary(),
+                            self.attn_k.blocks_ternary(),
+                            self.attn_v.blocks_ternary(),
+                        )
+                    } else {
+                        (None, None, None)
+                    };
+                    if let ((Some(q_blk), Some(k_blk), Some(v_blk)), Some(hnd)) =
+                        (blocks, self.attn_q.gpu_handle())
+                    {
+                        let q_rows = nq * hd;
+                        let k_rows = nkv * hd;
+                        let total_rows = q_rows + k_rows + k_rows;
+                        let q_bytes = blocks_as_bytes_ternary(q_blk);
+                        let k_bytes = blocks_as_bytes_ternary(k_blk);
+                        let v_bytes = blocks_as_bytes_ternary(v_blk);
+                        match try_cuda_gemv_ternary_fused(
+                            normed,
+                            fused_qkv,
+                            hnd.id(),
+                            &[q_bytes, k_bytes, v_bytes],
+                            total_rows,
+                            h,
+                        ) {
+                            Ok(()) => {
+                                q_all[..q_rows].copy_from_slice(&fused_qkv[..q_rows]);
+                                k_all[..k_rows]
+                                    .copy_from_slice(&fused_qkv[q_rows..q_rows + k_rows]);
+                                v_all[..k_rows]
+                                    .copy_from_slice(&fused_qkv[q_rows + k_rows..total_rows]);
+                                true
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "fused ternary QKV GEMV on CUDA failed, falling back to CPU"
+                                );
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    }
+                };
+                #[cfg(not(all(
+                    feature = "native-cuda",
+                    not(all(feature = "metal", target_os = "macos")),
+                    any(target_os = "linux", target_os = "windows")
+                )))]
+                let ternary_cuda_ok = false;
+                if !ternary_metal_ok && !ternary_cuda_ok {
+                    self.attn_q.forward_vec(normed, q_all)?;
+                    self.attn_k.forward_vec(normed, k_all)?;
+                    self.attn_v.forward_vec(normed, v_all)?;
+                }
             }
             qkv_us = qkv_start.elapsed().as_micros();
         }
@@ -226,12 +591,29 @@ impl<'a> TransformerBlock<'a> {
         )?;
         attn_us = attn_start.elapsed().as_micros();
         let ffn_start = Instant::now();
-        let did_batch_ffn =
-            if let (Some(attn_proj_handle), Some(gate_up_handle), Some(down_handle)) = (
-                self.attn_output.gpu_handle(),
-                self.fused_gate_up_handle,
-                self.ffn_down.gpu_handle(),
-            ) {
+        let did_batch_ffn = if let (
+            Some(attn_proj_handle),
+            Some(gate_up_handle),
+            Some(down_handle),
+        ) = (
+            self.attn_output.gpu_handle(),
+            self.fused_gate_up_handle,
+            self.ffn_down.gpu_handle(),
+        ) {
+            // M-21 hardening: `batch_ffn_phase`/`try_metal_ffn` always
+            // decode every buffer as `Q1_0_g128` regardless of the
+            // handle's true origin (`GpuWeightHandle` carries no format
+            // tag). `fused_gate_up_handle` is built only for 1-bit
+            // weights today (see `upload.rs`), but this whole-layer
+            // batched path must not rely on that invariant alone —
+            // require every matrix to genuinely be 1-bit before
+            // entering it, so a ternary (or future PQ2_0/PTQ1_0) model
+            // can never reach the wrong decoder here.
+            if self.attn_output.blocks_1bit().is_some()
+                && self.ffn_gate.blocks_1bit().is_some()
+                && self.ffn_up.blocks_1bit().is_some()
+                && self.ffn_down.blocks_1bit().is_some()
+            {
                 let inter = self.ffn_gate.out_features();
                 #[cfg(all(feature = "metal", target_os = "macos"))]
                 {
@@ -301,12 +683,20 @@ impl<'a> TransformerBlock<'a> {
                     any(target_os = "linux", target_os = "windows")
                 ))]
                 {
-                    if let (Some(attn_proj_blk), Some(gate_blk), Some(up_blk), Some(down_blk)) = (
-                        self.attn_output.blocks_1bit(),
-                        self.ffn_gate.blocks_1bit(),
-                        self.ffn_up.blocks_1bit(),
-                        self.ffn_down.blocks_1bit(),
-                    ) {
+                    // F-M2 (wave-2.5 addendum item 2): see the `try_cuda_qkv`
+                    // gate above — a CPU-tier run must not open the device.
+                    if let (Some(attn_proj_blk), Some(gate_blk), Some(up_blk), Some(down_blk)) =
+                        if kernel.is_gpu_accelerated() {
+                            (
+                                self.attn_output.blocks_1bit(),
+                                self.ffn_gate.blocks_1bit(),
+                                self.ffn_up.blocks_1bit(),
+                                self.ffn_down.blocks_1bit(),
+                            )
+                        } else {
+                            (None, None, None, None)
+                        }
+                    {
                         let attn_proj_bytes = blocks_as_bytes(attn_proj_blk);
                         let gate_bytes = blocks_as_bytes(gate_blk);
                         let up_bytes = blocks_as_bytes(up_blk);
@@ -325,6 +715,7 @@ impl<'a> TransformerBlock<'a> {
                             down_bytes,
                             h,
                             inter,
+                            CUDA_BLOCK_MODEL_EPOCH,
                         );
                         if cuda_result.is_ok() {
                             true
@@ -384,7 +775,10 @@ impl<'a> TransformerBlock<'a> {
                 }
             } else {
                 false
-            };
+            }
+        } else {
+            false
+        };
         if !did_batch_ffn {
             self.attn_output.forward_vec(attn_out, attn_proj)?;
             for i in 0..h {
@@ -392,16 +786,24 @@ impl<'a> TransformerBlock<'a> {
             }
             self.ffn_norm.forward(hidden, normed)?;
             if let Some(fused_handle) = self.fused_gate_up_handle {
-                let inter = gate_out.len();
-                let total_rows = inter * 2;
-                kernel.gemv_cached(fused_handle, normed, fused_gate_up, total_rows, h)?;
-                gate_out[..inter].copy_from_slice(&fused_gate_up[..inter]);
-                up_out[..inter].copy_from_slice(&fused_gate_up[inter..total_rows]);
+                // M-21 hardening: mirrors the QKV-side guard above —
+                // `gemv_cached` always decodes `Q1_0_g128`, so it must never
+                // see a handle built over a different format.
+                if self.ffn_gate.blocks_1bit().is_some() {
+                    let inter = gate_out.len();
+                    let total_rows = inter * 2;
+                    kernel.gemv_cached(fused_handle, normed, fused_gate_up, total_rows, h)?;
+                    gate_out[..inter].copy_from_slice(&fused_gate_up[..inter]);
+                    up_out[..inter].copy_from_slice(&fused_gate_up[inter..total_rows]);
+                } else {
+                    self.ffn_gate.forward_vec(normed, gate_out)?;
+                    self.ffn_up.forward_vec(normed, up_out)?;
+                }
             } else {
                 self.ffn_gate.forward_vec(normed, gate_out)?;
                 self.ffn_up.forward_vec(normed, up_out)?;
             }
-            swiglu_fn(gate_out, up_out, swiglu_out);
+            try_swiglu(gate_out, up_out, swiglu_out)?;
             self.ffn_down.forward_vec(swiglu_out, down_out)?;
             for i in 0..h {
                 hidden[i] += down_out[i];
@@ -415,5 +817,144 @@ impl<'a> TransformerBlock<'a> {
             layer = self.layer_idx,
         );
         Ok(())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests — M-21 fused-QKV slot namespace and SoA length predicate
+//
+// Both are pure integer arithmetic over the CUDA weight-cache contract, so
+// they run on every host, including this CUDA-less one. Nothing here opens a
+// device or links cudarc.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::{cuda_fused_qkv_slot, cuda_tq2_soa_len_bytes, CUDA_FUSED_QKV_SLOT_TAG};
+
+    /// Every id the allocator can mint is moved into a disjoint namespace, and
+    /// the original id survives in the low 63 bits.
+    #[test]
+    fn fused_qkv_slot_is_disjoint_from_raw_handle_ids() {
+        // 1 is the first value `alloc_handle_id` returns
+        // (`NEXT_HANDLE_ID: AtomicU64::new(1)`); the rest are arbitrary later
+        // values of the same `fetch_add(1)` counter.
+        for id in [
+            1u64,
+            2,
+            3,
+            12_345,
+            u32::MAX as u64,
+            1u64 << 62,
+            (1u64 << 63) - 1,
+        ] {
+            let slot = cuda_fused_qkv_slot(id);
+            assert_ne!(slot, id, "slot for id {id} must not equal the raw id");
+            assert_eq!(
+                slot,
+                id | (1u64 << 63),
+                "slot for id {id} must be the id with bit 63 set"
+            );
+            assert_eq!(
+                slot & !CUDA_FUSED_QKV_SLOT_TAG,
+                id,
+                "low 63 bits must round-trip"
+            );
+            assert_ne!(slot & CUDA_FUSED_QKV_SLOT_TAG, 0, "tag bit must be set");
+        }
+    }
+
+    /// The aliasing invariant the tag relies on: `alloc_handle_id` starts at 1
+    /// and only ever `fetch_add(1)`s, so no id it can return has bit 63 set
+    /// (that would take 2^63 uploads). Untagged and tagged slots are therefore
+    /// permanently disjoint.
+    #[test]
+    fn allocator_ids_never_carry_the_fused_tag() {
+        assert_eq!(CUDA_FUSED_QKV_SLOT_TAG, 1u64 << 63);
+        for id in [1u64, 1_000_000, 1u64 << 40, (1u64 << 63) - 1] {
+            assert_eq!(
+                id & CUDA_FUSED_QKV_SLOT_TAG,
+                0,
+                "a reachable allocator id ({id}) must have bit 63 clear"
+            );
+        }
+        // Two distinct raw ids stay distinct after tagging.
+        assert_ne!(cuda_fused_qkv_slot(7), cuda_fused_qkv_slot(8));
+    }
+
+    /// The length predicate against the real Ternary-Bonsai-1.7B QKV shape:
+    /// `nq = 16`, `nkv = 8`, `head_dim = 128`, `hidden = k = 2048`.
+    /// `total_rows = 16*128 + 2*(8*128) = 4096`, `blocks_per_row = 2048/128 =
+    /// 16`, so the fused SoA buffer is `4096 * 16 * 34` bytes.
+    #[test]
+    fn tq2_soa_len_matches_the_17b_fused_qkv_shape() {
+        let (nq, nkv, hd, k) = (16usize, 8usize, 128usize, 2048usize);
+        let total_rows = nq * hd + 2 * (nkv * hd);
+        assert_eq!(total_rows, 4096);
+        let expected = cuda_tq2_soa_len_bytes(total_rows, k);
+        assert_eq!(expected, Some(2_228_224));
+
+        // A Q-only buffer — exactly what the colliding slot used to hand back —
+        // is a third of that, so the check rejects it.
+        let q_only = cuda_tq2_soa_len_bytes(nq * hd, k).expect("q-only length");
+        assert_eq!(q_only, 1_114_112);
+        assert_ne!(Some(q_only), expected);
+    }
+
+    /// A near-miss byte length is not merely unequal — it is unreachable: for a
+    /// fixed `k`, valid SoA lengths are spaced `34 * (k / 128)` bytes apart
+    /// (one whole output row), so nothing within a row of the correct length is
+    /// a legal buffer. This is what makes the equality check in
+    /// `try_cuda_gemv_ternary_fused` a real guard rather than a coincidence
+    /// filter: a foreign buffer in the slot can only pass by being byte-exactly
+    /// the right shape.
+    #[test]
+    fn tq2_soa_len_rejects_near_misses() {
+        let k = 2048usize;
+        let row_stride = 34 * (k / 128);
+        assert_eq!(row_stride, 544);
+        let len = cuda_tq2_soa_len_bytes(4096, k).expect("length");
+
+        let reachable: std::collections::HashSet<usize> = (0usize..8192)
+            .filter_map(|rows| cuda_tq2_soa_len_bytes(rows, k))
+            .collect();
+        assert!(reachable.contains(&len));
+        for delta in [1usize, 2, 34, 33, 543] {
+            for wrong in [len - delta, len + delta] {
+                assert_ne!(wrong, len);
+                assert!(
+                    !reachable.contains(&wrong),
+                    "{wrong} (len {len} ± {delta}) must not be a valid SoA length for k={k}"
+                );
+            }
+        }
+        // One whole row away IS reachable — the guard rejects it on equality,
+        // which is exactly the Q-only-vs-fused case.
+        assert!(reachable.contains(&(len - row_stride)));
+        assert!(reachable.contains(&(len + row_stride)));
+    }
+
+    /// `k` must be a whole number of 128-wide quant groups; anything else has
+    /// no TQ2_0_g128 SoA length at all.
+    #[test]
+    fn tq2_soa_len_requires_whole_quant_groups() {
+        assert_eq!(cuda_tq2_soa_len_bytes(4096, 0), None);
+        assert_eq!(cuda_tq2_soa_len_bytes(4096, 127), None);
+        assert_eq!(cuda_tq2_soa_len_bytes(4096, 2049), None);
+        assert_eq!(cuda_tq2_soa_len_bytes(1, 128), Some(34));
+        assert_eq!(cuda_tq2_soa_len_bytes(0, 128), Some(0));
+    }
+
+    /// The 34-byte block stride is the contract, not an accident: one block
+    /// is 32 bytes of 2-bit codes plus a 2-byte FP16 scale.
+    #[test]
+    fn tq2_soa_len_is_34_bytes_per_block() {
+        for (rows, k, blocks) in [
+            (1usize, 128usize, 1usize),
+            (8, 256, 16),
+            (4096, 2048, 65_536),
+        ] {
+            assert_eq!(cuda_tq2_soa_len_bytes(rows, k), Some(blocks * 34));
+        }
     }
 }

@@ -193,7 +193,6 @@ mod tests {
         assert!(CUDA_RMSNORM.contains("rmsnorm"));
         assert!(CUDA_SILU.contains("silu"));
         assert!(CUDA_MATVEC_F32.contains("matvec_f32"));
-        assert!(CUDA_SWIGLU.contains("swiglu"));
         assert!(CUDA_SWIGLU_FUSED.contains("swiglu_fused"));
         assert!(CUDA_RESIDUAL_ADD.contains("residual_add"));
         assert!(CUDA_RMSNORM_WEIGHTED.contains("rmsnorm_weighted"));

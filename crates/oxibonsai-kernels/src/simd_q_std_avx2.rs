@@ -58,7 +58,7 @@ fn validate_gemv(
     in_features: usize,
     block_len: usize,
 ) -> KernelResult<usize> {
-    if in_features % block_len != 0 {
+    if !in_features.is_multiple_of(block_len) {
         return Err(KernelError::NotBlockAligned {
             count: in_features,
             block_size: block_len,

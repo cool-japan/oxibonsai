@@ -39,12 +39,14 @@ const U32_WORDS_PER_GROUP: usize = GROUP_SIZE / CODES_PER_U32; // = 8
 
 /// Reinterpret a bfloat16 bit pattern as `f32`.
 ///
-/// bfloat16 is the top 16 bits of an IEEE-754 `f32`, so the conversion is an
-/// exact left-shift by 16 with no rounding.
-#[inline]
-pub fn bf16_to_f32(bits: u16) -> f32 {
-    f32::from_bits((bits as u32) << 16)
-}
+/// Re-exports the single canonical implementation in
+/// [`oxibonsai_core::bf16::bf16_to_f32`] (K-12 bf16 hoist / FIX3-GGUF-WRITE
+/// item 4). This used to be its own copy of the identical bit-manipulation
+/// (`f32::from_bits((bits as u32) << 16)`); kept as a `pub use` rather than
+/// deleted outright because `crate::model::weight_loaders` and
+/// `crate::hybrid::weights` (not owned by this package) import it from this
+/// exact path.
+pub use oxibonsai_core::bf16::bf16_to_f32;
 
 /// Pack one MLX-quantized linear module into `BlockTQ2_0_g128` blocks.
 ///
@@ -75,7 +77,7 @@ pub fn pack_quantized_module(
     in_features: usize,
 ) -> Result<Vec<BlockTQ2_0_g128>, PackError> {
     // ── Shape validation ─────────────────────────────────────────────────────
-    if in_features == 0 || in_features % GROUP_SIZE != 0 {
+    if in_features == 0 || !in_features.is_multiple_of(GROUP_SIZE) {
         return Err(PackError::InFeaturesNotAligned {
             module: module.to_string(),
             in_features,
@@ -431,6 +433,29 @@ mod tests {
             let bits = f32_to_bf16(v);
             // bf16 representable exactly for these → exact round-trip.
             assert_eq!(bf16_to_f32(bits), v, "value {v}");
+        }
+    }
+
+    /// FIX3-GGUF-WRITE item 4: asserts the now-shared `bf16_to_f32`
+    /// (`oxibonsai_core::bf16::bf16_to_f32`) agrees with this module's
+    /// former local expression over the **entire** `u16` domain (all 65536
+    /// bit patterns) — every subnormal, both zeros, every infinity and
+    /// every NaN payload included. Comparison is by `to_bits()`, not `==`:
+    /// under IEEE `==`, `NaN != NaN` (so two agreeing NaN outputs would
+    /// wrongly look like a mismatch) and `-0.0 == 0.0` (so a real mismatch
+    /// on the sign of zero would wrongly look like agreement). Kept
+    /// permanently as a regression guard, not just a one-time pre-repoint
+    /// check.
+    #[test]
+    fn bf16_to_f32_matches_the_former_local_expression_across_the_full_u16_domain() {
+        for bits in 0u16..=0xFFFF {
+            let shared = bf16_to_f32(bits);
+            let former_local_expression = f32::from_bits((bits as u32) << 16);
+            assert_eq!(
+                shared.to_bits(),
+                former_local_expression.to_bits(),
+                "mismatch for bf16 bit pattern {bits:#06x}"
+            );
         }
     }
 }

@@ -45,7 +45,12 @@ fn run() -> Result<(), String> {
 
     println!("== Per-tensor ==");
     for (name, info) in &entries {
-        let tid = info.tensor_type as u32;
+        // `wire_id()` rather than a raw discriminant cast: `GgufTensorType`
+        // carries sentinel variants (`Q2_0G64`, `Q2_0G128DFirst`) whose raw
+        // discriminants are NOT the on-disk ggml id, so casting would print
+        // `1073741866` instead of `42` for a legacy PrismML file
+        // (core-gguf-12 / B2-01).
+        let tid = info.tensor_type.wire_id();
         println!(
             "{:<40} type={} ({:<12}) shape={:?} bytes={}",
             name,
@@ -74,7 +79,7 @@ fn run() -> Result<(), String> {
         total += *bytes;
         println!(
             "type={:<3} {:<12} count={:<5} bytes={:>13} ({:.2} MiB)",
-            *ty as u32,
+            ty.wire_id(),
             ty.name(),
             c,
             bytes,

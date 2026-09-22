@@ -24,18 +24,23 @@
 //! dimensions and provides parameter counts and expected file sizes.
 
 pub mod block;
+#[cfg(feature = "training")]
 pub mod calibration;
 pub mod checkpoint;
 pub mod chunked_prefill;
+#[cfg(feature = "training")]
 pub mod compression;
 pub mod convert;
+#[cfg(feature = "training")]
 pub mod disk_cache;
 pub mod dynamic_quant;
 pub mod error;
 pub mod export;
 pub mod gguf_loader;
+#[cfg(feature = "training")]
 pub mod gradient;
 pub mod gradient_checkpoint;
+pub mod hybrid;
 pub mod kv_cache;
 pub mod kv_cache_fp16;
 pub mod kv_cache_quant;
@@ -49,6 +54,7 @@ pub mod model_config_builder;
 pub mod model_merge;
 pub mod model_registry;
 pub mod model_variants;
+#[cfg(feature = "multi-device")]
 pub mod multi_gpu;
 pub mod optimizer;
 pub mod paged_kv_cache;
@@ -58,23 +64,29 @@ pub mod pruning;
 pub mod quantize;
 pub mod quantize_int8;
 pub mod quantize_ternary;
+#[cfg(feature = "training")]
 pub mod smoothquant;
 pub mod tensor_parallel;
+#[cfg(test)]
+pub(crate) mod test_alloc;
 pub mod weight_tying;
 
+#[cfg(feature = "training")]
 pub use calibration::{
-    simulate_calibration, validate_calibration, CalibMethod, CalibSummary, CalibValidation,
-    CalibrationDb, LayerCalibStats,
+    validate_calibration, CalibMethod, CalibSummary, CalibValidation, CalibrationDb,
+    LayerCalibStats,
 };
 pub use checkpoint::{Checkpoint, CheckpointError, CheckpointMetadata, CheckpointTensor};
 pub use chunked_prefill::{
     create_prefill_chunks, peak_memory_estimate, ChunkedPrefillConfig, PrefillAction, PrefillChunk,
     PrefillMemoryEstimate, PrefillPriority, PrefillScheduler,
 };
+#[cfg(feature = "training")]
 pub use compression::{
     compress_model, estimate_compressed_size, CompressionConfig, CompressionError,
     CompressionResult, CompressionStage, StageStats,
 };
+#[cfg(feature = "training")]
 pub use disk_cache::{
     CacheEntry, CacheFileInfo, CacheManager, DiskCache, DiskCacheError, CACHE_MAGIC, CACHE_VERSION,
 };
@@ -139,9 +151,16 @@ pub use model_merge::{
     task_vector_merge, ties_merge, MergeConfig, MergeError, MergeMethod, MergeStats, WeightTensor,
 };
 pub use model_registry::ModelVariant;
+// CQ-11: `SimulatedDeviceMesh`/`SimulatedCollectives` are the preferred
+// names (see `multi_gpu.rs`'s module doc); `DeviceMesh`/`NcclCollectives`
+// are `pub type` aliases to them kept ONLY for source compatibility.
+// `tests/multi_gpu_tests.rs` (not owned by this package) still imports the
+// legacy names directly, so they stay re-exported here alongside the real
+// ones rather than being dropped — see this package's deviations.
+#[cfg(feature = "multi-device")]
 pub use multi_gpu::{
     merge_column_shards, partition_weights_column, partition_weights_row, CollectiveResult,
-    DeviceId, DeviceInfo, DeviceMesh, NcclCollectives,
+    DeviceId, DeviceInfo, DeviceMesh, NcclCollectives, SimulatedCollectives, SimulatedDeviceMesh,
 };
 pub use paged_kv_cache::{
     BlockPool, BlockTable, KvPage, PagedKvCache, PagedKvError, DEFAULT_BLOCK_SIZE,
@@ -154,6 +173,7 @@ pub use pruning::{
     ImportanceMetric, ImportanceScores, ModelSparsitySummary, PruningConfig, PruningError,
     PruningGranularity, ScoreStats, SparsityReport,
 };
+#[cfg(feature = "training")]
 pub use smoothquant::{
     quantize_fp8_e4m3_smooth, quantize_fp8_e5m2_smooth, SmoothQuantCalibrator, SmoothQuantError,
 };

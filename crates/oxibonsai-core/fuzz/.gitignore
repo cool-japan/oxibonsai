@@ -1,0 +1,7 @@
+# Build output and crash artifacts are ephemeral/regenerable; `corpus/` is
+# intentionally NOT listed here — the checked-in files under
+# `corpus/gguf_parse/` are a small, deliberate set of seed inputs (T-03),
+# not fuzzer-discovered growth. A local `cargo fuzz run` will expand this
+# directory into thousands of files; do not `git add` that expansion.
+target
+artifacts

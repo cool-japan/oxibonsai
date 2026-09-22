@@ -24,10 +24,11 @@
 //! | [`oxibonsai-kernels`](https://crates.io/crates/oxibonsai-kernels) | Optimized compute kernels (SIMD, matmul, softmax) |
 //! | [`oxibonsai-model`](https://crates.io/crates/oxibonsai-model) | Transformer model definitions, KV cache, attention |
 //! | [`oxibonsai-runtime`](https://crates.io/crates/oxibonsai-runtime) | Inference engine, sampling, speculative decoding (`SpeculativeDecoder::generate_verified`, two real engines) |
-//! | [`oxibonsai-tokenizer`](https://crates.io/crates/oxibonsai-tokenizer) | HuggingFace tokenizer integration |
+//! | [`oxibonsai-tokenizer`](https://crates.io/crates/oxibonsai-tokenizer) | Pure-Rust native BPE tokenizer |
 //! | [`oxibonsai-rag`](https://crates.io/crates/oxibonsai-rag) | Retrieval-augmented generation pipeline |
 //! | [`oxibonsai-eval`](https://crates.io/crates/oxibonsai-eval) | Model evaluation and benchmarking |
 //! | [`oxibonsai-serve`](https://crates.io/crates/oxibonsai-serve) | OpenAI-compatible HTTP server |
+//! | [`oxibonsai-image`](https://crates.io/crates/oxibonsai-image) | Text-to-image (Bonsai-Image / FLUX.2 Klein DiT): GGUF weight loading, forward pass, and pipeline |
 //!
 //! ## Feature Flags
 //!
@@ -35,13 +36,25 @@
 //! |---------|-------------|
 //! | `server` | HTTP server support via `oxibonsai-serve` |
 //! | `rag` | Retrieval-augmented generation |
-//! | `native-tokenizer` | HuggingFace tokenizer support |
+//! | `native-tokenizer` | Pure-Rust native BPE tokenizer (`oxibonsai-tokenizer`), no C deps |
+//! | `hf-tokenizer` | HuggingFace `tokenizers`-backed tokenizer backend |
 //! | `eval` | Model evaluation framework |
-//! | `full` | Enable all optional features |
+//! | `image` | Text-to-image (`oxibonsai-image`: Bonsai-Image / FLUX.2 Klein DiT) |
+//! | `gpu` | GPU-backend plumbing shared by `metal`/`native-cuda` (rarely enabled directly) |
+//! | `metal` | Metal GPU acceleration for kernels/model/runtime, and for `image` when it is also enabled |
+//! | `cuda` | Compile-only CUDA stub forward (no dispatch change; see `native-cuda`) |
+//! | `native-cuda` | Real CUDA GPU acceleration (`cudarc`) for kernels/model/runtime, and for `image` when it is also enabled |
+//! | `full` | Enable every optional crate above (`server`, `rag`, both tokenizer backends, `eval`, `image`); GPU features stay opt-in even under `full` |
 //! | `simd-avx2` | AVX2 SIMD kernels (x86_64) |
 //! | `simd-avx512` | AVX-512 SIMD kernels (x86_64) |
 //! | `simd-neon` | NEON SIMD kernels (AArch64) |
 //! | `wasm` | WebAssembly target support |
+//!
+//! `metal`/`native-cuda` forward to `oxibonsai-image` with a *weak*
+//! dependency feature (`oxibonsai-image?/metal`, `oxibonsai-image?/native-cuda`):
+//! enabling `metal` alone never pulls the imaging crate in on its own. Combine
+//! it with `image` (`--features image,metal`) to get a GPU-accelerated
+//! text-to-image build.
 //!
 //! ## License
 //!
@@ -69,7 +82,7 @@ pub use oxibonsai_runtime as runtime;
 #[cfg(feature = "rag")]
 pub use oxibonsai_rag as rag;
 
-/// HuggingFace tokenizer integration.
+/// Pure-Rust native BPE tokenizer.
 #[cfg(feature = "native-tokenizer")]
 pub use oxibonsai_tokenizer as tokenizer;
 
@@ -80,3 +93,7 @@ pub use oxibonsai_eval as eval;
 /// OpenAI-compatible HTTP server.
 #[cfg(feature = "server")]
 pub use oxibonsai_serve as serve;
+
+/// Text-to-image (Bonsai-Image / FLUX.2 Klein DiT).
+#[cfg(feature = "image")]
+pub use oxibonsai_image as image;

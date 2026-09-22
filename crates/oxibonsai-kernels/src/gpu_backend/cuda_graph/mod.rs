@@ -42,6 +42,8 @@ pub mod types;
 
 // Re-export public types and functions
 pub use cudagraph_dit_block_group::*;
+/// Device-negotiated wide flash-attention configuration (finding F5).
+pub use cudagraph_global_group::FlashLargeConfig;
 pub use cudagraph_type::*;
 pub use functions::*;
 pub use types::*;

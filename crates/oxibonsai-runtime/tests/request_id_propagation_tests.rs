@@ -7,6 +7,11 @@
 //! 3. Malformed ids fall back to a freshly generated id (server doesn't 4xx).
 //! 4. The streaming path also emits the header on the SSE response.
 
+// The `server` module is only compiled with the `server` feature, so this
+// integration test must be gated the same way to keep `--no-default-features`
+// green.
+#![cfg(feature = "server")]
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;

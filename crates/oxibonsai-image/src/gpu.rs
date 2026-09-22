@@ -20,6 +20,17 @@
 //! On *any* error this module returns a [`GpuMatmulError`]; the caller
 //! ([`crate::math::ternary_matmul`]) swallows it and falls back to the CPU path,
 //! so a GPU failure can never break a forward pass (no `unwrap`/`expect`/`panic!`).
+//!
+//! That fallback used to be completely silent (RAG-EVAL-IMG-18): a flaky or
+//! absent Metal device degraded every DiT matmul to the ~0.2 GMAC/s CPU path
+//! (a real ~10× slowdown) with no diagnostic anywhere in the crate. Both
+//! GPU-calling functions below now get the same one-time-latch treatment used
+//! elsewhere in this crate (`crate::cuda_gpu`, `crate::vae::gpu`,
+//! `crate::vae::cuda_gpu`, `crate::te::forward`): an `AtomicBool` per
+//! function and a `tracing::warn!` naming the op and the underlying error the
+//! first time it fails, silent thereafter for the life of the process so a
+//! persistently-unavailable GPU does not spam the log on every one of the
+//! DiT's ~100 per-step matmul calls.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
@@ -38,6 +49,31 @@ pub enum GpuMatmulError {
     /// The fused Metal TQ2 GEMM (weight upload / encode / dispatch) failed.
     #[error("Metal TQ2 GEMM failed: {0}")]
     Metal(#[from] MetalGraphError),
+}
+
+/// Latch for [`ternary_matmul_gpu`]'s one-time fallback warning.
+static TERNARY_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Latch for [`joint_attention_gpu`]'s one-time fallback warning.
+static ATTN_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Emit a one-time `tracing::warn!` the first time `flag`'s GPU op fails and
+/// the caller falls back to the CPU reference path.
+///
+/// `flag.swap(true, ..)` returns the *previous* value, so the message prints
+/// exactly once per process per call site — every subsequent failure (e.g. a
+/// GPU that stays unavailable for the life of the process) is silently
+/// dropped, matching a "warn once" contract without spamming the log on a
+/// hot loop.
+fn warn_gpu_fallback_once(flag: &'static AtomicBool, op: &str, reason: &str) {
+    if !flag.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            op,
+            reason,
+            "oxibonsai-image: GPU op failed, falling back to CPU; further \
+             occurrences in this process are not logged"
+        );
+    }
 }
 
 /// Reinterpret the packed ternary blocks as their raw little-endian AoS bytes.
@@ -143,11 +179,18 @@ pub fn joint_attention_gpu(
     seq: usize,
     head_dim: usize,
 ) -> Result<Vec<f32>, GpuMatmulError> {
-    let graph =
-        MetalGraph::global().map_err(|e| GpuMatmulError::GraphUnavailable(e.to_string()))?;
+    let graph = MetalGraph::global()
+        .map_err(|e| GpuMatmulError::GraphUnavailable(e.to_string()))
+        .inspect_err(|e| {
+            warn_gpu_fallback_once(&ATTN_FALLBACK_WARNED, "joint attention", &e.to_string())
+        })?;
     // The kernel writes the token-major transposed result `[seq, num_heads*head_dim]`.
     let mut out = vec![0.0f32; seq * num_heads * head_dim];
-    graph.encode_joint_attention_flash_pooled(q, k, v, &mut out, num_heads, seq, head_dim)?;
+    graph
+        .encode_joint_attention_flash_pooled(q, k, v, &mut out, num_heads, seq, head_dim)
+        .inspect_err(|e| {
+            warn_gpu_fallback_once(&ATTN_FALLBACK_WARNED, "joint attention", &e.to_string())
+        })?;
     DIT_ATTN_GPU_USED.store(true, Ordering::Relaxed);
     Ok(out)
 }
@@ -175,15 +218,25 @@ pub fn ternary_matmul_gpu(
     n: usize,
     k: usize,
 ) -> Result<(), GpuMatmulError> {
-    let graph =
-        MetalGraph::global().map_err(|e| GpuMatmulError::GraphUnavailable(e.to_string()))?;
+    let graph = MetalGraph::global()
+        .map_err(|e| GpuMatmulError::GraphUnavailable(e.to_string()))
+        .inspect_err(|e| {
+            warn_gpu_fallback_once(&TERNARY_FALLBACK_WARNED, "ternary matmul", &e.to_string())
+        })?;
     // `blocks` is borrowed from the run-long mmap; its base address is stable and
     // unique per weight, so it doubles as a cache key with no per-Linear bookkeeping.
     // Pointer addresses are huge and won't collide with the LLM's small key space.
     let key = blocks.as_ptr() as u64;
-    let handle =
-        graph.get_or_upload_tq2_weight_soa_lazy(key, || blocks_as_bytes(blocks).to_vec())?;
-    graph.encode_gemm_tq2(&handle, input, out, m, n, k)?;
+    let handle = graph
+        .get_or_upload_tq2_weight_soa_lazy(key, || blocks_as_bytes(blocks).to_vec())
+        .inspect_err(|e| {
+            warn_gpu_fallback_once(&TERNARY_FALLBACK_WARNED, "ternary matmul", &e.to_string())
+        })?;
+    graph
+        .encode_gemm_tq2(&handle, input, out, m, n, k)
+        .inspect_err(|e| {
+            warn_gpu_fallback_once(&TERNARY_FALLBACK_WARNED, "ternary matmul", &e.to_string())
+        })?;
     GPU_USED.store(true, Ordering::Relaxed);
     Ok(())
 }
@@ -228,5 +281,29 @@ mod tests {
         if std::env::var("OXI_DIT_ATTN_GPU").is_err() {
             assert!(dit_attn_gpu_enabled());
         }
+    }
+
+    #[test]
+    fn warn_gpu_fallback_once_fires_exactly_once_per_flag() {
+        // A private, test-local latch (never touched by any other test or by
+        // the real GPU call sites), so this is deterministic regardless of
+        // process/thread scheduling — unlike the crate-wide GPU-enabled
+        // latches, this one is fully test-owned.
+        static LOCAL_WARNED: AtomicBool = AtomicBool::new(false);
+        assert!(
+            !LOCAL_WARNED.load(Ordering::Relaxed),
+            "fresh static must start false"
+        );
+        warn_gpu_fallback_once(&LOCAL_WARNED, "test op", "first reason");
+        assert!(
+            LOCAL_WARNED.load(Ordering::Relaxed),
+            "the first call must latch the flag"
+        );
+        // A second (and third) call must not panic, and must leave the latch
+        // set — this is what makes the diagnostic "once per process" rather
+        // than spamming stderr on every one of the DiT's ~100 matmuls.
+        warn_gpu_fallback_once(&LOCAL_WARNED, "test op", "second reason");
+        warn_gpu_fallback_once(&LOCAL_WARNED, "test op", "third reason");
+        assert!(LOCAL_WARNED.load(Ordering::Relaxed));
     }
 }

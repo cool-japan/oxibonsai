@@ -45,7 +45,7 @@ fn bench_kv_cache_policy(c: &mut Criterion) {
         // hysteresis branches.
         let mut tick = 0u64;
         b.iter(|| {
-            let v = if tick % 2 == 0 { 0.99 } else { 0.40 };
+            let v = if tick.is_multiple_of(2) { 0.99 } else { 0.40 };
             tick = tick.wrapping_add(1);
             let lvl = p.observe(black_box(v));
             black_box(lvl);
@@ -92,7 +92,7 @@ fn bench_adaptive_lookahead(c: &mut Criterion) {
         let mut t = 0u64;
         b.iter(|| {
             // Alternate between high and low acceptance to force updates.
-            let acc = if t % 2 == 0 { 5 } else { 0 };
+            let acc = if t.is_multiple_of(2) { 5 } else { 0 };
             t = t.wrapping_add(1);
             adj.observe_step(black_box(5), black_box(acc));
         });

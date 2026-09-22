@@ -63,28 +63,37 @@ pub struct ModelSpec {
 
 /// Build the [`ModelSpec`] for Bonsai-8B (Qwen3-8B architecture).
 ///
-/// Architecture: 36 layers, hidden=4096, intermediate=14336, Q=32 heads, KV=8 heads.
+/// Architecture (real GGUF header / `Qwen3Config::bonsai_8b()` — corrected by
+/// M-34): 36 layers, hidden=4096, intermediate=12288, vocab=151669, Q=32
+/// heads, KV=8 heads.
 pub fn bonsai_8b_spec() -> ModelSpec {
     let config = Qwen3Config::bonsai_8b();
 
     // ── param count ──────────────────────────────────────────────────────────
-    // Embedding table:  151 936 × 4 096 = 622 756 864
-    // Output (tied):    151 936 × 4 096 = 622 756 864  (separate in GGUF)
+    // Embedding table:  151 669 × 4 096 = 621 236 224
+    // Output (tied):    151 669 × 4 096 = 621 236 224  (separate in GGUF)
     // Per layer (36):
     //   Q: 4096×4096=16 777 216   K: 4096×1024=4 194 304
     //   V: 4096×1024=4 194 304   O: 4096×4096=16 777 216
-    //   gate: 4096×14336=58 720 256  up: 58 720 256  down: 58 720 256
+    //   gate: 4096×12288=50 331 648  up: 50 331 648  down: 50 331 648
     //   norms (×3 × 4096) ≈ 12 288
-    // Layer total ≈ 219 116 096  × 36 ≈ 7 888 179 456
+    // Layer total ≈ 192 950 272  × 36 ≈ 6 946 209 792
     // Final norm: 4 096
-    // Grand total ≈ 8 030 000 000
+    // Grand total ≈ 8 190 000 000
+    // NOTE (wave-2.5 deviation, M-31 class): this recomputation (real
+    // intermediate=12288/vocab=151669 shape) supersedes the pre-M-34
+    // comment, which used the stale intermediate=14336/vocab=151936 figures.
+    // Per the FIX2-BUILD precedent (see `bonsai_1_7b_spec` below), the
+    // returned literal is left unchanged — it already satisfies
+    // `param_count_is_reasonable`'s bound and changing it is outside this
+    // comment-only pass's scope.
     let param_count: u64 = 8_030_000_000;
 
     // ── weights at Q1_0_g128 ─────────────────────────────────────────────────
     // Quantised weights (transformer blocks only, excluding embedding/output):
-    //   params = 7 888 179 456  →  bytes = params * 1.125 / 8 = 1 111 653 000 (≈1.04 GiB)
-    // Embedding (FP16): 151936 × 4096 × 2 = 1 245 513 728 (≈1.16 GiB)
-    // Output head (FP16): same = 1 245 513 728
+    //   params = 6 946 209 792  →  bytes = params * 1.125 / 8 ≈ 976 060 000 (≈0.91 GiB)
+    // Embedding (FP16): 151 669 × 4 096 × 2 = 1 242 472 448 (≈1.16 GiB)
+    // Output head (FP16): same = 1 242 472 448
     // Norms (FP32): ~36 × 2 × 4096 × 4 = 1 179 648
     // Metadata overhead: ~50 MiB
     // Total ≈ 2 200 000 000
@@ -161,31 +170,43 @@ pub fn bonsai_4b_spec() -> ModelSpec {
 
 /// Build the [`ModelSpec`] for Bonsai-1.7B.
 ///
-/// Architecture: 16 layers, hidden=1536, intermediate=4096, Q=12 heads, KV=2 heads.
+/// Architecture (real GGUF header, `models/Ternary-Bonsai-1.7B.gguf` /
+/// `Qwen3Config::bonsai_1_7b()` — corrected by M-34): 28 layers, hidden=2048,
+/// intermediate=6144, Q=16 heads, KV=8 heads, head_dim=128, ctx=32768.
 pub fn bonsai_1_7b_spec() -> ModelSpec {
     let config = Qwen3Config::bonsai_1_7b();
 
     // ── param count ──────────────────────────────────────────────────────────
-    // Embedding: 151936 × 1536 = 233 374 720
+    // Embedding: 151669 × 2048 = 310 618 112
     // Output:    same
-    // Per layer (16):
-    //   Q: 1536×1536=2 359 296  K: 1536×256=393 216
-    //   V: 1536×256=393 216     O: 1536×1536=2 359 296
-    //   gate: 1536×4096=6 291 456  up: 6 291 456  down: 6 291 456
-    //   norms ≈ 4 608
-    // Layer total ≈ 24 383 616 × 16 = 390 137 856
-    // Total ≈ 1 720 000 000 (embedding tables are large relative to compute)
+    // Per layer (28):
+    //   Q: 2048×2048=4 194 304    K: 2048×1024=2 097 152
+    //   V: 2048×1024=2 097 152    O: 2048×2048=4 194 304
+    //   gate: 2048×6144=12 582 912  up: 12 582 912  down: 12 582 912
+    //   norms (×3 × 2048) ≈ 6 144
+    // Layer total ≈ 50 337 792 × 28 ≈ 1 409 458 176
+    // Total ≈ 2 030 694 400 (embedding tables are large relative to compute)
+    // NOTE (FIX2-BUILD item 3(g)): this recomputation (~2.03B, real 28-layer/
+    // hidden=2048 shape) differs from the historical literal below (1.72B,
+    // dating from the pre-M-34 16-layer/hidden=1536 shape). Both satisfy
+    // `param_count_is_reasonable`'s [1B, 10B] bound, so per the FIX2-BUILD
+    // spec the literal is left unchanged (only change a literal when the
+    // recomputation falls outside what the bound tests allow).
     let param_count: u64 = 1_720_000_000;
 
     // ── weights at Q1_0_g128 ─────────────────────────────────────────────────
-    // Quantised blocks: ~390 137 856 × 1.125/8 ≈ 54 956 940 bytes
-    // Embedding FP16:   233 374 720 × 2 = 466 749 440
+    // Quantised blocks: ~1 409 458 176 × 1.125/8 ≈ 198 205 056 bytes
+    // Embedding FP16:   310 618 112 × 2 = 621 236 224
     // Output FP16:      same
-    // Total ≈ 700 000 000
+    // Total ≈ 1 440 677 504
+    // NOTE (FIX2-BUILD item 3(g)): recomputed total (~1.44 GB) differs from
+    // the literal below (0.70 GB); both satisfy
+    // `weights_size_matches_q1_0_g128_expectation`'s bound
+    // (param_count/8 ..= param_count*2), so the literal is left unchanged.
     let weights_size_bytes: u64 = 700_000_000;
 
     // ── KV cache at 4 096 context ─────────────────────────────────────────────
-    // 16 × 2 × 2 × 128 × 4096 × 4 = 134 217 728
+    // 28 × 2 × 8 × 128 × 4096 × 4 = 939 524 096
     let kv_cache_4k_bytes: u64 = kv_cache_size_bytes(&config, 4096);
 
     let min_ram_bytes = weights_size_bytes + kv_cache_4k_bytes + 32 * 1024 * 1024;
@@ -199,9 +220,9 @@ pub fn bonsai_1_7b_spec() -> ModelSpec {
         kv_cache_4k_bytes,
         min_ram_bytes,
         description: "Bonsai-1.7B is the smallest and fastest variant, designed for \
-            resource-constrained environments. 16-layer GQA transformer with 1536-dimensional \
-            hidden state, 12 query heads, 2 KV heads, and a 65 536-token context window. \
-            Runs with under 1 GB RAM.",
+            resource-constrained environments. 28-layer GQA transformer with 2048-dimensional \
+            hidden state, 16 query heads, 8 KV heads, and a 32 768-token context window. \
+            Runs with under 2 GB RAM.",
     }
 }
 
@@ -267,9 +288,13 @@ pub fn ternary_bonsai_1_7b_spec() -> ModelSpec {
     let config = Qwen3Config::ternary_bonsai_1_7b();
     let param_count: u64 = 1_720_000_000;
 
-    // ~1.49B transformer params × 0.266 ≈ 0.40 GB
-    // Embedding FP16: 151936 × 1536 × 2 ≈ 0.47 GB (output head same)
+    // ~1.41B transformer params × 0.266 ≈ 0.37 GB
+    // Embedding FP16: 151669 × 2048 × 2 ≈ 0.62 GB (output head same)
     // Total → ~0.39 GB
+    // NOTE (FIX2-BUILD item 3(g)): recomputed against the real GGUF shape
+    // (28 layers, hidden=2048, vocab=151669; see bonsai_1_7b_spec() for the
+    // full per-layer breakdown). The literal below is left unchanged (still
+    // within weights_size_matches_q1_0_g128_expectation's bound).
     let weights_size_bytes: u64 = 390_000_000;
     let kv_cache_4k_bytes: u64 = kv_cache_size_bytes(&config, 4096);
     let min_ram_bytes = weights_size_bytes + kv_cache_4k_bytes + 32 * 1024 * 1024;
@@ -346,7 +371,11 @@ pub fn fp8_bonsai_1_7b_spec() -> ModelSpec {
     let config = Qwen3Config::bonsai_1_7b();
     let param_count: u64 = 1_720_000_000;
 
-    // ~1.49B transformer params × 1.0625 ≈ 1.58 GB + embeddings 0.47 GB → ~2.3 GB
+    // ~1.41B transformer params × 1.0625 ≈ 1.50 GB + embeddings 0.62 GB → ~2.12 GB
+    // NOTE (FIX2-BUILD item 3(g)): recomputed against the real GGUF shape
+    // (28 layers, hidden=2048, vocab=151669). The literal below is left
+    // unchanged (still within this variant's [param_count/8, param_count*2]
+    // bound).
     let weights_size_bytes: u64 = 2_300_000_000;
     let kv_cache_4k_bytes: u64 = kv_cache_size_bytes(&config, 4096);
     let min_ram_bytes = weights_size_bytes + kv_cache_4k_bytes + 32 * 1024 * 1024;
@@ -493,7 +522,11 @@ pub fn capability_profile(v: ModelVariant) -> CapabilityProfile {
             ],
         },
         ModelVariant::Bonsai1_7B => CapabilityProfile {
-            max_context_len: 65536,
+            // Pinned to `Qwen3Config::bonsai_1_7b().max_context_length` by
+            // `capability_profile_1_7b_family_context_len_matches_config`
+            // below (wave-2.5 deviation #0): the real model's max context is
+            // 32768, not 65536 — this used to over-claim 2x.
+            max_context_len: 32768,
             supports_system_prompt: true,
             supports_streaming: true,
             recommended_temperature: 0.75,
@@ -541,7 +574,9 @@ pub fn capability_profile(v: ModelVariant) -> CapabilityProfile {
             ],
         },
         ModelVariant::TernaryBonsai1_7B => CapabilityProfile {
-            max_context_len: 65536,
+            // See the `Bonsai1_7B` arm above: pinned to the real model's
+            // 32768 max context, not the stale 65536.
+            max_context_len: 32768,
             supports_system_prompt: true,
             supports_streaming: true,
             recommended_temperature: 0.75,
@@ -589,7 +624,9 @@ pub fn capability_profile(v: ModelVariant) -> CapabilityProfile {
             ],
         },
         ModelVariant::FP8Bonsai1_7B => CapabilityProfile {
-            max_context_len: 65536,
+            // See the `Bonsai1_7B` arm above: pinned to the real model's
+            // 32768 max context, not the stale 65536.
+            max_context_len: 32768,
             supports_system_prompt: true,
             supports_streaming: true,
             recommended_temperature: 0.75,
@@ -603,6 +640,47 @@ pub fn capability_profile(v: ModelVariant) -> CapabilityProfile {
                 "Fast text classification",
                 "WASM browser deployment",
             ],
+        },
+        ModelVariant::Bonsai27B
+        | ModelVariant::TernaryBonsai227bPq2
+        | ModelVariant::TernaryBonsai227bPtq1
+        | ModelVariant::TernaryBonsai227bQ2g64 => CapabilityProfile {
+            // Model max context (design Appendix A.4); the RAM-derived
+            // ceiling for a given machine is a separate, smaller number
+            // (§B2-12's context guard), not this capability declaration.
+            max_context_len: 262_144,
+            supports_system_prompt: true,
+            supports_streaming: true,
+            // PrismML's own recommended sampling for this model.
+            recommended_temperature: 1.0,
+            recommended_top_p: 0.95,
+            languages: LANGUAGES,
+            use_cases: &[
+                "Long-context reasoning with <think> blocks",
+                "Agentic tool use (XML tool-call format)",
+                "Long-document summarisation (up to 262K tokens)",
+                "Complex multi-turn dialogue",
+                "Code generation and debugging",
+                "Retrieval-augmented generation (RAG)",
+                "Vision-language tasks when paired with the mmproj projector",
+            ],
+        },
+        ModelVariant::Bonsai227bMmproj => CapabilityProfile {
+            // Not a causal LM on its own — this profile is a best-effort
+            // placeholder so callers that iterate every known variant get
+            // sane, nonzero bounds rather than a `Custom`-style zeroed guess
+            // (M-14). `supports_streaming`/`supports_system_prompt` mirror
+            // the paired language model's capability (a vision projector is
+            // never served standalone), matching every other variant's
+            // `true`/`true` rather than modelling a "no chat" state this
+            // struct has no dedicated field for.
+            max_context_len: 262_144,
+            supports_system_prompt: true,
+            supports_streaming: true,
+            recommended_temperature: 1.0,
+            recommended_top_p: 0.95,
+            languages: LANGUAGES,
+            use_cases: &["Image encoding for the Bonsai 2 27B vision-language pipeline"],
         },
         ModelVariant::Custom => CapabilityProfile {
             max_context_len: 65536,
@@ -624,7 +702,45 @@ mod tests {
 
     // ── helper ───────────────────────────────────────────────────────────────
 
-    fn all_known_variants() -> [ModelVariant; 9] {
+    fn all_known_variants() -> [ModelVariant; 14] {
+        [
+            ModelVariant::Bonsai8B,
+            ModelVariant::Bonsai4B,
+            ModelVariant::Bonsai1_7B,
+            ModelVariant::TernaryBonsai8B,
+            ModelVariant::TernaryBonsai4B,
+            ModelVariant::TernaryBonsai1_7B,
+            ModelVariant::FP8Bonsai8B,
+            ModelVariant::FP8Bonsai4B,
+            ModelVariant::FP8Bonsai1_7B,
+            ModelVariant::Bonsai27B,
+            ModelVariant::TernaryBonsai227bPq2,
+            ModelVariant::TernaryBonsai227bPtq1,
+            ModelVariant::TernaryBonsai227bQ2g64,
+            ModelVariant::Bonsai227bMmproj,
+        ]
+    }
+
+    /// The subset of [`all_known_variants`] that has a full [`ModelSpec`]
+    /// (`spec_for_variant` / `all_specs`), i.e. `spec_for_variant(v).is_some()`.
+    ///
+    /// `ModelSpec` bakes in [`kv_cache_size_bytes`]'s uniform
+    /// `num_layers × 2 × num_kv_heads × head_dim` KV-cache formula, which is
+    /// correct for the original 9 (non-hybrid) variants but would silently
+    /// **overestimate** the Bonsai 2 27B family's KV footprint by ~4x (only
+    /// 16 of its 64 layers carry a real KV cache; the other 48 are Gated
+    /// DeltaNet recurrent state, a completely different sizing formula —
+    /// design §3.7/§3.6). Fabricating a `ModelSpec` for it with the wrong
+    /// formula would be exactly the "confidently wrong number" class of bug
+    /// M-14/cli-02 exist to close, so the 27B family (and the mmproj
+    /// projector, not a causal LM at all) is `known` (see
+    /// [`ModelVariant::is_known`]) and fully covered by `name`/
+    /// `param_count`/`expected_model_size_bytes`/`default_config`/
+    /// `capability_profile`, but deliberately has **no** `ModelSpec` —
+    /// `spec_for_variant` returning `None` for it is the same supported
+    /// state [`spec_for_custom_returns_none`] already exercises for
+    /// `Custom`, not a gap.
+    fn spec_backed_variants() -> [ModelVariant; 9] {
         [
             ModelVariant::Bonsai8B,
             ModelVariant::Bonsai4B,
@@ -642,8 +758,8 @@ mod tests {
 
     #[test]
     fn all_variants_produce_valid_configs() {
-        for v in all_known_variants() {
-            let spec = spec_for_variant(v).expect("known variant must have a spec");
+        for v in spec_backed_variants() {
+            let spec = spec_for_variant(v).expect("spec-backed variant must have a spec");
             // Architecture-level sanity
             assert!(
                 spec.config.num_layers > 0,
@@ -789,12 +905,36 @@ mod tests {
                 spec.kv_cache_4k_bytes
             );
         }
-        // Order: 8B > 4B > 1.7B (more layers × more KV heads)
+        // Exact per-variant kv_cache_4k_bytes, computed from the formula the
+        // code uses (layers × 2(K+V) × kv_heads × head_dim × 4096 tokens ×
+        // 4 bytes/f32) with the REAL GGUF header layer/kv_head counts
+        // (config.rs `bonsai_8b`/`bonsai_4b`/`bonsai_1_7b`). The old
+        // "8B > 4B > 1.7B" ordering assumption no longer holds: Bonsai-1.7B
+        // now has 28 layers × 8 kv_heads, which beats Bonsai-4B's
+        // 24 layers × 4 kv_heads.
         let s8b = bonsai_8b_spec();
         let s4b = bonsai_4b_spec();
         let s1_7b = bonsai_1_7b_spec();
-        assert!(s8b.kv_cache_4k_bytes > s4b.kv_cache_4k_bytes);
-        assert!(s4b.kv_cache_4k_bytes > s1_7b.kv_cache_4k_bytes);
+        let expected_8b: u64 = 36 * 2 * 8 * 128 * 4096 * 4;
+        let expected_4b: u64 = 24 * 2 * 4 * 128 * 4096 * 4;
+        let expected_1_7b: u64 = 28 * 2 * 8 * 128 * 4096 * 4;
+        assert_eq!(s8b.kv_cache_4k_bytes, expected_8b);
+        assert_eq!(s4b.kv_cache_4k_bytes, expected_4b);
+        assert_eq!(s1_7b.kv_cache_4k_bytes, expected_1_7b);
+
+        // Sanity bound for these three variants: all within [64 MiB, 16 GiB].
+        let sane_min: u64 = 64 * 1024 * 1024;
+        let sane_max: u64 = 16 * 1024 * 1024 * 1024;
+        for bytes in [
+            s8b.kv_cache_4k_bytes,
+            s4b.kv_cache_4k_bytes,
+            s1_7b.kv_cache_4k_bytes,
+        ] {
+            assert!(
+                (sane_min..=sane_max).contains(&bytes),
+                "kv_cache_4k_bytes {bytes} outside [64 MiB, 16 GiB]"
+            );
+        }
     }
 
     // ── ModelSpec: min_ram includes weights + kv_cache ────────────────────────
@@ -819,7 +959,7 @@ mod tests {
 
     #[test]
     fn spec_for_known_variants_returns_some() {
-        for v in all_known_variants() {
+        for v in spec_backed_variants() {
             assert!(
                 spec_for_variant(v).is_some(),
                 "spec_for_variant({:?}) should return Some",
@@ -831,6 +971,25 @@ mod tests {
     #[test]
     fn spec_for_custom_returns_none() {
         assert!(spec_for_variant(ModelVariant::Custom).is_none());
+    }
+
+    /// Deliberate (see [`spec_backed_variants`]'s doc comment): the Bonsai 2
+    /// 27B family and its mmproj projector have no `ModelSpec`, the same
+    /// supported `None` state `Custom` already has above.
+    #[test]
+    fn spec_for_bonsai2_27b_family_returns_none() {
+        for v in [
+            ModelVariant::Bonsai27B,
+            ModelVariant::TernaryBonsai227bPq2,
+            ModelVariant::TernaryBonsai227bPtq1,
+            ModelVariant::TernaryBonsai227bQ2g64,
+            ModelVariant::Bonsai227bMmproj,
+        ] {
+            assert!(
+                spec_for_variant(v).is_none(),
+                "{v:?} deliberately has no ModelSpec (uniform KV-cache formula does not apply)"
+            );
+        }
     }
 
     #[test]
@@ -847,6 +1006,28 @@ mod tests {
     }
 
     // ── CapabilityProfile ─────────────────────────────────────────────────────
+
+    /// Wave-2.5 deviation #0: the 1.7B family's `max_context_len` must track
+    /// the real `Qwen3Config::bonsai_1_7b().max_context_length` (32768, from
+    /// the on-disk `models/Ternary-Bonsai-1.7B.gguf` header) so it cannot
+    /// silently drift back to the stale 65536 that used to over-claim 2x the
+    /// context the model actually supports.
+    #[test]
+    fn capability_profile_1_7b_family_context_len_matches_config() {
+        let expected = Qwen3Config::bonsai_1_7b().max_context_length;
+        for v in [
+            ModelVariant::Bonsai1_7B,
+            ModelVariant::TernaryBonsai1_7B,
+            ModelVariant::FP8Bonsai1_7B,
+        ] {
+            assert_eq!(
+                capability_profile(v).max_context_len,
+                expected,
+                "{v:?}: capability_profile max_context_len must match \
+                 Qwen3Config::bonsai_1_7b().max_context_length"
+            );
+        }
+    }
 
     #[test]
     fn capability_profile_returns_valid_data() {

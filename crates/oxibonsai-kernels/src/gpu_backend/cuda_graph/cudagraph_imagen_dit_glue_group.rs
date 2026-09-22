@@ -429,7 +429,7 @@ impl CudaGraph {
         seq: usize,
         head_dim: usize,
     ) -> Result<(), CudaGraphError> {
-        if head_dim % 2 != 0 {
+        if !head_dim.is_multiple_of(2) {
             return Err(CudaGraphError::DriverError(format!(
                 "encode_dit_rope: head_dim {head_dim} must be even"
             )));

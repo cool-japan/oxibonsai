@@ -31,6 +31,7 @@ use oxibonsai_kernels::dispatch::KernelTier;
 use oxibonsai_model::model::BonsaiModel;
 use oxibonsai_runtime::engine::InferenceEngine;
 use oxibonsai_runtime::sampling::SamplingParams;
+use oxibonsai_testkit::gguf_fixture::Lcg;
 
 /// KV-cache / context budget for the synthetic model.
 const MAX_SEQ: usize = 512;
@@ -39,6 +40,26 @@ const MAX_SEQ: usize = 512;
 // Synthetic ternary fixture (verbatim copy of the shared known-good fixture).
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// CQ-14 (wave-2.5 deviation routing #7): each packed byte holds four 2-bit
+/// ternary lanes, and only `{0, 1, 2}` are valid codes — `3` (`0b11`) is
+/// reserved and rejected by `screen_ternary_codes` in
+/// `oxibonsai-model/src/weight_loaders.rs`. Pushing a raw
+/// `(state >> 33) as u8` byte directly (the previous body) lands on `0b11`
+/// in about a quarter of *lanes*, which the loader now (correctly) refuses
+/// once `screen_ternary_codes` covers the zero-copy `load_ternary_blocks`
+/// path — this fixture must never emit that pattern in the first place.
+/// Each lane is folded into `{0, 1, 2}` before packing, exactly as
+/// `crates/oxibonsai-model/src/model/types/gpu_cache.rs::tq2_pattern`
+/// already does.
+///
+/// T-07 FIX (verifier wave 3): re-pointed at
+/// `oxibonsai_testkit::gguf_fixture::Lcg::next_valid_tq2_byte`. This
+/// produces byte-for-byte identical output to the previous hand-rolled
+/// state machine: `Lcg::new(s)` stores `s` as its state directly (no extra
+/// offset unless `s == 0`), so pre-adding the same golden-ratio constant
+/// this file always added before its own first `next_u64()` reproduces
+/// the exact sequence — confirmed by re-running every test in this file
+/// unchanged (still byte-identical GPU/fallback/CPU-reference agreement).
 fn tq2_0_g128_pattern(num_weights: usize, seed: u64) -> Vec<u8> {
     assert_eq!(
         num_weights % 128,
@@ -47,18 +68,13 @@ fn tq2_0_g128_pattern(num_weights: usize, seed: u64) -> Vec<u8> {
     );
     let num_blocks = num_weights / 128;
     let mut data = Vec::with_capacity(num_blocks * 34);
-    let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut lcg = Lcg::new(seed.wrapping_add(0x9E37_79B9_7F4A_7C15));
     for _ in 0..num_blocks {
         for _ in 0..32 {
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1);
-            data.push((state >> 33) as u8);
+            data.push(lcg.next_valid_tq2_byte());
         }
-        state = state
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1);
-        let scale_f32 = 0.25_f32 + ((state >> 33) as u32 as f32) / (u32::MAX as f32) * 0.5_f32;
+        let scale_f32 =
+            0.25_f32 + ((lcg.next_u64() >> 33) as u32 as f32) / (u32::MAX as f32) * 0.5_f32;
         let scale_bytes = f16::from_f32(scale_f32).to_le_bytes();
         data.extend_from_slice(&scale_bytes);
     }
@@ -131,6 +147,25 @@ fn build_synthetic_ternary_gguf() -> Vec<u8> {
         tensor_type: TensorType::F32,
         data: f32_pattern(h, 1.0),
     });
+    // Seeds restored to `0xCAFE_BABE` (verifier wave 3, round 2 empirical
+    // finding): a prior fix round reseeded these to `0xC0FF_EE01` /
+    // `0x2000_0000`, theorizing a fixture-coincidence near-exact-tie logit
+    // masked by the CQ-14 lane-fold. That theory was proven FALSE by direct
+    // measurement: with the *original* seeds and the (already-correct,
+    // lane-folded) fixture, every GPU-vs-CPU-reference logit step agreed to
+    // within ~1e-3–2e-3, and the *winning* token in a failing run sat
+    // 1.6–3.5 logits BELOW the max — not a near-tie at all. The real root
+    // cause is `run_greedy_gpu` mutating the process-global
+    // `OXIBONSAI_FORCE_CPU_DECODE_AFTER` env var (+ the `GLOBAL_METAL_GRAPH`
+    // singleton) while this file's tests run concurrently under `cargo
+    // test`'s default in-binary thread parallelism — the same
+    // METAL-CONCURRENCY class of bug `gpu_backend_tests.rs::gpu_serial` (and
+    // `metal_prefill_ternary_parity_tests.rs::gpu_serial`, its precedent)
+    // already serializes around. Reseeding never fixed anything; it just
+    // relocated the race to a token boundary where it happened not to flip
+    // the argmax winner on this run of this host. Fixed properly below via
+    // this file's own `gpu_serial()` (same precedent), so the seeds revert
+    // to their original, most-widely-shared values.
     writer.add_tensor(TensorEntry {
         name: "output.weight".to_string(),
         shape: vec![h as u64, vocab as u64],
@@ -261,6 +296,29 @@ fn run_cpu_reference(gguf_bytes: &[u8], prompt: &[u32], n: usize) -> Vec<u32> {
     engine.generate(prompt, n).expect("engine.generate")
 }
 
+/// Serializes every test below that calls [`run_greedy_gpu`].
+///
+/// MINOR fix (verifier wave 3, round 2 empirical finding): `run_greedy_gpu`
+/// mutates the process-global `OXIBONSAI_FORCE_CPU_DECODE_AFTER` env var and
+/// dispatches through the process-global `GLOBAL_METAL_GRAPH` singleton
+/// (METAL-CONCURRENCY, wave 4, removes it). `cargo test`'s default in-binary
+/// thread parallelism let two of this file's tests race — one setting/
+/// clearing the env var and touching GPU state while another read it —
+/// which was empirically proven to be the real cause of the intermittent
+/// argmax divergence this file's tests once "fixed" by reseeding the
+/// fixture (see `build_synthetic_ternary_gguf`'s doc comment). The
+/// precedent for this exact fix is
+/// `crates/oxibonsai-model/tests/metal_prefill_ternary_parity_tests.rs::gpu_serial`
+/// (FIX-06-KERN-MODEL) / `crates/oxibonsai-kernels/tests/gpu_backend_tests.rs::gpu_serial`
+/// (wave-1.5 addendum 3); once METAL-CONCURRENCY removes the singleton this
+/// helper (and every `let _gpu = gpu_serial();` call site below) can go.
+fn gpu_serial() -> std::sync::MutexGuard<'static, ()> {
+    static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GPU_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -270,6 +328,7 @@ fn run_cpu_reference(gguf_bytes: &[u8], prompt: &[u32], n: usize) -> Vec<u32> {
 /// all-GPU run. A stale/zero CPU cache would corrupt tokens `3..` and diverge.
 #[test]
 fn metal_greedy_cpu_fallback_matches_all_gpu() {
+    let _gpu = gpu_serial();
     let gguf = build_synthetic_ternary_gguf();
     let prompt: Vec<u32> = vec![1, 4, 7, 10, 13, 16];
     let n = 20;
@@ -294,6 +353,7 @@ fn metal_greedy_cpu_fallback_matches_all_gpu() {
 /// exercising the rebuild's shortest committed-sequence case.
 #[test]
 fn metal_greedy_cpu_fallback_from_first_token_matches_all_gpu() {
+    let _gpu = gpu_serial();
     let gguf = build_synthetic_ternary_gguf();
     let prompt: Vec<u32> = vec![2, 5, 9, 14];
     let n = 16;
@@ -312,6 +372,7 @@ fn metal_greedy_cpu_fallback_from_first_token_matches_all_gpu() {
 /// reproduces exactly what a from-scratch CPU generation would compute.
 #[test]
 fn metal_greedy_cpu_fallback_matches_cpu_reference() {
+    let _gpu = gpu_serial();
     let gguf = build_synthetic_ternary_gguf();
     let prompt: Vec<u32> = vec![1, 4, 7, 10, 13, 16];
     let n = 20;
@@ -345,6 +406,7 @@ fn metal_greedy_cpu_fallback_matches_cpu_reference() {
 #[test]
 #[ignore = "requires OXI_MODEL real ternary GGUF; run on dev Mac"]
 fn real_model_greedy_gpu_fallback_byte_identical() {
+    let _gpu = gpu_serial();
     let Some(path) = std::env::var_os("OXI_MODEL") else {
         eprintln!(
             "real_model_greedy_gpu_fallback_byte_identical: OXI_MODEL not set — skipping. \

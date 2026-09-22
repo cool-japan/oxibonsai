@@ -159,9 +159,14 @@ fn bench_te_gemm_f32_cpu_vs_gpu_ratio() {
 #[test]
 #[ignore = "loads ~16 GB TE weights — run explicitly with --ignored --nocapture"]
 fn bench_te_forward_cold_vs_warm() {
+    // Policy: no hardcoded absolute paths anywhere (they are wrong on Windows,
+    // and wrong wherever `TMPDIR`/the platform temp dir is redirected). This is
+    // a fallback for a read-only path behind `#[ignore]` plus the `is_dir()`
+    // guard below, so `std::env::temp_dir()` is a drop-in, policy-correct
+    // replacement; `TE_WEIGHTS_DIR` remains the primary override.
     let weights_dir = std::env::var("TE_WEIGHTS_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp/bonsai_golden/te/weights"));
+        .unwrap_or_else(|_| std::env::temp_dir().join("bonsai_golden/te/weights"));
     if !weights_dir.is_dir() {
         eprintln!(
             "TE weights dir not found ({}) — skipping end-to-end wall-time bench",

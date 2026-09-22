@@ -26,11 +26,22 @@ use std::sync::Arc;
 /// Build a TQ2_0_g128 weight blob with deterministic per-block patterns.
 ///
 /// Each block is 34 bytes: 32 bytes of 2-bit codes (4 weights/byte, LSB-first)
-/// followed by a 2-byte FP16 scale. The encoding is
-/// `00→-1, 01→0, 10→+1, 11→0`, matching the existing GEMV reference kernel.
+/// followed by a 2-byte FP16 scale. **Only the three ternary codes are ever
+/// emitted:** `00→-1, 01→0, 10→+1`. The fourth code `0b11` is reserved — in a
+/// tensor declared `TQ2_0_g128` it is the `PQ2_0` (+2) encoding leaking in, so
+/// genuine ternary data never contains it and the Metal SoA upload path
+/// rejects any block that does (`metal_graph::reformat::validate_tq2_ternary_codes`,
+/// reached from `upload_tq2_weight_soa`). An earlier revision of this helper
+/// pushed raw PRNG bytes as `qs`, which made ~25 % of its lanes `0b11` and
+/// relied on the old, tolerant `11→0` decode; that contract is gone, so the
+/// fixture — not the validation — was wrong.
 ///
-/// To get a reasonably "interesting" weight matrix we vary both the qs pattern
-/// and the scale across blocks based on a 64-bit linear-congruential PRNG seed.
+/// To keep the weight matrix "interesting" both the code pattern and the scale
+/// vary across blocks, driven by the same 64-bit linear-congruential PRNG seed,
+/// so the fixture stays fully deterministic. The helper asserts the result is
+/// non-degenerate: all three codes must actually occur, otherwise a
+/// seed/modulo change could silently reduce the fixture to a constant matrix
+/// and every parity assertion below would still pass while testing nothing.
 fn tq2_0_g128_pattern(num_weights: usize, seed: u64) -> Vec<u8> {
     assert_eq!(
         num_weights % 128,
@@ -40,13 +51,21 @@ fn tq2_0_g128_pattern(num_weights: usize, seed: u64) -> Vec<u8> {
     let num_blocks = num_weights / 128;
     let mut data = Vec::with_capacity(num_blocks * 34);
     let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut code_seen = [0usize; 3];
     for _ in 0..num_blocks {
-        // 32 bytes of qs (128 weights × 2 bits).
+        // 32 bytes of qs = 128 weights × 2 bits, four lanes per byte, LSB
+        // first. Each lane is drawn independently and folded into {0, 1, 2}.
         for _ in 0..32 {
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1);
-            data.push((state >> 33) as u8);
+            let mut byte = 0u8;
+            for lane in 0..4 {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                let code = ((state >> 33) % 3) as u8;
+                code_seen[code as usize] += 1;
+                byte |= code << (2 * lane);
+            }
+            data.push(byte);
         }
         // FP16 scale in (0.25, 0.75] so RMSNorm output stays in a sane range.
         state = state
@@ -56,6 +75,12 @@ fn tq2_0_g128_pattern(num_weights: usize, seed: u64) -> Vec<u8> {
         let scale_bytes = f16::from_f32(scale_f32).to_le_bytes();
         data.extend_from_slice(&scale_bytes);
     }
+    assert!(
+        code_seen.iter().all(|&n| n > 0),
+        "degenerate ternary fixture: code histogram {code_seen:?} (counts of \
+         -1/0/+1) — every ternary code must occur or the parity assertions \
+         would pass over a near-constant weight matrix"
+    );
     data
 }
 
@@ -243,6 +268,35 @@ fn parse_synthetic_gguf(gguf_bytes: &[u8]) -> GgufFile<'_> {
     GgufFile::parse(gguf_bytes).expect("GgufFile::parse synthetic")
 }
 
+/// Serialise the GPU-touching tests in this binary.
+///
+/// Every test here drives a `BonsaiModel` through the fused Metal path, which
+/// goes via the **process-global** `GLOBAL_METAL_GRAPH` singleton: one device,
+/// one command queue, one pooled buffer set and one GPU KV cache for the whole
+/// process. `cargo test` runs the tests of one integration binary on parallel
+/// threads by default, so two of them interleave on that single shared graph
+/// and one prefill observes another's KV state — measured here as a 3-in-8
+/// failure rate for `test_batched_ternary_prefill_chunked` (`logit[0]`
+/// single-shot vs chunked diverging by ~8e-2, well above the 1e-3 tolerance),
+/// against 0-in-8 with `--test-threads=1`.
+///
+/// That singleton is a real product limitation (GPU concurrency = 1), tracked
+/// separately as METAL-CONCURRENCY and **not** fixed here; it is not what
+/// these tests exist to check. Holding this lock removes the interference so
+/// each test measures prefill parity on an uncontended graph. Nothing about
+/// the assertions changes. Delete this helper once the graph stops being a
+/// process-global singleton.
+///
+/// A poisoned lock is recovered with `into_inner()` rather than propagated:
+/// one test panicking must not turn every sibling into a second, misleading
+/// failure.
+fn gpu_serial() -> std::sync::MutexGuard<'static, ()> {
+    static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GPU_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -255,6 +309,7 @@ fn parse_synthetic_gguf(gguf_bytes: &[u8]) -> GgufFile<'_> {
 /// returns only the final token's logits.
 #[test]
 fn test_batched_ternary_prefill_matches_per_position() {
+    let _gpu = gpu_serial();
     let path = write_temp_gguf("parity_8");
     let gguf_bytes = std::fs::read(&path).expect("read synthetic GGUF");
     let _ = std::fs::remove_file(&path);
@@ -317,6 +372,7 @@ fn test_batched_ternary_prefill_matches_per_position() {
 /// path — even where the relative logit gap is small.
 #[test]
 fn test_batched_ternary_prefill_verify_greedy_match() {
+    let _gpu = gpu_serial();
     let path = write_temp_gguf("verify_8");
     let gguf_bytes = std::fs::read(&path).expect("read synthetic GGUF");
     let _ = std::fs::remove_file(&path);
@@ -367,6 +423,7 @@ fn test_batched_ternary_prefill_verify_greedy_match() {
 /// test guarantees the new TQ2 GEMM does not inherit that bug.
 #[test]
 fn test_batched_ternary_prefill_matches_per_position_batch12() {
+    let _gpu = gpu_serial();
     let path = write_temp_gguf("parity_12");
     let gguf_bytes = std::fs::read(&path).expect("read synthetic GGUF");
     let _ = std::fs::remove_file(&path);
@@ -417,6 +474,7 @@ fn test_batched_ternary_prefill_matches_per_position_batch12() {
 /// chunk; here we drive it manually so we can compare logits.)
 #[test]
 fn test_batched_ternary_prefill_chunked() {
+    let _gpu = gpu_serial();
     let path = write_temp_gguf("chunked_8");
     let gguf_bytes = std::fs::read(&path).expect("read synthetic GGUF");
     let _ = std::fs::remove_file(&path);
@@ -487,6 +545,7 @@ const GUARD_MAX_SEQ: usize = 8;
 
 #[test]
 fn test_ternary_prefill_context_guard_returns_err() {
+    let _gpu = gpu_serial();
     let gguf_bytes = build_synthetic_ternary_gguf();
     let gguf = parse_synthetic_gguf(&gguf_bytes);
     let model = BonsaiModel::from_gguf(&gguf, GUARD_MAX_SEQ).expect("BonsaiModel::from_gguf");
@@ -503,6 +562,7 @@ fn test_ternary_prefill_context_guard_returns_err() {
 
 #[test]
 fn test_ternary_prefill_verify_context_guard_returns_err() {
+    let _gpu = gpu_serial();
     let gguf_bytes = build_synthetic_ternary_gguf();
     let gguf = parse_synthetic_gguf(&gguf_bytes);
     let model = BonsaiModel::from_gguf(&gguf, GUARD_MAX_SEQ).expect("BonsaiModel::from_gguf");
@@ -518,6 +578,7 @@ fn test_ternary_prefill_verify_context_guard_returns_err() {
 
 #[test]
 fn test_ternary_greedy_gpu_context_guard_returns_err() {
+    let _gpu = gpu_serial();
     let gguf_bytes = build_synthetic_ternary_gguf();
     let gguf = parse_synthetic_gguf(&gguf_bytes);
     let model = BonsaiModel::from_gguf(&gguf, GUARD_MAX_SEQ).expect("BonsaiModel::from_gguf");
@@ -536,6 +597,7 @@ fn test_ternary_greedy_gpu_context_guard_returns_err() {
 /// fail later for GPU-availability reasons, which is a *different* error class).
 #[test]
 fn test_ternary_greedy_gpu_last_valid_pos_not_guarded() {
+    let _gpu = gpu_serial();
     let gguf_bytes = build_synthetic_ternary_gguf();
     let gguf = parse_synthetic_gguf(&gguf_bytes);
     let model = BonsaiModel::from_gguf(&gguf, GUARD_MAX_SEQ).expect("BonsaiModel::from_gguf");

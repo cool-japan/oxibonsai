@@ -36,8 +36,43 @@
 //! safe because every op silently falls back to the CPU path on any GPU error.
 //!
 //! On *any* error each wrapper returns a `CudaVaeGpuError`; the call sites in
-//! `conv.rs` / `norm.rs` / `ops.rs` swallow it and fall back to the CPU path, so
-//! a GPU failure can never break a decode (no `unwrap`/`expect`/`panic!`).
+//! `conv.rs` / `norm.rs` / `ops.rs` swallow it and fall back to the CPU path.
+//! That fallback is no longer *silent* (RAG-EVAL-IMG-18): every wrapper below
+//! emits a one-time `tracing::warn!` naming the failed op and the underlying
+//! error the first time it happens (an `AtomicBool` latch per op, mirroring
+//! `crate::vae::gpu`'s Metal sibling exactly). A GPU failure can still never
+//! break a decode (no `unwrap`/`expect`/`panic!`).
+//!
+//! Also mirrors `crate::vae::gpu`'s `#[cfg(test)]`-only conv-dispatch override
+//! (T-Missed-1), including its **thread-local** storage (not a process-global
+//! atomic — a process-global override let a dispatch-forcing test on one
+//! thread corrupt an unrelated test's GroupNorm/SiLU calls on another thread
+//! mid-invocation; see that module's doc for the full incident): this file is
+//! `target_os`-disjoint from the Metal module (never both compiled), but the
+//! same hazards would apply here too on a Linux/Windows+CUDA build running
+//! this crate's test suite, so the override is implemented identically rather
+//! than only on the Metal side.
+//!
+//! **No CUDA hardware on the reference macOS/Apple-Silicon development
+//! machine**, so this module has never *run*, and this crate's own gate
+//! commands never compile it (`target_os`-gated to Linux/Windows). It has,
+//! however, been type-checked for real: `cargo check`/`cargo clippy -- -D
+//! warnings -p oxibonsai-image --target x86_64-unknown-linux-gnu --features
+//! native-cuda` (both `--all-features` and `native-cuda`-only) succeed
+//! cleanly, including this module's `#[cfg(test)]` code — cross-compiling
+//! resolves every type and runs every lint without needing a CUDA toolkit,
+//! since `cargo check` only type-checks and never links. The same target with
+//! `--features cuda` (the compile-only stub, `native-cuda` NOT enabled) was
+//! also checked, confirming `vae::tiling::force_conv_dispatch`'s three-way
+//! `cfg` split correctly falls through to its no-op arm in that configuration
+//! rather than dangling on this module. What is *not* verified is linking or
+//! execution (this workstation has no Linux cross-linker configured and no
+//! CUDA runtime/device either way), so a logic bug that only manifests at the
+//! kernel-call boundary (e.g. an actual `CudaGraph`/`CudaGraphError`
+//! behavioural mismatch) would not be caught here. It is authored as a
+//! character-exact mirror of the already-compiling,
+//! already-tested Metal sibling (`crate::vae::gpu`) with only the `Metal*` ->
+//! `Cuda*` renames the type signatures require.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
@@ -74,15 +109,95 @@ pub fn vae_gpu_was_used() -> bool {
 /// CPU path (for A/B parity testing without recompiling).
 static VAE_GPU_ENABLED: OnceLock<bool> = OnceLock::new();
 
+thread_local! {
+    /// Test-only conv-dispatch override consulted by `vae_gpu_enabled` *before*
+    /// `VAE_GPU_ENABLED`'s `OnceLock`. Mirrors `crate::vae::gpu`'s Metal
+    /// sibling exactly, including being thread-local rather than a
+    /// process-global atomic — see that module's doc for the full T-Missed-1
+    /// contract. `None` = unset, `Some(false)`/`Some(true)` force CPU/GPU, but
+    /// only for `vae_gpu_enabled` calls made on *this* thread.
+    #[cfg(test)]
+    static TEST_CONV_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// RAII guard returned by `set_conv_override`. Mirrors
+/// `crate::vae::gpu::ConvOverrideGuard` exactly: dropping it clears this
+/// thread's `TEST_CONV_OVERRIDE` back to `None`.
+#[cfg(test)]
+pub(crate) struct ConvOverrideGuard;
+
+#[cfg(test)]
+impl Drop for ConvOverrideGuard {
+    fn drop(&mut self) {
+        TEST_CONV_OVERRIDE.with(|c| c.set(None));
+    }
+}
+
+/// Force (or, with `None`, decline to force) `vae_gpu_enabled`'s conv-dispatch
+/// decision **for the calling thread only**, for the life of the returned
+/// guard. See `crate::vae::gpu::set_conv_override`'s doc for the full contract
+/// (this is a character-exact mirror); no lock is needed, since the override
+/// is thread-local.
+#[cfg(test)]
+pub(crate) fn set_conv_override(v: Option<bool>) -> ConvOverrideGuard {
+    TEST_CONV_OVERRIDE.with(|c| c.set(v));
+    ConvOverrideGuard
+}
+
+/// Read this thread's `TEST_CONV_OVERRIDE`. Always `None` outside
+/// `#[cfg(test)]`.
+#[cfg(test)]
+fn test_conv_override() -> Option<bool> {
+    TEST_CONV_OVERRIDE.with(std::cell::Cell::get)
+}
+
+/// Non-test builds have no override machinery (it is `#[cfg(test)]` only), so
+/// this is always `None`.
+#[cfg(not(test))]
+#[inline]
+fn test_conv_override() -> Option<bool> {
+    None
+}
+
 /// Whether the VAE decoder should use the GPU f32 path.
 ///
 /// `true` unless the environment variable `OXI_VAE_GPU` is set to `0`. The env
-/// read is cached in a [`OnceLock`] on first call. The per-op CPU fallback in
+/// read is cached in a `OnceLock` on first call. The per-op CPU fallback in
 /// `conv.rs` / `norm.rs` / `ops.rs` (a silent fall-through on any GPU `Err`)
 /// makes default-on safe.
+///
+/// In test builds this first consults the `set_conv_override` test hook; see
+/// `crate::vae::gpu::vae_gpu_enabled`'s doc (this mirrors it exactly).
 pub fn vae_gpu_enabled() -> bool {
+    if let Some(v) = test_conv_override() {
+        return v;
+    }
     *VAE_GPU_ENABLED
         .get_or_init(|| !matches!(std::env::var("OXI_VAE_GPU").ok().as_deref(), Some("0")))
+}
+
+/// Latch for [`conv2d_gpu`]'s one-time fallback warning.
+static CONV_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+/// Latch for [`groupnorm_gpu`]'s one-time fallback warning.
+static GROUPNORM_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+/// Latch for [`silu_gpu`]'s one-time fallback warning.
+static SILU_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+/// Latch for [`upsample_gpu`]'s one-time fallback warning.
+static UPSAMPLE_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Emit a one-time `tracing::warn!` the first time `flag`'s GPU op fails and
+/// the caller falls back to the CPU reference path. Mirrors
+/// `crate::vae::gpu::warn_gpu_fallback_once` exactly.
+fn warn_gpu_fallback_once(flag: &'static AtomicBool, op: &str, reason: &str) {
+    if !flag.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            op,
+            reason,
+            "oxibonsai-image: VAE GPU op failed, falling back to CPU; further \
+             occurrences in this process are not logged"
+        );
+    }
 }
 
 /// Run a stride-1 "same"-padded 2-D convolution on the GPU, returning the NCHW
@@ -98,7 +213,8 @@ pub fn vae_gpu_enabled() -> bool {
 /// # Errors
 /// `CudaVaeGpuError` if the CUDA graph is unavailable or the kernel
 /// upload/encode fails (e.g. a length/shape mismatch). The caller falls back to
-/// the CPU path on any error.
+/// the CPU path on any error (a one-time `tracing::warn!` fires first — see
+/// `warn_gpu_fallback_once`).
 #[allow(clippy::too_many_arguments)]
 pub fn conv2d_gpu(
     weight: &[f32],
@@ -111,8 +227,9 @@ pub fn conv2d_gpu(
     k: usize,
     pad: usize,
 ) -> Result<ConvGpuOut, CudaVaeGpuError> {
-    let graph =
-        CudaGraph::global().map_err(|e| CudaVaeGpuError::GraphUnavailable(e.to_string()))?;
+    let graph = CudaGraph::global()
+        .map_err(|e| CudaVaeGpuError::GraphUnavailable(e.to_string()))
+        .inspect_err(|e| warn_gpu_fallback_once(&CONV_FALLBACK_WARNED, "conv2d", &e.to_string()))?;
     // "same"-stride-1 output geometry (matches encode_conv2d_f32 / the CPU conv).
     let h_out = h + 2 * pad + 1 - k;
     let w_out = w + 2 * pad + 1 - k;
@@ -120,8 +237,12 @@ pub fn conv2d_gpu(
     // Upload + cache the conv weight by its stable slice-pointer key. Pointer
     // addresses are huge and won't collide with the DiT/TE/LLM key spaces.
     let key = weight.as_ptr() as u64;
-    let handle = graph.get_or_upload_f32_weight(key, weight)?;
-    graph.encode_conv2d_f32(&handle, input, bias, &mut out, c_in, c_out, h, w, k, pad)?;
+    let handle = graph
+        .get_or_upload_f32_weight(key, weight)
+        .inspect_err(|e| warn_gpu_fallback_once(&CONV_FALLBACK_WARNED, "conv2d", &e.to_string()))?;
+    graph
+        .encode_conv2d_f32(&handle, input, bias, &mut out, c_in, c_out, h, w, k, pad)
+        .inspect_err(|e| warn_gpu_fallback_once(&CONV_FALLBACK_WARNED, "conv2d", &e.to_string()))?;
     VAE_GPU_USED.store(true, Ordering::Relaxed);
     Ok(ConvGpuOut {
         data: out,
@@ -148,7 +269,8 @@ pub struct ConvGpuOut {
 ///
 /// # Errors
 /// `CudaVaeGpuError` if the CUDA graph is unavailable or the kernel
-/// upload/encode fails. The caller falls back to the CPU path on any error.
+/// upload/encode fails. The caller falls back to the CPU path on any error (a
+/// one-time `tracing::warn!` fires first — see `warn_gpu_fallback_once`).
 pub fn groupnorm_gpu(
     x: &mut [f32],
     weight: &[f32],
@@ -158,9 +280,16 @@ pub fn groupnorm_gpu(
     num_groups: usize,
     eps: f32,
 ) -> Result<(), CudaVaeGpuError> {
-    let graph =
-        CudaGraph::global().map_err(|e| CudaVaeGpuError::GraphUnavailable(e.to_string()))?;
-    graph.encode_groupnorm_f32(x, weight, bias, channels, hw, num_groups, eps)?;
+    let graph = CudaGraph::global()
+        .map_err(|e| CudaVaeGpuError::GraphUnavailable(e.to_string()))
+        .inspect_err(|e| {
+            warn_gpu_fallback_once(&GROUPNORM_FALLBACK_WARNED, "groupnorm", &e.to_string())
+        })?;
+    graph
+        .encode_groupnorm_f32(x, weight, bias, channels, hw, num_groups, eps)
+        .inspect_err(|e| {
+            warn_gpu_fallback_once(&GROUPNORM_FALLBACK_WARNED, "groupnorm", &e.to_string())
+        })?;
     VAE_GPU_USED.store(true, Ordering::Relaxed);
     Ok(())
 }
@@ -169,11 +298,15 @@ pub fn groupnorm_gpu(
 ///
 /// # Errors
 /// `CudaVaeGpuError` if the CUDA graph is unavailable or the kernel
-/// upload/encode fails. The caller falls back to the CPU path on any error.
+/// upload/encode fails. The caller falls back to the CPU path on any error (a
+/// one-time `tracing::warn!` fires first — see `warn_gpu_fallback_once`).
 pub fn silu_gpu(x: &mut [f32]) -> Result<(), CudaVaeGpuError> {
-    let graph =
-        CudaGraph::global().map_err(|e| CudaVaeGpuError::GraphUnavailable(e.to_string()))?;
-    graph.encode_silu_f32(x)?;
+    let graph = CudaGraph::global()
+        .map_err(|e| CudaVaeGpuError::GraphUnavailable(e.to_string()))
+        .inspect_err(|e| warn_gpu_fallback_once(&SILU_FALLBACK_WARNED, "silu", &e.to_string()))?;
+    graph
+        .encode_silu_f32(x)
+        .inspect_err(|e| warn_gpu_fallback_once(&SILU_FALLBACK_WARNED, "silu", &e.to_string()))?;
     VAE_GPU_USED.store(true, Ordering::Relaxed);
     Ok(())
 }
@@ -185,19 +318,27 @@ pub fn silu_gpu(x: &mut [f32]) -> Result<(), CudaVaeGpuError> {
 ///
 /// # Errors
 /// `CudaVaeGpuError` if the CUDA graph is unavailable or the kernel
-/// upload/encode fails. The caller falls back to the CPU path on any error.
+/// upload/encode fails. The caller falls back to the CPU path on any error (a
+/// one-time `tracing::warn!` fires first — see `warn_gpu_fallback_once`).
 pub fn upsample_gpu(
     input: &[f32],
     c: usize,
     h: usize,
     w: usize,
 ) -> Result<UpsampleGpuOut, CudaVaeGpuError> {
-    let graph =
-        CudaGraph::global().map_err(|e| CudaVaeGpuError::GraphUnavailable(e.to_string()))?;
+    let graph = CudaGraph::global()
+        .map_err(|e| CudaVaeGpuError::GraphUnavailable(e.to_string()))
+        .inspect_err(|e| {
+            warn_gpu_fallback_once(&UPSAMPLE_FALLBACK_WARNED, "upsample", &e.to_string())
+        })?;
     let h_out = h * 2;
     let w_out = w * 2;
     let mut out = vec![0.0f32; c * h_out * w_out];
-    graph.encode_upsample_nearest_f32(input, &mut out, c, h, w)?;
+    graph
+        .encode_upsample_nearest_f32(input, &mut out, c, h, w)
+        .inspect_err(|e| {
+            warn_gpu_fallback_once(&UPSAMPLE_FALLBACK_WARNED, "upsample", &e.to_string())
+        })?;
     VAE_GPU_USED.store(true, Ordering::Relaxed);
     Ok(UpsampleGpuOut {
         data: out,
@@ -222,10 +363,38 @@ mod tests {
 
     #[test]
     fn vae_gpu_enabled_by_default_when_env_unset() {
-        // Note: OnceLock caches the first read; this asserts the default policy
+        // Clears any override on this thread — see `crate::vae::gpu`'s
+        // sibling test doc for why thread-local storage makes this safe
+        // under `cargo test`'s multi-threaded harness with no lock.
+        let _guard = set_conv_override(None);
+        // OnceLock caches the first read; this asserts the default policy
         // (env `OXI_VAE_GPU` unset → enabled). It does not mutate the env.
         if std::env::var("OXI_VAE_GPU").is_err() {
             assert!(vae_gpu_enabled());
         }
+    }
+
+    #[test]
+    fn conv_override_forces_cpu_regardless_of_the_cached_default() {
+        let _guard = set_conv_override(Some(false));
+        assert!(!vae_gpu_enabled(), "Some(false) must force the CPU path");
+    }
+
+    #[test]
+    fn conv_override_forces_gpu_regardless_of_the_cached_default() {
+        let _guard = set_conv_override(Some(true));
+        assert!(vae_gpu_enabled(), "Some(true) must force the GPU path");
+    }
+
+    #[test]
+    fn warn_gpu_fallback_once_fires_exactly_once_per_flag() {
+        // A private, test-local latch — see `crate::vae::gpu`'s sibling test.
+        static LOCAL_WARNED: AtomicBool = AtomicBool::new(false);
+        assert!(!LOCAL_WARNED.load(Ordering::Relaxed));
+        warn_gpu_fallback_once(&LOCAL_WARNED, "test op", "first reason");
+        assert!(LOCAL_WARNED.load(Ordering::Relaxed));
+        warn_gpu_fallback_once(&LOCAL_WARNED, "test op", "second reason");
+        warn_gpu_fallback_once(&LOCAL_WARNED, "test op", "third reason");
+        assert!(LOCAL_WARNED.load(Ordering::Relaxed));
     }
 }

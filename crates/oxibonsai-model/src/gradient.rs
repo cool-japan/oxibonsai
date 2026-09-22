@@ -1,10 +1,18 @@
-//! Forward-mode automatic differentiation for 1D tensors.
+//! Reverse-mode gradient primitives for 1D tensors.
 //!
 //! Provides a lightweight [`Tensor`] type that tracks shape and optional
 //! gradients, together with a set of element-wise and reduction operations.
-//! Manual gradient formulas live in the [`backward`] sub-module so that
-//! a training loop can orchestrate its own backward pass without depending
-//! on an external AD framework.
+//! Manual, hand-derived reverse-mode backward formulas live in the
+//! [`backward`] sub-module so that a training loop can orchestrate its own
+//! backward pass without depending on an external autodiff framework.
+//!
+//! **This is not forward-mode automatic differentiation.** There are no
+//! dual numbers and no tangent propagation through the forward pass here —
+//! `backward::*` are closed-form gradient formulas written by hand for each
+//! operation (e.g. `sigmoid_backward`, `linear_backward`), which a caller
+//! composes manually. That is reverse-mode-*style* manual backpropagation,
+//! not forward-mode AD; an earlier version of this doc comment described it
+//! as the latter, which was incorrect.
 //!
 //! # Design
 //!
@@ -12,6 +20,73 @@
 //! - Operations always produce *new* tensors; no aliasing occurs.
 //! - Gradients are accumulated with [`Tensor::accumulate_grad`] and cleared
 //!   with [`Tensor::zero_grad`].
+//! - Shape/length mismatches on caller-supplied tensors are reported via
+//!   [`GradientError`], never via `panic!`/`assert!` — see
+//!   [`Tensor::new`], [`Tensor::add`], [`Tensor::mul`], [`Tensor::matmul`],
+//!   and [`Tensor::accumulate_grad`].
+//!
+//! ## Reachability
+//!
+//! As of this writing, nothing else in the crate constructs a [`Tensor`]
+//! from this module or calls into [`backward`] — there is no training loop
+//! wired up to consume these primitives yet. This module is a tested,
+//! documented primitive for that future work, not a wired feature.
+
+// ─── Errors ──────────────────────────────────────────────────────────────────
+
+/// Errors from [`Tensor`]'s checked element-wise and matrix operations.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum GradientError {
+    /// [`Tensor::add`] or [`Tensor::mul`] was called on tensors with
+    /// different shapes.
+    #[error("{op}: shape mismatch ({a:?} vs {b:?})")]
+    ShapeMismatch {
+        /// Name of the operation that failed (e.g. `"add"`, `"mul"`).
+        op: &'static str,
+        /// Shape of the left-hand tensor.
+        a: Vec<usize>,
+        /// Shape of the right-hand tensor.
+        b: Vec<usize>,
+    },
+    /// [`Tensor::accumulate_grad`] was called with a gradient slice whose
+    /// length does not match the tensor's own data length.
+    #[error("accumulate_grad: gradient length {got} does not match tensor length {expected}")]
+    GradLengthMismatch {
+        /// The tensor's own element count.
+        expected: usize,
+        /// The length of the gradient slice that was passed in.
+        got: usize,
+    },
+    /// [`Tensor::matmul`]'s left-hand operand did not have `m * k` elements.
+    #[error("matmul: left operand has {got} elements, expected m*k = {expected}")]
+    LeftOperandSize {
+        /// `m * k`, the element count the left operand was expected to have.
+        expected: usize,
+        /// The left operand's actual element count.
+        got: usize,
+    },
+    /// [`Tensor::matmul`]'s right-hand operand did not have `k * n` elements.
+    #[error("matmul: right operand has {got} elements, expected k*n = {expected}")]
+    RightOperandSize {
+        /// `k * n`, the element count the right operand was expected to have.
+        expected: usize,
+        /// The right operand's actual element count.
+        got: usize,
+    },
+    /// [`Tensor::new`] was called with a `data` vector whose length does not
+    /// match the product of the dimensions in `shape`.
+    #[error(
+        "Tensor::new: data has {data_len} elements, but shape {shape:?} needs {shape_product}"
+    )]
+    NewLengthMismatch {
+        /// `data.len()` as supplied by the caller.
+        data_len: usize,
+        /// The `shape` as supplied by the caller.
+        shape: Vec<usize>,
+        /// `shape.iter().product::<usize>()`.
+        shape_product: usize,
+    },
+}
 
 // ─── Tensor ──────────────────────────────────────────────────────────────────
 
@@ -34,19 +109,25 @@ pub struct Tensor {
 impl Tensor {
     /// Create a new tensor from flat data and a shape.
     ///
-    /// Panics (in debug) if `data.len() != shape.iter().product::<usize>()`.
-    pub fn new(data: Vec<f32>, shape: Vec<usize>) -> Self {
-        debug_assert_eq!(
-            data.len(),
-            shape.iter().product::<usize>(),
-            "data length must match shape product"
-        );
-        Self {
+    /// # Errors
+    ///
+    /// Returns [`GradientError::NewLengthMismatch`] if `data.len() !=
+    /// shape.iter().product::<usize>()` — never panics.
+    pub fn new(data: Vec<f32>, shape: Vec<usize>) -> Result<Self, GradientError> {
+        let shape_product = shape.iter().product::<usize>();
+        if data.len() != shape_product {
+            return Err(GradientError::NewLengthMismatch {
+                data_len: data.len(),
+                shape,
+                shape_product,
+            });
+        }
+        Ok(Self {
             data,
             grad: None,
             requires_grad: false,
             shape,
-        }
+        })
     }
 
     /// Enable gradient tracking for this tensor (builder pattern).
@@ -59,17 +140,19 @@ impl Tensor {
     pub fn zeros(shape: &[usize]) -> Self {
         let n = shape.iter().product();
         Self::new(vec![0.0f32; n], shape.to_vec())
+            .expect("freshly allocated data length matches shape product by construction")
     }
 
     /// Create a one-filled tensor with the given shape.
     pub fn ones(shape: &[usize]) -> Self {
         let n = shape.iter().product();
         Self::new(vec![1.0f32; n], shape.to_vec())
+            .expect("freshly allocated data length matches shape product by construction")
     }
 
     /// Create a scalar tensor (shape `[1]`) from a single value.
     pub fn from_scalar(v: f32) -> Self {
-        Self::new(vec![v], vec![1])
+        Self::new(vec![v], vec![1]).expect("single-element data matches shape [1] by construction")
     }
 
     /// Logical shape of the tensor.
@@ -97,15 +180,17 @@ impl Tensor {
     ///
     /// Allocates the gradient buffer if it does not exist yet.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `grad.len() != self.data.len()`.
-    pub fn accumulate_grad(&mut self, grad: &[f32]) {
-        assert_eq!(
-            grad.len(),
-            self.data.len(),
-            "gradient length must match tensor length"
-        );
+    /// Returns [`GradientError::GradLengthMismatch`] if
+    /// `grad.len() != self.data.len()` — never panics.
+    pub fn accumulate_grad(&mut self, grad: &[f32]) -> Result<(), GradientError> {
+        if grad.len() != self.data.len() {
+            return Err(GradientError::GradLengthMismatch {
+                expected: self.data.len(),
+                got: grad.len(),
+            });
+        }
         match self.grad.as_mut() {
             Some(g) => {
                 for (dst, src) in g.iter_mut().zip(grad.iter()) {
@@ -116,6 +201,7 @@ impl Tensor {
                 self.grad = Some(grad.to_vec());
             }
         }
+        Ok(())
     }
 
     /// Return a copy of this tensor with `requires_grad = false` and no
@@ -133,12 +219,19 @@ impl Tensor {
     // ── Basic operations ─────────────────────────────────────────────────────
 
     /// Element-wise addition.  Shapes must match.
-    pub fn add(&self, other: &Tensor) -> Tensor {
-        assert_eq!(
-            self.shape, other.shape,
-            "add: shapes must match ({:?} vs {:?})",
-            self.shape, other.shape
-        );
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GradientError::ShapeMismatch`] if `self.shape() !=
+    /// other.shape()` — never panics.
+    pub fn add(&self, other: &Tensor) -> Result<Tensor, GradientError> {
+        if self.shape != other.shape {
+            return Err(GradientError::ShapeMismatch {
+                op: "add",
+                a: self.shape.clone(),
+                b: other.shape.clone(),
+            });
+        }
         let data: Vec<f32> = self
             .data
             .iter()
@@ -149,12 +242,19 @@ impl Tensor {
     }
 
     /// Element-wise multiplication.  Shapes must match.
-    pub fn mul(&self, other: &Tensor) -> Tensor {
-        assert_eq!(
-            self.shape, other.shape,
-            "mul: shapes must match ({:?} vs {:?})",
-            self.shape, other.shape
-        );
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GradientError::ShapeMismatch`] if `self.shape() !=
+    /// other.shape()` — never panics.
+    pub fn mul(&self, other: &Tensor) -> Result<Tensor, GradientError> {
+        if self.shape != other.shape {
+            return Err(GradientError::ShapeMismatch {
+                op: "mul",
+                a: self.shape.clone(),
+                b: other.shape.clone(),
+            });
+        }
         let data: Vec<f32> = self
             .data
             .iter()
@@ -167,17 +267,31 @@ impl Tensor {
     /// Matrix multiplication: `self` (m×k) @ `other` (k×n) → (m×n).
     ///
     /// Both tensors are treated as flat row-major matrices.
-    pub fn matmul(&self, other: &Tensor, m: usize, k: usize, n: usize) -> Tensor {
-        assert_eq!(
-            self.data.len(),
-            m * k,
-            "matmul: self must have m*k elements"
-        );
-        assert_eq!(
-            other.data.len(),
-            k * n,
-            "matmul: other must have k*n elements"
-        );
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GradientError::LeftOperandSize`] /
+    /// [`GradientError::RightOperandSize`] if `self`/`other` do not have
+    /// `m*k`/`k*n` elements respectively — never panics.
+    pub fn matmul(
+        &self,
+        other: &Tensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<Tensor, GradientError> {
+        if self.data.len() != m * k {
+            return Err(GradientError::LeftOperandSize {
+                expected: m * k,
+                got: self.data.len(),
+            });
+        }
+        if other.data.len() != k * n {
+            return Err(GradientError::RightOperandSize {
+                expected: k * n,
+                got: other.data.len(),
+            });
+        }
         let mut out = vec![0.0f32; m * n];
         for i in 0..m {
             for j in 0..n {
@@ -195,6 +309,7 @@ impl Tensor {
     pub fn relu(&self) -> Tensor {
         let data: Vec<f32> = self.data.iter().map(|&x| x.max(0.0)).collect();
         Tensor::new(data, self.shape.clone())
+            .expect("element-wise map preserves length; shape is unchanged from a valid tensor")
     }
 
     /// Element-wise sigmoid: `1 / (1 + exp(-x))`.
@@ -205,6 +320,7 @@ impl Tensor {
             .map(|&x| 1.0 / (1.0 + (-x).exp()))
             .collect();
         Tensor::new(data, self.shape.clone())
+            .expect("element-wise map preserves length; shape is unchanged from a valid tensor")
     }
 
     /// Softmax along the last dimension.
@@ -233,6 +349,7 @@ impl Tensor {
             }
         }
         Tensor::new(data, self.shape.clone())
+            .expect("softmax preserves length; shape is unchanged from a valid tensor")
     }
 
     /// Reduce to scalar mean.
@@ -252,6 +369,7 @@ impl Tensor {
     pub fn neg(&self) -> Tensor {
         let data: Vec<f32> = self.data.iter().map(|&x| -x).collect();
         Tensor::new(data, self.shape.clone())
+            .expect("element-wise map preserves length; shape is unchanged from a valid tensor")
     }
 
     /// Element-wise natural logarithm.  Values ≤ 0 produce `-inf` / `NaN`
@@ -259,6 +377,7 @@ impl Tensor {
     pub fn log(&self) -> Tensor {
         let data: Vec<f32> = self.data.iter().map(|&x| x.ln()).collect();
         Tensor::new(data, self.shape.clone())
+            .expect("element-wise map preserves length; shape is unchanged from a valid tensor")
     }
 }
 
@@ -431,27 +550,56 @@ mod tests {
 
     #[test]
     fn test_tensor_add() {
-        let a = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]);
-        let b = Tensor::new(vec![4.0, 5.0, 6.0], vec![3]);
-        let c = a.add(&b);
+        let a = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]).expect("valid tensor");
+        let b = Tensor::new(vec![4.0, 5.0, 6.0], vec![3]).expect("valid tensor");
+        let c = a.add(&b).expect("matching shapes must succeed");
         assert_eq!(c.data, vec![5.0, 7.0, 9.0]);
     }
 
     #[test]
+    fn test_tensor_add_shape_mismatch_returns_err() {
+        let a = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]).expect("valid tensor");
+        let b = Tensor::new(vec![1.0, 2.0], vec![2]).expect("valid tensor");
+        let err = a
+            .add(&b)
+            .expect_err("mismatched shapes must be rejected, not panic");
+        assert!(matches!(
+            err,
+            GradientError::ShapeMismatch { op: "add", .. }
+        ));
+    }
+
+    #[test]
     fn test_tensor_mul() {
-        let a = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]);
-        let b = Tensor::new(vec![2.0, 3.0, 4.0], vec![3]);
-        let c = a.mul(&b);
+        let a = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]).expect("valid tensor");
+        let b = Tensor::new(vec![2.0, 3.0, 4.0], vec![3]).expect("valid tensor");
+        let c = a.mul(&b).expect("matching shapes must succeed");
         assert_eq!(c.data, vec![2.0, 6.0, 12.0]);
+    }
+
+    #[test]
+    fn test_tensor_mul_shape_mismatch_returns_err() {
+        let a = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]).expect("valid tensor");
+        let b = Tensor::new(vec![1.0, 2.0], vec![2]).expect("valid tensor");
+        let err = a
+            .mul(&b)
+            .expect_err("mismatched shapes must be rejected, not panic");
+        assert!(matches!(
+            err,
+            GradientError::ShapeMismatch { op: "mul", .. }
+        ));
     }
 
     #[test]
     fn test_tensor_matmul() {
         // 2×3 @ 3×2 = 2×2
         // [[1,2,3],[4,5,6]] @ [[7,8],[9,10],[11,12]]
-        let a = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
-        let b = Tensor::new(vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0], vec![3, 2]);
-        let c = a.matmul(&b, 2, 3, 2);
+        let a = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]).expect("valid tensor");
+        let b =
+            Tensor::new(vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0], vec![3, 2]).expect("valid tensor");
+        let c = a
+            .matmul(&b, 2, 3, 2)
+            .expect("shapes are consistent with m,k,n");
         // Row 0: [1*7+2*9+3*11, 1*8+2*10+3*12] = [58, 64]
         // Row 1: [4*7+5*9+6*11, 4*8+5*10+6*12] = [139, 154]
         assert!(approx_eq(c.data[0], 58.0));
@@ -462,8 +610,40 @@ mod tests {
     }
 
     #[test]
+    fn test_tensor_matmul_left_operand_size_mismatch_returns_err() {
+        let a = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]).expect("valid tensor"); // 3 elements, but m*k=2*3=6
+        let b = Tensor::new(vec![0.0; 6], vec![3, 2]).expect("valid tensor");
+        let err = a
+            .matmul(&b, 2, 3, 2)
+            .expect_err("left operand size mismatch must be rejected, not panic");
+        assert!(matches!(
+            err,
+            GradientError::LeftOperandSize {
+                expected: 6,
+                got: 3
+            }
+        ));
+    }
+
+    #[test]
+    fn test_tensor_matmul_right_operand_size_mismatch_returns_err() {
+        let a = Tensor::new(vec![0.0; 6], vec![2, 3]).expect("valid tensor");
+        let b = Tensor::new(vec![1.0, 2.0], vec![2]).expect("valid tensor"); // 2 elements, but k*n=3*2=6
+        let err = a
+            .matmul(&b, 2, 3, 2)
+            .expect_err("right operand size mismatch must be rejected, not panic");
+        assert!(matches!(
+            err,
+            GradientError::RightOperandSize {
+                expected: 6,
+                got: 2
+            }
+        ));
+    }
+
+    #[test]
     fn test_tensor_relu_forward() {
-        let t = Tensor::new(vec![-2.0, -0.5, 0.0, 0.5, 2.0], vec![5]);
+        let t = Tensor::new(vec![-2.0, -0.5, 0.0, 0.5, 2.0], vec![5]).expect("valid tensor");
         let r = t.relu();
         assert_eq!(r.data, vec![0.0, 0.0, 0.0, 0.5, 2.0]);
     }
@@ -481,7 +661,7 @@ mod tests {
 
     #[test]
     fn test_tensor_softmax_sums_to_one() {
-        let t = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![4]);
+        let t = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![4]).expect("valid tensor");
         let s = t.softmax();
         let total: f32 = s.data.iter().sum();
         assert!(approx_eq(total, 1.0), "softmax must sum to 1, got {total}");
@@ -495,7 +675,7 @@ mod tests {
 
     #[test]
     fn test_tensor_mean_scalar() {
-        let t = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![4]);
+        let t = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![4]).expect("valid tensor");
         let m = t.mean();
         assert_eq!(m.shape(), &[1]);
         assert!(approx_eq(m.data[0], 2.5));
@@ -503,7 +683,7 @@ mod tests {
 
     #[test]
     fn test_relu_backward_zeros_negatives() {
-        let input = Tensor::new(vec![-1.0, 0.0, 1.0, 2.0], vec![4]);
+        let input = Tensor::new(vec![-1.0, 0.0, 1.0, 2.0], vec![4]).expect("valid tensor");
         let grad_out = vec![1.0f32; 4];
         let grad_in = backward::relu_backward(&grad_out, &input);
         assert_eq!(grad_in, vec![0.0, 0.0, 1.0, 1.0]);
@@ -511,7 +691,7 @@ mod tests {
 
     #[test]
     fn test_sigmoid_backward_shape() {
-        let output = Tensor::new(vec![0.5f32; 4], vec![4]);
+        let output = Tensor::new(vec![0.5f32; 4], vec![4]).expect("valid tensor");
         let grad_out = vec![1.0f32; 4];
         let grad_in = backward::sigmoid_backward(&grad_out, &output);
         assert_eq!(grad_in.len(), 4);
@@ -577,12 +757,50 @@ mod tests {
 
     #[test]
     fn test_tensor_accumulate_grad() {
-        let mut t = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]).requires_grad();
-        t.accumulate_grad(&[0.1, 0.2, 0.3]);
-        t.accumulate_grad(&[0.1, 0.2, 0.3]);
+        let mut t = Tensor::new(vec![1.0, 2.0, 3.0], vec![3])
+            .expect("valid tensor")
+            .requires_grad();
+        t.accumulate_grad(&[0.1, 0.2, 0.3])
+            .expect("matching length must succeed");
+        t.accumulate_grad(&[0.1, 0.2, 0.3])
+            .expect("matching length must succeed");
         let grad = t.grad.as_ref().expect("grad must be Some");
         assert!(approx_eq(grad[0], 0.2));
         assert!(approx_eq(grad[1], 0.4));
         assert!(approx_eq(grad[2], 0.6));
+    }
+
+    #[test]
+    fn test_tensor_accumulate_grad_length_mismatch_returns_err() {
+        let mut t = Tensor::new(vec![1.0, 2.0, 3.0], vec![3])
+            .expect("valid tensor")
+            .requires_grad();
+        let err = t
+            .accumulate_grad(&[0.1, 0.2])
+            .expect_err("length mismatch must be rejected, not panic");
+        assert!(matches!(
+            err,
+            GradientError::GradLengthMismatch {
+                expected: 3,
+                got: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn test_tensor_new_length_mismatch_returns_err_not_panic() {
+        // 4 elements of data, but shape [3] only accounts for 3 — this used
+        // to be a debug-only `debug_assert_eq!` panic on caller input; it
+        // must now be a checked `Err`, in both debug and release builds.
+        let err = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![3])
+            .expect_err("length/shape mismatch must be rejected, not panic");
+        assert!(matches!(
+            err,
+            GradientError::NewLengthMismatch {
+                data_len: 4,
+                shape_product: 3,
+                ..
+            }
+        ));
     }
 }

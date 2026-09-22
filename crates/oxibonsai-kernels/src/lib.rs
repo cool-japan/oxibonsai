@@ -142,15 +142,23 @@ pub use gpu_backend::{try_cuda_prefill_fp8, CudaFP8PrefillLayerParams};
 
 pub mod dequant;
 pub mod dequant_fp8;
+pub mod dequant_prism;
 pub mod dequant_ternary;
 pub mod dispatch;
+pub mod dispatch_prism;
+pub mod dispatch_std_quant;
 pub mod error;
 pub mod fp8_lut;
+pub mod gated_delta_net;
+pub mod gated_delta_net_chunk;
 pub mod gemm;
 pub mod gemm_fp8;
+pub mod gemm_onebit;
 pub mod gemm_ternary;
 pub mod gemv;
+pub mod gemv_f32;
 pub mod gemv_fp8;
+pub mod gemv_ptq1;
 pub mod gemv_q2k;
 pub mod gemv_q3k;
 pub mod gemv_q4_0;
@@ -160,6 +168,7 @@ pub mod gemv_q6k;
 pub mod gemv_q8_0;
 pub mod gemv_q8k;
 pub mod gemv_ternary;
+pub mod hadamard;
 pub mod packing;
 pub mod parallel;
 pub mod parallel_tiled;
@@ -174,25 +183,36 @@ pub mod simd_fp8_avx512;
 #[cfg(target_arch = "aarch64")]
 pub mod simd_fp8_neon;
 #[cfg(target_arch = "aarch64")]
+pub mod simd_hadamard_neon;
+#[cfg(target_arch = "aarch64")]
 pub mod simd_neon;
+#[cfg(target_arch = "x86_64")]
+pub mod simd_prism_avx2;
+#[cfg(target_arch = "aarch64")]
+pub mod simd_prism_neon;
 #[cfg(target_arch = "x86_64")]
 pub mod simd_q_std_avx2;
 #[cfg(target_arch = "x86_64")]
 pub mod simd_q_std_avx512;
 #[cfg(target_arch = "aarch64")]
 pub mod simd_q_std_neon;
+pub mod tier;
 pub mod tiled;
 pub mod traits;
 pub mod weight_cache;
 
 pub mod aligned;
+pub mod norms;
 pub mod prefetch;
+pub mod rope_mrope;
 pub mod simd_float_ops;
+pub mod ssm_ops;
 pub mod tuning;
 
 pub use aligned::{AlignedBlocks, AlignedBuffer};
 pub use dispatch::{cpu_kernel_tier, KernelDispatcher, KernelTier};
 pub use error::{KernelError, KernelResult};
+pub use gemv_f32::{dot_f32, gemv_f32};
 pub use gemv_q2k::gemv_q2k;
 pub use gemv_q3k::gemv_q3k;
 pub use gemv_q4_0::gemv_q4_0;
@@ -208,6 +228,8 @@ pub use parallel::{
 pub use parallel_tiled::{gemm_adaptive_ternary, gemv_adaptive, gemv_adaptive_ternary};
 pub use prefetch::{PrefetchConfig, PrefetchLocality, PrefetchStrategy};
 pub use simd_float_ops::{rms_norm_simd, rope_apply_simd, silu_simd, softmax_simd, swiglu_simd};
-pub use traits::{Fp8Kernel, OneBitKernel, StandardQuantKernel, TernaryKernel};
+pub use traits::{
+    Fp8Kernel, FusedKernel, OneBitKernel, PrismKernel, StandardQuantKernel, TernaryKernel,
+};
 pub use tuning::{PlatformProfile, TunedThresholds, TuningSummary};
 pub use weight_cache::GpuWeightHandle;

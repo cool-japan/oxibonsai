@@ -16,11 +16,12 @@
 use std::collections::HashSet;
 
 use tracing::debug;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::{
     bpe::{
-        bpe_encode, bpe_encode_bytelevel, byte_fallback_id, pretokenize, pretokenize_gpt2,
-        BpeMerges,
+        bpe_encode, bpe_encode_bytelevel, byte_fallback_id, pretokenize, pretokenize_by_kind,
+        pretokenize_regex, BpeMerges, PreTokenizerKind,
     },
     error::{TokenizerError, TokenizerResult},
     hf_format::bytes_to_unicode_map,
@@ -60,6 +61,15 @@ pub struct TokenizerConfig {
     /// `true` automatically; hand-built configs default to `false` for
     /// backwards compatibility.
     pub byte_level_decode: bool,
+    /// When `true`, `encode` applies Unicode NFC (Canonical Composition)
+    /// normalization to each non-special segment before pre-tokenization
+    /// (TOK-09), matching a `tokenizer.json` that declares
+    /// `"normalizer": {"type": "NFC"}`.  Proven divergence without this:
+    /// HF composes `"e" + U+0301 (COMBINING ACUTE ACCENT)` into a single
+    /// `"é"` before encoding; without NFC the decomposed form tokenizes
+    /// differently from the precomposed `"é"`.  Defaults to `false` so
+    /// hand-built configs and non-NFC tokenizers are unaffected.
+    pub normalize_nfc: bool,
 }
 
 impl Default for TokenizerConfig {
@@ -73,6 +83,7 @@ impl Default for TokenizerConfig {
             pad_token_id: 3,
             max_length: None,
             byte_level_decode: false,
+            normalize_nfc: false,
         }
     }
 }
@@ -116,6 +127,18 @@ pub struct OxiTokenizer {
     /// takes precedence over the BPE path but is checked after Unigram.
     /// When `None`, the BPE path (or Unigram if attached) is used.
     wordpiece: Option<crate::wordpiece::WordPieceVocab>,
+    /// Which built-in `Split` pre-tokenizer pattern the byte-level encode
+    /// path uses when [`Self::custom_pretokenizer`] is `None`.  Set via
+    /// [`Self::with_pretokenizer_kind`]; defaults to
+    /// [`PreTokenizerKind::Gpt2`], matching this crate's historical
+    /// behaviour for every existing caller of [`Self::new`].
+    pretokenizer_kind: PreTokenizerKind,
+    /// An explicit `Split`-stage regex compiled from a `tokenizer.json`'s
+    /// own declared pattern (TOK-04 verdict correction: "when the source is
+    /// a tokenizer.json, take the pattern verbatim ... keep the enum for
+    /// the GGUF path"), taking priority over `pretokenizer_kind` when set.
+    /// Set via [`Self::with_pretokenizer_pattern`].
+    custom_pretokenizer: Option<fancy_regex::Regex>,
 }
 
 impl OxiTokenizer {
@@ -124,7 +147,7 @@ impl OxiTokenizer {
     /// Sets `unigram` and `wordpiece` to `None` — the BPE path is used for
     /// encoding.
     pub fn new(vocab: Vocabulary, merges: BpeMerges, config: TokenizerConfig) -> Self {
-        let special_ids = build_special_ids(&config);
+        let special_ids = build_special_ids(&config, &vocab);
         let special_pieces = build_special_pieces(&vocab);
         Self {
             vocab,
@@ -135,6 +158,8 @@ impl OxiTokenizer {
             byte_to_unicode: bytes_to_unicode_map(),
             unigram: None,
             wordpiece: None,
+            pretokenizer_kind: PreTokenizerKind::default(),
+            custom_pretokenizer: None,
         }
     }
 
@@ -148,7 +173,7 @@ impl OxiTokenizer {
         unigram_vocab: crate::unigram::UnigramVocab,
         config: TokenizerConfig,
     ) -> Self {
-        let special_ids = build_special_ids(&config);
+        let special_ids = build_special_ids(&config, &vocab);
         let special_pieces = build_special_pieces(&vocab);
         Self {
             vocab,
@@ -159,6 +184,8 @@ impl OxiTokenizer {
             byte_to_unicode: bytes_to_unicode_map(),
             unigram: Some(unigram_vocab),
             wordpiece: None,
+            pretokenizer_kind: PreTokenizerKind::default(),
+            custom_pretokenizer: None,
         }
     }
 
@@ -173,7 +200,7 @@ impl OxiTokenizer {
         wordpiece_vocab: crate::wordpiece::WordPieceVocab,
         config: TokenizerConfig,
     ) -> Self {
-        let special_ids = build_special_ids(&config);
+        let special_ids = build_special_ids(&config, &vocab);
         let special_pieces = build_special_pieces(&vocab);
         Self {
             vocab,
@@ -184,6 +211,8 @@ impl OxiTokenizer {
             byte_to_unicode: bytes_to_unicode_map(),
             unigram: None,
             wordpiece: Some(wordpiece_vocab),
+            pretokenizer_kind: PreTokenizerKind::default(),
+            custom_pretokenizer: None,
         }
     }
 
@@ -283,10 +312,24 @@ impl OxiTokenizer {
     }
 
     /// Encode a single non-special segment with the active model path.
+    ///
+    /// Applies [`TokenizerConfig::normalize_nfc`] first (TOK-09), mirroring
+    /// HuggingFace's per-segment pipeline order: `AddedVocabulary` carve-out
+    /// (done by the caller, [`Self::encode_with_special_tokens`]) happens
+    /// *before* normalization, and normalization happens before
+    /// pre-tokenization/model segmentation.
     fn encode_segment(&self, text: &str, ids: &mut Vec<u32>) {
         if text.is_empty() {
             return;
         }
+
+        let normalized;
+        let text: &str = if self.config.normalize_nfc {
+            normalized = text.chars().nfc().collect::<String>();
+            &normalized
+        } else {
+            text
+        };
 
         if let Some(wp) = &self.wordpiece {
             // WordPiece path: greedy longest-match-first segmentation of the
@@ -302,13 +345,20 @@ impl OxiTokenizer {
             // have explicit vocabulary entries (e.g. token 107 = `\n`).
             ids.extend_from_slice(&unigram.encode(text));
         } else if self.config.byte_level_decode {
-            // ByteLevel BPE path (GPT-2 / Qwen3 / Llama-3): whitespace-preserving
-            // pre-tokenization, then remap every UTF-8 byte through the GPT-2
-            // bytes→unicode table before running the merge table.  This is the
-            // only path that correctly encodes non-ASCII text (CJK, emoji,
-            // accented Latin) and non-space whitespace (tabs, newlines, repeated
-            // spaces) against a byte-level vocabulary.
-            for piece in pretokenize_gpt2(text) {
+            // ByteLevel BPE path (GPT-2 / Qwen2 / Qwen3.5 / Llama-3):
+            // whitespace-preserving pre-tokenization via the configured
+            // `Split` pattern (see [`Self::with_pretokenizer_kind`] /
+            // [`Self::with_pretokenizer_pattern`]), then remap every UTF-8
+            // byte through the GPT-2 bytes→unicode table before running the
+            // merge table.  This is the only path that correctly encodes
+            // non-ASCII text (CJK, emoji, accented Latin) and non-space
+            // whitespace (tabs, newlines, repeated spaces) against a
+            // byte-level vocabulary.
+            let pieces = match &self.custom_pretokenizer {
+                Some(re) => pretokenize_regex(text, re),
+                None => pretokenize_by_kind(text, self.pretokenizer_kind),
+            };
+            for piece in pieces {
                 let mut byte_level = String::with_capacity(piece.len());
                 for &byte in piece.as_bytes() {
                     byte_level.push(self.byte_to_unicode[byte as usize]);
@@ -360,6 +410,34 @@ impl OxiTokenizer {
         String::from_utf8(bytes).map_err(|e| TokenizerError::DecodeFailed(e.to_string()))
     }
 
+    /// Decode with explicit control over whether special tokens are
+    /// skipped, matching HF's `tokenizer.decode(ids, skip_special_tokens=)`
+    /// signature.
+    ///
+    /// Added additively (wave-1.5 addendum) rather than as a parameter on
+    /// [`Self::decode`] itself, since that method's signature is depended on
+    /// by callers in other packages within the same wave.
+    /// `skip_special_tokens = true` reproduces [`Self::decode`] exactly.
+    /// `skip_special_tokens = false` renders every token — including ones
+    /// [`Self::decode`] would silently drop — verbatim through the same
+    /// byte-level / legacy decode path, which is useful for diagnostics and
+    /// for API surfaces (e.g. an OpenAI-compatible server) that want to
+    /// show raw model output.
+    pub fn decode_with_options(
+        &self,
+        ids: &[u32],
+        skip_special_tokens: bool,
+    ) -> TokenizerResult<String> {
+        if skip_special_tokens {
+            return self.decode(ids);
+        }
+        let mut bytes: Vec<u8> = Vec::with_capacity(ids.len() * 2);
+        for &id in ids {
+            self.decode_id_into_unconditionally(id, &mut bytes);
+        }
+        String::from_utf8(bytes).map_err(|e| TokenizerError::DecodeFailed(e.to_string()))
+    }
+
     /// Decode to raw bytes — used by both [`Self::decode`] and the streaming
     /// decoder so that the two paths stay byte-for-byte identical.
     pub(crate) fn decode_to_bytes(&self, ids: &[u32]) -> Vec<u8> {
@@ -379,7 +457,12 @@ impl OxiTokenizer {
         if self.special_ids.contains(&id) {
             return;
         }
+        self.decode_id_into_unconditionally(id, bytes);
+    }
 
+    /// As [`Self::decode_id_into`], but never skips special tokens — used by
+    /// [`Self::decode_with_options`] with `skip_special_tokens = false`.
+    fn decode_id_into_unconditionally(&self, id: u32, bytes: &mut Vec<u8>) {
         let token = match self.vocab.get_token(id) {
             Some(t) => t,
             None => {
@@ -482,6 +565,58 @@ impl OxiTokenizer {
         parsed.into_tokenizer()
     }
 
+    /// Build a tokenizer directly from a GGUF file's metadata store
+    /// (TOK-05).
+    ///
+    /// Bonsai 2 27B (and any other `qwen35`/`gpt2`-pre GGUF checkpoint)
+    /// ships its vocabulary (`tokenizer.ggml.tokens`), merges
+    /// (`tokenizer.ggml.merges`) and special-token ids only inside the GGUF
+    /// — there is no accompanying `tokenizer.json`. This produces the same
+    /// kind of [`OxiTokenizer`] [`Self::from_hf_tokenizer_json`] does for
+    /// the JSON path (byte-level BPE, correct special-token carve-out, the
+    /// GGUF's own `tokenizer.ggml.pre` pattern).
+    ///
+    /// See [`crate::gguf_vocab`] for the field-by-field mapping.
+    pub fn from_gguf_metadata(md: &oxibonsai_core::MetadataStore) -> TokenizerResult<Self> {
+        crate::gguf_vocab::tokenizer_from_gguf_metadata(md)
+    }
+
+    /// Attach a built-in [`PreTokenizerKind`] to drive the byte-level encode
+    /// path's `Split` pre-tokenizer, overriding the default
+    /// [`PreTokenizerKind::Gpt2`].
+    ///
+    /// Additive builder method (TOK-03/TOK-04): kept separate from
+    /// [`Self::new`] so that constructor's signature — used throughout this
+    /// crate and by every downstream crate — never has to change. Has no
+    /// effect unless `config.byte_level_decode` is also `true`.
+    #[must_use]
+    pub fn with_pretokenizer_kind(mut self, kind: PreTokenizerKind) -> Self {
+        self.pretokenizer_kind = kind;
+        self.custom_pretokenizer = None;
+        self
+    }
+
+    /// Attach an explicit `Split`-stage regex pattern (verbatim from a
+    /// `tokenizer.json`'s own `pre_tokenizer` declaration), taking priority
+    /// over [`Self::with_pretokenizer_kind`] once set.
+    ///
+    /// # Errors
+    /// Returns [`TokenizerError::HfFormat`] if `pattern` fails to compile —
+    /// unlike the built-in kinds (vetted by this crate's own tests), a
+    /// pattern sourced from an external file can genuinely be malformed, so
+    /// this is a fallible, additive builder method rather than a change to
+    /// [`Self::new`]'s signature.
+    pub fn with_pretokenizer_pattern(mut self, pattern: &str) -> TokenizerResult<Self> {
+        let compiled = fancy_regex::RegexBuilder::new(pattern)
+            .backtrack_limit(1_000_000)
+            .build()
+            .map_err(|e| {
+                TokenizerError::HfFormat(format!("invalid pre-tokenizer regex {pattern:?}: {e}"))
+            })?;
+        self.custom_pretokenizer = Some(compiled);
+        Ok(self)
+    }
+
     /// Begin streaming decode.  Returns a [`crate::streaming::StreamingDecoder`]
     /// that keeps UTF-8 state across `push_token` calls — essential for server
     /// code that emits one token at a time.
@@ -512,11 +647,13 @@ impl OxiTokenizer {
     ///
     /// This tokenizer has no BPE merges: each character is its own token.
     /// The `_stub` suffix is retained for API compatibility.
+    ///
+    /// `vocab_size` is clamped up to a minimum of 4 (rather than panicking,
+    /// TOK-17) so this public constructor can never crash a caller that
+    /// passes a too-small size; the streaming decoder's own module-doc
+    /// example builds on this constructor and must never panic either.
     pub fn char_level_stub(vocab_size: usize) -> Self {
-        assert!(
-            vocab_size >= 4,
-            "char_level_stub requires vocab_size >= 4 for special tokens"
-        );
+        let vocab_size = vocab_size.max(4);
 
         let mut vocab = Vocabulary::new();
         vocab.add_special("<unk>", 0);
@@ -556,6 +693,7 @@ impl OxiTokenizer {
             pad_token_id: 3,
             max_length: None,
             byte_level_decode: false,
+            normalize_nfc: false,
         };
 
         let merges = BpeMerges::new();
@@ -583,13 +721,45 @@ impl OxiTokenizer {
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
-/// Build the set of special token IDs from a config.
-fn build_special_ids(config: &TokenizerConfig) -> HashSet<u32> {
+/// Build the set of special token IDs from a config and its vocabulary.
+///
+/// # TOK-01
+///
+/// A tokenizer whose source declares no explicit `unk`/`bos`/`eos`/`pad`
+/// token (e.g. Qwen3's real `tokenizer.json`) falls back to
+/// [`TokenizerConfig::default`]'s `unk=0, bos=1, eos=2, pad=3` — and a
+/// byte-level vocabulary routinely assigns those exact low ids to ordinary
+/// punctuation (`!`, `"`, `#`, `$`). Blindly trusting the config quartet
+/// (the previous behaviour) therefore classified real content tokens as
+/// special and silently deleted them on every `decode`.
+///
+/// The fix: a config id is only special when the vocabulary itself agrees —
+/// either it is genuinely registered as special (`vocab.is_special_id`), or
+/// it corresponds to no real vocabulary entry at all (a purely synthetic
+/// placeholder id, which can never legitimately appear in an encoded
+/// sequence and is therefore safe, and correct, to skip on decode either
+/// way). This is additionally unioned with the vocabulary's own
+/// [`Vocabulary::special_tokens`] registry, so specials whose ids do *not*
+/// happen to coincide with any config field (the common case — e.g. real
+/// `<|im_start|>`/`<|im_end|>`/`<|endoftext|>` ids far outside the config
+/// quartet) are still skipped on decode. Deliberately **excludes**
+/// [`Vocabulary::protected_tokens`]'s non-special members (e.g. `<think>`,
+/// `<tool_call>`): those are atomically carved out of *encode* so they map
+/// to their trained ids rather than being shredded by pre-tokenization, but
+/// they are genuine content and must still render on *decode*.
+fn build_special_ids(config: &TokenizerConfig, vocab: &Vocabulary) -> HashSet<u32> {
     let mut set = HashSet::new();
-    set.insert(config.bos_token_id);
-    set.insert(config.eos_token_id);
-    set.insert(config.unk_token_id);
-    set.insert(config.pad_token_id);
+    for id in [
+        config.bos_token_id,
+        config.eos_token_id,
+        config.unk_token_id,
+        config.pad_token_id,
+    ] {
+        if vocab.is_special_id(id) || vocab.get_token(id).is_none() {
+            set.insert(id);
+        }
+    }
+    set.extend(vocab.special_tokens().map(|(_, id)| id));
     set
 }
 
@@ -648,7 +818,7 @@ mod tests {
         let mut tok = OxiTokenizer::char_level_stub(200);
         tok.config.add_bos = true;
         tok.config.add_eos = true;
-        tok.special_ids = build_special_ids(&tok.config);
+        tok.special_ids = build_special_ids(&tok.config, &tok.vocab);
         let ids = tok.encode("hi").expect("encode should succeed");
         assert_eq!(ids[0], 1); // BOS
         assert_eq!(*ids.last().expect("must have last element"), 2); // EOS
@@ -700,7 +870,7 @@ mod tests {
     fn max_length_truncates() {
         let mut tok = OxiTokenizer::char_level_stub(200);
         tok.config.max_length = Some(3);
-        tok.special_ids = build_special_ids(&tok.config);
+        tok.special_ids = build_special_ids(&tok.config, &tok.vocab);
         let ids = tok.encode("hello world").expect("encode should succeed");
         assert!(ids.len() <= 3);
     }

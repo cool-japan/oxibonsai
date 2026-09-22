@@ -6,6 +6,7 @@ use oxibonsai_runtime::engine::InferenceEngine;
 use oxibonsai_runtime::{
     beam_search::{BeamSearchConfig, BeamSearchEngine},
     context_manager::{ContextWindow, TruncationStrategy},
+    error::RuntimeResult,
     pipeline::{PipelineBuilder, StopReason},
     sampling::SamplingParams,
     sampling_advanced::{
@@ -113,8 +114,17 @@ fn test_pipeline_with_token_healing() {
 
 #[test]
 fn test_pipeline_output_has_tokens() {
+    // RT-01 made `PipelineOutput::text` populate only when a detokenizer is
+    // attached; without one `text` is correctly always empty. Attach a toy
+    // detokenizer here so this test exercises that real seam instead of the
+    // (now-intentional) no-detokenizer empty-text path -- see the sibling
+    // test below for that direction.
     let mut engine = make_tiny_engine();
-    let mut pipeline = PipelineBuilder::new().max_tokens(5).greedy().build();
+    let mut pipeline = PipelineBuilder::new()
+        .max_tokens(5)
+        .greedy()
+        .with_detokenizer(|ids: &[u32]| -> RuntimeResult<String> { Ok(format!("{ids:?}")) })
+        .build();
 
     let output = pipeline.run(vec![1u32, 2, 3], &mut engine);
     // token_ids length must equal completion_tokens.
@@ -123,6 +133,30 @@ fn test_pipeline_output_has_tokens() {
     if output.completion_tokens > 0 {
         assert!(!output.text.is_empty());
     }
+    assert!(
+        output.text_available,
+        "a detokenizer was attached, so text_available must be true"
+    );
+}
+
+#[test]
+fn test_pipeline_output_without_detokenizer_has_no_text() {
+    // Pins the other direction of RT-01's contract: with no detokenizer
+    // attached, `text` stays empty and `text_available` stays false,
+    // regardless of how many tokens were generated.
+    let mut engine = make_tiny_engine();
+    let mut pipeline = PipelineBuilder::new().max_tokens(5).greedy().build();
+
+    let output = pipeline.run(vec![1u32, 2, 3], &mut engine);
+    assert!(
+        output.text.is_empty(),
+        "text must stay empty with no detokenizer attached, got {:?}",
+        output.text
+    );
+    assert!(
+        !output.text_available,
+        "text_available must be false with no detokenizer attached"
+    );
 }
 
 #[test]
@@ -561,18 +595,12 @@ mod tokenizer_tests {
     }
 }
 
-// When feature flags are not enabled, provide no-op tests so the test binary
-// compiles cleanly.
-#[cfg(not(feature = "rag"))]
-#[test]
-fn test_rag_pipeline_skipped_no_feature() {
-    // RAG tests require --features rag.  Marking as intentionally skipped.
-    eprintln!("rag feature not enabled; skipping RAG integration tests");
-}
-
-#[cfg(not(feature = "native-tokenizer"))]
-#[test]
-fn test_tokenizer_skipped_no_feature() {
-    // native-tokenizer tests require --features native-tokenizer.
-    eprintln!("native-tokenizer feature not enabled; skipping tokenizer integration tests");
-}
+// MINOR fix (verifier wave 3, T-09): `test_rag_pipeline_skipped_no_feature`
+// and `test_tokenizer_skipped_no_feature` used to live here as `#[cfg(not(
+// feature = "..."))]`-gated placeholders that asserted nothing (just an
+// `eprintln!`) — a placebo pass under a non-default build, not evidence of
+// anything. Deleted rather than given a fabricated assertion: this file has
+// no unconditional code that depends on the `rag`/`native-tokenizer`
+// features being off, so the test binary compiles and runs cleanly without
+// them regardless of which features are enabled (this package's own
+// `--all-features` and default-feature gate runs both confirm it).

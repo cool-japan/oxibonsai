@@ -151,23 +151,13 @@ impl<'a> BonsaiModel<'a> {
             )
             .into());
         }
-        // SPLIT-CACHE GUARD (disabled by default).
-        //
-        // FP8 E4M3/E5M2 DECODE runs CPU attention over `self.kv_cache` (the
-        // per-token FP8 path dispatches through `self.forward`), but this GPU
-        // batch-prefill path writes a GPU-private KV cache (`acquire_fp8_kv_cache`
-        // in `cuda_fp8_prefill.rs`, backed by the module-level `FP8_PREFILL_STATE`
-        // singleton) that is never synced back to the CPU cache.  A successful GPU
-        // prefill would therefore leave decode attending over all-zero prompt KV
-        // and silently corrupt generation.  Unlike the Q1/ternary path — whose
-        // prefill and decode now share one GPU KV cache — there is no safe handoff
-        // here without a GPU→CPU KV read-back, so the path is disabled and
-        // `forward_prefill` falls back to the bit-correct sequential per-token path
-        // (which populates `self.kv_cache`).  Set
-        // `OXIBONSAI_FORCE_CUDA_SPLIT_PREFILL=1` to force the (decode-incorrect)
-        // GPU path for throughput microbenchmarks only.
-        if std::env::var_os("OXIBONSAI_FORCE_CUDA_SPLIT_PREFILL").is_none() {
-            return Err("FP8 CUDA batch prefill disabled (GPU-private KV cache not read by CPU decode); using sequential fallback".into());
+        // F6 SPLIT-CACHE GUARD. `cuda_split_prefill_allowed` is always false
+        // today: see it and `cuda_split_prefill_disabled` for why, and for why
+        // the `OXIBONSAI_FORCE_CUDA_SPLIT_PREFILL` override no longer overrides.
+        if !super::forward_cuda::cuda_split_prefill_allowed() {
+            return Err(super::forward_cuda::cuda_split_prefill_disabled(
+                "FP8", false,
+            ));
         }
         let eps = self.blocks[0].attn_norm_eps();
         let h = self.config.hidden_size;
@@ -181,28 +171,22 @@ impl<'a> BonsaiModel<'a> {
 
         // Build hidden batch from token embeddings.
         let mut hidden_batch = vec![0.0f32; batch_size * h];
-        for (t, &token_id) in token_ids.iter().enumerate() {
-            let embd_start = token_id as usize * h;
-            let embd_end = embd_start + h;
-            if embd_end > self.token_embd.len() {
-                return Err(format!(
-                    "token_id {} out of range (vocab={})",
-                    token_id,
-                    self.token_embd.len() / h
-                )
-                .into());
-            }
-            hidden_batch[t * h..(t + 1) * h]
-                .copy_from_slice(&self.token_embd[embd_start..embd_end]);
-        }
+        // M-02: gather only the rows this batch references, decoding each
+        // straight out of the quantized table. The deleted dense
+        // `Index<Range<usize>>` hatch materialized the whole
+        // `vocab x hidden` FP32 table here (1.16 / 2.31 / 4.74 GiB for the
+        // 1.7B / 8B / 27B) on the first multi-token prompt.
+        self.token_embd.copy_rows(token_ids, &mut hidden_batch)?;
 
         // Build RoPE tables.
         let mut cos_table = vec![0.0f32; batch_size * half_dim];
         let mut sin_table = vec![0.0f32; batch_size * half_dim];
         for t in 0..batch_size {
             let pos = pos_start + t;
-            cos_table[t * half_dim..(t + 1) * half_dim].copy_from_slice(self.rope.cos_at(pos));
-            sin_table[t * half_dim..(t + 1) * half_dim].copy_from_slice(self.rope.sin_at(pos));
+            cos_table[t * half_dim..(t + 1) * half_dim]
+                .copy_from_slice(self.rope.cos_at_checked(pos)?);
+            sin_table[t * half_dim..(t + 1) * half_dim]
+                .copy_from_slice(self.rope.sin_at_checked(pos)?);
         }
 
         // Handle namespaces (Phase 26):
@@ -344,12 +328,13 @@ impl<'a> BonsaiModel<'a> {
             )
             .into());
         }
-        // SPLIT-CACHE GUARD (disabled by default) — see
-        // `try_cuda_prefill_with_lm_head_fp8`.  The GPU-private KV cache this path
-        // writes is not the CPU `self.kv_cache` that decode reads, so it is disabled
-        // by default and the caller falls back to the sequential path.
-        if std::env::var_os("OXIBONSAI_FORCE_CUDA_SPLIT_PREFILL").is_none() {
-            return Err("FP8 CUDA batch prefill verify disabled (GPU-private KV cache not read by CPU decode); using sequential fallback".into());
+        // F6 SPLIT-CACHE GUARD. `cuda_split_prefill_allowed` is always false
+        // today: see it and `cuda_split_prefill_disabled` for why, and for why
+        // the `OXIBONSAI_FORCE_CUDA_SPLIT_PREFILL` override no longer overrides.
+        if !super::forward_cuda::cuda_split_prefill_allowed() {
+            return Err(super::forward_cuda::cuda_split_prefill_disabled(
+                "FP8", true,
+            ));
         }
         let eps = self.blocks[0].attn_norm_eps();
         let h = self.config.hidden_size;
@@ -436,19 +421,12 @@ impl<'a> BonsaiModel<'a> {
 
         let mut token_ids_out: Vec<u32> = Vec::with_capacity(batch_size);
         for (t, &tok_id) in token_ids.iter().enumerate() {
-            let embd_start = tok_id as usize * h;
-            if embd_start + h > self.token_embd.len() {
-                return Err(format!(
-                    "token_id {} out of range (vocab={})",
-                    tok_id,
-                    self.token_embd.len() / h
-                )
-                .into());
-            }
-            let single_hidden = self.token_embd[embd_start..embd_start + h].to_vec();
+            // M-02: one row, decoded from the quantized table.
+            let mut single_hidden = vec![0.0f32; h];
+            self.token_embd.copy_row(tok_id, &mut single_hidden)?;
             let pos = pos_start + t;
-            let cos_single: Vec<f32> = self.rope.cos_at(pos).to_vec();
-            let sin_single: Vec<f32> = self.rope.sin_at(pos).to_vec();
+            let cos_single: Vec<f32> = self.rope.cos_at_checked(pos)?.to_vec();
+            let sin_single: Vec<f32> = self.rope.sin_at_checked(pos)?.to_vec();
             let _ = half_dim;
 
             let mut greedy_id: u32 = 0;

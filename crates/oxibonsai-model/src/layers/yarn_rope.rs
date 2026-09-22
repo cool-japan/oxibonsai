@@ -6,6 +6,28 @@
 //! 1. RoPE frequencies are split into three zones: high (unmodified), medium (linear interp), low (NTK)
 //! 2. An attention scaling factor `sqrt(1/log(s))` compensates for distribution shift
 //! 3. The effective context is extended by scale factor `s = target_len / training_len`
+//!
+//! # Relationship to `RopeTable::new_with_scaling` (M-08)
+//!
+//! [`RopeTable::new_with_scaling`](crate::layers::rope::RopeTable::new_with_scaling)
+//! — the path GGUF `<arch>.rope.scaling.type = "yarn"` metadata is routed
+//! through — uses [`crate::layers::rope_scaling::RopeScalingStrategy::Yarn`]
+//! instead of the types in this module. That variant implements the
+//! `ggml`/HF `transformers`-compatible NTK-by-parts formula (blend between
+//! the unscaled and `freq / factor` frequency over a correction-dimension
+//! ramp derived from `beta_fast`/`beta_slow`, with the standard
+//! `0.1 * ln(factor) + 1.0` mscale), which real GGUF files' `beta_fast` /
+//! `beta_slow` / `attn_factor` keys are defined against. This module's
+//! [`YarnConfig::scaled_frequencies`] implements a related but distinct
+//! blend (interpolating toward an NTK-*rescaled base*, per the original
+//! bloc97/bloc97-style formulation, and a plain `sqrt(1/ln(s))` attention
+//! scale rather than `ggml`'s `0.1*ln(s)+1`), so the two are **not**
+//! numerically interchangeable — do not swap one in for the other without
+//! re-deriving which formula a given caller actually needs to match. Both
+//! remain independently useful: this module offers on-the-fly
+//! rotate-without-precomputing-a-table application
+//! ([`apply_yarn_rope`]/[`YarnFreqTable::apply`]/[`apply_batch`](YarnFreqTable::apply_batch)),
+//! while `RopeTable` precomputes a full cos/sin table up front.
 
 /// YaRN configuration.
 #[derive(Debug, Clone)]
@@ -181,7 +203,7 @@ pub fn apply_yarn_rope(
 ) -> Result<(), YarnError> {
     let head_dim = config.head_dim;
 
-    if head_dim % 2 != 0 {
+    if !head_dim.is_multiple_of(2) {
         return Err(YarnError::OddHeadDim(head_dim));
     }
     if q.len() != head_dim {
@@ -234,7 +256,7 @@ impl YarnFreqTable {
     /// Apply YaRN-scaled RoPE to a single (query, key) pair at `pos`.
     pub fn apply(&self, q: &mut [f32], k: &mut [f32], pos: usize) -> Result<(), YarnError> {
         let head_dim = self.config.head_dim;
-        if head_dim % 2 != 0 {
+        if !head_dim.is_multiple_of(2) {
             return Err(YarnError::OddHeadDim(head_dim));
         }
         if q.len() != head_dim {
@@ -271,7 +293,7 @@ impl YarnFreqTable {
         positions: &[usize],
         head_dim: usize,
     ) -> Result<(), YarnError> {
-        if head_dim % 2 != 0 {
+        if !head_dim.is_multiple_of(2) {
             return Err(YarnError::OddHeadDim(head_dim));
         }
         let num_tokens = positions.len();

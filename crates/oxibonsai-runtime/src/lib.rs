@@ -59,6 +59,8 @@ pub mod embedding_index;
 #[cfg(feature = "server")]
 pub mod embeddings;
 pub mod engine;
+pub mod engine_control;
+pub mod engine_greedy;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod engine_pool;
 pub mod error;
@@ -93,6 +95,7 @@ pub mod request_queue;
 pub mod sampling;
 pub mod sampling_advanced;
 pub mod semantic_cache;
+pub mod serve_shared;
 #[cfg(feature = "server")]
 pub mod server;
 pub mod speculative;
@@ -174,6 +177,7 @@ pub use token_budget::{
     BudgetConfig, BudgetError, BudgetPolicy, GlobalTokenBudget, RequestBudget, TokenCostEstimate,
 };
 pub use tokenizer_bridge::TokenizerBridge;
+pub use tokenizer_bridge::{AddedTokenInfo, TokenizerBackendKind, TokenizerVocabView};
 #[cfg(feature = "server")]
 pub use tool_calling::{
     build_tool_constraint, make_tool_call, new_tool_call_id, select_tool, validate_tool_arguments,

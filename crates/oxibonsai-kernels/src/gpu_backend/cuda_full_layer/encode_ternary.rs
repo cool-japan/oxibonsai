@@ -40,10 +40,14 @@ use cudarc::driver::sys;
 use tracing::warn;
 
 use super::super::cuda_graph::{CudaGraph, CudaGraphError};
+use super::super::cuda_graph_slot::{
+    next_cuda_model_epoch, CudaGraphSlotAction, CudaGraphSlotKey, CudaQuantKind,
+};
 use super::{
-    acquire_full_layer_buffers, acquire_kv_cache, full_layer_state, get_or_upload_f32_weight,
-    init_attn_modules, profiling, CuGraphHolder, CudaAttnModules, CudaCachedLayerWeights,
-    CudaFullLayerBuffers, CudaKvCache,
+    acquire_full_layer_buffers, acquire_kv_cache, build_slot_key, full_layer_state,
+    get_or_upload_f32_weight_for_epoch, init_attn_modules, profiling, slot_action_dropping_stale,
+    CuGraphHolder, CudaAttnModules, CudaCachedLayerWeights, CudaFullLayerBuffers, CudaKvCache,
+    CudaResolvedModelWeights,
 };
 
 use super::launchers::{
@@ -138,6 +142,12 @@ pub unsafe fn encode_layer_into_ternary(
     let max_seq_u32 = bufs.max_seq as u32;
     let inv_sqrt_hd = 1.0f32 / (head_dim as f32).sqrt();
     let layer_offset = kv.layer_offset_elements(layer_idx);
+    // F9: the attention launchers take device views so the prefill path can
+    // point them at chunk-resident buffers; the decode path here always uses
+    // the single-token scratch slots.
+    let d_pos_seqlen = &bufs.d_pos_seqlen.slice(0..);
+    let d_cos = &bufs.d_cos.slice(0..);
+    let d_sin = &bufs.d_sin.slice(0..);
 
     // ── Attention sublayer ────────────────────────────────────────────────────
 
@@ -171,8 +181,8 @@ pub unsafe fn encode_layer_into_ternary(
         &mut bufs.d_k_rope,
         &weights.q_norm,
         &weights.k_norm,
-        &bufs.d_cos,
-        &bufs.d_sin,
+        d_cos,
+        d_sin,
         nq_u32,
         nkv_u32,
         hd_u32,
@@ -192,7 +202,7 @@ pub unsafe fn encode_layer_into_ternary(
         hd_u32,
         nkv_u32,
         max_seq_u32,
-        &bufs.d_pos_seqlen,
+        d_pos_seqlen,
         layer_offset,
     )?;
 
@@ -208,7 +218,7 @@ pub unsafe fn encode_layer_into_ternary(
         nkv_u32,
         heads_per_group_u32,
         max_seq_u32,
-        &bufs.d_pos_seqlen,
+        d_pos_seqlen,
         inv_sqrt_hd,
         layer_offset,
     )?;
@@ -220,7 +230,7 @@ pub unsafe fn encode_layer_into_ternary(
         &mut bufs.d_scores,
         nq_u32,
         max_seq_u32,
-        &bufs.d_pos_seqlen,
+        d_pos_seqlen,
     )?;
 
     // Dispatch 7: Weighted sum — seq_len read from d_pos_seqlen[1]
@@ -235,7 +245,7 @@ pub unsafe fn encode_layer_into_ternary(
         nkv_u32,
         heads_per_group_u32,
         max_seq_u32,
-        &bufs.d_pos_seqlen,
+        d_pos_seqlen,
         layer_offset,
     )?;
 
@@ -365,7 +375,7 @@ fn ternary_model_weights_fingerprint(
 /// (`cached_q1_model_weights`), so Q1 and TQ2 weight sets can never alias.
 fn get_or_build_ternary_model_weights(
     layer_params: &[CudaFullForwardLayerParamsTernary<'_>],
-) -> Option<(Arc<CudaGraph>, Arc<Vec<CudaCachedLayerWeights>>)> {
+) -> Option<CudaResolvedModelWeights> {
     let n_layers = layer_params.len();
     let fingerprint = ternary_model_weights_fingerprint(layer_params);
     let state = full_layer_state();
@@ -377,46 +387,111 @@ fn get_or_build_ternary_model_weights(
         let guard = state.cached_model_weights.lock().ok()?;
         if let Some((fp, cmw)) = guard.as_ref() {
             if *fp == fingerprint && cmw.n_layers == n_layers {
-                return Some((Arc::clone(&cmw.graph), Arc::clone(&cmw.layers)));
+                return Some(CudaResolvedModelWeights {
+                    graph: Arc::clone(&cmw.graph),
+                    layers: Arc::clone(&cmw.layers),
+                    model_epoch: cmw.model_epoch,
+                    weight_fingerprint: cmw.weight_fingerprint,
+                });
             }
         }
     }
 
+    // F-M3: free the previous model's GPU weights *before* uploading this one.
+    // Critical here: the ternary handle ids are `6_000_000 + layer * 10`, i.e.
+    // identical for two same-depth ternary models, so without this eviction the
+    // uploads below hit the previous model's cache entries and this "rebuilt"
+    // weight set would point at the previous model's device buffers. See
+    // `super::evict_cached_model_weights`.
+    let previous = state
+        .cached_model_weights
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take());
+    super::evict_cached_model_weights(previous);
+
     let graph = CudaGraph::global().ok()?;
     let dummy_weight = Arc::new(graph.stream_arc().alloc_zeros::<u8>(1).ok()?);
+    // A fresh epoch per uploaded weight set (findings F-M1 + F-M3).
+    let model_epoch = next_cuda_model_epoch();
+    let mut handle_ids: Vec<u64> = Vec::with_capacity(n_layers * 8);
 
     let mut cached: Vec<CudaCachedLayerWeights> = Vec::with_capacity(n_layers);
     for lp in layer_params {
+        handle_ids.extend_from_slice(&[
+            lp.fused_qkv_handle,
+            lp.attn_proj_handle,
+            lp.gate_up_handle,
+            lp.down_handle,
+            lp.attn_norm_handle,
+            lp.ffn_norm_handle,
+            lp.q_norm_handle,
+            lp.k_norm_handle,
+        ]);
         // TQ2 weights — uploaded as SoA via get_or_upload_weight_tq2_soa
         let q_weight = graph
-            .get_or_upload_weight_tq2_soa(lp.fused_qkv_handle, lp.fused_qkv_bytes)
+            .get_or_upload_weight_tq2_soa_for_epoch(
+                lp.fused_qkv_handle,
+                lp.fused_qkv_bytes,
+                model_epoch,
+            )
             .ok()?;
         let o_weight = graph
-            .get_or_upload_weight_tq2_soa(lp.attn_proj_handle, lp.attn_proj_bytes)
+            .get_or_upload_weight_tq2_soa_for_epoch(
+                lp.attn_proj_handle,
+                lp.attn_proj_bytes,
+                model_epoch,
+            )
             .ok()?;
 
         let gate_bytes = lp.gate_bytes;
         let up_bytes = lp.up_bytes;
         let gate_up_weight = graph
-            .get_or_upload_weight_tq2_soa_lazy(lp.gate_up_handle, || {
-                let mut fused = Vec::with_capacity(gate_bytes.len() + up_bytes.len());
-                fused.extend_from_slice(gate_bytes);
-                fused.extend_from_slice(up_bytes);
-                fused
-            })
+            .get_or_upload_weight_tq2_soa_lazy_for_epoch(
+                lp.gate_up_handle,
+                || {
+                    let mut fused = Vec::with_capacity(gate_bytes.len() + up_bytes.len());
+                    fused.extend_from_slice(gate_bytes);
+                    fused.extend_from_slice(up_bytes);
+                    fused
+                },
+                model_epoch,
+            )
             .ok()?;
 
         let down_weight = graph
-            .get_or_upload_weight_tq2_soa(lp.down_handle, lp.down_bytes)
+            .get_or_upload_weight_tq2_soa_for_epoch(lp.down_handle, lp.down_bytes, model_epoch)
             .ok()?;
 
         // FP32 norm weights — uploaded as plain f32
-        let pre_attn_norm =
-            get_or_upload_f32_weight(&graph, lp.attn_norm_handle, lp.attn_norm_bytes).ok()?;
-        let post_attn_norm =
-            get_or_upload_f32_weight(&graph, lp.ffn_norm_handle, lp.ffn_norm_bytes).ok()?;
-        let q_norm = get_or_upload_f32_weight(&graph, lp.q_norm_handle, lp.q_norm_bytes).ok()?;
-        let k_norm = get_or_upload_f32_weight(&graph, lp.k_norm_handle, lp.k_norm_bytes).ok()?;
+        let pre_attn_norm = get_or_upload_f32_weight_for_epoch(
+            &graph,
+            lp.attn_norm_handle,
+            lp.attn_norm_bytes,
+            model_epoch,
+        )
+        .ok()?;
+        let post_attn_norm = get_or_upload_f32_weight_for_epoch(
+            &graph,
+            lp.ffn_norm_handle,
+            lp.ffn_norm_bytes,
+            model_epoch,
+        )
+        .ok()?;
+        let q_norm = get_or_upload_f32_weight_for_epoch(
+            &graph,
+            lp.q_norm_handle,
+            lp.q_norm_bytes,
+            model_epoch,
+        )
+        .ok()?;
+        let k_norm = get_or_upload_f32_weight_for_epoch(
+            &graph,
+            lp.k_norm_handle,
+            lp.k_norm_bytes,
+            model_epoch,
+        )
+        .ok()?;
 
         cached.push(CudaCachedLayerWeights {
             q_weight,
@@ -433,18 +508,26 @@ fn get_or_build_ternary_model_weights(
     }
 
     let layers = Arc::new(cached);
+    let weight_fingerprint = CudaGraphSlotKey::fingerprint_handles(&handle_ids);
     let cmw = super::CudaCachedModelWeights {
         graph: Arc::clone(&graph),
         dummy_weight,
         layers: Arc::clone(&layers),
         n_layers,
+        model_epoch,
+        weight_fingerprint,
     };
     // Store fingerprint + weights together (atomic under one lock) so a stale
     // fingerprint can never be paired with the wrong cached buffers.
     if let Ok(mut guard) = state.cached_model_weights.lock() {
         *guard = Some((fingerprint, cmw));
     }
-    Some((graph, layers))
+    Some(CudaResolvedModelWeights {
+        graph,
+        layers,
+        model_epoch,
+        weight_fingerprint,
+    })
 }
 
 // =============================================================================
@@ -456,6 +539,12 @@ fn get_or_build_ternary_model_weights(
 /// Mirrors `encode_full_forward` in `encode_q1.rs` but uses TQ2 GEMV dispatches.
 /// CUDA driver graph capture/replay is used for decode-step acceleration after the
 /// first token.
+///
+/// The captured graph shares one process-global slot with the Q1 path, so it is
+/// **keyed** on `(model_epoch, quant_kind, dims, weight handles)` — see
+/// `encode_q1::encode_full_forward`'s "Graph validity" section and finding
+/// **F-M1**. `model_epoch` and `weight_fingerprint` come from
+/// `get_or_build_ternary_model_weights`.
 ///
 /// Returns the final hidden state (post-norm if `final_norm_weight` provided).
 #[allow(clippy::too_many_arguments)]
@@ -476,6 +565,8 @@ pub fn encode_full_forward_ternary(
     max_seq_len: usize,
     final_norm_weight: Option<&[f32]>,
     final_norm_handle: u64,
+    model_epoch: u64,
+    weight_fingerprint: u64,
 ) -> Result<Vec<f32>, CudaGraphError> {
     let h = hidden_size;
     let half_dim = head_dim / 2;
@@ -506,6 +597,21 @@ pub fn encode_full_forward_ternary(
         ));
     }
 
+    // F-M1: everything this capture would only be valid for.
+    let requested_key = build_slot_key(
+        CudaQuantKind::Tq2G128,
+        model_epoch,
+        weight_fingerprint,
+        final_norm_handle,
+        n_layers,
+        hidden_size,
+        nq,
+        nkv,
+        head_dim,
+        max_seq_len,
+        intermediate_size,
+    );
+
     let attn_mods = init_attn_modules(graph)?;
 
     let mut fl_guard =
@@ -530,12 +636,23 @@ pub fn encode_full_forward_ternary(
     }
 
     // ── Fast path: replay captured CUDA graph (every token after the first) ─────
+    // F-M1: only when the stored key matches this call's key. A mismatch drops
+    // the stale holder here (freeing its exec) so the slow path re-captures —
+    // without this, a Q1 model loaded first in the same process kept its graph
+    // in the slot and this ternary forward replayed the Q1 weight pointers.
     {
-        let graph_guard = full_layer_state()
+        let mut graph_guard = full_layer_state()
             .cuda_driver_graph
             .lock()
             .map_err(|_| CudaGraphError::LockPoisoned)?;
-        if let Some(Some(ref holder)) = *graph_guard {
+        let action = slot_action_dropping_stale(&mut graph_guard, &requested_key);
+        if action == CudaGraphSlotAction::Replay {
+            let holder = graph_guard
+                .as_ref()
+                .and_then(|(_, holder)| holder.as_ref())
+                .ok_or_else(|| {
+                    CudaGraphError::DriverError("captured CUDA graph vanished".into())
+                })?;
             unsafe {
                 graph.raw_htod(&hidden_init[..h], &mut bufs.d_hidden, h)?;
                 graph.raw_htod(&rope_cos[..half_dim], &mut bufs.d_cos, half_dim)?;
@@ -587,7 +704,8 @@ pub fn encode_full_forward_ternary(
 
     // Optional final RMSNorm.
     if let Some(fnorm_data) = final_norm_weight {
-        let d_fnorm = get_or_upload_f32_weight(graph, final_norm_handle, fnorm_data)?;
+        let d_fnorm =
+            get_or_upload_f32_weight_for_epoch(graph, final_norm_handle, fnorm_data, model_epoch)?;
         unsafe {
             graph.launch_rmsnorm_pub(
                 &bufs.d_hidden,
@@ -613,7 +731,11 @@ pub fn encode_full_forward_ternary(
     // ── Capture the kernel sequence as a replayable CUDA driver graph ────────────
     {
         if let Ok(ref mut graph_guard) = full_layer_state().cuda_driver_graph.lock() {
-            if graph_guard.is_none() {
+            // F-M1: capture only when the slot is empty or holds a graph for a
+            // different key (whose stale exec is freed here).
+            if slot_action_dropping_stale(graph_guard, &requested_key)
+                == CudaGraphSlotAction::Capture
+            {
                 let begin_ok = stream
                     .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL)
                     .is_ok();
@@ -621,7 +743,7 @@ pub fn encode_full_forward_ternary(
                     warn!(
                         "CUDA graph ternary: begin_capture failed — running without graph replay"
                     );
-                    **graph_guard = Some(None);
+                    **graph_guard = Some((requested_key, None));
                 } else {
                     let record_ok: bool = (|| -> Result<(), CudaGraphError> {
                         for (layer_idx, weights) in all_layer_weights.iter().enumerate() {
@@ -644,8 +766,12 @@ pub fn encode_full_forward_ternary(
                             }
                         }
                         if let Some(fnorm_data) = final_norm_weight {
-                            let d_fnorm =
-                                get_or_upload_f32_weight(graph, final_norm_handle, fnorm_data)?;
+                            let d_fnorm = get_or_upload_f32_weight_for_epoch(
+                                graph,
+                                final_norm_handle,
+                                fnorm_data,
+                                model_epoch,
+                            )?;
                             unsafe {
                                 graph.launch_rmsnorm_pub(
                                     &bufs.d_hidden,
@@ -690,7 +816,7 @@ pub fn encode_full_forward_ternary(
                                     };
                                     match unsafe { holder.upload() } {
                                         Ok(()) => {
-                                            **graph_guard = Some(Some(holder));
+                                            **graph_guard = Some((requested_key, Some(holder)));
                                             tracing::debug!(
                                                 "CUDA ternary graph captured and uploaded"
                                             );
@@ -699,7 +825,7 @@ pub fn encode_full_forward_ternary(
                                             warn!(
                                                 "CUDA ternary graph upload failed: {e} — disabling"
                                             );
-                                            **graph_guard = Some(None);
+                                            **graph_guard = Some((requested_key, None));
                                         }
                                     }
                                 }
@@ -709,17 +835,17 @@ pub fn encode_full_forward_ternary(
                                         let _ =
                                             cudarc::driver::result::graph::destroy(cu_graph_raw);
                                     }
-                                    **graph_guard = Some(None);
+                                    **graph_guard = Some((requested_key, None));
                                 }
                             }
                         }
                         Ok(_) => {
                             warn!("CUDA ternary graph: end_capture returned no graph");
-                            **graph_guard = Some(None);
+                            **graph_guard = Some((requested_key, None));
                         }
                         Err(e) => {
                             warn!("CUDA ternary graph: end_capture error: {e}");
-                            **graph_guard = Some(None);
+                            **graph_guard = Some((requested_key, None));
                         }
                     }
                 }
@@ -777,7 +903,9 @@ pub fn try_cuda_full_forward_ternary(
 ) -> Option<Vec<f32>> {
     let _t0 = profiling().then(std::time::Instant::now);
 
-    let (graph, layer_weights) = get_or_build_ternary_model_weights(layer_params)?;
+    let resolved = get_or_build_ternary_model_weights(layer_params)?;
+    let graph = resolved.graph;
+    let layer_weights = resolved.layers;
 
     let r = encode_full_forward_ternary(
         &graph,
@@ -796,6 +924,8 @@ pub fn try_cuda_full_forward_ternary(
         max_seq_len,
         final_norm_bytes,
         final_norm_handle,
+        resolved.model_epoch,
+        resolved.weight_fingerprint,
     );
     if profiling() {
         if let Some(t0) = _t0 {

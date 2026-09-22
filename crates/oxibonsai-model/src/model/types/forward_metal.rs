@@ -1,7 +1,47 @@
 //! Metal GPU forward-pass methods for `BonsaiModel`.
+//!
+//! All ternary (TQ2_0_g128) paths here share one weight-handle namespace and
+//! one weight-binding prologue, both owned by [`super::gpu_cache`]; see that
+//! module for why (MET-02 / MET-03 / perf-03).
 
 use super::{BonsaiModel, OutputWeight};
-use crate::block::{blocks_as_bytes, blocks_as_bytes_ternary};
+use crate::block::blocks_as_bytes;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+
+/// Test-only override for [`force_ternary_tail_failure`].
+static FORCE_TERNARY_TAIL_FAIL: AtomicBool = AtomicBool::new(false);
+
+/// `OXIBONSAI_FORCE_METAL_TAIL_FAIL` as read once at first use.
+///
+/// Read through a `OnceLock` rather than per call so the decode hot path never
+/// pays for a `getenv`.
+static FORCE_TERNARY_TAIL_FAIL_ENV: OnceLock<bool> = OnceLock::new();
+
+/// Whether the ternary fused forward must fail at its final-norm → LM-head
+/// tail, after every layer's weights are already GPU-resident.
+///
+/// This is the MET-02 fault-injection seam: the double-upload it guards against
+/// is reachable through *any* deterministic tail failure (a missing TQ2 LM-head
+/// pipeline, an `lm_head_out_features` mismatch, a logits-buffer allocation
+/// failure, a GPU fault surfaced by MET-04), none of which can be provoked on
+/// healthy hardware. Set `OXIBONSAI_FORCE_METAL_TAIL_FAIL` to reproduce the
+/// state that used to send `BonsaiModel::forward()` into a second handle
+/// namespace and duplicate the whole model on the GPU.
+fn force_ternary_tail_failure() -> bool {
+    *FORCE_TERNARY_TAIL_FAIL_ENV
+        .get_or_init(|| std::env::var_os("OXIBONSAI_FORCE_METAL_TAIL_FAIL").is_some())
+        || FORCE_TERNARY_TAIL_FAIL.load(Ordering::Relaxed)
+}
+
+/// Turn the [`force_ternary_tail_failure`] seam on or off from a test.
+///
+/// Process-global, like the `MetalGraph` singleton it is used against: callers
+/// must hold the GPU test lock and clear the flag before releasing it.
+#[cfg(test)]
+pub(super) fn set_force_ternary_tail_failure(on: bool) {
+    FORCE_TERNARY_TAIL_FAIL.store(on, Ordering::Relaxed);
+}
 
 impl<'a> BonsaiModel<'a> {
     /// Attempt to run all transformer layers in a single Metal command buffer.
@@ -90,8 +130,8 @@ impl<'a> BonsaiModel<'a> {
                 ),
             });
         }
-        let rope_cos = self.rope.cos_at(pos);
-        let rope_sin = self.rope.sin_at(pos);
+        let rope_cos = self.rope.cos_at_checked(pos)?;
+        let rope_sin = self.rope.sin_at_checked(pos)?;
         oxibonsai_kernels::try_metal_full_forward(
             hidden,
             pos,
@@ -130,13 +170,19 @@ impl<'a> BonsaiModel<'a> {
     /// and ternary block slices. Returns `Err` if any block is not ternary or
     /// the Metal dispatch fails — in which case the caller should fall back
     /// to the CPU per-layer path.
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    ///
+    /// This is the path `BonsaiModel::forward()` drops into when the fused
+    /// final-norm → LM-head route fails. It used to carry its own weight-handle
+    /// namespace (`2_000_000` / `3_000_000` bases), so that fallback uploaded a
+    /// **second full copy** of the model; it now shares the one
+    /// address-derived slot table with every other ternary path
+    /// ([`super::gpu_cache`]), so the fallback is a sequence of cache hits
+    /// (MET-02).
     pub(super) fn try_metal_full_forward_ternary_inner(
         &self,
         hidden: &mut [f32],
         pos: usize,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        use oxibonsai_kernels::FullForwardLayerParamsTernary;
         let n_layers = self.blocks.len();
         if n_layers == 0 {
             return Err("no blocks".into());
@@ -148,88 +194,14 @@ impl<'a> BonsaiModel<'a> {
         let nkv = self.config.num_kv_heads;
         let hd = self.config.head_dim;
         let max_seq_len = self.kv_cache.max_seq_len();
-        for block in &self.blocks {
-            if block.attn_q_blocks_ternary().is_none()
-                || block.attn_k_blocks_ternary().is_none()
-                || block.attn_v_blocks_ternary().is_none()
-                || block.attn_output_blocks_ternary().is_none()
-                || block.ffn_gate_blocks_ternary().is_none()
-                || block.ffn_up_blocks_ternary().is_none()
-                || block.ffn_down_blocks_ternary().is_none()
-            {
-                return Err("non-ternary block on ternary full-forward path".into());
-            }
-        }
-        let mut qkv_concats: Vec<Vec<u8>> = Vec::with_capacity(n_layers);
-        for block in &self.blocks {
-            let q_bytes = blocks_as_bytes_ternary(
-                block
-                    .attn_q_blocks_ternary()
-                    .ok_or("attn_q: not a ternary layer")?,
-            );
-            let k_bytes = blocks_as_bytes_ternary(
-                block
-                    .attn_k_blocks_ternary()
-                    .ok_or("attn_k: not a ternary layer")?,
-            );
-            let v_bytes = blocks_as_bytes_ternary(
-                block
-                    .attn_v_blocks_ternary()
-                    .ok_or("attn_v: not a ternary layer")?,
-            );
-            let mut concat = Vec::with_capacity(q_bytes.len() + k_bytes.len() + v_bytes.len());
-            concat.extend_from_slice(q_bytes);
-            concat.extend_from_slice(k_bytes);
-            concat.extend_from_slice(v_bytes);
-            qkv_concats.push(concat);
-        }
-        let mut layer_params: Vec<FullForwardLayerParamsTernary<'_>> = Vec::with_capacity(n_layers);
-        for (i, block) in self.blocks.iter().enumerate() {
-            let norm_handle_base = 2_000_000u64 + (block.layer_index() as u64) * 10;
-            let weight_handle_base = 3_000_000u64 + (block.layer_index() as u64) * 10;
-            layer_params.push(FullForwardLayerParamsTernary {
-                attn_norm_handle: norm_handle_base,
-                attn_norm_bytes: block.attn_norm_weight(),
-                fused_qkv_handle: weight_handle_base,
-                fused_qkv_bytes: &qkv_concats[i],
-                q_norm_handle: norm_handle_base + 1,
-                q_norm_bytes: block.q_norm_weight(),
-                k_norm_handle: norm_handle_base + 2,
-                k_norm_bytes: block.k_norm_weight(),
-                attn_proj_handle: weight_handle_base + 1,
-                attn_proj_bytes: blocks_as_bytes_ternary(
-                    block
-                        .attn_output_blocks_ternary()
-                        .ok_or("attn_output: not a ternary layer")?,
-                ),
-                ffn_norm_handle: norm_handle_base + 3,
-                ffn_norm_bytes: block.ffn_norm_weight(),
-                gate_up_handle: weight_handle_base + 2,
-                gate_bytes: blocks_as_bytes_ternary(
-                    block
-                        .ffn_gate_blocks_ternary()
-                        .ok_or("ffn_gate: not a ternary layer")?,
-                ),
-                up_bytes: blocks_as_bytes_ternary(
-                    block
-                        .ffn_up_blocks_ternary()
-                        .ok_or("ffn_up: not a ternary layer")?,
-                ),
-                down_handle: weight_handle_base + 3,
-                down_bytes: blocks_as_bytes_ternary(
-                    block
-                        .ffn_down_blocks_ternary()
-                        .ok_or("ffn_down: not a ternary layer")?,
-                ),
-            });
-        }
-        let rope_cos = self.rope.cos_at(pos);
-        let rope_sin = self.rope.sin_at(pos);
+        let binding = self.ternary_gpu_binding()?;
+        let rope_cos = self.rope.cos_at_checked(pos)?;
+        let rope_sin = self.rope.sin_at_checked(pos)?;
         oxibonsai_kernels::try_metal_full_forward_ternary(
             hidden,
             pos,
             n_layers,
-            &layer_params,
+            &binding.layer_params,
             rope_cos,
             rope_sin,
             h,
@@ -285,7 +257,9 @@ impl<'a> BonsaiModel<'a> {
 
         let lm_head_linear = match &self.output_weight {
             OutputWeight::OneBit(linear) => linear,
-            OutputWeight::Ternary(_) => unreachable!("handled above"),
+            OutputWeight::Ternary(_) => {
+                return Err("ternary LM head reached the Q1 fused GPU path".into())
+            }
             OutputWeight::FP8E4M3(_) | OutputWeight::FP8E5M2(_) => {
                 return Err("FP8 GPU inference not yet supported; use CPU path".into());
             }
@@ -376,8 +350,8 @@ impl<'a> BonsaiModel<'a> {
                 ),
             });
         }
-        let rope_cos = self.rope.cos_at(pos);
-        let rope_sin = self.rope.sin_at(pos);
+        let rope_cos = self.rope.cos_at_checked(pos)?;
+        let rope_sin = self.rope.sin_at_checked(pos)?;
         let final_norm_handle = 2_000_000u64;
         let final_norm_bytes = self.output_norm.weight();
         let final_norm_eps = self.output_norm.eps();
@@ -439,12 +413,13 @@ impl<'a> BonsaiModel<'a> {
         }
         // Context-length guard (mirrors the single-token `forward()` check at
         // model/types/mod.rs and the CUDA prefill guards in forward_cuda/*).
-        // The batched RoPE gather below indexes `self.rope.cos_at(pos_start + t)`
-        // with no bound, and `RopeTable` is sized to exactly `max_seq_len` rows —
-        // a prompt that overflows the context would slice out of bounds and panic
-        // inside the request task. Returning Err makes `forward_prefill` fall back
-        // to the sequential path, whose per-token `forward()` returns a clean
-        // `ModelError::SequenceTooLong`.
+        // The batched RoPE gather below reads `self.rope.cos_at_checked(pos_start
+        // + t)`, and `RopeTable` is sized to exactly `max_seq_len` rows. The
+        // checked accessor is the backstop (it returns
+        // `ModelError::PositionOutOfRange` where the old unchecked slice
+        // panicked); this guard is what produces the message callers match on and
+        // what makes `forward_prefill` fall back to the sequential path, whose
+        // per-token `forward()` returns a clean `ModelError::SequenceTooLong`.
         if pos_start + batch_size > self.kv_cache.max_seq_len() {
             return Err(format!(
                 "prefill sequence too long: {batch_size} tokens at pos {pos_start} exceeds max_seq_len {}",
@@ -496,26 +471,18 @@ impl<'a> BonsaiModel<'a> {
             }
         }
         let mut hidden_batch = vec![0.0f32; batch_size * h];
-        for (t, &token_id) in token_ids.iter().enumerate() {
-            let embd_start = token_id as usize * h;
-            let embd_end = embd_start + h;
-            if embd_end > self.token_embd.len() {
-                return Err(format!(
-                    "token_id {} out of range (vocab={})",
-                    token_id,
-                    self.token_embd.len() / h
-                )
-                .into());
-            }
-            hidden_batch[t * h..(t + 1) * h]
-                .copy_from_slice(&self.token_embd[embd_start..embd_end]);
-        }
+        // M-02: gather only the rows this batch references, decoding each
+        // straight out of the quantized table. The deleted dense
+        // `Index<Range<usize>>` hatch materialized the whole
+        // `vocab x hidden` FP32 table here (1.16 / 2.31 / 4.74 GiB for the
+        // 1.7B / 8B / 27B) on the first multi-token prompt.
+        self.token_embd.copy_rows(token_ids, &mut hidden_batch)?;
         let mut cos_table = vec![0.0f32; batch_size * half_dim];
         let mut sin_table = vec![0.0f32; batch_size * half_dim];
         for t in 0..batch_size {
             let pos = pos_start + t;
-            let cos_vals = self.rope.cos_at(pos);
-            let sin_vals = self.rope.sin_at(pos);
+            let cos_vals = self.rope.cos_at_checked(pos)?;
+            let sin_vals = self.rope.sin_at_checked(pos)?;
             cos_table[t * half_dim..(t + 1) * half_dim].copy_from_slice(cos_vals);
             sin_table[t * half_dim..(t + 1) * half_dim].copy_from_slice(sin_vals);
         }
@@ -693,26 +660,18 @@ impl<'a> BonsaiModel<'a> {
             }
         }
         let mut hidden_batch = vec![0.0f32; batch_size * h];
-        for (t, &token_id) in token_ids.iter().enumerate() {
-            let embd_start = token_id as usize * h;
-            let embd_end = embd_start + h;
-            if embd_end > self.token_embd.len() {
-                return Err(format!(
-                    "token_id {} out of range (vocab={})",
-                    token_id,
-                    self.token_embd.len() / h
-                )
-                .into());
-            }
-            hidden_batch[t * h..(t + 1) * h]
-                .copy_from_slice(&self.token_embd[embd_start..embd_end]);
-        }
+        // M-02: gather only the rows this batch references, decoding each
+        // straight out of the quantized table. The deleted dense
+        // `Index<Range<usize>>` hatch materialized the whole
+        // `vocab x hidden` FP32 table here (1.16 / 2.31 / 4.74 GiB for the
+        // 1.7B / 8B / 27B) on the first multi-token prompt.
+        self.token_embd.copy_rows(token_ids, &mut hidden_batch)?;
         let mut cos_table = vec![0.0f32; batch_size * half_dim];
         let mut sin_table = vec![0.0f32; batch_size * half_dim];
         for t in 0..batch_size {
             let pos = pos_start + t;
-            let cos_vals = self.rope.cos_at(pos);
-            let sin_vals = self.rope.sin_at(pos);
+            let cos_vals = self.rope.cos_at_checked(pos)?;
+            let sin_vals = self.rope.sin_at_checked(pos)?;
             cos_table[t * half_dim..(t + 1) * half_dim].copy_from_slice(cos_vals);
             sin_table[t * half_dim..(t + 1) * half_dim].copy_from_slice(sin_vals);
         }
@@ -835,16 +794,32 @@ impl<'a> BonsaiModel<'a> {
         pos: usize,
     ) -> Result<u32, Box<dyn std::error::Error>> {
         // Context-length guard (mirrors the single-token `forward()` check at
-        // model/types/mod.rs). `self.rope.cos_at(pos)` below does an unchecked
-        // slice into a `RopeTable` sized to exactly `max_seq_len` rows, so
-        // `pos >= max_seq_len` would panic; returning Err instead lets the
-        // engine's decode loop fall back to the guarded sequential path.
+        // model/types/mod.rs). `self.rope.cos_at_checked(pos)` below reads a
+        // `RopeTable` sized to exactly `max_seq_len` rows and errors rather than
+        // panicking past it; this guard returns the named Err first, which lets
+        // the engine's decode loop fall back to the guarded sequential path.
         if pos >= self.kv_cache.max_seq_len() {
             return Err(format!(
                 "greedy sequence too long: pos {pos} exceeds max_seq_len {}",
                 self.kv_cache.max_seq_len()
             )
             .into());
+        }
+        // M-17 gate (out-of-owned-files fix; see FIX3-MODEL wave-3.5 notes):
+        // this fused-Metal entry point attends over the *full* KV cache with
+        // no windowing, and is reached directly from
+        // `engine_greedy::greedy_decode_token_with_fallback` rather than
+        // through `BonsaiModel::forward`/`forward_into`, so the
+        // `sliding_window.is_none()` gate there cannot cover it. Refuse here
+        // so a windowed model falls back to the guarded CPU sequential path
+        // (which already replays the committed tokens and recovers on any
+        // `Err`) instead of silently decoding with full causal attention.
+        // Also covers `forward_greedy_gpu_ternary`, called only from below.
+        if self.config.sliding_window.is_some() {
+            return Err(
+                "sliding-window model: fused Metal greedy decode is full-causal; falling back to CPU"
+                    .into(),
+            );
         }
         let h = self.config.hidden_size;
         let inter = self.config.intermediate_size;
@@ -867,7 +842,9 @@ impl<'a> BonsaiModel<'a> {
 
         let lm_head_out_features = match &self.output_weight {
             OutputWeight::OneBit(linear) => linear.out_features(),
-            OutputWeight::Ternary(_) => unreachable!("handled above"),
+            OutputWeight::Ternary(_) => {
+                return Err("ternary LM head reached the Q1 greedy GPU path".into())
+            }
             OutputWeight::FP8E4M3(_) | OutputWeight::FP8E5M2(_) => {
                 return Err("FP8 GPU inference not yet supported; use CPU path".into());
             }
@@ -889,19 +866,12 @@ impl<'a> BonsaiModel<'a> {
             }
         };
         self.get_or_create_gpu_cache()?;
-        let embd_start = token_id as usize * h;
-        let embd_end = embd_start + h;
-        if embd_end > self.token_embd.len() {
-            return Err(format!(
-                "token_id {} out of range (vocab={})",
-                token_id,
-                self.token_embd.len() / h
-            )
-            .into());
-        }
-        let mut hidden = self.token_embd[embd_start..embd_end].to_vec();
-        let rope_cos = self.rope.cos_at(pos);
-        let rope_sin = self.rope.sin_at(pos);
+        // M-02: decode exactly this one row out of the quantized table
+        // instead of indexing a materialized dense view of all of it.
+        let mut hidden = vec![0.0f32; h];
+        self.token_embd.copy_row(token_id, &mut hidden)?;
+        let rope_cos = self.rope.cos_at_checked(pos)?;
+        let rope_sin = self.rope.sin_at_checked(pos)?;
         let mut greedy_token_id: u32 = 0;
         let guard = self
             .gpu_weight_cache
@@ -930,25 +900,29 @@ impl<'a> BonsaiModel<'a> {
             tracing::warn!(error = % e, "cached greedy GPU forward failed");
             Box::new(e) as Box<dyn std::error::Error>
         })?;
+        // MET-05 (runtime half): this path maintains the DEVICE KV cache and
+        // never writes the host one, so latch the backend before returning —
+        // otherwise a later CPU step would attend over an all-zero history and
+        // return confident garbage instead of asking for a cache rebuild.
+        self.note_device_kv_used();
         Ok(greedy_token_id)
     }
 
     /// Ternary-model greedy decode: all transformer layers + ternary LM head + GPU argmax.
     ///
-    /// Uses the pre-cached byte slices from `gpu_weight_cache` to build
-    /// `FullForwardLayerParamsTernary` and dispatch through the TQ2 Metal kernel.
-    /// On the first call the cache is populated (byte copies + GPU uploads);
-    /// subsequent calls reuse the kernel-side weight cache.
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    /// Builds `FullForwardLayerParamsTernary` from borrowed mmap slices and
+    /// dispatches through the TQ2 Metal kernel. The first call uploads every
+    /// weight to the GPU (`get_or_create_gpu_cache`); subsequent calls hit the
+    /// kernel-side weight cache and retain no host copy of the weights
+    /// (MET-03).
     fn forward_greedy_gpu_ternary(
         &self,
         token_id: u32,
         pos: usize,
     ) -> Result<u32, Box<dyn std::error::Error>> {
-        use oxibonsai_kernels::{CachedModelWeights, FullForwardLayerParamsTernary};
-        // Context-length guard: `self.rope.cos_at(pos)` below indexes a
-        // `RopeTable` sized to exactly `max_seq_len` rows; `pos >= max_seq_len`
-        // would panic. Mirrors the single-token `forward()` check.
+        // Context-length guard: `self.rope.cos_at_checked(pos)` below reads a
+        // `RopeTable` sized to exactly `max_seq_len` rows and errors past it.
+        // Mirrors the single-token `forward()` check, which owns the message.
         if pos >= self.kv_cache.max_seq_len() {
             return Err(format!(
                 "ternary greedy sequence too long: pos {pos} exceeds max_seq_len {}",
@@ -972,78 +946,36 @@ impl<'a> BonsaiModel<'a> {
 
         self.get_or_create_gpu_cache()?;
 
-        let embd_start = token_id as usize * h;
-        let embd_end = embd_start + h;
-        if embd_end > self.token_embd.len() {
-            return Err(format!(
-                "token_id {} out of range (vocab={})",
-                token_id,
-                self.token_embd.len() / h
-            )
-            .into());
-        }
-        let mut hidden = self.token_embd[embd_start..embd_end].to_vec();
-        let rope_cos = self.rope.cos_at(pos);
-        let rope_sin = self.rope.sin_at(pos);
+        // M-02: decode exactly this one row out of the quantized table
+        // instead of indexing a materialized dense view of all of it.
+        let mut hidden = vec![0.0f32; h];
+        self.token_embd.copy_row(token_id, &mut hidden)?;
+        let rope_cos = self.rope.cos_at_checked(pos)?;
+        let rope_sin = self.rope.sin_at_checked(pos)?;
         let mut greedy_token_id: u32 = 0;
 
-        let guard = self
-            .gpu_weight_cache
-            .lock()
-            .map_err(|e| format!("gpu_weight_cache lock: {e}"))?;
-        let cached = guard.as_ref().ok_or("GPU weight cache not populated")?;
-        let cached = match cached {
-            CachedModelWeights::Ternary(tern) => tern,
-            CachedModelWeights::Q1(_) => {
-                return Err("ternary greedy GPU path invoked with a Q1 weight cache".into());
-            }
-        };
-
-        if cached.qkv_concats.len() != n_layers {
+        // Guards that the populated cache really is the ternary one (it used to
+        // be the `qkv_concats.len()` check on the host byte copies this path no
+        // longer keeps).
+        let cached_out_features = self.ternary_gpu_cache_out_features()?;
+        let binding = self.ternary_gpu_binding()?;
+        let tail = binding
+            .tail
+            .ok_or("ternary greedy GPU path requires a ternary LM head")?;
+        if tail.lm_head_out_features != cached_out_features {
             return Err(format!(
-                "ternary cache layer count mismatch: expected {n_layers}, got {}",
-                cached.qkv_concats.len()
+                "ternary LM-head row count changed since the GPU cache was built: cache says \
+                 {cached_out_features}, model says {}",
+                tail.lm_head_out_features
             )
             .into());
         }
-
-        // Build FullForwardLayerParamsTernary referencing cached byte slices.
-        // These are cheap struct literals — no allocation beyond the Vec header.
-        let mut layer_params: Vec<FullForwardLayerParamsTernary<'_>> = Vec::with_capacity(n_layers);
-        for (i, block) in self.blocks.iter().enumerate() {
-            let norm_handle_base = 5_000_000u64 + (block.layer_index() as u64) * 10;
-            let weight_handle_base = 6_000_000u64 + (block.layer_index() as u64) * 10;
-            layer_params.push(FullForwardLayerParamsTernary {
-                attn_norm_handle: norm_handle_base,
-                attn_norm_bytes: block.attn_norm_weight(),
-                fused_qkv_handle: weight_handle_base,
-                fused_qkv_bytes: &cached.qkv_concats[i],
-                q_norm_handle: norm_handle_base + 1,
-                q_norm_bytes: block.q_norm_weight(),
-                k_norm_handle: norm_handle_base + 2,
-                k_norm_bytes: block.k_norm_weight(),
-                attn_proj_handle: weight_handle_base + 1,
-                attn_proj_bytes: &cached.attn_proj_bytes[i],
-                ffn_norm_handle: norm_handle_base + 3,
-                ffn_norm_bytes: block.ffn_norm_weight(),
-                gate_up_handle: weight_handle_base + 2,
-                gate_bytes: &cached.gate_bytes[i],
-                up_bytes: &cached.up_bytes[i],
-                down_handle: weight_handle_base + 3,
-                down_bytes: &cached.down_bytes[i],
-            });
-        }
-        let final_norm_handle = 5_900_000u64;
-        let final_norm_bytes = self.output_norm.weight();
-        let lm_head_handle = 7_000_000u64;
-        let lm_head_bytes = &cached.lm_head_bytes;
-        let lm_head_out_features = cached.lm_head_out_features;
 
         oxibonsai_kernels::try_metal_forward_greedy_ternary(
             &mut hidden,
             pos,
             n_layers,
-            &layer_params,
+            &binding.layer_params,
             rope_cos,
             rope_sin,
             h,
@@ -1053,33 +985,39 @@ impl<'a> BonsaiModel<'a> {
             hd,
             eps,
             max_seq_len,
-            Some(final_norm_handle),
-            Some(final_norm_bytes),
+            Some(tail.final_norm_handle),
+            Some(tail.final_norm_bytes),
             final_norm_eps,
-            Some(lm_head_handle),
-            Some(lm_head_bytes),
-            lm_head_out_features,
+            Some(tail.lm_head_handle),
+            Some(tail.lm_head_bytes),
+            tail.lm_head_out_features,
             &mut greedy_token_id,
         )
         .map_err(|e| {
             tracing::warn!(error = % e, "ternary greedy GPU forward failed");
             Box::new(e) as Box<dyn std::error::Error>
         })?;
+        // MET-05 (runtime half) — see `forward_greedy_gpu`.
+        self.note_device_kv_used();
         Ok(greedy_token_id)
     }
 
     /// Ternary fused forward + LM head (single token, non-greedy sampling).
     ///
-    /// Routes the decode hot-path for ternary models through the GPU TQ2 kernel.
-    /// Uses the same cached byte slices as `forward_greedy_gpu_ternary`.
-    #[cfg(all(feature = "metal", target_os = "macos"))]
-    fn try_metal_full_forward_with_lm_head_ternary(
+    /// Routes the decode hot-path for ternary models through the GPU TQ2 kernel,
+    /// binding every weight from a borrowed mmap slice (MET-03). This is the
+    /// call `BonsaiModel::forward()` makes first; when it fails, `forward()`
+    /// retries through [`Self::try_metal_full_forward_ternary_inner`], which
+    /// since MET-02 resolves to the very same weight slots.
+    ///
+    /// `pub(super)` so the MET-02 regression test can drive it and the fallback
+    /// directly, in the order `forward()` does.
+    pub(super) fn try_metal_full_forward_with_lm_head_ternary(
         &self,
         hidden: &mut [f32],
         pos: usize,
         logits: &mut Vec<f32>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        use oxibonsai_kernels::{CachedModelWeights, FullForwardLayerParamsTernary};
         let n_layers = self.blocks.len();
         let h = self.config.hidden_size;
         let inter = self.config.intermediate_size;
@@ -1096,63 +1034,41 @@ impl<'a> BonsaiModel<'a> {
 
         self.get_or_create_gpu_cache()?;
 
-        let guard = self
-            .gpu_weight_cache
-            .lock()
-            .map_err(|e| format!("gpu_weight_cache lock: {e}"))?;
-        let cached = guard.as_ref().ok_or("GPU weight cache not populated")?;
-        let cached = match cached {
-            CachedModelWeights::Ternary(tern) => tern,
-            CachedModelWeights::Q1(_) => {
-                return Err("ternary fused GPU path invoked with a Q1 weight cache".into());
-            }
-        };
-
-        if cached.qkv_concats.len() != n_layers {
+        let cached_out_features = self.ternary_gpu_cache_out_features()?;
+        let binding = self.ternary_gpu_binding()?;
+        let tail = binding
+            .tail
+            .ok_or("ternary fused GPU path requires a ternary LM head")?;
+        if tail.lm_head_out_features != cached_out_features {
             return Err(format!(
-                "ternary cache layer count mismatch: expected {n_layers}, got {}",
-                cached.qkv_concats.len()
+                "ternary LM-head row count changed since the GPU cache was built: cache says \
+                 {cached_out_features}, model says {}",
+                tail.lm_head_out_features
             )
             .into());
         }
 
-        let mut layer_params: Vec<FullForwardLayerParamsTernary<'_>> = Vec::with_capacity(n_layers);
-        for (i, block) in self.blocks.iter().enumerate() {
-            let norm_handle_base = 5_000_000u64 + (block.layer_index() as u64) * 10;
-            let weight_handle_base = 6_000_000u64 + (block.layer_index() as u64) * 10;
-            layer_params.push(FullForwardLayerParamsTernary {
-                attn_norm_handle: norm_handle_base,
-                attn_norm_bytes: block.attn_norm_weight(),
-                fused_qkv_handle: weight_handle_base,
-                fused_qkv_bytes: &cached.qkv_concats[i],
-                q_norm_handle: norm_handle_base + 1,
-                q_norm_bytes: block.q_norm_weight(),
-                k_norm_handle: norm_handle_base + 2,
-                k_norm_bytes: block.k_norm_weight(),
-                attn_proj_handle: weight_handle_base + 1,
-                attn_proj_bytes: &cached.attn_proj_bytes[i],
-                ffn_norm_handle: norm_handle_base + 3,
-                ffn_norm_bytes: block.ffn_norm_weight(),
-                gate_up_handle: weight_handle_base + 2,
-                gate_bytes: &cached.gate_bytes[i],
-                up_bytes: &cached.up_bytes[i],
-                down_handle: weight_handle_base + 3,
-                down_bytes: &cached.down_bytes[i],
-            });
+        // MET-02 fault-injection seam. Every layer's weights are resident by
+        // now and only the final-norm → LM-head tail is left, which is exactly
+        // the state a real deterministic tail failure (missing TQ2 LM-head
+        // pipeline, logits-buffer allocation failure, GPU fault) leaves behind —
+        // the state that used to send `forward()` into a second, separate
+        // handle namespace and duplicate the whole model on the GPU. Returning
+        // here reproduces it without needing a broken GPU.
+        if force_ternary_tail_failure() {
+            return Err(
+                "ternary fused GPU tail failure forced by OXIBONSAI_FORCE_METAL_TAIL_FAIL".into(),
+            );
         }
-        let rope_cos = self.rope.cos_at(pos);
-        let rope_sin = self.rope.sin_at(pos);
-        let final_norm_handle = 5_900_000u64;
-        let final_norm_bytes = self.output_norm.weight();
-        let lm_head_handle = 7_000_000u64;
-        let lm_head_bytes = &cached.lm_head_bytes;
-        let lm_head_out_features = cached.lm_head_out_features;
+
+        let rope_cos = self.rope.cos_at_checked(pos)?;
+        let rope_sin = self.rope.sin_at_checked(pos)?;
 
         oxibonsai_kernels::try_metal_prefill_ternary(
             hidden,
             pos,
             n_layers,
-            &layer_params,
+            &binding.layer_params,
             rope_cos,
             rope_sin,
             h,
@@ -1162,12 +1078,12 @@ impl<'a> BonsaiModel<'a> {
             hd,
             eps,
             max_seq_len,
-            Some(final_norm_handle),
-            Some(final_norm_bytes),
+            Some(tail.final_norm_handle),
+            Some(tail.final_norm_bytes),
             final_norm_eps,
-            Some(lm_head_handle),
-            Some(lm_head_bytes),
-            lm_head_out_features,
+            Some(tail.lm_head_handle),
+            Some(tail.lm_head_bytes),
+            tail.lm_head_out_features,
             logits,
         )
         .map_err(|e| {
@@ -1193,7 +1109,6 @@ impl<'a> BonsaiModel<'a> {
         token_ids: &[u32],
         pos_start: usize,
     ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-        use oxibonsai_kernels::FullForwardLayerParamsTernary;
         let batch_size = token_ids.len();
         let n_layers = self.blocks.len();
         if n_layers == 0 {
@@ -1209,10 +1124,9 @@ impl<'a> BonsaiModel<'a> {
             )
             .into());
         }
-        let lm_head_linear = match &self.output_weight {
-            OutputWeight::Ternary(linear) => linear,
-            _ => return Err("ternary prefill called on non-ternary model".into()),
-        };
+        if !matches!(&self.output_weight, OutputWeight::Ternary(_)) {
+            return Err("ternary prefill called on non-ternary model".into());
+        }
         let eps = self.blocks[0].attn_norm_eps();
         let h = self.config.hidden_size;
         let inter = self.config.intermediate_size;
@@ -1224,134 +1138,43 @@ impl<'a> BonsaiModel<'a> {
 
         // Embed prompt tokens into `[batch × hidden]` column-major layout.
         let mut hidden_batch = vec![0.0f32; batch_size * h];
-        for (t, &token_id) in token_ids.iter().enumerate() {
-            let embd_start = token_id as usize * h;
-            let embd_end = embd_start + h;
-            if embd_end > self.token_embd.len() {
-                return Err(format!(
-                    "token_id {} out of range (vocab={})",
-                    token_id,
-                    self.token_embd.len() / h
-                )
-                .into());
-            }
-            hidden_batch[t * h..(t + 1) * h]
-                .copy_from_slice(&self.token_embd[embd_start..embd_end]);
-        }
+        // M-02: gather only the rows this batch references, decoding each
+        // straight out of the quantized table. The deleted dense
+        // `Index<Range<usize>>` hatch materialized the whole
+        // `vocab x hidden` FP32 table here (1.16 / 2.31 / 4.74 GiB for the
+        // 1.7B / 8B / 27B) on the first multi-token prompt.
+        self.token_embd.copy_rows(token_ids, &mut hidden_batch)?;
 
         // Pre-compute RoPE cos/sin tables for every position in the batch.
         let mut cos_table = vec![0.0f32; batch_size * half_dim];
         let mut sin_table = vec![0.0f32; batch_size * half_dim];
         for t in 0..batch_size {
             let pos = pos_start + t;
-            let cos_vals = self.rope.cos_at(pos);
-            let sin_vals = self.rope.sin_at(pos);
+            let cos_vals = self.rope.cos_at_checked(pos)?;
+            let sin_vals = self.rope.sin_at_checked(pos)?;
             cos_table[t * half_dim..(t + 1) * half_dim].copy_from_slice(cos_vals);
             sin_table[t * half_dim..(t + 1) * half_dim].copy_from_slice(sin_vals);
         }
 
-        // Build per-layer ternary parameters: concatenate Q+K+V byte slices
-        // per layer (mirrors what the per-position ternary forward does).
-        let mut qkv_concats: Vec<Vec<u8>> = Vec::with_capacity(n_layers);
-        let mut attn_proj_bytes_per_layer: Vec<Vec<u8>> = Vec::with_capacity(n_layers);
-        let mut gate_bytes_per_layer: Vec<Vec<u8>> = Vec::with_capacity(n_layers);
-        let mut up_bytes_per_layer: Vec<Vec<u8>> = Vec::with_capacity(n_layers);
-        let mut down_bytes_per_layer: Vec<Vec<u8>> = Vec::with_capacity(n_layers);
-        for block in &self.blocks {
-            let q_bytes = blocks_as_bytes_ternary(
-                block
-                    .attn_q_blocks_ternary()
-                    .ok_or("attn_q: not a ternary layer")?,
-            );
-            let k_bytes = blocks_as_bytes_ternary(
-                block
-                    .attn_k_blocks_ternary()
-                    .ok_or("attn_k: not a ternary layer")?,
-            );
-            let v_bytes = blocks_as_bytes_ternary(
-                block
-                    .attn_v_blocks_ternary()
-                    .ok_or("attn_v: not a ternary layer")?,
-            );
-            let mut concat = Vec::with_capacity(q_bytes.len() + k_bytes.len() + v_bytes.len());
-            concat.extend_from_slice(q_bytes);
-            concat.extend_from_slice(k_bytes);
-            concat.extend_from_slice(v_bytes);
-            qkv_concats.push(concat);
-            attn_proj_bytes_per_layer.push(
-                blocks_as_bytes_ternary(
-                    block
-                        .attn_output_blocks_ternary()
-                        .ok_or("attn_output: not a ternary layer")?,
-                )
-                .to_vec(),
-            );
-            gate_bytes_per_layer.push(
-                blocks_as_bytes_ternary(
-                    block
-                        .ffn_gate_blocks_ternary()
-                        .ok_or("ffn_gate: not a ternary layer")?,
-                )
-                .to_vec(),
-            );
-            up_bytes_per_layer.push(
-                blocks_as_bytes_ternary(
-                    block
-                        .ffn_up_blocks_ternary()
-                        .ok_or("ffn_up: not a ternary layer")?,
-                )
-                .to_vec(),
-            );
-            down_bytes_per_layer.push(
-                blocks_as_bytes_ternary(
-                    block
-                        .ffn_down_blocks_ternary()
-                        .ok_or("ffn_down: not a ternary layer")?,
-                )
-                .to_vec(),
-            );
-        }
-
-        let mut layer_params: Vec<FullForwardLayerParamsTernary<'_>> = Vec::with_capacity(n_layers);
-        for (i, block) in self.blocks.iter().enumerate() {
-            let norm_handle_base = 5_000_000u64 + (block.layer_index() as u64) * 10;
-            let weight_handle_base = 6_000_000u64 + (block.layer_index() as u64) * 10;
-            layer_params.push(FullForwardLayerParamsTernary {
-                attn_norm_handle: norm_handle_base,
-                attn_norm_bytes: block.attn_norm_weight(),
-                fused_qkv_handle: weight_handle_base,
-                fused_qkv_bytes: &qkv_concats[i],
-                q_norm_handle: norm_handle_base + 1,
-                q_norm_bytes: block.q_norm_weight(),
-                k_norm_handle: norm_handle_base + 2,
-                k_norm_bytes: block.k_norm_weight(),
-                attn_proj_handle: weight_handle_base + 1,
-                attn_proj_bytes: &attn_proj_bytes_per_layer[i],
-                ffn_norm_handle: norm_handle_base + 3,
-                ffn_norm_bytes: block.ffn_norm_weight(),
-                gate_up_handle: weight_handle_base + 2,
-                gate_bytes: &gate_bytes_per_layer[i],
-                up_bytes: &up_bytes_per_layer[i],
-                down_handle: weight_handle_base + 3,
-                down_bytes: &down_bytes_per_layer[i],
-            });
-        }
-
-        let final_norm_handle = 5_900_000u64;
-        let final_norm_bytes = self.output_norm.weight();
+        // Bind every layer's weights from borrowed mmap slices. This used to
+        // rebuild five `Vec<Vec<u8>>` — the whole quantized model, 82 MB for
+        // the 1.7B LM head alone — on **every** call, with no memoization,
+        // while the GPU side was already handle-cached (perf-03). The one
+        // layout that has to be materialized, Q‖K‖V, is now built inside the
+        // upload closure on a cache miss only.
         let final_norm_eps = self.output_norm.eps();
-        let lm_head_handle = 7_000_000u64;
-        let lm_head_bytes_vec = blocks_as_bytes_ternary(lm_head_linear.blocks()).to_vec();
-        let lm_head_bytes: &[u8] = &lm_head_bytes_vec;
-        let lm_head_out_features = lm_head_linear.out_features();
+        let binding = self.ternary_gpu_binding()?;
+        let tail = binding
+            .tail
+            .ok_or("ternary prefill requires a ternary LM head")?;
 
-        let mut logits = vec![0.0f32; lm_head_out_features];
+        let mut logits = vec![0.0f32; tail.lm_head_out_features];
         oxibonsai_kernels::try_metal_full_forward_prefill_ternary(
             &hidden_batch,
             batch_size,
             pos_start,
             n_layers,
-            &layer_params,
+            &binding.layer_params,
             &cos_table,
             &sin_table,
             h,
@@ -1361,12 +1184,12 @@ impl<'a> BonsaiModel<'a> {
             hd,
             eps,
             max_seq_len,
-            Some(final_norm_handle),
-            Some(final_norm_bytes),
+            Some(tail.final_norm_handle),
+            Some(tail.final_norm_bytes),
             final_norm_eps,
-            Some(lm_head_handle),
-            Some(lm_head_bytes),
-            lm_head_out_features,
+            Some(tail.lm_head_handle),
+            Some(tail.lm_head_bytes),
+            tail.lm_head_out_features,
             Some(&mut logits),
             None,
         )
@@ -1391,7 +1214,6 @@ impl<'a> BonsaiModel<'a> {
         token_ids: &[u32],
         pos_start: usize,
     ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
-        use oxibonsai_kernels::FullForwardLayerParamsTernary;
         let batch_size = token_ids.len();
         let n_layers = self.blocks.len();
         if n_layers == 0 {
@@ -1407,10 +1229,9 @@ impl<'a> BonsaiModel<'a> {
             )
             .into());
         }
-        let lm_head_linear = match &self.output_weight {
-            OutputWeight::Ternary(linear) => linear,
-            _ => return Err("ternary prefill verify called on non-ternary model".into()),
-        };
+        if !matches!(&self.output_weight, OutputWeight::Ternary(_)) {
+            return Err("ternary prefill verify called on non-ternary model".into());
+        }
         let eps = self.blocks[0].attn_norm_eps();
         let h = self.config.hidden_size;
         let inter = self.config.intermediate_size;
@@ -1421,123 +1242,31 @@ impl<'a> BonsaiModel<'a> {
         let max_seq_len = self.kv_cache.max_seq_len();
 
         let mut hidden_batch = vec![0.0f32; batch_size * h];
-        for (t, &token_id) in token_ids.iter().enumerate() {
-            let embd_start = token_id as usize * h;
-            let embd_end = embd_start + h;
-            if embd_end > self.token_embd.len() {
-                return Err(format!(
-                    "token_id {} out of range (vocab={})",
-                    token_id,
-                    self.token_embd.len() / h
-                )
-                .into());
-            }
-            hidden_batch[t * h..(t + 1) * h]
-                .copy_from_slice(&self.token_embd[embd_start..embd_end]);
-        }
+        // M-02: gather only the rows this batch references, decoding each
+        // straight out of the quantized table. The deleted dense
+        // `Index<Range<usize>>` hatch materialized the whole
+        // `vocab x hidden` FP32 table here (1.16 / 2.31 / 4.74 GiB for the
+        // 1.7B / 8B / 27B) on the first multi-token prompt.
+        self.token_embd.copy_rows(token_ids, &mut hidden_batch)?;
 
         let mut cos_table = vec![0.0f32; batch_size * half_dim];
         let mut sin_table = vec![0.0f32; batch_size * half_dim];
         for t in 0..batch_size {
             let pos = pos_start + t;
-            let cos_vals = self.rope.cos_at(pos);
-            let sin_vals = self.rope.sin_at(pos);
+            let cos_vals = self.rope.cos_at_checked(pos)?;
+            let sin_vals = self.rope.sin_at_checked(pos)?;
             cos_table[t * half_dim..(t + 1) * half_dim].copy_from_slice(cos_vals);
             sin_table[t * half_dim..(t + 1) * half_dim].copy_from_slice(sin_vals);
         }
 
-        let mut qkv_concats: Vec<Vec<u8>> = Vec::with_capacity(n_layers);
-        let mut attn_proj_bytes_per_layer: Vec<Vec<u8>> = Vec::with_capacity(n_layers);
-        let mut gate_bytes_per_layer: Vec<Vec<u8>> = Vec::with_capacity(n_layers);
-        let mut up_bytes_per_layer: Vec<Vec<u8>> = Vec::with_capacity(n_layers);
-        let mut down_bytes_per_layer: Vec<Vec<u8>> = Vec::with_capacity(n_layers);
-        for block in &self.blocks {
-            let q_bytes = blocks_as_bytes_ternary(
-                block
-                    .attn_q_blocks_ternary()
-                    .ok_or("attn_q: not a ternary layer")?,
-            );
-            let k_bytes = blocks_as_bytes_ternary(
-                block
-                    .attn_k_blocks_ternary()
-                    .ok_or("attn_k: not a ternary layer")?,
-            );
-            let v_bytes = blocks_as_bytes_ternary(
-                block
-                    .attn_v_blocks_ternary()
-                    .ok_or("attn_v: not a ternary layer")?,
-            );
-            let mut concat = Vec::with_capacity(q_bytes.len() + k_bytes.len() + v_bytes.len());
-            concat.extend_from_slice(q_bytes);
-            concat.extend_from_slice(k_bytes);
-            concat.extend_from_slice(v_bytes);
-            qkv_concats.push(concat);
-            attn_proj_bytes_per_layer.push(
-                blocks_as_bytes_ternary(
-                    block
-                        .attn_output_blocks_ternary()
-                        .ok_or("attn_output: not a ternary layer")?,
-                )
-                .to_vec(),
-            );
-            gate_bytes_per_layer.push(
-                blocks_as_bytes_ternary(
-                    block
-                        .ffn_gate_blocks_ternary()
-                        .ok_or("ffn_gate: not a ternary layer")?,
-                )
-                .to_vec(),
-            );
-            up_bytes_per_layer.push(
-                blocks_as_bytes_ternary(
-                    block
-                        .ffn_up_blocks_ternary()
-                        .ok_or("ffn_up: not a ternary layer")?,
-                )
-                .to_vec(),
-            );
-            down_bytes_per_layer.push(
-                blocks_as_bytes_ternary(
-                    block
-                        .ffn_down_blocks_ternary()
-                        .ok_or("ffn_down: not a ternary layer")?,
-                )
-                .to_vec(),
-            );
-        }
-
-        let mut layer_params: Vec<FullForwardLayerParamsTernary<'_>> = Vec::with_capacity(n_layers);
-        for (i, block) in self.blocks.iter().enumerate() {
-            let norm_handle_base = 5_000_000u64 + (block.layer_index() as u64) * 10;
-            let weight_handle_base = 6_000_000u64 + (block.layer_index() as u64) * 10;
-            layer_params.push(FullForwardLayerParamsTernary {
-                attn_norm_handle: norm_handle_base,
-                attn_norm_bytes: block.attn_norm_weight(),
-                fused_qkv_handle: weight_handle_base,
-                fused_qkv_bytes: &qkv_concats[i],
-                q_norm_handle: norm_handle_base + 1,
-                q_norm_bytes: block.q_norm_weight(),
-                k_norm_handle: norm_handle_base + 2,
-                k_norm_bytes: block.k_norm_weight(),
-                attn_proj_handle: weight_handle_base + 1,
-                attn_proj_bytes: &attn_proj_bytes_per_layer[i],
-                ffn_norm_handle: norm_handle_base + 3,
-                ffn_norm_bytes: block.ffn_norm_weight(),
-                gate_up_handle: weight_handle_base + 2,
-                gate_bytes: &gate_bytes_per_layer[i],
-                up_bytes: &up_bytes_per_layer[i],
-                down_handle: weight_handle_base + 3,
-                down_bytes: &down_bytes_per_layer[i],
-            });
-        }
-
-        let final_norm_handle = 5_900_000u64;
-        let final_norm_bytes = self.output_norm.weight();
+        // Same borrowed binding as `try_metal_prefill_with_lm_head_ternary`;
+        // see the note there on the five per-call `Vec<Vec<u8>>` this replaces
+        // (perf-03).
         let final_norm_eps = self.output_norm.eps();
-        let lm_head_handle = 7_000_000u64;
-        let lm_head_bytes_vec = blocks_as_bytes_ternary(lm_head_linear.blocks()).to_vec();
-        let lm_head_bytes: &[u8] = &lm_head_bytes_vec;
-        let lm_head_out_features = lm_head_linear.out_features();
+        let binding = self.ternary_gpu_binding()?;
+        let tail = binding
+            .tail
+            .ok_or("ternary prefill verify requires a ternary LM head")?;
 
         let mut batch_token_ids: Vec<u32> = Vec::with_capacity(batch_size);
         oxibonsai_kernels::try_metal_full_forward_prefill_verify_ternary(
@@ -1545,7 +1274,7 @@ impl<'a> BonsaiModel<'a> {
             batch_size,
             pos_start,
             n_layers,
-            &layer_params,
+            &binding.layer_params,
             &cos_table,
             &sin_table,
             h,
@@ -1555,12 +1284,12 @@ impl<'a> BonsaiModel<'a> {
             hd,
             eps,
             max_seq_len,
-            Some(final_norm_handle),
-            Some(final_norm_bytes),
+            Some(tail.final_norm_handle),
+            Some(tail.final_norm_bytes),
             final_norm_eps,
-            Some(lm_head_handle),
-            Some(lm_head_bytes),
-            lm_head_out_features,
+            Some(tail.lm_head_handle),
+            Some(tail.lm_head_bytes),
+            tail.lm_head_out_features,
             &mut batch_token_ids,
         )
         .map_err(|e| {

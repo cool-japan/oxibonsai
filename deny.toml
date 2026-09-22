@@ -6,12 +6,16 @@
 # an approved set of OSS licenses may be pulled in transitively.
 #
 # Run before any release:
-#   cargo deny check bans licenses sources
+#   cargo deny check bans licenses sources advisories
 #
-# `advisories` is intentionally left as a permissive default (not part of
-# the gating command above) since it requires network access to the RustSec
-# advisory database and this workspace's release gate must stay usable
-# offline; run `cargo deny check advisories` separately when online.
+# `all-features = true` below means every check already considers the union
+# of every workspace member's optional dependencies (a strict superset of any
+# default-features-only resolve, since Cargo features are additive-only), so
+# one invocation covers both.
+#
+# `advisories` needs network access to fetch the RustSec advisory database
+# (`cargo deny check bans licenses sources` alone stays usable fully offline);
+# run `cargo deny check advisories` on its own when offline.
 
 [graph]
 targets = [
@@ -20,12 +24,74 @@ targets = [
     { triple = "x86_64-apple-darwin" },
     { triple = "wasm32-unknown-unknown" },
 ]
+# deps-03: check the union of every optional dependency across the workspace,
+# not just whatever the default feature set of the invoking crate happens to
+# pull in — a banned crate hiding behind a feature (the deps-01 class) would
+# otherwise slip past a default-features-only resolve.
+all-features = true
 
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+    # deps-05: `paste` (proc-macro, compile-time code generation only, no
+    # runtime component) is unmaintained upstream
+    # (https://github.com/dtolnay/paste, archived) with no released drop-in
+    # replacement yet adopted by its actual pullers in this graph
+    # (`tokenizers` v0.23.2 and `metal` v0.33.0). The suggested fork
+    # (`pastey`) is a rename, not something this workspace can switch to
+    # unilaterally since both are third-party crates.
+    # cargo-deny 0.19's `[[advisories.ignore]]` schema has no `expires` field,
+    # so the review-by date lives in `reason` instead: ignored 2026-09-21,
+    # REVISIT BY 2027-03-31 — sooner if `tokenizers`/`metal` migrate off it.
+    { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained (compile-time-only proc-macro, no runtime code path); pulled transitively via tokenizers v0.23.2 and metal v0.33.0; no safe upgrade exists yet. Ignored 2026-09-21, revisit by 2027-03-31." },
+    # deps-01/deps-05: `rustls-pemfile` is unmaintained upstream (archived);
+    # this is an "unmaintained" advisory, not a reported vulnerability. It is
+    # pulled transitively via `oxitls` v0.3.0 (the Pure-Rust TLS stack behind
+    # the new `oxihttp` client — see deps-01), which is a third-party
+    # COOLJAPAN crate: migrating it to `rustls-pki-types`'s `PemObject` is
+    # oxitls's own upgrade to make, not something fixable from this
+    # workspace's manifests. Ignored 2026-09-21, revisit by 2027-03-31 (or
+    # sooner if oxitls bumps past it).
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is unmaintained (archived, no CVE); pulled transitively via oxitls v0.3.0's rustls integration; the upgrade (rustls-pki-types::PemObject) is oxitls's own dependency choice, not this workspace's. Ignored 2026-09-21, revisit by 2027-03-31." },
+    # deps-01/deps-05: this IS a vulnerability advisory (not an "unmaintained"
+    # one like the two above) — read it as such, not downgraded.
+    # `rsa` v0.9.10 is a mandatory, non-optional dependency of
+    # `oxitls-rustcrypto-provider` (verified in its Cargo.toml: no feature
+    # gates it out), pulled in by oxitls's own `pure` feature — there is no
+    # knob to build the Pure-Rust TLS stack without it. RUSTSEC-2023-0071
+    # ("Marvin Attack") is a network-observable TIMING side-channel in RSA
+    # PRIVATE-key decryption/signing that could leak the key to a peer who
+    # can measure response latency. `cmd_tokenizer.rs`'s only use of this
+    # stack is an outbound HTTPS GET as a TLS *client* with no client
+    # certificate configured anywhere in this codebase: verifying a server's
+    # RSA-signed certificate is a PUBLIC-key operation (unaffected — the
+    # attack targets the private-key holder), and TLS 1.3 key exchange uses
+    # ECDHE, not RSA key transport, so no RSA private-key operation is ever
+    # performed here. THIS EXEMPTION IS INVALIDATED if any future code path
+    # in this workspace enables mTLS / presents an RSA client certificate
+    # through this stack — re-evaluate before doing that, don't just widen
+    # the ignore. No safe upgrade exists upstream. Ignored 2026-09-21,
+    # revisit by 2027-03-31.
+    #
+    # INVALIDATED IF mTLS with an RSA client certificate is ever configured
+    # through this stack. (Kept as its own line so a release-review grep for
+    # "INVALIDATED IF" surfaces every conditional vulnerability exemption; this
+    # is the only one in this file that ignores a real vulnerability rather
+    # than an unmaintained-crate advisory.)
+    { id = "RUSTSEC-2023-0071", reason = "rsa (Marvin Attack timing side-channel, RUSTSEC-2023-0071) is a mandatory dependency of oxitls-rustcrypto-provider (oxitls's `pure` feature, no avoidance knob). This workspace only uses the stack as a TLS client verifying server certificates (a public-key operation) with no client certificate configured, so the vulnerable private-key decrypt/sign path is never exercised. Invalidated if mTLS with an RSA client cert is ever added. No safe upgrade exists upstream. Ignored 2026-09-21, revisit by 2027-03-31." },
+]
 
+# deps-03/FIX-01-BUILD (wave-2.5 addendum: this comment was previously
+# mis-tagged "deps-16", which is the unrelated criterion/alloca/cc dev-dep
+# finding a few sections above — this list follows from the `[graph]
+# all-features = true` policy at the top of this file instead): this list
+# is the set of licenses actually ENCOUNTERED in the `all-features = true`
+# graph. `MPL-2.0` and `0BSD` were removed on
+# 2026-09-21 because nothing in the graph carries them any more and cargo-deny
+# reports every unused allowance as a `license-not-encountered` warning — a
+# dead allowance is also a silent widening of what may enter later. Re-add an
+# entry only together with the crate that needs it.
 [licenses]
 version = 2
 allow = [
@@ -35,10 +101,8 @@ allow = [
     "BSD-3-Clause",
     "ISC",
     "Unicode-3.0",
-    "MPL-2.0",
     "Zlib",
     "CC0-1.0",
-    "0BSD",
     "BSL-1.0",
     # webpki-root-certs ships the Mozilla CA root bundle under this
     # permissive (non-copyleft) data license — not source code.
@@ -47,43 +111,394 @@ allow = [
 confidence-threshold = 0.8
 
 [bans]
-multiple-versions = "warn"
+multiple-versions = "deny"
 wildcards = "deny"
 allow-wildcard-paths = true
 deny = [
     # C/C++/Fortran-backed BLAS — use oxiblas instead.
-    { name = "openblas-src" },
-    { name = "openblas-sys" },
-    { name = "blas-src" },
+    { name = "openblas-src", reason = "C/C++/Fortran-backed BLAS; use oxiblas instead." },
+    { name = "openblas-sys", reason = "C/C++/Fortran-backed BLAS; use oxiblas instead." },
+    { name = "openblas", reason = "C/C++/Fortran-backed BLAS; use oxiblas instead." },
+    { name = "blas-src", reason = "C/C++/Fortran-backed BLAS; use oxiblas instead." },
     # Non-Rust or superseded serialization — use oxicode instead.
-    { name = "bincode" },
+    { name = "bincode", reason = "superseded serialization format; use oxicode instead." },
     # C-backed FFT — use oxifft instead.
-    { name = "rustfft" },
+    { name = "rustfft", reason = "C-backed FFT; use oxifft instead." },
     # C++-backed SMT solver — use oxiz instead.
-    { name = "z3" },
-    { name = "z3-sys" },
+    { name = "z3", reason = "C++-backed SMT solver; use oxiz instead." },
+    { name = "z3-sys", reason = "C++-backed SMT solver; use oxiz instead." },
     # C-backed SQLite bindings — use oxisql-sqlite-compat instead.
-    { name = "rusqlite" },
-    { name = "libsqlite3-sys" },
+    { name = "rusqlite", reason = "C-backed SQLite bindings; use oxisql-sqlite-compat instead." },
+    { name = "libsqlite3-sys", reason = "C-backed SQLite bindings; use oxisql-sqlite-compat instead." },
     # Compression / archive formats with C dependencies — use oxiarc-*
     # instead.
-    { name = "zip" },
-    { name = "flate2" },
-    { name = "zstd" },
-    { name = "zstd-sys" },
-    { name = "zstd-safe" },
-    { name = "bzip2" },
-    { name = "bzip2-sys" },
-    { name = "lz4" },
-    { name = "lz4-sys" },
-    { name = "lz4_flex" },
-    { name = "tar" },
-    { name = "snap" },
-    { name = "brotli" },
-    { name = "brotli-sys" },
-    { name = "miniz_oxide" },
+    { name = "zip", reason = "C-backed compression/archive format; use oxiarc-* (e.g. oxiarc-deflate) instead." },
+    { name = "flate2", reason = "C-backed compression/archive format; use oxiarc-* (e.g. oxiarc-deflate) instead." },
+    { name = "zstd", reason = "C-backed compression/archive format; use oxiarc-* (e.g. oxiarc-deflate) instead." },
+    { name = "zstd-sys", reason = "C-backed compression/archive format; use oxiarc-* (e.g. oxiarc-deflate) instead." },
+    { name = "zstd-safe", reason = "C-backed compression/archive format; use oxiarc-* (e.g. oxiarc-deflate) instead." },
+    { name = "bzip2", reason = "C-backed compression/archive format; use oxiarc-* (e.g. oxiarc-deflate) instead." },
+    { name = "bzip2-sys", reason = "C-backed compression/archive format; use oxiarc-* (e.g. oxiarc-deflate) instead." },
+    { name = "lz4", reason = "C-backed compression/archive format; use oxiarc-* (e.g. oxiarc-deflate) instead." },
+    { name = "lz4-sys", reason = "C-backed compression/archive format; use oxiarc-* (e.g. oxiarc-deflate) instead." },
+    { name = "lz4_flex", reason = "C-backed compression/archive format; use oxiarc-* (e.g. oxiarc-deflate) instead." },
+    { name = "tar", reason = "C-backed compression/archive format; use oxiarc-* (e.g. oxiarc-deflate) instead." },
+    { name = "snap", reason = "C-backed compression/archive format; use oxiarc-* (e.g. oxiarc-deflate) instead." },
+    { name = "brotli", reason = "C-backed compression/archive format; use oxiarc-* (e.g. oxiarc-deflate) instead." },
+    { name = "brotli-sys", reason = "C-backed compression/archive format; use oxiarc-* (e.g. oxiarc-deflate) instead." },
+    { name = "miniz_oxide", reason = "C-backed compression/archive format; use oxiarc-* (e.g. oxiarc-deflate) instead." },
+    # deps-03/deps-01: TLS/crypto backends that compile C/assembly (BoringSSL,
+    # OpenSSL) into whatever links them — this is the exact class of crate
+    # deps-01 removed from the default build (aws-lc-sys via reqwest's
+    # default TLS backend). Use the Pure-Rust `oxihttp`/`oxitls` stack
+    # (rustls + a Pure-Rust crypto provider) instead of pulling any of these
+    # in, directly or transitively, on a default-shipping path.
+    #
+    # `wrappers` on the aws-lc-* entries: reqwest is kept as a dev-only
+    # dependency (integration tests hitting a local server; see the HTTP
+    # client comment in [workspace.dependencies]) and its default TLS stack
+    # (rustls, via hyper-rustls and rustls-webpki) resolves aws-lc-rs /
+    # aws-lc-sys as its default crypto provider. `wrappers = ["rustls",
+    # "rustls-webpki"]` allows aws-lc-* whenever its DIRECT parent is one of
+    # those two crates — cargo-deny's `wrappers` check is purely
+    # name-based, one hop up, so it does not itself distinguish reqwest's
+    # dev-only edge from a hypothetical future *production* dependency that
+    # also reaches aws-lc-rs through rustls. The dev-only guarantee comes
+    # from the manifests instead: reqwest is a `[dev-dependencies]` entry
+    # everywhere in this workspace (root and oxibonsai-serve) — a dev-dep
+    # never reaches a shipped artifact (same accepted-exception class as
+    # deps-16's `criterion` -> `alloca`). If a *normal* dependency is ever
+    # added on top of rustls/rustls-webpki, this wrapper would silently
+    # allow it too — re-check this exemption before adding one.
+    { name = "aws-lc-sys", wrappers = ["aws-lc-rs"], reason = "BoringSSL C + aarch64 asm; dev-only via reqwest's default TLS backend, wrappers-exempted. Use oxihttp/oxitls instead of a production dependency on this." },
+    { name = "aws-lc-rs", wrappers = ["rustls", "rustls-webpki"], reason = "BoringSSL C + aarch64 asm; dev-only via reqwest's default TLS backend, wrappers-exempted. Use oxihttp/oxitls instead of a production dependency on this." },
+    # deps-16 (BENCHES, wave 3; corrected FIX3-BUILD, wave 3.5): `criterion`
+    # (dev/bench-only) unconditionally depends on `alloca` (which builds one
+    # C source via a `cc` build-dependency) on unix/windows — verified in
+    # criterion 0.8.2's own manifest, not gated by any of criterion's
+    # features, so `default-features = false` cannot remove it (confirmed
+    # impossible; the wave-1 addendum's alternative was tried instead — see
+    # below). `alloca`/`cc` are intentionally NOT added to this `deny` list:
+    # they never reach a shipped artifact (same dev-only exception class as
+    # the aws-lc-* wrappers above), and criterion has no feature toggle to
+    # drop them. This exception is LOAD-BEARING, not cosmetic.
+    #
+    # CORRECTION (FIX3-BUILD, wave 3.5): every `[[bench]]` TARGET across the
+    # workspace is behind a no-op `bench` Cargo feature +
+    # `required-features = ["bench"]`, which does stop cargo from building
+    # or running the bench SOURCES without `--features bench`. It does
+    # **not** keep `criterion`/`alloca`/`cc` out of a default `cargo test`/
+    # `cargo check --all-targets` invocation, contradicting an earlier
+    # version of this comment's "no longer *compiled* by a default
+    # invocation": `required-features` gates a target, not the
+    # `[dev-dependencies]` entry its harness needs, and Cargo builds every
+    # `[dev-dependencies]` entry whenever ANY test target is selected.
+    # Durable proof (reproduces regardless of build-cache state):
+    # `cargo tree -p oxibonsai-rag -e normal,build,dev -i alloca` always
+    # shows `alloca -> criterion -> [dev-dependencies] oxibonsai-rag`,
+    # `--features bench` or not. Dated compile measurement (fresh empty
+    # `CARGO_TARGET_DIR`, 2026-09-22): `cargo test -p oxibonsai-rag --no-run`
+    # (default features) compiles `cc` v1.4.7, `alloca` v0.4.0 and
+    # `criterion` v0.8.2; `cargo check -p oxibonsai-rag --all-targets`
+    # compiles `cc` and `alloca`. The cross-target lint failure this was
+    # meant to fix is therefore UNFIXED: `cargo check -p oxibonsai-rag
+    # --all-targets --target aarch64-unknown-linux-gnu` still exits 101
+    # (`error occurred in cc-rs: failed to find tool
+    # "aarch64-linux-gnu-gcc"`; re-verified this session with that target
+    # installed). Do not re-assert the stronger claim anywhere in this
+    # workspace. This wording was also corrected in this workspace's root
+    # `Cargo.toml`'s own `bench` feature comment and in
+    # `crates/oxibonsai-kernels/Cargo.toml`'s — but NOT everywhere: the
+    # same uncorrected claim is still live, verbatim in shape, at
+    # `crates/oxibonsai-rag/Cargo.toml:23-27`,
+    # `crates/oxibonsai-model/Cargo.toml:34-38`,
+    # `crates/oxibonsai-eval/Cargo.toml:23-27` and
+    # `crates/oxibonsai-tokenizer/Cargo.toml:55-59` (re-measured, FIX3-BUILD
+    # wave 3.5). None of those four are in this package's owned_files;
+    # carried forward for a wave-4 grant, using this entry's wording as
+    # the template. Relocating the bench targets into a workspace
+    # member excluded from `default-members` (the only real fix) is
+    # orchestrator decision D-2 (wave 3.5), not attempted here — this
+    # dev-only exception stays. Revisit if/when a benchmark harness
+    # migration (e.g. to a Pure-Rust `divan`) removes the `criterion`
+    # dependency entirely, or D-2's relocation lands.
+    # `ring` is not currently reachable at all (oxitls uses the pure
+    # `oxitls-rustcrypto-provider`); banned outright rather than exempted so
+    # a future edge that pulls it in is caught immediately.
+    { name = "ring", reason = "not Pure-Rust auditable the way RustCrypto is, and not currently reachable; oxitls already uses oxitls-rustcrypto-provider instead — keep it that way." },
+    { name = "openssl", reason = "C-backed TLS; use oxihttp/oxitls instead." },
+    { name = "openssl-sys", reason = "C-backed TLS; use oxihttp/oxitls instead." },
+    { name = "native-tls", reason = "wraps the platform TLS library (often C-backed); use oxihttp/oxitls instead." },
+    { name = "libz-sys", reason = "C zlib bindings; use oxiarc-* (e.g. oxiarc-deflate) instead." },
 ]
-skip = []
+# deps-15: dated, enumerated exceptions to `multiple-versions = "deny"`.
+# Every entry below is a version *range* (not a single exact version) so a
+# patch-level bump on either side of a skew does not silently turn into a
+# hard CI failure on a fresh `cargo generate-lockfile` — Cargo.lock is
+# .gitignore'd (COOLJAPAN policy) in this workspace, so nothing here can
+# pin against a committed lock. Grouped by verified root cause (`cargo
+# tree`), not copy-pasted per crate.
+# RustCrypto-ecosystem two-generation skew inside oxitls (third-party
+# COOLJAPAN TLS stack, not a choice made in this workspace's own manifests):
+# oxitls-rustcrypto-provider's own edges (aes-gcm/ecdsa/rsa/curve25519-dalek
+# chains, used for its rustls CryptoProvider glue) still pull an older
+# RustCrypto generation, while oxitls's own direct TLS-record dependencies
+# already resolve the newer one. Verified with `cargo tree`: every path on
+# both sides terminates at oxitls v0.3.0 / oxitls-rustcrypto-provider v0.3.0,
+# neither of which this workspace controls; fixing it means oxitls converging
+# its own internal RustCrypto versions. Ignored 2026-09-21, revisit 2027-03-31
+# (or sooner if oxitls releases a converged version).
+[[bans.skip]]
+name = "aead"
+version = "<0.6"
+reason = "RustCrypto old generation via oxitls-rustcrypto-provider vs oxitls's own newer pull (see comment above). Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "aes"
+version = "<0.9"
+reason = "RustCrypto old generation via oxitls-rustcrypto-provider vs oxitls's own newer pull (see comment above). Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "aes-gcm"
+version = "<0.11"
+reason = "RustCrypto old generation via oxitls-rustcrypto-provider vs oxitls's own newer pull (see comment above). Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "base16ct"
+version = "<1.0.0"
+reason = "RustCrypto old generation via oxitls-rustcrypto-provider vs oxitls's own newer pull (see comment above). Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "block-buffer"
+version = "<0.12"
+reason = "RustCrypto old generation via oxitls-rustcrypto-provider vs oxitls's own newer pull (see comment above). Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "chacha20"
+version = "<0.10"
+reason = "RustCrypto old generation via oxitls-rustcrypto-provider vs oxitls's own newer pull (see comment above). Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "cipher"
+version = "<0.5"
+reason = "RustCrypto old generation via oxitls-rustcrypto-provider vs oxitls's own newer pull (see comment above). Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "const-oid"
+version = "<0.10"
+reason = "RustCrypto old generation via oxitls-rustcrypto-provider vs oxitls's own newer pull (see comment above). Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "cpufeatures"
+version = "<0.3"
+reason = "RustCrypto old generation via oxitls-rustcrypto-provider vs oxitls's own newer pull (see comment above). Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "crypto-bigint"
+version = "<0.7"
+reason = "RustCrypto old generation via oxitls-rustcrypto-provider vs oxitls's own newer pull (see comment above). Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "crypto-common"
+version = "<0.2"
+reason = "RustCrypto old generation via oxitls-rustcrypto-provider vs oxitls's own newer pull (see comment above). Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "ctr"
+version = "<0.10"
+reason = "RustCrypto old generation via oxitls-rustcrypto-provider vs oxitls's own newer pull (see comment above). Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "der"
+version = "<0.8"
+reason = "RustCrypto old generation via oxitls-rustcrypto-provider vs oxitls's own newer pull (see comment above). Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "digest"
+version = "<0.11"
+reason = "RustCrypto old generation via oxitls-rustcrypto-provider vs oxitls's own newer pull (see comment above). Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "ecdsa"
+version = "<0.17"
+reason = "RustCrypto old generation via oxitls-rustcrypto-provider vs oxitls's own newer pull (see comment above). Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "elliptic-curve"
+version = "<0.14"
+reason = "RustCrypto old generation via oxitls-rustcrypto-provider vs oxitls's own newer pull (see comment above). Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "ff"
+version = "<0.14"
+reason = "RustCrypto old generation via oxitls-rustcrypto-provider vs oxitls's own newer pull (see comment above). Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "ghash"
+version = "<0.6"
+reason = "RustCrypto old generation via oxitls-rustcrypto-provider vs oxitls's own newer pull (see comment above). Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "group"
+version = "<0.14"
+reason = "RustCrypto old generation via oxitls-rustcrypto-provider vs oxitls's own newer pull (see comment above). Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "hkdf"
+version = "<0.13"
+reason = "RustCrypto old generation via oxitls-rustcrypto-provider vs oxitls's own newer pull (see comment above). Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "hmac"
+version = "<0.13"
+reason = "RustCrypto old generation via oxitls-rustcrypto-provider vs oxitls's own newer pull (see comment above). Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "inout"
+version = "<0.2"
+reason = "RustCrypto old generation via oxitls-rustcrypto-provider vs oxitls's own newer pull (see comment above). Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "p256"
+version = "<0.14"
+reason = "RustCrypto old generation via oxitls-rustcrypto-provider vs oxitls's own newer pull (see comment above). Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "p384"
+version = "<0.14"
+reason = "RustCrypto old generation via oxitls-rustcrypto-provider vs oxitls's own newer pull (see comment above). Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "pkcs8"
+version = "<0.11"
+reason = "RustCrypto old generation via oxitls-rustcrypto-provider vs oxitls's own newer pull (see comment above). Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "polyval"
+version = "<0.7"
+reason = "RustCrypto old generation via oxitls-rustcrypto-provider vs oxitls's own newer pull (see comment above). Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "primeorder"
+version = "<0.14"
+reason = "RustCrypto old generation via oxitls-rustcrypto-provider vs oxitls's own newer pull (see comment above). Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "rfc6979"
+version = "<0.6"
+reason = "RustCrypto old generation via oxitls-rustcrypto-provider vs oxitls's own newer pull (see comment above). Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "sec1"
+version = "<0.8"
+reason = "RustCrypto old generation via oxitls-rustcrypto-provider vs oxitls's own newer pull (see comment above). Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "sha2"
+version = "<0.11"
+reason = "RustCrypto old generation via oxitls-rustcrypto-provider vs oxitls's own newer pull (see comment above). Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "signature"
+version = "<3.0.0"
+reason = "RustCrypto old generation via oxitls-rustcrypto-provider vs oxitls's own newer pull (see comment above). Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "spki"
+version = "<0.8"
+reason = "RustCrypto old generation via oxitls-rustcrypto-provider vs oxitls's own newer pull (see comment above). Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "universal-hash"
+version = "<0.6"
+reason = "RustCrypto old generation via oxitls-rustcrypto-provider vs oxitls's own newer pull (see comment above). Ignored 2026-09-21, revisit 2027-03-31."
+
+# Ecosystem-wide `rand`-family major-version treadmill, independent of the
+# RustCrypto skew above: three unrelated consumers each pin a different
+# generation — `rsa` v0.9.10 (an oxitls-rustcrypto-provider dependency) still
+# requires the 0.6-0.9 generation, this workspace's own `proptest` v1.11.0
+# dev-dependency requires the 0.9 generation (no 0.10-compatible proptest
+# release exists yet), and `scirs2-core` v0.6.5 (COOLJAPAN numerics, kept at
+# the latest release per policy) already uses the newest 0.10 generation.
+# Not fixable from this workspace alone without violating the Latest-Crates
+# policy (downgrading scirs2-core) or blocking on an upstream proptest
+# release. Ignored 2026-09-21, revisit 2027-03-31.
+[[bans.skip]]
+name = "getrandom"
+version = "<0.4"
+reason = "rand-family treadmill (rsa's old pin vs proptest's mid pin vs scirs2-core's newest); see comment above. Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "rand"
+version = "<0.10"
+reason = "rand-family treadmill (rsa's old pin vs proptest's mid pin vs scirs2-core's newest); see comment above. Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "rand_chacha"
+version = "<0.10"
+reason = "rand-family treadmill (rsa's old pin vs proptest's mid pin vs scirs2-core's newest); see comment above. Ignored 2026-09-21, revisit 2027-03-31."
+
+[[bans.skip]]
+name = "rand_core"
+version = "<0.10"
+reason = "rand-family treadmill (rsa's old pin vs proptest's mid pin vs scirs2-core's newest); see comment above. Ignored 2026-09-21, revisit 2027-03-31."
+
+# Three-way `base64` skew: `tokenizers` v0.23.2's own `spm_precompiled`
+# dependency pins the old 0.13 generation, `hyper-util` (pulled by
+# axum/reqwest/oxihttp-client's hyper stack) pins 0.22, and `oxihttp-client`/
+# `reqwest` use the current 0.23 generation directly. All three pins are
+# third-party and outside this workspace's manifests. Ignored 2026-09-21,
+# revisit 2027-03-31.
+[[bans.skip]]
+name = "base64"
+version = "<0.23"
+reason = "tokenizers' spm_precompiled (0.13) + hyper-util (0.22) vs reqwest/oxihttp-client's own 0.23; see comment above. Ignored 2026-09-21, revisit 2027-03-31."
+
+# `hashbrown` skew: `safetensors` v0.8.0 (third-party model-file format) pins
+# the older 0.16 generation while the HTTP stack (`indexmap` -> `h2`),
+# oxitls-webpki-roots's `lru` dependency, and `oxionnx-core` already resolve
+# 0.17. Third-party pins on both sides. Ignored 2026-09-21, revisit
+# 2027-03-31.
+[[bans.skip]]
+name = "hashbrown"
+version = "<0.17"
+reason = "safetensors' old pin (0.16) vs the HTTP/oxionnx stack's 0.17; see comment above. Ignored 2026-09-21, revisit 2027-03-31."
+
+# macOS-only `core-foundation` skew: `system-configuration` (pulled by
+# `hyper-util`, used by axum/reqwest/oxihttp-client for system proxy
+# detection) resolves the older 0.9 generation, while the `metal` GPU crate
+# (via `core-graphics-types`) and reqwest's `rustls-platform-verifier`/
+# `security-framework` (macOS certificate verification) already resolve
+# 0.10. Third-party pins on both sides. Ignored 2026-09-21, revisit
+# 2027-03-31.
+[[bans.skip]]
+name = "core-foundation"
+version = "<0.10"
+reason = "system-configuration's old pin (0.9) vs metal/security-framework's 0.10; see comment above. Ignored 2026-09-21, revisit 2027-03-31."
+
+# `syn` v3 arrived very early: `synstructure` v0.14.0 (pulled transitively
+# through the icu4x Unicode-normalization stack used for URL/IDNA parsing)
+# has already migrated to `syn` 3, while every other proc-macro dependency in
+# this graph (serde_derive, thiserror-impl, tokio-macros, axum-macros,
+# darling_core, asn1-rs-derive, curve25519-dalek-derive, etc.) is still on
+# `syn` 2. Third-party ecosystem transition. Ignored 2026-09-21, revisit
+# 2027-03-31.
+[[bans.skip]]
+name = "syn"
+version = "<3.0.0"
+reason = "synstructure's early syn-3 migration vs the rest of the proc-macro ecosystem on syn 2; see comment above. Ignored 2026-09-21, revisit 2027-03-31."
+
+# RESTORED (B2-08, 2026-09-21): `oxibonsai-tokenizer` now depends directly on
+# `fancy-regex = { workspace = true }` (0.19.2) for the qwen2/qwen35 `Split`
+# pre-tokenizer (TOK-03/TOK-04), re-introducing exactly the duplication
+# FIX-01-BUILD's note above predicted: `tokenizers` v0.23.2 still pins its own
+# internal `fancy-regex` at 0.17.0 (verified via `cargo tree --duplicates`).
+# Both are Pure Rust with no security advisories; skip rather than pin, since
+# `tokenizers` does not expose a way to override its internal dependency.
+[[bans.skip]]
+name = "fancy-regex"
+version = "<0.19"
+reason = "tokenizers v0.23.2 pins its own internal fancy-regex 0.17.0, independent of oxibonsai-tokenizer's direct 0.19.2 edge (TOK-03/TOK-04, B2-08 wave 2). Restored 2026-09-21, revisit 2027-03-31."
 
 [sources]
 unknown-registry = "deny"

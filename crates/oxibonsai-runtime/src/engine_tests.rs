@@ -1,0 +1,766 @@
+//! Unit tests for [`crate::engine`].
+//!
+//! Attached to `engine.rs` as its `#[cfg(test)] mod tests` via `#[path]`, so
+//! the tests keep full access to the module's private items while `engine.rs`
+//! itself stays under the workspace 2000-line ceiling.
+
+use super::*;
+
+// HOTFIX-TESTMEM: the tests below only need *some* config to prove
+// `InferenceEngine::new`/`batch_generate`/session-tracking behavior —
+// none of them depend on production-sized dimensions. They used to build
+// `Qwen3Config::bonsai_8b()`, which makes `BonsaiModel::new` allocate
+// ~5 GB of token_embd + output_weight tables (plus a ~1.2 GB KV cache)
+// per test; `tiny_test()` exercises the identical code path for a few
+// tens of MB.
+
+#[test]
+fn engine_creation() {
+    let config = Qwen3Config::tiny_test();
+    let engine = InferenceEngine::new(config, SamplingParams::default(), 42);
+    // tiny_test()'s num_layers (2), not bonsai_8b()'s (36): the assertion
+    // only needs to prove the config passed to `new` is the config
+    // `model().config()` reports back, which holds for any config.
+    assert_eq!(engine.model().config().num_layers, 2);
+}
+
+#[test]
+fn engine_stats_initial() {
+    let config = Qwen3Config::tiny_test();
+    let engine = InferenceEngine::new(config, SamplingParams::default(), 42);
+    let stats = engine.stats();
+    assert_eq!(stats.tokens_generated(), 0);
+    assert_eq!(stats.requests_completed(), 0);
+    assert_eq!(stats.active_session_count(), 0);
+    assert!(stats.uptime_seconds() >= 0.0);
+    assert!((stats.avg_tokens_per_request() - 0.0).abs() < f64::EPSILON);
+}
+
+#[test]
+fn engine_stats_record() {
+    let stats = EngineStats::new();
+    stats.record_request(10);
+    stats.record_request(20);
+    assert_eq!(stats.tokens_generated(), 30);
+    assert_eq!(stats.requests_completed(), 2);
+    assert!((stats.avg_tokens_per_request() - 15.0).abs() < f64::EPSILON);
+}
+
+#[test]
+fn engine_session_tracking() {
+    let config = Qwen3Config::tiny_test();
+    let engine = InferenceEngine::new(config, SamplingParams::default(), 42);
+    assert_eq!(engine.active_sessions(), 0);
+    assert_eq!(engine.session_count(), 0);
+}
+
+#[test]
+fn engine_batch_generate_empty() {
+    let config = Qwen3Config::tiny_test();
+    let mut engine = InferenceEngine::new(config, SamplingParams::default(), 42);
+    let results = engine.batch_generate(&[], 10);
+    assert!(results.is_empty());
+    assert_eq!(engine.session_count(), 0);
+}
+
+#[test]
+fn engine_batch_generate_empty_prompts() {
+    let config = Qwen3Config::tiny_test();
+    let mut engine = InferenceEngine::new(config, SamplingParams::default(), 42);
+    let prompts = vec![vec![], vec![]];
+    let results = engine.batch_generate(&prompts, 5);
+    assert_eq!(results.len(), 2);
+    for r in &results {
+        assert!(r.is_ok());
+    }
+    // Stats should reflect the completed requests
+    assert_eq!(engine.stats().requests_completed(), 2);
+}
+
+#[test]
+fn engine_stats_default() {
+    let stats = EngineStats::default();
+    assert_eq!(stats.tokens_generated(), 0);
+    assert_eq!(stats.requests_completed(), 0);
+}
+
+// ── EOS resolution ────────────────────────────────────────────────────
+
+#[test]
+fn resolve_eos_from_gguf_metadata() {
+    use oxibonsai_core::gguf::reader::GgufFile;
+    use oxibonsai_core::gguf::writer::{GgufWriter, MetadataWriteValue};
+
+    // A base Qwen3 tokenizer, for instance, assigns 151643 rather than the
+    // instruct EOS 151645 — the engine must honour the model's own key.
+    let mut w = GgufWriter::new();
+    w.add_metadata(
+        "tokenizer.ggml.eos_token_id",
+        MetadataWriteValue::U32(151643),
+    );
+    let bytes = w.to_bytes().expect("write synthetic gguf");
+    let gguf = GgufFile::parse(&bytes).expect("parse synthetic gguf");
+    assert_eq!(resolve_eos_token_id(&gguf), 151643);
+    assert_ne!(resolve_eos_token_id(&gguf), EOS_TOKEN_ID);
+}
+
+#[test]
+fn resolve_eos_falls_back_when_absent() {
+    use oxibonsai_core::gguf::reader::GgufFile;
+    use oxibonsai_core::gguf::writer::GgufWriter;
+
+    // No eos metadata key → fall back to the hardcoded Qwen3 default.
+    let w = GgufWriter::new();
+    let bytes = w.to_bytes().expect("write synthetic gguf");
+    let gguf = GgufFile::parse(&bytes).expect("parse synthetic gguf");
+    assert_eq!(resolve_eos_token_id(&gguf), EOS_TOKEN_ID);
+}
+
+#[test]
+fn synthetic_engine_uses_default_eos() {
+    let config = Qwen3Config::tiny_test();
+    let engine = InferenceEngine::new(config, SamplingParams::default(), 42);
+    assert_eq!(engine.eos_token_id(), EOS_TOKEN_ID);
+    // A synthetic engine has no GGUF vocabulary to resolve names against,
+    // so its set is exactly the one fallback id.
+    assert_eq!(engine.eos_token_ids(), &[EOS_TOKEN_ID]);
+    assert!(engine.is_eos(EOS_TOKEN_ID));
+    assert!(!engine.is_eos(EOS_TOKEN_ID + 1));
+}
+
+// ── RT-18: the EOS *set* ─────────────────────────────────────────────
+
+#[test]
+fn set_eos_token_ids_replaces_the_set_and_keeps_the_primary_first() {
+    let mut engine = InferenceEngine::new(Qwen3Config::tiny_test(), SamplingParams::default(), 42);
+    engine.set_eos_token_ids([248_046, 248_044]);
+    assert_eq!(engine.eos_token_id(), 248_046, "first id is the primary");
+    assert_eq!(engine.eos_token_ids(), &[248_046, 248_044]);
+    assert!(engine.is_eos(248_044), "a secondary id also terminates");
+    assert!(!engine.is_eos(EOS_TOKEN_ID), "the old id is gone");
+}
+
+#[test]
+fn set_eos_token_ids_ignores_an_empty_set() {
+    let mut engine = InferenceEngine::new(Qwen3Config::tiny_test(), SamplingParams::default(), 42);
+    engine.set_eos_token_ids(std::iter::empty());
+    assert_eq!(
+        engine.eos_token_ids(),
+        &[EOS_TOKEN_ID],
+        "an engine with no terminator would never stop"
+    );
+}
+
+/// The behavioural half of `RT-18`: generation must stop on a
+/// **non-primary** member of the set, which a single-id comparison
+/// cannot express.
+#[test]
+fn generation_stops_on_a_secondary_eos_id() {
+    let params = greedy_params();
+    let prompt = [1u32, 2, 3];
+
+    let mut baseline = InferenceEngine::new(Qwen3Config::tiny_test(), params.clone(), 42);
+    let produced = baseline.generate(&prompt, 6).expect("baseline generate");
+    assert!(
+        !produced.is_empty(),
+        "the fixture must generate something to terminate on"
+    );
+    let first = produced[0];
+    assert_ne!(first, EOS_TOKEN_ID);
+
+    // Keep the Qwen3 fallback as the primary and add the token this
+    // model actually emits first as a secondary terminator.
+    let mut engine = InferenceEngine::new(Qwen3Config::tiny_test(), params, 42);
+    engine.set_eos_token_ids([EOS_TOKEN_ID, first]);
+    let stopped = engine.generate(&prompt, 6).expect("generate");
+    assert!(
+        stopped.is_empty(),
+        "generation must stop on the secondary EOS id, got {stopped:?}"
+    );
+}
+
+// ── SV-09: cooperative cancellation ──────────────────────────────────
+
+fn greedy_params() -> SamplingParams {
+    SamplingParams {
+        temperature: 0.0,
+        top_k: 0,
+        top_p: 1.0,
+        repetition_penalty: 1.0,
+        max_tokens: 32,
+    }
+}
+
+#[test]
+fn cancellation_token_is_attachable_and_detachable() {
+    let mut engine = InferenceEngine::new(Qwen3Config::tiny_test(), greedy_params(), 42);
+    assert!(!engine.is_cancelled(), "no token armed");
+    assert!(engine.cancellation_token().is_none());
+
+    let token = CancellationToken::new();
+    engine.set_cancellation_token(token.clone());
+    assert!(engine.cancellation_token().is_some());
+    assert!(!engine.is_cancelled());
+    token.cancel();
+    assert!(engine.is_cancelled());
+
+    engine.clear_cancellation_token();
+    assert!(
+        !engine.is_cancelled(),
+        "a detached token must not keep cancelling"
+    );
+}
+
+#[test]
+fn a_cancelled_token_stops_generation_before_any_token() {
+    let prompt = [1u32, 2, 3];
+    let token = CancellationToken::new();
+    token.cancel();
+
+    let mut engine = InferenceEngine::new(Qwen3Config::tiny_test(), greedy_params(), 42);
+    engine.set_cancellation_token(token.clone());
+    assert!(engine.generate(&prompt, 8).expect("generate").is_empty());
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let sent = engine
+        .generate_streaming_sync(&prompt, 8, &tx)
+        .expect("streaming");
+    assert_eq!(sent, 0, "the streaming path must be cancellable too");
+    drop(tx);
+    assert!(rx.recv().is_err(), "nothing may be emitted after a cancel");
+
+    let mut tracker = RequestRateTracker::new();
+    let tracked = engine
+        .generate_tracked(&prompt, 8, &mut tracker)
+        .expect("tracked");
+    assert!(tracked.is_empty());
+}
+
+/// Cancellation lands *between decode steps*, deterministically: the
+/// emit callback cancels after the third token, so the fourth step must
+/// not run and the tokens already produced are returned (not discarded,
+/// and not an error).
+#[test]
+fn cancellation_mid_generation_returns_the_tokens_produced_so_far() {
+    let prompt = [1u32, 2, 3];
+    let token = CancellationToken::new();
+    let mut engine = InferenceEngine::new(Qwen3Config::tiny_test(), greedy_params(), 42);
+    engine.set_cancellation_token(token.clone());
+
+    let mut emitted = 0usize;
+    let out = engine
+        .generate_greedy_penalised(&prompt, 32, |_tok| {
+            emitted += 1;
+            if emitted == 3 {
+                token.cancel();
+            }
+            true
+        })
+        .expect("penalised greedy");
+
+    assert_eq!(
+        out.len(),
+        3,
+        "exactly the tokens emitted before the cancel, got {out:?}"
+    );
+}
+
+#[test]
+fn generation_without_a_token_is_unaffected() {
+    let prompt = [1u32, 2, 3];
+    let mut with_token = InferenceEngine::new(Qwen3Config::tiny_test(), greedy_params(), 42);
+    with_token.set_cancellation_token(CancellationToken::new());
+    let mut without = InferenceEngine::new(Qwen3Config::tiny_test(), greedy_params(), 42);
+
+    assert_eq!(
+        with_token.generate(&prompt, 6).expect("armed"),
+        without.generate(&prompt, 6).expect("unarmed"),
+        "an un-cancelled token must not change a single token of output"
+    );
+}
+
+// ── RT-28: the recurrent-state reset seam ────────────────────────────
+
+#[derive(Default)]
+struct CountingRecurrent {
+    resets: Arc<AtomicUsize>,
+}
+
+impl crate::engine_control::RecurrentState for CountingRecurrent {
+    fn reset_recurrent(&mut self) {
+        self.resets.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn recurrent_memory_bytes(&self) -> usize {
+        163_184_640
+    }
+
+    fn recurrent_name(&self) -> &str {
+        "counting-fake"
+    }
+}
+
+#[test]
+fn reset_clears_the_attached_recurrent_state() {
+    let resets = Arc::new(AtomicUsize::new(0));
+    let mut engine = InferenceEngine::new(Qwen3Config::tiny_test(), greedy_params(), 42);
+
+    // No state attached: reset must still work.
+    engine.reset();
+    assert_eq!(engine.recurrent_memory_bytes(), 0);
+
+    engine.set_recurrent_state(Box::new(CountingRecurrent {
+        resets: Arc::clone(&resets),
+    }));
+    assert_eq!(engine.recurrent_memory_bytes(), 163_184_640);
+
+    engine.reset();
+    assert_eq!(
+        resets.load(Ordering::Relaxed),
+        1,
+        "the per-request reset (RT-03) must clear the recurrence too"
+    );
+    engine.reset_recurrent();
+    assert_eq!(resets.load(Ordering::Relaxed), 2);
+
+    let taken = engine.take_recurrent_state();
+    assert!(taken.is_some());
+    engine.reset();
+    assert_eq!(
+        resets.load(Ordering::Relaxed),
+        2,
+        "a detached state is no longer reset"
+    );
+}
+
+/// `reset()` must NOT disarm the request's own token: the server's
+/// `run_blocking_generation` resets the engine *before* running the closure
+/// that generates, so a token armed for this request would be thrown away
+/// before it could ever be observed. (The pool's `EngineLease` clears it on
+/// return instead — see `engine_pool`'s lease-lifecycle test.)
+#[test]
+fn reset_keeps_the_token_armed_for_the_running_request() {
+    let mut engine = InferenceEngine::new(Qwen3Config::tiny_test(), greedy_params(), 42);
+    let token = engine.arm_cancellation();
+    engine.reset();
+    assert!(
+        engine.cancellation_token().is_some(),
+        "the per-request reset must not disarm the request's own token"
+    );
+    token.cancel();
+    assert!(engine.is_cancelled());
+    assert!(
+        engine
+            .generate(&[1u32, 2, 3], 8)
+            .expect("generate")
+            .is_empty(),
+        "the token armed before the reset must still stop generation"
+    );
+
+    engine.clear_cancellation_token();
+    assert!(!engine.is_cancelled());
+}
+
+// ── Chunked prefill (SV-09 for long prompts) ─────────────────────────
+
+#[test]
+fn prefill_chunking_is_off_by_default_and_configurable() {
+    let mut engine = InferenceEngine::new(Qwen3Config::tiny_test(), greedy_params(), 42);
+    assert_eq!(engine.prefill_chunk_tokens(), None, "one-shot by default");
+    engine.set_prefill_chunk_tokens(Some(64));
+    assert_eq!(engine.prefill_chunk_tokens(), Some(64));
+    engine.set_prefill_chunk_tokens(Some(0));
+    assert_eq!(
+        engine.prefill_chunk_tokens(),
+        None,
+        "a zero chunk size would never advance"
+    );
+    engine.set_prefill_chunk_tokens(None);
+    assert_eq!(engine.prefill_chunk_tokens(), None);
+}
+
+#[test]
+fn chunked_prefill_generates_the_same_tokens_as_one_shot() {
+    let prompt = [1u32, 2, 3, 4, 5, 6, 7];
+    let mut one_shot = InferenceEngine::new(Qwen3Config::tiny_test(), greedy_params(), 42);
+    let mut chunked = InferenceEngine::new(Qwen3Config::tiny_test(), greedy_params(), 42);
+    chunked.set_prefill_chunk_tokens(Some(2));
+
+    assert_eq!(
+        one_shot.generate(&prompt, 6).expect("one-shot"),
+        chunked.generate(&prompt, 6).expect("chunked"),
+        "splitting prefill must not change a single generated token"
+    );
+}
+
+#[test]
+fn chunked_prefill_observes_a_cancel_during_the_prompt() {
+    let prompt: Vec<u32> = (1..=32u32).collect();
+    let token = CancellationToken::new();
+    token.cancel();
+    let mut engine = InferenceEngine::new(Qwen3Config::tiny_test(), greedy_params(), 42);
+    engine.set_prefill_chunk_tokens(Some(4));
+    engine.set_cancellation_token(token);
+
+    assert!(
+        engine.generate(&prompt, 8).expect("generate").is_empty(),
+        "a cancel must abandon the prompt ingest, not only the decode loop"
+    );
+}
+
+// ── RT-27: speculative decoding is configuration, not an env var ─────
+
+#[test]
+fn speculative_config_defaults_off_and_is_settable() {
+    let mut engine = InferenceEngine::new(Qwen3Config::tiny_test(), greedy_params(), 42);
+    // The process may carry OXIBONSAI_SPEC from an outer shell; assert on
+    // the settable seam rather than on the inherited default.
+    engine.set_speculative(crate::engine_control::SpeculativeConfig::default());
+    assert!(!engine.speculative().is_enabled());
+
+    engine.set_speculative(crate::engine_control::SpeculativeConfig::ngram());
+    assert!(engine.speculative().is_enabled());
+    assert_eq!(engine.speculative().draft_len, 4);
+}
+
+// ── K-03: tier selection and its surface ─────────────────────────────
+
+#[test]
+fn try_from_model_with_tier_accepts_the_universal_reference_tier() {
+    let model = BonsaiModel::new(Qwen3Config::tiny_test());
+    let engine = InferenceEngine::try_from_model_with_tier(
+        model,
+        KernelTier::Reference,
+        greedy_params(),
+        42,
+    )
+    .expect("Reference is executable on every host");
+    assert_eq!(engine.kernel_tier(), KernelTier::Reference);
+}
+
+#[test]
+fn effective_tier_reason_names_the_tier_that_will_run() {
+    let model = BonsaiModel::new(Qwen3Config::tiny_test());
+    let engine =
+        InferenceEngine::from_model_with_tier(model, KernelTier::Reference, greedy_params(), 42);
+    let reason = engine.effective_tier_reason();
+    assert!(
+        reason.contains("reference"),
+        "the operator-facing reason must name the effective tier: {reason}"
+    );
+    assert!(!engine.uses_fused_gpu_decode());
+}
+
+// ── RT-24: one decoding contract ─────────────────────────────────────
+
+#[test]
+fn greedy_gpu_eligibility_requires_a_penalty_free_greedy_sampler() {
+    let mut engine = InferenceEngine::new(Qwen3Config::tiny_test(), greedy_params(), 42);
+    // A synthetic engine is never on the fused route, so eligibility is
+    // false regardless; the penalty terms are asserted directly.
+    assert!(!engine.greedy_gpu_eligible(false));
+    assert!(!engine.greedy_penalties_active());
+
+    engine.set_penalties(PenaltyParams::new(0.7, 0.0));
+    assert!(
+        engine.greedy_penalties_active(),
+        "a frequency penalty must be visible to the routing predicate"
+    );
+    assert!(!engine.greedy_gpu_eligible(false));
+}
+
+/// Gate-fix triage (wave 3), gatekeeper REQUIRED#1(a): `SamplingParams::default()`
+/// used to carry a hidden `repetition_penalty: 1.1`, which silently
+/// disqualified every plain `temperature: 0` request from the fused GPU
+/// argmax path (and every other `..SamplingParams::default()` seed site in
+/// the codebase inherited the same bug). The fixed default (`1.0`) is no
+/// longer penalised — `greedy_penalties_active()` must be `false` — though
+/// a synthetic/`tiny_test()` engine still never takes the fused GPU route,
+/// same as [`greedy_gpu_eligibility_requires_a_penalty_free_greedy_sampler`]
+/// above: it was never built as a fusion-capable engine in the first place,
+/// which `greedy_gpu_eligible` checks *before* consulting the sampler.
+#[test]
+fn default_sampling_params_are_not_penalised_and_the_argmax_route_only_needs_gpu_fusion() {
+    let engine = InferenceEngine::new(Qwen3Config::tiny_test(), SamplingParams::default(), 42);
+    assert_eq!(
+        engine.sampling_params().repetition_penalty,
+        1.0,
+        "the fixed Default must not carry a hidden penalty"
+    );
+    assert!(
+        !engine.greedy_penalties_active(),
+        "an unpenalised default must not read as 'penalties active'"
+    );
+    // Still `false` here -- but now purely because a synthetic engine is
+    // never `uses_fused_gpu_decode()`, not because of a hidden penalty.
+    assert!(!engine.greedy_gpu_eligible(false));
+}
+
+#[test]
+fn penalised_greedy_honours_the_penalty_and_restores_the_sampler() {
+    let prompt = [1u32, 2, 3];
+    let params = SamplingParams {
+        temperature: 0.9,
+        repetition_penalty: 1.3,
+        ..greedy_params()
+    };
+    let mut engine = InferenceEngine::new(Qwen3Config::tiny_test(), params.clone(), 42);
+    let out = engine
+        .generate_greedy_penalised(&prompt, 4, |_| true)
+        .expect("penalised greedy");
+    assert!(out.len() <= 4);
+    assert_eq!(
+        engine.sampling_params().repetition_penalty,
+        params.repetition_penalty,
+        "the temporary greedy override must be restored"
+    );
+    assert_eq!(
+        engine.sampling_params().temperature,
+        params.temperature,
+        "temperature must be restored after the greedy override"
+    );
+}
+
+#[test]
+fn penalised_greedy_is_deterministic_regardless_of_seed() {
+    let prompt = [1u32, 2, 3];
+    let params = SamplingParams {
+        temperature: 0.9,
+        repetition_penalty: 1.3,
+        ..greedy_params()
+    };
+    let mut a = InferenceEngine::new(Qwen3Config::tiny_test(), params.clone(), 1);
+    let mut b = InferenceEngine::new(Qwen3Config::tiny_test(), params, 9_999);
+    assert_eq!(
+        a.generate_greedy_penalised(&prompt, 5, |_| true)
+            .expect("a"),
+        b.generate_greedy_penalised(&prompt, 5, |_| true)
+            .expect("b"),
+        "greedy decoding must not consume RNG, whatever the seed"
+    );
+}
+
+// ── Penalty seam wiring ───────────────────────────────────────────────
+
+#[test]
+fn penalties_default_off_and_settable() {
+    let config = Qwen3Config::tiny_test();
+    let mut engine = InferenceEngine::new(config, SamplingParams::default(), 42);
+    assert!(!engine.penalties().is_active(), "penalties default off");
+    engine.set_penalties(PenaltyParams::new(0.5, 0.25));
+    assert!(engine.penalties().is_active());
+    assert_eq!(engine.penalties().frequency_penalty, 0.5);
+    assert_eq!(engine.penalties().presence_penalty, 0.25);
+}
+
+#[test]
+fn generate_is_deterministic_with_penalties() {
+    let params = SamplingParams {
+        temperature: 0.8,
+        top_k: 40,
+        top_p: 0.95,
+        repetition_penalty: 1.3,
+        max_tokens: 128,
+    };
+    let prompt = vec![151644u32, 872, 1234];
+
+    let mut e1 = InferenceEngine::new(Qwen3Config::tiny_test(), params.clone(), 7);
+    e1.set_penalties(PenaltyParams::new(0.5, 0.5));
+    let o1 = e1.generate(&prompt, 16).expect("gen1");
+
+    let mut e2 = InferenceEngine::new(Qwen3Config::tiny_test(), params, 7);
+    e2.set_penalties(PenaltyParams::new(0.5, 0.5));
+    let o2 = e2.generate(&prompt, 16).expect("gen2");
+
+    assert_eq!(
+        o1, o2,
+        "same seed + params + penalties must be deterministic"
+    );
+}
+
+#[test]
+fn generate_with_params_and_penalties_restores_state() {
+    let prompt = vec![151644u32, 872, 1234];
+    let base = SamplingParams::default();
+    let mut engine = InferenceEngine::new(Qwen3Config::tiny_test(), base.clone(), 11);
+
+    let temp_params = SamplingParams {
+        temperature: 0.5,
+        repetition_penalty: 1.5,
+        ..base.clone()
+    };
+    let penalties = PenaltyParams::new(0.8, 0.2);
+    let _ = engine
+        .generate_with_params_and_penalties(&prompt, 8, &temp_params, &penalties)
+        .expect("scoped generate");
+
+    // Both params and penalties are restored to their pre-call values.
+    assert_eq!(engine.penalties(), PenaltyParams::default());
+    assert!((engine.sampler.params().temperature - base.temperature).abs() < f32::EPSILON);
+    assert!(
+        (engine.sampler.params().repetition_penalty - base.repetition_penalty).abs() < f32::EPSILON
+    );
+}
+
+#[cfg(feature = "server")]
+#[test]
+fn generate_with_logprobs_returns_sane_values() {
+    let params = SamplingParams {
+        temperature: 0.0, // greedy for a stable emitted token
+        top_k: 0,
+        top_p: 1.0,
+        repetition_penalty: 1.0,
+        max_tokens: 128,
+    };
+    let prompt = vec![151644u32, 872, 1234];
+    let mut engine = InferenceEngine::new(Qwen3Config::tiny_test(), params, 3);
+
+    let (tokens, logprobs) = engine
+        .generate_with_logprobs(&prompt, 6, 5, &|id| format!("tok{id}"))
+        .expect("generate_with_logprobs");
+
+    assert_eq!(
+        tokens.len(),
+        logprobs.len(),
+        "one logprob entry per emitted token"
+    );
+    assert!(!tokens.is_empty(), "greedy tiny model should emit tokens");
+
+    for lp in &logprobs {
+        // A log-probability is always <= 0.
+        assert!(
+            lp.logprob <= 1e-4,
+            "chosen-token logprob must be <= 0, got {}",
+            lp.logprob
+        );
+        // top_logprobs is clamped to k (<= 20) and sorted descending.
+        assert!(lp.top_logprobs.len() <= 5);
+        assert!(!lp.top_logprobs.is_empty());
+        for pair in lp.top_logprobs.windows(2) {
+            assert!(
+                pair[0].logprob >= pair[1].logprob,
+                "top_logprobs must be sorted descending"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+#[test]
+fn generate_with_logprobs_empty_prompt() {
+    let mut engine = InferenceEngine::new(Qwen3Config::tiny_test(), SamplingParams::default(), 1);
+    let (tokens, logprobs) = engine
+        .generate_with_logprobs(&[], 4, 3, &|id| format!("t{id}"))
+        .expect("empty prompt ok");
+    assert!(tokens.is_empty());
+    assert!(logprobs.is_empty());
+}
+
+// ── wave-2 verifier: GPU-argmax tie-break dependency gate ──────────────
+
+/// Proves the gate actually gates: an engine presenting every *other*
+/// condition `greedy_gpu_eligible` checks (fused route, GPU kernel tier,
+/// greedy sampler) is eligible exactly when
+/// `GPU_ARGMAX_TIEBREAK_IS_FIRST_INDEX` is `true` -- the gate is what
+/// flips the predicate here, not any of the other conditions, which all
+/// already hold.
+///
+/// Built through `assemble` directly (reachable here only because
+/// `engine_tests` is a descendant module of `engine`, so it shares
+/// private-item visibility) because every *public* constructor either
+/// forces `fused_gpu_decode: false` (`from_model_with_kernel`/`new`) or
+/// requires a real GGUF file that itself classifies as fused
+/// (`from_gguf`). `KernelTier::Gpu` here is a nominal tag, never dispatched
+/// through — this test only reads it back via `greedy_gpu_eligible`'s
+/// predicate — which is exactly the "benchmarks only" use
+/// `with_tier_unchecked` documents, extended to a pure-predicate unit test.
+#[cfg(any(feature = "metal", feature = "native-cuda"))]
+#[test]
+fn greedy_gpu_eligible_reflects_the_tiebreak_gate_state() {
+    let model = BonsaiModel::new(Qwen3Config::tiny_test());
+    // Safety: never dispatched through a real kernel call in this test.
+    let kernel = unsafe { KernelDispatcher::with_tier_unchecked(KernelTier::Gpu) };
+    let sampler = Sampler::new(greedy_params(), 42);
+
+    let engine = InferenceEngine::assemble(
+        model,
+        kernel,
+        sampler,
+        EosTokenSet::single(EOS_TOKEN_ID),
+        true, // fused_gpu_decode
+    );
+
+    assert!(
+        engine.uses_fused_gpu_decode(),
+        "test setup: the engine must present as the fused-GPU route for \
+         this assertion to mean anything"
+    );
+    // Compile-time, not runtime (clippy: `assert!` on a `const` is
+    // pointless as a test): if this ever flips back to `false`, the crate
+    // stops building here until the assertion below is also revisited.
+    const {
+        assert!(
+            GPU_ARGMAX_TIEBREAK_IS_FIRST_INDEX,
+            "read GPU_ARGMAX_TIEBREAK_IS_FIRST_INDEX's doc comment before \
+             changing this -- the assertion right below assumes it is true"
+        );
+    }
+    assert!(
+        engine.greedy_gpu_eligible(false),
+        "with the tie-break gate open, an engine presenting the fused \
+         route, GPU tier and greedy sampler conditions must now be \
+         eligible"
+    );
+}
+
+// ── wave-2 verifier: EngineStats symmetry across decode routes ─────────
+
+#[test]
+fn generate_streaming_sync_records_engine_stats() {
+    let prompt = [1u32, 2, 3];
+    let mut engine = InferenceEngine::new(Qwen3Config::tiny_test(), greedy_params(), 42);
+    assert_eq!(engine.session_count(), 0);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let sent = engine
+        .generate_streaming_sync(&prompt, 4, &tx)
+        .expect("streaming_sync");
+    drop(tx);
+    assert_eq!(rx.try_iter().count(), sent, "every sent token must arrive");
+
+    assert_eq!(
+        engine.session_count(),
+        1,
+        "generate_streaming_sync's CPU tail must record engine stats just \
+         like generate/generate_tracked's do, so \
+         EngineStats::requests_completed does not depend on which decode \
+         route a request happened to take"
+    );
+    assert_eq!(engine.stats().tokens_generated(), sent as u64);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn generate_streaming_records_engine_stats() {
+    let prompt = [1u32, 2, 3];
+    let mut engine = InferenceEngine::new(Qwen3Config::tiny_test(), greedy_params(), 42);
+    assert_eq!(engine.session_count(), 0);
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let sent = engine
+        .generate_streaming(&prompt, 4, &tx)
+        .expect("streaming");
+    drop(tx);
+    let mut received = 0usize;
+    while rx.try_recv().is_ok() {
+        received += 1;
+    }
+    assert_eq!(received, sent, "every sent token must arrive");
+
+    assert_eq!(
+        engine.session_count(),
+        1,
+        "generate_streaming's CPU tail must record engine stats \
+         symmetrically with generate_streaming_sync's"
+    );
+}

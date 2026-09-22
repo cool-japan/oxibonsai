@@ -370,7 +370,7 @@ pub fn cuda_gemv_fp8_e4m3(
     n_rows: usize,
     k: usize,
 ) -> Result<(), CudaGraphError> {
-    if k == 0 || k % 32 != 0 {
+    if k == 0 || !k.is_multiple_of(32) {
         return Err(CudaGraphError::WeightLayoutError(format!(
             "FP8 E4M3 GEMV: k={k} must be a positive multiple of 32"
         )));
@@ -454,7 +454,7 @@ pub fn cuda_gemv_fp8_e5m2(
     n_rows: usize,
     k: usize,
 ) -> Result<(), CudaGraphError> {
-    if k == 0 || k % 32 != 0 {
+    if k == 0 || !k.is_multiple_of(32) {
         return Err(CudaGraphError::WeightLayoutError(format!(
             "FP8 E5M2 GEMV: k={k} must be a positive multiple of 32"
         )));

@@ -13,6 +13,14 @@
 //! - [`SmoothQuantCalibrator`]: online per-channel max-abs accumulator.
 //! - [`quantize_fp8_e4m3_smooth`]: quantize smoothed weights into E4M3FN blocks.
 //! - [`quantize_fp8_e5m2_smooth`]: quantize smoothed weights into E5M2 blocks.
+//!
+//! ## Reachability
+//!
+//! As of this writing, nothing in the CLI or the export/quantize pipeline
+//! constructs a [`SmoothQuantCalibrator`] or calls the `quantize_fp8_*_smooth`
+//! functions — there is no production entry point that runs SmoothQuant
+//! calibration against a real model's activations. This module is a
+//! tested, documented primitive for that future work, not a wired feature.
 
 use std::collections::HashMap;
 

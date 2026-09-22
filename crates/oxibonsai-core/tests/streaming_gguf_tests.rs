@@ -1,4 +1,19 @@
 //! Tests for the streaming GGUF parser.
+//!
+//! T-07 (verifier wave 3): `build_test_gguf` below is NOT re-pointed at
+//! `oxibonsai_testkit::gguf_fixture::GgufFixtureBuilder`, despite building a
+//! GGUF-shaped byte buffer. It tests a different layer of the system on
+//! purpose: the *incremental streaming parser's* byte-level state machine
+//! (one byte at a time, random chunk sizes, partial-header resumption), so
+//! it deliberately builds ONLY the header + metadata + tensor-info section
+//! (no tensor data, no alignment padding — `GgufFixtureBuilder` always
+//! produces a complete, `GgufFile::parse`-able file) and deliberately
+//! exercises every one of the 13 GGUF metadata value types (`GgufTestValue`)
+//! for full type-tag coverage, which `GgufFixtureBuilder` does not expose
+//! (only `Str`/`U32`/`F32`). Re-pointing this at the whole-file builder
+//! would need to either lose that metadata-type-tag coverage or grow
+//! `GgufFixtureBuilder` a second, incremental-friendly mode — recorded as
+//! the honest remaining duplicate T-07 explicitly allows listing.
 
 use oxibonsai_core::gguf::streaming::{GgufStreamParser, GgufValue, StreamState};
 use oxibonsai_core::BonsaiError;

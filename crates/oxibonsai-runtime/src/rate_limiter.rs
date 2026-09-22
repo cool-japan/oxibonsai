@@ -20,6 +20,52 @@
 //!     }
 //! }
 //! ```
+//!
+//! # Ready-to-mount layer (`server` feature)
+//!
+//! [`rate_limit_layer`] builds a [`RateLimitLayer`] — a plain [`tower::Layer`]
+//! — from a [`RateLimitConfig`], for a binary to mount directly with
+//! [`axum::Router::layer`] without going through [`crate::middleware`]'s
+//! bundled [`crate::middleware::apply_middleware`] convenience path. This is
+//! the seam a binary needs to interleave its own bearer-auth layer between
+//! CORS and rate limiting (findings sec-06/sec-07/SV-06/SV-10/cli-18):
+//!
+//! ```text
+//! # required layer order (outermost first, i.e. each `.layer()` call below
+//! # is issued in the OPPOSITE order, since axum/tower's later `.layer()`
+//! # call becomes the more-outer layer):
+//! cors -> auth -> rate-limit -> admission -> routes
+//! ```
+//!
+//! so that a request rejected by auth never consumes a rate-limit token, and
+//! a request rejected by the rate limiter never consumes an
+//! admission/concurrency permit. Concretely, from a binary (every call below
+//! is real, existing public API — `build_routes`, `max_concurrent_requests`
+//! / `timeout_ms`, `auth_state` and `bearer_auth` are the *binary's own*
+//! routes/admission-config/auth, not part of this crate; `cors_mw` itself is
+//! a private implementation detail of [`crate::middleware`], so CORS is
+//! mounted through the public [`crate::middleware::apply_middleware`]
+//! instead of by name):
+//!
+//! ```ignore
+//! use oxibonsai_runtime::middleware::{apply_middleware, MiddlewareConfig};
+//! use oxibonsai_runtime::rate_limiter::rate_limit_layer;
+//!
+//! let mut router = build_routes(...);
+//! router = apply_admission(router, max_concurrent_requests, timeout_ms); // innermost
+//! router = router.layer(rate_limit_layer(rate_limit_cfg));               // wraps admission
+//! router = router.layer(axum::middleware::from_fn_with_state(auth_state, bearer_auth));
+//! // CORS must be outermost. `apply_middleware` with only `cors` set (via
+//! // `MiddlewareConfig::none().with_cors(..)`, which leaves logging off and
+//! // rate limiting `None`) mounts *exactly* one layer -- CORS -- so this
+//! // call is equivalent to a standalone `cors_layer(cors_cfg)`.
+//! router = apply_middleware(router, MiddlewareConfig::none().with_cors(cors_cfg));
+//! ```
+//!
+//! [`crate::middleware::apply_middleware`] mounts the *same* [`RateLimitLayer`]
+//! internally when [`crate::middleware::MiddlewareConfig::rate_limit`] is
+//! set, so both call paths share one implementation and one observable
+//! 429/`Retry-After` contract.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -136,6 +182,36 @@ impl Default for RateLimitConfig {
     }
 }
 
+impl RateLimitConfig {
+    /// Build a config from a requests-per-minute figure — the unit both
+    /// `oxibonsai-serve`'s `--rate-limit-rpm` / `rate_limit.rpm` /
+    /// `OXIBONSAI_RATE_LIMIT_RPM` and the `oxibonsai serve` CLI's
+    /// `OXIBONSAI_RATE_LIMIT_RPM` accept (findings `sec-07` / `RT-34` /
+    /// `SV-10`), converted here to the internal per-second rate this
+    /// limiter actually enforces so the conversion has exactly one
+    /// implementation instead of being duplicated at each call site.
+    ///
+    /// `burst` is a token count (not a rate) and passes through unchanged —
+    /// see [`RateLimitConfig::burst`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oxibonsai_runtime::rate_limiter::RateLimitConfig;
+    ///
+    /// let cfg = RateLimitConfig::from_rpm(600.0, 50.0);
+    /// assert!((cfg.rps - 10.0).abs() < 1e-9);
+    /// assert!((cfg.burst - 50.0).abs() < 1e-9);
+    /// ```
+    pub fn from_rpm(rpm: f64, burst: f64) -> Self {
+        Self {
+            rps: rpm / 60.0,
+            burst,
+            ..Self::default()
+        }
+    }
+}
+
 // ─── RateLimitDecision ──────────────────────────────────────────────────────
 
 /// Decision returned by the rate limiter.
@@ -200,7 +276,7 @@ impl RateLimiter {
         if let Some(ref global_mutex) = self.global {
             let global = global_mutex
                 .lock()
-                .expect("global rate limiter mutex poisoned");
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if global.tokens < 1.0 {
                 let retry_ms = global.ms_until_available(1.0);
                 return RateLimitDecision::Deny {
@@ -213,7 +289,7 @@ impl RateLimiter {
         let mut clients = self
             .clients
             .lock()
-            .expect("client rate limiter mutex poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if let Some((bucket, _last_seen)) = clients.get_mut(client_id) {
             // Peek: refill without consuming.
@@ -238,7 +314,7 @@ impl RateLimiter {
         if let Some(ref global_mutex) = self.global {
             let mut global = global_mutex
                 .lock()
-                .expect("global rate limiter mutex poisoned");
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if !global.try_consume(1.0) {
                 let retry_ms = global.ms_until_available(1.0);
                 return RateLimitDecision::Deny {
@@ -250,7 +326,7 @@ impl RateLimiter {
         let mut clients = self
             .clients
             .lock()
-            .expect("client rate limiter mutex poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         // Evict stale entries if at capacity.
         if clients.len() >= self.config.max_clients {
@@ -286,7 +362,7 @@ impl RateLimiter {
         let mut clients = self
             .clients
             .lock()
-            .expect("client rate limiter mutex poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         clients.retain(|_, (_, last_seen)| now.duration_since(*last_seen) < ttl);
     }
 
@@ -294,7 +370,7 @@ impl RateLimiter {
     pub fn active_clients(&self) -> usize {
         self.clients
             .lock()
-            .expect("client rate limiter mutex poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .len()
     }
 
@@ -302,7 +378,7 @@ impl RateLimiter {
     pub fn reset_client(&self, client_id: &str) {
         self.clients
             .lock()
-            .expect("client rate limiter mutex poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(client_id);
     }
 
@@ -319,7 +395,7 @@ impl RateLimiter {
             Some(global_mutex) => {
                 let global = global_mutex
                     .lock()
-                    .expect("global rate limiter mutex poisoned");
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 global.tokens < 1.0
             }
         }
@@ -405,6 +481,183 @@ fn forwarded_client_id(headers: &axum::http::HeaderMap) -> Option<String> {
     }
 
     None
+}
+
+// ─── Ready-to-mount Tower layer (server feature) ─────────────────────────────
+
+/// Build the `429 Too Many Requests` response: a JSON error envelope plus a
+/// `Retry-After` header in whole seconds (rounded up, minimum 1 -- a `0`
+/// would tell the client to retry immediately, which defeats the point).
+#[cfg(feature = "server")]
+fn too_many_requests_response(retry_after_ms: u64) -> axum::response::Response {
+    use axum::http::{HeaderName, HeaderValue, StatusCode};
+    use axum::response::IntoResponse;
+
+    let retry_secs = (retry_after_ms.saturating_add(999) / 1000).max(1);
+    let body = axum::Json(serde_json::json!({
+        "error": {
+            "message": "rate limit exceeded",
+            "type": "rate_limit_error",
+            "retry_after_ms": retry_after_ms,
+        }
+    }));
+    let mut response = (StatusCode::TOO_MANY_REQUESTS, body).into_response();
+    if let Ok(header_value) = HeaderValue::from_str(&retry_secs.to_string()) {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static("retry-after"), header_value);
+    }
+    response
+}
+
+/// Resolve the client identifier for `req`: the real TCP peer address, if
+/// the router was served via
+/// [`axum::routing::Router::into_make_service_with_connect_info`], is
+/// honored as `X-Forwarded-For` / `X-Real-IP` only when it is a configured
+/// trusted proxy; otherwise the real peer (or the `"unknown"` fallback) is
+/// used directly. See [`extract_client_id`].
+///
+/// Reads the [`axum::extract::connect_info::ConnectInfo`] extension
+/// directly -- equivalent to, but without requiring, the
+/// [`axum::extract::FromRequestParts`] extractor machinery, since a raw
+/// [`tower::Service`] only sees the whole [`axum::extract::Request`] -- and,
+/// when that extension is absent, falls back to
+/// [`axum::extract::connect_info::MockConnectInfo`] exactly as
+/// `ConnectInfo::from_request_parts` itself does internally. That fallback
+/// is not merely cosmetic: `MockConnectInfo`'s `Layer` impl inserts a
+/// `MockConnectInfo<T>` extension, a *different type* from `ConnectInfo<T>`,
+/// so a plain `ConnectInfo<T>` extension lookup alone would silently never
+/// see a test's `.layer(MockConnectInfo(addr))` and every mocked-peer test
+/// would collapse onto the `"unknown"` bucket.
+#[cfg(feature = "server")]
+fn client_id_for_request(
+    req: &axum::extract::Request,
+    trusted_proxies: &[std::net::IpAddr],
+) -> String {
+    use axum::extract::connect_info::{ConnectInfo, MockConnectInfo};
+
+    let peer_ip = req
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip())
+        .or_else(|| {
+            req.extensions()
+                .get::<MockConnectInfo<std::net::SocketAddr>>()
+                .map(|MockConnectInfo(addr)| addr.ip())
+        });
+    extract_client_id(req.headers(), peer_ip, trusted_proxies)
+}
+
+/// Ready-to-mount [`tower::Layer`] enforcing a [`RateLimitConfig`].
+///
+/// Construct with [`rate_limit_layer`] and mount with
+/// [`axum::Router::layer`]. `/health` and `/metrics` are always exempt
+/// (liveness and metrics probes must never be throttled). See the module
+/// docs ("Ready-to-mount layer") for the required position of this layer
+/// relative to CORS, auth, and the admission/concurrency layer.
+///
+/// This is the exact same enforcement [`crate::middleware::apply_middleware`]
+/// installs when [`crate::middleware::MiddlewareConfig::rate_limit`] is
+/// `Some` -- both paths construct a [`RateLimitLayer`], so there is one
+/// implementation and one observable behavior.
+#[cfg(feature = "server")]
+#[derive(Clone)]
+pub struct RateLimitLayer {
+    limiter: std::sync::Arc<RateLimiter>,
+}
+
+#[cfg(feature = "server")]
+impl<S> tower::Layer<S> for RateLimitLayer {
+    type Service = RateLimitService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        RateLimitService {
+            inner,
+            limiter: std::sync::Arc::clone(&self.limiter),
+        }
+    }
+}
+
+/// The [`tower::Service`] produced by [`RateLimitLayer`]. Not constructed
+/// directly -- see [`rate_limit_layer`].
+#[cfg(feature = "server")]
+#[derive(Clone)]
+pub struct RateLimitService<S> {
+    inner: S,
+    limiter: std::sync::Arc<RateLimiter>,
+}
+
+#[cfg(feature = "server")]
+impl<S> tower::Service<axum::extract::Request> for RateLimitService<S>
+where
+    S: tower::Service<axum::extract::Request, Response = axum::response::Response>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+{
+    type Response = axum::response::Response;
+    type Error = S::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: axum::extract::Request) -> Self::Future {
+        let path = req.uri().path();
+        if path == "/health" || path == "/metrics" {
+            return Box::pin(self.inner.call(req));
+        }
+
+        let client_id = client_id_for_request(&req, self.limiter.trusted_proxies());
+        match self.limiter.check_and_consume(&client_id) {
+            RateLimitDecision::Allow => Box::pin(self.inner.call(req)),
+            RateLimitDecision::Deny { retry_after_ms } => Box::pin(std::future::ready(Ok(
+                too_many_requests_response(retry_after_ms),
+            ))),
+        }
+    }
+}
+
+/// Build a ready-to-mount rate-limiting [`tower::Layer`] from `cfg`.
+///
+/// Enforces [`RateLimiter::check_and_consume`] per client (identity from
+/// [`extract_client_id`]), responding `429 Too Many Requests` with a
+/// `Retry-After` header (whole seconds, rounded up, minimum 1) when the
+/// client's budget is exhausted; `/health` and `/metrics` are always exempt.
+///
+/// See the module docs ("Ready-to-mount layer") for the mandatory layer
+/// order: mount this **between** the bearer-auth layer and the
+/// admission/concurrency-limit layer (`cors -> auth -> rate-limit ->
+/// admission`), so an unauthenticated request is rejected before it can
+/// consume a rate-limit token, and a rate-limited request is rejected
+/// before it can consume an admission permit (cli-18).
+///
+/// # Example
+///
+/// ```
+/// use oxibonsai_runtime::rate_limiter::{rate_limit_layer, RateLimitConfig};
+/// use axum::{routing::get, Router};
+///
+/// async fn handler() -> &'static str { "ok" }
+///
+/// let cfg = RateLimitConfig { rps: 100.0, burst: 200.0, ..Default::default() };
+/// let router: Router = Router::new()
+///     .route("/", get(handler))
+///     .layer(rate_limit_layer(cfg));
+/// ```
+#[cfg(feature = "server")]
+pub fn rate_limit_layer(cfg: RateLimitConfig) -> RateLimitLayer {
+    RateLimitLayer {
+        limiter: std::sync::Arc::new(RateLimiter::new(cfg)),
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -508,6 +761,37 @@ mod tests {
         );
     }
 
+    // ─── RateLimitConfig::from_rpm (sec-07 / RT-34 / SV-10) ───────────────
+
+    #[test]
+    fn from_rpm_converts_to_the_internal_per_second_rate() {
+        let cfg = RateLimitConfig::from_rpm(600.0, 50.0);
+        assert!((cfg.rps - 10.0).abs() < 1e-9);
+        assert!((cfg.burst - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn from_rpm_leaves_the_other_defaults_untouched() {
+        let cfg = RateLimitConfig::from_rpm(60.0, 5.0);
+        let defaults = RateLimitConfig::default();
+        assert_eq!(cfg.max_clients, defaults.max_clients);
+        assert_eq!(cfg.client_ttl, defaults.client_ttl);
+        assert!(cfg.global_rps.is_none());
+        assert!(cfg.trusted_proxies.is_empty());
+    }
+
+    #[test]
+    fn from_rpm_enforces_the_converted_rate_end_to_end() {
+        // 60 rpm == 1 rps; with a burst of 1, a second immediate request
+        // (well under a second later) must be denied.
+        let limiter = RateLimiter::new(RateLimitConfig::from_rpm(60.0, 1.0));
+        assert_eq!(
+            limiter.check_and_consume("client"),
+            RateLimitDecision::Allow
+        );
+        assert!(!limiter.check_and_consume("client").is_allowed());
+    }
+
     #[test]
     fn test_rate_limit_decision_is_allowed() {
         assert!(RateLimitDecision::Allow.is_allowed());
@@ -525,6 +809,9 @@ mod tests {
     /// client-supplied `X-Forwarded-For` header must be completely ignored
     /// -- otherwise any direct client could rotate the header on every
     /// request to obtain a fresh rate-limit bucket each time.
+    // `extract_client_id` is `#[cfg(feature = "server")]`; without it this
+    // test cannot compile (it would break `--no-default-features --lib`).
+    #[cfg(feature = "server")]
     #[test]
     fn test_extract_client_id_ignores_untrusted_forwarded_header() {
         use axum::http::HeaderMap;
@@ -548,6 +835,9 @@ mod tests {
 
     /// When the immediate peer *is* a configured trusted proxy, the
     /// forwarded header is honored (the legitimate reverse-proxy case).
+    // `extract_client_id` is `#[cfg(feature = "server")]`; without it this
+    // test cannot compile (it would break `--no-default-features --lib`).
+    #[cfg(feature = "server")]
     #[test]
     fn test_extract_client_id_honors_forwarded_header_from_trusted_proxy() {
         use axum::http::HeaderMap;
@@ -567,6 +857,9 @@ mod tests {
 
     /// With no trusted proxies and no forwarded headers, a known peer
     /// address is used directly as the client identifier.
+    // `extract_client_id` is `#[cfg(feature = "server")]`; without it this
+    // test cannot compile (it would break `--no-default-features --lib`).
+    #[cfg(feature = "server")]
     #[test]
     fn test_extract_client_id_uses_real_peer_when_no_headers() {
         use axum::http::HeaderMap;
@@ -581,6 +874,9 @@ mod tests {
     /// With neither a known peer address nor headers, fall back to the
     /// literal `"unknown"` string (unchanged legacy behavior for callers
     /// that cannot supply connection info).
+    // `extract_client_id` is `#[cfg(feature = "server")]`; without it this
+    // test cannot compile (it would break `--no-default-features --lib`).
+    #[cfg(feature = "server")]
     #[test]
     fn test_extract_client_id_fallback() {
         use axum::http::HeaderMap;
@@ -592,6 +888,9 @@ mod tests {
     /// A trusted-proxy allowlist entry that does not match the actual peer
     /// must not grant header trust (exact-match only, no accidental prefix
     /// or subnet matching).
+    // `extract_client_id` is `#[cfg(feature = "server")]`; without it this
+    // test cannot compile (it would break `--no-default-features --lib`).
+    #[cfg(feature = "server")]
     #[test]
     fn test_extract_client_id_trusted_proxies_list_is_exact_match() {
         use axum::http::HeaderMap;
@@ -624,5 +923,256 @@ mod tests {
     fn test_rate_limiter_no_global_limit_by_default() {
         let limiter = RateLimiter::new(RateLimitConfig::default());
         assert!(!limiter.is_global_limited());
+    }
+}
+
+// ─── `rate_limit_layer` integration tests (server feature) ───────────────────
+
+#[cfg(all(test, feature = "server"))]
+mod rate_limit_layer_tests {
+    use super::{rate_limit_layer, RateLimitConfig};
+    use axum::body::Body;
+    use axum::extract::State;
+    use axum::http::{Request, StatusCode};
+    use axum::middleware::{self, Next};
+    use axum::response::Response;
+    use axum::routing::get;
+    use axum::Router;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    async fn handler() -> &'static str {
+        "ok"
+    }
+
+    /// Stands in for the admission/concurrency-limit layer's in-flight
+    /// permit count: a monotonic counter incremented once per request that
+    /// actually reaches it. Unlike an increment-then-decrement gauge, a
+    /// bug that let a denied request slip through cannot "self-heal" back
+    /// to the pre-request reading before the test observes it -- the
+    /// counter would simply read one higher.
+    #[derive(Clone, Default)]
+    struct AdmissionEntryCounter(Arc<AtomicUsize>);
+
+    async fn admission_stand_in(
+        State(counter): State<AdmissionEntryCounter>,
+        req: Request<Body>,
+        next: Next,
+    ) -> Response {
+        counter.0.fetch_add(1, Ordering::SeqCst);
+        next.run(req).await
+    }
+
+    /// `rate_limit_layer` returns `429` with a `Retry-After` header once a
+    /// client's burst is exhausted, and -- because it never calls the inner
+    /// service for a denied request -- a layer nested inside it (standing
+    /// in for the admission/concurrency-permit layer, per the mandatory
+    /// `rate-limit -> admission` order) never runs for that request
+    /// (acceptance criterion: "the concurrency gauge did not move";
+    /// cli-18).
+    #[tokio::test]
+    async fn denied_request_gets_429_and_never_reaches_admission() {
+        let counter = AdmissionEntryCounter::default();
+        let router = Router::new()
+            .route("/", get(handler))
+            // innermost: stands in for the admission/concurrency layer.
+            .layer(middleware::from_fn_with_state(
+                counter.clone(),
+                admission_stand_in,
+            ))
+            // outer: the layer under test.
+            .layer(rate_limit_layer(RateLimitConfig {
+                rps: 1.0,
+                burst: 1.0,
+                ..Default::default()
+            }));
+
+        let make_req = || {
+            Request::builder()
+                .uri("/")
+                .header("x-forwarded-for", "203.0.113.5")
+                .body(Body::empty())
+                .expect("request")
+        };
+
+        // First request: within burst -> allowed, reaches the admission
+        // stand-in exactly once.
+        let resp1 = router.clone().oneshot(make_req()).await.expect("resp1");
+        assert_eq!(resp1.status(), StatusCode::OK);
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            1,
+            "the allowed request must reach the admission stand-in"
+        );
+
+        // Second request from the same client: burst exhausted -> 429, and
+        // the gauge must read the exact same value as before this call --
+        // it must not move at all.
+        let resp2 = router.clone().oneshot(make_req()).await.expect("resp2");
+        assert_eq!(resp2.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            resp2.headers().get("retry-after").is_some(),
+            "a 429 response must carry a Retry-After header"
+        );
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            1,
+            "a rate-limited request must never reach the admission/concurrency \
+             layer -- the gauge must not have moved"
+        );
+
+        let retry_after = resp2
+            .headers()
+            .get("retry-after")
+            .expect("retry-after present")
+            .to_str()
+            .expect("retry-after is ASCII")
+            .parse::<u64>()
+            .expect("retry-after is an integer number of seconds");
+        assert!(retry_after >= 1, "Retry-After must be at least 1 second");
+
+        let body = axum::body::to_bytes(resp2.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("parse json");
+        assert_eq!(json["error"]["type"], "rate_limit_error");
+    }
+
+    /// `/health` and `/metrics` are always exempt, matching
+    /// [`crate::middleware::apply_middleware`]'s historical rate-limit
+    /// behavior (both now share this same [`super::RateLimitLayer`]).
+    #[tokio::test]
+    async fn health_and_metrics_are_exempt_from_rate_limit_layer() {
+        let router = Router::new()
+            .route("/health", get(handler))
+            .route("/metrics", get(handler))
+            .layer(rate_limit_layer(RateLimitConfig {
+                rps: 1.0,
+                burst: 1.0,
+                ..Default::default()
+            }));
+
+        for _ in 0..5 {
+            for path in ["/health", "/metrics"] {
+                let resp = router
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(path)
+                            .body(Body::empty())
+                            .expect("request"),
+                    )
+                    .await
+                    .expect("response");
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::OK,
+                    "{path} must never be throttled"
+                );
+            }
+        }
+    }
+
+    /// [`rate_limit_layer`] is directly mountable with a single `.layer()`
+    /// call given only a [`RateLimitConfig`] -- the "ready to mount"
+    /// contract it promises (findings sec-07 / SV-10), independent of
+    /// [`crate::middleware::MiddlewareConfig`] / `apply_middleware`.
+    #[tokio::test]
+    async fn mounts_directly_from_just_a_config() {
+        let router: Router = Router::new()
+            .route("/", get(handler))
+            .layer(rate_limit_layer(RateLimitConfig::default()));
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Two requests carrying the same (untrusted, so ignored)
+    /// `X-Forwarded-For` collapse onto the shared `"unknown"` bucket and
+    /// exhaust it together -- the standalone layer's default client
+    /// identity is the real peer, not a client-suppliable header (see
+    /// [`extract_client_id`]).
+    #[tokio::test]
+    async fn same_untrusted_forwarded_header_shares_one_bucket() {
+        let router = Router::new()
+            .route("/", get(handler))
+            .layer(rate_limit_layer(RateLimitConfig {
+                rps: 1.0,
+                burst: 1.0,
+                ..Default::default()
+            }));
+
+        let req = |peer: &str| {
+            Request::builder()
+                .uri("/")
+                .header("x-forwarded-for", peer)
+                .body(Body::empty())
+                .expect("request")
+        };
+
+        let resp = router.clone().oneshot(req("9.9.9.9")).await.expect("r1");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = router.clone().oneshot(req("9.9.9.9")).await.expect("r2");
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the shared \"unknown\" bucket (no trusted ConnectInfo) must now be exhausted"
+        );
+    }
+
+    /// Distinct *real* peers (via [`MockConnectInfo`], standing in for a
+    /// real TCP connection's address) get independent buckets through the
+    /// standalone layer, exactly as they do through
+    /// [`crate::middleware::apply_middleware`] -- one client's exhausted
+    /// budget must never throttle another.
+    #[tokio::test]
+    async fn distinct_real_peers_get_independent_buckets() {
+        use axum::extract::connect_info::MockConnectInfo;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let layer = rate_limit_layer(RateLimitConfig {
+            rps: 1.0,
+            burst: 1.0,
+            ..Default::default()
+        });
+        let router_for_peer = |ip: IpAddr| {
+            Router::new()
+                .route("/", get(handler))
+                .layer(layer.clone())
+                .layer(MockConnectInfo(SocketAddr::new(ip, 4000)))
+        };
+
+        let client_a = router_for_peer(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let client_b = router_for_peer(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+
+        let plain_req = || {
+            Request::builder()
+                .uri("/")
+                .body(Body::empty())
+                .expect("request")
+        };
+
+        // Client A exhausts its own (burst = 1) bucket.
+        let resp = client_a.clone().oneshot(plain_req()).await.expect("a1");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = client_a.oneshot(plain_req()).await.expect("a2");
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // Client B, a distinct real peer sharing the same `RateLimitLayer`
+        // (and thus the same underlying `RateLimiter`), is unaffected.
+        let resp = client_b.oneshot(plain_req()).await.expect("b1");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a distinct real peer must get its own bucket, not share client A's"
+        );
     }
 }

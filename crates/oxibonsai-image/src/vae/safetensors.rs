@@ -5,7 +5,8 @@
 //! (subfolder `vae/`), `_class_name = "AutoencoderKLFlux2"`.
 //!
 //! This is the self-serve replacement for the dev-time Python `.npy` golden
-//! dump (`/tmp/bonsai_vae_export_weights.py`): it resolves every dotted weight
+//! dump (exported by the project's `bonsai_vae_export_weights.py` export
+//! script): it resolves every dotted weight
 //! name the decoder requests (the [`super::weights`] key contract) to the
 //! matching safetensors tensor, applies the **identical** layout/name transforms
 //! the Python export applied, and decodes the on-disk dtype to the f32 the
@@ -59,6 +60,7 @@
 use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
+use oxibonsai_core::bf16::bf16_to_f32;
 use safetensors::{Dtype, SafeTensors};
 
 use crate::vae::error::{VaeError, VaeResult};
@@ -69,15 +71,6 @@ use crate::vae::weights::Tensor;
 const TO_OUT: &str = ".to_out.";
 /// Replacement infix that re-nests `to_out` into its `ModuleList` slot 0.
 const TO_OUT_NESTED: &str = ".to_out.0.";
-
-/// Reinterpret a bfloat16 bit pattern as `f32`.
-///
-/// bfloat16 is the top 16 bits of an IEEE-754 `f32`, so the widening is an exact
-/// left-shift by 16 with no rounding (lossless decode).
-#[inline]
-fn bf16_to_f32(bits: u16) -> f32 {
-    f32::from_bits((bits as u32) << 16)
-}
 
 /// A memory-mapped FLUX.2 `AutoencoderKLFlux2` VAE safetensors file.
 ///
@@ -286,6 +279,27 @@ mod tests {
         }
         // Explicit bit check: bf16 0x3FC0 == 1.5.
         assert_eq!(bf16_to_f32(0x3FC0), 1.5);
+    }
+
+    /// FIX3-GGUF-WRITE item 4: the now-imported `bf16_to_f32`
+    /// (`oxibonsai_core::bf16::bf16_to_f32`) must agree with this module's
+    /// former local expression over the entire `u16` domain — every
+    /// subnormal, both zeros, every infinity and every NaN payload.
+    /// Compared by `to_bits()`: under IEEE `==`, `NaN != NaN` (two
+    /// genuinely-agreeing NaN outputs would look like a mismatch) and
+    /// `-0.0 == 0.0` (a real sign-of-zero mismatch would look like
+    /// agreement).
+    #[test]
+    fn bf16_to_f32_matches_the_former_local_expression_across_the_full_u16_domain() {
+        for bits in 0u16..=0xFFFF {
+            let shared = bf16_to_f32(bits);
+            let former_local_expression = f32::from_bits((bits as u32) << 16);
+            assert_eq!(
+                shared.to_bits(),
+                former_local_expression.to_bits(),
+                "mismatch for bf16 bit pattern {bits:#06x}"
+            );
+        }
     }
 
     #[test]

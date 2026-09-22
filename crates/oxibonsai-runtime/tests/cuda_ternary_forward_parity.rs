@@ -28,6 +28,7 @@ use oxibonsai_kernels::dispatch::{KernelDispatcher, KernelTier};
 use oxibonsai_model::model::BonsaiModel;
 use oxibonsai_runtime::engine::InferenceEngine;
 use oxibonsai_runtime::sampling::SamplingParams;
+use oxibonsai_testkit::capability::{record as record_capability, Capability};
 
 const MAX_SEQ: usize = 512;
 
@@ -61,13 +62,32 @@ fn read_model() -> Option<Vec<u8>> {
     }
 }
 
+// ── T-05 capability-report producer ─────────────────────────────────────────
+//
+// T-07 FIX (verifier wave 3): this used to be an inline copy of
+// `oxibonsai_testkit::capability::record`; `oxibonsai-runtime` now takes
+// `oxibonsai-testkit` as a dev-dependency (imported above), so the copy is
+// deleted in favour of the shared implementation.
+
 /// Greedy CPU-reference vs CUDA-Gpu output must match on the real ternary model.
 /// The prompt length is the regression trigger (the bug appeared above ~16
 /// tokens); override the count via `OXI_PROMPT_LEN` (default 20, i.e. >16).
 #[test]
 #[ignore = "requires real ternary GGUF + CUDA GPU; run with --ignored"]
 fn real_ternary_cpu_cuda_parity() {
-    let Some(gguf) = read_model() else { return };
+    let Some(gguf) = read_model() else {
+        record_capability(
+            Capability::Cuda,
+            false,
+            "oxibonsai-runtime::cuda_ternary_forward_parity::real_ternary_cpu_cuda_parity",
+        );
+        return;
+    };
+    record_capability(
+        Capability::Cuda,
+        true,
+        "oxibonsai-runtime::cuda_ternary_forward_parity::real_ternary_cpu_cuda_parity",
+    );
     let plen: usize = std::env::var("OXI_PROMPT_LEN")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -95,7 +115,19 @@ fn real_ternary_cpu_cuda_parity() {
 #[test]
 #[ignore = "requires real ternary GGUF + CUDA GPU; run with --ignored"]
 fn real_ternary_decode_logit_delta() {
-    let Some(gguf) = read_model() else { return };
+    let Some(gguf) = read_model() else {
+        record_capability(
+            Capability::Cuda,
+            false,
+            "oxibonsai-runtime::cuda_ternary_forward_parity::real_ternary_decode_logit_delta",
+        );
+        return;
+    };
+    record_capability(
+        Capability::Cuda,
+        true,
+        "oxibonsai-runtime::cuda_ternary_forward_parity::real_ternary_decode_logit_delta",
+    );
     let plen: usize = std::env::var("OXI_PROMPT_LEN")
         .ok()
         .and_then(|s| s.parse().ok())

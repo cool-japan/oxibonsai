@@ -76,10 +76,18 @@ fn runtime_sampling_params_available() {
 
 #[test]
 fn runtime_config_available() {
+    // T-09: used to bind `_model`/`_sampling` and assert nothing about
+    // either. Pin the actual documented defaults instead (mirrors
+    // `runtime_sampling_params_available`'s style just above).
     let config = oxibonsai_runtime::OxiBonsaiConfig::default();
-    // Config should have reasonable defaults
-    let _model = &config.model;
-    let _sampling = &config.sampling;
+    assert!(
+        config.sampling.temperature >= 0.0,
+        "default sampling temperature should be non-negative"
+    );
+    assert!(
+        config.model.max_seq_len > 0,
+        "default model config should have a positive max sequence length"
+    );
 }
 
 #[test]
@@ -120,29 +128,28 @@ fn runtime_metrics_available() {
 
 // ── SIMD feature detection ──────────────────────────────────────────────────
 
-#[test]
-#[allow(clippy::assertions_on_constants)]
-fn simd_feature_flags_compile() {
-    // These are compile-time checks: if the feature is enabled, the
-    // corresponding module should exist.  On CI we test each feature
-    // separately with --features flags.
-
-    #[cfg(all(target_arch = "x86_64", feature = "simd-avx2"))]
-    {
-        // AVX2 module should be available
-        assert!(true, "simd-avx2 feature compiles on x86_64");
-    }
-
-    #[cfg(all(target_arch = "x86_64", feature = "simd-avx512"))]
-    {
-        assert!(true, "simd-avx512 feature compiles on x86_64");
-    }
-
-    #[cfg(all(target_arch = "aarch64", feature = "simd-neon"))]
-    {
-        assert!(true, "simd-neon feature compiles on aarch64");
-    }
-}
+// T-09: `simd_feature_flags_compile` used to be three `#[cfg(...)]`-gated
+// `assert!(true, ...)` blocks — vacuously true by construction (reaching a
+// `#[cfg]`-included block at all already proves it compiled; the `assert!`
+// checked nothing an unconditional `{}` would not have).
+//
+// Re-verified (this differs from the finder's "0 references" evidence,
+// which is now stale — a later wave's `src/cli/model_desc.rs` added a real
+// `cfg!(feature = "simd-avx2"/"simd-avx512"/"simd-neon")` consumer that
+// reports these flags to `oxibonsai info`): the three Cargo features still
+// gate **no kernel-dispatch behaviour** anywhere — `KernelTier::Avx2` /
+// `::Avx512` / `::Neon` (`crates/oxibonsai-kernels/src/dispatch.rs`) are
+// selected purely by `target_arch` plus *runtime* CPU-feature detection
+// (`is_x86_feature_detected!`), never by these Cargo features, so there is
+// still no dispatch-level behaviour for this test to assert against.
+// `model_desc.rs`'s new reporting fields are the only consumer, live in
+// `src/cli/` (not owned by this package, and not reachable from this
+// integration-test binary — the root `oxibonsai-cli` package has no `[lib]`
+// target `tests/*.rs` files could import from). Deleted per the spec's
+// explicit "give it a real assertion or delete it" rather than leaving a
+// stale claim or inventing an assertion this file cannot actually make;
+// recorded as a deviation for a package that owns `src/cli/model_desc.rs`
+// to add real coverage of its own `cfg!()` reporting.
 
 // ── Model crate availability ────────────────────────────────────────────────
 
@@ -160,11 +167,41 @@ fn model_kv_cache_available() {
 
 // ── Server feature gating ───────────────────────────────────────────────────
 
-#[test]
+// MINOR fix (verifier wave 3): this used to bind `create_router_with_metrics`
+// as compile-time evidence and then `assert!(true, ...)` — no runtime check
+// at all beyond "this compiled" (which the `#[cfg(feature = "server")]` gate
+// already guarantees). Now it actually calls the function and drives one
+// request through the built router, mirroring the in-process
+// `tower::ServiceExt::oneshot` style `tests/cli_surface_tests.rs` /
+// `tests/rag_serve_cli_tests.rs` already use in this same package.
 #[cfg(feature = "server")]
-#[allow(clippy::assertions_on_constants)]
-fn server_module_available_when_feature_enabled() {
-    // When "server" feature is on, the server module should be usable
-    let _router_fn_exists = oxibonsai_runtime::server::create_router_with_metrics;
-    assert!(true, "server module is available with server feature");
+#[tokio::test]
+async fn server_module_available_when_feature_enabled() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt as _;
+
+    let engine = oxibonsai_runtime::engine::InferenceEngine::new(
+        oxibonsai_core::Qwen3Config::tiny_test(),
+        oxibonsai_runtime::sampling::SamplingParams::default(),
+        42,
+    );
+    let router = oxibonsai_runtime::server::create_router_with_metrics(
+        engine,
+        None,
+        std::sync::Arc::new(oxibonsai_runtime::InferenceMetrics::new()),
+    );
+    let request = Request::builder()
+        .uri("/health")
+        .body(Body::empty())
+        .expect("build request");
+    let response = router
+        .oneshot(request)
+        .await
+        .expect("router must handle the request without erroring");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a router built by create_router_with_metrics must actually serve GET /health"
+    );
 }

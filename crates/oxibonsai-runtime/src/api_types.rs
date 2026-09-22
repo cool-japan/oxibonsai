@@ -288,12 +288,129 @@ pub struct ExtendedChatRequest {
     pub presence_penalty: Option<f32>,
     /// Penalty applied proportional to a token's frequency in the context.
     pub frequency_penalty: Option<f32>,
+    /// Repetition penalty (`1.0` = disabled). When omitted, the handler seeds
+    /// from the engine's own startup `SamplingParams` rather than a
+    /// hardcoded literal or `SamplingParams::default()` (gatekeeper
+    /// `REQUIRED #1`): the previous hardcoded `1.1` permanently disqualified
+    /// every extended-endpoint request from the GPU-argmax greedy path
+    /// (`InferenceEngine::greedy_gpu_eligible` requires exactly `1.0`), even
+    /// a `temperature: 0` request against a server started with no
+    /// repetition penalty configured at all.
+    pub repetition_penalty: Option<f32>,
     /// An optional identifier for the end user.
     pub user: Option<String>,
 }
 
 fn default_max_tokens() -> usize {
     256
+}
+
+// ── Multimodal content parts (SV-11 — prepare only) ──────────────────────────
+//
+// `ChatMessage.content` (`crate::server::ChatMessage`) is `Option<String>`,
+// so a request whose message content is an array of content parts (the
+// OpenAI vision shape, `content: string | ContentPart[]`) is rejected at the
+// type level with a bare deserialization error before any handler code runs
+// — the type-level block Bonsai 2 vision needs removed (mmproj / Qwen3-VL
+// merger, `<|image_pad|>` token expansion; see `CONTEXT.md`'s Bonsai 2
+// section). `ChatMessage` itself lives in `server.rs`, which this package
+// does not own, so this cannot be wired into it directly this wave (see
+// `deviations`); what *is* fully implemented here, end to end, is the
+// value-level machinery B2-20 (wave 6) will plug straight into
+// `ChatMessage.content: Option<MessageContent>` — deserialization, the
+// text-only extraction used by every prompt builder today, and an honest
+// rejection of `image_url` parts (never a silent drop, never a stub image
+// path: "do not accept `image_url` yet, and say so in the 400 message").
+
+/// One part of a multipart chat message `content` array (OpenAI vision
+/// shape: `{"type": "text", "text": "..."}` /
+/// `{"type": "image_url", "image_url": {"url": "...", ...}}`).
+///
+/// `ImageUrl` is parsed structurally — never silently dropped or merged into
+/// an "unknown variant" deserialization error — precisely so that
+/// [`MessageContent::into_text_only`] can recognize it and produce a clear,
+/// specific rejection message instead of an opaque schema error. Parsing an
+/// `image_url` part is not the same as supporting it: nothing here decodes,
+/// fetches, or otherwise acts on the URL (`B2-20`'s job).
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentPart {
+    /// A plain text segment.
+    Text {
+        /// The text content.
+        text: String,
+    },
+    /// An image reference. Structurally accepted, semantically rejected —
+    /// see [`MessageContent::into_text_only`].
+    ImageUrl {
+        /// The image reference payload.
+        image_url: ImageUrlPart,
+    },
+}
+
+/// The `image_url` object of an [`ContentPart::ImageUrl`] part.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct ImageUrlPart {
+    /// The image URL (`http(s)://...` or a `data:` URI).
+    pub url: String,
+    /// OpenAI's optional resolution hint (`"auto"` / `"low"` / `"high"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// A chat message's `content`: either a plain string (the common case, and
+/// the only shape `crate::server::ChatMessage` accepts today) or an array of
+/// [`ContentPart`]s (the OpenAI multimodal shape).
+///
+/// `#[serde(untagged)]` tries each variant in declaration order, so a bare
+/// JSON string deserializes as [`MessageContent::Text`] and a JSON array as
+/// [`MessageContent::Parts`] — matching the wire format exactly, including
+/// on the way back out: serializing `Text(s)` re-emits the bare string `s`,
+/// not `{"Text": s}`, so a future `ChatMessage.content: Option<MessageContent>`
+/// stays byte-identical on responses (which only ever construct `Text`).
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(untagged)]
+pub enum MessageContent {
+    /// Plain text content.
+    Text(String),
+    /// Multipart content.
+    Parts(Vec<ContentPart>),
+}
+
+impl MessageContent {
+    /// Flatten this content into a single string for the text-only prompt
+    /// builders every endpoint uses today.
+    ///
+    /// A bare string passes through unchanged. A parts array concatenates
+    /// every [`ContentPart::Text`] segment (in order, with no separator —
+    /// matching the single-text-part case OpenAI examples typically show).
+    /// An `image_url` part is never silently dropped: its presence is an
+    /// `Err` naming the field, so a caller can surface a `400` rather than
+    /// send the model a prompt silently missing the image the client asked
+    /// about.
+    pub fn into_text_only(self) -> Result<String, String> {
+        match self {
+            MessageContent::Text(s) => Ok(s),
+            MessageContent::Parts(parts) => {
+                if parts
+                    .iter()
+                    .any(|p| matches!(p, ContentPart::ImageUrl { .. }))
+                {
+                    return Err("image_url content parts are not supported yet; only text \
+                         content parts are accepted (image input support is planned)"
+                        .to_string());
+                }
+                Ok(parts
+                    .into_iter()
+                    .filter_map(|p| match p {
+                        ContentPart::Text { text } => Some(text),
+                        ContentPart::ImageUrl { .. } => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(""))
+            }
+        }
+    }
 }
 
 // ── Extended choice with logprobs ─────────────────────────────────────────────
@@ -566,5 +683,86 @@ mod tests {
         assert_eq!(lp.top_logprobs.len(), 3);
         // The highest logit (index 1) should be the first top logprob
         assert_eq!(lp.top_logprobs[0].token, "tok1");
+    }
+
+    // ── MessageContent / ContentPart (SV-11 prepare-only) ────────────────────
+
+    #[test]
+    fn message_content_deserializes_bare_string() {
+        let mc: MessageContent = serde_json::from_str(r#""hello world""#).expect("string form");
+        assert_eq!(mc, MessageContent::Text("hello world".to_string()));
+        assert_eq!(mc.into_text_only().expect("text only"), "hello world");
+    }
+
+    #[test]
+    fn message_content_deserializes_text_parts_array() {
+        let json = serde_json::json!([
+            {"type": "text", "text": "hello "},
+            {"type": "text", "text": "world"},
+        ]);
+        let mc: MessageContent = serde_json::from_value(json).expect("parts form");
+        assert_eq!(
+            mc,
+            MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "hello ".to_string()
+                },
+                ContentPart::Text {
+                    text: "world".to_string()
+                },
+            ])
+        );
+        assert_eq!(mc.into_text_only().expect("text only"), "hello world");
+    }
+
+    #[test]
+    fn message_content_single_text_part_round_trips() {
+        let json = serde_json::json!([{"type": "text", "text": "hi"}]);
+        let mc: MessageContent = serde_json::from_value(json).expect("parts form");
+        assert_eq!(mc.into_text_only().expect("text only"), "hi");
+    }
+
+    #[test]
+    fn content_part_image_url_deserializes_structurally() {
+        let json = serde_json::json!({
+            "type": "image_url",
+            "image_url": {"url": "https://example.com/cat.png", "detail": "high"}
+        });
+        let part: ContentPart = serde_json::from_value(json).expect("image_url part");
+        match part {
+            ContentPart::ImageUrl { image_url } => {
+                assert_eq!(image_url.url, "https://example.com/cat.png");
+                assert_eq!(image_url.detail.as_deref(), Some("high"));
+            }
+            ContentPart::Text { .. } => panic!("expected ImageUrl variant"),
+        }
+    }
+
+    #[test]
+    fn message_content_rejects_image_url_honestly() {
+        let json = serde_json::json!([
+            {"type": "text", "text": "what is this?"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+        ]);
+        let mc: MessageContent = serde_json::from_value(json).expect("parts form");
+        let err = mc.into_text_only().expect_err("image_url must be rejected");
+        assert!(
+            err.contains("image_url"),
+            "error must name the unsupported field, got: {err}"
+        );
+        assert!(
+            !err.to_lowercase().contains("todo") && !err.to_lowercase().contains("stub"),
+            "rejection message must be a real, honest error, not a stub marker"
+        );
+    }
+
+    #[test]
+    fn message_content_text_serializes_as_bare_string() {
+        // Round-tripping `Text` must stay byte-identical to a plain string —
+        // this is what keeps a future `ChatMessage.content:
+        // Option<MessageContent>` from changing today's response wire shape.
+        let mc = MessageContent::Text("hi".to_string());
+        let json = serde_json::to_string(&mc).expect("serialize");
+        assert_eq!(json, r#""hi""#);
     }
 }

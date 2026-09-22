@@ -5,6 +5,7 @@
 
 use oxibonsai_core::config::Qwen3Config;
 use oxibonsai_kernels::OneBitKernel;
+use oxibonsai_model::ModelVariant;
 use oxibonsai_runtime::builders::{ConfigBuilder, EngineBuilder, SamplerBuilder};
 use oxibonsai_runtime::convenience::{
     estimate_memory_requirements, format_bytes, format_token_count,
@@ -15,14 +16,16 @@ use oxibonsai_runtime::sampling::SamplingParams;
 
 // ── Helper ───────────────────────────────────────────────────────────────
 
-fn make_engine_with_config(config: Qwen3Config) -> InferenceEngine<'static> {
-    InferenceEngine::new(config, SamplingParams::default(), 42)
-}
-
 fn make_tiny_engine() -> InferenceEngine<'static> {
     InferenceEngine::new(Qwen3Config::tiny_test(), SamplingParams::default(), 42)
 }
 
+// HOTFIX-TESTMEM: kept only for `model_info_from_engine` below, which is
+// `#[ignore]`d specifically because it needs this full-size engine (see that
+// test for why). `model_variant_detection_8b/4b/1_7b` used to have their own
+// `make_8b_engine()`/`make_engine_with_config()`-built engines too, but no
+// longer construct a model at all — see the comment on
+// `model_variant_detection_8b`.
 fn make_8b_engine() -> InferenceEngine<'static> {
     InferenceEngine::new(Qwen3Config::bonsai_8b(), SamplingParams::default(), 42)
 }
@@ -240,30 +243,54 @@ fn generate_max_tokens_zero_returns_empty_or_minimal() {
 }
 
 // ── 10. Model variant detection ──────────────────────────────────────────
+//
+// HOTFIX-TESTMEM: these three used to build a real engine via
+// `make_8b_engine()`/`make_engine_with_config(bonsai_4b()/bonsai_1_7b())`,
+// i.e. `BonsaiModel::new(config)`, which allocates ~5 GB / ~2.7 GB / ~1.3 GB
+// of token_embd + output_weight tables (plus a KV cache) just to read back
+// `model.variant().name()`. `BonsaiModel::variant()` (model/types/mod.rs) is
+// `ModelVariant::from_config_and_sample_tensor_type(&self.config,
+// self.dominant_quant_type)`, and `ModelVariant::from_config` is a pure
+// function of `(num_layers, hidden_size)` alone (model_registry.rs) — it
+// never reads the model's weights. Calling it directly on the config proves
+// the identical detection result with no model construction at all.
+// `model_variant_detection_tiny_config_is_custom` below separately keeps the
+// real `engine.model().variant()` method chain covered end to end.
 
 #[test]
 fn model_variant_detection_8b() {
-    let engine = make_8b_engine();
-    let model = engine.model();
-    assert_eq!(model.config().num_layers, 36);
-    assert_eq!(model.config().hidden_size, 4096);
-    assert_eq!(model.variant().name(), "Bonsai-8B");
+    let config = Qwen3Config::bonsai_8b();
+    assert_eq!(config.num_layers, 36);
+    assert_eq!(config.hidden_size, 4096);
+    assert_eq!(ModelVariant::from_config(&config).name(), "Bonsai-8B");
 }
 
 #[test]
 fn model_variant_detection_4b() {
-    let engine = make_engine_with_config(Qwen3Config::bonsai_4b());
-    let model = engine.model();
-    assert_eq!(model.config().num_layers, 24);
-    assert_eq!(model.variant().name(), "Bonsai-4B");
+    let config = Qwen3Config::bonsai_4b();
+    assert_eq!(config.num_layers, 24);
+    assert_eq!(ModelVariant::from_config(&config).name(), "Bonsai-4B");
 }
 
 #[test]
 fn model_variant_detection_1_7b() {
-    let engine = make_engine_with_config(Qwen3Config::bonsai_1_7b());
-    let model = engine.model();
-    assert_eq!(model.config().num_layers, 16);
-    assert_eq!(model.variant().name(), "Bonsai-1.7B");
+    let config = Qwen3Config::bonsai_1_7b();
+    // Real GGUF header value (models/Ternary-Bonsai-1.7B.gguf): 28 layers.
+    assert_eq!(config.num_layers, 28);
+    assert_eq!(ModelVariant::from_config(&config).name(), "Bonsai-1.7B");
+}
+
+/// Coverage twin for the three tests above: exercises the real
+/// `engine.model().variant()` method (config -> `BonsaiModel` -> registry),
+/// which the direct `ModelVariant::from_config` calls above bypass on
+/// purpose to avoid constructing a multi-GB model. `tiny_test()`'s (2, 64)
+/// doesn't match any known architecture, so detection correctly falls back
+/// to `Custom`.
+#[test]
+fn model_variant_detection_tiny_config_is_custom() {
+    let engine = make_tiny_engine();
+    assert_eq!(engine.model().variant(), ModelVariant::Custom);
+    assert_eq!(engine.model().variant().name(), "Custom");
 }
 
 // ── 11. Convenience functions ────────────────────────────────────────────
@@ -376,10 +403,21 @@ fn engine_builder_defaults_produce_valid_config() {
 
 #[test]
 fn all_presets_create_valid_engines() {
+    // T-09: used to construct an engine per preset and assert nothing
+    // beyond "did not panic during construction". Actually drive a short
+    // generation through each preset's engine and check the real contract
+    // `generate` documents: `Ok` and at most `max_tokens` token ids.
     for preset in SamplingPreset::all() {
         let params = preset.params();
-        let _engine = InferenceEngine::new(Qwen3Config::tiny_test(), params, 42);
-        // If we got here without panic, the preset is compatible with the engine
+        let mut engine = InferenceEngine::new(Qwen3Config::tiny_test(), params, 42);
+        let tokens = engine
+            .generate(&[1, 2, 3], 4)
+            .unwrap_or_else(|e| panic!("preset {preset:?}: generate failed: {e}"));
+        assert!(
+            tokens.len() <= 4,
+            "preset {preset:?}: generate returned {} tokens, expected at most 4",
+            tokens.len()
+        );
     }
 }
 
@@ -423,6 +461,11 @@ fn engine_session_initial_state() {
 // ── 16. Model info accessors ─────────────────────────────────────────────
 
 #[test]
+#[ignore = "constructs a full Bonsai-8B engine (~5 GB token_embd + \
+            output_weight tables plus a ~1.2 GB KV cache) solely to read \
+            back accessor values; run explicitly with \
+            `cargo test -- --ignored` to validate real-size model info. See \
+            `model_info_from_engine_tiny_config` for the default-run twin."]
 fn model_info_from_engine() {
     let engine = make_8b_engine();
     let model = engine.model();
@@ -431,6 +474,33 @@ fn model_info_from_engine() {
     assert_eq!(model.context_length(), 65536);
     assert!(model.num_parameters() > 0);
     assert!(model.model_size_bytes() > 0);
+    assert!(model.kv_cache_memory_bytes() > 0);
+}
+
+/// Tiny-config twin of `model_info_from_engine` (kept `#[ignore]`d above
+/// because it needs a full production-size engine to reach a non-`Custom`
+/// variant). `tiny_test()`'s (2, 64) maps to `ModelVariant::Custom`, whose
+/// `param_count`/`expected_model_size_bytes` are defined as exactly 0
+/// (model_registry.rs), so this twin asserts the `Custom` contract — and
+/// still exercises `kv_cache_memory_bytes()`, which is independent of
+/// variant — on a ~78 MB fixture instead of a ~6 GB one.
+#[test]
+fn model_info_from_engine_tiny_config() {
+    let engine = make_tiny_engine();
+    let model = engine.model();
+    assert_eq!(model.num_layers(), 2);
+    assert_eq!(model.hidden_size(), 64);
+    assert_eq!(model.context_length(), 512);
+    assert_eq!(
+        model.num_parameters(),
+        0,
+        "Custom variant reports 0 parameters"
+    );
+    assert_eq!(
+        model.model_size_bytes(),
+        0,
+        "Custom variant reports 0 model size bytes"
+    );
     assert!(model.kv_cache_memory_bytes() > 0);
 }
 

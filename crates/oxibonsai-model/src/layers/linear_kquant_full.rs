@@ -11,9 +11,27 @@
 //! - Accessors: `out_features()`, `in_features()`, `blocks()`, `memory_bytes()`.
 
 use oxibonsai_core::{BlockQ2K, BlockQ3K, BlockQ4K, BlockQ8K};
-use oxibonsai_kernels::{gemv_q2k, gemv_q3k, gemv_q4k, gemv_q8k};
+use oxibonsai_kernels::traits::StandardQuantKernel;
+use oxibonsai_kernels::KernelDispatcher;
 
 use crate::error::{ModelError, ModelResult};
+
+/// Process-wide [`KernelDispatcher`], detected once instead of once per
+/// `forward` call (a MINOR gatekeeper finding on this package): every
+/// `forward` below used to call `KernelDispatcher::auto_detect()` per weight
+/// matrix per token, and `auto_detect` both allocates a fresh
+/// `Box<dyn GpuBackendTrait>`/`Arc` and emits an un-once-gated
+/// `tracing::info!` on every call (dispatch.rs:~71-91). Hardware tier/GPU
+/// availability is a property of the machine, not of any one layer or
+/// token, so detecting it once and reusing the answer changes no observable
+/// dispatch decision -- unlike `with_tier(cpu_kernel_tier())` (the
+/// established hot-path pattern for the *scalar* `gemv_q4_0`/`gemv_q8_0`
+/// entry points), this keeps `auto_detect`'s GPU-aware tier selection,
+/// which the six K-quant `StandardQuantKernel` methods can actually use.
+fn kquant_kernel_dispatcher() -> &'static KernelDispatcher {
+    static DISPATCHER: std::sync::OnceLock<KernelDispatcher> = std::sync::OnceLock::new();
+    DISPATCHER.get_or_init(KernelDispatcher::auto_detect)
+}
 
 // ---------------------------------------------------------------------------
 // Compile-time size assertions (documenting the SAFETY invariants used in the
@@ -44,31 +62,6 @@ const _: () =
 ))]
 const _: () =
     assert!(std::mem::size_of::<oxibonsai_core::BlockQ8K>() == oxibonsai_core::BLOCK_Q8K_BYTES,);
-
-#[cfg(all(feature = "metal", target_os = "macos"))]
-const _: () =
-    assert!(std::mem::size_of::<oxibonsai_core::BlockQ2K>() == oxibonsai_core::BLOCK_Q2_K_BYTES,);
-#[cfg(all(feature = "metal", target_os = "macos"))]
-const _: () =
-    assert!(std::mem::size_of::<oxibonsai_core::BlockQ3K>() == oxibonsai_core::BLOCK_Q3K_BYTES,);
-#[cfg(all(feature = "metal", target_os = "macos"))]
-const _: () =
-    assert!(std::mem::size_of::<oxibonsai_core::BlockQ4K>() == oxibonsai_core::BLOCK_Q4_K_BYTES,);
-#[cfg(all(feature = "metal", target_os = "macos"))]
-const _: () =
-    assert!(std::mem::size_of::<oxibonsai_core::BlockQ8K>() == oxibonsai_core::BLOCK_Q8K_BYTES,);
-
-/// Log a warning for a failed Metal K-quant GEMV dispatch, unless the failure
-/// is the benign "no Metal device on this system" case (in which every
-/// subsequent call would also fail identically, so the CPU fallback is the
-/// expected steady state rather than an anomaly worth logging every call).
-#[cfg(all(feature = "metal", target_os = "macos"))]
-fn warn_metal_gemv_fallback(format: &str, e: &oxibonsai_kernels::MetalGraphError) {
-    let msg = e.to_string();
-    if !msg.contains("no Metal-capable GPU device") {
-        tracing::warn!(error = %e, "Metal {format} GEMV failed, falling back to CPU scalar");
-    }
-}
 
 // ---------------------------------------------------------------------------
 // LinearQ2K
@@ -103,7 +96,7 @@ impl<'a> LinearQ2K<'a> {
     ) -> ModelResult<Self> {
         const QK_K: usize = 256;
 
-        if in_features == 0 || in_features % QK_K != 0 {
+        if in_features == 0 || !in_features.is_multiple_of(QK_K) {
             return Err(ModelError::ShapeMismatch {
                 name: "LinearQ2K".into(),
                 expected: vec![out_features, in_features],
@@ -153,8 +146,13 @@ impl<'a> LinearQ2K<'a> {
     ///
     /// When the `native-cuda` feature is enabled and a CUDA device is present
     /// the NVRTC Q2_K GEMV kernel is tried first; any failure other than
-    /// "no CUDA device" is logged as a warning and the CPU scalar path runs
-    /// instead.
+    /// "no CUDA device" is logged as a warning. Otherwise (or on that
+    /// fallback), the call routes through [`KernelDispatcher::gemv_q2k`]
+    /// (wave-1/1.5 addenda), which is the Metal-vs-CPU tier policy this type
+    /// used to bypass entirely by calling `metal_gemv_q2k` inline — the
+    /// exact gap that let a broken Metal kernel silently produce wrong
+    /// logits with no diagnostic (see `LinearQ5K::forward` in
+    /// `linear_kquant_ext.rs` for the measured example).
     pub fn forward(&self, input: &[f32], output: &mut [f32]) -> ModelResult<()> {
         #[cfg(all(
             feature = "native-cuda",
@@ -188,35 +186,15 @@ impl<'a> LinearQ2K<'a> {
                 }
             }
         }
-        #[cfg(all(feature = "metal", target_os = "macos"))]
-        {
-            // SAFETY: BlockQ2K is #[repr(C)] with size BLOCK_Q2_K_BYTES (= 84).
-            // The compile-time assert above guarantees this layout.
-            let raw = unsafe {
-                std::slice::from_raw_parts(
-                    self.blocks.as_ptr().cast::<u8>(),
-                    self.blocks.len() * oxibonsai_core::BLOCK_Q2_K_BYTES,
-                )
-            };
-            match oxibonsai_kernels::metal_gemv_q2k(
-                raw,
+        kquant_kernel_dispatcher()
+            .gemv_q2k(
+                self.blocks,
                 input,
                 output,
                 self.out_features,
                 self.in_features,
-            ) {
-                Ok(()) => return Ok(()),
-                Err(e) => warn_metal_gemv_fallback("Q2K", &e),
-            }
-        }
-        gemv_q2k(
-            self.blocks,
-            input,
-            output,
-            self.out_features,
-            self.in_features,
-        )
-        .map_err(ModelError::Kernel)
+            )
+            .map_err(ModelError::Kernel)
     }
 
     /// Forward pass: batched input (GEMM via sequential GEMV).
@@ -268,7 +246,7 @@ impl<'a> LinearQ3K<'a> {
     ) -> ModelResult<Self> {
         const QK_K: usize = 256;
 
-        if in_features == 0 || in_features % QK_K != 0 {
+        if in_features == 0 || !in_features.is_multiple_of(QK_K) {
             return Err(ModelError::ShapeMismatch {
                 name: "LinearQ3K".into(),
                 expected: vec![out_features, in_features],
@@ -318,8 +296,9 @@ impl<'a> LinearQ3K<'a> {
     ///
     /// When the `native-cuda` feature is enabled and a CUDA device is present
     /// the NVRTC Q3_K GEMV kernel is tried first; any failure other than
-    /// "no CUDA device" is logged as a warning and the CPU scalar path runs
-    /// instead.
+    /// "no CUDA device" is logged as a warning. Otherwise (or on that
+    /// fallback), the call routes through [`KernelDispatcher::gemv_q3k`] —
+    /// see `LinearQ2K::forward`'s doc comment for why.
     pub fn forward(&self, input: &[f32], output: &mut [f32]) -> ModelResult<()> {
         #[cfg(all(
             feature = "native-cuda",
@@ -353,35 +332,15 @@ impl<'a> LinearQ3K<'a> {
                 }
             }
         }
-        #[cfg(all(feature = "metal", target_os = "macos"))]
-        {
-            // SAFETY: BlockQ3K is #[repr(C)] with size BLOCK_Q3K_BYTES (= 110).
-            // The compile-time assert above guarantees this layout.
-            let raw = unsafe {
-                std::slice::from_raw_parts(
-                    self.blocks.as_ptr().cast::<u8>(),
-                    self.blocks.len() * oxibonsai_core::BLOCK_Q3K_BYTES,
-                )
-            };
-            match oxibonsai_kernels::metal_gemv_q3k(
-                raw,
+        kquant_kernel_dispatcher()
+            .gemv_q3k(
+                self.blocks,
                 input,
                 output,
                 self.out_features,
                 self.in_features,
-            ) {
-                Ok(()) => return Ok(()),
-                Err(e) => warn_metal_gemv_fallback("Q3K", &e),
-            }
-        }
-        gemv_q3k(
-            self.blocks,
-            input,
-            output,
-            self.out_features,
-            self.in_features,
-        )
-        .map_err(ModelError::Kernel)
+            )
+            .map_err(ModelError::Kernel)
     }
 
     /// Forward pass: batched input (GEMM via sequential GEMV).
@@ -433,7 +392,7 @@ impl<'a> LinearQ4K<'a> {
     ) -> ModelResult<Self> {
         const QK_K: usize = 256;
 
-        if in_features == 0 || in_features % QK_K != 0 {
+        if in_features == 0 || !in_features.is_multiple_of(QK_K) {
             return Err(ModelError::ShapeMismatch {
                 name: "LinearQ4K".into(),
                 expected: vec![out_features, in_features],
@@ -483,8 +442,9 @@ impl<'a> LinearQ4K<'a> {
     ///
     /// When the `native-cuda` feature is enabled and a CUDA device is present
     /// the NVRTC Q4_K GEMV kernel is tried first; any failure other than
-    /// "no CUDA device" is logged as a warning and the CPU scalar path runs
-    /// instead.
+    /// "no CUDA device" is logged as a warning. Otherwise (or on that
+    /// fallback), the call routes through [`KernelDispatcher::gemv_q4k`] —
+    /// see `LinearQ2K::forward`'s doc comment for why.
     pub fn forward(&self, input: &[f32], output: &mut [f32]) -> ModelResult<()> {
         #[cfg(all(
             feature = "native-cuda",
@@ -518,35 +478,15 @@ impl<'a> LinearQ4K<'a> {
                 }
             }
         }
-        #[cfg(all(feature = "metal", target_os = "macos"))]
-        {
-            // SAFETY: BlockQ4K is #[repr(C)] with size BLOCK_Q4_K_BYTES (= 144).
-            // The compile-time assert above guarantees this layout.
-            let raw = unsafe {
-                std::slice::from_raw_parts(
-                    self.blocks.as_ptr().cast::<u8>(),
-                    self.blocks.len() * oxibonsai_core::BLOCK_Q4_K_BYTES,
-                )
-            };
-            match oxibonsai_kernels::metal_gemv_q4k(
-                raw,
+        kquant_kernel_dispatcher()
+            .gemv_q4k(
+                self.blocks,
                 input,
                 output,
                 self.out_features,
                 self.in_features,
-            ) {
-                Ok(()) => return Ok(()),
-                Err(e) => warn_metal_gemv_fallback("Q4K", &e),
-            }
-        }
-        gemv_q4k(
-            self.blocks,
-            input,
-            output,
-            self.out_features,
-            self.in_features,
-        )
-        .map_err(ModelError::Kernel)
+            )
+            .map_err(ModelError::Kernel)
     }
 
     /// Forward pass: batched input (GEMM via sequential GEMV).
@@ -601,7 +541,7 @@ impl<'a> LinearQ8K<'a> {
     ) -> ModelResult<Self> {
         const QK_K: usize = 256;
 
-        if in_features == 0 || in_features % QK_K != 0 {
+        if in_features == 0 || !in_features.is_multiple_of(QK_K) {
             return Err(ModelError::ShapeMismatch {
                 name: "LinearQ8K".into(),
                 expected: vec![out_features, in_features],
@@ -651,8 +591,9 @@ impl<'a> LinearQ8K<'a> {
     ///
     /// When the `native-cuda` feature is enabled and a CUDA device is present
     /// the NVRTC Q8_K GEMV kernel is tried first; any failure other than
-    /// "no CUDA device" is logged as a warning and the CPU scalar path runs
-    /// instead.
+    /// "no CUDA device" is logged as a warning. Otherwise (or on that
+    /// fallback), the call routes through [`KernelDispatcher::gemv_q8k`] —
+    /// see `LinearQ2K::forward`'s doc comment for why.
     pub fn forward(&self, input: &[f32], output: &mut [f32]) -> ModelResult<()> {
         #[cfg(all(
             feature = "native-cuda",
@@ -686,35 +627,15 @@ impl<'a> LinearQ8K<'a> {
                 }
             }
         }
-        #[cfg(all(feature = "metal", target_os = "macos"))]
-        {
-            // SAFETY: BlockQ8K is #[repr(C)] with size BLOCK_Q8K_BYTES (= 292).
-            // The compile-time assert above guarantees this layout.
-            let raw = unsafe {
-                std::slice::from_raw_parts(
-                    self.blocks.as_ptr().cast::<u8>(),
-                    self.blocks.len() * oxibonsai_core::BLOCK_Q8K_BYTES,
-                )
-            };
-            match oxibonsai_kernels::metal_gemv_q8k(
-                raw,
+        kquant_kernel_dispatcher()
+            .gemv_q8k(
+                self.blocks,
                 input,
                 output,
                 self.out_features,
                 self.in_features,
-            ) {
-                Ok(()) => return Ok(()),
-                Err(e) => warn_metal_gemv_fallback("Q8K", &e),
-            }
-        }
-        gemv_q8k(
-            self.blocks,
-            input,
-            output,
-            self.out_features,
-            self.in_features,
-        )
-        .map_err(ModelError::Kernel)
+            )
+            .map_err(ModelError::Kernel)
     }
 
     /// Forward pass: batched input (GEMM via sequential GEMV).

@@ -12,6 +12,7 @@ use oxibonsai_kernels::{
     dequant::dequant_1bit_g128, gemv::gemv_1bit_g128, gemv_fp8_e4m3_par, gemv_fp8_e5m2_par,
 };
 use std::hint::black_box;
+use std::time::Duration;
 
 fn make_blocks(count: usize) -> Vec<BlockQ1_0G128> {
     (0..count)
@@ -224,35 +225,51 @@ fn bench_gemv_dispatch(c: &mut Criterion) {
     group.finish();
 }
 
+/// `m` sweep covering the K-18 regression surface (`gemm_ternary.rs:62`
+/// streamed the whole quantized weight matrix `m` times instead of batching
+/// -- see that finding for the ~750 GB/prefill-chunk zero-reuse upper bound
+/// at Bonsai 2 shapes). `m=512` at `n_rows=k=4096` is ~8.6 G MACs per
+/// `gemm` call; the unaccelerated `Reference` tier would spend seconds per
+/// sample there for no additional signal (the SIMD tiers are what ship), so
+/// it is only benchmarked up to `m=16` and the whole group runs a reduced,
+/// bounded sample size so a full sweep finishes in a reasonable time.
+const GEMM_M_SWEEP: &[usize] = &[1, 4, 8, 64, 512];
+/// Above this `m`, skip the scalar `Reference` tier (see [`GEMM_M_SWEEP`]).
+const GEMM_REFERENCE_MAX_M: usize = 16;
+
 fn bench_gemm_dispatch(c: &mut Criterion) {
     let mut group = c.benchmark_group("gemm_dispatch");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(10));
 
-    for &m in &[1, 4, 16] {
+    for &m in GEMM_M_SWEEP {
         let n_rows = 4096;
         let k = 4096;
         let blocks = make_blocks(n_rows * (k / 128));
         let input = vec![0.5f32; m * k];
         let mut output = vec![0.0f32; m * n_rows];
 
-        let ref_disp = KernelDispatcher::with_tier(KernelTier::Reference);
-        group.bench_with_input(
-            BenchmarkId::new("reference", format!("m{m}")),
-            &m,
-            |b, &batch| {
-                b.iter(|| {
-                    ref_disp
-                        .gemm(
-                            black_box(&blocks),
-                            black_box(&input),
-                            black_box(&mut output),
-                            batch,
-                            n_rows,
-                            k,
-                        )
-                        .expect("dispatcher gemm should succeed");
-                });
-            },
-        );
+        if m <= GEMM_REFERENCE_MAX_M {
+            let ref_disp = KernelDispatcher::with_tier(KernelTier::Reference);
+            group.bench_with_input(
+                BenchmarkId::new("reference", format!("m{m}")),
+                &m,
+                |b, &batch| {
+                    b.iter(|| {
+                        ref_disp
+                            .gemm(
+                                black_box(&blocks),
+                                black_box(&input),
+                                black_box(&mut output),
+                                batch,
+                                n_rows,
+                                k,
+                            )
+                            .expect("dispatcher gemm should succeed");
+                    });
+                },
+            );
+        }
 
         #[cfg(target_arch = "x86_64")]
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {

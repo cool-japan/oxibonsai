@@ -36,7 +36,7 @@ use std::sync::OnceLock;
 use serde_json::Value;
 
 use crate::{
-    bpe::BpeMerges,
+    bpe::{BpeMerges, PreTokenizerKind},
     error::{TokenizerError, TokenizerResult},
     tokenizer::{OxiTokenizer, TokenizerConfig},
     vocab::Vocabulary,
@@ -49,6 +49,12 @@ use crate::{
 ///
 /// Returns an array indexed by byte value containing the Unicode code point
 /// for that byte.  The inverse map is built by [`bytes_to_unicode_inverse`].
+///
+/// `O(256 × 188)` (a linear `contains` scan per byte) — cheap once, but see
+/// [`bytes_to_unicode_map`], which is the function every caller should
+/// actually use: it caches this result process-wide (TOK-14) so repeated
+/// construction (e.g. one `OxiTokenizer` per request) does not pay this
+/// cost more than once per process.
 fn build_bytes_to_unicode() -> [char; 256] {
     // Bytes that map to themselves.
     let mut printable: Vec<u8> = Vec::with_capacity(188);
@@ -77,12 +83,24 @@ fn build_bytes_to_unicode() -> [char; 256] {
     table
 }
 
+/// Process-wide cache for [`bytes_to_unicode_map`] (TOK-14): the table is
+/// deterministic and process-global, so building it once with
+/// [`build_bytes_to_unicode`]'s `O(256×188)` linear scan and reusing the
+/// `Copy` result is strictly better than re-running that scan on every
+/// call — which, before this cache, happened once per constructed
+/// [`crate::tokenizer::OxiTokenizer`] (`OxiTokenizer::new` /
+/// `with_unigram` / `with_wordpiece` each call this to populate their
+/// `byte_to_unicode` field) and, via [`bytes_to_unicode_string`], on every
+/// single legacy (non-cached) byte-level string conversion.
+static BYTES_TO_UNICODE_CACHE: OnceLock<[char; 256]> = OnceLock::new();
+
 /// Return the public 256-entry GPT-2 bytes-to-unicode mapping.
 ///
 /// The returned array is indexed by byte value.  Element `i` is the Unicode
 /// character used to represent byte `i` in the HF ByteLevel pre-tokenizer.
+/// `O(1)` after the first call in the process (TOK-14).
 pub fn bytes_to_unicode_map() -> [char; 256] {
-    build_bytes_to_unicode()
+    *BYTES_TO_UNICODE_CACHE.get_or_init(build_bytes_to_unicode)
 }
 
 /// Return the Unicode character for the given byte, per the GPT-2 map.
@@ -99,12 +117,52 @@ pub fn byte_to_unicode(b: u8) -> char {
 /// call would make that hot path needlessly quadratic.
 static UNICODE_TO_BYTE_CACHE: OnceLock<HashMap<char, u8>> = OnceLock::new();
 
+/// The maximum unicode codepoint the bytes-to-unicode table ever produces
+/// (`0x100 + 67`, the last of the 68 remapped bytes; see
+/// [`build_bytes_to_unicode`]). Sized with headroom for
+/// [`UNICODE_TO_BYTE_ARRAY_CACHE`]'s flat lookup array.
+const UNICODE_TO_BYTE_ARRAY_LEN: usize = 512;
+
+/// Process-wide flat-array reverse cache (TOK-14 fix-shape: "`OnceLock<[char;
+/// 256]>` plus a reverse `[u8; 512]`"): every codepoint the forward table can
+/// produce is `< 512` (`0x143` is the highest, `0x100..=0x143` covers the 68
+/// remapped bytes; everything else is a printable-ASCII/Latin-1 passthrough
+/// well under `0x100`), so a direct array index avoids even the hashing
+/// [`UNICODE_TO_BYTE_CACHE`] still costs. `u16::MAX` marks a codepoint that
+/// is not part of the table (byte values fit in `u8`, so this is
+/// unambiguous). [`unicode_to_byte`] uses this as its fast path and falls
+/// back to the hashmap cache only for `ch as u32 >= 512` (impossible for a
+/// valid entry, but keeps the function correct for any `char`).
+static UNICODE_TO_BYTE_ARRAY_CACHE: OnceLock<[u16; UNICODE_TO_BYTE_ARRAY_LEN]> = OnceLock::new();
+
+fn build_unicode_to_byte_array() -> [u16; UNICODE_TO_BYTE_ARRAY_LEN] {
+    let table = build_bytes_to_unicode();
+    let mut out = [u16::MAX; UNICODE_TO_BYTE_ARRAY_LEN];
+    for (byte, &ch) in table.iter().enumerate() {
+        let cp = ch as u32;
+        if (cp as usize) < UNICODE_TO_BYTE_ARRAY_LEN {
+            out[cp as usize] = byte as u16;
+        }
+    }
+    out
+}
+
 /// Inverse of [`byte_to_unicode`]: return the byte value for a Unicode char,
 /// or `None` if `ch` is not part of the 256-entry table.
 ///
-/// O(1) after the first call in the process (the inverse map is built once
-/// and cached in `UNICODE_TO_BYTE_CACHE`).
+/// `O(1)` after the first call in the process, via a direct array index
+/// (TOK-14) rather than a hash lookup for the overwhelmingly common case
+/// (every codepoint this table ever produces is `< 512`).
 pub fn unicode_to_byte(ch: char) -> Option<u8> {
+    let cp = ch as u32;
+    if (cp as usize) < UNICODE_TO_BYTE_ARRAY_LEN {
+        let table = UNICODE_TO_BYTE_ARRAY_CACHE.get_or_init(build_unicode_to_byte_array);
+        let v = table[cp as usize];
+        return if v == u16::MAX { None } else { Some(v as u8) };
+    }
+    // Unreachable for any codepoint the table actually produces, but kept
+    // as a correct (if slower) fallback rather than assuming the array
+    // bound above can never change.
     UNICODE_TO_BYTE_CACHE
         .get_or_init(bytes_to_unicode_inverse)
         .get(&ch)
@@ -218,6 +276,25 @@ pub struct HfTokenizerJson {
     pub pad_token: Option<String>,
     /// `true` if the tokenizer uses the GPT-2 ByteLevel pre-tokenizer.
     pub byte_level: bool,
+    /// `true` when `normalizer` declares (bare, or nested one level inside a
+    /// `Sequence`) `{"type": "NFC"}` (TOK-09). Applied by
+    /// [`crate::tokenizer::OxiTokenizer::encode`] via
+    /// [`crate::tokenizer::TokenizerConfig::normalize_nfc`].
+    pub normalize_nfc: bool,
+    /// The verbatim `Split`-stage regex pattern, when `pre_tokenizer` is a
+    /// `Sequence` containing a `Split` node with a `Regex` pattern (the
+    /// shape Qwen2/Qwen3/Bonsai's real `tokenizer.json` files use).
+    ///
+    /// `None` means: if [`Self::byte_level`] is set, fall back to the
+    /// built-in canonical GPT-2/Qwen2 pattern (a bare `ByteLevel`
+    /// pre-tokenizer with no preceding explicit `Split` applies HF's own
+    /// default internal regex, which *is* that canonical pattern) — see
+    /// [`crate::bpe::PreTokenizerKind::Gpt2`]. Kept separate from the
+    /// enum-driven GGUF path deliberately (TOK-04 verdict correction):
+    /// taking the pattern verbatim here, rather than re-deriving it from a
+    /// `PreTokenizerKind`, means a `tokenizer.json` is never re-split by a
+    /// second, possibly-different default pattern.
+    pub pretokenize_pattern: Option<String>,
 }
 
 impl HfTokenizerJson {
@@ -324,6 +401,22 @@ impl HfTokenizerJson {
         // ── 4. ByteLevel detection ───────────────────────────────────────────
         let byte_level = detect_byte_level(&root);
 
+        // ── 4b. Normalizer (TOK-09) ──────────────────────────────────────────
+        let normalize_nfc = parse_normalizer(root.get("normalizer"))?;
+
+        // ── 4c. Explicit `Split` pre-tokenizer pattern (TOK-04 correction) ───
+        let pretokenize_pattern = root
+            .get("pre_tokenizer")
+            .map(find_split_regex_pattern)
+            .transpose()?
+            .flatten();
+
+        // ── 4d. Post-processor (TOK-09 gap closure) ──────────────────────────
+        // Validate-only: no post-processor type this crate implements needs
+        // a stored field, but a declared, token-stream-altering type must
+        // not be silently dropped -- see `validate_post_processor`.
+        validate_post_processor(root.get("post_processor"))?;
+
         // ── 5. WordPiece-specific: max_input_chars_per_word ─────────────────
         let wordpiece_max_chars = if model_type == HfModelType::WordPiece {
             model
@@ -348,6 +441,8 @@ impl HfTokenizerJson {
             unk_token,
             pad_token,
             byte_level,
+            normalize_nfc,
+            pretokenize_pattern,
         })
     }
 
@@ -395,6 +490,7 @@ impl HfTokenizerJson {
 
         let mut config = TokenizerConfig {
             byte_level_decode: self.byte_level,
+            normalize_nfc: self.normalize_nfc,
             ..Default::default()
         };
         if let Some(id) = bos_id {
@@ -410,7 +506,10 @@ impl HfTokenizerJson {
             config.pad_token_id = id;
         }
 
-        match self.model_type {
+        let pretokenize_pattern = self.pretokenize_pattern.clone();
+        let byte_level = self.byte_level;
+
+        let tok = match self.model_type {
             HfModelType::Bpe | HfModelType::Other(_) => {
                 // Build the merge table.  For each (a, b) in priority order
                 // we need the merged token's ID — by HF convention this is
@@ -429,7 +528,7 @@ impl HfTokenizerJson {
                     };
                     merges.add_merge(a, b, merged_id);
                 }
-                Ok(OxiTokenizer::new(vocabulary, merges, config))
+                OxiTokenizer::new(vocabulary, merges, config)
             }
             HfModelType::Unigram => {
                 let entries = self.unigram_vocab.ok_or_else(|| {
@@ -442,11 +541,7 @@ impl HfTokenizerJson {
                 let effective_unk_id = self.unigram_unk_id.unwrap_or(config.unk_token_id);
                 let unigram_vocab = crate::unigram::UnigramVocab::new(entries, effective_unk_id)
                     .map_err(|e| TokenizerError::HfFormat(format!("invalid Unigram vocab: {e}")))?;
-                Ok(OxiTokenizer::with_unigram(
-                    vocabulary,
-                    unigram_vocab,
-                    config,
-                ))
+                OxiTokenizer::with_unigram(vocabulary, unigram_vocab, config)
             }
             HfModelType::WordPiece => {
                 // Build the ordered token list from the vocab map.
@@ -456,9 +551,23 @@ impl HfTokenizerJson {
                     self.wordpiece_max_chars,
                     config.unk_token_id,
                 )?;
-                Ok(OxiTokenizer::with_wordpiece(vocabulary, wp_vocab, config))
+                OxiTokenizer::with_wordpiece(vocabulary, wp_vocab, config)
             }
-        }
+        };
+
+        // Attach the byte-level `Split` pre-tokenizer pattern (TOK-03/04).
+        // A verbatim pattern from the JSON itself takes priority; otherwise
+        // fall back to the built-in canonical pattern whenever ByteLevel was
+        // detected (matching a bare `ByteLevel` pre-tokenizer's own default
+        // internal regex — see `HfTokenizerJson::pretokenize_pattern`'s
+        // docs for why this can never double-split).
+        let tok = match pretokenize_pattern {
+            Some(pattern) => tok.with_pretokenizer_pattern(&pattern)?,
+            None if byte_level => tok.with_pretokenizer_kind(PreTokenizerKind::Gpt2),
+            None => tok,
+        };
+
+        Ok(tok)
     }
 }
 
@@ -725,6 +834,222 @@ fn detect_byte_level(root: &Value) -> bool {
     let has_bl =
         |field: &str| -> bool { root.get(field).map(contains_byte_level).unwrap_or(false) };
     has_bl("pre_tokenizer") || has_bl("decoder")
+}
+
+// ── Normalizer (TOK-09) ────────────────────────────────────────────────────────
+
+/// Parse the top-level `normalizer` field, returning whether NFC
+/// normalization must be applied.
+///
+/// Absent or JSON `null` means "no normalizer declared" (`Ok(false)`,
+/// not an error — the overwhelming majority of `tokenizer.json` files omit
+/// this field entirely). Any *declared* normalizer this crate does not
+/// implement is a hard error (spec: "ERROR on an unsupported normalizer
+/// rather than silently skipping it") rather than a silent no-op, since
+/// silently ignoring a real normalizer step is exactly the proven TOK-09
+/// divergence (HF composing `"e" + U+0301` into `"é"` before encoding;
+/// this crate previously encoded the decomposed form as three separate
+/// tokens).
+fn parse_normalizer(value: Option<&Value>) -> TokenizerResult<bool> {
+    match value {
+        None => Ok(false),
+        Some(v) if v.is_null() => Ok(false),
+        Some(v) => normalizer_needs_nfc(v),
+    }
+}
+
+/// Recursive helper for [`parse_normalizer`]: `true` if `value` is (or, for
+/// a `Sequence`, contains) an `NFC` normalizer; errors on any other
+/// declared type.
+fn normalizer_needs_nfc(value: &Value) -> TokenizerResult<bool> {
+    let ty = value.get("type").and_then(Value::as_str).ok_or_else(|| {
+        TokenizerError::HfFormat("normalizer entry is missing its `type` field".to_owned())
+    })?;
+    match ty {
+        "NFC" => Ok(true),
+        "Sequence" => {
+            let list = value
+                .get("normalizers")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    TokenizerError::HfFormat(
+                        "Sequence normalizer is missing its `normalizers` array".to_owned(),
+                    )
+                })?;
+            let mut needs_nfc = false;
+            for entry in list {
+                if normalizer_needs_nfc(entry)? {
+                    needs_nfc = true;
+                }
+            }
+            Ok(needs_nfc)
+        }
+        other => Err(TokenizerError::HfFormat(format!(
+            "unsupported tokenizer.json normalizer type {other:?}: only \"NFC\" \
+             (optionally nested inside a \"Sequence\") is implemented; refusing \
+             to silently mis-tokenize rather than ignoring it"
+        ))),
+    }
+}
+
+// ── Split pre-tokenizer pattern extraction (TOK-04 correction) ─────────────────
+
+/// Search a `pre_tokenizer` value (bare or `Sequence`-wrapped, matching
+/// [`contains_byte_level`]'s recursion shape) for a `Split` node carrying a
+/// `Regex` pattern, returning that pattern verbatim if found.
+///
+/// This is how Qwen2/Qwen3/Bonsai's real `tokenizer.json` files declare
+/// their pre-tokenizer: `{"type": "Sequence", "pretokenizers": [{"type":
+/// "Split", "pattern": {"Regex": "..."}, "behavior": "Isolated", ...},
+/// {"type": "ByteLevel", "use_regex": false, ...}]}`. Taking the pattern
+/// verbatim from here — rather than re-deriving it from a
+/// [`PreTokenizerKind`] — means the `ByteLevel` stage's own default regex
+/// is never *also* applied, which would silently re-split already-atomic
+/// pieces a second time.
+///
+/// # Errors
+/// Propagates [`validate_split_behavior`]'s error for a `Split` node that
+/// declares a `behavior` other than `"Isolated"`, or `invert: true` —
+/// either would mean this crate's [`crate::bpe::pretokenize_regex`] (which
+/// always implements plain `Isolated`/`invert=false`) taking the pattern
+/// verbatim no longer reproduces the source tokenizer's actual split.
+fn find_split_regex_pattern(value: &Value) -> TokenizerResult<Option<String>> {
+    match value {
+        Value::Object(map) => {
+            let ty = map.get("type").and_then(Value::as_str);
+            if ty == Some("Split") {
+                validate_split_behavior(value)?;
+                return Ok(map
+                    .get("pattern")
+                    .and_then(|p| p.get("Regex"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned));
+            }
+            if ty == Some("Sequence") {
+                if let Some(Value::Array(list)) = map.get("pretokenizers") {
+                    for entry in list {
+                        if let Some(pattern) = find_split_regex_pattern(entry)? {
+                            return Ok(Some(pattern));
+                        }
+                    }
+                }
+            }
+            Ok(None)
+        }
+        Value::Array(list) => {
+            for entry in list {
+                if let Some(pattern) = find_split_regex_pattern(entry)? {
+                    return Ok(Some(pattern));
+                }
+            }
+            Ok(None)
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Validate a `Split` pre-tokenizer node's `behavior`/`invert` fields
+/// (minor finding, wave-2 B2-08 review, filed alongside TOK-04's
+/// pattern-extraction correction above).
+///
+/// [`crate::bpe::pretokenize_regex`] always implements HF's `Isolated`
+/// behaviour (every regex match becomes its own piece; non-matches pass
+/// through unchanged) with `invert = false` (matches are kept as the
+/// pieces, never treated as the separators). Silently taking a `Split`
+/// pattern verbatim while ignoring an *explicitly declared* different
+/// `behavior`, or `invert: true`, would change what the pattern actually
+/// produces and mis-tokenize without warning. **Absent** fields keep
+/// today's behaviour (`Isolated`/`false`, HF's own defaults, and what
+/// every hand-written fixture already in this crate assumes when it omits
+/// them) — only an *explicit* non-conforming declaration is an error, so
+/// this stays fail-loud without becoming fail-loud-by-default.
+fn validate_split_behavior(value: &Value) -> TokenizerResult<()> {
+    if let Some(behavior) = value.get("behavior").and_then(Value::as_str) {
+        if behavior != "Isolated" {
+            return Err(TokenizerError::HfFormat(format!(
+                "unsupported tokenizer.json Split behavior {behavior:?}: only \
+                 \"Isolated\" is implemented by this crate's `pretokenize_regex`"
+            )));
+        }
+    }
+    if value
+        .get("invert")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(TokenizerError::HfFormat(
+            "unsupported tokenizer.json Split invert=true: this crate's \
+             `pretokenize_regex` only implements invert=false (regex matches \
+             are kept as the pieces, never treated as separators)"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+// ── Post-processor (TOK-09 gap closure) ─────────────────────────────────────
+
+/// Validate the top-level `post_processor` field.
+///
+/// Absent or JSON `null` is fine (`Ok(())`) — most Qwen-family
+/// `tokenizer.json` files declare none; this crate's BOS/EOS insertion is
+/// driven independently by [`crate::tokenizer::TokenizerConfig::add_bos`] /
+/// `add_eos`. A bare, or `Sequence`-nested, `ByteLevel` post-processor is
+/// also accepted as a documented no-op: HF's `ByteLevel` post-processor
+/// only repairs the character-offset bookkeeping of the (unused by this
+/// crate) `Encoding::offsets` field — it never inserts, removes or renames
+/// a token id, so taking no action for it is correct, not a gap.
+///
+/// Any other declared type — `TemplateProcessing`, `BertProcessing`,
+/// `RobertaProcessing` — genuinely changes the emitted token *stream*
+/// (typically BOS/EOS/CLS/SEP insertion per a template), which this crate
+/// does not implement. Silently ignoring a real, stream-altering
+/// post-processor would reproduce exactly the class of defect TOK-09 fixed
+/// for `normalizer` (a declared step silently skipped rather than honoured
+/// or refused) — so an unsupported type is a hard, fail-loud error here
+/// too, matching [`normalizer_needs_nfc`]'s policy, rather than a silent
+/// no-op that could leave e.g. a `TemplateProcessing`-declared BOS/EOS
+/// insertion invisibly missing.
+fn validate_post_processor(value: Option<&Value>) -> TokenizerResult<()> {
+    match value {
+        None => Ok(()),
+        Some(v) if v.is_null() => Ok(()),
+        Some(v) => post_processor_is_supported(v),
+    }
+}
+
+/// Recursive helper for [`validate_post_processor`]: errors on any declared
+/// `post_processor` type this crate does not treat as an identity no-op
+/// over the token stream.
+fn post_processor_is_supported(value: &Value) -> TokenizerResult<()> {
+    let ty = value.get("type").and_then(Value::as_str).ok_or_else(|| {
+        TokenizerError::HfFormat("post_processor entry is missing its `type` field".to_owned())
+    })?;
+    match ty {
+        "ByteLevel" => Ok(()),
+        "Sequence" => {
+            let list = value
+                .get("processors")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    TokenizerError::HfFormat(
+                        "Sequence post_processor is missing its `processors` array".to_owned(),
+                    )
+                })?;
+            for entry in list {
+                post_processor_is_supported(entry)?;
+            }
+            Ok(())
+        }
+        other => Err(TokenizerError::HfFormat(format!(
+            "unsupported tokenizer.json post_processor type {other:?}: only \"ByteLevel\" \
+             (optionally nested inside a \"Sequence\") is an identity no-op for this \
+             crate's token stream; \"TemplateProcessing\"/\"BertProcessing\"/\
+             \"RobertaProcessing\" would insert or alter tokens (e.g. BOS/EOS/CLS/SEP) \
+             that this crate does not apply — refusing to silently mis-tokenize rather \
+             than ignoring it"
+        ))),
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

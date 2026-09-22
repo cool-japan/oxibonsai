@@ -150,10 +150,64 @@ pub enum SerializationError {
     DuplicateId(u32),
 }
 
+// ── ConfigSnapshot ───────────────────────────────────────────────────────────
+
+/// The subset of [`crate::tokenizer::TokenizerConfig`] that changes encode
+/// and decode *behaviour* — as opposed to the vocabulary/merges content
+/// already carried by [`TokenizerState`] — and therefore must round-trip
+/// through [`TokenizerState::save`] / [`TokenizerState::load`], or a
+/// byte-level tokenizer silently decodes through the wrong path after a
+/// save+load cycle (missed finding, TOK-01 second route).
+///
+/// Defaults to exactly [`crate::tokenizer::TokenizerConfig::default`]'s
+/// values, so a state saved by a version of this crate that predates this
+/// field (or one that never calls [`TokenizerState::with_config`]) still
+/// loads with today's observed behaviour — no format break.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfigSnapshot {
+    /// See [`crate::tokenizer::TokenizerConfig::byte_level_decode`].
+    pub byte_level_decode: bool,
+    /// See [`crate::tokenizer::TokenizerConfig::add_bos`].
+    pub add_bos: bool,
+    /// See [`crate::tokenizer::TokenizerConfig::add_eos`].
+    pub add_eos: bool,
+    /// See [`crate::tokenizer::TokenizerConfig::bos_token_id`].
+    pub bos_token_id: u32,
+    /// See [`crate::tokenizer::TokenizerConfig::eos_token_id`].
+    pub eos_token_id: u32,
+    /// See [`crate::tokenizer::TokenizerConfig::unk_token_id`].
+    pub unk_token_id: u32,
+    /// See [`crate::tokenizer::TokenizerConfig::pad_token_id`].
+    pub pad_token_id: u32,
+}
+
+impl Default for ConfigSnapshot {
+    fn default() -> Self {
+        // Mirrors `TokenizerConfig::default()` field-for-field.
+        Self {
+            byte_level_decode: false,
+            add_bos: false,
+            add_eos: false,
+            bos_token_id: 1,
+            eos_token_id: 2,
+            unk_token_id: 0,
+            pad_token_id: 3,
+        }
+    }
+}
+
 // ── TokenizerState ────────────────────────────────────────────────────────────
 
 /// A serializable snapshot of a trained tokenizer.
+///
+/// Marked `#[non_exhaustive]` (added alongside the `config` field, TOK-01)
+/// so a future field can be added the same way without breaking downstream
+/// full-struct-literal construction — matching the same precaution already
+/// taken on [`crate::tokenizer::TokenizerConfig`]. Build one with
+/// [`TokenizerState::new`] or [`TokenizerState::from_trained`] and
+/// [`TokenizerState::with_config`].
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct TokenizerState {
     /// id → token string
     pub vocab: HashMap<u32, String>,
@@ -161,6 +215,10 @@ pub struct TokenizerState {
     pub merges: Vec<(u32, u32, u32)>,
     /// special token name → id (e.g. `"<BOS>"` → 1)
     pub special_tokens: HashMap<String, u32>,
+    /// The encode/decode-affecting config to restore on load (TOK-01).
+    /// Defaults to [`ConfigSnapshot::default`]; attach a real tokenizer's
+    /// config with [`Self::with_config`] before saving.
+    pub config: ConfigSnapshot,
 }
 
 impl TokenizerState {
@@ -170,10 +228,17 @@ impl TokenizerState {
             vocab: HashMap::new(),
             merges: Vec::new(),
             special_tokens: HashMap::new(),
+            config: ConfigSnapshot::default(),
         }
     }
 
     /// Build a `TokenizerState` from a [`crate::trainer::TrainedTokenizer`].
+    ///
+    /// `TrainedTokenizer` (the `BpeTrainer`'s output) carries no
+    /// byte-level/BOS-EOS configuration of its own, so `config` is left at
+    /// [`ConfigSnapshot::default`] here; a caller that trained a byte-level
+    /// model should call [`Self::with_config`] with the real config before
+    /// saving.
     pub fn from_trained(trained: &crate::trainer::TrainedTokenizer) -> Self {
         let mut state = Self::new();
 
@@ -189,6 +254,20 @@ impl TokenizerState {
         }
 
         state
+    }
+
+    /// Attach an encode/decode config to this state before saving (TOK-01).
+    ///
+    /// Additive builder method: callers that already have a
+    /// [`crate::tokenizer::OxiTokenizer`] (via
+    /// [`crate::tokenizer::OxiTokenizer::config`]) can carry its *real*
+    /// `byte_level_decode`/BOS/EOS/UNK/PAD settings through a save+load
+    /// round trip instead of [`Self::to_oxi_tokenizer`] silently
+    /// reconstructing [`crate::tokenizer::TokenizerConfig::default`].
+    #[must_use]
+    pub fn with_config(mut self, config: ConfigSnapshot) -> Self {
+        self.config = config;
+        self
     }
 
     /// Number of vocabulary entries.
@@ -237,6 +316,23 @@ impl TokenizerState {
             let encoded = base64_encode(name.as_bytes());
             writeln!(writer, "special {encoded} {id}")?;
         }
+
+        // Config snapshot (TOK-01): always written, in a fixed field order,
+        // so the format stays deterministic. A pre-this-fix reader ignores
+        // these lines only if it treats unrecognised trailing lines as
+        // errors it doesn't hit — new `load_from` handles them explicitly;
+        // see the format-compat note on `ConfigSnapshot`.
+        writeln!(
+            writer,
+            "config byte_level_decode {}",
+            self.config.byte_level_decode
+        )?;
+        writeln!(writer, "config add_bos {}", self.config.add_bos)?;
+        writeln!(writer, "config add_eos {}", self.config.add_eos)?;
+        writeln!(writer, "config bos_token_id {}", self.config.bos_token_id)?;
+        writeln!(writer, "config eos_token_id {}", self.config.eos_token_id)?;
+        writeln!(writer, "config unk_token_id {}", self.config.unk_token_id)?;
+        writeln!(writer, "config pad_token_id {}", self.config.pad_token_id)?;
 
         Ok(())
     }
@@ -337,8 +433,13 @@ impl TokenizerState {
             merges.push((left, right, merged));
         }
 
-        // Read remaining lines as special tokens (optional section)
+        // Read remaining lines as either "special" or "config" entries
+        // (both optional sections; order-independent). A file saved before
+        // the TOK-01 config-snapshot fix has no "config" lines at all, and
+        // `config` simply stays at `ConfigSnapshot::default()` — the exact
+        // behaviour such a file already had, so this is purely additive.
         let mut special_tokens: HashMap<String, u32> = HashMap::new();
+        let mut config = ConfigSnapshot::default();
         for maybe_line in lines {
             line_no += 1;
             let l = maybe_line.map_err(SerializationError::Io)?;
@@ -347,31 +448,52 @@ impl TokenizerState {
                 continue;
             }
             let parts: Vec<&str> = l.splitn(3, ' ').collect();
-            if parts.len() != 3 || parts[0] != "special" {
-                return Err(SerializationError::ParseError {
-                    line: line_no,
-                    msg: format!("expected 'special <b64> <id>', got '{l}'"),
-                });
+            match parts.first().copied() {
+                Some("special") => {
+                    if parts.len() != 3 {
+                        return Err(SerializationError::ParseError {
+                            line: line_no,
+                            msg: format!("expected 'special <b64> <id>', got '{l}'"),
+                        });
+                    }
+                    let name_bytes = base64_decode(parts[1])?;
+                    let name = String::from_utf8(name_bytes).map_err(|_| {
+                        SerializationError::ParseError {
+                            line: line_no,
+                            msg: "special token name is not valid UTF-8".to_string(),
+                        }
+                    })?;
+                    let id: u32 = parts[2]
+                        .parse()
+                        .map_err(|_| SerializationError::ParseError {
+                            line: line_no,
+                            msg: format!("invalid special token id '{}'", parts[2]),
+                        })?;
+                    special_tokens.insert(name, id);
+                }
+                Some("config") => {
+                    if parts.len() != 3 {
+                        return Err(SerializationError::ParseError {
+                            line: line_no,
+                            msg: format!("expected 'config <key> <value>', got '{l}'"),
+                        });
+                    }
+                    apply_config_field(&mut config, parts[1], parts[2], line_no)?;
+                }
+                _ => {
+                    return Err(SerializationError::ParseError {
+                        line: line_no,
+                        msg: format!("expected 'special ...' or 'config ...', got '{l}'"),
+                    });
+                }
             }
-            let name_bytes = base64_decode(parts[1])?;
-            let name =
-                String::from_utf8(name_bytes).map_err(|_| SerializationError::ParseError {
-                    line: line_no,
-                    msg: "special token name is not valid UTF-8".to_string(),
-                })?;
-            let id: u32 = parts[2]
-                .parse()
-                .map_err(|_| SerializationError::ParseError {
-                    line: line_no,
-                    msg: format!("invalid special token id '{}'", parts[2]),
-                })?;
-            special_tokens.insert(name, id);
         }
 
         Ok(TokenizerState {
             vocab,
             merges,
             special_tokens,
+            config,
         })
     }
 
@@ -391,7 +513,14 @@ impl TokenizerState {
         Self::load_from(&mut reader)
     }
 
-    /// Convert to an [`crate::OxiTokenizer`] (char-level fallback using our vocab).
+    /// Convert to an [`crate::OxiTokenizer`] using our vocab, merges and the
+    /// saved [`ConfigSnapshot`] (TOK-01: this used to hardcode
+    /// `TokenizerConfig::default()`, silently forcing `byte_level_decode =
+    /// false` regardless of what the saved tokenizer actually was — which
+    /// both mis-decodes a byte-level vocabulary through the legacy
+    /// `Ġ`-stripping path and, via `OxiTokenizer::new`'s
+    /// `build_special_ids`, previously reintroduced the exact
+    /// punctuation-deletion bug through this second constructor route).
     pub fn to_oxi_tokenizer(&self) -> crate::OxiTokenizer {
         use crate::{
             bpe::BpeMerges,
@@ -415,9 +544,57 @@ impl TokenizerState {
             bpe_merges.add_merge(left_str, right_str, merged_id);
         }
 
-        let config = TokenizerConfig::default();
+        let config = TokenizerConfig {
+            byte_level_decode: self.config.byte_level_decode,
+            add_bos: self.config.add_bos,
+            add_eos: self.config.add_eos,
+            bos_token_id: self.config.bos_token_id,
+            eos_token_id: self.config.eos_token_id,
+            unk_token_id: self.config.unk_token_id,
+            pad_token_id: self.config.pad_token_id,
+            ..Default::default()
+        };
         OxiTokenizer::new(vocabulary, bpe_merges, config)
     }
+}
+
+/// Parse one `config <key> <value>` line into the matching
+/// [`ConfigSnapshot`] field.
+fn apply_config_field(
+    config: &mut ConfigSnapshot,
+    key: &str,
+    value: &str,
+    line_no: usize,
+) -> Result<(), SerializationError> {
+    fn parse_bool(value: &str, line_no: usize) -> Result<bool, SerializationError> {
+        value.parse().map_err(|_| SerializationError::ParseError {
+            line: line_no,
+            msg: format!("invalid bool value '{value}'"),
+        })
+    }
+    fn parse_u32(value: &str, line_no: usize) -> Result<u32, SerializationError> {
+        value.parse().map_err(|_| SerializationError::ParseError {
+            line: line_no,
+            msg: format!("invalid u32 value '{value}'"),
+        })
+    }
+
+    match key {
+        "byte_level_decode" => config.byte_level_decode = parse_bool(value, line_no)?,
+        "add_bos" => config.add_bos = parse_bool(value, line_no)?,
+        "add_eos" => config.add_eos = parse_bool(value, line_no)?,
+        "bos_token_id" => config.bos_token_id = parse_u32(value, line_no)?,
+        "eos_token_id" => config.eos_token_id = parse_u32(value, line_no)?,
+        "unk_token_id" => config.unk_token_id = parse_u32(value, line_no)?,
+        "pad_token_id" => config.pad_token_id = parse_u32(value, line_no)?,
+        other => {
+            return Err(SerializationError::ParseError {
+                line: line_no,
+                msg: format!("unknown config key '{other}'"),
+            });
+        }
+    }
+    Ok(())
 }
 
 impl Default for TokenizerState {
@@ -487,5 +664,104 @@ mod inline_tests {
         assert_eq!(loaded.vocab.get(&0), Some(&"<unk>".to_string()));
         assert_eq!(loaded.vocab.get(&1), Some(&"a".to_string()));
         assert_eq!(loaded.merges, vec![(0, 1, 2)]);
+        // A state saved without an explicit config carries the default
+        // through the round trip.
+        assert_eq!(loaded.config, ConfigSnapshot::default());
+    }
+
+    // ── TOK-01 second route: config round-trips through save/load ────────
+
+    #[test]
+    fn byte_level_config_round_trips_through_save_and_load() {
+        let mut state = TokenizerState::new();
+        // A byte-level vocab whose real GPT-2-remapped `!`=0 would, under
+        // the pre-fix `TokenizerConfig::default()` (unk=0), be silently
+        // deleted on decode if `to_oxi_tokenizer` ignored the real config.
+        state.vocab.insert(0, "!".to_string());
+        state.vocab.insert(1, "a".to_string());
+        state = state.with_config(ConfigSnapshot {
+            byte_level_decode: true,
+            unk_token_id: 999, // deliberately far from any real vocab id
+            ..ConfigSnapshot::default()
+        });
+
+        let mut buf = Vec::new();
+        state.save_to(&mut buf).expect("save should succeed");
+        let mut reader = std::io::BufReader::new(buf.as_slice());
+        let loaded = TokenizerState::load_from(&mut reader).expect("load should succeed");
+
+        assert!(loaded.config.byte_level_decode);
+        assert_eq!(loaded.config.unk_token_id, 999);
+
+        let tok = loaded.to_oxi_tokenizer();
+        assert!(
+            tok.config().byte_level_decode,
+            "byte_level_decode must survive the round trip"
+        );
+        // '!' (id 0) must decode normally: it does not collide with the
+        // real (relocated) unk id 999, and is not itself special.
+        let decoded = tok.decode(&[0]).expect("decode should succeed");
+        assert_eq!(decoded, "!");
+    }
+
+    #[test]
+    fn config_snapshot_defaults_match_tokenizer_config_defaults() {
+        // `ConfigSnapshot::default()` must mirror
+        // `TokenizerConfig::default()` field-for-field, or an old
+        // (pre-config-lines) saved file would silently change behaviour
+        // when loaded by this version of the crate.
+        let snapshot = ConfigSnapshot::default();
+        let config = crate::tokenizer::TokenizerConfig::default();
+        assert_eq!(snapshot.byte_level_decode, config.byte_level_decode);
+        assert_eq!(snapshot.add_bos, config.add_bos);
+        assert_eq!(snapshot.add_eos, config.add_eos);
+        assert_eq!(snapshot.bos_token_id, config.bos_token_id);
+        assert_eq!(snapshot.eos_token_id, config.eos_token_id);
+        assert_eq!(snapshot.unk_token_id, config.unk_token_id);
+        assert_eq!(snapshot.pad_token_id, config.pad_token_id);
+    }
+
+    #[test]
+    fn pre_config_lines_file_format_still_loads_with_defaults() {
+        // A file saved by a version of this crate that predates the
+        // config-snapshot fix has no "config ..." lines at all -- only
+        // "special ..." lines (or none). `load_from` must still parse it
+        // cleanly, defaulting the config rather than erroring.
+        let mut old_format = String::new();
+        old_format.push_str(&format!("{FORMAT_MAGIC}\n"));
+        old_format.push_str("vocab_size 1\n");
+        old_format.push_str("merges 0\n");
+        old_format.push_str(&format!("tok_id 0 {}\n", base64_encode(b"a")));
+        old_format.push_str(&format!("special {} 0\n", base64_encode(b"<unk>")));
+
+        let mut reader = std::io::BufReader::new(old_format.as_bytes());
+        let loaded = TokenizerState::load_from(&mut reader).expect("legacy format should load");
+        assert_eq!(loaded.config, ConfigSnapshot::default());
+        assert_eq!(loaded.special_tokens.get("<unk>"), Some(&0));
+    }
+
+    #[test]
+    fn unknown_config_key_is_a_parse_error() {
+        let mut old_format = String::new();
+        old_format.push_str(&format!("{FORMAT_MAGIC}\n"));
+        old_format.push_str("vocab_size 0\n");
+        old_format.push_str("merges 0\n");
+        old_format.push_str("config not_a_real_field true\n");
+
+        let mut reader = std::io::BufReader::new(old_format.as_bytes());
+        let err = match TokenizerState::load_from(&mut reader) {
+            Err(e) => e,
+            Ok(_) => panic!("expected a parse error for an unknown config key"),
+        };
+        assert!(matches!(err, SerializationError::ParseError { .. }));
+    }
+
+    #[test]
+    fn with_config_is_a_builder_that_returns_self() {
+        let state = TokenizerState::new().with_config(ConfigSnapshot {
+            add_bos: true,
+            ..ConfigSnapshot::default()
+        });
+        assert!(state.config.add_bos);
     }
 }

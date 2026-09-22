@@ -6,7 +6,7 @@ use oxibonsai_kernels::dispatch::{KernelDispatcher, KernelTier};
 use oxibonsai_model::layers::linear::Linear1Bit;
 use oxibonsai_model::layers::rms_norm::RmsNorm;
 use oxibonsai_model::layers::rope::RopeTable;
-use oxibonsai_model::layers::swiglu::{silu, swiglu};
+use oxibonsai_model::layers::swiglu::{silu, try_swiglu};
 
 fn make_block(scale: f32, bits: [u8; 16]) -> BlockQ1_0G128 {
     BlockQ1_0G128 {
@@ -276,7 +276,7 @@ fn swiglu_gate_times_up_pattern() {
     let gate = vec![1.0, 2.0, 0.0];
     let up = vec![3.0, 4.0, 5.0];
     let mut output = vec![0.0; 3];
-    swiglu(&gate, &up, &mut output);
+    try_swiglu(&gate, &up, &mut output).expect("matching-length buffers must succeed");
 
     assert!((output[0] - silu(1.0) * 3.0).abs() < 1e-5);
     assert!((output[1] - silu(2.0) * 4.0).abs() < 1e-5);
@@ -288,7 +288,7 @@ fn swiglu_zero_gate_zeroes_output() {
     let gate = vec![0.0; 8];
     let up = vec![100.0; 8];
     let mut output = vec![999.0; 8];
-    swiglu(&gate, &up, &mut output);
+    try_swiglu(&gate, &up, &mut output).expect("matching-length buffers must succeed");
 
     for &v in &output {
         assert!(v.abs() < 1e-5, "zero gate should zero output, got {v}");
@@ -300,7 +300,7 @@ fn swiglu_zero_up_zeroes_output() {
     let gate = vec![5.0; 4];
     let up = vec![0.0; 4];
     let mut output = vec![999.0; 4];
-    swiglu(&gate, &up, &mut output);
+    try_swiglu(&gate, &up, &mut output).expect("matching-length buffers must succeed");
 
     for &v in &output {
         assert!(v.abs() < 1e-5, "zero up should zero output, got {v}");

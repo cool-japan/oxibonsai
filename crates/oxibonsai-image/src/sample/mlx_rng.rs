@@ -114,7 +114,7 @@ pub fn random_bits(n: usize, key: [u32; 2]) -> Vec<u32> {
     // bytes_per_key = itemsize(=4) * n; out_skip = ceil(bytes_per_key / 4) = n.
     let out_skip = n;
     let half = out_skip / 2;
-    let even = out_skip % 2 == 0;
+    let even = out_skip.is_multiple_of(2);
 
     // copy_remaining for the u32-output case: 4*loc + 4 <= 4*n  <=>  loc < n,
     // which always holds for the indices used below, so it is a direct store.

@@ -134,7 +134,7 @@ impl Int8Tensor {
                 // Reshape as rows of length x.len() if divisible; otherwise panic.
                 let cols = x.len();
                 assert!(
-                    cols > 0 && self.data.len() % cols == 0,
+                    cols > 0 && self.data.len().is_multiple_of(cols),
                     "matvec: data length {} not divisible by x.len() {}",
                     self.data.len(),
                     cols
@@ -246,7 +246,7 @@ pub fn quantize_per_channel(
     if weights.is_empty() {
         return Err(Int8QuantizeError::EmptyTensor);
     }
-    if num_channels == 0 || weights.len() % num_channels != 0 {
+    if num_channels == 0 || !weights.len().is_multiple_of(num_channels) {
         return Err(Int8QuantizeError::ChannelMismatch {
             total: weights.len(),
             channels: num_channels,

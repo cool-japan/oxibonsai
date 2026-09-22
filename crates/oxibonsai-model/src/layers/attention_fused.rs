@@ -4,21 +4,23 @@
 //! matrix, requiring O(seq_len^2) memory. For long sequences this dominates
 //! memory usage and thrashes caches.
 //!
-//! This module implements **online softmax** (inspired by Flash Attention v2)
-//! to compute attention output in a single pass over KV positions, using
-//! only O(block_size) working memory regardless of sequence length.
+//! This module implements **online softmax** (flash-attention v2 style) to
+//! compute attention output in a single pass over KV positions, using only
+//! O(block_size) working memory regardless of sequence length.
 //!
-//! **Algorithm:**
+//! **Algorithm (two passes per block, flash-attention v2 form):**
 //! ```text
 //! For each block of KV positions:
-//!   1. Compute QK^T scores for the block
-//!   2. Update running max and sum_exp (online softmax)
-//!   3. Rescale previous output accumulator
-//!   4. Accumulate weighted V for this block
+//!   1. Compute QK^T scores for the block (SIMD dot product)
+//!   2. Take the block's max score; rescale the output accumulator ONCE
+//!      if it exceeds the running max (SIMD scale)
+//!   3. Accumulate all of the block's weighted V contributions against the
+//!      now-final running max (SIMD axpy) -- no further rescale this block
 //! ```
 //!
 //! The final output is mathematically identical to standard attention
-//! (within floating-point tolerance), but uses constant working memory.
+//! (within floating-point tolerance), but uses constant working memory and,
+//! for `head_dim <= MAX_HEAD_DIM`, zero heap allocations.
 
 use crate::error::{ModelError, ModelResult};
 use crate::layers::attention::CausalMask;
@@ -27,18 +29,42 @@ use crate::layers::attention::CausalMask;
 /// 32 positions x head_dim floats fits comfortably in L1 cache.
 pub const ATTENTION_BLOCK_SIZE: usize = 32;
 
+/// Upper bound on `head_dim` for the zero-allocation fast path.
+///
+/// Covers every architecture this crate ships today: Qwen3 (64/128) and
+/// Bonsai 2 (256, `qwen35.attention.key_length` / `value_length`). A
+/// `head_dim` above this bound is still computed correctly — it just falls
+/// back to a one-time heap allocation per call instead of a stack array —
+/// so correctness never depends on the bound, only the zero-alloc guarantee
+/// does.
+const MAX_HEAD_DIM: usize = 256;
+
 // ─── SIMD dot product ─────────────────────────────────────────────────────
 
-/// Compute `dot(a, b)` with SIMD acceleration where available.
+/// Compute `dot(a, b)` over the common prefix `a.len().min(b.len())`, with
+/// SIMD acceleration where available.
 ///
 /// Dispatches at runtime to:
 /// - NEON (aarch64): dual-accumulator 8-wide vfmaq_f32
 /// - AVX2+FMA (x86_64): dual-accumulator 16-wide _mm256_fmadd_ps
 /// - Scalar fallback for all other targets
+///
+/// # Length contract (K-M1 item c)
+///
+/// All three implementations stop at `min(a.len(), b.len())`. They used to
+/// disagree: the scalar path already clamped, but the NEON and AVX2 paths
+/// drove the loop from `a.len()` alone and dereferenced `b.as_ptr().add(i)`
+/// unchecked, so an `a` longer than `b` was an out-of-bounds **read** in
+/// release — and the guard here was a `debug_assert_eq!`, compiled out
+/// exactly where it mattered. That was reachable: the public entry points of
+/// this module deliberately accept `query.len() > head_dim` (they validate
+/// with `<`, and [`OnlineSoftmaxState::accumulate`] asserts `>=`), and they
+/// passed the whole `query` here against a `head_dim`-length key slice.
+/// Those entry points now also narrow `query` to `head_dim` before scoring,
+/// so the equal-length case is what the hot path actually takes; this clamp
+/// is the backstop that makes the function sound for any caller.
 #[inline]
 pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
-
     #[cfg(target_arch = "aarch64")]
     {
         if std::arch::is_aarch64_feature_detected!("neon") {
@@ -86,13 +112,19 @@ fn dot_f32_scalar(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// NEON dot product: dual 128-bit accumulators = 8 floats/iter.
+///
+/// # Safety
+///
+/// Caller must have confirmed the `neon` target feature. The loop is bounded
+/// by `a.len().min(b.len())`, so the unchecked `add(i)` loads stay in bounds
+/// for both operands regardless of their relative lengths.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn dot_f32_neon(a: &[f32], b: &[f32]) -> f32 {
     use core::arch::aarch64::*;
     let mut acc0 = vdupq_n_f32(0.0);
     let mut acc1 = vdupq_n_f32(0.0);
-    let n = a.len();
+    let n = a.len().min(b.len());
     let mut i = 0;
     while i + 8 <= n {
         let a0 = vld1q_f32(a.as_ptr().add(i));
@@ -112,13 +144,19 @@ unsafe fn dot_f32_neon(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// AVX2+FMA dot product: dual 256-bit accumulators = 16 floats/iter.
+///
+/// # Safety
+///
+/// Caller must have confirmed the `avx` and `fma` target features. The loop
+/// is bounded by `a.len().min(b.len())`, so the unchecked `add(i)` loads stay
+/// in bounds for both operands regardless of their relative lengths.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,fma")]
 unsafe fn dot_f32_avx2_fma(a: &[f32], b: &[f32]) -> f32 {
     use core::arch::x86_64::*;
     let mut acc0 = _mm256_setzero_ps();
     let mut acc1 = _mm256_setzero_ps();
-    let n = a.len();
+    let n = a.len().min(b.len());
     let mut i = 0;
     while i + 16 <= n {
         let a0 = _mm256_loadu_ps(a.as_ptr().add(i));
@@ -146,6 +184,228 @@ unsafe fn dot_f32_avx2_fma(a: &[f32], b: &[f32]) -> f32 {
     tail
 }
 
+// ─── SIMD axpy / scale (K-M1 item a: V-accumulate and rescale) ───────────
+
+/// Compute `acc[i] += scale * src[i]` for `i` in `0..acc.len().min(src.len())`
+/// (BLAS "saxpy"), with SIMD acceleration where available.
+///
+/// This is the online-softmax V-accumulation step: it has exactly as many
+/// FLOPs as [`dot_f32`]'s QK reduction, so it gets the same runtime
+/// dispatch instead of a plain scalar loop.
+#[inline]
+pub fn axpy_f32(acc: &mut [f32], scale: f32, src: &[f32]) {
+    let n = acc.len().min(src.len());
+    let acc = &mut acc[..n];
+    let src = &src[..n];
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            // SAFETY: neon feature confirmed above; acc/src truncated to equal length.
+            unsafe { axpy_f32_neon(acc, scale, src) };
+            return;
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("fma") && is_x86_feature_detected!("avx") {
+            // SAFETY: avx+fma features confirmed above; acc/src truncated to equal length.
+            unsafe { axpy_f32_avx2_fma(acc, scale, src) };
+            return;
+        }
+    }
+
+    axpy_f32_scalar(acc, scale, src);
+}
+
+/// Scalar saxpy fallback.
+#[inline]
+fn axpy_f32_scalar(acc: &mut [f32], scale: f32, src: &[f32]) {
+    for (a, &s) in acc.iter_mut().zip(src.iter()) {
+        *a += scale * s;
+    }
+}
+
+/// NEON saxpy: dual 128-bit FMA accumulators = 8 floats/iter.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn axpy_f32_neon(acc: &mut [f32], scale: f32, src: &[f32]) {
+    use core::arch::aarch64::*;
+    let n = acc.len();
+    let scale_v = vdupq_n_f32(scale);
+    let mut i = 0;
+    while i + 8 <= n {
+        let a0 = vld1q_f32(acc.as_ptr().add(i));
+        let a1 = vld1q_f32(acc.as_ptr().add(i + 4));
+        let s0 = vld1q_f32(src.as_ptr().add(i));
+        let s1 = vld1q_f32(src.as_ptr().add(i + 4));
+        vst1q_f32(acc.as_mut_ptr().add(i), vfmaq_f32(a0, scale_v, s0));
+        vst1q_f32(acc.as_mut_ptr().add(i + 4), vfmaq_f32(a1, scale_v, s1));
+        i += 8;
+    }
+    while i < n {
+        acc[i] += scale * src[i];
+        i += 1;
+    }
+}
+
+/// AVX2+FMA saxpy: dual 256-bit FMA accumulators = 16 floats/iter.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx,fma")]
+unsafe fn axpy_f32_avx2_fma(acc: &mut [f32], scale: f32, src: &[f32]) {
+    use core::arch::x86_64::*;
+    let n = acc.len();
+    let scale_v = _mm256_set1_ps(scale);
+    let mut i = 0;
+    while i + 16 <= n {
+        let a0 = _mm256_loadu_ps(acc.as_ptr().add(i));
+        let a1 = _mm256_loadu_ps(acc.as_ptr().add(i + 8));
+        let s0 = _mm256_loadu_ps(src.as_ptr().add(i));
+        let s1 = _mm256_loadu_ps(src.as_ptr().add(i + 8));
+        _mm256_storeu_ps(acc.as_mut_ptr().add(i), _mm256_fmadd_ps(scale_v, s0, a0));
+        _mm256_storeu_ps(
+            acc.as_mut_ptr().add(i + 8),
+            _mm256_fmadd_ps(scale_v, s1, a1),
+        );
+        i += 16;
+    }
+    while i < n {
+        acc[i] += scale * src[i];
+        i += 1;
+    }
+}
+
+/// Compute `acc[i] *= factor` in place (BLAS "sscal"), with SIMD
+/// acceleration where available. Shares [`axpy_f32`]'s dispatch tiers.
+///
+/// This is the online-softmax output-accumulator rescale: with the
+/// flash-attention v2 restructuring it runs **at most once per block**
+/// (previously: once per new running max within the block, up to
+/// [`ATTENTION_BLOCK_SIZE`] times), so unlike the old code it is no longer
+/// worth leaving scalar even though it now runs far less often.
+#[inline]
+pub fn scale_f32(acc: &mut [f32], factor: f32) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            // SAFETY: neon feature confirmed above
+            unsafe { scale_f32_neon(acc, factor) };
+            return;
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("fma") && is_x86_feature_detected!("avx") {
+            // SAFETY: avx feature confirmed above (fma is not needed for a
+            // plain multiply, but gating on the same pair as the other
+            // x86_64 helpers in this file keeps dispatch uniform).
+            unsafe { scale_f32_avx2(acc, factor) };
+            return;
+        }
+    }
+
+    scale_f32_scalar(acc, factor);
+}
+
+/// Scalar sscal fallback.
+#[inline]
+fn scale_f32_scalar(acc: &mut [f32], factor: f32) {
+    for a in acc.iter_mut() {
+        *a *= factor;
+    }
+}
+
+/// NEON sscal: dual 128-bit multiply = 8 floats/iter.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn scale_f32_neon(acc: &mut [f32], factor: f32) {
+    use core::arch::aarch64::*;
+    let n = acc.len();
+    let factor_v = vdupq_n_f32(factor);
+    let mut i = 0;
+    while i + 8 <= n {
+        let a0 = vld1q_f32(acc.as_ptr().add(i));
+        let a1 = vld1q_f32(acc.as_ptr().add(i + 4));
+        vst1q_f32(acc.as_mut_ptr().add(i), vmulq_f32(a0, factor_v));
+        vst1q_f32(acc.as_mut_ptr().add(i + 4), vmulq_f32(a1, factor_v));
+        i += 8;
+    }
+    while i < n {
+        acc[i] *= factor;
+        i += 1;
+    }
+}
+
+/// AVX2 sscal: dual 256-bit multiply = 16 floats/iter.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx,fma")]
+unsafe fn scale_f32_avx2(acc: &mut [f32], factor: f32) {
+    use core::arch::x86_64::*;
+    let n = acc.len();
+    let factor_v = _mm256_set1_ps(factor);
+    let mut i = 0;
+    while i + 16 <= n {
+        let a0 = _mm256_loadu_ps(acc.as_ptr().add(i));
+        let a1 = _mm256_loadu_ps(acc.as_ptr().add(i + 8));
+        _mm256_storeu_ps(acc.as_mut_ptr().add(i), _mm256_mul_ps(a0, factor_v));
+        _mm256_storeu_ps(acc.as_mut_ptr().add(i + 8), _mm256_mul_ps(a1, factor_v));
+        i += 16;
+    }
+    while i < n {
+        acc[i] *= factor;
+        i += 1;
+    }
+}
+
+// ─── Zero-allocation output accumulator (K-M1 item c) ─────────────────────
+
+/// The online-softmax output accumulator: a fixed `[f32; MAX_HEAD_DIM]`
+/// stack array for every `head_dim` this crate ships today, falling back to
+/// a heap `Vec` only for a hypothetical future `head_dim > MAX_HEAD_DIM`.
+///
+/// Replaces the old `vec![0.0f32; head_dim]` allocated once per head per
+/// token (24 heads x 16 full-attention layers x every token for Bonsai 2).
+///
+/// `Stack` is deliberately ~1 KiB against `Heap`'s ~24 bytes: the entire
+/// point is a large inline buffer for the common case so it never touches
+/// the allocator. Boxing `Stack` (clippy's usual suggestion for this lint)
+/// would itself be a heap allocation on every call and defeat the point of
+/// this type, so the size asymmetry is accepted rather than "fixed".
+#[allow(clippy::large_enum_variant)]
+enum Accum {
+    Stack([f32; MAX_HEAD_DIM]),
+    Heap(Vec<f32>),
+}
+
+impl Accum {
+    #[inline]
+    fn new(head_dim: usize) -> Self {
+        if head_dim <= MAX_HEAD_DIM {
+            Accum::Stack([0.0f32; MAX_HEAD_DIM])
+        } else {
+            Accum::Heap(vec![0.0f32; head_dim])
+        }
+    }
+
+    #[inline]
+    fn as_slice(&self, head_dim: usize) -> &[f32] {
+        match self {
+            Accum::Stack(a) => &a[..head_dim],
+            Accum::Heap(v) => &v[..head_dim],
+        }
+    }
+
+    #[inline]
+    fn as_mut_slice(&mut self, head_dim: usize) -> &mut [f32] {
+        match self {
+            Accum::Stack(a) => &mut a[..head_dim],
+            Accum::Heap(v) => &mut v[..head_dim],
+        }
+    }
+}
+
 // ─── Online Softmax State ──────────────────────────────────────────────
 
 /// Running state for numerically stable online softmax computation.
@@ -159,9 +419,12 @@ struct OnlineSoftmaxState {
     max_val: f32,
     /// Running sum of exp(score - max_val) for all scores seen so far.
     sum_exp: f32,
+    /// Dimension of each V vector; needed to slice `output` (which may be
+    /// backed by an over-sized fixed array — see [`Accum`]).
+    head_dim: usize,
     /// Running weighted sum of V vectors: sum(softmax_weight * V).
     /// Needs rescaling when max_val changes.
-    output: Vec<f32>,
+    output: Accum,
 }
 
 impl OnlineSoftmaxState {
@@ -170,46 +433,71 @@ impl OnlineSoftmaxState {
         Self {
             max_val: f32::NEG_INFINITY,
             sum_exp: 0.0,
-            output: vec![0.0f32; head_dim],
+            head_dim,
+            output: Accum::new(head_dim),
         }
     }
 
-    /// Process a block of attention scores and corresponding V vectors.
+    #[inline]
+    fn output_slice(&self) -> &[f32] {
+        self.output.as_slice(self.head_dim)
+    }
+
+    #[inline]
+    fn output_mut_slice(&mut self) -> &mut [f32] {
+        self.output.as_mut_slice(self.head_dim)
+    }
+
+    /// Pass 1 of a block: given the block's own raw max score, rescale the
+    /// output accumulator **once** if it exceeds the running max —
+    /// flash-attention v2's restructuring of what used to be a rescale on
+    /// every new max encountered while scanning the block's scores one at a
+    /// time (K-M1 item b).
     ///
-    /// Updates the running softmax state and output accumulator.
-    ///
-    /// - `scores`: QK^T scores for this block (already scaled by 1/sqrt(d)).
-    /// - `values`: Corresponding V vectors, each of length `head_dim`.
-    /// - `head_dim`: Dimension of each V vector.
-    fn update(&mut self, scores: &[f32], values: &[&[f32]], head_dim: usize) {
-        debug_assert_eq!(scores.len(), values.len());
-
-        for (idx, &score) in scores.iter().enumerate() {
-            let v = values[idx];
-            debug_assert_eq!(v.len(), head_dim);
-
-            if score > self.max_val {
-                // New maximum found: rescale previous accumulation
-                let rescale = if self.max_val == f32::NEG_INFINITY {
-                    0.0 // No previous accumulation to rescale
-                } else {
-                    (self.max_val - score).exp()
-                };
-
+    /// The very first block that contributes anything (`self.max_val` still
+    /// `NEG_INFINITY`) needs no rescale at all: `Accum::new` already
+    /// zero-initialized the accumulator (both the `Stack` and `Heap`
+    /// variants), and `sum_exp` starts at `0.0`, so there is nothing yet to
+    /// scale. Skipping the redundant `fill(0.0)` here means `Accum::new`'s
+    /// construction-time zero is now LOAD-BEARING, not merely a safe
+    /// default: for a mask that disallows every position for a given query
+    /// (`SlidingWindowConfig { window_size: 0, .. }`), this method is never
+    /// called at all, and the output comes ONLY from that construction-time
+    /// zero. `fully_masked_query_yields_zero_output` pins exactly that —
+    /// if `Accum::new` ever stops zero-filling, that test (not this one)
+    /// is what goes red.
+    fn rescale_for_block_max(&mut self, block_max: f32) {
+        if block_max > self.max_val {
+            if self.max_val != f32::NEG_INFINITY {
+                let rescale = (self.max_val - block_max).exp();
                 self.sum_exp *= rescale;
-                for d in 0..head_dim {
-                    self.output[d] *= rescale;
-                }
-                self.max_val = score;
+                scale_f32(self.output_mut_slice(), rescale);
             }
-
-            let exp_score = (score - self.max_val).exp();
-            self.sum_exp += exp_score;
-
-            for (out_d, &v_d) in self.output[..head_dim].iter_mut().zip(v.iter()) {
-                *out_d += exp_score * v_d;
-            }
+            self.max_val = block_max;
         }
+    }
+
+    /// Pass 2 of a block, one score/value pair: accumulate against the
+    /// running max, which `rescale_for_block_max` has already finalized for
+    /// this block (K-M1 item a: SIMD axpy instead of a scalar loop).
+    fn accumulate(&mut self, score: f32, v: &[f32]) {
+        // `axpy_f32` truncates to `acc.len().min(src.len())`, so a `v`
+        // shorter than `head_dim` would silently produce a partial
+        // accumulation instead of a loud failure. The two contiguous entry
+        // points always pass an exact `head_dim`-length slice by
+        // construction; `fused_attention_head` accepts caller-supplied
+        // references and is the one path this can actually catch. `>=`
+        // (not `==`): the public API tolerates over-long `query`/`output`
+        // slices throughout, so a `v` longer than `head_dim` is legitimate.
+        debug_assert!(
+            v.len() >= self.head_dim,
+            "OnlineSoftmaxState::accumulate: v.len()={} shorter than head_dim={}",
+            v.len(),
+            self.head_dim
+        );
+        let exp_score = (score - self.max_val).exp();
+        self.sum_exp += exp_score;
+        axpy_f32(self.output_mut_slice(), exp_score, v);
     }
 
     /// Finalize the output by dividing by the total softmax denominator.
@@ -218,9 +506,7 @@ impl OnlineSoftmaxState {
     fn finalize(&mut self) {
         if self.sum_exp > 0.0 {
             let inv_sum = 1.0 / self.sum_exp;
-            for d in self.output.iter_mut() {
-                *d *= inv_sum;
-            }
+            scale_f32(self.output_mut_slice(), inv_sum);
         }
     }
 }
@@ -282,33 +568,46 @@ pub fn fused_attention_head(
         return Ok(());
     }
 
+    // K-M1 item (c): narrow `query` to exactly `head_dim`. The validation
+    // above accepts an over-long query (`<`, not `!=`), and every scoring
+    // call below pairs it with a `head_dim`-length key, so scoring the whole
+    // slice would either read past the key or silently fold extra query
+    // dimensions into the score depending on the SIMD tier.
+    let query = &query[..head_dim];
+
     let scale = 1.0 / (head_dim as f32).sqrt();
     let mut state = OnlineSoftmaxState::new(head_dim);
 
-    // Process KV positions in blocks
+    // Process KV positions in blocks of at most ATTENTION_BLOCK_SIZE,
+    // scoring and accumulating straight from `keys`/`values` (already O(1)
+    // indexable reference slices) with no intermediate Vec.
     let mut pos = 0;
     while pos < seq_len {
         let block_end = (pos + ATTENTION_BLOCK_SIZE).min(seq_len);
         let block_len = block_end - pos;
+        let mut block_scores = [0.0f32; ATTENTION_BLOCK_SIZE];
 
-        // Compute scaled dot products for this block
-        let mut block_scores = Vec::with_capacity(block_len);
-        let mut block_values = Vec::with_capacity(block_len);
-
-        for t in pos..block_end {
-            let score = dot_f32(query, keys[t]) * scale;
-            block_scores.push(score);
-            block_values.push(values[t]);
+        for (score_slot, t) in block_scores.iter_mut().zip(pos..block_end) {
+            *score_slot = dot_f32(query, keys[t]) * scale;
         }
 
-        state.update(&block_scores, &block_values, head_dim);
+        let block_max = block_scores[..block_len]
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        state.rescale_for_block_max(block_max);
+
+        for (&score, t) in block_scores[..block_len].iter().zip(pos..block_end) {
+            state.accumulate(score, values[t]);
+        }
+
         pos = block_end;
     }
 
     state.finalize();
 
     // Copy result to output
-    output[..head_dim].copy_from_slice(&state.output[..head_dim]);
+    output[..head_dim].copy_from_slice(state.output_slice());
 
     Ok(())
 }
@@ -370,31 +669,47 @@ pub fn fused_attention_head_contiguous(
         return Ok(());
     }
 
+    // K-M1 item (c): narrow `query` to exactly `head_dim`. The validation
+    // above accepts an over-long query (`<`, not `!=`), and every scoring
+    // call below pairs it with a `head_dim`-length key, so scoring the whole
+    // slice would either read past the key or silently fold extra query
+    // dimensions into the score depending on the SIMD tier.
+    let query = &query[..head_dim];
+
     let scale = 1.0 / (head_dim as f32).sqrt();
     let mut state = OnlineSoftmaxState::new(head_dim);
 
-    // Process in blocks, building slice references on the fly
+    // Process in blocks, indexing the contiguous KV buffers directly by
+    // position -- no intermediate Vec<&[f32]> of scattered slice
+    // references (that indirection defeats prefetch on what is otherwise a
+    // sequential scan).
     let mut pos = 0;
     while pos < seq_len {
         let block_end = (pos + ATTENTION_BLOCK_SIZE).min(seq_len);
         let block_len = block_end - pos;
+        let mut block_scores = [0.0f32; ATTENTION_BLOCK_SIZE];
 
-        let mut block_scores = Vec::with_capacity(block_len);
-        let mut block_values: Vec<&[f32]> = Vec::with_capacity(block_len);
-
-        for t in pos..block_end {
+        for (score_slot, t) in block_scores.iter_mut().zip(pos..block_end) {
             let k_slice = &keys[t * head_dim..(t + 1) * head_dim];
-            let score = dot_f32(query, k_slice) * scale;
-            block_scores.push(score);
-            block_values.push(&values[t * head_dim..(t + 1) * head_dim]);
+            *score_slot = dot_f32(query, k_slice) * scale;
         }
 
-        state.update(&block_scores, &block_values, head_dim);
+        let block_max = block_scores[..block_len]
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        state.rescale_for_block_max(block_max);
+
+        for (&score, t) in block_scores[..block_len].iter().zip(pos..block_end) {
+            let v_slice = &values[t * head_dim..(t + 1) * head_dim];
+            state.accumulate(score, v_slice);
+        }
+
         pos = block_end;
     }
 
     state.finalize();
-    output[..head_dim].copy_from_slice(&state.output[..head_dim]);
+    output[..head_dim].copy_from_slice(state.output_slice());
 
     Ok(())
 }
@@ -469,36 +784,58 @@ pub fn fused_attention_head_contiguous_with_mask(
         return Ok(());
     }
 
+    // K-M1 item (c): narrow `query` to exactly `head_dim`. The validation
+    // above accepts an over-long query (`<`, not `!=`), and every scoring
+    // call below pairs it with a `head_dim`-length key, so scoring the whole
+    // slice would either read past the key or silently fold extra query
+    // dimensions into the score depending on the SIMD tier.
+    let query = &query[..head_dim];
+
     let scale = 1.0 / (head_dim as f32).sqrt();
     let mut state = OnlineSoftmaxState::new(head_dim);
 
-    // Process in blocks; skip masked positions per block
+    // Process in blocks; skip masked positions per block. Allowed
+    // positions within a block are tracked in a fixed-size stack array
+    // (rather than a `Vec<&[f32]>` of scattered references) so accumulate
+    // can still index the contiguous KV buffers directly by position.
     let mut pos = 0;
     while pos < seq_len {
         let block_end = (pos + ATTENTION_BLOCK_SIZE).min(seq_len);
-        let block_len = block_end - pos;
-
-        let mut block_scores = Vec::with_capacity(block_len);
-        let mut block_values: Vec<&[f32]> = Vec::with_capacity(block_len);
+        let mut block_scores = [0.0f32; ATTENTION_BLOCK_SIZE];
+        let mut block_positions = [0usize; ATTENTION_BLOCK_SIZE];
+        let mut count = 0usize;
 
         for t in pos..block_end {
             if !mask.is_allowed(query_pos, t) {
                 continue;
             }
             let k_slice = &keys[t * head_dim..(t + 1) * head_dim];
-            let score = dot_f32(query, k_slice) * scale;
-            block_scores.push(score);
-            block_values.push(&values[t * head_dim..(t + 1) * head_dim]);
+            block_scores[count] = dot_f32(query, k_slice) * scale;
+            block_positions[count] = t;
+            count += 1;
         }
 
-        if !block_scores.is_empty() {
-            state.update(&block_scores, &block_values, head_dim);
+        if count > 0 {
+            let block_max = block_scores[..count]
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max);
+            state.rescale_for_block_max(block_max);
+
+            for (&score, &t) in block_scores[..count]
+                .iter()
+                .zip(block_positions[..count].iter())
+            {
+                let v_slice = &values[t * head_dim..(t + 1) * head_dim];
+                state.accumulate(score, v_slice);
+            }
         }
+
         pos = block_end;
     }
 
     state.finalize();
-    output[..head_dim].copy_from_slice(&state.output[..head_dim]);
+    output[..head_dim].copy_from_slice(state.output_slice());
 
     Ok(())
 }
@@ -547,458 +884,5 @@ pub fn scaled_dot_product(q: &[f32], k: &[f32], scale: f32) -> f32 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Reference standard attention for comparison.
-    fn reference_attention(
-        query: &[f32],
-        keys: &[f32],
-        values: &[f32],
-        output: &mut [f32],
-        seq_len: usize,
-        head_dim: usize,
-    ) {
-        use super::super::attention::attention_head;
-        attention_head(query, keys, values, output, seq_len, head_dim)
-            .expect("reference attention should succeed");
-    }
-
-    #[test]
-    fn fused_matches_standard_single_token() {
-        let head_dim = 4;
-        let query = vec![1.0, 0.0, 0.0, 0.0];
-        let keys = vec![1.0, 0.0, 0.0, 0.0];
-        let values = vec![0.0, 1.0, 2.0, 3.0];
-
-        let mut out_std = vec![0.0f32; head_dim];
-        let mut out_fused = vec![0.0f32; head_dim];
-
-        reference_attention(&query, &keys, &values, &mut out_std, 1, head_dim);
-        fused_attention_head_contiguous(&query, &keys, &values, &mut out_fused, 1, head_dim)
-            .expect("fused attention should succeed");
-
-        for i in 0..head_dim {
-            assert!(
-                (out_std[i] - out_fused[i]).abs() < 1e-5,
-                "dim {i}: std={}, fused={}",
-                out_std[i],
-                out_fused[i]
-            );
-        }
-    }
-
-    #[test]
-    fn fused_matches_standard_multiple_tokens() {
-        let head_dim = 8;
-        let seq_len = 10;
-
-        // Generate deterministic test data
-        let query: Vec<f32> = (0..head_dim).map(|i| (i as f32 + 1.0) * 0.1).collect();
-        let keys: Vec<f32> = (0..seq_len * head_dim)
-            .map(|i| ((i % 17) as f32 - 8.0) * 0.05)
-            .collect();
-        let values: Vec<f32> = (0..seq_len * head_dim)
-            .map(|i| ((i % 13) as f32 - 6.0) * 0.1)
-            .collect();
-
-        let mut out_std = vec![0.0f32; head_dim];
-        let mut out_fused = vec![0.0f32; head_dim];
-
-        reference_attention(&query, &keys, &values, &mut out_std, seq_len, head_dim);
-        fused_attention_head_contiguous(&query, &keys, &values, &mut out_fused, seq_len, head_dim)
-            .expect("fused attention should succeed");
-
-        for i in 0..head_dim {
-            assert!(
-                (out_std[i] - out_fused[i]).abs() < 1e-4,
-                "dim {i}: std={}, fused={}",
-                out_std[i],
-                out_fused[i]
-            );
-        }
-    }
-
-    #[test]
-    fn fused_matches_standard_large_seq() {
-        // Sequence longer than ATTENTION_BLOCK_SIZE to test multi-block
-        let head_dim = 16;
-        let seq_len = 100; // > ATTENTION_BLOCK_SIZE (32)
-
-        let query: Vec<f32> = (0..head_dim).map(|i| (i as f32 * 0.2) - 1.0).collect();
-        let keys: Vec<f32> = (0..seq_len * head_dim)
-            .map(|i| ((i * 7 + 3) % 23) as f32 * 0.04 - 0.5)
-            .collect();
-        let values: Vec<f32> = (0..seq_len * head_dim)
-            .map(|i| ((i * 11 + 5) % 19) as f32 * 0.06 - 0.6)
-            .collect();
-
-        let mut out_std = vec![0.0f32; head_dim];
-        let mut out_fused = vec![0.0f32; head_dim];
-
-        reference_attention(&query, &keys, &values, &mut out_std, seq_len, head_dim);
-        fused_attention_head_contiguous(&query, &keys, &values, &mut out_fused, seq_len, head_dim)
-            .expect("fused attention should succeed");
-
-        for i in 0..head_dim {
-            assert!(
-                (out_std[i] - out_fused[i]).abs() < 1e-3,
-                "dim {i}: std={}, fused={}",
-                out_std[i],
-                out_fused[i]
-            );
-        }
-    }
-
-    #[test]
-    fn fused_with_slice_api() {
-        let head_dim = 4;
-        let seq_len = 3;
-
-        let query = vec![1.0, 0.5, -0.5, 0.0];
-        let k0 = vec![0.5, 0.5, 0.0, 0.0];
-        let k1 = vec![0.0, 1.0, 0.0, 0.0];
-        let k2 = vec![-0.5, 0.0, 1.0, 0.0];
-        let v0 = vec![1.0, 0.0, 0.0, 0.0];
-        let v1 = vec![0.0, 1.0, 0.0, 0.0];
-        let v2 = vec![0.0, 0.0, 1.0, 0.0];
-
-        let keys_refs: Vec<&[f32]> = vec![&k0, &k1, &k2];
-        let values_refs: Vec<&[f32]> = vec![&v0, &v1, &v2];
-
-        let mut output = vec![0.0f32; head_dim];
-        fused_attention_head(&query, &keys_refs, &values_refs, head_dim, &mut output)
-            .expect("fused attention should succeed");
-
-        // Build contiguous buffers for standard attention comparison
-        let mut keys_flat = vec![0.0f32; seq_len * head_dim];
-        let mut values_flat = vec![0.0f32; seq_len * head_dim];
-        for (t, (k, v)) in keys_refs.iter().zip(values_refs.iter()).enumerate() {
-            keys_flat[t * head_dim..(t + 1) * head_dim].copy_from_slice(k);
-            values_flat[t * head_dim..(t + 1) * head_dim].copy_from_slice(v);
-        }
-
-        let mut out_std = vec![0.0f32; head_dim];
-        reference_attention(
-            &query,
-            &keys_flat,
-            &values_flat,
-            &mut out_std,
-            seq_len,
-            head_dim,
-        );
-
-        for i in 0..head_dim {
-            assert!(
-                (out_std[i] - output[i]).abs() < 1e-4,
-                "dim {i}: std={}, fused={}",
-                out_std[i],
-                output[i]
-            );
-        }
-    }
-
-    #[test]
-    fn fused_empty_sequence() {
-        let head_dim = 4;
-        let keys: Vec<&[f32]> = vec![];
-        let values: Vec<&[f32]> = vec![];
-        let query = vec![1.0; head_dim];
-        let mut output = vec![99.0f32; head_dim];
-
-        fused_attention_head(&query, &keys, &values, head_dim, &mut output)
-            .expect("fused attention should handle empty seq");
-
-        for &v in &output {
-            assert!((v - 0.0).abs() < f32::EPSILON);
-        }
-    }
-
-    #[test]
-    fn softmax_inplace_basic() {
-        let mut vals = vec![1.0, 2.0, 3.0];
-        softmax_inplace(&mut vals);
-        let sum: f32 = vals.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-5);
-        assert!(vals[0] < vals[1]);
-        assert!(vals[1] < vals[2]);
-    }
-
-    #[test]
-    fn softmax_inplace_single() {
-        let mut vals = vec![5.0];
-        softmax_inplace(&mut vals);
-        assert!((vals[0] - 1.0).abs() < 1e-5);
-    }
-
-    #[test]
-    fn softmax_inplace_empty() {
-        let mut vals: Vec<f32> = vec![];
-        softmax_inplace(&mut vals); // Should not panic
-    }
-
-    #[test]
-    fn scaled_dot_product_basic() {
-        let q = vec![1.0, 2.0, 3.0, 4.0];
-        let k = vec![4.0, 3.0, 2.0, 1.0];
-        let scale = 0.5;
-        let result = scaled_dot_product(&q, &k, scale);
-        // dot = 4+6+6+4 = 20, scaled = 10.0
-        assert!((result - 10.0).abs() < 1e-5);
-    }
-
-    #[test]
-    fn scaled_dot_product_non_multiple_of_4() {
-        let q = vec![1.0, 2.0, 3.0];
-        let k = vec![4.0, 5.0, 6.0];
-        let scale = 1.0;
-        let result = scaled_dot_product(&q, &k, scale);
-        // dot = 4+10+18 = 32
-        assert!((result - 32.0).abs() < 1e-5);
-    }
-
-    #[test]
-    fn fused_validation_errors() {
-        let head_dim = 4;
-        let query = vec![1.0; 2]; // Too short
-        let keys: Vec<&[f32]> = vec![];
-        let values: Vec<&[f32]> = vec![];
-        let mut output = vec![0.0f32; head_dim];
-
-        let result = fused_attention_head(&query, &keys, &values, head_dim, &mut output);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn fused_contiguous_validation_errors() {
-        let head_dim = 4;
-        let query = vec![1.0; head_dim];
-        let keys = vec![1.0; 4]; // seq_len=1 matches
-        let values = vec![1.0; 2]; // Too short for seq_len=1
-        let mut output = vec![0.0f32; head_dim];
-
-        let result =
-            fused_attention_head_contiguous(&query, &keys, &values, &mut output, 1, head_dim);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn fused_head_dim_128() {
-        // Realistic head_dim matching Qwen3-8B
-        let head_dim = 128;
-        let seq_len = 50;
-
-        let query: Vec<f32> = (0..head_dim).map(|i| (i as f32 * 0.03) - 2.0).collect();
-        let keys: Vec<f32> = (0..seq_len * head_dim)
-            .map(|i| ((i * 7 + 3) % 31) as f32 * 0.02 - 0.3)
-            .collect();
-        let values: Vec<f32> = (0..seq_len * head_dim)
-            .map(|i| ((i * 13 + 7) % 23) as f32 * 0.04 - 0.5)
-            .collect();
-
-        let mut out_std = vec![0.0f32; head_dim];
-        let mut out_fused = vec![0.0f32; head_dim];
-
-        reference_attention(&query, &keys, &values, &mut out_std, seq_len, head_dim);
-        fused_attention_head_contiguous(&query, &keys, &values, &mut out_fused, seq_len, head_dim)
-            .expect("fused attention should succeed");
-
-        let max_diff = out_std
-            .iter()
-            .zip(out_fused.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-
-        assert!(
-            max_diff < 1e-3,
-            "max difference between standard and fused: {max_diff}"
-        );
-    }
-
-    // ── P11.1 Step 6: New tests ────────────────────────────────────────────
-
-    /// Test masked fused attention matches naive masked attention within 1e-3.
-    #[test]
-    fn fused_masked_matches_naive_masked() {
-        use super::super::attention::attention_head_with_mask;
-        let head_dim = 8;
-        let seq_len = 12;
-        let query_pos = 6; // causal: can attend to 0..=6
-
-        let query: Vec<f32> = (0..head_dim).map(|i| (i as f32 * 0.15) - 0.5).collect();
-        let keys: Vec<f32> = (0..seq_len * head_dim)
-            .map(|i| ((i * 5 + 2) % 17) as f32 * 0.05 - 0.4)
-            .collect();
-        let values: Vec<f32> = (0..seq_len * head_dim)
-            .map(|i| ((i * 7 + 3) % 13) as f32 * 0.08 - 0.5)
-            .collect();
-
-        let mask = CausalMask::new(32);
-
-        let mut out_naive = vec![0.0f32; head_dim];
-        let mut out_fused = vec![0.0f32; head_dim];
-
-        attention_head_with_mask(
-            &query,
-            &keys,
-            &values,
-            &mut out_naive,
-            seq_len,
-            head_dim,
-            query_pos,
-            &mask,
-        )
-        .expect("naive masked attention should succeed");
-
-        fused_attention_head_contiguous_with_mask(
-            &query,
-            &keys,
-            &values,
-            &mut out_fused,
-            seq_len,
-            head_dim,
-            query_pos,
-            &mask,
-        )
-        .expect("fused masked attention should succeed");
-
-        let max_diff = out_naive
-            .iter()
-            .zip(out_fused.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        assert!(
-            max_diff < 1e-3,
-            "masked: max diff = {max_diff}; naive={out_naive:?}, fused={out_fused:?}"
-        );
-    }
-
-    /// Long-context test at S=4096 exercising many block boundaries.
-    #[test]
-    fn fused_long_context_4096() {
-        let head_dim = 16;
-        let seq_len = 4096;
-
-        let query: Vec<f32> = (0..head_dim).map(|i| (i as f32 * 0.1) - 0.8).collect();
-        let keys: Vec<f32> = (0..seq_len * head_dim)
-            .map(|i| ((i * 3 + 1) % 29) as f32 * 0.02 - 0.3)
-            .collect();
-        let values: Vec<f32> = (0..seq_len * head_dim)
-            .map(|i| ((i * 7 + 5) % 17) as f32 * 0.03 - 0.25)
-            .collect();
-
-        let mut out_std = vec![0.0f32; head_dim];
-        let mut out_fused = vec![0.0f32; head_dim];
-
-        reference_attention(&query, &keys, &values, &mut out_std, seq_len, head_dim);
-        fused_attention_head_contiguous(&query, &keys, &values, &mut out_fused, seq_len, head_dim)
-            .expect("fused long-context attention should succeed");
-
-        let max_diff = out_std
-            .iter()
-            .zip(out_fused.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        assert!(
-            max_diff < 1e-3,
-            "long-context S=4096: max diff = {max_diff}"
-        );
-    }
-
-    /// Multi-head test: 4 Q heads, 2 KV heads (GQA 2:1), head_dim=32.
-    #[test]
-    fn fused_multi_head_gqa() {
-        let head_dim = 32;
-        let seq_len = 40;
-        let num_q_heads = 4;
-        let num_kv_heads = 2;
-        let q_heads_per_kv = num_q_heads / num_kv_heads;
-
-        let query_all: Vec<f32> = (0..num_q_heads * head_dim)
-            .map(|i| (i as f32 * 0.05) - 1.0)
-            .collect();
-        let keys: Vec<Vec<f32>> = (0..num_kv_heads)
-            .map(|kv| {
-                (0..seq_len * head_dim)
-                    .map(|i| ((i * (kv + 3) + 1) % 23) as f32 * 0.04 - 0.45)
-                    .collect()
-            })
-            .collect();
-        let values: Vec<Vec<f32>> = (0..num_kv_heads)
-            .map(|kv| {
-                (0..seq_len * head_dim)
-                    .map(|i| ((i * (kv + 5) + 2) % 19) as f32 * 0.06 - 0.55)
-                    .collect()
-            })
-            .collect();
-
-        let mut out_fused = vec![0.0f32; num_q_heads * head_dim];
-        let mut out_ref = vec![0.0f32; num_q_heads * head_dim];
-
-        // Reference: naive per-head
-        for q_head in 0..num_q_heads {
-            let kv_head = q_head / q_heads_per_kv;
-            let q_start = q_head * head_dim;
-            let mut head_out = vec![0.0f32; head_dim];
-            reference_attention(
-                &query_all[q_start..q_start + head_dim],
-                &keys[kv_head],
-                &values[kv_head],
-                &mut head_out,
-                seq_len,
-                head_dim,
-            );
-            out_ref[q_start..q_start + head_dim].copy_from_slice(&head_out);
-        }
-
-        // Fused: per-head
-        for q_head in 0..num_q_heads {
-            let kv_head = q_head / q_heads_per_kv;
-            let q_start = q_head * head_dim;
-            fused_attention_head_contiguous(
-                &query_all[q_start..q_start + head_dim],
-                &keys[kv_head],
-                &values[kv_head],
-                &mut out_fused[q_start..q_start + head_dim],
-                seq_len,
-                head_dim,
-            )
-            .expect("fused multi-head attention should succeed");
-        }
-
-        let max_diff = out_ref
-            .iter()
-            .zip(out_fused.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        assert!(max_diff < 1e-3, "multi-head GQA: max diff = {max_diff}");
-    }
-
-    // ── P11.2: SIMD dot correctness ────────────────────────────────────────
-
-    /// Verify SIMD dot_f32 matches scalar for various lengths.
-    #[test]
-    fn dot_f32_matches_scalar() {
-        let test_lengths = [128usize, 127, 513, 1024];
-
-        for &n in &test_lengths {
-            // Deterministic pseudo-random vectors
-            let a: Vec<f32> = (0..n)
-                .map(|i| ((i * 7 + 3) % 31) as f32 * 0.1 - 1.5)
-                .collect();
-            let b: Vec<f32> = (0..n)
-                .map(|i| ((i * 11 + 5) % 23) as f32 * 0.1 - 1.2)
-                .collect();
-
-            let scalar_val = dot_f32_scalar(&a, &b);
-            let simd_val = dot_f32(&a, &b);
-
-            let denom = scalar_val.abs().max(1.0);
-            let rel_err = (simd_val - scalar_val).abs() / denom;
-            assert!(
-                rel_err < 1e-5,
-                "n={n}: scalar={scalar_val}, simd={simd_val}, rel_err={rel_err}"
-            );
-        }
-    }
-}
+#[path = "attention_fused_tests.rs"]
+mod tests;

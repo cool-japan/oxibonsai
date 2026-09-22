@@ -54,7 +54,9 @@
 pub mod bpe;
 pub mod chat_templates;
 pub mod error;
+pub mod gguf_vocab;
 pub mod hf_format;
+pub mod jinja;
 pub mod serialization;
 pub mod streaming;
 pub mod tests;

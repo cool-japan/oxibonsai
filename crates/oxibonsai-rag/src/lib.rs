@@ -56,6 +56,7 @@ pub use embedding::{Embedder, IdentityEmbedder, TfIdfEmbedder};
 pub use error::RagError;
 pub use metadata_filter::{MetadataFilter, MetadataValue};
 pub use persistence::{IndexSnapshot, RetrieverSnapshot, SCHEMA_VERSION};
+pub use pipeline::PromptParts;
 pub use pipeline::{PipelineStats, RagConfig, RagPipeline};
 pub use retriever::{Retriever, RetrieverConfig};
 pub use semantic_chunker::SemanticChunker;

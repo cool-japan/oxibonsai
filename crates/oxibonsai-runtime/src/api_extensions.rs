@@ -14,13 +14,13 @@
 //!   [`crate::sampling::Sampler::sample_with_history`]. An all-zero pair is a
 //!   no-op.
 //! - `logprobs` — when requested, generation runs through
-//!   [`InferenceEngine::generate_with_logprobs`], which captures the per-step
+//!   [`crate::engine::InferenceEngine::generate_with_logprobs`], which captures the per-step
 //!   logits and returns real per-token log probabilities plus `top_logprobs`
 //!   alternatives. Because that variant has no per-call seed or params seam, a
 //!   `logprobs` request honors the frequency/presence penalties but samples
 //!   with the engine's ambient `temperature` / `top_p` and is not
 //!   seed-reproducible (the seeded, params-honoring, non-logprobs path via
-//!   [`InferenceEngine::generate_with_seed`] still is).
+//!   [`crate::engine::InferenceEngine::generate_with_seed`] still is).
 //!
 //! `stream: true` is implemented as real token-by-token SSE (see
 //! `extended_chat_completions_stream`), reusing the same
@@ -32,26 +32,100 @@
 //! before it can be applied (tool-call parsing, multi-choice interleaving,
 //! and JSON extraction/wrapping all operate on a finished string, not a
 //! partial one).
+//!
+//! ## Wave-3 fixes (RT-API-EXT)
+//!
+//! - `RT-05` — `usage.completion_tokens` reported a whitespace-split estimate
+//!   of the (possibly stop-truncated / JSON-rewritten) final text instead of
+//!   the real emitted token count. Both handlers now report the real
+//!   `output_len` the engine returned.
+//! - `RT-06` — the streaming path's stop-sequence check only ever suppressed
+//!   the *current* SSE chunk's trailing fragment; a stop sequence split
+//!   across two chunks leaked its prefix, because every earlier chunk had
+//!   already been sent. `extended_chat_completions_stream` now reuses
+//!   [`crate::pipeline::StopSequenceMatcher`]'s hold-back window (nothing is
+//!   emitted until it is provably outside any window that could still grow
+//!   into a match) and, for stop sequences that are themselves a single
+//!   token (a model's own `<|im_end|>`/`<think>`/`<tool_call>`-style
+//!   markers), an id-based fast path that removes the chunk-boundary-leak
+//!   class entirely for that case. Post-verifier-review fix: the id fast
+//!   path was itself silently dropping any *other* text still sitting in
+//!   the hold-back window at the moment it fired (`StreamDecodeState`'s
+//!   `finish()` refuses to flush once `hit_stop` is set, which the text-match
+//!   path relies on — it already flushed its own safe prefix inline — but
+//!   the id path set `hit_stop` without ever flushing anything); the decode
+//!   task now calls `StreamDecodeState::flush_before_stop` on that path
+//!   before breaking, so real, already-decoded output never goes missing.
+//! - `RT-12` — a client-supplied `seed` now reaches the streaming path too
+//!   (previously only the non-streaming path honored it); omitting `seed`
+//!   leaves the engine's ambient PRNG state untouched, so the default
+//!   (unseeded) case stays bit-identical to previous behavior.
+//! - `sec-03` — the non-streaming `n`-loop ran directly on the tokio worker
+//!   thread (up to [`MAX_EXTENDED_N_CHOICES`] full generations of up to
+//!   [`crate::server::MAX_OUTPUT_TOKENS`] tokens each); it now runs as one
+//!   unit on [`crate::server::blocking::run_blocking_generation`]'s blocking
+//!   pool, exactly like the streaming path already did.
+//! - `SV-25` — both routes mounted from this file recorded no metrics at
+//!   all; they now increment the same [`crate::metrics::InferenceMetrics`]
+//!   counters/gauges/histogram the base endpoint does.
+//! - `SV-32` — [`crate::middleware::IdempotencyCache`] was a complete,
+//!   tested, but wholly unreferenced primitive; the non-streaming path now
+//!   honors an `Idempotency-Key` request header through it.
+//! - `SV-11` (prepare only) — see [`crate::api_types::MessageContent`] /
+//!   [`crate::api_types::ContentPart`].
+//! - gatekeeper `REQUIRED #1` — `SamplingParams` is now seeded from the
+//!   engine's own ambient/startup parameters (never a hardcoded
+//!   `repetition_penalty: 1.1`, never `SamplingParams::default()`), with a
+//!   client-supplied `repetition_penalty` honored as an override.
+//!
+//! ## Post-wave-3-verifier-review fixes
+//!
+//! - `TOK-M2` (blocking) — the prompt was assembled as raw text
+//!   (`build_extended_prompt`) and handed to `TokenizerBridge::encode` in one
+//!   call, so only the raw-text `<|...|>` guard ever ran. `<think>`,
+//!   `</think>`, `<tool_call>`, and `</tool_call>` contain no `<|`, so a
+//!   client message consisting of exactly one of those real, atomic control
+//!   tokens was tokenized here as the model's genuine control-token id, while
+//!   the base `/v1/chat/completions` endpoint's vocabulary-driven
+//!   [`crate::server::SpecialTokenGuard`] dropped that same id. The tokenize
+//!   step now goes through [`crate::server::sanitize::encode_chat_prompt`],
+//!   reusing the base endpoint's per-segment encode + id-level carve-out
+//!   exactly (`build_extended_prompt` is gone; `encode_chat_prompt` already
+//!   covers the `sanitize == false` escape hatch internally).
+//! - logprobs / sampling-params conflict — `generate_with_logprobs` has no
+//!   `&SamplingParams` seam (see above), so a `logprobs: true` request used
+//!   to silently drop a validated `repetition_penalty` / `temperature` /
+//!   `top_p` instead of ever honoring it. Now rejected with `400`
+//!   (`param: "logprobs"`), mirroring `completions.rs`'s identical guard.
+//! - idempotency cache-hit metrics — a replayed (cache-hit) request was
+//!   counted in `requests_total` but never observed into
+//!   `request_duration_seconds`, leaving the histogram and the counter
+//!   silently inconsistent. The cache-hit return now observes its own
+//!   (near-zero) handler-local duration.
 
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{
         sse::{Event, Sse},
         IntoResponse, Json,
     },
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
 
 use crate::api_types::{
     ChoiceLogprobs, ExtendedChatRequest, ExtendedChatResponse, ExtendedChoice, UsageInfo,
 };
-use crate::engine::InferenceEngine;
-use crate::sampling::SamplingParams;
+use crate::engine_pool::EngineLease;
+use crate::metrics::InferenceMetrics;
+use crate::middleware::IdempotencyCache;
+use crate::pipeline::{StopMatch, StopSequenceMatcher};
+use crate::sampling::{PenaltyParams, Sampler, SamplingParams};
 use crate::server::{AppState, ChatMessage, MAX_OUTPUT_TOKENS};
 
 // ── Extended handler ──────────────────────────────────────────────────────────
@@ -69,6 +143,139 @@ fn bad_request(message: String, param: &str) -> axum::response::Response {
     crate::http_error::bad_request(message, param)
 }
 
+/// Build the per-request [`SamplingParams`] from the engine's own
+/// ambient/startup configuration, honoring whichever fields the client
+/// request explicitly overrides.
+///
+/// Gatekeeper `REQUIRED #1`: every field this function does not receive an
+/// explicit `Some` override for comes from `engine_defaults` — never from
+/// [`SamplingParams::default`], whose `repetition_penalty` is `1.1` and
+/// would otherwise silently disqualify a `temperature: 0` request from
+/// `InferenceEngine::greedy_gpu_eligible`'s GPU-argmax path even on a server
+/// started with no repetition penalty configured at all.
+fn resolve_sampling_params(
+    engine_defaults: &SamplingParams,
+    req_temperature: Option<f32>,
+    req_top_p: Option<f32>,
+    req_repetition_penalty: Option<f32>,
+) -> SamplingParams {
+    SamplingParams {
+        temperature: req_temperature.unwrap_or(engine_defaults.temperature),
+        top_p: req_top_p.unwrap_or(engine_defaults.top_p),
+        repetition_penalty: req_repetition_penalty.unwrap_or(engine_defaults.repetition_penalty),
+        ..engine_defaults.clone()
+    }
+}
+
+/// Decrements `active_requests` however the handler leaves (`SV-25`).
+///
+/// Mirrors `server.rs`'s private `ActiveRequestGuard` shape exactly (this
+/// file cannot import that one — it is private to its module — so it gets
+/// its own copy rather than a broken cross-module reference), so both of
+/// this file's mounted routes get the same "always decrements, even on an
+/// early return or a panicking join" guarantee the base endpoint already
+/// has instead of the two routes recording no metrics at all.
+struct ActiveRequestGuard(Arc<InferenceMetrics>);
+
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        self.0.active_requests.dec();
+    }
+}
+
+/// Module-local idempotency cache for the extended **non-streaming**
+/// endpoint (`SV-32`).
+///
+/// [`IdempotencyCache`] was a complete, fully unit-tested primitive with no
+/// caller anywhere in the crate (`grep -rn IdempotencyCache` outside
+/// `middleware.rs` returned nothing but its own tests) — dead in the request
+/// path it was built for. Wired in here, scoped to this one endpoint, via a
+/// module-private [`std::sync::OnceLock`] rather than a new `AppState`
+/// field, since `AppState` and `middleware.rs` both live in `server.rs` /
+/// `middleware.rs`, neither of which this package owns.
+///
+/// A client that supplies the same `Idempotency-Key` header twice within the
+/// TTL gets back the exact cached response instead of re-running generation.
+/// Deliberately **non-streaming only**: an SSE stream cannot be replayed
+/// from a byte cache without buffering the whole thing first, at which point
+/// it has stopped being a stream, so `extended_chat_completions_stream`
+/// never consults this cache and a `stream: true` request ignores the
+/// header entirely.
+fn idempotency_cache() -> &'static IdempotencyCache {
+    static CACHE: std::sync::OnceLock<IdempotencyCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| IdempotencyCache::new(256, std::time::Duration::from_secs(300)))
+}
+
+/// Combine a client-supplied `Idempotency-Key` header with a fingerprint of
+/// the request body into the actual cache key.
+///
+/// The header value **alone** is not a safe cache key: two different
+/// requests that happen to reuse the same key (a client bug, a colliding
+/// value, or simply a different client on an unauthenticated default-open
+/// server) would otherwise receive each other's cached completion — the
+/// wrong response served with a `200`, not a cache miss. Folding a hash of
+/// the semantically-relevant fields into the key (same technique as
+/// [`crate::api_types::fingerprint_from_config`]) makes a same-key-
+/// different-body request a clean cache **miss** that runs generation
+/// normally, rather than serving a stranger's answer.
+///
+/// Post-verifier-review fix: this used to fold in only `tools.is_some()`
+/// (not the tool *definitions*) and `response_format.format_type` (not its
+/// `json_schema`), and omitted `logprobs`, `top_logprobs`, `tool_choice`,
+/// and `user` entirely — so two requests replayed under the same key with,
+/// say, `logprobs: true` added on the second, would silently get back the
+/// first's cached (non-logprobs-shaped) `200` instead of a cache miss.
+/// `Tool`/`ToolChoice`/`JsonSchemaFormat` don't implement [`Hash`] (they are
+/// wire types built from `serde_json::Value`), so those fields are folded
+/// in via their serialized JSON text instead of a structural hash; this is
+/// intentionally conservative rather than a canonical fingerprint — two
+/// requests with e.g. object keys in a different order (but otherwise
+/// identical) hash differently and simply produce an extra cache **miss**,
+/// never a wrong hit, which is the same direction of error this function is
+/// already allowed to make (a fresh key always re-runs generation safely).
+/// There is deliberately no `model` field here: `ExtendedChatRequest` has
+/// none (this server has exactly one loaded model; an OpenAI-shaped
+/// `"model"` key in the request body is simply an unknown field that serde
+/// drops), so there is nothing named `model` to fold in.
+fn idempotency_cache_key(header_value: &str, req: &ExtendedChatRequest) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for msg in &req.messages {
+        msg.role.hash(&mut hasher);
+        msg.content.hash(&mut hasher);
+    }
+    req.max_tokens.hash(&mut hasher);
+    req.temperature.map(f32::to_bits).hash(&mut hasher);
+    req.top_p.map(f32::to_bits).hash(&mut hasher);
+    req.seed.hash(&mut hasher);
+    req.n.hash(&mut hasher);
+    req.presence_penalty.map(f32::to_bits).hash(&mut hasher);
+    req.frequency_penalty.map(f32::to_bits).hash(&mut hasher);
+    req.repetition_penalty.map(f32::to_bits).hash(&mut hasher);
+    if let Some(stop) = &req.stop {
+        stop.as_slice().hash(&mut hasher);
+    }
+    req.logprobs.hash(&mut hasher);
+    req.top_logprobs.hash(&mut hasher);
+    req.user.hash(&mut hasher);
+    // Full tool definitions (not just presence) and the tool-choice
+    // constraint: different tools/choice must not replay each other's
+    // cached completion.
+    if let Ok(s) = serde_json::to_string(&req.tools) {
+        s.hash(&mut hasher);
+    }
+    if let Ok(s) = serde_json::to_string(&req.tool_choice) {
+        s.hash(&mut hasher);
+    }
+    if let Some(rf) = &req.response_format {
+        rf.format_type.hash(&mut hasher);
+        if let Ok(s) = serde_json::to_string(&rf.json_schema) {
+            s.hash(&mut hasher);
+        }
+    }
+    format!("{header_value}:{:x}", hasher.finish())
+}
+
 /// Handler for `POST /v1/chat/completions/extended`.
 ///
 /// Supports all standard fields plus `tools`, `tool_choice`, `logprobs`,
@@ -78,12 +285,30 @@ fn bad_request(message: String, param: &str) -> axum::response::Response {
 /// larger value is rejected with `400` rather than silently clamped.
 pub async fn extended_chat_completions(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<ExtendedChatRequest>,
 ) -> impl IntoResponse {
+    // Separate from `request_start` below (which starts only once the engine
+    // has been acquired, so it measures the generation-inclusive tail the
+    // way the sibling endpoints do): this one covers the whole handler,
+    // purely so the idempotency-cache-hit early return a little further down
+    // has *something* to observe into `request_duration_seconds` (verifier
+    // wave-3 review) without redefining what that histogram means for every
+    // other request on this route.
+    let handler_start = Instant::now();
+    // `SV-25`: this route previously recorded no metrics at all. Incremented
+    // unconditionally, once, regardless of how the request is ultimately
+    // resolved (mirrors the base endpoint's `requests_total` semantics
+    // without needing a `requests_total.inc()` call at every one of the
+    // early-return validation branches below).
+    state.metrics().requests_total.inc();
+
     if req.max_tokens < 1 {
+        state.metrics().errors_total.inc();
         return bad_request("max_tokens must be at least 1".to_string(), "max_tokens");
     }
     if req.max_tokens > MAX_OUTPUT_TOKENS {
+        state.metrics().errors_total.inc();
         return bad_request(
             format!(
                 "max_tokens {} exceeds the maximum of {MAX_OUTPUT_TOKENS}",
@@ -94,6 +319,7 @@ pub async fn extended_chat_completions(
     }
     let requested_n = req.n.unwrap_or(1);
     if !(1..=MAX_EXTENDED_N_CHOICES).contains(&requested_n) {
+        state.metrics().errors_total.inc();
         return bad_request(
             format!("n must be between 1 and {MAX_EXTENDED_N_CHOICES}, got {requested_n}"),
             "n",
@@ -108,23 +334,63 @@ pub async fn extended_chat_completions(
     let frequency_penalty = req.frequency_penalty.unwrap_or(0.0);
     let presence_penalty = req.presence_penalty.unwrap_or(0.0);
     if !frequency_penalty.is_finite() || !(-2.0..=2.0).contains(&frequency_penalty) {
+        state.metrics().errors_total.inc();
         return bad_request(
             "frequency_penalty must be a finite number in the range [-2.0, 2.0]".to_string(),
             "frequency_penalty",
         );
     }
     if !presence_penalty.is_finite() || !(-2.0..=2.0).contains(&presence_penalty) {
+        state.metrics().errors_total.inc();
         return bad_request(
             "presence_penalty must be a finite number in the range [-2.0, 2.0]".to_string(),
             "presence_penalty",
         );
     }
-    let penalties = crate::sampling::PenaltyParams::new(frequency_penalty, presence_penalty);
+    // gatekeeper `REQUIRED #1`: validated the same way the two penalties
+    // above are (a client error is rejected honestly, not silently coerced),
+    // additionally requiring a strictly positive value — `0.0` or negative
+    // would zero out or invert every logit's repetition adjustment, which is
+    // never a real sampling strategy.
+    if let Some(rp) = req.repetition_penalty {
+        if !rp.is_finite() || rp <= 0.0 {
+            state.metrics().errors_total.inc();
+            return bad_request(
+                "repetition_penalty must be a finite number greater than 0.0".to_string(),
+                "repetition_penalty",
+            );
+        }
+    }
+    let penalties = PenaltyParams::new(frequency_penalty, presence_penalty);
     let max_tokens = req.max_tokens;
-    let temperature = req.temperature.unwrap_or(0.7);
-    let seed = req.seed.unwrap_or(42);
+    let seed = req.seed;
     let want_logprobs = req.logprobs.unwrap_or(false);
     let top_logprobs_k = req.top_logprobs.unwrap_or(0).clamp(0, 20);
+    // Verifier wave-3 review: `generate_with_logprobs` (used below whenever
+    // `want_logprobs` is set) takes no `&SamplingParams` at all — it samples
+    // with the engine's ambient sampler (see the module docs) — so a
+    // `repetition_penalty` / `temperature` / `top_p` override validated just
+    // above (or defaulted from the request struct) would otherwise be
+    // silently dropped for this request instead of ever reaching the
+    // sampler, with no signal to the client beyond a `200`. Reject the
+    // combination honestly, mirroring `completions.rs`'s identical guard for
+    // `temperature`/`top_p` (RT-32 / SV-22). `frequency_penalty` /
+    // `presence_penalty` are deliberately excluded: they ARE honored on the
+    // logprobs path (`lease.set_penalties(penalties)` runs before either
+    // branch below), so there is no dropped field to guard against there.
+    if want_logprobs
+        && (req.repetition_penalty.is_some() || req.temperature.is_some() || req.top_p.is_some())
+    {
+        state.metrics().errors_total.inc();
+        return bad_request(
+            "logprobs cannot be combined with repetition_penalty, temperature, or top_p \
+             in the same /v1/chat/completions/extended request (the logprobs code path \
+             samples with the engine's ambient sampler and has no per-call params seam \
+             yet); omit logprobs, or omit repetition_penalty/temperature/top_p"
+                .to_string(),
+            "logprobs",
+        );
+    }
     let response_format = req.response_format.clone();
     let tools = req.tools.clone();
     let is_json_mode = response_format
@@ -141,6 +407,7 @@ pub async fn extended_chat_completions(
     let stream = req.stream.unwrap_or(false);
     if stream {
         if tools.is_some() {
+            state.metrics().errors_total.inc();
             return bad_request(
                 "stream: true is not supported together with tools: tool-call parsing \
                  looks for a complete <tool_call>...</tool_call> block, which isn't \
@@ -150,6 +417,7 @@ pub async fn extended_chat_completions(
             );
         }
         if n > 1 {
+            state.metrics().errors_total.inc();
             return bad_request(
                 format!(
                     "stream: true only supports n = 1: interleaving {n} streamed choices \
@@ -159,6 +427,7 @@ pub async fn extended_chat_completions(
             );
         }
         if is_json_mode {
+            state.metrics().errors_total.inc();
             return bad_request(
                 "stream: true is not supported together with a json_object/json_schema \
                  response_format: JSON-mode extraction/wrapping needs the complete \
@@ -170,236 +439,335 @@ pub async fn extended_chat_completions(
         }
     }
 
+    // `SV-32`: only the non-streaming path is idempotency-cached — see
+    // `idempotency_cache`'s docs for why streaming is excluded. The cache
+    // key folds in a fingerprint of the request body
+    // (`idempotency_cache_key`) so a repeated header value with a different
+    // body cannot return a different client's cached completion.
+    let idempotency_key = if stream {
+        None
+    } else {
+        headers
+            .get("idempotency-key")
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| !s.is_empty())
+            .map(|header_value| idempotency_cache_key(header_value, &req))
+    };
+    if let Some(key) = idempotency_key.as_deref() {
+        if let Some((status, body)) = idempotency_cache().get(key) {
+            // Verifier wave-3 review: a replayed request was previously
+            // counted in `requests_total` (above) but invisible in
+            // `request_duration_seconds` — the histogram's `_count` and the
+            // counter could silently disagree. A cache hit does no
+            // tokenization/generation, so `prompt_tokens_total` is
+            // deliberately left alone (the cached body's own `usage` field
+            // still reports the real prompt-token count to the client;
+            // re-tokenizing here solely to re-observe a metric would defeat
+            // the point of caching).
+            state
+                .metrics()
+                .request_duration_seconds
+                .observe(handler_start.elapsed().as_secs_f64());
+            return (
+                StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+                .into_response();
+        }
+    }
+
     // Build stop checker
     let stop_checker = match req.stop {
         Some(ref seqs) => StopChecker::new(seqs.as_slice().to_vec()),
         None => StopChecker::new(vec![]),
     };
 
-    // Build prompt text from messages, neutralizing special-token markers in
-    // user/system content when sanitization is enabled (finding `security-03`).
-    let prompt_text = build_extended_prompt(&req.messages, state.sanitize_prompt());
-
-    // Tokenize the prompt
-    let prompt_tokens = {
-        let tokenizer = state.tokenizer();
-        if let Some(tok) = tokenizer {
-            match tok.encode(&prompt_text) {
-                Ok(tokens) => tokens,
-                Err(e) => {
-                    tracing::error!(error = %e, "tokenization failed");
-                    return (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": "tokenization failed"})),
-                    )
-                        .into_response();
-                }
+    // Tokenize the prompt.
+    //
+    // `TOK-M2` (blocking, wave-3 verifier re-review): this used to assemble
+    // the whole prompt as one string (`build_extended_prompt`, applying only
+    // the raw-text `<|...|>` guard, [`crate::server::neutralize_special_markers`])
+    // and hand it to `TokenizerBridge::encode` in a single call. That raw-text
+    // guard never matches `<think>`, `</think>`, `<tool_call>`, or
+    // `</tool_call>` — none of them contain `<|` — even though every one of
+    // them is a real, atomic control token in the shipped vocabularies
+    // (Bonsai 2's `token_type = 4` added tokens), so a client message whose
+    // content was exactly one of those strings was tokenized here as the
+    // model's real control-token id, while the base `/v1/chat/completions`
+    // endpoint's vocabulary-driven [`crate::server::SpecialTokenGuard`]
+    // silently drops that same id — the two mounted endpoints disagreed
+    // about prompt-injection safety. Routing through
+    // [`crate::server::sanitize::encode_chat_prompt`] closes that gap by
+    // reusing the exact same per-segment encode + id-level carve-out the
+    // base endpoint uses (mirrors server.rs's `chat_completions`,
+    // server.rs:1004-1011, including the no-tokenizer fallback below).
+    let prompt_tokens = match state.tokenizer() {
+        Some(tok) => match crate::server::sanitize::encode_chat_prompt(
+            tok,
+            &req.messages,
+            state.special_tokens(),
+            state.sanitize_prompt(),
+        ) {
+            Ok(tokens) => tokens,
+            Err(e) => {
+                state.metrics().errors_total.inc();
+                tracing::error!(error = %e, "tokenization failed");
+                return crate::http_error::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "tokenization failed",
+                    None,
+                );
             }
-        } else {
-            vec![151644u32]
-        }
+        },
+        None => vec![151644u32],
     };
 
     let prompt_len = prompt_tokens.len();
-
-    // Build sampling params
-    let sampling_params = SamplingParams {
-        temperature,
-        top_k: 40,
-        top_p: req.top_p.unwrap_or(0.9),
-        repetition_penalty: 1.1,
-        ..SamplingParams::default()
-    };
+    state
+        .metrics()
+        .prompt_tokens_total
+        .inc_by(prompt_len as u64);
 
     // Resolve the real loaded-model id once, for both the response `model`
     // field and the fingerprint input, instead of the previous hardcoded
     // "bonsai-8b" literal (mirrors the same fix already applied to the base
-    // /v1/chat/completions and /v1/models handlers in server.rs).
+    // /v1/chat/completions and /v1/models handlers in server.rs). MUST run
+    // before the engine is acquired below: on an uncached first call,
+    // `ServedModelInfo::descriptor` acquires its own (briefly held) lease
+    // from this same pool, so calling it while `lease` below is already held
+    // would self-deadlock a single-replica pool waiting on a permit only
+    // this request holds.
     let model_id = state.model_info().descriptor().await.id;
+
+    // Acquire the engine once, both to serve the request and — gatekeeper
+    // `REQUIRED #1` — to seed the per-request `SamplingParams` from the
+    // engine's own *ambient/startup* configuration rather than a hardcoded
+    // literal or `SamplingParams::default()` (whose `repetition_penalty` is
+    // `1.1`, which alone makes `InferenceEngine::greedy_gpu_eligible`
+    // permanently false for every request through this endpoint, even a
+    // `temperature: 0` one against a server started with no repetition
+    // penalty configured at all). A client-supplied `repetition_penalty` /
+    // `temperature` / `top_p` still overrides the engine default.
+    let lease = match state.acquire_engine().await {
+        Ok(lease) => lease,
+        Err(e) => {
+            state.metrics().errors_total.inc();
+            tracing::error!(error = %e, "engine pool acquire failed");
+            return crate::http_error::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "engine pool unavailable",
+                None,
+            );
+        }
+    };
+    state.metrics().active_requests.inc();
+    let active_guard = ActiveRequestGuard(Arc::clone(state.metrics()));
+    let request_start = Instant::now();
+
+    let sampling_params = resolve_sampling_params(
+        lease.sampling_params(),
+        req.temperature,
+        req.top_p,
+        req.repetition_penalty,
+    );
 
     if stream {
         let stop_sequences = stop_checker.sequences.clone();
-        return extended_chat_completions_stream(
-            state,
+        let resp = extended_chat_completions_stream(
+            Arc::clone(&state),
+            lease,
             prompt_tokens,
             max_tokens,
             sampling_params,
             penalties,
             stop_sequences,
             model_id,
+            seed,
+            active_guard,
+            request_start,
         )
         .await;
+        return resp;
     }
 
-    // Generate n completions. One lease serves all `n` runs (they reset KV
-    // between runs, as before), so the replica is held for the whole batch.
-    let mut engine = match state.acquire_engine().await {
-        Ok(lease) => lease,
-        Err(e) => {
-            tracing::error!(error = %e, "engine pool acquire failed");
-            return (
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "engine pool unavailable"})),
-            )
-                .into_response();
-        }
-    };
-
-    // Apply frequency/presence penalties for the whole batch, restoring the
-    // engine's previous penalties before the lease is returned to the pool so
-    // they cannot leak into the next request served by this replica.
-    let prev_penalties = engine.penalties();
-    engine.set_penalties(penalties);
-
-    // Each entry is `(decoded_text, output_token_count, logprobs)`; the token
-    // count is retained (rather than re-derived from whitespace-splitting the
-    // decoded text later) so the finish-reason computation below can tell a
-    // length-truncated run (`output_token_count == max_tokens`) apart from one
-    // that stopped early on EOS or a stop sequence. `logprobs` is `Some` only
-    // when the client requested them.
+    // `sec-03`: the whole `n`-loop — up to `MAX_EXTENDED_N_CHOICES` full
+    // generations of up to `max_tokens` tokens each — previously ran
+    // directly inside this async handler, pinning a tokio worker (and the
+    // engine replica) for the entire batch. It now runs as ONE unit on
+    // `run_blocking_generation`'s blocking pool: the lease is moved into the
+    // closure and reset once up front (`RT-03`), and each of the `n`
+    // independent runs additionally resets *inside* the loop so run `i > 0`
+    // never inherits run `i - 1`'s generated tokens.
     type RawCompletion = (
         String,
         usize,
         Option<Vec<crate::api_types::LogprobsContent>>,
     );
-    let raw_completions: Vec<RawCompletion> = {
-        let mut results = Vec::with_capacity(n);
+    let state_for_generation = Arc::clone(&state);
+    let generation = crate::server::blocking::run_blocking_generation(lease, move |lease| {
+        let prev_penalties = lease.penalties();
+        lease.set_penalties(penalties);
+
+        let mut results: Vec<RawCompletion> = Vec::with_capacity(n);
+        let mut failure: Option<crate::error::RuntimeError> = None;
         for i in 0..n {
-            engine.reset();
+            lease.reset();
 
             // Logprobs and seeded generation are mutually exclusive at this
             // layer: the logits-capturing variant honors the engine's penalties
             // (set above) but has no per-call seed seam, so a `logprobs`
             // request is not seed-reproducible (documented on the function).
-            // The far more common non-logprobs path stays fully seeded.
-            let (output_tokens, logprobs) = if want_logprobs {
+            // The far more common non-logprobs path stays fully seeded
+            // (`seed` defaults to `42` here only when the client omitted it
+            // *and* asked for `n > 1`, purely so the `n` completions differ
+            // from one another; a single-choice, unseeded request keeps
+            // consuming the engine's ambient PRNG exactly as before, via
+            // `generate_with_seed(..., seed.unwrap_or(42) + i, ...)`, matching
+            // this handler's pre-existing default of `42` for that case).
+            let outcome = if want_logprobs {
                 let id_to_token = |id: u32| -> String {
-                    match state.tokenizer() {
+                    match state_for_generation.tokenizer() {
                         Some(tok) => tok.decode(&[id]).unwrap_or_else(|_| format!("<{id}>")),
                         None => format!("<{id}>"),
                     }
                 };
-                match engine.generate_with_logprobs(
-                    &prompt_tokens,
-                    max_tokens,
-                    top_logprobs_k,
-                    &id_to_token,
-                ) {
-                    Ok((toks, lp)) => (toks, Some(lp)),
-                    Err(e) => {
-                        tracing::error!(error = %e, "logprobs generation failed for completion {i}");
-                        engine.set_penalties(prev_penalties);
-                        return (
-                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(serde_json::json!({"error": "generation failed"})),
-                        )
-                            .into_response();
-                    }
-                }
+                lease
+                    .generate_with_logprobs(
+                        &prompt_tokens,
+                        max_tokens,
+                        top_logprobs_k,
+                        &id_to_token,
+                    )
+                    .map(|(toks, lp)| (toks, Some(lp)))
             } else {
-                let run_seed = seed.wrapping_add(i as u64);
-                match engine.generate_with_seed(
-                    &prompt_tokens,
-                    max_tokens,
-                    run_seed,
-                    &sampling_params,
-                ) {
-                    Ok(toks) => (toks, None),
-                    Err(e) => {
-                        tracing::error!(error = %e, "generation failed for completion {i}");
-                        engine.set_penalties(prev_penalties);
-                        return (
-                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(serde_json::json!({"error": "generation failed"})),
-                        )
-                            .into_response();
-                    }
-                }
-            };
-            let output_len = output_tokens.len();
-
-            // Decode
-            let text = if let Some(tok) = state.tokenizer() {
-                tok.decode(&output_tokens)
-                    .unwrap_or_else(|_| format!("{output_tokens:?}"))
-            } else {
-                format!("{output_tokens:?}")
+                let run_seed = seed.unwrap_or(42).wrapping_add(i as u64);
+                lease
+                    .generate_with_seed(&prompt_tokens, max_tokens, run_seed, &sampling_params)
+                    .map(|toks| (toks, None))
             };
 
-            results.push((text, output_len, logprobs));
+            match outcome {
+                Ok((output_tokens, logprobs)) => {
+                    let output_len = output_tokens.len();
+                    let text = match state_for_generation.tokenizer() {
+                        Some(tok) => tok
+                            .decode(&output_tokens)
+                            .unwrap_or_else(|_| format!("{output_tokens:?}")),
+                        None => format!("{output_tokens:?}"),
+                    };
+                    results.push((text, output_len, logprobs));
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "generation failed for extended completion {i}");
+                    failure = Some(e);
+                    break;
+                }
+            }
         }
-        results
-    };
 
-    // Restore the engine's penalties now that the batch is complete.
-    engine.set_penalties(prev_penalties);
+        lease.set_penalties(prev_penalties);
+        match failure {
+            Some(e) => Err(e),
+            None => Ok(results),
+        }
+    })
+    .await;
+
+    let raw_completions: Vec<RawCompletion> = match generation {
+        Ok(Ok(results)) => results,
+        Ok(Err(e)) => {
+            state.metrics().errors_total.inc();
+            state
+                .metrics()
+                .request_duration_seconds
+                .observe(request_start.elapsed().as_secs_f64());
+            tracing::error!(error = %e, "generation failed");
+            return crate::http_error::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "generation failed",
+                None,
+            );
+        }
+        Err(api_err) => {
+            state.metrics().errors_total.inc();
+            state
+                .metrics()
+                .request_duration_seconds
+                .observe(request_start.elapsed().as_secs_f64());
+            return api_err.into_response();
+        }
+    };
 
     // Apply stop sequences and response format enforcement (`is_json_mode`
     // was already computed above, before the stream/tools/n compatibility
     // checks).
     let json_enforcer = JsonModeEnforcer::new();
 
-    let total_completion_tokens: usize;
-    let choices: Vec<ExtendedChoice> = {
-        let mut comp_tokens = 0usize;
-        let choices_out: Vec<ExtendedChoice> = raw_completions
-            .into_iter()
-            .enumerate()
-            .map(|(idx, (raw_text, output_len, run_logprobs))| {
-                let (truncated, hit_stop) = stop_checker.truncate_at_stop(&raw_text);
+    let mut total_completion_tokens = 0usize;
+    let choices: Vec<ExtendedChoice> = raw_completions
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (raw_text, output_len, run_logprobs))| {
+            let (truncated, hit_stop) = stop_checker.truncate_at_stop(&raw_text);
 
-                // Apply JSON mode enforcement if requested
-                let final_text = if is_json_mode {
-                    json_enforcer.enforce(&truncated)
-                } else {
-                    truncated.clone()
-                };
+            // Apply JSON mode enforcement if requested
+            let final_text = if is_json_mode {
+                json_enforcer.enforce(&truncated)
+            } else {
+                truncated
+            };
 
-                // Check for tool call pattern in the output
-                let tool_calls = if tools.is_some() {
-                    let call_id = crate::api_types::generate_tool_call_id();
-                    crate::api_types::parse_tool_call(&final_text, &call_id).map(|tc| vec![tc])
-                } else {
-                    None
-                };
+            // Check for tool call pattern in the output
+            let tool_calls = if tools.is_some() {
+                let call_id = crate::api_types::generate_tool_call_id();
+                crate::api_types::parse_tool_call(&final_text, &call_id).map(|tc| vec![tc])
+            } else {
+                None
+            };
 
-                let finish_reason = determine_extended_finish_reason(
-                    tool_calls.is_some(),
-                    hit_stop,
-                    output_len,
-                    max_tokens,
-                );
+            let finish_reason = determine_extended_finish_reason(
+                tool_calls.is_some(),
+                hit_stop,
+                output_len,
+                max_tokens,
+            );
 
-                // Real per-token logprobs, captured during generation by the
-                // engine's logits-capturing variant when the client requested
-                // them (`logprobs: true`). `content: Some([...])` carries one
-                // entry per generated token, each with the chosen token's log
-                // probability and its `top_logprobs` alternatives.
-                let logprobs: Option<ChoiceLogprobs> = run_logprobs.map(|content| ChoiceLogprobs {
-                    content: Some(content),
-                });
+            // Real per-token logprobs, captured during generation by the
+            // engine's logits-capturing variant when the client requested
+            // them (`logprobs: true`). `content: Some([...])` carries one
+            // entry per generated token, each with the chosen token's log
+            // probability and its `top_logprobs` alternatives.
+            let logprobs: Option<ChoiceLogprobs> = run_logprobs.map(|content| ChoiceLogprobs {
+                content: Some(content),
+            });
 
-                // Estimate token count
-                let approx_tokens = final_text.split_whitespace().count().max(1);
-                comp_tokens += approx_tokens;
+            // `RT-05`: report the real number of tokens the engine emitted
+            // for this completion (bound before stop-sequence truncation /
+            // JSON-mode rewriting, which is what OpenAI's own
+            // `completion_tokens` counts), not a whitespace-split estimate
+            // of the possibly-truncated, possibly-rewritten final text.
+            total_completion_tokens += output_len;
 
-                ExtendedChoice {
-                    index: idx,
-                    message: ChatMessage {
-                        role: "assistant".to_string(),
-                        content: Some(final_text),
-                        tool_calls: None,
-                        tool_call_id: None,
-                    },
-                    finish_reason,
-                    logprobs,
-                    tool_calls,
-                }
-            })
-            .collect();
-        total_completion_tokens = comp_tokens;
-        choices_out
-    };
+            ExtendedChoice {
+                index: idx,
+                message: ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some(final_text),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                finish_reason,
+                logprobs,
+                tool_calls,
+            }
+        })
+        .collect();
+
+    state
+        .metrics()
+        .tokens_generated_total
+        .inc_by(total_completion_tokens as u64);
 
     // Build system fingerprint from the real loaded-model id (resolved above).
     let system_fingerprint = Some(crate::api_types::fingerprint_from_config(&model_id));
@@ -423,6 +791,17 @@ pub async fn extended_chat_completions(
         system_fingerprint,
     };
 
+    if let Some(key) = idempotency_key.as_deref() {
+        if let Ok(body_bytes) = serde_json::to_vec(&response) {
+            idempotency_cache().insert(key, 200, body_bytes);
+        }
+    }
+
+    drop(active_guard);
+    state
+        .metrics()
+        .request_duration_seconds
+        .observe(request_start.elapsed().as_secs_f64());
     Json(response).into_response()
 }
 
@@ -477,40 +856,197 @@ fn extended_chunk_json(
     serde_json::to_string(&chunk).unwrap_or_default()
 }
 
+// ── Stop-sequence-safe streaming decode state (RT-06) ────────────────────────
+
+/// Pure per-token decode + stop-sequence hold-back state machine driving
+/// [`extended_chat_completions_stream`]'s decode task.
+///
+/// Factored out of the task itself so the hold-back / token-id-fast-path
+/// logic — the actual fix for the chunk-boundary leak — is unit-testable
+/// without a tokio runtime, a channel, or an HTTP router: feed it decoded
+/// text (or a raw token id, for the id fast path) one step at a time and
+/// assert on exactly what it says is safe to emit.
+///
+/// Never emits a byte that could still be swallowed by a stop sequence: text
+/// is only returned once it is provably outside any window that could still
+/// grow into a configured match (`hold_back_len`), and a token whose whole
+/// decoded text equals a stop sequence in its own right is caught by id,
+/// before any of its text is even considered.
+struct StreamDecodeState {
+    matcher: StopSequenceMatcher,
+    stop_token_ids: HashSet<u32>,
+    accumulated: String,
+    emitted_len: usize,
+    hit_stop: bool,
+}
+
+impl StreamDecodeState {
+    fn new(stop_sequences: &[String], stop_token_ids: HashSet<u32>) -> Self {
+        Self {
+            matcher: StopSequenceMatcher::new(stop_sequences),
+            stop_token_ids,
+            accumulated: String::new(),
+            emitted_len: 0,
+            hit_stop: false,
+        }
+    }
+
+    /// `true` once a stop sequence (by text or by id) has been matched; once
+    /// set, [`feed`](Self::feed) and [`finish`](Self::finish) are inert.
+    fn is_stopped(&self) -> bool {
+        self.hit_stop
+    }
+
+    /// Check `token_id` against the id fast path (see the struct docs) and,
+    /// if it matches, mark the stream stopped. Must be called *before*
+    /// decoding the token's text — the whole point is to never decode (and
+    /// thus never risk emitting so much as a byte of) a token that is itself
+    /// a configured stop marker.
+    fn hit_stop_by_id(&mut self, token_id: u32) -> bool {
+        if !self.hit_stop && self.stop_token_ids.contains(&token_id) {
+            self.hit_stop = true;
+        }
+        self.hit_stop
+    }
+
+    /// Feed one token's already-decoded text. Returns the text, if any, that
+    /// is now provably safe to emit to the client.
+    fn feed(&mut self, decoded_text: &str) -> Option<String> {
+        if self.hit_stop || decoded_text.is_empty() {
+            return None;
+        }
+        self.accumulated.push_str(decoded_text);
+
+        match self.matcher.check(&self.accumulated) {
+            StopMatch::Found { start, .. } => {
+                self.hit_stop = true;
+                (start > self.emitted_len)
+                    .then(|| self.accumulated[self.emitted_len..start].to_string())
+            }
+            StopMatch::None => {
+                // `hold_back_len` guarantees the cut lands on a UTF-8 char
+                // boundary, so this never panics mid-codepoint on
+                // multi-byte (e.g. CJK) output.
+                let safe_len =
+                    self.accumulated.len() - self.matcher.hold_back_len(&self.accumulated);
+                if safe_len > self.emitted_len {
+                    let visible = self.accumulated[self.emitted_len..safe_len].to_string();
+                    self.emitted_len = safe_len;
+                    Some(visible)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Flush whatever text is still held back once the token stream ends.
+    /// A no-op once a stop sequence has already been matched (that text was
+    /// never meant to reach the client) or when nothing is held back.
+    fn finish(&mut self) -> Option<String> {
+        if self.hit_stop || self.accumulated.len() <= self.emitted_len {
+            return None;
+        }
+        let visible = self.accumulated[self.emitted_len..].to_string();
+        self.emitted_len = self.accumulated.len();
+        Some(visible)
+    }
+
+    /// Flush whatever text is currently held back, bypassing the `hit_stop`
+    /// guard [`finish`](Self::finish) applies. Post-verifier-review
+    /// companion to [`hit_stop_by_id`](Self::hit_stop_by_id) (RT-06
+    /// regression fix): that method sets `hit_stop` *before* the caller
+    /// `break`s out of the decode loop, and the token that trips it never
+    /// contributes any text of its own to `accumulated` (it is checked by
+    /// id precisely so its text is never decoded at all) — so anything
+    /// still sitting in the hold-back window at that point is real,
+    /// already-decoded model output from *earlier* tokens that `finish()`
+    /// would otherwise silently discard (its `hit_stop` guard is correct
+    /// for the *text*-match path, where [`feed`](Self::feed) already
+    /// flushed the safe prefix itself via `StopMatch::Found`, but wrong for
+    /// this one). The realistic trigger: `stop: ["</think>", "\nUser:"]`
+    /// with a tokenizer attached — the newline that normally precedes
+    /// `</think>` is held back as an unfinished prefix of `"\nUser:"`, and
+    /// then the model emits `</think>` as its own single token, tripping
+    /// the id fast path; that held-back `"\n"` belongs to neither stop
+    /// sequence and must reach the client.
+    ///
+    /// Deliberately unconditional (no attempt to detect whether the
+    /// held-back tail happens to *also* be an unfinished prefix of the very
+    /// sequence that just tripped by id): that would require tracking which
+    /// specific stop text each id in `stop_token_ids` corresponds to, which
+    /// `HashSet<u32>` throws away. That narrower case can only arise if the
+    /// model spells part of its own single-token marker out via *other*
+    /// ordinary tokens and then, as its very next token, also emits the
+    /// literal special token for the same marker — a pathological
+    /// double-rendering of one marker, not the chunk-boundary leak this fix
+    /// targets (see the `..._realistic_held_back_prefix_before_id_stop`
+    /// test in `api_extensions_tests.rs` for the realistic, non-overlapping
+    /// case this method is for).
+    /// Called on the `break` path in `extended_chat_completions_stream`'s
+    /// decode task, before `delta_tx` closes, so the flushed text is always
+    /// emitted as its own SSE delta chunk strictly before the `finish_reason`
+    /// chunk (`full_stream` `.chain()`s `content_stream` ahead of
+    /// `finish_stream`, so the latter is never even polled until the former
+    /// is fully drained).
+    fn flush_before_stop(&mut self) -> Option<String> {
+        if self.accumulated.len() <= self.emitted_len {
+            return None;
+        }
+        let visible = self.accumulated[self.emitted_len..].to_string();
+        self.emitted_len = self.accumulated.len();
+        Some(visible)
+    }
+}
+
 /// Real SSE streaming for `POST /v1/chat/completions/extended`.
 ///
 /// Only reachable for the plain-text, single-choice, non-JSON-mode case (see
 /// [`extended_chat_completions`]'s compatibility checks); `tools`, `n > 1`,
 /// and JSON-mode `response_format` are all rejected with `400` before this
-/// function is ever called.
+/// function is ever called. `lease` and `metrics_guard` are already-acquired
+/// resources handed off by the caller (which also seeded `sampling_params`
+/// from the engine's own defaults, gatekeeper `REQUIRED #1`), so this
+/// function never touches the engine pool or `active_requests` itself.
 ///
-/// Reuses [`InferenceEngine::generate_streaming_with_params`] — the same
+/// Reuses [`crate::engine::InferenceEngine::generate_streaming_with_params`] / the seeded
+/// [`crate::engine::InferenceEngine::generate_streaming`] variant below — the same
 /// primitive the base `/v1/chat/completions` endpoint uses for streaming in
-/// `server.rs` — and additionally applies client-supplied `stop` sequences by
-/// watching the accumulating decoded text and suppressing further chunks once
-/// a stop sequence is seen. **Known limitation**: because SSE chunks already
-/// sent to the client cannot be retracted, a stop sequence that straddles a
-/// chunk boundary (part of it decoded in an earlier chunk, the rest in a
-/// later one) may leak the leading fragment before generation is recognized
-/// as stopped; this mirrors the inherent limits of incremental streaming
-/// truncation and does not affect the non-streaming endpoint, which truncates
-/// the complete text after the fact.
+/// `server.rs` — and applies client-supplied `stop` sequences via
+/// [`StopSequenceMatcher`] (`RT-06`): text is only ever handed to the client
+/// once it is provably outside any window that could still grow into a
+/// configured stop sequence, which is what actually closes the
+/// chunk-boundary leak (the previous per-chunk `accumulated.find` scan only
+/// ever suppressed the *current* chunk's trailing fragment — every earlier
+/// chunk carrying a leaked prefix had already been sent). A stop sequence
+/// that is itself exactly one token (a model's own
+/// `<|im_end|>`/`<think>`/`<tool_call>`-style markers) is additionally
+/// matched by id the instant it arrives, which removes the chunk-boundary-
+/// leak class entirely for that case, since there is no partial byte
+/// sequence to have split across a chunk boundary in the first place.
 ///
-/// **Known limitation**: unlike the non-streaming path (which seeds a fresh
-/// `Sampler` per run via `generate_with_seed`), `generate_streaming_with_params`
-/// has no seam to apply a request-supplied `seed` — it continues the engine's
-/// ambient PRNG state, same as the base (non-extended) streaming endpoint in
-/// `server.rs`. `stream: true` requests are therefore not seed-reproducible;
-/// only non-streaming requests are.
+/// `seed` (`RT-12`): when `Some`, a fresh, request-seeded [`Sampler`] runs
+/// the streaming generation instead of the engine's ambient one (mirroring
+/// [`crate::engine::InferenceEngine::generate_with_seed`]'s swap/restore pattern via the
+/// engine's `pub(crate)` sampler field, since `crate::engine::InferenceEngine` has no
+/// built-in seeded-streaming method); two identical requests with the same
+/// seed then produce byte-identical streams. When `None` (the common,
+/// unseeded case) this is not touched at all — `generate_streaming_with_params`
+/// runs exactly as before, so the engine's ambient PRNG state, and therefore
+/// the previous default behavior, stays bit-for-bit unchanged.
 #[allow(clippy::too_many_arguments)]
 async fn extended_chat_completions_stream(
     state: Arc<AppState>,
+    mut lease: EngineLease,
     prompt_tokens: Vec<u32>,
     max_tokens: usize,
     sampling_params: SamplingParams,
-    penalties: crate::sampling::PenaltyParams,
+    penalties: PenaltyParams,
     stop_sequences: Vec<String>,
     model_id: String,
+    seed: Option<u64>,
+    metrics_guard: ActiveRequestGuard,
+    request_start: Instant,
 ) -> axum::response::Response {
     let completion_id = format!("chatcmpl-ext-{}", rand_ext_id());
     let created = std::time::SystemTime::now()
@@ -518,25 +1054,13 @@ async fn extended_chat_completions_stream(
         .unwrap_or_default()
         .as_secs();
 
-    let mut lease = match state.acquire_engine().await {
-        Ok(lease) => lease,
-        Err(e) => {
-            tracing::error!(error = %e, "engine pool acquire failed");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "engine pool unavailable"})),
-            )
-                .into_response();
-        }
-    };
-
     let (token_tx, token_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
     let (finish_tx, finish_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
 
     // Run generation on a blocking thread, exactly like the base endpoint's
     // `chat_completions_stream` in server.rs. The lease (and thus `token_tx`)
     // drops at the end of the closure, which both returns the engine to the
-    // pool and closes the token channel so `content_stream` below terminates.
+    // pool and closes the token channel so the decode task below terminates.
     tokio::task::spawn_blocking(move || {
         lease.reset();
         // Apply frequency/presence penalties for this run, restoring the
@@ -544,12 +1068,27 @@ async fn extended_chat_completions_stream(
         // to the next request served by this pool replica.
         let prev_penalties = lease.penalties();
         lease.set_penalties(penalties);
-        let result = lease.generate_streaming_with_params(
-            &prompt_tokens,
-            max_tokens,
-            &sampling_params,
-            &token_tx,
-        );
+        let result = match seed {
+            // `RT-12`: `InferenceEngine::sampler` is `pub(crate)`, so this
+            // crate (this file included) can swap in a freshly seeded
+            // `Sampler` for the duration of the call exactly the way
+            // `generate_with_seed` does internally, without engine.rs
+            // needing a new seeded-streaming method.
+            Some(seed) => {
+                let mut fresh = Sampler::new(sampling_params.clone(), seed);
+                fresh.set_penalties(*lease.sampler.penalties());
+                let old_sampler = std::mem::replace(&mut lease.sampler, fresh);
+                let r = lease.generate_streaming(&prompt_tokens, max_tokens, &token_tx);
+                lease.sampler = old_sampler;
+                r
+            }
+            None => lease.generate_streaming_with_params(
+                &prompt_tokens,
+                max_tokens,
+                &sampling_params,
+                &token_tx,
+            ),
+        };
         lease.set_penalties(prev_penalties);
         // Send the real generated-token count for finish_reason, even on
         // error (0 generated is an honest "stop" rather than "length").
@@ -557,60 +1096,112 @@ async fn extended_chat_completions_stream(
     });
 
     let hit_stop = Arc::new(AtomicBool::new(false));
+    let hit_stop_for_finish = Arc::clone(&hit_stop);
     let hit_stop_for_content = Arc::clone(&hit_stop);
 
+    // `RT-06`: a preferential token-id fast path for any configured stop
+    // sequence that is exactly one token's own decoded text (see the
+    // function docs). Computed once, up front.
+    let stop_token_ids: HashSet<u32> = if stop_sequences.iter().all(|s| s.is_empty()) {
+        HashSet::new()
+    } else {
+        stop_sequences
+            .iter()
+            .filter(|s| !s.is_empty())
+            .filter_map(|seq| {
+                state
+                    .tokenizer()
+                    .and_then(|tok| tok.inner().token_to_id(seq))
+            })
+            .collect()
+    };
+    let mut decode_loop = StreamDecodeState::new(&stop_sequences, stop_token_ids);
+
+    let (delta_tx, delta_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let mut decode_state = state.tokenizer().map(|t| t.new_decode_stream(true));
     let state_for_content = Arc::clone(&state);
-    let mut accumulated = String::new();
+
+    // Owns the decode loop's state (`accumulated`/`emitted_len`, inside
+    // `decode_loop`) and runs to completion regardless of how fast the
+    // client reads the SSE response, which is what makes the trailing flush
+    // below possible: a `Stream` combinator built directly on `token_rx` has
+    // no hook that fires once after the source stream ends, but an explicit
+    // task does.
+    tokio::spawn(async move {
+        // Keeps `active_requests`/`request_duration_seconds` (`SV-25`) live
+        // for the whole decode loop, not just the instant this function
+        // hands back the initial `Sse` response — dropped when this task
+        // ends, i.e. once decoding (and any trailing flush) is fully done.
+        let _metrics_guard = metrics_guard;
+
+        let mut token_stream = UnboundedReceiverStream::new(token_rx);
+
+        while let Some(token_id) = token_stream.next().await {
+            // `SV-25` deliberately does *not* increment `tokens_generated_total`
+            // per token here, matching `server.rs`'s base streaming handler
+            // (`chat_completions_stream`, which also does not): both rely on
+            // `InferenceEngine::generate_streaming`'s own internal
+            // `self.metrics.tokens_generated_total.inc_by(..)` when a metrics
+            // handle is wired onto the engine (`EnginePool::set_metrics_all`,
+            // done by `cmd_serve.rs`'s real CLI path). Incrementing again
+            // here would double-count in exactly that configuration; this
+            // stays consistent with the base endpoint's existing choice
+            // rather than fixing that pre-existing gap unscoped.
+            if decode_loop.hit_stop_by_id(token_id) {
+                hit_stop_for_content.store(true, Ordering::Relaxed);
+                // Post-verifier-review regression fix: the token that just
+                // tripped the id fast path never contributed any text of
+                // its own to `accumulated` (its text is never decoded at
+                // all), so anything still sitting in the hold-back window
+                // is real, already-decoded output from *earlier* tokens.
+                // `finish()` below is a no-op once `hit_stop` is set, so
+                // without this the hold-back window's contents would be
+                // silently dropped instead of reaching the client. See
+                // `flush_before_stop`'s doc comment for the full rationale.
+                if let Some(visible) = decode_loop.flush_before_stop() {
+                    let _ = delta_tx.send(visible);
+                }
+                break;
+            }
+
+            let text = match (state_for_content.tokenizer(), decode_state.as_mut()) {
+                (Some(tok), Some(dec_state)) => match tok.step_decode(dec_state, token_id) {
+                    Ok(Some(txt)) => txt,
+                    Ok(None) => continue,
+                    Err(_) => format!("[{token_id}]"),
+                },
+                _ => format!("[{token_id}]"),
+            };
+
+            if let Some(visible) = decode_loop.feed(&text) {
+                let _ = delta_tx.send(visible);
+            }
+            if decode_loop.is_stopped() {
+                hit_stop_for_content.store(true, Ordering::Relaxed);
+                break;
+            }
+        }
+
+        // Generation ended without ever matching a stop sequence (EOS or
+        // max_tokens): flush whatever text was still held back as a
+        // possible stop-sequence prefix — it never grew into one, so it is
+        // real, final output that must not be silently dropped.
+        if let Some(visible) = decode_loop.finish() {
+            let _ = delta_tx.send(visible);
+        }
+
+        state_for_content
+            .metrics()
+            .request_duration_seconds
+            .observe(request_start.elapsed().as_secs_f64());
+        // `delta_tx` (closing `content_stream` below) and `_metrics_guard`
+        // (decrementing `active_requests`) both drop here.
+    });
 
     let id_for_content = completion_id.clone();
     let model_for_content = model_id.clone();
-    let token_stream = UnboundedReceiverStream::new(token_rx);
-
-    let content_stream = token_stream.filter_map(move |token_id| {
-        if hit_stop_for_content.load(Ordering::Relaxed) {
-            return None;
-        }
-
-        let text = match (state_for_content.tokenizer(), decode_state.as_mut()) {
-            (Some(tok), Some(dec_state)) => match tok.step_decode(dec_state, token_id) {
-                Ok(Some(txt)) => txt,
-                Ok(None) => return None,
-                Err(_) => format!("[{token_id}]"),
-            },
-            _ => format!("[{token_id}]"),
-        };
-        if text.is_empty() {
-            return None;
-        }
-
-        let chunk_start = accumulated.len();
-        accumulated.push_str(&text);
-
-        let mut stop_pos: Option<usize> = None;
-        for seq in &stop_sequences {
-            if seq.is_empty() {
-                continue;
-            }
-            if let Some(pos) = accumulated.find(seq.as_str()) {
-                stop_pos = Some(stop_pos.map_or(pos, |prev| prev.min(pos)));
-            }
-        }
-
-        let visible_text = match stop_pos {
-            Some(pos) => {
-                hit_stop_for_content.store(true, Ordering::Relaxed);
-                let visible_end = pos.max(chunk_start).min(accumulated.len());
-                accumulated[chunk_start..visible_end].to_string()
-            }
-            None => text,
-        };
-
-        if visible_text.is_empty() {
-            return None;
-        }
-
-        Some(extended_chunk_json(
+    let content_stream = UnboundedReceiverStream::new(delta_rx).map(move |visible_text| {
+        extended_chunk_json(
             &id_for_content,
             created,
             &model_for_content,
@@ -619,10 +1210,9 @@ async fn extended_chat_completions_stream(
                 content: Some(visible_text),
             },
             None,
-        ))
+        )
     });
 
-    let hit_stop_for_finish = Arc::clone(&hit_stop);
     let id_for_finish = completion_id.clone();
     let model_for_finish = model_id.clone();
     let finish_stream = UnboundedReceiverStream::new(finish_rx).map(move |generated| {
@@ -665,51 +1255,6 @@ async fn extended_chat_completions_stream(
         .chain(tokio_stream::once(Ok(Event::default().data("[DONE]"))));
 
     Sse::new(full_stream).into_response()
-}
-
-/// Build a prompt string from a slice of chat messages (ChatML format).
-///
-/// Messages with `content = None` are skipped (they represent tool-call turns).
-/// When `sanitize` is `true`, each message's content is passed through
-/// [`crate::server::neutralize_special_markers`] before concatenation so
-/// client-supplied text cannot forge fake role/turn boundaries once the merged
-/// prompt is tokenized (finding `security-03`).
-fn build_extended_prompt(messages: &[ChatMessage], sanitize: bool) -> String {
-    let mut prompt = String::new();
-    for msg in messages {
-        let raw = match msg.content.as_deref() {
-            Some(t) => t,
-            None => continue,
-        };
-        let text = if sanitize {
-            crate::server::neutralize_special_markers(raw)
-        } else {
-            raw.to_string()
-        };
-        match msg.role.as_str() {
-            "system" => {
-                prompt.push_str("<|im_start|>system\n");
-                prompt.push_str(&text);
-                prompt.push_str("<|im_end|>\n");
-            }
-            "user" => {
-                prompt.push_str("<|im_start|>user\n");
-                prompt.push_str(&text);
-                prompt.push_str("<|im_end|>\n");
-            }
-            "assistant" => {
-                prompt.push_str("<|im_start|>assistant\n");
-                prompt.push_str(&text);
-                prompt.push_str("<|im_end|>\n");
-            }
-            _ => {
-                prompt.push_str(&text);
-                prompt.push('\n');
-            }
-        }
-    }
-    prompt.push_str("<|im_start|>assistant\n");
-    prompt
 }
 
 fn rand_ext_id() -> String {
@@ -886,42 +1431,20 @@ impl StopChecker {
     }
 }
 
-// ── Multi-completion generator ────────────────────────────────────────────────
-
-/// Generate `n` independent completions from the same prompt, seeding each run
-/// with `base_seed + i` for determinism.
-///
-/// **Note**: This function resets the engine before each run.
-pub fn generate_n_completions(
-    engine: &mut InferenceEngine<'_>,
-    prompt: &str,
-    params: &SamplingParams,
-    n: usize,
-    base_seed: u64,
-) -> Vec<String> {
-    let prompt_tokens: Vec<u32> = {
-        // Simple whitespace-based tokenization fallback (no real tokenizer available here)
-        prompt
-            .split_whitespace()
-            .enumerate()
-            .map(|(i, _)| (i as u32).wrapping_add(1000))
-            .collect()
-    };
-
-    let mut results = Vec::with_capacity(n);
-    for i in 0..n {
-        engine.reset();
-        let seed = base_seed.wrapping_add(i as u64);
-        let text = engine
-            .generate_with_seed(&prompt_tokens, 64, seed, params)
-            .map(|toks| format!("{toks:?}"))
-            .unwrap_or_else(|_| String::new());
-        results.push(text);
-    }
-    results
-}
-
 // ── Frequency / presence penalty ─────────────────────────────────────────────
+//
+// `apply_frequency_penalty` below is a standalone, raw-logit-space utility
+// kept for API stability (an external integration test,
+// `tests/api_extensions_tests.rs`, imports and exercises it directly) rather
+// than because it sits on the live decode path: real frequency/presence
+// penalty application goes through `crate::sampling::PenaltyParams` /
+// `crate::sampling::Sampler::sample_with_history` (see the module docs),
+// which both handlers in this file use. `generate_n_completions`, the other
+// half of finding `SV-32`'s "two dead primitives" that lived in *this* file
+// (a whitespace-tokenizing, debug-formatting duplicate of the real `n`-loop
+// now implemented in `extended_chat_completions`), had no such caller and
+// has been removed rather than wired in — wiring it would have meant
+// routing production traffic through fake tokenization.
 
 /// Apply frequency and presence penalties in-place to a logit vector.
 ///
@@ -943,155 +1466,5 @@ pub fn apply_frequency_penalty(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn json_mode_enforcer_valid_passthrough() {
-        let enforcer = JsonModeEnforcer::new();
-        let json = r#"{"key": "value"}"#;
-        assert_eq!(enforcer.enforce(json), json);
-    }
-
-    #[test]
-    fn json_mode_enforcer_extracts_substring() {
-        let enforcer = JsonModeEnforcer::new();
-        let text = r#"Here is some text {"key": "value"} and more"#;
-        let result = enforcer.enforce(text);
-        assert!(
-            crate::api_types::is_valid_json(&result),
-            "result should be valid JSON, got: {result}"
-        );
-    }
-
-    #[test]
-    fn json_mode_enforcer_wraps_invalid() {
-        let enforcer = JsonModeEnforcer::new();
-        let text = "not json at all";
-        let result = enforcer.enforce(text);
-        assert!(
-            crate::api_types::is_valid_json(&result),
-            "result should be valid JSON, got: {result}"
-        );
-        let v: serde_json::Value = serde_json::from_str(&result).expect("should parse as json");
-        assert!(v.get("response").is_some(), "should have 'response' key");
-    }
-
-    #[test]
-    fn stop_checker_finds_sequence() {
-        let checker = StopChecker::new(vec!["STOP".to_string(), "END".to_string()]);
-        assert_eq!(checker.check("Hello STOP world"), Some("STOP"));
-        assert_eq!(checker.check("No match here"), None);
-    }
-
-    #[test]
-    fn stop_checker_truncates_correctly() {
-        let checker = StopChecker::new(vec!["<end>".to_string()]);
-        let (truncated, hit) = checker.truncate_at_stop("Hello world<end>more text");
-        assert_eq!(truncated, "Hello world");
-        assert!(hit);
-    }
-
-    #[test]
-    fn stop_checker_no_match() {
-        let checker = StopChecker::new(vec!["nope".to_string()]);
-        let (truncated, hit) = checker.truncate_at_stop("Hello world");
-        assert_eq!(truncated, "Hello world");
-        assert!(!hit);
-    }
-
-    #[test]
-    fn stop_checker_is_empty() {
-        let empty = StopChecker::new(vec![]);
-        assert!(empty.is_empty());
-        let non_empty = StopChecker::new(vec!["x".to_string()]);
-        assert!(!non_empty.is_empty());
-    }
-
-    #[test]
-    fn apply_frequency_penalty_reduces_seen() {
-        let mut logits = vec![1.0f32, 2.0, 3.0];
-        let mut counts = HashMap::new();
-        counts.insert(1u32, 2usize); // token 1 seen twice
-        apply_frequency_penalty(&mut logits, &counts, 0.5, 0.0);
-        // token 1 logit should be reduced by 0.5 * 2 = 1.0
-        assert!(
-            (logits[1] - 1.0).abs() < 1e-5,
-            "expected 1.0, got {}",
-            logits[1]
-        );
-        // others unchanged
-        assert!((logits[0] - 1.0).abs() < 1e-5);
-        assert!((logits[2] - 3.0).abs() < 1e-5);
-    }
-
-    #[test]
-    fn apply_presence_penalty_reduces_seen() {
-        let mut logits = vec![1.0f32, 2.0, 3.0];
-        let mut counts = HashMap::new();
-        counts.insert(0u32, 1usize);
-        apply_frequency_penalty(&mut logits, &counts, 0.0, 1.0);
-        assert!(
-            (logits[0] - 0.0).abs() < 1e-5,
-            "expected 0.0, got {}",
-            logits[0]
-        );
-        assert!((logits[1] - 2.0).abs() < 1e-5);
-    }
-
-    #[test]
-    fn extract_balanced_object() {
-        let text = r#"prefix {"a":1} suffix"#;
-        let result = extract_balanced(text, '{', '}');
-        assert_eq!(result.as_deref(), Some(r#"{"a":1}"#));
-    }
-
-    #[test]
-    fn extract_balanced_array() {
-        let text = r#"pre [1,2,3] post"#;
-        let result = extract_balanced(text, '[', ']');
-        assert_eq!(result.as_deref(), Some("[1,2,3]"));
-    }
-
-    // ── determine_extended_finish_reason (finding 28 regression) ─────────────
-
-    #[test]
-    fn finish_reason_tool_calls_takes_priority() {
-        // Even if the run also happened to exhaust max_tokens, a parsed tool
-        // call must win.
-        assert_eq!(
-            determine_extended_finish_reason(true, false, 10, 10),
-            "tool_calls"
-        );
-        assert_eq!(
-            determine_extended_finish_reason(true, true, 10, 10),
-            "tool_calls"
-        );
-    }
-
-    #[test]
-    fn finish_reason_stop_sequence_wins_over_length() {
-        // A stop sequence match must report "stop" even when output_len
-        // happens to equal max_tokens.
-        assert_eq!(determine_extended_finish_reason(false, true, 8, 8), "stop");
-    }
-
-    #[test]
-    fn finish_reason_length_when_truncated() {
-        // Regression for finding 28: previously this always returned "stop"
-        // regardless of truncation.
-        assert_eq!(
-            determine_extended_finish_reason(false, false, 8, 8),
-            "length"
-        );
-        assert_eq!(
-            determine_extended_finish_reason(false, false, 10, 8),
-            "length"
-        );
-    }
-
-    #[test]
-    fn finish_reason_stop_on_natural_eos() {
-        assert_eq!(determine_extended_finish_reason(false, false, 3, 8), "stop");
-    }
-}
+#[path = "api_extensions_tests.rs"]
+mod tests;

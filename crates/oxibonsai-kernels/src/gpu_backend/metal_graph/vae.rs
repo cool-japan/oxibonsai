@@ -22,7 +22,7 @@
 
 use metal::MTLResourceOptions;
 
-use super::buffers::{alloc_buf, download_f32, upload_f32};
+use super::buffers::{alloc_buf, commit_and_wait, download_f32, upload_f32};
 use super::error::{MetalGraphError, MetalWeightHandle};
 use super::graph::MetalGraph;
 
@@ -336,8 +336,7 @@ impl MetalGraph {
             );
 
             encoder.end_encoding();
-            cmd_buf.commit();
-            cmd_buf.wait_until_completed();
+            commit_and_wait(cmd_buf, "encode_conv2d_f32_im2col")?;
 
             // Download this tile and scatter into NCHW output with bias.
             // out_tile is row-major [rows, c_out] (outputs[m*c_out + oc]).
@@ -435,8 +434,7 @@ impl MetalGraph {
             w_out as u32,
         );
         encoder.end_encoding();
-        cmd_buf.commit();
-        cmd_buf.wait_until_completed();
+        commit_and_wait(cmd_buf, "encode_conv2d_f32_implicit")?;
 
         // Download row-major [c_out, spatial] and add the per-channel bias in
         // place (the kernel intentionally omits it, matching the im2col path's
@@ -486,7 +484,7 @@ impl MetalGraph {
         num_groups: usize,
         eps: f32,
     ) -> Result<(), MetalGraphError> {
-        if num_groups == 0 || channels % num_groups != 0 {
+        if num_groups == 0 || !channels.is_multiple_of(num_groups) {
             return Err(MetalGraphError::InvalidDimensions(format!(
                 "encode_groupnorm_f32: channels {channels} not divisible by num_groups {num_groups}"
             )));
@@ -538,8 +536,7 @@ impl MetalGraph {
             eps,
         );
         encoder.end_encoding();
-        cmd_buf.commit();
-        cmd_buf.wait_until_completed();
+        commit_and_wait(cmd_buf, "encode_groupnorm_f32")?;
 
         unsafe { download_f32(&x_buf, x) };
         Ok(())
@@ -563,8 +560,7 @@ impl MetalGraph {
         let encoder = cmd_buf.new_compute_command_encoder();
         self.dispatch_silu_f32(encoder, &x_buf, x.len() as u32);
         encoder.end_encoding();
-        cmd_buf.commit();
-        cmd_buf.wait_until_completed();
+        commit_and_wait(cmd_buf, "encode_silu_f32")?;
 
         unsafe { download_f32(&x_buf, x) };
         Ok(())
@@ -638,8 +634,7 @@ impl MetalGraph {
             expected_out as u32,
         );
         encoder.end_encoding();
-        cmd_buf.commit();
-        cmd_buf.wait_until_completed();
+        commit_and_wait(cmd_buf, "encode_upsample_nearest_f32")?;
 
         unsafe { download_f32(&out_buf, output) };
         Ok(())

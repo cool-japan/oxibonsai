@@ -19,9 +19,19 @@
 
 set -euo pipefail
 
+# NOTE on "${arr[@]+"${arr[@]}"}" below: macOS ships bash 3.2 as /bin/bash
+# (and `#!/usr/bin/env bash` resolves to it unless a newer bash is on PATH
+# first). Under `set -u`, bash 3.2 treats "${arr[@]}" on a still-empty array
+# as an unbound-variable error — bash 4.4+ fixed this, 3.2 never will. The
+# `${arr[@]+"${arr[@]}"}` form is the portable workaround: it expands to
+# nothing when the array is empty/unset and to the normal argument list
+# otherwise. Do not "simplify" it back to a bare "${arr[@]}" — that
+# reintroduces a crash on the default macOS shell whenever the guarded
+# array is legitimately empty (no tokenizer.json, --runs 0, etc).
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-cd "$PROJECT_ROOT"
+cd "$PROJECT_ROOT" || exit 1
 
 MODEL="models/Ternary-Bonsai-1.7B.gguf"
 TOKENIZER="models/tokenizer.json"
@@ -73,7 +83,7 @@ run_one() {
         --prompt "$PROMPT" \
         --max-tokens "$MAX_TOKENS" \
         --seed "$seed" \
-        "${TOKENIZER_FLAG[@]}" 2>&1 | tail -2 | tr -d '\r')
+        "${TOKENIZER_FLAG[@]+"${TOKENIZER_FLAG[@]}"}" 2>&1 | tail -2 | tr -d '\r')
     local toks
     toks=$(echo "$out" | grep -oE '[0-9]+\.[0-9]+ tok/s' | tail -1 | grep -oE '[0-9]+\.[0-9]+' || true)
     if [[ -z "$toks" ]]; then toks="—"; fi
@@ -132,7 +142,7 @@ if [[ "$DO_METAL" -eq 1 ]] && [[ "$(uname -s)" == "Darwin" ]]; then
         --prompt "hi" \
         --max-tokens 1 \
         --seed 1 \
-        "${TOKENIZER_FLAG[@]}" >/dev/null 2>&1 || true
+        "${TOKENIZER_FLAG[@]+"${TOKENIZER_FLAG[@]}"}" >/dev/null 2>&1 || true
     for i in $(seq 1 "$RUNS"); do
         result=$(run_one "metal" $((SEED + i - 1)) | tail -1)
         METAL_RESULTS+=("$result")
@@ -145,8 +155,8 @@ fi
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Throughput summary  (model: $(basename "$MODEL"), tokens: $MAX_TOKENS)"
 echo "═══════════════════════════════════════════════════════════════"
-if [[ "$DO_CPU"   -eq 1 ]]; then summary "CPU (SIMD)"   "${CPU_RESULTS[@]}";   fi
+if [[ "$DO_CPU"   -eq 1 ]]; then summary "CPU (SIMD)"   "${CPU_RESULTS[@]+"${CPU_RESULTS[@]}"}";   fi
 if [[ "$DO_METAL" -eq 1 ]] && [[ "$(uname -s)" == "Darwin" ]]; then
-    summary "Metal (GPU)"  "${METAL_RESULTS[@]}"
+    summary "Metal (GPU)"  "${METAL_RESULTS[@]+"${METAL_RESULTS[@]}"}"
 fi
 echo "═══════════════════════════════════════════════════════════════"

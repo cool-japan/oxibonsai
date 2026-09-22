@@ -25,6 +25,17 @@ const BF16_NAME: &str = "x_embedder.weight";
 
 /// Build a tiny in-memory `bonsai-image` GGUF and the f32 weights we expect the
 /// quantized linear to dequantize to.
+///
+/// T-07 (verifier wave 3): not re-pointed at
+/// `oxibonsai_testkit::gguf_fixture` — this already calls the real
+/// `BlockTQ2_0_g128::quantize`/`dequant` directly (no reinvented
+/// quantization logic to deduplicate), and needs both the quantized bytes
+/// AND the intermediate `blocks`/`q_expected` values back to assert an
+/// exact round-trip, which `quantize_bytes`'s bytes-only return type
+/// cannot give without quantizing twice. The manual `qs`-then-`d` byte
+/// assembly below already matches `TQ2_0_g128`'s documented on-disk layout
+/// (the same one `oxibonsai_testkit::gguf_fixture`'s private
+/// `blocks_to_bytes` produces).
 fn build_synthetic_gguf() -> (Vec<u8>, Vec<f32>, Vec<f32>) {
     // ── Quantized module: (out=2, in=128) → 2 ternary blocks (68 bytes). ──
     // Fill each 128-element group with a deterministic ternary pattern so the

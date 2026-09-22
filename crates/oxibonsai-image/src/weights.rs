@@ -123,7 +123,7 @@ impl<'a> Bf16Tensor<'a> {
     /// require on memory-mapped data. Returns `None` if the byte length is odd
     /// (never the case for a well-formed BF16 tensor).
     pub fn bits(&self) -> Option<Vec<u16>> {
-        if self.bytes.len() % 2 != 0 {
+        if !self.bytes.len().is_multiple_of(2) {
             return None;
         }
         Some(

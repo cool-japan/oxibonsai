@@ -143,8 +143,8 @@ impl<'a> BonsaiModel<'a> {
         let max_seq_len = self.kv_cache.max_seq_len();
         let qkv_concats = self.get_or_build_cuda_qkv_cache()?;
         let layer_params = self.build_cuda_layer_params(&qkv_concats)?;
-        let rope_cos = self.rope.cos_at(pos);
-        let rope_sin = self.rope.sin_at(pos);
+        let rope_cos = self.rope.cos_at_checked(pos)?;
+        let rope_sin = self.rope.sin_at_checked(pos)?;
         oxibonsai_kernels::try_cuda_full_forward(
             hidden,
             &layer_params,
@@ -200,8 +200,8 @@ impl<'a> BonsaiModel<'a> {
             let vocab_size = lm_head_ternary.out_features();
             let qkv_concats = self.build_cuda_ternary_qkv_concats()?;
             let layer_params = self.build_cuda_ternary_layer_params(&qkv_concats)?;
-            let rope_cos = self.rope.cos_at(pos);
-            let rope_sin = self.rope.sin_at(pos);
+            let rope_cos = self.rope.cos_at_checked(pos)?;
+            let rope_sin = self.rope.sin_at_checked(pos)?;
             return match oxibonsai_kernels::try_cuda_full_forward_ternary_with_gpu_lm_head(
                 hidden,
                 &layer_params,
@@ -235,7 +235,17 @@ impl<'a> BonsaiModel<'a> {
         // ── Q1 path ───────────────────────────────────────────────────────────
         let lm_head_linear = match &self.output_weight {
             OutputWeight::OneBit(linear) => linear,
-            OutputWeight::Ternary(_) => unreachable!("handled above"),
+            // M-29: the ternary branch above already returned, so this is
+            // dead today — but a future edit that moves or guards that branch
+            // must produce a diagnosable error, not an abort.
+            OutputWeight::Ternary(_) => {
+                return Err(format!(
+                    "cuda Q1 path reached with a {} LM head; the ternary branch above should \
+                     have handled it",
+                    self.output_weight.kind()
+                )
+                .into())
+            }
             OutputWeight::FP8E4M3(_) | OutputWeight::FP8E5M2(_) => {
                 return Err(
                     "FP8 uses CUDA GEMV via CPU block dispatch; handled in BonsaiModel::forward"
@@ -274,8 +284,8 @@ impl<'a> BonsaiModel<'a> {
         let vocab_size = lm_head_linear.out_features();
         let qkv_concats = self.get_or_build_cuda_qkv_cache()?;
         let layer_params = self.build_cuda_layer_params(&qkv_concats)?;
-        let rope_cos = self.rope.cos_at(pos);
-        let rope_sin = self.rope.sin_at(pos);
+        let rope_cos = self.rope.cos_at_checked(pos)?;
+        let rope_sin = self.rope.sin_at_checked(pos)?;
         match oxibonsai_kernels::try_cuda_full_forward_with_gpu_lm_head(
             hidden,
             &layer_params,
@@ -318,12 +328,15 @@ impl<'a> BonsaiModel<'a> {
             return Err("no blocks".into());
         }
         // Context-length guard (mirrors the single-token `forward()` check at
-        // model/types/mod.rs).  The batched RoPE gather below indexes
-        // `self.rope.cos_at(pos_start + t)` with no bound, and `RopeTable` is
-        // sized to exactly `max_seq_len` rows — a prompt that overflows the
-        // context would slice out of bounds and panic inside the request task.
-        // Returning Err makes `forward_prefill` fall back to the sequential path,
+        // model/types/mod.rs).  `RopeTable` is sized to exactly `max_seq_len`
+        // rows; the batched RoPE gather below now uses `cos_at_checked` /
+        // `sin_at_checked` (wave-1 addendum P3), so an overflowing position
+        // yields `ModelError::PositionOutOfRange` instead of the out-of-bounds
+        // slice + panic-inside-the-request-task the unchecked pair produced.
+        // This guard stays: it is the *early*, named rejection, and returning
+        // Err here makes `forward_prefill` fall back to the sequential path,
         // whose per-token `forward()` returns a clean SequenceTooLong error.
+
         if pos_start + batch_size > self.kv_cache.max_seq_len() {
             return Err(format!(
                 "prefill sequence too long: {batch_size} tokens at pos {pos_start} exceeds max_seq_len {}",
@@ -360,12 +373,32 @@ impl<'a> BonsaiModel<'a> {
 
         let lm_head_linear = match &self.output_weight {
             OutputWeight::OneBit(linear) => linear,
-            OutputWeight::Ternary(_) => unreachable!("handled above"),
+            // M-29: the ternary branch above already returned, so this is
+            // dead today — but a future edit that moves or guards that branch
+            // must produce a diagnosable error, not an abort.
+            OutputWeight::Ternary(_) => {
+                return Err(format!(
+                    "cuda Q1 path reached with a {} LM head; the ternary branch above should \
+                     have handled it",
+                    self.output_weight.kind()
+                )
+                .into())
+            }
             OutputWeight::FP8E4M3(_) | OutputWeight::FP8E5M2(_) => {
-                unreachable!("FP8 handled above")
+                return Err(format!(
+                    "cuda Q1 path reached with a {} LM head; the FP8 branch above should have \
+                     handled it",
+                    self.output_weight.kind()
+                )
+                .into())
             }
             OutputWeight::Q4_0(_) | OutputWeight::Q8_0(_) => {
-                unreachable!("Q4_0/Q8_0 handled above")
+                return Err(format!(
+                    "cuda Q1 path reached with a {} LM head; the Q4_0/Q8_0 branch above should \
+                     have handled it",
+                    self.output_weight.kind()
+                )
+                .into())
             }
             OutputWeight::Q5K(_)
             | OutputWeight::Q6K(_)
@@ -391,26 +424,18 @@ impl<'a> BonsaiModel<'a> {
         let heads_per_group = nq.checked_div(nkv).unwrap_or(1);
         let max_seq_len = self.kv_cache.max_seq_len();
         let mut hidden_batch = vec![0.0f32; batch_size * h];
-        for (t, &token_id) in token_ids.iter().enumerate() {
-            let embd_start = token_id as usize * h;
-            let embd_end = embd_start + h;
-            if embd_end > self.token_embd.len() {
-                return Err(format!(
-                    "token_id {} out of range (vocab={})",
-                    token_id,
-                    self.token_embd.len() / h
-                )
-                .into());
-            }
-            hidden_batch[t * h..(t + 1) * h]
-                .copy_from_slice(&self.token_embd[embd_start..embd_end]);
-        }
+        // M-02: gather only the rows this batch references, decoding each
+        // straight out of the quantized table. The deleted dense
+        // `Index<Range<usize>>` hatch materialized the whole
+        // `vocab x hidden` FP32 table here (1.16 / 2.31 / 4.74 GiB for the
+        // 1.7B / 8B / 27B) on the first multi-token prompt.
+        self.token_embd.copy_rows(token_ids, &mut hidden_batch)?;
         let mut cos_table = vec![0.0f32; batch_size * half_dim];
         let mut sin_table = vec![0.0f32; batch_size * half_dim];
         for t in 0..batch_size {
             let pos = pos_start + t;
-            let cos_vals = self.rope.cos_at(pos);
-            let sin_vals = self.rope.sin_at(pos);
+            let cos_vals = self.rope.cos_at_checked(pos)?;
+            let sin_vals = self.rope.sin_at_checked(pos)?;
             cos_table[t * half_dim..(t + 1) * half_dim].copy_from_slice(cos_vals);
             sin_table[t * half_dim..(t + 1) * half_dim].copy_from_slice(sin_vals);
         }
@@ -500,12 +525,32 @@ impl<'a> BonsaiModel<'a> {
 
         let lm_head_linear = match &self.output_weight {
             OutputWeight::OneBit(linear) => linear,
-            OutputWeight::Ternary(_) => unreachable!("handled above"),
+            // M-29: the ternary branch above already returned, so this is
+            // dead today — but a future edit that moves or guards that branch
+            // must produce a diagnosable error, not an abort.
+            OutputWeight::Ternary(_) => {
+                return Err(format!(
+                    "cuda Q1 path reached with a {} LM head; the ternary branch above should \
+                     have handled it",
+                    self.output_weight.kind()
+                )
+                .into())
+            }
             OutputWeight::FP8E4M3(_) | OutputWeight::FP8E5M2(_) => {
-                unreachable!("FP8 handled above")
+                return Err(format!(
+                    "cuda Q1 path reached with a {} LM head; the FP8 branch above should have \
+                     handled it",
+                    self.output_weight.kind()
+                )
+                .into())
             }
             OutputWeight::Q4_0(_) | OutputWeight::Q8_0(_) => {
-                unreachable!("Q4_0/Q8_0 handled above")
+                return Err(format!(
+                    "cuda Q1 path reached with a {} LM head; the Q4_0/Q8_0 branch above should \
+                     have handled it",
+                    self.output_weight.kind()
+                )
+                .into())
             }
             OutputWeight::Q5K(_)
             | OutputWeight::Q6K(_)
@@ -531,26 +576,18 @@ impl<'a> BonsaiModel<'a> {
         let heads_per_group = nq.checked_div(nkv).unwrap_or(1);
         let max_seq_len = self.kv_cache.max_seq_len();
         let mut hidden_batch = vec![0.0f32; batch_size * h];
-        for (t, &token_id) in token_ids.iter().enumerate() {
-            let embd_start = token_id as usize * h;
-            let embd_end = embd_start + h;
-            if embd_end > self.token_embd.len() {
-                return Err(format!(
-                    "token_id {} out of range (vocab={})",
-                    token_id,
-                    self.token_embd.len() / h
-                )
-                .into());
-            }
-            hidden_batch[t * h..(t + 1) * h]
-                .copy_from_slice(&self.token_embd[embd_start..embd_end]);
-        }
+        // M-02: gather only the rows this batch references, decoding each
+        // straight out of the quantized table. The deleted dense
+        // `Index<Range<usize>>` hatch materialized the whole
+        // `vocab x hidden` FP32 table here (1.16 / 2.31 / 4.74 GiB for the
+        // 1.7B / 8B / 27B) on the first multi-token prompt.
+        self.token_embd.copy_rows(token_ids, &mut hidden_batch)?;
         let mut cos_table = vec![0.0f32; batch_size * half_dim];
         let mut sin_table = vec![0.0f32; batch_size * half_dim];
         for t in 0..batch_size {
             let pos = pos_start + t;
-            let cos_vals = self.rope.cos_at(pos);
-            let sin_vals = self.rope.sin_at(pos);
+            let cos_vals = self.rope.cos_at_checked(pos)?;
+            let sin_vals = self.rope.sin_at_checked(pos)?;
             cos_table[t * half_dim..(t + 1) * half_dim].copy_from_slice(cos_vals);
             sin_table[t * half_dim..(t + 1) * half_dim].copy_from_slice(sin_vals);
         }
@@ -564,8 +601,14 @@ impl<'a> BonsaiModel<'a> {
         let layer_params = self.build_cuda_layer_params(&qkv_concats)?;
         let mut token_ids_out: Vec<u32> = Vec::with_capacity(batch_size);
         for t in 0..batch_size {
-            let single_embd_start = token_ids[t] as usize * h;
-            let single_hidden = self.token_embd[single_embd_start..single_embd_start + h].to_vec();
+            // M-02: one row, decoded from the quantized table. `copy_row`
+            // bounds-checks the token id, which this site never did.
+            let single_token_id = *token_ids
+                .get(t)
+                .ok_or("cuda Q1 prefill verify: token index past the batch")?;
+            let mut single_hidden = vec![0.0f32; h];
+            self.token_embd
+                .copy_row(single_token_id, &mut single_hidden)?;
             let pos = pos_start + t;
             let t_half = half_dim;
             let cos_single = &cos_table[t * t_half..(t + 1) * t_half];

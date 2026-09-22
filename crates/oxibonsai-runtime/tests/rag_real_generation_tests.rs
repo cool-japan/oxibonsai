@@ -24,6 +24,7 @@ use oxibonsai_runtime::engine_pool::EnginePool;
 use oxibonsai_runtime::rag_server::{create_rag_router, create_rag_router_with_pool};
 use oxibonsai_runtime::sampling::SamplingParams;
 use oxibonsai_runtime::tokenizer_bridge::TokenizerBridge;
+use oxibonsai_testkit::capability::{record_executed, record_skipped, Capability};
 
 /// Bundled Qwen3 tokenizer fixture (relative to the crate root). Tests needing
 /// a real tokenizer skip themselves when it is absent.
@@ -49,19 +50,54 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&bytes).expect("parse json")
 }
 
-fn maybe_tokenizer() -> Option<TokenizerBridge> {
+// ── T-05 capability-report producer ─────────────────────────────────────────
+//
+// T-07 FIX (verifier wave 3): this used to be an inline copy of
+// `oxibonsai_testkit::capability::record`; `oxibonsai-runtime` now takes
+// `oxibonsai-testkit` as a dev-dependency (imported above), so the copy is
+// deleted in favour of the shared implementation.
+//
+// Wave-1 addendum (1)(b): "`maybe_tokenizer()`'s missing-fixture early return
+// writes `executed:false`, the caller writes `executed:true` after a real
+// run" — `maybe_tokenizer` takes the caller's test name explicitly (rather
+// than inferring it, e.g. from the test-harness thread name) since it is
+// shared by more than one `#[tokio::test]`.
+//
+// FIX3-PARITY item 2(c): this function used to write `executed: true` HERE,
+// *before* `TokenizerBridge::from_file(..)` — so a fixture that existed but
+// failed to load recorded a validated capability while the caller silently
+// skipped on the `None`, and a fixture that loaded fine recorded one before
+// a single assertion had run. Both records are now correct by construction:
+// every path out of this function that yields `None` records the SKIP, and
+// the `executed: true` record is the caller's, written last (see
+// `oxibonsai_testkit::capability`'s THE INVARIANT section).
+fn maybe_tokenizer(test_name: &str) -> Option<TokenizerBridge> {
     if !Path::new(FIXTURE_TOKENIZER).exists() {
         eprintln!("skipped: tokenizer fixture missing at {FIXTURE_TOKENIZER}");
+        record_skipped(Capability::RagRealGeneration, test_name);
         return None;
     }
-    TokenizerBridge::from_file(FIXTURE_TOKENIZER).ok()
+    match TokenizerBridge::from_file(FIXTURE_TOKENIZER) {
+        Ok(tokenizer) => Some(tokenizer),
+        Err(e) => {
+            eprintln!("skipped: tokenizer fixture at {FIXTURE_TOKENIZER} failed to load: {e}");
+            record_skipped(Capability::RagRealGeneration, test_name);
+            None
+        }
+    }
 }
+
+/// The fully-qualified name of the one test below that drives the real
+/// tokenizer fixture — used for both its skip record and its execution
+/// record, so the two can never drift apart.
+const REAL_GENERATION_TEST: &str = "oxibonsai-runtime::rag_real_generation_tests::\
+rag_query_with_tokenizer_generates_from_context_and_query";
 
 // ── With a tokenizer: real generation on the real prompt ──────────────────────
 
 #[tokio::test]
 async fn rag_query_with_tokenizer_generates_from_context_and_query() {
-    let Some(tokenizer) = maybe_tokenizer() else {
+    let Some(tokenizer) = maybe_tokenizer(REAL_GENERATION_TEST) else {
         return;
     };
 
@@ -122,6 +158,13 @@ async fn rag_query_with_tokenizer_generates_from_context_and_query() {
             .any(|c| c.as_str().unwrap_or_default().contains("Photosynthesis")),
         "retrieved_chunks should contain the indexed document; got {json}"
     );
+
+    // FIX3-PARITY item 2(c): the capability is recorded as EXECUTED only
+    // here, after the real tokenizer loaded, the real generation ran and
+    // every assertion above passed. Any panic above leaves the manifest
+    // without an `executed: true` line for this capability, which is exactly
+    // what the release gate's freshness check is meant to see.
+    record_executed(Capability::RagRealGeneration, REAL_GENERATION_TEST);
 }
 
 // ── Without a tokenizer: honest, non-fabricated response ───────────────────────

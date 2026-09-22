@@ -34,9 +34,14 @@ use crate::error::{KernelError, KernelResult};
 /// # Errors
 ///
 /// - [`KernelError::NotBlockAligned`] if `in_features % QK_Q4_0 != 0`.
-/// - [`KernelError::DimensionMismatch`] if `blocks.len() < n_rows * blocks_per_row`
-///   or `input.len() < in_features`.
-/// - [`KernelError::BufferTooSmall`] if `output.len() < n_rows`.
+/// - [`KernelError::NamedDimensionMismatch`] (code `DIMENSION_MISMATCH`)
+///   naming `"blocks"` if `blocks.len() < n_rows * blocks_per_row`, or
+///   `"input"` if `input.len() < in_features`.
+/// - [`KernelError::NamedBufferTooSmall`] (code `BUFFER_TOO_SMALL`) naming
+///   `"output"` if `output.len() < n_rows`.
+///
+/// Match on [`KernelError::error_code`] rather than the variant shape: it is
+/// identical for the named and unnamed forms of one condition (K-02).
 pub fn gemv_q4_0(
     blocks: &[BlockQ4_0],
     input: &[f32],
@@ -61,7 +66,7 @@ pub(crate) fn gemv_q4_0_scalar(
     n_rows: usize,
     in_features: usize,
 ) -> KernelResult<()> {
-    if in_features % QK_Q4_0 != 0 {
+    if !in_features.is_multiple_of(QK_Q4_0) {
         return Err(KernelError::NotBlockAligned {
             count: in_features,
             block_size: QK_Q4_0,
@@ -200,31 +205,41 @@ mod tests {
         );
     }
 
-    /// Too few blocks → DimensionMismatch error.
+    /// Too few blocks → `DIMENSION_MISMATCH`.
+    ///
+    /// Asserted on [`KernelError::error_code`], not on the variant shape: the
+    /// named and unnamed forms of one condition deliberately share a code
+    /// (see `error.rs`), so this test keeps holding as construction sites
+    /// migrate from `DimensionMismatch` to `dimension_mismatch("blocks", …)`.
     #[test]
     fn q4_0_wrong_block_count() {
         let block = make_q4_block(1.0, [8u8; 32]);
         let blocks = vec![block];
         let input = vec![1.0f32; 32];
         let mut output = vec![0.0f32; 2];
-        let result = gemv_q4_0(&blocks, &input, &mut output, 2, 32);
-        assert!(
-            matches!(result, Err(KernelError::DimensionMismatch { .. })),
-            "expected DimensionMismatch, got {result:?}"
+        let err = gemv_q4_0(&blocks, &input, &mut output, 2, 32)
+            .expect_err("too few blocks must be rejected");
+        assert_eq!(
+            err.error_code(),
+            "DIMENSION_MISMATCH",
+            "expected DIMENSION_MISMATCH, got {err:?}"
         );
     }
 
-    /// Output buffer too small → BufferTooSmall error.
+    /// Output buffer too small → `BUFFER_TOO_SMALL` (see
+    /// [`q4_0_wrong_block_count`] for why this asserts on the code).
     #[test]
     fn q4_0_output_too_small() {
         let block = make_q4_block(1.0, [8u8; 32]);
         let blocks = vec![block];
         let input = vec![1.0f32; 32];
         let mut output = vec![];
-        let result = gemv_q4_0(&blocks, &input, &mut output, 1, 32);
-        assert!(
-            matches!(result, Err(KernelError::BufferTooSmall { .. })),
-            "expected BufferTooSmall, got {result:?}"
+        let err = gemv_q4_0(&blocks, &input, &mut output, 1, 32)
+            .expect_err("an undersized output buffer must be rejected");
+        assert_eq!(
+            err.error_code(),
+            "BUFFER_TOO_SMALL",
+            "expected BUFFER_TOO_SMALL, got {err:?}"
         );
     }
 

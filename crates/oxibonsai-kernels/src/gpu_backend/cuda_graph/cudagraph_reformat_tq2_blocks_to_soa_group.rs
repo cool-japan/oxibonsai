@@ -6,6 +6,8 @@
 
 use std::sync::Arc;
 
+use crate::gpu_backend::cuda_graph_slot::UNATTRIBUTED_CUDA_MODEL_EPOCH;
+
 use super::types::CudaGraphError;
 
 use super::cudagraph_type::CudaGraph;
@@ -26,22 +28,37 @@ impl CudaGraph {
         }
         soa
     }
-    /// Upload TQ2_0_g128 weights in SoA layout under a new handle id.
+    /// Upload TQ2_0_g128 weights in SoA layout under a new handle id,
+    /// **unattributed** (never freed by `release_model_epoch`; finding F-M3).
     pub fn upload_weight_tq2_soa(
         &self,
         handle_id: u64,
         blocks: &[oxibonsai_core::BlockTQ2_0_g128],
+    ) -> Result<(), CudaGraphError> {
+        self.upload_weight_tq2_soa_for_epoch(handle_id, blocks, UNATTRIBUTED_CUDA_MODEL_EPOCH)
+    }
+
+    /// [`Self::upload_weight_tq2_soa`], attributing the upload to `model_epoch`
+    /// so the model's `Drop` can free it (finding **F-M3**).
+    pub fn upload_weight_tq2_soa_for_epoch(
+        &self,
+        handle_id: u64,
+        blocks: &[oxibonsai_core::BlockTQ2_0_g128],
+        model_epoch: u64,
     ) -> Result<(), CudaGraphError> {
         let soa = Self::reformat_tq2_blocks_to_soa(blocks);
         let d_weight = self
             .stream
             .clone_htod(&soa)
             .map_err(|e| CudaGraphError::DriverError(format!("clone_htod tq2: {e}")))?;
-        let mut cache = self
-            .weight_cache
-            .lock()
-            .map_err(|_| CudaGraphError::LockPoisoned)?;
-        cache.insert(handle_id, Arc::new(d_weight));
+        {
+            let mut cache = self
+                .weight_cache
+                .lock()
+                .map_err(|_| CudaGraphError::LockPoisoned)?;
+            cache.insert(handle_id, Arc::new(d_weight));
+        }
+        self.register_model_weight(model_epoch, handle_id)?;
         Ok(())
     }
 
@@ -62,7 +79,7 @@ impl CudaGraph {
         const BLOCK_BYTES: usize = 34;
         const SCALE_BYTES: usize = 2;
         const QS_BYTES: usize = 32;
-        if aos_bytes.is_empty() || aos_bytes.len() % BLOCK_BYTES != 0 {
+        if aos_bytes.is_empty() || !aos_bytes.len().is_multiple_of(BLOCK_BYTES) {
             return None;
         }
         let n = aos_bytes.len() / BLOCK_BYTES;
@@ -86,19 +103,40 @@ impl CudaGraph {
     /// Mirrors `get_or_upload_weight_soa` but for TQ2_0_g128 block layout
     /// (34 bytes/block: 2-byte FP16 scale + 32-byte qs) rather than Q1_0_g128
     /// (18 bytes/block: 2-byte FP16 scale + 16-byte data).
+    ///
+    /// **Unattributed**: never freed by [`Self::release_model_epoch`] (finding
+    /// F-M3); use [`Self::get_or_upload_weight_tq2_soa_for_epoch`] when the
+    /// owning model is known.
     pub fn get_or_upload_weight_tq2_soa(
         &self,
         handle_id: u64,
         aos_bytes: &[u8],
     ) -> Result<Arc<cudarc::driver::CudaSlice<u8>>, CudaGraphError> {
-        {
+        self.get_or_upload_weight_tq2_soa_for_epoch(
+            handle_id,
+            aos_bytes,
+            UNATTRIBUTED_CUDA_MODEL_EPOCH,
+        )
+    }
+
+    /// [`Self::get_or_upload_weight_tq2_soa`], attributing the upload to
+    /// `model_epoch` so the model's `Drop` can free it (finding **F-M3**).
+    pub fn get_or_upload_weight_tq2_soa_for_epoch(
+        &self,
+        handle_id: u64,
+        aos_bytes: &[u8],
+        model_epoch: u64,
+    ) -> Result<Arc<cudarc::driver::CudaSlice<u8>>, CudaGraphError> {
+        let cached = {
             let cache = self
                 .weight_cache
                 .lock()
                 .map_err(|_| CudaGraphError::LockPoisoned)?;
-            if let Some(existing) = cache.get(&handle_id) {
-                return Ok(Arc::clone(existing));
-            }
+            cache.get(&handle_id).map(Arc::clone)
+        };
+        if let Some(existing) = cached {
+            self.register_model_weight(model_epoch, handle_id)?;
+            return Ok(existing);
         }
         let soa = Self::reformat_tq2_aos_bytes_to_soa(aos_bytes).ok_or_else(|| {
             CudaGraphError::WeightLayoutError(format!(
@@ -111,11 +149,16 @@ impl CudaGraph {
             .clone_htod(&soa)
             .map_err(|e| CudaGraphError::DriverError(format!("clone_htod tq2_soa: {e}")))?;
         let arc = Arc::new(d_weight);
-        let mut cache = self
-            .weight_cache
-            .lock()
-            .map_err(|_| CudaGraphError::LockPoisoned)?;
-        cache.insert(handle_id, Arc::clone(&arc));
+        {
+            let mut cache = self
+                .weight_cache
+                .lock()
+                .map_err(|_| CudaGraphError::LockPoisoned)?;
+            cache.insert(handle_id, Arc::clone(&arc));
+        }
+        // Outside the cache lock: the lock order is always "weight cache, then
+        // epoch registry".
+        self.register_model_weight(model_epoch, handle_id)?;
         Ok(arc)
     }
 
@@ -123,6 +166,8 @@ impl CudaGraph {
     ///
     /// On cache miss, calls `make_bytes()` to build the AoS byte slice, then reformats
     /// to SoA and uploads.  Avoids building the bytes when the weight is already cached.
+    ///
+    /// **Unattributed** — see [`Self::get_or_upload_weight_tq2_soa_lazy_for_epoch`].
     pub fn get_or_upload_weight_tq2_soa_lazy<F>(
         &self,
         handle_id: u64,
@@ -131,16 +176,36 @@ impl CudaGraph {
     where
         F: FnOnce() -> Vec<u8>,
     {
-        {
+        self.get_or_upload_weight_tq2_soa_lazy_for_epoch(
+            handle_id,
+            make_bytes,
+            UNATTRIBUTED_CUDA_MODEL_EPOCH,
+        )
+    }
+
+    /// [`Self::get_or_upload_weight_tq2_soa_lazy`], attributing the upload to
+    /// `model_epoch` (finding **F-M3**).
+    pub fn get_or_upload_weight_tq2_soa_lazy_for_epoch<F>(
+        &self,
+        handle_id: u64,
+        make_bytes: F,
+        model_epoch: u64,
+    ) -> Result<Arc<cudarc::driver::CudaSlice<u8>>, CudaGraphError>
+    where
+        F: FnOnce() -> Vec<u8>,
+    {
+        let cached = {
             let cache = self
                 .weight_cache
                 .lock()
                 .map_err(|_| CudaGraphError::LockPoisoned)?;
-            if let Some(existing) = cache.get(&handle_id) {
-                return Ok(Arc::clone(existing));
-            }
+            cache.get(&handle_id).map(Arc::clone)
+        };
+        if let Some(existing) = cached {
+            self.register_model_weight(model_epoch, handle_id)?;
+            return Ok(existing);
         }
         let aos_bytes = make_bytes();
-        self.get_or_upload_weight_tq2_soa(handle_id, &aos_bytes)
+        self.get_or_upload_weight_tq2_soa_for_epoch(handle_id, &aos_bytes, model_epoch)
     }
 }

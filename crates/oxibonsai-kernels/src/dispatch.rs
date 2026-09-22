@@ -14,48 +14,23 @@ use crate::dequant;
 use crate::error::KernelResult;
 use crate::gemm;
 use crate::gemv;
-use crate::traits::{Fp8Kernel, OneBitKernel, StandardQuantKernel, TernaryKernel};
+use crate::tier::TierReason;
+use crate::traits::{Fp8Kernel, OneBitKernel, TernaryKernel};
 use crate::weight_cache::GpuWeightHandle;
 use oxibonsai_core::tensor::BlockQ1_0G128;
-use oxibonsai_core::{BlockFP8E4M3, BlockFP8E5M2, BlockQ4_0, BlockQ8_0};
+use oxibonsai_core::{BlockFP8E4M3, BlockFP8E5M2};
 #[cfg(feature = "gpu")]
 use std::sync::Arc;
-use std::sync::OnceLock;
 
-/// Kernel implementation tier, ordered from slowest to fastest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KernelTier {
-    /// Pure scalar Rust — correctness reference.
-    Reference,
-    /// AVX2 + FMA (256-bit SIMD, x86-64).
-    #[cfg(target_arch = "x86_64")]
-    Avx2,
-    /// AVX-512F + AVX-512BW + AVX-512VL (512-bit SIMD, x86-64).
-    #[cfg(target_arch = "x86_64")]
-    Avx512,
-    /// NEON (128-bit SIMD, AArch64).
-    #[cfg(target_arch = "aarch64")]
-    Neon,
-    /// GPU-accelerated (Metal / CUDA via scirs2-core).
-    #[cfg(feature = "gpu")]
-    Gpu,
-}
-
-impl std::fmt::Display for KernelTier {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Reference => write!(f, "reference"),
-            #[cfg(target_arch = "x86_64")]
-            Self::Avx2 => write!(f, "avx2+fma"),
-            #[cfg(target_arch = "x86_64")]
-            Self::Avx512 => write!(f, "avx512f+bw+vl"),
-            #[cfg(target_arch = "aarch64")]
-            Self::Neon => write!(f, "neon"),
-            #[cfg(feature = "gpu")]
-            Self::Gpu => write!(f, "gpu"),
-        }
-    }
-}
+// `KernelTier` (the tier enum + its `Display` impl), `TierReason`, and the
+// pure CPU-feature-detection tier selection (`clamp_tier_to_cpu`,
+// `select_tier`, `warn_gpu_unavailable_once`, `cpu_kernel_tier`) live in the
+// sibling `tier` module (wave-1 / wave-1.5 addenda: this file was
+// 1997/2000 lines before the split). Re-exported here so every existing
+// `crate::dispatch::KernelTier` / `oxibonsai_kernels::KernelTier` path (and
+// `lib.rs`'s own `pub use dispatch::{cpu_kernel_tier, KernelDispatcher,
+// KernelTier};`) keeps resolving unchanged.
+pub use crate::tier::{cpu_kernel_tier, KernelTier};
 
 /// Dispatches kernel calls to the best available implementation.
 ///
@@ -67,6 +42,7 @@ pub struct KernelDispatcher {
     /// hardware-accelerated backend was detected at construction time.
     #[cfg(feature = "gpu")]
     gpu_backend: Option<Arc<dyn crate::gpu_backend::GpuBackendTrait>>,
+    tier_reason: TierReason,
 }
 
 impl std::fmt::Debug for KernelDispatcher {
@@ -74,6 +50,7 @@ impl std::fmt::Debug for KernelDispatcher {
         // GPU backend is a trait object without Debug; show only the tier.
         f.debug_struct("KernelDispatcher")
             .field("tier", &self.tier)
+            .field("tier_reason", &self.tier_reason)
             .finish_non_exhaustive()
     }
 }
@@ -83,45 +60,158 @@ impl KernelDispatcher {
     ///
     /// Queries SciRS2-Core's cached `CpuFeatures` to determine the
     /// optimal tier for the current CPU.
+    ///
+    /// If the `gpu` feature is compiled in but no accelerated backend is
+    /// found, this degrades to the best CPU SIMD tier (perf-13: ~1/7 the
+    /// throughput) and emits a one-time-per-process `tracing::warn!` naming
+    /// the reason, rather than only the `INFO`-level "selected kernel tier"
+    /// line that gives no hint the degradation happened. Use
+    /// [`Self::try_with_tier`]`(KernelTier::Gpu)` instead of this method
+    /// when a missing GPU should be a hard error.
     pub fn auto_detect() -> Self {
         // Try GPU first when the feature is compiled in.
         #[cfg(feature = "gpu")]
         {
             let backend = crate::gpu_backend::select_backend();
             if backend.is_accelerated() {
-                tracing::info!(backend = backend.name(), "GPU backend available");
+                let name = backend.name();
+                tracing::info!(backend = name, "GPU backend available");
                 return Self {
                     tier: KernelTier::Gpu,
+                    tier_reason: TierReason::GpuBackend(name),
                     gpu_backend: Some(Arc::from(backend)),
                 };
             }
+            Self::warn_gpu_unavailable_once(backend.name());
         }
 
         let caps = scirs2_core::simd::detect::get_cpu_features();
         let tier = Self::select_tier(caps);
         tracing::info!(tier = %tier, "selected kernel tier");
+
+        #[cfg(feature = "gpu")]
+        let tier_reason = TierReason::CpuAutoDetectGpuUnavailable;
+        #[cfg(not(feature = "gpu"))]
+        let tier_reason = TierReason::CpuAutoDetectNoGpuFeature;
+
         Self {
             tier,
             #[cfg(feature = "gpu")]
             gpu_backend: None,
+            tier_reason,
         }
     }
 
     /// Create a dispatcher with a specific tier (for testing/benchmarks).
+    ///
+    /// The requested tier is re-validated against the CPU's actual feature
+    /// set via [`Self::clamp_tier_to_cpu`] and silently demoted (with a
+    /// `tracing::warn!`) if unsupported (K-03/sec-14), so this constructor
+    /// can never hand back a dispatcher that would later hit an
+    /// illegal-instruction trap in the `unsafe { #[target_feature] }`
+    /// AVX2/AVX-512 kernels. A no-op for a tier the CPU already supports —
+    /// e.g. `with_tier(cpu_kernel_tier())` — and on aarch64 (where NEON is
+    /// the ISA baseline) always a no-op.
+    ///
+    /// Use [`Self::try_with_tier`] to be told about a demotion via `Err`
+    /// instead of silently accepting it, or the `unsafe`
+    /// [`Self::with_tier_unchecked`] to bypass validation entirely
+    /// (benchmarks only).
     pub fn with_tier(tier: KernelTier) -> Self {
+        let clamped = Self::clamp_tier_to_cpu(tier);
+        let tier_reason = if clamped == tier {
+            TierReason::Requested
+        } else {
+            TierReason::Demoted(tier)
+        };
+        Self {
+            tier: clamped,
+            #[cfg(feature = "gpu")]
+            gpu_backend: None,
+            tier_reason,
+        }
+    }
+
+    /// Construct a dispatcher with an explicitly-requested tier, rejecting
+    /// one the current hardware cannot execute instead of silently
+    /// constructing a [`Self::with_tier`] that demotes quietly (K-03/sec-14)
+    /// or, for `KernelTier::Gpu`, silently running every op on the CPU
+    /// fallback path (perf-13).
+    ///
+    /// # Errors
+    ///
+    /// - For `tier == KernelTier::Gpu` (when the `gpu` feature is compiled
+    ///   in): [`crate::error::KernelError::UnsupportedOperation`] naming the
+    ///   backend if no accelerated GPU backend is available.
+    /// - For `Avx2`/`Avx512` on x86-64: the same error naming the best tier
+    ///   this CPU actually supports, if the requested one is unsupported.
+    /// - `Reference` and (on aarch64) `Neon` always succeed.
+    pub fn try_with_tier(tier: KernelTier) -> KernelResult<Self> {
+        #[cfg(feature = "gpu")]
+        if tier == KernelTier::Gpu {
+            let backend = crate::gpu_backend::select_backend();
+            if !backend.is_accelerated() {
+                return Err(crate::error::KernelError::UnsupportedOperation(format!(
+                    "GPU kernel tier was explicitly requested but no accelerated GPU \
+                     backend is available (selected backend '{}' reports not accelerated)",
+                    backend.name()
+                )));
+            }
+            let name = backend.name();
+            return Ok(Self {
+                tier: KernelTier::Gpu,
+                tier_reason: TierReason::GpuBackend(name),
+                gpu_backend: Some(Arc::from(backend)),
+            });
+        }
+
+        let clamped = Self::clamp_tier_to_cpu(tier);
+        if clamped != tier {
+            return Err(crate::error::KernelError::UnsupportedOperation(format!(
+                "kernel tier {tier} was explicitly requested but is not supported by this \
+                 CPU (best available: {clamped})"
+            )));
+        }
+        Ok(Self {
+            tier,
+            #[cfg(feature = "gpu")]
+            gpu_backend: None,
+            tier_reason: TierReason::Requested,
+        })
+    }
+
+    /// Construct a dispatcher with the given tier **without** re-validating
+    /// it against the running CPU's feature set.
+    ///
+    /// For benchmarks that pin a specific tier for comparison purposes on
+    /// hardware already known to support it (`benches/kernel_benchmarks.rs`).
+    /// Prefer [`Self::try_with_tier`] or the clamped [`Self::with_tier`]
+    /// everywhere else.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure `tier` is actually executable on the current
+    /// CPU: requesting `Avx512`/`Avx2` on hardware lacking those extensions
+    /// makes any subsequent kernel call that reaches the corresponding
+    /// `unsafe { #[target_feature] }` function undefined behavior (illegal
+    /// instruction / miscompiled SIMD).
+    pub unsafe fn with_tier_unchecked(tier: KernelTier) -> Self {
         Self {
             tier,
             #[cfg(feature = "gpu")]
             gpu_backend: None,
+            tier_reason: TierReason::Unchecked,
         }
     }
 
     /// Create a dispatcher that uses the GPU backend with the given handle.
     #[cfg(feature = "gpu")]
     pub fn with_gpu(backend: Arc<dyn crate::gpu_backend::GpuBackendTrait>) -> Self {
+        let tier_reason = TierReason::GpuHandle(backend.name());
         Self {
             tier: KernelTier::Gpu,
             gpu_backend: Some(backend),
+            tier_reason,
         }
     }
 
@@ -130,88 +220,101 @@ impl KernelDispatcher {
         self.tier
     }
 
-    /// Select best tier based on detected capabilities.
+    /// The GPU backend handle, if this dispatcher was constructed with one
+    /// (`auto_detect`/`try_with_tier(Gpu)`/`with_gpu` on a machine with an
+    /// accelerated backend) — `None` on every CPU tier and on a `Gpu`-tier
+    /// dispatcher built without the `gpu` feature.
     ///
-    /// On x86_64, validates scirs2_core detection against Rust's built-in
-    /// `is_x86_feature_detected!` macros to ensure correct tier selection.
-    /// This prevents issues where scirs2_core might incorrectly detect
-    /// CPU features on certain platforms (e.g., Windows AMD CPUs).
-    fn select_tier(caps: &scirs2_core::simd::detect::CpuFeatures) -> KernelTier {
-        #[cfg(target_arch = "x86_64")]
-        {
-            // Use Rust's built-in feature detection as the source of truth.
-            // scirs2_core detection may be unreliable on some platforms.
-            let has_avx512f = is_x86_feature_detected!("avx512f");
-            let has_avx512bw = is_x86_feature_detected!("avx512bw");
-            let has_avx512vl = is_x86_feature_detected!("avx512vl");
-            let has_avx2 = is_x86_feature_detected!("avx2");
-            let has_fma = is_x86_feature_detected!("fma");
+    /// Wave-2.5 RT-ENGINE grant: `gpu_backend` was a private field with no
+    /// accessor, so `impl Drop for InferenceEngine`
+    /// (`oxibonsai-runtime/src/engine.rs`, wave 4, not owned by this
+    /// package) could not evict the GPU weight cache
+    /// (`Scirs2Backend::clear_weight_cache`) on drop — the second half of
+    /// MET-M1. That consumer lands in wave 4; this accessor is the piece
+    /// this package can deliver now.
+    #[cfg(feature = "gpu")]
+    pub fn gpu_backend(&self) -> Option<&Arc<dyn crate::gpu_backend::GpuBackendTrait>> {
+        self.gpu_backend.as_ref()
+    }
 
-            // Log if there's a mismatch between scirs2_core and std detection
-            if caps.has_avx512f != has_avx512f {
-                tracing::warn!(
-                    scirs2_avx512f = caps.has_avx512f,
-                    std_avx512f = has_avx512f,
-                    "CPU feature detection mismatch for AVX-512F, using std detection"
-                );
-            }
-            if caps.has_avx2 != has_avx2 || caps.has_fma != has_fma {
-                tracing::warn!(
-                    scirs2_avx2 = caps.has_avx2,
-                    scirs2_fma = caps.has_fma,
-                    std_avx2 = has_avx2,
-                    std_fma = has_fma,
-                    "CPU feature detection mismatch for AVX2/FMA, using std detection"
-                );
-            }
-
-            // AVX-512 requires all three: avx512f, avx512bw, and avx512vl
-            if has_avx512f && has_avx512bw && has_avx512vl {
-                tracing::debug!("AVX-512 (F+BW+VL) detected, selecting AVX-512 tier");
-                return KernelTier::Avx512;
-            }
-            if has_avx2 && has_fma {
-                tracing::debug!("AVX2 + FMA detected, selecting AVX2 tier");
-                return KernelTier::Avx2;
-            }
-
-            // Log fallback to reference tier
-            tracing::warn!(
-                has_avx512f,
-                has_avx512bw,
-                has_avx512vl,
-                has_avx2,
-                has_fma,
-                "No SIMD acceleration available, falling back to reference tier (this will be slow)"
-            );
+    /// Tier-only portion of [`OneBitKernel::name`] / [`Self::kernel_label`]
+    /// (cli-16) — no quant-family prefix, since a dispatcher instance is
+    /// shared across every quant-kernel trait and cannot know on its own
+    /// which one a given caller is using.
+    fn tier_label(&self) -> &'static str {
+        match self.tier {
+            KernelTier::Reference => "reference (scalar)",
+            #[cfg(target_arch = "x86_64")]
+            KernelTier::Avx2 => "AVX2+FMA (256-bit)",
+            #[cfg(target_arch = "x86_64")]
+            KernelTier::Avx512 => "AVX-512 (512-bit)",
+            #[cfg(target_arch = "aarch64")]
+            KernelTier::Neon => "NEON (128-bit)",
+            #[cfg(feature = "gpu")]
+            KernelTier::Gpu => "GPU (accelerated)",
         }
+    }
 
-        #[cfg(target_arch = "aarch64")]
-        {
-            if caps.has_neon {
-                return KernelTier::Neon;
+    /// A human-readable label combining a model's resolved dominant quant
+    /// type with this dispatcher's kernel tier, e.g.
+    /// `"TQ2_0_g128 NEON (128-bit)"` (cli-16).
+    ///
+    /// [`OneBitKernel::name`] cannot include the quant family for the reason
+    /// [`Self::tier_label`] documents; a caller that already knows which
+    /// type it resolved a model to (e.g. from
+    /// [`crate::traits::OneBitKernel`]-adjacent model codetracking its own
+    /// `dominant_quant_type`) should call this instead. `src/cli/model_desc.rs`'s
+    /// `resolved_engine_summary` builds the same information independently
+    /// today (it does not go through this method); the one remaining
+    /// hardcoded-family caller is `oxibonsai-runtime/src/engine.rs`'s
+    /// `"inference engine loaded from GGUF kernel=..."` log line, which is
+    /// not in this package's `owned_files` — it should switch to
+    /// `dispatcher.kernel_label(model.dominant_quant_type())` in place of
+    /// `kernel.name()`.
+    pub fn kernel_label(&self, dominant_type: oxibonsai_core::GgufTensorType) -> String {
+        format!("{dominant_type} {}", self.tier_label())
+    }
+
+    /// Human-readable explanation of how the effective kernel tier was
+    /// chosen — e.g. `"gpu tier (backend=metal)"` or `"neon tier (requested
+    /// avx2 not supported by this CPU, demoted)"`. For the CLI build-info
+    /// surface (cli-19) and `/admin/status` so a GPU-unavailable degradation
+    /// to a much slower CPU tier is observable instead of silent (perf-13).
+    pub fn effective_tier_reason(&self) -> String {
+        match self.tier_reason {
+            #[cfg(feature = "gpu")]
+            TierReason::GpuBackend(name) => format!("gpu tier (backend={name})"),
+            #[cfg(feature = "gpu")]
+            TierReason::GpuHandle(name) => {
+                format!("gpu tier (backend={name}, pre-built handle)")
+            }
+            #[cfg(not(feature = "gpu"))]
+            TierReason::CpuAutoDetectNoGpuFeature => {
+                format!(
+                    "{} tier (auto-detected; gpu feature not compiled in)",
+                    self.tier
+                )
+            }
+            #[cfg(feature = "gpu")]
+            TierReason::CpuAutoDetectGpuUnavailable => format!(
+                "{} tier (auto-detected; GPU backend not accelerated, fell back)",
+                self.tier
+            ),
+            TierReason::Requested => format!("{} tier (explicitly requested)", self.tier),
+            TierReason::Demoted(requested) => format!(
+                "{} tier (requested {requested} not supported by this CPU, demoted)",
+                self.tier
+            ),
+            TierReason::Unchecked => {
+                format!("{} tier (unchecked, caller-validated)", self.tier)
             }
         }
-
-        // Suppress unused-variable warning on architectures with no SIMD paths
-        let _ = caps;
-        KernelTier::Reference
     }
 }
 
-/// Best **CPU** kernel tier for the current machine, detected once and cached.
-///
-/// Unlike [`KernelDispatcher::auto_detect`], this never selects the GPU tier and
-/// never logs, so it is cheap enough to call on every kernel invocation. It is
-/// used by the standard-quant (Q4_0 / Q8_0) free-function entry points to build
-/// a lightweight CPU dispatcher per call without repeating feature detection.
-pub fn cpu_kernel_tier() -> KernelTier {
-    static TIER: OnceLock<KernelTier> = OnceLock::new();
-    *TIER.get_or_init(|| {
-        let caps = scirs2_core::simd::detect::get_cpu_features();
-        KernelDispatcher::select_tier(caps)
-    })
-}
+// `clamp_tier_to_cpu`, `select_tier` (both used by the constructors above via
+// `Self::`) and the free function `cpu_kernel_tier` now live in `crate::tier`
+// (re-exported at the top of this file) — see that module's doc comment.
 
 /// Minimum number of rows before the GPU path is worthwhile.
 ///
@@ -221,13 +324,62 @@ pub fn cpu_kernel_tier() -> KernelTier {
 const GPU_MIN_ROWS: usize = 1024;
 
 impl KernelDispatcher {
+    /// Dense FP32 GEMV — the LM-head projection (K-12 / M-23).
+    ///
+    /// `out[..out_features] = weights[out_features × in_features] · input[..in_features]`,
+    /// row-major, with an empty `weights` denoting the all-zero projection of
+    /// the weightless config-only model constructors (M-33).
+    ///
+    /// This is the dispatcher seam the FP32 LM head previously did not have:
+    /// `oxibonsai-model`'s `apply_lm_head` used to call a copy of the kernel
+    /// private to `model/types/lm_head.rs`, so the GPU tiers could never claim
+    /// the single largest GEMV in the model (`248 320 × 5120` on Bonsai 2 27B).
+    /// Every tier now arrives here.
+    ///
+    /// # Tier behaviour
+    ///
+    /// Every tier — including [`KernelTier::Gpu`] — currently executes
+    /// [`crate::gemv_f32::gemv_f32`], whose NEON-`fmla` / AVX2-`vfmadd` lane
+    /// structure already covers the CPU tiers without a per-tier body. `Gpu`
+    /// deliberately runs the same CPU kernel rather than degrading silently
+    /// to *something else*: neither
+    /// [`GpuBackendTrait`](crate::gpu_backend::GpuBackendTrait) nor the Metal
+    /// / CUDA kernel-source sets carries a dense-FP32 GEMV entry point yet, and
+    /// the wave's parity gate requires this projection to stay byte-identical
+    /// to the pre-hoist body on a real model. When a GPU FP32 GEMV lands, this
+    /// method is the one place that routes to it, and the change becomes
+    /// visible to `apply_lm_head` without touching `oxibonsai-model` at all.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`crate::gemv_f32::gemv_f32`]'s named shape errors.
+    pub fn gemv_f32(
+        &self,
+        weights: &[f32],
+        input: &[f32],
+        out: &mut [f32],
+        out_features: usize,
+        in_features: usize,
+    ) -> KernelResult<()> {
+        // Single body for every tier today — deliberately not a `match` on
+        // `self.tier`, which would be five arms doing the same thing. The
+        // dispatcher seam is what matters: this is the one call site a future
+        // GPU (or per-tier CPU) FP32 GEMV has to be wired into, and every
+        // caller already arrives through it.
+        crate::gemv_f32::gemv_f32(weights, input, out, out_features, in_features)
+    }
+
     /// Return the best CPU-only tier for use as GPU fallback.
     ///
     /// Uses Rust's built-in `is_x86_feature_detected!` macros directly
     /// for reliable detection, bypassing scirs2_core which may have issues
     /// on certain platforms.
+    ///
+    /// `pub(crate)` (not private) so the sibling dispatch-split files
+    /// (`dispatch_std_quant.rs`, `dispatch_prism.rs`) can call it from their
+    /// own `cpu_*_fallback` methods.
     #[cfg(feature = "gpu")]
-    fn cpu_tier() -> KernelTier {
+    pub(crate) fn cpu_tier() -> KernelTier {
         #[cfg(target_arch = "x86_64")]
         {
             let has_avx512f = is_x86_feature_detected!("avx512f");
@@ -422,6 +574,11 @@ impl KernelDispatcher {
         }
     }
 
+    // `cpu_gemv_q4_0_fallback` / `cpu_gemv_q8_0_fallback` (K-17) now live in
+    // `dispatch_std_quant.rs`, alongside the `StandardQuantKernel` impl that
+    // calls them (a single trait impl cannot itself be split across files,
+    // so it made sense to move its fallbacks with it).
+
     /// Reinterpret a slice of `BlockQ1_0G128` as raw bytes (zero-copy).
     ///
     /// # Safety
@@ -548,18 +705,18 @@ impl OneBitKernel for KernelDispatcher {
         }
     }
 
+    /// cli-16: this used to hardcode a `"Q1_0_g128 "` prefix regardless of
+    /// which quant family the caller was actually running — one
+    /// `KernelDispatcher` backs `OneBitKernel`/`TernaryKernel`/
+    /// `StandardQuantKernel`/`Fp8Kernel`/`PrismKernel` alike, so it has no
+    /// way to know which one a given caller cares about. The tier portion
+    /// was always correct; only the quant-family guess was wrong. Fixed by
+    /// dropping the guess (see [`Self::tier_label`]) rather than by
+    /// rewriting the tier text. [`Self::kernel_label`] is the parameterized
+    /// replacement for a caller that *does* know the model's resolved quant
+    /// type.
     fn name(&self) -> &'static str {
-        match self.tier {
-            KernelTier::Reference => "Q1_0_g128 reference (scalar)",
-            #[cfg(target_arch = "x86_64")]
-            KernelTier::Avx2 => "Q1_0_g128 AVX2+FMA (256-bit)",
-            #[cfg(target_arch = "x86_64")]
-            KernelTier::Avx512 => "Q1_0_g128 AVX-512 (512-bit)",
-            #[cfg(target_arch = "aarch64")]
-            KernelTier::Neon => "Q1_0_g128 NEON (128-bit)",
-            #[cfg(feature = "gpu")]
-            KernelTier::Gpu => "Q1_0_g128 GPU (accelerated)",
-        }
+        self.tier_label()
     }
 
     fn is_gpu_accelerated(&self) -> bool {
@@ -631,6 +788,17 @@ impl OneBitKernel for KernelDispatcher {
         // GPU batch (dispatch_no_wait + dispatch) for only 2 operations.
         // The GPU batch creates 4 new Metal buffers per call; the fallback
         // reuses pre-allocated io_input/output buffers.
+        //
+        // K-20: this is a measurement-driven `Ok(None)`, not a missing
+        // feature — do not "finish" this by wiring in a call. The real,
+        // working Metal implementation this permanently skips lives at
+        // `gpu_backend/scirs2_backend.rs`'s `batch_attn_phase` (wired into
+        // `GpuBackendTrait` at `gpu_backend/mod.rs`); it stays reachable via
+        // that trait impl for a future caller (the `forward_sw.rs` /
+        // `forward_stats.rs` revival point) that changes the underlying
+        // cost model, e.g. batching many more than 2 ops together. See the
+        // `#[doc(hidden)]` note on `OneBitKernel::batch_attn_phase` in
+        // `traits.rs`.
         let _ = (hidden, norm_weight, norm_eps, qkv_handle, q_rows, k_rows, h);
         Ok(None)
     }
@@ -1130,176 +1298,47 @@ impl Fp8Kernel for KernelDispatcher {
     }
 }
 
-impl StandardQuantKernel for KernelDispatcher {
-    fn gemv_q4_0(
-        &self,
-        blocks: &[BlockQ4_0],
-        input: &[f32],
-        output: &mut [f32],
-        n_rows: usize,
-        in_features: usize,
-    ) -> KernelResult<()> {
-        match self.tier {
-            #[cfg(target_arch = "x86_64")]
-            KernelTier::Avx512 => unsafe {
-                crate::simd_q_std_avx512::gemv_q4_0_avx512(
-                    blocks,
-                    input,
-                    output,
-                    n_rows,
-                    in_features,
-                )
-            },
-            #[cfg(target_arch = "x86_64")]
-            KernelTier::Avx2 => unsafe {
-                crate::simd_q_std_avx2::gemv_q4_0_avx2(blocks, input, output, n_rows, in_features)
-            },
-            // GPU tier: route to the Metal kernel on macOS; fall back to scalar
-            // on any failure (no device, shape mismatch, compile error).
-            #[cfg(feature = "gpu")]
-            KernelTier::Gpu => {
-                #[cfg(all(feature = "metal", target_os = "macos"))]
-                {
-                    if let Some(bytes) = q_std_gpu_bytes(
-                        blocks,
-                        input,
-                        output,
-                        n_rows,
-                        in_features,
-                        oxibonsai_core::BLOCK_Q4_0_BYTES,
-                    ) {
-                        match crate::gpu_backend::metal_gemv_q4_0(
-                            bytes,
-                            &input[..in_features],
-                            &mut output[..n_rows],
-                            n_rows,
-                            in_features,
-                        ) {
-                            Ok(()) => return Ok(()),
-                            Err(e) => warn_metal_gemv_fallback("Q4_0", &e),
-                        }
-                    }
-                }
-                crate::gemv_q4_0::gemv_q4_0_scalar(blocks, input, output, n_rows, in_features)
-            }
-            #[cfg(target_arch = "aarch64")]
-            KernelTier::Neon => unsafe {
-                crate::simd_q_std_neon::gemv_q4_0_neon(blocks, input, output, n_rows, in_features)
-            },
-            // No Q4_0 SIMD kernel for other tiers (Reference): use scalar.
-            _ => crate::gemv_q4_0::gemv_q4_0_scalar(blocks, input, output, n_rows, in_features),
-        }
-    }
+// `impl StandardQuantKernel for KernelDispatcher` (Q4_0, Q8_0, and the six
+// K-quant formats), its Metal `quant_gpu_bytes`/`warn_metal_gemv_fallback`
+// helpers, and the `Gpu`-arm CPU fallbacks now live in
+// `dispatch_std_quant.rs` — see that module's doc comment.
 
-    fn gemv_q8_0(
-        &self,
-        blocks: &[BlockQ8_0],
-        input: &[f32],
-        output: &mut [f32],
-        n_rows: usize,
-        in_features: usize,
-    ) -> KernelResult<()> {
-        match self.tier {
-            #[cfg(target_arch = "x86_64")]
-            KernelTier::Avx512 => unsafe {
-                crate::simd_q_std_avx512::gemv_q8_0_avx512(
-                    blocks,
-                    input,
-                    output,
-                    n_rows,
-                    in_features,
-                )
-            },
-            #[cfg(target_arch = "x86_64")]
-            KernelTier::Avx2 => unsafe {
-                crate::simd_q_std_avx2::gemv_q8_0_avx2(blocks, input, output, n_rows, in_features)
-            },
-            // GPU tier: route to the Metal kernel on macOS; fall back to scalar
-            // on any failure (no device, shape mismatch, compile error).
-            #[cfg(feature = "gpu")]
-            KernelTier::Gpu => {
-                #[cfg(all(feature = "metal", target_os = "macos"))]
-                {
-                    if let Some(bytes) = q_std_gpu_bytes(
-                        blocks,
-                        input,
-                        output,
-                        n_rows,
-                        in_features,
-                        oxibonsai_core::BLOCK_Q8_0_BYTES,
-                    ) {
-                        match crate::gpu_backend::metal_gemv_q8_0(
-                            bytes,
-                            &input[..in_features],
-                            &mut output[..n_rows],
-                            n_rows,
-                            in_features,
-                        ) {
-                            Ok(()) => return Ok(()),
-                            Err(e) => warn_metal_gemv_fallback("Q8_0", &e),
-                        }
-                    }
-                }
-                crate::gemv_q8_0::gemv_q8_0_scalar(blocks, input, output, n_rows, in_features)
-            }
-            #[cfg(target_arch = "aarch64")]
-            KernelTier::Neon => unsafe {
-                crate::simd_q_std_neon::gemv_q8_0_neon(blocks, input, output, n_rows, in_features)
-            },
-            _ => crate::gemv_q8_0::gemv_q8_0_scalar(blocks, input, output, n_rows, in_features),
-        }
-    }
+#[cfg(all(test, feature = "gpu"))]
+thread_local! {
+    /// Records which CPU tier a `cpu_gemv_*_fallback` (this file's Q1_0/
+    /// ternary fallbacks, plus `dispatch_std_quant.rs`'s Q4_0/Q8_0/K-quant
+    /// ones and `dispatch_prism.rs`'s prism ones) most recently routed onto,
+    /// so a K-17 regression test can observe the *routing decision* directly
+    /// instead of only the numeric result — the scalar/AVX2/AVX-512/NEON
+    /// kernels are numerically equivalent (mod float rounding), so comparing
+    /// outputs alone cannot tell "always hardcoded scalar" (the K-17 bug)
+    /// apart from "correctly tiered, and this machine's best tier happens to
+    /// be Reference". A thread-local, not a process-global atomic, because
+    /// `cargo test` runs each test function on its own thread by default,
+    /// giving every test its own counter with no cross-test interference.
+    /// `pub(crate)` (not private) so the sibling dispatch-split files can
+    /// record/read it too.
+    pub(crate) static LAST_GPU_FALLBACK_TIER: std::cell::Cell<Option<KernelTier>> =
+        const { std::cell::Cell::new(None) };
 }
 
-/// Reinterpret the leading `n_rows * (in_features / 32)` quant blocks as a raw
-/// byte slice for the Metal GEMV kernels, or `None` if the buffers are too small
-/// or `in_features` is not block-aligned (in which case the scalar reference
-/// runs and reports the precise error).
-///
-/// `block_bytes` is the `#[repr(C)]` size of the block type (18 for `Q4_0`,
-/// 34 for `Q8_0`); it equals `size_of::<Block>()` so the leading `expected`
-/// blocks occupy exactly `expected * block_bytes` contiguous, unpadded bytes.
-#[cfg(all(feature = "metal", target_os = "macos"))]
-fn q_std_gpu_bytes<'a, T>(
-    blocks: &'a [T],
-    input: &[f32],
-    output: &[f32],
-    n_rows: usize,
-    in_features: usize,
-    block_bytes: usize,
-) -> Option<&'a [u8]> {
-    const QK_STD: usize = 32;
-    if in_features == 0 || in_features % QK_STD != 0 {
-        return None;
-    }
-    let blocks_per_row = in_features / QK_STD;
-    let expected = n_rows.checked_mul(blocks_per_row)?;
-    if blocks.len() < expected || input.len() < in_features || output.len() < n_rows {
-        return None;
-    }
-    debug_assert_eq!(std::mem::size_of::<T>(), block_bytes);
-    // SAFETY: `T` is a `#[repr(C)]` quant block whose size equals `block_bytes`
-    // with no inter-element padding, so the leading `expected` blocks form a
-    // contiguous `expected * block_bytes` byte run within `blocks`. The returned
-    // slice borrows `blocks` (lifetime `'a`) and is never longer than it.
-    let bytes =
-        unsafe { std::slice::from_raw_parts(blocks.as_ptr().cast::<u8>(), expected * block_bytes) };
-    Some(bytes)
-}
-
-/// Log a one-line warning when a Metal GEMV falls back to the CPU scalar path,
-/// suppressing the benign "no Metal-capable GPU device" case.
-#[cfg(all(feature = "metal", target_os = "macos"))]
-fn warn_metal_gemv_fallback(format: &str, e: &crate::gpu_backend::MetalGraphError) {
-    let msg = e.to_string();
-    if !msg.contains("no Metal-capable GPU device") {
-        tracing::warn!(error = %e, "Metal {format} GEMV failed, falling back to CPU scalar");
-    }
+#[cfg(all(test, feature = "gpu"))]
+pub(crate) fn record_gpu_fallback_tier(tier: KernelTier) {
+    LAST_GPU_FALLBACK_TIER.with(|cell| cell.set(Some(tier)));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `StandardQuantKernel`'s impl moved to `dispatch_std_quant.rs`, but the
+    // K-17 regression tests below still call `dispatcher.gemv_q4_0`/
+    // `gemv_q8_0` through it, so the trait must be in scope here too. Both
+    // call sites (`gpu_tier_gemv_q4_0_routes_through_cpu_simd_fallback` and
+    // `gpu_tier_gemv_q8_0_routes_through_cpu_simd_fallback`) are
+    // `#[cfg(feature = "gpu")]`-only, so the import itself must be gated the
+    // same way or a non-gpu build warns about an unused import.
+    #[cfg(feature = "gpu")]
+    use crate::traits::StandardQuantKernel;
 
     #[test]
     fn auto_detect_creates_dispatcher() {
@@ -1307,6 +1346,75 @@ mod tests {
         // On x86-64 with AVX2, it should pick Avx2; otherwise Reference
         let _tier = dispatcher.tier();
         let _name = dispatcher.name();
+    }
+
+    /// K-12/M-23: every tier's `gemv_f32` must be byte-identical to the
+    /// free-function kernel — the LM-head logits the wave's parity gate
+    /// measures come out of exactly this path.
+    #[test]
+    fn gemv_f32_is_byte_identical_across_every_tier() {
+        let (out_features, in_features) = (300usize, 64usize);
+        let weights: Vec<f32> = (0..out_features * in_features)
+            .map(|i| ((i % 37) as f32 - 18.0) * 0.011)
+            .collect();
+        let input: Vec<f32> = (0..in_features).map(|i| (i as f32) * 0.003 - 0.1).collect();
+
+        let mut reference = vec![0.0f32; out_features];
+        crate::gemv_f32::gemv_f32(&weights, &input, &mut reference, out_features, in_features)
+            .expect("free-function kernel");
+
+        let mut tiers = vec![KernelTier::Reference];
+        #[cfg(target_arch = "x86_64")]
+        {
+            tiers.push(KernelTier::Avx2);
+            tiers.push(KernelTier::Avx512);
+        }
+        #[cfg(target_arch = "aarch64")]
+        tiers.push(KernelTier::Neon);
+        #[cfg(feature = "gpu")]
+        tiers.push(KernelTier::Gpu);
+
+        for tier in tiers {
+            // `with_tier` clamps an unsupported tier down to one this CPU can
+            // actually run, so this stays correct on every machine.
+            let dispatcher = KernelDispatcher::with_tier(tier);
+            let mut got = vec![0.0f32; out_features];
+            dispatcher
+                .gemv_f32(&weights, &input, &mut got, out_features, in_features)
+                .expect("dispatcher gemv_f32");
+            for (row, (g, r)) in got.iter().zip(reference.iter()).enumerate() {
+                assert_eq!(g.to_bits(), r.to_bits(), "tier {tier:?}, row {row}");
+            }
+        }
+    }
+
+    #[test]
+    fn gemv_f32_empty_weights_zero_the_logits() {
+        let dispatcher = KernelDispatcher::with_tier(KernelTier::Reference);
+        let mut out = vec![3.0f32; 8];
+        dispatcher
+            .gemv_f32(&[], &[1.0; 4], &mut out, 8, 4)
+            .expect("zero LM head");
+        assert!(out.iter().all(|&v| v == 0.0));
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_backend_accessor_agrees_with_tier() {
+        // A `Gpu`-tier dispatcher must expose a backend handle; a CPU-tier
+        // one must not (RT-ENGINE wave-2.5 grant).
+        let cpu = KernelDispatcher::with_tier(KernelTier::Reference);
+        assert!(cpu.gpu_backend().is_none());
+
+        let auto = KernelDispatcher::auto_detect();
+        if auto.tier() == KernelTier::Gpu {
+            assert!(
+                auto.gpu_backend().is_some(),
+                "a Gpu-tier dispatcher must have a backend handle"
+            );
+        } else {
+            assert!(auto.gpu_backend().is_none());
+        }
     }
 
     /// Verify that CPU feature detection uses std's is_x86_feature_detected!
@@ -1350,7 +1458,12 @@ mod tests {
     fn reference_tier_works() {
         let dispatcher = KernelDispatcher::with_tier(KernelTier::Reference);
         assert_eq!(dispatcher.tier(), KernelTier::Reference);
-        assert_eq!(dispatcher.name(), "Q1_0_g128 reference (scalar)");
+        // cli-16: `name()` no longer guesses a quant family.
+        assert_eq!(dispatcher.name(), "reference (scalar)");
+        assert_eq!(
+            dispatcher.kernel_label(oxibonsai_core::GgufTensorType::TQ2_0_g128),
+            "TQ2_0_g128 reference (scalar)"
+        );
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -1361,7 +1474,7 @@ mod tests {
         }
         let dispatcher = KernelDispatcher::with_tier(KernelTier::Avx2);
         assert_eq!(dispatcher.tier(), KernelTier::Avx2);
-        assert_eq!(dispatcher.name(), "Q1_0_g128 AVX2+FMA (256-bit)");
+        assert_eq!(dispatcher.name(), "AVX2+FMA (256-bit)");
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -1369,7 +1482,11 @@ mod tests {
     fn neon_tier_name() {
         let dispatcher = KernelDispatcher::with_tier(KernelTier::Neon);
         assert_eq!(dispatcher.tier(), KernelTier::Neon);
-        assert_eq!(dispatcher.name(), "Q1_0_g128 NEON (128-bit)");
+        assert_eq!(dispatcher.name(), "NEON (128-bit)");
+        assert_eq!(
+            dispatcher.kernel_label(oxibonsai_core::GgufTensorType::Q1_0_g128),
+            "Q1_0_g128 NEON (128-bit)"
+        );
     }
 
     #[test]
@@ -1446,6 +1563,65 @@ mod tests {
             handle.is_none(),
             "expected None for non-GPU tier, got {:?}",
             handle
+        );
+    }
+
+    // `with_tier`/`try_with_tier` clamping (K-03/sec-14) and
+    // `effective_tier_reason` are now tested alongside `clamp_tier_to_cpu`/
+    // `select_tier` themselves in `crate::tier`'s own test module.
+
+    // ── K-17: GPU tier falls back to the CPU SIMD tier, not scalar ──────
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_tier_gemv_q4_0_routes_through_cpu_simd_fallback() {
+        use oxibonsai_core::BlockQ4_0;
+
+        LAST_GPU_FALLBACK_TIER.with(|c| c.set(None));
+
+        let dispatcher = KernelDispatcher::with_tier(KernelTier::Gpu);
+        let blocks: Vec<BlockQ4_0> = Vec::new();
+        // `in_features = 1` is not a multiple of QK_STD (32), so
+        // `q_std_gpu_bytes` rejects the shape before any real Metal call is
+        // attempted — this makes the test deterministic on every machine/CI
+        // runner regardless of whether a real GPU device is present.
+        let input = vec![0.0f32; 1];
+        let mut output = vec![0.0f32; 1];
+
+        // The Ok/Err outcome is not interesting here — a degenerate 1-wide
+        // shape legitimately errors on every tier, scalar included — only
+        // whether routing went through `cpu_gemv_q4_0_fallback` is.
+        let _ = dispatcher.gemv_q4_0(&blocks, &input, &mut output, 1, 1);
+
+        let routed = LAST_GPU_FALLBACK_TIER.with(|c| c.get());
+        assert_eq!(
+            routed,
+            Some(KernelDispatcher::cpu_tier()),
+            "KernelTier::Gpu arm of gemv_q4_0 must route through \
+             cpu_gemv_q4_0_fallback (K-17), not call gemv_q4_0_scalar directly"
+        );
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_tier_gemv_q8_0_routes_through_cpu_simd_fallback() {
+        use oxibonsai_core::BlockQ8_0;
+
+        LAST_GPU_FALLBACK_TIER.with(|c| c.set(None));
+
+        let dispatcher = KernelDispatcher::with_tier(KernelTier::Gpu);
+        let blocks: Vec<BlockQ8_0> = Vec::new();
+        let input = vec![0.0f32; 1];
+        let mut output = vec![0.0f32; 1];
+
+        let _ = dispatcher.gemv_q8_0(&blocks, &input, &mut output, 1, 1);
+
+        let routed = LAST_GPU_FALLBACK_TIER.with(|c| c.get());
+        assert_eq!(
+            routed,
+            Some(KernelDispatcher::cpu_tier()),
+            "KernelTier::Gpu arm of gemv_q8_0 must route through \
+             cpu_gemv_q8_0_fallback (K-17), not call gemv_q8_0_scalar directly"
         );
     }
 }

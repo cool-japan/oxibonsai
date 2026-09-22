@@ -23,6 +23,9 @@ use core::arch::x86_64::*;
 use oxibonsai_core::tensor::{BlockQ1_0G128, QK1_0_G128};
 
 #[cfg(target_arch = "x86_64")]
+use oxibonsai_core::ternary_code_to_i8;
+
+#[cfg(target_arch = "x86_64")]
 use crate::error::{KernelError, KernelResult};
 
 // ─── Helpers ─────────────────────────────────────────────────────────────
@@ -60,28 +63,40 @@ unsafe fn hsum_avx512(v: __m512) -> f32 {
     _mm512_reduce_add_ps(v)
 }
 
+/// The ONE AVX-512 ternary decode helper (K-01): every dequant/gemv/gemm
+/// AVX-512 kernel below routes through this function instead of inlining
+/// its own copy, so the ISA tier physically cannot drift from the single
+/// shared [`oxibonsai_core::ternary_code_to_i8`] table (which maps the
+/// reserved `0b11` code to `0`, matching every GPU decoder and the CPU
+/// reference).
+///
+/// Decodes 16 lanes (four packed bytes, 4 codes each, in `b0..b3` order) via
+/// 16 scalar table lookups, then a single vector load — deliberately not a
+/// hand-rolled SIMD arithmetic re-implementation of the table, which is
+/// exactly the kind of "shadow copy" that caused K-01.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 #[inline]
 unsafe fn decode_4bytes_avx512_to_f32x16(b0: u8, b1: u8, b2: u8, b3: u8) -> __m512 {
-    let shifts = _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30);
-    let one = _mm512_set1_epi32(1);
-    let mask3 = _mm512_set1_epi32(3);
-    let packed = _mm512_set1_epi32(
-        ((b0 as u32) | ((b1 as u32) << 8) | ((b2 as u32) << 16) | ((b3 as u32) << 24)) as i32,
-    );
-    let shifted = _mm512_srlv_epi32(packed, shifts);
-    let idx = _mm512_and_si512(shifted, mask3);
-    let pos_part = _mm512_srli_epi32(idx, 1);
-    let min_part = _mm512_min_epu32(idx, one);
-    let neg_part = _mm512_sub_epi32(one, min_part);
-    let val_i = _mm512_sub_epi32(pos_part, neg_part);
-    let reserved = _mm512_cmpeq_epi32_mask(idx, mask3);
-    _mm512_cvtepi32_ps(_mm512_mask_mov_epi32(
-        val_i,
-        reserved,
-        _mm512_setzero_si512(),
-    ))
+    let vals: [f32; 16] = [
+        ternary_code_to_i8(b0) as f32,
+        ternary_code_to_i8(b0 >> 2) as f32,
+        ternary_code_to_i8(b0 >> 4) as f32,
+        ternary_code_to_i8(b0 >> 6) as f32,
+        ternary_code_to_i8(b1) as f32,
+        ternary_code_to_i8(b1 >> 2) as f32,
+        ternary_code_to_i8(b1 >> 4) as f32,
+        ternary_code_to_i8(b1 >> 6) as f32,
+        ternary_code_to_i8(b2) as f32,
+        ternary_code_to_i8(b2 >> 2) as f32,
+        ternary_code_to_i8(b2 >> 4) as f32,
+        ternary_code_to_i8(b2 >> 6) as f32,
+        ternary_code_to_i8(b3) as f32,
+        ternary_code_to_i8(b3 >> 2) as f32,
+        ternary_code_to_i8(b3 >> 4) as f32,
+        ternary_code_to_i8(b3 >> 6) as f32,
+    ];
+    _mm512_loadu_ps(vals.as_ptr())
 }
 
 // ─── AVX-512 Dequantization ─────────────────────────────────────────────
@@ -101,10 +116,11 @@ pub unsafe fn dequant_1bit_g128_avx512(
 ) -> KernelResult<()> {
     let expected_len = blocks.len() * QK1_0_G128;
     if output.len() < expected_len {
-        return Err(KernelError::BufferTooSmall {
-            needed: expected_len,
-            available: output.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "output",
+            expected_len,
+            output.len(),
+        ));
     }
 
     for (i, block) in blocks.iter().enumerate() {
@@ -144,32 +160,31 @@ pub unsafe fn gemv_tq2_0_g128_avx512_prefetch(
 ) -> KernelResult<()> {
     use oxibonsai_core::QK_TQ2_0_G128;
 
-    if k % QK_TQ2_0_G128 != 0 {
+    if !k.is_multiple_of(QK_TQ2_0_G128) {
         return Err(KernelError::NotBlockAligned {
             count: k,
             block_size: QK_TQ2_0_G128,
         });
     }
     if input.len() < k {
-        return Err(KernelError::DimensionMismatch {
-            expected: k,
-            got: input.len(),
-        });
+        return Err(KernelError::dimension_mismatch("input", k, input.len()));
     }
     if output.len() < n_rows {
-        return Err(KernelError::BufferTooSmall {
-            needed: n_rows,
-            available: output.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "output",
+            n_rows,
+            output.len(),
+        ));
     }
 
     let blocks_per_row = k / QK_TQ2_0_G128;
     let expected_blocks = n_rows * blocks_per_row;
     if blocks.len() < expected_blocks {
-        return Err(KernelError::BufferTooSmall {
-            needed: expected_blocks,
-            available: blocks.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "blocks",
+            expected_blocks,
+            blocks.len(),
+        ));
     }
 
     for (row, out) in output.iter_mut().enumerate().take(n_rows) {
@@ -241,32 +256,31 @@ pub unsafe fn gemv_1bit_g128_avx512(
     n_rows: usize,
     k: usize,
 ) -> KernelResult<()> {
-    if k % QK1_0_G128 != 0 {
+    if !k.is_multiple_of(QK1_0_G128) {
         return Err(KernelError::NotBlockAligned {
             count: k,
             block_size: QK1_0_G128,
         });
     }
     if input.len() < k {
-        return Err(KernelError::DimensionMismatch {
-            expected: k,
-            got: input.len(),
-        });
+        return Err(KernelError::dimension_mismatch("input", k, input.len()));
     }
     if output.len() < n_rows {
-        return Err(KernelError::BufferTooSmall {
-            needed: n_rows,
-            available: output.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "output",
+            n_rows,
+            output.len(),
+        ));
     }
 
     let blocks_per_row = k / QK1_0_G128;
     let expected_blocks = n_rows * blocks_per_row;
     if blocks.len() < expected_blocks {
-        return Err(KernelError::BufferTooSmall {
-            needed: expected_blocks,
-            available: blocks.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "blocks",
+            expected_blocks,
+            blocks.len(),
+        ));
     }
 
     for row in 0..n_rows {
@@ -323,32 +337,31 @@ pub unsafe fn gemm_1bit_g128_avx512(
     n_rows: usize,
     k: usize,
 ) -> KernelResult<()> {
-    if k % QK1_0_G128 != 0 {
+    if !k.is_multiple_of(QK1_0_G128) {
         return Err(KernelError::NotBlockAligned {
             count: k,
             block_size: QK1_0_G128,
         });
     }
     if input.len() < m * k {
-        return Err(KernelError::DimensionMismatch {
-            expected: m * k,
-            got: input.len(),
-        });
+        return Err(KernelError::dimension_mismatch("input", m * k, input.len()));
     }
     if output.len() < m * n_rows {
-        return Err(KernelError::BufferTooSmall {
-            needed: m * n_rows,
-            available: output.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "output",
+            m * n_rows,
+            output.len(),
+        ));
     }
 
     let blocks_per_row = k / QK1_0_G128;
     let expected_blocks = n_rows * blocks_per_row;
     if blocks.len() < expected_blocks {
-        return Err(KernelError::BufferTooSmall {
-            needed: expected_blocks,
-            available: blocks.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "blocks",
+            expected_blocks,
+            blocks.len(),
+        ));
     }
 
     for mi in 0..m {
@@ -446,32 +459,31 @@ pub unsafe fn gemv_1bit_g128_avx512_streaming(
     n_rows: usize,
     k: usize,
 ) -> KernelResult<()> {
-    if k % QK1_0_G128 != 0 {
+    if !k.is_multiple_of(QK1_0_G128) {
         return Err(KernelError::NotBlockAligned {
             count: k,
             block_size: QK1_0_G128,
         });
     }
     if input.len() < k {
-        return Err(KernelError::DimensionMismatch {
-            expected: k,
-            got: input.len(),
-        });
+        return Err(KernelError::dimension_mismatch("input", k, input.len()));
     }
     if output.len() < n_rows {
-        return Err(KernelError::BufferTooSmall {
-            needed: n_rows,
-            available: output.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "output",
+            n_rows,
+            output.len(),
+        ));
     }
 
     let blocks_per_row = k / QK1_0_G128;
     let expected_blocks = n_rows * blocks_per_row;
     if blocks.len() < expected_blocks {
-        return Err(KernelError::BufferTooSmall {
-            needed: expected_blocks,
-            available: blocks.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "blocks",
+            expected_blocks,
+            blocks.len(),
+        ));
     }
 
     // Process rows in groups of 16 for streaming stores
@@ -521,7 +533,7 @@ pub unsafe fn gemv_1bit_g128_avx512_streaming(
         let group_vec = _mm512_loadu_ps(group_results.as_ptr());
         let out_ptr = output.as_mut_ptr().add(base_row);
         // Check alignment for streaming store
-        if (out_ptr as usize) % 64 == 0 {
+        if (out_ptr as usize).is_multiple_of(64) {
             _mm512_stream_ps(out_ptr, group_vec);
         } else {
             _mm512_storeu_ps(out_ptr, group_vec);
@@ -579,32 +591,31 @@ pub unsafe fn gemv_1bit_g128_avx512_prefetch(
     n_rows: usize,
     k: usize,
 ) -> KernelResult<()> {
-    if k % QK1_0_G128 != 0 {
+    if !k.is_multiple_of(QK1_0_G128) {
         return Err(KernelError::NotBlockAligned {
             count: k,
             block_size: QK1_0_G128,
         });
     }
     if input.len() < k {
-        return Err(KernelError::DimensionMismatch {
-            expected: k,
-            got: input.len(),
-        });
+        return Err(KernelError::dimension_mismatch("input", k, input.len()));
     }
     if output.len() < n_rows {
-        return Err(KernelError::BufferTooSmall {
-            needed: n_rows,
-            available: output.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "output",
+            n_rows,
+            output.len(),
+        ));
     }
 
     let blocks_per_row = k / QK1_0_G128;
     let expected_blocks = n_rows * blocks_per_row;
     if blocks.len() < expected_blocks {
-        return Err(KernelError::BufferTooSmall {
-            needed: expected_blocks,
-            available: blocks.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "blocks",
+            expected_blocks,
+            blocks.len(),
+        ));
     }
 
     for row in 0..n_rows {
@@ -661,11 +672,13 @@ pub unsafe fn gemv_1bit_g128_avx512_prefetch(
 ///
 /// Decodes 2-bit ternary codes (4 per byte, 32 bytes per block = 128 weights)
 /// and scales by the block's FP16 scale factor. Processes 16 weights per
-/// AVX-512 iteration (4 bytes → 16 lanes via pure SIMD arithmetic decode).
+/// AVX-512 iteration (4 bytes → 16 lanes).
 ///
-/// Uses pure SIMD arithmetic decode: packs 4 bytes into a broadcast i32,
-/// extracts each 2-bit code via variable shifts, then computes
-/// `val = (idx >> 1) - (1 - min(idx, 1))` giving -1/0/+1 without branches.
+/// Decode is routed through the single shared
+/// [`decode_4bytes_avx512_to_f32x16`] helper (K-01), which calls
+/// [`oxibonsai_core::ternary_code_to_i8`] per lane rather than re-deriving
+/// the map with SIMD arithmetic — this is what makes it impossible for this
+/// tier to drift from the reference decode.
 ///
 /// # Safety
 /// Requires AVX-512F + AVX-512BW + AVX-512VL CPU support.
@@ -678,16 +691,12 @@ pub unsafe fn dequant_tq2_0_g128_avx512(
     use oxibonsai_core::QK_TQ2_0_G128;
     let needed = blocks.len() * QK_TQ2_0_G128;
     if output.len() < needed {
-        return Err(KernelError::BufferTooSmall {
+        return Err(KernelError::buffer_too_small(
+            "output",
             needed,
-            available: output.len(),
-        });
+            output.len(),
+        ));
     }
-
-    // Hoist loop-invariant SIMD constants outside all loops
-    let one = _mm512_set1_epi32(1);
-    let shifts = _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30);
-    let mask3 = _mm512_set1_epi32(3);
 
     for (bi, block) in blocks.iter().enumerate() {
         let d = block.d.to_f32();
@@ -702,21 +711,12 @@ pub unsafe fn dequant_tq2_0_g128_avx512(
             let b2 = block.qs[chunk * 4 + 2];
             let b3 = block.qs[chunk * 4 + 3];
 
-            // Pack 4 bytes into one u32, then broadcast to all 16 lanes
-            let bb = (b0 as u32) | ((b1 as u32) << 8) | ((b2 as u32) << 16) | ((b3 as u32) << 24);
-            let packed = _mm512_set1_epi32(bb as i32);
-
-            // Per-lane variable shifts to extract each 2-bit code
-            let shifted = _mm512_srlv_epi32(packed, shifts);
-            let idx = _mm512_and_si512(shifted, mask3);
-
-            // Arithmetic decode: val = (idx >> 1) - (1 - min(idx, 1))
-            // idx=0 → -1;  idx=1 → 0;  idx=2 → +1
-            let pos_part = _mm512_srli_epi32(idx, 1);
-            let min_part = _mm512_min_epu32(idx, one);
-            let neg_part = _mm512_sub_epi32(one, min_part);
-            let val_i = _mm512_sub_epi32(pos_part, neg_part);
-            let val_f = _mm512_cvtepi32_ps(val_i);
+            // K-01: this used to be an unmasked inline copy of the decode
+            // (pos_part/min_part/neg_part with no `0b11` guard), so a
+            // reserved code decoded to +1 here while every other ternary
+            // kernel decoded it to 0. Routing through the single shared
+            // helper makes that divergence structurally impossible.
+            let val_f = decode_4bytes_avx512_to_f32x16(b0, b1, b2, b3);
 
             let result = _mm512_mul_ps(scale, val_f);
             _mm512_storeu_ps(output.as_mut_ptr().add(base + chunk * 16), result);
@@ -729,12 +729,12 @@ pub unsafe fn dequant_tq2_0_g128_avx512(
 /// AVX-512 accelerated GEMV for TQ2\_0\_g128-quantized weight matrices.
 ///
 /// Computes `output[row] = dot(weight_row, input)` for each row.
-/// Processes 16 weights per iteration (4 bytes decoded via pure SIMD arithmetic)
-/// and accumulates with `_mm512_fmadd_ps`.
+/// Processes 16 weights per iteration (4 bytes decoded via the shared
+/// helper) and accumulates with `_mm512_fmadd_ps`.
 ///
-/// Uses pure SIMD arithmetic decode: packs 4 bytes into a broadcast i32,
-/// extracts each 2-bit code via variable shifts, then computes
-/// `val = (idx >> 1) - (1 - min(idx, 1))` giving -1/0/+1 without branches.
+/// Decode is routed through the single shared
+/// [`decode_4bytes_avx512_to_f32x16`] helper (K-01) — see the dequant
+/// function above for why.
 ///
 /// # Safety
 /// Requires AVX-512F + AVX-512BW + AVX-512VL CPU support.
@@ -749,38 +749,32 @@ pub unsafe fn gemv_tq2_0_g128_avx512(
 ) -> KernelResult<()> {
     use oxibonsai_core::QK_TQ2_0_G128;
 
-    if k % QK_TQ2_0_G128 != 0 {
+    if !k.is_multiple_of(QK_TQ2_0_G128) {
         return Err(KernelError::NotBlockAligned {
             count: k,
             block_size: QK_TQ2_0_G128,
         });
     }
     if input.len() < k {
-        return Err(KernelError::DimensionMismatch {
-            expected: k,
-            got: input.len(),
-        });
+        return Err(KernelError::dimension_mismatch("input", k, input.len()));
     }
     if output.len() < n_rows {
-        return Err(KernelError::BufferTooSmall {
-            needed: n_rows,
-            available: output.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "output",
+            n_rows,
+            output.len(),
+        ));
     }
 
     let blocks_per_row = k / QK_TQ2_0_G128;
     let expected_blocks = n_rows * blocks_per_row;
     if blocks.len() < expected_blocks {
-        return Err(KernelError::BufferTooSmall {
-            needed: expected_blocks,
-            available: blocks.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "blocks",
+            expected_blocks,
+            blocks.len(),
+        ));
     }
-
-    // Hoist loop-invariant SIMD constants outside all loops
-    let one = _mm512_set1_epi32(1);
-    let shifts = _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30);
-    let mask3 = _mm512_set1_epi32(3);
 
     for row in 0..n_rows {
         let row_blocks = &blocks[row * blocks_per_row..(row + 1) * blocks_per_row];
@@ -799,21 +793,9 @@ pub unsafe fn gemv_tq2_0_g128_avx512(
                 let b2 = block.qs[chunk * 4 + 2];
                 let b3 = block.qs[chunk * 4 + 3];
 
-                // Pack 4 bytes into one u32, then broadcast to all 16 lanes
-                let bb =
-                    (b0 as u32) | ((b1 as u32) << 8) | ((b2 as u32) << 16) | ((b3 as u32) << 24);
-                let packed = _mm512_set1_epi32(bb as i32);
-
-                // Per-lane variable shifts to extract each 2-bit code
-                let shifted = _mm512_srlv_epi32(packed, shifts);
-                let idx = _mm512_and_si512(shifted, mask3);
-
-                // Arithmetic decode: val = (idx >> 1) - (1 - min(idx, 1))
-                let pos_part = _mm512_srli_epi32(idx, 1);
-                let min_part = _mm512_min_epu32(idx, one);
-                let neg_part = _mm512_sub_epi32(one, min_part);
-                let val_i = _mm512_sub_epi32(pos_part, neg_part);
-                let val_f = _mm512_cvtepi32_ps(val_i);
+                // K-01: routed through the single shared decode helper
+                // (previously an unmasked inline copy; see dequant above).
+                let val_f = decode_4bytes_avx512_to_f32x16(b0, b1, b2, b3);
 
                 let inp_vec = _mm512_loadu_ps(input.as_ptr().add(inp_base + chunk * 16));
                 block_acc = _mm512_fmadd_ps(val_f, inp_vec, block_acc);
@@ -831,11 +813,11 @@ pub unsafe fn gemv_tq2_0_g128_avx512(
 /// AVX-512 accelerated GEMM for TQ2\_0\_g128-quantized weight matrices.
 ///
 /// Computes `output[m, n] = sum_k(weight[n, k] * input[m, k])` for each (m, n) pair.
-/// Iterates over batch dimension `m`, using per-row GEMV logic with pure SIMD decode.
+/// Iterates over batch dimension `m`, using per-row GEMV logic.
 ///
-/// Uses pure SIMD arithmetic decode: packs 4 bytes into a broadcast i32,
-/// extracts each 2-bit code via variable shifts, then computes
-/// `val = (idx >> 1) - (1 - min(idx, 1))` giving -1/0/+1 without branches.
+/// Decode is routed through the single shared
+/// [`decode_4bytes_avx512_to_f32x16`] helper (K-01) — see the dequant
+/// function above for why.
 ///
 /// # Safety
 /// Requires AVX-512F + AVX-512BW + AVX-512VL CPU support.
@@ -851,38 +833,32 @@ pub unsafe fn gemm_tq2_0_g128_avx512(
 ) -> KernelResult<()> {
     use oxibonsai_core::QK_TQ2_0_G128;
 
-    if k % QK_TQ2_0_G128 != 0 {
+    if !k.is_multiple_of(QK_TQ2_0_G128) {
         return Err(KernelError::NotBlockAligned {
             count: k,
             block_size: QK_TQ2_0_G128,
         });
     }
     if input.len() < m * k {
-        return Err(KernelError::DimensionMismatch {
-            expected: m * k,
-            got: input.len(),
-        });
+        return Err(KernelError::dimension_mismatch("input", m * k, input.len()));
     }
     if output.len() < m * n_rows {
-        return Err(KernelError::BufferTooSmall {
-            needed: m * n_rows,
-            available: output.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "output",
+            m * n_rows,
+            output.len(),
+        ));
     }
 
     let blocks_per_row = k / QK_TQ2_0_G128;
     let expected_blocks = n_rows * blocks_per_row;
     if blocks.len() < expected_blocks {
-        return Err(KernelError::BufferTooSmall {
-            needed: expected_blocks,
-            available: blocks.len(),
-        });
+        return Err(KernelError::buffer_too_small(
+            "blocks",
+            expected_blocks,
+            blocks.len(),
+        ));
     }
-
-    // Hoist loop-invariant SIMD constants outside all loops
-    let one = _mm512_set1_epi32(1);
-    let shifts = _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30);
-    let mask3 = _mm512_set1_epi32(3);
 
     for mi in 0..m {
         let input_row = &input[mi * k..];
@@ -902,23 +878,13 @@ pub unsafe fn gemm_tq2_0_g128_avx512(
                     let b2 = block.qs[chunk * 4 + 2];
                     let b3 = block.qs[chunk * 4 + 3];
 
-                    // Pack 4 bytes into one u32, then broadcast to all 16 lanes
-                    let bb = (b0 as u32)
-                        | ((b1 as u32) << 8)
-                        | ((b2 as u32) << 16)
-                        | ((b3 as u32) << 24);
-                    let packed = _mm512_set1_epi32(bb as i32);
-
-                    // Per-lane variable shifts to extract each 2-bit code
-                    let shifted = _mm512_srlv_epi32(packed, shifts);
-                    let idx = _mm512_and_si512(shifted, mask3);
-
-                    // Arithmetic decode: val = (idx >> 1) - (1 - min(idx, 1))
-                    let pos_part = _mm512_srli_epi32(idx, 1);
-                    let min_part = _mm512_min_epu32(idx, one);
-                    let neg_part = _mm512_sub_epi32(one, min_part);
-                    let val_i = _mm512_sub_epi32(pos_part, neg_part);
-                    let val_f = _mm512_cvtepi32_ps(val_i);
+                    // K-01: this used to be an unmasked inline copy of the
+                    // decode (pos_part/min_part/neg_part with no `0b11`
+                    // guard), so a reserved code decoded to +1 here while
+                    // every other ternary kernel decoded it to 0. Routing
+                    // through the single shared helper makes that
+                    // divergence structurally impossible.
+                    let val_f = decode_4bytes_avx512_to_f32x16(b0, b1, b2, b3);
 
                     let inp_vec = _mm512_loadu_ps(input_row.as_ptr().add(inp_base + chunk * 16));
                     block_acc = _mm512_fmadd_ps(val_f, inp_vec, block_acc);
@@ -1193,6 +1159,52 @@ mod tests {
         oxibonsai_core::BlockTQ2_0_g128 {
             qs,
             d: f16::from_f32(scale),
+        }
+    }
+
+    /// K-01 anti-drift guard: exhaustively checks every one of the 256
+    /// possible values of each of `b0..b3` (each mapping to its own group
+    /// of 4 lanes) against [`oxibonsai_core::ternary_code_to_i8`]. The four
+    /// bytes decode independently (no cross-term), so pinning the other
+    /// three bytes at a fixed value while sweeping the full `0..=255` range
+    /// of the byte under test is exhaustive, not merely a sample. A future
+    /// re-vectorization of `decode_4bytes_avx512_to_f32x16` that
+    /// reintroduces hand-rolled SIMD arithmetic (instead of calling the
+    /// shared table) fails this the moment it disagrees, including on the
+    /// reserved `0b11` code.
+    #[test]
+    fn decode_4bytes_avx512_to_f32x16_matches_ternary_code_to_i8_exhaustively() {
+        if !has_avx512() {
+            return;
+        }
+        let assert_lanes = |b0: u8, b1: u8, b2: u8, b3: u8| {
+            let decoded = unsafe { decode_4bytes_avx512_to_f32x16(b0, b1, b2, b3) };
+            let mut lanes = [0.0f32; 16];
+            unsafe { _mm512_storeu_ps(lanes.as_mut_ptr(), decoded) };
+            for (group, byte) in [b0, b1, b2, b3].into_iter().enumerate() {
+                for (lane, &got) in lanes[group * 4..group * 4 + 4].iter().enumerate() {
+                    let expected = oxibonsai_core::ternary_code_to_i8(byte >> (lane * 2)) as f32;
+                    assert_eq!(
+                        got,
+                        expected,
+                        "decode_4bytes_avx512_to_f32x16({b0:#04x},{b1:#04x},{b2:#04x},{b3:#04x}) \
+                         lane {} (byte group {group}={byte:#04x}): got {got}, expected {expected}",
+                        group * 4 + lane
+                    );
+                }
+            }
+        };
+        for b0 in 0..=255u8 {
+            assert_lanes(b0, 0x00, 0x00, 0x00);
+        }
+        for b1 in 0..=255u8 {
+            assert_lanes(0x00, b1, 0x00, 0x00);
+        }
+        for b2 in 0..=255u8 {
+            assert_lanes(0x00, 0x00, b2, 0x00);
+        }
+        for b3 in 0..=255u8 {
+            assert_lanes(0x00, 0x00, 0x00, b3);
         }
     }
 

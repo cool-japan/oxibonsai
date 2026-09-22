@@ -89,5 +89,6 @@ pub use pipeline::{
     text_to_image, GoldenOverride, PipelineError, TeSource, TextToImageCfg, TextToImageOut,
 };
 pub use png::{encode_rgb8, PngError, PngResult};
+pub use session::Backend;
 pub use session::{ImageSession, RenderOutcome, RenderParams, StageTimings};
 pub use weights::{Bf16Tensor, DitWeights, QuantizedLinear};

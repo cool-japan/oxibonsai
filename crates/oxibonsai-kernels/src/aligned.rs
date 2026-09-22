@@ -151,7 +151,10 @@ impl std::fmt::Debug for AlignedBuffer {
         f.debug_struct("AlignedBuffer")
             .field("len", &self.len)
             .field("alignment", &ALIGNMENT)
-            .field("aligned", &(self.as_ptr() as usize % ALIGNMENT == 0))
+            .field(
+                "aligned",
+                &(self.as_ptr() as usize).is_multiple_of(ALIGNMENT),
+            )
             .finish()
     }
 }

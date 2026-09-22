@@ -311,7 +311,12 @@ fn sampling_params_default_values() {
     assert!((params.temperature - 0.7).abs() < f32::EPSILON);
     assert_eq!(params.top_k, 40);
     assert!((params.top_p - 0.9).abs() < f32::EPSILON);
-    assert!((params.repetition_penalty - 1.1).abs() < f32::EPSILON);
+    // Gate-fix triage (wave 3), gatekeeper REQUIRED#1(a): the previous
+    // `1.1` default silently disqualified every plain `temperature: 0`
+    // request from the fused GPU argmax path (`greedy_gpu_eligible`
+    // requires `repetition_penalty == 1.0`); the fixed default carries no
+    // hidden penalty.
+    assert!((params.repetition_penalty - 1.0).abs() < f32::EPSILON);
 }
 
 #[test]

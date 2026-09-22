@@ -24,7 +24,7 @@ fn default_args_sensible() {
     assert_eq!(result.max_tokens, 256);
     assert!((result.temperature - 0.7).abs() < f32::EPSILON);
     assert_eq!(result.seed, 42);
-    assert_eq!(result.host, "0.0.0.0");
+    assert_eq!(result.host, "127.0.0.1");
     assert_eq!(result.log_level, "info");
     assert!(result.model_path.is_none());
     assert!(result.tokenizer_path.is_none());
@@ -179,11 +179,84 @@ fn parse_all_flags_together() {
 
 #[test]
 fn default_server_args_matches_struct_default() {
-    // Ensure the Default impl matches what the spec says.
+    // Ensure the Default impl matches what the spec says. `host` is
+    // "127.0.0.1" (FIX2-SERVE item 5): the struct default now agrees with
+    // the real, effective bind default (`BindConfig::default()`) instead of
+    // the stale, never-reachable historical "0.0.0.0" literal.
     let d = ServerArgs::default();
-    assert_eq!(d.host, "0.0.0.0");
+    assert_eq!(d.host, "127.0.0.1");
     assert_eq!(d.port, 8080);
     assert_eq!(d.max_tokens, 256);
     assert_eq!(d.seed, 42);
     assert_eq!(d.log_level, "info");
+    // SV-26 / SV-28: off/unset by default.
+    assert!(!d.enable_ui);
+    assert!(d.max_output_tokens.is_none());
+}
+
+// ─── SV-26 / SV-28: --enable-ui / --max-output-tokens ──────────────────────
+
+#[test]
+fn enable_ui_flag_is_off_by_default_and_on_when_passed() {
+    let default = parse_args_from(&argv(&[]))
+        .expect("should parse")
+        .expect("should not be help/version");
+    assert!(!default.enable_ui, "the bundled chat UI must be opt-in");
+
+    let result = parse_args_from(&argv(&["--enable-ui"]))
+        .expect("should parse")
+        .expect("should not be help/version");
+    assert!(result.enable_ui);
+}
+
+#[test]
+fn max_output_tokens_flag_is_parsed() {
+    let result = parse_args_from(&argv(&["--max-output-tokens", "4096"]))
+        .expect("should parse")
+        .expect("should not be help/version");
+    assert_eq!(result.max_output_tokens, Some(4096));
+}
+
+#[test]
+fn max_output_tokens_flag_rejects_a_non_numeric_value() {
+    let err = parse_args_from(&argv(&["--max-output-tokens", "abc"]))
+        .expect_err("non-numeric value should yield an error");
+    match err {
+        ParseError::InvalidValue { ref option, .. } => {
+            assert_eq!(option, "--max-output-tokens");
+        }
+        other => panic!("expected InvalidValue, got {other:?}"),
+    }
+}
+
+#[test]
+fn max_output_tokens_flag_rejects_zero() {
+    // A zero ceiling used to parse successfully and get silently clamped to
+    // 1 downstream (`RouterOptions::with_max_output_tokens_ceiling`),
+    // rejecting every request outright instead of capping it -- refused at
+    // parse time now, the same discipline a per-request `max_tokens: 0`
+    // already gets.
+    let err = parse_args_from(&argv(&["--max-output-tokens", "0"]))
+        .expect_err("a zero ceiling should yield an error");
+    match err {
+        ParseError::InvalidValue {
+            ref option,
+            ref value,
+            ..
+        } => {
+            assert_eq!(option, "--max-output-tokens");
+            assert_eq!(value, "0");
+        }
+        other => panic!("expected InvalidValue, got {other:?}"),
+    }
+}
+
+#[test]
+fn max_output_tokens_flag_missing_value_errors() {
+    let err = parse_args_from(&argv(&["--max-output-tokens"]))
+        .expect_err("missing value should yield an error");
+    match err {
+        ParseError::MissingValue(ref flag) => assert_eq!(flag, "--max-output-tokens"),
+        other => panic!("expected MissingValue, got {other:?}"),
+    }
 }

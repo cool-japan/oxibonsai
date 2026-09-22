@@ -1,3 +1,4 @@
+#![cfg(feature = "training")]
 //! Integration tests for SmoothQuant FP8 calibrator and channel-aware quantization.
 //!
 //! Tests cover:

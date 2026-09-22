@@ -78,7 +78,7 @@ pub fn try_cuda_prefill_k_quant(
     }
 
     // K-quant requires hidden_size to be a multiple of 256 (= QK_K).
-    if hidden_size % 256 != 0 {
+    if !hidden_size.is_multiple_of(256) {
         return Err(CudaGraphError::WeightLayoutError(format!(
             "K-quant prefill: hidden_size={hidden_size} must be a multiple of 256"
         )));

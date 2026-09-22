@@ -2,9 +2,15 @@
 //!
 //! This module defines the [`GpuBackendTrait`] trait and provides:
 //! - [`CpuBackend`]: Always-available CPU implementation (baseline)
-//! - `CudaBackend`: CUDA stub (feature = "cuda", compile-only placeholder)
-//! - `MetalBackend`: Metal stub (feature = "metal", target_os = "macos", compile-only placeholder)
 //! - `Scirs2Backend`: **Real** GPU backend via scirs2-core (feature = "gpu")
+//! - `NativeCudaBackend`: **Real** CUDA backend via cudarc (feature =
+//!   "native-cuda", Linux/Windows) — **UNVALIDATED on hardware**, this project
+//!   has no CUDA device, so every CUDA path is compile-checked only
+//! - [`kernel_artifact_cache`]: user-private, verified on-disk cache for
+//!   compiled kernel artifacts (PTX today)
+//! - [`cuda_graph_slot`]: identity key for the captured-CUDA-graph slot
+//! - [`cuda_device_negotiation`]: device-ordinal parsing and flash-attention
+//!   tile selection, kept `cfg`-free so it runs on every host
 //!
 //! # Architecture
 //! All GPU operations follow the same pattern:
@@ -14,8 +20,11 @@
 //! 4. Copy device → host
 //!
 //! The `Scirs2Backend` compiles Metal/CUDA kernels at runtime through
-//! scirs2-core and dispatches real GPU work.  Stub backends delegate to
-//! CPU operations.
+//! scirs2-core and dispatches real GPU work.  A backend that reports
+//! `is_accelerated() == false` is never selected (finding F7): the old
+//! `CudaBackend` / `MetalBackend` "stub" structs, which only re-emitted every
+//! op on the CPU behind a `warn!`, have been deleted and `select_backend`
+//! falls straight through to [`CpuBackend`].
 //!
 //! # Q1_0_g128 GPU acceleration
 //!
@@ -27,6 +36,7 @@
     any(target_os = "linux", target_os = "windows")
 ))]
 pub mod cuda_attn_kernels;
+pub mod cuda_device_negotiation;
 #[cfg(all(
     feature = "native-cuda",
     any(target_os = "linux", target_os = "windows")
@@ -52,6 +62,7 @@ pub mod cuda_full_layer;
     any(target_os = "linux", target_os = "windows")
 ))]
 pub mod cuda_graph;
+pub mod cuda_graph_slot;
 #[cfg(all(
     feature = "native-cuda",
     any(target_os = "linux", target_os = "windows")
@@ -117,6 +128,7 @@ pub mod cuda_q_std_prefill;
     any(target_os = "linux", target_os = "windows")
 ))]
 pub mod cuda_q_std_prefill_kernels;
+pub mod kernel_artifact_cache;
 pub mod kernel_sources;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod metal_dispatch;
@@ -183,7 +195,8 @@ pub use metal_prefill::{
     any(target_os = "linux", target_os = "windows")
 ))]
 pub use cuda_graph::{
-    try_cuda_ffn, try_cuda_qkv, CudaGraph, CudaGraphError, DitSingleBlockWeights, NativeCudaBackend,
+    cuda_init_attempts, try_cuda_ffn, try_cuda_qkv, CudaGraph, CudaGraphError,
+    DitSingleBlockWeights, FlashLargeConfig, NativeCudaBackend,
 };
 
 #[cfg(all(
@@ -715,193 +728,6 @@ impl GpuBackendTrait for CpuBackend {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// CudaBackend (stub, feature = "cuda")
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// CUDA backend stub — feature-gated, compile-only placeholder.
-///
-/// All operations delegate to `CpuBackend` and emit a `warn!` trace event.
-/// Use [`Scirs2Backend`] for real GPU acceleration.
-#[cfg(feature = "cuda")]
-pub struct CudaBackend {
-    /// Number of CUDA devices detected at construction time.
-    pub device_count: usize,
-    cpu_fallback: CpuBackend,
-}
-
-#[cfg(feature = "cuda")]
-impl CudaBackend {
-    /// Attempt to initialise the CUDA backend (stub).
-    pub fn new() -> Result<Self, GpuError> {
-        warn!("CudaBackend: CUDA stub active — no real GPU acceleration");
-        Ok(Self {
-            device_count: 1,
-            cpu_fallback: CpuBackend::new(),
-        })
-    }
-}
-
-#[cfg(feature = "cuda")]
-impl GpuBackendTrait for CudaBackend {
-    fn name(&self) -> &'static str {
-        "cuda"
-    }
-
-    fn is_accelerated(&self) -> bool {
-        false
-    }
-
-    fn device_count(&self) -> usize {
-        self.device_count
-    }
-
-    fn alloc(&self, size: usize, device_id: usize) -> Result<DeviceBuffer, GpuError> {
-        warn!("CudaBackend::alloc delegating to CPU fallback");
-        self.cpu_fallback.alloc(size, device_id)
-    }
-
-    fn host_to_device(&self, src: &[f32], device_id: usize) -> Result<DeviceBuffer, GpuError> {
-        warn!("CudaBackend::host_to_device delegating to CPU fallback");
-        self.cpu_fallback.host_to_device(src, device_id)
-    }
-
-    fn device_to_host(&self, buf: &DeviceBuffer) -> Result<Vec<f32>, GpuError> {
-        warn!("CudaBackend::device_to_host delegating to CPU fallback");
-        self.cpu_fallback.device_to_host(buf)
-    }
-
-    fn matvec(
-        &self,
-        a: &DeviceBuffer,
-        x: &DeviceBuffer,
-        m: usize,
-        k: usize,
-        device_id: usize,
-    ) -> Result<DeviceBuffer, GpuError> {
-        warn!("CudaBackend::matvec delegating to CPU fallback");
-        self.cpu_fallback.matvec(a, x, m, k, device_id)
-    }
-
-    fn relu(&self, x: &DeviceBuffer, device_id: usize) -> Result<DeviceBuffer, GpuError> {
-        warn!("CudaBackend::relu delegating to CPU fallback");
-        self.cpu_fallback.relu(x, device_id)
-    }
-
-    fn softmax(
-        &self,
-        x: &DeviceBuffer,
-        size: usize,
-        device_id: usize,
-    ) -> Result<DeviceBuffer, GpuError> {
-        warn!("CudaBackend::softmax delegating to CPU fallback");
-        self.cpu_fallback.softmax(x, size, device_id)
-    }
-
-    fn synchronize(&self, device_id: usize) -> Result<(), GpuError> {
-        warn!("CudaBackend::synchronize delegating to CPU fallback");
-        self.cpu_fallback.synchronize(device_id)
-    }
-
-    fn memory_info(&self, device_id: usize) -> Result<(usize, usize), GpuError> {
-        warn!("CudaBackend::memory_info delegating to CPU fallback");
-        self.cpu_fallback.memory_info(device_id)
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// MetalBackend (stub, feature = "metal", macOS only)
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Metal backend stub — feature-gated, macOS only, compile-only placeholder.
-///
-/// Use [`Scirs2Backend`] for real GPU acceleration.
-#[cfg(all(feature = "metal", target_os = "macos"))]
-pub struct MetalBackend {
-    /// Number of Metal devices detected at construction time.
-    pub device_count: usize,
-    cpu_fallback: CpuBackend,
-}
-
-#[cfg(all(feature = "metal", target_os = "macos"))]
-impl MetalBackend {
-    /// Attempt to initialise the Metal backend (stub).
-    pub fn new() -> Result<Self, GpuError> {
-        warn!("MetalBackend: Metal stub active — no real GPU acceleration");
-        Ok(Self {
-            device_count: 1,
-            cpu_fallback: CpuBackend::new(),
-        })
-    }
-}
-
-#[cfg(all(feature = "metal", target_os = "macos"))]
-impl GpuBackendTrait for MetalBackend {
-    fn name(&self) -> &'static str {
-        "metal"
-    }
-
-    fn is_accelerated(&self) -> bool {
-        false
-    }
-
-    fn device_count(&self) -> usize {
-        self.device_count
-    }
-
-    fn alloc(&self, size: usize, device_id: usize) -> Result<DeviceBuffer, GpuError> {
-        warn!("MetalBackend::alloc delegating to CPU fallback");
-        self.cpu_fallback.alloc(size, device_id)
-    }
-
-    fn host_to_device(&self, src: &[f32], device_id: usize) -> Result<DeviceBuffer, GpuError> {
-        warn!("MetalBackend::host_to_device delegating to CPU fallback");
-        self.cpu_fallback.host_to_device(src, device_id)
-    }
-
-    fn device_to_host(&self, buf: &DeviceBuffer) -> Result<Vec<f32>, GpuError> {
-        warn!("MetalBackend::device_to_host delegating to CPU fallback");
-        self.cpu_fallback.device_to_host(buf)
-    }
-
-    fn matvec(
-        &self,
-        a: &DeviceBuffer,
-        x: &DeviceBuffer,
-        m: usize,
-        k: usize,
-        device_id: usize,
-    ) -> Result<DeviceBuffer, GpuError> {
-        warn!("MetalBackend::matvec delegating to CPU fallback");
-        self.cpu_fallback.matvec(a, x, m, k, device_id)
-    }
-
-    fn relu(&self, x: &DeviceBuffer, device_id: usize) -> Result<DeviceBuffer, GpuError> {
-        warn!("MetalBackend::relu delegating to CPU fallback");
-        self.cpu_fallback.relu(x, device_id)
-    }
-
-    fn softmax(
-        &self,
-        x: &DeviceBuffer,
-        size: usize,
-        device_id: usize,
-    ) -> Result<DeviceBuffer, GpuError> {
-        warn!("MetalBackend::softmax delegating to CPU fallback");
-        self.cpu_fallback.softmax(x, size, device_id)
-    }
-
-    fn synchronize(&self, device_id: usize) -> Result<(), GpuError> {
-        warn!("MetalBackend::synchronize delegating to CPU fallback");
-        self.cpu_fallback.synchronize(device_id)
-    }
-
-    fn memory_info(&self, device_id: usize) -> Result<(usize, usize), GpuError> {
-        warn!("MetalBackend::memory_info delegating to CPU fallback");
-        self.cpu_fallback.memory_info(device_id)
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
 // Scirs2BackendHandle (singleton wrapper)
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1075,13 +901,18 @@ impl GpuBackendTrait for Scirs2BackendHandle {
 ///
 /// Priority order (highest to lowest):
 /// 1. `Scirs2Backend` (feature = "gpu") — Metal-accelerated via scirs2-core
-/// 2. `NativeCudaBackend` (feature = "native-cuda") — direct cudarc CUDA
-/// 3. CUDA stub (feature = "cuda", no "native-cuda") — falls back to CPU
-/// 4. Metal stub (feature = "metal", macOS only) — falls back to CPU
-/// 5. [`CpuBackend`] (always available)
+/// 2. `NativeCudaBackend` (feature = "native-cuda", Linux/Windows) — direct
+///    cudarc CUDA; **UNVALIDATED on hardware** (compile-checked only)
+/// 3. [`CpuBackend`] (always available)
 ///
 /// If initialisation fails at any level the function falls through to the
 /// next option, ultimately always returning a functional `CpuBackend`.
+///
+/// Only *accelerated* backends are candidates (finding F7): the former tiers 3
+/// and 4 — the `CudaBackend` / `MetalBackend` stubs — reported
+/// `is_accelerated() == false` and delegated every operation back to
+/// `CpuBackend` behind a `warn!`, advertising acceleration that did not exist.
+/// Both types are gone and this falls straight to `CpuBackend`.
 pub fn select_backend() -> Box<dyn GpuBackendTrait> {
     // `select_backend` may be called several times in a process (model load,
     // engine init, tests). The "scirs2 not accelerated" / "init failed" warnings
@@ -1139,33 +970,10 @@ pub fn select_backend() -> Box<dyn GpuBackendTrait> {
         }
     }
 
-    // ── 3. CUDA stub ─────────────────────────────────────────────────────
-    #[cfg(feature = "cuda")]
-    {
-        match CudaBackend::new() {
-            Ok(b) => {
-                return Box::new(b);
-            }
-            Err(e) => {
-                warn!("select_backend: CUDA init failed ({e}), trying next");
-            }
-        }
-    }
-
-    // ── 3. Metal stub ───────────────────────────────────────────────────
-    #[cfg(all(feature = "metal", target_os = "macos"))]
-    {
-        match MetalBackend::new() {
-            Ok(b) => {
-                return Box::new(b);
-            }
-            Err(e) => {
-                warn!("select_backend: Metal init failed ({e}), trying CPU");
-            }
-        }
-    }
-
-    // ── 4. CPU fallback ─────────────────────────────────────────────────
+    // ── 3. CPU fallback ─────────────────────────────────────────────────
+    //
+    // No stub tier: a backend that is not accelerated must never be returned
+    // ahead of the CPU tier it would delegate to anyway (finding F7).
     Box::new(CpuBackend::new())
 }
 
@@ -1283,7 +1091,7 @@ fn cpu_gemv_1bit_fallback(
     n_rows: usize,
     k: usize,
 ) -> Result<Vec<f32>, GpuError> {
-    if k == 0 || k % 128 != 0 {
+    if k == 0 || !k.is_multiple_of(128) {
         return Err(GpuError::InvalidArgument(format!(
             "k={k} must be a positive multiple of 128"
         )));
@@ -1451,5 +1259,19 @@ mod tests {
         let input: Vec<f32> = vec![1.0_f32; 128];
         let result = gpu_gemv_1bit(&block, &input, 1, 128).expect("gpu_gemv_1bit");
         assert!((result[0] - 128.0).abs() < 1e-2, "got {}", result[0]);
+    }
+
+    /// Finding F7: `select_backend` must never hand back a backend that names
+    /// itself after an accelerator while reporting `is_accelerated() == false`
+    /// — the deleted `CudaBackend` / `MetalBackend` stubs did exactly that.
+    /// Either a genuinely accelerated backend, or the CPU tier.
+    #[test]
+    fn select_backend_returns_an_accelerated_backend_or_the_cpu_tier() {
+        let backend = select_backend();
+        assert!(
+            backend.is_accelerated() || backend.name() == "cpu",
+            "select_backend returned the non-accelerated backend {:?}",
+            backend.name()
+        );
     }
 }

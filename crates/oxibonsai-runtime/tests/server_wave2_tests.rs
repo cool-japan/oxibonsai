@@ -15,6 +15,11 @@
 //! handler wiring rather than model quality (the engine-level penalty/logprobs
 //! behavior is covered by `penalty_seam_tests.rs`).
 
+// The `server` module is only compiled with the `server` feature, so this
+// integration test must be gated the same way to keep `--no-default-features`
+// green.
+#![cfg(feature = "server")]
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
@@ -268,29 +273,41 @@ async fn base_non_stream_tools_are_processed() {
 /// them all.
 #[tokio::test]
 async fn error_envelope_is_uniform_across_routes() {
-    let cases: [(&str, serde_json::Value); 4] = [
+    let cases: [(&str, serde_json::Value, StatusCode); 4] = [
         (
             "/v1/chat/completions",
             serde_json::json!({"messages": [{"role": "user", "content": "x"}], "max_tokens": 0}),
+            StatusCode::BAD_REQUEST,
         ),
         (
             "/v1/completions",
             serde_json::json!({"prompt": "x", "max_tokens": 0}),
+            StatusCode::BAD_REQUEST,
         ),
         (
             "/v1/chat/completions/extended",
             serde_json::json!({"messages": [{"role": "user", "content": "x"}], "max_tokens": 0}),
+            StatusCode::BAD_REQUEST,
         ),
-        // Empty batch input → 422 with the same envelope (previously a body-less
-        // status code).
-        ("/v1/embeddings", serde_json::json!({"input": []})),
+        // D-1 (wave 2.5, gate-fix triage wave 3): the base server has no
+        // model-backed embedder installed
+        // (`create_embeddings_router_requiring_model`), so an
+        // otherwise-invalid empty-batch request never reaches the
+        // input-validation check at all -- `model_backend_required_but_missing`
+        // refuses it first, honestly, with `501 Not Implemented`. Still
+        // exercises the identical envelope shape every other route uses.
+        (
+            "/v1/embeddings",
+            serde_json::json!({"input": []}),
+            StatusCode::NOT_IMPLEMENTED,
+        ),
     ];
 
-    for (path, body) in cases {
+    for (path, body, expected_status) in cases {
         let (status, json) = post(test_router(), path, body).await;
-        assert!(
-            status.is_client_error(),
-            "{path} should be a client error, got {status}"
+        assert_eq!(
+            status, expected_status,
+            "{path} returned an unexpected status; body: {json}"
         );
         assert!(
             json["error"].is_object(),

@@ -1,4 +1,5 @@
-//! OxiBonsai — 1-bit LLM inference engine for Bonsai-8B.
+//! OxiBonsai — Pure Rust sub-2-bit LLM inference engine for PrismML Bonsai
+//! models.
 //!
 //! This binary is not functional on WASM targets; the WASM entry points
 //! are exposed via [`oxibonsai_runtime`] library APIs instead.
@@ -24,9 +25,17 @@ fn main() -> anyhow::Result<()> {
         Err(_) => { /* no .env found (or unreadable): silently continue */ }
     }
 
+    // Parse argv before building the tokio runtime. cli-24: this is what
+    // lets `apply_pre_runtime_env` set the `OXI_TE_GPU` env-var latch
+    // while this is still the only thread in the process — see that
+    // function's doc for why that matters.
+    use clap::Parser;
+    let cli = cli::Cli::parse();
+    cli::apply_pre_runtime_env(&cli);
+
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| anyhow::anyhow!("failed to build tokio runtime: {e}"))?
-        .block_on(cli::run())
+        .block_on(cli::run_with(cli))
 }

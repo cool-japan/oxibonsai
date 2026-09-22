@@ -250,15 +250,82 @@ mod tests {
     use crate::vae::conv::Conv2d;
     use crate::vae::ops::silu_inplace;
 
-    /// Pin this test process to the CPU conv path. The bit-identity contract
-    /// (module docs) is against the **untiled CPU decode**; the GPU implicit-GEMM
-    /// conv reassociates its f32 reduction shape-dependently, so GPU-tiled vs
-    /// GPU-untiled only matches to `cos ≈ 1` (asserted separately below). Safe
-    /// under nextest's process-per-test model: the `OXI_VAE_GPU` gate is a
-    /// `OnceLock` read on first conv use, and nothing in this process has run a
-    /// conv before the test body.
-    fn force_cpu_conv() {
-        std::env::set_var("OXI_VAE_GPU", "0");
+    /// Force (or, with `None`, decline to force) this thread's conv dispatch
+    /// decision for the life of the returned guard — the thread-safe,
+    /// non-sticky replacement for the `std::env::set_var("OXI_VAE_GPU", "0")`
+    /// this used to be (T-Missed-1). That approach broke under a shared-process
+    /// `cargo test` run: whichever GPU-conv-dispatch test happened to call
+    /// `vae_gpu_enabled` first (e.g. `vae::gpu::tests::
+    /// vae_gpu_enabled_by_default_when_env_unset`, alphabetically before this
+    /// module) cached the answer in a `OnceLock` for the rest of the process,
+    /// so a *later* `set_var` here was a silent no-op and the "CPU" arm of a
+    /// bit-exact CPU-vs-CPU comparison could actually run the GPU implicit-GEMM
+    /// conv (whose f32 reduction reassociates shape-dependently — see the
+    /// module docs), producing the 1-2 ulp deltas the two tests below guard
+    /// against. Neither `--test-threads=1` nor reordering test modules fixes
+    /// this (both were proven insufficient — the poisoning is about *which*
+    /// test runs first, not concurrency), so the real fix is a per-call,
+    /// never-cached override consulted before the `OnceLock`.
+    ///
+    /// The override is a **thread-local**, not a process-global atomic: an
+    /// earlier attempt at this fix used a process-wide atomic (mutex-guarded so
+    /// only one *forcing* test ran at a time), but that still let this
+    /// module's forced-CPU override leak into an unrelated, concurrently
+    /// running test elsewhere in `vae` that reads `vae_gpu_enabled` without
+    /// ever taking the mutex (e.g. `vae::resnet`'s / `vae::decoder`'s tiling
+    /// parity tests) — corrupting *their* bit-identity comparisons instead. A
+    /// thread-local override is read only on the thread that set it (`cargo
+    /// test` gives every test function its own fresh OS thread), so it cannot
+    /// leak into any other test regardless of what that test does or does not
+    /// opt into — see `crate::vae::gpu::set_conv_override`'s doc for the full
+    /// contract, including why holding the returned guard for this test's
+    /// *entire* body (not discarding it with a bare `force_conv_dispatch(..);`)
+    /// still matters (dropping it early un-forces the dispatch for the rest of
+    /// the test body).
+    ///
+    /// The Metal and CUDA VAE GPU backends are `target_os`-disjoint, so at
+    /// most one of the two `cfg`-gated arms below ever compiles; when *neither*
+    /// is compiled (the default, no-GPU-feature build) there is no GPU conv
+    /// path to force at all — the CPU path is already the only one that
+    /// exists — so the guard is a no-op zero-sized marker type (not `()`
+    /// itself, which would trip `clippy::let_unit_value` at the call sites).
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[must_use]
+    fn force_conv_dispatch(v: Option<bool>) -> crate::vae::gpu::ConvOverrideGuard {
+        crate::vae::gpu::set_conv_override(v)
+    }
+
+    #[cfg(all(
+        feature = "native-cuda",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    #[must_use]
+    fn force_conv_dispatch(v: Option<bool>) -> crate::vae::cuda_gpu::ConvOverrideGuard {
+        crate::vae::cuda_gpu::set_conv_override(v)
+    }
+
+    #[cfg(not(any(
+        all(feature = "metal", target_os = "macos"),
+        all(
+            feature = "native-cuda",
+            any(target_os = "linux", target_os = "windows")
+        )
+    )))]
+    struct NoGpuConvDispatchGuard;
+
+    // A distinct (non-`()`) zero-sized type, not just `()`, so
+    // `let _dispatch_guard = force_conv_dispatch(..)` at the call sites below
+    // does not trip `clippy::let_unit_value` in this configuration while still
+    // reading identically to the real guard types in the other two `cfg` arms.
+    #[cfg(not(any(
+        all(feature = "metal", target_os = "macos"),
+        all(
+            feature = "native-cuda",
+            any(target_os = "linux", target_os = "windows")
+        )
+    )))]
+    fn force_conv_dispatch(_v: Option<bool>) -> NoGpuConvDispatchGuard {
+        NoGpuConvDispatchGuard
     }
 
     #[test]
@@ -288,7 +355,7 @@ mod tests {
 
     #[test]
     fn tiled_conv_out_equals_untiled() {
-        force_cpu_conv();
+        let _dispatch_guard = force_conv_dispatch(Some(false));
         // Tiny deterministic test: 3 in-channels, 2 out-channels, 8x8 spatial.
         // k=3, pad=1. Tile with tile_px=4 forces a 2x2=4-tile grid.
         let in_c = 3usize;
@@ -344,7 +411,7 @@ mod tests {
     /// tiling must still be bit-identical to the untiled path.
     #[test]
     fn tiled_conv_out_equals_untiled_odd_tile_rows() {
-        force_cpu_conv();
+        let _dispatch_guard = force_conv_dispatch(Some(false));
         let in_c = 4usize;
         let out_c = 3usize;
         let h = 11usize;
@@ -386,8 +453,17 @@ mod tests {
     /// tiled and untiled outputs are only guaranteed to agree at ulp level
     /// (`cos ≈ 1`, per the module docs) — not bitwise. On the CPU path this
     /// tolerance check is subsumed by the exact-equality tests above.
+    ///
+    /// Deliberately does **not** force either dispatch (`force_conv_dispatch`
+    /// with `None`): the override is thread-local, so a concurrently-running
+    /// forced test on another thread could never leak into this one anyway —
+    /// the explicit `None` call just documents that this test wants the real
+    /// env-derived default (which would otherwise silently turn into a
+    /// CPU-vs-CPU comparison, passing for the wrong reason and no longer
+    /// testing the *default* dispatch its name promises).
     #[test]
     fn tiled_conv_out_matches_untiled_under_default_dispatch() {
+        let _dispatch_guard = force_conv_dispatch(None);
         let in_c = 3usize;
         let out_c = 2usize;
         let h = 8usize;

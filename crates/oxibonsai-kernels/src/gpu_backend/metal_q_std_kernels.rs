@@ -24,7 +24,7 @@ use std::sync::OnceLock;
 use metal::{CommandQueue, CompileOptions, ComputePipelineState, Device, MTLResourceOptions};
 
 use super::kernel_sources::{MSL_GEMV_Q4_0_V1, MSL_GEMV_Q8_0_V1};
-use super::metal_graph::MetalGraphError;
+use super::metal_graph::{commit_and_wait, MetalGraphError};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Constants
@@ -112,6 +112,35 @@ fn clone_err(e: &MetalGraphError) -> MetalGraphError {
         MetalGraphError::EncodingFailed(s) => MetalGraphError::EncodingFailed(s.clone()),
         MetalGraphError::ExecutionFailed(s) => MetalGraphError::ExecutionFailed(s.clone()),
         MetalGraphError::InvalidDimensions(s) => MetalGraphError::InvalidDimensions(s.clone()),
+        MetalGraphError::CommandBufferFailed {
+            what,
+            status,
+            error,
+        } => MetalGraphError::CommandBufferFailed {
+            what,
+            status: *status,
+            error: error.clone(),
+        },
+        MetalGraphError::BufferTooLarge {
+            what,
+            requested,
+            max,
+        } => MetalGraphError::BufferTooLarge {
+            what,
+            requested: *requested,
+            max: *max,
+        },
+        // FIX-06 / MET-02: `MetalGraphError` gained a typed
+        // `WeightKindMismatch` variant, and this hand-written clone is an
+        // exhaustive match, so it must name it. See the package deviations:
+        // all four copies of `clone_err` should be replaced by a `Clone`
+        // derive on `MetalGraphError` itself.
+        MetalGraphError::WeightKindMismatch { expected, found } => {
+            MetalGraphError::WeightKindMismatch {
+                expected: *expected,
+                found: *found,
+            }
+        }
     }
 }
 
@@ -188,7 +217,7 @@ fn dispatch_q_std_gemv(
     format: &str,
 ) -> Result<(), MetalGraphError> {
     // ── Validate dimensions ─────────────────────────────────────────────────
-    if k == 0 || k % Q_STD_BLOCK_K != 0 {
+    if k == 0 || !k.is_multiple_of(Q_STD_BLOCK_K) {
         return Err(MetalGraphError::EncodingFailed(format!(
             "{format} GEMV: k = {k} must be a non-zero multiple of {Q_STD_BLOCK_K}"
         )));
@@ -268,8 +297,7 @@ fn dispatch_q_std_gemv(
     encoder.dispatch_thread_groups(grid, tg_size);
     encoder.end_encoding();
 
-    cmd.commit();
-    cmd.wait_until_completed();
+    commit_and_wait(cmd, "metal_gemv_q_std")?;
 
     // ── Read output back ────────────────────────────────────────────────────
     unsafe {

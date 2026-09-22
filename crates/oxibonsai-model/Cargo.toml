@@ -17,6 +17,38 @@ categories = ["science", "algorithms"]
 wasm = []
 metal = ["oxibonsai-kernels/metal"]
 native-cuda = ["oxibonsai-kernels/native-cuda"]
+# Grouping criterion: every module gated here (calibration, compression,
+# disk_cache, gradient, smoothquant) is tested but not yet wired to a
+# production entry point in this crate — see each module's "## Reachability"
+# doc section. Not all of them are literally "training" code (disk_cache is
+# an on-disk tensor cache, compression is a prune-then-quantize pipeline);
+# the feature name reflects the training-and-checkpointing *theme* of the
+# not-yet-wired primitive set, not a claim that each module trains a model.
+# Off by default so the default build doesn't carry unreachable surface
+# area; enable to develop/test these primitives directly.
+training = []
+# Multi-device / multi-GPU simulation utilities (`multi_gpu`): a CPU-only
+# rayon simulation of sharding math, not a real NCCL/GPU backend. Off by
+# default for the same reason as `training`; see `multi_gpu`'s module docs.
+multi-device = []
+# Opt-in gate for the `[[bench]]` TARGET only (deps-16/FIX-01-BUILD, wave-1
+# addendum K-M1): `required-features = ["bench"]` below stops cargo from
+# building or running the `attention_bench` bench binary unless
+# `--features bench` is passed.
+#
+# CORRECTION (wave-3.5 re-review, matches oxibonsai-kernels/Cargo.toml): this
+# does NOT keep a C compiler out of the crate's dependency graph, despite an
+# earlier version of this comment claiming so. `criterion` 0.8.2 pulls in
+# `alloca` -> `cc` on unix unconditionally (`alloca`'s
+# `default-features = false` cannot drop that edge), and `criterion` is an
+# ordinary, always-resolved `[dev-dependencies]` entry — it is not itself
+# feature-gated, only the bench *target* that uses it is. A default
+# `cargo test` / `cargo check --all-targets` for this package still resolves
+# and compiles `criterion`/`alloca`/`cc`; `required-features = ["bench"]`
+# only stops the bench *sources* themselves from compiling without an
+# explicit opt-in. Run the bench with
+# `cargo bench -p oxibonsai-model --features bench`.
+bench = []
 
 [dependencies]
 oxibonsai-core.workspace = true
@@ -35,3 +67,10 @@ memmap2.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 serde_json.workspace = true
+criterion.workspace = true
+oxibonsai-testkit.workspace = true
+
+[[bench]]
+name = "attention_bench"
+harness = false
+required-features = ["bench"]

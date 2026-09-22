@@ -126,8 +126,11 @@ fn q2k_dequant_known_values() {
         },
         qs: {
             let mut q = [0u8; 64];
-            // First 16 weights in sub-block 0: set all to q=3 (binary 11)
-            // 4 weights per byte, each 2 bits = 0b11_11_11_11 = 0xFF
+            // ggml's Q2_K layout is bit-plane, not element-sequential: at
+            // shift=0, sub-block 0 (elements 0..16) reads one crumb from each
+            // of bytes qs[0..16]. Setting qs[0..4] = 0xFF gives crumb 3 (q=3)
+            // for elements 0..4 only; qs[4..16] stay 0, so elements 4..16
+            // decode with crumb 0.
             for item in q[..4].iter_mut() {
                 *item = 0xFF;
             }
@@ -142,11 +145,17 @@ fn q2k_dequant_known_values() {
 
     // Sub-block 0: w = d * scale * q - dmin * min = 0.5 * 2 * 3 - 0.25 * 1 = 2.75
     let expected = 0.5 * 2.0 * 3.0 - 0.25 * 1.0;
-    for (i, &val) in output[..16].iter().enumerate() {
+    for (i, &val) in output[..4].iter().enumerate() {
         assert!(
             (val - expected).abs() < 0.01,
-            "Q2_K known dequant: index {i}, expected {expected}, got {}",
-            val
+            "Q2_K known dequant: index {i}, expected {expected}, got {val}"
+        );
+    }
+    for (i, &val) in output[4..16].iter().enumerate() {
+        assert!(
+            (val + 0.25).abs() < 0.01,
+            "Q2_K known dequant: index {} expected -0.25 (d*sc*0 - dmin*mn = 1.0*0 - 0.25), got {val}",
+            i + 4
         );
     }
 
@@ -297,8 +306,12 @@ fn q4k_dequant_known_values() {
     // Upper bits are all 0 since sc/mn values fit in 4 bits
 
     let mut qs = [0u8; 128];
-    // Set first 32 weights (sub-block 0) to q=7
-    // 2 weights per byte: low nibble = 7, high nibble = 7 -> 0x77
+    // ggml's Q4_K layout emits 32 LOW nibbles then 32 HIGH nibbles per
+    // 64-element group: `qs[l] & 0xF` feeds elements 0..32, `qs[l] >> 4` feeds
+    // elements 32..64. Setting qs[0..16] = 0x77 gives nibble 7 (low AND high)
+    // for elements 0..16 (low-nibble pass) and 32..48 (high-nibble pass, but
+    // scale/min pair 1 is zero so those decode as 0 regardless); qs[16..32]
+    // stay 0, so elements 16..32 decode with nibble 0.
     for item in qs[..16].iter_mut() {
         *item = 0x77;
     }
@@ -315,11 +328,17 @@ fn q4k_dequant_known_values() {
 
     // Sub-block 0: w = d * sc * q - dmin * mn = 0.5 * 4 * 7 - 0.25 * 2 = 13.5
     let expected = 0.5 * 4.0 * 7.0 - 0.25 * 2.0;
-    for (i, &val) in output[..32].iter().enumerate() {
+    for (i, &val) in output[..16].iter().enumerate() {
         assert!(
             (val - expected).abs() < 0.01,
-            "Q4_K known dequant: index {i}, expected {expected}, got {}",
-            val
+            "Q4_K known dequant: index {i}, expected {expected}, got {val}"
+        );
+    }
+    for (i, &val) in output[16..32].iter().enumerate() {
+        assert!(
+            (val + 0.5).abs() < 0.01,
+            "Q4_K known dequant: index {} expected -0.5 (d1*0 - m1 = 2.0*0 - 0.5), got {val}",
+            i + 16
         );
     }
 

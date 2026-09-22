@@ -278,6 +278,29 @@ fn device_buffer_size() {
 // Q1_0_g128 GPU GEMV tests (CPU fallback path)
 // ===========================================================================
 
+/// Serializes every test below that calls [`gpu_gemv_1bit`].
+///
+/// Wave-1.5 addendum (3): under `--all-features` (or `--features metal`),
+/// `gpu_gemv_1bit` routes through `Scirs2Backend::global()` — the same
+/// process-global Metal state (`GLOBAL_METAL_GRAPH`) METAL-CONCURRENCY
+/// (wave 4) removes — so `cargo test`'s default in-binary thread
+/// parallelism let two of these tests race and intermittently observe each
+/// other's half-finished GPU state (symptom: "got 0 expected 8128", i.e. a
+/// GEMV result read before the corresponding command buffer completed).
+/// `cargo nextest` hides this (one process per test), and a plain
+/// `--test-threads=1` run doesn't reproduce it either, but the *default*
+/// `cargo test` invocation is real and part of this project's gate. The
+/// precedent for this exact fix is
+/// `crates/oxibonsai-model/tests/metal_prefill_ternary_parity_tests.rs::gpu_serial`
+/// (FIX-06-KERN-MODEL); once METAL-CONCURRENCY removes the singleton this
+/// helper (and every `let _gpu = gpu_serial();` call site below) can go.
+fn gpu_serial() -> std::sync::MutexGuard<'static, ()> {
+    static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GPU_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Helper: build a single BlockQ1_0G128 as raw bytes (18 bytes).
 fn make_q1_block(scale: f32, bits: [u8; 16]) -> Vec<u8> {
     let d = half::f16::from_f32(scale);
@@ -292,6 +315,7 @@ fn make_q1_block(scale: f32, bits: [u8; 16]) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 #[test]
 fn gemv_1bit_all_ones_scale_one() {
+    let _gpu = gpu_serial();
     let block = make_q1_block(1.0, [0xFF; 16]);
     let input: Vec<f32> = (0..128).map(|i| i as f32).collect();
     let expected: f32 = input.iter().sum(); // 8128
@@ -309,6 +333,7 @@ fn gemv_1bit_all_ones_scale_one() {
 // ---------------------------------------------------------------------------
 #[test]
 fn gemv_1bit_all_zeros_neg_sum() {
+    let _gpu = gpu_serial();
     let block = make_q1_block(1.0, [0x00; 16]);
     let input = vec![1.0_f32; 128];
     // all bits=0 → weight = -1 → output = -128
@@ -325,6 +350,7 @@ fn gemv_1bit_all_zeros_neg_sum() {
 // ---------------------------------------------------------------------------
 #[test]
 fn gemv_1bit_multi_row() {
+    let _gpu = gpu_serial();
     // 2 rows × k=128
     let row0 = make_q1_block(2.0, [0xFF; 16]); // +2 * input
     let row1 = make_q1_block(0.5, [0x00; 16]); // -0.5 * input
@@ -344,6 +370,7 @@ fn gemv_1bit_multi_row() {
 // ---------------------------------------------------------------------------
 #[test]
 fn gemv_1bit_two_blocks_per_row() {
+    let _gpu = gpu_serial();
     let b0 = make_q1_block(1.0, [0xFF; 16]); // bits=1 → +1
     let b1 = make_q1_block(1.0, [0x00; 16]); // bits=0 → -1
     let mut blocks = b0;
@@ -360,6 +387,7 @@ fn gemv_1bit_two_blocks_per_row() {
 // ---------------------------------------------------------------------------
 #[test]
 fn gemv_1bit_bad_k_not_multiple_128() {
+    let _gpu = gpu_serial();
     let result = gpu_gemv_1bit(&[], &[], 0, 64);
     assert!(result.is_err());
 }
@@ -369,6 +397,7 @@ fn gemv_1bit_bad_k_not_multiple_128() {
 // ---------------------------------------------------------------------------
 #[test]
 fn gemv_1bit_input_size_mismatch() {
+    let _gpu = gpu_serial();
     let block = make_q1_block(1.0, [0xFF; 16]);
     let input = vec![1.0_f32; 64]; // should be 128
     let result = gpu_gemv_1bit(&block, &input, 1, 128);

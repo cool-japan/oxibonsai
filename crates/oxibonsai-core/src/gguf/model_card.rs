@@ -5,9 +5,34 @@
 
 use std::collections::HashMap;
 
+use crate::gguf::metadata::{MetadataStore, MetadataValue};
+use crate::gguf::tensor_info::TensorStore;
+
 // ── Well-known GGUF metadata key names ──────────────────────────────────────
 
 /// Well-known GGUF metadata key names.
+///
+/// # A note on the `llm.*`-prefixed constants (core-gguf-13)
+///
+/// `CONTEXT_LENGTH`, `EMBEDDING_LENGTH`, `NUM_LAYERS`, `NUM_HEADS`,
+/// `NUM_KV_HEADS` and `ROPE_FREQ_BASE` below spell a literal `"llm."`
+/// prefix. **No real GGUF file has ever used that prefix** — the GGUF spec
+/// scopes these keys under the model's own `general.architecture` value
+/// (`qwen35.context_length`, `llama.context_length`, ...), never a generic
+/// `llm.` namespace. `VOCAB_SIZE` similarly names a key
+/// (`tokenizer.ggml.tokens_count`) that appears in no real GGUF file either
+/// — the vocabulary size is the length of the `tokenizer.ggml.tokens`
+/// array. These constants are kept, unchanged, purely because
+/// [`extract_model_card`] and `tests/model_card_tests.rs` (outside this
+/// package's owned files) are built around this flat, pre-stringified
+/// `HashMap<String, String>` API and its `llm.*`/`tokens_count` keys.
+///
+/// [`extract_model_card_from_gguf`] is the corrected extraction path: it
+/// reads a real [`MetadataStore`] and re-keys on `general.*` plus the
+/// file's actual `<architecture>.*` namespace (with an `llm.*` fallback
+/// for any tooling that predates this convention), and derives
+/// `vocab_size` from the tokens array's length instead of the
+/// nonexistent `tokens_count` key.
 pub mod keys {
     pub const MODEL_NAME: &str = "general.name";
     pub const ARCHITECTURE: &str = "general.architecture";
@@ -24,6 +49,46 @@ pub mod keys {
     pub const QUANTIZATION: &str = "general.quantization_version";
     pub const FILE_SIZE: &str = "general.file_size";
     pub const PARAMETER_COUNT: &str = "general.parameter_count";
+
+    // ── Keys used by `extract_model_card_from_gguf` only ───────────────────
+
+    /// `tokenizer.ggml.tokens` — the real vocabulary array; its length is
+    /// the true vocab size (no real file has a `tokens_count` scalar key).
+    pub const TOKENIZER_TOKENS: &str = "tokenizer.ggml.tokens";
+    /// `token_embd.weight`'s tensor name — a secondary vocab-size fallback
+    /// (its last shape dimension) for the rare file whose metadata omits
+    /// the tokens array entirely.
+    pub const TOKEN_EMBD_TENSOR: &str = "token_embd.weight";
+    /// `prism.hadamard.version` — present on PrismML Bonsai 2-family models
+    /// that fold a Hadamard rotation into their quantized weights.
+    pub const HADAMARD_VERSION: &str = "prism.hadamard.version";
+    /// `general.sampling.temp` — the model author's recommended sampling
+    /// temperature.
+    pub const SAMPLING_TEMP: &str = "general.sampling.temp";
+    /// `general.sampling.top_p`.
+    pub const SAMPLING_TOP_P: &str = "general.sampling.top_p";
+    /// `general.sampling.top_k`.
+    pub const SAMPLING_TOP_K: &str = "general.sampling.top_k";
+
+    /// Architecture-scoped key suffixes: the real on-disk key is
+    /// `"{architecture}.{suffix}"` (e.g. `qwen35.context_length`), where
+    /// `architecture` is `general.architecture`'s own value — never a
+    /// literal `"llm."` prefix.
+    pub mod arch_suffix {
+        pub const CONTEXT_LENGTH: &str = "context_length";
+        pub const EMBEDDING_LENGTH: &str = "embedding_length";
+        pub const BLOCK_COUNT: &str = "block_count";
+        pub const HEAD_COUNT: &str = "attention.head_count";
+        pub const HEAD_COUNT_KV: &str = "attention.head_count_kv";
+        pub const ROPE_FREQ_BASE: &str = "rope.freq_base";
+        /// Hybrid full-attention/recurrent architectures (e.g. `qwen35`):
+        /// every Nth layer is full attention, the rest are linear/recurrent.
+        pub const FULL_ATTENTION_INTERVAL: &str = "full_attention_interval";
+    }
+
+    /// The legacy generic prefix ([`super::keys`]'s own `CONTEXT_LENGTH`
+    /// etc. above) — tried only when the architecture-scoped key is absent.
+    pub const LEGACY_PREFIX: &str = "llm";
 }
 
 // ── Markdown rendering helpers ───────────────────────────────────────────────
@@ -98,6 +163,23 @@ pub struct ModelCard {
     pub quantization: Option<String>,
     /// Size of the GGUF file on disk, in bytes.
     pub file_size_bytes: Option<u64>,
+    /// `prism.hadamard.version`, when the file carries a PrismML Hadamard
+    /// rotation contract (Bonsai 2 / `qwen35`-family models). Populated
+    /// only by [`extract_model_card_from_gguf`].
+    pub hadamard_version: Option<u64>,
+    /// `<architecture>.full_attention_interval`, for a hybrid
+    /// attention/recurrent architecture. Populated only by
+    /// [`extract_model_card_from_gguf`].
+    pub full_attention_interval: Option<u64>,
+    /// `general.sampling.temp` — the model author's recommended sampling
+    /// temperature. Populated only by [`extract_model_card_from_gguf`].
+    pub sampling_temp: Option<f64>,
+    /// `general.sampling.top_p`. Populated only by
+    /// [`extract_model_card_from_gguf`].
+    pub sampling_top_p: Option<f64>,
+    /// `general.sampling.top_k`. Populated only by
+    /// [`extract_model_card_from_gguf`].
+    pub sampling_top_k: Option<u64>,
     /// Any metadata key-value pairs not covered by the typed fields above.
     pub extra_metadata: HashMap<String, String>,
 }
@@ -204,7 +286,40 @@ impl ModelCard {
             out.push_str(&render::table_row(&["Vocab Size", &vocab_str]));
         }
 
+        let interval_str;
+        if let Some(v) = self.full_attention_interval {
+            interval_str = v.to_string();
+            out.push_str(&render::table_row(&[
+                "Full Attention Interval",
+                &interval_str,
+            ]));
+        }
+
+        let hadamard_str;
+        if let Some(v) = self.hadamard_version {
+            hadamard_str = v.to_string();
+            out.push_str(&render::table_row(&["Hadamard Version", &hadamard_str]));
+        }
+
         out.push('\n');
+
+        // ── Sampling Defaults ──
+        if self.sampling_temp.is_some()
+            || self.sampling_top_p.is_some()
+            || self.sampling_top_k.is_some()
+        {
+            out.push_str(&render::heading(2, "Sampling Defaults"));
+            if let Some(v) = self.sampling_temp {
+                out.push_str(&render::field("Temperature", &format!("{v:.2}")));
+            }
+            if let Some(v) = self.sampling_top_p {
+                out.push_str(&render::field("Top-p", &format!("{v:.2}")));
+            }
+            if let Some(v) = self.sampling_top_k {
+                out.push_str(&render::field("Top-k", &v.to_string()));
+            }
+            out.push('\n');
+        }
 
         // ── Extra Metadata ──
         if !self.extra_metadata.is_empty() {
@@ -267,6 +382,12 @@ impl ModelCard {
             lines.push(format!("File Size: {v} bytes"));
         }
 
+        push_opt_num!("Full Attention Interval", self.full_attention_interval);
+        push_opt_num!("Hadamard Version", self.hadamard_version);
+        push_opt_num!("Sampling Temp", self.sampling_temp);
+        push_opt_num!("Sampling Top-p", self.sampling_top_p);
+        push_opt_num!("Sampling Top-k", self.sampling_top_k);
+
         if lines.is_empty() {
             lines.push("(no metadata available)".to_owned());
         }
@@ -291,6 +412,11 @@ impl ModelCard {
             && self.parameter_count_billions.is_none()
             && self.quantization.is_none()
             && self.file_size_bytes.is_none()
+            && self.hadamard_version.is_none()
+            && self.full_attention_interval.is_none()
+            && self.sampling_temp.is_none()
+            && self.sampling_top_p.is_none()
+            && self.sampling_top_k.is_none()
             && self.extra_metadata.is_empty()
     }
 
@@ -340,6 +466,21 @@ impl ModelCard {
             count += 1;
         }
         if self.file_size_bytes.is_some() {
+            count += 1;
+        }
+        if self.hadamard_version.is_some() {
+            count += 1;
+        }
+        if self.full_attention_interval.is_some() {
+            count += 1;
+        }
+        if self.sampling_temp.is_some() {
+            count += 1;
+        }
+        if self.sampling_top_p.is_some() {
+            count += 1;
+        }
+        if self.sampling_top_k.is_some() {
             count += 1;
         }
         count
@@ -460,6 +601,128 @@ pub fn extract_known_fields(metadata: &HashMap<String, String>) -> HashMap<Strin
         .collect()
 }
 
+// ── Public extraction API (real GGUF metadata) ───────────────────────────────
+
+/// Extract a [`ModelCard`] directly from a parsed GGUF file's metadata and
+/// tensor table (core-gguf-13).
+///
+/// This is the corrected extraction path. [`extract_model_card`] reads a
+/// flat, already-stringified `key -> value` map keyed on a literal `"llm."`
+/// prefix and a `tokenizer.ggml.tokens_count` scalar — neither of which any
+/// real GGUF file has ever used (every architecture scopes its keys under
+/// its own `general.architecture` value, and the vocabulary size is the
+/// length of the `tokenizer.ggml.tokens` array, not a separate count key).
+/// This function instead:
+///
+/// - re-keys on `general.*` plus the file's actual `<architecture>.*`
+///   namespace, falling back to the legacy `llm.*` spelling only as a last
+///   resort;
+/// - derives `vocab_size` from `tokenizer.ggml.tokens`'s array length,
+///   falling back to `token_embd.weight`'s last shape dimension for a file
+///   whose metadata omits the tokens array;
+/// - derives `quantization` from the tensor table's dominant quantization
+///   type (e.g. `"PQ2_0"`), which is always present, rather than the
+///   numeric `general.quantization_version` the old flat-map key actually
+///   names;
+/// - surfaces `prism.hadamard.version`, `<architecture>.full_attention_interval`
+///   and `general.sampling.{temp,top_p,top_k}`, none of which the flat-map
+///   API has fields for;
+/// - populates `file_size_bytes` from `file_len` directly (there is no
+///   real `general.file_size` metadata key to read it from).
+///
+/// `extra_metadata` collects every other **scalar** metadata entry
+/// (arrays — `tokenizer.ggml.tokens`, `prism.hadamard.sign_values`, ... —
+/// are deliberately excluded; a model card is not the place to dump a
+/// quarter-million-entry token list).
+pub fn extract_model_card_from_gguf(
+    metadata: &MetadataStore,
+    file_len: Option<u64>,
+    tensors: &TensorStore,
+) -> ModelCard {
+    let mut card = ModelCard::new();
+
+    card.model_name = metadata_str(metadata, keys::MODEL_NAME);
+    let architecture = metadata_str(metadata, keys::ARCHITECTURE);
+    card.author = metadata_str(metadata, keys::AUTHOR);
+    card.license = metadata_str(metadata, keys::LICENSE);
+    card.description = metadata_str(metadata, keys::DESCRIPTION);
+
+    card.context_length = arch_or_legacy_u64(
+        metadata,
+        architecture.as_deref(),
+        keys::arch_suffix::CONTEXT_LENGTH,
+    );
+    card.embedding_length = arch_or_legacy_u64(
+        metadata,
+        architecture.as_deref(),
+        keys::arch_suffix::EMBEDDING_LENGTH,
+    );
+    card.num_layers = arch_or_legacy_u64(
+        metadata,
+        architecture.as_deref(),
+        keys::arch_suffix::BLOCK_COUNT,
+    );
+    card.num_heads = arch_or_legacy_u64(
+        metadata,
+        architecture.as_deref(),
+        keys::arch_suffix::HEAD_COUNT,
+    );
+    card.num_kv_heads = arch_or_legacy_u64(
+        metadata,
+        architecture.as_deref(),
+        keys::arch_suffix::HEAD_COUNT_KV,
+    );
+    card.rope_freq_base = arch_or_legacy_f64(
+        metadata,
+        architecture.as_deref(),
+        keys::arch_suffix::ROPE_FREQ_BASE,
+    );
+    card.full_attention_interval = arch_or_legacy_u64(
+        metadata,
+        architecture.as_deref(),
+        keys::arch_suffix::FULL_ATTENTION_INTERVAL,
+    );
+
+    card.hadamard_version = metadata
+        .get(keys::HADAMARD_VERSION)
+        .and_then(MetadataValue::as_u64);
+    card.sampling_temp = metadata
+        .get(keys::SAMPLING_TEMP)
+        .and_then(MetadataValue::as_f64);
+    card.sampling_top_p = metadata
+        .get(keys::SAMPLING_TOP_P)
+        .and_then(MetadataValue::as_f64);
+    card.sampling_top_k = metadata
+        .get(keys::SAMPLING_TOP_K)
+        .and_then(MetadataValue::as_u64);
+
+    card.vocab_size = metadata
+        .get_string_array(keys::TOKENIZER_TOKENS)
+        .ok()
+        .map(|tokens| tokens.len() as u64)
+        .or_else(|| {
+            tensors
+                .get(keys::TOKEN_EMBD_TENSOR)
+                .and_then(|info| info.shape.last().copied())
+        });
+
+    card.quantization = dominant_quant_type_name(tensors);
+    card.file_size_bytes = file_len;
+    card.architecture = architecture;
+
+    let known = known_key_set_for_gguf(card.architecture.as_deref());
+    for (k, v) in metadata.iter() {
+        if known.contains(k.as_str()) {
+            continue;
+        }
+        if let Some(s) = scalar_display_string(v) {
+            card.extra_metadata.insert(k.clone(), s);
+        }
+    }
+
+    card
+}
+
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
 /// The complete set of key strings defined in the [`keys`] module.
@@ -493,6 +756,139 @@ fn parse_u64(metadata: &HashMap<String, String>, key: &str) -> Option<u64> {
 /// Parse an `f64` from the given key in the metadata map.
 fn parse_f64(metadata: &HashMap<String, String>, key: &str) -> Option<f64> {
     metadata.get(key)?.trim().parse::<f64>().ok()
+}
+
+// ── Internal helpers (`extract_model_card_from_gguf` only) ──────────────────
+
+/// Build the real, on-disk key `"{architecture}.{suffix}"`.
+fn arch_key(architecture: &str, suffix: &str) -> String {
+    format!("{architecture}.{suffix}")
+}
+
+/// Build the legacy `"llm.{suffix}"` fallback key.
+fn legacy_key(suffix: &str) -> String {
+    format!("{}.{suffix}", keys::LEGACY_PREFIX)
+}
+
+/// Read a required-to-be-a-string metadata value.
+fn metadata_str(metadata: &MetadataStore, key: &str) -> Option<String> {
+    metadata
+        .get(key)
+        .and_then(MetadataValue::as_str)
+        .map(str::to_string)
+}
+
+/// Read a `u64` metadata value, trying `"{architecture}.{suffix}"` first
+/// and falling back to the legacy `"llm.{suffix}"` spelling.
+fn arch_or_legacy_u64(
+    metadata: &MetadataStore,
+    architecture: Option<&str>,
+    suffix: &str,
+) -> Option<u64> {
+    if let Some(arch) = architecture {
+        if let Some(v) = metadata
+            .get(&arch_key(arch, suffix))
+            .and_then(MetadataValue::as_u64)
+        {
+            return Some(v);
+        }
+    }
+    metadata
+        .get(&legacy_key(suffix))
+        .and_then(MetadataValue::as_u64)
+}
+
+/// `f64` counterpart of [`arch_or_legacy_u64`].
+fn arch_or_legacy_f64(
+    metadata: &MetadataStore,
+    architecture: Option<&str>,
+    suffix: &str,
+) -> Option<f64> {
+    if let Some(arch) = architecture {
+        if let Some(v) = metadata
+            .get(&arch_key(arch, suffix))
+            .and_then(MetadataValue::as_f64)
+        {
+            return Some(v);
+        }
+    }
+    metadata
+        .get(&legacy_key(suffix))
+        .and_then(MetadataValue::as_f64)
+}
+
+/// The tensor table's most common quantization type, by tensor count — a
+/// human-readable stand-in for "how is this model quantized" that is
+/// always present (unlike `general.quantization_version`, a numeric enum
+/// id the old flat-map `QUANTIZATION` key actually names, not a scheme
+/// string like `"Q4_K_M"`/`"PQ2_0"`).
+fn dominant_quant_type_name(tensors: &TensorStore) -> Option<String> {
+    tensors
+        .count_by_type()
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(ty, _)| ty.name().to_string())
+}
+
+/// Every metadata key `extract_model_card_from_gguf` already surfaces as a
+/// typed field, so `extra_metadata` does not duplicate it. Unlike
+/// [`known_key_set`] (the flat-map API's static set), this depends on the
+/// file's actual architecture string.
+fn known_key_set_for_gguf(architecture: Option<&str>) -> std::collections::HashSet<String> {
+    let mut set: std::collections::HashSet<String> = [
+        keys::MODEL_NAME,
+        keys::ARCHITECTURE,
+        keys::AUTHOR,
+        keys::LICENSE,
+        keys::DESCRIPTION,
+        keys::SAMPLING_TEMP,
+        keys::SAMPLING_TOP_P,
+        keys::SAMPLING_TOP_K,
+        keys::HADAMARD_VERSION,
+        keys::TOKENIZER_TOKENS,
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+
+    for suffix in [
+        keys::arch_suffix::CONTEXT_LENGTH,
+        keys::arch_suffix::EMBEDDING_LENGTH,
+        keys::arch_suffix::BLOCK_COUNT,
+        keys::arch_suffix::HEAD_COUNT,
+        keys::arch_suffix::HEAD_COUNT_KV,
+        keys::arch_suffix::ROPE_FREQ_BASE,
+        keys::arch_suffix::FULL_ATTENTION_INTERVAL,
+    ] {
+        set.insert(legacy_key(suffix));
+        if let Some(arch) = architecture {
+            set.insert(arch_key(arch, suffix));
+        }
+    }
+    set
+}
+
+/// Render a scalar [`MetadataValue`] as a display string for
+/// `extra_metadata`. Returns `None` for `Array` values: dumping a
+/// quarter-million-entry `tokenizer.ggml.tokens` or
+/// `prism.hadamard.sign_values` list into a "model card" would defeat the
+/// point of a card (a short, human-readable summary), not augment it.
+fn scalar_display_string(v: &MetadataValue) -> Option<String> {
+    match v {
+        MetadataValue::String(s) => Some(s.clone()),
+        MetadataValue::Bool(b) => Some(b.to_string()),
+        MetadataValue::Uint8(n) => Some(n.to_string()),
+        MetadataValue::Int8(n) => Some(n.to_string()),
+        MetadataValue::Uint16(n) => Some(n.to_string()),
+        MetadataValue::Int16(n) => Some(n.to_string()),
+        MetadataValue::Uint32(n) => Some(n.to_string()),
+        MetadataValue::Int32(n) => Some(n.to_string()),
+        MetadataValue::Uint64(n) => Some(n.to_string()),
+        MetadataValue::Int64(n) => Some(n.to_string()),
+        MetadataValue::Float32(n) => Some(n.to_string()),
+        MetadataValue::Float64(n) => Some(n.to_string()),
+        MetadataValue::Array(_) => None,
+    }
 }
 
 // ── Unit tests ───────────────────────────────────────────────────────────────
@@ -625,5 +1021,247 @@ mod tests {
             b > 1.0 && b < 50.0,
             "estimate {b:.2}B out of plausible range"
         );
+    }
+
+    // ── extract_model_card_from_gguf (core-gguf-13) ─────────────────────────
+
+    use crate::gguf::types::GgufValueType;
+
+    fn gguf_string(s: &str) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        b.extend_from_slice(s.as_bytes());
+        b
+    }
+
+    fn kv_string(key: &str, value: &str) -> Vec<u8> {
+        let mut b = gguf_string(key);
+        b.extend_from_slice(&(GgufValueType::String as u32).to_le_bytes());
+        b.extend_from_slice(&gguf_string(value));
+        b
+    }
+
+    fn kv_u32(key: &str, value: u32) -> Vec<u8> {
+        let mut b = gguf_string(key);
+        b.extend_from_slice(&(GgufValueType::Uint32 as u32).to_le_bytes());
+        b.extend_from_slice(&value.to_le_bytes());
+        b
+    }
+
+    fn kv_f32(key: &str, value: f32) -> Vec<u8> {
+        let mut b = gguf_string(key);
+        b.extend_from_slice(&(GgufValueType::Float32 as u32).to_le_bytes());
+        b.extend_from_slice(&value.to_le_bytes());
+        b
+    }
+
+    fn kv_string_array(key: &str, values: &[&str]) -> Vec<u8> {
+        let mut b = gguf_string(key);
+        b.extend_from_slice(&(GgufValueType::Array as u32).to_le_bytes());
+        b.extend_from_slice(&(GgufValueType::String as u32).to_le_bytes());
+        b.extend_from_slice(&(values.len() as u64).to_le_bytes());
+        for v in values {
+            b.extend_from_slice(&gguf_string(v));
+        }
+        b
+    }
+
+    fn tensor_info_bytes(name: &str, shape: &[u64], type_id: u32, offset: u64) -> Vec<u8> {
+        let mut b = gguf_string(name);
+        b.extend_from_slice(&(shape.len() as u32).to_le_bytes());
+        for &d in shape {
+            b.extend_from_slice(&d.to_le_bytes());
+        }
+        b.extend_from_slice(&type_id.to_le_bytes());
+        b.extend_from_slice(&offset.to_le_bytes());
+        b
+    }
+
+    /// A `qwen35`-flavoured metadata block modelled on the real Bonsai 2 27B
+    /// GGUF header (`gguf_headers_summary.txt`): arch-scoped keys (no
+    /// `llm.*`/`tokens_count` at all), plus Hadamard + sampling metadata.
+    fn qwen35_metadata_bytes() -> (Vec<u8>, u64) {
+        let entries: Vec<Vec<u8>> = vec![
+            kv_string(keys::ARCHITECTURE, "qwen35"),
+            kv_string(keys::MODEL_NAME, "Hf"),
+            kv_u32("qwen35.context_length", 262_144),
+            kv_u32("qwen35.attention.head_count", 24),
+            kv_u32("qwen35.attention.head_count_kv", 4),
+            kv_u32("qwen35.full_attention_interval", 4),
+            kv_u32(keys::HADAMARD_VERSION, 1),
+            kv_f32(keys::SAMPLING_TEMP, 1.0),
+            kv_f32(keys::SAMPLING_TOP_P, 0.95),
+            kv_u32(keys::SAMPLING_TOP_K, 20),
+            kv_string_array(keys::TOKENIZER_TOKENS, &["a", "b", "c", "d", "e"]),
+        ];
+        let count = entries.len() as u64;
+        (entries.concat(), count)
+    }
+
+    fn parse_metadata(bytes: &[u8], count: u64) -> MetadataStore {
+        MetadataStore::parse(bytes, 0, count)
+            .expect("synthetic metadata should parse")
+            .0
+    }
+
+    fn parse_tensors(bytes: &[u8], count: u64) -> TensorStore {
+        TensorStore::parse(bytes, 0, count)
+            .expect("synthetic tensor table should parse")
+            .0
+    }
+
+    #[test]
+    fn extract_from_gguf_reads_arch_scoped_keys_not_llm_prefixed_ones() {
+        let (bytes, count) = qwen35_metadata_bytes();
+        let metadata = parse_metadata(&bytes, count);
+        let tensors = TensorStore::new();
+
+        let card = extract_model_card_from_gguf(&metadata, None, &tensors);
+        assert_eq!(card.architecture.as_deref(), Some("qwen35"));
+        assert_eq!(card.model_name.as_deref(), Some("Hf"));
+        assert_eq!(card.context_length, Some(262_144));
+        assert_eq!(card.num_heads, Some(24));
+        assert_eq!(card.num_kv_heads, Some(4));
+        assert_eq!(card.full_attention_interval, Some(4));
+    }
+
+    #[test]
+    fn extract_from_gguf_surfaces_hadamard_and_sampling_defaults() {
+        let (bytes, count) = qwen35_metadata_bytes();
+        let metadata = parse_metadata(&bytes, count);
+        let tensors = TensorStore::new();
+
+        let card = extract_model_card_from_gguf(&metadata, None, &tensors);
+        assert_eq!(card.hadamard_version, Some(1));
+        assert!((card.sampling_temp.expect("temp set") - 1.0).abs() < 1e-6);
+        assert!((card.sampling_top_p.expect("top_p set") - 0.95).abs() < 1e-3);
+        assert_eq!(card.sampling_top_k, Some(20));
+    }
+
+    #[test]
+    fn extract_from_gguf_derives_vocab_size_from_the_tokens_array_length() {
+        let (bytes, count) = qwen35_metadata_bytes();
+        let metadata = parse_metadata(&bytes, count);
+        let tensors = TensorStore::new();
+
+        let card = extract_model_card_from_gguf(&metadata, None, &tensors);
+        // The real key (`tokenizer.ggml.tokens_count`) does not exist in
+        // this fixture, by design — only the true `tokenizer.ggml.tokens`
+        // array does, matching every real GGUF file.
+        assert_eq!(card.vocab_size, Some(5));
+    }
+
+    #[test]
+    fn extract_from_gguf_falls_back_to_token_embd_shape_when_tokens_array_absent() {
+        let entries: Vec<Vec<u8>> = vec![kv_string(keys::ARCHITECTURE, "qwen35")];
+        let metadata = parse_metadata(&entries.concat(), entries.len() as u64);
+
+        let tensor_bytes = tensor_info_bytes(keys::TOKEN_EMBD_TENSOR, &[5120, 248_320], 0, 0);
+        let tensors = parse_tensors(&tensor_bytes, 1);
+
+        let card = extract_model_card_from_gguf(&metadata, None, &tensors);
+        assert_eq!(
+            card.vocab_size,
+            Some(248_320),
+            "must fall back to token_embd.weight's last shape dimension"
+        );
+    }
+
+    #[test]
+    fn extract_from_gguf_derives_quantization_from_the_dominant_tensor_type() {
+        let entries: Vec<Vec<u8>> = vec![kv_string(keys::ARCHITECTURE, "qwen35")];
+        let metadata = parse_metadata(&entries.concat(), entries.len() as u64);
+
+        // 2 PQ2_0 (142) tensors + 1 F32 (0) norm — PQ2_0 must win.
+        let mut tensor_bytes = Vec::new();
+        tensor_bytes.extend_from_slice(&tensor_info_bytes("blk.0.ffn_up.weight", &[128], 142, 0));
+        tensor_bytes.extend_from_slice(&tensor_info_bytes("blk.0.ffn_down.weight", &[128], 142, 0));
+        tensor_bytes.extend_from_slice(&tensor_info_bytes("blk.0.attn_norm.weight", &[128], 0, 0));
+        let tensors = parse_tensors(&tensor_bytes, 3);
+
+        let card = extract_model_card_from_gguf(&metadata, None, &tensors);
+        assert_eq!(card.quantization.as_deref(), Some("PQ2_0"));
+    }
+
+    #[test]
+    fn extract_from_gguf_populates_file_size_from_the_parameter_not_metadata() {
+        let (bytes, count) = qwen35_metadata_bytes();
+        let metadata = parse_metadata(&bytes, count);
+        let tensors = TensorStore::new();
+
+        let card = extract_model_card_from_gguf(&metadata, Some(7_211_000_000), &tensors);
+        assert_eq!(card.file_size_bytes, Some(7_211_000_000));
+
+        let no_len = extract_model_card_from_gguf(&metadata, None, &tensors);
+        assert_eq!(no_len.file_size_bytes, None);
+    }
+
+    #[test]
+    fn extract_from_gguf_falls_back_to_legacy_llm_prefix_when_arch_key_absent() {
+        // No `qwen35.context_length`; only the legacy generic spelling.
+        let entries: Vec<Vec<u8>> = vec![
+            kv_string(keys::ARCHITECTURE, "qwen35"),
+            kv_u32("llm.context_length", 4096),
+        ];
+        let metadata = parse_metadata(&entries.concat(), entries.len() as u64);
+        let tensors = TensorStore::new();
+
+        let card = extract_model_card_from_gguf(&metadata, None, &tensors);
+        assert_eq!(card.context_length, Some(4096));
+    }
+
+    #[test]
+    fn extract_from_gguf_excludes_bulk_arrays_from_extra_metadata() {
+        let (bytes, count) = qwen35_metadata_bytes();
+        let metadata = parse_metadata(&bytes, count);
+        let tensors = TensorStore::new();
+
+        let card = extract_model_card_from_gguf(&metadata, None, &tensors);
+        assert!(
+            !card.extra_metadata.contains_key(keys::TOKENIZER_TOKENS),
+            "the tokens array must never be dumped into extra_metadata"
+        );
+    }
+
+    #[test]
+    fn extract_from_gguf_puts_unrecognised_scalars_in_extra_metadata() {
+        let entries: Vec<Vec<u8>> = vec![
+            kv_string(keys::ARCHITECTURE, "qwen35"),
+            kv_string("general.size_label", "27B"),
+        ];
+        let metadata = parse_metadata(&entries.concat(), entries.len() as u64);
+        let tensors = TensorStore::new();
+
+        let card = extract_model_card_from_gguf(&metadata, None, &tensors);
+        assert_eq!(
+            card.extra_metadata
+                .get("general.size_label")
+                .map(String::as_str),
+            Some("27B")
+        );
+    }
+
+    #[test]
+    fn extract_from_gguf_empty_metadata_gives_an_empty_card() {
+        let metadata = MetadataStore::new();
+        let tensors = TensorStore::new();
+        let card = extract_model_card_from_gguf(&metadata, None, &tensors);
+        assert!(card.is_empty());
+    }
+
+    #[test]
+    fn extract_from_gguf_renders_the_new_fields_in_markdown_and_summary() {
+        let (bytes, count) = qwen35_metadata_bytes();
+        let metadata = parse_metadata(&bytes, count);
+        let tensors = TensorStore::new();
+        let card = extract_model_card_from_gguf(&metadata, None, &tensors);
+
+        let md = card.to_markdown();
+        assert!(md.contains("Full Attention Interval"), "{md}");
+        assert!(md.contains("Hadamard Version"), "{md}");
+        assert!(md.contains("Sampling Defaults"), "{md}");
+
+        let summary = card.to_summary();
+        assert!(summary.contains("Hadamard Version: 1"), "{summary}");
     }
 }

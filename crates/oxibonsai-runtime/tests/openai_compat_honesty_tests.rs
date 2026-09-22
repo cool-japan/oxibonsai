@@ -4,6 +4,11 @@
 //! (`max_tokens` ceiling, `n` cap, non-zero `frequency_penalty` /
 //! `presence_penalty`) instead of silently ignoring or clamping it.
 
+// The `api_extensions` and `server` modules are only compiled with the
+// `server` feature, so this integration test must be gated the same way to
+// keep `--no-default-features` green.
+#![cfg(feature = "server")]
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;

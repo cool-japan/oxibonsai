@@ -10,6 +10,7 @@
 
 use cudarc::driver::{CudaSlice, CudaView, LaunchConfig, PushKernelArg};
 
+use super::super::cuda_device_negotiation::{attn_scores_shared_bytes, ATTN_SCORES_BLOCK_DIM};
 use super::super::cuda_graph::{CudaGraph, CudaGraphError};
 use super::CudaAttnModules;
 
@@ -118,8 +119,8 @@ pub(super) unsafe fn launch_fused_qk_norm_rope(
     d_k_out: &mut CudaSlice<f32>,
     d_q_weight: &CudaSlice<f32>,
     d_k_weight: &CudaSlice<f32>,
-    d_cos: &CudaSlice<f32>,
-    d_sin: &CudaSlice<f32>,
+    d_cos: &CudaView<'_, f32>,
+    d_sin: &CudaView<'_, f32>,
     nq: u32,
     nkv: u32,
     head_dim: u32,
@@ -156,6 +157,14 @@ pub(super) unsafe fn launch_fused_qk_norm_rope(
 ///
 /// `d_pos_seqlen[0]` = current position (read by the kernel from device memory).
 ///
+/// `layer_offset` is the `u64` element offset produced by
+/// [`CudaKvCache::layer_offset_elements`](super::CudaKvCache::layer_offset_elements);
+/// the kernel parameter is `unsigned long long` (finding **F4**).
+///
+/// **CUDA is unvalidated.** This session has no CUDA hardware; the widened
+/// argument type has never been exercised by an actual `unsigned long long`
+/// kernel launch.
+///
 /// # Safety
 /// All slices/views must be valid device pointers allocated on the graph's stream.
 #[allow(clippy::too_many_arguments)]
@@ -169,8 +178,8 @@ pub(super) unsafe fn launch_fused_kv_store(
     head_dim: u32,
     nkv: u32,
     max_seq: u32,
-    d_pos_seqlen: &CudaSlice<u32>,
-    layer_offset: u32,
+    d_pos_seqlen: &CudaView<'_, u32>,
+    layer_offset: u64,
 ) -> Result<(), CudaGraphError> {
     let grid_x = head_dim.div_ceil(64);
     let cfg = LaunchConfig {
@@ -197,12 +206,31 @@ pub(super) unsafe fn launch_fused_kv_store(
 
 /// Launch `batched_attn_scores_v2`.
 ///
-/// Grid `(n_q, max_seq / BATCH_STRIDE, 1)`, block `(128, 1, 1)`.
+/// Grid `(n_q, max_seq / BATCH_STRIDE, 1)`, block
+/// `(ATTN_SCORES_BLOCK_DIM, 1, 1)`.
 ///
 /// The grid Y dimension is fixed at `max_seq / BATCH_STRIDE` (not `seq_len`) so the
 /// kernel sequence can be captured as a CUDA driver graph once and replayed for any
 /// position.  Blocks with `pos_start >= seq_len` (read from `d_pos_seqlen[1]`) exit
 /// immediately via the existing loop condition, adding only negligible overhead.
+///
+/// **Finding F3.** This is the one place that sizes the kernel's dynamic shared
+/// memory, which holds the staged Q vector *and* the cross-warp partials. The
+/// kernel used to declare a fixed `__shared__ float shared_q[128]` and stage one
+/// element per thread, silently truncating the QK dot product to
+/// `min(head_dim, 128)` — so Bonsai 2 27B (`head_dim = 256`) computed every
+/// attention score from half its Q vector, with no error. `head_dim` above
+/// [`CUDA_ATTN_MAX_HEAD_DIM`](super::super::cuda_device_negotiation::CUDA_ATTN_MAX_HEAD_DIM)
+/// is now refused here rather than overrunning shared memory on the device.
+///
+/// # Errors
+/// [`CudaGraphError::DriverError`] when `head_dim` is zero or wider than the
+/// shared-memory budget allows.
+///
+/// **CUDA is unvalidated.** This session has no CUDA hardware; the shared-
+/// memory sizing and the precondition below are exercised only by
+/// [`attn_scores_shared_bytes`]'s host-side unit tests, never by a real
+/// launch.
 ///
 /// # Safety
 /// All slices must be valid device pointers allocated on the graph's stream.
@@ -218,18 +246,21 @@ pub(super) unsafe fn launch_batched_attn_scores_v2(
     n_kv: u32,
     heads_per_group: u32,
     max_seq: u32,
-    d_pos_seqlen: &CudaSlice<u32>,
+    d_pos_seqlen: &CudaView<'_, u32>,
     inv_sqrt_hd: f32,
-    cache_layer_offset: u32,
+    cache_layer_offset: u64,
 ) -> Result<(), CudaGraphError> {
     const BATCH_STRIDE: u32 = 4;
+    // F3 precondition: refuse before launch rather than corrupt shared memory.
+    let shared_mem_bytes = attn_scores_shared_bytes(head_dim, ATTN_SCORES_BLOCK_DIM)
+        .map_err(|e| CudaGraphError::DriverError(format!("batched_attn_scores_v2 launch: {e}")))?;
     // Fixed grid Y = max_seq / BATCH_STRIDE — constant across all decode positions,
     // allowing the kernel sequence to be captured as a replayable CUDA graph.
     let grid_y = max_seq.div_ceil(BATCH_STRIDE);
     let cfg = LaunchConfig {
         grid_dim: (n_q, grid_y, 1),
-        block_dim: (128, 1, 1),
-        shared_mem_bytes: 0,
+        block_dim: (ATTN_SCORES_BLOCK_DIM, 1, 1),
+        shared_mem_bytes,
     };
     graph
         .stream_arc()
@@ -265,7 +296,7 @@ pub(super) unsafe fn launch_batched_softmax(
     d_scores: &mut CudaSlice<f32>,
     n_q: u32,
     max_seq: u32,
-    d_pos_seqlen: &CudaSlice<u32>,
+    d_pos_seqlen: &CudaView<'_, u32>,
 ) -> Result<(), CudaGraphError> {
     let cfg = LaunchConfig {
         grid_dim: (n_q, 1, 1),
@@ -286,9 +317,14 @@ pub(super) unsafe fn launch_batched_softmax(
 
 /// Launch `batched_attn_weighted_sum`.
 ///
-/// Grid `(ceil(head_dim/64), n_q, 1)`, block `(64, 1, 1)`.
+/// Grid `(ceil(head_dim/64), n_q, 1)`, block `(64, 1, 1)`. The grid already
+/// covers any `head_dim`, so this kernel needed no F3 change.
 ///
 /// `d_pos_seqlen[1]` = seq_len (read by the kernel from device memory).
+///
+/// `cache_layer_offset` is the `u64` element offset from
+/// [`CudaKvCache::layer_offset_elements`](super::CudaKvCache::layer_offset_elements)
+/// (finding **F4**).
 ///
 /// # Safety
 /// All slices must be valid device pointers allocated on the graph's stream.
@@ -304,8 +340,8 @@ pub(super) unsafe fn launch_batched_attn_weighted_sum(
     n_kv: u32,
     heads_per_group: u32,
     max_seq: u32,
-    d_pos_seqlen: &CudaSlice<u32>,
-    cache_layer_offset: u32,
+    d_pos_seqlen: &CudaView<'_, u32>,
+    cache_layer_offset: u64,
 ) -> Result<(), CudaGraphError> {
     let grid_x = head_dim.div_ceil(64);
     let cfg = LaunchConfig {

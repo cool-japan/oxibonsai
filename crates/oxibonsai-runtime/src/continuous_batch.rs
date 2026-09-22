@@ -388,8 +388,14 @@ mod tests {
     use super::*;
     use oxibonsai_core::config::Qwen3Config;
 
+    // HOTFIX-TESTMEM: `bonsai_8b()` made `BonsaiModel::new` allocate ~5 GB of
+    // token_embd + output_weight tables (plus a ~1.2 GB KV cache) for every
+    // test using this helper, none of which exercise anything
+    // dimension-dependent (both callers submit empty prompts). `tiny_test()`
+    // exercises the identical scheduler <-> engine wiring for a few tens of
+    // MB.
     fn make_engine() -> InferenceEngine<'static> {
-        let config = Qwen3Config::bonsai_8b();
+        let config = Qwen3Config::tiny_test();
         InferenceEngine::new(config, SamplingParams::default(), 42)
     }
 

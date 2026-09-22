@@ -24,10 +24,16 @@
 //! `crate::gemv_q8_0::gemv_q8_0_scalar`; the in-module `tests` below and the
 //! `tests/neon_q_std_parity.rs` integration tests assert this.
 //!
-//! These functions are intentionally **not** wired into
-//! [`crate::dispatch::KernelDispatcher`] yet — dispatch wiring for the new
-//! `KernelTier::Neon` arm is a deliberately separate change so the two
-//! concerns (kernel correctness vs. routing) can be reviewed independently.
+//! These functions ARE wired into [`crate::dispatch::KernelDispatcher`]
+//! (K-19): its `Q4_0` and `Q8_0` `KernelTier::Neon` match arms call
+//! `gemv_q4_0_neon` / `gemv_q8_0_neon` directly, both on the primary
+//! dispatch path and on the `Gpu`-tier CPU fallback
+//! (`cpu_gemv_q4_0_fallback` / `cpu_gemv_q8_0_fallback`, K-17), and
+//! `tests/dispatch_neon_std_quant.rs` asserts that routing end to end
+//! (`cpu_kernel_tier_is_neon_on_aarch64`,
+//! `dispatcher_gemv_q4_0_neon_matches_reference`,
+//! `dispatcher_gemv_q8_0_neon_matches_reference`,
+//! `production_gemv_q4_0_matches_explicit_neon_tier`).
 
 #[cfg(target_arch = "aarch64")]
 use core::arch::aarch64::*;
@@ -62,7 +68,7 @@ fn validate_gemv(
     in_features: usize,
     block_len: usize,
 ) -> KernelResult<usize> {
-    if in_features % block_len != 0 {
+    if !in_features.is_multiple_of(block_len) {
         return Err(KernelError::NotBlockAligned {
             count: in_features,
             block_size: block_len,
@@ -71,22 +77,21 @@ fn validate_gemv(
     let blocks_per_row = in_features / block_len;
     let expected_blocks = n_rows * blocks_per_row;
     if n_blocks < expected_blocks {
-        return Err(KernelError::DimensionMismatch {
-            expected: expected_blocks,
-            got: n_blocks,
-        });
+        return Err(KernelError::dimension_mismatch(
+            "blocks",
+            expected_blocks,
+            n_blocks,
+        ));
     }
     if input_len < in_features {
-        return Err(KernelError::DimensionMismatch {
-            expected: in_features,
-            got: input_len,
-        });
+        return Err(KernelError::dimension_mismatch(
+            "input",
+            in_features,
+            input_len,
+        ));
     }
     if output_len < n_rows {
-        return Err(KernelError::BufferTooSmall {
-            needed: n_rows,
-            available: output_len,
-        });
+        return Err(KernelError::buffer_too_small("output", n_rows, output_len));
     }
     Ok(blocks_per_row)
 }
@@ -386,9 +391,15 @@ mod tests {
         let mut output: Vec<f32> = vec![];
         unsafe {
             let result = gemv_q4_0_neon(&blocks, &input, &mut output, 1, 32);
-            assert!(
-                matches!(result, Err(KernelError::BufferTooSmall { .. })),
-                "expected BufferTooSmall, got {result:?}"
+            // K-02: validate_gemv now raises the *named* buffer-too-small
+            // variant. Checking `buffer_name()` is strictly stronger than
+            // the old `matches!(.., BufferTooSmall { .. })` — it also pins
+            // down *which* buffer was rejected, not just the error shape.
+            let err = result.expect_err("output buffer too small must be rejected");
+            assert_eq!(
+                err.buffer_name(),
+                Some("output"),
+                "expected a named buffer-too-small error for \"output\", got {err:?}"
             );
         }
     }
@@ -400,9 +411,15 @@ mod tests {
         let mut output: Vec<f32> = vec![];
         unsafe {
             let result = gemv_q8_0_neon(&blocks, &input, &mut output, 1, 32);
-            assert!(
-                matches!(result, Err(KernelError::BufferTooSmall { .. })),
-                "expected BufferTooSmall, got {result:?}"
+            // K-02: validate_gemv now raises the *named* buffer-too-small
+            // variant. Checking `buffer_name()` is strictly stronger than
+            // the old `matches!(.., BufferTooSmall { .. })` — it also pins
+            // down *which* buffer was rejected, not just the error shape.
+            let err = result.expect_err("output buffer too small must be rejected");
+            assert_eq!(
+                err.buffer_name(),
+                Some("output"),
+                "expected a named buffer-too-small error for \"output\", got {err:?}"
             );
         }
     }

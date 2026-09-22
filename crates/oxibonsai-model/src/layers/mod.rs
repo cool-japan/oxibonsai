@@ -23,6 +23,7 @@ pub mod moe_expert;
 pub mod moe_router;
 pub mod rms_norm;
 pub mod rope;
+pub mod rope_mrope;
 pub mod rope_scaling;
 pub mod sliding_window;
 pub mod sparse_attention;

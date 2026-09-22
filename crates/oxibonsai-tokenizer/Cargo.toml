@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/oxibonsai-tokenizer"
 description = "Pure Rust BPE tokenizer for OxiBonsai (MeCrab-compatible)"
@@ -17,11 +18,64 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# Pure-Rust regex engine for the `qwen2`/`qwen35` `Split` pre-tokenizer
+# (TOK-03/TOK-04): the hand-written scanner it replaces diverged from HF on
+# ordinary input (Roman numerals, blank-line whitespace) because
+# `char::is_alphabetic`/`is_numeric` are broader than the Unicode `\p{L}`/
+# `\p{N}` classes fancy-regex uses. The workspace entry was pre-staged by
+# FIX-01-BUILD (wave 1) for exactly this landing; see the root Cargo.toml
+# comment and deny.toml's matching `[[bans.skip]]` restoration.
+fancy-regex = { workspace = true }
+# Pure Rust, no_std-capable (TOK-09): real Unicode NFC normalization for the
+# `tokenizer.json` `normalizer` field. Replaces silent skipping, which
+# produced a proven divergence from HF on decomposed input (e.g. "e" +
+# COMBINING ACUTE ACCENT tokenizing differently from precomposed "é").
+unicode-normalization = { workspace = true }
+# GGUF metadata reader (TOK-05): Bonsai 2 27B ships its vocabulary, merges
+# and chat template only inside the GGUF, so `gguf_vocab.rs` builds an
+# `OxiTokenizer` straight from `oxibonsai_core::MetadataStore`. Only the
+# metadata/type-enum modules are needed (no tensor-data I/O). This crate
+# would ideally opt out of oxibonsai-core's default `mmap` feature
+# (memmap2/libc — Pure Rust, but wasm32-incompatible) to keep the
+# WASM-clean story intact, but Cargo's workspace-dependency inheritance
+# cannot narrow a `[workspace.dependencies]` entry's default features from
+# a member crate (verified empirically: `default-features = false` here is
+# silently ignored whether the workspace entry is implicit-true or
+# explicit-true) — only widening (`features = [...]`) is supported that
+# way. Opting out would require adding `features = ["mmap"]` to every other
+# workspace member that currently depends on plain
+# `oxibonsai-core.workspace = true` (oxibonsai-model, oxibonsai-image,
+# oxibonsai, oxibonsai-cli, ...), none of which are in this package's
+# owned_files. Recorded as a deviation; `memmap2`/`libc` do not themselves
+# violate the Pure-Rust policy (no C/C++/Fortran toolchain involved), so
+# this is a WASM-cleanliness nice-to-have, not a correctness or policy gap.
+oxibonsai-core = { workspace = true }
+
+[features]
+# Opt-in gate for the `[[bench]]` TARGET only (deps-16/FIX-01-BUILD):
+# `required-features = ["bench"]` below stops cargo from building or running
+# the `tokenizer_bench` bench binary unless `--features bench` is passed.
+#
+# CORRECTION (wave-3.5 re-review, matches oxibonsai-kernels/Cargo.toml): this
+# does NOT keep a C compiler out of the crate's dependency graph, despite an
+# earlier version of this comment claiming so. `criterion` 0.8.2 pulls in
+# `alloca` -> `cc` on unix unconditionally (`alloca`'s
+# `default-features = false` cannot drop that edge), and `criterion` is an
+# ordinary, always-resolved `[dev-dependencies]` entry — it is not itself
+# feature-gated, only the bench *target* that uses it is. A default
+# `cargo test` / `cargo check --all-targets` for this package still resolves
+# and compiles `criterion`/`alloca`/`cc`; `required-features = ["bench"]`
+# only stops the bench *sources* themselves from compiling without an
+# explicit opt-in. Run the bench with
+# `cargo bench -p oxibonsai-tokenizer --features bench`.
+bench = []
 
 [dev-dependencies]
 proptest = { workspace = true }
 criterion = { workspace = true }
+tempfile = { workspace = true }
 
 [[bench]]
 name = "tokenizer_bench"
 harness = false
+required-features = ["bench"]

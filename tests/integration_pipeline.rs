@@ -5,6 +5,7 @@
 
 use half::f16;
 use oxibonsai_core::tensor::{BlockQ1_0G128, QK1_0_G128};
+use oxibonsai_core::GgufTensorType;
 use oxibonsai_kernels::dispatch::KernelTier;
 use oxibonsai_kernels::{KernelDispatcher, OneBitKernel};
 
@@ -21,28 +22,64 @@ fn test_dispatch_auto_detect() {
     let tier = dispatcher.tier();
     let name = dispatcher.name();
 
-    // Tier should be a valid variant
+    // FIX3-BUILD (wave 3.5): this whole test was unreachable under default
+    // features until the E0004 fix just below (the file failed to compile
+    // at all), so the literal expectations here were never actually run and
+    // had gone stale against cli-16 (already landed in `oxibonsai-kernels`,
+    // not owned here): `OneBitKernel::name()` (== `tier_label()`) is now
+    // tier-only ("NEON (128-bit)", no quant-family prefix), because the
+    // dispatcher is shared across multiple quant formats and hardcoding
+    // "Q1_0_g128" into the generic tier label was misleading for the
+    // others. The combined "<quant> <tier>" form these literals used to
+    // check now lives in `KernelDispatcher::kernel_label`, asserted below.
     match tier {
         KernelTier::Reference => {
-            assert_eq!(name, "Q1_0_g128 reference (scalar)");
+            assert_eq!(name, "reference (scalar)");
         }
         #[cfg(target_arch = "x86_64")]
         KernelTier::Avx2 => {
-            assert_eq!(name, "Q1_0_g128 AVX2+FMA (256-bit)");
+            assert_eq!(name, "AVX2+FMA (256-bit)");
         }
         #[cfg(target_arch = "x86_64")]
         KernelTier::Avx512 => {
-            assert_eq!(name, "Q1_0_g128 AVX-512 (512-bit)");
+            assert_eq!(name, "AVX-512 (512-bit)");
         }
         #[cfg(target_arch = "aarch64")]
         KernelTier::Neon => {
-            assert_eq!(name, "Q1_0_g128 NEON (128-bit)");
+            assert_eq!(name, "NEON (128-bit)");
         }
         #[cfg(feature = "gpu")]
         KernelTier::Gpu => {
             assert!(name.contains("GPU") || name.contains("scirs2"));
         }
+        // cli-09 / FIX3-BUILD (wave 3.5): this crate's `#[cfg(feature =
+        // "gpu")]` arm above tracks THIS crate's OWN `gpu` feature, but
+        // `KernelTier::Gpu` (`oxibonsai_kernels::tier::KernelTier`) is
+        // gated on `oxibonsai-kernels`' OWN `gpu` feature — a dependency's
+        // feature cannot be `cfg`'d on from a consumer crate, so the two
+        // can disagree (they did: a reverted `[target.'cfg(target_os =
+        // "macos")'.dependencies]` feature union once turned on
+        // `oxibonsai-kernels/gpu` while leaving this crate's own `gpu`
+        // feature off, making `KernelTier::Gpu` exist with no covering
+        // arm here — `E0004` non-exhaustive patterns). This wildcard keeps
+        // the match exhaustive under every feature combination this crate
+        // can select, including any future mismatch of the same shape;
+        // `#[allow]` is required because with the platform-gated union
+        // gone, the arm above is unreachable under every combination this
+        // crate can select today, and `-D warnings` would otherwise reject
+        // that as dead code.
+        #[allow(unreachable_patterns)]
+        _ => {}
     }
+
+    // cli-16: `kernel_label` recombines a resolved quant family with the
+    // tier label, e.g. the exact "Q1_0_g128 NEON (128-bit)" shape this test
+    // used to check via `name()` before that method became tier-only above.
+    assert_eq!(
+        dispatcher.kernel_label(GgufTensorType::Q1_0_g128),
+        format!("Q1_0_g128 {name}"),
+        "kernel_label should combine the quant family with the same tier label `name()` reports"
+    );
 }
 
 #[test]

@@ -1,9 +1,64 @@
 //! KV cache compression policy controller.
 //!
-//! Adapts the KV cache precision based on cache pressure: as more sequences
-//! accumulate, the cache transitions FP16 → INT8 (Q8) → INT4 (Q4) so the
-//! same memory budget can accommodate longer contexts and more in-flight
-//! requests.
+//! Computes an *advisory* KV cache precision tier from observed cache
+//! pressure: as more sequences accumulate, the recommended tier transitions
+//! FP16 → INT8 (Q8) → INT4 (Q4), which — if something actually acted on it —
+//! would let the same memory budget accommodate longer contexts and more
+//! in-flight requests.
+//!
+//! ## Honesty (RT-14 / M-13)
+//!
+//! **By default this is pure telemetry.** [`KvCachePolicy::observe`] updates
+//! an internal EWMA and picks a tier, and that is all — nothing in
+//! `oxibonsai-runtime` or `oxibonsai-model` reads the result and applies it
+//! to a real KV cache. `BonsaiModel` holds exactly one `KvCache` field
+//! (always FP32, or since B2-12/M-07 optionally sparse-`f16` via
+//! [`KvCache::new_sparse`](oxibonsai_model::kv_cache::KvCache::new_sparse)
+//! for a hybrid model, but still a *single* field chosen once at load time)
+//! threaded through every block-forward call; switching that backing per
+//! tier would mean changing the block-forward signature across every
+//! forward path (`block/types/forward.rs`, `forward_metal.rs`,
+//! `forward_cuda/*`, none of which this package owns). The related types
+//! [`KvCacheFp16`](https://docs.rs/oxibonsai-model) and the `kv_cache_quant`
+//! module (`QuantizedKvCache`/`Fp8KvCache`) exist as standalone,
+//! never-instantiated-by-the-model types for exactly the same reason, and
+//! `PagedKvCache` is a separate, explicitly experimental primitive with the
+//! same status.
+//!
+//! [`KvCachePolicy::with_action`] / [`KvCachePolicy::set_action`] is what
+//! turns this from telemetry into something that actually *does*
+//! something: attach a closure and it runs, on the calling thread, every
+//! time `observe()` decides to change tier, receiving the newly selected
+//! [`KvCacheLevel`]. That closure is the eviction/quantization action the
+//! finding asked for — this crate cannot manufacture one out of thin air
+//! (there is no KV-cache-backing selector to call in `oxibonsai-model`
+//! today), but a caller that adds one can wire it in without any further
+//! change here. Until such a caller exists, `current_level()` /
+//! `pressure()` / the `/admin/workload-stats` and `/admin/cache-stats`
+//! payloads that surface them remain **advisory numbers only** — read them
+//! as "what the policy would recommend", not "what the cache is doing".
+//!
+//! ### What B2-12 adds, and what it still cannot (RT-14 addendum)
+//!
+//! [`oxibonsai_model::kv_cache::KvCacheBacking`] is the data half of the
+//! still-missing seam: an enum naming the concrete backing a `BonsaiModel`
+//! could hold (`DenseF32`, `DenseF16`, `SparseF16`). [`From<KvCacheLevel>`]
+//! is implemented for it right here, so that *if* a
+//! `BonsaiModel::set_kv_backing(&mut self, backing: KvCacheBacking)` seam is
+//! ever added (it requires editing `model/types/mod.rs` and the
+//! `block/types/forward*.rs` files above, none of which this package owns —
+//! confirmed independently by this finding's own verifier correction, which
+//! recommends *not* pretending a partial wire-up is the real fix), wiring
+//! this policy to it is exactly:
+//!
+//! ```ignore
+//! // model: BonsaiModel — needs `set_kv_backing`, not added by this crate.
+//! policy.set_action(move |level| model.set_kv_backing(level.into()));
+//! ```
+//!
+//! one line, because the level-to-backing conversion already exists. Until
+//! that seam lands, this module's status is unchanged from the paragraph
+//! above: pure telemetry unless a caller supplies its own action.
 //!
 //! ## Design
 //!
@@ -34,8 +89,30 @@
 //! }
 //! assert_eq!(policy.current_level(), KvCacheLevel::Q8);
 //! ```
+//!
+//! ### Wiring a real action
+//!
+//! ```
+//! use oxibonsai_runtime::kv_cache_policy::{KvCachePolicy, KvCacheLevel};
+//! use std::sync::atomic::{AtomicUsize, Ordering};
+//! use std::sync::Arc;
+//!
+//! // In a real deployment this closure would call into a KV-cache-backing
+//! // selector on the loaded model. No such selector exists yet (see the
+//! // module docs), so this example just counts real transitions instead.
+//! let applied = Arc::new(AtomicUsize::new(0));
+//! let applied_clone = Arc::clone(&applied);
+//! let policy = KvCachePolicy::default().with_action(move |_level: KvCacheLevel| {
+//!     applied_clone.fetch_add(1, Ordering::Relaxed);
+//! });
+//! for _ in 0..20 {
+//!     policy.observe(0.92); // crosses the Q8 threshold once
+//! }
+//! assert!(applied.load(Ordering::Relaxed) >= 1);
+//! ```
 
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, OnceLock};
 
 // ─── Levels ────────────────────────────────────────────────────────────────
 
@@ -108,6 +185,28 @@ impl KvCacheLevel {
             1 => Self::Q8,
             2 => Self::Fp8,
             _ => Self::Q4,
+        }
+    }
+}
+
+/// Map a telemetry-driven precision tier onto the concrete
+/// [`oxibonsai_model::kv_cache::KvCacheBacking`] a hypothetical
+/// `BonsaiModel::set_kv_backing` seam would need (RT-14 / M-13 — see the
+/// module docs' "What B2-12 adds" section for why that seam does not exist
+/// yet). A 1:1 mirror of the four [`KvCacheLevel`] variants onto their
+/// `Dense*` `KvCacheBacking` counterparts; `KvCacheBacking::DenseF32` and
+/// `KvCacheBacking::SparseF16` are unreachable from this conversion because
+/// the policy has no notion of "one tier above baseline" or "this model is
+/// architecturally hybrid" — both are load-time facts, not pressure-driven
+/// recommendations.
+impl From<KvCacheLevel> for oxibonsai_model::kv_cache::KvCacheBacking {
+    fn from(level: KvCacheLevel) -> Self {
+        use oxibonsai_model::kv_cache::KvCacheBacking;
+        match level {
+            KvCacheLevel::Fp16 => KvCacheBacking::DenseF16,
+            KvCacheLevel::Q8 => KvCacheBacking::DenseQ8,
+            KvCacheLevel::Fp8 => KvCacheBacking::DenseFp8,
+            KvCacheLevel::Q4 => KvCacheBacking::DenseQ4,
         }
     }
 }
@@ -216,12 +315,18 @@ pub enum KvCachePolicyError {
 
 // ─── Policy controller ─────────────────────────────────────────────────────
 
+/// A real action to run when [`KvCachePolicy::observe`] decides to change
+/// tier. See [`KvCachePolicy::with_action`].
+type KvCacheAction = dyn Fn(KvCacheLevel) + Send + Sync;
+
 /// Stateful KV-cache compression policy.
 ///
 /// Thread-safe: the current level is stored in an [`AtomicU8`] so concurrent
 /// observers can read without locking. The pressure EWMA is also stored
 /// atomically (as `u64`-encoded `f64` bits).
-#[derive(Debug)]
+///
+/// See the [module docs](self) for the honest telemetry-vs-real-action
+/// distinction (RT-14 / M-13).
 pub struct KvCachePolicy {
     config: KvCachePolicyConfig,
     /// Current level encoded as `u8` for atomic load/store.
@@ -234,6 +339,27 @@ pub struct KvCachePolicy {
     upgrades: AtomicU64,
     /// Total downgrades fired (for telemetry).
     downgrades: AtomicU64,
+    /// Optional real action invoked on every tier transition. `None` (the
+    /// default) means this policy is pure telemetry — see the module docs.
+    /// A `OnceLock` rather than a plain field because `KvCachePolicy` is
+    /// typically shared behind an `Arc` (e.g. `AdminState::kv_cache_policy`)
+    /// once constructed, so attaching an action later needs `&self`
+    /// interior mutability, not `&mut self`.
+    action: OnceLock<Arc<KvCacheAction>>,
+}
+
+impl std::fmt::Debug for KvCachePolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KvCachePolicy")
+            .field("config", &self.config)
+            .field("level", &self.current_level())
+            .field("pressure", &self.pressure())
+            .field("samples", &self.samples())
+            .field("upgrades", &self.upgrades())
+            .field("downgrades", &self.downgrades())
+            .field("action_attached", &self.action.get().is_some())
+            .finish()
+    }
 }
 
 impl Default for KvCachePolicy {
@@ -255,8 +381,33 @@ impl KvCachePolicy {
             samples: AtomicU64::new(0),
             upgrades: AtomicU64::new(0),
             downgrades: AtomicU64::new(0),
+            action: OnceLock::new(),
             config,
         })
+    }
+
+    /// Attach a real action that runs, on the calling thread, every time
+    /// [`Self::observe`] decides to change tier — this is what turns the
+    /// policy from telemetry into something that actually applies its
+    /// decisions (RT-14 / M-13; see the module docs). Builder-style
+    /// consuming setter, for attaching one at construction time.
+    pub fn with_action(self, action: impl Fn(KvCacheLevel) + Send + Sync + 'static) -> Self {
+        let _ = self.action.set(Arc::new(action));
+        self
+    }
+
+    /// Same as [`Self::with_action`], callable through a shared `&self`
+    /// (e.g. an already-constructed `Arc<KvCachePolicy>`). Returns `true` if
+    /// this call attached the action, `false` if one was already attached
+    /// (only the first call wins).
+    pub fn set_action(&self, action: impl Fn(KvCacheLevel) + Send + Sync + 'static) -> bool {
+        self.action.set(Arc::new(action)).is_ok()
+    }
+
+    /// Whether a real action is currently attached — `false` means this
+    /// policy is pure telemetry (the default).
+    pub fn has_action(&self) -> bool {
+        self.action.get().is_some()
     }
 
     /// Read the current level.
@@ -289,6 +440,11 @@ impl KvCachePolicy {
     ///
     /// `pressure` is expected in `[0.0, 1.0]`; values are clamped to that
     /// range before being fed into the EWMA.
+    ///
+    /// When a real action is attached (see [`Self::with_action`] /
+    /// [`Self::set_action`]), it runs synchronously, on this call's thread,
+    /// exactly when the tier actually changes — never on every call, and
+    /// never when the decision holds steady.
     pub fn observe(&self, pressure: f64) -> KvCacheLevel {
         let p = pressure.clamp(0.0, 1.0);
 
@@ -330,6 +486,11 @@ impl KvCachePolicy {
                 self.upgrades.fetch_add(1, Ordering::Relaxed);
             } else {
                 self.downgrades.fetch_add(1, Ordering::Relaxed);
+            }
+            // Apply the decision for real, if a caller wired an action in
+            // (RT-14 / M-13). Fired exactly once per genuine transition.
+            if let Some(action) = self.action.get() {
+                action(target);
             }
         }
         target
@@ -582,7 +743,6 @@ mod tests {
 
     #[test]
     fn concurrent_observe_is_safe() {
-        use std::sync::Arc;
         use std::thread;
 
         let p = Arc::new(KvCachePolicy::default());
@@ -600,5 +760,205 @@ mod tests {
             h.join().expect("worker thread panicked");
         }
         assert_eq!(p.samples(), 8 * 100);
+    }
+
+    // ── RT-14 / M-13: real action sink ──────────────────────────────────────
+
+    #[test]
+    fn no_action_by_default() {
+        let p = KvCachePolicy::default();
+        assert!(!p.has_action(), "a fresh policy must be pure telemetry");
+    }
+
+    #[test]
+    fn action_sink_fires_on_every_real_transition() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::{Arc, Mutex};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_levels: Arc<Mutex<Vec<KvCacheLevel>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_clone = Arc::clone(&calls);
+        let levels_clone = Arc::clone(&observed_levels);
+
+        let p = KvCachePolicy::default().with_action(move |level| {
+            calls_clone.fetch_add(1, Ordering::Relaxed);
+            levels_clone
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(level);
+        });
+        assert!(p.has_action());
+
+        // Sustain ~85% pressure: should upgrade Fp16 -> Q8 exactly once.
+        for _ in 0..40 {
+            p.observe(0.85);
+        }
+        assert_eq!(p.current_level(), KvCacheLevel::Q8);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "the action must fire exactly once for exactly one transition, not once per observe()"
+        );
+        assert_eq!(
+            *observed_levels.lock().unwrap_or_else(|e| e.into_inner()),
+            vec![KvCacheLevel::Q8],
+            "the action must receive the newly selected level"
+        );
+
+        // Push further to Q4: a second, real transition -> a second call.
+        for _ in 0..40 {
+            p.observe(0.99);
+        }
+        assert_eq!(p.current_level(), KvCacheLevel::Q4);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            *observed_levels.lock().unwrap_or_else(|e| e.into_inner()),
+            vec![KvCacheLevel::Q8, KvCacheLevel::Q4]
+        );
+    }
+
+    #[test]
+    fn action_sink_does_not_fire_when_the_tier_holds_steady() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = Arc::clone(&calls);
+        let p = KvCachePolicy::default().with_action(move |_level| {
+            calls_clone.fetch_add(1, Ordering::Relaxed);
+        });
+
+        // Low, steady pressure never leaves Fp16 -> the action never fires.
+        for _ in 0..50 {
+            p.observe(0.10);
+        }
+        assert_eq!(p.current_level(), KvCacheLevel::Fp16);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "no transition occurred, so telemetry-only observe() calls must not apply anything"
+        );
+    }
+
+    #[test]
+    fn set_action_works_through_a_shared_arc_and_only_attaches_once() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        // Mirrors real usage: AdminState holds `Arc<KvCachePolicy>`, so any
+        // action must be attachable through `&self`, not just at
+        // construction time.
+        let p = Arc::new(KvCachePolicy::default());
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_clone = Arc::clone(&fired);
+
+        let attached = p.set_action(move |_level| fired_clone.store(true, Ordering::Relaxed));
+        assert!(attached, "the first set_action call must succeed");
+        assert!(p.has_action());
+
+        let attached_again = p.set_action(|_| {});
+        assert!(
+            !attached_again,
+            "a second set_action call must not replace the first (OnceLock semantics)"
+        );
+
+        for _ in 0..40 {
+            p.observe(0.90);
+        }
+        assert!(
+            fired.load(Ordering::Relaxed),
+            "the action attached via &Arc must still fire on a real transition"
+        );
+    }
+
+    #[test]
+    fn action_sink_receives_downgrades_too() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+
+        let downgrades_seen = Arc::new(AtomicUsize::new(0));
+        let downgrades_clone = Arc::clone(&downgrades_seen);
+        let p = KvCachePolicy::default().with_action(move |level| {
+            if level == KvCacheLevel::Fp16 {
+                downgrades_clone.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        for _ in 0..40 {
+            p.observe(0.99);
+        }
+        assert_eq!(p.current_level(), KvCacheLevel::Q4);
+
+        for _ in 0..200 {
+            p.observe(0.02);
+        }
+        assert_eq!(p.current_level(), KvCacheLevel::Fp16);
+        assert!(
+            downgrades_seen.load(Ordering::Relaxed) >= 1,
+            "the action must also fire on downgrade transitions, not just upgrades"
+        );
+    }
+
+    #[test]
+    fn debug_format_does_not_leak_the_unformattable_closure_but_reports_it_is_attached() {
+        let p = KvCachePolicy::default().with_action(|_level| {});
+        let debug_str = format!("{p:?}");
+        assert!(debug_str.contains("KvCachePolicy"));
+        assert!(debug_str.contains("action_attached: true"));
+
+        let q = KvCachePolicy::default();
+        assert!(format!("{q:?}").contains("action_attached: false"));
+    }
+
+    // ── RT-14 / M-13 addendum: KvCacheBacking conversion ────────────────────
+
+    #[test]
+    fn kv_cache_level_converts_to_the_matching_dense_backing() {
+        use oxibonsai_model::kv_cache::KvCacheBacking;
+
+        assert_eq!(
+            KvCacheBacking::from(KvCacheLevel::Fp16),
+            KvCacheBacking::DenseF16
+        );
+        assert_eq!(
+            KvCacheBacking::from(KvCacheLevel::Q8),
+            KvCacheBacking::DenseQ8
+        );
+        assert_eq!(
+            KvCacheBacking::from(KvCacheLevel::Fp8),
+            KvCacheBacking::DenseFp8
+        );
+        assert_eq!(
+            KvCacheBacking::from(KvCacheLevel::Q4),
+            KvCacheBacking::DenseQ4
+        );
+    }
+
+    #[test]
+    fn action_sink_can_target_a_kv_cache_backing_directly_via_into() {
+        // Exercises the exact one-line wiring the module docs promise:
+        // `policy.set_action(move |level| model.set_kv_backing(level.into()))`
+        // — here standing in for `set_kv_backing` with a plain capture, since
+        // no such seam exists in `oxibonsai-model` yet (see the module docs).
+        use oxibonsai_model::kv_cache::KvCacheBacking;
+        use std::sync::{Arc, Mutex};
+
+        let applied: Arc<Mutex<Vec<KvCacheBacking>>> = Arc::new(Mutex::new(Vec::new()));
+        let applied_clone = Arc::clone(&applied);
+        let p = KvCachePolicy::default().with_action(move |level: KvCacheLevel| {
+            let backing: KvCacheBacking = level.into();
+            applied_clone
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(backing);
+        });
+
+        for _ in 0..40 {
+            p.observe(0.85); // Fp16 -> Q8
+        }
+        assert_eq!(
+            *applied.lock().unwrap_or_else(|e| e.into_inner()),
+            vec![KvCacheBacking::DenseQ8]
+        );
     }
 }

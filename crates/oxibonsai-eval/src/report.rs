@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 use crate::accuracy::AccuracyResult;
+use crate::error::EvalError;
 use crate::perplexity::PerplexityResult;
 use crate::throughput::ThroughputResult;
 
@@ -94,9 +95,37 @@ impl EvalReport {
         });
     }
 
-    /// Serialise the report to a pretty-printed JSON string.
+    /// Serialise the report to a pretty-printed JSON string, propagating
+    /// any serialisation failure instead of discarding it.
+    ///
+    /// Realistically infallible for this struct today (every field is a
+    /// `String`, `f32`, `Option<String>` or `Vec` of those), but returning
+    /// `Result` means a caller that *does* hit a future failure (e.g. after
+    /// a field addition that is not always representable) gets a real
+    /// error instead of [`Self::to_json`]'s legacy placeholder (RAG-M6: the
+    /// original `to_json` swallowed the `serde_json::Error` into a bare
+    /// `"{}"`, which the CLI then happily wrote to disk as if it were a
+    /// real report).
+    ///
+    /// Maps a `serde_json` failure to [`EvalError::Serialization`] (via the
+    /// `#[from]` conversion) rather than [`EvalError::InvalidFormat`], so a
+    /// caller that needs to distinguish "the input was malformed" from "the
+    /// serialisation layer itself failed" can match on the real variant
+    /// instead of parsing a formatted string (gatekeeper REQUIRED #12).
+    pub fn try_to_json(&self) -> Result<String, EvalError> {
+        Ok(serde_json::to_string_pretty(self)?)
+    }
+
+    /// Serialise the report to a pretty-printed JSON string, silently
+    /// returning the placeholder `"{}"` on failure instead of propagating
+    /// the error.
+    ///
+    /// This is the crate's original, non-propagating signature, kept only
+    /// so existing callers keep compiling unchanged; prefer
+    /// [`Self::try_to_json`] in new code, which reports a real error
+    /// instead of writing `"{}"` to disk as if it were the report (RAG-M6).
     pub fn to_json(&self) -> String {
-        serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_string())
+        self.try_to_json().unwrap_or_else(|_| "{}".to_string())
     }
 
     /// Render the report as a GitHub-flavoured Markdown table.

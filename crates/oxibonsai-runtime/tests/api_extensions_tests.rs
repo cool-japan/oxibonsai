@@ -2,6 +2,11 @@
 //!
 //! Covers api_types helpers, api_extensions utilities, and the HTTP endpoint.
 
+// The `api_extensions`, `api_types`, and `server` modules are only compiled
+// with the `server` feature, so this integration test must be gated the same
+// way to keep `--no-default-features` green.
+#![cfg(feature = "server")]
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use std::collections::HashMap;

@@ -1,0 +1,1998 @@
+//! The `/v1/chat/completions` request pipeline: validation, sampling-params
+//! resolution, non-streaming and SSE-streaming generation.
+//!
+//! Split out of `server.rs` (which stayed the single assembly/route/type
+//! definition point) purely to keep both files under the workspace's
+//! 2000-line ceiling — every item here is `server`-private (or
+//! `pub(super)` for the one route handler `create_router_full` registers),
+//! so this split changes no public API and no behavior.
+//!
+//! `use super::*;` pulls in `server.rs`'s own imports (axum types,
+//! `AppState`, the request/response/chunk types, `RequestId`, `SamplingParams`
+//! / `PenaltyParams`, `TokenizerBridge`, the `budget`/`sanitize`/`sse`/
+//! `blocking` sibling submodules, …) — the same pattern `server.rs`'s own
+//! `#[cfg(test)] mod tests` already uses to reach its parent's private items.
+
+use super::*;
+
+struct ActiveRequestGuard(Arc<InferenceMetrics>);
+
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        self.0.active_requests.dec();
+    }
+}
+
+/// Sampling-parameter overrides extracted from a request.
+///
+/// Overlaid onto whatever the acquired engine replica is actually running
+/// with ([`crate::engine::InferenceEngine::sampling_params`]) — **never**
+/// onto a bare [`SamplingParams::default()`] (gatekeeper REQUIRED#1(b)): the
+/// latter silently reintroduced a `repetition_penalty` of `1.1` for every
+/// request regardless of the engine's configured startup defaults, which
+/// also permanently disqualified a plain `temperature: 0` request from the
+/// fused GPU-argmax fast path (`InferenceEngine::greedy_gpu_eligible`
+/// requires `repetition_penalty == 1.0`).
+#[derive(Debug, Clone)]
+struct SamplingOverrides {
+    temperature: f32,
+    top_p: Option<f32>,
+    top_k: Option<usize>,
+    repetition_penalty: Option<f32>,
+}
+
+impl SamplingOverrides {
+    fn from_request(body: &ChatCompletionRequest) -> Self {
+        Self {
+            temperature: body.temperature,
+            top_p: body.top_p,
+            top_k: body.top_k,
+            repetition_penalty: body.repetition_penalty,
+        }
+    }
+
+    /// Overlay these overrides onto `seeded` (the engine's ambient
+    /// [`SamplingParams`], read via
+    /// [`crate::engine::InferenceEngine::sampling_params`] on the lease that
+    /// will actually run this request).
+    fn apply(&self, seeded: &SamplingParams) -> SamplingParams {
+        let mut params = seeded.clone();
+        params.temperature = self.temperature;
+        if let Some(top_p) = self.top_p {
+            params.top_p = top_p;
+        }
+        if let Some(top_k) = self.top_k {
+            params.top_k = top_k;
+        }
+        if let Some(rp) = self.repetition_penalty {
+            params.repetition_penalty = rp;
+        }
+        params
+    }
+}
+
+/// A slot the outer per-request-timeout branch in [`chat_completions`] uses
+/// to cancel whichever generation is in flight for this request, once one
+/// has actually started (`SV-09` server wiring).
+///
+/// The token itself is created deep inside [`chat_completions_non_stream`]
+/// / [`chat_completions_stream`] (where the lease is acquired), so this slot
+/// is how it becomes visible to the outer timeout branch, which runs
+/// concurrently via `tokio::time::timeout`. `None` until a lease is
+/// acquired and armed — the timeout branch is a no-op if it fires before
+/// that (the request is still queued on the pool, not yet running, so there
+/// is nothing to cancel; the pool acquire future is what gets dropped, which
+/// is enough on its own).
+#[derive(Clone, Default)]
+struct CancelSlot(Arc<std::sync::Mutex<Option<crate::engine_control::CancellationToken>>>);
+
+impl CancelSlot {
+    /// Record the token this request's generation was armed with.
+    fn arm(&self, token: crate::engine_control::CancellationToken) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = Some(token);
+        }
+    }
+
+    /// Cancel whichever generation this slot currently holds a token for, if
+    /// any. Idempotent and safe to call even when nothing has armed yet.
+    fn request_cancel(&self) {
+        if let Ok(slot) = self.0.lock() {
+            if let Some(token) = slot.as_ref() {
+                token.cancel();
+            }
+        }
+    }
+}
+
+/// Prefill chunk size armed alongside a [`CancelSlot`] cancellation token
+/// (`SV-09`), so a long prompt's ingest observes the deadline instead of
+/// running the whole prefill as one uninterruptible call. Small enough to
+/// keep cancellation latency low, large enough not to meaningfully slow
+/// down prefill throughput.
+const CANCELLATION_PREFILL_CHUNK_TOKENS: usize = 512;
+
+/// Owns everything that must live exactly as long as a streaming chat
+/// completion's SSE body (`SV-08`): the in-flight gauge and the workload
+/// rate-tracker sample fed to the `/admin/workload-stats` aggregator
+/// (`SV-19`).
+///
+/// Wrapping the underlying stream in this type — rather than a bare local
+/// variable in the handler — is what makes the gauge decrement (and the
+/// rate sample get recorded) exactly once, whether the stream runs to
+/// completion or the client disconnects early: both paths drop the wrapper
+/// (a client disconnect drops the whole response body, which drops this
+/// wrapper along with it), and `Drop` runs exactly once either way. The
+/// previous design created the gauge guard as a plain local in the async
+/// handler, which dropped as soon as the *initial* SSE `Response` object was
+/// constructed — i.e. before the client had received a single byte of the
+/// actual generation — permanently under-counting genuinely in-flight
+/// streaming requests and never recording a rate sample for them at all.
+struct StreamLifecycleGuard<S> {
+    inner: S,
+    rate_aggregator: Arc<crate::request_metrics::RequestRateAggregator>,
+    tracker: Arc<std::sync::Mutex<crate::request_metrics::RequestRateTracker>>,
+    /// SV-08: the instant the *whole request* started (not just the SSE
+    /// head). `chat_completions` skips its own post-`.await` observation on
+    /// the streaming branch, so `Drop` here is the only place a streaming
+    /// request's latency is recorded, at true stream end.
+    request_start: std::time::Instant,
+    /// Shared metrics registry the histogram observation above is recorded
+    /// into.
+    metrics: Arc<InferenceMetrics>,
+    /// Decrements `active_requests` when this guard drops. Declared last so
+    /// it is dropped last among this struct's own fields (Rust drops fields
+    /// in declaration order) — immaterial for correctness here since the
+    /// two effects are independent, but keeps the gauge decrement visibly
+    /// "closest to the end" for a reader.
+    _active_guard: ActiveRequestGuard,
+}
+
+impl<S: tokio_stream::Stream + Unpin> tokio_stream::Stream for StreamLifecycleGuard<S> {
+    type Item = S::Item;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        std::pin::Pin::new(&mut this.inner).poll_next(cx)
+    }
+}
+
+impl<S> Drop for StreamLifecycleGuard<S> {
+    fn drop(&mut self) {
+        if let Ok(tracker) = self.tracker.lock() {
+            // Only record a sample when at least one token was actually
+            // emitted. An unconditional record would feed a
+            // `tokens_per_second: 0.0` / zero-elapsed sample into the
+            // aggregator for every request that never got that far (a
+            // prefill error, or a client that disconnects before the first
+            // token) — dragging down the very averages `/admin/workload-stats`
+            // (`SV-19`) exists to report *truthfully*.
+            if tracker.tokens_emitted() > 0 {
+                self.rate_aggregator.record(tracker.snapshot());
+            }
+        }
+        // SV-08: observe the latency histogram at the stream's *true* end
+        // (completion or disconnect, either of which drops this guard
+        // exactly once), not at SSE-head construction time --
+        // `chat_completions` skips its own observation on this branch so it
+        // is not double-counted.
+        self.metrics
+            .request_duration_seconds
+            .observe(self.request_start.elapsed().as_secs_f64());
+        // `_active_guard`'s own `Drop` decrements `active_requests`
+        // automatically once this function returns.
+    }
+}
+
+/// Find the earliest occurrence of any of `stop_sequences` in `text`.
+///
+/// Returns `(byte_offset, matched_sequence)` for the match that starts at
+/// the smallest byte offset (ties broken by the order `stop_sequences` lists
+/// them, matching a linear left-to-right scan). `None` when no sequence
+/// appears, or when `stop_sequences` is empty, or when a sequence is empty
+/// (an empty stop string can never delimit anything and must not spuriously
+/// "match" at offset 0).
+fn find_first_stop_match<'a>(text: &str, stop_sequences: &'a [String]) -> Option<(usize, &'a str)> {
+    stop_sequences
+        .iter()
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| text.find(s.as_str()).map(|pos| (pos, s.as_str())))
+        .min_by_key(|&(pos, _)| pos)
+}
+
+/// Incremental stop-sequence state for a single streaming chat completion
+/// (`SV-12`/`RT-04`), shared between the per-token decode closure and the
+/// end-of-stream flush step in [`chat_completions_stream`].
+///
+/// Holds back the last `max_stop_len - 1` bytes of accumulated decoded text
+/// at all times, so a stop sequence split across two decode chunks is still
+/// caught before any of it reaches the client (the same class of bug
+/// `RT-06` names for `api_extensions.rs`'s independent implementation).
+#[derive(Default)]
+struct StopTracker {
+    accumulated: String,
+    emitted_len: usize,
+    stopped: bool,
+}
+
+impl StopTracker {
+    /// Append `text` to the accumulated decoded output and return whatever
+    /// portion is now safe to release to the client: everything up to (but
+    /// not including) a stop-sequence match, or — when no match is found —
+    /// everything except a trailing `max_stop_len - 1`-byte holdback
+    /// window, snapped back to a valid UTF-8 char boundary (`accumulated`
+    /// is always valid UTF-8 as a whole, since it is built only from
+    /// `step_decode`'s already-complete pieces, but an arbitrary byte
+    /// offset within it need not land on a char boundary).
+    ///
+    /// Sets `self.stopped` on a match. A no-op once `self.stopped` is
+    /// already set.
+    fn push_and_release(
+        &mut self,
+        text: &str,
+        stop_sequences: &[String],
+        max_stop_len: usize,
+    ) -> String {
+        if self.stopped {
+            return String::new();
+        }
+        self.accumulated.push_str(text);
+        // A match can only ever start at or after `emitted_len`: were one
+        // to start earlier, the holdback below would already have caught
+        // it (an at-most-`max_stop_len - 1`-byte tail can never contain a
+        // *complete* match on its own, by construction) — searching only
+        // the unemitted suffix is therefore both correct and cheaper than
+        // rescanning from the start every time.
+        let unemitted = &self.accumulated[self.emitted_len..];
+        match find_first_stop_match(unemitted, stop_sequences) {
+            Some((rel_pos, _matched)) => {
+                self.stopped = true;
+                let abs_pos = self.emitted_len + rel_pos;
+                let out = self.accumulated[self.emitted_len..abs_pos].to_string();
+                self.emitted_len = self.accumulated.len(); // nothing more will ever be released.
+                out
+            }
+            None => {
+                let target = self
+                    .accumulated
+                    .len()
+                    .saturating_sub(max_stop_len.saturating_sub(1));
+                let mut boundary = target.min(self.accumulated.len());
+                while boundary > self.emitted_len && !self.accumulated.is_char_boundary(boundary) {
+                    boundary -= 1;
+                }
+                if boundary > self.emitted_len {
+                    let out = self.accumulated[self.emitted_len..boundary].to_string();
+                    self.emitted_len = boundary;
+                    out
+                } else {
+                    String::new()
+                }
+            }
+        }
+    }
+
+    /// Release everything still held back by the holdback window. Called
+    /// once generation has ended (EOS / `max_tokens`) without ever matching
+    /// a stop sequence, since "might still be the unfinished start of a
+    /// match" no longer applies once there is nothing left to arrive.
+    ///
+    /// Returns an empty string (never re-releasing anything) once a stop
+    /// sequence already matched, or once nothing remains to release.
+    fn take_remaining(&mut self) -> String {
+        if self.stopped || self.emitted_len >= self.accumulated.len() {
+            return String::new();
+        }
+        let out = self.accumulated[self.emitted_len..].to_string();
+        self.emitted_len = self.accumulated.len();
+        out
+    }
+}
+
+#[tracing::instrument(skip(state, headers, body), fields(request_id))]
+pub(super) async fn chat_completions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    OpenAiJson(body): OpenAiJson<ChatCompletionRequest>,
+) -> Result<Response, ApiError> {
+    let request_id = resolve_request_id(&headers);
+    tracing::Span::current().record("request_id", tracing::field::display(&request_id));
+
+    // SV-09 server wiring: this slot lets the timeout branch below cancel
+    // whichever generation `chat_completions_inner` starts, once it starts
+    // one — see [`CancelSlot`].
+    let cancel_slot = CancelSlot::default();
+
+    // sec-08: bound the WHOLE handler, not just the generation call. For the
+    // streaming branch this covers the response head; the SSE body carries the
+    // same deadline into `sse::sse_response`, so a stalled client cannot hold
+    // the connection (and the engine replica's turn) open indefinitely.
+    let result = match state.limits.per_request_timeout {
+        Some(limit) => {
+            match tokio::time::timeout(
+                limit,
+                chat_completions_inner(Arc::clone(&state), body, request_id, cancel_slot.clone()),
+            )
+            .await
+            {
+                Ok(inner) => inner,
+                Err(_) => {
+                    // SV-09: stop the in-flight generation (if one had
+                    // started) rather than letting it run to completion on a
+                    // pool replica the client will never see the answer
+                    // from.
+                    cancel_slot.request_cancel();
+                    state.metrics.errors_total.inc();
+                    tracing::warn!(
+                        timeout_ms = limit.as_millis() as u64,
+                        "request exceeded the per-request timeout"
+                    );
+                    Err(ApiError::timeout(format!(
+                        "request exceeded the server's per-request timeout of {} ms",
+                        limit.as_millis()
+                    )))
+                }
+            }
+        }
+        None => chat_completions_inner(Arc::clone(&state), body, request_id, cancel_slot).await,
+    };
+
+    result.map_err(|err| err.with_request_id(request_id))
+}
+
+/// The chat handler proper. Split out so [`chat_completions`] can wrap it in
+/// the per-request deadline without duplicating the body.
+async fn chat_completions_inner(
+    state: Arc<AppState>,
+    body: ChatCompletionRequest,
+    request_id: RequestId,
+    cancel_slot: CancelSlot,
+) -> Result<Response, ApiError> {
+    // SV-15(c) / SV-12 (`max_completion_tokens`): resolve the effective
+    // completion budget from the request and the server's configured
+    // default *before* validating, so `validate_chat_request` checks the
+    // number that will actually be used.
+    let effective_max_tokens = resolve_effective_max_tokens(&body, state.default_max_tokens);
+
+    // Validate client-supplied limits/sampling params *before* touching the
+    // engine or the in-flight counter, so a rejected request neither drives an
+    // unbounded allocation nor unbalances `active_requests`.
+    if let Err((message, param)) =
+        validate_chat_request(&body, effective_max_tokens, state.max_output_tokens_ceiling)
+    {
+        state.metrics.requests_total.inc();
+        state.metrics.errors_total.inc();
+        return Err(ApiError::bad_request(message, param));
+    }
+
+    // SV-12 (`model`): when a multi-model router is attached, reject a
+    // request naming a model this deployment does not serve rather than
+    // silently running it on whatever the pool happens to hold. With no
+    // router attached (the common single-model deployment) the field is
+    // accepted and ignored, matching every real OpenAI client, which always
+    // sends it.
+    if let (Some(requested), Some(router)) = (body.model.as_deref(), state.model_router()) {
+        let known = router.models_list().into_iter().any(|m| m.id == requested);
+        if !known {
+            state.metrics.requests_total.inc();
+            state.metrics.errors_total.inc();
+            return Err(ApiError::bad_request(
+                format!("model \"{requested}\" is not served by this deployment"),
+                "model",
+            ));
+        }
+    }
+
+    // `tools`/`tool_choice` and `logprobs` need either the complete generated
+    // text (tool-call parsing) or the per-step logits (logprobs), neither of
+    // which the token-by-token SSE path exposes, so combining them with
+    // `stream: true` is rejected honestly with `400` — the same decision the
+    // extended endpoint makes for stream + tools — instead of silently
+    // dropping the incompatible field. `tool_choice: "none"` is the client
+    // explicitly opting out of tool calling, so streaming stays allowed there.
+    let tool_choice_none = matches!(
+        body.tool_choice
+            .as_ref()
+            .and_then(serde_json::Value::as_str),
+        Some("none")
+    );
+    let tools_active =
+        body.tools.as_ref().map(|t| !t.is_empty()).unwrap_or(false) && !tool_choice_none;
+    let want_logprobs = body.logprobs.unwrap_or(false);
+    if body.stream && tools_active {
+        state.metrics.requests_total.inc();
+        state.metrics.errors_total.inc();
+        return Err(ApiError::bad_request(
+            "stream: true is not supported together with tools: tool-call parsing needs the \
+             complete generated text, which isn't available until streaming finishes; omit \
+             tools, set tool_choice to \"none\", or set stream to false",
+            "stream",
+        ));
+    }
+    if body.stream && want_logprobs {
+        state.metrics.requests_total.inc();
+        state.metrics.errors_total.inc();
+        return Err(ApiError::bad_request(
+            "stream: true is not supported together with logprobs: per-token logprobs are \
+             captured from the non-streaming decode path only; omit logprobs or set stream to \
+             false",
+            "logprobs",
+        ));
+    }
+
+    // Sampling overrides are resolved into a full `SamplingParams` once each
+    // generation path has acquired its engine lease (gatekeeper
+    // REQUIRED#1(b)): seeding from `engine.sampling_params()` needs a lease,
+    // and acquiring one *here* — before the model-descriptor lookup just
+    // below, which itself acquires a lease on its first (cache-cold) call —
+    // would self-deadlock a single-replica pool. See [`SamplingOverrides`].
+    let overrides = SamplingOverrides::from_request(&body);
+
+    // OpenAI frequency/presence penalties are now applied for real over the
+    // generated-token history (previously this endpoint silently ignored
+    // them). An all-zero `PenaltyParams` is a no-op, so a request that omits
+    // both penalties stays bit-identical to the previous behavior.
+    let penalties = PenaltyParams::new(
+        body.frequency_penalty.unwrap_or(0.0),
+        body.presence_penalty.unwrap_or(0.0),
+    );
+    let top_logprobs = body.top_logprobs.unwrap_or(0);
+
+    // SV-12/RT-04: stop sequences, applied by both generation paths (see
+    // `find_first_stop_match` and its two call sites below).
+    let stop_sequences = body
+        .stop
+        .map(crate::api_types::StopSequences::into_vec)
+        .unwrap_or_default();
+    // SV-12: deterministic seed, validated against stream/logprobs
+    // incompatibility above.
+    let seed = body.seed;
+
+    let request_start = std::time::Instant::now();
+    state.metrics.requests_total.inc();
+    state.metrics.active_requests.inc();
+    let active_guard = ActiveRequestGuard(Arc::clone(&state.metrics));
+
+    // sec-05 (byte half): bound the raw input BEFORE sanitizing or tokenizing,
+    // both of which are linear in the prompt length. This is also what keeps
+    // sec-01's scan and the tokenizer off an arbitrarily large body.
+    let prompt_bytes: usize = body
+        .messages
+        .iter()
+        .filter_map(|m| m.content.as_ref())
+        .map(|c| c.len())
+        .sum();
+    budget::validate_prompt_bytes(prompt_bytes, state.limits.max_prompt_bytes).inspect_err(
+        |_| {
+            state.metrics.errors_total.inc();
+        },
+    )?;
+
+    // Build the prompt. With a tokenizer attached this neutralizes control
+    // tokens by ID after a per-segment encode (finding `TOK-M2`); the
+    // `<|...|>` raw-text guard still runs first (finding `sec-01`).
+    let prompt_tokens = match &state.tokenizer {
+        Some(tok) => sanitize::encode_chat_prompt(
+            tok,
+            &body.messages,
+            &state.special_tokens,
+            state.sanitize_prompt(),
+        )
+        .map_err(|e| {
+            tracing::error!(error = %e, "prompt tokenization failed");
+            state.metrics.errors_total.inc();
+            ApiError::internal("failed to tokenize the prompt")
+        })?,
+        // Fallback: single start token
+        None => vec![151644],
+    };
+
+    // sec-05 (token half): reject an over-long prompt with a 400 naming the
+    // real numbers instead of letting it become an opaque 500 in the engine.
+    let descriptor = state.model_info().descriptor().await;
+    let ctx_len = descriptor.max_context_length;
+    budget::validate_request_budget(
+        prompt_tokens.len(),
+        effective_max_tokens,
+        ctx_len,
+        state.limits.max_input_tokens,
+    )
+    .inspect_err(|_| {
+        state.metrics.errors_total.inc();
+    })?;
+
+    state
+        .metrics
+        .prompt_tokens_total
+        .inc_by(prompt_tokens.len() as u64);
+
+    // SV-19: feed a real per-request context-utilization pressure sample
+    // into the KV cache policy so `/admin/cache-stats` reflects genuine
+    // load instead of a permanent null. This deployment does not act on the
+    // policy's tier decisions (RT-14 is out of this package's scope), only
+    // observes and reports them — the demote-to-telemetry option that
+    // finding's own fix explicitly allows.
+    if ctx_len > 0 {
+        let pressure = prompt_tokens.len() as f64 / ctx_len as f64;
+        state.kv_cache_policy.observe(pressure);
+    }
+
+    let created = unix_now_secs();
+    let model_id = descriptor.id.clone();
+
+    // SV-08: captured before branching so the post-`.await` skip-logic
+    // below can tell whether a `StreamLifecycleGuard` was actually
+    // constructed (and will observe `request_duration_seconds` itself, in
+    // `Drop`) without re-reading `body`.
+    let is_stream = body.stream;
+    let result = if is_stream {
+        // ── SSE streaming mode ──
+        chat_completions_stream(
+            Arc::clone(&state),
+            StreamRequest {
+                prompt_tokens,
+                max_tokens: effective_max_tokens,
+                overrides,
+                penalties,
+                stop_sequences,
+                seed,
+                cancel_slot,
+                include_usage: body
+                    .stream_options
+                    .as_ref()
+                    .map(|o| o.include_usage)
+                    .unwrap_or(false),
+                request_id,
+                request_start,
+                active_guard,
+            },
+        )
+        .await
+    } else {
+        // ── Non-streaming mode ──
+        // `active_guard` is not moved in this branch, so it stays alive
+        // (per ordinary Rust scoping) until `chat_completions_inner`
+        // returns — i.e. for the whole non-streaming generation, exactly
+        // as the original single-guard design did.
+        chat_completions_non_stream(
+            Arc::clone(&state),
+            NonStreamRequest {
+                prompt_tokens,
+                max_tokens: effective_max_tokens,
+                overrides,
+                penalties,
+                stop_sequences,
+                seed,
+                cancel_slot,
+                tools_active,
+                want_logprobs,
+                top_logprobs,
+                request_id,
+                created,
+                model_id,
+            },
+        )
+        .await
+    };
+
+    // SV-08: a *successful* stream already carries `request_start` into its
+    // `StreamLifecycleGuard`, which observes the real latency in `Drop` at
+    // true stream end -- observing it here too would under-report it
+    // (near-zero) and double-count the sample. A stream that fails *before*
+    // the guard exists (e.g. no engine replica available) has no such
+    // guard, so it is still observed here, like a non-streaming request.
+    let already_covered_by_stream_guard = is_stream && result.is_ok();
+    if !already_covered_by_stream_guard {
+        let elapsed = request_start.elapsed().as_secs_f64();
+        state.metrics.request_duration_seconds.observe(elapsed);
+    }
+
+    if result.is_err() {
+        state.metrics.errors_total.inc();
+    }
+
+    result
+}
+
+/// Bundled inputs for a single non-streaming chat completion.
+///
+/// Grouped into one struct so [`chat_completions_non_stream`] stays within
+/// clippy's argument-count budget now that the base endpoint honors penalties,
+/// tool calling, and logprobs in addition to the original sampling params.
+/// Bundled inputs for one streaming chat completion.
+struct StreamRequest {
+    prompt_tokens: Vec<u32>,
+    max_tokens: usize,
+    overrides: SamplingOverrides,
+    penalties: PenaltyParams,
+    /// Stop sequences (`SV-12`/`RT-04`), checked incrementally against the
+    /// accumulated decoded text; a match truncates the emitted content and
+    /// cancels the in-flight generation early.
+    stop_sequences: Vec<String>,
+    /// Deterministic sampling seed. Streaming + seed is rejected with `400`
+    /// by `validate_chat_request` (no streaming generation seam accepts a
+    /// per-call seed), so this is always `None` by the time it reaches
+    /// [`chat_completions_stream`] — carried through anyway so the type
+    /// documents the (currently unreachable) combination rather than
+    /// silently dropping the field earlier in the pipeline.
+    seed: Option<u64>,
+    /// SV-09 server wiring: armed with a fresh [`crate::engine_control::CancellationToken`]
+    /// once the engine lease is acquired, so the outer per-request timeout
+    /// can cancel this generation early.
+    cancel_slot: CancelSlot,
+    /// Whether the client set `stream_options.include_usage`, which adds the
+    /// final usage chunk before `[DONE]` (finding `sec-08`).
+    include_usage: bool,
+    request_id: RequestId,
+    /// SV-08: the whole request's start instant, carried into
+    /// [`StreamLifecycleGuard`] so the latency histogram is observed at
+    /// true stream end (or early disconnect) rather than at SSE-head
+    /// construction time.
+    request_start: std::time::Instant,
+    /// SV-08: kept alive for the whole SSE body (moved into
+    /// [`StreamLifecycleGuard`]), not just until the initial response head
+    /// is constructed.
+    active_guard: ActiveRequestGuard,
+}
+
+struct NonStreamRequest {
+    prompt_tokens: Vec<u32>,
+    max_tokens: usize,
+    overrides: SamplingOverrides,
+    penalties: PenaltyParams,
+    /// Stop sequences (`SV-12`/`RT-04`), applied by truncating the decoded
+    /// text at the first match (see [`chat_completions_non_stream`]'s doc
+    /// comment for why this is post-hoc rather than incremental on this
+    /// path).
+    stop_sequences: Vec<String>,
+    /// Deterministic sampling seed (`SV-12`), honored via
+    /// [`crate::engine::InferenceEngine::generate_with_seed`] when present
+    /// and `logprobs` was not requested (the two are mutually exclusive —
+    /// enforced by `validate_chat_request`).
+    seed: Option<u64>,
+    /// SV-09 server wiring: see [`StreamRequest::cancel_slot`].
+    cancel_slot: CancelSlot,
+    /// Whether tool-call parsing should run on the generated text (the client
+    /// supplied a non-empty `tools` list and did not set `tool_choice: "none"`).
+    tools_active: bool,
+    /// Whether to capture and return per-token logprobs.
+    want_logprobs: bool,
+    /// Number of top alternatives to report per token (`top_logprobs`, 0..=20).
+    top_logprobs: usize,
+    request_id: RequestId,
+    /// Unix timestamp for the response's `created` field (`SV-03`).
+    created: u64,
+    /// The served model's id for the response's `model` field (`SV-03`).
+    model_id: String,
+}
+
+/// Parse a tool call out of generated assistant text, reusing the same
+/// `<tool_call>...</tool_call>` parser the extended endpoint uses.
+///
+/// Returns `None` when tool calling is inactive (no `tools` supplied, or
+/// `tool_choice: "none"`) or when the text contains no parseable tool-call
+/// block. This is the seam that stops the base `/v1/chat/completions` endpoint
+/// from silently discarding an advertised `tools` field (finding
+/// `serve-api-03`).
+pub(crate) fn parse_base_tool_calls(
+    content: &str,
+    tools_active: bool,
+) -> Option<Vec<crate::api_types::ToolCallResult>> {
+    if !tools_active {
+        return None;
+    }
+    let call_id = crate::api_types::generate_tool_call_id();
+    crate::api_types::parse_tool_call(content, &call_id).map(|tc| {
+        vec![crate::api_types::ToolCallResult::new_function(
+            tc.id,
+            tc.function.name,
+            tc.function.arguments,
+        )]
+    })
+}
+
+/// Decode a single token id into a display string for OpenAI logprobs
+/// (`TOK-M1`).
+///
+/// Uses [`TokenizerBridge::piece`] — the raw byte-level vocabulary entry,
+/// unmapped through the byte-level alphabet — rather than
+/// [`TokenizerBridge::decode`] on a one-element slice. `decode` corrupts a
+/// token that is only part of a multi-byte UTF-8 sequence (verified against
+/// the HF oracle: `"日本語処理"`'s middle byte-fragment tokens came back as
+/// the literal placeholder string `"<id>"` via the old per-id `decode`
+/// call). `piece` + `from_utf8_lossy` cannot fully solve the general case
+/// either — a lone byte fragment is not valid UTF-8 on its own, so it still
+/// renders as `U+FFFD` — but it never fabricates a wrong *value* the way
+/// `decode`'s failure path did, and every token whose piece *is* complete,
+/// valid UTF-8 (the overwhelming majority, including every whole-CJK-word
+/// and whole-emoji token) decodes correctly. See this package's recorded
+/// deviations for the `bytes`-field caveat this implies.
+fn logprob_id_to_token(tokenizer: Option<&TokenizerBridge>, id: u32) -> String {
+    match tokenizer {
+        Some(tok) => String::from_utf8_lossy(&tok.piece(id)).into_owned(),
+        None => format!("<{id}>"),
+    }
+}
+
+/// TOK-M1's other half: correct the *chosen* token's `bytes` field on every
+/// [`crate::api_types::LogprobsContent`] `generate_with_logprobs` returns.
+///
+/// `crate::api_types::compute_logprobs` (RT-API-EXT's file, not this one)
+/// derives `bytes` from the *display string* -- correct only when that
+/// string is a complete, valid UTF-8 token. A byte-fragment token (part of
+/// a multi-byte character split across several vocabulary entries) renders
+/// as `U+FFFD`, so `bytes` came back as `U+FFFD`'s own 3-byte encoding
+/// instead of the token's real raw byte(s) -- verified against the HF
+/// oracle on `"日本語処理"`'s middle byte-fragment tokens.
+///
+/// `generate_with_logprobs` returns `output_tokens` index-aligned with its
+/// `LogprobsContent`s (engine.rs pushes both in the same loop iteration,
+/// only ever breaking *before* either push), so the real id -- and the real
+/// raw bytes via [`TokenizerBridge::piece`] -- is recoverable here, entirely
+/// within this package's owned files, without touching `compute_logprobs`'s
+/// shared signature.
+///
+/// This corrects every position's *chosen* token only. `top_logprobs`
+/// alternatives still carry the lossy-derived `bytes` because their ids
+/// never round-trip through `LogprobsContent`/`TopLogprob` -- closing that
+/// needs a signature change in `api_types.rs` itself (RT-API-EXT's file;
+/// see this package's recorded deviations).
+fn correct_logprob_bytes(
+    mut content: Vec<crate::api_types::LogprobsContent>,
+    output_tokens: &[u32],
+    tokenizer: Option<&TokenizerBridge>,
+) -> Vec<crate::api_types::LogprobsContent> {
+    let Some(tok) = tokenizer else {
+        return content;
+    };
+    for (entry, &id) in content.iter_mut().zip(output_tokens.iter()) {
+        let piece = tok.piece(id);
+        entry.bytes = if piece.is_empty() { None } else { Some(piece) };
+    }
+    content
+}
+
+/// Non-streaming chat completion handler.
+async fn chat_completions_non_stream(
+    state: Arc<AppState>,
+    req: NonStreamRequest,
+) -> Result<Response, ApiError> {
+    let NonStreamRequest {
+        prompt_tokens,
+        max_tokens,
+        overrides,
+        penalties,
+        stop_sequences,
+        seed,
+        cancel_slot,
+        tools_active,
+        want_logprobs,
+        top_logprobs,
+        request_id,
+        created,
+        model_id,
+    } = req;
+    let prompt_len = prompt_tokens.len();
+
+    let mut lease = state.acquire_engine().await.map_err(|e| {
+        tracing::error!(error = %e, "engine pool acquire failed");
+        ApiError::service_unavailable(format!("no inference engine replica is available: {e}"))
+            .with_code("engine_unavailable")
+    })?;
+
+    // gatekeeper REQUIRED#1(b): seed from the engine's actual running
+    // configuration, never `SamplingParams::default()`.
+    let seeded = lease.sampling_params().clone();
+    let params = overrides.apply(&seeded);
+
+    // SV-09 server wiring: arm cancellation now that generation is actually
+    // about to start, and expose the token to the outer per-request timeout
+    // via `cancel_slot`. Chunking prefill lets a long prompt's ingest also
+    // observe the deadline instead of running as one uninterruptible call.
+    let cancel_token = lease.arm_cancellation();
+    cancel_slot.arm(cancel_token);
+    lease.set_prefill_chunk_tokens(Some(CANCELLATION_PREFILL_CHUNK_TOKENS));
+
+    // sec-03: generation is synchronous, CPU-bound work and must not run on a
+    // tokio worker thread. `run_blocking_generation` moves the lease onto the
+    // blocking pool, resets the engine first (RT-03: no KV contamination
+    // across requests) and returns the replica to the pool when it finishes.
+    //
+    // `logprobs` generation has no per-call params argument of its own; the
+    // closure below swaps `params` onto the engine's sampler for that one
+    // call and restores it afterward (`RT-26`).
+    let state_for_generation = Arc::clone(&state);
+    let generated = run_blocking_generation(lease, move |lease| {
+        let prev_penalties = lease.penalties();
+        lease.set_penalties(penalties);
+        let result = if want_logprobs {
+            // RT-26: `lease.sampler` (`pub(crate)`, same pattern
+            // `prefix_cache_engine.rs::decode_loop` uses) is swapped and
+            // restored unconditionally, never via `?` — an early return
+            // here would leak this request's params onto the next one
+            // served by this pool replica.
+            let prev_params = lease.sampler.params().clone();
+            lease.sampler.set_params(params.clone());
+            let id_to_token = |id: u32| -> String {
+                logprob_id_to_token(state_for_generation.tokenizer.as_ref(), id)
+            };
+            let r = lease
+                .generate_with_logprobs(&prompt_tokens, max_tokens, top_logprobs, &id_to_token)
+                .map(|(tokens, lp)| (tokens, Some(lp)));
+            lease.sampler.set_params(prev_params);
+            r
+        } else if let Some(seed) = seed {
+            // SV-12: deterministic seed. `generate_with_seed` swaps in a
+            // fresh, seeded sampler carrying over whatever penalties are
+            // *currently* set on the engine (just set above), runs
+            // generation, then restores the previous sampler.
+            lease
+                .generate_with_seed(&prompt_tokens, max_tokens, seed, &params)
+                .map(|tokens| (tokens, None))
+        } else {
+            lease
+                .generate_with_params_and_penalties(&prompt_tokens, max_tokens, &params, &penalties)
+                .map(|tokens| (tokens, None))
+        };
+        lease.set_penalties(prev_penalties);
+        result
+    })
+    .await?;
+
+    let (output_tokens, logprobs_content) = generated.map_err(|e| {
+        tracing::error!(error = %e, "generation failed");
+        ApiError::internal(format!("generation failed: {e}"))
+    })?;
+
+    let completion_len = output_tokens.len();
+
+    // Record token metrics
+    state
+        .metrics
+        .tokens_generated_total
+        .inc_by(completion_len as u64);
+
+    // Decode
+    let content = if let Some(tok) = &state.tokenizer {
+        tok.decode(&output_tokens).map_err(|e| {
+            tracing::error!(error = %e, "decoding the generated tokens failed");
+            ApiError::internal(format!("failed to decode the generated tokens: {e}"))
+        })?
+    } else {
+        format!("{output_tokens:?}")
+    };
+
+    // SV-12/RT-04: stop sequences. Applied post-hoc — the engine returns the
+    // complete text in one shot on this path, so there is no incremental
+    // hook to stop the *model* early (that would need an
+    // `InferenceEngine`-level per-token text callback, outside this
+    // package's owned files; see recorded deviations) — but the *returned*
+    // text is truncated at the first match exactly like a real incremental
+    // stop would produce, so the client-visible contract is honored even
+    // though `completion_tokens` still reflects every token the engine
+    // actually computed (including the ones whose text is discarded here).
+    let (content, stopped) = match find_first_stop_match(&content, &stop_sequences) {
+        Some((pos, _matched)) => (content[..pos].to_string(), true),
+        None => (content, false),
+    };
+
+    // Tool calling: when the client supplied tools (and did not opt out via
+    // `tool_choice: "none"`), parse the generated text for a `<tool_call>` block
+    // using the same machinery as `/v1/chat/completions/extended` instead of
+    // silently dropping the advertised `tools` field (finding `serve-api-03`).
+    let tool_calls = parse_base_tool_calls(&content, tools_active);
+    let has_tool_calls = tool_calls.is_some();
+
+    // Honest finish_reason: a parsed tool call wins; a stop-sequence match
+    // wins next; otherwise report "length" when generation was truncated at
+    // max_tokens and "stop" when it ended naturally on EOS (finding
+    // `serve-api-01`).
+    let finish_reason = if has_tool_calls {
+        "tool_calls".to_string()
+    } else if stopped {
+        "stop".to_string()
+    } else if completion_len >= max_tokens {
+        "length".to_string()
+    } else {
+        "stop".to_string()
+    };
+
+    // When the assistant emitted a tool call, OpenAI reports `content: null`
+    // and carries the call in `message.tool_calls`.
+    let message_content = if has_tool_calls { None } else { Some(content) };
+
+    let response = ChatCompletionResponse {
+        id: format!("chatcmpl-{}", rand_id()),
+        object: "chat.completion".to_string(),
+        created,
+        model: model_id,
+        choices: vec![ChatChoice {
+            index: 0,
+            message: ChatMessage {
+                role: "assistant".to_string(),
+                content: message_content,
+                tool_calls,
+                tool_call_id: None,
+            },
+            finish_reason,
+            // TOK-M1: fix up `bytes` using the real per-position token id
+            // (`output_tokens`), rather than shipping api_types.rs's
+            // lossy-string-derived bytes for a byte-fragment token.
+            logprobs: logprobs_content.map(|content| crate::api_types::ChoiceLogprobs {
+                content: Some(correct_logprob_bytes(
+                    content,
+                    &output_tokens,
+                    state.tokenizer.as_ref(),
+                )),
+            }),
+        }],
+        usage: Usage {
+            prompt_tokens: prompt_len,
+            completion_tokens: completion_len,
+            total_tokens: prompt_len + completion_len,
+        },
+    };
+
+    let headers = request_id_header_map(request_id);
+    Ok((headers, Json(response)).into_response())
+}
+
+/// Build the JSON payload for the terminal SSE event of a streaming chat
+/// completion, from the real generation `outcome`.
+///
+/// * `Ok(generated)` → an ordinary finish chunk whose `finish_reason` is
+///   `"length"` when generation was truncated at `max_tokens` and `"stop"`
+///   otherwise (honest truncation signaling — finding `serve-api-01`).
+/// * `Err(message)` → an OpenAI-style error object, so a mid-stream failure
+///   (including a prefill error that emitted zero tokens) is surfaced to the
+///   client instead of being masked as a clean, complete response (finding
+///   `serve-api-02`).
+fn stream_terminal_json(
+    outcome: Result<usize, String>,
+    max_tokens: usize,
+    id: &str,
+    created: u64,
+    model: &str,
+    include_usage: bool,
+) -> String {
+    match outcome {
+        Ok(generated) => {
+            let finish_reason = if generated >= max_tokens {
+                "length"
+            } else {
+                "stop"
+            };
+            let finish_chunk = ChatCompletionChunk {
+                id: id.to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created,
+                model: model.to_string(),
+                choices: vec![ChunkChoice {
+                    index: 0,
+                    delta: ChunkDelta {
+                        role: None,
+                        content: None,
+                    },
+                    finish_reason: Some(finish_reason.to_string()),
+                }],
+                usage: usage_placeholder(include_usage),
+            };
+            serde_json::to_string(&finish_chunk).unwrap_or_default()
+        }
+        Err(message) => {
+            tracing::error!(error = %message, "streaming generation failed mid-stream");
+            ApiError::internal(message).to_json().to_string()
+        }
+    }
+}
+
+/// `Some(null)` when the client asked for usage (OpenAI puts an explicit
+/// `"usage": null` on every non-final chunk in that mode), `None` — i.e. the
+/// member is omitted entirely — otherwise.
+fn usage_placeholder(include_usage: bool) -> Option<serde_json::Value> {
+    include_usage.then_some(serde_json::Value::Null)
+}
+
+/// The final usage-carrying chunk emitted just before `[DONE]` when
+/// `stream_options.include_usage` is set (finding `sec-08`). It has an empty
+/// `choices` array and real token counts, exactly like the OpenAI stream.
+fn stream_usage_chunk_json(
+    id: &str,
+    created: u64,
+    model: &str,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+) -> String {
+    let chunk = ChatCompletionChunk {
+        id: id.to_string(),
+        object: "chat.completion.chunk".to_string(),
+        created,
+        model: model.to_string(),
+        choices: Vec::new(),
+        usage: Some(serde_json::json!({
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        })),
+    };
+    serde_json::to_string(&chunk).unwrap_or_default()
+}
+
+/// Everything the SSE tail emits for one generation outcome: the finish (or
+/// error) chunk, followed by the usage chunk when the client asked for it and
+/// generation succeeded.
+fn stream_terminal_payloads(
+    outcome: Result<usize, String>,
+    max_tokens: usize,
+    id: &str,
+    created: u64,
+    model: &str,
+    include_usage: bool,
+    prompt_tokens: usize,
+) -> Vec<String> {
+    let generated = outcome.as_ref().ok().copied();
+    let mut payloads = vec![stream_terminal_json(
+        outcome,
+        max_tokens,
+        id,
+        created,
+        model,
+        include_usage,
+    )];
+    if include_usage {
+        if let Some(completion_tokens) = generated {
+            payloads.push(stream_usage_chunk_json(
+                id,
+                created,
+                model,
+                prompt_tokens,
+                completion_tokens,
+            ));
+        }
+    }
+    payloads
+}
+
+/// SSE streaming chat completion handler.
+async fn chat_completions_stream(
+    state: Arc<AppState>,
+    req: StreamRequest,
+) -> Result<Response, ApiError> {
+    let StreamRequest {
+        prompt_tokens,
+        max_tokens,
+        overrides,
+        penalties,
+        stop_sequences,
+        seed: _seed, // always None here: stream + seed is rejected by validate_chat_request.
+        cancel_slot,
+        include_usage,
+        request_id,
+        request_start,
+        active_guard,
+    } = req;
+    let prompt_len = prompt_tokens.len();
+    let completion_id = format!("chatcmpl-{}", rand_id());
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Report the real loaded model id in the streaming chunks (resolved once and
+    // cached) instead of a hard-coded literal.
+    let model_id = state.model_info().descriptor().await.id;
+
+    let (token_tx, token_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+    // Carries the terminal payloads out of the blocking task: the finish chunk
+    // (so "stop" vs "length" is honest — finding `serve-api-01`), an error
+    // object when generation failed mid-stream (finding `serve-api-02`), and
+    // the usage chunk when the client set `stream_options.include_usage`
+    // (finding `sec-08`).
+    let (terminal_tx, terminal_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    // Acquire an engine lease in async context, then move it into the blocking
+    // generation task. The lease's Drop (a synchronous std-mutex push) runs at
+    // the closure's end — no async in Drop, so this is safe off the runtime.
+    let mut lease = state.acquire_engine().await.map_err(|e| {
+        tracing::error!(error = %e, "engine pool acquire failed");
+        ApiError::service_unavailable(format!("no inference engine replica is available: {e}"))
+            .with_code("engine_unavailable")
+    })?;
+
+    // gatekeeper REQUIRED#1(b): seed from the engine's actual running
+    // configuration, never `SamplingParams::default()`.
+    let params = overrides.apply(lease.sampling_params());
+
+    // SV-09 server wiring: arm cancellation, and keep a second clone in
+    // async scope so a stop-sequence match detected on the receiving side
+    // (below) can also cut generation short, not just the outer
+    // per-request timeout.
+    let cancel_token = lease.arm_cancellation();
+    cancel_slot.arm(cancel_token.clone());
+    lease.set_prefill_chunk_tokens(Some(CANCELLATION_PREFILL_CHUNK_TOKENS));
+
+    let metrics_for_task = Arc::clone(&state.metrics);
+    let id_for_task = completion_id.clone();
+    let model_for_task = model_id.clone();
+    tokio::task::spawn_blocking(move || {
+        // RT-03: start from a clean KV cache so this request cannot inherit
+        // state from the previous one served by this pool replica.
+        lease.reset();
+        // Apply OpenAI frequency/presence penalties for the duration of this
+        // run, restoring the engine's previous penalties before the lease drops
+        // so they don't leak to the next request served by this pool replica.
+        let prev_penalties = lease.penalties();
+        lease.set_penalties(penalties);
+        let result =
+            lease.generate_streaming_with_params(&prompt_tokens, max_tokens, &params, &token_tx);
+        lease.set_penalties(prev_penalties);
+
+        // SV-08: streaming requests were previously invisible to
+        // `tokens_generated_total`/`errors_total` — recorded here (from the
+        // real outcome the engine reported), mirroring the non-streaming
+        // path's bookkeeping instead of leaving both counters untouched.
+        match &result {
+            Ok(count) => metrics_for_task
+                .tokens_generated_total
+                .inc_by(*count as u64),
+            Err(_) => metrics_for_task.errors_total.inc(),
+        }
+
+        // Report the outcome to the SSE tail. A dropped receiver is harmless.
+        for payload in stream_terminal_payloads(
+            result.map_err(|e| e.to_string()),
+            max_tokens,
+            &id_for_task,
+            created,
+            &model_for_task,
+            include_usage,
+            prompt_len,
+        ) {
+            let _ = terminal_tx.send(payload);
+        }
+        // lease (and thus token_tx) is dropped here: the engine returns to the
+        // pool and the channel closes.
+    });
+
+    // Build SSE stream from the token receiver
+    let id_for_stream = completion_id;
+    let state_for_stream = Arc::clone(&state);
+
+    // First, send a role delta
+    let role_chunk = ChatCompletionChunk {
+        id: id_for_stream.clone(),
+        object: "chat.completion.chunk".to_string(),
+        created,
+        model: model_id.clone(),
+        choices: vec![ChunkChoice {
+            index: 0,
+            delta: ChunkDelta {
+                role: Some("assistant".to_string()),
+                content: None,
+            },
+            finish_reason: None,
+        }],
+        usage: usage_placeholder(include_usage),
+    };
+
+    let role_event = match serde_json::to_string(&role_chunk) {
+        Ok(json) => json,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to serialize the SSE role chunk");
+            return Err(ApiError::internal(
+                "failed to serialize the streaming response",
+            ));
+        }
+    };
+
+    let id_clone = id_for_stream.clone();
+    let model_for_stream = model_id.clone();
+
+    // Convert token receiver into a stream of SSE events
+    let token_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(token_rx);
+
+    // Per-request streaming-decode state.  BPE tokens may straddle UTF-8
+    // codepoint boundaries (CJK, emoji), so we buffer through HF's
+    // step_decode_stream and only emit a chunk when a complete UTF-8 piece is
+    // ready.  Mid-codepoint tokens yield `Ok(None)` and are filtered out.
+    let mut stream_state = state_for_stream
+        .tokenizer
+        .as_ref()
+        .map(|t| t.new_decode_stream(true));
+
+    // SV-19: per-request rate tracker, shared with `StreamLifecycleGuard`
+    // (below) which records the final snapshot into the admin aggregator
+    // when the stream ends. Tracked here (the async receiving side) rather
+    // than inside the blocking generation task because that is where each
+    // token becomes observable to *this* handler at all — the engine call
+    // that produces them offers no per-token callback across the
+    // process/thread boundary.
+    let tracker = Arc::new(std::sync::Mutex::new(
+        crate::request_metrics::RequestRateTracker::new(),
+    ));
+    if let Ok(mut t) = tracker.lock() {
+        t.record_admission();
+    }
+    let tracker_for_stream = Arc::clone(&tracker);
+
+    // SV-12/RT-04: stop sequences, checked against the accumulated decoded
+    // text as it arrives.
+    //
+    // A naive "check `accumulated`, emit whatever this token decoded to"
+    // scheme leaks a stop sequence that happens to split across two decode
+    // chunks: chunk N-1 emits "ST", chunk N would emit "OP", and only once
+    // "OP" arrives does "STOP" become visible in `accumulated` — but "ST"
+    // was already sent to the client, and SSE has no take-backs (this is
+    // finding `RT-06`'s bug class, for the chunk boundary rather than the
+    // UTF-8-codepoint one `step_decode` already handles). The fix is the
+    // same one RT-06 prescribes: hold back the last `max_stop_len - 1`
+    // bytes of `accumulated` — never emit a suffix that could still be the
+    // unfinished start of a stop sequence — and only release bytes once a
+    // longer window has passed without them completing a match.
+    let max_stop_len = stop_sequences
+        .iter()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.len())
+        .max()
+        .unwrap_or(0);
+    // Shared with the flush step below (built after `content_stream` ends
+    // without ever matching): the holdback window means up to
+    // `max_stop_len - 1` already-safe bytes can still be sitting unreleased
+    // when generation ends naturally (EOS / `max_tokens`), and they must
+    // still reach the client rather than being silently dropped.
+    let stop_state = Arc::new(std::sync::Mutex::new(StopTracker::default()));
+    let stop_state_for_stream = Arc::clone(&stop_state);
+
+    let content_stream = token_stream.filter_map(move |token_id| {
+        if let Ok(mut t) = tracker_for_stream.lock() {
+            if t.tokens_emitted() == 0 {
+                t.record_first_token();
+            } else {
+                t.record_token();
+            }
+        }
+
+        let already_stopped = stop_state_for_stream
+            .lock()
+            .map(|s| s.stopped)
+            .unwrap_or(false);
+        if already_stopped {
+            return None;
+        }
+
+        let text = match (&state_for_stream.tokenizer, stream_state.as_mut()) {
+            (Some(tok), Some(state)) => match tok.step_decode(state, token_id) {
+                Ok(Some(txt)) => txt,
+                Ok(None) => return None,
+                Err(_) => format!("[{token_id}]"),
+            },
+            _ => format!("[{token_id}]"),
+        };
+
+        let text = if stop_sequences.is_empty() {
+            text
+        } else {
+            let Ok(mut state) = stop_state_for_stream.lock() else {
+                return None;
+            };
+            let released = state.push_and_release(&text, &stop_sequences, max_stop_len);
+            if state.stopped {
+                cancel_token.cancel();
+            }
+            released
+        };
+
+        if text.is_empty() {
+            // Either nothing is safe to release yet (still within the
+            // holdback window), this chunk's text was entirely consumed by
+            // a just-detected stop boundary, or the decoder legitimately
+            // produced an empty piece — either way, an empty content delta
+            // would serve no purpose.
+            return None;
+        }
+
+        let chunk = ChatCompletionChunk {
+            id: id_clone.clone(),
+            object: "chat.completion.chunk".to_string(),
+            created,
+            model: model_for_stream.clone(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: ChunkDelta {
+                    role: None,
+                    content: Some(text),
+                },
+                finish_reason: None,
+            }],
+            usage: usage_placeholder(include_usage),
+        };
+
+        Some(serde_json::to_string(&chunk).unwrap_or_default())
+    });
+
+    // Release whatever the holdback window above is still sitting on, once
+    // `content_stream` is exhausted (`.chain` only polls this after that),
+    // *provided* no stop sequence ever matched (a match already released
+    // everything it safely could and marked nothing more should follow).
+    // `std::iter::once_with` defers evaluation to the first (only) poll, so
+    // this genuinely runs "at content_stream's end", not eagerly when the
+    // chain is assembled.
+    let id_for_flush = id_for_stream.clone();
+    let model_for_flush = model_id.clone();
+    let flush_stream = tokio_stream::iter(std::iter::once_with(move || {
+        let mut state = stop_state.lock().ok()?;
+        let leftover = state.take_remaining();
+        if leftover.is_empty() {
+            return None;
+        }
+        let chunk = ChatCompletionChunk {
+            id: id_for_flush,
+            object: "chat.completion.chunk".to_string(),
+            created,
+            model: model_for_flush,
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: ChunkDelta {
+                    role: None,
+                    content: Some(leftover),
+                },
+                finish_reason: None,
+            }],
+            usage: usage_placeholder(include_usage),
+        };
+        Some(serde_json::to_string(&chunk).unwrap_or_default())
+    }))
+    .filter_map(|item| item);
+
+    // Terminal events, derived from the real generation outcome and produced by
+    // the blocking task itself:
+    //   * `Ok(count)` → an ordinary finish chunk whose `finish_reason` is
+    //     "length" when generation was truncated at `max_tokens` and "stop"
+    //     otherwise (honest truncation signaling — finding `serve-api-01`;
+    //     a stop-sequence match also reports "stop" here, since cancelling
+    //     generation means `count < max_tokens`),
+    //     optionally followed by the usage chunk (finding `sec-08`).
+    //   * `Err(message)` → an OpenAI-style error object, so a mid-stream failure
+    //     (including a prefill error that emitted zero tokens) is no longer
+    //     masked as a clean, complete response (finding `serve-api-02`).
+    let finish_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(terminal_rx);
+
+    // Prepend role event; `sse::sse_response` appends `[DONE]`, applies the
+    // keep-alive interval and enforces the per-request deadline over the whole
+    // body (finding `sec-08`).
+    let role_stream = tokio_stream::once(role_event);
+    let full_stream = role_stream
+        .chain(content_stream)
+        .chain(flush_stream)
+        .chain(finish_stream);
+
+    // SV-08/SV-19: keep the in-flight gauge decremented (and the rate
+    // sample + latency histogram recorded) at the true end of this stream's
+    // life — completion *or* early client disconnect — rather than at the
+    // moment this function returns the initial `Response` object, which
+    // happens long before the client has seen any generated text.
+    let guarded_stream = StreamLifecycleGuard {
+        inner: full_stream,
+        rate_aggregator: Arc::clone(&state.rate_aggregator),
+        tracker,
+        request_start,
+        metrics: Arc::clone(&state.metrics),
+        _active_guard: active_guard,
+    };
+
+    Ok(sse::sse_response(
+        guarded_stream,
+        &state.limits,
+        request_id_header_map(request_id),
+    ))
+}
+
+/// Generate a short random-ish ID for completion responses.
+fn rand_id() -> String {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{ts:x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── gatekeeper REQUIRED#1(b): SamplingOverrides seeds from the engine's
+    //    ambient params, never from SamplingParams::default() ─────────────
+
+    /// A discriminating ambient config: every field differs from
+    /// `SamplingParams::default()`, so a bug that seeds from the bare
+    /// default instead of this value is caught on every field, not just
+    /// the one(s) a request happens to override.
+    fn distinctive_ambient() -> SamplingParams {
+        SamplingParams {
+            temperature: 0.9,
+            top_k: 7,
+            top_p: 0.55,
+            repetition_penalty: 1.0,
+            max_tokens: 33,
+        }
+    }
+
+    #[test]
+    fn sampling_overrides_seed_from_ambient_not_default_when_request_overrides_nothing() {
+        // A request that overrides *only* temperature (the one field
+        // `ChatCompletionRequest` cannot leave `None`) must still carry
+        // every other ambient value through untouched.
+        let overrides = SamplingOverrides {
+            temperature: 0.0,
+            top_p: None,
+            top_k: None,
+            repetition_penalty: None,
+        };
+        let ambient = distinctive_ambient();
+        let params = overrides.apply(&ambient);
+
+        assert_eq!(params.temperature, 0.0, "the request's own override wins");
+        assert_eq!(
+            params.top_k, 7,
+            "must come from the engine's ambient config, not SamplingParams::default()'s 40"
+        );
+        assert!(
+            (params.top_p - 0.55).abs() < f32::EPSILON,
+            "must come from ambient, not SamplingParams::default()'s 0.9: got {}",
+            params.top_p
+        );
+        assert_eq!(
+            params.repetition_penalty, 1.0,
+            "must come from ambient (which is already 1.0 here, matching the fixed default)"
+        );
+    }
+
+    #[test]
+    fn sampling_overrides_apply_lets_every_explicit_field_win_over_ambient() {
+        let overrides = SamplingOverrides {
+            temperature: 0.3,
+            top_p: Some(0.42),
+            top_k: Some(99),
+            repetition_penalty: Some(1.25),
+        };
+        let params = overrides.apply(&distinctive_ambient());
+        assert_eq!(params.temperature, 0.3);
+        assert!((params.top_p - 0.42).abs() < f32::EPSILON);
+        assert_eq!(params.top_k, 99);
+        assert_eq!(params.repetition_penalty, 1.25);
+        // max_tokens has no request-level override seam on this struct
+        // (the effective completion length is threaded separately via
+        // `resolve_effective_max_tokens`) -- ambient passes through as-is.
+        assert_eq!(params.max_tokens, 33);
+    }
+
+    #[test]
+    fn sampling_overrides_from_request_reads_every_field() {
+        let mut body = minimal_chat_request();
+        body.temperature = 0.0;
+        body.top_p = Some(0.8);
+        body.top_k = Some(5);
+        body.repetition_penalty = Some(1.2);
+        let overrides = SamplingOverrides::from_request(&body);
+        assert_eq!(overrides.temperature, 0.0);
+        assert_eq!(overrides.top_p, Some(0.8));
+        assert_eq!(overrides.top_k, Some(5));
+        assert_eq!(overrides.repetition_penalty, Some(1.2));
+    }
+
+    /// A `ChatCompletionRequest` with only the required field set and every
+    /// optional field at its post-deserialization default -- the shared
+    /// fixture the tests in this module build on top of.
+    fn minimal_chat_request() -> ChatCompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .expect("minimal request must deserialize")
+    }
+
+    // ── RT-26 fix regression: an omitted temperature must never 400 ──────
+
+    #[test]
+    fn logprobs_with_omitted_temperature_is_not_rejected_even_against_a_custom_ambient() {
+        // The bug this guards against: comparing the wire value of
+        // `temperature` (which defaults to 0.7 whether or not the client
+        // sent it) straight against the engine's ambient temperature would
+        // 400 *every* logprobs request that said nothing about temperature,
+        // on any server whose operator configured a non-0.7 default.
+        let body = minimal_chat_request(); // temperature omitted -> wire default 0.7
+        assert!(
+            (body.temperature - default_temperature()).abs() < f32::EPSILON,
+            "sanity: an omitted field must deserialize to the wire default"
+        );
+
+        let ambient = SamplingParams {
+            temperature: 0.9, // operator-configured; deliberately != 0.7
+            ..distinctive_ambient()
+        };
+        let overrides = SamplingOverrides::from_request(&body);
+        let params = overrides.apply(&ambient);
+
+        // Reproduce exactly the guard's own condition.
+        let temperature_explicit =
+            (overrides.temperature - default_temperature()).abs() > f32::EPSILON;
+        assert!(
+            !temperature_explicit,
+            "an omitted temperature must never be treated as an explicit override"
+        );
+        let _ = params; // silence unused-var lints if the condition above is ever inlined away
+    }
+
+    #[test]
+    fn logprobs_with_an_explicit_mismatched_temperature_is_applied_not_rejected() {
+        // The counterpart, post-fix: a client that explicitly asks for a
+        // different temperature/top_p together with `logprobs` must have it
+        // APPLIED, not rejected. `chat_completions_non_stream` swaps this
+        // exact `SamplingOverrides::apply` overlay onto the engine's sampler
+        // for the duration of the `generate_with_logprobs` call (see the
+        // handler); this asserts the overlay itself carries the client's
+        // explicit values through rather than silently keeping the ambient
+        // ones, which is the value the handler's swap applies to the
+        // sampler.
+        let mut body = minimal_chat_request();
+        body.temperature = 0.0; // explicit greedy request
+        body.top_p = Some(0.33);
+        let ambient = distinctive_ambient(); // temperature: 0.9, top_p: 0.55
+
+        assert!(
+            (body.temperature - ambient.temperature).abs() > f32::EPSILON,
+            "the explicit value must actually differ from ambient for this test to mean anything"
+        );
+
+        let overrides = SamplingOverrides::from_request(&body);
+        let params = overrides.apply(&ambient);
+        assert_eq!(
+            params.temperature, 0.0,
+            "the explicit temperature must win over the ambient value, not be silently dropped"
+        );
+        assert!(
+            (params.top_p - 0.33).abs() < f32::EPSILON,
+            "the explicit top_p must win over the ambient value, not be silently dropped"
+        );
+    }
+
+    /// End-to-end companion to the two unit tests above: drives a real
+    /// request through the real `/v1/chat/completions` route (not just the
+    /// `SamplingOverrides` overlay in isolation) to prove the handler itself
+    /// no longer 400s an explicit `temperature`/`top_p` override together
+    /// with `logprobs: true`, and that logprobs are genuinely computed
+    /// under that override.
+    #[tokio::test]
+    async fn logprobs_with_mismatched_temperature_and_top_p_succeeds_end_to_end() {
+        let ambient = SamplingParams {
+            temperature: 0.9,
+            top_p: 0.55,
+            ..distinctive_ambient()
+        };
+        let config = oxibonsai_core::config::Qwen3Config::tiny_test();
+        let engine = InferenceEngine::new(config, ambient, 42);
+        let app = create_router(engine, None);
+
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 4,
+            "logprobs": true,
+            "temperature": 0.0,
+            "top_p": 0.33,
+        });
+        let req = axum::http::Request::post("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&body).expect("serialize request"),
+            ))
+            .expect("build request");
+        let resp = tower::ServiceExt::oneshot(app, req)
+            .await
+            .expect("response");
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let json: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an explicit temperature/top_p override together with logprobs:true must be \
+             applied, not rejected: {json}"
+        );
+        assert!(
+            json["choices"][0]["logprobs"]["content"].is_array(),
+            "logprobs must actually be computed and returned under the override: {json}"
+        );
+    }
+
+    // ── serve-api-03: base-endpoint tool-call parsing ────────────────────
+
+    #[test]
+    fn base_tool_calls_parsed_from_generated_text() {
+        let text =
+            r#"sure<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>"#;
+        let calls = parse_base_tool_calls(text, true).expect("tool call should be parsed");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(calls[0].r#type, "function");
+        assert!(calls[0].id.starts_with("call_"));
+    }
+
+    #[test]
+    fn base_tool_calls_none_when_inactive() {
+        // Same text, but tool calling disabled (no tools / tool_choice: none)
+        // must not fabricate a tool call.
+        let text = r#"<tool_call>{"name":"f","arguments":{}}</tool_call>"#;
+        assert!(parse_base_tool_calls(text, false).is_none());
+    }
+
+    #[test]
+    fn base_tool_calls_none_for_plain_text() {
+        assert!(parse_base_tool_calls("just a normal answer", true).is_none());
+    }
+
+    // ── serve-api-01 / serve-api-02: streaming terminal event ────────────
+
+    #[test]
+    fn stream_terminal_reports_length_when_truncated() {
+        let json = stream_terminal_json(Ok(8), 8, "id", 1, "m", false);
+        assert!(json.contains("\"finish_reason\":\"length\""), "got: {json}");
+        assert!(!json.contains("\"error\""));
+        assert!(
+            !json.contains("usage"),
+            "usage must be omitted unless the client asked for it: {json}"
+        );
+    }
+
+    #[test]
+    fn stream_terminal_reports_stop_when_natural() {
+        let json = stream_terminal_json(Ok(3), 8, "id", 1, "m", false);
+        assert!(json.contains("\"finish_reason\":\"stop\""), "got: {json}");
+    }
+
+    #[test]
+    fn stream_terminal_surfaces_error() {
+        // A mid-stream failure must produce an error object, never a bogus
+        // clean finish chunk (finding serve-api-02).
+        let json = stream_terminal_json(
+            Err("forward pass failed".to_string()),
+            8,
+            "id",
+            1,
+            "m",
+            false,
+        );
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(v["error"]["message"], "forward pass failed");
+        assert_eq!(v["error"]["type"], "server_error");
+        assert!(
+            !json.contains("finish_reason"),
+            "error event must not masquerade as a normal finish: {json}"
+        );
+    }
+
+    // ── sec-08: stream_options.include_usage ─────────────────────────────
+
+    #[test]
+    fn include_usage_adds_a_final_usage_chunk() {
+        let payloads = stream_terminal_payloads(Ok(3), 8, "id", 1, "m", true, 11);
+        assert_eq!(
+            payloads.len(),
+            2,
+            "finish chunk + usage chunk: {payloads:?}"
+        );
+
+        let finish: serde_json::Value =
+            serde_json::from_str(&payloads[0]).expect("finish chunk is JSON");
+        assert_eq!(finish["choices"][0]["finish_reason"], "stop");
+        assert!(
+            finish["usage"].is_null(),
+            "non-final chunks carry an explicit null usage: {}",
+            payloads[0]
+        );
+
+        let usage: serde_json::Value =
+            serde_json::from_str(&payloads[1]).expect("usage chunk is JSON");
+        assert_eq!(usage["object"], "chat.completion.chunk");
+        assert_eq!(usage["choices"].as_array().map(Vec::len), Some(0));
+        assert_eq!(usage["usage"]["prompt_tokens"], 11);
+        assert_eq!(usage["usage"]["completion_tokens"], 3);
+        assert_eq!(usage["usage"]["total_tokens"], 14);
+    }
+
+    #[test]
+    fn usage_chunk_is_omitted_without_stream_options() {
+        let payloads = stream_terminal_payloads(Ok(3), 8, "id", 1, "m", false, 11);
+        assert_eq!(payloads.len(), 1);
+        assert!(!payloads[0].contains("usage"));
+    }
+
+    #[test]
+    fn failed_generation_emits_no_usage_chunk() {
+        // A usage chunk after an error event would imply a clean completion.
+        let payloads = stream_terminal_payloads(Err("boom".to_string()), 8, "id", 1, "m", true, 11);
+        assert_eq!(payloads.len(), 1);
+        let v: serde_json::Value = serde_json::from_str(&payloads[0]).expect("valid JSON");
+        assert_eq!(v["error"]["message"], "boom");
+    }
+
+    #[test]
+    fn usage_placeholder_shape() {
+        assert_eq!(usage_placeholder(true), Some(serde_json::Value::Null));
+        assert_eq!(usage_placeholder(false), None);
+    }
+
+    #[test]
+    fn rand_id_is_nonempty() {
+        let id = rand_id();
+        assert!(!id.is_empty());
+    }
+
+    // ── RT-23 / min_p / stop-sequence unit coverage ──────────────────────
+
+    #[test]
+    fn find_first_stop_match_picks_earliest_and_skips_empty() {
+        let stops = vec!["".to_string(), "STOP".to_string(), "END".to_string()];
+        assert_eq!(
+            find_first_stop_match("hello END world STOP", &stops),
+            Some((6, "END"))
+        );
+        assert_eq!(find_first_stop_match("nothing here", &stops), None);
+        assert_eq!(find_first_stop_match("", &stops), None);
+    }
+
+    #[test]
+    fn stop_tracker_releases_up_to_the_match_and_then_nothing_more() {
+        let mut tracker = StopTracker::default();
+        let stops = vec!["STOP".to_string()];
+        // "hello ST" then "OP!" — the match ("STOP") spans the chunk
+        // boundary: chunk 1 contributes "ST", chunk 2 completes it with
+        // "OP". `max_stop_len = 4` ("STOP"), so chunk 1 must hold back its
+        // last 3 bytes (" ST") — releasing only "hello" — precisely so that
+        // completing match is still caught here rather than leaking "ST"
+        // out through chunk 1 the way `RT-06`'s bug class would.
+        let r1 = tracker.push_and_release("hello ST", &stops, 4);
+        assert!(!tracker.stopped, "no match yet after chunk 1 alone");
+        assert_eq!(
+            r1, "hello",
+            "chunk 1 must hold back the last 3 (max_stop_len-1) bytes"
+        );
+        assert_eq!(
+            &tracker.accumulated[tracker.emitted_len..],
+            " ST",
+            "the held-back tail must still contain the in-progress partial match"
+        );
+
+        let r2 = tracker.push_and_release("OP!", &stops, 4);
+        assert!(tracker.stopped, "STOP must be detected once OP arrives");
+        assert_eq!(
+            format!("{r1}{r2}"),
+            "hello ",
+            "must never emit the stop sequence itself, only what preceded it"
+        );
+
+        // Nothing more is ever released after a match, even if more text
+        // (or a natural end-of-stream flush) arrives.
+        assert_eq!(tracker.push_and_release(" more", &stops, 4), "");
+        assert_eq!(tracker.take_remaining(), "");
+    }
+
+    #[test]
+    fn stop_tracker_take_remaining_flushes_the_holdback_on_natural_end() {
+        let mut tracker = StopTracker::default();
+        let stops = vec!["STOP".to_string()];
+        let released = tracker.push_and_release("hello world", &stops, 4);
+        // "hello world" is 11 bytes; holdback is 3, so "hello wo" (8 bytes)
+        // should already be released and "rld" held back.
+        assert_eq!(released, "hello wo");
+        assert!(!tracker.stopped);
+        assert_eq!(
+            tracker.take_remaining(),
+            "rld",
+            "natural end must flush whatever the holdback window is still sitting on"
+        );
+        // Idempotent: nothing left to flush a second time.
+        assert_eq!(tracker.take_remaining(), "");
+    }
+
+    #[test]
+    fn stop_tracker_empty_stop_list_never_holds_anything_back() {
+        let mut tracker = StopTracker::default();
+        let released = tracker.push_and_release("hello", &[], 0);
+        assert_eq!(released, "hello");
+        assert_eq!(tracker.take_remaining(), "");
+    }
+
+    // ── TOK-M1: logprob `bytes` must be the raw vocabulary bytes ─────────
+
+    /// A byte-level vocab whose ids 9/10 are the GPT-2 byte-level spellings
+    /// of `0xC3`/`0xA9` -- the two raw bytes of `é` -- exactly like
+    /// `tokenizer_bridge`'s own `TINY_TOKENIZER_JSON` fixture. Individually,
+    /// neither id's `piece()` is valid UTF-8 on its own, so
+    /// `String::from_utf8_lossy` renders each as `U+FFFD`: the shipping
+    /// TOK-M1 defect, reproduced in miniature.
+    const BYTE_FRAGMENT_TOKENIZER_JSON: &str = r##"{
+        "model": {
+            "type": "BPE",
+            "vocab": {
+                "!": 0, "\"": 1, "#": 2, "$": 3,
+                "H": 4, "i": 5, "Ġ": 6, "a": 7, "b": 8,
+                "Ã": 9, "©": 10, "Hi": 11
+            },
+            "merges": ["H i"]
+        },
+        "added_tokens": [
+            { "id": 12, "content": "<|im_start|>", "special": true },
+            { "id": 13, "content": "<tool_call>", "special": false }
+        ],
+        "pre_tokenizer": { "type": "ByteLevel" },
+        "decoder": { "type": "ByteLevel" }
+    }"##;
+
+    #[test]
+    fn correct_logprob_bytes_recovers_the_real_byte_fragment_not_replacement_char_bytes() {
+        let tok = TokenizerBridge::native_from_json_str(BYTE_FRAGMENT_TOKENIZER_JSON)
+            .expect("byte-fragment tokenizer fixture should load");
+
+        // What `api_types::compute_logprobs`/`token_bytes` produces today
+        // for a byte-fragment token: the display string is already
+        // `U+FFFD` (lossy), so `bytes` is `U+FFFD`'s own 3-byte UTF-8
+        // encoding rather than the token's real single raw byte.
+        let corrupted = vec![
+            crate::api_types::LogprobsContent {
+                token: "\u{FFFD}".to_string(),
+                logprob: -0.1,
+                bytes: Some("\u{FFFD}".as_bytes().to_vec()),
+                top_logprobs: vec![],
+            },
+            crate::api_types::LogprobsContent {
+                token: "\u{FFFD}".to_string(),
+                logprob: -0.2,
+                bytes: Some("\u{FFFD}".as_bytes().to_vec()),
+                top_logprobs: vec![],
+            },
+        ];
+        let output_tokens = [9u32, 10u32];
+
+        let fixed = correct_logprob_bytes(corrupted, &output_tokens, Some(&tok));
+
+        assert_eq!(
+            fixed[0].bytes,
+            Some(vec![0xC3]),
+            "id 9's real vocabulary byte (0xC3, half of 'é') must replace U+FFFD's encoding"
+        );
+        assert_eq!(
+            fixed[1].bytes,
+            Some(vec![0xA9]),
+            "id 10's real vocabulary byte (0xA9, half of 'é') must replace U+FFFD's encoding"
+        );
+        // The (already-correct, per the module docs' documented residual)
+        // display string is untouched -- only `bytes` is corrected.
+        assert_eq!(fixed[0].token, "\u{FFFD}");
+        assert_eq!(fixed[1].token, "\u{FFFD}");
+    }
+
+    #[test]
+    fn correct_logprob_bytes_recovers_a_whole_valid_token_unchanged() {
+        // A token whose piece is already complete, valid UTF-8 (the
+        // overwhelming majority) must come back byte-identical, not just
+        // "close": `id 4` = "H", `id 5` = "i".
+        let tok = TokenizerBridge::native_from_json_str(BYTE_FRAGMENT_TOKENIZER_JSON)
+            .expect("byte-fragment tokenizer fixture should load");
+        let content = vec![crate::api_types::LogprobsContent {
+            token: "H".to_string(),
+            logprob: -0.01,
+            bytes: Some(b"H".to_vec()),
+            top_logprobs: vec![],
+        }];
+        let fixed = correct_logprob_bytes(content, &[4u32], Some(&tok));
+        assert_eq!(fixed[0].bytes, Some(b"H".to_vec()));
+    }
+
+    #[test]
+    fn correct_logprob_bytes_is_a_no_op_without_a_tokenizer() {
+        let content = vec![crate::api_types::LogprobsContent {
+            token: "<9>".to_string(),
+            logprob: -0.1,
+            bytes: None,
+            top_logprobs: vec![],
+        }];
+        let fixed = correct_logprob_bytes(content.clone(), &[9], None);
+        assert_eq!(fixed[0].bytes, content[0].bytes);
+        assert_eq!(fixed[0].token, content[0].token);
+    }
+
+    // ── SV-08: StreamLifecycleGuard's RAII metrics on drop/disconnect ────
+
+    /// Simulates a client that disconnects before ever polling the SSE
+    /// body: the guard must still decrement the gauge, record a
+    /// latency-histogram sample at the *true* elapsed time (not the
+    /// near-zero an SSE-head-time observation would give), and record a
+    /// workload-rate sample -- purely from being dropped.
+    #[test]
+    fn stream_lifecycle_guard_records_metrics_on_drop_even_without_being_polled() {
+        let metrics = Arc::new(InferenceMetrics::new());
+        metrics.active_requests.inc();
+        let active_guard = ActiveRequestGuard(Arc::clone(&metrics));
+
+        let mut tracker = crate::request_metrics::RequestRateTracker::new();
+        tracker.record_first_token();
+        let tracker = Arc::new(std::sync::Mutex::new(tracker));
+        let rate_aggregator = Arc::new(crate::request_metrics::RequestRateAggregator::new());
+
+        let request_start = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let guard = StreamLifecycleGuard {
+            inner: (),
+            rate_aggregator: Arc::clone(&rate_aggregator),
+            tracker,
+            request_start,
+            metrics: Arc::clone(&metrics),
+            _active_guard: active_guard,
+        };
+        // Simulate an early client disconnect: drop without ever polling.
+        drop(guard);
+
+        assert_eq!(
+            metrics.active_requests.get(),
+            0.0,
+            "the in-flight gauge must be decremented on drop, not left dangling"
+        );
+        assert_eq!(
+            metrics.request_duration_seconds.count(),
+            1,
+            "the latency histogram must get exactly one sample from Drop"
+        );
+        assert!(
+            metrics.request_duration_seconds.sum() >= 0.005,
+            "the recorded latency must reflect the real elapsed time, not near-zero \
+             (observing at SSE-head construction under-reports this to ~0)"
+        );
+        assert_eq!(
+            rate_aggregator.snapshot().completed_requests,
+            1,
+            "a rate sample must be recorded because at least one token was emitted"
+        );
+    }
+
+    #[test]
+    fn stream_lifecycle_guard_skips_the_rate_sample_when_no_token_was_emitted() {
+        // A prefill error (or a disconnect before the first token) must not
+        // feed a spurious zero-elapsed sample into `/admin/workload-stats`,
+        // even though the histogram and gauge are still recorded.
+        let metrics = Arc::new(InferenceMetrics::new());
+        metrics.active_requests.inc();
+        let active_guard = ActiveRequestGuard(Arc::clone(&metrics));
+        let tracker = Arc::new(std::sync::Mutex::new(
+            crate::request_metrics::RequestRateTracker::new(),
+        ));
+        let rate_aggregator = Arc::new(crate::request_metrics::RequestRateAggregator::new());
+
+        let guard = StreamLifecycleGuard {
+            inner: (),
+            rate_aggregator: Arc::clone(&rate_aggregator),
+            tracker,
+            request_start: std::time::Instant::now(),
+            metrics: Arc::clone(&metrics),
+            _active_guard: active_guard,
+        };
+        drop(guard);
+
+        assert_eq!(metrics.active_requests.get(), 0.0);
+        assert_eq!(
+            metrics.request_duration_seconds.count(),
+            1,
+            "the latency histogram is recorded regardless of whether any token was emitted"
+        );
+        assert_eq!(
+            rate_aggregator.snapshot().completed_requests,
+            0,
+            "no rate sample should be recorded when zero tokens were emitted"
+        );
+    }
+}

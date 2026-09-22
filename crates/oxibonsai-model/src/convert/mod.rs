@@ -1,13 +1,21 @@
 //! HuggingFace safetensors → OxiBonsai GGUF conversion.
 //!
 //! Converts a HuggingFace model directory (containing `model.safetensors` or
-//! sharded safetensors files and `config.json`) into an OxiBonsai GGUF file
-//! with TQ2_0_g128 (default) or Q1_0_g128 quantisation for weight tensors and
-//! FP32 for norm tensors.
+//! sharded safetensors files and `config.json`) into an OxiBonsai GGUF file:
+//! `PQ2_0` (ggml id 142, the default group-128 ternary format), `PTQ1_0`
+//! (143), mainline `Q2_0` (group 64) or `Q1_0_g128` for weight tensors, with
+//! norm and 1-D tensors kept in a float type.
 //!
 //! A sibling [`onnx`] module provides the same output format from HuggingFace
 //! MatMulNBits-quantized ONNX models (e.g. `onnx-community/Ternary-Bonsai-1.7B-ONNX`).
-//! Shared helpers live in [`common`].
+//! Shared helpers live in [`common`]; the metadata writers live in
+//! [`meta`] (`general.*` / `<arch>.*`), [`tokenizer_meta`]
+//! (`tokenizer.ggml.*`) and [`qwen35`] (`qwen35.*` + `prism.hadamard.*`).
+//!
+//! A conversion is **complete or it fails**: a source tensor the converter
+//! cannot place is reported by name rather than skipped at `debug!` level
+//! behind a success message (CQ-04). Pass `allow_unmapped` to
+//! [`convert_hf_to_gguf_with_options`] to convert anyway.
 //!
 //! # Usage
 //!
@@ -25,11 +33,14 @@
 //! ```
 
 pub mod common;
+pub mod meta;
 pub mod mlx_image;
 pub mod name_map;
 pub mod onnx;
+pub mod qwen35;
+pub mod tokenizer_meta;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
@@ -38,16 +49,31 @@ use memmap2::Mmap;
 use safetensors::{Dtype, SafeTensors};
 use serde_json::Value;
 
-use oxibonsai_core::gguf::writer::{GgufWriter, TensorEntry, TensorType};
-use oxibonsai_core::quant_ternary::BlockTQ2_0_g128;
+use oxibonsai_core::gguf::writer::{GgufWriter, TensorEntry};
 
 use crate::convert::common::{
-    blocks_to_bytes, pad_to_multiple_of_128, read_config_json, write_metadata,
+    check_supported_architecture, read_config_json, write_metadata, UnmappedReport,
 };
 use crate::convert::name_map::hf_to_gguf_name;
-use crate::quantize::quantize_q1_0_g128;
+use crate::quantize::{dequant_source_bytes, encode_quantized_tensor, ScaleRule, SourceDtype};
 
 pub use crate::convert::common::ConvertStats;
+
+/// Map a safetensors dtype to the shared [`SourceDtype`].
+///
+/// Returns `None` for the packed integer layouts (I8/U8/F8/U32) used by
+/// MLX / AWQ / GPTQ exports, which this converter cannot decode. The caller
+/// records the name in an [`UnmappedReport`] rather than warning and
+/// continuing: the old `_ => vec![]` arm dropped every such tensor at warn
+/// level and still exited 0 (CQ-04).
+fn source_dtype_of(dtype: Dtype) -> Option<SourceDtype> {
+    match dtype {
+        Dtype::F32 => Some(SourceDtype::F32),
+        Dtype::F16 => Some(SourceDtype::F16),
+        Dtype::BF16 => Some(SourceDtype::BF16),
+        _ => None,
+    }
+}
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
@@ -58,30 +84,50 @@ pub use crate::convert::common::ConvertStats;
 /// * `from_dir` — Directory containing `model.safetensors` (or sharded files
 ///   plus `model.safetensors.index.json`) and `config.json`.
 /// * `to_path` — Destination path for the GGUF file.
-/// * `quant` — Quantisation format: `"tq2_0_g128"` (ternary, {-1,0,+1}) or
-///   `"q1_0_g128"` (1-bit sign + FP16 group scale). Both use 128-element
-///   groups; norm tensors are always kept FP32 regardless of format.
+/// * `quant` — Quantisation format; see [`common::SUPPORTED_QUANT_FORMATS`].
+///   `"tq2_0_g128"` and `"pq2_0"` both emit PrismML `PQ2_0` (ggml id 142).
+///   Norm and 1-D tensors are kept unquantized regardless of format.
+///
+/// Equivalent to [`convert_hf_to_gguf_with_options`] with
+/// `allow_unmapped = false`.
 ///
 /// # Errors
 ///
 /// Returns an error if the directory does not contain the expected files, if
-/// `quant` names an unsupported format, if any tensor cannot be converted, or
-/// if the output file cannot be written.
+/// `quant` names an unsupported format, if any source tensor could not be
+/// placed in the output (see [`ConvertStats::n_unmapped`]), or if the output
+/// file cannot be written.
 pub fn convert_hf_to_gguf(
     from_dir: &Path,
     to_path: &Path,
     quant: &str,
 ) -> anyhow::Result<ConvertStats> {
-    if quant != "tq2_0_g128" && quant != "q1_0_g128" {
-        anyhow::bail!(
-            "unsupported quantisation format '{}'; supported formats are 'tq2_0_g128' and \
-             'q1_0_g128'",
-            quant
-        );
-    }
+    convert_hf_to_gguf_with_options(from_dir, to_path, quant, false)
+}
+
+/// Convert a HuggingFace safetensors model directory to an OxiBonsai GGUF
+/// file, optionally tolerating source tensors that have no mapping.
+///
+/// `allow_unmapped` corresponds to the CLI's `--allow-unmapped`: without it a
+/// source tensor the converter cannot place is a hard error naming every such
+/// tensor, instead of a `debug!` line and a success message (CQ-04).
+pub fn convert_hf_to_gguf_with_options(
+    from_dir: &Path,
+    to_path: &Path,
+    quant: &str,
+    allow_unmapped: bool,
+) -> anyhow::Result<ConvertStats> {
+    let target_type = common::quant_format_tensor_type(quant).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unsupported quantisation format '{}'; supported formats are {:?}",
+            quant,
+            common::SUPPORTED_QUANT_FORMATS
+        )
+    })?;
 
     // ── 1. Read config.json ──────────────────────────────────────────────────
     let config = read_config_json(&from_dir.join("config.json"))?;
+    check_supported_architecture(&config)?;
 
     // ── 2. Collect shard paths ───────────────────────────────────────────────
     let shard_paths = discover_shard_paths(from_dir)?;
@@ -107,8 +153,9 @@ pub fn convert_hf_to_gguf(
         })
         .collect::<anyhow::Result<_>>()?;
 
-    // Collect (hf_name → shard_index) for all tensors across shards.
-    let mut name_to_shard: HashMap<&str, usize> = HashMap::new();
+    // Collect (hf_name → shard_index) for all tensors across shards, in a
+    // deterministic order so the completeness report reads the same way twice.
+    let mut name_to_shard: BTreeMap<&str, usize> = BTreeMap::new();
     for (shard_idx, shard) in parsed_shards.iter().enumerate() {
         for name in shard.names() {
             name_to_shard.insert(name, shard_idx);
@@ -123,7 +170,7 @@ pub fn convert_hf_to_gguf(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("unknown");
-    write_metadata(&mut writer, &config, model_name, quant)?;
+    write_metadata(&mut writer, &config, model_name, quant, Some(from_dir))?;
 
     // ── 5. Determine tied-embedding flag ────────────────────────────────────
     let tie_word_embeddings = config
@@ -135,12 +182,13 @@ pub fn convert_hf_to_gguf(
     // Storing only names/shapes avoids accumulating gigabytes of f32 data.
     // Sort by GGUF name to get a canonical ordering (blk.0 before blk.1 etc.).
     let mut meta_entries: BTreeMap<String, TensorMetaOnly> = BTreeMap::new();
+    let mut report = UnmappedReport::default();
 
     for (hf_name, &shard_idx) in &name_to_shard {
         let mapped = match hf_to_gguf_name(hf_name) {
             Some(m) => m,
             None => {
-                tracing::debug!(hf_name, "skipping unmapped tensor");
+                report.push_unmapped(hf_name);
                 continue;
             }
         };
@@ -150,9 +198,24 @@ pub fn convert_hf_to_gguf(
             .tensor(hf_name)
             .with_context(|| format!("tensor '{}' not found in shard", hf_name))?;
 
+        let Some(source_dtype) = source_dtype_of(view.dtype()) else {
+            // I8 / U8 / F8 / U32 — the packed MLX, AWQ and GPTQ layouts. The
+            // old code returned an empty `Vec<f32>` here, warned, and carried
+            // on to a successful exit (CQ-04).
+            report.push_unsupported_dtype(hf_name, &format!("{:?}", view.dtype()));
+            continue;
+        };
+
         let shape_hf = view.shape();
-        // GGUF shape = reversed HF shape (outermost dimension last).
+        // GGUF shape = reversed HF shape (first dimension fastest-varying).
         let gguf_shape: Vec<u64> = shape_hf.iter().rev().map(|&d| d as u64).collect();
+
+        if let Some(existing) = meta_entries.get(&mapped.gguf_name) {
+            // Keyed by GGUF name, so a two-to-one mapping would overwrite
+            // rather than skip — invisible to any count-based check.
+            report.push_collision(&mapped.gguf_name, &existing.hf_name, hf_name);
+            continue;
+        }
 
         meta_entries.insert(
             mapped.gguf_name.clone(),
@@ -162,88 +225,69 @@ pub fn convert_hf_to_gguf(
                 gguf_shape,
                 hf_name: hf_name.to_string(),
                 shard_idx,
+                source_dtype,
             },
         );
     }
+
+    report.check(allow_unmapped)?;
 
     // ── 7. Handle tied embeddings (metadata only) ────────────────────────────
     // If tie_word_embeddings is true and output.weight is absent, duplicate
     // token_embd.weight as output.weight (the loader hard-requires it).
     if tie_word_embeddings && !meta_entries.contains_key("output.weight") {
         if let Some(embed_meta) = meta_entries.get("token_embd.weight") {
-            let shape = embed_meta.gguf_shape.clone();
-            let embed_hf = embed_meta.hf_name.clone();
-            let embed_shard = embed_meta.shard_idx;
+            let duplicated = TensorMetaOnly {
+                gguf_name: "output.weight".to_string(),
+                is_norm: false,
+                gguf_shape: embed_meta.gguf_shape.clone(),
+                hf_name: embed_meta.hf_name.clone(),
+                shard_idx: embed_meta.shard_idx,
+                source_dtype: embed_meta.source_dtype,
+            };
             tracing::info!("tie_word_embeddings=true: duplicating token_embd as output.weight");
-            meta_entries.insert(
-                "output.weight".to_string(),
-                TensorMetaOnly {
-                    gguf_name: "output.weight".to_string(),
-                    is_norm: false,
-                    gguf_shape: shape,
-                    hf_name: embed_hf,
-                    shard_idx: embed_shard,
-                },
-            );
+            meta_entries.insert("output.weight".to_string(), duplicated);
         }
     }
 
     // ── 8. Quantize one tensor at a time (no accumulation of f32 data) ───────
     // Each f32_data Vec is dropped at the end of its loop iteration, so peak
     // memory = (largest single tensor as f32) + accumulated quantised output.
-    let mut stats = ConvertStats::default();
+    //
+    // The source is continuous HuggingFace weights, so the ternary/1-bit
+    // encoders use the error-minimising `AbsMean` scale rather than absmax,
+    // which on dense weights inflates every layer output by ~3.5x (CQ-03).
+    // Already-ternary groups are detected and keep the absmax encoding, so a
+    // ternary checkpoint still round-trips bit-identically.
+    let mut stats = ConvertStats {
+        n_unmapped: report.count(),
+        ..ConvertStats::default()
+    };
 
     for meta in meta_entries.values() {
         let view = parsed_shards[meta.shard_idx]
             .tensor(&meta.hf_name)
             .with_context(|| format!("tensor '{}' not found in shard", meta.hf_name))?;
 
-        let f32_data = to_f32_vec(view.dtype(), view.data());
-        if f32_data.is_empty() && !view.data().is_empty() {
-            tracing::warn!(
-                hf_name = meta.hf_name.as_str(),
-                dtype = ?view.dtype(),
-                "unsupported dtype — skipping tensor"
-            );
-            continue;
-        }
+        let (_, f32_data) = decode_tensor(view.dtype(), view.data())
+            .with_context(|| format!("decoding tensor '{}' ({:?})", meta.hf_name, view.dtype()))?;
 
-        let (raw_bytes, tensor_type) = if meta.is_norm {
-            // FP32 norm tensor
-            let raw: Vec<u8> = f32_data.iter().flat_map(|f| f.to_le_bytes()).collect();
-            (raw, TensorType::F32)
-        } else if quant == "q1_0_g128" {
-            // Q1_0_g128 quantised tensor — 1-bit sign + FP16 group scale.
-            // Same 128-element group size as TQ2_0_g128, and the same
-            // padding helper applies. Uses the canonical sign convention
-            // shared with `oxibonsai_core::tensor::BlockQ1_0G128` (see
-            // `crate::quantize` module docs): bit=1 -> +scale, bit=0 -> -scale.
-            let f32_padded = pad_to_multiple_of_128(&f32_data);
-            let raw = quantize_q1_0_g128(&f32_padded)
-                .with_context(|| format!("quantizing tensor '{}'", meta.gguf_name))?;
-            (raw, TensorType::Q1_0G128)
-        } else {
-            // TQ2_0_g128 quantised tensor — f32_data dropped after this block
-            let f32_padded = pad_to_multiple_of_128(&f32_data);
-            let blocks = BlockTQ2_0_g128::quantize(&f32_padded)
-                .with_context(|| format!("quantizing tensor '{}'", meta.gguf_name))?;
-            let raw = blocks_to_bytes(&blocks);
-            (raw, TensorType::TQ2_0_g128)
-        };
+        let tensor_type = common::tensor_type_for(
+            &meta.gguf_name,
+            &meta.gguf_shape,
+            meta.source_dtype,
+            target_type,
+            meta.is_norm,
+        );
+        let ne0 = meta.gguf_shape.first().copied().unwrap_or(0) as usize;
+        let raw_bytes = encode_quantized_tensor(&f32_data, ne0, tensor_type, ScaleRule::AbsMean)
+            .map_err(|e| anyhow::anyhow!("{}", e.with_tensor(&meta.gguf_name)))?;
         // f32_data is dropped here (end of binding scope)
         drop(f32_data);
 
         println!(
-            "  converting {} {:?} -> {}",
-            meta.gguf_name,
-            meta.gguf_shape,
-            if meta.is_norm {
-                "F32"
-            } else if quant == "q1_0_g128" {
-                "Q1_0_g128"
-            } else {
-                "TQ2_0_g128"
-            }
+            "  converting {} {:?} -> {:?}",
+            meta.gguf_name, meta.gguf_shape, tensor_type
         );
 
         writer.add_tensor(TensorEntry {
@@ -253,12 +297,7 @@ pub fn convert_hf_to_gguf(
             data: raw_bytes,
         });
 
-        if meta.is_norm {
-            stats.n_fp32 += 1;
-        } else {
-            stats.n_ternary += 1;
-        }
-        stats.n_tensors += 1;
+        common::record_tensor(&mut stats, tensor_type);
     }
 
     // ── 9. Write GGUF file ───────────────────────────────────────────────────
@@ -268,6 +307,19 @@ pub fn convert_hf_to_gguf(
     let bytes_written = writer
         .write(&mut buf_writer)
         .map_err(|e| anyhow::anyhow!("GGUF write error: {}", e))?;
+    buf_writer
+        .into_inner()
+        .map_err(|e| anyhow::anyhow!("flushing output file: {}", e))?
+        .sync_all()
+        .with_context(|| format!("flushing {:?}", to_path))?;
+
+    if stats.n_unmapped > 0 {
+        println!(
+            "  WARNING: {} source tensor(s) were skipped (--allow-unmapped):\n{}",
+            stats.n_unmapped,
+            report.describe()
+        );
+    }
 
     stats.output_bytes = bytes_written;
     Ok(stats)
@@ -284,6 +336,8 @@ struct TensorMetaOnly {
     hf_name: String,
     /// Index into `parsed_shards` where this tensor lives.
     shard_idx: usize,
+    /// Element type the tensor had in the safetensors file (CQ-M2).
+    source_dtype: SourceDtype,
 }
 
 /// Discover shard file paths from the model directory.
@@ -330,23 +384,55 @@ fn discover_shard_paths(from_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-/// Convert raw safetensors bytes to a `Vec<f32>` according to the dtype.
+/// Convert raw safetensors bytes to `f32`, carrying the source dtype through.
 ///
-/// Returns an empty vec for unsupported dtypes (caller should warn and skip).
-fn to_f32_vec(dtype: Dtype, data: &[u8]) -> Vec<f32> {
-    match dtype {
-        Dtype::F32 => data
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect(),
-        Dtype::F16 => data
-            .chunks_exact(2)
-            .map(|b| half::f16::from_le_bytes([b[0], b[1]]).to_f32())
-            .collect(),
-        Dtype::BF16 => data
-            .chunks_exact(2)
-            .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
-            .collect(),
-        _ => vec![],
+/// Replaces the old `to_f32_vec`, which returned an **empty vec** for every
+/// unsupported dtype and dropped the source type on the floor (CQ-M2/CQ-04):
+/// the caller could neither tell an unsupported tensor from a genuinely empty
+/// one, nor choose an output encoding that preserved a bf16 source. The
+/// decode itself now lives in [`crate::quantize::dequant_source_bytes`],
+/// which is also the crate's bf16 read path (CQ-M3).
+fn decode_tensor(dtype: Dtype, data: &[u8]) -> Option<(SourceDtype, Vec<f32>)> {
+    let source = source_dtype_of(dtype)?;
+    let values = dequant_source_bytes(source, data).ok()?;
+    Some((source, values))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supported_dtypes_round_trip_and_carry_their_type() {
+        let f32_bytes: Vec<u8> = [1.0_f32, -2.5, 0.0]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let (dtype, values) = decode_tensor(Dtype::F32, &f32_bytes).expect("f32 decodes");
+        assert_eq!(dtype, SourceDtype::F32);
+        assert_eq!(values, vec![1.0, -2.5, 0.0]);
+
+        let bf16_bytes: Vec<u8> = [1.0_f32, -2.5]
+            .iter()
+            .flat_map(|&f| half::bf16::from_f32(f).to_le_bytes())
+            .collect();
+        let (dtype, values) = decode_tensor(Dtype::BF16, &bf16_bytes).expect("bf16 decodes");
+        assert_eq!(
+            dtype,
+            SourceDtype::BF16,
+            "the bf16 read path exists (CQ-M3)"
+        );
+        assert_eq!(values, vec![1.0, -2.5]);
+    }
+
+    #[test]
+    fn packed_integer_dtypes_are_reported_not_silently_dropped() {
+        assert!(source_dtype_of(Dtype::I8).is_none());
+        assert!(source_dtype_of(Dtype::U8).is_none());
+        assert!(source_dtype_of(Dtype::I32).is_none());
+        assert!(
+            decode_tensor(Dtype::I8, &[0u8; 8]).is_none(),
+            "an MLX/AWQ/GPTQ packed tensor must surface as unsupported, not as an empty vec"
+        );
     }
 }

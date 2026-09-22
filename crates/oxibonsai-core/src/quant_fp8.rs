@@ -387,7 +387,7 @@ impl BlockFP8E4M3 {
     ///
     /// Input length must be a multiple of `QK_FP8` (32).
     pub fn quantize(values: &[f32]) -> BonsaiResult<Vec<Self>> {
-        if values.len() % QK_FP8 != 0 {
+        if !values.len().is_multiple_of(QK_FP8) {
             return Err(BonsaiError::KQuantError {
                 reason: format!(
                     "FP8 E4M3 quantize: input len {} not a multiple of {}",
@@ -457,7 +457,7 @@ impl BlockFP8E4M3 {
     /// Returns error if length is not a multiple of `BLOCK_FP8_BYTES` (34)
     /// or if the pointer is not properly aligned.
     pub fn slice_from_bytes(data: &[u8]) -> BonsaiResult<&[Self]> {
-        if data.len() % BLOCK_FP8_BYTES != 0 {
+        if !data.len().is_multiple_of(BLOCK_FP8_BYTES) {
             return Err(BonsaiError::KQuantError {
                 reason: format!(
                     "FP8 E4M3 slice_from_bytes: byte len {} not a multiple of {}",
@@ -531,7 +531,7 @@ impl BlockFP8E5M2 {
     ///
     /// Input length must be a multiple of `QK_FP8` (32).
     pub fn quantize(values: &[f32]) -> BonsaiResult<Vec<Self>> {
-        if values.len() % QK_FP8 != 0 {
+        if !values.len().is_multiple_of(QK_FP8) {
             return Err(BonsaiError::KQuantError {
                 reason: format!(
                     "FP8 E5M2 quantize: input len {} not a multiple of {}",
@@ -602,7 +602,7 @@ impl BlockFP8E5M2 {
     /// Returns error if length is not a multiple of `BLOCK_FP8_BYTES` (34)
     /// or if the pointer is not properly aligned.
     pub fn slice_from_bytes(data: &[u8]) -> BonsaiResult<&[Self]> {
-        if data.len() % BLOCK_FP8_BYTES != 0 {
+        if !data.len().is_multiple_of(BLOCK_FP8_BYTES) {
             return Err(BonsaiError::KQuantError {
                 reason: format!(
                     "FP8 E5M2 slice_from_bytes: byte len {} not a multiple of {}",

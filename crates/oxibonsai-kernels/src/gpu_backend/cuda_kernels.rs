@@ -65,6 +65,62 @@ static __device__ __forceinline__ float silu(float x) {
     return x / (1.0f + expf(-x));
 }
 
+/* ── 16-byte-aligned quant-section loads (finding F10) ───────────────────────
+   `ld.global.nc.v4.u32` REQUIRES a 16-byte-aligned address; a misaligned one
+   raises CUDA_ERROR_MISALIGNED_ADDRESS, which kills the whole context.
+
+   In the SoA weight layout the quant section starts immediately after the FP16
+   scales, at byte `scales_bytes = total_blocks * 2`, and each block occupies a
+   whole number of 16-byte units (16 B for `Q1_0_g128`, 32 B for
+   `TQ2_0_g128`).  The buffer base is a fresh `cuMemAlloc` (256-byte aligned,
+   never a sub-slice), so alignment of every quant load reduces to
+
+       scales_bytes % 16 == 0   <=>   total_blocks % 8 == 0.
+
+   The previous in-source comment argued only `% 2` — i.e. 4-byte alignment —
+   which proves nothing about the 16-byte requirement these instructions carry.
+   It happens to hold for every current Qwen3 tensor, so the bug is latent, but
+   any weight shape whose `n_rows * (k / 128)` is not a multiple of 8 aborted.
+
+   Rather than change the on-device layout (the TQ2 twins in
+   `cuda_prefill_kernels.rs` recompute the quant offset independently, so a
+   padded layout would silently desynchronise them), the vector load is guarded
+   and falls back to four scalar `__ldg` reads.  The predicate depends only on
+   kernel arguments, so the branch is uniform across the whole grid and costs no
+   divergence; `cuda_device_negotiation::soa_qs_vector_load_ok` is its host-side
+   twin and is unit-tested on every host.
+
+   NOTE for reviewers: `scripts/check_cuda.sh` removes every inline-PTX
+   statement before its tier-2 (clang++ `-fsyntax-only`) pass, so
+   in that pass the aligned branch of `soa_load4_u32` has an empty body and
+   its four outputs are left uninitialised. A clean tier-2 result therefore
+   proves less than usual for THIS helper; only a real `nvcc --cuda` (tier 1)
+   pass, on a box with the CUDA toolkit, validates the guarded vector load. */
+
+static __device__ __forceinline__ unsigned int soa_quant_aligned16(
+    unsigned long long total_blocks)
+{
+    return (((total_blocks * 2ull) & 15ull) == 0ull) ? 1u : 0u;
+}
+
+static __device__ __forceinline__ void soa_load4_u32(
+    const unsigned int* p,
+    unsigned int aligned16,
+    unsigned int &w0, unsigned int &w1, unsigned int &w2, unsigned int &w3)
+{
+    if (aligned16) {
+        asm("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(w0), "=r"(w1), "=r"(w2), "=r"(w3)
+            : "l"((unsigned long long)p));
+    } else {
+        w0 = __ldg(p + 0u);
+        w1 = __ldg(p + 1u);
+        w2 = __ldg(p + 2u);
+        w3 = __ldg(p + 3u);
+    }
+}
+
+
 /* =========================================================================
    Kernel 1 — gemv_q1_g128_v7
    Q1_0_G128 matrix-vector product (SoA, 8 rows per block, hardware fp16).
@@ -403,6 +459,24 @@ extern "C" __global__ void swiglu_fused(
 /* =========================================================================
    Kernel 8 — argmax_f32
    Single-block argmax with shared-memory tree reduction.
+
+   TIE-BREAK CONTRACT (perf-11 / RT-22): on equal values this returns the
+   SMALLEST ORIGINAL INDEX, byte-for-byte the same rule as the MSL `argmax`
+   in kernel_sources/utility.rs, llama.cpp, and the CPU sampler's
+   `argmax_first`.  A strict `>` alone compares reduction SLOTS, not indices,
+   so the surviving maximum depended on the fold path (measured on the MSL
+   twin: equal maxima at 1000/2000 returned 2000; 144 of 320 randomized
+   multi-way ties returned a non-minimal index).  Two halves:
+     - the per-thread strided scan keeps `>`, which already retains the
+       smallest index one thread sees because `i` ascends;
+     - every tree stage takes the partner slot when it is strictly greater
+       OR equal with a smaller original index.
+   A thread that scans nothing seeds `local_idx = n` (out of range) so it
+   loses every tie instead of winning with a `0` it never observed.
+   NOTE: `__syncthreads()` must stay OUTSIDE the `if (tid < s)` block — a
+   barrier inside a divergent branch hangs the block — and the partner reads
+   must stay INSIDE it, since the original relied on the `&&` short-circuit
+   to keep `sm_val[tid + s]` in bounds.
    ========================================================================= */
 extern "C" __global__ void argmax_f32(
     const float*  __restrict__ input,
@@ -414,7 +488,7 @@ extern "C" __global__ void argmax_f32(
 
     const unsigned int tid = threadIdx.x;
     float        local_max = -3.402823e+38f;
-    unsigned int local_idx = 0u;
+    unsigned int local_idx = n;   /* out-of-range sentinel: loses every tie */
 
     for (unsigned int i = tid; i < n; i += 256u) {
         if (input[i] > local_max) { local_max = input[i]; local_idx = i; }
@@ -425,14 +499,21 @@ extern "C" __global__ void argmax_f32(
     __syncthreads();
 
     for (unsigned int s = 128u; s > 0u; s >>= 1u) {
-        if (tid < s && sm_val[tid + s] > sm_val[tid]) {
-            sm_val[tid] = sm_val[tid + s];
-            sm_idx[tid] = sm_idx[tid + s];
+        if (tid < s) {
+            const float        ov = sm_val[tid + s];
+            const unsigned int oi = sm_idx[tid + s];
+            const float        mv = sm_val[tid];
+            const unsigned int mi = sm_idx[tid];
+            if (ov > mv || (ov == mv && oi < mi)) {
+                sm_val[tid] = ov;
+                sm_idx[tid] = oi;
+            }
         }
         __syncthreads();
     }
 
-    if (tid == 0u) output[0] = sm_idx[0];
+    /* Only reachable with the sentinel when n == 0 (nothing to scan). */
+    if (tid == 0u) output[0] = (sm_idx[0] < n) ? sm_idx[0] : 0u;
 }
 
 /* =========================================================================
@@ -566,10 +647,14 @@ extern "C" __global__ void gemv_q1_g128_v9(
 
     const unsigned int n_blocks = k >> 7u;
 
+    const unsigned long long total_blocks = (unsigned long long)n_rows * n_blocks;
+    /* F10: the 128-bit vector load below needs a 16-byte-aligned address. */
+    const unsigned int aligned16 = soa_quant_aligned16(total_blocks);
+
     const unsigned short* __restrict__ scales =
         (const unsigned short* __restrict__)blocks;
     const unsigned int* __restrict__ data =
-        (const unsigned int* __restrict__)(blocks + (unsigned long long)n_rows * n_blocks * 2u);
+        (const unsigned int* __restrict__)(blocks + total_blocks * 2ull);
 
     float partial = 0.0f;
 
@@ -578,12 +663,11 @@ extern "C" __global__ void gemv_q1_g128_v9(
         /* __ldg: read-only data hint → texture cache path for scale */
         const float scale = fast_fp16_to_float(__ldg(&scales[g]));
 
-        /* PTX 128-bit non-caching vector load for weight bits */
+        /* PTX 128-bit non-caching vector load for weight bits (F10-guarded) */
         const unsigned int* bp = data + (unsigned long long)g * 4u;
         unsigned int w0, w1, w2, w3;
-        asm("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
-            : "=r"(w0), "=r"(w1), "=r"(w2), "=r"(w3)
-            : "l"((unsigned long long)bp));
+        soa_load4_u32(bp, aligned16, w0, w1, w2, w3);
+
 
         const unsigned int base = b * 128u;
         float block_sum = 0.0f;
@@ -644,7 +728,11 @@ extern "C" __global__ void gemv_tq2_g128_v1(
 
     const unsigned int blocks_per_row = k >> 7u;
     const unsigned long long total_blocks = (unsigned long long)n_rows * blocks_per_row;
-    const unsigned long long qs_offset    = total_blocks * 2u;
+    const unsigned long long qs_offset    = total_blocks * 2ull;
+    /* F10: both 128-bit vector loads below need a 16-byte-aligned address,
+       which holds iff qs_offset % 16 == 0 (block stride is 32 B, base is a
+       256-byte-aligned cuMemAlloc). */
+    const unsigned int aligned16 = soa_quant_aligned16(total_blocks);
 
     const unsigned short* __restrict__ scales =
         (const unsigned short* __restrict__)soa_raw;
@@ -655,18 +743,14 @@ extern "C" __global__ void gemv_tq2_g128_v1(
         const unsigned long long block_idx = (unsigned long long)row * blocks_per_row + b;
         const float scale = fast_fp16_to_float(__ldg(&scales[block_idx]));
 
-        /* qs is 32 bytes per block, naturally 4-byte aligned (qs_offset = 2 * total_blocks
-           which is a multiple of 4 once n_rows*blocks_per_row is even — true for all
-           Qwen3 weight tensors). Use 2× 128-bit vector loads for 8 u32s = 32 bytes. */
+        /* qs is 32 bytes per block: 2x 128-bit vector loads for 8 u32s, or
+           8 scalar __ldg reads when the section is not 16-byte aligned. */
         const unsigned int* qs_words =
             (const unsigned int*)(soa_raw + qs_offset + block_idx * 32u);
         unsigned int w0, w1, w2, w3, w4, w5, w6, w7;
-        asm("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
-            : "=r"(w0), "=r"(w1), "=r"(w2), "=r"(w3)
-            : "l"((unsigned long long)qs_words));
-        asm("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
-            : "=r"(w4), "=r"(w5), "=r"(w6), "=r"(w7)
-            : "l"((unsigned long long)(qs_words + 4)));
+        soa_load4_u32(qs_words,      aligned16, w0, w1, w2, w3);
+        soa_load4_u32(qs_words + 4u, aligned16, w4, w5, w6, w7);
+
 
         const float* x = input + b * 128u;
         float block_sum =
@@ -734,10 +818,14 @@ extern "C" __global__ void gemv_q1_g128_v9_residual(
 
     const unsigned int n_blocks = k >> 7u;
 
+    const unsigned long long total_blocks = (unsigned long long)n_rows * n_blocks;
+    /* F10: the 128-bit vector load below needs a 16-byte-aligned address. */
+    const unsigned int aligned16 = soa_quant_aligned16(total_blocks);
+
     const unsigned short* __restrict__ scales =
         (const unsigned short* __restrict__)blocks;
     const unsigned int* __restrict__ data =
-        (const unsigned int* __restrict__)(blocks + (unsigned long long)n_rows * n_blocks * 2u);
+        (const unsigned int* __restrict__)(blocks + total_blocks * 2ull);
 
     float partial = 0.0f;
 
@@ -747,9 +835,8 @@ extern "C" __global__ void gemv_q1_g128_v9_residual(
 
         const unsigned int* bp = data + (unsigned long long)g * 4u;
         unsigned int w0, w1, w2, w3;
-        asm("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
-            : "=r"(w0), "=r"(w1), "=r"(w2), "=r"(w3)
-            : "l"((unsigned long long)bp));
+        soa_load4_u32(bp, aligned16, w0, w1, w2, w3);
+
 
         const unsigned int base = b * 128u;
         float block_sum = 0.0f;

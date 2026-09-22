@@ -13,6 +13,11 @@
 
 use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 
+use crate::gpu_backend::cuda_device_negotiation::{
+    flash_head_dim_supported, flash_launch_shared_bytes, flash_launch_tile_keys,
+    FLASH_LEAN_HEAD_DIM_CAP, FLASH_LEAN_TILE_KEYS,
+};
+
 use super::types::CudaGraphError;
 
 use super::cudagraph_type::CudaGraph;
@@ -46,7 +51,19 @@ const DIT_FLASH_BQ: usize = 8;
 /// Key-tile width (`BK`) — keys staged per online-softmax step; must match the
 /// kernel's `FA_BK`. Sizes the dynamic shared mem: `FA_BK*head_dim*2` floats
 /// (`Ksh ‖ Vsh`).
+///
+/// This is the **lean** (`FA_DMAX = 128`) build's tile only. The wide build's
+/// tile is negotiated with the device at init (finding F5) and must be read
+/// from `CudaGraph::flash_large_tile_keys()`, never assumed to be this.
 const DIT_FLASH_BK: usize = 32;
+
+/// The launcher and the host-side negotiation must agree on the lean build's
+/// key tile and head-dim cap, or the F5 shared-memory arithmetic in
+/// `cuda_device_negotiation` describes a kernel this file does not dispatch.
+const _: () = {
+    assert!(DIT_FLASH_BK == FLASH_LEAN_TILE_KEYS);
+    assert!(DIT_FLASH_HEAD_DIM_CAP >= FLASH_LEAN_HEAD_DIM_CAP);
+};
 
 impl CudaGraph {
     /// Validate the joint flash-attention shape against the kernel caps.
@@ -84,7 +101,7 @@ impl CudaGraph {
                 "joint_attention_flash: head_dim {head_dim} exceeds kernel cap {DIT_ATTN_MAX_HEAD_DIM}"
             )));
         }
-        if head_dim % 8 != 0 {
+        if !head_dim.is_multiple_of(8) {
             return Err(CudaGraphError::DriverError(format!(
                 "joint_attention_flash: head_dim {head_dim} must be a multiple of 8"
             )));
@@ -92,6 +109,21 @@ impl CudaGraph {
         if head_dim > DIT_FLASH_HEAD_DIM_CAP {
             return Err(CudaGraphError::DriverError(format!(
                 "joint_attention_flash: head_dim {head_dim} exceeds the flash kernel cap ({DIT_FLASH_HEAD_DIM_CAP})"
+            )));
+        }
+        // F5: a device that refused the >48 KiB dynamic-shared opt-in publishes
+        // `max_head_dim == 0`, and one that only granted a partial arena
+        // publishes what that arena can stage. Refuse here rather than letting
+        // the launch fail inside the driver with a bare
+        // `CUDA_ERROR_INVALID_VALUE`. `head_dim <= 128` uses the lean build,
+        // which needs no opt-in and is never affected.
+        let large_max_head_dim = CudaGraph::flash_large_max_head_dim();
+        if !flash_head_dim_supported(head_dim, large_max_head_dim) {
+            return Err(CudaGraphError::DriverError(format!(
+                "joint_attention_flash: head_dim {head_dim} needs the wide build, but this \
+                 device granted only enough dynamic shared memory for head_dim \
+                 {large_max_head_dim} (0 = the >48 KiB opt-in was refused entirely); \
+                 head_dim <= {FLASH_LEAN_HEAD_DIM_CAP} is unaffected"
             )));
         }
 
@@ -137,14 +169,33 @@ impl CudaGraph {
         head_dim: u32,
         scale: f32,
     ) -> Result<(), CudaGraphError> {
-        let shared_mem_bytes =
-            (DIT_FLASH_BK * head_dim as usize * 2 * std::mem::size_of::<f32>()) as u32;
+        // F5: refuse a `head_dim` this device's wide build cannot stage, here
+        // rather than only in `joint_attn_flash_validate` — the resident DiT
+        // encoders (`cudagraph_dit_block_group`,
+        // `cudagraph_dit_double_block_group`) reach this launcher directly,
+        // without passing through validation.
+        let head_dim_usize = head_dim as usize;
+        let large_max_head_dim = Self::flash_large_max_head_dim();
+        if !flash_head_dim_supported(head_dim_usize, large_max_head_dim) {
+            return Err(CudaGraphError::DriverError(format!(
+                "joint_attention_flash: head_dim {head_dim} needs the wide build, but this \
+                 device granted only enough dynamic shared memory for head_dim \
+                 {large_max_head_dim} (0 = the >48 KiB opt-in was refused entirely)"
+            )));
+        }
+        // F5: size the arena from the tile the dispatched build was actually
+        // compiled with. The wide build's tile is whatever `CudaGraph::new`
+        // negotiated with the device — assuming `DIT_FLASH_BK` here asked for
+        // 98 304 B on a device that had only opted into 49 152 B, so every wide
+        // launch on Turing/Pascal failed with `CUDA_ERROR_INVALID_VALUE`.
+        let tile_keys = flash_launch_tile_keys(head_dim_usize, Self::flash_large_tile_keys());
+        let shared_mem_bytes = flash_launch_shared_bytes(tile_keys, head_dim_usize) as u32;
         let cfg = LaunchConfig {
             grid_dim: ((seq as usize).div_ceil(DIT_FLASH_BQ) as u32, num_heads, 1),
             block_dim: (128, 1, 1),
             shared_mem_bytes,
         };
-        let func = if head_dim <= 128 {
+        let func = if head_dim_usize <= FLASH_LEAN_HEAD_DIM_CAP {
             &self.modules.joint_attention_flash_f32
         } else {
             &self.modules.joint_attention_flash_f32_large
@@ -477,5 +528,45 @@ mod tests {
             &q_short, &k, &v, &out, num_heads, seq, head_dim
         )
         .is_err());
+    }
+
+    /// F5: the new pre-launch `head_dim` guard must not reject shapes the device
+    /// can serve. Before the singleton has initialised,
+    /// `CudaGraph::flash_large_max_head_dim()` reports the kernel's compile-time
+    /// cap (permissive by design), so the VAE mid-attention `head_dim = 384`
+    /// still validates and the DiT `head_dim = 128` — which uses the lean build
+    /// and needs no opt-in at all — is never affected by the guard.
+    ///
+    /// The rejecting side of the guard needs a device that refuses or partially
+    /// grants the opt-in; that arithmetic is table-tested without hardware in
+    /// `cuda_device_negotiation::tests::
+    /// head_dim_guard_rejects_exactly_the_unsupported_combinations`.
+    #[test]
+    fn flash_head_dim_guard_admits_the_shapes_the_kernels_serve() {
+        for head_dim in [64usize, 128, 256, DIT_FLASH_HEAD_DIM_CAP] {
+            let (num_heads, seq) = (2usize, 16usize);
+            let qkv_len = num_heads * seq * head_dim;
+            let q = vec![0.0f32; qkv_len];
+            let k = vec![0.0f32; qkv_len];
+            let v = vec![0.0f32; qkv_len];
+            let out = vec![0.0f32; seq * num_heads * head_dim];
+            let validated =
+                CudaGraph::joint_attn_flash_validate(&q, &k, &v, &out, num_heads, seq, head_dim);
+            assert!(
+                validated.is_ok(),
+                "head_dim {head_dim} must validate (max_head_dim = {})",
+                CudaGraph::flash_large_max_head_dim()
+            );
+            // And the launcher's shared-memory request must fit whatever the
+            // dispatched build was compiled with.
+            let tile = flash_launch_tile_keys(head_dim, CudaGraph::flash_large_tile_keys());
+            let requested = flash_launch_shared_bytes(tile, head_dim);
+            if head_dim <= FLASH_LEAN_HEAD_DIM_CAP {
+                assert_eq!(tile, FLASH_LEAN_TILE_KEYS);
+                assert!(requested <= 49_152, "lean build must need no opt-in");
+            } else {
+                assert_eq!(tile, CudaGraph::flash_large_tile_keys());
+            }
+        }
     }
 }

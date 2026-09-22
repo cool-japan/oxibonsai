@@ -271,7 +271,7 @@ pub fn cuda_gemv_q4_0(
     n_rows: usize,
     k: usize,
 ) -> Result<(), CudaGraphError> {
-    if k == 0 || k % 32 != 0 {
+    if k == 0 || !k.is_multiple_of(32) {
         return Err(CudaGraphError::WeightLayoutError(format!(
             "Q4_0 GEMV: k={k} must be a positive multiple of 32"
         )));
@@ -361,7 +361,7 @@ pub fn cuda_gemv_q8_0(
     n_rows: usize,
     k: usize,
 ) -> Result<(), CudaGraphError> {
-    if k == 0 || k % 32 != 0 {
+    if k == 0 || !k.is_multiple_of(32) {
         return Err(CudaGraphError::WeightLayoutError(format!(
             "Q8_0 GEMV: k={k} must be a positive multiple of 32"
         )));

@@ -24,19 +24,11 @@ impl<'a> BonsaiModel<'a> {
         if n_layers == 0 {
             return Err("no blocks".into());
         }
-        // SPLIT-CACHE GUARD (disabled by default).
-        //
-        // K-quant DECODE runs CPU attention over `self.kv_cache` (see the K-quant
-        // branch in `BonsaiModel::forward`), but this GPU batch-prefill path
-        // writes a GPU-private KV cache that is never synced back to the CPU
-        // cache.  A successful GPU prefill would therefore leave decode attending
-        // over all-zero prompt KV and silently corrupt generation.  The path is
-        // disabled so `forward_prefill` falls back to the bit-correct sequential
-        // per-token path (which populates `self.kv_cache`).  Set
-        // `OXIBONSAI_FORCE_CUDA_SPLIT_PREFILL=1` to force the (decode-incorrect)
-        // GPU path for throughput microbenchmarks only.
-        if std::env::var_os("OXIBONSAI_FORCE_CUDA_SPLIT_PREFILL").is_none() {
-            return Err("K-quant CUDA batch prefill disabled (GPU-private KV cache not read by CPU decode); using sequential fallback".into());
+        // F6 SPLIT-CACHE GUARD. `cuda_split_prefill_allowed` is always false
+        // today: see it and `cuda_split_prefill_disabled` for why, and for why
+        // the `OXIBONSAI_FORCE_CUDA_SPLIT_PREFILL` override no longer overrides.
+        if !super::cuda_split_prefill_allowed() {
+            return Err(super::cuda_split_prefill_disabled("K-quant", false));
         }
         let eps = self.blocks[0].attn_norm_eps();
         let h = self.config.hidden_size;
@@ -50,28 +42,20 @@ impl<'a> BonsaiModel<'a> {
 
         // Build flattened hidden_batch from token embeddings
         let mut hidden_batch = vec![0.0f32; batch_size * h];
-        for (t, &token_id) in token_ids.iter().enumerate() {
-            let embd_start = token_id as usize * h;
-            let embd_end = embd_start + h;
-            if embd_end > self.token_embd.len() {
-                return Err(format!(
-                    "token_id {} out of range (vocab={})",
-                    token_id,
-                    self.token_embd.len() / h
-                )
-                .into());
-            }
-            hidden_batch[t * h..(t + 1) * h]
-                .copy_from_slice(&self.token_embd[embd_start..embd_end]);
-        }
+        // M-02: gather only the rows this batch references, decoding each
+        // straight out of the quantized table. The deleted dense
+        // `Index<Range<usize>>` hatch materialized the whole
+        // `vocab x hidden` FP32 table here (1.16 / 2.31 / 4.74 GiB for the
+        // 1.7B / 8B / 27B) on the first multi-token prompt.
+        self.token_embd.copy_rows(token_ids, &mut hidden_batch)?;
 
         // Build RoPE tables for the full batch
         let mut cos_table = vec![0.0f32; batch_size * half_dim];
         let mut sin_table = vec![0.0f32; batch_size * half_dim];
         for t in 0..batch_size {
             let pos = pos_start + t;
-            let cos_vals = self.rope.cos_at(pos);
-            let sin_vals = self.rope.sin_at(pos);
+            let cos_vals = self.rope.cos_at_checked(pos)?;
+            let sin_vals = self.rope.sin_at_checked(pos)?;
             cos_table[t * half_dim..(t + 1) * half_dim].copy_from_slice(cos_vals);
             sin_table[t * half_dim..(t + 1) * half_dim].copy_from_slice(sin_vals);
         }
@@ -152,12 +136,11 @@ impl<'a> BonsaiModel<'a> {
         if n_layers == 0 {
             return Err("no blocks".into());
         }
-        // SPLIT-CACHE GUARD (disabled by default) — see
-        // `try_cuda_prefill_with_lm_head_k_quant`.  The GPU-private KV cache this
-        // path writes is not the CPU `self.kv_cache` that decode reads, so it is
-        // disabled by default and the caller falls back to the sequential path.
-        if std::env::var_os("OXIBONSAI_FORCE_CUDA_SPLIT_PREFILL").is_none() {
-            return Err("K-quant CUDA batch prefill verify disabled (GPU-private KV cache not read by CPU decode); using sequential fallback".into());
+        // F6 SPLIT-CACHE GUARD. `cuda_split_prefill_allowed` is always false
+        // today: see it and `cuda_split_prefill_disabled` for why, and for why
+        // the `OXIBONSAI_FORCE_CUDA_SPLIT_PREFILL` override no longer overrides.
+        if !super::cuda_split_prefill_allowed() {
+            return Err(super::cuda_split_prefill_disabled("K-quant", true));
         }
         let eps = self.blocks[0].attn_norm_eps();
         let h = self.config.hidden_size;
@@ -196,19 +179,12 @@ impl<'a> BonsaiModel<'a> {
 
         let mut token_ids_out: Vec<u32> = Vec::with_capacity(batch_size);
         for (t, &tok_id) in token_ids.iter().enumerate() {
-            let embd_start = tok_id as usize * h;
-            if embd_start + h > self.token_embd.len() {
-                return Err(format!(
-                    "token_id {} out of range (vocab={})",
-                    tok_id,
-                    self.token_embd.len() / h
-                )
-                .into());
-            }
-            let single_hidden = self.token_embd[embd_start..embd_start + h].to_vec();
+            // M-02: one row, decoded from the quantized table.
+            let mut single_hidden = vec![0.0f32; h];
+            self.token_embd.copy_row(tok_id, &mut single_hidden)?;
             let pos = pos_start + t;
-            let cos_single = self.rope.cos_at(pos);
-            let sin_single = self.rope.sin_at(pos);
+            let cos_single = self.rope.cos_at_checked(pos)?;
+            let sin_single = self.rope.sin_at_checked(pos)?;
 
             let mut greedy_id: u32 = 0;
             oxibonsai_kernels::try_cuda_prefill_k_quant(

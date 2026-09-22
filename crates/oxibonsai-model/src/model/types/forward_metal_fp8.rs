@@ -286,12 +286,14 @@ impl<'a> BonsaiModel<'a> {
         if n_layers == 0 {
             return Err("no blocks".into());
         }
-        // Context-length guard: the batched RoPE gather below indexes
-        // `self.rope.{cos,sin}_at(pos_start + t)` with no bound, and `RopeTable`
-        // is sized to exactly `max_seq_len` rows — a prompt that overflows the
-        // context would slice out of bounds and panic inside the request task.
-        // Returning Err makes `forward_prefill` fall back to the sequential
-        // path, whose per-token `forward()` returns a clean `SequenceTooLong`.
+        // Context-length guard: the batched RoPE below calls
+        // `self.rope.apply(.., pos_start + t)`, and `RopeTable` is sized to
+        // exactly `max_seq_len` rows. `apply` is the guarded accessor (it
+        // returns `ModelError::PositionOutOfRange` rather than slicing out of
+        // bounds — M-27), so this check is not what keeps the process alive; it
+        // is what produces the named error early, which makes `forward_prefill`
+        // fall back to the sequential path, whose per-token `forward()` returns
+        // a clean `SequenceTooLong`.
         if pos_start + batch_size > self.kv_cache.max_seq_len() {
             return Err(format!(
                 "FP8 prefill sequence too long: {batch_size} tokens at pos {pos_start} exceeds max_seq_len {}",
@@ -328,19 +330,12 @@ impl<'a> BonsaiModel<'a> {
 
         // ── Embed prompt tokens into `[batch × hidden]` (token-major) ────────
         let mut hidden = vec![0.0f32; batch_size * h];
-        for (t, &token_id) in token_ids.iter().enumerate() {
-            let embd_start = token_id as usize * h;
-            let embd_end = embd_start + h;
-            if embd_end > self.token_embd.len() {
-                return Err(format!(
-                    "token_id {} out of range (vocab={})",
-                    token_id,
-                    self.token_embd.len() / h
-                )
-                .into());
-            }
-            hidden[t * h..(t + 1) * h].copy_from_slice(&self.token_embd[embd_start..embd_end]);
-        }
+        // M-02: gather only the rows this batch references, decoding each
+        // straight out of the quantized table. The deleted dense
+        // `Index<Range<usize>>` hatch materialized the whole
+        // `vocab x hidden` FP32 table here (1.16 / 2.31 / 4.74 GiB for the
+        // 1.7B / 8B / 27B) on the first multi-token prompt.
+        self.token_embd.copy_rows(token_ids, &mut hidden)?;
 
         // From here on we only touch owned buffers + `self.rope` (shared) and
         // `self.kv_cache` (mutable) — disjoint fields, so both coexist.

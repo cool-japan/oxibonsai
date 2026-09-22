@@ -7,7 +7,7 @@
 //! |--------|-------------------------|------------------------------------|
 //! | GET    | `/admin/status`         | Server status and live metrics     |
 //! | GET    | `/admin/config`         | Current configuration snapshot     |
-//! | POST   | `/admin/reset-metrics`  | Reset all metric counters to zero  |
+//! | POST   | `/admin/reset-metrics`  | Rebase the admin view of every counter to ~zero (see [`reset_metrics`]) |
 //! | GET    | `/admin/cache-stats`    | KV/inference cache statistics      |
 //! | GET    | `/admin/workload-stats` | Workload aggregator + KV policy    |
 //!
@@ -31,6 +31,7 @@ use axum::{
     Json, Router,
 };
 use serde::Serialize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -92,6 +93,20 @@ pub struct AdminState {
     /// Optional handle to the served model's descriptor, so `/admin/config` can
     /// report the real loaded model rather than only the sampling defaults.
     pub model_info: Option<Arc<crate::server::ServedModelInfo>>,
+    /// Baseline snapshot of `metrics.requests_total` recorded at the last
+    /// `/admin/reset-metrics` call (`0` if never reset). See
+    /// [`AdminState::requests_total`] (RT-19/SV-18).
+    requests_baseline: AtomicU64,
+    /// Baseline snapshot of `metrics.tokens_generated_total`.
+    tokens_baseline: AtomicU64,
+    /// Baseline snapshot of `metrics.errors_total`.
+    errors_baseline: AtomicU64,
+    /// Baseline snapshot of `metrics.prompt_tokens_total`.
+    prompt_tokens_baseline: AtomicU64,
+    /// Unix-epoch seconds of the last `/admin/reset-metrics` call, or `0` if
+    /// it has never been called (mirrors the `rss_raw == 0 => None`
+    /// zero-as-absent convention already used by [`get_status`] below).
+    last_reset_unix_secs: AtomicU64,
 }
 
 impl AdminState {
@@ -106,6 +121,11 @@ impl AdminState {
             rate_aggregator: None,
             kv_cache_policy: None,
             model_info: None,
+            requests_baseline: AtomicU64::new(0),
+            tokens_baseline: AtomicU64::new(0),
+            errors_baseline: AtomicU64::new(0),
+            prompt_tokens_baseline: AtomicU64::new(0),
+            last_reset_unix_secs: AtomicU64::new(0),
         }
     }
 
@@ -134,6 +154,147 @@ impl AdminState {
     pub fn uptime_secs(&self) -> u64 {
         self.started_at.elapsed().as_secs()
     }
+
+    /// Requests received since the server started, or since the last
+    /// `/admin/reset-metrics` call if one has happened (RT-19/SV-18).
+    ///
+    /// This never mutates — or even wraps-and-corrects — the underlying
+    /// [`crate::metrics::Counter`]; a Prometheus counter is monotonic *by
+    /// contract*, and any consumer scraping `metrics` directly (e.g. a raw
+    /// `/metrics` text endpoint, if one is mounted alongside this admin
+    /// router) must keep seeing that true, ever-increasing value. Instead a
+    /// baseline snapshot is recorded at reset time and subtracted here, so
+    /// only this admin view's *reported* number resets to (approximately)
+    /// zero — the source counter is untouched and cannot wrap.
+    pub fn requests_total(&self) -> u64 {
+        self.metrics
+            .requests_total
+            .get()
+            .saturating_sub(self.requests_baseline.load(Ordering::Relaxed))
+    }
+
+    /// Tokens generated since the server started or the last reset. See
+    /// [`AdminState::requests_total`] for the baseline-subtraction contract.
+    pub fn tokens_generated(&self) -> u64 {
+        self.metrics
+            .tokens_generated_total
+            .get()
+            .saturating_sub(self.tokens_baseline.load(Ordering::Relaxed))
+    }
+
+    /// Errors recorded since the server started or the last reset. See
+    /// [`AdminState::requests_total`] for the baseline-subtraction contract.
+    pub fn errors_total(&self) -> u64 {
+        self.metrics
+            .errors_total
+            .get()
+            .saturating_sub(self.errors_baseline.load(Ordering::Relaxed))
+    }
+
+    /// Prompt tokens processed since the server started or the last reset.
+    /// See [`AdminState::requests_total`] for the baseline-subtraction
+    /// contract.
+    pub fn prompt_tokens_total(&self) -> u64 {
+        self.metrics
+            .prompt_tokens_total
+            .get()
+            .saturating_sub(self.prompt_tokens_baseline.load(Ordering::Relaxed))
+    }
+
+    /// Unix-epoch seconds of the last `/admin/reset-metrics` call, or `None`
+    /// if it has never been called.
+    pub fn last_reset_unix_secs(&self) -> Option<u64> {
+        match self.last_reset_unix_secs.load(Ordering::Relaxed) {
+            0 => None,
+            secs => Some(secs),
+        }
+    }
+
+    /// Record a fresh baseline snapshot of every cumulative counter and the
+    /// current wall-clock time. This is the entire "reset" — it never calls
+    /// into `metrics` with a mutating operation, so the counters it snapshots
+    /// keep counting exactly as Prometheus expects (RT-19/SV-18).
+    fn record_metrics_reset(&self) {
+        self.requests_baseline
+            .store(self.metrics.requests_total.get(), Ordering::Relaxed);
+        self.tokens_baseline
+            .store(self.metrics.tokens_generated_total.get(), Ordering::Relaxed);
+        self.errors_baseline
+            .store(self.metrics.errors_total.get(), Ordering::Relaxed);
+        self.prompt_tokens_baseline
+            .store(self.metrics.prompt_tokens_total.get(), Ordering::Relaxed);
+        // `.max(1)` keeps the stored value distinct from the `0` "never
+        // reset" sentinel even in the (impossible in practice) case of a
+        // pre-epoch system clock.
+        self.last_reset_unix_secs
+            .store(unix_now_secs().max(1), Ordering::Relaxed);
+    }
+}
+
+/// Seconds since the Unix epoch, saturating to `0` on the (impossible) case
+/// of a pre-epoch system clock.
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Convert Unix seconds (UTC) into an RFC 3339 / ISO 8601 timestamp string
+/// with second precision, e.g. `"2026-09-21T12:34:56Z"`.
+///
+/// Hand-rolled (no additional date/time dependency — `admin.rs` is not the
+/// owner of this crate's `Cargo.toml`) using a plain proleptic-Gregorian
+/// year/month/day decomposition, the same technique already used by
+/// `oxibonsai-eval::report::iso8601_now`. Correct for any Unix timestamp on
+/// or after the epoch, which every real wall-clock reading here satisfies.
+fn unix_secs_to_iso8601(total_secs: u64) -> String {
+    let second = total_secs % 60;
+    let minutes = total_secs / 60;
+    let minute = minutes % 60;
+    let hours = minutes / 60;
+    let hour = hours % 24;
+    let mut days = hours / 24;
+
+    let is_leap = |year: u64| {
+        (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
+    };
+
+    let mut year = 1970u64;
+    loop {
+        let days_in_year = if is_leap(year) { 366 } else { 365 };
+        if days < days_in_year {
+            break;
+        }
+        days -= days_in_year;
+        year += 1;
+    }
+
+    let month_days: [u64; 12] = [
+        31,
+        if is_leap(year) { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut month = 1u64;
+    for &dim in &month_days {
+        if days < dim {
+            break;
+        }
+        days -= dim;
+        month += 1;
+    }
+    let day = days + 1;
+
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
 // ─── Route handlers ──────────────────────────────────────────────────────────
@@ -149,16 +310,28 @@ pub async fn get_status(State(state): State<Arc<AdminState>>) -> impl IntoRespon
         }
     };
 
+    // RT-30: report the real loaded-model identity from the model registry
+    // rather than a request-count heuristic (a 400 rejection on an
+    // unauthenticated port would previously flip `model_loaded` to `true`
+    // with zero requests ever reaching the model). `ServedModelInfo`
+    // resolves and caches its descriptor from a live engine-pool lease
+    // (`get_config` below already relies on the same cached resolution), and
+    // its documented not-ready sentinel is `id == "unknown"` — every real
+    // config has a non-empty model name. Without an attached
+    // `ServedModelInfo` there is nothing in `AdminState` that can answer the
+    // question honestly, so `false` is reported instead of guessing from
+    // unrelated counters.
+    let model_loaded = match &state.model_info {
+        Some(info) => info.descriptor().await.id != "unknown",
+        None => false,
+    };
+
     let status = ServerStatus {
         version: env!("CARGO_PKG_VERSION"),
         uptime_secs: state.uptime_secs(),
-        // We treat "model loaded" as true when at least one request has been
-        // handled (a placeholder heuristic; callers can extend AdminState for
-        // a real flag).
-        model_loaded: state.metrics.requests_total.get() > 0
-            || state.metrics.tokens_generated_total.get() > 0,
-        requests_total: state.metrics.requests_total.get(),
-        tokens_generated: state.metrics.tokens_generated_total.get(),
+        model_loaded,
+        requests_total: state.requests_total(),
+        tokens_generated: state.tokens_generated(),
         active_connections: state.metrics.active_requests.get() as u64,
         memory_rss_bytes: rss,
     };
@@ -199,54 +372,46 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
     (StatusCode::OK, Json(body))
 }
 
-/// `POST /admin/reset-metrics` — reset all metric counters to zero.
+/// `POST /admin/reset-metrics` — reset the admin view of every cumulative
+/// counter back to (approximately) zero.
 ///
 /// Returns a JSON object: `{"reset": true, "timestamp": "<ISO-8601>"}`.
+///
+/// # Honesty contract (RT-19 / SV-18)
+///
+/// A Prometheus [`Counter`](crate::metrics::Counter) is monotonic by
+/// contract — real dashboards compute `rate()`/`increase()` over it and
+/// silently assume it never goes backward. The previous implementation
+/// "reset" a counter by reading its value and then adding
+/// `u64::MAX - value + 1` back onto it (relying on wrapping arithmetic to
+/// land on zero); a concurrent increment landing between the read and the
+/// compensating add made the counter jump to `u64::MAX - k` instead of `0`
+/// — silent, permanent, and reported to every future scrape.
+///
+/// This handler never touches the underlying counters at all. It records a
+/// baseline snapshot (see [`AdminState::requests_total`] and friends), and
+/// every admin-surfaced count from that point on is `raw − baseline`. Since
+/// `raw` only ever increases, the subtraction can never underflow, there is
+/// no read-then-write race window, and a `/metrics` scrape mounted
+/// elsewhere against the same [`InferenceMetrics`] keeps seeing the true,
+/// ever-increasing values Prometheus requires — calling this endpoint
+/// invalidates that scrape's in-flight `rate()` window (a real counter
+/// reset, even a well-formed one, always does), which is expected, not a
+/// defect.
+///
+/// This also stops resetting the `active_requests` / `kv_cache_utilization`
+/// gauges to `0.0`: those track *current* state (in-flight requests, live
+/// cache pressure), not a cumulative total, so forcing them to zero while a
+/// request is genuinely in flight would itself have been a fabricated
+/// reading — the same class of dishonesty this endpoint exists to remove.
 pub async fn reset_metrics(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
-    // Reset counters by reading current values and subtracting them.
-    let requests = state.metrics.requests_total.get();
-    state.metrics.requests_total.inc_by(0); // ensure no-op reads are fine
-
-    // Use inc_by with wrapping: fetch current, set back to 0 by subtracting.
-    // Counter only supports inc_by(n) — we reset by exploiting u64 wrap-around
-    // with a large subtraction. A cleaner approach: read-subtract current value.
-    // Since Counter doesn't expose a reset(), we achieve "reset" semantics by
-    // subtracting the current reading. Under normal (non-overflow) circumstances
-    // this yields exactly 0.
-    let tokens = state.metrics.tokens_generated_total.get();
-    let errors = state.metrics.errors_total.get();
-    let prompt = state.metrics.prompt_tokens_total.get();
-
-    // Subtract current values to bring counters back to 0 (u64 wrapping arithmetic).
-    state
-        .metrics
-        .requests_total
-        .inc_by(u64::MAX.wrapping_sub(requests).wrapping_add(1));
-    state
-        .metrics
-        .tokens_generated_total
-        .inc_by(u64::MAX.wrapping_sub(tokens).wrapping_add(1));
-    state
-        .metrics
-        .errors_total
-        .inc_by(u64::MAX.wrapping_sub(errors).wrapping_add(1));
-    state
-        .metrics
-        .prompt_tokens_total
-        .inc_by(u64::MAX.wrapping_sub(prompt).wrapping_add(1));
-
-    // Also reset gauges.
-    state.metrics.active_requests.set(0.0);
-    state.metrics.kv_cache_utilization.set(0.0);
-
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    state.record_metrics_reset();
 
     let body = serde_json::json!({
         "reset": true,
-        "timestamp": ts,
+        "timestamp": unix_secs_to_iso8601(
+            state.last_reset_unix_secs().unwrap_or_else(unix_now_secs)
+        ),
     });
 
     (StatusCode::OK, Json(body))
@@ -449,5 +614,202 @@ mod tests {
     fn test_server_version_non_empty() {
         let version: &'static str = env!("CARGO_PKG_VERSION");
         assert!(!version.is_empty(), "CARGO_PKG_VERSION should not be empty");
+    }
+
+    // ── RT-19 / SV-18: honest metric reset ─────────────────────────────────
+
+    #[test]
+    fn reset_metrics_never_mutates_the_underlying_counter() {
+        let metrics = Arc::new(InferenceMetrics::new());
+        metrics.requests_total.inc_by(7);
+        let state = AdminState::new(Arc::clone(&metrics));
+
+        state.record_metrics_reset();
+
+        // The raw, shared counter must be untouched — any other consumer of
+        // `metrics` (e.g. a `/metrics` Prometheus scrape) still sees the true
+        // monotonic value.
+        assert_eq!(
+            metrics.requests_total.get(),
+            7,
+            "the shared Counter must never be mutated by a reset"
+        );
+        // But this admin view now reports (approximately) zero.
+        assert_eq!(state.requests_total(), 0);
+    }
+
+    #[test]
+    fn requests_total_reports_delta_since_last_reset() {
+        let metrics = Arc::new(InferenceMetrics::new());
+        let state = AdminState::new(Arc::clone(&metrics));
+
+        metrics.requests_total.inc_by(3);
+        assert_eq!(state.requests_total(), 3);
+
+        state.record_metrics_reset();
+        assert_eq!(state.requests_total(), 0);
+
+        metrics.requests_total.inc_by(5);
+        assert_eq!(
+            state.requests_total(),
+            5,
+            "post-reset requests must count from the new baseline, not from zero absolute"
+        );
+    }
+
+    #[test]
+    fn reset_cannot_underflow_even_if_baseline_races_ahead() {
+        // Pathological but reachable: a baseline recorded from a read that
+        // raced past a concurrent increment must never make the subsequent
+        // `saturating_sub` panic or wrap — it must clamp to 0.
+        let metrics = Arc::new(InferenceMetrics::new());
+        let state = AdminState::new(Arc::clone(&metrics));
+        state
+            .requests_baseline
+            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(state.requests_total(), 0, "must saturate, never underflow");
+    }
+
+    #[test]
+    fn last_reset_unix_secs_starts_absent_and_becomes_present() {
+        let metrics = Arc::new(InferenceMetrics::new());
+        let state = AdminState::new(metrics);
+        assert!(state.last_reset_unix_secs().is_none());
+        state.record_metrics_reset();
+        assert!(state.last_reset_unix_secs().is_some());
+    }
+
+    #[tokio::test]
+    async fn reset_metrics_handler_never_produces_a_near_u64_max_counter() {
+        let metrics = Arc::new(InferenceMetrics::new());
+        metrics.requests_total.inc_by(42);
+        metrics.tokens_generated_total.inc_by(1000);
+        let state = Arc::new(AdminState::new(Arc::clone(&metrics)));
+
+        let response = reset_metrics(State(Arc::clone(&state)))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("should read body");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("body should be valid JSON");
+        assert_eq!(json["reset"], serde_json::json!(true));
+        let ts = json["timestamp"]
+            .as_str()
+            .expect("timestamp should be a string");
+        // ISO 8601 / RFC 3339, e.g. "2026-09-21T12:34:56Z" — never the racy
+        // wrap-around's ~u64::MAX, and never a bare unix-epoch integer.
+        assert!(
+            ts.ends_with('Z') && ts.contains('T') && ts.len() == 20,
+            "timestamp should look like an ISO-8601 UTC instant, got {ts:?}"
+        );
+
+        // The raw counters are exactly what they were — never anywhere near
+        // u64::MAX, which is the signature of the old wrap-around bug.
+        assert_eq!(metrics.requests_total.get(), 42);
+        assert_eq!(metrics.tokens_generated_total.get(), 1000);
+    }
+
+    #[test]
+    fn concurrent_increments_during_reset_never_wrap_the_counter() {
+        use std::thread;
+
+        let metrics = Arc::new(InferenceMetrics::new());
+        let state = Arc::new(AdminState::new(Arc::clone(&metrics)));
+
+        let writer_metrics = Arc::clone(&metrics);
+        let writer = thread::spawn(move || {
+            for _ in 0..10_000 {
+                writer_metrics.requests_total.inc();
+            }
+        });
+        for _ in 0..50 {
+            state.record_metrics_reset();
+        }
+        writer.join().expect("writer thread panicked");
+
+        let raw = metrics.requests_total.get();
+        assert!(
+            raw <= 10_000,
+            "the true counter must never exceed the number of real increments \
+             issued; got {raw} (a value near u64::MAX would indicate the old \
+             wrap-around race)"
+        );
+        // The admin view must also never underflow/wrap regardless of
+        // exactly when the last reset raced the last increment.
+        assert!(state.requests_total() <= 10_000);
+    }
+
+    // ── RT-30: real model_loaded ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn model_loaded_is_honestly_false_without_a_served_model_info() {
+        let metrics = Arc::new(InferenceMetrics::new());
+        let state = Arc::new(AdminState::new(metrics));
+        assert!(
+            state.model_info.is_none(),
+            "precondition: no ServedModelInfo attached"
+        );
+
+        let response = get_status(State(Arc::clone(&state))).await.into_response();
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("should read body");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("body should be valid JSON");
+        assert_eq!(
+            json["model_loaded"],
+            serde_json::json!(false),
+            "without a real model-registry handle, model_loaded must not be \
+             guessed from unrelated request/token counters (the old \
+             placeholder heuristic)"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_loaded_placeholder_heuristic_is_gone() {
+        // Regression guard for the exact old bug: a request being *handled*
+        // (even a rejected one, which still increments requests_total on the
+        // validation-failure path elsewhere in the server) must not flip
+        // model_loaded to true on its own.
+        let metrics = Arc::new(InferenceMetrics::new());
+        metrics.requests_total.inc_by(5);
+        metrics.tokens_generated_total.inc_by(100);
+        let state = Arc::new(AdminState::new(metrics));
+
+        let response = get_status(State(Arc::clone(&state))).await.into_response();
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("should read body");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("body should be valid JSON");
+        assert_eq!(
+            json["model_loaded"],
+            serde_json::json!(false),
+            "nonzero request/token counters alone must never imply a model is loaded"
+        );
+    }
+
+    // ── unix_secs_to_iso8601 ─────────────────────────────────────────────────
+
+    #[test]
+    fn iso8601_epoch_zero() {
+        assert_eq!(unix_secs_to_iso8601(0), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn iso8601_known_reference_instants() {
+        // Cross-checked against `date -u -r <secs>`.
+        assert_eq!(unix_secs_to_iso8601(1_700_000_000), "2023-11-14T22:13:20Z");
+        assert_eq!(unix_secs_to_iso8601(1_789_948_800), "2026-09-21T00:00:00Z");
+    }
+
+    #[test]
+    fn iso8601_handles_leap_day() {
+        // 2000-02-29 is a real leap day (divisible by 400).
+        assert_eq!(unix_secs_to_iso8601(951_782_400), "2000-02-29T00:00:00Z");
     }
 }

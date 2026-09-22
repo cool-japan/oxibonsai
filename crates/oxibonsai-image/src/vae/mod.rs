@@ -8,9 +8,10 @@
 //! conv_norm_out → conv_out`) to produce `[1, 3, 512, 512]`. Everything is
 //! computed in f32 on flat NCHW (batch-1) buffers.
 //!
-//! Weights are loaded from the per-tensor `.npy` files exported by
-//! `/tmp/bonsai_vae_export_weights.py` via [`weights::VaeWeights`]. The conv
-//! weight layout is the MLX `[out, kH, kW, in]` (see [`weights`]).
+//! Weights are loaded from the per-tensor `.npy` files exported by the
+//! project's `bonsai_vae_export_weights.py` export script via
+//! [`weights::VaeWeights`]. The conv weight layout is the MLX
+//! `[out, kH, kW, in]` (see [`weights`]).
 //!
 //! The decoder supports both **untiled** (single forward pass,
 //! `decode_packed_latents`) and **tiled** (`decode_packed_latents_tiled`)
@@ -25,7 +26,7 @@
 //! use std::path::Path;
 //! use oxibonsai_image::vae::{VaeWeights, VaeDecoder};
 //!
-//! let weights = VaeWeights::open(Path::new("/tmp/bonsai_golden/vae/weights"))
+//! let weights = VaeWeights::open(Path::new("/path/to/exported/vae/weights"))
 //!     .expect("open vae weights");
 //! let decoder = VaeDecoder::from_weights(&weights).expect("build decoder");
 //! // packed: flat NCHW [1,128,32,32] latent from the DiT.

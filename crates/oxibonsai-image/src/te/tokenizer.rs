@@ -1,9 +1,10 @@
 //! Qwen3 ByteLevel-BPE tokenizer for the Bonsai-Image text encoder.
 //!
 //! Reproduces the HuggingFace `tokenizers` pipeline used by the reference
-//! (`tokenizer.json`): **NFC normalize → GPT-2 pre-tokenization regex → ByteLevel
-//! byte→unicode mapping → BPE merges**, then splices the fixed Qwen3 chat-template
-//! special-id prefix/suffix and right-pads to `max_len`.
+//! (`tokenizer.json`): **normalize (ASCII-only, see below) → GPT-2
+//! pre-tokenization regex → ByteLevel byte→unicode mapping → BPE merges**, then
+//! splices the fixed Qwen3 chat-template special-id prefix/suffix and
+//! right-pads to `max_len`.
 //!
 //! Chat template (`enable_thinking=False`) for a prompt `P`:
 //!
@@ -22,16 +23,55 @@
 //! equal the golden `input_ids` exactly (see the `tokenizer_*` tests / the
 //! `te_parity` example's tokenizer check).
 //!
-//! ## NFC scope
+//! ## Normalization scope (no real NFC)
 //!
-//! Normalization is applied for the ASCII range (identity) and is otherwise a
-//! pass-through: image prompts are overwhelmingly ASCII/Latin and the canonical
-//! goldens are ASCII. Full Unicode NFC (which would need composition tables) is a
-//! deliberate non-goal here; non-ASCII prompts that require recomposition may
-//! tokenize slightly differently from HF.
+//! `normalize_ascii_only` is a **plain identity pass-through**, not Unicode
+//! NFC normalization — it does not compose or decompose anything. It is
+//! correct only because image prompts are overwhelmingly ASCII/Latin (already
+//! in NFC by construction) and the canonical goldens are ASCII. Full Unicode
+//! NFC needs composition tables this crate does not implement; a non-ASCII
+//! prompt that requires real recomposition will tokenize slightly differently
+//! from HF. An earlier revision named this function `nfc_ascii`, which implied
+//! it performed some (if scope-limited) real NFC work; it did not, and the
+//! rename removes that false impression (RAG-EVAL-IMG-18 / TOK-10 audit).
+//! `oxibonsai-tokenizer` does have real NFC support
+//! ([`oxibonsai_tokenizer::tokenizer::TokenizerConfig::normalize_nfc`], via
+//! `OxiTokenizer::encode`), but this module bypasses the full `OxiTokenizer`
+//! pipeline (see below) in favour of calling the lower-level BPE primitives
+//! directly, so it does not go through that path either — tracked as a
+//! follow-up alongside real NFC support for this text encoder, not addressed
+//! by this fix (TOK-10's scope is de-duplication, not new normalization
+//! behaviour).
+//!
+//! ## Byte-level BPE pipeline (TOK-10: no longer a duplicate)
+//!
+//! This module used to carry its own independent, byte-for-byte duplicate of
+//! the GPT-2 byte-level BPE pipeline (`pre_tokenize`, `match_contraction`,
+//! `Qwen3Tokenizer::bpe`, `build_byte_to_unicode`, `parse_merge`) instead of
+//! depending on `oxibonsai-tokenizer`'s canonical implementation, so this
+//! crate's own pre-tokenizer fixes (e.g. TOK-03's `fancy-regex`-based
+//! `Split` engine, which corrected divergences from HF on Roman numerals and
+//! blank-line whitespace) never reached it. `encode_prompt`/`from_json_str`
+//! below now build an [`oxibonsai_tokenizer::Vocabulary`] +
+//! [`oxibonsai_tokenizer::BpeMerges`] from the parsed `tokenizer.json` and
+//! call [`oxibonsai_tokenizer::bpe::pretokenize_gpt2`] +
+//! [`oxibonsai_tokenizer::bpe::bpe_encode_bytelevel`] directly, rather than
+//! going through the full [`oxibonsai_tokenizer::OxiTokenizer`] type: this
+//! text encoder's chat-template wrapping is a **fixed, pre-captured id
+//! array** (`PREFIX`/`SUFFIX` below, validated against the mflux golden),
+//! spliced in after encoding the bare prompt body — it has no use for
+//! `OxiTokenizer`'s general special-token carve-out, BOS/EOS injection, or
+//! decode path. Calling the BPE primitives directly also means
+//! `OxiTokenizer`'s protected-token carve-out (`build_special_pieces`,
+//! `oxibonsai-tokenizer`'s `tokenizer.rs:607-616`) is never in this code
+//! path at all, so it cannot re-tokenize `PREFIX`/`SUFFIX` differently (the
+//! wave-1 addendum's mandatory pre-check for this rewrite).
 
-use std::collections::HashMap;
 use std::path::Path;
+
+use oxibonsai_tokenizer::bpe::{bpe_encode_bytelevel, pretokenize_gpt2};
+use oxibonsai_tokenizer::hf_format::bytes_to_unicode_map;
+use oxibonsai_tokenizer::{BpeMerges, HfTokenizerJson, Vocabulary};
 
 use crate::te::error::{TeError, TeResult};
 
@@ -80,13 +120,23 @@ pub struct TokenizerOutput {
 }
 
 /// Qwen3 ByteLevel-BPE tokenizer (loaded from `tokenizer.json`).
+///
+/// A thin wrapper over `oxibonsai-tokenizer`'s BPE primitives (see the
+/// module docs' "Byte-level BPE pipeline" section for why this does not use
+/// the full `OxiTokenizer` type).
 pub struct Qwen3Tokenizer {
-    /// Byte-level token string → id.
-    vocab: HashMap<String, u32>,
-    /// Ordered merge rule `(left, right)` → rank (lower = higher priority).
-    merge_ranks: HashMap<(String, String), u32>,
-    /// GPT-2 byte → unicode-char table.
-    byte_to_unicode: [char; 256],
+    /// Byte-level token string ↔ id, and the atomically-protected id sets
+    /// (unused by this module — `oxibonsai_tokenizer::Vocabulary` always
+    /// carries them, but nothing here calls the carve-out APIs that
+    /// consult them).
+    vocabulary: Vocabulary,
+    /// Ordered BPE merge table.
+    merges: BpeMerges,
+    /// Fallback id for a byte-level piece with no vocabulary entry. Real
+    /// byte-level vocabularies always cover all 256 remapped byte
+    /// characters, so this should be unreachable in practice; resolved from
+    /// the parsed `tokenizer.json`'s `unk_token` when declared, else `0`.
+    unk_id: u32,
 }
 
 impl Qwen3Tokenizer {
@@ -105,45 +155,46 @@ impl Qwen3Tokenizer {
 
     /// Parse from the raw `tokenizer.json` contents.
     ///
+    /// Delegates all parsing to
+    /// [`oxibonsai_tokenizer::hf_format::HfTokenizerJson::parse`] (handling
+    /// both merge shapes — `["a","b"]` and `"a b"` — and both `vocab`
+    /// object forms) rather than re-implementing a parser, then builds a
+    /// plain [`Vocabulary`] + [`BpeMerges`] from its `vocab`/`merges`
+    /// fields. This tokenizer has no use for `HfTokenizerJson`'s
+    /// added-token/special-token bookkeeping (see the module docs), so it
+    /// is intentionally not carried over.
+    ///
     /// # Errors
     /// [`TeError::Tokenizer`] if the JSON is malformed or missing the
-    /// `model.vocab` / `model.merges` fields.
+    /// `model.vocab` / `model.merges` fields, or if a merge's resulting
+    /// token is absent from the vocabulary.
     pub fn from_json_str(text: &str) -> TeResult<Self> {
-        let root: serde_json::Value = serde_json::from_str(text)
-            .map_err(|e| TeError::Tokenizer(format!("json parse: {e}")))?;
-        let model = root
-            .get("model")
-            .ok_or_else(|| TeError::Tokenizer("no model field".into()))?;
+        let parsed = HfTokenizerJson::parse(text).map_err(|e| TeError::Tokenizer(e.to_string()))?;
 
-        // vocab: { token: id }
-        let vocab_obj = model
-            .get("vocab")
-            .and_then(|v| v.as_object())
-            .ok_or_else(|| TeError::Tokenizer("no model.vocab object".into()))?;
-        let mut vocab = HashMap::with_capacity(vocab_obj.len());
-        for (k, v) in vocab_obj {
-            let id = v
-                .as_u64()
-                .ok_or_else(|| TeError::Tokenizer(format!("vocab id for {k:?} not an int")))?;
-            vocab.insert(k.clone(), id as u32);
+        let mut vocabulary = Vocabulary::new();
+        for (token, id) in &parsed.vocab {
+            vocabulary.insert(token, *id);
         }
 
-        // merges: either ["a b", ...] (older) or [["a","b"], ...] (newer).
-        let merges = model
-            .get("merges")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| TeError::Tokenizer("no model.merges array".into()))?;
-        let mut merge_ranks = HashMap::with_capacity(merges.len());
-        for (rank, m) in merges.iter().enumerate() {
-            let (a, b) = parse_merge(m)
-                .ok_or_else(|| TeError::Tokenizer(format!("bad merge entry at {rank}")))?;
-            merge_ranks.insert((a, b), rank as u32);
+        let mut merges = BpeMerges::new();
+        for (a, b) in &parsed.merges {
+            let merged = format!("{a}{b}");
+            let merged_id = parsed.vocab.get(&merged).copied().ok_or_else(|| {
+                TeError::Tokenizer(format!("merged token {merged:?} not in vocab"))
+            })?;
+            merges.add_merge(a, b, merged_id);
         }
+
+        let unk_id = parsed
+            .unk_token
+            .as_deref()
+            .and_then(|t| parsed.vocab.get(t).copied())
+            .unwrap_or(0);
 
         Ok(Self {
-            vocab,
-            merge_ranks,
-            byte_to_unicode: build_byte_to_unicode(),
+            vocabulary,
+            merges,
+            unk_id,
         })
     }
 
@@ -154,8 +205,7 @@ impl Qwen3Tokenizer {
     /// (matching `truncation`); the mask then has no padding zeros.
     ///
     /// # Errors
-    /// [`TeError::Tokenizer`] if a byte-level piece is not present in the vocab
-    /// (which would indicate a corrupt `tokenizer.json`).
+    /// Propagates any error from [`Self::encode_prompt`].
     pub fn tokenize(&self, prompt: &str, max_len: usize) -> TeResult<TokenizerOutput> {
         let mut ids: Vec<u32> = Vec::with_capacity(max_len);
         ids.extend_from_slice(&PREFIX);
@@ -180,282 +230,46 @@ impl Qwen3Tokenizer {
 
     /// BPE-encode the bare prompt `P` (no chat-template wrapping) to ids.
     ///
+    /// Pre-tokenizes with [`pretokenize_gpt2`] (the canonical HuggingFace
+    /// `ByteLevel` `Split` regex, driven by `fancy-regex` — TOK-03), remaps
+    /// each piece's UTF-8 bytes through the GPT-2 bytes→unicode table, and
+    /// BPE-merges with [`bpe_encode_bytelevel`]. A byte-level piece absent
+    /// from the vocabulary maps to `unk_id` (this type's private fallback
+    /// field) rather than erroring —
+    /// unreachable for a well-formed byte-level `tokenizer.json` (every one
+    /// of the 256 remapped byte characters always has an entry), matching
+    /// `bpe_encode_bytelevel`'s documented contract.
+    ///
     /// # Errors
-    /// As [`Self::tokenize`].
+    /// Currently infallible (kept as a `Result` for API stability and
+    /// forward-compatibility with a stricter validation mode).
     pub fn encode_prompt(&self, prompt: &str) -> TeResult<Vec<u32>> {
-        let normalized = nfc_ascii(prompt);
+        let byte_to_unicode = bytes_to_unicode_map();
         let mut ids = Vec::new();
-        for piece in pre_tokenize(&normalized) {
-            // ByteLevel: map each UTF-8 byte of the piece to its unicode char.
+        for piece in pretokenize_gpt2(prompt) {
             let mut byte_level = String::with_capacity(piece.len());
             for &b in piece.as_bytes() {
-                byte_level.push(self.byte_to_unicode[b as usize]);
+                byte_level.push(byte_to_unicode[b as usize]);
             }
-            for tok in self.bpe(&byte_level) {
-                let id = self
-                    .vocab
-                    .get(&tok)
-                    .ok_or_else(|| TeError::Tokenizer(format!("token {tok:?} not in vocab")))?;
-                ids.push(*id);
-            }
+            ids.extend(bpe_encode_bytelevel(
+                &byte_level,
+                &self.vocabulary,
+                &self.merges,
+                self.unk_id,
+            ));
         }
         Ok(ids)
     }
-
-    /// Apply BPE merges to a byte-level token string: start from single chars and
-    /// repeatedly merge the adjacent pair with the lowest rank until none remain.
-    fn bpe(&self, token: &str) -> Vec<String> {
-        let mut word: Vec<String> = token.chars().map(|c| c.to_string()).collect();
-        if word.len() < 2 {
-            return word;
-        }
-        loop {
-            // Find the lowest-rank adjacent pair.
-            let mut best_rank = u32::MAX;
-            let mut best_idx: Option<usize> = None;
-            for i in 0..word.len() - 1 {
-                if let Some(&r) = self
-                    .merge_ranks
-                    .get(&(word[i].clone(), word[i + 1].clone()))
-                {
-                    if r < best_rank {
-                        best_rank = r;
-                        best_idx = Some(i);
-                    }
-                }
-            }
-            let Some(idx) = best_idx else { break };
-            // Merge ALL non-overlapping occurrences of that best pair (the HF
-            // reference rebuilds the word merging every occurrence of the chosen
-            // pair left-to-right before re-scanning).
-            let (a, b) = (word[idx].clone(), word[idx + 1].clone());
-            let mut merged: Vec<String> = Vec::with_capacity(word.len());
-            let mut i = 0;
-            while i < word.len() {
-                if i + 1 < word.len() && word[i] == a && word[i + 1] == b {
-                    merged.push(format!("{a}{b}"));
-                    i += 2;
-                } else {
-                    merged.push(word[i].clone());
-                    i += 1;
-                }
-            }
-            word = merged;
-            if word.len() < 2 {
-                break;
-            }
-        }
-        word
-    }
 }
 
-/// Parse a merge entry: `["a","b"]` (array) or `"a b"` (space-joined string).
-fn parse_merge(m: &serde_json::Value) -> Option<(String, String)> {
-    if let Some(arr) = m.as_array() {
-        if arr.len() == 2 {
-            return Some((arr[0].as_str()?.to_string(), arr[1].as_str()?.to_string()));
-        }
-        return None;
-    }
-    let s = m.as_str()?;
-    let sp = s.find(' ')?;
-    Some((s[..sp].to_string(), s[sp + 1..].to_string()))
-}
-
-/// Build the GPT-2 byte→unicode table: printable ASCII/Latin map to themselves,
-/// the remaining bytes map to `256 + n` codepoints. (Identical to the table used
-/// by `tokenizers`' ByteLevel.)
-fn build_byte_to_unicode() -> [char; 256] {
-    // The "directly printable" byte ranges (kept as-is).
-    let mut keep: Vec<u32> = Vec::new();
-    keep.extend(b'!' as u32..=b'~' as u32);
-    keep.extend(0xA1u32..=0xACu32);
-    keep.extend(0xAEu32..=0xFFu32);
-
-    let mut table = ['\0'; 256];
-    let mut n = 0u32;
-    for b in 0u32..256 {
-        if keep.contains(&b) {
-            table[b as usize] = char::from_u32(b).unwrap_or('\0');
-        } else {
-            let c = char::from_u32(256 + n).unwrap_or('\0');
-            table[b as usize] = c;
-            n += 1;
-        }
-    }
-    table
-}
-
-/// NFC normalization restricted to the ASCII range (identity). Non-ASCII passes
-/// through unchanged (see module docs for the scope note).
-fn nfc_ascii(s: &str) -> String {
-    // ASCII is already in NFC; we do not recompose non-ASCII here.
+/// Identity pass-through, **not** Unicode NFC normalization (see the module
+/// docs' "Normalization scope" section for why the name no longer claims
+/// otherwise). ASCII input is already in NFC, so this is correct for the
+/// ASCII/Latin prompts this tokenizer targets; non-ASCII input that would need
+/// real composition/decomposition passes through unrecomposed.
+#[allow(dead_code)] // Kept for documentation/API-history purposes; see module docs.
+fn normalize_ascii_only(s: &str) -> String {
     s.to_string()
-}
-
-/// GPT-2 pre-tokenization, a hand-written port of the regex
-/// `(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}|
-///  ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+` with `Isolated` behavior.
-///
-/// Emits the matched substrings in order (the whole input is consumed).
-fn pre_tokenize(text: &str) -> Vec<String> {
-    let chars: Vec<char> = text.chars().collect();
-    let n = chars.len();
-    let mut out: Vec<String> = Vec::new();
-    let mut i = 0usize;
-
-    let is_letter = |c: char| c.is_alphabetic();
-    let is_number = |c: char| c.is_numeric();
-    let is_ws = |c: char| c.is_whitespace();
-    let is_nl = |c: char| c == '\r' || c == '\n';
-
-    while i < n {
-        let c = chars[i];
-
-        // 1) contractions: '(?i:'s|'t|'re|'ve|'m|'ll|'d)
-        if c == '\'' && i + 1 < n {
-            if let Some(len) = match_contraction(&chars[i..]) {
-                out.push(chars[i..i + len].iter().collect());
-                i += len;
-                continue;
-            }
-        }
-
-        // 2) [^\r\n\p{L}\p{N}]?\p{L}+   (optional single non-nl/non-alnum, then letters)
-        {
-            let mut j = i;
-            // optional leading char that is not \r,\n and not letter/number
-            if !is_nl(chars[j]) && !is_letter(chars[j]) && !is_number(chars[j]) {
-                // only consume it if a letter follows
-                if j + 1 < n && is_letter(chars[j + 1]) {
-                    j += 1;
-                }
-            }
-            if j < n && is_letter(chars[j]) {
-                while j < n && is_letter(chars[j]) {
-                    j += 1;
-                }
-                out.push(chars[i..j].iter().collect());
-                i = j;
-                continue;
-            }
-        }
-
-        // 3) \p{N}  (a single number char — \p{N} with no +)
-        if is_number(c) {
-            out.push(c.to_string());
-            i += 1;
-            continue;
-        }
-
-        // 4)  ?[^\s\p{L}\p{N}]+[\r\n]*  (optional space, run of non-ws/non-alnum, trailing newlines)
-        {
-            let mut j = i;
-            let mut consumed_space = false;
-            if chars[j] == ' ' {
-                // only if followed by a non-ws/non-alnum symbol
-                if j + 1 < n
-                    && !is_ws(chars[j + 1])
-                    && !is_letter(chars[j + 1])
-                    && !is_number(chars[j + 1])
-                {
-                    j += 1;
-                    consumed_space = true;
-                }
-            }
-            if j < n && !is_ws(chars[j]) && !is_letter(chars[j]) && !is_number(chars[j]) {
-                while j < n && !is_ws(chars[j]) && !is_letter(chars[j]) && !is_number(chars[j]) {
-                    j += 1;
-                }
-                while j < n && is_nl(chars[j]) {
-                    j += 1;
-                }
-                out.push(chars[i..j].iter().collect());
-                i = j;
-                continue;
-            }
-            // if we tentatively consumed a space but no symbol followed, fall
-            // through to the whitespace branches with i unchanged.
-            let _ = consumed_space;
-        }
-
-        // 5) \s*[\r\n]+   (whitespace ending in newlines)
-        if is_ws(c) {
-            // look ahead: a run of whitespace that contains a newline -> branch 5
-            let mut j = i;
-            while j < n && is_ws(chars[j]) && !is_nl(chars[j]) {
-                j += 1;
-            }
-            if j < n && is_nl(chars[j]) {
-                while j < n && is_nl(chars[j]) {
-                    j += 1;
-                }
-                out.push(chars[i..j].iter().collect());
-                i = j;
-                continue;
-            }
-        }
-
-        // 6) \s+(?!\S)  and  7) \s+
-        if is_ws(c) {
-            let mut j = i;
-            while j < n && is_ws(chars[j]) {
-                j += 1;
-            }
-            // \s+(?!\S): if the whitespace run reaches end-of-text, take it all.
-            // Otherwise \s+ but leaving the last space for a following word
-            // (GPT-2 keeps a single leading space with the next token).
-            if j == n {
-                out.push(chars[i..j].iter().collect());
-                i = j;
-            } else if j - i >= 2 {
-                // leave the final space to attach to the next token
-                out.push(chars[i..j - 1].iter().collect());
-                i = j - 1;
-            } else {
-                // single space followed by a non-space: it belongs to the next
-                // token (handled by branch 2/4's optional leading space), so emit
-                // nothing here and let the next iteration consume it. To avoid an
-                // infinite loop, attach it as its own piece only if the next char
-                // is itself whitespace (cannot happen here) — so advance by
-                // pushing the space (it will byte-encode to 'Ġ').
-                // In practice branch 2/4 already consumed the leading space, so
-                // reaching here with a lone space means a space before a word that
-                // those branches did not take; emit it standalone.
-                out.push(chars[i..j].iter().collect());
-                i = j;
-            }
-            continue;
-        }
-
-        // Fallback: emit the single char (should be unreachable for valid text).
-        out.push(c.to_string());
-        i += 1;
-    }
-    out
-}
-
-/// Match a leading contraction (`'s 't 're 've 'm 'll 'd`, case-insensitive),
-/// returning its char length if present.
-fn match_contraction(rest: &[char]) -> Option<usize> {
-    // rest[0] == '\''
-    let lower = |c: char| c.to_ascii_lowercase();
-    if rest.len() >= 2 {
-        let c1 = lower(rest[1]);
-        // 3-char: 're 've 'll
-        if rest.len() >= 3 {
-            let c2 = lower(rest[2]);
-            let three = matches!((c1, c2), ('r', 'e') | ('v', 'e') | ('l', 'l'));
-            if three {
-                return Some(3);
-            }
-        }
-        // 2-char: 's 't 'm 'd
-        if matches!(c1, 's' | 't' | 'm' | 'd') {
-            return Some(2);
-        }
-    }
-    None
 }
 
 #[cfg(test)]
@@ -464,18 +278,21 @@ mod tests {
 
     #[test]
     fn byte_to_unicode_known_points() {
-        let t = build_byte_to_unicode();
-        // space (0x20) is not in the printable-kept set → maps to 256+n; the
-        // first remapped byte 0x00 → 256 ('Ā'), and 0x20 → 'Ġ' (0x120).
+        // Wiring smoke-check (TOK-10): the same well-known GPT-2 mapping
+        // values, now sourced from `oxibonsai_tokenizer` instead of a local
+        // duplicate table.
+        let t = bytes_to_unicode_map();
         assert_eq!(t[b' ' as usize], 'Ġ');
         assert_eq!(t[b'\n' as usize], 'Ċ');
-        // 'a' stays 'a'.
         assert_eq!(t[b'a' as usize], 'a');
     }
 
     #[test]
     fn pretokenize_canonical_prompt() {
-        let p = pre_tokenize("a tiny bonsai tree in a ceramic pot");
+        // Wiring smoke-check: `pretokenize_gpt2` (fancy-regex-driven, owned
+        // by `oxibonsai-tokenizer`) must still split the canonical example
+        // prompt exactly as the old local scanner did.
+        let p = pretokenize_gpt2("a tiny bonsai tree in a ceramic pot");
         assert_eq!(
             p,
             vec!["a", " tiny", " bonsai", " tree", " in", " a", " ceramic", " pot"]
@@ -492,12 +309,60 @@ mod tests {
             }
         }"#;
         let tok = Qwen3Tokenizer::from_json_str(json).expect("parse");
-        // "abc" byte-level is "abc" (all printable ASCII) -> merge to ["abc"].
-        let out = tok.bpe("abc");
-        assert_eq!(out, vec!["abc".to_string()]);
-        // "ab" -> ["ab"]; "ba" -> no merge -> ["b","a"].
-        assert_eq!(tok.bpe("ab"), vec!["ab".to_string()]);
-        assert_eq!(tok.bpe("ba"), vec!["b".to_string(), "a".to_string()]);
+        // "abc" byte-level is "abc" (all printable ASCII) -> merge to ["abc"] (id 4).
+        assert_eq!(tok.encode_prompt("abc").expect("encode"), vec![4]);
+        // "ab" -> [3]; "ba" -> no merge -> [1, 0] ("b" then "a").
+        assert_eq!(tok.encode_prompt("ab").expect("encode"), vec![3]);
+        assert_eq!(tok.encode_prompt("ba").expect("encode"), vec![1, 0]);
+    }
+
+    /// Merge-order equivalence regression net (TOK-10 mandatory pre-check).
+    ///
+    /// The deleted local `Qwen3Tokenizer::bpe` merged **all** non-overlapping
+    /// occurrences of the single best-ranked pair per round before
+    /// re-scanning (the classic reference BPE algorithm — its own removed
+    /// doc comment asserted this explicitly). `oxibonsai_tokenizer::bpe`'s
+    /// replacement merges **one** occurrence per min-heap pop, with ties at
+    /// equal rank broken leftmost-first. These are two different
+    /// *implementations* of the same underlying process (a heap
+    /// pop-and-relink can never let a later occurrence of the current
+    /// best-ranked pair be pre-empted by anything higher-priority that
+    /// wasn't already queued ahead of it), and the values below were
+    /// captured empirically from the OLD implementation, on an adversarial
+    /// corpus specifically designed to exercise repeated/overlapping pair
+    /// occurrences within one word (a run of identical characters, and a
+    /// chain of distinct competing pairs), before it was deleted — so this
+    /// pins that the rewrite did not silently change segmentation.
+    #[test]
+    fn merge_order_equivalence_regression_net() {
+        let json = r#"{
+            "model": {
+                "vocab": {
+                    "a":1,"b":2,"c":3,"d":4,"e":5,
+                    "aa":20,"aaaa":21,
+                    "bc":22,"cd":23,"bcd":24,"de":25
+                },
+                "merges": [["a","a"],["aa","aa"],["b","c"],["c","d"],["bc","d"],["d","e"]]
+            }
+        }"#;
+        let tok = Qwen3Tokenizer::from_json_str(json).expect("parse");
+
+        let cases: &[(&str, &[u32])] = &[
+            ("aaaa", &[21]),         // "aaaa" (single merged token)
+            ("aaaaaa", &[21, 20]),   // "aaaa","aa"
+            ("aaa", &[20, 1]),       // "aa","a"
+            ("abab", &[1, 2, 1, 2]), // no (a,b)/(b,a) rule at all: unchanged
+            ("bcde", &[24, 5]),      // "bcd","e"
+            ("bcda", &[24, 1]),      // "bcd","a"
+        ];
+        for (word, expected_ids) in cases {
+            let ids = tok.encode_prompt(word).expect("encode");
+            assert_eq!(
+                &ids, expected_ids,
+                "merge-order divergence for {word:?}: got {ids:?}, expected {expected_ids:?} \
+                 (captured from the pre-rewrite reference implementation)"
+            );
+        }
     }
 
     #[test]
@@ -523,6 +388,11 @@ mod tests {
         );
         assert_eq!(out2.attention_mask.iter().filter(|&&m| m == 0).count(), 7);
         assert_eq!(out2.attention_mask.iter().filter(|&&m| m == 1).count(), 13);
+    }
+
+    #[test]
+    fn normalize_ascii_only_is_identity() {
+        assert_eq!(normalize_ascii_only("hello world"), "hello world");
     }
 
     /// Full golden match — gated on the real `tokenizer.json` being present.

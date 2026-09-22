@@ -24,7 +24,7 @@ byteorder.workspace = true
 half.workspace = true
 memmap2 = { workspace = true, optional = true }
 tracing.workspace = true
-serde.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+oxibonsai-testkit.workspace = true

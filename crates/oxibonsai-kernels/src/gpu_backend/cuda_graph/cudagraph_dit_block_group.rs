@@ -88,7 +88,7 @@ impl CudaGraph {
                 num_heads * head_dim
             )));
         }
-        if head_dim % 2 != 0 {
+        if !head_dim.is_multiple_of(2) {
             return Err(CudaGraphError::DriverError(
                 "dit_single_block: head_dim must be even".into(),
             ));
@@ -104,7 +104,7 @@ impl CudaGraph {
             )));
         }
         // The ternary GEMM requires the contraction dim be a multiple of 128.
-        if hidden % 128 != 0 || cat_w % 128 != 0 {
+        if !hidden.is_multiple_of(128) || !cat_w.is_multiple_of(128) {
             return Err(CudaGraphError::DriverError(format!(
                 "dit_single_block: gemm_tq2 k must be %128 (hidden {hidden}, hidden+ffn {cat_w})"
             )));
@@ -283,7 +283,7 @@ impl CudaGraph {
             return Ok(());
         }
         // ── Validate (shared) ────────────────────────────────────────────
-        if hidden != num_heads * head_dim || head_dim % 2 != 0 {
+        if hidden != num_heads * head_dim || !head_dim.is_multiple_of(2) {
             return Err(CudaGraphError::DriverError(
                 "dit_single_blocks: hidden != heads*head_dim, or odd head_dim".into(),
             ));
@@ -297,7 +297,7 @@ impl CudaGraph {
                 "dit_single_blocks: proj_out != 3*hidden+2*ffn_inner".into(),
             ));
         }
-        if hidden % 128 != 0 || cat_w % 128 != 0 {
+        if !hidden.is_multiple_of(128) || !cat_w.is_multiple_of(128) {
             return Err(CudaGraphError::DriverError(
                 "dit_single_blocks: gemm_tq2 k must be %128".into(),
             ));

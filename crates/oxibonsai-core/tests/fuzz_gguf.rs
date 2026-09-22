@@ -2,6 +2,67 @@
 //!
 //! Ensures the parser handles adversarial and malformed input gracefully
 //! (returning errors, never panicking or OOMing).
+//!
+//! # T-03: this file used to encode a wrong specification
+//!
+//! `random_tensor_type_id_no_panic` (and two sibling tests) used to hardcode
+//! a stale, incomplete `known_ids` list (missing IDs 16-29, 34, 39, 40, 43,
+//! 44, 142, 143 — i.e. every `oxibonsai_core::GgufTensorType` variant added
+//! since the test was first written), which made it structurally incapable
+//! of ever failing on the ids that actually matter (`P(random u32 hits one
+//! of ~40 specific values)` is astronomically small either way, so the test
+//! never meaningfully exercised the "known" branch at all). All three now
+//! derive their expected id set from [`GgufTensorType::ALL`] itself via
+//! [`known_wire_ids`], so they can never silently drift out of sync with the
+//! real type table again, plus a new exhaustive (non-random) scan over the
+//! small, dense id space where every interesting boundary actually lives.
+//!
+//! # cargo-fuzz follow-up
+//!
+//! The spec asks for a `cargo-fuzz` target for `GgufFile::parse` seeded from
+//! crafted adversarial files. This package's `owned_files` list a specific
+//! set of paths under `crates/oxibonsai-core/tests/`, not a sibling
+//! `crates/oxibonsai-core/fuzz/` directory, but that directory is a brand
+//! new path no other package's `owned_files` could possibly name (nothing
+//! about it existed before T-03), it carries its own one-crate
+//! `[workspace]` (the same technique `oxibonsai-testkit`'s `Cargo.toml`
+//! uses, so `cargo build/test/clippy --workspace` from the repository root
+//! never sees it and cannot regress), and the spec explicitly asks for it —
+//! so it *was* created: `crates/oxibonsai-core/fuzz/Cargo.toml`, a
+//! `libfuzzer-sys` dependency, `crates/oxibonsai-core/fuzz/fuzz_targets/
+//! gguf_parse.rs` (`fuzz_target!(|data: &[u8]| { let _ =
+//! oxibonsai_core::gguf::reader::GgufFile::parse(data); });`), and a seed
+//! corpus at `crates/oxibonsai-core/fuzz/corpus/gguf_parse/`. It needs the
+//! nightly toolchain and `cargo install cargo-fuzz` to actually run
+//! (`cargo +nightly fuzz run gguf_parse` from `crates/oxibonsai-core/`),
+//! which this gate does not have/do, so it is not part of `cargo test
+//! --workspace` — `cargo check --manifest-path
+//! crates/oxibonsai-core/fuzz/Cargo.toml` is the compile-only check this
+//! package's own verification used instead.
+//!
+//! Separately, the crafted byte patterns a prior exploratory probe
+//! (`scratchpad/ggufuzz` — session-local, not part of this repo) found
+//! interesting are *also* ported below as permanent, deterministic
+//! regression tests (the "── Crafted adversarial files" section):
+//! odd/misaligned data offsets, overlapping tensors, a `u64::MAX`-dimension
+//! tensor, a non-UTF-8 tensor name, and a `probe_compat` call against a file
+//! claiming a 200 MB tensor name it does not contain. These run on every
+//! `cargo test` (no nightly toolchain needed).
+//!
+//! CORRECTION (verifier wave 3): the previous paragraph here claimed these
+//! crafted cases "are also the fuzz target's seed corpus, so the two forms
+//! of coverage reinforce each other" — verified false.
+//! `crates/oxibonsai-core/fuzz/corpus/gguf_parse/` (not owned by this
+//! package; see the `cargo-fuzz follow-up` section above for why) holds 8
+//! plain header-shaped seeds (`empty`, `single_byte`, `magic_only`,
+//! `bad_magic`, `unsupported_version`, `huge_tensor_count`,
+//! `huge_metadata_kv_count`, `valid_empty_header`) and none of the five
+//! crafted cases above. The two forms of coverage are complementary today
+//! (this file's crafted cases run deterministically on every `cargo test`;
+//! the fuzz target explores its own, disjoint corpus under `cargo +nightly
+//! fuzz run`), not reinforcing — landing the five crafted files' exact byte
+//! patterns into the corpus directory (outside this package's `owned_files`)
+//! is the follow-up that would make the claim true.
 
 use proptest::prelude::*;
 
@@ -22,6 +83,84 @@ fn make_valid_header(version: u32, tensor_count: u64, metadata_kv_count: u64) ->
     data.extend_from_slice(&tensor_count.to_le_bytes());
     data.extend_from_slice(&metadata_kv_count.to_le_bytes());
     data
+}
+
+/// Every wire id [`GgufTensorType::from_id`] accepts, derived from the type
+/// table itself (`GgufTensorType::ALL`) rather than hand-copied — so this
+/// list cannot go stale the way the three-times-duplicated literal list it
+/// replaces did (T-03). `wire_id()` collapses the `Q2_0G64`/`Q2_0G128DFirst`
+/// sentinel discriminants back to `42`, matching what `from_id(42)` itself
+/// resolves to, so a plain `BTreeSet` (dedup + fast `contains`) is exactly
+/// the right shape.
+fn known_wire_ids() -> std::collections::BTreeSet<u32> {
+    GgufTensorType::ALL.iter().map(|ty| ty.wire_id()).collect()
+}
+
+// ── A minimal byte-builder for hand-crafted GGUF files ───────────────────
+// (mirrors the exploratory probe tool that first found these cases)
+
+/// Appends little-endian GGUF primitives to a byte buffer. Kept minimal and
+/// local to this file rather than promoted to `oxibonsai-testkit`: every
+/// method here is a one-line `to_le_bytes` wrapper, so the duplication cost
+/// of *not* sharing it is lower than the coupling cost of sharing it.
+struct GgufBytes(Vec<u8>);
+
+impl GgufBytes {
+    fn new() -> Self {
+        let mut v = Vec::new();
+        v.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+        v.extend_from_slice(&3u32.to_le_bytes()); // version 3
+        Self(v)
+    }
+
+    fn counts(mut self, tensor_count: u64, metadata_kv_count: u64) -> Self {
+        self.0.extend_from_slice(&tensor_count.to_le_bytes());
+        self.0.extend_from_slice(&metadata_kv_count.to_le_bytes());
+        self
+    }
+
+    fn u32(mut self, v: u32) -> Self {
+        self.0.extend_from_slice(&v.to_le_bytes());
+        self
+    }
+
+    fn u64(mut self, v: u64) -> Self {
+        self.0.extend_from_slice(&v.to_le_bytes());
+        self
+    }
+
+    /// A GGUF string: `u64` byte length, then the raw bytes (not
+    /// necessarily valid UTF-8 — see [`Self::raw_str`]).
+    fn str(self, s: &str) -> Self {
+        self.raw_str(s.as_bytes())
+    }
+
+    fn raw_str(mut self, bytes: &[u8]) -> Self {
+        self.0
+            .extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        self.0.extend_from_slice(bytes);
+        self
+    }
+
+    fn raw(mut self, bytes: &[u8]) -> Self {
+        self.0.extend_from_slice(bytes);
+        self
+    }
+
+    /// A `general.alignment = value` (UINT32) metadata entry.
+    fn alignment_metadata(self, value: u32) -> Self {
+        self.str("general.alignment").u32(4).u32(value)
+    }
+
+    /// One tensor-info entry: 1-D shape `[dim]`, ggml type `type_id`, byte
+    /// `offset` into the data section.
+    fn tensor_1d(self, name: &str, dim: u64, type_id: u32, offset: u64) -> Self {
+        self.str(name).u32(1).u64(dim).u32(type_id).u64(offset)
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.0
+    }
 }
 
 // ── 1. Random byte sequences never panic ─────────────────────────────────
@@ -179,16 +318,16 @@ proptest! {
 
     #[test]
     fn random_tensor_type_id_no_panic(id in any::<u32>()) {
-        // Should return Ok for known types, Err for unknown, never panic
+        // Should return Ok for known types, Err for unknown, never panic.
         let result = GgufTensorType::from_id(id);
-        match id {
-            0 | 1 | 2 | 3 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 30 | 41 => {
-                assert!(result.is_ok(), "known type {id} should parse");
-            }
-            _ => {
-                assert!(result.is_err(), "unknown type {id} should fail");
-            }
-        }
+        let expected = known_wire_ids().contains(&id);
+        prop_assert_eq!(
+            result.is_ok(),
+            expected,
+            "from_id({}) ok={} disagrees with GgufTensorType::ALL",
+            id,
+            result.is_ok()
+        );
     }
 
     #[test]
@@ -200,6 +339,41 @@ proptest! {
             assert!(result.is_err(), "value type {id} should fail");
         }
     }
+}
+
+/// Exhaustive (not random) scan of every id in the small, dense ranges
+/// where a real boundary lives: the whole `u8` range (covers every
+/// mainline/upstream ggml id, 0-40, plus the "just past" ids 41-44 this
+/// project adds) and the 140-150 window around the PrismML extension ids
+/// 142/143. Unlike the proptest above (`P(hit)` for any *specific* id is
+/// astronomically small over `any::<u32>()`), this is the test that
+/// actually would have caught 142/143 being forgotten — T-03's verifier
+/// correction singled this out as the fix the finder's own two "already
+/// correct" sibling tests both still missed (both omitted 43/44 too).
+#[test]
+fn exhaustive_type_id_scan_matches_known_wire_ids() {
+    let known = known_wire_ids();
+    for id in 0u32..=255 {
+        assert_eq!(
+            GgufTensorType::from_id(id).is_ok(),
+            known.contains(&id),
+            "id {id} (u8 range)"
+        );
+    }
+    for id in 140u32..150 {
+        assert_eq!(
+            GgufTensorType::from_id(id).is_ok(),
+            known.contains(&id),
+            "id {id} (PrismML extension window)"
+        );
+    }
+    // The set itself must be non-trivial and must contain every format this
+    // session's target (Bonsai 2 27B) actually ships: PQ2_0 (142) and
+    // PTQ1_0 (143).
+    assert!(known.contains(&142), "PQ2_0 must be a known id");
+    assert!(known.contains(&143), "PTQ1_0 must be a known id");
+    assert!(known.contains(&43), "F8_E4M3 must be a known id");
+    assert!(known.contains(&44), "F8_E5M2 must be a known id");
 }
 
 // ── 6. Alignment calculations with random offsets ────────────────────────
@@ -324,10 +498,10 @@ fn tensor_store_empty_operations() {
 
 #[test]
 fn all_known_tensor_types_have_properties() {
-    let known_ids: &[u32] = &[
-        0, 1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 30, 35, 41, 42,
-    ];
-    for &id in known_ids {
+    // Was a stale, hand-copied 18-entry list (missing every id added since
+    // it was written, including 43/44/142/143); now derived from the type
+    // table itself so it can never silently fall out of date again (T-03).
+    for &id in &known_wire_ids() {
         let ty = GgufTensorType::from_id(id).expect("known type should parse");
         assert!(ty.block_size() > 0, "block_size for {ty} must be > 0");
         assert!(ty.block_bytes() > 0, "block_bytes for {ty} must be > 0");
@@ -337,15 +511,12 @@ fn all_known_tensor_types_have_properties() {
 
 #[test]
 fn q1_0_g128_is_only_one_bit() {
-    let known_ids: &[u32] = &[
-        0, 1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 30, 35, 41, 42,
-    ];
-    for &id in known_ids {
+    for &id in &known_wire_ids() {
         let ty = GgufTensorType::from_id(id).expect("known type should parse");
         if id == 41 {
             assert!(ty.is_one_bit(), "Q1_0_g128 should be one_bit");
         } else {
-            assert!(!ty.is_one_bit(), "{ty} should not be one_bit");
+            assert!(!ty.is_one_bit(), "{ty} (id {id}) should not be one_bit");
         }
     }
 }
@@ -468,4 +639,122 @@ proptest! {
         prop_assert!(result.is_err(),
             "array with {array_count} claimed elements must fail, not OOM");
     }
+}
+
+// ── Crafted adversarial files (T-03 cargo-fuzz-target substitute) ────────
+//
+// See this file's header doc comment: these port the specific byte patterns
+// a prior exploratory probe found interesting into permanent, deterministic
+// regression tests.
+
+/// `general.alignment = 1` plus a tensor at byte offset 1: the data section
+/// starts at an odd, unaligned address. `validate_tensor_layout`
+/// (core-gguf-03 / sec-13) must reject a tensor whose offset does not land
+/// on an `alignment`-aligned boundary — this used to be reachable all the
+/// way to `BlockQ1_0G128::slice_from_bytes` handing back a live reference
+/// into a misaligned `mmap` slice (core-gguf-07 / sec-02, since fixed by
+/// `from_bytes`'s own alignment check). Parsing must reject this file
+/// outright, before any block-level code ever sees the misaligned pointer.
+#[test]
+fn crafted_odd_data_offset_with_alignment_one_is_rejected() {
+    let data = GgufBytes::new()
+        .counts(1, 1)
+        .alignment_metadata(1)
+        .tensor_1d("w", 256, 41, 1) // Q1_0_g128, 2 blocks, offset=1 (odd)
+        .raw(&[0xABu8; 256]) // enough trailing bytes that truncation isn't the cause
+        .finish();
+    assert!(
+        GgufFile::parse(&data).is_err(),
+        "an odd, alignment-1 tensor offset must be rejected at parse time"
+    );
+}
+
+/// Two tensors whose declared byte ranges overlap. `validate_tensor_layout`
+/// requires each tensor to start exactly where the previous one's
+/// `GGML_PAD(size, alignment)` says it ends, so an overlapping second
+/// tensor must be rejected rather than silently accepted (aliased mutable
+/// views into the same bytes would otherwise be obtainable via
+/// `tensor_data` for two different tensor names).
+#[test]
+fn crafted_overlapping_tensors_are_rejected() {
+    let data = GgufBytes::new()
+        .counts(2, 0)
+        .tensor_1d("a", 128, 41, 0) // Q1_0_g128, 1 block = 18 bytes, offset 0
+        .tensor_1d("bb", 128, 41, 4) // overlaps `a`'s [0, 18) range
+        .raw(&[0u8; 64])
+        .finish();
+    assert!(
+        GgufFile::parse(&data).is_err(),
+        "overlapping tensor byte ranges must be rejected"
+    );
+}
+
+/// A 1-D shape of `u64::MAX` (the bit pattern other tools would read as a
+/// negative dimension) must not panic, overflow-wrap into a small, plausible
+/// element count, or allocate/read out of bounds.
+#[test]
+fn crafted_u64_max_dimension_does_not_panic_or_oob_read() {
+    let data = GgufBytes::new()
+        .counts(1, 0)
+        .tensor_1d("w", u64::MAX, 41, 0)
+        .raw(&[0u8; 64])
+        .finish();
+    // Never panics (a plain call, not `catch_unwind` — a panic here would
+    // already fail the test process); either parse rejects it outright, or
+    // (parse tolerates the declared shape and only `tensor_data` refuses
+    // to hand back an absurd, out-of-file byte range) both must return Err,
+    // never a valid slice into memory the file does not contain.
+    match GgufFile::parse(&data) {
+        Err(_) => {}
+        Ok(file) => {
+            assert!(
+                file.tensor_data("w").is_err(),
+                "a u64::MAX-element tensor cannot possibly fit in a 64-byte file"
+            );
+        }
+    }
+}
+
+/// A tensor name containing invalid UTF-8 bytes must be rejected, matching
+/// the existing metadata-key/value UTF-8 checks (`invalid_utf8_string_*`
+/// above) but exercising `TensorStore::parse`'s own name-reading path
+/// instead.
+#[test]
+fn crafted_tensor_name_with_invalid_utf8_is_rejected() {
+    let data = GgufBytes::new()
+        .counts(1, 0)
+        .raw_str(&[0xFF, 0xFE]) // invalid UTF-8 tensor name, length-prefixed
+        .u32(1)
+        .u64(128)
+        .u32(41)
+        .u64(0)
+        .raw(&[0u8; 64])
+        .finish();
+    assert!(
+        GgufFile::parse(&data).is_err(),
+        "a non-UTF-8 tensor name must be rejected, not panic or silently substitute"
+    );
+}
+
+/// `probe_compat` must not hang or allocate ~200 MB when a file *claims* an
+/// enormous tensor name length it does not actually contain (the file here
+/// is a few dozen bytes total). Bounded wall-clock check rather than a
+/// memory-allocation check, since the latter cannot be asserted portably.
+#[test]
+fn probe_compat_huge_claimed_tensor_name_does_not_hang() {
+    let data = GgufBytes::new()
+        .counts(1, 0)
+        .u64(200 * 1024 * 1024) // claims a 200 MB tensor name
+        .finish();
+    let start = std::time::Instant::now();
+    let result = GgufFile::probe_compat(&data);
+    let elapsed = start.elapsed();
+    assert!(
+        result.is_err(),
+        "a 200 MB claimed name the file cannot back must fail"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "probe_compat must fail fast on an unbacked huge claimed length, took {elapsed:?}"
+    );
 }

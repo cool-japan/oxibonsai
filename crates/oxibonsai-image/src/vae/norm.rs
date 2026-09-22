@@ -54,7 +54,7 @@ impl GroupNorm {
             )));
         }
         let channels = weight.len();
-        if num_groups == 0 || channels % num_groups != 0 {
+        if num_groups == 0 || !channels.is_multiple_of(num_groups) {
             return Err(VaeError::Shape(format!(
                 "groupnorm channels {channels} not divisible by num_groups {num_groups}"
             )));

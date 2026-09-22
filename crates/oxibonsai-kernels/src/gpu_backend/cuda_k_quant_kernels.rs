@@ -11,55 +11,77 @@
 //! | `gemv_q6k`     | Q6_K GEMV, AoS super-blocks (210 B/block, 256 w)   |
 //! | `gemv_q8k`     | Q8_K GEMV, AoS super-blocks (292 B/block, 256 w)   |
 //!
+//! # The ggml walk is load-bearing
+//!
+//! The per-format `kq_dot_q*k` device helpers are fused transliterations of
+//! ggml's `dequantize_row_q*_K` (`ggml/src/ggml-quants.c`). ggml's output
+//! cursor is decoupled from its byte cursors, so the *n*-th value it emits —
+//! the one that multiplies `x[n]` — is generally **not** read from byte lane
+//! *n*. The byte-exact CPU reference (`oxibonsai_core::BlockQ*K::dequant`) is
+//! the normative source for these loops.
+//!
 //! # Block layouts (QK_K = 256 weights per super-block)
 //!
 //! **Q2_K** (84 bytes):
 //! ```text
 //! [scales:16u8][qs:64u8][d:f16 @80][dmin:f16 @82]
 //! ```
-//! 16 sub-blocks × 16 weights. scales\[sub\] low nibble = sub_sc, high nibble = sub_mn.
-//! qs: 2 bits/weight, 4/byte LSB-first. dequant: d*sc*q - dmin*mn (q ∈ \[0,3\]).
+//! Per 128-element half, `shift` steps 0, 2, 4, 6 and `is` advances twice per
+//! step: output `n*128 + j*32 + l` reads `qs[n*32 + l] >> 2j` under
+//! `scales[is]`, output `n*128 + j*32 + 16 + l` reads `qs[n*32 + 16 + l] >> 2j`
+//! under `scales[is + 1]`. sc = scales\[is\] & 0xF, mn = scales\[is\] >> 4.
+//! dequant: d*sc*q - dmin*mn (q ∈ \[0,3\]).
 //!
 //! **Q3_K** (110 bytes):
 //! ```text
 //! [hmask:32u8][qs:64u8][scales:12u8][d:f16 @108]
 //! ```
-//! hmask: high bit/weight, 8/byte. qs: low 2 bits/weight. q3=lo2|(hi<<2), signed q3-4.
-//! scales: 16×4-bit nibbles; signed_sc = nibble-8. dequant: d*signed_sc*q3_signed.
+//! Same 128-half / `shift` / `is` walk as Q2_K. The 16 six-bit scales come from
+//! the `kmask1`/`kmask2` `aux[4]` shuffle and carry a **-32** bias (they are not
+//! 4-bit nibbles). hmask is **inverted**: `q - (hm[l] & m ? 0 : 4)`, with the
+//! same 32 hmask bytes reused across all eight `m = 1 << (4n + j)` steps.
+//! dequant: d*(sc-32)*(q - hi).
 //!
 //! **Q4_K** (144 bytes):
 //! ```text
 //! [d:f16 @0][dmin:f16 @2][scales:12u8 @4][qs:128u8 @16]
 //! ```
-//! 8 sub-blocks × 32 weights. qs: 4 bits/weight, 2/byte. 6-bit scale decode.
-//! dequant: d*sc\[sub\]*q - dmin*mn\[sub\] (sc, mn ∈ \[0,63\]).
+//! Per 64-element group: 32 **low** nibbles under `get_scale_min_k4(is)` then 32
+//! **high** nibbles under `get_scale_min_k4(is + 1)`, `is += 2` per group. For
+//! `j < 4` the 6-bit scale is a full byte (`q[j] & 63`), not two nibbles.
+//! dequant: d*sc*q - dmin*mn (sc, mn ∈ \[0,63\]).
 //!
 //! **Q5_K** (176 bytes):
 //! ```text
 //! [d:f16 @0][dmin:f16 @2][scales:12u8 @4][qh:32u8 @16][qs:128u8 @48]
 //! ```
-//! Same 6-bit scales as Q4_K. q5 = nibble | (high_bit<<4), range [0..31].
-//! dequant: d*sc\[sub\]*q5 - dmin*mn\[sub\].
+//! Q4_K's walk plus the 5th bit: `qh[l]` is indexed `l in 0..32` and does **not**
+//! advance per group; the masks `u1`/`u2` shift left by 2 per group.
+//! dequant: d*sc*(q + 16*qh_bit) - dmin*mn.
 //!
 //! **Q6_K** (210 bytes):
 //! ```text
 //! [ql:128u8 @0][qh:64u8 @128][scales:16 i8 @192][d:f16 @208]
 //! ```
-//! 16 sub-blocks × 16 weights. ql: low 4 bits, qh: high 2 bits.
-//! q6 = nibble|(hi2<<4), centered: q6-32. scales_i8: signed per sub-block.
-//! dequant: d*scales_i8\[sub\]*q6_signed.
+//! Per 128-element half and `l in 0..32`, four interleaved lanes `y[l]`,
+//! `y[l+32]`, `y[l+64]`, `y[l+96]` with sub-scales `sc[is+0,+2,+4,+6]`,
+//! `is = l/16`. q6 = nibble|(hi2<<4), centered: q6-32.
+//! dequant: d*scales_i8*(q6-32).
 //!
 //! **Q8_K** (292 bytes):
 //! ```text
 //! [d:f32 @0][qs:256 i8 @4][bsums:16 i16 @260]
 //! ```
-//! d is f32 (not f16!). dequant: d_f32 * qs\[i\]. bsums not needed for GEMV.
+//! d is f32 (not f16!). Element-sequential in ggml too. dequant: d_f32 * qs\[i\].
+//! bsums not needed for GEMV.
 //!
 //! # Grid / block dimensions (same for all 6 kernels)
 //!
 //! - Grid:  `(ceil(n_rows / 8), 1, 1)` — 8 warps per CTA, one warp per output row
 //! - Block: `(256, 1, 1)` — 8 warps × 32 lanes
 //! - `k` must be a positive multiple of 256 (= QK_K)
+//! - One lane decodes one whole super-block: ggml's `is` / `m` / `u1` / `u2`
+//!   cursors are sequential state and must not be split across lanes.
 
 #![cfg(all(
     feature = "native-cuda",
@@ -81,7 +103,20 @@ use super::cuda_graph::{compile_or_load_ptx, CudaGraph, CudaGraphError};
 /// All kernels share the same grid/block strategy (8 warps per CTA, one warp
 /// per output row, 256 threads/block, k must be a multiple of QK_K=256).
 ///
-/// The `kq_decode_6bit_scales` device helper is used by Q4_K and Q5_K.
+/// # The ggml walk is load-bearing
+///
+/// Each format has a `kq_dot_q*k` device helper that is a **fused
+/// transliteration of ggml's `dequantize_row_q*_K`** (`ggml/src/ggml-quants.c`)
+/// against a 256-element input slice. ggml's output cursor is decoupled from
+/// its byte cursors, so the *n*-th value it emits — the value that multiplies
+/// `x[n]` — is generally **not** read from byte lane *n*. The byte-exact CPU
+/// reference (`oxibonsai_core::BlockQ*K::dequant`) is the normative source for
+/// these loops; the helpers reproduce them cursor for cursor. One warp lane
+/// decodes one whole super-block: the `is` / `m` / `u1` / `u2` cursors are
+/// sequential state and must not be split across lanes.
+///
+/// The `kq_scale_min_k4` device helper (ggml's `get_scale_min_k4`) is used by
+/// Q4_K and Q5_K.
 pub const CUDA_K_QUANT_KERNELS_SRC: &str = r#"
 /* ==========================================================================
    OxiBonsai CUDA K-quant GEMV kernels  (Q2_K / Q3_K / Q4_K / Q5_K / Q6_K / Q8_K)
@@ -92,6 +127,10 @@ pub const CUDA_K_QUANT_KERNELS_SRC: &str = r#"
    Block: (256, 1, 1)
 
    k must be a positive multiple of 256 for all kernels.
+
+   Every kq_dot_q*k helper below mirrors ggml's dequantize_row_q*_K walk
+   (ggml/src/ggml-quants.c) element for element, fused with the dot product:
+   the output cursor y indexes the input, the byte cursors index the block.
    ========================================================================== */
 
 /* ── Hardware FP16 → FP32 via PTX (1 instruction, SM 6.0+) ─────────────── */
@@ -101,61 +140,379 @@ static __device__ __forceinline__ float kq_fast_fp16_to_float(unsigned short h) 
     return f;
 }
 
-/* ── Q4_K / Q5_K: decode 12-byte scales array into 8 × 6-bit sc and mn ─── */
-static __device__ void kq_decode_6bit_scales(
-    const unsigned char* s,   /* 12-byte scales array from block */
-    unsigned char sc_out[8],
-    unsigned char mn_out[8]
+/* ── ggml get_scale_min_k4 (ggml-quants.c:935) ─────────────────────────────
+   Sub-block j's 6-bit scale and 6-bit min out of the 12-byte packed `scales`
+   array shared by Q4_K and Q5_K. For j < 4 the scale is a FULL 6-bit value
+   read from byte j -- not a 4-bit nibble.                                   */
+static __device__ __forceinline__ void kq_scale_min_k4(
+    const unsigned char* __restrict__ q,
+    unsigned int j,
+    unsigned char* sc_out,
+    unsigned char* m_out
 ) {
-    /* Low 4 bits of scales from bytes 0..3 (2 per byte) */
-    sc_out[0] = s[0] & 0x0Fu;  sc_out[1] = (s[0] >> 4u) & 0x0Fu;
-    sc_out[2] = s[1] & 0x0Fu;  sc_out[3] = (s[1] >> 4u) & 0x0Fu;
-    sc_out[4] = s[2] & 0x0Fu;  sc_out[5] = (s[2] >> 4u) & 0x0Fu;
-    sc_out[6] = s[3] & 0x0Fu;  sc_out[7] = (s[3] >> 4u) & 0x0Fu;
-    /* Low 4 bits of mins from bytes 4..7 */
-    mn_out[0] = s[4] & 0x0Fu;  mn_out[1] = (s[4] >> 4u) & 0x0Fu;
-    mn_out[2] = s[5] & 0x0Fu;  mn_out[3] = (s[5] >> 4u) & 0x0Fu;
-    mn_out[4] = s[6] & 0x0Fu;  mn_out[5] = (s[6] >> 4u) & 0x0Fu;
-    mn_out[6] = s[7] & 0x0Fu;  mn_out[7] = (s[7] >> 4u) & 0x0Fu;
-    /* Upper 2 bits of scales from bytes 8..9 */
-    sc_out[0] |= ((s[8] >> 0u) & 0x03u) << 4u;
-    sc_out[1] |= ((s[8] >> 2u) & 0x03u) << 4u;
-    sc_out[2] |= ((s[8] >> 4u) & 0x03u) << 4u;
-    sc_out[3] |= ((s[8] >> 6u) & 0x03u) << 4u;
-    sc_out[4] |= ((s[9] >> 0u) & 0x03u) << 4u;
-    sc_out[5] |= ((s[9] >> 2u) & 0x03u) << 4u;
-    sc_out[6] |= ((s[9] >> 4u) & 0x03u) << 4u;
-    sc_out[7] |= ((s[9] >> 6u) & 0x03u) << 4u;
-    /* Upper 2 bits of mins from bytes 10..11 */
-    mn_out[0] |= ((s[10] >> 0u) & 0x03u) << 4u;
-    mn_out[1] |= ((s[10] >> 2u) & 0x03u) << 4u;
-    mn_out[2] |= ((s[10] >> 4u) & 0x03u) << 4u;
-    mn_out[3] |= ((s[10] >> 6u) & 0x03u) << 4u;
-    mn_out[4] |= ((s[11] >> 0u) & 0x03u) << 4u;
-    mn_out[5] |= ((s[11] >> 2u) & 0x03u) << 4u;
-    mn_out[6] |= ((s[11] >> 4u) & 0x03u) << 4u;
-    mn_out[7] |= ((s[11] >> 6u) & 0x03u) << 4u;
+    if (j < 4u) {
+        *sc_out = (unsigned char)(q[j] & 63u);
+        *m_out  = (unsigned char)(q[j + 4u] & 63u);
+    } else {
+        *sc_out = (unsigned char)((q[j + 4u] & 0x0Fu) | (((unsigned int)q[j - 4u] >> 6u) << 4u));
+        *m_out  = (unsigned char)(((unsigned int)q[j + 4u] >> 4u)
+                                  | (((unsigned int)q[j] >> 6u) << 4u));
+    }
+}
+
+/* ── Q3_K: unpack the 12 packed scale bytes into 16 biased 6-bit scales ───
+   ggml-quants.c:1374-1381 (kmask1 / kmask2 aux[4] shuffle). The +32 bias is
+   removed by the caller.                                                    */
+static __device__ void kq_unpack_q3k_scales(
+    const unsigned char* __restrict__ s,
+    unsigned char* out
+) {
+    const unsigned int kmask1 = 0x03030303u;
+    const unsigned int kmask2 = 0x0f0f0f0fu;
+    const unsigned int a0_in = (unsigned int)s[0] | ((unsigned int)s[1] << 8u)
+                             | ((unsigned int)s[2] << 16u) | ((unsigned int)s[3] << 24u);
+    const unsigned int a1_in = (unsigned int)s[4] | ((unsigned int)s[5] << 8u)
+                             | ((unsigned int)s[6] << 16u) | ((unsigned int)s[7] << 24u);
+    const unsigned int tmp   = (unsigned int)s[8] | ((unsigned int)s[9] << 8u)
+                             | ((unsigned int)s[10] << 16u) | ((unsigned int)s[11] << 24u);
+
+    unsigned int aux[4];
+    aux[2] = ((a0_in >> 4u) & kmask2) | (((tmp >> 4u) & kmask1) << 4u);
+    aux[3] = ((a1_in >> 4u) & kmask2) | (((tmp >> 6u) & kmask1) << 4u);
+    aux[0] = (a0_in & kmask2) | ((tmp & kmask1) << 4u);
+    aux[1] = (a1_in & kmask2) | (((tmp >> 2u) & kmask1) << 4u);
+
+    #pragma unroll
+    for (unsigned int w = 0u; w < 4u; ++w) {
+        out[4u * w + 0u] = (unsigned char)(aux[w] & 0xFFu);
+        out[4u * w + 1u] = (unsigned char)((aux[w] >> 8u) & 0xFFu);
+        out[4u * w + 2u] = (unsigned char)((aux[w] >> 16u) & 0xFFu);
+        out[4u * w + 3u] = (unsigned char)((aux[w] >> 24u) & 0xFFu);
+    }
+}
+
+/* ── Q2_K super-block · dot product ────────────────────────────────────────
+   Block: [scales:16 @0][qs:64 @16][d:f16 @80][dmin:f16 @82]  (84 bytes)
+   dequantize_row_q2_K (ggml-quants.c:1016): per 128-element half, `shift`
+   steps 0,2,4,6 and `is` advances twice per step -- output n*128 + j*32 + l
+   reads qs[n*32 + l] >> 2j under scales[is], output n*128 + j*32 + 16 + l
+   reads qs[n*32 + 16 + l] >> 2j under scales[is + 1].
+   dequant: d*(sc & 0xF)*q - dmin*(sc >> 4)                                  */
+static __device__ float kq_dot_q2k(
+    const unsigned char* __restrict__ bptr,
+    const float* __restrict__ x
+) {
+    const unsigned short d_raw    = (unsigned short)bptr[80] | ((unsigned short)bptr[81] << 8u);
+    const unsigned short dmin_raw = (unsigned short)bptr[82] | ((unsigned short)bptr[83] << 8u);
+    const float d    = kq_fast_fp16_to_float(d_raw);
+    const float dmin = kq_fast_fp16_to_float(dmin_raw);
+    const unsigned char* qs = bptr + 16u;
+
+    float acc = 0.0f;
+    unsigned int y = 0u;      /* output cursor */
+    unsigned int is = 0u;     /* scales cursor */
+    unsigned int q_off = 0u;  /* qs byte cursor */
+
+    for (unsigned int n = 0u; n < 2u; ++n) {        /* QK_K / 128 */
+        unsigned int shift = 0u;
+        for (unsigned int j = 0u; j < 4u; ++j) {
+            for (unsigned int part = 0u; part < 2u; ++part) {
+                const unsigned int sc = bptr[is];
+                ++is;
+                const float dl = d * (float)(sc & 0x0Fu);
+                const float ml = dmin * (float)(sc >> 4u);
+                const unsigned char* qp = qs + q_off + part * 16u;
+                float qsum = 0.0f;
+                float xsum = 0.0f;
+                #pragma unroll 16
+                for (unsigned int l = 0u; l < 16u; ++l) {
+                    const float xv = x[y + l];
+                    qsum += (float)((qp[l] >> shift) & 3u) * xv;
+                    xsum += xv;
+                }
+                acc += dl * qsum - ml * xsum;
+                y += 16u;
+            }
+            shift += 2u;
+        }
+        q_off += 32u;
+    }
+    return acc;
+}
+
+/* ── Q3_K super-block · dot product ────────────────────────────────────────
+   Block: [hmask:32 @0][qs:64 @32][scales:12 @96][d:f16 @108]  (110 bytes)
+   dequantize_row_q3_K (ggml-quants.c:1360): the Q2_K walk, 6-bit scales from
+   the kmask shuffle biased by -32, and the INVERTED hmask convention
+   (q - (hm[l] & m ? 0 : 4)) with m = 1 << (4n + j) reusing the same 32 hmask
+   bytes across all eight steps.
+   dequant: d*(sc - 32)*(q - hi)                                             */
+static __device__ float kq_dot_q3k(
+    const unsigned char* __restrict__ bptr,
+    const float* __restrict__ x
+) {
+    const unsigned short d_raw = (unsigned short)bptr[108] | ((unsigned short)bptr[109] << 8u);
+    const float d_all = kq_fast_fp16_to_float(d_raw);
+    const unsigned char* hm = bptr;        /* hmask[32] */
+    const unsigned char* qs = bptr + 32u;  /* qs[64]    */
+
+    unsigned char sc[16];
+    kq_unpack_q3k_scales(bptr + 96u, sc);
+
+    float acc = 0.0f;
+    unsigned int y = 0u;
+    unsigned int is = 0u;
+    unsigned int q_off = 0u;
+    unsigned int m = 1u;
+
+    for (unsigned int n = 0u; n < 2u; ++n) {
+        unsigned int shift = 0u;
+        for (unsigned int j = 0u; j < 4u; ++j) {
+            for (unsigned int part = 0u; part < 2u; ++part) {
+                const float dl = d_all * (float)((int)sc[is] - 32);
+                ++is;
+                const unsigned char* qp = qs + q_off + part * 16u;
+                const unsigned char* hp = hm + part * 16u;
+                float qsum = 0.0f;
+                #pragma unroll 16
+                for (unsigned int l = 0u; l < 16u; ++l) {
+                    const int hi = ((unsigned int)hp[l] & m) != 0u ? 0 : 4;
+                    const int q  = (int)((qp[l] >> shift) & 3u);
+                    qsum += (float)(q - hi) * x[y + l];
+                }
+                acc += dl * qsum;
+                y += 16u;
+            }
+            shift += 2u;
+            m <<= 1u;
+        }
+        q_off += 32u;
+    }
+    return acc;
+}
+
+/* ── Q4_K super-block · dot product ────────────────────────────────────────
+   Block: [d:f16 @0][dmin:f16 @2][scales:12 @4][qs:128 @16]  (144 bytes)
+   dequantize_row_q4_K (ggml-quants.c:1584): per 64-element group, 32 LOW
+   nibbles under get_scale_min_k4(is) then 32 HIGH nibbles under
+   get_scale_min_k4(is + 1); is += 2 per group.
+   dequant: d*sc*q - dmin*mn                                                 */
+static __device__ float kq_dot_q4k(
+    const unsigned char* __restrict__ bptr,
+    const float* __restrict__ x
+) {
+    const unsigned short d_raw    = (unsigned short)bptr[0] | ((unsigned short)bptr[1] << 8u);
+    const unsigned short dmin_raw = (unsigned short)bptr[2] | ((unsigned short)bptr[3] << 8u);
+    const float d    = kq_fast_fp16_to_float(d_raw);
+    const float dmin = kq_fast_fp16_to_float(dmin_raw);
+    const unsigned char* scales = bptr + 4u;
+    const unsigned char* qs     = bptr + 16u;
+
+    float acc = 0.0f;
+    unsigned int y = 0u;
+    unsigned int q_off = 0u;
+    unsigned int is = 0u;
+
+    for (unsigned int g = 0u; g < 4u; ++g) {   /* (0..256).step_by(64) */
+        unsigned char sc1, mn1, sc2, mn2;
+        kq_scale_min_k4(scales, is, &sc1, &mn1);
+        kq_scale_min_k4(scales, is + 1u, &sc2, &mn2);
+        const float d1 = d * (float)sc1;
+        const float m1 = dmin * (float)mn1;
+        const float d2 = d * (float)sc2;
+        const float m2 = dmin * (float)mn2;
+
+        float qsum = 0.0f;
+        float xsum = 0.0f;
+        #pragma unroll 32
+        for (unsigned int l = 0u; l < 32u; ++l) {          /* 32 LOW nibbles */
+            const float xv = x[y + l];
+            qsum += (float)(qs[q_off + l] & 0x0Fu) * xv;
+            xsum += xv;
+        }
+        acc += d1 * qsum - m1 * xsum;
+        y += 32u;
+
+        qsum = 0.0f;
+        xsum = 0.0f;
+        #pragma unroll 32
+        for (unsigned int l = 0u; l < 32u; ++l) {          /* then 32 HIGH   */
+            const float xv = x[y + l];
+            qsum += (float)((unsigned int)qs[q_off + l] >> 4u) * xv;
+            xsum += xv;
+        }
+        acc += d2 * qsum - m2 * xsum;
+        y += 32u;
+
+        q_off += 32u;
+        is += 2u;
+    }
+    return acc;
+}
+
+/* ── Q5_K super-block · dot product ────────────────────────────────────────
+   Block: [d:f16 @0][dmin:f16 @2][scales:12 @4][qh:32 @16][qs:128 @48] (176 B)
+   dequantize_row_q5_K (ggml-quants.c:1786): Q4_K's walk plus the 5th bit --
+   qh[l] is indexed l in 0..32 and does NOT advance per group; the masks
+   u1 / u2 shift left by 2 per 64-element group.
+   dequant: d*sc*(q + 16*qh_bit) - dmin*mn                                   */
+static __device__ float kq_dot_q5k(
+    const unsigned char* __restrict__ bptr,
+    const float* __restrict__ x
+) {
+    const unsigned short d_raw    = (unsigned short)bptr[0] | ((unsigned short)bptr[1] << 8u);
+    const unsigned short dmin_raw = (unsigned short)bptr[2] | ((unsigned short)bptr[3] << 8u);
+    const float d    = kq_fast_fp16_to_float(d_raw);
+    const float dmin = kq_fast_fp16_to_float(dmin_raw);
+    const unsigned char* scales = bptr + 4u;
+    const unsigned char* qh     = bptr + 16u;   /* 32 bytes, not advanced */
+    const unsigned char* ql     = bptr + 48u;
+
+    float acc = 0.0f;
+    unsigned int y = 0u;
+    unsigned int ql_off = 0u;
+    unsigned int is = 0u;
+    unsigned int u1 = 1u;
+    unsigned int u2 = 2u;
+
+    for (unsigned int g = 0u; g < 4u; ++g) {   /* (0..256).step_by(64) */
+        unsigned char sc1, mn1, sc2, mn2;
+        kq_scale_min_k4(scales, is, &sc1, &mn1);
+        kq_scale_min_k4(scales, is + 1u, &sc2, &mn2);
+        const float d1 = d * (float)sc1;
+        const float m1 = dmin * (float)mn1;
+        const float d2 = d * (float)sc2;
+        const float m2 = dmin * (float)mn2;
+
+        float qsum = 0.0f;
+        float xsum = 0.0f;
+        #pragma unroll 32
+        for (unsigned int l = 0u; l < 32u; ++l) {
+            const float xv = x[y + l];
+            const unsigned int hi = ((unsigned int)qh[l] & u1) != 0u ? 16u : 0u;
+            qsum += (float)((ql[ql_off + l] & 0x0Fu) + hi) * xv;
+            xsum += xv;
+        }
+        acc += d1 * qsum - m1 * xsum;
+        y += 32u;
+
+        qsum = 0.0f;
+        xsum = 0.0f;
+        #pragma unroll 32
+        for (unsigned int l = 0u; l < 32u; ++l) {
+            const float xv = x[y + l];
+            const unsigned int hi = ((unsigned int)qh[l] & u2) != 0u ? 16u : 0u;
+            qsum += (float)(((unsigned int)ql[ql_off + l] >> 4u) + hi) * xv;
+            xsum += xv;
+        }
+        acc += d2 * qsum - m2 * xsum;
+        y += 32u;
+
+        ql_off += 32u;
+        is += 2u;
+        u1 <<= 2u;
+        u2 <<= 2u;
+    }
+    return acc;
+}
+
+/* ── Q6_K super-block · dot product ────────────────────────────────────────
+   Block: [ql:128 @0][qh:64 @128][scales:16 i8 @192][d:f16 @208]  (210 bytes)
+   dequantize_row_q6_K (ggml-quants.c:1994): per 128-element half and
+   l in 0..32, four interleaved lanes y[l], y[l+32], y[l+64], y[l+96] with
+   sub-scales sc[is+0], sc[is+2], sc[is+4], sc[is+6] where is = l / 16.
+   dequant: d*sc*(q6 - 32)                                                   */
+static __device__ float kq_dot_q6k(
+    const unsigned char* __restrict__ bptr,
+    const float* __restrict__ x
+) {
+    const unsigned short d_raw = (unsigned short)bptr[208] | ((unsigned short)bptr[209] << 8u);
+    const float d = kq_fast_fp16_to_float(d_raw);
+    const unsigned char* ql = bptr;
+    const unsigned char* qh = bptr + 128u;
+    const signed char* scales_i8 = (const signed char*)(bptr + 192u);
+
+    float acc = 0.0f;
+    unsigned int y = 0u;
+    unsigned int ql_off = 0u;
+    unsigned int qh_off = 0u;
+    unsigned int sc_off = 0u;
+
+    for (unsigned int n = 0u; n < 2u; ++n) {   /* (0..256).step_by(128) */
+        float dsc[8];
+        #pragma unroll
+        for (unsigned int t = 0u; t < 8u; ++t) {
+            dsc[t] = d * (float)(int)scales_i8[sc_off + t];
+        }
+
+        #pragma unroll 32
+        for (unsigned int l = 0u; l < 32u; ++l) {
+            const unsigned int is = l >> 4u;   /* l / 16 */
+            const unsigned int hq = qh[qh_off + l];
+            const int q1 = (int)((ql[ql_off + l] & 0x0Fu) | ((hq & 3u) << 4u)) - 32;
+            const int q2 = (int)((ql[ql_off + l + 32u] & 0x0Fu) | (((hq >> 2u) & 3u) << 4u)) - 32;
+            const int q3 = (int)(((unsigned int)ql[ql_off + l] >> 4u)
+                                 | (((hq >> 4u) & 3u) << 4u)) - 32;
+            const int q4 = (int)(((unsigned int)ql[ql_off + l + 32u] >> 4u)
+                                 | (((hq >> 6u) & 3u) << 4u)) - 32;
+
+            acc += dsc[is]      * (float)q1 * x[y + l];
+            acc += dsc[is + 2u] * (float)q2 * x[y + l + 32u];
+            acc += dsc[is + 4u] * (float)q3 * x[y + l + 64u];
+            acc += dsc[is + 6u] * (float)q4 * x[y + l + 96u];
+        }
+
+        y += 128u;
+        ql_off += 64u;
+        qh_off += 32u;
+        sc_off += 8u;
+    }
+    return acc;
+}
+
+/* ── Q8_K super-block · dot product ────────────────────────────────────────
+   Block: [d:f32 @0][qs:256 i8 @4][bsums:32 @260]  (292 bytes)
+   `d` is f32, NOT f16. ggml's dequantize_row_q8_K is element-sequential, so
+   no cursor walk is needed. bsums is unused by GEMV.                        */
+static __device__ float kq_dot_q8k(
+    const unsigned char* __restrict__ bptr,
+    const float* __restrict__ x
+) {
+    union { unsigned int u; float f; } ud;
+    ud.u = (unsigned int)bptr[0]
+         | ((unsigned int)bptr[1] << 8u)
+         | ((unsigned int)bptr[2] << 16u)
+         | ((unsigned int)bptr[3] << 24u);
+    const float d = ud.f;
+    const signed char* qs = (const signed char*)(bptr + 4u);
+
+    float acc = 0.0f;
+    #pragma unroll 32
+    for (unsigned int j = 0u; j < 256u; ++j) {
+        acc += d * (float)(int)qs[j] * x[j];
+    }
+    return acc;
+}
+
+/* ── Warp-shuffle reduction across 32 lanes ────────────────────────────── */
+static __device__ __forceinline__ float kq_warp_reduce(float acc) {
+    acc += __shfl_down_sync(0xffffffffu, acc, 16u);
+    acc += __shfl_down_sync(0xffffffffu, acc,  8u);
+    acc += __shfl_down_sync(0xffffffffu, acc,  4u);
+    acc += __shfl_down_sync(0xffffffffu, acc,  2u);
+    acc += __shfl_down_sync(0xffffffffu, acc,  1u);
+    return acc;
 }
 
 /* ==========================================================================
-   Kernel 1 — gemv_q2k
-   Q2_K GEMV: warp-per-row, AoS super-block layout (84 bytes/block).
-
-   Block layout:
-     bytes  0-15: scales[16]   — 16 × u8, nibble-encoded sub-scales/sub-mins
-     bytes 16-79: qs[64]       — 256 × 2-bit weights, 4/byte (LSB first)
-     bytes 80-81: d (FP16 LE)
-     bytes 82-83: dmin (FP16 LE)
-
-   16 sub-blocks × 16 weights each.
-   scales[sub] & 0xF  = sub_sc  (scale  factor for sub-block)
-   scales[sub] >> 4   = sub_mn  (min    factor for sub-block)
-   q = (qs[i/4] >> ((i%4)*2)) & 0x3;  q ∈ [0,3]
-   dequant: d * sub_sc * q - dmin * sub_mn
+   The six GEMV kernels. Each warp owns one output row and strides the row's
+   super-blocks by lane; one lane decodes one whole block.
 
    Grid:  (ceil(n_rows / 8), 1, 1)
    Block: (256, 1, 1)
    ========================================================================== */
+
+/* Kernel 1 — gemv_q2k (84 bytes/super-block) */
 extern "C" __global__ void gemv_q2k(
     const unsigned char* __restrict__ blocks,
     const float*         __restrict__ input,
@@ -169,75 +526,17 @@ extern "C" __global__ void gemv_q2k(
     if (row >= n_rows) return;
 
     const unsigned int blocks_per_row = k >> 8u;  /* k / 256 */
-    const unsigned int stride = 84u;              /* bytes per Q2_K super-block */
-
     float acc = 0.0f;
     for (unsigned int b = lane; b < blocks_per_row; b += 32u) {
-        const unsigned char* bptr = blocks + (row * blocks_per_row + b) * stride;
-
-        /* d and dmin at bytes 80-81, 82-83 */
-        const unsigned short d_raw    = (unsigned short)bptr[80] | ((unsigned short)bptr[81] << 8u);
-        const unsigned short dmin_raw = (unsigned short)bptr[82] | ((unsigned short)bptr[83] << 8u);
-        const float d    = kq_fast_fp16_to_float(d_raw);
-        const float dmin = kq_fast_fp16_to_float(dmin_raw);
-
-        const float* xbase = input + (b << 8u);  /* b * 256 */
-
-        /* 16 sub-blocks × 16 weights */
-        #pragma unroll 16
-        for (unsigned int sub = 0u; sub < 16u; ++sub) {
-            const unsigned char sc_byte = bptr[sub];  /* scales[sub] */
-            const float sub_sc = (float)(sc_byte & 0x0Fu);
-            const float sub_mn = (float)((sc_byte >> 4u) & 0x0Fu);
-
-            /* weight offset: sub * 16, qs byte offset: sub * 4 (4 weights/byte) */
-            const unsigned int w_base = sub * 16u;
-            const unsigned int q_base = sub * 4u;  /* qs start at bptr+16, so add 16 */
-
-            float sub_acc = 0.0f;
-            float sub_x_sum = 0.0f;
-            #pragma unroll 4
-            for (unsigned int qb = 0u; qb < 4u; ++qb) {
-                const unsigned char byte_val = bptr[16u + q_base + qb];
-                #pragma unroll 4
-                for (unsigned int bit = 0u; bit < 4u; ++bit) {
-                    const unsigned int wi = w_base + qb * 4u + bit;
-                    const float q = (float)((byte_val >> (bit * 2u)) & 0x3u);
-                    const float x = xbase[wi];
-                    sub_acc  += q * x;
-                    sub_x_sum += x;
-                }
-            }
-            acc += d * sub_sc * sub_acc - dmin * sub_mn * sub_x_sum;
-        }
+        const unsigned char* bptr = blocks
+            + (unsigned long long)(row * blocks_per_row + b) * 84u;
+        acc += kq_dot_q2k(bptr, input + (b << 8u));
     }
-
-    /* Warp-shuffle reduction across 32 lanes */
-    acc += __shfl_down_sync(0xffffffffu, acc, 16u);
-    acc += __shfl_down_sync(0xffffffffu, acc,  8u);
-    acc += __shfl_down_sync(0xffffffffu, acc,  4u);
-    acc += __shfl_down_sync(0xffffffffu, acc,  2u);
-    acc += __shfl_down_sync(0xffffffffu, acc,  1u);
+    acc = kq_warp_reduce(acc);
     if (lane == 0u) output[row] = acc;
 }
 
-/* ==========================================================================
-   Kernel 2 — gemv_q3k
-   Q3_K GEMV: warp-per-row, AoS super-block layout (110 bytes/block).
-
-   Block layout:
-     bytes  0-31:  hmask[32]   — 256 × 1 high bit, 8/byte
-     bytes 32-95:  qs[64]      — 256 × 2 low bits, 4/byte (LSB first)
-     bytes 96-107: scales[12]  — 16 × 4-bit signed nibbles, 2/byte
-     bytes 108-109: d (FP16 LE)
-
-   q3_code = lo2 | (hi << 2), range [0..7]; q3_signed = q3_code - 4.
-   signed_sc = nibble - 8  (nibble is 4-bit; sc can be negative).
-   dequant: d * signed_sc * q3_signed
-
-   Grid:  (ceil(n_rows / 8), 1, 1)
-   Block: (256, 1, 1)
-   ========================================================================== */
+/* Kernel 2 — gemv_q3k (110 bytes/super-block) */
 extern "C" __global__ void gemv_q3k(
     const unsigned char* __restrict__ blocks,
     const float*         __restrict__ input,
@@ -251,73 +550,17 @@ extern "C" __global__ void gemv_q3k(
     if (row >= n_rows) return;
 
     const unsigned int blocks_per_row = k >> 8u;
-    const unsigned int stride = 110u;
-
     float acc = 0.0f;
     for (unsigned int b = lane; b < blocks_per_row; b += 32u) {
-        const unsigned char* bptr = blocks + (row * blocks_per_row + b) * stride;
-
-        /* d at bytes 108-109 */
-        const unsigned short d_raw = (unsigned short)bptr[108] | ((unsigned short)bptr[109] << 8u);
-        const float d = kq_fast_fp16_to_float(d_raw);
-
-        const float* xbase = input + (b << 8u);
-
-        /* 16 sub-blocks × 16 weights each */
-        #pragma unroll 16
-        for (unsigned int sub = 0u; sub < 16u; ++sub) {
-            /* 4-bit signed scale nibble for this sub-block */
-            const unsigned char sc_byte = bptr[96u + sub / 2u];
-            const unsigned int  nibble  = (sub & 1u) == 0u
-                                          ? (sc_byte & 0x0Fu)
-                                          : ((sc_byte >> 4u) & 0x0Fu);
-            const float signed_sc = (float)(int)(nibble) - 8.0f;
-
-            /* Per-weight base within the 256-weight block */
-            const unsigned int w_base = sub * 16u;
-
-            float sub_acc = 0.0f;
-            #pragma unroll 16
-            for (unsigned int j = 0u; j < 16u; ++j) {
-                const unsigned int wi = w_base + j;
-                /* high bit: hmask[wi/8], bit (wi%8) */
-                const unsigned int hi = (bptr[wi >> 3u] >> (wi & 7u)) & 0x1u;
-                /* low 2 bits: qs[wi/4], bits [(wi%4)*2 .. (wi%4)*2+1] */
-                const unsigned int lo2 = (bptr[32u + (wi >> 2u)] >> ((wi & 3u) * 2u)) & 0x3u;
-                const int q3_code   = (int)(lo2 | (hi << 2u));
-                const int q3_signed = q3_code - 4;
-                sub_acc += (float)q3_signed * xbase[wi];
-            }
-            acc += d * signed_sc * sub_acc;
-        }
+        const unsigned char* bptr = blocks
+            + (unsigned long long)(row * blocks_per_row + b) * 110u;
+        acc += kq_dot_q3k(bptr, input + (b << 8u));
     }
-
-    acc += __shfl_down_sync(0xffffffffu, acc, 16u);
-    acc += __shfl_down_sync(0xffffffffu, acc,  8u);
-    acc += __shfl_down_sync(0xffffffffu, acc,  4u);
-    acc += __shfl_down_sync(0xffffffffu, acc,  2u);
-    acc += __shfl_down_sync(0xffffffffu, acc,  1u);
+    acc = kq_warp_reduce(acc);
     if (lane == 0u) output[row] = acc;
 }
 
-/* ==========================================================================
-   Kernel 3 — gemv_q4k
-   Q4_K GEMV: warp-per-row, AoS super-block layout (144 bytes/block).
-
-   Block layout:
-     bytes  0- 1: d (FP16 LE)
-     bytes  2- 3: dmin (FP16 LE)
-     bytes  4-15: scales[12]  — 6-bit sc[8] + 6-bit mn[8] (decoded by helper)
-     bytes 16-143: qs[128]    — 256 × 4-bit weights, 2/byte
-
-   8 sub-blocks × 32 weights each.
-   even weight j in sub:  qs[sub*16 + j/2] & 0xF
-   odd  weight j in sub: (qs[sub*16 + j/2] >> 4) & 0xF
-   dequant: d * sc[sub] * q - dmin * mn[sub]
-
-   Grid:  (ceil(n_rows / 8), 1, 1)
-   Block: (256, 1, 1)
-   ========================================================================== */
+/* Kernel 3 — gemv_q4k (144 bytes/super-block) */
 extern "C" __global__ void gemv_q4k(
     const unsigned char* __restrict__ blocks,
     const float*         __restrict__ input,
@@ -331,73 +574,17 @@ extern "C" __global__ void gemv_q4k(
     if (row >= n_rows) return;
 
     const unsigned int blocks_per_row = k >> 8u;
-    const unsigned int stride = 144u;
-
     float acc = 0.0f;
     for (unsigned int b = lane; b < blocks_per_row; b += 32u) {
-        const unsigned char* bptr = blocks + (row * blocks_per_row + b) * stride;
-
-        const unsigned short d_raw    = (unsigned short)bptr[0] | ((unsigned short)bptr[1] << 8u);
-        const unsigned short dmin_raw = (unsigned short)bptr[2] | ((unsigned short)bptr[3] << 8u);
-        const float d    = kq_fast_fp16_to_float(d_raw);
-        const float dmin = kq_fast_fp16_to_float(dmin_raw);
-
-        unsigned char sc[8], mn[8];
-        kq_decode_6bit_scales(bptr + 4u, sc, mn);
-
-        const float* xbase = input + (b << 8u);
-
-        /* 8 sub-blocks × 32 weights each */
-        #pragma unroll 8
-        for (unsigned int sub = 0u; sub < 8u; ++sub) {
-            const float sc_f  = (float)sc[sub];
-            const float mn_f  = (float)mn[sub];
-            /* qs for this sub-block start at bptr[16 + sub*16] */
-            const unsigned char* qs_sub = bptr + 16u + sub * 16u;
-            const float* x_sub = xbase + sub * 32u;
-
-            float sub_acc  = 0.0f;
-            float sub_xsum = 0.0f;
-            #pragma unroll 16
-            for (unsigned int nb = 0u; nb < 16u; ++nb) {
-                const unsigned int byte_val = qs_sub[nb];
-                const float q0 = (float)(byte_val & 0x0Fu);
-                const float q1 = (float)((byte_val >> 4u) & 0x0Fu);
-                const float x0 = x_sub[nb * 2u];
-                const float x1 = x_sub[nb * 2u + 1u];
-                sub_acc  += q0 * x0 + q1 * x1;
-                sub_xsum += x0 + x1;
-            }
-            acc += d * sc_f * sub_acc - dmin * mn_f * sub_xsum;
-        }
+        const unsigned char* bptr = blocks
+            + (unsigned long long)(row * blocks_per_row + b) * 144u;
+        acc += kq_dot_q4k(bptr, input + (b << 8u));
     }
-
-    acc += __shfl_down_sync(0xffffffffu, acc, 16u);
-    acc += __shfl_down_sync(0xffffffffu, acc,  8u);
-    acc += __shfl_down_sync(0xffffffffu, acc,  4u);
-    acc += __shfl_down_sync(0xffffffffu, acc,  2u);
-    acc += __shfl_down_sync(0xffffffffu, acc,  1u);
+    acc = kq_warp_reduce(acc);
     if (lane == 0u) output[row] = acc;
 }
 
-/* ==========================================================================
-   Kernel 4 — gemv_q5k
-   Q5_K GEMV: warp-per-row, AoS super-block layout (176 bytes/block).
-
-   Block layout:
-     bytes  0- 1: d (FP16 LE)
-     bytes  2- 3: dmin (FP16 LE)
-     bytes  4-15: scales[12]   — 6-bit sc[8] + 6-bit mn[8]
-     bytes 16-47: qh[32]       — 256 × 1 high bit, 8/byte
-     bytes 48-175: qs[128]     — 256 × 4 low bits, 2/byte
-
-   8 sub-blocks × 32 weights each.
-   q5 = (qs_nibble) | (high_bit << 4), range [0..31]
-   dequant: d * sc[sub] * q5 - dmin * mn[sub]
-
-   Grid:  (ceil(n_rows / 8), 1, 1)
-   Block: (256, 1, 1)
-   ========================================================================== */
+/* Kernel 4 — gemv_q5k (176 bytes/super-block) */
 extern "C" __global__ void gemv_q5k(
     const unsigned char* __restrict__ blocks,
     const float*         __restrict__ input,
@@ -411,87 +598,17 @@ extern "C" __global__ void gemv_q5k(
     if (row >= n_rows) return;
 
     const unsigned int blocks_per_row = k >> 8u;
-    const unsigned int stride = 176u;
-
     float acc = 0.0f;
     for (unsigned int b = lane; b < blocks_per_row; b += 32u) {
-        const unsigned char* bptr = blocks + (row * blocks_per_row + b) * stride;
-
-        const unsigned short d_raw    = (unsigned short)bptr[0] | ((unsigned short)bptr[1] << 8u);
-        const unsigned short dmin_raw = (unsigned short)bptr[2] | ((unsigned short)bptr[3] << 8u);
-        const float d    = kq_fast_fp16_to_float(d_raw);
-        const float dmin = kq_fast_fp16_to_float(dmin_raw);
-
-        unsigned char sc[8], mn[8];
-        kq_decode_6bit_scales(bptr + 4u, sc, mn);
-
-        /* qh starts at byte 16, qs starts at byte 48 */
-        const unsigned char* qh = bptr + 16u;
-        const unsigned char* qs = bptr + 48u;
-        const float* xbase = input + (b << 8u);
-
-        /* 8 sub-blocks × 32 weights each */
-        #pragma unroll 8
-        for (unsigned int sub = 0u; sub < 8u; ++sub) {
-            const float sc_f  = (float)sc[sub];
-            const float mn_f  = (float)mn[sub];
-            /* low-nibble bytes for this sub: qs + sub*16 (16 bytes = 32 nibbles) */
-            const unsigned char* qs_sub = qs + sub * 16u;
-            const float* x_sub = xbase + sub * 32u;
-
-            float sub_acc  = 0.0f;
-            float sub_xsum = 0.0f;
-            #pragma unroll 16
-            for (unsigned int nb = 0u; nb < 16u; ++nb) {
-                /* weight index within the 256-weight super-block */
-                const unsigned int wi0 = sub * 32u + nb * 2u;
-                const unsigned int wi1 = wi0 + 1u;
-                /* high bits from qh */
-                const unsigned int hi0 = (qh[wi0 >> 3u] >> (wi0 & 7u)) & 0x1u;
-                const unsigned int hi1 = (qh[wi1 >> 3u] >> (wi1 & 7u)) & 0x1u;
-                /* low nibbles */
-                const unsigned int byte_val = qs_sub[nb];
-                const unsigned int lo0 = byte_val & 0x0Fu;
-                const unsigned int lo1 = (byte_val >> 4u) & 0x0Fu;
-                const float q0 = (float)(lo0 | (hi0 << 4u));
-                const float q1 = (float)(lo1 | (hi1 << 4u));
-                const float x0 = x_sub[nb * 2u];
-                const float x1 = x_sub[nb * 2u + 1u];
-                sub_acc  += q0 * x0 + q1 * x1;
-                sub_xsum += x0 + x1;
-            }
-            acc += d * sc_f * sub_acc - dmin * mn_f * sub_xsum;
-        }
+        const unsigned char* bptr = blocks
+            + (unsigned long long)(row * blocks_per_row + b) * 176u;
+        acc += kq_dot_q5k(bptr, input + (b << 8u));
     }
-
-    acc += __shfl_down_sync(0xffffffffu, acc, 16u);
-    acc += __shfl_down_sync(0xffffffffu, acc,  8u);
-    acc += __shfl_down_sync(0xffffffffu, acc,  4u);
-    acc += __shfl_down_sync(0xffffffffu, acc,  2u);
-    acc += __shfl_down_sync(0xffffffffu, acc,  1u);
+    acc = kq_warp_reduce(acc);
     if (lane == 0u) output[row] = acc;
 }
 
-/* ==========================================================================
-   Kernel 5 — gemv_q6k
-   Q6_K GEMV: warp-per-row, AoS super-block layout (210 bytes/block).
-
-   Block layout:
-     bytes  0-127:  ql[128]    — 256 × 4 low bits, 2/byte
-     bytes 128-191: qh[64]     — 256 × 2 high bits, 4/byte
-     bytes 192-207: scales[16] — 16 × int8 signed scale, 1/sub-block
-     bytes 208-209: d (FP16 LE)
-
-   16 sub-blocks × 16 weights each.
-   ql nibble = (ql[i/2] >> ((i%2)*4)) & 0xF
-   qh hi2    = (qh[i/4] >> ((i%4)*2)) & 0x3
-   q6 = nibble | (hi2 << 4), range [0..63]; q6_signed = q6 - 32, range [-32..31]
-   scales_i8 is signed int8.
-   dequant: d * scales_i8[sub] * q6_signed
-
-   Grid:  (ceil(n_rows / 8), 1, 1)
-   Block: (256, 1, 1)
-   ========================================================================== */
+/* Kernel 5 — gemv_q6k (210 bytes/super-block) */
 extern "C" __global__ void gemv_q6k(
     const unsigned char* __restrict__ blocks,
     const float*         __restrict__ input,
@@ -505,66 +622,17 @@ extern "C" __global__ void gemv_q6k(
     if (row >= n_rows) return;
 
     const unsigned int blocks_per_row = k >> 8u;
-    const unsigned int stride = 210u;
-
     float acc = 0.0f;
     for (unsigned int b = lane; b < blocks_per_row; b += 32u) {
-        const unsigned char* bptr = blocks + (row * blocks_per_row + b) * stride;
-
-        /* d at bytes 208-209 */
-        const unsigned short d_raw = (unsigned short)bptr[208] | ((unsigned short)bptr[209] << 8u);
-        const float d = kq_fast_fp16_to_float(d_raw);
-
-        /* ql[128], qh[64], scales_i8[16] */
-        const unsigned char* ql       = bptr;
-        const unsigned char* qh       = bptr + 128u;
-        const signed   char* scales_i8 = (const signed char*)(bptr + 192u);
-        const float* xbase = input + (b << 8u);
-
-        /* 16 sub-blocks × 16 weights each */
-        #pragma unroll 16
-        for (unsigned int sub = 0u; sub < 16u; ++sub) {
-            const float sc = (float)(int)scales_i8[sub];
-            const unsigned int w_base = sub * 16u;
-
-            float sub_acc = 0.0f;
-            #pragma unroll 16
-            for (unsigned int j = 0u; j < 16u; ++j) {
-                const unsigned int wi = w_base + j;
-                /* low 4 bits from ql */
-                const unsigned int nibble = (ql[wi >> 1u] >> ((wi & 1u) * 4u)) & 0x0Fu;
-                /* high 2 bits from qh */
-                const unsigned int hi2    = (qh[wi >> 2u] >> ((wi & 3u) * 2u)) & 0x03u;
-                const int q6        = (int)(nibble | (hi2 << 4u));
-                const int q6_signed = q6 - 32;
-                sub_acc += (float)q6_signed * xbase[wi];
-            }
-            acc += d * sc * sub_acc;
-        }
+        const unsigned char* bptr = blocks
+            + (unsigned long long)(row * blocks_per_row + b) * 210u;
+        acc += kq_dot_q6k(bptr, input + (b << 8u));
     }
-
-    acc += __shfl_down_sync(0xffffffffu, acc, 16u);
-    acc += __shfl_down_sync(0xffffffffu, acc,  8u);
-    acc += __shfl_down_sync(0xffffffffu, acc,  4u);
-    acc += __shfl_down_sync(0xffffffffu, acc,  2u);
-    acc += __shfl_down_sync(0xffffffffu, acc,  1u);
+    acc = kq_warp_reduce(acc);
     if (lane == 0u) output[row] = acc;
 }
 
-/* ==========================================================================
-   Kernel 6 — gemv_q8k
-   Q8_K GEMV: warp-per-row, AoS super-block layout (292 bytes/block).
-
-   Block layout:
-     bytes  0-3:   d (FP32 LE)       — NOTE: float, not FP16!
-     bytes  4-259: qs[256] (int8)    — 256 signed int8 weights
-     bytes 260-291: bsums[16] (i16)  — not needed for GEMV
-
-   dequant: d_f32 * qs[i]
-
-   Grid:  (ceil(n_rows / 8), 1, 1)
-   Block: (256, 1, 1)
-   ========================================================================== */
+/* Kernel 6 — gemv_q8k (292 bytes/super-block) */
 extern "C" __global__ void gemv_q8k(
     const unsigned char* __restrict__ blocks,
     const float*         __restrict__ input,
@@ -578,35 +646,13 @@ extern "C" __global__ void gemv_q8k(
     if (row >= n_rows) return;
 
     const unsigned int blocks_per_row = k >> 8u;
-    const unsigned int stride = 292u;
-
     float acc = 0.0f;
     for (unsigned int b = lane; b < blocks_per_row; b += 32u) {
-        const unsigned char* bptr = blocks + (row * blocks_per_row + b) * stride;
-
-        /* Read f32 d from bytes 0-3 (little-endian) */
-        union { unsigned int u; float f; } ud;
-        ud.u = (unsigned int)bptr[0]
-             | ((unsigned int)bptr[1] << 8u)
-             | ((unsigned int)bptr[2] << 16u)
-             | ((unsigned int)bptr[3] << 24u);
-        const float d = ud.f;
-
-        const float* xbase = input + (b << 8u);
-
-        /* 256 signed int8 weights starting at byte 4 */
-        #pragma unroll 32
-        for (unsigned int j = 0u; j < 256u; ++j) {
-            const int q = (int)(signed char)bptr[4u + j];
-            acc += d * (float)q * xbase[j];
-        }
+        const unsigned char* bptr = blocks
+            + (unsigned long long)(row * blocks_per_row + b) * 292u;
+        acc += kq_dot_q8k(bptr, input + (b << 8u));
     }
-
-    acc += __shfl_down_sync(0xffffffffu, acc, 16u);
-    acc += __shfl_down_sync(0xffffffffu, acc,  8u);
-    acc += __shfl_down_sync(0xffffffffu, acc,  4u);
-    acc += __shfl_down_sync(0xffffffffu, acc,  2u);
-    acc += __shfl_down_sync(0xffffffffu, acc,  1u);
+    acc = kq_warp_reduce(acc);
     if (lane == 0u) output[row] = acc;
 }
 "#;
@@ -771,7 +817,7 @@ fn validate_k_quant_args(
     block_stride: usize,
     format: &str,
 ) -> Result<usize, CudaGraphError> {
-    if k == 0 || k % 256 != 0 {
+    if k == 0 || !k.is_multiple_of(256) {
         return Err(CudaGraphError::WeightLayoutError(format!(
             "{format} GEMV: k={k} must be a positive multiple of 256"
         )));
@@ -804,6 +850,7 @@ fn validate_k_quant_args(
 /// `blocks_bytes` is the raw AoS byte representation of the weight matrix:
 /// - 84 bytes per super-block: `[scales:16][qs:64][d_f16:2][dmin_f16:2]`
 ///   - 16 sub-blocks × 16 weights, 2-bit quant, per-sub scale/min
+///   - decoded by ggml's `dequantize_row_q2_K` walk (`kq_dot_q2k`)
 /// - Total length: `n_rows * (k / 256) * 84`
 ///
 /// `input` must have length `>= k`. `k` must be a positive multiple of 256.
@@ -835,6 +882,8 @@ pub fn cuda_gemv_q2k(
 /// `blocks_bytes` is the raw AoS byte representation of the weight matrix:
 /// - 110 bytes per super-block: `[hmask:32][qs:64][scales:12][d_f16:2]`
 ///   - 16 sub-blocks × 16 weights, 3-bit quant (1-bit high + 2-bit low)
+///   - 6-bit scales from the `kmask1`/`kmask2` shuffle, biased by -32;
+///     inverted hmask — see `kq_dot_q3k`
 /// - Total length: `n_rows * (k / 256) * 110`
 ///
 /// `input` must have length `>= k`. `k` must be a positive multiple of 256.
@@ -865,7 +914,9 @@ pub fn cuda_gemv_q3k(
 ///
 /// `blocks_bytes` is the raw AoS byte representation of the weight matrix:
 /// - 144 bytes per super-block: `[d_f16:2][dmin_f16:2][scales:12][qs:128]`
-///   - 8 sub-blocks × 32 weights, 4-bit quant, 6-bit scale/min
+///   - 8 sub-blocks × 32 weights, 4-bit quant, 6-bit `get_scale_min_k4`
+///     scale/min; 32 low then 32 high nibbles per 64-element group
+///     (`kq_dot_q4k`)
 /// - Total length: `n_rows * (k / 256) * 144`
 ///
 /// `input` must have length `>= k`. `k` must be a positive multiple of 256.
@@ -897,6 +948,7 @@ pub fn cuda_gemv_q4k(
 /// `blocks_bytes` is the raw AoS byte representation of the weight matrix:
 /// - 176 bytes per super-block: `[d_f16:2][dmin_f16:2][scales:12][qh:32][qs:128]`
 ///   - 8 sub-blocks × 32 weights, 5-bit quant (4-bit low + 1-bit high)
+///   - Q4_K's walk plus the `u1`/`u2` `qh` masks (`kq_dot_q5k`)
 /// - Total length: `n_rows * (k / 256) * 176`
 ///
 /// `input` must have length `>= k`. `k` must be a positive multiple of 256.
@@ -928,6 +980,7 @@ pub fn cuda_gemv_q5k(
 /// `blocks_bytes` is the raw AoS byte representation of the weight matrix:
 /// - 210 bytes per super-block: `[ql:128][qh:64][scales_i8:16][d_f16:2]`
 ///   - 16 sub-blocks × 16 weights, 6-bit quant (4-bit low + 2-bit high), signed i8 scales
+///   - four-lane interleave with `sc[is+0,+2,+4,+6]` (`kq_dot_q6k`)
 /// - Total length: `n_rows * (k / 256) * 210`
 ///
 /// `input` must have length `>= k`. `k` must be a positive multiple of 256.
@@ -1046,8 +1099,8 @@ mod tests {
     #[test]
     fn test_k_quant_kernel_source_has_6bit_scale_helper() {
         assert!(
-            CUDA_K_QUANT_KERNELS_SRC.contains("kq_decode_6bit_scales"),
-            "CUDA_K_QUANT_KERNELS_SRC must contain kq_decode_6bit_scales"
+            CUDA_K_QUANT_KERNELS_SRC.contains("kq_scale_min_k4"),
+            "CUDA_K_QUANT_KERNELS_SRC must contain kq_scale_min_k4 (ggml get_scale_min_k4)"
         );
     }
 

@@ -4,6 +4,13 @@
 //! be configured and applied to a collection of weight tensors. Each stage
 //! records statistics that are aggregated into a final `CompressionResult`.
 //!
+//! ## Reachability
+//!
+//! As of this writing, nothing in the CLI or the export pipeline calls
+//! [`compress_model`] — there is no `oxibonsai compress`-style entry point
+//! that runs this pipeline against a real model. This module is a tested,
+//! documented primitive for that future work, not a wired feature.
+//!
 //! # Example
 //!
 //! ```rust
@@ -30,8 +37,13 @@ use crate::pruning::{prune_tensor, PruningConfig, PruningError};
 pub enum CompressionStage {
     /// Prune weights to target sparsity using the provided configuration.
     Prune(PruningConfig),
-    /// Quantize to INT8 (per-tensor, simulate INT8 precision loss while keeping
-    /// f32 storage). Memory footprint is reported as `original * 0.25` (theoretical INT8 size).
+    /// Quantize to INT8 (per-tensor, simulate INT8 precision loss while
+    /// keeping `f32` storage in memory). [`StageStats::memory_after_bytes`]
+    /// honestly reports that the tensors are still `f32` after this stage
+    /// (unchanged from `memory_before_bytes`); the theoretical INT8-encoded
+    /// size (`original * 0.25`) is reported separately as
+    /// [`StageStats::encoded_bytes_after`], and that is what
+    /// [`StageStats::compression_ratio`] is computed against.
     QuantizeInt8,
     /// Apply magnitude-based weight clipping: zero out weights whose absolute value
     /// falls below the given percentile of absolute values in each tensor.
@@ -120,18 +132,40 @@ pub struct StageStats {
     pub nonzero_params_after: usize,
     /// Total memory (bytes) of all processed tensors before this stage.
     pub memory_before_bytes: usize,
-    /// Total memory (bytes) of all processed tensors after this stage.
+    /// **Real, measured** memory (bytes) the processed tensors occupy in
+    /// this process's memory *after* this stage — their actual current
+    /// `f32` storage footprint. This pipeline never changes a tensor's
+    /// element count or its in-memory representation (even
+    /// [`CompressionStage::QuantizeInt8`] dequantizes back to `f32` to
+    /// simulate precision loss), so today this is always equal to
+    /// `memory_before_bytes`. It is reported honestly rather than assuming
+    /// the stage's target on-disk encoding — see
+    /// [`encoded_bytes_after`][Self::encoded_bytes_after] for that.
     pub memory_after_bytes: usize,
+    /// Size (bytes) the processed tensors *would* occupy if actually
+    /// re-encoded into this stage's target format (e.g. 1 byte/element for
+    /// [`CompressionStage::QuantizeInt8`]). This is a computed estimate,
+    /// not a measurement of anything currently resident in memory; it is
+    /// what [`compression_ratio`][Self::compression_ratio] is computed
+    /// against. For [`CompressionStage::Prune`] and
+    /// [`CompressionStage::Clip`], which do not change the on-disk
+    /// encoding, this equals `memory_after_bytes`.
+    pub encoded_bytes_after: usize,
 }
 
 impl StageStats {
-    /// Ratio of `memory_before_bytes / memory_after_bytes`. Returns `1.0` if
-    /// `memory_after_bytes` is zero to avoid division by zero.
+    /// Ratio of `memory_before_bytes / encoded_bytes_after`. Returns `1.0`
+    /// if `encoded_bytes_after` is zero to avoid division by zero.
+    ///
+    /// This is computed against the *target-encoding* estimate, not the
+    /// real post-stage memory footprint (`memory_after_bytes`), since this
+    /// pipeline keeps `f32` storage in memory throughout — see
+    /// [`encoded_bytes_after`][Self::encoded_bytes_after].
     pub fn compression_ratio(&self) -> f32 {
-        if self.memory_after_bytes == 0 {
+        if self.encoded_bytes_after == 0 {
             return 1.0;
         }
-        self.memory_before_bytes as f32 / self.memory_after_bytes as f32
+        self.memory_before_bytes as f32 / self.encoded_bytes_after as f32
     }
 
     /// Fraction of parameters that are zero after this stage.
@@ -182,14 +216,17 @@ impl CompressionResult {
         zeros as f32 / total as f32
     }
 
-    /// Compression ratio: `memory_before / memory_after` using the first and last
-    /// stage's memory stats. Falls back to `1.0` if there are no stages.
+    /// Compression ratio: `memory_before / encoded_bytes_after` using the
+    /// first stage's `memory_before_bytes` and the last stage's
+    /// `encoded_bytes_after` (the target-encoding estimate, not the real
+    /// in-memory footprint — see [`StageStats::compression_ratio`]). Falls
+    /// back to `1.0` if there are no stages.
     pub fn total_compression_ratio(&self) -> f32 {
         if self.stage_stats.is_empty() {
             return 1.0;
         }
         let before = self.memory_before_bytes();
-        let after = self.memory_after_bytes();
+        let after = self.encoded_bytes_after();
         if after == 0 {
             return 1.0;
         }
@@ -205,12 +242,26 @@ impl CompressionResult {
             .unwrap_or(0)
     }
 
-    /// Memory (bytes) after all compression: taken from the last stage's
-    /// `memory_after_bytes`. Returns `0` if there are no stage stats.
+    /// **Real, measured** memory (bytes) resident after all compression
+    /// stages: taken from the last stage's `memory_after_bytes`. Returns
+    /// `0` if there are no stage stats. See
+    /// [`StageStats::memory_after_bytes`] — this pipeline keeps `f32`
+    /// storage throughout, so this is typically equal to
+    /// `memory_before_bytes`.
     pub fn memory_after_bytes(&self) -> usize {
         self.stage_stats
             .last()
             .map(|s| s.memory_after_bytes)
+            .unwrap_or(0)
+    }
+
+    /// Target-encoding size estimate (bytes) after all compression stages:
+    /// taken from the last stage's `encoded_bytes_after`. Returns `0` if
+    /// there are no stage stats. See [`StageStats::encoded_bytes_after`].
+    pub fn encoded_bytes_after(&self) -> usize {
+        self.stage_stats
+            .last()
+            .map(|s| s.encoded_bytes_after)
             .unwrap_or(0)
     }
 
@@ -224,7 +275,7 @@ impl CompressionResult {
         for (i, stats) in self.stage_stats.iter().enumerate() {
             lines.push(format!(
                 "  Stage {}: [{}] processed={} skipped={} sparsity={:.4} ratio={:.3}x \
-                 memory={}B->{}B",
+                 memory={}B->{}B (real, unchanged in this simulation) encoded-target={}B",
                 i + 1,
                 stats.stage_name,
                 stats.tensors_processed,
@@ -233,11 +284,12 @@ impl CompressionResult {
                 stats.compression_ratio(),
                 stats.memory_before_bytes,
                 stats.memory_after_bytes,
+                stats.encoded_bytes_after,
             ));
         }
         lines.push(format!(
             "  Overall: tensors={} total_params={} nonzero={} sparsity={:.4} \
-             compression_ratio={:.3}x memory={}B->{}B",
+             compression_ratio={:.3}x memory={}B->{}B (real) encoded-target={}B",
             self.compressed_tensors.len(),
             self.total_params(),
             self.total_nonzero(),
@@ -245,6 +297,7 @@ impl CompressionResult {
             self.total_compression_ratio(),
             self.memory_before_bytes(),
             self.memory_after_bytes(),
+            self.encoded_bytes_after(),
         ));
         lines.join("\n")
     }
@@ -300,8 +353,11 @@ fn count_nonzero(tensor: &WeightTensor) -> usize {
 /// Apply the INT8 quantization stage to a single tensor in-place.
 ///
 /// Quantises each tensor per-tensor using `scale = max(|w|) / 127`,
-/// then dequantises back to f32 to simulate the precision loss.
-/// The `memory_after_bytes` is reported as `memory_before * 0.25` (theoretical INT8 size).
+/// then dequantises back to f32 to simulate the precision loss. The tensor
+/// remains `f32` in memory (see [`StageStats::memory_after_bytes`]); the
+/// theoretical INT8-encoded size is tracked separately as
+/// `encoded_bytes_after = memory_before * 0.25` via
+/// [`quantize_int8_encoded_bytes`].
 fn apply_quantize_int8_inplace(tensor: &mut WeightTensor) {
     let data = &mut tensor.data;
     if data.is_empty() {
@@ -358,9 +414,13 @@ fn apply_clip_inplace(tensor: &mut WeightTensor, percentile: f32) -> Result<(), 
     Ok(())
 }
 
-/// Compute memory-after for a quantize_int8 stage (theoretical: 0.25 × original).
+/// Compute the theoretical INT8-*encoded* size for a quantize_int8 stage
+/// (0.25 × the real `f32` byte count). This is **not** the tensor's real
+/// post-stage memory footprint — the data stays `f32` in memory (see
+/// [`StageStats::memory_after_bytes`] vs
+/// [`StageStats::encoded_bytes_after`]).
 #[inline]
-fn quantize_int8_memory_after(memory_before: usize) -> usize {
+fn quantize_int8_encoded_bytes(memory_before: usize) -> usize {
     // INT8 is 1 byte vs 4 bytes for f32 → theoretical 4× compression
     (memory_before as f32 * 0.25).round() as usize
 }
@@ -413,6 +473,7 @@ pub fn compress_model(
         let mut nonzero_after = 0usize;
         let mut memory_before = 0usize;
         let mut memory_after = 0usize;
+        let mut encoded_after = 0usize;
 
         for tensor in working.iter_mut() {
             let should_skip = config.skip_embedding_layers && is_embedding_layer(&tensor.name);
@@ -423,9 +484,11 @@ pub fn compress_model(
 
             if should_skip {
                 tensors_skipped += 1;
-                // Skipped tensors are carried through unchanged
+                // Skipped tensors are carried through unchanged: real and
+                // encoded size are both just their unchanged f32 footprint.
                 nonzero_after += count_nonzero(tensor);
                 memory_after += tb;
+                encoded_after += tb;
                 continue;
             }
 
@@ -436,19 +499,29 @@ pub fn compress_model(
                     let (pruned, _mask) = prune_tensor(tensor, prune_cfg)?;
                     *tensor = pruned;
                     nonzero_after += count_nonzero(tensor);
-                    memory_after += tensor_bytes(tensor);
+                    // Pruning zeros elements but keeps dense f32 storage:
+                    // real and encoded size are the same here.
+                    let after_bytes = tensor_bytes(tensor);
+                    memory_after += after_bytes;
+                    encoded_after += after_bytes;
                 }
                 CompressionStage::QuantizeInt8 => {
                     apply_quantize_int8_inplace(tensor);
                     nonzero_after += count_nonzero(tensor);
-                    // Theoretical INT8 memory: 0.25 × original f32 bytes
-                    memory_after += quantize_int8_memory_after(tb);
+                    // Real: the tensor is still f32 in memory (dequantized
+                    // back after the simulated precision loss).
+                    memory_after += tensor_bytes(tensor);
+                    // Encoded: theoretical INT8-packed size, 0.25x original.
+                    encoded_after += quantize_int8_encoded_bytes(tb);
                 }
                 CompressionStage::Clip { percentile } => {
                     // percentile already validated above
                     apply_clip_inplace(tensor, *percentile)?;
                     nonzero_after += count_nonzero(tensor);
-                    memory_after += tensor_bytes(tensor);
+                    // Clipping zeros elements but keeps dense f32 storage.
+                    let after_bytes = tensor_bytes(tensor);
+                    memory_after += after_bytes;
+                    encoded_after += after_bytes;
                 }
             }
         }
@@ -461,6 +534,7 @@ pub fn compress_model(
             nonzero_params_after: nonzero_after,
             memory_before_bytes: memory_before,
             memory_after_bytes: memory_after,
+            encoded_bytes_after: encoded_after,
         });
     }
 
@@ -577,7 +651,7 @@ mod tests {
     }
 
     #[test]
-    fn stage_stats_compression_ratio_equals_before_over_after() {
+    fn stage_stats_compression_ratio_equals_before_over_encoded_after() {
         let stats = StageStats {
             stage_name: "prune".to_string(),
             tensors_processed: 1,
@@ -586,9 +660,39 @@ mod tests {
             nonzero_params_after: 50,
             memory_before_bytes: 400,
             memory_after_bytes: 400,
+            encoded_bytes_after: 400,
         };
         let ratio = stats.compression_ratio();
         assert!((ratio - 1.0).abs() < 1e-6);
+    }
+
+    /// CQ-15 regression: `memory_after_bytes` must be the *real* post-stage
+    /// footprint, not the fabricated `before * 0.25`. A `QuantizeInt8`
+    /// stage keeps the data as `f32` in memory, so `memory_after_bytes`
+    /// must equal `memory_before_bytes` even though `encoded_bytes_after`
+    /// (the theoretical INT8 size) is smaller.
+    #[test]
+    fn stage_stats_quantize_int8_memory_after_is_real_not_fabricated() {
+        let stats = StageStats {
+            stage_name: "quantize_int8".to_string(),
+            tensors_processed: 1,
+            tensors_skipped: 0,
+            params_before: 10,
+            nonzero_params_after: 10,
+            memory_before_bytes: 400,
+            memory_after_bytes: 400,
+            encoded_bytes_after: 100,
+        };
+        assert_eq!(
+            stats.memory_after_bytes, stats.memory_before_bytes,
+            "memory_after_bytes must report the real (unchanged) f32 footprint"
+        );
+        assert!(
+            (stats.compression_ratio() - 4.0).abs() < 1e-4,
+            "compression_ratio must still reflect the 4x theoretical INT8 saving \
+             via encoded_bytes_after, got {}",
+            stats.compression_ratio()
+        );
     }
 
     #[test]
@@ -601,6 +705,7 @@ mod tests {
             nonzero_params_after: 50,
             memory_before_bytes: 400,
             memory_after_bytes: 400,
+            encoded_bytes_after: 400,
         };
         assert!((stats.sparsity() - 0.5).abs() < 1e-6);
     }
@@ -618,6 +723,7 @@ mod tests {
                     nonzero_params_after: 5,
                     memory_before_bytes: 40,
                     memory_after_bytes: 40,
+                    encoded_bytes_after: 40,
                 },
                 StageStats {
                     stage_name: "quantize_int8".to_string(),
@@ -625,13 +731,21 @@ mod tests {
                     tensors_skipped: 0,
                     params_before: 10,
                     nonzero_params_after: 5,
+                    // Real memory stays f32 (unchanged from before) —
+                    // only the encoded/target size shrinks.
                     memory_before_bytes: 40,
-                    memory_after_bytes: 10,
+                    memory_after_bytes: 40,
+                    encoded_bytes_after: 10,
                 },
             ],
         };
         assert_eq!(result.memory_before_bytes(), 40);
-        assert_eq!(result.memory_after_bytes(), 10);
+        assert_eq!(
+            result.memory_after_bytes(),
+            40,
+            "real memory footprint is unchanged by this simulation"
+        );
+        assert_eq!(result.encoded_bytes_after(), 10);
         assert!((result.total_compression_ratio() - 4.0).abs() < 1e-4);
     }
 

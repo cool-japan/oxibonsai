@@ -9,6 +9,7 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use std::io::Read;
 
 use crate::error::{BonsaiError, BonsaiResult};
+use crate::gguf::tensor_info::read_string_body_chunked;
 use crate::gguf::types::GgufValueType;
 
 /// A typed metadata value from the GGUF key-value store.
@@ -31,30 +32,113 @@ pub enum MetadataValue {
 
 impl MetadataValue {
     /// Try to extract a u32 value.
+    ///
+    /// Accepts any GGUF integer scalar type that can represent the value
+    /// exactly or via a non-negative widening/narrowing conversion:
+    /// `Uint64`/`Int32` (pre-existing), and `Uint8`/`Int8`/`Uint16`/`Int16`
+    /// — the four small-integer scalar types that, before this, had no
+    /// reader anywhere (`general.sampling.top_k`-style `Int32` values
+    /// already worked via `u32::try_from`).
     pub fn as_u32(&self) -> Option<u32> {
         match self {
             Self::Uint32(v) => Some(*v),
             Self::Uint64(v) => u32::try_from(*v).ok(),
             Self::Int32(v) => u32::try_from(*v).ok(),
+            Self::Uint8(v) => Some(u32::from(*v)),
+            Self::Int8(v) => u32::try_from(*v).ok(),
+            Self::Uint16(v) => Some(u32::from(*v)),
+            Self::Int16(v) => u32::try_from(*v).ok(),
             _ => None,
         }
     }
 
     /// Try to extract a u64 value.
+    ///
+    /// See [`as_u32`](Self::as_u32) for why `Uint8`/`Int8`/`Uint16`/`Int16`
+    /// are accepted alongside the pre-existing `Uint32`/`Int64`.
     pub fn as_u64(&self) -> Option<u64> {
         match self {
             Self::Uint64(v) => Some(*v),
             Self::Uint32(v) => Some(u64::from(*v)),
             Self::Int64(v) => u64::try_from(*v).ok(),
+            Self::Uint8(v) => Some(u64::from(*v)),
+            Self::Int8(v) => u64::try_from(*v).ok(),
+            Self::Uint16(v) => Some(u64::from(*v)),
+            Self::Int16(v) => u64::try_from(*v).ok(),
             _ => None,
         }
     }
 
     /// Try to extract a f32 value.
+    ///
+    /// See [`as_u32`](Self::as_u32) for why `Uint8`/`Int8`/`Uint16`/`Int16`
+    /// are accepted alongside the pre-existing `Float32`/`Float64`; all
+    /// four integer widths convert to `f32` exactly (lossless).
     pub fn as_f32(&self) -> Option<f32> {
         match self {
             Self::Float32(v) => Some(*v),
             Self::Float64(v) => Some(*v as f32),
+            Self::Uint8(v) => Some(f32::from(*v)),
+            Self::Int8(v) => Some(f32::from(*v)),
+            Self::Uint16(v) => Some(f32::from(*v)),
+            Self::Int16(v) => Some(f32::from(*v)),
+            _ => None,
+        }
+    }
+
+    /// Try to extract a f64 value.
+    ///
+    /// Mirrors [`as_f32`](Self::as_f32)'s widening so the two float
+    /// accessors stay symmetric: `Uint8`/`Int8`/`Uint16`/`Int16` all
+    /// convert to `f64` exactly (lossless), alongside `Float32`/`Float64`.
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Self::Float64(v) => Some(*v),
+            Self::Float32(v) => Some(f64::from(*v)),
+            Self::Uint8(v) => Some(f64::from(*v)),
+            Self::Int8(v) => Some(f64::from(*v)),
+            Self::Uint16(v) => Some(f64::from(*v)),
+            Self::Int16(v) => Some(f64::from(*v)),
+            _ => None,
+        }
+    }
+
+    /// Try to extract an i32 value, preserving sign.
+    ///
+    /// Accepts any GGUF integer scalar type whose value fits in `i32`:
+    /// `Uint8`/`Int8`/`Uint16`/`Int16` convert exactly (always in range);
+    /// `Uint32`/`Int64`/`Uint64` convert via a range-checked
+    /// `i32::try_from` and yield `None` when the value does not fit
+    /// (e.g. a `Uint32` above `i32::MAX`), rather than silently wrapping
+    /// or dropping the sign.
+    pub fn as_i32(&self) -> Option<i32> {
+        match self {
+            Self::Int32(v) => Some(*v),
+            Self::Int64(v) => i32::try_from(*v).ok(),
+            Self::Uint64(v) => i32::try_from(*v).ok(),
+            Self::Uint32(v) => i32::try_from(*v).ok(),
+            Self::Int16(v) => Some(i32::from(*v)),
+            Self::Uint16(v) => Some(i32::from(*v)),
+            Self::Int8(v) => Some(i32::from(*v)),
+            Self::Uint8(v) => Some(i32::from(*v)),
+            _ => None,
+        }
+    }
+
+    /// Try to extract an i64 value, preserving sign.
+    ///
+    /// See [`as_i32`](Self::as_i32); the only value that can fail to fit is
+    /// a `Uint64` above `i64::MAX`.
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            Self::Int64(v) => Some(*v),
+            Self::Uint64(v) => i64::try_from(*v).ok(),
+            Self::Int32(v) => Some(i64::from(*v)),
+            Self::Uint32(v) => Some(i64::from(*v)),
+            Self::Int16(v) => Some(i64::from(*v)),
+            Self::Uint16(v) => Some(i64::from(*v)),
+            Self::Int8(v) => Some(i64::from(*v)),
+            Self::Uint8(v) => Some(i64::from(*v)),
             _ => None,
         }
     }
@@ -72,6 +156,39 @@ impl MetadataValue {
         match self {
             Self::Bool(v) => Some(*v),
             _ => None,
+        }
+    }
+
+    /// Try to extract an array's elements as a slice.
+    pub fn as_array(&self) -> Option<&[MetadataValue]> {
+        match self {
+            Self::Array(v) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// A short, stable name for this value's underlying GGUF type.
+    ///
+    /// Used to build precise type-mismatch error messages (naming both the
+    /// offending key and the actual type found) in [`MetadataStore`]'s
+    /// `get_*` accessors, and available to downstream crates building their
+    /// own such messages (e.g. a Hadamard/config accessor reporting why a
+    /// key could not be read as the type it expected).
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Self::Uint8(_) => "Uint8",
+            Self::Int8(_) => "Int8",
+            Self::Uint16(_) => "Uint16",
+            Self::Int16(_) => "Int16",
+            Self::Uint32(_) => "Uint32",
+            Self::Int32(_) => "Int32",
+            Self::Float32(_) => "Float32",
+            Self::Bool(_) => "Bool",
+            Self::String(_) => "String",
+            Self::Array(_) => "Array",
+            Self::Uint64(_) => "Uint64",
+            Self::Int64(_) => "Int64",
+            Self::Float64(_) => "Float64",
         }
     }
 }
@@ -166,6 +283,78 @@ impl MetadataStore {
         self.get(key).and_then(|v| v.as_f32()).unwrap_or(default)
     }
 
+    /// Get a required bool value, returning an error if missing or not a
+    /// bool.
+    pub fn get_bool(&self, key: &str) -> BonsaiResult<bool> {
+        match self.get(key) {
+            None => Err(BonsaiError::MissingConfigKey {
+                key: key.to_string(),
+            }),
+            Some(value) => value.as_bool().ok_or_else(|| BonsaiError::InvalidMetadata {
+                key: key.to_string(),
+                reason: format!("expected bool, found {}", value.type_name()),
+            }),
+        }
+    }
+
+    /// Get a required array value, returning an error if the key is
+    /// missing or its value is not an array. On a type mismatch the error
+    /// names both the key and the value's actual GGUF type.
+    pub fn get_array(&self, key: &str) -> BonsaiResult<&[MetadataValue]> {
+        match self.get(key) {
+            None => Err(BonsaiError::MissingConfigKey {
+                key: key.to_string(),
+            }),
+            Some(value) => value
+                .as_array()
+                .ok_or_else(|| BonsaiError::InvalidMetadata {
+                    key: key.to_string(),
+                    reason: format!("expected an array, found {}", value.type_name()),
+                }),
+        }
+    }
+
+    /// Get a required array of i32 values.
+    ///
+    /// Every element must be representable as `i32` (see
+    /// [`MetadataValue::as_i32`]); an element that is not an integer, or an
+    /// integer that does not fit, is a hard error naming the array's key
+    /// and that element's actual GGUF type — never a silent truncation or
+    /// sign flip (e.g. smuggling `-1` through an unsigned accessor and
+    /// getting back `4294967295`).
+    pub fn get_i32_array(&self, key: &str) -> BonsaiResult<Vec<i32>> {
+        self.get_array(key)?
+            .iter()
+            .map(|v| {
+                v.as_i32().ok_or_else(|| BonsaiError::InvalidMetadata {
+                    key: key.to_string(),
+                    reason: format!(
+                        "array element is not representable as i32, found {}",
+                        v.type_name()
+                    ),
+                })
+            })
+            .collect()
+    }
+
+    /// Get a required array of string values.
+    ///
+    /// Every element must be a `String`; a non-string element is a hard
+    /// error naming the array's key and that element's actual GGUF type.
+    pub fn get_string_array(&self, key: &str) -> BonsaiResult<Vec<String>> {
+        self.get_array(key)?
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| BonsaiError::InvalidMetadata {
+                        key: key.to_string(),
+                        reason: format!("array element is not a string, found {}", v.type_name()),
+                    })
+            })
+            .collect()
+    }
+
     /// Number of entries in the store.
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -204,17 +393,6 @@ const MAX_ARRAY_COUNT: u64 = 16 * 1024 * 1024;
 /// deep, so 32 comfortably covers real usage while bounding stack growth.
 const MAX_ARRAY_NESTING_DEPTH: u32 = 32;
 
-/// Upper bound on a single eager read chunk (and the initial `Vec`
-/// reservation) while reading a declared-length GGUF string.
-///
-/// The declared `len` prefix is attacker-controlled and only capped against
-/// [`MAX_STRING_LEN`] (256 MiB), so allocating `len` bytes up front before
-/// confirming the reader actually has that much data left lets a tiny file
-/// force a large allocation. Reading (and growing the buffer) in bounded
-/// chunks instead means peak allocation tracks bytes actually confirmed
-/// present, not the attacker-declared length.
-const STRING_READ_CHUNK: usize = 64 * 1024;
-
 /// Bound on the eager `Vec` capacity reservation for a metadata `Array`.
 ///
 /// The declared element `count` is attacker-controlled and only capped
@@ -230,11 +408,11 @@ const ARRAY_EAGER_RESERVE_CAP: usize = 4096;
 
 /// Read a GGUF string: [u64 length] [utf8 bytes].
 ///
-/// Reads in bounded [`STRING_READ_CHUNK`]-sized pieces rather than
-/// allocating the full declared `len` up front, so a small file with a
-/// large declared string length fails fast (on the first `read_exact` that
-/// finds fewer bytes than requested) instead of first committing a
-/// multi-hundred-MB buffer.
+/// The declared `len` prefix is attacker-controlled and only capped against
+/// [`MAX_STRING_LEN`] (256 MiB); the actual bounded-chunk read loop lives in
+/// [`read_string_body_chunked`] (core-gguf-20 / sec-10 / wave-2.5
+/// integration addendum, item 5) — this used to be an independent copy of
+/// that exact loop, one of three in the crate.
 fn read_gguf_string<R: Read>(reader: &mut R) -> BonsaiResult<String> {
     let len = reader
         .read_u64::<LittleEndian>()
@@ -242,18 +420,7 @@ fn read_gguf_string<R: Read>(reader: &mut R) -> BonsaiResult<String> {
     if len > MAX_STRING_LEN {
         return Err(BonsaiError::InvalidString { offset: 0 });
     }
-    let mut buf = Vec::with_capacity((len as usize).min(STRING_READ_CHUNK));
-    let mut remaining = len;
-    let mut chunk = [0u8; STRING_READ_CHUNK];
-    while remaining > 0 {
-        let take = (remaining as usize).min(STRING_READ_CHUNK);
-        reader
-            .read_exact(&mut chunk[..take])
-            .map_err(BonsaiError::MmapError)?;
-        buf.extend_from_slice(&chunk[..take]);
-        remaining -= take as u64;
-    }
-    String::from_utf8(buf).map_err(|_| BonsaiError::InvalidString { offset: 0 })
+    read_string_body_chunked(reader, len)
 }
 
 /// Read a single typed value from the reader.
@@ -393,6 +560,56 @@ mod tests {
         let mut bytes = make_string_bytes(key);
         bytes.extend_from_slice(&(GgufValueType::Uint32 as u32).to_le_bytes());
         bytes.extend_from_slice(&value.to_le_bytes());
+        bytes
+    }
+
+    fn make_kv_scalar_u8(key: &str, value: u8) -> Vec<u8> {
+        let mut bytes = make_string_bytes(key);
+        bytes.extend_from_slice(&(GgufValueType::Uint8 as u32).to_le_bytes());
+        bytes.push(value);
+        bytes
+    }
+
+    fn make_kv_scalar_i8(key: &str, value: i8) -> Vec<u8> {
+        let mut bytes = make_string_bytes(key);
+        bytes.extend_from_slice(&(GgufValueType::Int8 as u32).to_le_bytes());
+        bytes.push(value.to_le_bytes()[0]);
+        bytes
+    }
+
+    fn make_kv_scalar_u16(key: &str, value: u16) -> Vec<u8> {
+        let mut bytes = make_string_bytes(key);
+        bytes.extend_from_slice(&(GgufValueType::Uint16 as u32).to_le_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+        bytes
+    }
+
+    fn make_kv_scalar_i16(key: &str, value: i16) -> Vec<u8> {
+        let mut bytes = make_string_bytes(key);
+        bytes.extend_from_slice(&(GgufValueType::Int16 as u32).to_le_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+        bytes
+    }
+
+    fn make_kv_i32_array(key: &str, values: &[i32]) -> Vec<u8> {
+        let mut bytes = make_string_bytes(key);
+        bytes.extend_from_slice(&(GgufValueType::Array as u32).to_le_bytes());
+        bytes.extend_from_slice(&(GgufValueType::Int32 as u32).to_le_bytes());
+        bytes.extend_from_slice(&(values.len() as u64).to_le_bytes());
+        for v in values {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn make_kv_string_array(key: &str, values: &[&str]) -> Vec<u8> {
+        let mut bytes = make_string_bytes(key);
+        bytes.extend_from_slice(&(GgufValueType::Array as u32).to_le_bytes());
+        bytes.extend_from_slice(&(GgufValueType::String as u32).to_le_bytes());
+        bytes.extend_from_slice(&(values.len() as u64).to_le_bytes());
+        for v in values {
+            bytes.extend_from_slice(&make_string_bytes(v));
+        }
         bytes
     }
 
@@ -550,5 +767,140 @@ mod tests {
         let (store, _) = MetadataStore::parse(&bytes, 0, 1)
             .expect("nesting exactly at the configured maximum should still parse");
         assert_eq!(store.len(), 1);
+    }
+
+    /// Reproduces the exact `sign_values` prefix from the real Bonsai 2 27B
+    /// `prism.hadamard.sign_values` metadata array (`[-1,-1,-1,1,-1,1]`, per
+    /// `core-gguf-08`'s evidence), plus a companion string array and every
+    /// small-integer scalar type that previously had no accessor at all
+    /// (`Uint8`/`Int8`/`Uint16`/`Int16`). Every value must read back with
+    /// the correct sign, not just a plausible-looking one.
+    #[test]
+    fn reads_i32_array_string_array_and_small_int_scalars_with_correct_sign() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&make_kv_i32_array("sign_values", &[-1, -1, -1, 1, -1, 1]));
+        data.extend_from_slice(&make_kv_string_array("names", &["alpha", "beta"]));
+        data.extend_from_slice(&make_kv_scalar_u8("u8_val", 200));
+        data.extend_from_slice(&make_kv_scalar_i8("i8_val", -100));
+        data.extend_from_slice(&make_kv_scalar_u16("u16_val", 60_000));
+        data.extend_from_slice(&make_kv_scalar_i16("i16_val", -30_000));
+
+        let (store, _) =
+            MetadataStore::parse(&data, 0, 6).expect("well-formed metadata block should parse");
+        assert_eq!(store.len(), 6);
+
+        assert_eq!(
+            store
+                .get_i32_array("sign_values")
+                .expect("sign_values should read as an i32 array"),
+            vec![-1, -1, -1, 1, -1, 1]
+        );
+        assert_eq!(
+            store
+                .get_string_array("names")
+                .expect("names should read as a string array"),
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+
+        // Small-integer scalars: as_u32/as_u64/as_f32/as_f64 widened,
+        // as_i32/as_i64 preserve sign.
+        let u8_val = store.get("u8_val").expect("u8_val should exist");
+        assert_eq!(u8_val.as_u32(), Some(200));
+        assert_eq!(u8_val.as_i32(), Some(200));
+        assert_eq!(u8_val.as_f32(), Some(200.0));
+        assert_eq!(u8_val.as_f64(), Some(200.0));
+
+        let i8_val = store.get("i8_val").expect("i8_val should exist");
+        assert_eq!(i8_val.as_i32(), Some(-100), "sign must be preserved");
+        assert_eq!(i8_val.as_i64(), Some(-100), "sign must be preserved");
+        assert_eq!(
+            i8_val.as_u32(),
+            None,
+            "a negative value must not silently reinterpret as a large u32"
+        );
+        assert_eq!(i8_val.as_f32(), Some(-100.0));
+
+        let u16_val = store.get("u16_val").expect("u16_val should exist");
+        assert_eq!(u16_val.as_u32(), Some(60_000));
+        assert_eq!(u16_val.as_i32(), Some(60_000));
+
+        let i16_val = store.get("i16_val").expect("i16_val should exist");
+        assert_eq!(i16_val.as_i32(), Some(-30_000), "sign must be preserved");
+        assert_eq!(
+            i16_val.as_u32(),
+            None,
+            "a negative value must not silently reinterpret as a large u32"
+        );
+        assert_eq!(i16_val.as_u64(), None);
+        assert_eq!(i16_val.as_f64(), Some(-30_000.0));
+    }
+
+    /// Type-mismatch errors from the array/bool accessors must name both
+    /// the offending key and the value's actual GGUF type, never just
+    /// "wrong type".
+    #[test]
+    fn get_array_accessors_name_the_key_and_actual_type_on_mismatch() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&make_kv_i32_array("ints", &[1, 2, 3]));
+        data.extend_from_slice(&make_kv_string_array("strings", &["a"]));
+        data.extend_from_slice(&make_kv_u32("scalar", 7));
+        let (store, _) = MetadataStore::parse(&data, 0, 3).expect("metadata block should parse");
+
+        match store.get_array("missing") {
+            Err(BonsaiError::MissingConfigKey { key }) => assert_eq!(key, "missing"),
+            other => panic!("expected MissingConfigKey, got: {other:?}"),
+        }
+
+        match store.get_array("scalar") {
+            Err(BonsaiError::InvalidMetadata { key, reason }) => {
+                assert_eq!(key, "scalar");
+                assert!(reason.contains("Uint32"), "reason: {reason}");
+            }
+            other => panic!("expected InvalidMetadata, got: {other:?}"),
+        }
+
+        match store.get_string_array("ints") {
+            Err(BonsaiError::InvalidMetadata { key, reason }) => {
+                assert_eq!(key, "ints");
+                assert!(reason.contains("Int32"), "reason: {reason}");
+            }
+            other => panic!("expected InvalidMetadata, got: {other:?}"),
+        }
+
+        match store.get_i32_array("strings") {
+            Err(BonsaiError::InvalidMetadata { key, reason }) => {
+                assert_eq!(key, "strings");
+                assert!(reason.contains("String"), "reason: {reason}");
+            }
+            other => panic!("expected InvalidMetadata, got: {other:?}"),
+        }
+
+        match store.get_bool("scalar") {
+            Err(BonsaiError::InvalidMetadata { key, reason }) => {
+                assert_eq!(key, "scalar");
+                assert!(reason.contains("Uint32"), "reason: {reason}");
+            }
+            other => panic!("expected InvalidMetadata, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_bool_reads_true_and_false() {
+        let mut kv_true = make_string_bytes("flag_true");
+        kv_true.extend_from_slice(&(GgufValueType::Bool as u32).to_le_bytes());
+        kv_true.push(1);
+        let mut kv_false = make_string_bytes("flag_false");
+        kv_false.extend_from_slice(&(GgufValueType::Bool as u32).to_le_bytes());
+        kv_false.push(0);
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&kv_true);
+        data.extend_from_slice(&kv_false);
+
+        let (store, _) = MetadataStore::parse(&data, 0, 2).expect("metadata block should parse");
+        assert!(store.get_bool("flag_true").expect("flag_true should read"));
+        assert!(!store
+            .get_bool("flag_false")
+            .expect("flag_false should read"));
     }
 }

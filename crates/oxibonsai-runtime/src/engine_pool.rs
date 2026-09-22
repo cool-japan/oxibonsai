@@ -100,8 +100,47 @@ impl EnginePool {
     }
 
     /// Number of replicas in the pool.
+    ///
+    /// This is the *effective* capacity after any tier clamp — on the GPU
+    /// tier it is always `1`, whatever was requested (see
+    /// [`resolve_pool_size`]).
     pub fn size(&self) -> usize {
         self.size
+    }
+
+    /// Number of replicas currently idle (not leased out).
+    ///
+    /// A cheap gauge for `/admin/status` and the queue-depth metric; returns
+    /// `0` if the idle mutex is poisoned rather than propagating an error,
+    /// because a gauge must never fail a request.
+    pub fn idle_count(&self) -> usize {
+        self.idle.lock().map(|idle| idle.len()).unwrap_or(0)
+    }
+
+    /// The number of requests that may usefully be admitted at once.
+    ///
+    /// `perf-M1`: the server admits `--max-concurrent-requests` (default 32)
+    /// while the pool may hold a *single* replica — on the GPU tier it always
+    /// does, because decode funnels through a process-global singleton. The
+    /// surplus requests do not fail fast; they queue invisibly behind one
+    /// engine on `acquire()` and then time out, which measures as flat
+    /// throughput plus a timing-out tail (1 request 1.40 s; 4 concurrent
+    /// 1.44/2.76/4.12/5.39 s).
+    ///
+    /// An admission controller should derive its limit from this rather than
+    /// from a standalone configuration default, and shed beyond it with
+    /// `503` + `Retry-After` instead of accepting work it cannot start.
+    /// `queue_depth_per_replica` is how many *waiting* requests per replica
+    /// the operator is willing to hold: `0` admits only what can run
+    /// immediately, `1` (a reasonable default) keeps one warm request behind
+    /// each replica so a replica never idles between requests.
+    ///
+    /// Saturating arithmetic: a hostile `queue_depth_per_replica` cannot
+    /// overflow the limit into a small number.
+    pub fn admission_limit(&self, queue_depth_per_replica: usize) -> usize {
+        self.size
+            .saturating_mul(queue_depth_per_replica.saturating_add(1))
+            .max(1)
     }
 
     /// Attach a shared [`crate::metrics::InferenceMetrics`] to every replica in the pool.
@@ -207,7 +246,16 @@ impl Drop for EngineLease {
         // SAFETY: `ManuallyDrop::take` is called exactly once, here in `Drop`;
         // `self.engine` is never accessed afterwards (the struct is being
         // destroyed), so no double-take or use-after-take can occur.
-        let engine = unsafe { ManuallyDrop::take(&mut self.engine) };
+        let mut engine = unsafe { ManuallyDrop::take(&mut self.engine) };
+
+        // `SV-09`: a cancellation token is scoped to the request that armed
+        // it. Drop it here, on the replica's way back into the pool, so a
+        // request that was cancelled (or timed out) cannot leave a latched
+        // flag that instantly cancels whichever request is served next by
+        // this replica. This is also why `InferenceEngine::reset` does not
+        // clear it: `run_blocking_generation` resets *before* the closure
+        // runs, so clearing there would disarm the request's own token.
+        engine.clear_cancellation_token();
 
         // Return the engine to the pool. We deliberately do NOT run a heavy
         // reset here: every `generate*` entry point resets the model KV cache
@@ -259,16 +307,72 @@ pub fn default_cpu_pool_size() -> usize {
 /// only exists when one of them is compiled in; non-GPU builds always take the
 /// CPU branch.
 pub fn resolve_pool_size(requested: Option<usize>, tier: oxibonsai_kernels::KernelTier) -> usize {
+    resolve_pool_sizing(requested, tier).effective
+}
+
+/// How a pool was sized, including whether a tier clamp overrode the request.
+///
+/// `perf-M1`: the clamp is invisible in `resolve_pool_size`'s `usize`, so a
+/// server cannot tell "the operator asked for 8 and got 8" from "the operator
+/// asked for 8 and the GPU singleton forced 1" — and it is exactly that
+/// difference an admission limit and `/admin/status` must report. Returned by
+/// [`resolve_pool_sizing`] and carried alongside the pool by
+/// [`build_pool_from_gguf`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolSizing {
+    /// What the caller asked for (`None` = "use the default").
+    pub requested: Option<usize>,
+    /// What the pool will actually hold.
+    pub effective: usize,
+    /// Whether `effective` is below `requested` because of the GPU-tier
+    /// clamp.
+    pub clamped_by_gpu_tier: bool,
+}
+
+impl PoolSizing {
+    /// One-line, operator-facing explanation of the effective size.
+    pub fn reason(&self) -> String {
+        if self.clamped_by_gpu_tier {
+            format!(
+                "pool size {} (requested {}, clamped to 1 on the GPU tier: decode funnels through a process-global graph)",
+                self.effective,
+                self.requested.unwrap_or(self.effective)
+            )
+        } else {
+            match self.requested {
+                Some(r) => format!("pool size {} (requested {r})", self.effective),
+                None => format!("pool size {} (host default)", self.effective),
+            }
+        }
+    }
+}
+
+/// Resolve the effective pool size *and* why it came out that way.
+///
+/// The data behind [`resolve_pool_size`]; see [`PoolSizing`]. Pure and
+/// unit-testable, with the same clamp semantics.
+pub fn resolve_pool_sizing(
+    requested: Option<usize>,
+    tier: oxibonsai_kernels::KernelTier,
+) -> PoolSizing {
     #[cfg(any(feature = "metal", feature = "native-cuda"))]
     {
         if tier == oxibonsai_kernels::KernelTier::Gpu {
-            return 1;
+            return PoolSizing {
+                requested,
+                effective: 1,
+                clamped_by_gpu_tier: requested.is_some_and(|r| r > 1),
+            };
         }
     }
     // Silence the unused-variable lint on non-GPU builds where `tier` is not
     // inspected.
     let _ = tier;
-    requested.unwrap_or_else(default_cpu_pool_size).max(1)
+    PoolSizing {
+        requested,
+        effective: requested.unwrap_or_else(default_cpu_pool_size).max(1),
+        clamped_by_gpu_tier: false,
+    }
 }
 
 /// Build an [`EnginePool`] from a GGUF file, sizing it for the detected tier.
@@ -305,18 +409,21 @@ pub fn build_pool_from_gguf(
         InferenceEngine::from_gguf_path_leaked(path, sampling_params.clone(), seed, max_seq_len)?;
 
     let tier = first.kernel_tier();
-    let size = resolve_pool_size(requested_size, tier);
+    let sizing = resolve_pool_sizing(requested_size, tier);
+    let size = sizing.effective;
 
-    if requested_size.map(|r| r > size).unwrap_or(false) {
-        tracing::info!(
-            requested = requested_size.unwrap_or(0),
-            effective = size,
-            tier = %tier,
-            "engine pool size clamped to 1 on the GPU tier (process-global GPU singleton)"
-        );
-    } else {
-        tracing::info!(size, tier = %tier, "engine pool built");
-    }
+    // The effective size is what an admission controller must budget against
+    // (`perf-M1`): admitting 32 requests into a 1-replica pool queues them
+    // invisibly on `acquire()` until they time out. `EnginePool::size` and
+    // `EnginePool::admission_limit` expose it after construction; this line
+    // explains it once at startup.
+    tracing::info!(
+        tier = %tier,
+        effective = size,
+        clamped = sizing.clamped_by_gpu_tier,
+        "{}",
+        sizing.reason()
+    );
 
     // Extract replica #1's shared token-embedding table (a cheap refcount-bumped
     // `Arc<[f32]>` handle, not a copy). Replicas 2..size clone this same `Arc`
@@ -789,5 +896,111 @@ mod tests {
             size + 1,
             "expected {size} replicas + the local handle to alias one allocation"
         );
+    }
+
+    // ── perf-M1: the real capacity must be visible to admission control ──
+
+    #[test]
+    fn admission_limit_is_derived_from_the_effective_pool_size() {
+        let pool = EnginePool::new(vec![tiny_engine(), tiny_engine()]);
+        assert_eq!(pool.size(), 2);
+        // No queueing: admit only what can start immediately.
+        assert_eq!(pool.admission_limit(0), 2);
+        // One warm request per replica.
+        assert_eq!(pool.admission_limit(1), 4);
+        // A hostile depth must saturate, not wrap to a small limit.
+        assert!(pool.admission_limit(usize::MAX) >= 2);
+    }
+
+    #[test]
+    fn admission_limit_is_never_zero() {
+        let pool = EnginePool::new(vec![tiny_engine()]);
+        assert_eq!(pool.admission_limit(0), 1);
+    }
+
+    /// `SV-09` lifecycle: a request's cancellation token must not survive
+    /// the lease that armed it. Without this, a replica that served one
+    /// cancelled (or timed-out) request would instantly cancel the next
+    /// request it is handed — a one-request outage per timeout.
+    #[tokio::test]
+    async fn a_cancelled_request_does_not_poison_the_next_lease() {
+        let pool = EnginePool::new(vec![tiny_engine()]);
+
+        let token = {
+            let mut lease = pool.acquire().await.expect("acquire");
+            // The server's shape: reset (as `run_blocking_generation` does),
+            // then arm, then generate.
+            lease.reset();
+            let token = lease.arm_cancellation();
+            token.cancel();
+            assert!(lease.is_cancelled());
+            token
+        };
+        // The token itself stays cancelled for whoever still holds it ...
+        assert!(token.is_cancelled());
+
+        // ... but the replica handed to the next request is not armed at all.
+        let next = pool.acquire().await.expect("re-acquire");
+        assert!(
+            next.cancellation_token().is_none(),
+            "the returned replica must carry no token from the previous request"
+        );
+        assert!(!next.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn idle_count_tracks_outstanding_leases() {
+        let pool = EnginePool::new(vec![tiny_engine(), tiny_engine()]);
+        assert_eq!(pool.idle_count(), 2);
+        let lease = pool.acquire().await.expect("acquire");
+        assert_eq!(pool.idle_count(), 1);
+        drop(lease);
+        assert_eq!(pool.idle_count(), 2);
+    }
+
+    #[test]
+    fn pool_sizing_reports_the_host_default_when_nothing_was_requested() {
+        let sizing = resolve_pool_sizing(None, oxibonsai_kernels::KernelTier::Reference);
+        assert_eq!(sizing.effective, default_cpu_pool_size());
+        assert_eq!(sizing.requested, None);
+        assert!(!sizing.clamped_by_gpu_tier);
+        assert!(
+            sizing.reason().contains("host default"),
+            "{}",
+            sizing.reason()
+        );
+    }
+
+    #[test]
+    fn pool_sizing_reports_an_honoured_request_on_a_cpu_tier() {
+        let sizing = resolve_pool_sizing(Some(3), oxibonsai_kernels::KernelTier::Reference);
+        assert_eq!(sizing.effective, 3);
+        assert!(!sizing.clamped_by_gpu_tier);
+        assert_eq!(
+            sizing.effective,
+            resolve_pool_size(Some(3), oxibonsai_kernels::KernelTier::Reference)
+        );
+    }
+
+    #[cfg(any(feature = "metal", feature = "native-cuda"))]
+    #[test]
+    fn pool_sizing_records_the_gpu_clamp_instead_of_hiding_it() {
+        let sizing = resolve_pool_sizing(Some(8), oxibonsai_kernels::KernelTier::Gpu);
+        assert_eq!(
+            sizing.effective, 1,
+            "the GPU clamp stays a correctness rule"
+        );
+        assert!(
+            sizing.clamped_by_gpu_tier,
+            "a server must be able to tell a clamp from an honoured request"
+        );
+        let reason = sizing.reason();
+        assert!(reason.contains("requested 8"), "{reason}");
+        assert!(reason.contains("GPU tier"), "{reason}");
+
+        // An unspecified request that lands on 1 anyway is not a clamp.
+        let default_sizing = resolve_pool_sizing(None, oxibonsai_kernels::KernelTier::Gpu);
+        assert_eq!(default_sizing.effective, 1);
+        assert!(!default_sizing.clamped_by_gpu_tier);
     }
 }

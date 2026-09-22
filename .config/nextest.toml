@@ -1,21 +1,68 @@
 # cargo-nextest configuration for OxiBonsai CI.
 #
 # See https://nexte.st/docs/configuration/ for the full reference.
+#
+# T-13: the previous 60s/90s slow-timeout margins were tuned against this
+# dev machine (Apple M3) and left near-zero headroom for anything slower —
+# a loaded CI runner, an older laptop, or a debug (unoptimized) build of the
+# heavier model/kernel parity tests, all of which run measurably slower than
+# release-profile SIMD on an M3. `terminate-after` is raised alongside
+# `period` so the effective hang ceiling (period * terminate-after) grows
+# too, not just the per-check interval.
+
+# FIX3-PARITY / D-6(4) (wave-3.5): `legacy_parity_tests` (oxibonsai-model and
+# oxibonsai-runtime) are no longer `#[ignore]`d and each loads one or more
+# multi-GB real GGUFs from ./models — running more than one of these bodies
+# concurrently would multiply peak RSS and contend for the same mmap'd
+# files, and a 120s/180s default slow-timeout is far too short for a cold
+# multi-GB load + full greedy decode. `real-model-gate` below pins these
+# binaries to a single thread (never run alongside each other) and the
+# per-profile overrides give them their own, much longer slow-timeout
+# instead of inheriting the profile default.
+[test-groups]
+real-model-gate = { max-threads = 1 }
 
 [profile.default]
 retries = 0
 fail-fast = false
-# Most unit/integration tests finish in well under this; the CUDA-gated
-# tests self-skip immediately when no GPU is present (see
-# .github/workflows/ci.yml), so a hang here means a genuine deadlock/livelock
-# rather than expected long-running work.
-slow-timeout = { period = "60s", terminate-after = 2 }
+# Effective hang ceiling: 120s * 3 = 360s. A test that is merely slow (not
+# deadlocked) on a weaker machine should clear this; a genuine
+# deadlock/livelock still gets terminated rather than hanging the run
+# forever.
+slow-timeout = { period = "120s", terminate-after = 3 }
+
+[[profile.default.overrides]]
+filter = 'binary(legacy_parity_tests)'
+test-group = 'real-model-gate'
+slow-timeout = { period = "600s", terminate-after = 4 }
 
 [profile.ci]
 retries = 0
 fail-fast = false
-slow-timeout = { period = "90s", terminate-after = 2 }
+# CI runners are frequently shared/throttled and slower than local dev
+# hardware, and this profile also covers `--all-features` runs that pull in
+# the (self-skipping today, but not forever — see T-05) hardware-gated
+# suites. Effective hang ceiling: 180s * 4 = 720s.
+slow-timeout = { period = "180s", terminate-after = 4 }
 failure-output = "immediate-final"
 success-output = "never"
 status-level = "fail"
 final-status-level = "flaky"
+
+[[profile.ci.overrides]]
+filter = 'binary(legacy_parity_tests)'
+test-group = 'real-model-gate'
+slow-timeout = { period = "600s", terminate-after = 4 }
+
+[profile.fast]
+# For the inner dev loop: run a narrow `-E` filter while iterating on one
+# module and get feedback (including a stuck test) as quickly as possible.
+# Not used by scripts/ci.sh or scripts/release-gate.sh — those always use
+# `default`/`ci` so a real hang cannot be masked by a short fast-profile
+# timeout in the gate that is supposed to catch it.
+retries = 0
+fail-fast = true
+slow-timeout = { period = "20s", terminate-after = 2 }
+failure-output = "immediate"
+success-output = "never"
+status-level = "fail"

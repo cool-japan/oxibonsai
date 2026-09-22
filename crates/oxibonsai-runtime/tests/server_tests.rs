@@ -2,6 +2,11 @@
 //!
 //! Uses axum test utilities to verify HTTP endpoints.
 
+// The `server` module is only compiled with the `server` feature, so this
+// integration test must be gated the same way to keep `--no-default-features`
+// green.
+#![cfg(feature = "server")]
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use std::sync::Arc;
@@ -245,9 +250,12 @@ async fn multi_turn_conversation_via_api() {
 
 #[tokio::test]
 async fn default_max_tokens_applied() {
-    // Verify that omitting max_tokens in JSON results in the default (256)
-    // by deserializing the request body directly, rather than generating
-    // 256 tokens which would be too slow.
+    // SV-15(c) gate-fix triage (wave 3): `max_tokens` is `Option<usize>`
+    // now, so an omitted value deserializes to `None` -- the configured
+    // default (256) is overlaid later, when resolving the effective
+    // completion-length budget, not at deserialization time. Verify that
+    // seam directly (by deserializing the request body), rather than
+    // generating 256 tokens which would be too slow.
     let raw = serde_json::json!({
         "messages": [
             {"role": "user", "content": "Hello"}
@@ -255,7 +263,15 @@ async fn default_max_tokens_applied() {
     });
     let parsed: oxibonsai_runtime::server::ChatCompletionRequest =
         serde_json::from_value(raw).expect("deserialize request");
-    assert_eq!(parsed.max_tokens, 256, "default max_tokens should be 256");
+    assert_eq!(
+        parsed.max_tokens, None,
+        "an omitted max_tokens must deserialize to None, not a baked-in default"
+    );
+    assert_eq!(
+        oxibonsai_runtime::server::default_max_tokens_value(),
+        256,
+        "the configured default that is overlaid onto a None max_tokens"
+    );
 
     // Also verify the endpoint still works with an explicit small max_tokens
     let app = test_router();
@@ -293,14 +309,15 @@ async fn default_temperature_applied() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
-#[test]
-fn create_router_without_tokenizer() {
-    let config = Qwen3Config::tiny_test();
-    let params = SamplingParams::default();
-    let engine = InferenceEngine::new(config, params, 42);
-    let _router = create_router(engine, None);
-    // Should not panic
-}
+// T-09: `create_router_without_tokenizer` used to build a router (with a
+// `None` tokenizer, exactly `test_router()`'s own construction above) and
+// assert nothing beyond "did not panic". Deleted rather than given a
+// contrived new assertion: `test_router()` (used by `health_returns_200`
+// immediately below and by most of this file) already builds a router this
+// same way and drives a *real* request through it, which is strictly
+// stronger evidence that "no-tokenizer" router construction actually
+// works — the deleted test asserted a proper subset of what already-passing
+// coverage proves elsewhere in this file.
 
 // ══════════════════════════════════════════════════════════════
 // Prometheus /metrics endpoint
@@ -433,20 +450,16 @@ async fn metrics_endpoint_shows_incremented_counter_after_request() {
     );
 }
 
-// ══════════════════════════════════════════════════════════════
-// create_router delegates to create_router_with_metrics
-// ══════════════════════════════════════════════════════════════
-
-#[test]
-fn create_router_delegates_to_metrics_variant() {
-    // create_router must wire up the /metrics route (it calls
-    // create_router_with_metrics internally).
-    let config = Qwen3Config::tiny_test();
-    let params = SamplingParams::default();
-    let engine = InferenceEngine::new(config, params, 42);
-    let _router = create_router(engine, None);
-    // Construction alone verifies the delegation — no panic = success.
-}
+// T-09: `create_router_delegates_to_metrics_variant` used to build a
+// `create_router(...)` router and assert nothing beyond "did not panic" —
+// its own comment already named the real invariant
+// ("create_router must wire up the /metrics route") without checking it.
+// Deleted rather than given a contrived new assertion:
+// `metrics_endpoint_returns_prometheus_format` above (also built on plain
+// `create_router` via `test_router()`) already drives a real `GET
+// /metrics` request and asserts the Prometheus body shape, which *is* the
+// delegation proof this test's comment promised but its body never
+// performed.
 
 // ══════════════════════════════════════════════════════════════
 // Temperature is honored by the base /v1/chat/completions endpoint

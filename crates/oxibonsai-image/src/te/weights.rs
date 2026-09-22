@@ -1,9 +1,10 @@
 //! Weight registry for the Pure-Rust Qwen3-4B text encoder.
 //!
-//! Weights are loaded from the per-tensor `.npy` files exported by
-//! `/tmp/bonsai_te_export_weights.py` (the dequantised f32 of every 4-bit
-//! mlx-packed-affine linear, plus the bf16 RMSNorm vectors), in row-major
-//! C-order. Each tensor is read on demand by its dotted name and cached.
+//! Weights are loaded from the per-tensor `.npy` files exported by the
+//! project's `bonsai_te_export_weights.py` export script (the dequantised f32
+//! of every 4-bit mlx-packed-affine linear, plus the bf16 RMSNorm vectors), in
+//! row-major C-order. Each tensor is read on demand by its dotted name and
+//! cached.
 //!
 //! Naming (mirrors the export script):
 //! - `embed_tokens`                        `[vocab, hidden]`
@@ -73,9 +74,14 @@ pub struct TeWeights {
     /// When set, the [`Source::Mlx4bit`] path also caches its dequantised f32
     /// tensors (like the `.npy` path always does), trading RAM for speed so a
     /// long-lived registry pays the dequant cost once instead of once per
-    /// forward. Default off: the one-shot CLI keeps its ~2.5 GB low-RAM
-    /// profile; [`crate::session::ImageSession`] flips it on to keep the
-    /// ~16 GB of f32 encoder weights resident across REPL prompts.
+    /// forward. Default off at construction ([`Self::open_mlx_4bit`]): the
+    /// one-shot CLI keeps its ~2.5 GB low-RAM profile.
+    /// [`crate::session::ImageSession`] is source-aware about this: it stays
+    /// **transient** by default for this (`Mlx4bit`) source, opting in via
+    /// `OXI_TE_RESIDENT=1` / `with_te_resident(true)` on a high-memory
+    /// machine, while a [`Source::NpyDir`] session defaults resident (that
+    /// source ignores this flag and is inherently resident once read
+    /// regardless) — see that type's module docs for the full table.
     resident: Cell<bool>,
 }
 
@@ -87,7 +93,10 @@ impl TeWeights {
     /// `weights_manifest.json` is present its scalar fields are honoured.
     ///
     /// # Errors
-    /// [`TeError::Io`] if the directory cannot be inspected.
+    /// [`TeError::Io`] if the directory cannot be inspected, or if a present
+    /// `weights_manifest.json` is not valid JSON (a malformed manifest is a
+    /// real misconfiguration and must not be silently swallowed into
+    /// possibly-wrong defaults — see [`TeConfig::from_manifest_dir`]).
     pub fn open(dir: &Path) -> TeResult<Self> {
         if !dir.is_dir() {
             return Err(TeError::Io {
@@ -98,7 +107,12 @@ impl TeWeights {
                 ),
             });
         }
-        let config = TeConfig::from_manifest_dir(dir).unwrap_or_default();
+        let config = TeConfig::from_manifest_dir(dir)
+            .map_err(|e| TeError::Io {
+                path: dir.join("weights_manifest.json").display().to_string(),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()),
+            })?
+            .unwrap_or_default();
         Ok(Self {
             source: Source::NpyDir(dir.to_path_buf()),
             config,
@@ -144,14 +158,40 @@ impl TeWeights {
         self.resident.get()
     }
 
+    /// Whether [`Self::get`] currently caches every tensor it loads for this
+    /// registry, i.e. whether a warm-up pass (touch every tensor once) would
+    /// actually benefit a later real read.
+    ///
+    /// This is **not** the same question as [`Self::is_resident`]:
+    /// - `Source::NpyDir` always caches (see [`Self::get`]'s doc),
+    ///   regardless of the `resident` flag — that flag only ever changes the
+    ///   `Mlx4bit` source's behaviour. So a `NpyDir` registry caches tensors
+    ///   even while [`Self::is_resident`] reports `false` (its default), and
+    ///   a caller deciding whether to warm this registry must check this
+    ///   method, not [`Self::is_resident`] alone (see
+    ///   [`crate::session::ImageSession::warm`], which regressed on exactly
+    ///   this distinction before this method existed).
+    /// - `Source::Mlx4bit` caches only when [`Self::is_resident`] is `true`;
+    ///   otherwise [`Self::get`] deliberately re-dequantises on every call
+    ///   and a warm-up pass would just waste time with nothing kept.
+    pub fn caches_tensors(&self) -> bool {
+        matches!(self.source, Source::NpyDir(_)) || self.resident.get()
+    }
+
     /// Keep dequantised f32 weights resident across forwards.
     ///
-    /// Off by default. The `.npy` source already caches every tensor; this only
-    /// changes the `Mlx4bit` source path, which otherwise re-dequantises each
-    /// weight on every [`Self::get`] (the deliberate low-RAM policy). Turning it
-    /// on holds the full f32 encoder (~16 GB) resident so repeated forwards skip
-    /// the dequant. Intended for a long-lived [`crate::session::ImageSession`] on
-    /// a high-memory machine, not the one-shot CLI.
+    /// Off by default at construction. The `.npy` source already caches every
+    /// tensor; this only changes the `Mlx4bit` source path, which otherwise
+    /// re-dequantises each weight on every [`Self::get`] (the deliberate
+    /// low-RAM policy). Turning it on holds the full f32 encoder (~16 GB)
+    /// resident so repeated forwards skip the dequant.
+    /// [`crate::session::ImageSession`] leaves this **off** by default for a
+    /// `Source::Mlx4bit` session (opt in via `OXI_TE_RESIDENT=1` /
+    /// `with_te_resident(true)` on a high-memory machine) — a
+    /// `Source::NpyDir` session is resident regardless, since that source
+    /// ignores this flag — see that type's module docs for the full table.
+    /// The one-shot CLI path never calls this at all and keeps the low-RAM
+    /// behaviour.
     pub fn set_resident(&self, on: bool) {
         self.resident.set(on);
         if !on {
@@ -378,7 +418,7 @@ pub fn read_npy_f32(path: &Path) -> TeResult<Tensor> {
         .collect::<Result<_, _>>()?;
     let data_start = header_start + header_len;
     let payload = &bytes[data_start..];
-    if payload.len() % 4 != 0 {
+    if !payload.len().is_multiple_of(4) {
         return Err(npy("payload not f32-aligned".to_string()));
     }
     let numel: usize = shape.iter().product();
@@ -422,4 +462,110 @@ fn fortran_to_c(src: &[f32], shape: &[usize]) -> Vec<f32> {
         *slot = src[f_off];
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression guard for RAG-EVAL-IMG-27's fix: `TeWeights::open` used to
+    /// swallow *any* `weights_manifest.json` problem via
+    /// `.unwrap_or_default()`, so a present-but-malformed manifest silently
+    /// fell back to the Qwen3-4B defaults instead of surfacing an error. It
+    /// must now propagate a real error.
+    #[test]
+    fn open_surfaces_a_malformed_manifest_as_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("weights_manifest.json"), b"{ not json")
+            .expect("write malformed manifest");
+        // `TeWeights` does not derive `Debug` (it holds a `Mlx4bitModel`), so
+        // match explicitly rather than using `expect_err`.
+        match TeWeights::open(dir.path()) {
+            Err(TeError::Io { .. }) => {}
+            Err(other) => {
+                panic!("expected TeError::Io wrapping the manifest parse failure, got: {other}")
+            }
+            Ok(_) => panic!("a malformed weights_manifest.json must fail Self::open"),
+        }
+    }
+
+    /// Companion: a directory with **no** manifest at all must still open
+    /// successfully with the Qwen3-4B defaults (the common case).
+    #[test]
+    fn open_succeeds_with_defaults_when_no_manifest_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let weights = TeWeights::open(dir.path()).expect("open with no manifest");
+        assert_eq!(
+            weights.config().hidden_size,
+            TeConfig::default().hidden_size
+        );
+    }
+
+    /// Minimal valid `<f4` `.npy` writer for test fixtures (mirrors what
+    /// [`read_npy_f32`] parses; not full NumPy-format-compliant — no 64-byte
+    /// header alignment — but this reader does not require that).
+    fn write_tiny_f32_npy(path: &Path, data: &[f32], shape: &[usize]) {
+        let shape_str = shape
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut header =
+            format!("{{'descr': '<f4', 'fortran_order': False, 'shape': ({shape_str},), }}")
+                .into_bytes();
+        header.push(b'\n');
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"\x93NUMPY");
+        bytes.push(1); // major version
+        bytes.push(0); // minor version
+        bytes.extend_from_slice(&(header.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&header);
+        for v in data {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        std::fs::write(path, bytes).expect("write tiny npy fixture");
+    }
+
+    /// Regression/characterization test for the exact mechanism
+    /// `ImageSession::render`'s one-shot path (`free_te_after_render`, set
+    /// via `ImageSession::one_shot`) depends on: [`TeWeights::set_resident`]`(false)`
+    /// must actually empty whatever is cached *right now*, not just flip a
+    /// flag for future reads. `ImageSession::one_shot`/`with_te_resident`
+    /// have no caller in this repo yet (the natural caller is the
+    /// `oxibonsai repl` front-end, owned by a different package), so this
+    /// exercises the shared, source-agnostic cache-clearing behaviour
+    /// directly at the `TeWeights` level instead — `set_resident`'s clearing
+    /// does not branch on `Source`, so the `NpyDir` path used here runs the
+    /// identical code a one-shot `Mlx4bit` session's `render()` call does.
+    #[test]
+    fn set_resident_false_frees_whatever_is_currently_cached() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_tiny_f32_npy(&dir.path().join("probe.npy"), &[1.0, 2.0], &[2]);
+        let weights = TeWeights::open(dir.path()).expect("open");
+
+        assert!(
+            !weights.is_resident(),
+            "NpyDir starts non-resident by default"
+        );
+        let _ = weights.get("probe").expect("get probe");
+        assert_eq!(
+            weights.cache.borrow().len(),
+            1,
+            "get() must have cached the tensor regardless of the resident flag"
+        );
+
+        // The exact call `ImageSession::render` makes when
+        // `free_te_after_render` is set: it must empty the cache right now.
+        weights.set_resident(false);
+        assert!(
+            weights.cache.borrow().is_empty(),
+            "set_resident(false) must free whatever was cached, not just \
+             flip a flag for future reads"
+        );
+
+        // Self-healing (documented on `Self::get`): the very next read
+        // re-populates the cache for `NpyDir`, independent of the flag.
+        let _ = weights.get("probe").expect("get probe again");
+        assert_eq!(weights.cache.borrow().len(), 1);
+    }
 }

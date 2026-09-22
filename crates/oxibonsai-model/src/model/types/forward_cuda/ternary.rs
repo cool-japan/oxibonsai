@@ -142,27 +142,19 @@ impl<'a> BonsaiModel<'a> {
         let max_seq_len = self.kv_cache.max_seq_len();
 
         let mut hidden_batch = vec![0.0f32; batch_size * h];
-        for (t, &token_id) in token_ids.iter().enumerate() {
-            let embd_start = token_id as usize * h;
-            let embd_end = embd_start + h;
-            if embd_end > self.token_embd.len() {
-                return Err(format!(
-                    "token_id {} out of range (vocab={})",
-                    token_id,
-                    self.token_embd.len() / h
-                )
-                .into());
-            }
-            hidden_batch[t * h..(t + 1) * h]
-                .copy_from_slice(&self.token_embd[embd_start..embd_end]);
-        }
+        // M-02: gather only the rows this batch references, decoding each
+        // straight out of the quantized table. The deleted dense
+        // `Index<Range<usize>>` hatch materialized the whole
+        // `vocab x hidden` FP32 table here (1.16 / 2.31 / 4.74 GiB for the
+        // 1.7B / 8B / 27B) on the first multi-token prompt.
+        self.token_embd.copy_rows(token_ids, &mut hidden_batch)?;
 
         let mut cos_table = vec![0.0f32; batch_size * half_dim];
         let mut sin_table = vec![0.0f32; batch_size * half_dim];
         for t in 0..batch_size {
             let pos = pos_start + t;
-            let cos_vals = self.rope.cos_at(pos);
-            let sin_vals = self.rope.sin_at(pos);
+            let cos_vals = self.rope.cos_at_checked(pos)?;
+            let sin_vals = self.rope.sin_at_checked(pos)?;
             cos_table[t * half_dim..(t + 1) * half_dim].copy_from_slice(cos_vals);
             sin_table[t * half_dim..(t + 1) * half_dim].copy_from_slice(sin_vals);
         }
@@ -257,19 +249,12 @@ impl<'a> BonsaiModel<'a> {
 
         let mut token_ids_out: Vec<u32> = Vec::with_capacity(batch_size);
         for (t, &tok_id) in token_ids.iter().enumerate().take(batch_size) {
-            let embd_start = tok_id as usize * h;
-            if embd_start + h > self.token_embd.len() {
-                return Err(format!(
-                    "token_id {} out of range (vocab={})",
-                    tok_id,
-                    self.token_embd.len() / h
-                )
-                .into());
-            }
-            let single_hidden = self.token_embd[embd_start..embd_start + h].to_vec();
+            // M-02: one row, decoded from the quantized table.
+            let mut single_hidden = vec![0.0f32; h];
+            self.token_embd.copy_row(tok_id, &mut single_hidden)?;
             let pos = pos_start + t;
-            let cos_single = self.rope.cos_at(pos);
-            let sin_single = self.rope.sin_at(pos);
+            let cos_single = self.rope.cos_at_checked(pos)?;
+            let sin_single = self.rope.sin_at_checked(pos)?;
 
             let mut greedy_id: u32 = 0;
             oxibonsai_kernels::try_cuda_prefill_ternary(

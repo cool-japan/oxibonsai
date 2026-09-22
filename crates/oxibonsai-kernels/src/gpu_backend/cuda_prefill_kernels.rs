@@ -7,7 +7,6 @@
 //! | `gemm_q1_g128_v7`                | Batch GEMM: 1 warp per weight row, all batch cols |
 //! | `gemm_q1_g128_v7_residual`       | GEMM + fused in-place residual add |
 //! | `fused_gate_up_swiglu_gemm_q1`   | Fused gate+up Q1 GEMM with SwiGLU epilogue |
-//! | `batched_swiglu`                 | Element-wise SiLU(gate)*up for batch_size vectors |
 //! | `batched_rmsnorm_v2`             | Per-token RMSNorm for batch_size tokens |
 //!
 //! # Layout convention
@@ -50,6 +49,63 @@ static __device__ __forceinline__ float fast_fp16_to_float(unsigned short h) {
 /* ── SiLU activation: x · σ(x) ─────────────────────────────────────────── */
 static __device__ __forceinline__ float silu(float x) {
     return x / (1.0f + expf(-x));
+}
+
+/* --- 16-byte-aligned quant-section loads (finding F10) -------------------
+   Exact twin of the pair in `cuda_kernels.rs` -- same names, same bodies, same
+   contract. The three TQ2 kernels below previously recomputed the quant offset
+   and issued `ld.global.nc.v4.u32` unguarded, which the decode-side kernels no
+   longer do; F10 asks for one form, not two.
+
+   `ld.global.nc.v4.u32` REQUIRES a 16-byte-aligned address; a misaligned one
+   raises CUDA_ERROR_MISALIGNED_ADDRESS, which kills the whole context.
+
+   In the SoA weight layout the quant section starts immediately after the FP16
+   scales, at byte `scales_bytes = total_blocks * 2`, and each TQ2_0_g128 block
+   occupies 32 bytes -- a whole number of 16-byte units. The buffer base is a
+   fresh `cuMemAlloc` (256-byte aligned, never a sub-slice), so alignment of
+   every quant load reduces to
+
+       scales_bytes % 16 == 0   <=>   total_blocks % 8 == 0.
+
+   `total_blocks` is whichever block count that kernel's own qs_offset is
+   derived from: `n_rows * blocks_per_row` for the two plain GEMMs, and
+   `2 * n_rows * blocks_per_row` for the fused gate+up kernel, whose scales
+   section covers both halves.
+
+   The predicate depends only on kernel arguments, so the branch is uniform
+   across the whole grid and costs no divergence;
+   `cuda_device_negotiation::soa_qs_vector_load_ok` is its host-side twin and is
+   unit-tested on every host.
+
+   NOTE for reviewers: `scripts/check_cuda.sh` removes every inline-PTX
+   statement before its tier-2 (clang++ `-fsyntax-only`) pass, so in that pass
+   the aligned branch of `soa_load4_u32` has an empty body and its four outputs
+   are left uninitialised. A clean tier-2 result therefore proves less than
+   usual for THIS helper; only a real `nvcc --cuda` (tier 1) pass, on a box with
+   the CUDA toolkit, validates the guarded vector load. */
+
+static __device__ __forceinline__ unsigned int soa_quant_aligned16(
+    unsigned long long total_blocks)
+{
+    return (((total_blocks * 2ull) & 15ull) == 0ull) ? 1u : 0u;
+}
+
+static __device__ __forceinline__ void soa_load4_u32(
+    const unsigned int* p,
+    unsigned int aligned16,
+    unsigned int &w0, unsigned int &w1, unsigned int &w2, unsigned int &w3)
+{
+    if (aligned16) {
+        asm("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(w0), "=r"(w1), "=r"(w2), "=r"(w3)
+            : "l"((unsigned long long)p));
+    } else {
+        w0 = __ldg(p + 0u);
+        w1 = __ldg(p + 1u);
+        w2 = __ldg(p + 2u);
+        w3 = __ldg(p + 3u);
+    }
 }
 
 /* =========================================================================
@@ -325,36 +381,7 @@ extern "C" __global__ void fused_gate_up_swiglu_gemm_q1(
 }
 
 /* =========================================================================
-   Kernel 4 — batched_swiglu
-   Element-wise SiLU(gate)*up for batch_size vectors at once.
-
-   Input layout:  gate_up[gid]              = gate element
-                  gate_up[gid + n*bs_f]     = up element
-   where n*bs_f = n * batch_size, and gid = blockIdx.x*256 + threadIdx.x
-   covers [0 .. n*batch_size).
-
-   Output: output[gid] = SiLU(gate_up[gid]) * gate_up[gid + n*batch_size]
-
-   Grid:  (ceil(n*batch_size/256), 1, 1)
-   Block: (256, 1, 1)
-   ========================================================================= */
-extern "C" __global__ void batched_swiglu(
-    const float* __restrict__ gate_up,
-    float*       __restrict__ output,
-    unsigned int n,
-    unsigned int batch_size
-) {
-    const unsigned long long total   = (unsigned long long)n * batch_size;
-    const unsigned long long gid     = (unsigned long long)blockIdx.x * 256u + threadIdx.x;
-    if (gid >= total) return;
-
-    const float gate_elem = gate_up[gid];
-    const float up_elem   = gate_up[gid + total];
-    output[gid] = silu(gate_elem) * up_elem;
-}
-
-/* =========================================================================
-   Kernel 5 — batched_rmsnorm_v2
+   Kernel 4 — batched_rmsnorm_v2
    Per-token RMSNorm for batch_size tokens simultaneously.
 
    Each block is responsible for one token (batch item).  All 256 threads
@@ -441,7 +468,7 @@ static __device__ __forceinline__ float pf_byte_dot_tq2(unsigned int bval, const
 }
 
 /* =========================================================================
-   Kernel 6 — gemm_tq2_g128_v7
+   Kernel 5 — gemm_tq2_g128_v7
    Batch TQ2_0_G128 GEMM (accumulates into output with +=).
 
    Weight layout (SoA):
@@ -469,7 +496,11 @@ extern "C" __global__ void gemm_tq2_g128_v7(
 
     const unsigned int blocks_per_row = k >> 7u;
     const unsigned long long total_blocks = (unsigned long long)n_rows * blocks_per_row;
-    const unsigned long long qs_offset   = total_blocks * 2u;
+    const unsigned long long qs_offset   = total_blocks * 2ull;
+    /* F10: both 128-bit vector loads below need a 16-byte-aligned address,
+       which holds iff qs_offset % 16 == 0 (block stride is 32 B, base is a
+       256-byte-aligned cuMemAlloc). */
+    const unsigned int aligned16 = soa_quant_aligned16(total_blocks);
     const unsigned short* __restrict__ scales = (const unsigned short* __restrict__)soa_raw;
 
     /* Process batch columns in 8-column outer chunks (cap-of-8 fix). */
@@ -488,12 +519,8 @@ extern "C" __global__ void gemm_tq2_g128_v7(
             const unsigned int* qs_ptr =
                 (const unsigned int*)(soa_raw + qs_offset + block_idx * 32u);
             unsigned int w0, w1, w2, w3, w4, w5, w6, w7;
-            asm("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(w0), "=r"(w1), "=r"(w2), "=r"(w3)
-                : "l"(qs_ptr));
-            asm("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(w4), "=r"(w5), "=r"(w6), "=r"(w7)
-                : "l"(qs_ptr + 4u));
+            soa_load4_u32(qs_ptr,      aligned16, w0, w1, w2, w3);
+            soa_load4_u32(qs_ptr + 4u, aligned16, w4, w5, w6, w7);
 
             const unsigned int base = b * 128u;
 
@@ -551,7 +578,7 @@ extern "C" __global__ void gemm_tq2_g128_v7(
 }
 
 /* =========================================================================
-   Kernel 7 — gemm_tq2_g128_v7_residual
+   Kernel 6 — gemm_tq2_g128_v7_residual
    Batch TQ2 GEMM + fused in-place residual add.
 
    For each (row, col): outputs[col*n_rows + row] = residual[col*n_rows + row] + sum
@@ -574,7 +601,11 @@ extern "C" __global__ void gemm_tq2_g128_v7_residual(
 
     const unsigned int blocks_per_row = k >> 7u;
     const unsigned long long total_blocks = (unsigned long long)n_rows * blocks_per_row;
-    const unsigned long long qs_offset   = total_blocks * 2u;
+    const unsigned long long qs_offset   = total_blocks * 2ull;
+    /* F10: both 128-bit vector loads below need a 16-byte-aligned address,
+       which holds iff qs_offset % 16 == 0 (block stride is 32 B, base is a
+       256-byte-aligned cuMemAlloc). */
+    const unsigned int aligned16 = soa_quant_aligned16(total_blocks);
     const unsigned short* __restrict__ scales = (const unsigned short* __restrict__)soa_raw;
 
     for (unsigned int col_base = 0u; col_base < batch_size; col_base += 8u) {
@@ -591,12 +622,8 @@ extern "C" __global__ void gemm_tq2_g128_v7_residual(
             const unsigned int* qs_ptr =
                 (const unsigned int*)(soa_raw + qs_offset + block_idx * 32u);
             unsigned int w0, w1, w2, w3, w4, w5, w6, w7;
-            asm("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(w0), "=r"(w1), "=r"(w2), "=r"(w3)
-                : "l"(qs_ptr));
-            asm("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(w4), "=r"(w5), "=r"(w6), "=r"(w7)
-                : "l"(qs_ptr + 4u));
+            soa_load4_u32(qs_ptr,      aligned16, w0, w1, w2, w3);
+            soa_load4_u32(qs_ptr + 4u, aligned16, w4, w5, w6, w7);
 
             const unsigned int base = b * 128u;
 
@@ -655,7 +682,7 @@ extern "C" __global__ void gemm_tq2_g128_v7_residual(
 }
 
 /* =========================================================================
-   Kernel 8 — fused_gate_up_swiglu_gemm_tq2
+   Kernel 7 — fused_gate_up_swiglu_gemm_tq2
    Batch fused gate+up TQ2 GEMM with SwiGLU epilogue for prefill.
 
    Weight layout (concatenated gate+up SoA, total_rows = 2*n_rows):
@@ -686,7 +713,11 @@ extern "C" __global__ void fused_gate_up_swiglu_gemm_tq2(
     const unsigned int blocks_per_row   = k >> 7u;
     const unsigned long long total_blocks_fused =
         (unsigned long long)total_rows_fused * blocks_per_row;
-    const unsigned long long qs_offset = total_blocks_fused * 2u;
+    const unsigned long long qs_offset = total_blocks_fused * 2ull;
+    /* F10: the four 128-bit vector loads below need a 16-byte-aligned address.
+       This kernel's qs_offset is derived from total_blocks_FUSED (the scales
+       section spans gate and up), so the guard must be too. */
+    const unsigned int aligned16 = soa_quant_aligned16(total_blocks_fused);
     const unsigned short* __restrict__ scales = (const unsigned short* __restrict__)soa_raw;
 
     for (unsigned int col_base = 0u; col_base < batch_size; col_base += 8u) {
@@ -706,12 +737,8 @@ extern "C" __global__ void fused_gate_up_swiglu_gemm_tq2(
             const unsigned int* gqs =
                 (const unsigned int*)(soa_raw + qs_offset + gate_idx * 32u);
             unsigned int gw0, gw1, gw2, gw3, gw4, gw5, gw6, gw7;
-            asm("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(gw0), "=r"(gw1), "=r"(gw2), "=r"(gw3)
-                : "l"(gqs));
-            asm("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(gw4), "=r"(gw5), "=r"(gw6), "=r"(gw7)
-                : "l"(gqs + 4u));
+            soa_load4_u32(gqs,      aligned16, gw0, gw1, gw2, gw3);
+            soa_load4_u32(gqs + 4u, aligned16, gw4, gw5, gw6, gw7);
 
             /* ── Up block (row r + n_rows) ──────────────────────────────────── */
             const unsigned long long up_idx =
@@ -720,12 +747,8 @@ extern "C" __global__ void fused_gate_up_swiglu_gemm_tq2(
             const unsigned int* uqs =
                 (const unsigned int*)(soa_raw + qs_offset + up_idx * 32u);
             unsigned int uw0, uw1, uw2, uw3, uw4, uw5, uw6, uw7;
-            asm("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(uw0), "=r"(uw1), "=r"(uw2), "=r"(uw3)
-                : "l"(uqs));
-            asm("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(uw4), "=r"(uw5), "=r"(uw6), "=r"(uw7)
-                : "l"(uqs + 4u));
+            soa_load4_u32(uqs,      aligned16, uw0, uw1, uw2, uw3);
+            soa_load4_u32(uqs + 4u, aligned16, uw4, uw5, uw6, uw7);
 
             const unsigned int base = b * 128u;
 

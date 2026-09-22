@@ -60,6 +60,27 @@ fn scratch(label: &str) -> PathBuf {
 /// Force the pure-CPU DiT/VAE path so the orchestration test is deterministic and
 /// hermetic regardless of which GPU features the build enables (each nextest test
 /// runs in its own process, so these env writes are isolated).
+///
+/// Wave-1.5 addendum (4) / T-Missed-1: this is the same shared-mutable-
+/// process-state pattern (`std::env::set_var` racing a `OnceLock`-latched
+/// reader) that `crates/oxibonsai-image/src/vae/tiling.rs`'s now-removed
+/// `force_cpu_conv()` used to have, and that file's `vae/gpu.rs` fix
+/// (`set_conv_override`, a `#[cfg(test)]`-only thread-local + RAII guard) is
+/// the precedent for how to remove it. This file cannot adopt that fix
+/// directly: `set_conv_override` is `#[cfg(test)]`-gated on the *library*
+/// crate, so it is only visible to `oxibonsai-image`'s own in-crate unit
+/// tests, not to this external `tests/` integration binary, which only sees
+/// the crate's public API — an equivalent *public*, non-env override entry
+/// point for `OXI_DIT_GPU` / `OXI_DIT_FUSED` / `OXI_VAE_GPU` / `OXI_TE_GPU`
+/// would need to be added to `oxibonsai-image/src/{gpu,cuda_gpu,vae/gpu,
+/// te/gpu,te/cuda_gpu}.rs`, none of which are in this package's
+/// `owned_files` (recorded as a deviation). Harmless *today* because this
+/// file is its own separate test binary (nextest's one-process-per-test
+/// model means no other test's `OnceLock` can already be latched when this
+/// one runs), but it is a latent ordering hazard the moment a second test
+/// is added to this same file — see METAL-CONCURRENCY (wave 4), which
+/// removes the underlying `GLOBAL_METAL_GRAPH` process-global singleton
+/// these `OnceLock` gates exist alongside.
 fn force_cpu() {
     std::env::set_var("OXI_DIT_GPU", "0");
     std::env::set_var("OXI_DIT_FUSED", "0");
@@ -133,6 +154,16 @@ fn add_quant(w: &mut GgufWriter, name: &str, out: usize, in_: usize, seed: f32, 
 
 /// Build a complete, tiny `bonsai-image` DiT GGUF (1 dual + 1 single block) that
 /// `DitForward::sample` can run end-to-end.
+///
+/// T-07 (verifier wave 3): not re-pointed at
+/// `oxibonsai_testkit::gguf_fixture::GgufFixtureBuilder` — this builds the
+/// real Bonsai-Image DiT's specific named-tensor architecture (dozens of
+/// BF16 dense/norm weights alongside the ternary-quantized projections,
+/// exact names/shapes matching `oxibonsai_image`'s real loader), and
+/// `GgufFixtureBuilder` has no BF16 `FixtureQuant` variant at all (only the
+/// quantized formats). `add_quant`'s `quant_bytes` helper below does share
+/// `oxibonsai_testkit::gguf_fixture`'s `qs`-then-`d` TQ2_0_g128 byte
+/// convention (same as `synthetic_gguf.rs`'s own documented exception).
 fn build_dit_gguf() -> Vec<u8> {
     let mut w = GgufWriter::new();
 

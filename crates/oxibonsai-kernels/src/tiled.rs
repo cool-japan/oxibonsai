@@ -18,6 +18,7 @@ use rayon::prelude::*;
 
 use crate::dispatch::KernelDispatcher;
 use crate::error::{KernelError, KernelResult};
+use crate::gemm_onebit::gemm_1bit_g128_blocked;
 use crate::traits::OneBitKernel;
 
 /// Number of rows per L1-sized tile.
@@ -47,7 +48,7 @@ fn validate_gemv_params(
     n_rows: usize,
     k: usize,
 ) -> KernelResult<usize> {
-    if k % QK1_0_G128 != 0 {
+    if !k.is_multiple_of(QK1_0_G128) {
         return Err(KernelError::NotBlockAligned {
             count: k,
             block_size: QK1_0_G128,
@@ -85,7 +86,7 @@ fn validate_gemm_params(
     n_rows: usize,
     k: usize,
 ) -> KernelResult<usize> {
-    if k % QK1_0_G128 != 0 {
+    if !k.is_multiple_of(QK1_0_G128) {
         return Err(KernelError::NotBlockAligned {
             count: k,
             block_size: QK1_0_G128,
@@ -163,6 +164,16 @@ pub fn gemv_tiled(
 ///
 /// This ensures that for each batch tile, the weight rows cycle
 /// through L1 cache, and the input tile stays resident in L2.
+///
+/// **This is a CPU driver (K-18, PERF-CPU-PREFILL).** It used to call
+/// `dispatcher.gemm(...)`, which for a GPU-tier dispatcher with
+/// `n_rows >= GPU_MIN_ROWS` reached Metal/CUDA. It now always calls
+/// [`gemm_1bit_g128_blocked`], which maps a GPU-tier dispatcher onto its
+/// best CPU tier the same way [`crate::parallel::gemm_1bit_g128_par`] does
+/// — so on a build where `KernelDispatcher::tier` would pick `Gpu`, this
+/// function no longer touches the GPU at all. Callers that want the
+/// Metal/CUDA GEMM call `KernelDispatcher::gemm` (or the model's fused GPU
+/// prefill) directly.
 pub fn gemm_tiled(
     dispatcher: &KernelDispatcher,
     blocks: &[BlockQ1_0G128],
@@ -172,39 +183,28 @@ pub fn gemm_tiled(
     n_rows: usize,
     k: usize,
 ) -> KernelResult<()> {
-    let blocks_per_row = validate_gemm_params(blocks, input, output, m, n_rows, k)?;
+    validate_gemm_params(blocks, input, output, m, n_rows, k)?;
 
-    // Tile the batch dimension
+    // Tile the batch dimension only. The weight-row tiling this loop used
+    // to do existed to keep a tile's weights hot in L1 across the batch
+    // loop — but it did that by calling the kernel with `m = 1` per batch
+    // element (K-18), so the decoded weights were thrown away between
+    // batch elements and only the *compressed* bytes stayed cached.
+    // `gemm_1bit_g128_blocked` keeps the batch loop innermost and the
+    // decoded block live across `ONEBIT_GEMM_MR` rows, which subsumes the
+    // row tiling: the weight row is re-read from L1, never re-decoded.
     let mut batch_start = 0;
     while batch_start < m {
         let batch_tile = (m - batch_start).min(GEMM_BATCH_TILE);
-
-        // Tile the weight rows dimension
-        let mut row_start = 0;
-        while row_start < n_rows {
-            let tile_rows = (n_rows - row_start).min(L1_TILE_ROWS);
-            let block_start = row_start * blocks_per_row;
-            let block_end = (row_start + tile_rows) * blocks_per_row;
-
-            // Process each batch element in this tile
-            for bi in 0..batch_tile {
-                let mi = batch_start + bi;
-                let input_offset = mi * k;
-                let output_offset = mi * n_rows + row_start;
-
-                dispatcher.gemm(
-                    &blocks[block_start..block_end],
-                    &input[input_offset..input_offset + k],
-                    &mut output[output_offset..output_offset + tile_rows],
-                    1,
-                    tile_rows,
-                    k,
-                )?;
-            }
-
-            row_start += tile_rows;
-        }
-
+        gemm_1bit_g128_blocked(
+            dispatcher,
+            blocks,
+            &input[batch_start * k..(batch_start + batch_tile) * k],
+            &mut output[batch_start * n_rows..(batch_start + batch_tile) * n_rows],
+            batch_tile,
+            n_rows,
+            k,
+        )?;
         batch_start += batch_tile;
     }
 
@@ -244,7 +244,7 @@ pub fn gemv_tiled_par(
     // On WASM: no rayon threads — fall back to sequential tiled.
     #[cfg(target_arch = "wasm32")]
     {
-        return gemv_tiled(dispatcher, blocks, input, output, n_rows, k);
+        gemv_tiled(dispatcher, blocks, input, output, n_rows, k)
     }
 
     // Parallel L2 tiles, each internally using L1 tiling
@@ -290,7 +290,8 @@ pub fn gemv_tiled_par(
 /// Parallelizes over the batch dimension at L2 granularity,
 /// with L1 tiling on the weight rows within each parallel task.
 ///
-/// Falls back to sequential `gemm_tiled` for small batch sizes.
+/// Falls back to sequential `gemm_tiled` for small batch sizes. Same
+/// CPU-only note as [`gemm_tiled`], which every slab here calls.
 pub fn gemm_tiled_par(
     dispatcher: &KernelDispatcher,
     blocks: &[BlockQ1_0G128],
@@ -300,10 +301,7 @@ pub fn gemm_tiled_par(
     n_rows: usize,
     k: usize,
 ) -> KernelResult<()> {
-    #[cfg(not(target_arch = "wasm32"))]
-    let blocks_per_row = validate_gemm_params(blocks, input, output, m, n_rows, k)?;
-    #[cfg(target_arch = "wasm32")]
-    let _blocks_per_row = validate_gemm_params(blocks, input, output, m, n_rows, k)?;
+    validate_gemm_params(blocks, input, output, m, n_rows, k)?;
 
     // Sequential fallback for small batch sizes
     if m < PAR_TILED_GEMM_MIN_BATCH {
@@ -313,42 +311,45 @@ pub fn gemm_tiled_par(
     // On WASM: no rayon threads — fall back to sequential tiled.
     #[cfg(target_arch = "wasm32")]
     {
-        return gemm_tiled(dispatcher, blocks, input, output, m, n_rows, k);
+        gemm_tiled(dispatcher, blocks, input, output, m, n_rows, k)
     }
 
-    // Parallel over batch elements, L1-tiled weight rows within
+    // Parallel over *slabs* of batch elements rather than one task per
+    // batch element (K-18): a slab is a genuine `m > 1` GEMM, so the
+    // register-blocked kernel reuses each decoded weight block across
+    // `ONEBIT_GEMM_MR` rows inside the task instead of re-decoding the
+    // whole matrix per token.
     #[cfg(not(target_arch = "wasm32"))]
     {
+        let batch_chunk = gemm_par_batch_chunk(m);
         output[..m * n_rows]
-            .par_chunks_mut(n_rows)
+            .par_chunks_mut(batch_chunk * n_rows)
             .enumerate()
-            .try_for_each(|(mi, out_row)| -> KernelResult<()> {
-                let input_offset = mi * k;
-
-                // L1-tile the weight rows
-                let mut row_start = 0;
-                while row_start < n_rows {
-                    let tile_rows = (n_rows - row_start).min(L1_TILE_ROWS);
-                    let block_start = row_start * blocks_per_row;
-                    let block_end = (row_start + tile_rows) * blocks_per_row;
-
-                    dispatcher.gemm(
-                        &blocks[block_start..block_end],
-                        &input[input_offset..input_offset + k],
-                        &mut out_row[row_start..row_start + tile_rows],
-                        1,
-                        tile_rows,
-                        k,
-                    )?;
-
-                    row_start += tile_rows;
-                }
-
-                Ok::<(), KernelError>(())
+            .try_for_each(|(chunk_idx, out_chunk)| -> KernelResult<()> {
+                let m0 = chunk_idx * batch_chunk;
+                let rows = out_chunk.len() / n_rows;
+                gemm_tiled(
+                    dispatcher,
+                    blocks,
+                    &input[m0 * k..(m0 + rows) * k],
+                    out_chunk,
+                    rows,
+                    n_rows,
+                    k,
+                )
             })?;
 
         Ok(())
     }
+}
+
+/// Batch rows per Rayon task for [`gemm_tiled_par`], floored at
+/// [`GEMM_BATCH_TILE`] so every task still fills the register block.
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+fn gemm_par_batch_chunk(m: usize) -> usize {
+    let threads = rayon::current_num_threads().max(1);
+    m.div_ceil(threads).max(GEMM_BATCH_TILE).min(m).max(1)
 }
 
 /// Choose optimal tile size based on working set characteristics.

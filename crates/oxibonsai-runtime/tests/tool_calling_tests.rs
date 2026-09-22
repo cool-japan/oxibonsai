@@ -1,3 +1,8 @@
+// The `api_types` and `tool_calling` modules are only compiled with the
+// `server` feature, so this integration test must be gated the same way to
+// keep `--no-default-features` green.
+#![cfg(feature = "server")]
+
 use oxibonsai_runtime::api_types::{ToolCall, ToolDefinition};
 use oxibonsai_runtime::tool_calling::{
     build_tool_constraint, make_tool_call, new_tool_call_id, select_tool, validate_tool_arguments,
@@ -350,6 +355,11 @@ fn tool_call_error_display_variants_non_empty() {
 
 #[test]
 fn tool_call_error_implements_std_error() {
+    // T-09: used to discard `e.to_string()`'s result entirely. The coercion
+    // to `&dyn std::error::Error` on the line above already proves the
+    // trait impl exists (a compile-time check); assert the Display output
+    // it unlocks is non-empty too, so the test's own name is backed by a
+    // real runtime check, not just a successful compile.
     let e: &dyn std::error::Error = &ToolCallError::NoToolCallFound;
-    let _ = e.to_string();
+    assert!(!e.to_string().is_empty());
 }

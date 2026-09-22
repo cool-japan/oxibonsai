@@ -1,3 +1,4 @@
+#![cfg(feature = "training")]
 //! Integration tests for the PTQ calibration pipeline.
 
 use oxibonsai_model::calibration::{

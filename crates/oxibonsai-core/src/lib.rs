@@ -26,16 +26,21 @@
 //! |--------|---------|
 //! | [`config`] | `Qwen3Config` with named constructors for each variant |
 //! | [`gguf`] | Low-level GGUF v3 reader (header, metadata, tensors) |
+//! | [`quant_prism`] | `BlockPQ2_0`, `BlockPTQ1_0`, `BlockQ2_0G64` — PrismML Bonsai 2 block types |
 //! | [`quant_ternary`] | `BlockTQ2_0_g128`, `BlockTQ2_0`, `TernaryCode` — ternary block types |
 //! | [`tensor`] | `BlockQ1_0G128` and `OneBitTensor` types |
 //! | [`error`] | `BonsaiError` / `BonsaiResult` |
 
+pub mod bf16;
 pub mod config;
+pub mod config_hybrid;
 pub mod error;
 pub mod gguf;
+pub mod hadamard_config;
 pub mod quant_fp8;
 pub mod quant_k;
 pub mod quant_k_ext;
+pub mod quant_prism;
 pub mod quant_std;
 pub mod quant_ternary;
 pub mod tensor;
@@ -50,13 +55,21 @@ pub use gguf::header::GgufHeader;
 pub use gguf::metadata::{MetadataStore, MetadataValue};
 pub use gguf::model_card::keys as model_card_keys;
 pub use gguf::model_card::{extract_known_fields, extract_model_card, ModelCard};
+pub use gguf::quant_resolve::{
+    compute_extents, resolve_type_42, resolve_type_42_with_sample, LegacyVersionTag, OrderEvidence,
+    Resolved42, SizeModel, AMBIGUOUS_TYPE_ID,
+};
 pub use gguf::streaming::{
     GgufStreamParser, GgufValue, StreamState, StreamedGguf, StreamedTensorInfo,
 };
-pub use gguf::tensor_info::{TensorInfo, TensorStore};
-pub use gguf::types::{GgufTensorType, GgufValueType};
+pub use gguf::tensor_info::{
+    align_up, padded_size, row_size_bytes, TensorInfo, TensorStore, MAX_TENSOR_DIMS,
+};
+pub use gguf::types::{GgufTensorType, GgufValueType, TypeIdResolution};
 pub use gguf::writer::MetadataWriteValue;
-pub use gguf::writer::{GgufWriter, TensorEntry, TensorType, WriteError};
+pub use gguf::writer::{
+    GgufWriter, TensorEntry, TensorProducer, TensorSource, TensorStream, TensorType, WriteError,
+};
 pub use quant_fp8::{
     fp8_e4m3_decode, fp8_e4m3_encode, fp8_e5m2_decode, fp8_e5m2_encode, BlockFP8E4M3, BlockFP8E5M2,
     BLOCK_FP8_BYTES, FP8_E4M3_MAX, FP8_E5M2_MAX, QK_FP8,
@@ -66,9 +79,16 @@ pub use quant_k::{
     BLOCK_Q8K_BYTES,
 };
 pub use quant_k_ext::{BlockQ5K, BlockQ6K, BLOCK_Q5K_BYTES, BLOCK_Q6K_BYTES};
+pub use quant_prism::{
+    count_plus_two_codes, q2_0_code_to_i32, transcode_ptq1_0_to_tq2, two_bit_code, BlockPQ2_0,
+    BlockPTQ1_0, BlockQ2_0G64, BLOCK_PQ2_0_BYTES, BLOCK_PTQ1_0_BYTES, BLOCK_Q2_0_G64_BYTES, POW3,
+    PTQ1_0_STAGES, QK_PQ2_0, QK_PTQ1_0, QK_Q2_0_G64,
+};
 pub use quant_std::{BlockQ4_0, BlockQ8_0, BLOCK_Q4_0_BYTES, BLOCK_Q8_0_BYTES, QK_Q4_0, QK_Q8_0};
 pub use quant_ternary::{
-    BlockTQ2_0, BlockTQ2_0_g128, TernaryCode, BLOCK_TQ2_0_BYTES, BLOCK_TQ2_0_G128_BYTES, QK_TQ2_0,
-    QK_TQ2_0_G128,
+    sniff_two_bit_layout, sniff_two_bit_layout_scores, ternary_code_to_i8, BlockTQ2_0,
+    BlockTQ2_0_g128, LayoutScore, TernaryCode, TwoBitLayout, BLOCK_TQ2_0_BYTES,
+    BLOCK_TQ2_0_G128_BYTES, QK_TQ2_0, QK_TQ2_0_G128, SNIFF_DEFAULT_BLOCKS,
+    TWO_BIT_LAYOUT_CANDIDATES,
 };
 pub use tensor::{BlockQ1_0G128, OneBitTensor};

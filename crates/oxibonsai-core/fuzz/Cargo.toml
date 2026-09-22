@@ -1,0 +1,64 @@
+# `oxibonsai-core` fuzz targets (T-03, second half).
+#
+# This is a standard `cargo fuzz`-style scaffold: its own one-crate
+# `[workspace]` (below), exactly like `crates/oxibonsai-testkit/Cargo.toml`
+# for the same reason — Cargo never absorbs a nested manifest that names
+# itself a workspace root, so this directory is invisible to `cargo build
+# --workspace` / `cargo test --workspace` / `cargo clippy --workspace` run
+# from the repository root, and creating it cannot regress or even touch
+# the main gate. This also matches upstream `cargo fuzz init`'s own default
+# layout, which deliberately keeps fuzz crates out of the parent workspace
+# (they pull in `libfuzzer-sys`, need nightly + sanitizer flags to actually
+# fuzz, and would otherwise perturb the main workspace's dependency/feature
+# resolution for every contributor, not just the ones fuzzing).
+#
+# Never published: `publish = false` below. Never a runtime or dev
+# dependency of anything else (nothing points *at* this crate; it only
+# depends on `oxibonsai-core` via a relative path, never a hardcoded
+# absolute one).
+[workspace]
+
+[package]
+name = "oxibonsai-core-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# `cargo fuzz`'s own convention (and every existing rust-fuzz target in the
+# wild) names the `[[bin]]` after the `fuzz_targets/<name>.rs` file stem
+# verbatim — snake_case, matching the Rust filename, not kebab-case. This
+# cargo (1.95, stable) does not yet stabilise `[lints.cargo]` (it emits its
+# own "unused manifest key" warning if the table is present at all, which
+# would be a warning this crate introduces for no benefit), and no
+# non-kebab-case-bin warning is actually emitted by `cargo check`/`clippy`
+# for this manifest today, so there is nothing here to silence.
+#
+# POLICY NOTE (verifier wave 3): `libfuzzer-sys` below is a version pin, not
+# `*.workspace = true` — a deliberate, documented exception to COOLJAPAN's
+# "manage deps at the workspace level" policy, not an oversight. By
+# `cargo fuzz`'s own convention this manifest is its own one-crate
+# `[workspace]` (above), precisely so it is NEVER absorbed into the root
+# workspace; a `*.workspace = true` reference here would be a compile error
+# (there is no root `[workspace.dependencies]` for a manifest that declares
+# itself a workspace root). The same isolation means this crate is also
+# invisible to `cargo deny check bans` at the repository root (`deny.toml`
+# is workspace-scoped) — this is a known, accepted gap, not a silent one:
+# `deny.toml` itself is not owned by this package, but should carry an
+# equivalent note the next time it is touched. This is NOT a publish hazard
+# either way: `cargo package --list -p oxibonsai-core` excludes this nested
+# `fuzz/` directory entirely (verified).
+[dependencies]
+libfuzzer-sys = "0.4.13"
+
+[dependencies.oxibonsai-core]
+path = ".."
+
+[[bin]]
+name = "gguf_parse"
+path = "fuzz_targets/gguf_parse.rs"
+test = false
+doc = false
+bench = false

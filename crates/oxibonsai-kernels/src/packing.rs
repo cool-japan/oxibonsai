@@ -102,7 +102,7 @@ impl AlignedBuffer {
     /// Check that the buffer is actually aligned to 64 bytes.
     pub fn is_aligned(&self) -> bool {
         let ptr = self.storage[self.offset..].as_ptr() as usize;
-        ptr % CACHE_LINE_BYTES == 0
+        ptr.is_multiple_of(CACHE_LINE_BYTES)
     }
 
     /// Copy data from a slice into the aligned buffer.
@@ -138,7 +138,7 @@ pub fn pack_blocks_for_gemv(
     n_rows: usize,
     k: usize,
 ) -> KernelResult<Vec<BlockQ1_0G128>> {
-    if k % QK1_0_G128 != 0 {
+    if !k.is_multiple_of(QK1_0_G128) {
         return Err(KernelError::NotBlockAligned {
             count: k,
             block_size: QK1_0_G128,
@@ -184,7 +184,7 @@ pub fn unpack_blocks_from_gemv(
     n_rows: usize,
     k: usize,
 ) -> KernelResult<Vec<BlockQ1_0G128>> {
-    if k % QK1_0_G128 != 0 {
+    if !k.is_multiple_of(QK1_0_G128) {
         return Err(KernelError::NotBlockAligned {
             count: k,
             block_size: QK1_0_G128,

@@ -2,12 +2,30 @@
 //!
 //! These follow the GGML K-quant specification:
 //! - **Q2_K**: 2-bit quantization with 4-bit scales, super-block of 256 weights (84 bytes)
-//! - **Q3_K**: 3-bit quantization with 4-bit scales, super-block of 256 weights (110 bytes)
+//! - **Q3_K**: 3-bit quantization with 6-bit scales, super-block of 256 weights (110 bytes)
 //! - **Q4_K**: 4-bit quantization with 6-bit scales, super-block of 256 weights (144 bytes)
 //! - **Q8_K**: 8-bit quantization with FP32 scale, super-block of 256 weights (292 bytes)
 //!
 //! Each super-block stores a global `d` (scale) and `dmin` (minimum) in FP16,
 //! plus per-sub-block scales and quantized weight nibbles/pairs.
+//!
+//! # ggml byte-exactness
+//!
+//! The Q2_K / Q3_K / Q4_K codecs are **verbatim transliterations** of the ggml
+//! reference implementation (`ggml/src/ggml-quants.c`), keeping ggml's loop
+//! structure rather than an "equivalent" element-sequential rewrite:
+//!
+//! - `dequantize_row_q2_K` (`:1016`) / `quantize_row_q2_K_ref` (`:946`)
+//! - `dequantize_row_q3_K` (`:1360`) / `quantize_row_q3_K_ref` (`:1284`)
+//! - `dequantize_row_q4_K` (`:1584`) / `quantize_row_q4_K_ref` (`:1512`)
+//! - `get_scale_min_k4` (`:935`), `nearest_int` (`:676`),
+//!   `make_qkx2_quants` (`:854`), `make_q3_quants` (`:752`), `make_qx_quants` (`:683`)
+//!
+//! The sub-block scale/weight interleaving is load-bearing: Q2_K assigns
+//! sub-block scales in `is++` order under a shift stepping 0, 2, 4, 6 per
+//! 128-element half, and Q4_K emits 32 *low* nibbles then 32 *high* nibbles per
+//! 64-element group. Reproducing these orders is what lets OxiBonsai read
+//! third-party llama.cpp K-quant GGUFs (and write files llama.cpp can read).
 
 use half::f16;
 
@@ -33,19 +51,347 @@ pub const BLOCK_Q4_K_BYTES: usize = 144;
 pub const BLOCK_Q8K_BYTES: usize = 292;
 
 // ---------------------------------------------------------------------------
+// ggml reference primitives (ggml/src/ggml-quants.c)
+// ---------------------------------------------------------------------------
+
+/// `GROUP_MAX_EPS` (`ggml-quants.c:20`) — the "all zero" cut-off used by the
+/// reference quantizers.
+pub(crate) const GROUP_MAX_EPS: f32 = 1e-15;
+
+/// ggml's `nearest_int` (`ggml-quants.c:676`).
+///
+/// This is deliberately **not** `f32::round`: the magic-number trick rounds
+/// half-to-even, while `round()` rounds half away from zero. A single differing
+/// code on a `.5` boundary breaks bit-exactness against llama.cpp, so the bit
+/// trick is reproduced exactly. Matching ggml's release builds (`NDEBUG`), the
+/// `|fval| <= 4194303` assertion is not enforced; every call site in this module
+/// feeds values bounded by the format's `nmax`.
+#[inline]
+pub(crate) fn nearest_int(fval: f32) -> i32 {
+    let val = fval + 12_582_912.0_f32;
+    let i = val.to_bits() as i32;
+    (i & 0x007f_ffff) - 0x0040_0000
+}
+
+/// ggml's `get_scale_min_k4` (`ggml-quants.c:935`).
+///
+/// Unpacks sub-block `j`'s 6-bit scale and 6-bit min from the 12-byte packed
+/// `scales` array shared by Q4_K and Q5_K. For `j < 4` the scale is a **full
+/// 6-bit value read from byte `j`** — not two 4-bit nibbles.
+#[inline]
+pub(crate) fn get_scale_min_k4(j: usize, q: &[u8; 12]) -> (u8, u8) {
+    if j < 4 {
+        (q[j] & 63, q[j + 4] & 63)
+    } else {
+        (
+            (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4),
+            (q[j + 4] >> 4) | ((q[j] >> 6) << 4),
+        )
+    }
+}
+
+/// Pack eight 6-bit scales and eight 6-bit mins into the 12-byte K-quant
+/// `scales` array, exactly as `quantize_row_q4_K_ref` (`ggml-quants.c:1543-1556`)
+/// and `quantize_row_q5_K_ref` (`:1730-1743`) do.
+///
+/// The ascending `j` order is load-bearing: `j < 4` *assigns* bytes `j` and
+/// `j + 4`, and `j >= 4` then ORs the top two bits into those same bytes.
+pub(crate) fn pack_scales_min_k4(sc: &[u8; 8], mn: &[u8; 8]) -> [u8; 12] {
+    let mut out = [0u8; 12];
+    for j in 0..8usize {
+        let ls = sc[j].min(63);
+        let lm = mn[j].min(63);
+        if j < 4 {
+            out[j] = ls;
+            out[j + 4] = lm;
+        } else {
+            out[j + 4] = (ls & 0xF) | ((lm & 0xF) << 4);
+            out[j - 4] |= (ls >> 4) << 6;
+            out[j] |= (lm >> 4) << 6;
+        }
+    }
+    out
+}
+
+/// ggml's `make_qx_quants` (`ggml-quants.c:683`) — RMSE-refined symmetric
+/// quantization used by the Q6_K reference encoder.
+///
+/// `qw` is ggml's optional per-weight importance vector (`NULL` for the plain
+/// `_ref` path).
+#[allow(clippy::needless_range_loop)]
+pub(crate) fn make_qx_quants(
+    n: usize,
+    nmax: i32,
+    x: &[f32],
+    l: &mut [i8],
+    rmse_type: i32,
+    qw: Option<&[f32]>,
+) -> f32 {
+    let mut max = 0.0f32;
+    let mut amax = 0.0f32;
+    for i in 0..n {
+        let ax = x[i].abs();
+        if ax > amax {
+            amax = ax;
+            max = x[i];
+        }
+    }
+    if amax < GROUP_MAX_EPS {
+        for i in 0..n {
+            l[i] = 0;
+        }
+        return 0.0;
+    }
+    let mut iscale = -(nmax as f32) / max;
+    if rmse_type == 0 {
+        for i in 0..n {
+            let q = nearest_int(iscale * x[i]);
+            l[i] = (nmax + q.clamp(-nmax, nmax - 1)) as i8;
+        }
+        return 1.0 / iscale;
+    }
+    let mut rmse_type = rmse_type;
+    let mut return_early = false;
+    if rmse_type < 0 {
+        rmse_type = -rmse_type;
+        return_early = true;
+    }
+    let weight = |i: usize| -> f32 {
+        match qw {
+            Some(w) => w[i],
+            None => match rmse_type {
+                1 => x[i] * x[i],
+                2 => 1.0,
+                3 => x[i].abs(),
+                _ => x[i].abs().sqrt(),
+            },
+        }
+    };
+    let mut sumlx = 0.0f32;
+    let mut suml2 = 0.0f32;
+    for i in 0..n {
+        let q = nearest_int(iscale * x[i]).clamp(-nmax, nmax - 1);
+        l[i] = (q + nmax) as i8;
+        let w = weight(i);
+        sumlx += w * x[i] * (q as f32);
+        suml2 += w * (q as f32) * (q as f32);
+    }
+    let mut scale = if suml2 != 0.0 { sumlx / suml2 } else { 0.0 };
+    if return_early {
+        return if suml2 > 0.0 {
+            0.5 * (scale + 1.0 / iscale)
+        } else {
+            1.0 / iscale
+        };
+    }
+    let mut best = scale * sumlx;
+    for is in -9i32..=9 {
+        if is == 0 {
+            continue;
+        }
+        iscale = -((nmax as f32) + 0.1 * (is as f32)) / max;
+        sumlx = 0.0;
+        suml2 = 0.0;
+        for i in 0..n {
+            let q = nearest_int(iscale * x[i]).clamp(-nmax, nmax - 1);
+            let w = weight(i);
+            sumlx += w * x[i] * (q as f32);
+            suml2 += w * (q as f32) * (q as f32);
+        }
+        if suml2 > 0.0 && sumlx * sumlx > best * suml2 {
+            for i in 0..n {
+                let q = nearest_int(iscale * x[i]);
+                l[i] = (nmax + q.clamp(-nmax, nmax - 1)) as i8;
+            }
+            scale = sumlx / suml2;
+            best = scale * sumlx;
+        }
+    }
+    scale
+}
+
+/// ggml's `make_q3_quants` (`ggml-quants.c:752`) — the Q3_K reference
+/// sub-block quantizer (called with `do_rmse = true`).
+#[allow(clippy::needless_range_loop)]
+pub(crate) fn make_q3_quants(n: usize, nmax: i32, x: &[f32], l: &mut [i8], do_rmse: bool) -> f32 {
+    let mut max = 0.0f32;
+    let mut amax = 0.0f32;
+    for i in 0..n {
+        let ax = x[i].abs();
+        if ax > amax {
+            amax = ax;
+            max = x[i];
+        }
+    }
+    if amax < GROUP_MAX_EPS {
+        for i in 0..n {
+            l[i] = 0;
+        }
+        return 0.0;
+    }
+    let iscale = -(nmax as f32) / max;
+    if do_rmse {
+        let mut sumlx = 0.0f32;
+        let mut suml2 = 0.0f32;
+        for i in 0..n {
+            let q = nearest_int(iscale * x[i]).clamp(-nmax, nmax - 1);
+            l[i] = q as i8;
+            let w = x[i] * x[i];
+            sumlx += w * x[i] * (q as f32);
+            suml2 += w * (q as f32) * (q as f32);
+        }
+        for _itry in 0..5 {
+            let mut n_changed = 0u32;
+            for i in 0..n {
+                let w = x[i] * x[i];
+                let mut slx = sumlx - w * x[i] * (l[i] as f32);
+                if slx > 0.0 {
+                    let mut sl2 = suml2 - w * (l[i] as f32) * (l[i] as f32);
+                    let new_l = nearest_int(x[i] * sl2 / slx).clamp(-nmax, nmax - 1);
+                    if new_l != l[i] as i32 {
+                        slx += w * x[i] * (new_l as f32);
+                        sl2 += w * (new_l as f32) * (new_l as f32);
+                        if sl2 > 0.0 && slx * slx * suml2 > sumlx * sumlx * sl2 {
+                            l[i] = new_l as i8;
+                            sumlx = slx;
+                            suml2 = sl2;
+                            n_changed += 1;
+                        }
+                    }
+                }
+            }
+            if n_changed == 0 {
+                break;
+            }
+        }
+        for i in 0..n {
+            l[i] += nmax as i8;
+        }
+        return if suml2 > 0.0 { sumlx / suml2 } else { 0.0 };
+    }
+    for i in 0..n {
+        let q = nearest_int(iscale * x[i]).clamp(-nmax, nmax - 1);
+        l[i] = (q + nmax) as i8;
+    }
+    1.0 / iscale
+}
+
+/// ggml's `make_qkx2_quants` (`ggml-quants.c:854`) — the asymmetric
+/// (scale + min) sub-block quantizer used by Q2_K, Q4_K and Q5_K.
+///
+/// Returns the sub-block scale and writes the sub-block min (already negated,
+/// matching ggml's `*the_min = -min`) into `the_min`.
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+pub(crate) fn make_qkx2_quants(
+    n: usize,
+    nmax: i32,
+    x: &[f32],
+    weights: &[f32],
+    l: &mut [u8],
+    the_min: &mut f32,
+    laux: &mut [u8],
+    rmin: f32,
+    rdelta: f32,
+    nstep: i32,
+    use_mad: bool,
+) -> f32 {
+    let mut min = x[0];
+    let mut max = x[0];
+    let mut sum_w = weights[0];
+    let mut sum_x = sum_w * x[0];
+    for i in 1..n {
+        if x[i] < min {
+            min = x[i];
+        }
+        if x[i] > max {
+            max = x[i];
+        }
+        let w = weights[i];
+        sum_w += w;
+        sum_x += w * x[i];
+    }
+    if min > 0.0 {
+        min = 0.0;
+    }
+    if max == min {
+        for i in 0..n {
+            l[i] = 0;
+        }
+        *the_min = -min;
+        return 0.0;
+    }
+    let mut iscale = (nmax as f32) / (max - min);
+    let mut scale = 1.0 / iscale;
+    let mut best_error = 0.0f32;
+    for i in 0..n {
+        let q = nearest_int(iscale * (x[i] - min));
+        l[i] = q.clamp(0, nmax) as u8;
+        let mut diff = scale * (l[i] as f32) + min - x[i];
+        diff = if use_mad { diff.abs() } else { diff * diff };
+        best_error += weights[i] * diff;
+    }
+    if nstep < 1 {
+        *the_min = -min;
+        return scale;
+    }
+    for is in 0..=nstep {
+        iscale = (rmin + rdelta * (is as f32) + (nmax as f32)) / (max - min);
+        let mut sum_l = 0.0f32;
+        let mut sum_l2 = 0.0f32;
+        let mut sum_xl = 0.0f32;
+        for i in 0..n {
+            let q = nearest_int(iscale * (x[i] - min)).clamp(0, nmax);
+            laux[i] = q as u8;
+            let w = weights[i];
+            sum_l += w * (q as f32);
+            sum_l2 += w * (q as f32) * (q as f32);
+            sum_xl += w * (q as f32) * x[i];
+        }
+        let dd = sum_w * sum_l2 - sum_l * sum_l;
+        if dd > 0.0 {
+            let mut this_scale = (sum_w * sum_xl - sum_x * sum_l) / dd;
+            let mut this_min = (sum_l2 * sum_x - sum_l * sum_xl) / dd;
+            if this_min > 0.0 {
+                this_min = 0.0;
+                this_scale = sum_xl / sum_l2;
+            }
+            let mut cur_error = 0.0f32;
+            for i in 0..n {
+                let mut diff = this_scale * (laux[i] as f32) + this_min - x[i];
+                diff = if use_mad { diff.abs() } else { diff * diff };
+                cur_error += weights[i] * diff;
+            }
+            if cur_error < best_error {
+                l[..n].copy_from_slice(&laux[..n]);
+                best_error = cur_error;
+                scale = this_scale;
+                min = this_min;
+            }
+        }
+    }
+    *the_min = -min;
+    scale
+}
+
+// ---------------------------------------------------------------------------
 // BlockQ2K
 // ---------------------------------------------------------------------------
 
 /// Q2_K super-block: 256 weights quantized to 2 bits each.
 ///
-/// Layout (84 bytes):
+/// Layout (84 bytes, `block_q2_K` in `ggml-common.h`):
 /// - `scales`: 16 bytes — packed 4-bit scale/min pairs for 16 sub-blocks of 16 weights.
 ///   Each byte holds two 4-bit values: low nibble = scale, high nibble = min.
-/// - `qs`: 64 bytes — 256 x 2-bit quantized weights (4 per byte, LSB first).
+/// - `qs`: 64 bytes — 256 x 2-bit quantized weights.
 /// - `d`: FP16 super-block scale.
 /// - `dmin`: FP16 super-block minimum.
 ///
-/// Dequant: `w[i] = d * sub_scale * q[i] - dmin * sub_min`
+/// The 2-bit codes are **not** element-sequential. Per 128-element half, `qs`
+/// byte `l` carries elements `l`, `l + 32`, `l + 64`, `l + 96` in bit lanes
+/// 0-1, 2-3, 4-5, 6-7, and the sub-block scales are consumed in `is++` order
+/// under a shift stepping 0, 2, 4, 6 (`dequantize_row_q2_K`, `ggml-quants.c:1016`).
+///
+/// Dequant: `w = d * sub_scale * q - dmin * sub_min`
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(C)]
 pub struct BlockQ2K {
@@ -64,6 +410,8 @@ const _: () = assert!(std::mem::size_of::<BlockQ2K>() == BLOCK_Q2_K_BYTES);
 impl BlockQ2K {
     /// Dequantize a slice of Q2_K blocks into f32 output.
     ///
+    /// Byte-exact transliteration of `dequantize_row_q2_K` (`ggml-quants.c:1016`).
+    ///
     /// `output` must have length `blocks.len() * QK_K`.
     pub fn dequant(blocks: &[Self], output: &mut [f32]) -> BonsaiResult<()> {
         let expected_len = blocks.len() * QK_K;
@@ -79,24 +427,36 @@ impl BlockQ2K {
 
         for (block_idx, block) in blocks.iter().enumerate() {
             let d = block.d.to_f32();
-            let dmin = block.dmin.to_f32();
-            let base = block_idx * QK_K;
+            let min = block.dmin.to_f32();
 
-            // 16 sub-blocks of 16 weights each
-            for sub in 0..16 {
-                let scale_byte = block.scales[sub];
-                let sc = (scale_byte & 0x0F) as f32; // low nibble = scale
-                let mn = ((scale_byte >> 4) & 0x0F) as f32; // high nibble = min
+            let mut y = block_idx * QK_K;
+            let mut is = 0usize;
+            let mut q_off = 0usize;
 
-                let sub_offset = sub * 16;
-                for j in 0..16 {
-                    let global_idx = sub_offset + j;
-                    // Each byte holds 4 x 2-bit values
-                    let byte_idx = global_idx / 4;
-                    let shift = (global_idx % 4) * 2;
-                    let q = ((block.qs[byte_idx] >> shift) & 0x03) as f32;
-                    output[base + global_idx] = d * sc * q - dmin * mn;
+            for _n in 0..(QK_K / 128) {
+                let mut shift = 0u32;
+                for _j in 0..4 {
+                    let sc = block.scales[is];
+                    is += 1;
+                    let dl = d * ((sc & 0xF) as f32);
+                    let ml = min * ((sc >> 4) as f32);
+                    for l in 0..16usize {
+                        output[y] = dl * (((block.qs[q_off + l] >> shift) & 3) as f32) - ml;
+                        y += 1;
+                    }
+
+                    let sc = block.scales[is];
+                    is += 1;
+                    let dl = d * ((sc & 0xF) as f32);
+                    let ml = min * ((sc >> 4) as f32);
+                    for l in 0..16usize {
+                        output[y] = dl * (((block.qs[q_off + l + 16] >> shift) & 3) as f32) - ml;
+                        y += 1;
+                    }
+
+                    shift += 2;
                 }
+                q_off += 32;
             }
         }
         Ok(())
@@ -104,9 +464,14 @@ impl BlockQ2K {
 
     /// Quantize f32 input into Q2_K blocks.
     ///
+    /// Byte-exact transliteration of `quantize_row_q2_K_ref` (`ggml-quants.c:946`),
+    /// including `make_qkx2_quants(16, 3, …, -0.5, 0.1, 15, use_mad = true)` and
+    /// the `q4scale = 15` scale/min requantization.
+    ///
     /// Input length must be a multiple of `QK_K` (256).
+    #[allow(clippy::needless_range_loop)]
     pub fn quantize(input: &[f32]) -> BonsaiResult<Vec<Self>> {
-        if input.len() % QK_K != 0 {
+        if !input.len().is_multiple_of(QK_K) {
             return Err(BonsaiError::KQuantError {
                 reason: format!(
                     "Q2_K quantize: input len {} not a multiple of {}",
@@ -116,92 +481,100 @@ impl BlockQ2K {
             });
         }
 
+        const Q4SCALE: f32 = 15.0;
+
         let num_blocks = input.len() / QK_K;
         let mut blocks = Vec::with_capacity(num_blocks);
 
+        let mut l_codes = [0u8; QK_K];
+        let mut laux = [0u8; 16];
+        let mut weights = [0.0f32; 16];
+        let mut mins = [0.0f32; QK_K / 16];
+        let mut scales = [0.0f32; QK_K / 16];
+
         for block_idx in 0..num_blocks {
-            let base = block_idx * QK_K;
-            let chunk = &input[base..base + QK_K];
+            let chunk = &input[block_idx * QK_K..block_idx * QK_K + QK_K];
 
-            // Pass 1: find global max absolute value and min value across
-            // all sub-blocks to set d and dmin.
-            // For each sub-block of 16 weights, we find the range [min, max].
-            let mut sub_scales = [0.0f32; 16];
-            let mut sub_mins = [0.0f32; 16];
-
-            for sub in 0..16 {
-                let sub_offset = sub * 16;
-                let sub_chunk = &chunk[sub_offset..sub_offset + 16];
-
-                let mut smin = f32::MAX;
-                let mut smax = f32::MIN;
-                for &v in sub_chunk {
-                    if v < smin {
-                        smin = v;
-                    }
-                    if v > smax {
-                        smax = v;
-                    }
+            let mut max_scale = 0.0f32;
+            let mut max_min = 0.0f32;
+            for j in 0..(QK_K / 16) {
+                for l in 0..16usize {
+                    weights[l] = chunk[16 * j + l].abs();
                 }
-
-                // The offset (min) removes the minimum, then scale maps remainder to 0..3
-                sub_mins[sub] = if smin < 0.0 { -smin } else { 0.0 };
-                let range = smax + sub_mins[sub];
-                sub_scales[sub] = if range > 0.0 { range / 3.0 } else { 0.0 };
+                let mut this_min = 0.0f32;
+                scales[j] = make_qkx2_quants(
+                    16,
+                    3,
+                    &chunk[16 * j..16 * j + 16],
+                    &weights,
+                    &mut l_codes[16 * j..16 * j + 16],
+                    &mut this_min,
+                    &mut laux,
+                    -0.5,
+                    0.1,
+                    15,
+                    true,
+                );
+                mins[j] = this_min;
+                if scales[j] > max_scale {
+                    max_scale = scales[j];
+                }
+                if mins[j] > max_min {
+                    max_min = mins[j];
+                }
             }
 
-            // Find the global maximum scale and minimum across sub-blocks
-            let max_scale = sub_scales.iter().copied().fold(0.0f32, f32::max);
-            let max_min = sub_mins.iter().copied().fold(0.0f32, f32::max);
-
-            // Compute d and dmin so that 4-bit sub-block factors (0..15) can represent
-            // the per-sub-block scales and mins.
+            // The scale half assigns `sc_bytes[j]`; the min half then ORs into
+            // the same bytes, so this order is load-bearing.
+            let mut sc_bytes = [0u8; 16];
             let d = if max_scale > 0.0 {
-                max_scale / 15.0
+                let iscale = Q4SCALE / max_scale;
+                for j in 0..(QK_K / 16) {
+                    sc_bytes[j] = nearest_int(iscale * scales[j]) as u8;
+                }
+                f16::from_f32(max_scale / Q4SCALE)
             } else {
-                0.0
+                f16::from_f32(0.0)
             };
-            let dmin = if max_min > 0.0 { max_min / 15.0 } else { 0.0 };
 
-            let inv_d = if d > 0.0 { 1.0 / d } else { 0.0 };
-            let inv_dmin = if dmin > 0.0 { 1.0 / dmin } else { 0.0 };
+            let dmin = if max_min > 0.0 {
+                let iscale = Q4SCALE / max_min;
+                for j in 0..(QK_K / 16) {
+                    let l = nearest_int(iscale * mins[j]) as u8;
+                    sc_bytes[j] |= l << 4;
+                }
+                f16::from_f32(max_min / Q4SCALE)
+            } else {
+                f16::from_f32(0.0)
+            };
 
-            // Quantize per-sub-block scales and mins to 4 bits
-            let mut scales = [0u8; 16];
-            let mut quant_sc = [0u8; 16];
-            let mut quant_mn = [0u8; 16];
-
-            for sub in 0..16 {
-                let sc = (sub_scales[sub] * inv_d + 0.5).min(15.0) as u8;
-                let mn = (sub_mins[sub] * inv_dmin + 0.5).min(15.0) as u8;
-                quant_sc[sub] = sc;
-                quant_mn[sub] = mn;
-                scales[sub] = sc | (mn << 4);
+            for j in 0..(QK_K / 16) {
+                let dj = d.to_f32() * ((sc_bytes[j] & 0xF) as f32);
+                if dj == 0.0 {
+                    continue;
+                }
+                let dm = dmin.to_f32() * ((sc_bytes[j] >> 4) as f32);
+                for ii in 0..16usize {
+                    let l = nearest_int((chunk[16 * j + ii] + dm) / dj).clamp(0, 3);
+                    l_codes[16 * j + ii] = l as u8;
+                }
             }
 
-            // Quantize weights to 2 bits
             let mut qs = [0u8; 64];
-            for sub in 0..16 {
-                let sub_offset = sub * 16;
-                let sc_f = d * (quant_sc[sub] as f32);
-                let mn_f = dmin * (quant_mn[sub] as f32);
-                let inv_sc = if sc_f > 0.0 { 1.0 / sc_f } else { 0.0 };
-
-                for j in 0..16 {
-                    let global_idx = sub_offset + j;
-                    let val = chunk[global_idx] + mn_f;
-                    let q = (val * inv_sc + 0.5).clamp(0.0, 3.0) as u8;
-                    let byte_idx = global_idx / 4;
-                    let shift = (global_idx % 4) * 2;
-                    qs[byte_idx] |= q << shift;
+            for j in (0..QK_K).step_by(128) {
+                for l in 0..32usize {
+                    qs[j / 4 + l] = l_codes[j + l]
+                        | (l_codes[j + l + 32] << 2)
+                        | (l_codes[j + l + 64] << 4)
+                        | (l_codes[j + l + 96] << 6);
                 }
             }
 
             blocks.push(BlockQ2K {
-                scales,
+                scales: sc_bytes,
                 qs,
-                d: f16::from_f32(d),
-                dmin: f16::from_f32(dmin),
+                d,
+                dmin,
             });
         }
 
@@ -223,7 +596,7 @@ impl BlockQ2K {
     /// Returns error if length is not a multiple of `BLOCK_Q2_K_BYTES` (84)
     /// or if the pointer is not properly aligned.
     pub fn slice_from_bytes(data: &[u8]) -> BonsaiResult<&[Self]> {
-        if data.len() % BLOCK_Q2_K_BYTES != 0 {
+        if !data.len().is_multiple_of(BLOCK_Q2_K_BYTES) {
             return Err(BonsaiError::KQuantError {
                 reason: format!(
                     "Q2_K slice_from_bytes: byte len {} not a multiple of {}",
@@ -256,24 +629,24 @@ impl BlockQ2K {
 
 /// Q3_K super-block: 256 weights quantized to 3 bits each.
 ///
-/// Layout (110 bytes):
-/// - `hmask`:  32 bytes — high bit (bit 2) for each of the 256 weights, packed 8 per byte.
-/// - `qs`:     64 bytes — low 2 bits for each of the 256 weights, packed 4 per byte.
-/// - `scales`: 12 bytes — 4-bit scale values for 16 sub-blocks of 16 weights each.
-///   Each nibble is a signed 4-bit value (stored as u4, subtract 8 for range [-8..7]).
-///   Packing: `scales[j/2] >> (4*(j%2)) & 0xF` gives sub-block j's raw scale.
+/// Layout (110 bytes, `block_q3_K` in `ggml-common.h`):
+/// - `hmask`:  32 bytes — the *inverted* high bit for each of the 256 weights.
+/// - `qs`:     64 bytes — low 2 bits for each of the 256 weights.
+/// - `scales`: 12 bytes — sixteen **6-bit** sub-block scales, biased by +32 and
+///   split into a 4-bit low part (bytes 0..8) and a 2-bit high part (bytes 8..12).
 /// - `d`: FP16 super-block scale.
 ///
-/// Dequant: `w[i] = d * sub_scale * q3_signed[i]`
-/// where `q3_signed = ((low2 | (high1<<2)) as i32) - 4`, range [-4, 3].
+/// Dequant (`dequantize_row_q3_K`, `ggml-quants.c:1360`):
+/// `w = d * (scale - 32) * (low2 - (hmask_bit ? 0 : 4))` — note the **inverted**
+/// high-bit convention: a *set* `hmask` bit means "do not subtract 4".
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(C)]
 pub struct BlockQ3K {
-    /// High bit (bit 2) for each of 256 weights, packed 8 per byte.
+    /// Inverted high bit for each of 256 weights, packed 8 per byte.
     pub hmask: [u8; 32],
-    /// Low 2 bits for each of 256 weights, packed 4 per byte (2 bits each, LSB first).
+    /// Low 2 bits for each of 256 weights, packed 4 per byte.
     pub qs: [u8; 64],
-    /// 16 × 4-bit sub-block scales, 2 per byte (low nibble = sub 2i, high nibble = sub 2i+1).
+    /// 16 x 6-bit sub-block scales in ggml's split 4-bit/2-bit packing.
     pub scales: [u8; 12],
     /// Super-block scale (FP16).
     pub d: f16,
@@ -281,10 +654,42 @@ pub struct BlockQ3K {
 
 const _: () = assert!(std::mem::size_of::<BlockQ3K>() == BLOCK_Q3K_BYTES);
 
+/// `kmask1` from `dequantize_row_q3_K` (`ggml-quants.c:1364`).
+const Q3K_KMASK1: u32 = 0x0303_0303;
+/// `kmask2` from `dequantize_row_q3_K` (`ggml-quants.c:1365`).
+const Q3K_KMASK2: u32 = 0x0f0f_0f0f;
+
+/// Unpack the 12 packed Q3_K scale bytes into 16 biased 6-bit scales, exactly
+/// as `dequantize_row_q3_K` does with its `aux[4]` / `kmask1` / `kmask2` shuffle
+/// (`ggml-quants.c:1374-1381`). The returned values still carry ggml's `+32`
+/// bias; callers subtract 32.
+fn unpack_q3k_scales(scales: &[u8; 12]) -> [u8; 16] {
+    let mut aux = [0u32; 4];
+    aux[0] = u32::from_le_bytes([scales[0], scales[1], scales[2], scales[3]]);
+    aux[1] = u32::from_le_bytes([scales[4], scales[5], scales[6], scales[7]]);
+    aux[2] = u32::from_le_bytes([scales[8], scales[9], scales[10], scales[11]]);
+
+    let tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & Q3K_KMASK2) | (((tmp >> 4) & Q3K_KMASK1) << 4);
+    aux[3] = ((aux[1] >> 4) & Q3K_KMASK2) | (((tmp >> 6) & Q3K_KMASK1) << 4);
+    aux[0] = (aux[0] & Q3K_KMASK2) | (((tmp) & Q3K_KMASK1) << 4);
+    aux[1] = (aux[1] & Q3K_KMASK2) | (((tmp >> 2) & Q3K_KMASK1) << 4);
+
+    let mut out = [0u8; 16];
+    for (k, word) in aux.iter().enumerate() {
+        out[4 * k..4 * k + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    out
+}
+
 impl BlockQ3K {
     /// Dequantize a slice of Q3_K blocks into f32 output.
     ///
+    /// Byte-exact transliteration of `dequantize_row_q3_K` (`ggml-quants.c:1360`),
+    /// including the `-32` scale bias and the inverted `hmask` convention.
+    ///
     /// `output` must have length >= `blocks.len() * QK_K` (256 per block).
+    #[allow(clippy::needless_range_loop)]
     pub fn dequant(blocks: &[Self], output: &mut [f32]) -> BonsaiResult<()> {
         let expected_len = blocks.len() * QK_K;
         if output.len() < expected_len {
@@ -298,31 +703,40 @@ impl BlockQ3K {
         }
 
         for (block_idx, block) in blocks.iter().enumerate() {
-            let d = block.d.to_f32();
-            let base = block_idx * QK_K;
+            let d_all = block.d.to_f32();
+            let sc = unpack_q3k_scales(&block.scales);
+            let hm = &block.hmask;
 
-            // 16 sub-blocks of 16 weights each; scale is 4-bit signed nibble
-            for i in 0..QK_K {
-                // Low 2 bits from qs: each byte holds 4 × 2-bit values (2 bits per weight)
-                let byte_idx = i / 4;
-                let bit_shift = (i % 4) * 2;
-                let lo2 = (block.qs[byte_idx] >> bit_shift) & 0x03;
+            let mut y = block_idx * QK_K;
+            let mut is = 0usize;
+            let mut q_off = 0usize;
+            let mut m: u8 = 1;
 
-                // High bit (bit 2) from hmask: each byte holds 8 bits, one per weight
-                let hi1 = (block.hmask[i / 8] >> (i % 8)) & 0x01;
+            for _n in 0..(QK_K / 128) {
+                let mut shift = 0u32;
+                for _j in 0..4 {
+                    let dl = d_all * ((sc[is] as i32 - 32) as f32);
+                    is += 1;
+                    for l in 0..16usize {
+                        let hi = if (hm[l] & m) != 0 { 0i32 } else { 4i32 };
+                        let q = ((block.qs[q_off + l] >> shift) & 3) as i32;
+                        output[y] = dl * ((q - hi) as f32);
+                        y += 1;
+                    }
 
-                // 3-bit code in [0..7], centered: range [-4..3]
-                let q3 = lo2 | (hi1 << 2);
-                let q3_signed = (q3 as i32) - 4;
+                    let dl = d_all * ((sc[is] as i32 - 32) as f32);
+                    is += 1;
+                    for l in 0..16usize {
+                        let hi = if (hm[l + 16] & m) != 0 { 0i32 } else { 4i32 };
+                        let q = ((block.qs[q_off + l + 16] >> shift) & 3) as i32;
+                        output[y] = dl * ((q - hi) as f32);
+                        y += 1;
+                    }
 
-                // Sub-block index: 16 sub-blocks of 16 weights each
-                let sub = i / 16;
-                // 4-bit nibble from scales (2 per byte)
-                let scale_nibble = (block.scales[sub / 2] >> (4 * (sub % 2))) & 0x0F;
-                // Signed 4-bit scale: stored as 0..15 representing -8..7
-                let scale_signed = (scale_nibble as i8) as i32 - 8;
-
-                output[base + i] = d * (scale_signed as f32) * (q3_signed as f32);
+                    shift += 2;
+                    m <<= 1;
+                }
+                q_off += 32;
             }
         }
         Ok(())
@@ -340,12 +754,14 @@ impl BlockQ3K {
 
     /// Quantize f32 input into Q3_K blocks.
     ///
-    /// Input length must be a multiple of `QK_K` (256).
+    /// Byte-exact transliteration of `quantize_row_q3_K_ref` (`ggml-quants.c:1284`),
+    /// including `make_q3_quants(16, 4, …, do_rmse = true)`, the `-32.f/max_scale`
+    /// scale requantization and the inverted-`hmask` bit extraction.
     ///
-    /// Uses symmetric per-sub-block quantization: 16 sub-blocks of 16 weights each,
-    /// mapping each sub-block to the range [-4..3] with a 4-bit signed scale.
+    /// Input length must be a multiple of `QK_K` (256).
+    #[allow(clippy::needless_range_loop)]
     pub fn quantize(input: &[f32]) -> BonsaiResult<Vec<Self>> {
-        if input.len() % QK_K != 0 {
+        if !input.len().is_multiple_of(QK_K) {
             return Err(BonsaiError::KQuantError {
                 reason: format!(
                     "Q3_K quantize: input len {} not a multiple of {}",
@@ -358,85 +774,100 @@ impl BlockQ3K {
         let num_blocks = input.len() / QK_K;
         let mut blocks = Vec::with_capacity(num_blocks);
 
+        let mut l_codes = [0i8; QK_K];
+        let mut scales = [0.0f32; QK_K / 16];
+
         for block_idx in 0..num_blocks {
             let chunk = &input[block_idx * QK_K..block_idx * QK_K + QK_K];
 
-            // Compute per-sub-block max absolute value for 16 sub-blocks of 16 weights
-            let mut sub_max_abs = [0.0f32; 16];
-            for (sub, slot) in sub_max_abs.iter_mut().enumerate() {
-                let sub_chunk = &chunk[sub * 16..(sub + 1) * 16];
-                *slot = sub_chunk.iter().map(|&v| v.abs()).fold(0.0f32, f32::max);
-            }
-
-            // Super-block scale: d * max_scale_nibble * 4 ≈ overall max abs
-            // max scale nibble is 7 (for signed scale value 7 - 8 + 8 = 7 in [0..15])
-            // and max 3-bit centered code is 3 (q3_signed in [-4..3])
-            // Effective range = d * 7 * 3 = d * 21
-            let overall_max = sub_max_abs.iter().copied().fold(0.0f32, f32::max);
-            let d = if overall_max > 0.0 {
-                overall_max / 21.0
-            } else {
-                0.0
-            };
-            let inv_d = if d > 0.0 { 1.0 / d } else { 0.0 };
-
-            // Compute per-sub-block 4-bit signed scale nibbles
-            let mut scale_nibbles = [0u8; 16];
-            for (sub, &max_abs) in sub_max_abs.iter().enumerate() {
-                // scale_signed = max_abs / (d * 3), clamped to [-8..7]
-                let sc_f = if d > 0.0 { max_abs * inv_d / 3.0 } else { 0.0 };
-                let sc_signed = sc_f.round().clamp(-8.0, 7.0) as i32;
-                // Store as 0..15 (add 8 to shift from signed to unsigned nibble)
-                scale_nibbles[sub] = (sc_signed + 8).clamp(0, 15) as u8;
-            }
-
-            // Pack nibbles into scales[12]: 2 per byte
-            let mut scales = [0u8; 12];
-            for (sub, &nibble_val) in scale_nibbles.iter().enumerate() {
-                let byte_idx = sub / 2;
-                let nibble = nibble_val & 0x0F;
-                if sub % 2 == 0 {
-                    scales[byte_idx] |= nibble;
-                } else {
-                    scales[byte_idx] |= nibble << 4;
+            let mut max_scale = 0.0f32;
+            let mut amax = 0.0f32;
+            for j in 0..(QK_K / 16) {
+                scales[j] = make_q3_quants(
+                    16,
+                    4,
+                    &chunk[16 * j..16 * j + 16],
+                    &mut l_codes[16 * j..16 * j + 16],
+                    true,
+                );
+                let scale = scales[j].abs();
+                if scale > amax {
+                    amax = scale;
+                    max_scale = scales[j];
                 }
             }
 
-            // Quantize weights to 3-bit codes
-            let mut hmask = [0u8; 32];
-            let mut qs = [0u8; 64];
+            let mut sc_bytes = [0u8; 12];
+            let d;
+            if max_scale != 0.0 {
+                let iscale = -32.0f32 / max_scale;
+                for j in 0..(QK_K / 16) {
+                    let mut l = nearest_int(iscale * scales[j]) as i8;
+                    l = l.clamp(-32, 31) + 32;
+                    if j < 8 {
+                        sc_bytes[j] = (l as u8) & 0xF;
+                    } else {
+                        sc_bytes[j - 8] |= ((l as u8) & 0xF) << 4;
+                    }
+                    l >>= 4;
+                    sc_bytes[j % 4 + 8] |= (l as u8) << (2 * (j / 4));
+                }
+                d = f16::from_f32(1.0 / iscale);
+            } else {
+                d = f16::from_f32(0.0);
+            }
 
-            for i in 0..QK_K {
-                let sub = i / 16;
-                let sc_signed = (scale_nibbles[sub] as i32) - 8;
-                // Effective scale for this sub-block
-                let eff_scale = d * (sc_signed as f32);
-                let inv_eff = if eff_scale.abs() > 1e-9 {
-                    1.0 / eff_scale
+            for j in 0..(QK_K / 16) {
+                let low = if j < 8 {
+                    sc_bytes[j] & 0xF
                 } else {
-                    0.0
+                    sc_bytes[j - 8] >> 4
                 };
+                let high = (sc_bytes[8 + j % 4] >> (2 * (j / 4))) & 3;
+                let sc = ((low | (high << 4)) as i32) - 32;
+                let dj = d.to_f32() * (sc as f32);
+                if dj == 0.0 {
+                    continue;
+                }
+                for ii in 0..16usize {
+                    let l = nearest_int(chunk[16 * j + ii] / dj).clamp(-4, 3);
+                    l_codes[16 * j + ii] = (l + 4) as i8;
+                }
+            }
 
-                // Compute 3-bit code: map w → q3_signed in [-4..3], then add 4 → [0..7]
-                let q3_signed = (chunk[i] * inv_eff).round() as i32;
-                let q3 = (q3_signed + 4).clamp(0, 7) as u8;
+            // "We put the high-bit for the 1st 8 quants into bit 0, the next 8
+            // into bit 1, etc." — and the bit is only set when the code is >= 4,
+            // which the decoder reads as "do not subtract 4".
+            let mut hmask = [0u8; QK_K / 8];
+            let mut m = 0usize;
+            let mut hm: u8 = 1;
+            for j in 0..QK_K {
+                if l_codes[j] > 3 {
+                    hmask[m] |= hm;
+                    l_codes[j] -= 4;
+                }
+                m += 1;
+                if m == QK_K / 8 {
+                    m = 0;
+                    hm <<= 1;
+                }
+            }
 
-                // Low 2 bits → qs (4 × 2-bit per byte)
-                let lo2 = q3 & 0x03;
-                let byte_idx = i / 4;
-                let bit_shift = (i % 4) * 2;
-                qs[byte_idx] |= lo2 << bit_shift;
-
-                // High bit (bit 2) → hmask (8 × 1-bit per byte)
-                let hi1 = (q3 >> 2) & 0x01;
-                hmask[i / 8] |= hi1 << (i % 8);
+            let mut qs = [0u8; 64];
+            for j in (0..QK_K).step_by(128) {
+                for l in 0..32usize {
+                    qs[j / 4 + l] = (l_codes[j + l] as u8)
+                        | ((l_codes[j + l + 32] as u8) << 2)
+                        | ((l_codes[j + l + 64] as u8) << 4)
+                        | ((l_codes[j + l + 96] as u8) << 6);
+                }
             }
 
             blocks.push(BlockQ3K {
                 hmask,
                 qs,
-                scales,
-                d: f16::from_f32(d),
+                scales: sc_bytes,
+                d,
             });
         }
 
@@ -448,7 +879,7 @@ impl BlockQ3K {
     /// Returns error if length is not a multiple of `BLOCK_Q3K_BYTES` (110)
     /// or if the pointer is not properly aligned.
     pub fn slice_from_bytes(data: &[u8]) -> BonsaiResult<&[Self]> {
-        if data.len() % BLOCK_Q3K_BYTES != 0 {
+        if !data.len().is_multiple_of(BLOCK_Q3K_BYTES) {
             return Err(BonsaiError::KQuantError {
                 reason: format!(
                     "Q3_K slice_from_bytes: byte len {} not a multiple of {}",
@@ -481,15 +912,21 @@ impl BlockQ3K {
 
 /// Q4_K super-block: 256 weights quantized to 4 bits each.
 ///
-/// Layout (144 bytes):
+/// Layout (144 bytes, `block_q4_K` in `ggml-common.h`):
 /// - `d`: FP16 super-block scale.
 /// - `dmin`: FP16 super-block minimum.
-/// - `scales`: 12 bytes — packed 6-bit scale/min values for 8 sub-blocks of 32 weights.
-///   Encoding: bytes 0..3 hold low 4 bits of scale[0..7], bytes 4..7 hold low 4 bits
-///   of min[0..7], bytes 8..11 hold the upper 2 bits of scales and mins packed.
-/// - `qs`: 128 bytes — 256 x 4-bit quantized weights (2 per byte).
+/// - `scales`: 12 bytes — eight **6-bit** scales and eight 6-bit mins, packed by
+///   `get_scale_min_k4` (`ggml-quants.c:935`): for `j < 4` the scale is the full
+///   low six bits of byte `j` and the min the low six bits of byte `j + 4`; for
+///   `j >= 4` the low nibbles live in bytes `j + 4` and the high two bits in the
+///   top bits of bytes `j - 4` / `j`.
+/// - `qs`: 128 bytes — 256 x 4-bit quantized weights.
 ///
-/// Dequant: `w[i] = d * sub_scale * q[i] - dmin * sub_min`
+/// The nibble order is **not** element-sequential: per 64-element group the
+/// decoder emits 32 *low* nibbles (`qs[l] & 0xF`) then 32 *high* nibbles
+/// (`qs[l] >> 4`).
+///
+/// Dequant: `w = d * sub_scale * q - dmin * sub_min`
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(C)]
 pub struct BlockQ4K {
@@ -497,7 +934,7 @@ pub struct BlockQ4K {
     pub d: f16,
     /// Super-block minimum (FP16).
     pub dmin: f16,
-    /// Packed 6-bit scales for 8 sub-blocks.
+    /// Packed 6-bit scales and mins for 8 sub-blocks.
     pub scales: [u8; 12],
     /// 256 x 4-bit quantized weights, 2 per byte.
     pub qs: [u8; 128],
@@ -505,82 +942,35 @@ pub struct BlockQ4K {
 
 const _: () = assert!(std::mem::size_of::<BlockQ4K>() == BLOCK_Q4_K_BYTES);
 
-/// Decode the 8 six-bit scale values and 8 six-bit min values from the
-/// 12-byte packed `scales` array in a Q4_K block.
+/// Decode all eight 6-bit scales and eight 6-bit mins from a Q4_K/Q5_K
+/// 12-byte `scales` array by calling ggml's [`get_scale_min_k4`] for each
+/// sub-block.
 ///
-/// Layout of the 12 bytes:
-/// - bytes 0..3:  low 4 bits of scale[0..7] (two per byte, 4 bits each)
-/// - bytes 4..7:  low 4 bits of min[0..7]   (two per byte, 4 bits each)
-/// - bytes 8..11: upper 2 bits of scale and min, packed
-///
-/// Specifically for bytes 8..11:
-/// - byte  8: bits 0..1 = scale[0] hi, bits 2..3 = scale[1] hi, bits 4..5 = scale[2] hi, bits 6..7 = scale[3] hi
-/// - byte  9: bits 0..1 = scale[4] hi, bits 2..3 = scale[5] hi, bits 4..5 = scale[6] hi, bits 6..7 = scale[7] hi
-/// - byte 10: bits 0..1 = min[0] hi,   bits 2..3 = min[1] hi,   bits 4..5 = min[2] hi,   bits 6..7 = min[3] hi
-/// - byte 11: bits 0..1 = min[4] hi,   bits 2..3 = min[5] hi,   bits 4..5 = min[6] hi,   bits 6..7 = min[7] hi
+/// The hot decode path calls [`get_scale_min_k4`] directly (as ggml does), so
+/// this batched form only exists for the packing round-trip tests.
+#[cfg(test)]
 fn decode_q4k_scales(scales_raw: &[u8; 12]) -> ([u8; 8], [u8; 8]) {
     let mut sc = [0u8; 8];
     let mut mn = [0u8; 8];
-
-    // Low 4 bits of scales (2 per byte in bytes 0..3)
-    for i in 0..4 {
-        sc[2 * i] = scales_raw[i] & 0x0F;
-        sc[2 * i + 1] = (scales_raw[i] >> 4) & 0x0F;
+    for j in 0..8usize {
+        let (d, m) = get_scale_min_k4(j, scales_raw);
+        sc[j] = d;
+        mn[j] = m;
     }
-
-    // Low 4 bits of mins (2 per byte in bytes 4..7)
-    for i in 0..4 {
-        mn[2 * i] = scales_raw[4 + i] & 0x0F;
-        mn[2 * i + 1] = (scales_raw[4 + i] >> 4) & 0x0F;
-    }
-
-    // Upper 2 bits of scales from bytes 8..9
-    for i in 0..4 {
-        sc[i] |= ((scales_raw[8] >> (2 * i)) & 0x03) << 4;
-        sc[4 + i] |= ((scales_raw[9] >> (2 * i)) & 0x03) << 4;
-    }
-
-    // Upper 2 bits of mins from bytes 10..11
-    for i in 0..4 {
-        mn[i] |= ((scales_raw[10] >> (2 * i)) & 0x03) << 4;
-        mn[4 + i] |= ((scales_raw[11] >> (2 * i)) & 0x03) << 4;
-    }
-
     (sc, mn)
 }
 
-/// Encode 8 six-bit scale values and 8 six-bit min values into the 12-byte
-/// packed format used by Q4_K blocks.
+/// Encode eight 6-bit scale values and eight 6-bit min values into the 12-byte
+/// packed format used by Q4_K and Q5_K — the exact inverse of
+/// [`get_scale_min_k4`].
 fn encode_q4k_scales(sc: &[u8; 8], mn: &[u8; 8]) -> [u8; 12] {
-    let mut out = [0u8; 12];
-
-    // Low 4 bits of scales into bytes 0..3
-    for i in 0..4 {
-        out[i] = (sc[2 * i] & 0x0F) | ((sc[2 * i + 1] & 0x0F) << 4);
-    }
-
-    // Low 4 bits of mins into bytes 4..7
-    for i in 0..4 {
-        out[4 + i] = (mn[2 * i] & 0x0F) | ((mn[2 * i + 1] & 0x0F) << 4);
-    }
-
-    // Upper 2 bits of scales into bytes 8..9
-    for i in 0..4 {
-        out[8] |= ((sc[i] >> 4) & 0x03) << (2 * i);
-        out[9] |= ((sc[4 + i] >> 4) & 0x03) << (2 * i);
-    }
-
-    // Upper 2 bits of mins into bytes 10..11
-    for i in 0..4 {
-        out[10] |= ((mn[i] >> 4) & 0x03) << (2 * i);
-        out[11] |= ((mn[4 + i] >> 4) & 0x03) << (2 * i);
-    }
-
-    out
+    pack_scales_min_k4(sc, mn)
 }
 
 impl BlockQ4K {
     /// Dequantize a slice of Q4_K blocks into f32 output.
+    ///
+    /// Byte-exact transliteration of `dequantize_row_q4_K` (`ggml-quants.c:1584`).
     ///
     /// `output` must have length >= `blocks.len() * QK_K`.
     pub fn dequant(blocks: &[Self], output: &mut [f32]) -> BonsaiResult<()> {
@@ -597,27 +987,30 @@ impl BlockQ4K {
 
         for (block_idx, block) in blocks.iter().enumerate() {
             let d = block.d.to_f32();
-            let dmin_val = block.dmin.to_f32();
-            let base = block_idx * QK_K;
+            let min = block.dmin.to_f32();
 
-            let (sc, mn) = decode_q4k_scales(&block.scales);
+            let mut y = block_idx * QK_K;
+            let mut q_off = 0usize;
+            let mut is = 0usize;
 
-            // 8 sub-blocks of 32 weights each
-            for sub in 0..8 {
-                let sub_scale = d * (sc[sub] as f32);
-                let sub_min = dmin_val * (mn[sub] as f32);
-                let sub_offset = sub * 32;
+            for _j in (0..QK_K).step_by(64) {
+                let (sc, m) = get_scale_min_k4(is, &block.scales);
+                let d1 = d * (sc as f32);
+                let m1 = min * (m as f32);
+                let (sc, m) = get_scale_min_k4(is + 1, &block.scales);
+                let d2 = d * (sc as f32);
+                let m2 = min * (m as f32);
 
-                for j in 0..32 {
-                    let global_idx = sub_offset + j;
-                    let byte_idx = global_idx / 2;
-                    let q = if global_idx % 2 == 0 {
-                        (block.qs[byte_idx] & 0x0F) as f32
-                    } else {
-                        ((block.qs[byte_idx] >> 4) & 0x0F) as f32
-                    };
-                    output[base + global_idx] = sub_scale * q - sub_min;
+                for l in 0..32usize {
+                    output[y] = d1 * ((block.qs[q_off + l] & 0xF) as f32) - m1;
+                    y += 1;
                 }
+                for l in 0..32usize {
+                    output[y] = d2 * ((block.qs[q_off + l] >> 4) as f32) - m2;
+                    y += 1;
+                }
+                q_off += 32;
+                is += 2;
             }
         }
         Ok(())
@@ -625,9 +1018,14 @@ impl BlockQ4K {
 
     /// Quantize f32 input into Q4_K blocks.
     ///
+    /// Byte-exact transliteration of `quantize_row_q4_K_ref` (`ggml-quants.c:1512`),
+    /// including the `av_x + |x|` importance weights and
+    /// `make_qkx2_quants(32, 15, …, -1.0, 0.1, 20, use_mad = false)`.
+    ///
     /// Input length must be a multiple of `QK_K` (256).
+    #[allow(clippy::needless_range_loop)]
     pub fn quantize(input: &[f32]) -> BonsaiResult<Vec<Self>> {
-        if input.len() % QK_K != 0 {
+        if !input.len().is_multiple_of(QK_K) {
             return Err(BonsaiError::KQuantError {
                 reason: format!(
                     "Q4_K quantize: input len {} not a multiple of {}",
@@ -640,83 +1038,93 @@ impl BlockQ4K {
         let num_blocks = input.len() / QK_K;
         let mut blocks = Vec::with_capacity(num_blocks);
 
+        let mut l_codes = [0u8; QK_K];
+        let mut laux = [0u8; 32];
+        let mut weights = [0.0f32; 32];
+        let mut mins = [0.0f32; QK_K / 32];
+        let mut scales = [0.0f32; QK_K / 32];
+
         for block_idx in 0..num_blocks {
-            let base = block_idx * QK_K;
-            let chunk = &input[base..base + QK_K];
+            let chunk = &input[block_idx * QK_K..block_idx * QK_K + QK_K];
 
-            // 8 sub-blocks of 32 weights
-            let mut sub_scales = [0.0f32; 8];
-            let mut sub_mins = [0.0f32; 8];
-
-            for sub in 0..8 {
-                let sub_offset = sub * 32;
-                let sub_chunk = &chunk[sub_offset..sub_offset + 32];
-
-                let mut smin = f32::MAX;
-                let mut smax = f32::MIN;
-                for &v in sub_chunk {
-                    if v < smin {
-                        smin = v;
-                    }
-                    if v > smax {
-                        smax = v;
-                    }
+            let mut max_scale = 0.0f32;
+            let mut max_min = 0.0f32;
+            for j in 0..(QK_K / 32) {
+                let mut sum_x2 = 0.0f32;
+                for l in 0..32usize {
+                    sum_x2 += chunk[32 * j + l] * chunk[32 * j + l];
                 }
-
-                sub_mins[sub] = if smin < 0.0 { -smin } else { 0.0 };
-                let range = smax + sub_mins[sub];
-                sub_scales[sub] = if range > 0.0 { range / 15.0 } else { 0.0 };
+                let av_x = (sum_x2 / 32.0).sqrt();
+                for l in 0..32usize {
+                    weights[l] = av_x + chunk[32 * j + l].abs();
+                }
+                let mut this_min = 0.0f32;
+                scales[j] = make_qkx2_quants(
+                    32,
+                    15,
+                    &chunk[32 * j..32 * j + 32],
+                    &weights,
+                    &mut l_codes[32 * j..32 * j + 32],
+                    &mut this_min,
+                    &mut laux,
+                    -1.0,
+                    0.1,
+                    20,
+                    false,
+                );
+                mins[j] = this_min;
+                if scales[j] > max_scale {
+                    max_scale = scales[j];
+                }
+                if mins[j] > max_min {
+                    max_min = mins[j];
+                }
             }
 
-            let max_scale = sub_scales.iter().copied().fold(0.0f32, f32::max);
-            let max_min = sub_mins.iter().copied().fold(0.0f32, f32::max);
-
-            // 6-bit sub-block factors: 0..63
-            let d = if max_scale > 0.0 {
-                max_scale / 63.0
+            let inv_scale = if max_scale > 0.0 {
+                63.0 / max_scale
             } else {
                 0.0
             };
-            let dmin = if max_min > 0.0 { max_min / 63.0 } else { 0.0 };
+            let inv_min = if max_min > 0.0 { 63.0 / max_min } else { 0.0 };
 
-            let inv_d = if d > 0.0 { 1.0 / d } else { 0.0 };
-            let inv_dmin = if dmin > 0.0 { 1.0 / dmin } else { 0.0 };
-
-            let mut sc = [0u8; 8];
-            let mut mn = [0u8; 8];
-
-            for sub in 0..8 {
-                sc[sub] = (sub_scales[sub] * inv_d + 0.5).min(63.0) as u8;
-                mn[sub] = (sub_mins[sub] * inv_dmin + 0.5).min(63.0) as u8;
+            let mut sc_arr = [0u8; 8];
+            let mut mn_arr = [0u8; 8];
+            for j in 0..(QK_K / 32) {
+                sc_arr[j] = (nearest_int(inv_scale * scales[j]) as u8).min(63);
+                mn_arr[j] = (nearest_int(inv_min * mins[j]) as u8).min(63);
             }
+            let sc_bytes = encode_q4k_scales(&sc_arr, &mn_arr);
 
-            let scales = encode_q4k_scales(&sc, &mn);
+            let d = f16::from_f32(max_scale / 63.0);
+            let dmin = f16::from_f32(max_min / 63.0);
 
-            // Quantize weights to 4 bits
-            let mut qs = [0u8; 128];
-            for sub in 0..8 {
-                let sub_offset = sub * 32;
-                let sc_f = d * (sc[sub] as f32);
-                let mn_f = dmin * (mn[sub] as f32);
-                let inv_sc = if sc_f > 0.0 { 1.0 / sc_f } else { 0.0 };
-
-                for j in 0..32 {
-                    let global_idx = sub_offset + j;
-                    let val = chunk[global_idx] + mn_f;
-                    let q = (val * inv_sc + 0.5).clamp(0.0, 15.0) as u8;
-                    let byte_idx = global_idx / 2;
-                    if global_idx % 2 == 0 {
-                        qs[byte_idx] |= q & 0x0F;
-                    } else {
-                        qs[byte_idx] |= (q & 0x0F) << 4;
-                    }
+            for j in 0..(QK_K / 32) {
+                let (sc, m) = get_scale_min_k4(j, &sc_bytes);
+                let dj = d.to_f32() * (sc as f32);
+                if dj == 0.0 {
+                    continue;
+                }
+                let dm = dmin.to_f32() * (m as f32);
+                for ii in 0..32usize {
+                    let l = nearest_int((chunk[32 * j + ii] + dm) / dj).clamp(0, 15);
+                    l_codes[32 * j + ii] = l as u8;
                 }
             }
 
+            let mut qs = [0u8; 128];
+            let mut q_off = 0usize;
+            for j in (0..QK_K).step_by(64) {
+                for l in 0..32usize {
+                    qs[q_off + l] = l_codes[j + l] | (l_codes[j + l + 32] << 4);
+                }
+                q_off += 32;
+            }
+
             blocks.push(BlockQ4K {
-                d: f16::from_f32(d),
-                dmin: f16::from_f32(dmin),
-                scales,
+                d,
+                dmin,
+                scales: sc_bytes,
                 qs,
             });
         }
@@ -739,7 +1147,7 @@ impl BlockQ4K {
     /// Returns error if length is not a multiple of `BLOCK_Q4_K_BYTES` (144)
     /// or if the pointer is not properly aligned.
     pub fn slice_from_bytes(data: &[u8]) -> BonsaiResult<&[Self]> {
-        if data.len() % BLOCK_Q4_K_BYTES != 0 {
+        if !data.len().is_multiple_of(BLOCK_Q4_K_BYTES) {
             return Err(BonsaiError::KQuantError {
                 reason: format!(
                     "Q4_K slice_from_bytes: byte len {} not a multiple of {}",
@@ -765,7 +1173,6 @@ impl BlockQ4K {
         Ok(unsafe { std::slice::from_raw_parts(ptr, count) })
     }
 }
-
 // ---------------------------------------------------------------------------
 // BlockQ8K
 // ---------------------------------------------------------------------------
@@ -835,7 +1242,7 @@ impl BlockQ8K {
     /// populated with the sum of each group of 16 weights (useful for SIMD optimized
     /// dot-product computation in other implementations).
     pub fn quantize(input: &[f32]) -> BonsaiResult<Vec<Self>> {
-        if input.len() % QK_K != 0 {
+        if !input.len().is_multiple_of(QK_K) {
             return Err(BonsaiError::KQuantError {
                 reason: format!(
                     "Q8_K quantize: input len {} not a multiple of {}",
@@ -884,7 +1291,7 @@ impl BlockQ8K {
     /// Returns error if length is not a multiple of `BLOCK_Q8K_BYTES` (292)
     /// or if the pointer is not properly aligned.
     pub fn slice_from_bytes(data: &[u8]) -> BonsaiResult<&[Self]> {
-        if data.len() % BLOCK_Q8K_BYTES != 0 {
+        if !data.len().is_multiple_of(BLOCK_Q8K_BYTES) {
             return Err(BonsaiError::KQuantError {
                 reason: format!(
                     "Q8_K slice_from_bytes: byte len {} not a multiple of {}",
@@ -1056,9 +1463,39 @@ mod tests {
 
     #[test]
     fn q3k_slice_from_bytes() {
-        // Create a valid aligned byte buffer of exactly 110 bytes and parse it.
-        let data = vec![0u8; BLOCK_Q3K_BYTES];
-        let result = BlockQ3K::slice_from_bytes(&data).expect("single block should parse");
+        // wave-2.5 addendum (6) (Miri, pre-existing): borrow directly from a
+        // real `BlockQ3K`'s own (compiler-guaranteed-aligned) stack address,
+        // rather than reinterpreting a `Vec<u8>`'s buffer — `align_of::<u8>()
+        // == 1`, so nothing guarantees a `Vec<u8>` allocation is aligned to
+        // `align_of::<BlockQ3K>()`; real-world allocators are generous about
+        // it, but Miri's is not (`cargo +nightly miri test -p
+        // oxibonsai-core --no-default-features --lib` tripped the (correct)
+        // alignment guard on a perfectly legitimate all-zero block). Same
+        // technique as `tensor.rs::one_bit_tensor_dequantize`.
+        //
+        // `f16::from_bits(0)`, not `f16::from_f32(0.0)` (verifier, wave 3):
+        // re-running this fix under Miri surfaced a second, unrelated wall
+        // — `half`'s aarch64 `f32_to_f16` path is `asm!`-based (hardware
+        // `fcvt`), which Miri's interpreter cannot execute at all
+        // ("unsupported operation: inline assembly is not supported"),
+        // independent of alignment. `from_bits` is a plain `u16` transmute
+        // (IEEE-754 half-precision zero is bit pattern `0x0000`, exactly
+        // like `f32`/`f64`), so it exercises neither the alignment guard
+        // nor any hardware conversion intrinsic. Confirmed green under
+        // `cargo +nightly miri test -p oxibonsai-core --no-default-features
+        // --lib q3k_slice_from_bytes` after this change (was previously
+        // still red, just for this different reason, even after the
+        // alignment fix alone).
+        let block = BlockQ3K {
+            hmask: [0u8; 32],
+            qs: [0u8; 64],
+            scales: [0u8; 12],
+            d: f16::from_bits(0),
+        };
+        let data: &[u8] = unsafe {
+            std::slice::from_raw_parts(&block as *const BlockQ3K as *const u8, BLOCK_Q3K_BYTES)
+        };
+        let result = BlockQ3K::slice_from_bytes(data).expect("single block should parse");
         assert_eq!(result.len(), 1);
     }
 
@@ -1140,8 +1577,18 @@ mod tests {
 
     #[test]
     fn q8k_slice_from_bytes() {
-        let data = vec![0u8; BLOCK_Q8K_BYTES];
-        let result = BlockQ8K::slice_from_bytes(&data).expect("single block should parse");
+        // wave-2.5 addendum (6) (Miri, pre-existing): see
+        // `q3k_slice_from_bytes`'s doc comment — same borrow-from-a-real-
+        // aligned-value fix, not a `Vec<u8>` reinterpreted as bytes.
+        let block = BlockQ8K {
+            d: 0.0f32,
+            qs: [0i8; 256],
+            bsums: [0i16; 16],
+        };
+        let data: &[u8] = unsafe {
+            std::slice::from_raw_parts(&block as *const BlockQ8K as *const u8, BLOCK_Q8K_BYTES)
+        };
+        let result = BlockQ8K::slice_from_bytes(data).expect("single block should parse");
         assert_eq!(result.len(), 1);
     }
 

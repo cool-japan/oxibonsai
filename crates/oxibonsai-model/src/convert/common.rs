@@ -4,23 +4,32 @@
 //! (`convert::onnx::convert_onnx_to_gguf`) emit the same GGUF layout and share:
 //!
 //! * Parsing of the sibling `config.json`.
-//! * Writing Qwen3 metadata (architecture, dimensions, norm epsilon, rope base).
-//! * Padding `f32` weights to a multiple of the 128-element group size shared
-//!   by both TQ2_0_g128 and Q1_0_g128.
-//! * Serialising `BlockTQ2_0_g128` blocks into raw GGUF tensor bytes (the
-//!   Q1_0_g128 path uses [`crate::quantize::quantize_q1_0_g128`] directly,
-//!   which already returns raw bytes).
-//! * A single `ConvertStats` result struct so callers can report progress
+//! * Writing the `general.*`, `<arch>.*` and `tokenizer.ggml.*` blocks (via
+//!   [`crate::convert::meta`] and [`crate::convert::tokenizer_meta`]).
+//! * Deciding which GGUF tensor type each tensor gets, including the FP32
+//!   carve-outs and the per-row block-alignment rule.
+//! * A single [`ConvertStats`] result struct so callers can report progress
 //!   uniformly.
+//! * [`UnmappedReport`], which turns silently-dropped tensors into a hard
+//!   error (CQ-04).
 
 use std::path::Path;
 
 use anyhow::Context;
 use serde_json::Value;
 
-use oxibonsai_core::gguf::tensor_info::keys;
-use oxibonsai_core::gguf::writer::{GgufWriter, MetadataWriteValue};
+use oxibonsai_core::gguf::writer::{GgufWriter, TensorType};
 use oxibonsai_core::quant_ternary::{BlockTQ2_0_g128, BLOCK_TQ2_0_G128_BYTES};
+use serde_json::Value as JsonValue;
+
+use crate::convert::meta::{
+    architecture_from_config_json, ggml_file_type, resolve_rope_theta, write_arch_metadata,
+    write_general_metadata, ArchMetadata, GeneralMetadata,
+};
+use crate::convert::qwen35::is_never_quantized_qwen35;
+use crate::convert::tokenizer_meta::{pre_tokenizer_for_arch, TokenizerMetadata};
+use crate::export::keep_fp32_by_kind;
+use crate::quantize::{row_is_block_aligned, SourceDtype};
 
 /// Statistics returned after a successful conversion.
 ///
@@ -31,8 +40,7 @@ use oxibonsai_core::quant_ternary::{BlockTQ2_0_g128, BLOCK_TQ2_0_G128_BYTES};
 pub struct ConvertStats {
     /// Total number of tensors written to the GGUF file.
     pub n_tensors: usize,
-    /// Number of tensors quantized to the requested format (TQ2_0_g128 or
-    /// Q1_0_g128, per the `quant` argument the converter was called with).
+    /// Number of tensors quantized to the requested format.
     pub n_ternary: usize,
     /// Number of tensors stored as FP32.
     pub n_fp32: usize,
@@ -40,9 +48,109 @@ pub struct ConvertStats {
     pub n_bf16: usize,
     /// Number of tensors stored verbatim as F16.
     pub n_f16: usize,
+    /// Number of source tensors that had no mapping and were skipped.
+    ///
+    /// Non-zero only when the caller explicitly allowed unmapped tensors;
+    /// otherwise the conversion fails instead (CQ-04).
+    pub n_unmapped: usize,
     /// Total size of the output GGUF file in bytes.
     pub output_bytes: usize,
 }
+
+// ─── Completeness ─────────────────────────────────────────────────────────────
+
+/// Collects source tensors the converter could not place in the output.
+///
+/// Both converters used to `continue` past an unrecognised tensor name at
+/// `debug`/`warn` level and then report success, so a model with a renamed
+/// layer silently produced a GGUF missing whole projections and exited 0
+/// (CQ-04). There are two distinct ways that happened — an unmapped *name*
+/// and an unsupported source *dtype* — and this type records both.
+#[derive(Debug, Clone, Default)]
+pub struct UnmappedReport {
+    /// Source tensor names with no GGUF counterpart.
+    pub unmapped_names: Vec<String>,
+    /// Source tensors whose element type this crate cannot decode,
+    /// as `(name, dtype label)`.
+    pub unsupported_dtypes: Vec<(String, String)>,
+    /// GGUF names that two different source tensors both mapped to.
+    ///
+    /// The pending-tensor tables are keyed by GGUF name, so a two-to-one
+    /// mapping overwrites rather than skips — which no count-based check
+    /// would ever notice.
+    pub collisions: Vec<(String, String, String)>,
+}
+
+impl UnmappedReport {
+    /// Record a source tensor with no GGUF counterpart.
+    pub fn push_unmapped(&mut self, name: &str) {
+        self.unmapped_names.push(name.to_string());
+    }
+
+    /// Record a source tensor whose dtype cannot be decoded.
+    pub fn push_unsupported_dtype(&mut self, name: &str, dtype: &str) {
+        self.unsupported_dtypes
+            .push((name.to_string(), dtype.to_string()));
+    }
+
+    /// Record two source tensors competing for one GGUF name.
+    pub fn push_collision(&mut self, gguf_name: &str, first: &str, second: &str) {
+        self.collisions
+            .push((gguf_name.to_string(), first.to_string(), second.to_string()));
+    }
+
+    /// Total number of source tensors that did not reach the output.
+    pub fn count(&self) -> usize {
+        self.unmapped_names.len() + self.unsupported_dtypes.len() + self.collisions.len()
+    }
+
+    /// Whether every source tensor was accounted for.
+    pub fn is_complete(&self) -> bool {
+        self.count() == 0
+    }
+
+    /// Fail unless the conversion was complete or the caller opted out.
+    ///
+    /// `allow_unmapped` corresponds to the CLI's `--allow-unmapped`.
+    pub fn check(&self, allow_unmapped: bool) -> anyhow::Result<()> {
+        if self.is_complete() || allow_unmapped {
+            return Ok(());
+        }
+        anyhow::bail!("{}", self.describe());
+    }
+
+    /// A full, human-readable listing — never a truncated summary, because
+    /// the whole point is to name every tensor that went missing.
+    pub fn describe(&self) -> String {
+        let mut out = format!(
+            "conversion is incomplete: {} source tensor(s) did not reach the output \
+             (pass --allow-unmapped to convert anyway)",
+            self.count()
+        );
+        if !self.unmapped_names.is_empty() {
+            out.push_str("\n  unmapped tensor names:");
+            for name in &self.unmapped_names {
+                out.push_str("\n    - ");
+                out.push_str(name);
+            }
+        }
+        if !self.unsupported_dtypes.is_empty() {
+            out.push_str("\n  unsupported source dtypes:");
+            for (name, dtype) in &self.unsupported_dtypes {
+                out.push_str(&format!("\n    - {name} ({dtype})"));
+            }
+        }
+        if !self.collisions.is_empty() {
+            out.push_str("\n  two source tensors mapped to one GGUF name:");
+            for (gguf, first, second) in &self.collisions {
+                out.push_str(&format!("\n    - {gguf} <- {first} and {second}"));
+            }
+        }
+        out
+    }
+}
+
+// ─── config.json ──────────────────────────────────────────────────────────────
 
 /// Read and parse `config.json` at the given path.
 ///
@@ -57,163 +165,237 @@ pub fn read_config_json(config_path: &Path) -> anyhow::Result<Value> {
     Ok(value)
 }
 
-/// Write Qwen3 metadata from `config.json` into a GGUF writer.
+/// Reject a `config.json` whose `architectures` entry names a model family
+/// this converter does not implement.
 ///
-/// The caller provides the human-readable model name; for HF this is usually
-/// the directory basename, and for ONNX the `.onnx` file stem or repository
-/// identifier. `quant` is the target quantisation format string (as accepted
-/// by [`crate::convert::convert_hf_to_gguf`] / `convert_onnx_to_gguf`, e.g.
-/// `"tq2_0_g128"` or `"q1_0_g128"`) — it is recorded verbatim (uppercased) in
-/// the `general.quantization_version` metadata field so `oxibonsai info`
-/// reports the format that was actually written, not a hard-coded one.
+/// No converter previously looked at `architectures` at all, so pointing
+/// `convert` at, say, a Llama checkpoint produced a file labelled `qwen3`
+/// with Qwen3 tensor names and silently wrong dimensions.
+pub fn check_supported_architecture(config: &Value) -> anyhow::Result<()> {
+    const SUPPORTED: [&str; 6] = ["qwen2", "qwen3", "qwen35", "qwen3_next", "bonsai", "prism"];
+
+    let listed: Vec<String> = config
+        .get("architectures")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if listed.is_empty() {
+        // `model_type` alone is enough for the older exports that omit
+        // `architectures`; absence is not evidence of a wrong model.
+        return Ok(());
+    }
+    let ok = listed.iter().any(|a| {
+        let lower = a.to_ascii_lowercase();
+        SUPPORTED.iter().any(|s| lower.contains(s))
+    });
+    if ok {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "config.json declares architectures {:?}, none of which this converter implements \
+         (supported families: {:?}); converting would produce a file labelled qwen3 with \
+         Qwen3 tensor names and the wrong dimensions",
+        listed,
+        SUPPORTED
+    )
+}
+
+// ─── Metadata ─────────────────────────────────────────────────────────────────
+
+/// Write the complete metadata block for a converted model.
+///
+/// Emits `general.*` (with `quantization_version` as a **U32**, never a
+/// string), the `<arch>.*` hyper-parameters under the real architecture
+/// prefix (never the non-existent `llm.*`), and — when a tokenizer is found
+/// next to the source — the whole `tokenizer.ggml.*` vocabulary (CQ-08).
+///
+/// `source_dir` is where the tokenizer is looked for; pass the model
+/// directory. `quant` is the target format string (`"pq2_0"`, `"q1_0_g128"`,
+/// …), recorded as a non-normative label and reflected in
+/// `general.file_type`.
 pub fn write_metadata(
-    writer: &mut GgufWriter,
+    writer: &mut GgufWriter<'_>,
     config: &Value,
     model_name: &str,
     quant: &str,
+    source_dir: Option<&Path>,
 ) -> anyhow::Result<()> {
-    // Architecture constant
-    writer.add_metadata(
-        keys::GENERAL_ARCHITECTURE,
-        MetadataWriteValue::Str("qwen3".to_string()),
-    );
+    let tensor_type = quant_format_tensor_type(quant)
+        .ok_or_else(|| anyhow::anyhow!("unsupported quantisation format '{quant}'"))?;
+    let architecture = architecture_from_config_json(config);
 
-    // Human-readable model name
-    writer.add_metadata(
-        keys::GENERAL_NAME,
-        MetadataWriteValue::Str(model_name.to_string()),
-    );
-
-    // Quantisation version string — reflects the actual format written for
-    // this conversion (each caller validates `quant` before reaching here).
-    let quant_version = match quant {
-        "tq2_0_g128" => "TQ2_0_G128".to_string(),
-        "q1_0_g128" => "Q1_0_G128".to_string(),
-        other => other.to_uppercase(),
+    let general = GeneralMetadata {
+        architecture: architecture.clone(),
+        name: model_name.to_string(),
+        version: None,
+        description: None,
+        file_type: ggml_file_type(tensor_type),
+        quant_format: Some(quant.to_ascii_uppercase()),
+        scale_rule: Some("AbsMean".to_string()),
     };
-    writer.add_metadata(
-        "general.quantization_version",
-        MetadataWriteValue::Str(quant_version),
-    );
+    write_general_metadata(writer, &general);
 
-    // Integer keys (u32) - required.
-    let u32_keys = [
-        (keys::LLM_BLOCK_COUNT, "num_hidden_layers"),
-        (keys::LLM_EMBEDDING_LENGTH, "hidden_size"),
-        (keys::LLM_FEED_FORWARD_LENGTH, "intermediate_size"),
-        (keys::LLM_ATTENTION_HEAD_COUNT, "num_attention_heads"),
-        (keys::LLM_ATTENTION_HEAD_COUNT_KV, "num_key_value_heads"),
-        (keys::LLM_CONTEXT_LENGTH, "max_position_embeddings"),
-        (keys::LLM_VOCAB_SIZE, "vocab_size"),
-    ];
-    for (gguf_key, json_key) in &u32_keys {
-        if let Some(val) = config.get(*json_key).and_then(Value::as_u64) {
-            writer.add_metadata(gguf_key, MetadataWriteValue::U32(val as u32));
-        } else {
-            tracing::warn!(json_key, "missing or non-u64 field in config.json");
-        }
-    }
+    let arch_meta = ArchMetadata::from_config_json(config)?;
+    write_arch_metadata(writer, &architecture, &arch_meta);
 
-    // head_dim is optional in config.json: Qwen3 (1.7B/4B/8B/14B) sets it
-    // explicitly because head_dim is decoupled from hidden_size/num_heads
-    // (notably Qwen3-4B has hidden=2560, heads=32, head_dim=128, so the
-    // derived hidden/heads=80 is wrong). Older Qwen2 configs omit it and
-    // the reader falls back to the hidden/heads derivation.
-    if let Some(val) = config.get("head_dim").and_then(Value::as_u64) {
-        writer.add_metadata(
-            keys::LLM_ATTENTION_KEY_LENGTH,
-            MetadataWriteValue::U32(val as u32),
-        );
-    }
-
-    // rms_norm_eps → F32
-    if let Some(eps) = config.get("rms_norm_eps").and_then(Value::as_f64) {
-        writer.add_metadata(
-            keys::LLM_ATTENTION_LAYER_NORM_RMS_EPSILON,
-            MetadataWriteValue::F32(eps as f32),
-        );
-    }
-
-    // rope_theta → F32 (default 10000.0 if absent)
-    //
-    // Resolution order:
-    //   1. `config["rope_theta"]`                    (top-level, legacy Qwen2 layout)
-    //   2. `config["rope_parameters"]["rope_theta"]` (nested, Qwen3 ONNX/newer layout)
-    //   3. 10000.0 fallback (with `tracing::warn!`)
-    let rope_theta = resolve_rope_theta(config);
-    writer.add_metadata(
-        keys::LLM_ROPE_FREQ_BASE,
-        MetadataWriteValue::F32(rope_theta as f32),
-    );
-
-    // If the nested `rope_parameters` block indicates YARN scaling, note it.
-    //
-    // The existing native `Ternary-Bonsai-1.7B.gguf` only carries
-    // `llm.rope.freq_base` — no `llm.rope.scaling.*` keys — so for now we log
-    // the YARN parameters at info level and rely on architecture defaults
-    // rather than inventing new metadata keys.
+    // If the nested `rope_parameters` block indicates YaRN scaling, note it.
     if let Some(rp) = config.get("rope_parameters").and_then(Value::as_object) {
         let rope_type = rp.get("rope_type").and_then(Value::as_str).unwrap_or("");
         if rope_type.eq_ignore_ascii_case("yarn") {
-            let factor = rp.get("factor").and_then(Value::as_f64);
+            // Fully qualified: inside `tracing::info!`, a bare `Value` would
+            // resolve to `tracing::Value`, the trait.
+            let factor = rp.get("factor").and_then(serde_json::Value::as_f64);
             let original_max_pos = rp
                 .get("original_max_position_embeddings")
-                .and_then(Value::as_u64);
+                .and_then(serde_json::Value::as_u64);
             tracing::info!(
                 ?factor,
                 ?original_max_pos,
-                "YARN rope_parameters detected; GGUF YARN metadata not plumbed, relying on architecture defaults"
+                "YaRN rope_parameters detected; relying on architecture defaults"
             );
+        }
+    }
+
+    if let Some(dir) = source_dir {
+        match TokenizerMetadata::discover(dir, pre_tokenizer_for_arch(&architecture)) {
+            Ok(Some(tokenizer)) => {
+                tracing::info!(
+                    vocab_size = tokenizer.vocab_size(),
+                    merges = tokenizer.merges.len(),
+                    "embedding tokenizer into the GGUF"
+                );
+                tokenizer.write(writer);
+            }
+            Ok(None) => tracing::warn!(
+                dir = ?dir,
+                "no tokenizer.json found next to the source model; the converted GGUF will \
+                 carry no tokenizer and will need an external one"
+            ),
+            Err(e) => return Err(anyhow::anyhow!("reading source tokenizer: {e}")),
         }
     }
 
     Ok(())
 }
 
-/// Resolve `rope_theta` from a HuggingFace `config.json` value.
+/// Map a converter `quant` string to its GGUF tensor type.
 ///
-/// Looks in this order:
-///   1. Top-level `rope_theta` (legacy Qwen2 layout).
-///   2. Nested `rope_parameters.rope_theta` (Qwen3 ONNX/newer layout).
-///   3. Fallback `10000.0` with a `tracing::warn!` describing the absence.
-fn resolve_rope_theta(config: &Value) -> f64 {
-    if let Some(v) = config.get("rope_theta").and_then(Value::as_f64) {
-        return v;
+/// `"tq2_0_g128"` resolves to [`TensorType::PQ2_0`] — ggml id **142**, `d`
+/// first — not to the legacy qs-first id 42. The two carry identical ternary
+/// data, but only 142 is a layout any other ggml consumer can read
+/// (core-gguf-02): `llama.cpp` validates each tensor offset against the
+/// running padded sum and hard-errors on the 34-byte-at-id-42 files, and the
+/// Prism fork prints a dedicated hint naming exactly them.
+pub fn quant_format_tensor_type(quant: &str) -> Option<TensorType> {
+    match quant {
+        "tq2_0_g128" | "pq2_0" => Some(TensorType::PQ2_0),
+        "q1_0_g128" => Some(TensorType::Q1_0G128),
+        "ptq1_0" => Some(TensorType::PTQ1_0),
+        "q2_0_g64" => Some(TensorType::Q2_0G64),
+        "f32" => Some(TensorType::F32),
+        _ => None,
     }
-    if let Some(v) = config
-        .get("rope_parameters")
-        .and_then(|rp| rp.get("rope_theta"))
-        .and_then(Value::as_f64)
-    {
-        return v;
-    }
-    tracing::warn!(
-        "config.json missing both `rope_theta` and `rope_parameters.rope_theta`; \
-         falling back to default 10000.0"
-    );
-    10000.0
 }
 
-/// Pad an f32 slice to a multiple of 128 elements for TQ2_0_g128 quantisation.
+/// Every `quant` string the converters accept, for help text and errors.
+pub const SUPPORTED_QUANT_FORMATS: [&str; 6] = [
+    "tq2_0_g128",
+    "pq2_0",
+    "ptq1_0",
+    "q2_0_g64",
+    "q1_0_g128",
+    "f32",
+];
+
+// ─── Tensor typing ────────────────────────────────────────────────────────────
+
+/// Decide the GGUF tensor type for one converted tensor.
 ///
-/// If the length is already block-aligned, the slice is copied verbatim.
-/// Otherwise the tail is zero-padded up to the next multiple of 128.
-pub fn pad_to_multiple_of_128(f32_data: &[f32]) -> Vec<f32> {
-    let len = f32_data.len();
-    let remainder = len % 128;
-    if remainder == 0 {
-        f32_data.to_vec()
-    } else {
-        let padded_len = len + (128 - remainder);
-        let mut padded = f32_data.to_vec();
-        padded.resize(padded_len, 0.0_f32);
-        padded
+/// Four rules, in order:
+///
+/// 1. A norm gain or any 1-D tensor stays in a float type — quantizing an
+///    RMSNorm weight measured up to 910 % relative error (CQ-02). It is
+///    written back in the dtype it arrived in, so a bf16 norm stays bf16
+///    instead of being inflated 2× to f32 (CQ-M2).
+/// 2. A `qwen35` hybrid scalar/conv weight that policy excludes from
+///    quantization even though its shape passes rule 1 — e.g. the real
+///    27B's `ssm_alpha.weight` / `ssm_beta.weight` are `[5120, 48]` BF16,
+///    two-dimensional with a block-aligned `ne0` (CQ-06 residue). Applied
+///    unconditionally rather than gated on the source architecture: these
+///    exact tensor names never occur in any other supported architecture.
+///    Also written back in its source dtype, like rule 1.
+/// 3. A tensor whose first (fastest-varying) dimension is not a whole number
+///    of blocks has no valid encoding in the target format, so it stays float
+///    too — exactly what `llama.cpp`'s quantizer does. The converter used to
+///    zero-pad the *flattened* tensor instead, which made every row after the
+///    first straddle a group boundary (CQ-14).
+/// 4. Otherwise, the requested quantized type.
+pub fn tensor_type_for(
+    name: &str,
+    gguf_shape: &[u64],
+    source_dtype: SourceDtype,
+    target: TensorType,
+    is_norm: bool,
+) -> TensorType {
+    let shape_usize: Vec<usize> = gguf_shape.iter().map(|&d| d as usize).collect();
+    if is_norm || keep_fp32_by_kind(name, &shape_usize) || is_never_quantized_qwen35(name) {
+        return unquantized_type(source_dtype, is_norm);
     }
+    let ne0 = gguf_shape.first().copied().unwrap_or(0) as usize;
+    if !row_is_block_aligned(ne0, target) {
+        tracing::info!(
+            tensor = name,
+            ne0,
+            block_size = target.block_size(),
+            "first dimension is not a block multiple — keeping this tensor unquantized"
+        );
+        return unquantized_type(source_dtype, is_norm);
+    }
+    target
+}
+
+/// The float type an unquantized tensor is written as.
+///
+/// Norm gains are always widened to F32: they are tiny, and every consumer in
+/// this workspace reads them as f32. Anything else keeps its source dtype.
+fn unquantized_type(source_dtype: SourceDtype, is_norm: bool) -> TensorType {
+    if is_norm {
+        return TensorType::F32;
+    }
+    match source_dtype {
+        SourceDtype::F32 => TensorType::F32,
+        SourceDtype::F16 => TensorType::F16,
+        SourceDtype::BF16 => TensorType::BF16,
+    }
+}
+
+/// Count one written tensor into [`ConvertStats`].
+pub fn record_tensor(stats: &mut ConvertStats, tensor_type: TensorType) {
+    match tensor_type {
+        TensorType::F32 => stats.n_fp32 += 1,
+        TensorType::F16 => stats.n_f16 += 1,
+        TensorType::BF16 => stats.n_bf16 += 1,
+        _ => stats.n_ternary += 1,
+    }
+    stats.n_tensors += 1;
 }
 
 /// Serialise a slice of `BlockTQ2_0_g128` blocks into raw bytes.
 ///
 /// Each block is 34 bytes: 32 bytes of packed `qs` + 2 bytes of FP16 `d`.
+///
+/// **This is the legacy qs-first layout and must never be used for
+/// `PQ2_0`** — that type is `d`-first, so reusing this cast would emit
+/// byte-swapped blocks which still pass every length check. Go through
+/// [`crate::quantize::encode_quantized_tensor`] instead, which picks the
+/// right block struct per tensor type.
 ///
 /// # Safety
 ///
@@ -227,74 +409,223 @@ pub fn blocks_to_bytes(blocks: &[BlockTQ2_0_g128]) -> Vec<u8> {
     bytes.to_vec()
 }
 
+/// Re-export so the ONNX path can resolve `rope_theta` the same way.
+pub fn config_rope_theta(config: &JsonValue) -> f64 {
+    resolve_rope_theta(config)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oxibonsai_core::gguf::reader::GgufFile;
     use serde_json::json;
 
-    #[test]
-    fn pad_aligned_is_identity() {
-        let v = vec![1.0_f32; 128];
-        assert_eq!(pad_to_multiple_of_128(&v), v);
+    fn minimal_config() -> Value {
+        json!({
+            "num_hidden_layers": 2,
+            "hidden_size": 128,
+            "intermediate_size": 256,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "max_position_embeddings": 512,
+            "vocab_size": 1024,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 1_000_000.0,
+        })
     }
 
     #[test]
-    fn pad_extends_to_next_block() {
-        let v = vec![1.0_f32; 130];
-        let padded = pad_to_multiple_of_128(&v);
-        assert_eq!(padded.len(), 256);
-        assert_eq!(&padded[..130], &v[..]);
-        assert!(padded[130..].iter().all(|&x| x == 0.0));
+    fn group_128_ternary_resolves_to_pq2_0_not_id_42() {
+        assert_eq!(
+            quant_format_tensor_type("tq2_0_g128"),
+            Some(TensorType::PQ2_0)
+        );
+        assert_eq!(quant_format_tensor_type("pq2_0"), Some(TensorType::PQ2_0));
+        assert_eq!(TensorType::PQ2_0.wire_id(), 142);
+        assert_eq!(quant_format_tensor_type("ptq1_0"), Some(TensorType::PTQ1_0));
+        assert_eq!(
+            quant_format_tensor_type("q2_0_g64"),
+            Some(TensorType::Q2_0G64)
+        );
+        assert_eq!(TensorType::Q2_0G64.wire_id(), 42);
+        assert!(quant_format_tensor_type("nope").is_none());
     }
 
     #[test]
-    fn empty_input_stays_empty() {
-        let v: Vec<f32> = Vec::new();
-        assert!(pad_to_multiple_of_128(&v).is_empty());
+    fn metadata_is_spec_typed_and_arch_prefixed() {
+        let mut w = GgufWriter::new();
+        write_metadata(&mut w, &minimal_config(), "unit", "tq2_0_g128", None)
+            .expect("write metadata");
+        let bytes = w.to_bytes().expect("serialise");
+        let gguf = GgufFile::parse(&bytes).expect("parse");
+
+        assert_eq!(
+            gguf.metadata.get_u32("general.quantization_version").ok(),
+            Some(2)
+        );
+        assert_eq!(gguf.metadata.get_u32("general.file_type").ok(), Some(141));
+        assert_eq!(gguf.metadata.get_u32("qwen3.block_count").ok(), Some(2));
+        assert!(gguf.metadata.get_u32("llm.block_count").is_err());
     }
 
     #[test]
-    fn rope_theta_top_level_wins() {
-        // Legacy Qwen2 layout: `rope_theta` at the top level.
-        let cfg = json!({
-            "rope_theta": 500000.0,
-        });
-        assert_eq!(resolve_rope_theta(&cfg), 500000.0);
+    fn norms_and_one_dimensional_tensors_stay_float() {
+        assert_eq!(
+            tensor_type_for(
+                "blk.0.attn_norm.weight",
+                &[128],
+                SourceDtype::F32,
+                TensorType::PQ2_0,
+                true
+            ),
+            TensorType::F32
+        );
+        assert_eq!(
+            tensor_type_for(
+                "blk.0.ssm_a",
+                &[48],
+                SourceDtype::F32,
+                TensorType::PQ2_0,
+                false
+            ),
+            TensorType::F32,
+            "a 1-D tensor is never quantized, whatever it is called"
+        );
     }
 
     #[test]
-    fn rope_theta_nested_under_rope_parameters() {
-        // Qwen3 ONNX layout: nested under `rope_parameters`.
-        let cfg = json!({
-            "rope_parameters": {
-                "factor": 4.0,
-                "original_max_position_embeddings": 8192,
-                "rope_theta": 1_000_000.0,
-                "rope_type": "yarn",
-            },
-        });
-        assert_eq!(resolve_rope_theta(&cfg), 1_000_000.0);
+    fn qwen35_ssm_scalars_stay_unquantized_even_when_block_aligned() {
+        // ssm_alpha.weight / ssm_beta.weight are [5120, 48] BF16 in the real
+        // 27B: ne0 = 5120 is a multiple of every block size in this crate
+        // (5120 / 128 = 40), so without the qwen35 never-quantized policy
+        // this would silently ternarize the gated-delta-net decay/gate
+        // scalars.
+        assert_eq!(
+            tensor_type_for(
+                "blk.0.ssm_alpha.weight",
+                &[5120, 48],
+                SourceDtype::BF16,
+                TensorType::PQ2_0,
+                false
+            ),
+            TensorType::BF16,
+            "qwen35's never-quantized ssm scalars must keep their source dtype"
+        );
+        assert_eq!(
+            tensor_type_for(
+                "blk.3.ssm_beta.weight",
+                &[5120, 48],
+                SourceDtype::BF16,
+                TensorType::PQ2_0,
+                false
+            ),
+            TensorType::BF16
+        );
+        // A genuinely quantizable tensor of the same block-aligned shape is
+        // unaffected.
+        assert_eq!(
+            tensor_type_for(
+                "blk.0.ffn_gate.weight",
+                &[5120, 48],
+                SourceDtype::F32,
+                TensorType::PQ2_0,
+                false
+            ),
+            TensorType::PQ2_0
+        );
     }
 
     #[test]
-    fn rope_theta_top_level_takes_precedence_over_nested() {
-        // If both are present, the top-level value wins.
-        let cfg = json!({
-            "rope_theta": 250000.0,
-            "rope_parameters": {
-                "rope_theta": 1_000_000.0,
-                "rope_type": "yarn",
-            },
-        });
-        assert_eq!(resolve_rope_theta(&cfg), 250000.0);
+    fn bf16_source_keeps_bf16_when_unquantized() {
+        assert_eq!(
+            tensor_type_for(
+                "blk.0.ssm_alpha.weight",
+                &[48],
+                SourceDtype::BF16,
+                TensorType::PQ2_0,
+                false
+            ),
+            TensorType::BF16,
+            "a bf16 tensor must not be inflated 2x to f32 (CQ-M2)"
+        );
     }
 
     #[test]
-    fn rope_theta_fallback_when_missing() {
-        // Neither key present: fall back to the default 10000.0.
-        let cfg = json!({
-            "hidden_size": 2048,
-        });
-        assert_eq!(resolve_rope_theta(&cfg), 10000.0);
+    fn non_block_aligned_rows_are_not_quantized() {
+        // 130 is not a multiple of 128: padding the flattened tensor would
+        // make rows 2..n straddle group boundaries (CQ-14).
+        assert_eq!(
+            tensor_type_for(
+                "blk.0.ffn_up.weight",
+                &[130, 4],
+                SourceDtype::F32,
+                TensorType::PQ2_0,
+                false
+            ),
+            TensorType::F32
+        );
+        assert_eq!(
+            tensor_type_for(
+                "blk.0.ffn_up.weight",
+                &[128, 4],
+                SourceDtype::F32,
+                TensorType::PQ2_0,
+                false
+            ),
+            TensorType::PQ2_0
+        );
+    }
+
+    #[test]
+    fn unmapped_report_names_every_missing_tensor() {
+        let mut r = UnmappedReport::default();
+        assert!(r.is_complete());
+        r.push_unmapped("model.layers.0.mystery.weight");
+        r.push_unsupported_dtype("model.layers.0.packed.weight", "I8");
+        r.push_collision("blk.0.attn_q.weight", "a.weight", "b.weight");
+        assert_eq!(r.count(), 3);
+        assert!(r.check(false).is_err());
+        r.check(true).expect("--allow-unmapped converts anyway");
+
+        let text = r.describe();
+        assert!(text.contains("model.layers.0.mystery.weight"));
+        assert!(text.contains("packed.weight"));
+        assert!(text.contains("I8"));
+        assert!(text.contains("blk.0.attn_q.weight <- a.weight and b.weight"));
+    }
+
+    #[test]
+    fn architecture_gate_rejects_foreign_models() {
+        let mut cfg = minimal_config();
+        cfg["architectures"] = json!(["LlamaForCausalLM"]);
+        assert!(check_supported_architecture(&cfg).is_err());
+
+        cfg["architectures"] = json!(["Qwen3ForCausalLM"]);
+        check_supported_architecture(&cfg).expect("qwen3 is supported");
+
+        // Absent `architectures` is not evidence of a wrong model.
+        let cfg = minimal_config();
+        check_supported_architecture(&cfg).expect("absent key is allowed");
+    }
+
+    #[test]
+    fn stats_count_by_written_type() {
+        let mut stats = ConvertStats::default();
+        record_tensor(&mut stats, TensorType::F32);
+        record_tensor(&mut stats, TensorType::BF16);
+        record_tensor(&mut stats, TensorType::PQ2_0);
+        assert_eq!(stats.n_fp32, 1);
+        assert_eq!(stats.n_bf16, 1);
+        assert_eq!(stats.n_ternary, 1);
+        assert_eq!(stats.n_tensors, 3);
+    }
+
+    #[test]
+    fn rope_theta_resolution_is_shared_with_meta() {
+        assert_eq!(
+            config_rope_theta(&json!({"rope_theta": 500000.0})),
+            500000.0
+        );
+        assert_eq!(config_rope_theta(&json!({})), 10000.0);
     }
 }

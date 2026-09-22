@@ -27,10 +27,25 @@
 //! goldens; the GPU path is a speed optimization, enabled explicitly for A/B and
 //! production use.
 //!
-//! On *any* error this module returns a `CudaTeGpuMatmulError`; the caller (the
-//! `matmul` helper in [`crate::te::forward`]) swallows it and falls back to the
-//! CPU [`crate::gemm::gemm_abt`], so a GPU failure can never break a forward
-//! pass (no `unwrap`/`expect`/`panic!`).
+//! On *any* error this module returns a `CudaTeGpuMatmulError`; the caller
+//! (the `matmul_inner` helper in [`crate::te::forward`]) falls back to the CPU
+//! [`crate::gemm::gemm_abt`], so a GPU failure can never break a forward pass
+//! (no `unwrap`/`expect`/`panic!`). That fallback used to be silent
+//! (RAG-EVAL-IMG-18); `matmul_inner` now latches a one-time `tracing::warn!`
+//! at its catch site the first time this fails, naming the backend and the
+//! underlying error — see that function's doc for why the warning lives
+//! *there* rather than in this module (mirrors `crate::te::gpu`'s Metal
+//! sibling exactly): `te_matmul_gpu` has exactly one caller, so warning at
+//! the raise site here too would double-log a single failure.
+//!
+//! **No CUDA hardware on the reference macOS/Apple-Silicon development
+//! machine**, so this module has never *run*, and this crate's own gate
+//! commands never compile it (`target_os`-gated to Linux/Windows). It has,
+//! however, been type-checked for real: `cargo check`/`cargo clippy -- -D
+//! warnings -p oxibonsai-image --target x86_64-unknown-linux-gnu --features
+//! native-cuda` (both `--all-features` and `native-cuda`-only) succeed
+//! cleanly. What is *not* verified is linking or execution (no Linux
+//! cross-linker configured here, and no CUDA runtime/device either way).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,7 +70,7 @@ pub enum CudaTeGpuMatmulError {
 /// (used by the parity example to PROVE the GPU ran, not a silent CPU fallback).
 static TE_GPU_USED: AtomicBool = AtomicBool::new(false);
 
-/// Returns `true` once any [`te_matmul_gpu`] call has succeeded.
+/// Returns `true` once any `te_matmul_gpu` call has succeeded.
 ///
 /// Lock-free and cheap; intended for diagnostics / parity assertions.
 pub fn te_gpu_was_used() -> bool {
@@ -69,7 +84,7 @@ static TE_GPU_ENABLED: OnceLock<bool> = OnceLock::new();
 /// Whether the text encoder should use the GPU f32 path.
 ///
 /// `false` unless the environment variable `OXI_TE_GPU` is set to `1`. The env
-/// read is cached in a [`OnceLock`] on first call.
+/// read is cached in a `OnceLock` on first call.
 pub fn te_gpu_enabled() -> bool {
     *TE_GPU_ENABLED.get_or_init(|| matches!(std::env::var("OXI_TE_GPU").ok().as_deref(), Some("1")))
 }
@@ -172,6 +187,31 @@ fn residency() -> &'static Mutex<ResidencyLru> {
     TE_RESIDENCY.get_or_init(|| Mutex::new(ResidencyLru::default()))
 }
 
+/// Latch for a failed best-effort LRU eviction of a resident weight from the
+/// GPU cache (see [`te_matmul_gpu`]'s residency-eviction loop): the eviction
+/// itself is never fallback-worthy (the GEMM it follows already succeeded,
+/// and a failed eviction only means the entry lingers device-side until the
+/// next upload for that key overwrites it), so this is not one of
+/// RAG-EVAL-IMG-18's GPU→CPU fallback warnings — but it is still worth a
+/// one-time diagnostic rather than a fully silent swallow. Mirrors
+/// `crate::te::gpu::warn_evict_fallback_once` exactly.
+static EVICT_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Emit a one-time `tracing::warn!` the first time a resident weight's
+/// best-effort LRU eviction fails. Mirrors the `warn_*_fallback_once` latch
+/// idiom used throughout this crate so it is unit-testable via a
+/// caller-supplied `flag`.
+fn warn_evict_fallback_once(flag: &'static AtomicBool, reason: &str) {
+    if !flag.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            reason,
+            "oxibonsai-image: TE GPU weight-cache eviction failed (non-fatal; the \
+             entry lingers until the next upload for this key overwrites it); \
+             further occurrences in this process are not logged"
+        );
+    }
+}
+
 /// Compute `out[m, n] = Σ_k input[m, k] · weight[n, k]` (`x · Wᵀ`) on the GPU.
 ///
 /// - `weight`: row-major f32 `[n, k]` (the dequantized TE Linear weight,
@@ -240,8 +280,12 @@ pub fn te_matmul_gpu(
             Err(_) => vec![key],
         };
         for ev in to_evict {
-            // Eviction failure is non-fatal: the next upload overwrites the entry.
-            let _ = graph.evict_f32_weight(ev);
+            // Eviction failure is non-fatal: the next upload overwrites the
+            // entry. A one-time diagnostic still fires rather than discarding
+            // the error completely.
+            if let Err(e) = graph.evict_f32_weight(ev) {
+                warn_evict_fallback_once(&EVICT_FALLBACK_WARNED, &e.to_string());
+            }
         }
     } else {
         // Non-resident (or residency disabled): evict this key immediately.
@@ -312,5 +356,26 @@ mod tests {
         if std::env::var("OXI_TE_GPU_RESIDENT_BUDGET_MB").is_err() {
             assert_eq!(resident_budget_bytes(), 0);
         }
+    }
+
+    #[test]
+    fn warn_evict_fallback_once_fires_exactly_once_per_flag() {
+        // A private, test-local latch (never touched by any other test or by
+        // the real eviction call site), so this is deterministic regardless
+        // of process/thread scheduling — mirrors `crate::te::gpu`'s sibling
+        // test exactly.
+        static LOCAL_WARNED: AtomicBool = AtomicBool::new(false);
+        assert!(
+            !LOCAL_WARNED.load(Ordering::Relaxed),
+            "fresh static must start false"
+        );
+        warn_evict_fallback_once(&LOCAL_WARNED, "first reason");
+        assert!(
+            LOCAL_WARNED.load(Ordering::Relaxed),
+            "the first call must latch the flag"
+        );
+        warn_evict_fallback_once(&LOCAL_WARNED, "second reason");
+        warn_evict_fallback_once(&LOCAL_WARNED, "third reason");
+        assert!(LOCAL_WARNED.load(Ordering::Relaxed));
     }
 }
