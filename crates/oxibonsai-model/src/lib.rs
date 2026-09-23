@@ -151,16 +151,17 @@ pub use model_merge::{
     task_vector_merge, ties_merge, MergeConfig, MergeError, MergeMethod, MergeStats, WeightTensor,
 };
 pub use model_registry::ModelVariant;
-// CQ-11: `SimulatedDeviceMesh`/`SimulatedCollectives` are the preferred
-// names (see `multi_gpu.rs`'s module doc); `DeviceMesh`/`NcclCollectives`
-// are `pub type` aliases to them kept ONLY for source compatibility.
-// `tests/multi_gpu_tests.rs` (not owned by this package) still imports the
-// legacy names directly, so they stay re-exported here alongside the real
-// ones rather than being dropped — see this package's deviations.
+// CQ-11: `SimulatedDeviceMesh`/`SimulatedCollectives` are the only names
+// exported. The legacy `DeviceMesh`/`NcclCollectives` aliases used to be
+// re-exported beside them for source compatibility, which made an
+// in-process rayon simulation look like a real device mesh and a real NCCL
+// binding at every call site; the one consumer
+// (`tests/multi_gpu_tests.rs`) now uses the honest names, so the aliases
+// are gone rather than merely deprecated.
 #[cfg(feature = "multi-device")]
 pub use multi_gpu::{
     merge_column_shards, partition_weights_column, partition_weights_row, CollectiveResult,
-    DeviceId, DeviceInfo, DeviceMesh, NcclCollectives, SimulatedCollectives, SimulatedDeviceMesh,
+    DeviceId, DeviceInfo, SimulatedCollectives, SimulatedDeviceMesh,
 };
 pub use paged_kv_cache::{
     BlockPool, BlockTable, KvPage, PagedKvCache, PagedKvError, DEFAULT_BLOCK_SIZE,

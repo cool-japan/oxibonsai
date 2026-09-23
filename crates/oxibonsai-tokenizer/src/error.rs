@@ -37,6 +37,25 @@ pub enum TokenizerError {
     #[error("HF tokenizer format error: {0}")]
     HfFormat(String),
 
+    /// A GGUF-embedded tokenizer definition (`tokenizer.ggml.*`) could not be
+    /// parsed or interpreted (B2-08/TOK-05's format, distinct from
+    /// [`Self::HfFormat`]'s `tokenizer.json`: both describe "the serialized
+    /// tokenizer definition could not be parsed", just from a different
+    /// container).
+    ///
+    /// Added by B2-13 per the wave-2.5 addendum: `gguf_vocab.rs`'s own
+    /// loader was written before this variant existed (that file was
+    /// outside its owning package's `owned_files`, so it could not add the
+    /// variant itself) and reused `HfFormat` with a `"GGUF: "` message
+    /// prefix instead — `gguf_vocab.rs` is not in *this* package's
+    /// `owned_files` either, so its two `.map_err` call sites still emit
+    /// `HfFormat("GGUF: …")` rather than this variant; recorded as a
+    /// deviation with the exact one-line diff each site needs
+    /// (`.map_err(|e| TokenizerError::HfFormat(format!("GGUF: {e}")))` →
+    /// `.map_err(|e| TokenizerError::GgufFormat(e.to_string()))`).
+    #[error("GGUF tokenizer format error: {0}")]
+    GgufFormat(String),
+
     /// A streaming decoder received token IDs that together do not form a
     /// complete UTF-8 sequence and further bytes are required to finish.
     ///
@@ -84,6 +103,21 @@ mod tests {
         let s = format!("{e}");
         assert!(s.contains("bad merges"));
         assert!(s.contains("HF"));
+    }
+
+    #[test]
+    fn display_gguf_format() {
+        let e = TokenizerError::GgufFormat("missing tokenizer.ggml.tokens".to_owned());
+        let s = format!("{e}");
+        assert!(s.contains("missing tokenizer.ggml.tokens"));
+        assert!(s.contains("GGUF"));
+    }
+
+    #[test]
+    fn gguf_format_is_distinct_from_hf_format() {
+        let a = TokenizerError::GgufFormat("x".to_owned());
+        let b = TokenizerError::HfFormat("x".to_owned());
+        assert_ne!(a, b);
     }
 
     #[test]

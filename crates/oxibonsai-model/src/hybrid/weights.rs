@@ -86,13 +86,13 @@ use oxibonsai_core::{
 use oxibonsai_kernels::gated_delta_net::{validate_a_neg, GdnBeta, GdnDecay, GdnGates};
 use oxibonsai_kernels::KernelDispatcher;
 
-use crate::convert::mlx_image::pack::bf16_to_f32;
 use crate::error::{ModelError, ModelResult};
 use crate::hybrid::vhead_map::VHeadMap;
 use crate::layers::linear::{
     Linear1Bit, LinearLayer, LinearPQ2_0, LinearPTQ1_0, LinearQ2_0G64, LinearTernary,
 };
 use crate::layers::rms_norm::RmsNorm;
+use oxibonsai_core::bf16::bf16_to_f32;
 
 /// Tensor names a hybrid stack binds, as GGUF spells them.
 pub mod names {
@@ -203,11 +203,31 @@ pub fn block_tensor(layer: usize, suffix: &str) -> String {
 /// GGUF tensor offset is only guaranteed aligned to `general.alignment`,
 /// and a `&[u8] → &[u16]` cast at an odd address is instant UB. Decoding
 /// with [`u16::from_le_bytes`] costs nothing here and needs no `unsafe`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Bf16Matrix<'a> {
-    bytes: &'a [u8],
+    storage: GateStorage<'a>,
     out_features: usize,
     in_features: usize,
+}
+
+/// How one gate projection's weights are held (gatekeeper REQUIRED #16).
+///
+/// Every Bonsai **2** file stores `ssm_alpha`/`ssm_beta` as BF16, which is
+/// read zero-copy straight out of the mmap. The gen-1 27B builds
+/// (`Bonsai-27B-Q1_0`, `Ternary-Bonsai-27B-{PQ2_0,Q2_0}`) store the same
+/// two tensors **quantized** (ggml ids 41/142/42 per
+/// `gguf_headers_summary.txt`), and `ModelVariant::Bonsai27B` advertises
+/// those files as supported -- so refusing anything but BF16 made a
+/// supported variant unloadable. A quantized gate is dequantized once at
+/// load: `n_v_heads x hidden` is 48 x 5120 = 983 KB for the 27B, i.e. a
+/// rounding error beside the 7.2 GB of weights, and the alternative (a
+/// per-token quantized GEMV for a 48-row matrix) would be slower.
+#[derive(Debug, Clone)]
+enum GateStorage<'a> {
+    /// Zero-copy BF16 bytes, `[out_features][in_features]` row-major.
+    Bf16(&'a [u8]),
+    /// Dequantized `f32`, same shape.
+    Dense(Arc<[f32]>),
 }
 
 impl<'a> Bf16Matrix<'a> {
@@ -239,7 +259,7 @@ impl<'a> Bf16Matrix<'a> {
             });
         }
         Ok(Self {
-            bytes,
+            storage: GateStorage::Bf16(bytes),
             out_features,
             in_features,
         })
@@ -259,15 +279,64 @@ impl<'a> Bf16Matrix<'a> {
         self.in_features
     }
 
+    /// Wrap already-dequantized `f32` weights (a gen-1 27B checkpoint whose
+    /// `ssm_alpha`/`ssm_beta` are quantized rather than BF16).
+    ///
+    /// # Errors
+    ///
+    /// [`ModelError::ShapeMismatch`] when `values.len() != out_features *
+    /// in_features`.
+    pub fn from_dense(
+        name: &str,
+        values: Vec<f32>,
+        out_features: usize,
+        in_features: usize,
+    ) -> ModelResult<Self> {
+        let expected =
+            out_features
+                .checked_mul(in_features)
+                .ok_or_else(|| ModelError::ShapeInvariant {
+                    tensor: name.to_string(),
+                    expected: "out_features * in_features representable as usize".to_string(),
+                    actual: format!("{out_features} x {in_features}"),
+                })?;
+        if values.len() != expected {
+            return Err(ModelError::ShapeMismatch {
+                name: name.to_string(),
+                expected: vec![expected],
+                actual: vec![values.len()],
+            });
+        }
+        Ok(Self {
+            storage: GateStorage::Dense(values.into()),
+            out_features,
+            in_features,
+        })
+    }
+
     /// One element, widened to `f32`.
     #[inline]
     #[must_use]
     pub fn at(&self, row: usize, col: usize) -> f32 {
-        let index = (row * self.in_features + col) * 2;
-        match self.bytes.get(index..index + 2) {
-            Some(pair) => bf16_to_f32(u16::from_le_bytes([pair[0], pair[1]])),
-            None => 0.0,
+        let flat = row * self.in_features + col;
+        match &self.storage {
+            GateStorage::Bf16(bytes) => {
+                let index = flat * 2;
+                match bytes.get(index..index + 2) {
+                    Some(pair) => bf16_to_f32(u16::from_le_bytes([pair[0], pair[1]])),
+                    None => 0.0,
+                }
+            }
+            GateStorage::Dense(values) => values.get(flat).copied().unwrap_or(0.0),
         }
+    }
+
+    /// `true` when the weights are held as dequantized `f32` rather than as
+    /// a zero-copy BF16 view (a gen-1 27B checkpoint).
+    #[inline]
+    #[must_use]
+    pub fn is_dequantized(&self) -> bool {
+        matches!(self.storage, GateStorage::Dense(_))
     }
 
     /// `y = W x`, widening each weight on the fly.
@@ -291,12 +360,29 @@ impl<'a> Bf16Matrix<'a> {
                 actual: vec![y.len()],
             });
         }
+        if let GateStorage::Dense(values) = &self.storage {
+            for (row, out) in y.iter_mut().take(self.out_features).enumerate() {
+                let base = row * self.in_features;
+                let mut acc = 0.0f32;
+                for (col, xv) in x.iter().enumerate() {
+                    acc += values.get(base + col).copied().unwrap_or(0.0) * xv;
+                }
+                *out = acc;
+            }
+            return Ok(());
+        }
+        let GateStorage::Bf16(bytes) = &self.storage else {
+            // Unreachable: the `Dense` arm returned above.
+            return Err(ModelError::Internal(
+                "Bf16Matrix storage discriminant changed under us".to_string(),
+            ));
+        };
         for (row, out) in y.iter_mut().take(self.out_features).enumerate() {
             let base = row * self.in_features * 2;
             let mut acc = 0.0f32;
             for (col, xv) in x.iter().enumerate() {
                 let index = base + col * 2;
-                if let Some(pair) = self.bytes.get(index..index + 2) {
+                if let Some(pair) = bytes.get(index..index + 2) {
                     acc += bf16_to_f32(u16::from_le_bytes([pair[0], pair[1]])) * xv;
                 }
             }
@@ -543,6 +629,68 @@ fn row_blocks(
 //  ggml wire id 42 resolution
 // ─────────────────────────────────────────────────────────────────────────
 
+/// Environment variable name of design SS1.3's layout override.
+pub const FORCE_Q2_LAYOUT_ENV: &str = "OXI_FORCE_Q2_LAYOUT";
+
+/// Design SS1.3's escape hatch: an explicit reading for the ambiguous ggml
+/// wire id 42, set by the operator when the automatic evidence is
+/// inconclusive.
+///
+/// ggml id 42 is used by three mutually incompatible on-disk layouts (the
+/// legacy PrismML `qs`-first group-128 block, PrismML's `d`-first group-128
+/// block, and mainline `Q2_0` at group 64). `resolve_type_42_with_sample`
+/// decides between them from the tensor offset table and a data sample and
+/// is conclusive on every real file; a degenerate sample (all-zero, or a
+/// synthetic fixture too small to sample) is the one case where it is not,
+/// and a `d`-first file with such a sample would otherwise be decoded as
+/// `qs`-first with nothing but a `warn!` to show for it.
+///
+/// Accepted values, case-insensitive: `d-first` / `dfirst` / `pq2` (PrismML
+/// `d`-first, group 128), `qs-first` / `qsfirst` / `tq2` / `legacy` (the
+/// historical OxiBonsai reading), `g64` / `q2_0_g64` (mainline group 64).
+/// The override applies **before** the sniff, because an operator who has
+/// gone to the trouble of setting it knows something the bytes do not say.
+///
+/// # Errors
+///
+/// [`ModelError::InvalidTensor`] naming the variable and the accepted
+/// values when it is set to anything else -- a typo must not silently
+/// degrade to the automatic path, which is the failure mode this hatch
+/// exists to prevent.
+pub fn forced_q2_layout() -> ModelResult<Option<GgufTensorType>> {
+    let Ok(raw) = std::env::var(FORCE_Q2_LAYOUT_ENV) else {
+        return Ok(None);
+    };
+    parse_forced_q2_layout(&raw)
+}
+
+/// [`forced_q2_layout`]'s parser, split out so the accepted spellings can
+/// be tested without mutating the process environment (which no test can do
+/// safely while other tests run in the same process).
+///
+/// # Errors
+///
+/// As [`forced_q2_layout`].
+pub fn parse_forced_q2_layout(raw: &str) -> ModelResult<Option<GgufTensorType>> {
+    let value = raw.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    match value.as_str() {
+        "d-first" | "dfirst" | "d_first" | "pq2" | "pq2_0" => {
+            Ok(Some(GgufTensorType::Q2_0G128DFirst))
+        }
+        "qs-first" | "qsfirst" | "qs_first" | "tq2" | "tq2_0" | "legacy" => {
+            Ok(Some(GgufTensorType::TQ2_0_g128))
+        }
+        "g64" | "q2_0_g64" | "q2_0g64" => Ok(Some(GgufTensorType::Q2_0G64)),
+        other => Err(ModelError::InvalidTensor(format!(
+            "{FORCE_Q2_LAYOUT_ENV}={other:?} is not a recognised layout: use one of \
+             d-first|dfirst|pq2, qs-first|qsfirst|tq2|legacy, or g64"
+        ))),
+    }
+}
+
 /// Resolve this file's reading of ggml wire id 42 **once**, or `Ok(None)`
 /// when the file has no type-42 tensor.
 ///
@@ -565,6 +713,16 @@ fn row_blocks(
 /// fixture) falls back to the historical qs-first reading, exactly as the
 /// dense loader does.
 pub fn resolve_id42(gguf: &GgufFile<'_>) -> ModelResult<Option<GgufTensorType>> {
+    // Design SS1.3's operator override, shared with the dense loader so the
+    // two paths cannot disagree about what a forced layout means.
+    if let Some(forced) = forced_q2_layout()? {
+        tracing::debug!(
+            layout = ?forced,
+            env = FORCE_Q2_LAYOUT_ENV,
+            "qwen35: ggml wire id 42 layout forced by the environment"
+        );
+        return Ok(Some(forced));
+    }
     let infos: Vec<TensorInfo> = gguf
         .tensors
         .sorted_by_offset()
@@ -601,8 +759,10 @@ pub fn resolve_id42(gguf: &GgufFile<'_>) -> ModelResult<Option<GgufTensorType>> 
             tracing::warn!(
                 tensor = %sample_name,
                 reason = %hint,
+                env = FORCE_Q2_LAYOUT_ENV,
                 "qwen35: ggml wire id 42 could not be conclusively resolved; falling back to \
-                 the legacy qs-first TQ2_0_g128 reading"
+                 the legacy qs-first TQ2_0_g128 reading -- set OXI_FORCE_Q2_LAYOUT=d-first if \
+                 this file is a PrismML d-first checkpoint"
             );
             Ok(None)
         }
@@ -821,6 +981,25 @@ pub fn bind_linear<'a>(
                 kernel.clone(),
             )?)
         }
+        // `dequant_any` CAN decode these, and `HybridEmbedding::Dense`
+        // already consumes them for `token_embd.weight`, but `LinearLayer`
+        // has no dense variant in this build, so there is no kernel to run
+        // the projection through. Deliberately NOT
+        // `non_executable_quant_type`: that error's generated "executable
+        // types are ..." list names F32 itself, contradicting the refusal
+        // it is attached to (gatekeeper REQUIRED #5 / OPTIONAL #O8). The
+        // fix that makes these executable is a `LinearLayer::Dense`
+        // variant in `layers/linear.rs`; until it exists this says so.
+        GgufTensorType::F32 | GgufTensorType::F16 | GgufTensorType::BF16 => {
+            return Err(ModelError::InvalidTensor(format!(
+                "{name}: {} (id {}) is stored unquantized, and this build has no dense \
+                 LinearLayer variant to run a qwen35 projection through - add \
+                 `LinearLayer::Dense` (mirroring `weight_loaders.rs`'s `OutputWeight::Fp32`) \
+                 or quantize the file",
+                resolved,
+                resolved.wire_id(),
+            )))
+        }
         other => {
             return Err(ModelError::Core(BonsaiError::non_executable_quant_type(
                 name, other,
@@ -845,6 +1024,28 @@ pub fn bind_embedding<'a>(
     let info = expect_shape(gguf, name, &[hidden, vocab])?;
     let resolved = apply_resolved_type(info.tensor_type, resolved_42);
     let data = tensor_data_resolved(gguf, name, resolved)?;
+    embedding_view(name, data, resolved, hidden, vocab)
+}
+
+/// A row-wise decoder over a `[row_len, rows]` GGUF matrix.
+///
+/// Shared by `token_embd.weight` (where the rows are vocabulary entries)
+/// and by a gen-1 27B's quantized `ssm_alpha`/`ssm_beta` (where they are
+/// v-heads), so one type table serves both and a new quantization format
+/// cannot be wired into only one of them.
+///
+/// # Errors
+///
+/// [`ModelError::Core`] from a block cast or a dequantizer;
+/// [`ModelError::ShapeInvariant`] for an overflowing geometry.
+fn embedding_view<'a>(
+    name: &str,
+    data: &'a [u8],
+    resolved: GgufTensorType,
+    row_len: usize,
+    rows: usize,
+) -> ModelResult<HybridEmbedding<'a>> {
+    let (hidden, vocab) = (row_len, rows);
     let table = match resolved {
         GgufTensorType::PQ2_0 | GgufTensorType::Q2_0G128DFirst => {
             HybridEmbedding::Pq2_0(BlockPQ2_0::slice_from_bytes(data).map_err(ModelError::Core)?)
@@ -866,10 +1067,10 @@ pub fn bind_embedding<'a>(
                 .checked_mul(vocab)
                 .ok_or_else(|| ModelError::ShapeInvariant {
                     tensor: name.to_string(),
-                    expected: "hidden * vocab representable as usize".to_string(),
+                    expected: "row_len * rows representable as usize".to_string(),
                     actual: format!("{hidden} x {vocab}"),
                 })?;
-            HybridEmbedding::Dense(load_dense_f32(gguf, name, n)?)
+            HybridEmbedding::Dense(widen_dense(name, data, resolved, n)?)
         }
         other => {
             return Err(ModelError::Core(BonsaiError::non_executable_quant_type(
@@ -878,6 +1079,58 @@ pub fn bind_embedding<'a>(
         }
     };
     Ok(table)
+}
+
+/// Widen an unquantized `F32`/`F16`/`BF16` tensor's raw bytes to `f32`.
+///
+/// # Errors
+///
+/// [`ModelError::ShapeMismatch`] when `data` is shorter than `n` elements,
+/// or [`ModelError::InvalidTensor`] for a type that is not one of the three.
+fn widen_dense(
+    name: &str,
+    data: &[u8],
+    resolved: GgufTensorType,
+    n: usize,
+) -> ModelResult<Vec<f32>> {
+    let width = match resolved {
+        GgufTensorType::F32 => 4usize,
+        GgufTensorType::F16 | GgufTensorType::BF16 => 2,
+        other => {
+            return Err(ModelError::InvalidTensor(format!(
+                "{name}: {other} is not an unquantized type"
+            )))
+        }
+    };
+    let needed = n
+        .checked_mul(width)
+        .ok_or_else(|| ModelError::ShapeInvariant {
+            tensor: name.to_string(),
+            expected: "n * element width representable as usize".to_string(),
+            actual: format!("{n} x {width}"),
+        })?;
+    let bytes = data
+        .get(..needed)
+        .ok_or_else(|| ModelError::ShapeMismatch {
+            name: name.to_string(),
+            expected: vec![needed],
+            actual: vec![data.len()],
+        })?;
+    let mut out = Vec::with_capacity(n);
+    for chunk in bytes.chunks_exact(width) {
+        let value = match (resolved, chunk) {
+            (GgufTensorType::F32, [a, b, c, d]) => f32::from_le_bytes([*a, *b, *c, *d]),
+            (GgufTensorType::F16, [a, b]) => {
+                half::f16::from_bits(u16::from_le_bytes([*a, *b])).to_f32()
+            }
+            (_, [a, b]) => bf16_to_f32(u16::from_le_bytes([*a, *b])),
+            // Unreachable: `chunks_exact(width)` yields exactly `width`
+            // bytes and `width` is 4 for F32, 2 otherwise.
+            _ => 0.0,
+        };
+        out.push(value);
+    }
+    Ok(out)
 }
 
 /// Bind the LM head, refusing a tied head (design §3.5).
@@ -1000,39 +1253,138 @@ pub fn bind_conv1d(
     Ok(values.into())
 }
 
-/// Bind one BF16 gate projection (`ssm_alpha.weight` / `ssm_beta.weight`).
+/// Bind one gate projection (`ssm_alpha.weight` / `ssm_beta.weight`).
+///
+/// BF16 (every Bonsai 2 file) is a zero-copy view; anything else -- a gen-1
+/// 27B's quantized gate, or a dequantized/converted file -- is widened to
+/// `f32` once, here.
 ///
 /// # Errors
 ///
 /// [`ModelError::MissingTensor`] / [`ModelError::ShapeMismatch`];
-/// [`ModelError::Core`] naming the type when it is not BF16/F16/F32.
+/// [`ModelError::Core`] from a dequantizer for a genuinely non-executable
+/// type.
 pub fn bind_gate_projection<'a>(
     gguf: &'a GgufFile<'a>,
     layer: usize,
     suffix: &str,
     in_features: usize,
     out_features: usize,
+    resolved_42: Option<GgufTensorType>,
 ) -> ModelResult<Bf16Matrix<'a>> {
     let name = block_tensor(layer, suffix);
     let info = expect_shape(gguf, &name, &[in_features, out_features])?;
-    if info.tensor_type != GgufTensorType::BF16 {
-        // Not `NonExecutableQuantType`: an F32 `ssm_alpha` would be perfectly
-        // executable, it simply is not the layout every real Bonsai 2 file
-        // uses, and this binder is the zero-copy BF16 view. Say that, rather
-        // than claiming the build cannot execute F32.
-        return Err(ModelError::InvalidTensor(format!(
-            "{name}: a qwen35 gate projection must be BF16 (ggml id 30); found {} (id {})",
-            info.tensor_type.name(),
-            info.tensor_type.wire_id()
-        )));
+    if info.tensor_type == GgufTensorType::BF16 {
+        let data = gguf.tensor_data(&name).map_err(ModelError::Core)?;
+        return Bf16Matrix::new(&name, data, out_features, in_features);
     }
-    let data = gguf.tensor_data(&name).map_err(ModelError::Core)?;
-    Bf16Matrix::new(&name, data, out_features, in_features)
+    // Gen-1 27B files (`Bonsai-27B-Q1_0`, `Ternary-Bonsai-27B-{PQ2_0,Q2_0}`)
+    // store these two tensors quantized (ids 41/142/42). Dequantize the
+    // whole 48 x hidden matrix once at load rather than refusing a variant
+    // `ModelVariant::Bonsai27B` advertises as supported (gatekeeper
+    // REQUIRED #16); the id-42 ambiguity is resolved the same way every
+    // other tensor's is.
+    let resolved = apply_resolved_type(info.tensor_type, resolved_42);
+    let n = out_features
+        .checked_mul(in_features)
+        .ok_or_else(|| ModelError::ShapeInvariant {
+            tensor: name.clone(),
+            expected: "out_features * in_features representable as usize".to_string(),
+            actual: format!("{out_features} x {in_features}"),
+        })?;
+    let data = tensor_data_resolved(gguf, &name, resolved)?;
+    let table = embedding_view(&name, data, resolved, in_features, out_features)?;
+    let mut values = vec![0.0f32; n];
+    for row in 0..out_features {
+        let lo = row * in_features;
+        let slot =
+            values
+                .get_mut(lo..lo + in_features)
+                .ok_or_else(|| ModelError::ShapeMismatch {
+                    name: name.clone(),
+                    expected: vec![n],
+                    actual: vec![lo + in_features],
+                })?;
+        let index = u32::try_from(row).map_err(|_| ModelError::ShapeInvariant {
+            tensor: name.clone(),
+            expected: "row index representable as u32".to_string(),
+            actual: row.to_string(),
+        })?;
+        table.row(index, in_features, slot)?;
+    }
+    Bf16Matrix::from_dense(&name, values, out_features, in_features)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forced_q2_layout_parses_every_documented_spelling_bonsai2() {
+        for (raw, expected) in [
+            ("d-first", GgufTensorType::Q2_0G128DFirst),
+            ("DFirst", GgufTensorType::Q2_0G128DFirst),
+            ("pq2", GgufTensorType::Q2_0G128DFirst),
+            ("qs-first", GgufTensorType::TQ2_0_g128),
+            ("legacy", GgufTensorType::TQ2_0_g128),
+            ("TQ2", GgufTensorType::TQ2_0_g128),
+            ("g64", GgufTensorType::Q2_0G64),
+            ("  q2_0_g64  ", GgufTensorType::Q2_0G64),
+        ] {
+            assert_eq!(
+                parse_forced_q2_layout(raw).expect("valid spelling"),
+                Some(expected),
+                "spelling {raw:?}"
+            );
+        }
+        assert_eq!(parse_forced_q2_layout("").expect("empty is unset"), None);
+        assert_eq!(parse_forced_q2_layout("   ").expect("blank is unset"), None);
+    }
+
+    #[test]
+    fn forced_q2_layout_refuses_a_typo_rather_than_falling_back_bonsai2() {
+        // A typo must be loud: silently degrading to the automatic sniff is
+        // the exact failure this hatch exists to prevent (design SS1.3).
+        let err = parse_forced_q2_layout("d_frist").expect_err("typo rejected");
+        let message = err.to_string();
+        assert!(message.contains("OXI_FORCE_Q2_LAYOUT"), "{message}");
+        assert!(message.contains("d-first"), "{message}");
+    }
+
+    #[test]
+    fn bf16_matrix_dense_and_bf16_storage_agree_bonsai2() {
+        // Two rows of three columns, chosen so every value is exactly
+        // representable in bf16 (so the two storages must agree bitwise).
+        let values = vec![1.0f32, -2.0, 0.5, 4.0, -0.25, 8.0];
+        let mut bytes = Vec::new();
+        for v in &values {
+            let bits = v.to_bits();
+            let rounded = ((bits >> 16) & 1).wrapping_add(0x7fff).wrapping_add(bits);
+            bytes.extend_from_slice(&((rounded >> 16) as u16).to_le_bytes());
+        }
+        let view = Bf16Matrix::new("test", &bytes, 2, 3).expect("bf16 view");
+        let dense = Bf16Matrix::from_dense("test", values.clone(), 2, 3).expect("dense");
+        assert!(!view.is_dequantized());
+        assert!(dense.is_dequantized());
+        for row in 0..2 {
+            for col in 0..3 {
+                assert_eq!(view.at(row, col).to_bits(), dense.at(row, col).to_bits());
+            }
+        }
+        let x = [1.0f32, 2.0, 3.0];
+        let mut a = vec![0.0f32; 2];
+        let mut b = vec![0.0f32; 2];
+        view.forward_vec(&x, &mut a).expect("bf16 gemv");
+        dense.forward_vec(&x, &mut b).expect("dense gemv");
+        assert_eq!(a, b);
+        assert_eq!(a, vec![1.0 - 4.0 + 1.5, 4.0 - 0.5 + 24.0]);
+    }
+
+    #[test]
+    fn bf16_matrix_from_dense_rejects_a_wrong_sized_vector_bonsai2() {
+        assert!(Bf16Matrix::from_dense("test", vec![0.0; 5], 2, 3).is_err());
+    }
+
     use crate::hybrid::tests_support::{
         synthetic_default, synthetic_gguf, FixtureOptions, FixtureShape,
     };
@@ -1111,8 +1463,15 @@ mod tests {
         let bytes = synthetic_default();
         let gguf = GgufFile::parse(&bytes).expect("fixture parses");
         let shape = FixtureShape::default();
-        let alpha = bind_gate_projection(&gguf, 0, names::SSM_ALPHA, shape.hidden, shape.n_v_heads)
-            .expect("ssm_alpha binds");
+        let alpha = bind_gate_projection(
+            &gguf,
+            0,
+            names::SSM_ALPHA,
+            shape.hidden,
+            shape.n_v_heads,
+            None,
+        )
+        .expect("ssm_alpha binds");
         assert_eq!(alpha.out_features(), shape.n_v_heads);
         assert_eq!(alpha.in_features(), shape.hidden);
 

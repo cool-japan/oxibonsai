@@ -561,6 +561,267 @@ pub unsafe fn gemm_ptq1_0_avx2(
 }
 
 // ---------------------------------------------------------------------------
+// Register-blocked (MR-tiled) AVX2 GEMM — K-INT8 / gatekeeper REQUIRED #9
+//
+// The x86-64 twin of `simd_prism_neon.rs`'s blocked kernels, with the same
+// bit-identity contract: one decoded block is consumed by `PRISM_GEMM_MR`
+// batch rows, and each (batch row, weight row) pair keeps the exact
+// `_mm256_fmadd_ps` sequence, `hsum8_avx2` and `row_sum += d * hsum` order
+// the per-row GEMV above uses.
+//
+// `KernelTier::Avx512` routes here too (see `dispatch_prism.rs`'s module
+// doc: the Prism formats have no dedicated AVX-512 kernel, and every
+// AVX-512F CPU also has AVX2).
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "x86_64")]
+use crate::dequant_prism::{
+    for_each_prism_register_block, validate_prism_gemm, PrismTileSpan, TwoBitBlockView,
+};
+
+/// # Safety
+/// Requires AVX2 + FMA; all indices are pre-validated by
+/// [`validate_prism_gemm`].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn micro_two_bit_avx2<const MR: usize, B: TwoBitBlockView>(
+    row_blocks: &[B],
+    input: &[f32],
+    output: &mut [f32],
+    qk: usize,
+    span: PrismTileSpan,
+) {
+    let mut sums = [0.0f32; MR];
+    for (bi, block) in row_blocks.iter().enumerate() {
+        let inp_base = bi * qk;
+        let qs = block.qs_bytes();
+        let mut acc = [_mm256_setzero_ps(); MR];
+        for chunk in 0..qs.len() / 2 {
+            let val = decode_2bytes_avx2_arith_to_f32x8(qs[chunk * 2], qs[chunk * 2 + 1]);
+            let col = inp_base + chunk * 8;
+            for (r, a) in acc.iter_mut().enumerate() {
+                let x = _mm256_loadu_ps(input.as_ptr().add((span.m0 + r) * span.k + col));
+                *a = _mm256_fmadd_ps(val, x, *a);
+            }
+        }
+        let d = block.scale();
+        for (a, sum) in acc.iter().zip(sums.iter_mut()) {
+            *sum += d * hsum8_avx2(*a);
+        }
+    }
+    for (r, sum) in sums.iter().enumerate() {
+        output[(span.m0 + r) * span.n_rows + span.ni] = *sum;
+    }
+}
+
+/// # Safety
+/// See [`micro_two_bit_avx2`].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn tile_two_bit_avx2<const MR: usize, B: TwoBitBlockView>(
+    blocks: &[B],
+    input: &[f32],
+    output: &mut [f32],
+    n_rows: usize,
+    k: usize,
+    qk: usize,
+    blocks_per_row: usize,
+    m0: usize,
+) {
+    for ni in 0..n_rows {
+        let row_blocks = &blocks[ni * blocks_per_row..(ni + 1) * blocks_per_row];
+        let span = PrismTileSpan { k, n_rows, ni, m0 };
+        micro_two_bit_avx2::<MR, B>(row_blocks, input, output, qk, span);
+    }
+}
+
+/// Register-blocked AVX2 GEMM for either 2-bit Prism format, bit-identical
+/// to the matching per-row AVX2 GEMV sweep.
+///
+/// # Errors
+///
+/// See [`validate_prism_gemm`].
+///
+/// # Safety
+/// Requires AVX2 + FMA CPU support.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+pub unsafe fn gemm_two_bit_avx2_blocked<B: TwoBitBlockView>(
+    blocks: &[B],
+    input: &[f32],
+    output: &mut [f32],
+    m: usize,
+    n_rows: usize,
+    k: usize,
+    qk: usize,
+) -> KernelResult<()> {
+    let blocks_per_row =
+        validate_prism_gemm(blocks.len(), input.len(), output.len(), m, n_rows, k, qk)?;
+    if m == 0 || n_rows == 0 {
+        return Ok(());
+    }
+    for_each_prism_register_block!(
+        m,
+        tile_two_bit_avx2,
+        [B],
+        blocks,
+        input,
+        output,
+        n_rows,
+        k,
+        qk,
+        blocks_per_row
+    );
+    Ok(())
+}
+
+/// Register-blocked AVX2 GEMM for `PQ2_0`.
+///
+/// # Errors
+///
+/// See [`validate_prism_gemm`].
+///
+/// # Safety
+/// Requires AVX2 + FMA CPU support.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+pub unsafe fn gemm_pq2_0_avx2_blocked(
+    blocks: &[BlockPQ2_0],
+    input: &[f32],
+    output: &mut [f32],
+    m: usize,
+    n_rows: usize,
+    k: usize,
+) -> KernelResult<()> {
+    gemm_two_bit_avx2_blocked(blocks, input, output, m, n_rows, k, QK_PQ2_0)
+}
+
+/// Register-blocked AVX2 GEMM for `Q2_0_g64`.
+///
+/// # Errors
+///
+/// See [`validate_prism_gemm`].
+///
+/// # Safety
+/// Requires AVX2 + FMA CPU support.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+pub unsafe fn gemm_q2_0_g64_avx2_blocked(
+    blocks: &[BlockQ2_0G64],
+    input: &[f32],
+    output: &mut [f32],
+    m: usize,
+    n_rows: usize,
+    k: usize,
+) -> KernelResult<()> {
+    gemm_two_bit_avx2_blocked(blocks, input, output, m, n_rows, k, QK_Q2_0_G64)
+}
+
+/// # Safety
+/// Requires AVX2 + FMA; indices pre-validated by [`validate_prism_gemm`].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn micro_ptq1_0_avx2<const MR: usize>(
+    row_blocks: &[BlockPTQ1_0],
+    input: &[f32],
+    output: &mut [f32],
+    span: PrismTileSpan,
+) {
+    let mut sums = [0.0f32; MR];
+    for (bi, block) in row_blocks.iter().enumerate() {
+        let codes = decode_ptq1_0_codes_avx2(block);
+        let inp_base = bi * QK_PTQ1_0;
+        let mut acc = [_mm256_setzero_ps(); MR];
+        for chunk in 0..8 {
+            let codes16 = _mm_loadu_si128(codes.as_ptr().add(chunk * 16) as *const __m128i);
+            let [a_vec, b_vec] = codes16_to_f32x8x2(codes16);
+            let col = inp_base + chunk * 16;
+            for (r, a) in acc.iter_mut().enumerate() {
+                let row_base = (span.m0 + r) * span.k + col;
+                let inp_a = _mm256_loadu_ps(input.as_ptr().add(row_base));
+                let inp_b = _mm256_loadu_ps(input.as_ptr().add(row_base + 8));
+                *a = _mm256_fmadd_ps(a_vec, inp_a, *a);
+                *a = _mm256_fmadd_ps(b_vec, inp_b, *a);
+            }
+        }
+        let d = block.d.to_f32();
+        for (a, sum) in acc.iter().zip(sums.iter_mut()) {
+            *sum += d * hsum8_avx2(*a);
+        }
+    }
+    for (r, sum) in sums.iter().enumerate() {
+        output[(span.m0 + r) * span.n_rows + span.ni] = *sum;
+    }
+}
+
+/// # Safety
+/// See [`micro_ptq1_0_avx2`].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn tile_ptq1_0_avx2<const MR: usize>(
+    blocks: &[BlockPTQ1_0],
+    input: &[f32],
+    output: &mut [f32],
+    n_rows: usize,
+    k: usize,
+    blocks_per_row: usize,
+    m0: usize,
+) {
+    for ni in 0..n_rows {
+        let row_blocks = &blocks[ni * blocks_per_row..(ni + 1) * blocks_per_row];
+        let span = PrismTileSpan { k, n_rows, ni, m0 };
+        micro_ptq1_0_avx2::<MR>(row_blocks, input, output, span);
+    }
+}
+
+/// Register-blocked AVX2 GEMM for `PTQ1_0`, bit-identical to
+/// [`gemm_ptq1_0_avx2`] but trit-decoding each block once per register
+/// block instead of once per batch row.
+///
+/// # Errors
+///
+/// See [`validate_prism_gemm`].
+///
+/// # Safety
+/// Requires AVX2 + FMA CPU support.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+pub unsafe fn gemm_ptq1_0_avx2_blocked(
+    blocks: &[BlockPTQ1_0],
+    input: &[f32],
+    output: &mut [f32],
+    m: usize,
+    n_rows: usize,
+    k: usize,
+) -> KernelResult<()> {
+    let blocks_per_row = validate_prism_gemm(
+        blocks.len(),
+        input.len(),
+        output.len(),
+        m,
+        n_rows,
+        k,
+        QK_PTQ1_0,
+    )?;
+    if m == 0 || n_rows == 0 {
+        return Ok(());
+    }
+    for_each_prism_register_block!(
+        m,
+        tile_ptq1_0_avx2,
+        [],
+        blocks,
+        input,
+        output,
+        n_rows,
+        k,
+        blocks_per_row
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests — gated to x86_64 like the rest of the file; also runtime-checks
 // for AVX2 (the way `simd_avx2.rs`'s own ternary tests already do), since a
 // binary built for a generic x86_64 target may run on a CPU without AVX2.

@@ -19,7 +19,6 @@ use oxibonsai_core::{
 };
 
 use crate::block::TransformerBlock;
-use crate::convert::mlx_image::pack::bf16_to_f32;
 use crate::error::{ModelError, ModelResult};
 use crate::layers::linear::{
     Linear1Bit, LinearFP8E4M3, LinearFP8E5M2, LinearPQ2_0, LinearPTQ1_0, LinearQ2_0G64,
@@ -29,6 +28,7 @@ use crate::layers::linear_kquant_ext::{LinearQ5K, LinearQ6K};
 use crate::layers::linear_kquant_full::{LinearQ2K, LinearQ3K, LinearQ4K, LinearQ8K};
 use crate::layers::linear_standard::{LinearQ4_0, LinearQ8_0};
 use crate::layers::rms_norm::RmsNorm;
+use oxibonsai_core::bf16::bf16_to_f32;
 
 use super::types::OutputWeight;
 
@@ -321,22 +321,31 @@ pub(super) fn dequant_any(
 
 /// Resolve ggml wire id 42's on-disk layout ONCE for a whole GGUF file.
 ///
-/// The whole file shares one on-disk reading of id 42 --
-/// [`resolve_type_42_with_sample`] settles the group size by replaying
-/// every tensor's offset and the byte order from one sample -- so this
-/// resolves once per file (mirroring
-/// `oxibonsai_model::gguf_loader::load_tensor_metadata_resolved`'s
-/// pattern) rather than once per tensor or once per layer: `Ok(None)` when
-/// the file has no wire-id-42 tensor at all (every type then passes through
-/// [`apply_resolved_type`] unchanged), `Ok(Some(ty))` otherwise.
+/// `TensorInfo::tensor_type` is only the parse-time guess for id 42; the
+/// real reading is settled by replaying every tensor's offset and sniffing
+/// one sample's bytes ([`resolve_type_42_with_sample`]), which is the same
+/// answer for every tensor in the file. Callers thread the result through
+/// [`apply_resolved_type`] rather than calling this per tensor or per
+/// layer.
 ///
-/// Callers that already hold this value (e.g. the per-layer loop in
-/// `model/types/mod.rs`) must compute it once and thread it through rather
-/// than calling this again per layer -- the replay walks every tensor's
-/// offset and the sniff samples real block bytes, so repeating it 64 times
-/// for the 27B would be pure waste for an answer that cannot change within
-/// one file.
-pub(super) fn resolve_id42_once(gguf: &GgufFile<'_>) -> ModelResult<Option<GgufTensorType>> {
+/// [`crate::hybrid::weights::forced_q2_layout`] (design SS1.3's
+/// `OXI_FORCE_Q2_LAYOUT`) takes priority over the automatic evidence.
+///
+/// # Errors
+///
+/// [`ModelError::Core`] when the offsets are internally inconsistent or the
+/// data actively contradicts a declared legacy tag; an *inconclusive*
+/// sniff (an all-zero or too-small sample, i.e. a synthetic fixture) falls
+/// back to the historical qs-first reading with a `warn!`.
+pub(crate) fn resolve_id42_once(gguf: &GgufFile<'_>) -> ModelResult<Option<GgufTensorType>> {
+    if let Some(forced) = crate::hybrid::weights::forced_q2_layout()? {
+        tracing::debug!(
+            layout = ?forced,
+            env = crate::hybrid::weights::FORCE_Q2_LAYOUT_ENV,
+            "ggml wire id 42 layout forced by the environment"
+        );
+        return Ok(Some(forced));
+    }
     let infos: Vec<TensorInfo> = gguf
         .tensors
         .sorted_by_offset()
@@ -393,8 +402,10 @@ pub(super) fn resolve_id42_once(gguf: &GgufFile<'_>) -> ModelResult<Option<GgufT
             tracing::warn!(
                 tensor = %sample_name,
                 reason = %hint,
+                env = crate::hybrid::weights::FORCE_Q2_LAYOUT_ENV,
                 "ggml wire id 42 could not be conclusively resolved (degenerate/synthetic \
-                 sample); falling back to the legacy qs-first TQ2_0_g128 reading"
+                 sample); falling back to the legacy qs-first TQ2_0_g128 reading -- set \
+                 OXI_FORCE_Q2_LAYOUT=d-first if this file is a PrismML d-first checkpoint"
             );
             Ok(None)
         }
@@ -412,7 +423,7 @@ pub(super) fn resolve_id42_once(gguf: &GgufFile<'_>) -> ModelResult<Option<GgufT
 /// the historical legacy reading, not a guess). Either way `raw` -- already
 /// `TQ2_0_g128` for any wire-id-42 tensor per `GgufTensorType::from_id` --
 /// is the answer.
-pub(super) fn apply_resolved_type(
+pub(crate) fn apply_resolved_type(
     raw: GgufTensorType,
     resolved_42: Option<GgufTensorType>,
 ) -> GgufTensorType {
@@ -438,7 +449,7 @@ pub(super) fn apply_resolved_type(
 /// "recompute [the size] from the settled resolved type ... via
 /// `row_size_bytes`", which is exactly what this does; every other
 /// (non-wire-id-42) tensor is byte-identical to plain `tensor_data`.
-fn tensor_data_resolved<'a>(
+pub(crate) fn tensor_data_resolved<'a>(
     gguf: &'a GgufFile<'a>,
     name: &str,
     resolved_type: GgufTensorType,

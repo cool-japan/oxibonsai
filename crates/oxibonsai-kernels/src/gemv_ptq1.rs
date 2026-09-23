@@ -122,6 +122,106 @@ pub fn gemm_ptq1_0(
 }
 
 // ---------------------------------------------------------------------------
+// Register-blocked (MR-tiled) GEMM — K-INT8 / gatekeeper REQUIRED #9
+//
+// `gemm_ptq1_0` above re-runs `decode_ptq1_0_codes` (a five-stage base-3
+// trit unpack) once per (batch row, block) pair. The blocked form below
+// decodes each block ONCE and consumes it with
+// [`crate::dequant_prism::PRISM_GEMM_MR`] batch rows' accumulators live,
+// which for `PTQ1_0` saves the decode as well as the weight traffic. The
+// per-(batch row, weight row) multiply-add sequence is unchanged, so the
+// result is bit-identical to the GEMV sweep.
+// ---------------------------------------------------------------------------
+
+use crate::dequant_prism::{for_each_prism_register_block, validate_prism_gemm, PrismTileSpan};
+
+fn micro_ptq1_0_scalar<const MR: usize>(
+    row_blocks: &[BlockPTQ1_0],
+    input: &[f32],
+    output: &mut [f32],
+    span: PrismTileSpan,
+) {
+    let mut sums = [0.0f32; MR];
+    for (bi, block) in row_blocks.iter().enumerate() {
+        let codes = decode_ptq1_0_codes(block);
+        let input_base = bi * QK_PTQ1_0;
+        let mut acc = [0.0f32; MR];
+        for (j, &code) in codes.iter().enumerate() {
+            let w = q2_0_code_to_i32(code) as f32;
+            let col = input_base + j;
+            for (r, a) in acc.iter_mut().enumerate() {
+                *a += w * input[(span.m0 + r) * span.k + col];
+            }
+        }
+        let d = block.d.to_f32();
+        for (a, sum) in acc.iter().zip(sums.iter_mut()) {
+            *sum += d * *a;
+        }
+    }
+    for (r, sum) in sums.iter().enumerate() {
+        output[(span.m0 + r) * span.n_rows + span.ni] = *sum;
+    }
+}
+
+fn tile_ptq1_0_scalar<const MR: usize>(
+    blocks: &[BlockPTQ1_0],
+    input: &[f32],
+    output: &mut [f32],
+    n_rows: usize,
+    k: usize,
+    blocks_per_row: usize,
+    m0: usize,
+) {
+    for ni in 0..n_rows {
+        let row_blocks = &blocks[ni * blocks_per_row..(ni + 1) * blocks_per_row];
+        let span = PrismTileSpan { k, n_rows, ni, m0 };
+        micro_ptq1_0_scalar::<MR>(row_blocks, input, output, span);
+    }
+}
+
+/// Register-blocked scalar GEMM for `PTQ1_0` — bit-identical to
+/// [`gemm_ptq1_0`], with each weight block trit-decoded once per
+/// [`crate::dequant_prism::PRISM_GEMM_MR`] batch rows instead of once per
+/// batch row.
+///
+/// # Errors
+///
+/// See [`validate_prism_gemm`].
+pub fn gemm_ptq1_0_blocked(
+    blocks: &[BlockPTQ1_0],
+    input: &[f32],
+    output: &mut [f32],
+    m: usize,
+    n_rows: usize,
+    k: usize,
+) -> KernelResult<()> {
+    let blocks_per_row = validate_prism_gemm(
+        blocks.len(),
+        input.len(),
+        output.len(),
+        m,
+        n_rows,
+        k,
+        QK_PTQ1_0,
+    )?;
+    if m == 0 || n_rows == 0 {
+        return Ok(());
+    }
+    for_each_prism_register_block!(
+        m,
+        tile_ptq1_0_scalar,
+        [],
+        blocks,
+        input,
+        output,
+        n_rows,
+        k,
+        blocks_per_row
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 //
 // NOTE ON NAMING: the package gate filters tests by the substring `prism`

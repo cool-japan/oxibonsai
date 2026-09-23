@@ -66,9 +66,12 @@ impl fmt::Display for WeightKind {
 /// Stable substring of every weight-cache kind-mismatch error message.
 ///
 /// `MetalGraph`'s cache reports a format collision as
-/// `MetalGraphError::ExecutionFailed` whose message starts with this tag (there
-/// is no structured variant for it yet — see the package deviations). Callers
-/// and tests match on this rather than on the full wording.
+/// [`MetalGraphError::WeightKindMismatch`], whose `Display` opens with this
+/// tag. Callers that only need to recognise the condition in a string (logs,
+/// downstream error text) match on this rather than on the full wording;
+/// callers holding the error itself should match the variant.
+///
+/// [`MetalGraphError::WeightKindMismatch`]: crate::gpu_backend::metal_graph::MetalGraphError::WeightKindMismatch
 pub const WEIGHT_KIND_MISMATCH_TAG: &str = "weight cache kind mismatch";
 
 /// Epoch used by callers that have not been given a model epoch yet.

@@ -307,11 +307,44 @@ impl<'a> InferenceEngine<'a> {
         if !*cpu_fallback_active && !force_cpu {
             match self.model.forward_greedy_gpu(next_token, pos - 1) {
                 Ok(token_id) => return Ok(token_id),
-                Err(e) => {
+                // The DESIGNED signal (MET-05): the fused GPU path kept its
+                // own device KV cache, so the host cache holds no history
+                // and the CPU must replay the committed prefix first. This
+                // is expected control flow, not a failure.
+                Err(e)
+                    if e.downcast_ref::<oxibonsai_model::error::ModelError>()
+                        .and_then(oxibonsai_model::model::gpu_fallback_cache_rebuild_pos)
+                        .is_some() =>
+                {
+                    let rebuild_pos = e
+                        .downcast_ref::<oxibonsai_model::error::ModelError>()
+                        .and_then(oxibonsai_model::model::gpu_fallback_cache_rebuild_pos);
                     tracing::warn!(
-                        error = %e, pos,
-                        "Metal greedy GPU decode failed; rebuilding the CPU KV cache from the \
-                         committed sequence and continuing on the CPU"
+                        error = %e, pos, ?rebuild_pos,
+                        "GPU decode requires a host KV-cache rebuild (MET-05); replaying the \
+                         committed sequence on the CPU"
+                    );
+                }
+                // Anything else is a GENUINE Metal failure. It is still
+                // recovered from -- dropping the request would be worse --
+                // but at `error` level with its stable code, so it is
+                // distinguishable from the designed signal above instead of
+                // being swallowed into the same `warn!` (gatekeeper
+                // REQUIRED #3).
+                Err(e) => {
+                    let code = e
+                        .downcast_ref::<oxibonsai_model::error::ModelError>()
+                        .map_or(
+                            "NON_MODEL_ERROR",
+                            oxibonsai_model::error::ModelError::error_code,
+                        );
+                    tracing::error!(
+                        error = %e,
+                        code,
+                        pos,
+                        "Metal greedy GPU decode FAILED (not the MET-05 cache-rebuild signal); \
+                         rebuilding the CPU KV cache and continuing on the CPU -- this is a \
+                         real GPU error, not expected control flow"
                     );
                 }
             }

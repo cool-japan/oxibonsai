@@ -2,6 +2,8 @@
 //!
 //! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
 
+use std::borrow::Cow;
+
 #[cfg(test)]
 use crate::block::types::{LayerStats, TransformerBlock};
 use crate::error::{ModelError, ModelResult};
@@ -62,6 +64,47 @@ pub(crate) fn blocks_as_bytes_ternary(blocks: &[oxibonsai_core::BlockTQ2_0_g128]
 /// small to amortise Rayon's thread-pool overhead, so we fall back to the
 /// sequential loop.
 pub(super) const PAR_HEAD_MIN_HEADS: usize = 8;
+/// Borrow (dense) or copy (sparse) one head's key history.
+///
+/// `KvCache::keys_for`/`values_for` return an **empty** `&[f32]` for the
+/// `f16`-backed sparse storage a hybrid model allocates, because a
+/// zero-copy `&[f32]` view of `f16` bytes does not exist. The round-2
+/// mitigation for that was a `#[cfg(not(test))] debug_assert!`, which
+/// compiles out in release: an attention pass over an empty history
+/// returns zeros and every downstream logit is wrong with no signal.
+///
+/// This helper closes that hole without paying for it on the dense path
+/// every shipping Qwen3 model uses: `Cow::Borrowed` there (unchanged,
+/// zero-copy), `Cow::Owned` only when the cache really is sparse.
+#[inline]
+pub(crate) fn keys_for_cow(
+    cache: &KvCache,
+    layer: usize,
+    head: usize,
+    seq_len: usize,
+) -> Cow<'_, [f32]> {
+    if cache.is_sparse() {
+        Cow::Owned(cache.keys_for_owned(layer, head, seq_len))
+    } else {
+        Cow::Borrowed(cache.keys_for(layer, head, seq_len))
+    }
+}
+
+/// [`keys_for_cow`]'s value counterpart.
+#[inline]
+pub(crate) fn values_for_cow(
+    cache: &KvCache,
+    layer: usize,
+    head: usize,
+    seq_len: usize,
+) -> Cow<'_, [f32]> {
+    if cache.is_sparse() {
+        Cow::Owned(cache.values_for_owned(layer, head, seq_len))
+    } else {
+        Cow::Borrowed(cache.values_for(layer, head, seq_len))
+    }
+}
+
 /// Run GQA attention for all Q heads, writing results into `attn_out`.
 ///
 /// Dispatches to a parallel Rayon loop when `num_q_heads >= PAR_HEAD_MIN_HEADS`,
@@ -92,12 +135,12 @@ pub(super) fn compute_gqa_attention(
             |(q_head, out_slice)| -> ModelResult<()> {
                 let kv_head = q_head / heads_per_group;
                 let q_start = q_head * head_dim;
-                let keys = kv_cache.keys_for(layer_idx, kv_head, seq_len);
-                let values = kv_cache.values_for(layer_idx, kv_head, seq_len);
+                let keys = keys_for_cow(kv_cache, layer_idx, kv_head, seq_len);
+                let values = values_for_cow(kv_cache, layer_idx, kv_head, seq_len);
                 fused_attention_head_contiguous(
                     &q_rope[q_start..q_start + head_dim],
-                    keys,
-                    values,
+                    &keys,
+                    &values,
                     out_slice,
                     seq_len,
                     head_dim,
@@ -109,12 +152,12 @@ pub(super) fn compute_gqa_attention(
         for q_head in 0..num_q_heads {
             let kv_head = q_head / heads_per_group;
             let q_start = q_head * head_dim;
-            let keys = kv_cache.keys_for(layer_idx, kv_head, seq_len);
-            let values = kv_cache.values_for(layer_idx, kv_head, seq_len);
+            let keys = keys_for_cow(kv_cache, layer_idx, kv_head, seq_len);
+            let values = values_for_cow(kv_cache, layer_idx, kv_head, seq_len);
             fused_attention_head_contiguous(
                 &q_rope[q_start..q_start + head_dim],
-                keys,
-                values,
+                &keys,
+                &values,
                 &mut attn_out[q_start..q_start + head_dim],
                 seq_len,
                 head_dim,

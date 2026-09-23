@@ -10,6 +10,18 @@
 //!    first [`ToolCall`] it finds, matching against a provided registry.
 //! 3. **Convenience constructors**: `make_tool_call` and `new_tool_call_id`
 //!    expose the low-level helpers under module-level names.
+//! 4. **XML tool calls** (B2-13/RT-11, bonsai2-design.md §5.4): Bonsai 2's
+//!    chat template teaches the model
+//!    `<tool_call>\n<function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>\n
+//!    </function>\n</tool_call>`, not the JSON payload `select_tool`/
+//!    `parse_tool_call` above expect. [`parse_xml_tool_calls`] parses that
+//!    shape (zero or more calls per message); [`parse_tool_calls`] is the
+//!    single entry point server/extended handlers should call — it tries
+//!    the XML shape first and falls back to the legacy JSON shape, so
+//!    neither format regresses. A truncated `<tool_call>` (still open at
+//!    end of text — the model was cut off, or is still streaming) yields
+//!    [`ToolParseError::Truncated`], never a panic and never a half-formed
+//!    call.
 
 use std::collections::HashMap;
 
@@ -338,6 +350,615 @@ pub fn validate_tool_arguments(
     }
 
     Ok(parsed)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// XML tool-call parsing (B2-13/RT-11, bonsai2-design.md §5.4)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Errors from [`parse_xml_tool_calls`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolParseError {
+    /// A `<tool_call>` block was opened but never closed before the text
+    /// ended — the model was cut off (max tokens / stop) or, on the
+    /// streaming path, has simply not finished emitting it yet. Never
+    /// treat this as "no tool call": the caller should either wait for more
+    /// tokens (streaming) or report a failed/incomplete generation
+    /// (non-streaming) — never silently drop or half-apply the call.
+    Truncated,
+    /// A `<tool_call>` block closed, but its interior does not match the
+    /// `<function=NAME>` / `<parameter=KEY>...</parameter>` shape.
+    Malformed(String),
+}
+
+impl std::fmt::Display for ToolParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ToolParseError::Truncated => {
+                write!(f, "a <tool_call> block was never closed")
+            }
+            ToolParseError::Malformed(reason) => write!(f, "malformed <tool_call> XML: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for ToolParseError {}
+
+/// One parsed `<tool_call><function=NAME>...</function></tool_call>` block.
+#[derive(Debug, Clone, PartialEq)]
+pub struct XmlToolCall {
+    /// The function name from `<function=NAME>`.
+    pub name: String,
+    /// `<parameter=KEY>VALUE</parameter>` pairs, in the order they appeared.
+    /// A `VALUE` that parses as JSON (a number, boolean, array, object, or
+    /// `null`) is stored as that parsed value; otherwise it is stored as a
+    /// JSON string — mirroring the template's own convention of emitting
+    /// `|tojson` for non-string arguments and raw text for string ones
+    /// (bonsai2-design.md §5.4).
+    pub arguments: serde_json::Map<String, serde_json::Value>,
+}
+
+const TOOL_CALL_OPEN: &str = "<tool_call>";
+const TOOL_CALL_CLOSE: &str = "</tool_call>";
+const FUNCTION_OPEN_PREFIX: &str = "<function=";
+const FUNCTION_CLOSE: &str = "</function>";
+const PARAMETER_OPEN_PREFIX: &str = "<parameter=";
+const PARAMETER_CLOSE: &str = "</parameter>";
+
+/// Parse zero or more `<tool_call>` blocks out of an assistant message.
+///
+/// Returns `(leading_natural_language, calls)`: text **before** the first
+/// `<tool_call>` is kept verbatim (the template's own `<IMPORTANT>` block
+/// allows reasoning before a call, never after). Text **after** the last
+/// `</tool_call>` that is not itself another `<tool_call>` block is a
+/// protocol violation per that same `<IMPORTANT>` block — it is logged via
+/// `tracing::warn!` and dropped rather than silently concatenated onto
+/// `leading_natural_language` or a call's arguments.
+///
+/// Every byte offset this function slices at comes from `str::find`-ing a
+/// fixed ASCII literal (or is `0`/`text.len()`), which is always a valid
+/// UTF-8 char boundary — this function never panics on any input, verified
+/// by `parse_xml_tool_calls_never_panics*` below.
+///
+/// # Errors
+///
+/// - [`ToolParseError::Truncated`] — a `<tool_call>` was opened but the
+///   matching `</tool_call>` never appears.
+/// - [`ToolParseError::Malformed`] — a closed `<tool_call>...</tool_call>`
+///   block's interior does not match the expected shape (no
+///   `<function=NAME>`, no `</function>`, or a `<parameter=KEY>` with no
+///   matching `</parameter>`).
+pub fn parse_xml_tool_calls(text: &str) -> Result<(String, Vec<XmlToolCall>), ToolParseError> {
+    let Some(first_open) = text.find(TOOL_CALL_OPEN) else {
+        return Ok((text.to_string(), Vec::new()));
+    };
+    let leading = text[..first_open].to_string();
+    let mut rest = &text[first_open..];
+    let mut calls = Vec::new();
+
+    while let Some(inner_and_after) = rest.strip_prefix(TOOL_CALL_OPEN) {
+        let Some(close_rel) = inner_and_after.find(TOOL_CALL_CLOSE) else {
+            return Err(ToolParseError::Truncated);
+        };
+        let inner = &inner_and_after[..close_rel];
+        calls.push(parse_function_block(inner)?);
+        rest = &inner_and_after[close_rel + TOOL_CALL_CLOSE.len()..];
+
+        // Consecutive tool-call blocks may be separated by nothing or by
+        // whitespace (the reference template emits them back-to-back); skip
+        // that separator before checking for the next block.
+        let after_whitespace = rest.trim_start_matches(['\n', '\r', ' ', '\t']);
+        if after_whitespace.starts_with(TOOL_CALL_OPEN) {
+            rest = after_whitespace;
+            continue;
+        }
+        if !rest.is_empty() {
+            // Trailing content after the last real `<tool_call>` block that
+            // is not itself another block: the `<IMPORTANT>` block the
+            // template teaches the model states reasoning must come
+            // *before* a call, never after — this is a protocol violation,
+            // not natural language to append anywhere. Warn and drop it.
+            tracing::warn!(
+                target: "oxibonsai_runtime::tool_calling",
+                dropped_bytes = rest.len(),
+                "text after the final </tool_call> is a protocol violation \
+                 (reasoning must precede a tool call, never follow it); dropping it"
+            );
+        }
+        break;
+    }
+
+    Ok((leading, calls))
+}
+
+/// Parse one `<tool_call>` block's interior (everything between
+/// `<tool_call>` and `</tool_call>`, exclusive).
+fn parse_function_block(inner: &str) -> Result<XmlToolCall, ToolParseError> {
+    let after_fn_prefix = inner
+        .find(FUNCTION_OPEN_PREFIX)
+        .map(|i| &inner[i + FUNCTION_OPEN_PREFIX.len()..])
+        .ok_or_else(|| ToolParseError::Malformed("missing <function=NAME> tag".to_string()))?;
+
+    let name_end = after_fn_prefix
+        .find('>')
+        .ok_or_else(|| ToolParseError::Malformed("unterminated <function=NAME> tag".to_string()))?;
+    let name = after_fn_prefix[..name_end].trim().to_string();
+    if name.is_empty() {
+        return Err(ToolParseError::Malformed("empty function name".to_string()));
+    }
+
+    let body_and_after = &after_fn_prefix[name_end + 1..];
+    let function_close_rel = body_and_after
+        .find(FUNCTION_CLOSE)
+        .ok_or_else(|| ToolParseError::Malformed("missing </function> tag".to_string()))?;
+    let body = &body_and_after[..function_close_rel];
+
+    let mut arguments = serde_json::Map::new();
+    let mut cursor = body;
+    while let Some(open_rel) = cursor.find(PARAMETER_OPEN_PREFIX) {
+        let after_open = &cursor[open_rel + PARAMETER_OPEN_PREFIX.len()..];
+        let Some(key_end) = after_open.find('>') else {
+            return Err(ToolParseError::Malformed(
+                "unterminated <parameter=KEY> tag".to_string(),
+            ));
+        };
+        let key = after_open[..key_end].trim().to_string();
+        let value_and_after = &after_open[key_end + 1..];
+        let Some(close_rel) = value_and_after.find(PARAMETER_CLOSE) else {
+            return Err(ToolParseError::Malformed(
+                "missing </parameter> tag".to_string(),
+            ));
+        };
+        let raw_value = value_and_after[..close_rel].trim();
+        // "Parsed as JSON when they parse, else kept as strings" (§5.4):
+        // a bare number/bool/array/object/null round-trips through
+        // `serde_json`; anything else (including a bare word with no
+        // quotes, which the template never JSON-quotes for a string
+        // argument) becomes a JSON string holding the literal text.
+        let value = serde_json::from_str::<serde_json::Value>(raw_value)
+            .unwrap_or_else(|_| serde_json::Value::String(raw_value.to_string()));
+        if !key.is_empty() {
+            arguments.insert(key, value);
+        }
+        cursor = &value_and_after[close_rel + PARAMETER_CLOSE.len()..];
+    }
+
+    Ok(XmlToolCall { name, arguments })
+}
+
+/// Convert parsed XML tool calls into OpenAI-shaped [`ToolCall`]s, minting a
+/// fresh id for each (see [`new_tool_call_id`]).
+pub fn xml_tool_calls_to_openai(calls: Vec<XmlToolCall>) -> Vec<ToolCall> {
+    calls
+        .into_iter()
+        .map(|call| {
+            let arguments =
+                serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".to_string());
+            make_tool_call(new_tool_call_id(), call.name, arguments)
+        })
+        .collect()
+}
+
+/// The outcome of [`parse_tool_calls`] — the single entry point server /
+/// extended-endpoint handlers should call once generation has finished.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolCallParseOutcome {
+    /// No tool-call markup of any kind (XML or legacy JSON) was found; the
+    /// whole text is ordinary content.
+    None,
+    /// One or more complete tool calls were found.
+    Found {
+        /// Text before the first tool call — the model's natural-language
+        /// preamble, if any.
+        leading_text: String,
+        /// The parsed calls, OpenAI-shaped and each carrying a fresh id.
+        calls: Vec<ToolCall>,
+    },
+    /// A `<tool_call>` was opened but never closed. The caller must not
+    /// treat this as "no tool call" (which would leak the partial XML as
+    /// visible assistant content) — see [`ToolParseError::Truncated`].
+    Truncated,
+}
+
+/// Parse tool calls out of a finished assistant message: tries the Bonsai 2
+/// XML shape first ([`parse_xml_tool_calls`]), falling back to the legacy
+/// JSON payload shape ([`crate::api_types::parse_tool_call`]) so a model
+/// that emits the older `<tool_call>{"name":...}</tool_call>` form is not
+/// regressed by adding XML support.
+pub fn parse_tool_calls(text: &str) -> ToolCallParseOutcome {
+    match parse_xml_tool_calls(text) {
+        Ok((leading, calls)) if !calls.is_empty() => ToolCallParseOutcome::Found {
+            leading_text: leading,
+            calls: xml_tool_calls_to_openai(calls),
+        },
+        Err(ToolParseError::Truncated) => ToolCallParseOutcome::Truncated,
+        // No `<tool_call>` tag at all, or one that closed but whose
+        // interior isn't the XML shape: try the legacy JSON payload before
+        // concluding there is no tool call.
+        Ok(_) | Err(ToolParseError::Malformed(_)) => legacy_json_tool_call(text),
+    }
+}
+
+/// The legacy `<tool_call>{"name": ..., "arguments": {...}}</tool_call>`
+/// fallback [`parse_tool_calls`] uses when the XML shape does not match.
+fn legacy_json_tool_call(text: &str) -> ToolCallParseOutcome {
+    match crate::api_types::parse_tool_call(text, &new_tool_call_id()) {
+        Some(call) => {
+            let split_at = text.find(TOOL_CALL_OPEN).unwrap_or(text.len());
+            ToolCallParseOutcome::Found {
+                leading_text: text[..split_at].to_string(),
+                calls: vec![call],
+            }
+        }
+        None => ToolCallParseOutcome::None,
+    }
+}
+
+/// Incremental wrapper around [`parse_xml_tool_calls`] for the SSE
+/// streaming path: feed it the growing decoded-so-far assistant text and it
+/// reports only the calls newly *completed* since the last call, so a
+/// caller can stream `tool_calls` deltas without re-emitting the same call
+/// twice or emitting a partially-formed one.
+#[derive(Debug, Clone, Default)]
+pub struct XmlToolCallStreamParser {
+    emitted: usize,
+}
+
+impl XmlToolCallStreamParser {
+    /// Build a fresh parser with nothing emitted yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Re-parse the full text generated so far; returns only the tool calls
+    /// newly completed since the last call to this method. Returns an empty
+    /// `Vec` while a call is still open ([`ToolParseError::Truncated`]) or
+    /// its interior does not (yet) match the expected shape — both are
+    /// "not yet", not errors, since more tokens may still complete it; only
+    /// [`Self::finish`] turns a still-open block into a hard error.
+    pub fn feed(&mut self, text_so_far: &str) -> Vec<XmlToolCall> {
+        match parse_xml_tool_calls(text_so_far) {
+            Ok((_, calls)) if calls.len() > self.emitted => {
+                let new_calls = calls[self.emitted..].to_vec();
+                self.emitted = calls.len();
+                new_calls
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Number of calls already reported by [`Self::feed`].
+    pub fn emitted_count(&self) -> usize {
+        self.emitted
+    }
+
+    /// Call once generation has ended (EOS / stop / max tokens) with the
+    /// complete final text. `Ok(())` when nothing was left open;
+    /// `Err` — always [`ToolParseError`], never a panic — when a
+    /// `<tool_call>` is still unclosed or malformed at end of stream.
+    pub fn finish(&self, final_text: &str) -> Result<(), ToolParseError> {
+        parse_xml_tool_calls(final_text).map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod xml_tool_call_tests {
+    use super::*;
+
+    // ── The template's own worked example (bonsai2-design.md §5.4) ────────
+
+    const TEMPLATE_EXAMPLE: &str = concat!(
+        "<tool_call>\n",
+        "<function=example_function_name>\n",
+        "<parameter=example_parameter_1>\n",
+        "value_1\n",
+        "</parameter>\n",
+        "<parameter=example_parameter_2>\n",
+        "This is the value for the second parameter\n",
+        "that can span\n",
+        "multiple lines\n",
+        "</parameter>\n",
+        "</function>\n",
+        "</tool_call>",
+    );
+
+    #[test]
+    fn round_trips_the_templates_own_example() {
+        let (leading, calls) = parse_xml_tool_calls(TEMPLATE_EXAMPLE).expect("must parse");
+        assert_eq!(leading, "");
+        assert_eq!(calls.len(), 1);
+        let call = &calls[0];
+        assert_eq!(call.name, "example_function_name");
+        assert_eq!(
+            call.arguments.get("example_parameter_1"),
+            Some(&serde_json::Value::String("value_1".to_string()))
+        );
+        assert_eq!(
+            call.arguments.get("example_parameter_2"),
+            Some(&serde_json::Value::String(
+                "This is the value for the second parameter\nthat can span\nmultiple lines"
+                    .to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn leading_natural_language_is_preserved() {
+        let text = format!("Let me check that for you.\n{TEMPLATE_EXAMPLE}");
+        let (leading, calls) = parse_xml_tool_calls(&text).expect("must parse");
+        assert_eq!(leading, "Let me check that for you.\n");
+        assert_eq!(calls.len(), 1);
+    }
+
+    #[test]
+    fn no_tool_call_tag_returns_empty_with_full_text_as_leading() {
+        let (leading, calls) = parse_xml_tool_calls("just a normal answer").expect("must parse");
+        assert_eq!(leading, "just a normal answer");
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn numeric_and_boolean_arguments_parse_as_json_not_strings() {
+        let text = concat!(
+            "<tool_call>\n<function=set_count>\n",
+            "<parameter=count>\n42\n</parameter>\n",
+            "<parameter=enabled>\ntrue\n</parameter>\n",
+            "</function>\n</tool_call>",
+        );
+        let (_, calls) = parse_xml_tool_calls(text).expect("must parse");
+        assert_eq!(
+            calls[0].arguments.get("count"),
+            Some(&serde_json::Value::Number(42.into()))
+        );
+        assert_eq!(
+            calls[0].arguments.get("enabled"),
+            Some(&serde_json::Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn multiple_tool_calls_all_parsed() {
+        let text = concat!(
+            "<tool_call>\n<function=a>\n</function>\n</tool_call>\n",
+            "<tool_call>\n<function=b>\n</function>\n</tool_call>",
+        );
+        let (_, calls) = parse_xml_tool_calls(text).expect("must parse");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "a");
+        assert_eq!(calls[1].name, "b");
+    }
+
+    #[test]
+    fn function_with_no_parameters() {
+        let text = "<tool_call>\n<function=ping>\n</function>\n</tool_call>";
+        let (_, calls) = parse_xml_tool_calls(text).expect("must parse");
+        assert_eq!(calls[0].name, "ping");
+        assert!(calls[0].arguments.is_empty());
+    }
+
+    // ── Truncation (RT-11) ─────────────────────────────────────────────────
+
+    #[test]
+    fn truncated_after_open_tag_is_truncated_not_panic() {
+        let err = parse_xml_tool_calls("<tool_call>\n<function=foo>\n<parameter=x>\nbar")
+            .expect_err("must error");
+        assert_eq!(err, ToolParseError::Truncated);
+    }
+
+    #[test]
+    fn truncated_bare_open_tag_is_truncated() {
+        let err = parse_xml_tool_calls("thinking...<tool_call>").expect_err("must error");
+        assert_eq!(err, ToolParseError::Truncated);
+    }
+
+    #[test]
+    fn first_call_complete_second_call_truncated_is_truncated_not_partial_success() {
+        let text = format!("{TEMPLATE_EXAMPLE}\n<tool_call>\n<function=incomplete");
+        let err = parse_xml_tool_calls(&text).expect_err("must error, never a half-formed call");
+        assert_eq!(err, ToolParseError::Truncated);
+    }
+
+    // ── Malformed (closed, but wrong interior shape) ───────────────────────
+
+    #[test]
+    fn closed_but_no_function_tag_is_malformed() {
+        let err = parse_xml_tool_calls("<tool_call>\nnot a function\n</tool_call>")
+            .expect_err("must error");
+        assert!(matches!(err, ToolParseError::Malformed(_)));
+    }
+
+    #[test]
+    fn closed_but_unterminated_function_name_is_malformed() {
+        let err = parse_xml_tool_calls("<tool_call>\n<function=foo\n</tool_call>")
+            .expect_err("must error");
+        assert!(matches!(err, ToolParseError::Malformed(_)));
+    }
+
+    #[test]
+    fn closed_but_missing_function_close_is_malformed() {
+        let err = parse_xml_tool_calls("<tool_call>\n<function=foo>\n</tool_call>")
+            .expect_err("must error");
+        assert!(matches!(err, ToolParseError::Malformed(_)));
+    }
+
+    #[test]
+    fn empty_function_name_is_malformed() {
+        let err = parse_xml_tool_calls("<tool_call>\n<function=>\n</function>\n</tool_call>")
+            .expect_err("must error");
+        assert!(matches!(err, ToolParseError::Malformed(_)));
+    }
+
+    // ── xml_tool_calls_to_openai ───────────────────────────────────────────
+
+    #[test]
+    fn xml_tool_calls_to_openai_shape() {
+        let (_, calls) = parse_xml_tool_calls(TEMPLATE_EXAMPLE).expect("must parse");
+        let openai = xml_tool_calls_to_openai(calls);
+        assert_eq!(openai.len(), 1);
+        assert_eq!(openai[0].function.name, "example_function_name");
+        assert!(openai[0].id.starts_with("call_"));
+        let args: serde_json::Value =
+            serde_json::from_str(&openai[0].function.arguments).expect("valid JSON");
+        assert_eq!(args["example_parameter_1"], "value_1");
+    }
+
+    #[test]
+    fn xml_tool_calls_get_distinct_ids() {
+        let text = concat!(
+            "<tool_call>\n<function=a>\n</function>\n</tool_call>\n",
+            "<tool_call>\n<function=b>\n</function>\n</tool_call>",
+        );
+        let (_, calls) = parse_xml_tool_calls(text).expect("must parse");
+        let openai = xml_tool_calls_to_openai(calls);
+        assert_ne!(openai[0].id, openai[1].id);
+    }
+
+    // ── parse_tool_calls: XML-first, JSON-fallback dispatcher ──────────────
+
+    #[test]
+    fn parse_tool_calls_prefers_xml() {
+        let outcome = parse_tool_calls(TEMPLATE_EXAMPLE);
+        match outcome {
+            ToolCallParseOutcome::Found { calls, .. } => {
+                assert_eq!(calls[0].function.name, "example_function_name");
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_tool_calls_falls_back_to_legacy_json() {
+        let text = r#"<tool_call>{"name":"get_weather","arguments":{"city":"Tokyo"}}</tool_call>"#;
+        let outcome = parse_tool_calls(text);
+        match outcome {
+            ToolCallParseOutcome::Found { calls, .. } => {
+                assert_eq!(calls[0].function.name, "get_weather");
+            }
+            other => panic!("expected Found (legacy JSON fallback), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_tool_calls_none_when_no_markup() {
+        assert_eq!(parse_tool_calls("plain answer"), ToolCallParseOutcome::None);
+    }
+
+    #[test]
+    fn parse_tool_calls_truncated_propagates() {
+        assert_eq!(
+            parse_tool_calls("<tool_call>\n<function=foo"),
+            ToolCallParseOutcome::Truncated
+        );
+    }
+
+    // ── XmlToolCallStreamParser ─────────────────────────────────────────────
+
+    #[test]
+    fn stream_parser_emits_only_newly_completed_calls() {
+        let mut parser = XmlToolCallStreamParser::new();
+        let prefix = "Let me check.\n<tool_call>\n<function=a>\n</function>\n</tool_call>";
+        assert_eq!(parser.feed(prefix).len(), 1);
+        assert_eq!(parser.emitted_count(), 1);
+        // Feeding the same text again reports nothing new.
+        assert!(parser.feed(prefix).is_empty());
+        let extended = format!("{prefix}\n<tool_call>\n<function=b>\n</function>\n</tool_call>");
+        let newly = parser.feed(&extended);
+        assert_eq!(newly.len(), 1);
+        assert_eq!(newly[0].name, "b");
+        assert_eq!(parser.emitted_count(), 2);
+    }
+
+    #[test]
+    fn stream_parser_feed_is_empty_while_call_is_still_open() {
+        let mut parser = XmlToolCallStreamParser::new();
+        assert!(parser
+            .feed("<tool_call>\n<function=a>\n<parameter=x>\nun")
+            .is_empty());
+    }
+
+    #[test]
+    fn stream_parser_finish_ok_when_nothing_open() {
+        let parser = XmlToolCallStreamParser::new();
+        assert!(parser.finish(TEMPLATE_EXAMPLE).is_ok());
+        assert!(parser.finish("plain text, no tool call").is_ok());
+    }
+
+    #[test]
+    fn stream_parser_finish_errors_when_still_open() {
+        let parser = XmlToolCallStreamParser::new();
+        let err = parser
+            .finish("<tool_call>\n<function=a>\nstill going")
+            .expect_err("must error");
+        assert_eq!(err, ToolParseError::Truncated);
+    }
+
+    // ── ToolParseError::Display ─────────────────────────────────────────────
+
+    #[test]
+    fn tool_parse_error_display_not_empty() {
+        assert!(!ToolParseError::Truncated.to_string().is_empty());
+        assert!(!ToolParseError::Malformed("x".to_string())
+            .to_string()
+            .is_empty());
+    }
+
+    // ── Fuzz: never panics on arbitrary input ──────────────────────────────
+
+    mod fuzz {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// A strategy biased toward the tag fragments this parser looks
+        /// for, so truncation/malformed-interior edge cases are actually
+        /// exercised — uniform random Unicode text almost never contains
+        /// `<tool_call>` and would rarely reach past the first `.find`.
+        fn tag_fragment_text() -> impl Strategy<Value = String> {
+            prop::collection::vec(
+                prop_oneof![
+                    Just("<tool_call>".to_string()),
+                    Just("</tool_call>".to_string()),
+                    Just("<function=".to_string()),
+                    Just(">".to_string()),
+                    Just("</function>".to_string()),
+                    Just("<parameter=".to_string()),
+                    Just("</parameter>".to_string()),
+                    Just("\n".to_string()),
+                    Just("{\"a\":1}".to_string()),
+                    "[a-zA-Z0-9_]{0,6}".prop_map(|s| s),
+                ],
+                0..16,
+            )
+            .prop_map(|parts| parts.concat())
+        }
+
+        proptest! {
+            #[test]
+            fn parse_xml_tool_calls_never_panics_on_arbitrary_text(s in ".{0,300}") {
+                let _ = parse_xml_tool_calls(&s);
+            }
+
+            #[test]
+            fn parse_xml_tool_calls_never_panics_on_tag_fragments(s in tag_fragment_text()) {
+                let _ = parse_xml_tool_calls(&s);
+            }
+
+            #[test]
+            fn parse_tool_calls_never_panics(s in tag_fragment_text()) {
+                let _ = parse_tool_calls(&s);
+            }
+
+            #[test]
+            fn stream_parser_never_panics_incrementally(chunks in prop::collection::vec(tag_fragment_text(), 0..8)) {
+                let mut parser = XmlToolCallStreamParser::new();
+                let mut acc = String::new();
+                for chunk in chunks {
+                    acc.push_str(&chunk);
+                    let _ = parser.feed(&acc);
+                }
+                let _ = parser.finish(&acc);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -3,6 +3,29 @@
 //! Implements `POST /v1/completions` — the original text completion API that is
 //! still widely used by clients that pre-date the chat-completions interface.
 //!
+//! ## B2-13 (2026-09-23)
+//!
+//! - **`stream: true` is real SSE**, not a `400`. ORCHESTRATOR RULING D-3
+//!   (final): the wave-2 interim that rejected `stream: true` is superseded
+//!   — this endpoint now emits `text_completion` chunks sharing the chat
+//!   endpoint's SSE machinery ([`crate::server::sse::sse_response`]); see
+//!   [`stream`] for the chunk shapes and the (documented, deliberate)
+//!   combinations still rejected — a batch of more than one prompt,
+//!   `logprobs`, and `seed` — because none of those has a streaming-capable
+//!   engine seam.
+//! - **`repetition_penalty`** is now a real request field (gatekeeper
+//!   `REQUIRED #3`), validated `> 0.0` exactly like
+//!   `ExtendedChatRequest::repetition_penalty`.
+//! - **Sampling params are seeded from the engine's own ambient/startup
+//!   configuration** (`lease.sampling_params()`), never
+//!   `SamplingParams::default()` (gatekeeper `REQUIRED #1`/`#3`): the old
+//!   `let mut sampling_params = SamplingParams::default();` meant a server
+//!   started with non-default `top_k`/`top_p`/`repetition_penalty` had every
+//!   field the request did not itself override silently reset to the
+//!   library defaults on every request. Shared with `api_extensions.rs` via
+//!   [`crate::api_extensions::resolve_sampling_params`] (`pub(crate)`) —
+//!   one implementation, not two.
+//!
 //! # Behaviour
 //!
 //! - Accepts a single prompt string **or** a batch of prompt strings.
@@ -32,11 +55,14 @@
 //!   alongside `logprobs` (applied via `set_penalties` before the
 //!   logprobs-capturing decode loop runs), since that combination has no
 //!   such gap.
-//! - `stream: true` and a non-empty `suffix` are rejected with `400 Bad
-//!   Request` naming the field, rather than accepted and silently ignored
-//!   (`RT-32` / `SV-22`): this endpoint always generates and returns the full
-//!   completion synchronously, and has no fill-in-the-middle generation mode.
-//!   `stream: false` (or the field omitted, the common case) is unaffected.
+//! - `stream: true` streams real SSE (see the `B2-13` section above and
+//!   [`stream`]) for the single-prompt, non-`logprobs`, non-`seed` case;
+//!   those three combinations are rejected with `400 Bad Request` naming
+//!   the field, since none has a streaming-capable engine seam. A
+//!   non-empty `suffix` is rejected the same way regardless of `stream`
+//!   (`RT-32` / `SV-22`): the engine has no fill-in-the-middle generation
+//!   mode. `stream: false` (or the field omitted, the common case) is
+//!   unaffected by any of this.
 //! - Every prompt in a batch is generated: the engine lease is held for the
 //!   whole request and every prompt's generation runs inside a single
 //!   [`crate::server::blocking::run_blocking_generation`] call (`sec-03`) —
@@ -74,13 +100,22 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::api_extensions::StopChecker;
+use crate::api_extensions::{resolve_sampling_params, StopChecker};
 use crate::api_types::{LogprobsContent, StopSequences, UsageInfo};
 use crate::error::RuntimeResult;
-use crate::sampling::{PenaltyParams, SamplingParams};
+use crate::sampling::PenaltyParams;
+// Only used by this file's and `stream.rs`'s `#[cfg(test)]` `test_router()`
+// helpers (both reach it via `use super::*;`); a non-test build resolves
+// `SamplingParams` entirely through `resolve_sampling_params`'s return type,
+// never by name, so gating the import the same way `InferenceMetrics` is
+// gated in `api_extensions.rs` keeps a non-test build warning-free.
+#[cfg(test)]
+use crate::sampling::SamplingParams;
 use crate::server::api_error::{ApiError, OpenAiJson};
 use crate::server::blocking::run_blocking_generation;
-use crate::server::{AppState, MAX_OUTPUT_TOKENS};
+use crate::server::{ActiveRequestGuard, AppState, StreamOptions, MAX_OUTPUT_TOKENS};
+
+mod stream;
 
 /// Maximum number of prompts a single `POST /v1/completions` batch request
 /// (`prompt: [...]`) may contain. Requests with a larger batch are rejected
@@ -138,10 +173,17 @@ pub struct CompletionRequest {
     pub top_p: Option<f32>,
     /// Number of completions to generate (only 1 is currently supported).
     pub n: Option<usize>,
-    /// Whether to stream the response as SSE. Only `false`/omitted is
-    /// supported; `true` is rejected with `400` naming this field (see the
-    /// module docs).
+    /// Whether to stream the response as SSE (B2-13 / ORCHESTRATOR RULING
+    /// D-3). Real SSE for the single-prompt, non-`logprobs`, non-`seed`
+    /// case; those three combinations are rejected with `400` naming the
+    /// offending field rather than `stream` itself (see the module docs and
+    /// [`stream`]).
     pub stream: Option<bool>,
+    /// OpenAI `stream_options`; only meaningful with `stream: true`. Only
+    /// `include_usage` is honored, exactly like the base chat endpoint: a
+    /// final usage-only chunk is emitted just before `[DONE]` when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
     /// Sequences that terminate generation. Honoured via
     /// [`crate::api_extensions::StopChecker`].
     pub stop: Option<StopSequences>,
@@ -149,25 +191,34 @@ pub struct CompletionRequest {
     pub presence_penalty: Option<f32>,
     /// Penalise tokens proportional to their frequency.
     pub frequency_penalty: Option<f32>,
+    /// Repetition penalty (`1.0` = disabled), matching
+    /// `ChatCompletionRequest`/`ExtendedChatRequest`'s field of the same
+    /// name (gatekeeper `REQUIRED #3`; not a standard OpenAI Completions
+    /// field, but accepted the same way vLLM does — and this endpoint
+    /// already accepted the analogous non-standard `top_p`/`temperature`
+    /// overrides). Validated `> 0.0`. When omitted, the engine's own
+    /// startup value is used (never `SamplingParams::default`'s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repetition_penalty: Option<f32>,
     /// Return the log probabilities for the top-N tokens at each step.
-    /// Mutually exclusive with `seed` (see the module docs).
+    /// Mutually exclusive with `seed` and with `stream: true` (see the
+    /// module docs).
     pub logprobs: Option<usize>,
     /// If `true`, the prompt is echoed back at the start of the completion text.
     pub echo: Option<bool>,
     /// Random seed for deterministic generation. Mutually exclusive with
-    /// `logprobs` (see the module docs).
+    /// `logprobs` and with `stream: true` (see the module docs).
     ///
-    /// Caveat: [`crate::engine::InferenceEngine::generate_with_seed`] builds
-    /// its temporary sampler from [`SamplingParams::default`] when this
-    /// request sets `seed` but not `temperature`/`top_p` (this handler has
-    /// no accessor to read back the engine's *own* ambient sampling
-    /// parameters first — `InferenceEngine` exposes no such getter). On a
-    /// server started with non-default sampling, a request that sets only
-    /// `seed` therefore also silently resets temperature/top-k/top-p/
-    /// repetition-penalty to their defaults for that one request, not just
-    /// makes it deterministic. Not fixable from this crate; would need an
-    /// `InferenceEngine::sampling_params()` accessor added in a later
-    /// package.
+    /// Seeded from the engine's own ambient `SamplingParams`
+    /// ([`crate::engine::InferenceEngine::sampling_params`], via
+    /// [`resolve_sampling_params`]) before being passed to
+    /// [`crate::engine::InferenceEngine::generate_with_seed`] — gatekeeper
+    /// `REQUIRED #3` closed the gap an earlier revision of this doc
+    /// recorded (`generate_with_seed` building its temporary sampler from
+    /// library defaults instead of the server's actual configuration): that
+    /// accessor now exists and this handler uses it, so setting only `seed`
+    /// no longer silently resets `temperature`/`top_p`/`repetition_penalty`
+    /// to their library defaults for that one request.
     pub seed: Option<u64>,
     /// Text to append after the completion. Not supported — the engine has
     /// no fill-in-the-middle generation mode; a non-empty value is rejected
@@ -245,16 +296,26 @@ struct PromptOutcome {
 /// ready to drive generation. Kept separate from the wire request so
 /// validation is a pure function of the request body — testable without an
 /// Axum extractor, an engine, or a tokio runtime.
+///
+/// Carries the raw `temperature`/`top_p`/`repetition_penalty` *overrides*
+/// rather than a resolved [`SamplingParams`] (gatekeeper `REQUIRED #3`):
+/// resolving them needs the acquired engine lease's own ambient
+/// configuration ([`resolve_sampling_params`]), which only exists in
+/// [`create_completion`]/[`stream::stream_completion`], not here.
 struct ValidatedRequest {
     prompts: Vec<String>,
     max_tokens: usize,
     penalties: PenaltyParams,
-    sampling_params: SamplingParams,
+    req_temperature: Option<f32>,
+    req_top_p: Option<f32>,
+    req_repetition_penalty: Option<f32>,
     custom_sampling: bool,
     echo: bool,
     seed: Option<u64>,
     logprobs_top_k: Option<usize>,
     stop_checker: StopChecker,
+    stream: bool,
+    include_usage: bool,
 }
 
 /// Validate a [`CompletionRequest`], or return the first [`ApiError`] naming
@@ -307,21 +368,10 @@ fn validate_completion_request(req: CompletionRequest) -> Result<ValidatedReques
         ));
     }
 
-    // RT-32 / SV-22: `stream: true` and a non-empty `suffix` are
-    // declared-but-dropped fields the previous version silently ignored.
-    // Reject them by name instead of pretending to support either — the same
-    // honesty the base chat endpoint already applies to an unsupported
-    // `stream` + `tools`/`logprobs` combination
-    // (`server.rs::chat_completions_inner`). `stream: false` (or the field
-    // omitted, the common case) and an absent/empty `suffix` are unaffected.
-    if req.stream == Some(true) {
-        return Err(ApiError::bad_request(
-            "stream: true is not supported by /v1/completions: this endpoint always \
-             generates and returns the full completion synchronously; omit stream or set \
-             it to false",
-            "stream",
-        ));
-    }
+    // RT-32 / SV-22: a non-empty `suffix` is a declared-but-dropped field —
+    // reject it by name instead of pretending to support it. `stream: true`
+    // itself is no longer rejected here (ORCHESTRATOR RULING D-3 supersedes
+    // the wave-2 interim); see the streaming-specific guards below instead.
     if req.suffix.as_deref().is_some_and(|s| !s.is_empty()) {
         return Err(ApiError::bad_request(
             "suffix is not supported: the engine has no fill-in-the-middle generation mode, \
@@ -349,9 +399,10 @@ fn validate_completion_request(req: CompletionRequest) -> Result<ValidatedReques
     }
     let penalties = PenaltyParams::new(frequency_penalty, presence_penalty);
 
-    // Optional temperature / top_p sampling overrides. Built on top of the
-    // engine's defaults so an omitted field keeps the previous behavior.
-    let mut sampling_params = SamplingParams::default();
+    // Optional temperature / top_p / repetition_penalty sampling overrides.
+    // Validated here; *resolved* against the engine's own ambient
+    // `SamplingParams` later, once a lease is available (gatekeeper
+    // `REQUIRED #3` — see `ValidatedRequest`'s doc).
     if let Some(temperature) = req.temperature {
         if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
             return Err(ApiError::bad_request(
@@ -359,7 +410,6 @@ fn validate_completion_request(req: CompletionRequest) -> Result<ValidatedReques
                 "temperature",
             ));
         }
-        sampling_params.temperature = temperature;
     }
     if let Some(top_p) = req.top_p {
         if !top_p.is_finite() || top_p <= 0.0 || top_p > 1.0 {
@@ -368,13 +418,63 @@ fn validate_completion_request(req: CompletionRequest) -> Result<ValidatedReques
                 "top_p",
             ));
         }
-        sampling_params.top_p = top_p;
+    }
+    // Gatekeeper `REQUIRED #3`: `repetition_penalty` was entirely absent
+    // from this request type, so a client sending it got no validation and
+    // no effect at all (silently dropped as an unknown field) — validated
+    // identically to `ChatCompletionRequest`/`ExtendedChatRequest`'s field
+    // of the same name.
+    if let Some(rp) = req.repetition_penalty {
+        if !rp.is_finite() || rp <= 0.0 {
+            return Err(ApiError::bad_request(
+                "repetition_penalty must be a finite number greater than 0.0",
+                "repetition_penalty",
+            ));
+        }
     }
     // Whether the request customizes sampling at all. When it does not, the
     // vanilla `generate` path is used so default requests stay bit-identical
     // to the previous behavior; only customized requests take the
     // params+penalties path.
-    let custom_sampling = penalties.is_active() || req.temperature.is_some() || req.top_p.is_some();
+    let custom_sampling = penalties.is_active()
+        || req.temperature.is_some()
+        || req.top_p.is_some()
+        || req.repetition_penalty.is_some();
+
+    // B2-13 / ORCHESTRATOR RULING D-3: `stream: true` is real SSE, but only
+    // for the shapes that have a streaming-capable engine seam — a single
+    // prompt, no `logprobs` (`generate_streaming_with_params` has no
+    // logit-capturing counterpart) and no `seed`
+    // (`generate_streaming_with_params` has no seeded counterpart either;
+    // see `crate::engine::InferenceEngine`). Each unsupported combination is
+    // rejected by name rather than silently falling back to a non-streaming
+    // response the client's `Accept: text/event-stream` never expected.
+    let stream = req.stream.unwrap_or(false);
+    if stream && prompts.len() > 1 {
+        return Err(ApiError::bad_request(
+            "stream: true does not support a batched prompt (more than one entry); \
+             send one prompt per streaming request",
+            "stream",
+        ));
+    }
+    if stream && req.logprobs.is_some() {
+        return Err(ApiError::bad_request(
+            "stream: true cannot be combined with logprobs (no engine path streams \
+             per-token log probabilities yet); omit one",
+            "stream",
+        ));
+    }
+    if stream && req.seed.is_some() {
+        return Err(ApiError::bad_request(
+            "stream: true cannot be combined with seed (no engine path streams \
+             deterministically-seeded generation yet); omit one",
+            "stream",
+        ));
+    }
+    let include_usage = req
+        .stream_options
+        .as_ref()
+        .is_some_and(|opts| opts.include_usage);
 
     // RT-32: `seed` and `logprobs` each have an existing engine seam
     // (`generate_with_seed`, `generate_with_logprobs`), but no *combined*
@@ -437,29 +537,25 @@ fn validate_completion_request(req: CompletionRequest) -> Result<ValidatedReques
         prompts,
         max_tokens: req.max_tokens,
         penalties,
-        sampling_params,
+        req_temperature: req.temperature,
+        req_top_p: req.top_p,
+        req_repetition_penalty: req.repetition_penalty,
         custom_sampling,
         echo: req.echo.unwrap_or(false),
         seed: req.seed,
         logprobs_top_k: req.logprobs,
         stop_checker: StopChecker::new(stop_sequences),
+        stream,
+        include_usage,
     })
 }
 
 // ─── Handler ──────────────────────────────────────────────────────────────────
 
-/// Decrements `active_requests` on every exit from [`create_completion`] —
-/// including this fix's new early-return validation paths, and (as a
-/// side-effect) the pre-existing decode-failure path that used to leak the
-/// gauge because that one `return` had no matching manual `.dec()` — mirroring
-/// `server.rs`'s own (non-`pub`, so not importable from here) `ActiveRequestGuard`.
-struct ActiveRequestGuard(Arc<crate::metrics::InferenceMetrics>);
-
-impl Drop for ActiveRequestGuard {
-    fn drop(&mut self) {
-        self.0.active_requests.dec();
-    }
-}
+// `ActiveRequestGuard` — decrements `active_requests` on every exit from
+// `create_completion`, including the validation early-return paths — now
+// lives once, `pub(crate)`, in `server.rs` (wave-3.5 gatekeeper triage item
+// (5)) rather than as a third independently-maintained copy here.
 
 /// Handler for `POST /v1/completions`.
 ///
@@ -473,6 +569,14 @@ pub async fn create_completion(
     let request_start = std::time::Instant::now();
     state.metrics().requests_total.inc();
     state.metrics().active_requests.inc();
+    // Constructed once, here, so a validation error (the `?` below) is
+    // still covered by its `Drop` — but *moved* into `StreamRequest` for
+    // the streaming branch below rather than living out this function's
+    // own scope, so the gauge decrements when the background generation
+    // task actually finishes, not the moment this function returns the
+    // initial SSE response object (which happens long before any content
+    // has been streamed). The non-streaming branch keeps it as an ordinary
+    // `_`-prefixed drop guard, unchanged from before.
     let _active_guard = ActiveRequestGuard(Arc::clone(state.metrics()));
 
     if let Some(user) = req.user.as_deref() {
@@ -483,13 +587,42 @@ pub async fn create_completion(
         prompts,
         max_tokens,
         penalties,
-        sampling_params,
+        req_temperature,
+        req_top_p,
+        req_repetition_penalty,
         custom_sampling,
         echo,
         seed,
         logprobs_top_k,
         stop_checker,
+        stream,
+        include_usage,
     } = validate_completion_request(req)?;
+
+    // B2-13 / ORCHESTRATOR RULING D-3: real SSE for `stream: true`, split
+    // into its own module both to keep this file under the workspace's
+    // 2000-line ceiling and because the streaming and non-streaming paths
+    // share almost no code beyond the request shape already destructured
+    // above (validation already guarantees exactly one prompt here).
+    if stream {
+        let prompt_text = prompts.into_iter().next().unwrap_or_default();
+        return stream::stream_completion(
+            Arc::clone(&state),
+            stream::StreamRequest {
+                prompt_text,
+                max_tokens,
+                penalties,
+                req_temperature,
+                req_top_p,
+                req_repetition_penalty,
+                echo,
+                stop_checker,
+                include_usage,
+                active_guard: _active_guard,
+            },
+        )
+        .await;
+    }
 
     // Tokenise every prompt up front, in the async context: BPE tokenisation
     // is not the CPU-bound step `sec-03` targets (generation is), so it stays
@@ -520,6 +653,18 @@ pub async fn create_completion(
         ApiError::service_unavailable(format!("no inference engine replica is available: {e}"))
             .with_code("engine_unavailable")
     })?;
+
+    // Gatekeeper `REQUIRED #1`/`REQUIRED #3`: seeded from the engine's own
+    // ambient/startup `SamplingParams`, never `SamplingParams::default()` —
+    // see the module doc and `resolve_sampling_params`'s doc for why this
+    // still matters even though `SamplingParams::default`'s
+    // `repetition_penalty` is `1.0` today.
+    let sampling_params = resolve_sampling_params(
+        lease.sampling_params(),
+        req_temperature,
+        req_top_p,
+        req_repetition_penalty,
+    );
 
     // sec-03: generation is synchronous, CPU-bound work and must not run on a
     // tokio worker thread. The *whole* batch runs inside ONE
@@ -881,9 +1026,11 @@ mod tests {
             top_p: None,
             n: None,
             stream: None,
+            stream_options: None,
             stop: None,
             presence_penalty: None,
             frequency_penalty: None,
+            repetition_penalty: None,
             logprobs: None,
             echo: None,
             seed: None,
@@ -1130,6 +1277,7 @@ mod tests {
 
     fn logprobs_content(token: &str, logprob: f32) -> LogprobsContent {
         LogprobsContent {
+            id: 0,
             token: token.to_string(),
             logprob,
             bytes: None,
@@ -1184,11 +1332,13 @@ mod tests {
         let mut content = logprobs_content("a", -0.05);
         content.top_logprobs = vec![
             crate::api_types::TopLogprob {
+                id: 0,
                 token: "a".to_string(),
                 logprob: -0.05,
                 bytes: None,
             },
             crate::api_types::TopLogprob {
+                id: 1,
                 token: "b".to_string(),
                 logprob: -1.2,
                 bytes: None,
@@ -1274,9 +1424,41 @@ mod tests {
 
     /// `stream: true` is rejected naming the field (RT-32 / SV-22).
     #[test]
-    fn validate_rejects_stream_true() {
+    fn validate_accepts_stream_true_alone() {
+        // ORCHESTRATOR RULING D-3 (final) supersedes the wave-2 interim this
+        // test used to assert (`stream: true` -> unconditional 400): a bare
+        // `stream: true` with a single prompt and no `logprobs`/`seed` is now
+        // valid and must resolve to the streaming branch.
         let mut req = base_request(PromptInput::Single("hi".to_string()));
         req.stream = Some(true);
+        let validated = validate_completion_request(req).expect("stream: true alone must validate");
+        assert!(validated.stream);
+    }
+
+    /// The three combinations that remain rejected under D-3: a streaming
+    /// request has no engine seam for a batch, `logprobs`, or `seed`.
+    #[test]
+    fn validate_rejects_stream_with_batch() {
+        let mut req = base_request(PromptInput::Batch(vec!["a".to_string(), "b".to_string()]));
+        req.stream = Some(true);
+        let err = expect_err(validate_completion_request(req));
+        assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn validate_rejects_stream_with_logprobs() {
+        let mut req = base_request(PromptInput::Single("hi".to_string()));
+        req.stream = Some(true);
+        req.logprobs = Some(2);
+        let err = expect_err(validate_completion_request(req));
+        assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn validate_rejects_stream_with_seed() {
+        let mut req = base_request(PromptInput::Single("hi".to_string()));
+        req.stream = Some(true);
+        req.seed = Some(7);
         let err = expect_err(validate_completion_request(req));
         assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
     }
@@ -1568,14 +1750,41 @@ mod tests {
         assert!(json["choices"][0]["logprobs"].is_null());
     }
 
-    /// `stream: true` is rejected end-to-end with `400`, naming the field —
-    /// not silently accepted and answered with a non-streaming JSON body.
+    /// `stream: true` alone now resolves to real SSE (ORCHESTRATOR RULING
+    /// D-3, final — supersedes this test's former wave-2-interim
+    /// assertion that it was unconditionally rejected with `400`): status
+    /// is `200 OK`, and the body is SSE text (not the non-streaming JSON
+    /// object shape), so `post_completion`'s `serde_json::from_slice` on it
+    /// falls back to `Value::Null`. The detailed chunk-shape assertions
+    /// (`text_completion` chunks, `[DONE]`, `stream_options.include_usage`)
+    /// live in `stream::tests`, which reads the raw body as text rather
+    /// than attempting a JSON parse.
     #[tokio::test]
-    async fn handler_stream_true_is_rejected_with_400() {
+    async fn handler_stream_true_alone_is_ok_not_400() {
         let app = test_router();
         let (status, json) = post_completion(
             app,
             serde_json::json!({ "prompt": "hello", "max_tokens": 3, "stream": true }),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            json,
+            serde_json::Value::Null,
+            "an SSE body must not parse as a single JSON document"
+        );
+    }
+
+    /// The three combinations that remain rejected under D-3 (batch,
+    /// `logprobs`, `seed`) still return `400` naming `stream`, end to end.
+    #[tokio::test]
+    async fn handler_stream_with_logprobs_is_rejected_with_400() {
+        let app = test_router();
+        let (status, json) = post_completion(
+            app,
+            serde_json::json!({
+                "prompt": "hello", "max_tokens": 3, "stream": true, "logprobs": 2
+            }),
         )
         .await;
         assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);

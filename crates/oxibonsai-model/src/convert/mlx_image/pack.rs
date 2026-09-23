@@ -23,6 +23,7 @@
 //! `[out × in/128]` row-major expectation.
 
 use half::f16;
+use oxibonsai_core::bf16::bf16_to_f32;
 
 use oxibonsai_core::quant_ternary::BlockTQ2_0_g128;
 
@@ -36,17 +37,6 @@ const CODES_PER_U32: usize = 16;
 
 /// Number of `u32` words spanning one 128-element group (`128 / 16`).
 const U32_WORDS_PER_GROUP: usize = GROUP_SIZE / CODES_PER_U32; // = 8
-
-/// Reinterpret a bfloat16 bit pattern as `f32`.
-///
-/// Re-exports the single canonical implementation in
-/// [`oxibonsai_core::bf16::bf16_to_f32`] (K-12 bf16 hoist / FIX3-GGUF-WRITE
-/// item 4). This used to be its own copy of the identical bit-manipulation
-/// (`f32::from_bits((bits as u32) << 16)`); kept as a `pub use` rather than
-/// deleted outright because `crate::model::weight_loaders` and
-/// `crate::hybrid::weights` (not owned by this package) import it from this
-/// exact path.
-pub use oxibonsai_core::bf16::bf16_to_f32;
 
 /// Pack one MLX-quantized linear module into `BlockTQ2_0_g128` blocks.
 ///

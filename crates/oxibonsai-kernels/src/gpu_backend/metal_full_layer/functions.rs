@@ -47,6 +47,11 @@ pub(super) mod gpu_profile {
     /// # Safety
     /// Must be called only after `wait_until_completed()` returns.
     pub unsafe fn gpu_cmd_times(cmd_buf: &metal::CommandBufferRef) -> (f64, f64) {
+        // `deps-17`: `metal` 0.33 re-exports `objc` (`pub extern crate objc;`),
+        // so these macros come from the `metal` dependency and the crate needs
+        // no direct `objc` dependency of its own. `msg_send!` expands to
+        // `sel!`/`sel_impl!`, hence all three imports.
+        use metal::objc::{msg_send, sel, sel_impl};
         let start: f64 = msg_send![cmd_buf, GPUStartTime];
         let end: f64 = msg_send![cmd_buf, GPUEndTime];
         (start, end)

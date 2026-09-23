@@ -664,8 +664,8 @@ fn prefill_pass(
             let v_row = &scratch.v_all[row * geom.kv_dim..(row + 1) * geom.kv_dim];
             for head in 0..geom.num_kv_heads {
                 let span = head * hd..(head + 1) * hd;
-                kv_cache.store_key(layer_idx, head, pos, &scratch.k_rope[span.clone()]);
-                kv_cache.store_value(layer_idx, head, pos, &v_row[span]);
+                kv_cache.try_store_key(layer_idx, head, pos, &scratch.k_rope[span.clone()])?;
+                kv_cache.try_store_value(layer_idx, head, pos, &v_row[span])?;
             }
             // Mirrors `block::functions::advance_kv_cache_to`: keep the
             // cache's own cursor at least one past the position just written.
@@ -765,12 +765,13 @@ fn gqa_attention_row(
         |(q_head, out_slice)| -> ModelResult<()> {
             let kv_head = q_head / geom.heads_per_group;
             let q_start = q_head * head_dim;
-            let keys = kv_cache.keys_for(layer_idx, kv_head, seq_len);
-            let values = kv_cache.values_for(layer_idx, kv_head, seq_len);
+            let keys = crate::block::functions::keys_for_cow(kv_cache, layer_idx, kv_head, seq_len);
+            let values =
+                crate::block::functions::values_for_cow(kv_cache, layer_idx, kv_head, seq_len);
             fused_attention_head_contiguous(
                 &q_rope[q_start..q_start + head_dim],
-                keys,
-                values,
+                &keys,
+                &values,
                 out_slice,
                 seq_len,
                 head_dim,

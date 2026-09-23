@@ -5,6 +5,8 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::OnceLock;
 
 // ── Phase 19: Tool calling types ──────────────────────────────────────────────
 
@@ -133,7 +135,7 @@ pub struct FunctionName {
 }
 
 /// A tool call made by the model in the response.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct ToolCall {
     /// A unique ID for this tool call.
     pub id: String,
@@ -145,7 +147,7 @@ pub struct ToolCall {
 }
 
 /// The result of a function call — name and serialized arguments.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct FunctionCallResult {
     /// The name of the function called.
     pub name: String,
@@ -158,6 +160,16 @@ pub struct FunctionCallResult {
 /// Log probability information for a single generated token.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LogprobsContent {
+    /// The token id this entry describes. Not part of the OpenAI wire
+    /// shape (never serialized — no `#[serde]` attribute needed since
+    /// callers read it before building the wire response), but the seam
+    /// [`fix_logprob_bytes`] needs: without carrying the id alongside the
+    /// (possibly lossy) display `token` string, a caller has no way to
+    /// recover the token's real raw bytes for a byte-fragment token
+    /// (`TOK-M1`) short of re-deriving it from a second, externally-tracked
+    /// id list that must stay in lockstep by construction.
+    #[serde(skip)]
+    pub id: u32,
     /// The token text.
     pub token: String,
     /// The log probability of this token.
@@ -171,12 +183,47 @@ pub struct LogprobsContent {
 /// A top-k alternative token and its log probability.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TopLogprob {
+    /// The token id this alternative describes. See [`LogprobsContent::id`]'s
+    /// doc — same rationale, same `#[serde(skip)]`.
+    #[serde(skip)]
+    pub id: u32,
     /// The token text.
     pub token: String,
     /// The log probability of this token.
     pub logprob: f32,
     /// The UTF-8 bytes of the token, if representable.
     pub bytes: Option<Vec<u8>>,
+}
+
+/// Fix up every entry's (and every alternative's) `bytes` field using the
+/// real per-token raw vocabulary bytes, rather than [`compute_logprobs`]'s
+/// necessarily lossy `token_bytes(display_string)` derivation.
+///
+/// `TOK-M1`: a byte-fragment token (part of a multi-byte UTF-8 sequence
+/// that does not decode on its own — routine for CJK/emoji output) decodes
+/// through a single-id `decode`/`Display` round-trip as `U+FFFD`
+/// (`"�"`), so `token_bytes` reports `U+FFFD`'s own 3-byte UTF-8 encoding
+/// instead of the token's real (possibly single) raw byte. `piece_of`
+/// should be a raw vocabulary lookup that does not go through UTF-8
+/// validation (e.g. [`crate::tokenizer_bridge::TokenizerBridge::piece`]),
+/// so it recovers the exact bytes regardless of whether the id is valid
+/// UTF-8 on its own.
+///
+/// Every [`LogprobsContent`]/[`TopLogprob`] this workspace constructs
+/// carries its own `id` (see their docs), so — unlike an earlier
+/// implementation that zipped a separate `&[u32]` token-id list against the
+/// content Vec and trusted the two stayed aligned — this cannot desync from
+/// what it corrects: the id and the (possibly stale) bytes it replaces live
+/// in the same struct.
+pub fn fix_logprob_bytes(content: &mut [LogprobsContent], piece_of: &dyn Fn(u32) -> Vec<u8>) {
+    for entry in content.iter_mut() {
+        let piece = piece_of(entry.id);
+        entry.bytes = if piece.is_empty() { None } else { Some(piece) };
+        for top in entry.top_logprobs.iter_mut() {
+            let piece = piece_of(top.id);
+            top.bytes = if piece.is_empty() { None } else { Some(piece) };
+        }
+    }
 }
 
 /// Logprob information attached to a choice.
@@ -467,6 +514,7 @@ pub fn compute_logprobs(
 ) -> LogprobsContent {
     if logits.is_empty() {
         return LogprobsContent {
+            id: chosen_token,
             token: id_to_token(chosen_token),
             logprob: 0.0,
             bytes: token_bytes(id_to_token(chosen_token).as_str()),
@@ -505,6 +553,7 @@ pub fn compute_logprobs(
             let text = id_to_token(tid);
             let bytes = token_bytes(&text);
             TopLogprob {
+                id: tid,
                 token: text,
                 logprob: lp,
                 bytes,
@@ -513,6 +562,7 @@ pub fn compute_logprobs(
         .collect();
 
     LogprobsContent {
+        id: chosen_token,
         token: chosen_text,
         logprob: chosen_logprob,
         bytes: chosen_bytes,
@@ -573,18 +623,38 @@ pub fn parse_tool_call(text: &str, call_id: &str) -> Option<ToolCall> {
 
 /// Generate a unique tool call identifier with the `call_` prefix.
 ///
-/// Uses a timestamp-derived hash to produce 8 hex characters, yielding
-/// identifiers such as `call_1a2b3c4d`.
+/// A process-lifetime [`AtomicU32`] counter, seeded once (from the
+/// sub-second part of [`std::time::SystemTime::now`], so consecutive
+/// process restarts don't all start the sequence at the same value) and
+/// incremented on every call — **not** a fresh hash of the current instant.
+///
+/// RT-11 correction: the previous implementation hashed only
+/// `SystemTime::now()` (nanosecond resolution) through `DefaultHasher` and
+/// gave no uniqueness guarantee at all within a process — this function is
+/// called once per tool call in a loop over a response's `choices`
+/// (`xml_tool_calls_to_openai` in `tool_calling.rs`), so two calls in the
+/// same response can land in the same nanosecond on fast hardware, and
+/// `DefaultHasher` has no collision resistance to fall back on for
+/// near-identical inputs either. An atomic counter cannot collide within
+/// one process by construction, which a hash of *any* input can.
+///
+/// Formatted as 8 hex characters (`call_1a2b3c4d`), kept at this width —
+/// not the correction's suggested 16 — to stay compatible with
+/// `generate_tool_call_id_prefix`'s existing `id.len() == 13` assertion (an
+/// existing test this package may not weaken to land a fix); 2^32 unique
+/// ids per process is not a realistic exhaustion risk for a request-scoped
+/// identifier.
 pub fn generate_tool_call_id() -> String {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-
-    let mut hasher = DefaultHasher::new();
-    ts.hash(&mut hasher);
-    let hash = hasher.finish();
-    format!("call_{:08x}", hash & 0xFFFF_FFFF)
+    static COUNTER: OnceLock<AtomicU32> = OnceLock::new();
+    let counter = COUNTER.get_or_init(|| {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        AtomicU32::new(seed)
+    });
+    let value = counter.fetch_add(1, Ordering::Relaxed);
+    format!("call_{value:08x}")
 }
 
 /// Compute a stable hex fingerprint from a model configuration value.
@@ -663,6 +733,18 @@ mod tests {
         assert_eq!(id.len(), 13, "expected 13 chars, got: {id}");
     }
 
+    // RT-11 correction: the old hash-of-a-timestamp implementation gave no
+    // uniqueness guarantee across calls in the same process. A tight loop
+    // (many calls landing in the same or adjacent nanoseconds) is exactly
+    // the failure mode `xml_tool_calls_to_openai` hits when a response
+    // carries several tool calls; the atomic counter must never repeat.
+    #[test]
+    fn generate_tool_call_id_never_collides_in_a_tight_loop() {
+        let ids: std::collections::HashSet<String> =
+            (0..10_000).map(|_| generate_tool_call_id()).collect();
+        assert_eq!(ids.len(), 10_000, "every id in the loop must be unique");
+    }
+
     #[test]
     fn fingerprint_from_config_stable() {
         let fp1 = fingerprint_from_config("bonsai-8b");
@@ -683,6 +765,85 @@ mod tests {
         assert_eq!(lp.top_logprobs.len(), 3);
         // The highest logit (index 1) should be the first top logprob
         assert_eq!(lp.top_logprobs[0].token, "tok1");
+    }
+
+    // ── TOK-M1: id round-trips and fix_logprob_bytes ──────────────────────
+
+    #[test]
+    fn compute_logprobs_carries_the_chosen_and_alternative_ids() {
+        let logits = vec![1.0f32, 3.0, 2.0, 0.5, 1.5];
+        let lp = compute_logprobs(&logits, 1, 3, &|id| format!("tok{id}"));
+        assert_eq!(lp.id, 1, "chosen entry must carry the chosen token's id");
+        assert_eq!(
+            lp.top_logprobs[0].id, 1,
+            "the highest-logit alternative (index 1) must carry id 1"
+        );
+        // Every alternative's id must be a valid index into `logits` and
+        // must be distinct from every other alternative's id.
+        let ids: std::collections::HashSet<u32> = lp.top_logprobs.iter().map(|t| t.id).collect();
+        assert_eq!(ids.len(), lp.top_logprobs.len(), "ids must not repeat");
+        for id in ids {
+            assert!((id as usize) < logits.len());
+        }
+    }
+
+    #[test]
+    fn fix_logprob_bytes_recovers_the_real_byte_fragment_for_chosen_and_alternatives() {
+        // Simulates the TOK-M1 corruption: `compute_logprobs`'s lossy
+        // `token_bytes(display_string)` derivation produced `U+FFFD`'s own
+        // 3-byte UTF-8 encoding for every entry, chosen AND alternative
+        // alike, because a byte-fragment token's `Display` string is
+        // already the replacement character by the time `token_bytes` sees
+        // it. `fix_logprob_bytes` must replace ALL of them (not just the
+        // chosen entry, which an earlier, narrower fix already handled via
+        // a hand-rolled zip against a separate id list) using a raw
+        // per-id vocabulary lookup instead.
+        let mut content = vec![LogprobsContent {
+            id: 10,
+            token: "\u{FFFD}".to_string(),
+            logprob: -0.1,
+            bytes: Some("\u{FFFD}".as_bytes().to_vec()),
+            top_logprobs: vec![
+                TopLogprob {
+                    id: 10,
+                    token: "\u{FFFD}".to_string(),
+                    logprob: -0.1,
+                    bytes: Some("\u{FFFD}".as_bytes().to_vec()),
+                },
+                TopLogprob {
+                    id: 20,
+                    token: "\u{FFFD}".to_string(),
+                    logprob: -2.0,
+                    bytes: Some("\u{FFFD}".as_bytes().to_vec()),
+                },
+            ],
+        }];
+
+        let piece_of = |id: u32| -> Vec<u8> {
+            match id {
+                10 => vec![0xE6], // real single raw byte of a CJK fragment
+                20 => vec![0x97],
+                _ => vec![],
+            }
+        };
+        fix_logprob_bytes(&mut content, &piece_of);
+
+        assert_eq!(content[0].bytes, Some(vec![0xE6]));
+        assert_eq!(content[0].top_logprobs[0].bytes, Some(vec![0xE6]));
+        assert_eq!(content[0].top_logprobs[1].bytes, Some(vec![0x97]));
+    }
+
+    #[test]
+    fn fix_logprob_bytes_sets_none_for_an_empty_piece() {
+        let mut content = vec![LogprobsContent {
+            id: 99,
+            token: "x".to_string(),
+            logprob: 0.0,
+            bytes: Some(vec![1, 2, 3]),
+            top_logprobs: vec![],
+        }];
+        fix_logprob_bytes(&mut content, &|_| Vec::new());
+        assert_eq!(content[0].bytes, None);
     }
 
     // ── MessageContent / ContentPart (SV-11 prepare-only) ────────────────────

@@ -20,23 +20,29 @@
 //! stack here, so existing models stay byte-identical; nothing in this
 //! module is reachable from [`crate::model::BonsaiModel`].
 //!
-//! # What this package (B2-10) lands
+//! # What is here
 //!
-//! The *skeleton*: every weight bound and validated, every cache allocated,
-//! the v-head index map, the Hadamard hook and its scratch. The per-layer
-//! `forward` bodies are B2-11 and are deliberately **absent** rather than
-//! present-and-`todo!()` — a method that exists must work.
+//! B2-10 landed the skeleton (every weight bound and validated, every cache
+//! allocated, the v-head index map, the Hadamard hook and its scratch);
+//! B2-11 landed the two per-layer forward bodies, the driver that runs them
+//! and the model seam the runtime dispatches through.
 //!
 //! | file | role |
 //! |---|---|
 //! | [`block`] | [`HybridBlock`] enum + the two layer kinds + their scratch |
+//! | [`block_full`] | the full-attention layer's forward body (M-16, §3.2) |
+//! | [`block_linear`] | the Gated-DeltaNet layer's forward body (M-04, §2.3) |
+//! | [`forward`] | the driver, [`RopeTables`], [`HybridScratch`], [`LayerDump`], [`LoadedModel`] |
 //! | [`hadamard`] | [`HadamardHook`] / [`HadamardScratch`] (design §3.4/§3.5) |
-//! | [`model`] | [`HybridModel`]: construction, layer split, reset |
+//! | [`model`] | [`HybridModel`]: construction, layer split, forward, reset |
 //! | [`recurrent_cache`] | [`RecurrentCache`]: GDN state + conv window (§3.6) |
 //! | [`vhead_map`] | [`VHeadMap`]: tiled ↔ grouped v-head indices (§3.3) |
 //! | [`weights`] | GGUF name → field binding, with hard shape errors (§3.8) |
 
 pub mod block;
+pub mod block_full;
+pub mod block_linear;
+pub mod forward;
 pub mod hadamard;
 pub mod model;
 pub mod recurrent_cache;
@@ -44,6 +50,9 @@ pub mod vhead_map;
 pub mod weights;
 
 pub use block::{FullAttnBlock, FullScratch, HybridBlock, LinearAttnBlock, LinearScratch};
+pub use forward::{
+    ForwardCtx, HybridScratch, LayerDump, LoadedModel, RopeTables, DEFAULT_PREFILL_CHUNK,
+};
 pub use hadamard::{rotated_widths, HadamardHook, HadamardScratch};
 pub use model::{HybridModel, LayerSplit, DEFAULT_MAX_SEQ_LEN};
 pub use recurrent_cache::{RecurrentCache, RecurrentSnapshot, RECURRENT_NAME};

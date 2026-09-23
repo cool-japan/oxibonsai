@@ -4,29 +4,29 @@
 //! All data is deterministic — no rand crate is used.
 
 use oxibonsai_model::multi_gpu::{
-    merge_column_shards, partition_weights_column, partition_weights_row, DeviceMesh,
-    NcclCollectives,
+    merge_column_shards, partition_weights_column, partition_weights_row, SimulatedCollectives,
+    SimulatedDeviceMesh,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DeviceMesh
+// SimulatedDeviceMesh
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn device_mesh_tp_only() {
-    let mesh = DeviceMesh::tensor_parallel(4);
+    let mesh = SimulatedDeviceMesh::tensor_parallel(4);
     assert_eq!(mesh.size(), 4, "tensor_parallel(4) should have 4 devices");
 }
 
 #[test]
 fn device_mesh_2d() {
-    let mesh = DeviceMesh::new(2, 2);
+    let mesh = SimulatedDeviceMesh::new(2, 2);
     assert_eq!(mesh.size(), 4, "new(2,2) should have 4 devices");
 }
 
 #[test]
 fn device_mesh_get_valid() {
-    let mesh = DeviceMesh::new(2, 3);
+    let mesh = SimulatedDeviceMesh::new(2, 3);
     assert!(mesh.get(0, 0).is_some(), "get(0,0) should return Some");
     assert!(
         mesh.get(1, 2).is_some(),
@@ -36,7 +36,7 @@ fn device_mesh_get_valid() {
 
 #[test]
 fn device_mesh_get_oob() {
-    let mesh = DeviceMesh::new(2, 2);
+    let mesh = SimulatedDeviceMesh::new(2, 2);
     assert!(
         mesh.get(99, 0).is_none(),
         "out-of-bounds tp_rank should return None"
@@ -53,21 +53,21 @@ fn device_mesh_get_oob() {
 
 #[test]
 fn device_mesh_tp_group_size() {
-    let mesh = DeviceMesh::new(4, 2);
+    let mesh = SimulatedDeviceMesh::new(4, 2);
     let grp = mesh.tp_group(0);
     assert_eq!(grp.len(), 4, "tp_group should contain tp_size devices");
 }
 
 #[test]
 fn device_mesh_pp_group_size() {
-    let mesh = DeviceMesh::new(4, 3);
+    let mesh = SimulatedDeviceMesh::new(4, 3);
     let grp = mesh.pp_group(0);
     assert_eq!(grp.len(), 3, "pp_group should contain pp_size devices");
 }
 
 #[test]
 fn device_mesh_tp_group_oob() {
-    let mesh = DeviceMesh::new(2, 2);
+    let mesh = SimulatedDeviceMesh::new(2, 2);
     let grp = mesh.tp_group(99);
     assert!(
         grp.is_empty(),
@@ -77,7 +77,7 @@ fn device_mesh_tp_group_oob() {
 
 #[test]
 fn device_mesh_pp_group_oob() {
-    let mesh = DeviceMesh::new(2, 2);
+    let mesh = SimulatedDeviceMesh::new(2, 2);
     let grp = mesh.pp_group(99);
     assert!(
         grp.is_empty(),
@@ -91,7 +91,7 @@ fn device_mesh_pp_group_oob() {
 
 #[test]
 fn device_info_has_name() {
-    let mesh = DeviceMesh::tensor_parallel(1);
+    let mesh = SimulatedDeviceMesh::tensor_parallel(1);
     let dev = mesh.get(0, 0).expect("device 0 should exist");
     assert!(!dev.name.is_empty(), "device name should not be empty");
 }
@@ -101,7 +101,7 @@ fn device_info_memory_is_honestly_unknown() {
     // `memory_bytes` used to be a fabricated 24 GiB constant. This
     // simulation has no real hardware to probe, so it must honestly
     // report `None` rather than hand out a made-up number.
-    let mesh = DeviceMesh::tensor_parallel(2);
+    let mesh = SimulatedDeviceMesh::tensor_parallel(2);
     for tp in 0..2 {
         let dev = mesh.get(tp, 0).expect("device should exist");
         assert!(
@@ -116,13 +116,13 @@ fn device_info_memory_is_honestly_unknown() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// NcclCollectives — all_reduce_sum
+// SimulatedCollectives — all_reduce_sum
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn nccl_all_reduce_sum_single() {
     let shard = vec![1.0f32, 2.0, 3.0];
-    let result = NcclCollectives::all_reduce_sum(std::slice::from_ref(&shard));
+    let result = SimulatedCollectives::all_reduce_sum(std::slice::from_ref(&shard));
     assert_eq!(
         result.data, shard,
         "single-shard all-reduce should be identity"
@@ -134,7 +134,7 @@ fn nccl_all_reduce_sum_single() {
 fn nccl_all_reduce_sum_two() {
     let a = vec![1.0f32, 2.0, 3.0];
     let b = vec![4.0f32, 5.0, 6.0];
-    let result = NcclCollectives::all_reduce_sum(&[a, b]);
+    let result = SimulatedCollectives::all_reduce_sum(&[a, b]);
     assert_eq!(
         result.data,
         vec![5.0f32, 7.0, 9.0],
@@ -146,19 +146,19 @@ fn nccl_all_reduce_sum_two() {
 #[test]
 fn nccl_all_reduce_sum_three() {
     let shards = vec![vec![1.0f32, 0.0], vec![2.0f32, 0.0], vec![3.0f32, 0.0]];
-    let result = NcclCollectives::all_reduce_sum(&shards);
+    let result = SimulatedCollectives::all_reduce_sum(&shards);
     assert!((result.data[0] - 6.0).abs() < 1e-6, "sum of 1+2+3=6");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// NcclCollectives — all_reduce_max
+// SimulatedCollectives — all_reduce_max
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn nccl_all_reduce_max() {
     let a = vec![1.0f32, 5.0, 3.0];
     let b = vec![4.0f32, 2.0, 6.0];
-    let result = NcclCollectives::all_reduce_max(&[a, b]);
+    let result = SimulatedCollectives::all_reduce_max(&[a, b]);
     assert_eq!(
         result.data,
         vec![4.0f32, 5.0, 6.0],
@@ -168,13 +168,13 @@ fn nccl_all_reduce_max() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// NcclCollectives — all_gather
+// SimulatedCollectives — all_gather
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn nccl_all_gather_concatenates() {
     let shards = vec![vec![1.0f32, 2.0], vec![3.0f32, 4.0], vec![5.0f32, 6.0]];
-    let result = NcclCollectives::all_gather(&shards);
+    let result = SimulatedCollectives::all_gather(&shards);
     assert_eq!(
         result.data,
         vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0],
@@ -185,13 +185,13 @@ fn nccl_all_gather_concatenates() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// NcclCollectives — scatter_equal_shards
+// SimulatedCollectives — scatter_equal_shards
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn nccl_scatter_equal_shards_correct_shard_count() {
     let data: Vec<f32> = (0..12).map(|i| i as f32).collect();
-    let shards = NcclCollectives::scatter_equal_shards(&data, 4);
+    let shards = SimulatedCollectives::scatter_equal_shards(&data, 4);
     assert_eq!(
         shards.len(),
         4,
@@ -202,19 +202,19 @@ fn nccl_scatter_equal_shards_correct_shard_count() {
 #[test]
 fn nccl_scatter_equal_shards_covers_all_data() {
     let data: Vec<f32> = (0..12).map(|i| i as f32).collect();
-    let shards = NcclCollectives::scatter_equal_shards(&data, 3);
+    let shards = SimulatedCollectives::scatter_equal_shards(&data, 3);
     let total_elements: usize = shards.iter().map(|s| s.len()).sum();
     assert_eq!(total_elements, data.len(), "all elements should be covered");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// NcclCollectives — broadcast
+// SimulatedCollectives — broadcast
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn nccl_broadcast_replicates() {
     let data = vec![1.0f32, 2.0, 3.0];
-    let replicas = NcclCollectives::broadcast(&data, 4);
+    let replicas = SimulatedCollectives::broadcast(&data, 4);
     assert_eq!(
         replicas.len(),
         4,
@@ -231,7 +231,7 @@ fn nccl_broadcast_replicates() {
 #[test]
 fn nccl_broadcast_single() {
     let data = vec![42.0f32];
-    let replicas = NcclCollectives::broadcast(&data, 1);
+    let replicas = SimulatedCollectives::broadcast(&data, 1);
     assert_eq!(replicas.len(), 1);
     assert_eq!(replicas[0], data);
 }
@@ -243,14 +243,14 @@ fn nccl_broadcast_single() {
 #[test]
 fn collective_result_op_name_all_reduce_sum() {
     let shards = vec![vec![1.0f32]];
-    let result = NcclCollectives::all_reduce_sum(&shards);
+    let result = SimulatedCollectives::all_reduce_sum(&shards);
     assert_eq!(result.op_name, "all_reduce_sum");
 }
 
 #[test]
 fn collective_result_op_name_all_gather() {
     let shards = vec![vec![1.0f32]];
-    let result = NcclCollectives::all_gather(&shards);
+    let result = SimulatedCollectives::all_gather(&shards);
     assert_eq!(result.op_name, "all_gather");
 }
 

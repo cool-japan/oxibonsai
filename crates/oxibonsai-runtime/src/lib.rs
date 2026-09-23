@@ -55,6 +55,7 @@ pub mod convenience;
 pub mod dedup;
 #[cfg(feature = "server")]
 pub mod distributed;
+pub mod embed_engine;
 pub mod embedding_index;
 #[cfg(feature = "server")]
 pub mod embeddings;
@@ -88,6 +89,7 @@ pub mod quality_metrics;
 #[cfg(feature = "rag")]
 pub mod rag_server;
 pub mod rate_limiter;
+pub mod reasoning;
 pub mod recovery;
 pub mod request_id;
 pub mod request_metrics;

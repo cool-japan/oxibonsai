@@ -401,6 +401,20 @@ impl<'a> InferenceEngine<'a> {
     ) -> RuntimeResult<Self> {
         let eos = resolve_eos_token_set(gguf, EOS_TOKEN_ID);
         let route = gguf_fused_metal_route(gguf);
+        // A `qwen35` (PrismML Bonsai 2) file is structurally a different
+        // stack -- 48 of its 64 layers have no `attn_q.weight` at all -- so
+        // `BonsaiModel::from_gguf` would fail on a missing tensor and say
+        // nothing about why. Name the seam instead (gatekeeper REQUIRED
+        // #1(b)); `LoadedModel` is what routes the two kinds.
+        if oxibonsai_model::hybrid::LoadedModel::is_hybrid_gguf(gguf) {
+            return Err(RuntimeError::Config(format!(
+                "this GGUF declares general.architecture = \"{}\", a hybrid stack the dense \
+                 InferenceEngine cannot execute; load it through \
+                 oxibonsai_model::hybrid::LoadedModel::from_gguf (or HybridModel::from_gguf), \
+                 which selects the hybrid forward driver",
+                oxibonsai_model::hybrid::LoadedModel::architecture_of(gguf)
+            )));
+        }
         let model = BonsaiModel::from_gguf(gguf, max_seq_len)?;
         Self::from_model_with_gpu_warmup(model, sampling_params, seed, eos, route)
     }
@@ -643,7 +657,59 @@ impl<'a> InferenceEngine<'a> {
     /// drafts past it, then calls this to drop the rejected suffix so the
     /// next committed write targets `committed_len`.
     pub fn rewind_cache(&mut self, committed_len: usize) {
+        if let Err(e) = self.try_rewind_cache(committed_len) {
+            // Not a silent half-rollback: a caller using the infallible
+            // spelling still gets a loud, coded record of the refusal.
+            tracing::error!(
+                error = %e,
+                committed_len,
+                "rewind_cache refused: this engine holds recurrent state that cannot be \
+                 rolled back by moving a cursor -- use try_rewind_cache and handle the error, \
+                 or snapshot/restore around the rollback window"
+            );
+        }
+    }
+
+    /// Fallible [`rewind_cache`](Self::rewind_cache) (RT-28, design SS3.6).
+    ///
+    /// A KV cache rolls back by moving a cursor: every stored key/value is
+    /// still the same function of the same token, so truncating to
+    /// `committed_len` is exact. A **recurrent** state has no such
+    /// property -- `S` after `n + k` tokens does not determine `S` after
+    /// `n` -- so on a hybrid (`qwen35`) engine, truncating only the KV
+    /// cache leaves the Gated-DeltaNet state contaminated with tokens the
+    /// caller believes it discarded, and every subsequent token is wrong
+    /// with no signal. Speculative decoding and the pipeline are the two
+    /// callers; both must either take a
+    /// [`RecurrentCache::snapshot`](oxibonsai_model::hybrid::RecurrentCache::snapshot)
+    /// at the draft start and restore it, or refuse hybrid models.
+    ///
+    /// # Errors
+    ///
+    /// [`ModelError::RecurrentRollbackUnsupported`] when recurrent state is
+    /// attached to this engine.
+    pub fn try_rewind_cache(&mut self, committed_len: usize) -> RuntimeResult<()> {
+        if let Some(state) = self.recurrent.as_ref() {
+            let bytes = state.recurrent_memory_bytes();
+            return Err(RuntimeError::Model(
+                oxibonsai_model::error::ModelError::RecurrentRollbackUnsupported {
+                    pos: committed_len,
+                    tokens: bytes,
+                },
+            ));
+        }
         self.model.kv_cache_mut().truncate(committed_len);
+        Ok(())
+    }
+
+    /// `true` when this engine holds recurrent state, i.e. when
+    /// [`try_rewind_cache`](Self::try_rewind_cache) will refuse.
+    ///
+    /// Speculative decoding and the pipeline check this before starting a
+    /// draft window rather than discovering it at rollback time.
+    #[must_use]
+    pub fn recurrent_rollback_supported(&self) -> bool {
+        self.recurrent.is_none()
     }
 
     /// Sample one token from `logits` using the engine's current sampler.

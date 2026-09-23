@@ -390,9 +390,10 @@ impl<'a> BonsaiModel<'a> {
                     let v_s = base + q_rows + kv_rows + head * hd;
                     lb.k_norm.forward(&qkv[k_s..k_s + hd], &mut head_norm)?;
                     self.rope.apply(&head_norm, &mut head_rope, pos)?;
-                    self.kv_cache.store_key(layer_idx, head, pos, &head_rope);
                     self.kv_cache
-                        .store_value(layer_idx, head, pos, &qkv[v_s..v_s + hd]);
+                        .try_store_key(layer_idx, head, pos, &head_rope)?;
+                    self.kv_cache
+                        .try_store_value(layer_idx, head, pos, &qkv[v_s..v_s + hd])?;
                 }
             }
 

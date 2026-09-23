@@ -174,6 +174,27 @@ pub enum ModelError {
         embedding: String,
     },
 
+    /// A KV-cache buffer could not be allocated (B2-12 item (5)).
+    ///
+    /// Distinct from [`ModelError::Internal`], which is the crate's
+    /// catch-all for "an invariant this code owns was broken": running out
+    /// of memory for a 16 GiB KV window is a *capacity* answer a caller can
+    /// act on -- shorten the context, lower `max_seq_len`, switch to the
+    /// `f16` sparse cache -- and the context guard needs to tell it apart
+    /// from a bug in order to report the RAM-derived ceiling instead of a
+    /// stack trace. `requested_bytes` is `None` when the geometry overflows
+    /// a `usize` before any allocation is attempted.
+    #[error(
+        "KV cache allocation failed ({detail}); requested_bytes={}",
+        match requested_bytes { Some(n) => n.to_string(), None => "overflow".to_string() }
+    )]
+    KvAllocation {
+        /// Bytes the failing request asked for, or `None` on overflow.
+        requested_bytes: Option<usize>,
+        /// The geometry or allocator message behind the failure.
+        detail: String,
+    },
+
     /// Underlying core error.
     #[error("core: {0}")]
     Core(#[from] oxibonsai_core::error::BonsaiError),
@@ -202,6 +223,7 @@ impl ModelError {
             Self::UngroupedFoldedGdnOutput { .. } => "UNGROUPED_FOLDED_GDN_OUTPUT",
             Self::RecurrentRollbackUnsupported { .. } => "RECURRENT_ROLLBACK_UNSUPPORTED",
             Self::TiedLmHeadUnsupported { .. } => "TIED_LM_HEAD_UNSUPPORTED",
+            Self::KvAllocation { .. } => "KV_ALLOCATION",
             Self::Core(_) => "CORE_ERROR",
             Self::Kernel(_) => "KERNEL_ERROR",
             Self::Internal(_) => "INTERNAL_ERROR",

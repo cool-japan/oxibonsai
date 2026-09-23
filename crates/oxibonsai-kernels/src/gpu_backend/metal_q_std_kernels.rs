@@ -21,10 +21,10 @@
 
 use std::sync::OnceLock;
 
-use metal::{CommandQueue, CompileOptions, ComputePipelineState, Device, MTLResourceOptions};
+use metal::{CompileOptions, ComputePipelineState, Device, MTLResourceOptions};
 
 use super::kernel_sources::{MSL_GEMV_Q4_0_V1, MSL_GEMV_Q8_0_V1};
-use super::metal_graph::{commit_and_wait, MetalGraphError};
+use super::metal_graph::{commit_and_wait, MetalGraph, MetalGraphError};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Constants
@@ -47,8 +47,6 @@ const THREADS_PER_TG: u64 = 256;
 
 /// Process-wide Metal standard-quant dispatch state.
 struct MetalQStdState {
-    device: Device,
-    queue: CommandQueue,
     pipeline_q4_0: ComputePipelineState,
     pipeline_q8_0: ComputePipelineState,
 }
@@ -61,16 +59,15 @@ unsafe impl Sync for MetalQStdState {}
 
 impl MetalQStdState {
     fn new() -> Result<Self, MetalGraphError> {
-        let device = Device::system_default().ok_or(MetalGraphError::DeviceNotFound)?;
-        let queue = device.new_command_queue();
+        // `MET-10`: compile against the **shared** device rather than opening
+        // a second `Device::system_default()` handle with its own queue.
+        let device = MetalGraph::global()?.device().to_owned();
         let options = CompileOptions::new();
 
         let pipeline_q4_0 = compile_pipeline(&device, &options, MSL_GEMV_Q4_0_V1, "gemv_q4_0")?;
         let pipeline_q8_0 = compile_pipeline(&device, &options, MSL_GEMV_Q8_0_V1, "gemv_q8_0")?;
 
         Ok(Self {
-            device,
-            queue,
             pipeline_q4_0,
             pipeline_q8_0,
         })
@@ -100,47 +97,9 @@ fn state() -> Result<&'static MetalQStdState, MetalGraphError> {
     static STATE: OnceLock<Result<MetalQStdState, MetalGraphError>> = OnceLock::new();
     match STATE.get_or_init(MetalQStdState::new) {
         Ok(s) => Ok(s),
-        Err(e) => Err(clone_err(e)),
-    }
-}
-
-fn clone_err(e: &MetalGraphError) -> MetalGraphError {
-    match e {
-        MetalGraphError::DeviceNotFound => MetalGraphError::DeviceNotFound,
-        MetalGraphError::CompilationFailed(s) => MetalGraphError::CompilationFailed(s.clone()),
-        MetalGraphError::BufferCreationFailed => MetalGraphError::BufferCreationFailed,
-        MetalGraphError::EncodingFailed(s) => MetalGraphError::EncodingFailed(s.clone()),
-        MetalGraphError::ExecutionFailed(s) => MetalGraphError::ExecutionFailed(s.clone()),
-        MetalGraphError::InvalidDimensions(s) => MetalGraphError::InvalidDimensions(s.clone()),
-        MetalGraphError::CommandBufferFailed {
-            what,
-            status,
-            error,
-        } => MetalGraphError::CommandBufferFailed {
-            what,
-            status: *status,
-            error: error.clone(),
-        },
-        MetalGraphError::BufferTooLarge {
-            what,
-            requested,
-            max,
-        } => MetalGraphError::BufferTooLarge {
-            what,
-            requested: *requested,
-            max: *max,
-        },
-        // FIX-06 / MET-02: `MetalGraphError` gained a typed
-        // `WeightKindMismatch` variant, and this hand-written clone is an
-        // exhaustive match, so it must name it. See the package deviations:
-        // all four copies of `clone_err` should be replaced by a `Clone`
-        // derive on `MetalGraphError` itself.
-        MetalGraphError::WeightKindMismatch { expected, found } => {
-            MetalGraphError::WeightKindMismatch {
-                expected: *expected,
-                found: *found,
-            }
-        }
+        // `MetalGraphError` derives `Clone` (`O3`), so the four hand-written
+        // exhaustive `clone_err` matches this file used to carry are gone.
+        Err(e) => Err(e.clone()),
     }
 }
 
@@ -170,7 +129,6 @@ pub fn metal_gemv_q4_0(
 ) -> Result<(), MetalGraphError> {
     let s = state()?;
     dispatch_q_std_gemv(
-        s,
         &s.pipeline_q4_0,
         blocks,
         input,
@@ -192,7 +150,6 @@ pub fn metal_gemv_q8_0(
 ) -> Result<(), MetalGraphError> {
     let s = state()?;
     dispatch_q_std_gemv(
-        s,
         &s.pipeline_q8_0,
         blocks,
         input,
@@ -206,7 +163,6 @@ pub fn metal_gemv_q8_0(
 
 #[allow(clippy::too_many_arguments)]
 fn dispatch_q_std_gemv(
-    s: &MetalQStdState,
     pipeline: &ComputePipelineState,
     blocks: &[u8],
     input: &[f32],
@@ -216,6 +172,17 @@ fn dispatch_q_std_gemv(
     block_bytes: usize,
     format: &str,
 ) -> Result<(), MetalGraphError> {
+    // `MET-10`: dispatch on the **shared** device and on the *current
+    // session's* command queue, instead of the private
+    // `Device::system_default()` + `new_command_queue()` this family used to
+    // own. Five independent `MTLCommandQueue`s on one device is what made
+    // these kernel families invisible to the `MET-08` session split; routed
+    // through `MetalGraph::global()` they inherit the caller's session, so a
+    // replica's submissions stay on that replica's queue. (The pipelines
+    // themselves still live in this family's own Metal library — folding them
+    // into the combined metallib is the other, separately-owned half of
+    // `MET-10`.)
+    let graph = MetalGraph::global()?;
     // ── Validate dimensions ─────────────────────────────────────────────────
     if k == 0 || !k.is_multiple_of(Q_STD_BLOCK_K) {
         return Err(MetalGraphError::EncodingFailed(format!(
@@ -247,17 +214,17 @@ fn dispatch_q_std_gemv(
     }
 
     // ── Allocate buffers (shared storage) ───────────────────────────────────
-    let block_buf = s.device.new_buffer_with_data(
+    let block_buf = graph.device().new_buffer_with_data(
         blocks.as_ptr() as *const std::ffi::c_void,
         blocks.len() as u64,
         MTLResourceOptions::StorageModeShared,
     );
-    let input_buf = s.device.new_buffer_with_data(
+    let input_buf = graph.device().new_buffer_with_data(
         input.as_ptr() as *const std::ffi::c_void,
         std::mem::size_of_val(input) as u64,
         MTLResourceOptions::StorageModeShared,
     );
-    let output_buf = s.device.new_buffer(
+    let output_buf = graph.device().new_buffer(
         (n_rows * std::mem::size_of::<f32>()) as u64,
         MTLResourceOptions::StorageModeShared,
     );
@@ -273,7 +240,7 @@ fn dispatch_q_std_gemv(
         .map_err(|_| MetalGraphError::EncodingFailed(format!("k = {k} exceeds u32::MAX")))?;
 
     // ── Encode + commit ─────────────────────────────────────────────────────
-    let cmd = s.queue.new_command_buffer();
+    let cmd = graph.command_queue.new_command_buffer();
     let encoder = cmd.new_compute_command_encoder();
 
     encoder.set_compute_pipeline_state(pipeline);

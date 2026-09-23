@@ -74,8 +74,10 @@
 //! - `SV-11` (prepare only) — see [`crate::api_types::MessageContent`] /
 //!   [`crate::api_types::ContentPart`].
 //! - gatekeeper `REQUIRED #1` — `SamplingParams` is now seeded from the
-//!   engine's own ambient/startup parameters (never a hardcoded
-//!   `repetition_penalty: 1.1`, never `SamplingParams::default()`), with a
+//!   engine's own ambient/startup parameters, never `SamplingParams::default()`
+//!   (see `resolve_sampling_params`'s doc, `REQUIRED #18`, for why this
+//!   still matters now that `SamplingParams::default`'s `repetition_penalty`
+//!   is `1.0`, not the `1.1` an earlier revision of this doc named), with a
 //!   client-supplied `repetition_penalty` honored as an override.
 //!
 //! ## Post-wave-3-verifier-review fixes
@@ -122,11 +124,16 @@ use crate::api_types::{
     ChoiceLogprobs, ExtendedChatRequest, ExtendedChatResponse, ExtendedChoice, UsageInfo,
 };
 use crate::engine_pool::EngineLease;
+// Only consumed by `api_extensions_tests.rs`'s `use super::*;` (that file is
+// declared `#[cfg(test)]` below and is not in this package's `owned_files`,
+// so it cannot be edited to import this itself); gating the import the same
+// way keeps a non-test build warning-free instead of flagging it unused.
+#[cfg(test)]
 use crate::metrics::InferenceMetrics;
 use crate::middleware::IdempotencyCache;
 use crate::pipeline::{StopMatch, StopSequenceMatcher};
 use crate::sampling::{PenaltyParams, Sampler, SamplingParams};
-use crate::server::{AppState, ChatMessage, MAX_OUTPUT_TOKENS};
+use crate::server::{ActiveRequestGuard, AppState, ChatMessage, MAX_OUTPUT_TOKENS};
 
 // ── Extended handler ──────────────────────────────────────────────────────────
 
@@ -149,11 +156,21 @@ fn bad_request(message: String, param: &str) -> axum::response::Response {
 ///
 /// Gatekeeper `REQUIRED #1`: every field this function does not receive an
 /// explicit `Some` override for comes from `engine_defaults` — never from
-/// [`SamplingParams::default`], whose `repetition_penalty` is `1.1` and
-/// would otherwise silently disqualify a `temperature: 0` request from
-/// `InferenceEngine::greedy_gpu_eligible`'s GPU-argmax path even on a server
-/// started with no repetition penalty configured at all.
-fn resolve_sampling_params(
+/// [`SamplingParams::default`]. `SamplingParams::default`'s
+/// `repetition_penalty` is `1.0` today (the RT-24/`REQUIRED #1(a)` fix
+/// landed in `sampling.rs`, not `1.1` as an earlier revision of this
+/// comment said — corrected here, `REQUIRED #18`), so the eligibility
+/// break that number used to cause is gone; seeding from `engine_defaults`
+/// remains necessary for a *different* reason that number's fix didn't
+/// touch: a server started with non-default ambient `top_k`/`top_p`/
+/// `repetition_penalty` must not have those silently reset to
+/// `SamplingParams::default`'s library values just because a request
+/// customized only `temperature`.
+///
+/// Shared with `completions.rs` (`pub(crate)`, gatekeeper `REQUIRED #3`) —
+/// `/v1/completions` had the identical gap and needs the identical fix; one
+/// implementation, not two independently-maintained copies.
+pub(crate) fn resolve_sampling_params(
     engine_defaults: &SamplingParams,
     req_temperature: Option<f32>,
     req_top_p: Option<f32>,
@@ -167,21 +184,11 @@ fn resolve_sampling_params(
     }
 }
 
-/// Decrements `active_requests` however the handler leaves (`SV-25`).
-///
-/// Mirrors `server.rs`'s private `ActiveRequestGuard` shape exactly (this
-/// file cannot import that one — it is private to its module — so it gets
-/// its own copy rather than a broken cross-module reference), so both of
-/// this file's mounted routes get the same "always decrements, even on an
-/// early return or a panicking join" guarantee the base endpoint already
-/// has instead of the two routes recording no metrics at all.
-struct ActiveRequestGuard(Arc<InferenceMetrics>);
-
-impl Drop for ActiveRequestGuard {
-    fn drop(&mut self) {
-        self.0.active_requests.dec();
-    }
-}
+// `ActiveRequestGuard` (`SV-25`: "always decrements, even on an early
+// return or a panicking join") now lives once, `pub(crate)`, in
+// `server.rs` — wave-3.5 gatekeeper triage item (5). Imported above via
+// `crate::server::{ActiveRequestGuard, ...}` rather than carried here as a
+// second, independently-maintained copy.
 
 /// Module-local idempotency cache for the extended **non-streaming**
 /// endpoint (`SV-32`).
@@ -543,12 +550,12 @@ pub async fn extended_chat_completions(
     // Acquire the engine once, both to serve the request and — gatekeeper
     // `REQUIRED #1` — to seed the per-request `SamplingParams` from the
     // engine's own *ambient/startup* configuration rather than a hardcoded
-    // literal or `SamplingParams::default()` (whose `repetition_penalty` is
-    // `1.1`, which alone makes `InferenceEngine::greedy_gpu_eligible`
-    // permanently false for every request through this endpoint, even a
-    // `temperature: 0` one against a server started with no repetition
-    // penalty configured at all). A client-supplied `repetition_penalty` /
-    // `temperature` / `top_p` still overrides the engine default.
+    // literal or `SamplingParams::default()` (see `resolve_sampling_params`'s
+    // doc, `REQUIRED #18`, for why this still matters now that
+    // `SamplingParams::default`'s `repetition_penalty` is `1.0`, not the
+    // `1.1` an earlier revision of this comment named). A client-supplied
+    // `repetition_penalty` / `temperature` / `top_p` still overrides the
+    // engine default.
     let lease = match state.acquire_engine().await {
         Ok(lease) => lease,
         Err(e) => {
@@ -656,6 +663,22 @@ pub async fn extended_chat_completions(
                             .unwrap_or_else(|_| format!("{output_tokens:?}")),
                         None => format!("{output_tokens:?}"),
                     };
+                    // TOK-M1: this endpoint applied no `bytes` correction at
+                    // all -- `id_to_token`'s single-id `decode` above (not
+                    // the raw-vocabulary `piece` lookup) makes a
+                    // byte-fragment token's `bytes` the display string's
+                    // (lossy, `U+FFFD`-derived) encoding, for the chosen
+                    // token AND every `top_logprobs` alternative alike.
+                    // Mirrors `server/chat.rs::correct_logprob_bytes`, now
+                    // possible here too because `id` lives on
+                    // `LogprobsContent`/`TopLogprob` directly
+                    // (`api_types.rs`, this package's file).
+                    let logprobs = logprobs.map(|mut lp| {
+                        if let Some(tok) = state_for_generation.tokenizer() {
+                            crate::api_types::fix_logprob_bytes(&mut lp, &|id| tok.piece(id));
+                        }
+                        lp
+                    });
                     results.push((text, output_len, logprobs));
                 }
                 Err(e) => {
@@ -718,12 +741,40 @@ pub async fn extended_chat_completions(
                 truncated
             };
 
-            // Check for tool call pattern in the output
-            let tool_calls = if tools.is_some() {
-                let call_id = crate::api_types::generate_tool_call_id();
-                crate::api_types::parse_tool_call(&final_text, &call_id).map(|tc| vec![tc])
+            // B2-13/RT-11: was JSON-only (`crate::api_types::parse_tool_call`),
+            // so Bonsai 2's `<tool_call><function=NAME>…</function></tool_call>`
+            // XML shape (design §5.4) came back as `None` and its raw XML
+            // rendered verbatim as `message.content` with `finish_reason:
+            // "stop"` — exactly RT-11's complaint. `parse_tool_calls` tries
+            // the XML shape first, falling back to the legacy JSON payload,
+            // and — when it finds a call — also reports the natural-language
+            // text that preceded it, which becomes this choice's `content`
+            // instead of the whole raw text (including the tool-call
+            // markup). A `Truncated` result (opened but unclosed) is treated
+            // as "no tool call" here, matching the base endpoint: the caller
+            // still gets the complete raw text as ordinary content rather
+            // than an error for a block the model never finished.
+            let (content_text, tool_calls) = if tools.is_some() {
+                match crate::tool_calling::parse_tool_calls(&final_text) {
+                    crate::tool_calling::ToolCallParseOutcome::Found {
+                        leading_text,
+                        calls,
+                    } => {
+                        let trimmed = leading_text.trim();
+                        let content = if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_string())
+                        };
+                        (content, Some(calls))
+                    }
+                    crate::tool_calling::ToolCallParseOutcome::None
+                    | crate::tool_calling::ToolCallParseOutcome::Truncated => {
+                        (Some(final_text), None)
+                    }
+                }
             } else {
-                None
+                (Some(final_text), None)
             };
 
             let finish_reason = determine_extended_finish_reason(
@@ -753,7 +804,7 @@ pub async fn extended_chat_completions(
                 index: idx,
                 message: ChatMessage {
                     role: "assistant".to_string(),
-                    content: Some(final_text),
+                    content: content_text,
                     tool_calls: None,
                     tool_call_id: None,
                 },
@@ -1390,6 +1441,18 @@ impl StopChecker {
     /// Create a new checker with the given stop sequences.
     pub fn new(sequences: Vec<String>) -> Self {
         Self { sequences }
+    }
+
+    /// The configured stop sequences (already filtered of empty strings by
+    /// every constructor's caller).
+    ///
+    /// B2-13: `completions::stream` needs these to build a
+    /// [`crate::pipeline::StopSequenceMatcher`] for its SSE hold-back
+    /// window — this checker's own `check`/`truncate_at_stop` only ever run
+    /// against a complete, already-finished string (the non-streaming
+    /// path), so they have no notion of "safe to flush so far".
+    pub(crate) fn sequences(&self) -> &[String] {
+        &self.sequences
     }
 
     /// Returns `Some(&str)` with the first matched stop sequence, or `None`.

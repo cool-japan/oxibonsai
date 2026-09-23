@@ -79,6 +79,26 @@ pub const MAX_OUTPUT_TOKENS: usize = 8192;
 /// rejected rather than silently collapsed to one choice.
 const MAX_N_CHOICES: usize = 1;
 
+/// Decrements `active_requests` however a handler leaves — success, an
+/// early-return validation error, or a mid-generation failure — by tying the
+/// decrement to this guard's `Drop` rather than one `.dec()` call per exit
+/// path (`SV-25`; a handler with several early returns reliably leaks the
+/// gauge otherwise, since it is easy to add a new `return` and forget the
+/// matching `.dec()`).
+///
+/// One implementation, `pub(crate)` here, used by `server/chat.rs`,
+/// `api_extensions.rs` and `completions.rs` — wave-3.5 gatekeeper triage
+/// item (5): each of those three previously carried a byte-identical,
+/// independently-maintained copy because this type was private to
+/// `server::chat`, the one place `use super::*;` could reach it from.
+pub(crate) struct ActiveRequestGuard(pub(crate) Arc<InferenceMetrics>);
+
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        self.0.active_requests.dec();
+    }
+}
+
 /// Header name used for end-to-end request correlation. Request handlers
 /// echo whatever the client supplied in the response, or generate a fresh
 /// UUIDv4-style id when the header is absent.
@@ -697,6 +717,28 @@ fn validate_chat_request(
             return Err((
                 "top_logprobs requires logprobs to be set to true".to_string(),
                 "top_logprobs",
+            ));
+        }
+    }
+    // RT-07 correction (B2-13): an unrecognized `role` used to fall into
+    // `sanitize::chat_prompt_segments`'s `_` arm and be silently spliced
+    // into the prompt as bare, unwrapped text — a protocol-correctness gap
+    // (an OpenAI-shaped client sending a typo'd or future role should get a
+    // clear `400`, never a request that "succeeds" against a prompt the
+    // model was never designed to see) rather than the injection risk an
+    // earlier draft of this finding named (content reaching that arm is
+    // already covered by `neutralize_special_markers` when sanitization is
+    // on). Every message's role must be one of the four this server's
+    // template vocabulary understands.
+    for (index, msg) in req.messages.iter().enumerate() {
+        if !matches!(msg.role.as_str(), "system" | "user" | "assistant" | "tool") {
+            return Err((
+                format!(
+                    "messages[{index}].role {:?} is not recognized: expected one of \
+                     \"system\", \"user\", \"assistant\", \"tool\"",
+                    msg.role
+                ),
+                "messages",
             ));
         }
     }
@@ -1431,6 +1473,48 @@ mod tests {
         req.top_k = Some(40);
         validate_chat_request(&req, 256, MAX_OUTPUT_TOKENS)
             .expect("explicit-but-benign values must not be rejected");
+    }
+
+    // ── RT-07 correction: unrecognized roles must be a 400, not a silent
+    //    splice into the prompt ────────────────────────────────────────────
+
+    #[test]
+    fn validate_chat_request_accepts_every_known_role() {
+        for role in ["system", "user", "assistant", "tool"] {
+            let mut req = minimal_request();
+            req.messages[0].role = role.to_string();
+            validate_chat_request(&req, 256, MAX_OUTPUT_TOKENS)
+                .unwrap_or_else(|_| panic!("role {role:?} must be accepted"));
+        }
+    }
+
+    #[test]
+    fn validate_chat_request_rejects_an_unrecognized_role() {
+        let mut req = minimal_request();
+        req.messages[0].role = "developer".to_string();
+        let err = validate_chat_request(&req, 256, MAX_OUTPUT_TOKENS)
+            .expect_err("an unrecognized role must be rejected");
+        assert_eq!(err.1, "messages");
+        assert!(
+            err.0.contains("developer"),
+            "the rejection must name the offending role, got: {}",
+            err.0
+        );
+    }
+
+    #[test]
+    fn validate_chat_request_rejects_an_unrecognized_role_on_a_later_message() {
+        let mut req = minimal_request();
+        req.messages.push(crate::server::ChatMessage {
+            role: "narrator".to_string(),
+            content: Some("once upon a time".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+        let err = validate_chat_request(&req, 256, MAX_OUTPUT_TOKENS)
+            .expect_err("a bad role anywhere in the list must be rejected");
+        assert_eq!(err.1, "messages");
+        assert!(err.0.contains("messages[1]"), "got: {}", err.0);
     }
 
     #[test]

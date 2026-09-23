@@ -111,7 +111,7 @@ fn checked_element_count(
 }
 
 /// Allocate a `len`-element `Vec<T>` filled with `zero`, surfacing a real
-/// allocator failure as a [`ModelError::Internal`] instead of aborting the
+/// allocator failure as a [`ModelError::KvAllocation`] instead of aborting the
 /// process (M-07 verifier correction: `try_new`/`try_new_sparse` were
 /// "fallible" only in the overflow-detecting sense — both used to finish
 /// with `Self::new(...)`/`Self::new_sparse(...)`, whose plain `vec![zero;
@@ -122,12 +122,11 @@ fn checked_element_count(
 /// introduce a second, unchecked allocation point.
 fn try_alloc_zeroed<T: Clone>(len: usize, zero: T, requested_bytes: usize) -> ModelResult<Vec<T>> {
     let mut buf: Vec<T> = Vec::new();
-    buf.try_reserve_exact(len).map_err(|e| {
-        ModelError::Internal(format!(
-            "KV cache allocation of {requested_bytes} bytes failed: {e} \
-             (requested_bytes={requested_bytes})"
-        ))
-    })?;
+    buf.try_reserve_exact(len)
+        .map_err(|e| ModelError::KvAllocation {
+            requested_bytes: Some(requested_bytes),
+            detail: format!("allocator refused {requested_bytes} bytes: {e}"),
+        })?;
     buf.resize(len, zero);
     Ok(buf)
 }
@@ -173,7 +172,7 @@ impl KvCache {
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::Internal`] naming the number of bytes that
+    /// Returns [`ModelError::KvAllocation`] naming the number of bytes that
     /// would have been requested when `num_layers * num_kv_heads *
     /// max_seq_len * head_dim` overflows `usize`, when the resulting byte
     /// count would exceed the largest representable allocation, or when the
@@ -185,31 +184,29 @@ impl KvCache {
         max_seq_len: usize,
     ) -> ModelResult<Self> {
         let total = checked_element_count(num_layers, num_kv_heads, max_seq_len, head_dim)
-            .ok_or_else(|| {
-                ModelError::Internal(format!(
-                    "KV cache allocation overflows usize: {num_layers} layers x \
-                     {num_kv_heads} kv_heads x {max_seq_len} max_seq_len x {head_dim} head_dim \
-                     (requested_bytes=overflow)"
-                ))
+            .ok_or_else(|| ModelError::KvAllocation {
+                requested_bytes: None,
+                detail: format!(
+                    "{num_layers} layers x {num_kv_heads} kv_heads x \
+                         {max_seq_len} max_seq_len x {head_dim} head_dim overflows usize"
+                ),
             })?;
         let requested_bytes = total
             .checked_mul(2) // keys + values
             .and_then(|n| n.checked_mul(std::mem::size_of::<f32>()))
-            .ok_or_else(|| {
-                ModelError::Internal(format!(
-                    "KV cache allocation of {total} elements overflows a byte count \
-                     (requested_bytes=overflow)"
-                ))
+            .ok_or_else(|| ModelError::KvAllocation {
+                requested_bytes: None,
+                detail: format!("{total} elements overflow a byte count"),
             })?;
         // A byte count past `isize::MAX` cannot be a valid `Vec` allocation
         // on any target this crate ships for; fail cleanly with the
         // computed size named instead of letting the allocator abort the
         // process with "capacity overflow".
         if requested_bytes > isize::MAX as usize {
-            return Err(ModelError::Internal(format!(
-                "KV cache allocation of {requested_bytes} bytes exceeds the largest \
-                 representable allocation"
-            )));
+            return Err(ModelError::KvAllocation {
+                requested_bytes: Some(requested_bytes),
+                detail: "exceeds the largest representable allocation".to_string(),
+            });
         }
         let keys = try_alloc_zeroed(total, 0.0f32, requested_bytes)?;
         let values = try_alloc_zeroed(total, 0.0f32, requested_bytes)?;
@@ -290,7 +287,7 @@ impl KvCache {
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::Internal`] naming the requested byte count when
+    /// Returns [`ModelError::KvAllocation`] naming the requested byte count when
     /// the element count or byte count would overflow, when it would exceed
     /// the largest representable allocation, or when the allocator reports
     /// it cannot satisfy an otherwise in-range request.
@@ -302,26 +299,26 @@ impl KvCache {
     ) -> ModelResult<Self> {
         let total =
             checked_element_count(n_slots, n_kv_heads, max_seq, head_dim).ok_or_else(|| {
-                ModelError::Internal(format!(
-                    "sparse KV cache allocation overflows usize: {n_slots} slots x \
-                     {n_kv_heads} kv_heads x {max_seq} max_seq_len x {head_dim} head_dim \
-                     (requested_bytes=overflow)"
-                ))
+                ModelError::KvAllocation {
+                    requested_bytes: None,
+                    detail: format!(
+                        "sparse: {n_slots} slots x {n_kv_heads} kv_heads x \
+                         {max_seq} max_seq_len x {head_dim} head_dim overflows usize"
+                    ),
+                }
             })?;
         let requested_bytes = total
             .checked_mul(2) // keys + values
             .and_then(|n| n.checked_mul(std::mem::size_of::<f16>()))
-            .ok_or_else(|| {
-                ModelError::Internal(format!(
-                    "sparse KV cache allocation of {total} elements overflows a byte count \
-                     (requested_bytes=overflow)"
-                ))
+            .ok_or_else(|| ModelError::KvAllocation {
+                requested_bytes: None,
+                detail: format!("sparse: {total} elements overflow a byte count"),
             })?;
         if requested_bytes > isize::MAX as usize {
-            return Err(ModelError::Internal(format!(
-                "sparse KV cache allocation of {requested_bytes} bytes exceeds the largest \
-                 representable allocation"
-            )));
+            return Err(ModelError::KvAllocation {
+                requested_bytes: Some(requested_bytes),
+                detail: "exceeds the largest representable allocation".to_string(),
+            });
         }
         let keys = try_alloc_zeroed(total, f16::ZERO, requested_bytes)?;
         let values = try_alloc_zeroed(total, f16::ZERO, requested_bytes)?;
@@ -364,7 +361,7 @@ impl KvCache {
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::Internal`] when the grown geometry's element or
+    /// Returns [`ModelError::KvAllocation`] when the grown geometry's element or
     /// byte count would overflow (see [`try_new`](Self::try_new)/
     /// [`try_new_sparse`](Self::try_new_sparse)); the cache is left
     /// completely unchanged in that case.
@@ -408,7 +405,7 @@ impl KvCache {
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::Internal`] when the new geometry's element or
+    /// Returns [`ModelError::KvAllocation`] when the new geometry's element or
     /// byte count would overflow; the cache is left completely unchanged
     /// (the old, smaller storage is never dropped until the new one is
     /// fully built and populated).
@@ -595,8 +592,17 @@ impl KvCache {
     /// particular for a sparse-backed ([`KvCache::new_sparse`]) cache, where
     /// a dropped store loses an entire full-attention layer's KV history for
     /// the position, not one stale row in a much larger dense cache.
-    pub fn store_key(&mut self, layer: usize, head: usize, pos: usize, key: &[f32]) {
+    pub fn store_key_lossy(&mut self, layer: usize, head: usize, pos: usize, key: &[f32]) {
         let _ = self.try_store_key(layer, head, pos, key);
+    }
+
+    /// Legacy spelling of [`store_key_lossy`](Self::store_key_lossy).
+    ///
+    /// Kept only so call sites that pre-date the rename keep compiling; it
+    /// has the same error-swallowing behaviour and the same warning. New
+    /// code uses [`try_store_key`](Self::try_store_key).
+    pub fn store_key(&mut self, layer: usize, head: usize, pos: usize, key: &[f32]) {
+        self.store_key_lossy(layer, head, pos, key);
     }
 
     /// Fallible counterpart of [`store_key`](Self::store_key).
@@ -624,8 +630,15 @@ impl KvCache {
     /// See [`store_key`](Self::store_key) for the bounds-checking contract
     /// and the M-26 compatibility note; out-of-range calls are silently
     /// ignored rather than panicking or returning an error.
-    pub fn store_value(&mut self, layer: usize, head: usize, pos: usize, value: &[f32]) {
+    pub fn store_value_lossy(&mut self, layer: usize, head: usize, pos: usize, value: &[f32]) {
         let _ = self.try_store_value(layer, head, pos, value);
+    }
+
+    /// Legacy spelling of [`store_value_lossy`](Self::store_value_lossy).
+    ///
+    /// Kept only so call sites that pre-date the rename keep compiling.
+    pub fn store_value(&mut self, layer: usize, head: usize, pos: usize, value: &[f32]) {
+        self.store_value_lossy(layer, head, pos, value);
     }
 
     /// Fallible counterpart of [`store_value`](Self::store_value).
@@ -1640,11 +1653,11 @@ mod tests {
     fn try_new_and_try_new_sparse_reject_overflowing_geometry_instead_of_panicking() {
         let err = KvCache::try_new(usize::MAX, usize::MAX, usize::MAX, usize::MAX)
             .expect_err("an overflowing element count must be rejected, not panic");
-        assert!(matches!(err, ModelError::Internal(_)));
+        assert!(matches!(err, ModelError::KvAllocation { .. }), "{err}");
 
         let err = KvCache::try_new_sparse(usize::MAX, usize::MAX, usize::MAX, usize::MAX)
             .expect_err("an overflowing sparse element count must be rejected, not panic");
-        assert!(matches!(err, ModelError::Internal(_)));
+        assert!(matches!(err, ModelError::KvAllocation { .. }), "{err}");
 
         // A count that does not overflow `usize` but whose *byte* total does
         // (elements * 2 (K+V) * size_of::<f32>()) must also be rejected
@@ -1652,7 +1665,7 @@ mod tests {
         let huge_but_not_overflowing = usize::MAX / 4;
         let err = KvCache::try_new(huge_but_not_overflowing, 1, 1, 1)
             .expect_err("a byte count past isize::MAX must be rejected");
-        assert!(matches!(err, ModelError::Internal(_)));
+        assert!(matches!(err, ModelError::KvAllocation { .. }), "{err}");
     }
 
     #[test]
@@ -1980,7 +1993,7 @@ mod tests {
         let err = cache
             .try_grow_to(usize::MAX)
             .expect_err("an overflowing grow target must be rejected");
-        assert!(matches!(err, ModelError::Internal(_)));
+        assert!(matches!(err, ModelError::KvAllocation { .. }), "{err}");
         // The cache must be completely unchanged after a rejected grow.
         assert_eq!(cache.max_seq_len(), 8);
         cache.set_seq_len(1);
@@ -1989,7 +2002,7 @@ mod tests {
         let err = cache
             .try_ensure_capacity(usize::MAX)
             .expect_err("an overflowing ensure_capacity target must be rejected");
-        assert!(matches!(err, ModelError::Internal(_)));
+        assert!(matches!(err, ModelError::KvAllocation { .. }), "{err}");
         assert_eq!(cache.max_seq_len(), 8);
     }
 }

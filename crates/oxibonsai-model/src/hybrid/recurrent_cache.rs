@@ -58,7 +58,11 @@ pub struct RecurrentCache {
     /// v-head order.
     ssm: Vec<Vec<f32>>,
     /// `[n_linear_layers][conv_dim * (conv_kernel - 1)]`, channel-major,
-    /// oldest tap first.
+    /// oldest tap first, in the GGUF's **raw (tiled)** channel order --
+    /// NOT the grouped v-head order `ssm` above uses. The conv runs over
+    /// all `conv_dim` channels of the concatenated `q|k|v` stream
+    /// untouched; only the `v` *slice* of its output is re-indexed
+    /// tiled -> grouped afterwards (design SS3.3).
     conv: Vec<Vec<f32>>,
     /// Kernel geometry of one layer's `S`.
     dims: GdnDims,

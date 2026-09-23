@@ -78,10 +78,6 @@ macro_rules! aarch64_prefetch {
 #[allow(unused_imports)] // re-export unused on non-aarch64 targets (see macro doc above)
 pub(crate) use aarch64_prefetch;
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
-#[macro_use]
-extern crate objc;
-
 pub mod gpu_backend;
 #[cfg(feature = "gpu")]
 pub use gpu_backend::Scirs2Backend;
@@ -145,6 +141,7 @@ pub mod dequant_fp8;
 pub mod dequant_prism;
 pub mod dequant_ternary;
 pub mod dispatch;
+pub mod dispatch_int8;
 pub mod dispatch_prism;
 pub mod dispatch_std_quant;
 pub mod error;
@@ -172,10 +169,12 @@ pub mod hadamard;
 pub mod packing;
 pub mod parallel;
 pub mod parallel_tiled;
+pub mod quant_activation;
 #[cfg(target_arch = "x86_64")]
 pub mod simd_avx2;
 #[cfg(target_arch = "x86_64")]
 pub mod simd_avx512;
+pub mod simd_dot_int8;
 #[cfg(target_arch = "x86_64")]
 pub mod simd_fp8_avx2;
 #[cfg(target_arch = "x86_64")]

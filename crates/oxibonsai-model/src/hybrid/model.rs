@@ -1,15 +1,15 @@
 //! [`HybridModel`] — construction, layer split and reset for a `qwen35`
 //! (PrismML Bonsai 2) stack (design §3.1 / §3.10).
 //!
-//! # What is here, and what is deliberately not
+//! # What is here
 //!
-//! This package (B2-10) lands the **skeleton**: every tensor bound and
-//! shape-checked, both caches allocated, the v-head map, the Hadamard hook
-//! and the layer split. `forward` / `forward_prefill` are B2-11's and are
-//! **absent**, not present-and-`todo!()`: a method that exists must work.
-//! Everything they will need is reachable from here — [`HybridModel::block`],
-//! [`HybridModel::hadamard`], [`HybridModel::vhead_map`],
-//! [`HybridModel::kv_cache_mut`], [`HybridModel::recurrent_mut`].
+//! B2-10 landed the **skeleton**: every tensor bound and shape-checked,
+//! both caches allocated, the v-head map, the Hadamard hook and the layer
+//! split. B2-11 landed the **forward**: [`HybridModel::forward`],
+//! [`HybridModel::forward_prefill`] and [`HybridModel::forward_with_dump`],
+//! all three of which are one call into
+//! [`crate::hybrid::forward::run_chunk`] parameterised by batch, plus the
+//! RoPE table and the chunk-wide activation scratch they run in.
 //!
 //! # Memory: `max_seq_len` is a parameter, never the model's context length
 //!
@@ -20,10 +20,12 @@
 //! [`DEFAULT_MAX_SEQ_LEN`] is 8192, not the model maximum; the context guard
 //! that turns a RAM budget into a ceiling is B2-12's.
 //!
-//! The host cache here is `f32` (the existing [`KvCache`]), i.e. 128 KiB per
-//! token for the 27B. Design §3.7's 64 KiB/token figure is the **f16**
-//! `KvCache::new_sparse` that B2-12 owns; the *sparseness* — 16 slots, not
-//! 64 — is already honoured here.
+//! The host cache is the **f16**, layer-sparse `KvCache::try_new_sparse` of
+//! design §3.7 — 16 slots × 4 kv heads × 256 dims × 2 (K+V) × 2 B =
+//! 64 KiB/token for the 27B, and the same `f16` KV the PrismML fork's own
+//! goldens were produced with. [`KvPrecision::F32`] doubles that and exists
+//! so a differential test can tell `f16` rounding apart from an arithmetic
+//! bug.
 
 use std::sync::Arc;
 
@@ -36,6 +38,9 @@ use oxibonsai_kernels::KernelDispatcher;
 use crate::error::{ModelError, ModelResult};
 use crate::hybrid::block::{
     FullAttnBlock, FullScratch, HybridBlock, LinearAttnBlock, LinearScratch,
+};
+use crate::hybrid::forward::{
+    run_chunk, ForwardCtx, HybridScratch, LayerDump, RopeTables, DEFAULT_PREFILL_CHUNK,
 };
 use crate::hybrid::hadamard::{HadamardHook, HadamardScratch};
 use crate::hybrid::recurrent_cache::RecurrentCache;
@@ -155,9 +160,29 @@ pub struct HybridModel<'a> {
     vhead_map: VHeadMap,
     kv_cache: KvCache,
     recurrent: RecurrentCache,
+    rope: RopeTables,
+    scratch: HybridScratch,
+    prefill_chunk: usize,
     max_seq_len: usize,
     quant_type: GgufTensorType,
     variant: Option<ModelVariant>,
+}
+
+/// Element type of a hybrid model's KV cache.
+///
+/// Design §3.7 ships `f16` (64 KiB/token for the 27B, and what the PrismML
+/// fork's own goldens were generated with — `llama-cli` defaults to an
+/// `f16` KV with no `-ctk`/`-ctv`). `F32` doubles the footprint and exists
+/// for differential testing against an exact reference, where the `f16`
+/// rounding of stored keys and values would otherwise be indistinguishable
+/// from an arithmetic bug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KvPrecision {
+    /// Half precision, layer-sparse (design §3.7) — the shipped default.
+    #[default]
+    F16,
+    /// Single precision, dense-backed: 128 KiB/token for the 27B.
+    F32,
 }
 
 impl<'a> HybridModel<'a> {
@@ -212,6 +237,21 @@ impl<'a> HybridModel<'a> {
         config: HybridConfig,
         max_seq_len: usize,
         kernel: &Arc<KernelDispatcher>,
+    ) -> ModelResult<Self> {
+        Self::from_gguf_with_precision(gguf, config, max_seq_len, kernel, KvPrecision::default())
+    }
+
+    /// [`HybridModel::from_gguf_with`] with an explicit KV element type.
+    ///
+    /// # Errors
+    ///
+    /// As [`HybridModel::from_gguf`].
+    pub fn from_gguf_with_precision(
+        gguf: &'a GgufFile<'a>,
+        config: HybridConfig,
+        max_seq_len: usize,
+        kernel: &Arc<KernelDispatcher>,
+        kv_precision: KvPrecision,
     ) -> ModelResult<Self> {
         if max_seq_len == 0 {
             return Err(ModelError::ShapeInvariant {
@@ -286,14 +326,33 @@ impl<'a> HybridModel<'a> {
         }
 
         // ── Caches ──────────────────────────────────────────────────────
-        // Indexed by `kv_slot` (0..16 for the 27B), never by `layer_idx`.
-        let kv_cache = KvCache::new(
-            split.full_layers().len(),
-            config.base.num_kv_heads,
-            config.base.head_dim,
-            max_seq_len,
-        );
+        // Indexed by `kv_slot` (0..16 for the 27B), never by `layer_idx`,
+        // and allocated through the *fallible* constructors: a 27B at the
+        // model's declared 262 144-token context is 16 GiB of KV even at
+        // `f16`, which must surface as an error rather than an abort.
+        let kv_cache = match kv_precision {
+            KvPrecision::F16 => KvCache::try_new_sparse(
+                split.full_layers().len(),
+                config.base.num_kv_heads,
+                config.base.head_dim,
+                max_seq_len,
+            )?,
+            KvPrecision::F32 => KvCache::try_new(
+                split.full_layers().len(),
+                config.base.num_kv_heads,
+                config.base.head_dim,
+                max_seq_len,
+            )?,
+        };
         let recurrent = RecurrentCache::new(&config)?;
+        let rope = RopeTables::new(
+            config.rope_dimension_count,
+            max_seq_len,
+            config.base.rope_freq_base,
+        )?;
+        // One token's worth to start with: `run_chunk` grows it in place the
+        // first time a prefill asks for more.
+        let scratch = HybridScratch::new(&config, 1);
 
         let quant_type = crate::hybrid::weights::apply_resolved_type(
             gguf.tensors
@@ -320,6 +379,9 @@ impl<'a> HybridModel<'a> {
             vhead_map,
             kv_cache,
             recurrent,
+            rope,
+            scratch,
+            prefill_chunk: DEFAULT_PREFILL_CHUNK,
             max_seq_len,
             quant_type,
             variant,
@@ -473,6 +535,165 @@ impl<'a> HybridModel<'a> {
         HadamardScratch::new(&self.config)
     }
 
+    /// Tokens per prefill chunk (design SS3.10; `--prefill-chunk`).
+    #[inline]
+    #[must_use]
+    pub fn prefill_chunk(&self) -> usize {
+        self.prefill_chunk
+    }
+
+    /// Set the prefill chunk size; `0` is rejected.
+    ///
+    /// # Errors
+    ///
+    /// [`ModelError::ShapeInvariant`] for a zero chunk.
+    pub fn set_prefill_chunk(&mut self, chunk: usize) -> ModelResult<()> {
+        if chunk == 0 {
+            return Err(ModelError::ShapeInvariant {
+                tensor: "prefill chunk".to_string(),
+                expected: "> 0".to_string(),
+                actual: "0".to_string(),
+            });
+        }
+        self.prefill_chunk = chunk;
+        Ok(())
+    }
+
+    /// Whether the KV cache is the `f16`, layer-sparse one of design SS3.7.
+    #[inline]
+    #[must_use]
+    pub fn kv_is_f16(&self) -> bool {
+        self.kv_cache.is_sparse()
+    }
+
+    /// Borrow every part one forward needs, field by field, so the driver
+    /// can hold disjoint `&`/`&mut` borrows of one model.
+    fn ctx(&mut self) -> ForwardCtx<'_, 'a> {
+        ForwardCtx {
+            config: &self.config,
+            blocks: &self.blocks,
+            embedding: &self.embedding,
+            output_norm: &self.output_norm,
+            lm_head: &self.lm_head,
+            hadamard: self.hadamard.as_ref(),
+            vhead_map: &self.vhead_map,
+            rope: &self.rope,
+            kv: &mut self.kv_cache,
+            recurrent: &mut self.recurrent,
+            scratch: &mut self.scratch,
+        }
+    }
+
+    /// Single-token decode at absolute position `pos`, writing
+    /// `[vocab_size]` logits into `logits` (design SS3.10).
+    ///
+    /// This is [`HybridModel::forward_prefill`] with a one-token chunk --
+    /// literally the same body -- so a decode step and the last token of a
+    /// prefill chunk cannot diverge.
+    ///
+    /// # Errors
+    ///
+    /// [`ModelError::PositionOutOfRange`] past the KV window,
+    /// [`ModelError::ShapeMismatch`] for a short `logits`, and anything the
+    /// blocks or kernels return.
+    pub fn forward(&mut self, token: u32, pos: usize, logits: &mut [f32]) -> ModelResult<()> {
+        let mut ctx = self.ctx();
+        run_chunk(&mut ctx, &[token], pos, Some(logits), None)?;
+        self.kv_cache.set_seq_len(pos + 1);
+        Ok(())
+    }
+
+    /// Single-token decode that also allocates its logit row.
+    ///
+    /// # Errors
+    ///
+    /// As [`HybridModel::forward`].
+    pub fn forward_alloc(&mut self, token: u32, pos: usize) -> ModelResult<Vec<f32>> {
+        let mut logits = vec![0.0f32; self.config.base.vocab_size];
+        self.forward(token, pos, &mut logits)?;
+        Ok(logits)
+    }
+
+    /// Chunked prefill of `tokens` starting at `start_pos`, writing the
+    /// **last** token's `[vocab_size]` logits into `last_logits`.
+    ///
+    /// Long prompts are split into [`HybridModel::prefill_chunk`]-token
+    /// chunks; each chunk advances the recurrent state exactly once per
+    /// token, in order, and stores every key/value at its absolute
+    /// position, so the result is the same as feeding the tokens one at a
+    /// time (design SS8.2 G5).
+    ///
+    /// # Errors
+    ///
+    /// As [`HybridModel::forward`].
+    pub fn forward_prefill(
+        &mut self,
+        tokens: &[u32],
+        start_pos: usize,
+        last_logits: &mut [f32],
+    ) -> ModelResult<()> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        let chunk = self.prefill_chunk.max(1);
+        let total = tokens.len();
+        let mut offset = 0usize;
+        while offset < total {
+            let end = (offset + chunk).min(total);
+            let is_last = end == total;
+            let slice = tokens
+                .get(offset..end)
+                .ok_or_else(|| ModelError::ShapeInvariant {
+                    tensor: "prefill chunk".to_string(),
+                    expected: format!("{offset}..{end} within {total} tokens"),
+                    actual: "out of range".to_string(),
+                })?;
+            let mut ctx = self.ctx();
+            if is_last {
+                run_chunk(&mut ctx, slice, start_pos + offset, Some(last_logits), None)?;
+            } else {
+                run_chunk(&mut ctx, slice, start_pos + offset, None, None)?;
+            }
+            offset = end;
+        }
+        self.kv_cache.set_seq_len(start_pos + total);
+        Ok(())
+    }
+
+    /// [`HybridModel::forward_prefill`] over a single chunk, recording every
+    /// block's output (design SS8.2 G11: the CPU reference dump the later
+    /// Metal parity gate diffs against).
+    ///
+    /// Deliberately **not** chunked: a dump is a diagnostic over a known,
+    /// bounded token list, and stitching per-chunk dumps together would hide
+    /// exactly the chunk-boundary behaviour it exists to expose.
+    ///
+    /// # Errors
+    ///
+    /// As [`HybridModel::forward`].
+    pub fn forward_with_dump(
+        &mut self,
+        tokens: &[u32],
+        start_pos: usize,
+        last_logits: Option<&mut [f32]>,
+    ) -> ModelResult<LayerDump> {
+        let mut dump = LayerDump::default();
+        let end = start_pos + tokens.len();
+        {
+            let mut ctx = self.ctx();
+            run_chunk(&mut ctx, tokens, start_pos, last_logits, Some(&mut dump))?;
+        }
+        self.kv_cache.set_seq_len(end);
+        Ok(dump)
+    }
+
+    /// Bytes held by the activation scratch at its current chunk capacity.
+    #[inline]
+    #[must_use]
+    pub fn scratch_bytes(&self) -> usize {
+        self.scratch.memory_bytes()
+    }
+
     /// Clear both caches: the KV cursor **and** the recurrent state (RT-28).
     ///
     /// The recurrent half is the part with no positional masking — a stale
@@ -624,8 +845,8 @@ fn bind_linear_layer<'a>(
             resolved_42,
             kernel,
         )?,
-        ssm_alpha: bind_gate_projection(gguf, layer, names::SSM_ALPHA, hidden, heads)?,
-        ssm_beta: bind_gate_projection(gguf, layer, names::SSM_BETA, hidden, heads)?,
+        ssm_alpha: bind_gate_projection(gguf, layer, names::SSM_ALPHA, hidden, heads, resolved_42)?,
+        ssm_beta: bind_gate_projection(gguf, layer, names::SSM_BETA, hidden, heads, resolved_42)?,
         ssm_conv1d: bind_conv1d(gguf, layer, config)?,
         // `ssm_a` and `ssm_dt.bias` bound by name (never positionally,
         // B2-05 / gatekeeper REQUIRED #8), `validate_a_neg`-checked at load,

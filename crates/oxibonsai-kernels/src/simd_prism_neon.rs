@@ -563,6 +563,273 @@ pub unsafe fn gemm_ptq1_0_neon(
 }
 
 // ---------------------------------------------------------------------------
+// Register-blocked (MR-tiled) NEON GEMM — K-INT8 / gatekeeper REQUIRED #9
+//
+// Same contract as `crate::dequant_prism`'s scalar blocked kernels: one
+// decoded block is consumed by `PRISM_GEMM_MR` batch rows before the next is
+// touched, and every (batch row, weight row) pair keeps the exact
+// `vfmaq_f32` sequence, `hsum4_neon` and `row_sum += d * hsum` order the
+// per-row GEMV above uses — so the output is bit-identical to the GEMV
+// sweep, which `prism_blocked_tests` asserts on every run.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "aarch64")]
+use crate::dequant_prism::{
+    for_each_prism_register_block, validate_prism_gemm, PrismTileSpan, TwoBitBlockView,
+};
+
+/// # Safety
+/// Requires NEON CPU support; all indices are pre-validated by
+/// [`validate_prism_gemm`].
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn micro_two_bit_neon<const MR: usize, B: TwoBitBlockView>(
+    row_blocks: &[B],
+    input: &[f32],
+    output: &mut [f32],
+    qk: usize,
+    span: PrismTileSpan,
+) {
+    let mut sums = [0.0f32; MR];
+    for (bi, block) in row_blocks.iter().enumerate() {
+        let inp_base = bi * qk;
+        let mut acc = [vdupq_n_f32(0.0); MR];
+        for (byte_idx, &byte) in block.qs_bytes().iter().enumerate() {
+            let val_f = decode_byte_arith_to_f32x4(byte);
+            let col = inp_base + byte_idx * 4;
+            for (r, a) in acc.iter_mut().enumerate() {
+                let x = vld1q_f32(input.as_ptr().add((span.m0 + r) * span.k + col));
+                *a = vfmaq_f32(*a, val_f, x);
+            }
+        }
+        let d = block.scale();
+        for (a, sum) in acc.iter().zip(sums.iter_mut()) {
+            *sum += d * hsum4_neon(*a);
+        }
+    }
+    for (r, sum) in sums.iter().enumerate() {
+        output[(span.m0 + r) * span.n_rows + span.ni] = *sum;
+    }
+}
+
+/// # Safety
+/// See [`micro_two_bit_neon`].
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn tile_two_bit_neon<const MR: usize, B: TwoBitBlockView>(
+    blocks: &[B],
+    input: &[f32],
+    output: &mut [f32],
+    n_rows: usize,
+    k: usize,
+    qk: usize,
+    blocks_per_row: usize,
+    m0: usize,
+) {
+    for ni in 0..n_rows {
+        if ni + 1 < n_rows {
+            let next_row = blocks.as_ptr().add((ni + 1) * blocks_per_row) as *const i8;
+            // SAFETY: prefetch is a hint; the macro is a no-op off-nightly.
+            crate::aarch64_prefetch!(next_row, 0, 3);
+        }
+        let row_blocks = &blocks[ni * blocks_per_row..(ni + 1) * blocks_per_row];
+        let span = PrismTileSpan { k, n_rows, ni, m0 };
+        micro_two_bit_neon::<MR, B>(row_blocks, input, output, qk, span);
+    }
+}
+
+/// Register-blocked NEON GEMM for either 2-bit Prism format, bit-identical
+/// to the matching per-row NEON GEMV sweep.
+///
+/// # Errors
+///
+/// See [`validate_prism_gemm`].
+///
+/// # Safety
+/// Requires NEON CPU support (always available on AArch64).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+pub unsafe fn gemm_two_bit_neon_blocked<B: TwoBitBlockView>(
+    blocks: &[B],
+    input: &[f32],
+    output: &mut [f32],
+    m: usize,
+    n_rows: usize,
+    k: usize,
+    qk: usize,
+) -> KernelResult<()> {
+    let blocks_per_row =
+        validate_prism_gemm(blocks.len(), input.len(), output.len(), m, n_rows, k, qk)?;
+    if m == 0 || n_rows == 0 {
+        return Ok(());
+    }
+    for_each_prism_register_block!(
+        m,
+        tile_two_bit_neon,
+        [B],
+        blocks,
+        input,
+        output,
+        n_rows,
+        k,
+        qk,
+        blocks_per_row
+    );
+    Ok(())
+}
+
+/// Register-blocked NEON GEMM for `PQ2_0`.
+///
+/// # Errors
+///
+/// See [`validate_prism_gemm`].
+///
+/// # Safety
+/// Requires NEON CPU support (always available on AArch64).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+pub unsafe fn gemm_pq2_0_neon_blocked(
+    blocks: &[BlockPQ2_0],
+    input: &[f32],
+    output: &mut [f32],
+    m: usize,
+    n_rows: usize,
+    k: usize,
+) -> KernelResult<()> {
+    gemm_two_bit_neon_blocked(blocks, input, output, m, n_rows, k, QK_PQ2_0)
+}
+
+/// Register-blocked NEON GEMM for `Q2_0_g64`.
+///
+/// # Errors
+///
+/// See [`validate_prism_gemm`].
+///
+/// # Safety
+/// Requires NEON CPU support (always available on AArch64).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+pub unsafe fn gemm_q2_0_g64_neon_blocked(
+    blocks: &[BlockQ2_0G64],
+    input: &[f32],
+    output: &mut [f32],
+    m: usize,
+    n_rows: usize,
+    k: usize,
+) -> KernelResult<()> {
+    gemm_two_bit_neon_blocked(blocks, input, output, m, n_rows, k, QK_Q2_0_G64)
+}
+
+/// # Safety
+/// Requires NEON CPU support; indices pre-validated by
+/// [`validate_prism_gemm`].
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn micro_ptq1_0_neon<const MR: usize>(
+    row_blocks: &[BlockPTQ1_0],
+    input: &[f32],
+    output: &mut [f32],
+    span: PrismTileSpan,
+) {
+    let mut sums = [0.0f32; MR];
+    for (bi, block) in row_blocks.iter().enumerate() {
+        let codes = decode_ptq1_0_codes_neon(block);
+        let inp_base = bi * QK_PTQ1_0;
+        let mut acc = [vdupq_n_f32(0.0); MR];
+        for chunk in 0..8 {
+            let codes16 = vld1q_u8(codes.as_ptr().add(chunk * 16));
+            let vals = codes16_to_f32x4x4(codes16);
+            for (i, v) in vals.iter().enumerate() {
+                let col = inp_base + chunk * 16 + i * 4;
+                for (r, a) in acc.iter_mut().enumerate() {
+                    let x = vld1q_f32(input.as_ptr().add((span.m0 + r) * span.k + col));
+                    *a = vfmaq_f32(*a, *v, x);
+                }
+            }
+        }
+        let d = block.d.to_f32();
+        for (a, sum) in acc.iter().zip(sums.iter_mut()) {
+            *sum += d * hsum4_neon(*a);
+        }
+    }
+    for (r, sum) in sums.iter().enumerate() {
+        output[(span.m0 + r) * span.n_rows + span.ni] = *sum;
+    }
+}
+
+/// # Safety
+/// See [`micro_ptq1_0_neon`].
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn tile_ptq1_0_neon<const MR: usize>(
+    blocks: &[BlockPTQ1_0],
+    input: &[f32],
+    output: &mut [f32],
+    n_rows: usize,
+    k: usize,
+    blocks_per_row: usize,
+    m0: usize,
+) {
+    for ni in 0..n_rows {
+        if ni + 1 < n_rows {
+            let next_row = blocks.as_ptr().add((ni + 1) * blocks_per_row) as *const i8;
+            // SAFETY: prefetch is a hint; the macro is a no-op off-nightly.
+            crate::aarch64_prefetch!(next_row, 0, 3);
+        }
+        let row_blocks = &blocks[ni * blocks_per_row..(ni + 1) * blocks_per_row];
+        let span = PrismTileSpan { k, n_rows, ni, m0 };
+        micro_ptq1_0_neon::<MR>(row_blocks, input, output, span);
+    }
+}
+
+/// Register-blocked NEON GEMM for `PTQ1_0`, bit-identical to
+/// [`gemm_ptq1_0_neon`] but trit-decoding each block once per register
+/// block instead of once per batch row.
+///
+/// # Errors
+///
+/// See [`validate_prism_gemm`].
+///
+/// # Safety
+/// Requires NEON CPU support (always available on AArch64).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+pub unsafe fn gemm_ptq1_0_neon_blocked(
+    blocks: &[BlockPTQ1_0],
+    input: &[f32],
+    output: &mut [f32],
+    m: usize,
+    n_rows: usize,
+    k: usize,
+) -> KernelResult<()> {
+    let blocks_per_row = validate_prism_gemm(
+        blocks.len(),
+        input.len(),
+        output.len(),
+        m,
+        n_rows,
+        k,
+        QK_PTQ1_0,
+    )?;
+    if m == 0 || n_rows == 0 {
+        return Ok(());
+    }
+    for_each_prism_register_block!(
+        m,
+        tile_ptq1_0_neon,
+        [],
+        blocks,
+        input,
+        output,
+        n_rows,
+        k,
+        blocks_per_row
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests — module name already contains "prism" (matches the package gate's
 // `prism` test-name filter without any extra renaming).
 // ---------------------------------------------------------------------------

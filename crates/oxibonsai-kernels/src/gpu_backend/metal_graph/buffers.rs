@@ -241,7 +241,8 @@ fn map_command_buffer_status(
 /// supplied an `NSError`.
 ///
 /// `metal` 0.33 does not expose `-[MTLCommandBuffer error]` as a safe
-/// binding, so this reads it directly via the `objc` crate — the same
+/// binding, so this reads it directly through `metal`'s own re-exported
+/// `objc` (`deps-17`: no direct `objc` dependency needed) — the same
 /// pattern the project already uses for `GPUStartTime`/`GPUEndTime` at
 /// `metal_full_layer/functions.rs`. Returns `None` (rather than failing)
 /// whenever any step of the `NSError` → `NSString` → `CStr` chain yields a
@@ -252,11 +253,17 @@ fn map_command_buffer_status(
 /// Must be called only after `wait_until_completed()` (or an equivalent
 /// synchronization point) has returned for `cmd`.
 unsafe fn command_buffer_error_description(cmd: &CommandBufferRef) -> Option<String> {
-    let err_obj: *mut objc::runtime::Object = msg_send![cmd, error];
+    // `deps-17`: `metal` 0.33 re-exports `objc` (`pub extern crate objc;`), so
+    // these come from the `metal` dependency — the crate needs no direct
+    // `objc` dependency. `msg_send!` expands to `sel!`/`sel_impl!`.
+    use metal::objc::runtime::Object;
+    use metal::objc::{msg_send, sel, sel_impl};
+
+    let err_obj: *mut Object = msg_send![cmd, error];
     if err_obj.is_null() {
         return None;
     }
-    let desc_obj: *mut objc::runtime::Object = msg_send![err_obj, localizedDescription];
+    let desc_obj: *mut Object = msg_send![err_obj, localizedDescription];
     if desc_obj.is_null() {
         return None;
     }

@@ -239,8 +239,8 @@ impl<'a> TransformerBlock<'a> {
         }
         for head in 0..nkv {
             let start = head * hd;
-            kv_cache.store_key(self.layer_idx, head, pos, &k_rope[start..start + hd]);
-            kv_cache.store_value(self.layer_idx, head, pos, &v_all[start..start + hd]);
+            kv_cache.try_store_key(self.layer_idx, head, pos, &k_rope[start..start + hd])?;
+            kv_cache.try_store_value(self.layer_idx, head, pos, &v_all[start..start + hd])?;
         }
         let full_seq_len = pos + 1;
         if let Some(sw_config) = sliding_window {

@@ -32,6 +32,7 @@ use oxibonsai_core::gguf::tensor_info::tensor_names;
 use oxibonsai_kernels::traits::{FusedKernel, OneBitKernel};
 
 mod embedding;
+mod forward_hidden;
 mod lm_head;
 mod prefill_cpu;
 #[cfg(test)]
@@ -739,6 +740,11 @@ impl<'a> BonsaiModel<'a> {
     }
 
     /// Number of transformer layers.
+    /// Dominant weight quantization type detected at load time (M-25).
+    pub fn dominant_quant_type(&self) -> oxibonsai_core::GgufTensorType {
+        self.dominant_quant_type
+    }
+
     pub fn num_layers(&self) -> usize {
         self.config.num_layers
     }

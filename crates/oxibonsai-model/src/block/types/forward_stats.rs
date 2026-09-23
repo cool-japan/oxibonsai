@@ -234,8 +234,8 @@ impl<'a> TransformerBlock<'a> {
         let attn_start = Instant::now();
         for head in 0..nkv {
             let start = head * hd;
-            kv_cache.store_key(self.layer_idx, head, pos, &k_rope[start..start + hd]);
-            kv_cache.store_value(self.layer_idx, head, pos, &v_all[start..start + hd]);
+            kv_cache.try_store_key(self.layer_idx, head, pos, &k_rope[start..start + hd])?;
+            kv_cache.try_store_value(self.layer_idx, head, pos, &v_all[start..start + hd])?;
         }
         let seq_len = pos + 1;
         compute_gqa_attention(

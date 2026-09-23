@@ -26,6 +26,7 @@ use oxibonsai_core::tensor::{BlockQ1_0G128, QK1_0_G128};
 use oxibonsai_core::ternary_code_to_i8;
 
 #[cfg(target_arch = "x86_64")]
+use crate::dequant_prism::for_each_prism_register_block;
 use crate::error::{KernelError, KernelResult};
 
 // ─── Helpers ─────────────────────────────────────────────────────────────
@@ -319,6 +320,165 @@ pub unsafe fn gemv_1bit_g128_avx512(
     Ok(())
 }
 
+// ─── Register-blocked micro-kernels (K-18's AVX-512 tier) ───────────────
+//
+// `BlockedTier::Delegate` (gemm_ternary.rs) routes AVX-512 hosts straight
+// into this file's `gemm_*_avx512`, which until K-INT8 were loops of GEMVs:
+// correct, and never a GPU escape, but with none of K-18's register
+// blocking, so an AVX-512 host re-streamed and re-decoded the whole weight
+// matrix once per batch row. Rather than add a second entry point that
+// `gemm_ternary.rs` (not this package's file) would have to be edited to
+// call, the blocking is applied **inside** the existing functions: same
+// names, same signatures, same numbers.
+//
+// Bit-identity is by construction, and is the reason the loops are nested
+// this exact way: only the *order in which (batch row, weight row) pairs
+// are visited* changes, plus the hoisting of the decode out of the batch
+// loop. Each pair still performs the same `_mm512_fmadd_ps` sequence
+// against the same accumulator and ends with the same `hsum_avx512`, so
+// every output element is the identical `f32`.
+//
+// Compile-blind: this file cannot be executed on the AArch64 machine the
+// package was developed on. It is cross-checked against two real x86-64
+// targets, not just one: `cargo check -p oxibonsai-kernels --target
+// x86_64-apple-darwin --all-features --lib --profile test` (which also
+// compiles the `#[cfg(all(test, target_arch = "x86_64"))]` modules) *and*
+// `cargo check -p oxibonsai-kernels --target x86_64-unknown-linux-gnu
+// --all-features` — `x86_64-unknown-linux-gnu` is installed on this host
+// (`rustup target list --installed`), so this is a real Linux x86-64
+// compile check, not merely Darwin's x86-64 target. The one part that
+// could be silently *wrong* rather than non-compiling — the decode table —
+// is proven exhaustively on any host by
+// `simd_dot_int8::int8_dot_tests::ternary_f32_lut_matches_the_shared_decode_exhaustively`.
+// No runtime validation is claimed on either target.
+
+/// Batch rows a decoded weight block is consumed by before the next block
+/// is touched — the AVX-512 twin of `gemm_ternary::TERNARY_GEMM_MR`.
+///
+/// 8 `__m512` accumulators plus the decoded weight vector and one input
+/// vector sit comfortably inside x86-64's 32 `zmm` registers.
+pub const AVX512_GEMM_MR: usize = 8;
+
+/// Assemble one `__m512` of 16 decoded ternary weights from four packed
+/// `qs` bytes, via four 4-wide table rows and `_mm512_insertf32x4`.
+///
+/// Bit-identical to [`decode_4bytes_avx512_to_f32x16`] — both read the same
+/// generated [`crate::simd_dot_int8::TERNARY_BYTE_LUT_F32`] values in the
+/// same lane order — but it replaces sixteen scalar table lookups plus a
+/// stack round trip (perf-08) with four vector loads.
+///
+/// # Safety
+/// Requires AVX-512F.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn decode_4bytes_avx512_lut(b0: u8, b1: u8, b2: u8, b3: u8) -> __m512 {
+    let lut = crate::simd_dot_int8::TERNARY_BYTE_LUT_F32.as_ptr() as *const f32;
+    let r0 = _mm_loadu_ps(lut.add(b0 as usize * 4));
+    let r1 = _mm_loadu_ps(lut.add(b1 as usize * 4));
+    let r2 = _mm_loadu_ps(lut.add(b2 as usize * 4));
+    let r3 = _mm_loadu_ps(lut.add(b3 as usize * 4));
+    let v = _mm512_castps128_ps512(r0);
+    let v = _mm512_insertf32x4::<1>(v, r1);
+    let v = _mm512_insertf32x4::<2>(v, r2);
+    _mm512_insertf32x4::<3>(v, r3)
+}
+
+/// One register block of the ternary GEMM: `MR` batch rows against every
+/// weight row.
+///
+/// # Safety
+/// Requires AVX-512F + AVX-512BW + AVX-512VL; every index is bounded by
+/// the caller's validation.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn tile_tq2_avx512<const MR: usize>(
+    blocks: &[oxibonsai_core::BlockTQ2_0_g128],
+    input: &[f32],
+    output: &mut [f32],
+    n_rows: usize,
+    k: usize,
+    blocks_per_row: usize,
+    m0: usize,
+) {
+    use oxibonsai_core::QK_TQ2_0_G128;
+
+    for ni in 0..n_rows {
+        let row_blocks = &blocks[ni * blocks_per_row..(ni + 1) * blocks_per_row];
+        let mut sums = [0.0f32; MR];
+
+        for (bi, block) in row_blocks.iter().enumerate() {
+            let d = block.d.to_f32();
+            let inp_base = bi * QK_TQ2_0_G128;
+            let mut acc = [_mm512_setzero_ps(); MR];
+
+            for chunk in 0..8 {
+                let val_f = decode_4bytes_avx512_lut(
+                    block.qs[chunk * 4],
+                    block.qs[chunk * 4 + 1],
+                    block.qs[chunk * 4 + 2],
+                    block.qs[chunk * 4 + 3],
+                );
+                let col = inp_base + chunk * 16;
+                for (r, a) in acc.iter_mut().enumerate() {
+                    let inp_vec = _mm512_loadu_ps(input.as_ptr().add((m0 + r) * k + col));
+                    *a = _mm512_fmadd_ps(val_f, inp_vec, *a);
+                }
+            }
+
+            for (a, sum) in acc.iter().zip(sums.iter_mut()) {
+                *sum += d * hsum_avx512(*a);
+            }
+        }
+
+        for (r, sum) in sums.iter().enumerate() {
+            output[(m0 + r) * n_rows + ni] = *sum;
+        }
+    }
+}
+
+/// One register block of the 1-bit GEMM.
+///
+/// # Safety
+/// See [`tile_tq2_avx512`].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vl")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn tile_1bit_avx512<const MR: usize>(
+    blocks: &[BlockQ1_0G128],
+    input: &[f32],
+    output: &mut [f32],
+    n_rows: usize,
+    k: usize,
+    blocks_per_row: usize,
+    m0: usize,
+) {
+    for ni in 0..n_rows {
+        let row_blocks = &blocks[ni * blocks_per_row..(ni + 1) * blocks_per_row];
+        let mut acc = [_mm512_setzero_ps(); MR];
+
+        for (bi, block) in row_blocks.iter().enumerate() {
+            let scale = _mm512_set1_ps(block.d.to_f32());
+            let input_base = bi * QK1_0_G128;
+
+            for chunk in 0..8 {
+                let signs = bits_to_signs_avx512(block.qs[chunk * 2], block.qs[chunk * 2 + 1]);
+                let col = input_base + chunk * 16;
+                for (r, a) in acc.iter_mut().enumerate() {
+                    let inp = _mm512_loadu_ps(input.as_ptr().add((m0 + r) * k + col));
+                    let signed_input = _mm512_mul_ps(signs, inp);
+                    *a = _mm512_fmadd_ps(scale, signed_input, *a);
+                }
+            }
+        }
+
+        for (r, a) in acc.iter().enumerate() {
+            output[(m0 + r) * n_rows + ni] = hsum_avx512(*a);
+        }
+    }
+}
+
 // ─── AVX-512 GEMM ───────────────────────────────────────────────────────
 
 /// AVX-512 accelerated 1-bit GEMM.
@@ -364,35 +524,26 @@ pub unsafe fn gemm_1bit_g128_avx512(
         ));
     }
 
-    for mi in 0..m {
-        let input_row = &input[mi * k..];
-
-        for ni in 0..n_rows {
-            let row_blocks = &blocks[ni * blocks_per_row..(ni + 1) * blocks_per_row];
-            let mut acc = _mm512_setzero_ps();
-
-            for (bi, block) in row_blocks.iter().enumerate() {
-                let d = block.d.to_f32();
-                let scale = _mm512_set1_ps(d);
-                let input_base = bi * QK1_0_G128;
-
-                for chunk in 0..8 {
-                    let bits_lo = block.qs[chunk * 2];
-                    let bits_hi = block.qs[chunk * 2 + 1];
-                    let inp_offset = input_base + chunk * 16;
-
-                    let inp = _mm512_loadu_ps(input_row.as_ptr().add(inp_offset));
-
-                    let signs = bits_to_signs_avx512(bits_lo, bits_hi);
-
-                    let signed_input = _mm512_mul_ps(signs, inp);
-                    acc = _mm512_fmadd_ps(scale, signed_input, acc);
-                }
-            }
-
-            output[mi * n_rows + ni] = hsum_avx512(acc);
-        }
+    if m == 0 || n_rows == 0 {
+        return Ok(());
     }
+
+    // K-18's AVX-512 tier: register-blocked over the batch dimension, so a
+    // decoded sign vector is consumed by `AVX512_GEMM_MR` batch rows before
+    // the next `qs` pair is touched. Bit-identical to the loop of GEMVs
+    // this replaces — see this file's "Register-blocked micro-kernels"
+    // section.
+    for_each_prism_register_block!(
+        m,
+        tile_1bit_avx512,
+        [],
+        blocks,
+        input,
+        output,
+        n_rows,
+        k,
+        blocks_per_row
+    );
 
     Ok(())
 }
@@ -860,42 +1011,29 @@ pub unsafe fn gemm_tq2_0_g128_avx512(
         ));
     }
 
-    for mi in 0..m {
-        let input_row = &input[mi * k..];
-
-        for ni in 0..n_rows {
-            let row_blocks = &blocks[ni * blocks_per_row..(ni + 1) * blocks_per_row];
-            let mut row_sum = 0.0_f32;
-
-            for (bi, block) in row_blocks.iter().enumerate() {
-                let d = block.d.to_f32();
-                let inp_base = bi * QK_TQ2_0_G128;
-                let mut block_acc = _mm512_setzero_ps();
-
-                for chunk in 0..8 {
-                    let b0 = block.qs[chunk * 4];
-                    let b1 = block.qs[chunk * 4 + 1];
-                    let b2 = block.qs[chunk * 4 + 2];
-                    let b3 = block.qs[chunk * 4 + 3];
-
-                    // K-01: this used to be an unmasked inline copy of the
-                    // decode (pos_part/min_part/neg_part with no `0b11`
-                    // guard), so a reserved code decoded to +1 here while
-                    // every other ternary kernel decoded it to 0. Routing
-                    // through the single shared helper makes that
-                    // divergence structurally impossible.
-                    let val_f = decode_4bytes_avx512_to_f32x16(b0, b1, b2, b3);
-
-                    let inp_vec = _mm512_loadu_ps(input_row.as_ptr().add(inp_base + chunk * 16));
-                    block_acc = _mm512_fmadd_ps(val_f, inp_vec, block_acc);
-                }
-
-                row_sum += d * hsum_avx512(block_acc);
-            }
-
-            output[mi * n_rows + ni] = row_sum;
-        }
+    if m == 0 || n_rows == 0 {
+        return Ok(());
     }
+
+    // K-18's AVX-512 tier: register-blocked over the batch dimension, so
+    // each 128-weight block is decoded once per `AVX512_GEMM_MR` batch rows
+    // instead of once per batch row. Bit-identical to the loop of GEMVs it
+    // replaces — see this file's "Register-blocked micro-kernels" section.
+    // K-01 still holds: `decode_4bytes_avx512_lut` reads the same generated
+    // `ternary_code_to_i8` table (reserved `0b11` -> 0) the scalar helper
+    // does, proved entry by entry by
+    // `simd_dot_int8::int8_dot_tests::ternary_f32_lut_matches_the_shared_decode_exhaustively`.
+    for_each_prism_register_block!(
+        m,
+        tile_tq2_avx512,
+        [],
+        blocks,
+        input,
+        output,
+        n_rows,
+        k,
+        blocks_per_row
+    );
 
     Ok(())
 }

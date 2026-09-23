@@ -472,6 +472,304 @@ pub fn transcode_ptq1_0_to_pq2_0(
 }
 
 // ---------------------------------------------------------------------------
+// Register-blocked (MR-tiled) GEMM — K-INT8 / gatekeeper REQUIRED #9
+//
+// Before this section the three Prism GEMMs were literal loops of GEMVs
+// (`gemm_pq2_0` below, `gemm_ptq1_0`, and every SIMD twin): the full
+// quantized weight matrix was streamed and re-decoded once per batch row.
+// For Bonsai 2's `ffn_up [5120, 17408]` at a 64-token prefill chunk that is
+// 64 re-walks of a 23 MB matrix per layer, on one core.
+//
+// The fix mirrors `gemm_ternary.rs`'s K-18 register blocking exactly: decode
+// one block once, consume it with [`PRISM_GEMM_MR`] batch rows' accumulators
+// live in registers, then advance. Because each `(batch row, weight row)`
+// pair keeps the *same* sequence of multiply-adds and the same per-block
+// `sum += d * acc` order it had in the GEMV sweep, the blocked result is
+// **bit-identical** to the unblocked one — the invariant FIX3-PERF
+// established for the ternary family and which
+// `prism_blocked_tests::*_blocked_is_bit_identical_to_the_gemv_sweep`
+// re-checks here on every run.
+// ---------------------------------------------------------------------------
+
+/// Register-blocking factor for the Prism GEMMs: how many batch rows a
+/// decoded weight block is consumed by before the next block is touched.
+///
+/// 8, matching [`crate::gemm_ternary::TERNARY_GEMM_MR`] and for the same
+/// reason: 8 accumulators plus the decoded weight vector and one input
+/// vector stay inside AArch64's 32-register vector file, while dividing the
+/// decode work and the streamed weight bytes by 8.
+pub const PRISM_GEMM_MR: usize = 8;
+
+/// Walk the batch dimension in register blocks, calling `$tile` with the
+/// largest supported block that fits the remaining rows.
+///
+/// Four monomorphizations (8/4/2/1) cover every `m`; each is fully unrolled
+/// over its batch rows so the accumulators stay in registers. The `[..]`
+/// slot carries any generic arguments the tile takes *after* `MR` (the
+/// 2-bit tiles are generic over [`TwoBitBlockView`]; the `PTQ1_0` ones take
+/// none, so they pass `[]`). Shared with
+/// `simd_prism_neon.rs` / `simd_prism_avx2.rs` through `pub(crate) use`
+/// below, so the three tiers cannot drift in how they split `m`.
+macro_rules! for_each_prism_register_block {
+    ($m:expr, $tile:ident, [$($gen:ty),* $(,)?], $($arg:expr),* $(,)?) => {{
+        let mut m0 = 0usize;
+        while m0 < $m {
+            let remaining = $m - m0;
+            if remaining >= $crate::dequant_prism::PRISM_GEMM_MR {
+                $tile::<{ $crate::dequant_prism::PRISM_GEMM_MR } $(, $gen)*>($($arg,)* m0);
+                m0 += $crate::dequant_prism::PRISM_GEMM_MR;
+            } else if remaining >= 4 {
+                $tile::<4 $(, $gen)*>($($arg,)* m0);
+                m0 += 4;
+            } else if remaining >= 2 {
+                $tile::<2 $(, $gen)*>($($arg,)* m0);
+                m0 += 2;
+            } else {
+                $tile::<1 $(, $gen)*>($($arg,)* m0);
+                m0 += 1;
+            }
+        }
+    }};
+}
+pub(crate) use for_each_prism_register_block;
+
+/// Where one register-blocked micro-kernel call writes its results.
+///
+/// Bundled into a struct rather than passed as four more parameters so the
+/// micro-kernels stay inside clippy's `too_many_arguments` budget — the same
+/// shape `gemm_ternary.rs::TileSpan` uses.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PrismTileSpan {
+    /// Inner dimension of the GEMM.
+    pub k: usize,
+    /// Output row stride (number of weight rows in the full matrix).
+    pub n_rows: usize,
+    /// Index of the weight row this call computes.
+    pub ni: usize,
+    /// First batch row of the register block.
+    pub m0: usize,
+}
+
+/// The two 2-bit Prism formats (`PQ2_0`, `Q2_0_g64`) differ only in how many
+/// `qs` bytes a block carries, so every blocked kernel in this crate is
+/// written once against this view and instantiated twice.
+///
+/// `d`-scale and `qs` accessors only — deliberately not a decode trait, so
+/// the one shared `code -> value` map ([`q2_0_code_to_i32`]) stays the only
+/// place a decode can be written.
+pub trait TwoBitBlockView {
+    /// The block's packed 2-bit codes, 4 per byte, LSB-first.
+    fn qs_bytes(&self) -> &[u8];
+    /// The block's FP16 scale, widened to `f32`.
+    fn scale(&self) -> f32;
+}
+
+impl TwoBitBlockView for BlockPQ2_0 {
+    #[inline(always)]
+    fn qs_bytes(&self) -> &[u8] {
+        &self.qs
+    }
+    #[inline(always)]
+    fn scale(&self) -> f32 {
+        self.d.to_f32()
+    }
+}
+
+impl TwoBitBlockView for BlockQ2_0G64 {
+    #[inline(always)]
+    fn qs_bytes(&self) -> &[u8] {
+        &self.qs
+    }
+    #[inline(always)]
+    fn scale(&self) -> f32 {
+        self.d.to_f32()
+    }
+}
+
+/// Validate the preconditions every Prism GEMM shares and return
+/// `blocks_per_row`.
+///
+/// Returns exactly the errors (and buffer names) the per-row GEMV kernels
+/// return, so hoisting validation out of the per-chunk kernels for the
+/// parallel drivers cannot change which error a bad call reports.
+///
+/// # Errors
+///
+/// - [`KernelError::NotBlockAligned`] if `k % qk != 0`.
+/// - [`KernelError::NamedDimensionMismatch`] if `input` is shorter than `m * k`.
+/// - [`KernelError::NamedBufferTooSmall`] if `output` or `blocks` is too short.
+pub fn validate_prism_gemm(
+    n_blocks: usize,
+    input_len: usize,
+    output_len: usize,
+    m: usize,
+    n_rows: usize,
+    k: usize,
+    qk: usize,
+) -> KernelResult<usize> {
+    if !k.is_multiple_of(qk) {
+        return Err(KernelError::NotBlockAligned {
+            count: k,
+            block_size: qk,
+        });
+    }
+    if input_len < m * k {
+        return Err(KernelError::dimension_mismatch("input", m * k, input_len));
+    }
+    if output_len < m * n_rows {
+        return Err(KernelError::buffer_too_small(
+            "output",
+            m * n_rows,
+            output_len,
+        ));
+    }
+    let blocks_per_row = k / qk;
+    let expected_blocks = n_rows * blocks_per_row;
+    if n_blocks < expected_blocks {
+        return Err(KernelError::buffer_too_small(
+            "blocks",
+            expected_blocks,
+            n_blocks,
+        ));
+    }
+    Ok(blocks_per_row)
+}
+
+/// Accumulate one 2-bit block into `MR` batch-row accumulators, in exactly
+/// [`dot_two_bit_block`]'s order (byte 0 lanes 0..4, byte 1 lanes 0..4, ...)
+/// so the sum is bit-identical to the GEMV sweep's.
+#[inline(always)]
+fn accumulate_two_bit_block_scalar<const MR: usize>(
+    qs: &[u8],
+    input: &[f32],
+    inp_base: usize,
+    span: PrismTileSpan,
+    acc: &mut [f32; MR],
+) {
+    for (byte_idx, &byte) in qs.iter().enumerate() {
+        let base = inp_base + byte_idx * 4;
+        for lane in 0..4usize {
+            let w = q2_0_code_to_i32((byte >> (lane * 2)) & 0b11) as f32;
+            let col = base + lane;
+            for (r, a) in acc.iter_mut().enumerate() {
+                *a += w * input[(span.m0 + r) * span.k + col];
+            }
+        }
+    }
+}
+
+fn micro_two_bit_scalar<const MR: usize, B: TwoBitBlockView>(
+    row_blocks: &[B],
+    input: &[f32],
+    output: &mut [f32],
+    qk: usize,
+    span: PrismTileSpan,
+) {
+    let mut sums = [0.0f32; MR];
+    for (bi, block) in row_blocks.iter().enumerate() {
+        let mut acc = [0.0f32; MR];
+        accumulate_two_bit_block_scalar::<MR>(block.qs_bytes(), input, bi * qk, span, &mut acc);
+        let d = block.scale();
+        for (a, sum) in acc.iter().zip(sums.iter_mut()) {
+            *sum += d * *a;
+        }
+    }
+    for (r, sum) in sums.iter().enumerate() {
+        output[(span.m0 + r) * span.n_rows + span.ni] = *sum;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tile_two_bit_scalar<const MR: usize, B: TwoBitBlockView>(
+    blocks: &[B],
+    input: &[f32],
+    output: &mut [f32],
+    n_rows: usize,
+    k: usize,
+    qk: usize,
+    blocks_per_row: usize,
+    m0: usize,
+) {
+    for ni in 0..n_rows {
+        let row_blocks = &blocks[ni * blocks_per_row..(ni + 1) * blocks_per_row];
+        let span = PrismTileSpan { k, n_rows, ni, m0 };
+        micro_two_bit_scalar::<MR, B>(row_blocks, input, output, qk, span);
+    }
+}
+
+/// Register-blocked scalar GEMM for either 2-bit Prism format.
+///
+/// Bit-identical to the matching `gemm_*` GEMV sweep; see this section's
+/// header for why.
+///
+/// # Errors
+///
+/// See [`validate_prism_gemm`].
+pub fn gemm_two_bit_blocked<B: TwoBitBlockView>(
+    blocks: &[B],
+    input: &[f32],
+    output: &mut [f32],
+    m: usize,
+    n_rows: usize,
+    k: usize,
+    qk: usize,
+) -> KernelResult<()> {
+    let blocks_per_row =
+        validate_prism_gemm(blocks.len(), input.len(), output.len(), m, n_rows, k, qk)?;
+    if m == 0 || n_rows == 0 {
+        return Ok(());
+    }
+    for_each_prism_register_block!(
+        m,
+        tile_two_bit_scalar,
+        [B],
+        blocks,
+        input,
+        output,
+        n_rows,
+        k,
+        qk,
+        blocks_per_row
+    );
+    Ok(())
+}
+
+/// Register-blocked scalar GEMM for `PQ2_0` — bit-identical to
+/// [`gemm_pq2_0`], with each weight block decoded once per
+/// [`PRISM_GEMM_MR`] batch rows instead of once per batch row.
+///
+/// # Errors
+///
+/// See [`validate_prism_gemm`].
+pub fn gemm_pq2_0_blocked(
+    blocks: &[BlockPQ2_0],
+    input: &[f32],
+    output: &mut [f32],
+    m: usize,
+    n_rows: usize,
+    k: usize,
+) -> KernelResult<()> {
+    gemm_two_bit_blocked(blocks, input, output, m, n_rows, k, QK_PQ2_0)
+}
+
+/// Register-blocked scalar GEMM for `Q2_0_g64` — see
+/// [`gemm_pq2_0_blocked`].
+///
+/// # Errors
+///
+/// See [`validate_prism_gemm`].
+pub fn gemm_q2_0_g64_blocked(
+    blocks: &[BlockQ2_0G64],
+    input: &[f32],
+    output: &mut [f32],
+    m: usize,
+    n_rows: usize,
+    k: usize,
+) -> KernelResult<()> {
+    gemm_two_bit_blocked(blocks, input, output, m, n_rows, k, QK_Q2_0_G64)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

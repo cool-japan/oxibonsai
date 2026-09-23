@@ -10,7 +10,14 @@ use crate::gpu_backend::metal_full_layer::types::{WeightKind, WEIGHT_KIND_MISMAT
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Errors raised by the Metal graph dispatch engine.
-#[derive(Debug)]
+///
+/// `Clone` is derived (every payload is `String`, `Option<String>`,
+/// `&'static str`, `MTLCommandBufferStatus` or [`WeightKind`], all of which
+/// are `Clone`) so a caller that must both log an error and return it — the
+/// FP8/K-quant/Q-std kernel families all do — can simply `e.clone()`. Four
+/// hand-written, exhaustive `clone_err` matches used to do that, and every
+/// new variant broke all four files.
+#[derive(Debug, Clone)]
 pub enum MetalGraphError {
     /// No Metal-capable GPU device was found on the system.
     DeviceNotFound,
@@ -73,6 +80,12 @@ pub enum MetalGraphError {
         expected: WeightKind,
         /// The [`WeightKind`] already resident in that slot.
         found: WeightKind,
+        /// Per-model weight identity of the colliding slot (`WeightKey::slot`)
+        /// — *which* tensor collided, context the replaced string form
+        /// carried and the typed variant originally dropped.
+        slot: u64,
+        /// The loaded-model epoch of the colliding key (`WeightKey::model_epoch`).
+        model_epoch: u64,
     },
 }
 
@@ -113,10 +126,15 @@ impl fmt::Display for MetalGraphError {
             // (`metal_graph::graph::weight_cache`'s acceptance tests), and
             // interpolating the constant rather than re-typing the literal keeps
             // the two from drifting apart.
-            Self::WeightKindMismatch { expected, found } => write!(
+            Self::WeightKindMismatch {
+                expected,
+                found,
+                slot,
+                model_epoch,
+            } => write!(
                 f,
-                "{WEIGHT_KIND_MISMATCH_TAG}: slot holds a {found} buffer but \
-                 {expected} was requested"
+                "{WEIGHT_KIND_MISMATCH_TAG}: epoch {model_epoch} slot {slot} holds a {found} \
+                 buffer but {expected} was requested"
             ),
         }
     }
@@ -185,14 +203,42 @@ mod tests {
     /// `1.0`, 2-bit codes cycling through `00/01/10` only (never the reserved
     /// `0b11`, which the upload validator rejects for a ternary tensor).
     fn tq2_blocks(n_blocks: usize) -> Vec<u8> {
-        let mut out = vec![0u8; n_blocks * 34];
-        for (i, block) in out.chunks_exact_mut(34).enumerate() {
-            for (j, byte) in block[..32].iter_mut().enumerate() {
-                let c = |s: usize| ((i + j + s) % 3) as u8;
-                *byte = c(0) | (c(1) << 2) | (c(2) << 4) | (c(3) << 6);
-            }
-            block[32..34].copy_from_slice(&0x3C00u16.to_le_bytes());
-        }
+        tq2_block_structs(n_blocks)
+            .iter()
+            .flat_map(tq2_block_bytes)
+            .collect()
+    }
+
+    /// The same blocks as [`tq2_blocks`], but **typed**.
+    ///
+    /// `O4`: the scalar-reference call sites used to cast the `Vec<u8>` above
+    /// to `*const BlockTQ2_0_g128`. `BlockTQ2_0_g128` has alignment 2 (its
+    /// `d: f16`) while a `Vec<u8>` is only guaranteed 1-aligned, so that cast
+    /// was UB by the letter — it worked only because the system allocator
+    /// over-aligns, and Miri flags it. Building the typed vector first and
+    /// deriving the bytes from it inverts the direction and removes the cast.
+    fn tq2_block_structs(n_blocks: usize) -> Vec<oxibonsai_core::BlockTQ2_0_g128> {
+        (0..n_blocks)
+            .map(|i| {
+                let mut qs = [0u8; 32];
+                for (j, byte) in qs.iter_mut().enumerate() {
+                    let c = |s: usize| ((i + j + s) % 3) as u8;
+                    *byte = c(0) | (c(1) << 2) | (c(2) << 4) | (c(3) << 6);
+                }
+                oxibonsai_core::BlockTQ2_0_g128 {
+                    qs,
+                    // 0x3C00 == 1.0 in IEEE binary16.
+                    d: half::f16::from_bits(0x3C00),
+                }
+            })
+            .collect()
+    }
+
+    /// The on-disk 34 bytes of one block: `[qs 32 B][d f16 LE]`.
+    fn tq2_block_bytes(block: &oxibonsai_core::BlockTQ2_0_g128) -> Vec<u8> {
+        let mut out = Vec::with_capacity(34);
+        out.extend_from_slice(&block.qs);
+        out.extend_from_slice(&block.d.to_bits().to_le_bytes());
         out
     }
 
@@ -259,7 +305,11 @@ mod tests {
         let n_rows = 8usize;
         let k = 256usize;
         let blocks_per_row = k / 128;
-        let aos = tq2_blocks(n_rows * blocks_per_row);
+        // `O4`: build the typed blocks first and derive the byte blob from
+        // them, rather than casting a 1-aligned `Vec<u8>` to a 2-aligned
+        // `*const BlockTQ2_0_g128`.
+        let blocks = tq2_block_structs(n_rows * blocks_per_row);
+        let aos: Vec<u8> = blocks.iter().flat_map(tq2_block_bytes).collect();
         let handle = graph
             .upload_tq2_weight_soa(&aos)
             .expect("upload_tq2_weight_soa");
@@ -267,15 +317,9 @@ mod tests {
 
         let input: Vec<f32> = (0..k).map(|i| (i as f32) * 0.01 - 0.5).collect();
 
-        // Scalar reference over the same bytes.
-        let blocks: &[oxibonsai_core::BlockTQ2_0_g128] = unsafe {
-            std::slice::from_raw_parts(
-                aos.as_ptr() as *const oxibonsai_core::BlockTQ2_0_g128,
-                n_rows * blocks_per_row,
-            )
-        };
+        // Scalar reference over the same blocks.
         let mut expected = vec![0f32; n_rows];
-        crate::gemv_ternary::gemv_tq2_0_g128(blocks, &input, &mut expected, n_rows, k)
+        crate::gemv_ternary::gemv_tq2_0_g128(&blocks, &input, &mut expected, n_rows, k)
             .expect("scalar reference GEMV");
 
         let mut got = vec![0f32; n_rows];
@@ -330,6 +374,8 @@ mod tests {
         let err = MetalGraphError::WeightKindMismatch {
             expected: WeightKind::Tq2Soa,
             found: WeightKind::Q1Soa,
+            slot: 0x2a,
+            model_epoch: 7,
         };
         let msg = err.to_string();
         assert!(msg.starts_with(WEIGHT_KIND_MISMATCH_TAG), "{msg}");
@@ -337,7 +383,8 @@ mod tests {
         assert!(msg.contains("tq2_soa"), "{msg}");
         assert_eq!(
             msg,
-            "weight cache kind mismatch: slot holds a q1_soa buffer but tq2_soa was requested"
+            "weight cache kind mismatch: epoch 7 slot 42 holds a q1_soa buffer but tq2_soa was \
+             requested"
         );
     }
 
@@ -364,9 +411,18 @@ mod tests {
         match graph.get_or_upload_keyed(WeightKey::new(epoch, WeightKind::Tq2Soa, slot), || {
             graph.upload_tq2_weight_soa(&tq2_blocks(4))
         }) {
-            Err(MetalGraphError::WeightKindMismatch { expected, found }) => {
+            Err(MetalGraphError::WeightKindMismatch {
+                expected,
+                found,
+                slot: reported_slot,
+                model_epoch,
+            }) => {
                 assert_eq!(expected, WeightKind::Tq2Soa);
                 assert_eq!(found, WeightKind::Q1Soa);
+                // `O5`: the typed variant now names *which* tensor collided,
+                // context that previously survived only in the log line.
+                assert_eq!(reported_slot, slot);
+                assert_eq!(model_epoch, epoch);
             }
             Ok(_) => panic!("a Q1 buffer must never be served to the ternary path"),
             Err(other) => panic!("expected WeightKindMismatch, got {other:?}"),

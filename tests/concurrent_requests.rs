@@ -338,3 +338,49 @@ fn engine_batch_generate_tracks_stats() {
         "should record at least 3 requests"
     );
 }
+
+// ── SV-32: the async front end is backed by a replica pool ──────────────────
+
+/// `SV-32`: `AsyncInferenceEngine` used to hold one `Mutex<InferenceEngine>`,
+/// so `max_concurrent` bounded admission while every admitted request still
+/// queued on a single engine. It now wraps an `EnginePool`, and the two
+/// numbers are reported separately: `max_concurrent` (admission) and
+/// `replicas` (execution).
+#[test]
+fn async_engine_reports_admission_and_execution_separately() {
+    let async_engine = AsyncInferenceEngine::new(make_engine(), 4);
+    assert_eq!(async_engine.max_concurrent(), 4);
+    assert_eq!(
+        async_engine.replicas(),
+        1,
+        "a lone engine is one replica, whatever the admission limit says"
+    );
+}
+
+/// Built from a pool, the front end admits exactly what it can execute, and
+/// concurrent requests reproduce their isolated baselines.
+#[tokio::test]
+async fn async_engine_from_pool_runs_requests_concurrently() {
+    use oxibonsai_runtime::engine_pool::EnginePool;
+
+    let prompts: Vec<Vec<u32>> = vec![vec![1, 2, 3], vec![4, 5, 6]];
+    let baselines: Vec<Vec<u32>> = prompts
+        .iter()
+        .map(|p| make_engine().generate(p, 3).expect("baseline"))
+        .collect();
+
+    let pool = EnginePool::new(vec![make_engine(), make_engine()]);
+    let async_engine = Arc::new(AsyncInferenceEngine::from_pool(pool));
+    assert_eq!(async_engine.max_concurrent(), 2);
+    assert_eq!(async_engine.replicas(), 2);
+
+    let mut handles = Vec::new();
+    for p in prompts {
+        let ae = Arc::clone(&async_engine);
+        handles.push(tokio::spawn(async move { ae.generate(p, 3).await }));
+    }
+    for (i, h) in handles.into_iter().enumerate() {
+        let got = h.await.expect("join").expect("generate");
+        assert_eq!(got, baselines[i], "concurrent request {i} diverged");
+    }
+}

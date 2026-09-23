@@ -7,43 +7,29 @@
 //!
 //! The [`EmbedderRegistry`] manages three backends, tried in priority order:
 //!
-//! 1. **A model-backed [`Embedder`]** (see [`EmbedderRegistry::with_model_embedder`])
-//!    — the intended production default once one is installed. **No live HTTP
-//!    path installs one today**, because reaching a real model from this file
-//!    needs three changes outside this crate's / this file's ownership: (a) a
-//!    CPU-only `BonsaiModel::forward_hidden(&[u32]) -> ModelResult<Vec<f32>>`
-//!    seam in `crates/oxibonsai-model/src/model/types/mod.rs` returning the
-//!    post-`output_norm` hidden state instead of logits (the Metal fast path
-//!    fuses the LM head into the same dispatch, so this needs either a
-//!    non-fused variant or a CPU-only path); (b) an `InferenceEngine`
-//!    accessor in `crates/oxibonsai-runtime/src/engine.rs` that calls it and
-//!    mean-pools + L2-normalises the result; (c) `server.rs`'s
-//!    `create_embeddings_router(512)` call site switched to
-//!    [`create_embeddings_router_with_model`] once an `Embedder` wrapping
-//!    that accessor exists. [`create_embeddings_router_with_model`] is the
-//!    wiring point for whoever lands (a)–(c); it does not require any change
-//!    to [`create_embeddings_router`]'s signature or its existing caller.
+//! 1. **A model-backed [`Embedder`]** — the production default since
+//!    orchestrator decision D-1. [`crate::embed_engine::ModelEmbedder`]
+//!    tokenises the input, runs it through a loaded model and returns the
+//!    mean-pooled, L2-normalised final hidden state
+//!    (`BonsaiModel::forward_hidden`, taken *before* the LM head): a genuine
+//!    semantic embedding, a pure function of `(model, text)` and of nothing
+//!    else. Install one with [`EmbedderRegistry::with_model`] (which also
+//!    wires the two model-only refinements below) or, for any other
+//!    [`Embedder`] implementation, [`EmbedderRegistry::with_model_embedder`].
+//!    * `usage.prompt_tokens` is then the **real** token count from the
+//!      model's tokenizer ([`EmbeddingTokenCounter`]) rather than a
+//!      whitespace-split word count.
+//!    * `"input": [1, 2, 3]` is embedded as those token ids
+//!      ([`TokenSequenceEmbedder`]) rather than as the *string* `"1 2 3"`.
 //!
-//!    **Interim substitute while (a)–(c) are outstanding** (`SV-02`
-//!    correction (b)): [`EmbedderRegistry::with_require_model_backend`] lets
-//!    a caller who does *not* want the stateless fallback to ever answer
-//!    disable it — [`create_embeddings`] then returns `501 Not Implemented`
-//!    instead of a `200` carrying a byte-hash/TF-IDF vector whenever no
-//!    model backend is installed. The check lives inside this file's own
-//!    handler, not at any call site, so it cannot be silently bypassed by a
-//!    caller that forgets to check first. **`server.rs`'s live call site now
-//!    opts into it** (orchestrator decision D-1, wave 2.5): the running
-//!    server calls [`create_embeddings_router_requiring_model`] rather than
-//!    the bare [`create_embeddings_router`], so **`/v1/embeddings` on the
-//!    running server honestly answers `501` today** (no model-backed
-//!    `Embedder` is installed) instead of a silently-wrong `200` carrying an
-//!    `IdentityEmbedder` byte-hash vector. `tests/embeddings_tests.rs`
-//!    (outside this package's `owned_files`) still asserts `200` against
-//!    the bare [`create_embeddings_router`] directly — that is intentional
-//!    and unaffected, since that constructor's own documented behavior is
-//!    unchanged; only the running server's call site moved to the stricter
-//!    one. See [`create_embeddings_router_requiring_model`]'s own doc
-//!    comment for the real-embedder follow-up (a)–(c) above still needs.
+//!    When no model backend is installed,
+//!    [`EmbedderRegistry::with_require_model_backend`] decides what happens.
+//!    With it set — which is what the served router does — [`create_embeddings`]
+//!    answers `501 Not Implemented` naming the missing backend, rather than
+//!    ever handing back a non-semantic vector that merely *looks* like an
+//!    embedding. Left unset (the default of the bare library constructors) the
+//!    two lexical fallbacks below still answer, which is exactly what an
+//!    embedded caller that has no model asked for.
 //! 2. **[`TfIdfEmbedder`]** — a lexical bag-of-words backend. It is
 //!    **stateless from the HTTP handler's point of view**: nothing in
 //!    [`create_embeddings`] ever calls [`EmbedderRegistry::fit_tfidf`], so
@@ -57,17 +43,34 @@
 //!    intentionally mutating operation for exactly that one-time use; it is
 //!    simply no longer invoked implicitly from client-supplied request data.
 //! 3. **[`IdentityEmbedder`]** — deterministic byte-hash fallback, always
-//!    available. This is what [`create_embeddings_router`] actually serves
-//!    today for every request, since nothing pre-fits TF-IDF and no model is
-//!    wired in: a pure function of the input bytes, so embedding the same
-//!    text twice — in the same request, a different request, or a different
-//!    process — always returns a bit-identical vector.
+//!    available, and **never the default on a served router** (`RT-08`): it is
+//!    an explicitly opt-in test double, reachable only through the bare
+//!    [`create_embeddings_router`] constructor, which library embedders and
+//!    this crate's own router tests use. It is a pure function of the input
+//!    bytes, so embedding the same text twice — in the same request, a
+//!    different request, or a different process — always returns a
+//!    bit-identical vector.
 //!
 //! The response's `model` field reports which backend actually answered
 //! (`"bonsai-embeddings-model"` / `"-tfidf"` / `"-identity"`, see
 //! [`EmbedderRegistry::backend_name`]) rather than echoing the client's
 //! (arbitrary, unverified) `model` request field, so a caller can tell a
 //! byte hash from a real embedding without reading this module's source.
+//!
+//! # Metrics (`SV-25`)
+//!
+//! Both branches of [`create_embeddings`] — the `501` refusal and the
+//! computed response — record onto the **shared** [`InferenceMetrics`] the
+//! router was built with ([`EmbeddingAppState::with_metrics`]):
+//! `requests_total` on entry, `active_requests` through an RAII guard that
+//! also fires when a client disconnects mid-request, `errors_total` on every
+//! non-2xx answer, `prompt_tokens_total`, and `request_duration_seconds`.
+//! `/v1/embeddings` carries its own [`EmbeddingAppState`] and is `merge`d
+//! separately from the main `AppState`, so it escapes any `AppState`-based
+//! instrumentation and has to be wired explicitly. A registry built without
+//! metrics (the bare library constructors) records nothing — deliberately, so
+//! this module never fabricates a second, unmounted registry whose counters
+//! nobody scrapes.
 //!
 //! # Batch cap and per-item length cap (`sec-19`)
 //!
@@ -137,6 +140,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use oxibonsai_rag::embedding::{l2_normalize, Embedder, IdentityEmbedder, TfIdfEmbedder};
+
+use crate::embed_engine::{EmbeddingTokenCounter, ModelEmbedder, TokenSequenceEmbedder};
+use crate::metrics::InferenceMetrics;
 
 /// Lock `mutex`, recovering from lock poisoning instead of panicking.
 ///
@@ -208,6 +214,21 @@ impl EmbeddingInput {
                         .join(" ")
                 })
                 .collect(),
+        }
+    }
+
+    /// The raw token-id batches, when the request supplied ids rather than
+    /// text; `None` for the two text variants.
+    ///
+    /// [`create_embeddings`] routes these straight to a
+    /// [`TokenSequenceEmbedder`] when one is installed, instead of going
+    /// through [`as_strings`](Self::as_strings)'s decimal rendering — see that
+    /// trait's docs for why `"1 2 3"` is not an approximation of `[1, 2, 3]`.
+    pub fn as_token_batches(&self) -> Option<Vec<Vec<u32>>> {
+        match self {
+            EmbeddingInput::Single(_) | EmbeddingInput::Batch(_) => None,
+            EmbeddingInput::TokenIds(ids) => Some(vec![ids.clone()]),
+            EmbeddingInput::BatchTokenIds(batch) => Some(batch.clone()),
         }
     }
 
@@ -338,6 +359,12 @@ pub struct EmbedderRegistry {
     /// hidden-state embedder type; any `Embedder` implementation — including
     /// one built on `BonsaiModel` once it exists — can be installed here.
     model: Option<Arc<dyn Embedder>>,
+    /// Exact `usage.prompt_tokens` source, when the installed backend owns a
+    /// tokenizer (`SV-02`: the whitespace word count is not a token count).
+    token_counter: Option<Arc<dyn EmbeddingTokenCounter>>,
+    /// Native `"input": [1, 2, 3]` path, when the installed backend can
+    /// consume token ids directly.
+    token_embedder: Option<Arc<dyn TokenSequenceEmbedder>>,
     tfidf: std::sync::Mutex<Option<TfIdfEmbedder>>,
     identity: IdentityEmbedder,
 }
@@ -365,9 +392,47 @@ impl EmbedderRegistry {
             max_input_len: DEFAULT_MAX_EMBEDDING_INPUT_CHARS,
             require_model_backend: false,
             model: None,
+            token_counter: None,
+            token_embedder: None,
             tfidf: std::sync::Mutex::new(None),
             identity,
         }
+    }
+
+    /// Install a real, model-backed embedder — the production backend
+    /// (`RT-08` / `SV-02`, orchestrator decision D-1).
+    ///
+    /// The one-call form of [`with_model_embedder`](Self::with_model_embedder)
+    /// for [`ModelEmbedder`], which is more capable than a bare [`Embedder`]:
+    /// this also installs it as the registry's
+    /// [`EmbeddingTokenCounter`] (so `usage.prompt_tokens` is the model's own
+    /// token count, not a whitespace word count) and as its
+    /// [`TokenSequenceEmbedder`] (so a `"input": [1, 2, 3]` request embeds
+    /// those ids rather than the string `"1 2 3"`). Wiring all three by hand
+    /// and forgetting one is the whole reason this exists.
+    #[must_use]
+    pub fn with_model(mut self, embedder: Arc<ModelEmbedder>) -> Self {
+        self.token_counter = Some(Arc::clone(&embedder) as Arc<dyn EmbeddingTokenCounter>);
+        self.token_embedder = Some(Arc::clone(&embedder) as Arc<dyn TokenSequenceEmbedder>);
+        self.model = Some(embedder as Arc<dyn Embedder>);
+        self
+    }
+
+    /// Install an exact token counter for `usage.prompt_tokens` (builder).
+    ///
+    /// Independent of the embedding backend: a caller may want honest token
+    /// accounting even behind a lexical backend.
+    #[must_use]
+    pub fn with_token_counter(mut self, counter: Arc<dyn EmbeddingTokenCounter>) -> Self {
+        self.token_counter = Some(counter);
+        self
+    }
+
+    /// Install a native token-id embedding path (builder).
+    #[must_use]
+    pub fn with_token_embedder(mut self, embedder: Arc<dyn TokenSequenceEmbedder>) -> Self {
+        self.token_embedder = Some(embedder);
+        self
     }
 
     /// Install a model-backed embedder as the highest-priority backend
@@ -495,6 +560,58 @@ impl EmbedderRegistry {
         }
     }
 
+    /// Whether this registry can embed client-supplied token ids natively.
+    pub fn has_token_embedder(&self) -> bool {
+        self.token_embedder.is_some()
+    }
+
+    /// Embed token-id batches straight through the installed
+    /// [`TokenSequenceEmbedder`], one vector per batch.
+    ///
+    /// Returns `None` when no such backend is installed, so the caller falls
+    /// back to the decimal-string rendering. A per-batch failure degrades to a
+    /// zero vector, exactly as [`embed_texts`](Self::embed_texts) does.
+    pub fn embed_token_batches(&self, batches: &[Vec<u32>]) -> Option<Vec<Vec<f32>>> {
+        let embedder = self.token_embedder.as_ref()?;
+        let dim = self.embedding_dim();
+        Some(
+            batches
+                .iter()
+                .map(|ids| {
+                    embedder
+                        .embed_token_ids(ids)
+                        .unwrap_or_else(|_| vec![0.0; dim])
+                })
+                .collect(),
+        )
+    }
+
+    /// Total `usage.prompt_tokens` for `texts`.
+    ///
+    /// Uses the installed [`EmbeddingTokenCounter`] when there is one — the
+    /// model's real tokenizer — and otherwise falls back to the historical
+    /// whitespace-split word count, which is an approximation this module has
+    /// no way to improve on without a tokenizer. Every input counts as at
+    /// least one token either way, so a non-empty request never reports
+    /// `prompt_tokens: 0`.
+    pub fn count_prompt_tokens(&self, texts: &[String]) -> usize {
+        match self.token_counter.as_ref() {
+            Some(counter) => texts
+                .iter()
+                .map(|t| {
+                    counter
+                        .count_tokens(t)
+                        .unwrap_or_else(|| t.split_whitespace().count())
+                        .max(1)
+                })
+                .sum(),
+            None => texts
+                .iter()
+                .map(|t| t.split_whitespace().count().max(1))
+                .sum(),
+        }
+    }
+
     /// Fit the TF-IDF backend from `corpus`.
     ///
     /// After this call [`embed_texts`](Self::embed_texts) will use TF-IDF for
@@ -593,14 +710,71 @@ fn base64_encode_bytes(bytes: &[u8]) -> String {
 pub struct EmbeddingAppState {
     /// The active embedding registry.
     pub registry: EmbedderRegistry,
+    /// The **shared** [`InferenceMetrics`] this route records onto (`SV-25`),
+    /// or `None` for a router built without one (which then records nothing —
+    /// see the module docs' "Metrics" section for why a private registry is
+    /// not an acceptable substitute).
+    pub metrics: Option<Arc<InferenceMetrics>>,
 }
 
 impl EmbeddingAppState {
     /// Create a new state with the given embedding dimensionality.
     pub fn new(dim: usize) -> Self {
+        Self::from_registry(EmbedderRegistry::new(dim))
+    }
+
+    /// Create a state around an already-configured registry.
+    ///
+    /// This is the seam a server uses to install a model backend, a batch cap
+    /// and a metrics handle without this module needing a constructor per
+    /// combination:
+    ///
+    /// ```ignore
+    /// let state = EmbeddingAppState::from_registry(
+    ///         EmbedderRegistry::new(dim)
+    ///             .with_require_model_backend(true)
+    ///             .with_model(Arc::clone(&model_embedder)),
+    ///     )
+    ///     .with_metrics(Arc::clone(&metrics));
+    /// let router = create_embeddings_router_from_state(state);
+    /// ```
+    pub fn from_registry(registry: EmbedderRegistry) -> Self {
         Self {
-            registry: EmbedderRegistry::new(dim),
+            registry,
+            metrics: None,
         }
+    }
+
+    /// Attach the shared metrics registry (builder) — `SV-25`.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<InferenceMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+}
+
+/// Decrements `active_requests` when the request future is dropped, however it
+/// ends — normal return, error, or a client that disconnected mid-request
+/// (`SV-25`, the same RAII shape `SV-08` needs for the streaming tail).
+///
+/// A fourth local copy of this guard: `server/chat.rs`, `completions.rs` and
+/// `api_extensions.rs` each carry their own because `server.rs`'s lives in a
+/// private submodule that cannot be named from here. `B2-13` is making it
+/// `pub(crate)`; once it lands, this copy should be deleted in favour of it —
+/// see this package's `deviations`.
+struct ActiveRequestGuard(Arc<InferenceMetrics>);
+
+impl ActiveRequestGuard {
+    /// Increment `active_requests` and return the guard that will decrement it.
+    fn enter(metrics: &Arc<InferenceMetrics>) -> Self {
+        metrics.active_requests.inc();
+        Self(Arc::clone(metrics))
+    }
+}
+
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        self.0.active_requests.dec();
     }
 }
 
@@ -615,14 +789,46 @@ pub async fn create_embeddings(
     State(state): State<Arc<EmbeddingAppState>>,
     Json(req): Json<EmbeddingRequest>,
 ) -> Result<Response, StatusCode> {
+    // SV-25: instrument BOTH branches — the `501` refusal below is a request
+    // and an error like any other, and a deployment that only ever refuses
+    // must still be visible in `/metrics` as such. All of it is skipped when
+    // the router was built without a shared metrics handle; see the module
+    // docs' "Metrics" section.
+    let started = std::time::Instant::now();
+    let _active_guard = state.metrics.as_ref().map(ActiveRequestGuard::enter);
+    if let Some(metrics) = state.metrics.as_ref() {
+        metrics.requests_total.inc();
+    }
+    let outcome = create_embeddings_inner(&state, req).await;
+    if let Some(metrics) = state.metrics.as_ref() {
+        let failed = match &outcome {
+            Ok(response) => !response.status().is_success(),
+            Err(_) => true,
+        };
+        if failed {
+            metrics.errors_total.inc();
+        }
+        metrics
+            .request_duration_seconds
+            .observe(started.elapsed().as_secs_f64());
+    }
+    outcome
+}
+
+/// Body of [`create_embeddings`], with the metrics wrapper peeled off so
+/// every `return` inside it is still covered by one exit point.
+async fn create_embeddings_inner(
+    state: &Arc<EmbeddingAppState>,
+    req: EmbeddingRequest,
+) -> Result<Response, StatusCode> {
     // RT-08 / SV-02 correction (b): when this registry was explicitly
     // configured to require a model-backed `Embedder`
     // (`with_require_model_backend(true)`) and none is installed, refuse the
     // request outright rather than ever answering with a non-semantic
-    // byte-hash/TF-IDF vector. This is the sanctioned interim substitute for
-    // a live model-backed default; `server.rs`'s live call site opts into
-    // it (see the module docs for the D-1 background and the real-embedder
-    // follow-up still needed).
+    // byte-hash/TF-IDF vector. `server.rs`'s live call site sets it, and
+    // since `EMBED-MODEL` also installs a real `ModelEmbedder` whenever the
+    // server has an engine and a tokenizer, this branch is now reached only
+    // by a deployment that genuinely has no model to embed with.
     if state.registry.model_backend_required_but_missing() {
         return Ok(crate::http_error::error_response(
             StatusCode::NOT_IMPLEMENTED,
@@ -704,13 +910,33 @@ pub async fn create_embeddings(
         ));
     }
 
-    // Count tokens for usage: approximate as whitespace-split word count.
-    // Computed from `&texts` before `texts` is moved into the blocking task
-    // below, so this stays a cheap borrow rather than a clone of the batch.
-    let prompt_tokens: usize = texts
-        .iter()
-        .map(|t| t.split_whitespace().count().max(1))
-        .sum();
+    // A request that supplied token ids (`"input": [1, 2, 3]`) is embedded as
+    // those ids when the backend can consume them, instead of re-tokenising
+    // the decimal string `as_strings` renders — see
+    // `EmbeddingInput::as_token_batches`.
+    let token_batches = if state.registry.has_token_embedder() {
+        req.input.as_token_batches()
+    } else {
+        None
+    };
+
+    // `usage.prompt_tokens` must count what is ACTUALLY embedded. For a
+    // token-id request taking the `token_batches` path above that is the ids
+    // themselves — counting the decimal rendering instead would charge the
+    // client for a string the model never sees (`[10, 20, 30]` is 3 tokens;
+    // `"10 20 30"` tokenises to 8 under the char-level vocabulary, and to
+    // something else again under a real BPE). Otherwise it is the model's own
+    // tokenizer, or the historical whitespace word count when no backend owns
+    // one (see `EmbedderRegistry::count_prompt_tokens`). Computed from
+    // `&texts` / `&token_batches` before either is moved into the blocking
+    // task below, so this stays a borrow rather than a clone of the batch.
+    let prompt_tokens: usize = match token_batches.as_ref() {
+        Some(batches) => batches.iter().map(|ids| ids.len()).sum(),
+        None => state.registry.count_prompt_tokens(&texts),
+    };
+    if let Some(metrics) = state.metrics.as_ref() {
+        metrics.prompt_tokens_total.inc_by(prompt_tokens as u64);
+    }
 
     // RT-08 / SV-02 / sec-19: no fitting happens here. A previous version
     // fit TF-IDF on the fly from whatever texts.len() >= 2 the CURRENT client
@@ -722,27 +948,39 @@ pub async fn create_embeddings(
     // installed administratively (see the module docs), so it is a pure
     // function of `texts` for the lifetime of this `EmbedderRegistry`.
     //
-    // sec-19: this (TF-IDF and, once wired, model-backed) computation is
-    // CPU-bound and must not run directly on the async handler's tokio
-    // worker thread — the same defect class `sec-03` already fixes for
-    // `/v1/completions`. `state` is cloned (cheap: `Arc`) and moved into the
-    // blocking task; `texts` is moved too (not cloned), since nothing after
-    // this point needs the original `Vec<String>`.
-    let state_for_embed = Arc::clone(&state);
-    let raw_embeddings =
-        match tokio::task::spawn_blocking(move || state_for_embed.registry.embed_texts(&texts))
-            .await
-        {
-            Ok(embeddings) => embeddings,
-            Err(join_error) => {
-                tracing::error!(error = %join_error, "embedding computation task panicked");
-                return Ok(crate::http_error::error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("embedding computation failed: {join_error}"),
-                    None,
-                ));
-            }
-        };
+    // sec-19: this (TF-IDF and model-backed) computation is CPU-bound — a
+    // model-backed batch is a full forward pass per input — and must not run
+    // directly on the async handler's tokio worker thread; the same defect
+    // class `sec-03` already fixes for `/v1/completions`. `state` is cloned
+    // (cheap: `Arc`) and moved into the blocking task; `texts` /
+    // `token_batches` are moved too (not cloned), since nothing after this
+    // point needs the originals.
+    let state_for_embed = Arc::clone(state);
+    let raw_embeddings = match tokio::task::spawn_blocking(move || {
+        match token_batches {
+            Some(batches) => state_for_embed
+                .registry
+                .embed_token_batches(&batches)
+                // `has_token_embedder()` was true when `token_batches` was
+                // built and the registry is immutable behind an `Arc`, so
+                // this `None` arm is unreachable; falling back to the text
+                // path rather than unwrapping keeps it panic-free anyway.
+                .unwrap_or_else(|| state_for_embed.registry.embed_texts(&texts)),
+            None => state_for_embed.registry.embed_texts(&texts),
+        }
+    })
+    .await
+    {
+        Ok(embeddings) => embeddings,
+        Err(join_error) => {
+            tracing::error!(error = %join_error, "embedding computation task panicked");
+            return Ok(crate::http_error::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("embedding computation failed: {join_error}"),
+                None,
+            ));
+        }
+    };
 
     // Report which backend actually answered rather than echoing the
     // client's unverified `model` request field (RT-08's fix item 3: "make
@@ -826,49 +1064,59 @@ pub async fn create_embeddings(
 
 // ─── Router factory ───────────────────────────────────────────────────────────
 
-/// Build a standalone Axum router for the embeddings endpoint, serving the
-/// deterministic stateless default backend (see the module docs' "Backends
-/// and determinism" section).
+/// Build a standalone Axum router for the embeddings endpoint around an
+/// already-configured [`EmbeddingAppState`].
 ///
-/// Mount this at the root with [`Router::merge`] or nest it under a path
-/// prefix with [`Router::nest`].  The router exposes a single route:
+/// This is the one constructor that can express every combination — model
+/// backend, `require_model_backend`, batch caps, shared metrics — and the one
+/// the served router uses. Mount it at the root with [`Router::merge`] or nest
+/// it under a path prefix with [`Router::nest`]; it exposes a single route:
 ///
 /// ```text
 /// POST /v1/embeddings
 /// ```
 ///
-/// This is the constructor `server.rs` calls; its signature is kept stable
-/// (a bare dimension, no engine/model handle) both because it is `pub` and
-/// reachable by library embedders who have no model to hand it, and because
-/// changing it would require a matching change to that call site. A caller
-/// that *does* have a model-backed [`Embedder`] should use
-/// [`create_embeddings_router_with_model`] instead.
-pub fn create_embeddings_router(dim: usize) -> Router {
-    let state = Arc::new(EmbeddingAppState::new(dim));
+/// The three `create_embeddings_router*` helpers below are thin,
+/// signature-stable wrappers over it, kept because they are `pub` and have
+/// callers.
+pub fn create_embeddings_router_from_state(state: EmbeddingAppState) -> Router {
     Router::new()
         .route("/v1/embeddings", axum::routing::post(create_embeddings))
-        .with_state(state)
+        .with_state(Arc::new(state))
+}
+
+/// Build a standalone embeddings router serving the deterministic stateless
+/// fallback backend (see the module docs' "Backends and determinism" section).
+///
+/// **Not what the served server mounts.** This is the library constructor: a
+/// bare dimension, no engine, no model, no metrics, and therefore the
+/// `IdentityEmbedder` byte-hash test double as the backend that actually
+/// answers. Its signature is deliberately frozen — it is `pub`, reachable by
+/// library embedders who have no model to hand it, and exercised by this
+/// crate's own router tests. A server with a real model uses
+/// [`create_embeddings_router_from_state`]; a caller with some other
+/// [`Embedder`] uses [`create_embeddings_router_with_model`].
+pub fn create_embeddings_router(dim: usize) -> Router {
+    create_embeddings_router_from_state(EmbeddingAppState::new(dim))
 }
 
 /// Like [`create_embeddings_router`], but installs `model_embedder` as the
 /// registry's highest-priority backend (see
 /// [`EmbedderRegistry::with_model_embedder`]).
 ///
-/// This is the wiring point for a real neural embedding path once one
-/// exists: build an [`Embedder`] over a loaded model (e.g. mean-pooled,
-/// L2-normalised hidden states from `BonsaiModel::forward_hidden`, once that
-/// seam exists — see the module docs) and pass it here. No HTTP entry point
-/// in this crate calls this constructor today.
+/// Takes any [`Embedder`], so a caller can plug in an embedding backend this
+/// crate knows nothing about. For the project's own [`ModelEmbedder`], prefer
+/// [`EmbedderRegistry::with_model`] through
+/// [`create_embeddings_router_from_state`]: that additionally wires the exact
+/// token counter and the native token-id path, which a bare `dyn Embedder`
+/// cannot express.
 pub fn create_embeddings_router_with_model(
     dim: usize,
     model_embedder: Arc<dyn Embedder>,
 ) -> Router {
-    let state = Arc::new(EmbeddingAppState {
-        registry: EmbedderRegistry::new(dim).with_model_embedder(model_embedder),
-    });
-    Router::new()
-        .route("/v1/embeddings", axum::routing::post(create_embeddings))
-        .with_state(state)
+    create_embeddings_router_from_state(EmbeddingAppState::from_registry(
+        EmbedderRegistry::new(dim).with_model_embedder(model_embedder),
+    ))
 }
 
 /// Like [`create_embeddings_router`], but configures the registry with
@@ -879,966 +1127,22 @@ pub fn create_embeddings_router_with_model(
 /// vector.
 ///
 /// This is orchestrator decision D-1 (wave 2.5, `RT-EMBEDDINGS` blocking 1):
-/// a real model-backed embedder needs `BonsaiModel::forward_hidden` (a
-/// non-fused, post-`output_norm` hidden-state accessor that does not yet
-/// exist — outside `oxibonsai-runtime` entirely, in `oxibonsai-model`) plus
-/// an `InferenceEngine::embed_hidden` seam, which the decision explicitly
-/// scoped out of this wave as "a genuine feature, not a fix". Given that,
-/// answering with a byte-hash vector that merely *looks* like an embedding
-/// is worse than refusing outright, so `server.rs`'s `/v1/embeddings` call
-/// site uses this constructor rather than [`create_embeddings_router`].
-/// [`create_embeddings_router`] itself is unchanged (and still used by
-/// library embedders and by this module's own test suite below) precisely
-/// so this change does not silently alter its documented behavior for
-/// anyone already depending on the stateless fallback.
+/// answering with a byte-hash vector that merely *looks* like an embedding is
+/// worse than refusing outright. Since `EMBED-MODEL` landed
+/// `BonsaiModel::forward_hidden` and [`ModelEmbedder`], a served deployment
+/// normally *has* a model backend, and this constructor is the honest answer
+/// only for one that does not (no engine loaded, or no tokenizer to encode
+/// with). [`create_embeddings_router`] itself is unchanged, so this does not
+/// silently alter its documented behavior for anyone already depending on the
+/// stateless fallback.
 pub fn create_embeddings_router_requiring_model(dim: usize) -> Router {
-    let state = Arc::new(EmbeddingAppState {
-        registry: EmbedderRegistry::new(dim).with_require_model_backend(true),
-    });
-    Router::new()
-        .route("/v1/embeddings", axum::routing::post(create_embeddings))
-        .with_state(state)
+    create_embeddings_router_from_state(EmbeddingAppState::from_registry(
+        EmbedderRegistry::new(dim).with_require_model_backend(true),
+    ))
 }
 
 // ─── Unit tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ── EmbeddingInput ────────────────────────────────────────────────────────
-
-    #[test]
-    fn embedding_input_single_as_strings() {
-        let input = EmbeddingInput::Single("hello world".to_string());
-        assert_eq!(input.as_strings(), vec!["hello world"]);
-        assert_eq!(input.len(), 1);
-        assert!(!input.is_empty());
-    }
-
-    #[test]
-    fn embedding_input_batch_as_strings() {
-        let input = EmbeddingInput::Batch(vec!["foo".to_string(), "bar".to_string()]);
-        let strings = input.as_strings();
-        assert_eq!(strings.len(), 2);
-        assert_eq!(strings[0], "foo");
-        assert_eq!(strings[1], "bar");
-        assert_eq!(input.len(), 2);
-    }
-
-    #[test]
-    fn embedding_input_token_ids_as_strings() {
-        let input = EmbeddingInput::TokenIds(vec![1u32, 2, 3]);
-        let strings = input.as_strings();
-        assert_eq!(strings.len(), 1);
-        assert_eq!(strings[0], "1 2 3");
-    }
-
-    #[test]
-    fn embedding_input_batch_token_ids_as_strings() {
-        let input = EmbeddingInput::BatchTokenIds(vec![vec![10u32, 20], vec![30u32]]);
-        let strings = input.as_strings();
-        assert_eq!(strings.len(), 2);
-        assert_eq!(strings[0], "10 20");
-        assert_eq!(strings[1], "30");
-    }
-
-    #[test]
-    fn embedding_input_empty_batch_is_empty() {
-        let input = EmbeddingInput::Batch(vec![]);
-        assert!(input.is_empty());
-        assert_eq!(input.len(), 0);
-    }
-
-    // ── EmbedderRegistry ─────────────────────────────────────────────────────
-
-    #[test]
-    fn embedder_registry_basic_embed() {
-        let registry = EmbedderRegistry::new(32);
-        let texts = vec!["hello world".to_string(), "foo bar baz".to_string()];
-        let embeddings = registry.embed_texts(&texts);
-        assert_eq!(embeddings.len(), 2);
-        // Each embedding must have exactly `default_dim` elements.
-        for emb in &embeddings {
-            assert_eq!(emb.len(), 32, "expected 32 dimensions, got {}", emb.len());
-        }
-    }
-
-    #[test]
-    fn embedder_registry_tfidf_fit_changes_dim() {
-        let registry = EmbedderRegistry::new(64);
-        let corpus: Vec<String> = (0..20)
-            .map(|i| format!("document number {i} with some unique words term{i}"))
-            .collect();
-        registry.fit_tfidf(&corpus);
-        // After fitting the dimension comes from the TF-IDF vocabulary.
-        let dim = registry.embedding_dim();
-        assert!(dim > 0, "expected positive dimension after fit");
-    }
-
-    #[test]
-    fn embedder_registry_fit_empty_corpus_is_noop() {
-        let registry = EmbedderRegistry::new(16);
-        registry.fit_tfidf(&[]);
-        // Should still use IdentityEmbedder (dim == default_dim).
-        assert_eq!(registry.embedding_dim(), 16);
-    }
-
-    #[test]
-    fn embedder_registry_embed_after_fit() {
-        let registry = EmbedderRegistry::new(32);
-        let corpus: Vec<String> = vec![
-            "the quick brown fox".to_string(),
-            "jumped over the lazy dog".to_string(),
-            "the fox and the dog".to_string(),
-        ];
-        registry.fit_tfidf(&corpus);
-        let embeddings = registry.embed_texts(&corpus);
-        for emb in &embeddings {
-            assert!(!emb.is_empty(), "embedding must not be empty after fit");
-        }
-    }
-
-    // ── Poisoned-lock recovery (finding #70) ─────────────────────────────────
-
-    /// Regression test: a panic on another thread while holding
-    /// `EmbedderRegistry`'s internal `tfidf` mutex must not turn every
-    /// subsequent `POST /v1/embeddings` request into a permanent panic.
-    /// Before the fix, `embed_texts`/`fit_tfidf`/`embedding_dim` all used
-    /// `.lock().expect("... poisoned")`, so a single unrelated panic while
-    /// holding the lock would wedge this (server-reachable) route for the
-    /// rest of the process lifetime.
-    #[test]
-    fn embedder_registry_recovers_from_poisoned_tfidf_lock() {
-        let registry = Arc::new(EmbedderRegistry::new(16));
-
-        // Poison the `tfidf` mutex from a background thread that panics
-        // while holding the lock.
-        {
-            let registry = Arc::clone(&registry);
-            let handle = std::thread::spawn(move || {
-                let _guard = registry.tfidf.lock().expect("lock for poisoning");
-                panic!("intentional panic to poison the tfidf mutex");
-            });
-            let result = handle.join();
-            assert!(result.is_err(), "background thread should have panicked");
-        }
-
-        // The mutex is now poisoned. Operations that touch it must recover
-        // instead of panicking.
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let corpus: Vec<String> = vec![
-                "the quick brown fox".to_string(),
-                "jumped over the lazy dog".to_string(),
-            ];
-            registry.fit_tfidf(&corpus);
-            let embeddings = registry.embed_texts(&corpus);
-            let dim = registry.embedding_dim();
-            (embeddings, dim)
-        }));
-
-        assert!(
-            outcome.is_ok(),
-            "operations on an EmbedderRegistry with a poisoned `tfidf` mutex must not panic"
-        );
-        let (embeddings, dim) = outcome.expect("checked is_ok above");
-        assert_eq!(embeddings.len(), 2);
-        assert!(
-            dim > 0,
-            "embedding_dim should still be usable after poison recovery"
-        );
-    }
-
-    // ── encode_base64 (finding serve-api-08: must be real RFC 4648 base64,
-    //    not hex) ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn encode_base64_non_empty() {
-        let vec = vec![1.0f32, 0.5f32, -1.0f32];
-        let encoded = EmbedderRegistry::encode_base64(&vec);
-        // 3 f32 values → 12 bytes → 12/3*4 = 16 base64 chars, no padding.
-        assert_eq!(
-            encoded.len(),
-            16,
-            "expected 16 base64 chars for 3 f32 values (12 bytes), got {}",
-            encoded.len()
-        );
-        assert!(!encoded.is_empty());
-        // Every character must be a valid RFC 4648 base64 alphabet character.
-        assert!(encoded
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'='));
-    }
-
-    #[test]
-    fn encode_base64_empty_input() {
-        let encoded = EmbedderRegistry::encode_base64(&[]);
-        assert!(encoded.is_empty());
-    }
-
-    #[test]
-    fn encode_base64_deterministic() {
-        let vec = vec![std::f32::consts::PI, 2.71f32];
-        let a = EmbedderRegistry::encode_base64(&vec);
-        let b = EmbedderRegistry::encode_base64(&vec);
-        assert_eq!(a, b, "encoding must be deterministic");
-    }
-
-    /// Regression test for finding `serve-api-08`: the previous
-    /// implementation emitted lowercase hex ("0000803f") under the
-    /// `encoding_format: "base64"` contract. The expected string below was
-    /// computed independently with Python's standard `base64` module
-    /// (`base64.b64encode(struct.pack("<f", 1.0))` == `b"AACAPw=="`), so this
-    /// test verifies interoperability with a real RFC 4648 base64 decoder,
-    /// not just internal self-consistency.
-    #[test]
-    fn encode_base64_known_value_matches_real_base64_decoder() {
-        // f32::to_le_bytes(1.0) == [0x00, 0x00, 0x80, 0x3f]
-        let vec = vec![1.0f32];
-        let encoded = EmbedderRegistry::encode_base64(&vec);
-        assert_eq!(encoded, "AACAPw==");
-    }
-
-    /// Second independently-computed known vector: `base64.b64encode(
-    /// struct.pack("<2f", 1.0, 0.5))` == `b"AACAPwAAAD8="`.
-    #[test]
-    fn encode_base64_known_value_two_floats() {
-        let vec = vec![1.0f32, 0.5f32];
-        let encoded = EmbedderRegistry::encode_base64(&vec);
-        assert_eq!(encoded, "AACAPwAAAD8=");
-    }
-
-    /// Full round-trip: encode with the production encoder, decode with an
-    /// independent, standard-conformant base64 decoder (implemented here
-    /// for the test only), and confirm the reconstructed `f32` bytes match
-    /// the originals exactly. This is the "real decoder" check the finding
-    /// asked for: any RFC 4648-conformant decoder (including a real
-    /// `base64.b64decode`) must be able to reverse our output.
-    #[test]
-    fn encode_base64_round_trips_through_independent_decoder() {
-        let original = vec![1.0f32, -2.5f32, 0.0f32, std::f32::consts::PI, -999.125f32];
-        let encoded = EmbedderRegistry::encode_base64(&original);
-        let decoded_bytes = test_base64_decode(&encoded);
-
-        let mut expected_bytes = Vec::with_capacity(original.len() * 4);
-        for v in &original {
-            expected_bytes.extend_from_slice(&v.to_le_bytes());
-        }
-        assert_eq!(
-            decoded_bytes, expected_bytes,
-            "round-trip through an independent base64 decoder must reproduce \
-             the exact little-endian f32 byte sequence"
-        );
-
-        // Reinterpret the decoded bytes as f32 values and confirm they match.
-        let decoded_floats: Vec<f32> = decoded_bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        assert_eq!(decoded_floats, original);
-    }
-
-    /// Minimal standard-conformant RFC 4648 base64 decoder, used only to
-    /// independently verify [`EmbedderRegistry::encode_base64`]'s output in
-    /// tests (kept separate from the production encoder so the test does
-    /// not just check the encoder against itself).
-    fn test_base64_decode(s: &str) -> Vec<u8> {
-        fn value_of(c: u8) -> u32 {
-            match c {
-                b'A'..=b'Z' => (c - b'A') as u32,
-                b'a'..=b'z' => (c - b'a' + 26) as u32,
-                b'0'..=b'9' => (c - b'0' + 52) as u32,
-                b'+' => 62,
-                b'/' => 63,
-                _ => 0, // padding '=' contributes no bits
-            }
-        }
-        let bytes = s.as_bytes();
-        let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-        for chunk in bytes.chunks(4) {
-            let pad = chunk.iter().filter(|&&b| b == b'=').count();
-            let c0 = value_of(chunk[0]);
-            let c1 = value_of(*chunk.get(1).unwrap_or(&b'A'));
-            let c2 = value_of(*chunk.get(2).unwrap_or(&b'A'));
-            let c3 = value_of(*chunk.get(3).unwrap_or(&b'A'));
-            let packed = (c0 << 18) | (c1 << 12) | (c2 << 6) | c3;
-            let b0 = ((packed >> 16) & 0xff) as u8;
-            let b1 = ((packed >> 8) & 0xff) as u8;
-            let b2 = (packed & 0xff) as u8;
-            match pad {
-                0 => out.extend_from_slice(&[b0, b1, b2]),
-                1 => out.extend_from_slice(&[b0, b1]),
-                2 => out.push(b0),
-                _ => {}
-            }
-        }
-        out
-    }
-
-    // ── EmbeddingResponse serialisation ──────────────────────────────────────
-
-    #[test]
-    fn embedding_response_serialises_correctly() {
-        let resp = EmbeddingResponse {
-            object: "list".to_owned(),
-            data: vec![EmbeddingObject {
-                object: "embedding".to_owned(),
-                embedding: EmbeddingData::Float(vec![0.1, 0.2]),
-                index: 0,
-            }],
-            model: "bonsai-embeddings".to_owned(),
-            usage: EmbeddingUsage {
-                prompt_tokens: 3,
-                total_tokens: 3,
-            },
-            dimension: 2,
-            normalized: true,
-        };
-        let json = serde_json::to_string(&resp).expect("serialisation must succeed");
-        assert!(json.contains("\"object\":\"list\""));
-        assert!(json.contains("\"object\":\"embedding\""));
-        assert!(json.contains("\"index\":0"));
-        assert!(json.contains("\"dimension\":2"));
-        assert!(json.contains("\"normalized\":true"));
-    }
-
-    // ── RT-08 / SV-02 / sec-19: statelessness, batch cap, backend naming ────
-
-    use axum::body::Body;
-    use axum::http::Request;
-    use tower::ServiceExt;
-
-    /// POST `body` to `/v1/embeddings` on `app` and return (status, JSON).
-    async fn post(app: Router, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
-        let req = Request::post("/v1/embeddings")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&body).expect("body serialisation"),
-            ))
-            .expect("request build");
-        let resp = app.oneshot(req).await.expect("response");
-        let status = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .expect("body bytes");
-        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-        (status, json)
-    }
-
-    /// The core acceptance property: embedding the same text twice across two
-    /// *separate* requests on the *same* router returns a bit-identical
-    /// vector. Before the fix, a request with >= 2 texts silently fit TF-IDF
-    /// from its own input, so a second request's embedding of the same text
-    /// (now scored against a vocabulary the first request installed) could
-    /// differ in both value and dimension from the first.
-    #[tokio::test]
-    async fn embedding_same_text_twice_across_two_requests_is_bit_identical() {
-        let app = create_embeddings_router(32);
-
-        // First request: a multi-text batch that, under the old auto-fit
-        // behaviour, would have installed a TF-IDF vocabulary derived from
-        // *these specific texts* — poisoning every later request.
-        let (status1, _) = post(
-            app.clone(),
-            serde_json::json!({ "input": ["alpha document one", "beta document two"] }),
-        )
-        .await;
-        assert_eq!(status1, StatusCode::OK);
-
-        // Second, unrelated request embeds a fixed probe text.
-        let (status_a, json_a) =
-            post(app.clone(), serde_json::json!({ "input": "probe text" })).await;
-        assert_eq!(status_a, StatusCode::OK);
-
-        // A third request, with yet another multi-text batch that would
-        // previously have re-fit TF-IDF to a *different* vocabulary.
-        let (status2, _) = post(
-            app.clone(),
-            serde_json::json!({ "input": ["gamma document three", "delta document four", "epsilon"] }),
-        )
-        .await;
-        assert_eq!(status2, StatusCode::OK);
-
-        // Re-embedding the exact same probe text must be bit-identical.
-        let (status_b, json_b) = post(app, serde_json::json!({ "input": "probe text" })).await;
-        assert_eq!(status_b, StatusCode::OK);
-
-        assert_eq!(
-            json_a["data"][0]["embedding"], json_b["data"][0]["embedding"],
-            "the same text embedded a request apart must return a bit-identical vector"
-        );
-        assert_eq!(
-            json_a["data"][0]["embedding"]
-                .as_array()
-                .expect("array")
-                .len(),
-            json_b["data"][0]["embedding"]
-                .as_array()
-                .expect("array")
-                .len(),
-            "the embedding dimension must not drift across requests either"
-        );
-    }
-
-    /// Same property at the library level (no HTTP layer): two independently
-    /// constructed registries (simulating two separate process lifetimes)
-    /// must embed the same text identically, since neither one ever mutates
-    /// from request content.
-    #[test]
-    fn two_independent_registries_embed_the_same_text_identically() {
-        let a = EmbedderRegistry::new(24);
-        let b = EmbedderRegistry::new(24);
-        let out_a = a.embed_texts(&["consistent text".to_string()]);
-        let out_b = b.embed_texts(&["consistent text".to_string()]);
-        assert_eq!(out_a, out_b);
-    }
-
-    /// `fit_tfidf` remains available as an explicit, administrative
-    /// operation (existing callers, including the sibling
-    /// `tests/embeddings_tests.rs` integration suite, rely on this) — the fix
-    /// removes the *automatic* per-request call from the handler, not the
-    /// method itself.
-    #[test]
-    fn fit_tfidf_remains_an_explicit_public_operation() {
-        let registry = EmbedderRegistry::new(50);
-        assert_eq!(registry.backend_name(), "identity");
-        let corpus: Vec<String> = (0..5).map(|i| format!("doc {i} content")).collect();
-        registry.fit_tfidf(&corpus);
-        assert_eq!(registry.backend_name(), "tfidf");
-    }
-
-    /// A batch over the (default) cap is rejected with `400`, not silently
-    /// truncated or accepted at unbounded cost.
-    #[tokio::test]
-    async fn batch_over_the_default_cap_is_rejected_with_400() {
-        let app = create_embeddings_router(16);
-        let inputs: Vec<String> = (0..(DEFAULT_MAX_EMBEDDING_BATCH_SIZE + 1))
-            .map(|i| format!("text {i}"))
-            .collect();
-        let (status, _) = post(app, serde_json::json!({ "input": inputs })).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-    }
-
-    /// A batch at or under the cap is accepted.
-    #[tokio::test]
-    async fn batch_at_the_cap_is_accepted() {
-        let app = create_embeddings_router(16);
-        let inputs: Vec<String> = (0..4).map(|i| format!("text {i}")).collect();
-        let (status, json) = post(app, serde_json::json!({ "input": inputs })).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["data"].as_array().expect("data array").len(), 4);
-    }
-
-    /// `with_max_batch_size` is honoured by the handler (via
-    /// [`create_embeddings_router_with_model`], the only router constructor
-    /// that exposes registry construction to this test without a model
-    /// dependency — installing a trivial passthrough embedder here only to
-    /// reach the registry builder, and asserting the cap check fires before
-    /// any embedding happens).
-    #[tokio::test]
-    async fn configured_max_batch_size_is_enforced() {
-        struct TinyEmbedder;
-        impl Embedder for TinyEmbedder {
-            fn embed(&self, _text: &str) -> Result<Vec<f32>, oxibonsai_rag::error::RagError> {
-                Ok(vec![1.0])
-            }
-            fn embedding_dim(&self) -> usize {
-                1
-            }
-        }
-        let state = Arc::new(EmbeddingAppState {
-            registry: EmbedderRegistry::new(4)
-                .with_max_batch_size(2)
-                .with_model_embedder(Arc::new(TinyEmbedder)),
-        });
-        let app = Router::new()
-            .route("/v1/embeddings", axum::routing::post(create_embeddings))
-            .with_state(state);
-
-        let (status_ok, _) = post(app.clone(), serde_json::json!({ "input": ["a", "b"] })).await;
-        assert_eq!(status_ok, StatusCode::OK);
-
-        let (status_over, _) = post(app, serde_json::json!({ "input": ["a", "b", "c"] })).await;
-        assert_eq!(status_over, StatusCode::BAD_REQUEST);
-    }
-
-    /// `with_max_batch_size(0)` clamps to `1` rather than making the endpoint
-    /// refuse every request, including a single-input one.
-    #[test]
-    fn max_batch_size_zero_is_clamped_to_one() {
-        let registry = EmbedderRegistry::new(8).with_max_batch_size(0);
-        assert_eq!(registry.max_batch_size(), 1);
-    }
-
-    /// The response `model` field reports which backend answered, not the
-    /// client's arbitrary `model` request field.
-    #[tokio::test]
-    async fn response_model_field_reports_the_real_backend_not_the_client_value() {
-        let app = create_embeddings_router(16);
-        let (status, json) = post(
-            app,
-            serde_json::json!({ "input": "hello", "model": "text-embedding-3-large" }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            json["model"].as_str().expect("model field"),
-            "bonsai-embeddings-identity",
-            "the client's claimed model name must not be echoed back verbatim"
-        );
-    }
-
-    // ── Model-backed embedder seam ───────────────────────────────────────────
-
-    /// A trivial deterministic test double standing in for a future
-    /// `BonsaiModel`-backed embedder.
-    struct FixedVectorEmbedder {
-        dim: usize,
-    }
-
-    impl Embedder for FixedVectorEmbedder {
-        fn embed(&self, text: &str) -> Result<Vec<f32>, oxibonsai_rag::error::RagError> {
-            // Deterministic function of the text length, just distinctive
-            // enough to tell apart from Identity/TF-IDF output in a test.
-            let mut v = vec![0.0f32; self.dim];
-            v[0] = text.len() as f32;
-            l2_normalize(&mut v);
-            Ok(v)
-        }
-
-        fn embedding_dim(&self) -> usize {
-            self.dim
-        }
-    }
-
-    #[test]
-    fn model_embedder_takes_priority_over_identity_and_tfidf() {
-        let registry =
-            EmbedderRegistry::new(8).with_model_embedder(Arc::new(FixedVectorEmbedder { dim: 4 }));
-        // Even after fitting TF-IDF, the model backend must still win.
-        registry.fit_tfidf(&["a document".to_string(), "another document".to_string()]);
-        assert_eq!(registry.backend_name(), "model");
-        assert_eq!(registry.embedding_dim(), 4);
-        let out = registry.embed_texts(&["four".to_string()]);
-        assert_eq!(out[0].len(), 4);
-        assert!(
-            out[0][0] > 0.0,
-            "expected the model embedder's distinctive first component"
-        );
-    }
-
-    #[tokio::test]
-    async fn router_with_model_embedder_serves_the_model_backend() {
-        let app = create_embeddings_router_with_model(8, Arc::new(FixedVectorEmbedder { dim: 4 }));
-        let (status, json) = post(app, serde_json::json!({ "input": "hi" })).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            json["model"].as_str().expect("model field"),
-            "bonsai-embeddings-model"
-        );
-        assert_eq!(
-            json["data"][0]["embedding"]
-                .as_array()
-                .expect("embedding array")
-                .len(),
-            4
-        );
-    }
-
-    // ── D-1 / SV-02: create_embeddings_router_requiring_model ────────────────
-
-    #[tokio::test]
-    async fn router_requiring_model_refuses_with_501_when_none_is_installed() {
-        let app = create_embeddings_router_requiring_model(8);
-        let (status, json) = post(app, serde_json::json!({ "input": "hi" })).await;
-        assert_eq!(
-            status,
-            StatusCode::NOT_IMPLEMENTED,
-            "no model-backed embedder is installed, so this must refuse honestly rather than \
-             answer with a byte-hash vector"
-        );
-        assert!(
-            json["error"]["message"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("model-backed"),
-            "the error must explain why, not just carry a bare status: {json}"
-        );
-    }
-
-    #[tokio::test]
-    async fn router_requiring_model_is_independent_of_the_default_router() {
-        // The default `create_embeddings_router` (used elsewhere in this
-        // test suite, and by library embedders) must keep answering 200
-        // with the stateless fallback -- this constructor is additive, not
-        // a change to that one's documented behavior.
-        let default_app = create_embeddings_router(8);
-        let (status, _) = post(default_app, serde_json::json!({ "input": "hi" })).await;
-        assert_eq!(status, StatusCode::OK);
-    }
-
-    // ── Dimension truncation renormalises (SV-02 correction (a)) ─────────────
-
-    #[tokio::test]
-    async fn dimensions_truncation_returns_a_unit_vector() {
-        let app = create_embeddings_router(32);
-        let (status, json) = post(
-            app,
-            serde_json::json!({ "input": "renormalisation test", "dimensions": 5 }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        let vec: Vec<f32> = json["data"][0]["embedding"]
-            .as_array()
-            .expect("embedding array")
-            .iter()
-            .map(|v| v.as_f64().expect("f64") as f32)
-            .collect();
-        assert_eq!(vec.len(), 5);
-        let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!(
-            (norm - 1.0).abs() < 1e-4,
-            "truncated embedding must be re-normalised to unit length, got norm {norm}"
-        );
-    }
-
-    /// When `dimensions` is >= the natural size, the vector is returned
-    /// unmodified (still unit-length, since every backend already normalises).
-    #[tokio::test]
-    async fn dimensions_at_or_above_natural_size_is_a_no_op() {
-        let app = create_embeddings_router(8);
-        let (status, json) = post(
-            app,
-            serde_json::json!({ "input": "no truncation needed", "dimensions": 999 }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            json["data"][0]["embedding"]
-                .as_array()
-                .expect("embedding array")
-                .len(),
-            8
-        );
-    }
-
-    /// `dimensions: 0` is rejected rather than silently truncating every
-    /// embedding to an empty vector and returning `200`.
-    #[tokio::test]
-    async fn dimensions_zero_is_rejected_with_400() {
-        let app = create_embeddings_router(16);
-        let (status, json) = post(
-            app,
-            serde_json::json!({ "input": "hello", "dimensions": 0 }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["error"]["param"], "dimensions");
-    }
-
-    // ── dimension / normalized response fields (RT-08 fix item 1) ───────────
-
-    #[tokio::test]
-    async fn response_reports_the_natural_dimension() {
-        let app = create_embeddings_router(16);
-        let (status, json) = post(app, serde_json::json!({ "input": "hello world" })).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["dimension"].as_u64(), Some(16));
-    }
-
-    #[tokio::test]
-    async fn response_dimension_field_reflects_truncation() {
-        let app = create_embeddings_router(32);
-        let (status, json) = post(
-            app,
-            serde_json::json!({ "input": "hello world", "dimensions": 5 }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["dimension"].as_u64(), Some(5));
-    }
-
-    #[tokio::test]
-    async fn response_normalized_field_is_true_for_a_genuine_embedding() {
-        let app = create_embeddings_router(16);
-        let (status, json) = post(app, serde_json::json!({ "input": "hello world" })).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["normalized"].as_bool(), Some(true));
-    }
-
-    /// A fully out-of-vocabulary TF-IDF query (default, non-strict mode)
-    /// falls back to an all-zero vector — the response must report
-    /// `normalized: false` for it rather than unconditionally claiming
-    /// `true` regardless of what actually happened (the exact defect class
-    /// this fix's `dimension`/`normalized` fields exist to avoid
-    /// reintroducing).
-    #[tokio::test]
-    async fn response_normalized_field_is_false_when_an_item_falls_back_to_zero_vector() {
-        let registry = EmbedderRegistry::new(16);
-        registry.fit_tfidf(&["alpha document".to_string(), "beta document".to_string()]);
-        let state = Arc::new(EmbeddingAppState { registry });
-        let app = Router::new()
-            .route("/v1/embeddings", axum::routing::post(create_embeddings))
-            .with_state(state);
-
-        let (status, json) = post(app, serde_json::json!({ "input": "zzz" })).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            json["normalized"].as_bool(),
-            Some(false),
-            "an all-zero fallback vector must be reported as not normalised, got {json}"
-        );
-    }
-
-    /// RT-EMBEDDINGS BLOCKING 2 / SV-02 follow-up: `normalized` must reflect
-    /// the vector actually shipped, not the pre-truncation one. Reproduced
-    /// with the real TF-IDF backend: fit on 12 documents that each pair a
-    /// unique `termN` with the word every document shares (`shared`), so
-    /// `shared` has the highest document frequency and sorts into vocabulary
-    /// column 0, while every `termN` ties at document frequency 1 and is
-    /// broken alphabetically -- putting `term5` at column 8, past a
-    /// `dimensions: 2` truncation.
-    ///
-    /// Self-validating: the *untruncated* embedding is asserted non-zero
-    /// first, proving `term5` really does embed to a genuine, non-degenerate
-    /// vector, so the truncated all-zero result below is known to come from
-    /// truncation discarding the signal rather than a broken fixture. Before
-    /// the fix, `any_zero_vector` was computed on this same non-zero
-    /// pre-truncation vector, so the truncated response below reported
-    /// `normalized: true` for a shipped `[0.0, 0.0]`.
-    #[tokio::test]
-    async fn response_normalized_field_is_false_when_truncation_zeroes_every_component() {
-        let corpus: Vec<String> = (0..12).map(|i| format!("term{i} shared")).collect();
-        let registry = EmbedderRegistry::new(64);
-        registry.fit_tfidf(&corpus);
-        let state = Arc::new(EmbeddingAppState { registry });
-        let app = Router::new()
-            .route("/v1/embeddings", axum::routing::post(create_embeddings))
-            .with_state(state);
-
-        // No truncation: `term5` must embed to a genuine (non-degenerate)
-        // unit vector -- the fixture's precondition.
-        let (status, json) = post(app.clone(), serde_json::json!({ "input": "term5" })).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["normalized"].as_bool(), Some(true));
-        let full = json["data"][0]["embedding"]
-            .as_array()
-            .expect("float embedding array")
-            .clone();
-        assert!(
-            full.iter().any(|v| v.as_f64().unwrap_or(0.0) != 0.0),
-            "fixture precondition: term5's untruncated embedding must have a \
-             non-zero component, got {full:?}"
-        );
-
-        // Truncated to the first 2 columns: term5's only non-zero column
-        // (8, "shared" occupies 0) is discarded, so the shipped vector is
-        // exactly [0.0, 0.0].
-        let (status, json) = post(
-            app,
-            serde_json::json!({ "input": "term5", "dimensions": 2 }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["dimension"].as_u64(), Some(2));
-        let truncated = json["data"][0]["embedding"]
-            .as_array()
-            .expect("float embedding array");
-        assert!(
-            truncated.iter().all(|v| v.as_f64() == Some(0.0)),
-            "fixture precondition: truncating to 2 columns must zero every \
-             component, got {truncated:?}"
-        );
-        assert_eq!(
-            json["normalized"].as_bool(),
-            Some(false),
-            "a vector that truncated to all-zero must not be reported as \
-             normalized, got {json}"
-        );
-    }
-
-    /// Sibling of the above: a truncation that *keeps* the surviving signal
-    /// must still report `normalized: true` -- the fix moves the check to
-    /// run after truncation, it does not make the field unconditionally
-    /// `false` whenever `dimensions` is set. `shared` is the
-    /// highest-document-frequency term in the same fixture and therefore
-    /// sorts into vocabulary column 0, so a `dimensions: 2` truncation keeps
-    /// it.
-    #[tokio::test]
-    async fn response_normalized_field_is_true_when_truncation_keeps_a_unit_vector() {
-        let corpus: Vec<String> = (0..12).map(|i| format!("term{i} shared")).collect();
-        let registry = EmbedderRegistry::new(64);
-        registry.fit_tfidf(&corpus);
-        let state = Arc::new(EmbeddingAppState { registry });
-        let app = Router::new()
-            .route("/v1/embeddings", axum::routing::post(create_embeddings))
-            .with_state(state);
-
-        let (status, json) = post(
-            app,
-            serde_json::json!({ "input": "shared", "dimensions": 2 }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["dimension"].as_u64(), Some(2));
-        let embedding = json["data"][0]["embedding"]
-            .as_array()
-            .expect("float embedding array");
-        let norm_sq: f64 = embedding
-            .iter()
-            .map(|v| v.as_f64().unwrap_or(0.0).powi(2))
-            .sum();
-        assert!(
-            (norm_sq - 1.0).abs() < 1e-4,
-            "fixture precondition: the truncated vector must still be a \
-             (re-normalised) unit vector, got {json}"
-        );
-        assert_eq!(
-            json["normalized"].as_bool(),
-            Some(true),
-            "a truncation that keeps a genuine unit vector must still report \
-             normalized: true, got {json}"
-        );
-    }
-
-    // ── encoding_format validation (SV-02) ───────────────────────────────────
-
-    #[tokio::test]
-    async fn unknown_encoding_format_is_rejected_with_400() {
-        let app = create_embeddings_router(16);
-        let (status, json) = post(
-            app,
-            serde_json::json!({ "input": "hello", "encoding_format": "binary" }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["error"]["param"], "encoding_format");
-    }
-
-    #[tokio::test]
-    async fn encoding_format_float_is_accepted_explicitly() {
-        let app = create_embeddings_router(16);
-        let (status, json) = post(
-            app,
-            serde_json::json!({ "input": "hello", "encoding_format": "float" }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(json["data"][0]["embedding"].is_array());
-    }
-
-    // ── Per-item input length cap (sec-19) ───────────────────────────────────
-
-    #[tokio::test]
-    async fn input_over_the_max_input_len_is_rejected_with_400() {
-        let app = create_embeddings_router(16);
-        let long_text = "a".repeat(DEFAULT_MAX_EMBEDDING_INPUT_CHARS + 1);
-        let (status, json) = post(app, serde_json::json!({ "input": long_text })).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["error"]["param"], "input");
-    }
-
-    #[tokio::test]
-    async fn input_at_the_max_input_len_is_accepted() {
-        let app = create_embeddings_router(16);
-        let text = "a".repeat(DEFAULT_MAX_EMBEDDING_INPUT_CHARS);
-        let (status, _json) = post(app, serde_json::json!({ "input": text })).await;
-        assert_eq!(status, StatusCode::OK);
-    }
-
-    /// Only the offending item's index is named for a multi-input batch, so
-    /// a caller can locate which entry needs shortening.
-    #[tokio::test]
-    async fn per_item_cap_names_the_offending_batch_index() {
-        let app = create_embeddings_router(16);
-        let long_text = "a".repeat(DEFAULT_MAX_EMBEDDING_INPUT_CHARS + 1);
-        let (status, json) = post(app, serde_json::json!({ "input": ["short", long_text] })).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        let message = json["error"]["message"].as_str().expect("message");
-        assert!(
-            message.contains("input[1]"),
-            "expected the message to name the offending index (1), got {message:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn configured_max_input_len_is_enforced() {
-        let state = Arc::new(EmbeddingAppState {
-            registry: EmbedderRegistry::new(4).with_max_input_len(5),
-        });
-        let app = Router::new()
-            .route("/v1/embeddings", axum::routing::post(create_embeddings))
-            .with_state(state);
-
-        let (status_ok, _) = post(app.clone(), serde_json::json!({ "input": "hello" })).await;
-        assert_eq!(status_ok, StatusCode::OK);
-
-        let (status_over, json) = post(app, serde_json::json!({ "input": "hello world" })).await;
-        assert_eq!(status_over, StatusCode::BAD_REQUEST);
-        assert_eq!(json["error"]["param"], "input");
-    }
-
-    #[test]
-    fn max_input_len_zero_is_clamped_to_one() {
-        let registry = EmbedderRegistry::new(8).with_max_input_len(0);
-        assert_eq!(registry.max_input_len(), 1);
-    }
-
-    // ── require_model_backend gate (RT-08 / SV-02 correction (b)) ────────────
-
-    #[tokio::test]
-    async fn require_model_backend_returns_501_when_no_model_installed() {
-        let state = Arc::new(EmbeddingAppState {
-            registry: EmbedderRegistry::new(16).with_require_model_backend(true),
-        });
-        let app = Router::new()
-            .route("/v1/embeddings", axum::routing::post(create_embeddings))
-            .with_state(state);
-
-        let (status, _json) = post(app, serde_json::json!({ "input": "hello" })).await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-    }
-
-    #[tokio::test]
-    async fn require_model_backend_still_serves_200_when_a_model_is_installed() {
-        let state = Arc::new(EmbeddingAppState {
-            registry: EmbedderRegistry::new(16)
-                .with_require_model_backend(true)
-                .with_model_embedder(Arc::new(FixedVectorEmbedder { dim: 4 })),
-        });
-        let app = Router::new()
-            .route("/v1/embeddings", axum::routing::post(create_embeddings))
-            .with_state(state);
-
-        let (status, json) = post(app, serde_json::json!({ "input": "hello" })).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["model"].as_str(), Some("bonsai-embeddings-model"));
-    }
-
-    #[test]
-    fn model_backend_required_but_missing_reflects_the_gate() {
-        let no_gate = EmbedderRegistry::new(8);
-        assert!(!no_gate.model_backend_required_but_missing());
-
-        let gated_no_model = EmbedderRegistry::new(8).with_require_model_backend(true);
-        assert!(gated_no_model.model_backend_required_but_missing());
-
-        let gated_with_model = EmbedderRegistry::new(8)
-            .with_require_model_backend(true)
-            .with_model_embedder(Arc::new(FixedVectorEmbedder { dim: 4 }));
-        assert!(!gated_with_model.model_backend_required_but_missing());
-    }
-
-    /// The default router (the one `server.rs` actually calls, and the one
-    /// the sibling `tests/embeddings_tests.rs` integration suite exercises
-    /// directly) is unaffected by the gate: `with_require_model_backend`
-    /// defaults to `false`, so it keeps serving the stateless fallback at
-    /// `200` — see the module docs' "Backends and determinism" section for
-    /// why the live `server.rs` call site does not opt into the gate today.
-    #[tokio::test]
-    async fn default_router_is_unaffected_by_the_require_model_backend_gate() {
-        let app = create_embeddings_router(16);
-        let (status, _json) = post(app, serde_json::json!({ "input": "hello" })).await;
-        assert_eq!(status, StatusCode::OK);
-    }
-}
+#[path = "embeddings_tests.rs"]
+mod tests;

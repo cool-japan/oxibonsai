@@ -268,33 +268,34 @@ fn parse_synthetic_gguf(gguf_bytes: &[u8]) -> GgufFile<'_> {
     GgufFile::parse(gguf_bytes).expect("GgufFile::parse synthetic")
 }
 
-/// Serialise the GPU-touching tests in this binary.
+/// Give this test its own Metal session (`MET-08`).
 ///
-/// Every test here drives a `BonsaiModel` through the fused Metal path, which
-/// goes via the **process-global** `GLOBAL_METAL_GRAPH` singleton: one device,
-/// one command queue, one pooled buffer set and one GPU KV cache for the whole
-/// process. `cargo test` runs the tests of one integration binary on parallel
-/// threads by default, so two of them interleave on that single shared graph
-/// and one prefill observes another's KV state — measured here as a 3-in-8
-/// failure rate for `test_batched_ternary_prefill_chunked` (`logit[0]`
+/// Every test here drives a `BonsaiModel` through the fused Metal path. That
+/// path used to go via a **process-global** `MetalGraph` singleton — one
+/// device, one command queue, one pooled buffer set and one GPU KV cache for
+/// the whole process — and `cargo test` runs the tests of one integration
+/// binary on parallel threads, so two of them interleaved on that single
+/// shared graph and one prefill observed another's KV state. It measured as a
+/// 3-in-8 failure rate for `test_batched_ternary_prefill_chunked` (`logit[0]`
 /// single-shot vs chunked diverging by ~8e-2, well above the 1e-3 tolerance),
-/// against 0-in-8 with `--test-threads=1`.
+/// against 0-in-8 with `--test-threads=1`, and it was held off with a
+/// file-local `gpu_serial()` mutex that ran every GPU test one at a time.
 ///
-/// That singleton is a real product limitation (GPU concurrency = 1), tracked
-/// separately as METAL-CONCURRENCY and **not** fixed here; it is not what
-/// these tests exist to check. Holding this lock removes the interference so
-/// each test measures prefill parity on an uncontended graph. Nothing about
-/// the assertions changes. Delete this helper once the graph stops being a
-/// process-global singleton.
+/// `MET-08` removed the singleton: the device, its pipelines and its weight
+/// cache are shared, but the KV cache and every scratch buffer now belong to a
+/// **session**. One line per test — this guard — gives each test its own, and
+/// the suite passes with full parallelism and **no serialisation at all**.
+/// That is the acceptance evidence for `MET-08`; if these tests ever need a
+/// lock again, the session split has regressed.
 ///
-/// A poisoned lock is recovered with `into_inner()` rather than propagated:
-/// one test panicking must not turn every sibling into a second, misleading
-/// failure.
-fn gpu_serial() -> std::sync::MutexGuard<'static, ()> {
-    static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    GPU_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+/// The guard is inert on a host without a Metal device, where every test
+/// below early-returns anyway.
+///
+/// (The concrete guard type is `metal_graph::SessionScope`; it is returned
+/// opaquely here only because the crate root does not re-export it yet — see
+/// this package's deviations.)
+fn gpu_session() -> impl Sized {
+    oxibonsai_kernels::MetalGraph::bind_new_session()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -309,7 +310,7 @@ fn gpu_serial() -> std::sync::MutexGuard<'static, ()> {
 /// returns only the final token's logits.
 #[test]
 fn test_batched_ternary_prefill_matches_per_position() {
-    let _gpu = gpu_serial();
+    let _gpu = gpu_session();
     let path = write_temp_gguf("parity_8");
     let gguf_bytes = std::fs::read(&path).expect("read synthetic GGUF");
     let _ = std::fs::remove_file(&path);
@@ -372,7 +373,7 @@ fn test_batched_ternary_prefill_matches_per_position() {
 /// path — even where the relative logit gap is small.
 #[test]
 fn test_batched_ternary_prefill_verify_greedy_match() {
-    let _gpu = gpu_serial();
+    let _gpu = gpu_session();
     let path = write_temp_gguf("verify_8");
     let gguf_bytes = std::fs::read(&path).expect("read synthetic GGUF");
     let _ = std::fs::remove_file(&path);
@@ -423,7 +424,7 @@ fn test_batched_ternary_prefill_verify_greedy_match() {
 /// test guarantees the new TQ2 GEMM does not inherit that bug.
 #[test]
 fn test_batched_ternary_prefill_matches_per_position_batch12() {
-    let _gpu = gpu_serial();
+    let _gpu = gpu_session();
     let path = write_temp_gguf("parity_12");
     let gguf_bytes = std::fs::read(&path).expect("read synthetic GGUF");
     let _ = std::fs::remove_file(&path);
@@ -474,7 +475,7 @@ fn test_batched_ternary_prefill_matches_per_position_batch12() {
 /// chunk; here we drive it manually so we can compare logits.)
 #[test]
 fn test_batched_ternary_prefill_chunked() {
-    let _gpu = gpu_serial();
+    let _gpu = gpu_session();
     let path = write_temp_gguf("chunked_8");
     let gguf_bytes = std::fs::read(&path).expect("read synthetic GGUF");
     let _ = std::fs::remove_file(&path);
@@ -545,7 +546,7 @@ const GUARD_MAX_SEQ: usize = 8;
 
 #[test]
 fn test_ternary_prefill_context_guard_returns_err() {
-    let _gpu = gpu_serial();
+    let _gpu = gpu_session();
     let gguf_bytes = build_synthetic_ternary_gguf();
     let gguf = parse_synthetic_gguf(&gguf_bytes);
     let model = BonsaiModel::from_gguf(&gguf, GUARD_MAX_SEQ).expect("BonsaiModel::from_gguf");
@@ -562,7 +563,7 @@ fn test_ternary_prefill_context_guard_returns_err() {
 
 #[test]
 fn test_ternary_prefill_verify_context_guard_returns_err() {
-    let _gpu = gpu_serial();
+    let _gpu = gpu_session();
     let gguf_bytes = build_synthetic_ternary_gguf();
     let gguf = parse_synthetic_gguf(&gguf_bytes);
     let model = BonsaiModel::from_gguf(&gguf, GUARD_MAX_SEQ).expect("BonsaiModel::from_gguf");
@@ -578,7 +579,7 @@ fn test_ternary_prefill_verify_context_guard_returns_err() {
 
 #[test]
 fn test_ternary_greedy_gpu_context_guard_returns_err() {
-    let _gpu = gpu_serial();
+    let _gpu = gpu_session();
     let gguf_bytes = build_synthetic_ternary_gguf();
     let gguf = parse_synthetic_gguf(&gguf_bytes);
     let model = BonsaiModel::from_gguf(&gguf, GUARD_MAX_SEQ).expect("BonsaiModel::from_gguf");
@@ -597,7 +598,7 @@ fn test_ternary_greedy_gpu_context_guard_returns_err() {
 /// fail later for GPU-availability reasons, which is a *different* error class).
 #[test]
 fn test_ternary_greedy_gpu_last_valid_pos_not_guarded() {
-    let _gpu = gpu_serial();
+    let _gpu = gpu_session();
     let gguf_bytes = build_synthetic_ternary_gguf();
     let gguf = parse_synthetic_gguf(&gguf_bytes);
     let model = BonsaiModel::from_gguf(&gguf, GUARD_MAX_SEQ).expect("BonsaiModel::from_gguf");

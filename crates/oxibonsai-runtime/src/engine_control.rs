@@ -102,13 +102,18 @@ impl CancellationToken {
 /// `RT-28` therefore requires a reset seam in the runtime *before* the state
 /// itself exists.
 ///
-/// `B2-10` supplies the concrete `RecurrentCache`; it only has to
-/// `impl RecurrentState for RecurrentCache` and hand the engine one via
-/// [`InferenceEngine::set_recurrent_state`](crate::engine::InferenceEngine::set_recurrent_state).
-/// Everything else — [`InferenceEngine::reset`](crate::engine::InferenceEngine::reset)
+/// `B2-10` supplies the concrete
+/// [`RecurrentCache`](oxibonsai_model::hybrid::RecurrentCache); the impl for it
+/// lives **here**, just below this trait, and not in `oxibonsai-model`:
+/// `RecurrentState` is defined in this crate and `RecurrentCache` in the crate
+/// this one depends on, so the orphan rule leaves the runtime as the only
+/// legal home for it (wave-3.5 triage item 3 — the earlier "zero runtime
+/// edits" note on this trait was mistaken). A caller hands the engine one via
+/// [`InferenceEngine::set_recurrent_state`](crate::engine::InferenceEngine::set_recurrent_state);
+/// everything else — [`InferenceEngine::reset`](crate::engine::InferenceEngine::reset)
 /// calling [`InferenceEngine::reset_recurrent`](crate::engine::InferenceEngine::reset_recurrent),
 /// which the server's per-request reset (`RT-03`) already goes through — is
-/// wired here, so no follow-up edit to the runtime is needed.
+/// wired here.
 ///
 /// `Send` is required because engine replicas are moved between threads by
 /// the pool (`spawn_blocking`).
@@ -129,6 +134,34 @@ pub trait RecurrentState: Send {
     /// Short human-readable name for logs (e.g. `"gated-delta-net"`).
     fn recurrent_name(&self) -> &str {
         "recurrent-state"
+    }
+}
+
+/// The hybrid model's own recurrent state is a [`RecurrentState`].
+///
+/// `B2-10`/`RT-28`: `RecurrentCache` holds the Gated-DeltaNet conv windows and
+/// `S` matrices — ~157 MB for Bonsai 2's 48 linear-attention layers — and,
+/// unlike a KV cache, none of it is masked by position: a stale `S` silently
+/// contaminates the next request instead of being overwritten. Wiring it to
+/// this trait is what makes the engine's existing per-request reset seam
+/// (`RT-03`) clear it.
+///
+/// The impl lives in this crate because of the orphan rule: the trait is
+/// local here and the type is not.
+impl RecurrentState for oxibonsai_model::hybrid::RecurrentCache {
+    fn reset_recurrent(&mut self) {
+        // `RecurrentCache::reset` zeroes every conv window and `S` slab, and a
+        // zeroed state *is* the start-of-sequence state, so this is idempotent
+        // exactly as the trait requires.
+        self.reset();
+    }
+
+    fn recurrent_memory_bytes(&self) -> usize {
+        self.memory_bytes()
+    }
+
+    fn recurrent_name(&self) -> &str {
+        "gated-delta-net"
     }
 }
 
@@ -725,6 +758,20 @@ mod tests {
         resets: usize,
         dirty: bool,
     }
+
+    /// `B2-10`/`RT-28`: the concrete `RecurrentCache` implements this crate's
+    /// `RecurrentState`, and the impl lives *here* rather than in
+    /// `oxibonsai-model` because the orphan rule leaves no other home for it.
+    ///
+    /// Compile-time, because building a `HybridConfig` needs GGUF metadata (or
+    /// `oxibonsai-model`'s `pub(crate)` test fixture, which this crate cannot
+    /// reach); the behavioural half — `reset()` zeroing every slab,
+    /// `memory_bytes()` — is covered by `recurrent_cache.rs`'s own tests, and
+    /// the three methods below are one-line delegations to exactly those.
+    const _: fn() = || {
+        fn assert_recurrent_state<T: RecurrentState>() {}
+        assert_recurrent_state::<oxibonsai_model::hybrid::RecurrentCache>();
+    };
 
     impl RecurrentState for FakeRecurrent {
         fn reset_recurrent(&mut self) {

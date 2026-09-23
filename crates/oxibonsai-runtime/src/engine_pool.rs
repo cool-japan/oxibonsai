@@ -17,11 +17,18 @@
 //! - On CPU tiers (Reference / AVX / NEON), `BonsaiModel::forward` mutates only
 //!   `self.kv_cache` over a shared `&dyn OneBitKernel` on immutable weights, so
 //!   distinct engine instances run fully parallel.
-//! - On the GPU tier (Metal / CUDA), decode funnels through a process-global
-//!   singleton graph owning one KV cache and shared scratch. `N > 1` GPU
-//!   replicas give *no* compute parallelism and would corrupt each other's KV,
-//!   so the pool size is clamped to `1` on the GPU tier (see
-//!   [`resolve_pool_size`]).
+//! - On the Metal tier, each replica now owns a `MetalGraph` **session**
+//!   (`MET-08`): its own command queue and its own device KV cache, prefill
+//!   and full-layer buffers, over a process-shared device that still holds one
+//!   copy of the weights. The lease binds its replica's session for as long as
+//!   the replica is in use, so two replicas submit concurrently instead of
+//!   serialising on one another's `MutexGuard`s. The pool size is therefore
+//!   `min(requested, MetalGraph::max_sessions())` — a *memory* bound (604 MB
+//!   of device KV per session for the 8B at `ctx = 4096`), not a correctness
+//!   one.
+//! - On the CUDA tier the process-global `CudaGraph` singleton is unchanged,
+//!   so `N > 1` replicas would still corrupt each other's KV: the clamp to `1`
+//!   stays there (see [`resolve_pool_sizing`]).
 //!
 //! ## Back-compatibility
 //!
@@ -43,6 +50,119 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::engine::InferenceEngine;
+
+/// Per-replica GPU session binding (`MET-08`).
+///
+/// On the Metal tier a replica owns a `MetalGraph` session — its own command
+/// queue and its own device KV cache / prefill / full-layer buffers — and the
+/// lease binds it to whichever thread is running that replica, so every
+/// `MetalGraph::global()` call made deep inside the model and kernel stack
+/// resolves to *this replica's* session.
+///
+/// Off the Metal tier (CPU tiers, CUDA, non-macOS, `metal` feature off) the
+/// type is an empty placeholder whose `bind`/`release` compile away, and
+/// `MetalGraph::global()` keeps returning the process-default session exactly
+/// as it did before the split.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[derive(Clone, Default)]
+struct GpuSession(Option<Arc<oxibonsai_kernels::MetalGraph>>);
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+impl GpuSession {
+    /// Create a session for a replica running on `tier`.
+    ///
+    /// Only the GPU tier gets one, and that is sufficient rather than merely
+    /// cheap: every Metal path a replica can take is itself tier-gated —
+    /// `InferenceEngine::uses_fused_gpu_decode` ANDs `fused_gpu_decode` with
+    /// `kernel_is_gpu_tier`, and the per-layer/GEMV Metal entry points are
+    /// only reached through GPU weight handles a non-GPU tier never uploads.
+    /// A CPU-tier replica therefore issues no GPU work to share, while
+    /// creating a session for it would open the Metal device and compile the
+    /// MSL library for a pool that never dispatches.
+    ///
+    /// Failure to create one is not fatal — the replica falls back to the
+    /// process-default session, i.e. the pre-`MET-08` behaviour.
+    fn for_tier(tier: oxibonsai_kernels::KernelTier) -> Self {
+        if tier != oxibonsai_kernels::KernelTier::Gpu {
+            return Self(None);
+        }
+        match oxibonsai_kernels::MetalGraph::new_session() {
+            Ok(session) => Self(Some(session)),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "could not create a per-replica Metal session; using the shared one"
+                );
+                Self(None)
+            }
+        }
+    }
+
+    /// Bind this replica's session to the calling thread.
+    ///
+    /// Called from `Deref`/`DerefMut`, i.e. immediately before every use of
+    /// the engine, so the binding lands on the thread that actually runs the
+    /// generation even when the lease was created on another one (the server
+    /// acquires on a tokio worker and then runs inside `spawn_blocking`).
+    /// Re-binding the already-bound session costs one `u64` compare.
+    fn bind(&self) {
+        if let Some(session) = &self.0 {
+            oxibonsai_kernels::MetalGraph::bind_current(session);
+        }
+    }
+
+    /// Release this replica's binding, if this thread still holds it.
+    fn release(&self) {
+        if let Some(session) = &self.0 {
+            oxibonsai_kernels::MetalGraph::unbind_current_if(session.session_id());
+        }
+    }
+
+    /// This replica's session id, for diagnostics and tests.
+    fn id(&self) -> Option<u64> {
+        self.0.as_ref().map(|s| s.session_id())
+    }
+}
+
+/// Placeholder [`GpuSession`] for builds without the Metal backend.
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+#[derive(Clone, Default)]
+struct GpuSession;
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+impl GpuSession {
+    /// No GPU session exists off the Metal tier.
+    fn for_tier(_tier: oxibonsai_kernels::KernelTier) -> Self {
+        Self
+    }
+
+    /// No-op: nothing to bind.
+    fn bind(&self) {}
+
+    /// No-op: nothing to release.
+    fn release(&self) {}
+
+    /// No session, no id.
+    fn id(&self) -> Option<u64> {
+        None
+    }
+}
+
+/// One pool slot: an engine replica plus the GPU session it dispatches in.
+struct Replica {
+    /// The replica itself.
+    engine: InferenceEngine<'static>,
+    /// Its GPU session (`MET-08`); empty off the Metal tier.
+    session: GpuSession,
+}
+
+impl Replica {
+    /// Wrap an engine, giving it a session sized for its own kernel tier.
+    fn new(engine: InferenceEngine<'static>) -> Self {
+        let session = GpuSession::for_tier(engine.kernel_tier());
+        Self { engine, session }
+    }
+}
 
 /// Errors that can occur while acquiring an engine from the pool.
 ///
@@ -74,7 +194,7 @@ pub struct EnginePool {
     /// Idle (available) engines. Guarded by a *synchronous* mutex held only for
     /// `pop`/`push`. The number of engines ever simultaneously checked out plus
     /// the length of this vector always equals [`EnginePool::size`].
-    idle: Mutex<Vec<InferenceEngine<'static>>>,
+    idle: Mutex<Vec<Replica>>,
     /// Async gate: exactly `size` permits. A permit is held for the lifetime of
     /// each outstanding [`EngineLease`] and released only after the engine has
     /// been returned to `idle`.
@@ -92,8 +212,11 @@ impl EnginePool {
     /// engine). The semaphore is seeded with `size` permits.
     pub fn new(engines: Vec<InferenceEngine<'static>>) -> Arc<Self> {
         let size = engines.len().max(1);
+        // `MET-08`: each replica gets its own Metal session on the GPU tier, so
+        // the KV cache and scratch it locks across `commit()` are its own.
+        let replicas: Vec<Replica> = engines.into_iter().map(Replica::new).collect();
         Arc::new(Self {
-            idle: Mutex::new(engines),
+            idle: Mutex::new(replicas),
             sem: Arc::new(Semaphore::new(size)),
             size,
         })
@@ -159,8 +282,8 @@ impl EnginePool {
         metrics: &Arc<crate::metrics::InferenceMetrics>,
     ) -> Result<(), PoolError> {
         let mut idle = self.idle.lock().map_err(|_| PoolError::Poisoned)?;
-        for engine in idle.iter_mut() {
-            engine.set_metrics(Arc::clone(metrics));
+        for replica in idle.iter_mut() {
+            replica.engine.set_metrics(Arc::clone(metrics));
         }
         Ok(())
     }
@@ -178,14 +301,15 @@ impl EnginePool {
             .await
             .map_err(|_| PoolError::Closed)?;
 
-        // Pop an idle engine. The lock is held only for this `pop`.
-        let engine = {
+        // Pop an idle replica. The lock is held only for this `pop`.
+        let replica = {
             let mut idle = self.idle.lock().map_err(|_| PoolError::Poisoned)?;
             idle.pop().ok_or(PoolError::Empty)?
         };
 
         Ok(EngineLease {
-            engine: ManuallyDrop::new(engine),
+            engine: ManuallyDrop::new(replica.engine),
+            session: replica.session,
             pool: Arc::clone(self),
             _permit: permit,
         })
@@ -215,6 +339,9 @@ impl std::fmt::Debug for EnginePool {
 /// guard is panic-free.
 pub struct EngineLease {
     engine: ManuallyDrop<InferenceEngine<'static>>,
+    /// The replica's GPU session (`MET-08`), bound to the calling thread on
+    /// every `Deref`/`DerefMut` and released in `Drop`.
+    session: GpuSession,
     pool: Arc<EnginePool>,
     // Field order matters: `_permit` is declared last so it is dropped *after*
     // the explicit `Drop::drop` body below has returned the engine to `idle`.
@@ -224,10 +351,32 @@ pub struct EngineLease {
     _permit: OwnedSemaphorePermit,
 }
 
+impl EngineLease {
+    /// The id of the Metal session this replica dispatches in (`MET-08`).
+    ///
+    /// `None` off the Metal tier, where there is no per-replica session and
+    /// GPU work (if any) goes to the process-default one. Two leases held at
+    /// the same time from a pool sized `> 1` on the GPU tier always report
+    /// *different* ids — that is what makes their submissions overlap instead
+    /// of serialising on a shared KV cache — and the id is stable across
+    /// leases of the same replica.
+    pub fn gpu_session_id(&self) -> Option<u64> {
+        self.session.id()
+    }
+}
+
 impl Deref for EngineLease {
     type Target = InferenceEngine<'static>;
 
     fn deref(&self) -> &Self::Target {
+        // `MET-08`: bind here rather than in `acquire`, because the thread
+        // that acquires a lease is not always the thread that uses it — the
+        // server acquires on a tokio worker and then moves the lease into
+        // `spawn_blocking`. Every use of the engine goes through
+        // `Deref`/`DerefMut`, so the binding is always established on the
+        // thread that is about to dispatch, and re-binding the session that
+        // is already bound costs one `u64` compare.
+        self.session.bind();
         // Total: `engine` is always populated until `Drop` takes it exactly
         // once, and the lease is never accessed after drop.
         &self.engine
@@ -236,6 +385,7 @@ impl Deref for EngineLease {
 
 impl DerefMut for EngineLease {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        self.session.bind();
         // Total: see `deref`.
         &mut self.engine
     }
@@ -247,6 +397,20 @@ impl Drop for EngineLease {
         // `self.engine` is never accessed afterwards (the struct is being
         // destroyed), so no double-take or use-after-take can occur.
         let mut engine = unsafe { ManuallyDrop::take(&mut self.engine) };
+
+        // `MET-08`: drop this replica's GPU-session binding from the current
+        // thread, so a later, unleased dispatch on this thread falls back to
+        // the process-default session instead of quietly sharing a session
+        // with whichever replica ran here last.
+        //
+        // The binding is established in `Deref`, on the thread that *uses* the
+        // lease, and every caller in this tree uses and drops a lease on one
+        // thread (`server::blocking::run_blocking_generation` moves it into the
+        // blocking closure and drops it there). A lease used on one thread and
+        // dropped on another would leave the using thread bound until its next
+        // lease rebinds it: still correct — a session is only ever used by the
+        // replica that owns it — but no longer replica-affine.
+        self.session.release();
 
         // `SV-09`: a cancellation token is scoped to the request that armed
         // it. Drop it here, on the replica's way back into the pool, so a
@@ -263,7 +427,13 @@ impl Drop for EngineLease {
         // state is intentionally preserved, so resetting here would be both
         // redundant and a risk to byte-identical single-request behavior.
         match self.pool.idle.lock() {
-            Ok(mut idle) => idle.push(engine),
+            Ok(mut idle) => idle.push(Replica {
+                engine,
+                // A cheap `Arc` refcount bump: the replica keeps the same
+                // session for its whole life, so the next lease of it binds
+                // the same queue and the same device KV cache.
+                session: self.session.clone(),
+            }),
             Err(_poisoned) => {
                 // The pool mutex is poisoned (a thread panicked while holding
                 // it). Dropping `engine` here is the safe choice: we must not
@@ -295,17 +465,19 @@ pub fn default_cpu_pool_size() -> usize {
 
 /// Resolve the effective pool size for a given kernel tier.
 ///
-/// - On the GPU tier (Metal / CUDA), the size is forced to `1`: GPU decode
-///   funnels through a process-global singleton that cannot run replicas in
-///   parallel and would corrupt shared KV state. This is a correctness
-///   requirement, not a tuning choice.
+/// - On the GPU tier, the size is `min(requested, `[`gpu_max_replicas`]`)`,
+///   defaulting to `1` when nothing was requested. Since `MET-08` a Metal
+///   replica owns its own session (command queue + device KV cache), so
+///   `N > 1` is *correct*; what bounds it is memory — 604 MB of device KV per
+///   session for the 8B at `ctx = 4096`. A CUDA-only build keeps the hard
+///   clamp to `1`, because `CudaGraph` is still a process-global singleton
+///   with one shared KV cache.
 /// - On CPU tiers, the size is `requested` (clamped to `>= 1`) or, if `None`,
 ///   [`default_cpu_pool_size`].
 ///
-/// Pure and unit-testable. The GPU comparison is gated behind the GPU-enabling
-/// features (`metal` / `native-cuda`) because `oxibonsai_kernels::KernelTier::Gpu`
-/// only exists when one of them is compiled in; non-GPU builds always take the
-/// CPU branch.
+/// The GPU comparison is gated behind the GPU-enabling features (`metal` /
+/// `native-cuda`) because `oxibonsai_kernels::KernelTier::Gpu` only exists
+/// when one of them is compiled in; non-GPU builds always take the CPU branch.
 pub fn resolve_pool_size(requested: Option<usize>, tier: oxibonsai_kernels::KernelTier) -> usize {
     resolve_pool_sizing(requested, tier).effective
 }
@@ -327,6 +499,10 @@ pub struct PoolSizing {
     /// Whether `effective` is below `requested` because of the GPU-tier
     /// clamp.
     pub clamped_by_gpu_tier: bool,
+    /// The GPU-tier ceiling that produced `effective`, when the GPU arm was
+    /// taken (`1` on a CUDA-only build, `MetalGraph::max_sessions()` with the
+    /// Metal backend). `None` on the CPU arm.
+    pub gpu_max: Option<usize>,
 }
 
 impl PoolSizing {
@@ -334,9 +510,11 @@ impl PoolSizing {
     pub fn reason(&self) -> String {
         if self.clamped_by_gpu_tier {
             format!(
-                "pool size {} (requested {}, clamped to 1 on the GPU tier: decode funnels through a process-global graph)",
+                "pool size {} (requested {}, clamped to {} on the GPU tier: one Metal session per \
+                 replica, each with its own device KV cache)",
                 self.effective,
-                self.requested.unwrap_or(self.effective)
+                self.requested.unwrap_or(self.effective),
+                self.gpu_max.unwrap_or(self.effective)
             )
         } else {
             match self.requested {
@@ -355,23 +533,61 @@ pub fn resolve_pool_sizing(
     requested: Option<usize>,
     tier: oxibonsai_kernels::KernelTier,
 ) -> PoolSizing {
+    resolve_pool_sizing_with_gpu_max(requested, tier, gpu_max_replicas())
+}
+
+/// How many replicas may usefully share the GPU on this build and host.
+///
+/// Metal: `MetalGraph::max_sessions()` — the per-session device KV cache is
+/// the bound, so it is small by default and tunable with
+/// `OXIBONSAI_METAL_MAX_SESSIONS`. CUDA-only: `1`, because `CudaGraph` remains
+/// a process-global singleton with one shared KV cache (`MET-08` split the
+/// Metal graph only).
+pub fn gpu_max_replicas() -> usize {
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    {
+        oxibonsai_kernels::MetalGraph::max_sessions().max(1)
+    }
+    #[cfg(not(all(feature = "metal", target_os = "macos")))]
+    {
+        1
+    }
+}
+
+/// The pure half of [`resolve_pool_sizing`]: the same clamp semantics with the
+/// GPU ceiling supplied by the caller, so it is unit-testable without a GPU.
+///
+/// An unspecified `requested` stays at `1` on the GPU tier: sessions are
+/// correct but not free (604 MB of device KV each for the 8B at `ctx = 4096`),
+/// so growing the pool is an explicit operator choice and the ceiling only
+/// ever caps what was actually asked for.
+pub fn resolve_pool_sizing_with_gpu_max(
+    requested: Option<usize>,
+    tier: oxibonsai_kernels::KernelTier,
+    gpu_max: usize,
+) -> PoolSizing {
     #[cfg(any(feature = "metal", feature = "native-cuda"))]
     {
         if tier == oxibonsai_kernels::KernelTier::Gpu {
+            let ceiling = gpu_max.max(1);
+            let effective = requested.unwrap_or(1).max(1).min(ceiling);
             return PoolSizing {
                 requested,
-                effective: 1,
-                clamped_by_gpu_tier: requested.is_some_and(|r| r > 1),
+                effective,
+                clamped_by_gpu_tier: requested.is_some_and(|r| r > effective),
+                gpu_max: Some(ceiling),
             };
         }
     }
-    // Silence the unused-variable lint on non-GPU builds where `tier` is not
+    // Silence the unused-variable lints on non-GPU builds where neither is
     // inspected.
     let _ = tier;
+    let _ = gpu_max;
     PoolSizing {
         requested,
         effective: requested.unwrap_or_else(default_cpu_pool_size).max(1),
         clamped_by_gpu_tier: false,
+        gpu_max: None,
     }
 }
 
@@ -641,13 +857,49 @@ mod tests {
 
     #[cfg(any(feature = "metal", feature = "native-cuda"))]
     #[test]
-    fn resolve_pool_size_gpu_is_clamped_to_one() {
-        // The GPU clamp is a correctness property: a process-global singleton
-        // cannot run replicas in parallel.
+    fn resolve_pool_size_gpu_is_capped_by_the_session_ceiling() {
+        // `MET-08` changed this rule deliberately: the GPU tier used to be a
+        // hard clamp to 1 because decode funnelled through a process-global
+        // graph with one KV cache. A Metal replica now owns its own session,
+        // so the tier admits up to `gpu_max` replicas — the bound is device
+        // memory (one KV cache per session), not correctness.
         let tier = oxibonsai_kernels::KernelTier::Gpu;
-        assert_eq!(resolve_pool_size(Some(8), tier), 1);
-        assert_eq!(resolve_pool_size(None, tier), 1);
-        assert_eq!(resolve_pool_size(Some(1), tier), 1);
+        assert_eq!(
+            resolve_pool_sizing_with_gpu_max(Some(8), tier, 3).effective,
+            3
+        );
+        assert_eq!(
+            resolve_pool_sizing_with_gpu_max(Some(2), tier, 3).effective,
+            2
+        );
+        assert_eq!(
+            resolve_pool_sizing_with_gpu_max(Some(1), tier, 3).effective,
+            1
+        );
+        // An unspecified request stays conservative: one replica.
+        assert_eq!(resolve_pool_sizing_with_gpu_max(None, tier, 3).effective, 1);
+        // A ceiling of 1 (a CUDA-only build) reproduces the old hard clamp.
+        assert_eq!(
+            resolve_pool_sizing_with_gpu_max(Some(8), tier, 1).effective,
+            1
+        );
+        // A zero/absurd ceiling can never yield an empty pool.
+        assert_eq!(
+            resolve_pool_sizing_with_gpu_max(Some(8), tier, 0).effective,
+            1
+        );
+        // The live wiring agrees with the pure function.
+        assert_eq!(
+            resolve_pool_size(Some(8), tier),
+            resolve_pool_sizing_with_gpu_max(Some(8), tier, gpu_max_replicas()).effective
+        );
+    }
+
+    #[cfg(any(feature = "metal", feature = "native-cuda"))]
+    #[test]
+    fn gpu_max_replicas_is_at_least_one() {
+        // A pool of zero replicas would deadlock every request on `acquire`.
+        assert!(gpu_max_replicas() >= 1);
     }
 
     // ── lease / pool mechanics ───────────────────────────────────────────
@@ -985,11 +1237,13 @@ mod tests {
     #[cfg(any(feature = "metal", feature = "native-cuda"))]
     #[test]
     fn pool_sizing_records_the_gpu_clamp_instead_of_hiding_it() {
-        let sizing = resolve_pool_sizing(Some(8), oxibonsai_kernels::KernelTier::Gpu);
-        assert_eq!(
-            sizing.effective, 1,
-            "the GPU clamp stays a correctness rule"
-        );
+        // `perf-M1`: a request above the ceiling must still be *reported* as a
+        // clamp, so an admission controller can shed instead of queueing 8
+        // requests behind 2 replicas.
+        let tier = oxibonsai_kernels::KernelTier::Gpu;
+        let sizing = resolve_pool_sizing_with_gpu_max(Some(8), tier, 2);
+        assert_eq!(sizing.effective, 2);
+        assert_eq!(sizing.gpu_max, Some(2));
         assert!(
             sizing.clamped_by_gpu_tier,
             "a server must be able to tell a clamp from an honoured request"
@@ -997,10 +1251,86 @@ mod tests {
         let reason = sizing.reason();
         assert!(reason.contains("requested 8"), "{reason}");
         assert!(reason.contains("GPU tier"), "{reason}");
+        assert!(reason.contains("clamped to 2"), "{reason}");
+
+        // A request at or below the ceiling is honoured, not clamped.
+        let honoured = resolve_pool_sizing_with_gpu_max(Some(2), tier, 2);
+        assert_eq!(honoured.effective, 2);
+        assert!(!honoured.clamped_by_gpu_tier);
 
         // An unspecified request that lands on 1 anyway is not a clamp.
-        let default_sizing = resolve_pool_sizing(None, oxibonsai_kernels::KernelTier::Gpu);
+        let default_sizing = resolve_pool_sizing_with_gpu_max(None, tier, 4);
         assert_eq!(default_sizing.effective, 1);
         assert!(!default_sizing.clamped_by_gpu_tier);
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn gpu_session_binds_and_releases_on_the_using_thread() {
+        // Direct, non-vacuous cover for the lease's `Deref`-binds /
+        // `Drop`-releases contract (`MET-08`). The pool fixtures in this crate
+        // all resolve to a CPU tier, where `GpuSession` is empty, so the
+        // binding itself is exercised here against a real session instead.
+        let Ok(session) = oxibonsai_kernels::MetalGraph::new_session() else {
+            return; // no Metal device on this host
+        };
+        let id = session.session_id();
+        let gpu = GpuSession(Some(session));
+
+        assert_eq!(oxibonsai_kernels::MetalGraph::current_session_id(), None);
+        gpu.bind();
+        assert_eq!(
+            oxibonsai_kernels::MetalGraph::current_session_id(),
+            Some(id),
+            "the replica's session must be bound to the thread using it"
+        );
+        // Re-binding the same session is idempotent (this runs on every deref).
+        gpu.bind();
+        assert_eq!(
+            oxibonsai_kernels::MetalGraph::current_session_id(),
+            Some(id)
+        );
+        assert_eq!(
+            oxibonsai_kernels::MetalGraph::global()
+                .expect("global")
+                .session_id(),
+            id,
+            "global() must resolve to the leased replica's session"
+        );
+
+        gpu.release();
+        assert_eq!(
+            oxibonsai_kernels::MetalGraph::current_session_id(),
+            None,
+            "returning a replica must release its binding"
+        );
+        // Releasing a binding this thread no longer holds is a no-op.
+        gpu.release();
+        assert_eq!(oxibonsai_kernels::MetalGraph::current_session_id(), None);
+    }
+
+    #[tokio::test]
+    async fn every_replica_gets_its_own_gpu_session() {
+        // `MET-08`: two replicas leased at once must never share a session —
+        // a shared session means a shared device KV cache, which is exactly
+        // the state two concurrent decodes would trample. Off the Metal tier
+        // (this fixture is a CPU-tier `tiny_test` engine, and CI hosts have no
+        // GPU at all) there is no session and both report `None`, which the
+        // assertion below tolerates.
+        let pool = EnginePool::new(vec![tiny_engine(), tiny_engine()]);
+        let a = pool.acquire().await.expect("acquire a");
+        let b = pool.acquire().await.expect("acquire b");
+        match (a.gpu_session_id(), b.gpu_session_id()) {
+            (Some(x), Some(y)) => assert_ne!(x, y, "two live replicas share one Metal session"),
+            (None, None) => {}
+            other => panic!("replicas disagree about having a GPU session: {other:?}"),
+        }
+
+        // A replica keeps its session across leases: the id it reports after
+        // being returned and re-acquired is the one it had before.
+        let a_id = a.gpu_session_id();
+        drop(a);
+        let a_again = pool.acquire().await.expect("re-acquire a");
+        assert_eq!(a_again.gpu_session_id(), a_id);
     }
 }
