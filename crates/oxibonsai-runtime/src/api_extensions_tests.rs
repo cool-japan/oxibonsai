@@ -7,11 +7,9 @@
 //! 2000-line ceiling (mirrors `engine.rs` / `engine_tests.rs`).
 //!
 //! Distinct from the crate's external integration file,
-//! `tests/api_extensions_tests.rs` (not owned by this package, and unable to
-//! reach these `pub(crate)`/private items at all): this file additionally
-//! covers wave-3's own findings (RT-05, RT-06, RT-12, SV-25, SV-32,
-//! gatekeeper `REQUIRED #1`, `TOK-M2`) with tests scoped to exactly what
-//! changed here.
+//! `tests/api_extensions_tests.rs` (which cannot reach these
+//! `pub(crate)`/private items at all): this file covers the findings RT-05,
+//! RT-06, RT-12, SV-25, SV-32 and `TOK-M2` on this endpoint.
 
 use super::*;
 use crate::engine::InferenceEngine;
@@ -266,7 +264,7 @@ fn stream_decode_state_token_id_fast_path_never_reveals_the_marker() {
         "once stopped, feed must stay inert even if called again"
     );
     // Nothing was held back here ("hello " fully cleared the hold-back
-    // window on its own), so the post-verifier-review flush companion must
+    // window on its own), so the flush companion must
     // be a no-op too -- it must never manufacture output that was never
     // there. The case where something *is* held back at the moment the id
     // fast path fires is covered by
@@ -281,7 +279,7 @@ fn stream_decode_state_token_id_fast_path_never_reveals_the_marker() {
     );
 }
 
-// ── RT-06 post-verifier-review regression: the id fast path must flush the
+// ── RT-06 regression: the id fast path must flush the
 //    hold-back window, not silently drop it (`finish()`'s `hit_stop` guard
 //    is correct for the *text*-match path, which already flushed its own
 //    safe prefix inline, but was wrong for the id path, which never
@@ -289,7 +287,7 @@ fn stream_decode_state_token_id_fast_path_never_reveals_the_marker() {
 
 #[test]
 fn stream_decode_state_flush_before_stop_matches_the_reported_regression() {
-    // The exact repro from the verifier finding: "AB" is held back as an
+    // The exact reported repro: "AB" is held back as an
     // unfinished prefix of "ABC" when the *unrelated* single-token marker
     // "<|im_end|>" (id 999) arrives and stops generation. "AB" is real
     // model output that was never part of any matched stop sequence and
@@ -365,28 +363,19 @@ fn stream_decode_state_flushes_realistic_held_back_prefix_before_id_stop() {
     );
 }
 
-/// Post-verifier-review, narrower residual of the `step_decode`-`Ok(None)`
-/// fix: reproduces `extended_chat_completions_stream`'s exact fixed
-/// ordering (the id-fast-path check now runs BEFORE
-/// `reasoning_splitter.push`, gated on `!in_reasoning()`) for the one case
-/// the fix specifically targets and the old ordering could not reach at
-/// all — a stop-configured id landing in the post-`</think>`
-/// newline-swallow window (`Phase::JustClosed`), before any real content
-/// token. Confirmed live on the real 27B model: `<|im_end|>` really is
+/// A narrower residual of the `step_decode`-`Ok(None)` fix: a
+/// stop-configured id landing in the post-`</think>` newline window
+/// (`Phase::JustClosed`), before any real content token, must still stop
+/// generation. Confirmed live on the real 27B model: `<|im_end|>` really is
 /// vocabulary-flagged `special` there, so it really does decode to `""`
 /// via `step_decode`, and a model that stops immediately after its
 /// reasoning (no separate content at all) would hit exactly this.
 ///
-/// Pins the precondition the reordering exists for: with the OLD ordering
-/// (check `hit_stop_by_id` only after `push`), `push` returns `Boundary`
-/// for this empty piece in `JustClosed` (`reasoning.rs::push`'s own
-/// `trimmed.is_empty()` arm) and the loop's `Boundary => continue` would
-/// skip the id check entirely, past `break`, on to the next token — this
-/// test demonstrates both halves: the id fast path trips when checked
-/// first (the fix), and `push` alone, for the exact same id/phase, really
-/// would have produced the `Boundary` a bare `continue` swallows (the
-/// precondition — a post-`push`-only check could not have reached the id
-/// check at all for this case).
+/// Both halves are pinned: the id fast path trips for the configured id
+/// whatever the reasoning phase, and the splitter hands that empty-text id
+/// on as (empty) content instead of swallowing it as a `Boundary` — which
+/// is what lets the stop stage behind the split (where the response
+/// pipeline checks stop ids) see it at all.
 #[test]
 fn a_stop_id_landing_in_the_post_think_newline_window_still_stops_generation() {
     const CLOSE_THINK_ID: u32 = 248069;
@@ -409,9 +398,8 @@ fn a_stop_id_landing_in_the_post_think_newline_window_still_stops_generation() {
     );
 
     // `<|im_end|>` arrives immediately after, decoding to `""` (special,
-    // `step_decode` returns `None`) -- the loop's fixed ordering: check the
-    // id fast path first, since we are (correctly) not `in_reasoning()`
-    // here (`JustClosed`, not `Reasoning`).
+    // `step_decode` returns `None`) -- and we are (correctly) not
+    // `in_reasoning()` here (`JustClosed`, not `Reasoning`).
     assert!(
         !splitter.in_reasoning(),
         "must be in JustClosed, not Reasoning, for this to be the case under test"
@@ -420,23 +408,20 @@ fn a_stop_id_landing_in_the_post_think_newline_window_still_stops_generation() {
         decode_loop.hit_stop_by_id(IM_END_ID),
         "the id fast path must trip for the configured stop id regardless of reasoning phase"
     );
-    // The loop `break`s here, exactly as the fixed code does -- `push` for
-    // this token is never even called once the id fast path has already
-    // claimed it.
+    // Nothing of the claimed id is ever emitted: the stream stops here.
 
-    // The precondition itself: had the OLD ordering run `push` for this
-    // same (id, "") FIRST, it would have returned `Boundary` -- a bare
-    // `continue` (the pre-fix code) discards that outcome and skips the
-    // very id check the assertion above just proved catches it. This is
-    // what makes the reordering necessary, not merely harmless.
-    let mut old_ordering_splitter =
+    // And the splitter itself no longer hides such an id: an empty-text id
+    // in the post-`</think>` window is handed on as (empty) content rather
+    // than swallowed as a `Boundary`, so a stage after the split — the stop
+    // check, the tool-call extractor — still sees the id.
+    let mut splitter_after_close =
         crate::reasoning::ReasoningSplitter::new(true, Some(CLOSE_THINK_ID));
-    let _ = old_ordering_splitter.push(1, "thinking");
-    let _ = old_ordering_splitter.push(CLOSE_THINK_ID, "</think>");
+    let _ = splitter_after_close.push(1, "thinking");
+    let _ = splitter_after_close.push(CLOSE_THINK_ID, "</think>");
     assert_eq!(
-        old_ordering_splitter.push(IM_END_ID, ""),
-        crate::reasoning::ReasoningChunk::Boundary,
-        "a post-push-only check would have seen Boundary here, not a chance to stop"
+        splitter_after_close.push(IM_END_ID, ""),
+        crate::reasoning::ReasoningChunk::Content(String::new()),
+        "an empty-text id after `</think>` must reach the next stage"
     );
 }
 
@@ -475,7 +460,7 @@ fn stream_decode_state_no_stop_sequences_emits_immediately() {
     assert_eq!(state.finish(), None);
 }
 
-// ── resolve_sampling_params (gatekeeper REQUIRED #1) ──────────────────────
+// ── resolve_sampling_params: request fields over the engine defaults ─────
 
 #[test]
 fn resolve_sampling_params_seeds_from_engine_defaults_when_request_omits_fields() {
@@ -518,15 +503,15 @@ fn resolve_sampling_params_honours_client_overrides() {
 
 // ── HTTP-level regression tests ────────────────────────────────────────
 //
-// A fresh `Qwen3Config::tiny_test()` engine (no tokenizer) per test, kept
-// local to this file's own test module rather than added to the crate's
-// external `tests/api_extensions_tests.rs` (not owned by this package).
+// A fresh `Qwen3Config::tiny_test()` engine per test behind a
+// tokenizer-less router (text prompts run as the configured prompt start
+// token; the answer's text is empty while `usage` counts every token).
 
 fn test_router() -> axum::Router {
     let config = oxibonsai_core::config::Qwen3Config::tiny_test();
     let params = SamplingParams::default();
     let engine = InferenceEngine::new(config, params, 42);
-    crate::server::create_router(engine, None)
+    crate::tokenizer_bridge::chat_render::test_fixtures::tokenizerless_router(engine)
 }
 
 /// A short, unique-per-call string so tests sharing the process-global
@@ -601,28 +586,24 @@ async fn extended_endpoint_reports_real_completion_tokens_not_a_word_count_estim
     }
 }
 
-/// Post-verifier-review addition: the test above is structurally vacuous
-/// against the RT-05 regression it targets. Against the tokenizer-less
-/// [`test_router`], `content` is `format!("{output_tokens:?}")`, and
-/// `Debug` of a `Vec<u32>` always prints exactly `output_len`
-/// whitespace-separated words -- so the *old*, buggy whitespace-split
-/// estimate equals `output_len` for every `max_tokens`, and the test above
-/// passes identically whether or not the bug is fixed.
-///
 /// A `stop` sequence that truncates the *visible* text partway through
-/// provably separates the two: `completion_tokens` must still equal the
-/// real number of emitted tokens (unaffected by the truncation), while the
-/// word count of the truncated `content` is now something else entirely --
-/// only a genuinely fixed implementation reports the former, not the
-/// latter.
+/// separates the real token count from any estimate derived from the text:
+/// the engine emits exactly the 15 byte tokens of `"1 2 3 4 5 6 7 8"`
+/// (one token per character), `stop: [" 4"]` truncates the content to
+/// `"1 2 3"` (3 words), and `completion_tokens` must still be 15 — a
+/// whitespace-split estimate of either text (8 or 3 words) never is.
 #[tokio::test]
 async fn extended_endpoint_completion_tokens_survive_stop_sequence_truncation() {
-    let app = test_router();
+    use crate::tokenizer_bridge::chat_render::test_fixtures as fx;
+    let app = crate::server::create_router(
+        fx::scripted_byte_engine("1 2 3 4 5 6 7 8"),
+        Some(fx::byte_tokenizer()),
+    );
     let body = serde_json::json!({
         "messages": [{"role": "user", "content": "Count to ten please"}],
-        "max_tokens": 4,
+        "max_tokens": 15,
         "temperature": 0.0,
-        "stop": ["0,"],
+        "stop": [" 4"],
     });
     let resp = post_extended(app, body, None).await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -637,6 +618,7 @@ async fn extended_endpoint_completion_tokens_survive_stop_sequence_truncation() 
     let completion_tokens = json["usage"]["completion_tokens"]
         .as_u64()
         .expect("completion_tokens");
+    assert_eq!(content, "1 2 3", "{json}");
     let word_count = content.split_whitespace().count() as u64;
     assert!(
         word_count < completion_tokens,
@@ -647,11 +629,11 @@ async fn extended_endpoint_completion_tokens_survive_stop_sequence_truncation() 
          whitespace-split estimate of the (truncated) text"
     );
     assert_eq!(
-        completion_tokens, 4,
+        completion_tokens, 15,
         "completion_tokens must count every token the engine actually \
-         emitted (max_tokens, with this tiny greedy model + temperature \
-         0.0), not a word-count of the stop-truncated final text"
+         emitted, not a word-count of the stop-truncated final text"
     );
+    assert_eq!(json["choices"][0]["finish_reason"], "stop");
 }
 
 // ── RT-12: seed reaches the streaming path too ────────────────────────────
@@ -670,21 +652,33 @@ fn normalize_sse_deltas(body: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// Whether any delta in `normalize_sse_deltas`' output carries text: a
+/// stream compared for equality must actually contain some, or two empty
+/// streams would compare equal whatever the seed did.
+fn deltas_carry_text(deltas: &[serde_json::Value]) -> bool {
+    deltas.iter().any(|choices| {
+        choices[0]["delta"]["content"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty())
+    })
+}
+
 #[tokio::test]
 async fn extended_endpoint_stream_same_seed_produces_byte_identical_output() {
     // Constructing the two engines with *different* ambient seeds (1 and
     // 999) makes this test actually discriminate: if the fix regressed
     // to "the request `seed` is silently ignored", the two streams would
     // very likely diverge, each falling back to its own engine's ambient
-    // seed, instead of matching.
+    // seed, instead of matching. Every step is an equal choice among 26
+    // letters of a byte-level vocabulary, so each sampled token is visible
+    // text picked by the PRNG alone (a stream without a tokenizer carries
+    // no text at all, which would make this comparison vacuous).
     async fn run(ambient_seed: u64, request_seed: u64) -> String {
-        let config = oxibonsai_core::config::Qwen3Config::tiny_test();
-        let params = SamplingParams {
-            temperature: 0.9,
-            ..SamplingParams::default()
-        };
-        let engine = InferenceEngine::new(config, params, ambient_seed);
-        let app = crate::server::create_router(engine, None);
+        use crate::tokenizer_bridge::chat_render::test_fixtures as fx;
+        let app = crate::server::create_router(
+            fx::uniform_letters_engine(ambient_seed),
+            Some(fx::byte_tokenizer()),
+        );
         let body = serde_json::json!({
             "messages": [{"role": "user", "content": "Tell me a story"}],
             "max_tokens": 8,
@@ -702,6 +696,12 @@ async fn extended_endpoint_stream_same_seed_produces_byte_identical_output() {
 
     let a = run(1, 777).await;
     let b = run(999, 777).await;
+    assert!(deltas_carry_text(&normalize_sse_deltas(&a)), "{a}");
+    assert_ne!(
+        normalize_sse_deltas(&a),
+        normalize_sse_deltas(&run(1, 778).await),
+        "a different request seed must stream different content"
+    );
     assert_eq!(
         normalize_sse_deltas(&a),
         normalize_sse_deltas(&b),
@@ -721,13 +721,11 @@ async fn extended_endpoint_stream_without_seed_stays_deterministic_via_ambient_s
     // own construction seed), never forcibly reset to a hardcoded
     // default seed nor made non-deterministic.
     async fn run() -> String {
-        let config = oxibonsai_core::config::Qwen3Config::tiny_test();
-        let params = SamplingParams {
-            temperature: 0.9,
-            ..SamplingParams::default()
-        };
-        let engine = InferenceEngine::new(config, params, 4242);
-        let app = crate::server::create_router(engine, None);
+        use crate::tokenizer_bridge::chat_render::test_fixtures as fx;
+        let app = crate::server::create_router(
+            fx::uniform_letters_engine(4242),
+            Some(fx::byte_tokenizer()),
+        );
         let body = serde_json::json!({
             "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 8,
@@ -744,6 +742,7 @@ async fn extended_endpoint_stream_without_seed_stays_deterministic_via_ambient_s
 
     let a = run().await;
     let b = run().await;
+    assert!(deltas_carry_text(&normalize_sse_deltas(&a)), "{a}");
     assert_eq!(
         normalize_sse_deltas(&a),
         normalize_sse_deltas(&b),
@@ -762,7 +761,11 @@ async fn extended_endpoint_records_metrics() {
     let params = SamplingParams::default();
     let engine = InferenceEngine::new(config, params, 42);
     let metrics = Arc::new(InferenceMetrics::new());
-    let app = crate::server::create_router_with_metrics(engine, None, Arc::clone(&metrics));
+    let app =
+        crate::tokenizer_bridge::chat_render::test_fixtures::tokenizerless_router_with_metrics(
+            engine,
+            Arc::clone(&metrics),
+        );
 
     assert_eq!(metrics.requests_total.get(), 0);
     assert_eq!(metrics.active_requests.get(), 0.0);
@@ -803,7 +806,11 @@ async fn extended_endpoint_stream_records_metrics() {
     let params = SamplingParams::default();
     let engine = InferenceEngine::new(config, params, 42);
     let metrics = Arc::new(InferenceMetrics::new());
-    let app = crate::server::create_router_with_metrics(engine, None, Arc::clone(&metrics));
+    let app =
+        crate::tokenizer_bridge::chat_render::test_fixtures::tokenizerless_router_with_metrics(
+            engine,
+            Arc::clone(&metrics),
+        );
 
     let body = serde_json::json!({
         "messages": [{"role": "user", "content": "hello"}],
@@ -822,9 +829,9 @@ async fn extended_endpoint_stream_records_metrics() {
         1,
         "SV-25: the streaming path must also increment requests_total"
     );
-    // The `ActiveRequestGuard` moved into the decode task is dropped at the
-    // tail of that task's async block, in the same drop sequence as
-    // `delta_tx` -- nothing orders that drop *before* the SSE body future
+    // The `ActiveRequestGuard` moved into the stream-driver task is dropped
+    // at the tail of that task's async block, in the same drop sequence as
+    // `payload_tx` -- nothing orders that drop *before* the SSE body future
     // above finishes being read, so there is a theoretical window where the
     // client-visible body is fully read while the server-side task hasn't
     // unwound yet. Poll with a short bounded retry rather than a bare
@@ -841,8 +848,8 @@ async fn extended_endpoint_stream_records_metrics() {
     }
     assert_eq!(
         active, 0.0,
-        "the guard moved into the decode task must decrement \
-         active_requests once decoding finishes"
+        "the guard moved into the stream-driver task must decrement \
+         active_requests once the stream finishes"
     );
 }
 
@@ -867,60 +874,47 @@ async fn extended_endpoint_rejects_non_positive_repetition_penalty() {
     }
 }
 
-// ── logprobs + sampling-param conflict validation ───────────────────────
+// ── logprobs + sampling params: honoured on the logits-capturing path ───
 //
-// Verifier wave-3 review: `generate_with_logprobs` has no `&SamplingParams`
-// seam (see the module docs on `api_extensions.rs`), so before this guard a
-// `logprobs: true` request silently dropped a validated
-// `repetition_penalty` / `temperature` / `top_p` instead of ever honoring
-// or rejecting it.
+// The request's sampling configuration is installed on the replica for the
+// `generate_with_logprobs` call too (`RequestSampling`), so `logprobs`
+// combines with `temperature` / `top_p` / `repetition_penalty` / `seed`.
 
+/// `logprobs` with `temperature: 0` really samples greedily: every step of
+/// the uniform-letters engine is an equal choice among `a`..=`z`, which only
+/// a greedy draw (the lowest id wins a tie) turns into `"aaaa"`, while the
+/// engine's ambient temperature (`0.9`) would draw random letters.
 #[tokio::test]
-async fn extended_endpoint_rejects_logprobs_with_repetition_penalty() {
-    let app = test_router();
+async fn extended_endpoint_honours_logprobs_with_temperature_top_p_and_repetition_penalty() {
+    use crate::tokenizer_bridge::chat_render::test_fixtures as fx;
+    let app =
+        crate::server::create_router(fx::uniform_letters_engine(5), Some(fx::byte_tokenizer()));
     let body = serde_json::json!({
         "messages": [{"role": "user", "content": "hi"}],
-        "max_tokens": 2,
+        "max_tokens": 4,
         "logprobs": true,
+        "top_logprobs": 2,
+        "temperature": 0.0,
+        "top_p": 0.5,
         "repetition_penalty": 1.3,
     });
     let resp = post_extended(app, body, None).await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::OK);
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .expect("read body");
     let json: serde_json::Value = serde_json::from_slice(&bytes).expect("parse JSON");
-    assert_eq!(json["error"]["param"], "logprobs");
-}
-
-#[tokio::test]
-async fn extended_endpoint_rejects_logprobs_with_temperature_or_top_p() {
-    for field in ["temperature", "top_p"] {
-        let app = test_router();
-        let mut body = serde_json::json!({
-            "messages": [{"role": "user", "content": "hi"}],
-            "max_tokens": 2,
-            "logprobs": true,
-        });
-        body.as_object_mut()
-            .expect("object body")
-            .insert(field.to_string(), serde_json::json!(0.5));
-        let resp = post_extended(app, body, None).await;
-        assert_eq!(
-            resp.status(),
-            StatusCode::BAD_REQUEST,
-            "logprobs + {field} must be rejected, not silently honored \
-             for only one of the two"
-        );
-    }
+    assert_eq!(json["choices"][0]["message"]["content"], "aaaa", "{json}");
+    let entries = json["choices"][0]["logprobs"]["content"]
+        .as_array()
+        .expect("logprobs.content array");
+    assert_eq!(entries.len(), 4, "{json}");
 }
 
 #[tokio::test]
 async fn extended_endpoint_allows_logprobs_with_frequency_or_presence_penalty() {
-    // Unlike repetition_penalty/temperature/top_p, frequency_penalty and
-    // presence_penalty ARE honored on the logprobs path
-    // (`lease.set_penalties(penalties)` runs before either branch), so this
-    // combination must still succeed.
+    // frequency_penalty and presence_penalty are honored on the logprobs
+    // path, so this combination must succeed.
     let app = test_router();
     let body = serde_json::json!({
         "messages": [{"role": "user", "content": "hi"}],
@@ -1028,7 +1022,7 @@ fn idempotency_cache_key_differs_for_different_bodies_under_the_same_header() {
     );
 }
 
-/// Post-verifier-review regression test: `idempotency_cache_key` used to
+/// Regression test: `idempotency_cache_key` used to
 /// fold in only `tools.is_some()` (never the tool definitions themselves)
 /// and dropped `logprobs`/`top_logprobs`/`tool_choice`/`user` entirely, so
 /// two requests differing *only* in one of those fields collided on the
@@ -1152,7 +1146,7 @@ async fn extended_endpoint_idempotency_key_reused_with_logprobs_added_is_a_cache
 
 // ── TOK-M2: control-token injection via the extended endpoint ───────────
 //
-// Blocking finding (wave-3 verifier re-review): the raw-text `<|...|>`
+// The raw-text `<|...|>`
 // guard alone (`neutralize_special_markers`) never matches `<think>`,
 // `</think>`, `<tool_call>`, or `</tool_call>` -- none of them contain
 // `<|` -- even though each is a real, atomic control token in the shipped
@@ -1255,10 +1249,10 @@ async fn extended_endpoint_drops_guarded_control_token_in_message_content() {
 // ── B1/B2/B3: real chat-template rendering + reasoning split wired into
 //    the extended endpoint too (non-streaming AND streaming) ────────────
 
-/// A vocabulary that DOES define `<think>`/`</think>` (RT-10: the shipped
-/// Qwen3 1.7B/8B do not, which is exactly why `tokenizer_with_control_token`
-/// above cannot double as this fixture) plus full printable-ASCII coverage
-/// so ordinary message text round-trips.
+/// A vocabulary that DOES define `<think>`/`</think>` (as the shipped Qwen3
+/// 1.7B/8B and Bonsai 2 vocabularies do; `tokenizer_with_control_token`
+/// above does not, which is why it cannot double as this fixture) plus full
+/// printable-ASCII coverage so ordinary message text round-trips.
 fn think_capable_tokenizer() -> crate::tokenizer_bridge::TokenizerBridge {
     use oxibonsai_tokenizer::{BpeMerges, OxiTokenizer, TokenizerConfig, Vocabulary};
 
@@ -1293,8 +1287,9 @@ fn think_capable_router() -> axum::Router {
 /// The extended endpoint must render through the real Jinja engine (B1)
 /// and stay a valid `200` end to end for a tokenizer whose vocabulary DOES
 /// define `<think>`/`</think>` — `reasoning_content`, if present, must be
-/// a well-formed string patched into the JSON response despite
-/// `ChatMessage` (`server.rs`) not declaring the field.
+/// a well-formed string (the native `ChatMessage::reasoning_content` field;
+/// see `extended_endpoint_returns_a_model_emitted_think_span_as_native_reasoning_content`
+/// for its exact value on a scripted generation).
 #[tokio::test]
 async fn extended_endpoint_renders_through_the_real_template_with_a_think_capable_tokenizer() {
     let app = think_capable_router();
@@ -1314,8 +1309,8 @@ async fn extended_endpoint_renders_through_the_real_template_with_a_think_capabl
     }
 }
 
-/// Same tokenizer, streaming: the reasoning-split wiring in
-/// `extended_chat_completions_stream`'s decode task must not crash and
+/// Same tokenizer, streaming: the reasoning-split wiring of the extended
+/// endpoint's stream must not crash and
 /// must still produce a well-formed SSE stream ending in `[DONE]`.
 #[tokio::test]
 async fn extended_endpoint_stream_with_a_think_capable_tokenizer_is_well_formed_sse() {
@@ -1349,7 +1344,7 @@ async fn extended_endpoint_stream_with_a_think_capable_tokenizer_is_well_formed_
     }
 }
 
-/// spec item 1 ("an unsupported construct must ERROR"): `messages: []`
+/// TOK-07/RT-09 (an unsupported construct must ERROR): `messages: []`
 /// reaching the render layer must be an honest `400`/`500`-free error
 /// response, not a silent bare prompt (the old `build_extended_prompt`
 /// behavior) or a panic.
@@ -1427,4 +1422,165 @@ async fn extended_endpoint_rejects_an_image_url_content_part_honestly() {
         .expect("body bytes");
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
     assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+}
+
+// ── On the extended endpoint: native
+//    `reasoning_content`, and tool calls gated on the vocabulary's own
+//    `<tool_call>` id, over a scripted generation ─────────────────────────
+
+mod scripted_extended {
+    use super::*;
+    use crate::tokenizer_bridge::chat_render::test_fixtures as fx;
+
+    const EXTENDED: &str = "/v1/chat/completions/extended";
+
+    /// A router whose engine emits exactly `script` (then EOS) on every
+    /// generation, over the marker-carrying byte-level vocabulary.
+    fn scripted_router(script: Vec<u32>) -> axum::Router {
+        let mut engine = fx::weightless_engine(fx::MARKER_VOCAB, SamplingParams::default(), 42);
+        engine.script_generation(script);
+        crate::server::create_router(engine, Some(fx::byte_tokenizer_with_markers()))
+    }
+
+    /// The model's own `<think>` + `reasoning` + `</think>` + `answer`.
+    fn think_span(reasoning: &str, answer: &str) -> Vec<u32> {
+        let mut ids = vec![fx::THINK_OPEN];
+        ids.extend(fx::byte_ids(reasoning));
+        ids.push(fx::THINK_CLOSE);
+        ids.extend(fx::byte_ids(answer));
+        ids
+    }
+
+    fn chat_body(stream: bool) -> serde_json::Value {
+        serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 256,
+            "stream": stream,
+        })
+    }
+
+    async fn post_json(app: axum::Router, body: serde_json::Value) -> serde_json::Value {
+        let (status, _, text) = fx::post(app, EXTENDED, body).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        serde_json::from_str(&text).expect("a JSON chat.completion")
+    }
+
+    #[tokio::test]
+    async fn extended_endpoint_streams_a_model_emitted_think_span_as_reasoning_before_content() {
+        let app = scripted_router(think_span("\nplan the answer\n", "\n\nThe answer."));
+        let (status, _, body) = fx::post(app, EXTENDED, chat_body(true)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let mut order = Vec::new();
+        for chunk in fx::sse_payloads(&body) {
+            let delta = &chunk["choices"][0]["delta"];
+            assert!(
+                !(delta["reasoning_content"].is_string() && delta["content"].is_string()),
+                "a delta carries one channel, never both: {chunk}"
+            );
+            if let Some(text) = delta["reasoning_content"].as_str() {
+                order.push(("reasoning", text.to_string()));
+            }
+            if let Some(text) = delta["content"].as_str() {
+                order.push(("content", text.to_string()));
+            }
+        }
+        let last_reasoning = order
+            .iter()
+            .rposition(|(channel, _)| *channel == "reasoning")
+            .expect("reasoning deltas");
+        let first_content = order
+            .iter()
+            .position(|(channel, _)| *channel == "content")
+            .expect("content deltas");
+        assert!(last_reasoning < first_content, "{order:?}");
+        let reasoning: String = order
+            .iter()
+            .filter(|(channel, _)| *channel == "reasoning")
+            .map(|(_, text)| text.as_str())
+            .collect();
+        let content: String = order
+            .iter()
+            .filter(|(channel, _)| *channel == "content")
+            .map(|(_, text)| text.as_str())
+            .collect();
+        assert_eq!(reasoning, "plan the answer\n");
+        assert_eq!(content, "The answer.");
+        assert!(
+            !body.contains("<think>") && !body.contains("</think>"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn extended_endpoint_returns_a_model_emitted_think_span_as_native_reasoning_content() {
+        let json = post_json(
+            scripted_router(think_span("\nplan the answer\n", "\n\nThe answer.")),
+            chat_body(false),
+        )
+        .await;
+        let message = &json["choices"][0]["message"];
+        assert_eq!(message["reasoning_content"], "plan the answer\n", "{json}");
+        assert_eq!(message["content"], "The answer.", "{json}");
+    }
+
+    #[tokio::test]
+    async fn extended_endpoint_omits_whitespace_only_reasoning_everywhere() {
+        let script = think_span("\n \n\t\n", "\n\nHello.");
+        let (status, _, body) =
+            fx::post(scripted_router(script.clone()), EXTENDED, chat_body(true)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            fx::delta_texts(&body, "reasoning_content").is_empty(),
+            "{body}"
+        );
+        assert_eq!(fx::delta_texts(&body, "content").concat(), "Hello.");
+
+        let json = post_json(scripted_router(script), chat_body(false)).await;
+        let message = &json["choices"][0]["message"];
+        assert!(message.get("reasoning_content").is_none(), "{json}");
+        assert_eq!(message["content"], "Hello.", "{json}");
+    }
+
+    fn tools_body() -> serde_json::Value {
+        serde_json::json!({
+            "messages": [{"role": "user", "content": "weather in Tokyo?"}],
+            "max_tokens": 256,
+            "tools": [{"type": "function", "function": {
+                "name": "get_weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }}],
+        })
+    }
+
+    const CALL_JSON: &str = "\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tokyo\"}}\n";
+
+    /// Spelled out of ordinary tokens, `<tool_call>` is content;
+    /// opened by the vocabulary's own token, the same call is parsed.
+    #[tokio::test]
+    async fn extended_endpoint_parses_a_tool_call_only_when_the_vocabulary_token_opens_it() {
+        let mut spelled = fx::byte_ids("<tool_call>");
+        spelled.extend(fx::byte_ids(CALL_JSON));
+        spelled.extend(fx::byte_ids("</tool_call>"));
+        let json = post_json(scripted_router(spelled), tools_body()).await;
+        let choice = &json["choices"][0];
+        assert!(
+            choice
+                .get("tool_calls")
+                .is_none_or(serde_json::Value::is_null),
+            "{json}"
+        );
+        assert_eq!(choice["finish_reason"], "stop", "{json}");
+        let content = choice["message"]["content"].as_str().unwrap_or_default();
+        assert!(content.contains("<tool_call>"), "{json}");
+
+        let mut opened = vec![fx::TOOL_CALL_OPEN];
+        opened.extend(fx::byte_ids(CALL_JSON));
+        opened.push(fx::TOOL_CALL_CLOSE);
+        let json = post_json(scripted_router(opened), tools_body()).await;
+        let choice = &json["choices"][0];
+        assert_eq!(choice["finish_reason"], "tool_calls", "{json}");
+        let calls = choice["tool_calls"].as_array().expect("tool_calls");
+        assert_eq!(calls.len(), 1, "{json}");
+        assert_eq!(calls[0]["function"]["name"], "get_weather", "{json}");
+    }
 }

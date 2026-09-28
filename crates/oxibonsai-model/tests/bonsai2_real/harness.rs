@@ -36,7 +36,6 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use oxibonsai_core::gguf::reader::GgufFile;
@@ -87,38 +86,30 @@ pub fn require_model_files() -> bool {
 }
 
 /// Append one `{"capability", "executed", "test"}` record to the capability
-/// manifest, in the schema `scripts/release-gate.sh` documents, with a
-/// single `write` so concurrent producers never interleave mid-line.
+/// manifest, in the schema `scripts/release-gate.sh` documents, via
+/// `oxibonsai_testkit::capability`'s own canonical, single-`write_all`
+/// implementation (`oxibonsai_testkit::capability::Capability::Bonsai2Models`,
+/// which writes exactly [`CAPABILITY`]'s string) — never a second,
+/// hand-written JSONL writer.
 ///
-/// `oxibonsai_testkit::capability::Capability` has no Bonsai 2 variant yet
-/// (that enum belongs to a later package), so the record is written here
-/// with the same format and the dedicated capability name [`CAPABILITY`].
+/// HANDOVER-INFRA: `oxibonsai_testkit::capability::Capability` used to have
+/// no Bonsai 2 variant, so this function used to open and append to the
+/// manifest by hand. Now that the variant exists, this is a thin wrapper
+/// (kept, rather than inlined at each of this binary's call sites, because
+/// `greedy_gates.rs`/`layer_gate.rs` call it by this name and are not owned
+/// here) that also keeps printing the `CAPABILITY-REPORT` stderr line every
+/// gate's own log output already greps for.
 pub fn record_capability(executed: bool, test_name: &str) {
-    let path = oxibonsai_testkit::capability::report_path();
-    let line = serde_json::json!({
-        "capability": CAPABILITY,
-        "executed": executed,
-        "test": test_name,
-    })
-    .to_string()
-        + "\n";
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() && std::fs::create_dir_all(parent).is_err() {
-            eprintln!("capability report: cannot create {}", parent.display());
-            return;
-        }
-    }
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        Ok(mut file) => {
-            if let Err(e) = file.write_all(line.as_bytes()) {
-                eprintln!("capability report: write to {} failed: {e}", path.display());
-            }
-        }
-        Err(e) => eprintln!("capability report: open {} failed: {e}", path.display()),
+    if executed {
+        oxibonsai_testkit::capability::record_executed(
+            oxibonsai_testkit::capability::Capability::Bonsai2Models,
+            test_name,
+        );
+    } else {
+        oxibonsai_testkit::capability::record_skipped(
+            oxibonsai_testkit::capability::Capability::Bonsai2Models,
+            test_name,
+        );
     }
     eprintln!("CAPABILITY-REPORT capability={CAPABILITY} executed={executed} test={test_name}");
 }

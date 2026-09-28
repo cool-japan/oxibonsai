@@ -29,8 +29,12 @@ native-cuda = ["gpu", "dep:cudarc"]
 # objc2 port is needed. This is manifest hygiene, not a Pure-Rust item: metal
 # 0.33 still pulls objc 0.2.7 transitively. Every normal/build edge of
 # `cargo tree -p oxibonsai-kernels --features metal -e normal,build -i objc`
-# ends at `metal`; the plain `cargo tree -i objc` additionally lists the one
-# test-only `[dev-dependencies]` edge declared at the bottom of this file.
+# ends at `metal`; HANDOVER-INFRA (deps-17 follow-up) ported
+# `tests/gpu_argmax_tiebreak.rs`'s last bare `objc::rc::autoreleasepool` call
+# to `metal::objc::rc::autoreleasepool` too, so `cargo tree --all-features -e
+# normal,build,dev -i objc` no longer prints a `[dev-dependencies]` edge
+# either — there is no longer a `[target.'cfg(target_os = "macos")'.dev-
+# dependencies]` table in this manifest at all.
 metal = ["gpu", "scirs2-core/gpu", "scirs2-core/metal", "dep:metal"]
 gpu = ["scirs2-core/gpu"]
 avx2 = []
@@ -74,15 +78,6 @@ metal = { workspace = true, optional = true }
 criterion.workspace = true
 proptest.workspace = true
 oxibonsai-testkit.workspace = true
-
-# deps-17 residue, TEST-ONLY: `tests/gpu_argmax_tiebreak.rs` calls
-# `objc::rc::autoreleasepool` by the bare crate name, so its test binary needs
-# `objc` in its extern prelude. This table is the `[dev-dependencies]` edge
-# `cargo tree -i objc` still prints; the library itself no longer depends on
-# `objc` (see the `metal` feature above). Once that test says
-# `metal::objc::rc::autoreleasepool` instead, delete this table.
-[target.'cfg(target_os = "macos")'.dev-dependencies]
-objc.workspace = true
 
 [[bench]]
 name = "kernel_benchmarks"

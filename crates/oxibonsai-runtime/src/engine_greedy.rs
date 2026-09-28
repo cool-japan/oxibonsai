@@ -1,5 +1,5 @@
-//! Greedy decoding: the GPU-argmax fast path and its penalty-honouring
-//! sibling.
+//! Decoding on the fused Metal route: greedy (the GPU-argmax fast path and
+//! its penalty-honouring sibling) and sampled (the top-k candidate route).
 //!
 //! Split out of [`crate::engine`] to keep that file under the workspace
 //! 2000-line ceiling. Everything here is an inherent method of
@@ -9,8 +9,8 @@
 //!
 //! [`InferenceEngine::generate_greedy_gpu`] used to be pure argmax: it never
 //! consulted `self.sampler`, so a caller that had configured
-//! `repetition_penalty: 1.1` (which `SamplingParams::default()` does, and
-//! which the CLI hardcoded) got *penalised* greedy on the CPU path and
+//! `repetition_penalty: 1.1` (as `SamplingParams::default()` and the CLI both
+//! did at the time) got *penalised* greedy on the CPU path and
 //! *unpenalised* greedy on the Metal path — measurably different text on 7
 //! of 9 real-model runs, at a top-1/top-2 margin ~5000× the cross-backend
 //! numerical delta, i.e. an algorithm mismatch, not floating-point noise.
@@ -27,33 +27,45 @@
 //! every step (`SV-09`). The CPU-side arms — [`argmax_first`] here and
 //! `sampling.rs::argmax` — break ties toward the **first** index (`RT-22`).
 //!
-//! ## The GPU kernel now shares that tie-break too (`perf-11` / `FIX2-KERN`)
+//! ## The GPU kernel shares that tie-break (`perf-11`)
 //!
-//! An earlier version of this doc claimed the MSL argmax kernel's
-//! lowest-`tid` rule was equivalent to first-index tie-breaking. A wave-2
-//! verifier review traced the kernel directly and found that was false: it
-//! tied toward the lowest *thread id*, and a payload's thread id is not its
-//! original array index, so two exactly-equal maxima could resolve to the
-//! *higher* index (the traced example: indices `1000` and `2000` under a
-//! 1024-wide threadgroup used to resolve to `2000`). Both the MSL kernel
-//! (`kernel_sources/utility.rs`'s `argmax`) and its CUDA twin
-//! (`cuda_kernels.rs`'s `argmax_f32`) now compare the payload's *original
-//! index* on a value-tie, verified by a dedicated kernel-level harness
-//! (`crates/oxibonsai-kernels/tests/gpu_argmax_tiebreak.rs`, ≥ 300
-//! randomized multi-way ties plus the worked example, all resolving to the
-//! minimal tied index). See
+//! The MSL argmax kernel once tied toward the lowest *thread id*, and a
+//! payload's thread id is not its original array index, so two
+//! exactly-equal maxima could resolve to the *higher* index (the traced
+//! example: indices `1000` and `2000` under a 1024-wide threadgroup
+//! resolved to `2000`). Both the MSL kernel (`kernel_sources/utility.rs`'s
+//! `argmax`) and its CUDA twin (`cuda_kernels.rs`'s `argmax_f32`) compare
+//! the payload's *original index* on a value-tie, verified by a dedicated
+//! kernel-level harness (`crates/oxibonsai-kernels/tests/gpu_argmax_tiebreak.rs`,
+//! ≥ 300 randomized multi-way ties plus the worked example, all resolving
+//! to the minimal tied index). See
 //! [`crate::engine_control::GPU_ARGMAX_TIEBREAK_IS_FIRST_INDEX`], the gate
-//! this module's routing depends on, for the full trace and the fix; it is
-//! now `true`, so every entry point in this module that can reach
-//! `forward_greedy_gpu` — [`InferenceEngine::greedy_gpu_eligible`]'s four
-//! routed callers *and* [`InferenceEngine::generate_greedy_gpu`]'s own
-//! direct, unconditional entry point (the CLI's `--temperature 0` fast
-//! path, which does not go through `greedy_gpu_eligible` at all) — may take
-//! the GPU-argmax fast path, and when a model is not fused for Metal decode
-//! (or a Metal dispatch fails mid-generation), the per-token CPU fallback in
-//! [`InferenceEngine::greedy_decode_token_with_fallback`] still applies the
-//! same first-index rule the GPU kernel now also implements, so the two
-//! tiers agree on ties either way.
+//! this module's routing depends on, for the full trace; it is `true`, so
+//! every entry point in this module that can reach `forward_greedy_gpu` —
+//! [`InferenceEngine::greedy_gpu_eligible`]'s four routed callers *and*
+//! [`InferenceEngine::generate_greedy_gpu`]'s own direct, unconditional
+//! entry point (the CLI's `--temperature 0` fast path, which does not go
+//! through `greedy_gpu_eligible` at all) — may take the GPU-argmax fast
+//! path, and when a model is not fused for Metal decode (or a Metal
+//! dispatch fails mid-generation), the per-token CPU fallback in
+//! `InferenceEngine::greedy_decode_token_with_fallback` applies the same
+//! first-index rule the GPU kernel implements, so the two tiers agree on
+//! ties either way.
+//!
+//! ## The sampled top-k route (`perf-11`, sampled half)
+//!
+//! A sampled request on the fused route downloads only the top-`k`
+//! `(id, logit)` candidates of each decode step's resident logit row
+//! instead of the whole row — on by default ([`SampledTopKConfig`]). The
+//! engine's own sampler draws over the candidate sub-row; because the
+//! sampler ranks and walks its top-k survivors in a canonical order that
+//! depends only on the survivor set (`crate::sampling`'s module docs), and
+//! the candidates contain every survivor in that order, a seeded draw picks
+//! exactly the token the full-row draw would. Requests the candidates
+//! cannot serve exactly (a penalty, `top_k` of `0` or above the candidate
+//! count, log-probabilities) decode the full row, and every such request
+//! or step is counted ([`crate::engine::EngineStats`] and, when attached,
+//! the Prometheus counters).
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use oxibonsai_kernels::{KernelDispatcher, KernelTier};
@@ -68,25 +80,23 @@ use crate::error::RuntimeResult;
 use crate::ngram_cache::NgramCache;
 
 /// Default number of top-k candidates a sampled request on the fused GPU
-/// route downloads per token instead of the full logit row (`perf-11`), once
-/// the route is opted into (see [`SampledTopKConfig`]).
+/// route downloads per token instead of the full logit row (`perf-11`).
 pub const DEFAULT_SAMPLED_TOPK_CANDIDATES: usize = 64;
 
 /// Where sampled decode on the fused GPU route gets its candidates from
 /// (`perf-11`, sampled half).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SampledTopKMode {
-    /// Route disabled — **the default**. A sampled request decodes every
-    /// step's full logit row through the classic sampler
-    /// (`Sampler::sample_with_history`), exactly as it did before the route
-    /// existed, so a seeded sampled request reproduces the pre-route output
-    /// token for token. [`SampledTopKConfig`] says why this is the default
-    /// and what lets it flip.
-    #[default]
+    /// Route disabled: a sampled request decodes every step's full logit row
+    /// through the classic sampler (`Sampler::sample_with_history`). Its
+    /// output is byte-identical to [`Self::GpuCandidates`]'s; it only costs
+    /// the full download.
     Off,
-    /// Opt-in: download only the top-`k` `(id, logit)` pairs of each decode
-    /// step's logit row (the GPU `topk_f32` kernel over the resident logits)
-    /// and draw the step's token from them.
+    /// **The default**: download only the top-`k` `(id, logit)` pairs of each
+    /// decode step's logit row (the GPU `topk_f32` kernel over the resident
+    /// logits) and draw the step's token from them — byte-identical to the
+    /// classic full-row draw (see [`SampledTopKConfig`]).
+    #[default]
     GpuCandidates,
     /// Download the full row and extract the very same top-`k` on the CPU,
     /// then draw from them exactly as [`Self::GpuCandidates`] does: the
@@ -113,40 +123,37 @@ pub enum SampledTopKMode {
 /// every logit — a GPU tail-mass sum could not be bit-identical to the host
 /// sampler's sequential `f32` sum, so the route does not try), a `top_k`
 /// above the candidate count or at/above the vocabulary, a penalty, or the
-/// route disabled. Under the default [`SampledTopKMode::Off`] that counter
-/// therefore counts every sampled request on the fused route.
+/// route disabled.
 ///
-/// # Default: [`SampledTopKMode::Off`]
+/// # Default: [`SampledTopKMode::GpuCandidates`] — byte-identical to the classic sampler
 ///
-/// The route changes the *realisation* of a seeded draw, not its
-/// distribution. The classic sampler (`sampling.rs`'s `Sampler::sample_core`)
-/// selects its `top_k` survivors with `select_nth_unstable_by` and walks them
-/// — the softmax sum and, at `top_p = 1.0`, the weighted draw — in whatever
-/// order that partial selection leaves them, which is a function of the
-/// **whole** row. A candidate sub-row cannot reproduce that order, so for the
-/// same seed the route draws a different, equally distributed token on some
-/// steps: on tie-heavy 1000-wide rows, 125 of 200 seeded draws differ at
-/// `top_k 20, top_p 1.0` and 7 of 200 at `top_p 0.9`. A seeded request's
-/// output is a contract (`generate_with_seed`, the API's `seed` field), so,
-/// exactly like [`SpeculativeConfig`](crate::engine_control::SpeculativeConfig),
-/// the route stays opt-in ([`InferenceEngine::set_sampled_topk`]) until
-/// `Sampler::sample_core` walks its survivors in a canonical order — raw
-/// logit descending, `NaN` last, an exact tie to the lower index, top-p as a
-/// prefix scan of that order. That order depends only on the survivor set,
-/// which the candidates contain, so from then on the route is byte-identical
-/// to the full-row sampler and the default can flip to
-/// [`SampledTopKMode::GpuCandidates`] (the `sampling.rs` change is a recorded
-/// handover: that file is owned by another package).
+/// `Sampler::sample_core` selects its `top_k` survivors and walks them — the
+/// softmax sum, min-p/top-p, the weighted draw — in a canonical order: raw
+/// logit descending, `NaN` last, an exact tie to the lower index (top-p as a
+/// prefix scan of that order). That order depends only on the survivor set,
+/// and the GPU candidates are the top `candidates` logits in exactly that
+/// order with `candidates >= top_k`, so they contain the survivors: a draw
+/// over the candidate sub-row consumes the same single random draw and picks
+/// the same token as the classic draw over the full row — min-p included,
+/// which the engine's sampler applies within the survivors
+/// ([`InferenceEngine::set_min_p`]). A seeded sampled request therefore
+/// produces the same tokens with the route on or off (tested on the ternary
+/// and the 1-bit fused fixtures across `top_k`, `top_p`, min-p, temperature
+/// and seed, and on the real 1.7B, against the route switched off and an
+/// independently spelled-out classic loop), so switching it off
+/// ([`SampledTopKMode::Off`] through [`InferenceEngine::set_sampled_topk`])
+/// only changes what each decode step downloads, never the output.
 ///
-/// # What the opt-in route guarantees today
+/// # What the route guarantees
 ///
 /// * Every step whose full row is on the host anyway — the prefill row, and
 ///   every fallback step — is drawn by the classic sampler over that full
 ///   row, exactly as under [`SampledTopKMode::Off`].
 /// * A candidate step draws with the engine's own sampler over the candidate
 ///   sub-row (descending logit, an exact tie to the lower id), consuming
-///   exactly one random draw as the classic sampler does. The GPU download is
-///   bit-identical to the CPU extraction of the same row
+///   exactly one random draw as the classic sampler does, and picking the
+///   same token. The GPU download is bit-identical to the CPU extraction of
+///   the same row
 ///   ([`SampledTopKMode::FullRowCandidates`]; tested on a fused fixture and
 ///   on the real 1.7B).
 /// * Candidates that cannot stand in for the row — a non-finite value inside
@@ -164,19 +171,20 @@ pub struct SampledTopKConfig {
 }
 
 impl Default for SampledTopKConfig {
-    /// The route disabled ([`SampledTopKMode::Off`]), with
-    /// [`DEFAULT_SAMPLED_TOPK_CANDIDATES`] candidates ready for an opt-in.
+    /// The route on ([`SampledTopKMode::GpuCandidates`]) with
+    /// [`DEFAULT_SAMPLED_TOPK_CANDIDATES`] candidates per decode step.
     fn default() -> Self {
         Self {
-            mode: SampledTopKMode::Off,
+            mode: SampledTopKMode::GpuCandidates,
             candidates: DEFAULT_SAMPLED_TOPK_CANDIDATES,
         }
     }
 }
 
 impl SampledTopKConfig {
-    /// The opt-in configuration: [`SampledTopKMode::GpuCandidates`] with
-    /// [`DEFAULT_SAMPLED_TOPK_CANDIDATES`] candidates per decode step.
+    /// [`SampledTopKMode::GpuCandidates`] with
+    /// [`DEFAULT_SAMPLED_TOPK_CANDIDATES`] candidates per decode step (the
+    /// default configuration, spelled out).
     #[must_use]
     pub fn gpu_candidates() -> Self {
         Self {
@@ -238,12 +246,12 @@ pub fn top_k_candidates(row: &[f32], k: usize) -> (Vec<u32>, Vec<f32>) {
 /// conventions existed on the CPU side alone (sampler `max_by` → last,
 /// engine loops → first). First-index is the one convention; this helper is
 /// the engine's single implementation of it, and every CPU decode loop in
-/// this module routes through it. The GPU argmax kernel now implements this
-/// same convention too (`perf-11` / `FIX2-KERN`; see
-/// [`crate::engine_control::GPU_ARGMAX_TIEBREAK_IS_FIRST_INDEX`] for the fix
-/// and the kernel-level test that verifies it), so this function and the
-/// GPU kernel agree on ties rather than the gate existing to route around a
-/// permanent mismatch.
+/// this module routes through it. The GPU argmax kernel implements this
+/// same convention (`perf-11`; see
+/// [`crate::engine_control::GPU_ARGMAX_TIEBREAK_IS_FIRST_INDEX`] for the
+/// kernel-level test that verifies it), so this function and the GPU kernel
+/// agree on ties rather than the gate existing to route around a permanent
+/// mismatch.
 ///
 /// `NaN` never wins: `v > best` is false for `NaN`, so an all-`NaN` slice
 /// yields index `0` rather than a panic.
@@ -266,7 +274,7 @@ impl<'a> InferenceEngine<'a> {
     /// token, downloading only the 4-byte token id instead of the full f32
     /// logits vector. On a Metal dispatch failure mid-generation the decode
     /// transparently rebuilds the CPU KV cache and continues on the CPU (see
-    /// [`Self::greedy_decode_token_with_fallback`]) rather than emitting a
+    /// `Self::greedy_decode_token_with_fallback`) rather than emitting a
     /// corrupted continuation.
     ///
     /// ## Penalties are honoured, never ignored (`RT-24`)
@@ -277,17 +285,17 @@ impl<'a> InferenceEngine<'a> {
     /// [`Self::generate_greedy_penalised`], which downloads the full row and
     /// applies the same penalty stage the CPU path uses, rather than
     /// silently dropping the penalties (the defect) or failing the request
-    /// (which would break every caller that leaves
-    /// `SamplingParams::default()`'s `repetition_penalty: 1.1` in place).
+    /// (which would break every caller that configures a repetition
+    /// penalty and asks for greedy output).
     ///
-    /// ## The tie-break gate applies here too (wave-2 verifier follow-up)
+    /// ## The tie-break gate applies here too
     ///
     /// Unlike `generate`/`generate_tracked`/the streaming pair, this is a
     /// **direct, unconditional** entry point: the CLI's `--temperature 0`
     /// fast path (`cmd_run.rs`) calls it without going through
     /// [`InferenceEngine::greedy_gpu_eligible`] at all. It shares the exact
     /// same underlying risk those four routed callers do — a mid-generation
-    /// [`Self::greedy_decode_token_with_fallback`] call returns whatever
+    /// `Self::greedy_decode_token_with_fallback` call returns whatever
     /// `forward_greedy_gpu` produces for the *second* and later tokens
     /// without re-deriving it on the CPU — so it consults
     /// [`crate::engine_control::GPU_ARGMAX_TIEBREAK_IS_FIRST_INDEX`] itself
@@ -462,11 +470,11 @@ impl<'a> InferenceEngine<'a> {
     ///
     /// Returns the greedy argmax token id. On the CPU fallback branch this is
     /// [`argmax_first`]'s first-index tie-break; on the GPU branch it is
-    /// whatever `forward_greedy_gpu` returns, which now agrees with that same
-    /// first-index rule on a tie (`perf-11` / `FIX2-KERN` fixed both the MSL
-    /// and CUDA argmax kernels; see
+    /// whatever `forward_greedy_gpu` returns, which agrees with that same
+    /// first-index rule on a tie (`perf-11`: both the MSL and CUDA argmax
+    /// kernels compare original indices on a value tie; see
     /// [`crate::engine_control::GPU_ARGMAX_TIEBREAK_IS_FIRST_INDEX`] for the
-    /// fix and the kernel-level test that verifies it) — so a caller reached
+    /// kernel-level test that verifies it) — so a caller reached
     /// through either [`InferenceEngine::greedy_gpu_eligible`]'s routed
     /// entry points or `generate_greedy_gpu`'s direct one gets the same
     /// tie-break regardless of which branch below actually answers.
@@ -515,8 +523,7 @@ impl<'a> InferenceEngine<'a> {
                 // recovered from -- dropping the request would be worse --
                 // but at `error` level with its stable code, so it is
                 // distinguishable from the designed signal above instead of
-                // being swallowed into the same `warn!` (gatekeeper
-                // REQUIRED #3).
+                // being swallowed into the same `warn!`.
                 Err(e) => {
                     let code = e
                         .downcast_ref::<oxibonsai_model::error::ModelError>()
@@ -641,11 +648,11 @@ impl<'a> InferenceEngine<'a> {
         let mut cpu_fallback_active = false;
         // Optional debug / test seam: after this many committed tokens, force the
         // remainder of the decode onto the CPU path (exercises the KV-cache
-        // rebuild without a real GPU fault). Resolved once (already applied
-        // from the legacy `OXIBONSAI_FORCE_CPU_DECODE_AFTER` env var at
-        // construction, via `SpeculativeConfig::with_env_override` — a
-        // wave-2 verifier finding folded this out of a raw per-call env read
-        // and into the documented config alongside `RT-27`'s own variable).
+        // rebuild without a real GPU fault). Resolved once: the legacy
+        // `OXIBONSAI_FORCE_CPU_DECODE_AFTER` env var is applied at
+        // construction, via `SpeculativeConfig::with_env_override`, into the
+        // documented config alongside `RT-27`'s own variable — never read
+        // per call inside the loop.
         let force_cpu_after: Option<usize> = spec.force_cpu_decode_after;
 
         let mut next_token = first_token;
@@ -849,9 +856,8 @@ impl InferenceEngine<'_> {
         self.sampled_topk
     }
 
-    /// Configure the sampled top-k route: opt in with
-    /// [`SampledTopKConfig::gpu_candidates`], choose the candidate count, or
-    /// select the full-row reference / disabled (default) modes.
+    /// Configure the sampled top-k route: the candidate count, or the
+    /// full-row reference / disabled modes.
     pub fn set_sampled_topk(&mut self, config: SampledTopKConfig) {
         self.sampled_topk = config;
     }
@@ -866,7 +872,7 @@ impl InferenceEngine<'_> {
     /// the top-k route (`perf-11`, sampled half): the fused GPU route, a
     /// truly sampled request, no penalty (a penalty must see every logit),
     /// no need for the full row (`needs_full_logits`: logprobs), the route
-    /// enabled (it is **off** by default), and the sampler's `top_k` within
+    /// enabled, and the sampler's `top_k` within
     /// `1..=candidates` and below the vocabulary — see [`SampledTopKConfig`]
     /// for why those last two conditions are what make the candidate sub-row
     /// an exact stand-in for the full row.
@@ -889,13 +895,45 @@ impl InferenceEngine<'_> {
     }
 
     /// Count a sampled request on the fused GPU route that is about to decode
-    /// the full logit row because it is not eligible for the top-k route.
+    /// the full logit row because it is not eligible for the top-k route —
+    /// in [`EngineStats`](crate::engine::EngineStats) and, when attached, in
+    /// the Prometheus `oxibonsai_sampled_full_row_requests_total` counter.
     #[cfg(all(feature = "metal", target_os = "macos"))]
     pub(crate) fn note_sampled_full_row_request(&self) {
         if self.uses_fused_gpu_decode() && self.sampler_is_sampled() {
             self.stats
                 .sampled_full_row_requests
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(m) = &self.metrics {
+                m.sampled_full_row_requests_total.inc();
+            }
+        }
+    }
+
+    /// Count one decode step served from GPU top-k candidates
+    /// ([`EngineStats`](crate::engine::EngineStats) and, when attached, the
+    /// Prometheus `oxibonsai_sampled_topk_steps_total` counter).
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    fn note_sampled_topk_step(&self) {
+        self.stats
+            .sampled_topk_steps
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(m) = &self.metrics {
+            m.sampled_topk_steps_total.inc();
+        }
+    }
+
+    /// Count one top-k-route decode step that downloaded the full logit row
+    /// instead ([`EngineStats`](crate::engine::EngineStats) and, when
+    /// attached, the Prometheus `oxibonsai_sampled_topk_full_row_steps_total`
+    /// counter).
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    fn note_sampled_topk_full_row_step(&self) {
+        self.stats
+            .sampled_topk_full_row_steps
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(m) = &self.metrics {
+            m.sampled_topk_full_row_steps_total.inc();
         }
     }
 
@@ -920,14 +958,11 @@ impl InferenceEngine<'_> {
     /// performs, and what [`SampledTopKMode::FullRowCandidates`] runs as its
     /// bit-exact reference.
     ///
-    /// This is the opt-in route's *candidate* realisation, **not** the
-    /// classic full-row sampler: until `Sampler::sample_core` walks its
-    /// survivors in a canonical order (see [`SampledTopKConfig`]), a seeded
-    /// draw through this function and a seeded `Sampler::sample` over the
-    /// same full row pick different — equally distributed — tokens on a
-    /// share of rows (measured: 125 of 200 tie-heavy rows at `top_k 20,
-    /// top_p 1.0`). That is exactly why the route is off by default; the
-    /// shipped default path never calls this.
+    /// Because `Sampler::sample_core` walks its top-k survivors in the
+    /// canonical order (see [`SampledTopKConfig`]), a seeded draw through
+    /// this function and a seeded `Sampler::sample` over the same full row
+    /// pick the same token whenever `k >= top_k` (tested draw for draw on
+    /// tie-heavy rows).
     #[cfg(test)]
     pub(crate) fn sample_row_candidates(&mut self, row: &[f32], k: usize) -> RuntimeResult<u32> {
         let (ids, values) = top_k_candidates(row, k);
@@ -938,7 +973,7 @@ impl InferenceEngine<'_> {
     /// — exactly the draw [`SampledTopKMode::Off`] makes at every step. The
     /// route uses it for every step whose full row is on the host anyway
     /// (the prefill row and every fallback), so those steps can never differ
-    /// from the default path.
+    /// from the route switched off.
     #[cfg(all(feature = "metal", target_os = "macos"))]
     fn sample_full_row(&mut self, row: &[f32]) -> RuntimeResult<u32> {
         self.sampler.sample(row)
@@ -994,8 +1029,6 @@ impl InferenceEngine<'_> {
         cpu_fallback_active: &mut bool,
         force_cpu: bool,
     ) -> RuntimeResult<u32> {
-        use std::sync::atomic::Ordering;
-
         let gpu_attempt = match &self.model {
             LoadedModel::Dense(model) if !*cpu_fallback_active && !force_cpu => {
                 Some(model.forward_greedy_gpu(token, pos))
@@ -1014,9 +1047,7 @@ impl InferenceEngine<'_> {
                                 argmax_id,
                             ) =>
                         {
-                            self.stats
-                                .sampled_topk_steps
-                                .fetch_add(1, Ordering::Relaxed);
+                            self.note_sampled_topk_step();
                             return self.sample_candidates(&candidates.ids, &candidates.values);
                         }
                         Ok(candidates) => tracing::debug!(
@@ -1035,9 +1066,7 @@ impl InferenceEngine<'_> {
                     }
                 }
                 // The logits are still resident: no second forward needed.
-                self.stats
-                    .sampled_topk_full_row_steps
-                    .fetch_add(1, Ordering::Relaxed);
+                self.note_sampled_topk_full_row_step();
                 let row = Self::download_resident_row(vocab)?;
                 if self.sampled_topk.mode == SampledTopKMode::FullRowCandidates {
                     let (ids, values) = top_k_candidates(&row, k);
@@ -1069,9 +1098,7 @@ impl InferenceEngine<'_> {
             None => {}
         }
 
-        self.stats
-            .sampled_topk_full_row_steps
-            .fetch_add(1, Ordering::Relaxed);
+        self.note_sampled_topk_full_row_step();
         let logits = if *cpu_fallback_active {
             self.forward_logits_on(token, pos, cpu_kernel)?
         } else {
@@ -1224,9 +1251,9 @@ mod tests {
 
     /// §5.4 of the divergence report: every *CPU-side* argmax in the engine
     /// must break ties toward the **first** index — the sampler's convention
-    /// (`RT-22`). The MSL/CUDA kernels now share this convention too
-    /// (`GPU_ARGMAX_TIEBREAK_IS_FIRST_INDEX`, `perf-11` / `FIX2-KERN`), and
-    /// this helper is the CPU-side reference both tiers agree with.
+    /// (`RT-22`). The MSL/CUDA kernels share this convention
+    /// (`GPU_ARGMAX_TIEBREAK_IS_FIRST_INDEX`, `perf-11`), and this helper is
+    /// the CPU-side reference both tiers agree with.
     #[test]
     fn argmax_first_breaks_ties_toward_the_first_index() {
         assert_eq!(argmax_first(&[1.0, 1.0, 1.0]), 0);
@@ -1275,7 +1302,7 @@ mod tests {
         assert!(!engine.greedy_gpu_eligible(false));
     }
 
-    /// `perf-11` / `FIX2-KERN` follow-up: `generate_greedy_gpu` is a
+    /// `perf-11`: `generate_greedy_gpu` is a
     /// *direct*, unconditional entry point -- unlike
     /// `generate`/`generate_tracked`/the streaming pair, it never consults
     /// `greedy_gpu_eligible`, so it checks

@@ -1,13 +1,42 @@
 //! K-quant (Q2K / Q3K / Q4K / Q5K / Q6K / Q8K) CUDA batch-prefill helpers and
 //! entry points (Phase 25).
 
+use super::super::q1_slots::SlotNamespace;
 use super::super::{BonsaiModel, OutputWeight};
 use super::byte_helpers::{
     blocks_q2k_as_bytes, blocks_q3k_as_bytes, blocks_q4k_as_bytes, blocks_q5k_as_bytes,
     blocks_q6k_as_bytes, blocks_q8k_as_bytes,
 };
 
+/// This format's index into the CUDA K-quant slot layout (`0..`
+/// [`super::super::q1_slots::K_QUANT_FORMAT_COUNT`]), matching
+/// `KQuantFormat`'s declaration order.
+///
+/// `q1_slots` itself cannot name `oxibonsai_kernels::KQuantFormat` (that
+/// type is exported only on the `native-cuda` + linux/windows build, while
+/// `q1_slots`'s slot arithmetic is plain data compiled — and tested — on
+/// every host), so this file, which already requires that same gate for
+/// everything else it does, is where the conversion happens.
+const fn k_quant_format_slot_index(fmt: oxibonsai_kernels::KQuantFormat) -> u64 {
+    match fmt {
+        oxibonsai_kernels::KQuantFormat::Q2K => 0,
+        oxibonsai_kernels::KQuantFormat::Q3K => 1,
+        oxibonsai_kernels::KQuantFormat::Q4K => 2,
+        oxibonsai_kernels::KQuantFormat::Q5K => 3,
+        oxibonsai_kernels::KQuantFormat::Q6K => 4,
+        oxibonsai_kernels::KQuantFormat::Q8K => 5,
+    }
+}
+
 impl<'a> BonsaiModel<'a> {
+    /// This model's CUDA K-quant slot namespace: the composition over its
+    /// `cuda_model_epoch`, shared with every other CUDA family's namespace
+    /// (see
+    /// [`BonsaiModel::cuda_q1_slots`](super::super::q1::BonsaiModel::cuda_q1_slots)).
+    fn cuda_k_quant_slots(&self) -> SlotNamespace {
+        SlotNamespace::new(self.cuda_model_epoch)
+    }
+
     // ── Phase 25: K-quant batch GEMM prefill ─────────────────────────────────
 
     /// GPU batch prefill for K-quant models: all layers + final norm + LM head.
@@ -24,9 +53,11 @@ impl<'a> BonsaiModel<'a> {
         if n_layers == 0 {
             return Err("no blocks".into());
         }
-        // F6 SPLIT-CACHE GUARD. `cuda_split_prefill_allowed` is always false
-        // today: see it and `cuda_split_prefill_disabled` for why, and for why
-        // the `OXIBONSAI_FORCE_CUDA_SPLIT_PREFILL` override no longer overrides.
+        // F6 SPLIT-CACHE GUARD. `cuda_split_prefill_allowed` is false for
+        // this family: its device KV cache is GPU-private and no K/V
+        // read-back is stored into `self.kv_cache` here (see it and
+        // `cuda_split_prefill_disabled`, including why the
+        // `OXIBONSAI_FORCE_CUDA_SPLIT_PREFILL` override no longer overrides).
         if !super::cuda_split_prefill_allowed() {
             return Err(super::cuda_split_prefill_disabled("K-quant", false));
         }
@@ -60,17 +91,11 @@ impl<'a> BonsaiModel<'a> {
             sin_table[t * half_dim..(t + 1) * half_dim].copy_from_slice(sin_vals);
         }
 
-        // Handle namespaces for final norm + LM head (Phase 25 ranges)
-        let format_offset: u64 = match fmt {
-            oxibonsai_kernels::KQuantFormat::Q2K => 0,
-            oxibonsai_kernels::KQuantFormat::Q3K => 1_000_000,
-            oxibonsai_kernels::KQuantFormat::Q4K => 2_000_000,
-            oxibonsai_kernels::KQuantFormat::Q5K => 3_000_000,
-            oxibonsai_kernels::KQuantFormat::Q6K => 4_000_000,
-            oxibonsai_kernels::KQuantFormat::Q8K => 5_000_000,
-        };
-        let final_norm_handle = 24_000_000u64 + format_offset;
-        let lm_head_handle = 25_000_000u64 + format_offset;
+        // Handle namespaces for final norm + LM head: composed over this
+        // model's `cuda_model_epoch`, per format.
+        let format_idx = k_quant_format_slot_index(fmt);
+        let final_norm_handle = self.cuda_k_quant_slots().k_quant_final_norm(format_idx);
+        let lm_head_handle = self.cuda_k_quant_slots().k_quant_lm_head(format_idx);
         let final_norm_bytes = self.output_norm.weight();
         let final_norm_eps = self.output_norm.eps();
 
@@ -113,6 +138,9 @@ impl<'a> BonsaiModel<'a> {
             fmt,
             Some(&mut logits),
             None,
+            // F6: no read-back is stored for this family yet, which is why
+            // `cuda_split_prefill_allowed()` keeps it refused above.
+            None,
         )
         .map_err(|e| {
             tracing::warn!(error = %e, "CUDA K-quant batch prefill dispatch failed");
@@ -136,9 +164,11 @@ impl<'a> BonsaiModel<'a> {
         if n_layers == 0 {
             return Err("no blocks".into());
         }
-        // F6 SPLIT-CACHE GUARD. `cuda_split_prefill_allowed` is always false
-        // today: see it and `cuda_split_prefill_disabled` for why, and for why
-        // the `OXIBONSAI_FORCE_CUDA_SPLIT_PREFILL` override no longer overrides.
+        // F6 SPLIT-CACHE GUARD. `cuda_split_prefill_allowed` is false for
+        // this family: its device KV cache is GPU-private and no K/V
+        // read-back is stored into `self.kv_cache` here (see it and
+        // `cuda_split_prefill_disabled`, including why the
+        // `OXIBONSAI_FORCE_CUDA_SPLIT_PREFILL` override no longer overrides).
         if !super::cuda_split_prefill_allowed() {
             return Err(super::cuda_split_prefill_disabled("K-quant", true));
         }
@@ -151,16 +181,9 @@ impl<'a> BonsaiModel<'a> {
         let heads_per_group = nq.checked_div(nkv).unwrap_or(1);
         let max_seq_len = self.kv_cache.max_seq_len();
 
-        let format_offset: u64 = match fmt {
-            oxibonsai_kernels::KQuantFormat::Q2K => 0,
-            oxibonsai_kernels::KQuantFormat::Q3K => 1_000_000,
-            oxibonsai_kernels::KQuantFormat::Q4K => 2_000_000,
-            oxibonsai_kernels::KQuantFormat::Q5K => 3_000_000,
-            oxibonsai_kernels::KQuantFormat::Q6K => 4_000_000,
-            oxibonsai_kernels::KQuantFormat::Q8K => 5_000_000,
-        };
-        let final_norm_handle = 24_000_000u64 + format_offset;
-        let lm_head_handle = 25_000_000u64 + format_offset;
+        let format_idx = k_quant_format_slot_index(fmt);
+        let final_norm_handle = self.cuda_k_quant_slots().k_quant_final_norm(format_idx);
+        let lm_head_handle = self.cuda_k_quant_slots().k_quant_lm_head(format_idx);
         let final_norm_bytes = self.output_norm.weight();
         let final_norm_eps = self.output_norm.eps();
 
@@ -212,6 +235,8 @@ impl<'a> BonsaiModel<'a> {
                 fmt,
                 None,
                 Some(&mut greedy_id),
+                // F6: see the batch-prefill call above.
+                None,
             )
             .map_err(|e| {
                 tracing::warn!(
@@ -278,13 +303,10 @@ impl<'a> BonsaiModel<'a> {
 
     /// Build per-layer `CudaKQuantPrefillLayerParams` for the K-quant CUDA path.
     ///
-    /// Handle namespaces (non-overlapping with all existing ranges 1M–23M):
-    ///   Q2K norms: 12_000_000 + layer*10,  weights: 13_000_000 + layer*10
-    ///   Q3K norms: 14_000_000 + layer*10,  weights: 15_000_000 + layer*10
-    ///   Q4K norms: 16_000_000 + layer*10,  weights: 17_000_000 + layer*10
-    ///   Q5K norms: 18_000_000 + layer*10,  weights: 19_000_000 + layer*10
-    ///   Q6K norms: 20_000_000 + layer*10,  weights: 21_000_000 + layer*10
-    ///   Q8K norms: 22_000_000 + layer*10,  weights: 23_000_000 + layer*10
+    /// Handle namespaces: every norm / weight handle is composed over this
+    /// model's `cuda_model_epoch` via [`SlotNamespace::k_quant_norm_base`] /
+    /// [`SlotNamespace::k_quant_weight_base`], distinct per format and from
+    /// every other family's and every other model's namespace.
     pub(super) fn build_cuda_k_quant_layer_params<'b>(
         &'b self,
         qkv_concats: &'b [Vec<u8>],
@@ -295,19 +317,14 @@ impl<'a> BonsaiModel<'a> {
         if n_layers == 0 {
             return Err("no blocks".into());
         }
-        let (norm_base, weight_base): (u64, u64) = match fmt {
-            oxibonsai_kernels::KQuantFormat::Q2K => (12_000_000, 13_000_000),
-            oxibonsai_kernels::KQuantFormat::Q3K => (14_000_000, 15_000_000),
-            oxibonsai_kernels::KQuantFormat::Q4K => (16_000_000, 17_000_000),
-            oxibonsai_kernels::KQuantFormat::Q5K => (18_000_000, 19_000_000),
-            oxibonsai_kernels::KQuantFormat::Q6K => (20_000_000, 21_000_000),
-            oxibonsai_kernels::KQuantFormat::Q8K => (22_000_000, 23_000_000),
-        };
+        SlotNamespace::check_layer_count(n_layers)?;
+        let slots = self.cuda_k_quant_slots();
+        let format_idx = k_quant_format_slot_index(fmt);
         let mut layer_params: Vec<oxibonsai_kernels::CudaKQuantPrefillLayerParams<'b>> =
             Vec::with_capacity(n_layers);
         for (i, block) in self.blocks.iter().enumerate() {
-            let norm_handle_base = norm_base + (block.layer_index() as u64) * 10;
-            let weight_handle_base = weight_base + (block.layer_index() as u64) * 10;
+            let norm_handle_base = slots.k_quant_norm_base(block.layer_index(), format_idx);
+            let weight_handle_base = slots.k_quant_weight_base(block.layer_index(), format_idx);
             let (attn_proj_bytes, gate_bytes, up_bytes, down_bytes): (&[u8], &[u8], &[u8], &[u8]) =
                 match fmt {
                     oxibonsai_kernels::KQuantFormat::Q2K => (

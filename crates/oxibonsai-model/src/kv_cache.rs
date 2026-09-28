@@ -717,7 +717,7 @@ impl KvCache {
         self.capacity
     }
 
-    /// Validate a `store_key`/`store_value` call and make sure `pos` is
+    /// Validate a `try_store_key`/`try_store_value` call and make sure `pos` is
     /// allocated (growing a lazy cache on demand).
     ///
     /// Mirrors the checks performed by [`crate::kv_cache_fp16::KvCacheFp16::store`]
@@ -784,21 +784,17 @@ impl KvCache {
 
     /// Store a key vector, **silently ignoring** an out-of-range call.
     ///
-    /// This form exists only for source compatibility with call sites that
-    /// pre-date [`try_store_key`](Self::try_store_key) (M-26): it drops the
-    /// error instead of returning it. Prefer `try_store_key` for every new
-    /// call site — in particular for a sparse cache, where a dropped store
-    /// loses an entire full-attention layer's history for the position.
+    /// This form exists only for callers that deliberately want the
+    /// pre-[`try_store_key`](Self::try_store_key) contract (M-26): it drops
+    /// the error instead of returning it. Prefer `try_store_key` for every
+    /// new call site — in particular for a sparse cache, where a dropped
+    /// store loses an entire full-attention layer's history for the position.
+    ///
+    /// The error-swallowing `store_key` / `store_value` forwarders this used
+    /// to back are gone: every caller either propagates the error
+    /// (`try_store_*`) or names this lossy form explicitly.
     pub fn store_key_lossy(&mut self, layer: usize, head: usize, pos: usize, key: &[f32]) {
         let _ = self.try_store_key(layer, head, pos, key);
-    }
-
-    /// Legacy spelling of [`store_key_lossy`](Self::store_key_lossy), kept
-    /// only so call sites that pre-date the rename keep compiling; same
-    /// error-swallowing behaviour. New code uses
-    /// [`try_store_key`](Self::try_store_key).
-    pub fn store_key(&mut self, layer: usize, head: usize, pos: usize, key: &[f32]) {
-        self.store_key_lossy(layer, head, pos, key);
     }
 
     /// Store a key vector for `(layer, head, pos)`, growing a lazy cache's
@@ -827,11 +823,6 @@ impl KvCache {
     /// [`store_key_lossy`](Self::store_key_lossy).
     pub fn store_value_lossy(&mut self, layer: usize, head: usize, pos: usize, value: &[f32]) {
         let _ = self.try_store_value(layer, head, pos, value);
-    }
-
-    /// Legacy spelling of [`store_value_lossy`](Self::store_value_lossy).
-    pub fn store_value(&mut self, layer: usize, head: usize, pos: usize, value: &[f32]) {
-        self.store_value_lossy(layer, head, pos, value);
     }
 
     /// Fallible value store; same contract as

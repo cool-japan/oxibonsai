@@ -157,7 +157,7 @@ impl ArgmaxHarness {
             self.capacity,
             values.len()
         );
-        objc::rc::autoreleasepool(|| {
+        metal::objc::rc::autoreleasepool(|| {
             // SAFETY: `StorageModeShared` buffer sized for `capacity` f32s;
             // `values.len() <= capacity` is asserted above.
             unsafe {

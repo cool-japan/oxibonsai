@@ -10,23 +10,33 @@
 //!    first [`ToolCall`] it finds, matching against a provided registry.
 //! 3. **Convenience constructors**: `make_tool_call` and `new_tool_call_id`
 //!    expose the low-level helpers under module-level names.
-//! 4. **XML tool calls** (B2-13/RT-11, bonsai2-design.md §5.4): Bonsai 2's
-//!    chat template teaches the model
+//! 4. **XML tool calls** (RT-11, bonsai2-design.md §5.4): Bonsai 2's chat
+//!    template teaches the model
 //!    `<tool_call>\n<function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>\n
 //!    </function>\n</tool_call>`, not the JSON payload `select_tool`/
 //!    `parse_tool_call` above expect. [`parse_xml_tool_calls`] parses that
-//!    shape (zero or more calls per message); [`parse_tool_calls`] is the
-//!    single entry point server/extended handlers should call — it tries
+//!    shape (zero or more calls per message); [`parse_tool_calls`] tries
 //!    the XML shape first and falls back to the legacy JSON shape, so
 //!    neither format regresses. A truncated `<tool_call>` (still open at
 //!    end of text — the model was cut off, or is still streaming) yields
 //!    [`ToolParseError::Truncated`], never a panic and never a half-formed
 //!    call.
+//! 5. **Token-level extraction** ([`ToolCallStreamExtractor`]): what the chat
+//!    endpoints run over a response's content, streamed or not — id-gated
+//!    openers, each call released the moment its block closes, in either
+//!    the XML or the JSON form.
 
 use std::collections::HashMap;
 
 use crate::api_types::{FunctionCallResult, ToolCall, ToolDefinition};
 use crate::grammar::{compile_json_schema, Grammar, Rule, Symbol};
+
+/// Token-level tool-call extraction, in its own file to keep this one under
+/// the workspace's 2000-line ceiling.
+#[path = "tool_calling_extract.rs"]
+mod extract;
+
+pub use extract::{ToolCallStreamExtractor, ToolStreamEnd, ToolStreamEvent};
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -327,16 +337,15 @@ pub fn validate_tool_arguments(
             reason: e.to_string(),
         })?;
 
-    if !parsed.is_object() {
+    let Some(obj) = parsed.as_object() else {
         return Err(ToolCallError::MalformedArguments {
             reason: "tool arguments must be a JSON object".to_string(),
         });
-    }
+    };
 
     // Validate required properties if defined in the schema.
     if let Some(required) = tool.function.parameters.get("required") {
         if let Some(req_arr) = required.as_array() {
-            let obj = parsed.as_object().expect("parsed is_object checked above");
             for req_field in req_arr {
                 if let Some(field_name) = req_field.as_str() {
                     if !obj.contains_key(field_name) {
@@ -353,7 +362,7 @@ pub fn validate_tool_arguments(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// XML tool-call parsing (B2-13/RT-11, bonsai2-design.md §5.4)
+// XML tool-call parsing (RT-11, bonsai2-design.md §5.4)
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Errors from [`parse_xml_tool_calls`].
@@ -389,13 +398,63 @@ impl std::error::Error for ToolParseError {}
 pub struct XmlToolCall {
     /// The function name from `<function=NAME>`.
     pub name: String,
-    /// `<parameter=KEY>VALUE</parameter>` pairs, in the order they appeared.
+    /// `<parameter=KEY>VALUE</parameter>` pairs in the order the model
+    /// emitted them — the order [`Self::arguments_json`] serializes them in,
+    /// which is the order the reference parser's OpenAI `arguments` string
+    /// carries them.
+    ///
     /// A `VALUE` that parses as JSON (a number, boolean, array, object, or
     /// `null`) is stored as that parsed value; otherwise it is stored as a
     /// JSON string — mirroring the template's own convention of emitting
     /// `|tojson` for non-string arguments and raw text for string ones
-    /// (bonsai2-design.md §5.4).
-    pub arguments: serde_json::Map<String, serde_json::Value>,
+    /// (bonsai2-design.md §5.4). A value that is itself a JSON object is a
+    /// [`serde_json::Value`], so *its* keys serialize sorted; only the
+    /// top-level parameter order is the model's.
+    ///
+    /// **Repeated keys:** a `<parameter=KEY>` the model emits twice appears
+    /// once, at the position of its first emission, holding its **last**
+    /// value. The reference parser appends every pair to the arguments
+    /// string verbatim (`{"k":v1,…,"k":v2}`), and that is exactly what a
+    /// JSON client decoding that string sees: the last value, at the
+    /// position the key was first inserted.
+    pub arguments: Vec<(String, serde_json::Value)>,
+}
+
+impl XmlToolCall {
+    /// The value of parameter `key`, if the model emitted one.
+    pub fn argument(&self, key: &str) -> Option<&serde_json::Value> {
+        self.arguments
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value)
+    }
+
+    /// The OpenAI `function.arguments` string: a compact JSON object whose
+    /// keys (escaped by `serde_json`) appear in [`Self::arguments`]' order —
+    /// the model's own emission order — rather than re-sorted the way a
+    /// `serde_json::Map` would re-sort them.
+    pub fn arguments_json(&self) -> String {
+        let mut out = String::from("{");
+        for (index, (key, value)) in self.arguments.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            out.push_str(&serde_json::Value::String(key.clone()).to_string());
+            out.push(':');
+            out.push_str(&value.to_string());
+        }
+        out.push('}');
+        out
+    }
+
+    /// Record one emitted `<parameter=KEY>` pair under the repeated-key
+    /// policy documented on [`Self::arguments`].
+    fn push_argument(&mut self, key: String, value: serde_json::Value) {
+        match self.arguments.iter_mut().find(|(name, _)| *name == key) {
+            Some(slot) => slot.1 = value,
+            None => self.arguments.push((key, value)),
+        }
+    }
 }
 
 const TOOL_CALL_OPEN: &str = "<tool_call>";
@@ -471,6 +530,19 @@ pub fn parse_xml_tool_calls(text: &str) -> Result<(String, Vec<XmlToolCall>), To
     Ok((leading, calls))
 }
 
+/// The value text of one `<parameter=KEY>…</parameter>` element: exactly
+/// one leading and one trailing `'\n'` removed — the template's own framing
+/// (`<parameter=KEY>\n` VALUE `\n</parameter>`), the same split the
+/// reference parser makes by matching the literal `">\n"` opener and
+/// `"\n</parameter>\n"` closer — and nothing else, so whitespace that is
+/// part of the value (indentation, a trailing blank line, surrounding
+/// spaces) survives. A value missing either framing newline keeps that end
+/// as-is.
+fn parameter_value_text(raw: &str) -> &str {
+    let without_open = raw.strip_prefix('\n').unwrap_or(raw);
+    without_open.strip_suffix('\n').unwrap_or(without_open)
+}
+
 /// Parse one `<tool_call>` block's interior (everything between
 /// `<tool_call>` and `</tool_call>`, exclusive).
 fn parse_function_block(inner: &str) -> Result<XmlToolCall, ToolParseError> {
@@ -493,7 +565,10 @@ fn parse_function_block(inner: &str) -> Result<XmlToolCall, ToolParseError> {
         .ok_or_else(|| ToolParseError::Malformed("missing </function> tag".to_string()))?;
     let body = &body_and_after[..function_close_rel];
 
-    let mut arguments = serde_json::Map::new();
+    let mut call = XmlToolCall {
+        name,
+        arguments: Vec::new(),
+    };
     let mut cursor = body;
     while let Some(open_rel) = cursor.find(PARAMETER_OPEN_PREFIX) {
         let after_open = &cursor[open_rel + PARAMETER_OPEN_PREFIX.len()..];
@@ -509,31 +584,32 @@ fn parse_function_block(inner: &str) -> Result<XmlToolCall, ToolParseError> {
                 "missing </parameter> tag".to_string(),
             ));
         };
-        let raw_value = value_and_after[..close_rel].trim();
+        let raw_value = parameter_value_text(&value_and_after[..close_rel]);
         // "Parsed as JSON when they parse, else kept as strings" (§5.4):
         // a bare number/bool/array/object/null round-trips through
         // `serde_json`; anything else (including a bare word with no
         // quotes, which the template never JSON-quotes for a string
-        // argument) becomes a JSON string holding the literal text.
+        // argument) becomes a JSON string holding the literal text —
+        // meaningful leading/trailing whitespace included.
         let value = serde_json::from_str::<serde_json::Value>(raw_value)
             .unwrap_or_else(|_| serde_json::Value::String(raw_value.to_string()));
         if !key.is_empty() {
-            arguments.insert(key, value);
+            call.push_argument(key, value);
         }
         cursor = &value_and_after[close_rel + PARAMETER_CLOSE.len()..];
     }
 
-    Ok(XmlToolCall { name, arguments })
+    Ok(call)
 }
 
 /// Convert parsed XML tool calls into OpenAI-shaped [`ToolCall`]s, minting a
-/// fresh id for each (see [`new_tool_call_id`]).
+/// fresh id for each (see [`new_tool_call_id`]); each `arguments` string is
+/// [`XmlToolCall::arguments_json`], in the model's emission order.
 pub fn xml_tool_calls_to_openai(calls: Vec<XmlToolCall>) -> Vec<ToolCall> {
     calls
         .into_iter()
         .map(|call| {
-            let arguments =
-                serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".to_string());
+            let arguments = call.arguments_json();
             make_tool_call(new_tool_call_id(), call.name, arguments)
         })
         .collect()
@@ -691,11 +767,11 @@ mod xml_tool_call_tests {
         let call = &calls[0];
         assert_eq!(call.name, "example_function_name");
         assert_eq!(
-            call.arguments.get("example_parameter_1"),
+            call.argument("example_parameter_1"),
             Some(&serde_json::Value::String("value_1".to_string()))
         );
         assert_eq!(
-            call.arguments.get("example_parameter_2"),
+            call.argument("example_parameter_2"),
             Some(&serde_json::Value::String(
                 "This is the value for the second parameter\nthat can span\nmultiple lines"
                     .to_string()
@@ -718,6 +794,58 @@ mod xml_tool_call_tests {
         assert!(calls.is_empty());
     }
 
+    /// Only the template's own framing newline on each
+    /// side is removed (`<parameter=KEY>\n` … `\n</parameter>`); whitespace
+    /// that belongs to the value — indentation, surrounding spaces, a
+    /// trailing blank line — survives (the old `trim()` destroyed it).
+    #[test]
+    fn parameter_values_keep_meaningful_edge_whitespace() {
+        let text = concat!(
+            "<tool_call>\n<function=write_file>\n",
+            "<parameter=code>\n    indented();\n\n</parameter>\n",
+            "<parameter=padded>\n  two spaces  \n</parameter>\n",
+            "<parameter=blank_lines>\n\n\nx\n\n\n</parameter>\n",
+            "</function>\n</tool_call>",
+        );
+        let (_, calls) = parse_xml_tool_calls(text).expect("must parse");
+        let arg = |key: &str| calls[0].argument(key).cloned();
+        assert_eq!(arg("code"), Some(serde_json::json!("    indented();\n")));
+        assert_eq!(arg("padded"), Some(serde_json::json!("  two spaces  ")));
+        assert_eq!(
+            arg("blank_lines"),
+            Some(serde_json::json!("\n\nx\n\n")),
+            "exactly ONE framing newline per side is markup"
+        );
+    }
+
+    #[test]
+    fn parameter_value_framing_is_exactly_one_newline_per_side() {
+        assert_eq!(parameter_value_text("\nvalue\n"), "value");
+        assert_eq!(parameter_value_text("\n\nvalue\n\n"), "\nvalue\n");
+        assert_eq!(parameter_value_text("value"), "value");
+        assert_eq!(parameter_value_text("\n"), "");
+        assert_eq!(parameter_value_text(""), "");
+        assert_eq!(parameter_value_text(" \nvalue\n "), " \nvalue\n ");
+    }
+
+    /// JSON-shaped values still parse after the exact framing strip —
+    /// JSON's own insignificant whitespace included.
+    #[test]
+    fn json_values_with_inner_padding_still_parse_as_json() {
+        let text = concat!(
+            "<tool_call>\n<function=f>\n",
+            "<parameter=n>\n  7  \n</parameter>\n",
+            "<parameter=obj>\n{\"a\": [1, 2]}\n</parameter>\n",
+            "</function>\n</tool_call>",
+        );
+        let (_, calls) = parse_xml_tool_calls(text).expect("must parse");
+        assert_eq!(calls[0].argument("n"), Some(&serde_json::json!(7)));
+        assert_eq!(
+            calls[0].argument("obj"),
+            Some(&serde_json::json!({ "a": [1, 2] }))
+        );
+    }
+
     #[test]
     fn numeric_and_boolean_arguments_parse_as_json_not_strings() {
         let text = concat!(
@@ -728,11 +856,11 @@ mod xml_tool_call_tests {
         );
         let (_, calls) = parse_xml_tool_calls(text).expect("must parse");
         assert_eq!(
-            calls[0].arguments.get("count"),
+            calls[0].argument("count"),
             Some(&serde_json::Value::Number(42.into()))
         );
         assert_eq!(
-            calls[0].arguments.get("enabled"),
+            calls[0].argument("enabled"),
             Some(&serde_json::Value::Bool(true))
         );
     }
@@ -821,6 +949,74 @@ mod xml_tool_call_tests {
         let args: serde_json::Value =
             serde_json::from_str(&openai[0].function.arguments).expect("valid JSON");
         assert_eq!(args["example_parameter_1"], "value_1");
+    }
+
+    /// The arguments keep the model's emission order: `zeta` before `alpha`
+    /// in the XML stays `zeta` before `alpha` in the OpenAI string (a
+    /// `serde_json::Map` would have sorted `alpha` first).
+    #[test]
+    fn xml_tool_call_arguments_keep_emission_order_in_the_parser() {
+        let text = concat!(
+            "<tool_call>\n<function=f>\n",
+            "<parameter=zeta>\nlast letter\n</parameter>\n",
+            "<parameter=middle>\n7\n</parameter>\n",
+            "<parameter=alpha>\n{\"b\": true}\n</parameter>\n",
+            "</function>\n</tool_call>",
+        );
+        let (_, calls) = parse_xml_tool_calls(text).expect("must parse");
+        let keys: Vec<&str> = calls[0].arguments.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["zeta", "middle", "alpha"]);
+        assert_eq!(
+            calls[0].arguments_json(),
+            r#"{"zeta":"last letter","middle":7,"alpha":{"b":true}}"#
+        );
+        let openai = xml_tool_calls_to_openai(calls);
+        assert_eq!(
+            openai[0].function.arguments,
+            r#"{"zeta":"last letter","middle":7,"alpha":{"b":true}}"#
+        );
+    }
+
+    /// A repeated `<parameter=k>` keeps `k`'s first position and its last
+    /// value — what a JSON client decoding the reference parser's
+    /// `{"k":"a","j":1,"k":"b"}` arguments string sees.
+    #[test]
+    fn xml_tool_call_repeated_parameter_keeps_its_first_position_and_last_value() {
+        let text = concat!(
+            "<tool_call>\n<function=f>\n",
+            "<parameter=k>\na\n</parameter>\n",
+            "<parameter=j>\n1\n</parameter>\n",
+            "<parameter=k>\nb\n</parameter>\n",
+            "</function>\n</tool_call>",
+        );
+        let (_, calls) = parse_xml_tool_calls(text).expect("must parse");
+        assert_eq!(calls[0].arguments.len(), 2);
+        assert_eq!(calls[0].argument("k"), Some(&serde_json::json!("b")));
+        assert_eq!(calls[0].arguments_json(), r#"{"k":"b","j":1}"#);
+        let reference: serde_json::Value =
+            serde_json::from_str(r#"{"k":"a","j":1,"k":"b"}"#).expect("valid JSON");
+        let ours: serde_json::Value =
+            serde_json::from_str(&calls[0].arguments_json()).expect("valid JSON");
+        assert_eq!(
+            ours, reference,
+            "the value a JSON client decodes is the same"
+        );
+    }
+
+    #[test]
+    fn xml_tool_call_argument_lookup_and_escaped_keys() {
+        let text = concat!(
+            "<tool_call>\n<function=f>\n",
+            "<parameter=say \"hi\">\nx\n</parameter>\n",
+            "</function>\n</tool_call>",
+        );
+        let (_, calls) = parse_xml_tool_calls(text).expect("must parse");
+        assert_eq!(
+            calls[0].argument("say \"hi\""),
+            Some(&serde_json::json!("x"))
+        );
+        assert_eq!(calls[0].argument("missing"), None);
+        assert_eq!(calls[0].arguments_json(), r#"{"say \"hi\"":"x"}"#);
     }
 
     #[test]
@@ -969,8 +1165,14 @@ mod xml_tool_call_tests {
         }
 
         proptest! {
+            /// Arbitrary bytes, lossily decoded — newlines, control bytes and
+            /// `U+FFFD` included (a `".{0,300}"` regex never generates `'\n'`,
+            /// the one character this parser's value framing keys off).
             #[test]
-            fn parse_xml_tool_calls_never_panics_on_arbitrary_text(s in ".{0,300}") {
+            fn parse_xml_tool_calls_never_panics_on_arbitrary_text(
+                bytes in prop::collection::vec(any::<u8>(), 0..512)
+            ) {
+                let s = String::from_utf8_lossy(&bytes);
                 let _ = parse_xml_tool_calls(&s);
             }
 

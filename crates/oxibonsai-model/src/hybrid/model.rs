@@ -3,13 +3,18 @@
 //!
 //! # What is here
 //!
-//! B2-10 landed the **skeleton**: every tensor bound and shape-checked,
-//! both caches allocated, the v-head map, the Hadamard hook and the layer
-//! split. B2-11 landed the **forward**: [`HybridModel::forward`],
-//! [`HybridModel::forward_prefill`] and [`HybridModel::forward_with_dump`],
-//! all three of which are one call into
-//! [`crate::hybrid::forward::run_chunk`] parameterised by batch, plus the
-//! RoPE table and the chunk-wide activation scratch they run in.
+//! * The **skeleton**: every tensor bound and shape-checked, both caches
+//!   allocated, the v-head map, the Hadamard hook and the layer split.
+//! * The **forward**: [`HybridModel::forward`],
+//!   [`HybridModel::forward_prefill`] and [`HybridModel::forward_with_dump`],
+//!   all three of which are one call into
+//!   [`crate::hybrid::forward::run_chunk`] parameterised by batch, plus the
+//!   RoPE table and the chunk-wide activation scratch they run in.
+//! * The **hidden-state seam** embeddings need:
+//!   [`HybridModel::forward_hidden`] and [`HybridModel::embed_mean_pooled`]
+//!   (`forward_hidden.rs`, a child module so it drives the same private
+//!   forward context the prefill does) — `run_chunk` with the LM head
+//!   skipped, `output_norm` applied to every row.
 //!
 //! # Memory: `max_seq_len` is a parameter, never the model's context length
 //!
@@ -17,8 +22,8 @@
 //! that would be 16 slots × 4 kv heads × 256 dims × 2 (K+V) × 262144 × 4 B =
 //! **34 GB** — an OOM kill on a 24 GB machine before the first token. So
 //! [`HybridModel::from_gguf`] takes `max_seq_len` explicitly and
-//! [`DEFAULT_MAX_SEQ_LEN`] is 8192, not the model maximum; the context guard
-//! that turns a RAM budget into a ceiling is B2-12's.
+//! [`DEFAULT_MAX_SEQ_LEN`] is 8192, not the model maximum; the runtime's
+//! context guard is what turns a RAM budget into a ceiling.
 //!
 //! The host cache is the **f16**, layer-sparse cache of design §3.7
 //! (`KvCacheBacking::SparseF16`) — 16 slots × 4 kv heads × 256 dims × 2
@@ -55,6 +60,12 @@ use crate::kv_cache::{KvCache, KvCacheBacking, GROWTH_CHUNK_POSITIONS};
 use crate::layers::linear::LinearLayer;
 use crate::layers::rms_norm::RmsNorm;
 use crate::model_registry::ModelVariant;
+
+/// [`HybridModel::forward_hidden`] / [`HybridModel::embed_mean_pooled`]: a
+/// child of this module (rather than a sibling in `hybrid/`) so it can drive
+/// the private `HybridModel::ctx` forward context and the scratch it fills.
+#[path = "forward_hidden.rs"]
+mod forward_hidden;
 
 /// The KV window a hybrid model is built with unless the caller says
 /// otherwise — the shipped default of design §5.6, **not** the model's
@@ -215,7 +226,7 @@ impl<'a> HybridModel<'a> {
     /// * `gdn_v_grouped = false` with more v-heads than k-heads, which is
     ///   refused outright (design §3.3);
     /// * every tensor's presence and shape, per layer kind (design §3.8);
-    /// * `ssm_a <= 0` on every linear layer, at load (B2-05);
+    /// * `ssm_a <= 0` on every linear layer, at load (`A = -exp(A_log)`);
     /// * the presence of an explicit `output.weight` (a tied head is
     ///   refused, design §3.5).
     ///
@@ -914,11 +925,12 @@ fn bind_linear_layer<'a>(
         ssm_alpha: bind_gate_projection(gguf, layer, names::SSM_ALPHA, hidden, heads, resolved_42)?,
         ssm_beta: bind_gate_projection(gguf, layer, names::SSM_BETA, hidden, heads, resolved_42)?,
         ssm_conv1d: bind_conv1d(gguf, layer, config)?,
-        // `ssm_a` and `ssm_dt.bias` bound by name (never positionally,
-        // B2-05 / gatekeeper REQUIRED #8), `validate_a_neg`-checked at load,
-        // and re-indexed tiled -> grouped through `vhead_map` so they land
-        // in the same v-head order as every other v-indexed quantity this
-        // block produces (gatekeeper blocking finding on this package).
+        // `ssm_a` and `ssm_dt.bias` bound by name (never positionally, so a
+        // reordered tensor table cannot swap them), `validate_a_neg`-checked
+        // at load, and re-indexed tiled -> grouped through `vhead_map` so
+        // they land in the same v-head order as every other v-indexed
+        // quantity this block produces (a raw-row binding put 45 of the 48
+        // heads' gates on the wrong head).
         gates: bind_gdn_gates(gguf, layer, heads, vhead_map)?,
         ssm_norm: load_norm(gguf, &blk(names::SSM_NORM), config.head_v_dim(), eps)?,
         ssm_out: bind_linear(
@@ -1300,7 +1312,7 @@ mod tests {
     }
 }
 
-/// The package's acceptance gate against the **real** Bonsai 2 27B files
+/// The loader's acceptance gate against the **real** Bonsai 2 27B files
 /// (design §7.3 gate G2).
 ///
 /// Model weights are not in the repository, so each case skips when its file
@@ -1451,16 +1463,16 @@ mod real_model_tests {
             assert_eq!(linear.ssm_norm().hidden_size(), 128);
             assert_eq!(linear.gates().a_neg().len(), N_V_HEADS);
             assert_eq!(linear.gates().dt_bias().len(), N_V_HEADS);
-            // B2-05: every ssm_a was validated at load, not mid-decode.
+            // Every ssm_a was validated at load, not mid-decode.
             assert!(
                 linear.gates().a_neg().iter().all(|a| *a <= 0.0),
                 "{filename} layer {layer}: ssm_a must be A = -exp(A_log)"
             );
-            // Gatekeeper's blocking finding, pinned on the REAL file (this is
-            // the exact layer/tensor the verifier's mutation probe measured
-            // 45/48 wrong heads on): `gates().a_neg()`/`dt_bias()` must be in
-            // GROUPED order, i.e. index `m` must equal the raw GGUF row
-            // `vhead_map.tiled(m)`, not the raw row `m` itself.
+            // Pinned on the REAL file (a mutation probe on exactly these
+            // tensors measured 45 of 48 heads wrong under a raw-row binding):
+            // `gates().a_neg()`/`dt_bias()` must be in GROUPED order, i.e.
+            // index `m` must equal the raw GGUF row `vhead_map.tiled(m)`, not
+            // the raw row `m` itself.
             let raw_a = load_dense_f32(&gguf, &block_tensor(layer, names::SSM_A), N_V_HEADS)
                 .unwrap_or_else(|e| panic!("{filename} layer {layer}: raw ssm_a: {e}"));
             let raw_dt = load_dense_f32(&gguf, &block_tensor(layer, names::SSM_DT_BIAS), N_V_HEADS)
@@ -1504,7 +1516,7 @@ mod real_model_tests {
         assert!(hook.is_folded(names::OUTPUT), "{filename}");
         assert_eq!(hook.config().inverse.len(), 1, "{filename}");
         assert!(hook.config().gdn_v_grouped, "{filename}");
-        // The exclusions B2-11 must honour: feeding these the ROTATED
+        // The exclusions the forward must honour: feeding these the ROTATED
         // activation is silent wrong math (design §3.4).
         for layer in split.linear_layers().iter().copied() {
             for suffix in [

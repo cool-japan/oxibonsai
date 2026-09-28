@@ -5,14 +5,15 @@
 //! itself stays under the workspace 2000-line ceiling.
 
 use super::*;
+use crate::request_metrics::RequestRateTracker;
 
-// HOTFIX-TESTMEM: the tests below only need *some* config to prove
+// The tests below only need *some* config to prove
 // `InferenceEngine::new`/`batch_generate`/session-tracking behavior —
-// none of them depend on production-sized dimensions. They used to build
-// `Qwen3Config::bonsai_8b()`, which makes `BonsaiModel::new` allocate
-// ~5 GB of token_embd + output_weight tables (plus a ~1.2 GB KV cache)
-// per test; `tiny_test()` exercises the identical code path for a few
-// tens of MB.
+// none of them depend on production-sized dimensions. They use
+// `Qwen3Config::tiny_test()`, not `Qwen3Config::bonsai_8b()`, whose
+// `BonsaiModel::new` would allocate ~5 GB of token_embd + output_weight
+// tables (plus a ~1.2 GB KV cache) per test; `tiny_test()` exercises the
+// identical code path for a few tens of MB.
 
 #[test]
 fn engine_creation() {
@@ -476,7 +477,7 @@ fn greedy_gpu_eligibility_requires_a_penalty_free_greedy_sampler() {
     assert!(!engine.greedy_gpu_eligible(false));
 }
 
-/// Gate-fix triage (wave 3), gatekeeper REQUIRED#1(a): `SamplingParams::default()`
+/// `RT-24`: `SamplingParams::default()`
 /// used to carry a hidden `repetition_penalty: 1.1`, which silently
 /// disqualified every plain `temperature: 0` request from the fused GPU
 /// argmax path (and every other `..SamplingParams::default()` seed site in
@@ -663,7 +664,7 @@ fn generate_with_logprobs_empty_prompt() {
     assert!(logprobs.is_empty());
 }
 
-// ── wave-2 verifier: GPU-argmax tie-break dependency gate ──────────────
+// ── GPU-argmax tie-break dependency gate ──────────────────────────────
 
 /// Proves the gate actually gates: an engine presenting every *other*
 /// condition `greedy_gpu_eligible` checks (fused route, GPU kernel tier,
@@ -720,7 +721,7 @@ fn greedy_gpu_eligible_reflects_the_tiebreak_gate_state() {
     );
 }
 
-// ── wave-2 verifier: EngineStats symmetry across decode routes ─────────
+// ── EngineStats symmetry across decode routes ─────────────────────────
 
 #[test]
 fn generate_streaming_sync_records_engine_stats() {
@@ -1006,4 +1007,339 @@ fn replicas_share_resident_weights_and_drop_releases_only_their_own_epoch() {
     assert_eq!(third_uploads.fresh_buffers, first_uploads.fresh_buffers);
     assert_eq!(third_uploads.fresh_bytes, first_uploads.fresh_bytes);
     assert_eq!(third_uploads.shared_buffers, 0);
+}
+
+// ── RT-23: the engine's min-p seam (`set_min_p` / `min_p`) ─────────────
+
+/// A known logit row for the min-p tests: five live ids whose probabilities
+/// at temperature 1.0 are ≈ 0.479, 0.392, 0.065, 0.039 and 0.024, so min-p
+/// 0.5 (threshold ≈ 0.240) keeps exactly [`MIN_P_SURVIVORS`].
+const MIN_P_ROW: [(u32, f32); 5] = [(100, 3.0), (101, 2.8), (102, 1.0), (103, 0.5), (104, 0.0)];
+
+/// The ids of [`MIN_P_ROW`] at or above half the top probability.
+const MIN_P_SURVIVORS: [u32; 2] = [100, 101];
+
+fn min_p_params(top_k: usize) -> SamplingParams {
+    SamplingParams {
+        temperature: 1.0,
+        top_k,
+        top_p: 1.0,
+        repetition_penalty: 1.0,
+        max_tokens: 24,
+    }
+}
+
+/// A synthetic engine whose every logit row is [`MIN_P_ROW`] (through the
+/// test-only scripted-row seam), with its min-p set through the seam under
+/// test.
+fn known_row_engine(params: SamplingParams, seed: u64, min_p: f32) -> InferenceEngine<'static> {
+    let mut engine = InferenceEngine::new(Qwen3Config::tiny_test(), params, seed);
+    engine.script_known_row(MIN_P_ROW.to_vec());
+    engine.set_min_p(min_p);
+    engine
+}
+
+/// `n` seeded draws over [`MIN_P_ROW`] (padded with the scripted floor to
+/// `width`) by a standalone sampler with the given min-p: what an engine
+/// honouring that min-p must produce.
+fn known_row_reference(
+    params: &SamplingParams,
+    seed: u64,
+    min_p: f32,
+    width: usize,
+    n: usize,
+) -> Vec<u32> {
+    let mut row = vec![SCRIPTED_LOGIT_FLOOR; width];
+    for &(id, logit) in &MIN_P_ROW {
+        row[id as usize] = logit;
+    }
+    let mut sampler = Sampler::new(params.clone(), seed);
+    sampler.set_min_p(min_p);
+    (0..n)
+        .map(|_| sampler.sample(&row).expect("reference draw"))
+        .collect()
+}
+
+/// The seam's contract: a pure forwarder to the engine's sampler, disabled
+/// by default, stored as given, and sampler configuration — it survives
+/// `reset` and every generation entry point until changed.
+#[test]
+fn engine_set_min_p_round_trips_and_persists_across_requests() {
+    let prompt = [1u32, 2, 3];
+    let mut engine = InferenceEngine::new(Qwen3Config::tiny_test(), SamplingParams::default(), 42);
+    assert_eq!(engine.min_p(), 0.0, "disabled by default");
+
+    engine.set_min_p(0.1);
+    assert_eq!(engine.min_p(), 0.1);
+    assert_eq!(
+        engine.sampler.min_p(),
+        0.1,
+        "a pure forwarder to the sampler every entry point decodes with"
+    );
+
+    engine.reset();
+    assert_eq!(
+        engine.min_p(),
+        0.1,
+        "reset clears sequence state, not sampler configuration"
+    );
+
+    let other = SamplingParams {
+        temperature: 0.5,
+        top_k: 5,
+        ..SamplingParams::default()
+    };
+    let _ = engine.generate(&prompt, 2).expect("generate");
+    assert_eq!(engine.min_p(), 0.1, "generate");
+    let _ = engine
+        .generate_with_params(&prompt, 2, &other)
+        .expect("generate_with_params");
+    assert_eq!(engine.min_p(), 0.1, "generate_with_params");
+    let _ = engine
+        .generate_with_params_and_penalties(&prompt, 2, &other, &PenaltyParams::new(0.2, 0.1))
+        .expect("generate_with_params_and_penalties");
+    assert_eq!(engine.min_p(), 0.1, "generate_with_params_and_penalties");
+    let _ = engine
+        .generate_with_seed(&prompt, 2, 7, &other)
+        .expect("generate_with_seed");
+    assert_eq!(engine.min_p(), 0.1, "generate_with_seed");
+    let (tx, _rx) = std::sync::mpsc::channel();
+    engine
+        .generate_streaming_sync(&prompt, 2, &tx)
+        .expect("generate_streaming_sync");
+    assert_eq!(engine.min_p(), 0.1, "generate_streaming_sync");
+
+    // Stored exactly as given: clamping happens when a draw applies it.
+    for value in [1.5f32, -0.25, 0.0] {
+        engine.set_min_p(value);
+        assert_eq!(engine.min_p(), value);
+    }
+    // A server's per-request override sets the same sampler field.
+    engine.sampler.set_min_p(0.3);
+    assert_eq!(engine.min_p(), 0.3);
+}
+
+/// On a known logit row, min-p 0.5 removes every low-probability survivor
+/// from the seeded draw that min-p 0.0 keeps, through the ranked (`top_k`
+/// 20, the Bonsai 2 default) and the unranked (`top_k` 0) sampler paths;
+/// and the engine's realisation is draw for draw a standalone sampler's
+/// with the same min-p.
+#[test]
+fn engine_set_min_p_removes_low_probability_survivors_from_the_seeded_draw() {
+    const TOKENS: usize = 24;
+    let prompt = [1u32, 2, 3];
+    let mut low_probability_draws = 0usize;
+    for top_k in [0usize, 20] {
+        let params = min_p_params(top_k);
+        for seed in 0..8u64 {
+            let mut unfiltered = known_row_engine(params.clone(), seed, 0.0);
+            let without = unfiltered.generate(&prompt, TOKENS).expect("min-p 0.0");
+            let width = unfiltered.vocab_size();
+            assert_eq!(without.len(), TOKENS, "the known row never scripts EOS");
+            assert_eq!(
+                without,
+                known_row_reference(&params, seed, 0.0, width, TOKENS),
+                "top_k {top_k} seed {seed}: min-p 0.0 is the plain sampler"
+            );
+            assert!(
+                without
+                    .iter()
+                    .all(|token| MIN_P_ROW.iter().any(|(id, _)| id == token)),
+                "top_k {top_k} seed {seed}: a draw left the known support: {without:?}"
+            );
+            low_probability_draws += without
+                .iter()
+                .filter(|token| !MIN_P_SURVIVORS.contains(token))
+                .count();
+
+            let mut filtered = known_row_engine(params.clone(), seed, 0.5);
+            let with = filtered.generate(&prompt, TOKENS).expect("min-p 0.5");
+            assert_eq!(
+                with,
+                known_row_reference(&params, seed, 0.5, width, TOKENS),
+                "top_k {top_k} seed {seed}: the engine applies exactly the sampler's min-p"
+            );
+            assert!(
+                with.iter().all(|token| MIN_P_SURVIVORS.contains(token)),
+                "top_k {top_k} seed {seed}: min-p 0.5 must remove every candidate below half \
+                 the top probability, got {with:?}"
+            );
+        }
+    }
+    assert!(
+        low_probability_draws > 0,
+        "without min-p the low-probability ids must be drawn somewhere, or their removal \
+         proves nothing"
+    );
+}
+
+/// Min-p is clamped when a draw applies it, exactly as the sampler always
+/// has: above 1.0 behaves as 1.0 (only the most likely candidate survives,
+/// never none), and zero, negative or `NaN` disable the filter draw for
+/// draw.
+#[test]
+fn engine_set_min_p_is_clamped_by_the_sampler() {
+    const TOKENS: usize = 24;
+    let prompt = [1u32, 2, 3];
+    let params = min_p_params(20);
+
+    let mut above_one = known_row_engine(params.clone(), 9, 5.0);
+    assert_eq!(above_one.min_p(), 5.0, "stored as given");
+    let strict = above_one.generate(&prompt, TOKENS).expect("min-p 5.0");
+    assert_eq!(strict, vec![MIN_P_ROW[0].0; TOKENS]);
+    let mut one = known_row_engine(params.clone(), 9, 1.0);
+    assert_eq!(
+        one.generate(&prompt, TOKENS).expect("min-p 1.0"),
+        strict,
+        "5.0 behaves exactly as 1.0"
+    );
+
+    let mut disabled = known_row_engine(params.clone(), 9, 0.0);
+    let unfiltered = disabled.generate(&prompt, TOKENS).expect("min-p 0.0");
+    for min_p in [-0.25f32, f32::NAN] {
+        let mut engine = known_row_engine(params.clone(), 9, min_p);
+        assert_eq!(
+            engine.generate(&prompt, TOKENS).expect("disabled min-p"),
+            unfiltered,
+            "min-p {min_p} must disable the filter"
+        );
+    }
+}
+
+/// `generate_with_seed` runs a fresh per-call sampler; it carries the
+/// engine's min-p into it (as it does the penalties), so a seeded request
+/// is filtered exactly like an unseeded one, and the engine's own sampler —
+/// min-p included — is restored afterwards.
+#[test]
+fn engine_set_min_p_is_carried_into_generate_with_seed() {
+    const TOKENS: usize = 24;
+    let prompt = [1u32, 2, 3];
+    let params = min_p_params(20);
+    let mut engine = known_row_engine(params.clone(), 1, 0.5);
+    for seed in 0..4u64 {
+        let seeded = engine
+            .generate_with_seed(&prompt, TOKENS, seed, &params)
+            .expect("seeded");
+        let mut fresh = known_row_engine(params.clone(), seed, 0.5);
+        assert_eq!(
+            seeded,
+            fresh.generate(&prompt, TOKENS).expect("fresh"),
+            "seed {seed}: the per-call sampler must carry the engine's min-p"
+        );
+        assert!(seeded.iter().all(|token| MIN_P_SURVIVORS.contains(token)));
+        assert_eq!(engine.min_p(), 0.5, "the engine's sampler is restored");
+    }
+}
+
+/// The fused GPU route honours the sampler's min-p: on the 1-bit fused
+/// fixture, a seeded sampled request with min-p 0.1 set through
+/// [`InferenceEngine::set_min_p`] is token-for-token the same with the
+/// sampled top-k route on (the default) and off, over 8 seeds, and equal to
+/// an independently spelled-out classic loop with a min-p 0.1 sampler. Not
+/// vacuous: the route serves every decode step from GPU candidates, and
+/// min-p 0.1 changes the route-off realisation of at least one seed. (This
+/// fixture's logits span only ~1.2, so the request samples at temperature
+/// 0.2: at 1.0 every top-20 candidate would sit above a tenth of the most
+/// likely one's probability and min-p 0.1 would filter nothing.)
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+fn engine_set_min_p_route_on_equals_route_off() {
+    use crate::engine_greedy::{SampledTopKConfig, SampledTopKMode};
+    use oxibonsai_testkit::capability::{record_executed, record_skipped, Capability};
+
+    const TEST: &str = "oxibonsai-runtime::lib::engine_set_min_p_route_on_equals_route_off";
+    const TOKENS: usize = 16;
+    const MIN_P: f32 = 0.1;
+    let _session = oxibonsai_kernels::MetalGraph::bind_new_session().expect("metal session");
+    let bytes = distinct_q1_gguf(0x0005_EED0_0111_0B10);
+    let gguf = GgufFile::parse(&bytes).expect("fixture parses");
+    let params = SamplingParams {
+        temperature: 0.2,
+        top_k: 20,
+        top_p: 0.95,
+        repetition_penalty: 1.0,
+        max_tokens: TOKENS,
+    };
+    let prompt = [1u32, 5, 9];
+
+    let mut on = InferenceEngine::from_gguf(&gguf, params.clone(), 0, 64).expect("route on");
+    if !on.uses_fused_gpu_decode() {
+        eprintln!(
+            "capability report: {TEST} SKIPPED -- no accelerated Metal device, so the fused \
+             route (and its sampled top-k route) does not run on this host"
+        );
+        record_skipped(Capability::Metal, TEST);
+        return;
+    }
+    assert_eq!(on.sampled_topk().mode, SampledTopKMode::GpuCandidates);
+    assert!(on.sampled_topk_eligible(false));
+    let mut off = InferenceEngine::from_gguf(&gguf, params.clone(), 0, 64).expect("route off");
+    off.set_sampled_topk(SampledTopKConfig {
+        mode: SampledTopKMode::Off,
+        ..SampledTopKConfig::default()
+    });
+
+    let mut min_p_changed = 0usize;
+    for seed in 0..8u64 {
+        on.set_min_p(MIN_P);
+        off.set_min_p(MIN_P);
+        let served = on.stats().sampled_topk_steps();
+        on.reset();
+        let via_on = on
+            .generate_with_seed(&prompt, TOKENS, seed, &params)
+            .expect("route on");
+        off.reset();
+        let via_off = off
+            .generate_with_seed(&prompt, TOKENS, seed, &params)
+            .expect("route off");
+        assert_eq!(via_on.len(), TOKENS, "seed {seed}: no EOS in the fixture");
+        assert_eq!(
+            via_on, via_off,
+            "seed {seed}: route on != route off at min-p {MIN_P}"
+        );
+        assert_eq!(
+            on.stats().sampled_topk_steps() - served,
+            (TOKENS - 1) as u64,
+            "seed {seed}: every decode step served from GPU candidates"
+        );
+
+        off.set_min_p(0.0);
+        off.reset();
+        let unfiltered = off
+            .generate_with_seed(&prompt, TOKENS, seed, &params)
+            .expect("route off, min-p 0.0");
+        if unfiltered != via_off {
+            min_p_changed += 1;
+        }
+
+        if seed == 0 {
+            let mut reference =
+                InferenceEngine::from_gguf(&gguf, params.clone(), 0, 64).expect("reference");
+            let mut sampler = Sampler::new(params.clone(), seed);
+            sampler.set_min_p(MIN_P);
+            let mut row = reference.prefill_from_pos(&prompt, 0).expect("prefill");
+            let mut classic = Vec::new();
+            for pos in prompt.len()..prompt.len() + TOKENS {
+                let token = sampler.sample(&row).expect("classic draw");
+                if reference.is_eos(token) {
+                    break;
+                }
+                classic.push(token);
+                row = reference.decode_step(token, pos).expect("decode step");
+            }
+            assert_eq!(
+                via_on, classic,
+                "the route's min-p draw is the classic sampler's"
+            );
+        }
+    }
+    println!(
+        "engine_set_min_p_route_on_equals_route_off: 8 seeds identical at min-p {MIN_P}; \
+         min-p changed {min_p_changed} of 8 route-off realisations"
+    );
+    assert!(
+        min_p_changed > 0,
+        "min-p {MIN_P} never changed a realisation: the comparison proves nothing"
+    );
+    record_executed(Capability::Metal, TEST);
 }

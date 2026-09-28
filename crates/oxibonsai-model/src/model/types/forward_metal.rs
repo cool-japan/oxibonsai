@@ -1,188 +1,270 @@
 //! Metal GPU forward-pass methods for `BonsaiModel`.
 //!
-//! All ternary (TQ2_0_g128) paths here share one weight-handle namespace and
-//! one weight-binding prologue, both owned by [`super::gpu_cache`]; see that
-//! module for why (MET-02 / MET-03 / perf-03).
+//! # One namespace per GGUF mapping (`MET-02`)
 //!
-//! The 1-bit (Q1) fused paths key the norm and LM-head buffers they hand the
-//! kernels on [`Q1MetalSlots`]: slots namespaced by a per-load model epoch,
-//! so two different Q1 models in one process can never be served each
-//! other's weights (MET-02, Q1 half).
+//! Every buffer a fused Metal path keys on a model-owned slot — the Q1
+//! RMSNorm weights, final norm and LM head, and every ternary weight — is
+//! keyed `WeightKey::new(epoch, kind, slot)` under the **mapping epoch** held
+//! by [`Q1MetalSlots`]: one epoch per GGUF mapping, shared by every
+//! engine-pool replica of it and by every block of those replicas, distinct
+//! across mappings (see [`super::q1_slots`]). So:
+//!
+//! - two *different* models in one process can never be served each other's
+//!   norms or LM head;
+//! - N replicas of one model hold those buffers **once**;
+//! - within one model, the prefill, the fused decode, the cached greedy
+//!   builder (`gpu_cache.rs`) and the per-layer block path all resolve the
+//!   same slot to the same buffer;
+//! - the whole set leaves the GPU in one `MetalGraph::release_model(epoch)`
+//!   when the last replica drops.
+//!
+//! The Q1 **projections** are the exception on purpose: they are keyed by
+//! the scirs2 upload-handle ids, which the backend deduplicates across
+//! replicas and evicts itself when their last replica releases them.
+//!
+//! # Ternary routing (`MET-03`)
+//!
+//! Every ternary decode / prefill / verify path the model takes dispatches
+//! through the **cached** entry points of [`super::gpu_cache`] (eight GPU
+//! handles per layer resolved once). The uncached binding survives as the
+//! reference those paths are proven bit-identical against
+//! ([`BonsaiModel::forward_logits_gpu_ternary_uncached`],
+//! [`BonsaiModel::prefill_logits_gpu_ternary_uncached`],
+//! [`BonsaiModel::prefill_verify_gpu_ternary_uncached`]) and as the only
+//! route for a ternary body under a non-ternary LM head, whose cache has no
+//! tail.
 
+use super::q1_slots::{MappingRegistration, MappingState, SlotNamespace};
 use super::{BonsaiModel, OutputWeight};
 use crate::block::blocks_as_bytes;
-use oxibonsai_kernels::gpu_backend::metal_full_layer::types::{
-    next_model_epoch, WeightKey, WeightKind,
-};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::OnceLock;
+use oxibonsai_kernels::gpu_backend::metal_full_layer::types::{next_model_epoch, WeightKind};
+use oxibonsai_kernels::{FullForwardLayerParams, GpuWeightHandle, MetalGraph};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
-/// Tag bit of every [`Q1MetalSlots`] slot. User-space addresses (which the
-/// ternary and image caches key on) never set bit 63, and the per-upload
-/// handle ids (`NEXT_HANDLE_ID`) are small counters, so a tagged slot cannot
-/// collide with either namespace.
-const Q1_SLOT_TAG: u64 = 1 << 63;
+/// Convenience alias for the boxed error every Metal entry point here returns.
+type GpuResult<T> = Result<T, Box<dyn std::error::Error>>;
 
-/// Bits below the epoch: the per-model local slot (`< 2^24`).
-const Q1_SLOT_LOCAL_BITS: u32 = 24;
-
-/// Mask keeping the epoch clear of the tag bit (`2^39` model loads).
-const Q1_SLOT_EPOCH_MASK: u64 = (1 << (63 - Q1_SLOT_LOCAL_BITS)) - 1;
-
-/// Local slot of layer `l`'s first norm (`+0` attn, `+1` q, `+2` k, `+3` ffn).
-const Q1_NORM_LOCAL_BASE: u64 = 1_000_000;
-/// Local slot of the final `output_norm`.
-const Q1_FINAL_NORM_LOCAL: u64 = 2_000_000;
-/// Local slot of the 1-bit LM head.
-const Q1_LM_HEAD_LOCAL: u64 = 3_000_000;
-
-/// The Metal weight-cache slots of one Q1 model's fused paths (MET-02, Q1
-/// half).
+/// Release every buffer keyed under `epoch` from the Metal weight cache —
+/// the [`super::q1_slots::ReleaseHook`] of the Metal build, run once when the
+/// last holder of a mapping that touched the GPU drops.
 ///
-/// The kernels' Q1 entry points (`try_metal_full_forward*`,
-/// `try_metal_full_forward_prefill*`) take `u64` slot ids for the norms and
-/// the LM head and key each upload as `WeightKey::legacy(kind, slot)`. Every
-/// Q1 model used to pass the same literals — `1_000_000 + layer * 10 + k`,
-/// `2_000_000`, `3_000_000` — so a second, different Q1 model loaded into the
-/// same process was silently served the first model's norms and LM head from
-/// the cache. Each load now mints a fresh epoch
-/// ([`next_model_epoch`], never reused) and composes its slots as
-/// `TAG | epoch << 24 | local`: the old locals, namespaced per model.
+/// **Never opens a device.** It releases through the session bound to this
+/// thread when there is one (a model used inside a private or isolated
+/// session is dropped inside it), else through the process-default session
+/// **iff** the shared device already has live sessions. When neither holds,
+/// no Metal state exists in this process on the shared device, so nothing can
+/// be resident under the epoch there.
+pub(crate) fn release_metal_mapping(epoch: u64) {
+    let graph = match MetalGraph::current_session() {
+        Some(session) => session,
+        None if MetalGraph::live_session_count() > 0 => match MetalGraph::global() {
+            Ok(graph) => graph,
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    epoch,
+                    "could not reach the Metal graph to release a dropped mapping's buffers"
+                );
+                return;
+            }
+        },
+        None => return,
+    };
+    match graph.release_model(epoch) {
+        Ok(0) => {}
+        Ok(released) => tracing::debug!(
+            epoch,
+            released,
+            "released the last replica's Metal weight buffers"
+        ),
+        Err(e) => tracing::debug!(
+            error = %e,
+            epoch,
+            "releasing a dropped mapping's Metal weight buffers failed"
+        ),
+    }
+}
+
+/// The Metal weight-cache namespace of one model's GGUF **mapping**
+/// (`MET-02`): the Q1 norm / final-norm / LM-head slots and the epoch every
+/// model-owned Metal buffer (Q1 and ternary) is keyed under.
 ///
-/// # Lifetime
+/// The kernels' Q1 entry points take the norm and LM-head slots as `u64`s
+/// composed `TAG | epoch << 24 | local` (the historical locals —
+/// `1_000_000 + layer * 10 + k`, `2_000_000`, `3_000_000` — namespaced by the
+/// epoch; see [`SlotNamespace`]) and key each upload
+/// `WeightKey::new(epoch, kind, slot)`.
 ///
-/// Per-load slots would otherwise leak one copy of a model's norms and LM
-/// head per load/unload cycle (the shared literals were at least reused), so
-/// the slots release what they populated: explicitly through
-/// [`Self::release`] / [`BonsaiModel::release_q1_metal_slots`], and on
-/// `Drop` — i.e. when the owning model is dropped. Evicting only removes the
-/// cache entries; a dispatch already encoded keeps its buffers alive through
-/// its own `Arc`s.
+/// # Sharing and lifetime
+///
+/// - [`Self::for_mapping`] — what every loaded model uses — **joins** the
+///   namespace of the mapping its weights are borrowed from: every
+///   engine-pool replica of one GGUF gets the same epoch and therefore the
+///   same buffers, and a different mapping always gets a different epoch.
+/// - [`Self::fresh`] / [`Self::with_epoch`] build a **private** namespace
+///   nobody else can join (a weight-less model; a test control that aims a
+///   model at another's epoch on purpose).
+///
+/// The buffers are released with `MetalGraph::release_model(epoch)` when the
+/// **last** holder of the namespace drops — the last replica of a shared
+/// mapping (dropping any earlier replica leaves them resident for its
+/// siblings), or the sole owner of a private one — and only if some path put
+/// buffers under it. [`Self::release`] releases them on demand, for every
+/// holder at once: a surviving replica simply re-uploads on its next miss.
+/// Evicting only removes the cache entries; a dispatch already encoded keeps
+/// its buffers alive through its own `Arc`s.
 #[derive(Debug)]
 pub struct Q1MetalSlots {
-    epoch: u64,
-    /// Layer count of the model a fused Q1 path last handed these slots to
-    /// the kernels for; `0` while no path has. [`Self::release`] sweeps
-    /// exactly the keys that can then be populated, and a model that never
-    /// ran a fused Q1 path never touches (or initialises) the Metal graph.
-    used_layers: AtomicUsize,
+    registration: MappingRegistration,
 }
 
 impl Q1MetalSlots {
-    /// Slots for a freshly loaded model (a new, never-reused epoch).
+    /// A private namespace under a new, never-reused epoch.
     #[must_use]
     pub fn fresh() -> Self {
         Self::with_epoch(next_model_epoch())
     }
 
-    /// Slots for a given epoch — for a caller that already holds one. Two
-    /// values built from the same epoch address the same buffers, and
-    /// either one's release (or drop) evicts them for both: the other simply
-    /// re-uploads on its next miss.
+    /// A private namespace under `epoch`: it addresses exactly the buffers
+    /// every other holder of that epoch addresses, but joins no mapping —
+    /// its own release (or its last holder's drop) evicts the epoch's buffers
+    /// for all of them. Meant for a caller that already holds an epoch.
     #[must_use]
     pub fn with_epoch(epoch: u64) -> Self {
         Self {
-            epoch,
-            used_layers: AtomicUsize::new(0),
+            registration: MappingRegistration::private(epoch, Some(release_metal_mapping)),
         }
     }
 
-    /// The model epoch these slots are namespaced by.
+    /// Join the namespace of the mapping anchored at `anchor` (shared with
+    /// every live replica of that mapping), or take a private one for `None`.
     #[must_use]
-    pub fn epoch(&self) -> u64 {
-        self.epoch
+    pub(crate) fn for_mapping(anchor: Option<u64>) -> Self {
+        Self {
+            registration: MappingRegistration::join(
+                anchor,
+                next_model_epoch,
+                Some(release_metal_mapping),
+            ),
+        }
     }
 
-    fn slot(&self, local: u64) -> u64 {
-        Q1_SLOT_TAG | ((self.epoch & Q1_SLOT_EPOCH_MASK) << Q1_SLOT_LOCAL_BITS) | local
+    /// The epoch these slots — and every model-owned Metal buffer of the
+    /// mapping — are keyed under.
+    #[must_use]
+    pub fn epoch(&self) -> u64 {
+        self.registration.epoch()
+    }
+
+    /// The pure slot composition of [`Self::epoch`].
+    fn slots(&self) -> SlotNamespace {
+        self.registration.slots()
     }
 
     /// Base of layer `layer`'s four norm slots (`+0` attn, `+1` q, `+2` k,
     /// `+3` ffn).
     #[must_use]
     pub fn norm_base(&self, layer: usize) -> u64 {
-        self.slot(Q1_NORM_LOCAL_BASE + (layer as u64) * 10)
+        self.slots().norm_base(layer)
     }
 
     /// Slot of the final `output_norm`.
     #[must_use]
     pub fn final_norm(&self) -> u64 {
-        self.slot(Q1_FINAL_NORM_LOCAL)
+        self.slots().final_norm()
     }
 
     /// Slot of the 1-bit LM head.
     #[must_use]
     pub fn lm_head(&self) -> u64 {
-        self.slot(Q1_LM_HEAD_LOCAL)
+        self.slots().lm_head()
     }
 
-    /// Record that a fused path is about to hand these slots to the kernels
-    /// for an `n_layers`-layer model. `pub(super)` so every `BonsaiModel`
-    /// path that keys Q1 buffers on these slots can record it.
+    /// Record that a fused path is about to hand (or has handed) these slots
+    /// to the kernels for an `n_layers`-layer model. Every path calls it
+    /// before **and** after its dispatch, so an explicit [`Self::release`]
+    /// racing a sibling replica's upload can never leave a resident buffer
+    /// behind with the in-use flag cleared.
     pub(super) fn mark_used(&self, n_layers: usize) {
-        self.used_layers
-            .fetch_max(n_layers.max(1), Ordering::Relaxed);
+        debug_assert!(
+            SlotNamespace::check_layer_count(n_layers).is_ok(),
+            "layer counts are checked before any slot is derived"
+        );
+        self.registration.state().mark_gpu_used();
     }
 
-    /// Whether a fused Q1 path has handed these slots to the kernels since
-    /// they were created or last released.
+    /// Whether a fused path has put buffers under this namespace since it was
+    /// created or last released — by this model or by a sibling replica of
+    /// the same mapping.
     #[must_use]
     pub fn is_in_use(&self) -> bool {
-        self.used_layers.load(Ordering::Relaxed) > 0
+        self.registration.state().is_gpu_used()
     }
 
-    /// Every `(slot, kind)` these slots can have populated for an
-    /// `n_layers`-layer model.
+    /// Whether this namespace is a GGUF mapping's shared one (as opposed to
+    /// a private namespace).
+    #[must_use]
+    pub fn is_shared_mapping(&self) -> bool {
+        self.registration.is_shared_mapping()
+    }
+
+    /// Live models holding this namespace's mapping (1 for a private one).
+    #[must_use]
+    pub fn replicas(&self) -> usize {
+        self.registration.replicas()
+    }
+
+    /// The shared mapping state (cloned into the model's blocks so the
+    /// per-layer path keys on the same epoch).
+    pub(crate) fn state(&self) -> &Arc<MappingState> {
+        self.registration.state()
+    }
+
+    /// Every `(slot, kind)` the Q1 fused paths can populate for an
+    /// `n_layers`-layer model: four norms per layer, the final norm and the
+    /// LM head.
     #[must_use]
     pub fn cache_keys(&self, n_layers: usize) -> Vec<(u64, WeightKind)> {
-        let mut keys = Vec::with_capacity(n_layers * 4 + 2);
-        for layer in 0..n_layers {
-            let base = self.norm_base(layer);
-            keys.extend((0..4).map(|k| (base + k, WeightKind::RawF32)));
-        }
-        keys.push((self.final_norm(), WeightKind::RawF32));
-        keys.push((self.lm_head(), WeightKind::Q1Soa));
-        keys
+        self.slots()
+            .keys(n_layers)
+            .into_iter()
+            .map(|(slot, cache)| {
+                let kind = match cache {
+                    super::q1_slots::SlotCache::Norm => WeightKind::RawF32,
+                    super::q1_slots::SlotCache::Quant => WeightKind::Q1Soa,
+                };
+                (slot, kind)
+            })
+            .collect()
     }
 
-    /// Evict every buffer these slots can have populated from the Metal
+    /// Evict every buffer keyed under this namespace's epoch from the Metal
     /// weight cache of the session this thread dispatches into
-    /// ([`oxibonsai_kernels::MetalGraph::global`]), returning how many slots
-    /// were swept — `Ok(0)`, without touching the Metal graph, when no fused
-    /// Q1 path has used them since they were created or last released.
+    /// ([`MetalGraph::global`]), returning how many were released — `Ok(0)`,
+    /// without touching the Metal graph, when no path has put buffers under
+    /// it since it was created or last released.
+    ///
+    /// The namespace is shared by every replica of the mapping, so this
+    /// evicts **their** buffers too; a surviving replica re-uploads on its
+    /// next miss (and a replica's cached handle set keeps its old buffers
+    /// alive until it is dropped or rebuilt).
     ///
     /// # Errors
     ///
     /// The Metal graph cannot be reached, or its cache lock is poisoned; the
-    /// slots then stay marked in use, so a later call sweeps them again.
+    /// namespace then stays marked in use, so a later call (or the last
+    /// holder's drop) releases it again.
     pub fn release(&self) -> Result<usize, oxibonsai_kernels::MetalGraphError> {
-        let n_layers = self.used_layers.swap(0, Ordering::Relaxed);
-        if n_layers == 0 {
+        let state = self.registration.state();
+        if !state.take_gpu_used() {
             return Ok(0);
         }
-        let swept = oxibonsai_kernels::MetalGraph::global().and_then(|graph| {
-            let keys = self.cache_keys(n_layers);
-            for &(slot, kind) in &keys {
-                graph.evict_weight(WeightKey::legacy(kind, slot))?;
-            }
-            Ok(keys.len())
-        });
-        if swept.is_err() {
-            self.used_layers.fetch_max(n_layers, Ordering::Relaxed);
+        let released = MetalGraph::global().and_then(|graph| graph.release_model(state.epoch()));
+        if released.is_err() {
+            state.mark_gpu_used();
         }
-        swept
-    }
-}
-
-impl Drop for Q1MetalSlots {
-    fn drop(&mut self) {
-        if let Err(e) = self.release() {
-            tracing::debug!(
-                error = %e,
-                epoch = self.epoch,
-                "could not release a dropped Q1 model's Metal norm / LM-head buffers"
-            );
-        }
+        released
     }
 }
 
@@ -220,30 +302,27 @@ pub(super) fn set_force_ternary_tail_failure(on: bool) {
     FORCE_TERNARY_TAIL_FAIL.store(on, Ordering::Relaxed);
 }
 
+/// The id of a block's upload handle, or a named error.
+fn handle_id(handle: Option<GpuWeightHandle>, layer: usize, what: &str) -> GpuResult<u64> {
+    handle
+        .map(|hnd| hnd.id())
+        .ok_or_else(|| format!("missing GPU handle for layer {layer} {what}").into())
+}
+
 impl<'a> BonsaiModel<'a> {
-    /// Attempt to run all transformer layers in a single Metal command buffer.
-    ///
-    /// On success, `hidden` is updated in-place through all layers. The GPU
-    /// manages its own KV cache. Returns `Err` if any precondition is not
-    /// met or the dispatch fails.
-    #[cfg(all(feature = "metal", target_os = "macos"))]
-    pub(super) fn try_metal_full_forward_inner(
-        &self,
-        hidden: &mut [f32],
-        pos: usize,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        use oxibonsai_kernels::FullForwardLayerParams;
-        let n_layers = self.blocks.len();
-        if n_layers == 0 {
-            return Err("no blocks".into());
-        }
-        let eps = self.blocks[0].attn_norm_eps();
-        let h = self.config.hidden_size;
-        let inter = self.config.intermediate_size;
-        let nq = self.config.num_attention_heads;
-        let nkv = self.config.num_kv_heads;
-        let hd = self.config.head_dim;
-        let max_seq_len = self.kv_cache.max_seq_len();
+    /// The epoch every model-owned Metal buffer of this model's GGUF mapping
+    /// is keyed under — shared by every replica of the mapping, distinct
+    /// across mappings (`MET-02`).
+    #[must_use]
+    pub fn gpu_mapping_epoch(&self) -> u64 {
+        self.metal_q1_slots.epoch()
+    }
+
+    /// Refuse the Q1 fused paths unless every block holds its four GPU
+    /// upload handles — checked **before** anything is concatenated, so a
+    /// ternary (or never-uploaded) model falls through for the price of a
+    /// few `Option` checks.
+    fn require_q1_gpu_handles(&self) -> GpuResult<()> {
         for block in &self.blocks {
             if block.fused_qkv_gpu_handle().is_none()
                 || block.attn_output_gpu_handle().is_none()
@@ -253,7 +332,13 @@ impl<'a> BonsaiModel<'a> {
                 return Err("missing GPU handle".into());
             }
         }
-        let mut qkv_concats: Vec<Vec<u8>> = Vec::with_capacity(n_layers);
+        Ok(())
+    }
+
+    /// Every layer's Q‖K‖V concatenation — the one Q1 layout that cannot be
+    /// borrowed from the mapping.
+    pub(super) fn q1_qkv_concats(&self) -> GpuResult<Vec<Vec<u8>>> {
+        let mut qkv_concats: Vec<Vec<u8>> = Vec::with_capacity(self.blocks.len());
         for block in &self.blocks {
             let q_bytes =
                 blocks_as_bytes(block.attn_q_blocks().ok_or("attn_q: not a 1-bit layer")?);
@@ -267,19 +352,41 @@ impl<'a> BonsaiModel<'a> {
             concat.extend_from_slice(v_bytes);
             qkv_concats.push(concat);
         }
-        let mut layer_params: Vec<FullForwardLayerParams<'_>> = Vec::with_capacity(n_layers);
+        Ok(qkv_concats)
+    }
+
+    /// Per-layer Q1 dispatch parameters — the **single** place every Q1
+    /// fused path (decode, decode + LM head, prefill, prefill-verify, and the
+    /// cached greedy builder in `gpu_cache.rs`) derives its slots from, so
+    /// they agree by construction: the norms from this model's mapping
+    /// namespace (under its epoch), the projections from the blocks' upload
+    /// handles (`MET-02`).
+    ///
+    /// Marks the namespace in use: the caller dispatches next.
+    pub(super) fn q1_layer_params<'b>(
+        &'b self,
+        qkv_concats: &'b [Vec<u8>],
+    ) -> GpuResult<Vec<FullForwardLayerParams<'b>>> {
+        SlotNamespace::check_layer_count(self.blocks.len())?;
+        let epoch = self.metal_q1_slots.epoch();
+        let mut layer_params: Vec<FullForwardLayerParams<'b>> =
+            Vec::with_capacity(self.blocks.len());
         for (i, block) in self.blocks.iter().enumerate() {
-            let norm_handle_base = self.metal_q1_slots.norm_base(block.layer_index());
+            let layer = block.layer_index();
+            let norm_handle_base = self.metal_q1_slots.norm_base(layer);
             layer_params.push(FullForwardLayerParams {
+                model_epoch: epoch,
                 attn_norm_handle: norm_handle_base,
                 attn_norm_bytes: block.attn_norm_weight(),
-                fused_qkv_handle: block.fused_qkv_gpu_handle().map(|h| h.id()).unwrap_or(0),
-                fused_qkv_bytes: &qkv_concats[i],
+                fused_qkv_handle: handle_id(block.fused_qkv_gpu_handle(), layer, "fused_qkv")?,
+                fused_qkv_bytes: qkv_concats
+                    .get(i)
+                    .ok_or("fewer Q‖K‖V concatenations than layers")?,
                 q_norm_handle: norm_handle_base + 1,
                 q_norm_bytes: block.q_norm_weight(),
                 k_norm_handle: norm_handle_base + 2,
                 k_norm_bytes: block.k_norm_weight(),
-                attn_proj_handle: block.attn_output_gpu_handle().map(|h| h.id()).unwrap_or(0),
+                attn_proj_handle: handle_id(block.attn_output_gpu_handle(), layer, "attn_proj")?,
                 attn_proj_bytes: blocks_as_bytes(
                     block
                         .attn_output_blocks()
@@ -287,10 +394,7 @@ impl<'a> BonsaiModel<'a> {
                 ),
                 ffn_norm_handle: norm_handle_base + 3,
                 ffn_norm_bytes: block.ffn_norm_weight(),
-                gate_up_handle: block
-                    .fused_gate_up_gpu_handle()
-                    .map(|h| h.id())
-                    .unwrap_or(0),
+                gate_up_handle: handle_id(block.fused_gate_up_gpu_handle(), layer, "gate_up")?,
                 gate_bytes: blocks_as_bytes(
                     block
                         .ffn_gate_blocks()
@@ -299,7 +403,7 @@ impl<'a> BonsaiModel<'a> {
                 up_bytes: blocks_as_bytes(
                     block.ffn_up_blocks().ok_or("ffn_up: not a 1-bit layer")?,
                 ),
-                down_handle: block.ffn_down_gpu_handle().map(|h| h.id()).unwrap_or(0),
+                down_handle: handle_id(block.ffn_down_gpu_handle(), layer, "down")?,
                 down_bytes: blocks_as_bytes(
                     block
                         .ffn_down_blocks()
@@ -307,10 +411,65 @@ impl<'a> BonsaiModel<'a> {
                 ),
             });
         }
+        self.metal_q1_slots.mark_used(self.blocks.len());
+        Ok(layer_params)
+    }
+
+    /// Embed a batch column-major and build its per-position RoPE tables.
+    fn q1_prefill_inputs(
+        &self,
+        token_ids: &[u32],
+        pos_start: usize,
+    ) -> GpuResult<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        let batch_size = token_ids.len();
+        let h = self.config.hidden_size;
+        let half_dim = self.config.head_dim / 2;
+        let mut hidden_batch = vec![0.0f32; batch_size * h];
+        // M-02: gather only the rows this batch references, decoding each
+        // straight out of the quantized table. The deleted dense
+        // `Index<Range<usize>>` hatch materialized the whole
+        // `vocab x hidden` FP32 table here (1.16 / 2.31 / 4.74 GiB for the
+        // 1.7B / 8B / 27B) on the first multi-token prompt.
+        self.token_embd.copy_rows(token_ids, &mut hidden_batch)?;
+        let mut cos_table = vec![0.0f32; batch_size * half_dim];
+        let mut sin_table = vec![0.0f32; batch_size * half_dim];
+        for t in 0..batch_size {
+            let pos = pos_start + t;
+            cos_table[t * half_dim..(t + 1) * half_dim]
+                .copy_from_slice(self.rope.cos_at_checked(pos)?);
+            sin_table[t * half_dim..(t + 1) * half_dim]
+                .copy_from_slice(self.rope.sin_at_checked(pos)?);
+        }
+        Ok((hidden_batch, cos_table, sin_table))
+    }
+
+    /// Attempt to run all transformer layers in a single Metal command buffer.
+    ///
+    /// On success, `hidden` is updated in-place through all layers. The GPU
+    /// manages its own KV cache. Returns `Err` if any precondition is not
+    /// met or the dispatch fails.
+    pub(super) fn try_metal_full_forward_inner(
+        &self,
+        hidden: &mut [f32],
+        pos: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let n_layers = self.blocks.len();
+        if n_layers == 0 {
+            return Err("no blocks".into());
+        }
+        let eps = self.blocks[0].attn_norm_eps();
+        let h = self.config.hidden_size;
+        let inter = self.config.intermediate_size;
+        let nq = self.config.num_attention_heads;
+        let nkv = self.config.num_kv_heads;
+        let hd = self.config.head_dim;
+        let max_seq_len = self.kv_cache.max_seq_len();
+        self.require_q1_gpu_handles()?;
+        let qkv_concats = self.q1_qkv_concats()?;
+        let layer_params = self.q1_layer_params(&qkv_concats)?;
         let rope_cos = self.rope.cos_at_checked(pos)?;
         let rope_sin = self.rope.sin_at_checked(pos)?;
-        self.metal_q1_slots.mark_used(n_layers);
-        oxibonsai_kernels::try_metal_full_forward(
+        let result = oxibonsai_kernels::try_metal_full_forward(
             hidden,
             pos,
             n_layers,
@@ -332,8 +491,9 @@ impl<'a> BonsaiModel<'a> {
             0,
             None,
             None,
-        )
-        .map_err(|e| {
+        );
+        self.metal_q1_slots.mark_used(n_layers);
+        result.map_err(|e| {
             tracing::warn!(
                 error = % e, "full-forward GPU dispatch failed, falling back"
             );
@@ -344,18 +504,18 @@ impl<'a> BonsaiModel<'a> {
     /// Attempt to run every transformer layer on Metal for a ternary
     /// (TQ2_0_g128) model, encoding all layers into a single command buffer.
     ///
-    /// Mirrors [`try_metal_full_forward_inner`] but uses the TQ2 GEMV kernel
-    /// and ternary block slices. Returns `Err` if any block is not ternary or
-    /// the Metal dispatch fails — in which case the caller should fall back
-    /// to the CPU per-layer path.
+    /// Mirrors [`Self::try_metal_full_forward_inner`] for the TQ2 GEMV kernel.
+    /// Returns `Err` if any block is not ternary or the Metal dispatch fails —
+    /// in which case the caller falls back to the CPU per-layer path.
     ///
     /// This is the path `BonsaiModel::forward()` drops into when the fused
     /// final-norm → LM-head route fails. It used to carry its own weight-handle
-    /// namespace (the Q1 path's literal norm / LM-head bases), so that fallback
-    /// uploaded a **second full copy** of the model; it now shares the one
-    /// address-derived slot table with every other ternary path
-    /// ([`super::gpu_cache`]), so the fallback is a sequence of cache hits
-    /// (MET-02).
+    /// namespace, so that fallback uploaded a **second full copy** of the
+    /// model (MET-02). With a ternary LM head it now binds the model's
+    /// **cached** weight set (`MET-03`) — the very buffers the failed route
+    /// made resident — and runs no lookup at all; a ternary body under a
+    /// non-ternary head has no cached tail, so it keeps the uncached binding,
+    /// which resolves to the same mapping-epoch slots.
     pub(super) fn try_metal_full_forward_ternary_inner(
         &self,
         hidden: &mut [f32],
@@ -372,33 +532,55 @@ impl<'a> BonsaiModel<'a> {
         let nkv = self.config.num_kv_heads;
         let hd = self.config.head_dim;
         let max_seq_len = self.kv_cache.max_seq_len();
-        let binding = self.ternary_gpu_binding()?;
         let rope_cos = self.rope.cos_at_checked(pos)?;
         let rope_sin = self.rope.sin_at_checked(pos)?;
-        oxibonsai_kernels::try_metal_full_forward_ternary(
-            hidden,
-            pos,
-            n_layers,
-            &binding.layer_params,
-            rope_cos,
-            rope_sin,
-            h,
-            inter,
-            nq,
-            nkv,
-            hd,
-            eps,
-            max_seq_len,
-            None,
-            None,
-            eps,
-            None,
-            None,
-            0,
-            None,
-            None,
-        )
-        .map_err(|e| {
+        let result = if matches!(self.output_weight, OutputWeight::Ternary(_)) {
+            self.with_ternary_gpu_cache(|cached| {
+                oxibonsai_kernels::try_metal_full_forward_ternary_cached(
+                    hidden,
+                    pos,
+                    cached,
+                    rope_cos,
+                    rope_sin,
+                    h,
+                    inter,
+                    nq,
+                    nkv,
+                    hd,
+                    eps,
+                    max_seq_len,
+                    eps,
+                    None,
+                    None,
+                )
+            })?
+        } else {
+            let binding = self.ternary_gpu_binding()?;
+            oxibonsai_kernels::try_metal_full_forward_ternary(
+                hidden,
+                pos,
+                n_layers,
+                &binding.layer_params,
+                rope_cos,
+                rope_sin,
+                h,
+                inter,
+                nq,
+                nkv,
+                hd,
+                eps,
+                max_seq_len,
+                None,
+                None,
+                eps,
+                None,
+                None,
+                0,
+                None,
+                None,
+            )
+        };
+        result.map_err(|e| {
             tracing::warn!(
                 error = % e, "ternary full-forward GPU dispatch failed, falling back"
             );
@@ -413,16 +595,13 @@ impl<'a> BonsaiModel<'a> {
     /// NOT updated (the GPU handles everything end-to-end). Returns `Err` if
     /// any precondition is not met (missing GPU handles, FP32 LM head, etc.).
     ///
-    /// For ternary models the function delegates to the ternary GPU path using
-    /// pre-cached byte slices; `get_or_create_gpu_cache` is called first.
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    /// Ternary models are delegated to the cached ternary route.
     pub(super) fn try_metal_full_forward_with_lm_head(
         &self,
         hidden: &mut [f32],
         pos: usize,
         logits: &mut Vec<f32>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        use oxibonsai_kernels::FullForwardLayerParams;
         let n_layers = self.blocks.len();
         if n_layers == 0 {
             return Err("no blocks".into());
@@ -465,69 +644,9 @@ impl<'a> BonsaiModel<'a> {
         let nkv = self.config.num_kv_heads;
         let hd = self.config.head_dim;
         let max_seq_len = self.kv_cache.max_seq_len();
-        for block in &self.blocks {
-            if block.fused_qkv_gpu_handle().is_none()
-                || block.attn_output_gpu_handle().is_none()
-                || block.fused_gate_up_gpu_handle().is_none()
-                || block.ffn_down_gpu_handle().is_none()
-            {
-                return Err("missing GPU handle".into());
-            }
-        }
-        let mut qkv_concats: Vec<Vec<u8>> = Vec::with_capacity(n_layers);
-        for block in &self.blocks {
-            let q_bytes =
-                blocks_as_bytes(block.attn_q_blocks().ok_or("attn_q: not a 1-bit layer")?);
-            let k_bytes =
-                blocks_as_bytes(block.attn_k_blocks().ok_or("attn_k: not a 1-bit layer")?);
-            let v_bytes =
-                blocks_as_bytes(block.attn_v_blocks().ok_or("attn_v: not a 1-bit layer")?);
-            let mut concat = Vec::with_capacity(q_bytes.len() + k_bytes.len() + v_bytes.len());
-            concat.extend_from_slice(q_bytes);
-            concat.extend_from_slice(k_bytes);
-            concat.extend_from_slice(v_bytes);
-            qkv_concats.push(concat);
-        }
-        let mut layer_params: Vec<FullForwardLayerParams<'_>> = Vec::with_capacity(n_layers);
-        for (i, block) in self.blocks.iter().enumerate() {
-            let norm_handle_base = self.metal_q1_slots.norm_base(block.layer_index());
-            layer_params.push(FullForwardLayerParams {
-                attn_norm_handle: norm_handle_base,
-                attn_norm_bytes: block.attn_norm_weight(),
-                fused_qkv_handle: block.fused_qkv_gpu_handle().map(|h| h.id()).unwrap_or(0),
-                fused_qkv_bytes: &qkv_concats[i],
-                q_norm_handle: norm_handle_base + 1,
-                q_norm_bytes: block.q_norm_weight(),
-                k_norm_handle: norm_handle_base + 2,
-                k_norm_bytes: block.k_norm_weight(),
-                attn_proj_handle: block.attn_output_gpu_handle().map(|h| h.id()).unwrap_or(0),
-                attn_proj_bytes: blocks_as_bytes(
-                    block
-                        .attn_output_blocks()
-                        .ok_or("attn_output: not a 1-bit layer")?,
-                ),
-                ffn_norm_handle: norm_handle_base + 3,
-                ffn_norm_bytes: block.ffn_norm_weight(),
-                gate_up_handle: block
-                    .fused_gate_up_gpu_handle()
-                    .map(|h| h.id())
-                    .unwrap_or(0),
-                gate_bytes: blocks_as_bytes(
-                    block
-                        .ffn_gate_blocks()
-                        .ok_or("ffn_gate: not a 1-bit layer")?,
-                ),
-                up_bytes: blocks_as_bytes(
-                    block.ffn_up_blocks().ok_or("ffn_up: not a 1-bit layer")?,
-                ),
-                down_handle: block.ffn_down_gpu_handle().map(|h| h.id()).unwrap_or(0),
-                down_bytes: blocks_as_bytes(
-                    block
-                        .ffn_down_blocks()
-                        .ok_or("ffn_down: not a 1-bit layer")?,
-                ),
-            });
-        }
+        self.require_q1_gpu_handles()?;
+        let qkv_concats = self.q1_qkv_concats()?;
+        let layer_params = self.q1_layer_params(&qkv_concats)?;
         let rope_cos = self.rope.cos_at_checked(pos)?;
         let rope_sin = self.rope.sin_at_checked(pos)?;
         let final_norm_handle = self.metal_q1_slots.final_norm();
@@ -536,8 +655,7 @@ impl<'a> BonsaiModel<'a> {
         let lm_head_handle = self.metal_q1_slots.lm_head();
         let lm_head_bytes = blocks_as_bytes(lm_head_linear.blocks());
         let lm_head_out_features = lm_head_linear.out_features();
-        self.metal_q1_slots.mark_used(n_layers);
-        oxibonsai_kernels::try_metal_full_forward(
+        let result = oxibonsai_kernels::try_metal_full_forward(
             hidden,
             pos,
             n_layers,
@@ -559,8 +677,9 @@ impl<'a> BonsaiModel<'a> {
             lm_head_out_features,
             Some(logits),
             None,
-        )
-        .map_err(|e| {
+        );
+        self.metal_q1_slots.mark_used(n_layers);
+        result.map_err(|e| {
             tracing::warn!(
                 error = % e, "full-forward+lm_head GPU dispatch failed, falling back"
             );
@@ -570,21 +689,17 @@ impl<'a> BonsaiModel<'a> {
 
     /// GPU batch prefill implementation: all layers + final norm + LM head.
     ///
-    /// Both 1-bit and ternary (TQ2_0_g128) LM-head models are supported. The
-    /// ternary path delegates to a separate helper that builds
-    /// `FullForwardLayerParamsTernary` and dispatches the new TQ2 batched
-    /// GEMM kernel across all layers.
+    /// Both 1-bit and ternary (TQ2_0_g128) LM-head models are supported; the
+    /// ternary one runs the cached ternary prefill.
     ///
     /// Marked `pub` so parity tests can invoke this **strict** path
     /// directly, bypassing the silent fallback in [`Self::forward_prefill`]
     /// that masks GPU dispatch failures.
-    #[cfg(all(feature = "metal", target_os = "macos"))]
     pub fn try_metal_prefill_with_lm_head(
         &self,
         token_ids: &[u32],
         pos_start: usize,
     ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-        use oxibonsai_kernels::FullForwardLayerParams;
         let batch_size = token_ids.len();
         let n_layers = self.blocks.len();
         if n_layers == 0 {
@@ -638,93 +753,11 @@ impl<'a> BonsaiModel<'a> {
         let nq = self.config.num_attention_heads;
         let nkv = self.config.num_kv_heads;
         let hd = self.config.head_dim;
-        let half_dim = hd / 2;
         let max_seq_len = self.kv_cache.max_seq_len();
-        for block in &self.blocks {
-            if block.fused_qkv_gpu_handle().is_none()
-                || block.attn_output_gpu_handle().is_none()
-                || block.fused_gate_up_gpu_handle().is_none()
-                || block.ffn_down_gpu_handle().is_none()
-            {
-                return Err("missing GPU handle".into());
-            }
-        }
-        let mut hidden_batch = vec![0.0f32; batch_size * h];
-        // M-02: gather only the rows this batch references, decoding each
-        // straight out of the quantized table. The deleted dense
-        // `Index<Range<usize>>` hatch materialized the whole
-        // `vocab x hidden` FP32 table here (1.16 / 2.31 / 4.74 GiB for the
-        // 1.7B / 8B / 27B) on the first multi-token prompt.
-        self.token_embd.copy_rows(token_ids, &mut hidden_batch)?;
-        let mut cos_table = vec![0.0f32; batch_size * half_dim];
-        let mut sin_table = vec![0.0f32; batch_size * half_dim];
-        for t in 0..batch_size {
-            let pos = pos_start + t;
-            let cos_vals = self.rope.cos_at_checked(pos)?;
-            let sin_vals = self.rope.sin_at_checked(pos)?;
-            cos_table[t * half_dim..(t + 1) * half_dim].copy_from_slice(cos_vals);
-            sin_table[t * half_dim..(t + 1) * half_dim].copy_from_slice(sin_vals);
-        }
-        let mut qkv_concats: Vec<Vec<u8>> = Vec::with_capacity(n_layers);
-        for block in &self.blocks {
-            let q_bytes =
-                blocks_as_bytes(block.attn_q_blocks().ok_or("attn_q: not a 1-bit layer")?);
-            let k_bytes =
-                blocks_as_bytes(block.attn_k_blocks().ok_or("attn_k: not a 1-bit layer")?);
-            let v_bytes =
-                blocks_as_bytes(block.attn_v_blocks().ok_or("attn_v: not a 1-bit layer")?);
-            let mut concat = Vec::with_capacity(q_bytes.len() + k_bytes.len() + v_bytes.len());
-            concat.extend_from_slice(q_bytes);
-            concat.extend_from_slice(k_bytes);
-            concat.extend_from_slice(v_bytes);
-            qkv_concats.push(concat);
-        }
-        let mut layer_params: Vec<FullForwardLayerParams<'_>> = Vec::with_capacity(n_layers);
-        for (i, block) in self.blocks.iter().enumerate() {
-            let norm_handle_base = self.metal_q1_slots.norm_base(block.layer_index());
-            layer_params.push(FullForwardLayerParams {
-                attn_norm_handle: norm_handle_base,
-                attn_norm_bytes: block.attn_norm_weight(),
-                fused_qkv_handle: block
-                    .fused_qkv_gpu_handle()
-                    .map(|hnd| hnd.id())
-                    .unwrap_or(0),
-                fused_qkv_bytes: &qkv_concats[i],
-                q_norm_handle: norm_handle_base + 1,
-                q_norm_bytes: block.q_norm_weight(),
-                k_norm_handle: norm_handle_base + 2,
-                k_norm_bytes: block.k_norm_weight(),
-                attn_proj_handle: block
-                    .attn_output_gpu_handle()
-                    .map(|hnd| hnd.id())
-                    .unwrap_or(0),
-                attn_proj_bytes: blocks_as_bytes(
-                    block
-                        .attn_output_blocks()
-                        .ok_or("attn_output: not a 1-bit layer")?,
-                ),
-                ffn_norm_handle: norm_handle_base + 3,
-                ffn_norm_bytes: block.ffn_norm_weight(),
-                gate_up_handle: block
-                    .fused_gate_up_gpu_handle()
-                    .map(|hnd| hnd.id())
-                    .unwrap_or(0),
-                gate_bytes: blocks_as_bytes(
-                    block
-                        .ffn_gate_blocks()
-                        .ok_or("ffn_gate: not a 1-bit layer")?,
-                ),
-                up_bytes: blocks_as_bytes(
-                    block.ffn_up_blocks().ok_or("ffn_up: not a 1-bit layer")?,
-                ),
-                down_handle: block.ffn_down_gpu_handle().map(|hnd| hnd.id()).unwrap_or(0),
-                down_bytes: blocks_as_bytes(
-                    block
-                        .ffn_down_blocks()
-                        .ok_or("ffn_down: not a 1-bit layer")?,
-                ),
-            });
-        }
+        self.require_q1_gpu_handles()?;
+        let (hidden_batch, cos_table, sin_table) = self.q1_prefill_inputs(token_ids, pos_start)?;
+        let qkv_concats = self.q1_qkv_concats()?;
+        let layer_params = self.q1_layer_params(&qkv_concats)?;
         let final_norm_handle = self.metal_q1_slots.final_norm();
         let final_norm_bytes = self.output_norm.weight();
         let final_norm_eps = self.output_norm.eps();
@@ -732,8 +765,7 @@ impl<'a> BonsaiModel<'a> {
         let lm_head_bytes = blocks_as_bytes(lm_head_linear.blocks());
         let lm_head_out_features = lm_head_linear.out_features();
         let mut logits = vec![0.0f32; lm_head_out_features];
-        self.metal_q1_slots.mark_used(n_layers);
-        oxibonsai_kernels::try_metal_full_forward_prefill(
+        let result = oxibonsai_kernels::try_metal_full_forward_prefill(
             &hidden_batch,
             batch_size,
             pos_start,
@@ -756,8 +788,9 @@ impl<'a> BonsaiModel<'a> {
             lm_head_out_features,
             Some(&mut logits),
             None,
-        )
-        .map_err(|e| {
+        );
+        self.metal_q1_slots.mark_used(n_layers);
+        result.map_err(|e| {
             tracing::warn!(error = % e, "batch prefill GPU dispatch failed");
             Box::new(e) as Box<dyn std::error::Error>
         })?;
@@ -766,21 +799,17 @@ impl<'a> BonsaiModel<'a> {
 
     /// GPU batch prefill verify: all layers + final norm + LM head + per-position argmax.
     ///
-    /// Both 1-bit and ternary (TQ2_0_g128) LM-head models are supported. The
-    /// ternary path delegates to
-    /// [`Self::try_metal_prefill_verify_ternary_path`] which dispatches the
-    /// new TQ2 batched GEMM kernel and per-position TQ2 LM-head GEMV.
+    /// Both 1-bit and ternary (TQ2_0_g128) LM-head models are supported; the
+    /// ternary one runs the cached ternary verify.
     ///
     /// Marked `pub` so parity tests can invoke this **strict** path
     /// directly, bypassing the silent fallback in
     /// [`Self::forward_prefill_verify`] that masks GPU dispatch failures.
-    #[cfg(all(feature = "metal", target_os = "macos"))]
     pub fn try_metal_prefill_verify(
         &self,
         token_ids: &[u32],
         pos_start: usize,
     ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
-        use oxibonsai_kernels::FullForwardLayerParams;
         let batch_size = token_ids.len();
         let n_layers = self.blocks.len();
         if n_layers == 0 {
@@ -828,93 +857,11 @@ impl<'a> BonsaiModel<'a> {
         let nq = self.config.num_attention_heads;
         let nkv = self.config.num_kv_heads;
         let hd = self.config.head_dim;
-        let half_dim = hd / 2;
         let max_seq_len = self.kv_cache.max_seq_len();
-        for block in &self.blocks {
-            if block.fused_qkv_gpu_handle().is_none()
-                || block.attn_output_gpu_handle().is_none()
-                || block.fused_gate_up_gpu_handle().is_none()
-                || block.ffn_down_gpu_handle().is_none()
-            {
-                return Err("missing GPU handle".into());
-            }
-        }
-        let mut hidden_batch = vec![0.0f32; batch_size * h];
-        // M-02: gather only the rows this batch references, decoding each
-        // straight out of the quantized table. The deleted dense
-        // `Index<Range<usize>>` hatch materialized the whole
-        // `vocab x hidden` FP32 table here (1.16 / 2.31 / 4.74 GiB for the
-        // 1.7B / 8B / 27B) on the first multi-token prompt.
-        self.token_embd.copy_rows(token_ids, &mut hidden_batch)?;
-        let mut cos_table = vec![0.0f32; batch_size * half_dim];
-        let mut sin_table = vec![0.0f32; batch_size * half_dim];
-        for t in 0..batch_size {
-            let pos = pos_start + t;
-            let cos_vals = self.rope.cos_at_checked(pos)?;
-            let sin_vals = self.rope.sin_at_checked(pos)?;
-            cos_table[t * half_dim..(t + 1) * half_dim].copy_from_slice(cos_vals);
-            sin_table[t * half_dim..(t + 1) * half_dim].copy_from_slice(sin_vals);
-        }
-        let mut qkv_concats: Vec<Vec<u8>> = Vec::with_capacity(n_layers);
-        for block in &self.blocks {
-            let q_bytes =
-                blocks_as_bytes(block.attn_q_blocks().ok_or("attn_q: not a 1-bit layer")?);
-            let k_bytes =
-                blocks_as_bytes(block.attn_k_blocks().ok_or("attn_k: not a 1-bit layer")?);
-            let v_bytes =
-                blocks_as_bytes(block.attn_v_blocks().ok_or("attn_v: not a 1-bit layer")?);
-            let mut concat = Vec::with_capacity(q_bytes.len() + k_bytes.len() + v_bytes.len());
-            concat.extend_from_slice(q_bytes);
-            concat.extend_from_slice(k_bytes);
-            concat.extend_from_slice(v_bytes);
-            qkv_concats.push(concat);
-        }
-        let mut layer_params: Vec<FullForwardLayerParams<'_>> = Vec::with_capacity(n_layers);
-        for (i, block) in self.blocks.iter().enumerate() {
-            let norm_handle_base = self.metal_q1_slots.norm_base(block.layer_index());
-            layer_params.push(FullForwardLayerParams {
-                attn_norm_handle: norm_handle_base,
-                attn_norm_bytes: block.attn_norm_weight(),
-                fused_qkv_handle: block
-                    .fused_qkv_gpu_handle()
-                    .map(|hnd| hnd.id())
-                    .unwrap_or(0),
-                fused_qkv_bytes: &qkv_concats[i],
-                q_norm_handle: norm_handle_base + 1,
-                q_norm_bytes: block.q_norm_weight(),
-                k_norm_handle: norm_handle_base + 2,
-                k_norm_bytes: block.k_norm_weight(),
-                attn_proj_handle: block
-                    .attn_output_gpu_handle()
-                    .map(|hnd| hnd.id())
-                    .unwrap_or(0),
-                attn_proj_bytes: blocks_as_bytes(
-                    block
-                        .attn_output_blocks()
-                        .ok_or("attn_output: not a 1-bit layer")?,
-                ),
-                ffn_norm_handle: norm_handle_base + 3,
-                ffn_norm_bytes: block.ffn_norm_weight(),
-                gate_up_handle: block
-                    .fused_gate_up_gpu_handle()
-                    .map(|hnd| hnd.id())
-                    .unwrap_or(0),
-                gate_bytes: blocks_as_bytes(
-                    block
-                        .ffn_gate_blocks()
-                        .ok_or("ffn_gate: not a 1-bit layer")?,
-                ),
-                up_bytes: blocks_as_bytes(
-                    block.ffn_up_blocks().ok_or("ffn_up: not a 1-bit layer")?,
-                ),
-                down_handle: block.ffn_down_gpu_handle().map(|hnd| hnd.id()).unwrap_or(0),
-                down_bytes: blocks_as_bytes(
-                    block
-                        .ffn_down_blocks()
-                        .ok_or("ffn_down: not a 1-bit layer")?,
-                ),
-            });
-        }
+        self.require_q1_gpu_handles()?;
+        let (hidden_batch, cos_table, sin_table) = self.q1_prefill_inputs(token_ids, pos_start)?;
+        let qkv_concats = self.q1_qkv_concats()?;
+        let layer_params = self.q1_layer_params(&qkv_concats)?;
         let final_norm_handle = self.metal_q1_slots.final_norm();
         let final_norm_bytes = self.output_norm.weight();
         let final_norm_eps = self.output_norm.eps();
@@ -922,8 +869,7 @@ impl<'a> BonsaiModel<'a> {
         let lm_head_bytes = blocks_as_bytes(lm_head_linear.blocks());
         let lm_head_out_features = lm_head_linear.out_features();
         let mut batch_token_ids: Vec<u32> = Vec::with_capacity(batch_size);
-        self.metal_q1_slots.mark_used(n_layers);
-        oxibonsai_kernels::try_metal_full_forward_prefill_verify(
+        let result = oxibonsai_kernels::try_metal_full_forward_prefill_verify(
             &hidden_batch,
             batch_size,
             pos_start,
@@ -945,8 +891,9 @@ impl<'a> BonsaiModel<'a> {
             Some(lm_head_bytes),
             lm_head_out_features,
             &mut batch_token_ids,
-        )
-        .map_err(|e| {
+        );
+        self.metal_q1_slots.mark_used(n_layers);
+        result.map_err(|e| {
             tracing::warn!(error = % e, "batch prefill verify GPU dispatch failed");
             Box::new(e) as Box<dyn std::error::Error>
         })?;
@@ -960,15 +907,16 @@ impl<'a> BonsaiModel<'a> {
     /// This eliminates ~607KB of GPU→CPU bandwidth per token and removes
     /// CPU-side sampling overhead for greedy (temperature=0) decoding.
     ///
-    /// On the first call, all weight handles are cached in `gpu_weight_cache`.
-    /// Subsequent calls skip ALL byte concatenation, weight upload, and
-    /// HashMap lookups — passing pre-cached handles directly to the GPU.
+    /// On the first call, all weight handles are cached in `gpu_weight_cache`
+    /// (keyed exactly like the uncached fused paths, so a model that already
+    /// prefilled uploads nothing more). Subsequent calls skip ALL byte
+    /// concatenation, weight upload, and HashMap lookups — passing
+    /// pre-cached handles directly to the GPU.
     ///
     /// Supports both Q1 (1-bit) and ternary (TQ2_0_g128) models. FP32 LM head
     /// is not supported and returns `Err`.
     ///
     /// Returns the token ID directly, or `Err` if the GPU path is not available.
-    #[cfg(all(feature = "metal", target_os = "macos"))]
     pub fn forward_greedy_gpu(
         &self,
         token_id: u32,
@@ -1015,8 +963,7 @@ impl<'a> BonsaiModel<'a> {
         };
         let final_norm_eps = self.output_norm.eps();
 
-        // Ternary models use a separate cached path that builds
-        // FullForwardLayerParamsTernary from the cached byte slices.
+        // Ternary models run the cached ternary greedy path.
         if matches!(&self.output_weight, OutputWeight::Ternary(_)) {
             return self.forward_greedy_gpu_ternary(token_id, pos);
         }
@@ -1089,19 +1036,16 @@ impl<'a> BonsaiModel<'a> {
         Ok(greedy_token_id)
     }
 
-    /// Ternary-model greedy decode: all transformer layers + ternary LM head + GPU argmax.
-    ///
-    /// Builds `FullForwardLayerParamsTernary` from borrowed mmap slices and
-    /// dispatches through the TQ2 Metal kernel. The first call uploads every
-    /// weight to the GPU (`get_or_create_gpu_cache`); subsequent calls hit the
-    /// kernel-side weight cache and retain no host copy of the weights
-    /// (MET-03).
+    /// Ternary-model greedy decode: all transformer layers + ternary LM head +
+    /// GPU argmax, through the **cached** ternary weight set (`MET-03`) — the
+    /// eight GPU handles per layer `get_or_create_gpu_cache` resolved once,
+    /// bound directly (no per-token lookup, no host copy of any weight).
     fn forward_greedy_gpu_ternary(
         &self,
         token_id: u32,
         pos: usize,
     ) -> Result<u32, Box<dyn std::error::Error>> {
-        // Context-length guard: `self.rope.cos_at_checked(pos)` below reads a
+        // Context-length guard: `self.rope.cos_at_checked(pos)` reads a
         // `RopeTable` sized to exactly `max_seq_len` rows and errors past it.
         // Mirrors the single-token `forward()` check, which owns the message.
         if pos >= self.kv_cache.max_seq_len() {
@@ -1111,85 +1055,20 @@ impl<'a> BonsaiModel<'a> {
             )
             .into());
         }
-        let n_layers = self.blocks.len();
-        let h = self.config.hidden_size;
-        let inter = self.config.intermediate_size;
-        let nq = self.config.num_attention_heads;
-        let nkv = self.config.num_kv_heads;
-        let hd = self.config.head_dim;
-        let max_seq_len = self.kv_cache.max_seq_len();
-        let eps = if self.blocks.is_empty() {
-            return Err("no blocks".into());
-        } else {
-            self.blocks[0].attn_norm_eps()
-        };
-        let final_norm_eps = self.output_norm.eps();
-
-        self.get_or_create_gpu_cache()?;
-
-        // M-02: decode exactly this one row out of the quantized table
-        // instead of indexing a materialized dense view of all of it.
-        let mut hidden = vec![0.0f32; h];
-        self.token_embd.copy_row(token_id, &mut hidden)?;
-        let rope_cos = self.rope.cos_at_checked(pos)?;
-        let rope_sin = self.rope.sin_at_checked(pos)?;
-        let mut greedy_token_id: u32 = 0;
-
-        // Guards that the populated cache really is the ternary one (it used to
-        // be the `qkv_concats.len()` check on the host byte copies this path no
-        // longer keeps).
-        let cached_out_features = self.ternary_gpu_cache_out_features()?;
-        let binding = self.ternary_gpu_binding()?;
-        let tail = binding
-            .tail
-            .ok_or("ternary greedy GPU path requires a ternary LM head")?;
-        if tail.lm_head_out_features != cached_out_features {
-            return Err(format!(
-                "ternary LM-head row count changed since the GPU cache was built: cache says \
-                 {cached_out_features}, model says {}",
-                tail.lm_head_out_features
-            )
-            .into());
-        }
-
-        oxibonsai_kernels::try_metal_forward_greedy_ternary(
-            &mut hidden,
-            pos,
-            n_layers,
-            &binding.layer_params,
-            rope_cos,
-            rope_sin,
-            h,
-            inter,
-            nq,
-            nkv,
-            hd,
-            eps,
-            max_seq_len,
-            Some(tail.final_norm_handle),
-            Some(tail.final_norm_bytes),
-            final_norm_eps,
-            Some(tail.lm_head_handle),
-            Some(tail.lm_head_bytes),
-            tail.lm_head_out_features,
-            &mut greedy_token_id,
-        )
-        .map_err(|e| {
-            tracing::warn!(error = % e, "ternary greedy GPU forward failed");
-            Box::new(e) as Box<dyn std::error::Error>
-        })?;
-        // MET-05 (runtime half) — see `forward_greedy_gpu`.
-        self.note_device_kv_used();
-        Ok(greedy_token_id)
+        self.forward_greedy_gpu_ternary_cached(token_id, pos)
+            .map_err(|e| {
+                tracing::warn!(error = % e, "ternary greedy GPU forward failed");
+                e
+            })
     }
 
     /// Ternary fused forward + LM head (single token, non-greedy sampling).
     ///
-    /// Routes the decode hot-path for ternary models through the GPU TQ2 kernel,
-    /// binding every weight from a borrowed mmap slice (MET-03). This is the
-    /// call `BonsaiModel::forward()` makes first; when it fails, `forward()`
-    /// retries through [`Self::try_metal_full_forward_ternary_inner`], which
-    /// since MET-02 resolves to the very same weight slots.
+    /// Routes the decode hot-path for ternary models through the **cached**
+    /// ternary weight set (`MET-03`). This is the call `BonsaiModel::forward()`
+    /// makes first; when it fails, `forward()` retries through
+    /// [`Self::try_metal_full_forward_ternary_inner`], which binds the very
+    /// same cached buffers (MET-02).
     ///
     /// `pub(super)` so the MET-02 regression test can drive it and the fallback
     /// directly, in the order `forward()` does.
@@ -1199,7 +1078,6 @@ impl<'a> BonsaiModel<'a> {
         pos: usize,
         logits: &mut Vec<f32>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let n_layers = self.blocks.len();
         let h = self.config.hidden_size;
         let inter = self.config.intermediate_size;
         let nq = self.config.num_attention_heads;
@@ -1213,21 +1091,8 @@ impl<'a> BonsaiModel<'a> {
         };
         let final_norm_eps = self.output_norm.eps();
 
+        // Every weight resident first (the cached shape resolves them all)...
         self.get_or_create_gpu_cache()?;
-
-        let cached_out_features = self.ternary_gpu_cache_out_features()?;
-        let binding = self.ternary_gpu_binding()?;
-        let tail = binding
-            .tail
-            .ok_or("ternary fused GPU path requires a ternary LM head")?;
-        if tail.lm_head_out_features != cached_out_features {
-            return Err(format!(
-                "ternary LM-head row count changed since the GPU cache was built: cache says \
-                 {cached_out_features}, model says {}",
-                tail.lm_head_out_features
-            )
-            .into());
-        }
 
         // MET-02 fault-injection seam. Every layer's weights are resident by
         // now and only the final-norm → LM-head tail is left, which is exactly
@@ -1244,55 +1109,44 @@ impl<'a> BonsaiModel<'a> {
 
         let rope_cos = self.rope.cos_at_checked(pos)?;
         let rope_sin = self.rope.sin_at_checked(pos)?;
-
-        oxibonsai_kernels::try_metal_prefill_ternary(
-            hidden,
-            pos,
-            n_layers,
-            &binding.layer_params,
-            rope_cos,
-            rope_sin,
-            h,
-            inter,
-            nq,
-            nkv,
-            hd,
-            eps,
-            max_seq_len,
-            Some(tail.final_norm_handle),
-            Some(tail.final_norm_bytes),
-            final_norm_eps,
-            Some(tail.lm_head_handle),
-            Some(tail.lm_head_bytes),
-            tail.lm_head_out_features,
-            logits,
-        )
+        self.with_ternary_gpu_cache(|cached| {
+            oxibonsai_kernels::try_metal_prefill_ternary_cached(
+                hidden,
+                pos,
+                cached,
+                rope_cos,
+                rope_sin,
+                h,
+                inter,
+                nq,
+                nkv,
+                hd,
+                eps,
+                max_seq_len,
+                final_norm_eps,
+                logits,
+            )
+        })?
         .map_err(|e| {
             tracing::warn!(error = % e, "ternary fused GPU forward failed");
             Box::new(e) as Box<dyn std::error::Error>
         })
     }
 
-    /// GPU batch prefill — ternary (TQ2_0_g128) variant.
-    ///
-    /// Mirror of [`Self::try_metal_prefill_with_lm_head`] for ternary
-    /// LM-head models. Builds `FullForwardLayerParamsTernary` from the
-    /// model's per-layer ternary blocks and dispatches the new TQ2 batched
-    /// prefill kernel via [`oxibonsai_kernels::try_metal_full_forward_prefill_ternary`].
+    /// GPU batch prefill — ternary (TQ2_0_g128) variant, through the
+    /// **cached** ternary weight set ([`Self::prefill_logits_gpu_ternary_cached`]).
     /// Only the last token's logits are returned.
     ///
     /// Marked `pub` so parity tests can invoke this **strict** path
     /// directly, bypassing the silent fallback in
     /// [`Self::forward_prefill`] that masks GPU dispatch failures.
-    #[cfg(all(feature = "metal", target_os = "macos"))]
     pub fn try_metal_prefill_with_lm_head_ternary(
         &self,
         token_ids: &[u32],
         pos_start: usize,
     ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
         let batch_size = token_ids.len();
-        let n_layers = self.blocks.len();
-        if n_layers == 0 {
+        if self.blocks.is_empty() {
             return Err("no blocks".into());
         }
         // Context-length guard: prevents an out-of-bounds RoPE slice panic on
@@ -1308,96 +1162,27 @@ impl<'a> BonsaiModel<'a> {
         if !matches!(&self.output_weight, OutputWeight::Ternary(_)) {
             return Err("ternary prefill called on non-ternary model".into());
         }
-        let eps = self.blocks[0].attn_norm_eps();
-        let h = self.config.hidden_size;
-        let inter = self.config.intermediate_size;
-        let nq = self.config.num_attention_heads;
-        let nkv = self.config.num_kv_heads;
-        let hd = self.config.head_dim;
-        let half_dim = hd / 2;
-        let max_seq_len = self.kv_cache.max_seq_len();
-
-        // Embed prompt tokens into `[batch × hidden]` column-major layout.
-        let mut hidden_batch = vec![0.0f32; batch_size * h];
-        // M-02: gather only the rows this batch references, decoding each
-        // straight out of the quantized table. The deleted dense
-        // `Index<Range<usize>>` hatch materialized the whole
-        // `vocab x hidden` FP32 table here (1.16 / 2.31 / 4.74 GiB for the
-        // 1.7B / 8B / 27B) on the first multi-token prompt.
-        self.token_embd.copy_rows(token_ids, &mut hidden_batch)?;
-
-        // Pre-compute RoPE cos/sin tables for every position in the batch.
-        let mut cos_table = vec![0.0f32; batch_size * half_dim];
-        let mut sin_table = vec![0.0f32; batch_size * half_dim];
-        for t in 0..batch_size {
-            let pos = pos_start + t;
-            let cos_vals = self.rope.cos_at_checked(pos)?;
-            let sin_vals = self.rope.sin_at_checked(pos)?;
-            cos_table[t * half_dim..(t + 1) * half_dim].copy_from_slice(cos_vals);
-            sin_table[t * half_dim..(t + 1) * half_dim].copy_from_slice(sin_vals);
-        }
-
-        // Bind every layer's weights from borrowed mmap slices. This used to
-        // rebuild five `Vec<Vec<u8>>` — the whole quantized model, 82 MB for
-        // the 1.7B LM head alone — on **every** call, with no memoization,
-        // while the GPU side was already handle-cached (perf-03). The one
-        // layout that has to be materialized, Q‖K‖V, is now built inside the
-        // upload closure on a cache miss only.
-        let final_norm_eps = self.output_norm.eps();
-        let binding = self.ternary_gpu_binding()?;
-        let tail = binding
-            .tail
-            .ok_or("ternary prefill requires a ternary LM head")?;
-
-        let mut logits = vec![0.0f32; tail.lm_head_out_features];
-        oxibonsai_kernels::try_metal_full_forward_prefill_ternary(
-            &hidden_batch,
-            batch_size,
-            pos_start,
-            n_layers,
-            &binding.layer_params,
-            &cos_table,
-            &sin_table,
-            h,
-            inter,
-            nq,
-            nkv,
-            hd,
-            eps,
-            max_seq_len,
-            Some(tail.final_norm_handle),
-            Some(tail.final_norm_bytes),
-            final_norm_eps,
-            Some(tail.lm_head_handle),
-            Some(tail.lm_head_bytes),
-            tail.lm_head_out_features,
-            Some(&mut logits),
-            None,
-        )
-        .map_err(|e| {
-            tracing::warn!(error = % e, "ternary batch prefill GPU dispatch failed");
-            Box::new(e) as Box<dyn std::error::Error>
-        })?;
-        Ok(logits)
+        self.prefill_logits_gpu_ternary_cached(token_ids, pos_start)
+            .map_err(|e| {
+                tracing::warn!(error = % e, "ternary batch prefill GPU dispatch failed");
+                e
+            })
     }
 
-    /// GPU batch prefill verify — ternary (TQ2_0_g128) variant.
-    ///
-    /// Mirror of [`Self::try_metal_prefill_verify`] for ternary LM-head
-    /// models. Returns the per-position greedy argmax token IDs.
+    /// GPU batch prefill verify — ternary (TQ2_0_g128) variant, through the
+    /// **cached** ternary weight set ([`Self::prefill_verify_gpu_ternary_cached`]).
+    /// Returns the per-position greedy argmax token IDs.
     ///
     /// Marked `pub` so parity tests can invoke this **strict** path
     /// directly, bypassing the silent fallback in
     /// [`Self::forward_prefill_verify`] that masks GPU dispatch failures.
-    #[cfg(all(feature = "metal", target_os = "macos"))]
     pub fn try_metal_prefill_verify_ternary_path(
         &self,
         token_ids: &[u32],
         pos_start: usize,
     ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
         let batch_size = token_ids.len();
-        let n_layers = self.blocks.len();
-        if n_layers == 0 {
+        if self.blocks.is_empty() {
             return Err("no blocks".into());
         }
         // Context-length guard: prevents an out-of-bounds RoPE slice panic on
@@ -1413,94 +1198,211 @@ impl<'a> BonsaiModel<'a> {
         if !matches!(&self.output_weight, OutputWeight::Ternary(_)) {
             return Err("ternary prefill verify called on non-ternary model".into());
         }
-        let eps = self.blocks[0].attn_norm_eps();
-        let h = self.config.hidden_size;
-        let inter = self.config.intermediate_size;
-        let nq = self.config.num_attention_heads;
-        let nkv = self.config.num_kv_heads;
-        let hd = self.config.head_dim;
-        let half_dim = hd / 2;
-        let max_seq_len = self.kv_cache.max_seq_len();
+        self.prefill_verify_gpu_ternary_cached(token_ids, pos_start)
+            .map_err(|e| {
+                tracing::warn!(error = % e, "ternary batch prefill verify GPU dispatch failed");
+                e
+            })
+    }
 
-        let mut hidden_batch = vec![0.0f32; batch_size * h];
-        // M-02: gather only the rows this batch references, decoding each
-        // straight out of the quantized table. The deleted dense
-        // `Index<Range<usize>>` hatch materialized the whole
-        // `vocab x hidden` FP32 table here (1.16 / 2.31 / 4.74 GiB for the
-        // 1.7B / 8B / 27B) on the first multi-token prompt.
-        self.token_embd.copy_rows(token_ids, &mut hidden_batch)?;
+    // ── Uncached ternary reference entries (the MET-03 A/B arm) ──────────────
 
-        let mut cos_table = vec![0.0f32; batch_size * half_dim];
-        let mut sin_table = vec![0.0f32; batch_size * half_dim];
-        for t in 0..batch_size {
-            let pos = pos_start + t;
-            let cos_vals = self.rope.cos_at_checked(pos)?;
-            let sin_vals = self.rope.sin_at_checked(pos)?;
-            cos_table[t * half_dim..(t + 1) * half_dim].copy_from_slice(cos_vals);
-            sin_table[t * half_dim..(t + 1) * half_dim].copy_from_slice(sin_vals);
-        }
-
-        // Same borrowed binding as `try_metal_prefill_with_lm_head_ternary`;
-        // see the note there on the five per-call `Vec<Vec<u8>>` this replaces
-        // (perf-03).
-        let final_norm_eps = self.output_norm.eps();
+    /// Logits of one token through the **uncached** ternary GPU path, strictly
+    /// (no CPU fallback): the per-call `FullForwardLayerParamsTernary` binding
+    /// ([`Self::ternary_gpu_binding`]) and eight weight-cache lookups per
+    /// layer in the kernels.
+    ///
+    /// Nothing on the model's decode route takes this any more; it is the
+    /// reference the cached shape is proven against — the MET-03 parity
+    /// evidence compares it with [`Self::forward_logits_gpu_ternary_cached`]
+    /// bit for bit — and the explicit "no fallback, no cache" entry a caller
+    /// can use to tell a GPU failure from a CPU answer.
+    ///
+    /// # Errors
+    ///
+    /// A non-ternary model, a position past the context, a sliding-window
+    /// model, or any Metal failure — never a CPU fallback.
+    pub fn forward_logits_gpu_ternary_uncached(
+        &self,
+        token_id: u32,
+        pos: usize,
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        let (mut hidden, rope_cos, rope_sin) = self.ternary_decode_prologue(token_id, pos)?;
         let binding = self.ternary_gpu_binding()?;
         let tail = binding
             .tail
-            .ok_or("ternary prefill verify requires a ternary LM head")?;
-
-        let mut batch_token_ids: Vec<u32> = Vec::with_capacity(batch_size);
-        oxibonsai_kernels::try_metal_full_forward_prefill_verify_ternary(
-            &hidden_batch,
-            batch_size,
-            pos_start,
-            n_layers,
+            .ok_or("the uncached ternary logits path requires a ternary LM head")?;
+        let mut logits = Vec::new();
+        let result = oxibonsai_kernels::try_metal_prefill_ternary(
+            &mut hidden,
+            pos,
+            self.blocks.len(),
             &binding.layer_params,
-            &cos_table,
-            &sin_table,
-            h,
-            inter,
-            nq,
-            nkv,
-            hd,
-            eps,
-            max_seq_len,
+            rope_cos,
+            rope_sin,
+            self.config.hidden_size,
+            self.config.intermediate_size,
+            self.config.num_attention_heads,
+            self.config.num_kv_heads,
+            self.config.head_dim,
+            self.blocks[0].attn_norm_eps(),
+            self.kv_cache.max_seq_len(),
             Some(tail.final_norm_handle),
             Some(tail.final_norm_bytes),
-            final_norm_eps,
+            self.output_norm.eps(),
             Some(tail.lm_head_handle),
             Some(tail.lm_head_bytes),
             tail.lm_head_out_features,
-            &mut batch_token_ids,
-        )
-        .map_err(|e| {
-            tracing::warn!(error = % e, "ternary batch prefill verify GPU dispatch failed");
-            Box::new(e) as Box<dyn std::error::Error>
-        })?;
-        Ok(batch_token_ids)
+            &mut logits,
+        );
+        self.metal_q1_slots.mark_used(self.blocks.len());
+        result?;
+        self.note_device_kv_used();
+        Ok(logits)
+    }
+
+    /// Batched prefill through the **uncached** ternary GPU path, strictly:
+    /// the per-call binding plus the kernels' batched ternary prefill, which
+    /// resolves all eight buffers per layer and the tail under the layers'
+    /// `model_epoch` (the mapping epoch). The reference
+    /// [`Self::prefill_logits_gpu_ternary_cached`] is proven against; returns
+    /// the last position's logits.
+    ///
+    /// # Errors
+    ///
+    /// A non-ternary model, an empty or over-long batch, or any Metal
+    /// failure — never a CPU fallback.
+    pub fn prefill_logits_gpu_ternary_uncached(
+        &self,
+        token_ids: &[u32],
+        pos_start: usize,
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        let (hidden_batch, cos_table, sin_table) =
+            self.ternary_prefill_inputs(token_ids, pos_start)?;
+        let binding = self.ternary_gpu_binding()?;
+        let tail = binding
+            .tail
+            .ok_or("the uncached ternary prefill requires a ternary LM head")?;
+        let mut logits = vec![0.0f32; tail.lm_head_out_features];
+        let result = oxibonsai_kernels::try_metal_full_forward_prefill_ternary(
+            &hidden_batch,
+            token_ids.len(),
+            pos_start,
+            self.blocks.len(),
+            &binding.layer_params,
+            &cos_table,
+            &sin_table,
+            self.config.hidden_size,
+            self.config.intermediate_size,
+            self.config.num_attention_heads,
+            self.config.num_kv_heads,
+            self.config.head_dim,
+            self.blocks[0].attn_norm_eps(),
+            self.kv_cache.max_seq_len(),
+            Some(tail.final_norm_handle),
+            Some(tail.final_norm_bytes),
+            self.output_norm.eps(),
+            Some(tail.lm_head_handle),
+            Some(tail.lm_head_bytes),
+            tail.lm_head_out_features,
+            Some(&mut logits),
+            None,
+        );
+        self.metal_q1_slots.mark_used(self.blocks.len());
+        result?;
+        self.note_device_kv_used();
+        Ok(logits)
+    }
+
+    /// Batched speculative-verify prefill through the **uncached** ternary GPU
+    /// path, strictly — the twin of [`Self::prefill_logits_gpu_ternary_uncached`]
+    /// returning every position's greedy argmax, and the reference
+    /// [`Self::prefill_verify_gpu_ternary_cached`] is proven against.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::prefill_logits_gpu_ternary_uncached`].
+    pub fn prefill_verify_gpu_ternary_uncached(
+        &self,
+        token_ids: &[u32],
+        pos_start: usize,
+    ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+        let (hidden_batch, cos_table, sin_table) =
+            self.ternary_prefill_inputs(token_ids, pos_start)?;
+        let binding = self.ternary_gpu_binding()?;
+        let tail = binding
+            .tail
+            .ok_or("the uncached ternary prefill verify requires a ternary LM head")?;
+        let mut ids: Vec<u32> = Vec::with_capacity(token_ids.len());
+        let result = oxibonsai_kernels::try_metal_full_forward_prefill_verify_ternary(
+            &hidden_batch,
+            token_ids.len(),
+            pos_start,
+            self.blocks.len(),
+            &binding.layer_params,
+            &cos_table,
+            &sin_table,
+            self.config.hidden_size,
+            self.config.intermediate_size,
+            self.config.num_attention_heads,
+            self.config.num_kv_heads,
+            self.config.head_dim,
+            self.blocks[0].attn_norm_eps(),
+            self.kv_cache.max_seq_len(),
+            Some(tail.final_norm_handle),
+            Some(tail.final_norm_bytes),
+            self.output_norm.eps(),
+            Some(tail.lm_head_handle),
+            Some(tail.lm_head_bytes),
+            tail.lm_head_out_features,
+            &mut ids,
+        );
+        self.metal_q1_slots.mark_used(self.blocks.len());
+        result?;
+        self.note_device_kv_used();
+        Ok(ids)
     }
 }
 
 impl BonsaiModel<'_> {
-    /// This model's Q1 Metal weight-cache slots (MET-02, Q1 half).
+    /// This model's Metal weight-cache namespace: the Q1 norm / LM-head slots
+    /// and the mapping epoch (MET-02).
     #[must_use]
     pub fn q1_metal_slots(&self) -> &Q1MetalSlots {
         &self.metal_q1_slots
     }
 
-    /// Evict every norm / LM-head buffer this model's fused Q1 paths put in
-    /// the Metal weight cache, returning how many slots were swept. A model
-    /// whose Q1 fused paths never ran (or were already released) returns
-    /// `Ok(0)` without touching (or initialising) the Metal graph. Dropping
-    /// the model does the same.
+    /// Evict every Metal buffer keyed under this model's mapping epoch — for
+    /// a Q1 model its norms, final norm and LM head — returning how many
+    /// were released, and drop the model's cached Q1 handle set so the freed
+    /// buffers are not kept alive by it (the next greedy call rebuilds it). A
+    /// model whose fused paths never ran (or were already released) returns
+    /// `Ok(0)` without touching (or initialising) the Metal graph.
     ///
-    /// Safe for engine-pool replicas: every load has its own epoch, so this
-    /// can only ever release this model's own buffers.
+    /// **Siblings.** The namespace belongs to the GGUF mapping, so the
+    /// buffers of every engine-pool replica of this model go too: a surviving
+    /// replica re-uploads them on its next miss (its own cached handle set
+    /// keeps the old copies alive until it is rebuilt or dropped). Dropping a
+    /// model releases nothing while a sibling replica is alive — the last
+    /// replica's drop releases the lot — so call this only to free the
+    /// buffers of a mapping early.
     ///
     /// # Errors
     ///
-    /// The Metal graph cannot be reached, or its cache lock is poisoned.
+    /// The Metal graph cannot be reached, or a lock is poisoned.
     pub fn release_q1_metal_slots(&self) -> Result<usize, Box<dyn std::error::Error>> {
+        {
+            let mut guard = self
+                .gpu_weight_cache
+                .lock()
+                .map_err(|e| format!("gpu_weight_cache lock: {e}"))?;
+            if matches!(
+                guard.as_ref(),
+                Some(oxibonsai_kernels::CachedModelWeights::Q1(_))
+            ) {
+                *guard = None;
+            }
+        }
         Ok(self.metal_q1_slots.release()?)
     }
 }

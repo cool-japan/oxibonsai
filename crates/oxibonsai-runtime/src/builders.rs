@@ -7,7 +7,7 @@
 //! - [`ConfigBuilder`] — validates and creates an [`OxiBonsaiConfig`]
 //! - [`EngineBuilder`] — orchestrates config + sampler together
 
-use crate::config::OxiBonsaiConfig;
+use crate::config::{OxiBonsaiConfig, RopeScalingMode};
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::sampling::{Sampler, SamplingParams};
 
@@ -41,12 +41,19 @@ pub struct SamplerBuilder {
 
 impl SamplerBuilder {
     /// Create a new sampler builder with default values.
+    ///
+    /// `repetition_penalty` defaults to `1.0` (no-op). Gatekeeper REQUIRED
+    /// #18 (waves 3+3.5 review): this used to be `1.1`, one of the residual
+    /// seeds left over after `sampling::SamplingParams::default()` was
+    /// corrected to `1.0` (RT-24 / gatekeeper REQUIRED #1(a)) — the P0
+    /// CPU-vs-Metal greedy-parity fix depends on every default-constructed
+    /// sampler applying no penalty unless a caller opts in explicitly.
     pub fn new() -> Self {
         Self {
             temperature: 0.7,
             top_k: 40,
             top_p: 0.9,
-            repetition_penalty: 1.1,
+            repetition_penalty: 1.0,
             seed: 42,
         }
     }
@@ -221,12 +228,17 @@ impl Default for ConfigBuilder {
 /// Builder for the inference engine (high-level orchestrator).
 ///
 /// Validates configuration and sampling parameters together.
-/// Cannot create an actual engine without a GGUF file, but returns
-/// the validated config and sampler ready for engine construction.
+/// [`build`](Self::build) returns the validated config and sampler;
+/// [`build_engine`](Self::build_engine) goes on to construct the real
+/// [`InferenceEngine`](crate::engine::InferenceEngine) from a parsed GGUF,
+/// honouring the configured `--rope-scaling` mode.
 pub struct EngineBuilder {
     config: Option<OxiBonsaiConfig>,
     sampler: Option<SamplerBuilder>,
     kernel_tier: Option<String>,
+    /// An explicit [`Self::rope_scaling`] call; `None` defers to the
+    /// configuration's own `[model].rope_scaling`.
+    rope_scaling: Option<RopeScalingMode>,
 }
 
 impl EngineBuilder {
@@ -236,6 +248,7 @@ impl EngineBuilder {
             config: None,
             sampler: None,
             kernel_tier: None,
+            rope_scaling: None,
         }
     }
 
@@ -269,12 +282,35 @@ impl EngineBuilder {
         self.kernel_tier.as_deref()
     }
 
+    /// Set the `--rope-scaling` override (wave-4b orchestrator addendum;
+    /// see [`RopeScalingMode`]). It wins over the configuration's own
+    /// `[model].rope_scaling`, is written into the configuration
+    /// [`build`](Self::build) returns, and is applied to the model by
+    /// [`build_engine`](Self::build_engine) (through
+    /// `InferenceEngine::from_gguf_with_backend_and_rope`).
+    pub fn rope_scaling(mut self, mode: RopeScalingMode) -> Self {
+        self.rope_scaling = Some(mode);
+        self
+    }
+
+    /// The RoPE-scaling mode an engine built by this builder uses: an
+    /// explicit [`Self::rope_scaling`], else the configuration's
+    /// `[model].rope_scaling`, else `auto`.
+    pub fn configured_rope_scaling(&self) -> RopeScalingMode {
+        self.rope_scaling
+            .or_else(|| self.config.as_ref().map(|c| c.model.rope_scaling))
+            .unwrap_or_default()
+    }
+
     /// Validate and build the config + sampler pair.
     ///
     /// Returns the validated configuration and sampler, ready for
     /// engine construction once a GGUF file is available.
     pub fn build(self) -> RuntimeResult<(OxiBonsaiConfig, Sampler)> {
-        let config = self.config.unwrap_or_default();
+        let mut config = self.config.unwrap_or_default();
+        if let Some(mode) = self.rope_scaling {
+            config.model.rope_scaling = mode;
+        }
         config.validate()?;
 
         let sampler = match self.sampler {
@@ -291,6 +327,32 @@ impl EngineBuilder {
         };
 
         Ok((config, sampler))
+    }
+
+    /// [`build`](Self::build), then construct the engine from `gguf` with
+    /// the validated sampling parameters, `seed`, the configuration's
+    /// `max_seq_len`, `backend`, and the configured RoPE-scaling mode.
+    ///
+    /// # Errors
+    ///
+    /// A configuration/sampler validation error, `--rope-scaling on` on a
+    /// file that declares no scaling, or an engine construction error.
+    pub fn build_engine<'a>(
+        self,
+        gguf: &'a oxibonsai_core::gguf::reader::GgufFile<'a>,
+        seed: u64,
+        backend: crate::engine_seam::Backend,
+    ) -> RuntimeResult<(crate::engine::InferenceEngine<'a>, OxiBonsaiConfig)> {
+        let (config, sampler) = self.build()?;
+        let engine = crate::engine::InferenceEngine::from_gguf_with_backend_and_rope(
+            gguf,
+            sampler.params().clone(),
+            seed,
+            config.model.max_seq_len,
+            backend,
+            config.model.rope_scaling.into(),
+        )?;
+        Ok((engine, config))
     }
 }
 
@@ -315,7 +377,9 @@ mod tests {
         assert!((params.temperature - 0.7).abs() < f32::EPSILON);
         assert_eq!(params.top_k, 40);
         assert!((params.top_p - 0.9).abs() < f32::EPSILON);
-        assert!((params.repetition_penalty - 1.1).abs() < f32::EPSILON);
+        // Gatekeeper REQUIRED #18: the raw builder default is now `1.0`
+        // (no-op), matching `sampling::SamplingParams::default()`.
+        assert!((params.repetition_penalty - 1.0).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -538,8 +602,102 @@ port = 7777
     }
 
     #[test]
+    fn engine_builder_rope_scaling_defaults_to_auto() {
+        let builder = EngineBuilder::new();
+        assert_eq!(builder.configured_rope_scaling(), RopeScalingMode::Auto);
+    }
+
+    #[test]
+    fn engine_builder_rope_scaling_is_settable_and_survives_build() {
+        let builder = EngineBuilder::new().rope_scaling(RopeScalingMode::Off);
+        assert_eq!(builder.configured_rope_scaling(), RopeScalingMode::Off);
+        assert!(builder.build().is_ok());
+    }
+
+    #[test]
     fn engine_builder_default_trait() {
         let builder = EngineBuilder::default();
         assert!(builder.build().is_ok());
+    }
+
+    // ── --rope-scaling reaches the built config and the engine ──
+
+    #[test]
+    fn an_explicit_rope_scaling_is_written_into_the_built_config() {
+        let (config, _) = EngineBuilder::new()
+            .rope_scaling(RopeScalingMode::Off)
+            .build()
+            .expect("valid");
+        assert_eq!(config.model.rope_scaling, RopeScalingMode::Off);
+
+        // Without an explicit call the configuration's own value stands.
+        let mut from_toml = OxiBonsaiConfig::default();
+        from_toml.model.rope_scaling = RopeScalingMode::On;
+        let builder = EngineBuilder::new().config(from_toml);
+        assert_eq!(builder.configured_rope_scaling(), RopeScalingMode::On);
+        let (config, _) = builder.build().expect("valid");
+        assert_eq!(config.model.rope_scaling, RopeScalingMode::On);
+
+        // ...and an explicit call beats it.
+        let mut from_toml = OxiBonsaiConfig::default();
+        from_toml.model.rope_scaling = RopeScalingMode::On;
+        let builder = EngineBuilder::new()
+            .config(from_toml)
+            .rope_scaling(RopeScalingMode::Auto);
+        assert_eq!(builder.configured_rope_scaling(), RopeScalingMode::Auto);
+    }
+
+    fn small_builder(
+        config_mode: RopeScalingMode,
+        explicit: Option<RopeScalingMode>,
+    ) -> EngineBuilder {
+        let mut config = OxiBonsaiConfig::default();
+        config.model.max_seq_len = 64;
+        config.model.rope_scaling = config_mode;
+        let builder = EngineBuilder::new().config(config);
+        match explicit {
+            Some(mode) => builder.rope_scaling(mode),
+            None => builder,
+        }
+    }
+
+    #[test]
+    fn build_engine_applies_the_configured_rope_scaling() {
+        use crate::engine_pool::tests::{
+            build_tiny_gguf_bytes_with, engine_rope_scaling, yarn_metadata,
+        };
+        use oxibonsai_core::config::RopeScaling;
+        let bytes = build_tiny_gguf_bytes_with(yarn_metadata());
+        let gguf = oxibonsai_core::gguf::reader::GgufFile::parse(&bytes).expect("parse");
+        let backend = crate::engine_seam::Backend::Cpu;
+
+        let (auto, config) = small_builder(RopeScalingMode::Auto, None)
+            .build_engine(&gguf, 42, backend)
+            .expect("auto");
+        assert!(matches!(
+            engine_rope_scaling(&auto),
+            RopeScaling::Yarn { .. }
+        ));
+        assert_eq!(config.model.max_seq_len, 64);
+
+        let (off, config) = small_builder(RopeScalingMode::Auto, Some(RopeScalingMode::Off))
+            .build_engine(&gguf, 42, backend)
+            .expect("explicit off");
+        assert_eq!(engine_rope_scaling(&off), RopeScaling::None);
+        assert_eq!(config.model.rope_scaling, RopeScalingMode::Off);
+
+        let (config_off, _) = small_builder(RopeScalingMode::Off, None)
+            .build_engine(&gguf, 42, backend)
+            .expect("[model].rope_scaling = off");
+        assert_eq!(engine_rope_scaling(&config_off), RopeScaling::None);
+
+        let plain = build_tiny_gguf_bytes_with(Vec::new());
+        let plain = oxibonsai_core::gguf::reader::GgufFile::parse(&plain).expect("parse");
+        let refused = small_builder(RopeScalingMode::Auto, Some(RopeScalingMode::On))
+            .build_engine(&plain, 42, backend);
+        assert!(
+            refused.is_err(),
+            "`on` refuses a file that declares no scaling"
+        );
     }
 }

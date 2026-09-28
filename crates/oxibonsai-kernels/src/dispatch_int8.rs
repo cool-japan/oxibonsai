@@ -23,20 +23,60 @@
 //! and [`Int8Tier::from_env`]'s own tests fail loudly if anyone makes this
 //! tier reachable without asking for it.
 //!
+//! # Where the environment selector is read
+//!
+//! [`Int8Tier::from_env`] is consulted once per call, at the **entry** of
+//! every CPU GEMV/GEMM for the formats this tier serves:
+//!
+//! - the native formats: `KernelDispatcher`'s `OneBitKernel::{gemv, gemm}`
+//!   (`Q1_0_g128`) and `TernaryKernel::{gemv_ternary_g128,
+//!   gemm_ternary_g128}` (`TQ2_0_g128`), the `parallel_tiled` adaptive
+//!   drivers (`gemv_adaptive`, `gemv_adaptive_ternary`,
+//!   `gemm_adaptive_ternary`, `gemv_parallel_tiled*`, `gemm_parallel_tiled`)
+//!   and the `parallel` drivers (`gemv_1bit_g128_par`, `gemm_1bit_g128_par`,
+//!   `gemv_ternary_g128_par`, `gemm_ternary_g128_par`) — see
+//!   `KernelDispatcher::native_int8_tier`;
+//! - the PrismML formats `PQ2_0` and group-64 `Q2_0`, in
+//!   `dispatch_prism.rs`'s `PrismKernel` impl.
+//!
+//! A driver's tiles and chunks never re-read it: the check happens once,
+//! before any strategy is chosen, so the activation is quantized once per
+//! call and the INT8 kernels (which parallelize themselves) are never
+//! re-entered per tile. (The older `tiled::gemv_tiled` /
+//! `tiled::gemv_tiled_par` drivers still call `OneBitKernel::gemv` once
+//! per tile, so a direct caller gets the INT8 tier tile by tile — the same
+//! values, with the activation re-quantized per tile; nothing in the
+//! workspace calls them outside their own tests.) On the native formats a
+//! `KernelTier::Gpu`
+//! dispatcher and every `*_cached` GPU-handle entry point are never
+//! diverted; the PrismML formats have no GPU kernel, so their CPU kernels
+//! honour the selector whichever tier the dispatcher is on.
+//!
 //! # Tiers
 //!
 //! | [`Int8Tier`] | `OXIBONSAI_KERNEL_TIER` | Requires | Inner loop |
 //! |---|---|---|---|
 //! | [`Int8Tier::Scalar`] | `int8-scalar` | — | `i32` MAC |
-//! | [`Int8Tier::Neon`] | `neon-int8` | AArch64 | `SMULL` + `SADALP` |
-//! | [`Int8Tier::NeonDot`] | `neon-dot` | `dotprod` | `SDOT` (16 MACs) |
-//! | [`Int8Tier::NeonI8mm`] | `neon-i8mm` | `i8mm` + `dotprod` | `SDOT` (GEMV and GEMM — see the variant's doc) |
-//! | [`Int8Tier::Avx512Vnni`] | `avx512-vnni` | `avx512f/bw/vnni` | `VPDPBUSD` (64 MACs) |
+//! | `Int8Tier::Neon` | `neon-int8` | AArch64 | `SMULL` + `SADALP` |
+//! | `Int8Tier::NeonDot` | `neon-dot` | `dotprod` | `SDOT` (16 MACs) |
+//! | `Int8Tier::NeonI8mm` | `neon-i8mm` | `i8mm` + `dotprod` | `SMMLA` (32 MACs) for GEMM, `SDOT` for GEMV |
+//! | `Int8Tier::Avx512Vnni` | `avx512-vnni` | `avx512f/bw/vnni` | `VPDPBUSD` (64 MACs) |
 //!
 //! Every tier computes the **same `i32`** per block — integer arithmetic is
 //! exact and associative, so the only thing that changes between them is
 //! how fast the sum is formed. The `f32` result is therefore identical
 //! across tiers as well, which `int8_tier_parity` asserts bit-for-bit.
+//!
+//! # Parallelism
+//!
+//! Every GEMV splits the weight-row dimension across Rayon tasks above
+//! [`INT8_PAR_MIN_ROWS`]; every row-kernel GEMM chooses between a
+//! per-batch-row loop of those GEMVs (small `m`, so a 2-token batch still
+//! uses every core) and slabs of whole batch rows per task (see
+//! `Int8GemmSplit`); the `SMMLA` GEMM splits weight-row pairs. A split only
+//! decides *which thread* evaluates an output element, never in what order
+//! its terms are summed, so every split is bit-identical to a sequential
+//! sweep — the sweep tests below assert it with `to_bits()`.
 //!
 //! [`Int8Tier::clamp_to_cpu`] mirrors
 //! `KernelDispatcher::clamp_tier_to_cpu` (KERN-SOUND / K-03): a tier this
@@ -71,18 +111,16 @@ pub enum Int8Tier {
     /// ARMv8.2 `SDOT` — 16 int8 MACs per instruction.
     #[cfg(target_arch = "aarch64")]
     NeonDot,
-    /// ARMv8.6 `SMMLA` — 32 int8 MACs per instruction, for the 2x2 GEMM
-    /// micro-kernel `gemm_two_bit_i8mm` implements.
+    /// ARMv8.6 `SMMLA` — 32 int8 MACs per instruction.
     ///
-    /// K-INT8 wave-4b: `gemm_two_bit_int8` does **not** route through that
-    /// micro-kernel any more — measured on an M3, it lost to the plain
-    /// `SDOT` row loop at every `M >= 2` (e.g. 27B `ffn_up` M=64: 326ms
-    /// `SMMLA` vs 217ms `SDOT`), because each `(batch-row, weight-row)` tile
-    /// pair re-decodes both weight rows from scratch instead of reusing a
-    /// decode across pairs. This tier's GEMV *and* GEMM both run on `SDOT`
-    /// today (same as [`Self::NeonDot`]) until a future fix hoists that
-    /// decode out of the tile loop; `gemm_two_bit_i8mm` is kept, unrouted,
-    /// and directly tested for when that lands.
+    /// Every GEMM at `m >= 2`, 2-bit and 1-bit alike, runs a decode-reuse
+    /// `SMMLA` kernel (`gemm_two_bit_i8mm` / `gemm_one_bit_i8mm`): each
+    /// weight-row pair's block is decoded once and applied to every
+    /// batch-row pair, where the `SDOT` row kernel re-decodes every weight
+    /// row once per batch row. A GEMV (`m == 1`) is a single activation row,
+    /// which cannot fill `SMMLA`'s 2x2 tile, so it runs the `SDOT` row
+    /// kernel exactly as [`Self::NeonDot`] does. Both kernels form the same
+    /// integers, so the output is bit-identical to every other tier's.
     #[cfg(target_arch = "aarch64")]
     NeonI8mm,
     /// AVX-512 VNNI `VPDPBUSD` — 64 int8 MACs per instruction.
@@ -104,46 +142,52 @@ impl std::fmt::Display for Int8Tier {
 pub const KERNEL_TIER_ENV: &str = "OXIBONSAI_KERNEL_TIER";
 
 /// Deduplicates [`Int8Tier::clamp_to_cpu`]'s demotion warning to once per
-/// process (K-INT8 wave-4b, minor[6]) — see that function's doc comment.
-/// Not `#[cfg(test)]`: this is a production robustness fix, not a
-/// test-only concern.
+/// process — see that function's doc comment. A production concern (the
+/// selector is read on every GEMV/GEMM call), not a test-only one.
 static TIER_DEMOTION_WARNED: std::sync::Once = std::sync::Once::new();
 
 /// Serializes every test in this crate's `--lib` unit-test binary that
-/// mutates or depends on a clean [`KERNEL_TIER_ENV`].
+/// mutates [`KERNEL_TIER_ENV`].
 ///
 /// `std::env::set_var`/`remove_var` are `unsafe fn` (edition 2024) precisely
 /// because a concurrent `std::env::var` on *any* key can observe a torn
-/// `environ` while another thread mutates it — this is a whole-process
-/// hazard, not a same-key one. Since `dispatch_prism.rs`'s `PrismKernel`
-/// methods now call [`Int8Tier::from_env`] on every invocation (K-INT8
-/// wave-4 fix-up), its bit-exact tests (`assert_eq!` on raw `f32` bits, no
-/// tolerance) would go nondeterministically red if they ran concurrently
-/// with this file's env-mutating test. Every test in this crate that reads
-/// or writes [`KERNEL_TIER_ENV`] — here and in `dispatch_prism.rs` — takes
-/// this lock first; nothing else in `oxibonsai-kernels` ever touches this
-/// variable, so holding it for a test's short lifetime fully serializes the
-/// hazard for this crate's test binary.
+/// `environ` while another thread mutates it — a whole-process hazard, not a
+/// same-key one. Every test here and in `dispatch_prism.rs` that sets the
+/// variable does so through a [`TierEnvGuard`], which holds this lock.
+///
+/// Holding the lock only serializes the *writers*. What keeps the readers
+/// deterministic is the per-thread gate in [`Int8Tier::from_env`]: in this
+/// crate's own unit-test build the variable is honoured only on a thread
+/// that holds a [`TierEnvGuard`], so the many unguarded tests that call the
+/// native entry points (`parallel_tests.rs`, `tiled.rs`, `gemm_onebit.rs`,
+/// `gemm_ternary.rs`, all comparing raw `f32` bits) can never observe
+/// another test's value mid-run.
 ///
 /// `#[cfg(test)]`, and referenced from `dispatch_prism.rs`'s own
-/// `#[cfg(test)]` modules — this is a legal cross-module reference, not a
-/// cross-crate one: `cargo test -p oxibonsai-kernels` rebuilds this whole
-/// crate with `cfg(test)` active for the one `--lib` test binary, so both
-/// modules see this item there. It adds zero surface to the non-test
-/// build.
+/// `#[cfg(test)]` modules — a legal cross-module reference: `cargo test -p
+/// oxibonsai-kernels` rebuilds this whole crate with `cfg(test)` active for
+/// the one `--lib` test binary. It adds zero surface to the non-test build.
 #[cfg(test)]
 pub(crate) static KERNEL_TIER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// RAII guard around [`KERNEL_TIER_ENV_LOCK`] (K-INT8 wave-4b test-hygiene
-/// fix-up): [`Self::acquire`] takes the lock, snapshots whatever
-/// [`KERNEL_TIER_ENV`] currently holds — a developer's own shell export, or
-/// nothing — and clears it, so a guarded test always starts from a
-/// known-clean environment regardless of the ambient shell. [`Drop::drop`]
-/// restores that exact snapshot, including when the guarded test body
-/// panics: `Drop` still runs while unwinding, so a failed `assert!` between
-/// a test's own `set_var` and its own cleanup `remove_var` no longer leaks
-/// the mutated value to every later holder of the lock in this process (the
-/// hazard the bare-`MutexGuard` version of this helper had).
+#[cfg(test)]
+thread_local! {
+    /// Whether the current thread holds a [`TierEnvGuard`] — the per-thread
+    /// gate [`Int8Tier::from_env`] consults in this crate's unit-test build
+    /// (see [`KERNEL_TIER_ENV_LOCK`]).
+    static TIER_ENV_GUARD_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// RAII guard around [`KERNEL_TIER_ENV_LOCK`]: [`Self::acquire`] takes the
+/// lock, snapshots whatever [`KERNEL_TIER_ENV`] currently holds — a
+/// developer's own shell export, or nothing — clears it, and opens the
+/// per-thread gate [`Int8Tier::from_env`] checks, so a guarded test always
+/// starts from a known-clean environment and is the only thread whose
+/// dispatcher calls can see a value it sets. [`Drop::drop`] closes the gate
+/// and restores that exact snapshot, including when the guarded test body
+/// panics (`Drop` still runs while unwinding), so a failed `assert!`
+/// between a test's own `set_var` and its cleanup never leaks the mutated
+/// value to a later holder of the lock.
 ///
 /// Tests that toggle [`KERNEL_TIER_ENV`] *mid-body* (to compare the tier
 /// selected against the tier cleared, in one test) still do that toggling
@@ -164,12 +208,12 @@ impl TierEnvGuard {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prior = std::env::var(KERNEL_TIER_ENV).ok();
         // SAFETY: `lock` (held here, and for the lifetime of the `Self` it
-        // moves into) serializes every reader/writer of `KERNEL_TIER_ENV`
-        // in this crate's test binary — see `KERNEL_TIER_ENV_LOCK`'s doc
-        // comment.
+        // moves into) serializes every writer of `KERNEL_TIER_ENV` in this
+        // crate's test binary — see `KERNEL_TIER_ENV_LOCK`'s doc comment.
         unsafe {
             std::env::remove_var(KERNEL_TIER_ENV);
         }
+        TIER_ENV_GUARD_HELD.with(|held| held.set(true));
         Self { _lock: lock, prior }
     }
 }
@@ -177,6 +221,7 @@ impl TierEnvGuard {
 #[cfg(test)]
 impl Drop for TierEnvGuard {
     fn drop(&mut self) {
+        TIER_ENV_GUARD_HELD.with(|held| held.set(false));
         // SAFETY: `self._lock` is held for the entire body of `drop`.
         unsafe {
             match &self.prior {
@@ -204,17 +249,22 @@ impl Int8Tier {
         }
     }
 
-    /// Parse a tier from its [`Self::name`] (case- and dash/underscore-
-    /// insensitive). `None` for anything else.
+    /// Parse a tier from its [`Self::name`] (surrounding whitespace, ASCII
+    /// case and `-`/`_` are ignored). `None` for anything else.
+    ///
+    /// Allocation-free: [`Self::from_env`] runs it on every native GEMV/GEMM
+    /// call while a tier is selected.
     #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
-        let normalized = name.trim().to_ascii_lowercase().replace('_', "-");
-        for tier in Self::ALL {
-            if tier.name() == normalized {
-                return Some(*tier);
-            }
-        }
-        None
+        let wanted = name.trim().as_bytes();
+        Self::ALL.iter().copied().find(|tier| {
+            let canonical = tier.name().as_bytes();
+            canonical.len() == wanted.len()
+                && canonical.iter().zip(wanted).all(|(&c, &w)| {
+                    let w = w.to_ascii_lowercase();
+                    c == if w == b'_' { b'-' } else { w }
+                })
+        })
     }
 
     /// Every tier this build knows about, slowest first.
@@ -239,12 +289,12 @@ impl Int8Tier {
             Self::Neon => true,
             #[cfg(target_arch = "aarch64")]
             Self::NeonDot => std::arch::is_aarch64_feature_detected!("dotprod"),
-            // `i8mm` **and** `dotprod`: this tier's GEMV, and the odd
-            // row/column tails of its `SMMLA` tiler, run on `SDOT`. Both are
-            // mandatory from Armv8.6 (where `FEAT_I8MM` becomes mandatory,
-            // and `FEAT_DotProd` has been since Armv8.4), but an Armv8.2
-            // implementation may in principle carry `i8mm` alone — requiring
-            // both here keeps every code path this tier can reach executable.
+            // `i8mm` **and** `dotprod`: this tier's GEMV runs on `SDOT`.
+            // Both are mandatory from Armv8.6 (where `FEAT_I8MM` becomes
+            // mandatory, and `FEAT_DotProd` has been since Armv8.4), but an
+            // Armv8.2 implementation may in principle carry `i8mm` alone —
+            // requiring both here keeps every code path this tier can reach
+            // executable.
             #[cfg(target_arch = "aarch64")]
             Self::NeonI8mm => {
                 std::arch::is_aarch64_feature_detected!("i8mm")
@@ -259,25 +309,21 @@ impl Int8Tier {
         }
     }
 
-    /// Demote a tier this CPU cannot execute to the best one it can,
-    /// warning once per call — the INT8 twin of
-    /// `KernelDispatcher::clamp_tier_to_cpu` (K-03/sec-14), and what makes
-    /// every safe entry point in this module safe on every host.
+    /// Demote a tier this CPU cannot execute to the best one it can — the
+    /// INT8 twin of `KernelDispatcher::clamp_tier_to_cpu` (K-03/sec-14), and
+    /// what makes every safe entry point in this module safe on every host.
+    ///
+    /// The demotion itself happens on every call, but its `tracing::warn!`
+    /// fires once per process: the environment selector is read on every
+    /// GEMV/GEMM call by design (a cached value would go stale the moment
+    /// the variable changes), so an unsupported-tier request would otherwise
+    /// log hundreds of times per decoded token.
     #[must_use]
     pub fn clamp_to_cpu(self) -> Self {
         if self.is_supported() {
             return self;
         }
         let demoted = Self::best_available();
-        // K-INT8 wave-4b (minor[6]): `dispatch_prism.rs`'s `PrismKernel`
-        // methods call `Int8Tier::from_env` (and so `clamp_to_cpu`) on
-        // *every* GEMV/GEMM call, by design — see that module's doc comment
-        // for why the parsed tier itself is deliberately never cached (a
-        // cached value would go stale mid-test while `dispatch_int8.rs`'s
-        // env-mutating test is running). An unsupported-tier request would
-        // therefore `tracing::warn!` on every one of those calls — hundreds
-        // per token once decoding starts — so only the *warning* is
-        // deduplicated (once per process), never the tier lookup itself.
         TIER_DEMOTION_WARNED.call_once(|| {
             tracing::warn!(
                 requested = %self,
@@ -307,9 +353,21 @@ impl Int8Tier {
     /// **`None` when the variable is unset** — that is the guard that keeps
     /// this tier off by default. A named-but-unsupported tier is clamped
     /// (with a warning) rather than rejected, so a config that travels
-    /// between machines still runs.
+    /// between machines still runs. An unknown name selects nothing.
+    ///
+    /// # In this crate's own unit-test build
+    ///
+    /// The variable is honoured only on a thread that holds a
+    /// `TierEnvGuard` (every other thread sees `None`), so one test that
+    /// sets it can never change the bits another, unguarded test computes on
+    /// a concurrent thread. Integration tests and every downstream crate
+    /// link the regular build, where every thread reads the variable.
     #[must_use]
     pub fn from_env() -> Option<Self> {
+        #[cfg(test)]
+        if !TIER_ENV_GUARD_HELD.with(std::cell::Cell::get) {
+            return None;
+        }
         let raw = std::env::var(KERNEL_TIER_ENV).ok()?;
         Some(Self::from_name(&raw)?.clamp_to_cpu())
     }
@@ -381,6 +439,10 @@ fn one_bit_block_dot(tier: Int8Tier, qs: &[u8], act: &[i8]) -> i32 {
 }
 
 /// Validate a GEMV/GEMM's shapes and return `blocks_per_row`.
+///
+/// Checks, in order and with the same buffer names, exactly what the f32
+/// drivers in `parallel.rs` / `parallel_tiled.rs` check, so diverting a call
+/// to this tier never changes which error a caller sees.
 fn validate_int8(
     n_blocks: usize,
     input_len: usize,
@@ -417,7 +479,7 @@ fn validate_int8(
 /// One activation row's quantized form, as the row kernels consume it.
 ///
 /// Bundled into a struct rather than passed as three more parameters so
-/// [`two_bit_rows`] stays inside clippy's `too_many_arguments` budget.
+/// the row kernels stay inside clippy's `too_many_arguments` budget.
 #[derive(Debug, Clone, Copy)]
 struct Int8Row<'a> {
     /// The row's int8 codes, in the kernel's expected layout.
@@ -428,8 +490,20 @@ struct Int8Row<'a> {
     sums: &'a [i32],
 }
 
+impl<'a> Int8Row<'a> {
+    /// Batch row `r` of a quantized activation.
+    fn of(act: &'a Int8Activation, r: usize) -> Self {
+        Self {
+            codes: act.codes_row(r),
+            scales: act.scales_row(r),
+            sums: act.sums_row(r),
+        }
+    }
+}
+
 /// `output[row] = Σ_b d_b * s_b * (biased_dot_b − sum_b)` for one
-/// activation row — the whole INT8 GEMV, minus the parallel split.
+/// activation row over `output.len()` weight rows — the whole 2-bit INT8
+/// GEMV, minus the parallel split.
 fn two_bit_rows<B: Int8TwoBitBlock>(
     tier: Int8Tier,
     blocks: &[B],
@@ -455,7 +529,33 @@ fn two_bit_rows<B: Int8TwoBitBlock>(
     }
 }
 
-/// Rows per Rayon task for the INT8 GEMV — the same shape
+/// The 1-bit twin of [`two_bit_rows`]: same per-block arithmetic, same
+/// summation order, on `Q1_0_g128` sign bits.
+fn one_bit_rows(
+    tier: Int8Tier,
+    blocks: &[BlockQ1_0G128],
+    row: Int8Row<'_>,
+    output: &mut [f32],
+    blocks_per_row: usize,
+) {
+    let Int8Row {
+        codes,
+        scales,
+        sums,
+    } = row;
+    for (ni, out) in output.iter_mut().enumerate() {
+        let row_blocks = &blocks[ni * blocks_per_row..(ni + 1) * blocks_per_row];
+        let mut sum = 0.0f32;
+        for (bi, block) in row_blocks.iter().enumerate() {
+            let act = &codes[bi * QK1_0_G128..(bi + 1) * QK1_0_G128];
+            let acc = one_bit_block_dot(tier, &block.qs, act) - sums[bi];
+            sum += block.d.to_f32() * scales[bi] * acc as f32;
+        }
+        *out = sum;
+    }
+}
+
+/// Weight rows per Rayon task for the INT8 GEMV — the same shape
 /// `parallel.rs::rows_per_task` uses (K-16).
 #[cfg(not(target_arch = "wasm32"))]
 #[inline]
@@ -464,71 +564,133 @@ fn int8_rows_per_task(n_rows: usize) -> usize {
     (n_rows / (threads * 4)).clamp(8, 512)
 }
 
-/// Row count below which the INT8 GEMV stays on one thread.
-#[cfg(not(target_arch = "wasm32"))]
-const INT8_PAR_MIN_ROWS: usize = 256;
+/// Weight-row count below which an INT8 GEMV stays on one thread.
+pub const INT8_PAR_MIN_ROWS: usize = 256;
 
-fn two_bit_gemv_int8<B: Int8TwoBitBlock + Sync>(
-    tier: Int8Tier,
-    blocks: &[B],
-    act: &Int8Activation,
-    output: &mut [f32],
-    n_rows: usize,
-    blocks_per_row: usize,
-) -> KernelResult<()> {
-    let lut16 = biased_lut16(&B::BIASED_LUT);
-    let row = Int8Row {
-        codes: act.codes_row(0),
-        scales: act.scales_row(0),
-        sums: act.sums_row(0),
-    };
-
-    // On WASM: no Rayon worker pool — stay sequential.
-    #[cfg(target_arch = "wasm32")]
-    {
-        two_bit_rows(
-            tier,
-            blocks,
-            row,
-            &mut output[..n_rows],
-            blocks_per_row,
-            &lut16,
-        );
-        Ok(())
-    }
-
+/// Evaluate `rows(block_slice, out_chunk)` over every weight row of
+/// `output` (one entry per weight row), split into Rayon chunks of whole
+/// weight rows once there are at least [`INT8_PAR_MIN_ROWS`] of them.
+///
+/// `rows` must compute each output element from its own weight row alone
+/// (both row kernels do), which is what makes the split bit-exact.
+fn for_weight_rows<B, F>(blocks: &[B], output: &mut [f32], blocks_per_row: usize, rows: F)
+where
+    B: Sync,
+    F: Fn(&[B], &mut [f32]) + Sync,
+{
+    let n_rows = output.len();
     #[cfg(not(target_arch = "wasm32"))]
-    {
-        if n_rows < INT8_PAR_MIN_ROWS {
-            two_bit_rows(
-                tier,
-                blocks,
-                row,
-                &mut output[..n_rows],
-                blocks_per_row,
-                &lut16,
-            );
-            return Ok(());
-        }
+    if n_rows >= INT8_PAR_MIN_ROWS {
         let chunk = int8_rows_per_task(n_rows);
-        output[..n_rows]
+        output
             .par_chunks_mut(chunk)
             .enumerate()
             .for_each(|(ci, out_chunk)| {
                 let row_start = ci * chunk;
-                let rows = out_chunk.len();
-                let slice =
-                    &blocks[row_start * blocks_per_row..(row_start + rows) * blocks_per_row];
-                two_bit_rows(tier, slice, row, out_chunk, blocks_per_row, &lut16);
+                let slice = &blocks
+                    [row_start * blocks_per_row..(row_start + out_chunk.len()) * blocks_per_row];
+                rows(slice, out_chunk);
             });
-        Ok(())
+        return;
+    }
+    rows(&blocks[..n_rows * blocks_per_row], output);
+}
+
+/// How an INT8 GEMM spreads its `m` batch rows over Rayon (WASM has no
+/// worker pool, so its GEMM is always a sequential batch-row loop).
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Int8GemmSplit {
+    /// One weight-row-parallel GEMV per batch row. Used when there are
+    /// fewer batch rows than threads (a batch split would leave cores idle —
+    /// `m = 2` on an 8-core host would use 2 of them) and enough weight rows
+    /// for [`for_weight_rows`] to split.
+    PerRowGemv,
+    /// Slabs of whole batch rows per Rayon task, each evaluated over every
+    /// weight row.
+    BatchSlabs,
+}
+
+/// The split [`int8_gemm_rows`] uses for an `m x n_rows` GEMM on a pool of
+/// `threads` workers. Pure, so the boundaries are testable on any host.
+#[cfg(not(target_arch = "wasm32"))]
+fn int8_gemm_split(m: usize, n_rows: usize, threads: usize) -> Int8GemmSplit {
+    if m < threads && n_rows >= INT8_PAR_MIN_ROWS {
+        Int8GemmSplit::PerRowGemv
+    } else {
+        Int8GemmSplit::BatchSlabs
+    }
+}
+
+/// Batch rows per Rayon task for [`Int8GemmSplit::BatchSlabs`].
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+fn int8_gemm_rows_per_task(m: usize) -> usize {
+    let threads = rayon::current_num_threads().max(1);
+    m.div_ceil(threads).max(1).min(m)
+}
+
+/// Batch-row count below which [`Int8GemmSplit::BatchSlabs`] stays on one
+/// thread.
+#[cfg(not(target_arch = "wasm32"))]
+const INT8_GEMM_PAR_MIN_BATCH: usize = 2;
+
+/// The INT8 GEMM driver shared by both formats.
+///
+/// `batch_row(mi, out_row, parallel)` must write batch row `mi`'s `n_rows`
+/// outputs into `out_row`, splitting its weight rows across Rayon when
+/// `parallel` is true (via [`for_weight_rows`]) and staying on the calling
+/// thread otherwise. Every output element is computed by the same row
+/// kernel with the same per-block order whichever split runs it.
+fn int8_gemm_rows<F>(output: &mut [f32], m: usize, n_rows: usize, batch_row: F)
+where
+    F: Fn(usize, &mut [f32], bool) + Sync,
+{
+    let output = &mut output[..m * n_rows];
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        for (mi, out_row) in output.chunks_mut(n_rows).enumerate() {
+            batch_row(mi, out_row, false);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let threads = rayon::current_num_threads().max(1);
+        match int8_gemm_split(m, n_rows, threads) {
+            Int8GemmSplit::PerRowGemv => {
+                for (mi, out_row) in output.chunks_mut(n_rows).enumerate() {
+                    batch_row(mi, out_row, true);
+                }
+            }
+            Int8GemmSplit::BatchSlabs => {
+                if m < INT8_GEMM_PAR_MIN_BATCH {
+                    for (mi, out_row) in output.chunks_mut(n_rows).enumerate() {
+                        batch_row(mi, out_row, false);
+                    }
+                    return;
+                }
+                let chunk = int8_gemm_rows_per_task(m);
+                output
+                    .par_chunks_mut(chunk * n_rows)
+                    .enumerate()
+                    .for_each(|(ci, out_chunk)| {
+                        let m0 = ci * chunk;
+                        for (r, out_row) in out_chunk.chunks_mut(n_rows).enumerate() {
+                            batch_row(m0 + r, out_row, false);
+                        }
+                    });
+            }
+        }
     }
 }
 
 /// INT8 GEMV for any 2-bit format: `output[row] = dot(weight_row, input)`.
 ///
 /// The activation is quantized **once** here and reused by all `n_rows`
-/// weight rows (K-14, step 1), which is what makes the tier pay.
+/// weight rows (K-14, step 1), which is what makes the tier pay; the weight
+/// rows are then split across Rayon above [`INT8_PAR_MIN_ROWS`].
 ///
 /// # Errors
 ///
@@ -552,122 +714,24 @@ pub fn gemv_two_bit_int8<B: Int8TwoBitBlock + Sync>(
         return Ok(());
     }
     let act = Int8Activation::quantize(input, 1, k, B::QK, Int8Layout::Stride4)?;
-    two_bit_gemv_int8(tier, blocks, &act, output, n_rows, blocks_per_row)
-}
-
-/// Rows (batch dimension) per Rayon task for the plain INT8 GEMM — same
-/// shape as [`int8_rows_per_task`], just chunking `m` instead of `n_rows`.
-#[cfg(not(target_arch = "wasm32"))]
-#[inline]
-fn int8_gemm_rows_per_task(m: usize) -> usize {
-    let threads = rayon::current_num_threads().max(1);
-    m.div_ceil(threads).max(1).min(m)
-}
-
-/// Row count (batch dimension) below which the plain INT8 GEMM stays on one
-/// thread — small enough that Rayon's task overhead is not worth it.
-#[cfg(not(target_arch = "wasm32"))]
-const INT8_GEMM_PAR_MIN_BATCH: usize = 2;
-
-/// Row-parallel (batch dimension) plain INT8 GEMM: one [`two_bit_rows`] call
-/// per output row, batch rows split across Rayon tasks. Bit-identical to a
-/// sequential per-row loop — the split only decides *which* thread computes
-/// a given row, never in what order that row's own terms are summed
-/// (minor[1], K-INT8 wave-4b: `gemm_two_bit_int8` used to run this loop on
-/// one thread regardless of `m`).
-#[allow(clippy::too_many_arguments)]
-fn two_bit_gemm_rows_par<B: Int8TwoBitBlock + Sync>(
-    tier: Int8Tier,
-    blocks: &[B],
-    act: &Int8Activation,
-    output: &mut [f32],
-    m: usize,
-    n_rows: usize,
-    blocks_per_row: usize,
-    lut16: &[u8; 16],
-) {
-    #[cfg(target_arch = "wasm32")]
-    {
-        for mi in 0..m {
-            let row = Int8Row {
-                codes: act.codes_row(mi),
-                scales: act.scales_row(mi),
-                sums: act.sums_row(mi),
-            };
-            two_bit_rows(
-                tier,
-                blocks,
-                row,
-                &mut output[mi * n_rows..mi * n_rows + n_rows],
-                blocks_per_row,
-                lut16,
-            );
-        }
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        if m < INT8_GEMM_PAR_MIN_BATCH {
-            for mi in 0..m {
-                let row = Int8Row {
-                    codes: act.codes_row(mi),
-                    scales: act.scales_row(mi),
-                    sums: act.sums_row(mi),
-                };
-                two_bit_rows(
-                    tier,
-                    blocks,
-                    row,
-                    &mut output[mi * n_rows..mi * n_rows + n_rows],
-                    blocks_per_row,
-                    lut16,
-                );
-            }
-            return;
-        }
-        let chunk = int8_gemm_rows_per_task(m);
-        output[..m * n_rows]
-            .par_chunks_mut(chunk * n_rows)
-            .enumerate()
-            .for_each(|(ci, out_chunk)| {
-                let m0 = ci * chunk;
-                let rows = out_chunk.len() / n_rows;
-                for r in 0..rows {
-                    let mi = m0 + r;
-                    let row = Int8Row {
-                        codes: act.codes_row(mi),
-                        scales: act.scales_row(mi),
-                        sums: act.sums_row(mi),
-                    };
-                    two_bit_rows(
-                        tier,
-                        blocks,
-                        row,
-                        &mut out_chunk[r * n_rows..(r + 1) * n_rows],
-                        blocks_per_row,
-                        lut16,
-                    );
-                }
-            });
-    }
+    let lut16 = biased_lut16(&B::BIASED_LUT);
+    let row = Int8Row::of(&act, 0);
+    for_weight_rows(blocks, &mut output[..n_rows], blocks_per_row, |blk, out| {
+        two_bit_rows(tier, blk, row, out, blocks_per_row, &lut16);
+    });
+    Ok(())
 }
 
 /// INT8 GEMM for any 2-bit format: `output[m, n] = dot(weight_n, input_m)`.
 ///
-/// The whole `m x k` activation is quantized once, then every batch row is
-/// evaluated against the shared weight matrix — `m == 1` delegates to
-/// [`two_bit_gemv_int8`] (its own `n_rows`-parallel Rayon fan-out, the
-/// dimension that is actually large at decode) and `m > 1` parallelizes
-/// over the batch dimension via [`two_bit_gemm_rows_par`] (minor[0]/[1],
-/// K-INT8 wave-4b: this whole function used to be single-threaded
-/// regardless of `m`).
+/// The whole `m x k` activation is quantized once, then spread over Rayon
+/// by `int8_gemm_rows`: a per-batch-row loop of weight-row-parallel GEMVs
+/// while `m` is below the thread count (so a 2-token batch still uses every
+/// core), slabs of batch rows otherwise. `m == 1` is exactly
+/// [`gemv_two_bit_int8`], bit for bit.
 ///
-/// Does **not** use [`Int8Tier::NeonI8mm`]'s `SMMLA` 2x2 tile
-/// (`gemm_two_bit_i8mm`) — see that variant's doc comment for why (minor[2],
-/// same fix-up): measured slower than the plain `SDOT` row loop at every
-/// `M >= 2` on an M3, so `NeonI8mm`'s GEMM runs on `SDOT` like
-/// [`Int8Tier::NeonDot`] until a decode-reuse fix makes the tile actually
-/// win.
+/// `Int8Tier::NeonI8mm` at `m >= 2` runs `gemm_two_bit_i8mm` instead — see
+/// the variant's doc comment. Every path yields the same bits.
 ///
 /// # Errors
 ///
@@ -688,46 +752,174 @@ pub fn gemm_two_bit_int8<B: Int8TwoBitBlock + Sync>(
         return Ok(());
     }
     let act = Int8Activation::quantize(input, m, k, B::QK, Int8Layout::Stride4)?;
+    let lut16 = biased_lut16(&B::BIASED_LUT);
 
-    if m == 1 {
-        return two_bit_gemv_int8(
-            tier,
-            blocks,
-            &act,
-            &mut output[..n_rows],
-            n_rows,
-            blocks_per_row,
-        );
+    #[cfg(target_arch = "aarch64")]
+    if tier == Int8Tier::NeonI8mm && m >= 2 {
+        gemm_two_bit_i8mm(blocks, &act, output, m, n_rows, blocks_per_row, &lut16);
+        return Ok(());
     }
 
-    let lut16 = biased_lut16(&B::BIASED_LUT);
-    two_bit_gemm_rows_par(
-        tier,
-        blocks,
-        &act,
-        output,
-        m,
-        n_rows,
-        blocks_per_row,
-        &lut16,
-    );
+    int8_gemm_rows(output, m, n_rows, |mi, out_row, parallel| {
+        let row = Int8Row::of(&act, mi);
+        if parallel {
+            for_weight_rows(blocks, out_row, blocks_per_row, |blk, out| {
+                two_bit_rows(tier, blk, row, out, blocks_per_row, &lut16);
+            });
+        } else {
+            two_bit_rows(tier, blocks, row, out_row, blocks_per_row, &lut16);
+        }
+    });
     Ok(())
 }
 
-/// `SMMLA` 2x2 GEMM: two batch rows against two weight rows per tile, with
-/// scalar-tier rows for the odd tails.
+/// The activation side of the `SMMLA` GEMM: every batch-row pair's codes,
+/// interleaved once per call into the `B`-operand layout the weight-pair
+/// decoders produce (`decode_two_bit_pair_for_mmla` for the stride-4 2-bit
+/// layout, `decode_one_bit_pair_for_mmla` for the sequential 1-bit one),
+/// plus each pair's per-block scales and code sums spread over the four
+/// tile lanes.
 ///
-/// Every tile's `i32` is the same integer the other tiers form, so the
-/// `f32` results are identical — `unrouted_i8mm_tile_still_matches_the_gemv_per_row_reference`
-/// pins that directly, and it used to be exercised implicitly through
-/// `gemm_two_bit_int8` before minor[2] (K-INT8 wave-4b) stopped routing
-/// `Int8Tier::NeonI8mm`'s GEMM here (see that variant's doc comment: this
-/// tile measured slower than the plain `SDOT` row loop on an M3). Kept,
-/// `#[allow(dead_code)]`, for a future fix that hoists the weight-block
-/// decode out of the `(mp, np)` loop and re-enables it.
+/// Block-major (`[block][pair]`), so the inner loop over batch-row pairs of
+/// one block reads one contiguous stream. An odd `m` pairs its last row
+/// with itself; that duplicate's lanes are computed and discarded, so no
+/// scalar tail path exists to drift.
 #[cfg(target_arch = "aarch64")]
-#[allow(dead_code, clippy::too_many_arguments)]
-fn gemm_two_bit_i8mm<B: Int8TwoBitBlock>(
+struct I8mmPanel {
+    /// `blocks_per_row * pairs * qk * 2` interleaved codes.
+    codes: Vec<i8>,
+    /// `[s0, s1, s0, s1]` per `(block, pair)` — the tile's lane order.
+    scales: Vec<f32>,
+    /// `[sum0, sum1, sum0, sum1]` per `(block, pair)`.
+    sums: Vec<i32>,
+    pairs: usize,
+    /// Interleaved code bytes per `(block, pair)`: `qk * 2`.
+    block_bytes: usize,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl I8mmPanel {
+    /// Interleave `act`'s `m` rows (blocks of `qk`, in `act`'s own layout).
+    fn build(act: &Int8Activation, m: usize, qk: usize, blocks_per_row: usize) -> Self {
+        let pairs = m.div_ceil(2);
+        let chunks = qk / 8;
+        let block_bytes = chunks * 16;
+        let layout = act.layout();
+        let mut codes = vec![0i8; blocks_per_row * pairs * block_bytes];
+        let mut scales = vec![0.0f32; blocks_per_row * pairs * 4];
+        let mut sums = vec![0i32; blocks_per_row * pairs * 4];
+        for p in 0..pairs {
+            let (r0, r1) = (2 * p, (2 * p + 1).min(m - 1));
+            let (x0, x1) = (act.codes_row(r0), act.codes_row(r1));
+            let (s0, s1) = (act.scales_row(r0), act.scales_row(r1));
+            let (u0, u1) = (act.sums_row(r0), act.sums_row(r1));
+            for b in 0..blocks_per_row {
+                let base = (b * pairs + p) * block_bytes;
+                for c in 0..chunks {
+                    // Chunk `c`'s eight activations, in the order the weight
+                    // decoder emits chunk `c`'s eight weights.
+                    let within = match layout {
+                        Int8Layout::Stride4 => {
+                            let (g, s, h) = (c / 8, (c / 2) % 4, c % 2);
+                            g * 64 + s * 16 + h * 8
+                        }
+                        Int8Layout::Sequential => c * 8,
+                    };
+                    let src = b * qk + within;
+                    let dst = base + c * 16;
+                    codes[dst..dst + 8].copy_from_slice(&x0[src..src + 8]);
+                    codes[dst + 8..dst + 16].copy_from_slice(&x1[src..src + 8]);
+                }
+                let lane = (b * pairs + p) * 4;
+                scales[lane..lane + 4].copy_from_slice(&[s0[b], s1[b], s0[b], s1[b]]);
+                sums[lane..lane + 4].copy_from_slice(&[u0[b], u1[b], u0[b], u1[b]]);
+            }
+        }
+        Self {
+            codes,
+            scales,
+            sums,
+            pairs,
+            block_bytes,
+        }
+    }
+
+    /// Block `b`'s pair-0 codes, scales and sums — consecutive pairs follow
+    /// contiguously (`block_bytes` code bytes, 4 lanes apart).
+    fn block(&self, b: usize) -> (&[i8], &[f32], &[i32]) {
+        (
+            &self.codes[b * self.pairs * self.block_bytes..],
+            &self.scales[b * self.pairs * 4..],
+            &self.sums[b * self.pairs * 4..],
+        )
+    }
+}
+
+/// Weight rows per Rayon task for the `SMMLA` GEMM: the GEMV's row shape,
+/// rounded up to a whole number of weight-row pairs.
+#[cfg(target_arch = "aarch64")]
+fn i8mm_rows_per_task(n_rows: usize) -> usize {
+    let threads = rayon::current_num_threads().max(1);
+    let rows = (n_rows / (threads * 4)).clamp(16, 512);
+    rows + rows % 2
+}
+
+/// The decode-reuse `SMMLA` GEMM driver `Int8Tier::NeonI8mm` runs for
+/// every GEMM at `m >= 2`, both formats.
+///
+/// `pair_block(n0, n1, b, panel, accs)` must decode block `b` of weight
+/// rows `n0` and `n1` **once** and fold it against every batch-row pair of
+/// `panel` into `accs` (`[n0m0, n0m1, n1m0, n1m1]` per pair) — 16 `SMMLA`s
+/// (32 int8 MACs each) per 128 weights per pair, where the `SDOT` row
+/// kernel re-decodes every weight row once per batch row. Weight rows are
+/// split across Rayon in whole pairs; an odd `n_rows` pairs its last row
+/// with itself (duplicate lanes discarded).
+///
+/// Bit-identical to the row kernels on every cell: each `SMMLA` tile lane
+/// is the same exact `i32` the other tiers form, and each cell accumulates
+/// `(d * s) * (acc - sum)` over the blocks in the same order with separate
+/// multiply and add (never a fused multiply-add) —
+/// `i8mm_gemm_matches_the_gemv_sweep_at_every_shape` pins it.
+#[cfg(target_arch = "aarch64")]
+fn i8mm_gemm<F>(
+    panel: &I8mmPanel,
+    output: &mut [f32],
+    m: usize,
+    n_rows: usize,
+    blocks_per_row: usize,
+    pair_block: F,
+) where
+    F: Fn(usize, usize, usize, &I8mmPanel, &mut [f32]) + Sync,
+{
+    let chunk_rows = i8mm_rows_per_task(n_rows);
+    let n_tasks = n_rows.div_ceil(chunk_rows);
+    // Hand every task its own column range of every batch row: disjoint
+    // `&mut` slices, so the split needs no `unsafe`.
+    let mut per_task: Vec<Vec<&mut [f32]>> = (0..n_tasks).map(|_| Vec::with_capacity(m)).collect();
+    for row in output[..m * n_rows].chunks_mut(n_rows) {
+        for (t, piece) in row.chunks_mut(chunk_rows).enumerate() {
+            per_task[t].push(piece);
+        }
+    }
+    per_task
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(t, mut out_rows)| {
+            i8mm_task(
+                panel,
+                &mut out_rows,
+                t * chunk_rows,
+                blocks_per_row,
+                &pair_block,
+            );
+        });
+}
+
+/// `Int8Tier::NeonI8mm`'s 2-bit GEMM (`m >= 2`) on [`i8mm_gemm`], decoding
+/// with the format's own biased table (`0b11 -> 0` for `TQ2_0_g128`).
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+fn gemm_two_bit_i8mm<B: Int8TwoBitBlock + Sync>(
     blocks: &[B],
     act: &Int8Activation,
     output: &mut [f32],
@@ -736,89 +928,135 @@ fn gemm_two_bit_i8mm<B: Int8TwoBitBlock>(
     blocks_per_row: usize,
     lut16: &[u8; 16],
 ) {
-    let m_pairs = m / 2;
-    let n_pairs = n_rows / 2;
-    for mp in 0..m_pairs {
-        let (m0, m1) = (mp * 2, mp * 2 + 1);
-        let (codes0, codes1) = (act.codes_row(m0), act.codes_row(m1));
-        let (scales0, scales1) = (act.scales_row(m0), act.scales_row(m1));
-        let (sums0, sums1) = (act.sums_row(m0), act.sums_row(m1));
-        for np in 0..n_pairs {
-            let (n0, n1) = (np * 2, np * 2 + 1);
-            let row0 = &blocks[n0 * blocks_per_row..(n0 + 1) * blocks_per_row];
-            let row1 = &blocks[n1 * blocks_per_row..(n1 + 1) * blocks_per_row];
-            let mut acc = [0.0f32; 4]; // [n0m0, n0m1, n1m0, n1m1]
-            for bi in 0..blocks_per_row {
-                let a0 = &codes0[bi * B::QK..(bi + 1) * B::QK];
-                let a1 = &codes1[bi * B::QK..(bi + 1) * B::QK];
-                // SAFETY: this function is only called for
-                // `Int8Tier::NeonI8mm`, which `is_supported()` gates on
-                // `is_aarch64_feature_detected!("i8mm")`.
-                let tile = unsafe {
-                    let lv = crate::simd_dot_int8::load_lut(lut16);
-                    crate::simd_dot_int8::block_dot_two_bit_2x2_i8mm(
-                        row0[bi].packed_codes(),
-                        row1[bi].packed_codes(),
-                        a0,
-                        a1,
-                        lv,
-                    )
-                };
-                let d0 = row0[bi].block_scale();
-                let d1 = row1[bi].block_scale();
-                acc[0] += d0 * scales0[bi] * (tile[0] - sums0[bi]) as f32;
-                acc[1] += d0 * scales1[bi] * (tile[1] - sums1[bi]) as f32;
-                acc[2] += d1 * scales0[bi] * (tile[2] - sums0[bi]) as f32;
-                acc[3] += d1 * scales1[bi] * (tile[3] - sums1[bi]) as f32;
+    use crate::simd_dot_int8::{load_lut, mmla_pair_block};
+    use core::arch::aarch64::{vcombine_f32, vdup_n_f32};
+
+    let panel = I8mmPanel::build(act, m, B::QK, blocks_per_row);
+    let groups = B::QK / 64;
+    i8mm_gemm(
+        &panel,
+        output,
+        m,
+        n_rows,
+        blocks_per_row,
+        |n0, n1, b, panel, accs| {
+            let (w0, w1) = (
+                &blocks[n0 * blocks_per_row + b],
+                &blocks[n1 * blocks_per_row + b],
+            );
+            let (codes, scales, sums) = panel.block(b);
+            // SAFETY: only reached for `Int8Tier::NeonI8mm`, which
+            // `is_supported()` gates on `i8mm` + `dotprod`; each block holds
+            // `groups * 16` code bytes (the block type), and the panel slices
+            // hold `panel.pairs` whole entries for block `b`
+            // (`I8mmPanel::build`), as `accs` holds `panel.pairs * 4` floats.
+            unsafe {
+                let lut = load_lut(lut16);
+                let d4 = vcombine_f32(vdup_n_f32(w0.block_scale()), vdup_n_f32(w1.block_scale()));
+                let (qs0, qs1) = (w0.packed_codes().as_ptr(), w1.packed_codes().as_ptr());
+                let (c, s, u) = (codes.as_ptr(), scales.as_ptr(), sums.as_ptr());
+                let slot = accs.as_mut_ptr();
+                if groups == 2 {
+                    mmla_pair_block::<2>(qs0, qs1, lut, d4, c, s, u, panel.pairs, slot);
+                } else {
+                    mmla_pair_block::<1>(qs0, qs1, lut, d4, c, s, u, panel.pairs, slot);
+                }
             }
-            output[m0 * n_rows + n0] = acc[0];
-            output[m1 * n_rows + n0] = acc[1];
-            output[m0 * n_rows + n1] = acc[2];
-            output[m1 * n_rows + n1] = acc[3];
-        }
-        // Odd weight-row tail.
-        for n in n_pairs * 2..n_rows {
-            scalar_tail_cell(blocks, act, output, m0, n, n_rows, blocks_per_row, lut16);
-            scalar_tail_cell(blocks, act, output, m1, n, n_rows, blocks_per_row, lut16);
-        }
-    }
-    // Odd batch-row tail.
-    for mi in m_pairs * 2..m {
-        for n in 0..n_rows {
-            scalar_tail_cell(blocks, act, output, mi, n, n_rows, blocks_per_row, lut16);
-        }
-    }
+        },
+    );
 }
 
-/// One `(batch row, weight row)` cell on the `SDOT` path — used for the
-/// `SMMLA` tiler's odd tails. `#[allow(dead_code)]` for the same reason as
-/// [`gemm_two_bit_i8mm`], its only caller.
+/// `Int8Tier::NeonI8mm`'s 1-bit `Q1_0_g128` GEMM (`m >= 2`) on
+/// [`i8mm_gemm`].
 #[cfg(target_arch = "aarch64")]
-#[allow(dead_code, clippy::too_many_arguments)]
-fn scalar_tail_cell<B: Int8TwoBitBlock>(
-    blocks: &[B],
+fn gemm_one_bit_i8mm(
+    blocks: &[BlockQ1_0G128],
     act: &Int8Activation,
     output: &mut [f32],
-    mi: usize,
-    ni: usize,
+    m: usize,
     n_rows: usize,
     blocks_per_row: usize,
-    lut16: &[u8; 16],
 ) {
-    let codes = act.codes_row(mi);
-    let scales = act.scales_row(mi);
-    let sums = act.sums_row(mi);
-    let row = &blocks[ni * blocks_per_row..(ni + 1) * blocks_per_row];
-    let mut sum = 0.0f32;
-    for (bi, block) in row.iter().enumerate() {
-        let a = &codes[bi * B::QK..(bi + 1) * B::QK];
-        let acc = two_bit_block_dot(Int8Tier::NeonDot, block.packed_codes(), a, lut16) - sums[bi];
-        sum += block.block_scale() * scales[bi] * acc as f32;
-    }
-    output[mi * n_rows + ni] = sum;
+    use crate::simd_dot_int8::mmla_pair_block_one_bit;
+    use core::arch::aarch64::{vcombine_f32, vdup_n_f32};
+
+    let panel = I8mmPanel::build(act, m, QK1_0_G128, blocks_per_row);
+    i8mm_gemm(
+        &panel,
+        output,
+        m,
+        n_rows,
+        blocks_per_row,
+        |n0, n1, b, panel, accs| {
+            let (w0, w1) = (
+                &blocks[n0 * blocks_per_row + b],
+                &blocks[n1 * blocks_per_row + b],
+            );
+            let (codes, scales, sums) = panel.block(b);
+            // SAFETY: only reached for `Int8Tier::NeonI8mm` (`i8mm` +
+            // `dotprod`); each block holds 16 sign bytes, and the panel
+            // slices / `accs` are sized as in `gemm_two_bit_i8mm`.
+            unsafe {
+                let d4 = vcombine_f32(vdup_n_f32(w0.d.to_f32()), vdup_n_f32(w1.d.to_f32()));
+                mmla_pair_block_one_bit(
+                    w0.qs.as_ptr(),
+                    w1.qs.as_ptr(),
+                    d4,
+                    codes.as_ptr(),
+                    scales.as_ptr(),
+                    sums.as_ptr(),
+                    panel.pairs,
+                    accs.as_mut_ptr(),
+                );
+            }
+        },
+    );
 }
 
-/// INT8 GEMV for the 1-bit `Q1_0_g128` format.
+/// One Rayon task of [`i8mm_gemm`]: weight rows
+/// `n_start .. n_start + out_rows[0].len()` against every batch row.
+#[cfg(target_arch = "aarch64")]
+fn i8mm_task<F>(
+    panel: &I8mmPanel,
+    out_rows: &mut [&mut [f32]],
+    n_start: usize,
+    blocks_per_row: usize,
+    pair_block: &F,
+) where
+    F: Fn(usize, usize, usize, &I8mmPanel, &mut [f32]),
+{
+    let m = out_rows.len();
+    let rows = out_rows.first().map_or(0, |r| r.len());
+    // One `[n0m0, n0m1, n1m0, n1m1]` accumulator per batch-row pair.
+    let mut accs = vec![0.0f32; panel.pairs * 4];
+    let mut ln = 0usize;
+    while ln < rows {
+        let n0 = n_start + ln;
+        let n1 = if ln + 1 < rows { n0 + 1 } else { n0 };
+        accs.fill(0.0);
+        for b in 0..blocks_per_row {
+            pair_block(n0, n1, b, panel, &mut accs);
+        }
+        for p in 0..panel.pairs {
+            let (m0, m1) = (2 * p, 2 * p + 1);
+            let a = &accs[p * 4..p * 4 + 4];
+            out_rows[m0][ln] = a[0];
+            if m1 < m {
+                out_rows[m1][ln] = a[1];
+            }
+            if ln + 1 < rows {
+                out_rows[m0][ln + 1] = a[2];
+                if m1 < m {
+                    out_rows[m1][ln + 1] = a[3];
+                }
+            }
+        }
+        ln += 2;
+    }
+}
+
+/// INT8 GEMV for the 1-bit `Q1_0_g128` format, weight rows split across
+/// Rayon above [`INT8_PAR_MIN_ROWS`] exactly like [`gemv_two_bit_int8`].
 ///
 /// # Errors
 ///
@@ -845,19 +1083,18 @@ pub fn gemv_1bit_g128_int8(
         return Ok(());
     }
     let act = Int8Activation::quantize(input, 1, k, QK1_0_G128, Int8Layout::Sequential)?;
-    one_bit_rows(
-        tier,
-        blocks,
-        &act,
-        0,
-        &mut output[..n_rows],
-        n_rows,
-        blocks_per_row,
-    );
+    let row = Int8Row::of(&act, 0);
+    for_weight_rows(blocks, &mut output[..n_rows], blocks_per_row, |blk, out| {
+        one_bit_rows(tier, blk, row, out, blocks_per_row);
+    });
     Ok(())
 }
 
-/// INT8 GEMM for the 1-bit `Q1_0_g128` format.
+/// INT8 GEMM for the 1-bit `Q1_0_g128` format, spread over Rayon by the
+/// same `int8_gemm_rows` driver as [`gemm_two_bit_int8`]; `m == 1` is
+/// exactly [`gemv_1bit_g128_int8`], bit for bit. `Int8Tier::NeonI8mm` at
+/// `m >= 2` runs the decode-reuse `SMMLA` kernel (`gemm_one_bit_i8mm`) —
+/// the same bits.
 ///
 /// # Errors
 ///
@@ -885,59 +1122,145 @@ pub fn gemm_1bit_g128_int8(
         return Ok(());
     }
     let act = Int8Activation::quantize(input, m, k, QK1_0_G128, Int8Layout::Sequential)?;
-    for mi in 0..m {
-        let (start, end) = (mi * n_rows, mi * n_rows + n_rows);
-        one_bit_rows(
-            tier,
-            blocks,
-            &act,
-            mi,
-            &mut output[start..end],
-            n_rows,
-            blocks_per_row,
-        );
-    }
-    Ok(())
-}
 
-fn one_bit_rows(
-    tier: Int8Tier,
-    blocks: &[BlockQ1_0G128],
-    act: &Int8Activation,
-    row_index: usize,
-    output: &mut [f32],
-    n_rows: usize,
-    blocks_per_row: usize,
-) {
-    let codes = act.codes_row(row_index);
-    let scales = act.scales_row(row_index);
-    let sums = act.sums_row(row_index);
-    for (row, out) in output.iter_mut().enumerate().take(n_rows) {
-        let row_blocks = &blocks[row * blocks_per_row..(row + 1) * blocks_per_row];
-        let mut sum = 0.0f32;
-        for (bi, block) in row_blocks.iter().enumerate() {
-            let a = &codes[bi * QK1_0_G128..(bi + 1) * QK1_0_G128];
-            let acc = one_bit_block_dot(tier, &block.qs, a) - sums[bi];
-            sum += block.d.to_f32() * scales[bi] * acc as f32;
-        }
-        *out = sum;
+    #[cfg(target_arch = "aarch64")]
+    if tier == Int8Tier::NeonI8mm && m >= 2 {
+        gemm_one_bit_i8mm(blocks, &act, output, m, n_rows, blocks_per_row);
+        return Ok(());
     }
+
+    int8_gemm_rows(output, m, n_rows, |mi, out_row, parallel| {
+        let row = Int8Row::of(&act, mi);
+        if parallel {
+            for_weight_rows(blocks, out_row, blocks_per_row, |blk, out| {
+                one_bit_rows(tier, blk, row, out, blocks_per_row);
+            });
+        } else {
+            one_bit_rows(tier, blocks, row, out_row, blocks_per_row);
+        }
+    });
+    Ok(())
 }
 
 #[cfg(test)]
 mod int8_dispatch_tests {
     use super::*;
+    use oxibonsai_core::{BlockPQ2_0, BlockTQ2_0_g128, QK_PQ2_0, QK_TQ2_0_G128};
+
+    /// Deterministic LCG for synthetic weights and activations.
+    struct Lcg(u32);
+
+    impl Lcg {
+        fn new(seed: u32) -> Self {
+            Self(seed | 1)
+        }
+        fn next_u8(&mut self) -> u8 {
+            self.0 = self.0.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (self.0 >> 19) as u8
+        }
+        fn next_f32(&mut self) -> f32 {
+            (i32::from(self.next_u8()) - 128) as f32 / 64.0
+        }
+    }
+
+    fn pq2_blocks(n: usize, seed: u32) -> Vec<BlockPQ2_0> {
+        let mut rng = Lcg::new(seed);
+        (0..n)
+            .map(|_| {
+                let mut qs = [0u8; 32];
+                for b in &mut qs {
+                    *b = rng.next_u8();
+                }
+                BlockPQ2_0 {
+                    d: half::f16::from_f32(0.0625 + (rng.next_u8() % 16) as f32 / 256.0),
+                    qs,
+                }
+            })
+            .collect()
+    }
+
+    fn tq2_blocks(n: usize, seed: u32) -> Vec<BlockTQ2_0_g128> {
+        let mut rng = Lcg::new(seed);
+        (0..n)
+            .map(|_| {
+                let mut qs = [0u8; 32];
+                for b in &mut qs {
+                    *b = rng.next_u8();
+                }
+                BlockTQ2_0_g128 {
+                    qs,
+                    d: half::f16::from_f32(0.0625 + (rng.next_u8() % 16) as f32 / 256.0),
+                }
+            })
+            .collect()
+    }
+
+    fn q1_blocks(n: usize, seed: u32) -> Vec<BlockQ1_0G128> {
+        let mut rng = Lcg::new(seed);
+        (0..n)
+            .map(|_| {
+                let mut qs = [0u8; QK1_0_G128 / 8];
+                for b in &mut qs {
+                    *b = rng.next_u8();
+                }
+                BlockQ1_0G128 {
+                    d: half::f16::from_f32(0.125 + (rng.next_u8() % 16) as f32 / 256.0),
+                    qs,
+                }
+            })
+            .collect()
+    }
+
+    fn activations(len: usize, seed: u32) -> Vec<f32> {
+        let mut rng = Lcg::new(seed);
+        (0..len).map(|_| rng.next_f32()).collect()
+    }
+
+    fn supported_tiers() -> Vec<Int8Tier> {
+        Int8Tier::ALL
+            .iter()
+            .copied()
+            .filter(|t| t.is_supported())
+            .collect()
+    }
+
+    fn assert_bits_eq(expect: &[f32], got: &[f32], what: &str) {
+        assert_eq!(expect.len(), got.len(), "{what}: length");
+        for (i, (e, g)) in expect.iter().zip(got.iter()).enumerate() {
+            assert_eq!(
+                e.to_bits(),
+                g.to_bits(),
+                "{what}: cell {i} diverged: {e} vs {g}"
+            );
+        }
+    }
+
+    /// The batch sizes every GEMM sweep below covers: `1`, the smallest
+    /// split, both sides of the thread-count boundary [`int8_gemm_split`]
+    /// uses, `PRISM_GEMM_MR`, and an odd size past every boundary.
+    fn boundary_batches() -> Vec<usize> {
+        let threads = rayon::current_num_threads().max(1);
+        let mut ms = vec![
+            1,
+            2,
+            threads.saturating_sub(1).max(1),
+            threads,
+            threads + 1,
+            crate::dequant_prism::PRISM_GEMM_MR,
+            13,
+        ];
+        ms.sort_unstable();
+        ms.dedup();
+        ms
+    }
 
     /// The guard the HARD CONSTRAINT asks for: with the environment clean,
     /// nothing selects this tier.
     ///
-    /// Not `#[test]`-parallel-safe against a test that sets the variable, so
-    /// the two live in one function; [`KERNEL_TIER_ENV_LOCK`] also
-    /// serializes this against `dispatch_prism.rs`'s tests, which now
-    /// observe this variable indirectly through every `PrismKernel` call.
-    /// [`TierEnvGuard`] both takes that lock and guarantees a clean
-    /// environment on entry and a restored one on exit (even on panic), so
-    /// this test needs no manual `remove_var` of its own at either end.
+    /// [`TierEnvGuard`] both takes [`KERNEL_TIER_ENV_LOCK`] and guarantees a
+    /// clean environment on entry and a restored one on exit (even on
+    /// panic), so this test needs no manual `remove_var` of its own at
+    /// either end.
     #[test]
     fn from_env_selects_nothing_unless_asked_and_then_exactly_what_was_asked() {
         let _guard = TierEnvGuard::acquire();
@@ -973,6 +1296,28 @@ mod int8_dispatch_tests {
         // cleanup needed.
     }
 
+    /// The unit-test isolation gate: while one thread holds a
+    /// [`TierEnvGuard`] and has the variable set, every other thread — the
+    /// unguarded tests elsewhere in this binary that compare the native
+    /// entry points' raw bits — must still read `None`.
+    #[test]
+    fn from_env_is_honoured_only_on_the_thread_holding_the_guard() {
+        let _guard = TierEnvGuard::acquire();
+        unsafe {
+            std::env::set_var(KERNEL_TIER_ENV, "int8-scalar");
+        }
+        assert_eq!(Int8Tier::from_env(), Some(Int8Tier::Scalar));
+        let other_thread = std::thread::scope(|s| {
+            s.spawn(Int8Tier::from_env)
+                .join()
+                .unwrap_or(Some(Int8Tier::Scalar))
+        });
+        assert_eq!(
+            other_thread, None,
+            "a thread without a TierEnvGuard must not see another test's tier"
+        );
+    }
+
     #[test]
     fn every_tier_round_trips_through_its_name() {
         for tier in Int8Tier::ALL {
@@ -997,7 +1342,6 @@ mod int8_dispatch_tests {
 
     #[test]
     fn gemv_rejects_a_misaligned_k() {
-        use oxibonsai_core::BlockTQ2_0_g128;
         let blocks = vec![BlockTQ2_0_g128 {
             qs: [0u8; 32],
             d: half::f16::from_f32(1.0),
@@ -1009,7 +1353,6 @@ mod int8_dispatch_tests {
 
     #[test]
     fn gemv_reports_a_short_block_slice_by_name() {
-        use oxibonsai_core::BlockPQ2_0;
         let blocks: Vec<BlockPQ2_0> = Vec::new();
         let input = vec![0.0f32; 128];
         let mut out = vec![0.0f32; 1];
@@ -1018,13 +1361,32 @@ mod int8_dispatch_tests {
         assert_eq!(err.buffer_name(), Some("blocks"));
     }
 
-    /// K-INT8 wave-4b (minor[6]): a NaN in the activation must reach the
-    /// GEMV's output as NaN (matching the f32 reference path's NaN
-    /// contagion through a dot product), never silently become a finite
-    /// number because the poisoned block's contribution vanished.
+    /// The 1-bit entry points report the same named errors as the 2-bit
+    /// ones (and as the f32 drivers they stand in for).
+    #[test]
+    fn one_bit_entry_points_report_errors_by_name() {
+        let blocks = q1_blocks(2, 0x0B17);
+        let input = vec![0.5f32; 64];
+        let mut out = vec![0.0f32; 2];
+        let err = gemv_1bit_g128_int8(Int8Tier::Scalar, &blocks, &input, &mut out, 2, 128)
+            .expect_err("short input");
+        assert_eq!(err.buffer_name(), Some("input"));
+        let input = vec![0.5f32; 128];
+        let err = gemm_1bit_g128_int8(Int8Tier::Scalar, &blocks, &input, &mut out, 1, 3, 128)
+            .expect_err("short output");
+        assert_eq!(err.buffer_name(), Some("output"));
+        let mut out = vec![0.0f32; 3];
+        let err = gemm_1bit_g128_int8(Int8Tier::Scalar, &blocks, &input, &mut out, 1, 3, 128)
+            .expect_err("short blocks");
+        assert_eq!(err.buffer_name(), Some("blocks"));
+    }
+
+    /// A NaN in the activation must reach the GEMV's output as NaN
+    /// (matching the f32 reference path's NaN contagion through a dot
+    /// product), never silently become a finite number because the
+    /// poisoned block's contribution vanished.
     #[test]
     fn a_nan_activation_element_makes_the_gemv_output_nan() {
-        use oxibonsai_core::BlockPQ2_0;
         let (n_rows, k) = (3usize, 128usize);
         let blocks: Vec<BlockPQ2_0> = (0..n_rows)
             .map(|_| BlockPQ2_0 {
@@ -1041,63 +1403,258 @@ mod int8_dispatch_tests {
             out.iter().all(|v| v.is_nan()),
             "a NaN activation element must poison every output row, got {out:?}"
         );
+
+        let q1 = q1_blocks(n_rows, 0x0B18);
+        let mut out = vec![0.0f32; n_rows];
+        gemv_1bit_g128_int8(Int8Tier::Scalar, &q1, &input, &mut out, n_rows, k)
+            .expect("1-bit gemv with a NaN activation element");
+        assert!(out.iter().all(|v| v.is_nan()), "1-bit: got {out:?}");
     }
 
-    /// K-INT8 wave-4b minor[1]: `gemm_two_bit_int8` at `m == 1` must
-    /// delegate to [`gemv_two_bit_int8`] and be bit-for-bit identical to it
-    /// — not merely close, since integer accumulation is exact.
+    /// `gemm_two_bit_int8` at `m == 1` must be bit-for-bit identical to
+    /// [`gemv_two_bit_int8`] — not merely close, since integer accumulation
+    /// is exact — with `n_rows` above [`INT8_PAR_MIN_ROWS`] so the Rayon
+    /// split runs.
     #[test]
     fn gemm_at_m1_is_bit_identical_to_gemv() {
-        use oxibonsai_core::BlockPQ2_0;
-        let (n_rows, k) = (300usize, 2 * oxibonsai_core::QK_PQ2_0); // crosses INT8_PAR_MIN_ROWS
-        let blocks_per_row = k / oxibonsai_core::QK_PQ2_0;
-        let mut lcg = 0x5EED_0099u32 | 1;
-        let mut next_u8 = move || {
-            lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            (lcg >> 19) as u8
-        };
-        let blocks: Vec<BlockPQ2_0> = (0..n_rows * blocks_per_row)
-            .map(|_| {
-                let mut qs = [0u8; 32];
-                for b in &mut qs {
-                    *b = next_u8();
-                }
-                BlockPQ2_0 {
-                    d: half::f16::from_f32(0.0625 + (next_u8() % 16) as f32 / 256.0),
-                    qs,
-                }
-            })
-            .collect();
-        let input: Vec<f32> = (0..k)
-            .map(|_| (i32::from(next_u8()) - 128) as f32 / 64.0)
-            .collect();
+        let (n_rows, k) = (300usize, 2 * QK_PQ2_0);
+        let blocks = pq2_blocks(n_rows * (k / QK_PQ2_0), 0x5EED_0099);
+        let input = activations(k, 0x5EED_0098);
 
-        for tier in Int8Tier::ALL.iter().copied().filter(|t| t.is_supported()) {
+        for tier in supported_tiers() {
             let mut via_gemv = vec![0.0f32; n_rows];
             gemv_two_bit_int8(tier, &blocks, &input, &mut via_gemv, n_rows, k)
                 .expect("gemv_two_bit_int8");
             let mut via_gemm = vec![0.0f32; n_rows];
             gemm_two_bit_int8(tier, &blocks, &input, &mut via_gemm, 1, n_rows, k)
                 .expect("gemm_two_bit_int8 m=1");
-            for (i, (e, g)) in via_gemv.iter().zip(via_gemm.iter()).enumerate() {
+            assert_bits_eq(&via_gemv, &via_gemm, &format!("{tier}: gemm(m=1) vs gemv"));
+        }
+    }
+
+    /// Companion: `m == 2` must match a sequential per-row
+    /// [`gemv_two_bit_int8`] sweep bit for bit.
+    #[test]
+    fn gemm_at_m2_matches_the_gemv_sweep_across_the_batch_parallel_threshold() {
+        let (m, n_rows, k) = (2usize, 37usize, 2 * QK_PQ2_0);
+        let blocks = pq2_blocks(n_rows * (k / QK_PQ2_0), 0x5EED_00BB);
+        let input = activations(m * k, 0x5EED_00BA);
+
+        for tier in supported_tiers() {
+            let mut expect = vec![0.0f32; m * n_rows];
+            for mi in 0..m {
+                gemv_two_bit_int8(
+                    tier,
+                    &blocks,
+                    &input[mi * k..(mi + 1) * k],
+                    &mut expect[mi * n_rows..(mi + 1) * n_rows],
+                    n_rows,
+                    k,
+                )
+                .expect("gemv sweep row");
+            }
+            let mut got = vec![0.0f32; m * n_rows];
+            gemm_two_bit_int8(tier, &blocks, &input, &mut got, m, n_rows, k)
+                .expect("gemm_two_bit_int8 m=2");
+            assert_bits_eq(&expect, &got, &format!("{tier}: gemm(m=2) vs gemv sweep"));
+        }
+    }
+
+    /// The split decision itself, on synthetic thread counts so every
+    /// boundary is exercised whatever this host's pool size is.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn int8_gemm_split_boundaries() {
+        let big = INT8_PAR_MIN_ROWS;
+        for threads in [2usize, 4, 8, 16] {
+            assert_eq!(int8_gemm_split(1, big, threads), Int8GemmSplit::PerRowGemv);
+            if threads > 2 {
                 assert_eq!(
-                    e.to_bits(),
-                    g.to_bits(),
-                    "{tier}: gemm(m=1) diverged from gemv at row {i}: {e} vs {g}"
+                    int8_gemm_split(2, big, threads),
+                    Int8GemmSplit::PerRowGemv,
+                    "m=2 on a {threads}-thread pool must fan out over weight rows"
                 );
+            }
+            assert_eq!(
+                int8_gemm_split(threads - 1, big, threads),
+                Int8GemmSplit::PerRowGemv,
+                "threads-1 batch rows must fan out over weight rows"
+            );
+            assert_eq!(
+                int8_gemm_split(threads, big, threads),
+                Int8GemmSplit::BatchSlabs,
+                "a full batch per thread splits over batch rows"
+            );
+            assert_eq!(
+                int8_gemm_split(2, big - 1, threads),
+                Int8GemmSplit::BatchSlabs,
+                "too few weight rows to split: batch slabs instead"
+            );
+        }
+        // A one-thread pool never fans out.
+        assert_eq!(int8_gemm_split(2, big, 1), Int8GemmSplit::BatchSlabs);
+    }
+
+    /// Every GEMM split — per-row GEMV fan-out, batch slabs, the
+    /// sequential small-batch path — must match a sequential per-row GEMV
+    /// sweep bit for bit, at every boundary batch size, with weight-row
+    /// counts on both sides of [`INT8_PAR_MIN_ROWS`], on every tier.
+    #[test]
+    fn two_bit_gemm_matches_the_gemv_sweep_at_every_split_boundary() {
+        let k = 2 * QK_TQ2_0_G128;
+        for n_rows in [37usize, 300] {
+            let blocks = tq2_blocks(n_rows * (k / QK_TQ2_0_G128), 0xB0DE_0001);
+            for m in boundary_batches() {
+                let input = activations(m * k, 0xB0DE_1000 + m as u32);
+                for tier in supported_tiers() {
+                    let mut expect = vec![0.0f32; m * n_rows];
+                    for mi in 0..m {
+                        gemv_two_bit_int8(
+                            tier,
+                            &blocks,
+                            &input[mi * k..(mi + 1) * k],
+                            &mut expect[mi * n_rows..(mi + 1) * n_rows],
+                            n_rows,
+                            k,
+                        )
+                        .expect("gemv sweep row");
+                    }
+                    let mut got = vec![0.0f32; m * n_rows];
+                    gemm_two_bit_int8(tier, &blocks, &input, &mut got, m, n_rows, k)
+                        .expect("gemm_two_bit_int8");
+                    assert_bits_eq(
+                        &expect,
+                        &got,
+                        &format!("{tier}: 2-bit gemm m={m} n_rows={n_rows} vs gemv sweep"),
+                    );
+                }
             }
         }
     }
 
-    /// Companion: `m == 2` must go through [`two_bit_gemm_rows_par`]'s
-    /// Rayon split (crossing [`INT8_GEMM_PAR_MIN_BATCH`]) and still match a
-    /// sequential per-row [`gemv_two_bit_int8`] sweep bit for bit.
+    /// The 1-bit GEMV's Rayon split (`n_rows = 300` crosses
+    /// [`INT8_PAR_MIN_ROWS`]) must equal the same rows computed as uneven
+    /// sequential sub-calls on the matching block slices, on every tier.
     #[test]
-    fn gemm_at_m2_matches_the_gemv_sweep_across_the_batch_parallel_threshold() {
-        use oxibonsai_core::BlockPQ2_0;
-        let (m, n_rows, k) = (2usize, 37usize, 2 * oxibonsai_core::QK_PQ2_0);
-        let blocks_per_row = k / oxibonsai_core::QK_PQ2_0;
-        let mut lcg = 0x5EED_00BBu32 | 1;
+    fn one_bit_gemv_rayon_split_matches_sequential_sub_calls() {
+        let (n_rows, k) = (300usize, 3 * QK1_0_G128);
+        let blocks_per_row = k / QK1_0_G128;
+        let blocks = q1_blocks(n_rows * blocks_per_row, 0x0B17_0300);
+        let input = activations(k, 0x0B17_0301);
+        for tier in supported_tiers() {
+            let mut whole = vec![0.0f32; n_rows];
+            gemv_1bit_g128_int8(tier, &blocks, &input, &mut whole, n_rows, k)
+                .expect("whole 300-row gemv");
+            let mut sequential = vec![0.0f32; n_rows];
+            let mut row_start = 0usize;
+            for rows in [113usize, 90, 97] {
+                gemv_1bit_g128_int8(
+                    tier,
+                    &blocks[row_start * blocks_per_row..(row_start + rows) * blocks_per_row],
+                    &input,
+                    &mut sequential[row_start..row_start + rows],
+                    rows,
+                    k,
+                )
+                .expect("sequential sub-call");
+                row_start += rows;
+            }
+            assert_eq!(row_start, n_rows);
+            assert_bits_eq(
+                &whole,
+                &sequential,
+                &format!("{tier}: 1-bit gemv split vs sequential sub-calls"),
+            );
+        }
+    }
+
+    /// The 1-bit GEMM twin of
+    /// [`two_bit_gemm_matches_the_gemv_sweep_at_every_split_boundary`].
+    #[test]
+    fn one_bit_gemm_matches_the_gemv_sweep_at_every_split_boundary() {
+        let k = 2 * QK1_0_G128;
+        for n_rows in [23usize, 300] {
+            let blocks = q1_blocks(n_rows * (k / QK1_0_G128), 0x0B17_1000);
+            for m in boundary_batches() {
+                let input = activations(m * k, 0x0B17_2000 + m as u32);
+                for tier in supported_tiers() {
+                    let mut expect = vec![0.0f32; m * n_rows];
+                    for mi in 0..m {
+                        gemv_1bit_g128_int8(
+                            tier,
+                            &blocks,
+                            &input[mi * k..(mi + 1) * k],
+                            &mut expect[mi * n_rows..(mi + 1) * n_rows],
+                            n_rows,
+                            k,
+                        )
+                        .expect("gemv sweep row");
+                    }
+                    let mut got = vec![0.0f32; m * n_rows];
+                    gemm_1bit_g128_int8(tier, &blocks, &input, &mut got, m, n_rows, k)
+                        .expect("gemm_1bit_g128_int8");
+                    assert_bits_eq(
+                        &expect,
+                        &got,
+                        &format!("{tier}: 1-bit gemm m={m} n_rows={n_rows} vs gemv sweep"),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zero_rows_is_a_no_op() {
+        let blocks: Vec<BlockPQ2_0> = Vec::new();
+        let input = vec![1.0f32; 128];
+        let mut out: Vec<f32> = Vec::new();
+        gemv_two_bit_int8(Int8Tier::Scalar, &blocks, &input, &mut out, 0, 128)
+            .expect("zero rows must succeed");
+        assert!(out.is_empty());
+        let q1: Vec<BlockQ1_0G128> = Vec::new();
+        gemm_1bit_g128_int8(Int8Tier::Scalar, &q1, &input, &mut out, 1, 0, 128)
+            .expect("zero weight rows must succeed");
+    }
+
+    /// A per-row GEMV sweep — the reference every GEMM path must reproduce
+    /// bit for bit.
+    #[cfg(target_arch = "aarch64")]
+    fn gemv_sweep<B: Int8TwoBitBlock + Sync>(
+        tier: Int8Tier,
+        blocks: &[B],
+        input: &[f32],
+        m: usize,
+        n_rows: usize,
+        k: usize,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; m * n_rows];
+        for mi in 0..m {
+            gemv_two_bit_int8(
+                tier,
+                blocks,
+                &input[mi * k..(mi + 1) * k],
+                &mut out[mi * n_rows..(mi + 1) * n_rows],
+                n_rows,
+                k,
+            )
+            .expect("gemv sweep row");
+        }
+        out
+    }
+
+    /// `gemm_two_bit_i8mm` called directly (not through the tier routing)
+    /// on the `5 x 7` `PQ2_0` shape and data it was first pinned on, against
+    /// the per-row GEMV reference every tier agrees on, bit for bit.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn i8mm_tile_matches_the_gemv_per_row_reference() {
+        if !Int8Tier::NeonI8mm.is_supported() {
+            eprintln!("skip: this host has no i8mm+dotprod");
+            return;
+        }
+        let (m, n_rows, k) = (5usize, 7usize, 2 * QK_PQ2_0);
+        let blocks_per_row = k / QK_PQ2_0;
+        let mut lcg = 0x9EED_00AAu32 | 1;
         let mut next_u8 = move || {
             lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             (lcg >> 19) as u8
@@ -1118,114 +1675,136 @@ mod int8_dispatch_tests {
             .map(|_| (i32::from(next_u8()) - 128) as f32 / 64.0)
             .collect();
 
-        for tier in Int8Tier::ALL.iter().copied().filter(|t| t.is_supported()) {
-            let mut expect = vec![0.0f32; m * n_rows];
-            for mi in 0..m {
-                gemv_two_bit_int8(
-                    tier,
-                    &blocks,
-                    &input[mi * k..(mi + 1) * k],
-                    &mut expect[mi * n_rows..(mi + 1) * n_rows],
-                    n_rows,
-                    k,
-                )
-                .expect("gemv sweep row");
-            }
-            let mut got = vec![0.0f32; m * n_rows];
-            gemm_two_bit_int8(tier, &blocks, &input, &mut got, m, n_rows, k)
-                .expect("gemm_two_bit_int8 m=2");
-            for (i, (e, g)) in expect.iter().zip(got.iter()).enumerate() {
-                assert_eq!(
-                    e.to_bits(),
-                    g.to_bits(),
-                    "{tier}: gemm(m=2) diverged from the gemv sweep at cell {i}: {e} vs {g}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn zero_rows_is_a_no_op() {
-        use oxibonsai_core::BlockPQ2_0;
-        let blocks: Vec<BlockPQ2_0> = Vec::new();
-        let input = vec![1.0f32; 128];
-        let mut out: Vec<f32> = Vec::new();
-        gemv_two_bit_int8(Int8Tier::Scalar, &blocks, &input, &mut out, 0, 128)
-            .expect("zero rows must succeed");
-        assert!(out.is_empty());
-    }
-
-    /// K-INT8 wave-4b minor[2]: `gemm_two_bit_i8mm` (the `SMMLA` 2x2 tile)
-    /// is deliberately not routed to from `gemm_two_bit_int8` any more —
-    /// see [`Int8Tier::NeonI8mm`]'s doc comment for the measured numbers.
-    /// It is kept, `#[allow(dead_code)]`, for a future decode-reuse fix;
-    /// this test is what keeps it alive and proven bit-for-bit correct in
-    /// the meantime — without it, the tile would be genuine dead code,
-    /// unreachable from anywhere in the crate.
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn unrouted_i8mm_tile_still_matches_the_gemv_per_row_reference() {
-        use oxibonsai_core::BlockPQ2_0;
-
-        if !Int8Tier::NeonI8mm.is_supported() {
-            eprintln!("skip: this host has no i8mm+dotprod");
-            return;
-        }
-
-        let (m, n_rows, k) = (5usize, 7usize, 2 * oxibonsai_core::QK_PQ2_0);
-        let blocks_per_row = k / oxibonsai_core::QK_PQ2_0;
-        let mut lcg = 0x9EED_00AAu32 | 1;
-        let mut next_u8 = move || {
-            lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            (lcg >> 19) as u8
-        };
-        let blocks: Vec<BlockPQ2_0> = (0..n_rows * blocks_per_row)
-            .map(|_| {
-                let mut qs = [0u8; 32];
-                for b in &mut qs {
-                    *b = next_u8();
-                }
-                BlockPQ2_0 {
-                    d: half::f16::from_f32(0.0625 + (next_u8() % 16) as f32 / 256.0),
-                    qs,
-                }
-            })
-            .collect();
-        let mut input = vec![0.0f32; m * k];
-        for x in &mut input {
-            *x = (i32::from(next_u8()) - 128) as f32 / 64.0;
-        }
-
-        // Reference: the exact same per-row GEMV every tier (including
-        // `NeonI8mm`, which runs `SDOT` for GEMV) already agrees on, per
-        // `every_int8_tier_produces_bit_identical_output` in
-        // `int8_tier_parity.rs`.
-        let mut expect = vec![0.0f32; m * n_rows];
-        for mi in 0..m {
-            gemv_two_bit_int8(
-                Int8Tier::NeonI8mm,
-                &blocks,
-                &input[mi * k..(mi + 1) * k],
-                &mut expect[mi * n_rows..(mi + 1) * n_rows],
-                n_rows,
-                k,
-            )
-            .expect("gemv reference");
-        }
-
+        let expect = gemv_sweep(Int8Tier::NeonI8mm, &blocks, &input, m, n_rows, k);
         let act = Int8Activation::quantize(&input, m, k, BlockPQ2_0::QK, Int8Layout::Stride4)
             .expect("quantize");
         let lut16 = biased_lut16(&BlockPQ2_0::BIASED_LUT);
         let mut got = vec![0.0f32; m * n_rows];
         gemm_two_bit_i8mm(&blocks, &act, &mut got, m, n_rows, blocks_per_row, &lut16);
+        assert_bits_eq(&expect, &got, "i8mm tile vs the gemv-per-row reference");
+    }
 
-        for (i, (e, g)) in expect.iter().zip(got.iter()).enumerate() {
-            assert_eq!(
-                e.to_bits(),
-                g.to_bits(),
-                "unrouted i8mm tile diverged from the gemv-per-row reference \
-                 at cell {i}: {e} vs {g}"
+    /// The decode-reuse `SMMLA` GEMM against the per-row GEMV sweep, bit
+    /// for bit: odd and even `m` (the duplicated last batch row), odd and
+    /// even `n_rows` (the duplicated last weight row), weight-row counts
+    /// that span several Rayon tasks with a ragged last one, every format
+    /// (`QK = 128`: `TQ2_0_g128` with its `0b11 -> 0` table, `PQ2_0` and
+    /// `Q1_0_g128`; `QK = 64`: group-64 `Q2_0`) — including the `5 x 7`
+    /// shape the per-block 2x2 tile was first pinned on.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn i8mm_gemm_matches_the_gemv_sweep_at_every_shape() {
+        use oxibonsai_core::{BlockQ2_0G64, QK_Q2_0_G64};
+
+        if !Int8Tier::NeonI8mm.is_supported() {
+            eprintln!("skip: this host has no i8mm+dotprod");
+            return;
+        }
+        let tier = Int8Tier::NeonI8mm;
+        for (m, n_rows) in [
+            (2usize, 7usize),
+            (3, 8),
+            (5, 7),
+            (5, 37),
+            (8, 300),
+            (13, 1031),
+        ] {
+            let k = 3 * QK_TQ2_0_G128;
+            let input = activations(m * k, 0x3A00 + m as u32);
+
+            let tq2 = tq2_blocks(n_rows * (k / QK_TQ2_0_G128), 0x3A10 + n_rows as u32);
+            let mut got = vec![0.0f32; m * n_rows];
+            gemm_two_bit_int8(tier, &tq2, &input, &mut got, m, n_rows, k).expect("tq2 gemm");
+            assert_bits_eq(
+                &gemv_sweep(tier, &tq2, &input, m, n_rows, k),
+                &got,
+                &format!("TQ2_0_g128 i8mm gemm m={m} n_rows={n_rows}"),
             );
+
+            let pq2 = pq2_blocks(n_rows * (k / QK_PQ2_0), 0x3A20 + n_rows as u32);
+            let mut got = vec![0.0f32; m * n_rows];
+            gemm_two_bit_int8(tier, &pq2, &input, &mut got, m, n_rows, k).expect("pq2 gemm");
+            assert_bits_eq(
+                &gemv_sweep(tier, &pq2, &input, m, n_rows, k),
+                &got,
+                &format!("PQ2_0 i8mm gemm m={m} n_rows={n_rows}"),
+            );
+
+            let k64 = 5 * QK_Q2_0_G64;
+            let input64 = activations(m * k64, 0x3A30 + m as u32);
+            let mut rng = Lcg::new(0x3A40 + n_rows as u32);
+            let g64: Vec<BlockQ2_0G64> = (0..n_rows * (k64 / QK_Q2_0_G64))
+                .map(|_| {
+                    let mut qs = [0u8; QK_Q2_0_G64 / 4];
+                    for b in &mut qs {
+                        *b = rng.next_u8();
+                    }
+                    BlockQ2_0G64 {
+                        d: half::f16::from_f32(0.0625 + (rng.next_u8() % 16) as f32 / 256.0),
+                        qs,
+                    }
+                })
+                .collect();
+            let mut got = vec![0.0f32; m * n_rows];
+            gemm_two_bit_int8(tier, &g64, &input64, &mut got, m, n_rows, k64)
+                .expect("q2_0_g64 gemm");
+            assert_bits_eq(
+                &gemv_sweep(tier, &g64, &input64, m, n_rows, k64),
+                &got,
+                &format!("Q2_0_g64 i8mm gemm m={m} n_rows={n_rows}"),
+            );
+
+            let q1 = q1_blocks(n_rows * (k / QK1_0_G128), 0x3A60 + n_rows as u32);
+            let mut expect = vec![0.0f32; m * n_rows];
+            for mi in 0..m {
+                gemv_1bit_g128_int8(
+                    tier,
+                    &q1,
+                    &input[mi * k..(mi + 1) * k],
+                    &mut expect[mi * n_rows..(mi + 1) * n_rows],
+                    n_rows,
+                    k,
+                )
+                .expect("1-bit gemv sweep row");
+            }
+            let mut got = vec![0.0f32; m * n_rows];
+            gemm_1bit_g128_int8(tier, &q1, &input, &mut got, m, n_rows, k).expect("q1 gemm");
+            assert_bits_eq(
+                &expect,
+                &got,
+                &format!("Q1_0_g128 i8mm gemm m={m} n_rows={n_rows}"),
+            );
+        }
+    }
+
+    /// NaN contagion survives the `SMMLA` path: a NaN activation element
+    /// poisons exactly its own batch row's outputs.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn i8mm_gemm_propagates_a_nan_activation_to_its_own_batch_row_only() {
+        if !Int8Tier::NeonI8mm.is_supported() {
+            eprintln!("skip: this host has no i8mm+dotprod");
+            return;
+        }
+        let (m, n_rows, k) = (3usize, 5usize, QK_TQ2_0_G128);
+        let blocks = tq2_blocks(n_rows, 0x3A50);
+        let q1 = q1_blocks(n_rows, 0x3A52);
+        let mut input = activations(m * k, 0x3A51);
+        input[k + 7] = f32::NAN; // batch row 1 only
+        let mut out = vec![0.0f32; m * n_rows];
+        gemm_two_bit_int8(Int8Tier::NeonI8mm, &blocks, &input, &mut out, m, n_rows, k)
+            .expect("i8mm gemm");
+        let mut out_q1 = vec![0.0f32; m * n_rows];
+        gemm_1bit_g128_int8(Int8Tier::NeonI8mm, &q1, &input, &mut out_q1, m, n_rows, k)
+            .expect("1-bit i8mm gemm");
+        for result in [&out, &out_q1] {
+            for (mi, row) in result.chunks(n_rows).enumerate() {
+                if mi == 1 {
+                    assert!(row.iter().all(|v| v.is_nan()), "row 1: {row:?}");
+                } else {
+                    assert!(row.iter().all(|v| v.is_finite()), "row {mi}: {row:?}");
+                }
+            }
         }
     }
 }

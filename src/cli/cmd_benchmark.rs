@@ -5,6 +5,7 @@
 //! untrained 2-layer toy benchmark, which is no longer the silent default.
 
 use super::model_desc;
+use super::tokenizer_backend::TokenizerBackendChoice;
 use super::util::{
     build_sampling_params, missing_tokenizer_warning, model_vocab_size,
     resolve_tokenizer_vocab_aware,
@@ -15,6 +16,7 @@ pub(crate) fn run(
     model: Option<String>,
     synthetic: bool,
     tokenizer: Option<String>,
+    tokenizer_backend: TokenizerBackendChoice,
     tokens: usize,
     warmup: usize,
     temperature: f32,
@@ -23,7 +25,15 @@ pub(crate) fn run(
     let model = model.or_else(|| std::env::var("OXI_MODEL").ok().filter(|s| !s.is_empty()));
 
     match model {
-        Some(model) => run_real_model(&model, tokenizer, tokens, warmup, temperature, seed),
+        Some(model) => run_real_model(
+            &model,
+            tokenizer,
+            tokenizer_backend,
+            tokens,
+            warmup,
+            temperature,
+            seed,
+        ),
         None => {
             if !synthetic {
                 anyhow::bail!(
@@ -42,6 +52,7 @@ pub(crate) fn run(
 fn run_real_model(
     model: &str,
     tokenizer: Option<String>,
+    tokenizer_backend: TokenizerBackendChoice,
     tokens: usize,
     warmup: usize,
     temperature: f32,
@@ -50,43 +61,36 @@ fn run_real_model(
     let mmap = oxibonsai_core::gguf::reader::mmap_gguf_file(std::path::Path::new(model))
         .map_err(|e| anyhow::anyhow!("failed to open model '{model}': {e}"))?;
     let gguf = oxibonsai_core::gguf::reader::GgufFile::parse(&mmap)?;
+    let arch = gguf
+        .metadata
+        .get_string(oxibonsai_core::gguf::tensor_info::keys::GENERAL_ARCHITECTURE)
+        .unwrap_or("")
+        .to_string();
 
     let params = build_sampling_params(temperature, 40, 0.9, 1.0);
-    let mut engine = oxibonsai_runtime::InferenceEngine::from_gguf(&gguf, params, seed, 4096)?;
+    let mut engine = oxibonsai_runtime::InferenceEngine::from_gguf(
+        &gguf,
+        params,
+        seed,
+        super::bonsai2::default_max_seq_len(&arch),
+    )?;
 
-    if let Ok(config) = oxibonsai_core::config::Qwen3Config::from_metadata(&gguf.metadata) {
-        let dominant_type = gguf
-            .tensors
-            .count_by_type()
-            .iter()
-            .max_by_key(|(_, count)| *count)
-            .map(|(ty, _)| *ty)
-            .unwrap_or(oxibonsai_core::GgufTensorType::Q1_0_g128);
-        let variant = oxibonsai_model::ModelVariant::from_config_and_sample_tensor_type(
-            &config,
-            dominant_type,
-        );
-        eprintln!(
-            "{}",
-            model_desc::resolved_engine_summary(
-                variant.name(),
-                dominant_type,
-                engine.kernel_tier(),
-                &engine.kernel().effective_tier_reason(),
-            )
-        );
-    }
+    // cli-16 / REQUIRED #14: the engine's own resolved variant, quant type,
+    // kernel label and tier — never the raw parse-time tensor-type guess.
+    eprintln!("{}", model_desc::engine_summary(&engine));
 
     let expected_vocab = model_vocab_size(&gguf).ok();
     let lookup = resolve_tokenizer_vocab_aware(tokenizer.as_deref(), model, expected_vocab);
-    // ENGINE-SEAM: shared with `run` (GGUF-embedded tokenizer fallback).
-    let resolved = super::cmd_run::resolve_model_tokenizer_with(
+    // ENGINE-SEAM: shared with `run` (GGUF-embedded tokenizer fallback, the
+    // GGUF's own chat template, the TOK-08 compatibility check), loading the
+    // on-disk candidate through the chosen `--tokenizer-backend`.
+    let resolved = super::cmd_run::resolve_model_tokenizer(
         tokenizer.as_deref(),
         &lookup,
         &gguf,
         expected_vocab,
+        tokenizer_backend,
         false,
-        |path| Ok(oxibonsai_runtime::TokenizerBridge::from_file(path)?),
     )?;
     let prompt_tokens: Vec<u32> = if let Some(tok) = resolved {
         // A short, fixed benchmark prompt: real tokenization, not a

@@ -1,4 +1,5 @@
-//! Batched CPU prefill (perf-M2).
+//! Batched CPU prefill (perf-M2), shared by the generation prefill and the
+//! embedding hidden-state pass (`RT-08`).
 //!
 //! Before this module there was **no batched CPU prefill at all**:
 //! [`BonsaiModel::forward_prefill`](super::BonsaiModel::forward_prefill)
@@ -13,122 +14,29 @@
 //!   were thrown away for all but the last — for Bonsai 2 that is
 //!   `248 320 x 5120` MACs discarded per prompt token.
 //!
-//! The verifier measured the consequence: **183 ms/prompt-token** (277
-//! prompt tokens in 50.81 s on the default build), *worse* than the 125 ms
-//! CPU decode step, which at least has the excuse of being memory-bound.
+//! The consequence was measured at **183 ms/prompt-token** (277 prompt
+//! tokens in 50.81 s on the default build), *worse* than the 125 ms CPU
+//! decode step, which at least has the excuse of being memory-bound.
 //!
-//! # MEASUREMENTS (three independent points, each with its load average)
+//! # Shape of one pass
 //!
-//! [`tests::real_model_cpu_prefill_outruns_the_sequential_prefill`] runs the
-//! now-wired [`BonsaiModel::forward_prefill_cpu`] against the sequential
-//! per-token reference (same pinned CPU tier on both sides) on the real,
-//! shipped `Ternary-Bonsai-1.7B.gguf`, 280 prompt tokens, release,
-//! `--all-features`, on this 8-core M3. Three independent measurement points
-//! exist — four runs, because point 3 was taken twice — from three different
-//! agents in three different worktrees:
-//!
-//! | # | who / tree | batched | sequential | speedup | load avg (1/5/15) |
-//! |---|---|---|---|---|---|
-//! | 1 | PERF-CPU-PREFILL implementer, wave-3 package worktree, single run | **82.3 ms/prompt-token** | 268.6 | 3.26x | 14.87 / 34.43 / 42.60 |
-//! | 2 | wave-3.5 verifier, wave-3 merged worktree, single run | **82.707** | 392.4 | 4.74x | 93.85 |
-//! | 3 | FIX3-PERF, this worktree, 2026-09-23, min of 3 in-process runs | **25.9** and **31.0** (two sessions; per-run 34.748 / 31.488 / 30.989) | 279.6 and 305.1 | 10.78x / 9.84x | 13.19-15.60 before, 18.75-20.22 after |
-//!
-//! `cos(batched, sequential)` printed **0.9999999999997823** — identical to
-//! all thirteen digits — in every one of those runs, which is how each is
-//! known to have timed the same code path.
-//!
-//! **What every run establishes.** The correctness leg (cos >= 0.9999,
-//! eleven nines of margin) and the relative leg (speedup >= 3x) are
-//! confirmed by all four runs. Those are dimensionless and they hold across
-//! a 7x load-average range; they are what this path's acceptance rests on.
-//!
-//! **What point 3 does NOT establish.** It does not reproduce 82 ms/token,
-//! and this module does not claim to know why. What the measurement can and
-//! cannot exclude, stated exactly:
-//!
-//! * *not file I/O or model load* — `std::fs::read` and
-//!   `BonsaiModel::from_gguf` both complete before the timer starts, in
-//!   point 3 exactly as in points 1 and 2;
-//! * *not in-process warm-up alone* — point 3's per-run series is
-//!   34.748 / 31.488 / 30.989 ms/prompt-token, so even its **first** timed
-//!   run is 2.4x faster than 82.3 and the whole spread is ~12 %, not the 3x
-//!   that would be needed. (The OS page cache was warm for that series, but
-//!   the weight bytes are read and parsed before the timer starts in every
-//!   version of this test, so page-cache state sits outside the timed region
-//!   either way.);
-//! * *not a code change on this path* — point 2 was taken against the wave-3
-//!   **merged** tree, which is exactly this worktree's baseline; the only
-//!   patches on top of it here are FIX3-BUILD and FIX3-MODEL, and neither
-//!   touches `gemm_ternary.rs`, `parallel.rs`, `simd_neon.rs` or `tiled.rs`
-//!   (both file lists checked). FIX3-MODEL does hoist the dense-FP32
-//!   LM-head GEMV into the kernel dispatcher, but the LM head runs **once**
-//!   per batched call against 280 times per sequential one, so it cannot
-//!   move the batched leg by 2.6x;
-//! * *what is left* — the load average (93.85 for point 2 against 13-20
-//!   here) and single-run against min-of-three. This package did not isolate
-//!   which, and claims neither. Note also that the reading "load does not
-//!   move this path", drawn from points 1 and 2 agreeing to within 0.5 %
-//!   across a 5x load delta, rests on two single runs: at load 93.85 on 8
-//!   cores — roughly 12x oversubscription — a Rayon-parallel GEMM running
-//!   2-3x slow is an ordinary outcome, so that reading is weaker than its
-//!   0.5 % agreement makes it look. The contention story the *first* version
-//!   of this doc told ("treat 82.3 ms/token as an upper bound taken under
-//!   contention", "the evidence that the environment, not the code, moved")
-//!   was refuted by point 2 and is not reinstated here: point 3 leaves the
-//!   82 ms figure unexplained, not re-explained.
-//!
-//! **The absolute acceptance leg, and why it is not asserted (decision
-//! D-5).** The spec's `< 60 ms/prompt-token` was the verifier's 183 ms/token
-//! sequential baseline divided by three. That baseline is not reproducible
-//! on this machine (the unchanged sequential code measures 268.6, 392.4,
-//! 279.6 and 305.1 ms/token across the four runs above), so the threshold
-//! derived from it is not a stable contract on this hardware — which is
-//! exactly what D-5 ruled. The gating unit test therefore keeps only the
-//! **relative** invariant (batched throughput >= sequential throughput, min
-//! of three runs each) and *records* the absolute figure instead of
-//! asserting it. Point 3 happens to sit comfortably under 60 ms; points 1
-//! and 2 did not; that spread is the argument for the ruling, not against
-//! it.
-//!
-//! # CROSS-TIER NUMERICS (wave 3.5, real `Ternary-Bonsai-1.7B.gguf`)
-//!
-//! The same wave-3.5 pass that re-measured the speed above also measured
-//! what this path does to the *numbers*, over 64 self-generated greedy steps
-//! on all three of the legacy parity gate's prompt slots:
-//!
-//! * `KernelTier::Reference` vs the auto-detected CPU tier (NEON here),
-//!   batched prefill: **exactly 0.0 at every step**, identical token chains;
-//! * the same pair with a per-token (`forward`) prefill: **also exactly
-//!   0.0**;
-//! * batched prefill vs per-token prefill *within* a tier: worst
-//!   **9.06e-6 at step 45** (slot 0) and **8.58e-6 at step 0** (slot 1),
-//!   token chains identical, and the same series on both tiers to every
-//!   printed digit.
-//!
-//! So this path costs ~1e-5 absolute against the per-token sweep and
-//! contributes **zero** cross-tier divergence — it is not the source of the
-//! legacy parity RED, which is a Reference-vs-Metal bound-shape problem.
-//! Both halves are now asserted rather than merely reported:
-//! `model::types::tests::forward_prefill_is_bit_exact_across_the_reference_and_native_cpu_tiers`
-//! and
-//! `model::types::tests::batched_prefill_agrees_with_the_per_token_prefill_within_a_tier`.
-//!
-//! [`BonsaiModel::forward_prefill_cpu`] replaces that with a real batched
-//! pass:
+//! [`BonsaiModel::forward_prefill_cpu`] and the embedding pass
+//! ([`BonsaiModel::forward_hidden`]) both drive `run_prefill_cpu`:
 //!
 //! 1. the prompt is embedded once per micro-batch;
 //! 2. every projection (Q/K/V, attention output, FFN gate/up/down) is a
-//!    **GEMM over the whole micro-batch**, through
-//!    `oxibonsai_kernels::parallel::gemm_1bit_g128_par` /
-//!    `gemm_ternary_g128_par` — the K-18 register-blocked drivers, which
-//!    decode each weight block once per `MR` batch rows and split Rayon work
-//!    over **slabs of rows inside the GEMM**, never over prompt positions;
-//! 3. QK-norm, RoPE, the KV-cache writes and the causal GQA attention stay
-//!    **strictly sequential in position order**, because row `i` must see
-//!    exactly the keys and values of positions `0..=i` and no more;
-//! 4. the output norm and the **LM head run once per call to this
-//!    function**, on the last position of whatever range `token_ids`
-//!    covers for that call.
+//!    **GEMM over the whole micro-batch** through the K-18 register-blocked
+//!    kernels (`gemm_tq2_0_g128_blocked` / `gemm_1bit_g128_blocked`), which
+//!    decode each weight block once per `MR` batch rows — split into Rayon
+//!    tasks over batch slabs **and** feature slabs (see "GEMM split");
+//! 3. QK-norm, RoPE and the KV-cache writes run **strictly in position
+//!    order**; the causal GQA attention of the micro-batch's rows then runs
+//!    in parallel over rows, each row reading exactly positions `0..=pos`
+//!    (see "Attention");
+//! 4. each micro-batch's post-block rows go to a sink together with
+//!    `output_norm`: the generation prefill keeps the last row and runs the
+//!    output norm and the **LM head once per call**; the embedding pass
+//!    normalises every row and never touches the head.
 //!
 //! Long prompts are processed in [`CPU_PREFILL_MICRO_BATCH`]-token passes so
 //! the activation buffers stay bounded (`m x intermediate_size` floats is
@@ -145,22 +53,124 @@
 //! logits reach the caller. That repeat is bounded by the chunk count, not
 //! the prompt length, so it keeps perf-M2's win (was: once per **token**).
 //!
+//! # GEMM split (bit-identical)
+//!
+//! `oxibonsai_kernels::parallel::gemm_*_par` splits Rayon work over batch
+//! slabs only, one slab per worker and at least one register block (8 rows)
+//! each. That fills the pool for a 128-row micro-batch, but a short input
+//! gets `ceil(m / 8)` slabs: a 10-token prompt ran every GEMM on **two
+//! cores** of eight. `gemm_blocked_2d` keeps each batch slab to one register
+//! block and adds feature slabs until there are about four tasks per worker
+//! thread, so a short input uses the whole machine and work stealing
+//! balances the long tail on a mixed performance/efficiency-core part. Every
+//! task runs the same register-blocked kernel on the same dispatcher, whose
+//! per-element accumulation order depends on neither which batch rows nor
+//! which features share a call, so the output is **bit-identical** to
+//! `gemm_*_par` (pinned by `gemm_blocked_2d_is_bit_identical_to_the_kernel_driver`
+//! over both formats and every batch size a micro-batch can take).
+//!
+//! The opt-in INT8 dot-product tier (`OXIBONSAI_KERNEL_TIER`) is routed
+//! inside the kernel crate's drivers, so while it is selected the GEMMs go
+//! through `gemm_*_par` unchanged; with the variable unset that route is
+//! never taken.
+//!
+//! # Attention (bit-identical)
+//!
+//! Row `i` of a micro-batch must see exactly the keys and values of
+//! positions `0..=pos_start + i`. The rows' keys and values are stored in
+//! position order first; the rows' attention then runs in parallel, each
+//! through the very function the per-token decode path runs
+//! (`gqa_attention`, `seq_len = pos + 1`), and the cache's `attend_group`
+//! reads exactly the first `seq_len` stored positions. A later row's keys
+//! being in the cache already is therefore invisible to an earlier row, and
+//! each row gets the bits it would get alone (pinned by
+//! `attend_rows_is_bit_identical_to_the_per_row_attention`, `f32` and
+//! `f16` caches). Every position of the call is made resident before the
+//! first layer runs, so the cache's allocation cannot move in between.
+//!
+//! # MEASUREMENTS
+//!
+//! `real_model_cpu_prefill_outruns_the_sequential_prefill` runs
+//! [`BonsaiModel::forward_prefill_cpu`] against the sequential per-token
+//! reference (same pinned CPU tier on both sides) on the real, shipped
+//! `Ternary-Bonsai-1.7B.gguf`, 280 prompt tokens, release, `--all-features`,
+//! on an 8-core M3. With the batch-slab split, three independent measurement
+//! points (different checkouts, different days, different machine load)
+//! gave:
+//!
+//! | # | runs | batched (ms/prompt-token) | sequential | speedup | load avg (1/5/15) |
+//! |---|---|---|---|---|---|
+//! | 1 | single run | **82.3** | 268.6 | 3.26x | 14.87 / 34.43 / 42.60 |
+//! | 2 | single run | **82.707** | 392.4 | 4.74x | 93.85 |
+//! | 3 | min of 3 in-process runs, two sessions | **25.9** and **31.0** (per-run 34.748 / 31.488 / 30.989) | 279.6 and 305.1 | 10.78x / 9.84x | 13.19-15.60 before, 18.75-20.22 after |
+//!
+//! `cos(batched, sequential)` printed **0.9999999999997823** — identical to
+//! all thirteen digits — in every one of those runs, which is how each is
+//! known to have timed the same code path. The correctness leg (cos >=
+//! 0.9999) and the relative leg (speedup >= 3x) hold across a 7x
+//! load-average range; those dimensionless figures are what this path's
+//! acceptance rests on. The spread of the absolute figure (82 against 26-31
+//! ms/token) was never isolated beyond this: not file I/O or model load
+//! (both finish before the timer starts), not in-process warm-up alone (point
+//! 3's first run is already 2.4x faster than 82.3), not a code change on the
+//! GEMM path; what remains is the load average and single-run against
+//! min-of-three — at load 93.85 on 8 cores, a Rayon-parallel GEMM running
+//! 2-3x slow is an ordinary outcome. The absolute figure is therefore
+//! recorded, not asserted.
+//!
+//! The two-way GEMM split and the row-parallel attention keep every output
+//! bit-identical — pinned by `gemm_blocked_2d_is_bit_identical_to_the_kernel_driver`,
+//! `both_gemm_routes_agree_bit_for_bit` and
+//! `attend_rows_is_bit_identical_to_the_per_row_attention`, and confirmed
+//! end to end against the batch-slab version's logits on the real 1.7B (10-
+//! and 280-token prompts, every bit equal). Interleaved on this M3, the split
+//! runs the 10-row projection GEMMs 1.3-2.1x faster than the batch-slab
+//! driver and the 128-row ones at parity; the embedding path's end-to-end
+//! effect is measured by the runtime's `embed_bench_short_and_long`, whose
+//! printed figures carry their own load averages.
+//!
+//! # CROSS-TIER NUMERICS (real `Ternary-Bonsai-1.7B.gguf`)
+//!
+//! Measured over 64 self-generated greedy steps on all three of the legacy
+//! parity gate's prompt slots:
+//!
+//! * `KernelTier::Reference` vs the auto-detected CPU tier (NEON here),
+//!   batched prefill: **exactly 0.0 at every step**, identical token chains;
+//! * the same pair with a per-token (`forward`) prefill: **also exactly
+//!   0.0**;
+//! * batched prefill vs per-token prefill *within* a tier: worst
+//!   **9.06e-6 at step 45** (slot 0) and **8.58e-6 at step 0** (slot 1),
+//!   token chains identical, and the same series on both tiers to every
+//!   printed digit.
+//!
+//! So this path costs ~1e-5 absolute against the per-token sweep and
+//! contributes **zero** cross-tier divergence — it is not the source of any
+//! Reference-vs-Metal divergence, which is a bound-shape problem. Both
+//! halves are asserted rather than merely reported:
+//! `model::types::tests::forward_prefill_is_bit_exact_across_the_reference_and_native_cpu_tiers`
+//! and
+//! `model::types::tests::batched_prefill_agrees_with_the_per_token_prefill_within_a_tier`.
+//!
 //! **Scope.** This is the CPU path and only the CPU path. It handles the two
 //! weight formats that have register-blocked GEMM kernels — `Q1_0_g128` and
 //! `TQ2_0_g128`. Anything else (FP8, Q4\_0/Q8\_0, the K-quants, a
-//! mixed-format layer, a geometry that does not match the config) returns
-//! `Ok(None)` **before writing anything**, so the caller keeps its existing,
-//! proven `forward_sequential` behaviour. The LM head is not restricted: it
+//! mixed-format layer, a geometry that does not match the config, a
+//! declared sliding window — this path's attention is full-causal, M-17)
+//! returns `Ok(None)` **before writing anything**, so the caller keeps its
+//! existing, proven sequential behaviour. The LM head is not restricted: it
 //! runs once through `apply_lm_head`, whatever its format.
 
 use oxibonsai_core::tensor::{BlockQ1_0G128, QK1_0_G128};
 use oxibonsai_core::BlockTQ2_0_g128;
+use oxibonsai_kernels::error::KernelError;
 use oxibonsai_kernels::KernelDispatcher;
+use rayon::prelude::*;
 use std::sync::OnceLock;
 
 use crate::block::TransformerBlock;
 use crate::error::{ModelError, ModelResult};
 use crate::kv_cache::KvCache;
+use crate::layers::rms_norm::RmsNorm;
 use crate::layers::rope::RopeTable;
 use crate::layers::swiglu::try_swiglu;
 
@@ -184,19 +194,64 @@ pub const CPU_PREFILL_MICRO_BATCH: usize = 128;
 /// Both register-blocked formats group this many weights per block.
 const GROUP_WEIGHTS: usize = QK1_0_G128;
 
+/// Rayon tasks a batched GEMM is split into, per worker thread.
+///
+/// Several tasks per thread rather than one: this machine class mixes
+/// performance and efficiency cores, and a split into exactly one task per
+/// thread finishes when the slowest core does. Four lets work stealing move
+/// the tail onto whichever cores are free.
+const GEMM_TASKS_PER_THREAD: usize = 4;
+
+/// Fewest output features one GEMM task computes.
+///
+/// Below this, a task's fixed costs (the kernel's shape validation, one
+/// small allocation, the Rayon hand-off) stop being negligible against its
+/// arithmetic.
+const GEMM_MIN_FEATURES_PER_TASK: usize = 32;
+
 /// The dispatcher the batched CPU prefill runs its GEMMs on.
 ///
 /// Pinned to the best **CPU** tier
 /// ([`oxibonsai_kernels::cpu_kernel_tier`]) and built once per process,
-/// rather than `auto_detect`: this path only ever runs when a GPU prefill
-/// was declined — because there is no GPU, because the caller forced the CPU
-/// (`OXIBONSAI_FORCE_CPU_DECODE_AFTER`), or because the fused GPU prefill
-/// failed — so quietly routing its GEMMs back onto the GPU would defeat
+/// rather than `auto_detect`. Two callers reach this path and neither wants
+/// its GEMMs back on a GPU: the generation prefill only runs here once a GPU
+/// prefill was declined — because there is no GPU, because the caller forced
+/// the CPU (`OXIBONSAI_FORCE_CPU_DECODE_AFTER`), or because the fused GPU
+/// prefill failed — so routing the GEMMs back onto the GPU would defeat
 /// every one of those reasons and would put device work behind a host-KV
-/// contract (MET-05).
+/// contract (MET-05); and
+/// [`forward_hidden`](BonsaiModel::forward_hidden) (embeddings) runs here on
+/// *every* tier, including a GPU engine's, because no head-free batched GPU
+/// prefill exists (see that module's docs).
 fn prefill_dispatcher() -> &'static KernelDispatcher {
     static DISPATCHER: OnceLock<KernelDispatcher> = OnceLock::new();
     DISPATCHER.get_or_init(|| KernelDispatcher::with_tier(oxibonsai_kernels::cpu_kernel_tier()))
+}
+
+/// Which driver a batched pass sends its GEMMs through, decided once per
+/// call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GemmRoute {
+    /// The f32 register-blocked kernels under this module's two-way split
+    /// ([`gemm_blocked_2d`]) — the default.
+    Blocked2d,
+    /// `oxibonsai_kernels::parallel::gemm_*_par`, taken while the opt-in
+    /// INT8 dot-product tier is selected through `OXIBONSAI_KERNEL_TIER`:
+    /// that tier is routed inside the kernel crate's drivers, so deferring
+    /// to them is what keeps the opt-in reachable from this path. With the
+    /// variable unset this route is never taken.
+    KernelDriver,
+}
+
+impl GemmRoute {
+    /// The route for one call, read from the environment once.
+    fn for_this_call() -> Self {
+        if oxibonsai_kernels::dispatch_int8::Int8Tier::from_env().is_some() {
+            Self::KernelDriver
+        } else {
+            Self::Blocked2d
+        }
+    }
 }
 
 /// One quantized projection matrix in a format that has a register-blocked
@@ -218,6 +273,15 @@ impl PrefillMatrix<'_> {
         }
     }
 
+    /// Batch rows the format's register-blocked kernel consumes one decoded
+    /// weight block with.
+    fn register_block(&self) -> usize {
+        match self {
+            Self::OneBit(_) => oxibonsai_kernels::gemm_onebit::ONEBIT_GEMM_MR,
+            Self::Ternary(_) => oxibonsai_kernels::gemm_ternary::TERNARY_GEMM_MR,
+        }
+    }
+
     /// Output rows implied by the block count and `in_features`.
     ///
     /// Derived from the weights themselves rather than assumed from the
@@ -235,10 +299,15 @@ impl PrefillMatrix<'_> {
         Some(total / blocks_per_row)
     }
 
-    /// `output[m x n_rows] = input[m x k] . weights^T` through the K-18
-    /// register-blocked, Rayon row-slab parallel driver.
+    /// `output[m x n_rows] = input[m x k] . weights^T` on the route chosen
+    /// for this call.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one GEMM: its route, both buffers and the three dimensions"
+    )]
     fn gemm(
         &self,
+        route: GemmRoute,
         input: &[f32],
         output: &mut [f32],
         m: usize,
@@ -246,15 +315,221 @@ impl PrefillMatrix<'_> {
         k: usize,
     ) -> ModelResult<()> {
         let dispatcher = prefill_dispatcher();
+        match route {
+            GemmRoute::Blocked2d => gemm_blocked_2d(*self, dispatcher, input, output, m, n_rows, k),
+            GemmRoute::KernelDriver => match self {
+                Self::OneBit(blocks) => oxibonsai_kernels::parallel::gemm_1bit_g128_par(
+                    dispatcher, blocks, input, output, m, n_rows, k,
+                ),
+                Self::Ternary(blocks) => oxibonsai_kernels::parallel::gemm_ternary_g128_par(
+                    dispatcher, blocks, input, output, m, n_rows, k,
+                ),
+            }
+            .map_err(ModelError::Kernel),
+        }
+    }
+
+    /// The format's register-blocked kernel over the weight rows whose
+    /// blocks are `blocks`, writing `[m x n_rows]` contiguously.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one kernel call: its dispatcher, block range, both buffers and three dimensions"
+    )]
+    fn blocked_gemm(
+        &self,
+        dispatcher: &KernelDispatcher,
+        blocks: std::ops::Range<usize>,
+        input: &[f32],
+        output: &mut [f32],
+        m: usize,
+        n_rows: usize,
+        k: usize,
+    ) -> ModelResult<()> {
+        let available = self.block_count();
+        let out_of_range = || {
+            ModelError::Kernel(KernelError::buffer_too_small(
+                "blocks", blocks.end, available,
+            ))
+        };
         match self {
-            Self::OneBit(blocks) => oxibonsai_kernels::parallel::gemm_1bit_g128_par(
-                dispatcher, blocks, input, output, m, n_rows, k,
+            Self::OneBit(all) => oxibonsai_kernels::gemm_onebit::gemm_1bit_g128_blocked(
+                dispatcher,
+                all.get(blocks.clone()).ok_or_else(out_of_range)?,
+                input,
+                output,
+                m,
+                n_rows,
+                k,
             ),
-            Self::Ternary(blocks) => oxibonsai_kernels::parallel::gemm_ternary_g128_par(
-                dispatcher, blocks, input, output, m, n_rows, k,
+            Self::Ternary(all) => oxibonsai_kernels::gemm_ternary::gemm_tq2_0_g128_blocked(
+                dispatcher,
+                all.get(blocks.clone()).ok_or_else(out_of_range)?,
+                input,
+                output,
+                m,
+                n_rows,
+                k,
             ),
         }
         .map_err(ModelError::Kernel)
+    }
+}
+
+/// How [`gemm_blocked_2d`] cuts one `[m x n_rows]` GEMM into Rayon tasks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GemmSplit {
+    /// Batch rows per task: one register block (the last slab may be
+    /// shorter).
+    row_slab: usize,
+    /// Output features per task (the last slab may be narrower).
+    features_per_slab: usize,
+    /// Feature slabs per batch slab; every one is non-empty.
+    feature_slabs: usize,
+}
+
+impl GemmSplit {
+    /// Plan the split of an `[m x n_rows]` GEMM whose kernel register-blocks
+    /// `mr` batch rows, for `threads` Rayon workers.
+    ///
+    /// Batch slabs are exactly one register block, so no slab strands a
+    /// partial block that a wider slab would have filled: the weight matrix
+    /// is decoded `ceil(m / mr)` times in total, the same as any split whose
+    /// slabs are whole register blocks. The feature split then supplies the
+    /// parallelism the batch split alone cannot — at `m = 10` a batch-only
+    /// split yields two tasks, and so two busy cores, whatever the machine.
+    fn plan(m: usize, n_rows: usize, mr: usize, threads: usize) -> Self {
+        let row_slab = mr.max(1).min(m.max(1));
+        let row_slabs = m.max(1).div_ceil(row_slab);
+        let target_tasks = threads.max(1).saturating_mul(GEMM_TASKS_PER_THREAD);
+        let wanted = target_tasks.div_ceil(row_slabs).max(1);
+        let most = n_rows.div_ceil(GEMM_MIN_FEATURES_PER_TASK).max(1);
+        let features_per_slab = n_rows.max(1).div_ceil(wanted.min(most));
+        let feature_slabs = n_rows.max(1).div_ceil(features_per_slab);
+        Self {
+            row_slab,
+            features_per_slab,
+            feature_slabs,
+        }
+    }
+}
+
+/// `output[m x n_rows] = input[m x k] . weights^T` through the format's
+/// register-blocked kernel, split over batch slabs **and** feature slabs.
+///
+/// **Bit-identical to `oxibonsai_kernels::parallel::gemm_*_par`**: both run
+/// the same `gemm_*_blocked` kernel on the same dispatcher, and that kernel
+/// computes every `(batch row, feature)` element with an accumulation order
+/// that depends on neither which other rows nor which other features share
+/// the call (the kernel's own module documents that per-element contract).
+/// Only the task boundaries differ — which `gemm_blocked_2d_is_bit_identical_to_the_kernel_driver`
+/// pins over odd shapes, both formats and every batch size a micro-batch
+/// can take.
+///
+/// Each task computes its `[rows x features]` tile into a private buffer;
+/// the batch slab that owns those output rows then scatters its tiles into
+/// place, so no two tasks ever write the same memory.
+fn gemm_blocked_2d(
+    matrix: PrefillMatrix<'_>,
+    dispatcher: &KernelDispatcher,
+    input: &[f32],
+    output: &mut [f32],
+    m: usize,
+    n_rows: usize,
+    k: usize,
+) -> ModelResult<()> {
+    if m == 0 || n_rows == 0 {
+        return Ok(());
+    }
+    if k == 0 || !k.is_multiple_of(GROUP_WEIGHTS) {
+        return Err(ModelError::Kernel(KernelError::NotBlockAligned {
+            count: k,
+            block_size: GROUP_WEIGHTS,
+        }));
+    }
+    let input_len = m
+        .checked_mul(k)
+        .ok_or_else(|| gemm_overflow("input", m, k))?;
+    let output_len = m
+        .checked_mul(n_rows)
+        .ok_or_else(|| gemm_overflow("output", m, n_rows))?;
+    let supplied = input.len();
+    let input = input.get(..input_len).ok_or_else(|| {
+        ModelError::Kernel(KernelError::dimension_mismatch(
+            "input", input_len, supplied,
+        ))
+    })?;
+    let available = output.len();
+    let output = output.get_mut(..output_len).ok_or_else(|| {
+        ModelError::Kernel(KernelError::buffer_too_small(
+            "output", output_len, available,
+        ))
+    })?;
+    let blocks_per_row = k / GROUP_WEIGHTS;
+    let needed_blocks = n_rows
+        .checked_mul(blocks_per_row)
+        .ok_or_else(|| gemm_overflow("blocks", n_rows, blocks_per_row))?;
+    if matrix.block_count() < needed_blocks {
+        return Err(ModelError::Kernel(KernelError::buffer_too_small(
+            "blocks",
+            needed_blocks,
+            matrix.block_count(),
+        )));
+    }
+
+    let split = GemmSplit::plan(
+        m,
+        n_rows,
+        matrix.register_block(),
+        rayon::current_num_threads(),
+    );
+    output
+        .par_chunks_mut(split.row_slab * n_rows)
+        .enumerate()
+        .try_for_each(|(slab, out_slab)| -> ModelResult<()> {
+            let rows = out_slab.len() / n_rows;
+            let first = slab * split.row_slab;
+            let input_slab = input
+                .get(first * k..(first + rows) * k)
+                .ok_or_else(|| gemm_overflow("input slab", first, rows))?;
+            let tiles = (0..split.feature_slabs)
+                .into_par_iter()
+                .map(|feature_slab| -> ModelResult<(usize, Vec<f32>)> {
+                    let start = feature_slab * split.features_per_slab;
+                    let end = (start + split.features_per_slab).min(n_rows);
+                    let width = end - start;
+                    let mut tile = vec![0.0f32; rows * width];
+                    matrix.blocked_gemm(
+                        dispatcher,
+                        start * blocks_per_row..end * blocks_per_row,
+                        input_slab,
+                        &mut tile,
+                        rows,
+                        width,
+                        k,
+                    )?;
+                    Ok((start, tile))
+                })
+                .collect::<ModelResult<Vec<_>>>()?;
+            for (start, tile) in tiles {
+                let width = tile.len() / rows;
+                for (dst_row, src_row) in out_slab
+                    .chunks_exact_mut(n_rows)
+                    .zip(tile.chunks_exact(width))
+                {
+                    dst_row[start..start + width].copy_from_slice(src_row);
+                }
+            }
+            Ok(())
+        })
+}
+
+/// A GEMM dimension product that does not fit `usize` — unreachable for any
+/// shape that fits in memory, reported rather than wrapped.
+fn gemm_overflow(what: &str, a: usize, b: usize) -> ModelError {
+    ModelError::ShapeInvariant {
+        tensor: format!("batched prefill GEMM {what}"),
+        expected: "dimensions whose product fits usize".to_string(),
+        actual: format!("{a} x {b}"),
     }
 }
 
@@ -376,6 +651,10 @@ struct PrefillGeometry {
 }
 
 /// Scratch buffers for one batched pass, sized once and reused per layer.
+///
+/// `q_rope` holds every row of the micro-batch (the attention of all rows
+/// runs after their keys and values are stored); `q_normed`, `k_normed` and
+/// `k_rope` are one-row staging buffers.
 struct PrefillScratch {
     hidden: Vec<f32>,
     normed: Vec<f32>,
@@ -403,7 +682,7 @@ impl PrefillScratch {
             v_all: vec![0.0; batch * geom.kv_dim],
             q_normed: vec![0.0; geom.q_dim],
             k_normed: vec![0.0; geom.kv_dim],
-            q_rope: vec![0.0; geom.q_dim],
+            q_rope: vec![0.0; batch * geom.q_dim],
             k_rope: vec![0.0; geom.kv_dim],
             attn_out: vec![0.0; batch * geom.q_dim],
             proj: vec![0.0; batch * geom.hidden],
@@ -412,6 +691,19 @@ impl PrefillScratch {
             swiglu: vec![0.0; batch * geom.intermediate],
         }
     }
+}
+
+/// One micro-batch of post-block hidden rows, as a batched pass hands it to
+/// the sink of [`BonsaiModel::run_prefill_cpu`].
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PrefillRows<'r> {
+    /// Index, within the call's `token_ids`, of the first row.
+    pub(super) first: usize,
+    /// Number of rows (at least one).
+    pub(super) count: usize,
+    /// `[count x hidden]` hidden states after the last block and **before**
+    /// `output_norm`.
+    pub(super) data: &'r [f32],
 }
 
 impl BonsaiModel<'_> {
@@ -426,10 +718,12 @@ impl BonsaiModel<'_> {
     /// Returns `Ok(None)` when this path declines the prompt, in which case
     /// **nothing has been written**: no KV-cache entry, no watermark. The
     /// caller must fall back to its sequential path. That happens for a
-    /// prompt below [`CPU_PREFILL_MIN_TOKENS`], a model with no transformer
-    /// blocks, a layer whose projections are not all in one register-blocked
-    /// format (`Q1_0_g128` / `TQ2_0_g128`), or a geometry that does not match
-    /// the config — every decline is decided before the first write.
+    /// prompt below `CPU_PREFILL_MIN_TOKENS` (2), a model with no transformer
+    /// blocks, a model that declares a sliding attention window (M-17: this
+    /// path's attention is full-causal), a layer whose projections are not
+    /// all in one register-blocked format (`Q1_0_g128` / `TQ2_0_g128`), or a
+    /// geometry that does not match the config — every decline is decided
+    /// before the first write.
     ///
     /// # Errors
     ///
@@ -444,12 +738,68 @@ impl BonsaiModel<'_> {
         token_ids: &[u32],
         pos_start: usize,
     ) -> ModelResult<Option<Vec<f32>>> {
+        let h = self.config.hidden_size;
         let total = token_ids.len();
-        if total < CPU_PREFILL_MIN_TOKENS || self.blocks.is_empty() {
+        // perf-M2: only the last position feeds the LM head, and it is the
+        // last row of the final micro-batch.
+        let mut last_row = vec![0.0f32; h];
+        let ran = self.run_prefill_cpu(token_ids, pos_start, |_, rows| {
+            if rows.first + rows.count == total {
+                let start = (rows.count - 1) * h;
+                let src = rows
+                    .data
+                    .get(start..start + h)
+                    .ok_or_else(|| prefill_rows_short(rows.count, h, rows.data.len()))?;
+                last_row.copy_from_slice(src);
+            }
+            Ok(())
+        })?;
+        if !ran {
             return Ok(None);
         }
+        // perf-M2: the output norm and the LM head run exactly once.
+        let mut normed = vec![0.0f32; h];
+        self.output_norm.forward(&last_row, &mut normed)?;
+        let mut logits = vec![0.0f32; self.config.vocab_size];
+        self.apply_lm_head(&normed, &mut logits)?;
+        Ok(Some(logits))
+    }
+
+    /// The batched CPU pass itself: embed, run every block over
+    /// [`CPU_PREFILL_MICRO_BATCH`]-row micro-batches, commit every position's
+    /// keys and values to the host KV cache, and hand each micro-batch's
+    /// post-block rows to `sink` together with this model's `output_norm`.
+    ///
+    /// Shared by [`forward_prefill_cpu`](Self::forward_prefill_cpu) (which
+    /// keeps only the last row, for the LM head) and
+    /// [`forward_hidden`](Self::forward_hidden) (which normalises every row),
+    /// so the two cannot compute different hidden states.
+    ///
+    /// Returns `Ok(false)` — having written nothing — for exactly the
+    /// declines [`forward_prefill_cpu`](Self::forward_prefill_cpu) lists.
+    ///
+    /// # Errors
+    ///
+    /// As [`forward_prefill_cpu`](Self::forward_prefill_cpu), plus whatever
+    /// `sink` returns.
+    pub(super) fn run_prefill_cpu<F>(
+        &mut self,
+        token_ids: &[u32],
+        pos_start: usize,
+        mut sink: F,
+    ) -> ModelResult<bool>
+    where
+        F: FnMut(&RmsNorm, PrefillRows<'_>) -> ModelResult<()>,
+    {
+        let total = token_ids.len();
+        if total < CPU_PREFILL_MIN_TOKENS
+            || self.blocks.is_empty()
+            || self.config.sliding_window.is_some()
+        {
+            return Ok(false);
+        }
         let Some(geom) = self.prefill_geometry() else {
-            return Ok(None);
+            return Ok(false);
         };
         // Decide, before touching any state, whether every layer is in
         // scope. `layer_plan` borrows `self.blocks`, so this probe is run
@@ -459,7 +809,7 @@ impl BonsaiModel<'_> {
             .iter()
             .all(|b| layer_plan(b).is_some_and(|p| p.shapes_match(&geom)))
         {
-            return Ok(None);
+            return Ok(false);
         }
 
         let last_pos = pos_start
@@ -468,20 +818,21 @@ impl BonsaiModel<'_> {
         self.ensure_context_capacity(last_pos)?;
         self.require_host_kv_coherent(pos_start)?;
         if self.kv_cache.max_seq_len() <= last_pos {
-            return Ok(None);
+            return Ok(false);
         }
 
+        let route = GemmRoute::for_this_call();
         let batch = CPU_PREFILL_MICRO_BATCH.min(total);
         let mut scratch = PrefillScratch::new(batch, &geom);
         let h = geom.hidden;
-        let mut last_rows = 0usize;
 
         {
             // Disjoint field borrows: `plans` holds `&self.blocks`, the pass
-            // takes `&mut self.kv_cache` and `&self.rope`.
+            // takes `&mut self.kv_cache` and `&self.rope`, the sink gets
+            // `&self.output_norm`.
             let plans: Vec<LayerPlan<'_>> = self.blocks.iter().filter_map(layer_plan).collect();
             if plans.len() != self.blocks.len() {
-                return Ok(None);
+                return Ok(false);
             }
             let mut offset = 0usize;
             while offset < total {
@@ -502,22 +853,21 @@ impl BonsaiModel<'_> {
                         rows,
                         pos_start: pos_start + offset,
                     },
+                    route,
+                )?;
+                sink(
+                    &self.output_norm,
+                    PrefillRows {
+                        first: offset,
+                        count: rows,
+                        data: &scratch.hidden[..rows * h],
+                    },
                 )?;
                 offset += rows;
-                last_rows = rows;
             }
         }
         self.note_host_kv_written(last_pos);
-
-        // perf-M2: the LM head runs exactly once, on the last position —
-        // which is the last row of the final micro-batch.
-        let start = (last_rows - 1) * h;
-        let mut normed = vec![0.0f32; h];
-        self.output_norm
-            .forward(&scratch.hidden[start..start + h], &mut normed)?;
-        let mut logits = vec![0.0f32; self.config.vocab_size];
-        self.apply_lm_head(&normed, &mut logits)?;
-        Ok(Some(logits))
+        Ok(true)
     }
 
     /// Geometry of this model, or `None` if it is not a shape this path
@@ -559,6 +909,16 @@ impl BonsaiModel<'_> {
     }
 }
 
+/// A sink got fewer floats than its row count says it holds — an internal
+/// invariant violation, reported rather than indexed past.
+fn prefill_rows_short(count: usize, hidden: usize, len: usize) -> ModelError {
+    ModelError::ShapeInvariant {
+        tensor: "batched prefill rows".to_string(),
+        expected: format!("{count} rows x {hidden} floats"),
+        actual: format!("{len} floats"),
+    }
+}
+
 /// Which prompt positions one batched pass covers.
 #[derive(Debug, Clone, Copy)]
 struct PassRange {
@@ -577,6 +937,7 @@ fn prefill_pass(
     geom: &PrefillGeometry,
     scratch: &mut PrefillScratch,
     range: PassRange,
+    route: GemmRoute,
 ) -> ModelResult<()> {
     let m = range.rows;
     let h = geom.hidden;
@@ -594,38 +955,39 @@ fn prefill_pass(
         )?;
 
         // ── Q / K / V projections: one GEMM each over the micro-batch ────
-        plan.attn_q.gemm(
-            &scratch.normed[..m * h],
-            &mut scratch.q_all,
-            m,
-            geom.q_dim,
-            h,
-        )?;
-        plan.attn_k.gemm(
-            &scratch.normed[..m * h],
-            &mut scratch.k_all,
-            m,
-            geom.kv_dim,
-            h,
-        )?;
-        plan.attn_v.gemm(
-            &scratch.normed[..m * h],
-            &mut scratch.v_all,
-            m,
-            geom.kv_dim,
-            h,
-        )?;
-
-        // ── per position: QK-norm, RoPE, KV write, causal attention ──────
         //
-        // Strictly sequential in position order: row `i`'s attention must see
-        // exactly positions `0..=pos_start + i`, so these writes can never be
-        // reordered or parallelised across prompt positions.
+        // The three read the same input and write disjoint buffers, so they
+        // run concurrently: one fork-join instead of three, and their tasks
+        // share the pool (each GEMM's own arithmetic is unchanged).
+        {
+            let normed = &scratch.normed[..m * h];
+            let (q_all, k_all, v_all) =
+                (&mut scratch.q_all, &mut scratch.k_all, &mut scratch.v_all);
+            let (q, (k, v)) = rayon::join(
+                || plan.attn_q.gemm(route, normed, q_all, m, geom.q_dim, h),
+                || {
+                    rayon::join(
+                        || plan.attn_k.gemm(route, normed, k_all, m, geom.kv_dim, h),
+                        || plan.attn_v.gemm(route, normed, v_all, m, geom.kv_dim, h),
+                    )
+                },
+            );
+            q?;
+            k?;
+            v?;
+        }
+
+        // ── per position, in position order: QK-norm, RoPE, KV write ─────
+        //
+        // The writes stay strictly sequential: position `pos_start + i` is
+        // stored before position `pos_start + i + 1`, exactly as the
+        // per-token path stores them. Attention runs afterwards (below).
         for row in 0..m {
             let pos = range.pos_start + row;
             let hd = geom.head_dim;
 
             let q_row = &scratch.q_all[row * geom.q_dim..(row + 1) * geom.q_dim];
+            let q_rope_row = &mut scratch.q_rope[row * geom.q_dim..(row + 1) * geom.q_dim];
             for head in 0..geom.num_heads {
                 let span = head * hd..(head + 1) * hd;
                 oxibonsai_kernels::rms_norm_simd(
@@ -635,11 +997,7 @@ fn prefill_pass(
                     plan.eps,
                 )
                 .map_err(ModelError::Kernel)?;
-                rope.apply(
-                    &scratch.q_normed[span.clone()],
-                    &mut scratch.q_rope[span],
-                    pos,
-                )?;
+                rope.apply(&scratch.q_normed[span.clone()], &mut q_rope_row[span], pos)?;
             }
 
             let k_row = &scratch.k_all[row * geom.kv_dim..(row + 1) * geom.kv_dim];
@@ -670,19 +1028,21 @@ fn prefill_pass(
             if kv_cache.seq_len() <= pos {
                 kv_cache.set_seq_len(pos + 1);
             }
-
-            gqa_attention_row(
-                &scratch.q_rope,
-                &mut scratch.attn_out[row * geom.q_dim..(row + 1) * geom.q_dim],
-                kv_cache,
-                layer_idx,
-                geom,
-                pos + 1,
-            )?;
         }
+
+        // ── causal GQA attention, every row of the micro-batch in parallel ─
+        attend_rows(
+            &scratch.q_rope[..m * geom.q_dim],
+            &mut scratch.attn_out[..m * geom.q_dim],
+            kv_cache,
+            layer_idx,
+            geom,
+            range.pos_start,
+        )?;
 
         // ── attention output projection + residual ───────────────────────
         plan.attn_output.gemm(
+            route,
             &scratch.attn_out[..m * geom.q_dim],
             &mut scratch.proj,
             m,
@@ -700,10 +1060,17 @@ fn prefill_pass(
             plan.ffn_norm_w,
             plan.eps,
         )?;
-        plan.ffn_gate
-            .gemm(&scratch.normed[..m * h], &mut scratch.gate, m, inter, h)?;
-        plan.ffn_up
-            .gemm(&scratch.normed[..m * h], &mut scratch.up, m, inter, h)?;
+        // Gate and up share their input too: one fork-join for both.
+        {
+            let normed = &scratch.normed[..m * h];
+            let (gate, up) = (&mut scratch.gate, &mut scratch.up);
+            let (g, u) = rayon::join(
+                || plan.ffn_gate.gemm(route, normed, gate, m, inter, h),
+                || plan.ffn_up.gemm(route, normed, up, m, inter, h),
+            );
+            g?;
+            u?;
+        }
         for row in 0..m {
             let span = row * inter..(row + 1) * inter;
             try_swiglu(
@@ -712,8 +1079,14 @@ fn prefill_pass(
                 &mut scratch.swiglu[span],
             )?;
         }
-        plan.ffn_down
-            .gemm(&scratch.swiglu[..m * inter], &mut scratch.proj, m, h, inter)?;
+        plan.ffn_down.gemm(
+            route,
+            &scratch.swiglu[..m * inter],
+            &mut scratch.proj,
+            m,
+            h,
+            inter,
+        )?;
         add_into(&mut scratch.hidden, &scratch.proj, m * h);
     }
     Ok(())
@@ -744,784 +1117,68 @@ fn add_into(dst: &mut [f32], src: &[f32], len: usize) {
     }
 }
 
-/// Causal grouped-query attention for one position, parallel over KV heads.
+/// Causal grouped-query attention of every row of one micro-batch, in
+/// parallel over rows.
 ///
-/// The very function the per-block decode path runs
-/// ([`crate::block::functions::gqa_attention`], shared since B2-11-FIX), so
-/// the batched prefill and the sequential decode read the cache — `f32` or
-/// `f16` — through one body and cannot drift.
-fn gqa_attention_row(
+/// Row `r` (absolute position `pos_start + r`) attends over exactly
+/// positions `0..=pos_start + r`: it calls the very function the per-block
+/// decode path runs ([`crate::block::functions::gqa_attention`]) with
+/// `seq_len = pos_start + r + 1`, and [`KvCache::attend_group`] reads exactly
+/// the first `seq_len` stored positions — never the cursor, never past
+/// `seq_len`. So running the rows concurrently, after the whole micro-batch
+/// has been stored, gives every row the bits it would get one at a time: the
+/// later rows' keys and values are in the cache but outside every earlier
+/// row's window. The batched prefill and the sequential decode therefore
+/// still read the cache — `f32` or `f16` — through one body and cannot
+/// drift. The cache's allocation cannot change between the stores and these
+/// reads: every position of the call was made resident up front
+/// (`ensure_context_capacity(last_pos)`).
+///
+/// With fewer rows than worker threads, each row's KV heads also run in
+/// parallel (the per-token path's own setting); with more, whole rows are
+/// the unit of work. Either way the per-head arithmetic is identical.
+fn attend_rows(
     q_rope: &[f32],
     attn_out: &mut [f32],
     kv_cache: &KvCache,
     layer_idx: usize,
     geom: &PrefillGeometry,
-    seq_len: usize,
+    pos_start: usize,
 ) -> ModelResult<()> {
-    crate::block::functions::gqa_attention(
-        q_rope,
-        attn_out,
-        kv_cache,
-        layer_idx,
-        geom.num_heads,
-        geom.heads_per_group,
-        geom.head_dim,
-        seq_len,
-        true,
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::model::types::OutputWeight;
-    use oxibonsai_core::config::{Qwen3Config, RopeScaling};
-    use oxibonsai_kernels::{KernelDispatcher, KernelTier};
-
-    /// Small config satisfying the `Q1_0_g128` fixture's constraints
-    /// (`hidden % 128 == 0`, `intermediate % 128 == 0`), with genuine GQA
-    /// (4 query heads over 2 KV heads) so the head mapping is exercised.
-    fn tiny_config(num_layers: usize) -> Qwen3Config {
-        Qwen3Config {
-            hidden_size: 128,
-            intermediate_size: 256,
-            num_layers,
-            num_attention_heads: 4,
-            num_kv_heads: 2,
-            head_dim: 32,
-            value_length: 32,
-            vocab_size: 96,
-            max_context_length: 512,
-            rms_norm_eps: 1e-6,
-            rope_freq_base: 10_000.0,
-            rope_scaling: RopeScaling::None,
-            // FIX3-MODEL added this field (M-17). `forward_prefill_cpu` is
-            // full-causal by construction and `forward_prefill_unchunked`
-            // declines to call it for a windowed model, so the batched path
-            // under test here is only reachable with `None`.
-            sliding_window: None,
-            architecture: "test".to_string(),
-            model_name: "prefill-cpu-test".to_string(),
-        }
-    }
-
-    /// Deterministic dense FP32 LM head.
-    ///
-    /// `new_for_testing_with_blocks` installs `OutputWeight::zero_fp32`,
-    /// whose weight vector is **empty**, so its logits carry no information
-    /// and could not distinguish a correct prefill from a broken one. Every
-    /// test below swaps in this real head first.
-    fn dense_lm_head(out_features: usize, in_features: usize) -> OutputWeight<'static> {
-        let weights = (0..out_features * in_features)
-            .map(|i| ((i % 17) as f32 - 8.0) * 0.01)
-            .collect();
-        OutputWeight::Fp32 {
-            weights,
-            out_features,
-            in_features,
-        }
-    }
-
-    fn fixture(cfg: Qwen3Config) -> BonsaiModel<'static> {
-        let vocab = cfg.vocab_size;
-        let hidden = cfg.hidden_size;
-        let mut model = BonsaiModel::new_for_testing_with_blocks(cfg);
-        model.output_weight = dense_lm_head(vocab, hidden);
-        model
-    }
-
-    /// Deterministic `TQ2_0_g128` blocks for the ternary test fixture below.
-    ///
-    /// Mirrors `BonsaiModel::new_for_testing_with_blocks`'s own
-    /// `make_blocks_static` helper for `Q1_0_g128` -- that helper is a
-    /// closure private to `new_for_testing_with_blocks`'s body, not
-    /// reusable here, so this is its ternary twin. A `0b11` 2-bit code the
-    /// pattern happens to produce decodes to `0` (the K-01 reserved-code
-    /// contract every ternary kernel shares), which is a perfectly valid
-    /// ternary weight -- this fixture only needs deterministic,
-    /// differentiated data, not "realistic" weights.
-    fn ternary_blocks_static(n: usize, scale: f32, pattern: u8) -> &'static [BlockTQ2_0_g128] {
-        let v: Vec<BlockTQ2_0_g128> = (0..n)
-            .map(|i| {
-                let mut qs = [0u8; 32];
-                for (j, b) in qs.iter_mut().enumerate() {
-                    *b = pattern.wrapping_add(((i * 32 + j) & 0xff) as u8);
-                }
-                BlockTQ2_0_g128 {
-                    qs,
-                    d: half::f16::from_f32(scale),
-                }
-            })
-            .collect();
-        // Leak the allocation so the slice lives for 'static, same as the
-        // Q1_0_g128 fixture does -- acceptable in tests.
-        Box::leak(v.into_boxed_slice())
-    }
-
-    /// The ternary (`TQ2_0_g128`) twin of [`fixture`].
-    ///
-    /// `fixture` builds every projection as `LinearLayer::OneBit`
-    /// (`Q1_0_g128`), so `PrefillMatrix::Ternary` and the ternary half of
-    /// `layer_plan` (this module's *other* branch) are never exercised by
-    /// any test that only calls `fixture` -- and ternary is the format this
-    /// project is named for and the one `LinearTernary::forward_batch`
-    /// actually uses in production (TEST-COVERAGE GAP, PERF-CPU-PREFILL
-    /// verifier pass).
-    ///
-    /// Reuses `new_for_testing_with_blocks` for everything that does not
-    /// depend on the projection format -- embedding, KV cache, RoPE,
-    /// output norm -- then replaces `blocks` with freshly built
-    /// all-`LinearTernary` ones. `BonsaiModel::blocks` is `pub(crate)`, and
-    /// every other field this function touches is a plain private field
-    /// `mod.rs` declares on `BonsaiModel`: `prefill_cpu` is a *child*
-    /// module of `model::types` (`mod.rs`), so those private fields are
-    /// visible from here exactly as they are from `mod.rs` itself -- no new
-    /// visibility was widened to write this fixture.
-    fn ternary_fixture(cfg: Qwen3Config) -> BonsaiModel<'static> {
-        use crate::layers::linear::{LinearLayer, LinearTernary};
-        use crate::layers::rms_norm::RmsNorm;
-        use std::sync::Arc;
-
-        let h = cfg.hidden_size;
-        let hd = cfg.head_dim;
-        let nq = cfg.num_attention_heads;
-        let nkv = cfg.num_kv_heads;
-        let inter = cfg.intermediate_size;
-        assert!(
-            h.is_multiple_of(128),
-            "ternary test fixture requires hidden_size to be a multiple of 128"
-        );
-        assert!(
-            inter.is_multiple_of(128),
-            "ternary test fixture requires intermediate_size to be a multiple of 128"
-        );
-        let h_bpr = h / 128;
-        let inter_bpr = inter / 128;
-
-        // Same Reference-tier pin as `new_for_testing_with_blocks`, for the
-        // same reason: populate the CPU `KvCache` deterministically instead
-        // of routing through whatever GPU tier this host would auto-detect.
-        let kernel_arc = Arc::new(KernelDispatcher::with_tier(KernelTier::Reference));
-
-        let mut blocks = Vec::with_capacity(cfg.num_layers);
-        for layer_idx in 0..cfg.num_layers {
-            let q_blk = ternary_blocks_static(nq * hd * h_bpr, 0.01, 0xA5);
-            let k_blk = ternary_blocks_static(nkv * hd * h_bpr, 0.01, 0x5A);
-            let v_blk = ternary_blocks_static(nkv * hd * h_bpr, 0.01, 0x33);
-            let o_blk = ternary_blocks_static(h * (nq * hd / 128).max(1), 0.01, 0xCC);
-            let g_blk = ternary_blocks_static(inter * h_bpr, 0.01, 0x77);
-            let u_blk = ternary_blocks_static(inter * h_bpr, 0.01, 0x88);
-            let d_blk = ternary_blocks_static(h * inter_bpr, 0.01, 0x99);
-
-            let attn_q: LinearLayer<'static> =
-                LinearTernary::new(q_blk, nq * hd, h, kernel_arc.clone())
-                    .expect("q proj")
-                    .into();
-            let attn_k: LinearLayer<'static> =
-                LinearTernary::new(k_blk, nkv * hd, h, kernel_arc.clone())
-                    .expect("k proj")
-                    .into();
-            let attn_v: LinearLayer<'static> =
-                LinearTernary::new(v_blk, nkv * hd, h, kernel_arc.clone())
-                    .expect("v proj")
-                    .into();
-            let attn_out: LinearLayer<'static> =
-                LinearTernary::new(o_blk, h, nq * hd, kernel_arc.clone())
-                    .expect("o proj")
-                    .into();
-            let ffn_gate: LinearLayer<'static> =
-                LinearTernary::new(g_blk, inter, h, kernel_arc.clone())
-                    .expect("gate proj")
-                    .into();
-            let ffn_up: LinearLayer<'static> =
-                LinearTernary::new(u_blk, inter, h, kernel_arc.clone())
-                    .expect("up proj")
-                    .into();
-            let ffn_down: LinearLayer<'static> =
-                LinearTernary::new(d_blk, h, inter, kernel_arc.clone())
-                    .expect("down proj")
-                    .into();
-
-            let block = TransformerBlock::new(
+    let q_dim = geom.q_dim;
+    // `prefill_geometry` never yields a zero head width; checked anyway so a
+    // zero can never reach `par_chunks_mut`.
+    let rows = q_rope
+        .len()
+        .checked_div(q_dim)
+        .ok_or_else(|| ModelError::ShapeInvariant {
+            tensor: format!("layer {layer_idx}: batched attention"),
+            expected: "q_dim >= 1".to_string(),
+            actual: "q_dim = 0".to_string(),
+        })?;
+    let heads_parallel = rows < rayon::current_num_threads();
+    attn_out
+        .par_chunks_mut(q_dim)
+        .zip(q_rope.par_chunks(q_dim))
+        .enumerate()
+        .try_for_each(|(row, (out_row, q_row))| {
+            crate::block::functions::gqa_attention(
+                q_row,
+                out_row,
+                kv_cache,
                 layer_idx,
-                RmsNorm::new(vec![1.0; h], cfg.rms_norm_eps),
-                attn_q,
-                attn_k,
-                attn_v,
-                attn_out,
-                RmsNorm::new(vec![1.0; hd], cfg.rms_norm_eps),
-                RmsNorm::new(vec![1.0; hd], cfg.rms_norm_eps),
-                RmsNorm::new(vec![1.0; h], cfg.rms_norm_eps),
-                ffn_gate,
-                ffn_up,
-                ffn_down,
-                nq,
-                nkv,
-                hd,
-                h,
-            );
-            blocks.push(block);
-        }
-
-        let vocab = cfg.vocab_size;
-        let hidden = cfg.hidden_size;
-        let mut model = BonsaiModel::new_for_testing_with_blocks(cfg);
-        model.blocks = blocks;
-        model.dominant_quant_type = oxibonsai_core::GgufTensorType::TQ2_0_g128;
-        model.output_weight = dense_lm_head(vocab, hidden);
-        model
-    }
-
-    fn cosine(a: &[f32], b: &[f32]) -> f64 {
-        let mut dot = 0.0f64;
-        let mut na = 0.0f64;
-        let mut nb = 0.0f64;
-        for (x, y) in a.iter().zip(b.iter()) {
-            dot += f64::from(*x) * f64::from(*y);
-            na += f64::from(*x) * f64::from(*x);
-            nb += f64::from(*y) * f64::from(*y);
-        }
-        if na == 0.0 || nb == 0.0 {
-            return 0.0;
-        }
-        dot / (na.sqrt() * nb.sqrt())
-    }
-
-    /// Run the sequential per-token reference over `prompt` on a model
-    /// `build` constructs, returning the last position's logits.
-    fn sequential_logits_with(
-        cfg: &Qwen3Config,
-        prompt: &[u32],
-        build: impl Fn(Qwen3Config) -> BonsaiModel<'static>,
-    ) -> Vec<f32> {
-        let kernel = KernelDispatcher::with_tier(KernelTier::Reference);
-        let mut model = build(cfg.clone());
-        let mut logits = Vec::new();
-        for (i, &tok) in prompt.iter().enumerate() {
-            logits = model
-                .forward(tok, i, &kernel)
-                .expect("sequential forward should succeed");
-        }
-        logits
-    }
-
-    /// [`sequential_logits_with`] against the `Q1_0_g128` [`fixture`] —
-    /// every existing caller's reference before ternary coverage was added.
-    fn sequential_logits(cfg: &Qwen3Config, prompt: &[u32]) -> Vec<f32> {
-        sequential_logits_with(cfg, prompt, fixture)
-    }
-
-    /// perf-M2's acceptance: the batched CPU prefill reproduces the
-    /// sequential per-token reference on the last position.
-    #[test]
-    fn batched_prefill_matches_the_sequential_reference() {
-        let cfg = tiny_config(2);
-        let prompt: Vec<u32> = (0..12u32).map(|i| (i * 5) % 96).collect();
-        let expected = sequential_logits(&cfg, &prompt);
-
-        let mut batched = fixture(cfg);
-        let logits = batched
-            .forward_prefill_cpu(&prompt, 0)
-            .expect("batched prefill should succeed")
-            .expect("the 1-bit fixture is in scope for the batched path");
-
-        assert_eq!(logits.len(), expected.len());
-        let cos = cosine(&logits, &expected);
-        assert!(
-            cos >= 0.9999,
-            "batched prefill diverged from the sequential reference: cos={cos}"
-        );
-        // Cosine alone would tolerate a single badly wrong logit, so bound
-        // every element as well.
-        let (rel, idx) = max_scaled_diff(&logits, &expected);
-        assert!(
-            rel <= 1e-4,
-            "logit {idx} diverged by {rel} (ref={}, got={})",
-            expected[idx],
-            logits[idx]
-        );
-    }
-
-    /// The ternary (`TQ2_0_g128`) twin of
-    /// `batched_prefill_matches_the_sequential_reference` (TEST-COVERAGE
-    /// GAP, PERF-CPU-PREFILL verifier pass): same acceptance, same
-    /// tolerances, [`ternary_fixture`] in place of [`fixture`], so
-    /// `PrefillMatrix::Ternary` and `layer_plan`'s ternary branch actually
-    /// run under test. The tolerance is a cosine/scaled-diff bound rather
-    /// than bit-exact equality for the same reason as every other test in
-    /// this module (spec item 1's CAUTION): the register-blocked GEMM
-    /// changes the per-row FMA accumulation order relative to the
-    /// sequential GEMV reference this compares against.
-    #[test]
-    fn batched_prefill_matches_the_sequential_reference_ternary() {
-        let cfg = tiny_config(2);
-        let prompt: Vec<u32> = (0..12u32).map(|i| (i * 5) % 96).collect();
-        let expected = sequential_logits_with(&cfg, &prompt, ternary_fixture);
-
-        let mut batched = ternary_fixture(cfg);
-        let logits = batched
-            .forward_prefill_cpu(&prompt, 0)
-            .expect("batched prefill should succeed")
-            .expect("the ternary fixture is in scope for the batched path");
-
-        assert_eq!(logits.len(), expected.len());
-        let cos = cosine(&logits, &expected);
-        assert!(
-            cos >= 0.9999,
-            "ternary batched prefill diverged from the sequential reference: cos={cos}"
-        );
-        let (rel, idx) = max_scaled_diff(&logits, &expected);
-        assert!(
-            rel <= 1e-4,
-            "ternary logit {idx} diverged by {rel} (ref={}, got={})",
-            expected[idx],
-            logits[idx]
-        );
-    }
-
-    /// The KV cache a batched pass leaves behind must let decoding continue
-    /// exactly as the sequential path would — this is what proves the
-    /// per-position KV writes stayed ordered and causal.
-    #[test]
-    fn batched_prefill_leaves_a_usable_kv_cache() {
-        let cfg = tiny_config(2);
-        let kernel = KernelDispatcher::with_tier(KernelTier::Reference);
-        let prompt: Vec<u32> = (0..9u32).map(|i| (i * 7 + 1) % 96).collect();
-        let next_token = 13u32;
-
-        let mut reference = fixture(cfg.clone());
-        for (i, &tok) in prompt.iter().enumerate() {
-            reference
-                .forward(tok, i, &kernel)
-                .expect("sequential forward should succeed");
-        }
-        let seq_next = reference
-            .forward(next_token, prompt.len(), &kernel)
-            .expect("sequential decode step should succeed");
-
-        let mut batched = fixture(cfg);
-        batched
-            .forward_prefill_cpu(&prompt, 0)
-            .expect("batched prefill should succeed")
-            .expect("fixture is in scope");
-        let batched_next = batched
-            .forward(next_token, prompt.len(), &kernel)
-            .expect("decode after batched prefill should succeed");
-
-        let cos = cosine(&batched_next, &seq_next);
-        assert!(
-            cos >= 0.9999,
-            "decode after batched prefill diverged: cos={cos}"
-        );
-        assert_eq!(
-            batched.kv_cache().seq_len(),
-            prompt.len() + 1,
-            "the KV cursor must cover every prefilled position plus the decode step"
-        );
-    }
-
-    /// Largest element-wise difference between two vectors, expressed as a
-    /// fraction of the **vector's own** largest magnitude.
-    ///
-    /// Scaling by the vector rather than by each element is what makes this
-    /// usable as a hard bound: an element that happens to be `-3.7e-9` where
-    /// its neighbours are `O(1)` carries no information, and a per-element
-    /// relative ratio would report a 0.4 % "divergence" for the difference
-    /// between `-3.7e-9` and `0`. Per-vector scaling asks the question that
-    /// matters — is any element off by a meaningful fraction of the signal?
-    fn max_scaled_diff(a: &[f32], b: &[f32]) -> (f32, usize) {
-        let scale = a
-            .iter()
-            .chain(b.iter())
-            .fold(0.0f32, |m, v| m.max(v.abs()))
-            .max(f32::MIN_POSITIVE);
-        let mut worst = 0.0f32;
-        let mut at = 0usize;
-        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
-            let rel = (x - y).abs() / scale;
-            if rel > worst {
-                worst = rel;
-                at = i;
-            }
-        }
-        (worst, at)
-    }
-
-    /// Every prefilled position's keys and values must match the sequential
-    /// path's, for every layer, every KV head and **every element** — not
-    /// just in aggregate.
-    ///
-    /// Checked element by element rather than by a cosine over the whole
-    /// flattened `[seq_len x head_dim]` buffer: that aggregate is dominated
-    /// by the correct majority, so one wrong position (or a permutation of
-    /// positions) would still clear 0.9999. This is the check that actually
-    /// constrains the three pieces of logic this module re-derives instead
-    /// of calling — the per-head QK-norm + RoPE ordering, the
-    /// `advance_kv_cache_to` cursor rule, and `compute_gqa_attention`.
-    ///
-    /// The bound is a tight scaled one rather than exact equality because
-    /// the two paths legitimately run different SIMD tiers: the fixture's
-    /// `LinearLayer`s carry a `KernelTier::Reference` dispatcher, while
-    /// [`prefill_dispatcher`] pins the best CPU tier (NEON here), whose
-    /// per-block reduction order differs by design.
-    #[test]
-    fn batched_prefill_kv_cache_matches_position_by_position() {
-        let cfg = tiny_config(2);
-        let kernel = KernelDispatcher::with_tier(KernelTier::Reference);
-        let prompt: Vec<u32> = (0..10u32).map(|i| (i * 11 + 3) % 96).collect();
-
-        let mut reference = fixture(cfg.clone());
-        for (i, &tok) in prompt.iter().enumerate() {
-            reference
-                .forward(tok, i, &kernel)
-                .expect("sequential forward should succeed");
-        }
-
-        let mut batched = fixture(cfg.clone());
-        batched
-            .forward_prefill_cpu(&prompt, 0)
-            .expect("batched prefill should succeed")
-            .expect("fixture is in scope");
-
-        let seq_len = prompt.len();
-        let hd = cfg.head_dim;
-        for layer in 0..cfg.num_layers {
-            for head in 0..cfg.num_kv_heads {
-                let ref_k = reference.kv_cache().keys_for(layer, head, seq_len);
-                let got_k = batched.kv_cache().keys_for(layer, head, seq_len);
-                let ref_v = reference.kv_cache().values_for(layer, head, seq_len);
-                let got_v = batched.kv_cache().values_for(layer, head, seq_len);
-                assert_eq!(ref_k.len(), got_k.len(), "key buffer length");
-                assert_eq!(ref_v.len(), got_v.len(), "value buffer length");
-                for pos in 0..seq_len {
-                    let span = pos * hd..(pos + 1) * hd;
-                    let (rk, ik) = max_scaled_diff(&ref_k[span.clone()], &got_k[span.clone()]);
-                    assert!(
-                        rk <= 1e-4,
-                        "layer {layer} head {head} pos {pos} key element {ik}                          diverged by {rk} (ref={}, got={})",
-                        ref_k[span.start + ik],
-                        got_k[span.start + ik]
-                    );
-                    let (rv, iv) = max_scaled_diff(&ref_v[span.clone()], &got_v[span.clone()]);
-                    assert!(
-                        rv <= 1e-4,
-                        "layer {layer} head {head} pos {pos} value element {iv}                          diverged by {rv} (ref={}, got={})",
-                        ref_v[span.start + iv],
-                        got_v[span.start + iv]
-                    );
-                }
-            }
-        }
-    }
-
-    /// A prompt longer than one micro-batch must give the same answer as a
-    /// single-pass one: the pass boundary is invisible, and the register
-    /// block's `m % MR` tail is exercised.
-    #[test]
-    fn micro_batch_boundary_is_invisible() {
-        let cfg = tiny_config(1);
-        let prompt: Vec<u32> = (0..CPU_PREFILL_MICRO_BATCH as u32 + 5)
-            .map(|i| (i * 3) % 96)
-            .collect();
-        let expected = sequential_logits(&cfg, &prompt);
-
-        let mut batched = fixture(cfg);
-        let logits = batched
-            .forward_prefill_cpu(&prompt, 0)
-            .expect("batched prefill should succeed")
-            .expect("fixture is in scope");
-        let cos = cosine(&logits, &expected);
-        assert!(
-            cos >= 0.9999,
-            "multi-pass batched prefill diverged: cos={cos}"
-        );
-    }
-
-    /// Prefilling from a non-zero `pos_start` continues an existing sequence
-    /// rather than restarting it.
-    #[test]
-    fn batched_prefill_continues_from_a_non_zero_position() {
-        let cfg = tiny_config(2);
-        let kernel = KernelDispatcher::with_tier(KernelTier::Reference);
-        let head: Vec<u32> = vec![5, 9, 17];
-        let tail: Vec<u32> = vec![23, 31, 42, 55];
-
-        let mut reference = fixture(cfg.clone());
-        let mut expected = Vec::new();
-        for (i, &tok) in head.iter().chain(tail.iter()).enumerate() {
-            expected = reference
-                .forward(tok, i, &kernel)
-                .expect("sequential forward should succeed");
-        }
-
-        let mut batched = fixture(cfg);
-        for (i, &tok) in head.iter().enumerate() {
-            batched
-                .forward(tok, i, &kernel)
-                .expect("warm-up forward should succeed");
-        }
-        let logits = batched
-            .forward_prefill_cpu(&tail, head.len())
-            .expect("batched prefill should succeed")
-            .expect("fixture is in scope");
-        let cos = cosine(&logits, &expected);
-        assert!(
-            cos >= 0.9999,
-            "batched prefill from pos_start={} diverged: cos={cos}",
-            head.len()
-        );
-    }
-
-    /// A one-token prompt is the decode path; the batched path declines it
-    /// without writing anything.
-    #[test]
-    fn single_token_prompt_is_declined_without_writing() {
-        let mut model = fixture(tiny_config(1));
-        let before = model.kv_cache().seq_len();
-        assert!(
-            model
-                .forward_prefill_cpu(&[3], 0)
-                .expect("declining is not an error")
-                .is_none(),
-            "a single-token prompt must be declined"
-        );
-        assert_eq!(model.kv_cache().seq_len(), before, "nothing may be written");
-    }
-
-    /// A model with no transformer blocks (the config-only constructor) is
-    /// declined rather than producing garbage.
-    #[test]
-    fn blockless_model_is_declined() {
-        let mut model = BonsaiModel::new(tiny_config(2));
-        assert!(
-            model
-                .forward_prefill_cpu(&[1, 2, 3], 0)
-                .expect("declining is not an error")
-                .is_none(),
-            "a model without blocks must be declined"
-        );
-    }
-
-    /// The derived-shape helper rejects a block count that does not divide
-    /// cleanly, instead of mis-indexing the weights.
-    #[test]
-    fn out_features_rejects_inconsistent_block_counts() {
-        let blocks = vec![
-            BlockQ1_0G128 {
-                d: half::f16::ONE,
-                qs: [0; 16],
-            };
-            5
-        ];
-        let matrix = PrefillMatrix::OneBit(&blocks);
-        assert_eq!(
-            matrix.out_features(256),
-            None,
-            "5 blocks is not a multiple of 2 blocks per row"
-        );
-        assert_eq!(matrix.out_features(0), None, "zero in_features");
-        assert_eq!(matrix.out_features(100), None, "not block aligned");
-        assert_eq!(matrix.out_features(128), Some(5));
-    }
-
-    /// How many times each leg of
-    /// [`real_model_cpu_prefill_outruns_the_sequential_prefill`] is timed.
-    ///
-    /// The gating comparison is the **minimum** of these, not the mean:
-    /// a minimum is the closest a wall-clock sample gets to the machine's
-    /// own floor, and it is the statistic that survives the contention this
-    /// module's MEASUREMENTS table showed moves the sequential leg by 46 %
-    /// while leaving the batched leg within 0.5 %.
-    const PERF_TIMED_RUNS: usize = 3;
-
-    /// Best-effort 1/5/15-minute load average, for the measurement record.
-    ///
-    /// Read through `uptime` rather than a crate: this is test-only
-    /// reporting, the workspace has no load-average dependency, and adding
-    /// one for a printed diagnostic would be a real dependency for a string.
-    /// Anything that goes wrong yields `"unavailable"` — the measurement is
-    /// still valid, it just carries no load annotation.
-    fn load_average() -> String {
-        match std::process::Command::new("uptime").output() {
-            Ok(out) if out.status.success() => {
-                let text = String::from_utf8_lossy(&out.stdout);
-                match text.split_once("load average") {
-                    Some((_, tail)) => tail.trim_start_matches([':', 's', ' ']).trim().to_string(),
-                    None => text.trim().to_string(),
-                }
-            }
-            _ => "unavailable".to_string(),
-        }
-    }
-
-    /// perf-M2 on the real shipped model: the batched CPU prefill must
-    /// reproduce the sequential per-token reference (cos >= 0.9999) and be
-    /// **at least as fast** as it on the same machine.
-    ///
-    /// # What this asserts, and what it only records (decision D-5)
-    ///
-    /// The original spec asked for an absolute `< 60 ms/prompt-token`. That
-    /// number was the verifier's 183 ms/token sequential baseline divided by
-    /// three, and neither leg of that derivation is reproducible on this
-    /// hardware: the unchanged sequential code measures 268.6–392.4 ms/token
-    /// here, and the batched path measures 82.3–82.7 ms/token across a 5x
-    /// load-average swing (see the module doc's MEASUREMENTS table — three
-    /// independent points). Orchestrator decision **D-5** therefore rules
-    /// that the absolute figure is *recorded*, not asserted, and that the
-    /// gating invariant is the **relative** one: batched prefill throughput
-    /// at least equal to the sequential per-token prefill throughput,
-    /// measured in-process, as the minimum of [`PERF_TIMED_RUNS`] runs of
-    /// each leg. A ratio is
-    /// dimensionless, so it is the one thing a contended machine cannot
-    /// fake; an absolute millisecond count is not.
-    ///
-    /// The `speedup >= 1.5` floor below is deliberately kept from the
-    /// pre-D-5 version of this test even though D-5's letter only requires
-    /// `>= 1.0`: 1.5x was never the red leg (every measurement taken is
-    /// 3.26x–4.74x), so keeping it preserves a guarantee rather than
-    /// weakening one.
-    ///
-    /// Ignored by default (it needs a multi-hundred-MB model file and a real
-    /// CPU); the absolute numbers it prints are the record D-5 asks for.
-    ///
-    /// Calls [`BonsaiModel::forward_prefill_cpu`] **directly** rather than
-    /// through [`BonsaiModel::forward_prefill`]: under `--all-features` the
-    /// Metal feature is on, and `forward_prefill` would take the fused GPU
-    /// path first, timing the GPU instead of the CPU path this package
-    /// changed. The sequential reference uses the same pinned CPU tier
-    /// ([`oxibonsai_kernels::cpu_kernel_tier`]) that [`prefill_dispatcher`]
-    /// pins, so the comparison is CPU-tier-for-CPU-tier: the old
-    /// loop-of-GEMVs shape against the new register-blocked batch, which is
-    /// the axis perf-M2 is about.
-    ///
-    /// Run with:
-    /// ```text
-    /// OXI_MODEL=/path/to/Ternary-Bonsai-1.7B.gguf \
-    ///   cargo test -p oxibonsai-model --release --all-features --lib \
-    ///   prefill_cpu::tests::real_model_cpu_prefill_outruns_the_sequential_prefill \
-    ///   -- --ignored --nocapture
-    /// ```
-    #[test]
-    #[ignore = "requires OXI_MODEL real ternary/1-bit GGUF; run on dev Mac"]
-    fn real_model_cpu_prefill_outruns_the_sequential_prefill() {
-        use oxibonsai_core::gguf::reader::GgufFile;
-        use std::time::{Duration, Instant};
-
-        let Some(path) = std::env::var_os("OXI_MODEL") else {
-            eprintln!(
-                "real_model_cpu_prefill_outruns_the_sequential_prefill: OXI_MODEL not set — \
-                 skipping. Set OXI_MODEL=/path/to/Ternary-Bonsai-1.7B.gguf to run."
-            );
-            return;
-        };
-        let bytes = std::fs::read(&path).expect("read OXI_MODEL gguf");
-        let gguf = GgufFile::parse(&bytes).expect("GgufFile::parse OXI_MODEL");
-
-        const MAX_SEQ: usize = 4096;
-        const PROMPT_LEN: usize = 280; // same order as the verifier's 277-token run
-
-        // Two independent models from the same bytes: one for the batched
-        // CPU path, one for the sequential reference, so neither run's KV
-        // cache or timing is polluted by the other.
-        let mut cpu_model =
-            BonsaiModel::from_gguf(&gguf, MAX_SEQ).expect("BonsaiModel::from_gguf (cpu)");
-        let mut seq_model =
-            BonsaiModel::from_gguf(&gguf, MAX_SEQ).expect("BonsaiModel::from_gguf (sequential)");
-
-        let vocab = cpu_model.config().vocab_size as u32;
-        assert!(vocab > 1, "real model must have a non-trivial vocabulary");
-        let prompt: Vec<u32> = (0..PROMPT_LEN as u32)
-            .map(|i| 1 + (i * 97) % (vocab - 1))
-            .collect();
-
-        let load_before = load_average();
-
-        // Leg 1: the batched CPU prefill, `PERF_TIMED_RUNS` times, each from
-        // a cleared KV cache so every run does the identical work.
-        let mut cpu_runs: Vec<Duration> = Vec::with_capacity(PERF_TIMED_RUNS);
-        let mut cpu_logits = Vec::new();
-        for _ in 0..PERF_TIMED_RUNS {
-            cpu_model.reset();
-            let t = Instant::now();
-            cpu_logits = cpu_model
-                .forward_prefill_cpu(&prompt, 0)
-                .expect("batched CPU prefill should succeed on the real model")
-                .expect(
-                    "the real model's projections should be a register-blocked format \
-                     (Q1_0_g128 or TQ2_0_g128)",
-                );
-            cpu_runs.push(t.elapsed());
-        }
-        let cpu_best = cpu_runs.iter().copied().min().unwrap_or(Duration::MAX);
-
-        // Leg 2: the sequential per-token reference on the same CPU tier.
-        let kernel = KernelDispatcher::with_tier(oxibonsai_kernels::cpu_kernel_tier());
-        let mut seq_runs: Vec<Duration> = Vec::with_capacity(PERF_TIMED_RUNS);
-        let mut seq_logits = Vec::new();
-        for _ in 0..PERF_TIMED_RUNS {
-            seq_model.reset();
-            let t = Instant::now();
-            for (i, &tok) in prompt.iter().enumerate() {
-                seq_logits = seq_model
-                    .forward(tok, i, &kernel)
-                    .expect("sequential forward should succeed on the real model");
-            }
-            seq_runs.push(t.elapsed());
-        }
-        let seq_best = seq_runs.iter().copied().min().unwrap_or(Duration::MAX);
-
-        let load_after = load_average();
-        let cos = cosine(&cpu_logits, &seq_logits);
-        let ms_per_token = cpu_best.as_secs_f64() * 1e3 / PROMPT_LEN as f64;
-        let seq_ms_per_token = seq_best.as_secs_f64() * 1e3 / PROMPT_LEN as f64;
-        let speedup = seq_best.as_secs_f64() / cpu_best.as_secs_f64().max(f64::MIN_POSITIVE);
-
-        // Every individual run, not just the minimum: the first pass over a
-        // multi-hundred-MB weight file pays the page-fault and first-touch
-        // cost of the whole matrix, which is exactly the difference between
-        // this package's earlier single-run numbers and the warm figure.
-        let per_run = |runs: &[Duration]| -> String {
-            runs.iter()
-                .map(|d| format!("{:.3}", d.as_secs_f64() * 1e3 / PROMPT_LEN as f64))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        eprintln!(
-            "real_model_cpu_prefill_outruns_the_sequential_prefill: model={path:?} \
-             prompt_len={PROMPT_LEN} runs={PERF_TIMED_RUNS} (min of each leg)\n\
-             \x20 batched CPU prefill : {:>9.2} ms total, {:>7.3} ms/prompt-token (min)\n\
-             \x20   per run           : [{}] ms/prompt-token\n\
-             \x20 sequential reference: {:>9.2} ms total, {:>7.3} ms/prompt-token (min)\n\
-             \x20   per run           : [{}] ms/prompt-token\n\
-             \x20 speedup             : {speedup:.2}x\n\
-             \x20 cos(batched, sequential) = {cos}\n\
-             \x20 load average before : {load_before}\n\
-             \x20 load average after  : {load_after}",
-            cpu_best.as_secs_f64() * 1e3,
-            ms_per_token,
-            per_run(&cpu_runs),
-            seq_best.as_secs_f64() * 1e3,
-            seq_ms_per_token,
-            per_run(&seq_runs),
-        );
-
-        assert_eq!(cpu_logits.len(), seq_logits.len());
-        assert!(
-            cos >= 0.9999,
-            "batched CPU prefill diverged from the sequential reference on the real model: \
-             cos={cos}"
-        );
-        // D-5's gating invariant: the ratio, not the millisecond count.
-        assert!(
-            cpu_best <= seq_best,
-            "perf-M2 relative invariant violated: batched CPU prefill ({ms_per_token:.3} \
-             ms/token) is slower than the sequential per-token prefill \
-             ({seq_ms_per_token:.3} ms/token)"
-        );
-        assert!(
-            speedup >= 1.5,
-            "batched CPU prefill should be substantially faster than the sequential \
-             reference, got only {speedup:.2}x"
-        );
-    }
+                geom.num_heads,
+                geom.heads_per_group,
+                geom.head_dim,
+                pos_start + row + 1,
+                heads_parallel,
+            )
+        })
 }
+
+/// The batched prefill's tests, and the fixtures `forward_hidden`'s tests
+/// share with them (`pub(in crate::model::types)`: test-only, and only for
+/// this module's siblings).
+#[cfg(test)]
+#[path = "prefill_cpu_tests.rs"]
+pub(super) mod tests;

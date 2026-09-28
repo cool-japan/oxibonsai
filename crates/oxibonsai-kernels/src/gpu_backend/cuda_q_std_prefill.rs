@@ -28,8 +28,9 @@ use cudarc::driver::{CudaFunction, CudaSlice, CudaView, LaunchConfig, PushKernel
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::cuda_full_layer::{
-    acquire_full_layer_buffers, encode_attn_phase_from_qkv, get_or_upload_f32_weight,
-    init_attn_modules, CudaAttnModules, CudaFullLayerBuffers, CudaKvCache,
+    acquire_full_layer_buffers, check_batch_prefill_inputs, encode_attn_phase_from_qkv,
+    get_or_upload_f32_weight, init_attn_modules, read_back_kv_cache, CudaAttnModules,
+    CudaFullLayerBuffers, CudaKvCache, KvReadback,
 };
 use super::cuda_graph::{compile_or_load_ptx, CudaGraph, CudaGraphError};
 use super::cuda_prefill::{init_prefill_modules, CudaPrefillBuffers, CudaPrefillModules};
@@ -219,7 +220,6 @@ fn acquire_q_std_prefill_buffers(
             d_normed: alloc(capacity * hidden_size)?,
             d_qkv: alloc(capacity * qkv_total)?,
             d_attn_out: alloc(capacity * nq * head_dim)?,
-            d_gate_up: alloc(2 * capacity * intermediate_size)?,
             d_swiglu: alloc(capacity * intermediate_size)?,
             capacity,
             actual_batch_size: batch_size,
@@ -231,9 +231,12 @@ fn acquire_q_std_prefill_buffers(
             max_seq,
         });
     } else {
+        // `needs_alloc` is false only when the guard holds `Some`.
         guard
             .as_mut()
-            .expect("guard is Some when needs_alloc is false")
+            .ok_or_else(|| {
+                CudaGraphError::DriverError("Q4_0/Q8_0 prefill buffers missing on reuse".into())
+            })?
             .actual_batch_size = batch_size;
     }
 
@@ -260,7 +263,14 @@ fn acquire_q_std_kv_cache(
     };
 
     if needs_alloc {
-        let total = n_layers * n_kv * max_seq * head_dim;
+        // F4: a zero or overflowing geometry is refused before allocating
+        // (an unchecked product could wrap and under-allocate the cache
+        // every later layer offset and the F6 read-back index into).
+        let total = super::cuda_device_negotiation::check_cuda_kv_cache_geometry(
+            n_layers, n_kv, max_seq, head_dim,
+        )
+        .map_err(|e| CudaGraphError::InvalidDimensions(format!("KV cache geometry: {e}")))?
+            as usize;
         let k_cache = graph
             .stream_arc()
             .alloc_zeros::<u16>(total)
@@ -905,6 +915,15 @@ unsafe fn encode_q_std_prefill_layer(
 ///   `[batch_size × hidden_size]` (token-major).  Converted to column-major internally.
 /// - `logits_out` / `greedy_token_id_out` — if `Some`, the function runs the final
 ///   norm and LM head for the last token and returns either full logits or the argmax.
+/// - `kv_readback_out` — if `Some`, filled (finding **F6**) with this call's
+///   `[pos_start, pos_start + batch_size)` window of every layer's K/V,
+///   converted to `f32` (see [`super::cuda_full_layer::read_back_kv_cache`]
+///   for the exact layout), after the last layer and before the optional
+///   final norm / LM head. This family's device KV cache is GPU-private and
+///   its decode attends over the host `KvCache`, so the model side writes
+///   this into that host cache. Left untouched when the call fails.
+///
+/// **CUDA is unvalidated**: no CUDA hardware has run this entry point.
 #[allow(clippy::too_many_arguments)]
 pub fn try_cuda_prefill_q_std(
     hidden_batch: &[f32],
@@ -931,10 +950,23 @@ pub fn try_cuda_prefill_q_std(
     lm_head_q4_0: bool,
     logits_out: Option<&mut Vec<f32>>,
     greedy_token_id_out: Option<&mut u32>,
+    kv_readback_out: Option<&mut KvReadback>,
 ) -> Result<(), CudaGraphError> {
     if batch_size == 0 {
         return Ok(());
     }
+    // Refuse an impossible KV window or short host inputs before any device
+    // work (the window bound is what keeps `fused_kv_store` inside its slab).
+    check_batch_prefill_inputs(
+        "try_cuda_prefill_q_std",
+        pos_start,
+        batch_size,
+        max_seq_len,
+        hidden_batch.len(),
+        hidden_size,
+        (cos_table.len(), sin_table.len()),
+        head_dim,
+    )?;
 
     // Get global CudaGraph singleton.
     let graph = CudaGraph::global()?;
@@ -1076,6 +1108,14 @@ pub fn try_cuda_prefill_q_std(
                 q4_0,
             )?;
         }
+    }
+
+    // F6: hand the prompt's device K/V back to the host so decode does not
+    // attend over stale all-zero KV for these positions. `kv` is still a
+    // live `&mut CudaKvCache` borrow here (the same one every layer wrote
+    // through above), so the read-back sees the layer loop's writes.
+    if let Some(out) = kv_readback_out {
+        *out = unsafe { read_back_kv_cache(&graph, kv, pos_start, batch_size)? };
     }
 
     // ─── Final norm + LM head (optional) ─────────────────────────────────────
@@ -1368,12 +1408,184 @@ mod tests {
             true,
             None,
             None,
+            None,
         );
 
         assert!(
             result.is_ok(),
             "try_cuda_prefill_q_std batch=12 failed: {:?}",
             result.err()
+        );
+    }
+
+    /// All-zero Q4_0 AoS weights for an `n_rows x k` matrix (18-byte blocks
+    /// of 32 weights): scale FP16 1.0, every nibble 8, so every weight
+    /// dequantises to `(8 - 8) * 1.0 == 0`.
+    fn zero_q4_0_weights(n_rows: usize, k: usize) -> Vec<u8> {
+        let blocks = n_rows * (k / 32);
+        let mut v = Vec::with_capacity(blocks * 18);
+        for _ in 0..blocks {
+            v.extend_from_slice(&[0x00, 0x3C]);
+            v.extend_from_slice(&[0x88; 16]);
+        }
+        v
+    }
+
+    /// F6: a successful call with `kv_readback_out: Some` hands back exactly
+    /// one `(keys, values)` pair per layer, each `[n_kv * batch * head_dim]`,
+    /// holding what the layer loop stored — all zeros here, because every
+    /// weight is zero (Q = K = V = 0, and QK-norm + RoPE keep a zero vector
+    /// zero). GPU-gated like the batch=12 test above: it skips, and asserts
+    /// nothing, without a CUDA device.
+    #[test]
+    fn try_cuda_prefill_q_std_accepts_a_kv_readback_request() {
+        if CudaGraph::global().is_err() {
+            eprintln!(
+                "SKIP: try_cuda_prefill_q_std_accepts_a_kv_readback_request — no CUDA device"
+            );
+            return;
+        }
+        let hidden_size = 64usize;
+        let intermediate_size = 64usize;
+        let nq = 2usize;
+        let nkv = 2usize;
+        let head_dim = 32usize;
+        let batch_size = 12usize;
+        let max_seq = 64usize;
+
+        let fused_qkv_bytes = zero_q4_0_weights((nq + 2 * nkv) * head_dim, hidden_size);
+        let attn_proj_bytes = zero_q4_0_weights(hidden_size, nq * head_dim);
+        let gate_bytes = zero_q4_0_weights(intermediate_size, hidden_size);
+        let up_bytes = zero_q4_0_weights(intermediate_size, hidden_size);
+        let down_bytes = zero_q4_0_weights(hidden_size, intermediate_size);
+        let attn_norm = vec![1.0f32; hidden_size];
+        let q_norm = vec![1.0f32; head_dim];
+        let k_norm = vec![1.0f32; head_dim];
+        let ffn_norm = vec![1.0f32; hidden_size];
+
+        // Handle ids disjoint from the batch=12 test's `0xDEAD_BEEF_...` range.
+        let base_h = 0xF6F6_0000_0000_0001u64;
+        let layer_params = vec![CudaQStdPrefillLayerParams {
+            attn_norm_handle: base_h,
+            attn_norm_bytes: &attn_norm,
+            fused_qkv_handle: base_h + 1,
+            fused_qkv_bytes: &fused_qkv_bytes,
+            q_norm_handle: base_h + 2,
+            q_norm_bytes: &q_norm,
+            k_norm_handle: base_h + 3,
+            k_norm_bytes: &k_norm,
+            attn_proj_handle: base_h + 4,
+            attn_proj_bytes: &attn_proj_bytes,
+            ffn_norm_handle: base_h + 5,
+            ffn_norm_bytes: &ffn_norm,
+            gate_up_handle: base_h + 6,
+            gate_bytes: &gate_bytes,
+            up_bytes: &up_bytes,
+            down_handle: base_h + 7,
+            down_bytes: &down_bytes,
+            q4_0: true,
+        }];
+
+        let half_dim = head_dim / 2;
+        let cos_table = vec![1.0f32; batch_size * half_dim];
+        let sin_table = vec![0.0f32; batch_size * half_dim];
+        let hidden_batch = vec![1.0f32; batch_size * hidden_size];
+        let mut kv_readback = Vec::new();
+
+        let result = try_cuda_prefill_q_std(
+            &hidden_batch,
+            batch_size,
+            0,
+            1,
+            &layer_params,
+            &cos_table,
+            &sin_table,
+            hidden_size,
+            intermediate_size,
+            nq,
+            nkv,
+            head_dim,
+            nq / nkv,
+            1e-5f32,
+            max_seq,
+            None,
+            None,
+            1e-5f32,
+            None,
+            None,
+            0,
+            true,
+            None,
+            None,
+            Some(&mut kv_readback),
+        );
+
+        assert!(
+            result.is_ok(),
+            "try_cuda_prefill_q_std with a KV read-back request failed: {:?}",
+            result.err()
+        );
+        assert_eq!(kv_readback.len(), 1, "one (keys, values) pair per layer");
+        let (keys, values) = &kv_readback[0];
+        assert_eq!(keys.len(), nkv * batch_size * head_dim);
+        assert_eq!(values.len(), nkv * batch_size * head_dim);
+        assert!(
+            keys.iter().chain(values.iter()).all(|&x| x == 0.0),
+            "all-zero weights must store an all-zero K/V window"
+        );
+    }
+
+    /// F6 / window check: a KV window past `max_seq_len` is refused as
+    /// `InvalidDimensions` before any device work (so this runs, and
+    /// asserts, with or without a CUDA device), and a refused call leaves
+    /// `kv_readback_out` exactly as it was.
+    #[test]
+    fn try_cuda_prefill_q_std_refuses_a_window_past_max_seq_before_any_device_work() {
+        let hidden_size = 64usize;
+        let head_dim = 32usize;
+        let batch_size = 4usize;
+        let max_seq = 32usize;
+        let pos_start = 30usize; // [30, 34) does not fit in 32 positions
+        let hidden_batch = vec![0.0f32; batch_size * hidden_size];
+        let rope = vec![0.0f32; batch_size * head_dim / 2];
+        let sentinel = vec![(vec![1.0f32], vec![2.0f32])];
+        let mut kv_readback = sentinel.clone();
+
+        let result = try_cuda_prefill_q_std(
+            &hidden_batch,
+            batch_size,
+            pos_start,
+            1,
+            &[],
+            &rope,
+            &rope,
+            hidden_size,
+            64,
+            2,
+            2,
+            head_dim,
+            1,
+            1e-5f32,
+            max_seq,
+            None,
+            None,
+            1e-5f32,
+            None,
+            None,
+            0,
+            true,
+            None,
+            None,
+            Some(&mut kv_readback),
+        );
+
+        assert!(
+            matches!(result, Err(CudaGraphError::InvalidDimensions(_))),
+            "expected InvalidDimensions, got {result:?}"
+        );
+        assert_eq!(
+            kv_readback, sentinel,
+            "a refused call must not touch the read-back"
         );
     }
 }

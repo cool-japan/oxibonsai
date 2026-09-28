@@ -22,7 +22,7 @@
 //!
 //! The credential is accepted either as `Authorization: Bearer <token>` or as
 //! `X-Admin-Token: <token>`, and is compared in constant time. The token comes
-//! from [`AuthConfig::admin_token`] (what the serve binaries pass for
+//! from [`AuthConfig::with_admin_token`] (what the serve binaries pass for
 //! `--admin-token`) or, for the convenience constructors, from the
 //! `OXI_ADMIN_TOKEN` environment variable.
 

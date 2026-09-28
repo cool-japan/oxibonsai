@@ -49,19 +49,17 @@
 //!   shared device holds the same resident weight bytes with 1, 2 or 3
 //!   replicas warm (see `metal_concurrency_tests.rs`, the pool-scaling
 //!   measurement).
-//! - **Weights, Q1 (1-bit) route: N× — not shared yet.** Each replica runs its
-//!   own `BonsaiModel::upload_weights_to_gpu`, which mints fresh
-//!   `GpuWeightHandle` ids, and the Q1 fused path keys this cache on those
-//!   ids, so N replicas hold N copies here — on top of N copies of the same
-//!   blocks (plus the fused Q‖K‖V and gate‖up concatenations) in the
-//!   process-wide `Scirs2Backend` cache. For the 8B Q1 that is on the order of
-//!   the quantized model (~1.1 GB) here plus ~1.85 GB in the `Scirs2Backend`
-//!   cache **per replica**. De-duplicating the Q1 uploads across replicas is
-//!   the engine seam's job (`ENGINE-SEAM`: `engine.rs` / `engine_pool.rs`),
-//!   not this module's; until it lands, size a Q1 GPU pool as N full models.
+//! - **Weights, Q1 (1-bit) route: 1×.** Every replica of one `GgufFile` joins
+//!   that mapping's GPU namespace (one epoch; `model/types/q1_slots.rs`), so
+//!   the norms, final norm and LM head bind the first replica's buffers, and
+//!   the per-replica `upload_weights_to_gpu` of the block weights is
+//!   deduplicated by content in `Scirs2Backend`, so the handle-keyed
+//!   `MetalGraph` slots coincide too (Bonsai-8B: replica 1 +1016.0 MiB
+//!   MetalGraph / +1622.3 MiB scirs2, replicas 2-3 +0 B).
 //!
-//! On a 24 GB box the practical GPU pool is therefore 2–3 sessions for the
-//! ternary 1.7B/8B and fewer for a Q1 8B, which is why
+//! On a 24 GB box the practical GPU pool is therefore bounded by the KV
+//! cache — 2–3 sessions for the ternary 1.7B/8B and a Q1 8B alike — which is
+//! why
 //! [`MetalGraph::max_sessions`] defaults to a small number and is the bound
 //! `engine_pool::resolve_pool_sizing` uses on the GPU tier.
 //!
@@ -120,10 +118,9 @@ pub(crate) const MAX_SESSIONS_ENV: &str = "OXIBONSAI_METAL_MAX_SESSIONS";
 ///
 /// Deliberately small: the bound that matters is not the queue count but
 /// memory — the per-session device KV cache (604 MB for the 8B at
-/// `ctx = 4096`) and, on the Q1 route, a full copy of the weights per replica
-/// until the engine seam shares them (see the module's *Sizing reality*), so a
-/// 24 GB box saturates at 2–3 sessions. Raise it with [`MAX_SESSIONS_ENV`] on
-/// a machine with more unified memory.
+/// `ctx = 4096`; see the module's *Sizing reality*), so a 24 GB box saturates
+/// at 2–3 sessions. Raise it with [`MAX_SESSIONS_ENV`] on a machine with more
+/// unified memory.
 pub(crate) const DEFAULT_MAX_SESSIONS: usize = 4;
 
 /// The process-global shared device, created on first use.

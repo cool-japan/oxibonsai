@@ -277,86 +277,61 @@ pub(super) fn advance_kv_cache_to(kv_cache: &mut KvCache, pos: usize) {
     }
 }
 
-/// Attempt a fused ternary GEMV via direct Metal dispatch (M-21).
+/// Attempt a fused ternary GEMV via direct Metal dispatch (M-21): the
+/// block-level entry every fused ternary arm goes through (Q‖K‖V for all
+/// three block forward kinds, and gate‖up).
 ///
-/// Concatenates the given ternary (`BlockTQ2_0_g128`) AoS byte blobs into
-/// one SoA-uploaded buffer keyed by `weight_slot` (reformatted and cached on
-/// first call, reused after) and runs a single GEMV producing all `n_rows`
-/// outputs in one command buffer — the ternary mirror of
-/// [`oxibonsai_kernels::try_metal_qkv`], which exists only for the
-/// `Q1_0_g128` format (fused handles were built only for 1-bit weights in
-/// `upload.rs`, so ternary models paid one GPU dispatch per projection).
-/// Generalized over `aos_parts` (rather than fixed at three) so the same
-/// helper could serve a future 2-way gate+up fusion too, though today only
-/// the 3-way Q+K+V call site uses it.
+/// The row-wise concatenation of the `TQ2_0_g128` AoS `aos_parts` is
+/// SoA-uploaded once — built only on a cache miss — under
+/// `WeightKey::new(model_epoch, WeightKind::Tq2Soa, weight_slot)`, and one
+/// GEMV produces all `n_rows` outputs in one command buffer: the ternary
+/// mirror of [`oxibonsai_kernels::try_metal_qkv`], which exists only for the
+/// `Q1_0_g128` format.
 ///
-/// `weight_slot` must be a stable, per-instance identity, unique for the
-/// lifetime of the process. Call sites pass `attn_q.gpu_handle()`'s own
-/// `.id()` — the per-matrix `GpuWeightHandle` that `LinearTernary`'s own
-/// `upload_to_gpu()` already populates via `TernaryKernel::upload_weights_ternary`
-/// (see `upload.rs`) — rather than a raw pointer into this model's mmap.
-/// That id is drawn from the same process-global monotonic counter
-/// (`NEXT_HANDLE_ID.fetch_add(1)` in `scirs2_backend.rs`) that 1-bit fused
-/// handles use, so it is never reused across model loads. This matters
-/// because `MetalGraph::get_or_upload_tq2_weight_soa_lazy` caches under
-/// `LEGACY_MODEL_EPOCH` (`metal_full_layer/types.rs`, no per-model-epoch
-/// component) and is never reclaimed by `MetalGraph::release_model()` for
-/// that epoch: keying on the weight's own `as_ptr()` (an earlier version of
-/// this function did) would let a model loaded after a previous one was
-/// dropped, whose mmap happens to land on a freed address, be served the
-/// PRIOR model's fused Q|K|V weights under the same cache slot — silently
-/// wrong logits. A monotonically-issued id cannot collide from address
-/// reuse the way `as_ptr()` could, but it is not collision-proof forever:
-/// the other `WeightKind::Tq2Soa` slots in the process are `3_000_000`/
-/// `6_000_000 + layer*10` (`model/types/forward_metal.rs`) and
-/// `oxibonsai-image`'s own pointer-keyed cache, so this mitigation holds
-/// exactly **while `NEXT_HANDLE_ID` stays below `3_000_000`** — a
-/// long-lived server process that loads/unloads enough models to walk the
-/// counter past that point would reopen the same silent-aliasing class
-/// this fix removes, now against `forward_metal.rs`'s fixed slots instead
-/// of a freed mmap address. Closing that gap for good (unbounded, not just
-/// below the current fixed slots) is MET-02's `WeightKey { model_epoch, .. }`
-/// work, which this is a same-epoch mitigation for, not a replacement of.
+/// This is a thin wrapper over the kernels' N-part
+/// [`oxibonsai_kernels::try_metal_gemv_tq2_fused`], which checks the parts'
+/// byte total against `n_rows × (k / 128) × 34` and **refuses a resident
+/// buffer of the wrong size** — a slot another producer filled with, say, a
+/// Q-only buffer — instead of letting the GEMV read past its end.
 ///
-/// Returns `Err` (never panics) if Metal is unavailable or the dispatch
-/// fails; callers fall back to the per-matrix path in that case.
+/// # Slot identity (`MET-02`)
 ///
-/// # Known cost: double GPU residency for Q/K/V
+/// Callers pass the block's mapping namespace: `weight_slot` is the address
+/// of the mapped tensor the concatenation starts with
+/// (`TransformerBlock::ternary_fused_qkv_slot` /
+/// `ternary_fused_gate_up_slot`) and `model_epoch` the block's namespace
+/// epoch — for a block of a loaded model, its GGUF mapping's epoch. That is
+/// exactly the key the model's full-forward ternary cache stores the same
+/// (byte-identical) concatenation under, so the block path and the
+/// whole-model path share one buffer, every replica of the mapping shares
+/// it, and it leaves the GPU with the mapping's last replica
+/// (`MetalGraph::release_model(epoch)`). A model re-loaded at a reused
+/// address mints a **new** epoch, so it can never be served a freed
+/// mapping's concatenation — the aliasing class the earlier handle-id and
+/// literal-slot keyings could only mitigate.
 ///
-/// `upload_to_gpu()` already gave each of `attn_q`/`attn_k`/`attn_v` its own
-/// per-matrix GPU buffer in `Scirs2Backend`'s weight cache (that is exactly
-/// the `GpuWeightHandle` this function keys on above); this function then
-/// uploads a *second*, concatenated copy of the same three matrices into
-/// `MetalGraph`'s independent cache the first time it runs for a given
-/// `weight_slot`. Under `LEGACY_MODEL_EPOCH` that second copy is never
-/// reclaimed for the life of the process, so a ternary model pays roughly
-/// 2x GPU memory for every layer's Q/K/V — material at the 27B target this
-/// helper exists for. `Scirs2Backend` has no per-handle eviction API (only
-/// a clear-everything `clear_weight_cache()`, which would also drop
-/// `attn_output`'s and any FFN matrices' own per-matrix ternary handles
-/// still needed by the non-fused paths), so freeing just the Q/K/V copies
-/// once the fused path is confirmed live would need a new eviction primitive
-/// in `oxibonsai-kernels` — out of this file's reach. Documented here rather
-/// than fixed; a real fix belongs alongside MET-02's epoch plumbing.
+/// Returns `Err` (never panics) if Metal is unavailable, the parts do not
+/// add up, a resident buffer has the wrong size, or the dispatch fails;
+/// callers fall back to the per-matrix path in that case.
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub(super) fn try_metal_gemv_ternary_fused(
     input: &[f32],
     output: &mut [f32],
+    model_epoch: u64,
     weight_slot: u64,
     aos_parts: &[&[u8]],
     n_rows: usize,
     k: usize,
 ) -> Result<(), oxibonsai_kernels::MetalGraphError> {
-    let graph = oxibonsai_kernels::MetalGraph::global()?;
-    let weight = graph.get_or_upload_tq2_weight_soa_lazy(weight_slot, || {
-        let total: usize = aos_parts.iter().map(|part| part.len()).sum();
-        let mut fused = Vec::with_capacity(total);
-        for part in aos_parts {
-            fused.extend_from_slice(part);
-        }
-        fused
-    })?;
-    graph.encode_gemv_tq2(&weight, input, output, n_rows, k)
+    oxibonsai_kernels::try_metal_gemv_tq2_fused(
+        input,
+        output,
+        model_epoch,
+        weight_slot,
+        aos_parts,
+        n_rows,
+        k,
+    )
 }
 
 #[cfg(test)]
@@ -1220,19 +1195,21 @@ mod tests {
         );
     }
 
-    /// Blocking-fix verification for the `weight_slot` rekey.
+    /// Engagement check for the fused ternary helper at its block-level call
+    /// site.
     ///
     /// `ternary_forward_matches_with_and_without_gpu_upload` above cannot by
     /// itself prove the fused Metal dispatch actually ran: every caller of
     /// `try_metal_gemv_ternary_fused` silently falls back to the per-matrix
     /// path on `Err`, so a test that only checks "same answer either way"
-    /// would still pass if the helper (or `attn_q.gpu_handle()`) were
-    /// silently dead on the test machine. This test calls
-    /// `try_metal_gemv_ternary_fused` directly with a real
-    /// `GpuWeightHandle::id()` — the exact value the fixed call sites in
-    /// `forward.rs`/`forward_stats.rs`/`forward_sw.rs` now pass as
-    /// `weight_slot` — and `.expect()`s success, so a dead or broken Metal
-    /// path fails loudly here instead of being masked by a fallback.
+    /// would still pass if the helper were silently dead on the test machine.
+    /// This test calls `try_metal_gemv_ternary_fused` directly with the key
+    /// the block forwards now pass — the mapped `attn_q` address as the slot,
+    /// under a namespace epoch (`MET-02`) — and `.expect()`s success, so a
+    /// dead or broken Metal path fails loudly here instead of being masked by
+    /// a fallback. It also still requires a real GPU tier (the per-matrix
+    /// upload `LinearTernary::upload_to_gpu()` makes in production), which is
+    /// what gates the fused arms in the first place.
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
     fn try_metal_gemv_ternary_fused_engages_and_matches_cpu_reference() {
@@ -1246,13 +1223,12 @@ mod tests {
 
         let kernel = oxibonsai_kernels::KernelDispatcher::auto_detect();
         // The same call `LinearTernary::upload_to_gpu()` makes in
-        // production; its `.id()` is what the fixed call sites now key
-        // `try_metal_gemv_ternary_fused`'s `weight_slot` on.
-        let handle = kernel.upload_weights_ternary(&q_b).expect(
+        // production: the GPU residency the fused arms are gated on.
+        kernel.upload_weights_ternary(&q_b).expect(
             "this test requires a real GPU tier (metal feature + Metal-capable \
              hardware) to actually verify the fused ternary dispatch; if this \
              fails, `try_metal_gemv_ternary_fused`'s call sites are dead on \
-             this machine regardless of the blocking fix",
+             this machine",
         );
 
         let input: Vec<f32> = (0..h).map(|i| (i as f32 + 1.0) * 0.01).collect();
@@ -1263,11 +1239,15 @@ mod tests {
         let q_bytes = blocks_as_bytes_ternary(&q_b);
         let k_bytes = blocks_as_bytes_ternary(&k_b);
         let v_bytes = blocks_as_bytes_ternary(&v_b);
+        let slot = crate::model::types::q1_slots::mapped_tensor_slot(q_bytes)
+            .expect("a heap address is a valid mapped-tensor slot");
+        let epoch = oxibonsai_kernels::gpu_backend::next_gpu_model_epoch();
 
         try_metal_gemv_ternary_fused(
             &input,
             &mut fused_output,
-            handle.id(),
+            epoch,
+            slot,
             &[q_bytes, k_bytes, v_bytes],
             total_rows,
             h,
@@ -1309,5 +1289,88 @@ mod tests {
         {
             assert!((a - b).abs() < 1e-3, "V[{i}]: fused={a} cpu_ref={b}");
         }
+    }
+
+    /// B1 (MC-FIX D5): the block-level fused helper **refuses** a resident
+    /// buffer of the wrong size instead of running the GEMV past its end.
+    ///
+    /// The slot is filled first with the Q projection alone — what a
+    /// per-matrix producer keyed on the same slot would leave there — and the
+    /// fused Q‖K‖V call over that key must fail with a named
+    /// `InvalidDimensions` error (the callers then fall back to the per-matrix
+    /// projections). The old bare `get_or_upload` + `encode_gemv_tq2` body
+    /// bound the Q-only buffer and read K/V rows out of bounds. The same call
+    /// under a fresh epoch — nothing resident — succeeds, so the refusal is
+    /// about the resident buffer, not the request. Runs in a private Metal
+    /// graph so the pre-filled slot cannot leak into another test.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn try_metal_gemv_ternary_fused_refuses_a_wrong_size_resident_buffer() {
+        let Ok(graph) = oxibonsai_kernels::MetalGraph::new() else {
+            return; // no Metal device on this host
+        };
+        let graph = std::sync::Arc::new(graph);
+        oxibonsai_kernels::MetalGraph::with_session(&graph, || {
+            let (h, hd, nq, nkv) = (256, 64, 4, 2);
+            let bpr = h / 128;
+            let q_b = make_ternary_blocks(nq * hd * bpr, 0.05, 0x00);
+            let k_b = make_ternary_blocks(nkv * hd * bpr, 0.04, 0x00);
+            let v_b = make_ternary_blocks(nkv * hd * bpr, 0.03, 0x00);
+            let (q_bytes, k_bytes, v_bytes) = (
+                blocks_as_bytes_ternary(&q_b),
+                blocks_as_bytes_ternary(&k_b),
+                blocks_as_bytes_ternary(&v_b),
+            );
+            let total_rows = nq * hd + 2 * nkv * hd;
+            let input: Vec<f32> = (0..h).map(|i| (i as f32 + 1.0) * 0.01).collect();
+            let mut output = vec![0.0f32; total_rows];
+            let slot = crate::model::types::q1_slots::mapped_tensor_slot(q_bytes)
+                .expect("a heap address is a valid mapped-tensor slot");
+            let epoch = oxibonsai_kernels::gpu_backend::next_gpu_model_epoch();
+
+            // Another producer put the Q projection alone under the key.
+            let q_only = graph
+                .get_or_upload_tq2_weight_soa_for_epoch(epoch, slot, q_bytes)
+                .expect("the Q-only upload");
+            assert_eq!(q_only.byte_len(), q_bytes.len());
+
+            let err = try_metal_gemv_ternary_fused(
+                &input,
+                &mut output,
+                epoch,
+                slot,
+                &[q_bytes, k_bytes, v_bytes],
+                total_rows,
+                h,
+            )
+            .expect_err("a Q-only resident buffer must be refused for a Q‖K‖V GEMV");
+            assert!(
+                matches!(
+                    err,
+                    oxibonsai_kernels::MetalGraphError::InvalidDimensions(_)
+                ),
+                "the refusal must be the named size error, got: {err}"
+            );
+            assert!(
+                err.to_string().contains("refusing"),
+                "the error must say it refused the resident buffer: {err}"
+            );
+
+            // Control: the very same request under a fresh epoch builds the
+            // concatenation itself and runs.
+            let fresh = oxibonsai_kernels::gpu_backend::next_gpu_model_epoch();
+            try_metal_gemv_ternary_fused(
+                &input,
+                &mut output,
+                fresh,
+                slot,
+                &[q_bytes, k_bytes, v_bytes],
+                total_rows,
+                h,
+            )
+            .expect("with nothing resident under the key, the fused GEMV runs");
+            let _ = graph.release_model(epoch);
+            let _ = graph.release_model(fresh);
+        });
     }
 }

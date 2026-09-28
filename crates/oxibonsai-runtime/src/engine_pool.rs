@@ -25,14 +25,19 @@
 //!   serialising on one another's `MutexGuard`s. The pool size is therefore
 //!   `min(requested, MetalGraph::max_sessions())` — a *memory* bound (604 MB
 //!   of device KV per session for the 8B at `ctx = 4096`), not a correctness
-//!   one. The weights really are held once: the ternary fused route keys its
-//!   device buffers on the mapped tensors' addresses (shared by every replica
-//!   of one `GgufFile`), and the 1-bit route's per-replica
-//!   `upload_weights_to_gpu` is deduplicated by content in `Scirs2Backend` —
-//!   a replica uploading byte-identical weights gets the resident handle back,
-//!   so the `MetalGraph` slots keyed on those handles coincide too. Each
-//!   replica's registrations are released when it drops (`MET-M1`), and a
-//!   buffer is freed only with its last replica.
+//!   one. The weights really are held once, on both routes. Every replica of
+//!   one `GgufFile` joins that mapping's GPU namespace — one model epoch,
+//!   minted by the first replica and shared by all of them — so the ternary
+//!   fused route, which keys all of its device buffers on the mapped tensors'
+//!   addresses under that epoch, and the 1-bit route, which keys its norms,
+//!   final norm and LM head on the namespace's slots, both bind the first
+//!   replica's buffers. The 1-bit route's block weights come from the
+//!   per-replica `upload_weights_to_gpu`, which `Scirs2Backend` deduplicates
+//!   by content — a replica uploading byte-identical weights gets the
+//!   resident handle back, so the `MetalGraph` slots keyed on those handles
+//!   coincide too. Each replica's scirs2 registrations are released when it
+//!   drops (`MET-M1`) and a buffer is freed only with its last replica; the
+//!   namespace's buffers likewise go with the mapping's last replica.
 //! - On the CUDA tier the process-global `CudaGraph` singleton is unchanged,
 //!   so `N > 1` replicas would still corrupt each other's KV: the clamp to `1`
 //!   stays there (see [`resolve_pool_sizing`]).
@@ -764,8 +769,137 @@ pub fn build_pool_from_gguf_parts(
     })
 }
 
+/// [`build_pool_from_gguf_parts`] with a `--rope-scaling auto|on|off`
+/// override (wave-4b ruling R2; additive — the existing builders are
+/// unchanged). Memory-maps and leaks the GGUF exactly as
+/// [`InferenceEngine::from_gguf_path_leaked_with_backend`] does, then
+/// defers to [`build_pool_from_static_gguf_with_rope`].
+///
+/// # Errors
+///
+/// [`crate::error::RuntimeError::FileNotFound`] for a missing file, the
+/// refusals of [`crate::engine_seam::resolve_rope_scaling_at_load`], and
+/// anything replica construction returns.
+pub fn build_pool_from_gguf_parts_with_rope(
+    path: impl AsRef<std::path::Path>,
+    sampling_params: crate::sampling::SamplingParams,
+    seed: u64,
+    max_seq_len: usize,
+    requested_size: Option<usize>,
+    backend: crate::engine_seam::Backend,
+    rope: oxibonsai_core::config::RopeScalingOverride,
+) -> crate::error::RuntimeResult<PoolBuild> {
+    let path_ref = path.as_ref();
+    if !path_ref.exists() {
+        return Err(crate::error::RuntimeError::FileNotFound {
+            path: path_ref.display().to_string(),
+        });
+    }
+    let mmap = oxibonsai_core::gguf::reader::mmap_gguf_file(path_ref)?;
+    let mmap: &'static memmap2::Mmap = Box::leak(Box::new(mmap));
+    let gguf = oxibonsai_core::gguf::reader::GgufFile::parse(mmap)?;
+    let gguf: &'static oxibonsai_core::gguf::reader::GgufFile<'static> = Box::leak(Box::new(gguf));
+    build_pool_from_static_gguf_with_rope(
+        gguf,
+        sampling_params,
+        seed,
+        max_seq_len,
+        requested_size,
+        backend,
+        rope,
+    )
+}
+
+/// Build an [`EnginePool`] off an already-`'static` GGUF — a leaked memory
+/// map, or an in-memory image such as the CLI's `--ptq1-transcode` output —
+/// with a `--rope-scaling` override (wave-4b ruling R2; additive).
+///
+/// Same sizing policy and replica sharing as [`build_pool_from_gguf_parts`]
+/// (hybrid → 1 replica unless asked; replicas `2..size` share replica
+/// `#1`'s token-embedding handle). Every replica is constructed on the
+/// calling thread inside one
+/// [`RopeScalingOverrideScope`](oxibonsai_core::config::RopeScalingOverrideScope),
+/// so all of them get the same effective RoPE table.
+///
+/// # Errors
+///
+/// The refusals of [`crate::engine_seam::resolve_rope_scaling_at_load`], and
+/// anything replica construction returns.
+pub fn build_pool_from_static_gguf_with_rope(
+    gguf: &'static oxibonsai_core::gguf::reader::GgufFile<'static>,
+    sampling_params: crate::sampling::SamplingParams,
+    seed: u64,
+    max_seq_len: usize,
+    requested_size: Option<usize>,
+    backend: crate::engine_seam::Backend,
+    rope: oxibonsai_core::config::RopeScalingOverride,
+) -> crate::error::RuntimeResult<PoolBuild> {
+    crate::engine_seam::resolve_rope_scaling_at_load(gguf, rope)?;
+    let _rope_scope = oxibonsai_core::config::RopeScalingOverrideScope::enter(rope);
+
+    let first = InferenceEngine::from_gguf_static_with_embd_and_backend(
+        gguf,
+        sampling_params.clone(),
+        seed,
+        max_seq_len,
+        Arc::from(Vec::new()),
+        backend,
+    )?;
+
+    let tier = first.kernel_tier();
+    let hybrid = first.is_hybrid();
+    let sizing = if hybrid && requested_size.is_none() {
+        tracing::info!(
+            architecture = %first.architecture(),
+            "hybrid model: defaulting the engine pool to 1 replica (each replica holds its own \
+             KV cache and recurrent state, and one CPU replica already saturates memory \
+             bandwidth); pass an explicit pool size to run more"
+        );
+        PoolSizing {
+            requested: None,
+            effective: 1,
+            clamped_by_gpu_tier: false,
+            gpu_max: None,
+        }
+    } else {
+        resolve_pool_sizing(requested_size, tier)
+    };
+    let size = sizing.effective;
+    tracing::info!(
+        tier = %tier,
+        effective = size,
+        clamped = sizing.clamped_by_gpu_tier,
+        "{}",
+        sizing.reason()
+    );
+
+    let shared_token_embd = first.model_token_embd();
+    let mut engines = Vec::with_capacity(size);
+    engines.push(first);
+    for _ in 1..size {
+        let replica = InferenceEngine::from_gguf_static_with_embd_and_backend(
+            gguf,
+            sampling_params.clone(),
+            seed,
+            max_seq_len,
+            Arc::clone(&shared_token_embd),
+            backend,
+        )?;
+        engines.push(replica);
+    }
+
+    Ok(PoolBuild {
+        pool: EnginePool::new(engines),
+        tier,
+        size,
+        gguf,
+        shared_token_embd,
+        hybrid,
+    })
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::sampling::SamplingParams;
     use oxibonsai_core::config::Qwen3Config;
@@ -796,6 +930,17 @@ mod tests {
     }
 
     fn build_tiny_gguf_bytes() -> Vec<u8> {
+        build_tiny_gguf_bytes_with(Vec::new())
+    }
+
+    /// [`build_tiny_gguf_bytes`] plus caller-supplied metadata (e.g. a
+    /// `qwen3.rope.scaling.*` declaration for the `--rope-scaling` tests).
+    pub(crate) fn build_tiny_gguf_bytes_with(
+        extra_metadata: Vec<(
+            &'static str,
+            oxibonsai_core::gguf::writer::MetadataWriteValue,
+        )>,
+    ) -> Vec<u8> {
         use oxibonsai_core::gguf::writer::{
             GgufWriter, MetadataWriteValue, TensorEntry, TensorType,
         };
@@ -838,6 +983,9 @@ mod tests {
             MetadataWriteValue::F32(1e-6),
         );
         w.add_metadata("qwen3.rope.freq_base", MetadataWriteValue::F32(10_000.0));
+        for (key, value) in extra_metadata {
+            w.add_metadata(key, value);
+        }
 
         let f32_ones = |n: usize| -> Vec<u8> {
             let mut v = Vec::with_capacity(n * 4);
@@ -1435,5 +1583,213 @@ mod tests {
         drop(a);
         let a_again = pool.acquire().await.expect("re-acquire a");
         assert_eq!(a_again.gpu_session_id(), a_id);
+    }
+
+    // ── `--rope-scaling auto|on|off` (wave-4b ruling R2) ─────────────────────
+
+    /// The exact YaRN declaration `models/Bonsai-8B.gguf` carries, on the
+    /// tiny dense fixture.
+    pub(crate) fn yarn_metadata() -> Vec<(
+        &'static str,
+        oxibonsai_core::gguf::writer::MetadataWriteValue,
+    )> {
+        use oxibonsai_core::gguf::writer::MetadataWriteValue;
+        vec![
+            (
+                "qwen3.rope.scaling.type",
+                MetadataWriteValue::Str("yarn".to_string()),
+            ),
+            ("qwen3.rope.scaling.factor", MetadataWriteValue::F32(4.0)),
+            (
+                "qwen3.rope.scaling.original_context_length",
+                MetadataWriteValue::U32(128),
+            ),
+        ]
+    }
+
+    pub(crate) fn engine_rope_scaling(
+        engine: &InferenceEngine<'_>,
+    ) -> oxibonsai_core::config::RopeScaling {
+        engine
+            .dense_model()
+            .expect("the tiny fixture is a dense model")
+            .config()
+            .rope_scaling
+            .clone()
+    }
+
+    /// Ruling R2's required test: a tiny GGUF declaring YaRN — `auto`
+    /// applies it, `off` builds the model with plain RoPE, and the choice
+    /// does not leak into a later `auto` load on the same thread.
+    #[test]
+    fn rope_override_on_a_yarn_gguf_auto_applies_and_off_does_not() {
+        use oxibonsai_core::config::{RopeScaling, RopeScalingOverride};
+        let bytes = build_tiny_gguf_bytes_with(yarn_metadata());
+        let gguf = oxibonsai_core::gguf::reader::GgufFile::parse(&bytes).expect("parse fixture");
+
+        let auto = InferenceEngine::from_gguf_with_backend_and_rope(
+            &gguf,
+            SamplingParams::default(),
+            42,
+            64,
+            crate::engine_seam::Backend::Cpu,
+            RopeScalingOverride::Auto,
+        )
+        .expect("auto load");
+        assert!(
+            matches!(engine_rope_scaling(&auto), RopeScaling::Yarn { factor, .. } if factor == 4.0),
+            "auto must honour the declared YaRN"
+        );
+
+        let off = InferenceEngine::from_gguf_with_backend_and_rope(
+            &gguf,
+            SamplingParams::default(),
+            42,
+            64,
+            crate::engine_seam::Backend::Cpu,
+            RopeScalingOverride::Off,
+        )
+        .expect("off load");
+        assert_eq!(engine_rope_scaling(&off), RopeScaling::None);
+
+        // The scope ended with the constructor: a plain load is unaffected.
+        let plain = InferenceEngine::from_gguf_with_backend(
+            &gguf,
+            SamplingParams::default(),
+            42,
+            64,
+            crate::engine_seam::Backend::Cpu,
+        )
+        .expect("plain load");
+        assert!(matches!(
+            engine_rope_scaling(&plain),
+            RopeScaling::Yarn { .. }
+        ));
+    }
+
+    #[test]
+    fn rope_override_on_refuses_a_gguf_without_scaling() {
+        use oxibonsai_core::config::RopeScalingOverride;
+        let bytes = build_tiny_gguf_bytes();
+        let gguf = oxibonsai_core::gguf::reader::GgufFile::parse(&bytes).expect("parse fixture");
+        let err = InferenceEngine::from_gguf_with_backend_and_rope(
+            &gguf,
+            SamplingParams::default(),
+            42,
+            64,
+            crate::engine_seam::Backend::Cpu,
+            RopeScalingOverride::On,
+        )
+        .err()
+        .expect("`on` must refuse a file that declares no scaling");
+        assert!(err.to_string().contains("--rope-scaling on"), "{err}");
+
+        let at_load =
+            crate::engine_seam::resolve_rope_scaling_at_load(&gguf, RopeScalingOverride::Auto)
+                .expect("auto resolves");
+        assert_eq!(at_load.declared, oxibonsai_core::config::RopeScaling::None);
+        assert_eq!(at_load.effective, oxibonsai_core::config::RopeScaling::None);
+    }
+
+    /// Every replica of a pool built with `off` gets plain RoPE (all of them
+    /// are constructed inside the one scope, on this thread).
+    #[tokio::test]
+    async fn rope_override_off_reaches_every_pool_replica() {
+        use oxibonsai_core::config::{RopeScaling, RopeScalingOverride};
+        let bytes: &'static [u8] =
+            Box::leak(build_tiny_gguf_bytes_with(yarn_metadata()).into_boxed_slice());
+        let gguf: &'static oxibonsai_core::gguf::reader::GgufFile<'static> = Box::leak(Box::new(
+            oxibonsai_core::gguf::reader::GgufFile::parse(bytes).expect("parse fixture"),
+        ));
+        let built = build_pool_from_static_gguf_with_rope(
+            gguf,
+            SamplingParams::default(),
+            42,
+            64,
+            Some(2),
+            crate::engine_seam::Backend::Cpu,
+            RopeScalingOverride::Off,
+        )
+        .expect("build pool");
+        assert_eq!(built.size, 2);
+        let first = built.pool.acquire().await.expect("replica 1");
+        let second = built.pool.acquire().await.expect("replica 2");
+        assert_eq!(engine_rope_scaling(&first), RopeScaling::None);
+        assert_eq!(engine_rope_scaling(&second), RopeScaling::None);
+    }
+
+    /// `GpuSession::for_tier(KernelTier::Gpu)` twice hands out two **real,
+    /// distinct** sessions (METAL-CONCURRENCY verify minor[1]).
+    /// `every_replica_gets_its_own_gpu_session` runs on a CPU-tier fixture,
+    /// where both ids are `None` and its distinctness check is vacuous; this
+    /// calls the constructor on the GPU tier directly. A CPU tier still gets
+    /// no session. Self-skips with a capability record when the host has no
+    /// Metal device.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn gpu_tier_sessions_are_real_and_distinct() {
+        use oxibonsai_kernels::KernelTier;
+        use oxibonsai_testkit::capability::{record_executed, record_skipped, Capability};
+
+        const TEST: &str = "engine_pool::tests::gpu_tier_sessions_are_real_and_distinct";
+        if let Err(e) = oxibonsai_kernels::MetalGraph::new_session() {
+            eprintln!("capability report: {TEST} SKIPPED -- no Metal device ({e})");
+            record_skipped(Capability::Metal, TEST);
+            return;
+        }
+        let a = GpuSession::for_tier(KernelTier::Gpu);
+        let b = GpuSession::for_tier(KernelTier::Gpu);
+        match (a.id(), b.id()) {
+            (Some(x), Some(y)) => assert_ne!(x, y, "two GPU-tier replicas share one Metal session"),
+            other => {
+                panic!("a GPU-tier replica on a Metal host must get its own session: {other:?}")
+            }
+        }
+        assert_eq!(
+            GpuSession::for_tier(KernelTier::Reference).id(),
+            None,
+            "a CPU-tier replica never opens a session"
+        );
+        record_executed(Capability::Metal, TEST);
+    }
+
+    /// A GPU build without the Metal backend (`native-cuda`, or `metal` off
+    /// macOS): the GPU tier exists, but there is no Metal session to hand
+    /// out, so the placeholder reports none on the GPU tier and on a CPU one.
+    ///
+    /// Gated on the runtime features that turn on `oxibonsai-kernels/gpu` —
+    /// the only builds in which `KernelTier::Gpu` exists (the runtime crate
+    /// has no `gpu` feature of its own).
+    #[cfg(all(
+        any(feature = "metal", feature = "native-cuda"),
+        not(all(feature = "metal", target_os = "macos"))
+    ))]
+    #[test]
+    fn gpu_tier_sessions_are_real_and_distinct() {
+        use oxibonsai_kernels::KernelTier;
+        use oxibonsai_testkit::capability::{record_skipped, Capability};
+
+        const TEST: &str = "engine_pool::tests::gpu_tier_sessions_are_real_and_distinct";
+        assert_eq!(GpuSession::for_tier(KernelTier::Gpu).id(), None);
+        assert_eq!(GpuSession::for_tier(KernelTier::Reference).id(), None);
+        eprintln!("capability report: {TEST} SKIPPED -- built without the Metal backend");
+        record_skipped(Capability::Metal, TEST);
+    }
+
+    /// A build with no GPU backend at all: `KernelTier::Gpu` is not even
+    /// compiled (it needs `oxibonsai-kernels/gpu`), so there is no GPU-tier
+    /// session to test; a CPU tier still gets none.
+    #[cfg(not(any(feature = "metal", feature = "native-cuda")))]
+    #[test]
+    fn gpu_tier_sessions_are_real_and_distinct() {
+        use oxibonsai_testkit::capability::{record_skipped, Capability};
+
+        const TEST: &str = "engine_pool::tests::gpu_tier_sessions_are_real_and_distinct";
+        assert_eq!(
+            GpuSession::for_tier(oxibonsai_kernels::KernelTier::Reference).id(),
+            None
+        );
+        eprintln!("capability report: {TEST} SKIPPED -- built without a GPU backend");
+        record_skipped(Capability::Metal, TEST);
     }
 }

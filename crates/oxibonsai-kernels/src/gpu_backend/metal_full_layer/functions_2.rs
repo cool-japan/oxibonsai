@@ -50,6 +50,31 @@ impl MetalGraph {
             || self.upload_weight(byte_slice),
         )
     }
+    /// Epoch-keyed `Q1_0_g128` SoA lookup-or-upload (`MET-02`, Q1 half).
+    ///
+    /// Caches under `WeightKey::new(model_epoch, WeightKind::Q1Soa, slot)` —
+    /// the Q1 LM head of a loaded model is keyed this way, so
+    /// `release_model(model_epoch)` frees it with the model's norms, and a
+    /// model keyed under a different epoch can never be served it. The Q1
+    /// block weights stay on [`Self::get_or_upload_q1_weight_soa`]'s legacy
+    /// key: they are keyed by upload-handle ids that the scirs2 backend
+    /// deduplicates across replicas and evicts itself when the last replica
+    /// releases them.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the reformat / allocation failure, or a kind mismatch on the
+    /// slot.
+    pub fn get_or_upload_q1_weight_soa_for_epoch(
+        &self,
+        model_epoch: u64,
+        slot: u64,
+        aos_bytes: &[u8],
+    ) -> Result<Arc<MetalWeightHandle>, MetalGraphError> {
+        self.get_or_upload_keyed(WeightKey::new(model_epoch, WeightKind::Q1Soa, slot), || {
+            self.upload_q1_weight_soa(aos_bytes)
+        })
+    }
     /// Acquire the full-layer buffer set, allocating if needed.
     fn acquire_full_layer_buffers(
         &self,

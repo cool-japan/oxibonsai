@@ -56,6 +56,12 @@ impl<'a> TransformerBlock<'a> {
     /// On `Some(Ok(()))`, `hidden` is modified in-place and the caller should
     /// return early, skipping the CPU path entirely. The GPU manages its own
     /// KV cache internally.
+    ///
+    /// The four RMSNorm weights are keyed on the block's slot namespace — the
+    /// owning model's GGUF-mapping namespace (`MET-02`) — under its epoch,
+    /// i.e. on exactly the slots the model's fused Q1 paths use for this
+    /// layer: the per-layer and the fused paths share one buffer per norm,
+    /// and two different Q1 models can never be served each other's norms.
     #[cfg(all(feature = "metal", target_os = "macos"))]
     pub(super) fn try_full_layer_gpu(
         &self,
@@ -84,7 +90,11 @@ impl<'a> TransformerBlock<'a> {
         let eps = self.attn_norm.eps();
         let n_layers = kv_cache.num_layers();
         let max_seq_len = kv_cache.max_seq_len();
-        let norm_handle_base = 1_000_000u64 + (self.layer_idx as u64) * 10;
+        if self.layer_idx >= crate::model::types::q1_slots::MAX_SLOT_LAYERS {
+            return None;
+        }
+        let slots = self.slot_namespace.slots();
+        let norm_handle_base = slots.norm_base(self.layer_idx);
         let attn_norm_handle_id = norm_handle_base;
         let q_norm_handle_id = norm_handle_base + 1;
         let k_norm_handle_id = norm_handle_base + 2;
@@ -118,6 +128,9 @@ impl<'a> TransformerBlock<'a> {
         let down_bytes = blocks_as_bytes(dn_blk);
         let rope_cos = rope.cos_at(pos);
         let rope_sin = rope.sin_at(pos);
+        // Before and after: an explicit release racing this upload must not
+        // leave a resident norm behind with the namespace marked unused.
+        self.slot_namespace.mark_gpu_used();
         let result = oxibonsai_kernels::try_metal_full_layer(
             hidden,
             pos,
@@ -149,7 +162,9 @@ impl<'a> TransformerBlock<'a> {
             eps,
             max_seq_len,
             n_layers,
+            slots.epoch(),
         );
+        self.slot_namespace.mark_gpu_used();
         match result {
             Ok(()) => {
                 tracing::debug!(
@@ -177,6 +192,16 @@ impl<'a> TransformerBlock<'a> {
     /// - `Some(Ok(()))` if the full layer was successfully computed on GPU.
     /// - `Some(Err(..))` if GPU dispatch was attempted but failed.
     /// - `None` if preconditions are not met (handles not available).
+    ///
+    /// The four RMSNorm weights are keyed on the block's slot namespace — for
+    /// a block of a loaded model, the composition over the model's
+    /// `cuda_model_epoch` that its full-forward CUDA paths use too
+    /// (`forward_cuda/q1.rs`) — so the per-layer and the full-forward paths
+    /// share one buffer per norm, and no norm slot can equal the final-norm
+    /// slot (they used to: this path keyed layer 0's attention norm on
+    /// `2_000_000`, the literal the full-forward path used for the final
+    /// norm, in the same `f32` cache). **Compile-blind** (no CUDA device on
+    /// the development host).
     #[cfg(all(
         feature = "native-cuda",
         not(all(feature = "metal", target_os = "macos")),
@@ -207,7 +232,10 @@ impl<'a> TransformerBlock<'a> {
         let eps = self.attn_norm.eps();
         let n_layers = kv_cache.num_layers();
         let max_seq_len = kv_cache.max_seq_len();
-        let norm_handle_base = 2_000_000u64 + (self.layer_idx as u64) * 10;
+        if self.layer_idx >= crate::model::types::q1_slots::MAX_SLOT_LAYERS {
+            return None;
+        }
+        let norm_handle_base = self.slot_namespace.slots().norm_base(self.layer_idx);
         let attn_norm_handle_id = norm_handle_base;
         let q_norm_handle_id = norm_handle_base + 1;
         let k_norm_handle_id = norm_handle_base + 2;

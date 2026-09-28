@@ -30,11 +30,115 @@ fail-fast = false
 # deadlock/livelock still gets terminated rather than hanging the run
 # forever.
 slow-timeout = { period = "120s", terminate-after = 3 }
+# HANDOVER-INFRA / T-13 (c): an ORCHESTRATOR-REVERSIBLE DECISION. Excludes
+# exactly the five real Bonsai 2 27B gate tests from every `cargo nextest run`
+# that does not explicitly ask for them. Without this, a workspace
+# `cargo nextest run --all-features` with `OXIBONSAI_MODELS_DIR` set (the
+# orchestrator's usual invocation) schedules `hybrid_forward_parity_tests`'s
+# and `bonsai2_engine_tests`'s real-27B cases as DEBUG builds — each maps a
+# 5.9-7.2 GB GGUF, so a handful running concurrently (nextest's default
+# parallelism, one process per test) can reach tens of GB resident on this
+# 24 GB machine (ruling R3) and takes on the order of hours in debug. They
+# still run in full: `scripts/release-gate.sh`'s stage 1c invokes them
+# directly in `--release`, one at a time; a developer who wants them through
+# nextest locally still can, explicitly, with `cargo nextest run
+# --release --ignore-default-filter -E '<the two filters just below,
+# combined with "or">'`. Reverse this (drop `default-filter`, or narrow it)
+# if a future host/CI runner can afford running them by default.
+default-filter = 'not (binary(hybrid_forward_parity_tests) & test(/hybrid_real_27b_/)) & not (binary(bonsai2_engine_tests) & test(/_engine_greedy_matches_the_fork_goldens$/))'
 
 [[profile.default.overrides]]
 filter = 'binary(legacy_parity_tests)'
 test-group = 'real-model-gate'
-slow-timeout = { period = "600s", terminate-after = 4 }
+# T-13: raised from `terminate-after = 4` (2400s ceiling) — under machine
+# load the orchestrator's own nextest run hit this ceiling on
+# `oxibonsai-runtime::legacy_parity_tests::
+# ternary_8b_greedy_text_matches_golden_across_tiers` (1445s quiet, > 2400s
+# loaded). `period` is unchanged; only the number of checks before giving up
+# grows, so a genuine deadlock/livelock is still caught, just with more
+# headroom for a busy shared build machine.
+slow-timeout = { period = "600s", terminate-after = 10 }
+
+# HANDOVER-INFRA (T-13 / B2-11-FIX verify minor[1]): pins
+# the real Bonsai 2 27B gates to the SAME `real-model-gate` group (already
+# `max-threads = 1`, see `[test-groups]` above) so they never run alongside
+# each other or alongside the legacy real-model gates above — one real-model
+# process at a time (ruling R3) — while every OTHER test in the same two
+# binaries (the synthetic/fixture-only cases nextest's own process-per-test
+# model already isolates) keeps running with full parallelism. `test(/…/)`
+# is a REGEX filter (the `/…/` delimiters), not a substring match: an
+# anchored `^hybrid_real_27b_` matches nothing here because
+# `hybrid_forward_parity_tests.rs` pulls these tests in through `#[path]
+# mod greedy_gates;` / `mod layer_gate;`, so nextest names them
+# `greedy_gates::hybrid_real_27b_*` / `layer_gate::hybrid_real_27b_*` — the
+# module prefix comes before the anchor point. Exact counts, verified
+# against this workspace (`cargo nextest list -p oxibonsai-model -p
+# oxibonsai-runtime --all-features --ignore-default-filter -E '<these two
+# filters, combined with "or">'` lists exactly 5; the same command without
+# `--ignore-default-filter` lists 0, per `default-filter` above):
+#   - `binary(hybrid_forward_parity_tests) & test(/hybrid_real_27b_/)` = 3
+#     (`greedy_gates::hybrid_real_27b_pq2_0_matches_the_fork_goldens_bonsai2`,
+#     `greedy_gates::hybrid_real_27b_ptq1_0_greedy_matches_the_fork_goldens_bonsai2`,
+#     `layer_gate::hybrid_real_27b_layers_match_the_f64_reference_bonsai2`);
+#   - `binary(bonsai2_engine_tests) & test(/_engine_greedy_matches_the_fork_goldens$/)`
+#     = 2 (`bonsai2_pq2_engine_greedy_matches_the_fork_goldens`,
+#     `bonsai2_ptq1_engine_greedy_matches_the_fork_goldens`).
+# `slow-timeout` here is deliberately generous (900s x 8 = 7200s): these are
+# release-profile-only gates in practice (`default-filter` above keeps a
+# plain nextest run from ever hitting them in debug), each mapping a
+# multi-GB GGUF and decoding tens of tokens. NOTE: with `default-filter`
+# active (the normal case), `cargo nextest show-config test-groups` prints
+# these two override headers with no test names underneath — the tests are
+# filtered out before show-config can list them. Add `--ignore-default-filter`
+# to the same command to see the pinned test names themselves.
+[[profile.default.overrides]]
+filter = 'binary(hybrid_forward_parity_tests) & test(/hybrid_real_27b_/)'
+test-group = 'real-model-gate'
+slow-timeout = { period = "900s", terminate-after = 8 }
+
+[[profile.default.overrides]]
+filter = 'binary(bonsai2_engine_tests) & test(/_engine_greedy_matches_the_fork_goldens$/)'
+test-group = 'real-model-gate'
+slow-timeout = { period = "900s", terminate-after = 8 }
+
+# EMBED-PERF / K-INT8-LEGACY-WIRE (wave 5): four more real-model legs join the
+# same one-at-a-time `real-model-gate` group (ruling R3). None of them is
+# `#[ignore]`d — each self-skips with a capability record when its model is
+# absent, and `int8_native_forward_tests` / `int8_tier_parity` also find
+# models through the testkit `models/` fallback when `OXIBONSAI_MODELS_DIR`
+# is unset — so without these pins a workspace `cargo nextest run` maps the
+# Ternary-Bonsai-1.7B and Bonsai-8B GGUFs in several concurrent debug
+# processes. The 600s x 10 ceiling matches `legacy_parity_tests` above: the
+# batched-hidden parity leg alone took 912-2653s in debug under load, far
+# past the 360s profile default that used to terminate it.
+#   - `real_model_batched_hidden_matches_sequential` (oxibonsai-model lib):
+#     batched `forward_hidden` vs the sequential path on a real GGUF;
+#   - `embed_bench_short_and_long` (oxibonsai-runtime): the embeddings
+#     throughput bench on a real GGUF;
+#   - `int8_native_forward_tests` (whole binary): the two full-forward INT8
+#     tier parity legs on the real 1.7B / 8B;
+#   - `int8_tier_parity`'s `*_on_the_real_*` legs (1.7B / 8B / 27B PQ2_0
+#     weights) and `cross_backend_determinism_tests`'s `real_model_*` legs
+#     (CPU-vs-Metal byte identity, INT8-tier decode tok/s).
+[[profile.default.overrides]]
+filter = 'package(oxibonsai-model) & kind(lib) & test(/real_model_batched_hidden_matches_sequential$/)'
+test-group = 'real-model-gate'
+slow-timeout = { period = "600s", terminate-after = 10 }
+
+[[profile.default.overrides]]
+filter = 'binary(embeddings_model_backed) & test(/embed_bench_short_and_long$/)'
+test-group = 'real-model-gate'
+slow-timeout = { period = "600s", terminate-after = 10 }
+
+[[profile.default.overrides]]
+filter = 'binary(int8_native_forward_tests)'
+test-group = 'real-model-gate'
+slow-timeout = { period = "600s", terminate-after = 10 }
+
+[[profile.default.overrides]]
+filter = '(binary(int8_tier_parity) & test(/_on_the_real_/)) | (binary(cross_backend_determinism_tests) & test(/^real_model_/))'
+test-group = 'real-model-gate'
+slow-timeout = { period = "600s", terminate-after = 10 }
 
 [profile.ci]
 retries = 0
@@ -48,11 +152,47 @@ failure-output = "immediate-final"
 success-output = "never"
 status-level = "fail"
 final-status-level = "flaky"
+# See `[profile.default]`'s own `default-filter` comment — same exclusion,
+# same reason, kept in sync by hand (nextest does not support inheriting one
+# profile's `default-filter` into another).
+default-filter = 'not (binary(hybrid_forward_parity_tests) & test(/hybrid_real_27b_/)) & not (binary(bonsai2_engine_tests) & test(/_engine_greedy_matches_the_fork_goldens$/))'
 
 [[profile.ci.overrides]]
 filter = 'binary(legacy_parity_tests)'
 test-group = 'real-model-gate'
-slow-timeout = { period = "600s", terminate-after = 4 }
+slow-timeout = { period = "600s", terminate-after = 10 }
+
+[[profile.ci.overrides]]
+filter = 'binary(hybrid_forward_parity_tests) & test(/hybrid_real_27b_/)'
+test-group = 'real-model-gate'
+slow-timeout = { period = "900s", terminate-after = 8 }
+
+[[profile.ci.overrides]]
+filter = 'binary(bonsai2_engine_tests) & test(/_engine_greedy_matches_the_fork_goldens$/)'
+test-group = 'real-model-gate'
+slow-timeout = { period = "900s", terminate-after = 8 }
+
+# Same four wave-5 real-model pins as `[profile.default]` above (see the
+# comment there); kept in sync by hand like `default-filter`.
+[[profile.ci.overrides]]
+filter = 'package(oxibonsai-model) & kind(lib) & test(/real_model_batched_hidden_matches_sequential$/)'
+test-group = 'real-model-gate'
+slow-timeout = { period = "600s", terminate-after = 10 }
+
+[[profile.ci.overrides]]
+filter = 'binary(embeddings_model_backed) & test(/embed_bench_short_and_long$/)'
+test-group = 'real-model-gate'
+slow-timeout = { period = "600s", terminate-after = 10 }
+
+[[profile.ci.overrides]]
+filter = 'binary(int8_native_forward_tests)'
+test-group = 'real-model-gate'
+slow-timeout = { period = "600s", terminate-after = 10 }
+
+[[profile.ci.overrides]]
+filter = '(binary(int8_tier_parity) & test(/_on_the_real_/)) | (binary(cross_backend_determinism_tests) & test(/^real_model_/))'
+test-group = 'real-model-gate'
+slow-timeout = { period = "600s", terminate-after = 10 }
 
 [profile.fast]
 # For the inner dev loop: run a narrow `-E` filter while iterating on one

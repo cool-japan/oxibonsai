@@ -620,22 +620,30 @@ fn compare_against_reference(context: &str, reference: &TierRun, other: &TierRun
 
 /// Serializes the real-model gates inside one test binary.
 ///
-/// Every gate below drives `KernelTier::Gpu`, and the Metal decode path is a
-/// process-global singleton (`GLOBAL_METAL_GRAPH`, one KV cache), so two of
-/// these running on `cargo test`'s default in-process thread pool would share
-/// it. Same pattern as
+/// Every gate below drives `KernelTier::Gpu`. MET-08 (METAL-CONCURRENCY,
+/// landed wave 4) split the old single mutable `GLOBAL_METAL_GRAPH` into a
+/// process-shared, immutable `MetalDevice` and a per-session `MetalGraph`
+/// (its own command queue, its own device KV cache) bound to a thread via
+/// `SessionScope` — so N sessions *can* now overlap on the GPU. None of the
+/// gates below bind a session, though, so `MetalGraph::global()` falls
+/// through to the single process-default session (`session.rs`'s own
+/// documented fallback, quoted verbatim: "A process that never binds
+/// therefore behaves exactly as it did before this split: one session, one
+/// queue, one KV cache, byte-identical output"), and
+/// two of these gates running on `cargo test`'s default in-process thread
+/// pool would still share it. Same pattern as
 /// `crates/oxibonsai-runtime/tests/metal_greedy_cpu_fallback_tests.rs`'s
 /// `gpu_serial()`, which was added for exactly this reason after the wave-3
 /// verifier reproduced a 3-of-3 failure under default parallelism.
 ///
 /// This is an in-binary guard only. `cargo nextest` runs each test in its own
-/// PROCESS, where the singleton is not shared but the MEMORY is: three real
-/// models (0.5 GB + 2.2 GB + 1.2 GB on disk, several GB resident each)
-/// decoded concurrently drove this 8-core/24 GB M3 to load average 96 during
-/// the wave-3.5 triage. **The release gate must invoke these tests with
-/// `--test-threads=1`** — `scripts/release-gate.sh` does; see this file's
-/// deviations footer for the `scripts/ci.sh` / `.config/nextest.toml` change
-/// that is not in this package's owned files.
+/// PROCESS, where the shared default session is not an issue but the MEMORY
+/// is: three real models (0.5 GB + 2.2 GB + 1.2 GB on disk, several GB
+/// resident each) decoded concurrently drove this 8-core/24 GB M3 to load
+/// average 96 during the wave-3.5 triage. **The release gate must invoke
+/// these tests with `--test-threads=1`** — `scripts/release-gate.sh` does;
+/// `.config/nextest.toml`'s `real-model-gate` test-group additionally pins
+/// this binary to one thread under `cargo nextest`.
 fn gpu_serial() -> std::sync::MutexGuard<'static, ()> {
     static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     GPU_LOCK

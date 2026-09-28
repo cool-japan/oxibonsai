@@ -56,7 +56,6 @@ oxiarc-deflate = "0.4.2"
 # ── GPU backends ──
 metal = "0.33.0"
 cudarc = { version = "0.19", features = ["nvrtc", "cuda-version-from-build-system", "fallback-latest"] }
-objc = "0.2"
 
 # ── Error handling ──
 thiserror = "2.0.20"
@@ -68,7 +67,14 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 
 # ── Serialization ──
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+# `raw_value` (B2-13 reverify minor[7]): `tokenizer_bridge/chat_render.rs`,
+# `server/chat.rs` and `api_extensions.rs` construct `Box<serde_json::value::
+# RawValue>` directly (preserving a request's raw tool-call-argument JSON
+# byte for byte through the chat-template/tool-call path). That feature used
+# to be enabled only transitively through axum's own `serde_json` edge —
+# declared explicitly here so it does not silently disappear if axum ever
+# drops it.
+serde_json = { version = "1.0.151", features = ["raw_value"] }
 toml = "1.1.6"
 
 # ── Async runtime ──
@@ -268,6 +274,11 @@ oxibonsai-core.workspace = true
 oxibonsai-kernels.workspace = true
 oxibonsai-model.workspace = true
 oxibonsai-runtime.workspace = true
+# EMBED-WIRE handover (2): lets `tests/server_integration_tests.rs` build its
+# synthetic fixtures through `oxibonsai_testkit::gguf_fixture` instead of a
+# hand-rolled copy. Dev-only (see the `[workspace.dependencies]` entry's own
+# doc comment for why that crate carries no `version` key).
+oxibonsai-testkit.workspace = true
 reqwest.workspace = true
 axum.workspace = true
 tower.workspace = true
@@ -300,6 +311,7 @@ path = "examples/metrics_demo.rs"
 [[example]]
 name = "server_client"
 path = "examples/server_client.rs"
+required-features = ["server"]
 
 [[example]]
 name = "runtime_controllers"

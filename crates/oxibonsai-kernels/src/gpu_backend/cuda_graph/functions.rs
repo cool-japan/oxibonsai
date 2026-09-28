@@ -170,8 +170,9 @@ pub fn cuda_context_is_live() -> bool {
 }
 
 /// `CudaGraphError` is memoised in the singleton slot and handed back to every
-/// later caller, so it must be cloneable. (Manual rather than derived: the enum
-/// lives in this module's sibling `types`, which this package does not own.)
+/// later caller, so it must be cloneable. (Implemented here, beside the
+/// singleton that needs it, rather than derived on the enum in the sibling
+/// `types` module.)
 impl Clone for CudaGraphError {
     fn clone(&self) -> Self {
         match self {
@@ -180,6 +181,7 @@ impl Clone for CudaGraphError {
             Self::DriverError(m) => Self::DriverError(m.clone()),
             Self::WeightNotFound(h) => Self::WeightNotFound(*h),
             Self::WeightLayoutError(m) => Self::WeightLayoutError(m.clone()),
+            Self::InvalidDimensions(m) => Self::InvalidDimensions(m.clone()),
             Self::LockPoisoned => Self::LockPoisoned,
         }
     }

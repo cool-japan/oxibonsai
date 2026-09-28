@@ -50,9 +50,9 @@
 # Each line's object:
 #   {"capability": "metal", "executed": true, "test": "oxibonsai-kernels::metal_k_quant_gemv_parity::metal_gemv_q2k_matches_scalar"}
 #   - "capability" (string, required): one of "metal", "cuda", "rag-real-generation",
-#     "image-parity", "legacy-models" (extend this list here, in the same
-#     edit that adds a new gated capability, so this file stays the single
-#     source of truth).
+#     "image-parity", "legacy-models", "bonsai2-models" (extend this list
+#     here, in the same edit that adds a new gated capability, so this file
+#     stays the single source of truth).
 #   - "executed" (bool, required): true iff the test body actually reached
 #     and ran the hardware/fixture-dependent code path this run — NOT
 #     merely "the process exited 0". A test that detects the capability is
@@ -84,6 +84,15 @@
 #     not they record executed=false, and a release must not be cut from such
 #     a run without the operator saying so out loud. --skip-legacy-models is
 #     that explicit statement; it is visible in this script's own output.
+#   - "bonsai2-models" is required on Darwin unless --skip-bonsai2-models is
+#     passed (HANDOVER-INFRA, same shape as "legacy-models" above, for the
+#     Bonsai 2 27B target instead of the 1.7B/8B/1-bit legacy models): the
+#     evidence that `oxibonsai-model::hybrid_forward_parity_tests`'s three
+#     real-27B gates (PQ2_0, PTQ1_0, the f64-layer reference) and
+#     `oxibonsai-runtime::bonsai2_engine_tests`'s two real-27B gates actually
+#     RAN against the shipped `Ternary-Bonsai-2-27B-{PQ2_0,PTQ1_0}.gguf`
+#     files, not merely that they self-skipped cleanly. --skip-bonsai2-models
+#     is the explicit "this release carries no such evidence" statement.
 #
 # ── THE REAL-MODEL PARITY STAGE MUST BE SERIALIZED ──────────────────────────
 # The six real-model parity tests (three in oxibonsai-model, three in
@@ -162,12 +171,16 @@
 # (tracked as CI-GATE's T-05 deviation until TESTS-INFRA lands it).
 #
 # Usage:
-#   ./scripts/release-gate.sh                       # metal + legacy-models
-#                                                   # required iff macOS
-#   ./scripts/release-gate.sh --require-cuda        # also require cuda evidence
-#   ./scripts/release-gate.sh --skip-legacy-models  # release WITHOUT real-model
-#                                                   # parity evidence (state it
-#                                                   # in the release notes)
+#   ./scripts/release-gate.sh                        # metal + legacy-models +
+#                                                     # bonsai2-models required
+#                                                     # iff macOS
+#   ./scripts/release-gate.sh --require-cuda         # also require cuda evidence
+#   ./scripts/release-gate.sh --skip-legacy-models   # release WITHOUT real legacy-
+#                                                     # model parity evidence (state
+#                                                     # it in the release notes)
+#   ./scripts/release-gate.sh --skip-bonsai2-models  # release WITHOUT real Bonsai 2
+#                                                     # 27B evidence (state it in the
+#                                                     # release notes)
 #
 # Copyright 2026 COOLJAPAN OU (Team KitaSan)
 # SPDX-License-Identifier: Apache-2.0
@@ -344,10 +357,19 @@ release_gate_self_test() {
     check "two required capabilities, both satisfied" 0 \
         "$work_dir/both_true.jsonl" "$now" metal cuda
 
+    # 9. HANDOVER-INFRA: the "bonsai2-models" capability is checked by the
+    #    exact same generic logic as every other capability name above — this
+    #    scenario exercises it by name so a future rename/typo of the string
+    #    this script and `Capability::Bonsai2Models::as_str()` must agree on
+    #    fails a test here, not only in production.
+    printf '%s\n' '{"capability":"bonsai2-models","executed":true,"test":"t::bonsai2_ran"}' \
+        >"$work_dir/bonsai2_models_true.jsonl"
+    check "bonsai2-models executed:true" 0 "$work_dir/bonsai2_models_true.jsonl" "$now" bonsai2-models
+
     rm -rf "$work_dir"
     if [[ "$failures" -eq 0 ]]; then
         echo ""
-        echo "OK: release-gate.sh self-test — all 8 scenarios matched their expected verdict."
+        echo "OK: release-gate.sh self-test — all 9 scenarios matched their expected verdict."
         return 0
     fi
     echo ""
@@ -357,17 +379,20 @@ release_gate_self_test() {
 
 REQUIRE_CUDA=0
 SKIP_LEGACY_MODELS=0
+SKIP_BONSAI2_MODELS=0
 for arg in "$@"; do
     case "$arg" in
         --require-cuda) REQUIRE_CUDA=1 ;;
         --skip-legacy-models) SKIP_LEGACY_MODELS=1 ;;
+        --skip-bonsai2-models) SKIP_BONSAI2_MODELS=1 ;;
         --self-test)
             release_gate_self_test
             exit $?
             ;;
         --help|-h)
             cat <<'HELP_EOF'
-Usage: release-gate.sh [--require-cuda] [--skip-legacy-models] [--self-test]
+Usage: release-gate.sh [--require-cuda] [--skip-legacy-models]
+                        [--skip-bonsai2-models] [--self-test]
 
   --require-cuda        Also require fresh "cuda" capability-manifest
                          evidence (see the capability-manifest contract at
@@ -390,6 +415,22 @@ Usage: release-gate.sh [--require-cuda] [--skip-legacy-models] [--self-test]
                          "legacy-models" to the required-capability list —
                          and must be stated explicitly in the release notes
                          when used; it is never applied implicitly.
+
+  --skip-bonsai2-models  Opt out of the "bonsai2-models" capability, which
+                         is otherwise REQUIRED on Darwin (HANDOVER-INFRA,
+                         same shape as --skip-legacy-models above, for the
+                         Bonsai 2 27B target). "bonsai2-models" is the
+                         evidence that the real Bonsai 2 27B gates
+                         (oxibonsai-model's hybrid_forward_parity_tests and
+                         oxibonsai-runtime's bonsai2_engine_tests, driven
+                         against the shipped Ternary-Bonsai-2-27B-{PQ2_0,
+                         PTQ1_0}.gguf files) actually ran on this host.
+                         Passing this flag releases WITHOUT that real-model
+                         evidence — the gate skips stage 1c entirely and
+                         does not add "bonsai2-models" to the
+                         required-capability list — and must be stated
+                         explicitly in the release notes when used; it is
+                         never applied implicitly.
 
   --self-test            Run this script's own capability-manifest-parsing
                          self-test scenarios and exit (no release gate).
@@ -432,6 +473,15 @@ if [[ "$SKIP_LEGACY_MODELS" -eq 1 ]]; then
 elif [[ "$(uname -s)" == "Darwin" ]]; then
     echo "  -> real-model CPU/NEON/Metal greedy parity evidence (\"legacy-models\")"
     echo "     is REQUIRED on this host; pass --skip-legacy-models to opt out."
+fi
+echo "skip-bonsai2-models: $([[ "$SKIP_BONSAI2_MODELS" -eq 1 ]] && echo yes || echo no)"
+if [[ "$SKIP_BONSAI2_MODELS" -eq 1 ]]; then
+    echo "  -> real Bonsai 2 27B parity evidence (\"bonsai2-models\") will NOT be"
+    echo "     required or collected this run; state this explicitly in the"
+    echo "     release notes (run with --help for the full explanation)."
+elif [[ "$(uname -s)" == "Darwin" ]]; then
+    echo "  -> real Bonsai 2 27B parity evidence (\"bonsai2-models\") is REQUIRED"
+    echo "     on this host; pass --skip-bonsai2-models to opt out."
 fi
 echo ""
 
@@ -539,6 +589,107 @@ else
     done
 fi
 
+# ── 1c. Real Bonsai 2 27B gates, SERIALIZED, RELEASE (HANDOVER-INFRA) ────
+# Same shape as stage 1b, for the Bonsai 2 27B target: two `cargo test`
+# invocations (`oxibonsai-model`'s `hybrid_forward_parity_tests`, then
+# `oxibonsai-runtime`'s `bonsai2_engine_tests`), each `--test-threads=1`, run
+# ONE AFTER THE OTHER — never backgrounded, never `&`ed — so this script maps
+# at most one 27B GGUF (5.9-7.2 GB) at a time, honouring the memory rule
+# every producer test's own in-binary/engine-level lock only enforces WITHIN
+# its own process (ruling R3: one real-27B process at a time on this 24 GB
+# machine). Each binary is NOT `#[ignore]`d: on a host with the GGUFs it runs
+# the real gates and records `executed: true`; on a host without them it
+# self-skips and records `executed: false`, which the capability check below
+# turns into a failed gate unless --skip-bonsai2-models was passed.
+if [[ "$SKIP_BONSAI2_MODELS" -eq 1 ]]; then
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo "  Real Bonsai 2 27B gate: SKIPPED BY REQUEST"
+    echo "═══════════════════════════════════════════════════════════════"
+    echo "--skip-bonsai2-models was passed: this release carries NO real Bonsai 2"
+    echo "27B parity evidence. Say so in the release notes."
+elif [[ "$(uname -s)" != "Darwin" ]]; then
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo "  Real Bonsai 2 27B gate: NOT AVAILABLE ON THIS HOST"
+    echo "═══════════════════════════════════════════════════════════════"
+    echo "Both gates target the Metal-capable CPU/GPU tiers on Apple Silicon;"
+    echo "there is no non-macOS run of them on this machine. Nothing to run."
+else
+    BONSAI2_MODELS_DIR="${OXIBONSAI_MODELS_DIR:-$PROJECT_ROOT/models}"
+    BONSAI2_GOLDEN_DIR="$PROJECT_ROOT/crates/oxibonsai-model/tests/fixtures/bonsai2_golden"
+    BONSAI2_PQ2_PATH="$BONSAI2_MODELS_DIR/Ternary-Bonsai-2-27B-PQ2_0.gguf"
+    BONSAI2_PTQ1_PATH="$BONSAI2_MODELS_DIR/Ternary-Bonsai-2-27B-PTQ1_0.gguf"
+
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo "  Real Bonsai 2 27B gate (--test-threads=1, one 27B process at a time)"
+    echo "═══════════════════════════════════════════════════════════════"
+    echo "models dir: $BONSAI2_MODELS_DIR"
+    echo "golden dir: $BONSAI2_GOLDEN_DIR (vendored)"
+    BONSAI2_MISSING=()
+    [[ -s "$BONSAI2_PQ2_PATH" ]] || BONSAI2_MISSING+=("Ternary-Bonsai-2-27B-PQ2_0.gguf")
+    [[ -s "$BONSAI2_PTQ1_PATH" ]] || BONSAI2_MISSING+=("Ternary-Bonsai-2-27B-PTQ1_0.gguf")
+    if [[ "${#BONSAI2_MISSING[@]}" -gt 0 ]]; then
+        echo "MISSING fixtures: ${BONSAI2_MISSING[*]}"
+        echo "The gates below will self-skip and record executed=false for whichever"
+        echo "GGUF is absent, which the capability check will report as a FAILED"
+        echo "release gate. Put the GGUFs in place, point OXIBONSAI_MODELS_DIR at"
+        echo "them, or pass --skip-bonsai2-models deliberately."
+    fi
+
+    # oxibonsai-model's harness (`bonsai2_real/harness.rs::locate_model`)
+    # resolves each file from `OXIBONSAI_MODELS_DIR` itself plus the release
+    # file name, and self-skips per-file when one is absent — so this one
+    # variable is always safe to export, present or not.
+    echo ""
+    echo "── oxibonsai-model::hybrid_forward_parity_tests (real 27B gates) ──────"
+    OXIBONSAI_MODELS_DIR="$BONSAI2_MODELS_DIR" \
+        cargo test --release -p oxibonsai-model --all-features \
+        --test hybrid_forward_parity_tests -- --test-threads=1 --nocapture || {
+        rc=$?
+        echo ""
+        echo "═══════════════════════════════════════════════════════════════"
+        echo "RELEASE GATE FAILED: oxibonsai-model's real Bonsai 2 27B gate did"
+        echo "not pass (exit $rc). Read the per-step/per-layer comparison above."
+        echo "═══════════════════════════════════════════════════════════════"
+        exit "$rc"
+    }
+
+    # oxibonsai-runtime's harness (`bonsai2_engine_tests.rs::env_path`), by
+    # contrast, treats a SET-but-missing `OXI_BONSAI2_{PQ2,PTQ1}_GGUF` as a
+    # hard failure (`check_engine_against_goldens` asserts `model_path.
+    # is_file()`), not a skip — unlike `locate_model` above, it does not
+    # itself re-check the file's existence before trusting the variable. So
+    # each is exported here only when its own file actually exists; the
+    # unconditional `OXIBONSAI_MODELS_DIR` and vendored `OXI_BONSAI2_GOLDEN_DIR`
+    # are always safe (both are simply directories `env_path`/`locate_model`
+    # never assert the existence of on their own).
+    BONSAI2_ENGINE_ENV=(
+        "OXIBONSAI_MODELS_DIR=$BONSAI2_MODELS_DIR"
+        "OXI_BONSAI2_GOLDEN_DIR=$BONSAI2_GOLDEN_DIR"
+    )
+    [[ -s "$BONSAI2_PQ2_PATH" ]] && BONSAI2_ENGINE_ENV+=("OXI_BONSAI2_PQ2_GGUF=$BONSAI2_PQ2_PATH")
+    [[ -s "$BONSAI2_PTQ1_PATH" ]] && BONSAI2_ENGINE_ENV+=("OXI_BONSAI2_PTQ1_GGUF=$BONSAI2_PTQ1_PATH")
+
+    # Run strictly AFTER the model-crate gate above has fully exited — never
+    # in parallel with it — so this script never holds two 27B mappings at
+    # once (the memory rule this section's header comment states).
+    echo ""
+    echo "── oxibonsai-runtime::bonsai2_engine_tests (real 27B gates) ───────────"
+    env "${BONSAI2_ENGINE_ENV[@]}" \
+        cargo test --release -p oxibonsai-runtime --all-features \
+        --test bonsai2_engine_tests -- --test-threads=1 --nocapture || {
+        rc=$?
+        echo ""
+        echo "═══════════════════════════════════════════════════════════════"
+        echo "RELEASE GATE FAILED: oxibonsai-runtime's real Bonsai 2 27B engine"
+        echo "gate did not pass (exit $rc). Read the per-prompt comparison above."
+        echo "═══════════════════════════════════════════════════════════════"
+        exit "$rc"
+    }
+fi
+
 # ── 2. Hardware-capability enforcement (T-05) ────────────────────────────
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
@@ -555,6 +706,11 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     # its own name. See the --skip-legacy-models note in this file's header.
     if [[ "$SKIP_LEGACY_MODELS" -eq 0 ]]; then
         REQUIRED_CAPS+=("legacy-models")
+    fi
+    # Same reasoning, for the Bonsai 2 27B target (HANDOVER-INFRA): see the
+    # --skip-bonsai2-models note in this file's header.
+    if [[ "$SKIP_BONSAI2_MODELS" -eq 0 ]]; then
+        REQUIRED_CAPS+=("bonsai2-models")
     fi
 fi
 if [[ "$REQUIRE_CUDA" -eq 1 ]]; then

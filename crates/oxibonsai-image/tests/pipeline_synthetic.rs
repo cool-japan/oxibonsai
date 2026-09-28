@@ -78,9 +78,16 @@ fn scratch(label: &str) -> PathBuf {
 /// file is its own separate test binary (nextest's one-process-per-test
 /// model means no other test's `OnceLock` can already be latched when this
 /// one runs), but it is a latent ordering hazard the moment a second test
-/// is added to this same file — see METAL-CONCURRENCY (wave 4), which
-/// removes the underlying `GLOBAL_METAL_GRAPH` process-global singleton
-/// these `OnceLock` gates exist alongside.
+/// is added to this same file. METAL-CONCURRENCY (MET-08, landed wave 4)
+/// fixed the analogous hazard in `oxibonsai-kernels`, but by a mechanism
+/// that does not apply here unmodified: it split the single mutable
+/// `GLOBAL_METAL_GRAPH` into a process-shared `MetalDevice` plus a
+/// per-session `MetalGraph` bound to a thread via `SessionScope` — this
+/// file's `OXI_DIT_GPU`/`OXI_DIT_FUSED`/`OXI_VAE_GPU`/`OXI_TE_GPU`
+/// `OnceLock` gates are a different, image-crate-local mechanism with no
+/// per-session equivalent yet, so the precedent it sets is "give this file's
+/// gates a public, non-env override entry point" (this doc comment's own
+/// paragraph above), not a ready-made fix to adopt directly.
 fn force_cpu() {
     std::env::set_var("OXI_DIT_GPU", "0");
     std::env::set_var("OXI_DIT_FUSED", "0");

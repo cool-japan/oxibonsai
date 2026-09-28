@@ -239,7 +239,6 @@ pub(super) fn acquire_k_quant_prefill_buffers(
             d_normed: alloc(capacity * hidden_size)?,
             d_qkv: alloc(capacity * qkv_total)?,
             d_attn_out: alloc(capacity * nq * head_dim)?,
-            d_gate_up: alloc(2 * capacity * intermediate_size)?,
             d_swiglu: alloc(capacity * intermediate_size)?,
             capacity,
             actual_batch_size: batch_size,
@@ -251,9 +250,12 @@ pub(super) fn acquire_k_quant_prefill_buffers(
             max_seq,
         });
     } else {
+        // `needs_alloc` is false only when the guard holds `Some`.
         guard
             .as_mut()
-            .expect("guard is Some when needs_alloc is false")
+            .ok_or_else(|| {
+                CudaGraphError::DriverError("K-quant prefill buffers missing on reuse".into())
+            })?
             .actual_batch_size = batch_size;
     }
 
@@ -280,7 +282,14 @@ pub(super) fn acquire_k_quant_kv_cache(
     };
 
     if needs_alloc {
-        let total = n_layers * n_kv * max_seq * head_dim;
+        // F4: a zero or overflowing geometry is refused before allocating
+        // (an unchecked product could wrap and under-allocate the cache
+        // every later layer offset and the F6 read-back index into).
+        let total = crate::gpu_backend::cuda_device_negotiation::check_cuda_kv_cache_geometry(
+            n_layers, n_kv, max_seq, head_dim,
+        )
+        .map_err(|e| CudaGraphError::InvalidDimensions(format!("KV cache geometry: {e}")))?
+            as usize;
         let k_cache = graph
             .stream_arc()
             .alloc_zeros::<u16>(total)

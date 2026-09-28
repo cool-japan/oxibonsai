@@ -21,6 +21,7 @@ impl fmt::Display for CudaGraphError {
             Self::DriverError(s) => write!(f, "CUDA driver error: {s}"),
             Self::WeightNotFound(id) => write!(f, "weight handle {id} not in cache"),
             Self::WeightLayoutError(s) => write!(f, "weight layout error: {s}"),
+            Self::InvalidDimensions(s) => write!(f, "invalid dimensions: {s}"),
             Self::LockPoisoned => write!(f, "mutex lock poisoned"),
         }
     }

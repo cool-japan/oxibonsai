@@ -227,7 +227,14 @@ impl<'a> PrefixCachedEngine<'a> {
         );
         let prefix_cache = PrefixAwarePrefill::new(cache);
         let effective_seed = if seed == 0 { 0xdeadbeef_cafebabe } else { seed };
-        let sampler = Sampler::new(SamplingParams::default(), effective_seed);
+        // Gatekeeper REQUIRED #18 (waves 3+3.5 review): seed the wrapper's
+        // own decode sampler from the WRAPPED engine's own configured
+        // sampling params (e.g. GGUF-derived defaults per RT-17) rather
+        // than a bare `SamplingParams::default()`, so this "at rest"
+        // baseline (restored by `decode_loop` between calls, see its own
+        // doc comment) never silently diverges from what the engine itself
+        // was actually built with.
+        let sampler = Sampler::new(engine.sampling_params().clone(), effective_seed);
         Self {
             inner: engine,
             prefix_cache,

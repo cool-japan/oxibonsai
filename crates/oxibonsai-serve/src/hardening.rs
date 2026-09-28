@@ -299,11 +299,16 @@ pub struct RouterBuildOptions {
     /// The hard `max_tokens` ceiling override (`SV-28`, from
     /// `--max-output-tokens`), when the CLI passed one.
     pub max_output_tokens_ceiling: Option<usize>,
+    /// The model-backed embedder `/v1/embeddings` answers from
+    /// (`HANDOVER-RT` item 13, built by `oxibonsai_serve::embedder`), or
+    /// `None` for the route's honest `501`.
+    pub embedder: Option<Arc<oxibonsai_runtime::embed_engine::ModelEmbedder>>,
 }
 
 impl RouterBuildOptions {
     /// Name every field positionally -- the shape both call sites already
-    /// had before this bundle existed.
+    /// had before this bundle existed. No embedder: see
+    /// [`Self::with_embedder`].
     pub fn new(
         admin_auth: AdminAuthConfig,
         pool_size: usize,
@@ -315,7 +320,18 @@ impl RouterBuildOptions {
             pool_size,
             enable_ui,
             max_output_tokens_ceiling,
+            embedder: None,
         }
+    }
+
+    /// Serve `/v1/embeddings` from `embedder` (builder).
+    #[must_use]
+    pub fn with_embedder(
+        mut self,
+        embedder: Option<Arc<oxibonsai_runtime::embed_engine::ModelEmbedder>>,
+    ) -> Self {
+        self.embedder = embedder;
+        self
     }
 }
 
@@ -362,13 +378,15 @@ pub fn build_router(
         pool_size,
         enable_ui,
         max_output_tokens_ceiling,
+        embedder,
     } = build_options;
 
     let mut router_options = RouterOptions::default()
         .with_limits(resolve_request_limits(config))
         .with_auth(admin_auth)
         .with_default_max_tokens(config.sampling.default_max_tokens)
-        .with_enable_ui(enable_ui);
+        .with_enable_ui(enable_ui)
+        .with_embedder(embedder);
     if let Some(ceiling) = max_output_tokens_ceiling {
         router_options = router_options.with_max_output_tokens_ceiling(ceiling);
     }

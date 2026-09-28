@@ -37,6 +37,7 @@
 
 mod archive;
 mod attention;
+pub mod cuda_qwen35_kernels;
 mod decode;
 mod decode_ternary;
 mod dit_attention_flash;
@@ -49,6 +50,7 @@ mod prefill_simdgroup;
 mod prefill_simdgroup_v10;
 mod prefill_tiled;
 mod q_std;
+pub mod qwen35;
 mod utility;
 mod vae;
 mod vae_conv_implicit;

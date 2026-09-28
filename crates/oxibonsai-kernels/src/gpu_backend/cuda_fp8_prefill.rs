@@ -34,8 +34,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use super::cuda_fp8_prefill_kernels::CUDA_FP8_PREFILL_KERNELS_SRC;
 use super::cuda_full_layer::{
-    acquire_full_layer_buffers, encode_attn_phase_from_qkv, get_or_upload_f32_weight,
-    init_attn_modules, CudaAttnModules, CudaFullLayerBuffers, CudaKvCache,
+    acquire_full_layer_buffers, check_batch_prefill_inputs, encode_attn_phase_from_qkv,
+    get_or_upload_f32_weight, init_attn_modules, read_back_kv_cache, CudaAttnModules,
+    CudaFullLayerBuffers, CudaKvCache, KvReadback,
 };
 use super::cuda_graph::{compile_or_load_ptx, CudaGraph, CudaGraphError};
 use super::cuda_prefill::{init_prefill_modules, CudaPrefillBuffers, CudaPrefillModules};
@@ -222,7 +223,6 @@ fn acquire_fp8_prefill_buffers(
             d_normed: alloc(capacity * hidden_size)?,
             d_qkv: alloc(capacity * qkv_total)?,
             d_attn_out: alloc(capacity * nq * head_dim)?,
-            d_gate_up: alloc(2 * capacity * intermediate_size)?,
             d_swiglu: alloc(capacity * intermediate_size)?,
             capacity,
             actual_batch_size: batch_size,
@@ -234,9 +234,12 @@ fn acquire_fp8_prefill_buffers(
             max_seq,
         });
     } else {
+        // `needs_alloc` is false only when the guard holds `Some`.
         guard
             .as_mut()
-            .expect("guard is Some when needs_alloc is false")
+            .ok_or_else(|| {
+                CudaGraphError::DriverError("FP8 prefill buffers missing on reuse".into())
+            })?
             .actual_batch_size = batch_size;
     }
 
@@ -263,7 +266,14 @@ fn acquire_fp8_kv_cache(
     };
 
     if needs_alloc {
-        let total = n_layers * n_kv * max_seq * head_dim;
+        // F4: a zero or overflowing geometry is refused before allocating
+        // (an unchecked product could wrap and under-allocate the cache
+        // every later layer offset and the F6 read-back index into).
+        let total = super::cuda_device_negotiation::check_cuda_kv_cache_geometry(
+            n_layers, n_kv, max_seq, head_dim,
+        )
+        .map_err(|e| CudaGraphError::InvalidDimensions(format!("KV cache geometry: {e}")))?
+            as usize;
         let k_cache = graph
             .stream_arc()
             .alloc_zeros::<u16>(total)
@@ -892,22 +902,19 @@ unsafe fn encode_fp8_prefill_layer(
 }
 
 // =============================================================================
-// Public entry point: try_cuda_prefill_fp8
+// Public entry point: try_cuda_prefill_fp8 / try_cuda_prefill_fp8_with_kv_readback
 // =============================================================================
 
-/// Batch prefill for FP8 E4M3 or E5M2 quantised models.
+/// [`try_cuda_prefill_fp8_with_kv_readback`] without a KV read-back request
+/// (`kv_readback_out: None`).
 ///
-/// Processes `batch_size` tokens simultaneously using real fused batch GEMM kernels
-/// for all linear projections.  Attention is processed per-token sequentially.
+/// The model's FP8 batch-prefill methods (`oxibonsai-model`'s
+/// `forward_cuda_fp8`) call this form: they do not write a read-back into
+/// the host `KvCache`, which is why that family's split-cache prefill stays
+/// refused (`forward_cuda::cuda_split_prefill_allowed`). A caller that does
+/// store the read-back uses [`try_cuda_prefill_fp8_with_kv_readback`].
 ///
-/// Set `is_e4m3 = true` for E4M3 weights, `is_e4m3 = false` for E5M2 weights.
-///
-/// # Arguments
-///
-/// - `hidden_batch` — host-side batched hidden states in row-major layout:
-///   `[batch_size × hidden_size]` (token-major).  Converted to column-major internally.
-/// - `logits_out` / `greedy_token_id_out` — if `Some`, the function runs the final
-///   norm and LM head for the last token and returns either full logits or the argmax.
+/// **CUDA is unvalidated**: no CUDA hardware has run this entry point.
 #[allow(clippy::too_many_arguments)]
 pub fn try_cuda_prefill_fp8(
     hidden_batch: &[f32],
@@ -935,9 +942,99 @@ pub fn try_cuda_prefill_fp8(
     logits_out: Option<&mut Vec<f32>>,
     greedy_token_id_out: Option<&mut u32>,
 ) -> Result<(), CudaGraphError> {
+    try_cuda_prefill_fp8_with_kv_readback(
+        hidden_batch,
+        batch_size,
+        pos_start,
+        n_layers,
+        layer_params,
+        cos_table,
+        sin_table,
+        hidden_size,
+        intermediate_size,
+        nq,
+        nkv,
+        head_dim,
+        heads_per_group,
+        eps,
+        max_seq_len,
+        final_norm_handle,
+        final_norm_bytes,
+        final_norm_eps,
+        lm_head_handle,
+        lm_head_bytes,
+        lm_head_out_features,
+        is_e4m3,
+        logits_out,
+        greedy_token_id_out,
+        None,
+    )
+}
+
+/// Batch prefill for FP8 E4M3 or E5M2 quantised models.
+///
+/// Processes `batch_size` tokens simultaneously using real fused batch GEMM kernels
+/// for all linear projections.  Attention is processed per-token sequentially.
+///
+/// Set `is_e4m3 = true` for E4M3 weights, `is_e4m3 = false` for E5M2 weights.
+///
+/// # Arguments
+///
+/// - `hidden_batch` — host-side batched hidden states in row-major layout:
+///   `[batch_size × hidden_size]` (token-major).  Converted to column-major internally.
+/// - `logits_out` / `greedy_token_id_out` — if `Some`, the function runs the final
+///   norm and LM head for the last token and returns either full logits or the argmax.
+/// - `kv_readback_out` — if `Some`, filled (finding **F6**) with this call's
+///   `[pos_start, pos_start + batch_size)` window of every layer's K/V,
+///   converted to `f32` (see [`super::cuda_full_layer::read_back_kv_cache`]
+///   for the exact layout) — the caller then writes it into the model's
+///   host `KvCache` so decode does not attend over stale, all-zero prompt
+///   positions. Left untouched when the call fails.
+///
+/// **CUDA is unvalidated**: no CUDA hardware has run this entry point.
+#[allow(clippy::too_many_arguments)]
+pub fn try_cuda_prefill_fp8_with_kv_readback(
+    hidden_batch: &[f32],
+    batch_size: usize,
+    pos_start: usize,
+    n_layers: usize,
+    layer_params: &[CudaFP8PrefillLayerParams<'_>],
+    cos_table: &[f32],
+    sin_table: &[f32],
+    hidden_size: usize,
+    intermediate_size: usize,
+    nq: usize,
+    nkv: usize,
+    head_dim: usize,
+    heads_per_group: usize,
+    eps: f32,
+    max_seq_len: usize,
+    final_norm_handle: Option<u64>,
+    final_norm_bytes: Option<&[f32]>,
+    final_norm_eps: f32,
+    lm_head_handle: Option<u64>,
+    lm_head_bytes: Option<&[u8]>,
+    lm_head_out_features: usize,
+    is_e4m3: bool,
+    logits_out: Option<&mut Vec<f32>>,
+    greedy_token_id_out: Option<&mut u32>,
+    kv_readback_out: Option<&mut KvReadback>,
+) -> Result<(), CudaGraphError> {
     if batch_size == 0 {
         return Ok(());
     }
+    // Refuse an impossible KV window or short host inputs before any device
+    // work (the window bound is what keeps `fused_kv_store` inside its slab).
+    check_batch_prefill_inputs(
+        "try_cuda_prefill_fp8",
+        pos_start,
+        batch_size,
+        max_seq_len,
+        hidden_batch.len(),
+        hidden_size,
+        (cos_table.len(), sin_table.len()),
+        head_dim,
+    )?;
 
     // Get global CudaGraph singleton.
     let graph = CudaGraph::global()?;
@@ -1060,6 +1157,12 @@ pub fn try_cuda_prefill_fp8(
                 is_e4m3,
             )?;
         }
+    }
+
+    // F6: hand the prompt's device K/V back to the host so decode does not
+    // attend over stale all-zero KV for these positions.
+    if let Some(out) = kv_readback_out {
+        *out = unsafe { read_back_kv_cache(&graph, kv, pos_start, batch_size)? };
     }
 
     // ─── Final norm + LM head (optional) ─────────────────────────────────────

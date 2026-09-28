@@ -83,7 +83,7 @@ fn env_path(var: &str, test: &str) -> Option<PathBuf> {
                 "capability report: {test} SKIPPED — ${var} is not set (point it at the real \
                  Bonsai 2 27B file / golden directory to run this acceptance case)"
             );
-            record_skipped(Capability::LegacyModels, test);
+            record_skipped(Capability::Bonsai2Models, test);
             None
         }
     }
@@ -234,7 +234,7 @@ fn bonsai2_pq2_engine_greedy_matches_the_fork_goldens() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     check_engine_against_goldens(&model, &golden_dir, "PQ2_0");
-    record_executed(Capability::LegacyModels, TEST);
+    record_executed(Capability::Bonsai2Models, TEST);
 }
 
 #[test]
@@ -250,7 +250,7 @@ fn bonsai2_ptq1_engine_greedy_matches_the_fork_goldens() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     check_engine_against_goldens(&model, &golden_dir, "PTQ1_0");
-    record_executed(Capability::LegacyModels, TEST);
+    record_executed(Capability::Bonsai2Models, TEST);
 }
 
 /// The golden parsers themselves, proven on inline copies of both fork

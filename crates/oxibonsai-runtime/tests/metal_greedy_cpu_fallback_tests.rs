@@ -156,8 +156,10 @@ fn build_synthetic_ternary_gguf() -> Vec<u8> {
     // within ~1e-3–2e-3, and the *winning* token in a failing run sat
     // 1.6–3.5 logits BELOW the max — not a near-tie at all. The real root
     // cause is `run_greedy_gpu` mutating the process-global
-    // `OXIBONSAI_FORCE_CPU_DECODE_AFTER` env var (+ the `GLOBAL_METAL_GRAPH`
-    // singleton) while this file's tests run concurrently under `cargo
+    // `OXIBONSAI_FORCE_CPU_DECODE_AFTER` env var while this file's tests
+    // (none of which bind a MET-08 `SessionScope`, so `MetalGraph::global()`
+    // still falls through to the single process-default session — see
+    // `gpu_serial`'s own doc comment below) run concurrently under `cargo
     // test`'s default in-binary thread parallelism — the same
     // METAL-CONCURRENCY class of bug `gpu_backend_tests.rs::gpu_serial` (and
     // `metal_prefill_ternary_parity_tests.rs::gpu_serial`, its precedent)
@@ -300,8 +302,14 @@ fn run_cpu_reference(gguf_bytes: &[u8], prompt: &[u32], n: usize) -> Vec<u32> {
 ///
 /// MINOR fix (verifier wave 3, round 2 empirical finding): `run_greedy_gpu`
 /// mutates the process-global `OXIBONSAI_FORCE_CPU_DECODE_AFTER` env var and
-/// dispatches through the process-global `GLOBAL_METAL_GRAPH` singleton
-/// (METAL-CONCURRENCY, wave 4, removes it). `cargo test`'s default in-binary
+/// dispatches through Metal. MET-08 (METAL-CONCURRENCY, landed wave 4) split
+/// the old single mutable `GLOBAL_METAL_GRAPH` into a process-shared,
+/// immutable `MetalDevice` and a per-session `MetalGraph` bound to a thread
+/// via `SessionScope`, so N sessions can now genuinely overlap on the GPU —
+/// but no test in this file binds one, so `MetalGraph::global()` still falls
+/// through to the single process-default session (`session.rs`'s documented
+/// fallback for a caller that never binds), exactly the pre-MET-08 shared
+/// state this guard was written against. `cargo test`'s default in-binary
 /// thread parallelism let two of this file's tests race — one setting/
 /// clearing the env var and touching GPU state while another read it —
 /// which was empirically proven to be the real cause of the intermittent
@@ -310,8 +318,10 @@ fn run_cpu_reference(gguf_bytes: &[u8], prompt: &[u32], n: usize) -> Vec<u32> {
 /// precedent for this exact fix is
 /// `crates/oxibonsai-model/tests/metal_prefill_ternary_parity_tests.rs::gpu_serial`
 /// (FIX-06-KERN-MODEL) / `crates/oxibonsai-kernels/tests/gpu_backend_tests.rs::gpu_serial`
-/// (wave-1.5 addendum 3); once METAL-CONCURRENCY removes the singleton this
-/// helper (and every `let _gpu = gpu_serial();` call site below) can go.
+/// (wave-1.5 addendum 3); rewriting this file's tests to bind their own
+/// `MetalGraph::bind_new_session()` (rather than relying on the shared
+/// default) would let this helper (and every `let _gpu = gpu_serial();` call
+/// site below) go, but that rewrite is out of this package's scope.
 fn gpu_serial() -> std::sync::MutexGuard<'static, ()> {
     static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     GPU_LOCK

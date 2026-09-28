@@ -8,6 +8,10 @@
 //! - [`gguf_fixture`] — one deterministic GGUF fixture builder covering
 //!   every quant format this workspace executes, replacing 13 independently
 //!   written, subtly-divergent builders (T-07).
+//! - [`qwen35_fixture`] — a complete, public synthetic Bonsai 2 hybrid
+//!   (`qwen35`) GGUF built on [`gguf_fixture`], for any crate that needs a
+//!   loadable hybrid model without a multi-GB real one (EMBED-WIRE handover
+//!   (3)).
 //! - [`capability`] — the JSONL hardware/fixture-capability self-skip
 //!   report contract (T-05), so a skipped hardware-dependent test is
 //!   visibly distinct from one that ran and passed.
@@ -25,6 +29,7 @@
 
 pub mod capability;
 pub mod gguf_fixture;
+pub mod qwen35_fixture;
 
 /// Collision-free temp-path helpers built on `std::env::temp_dir()`.
 ///

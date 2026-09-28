@@ -10,11 +10,7 @@ use std::time::Instant;
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use crate::block::functions::blocks_as_bytes;
-#[cfg(all(feature = "metal", target_os = "macos"))]
-use crate::block::functions::blocks_as_bytes_ternary;
 use crate::block::functions::compute_gqa_attention;
-#[cfg(all(feature = "metal", target_os = "macos"))]
-use crate::block::functions::try_metal_gemv_ternary_fused;
 use crate::block::functions::{advance_kv_cache_to, validate_shapes};
 
 use super::block_def::TransformerBlock;
@@ -144,55 +140,15 @@ impl<'a> TransformerBlock<'a> {
                     v_all[..k_rows].copy_from_slice(&fused_qkv[q_rows + k_rows..total_rows]);
                 }
             } else {
-                // M-21: ternary fused-QKV Metal fast path; see `forward.rs`
-                // for the full rationale (no `fused_qkv_handle` exists for
-                // ternary, so key on `blocks_ternary()` + the ternary GPU
-                // handle's own `.id()` instead, gated on
-                // `attn_q.gpu_handle()`). The id — not the weight's mmap
-                // pointer — comes from the same process-global monotonic
-                // counter 1-bit handles use, so it is never reused across
-                // model loads.
+                // M-21: the ternary fused-QKV Metal arm `forward` runs — the
+                // same method, so the same slot (the mapped `attn_q`
+                // address) under the same namespace epoch (the model's
+                // mapping epoch) and therefore the same resident Q‖K‖V buffer
+                // whichever forward kind ran first; see
+                // `TransformerBlock::try_fused_qkv_ternary_metal`.
                 #[cfg(all(feature = "metal", target_os = "macos"))]
-                let ternary_metal_ok = {
-                    if let (Some(q_blk), Some(k_blk), Some(v_blk)) = (
-                        self.attn_q.blocks_ternary(),
-                        self.attn_k.blocks_ternary(),
-                        self.attn_v.blocks_ternary(),
-                    ) {
-                        if let Some(hnd) = self.attn_q.gpu_handle() {
-                            let q_rows = nq * hd;
-                            let k_rows = nkv * hd;
-                            let total_rows = q_rows + k_rows + k_rows;
-                            let q_bytes = blocks_as_bytes_ternary(q_blk);
-                            let k_bytes = blocks_as_bytes_ternary(k_blk);
-                            let v_bytes = blocks_as_bytes_ternary(v_blk);
-                            let slot = hnd.id();
-                            if try_metal_gemv_ternary_fused(
-                                normed,
-                                fused_qkv,
-                                slot,
-                                &[q_bytes, k_bytes, v_bytes],
-                                total_rows,
-                                h,
-                            )
-                            .is_ok()
-                            {
-                                q_all[..q_rows].copy_from_slice(&fused_qkv[..q_rows]);
-                                k_all[..k_rows]
-                                    .copy_from_slice(&fused_qkv[q_rows..q_rows + k_rows]);
-                                v_all[..k_rows]
-                                    .copy_from_slice(&fused_qkv[q_rows + k_rows..total_rows]);
-                                true
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                };
+                let ternary_metal_ok =
+                    self.try_fused_qkv_ternary_metal(normed, fused_qkv, q_all, k_all, v_all);
                 #[cfg(not(all(feature = "metal", target_os = "macos")))]
                 let ternary_metal_ok = false;
                 if !ternary_metal_ok {
@@ -368,7 +324,16 @@ impl<'a> TransformerBlock<'a> {
                     self.ffn_gate.forward_vec(normed, gate_out)?;
                     self.ffn_up.forward_vec(normed, up_out)?;
                 }
-            } else {
+            } else if !self.try_fused_gate_up_ternary(
+                normed,
+                fused_gate_up,
+                gate_out,
+                up_out,
+                kernel,
+            ) {
+                // Not a GPU-uploaded ternary block (or the fused GEMV
+                // failed): the two projections, per matrix — exactly as
+                // `forward` does (the fused gate‖up arm is shared).
                 self.ffn_gate.forward_vec(normed, gate_out)?;
                 self.ffn_up.forward_vec(normed, up_out)?;
             }

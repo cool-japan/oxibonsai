@@ -17,14 +17,18 @@
 //!
 //! 1. the four kernel-family files contain none of `new_library_with_source(`,
 //!    `Device::system_default(` or `new_command_queue(`;
-//! 2. across the whole `gpu_backend` tree, the files that still compile a
-//!    library from source are a **subset** of the two known owners:
-//!    `metal_graph/pipelines.rs` (the combined library's own
-//!    embedded → disk-cache → `xcrun` → runtime-source cascade, plus the
-//!    best-effort bf16 sidecar) and `metal_prefill/attention.rs` (the prefill
-//!    attention library, which is B2-15's to fold into the combined metallib).
-//!    A subset rather than an equality, so folding `attention.rs` in later
-//!    keeps this green, while any *new* private library fails it.
+//! 2. across the whole `gpu_backend` tree, the only file that compiles a
+//!    library from source is `metal_graph/pipelines.rs` — the combined
+//!    library's own embedded → disk-cache → `xcrun` → runtime-source cascade,
+//!    plus the best-effort bf16 sidecar. The batched prefill attention kernels
+//!    (`metal_prefill/attention.rs`) and the Qwen3.5 hybrid kernels
+//!    (`metal_full_layer/qwen35.rs`) ride the combined metallib and resolve
+//!    their pipelines through `pipeline_for`; any *new* private library fails
+//!    this;
+//! 3. `metal_prefill/attention.rs` does not even mention the source-compile
+//!    call any more — the one-off prefill-attention compile path (its own
+//!    library, a fixed pid-named temp build directory and non-atomic cache
+//!    writes) is gone, not merely unreachable.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -37,8 +41,14 @@ const PORTED_FAMILIES: [&str; 4] = [
     "metal_q_std_kernels.rs",
 ];
 
-/// The only `gpu_backend` files allowed to compile an MSL library from source.
-const LIBRARY_OWNERS: [&str; 2] = ["metal_graph/pipelines.rs", "metal_prefill/attention.rs"];
+/// The only `gpu_backend` file allowed to compile an MSL library from source.
+const LIBRARY_OWNERS: [&str; 1] = ["metal_graph/pipelines.rs"];
+
+/// Files that dispatch kernels of the combined metallib and must resolve
+/// them through `pipeline_for` rather than own any Metal library, device or
+/// queue of their own.
+const COMBINED_LIBRARY_CLIENTS: [&str; 2] =
+    ["metal_prefill/attention.rs", "metal_full_layer/qwen35.rs"];
 
 /// Root of the scan: this crate's `src/gpu_backend`.
 fn gpu_backend_dir() -> PathBuf {
@@ -252,4 +262,54 @@ fn only_the_known_owners_compile_a_metal_library_from_source() {
         "the combined library's own compile cascade disappeared from pipelines.rs — the scan \
          is not seeing the code it is meant to guard"
     );
+}
+
+#[test]
+fn combined_library_clients_own_no_library_device_or_queue() {
+    let sources = scanned_sources();
+    for client in COMBINED_LIBRARY_CLIENTS {
+        let (_, code) = sources
+            .iter()
+            .find(|(path, _)| path == client)
+            .unwrap_or_else(|| panic!("{client} not found under src/gpu_backend"));
+        for needle in [
+            "new_library_with_source(",
+            "new_library_with_data(",
+            "Device::system_default(",
+            "new_command_queue(",
+        ] {
+            assert!(
+                !code.contains(needle),
+                "{client} contains `{needle}` in non-test code: its kernels are in the combined \
+                 metallib and must be resolved with `MetalGraph::pipeline_for`"
+            );
+        }
+        assert!(
+            code.contains("pipeline_for("),
+            "{client} no longer resolves pipelines through `pipeline_for`"
+        );
+    }
+}
+
+/// The batched prefill attention module keeps no trace of a private compile
+/// path: its whole text — test code and comments included — names no
+/// source or data library compile, no `xcrun` build and no temp build
+/// directory, because its kernels come from the combined metallib.
+#[test]
+fn prefill_attention_has_no_private_compile_path_left() {
+    let path = gpu_backend_dir().join("metal_prefill").join("attention.rs");
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    for needle in [
+        "new_library_with_source",
+        "new_library_with_data",
+        "xcrun",
+        "temp_dir(",
+    ] {
+        assert!(
+            !text.contains(needle),
+            "{} still contains `{needle}`",
+            path.display()
+        );
+    }
 }

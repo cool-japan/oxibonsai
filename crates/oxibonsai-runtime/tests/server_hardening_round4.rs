@@ -1,4 +1,4 @@
-//! Round-4 server hardening regressions (package `SRV-HARDEN`).
+//! Server hardening regressions (round 4).
 //!
 //! One test per verified finding, exercised through the real router built by
 //! `create_router*` wherever the defect is observable over HTTP:
@@ -30,7 +30,7 @@ use oxibonsai_runtime::engine_pool::EnginePool;
 use oxibonsai_runtime::metrics::InferenceMetrics;
 use oxibonsai_runtime::sampling::SamplingParams;
 use oxibonsai_runtime::server::{
-    create_router, create_router_full, create_router_with_auth, install_shutdown_signals,
+    create_router_full, create_router_with_auth, install_shutdown_signals,
     neutralize_special_markers, validate_request_budget, AuthConfig, RequestLimits, RouterOptions,
 };
 
@@ -40,8 +40,27 @@ fn engine() -> InferenceEngine<'static> {
     InferenceEngine::new(Qwen3Config::tiny_test(), SamplingParams::default(), 42)
 }
 
+/// Qwen3's `<|im_start|>` id: the tokenizer-less routers of this suite serve
+/// a `Qwen3Config::tiny_test()` engine (the Qwen3 vocabulary size) and run a
+/// text prompt as this single token.
+const QWEN3_IM_START: u32 = 151_644;
+
+/// A tokenizer-less router over `engine`. Without a tokenizer a server needs
+/// a configured prompt start token to accept a text prompt at all (it
+/// answers `400 tokenizer_required` otherwise), and the answer's text is
+/// empty — nothing to render it with — while `usage` still counts every
+/// generated token.
+fn tokenizerless_router(engine: InferenceEngine<'static>) -> axum::Router {
+    oxibonsai_runtime::server::create_router_full(
+        oxibonsai_runtime::engine_pool::EnginePool::new(vec![engine]),
+        None,
+        std::sync::Arc::new(oxibonsai_runtime::metrics::InferenceMetrics::new()),
+        oxibonsai_runtime::server::RouterOptions::default().with_prompt_start_token(QWEN3_IM_START),
+    )
+}
+
 fn router() -> axum::Router {
-    create_router(engine(), None)
+    tokenizerless_router(engine())
 }
 
 fn router_with_limits(limits: RequestLimits) -> axum::Router {
@@ -51,7 +70,8 @@ fn router_with_limits(limits: RequestLimits) -> axum::Router {
         Arc::new(InferenceMetrics::new()),
         RouterOptions::default()
             .with_limits(limits)
-            .with_auth(AuthConfig::with_admin_token(ADMIN_TOKEN)),
+            .with_auth(AuthConfig::with_admin_token(ADMIN_TOKEN))
+            .with_prompt_start_token(QWEN3_IM_START),
     )
 }
 
@@ -466,7 +486,7 @@ async fn admin_is_refused_when_no_token_is_configured() {
 
 // ── sec-15 regression: the admin-auth layer must not swallow the app's 404 ───
 
-/// The security regression a verifier caught after the original `sec-15` fix
+/// The security regression found after the original `sec-15` fix
 /// landed: `Router::layer` (unlike `Router::route_layer`) also wraps the
 /// router's own fallback, and `Router::merge` then propagates that wrapped
 /// fallback to the WHOLE merged app. That turned every unmatched path on the

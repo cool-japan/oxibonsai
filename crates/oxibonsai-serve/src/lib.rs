@@ -10,10 +10,14 @@
 //! - [`mod@env`]    — `OXIBONSAI_*` environment-variable parsing
 //! - [`validation`] — invariants over a fully-merged [`config::ServerConfig`]
 //! - [`metrics`]    — hand-rolled Prometheus text-exposition registry
+//!
+//! [`embedder`] builds the model-backed `/v1/embeddings` embedder the binary
+//! hands its router, exactly as `oxibonsai serve` does.
 
 pub mod args;
 pub mod banner;
 pub mod config;
+pub mod embedder;
 pub mod env;
 pub mod metrics;
 pub mod validation;

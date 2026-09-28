@@ -7,8 +7,8 @@
 //!
 //! The [`EmbedderRegistry`] manages three backends, tried in priority order:
 //!
-//! 1. **A model-backed [`Embedder`]** — the production default since
-//!    orchestrator decision D-1. [`crate::embed_engine::ModelEmbedder`]
+//! 1. **A model-backed [`Embedder`]** — the production default (`RT-08` /
+//!    `SV-02`). [`crate::embed_engine::ModelEmbedder`]
 //!    tokenises the input, runs it through a loaded model and returns the
 //!    mean-pooled, L2-normalised final hidden state
 //!    (`BonsaiModel::forward_hidden`, taken *before* the LM head): a genuine
@@ -24,7 +24,13 @@
 //!    * `"input": [1, 2, 3]` is embedded as those token ids
 //!      ([`TokenSequenceEmbedder`]) rather than as the *string* `"1 2 3"`.
 //!    * An N-input batch takes the model's engine lock **once**, not N
-//!      times ([`crate::embed_engine::BatchEmbedder`], EMBED-WIRE item 2).
+//!      times ([`Embedder::embed_batch`], which
+//!      [`crate::embed_engine::ModelEmbedder`] overrides).
+//!    * Each text input is tokenized **once** per request: the ids answer
+//!      the `context_length_exceeded` guard and `usage.prompt_tokens`, and
+//!      are then embedded as ids ([`EmbeddingTokenCounter::token_ids`],
+//!      [`EmbedderRegistry::with_token_aware_model`]) — not tokenized again
+//!      to count, to bill and to embed.
 //!
 //!    When no model backend is installed,
 //!    [`EmbedderRegistry::with_require_model_backend`] decides what happens.
@@ -106,9 +112,8 @@
 //! * **Text** (`"input": "..."` / `["...", "..."]`) that tokenizes past this
 //!   ceiling is refused with `400 context_length_exceeded`, naming the real
 //!   token count and the ceiling, rather than silently truncated and billed
-//!   in full — the OpenAI contract, and the fix for the wave-4 verifier's
-//!   minor[3] (`usage.prompt_tokens` used to report the untruncated count
-//!   while the model only ever saw the truncated one).
+//!   in full — the OpenAI contract (`usage.prompt_tokens` used to report
+//!   the untruncated count while the model only ever saw the truncated one).
 //! * **Raw token ids** (`"input": [1, 2, 3]`) deliberately keep truncating —
 //!   a caller supplying ids already knows exactly how many it sent, so
 //!   [`crate::embed_engine::ModelEmbedder::embed_tokens`]'s conventional
@@ -168,9 +173,7 @@ use std::sync::Arc;
 
 use oxibonsai_rag::embedding::{l2_normalize, Embedder, IdentityEmbedder, TfIdfEmbedder};
 
-use crate::embed_engine::{
-    BatchEmbedder, EmbeddingTokenCounter, ModelEmbedder, TokenSequenceEmbedder,
-};
+use crate::embed_engine::{EmbeddingTokenCounter, ModelEmbedder, TokenSequenceEmbedder};
 use crate::metrics::InferenceMetrics;
 use crate::server::ActiveRequestGuard;
 
@@ -395,13 +398,55 @@ pub struct EmbedderRegistry {
     /// Native `"input": [1, 2, 3]` path, when the installed backend can
     /// consume token ids directly.
     token_embedder: Option<Arc<dyn TokenSequenceEmbedder>>,
-    /// Batched-lock path, when the installed backend can embed a whole
-    /// request's texts under one critical section (`EmbedderRegistry::with_model`
-    /// wires a [`ModelEmbedder`] here — see [`BatchEmbedder`]'s docs for why
-    /// this is a local trait rather than a method on [`Embedder`] itself).
-    batch_embedder: Option<Arc<dyn BatchEmbedder>>,
+    /// `true` only while `model`, `token_counter` and `token_embedder` are
+    /// one object installed by [`EmbedderRegistry::with_token_aware_model`]
+    /// (or [`EmbedderRegistry::with_model`]): only then are the ids the
+    /// counter hands out ([`EmbeddingTokenCounter::token_ids`]) the ids the
+    /// model would embed, so a text request may be tokenized once and
+    /// embedded from those ids. Every builder that replaces one of the three
+    /// independently clears it.
+    reuse_text_tokens: bool,
     tfidf: std::sync::Mutex<Option<TfIdfEmbedder>>,
     identity: IdentityEmbedder,
+    /// Why no model backend is installed, when the builder knows: named in
+    /// the `501` body [`create_embeddings`] answers with — see
+    /// [`EmbedderRegistry::with_unavailable_reason`].
+    unavailable: Option<EmbedderUnavailable>,
+}
+
+/// `error.code` of the `/v1/embeddings` `501` when no more specific reason
+/// was recorded ([`EmbedderRegistry::with_unavailable_reason`]).
+pub const EMBEDDINGS_UNAVAILABLE_CODE: &str = "embeddings_unavailable";
+
+/// `error.type` of the `/v1/embeddings` `501`.
+pub const NOT_IMPLEMENTED_ERROR_TYPE: &str = "not_implemented_error";
+
+/// Why a server has no model-backed embedder — e.g. the typed refusal a
+/// model's embedder construction returned — carried into the `501` body of
+/// `/v1/embeddings` so a client sees the reason, not only the operator's
+/// log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbedderUnavailable {
+    /// A stable machine-readable code (an engine refusal's own code, such as
+    /// `"NOT_A_DENSE_MODEL"`), or `None` for [`EMBEDDINGS_UNAVAILABLE_CODE`].
+    pub code: Option<&'static str>,
+    /// The human-readable reason, appended to the `501` message.
+    pub message: String,
+}
+
+impl EmbedderUnavailable {
+    /// A reason with an optional stable `code`.
+    pub fn new(code: Option<&'static str>, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    /// The `error.code` this reason answers with.
+    pub fn code(&self) -> &'static str {
+        self.code.unwrap_or(EMBEDDINGS_UNAVAILABLE_CODE)
+    }
 }
 
 impl EmbedderRegistry {
@@ -429,14 +474,15 @@ impl EmbedderRegistry {
             model: None,
             token_counter: None,
             token_embedder: None,
-            batch_embedder: None,
+            reuse_text_tokens: false,
             tfidf: std::sync::Mutex::new(None),
             identity,
+            unavailable: None,
         }
     }
 
     /// Install a real, model-backed embedder — the production backend
-    /// (`RT-08` / `SV-02`, orchestrator decision D-1).
+    /// (`RT-08` / `SV-02`).
     ///
     /// The one-call form of [`with_model_embedder`](Self::with_model_embedder)
     /// for [`ModelEmbedder`], which is more capable than a bare [`Embedder`]:
@@ -444,16 +490,46 @@ impl EmbedderRegistry {
     /// [`EmbeddingTokenCounter`] (so `usage.prompt_tokens` is the model's own
     /// token count, not a whitespace word count), as its
     /// [`TokenSequenceEmbedder`] (so a `"input": [1, 2, 3]` request embeds
-    /// those ids rather than the string `"1 2 3"`), and as its
-    /// [`BatchEmbedder`] (so an N-input request takes the engine lock once,
-    /// not N times — `EmbedderRegistry::embed_texts`). Wiring all four by
-    /// hand and forgetting one is the whole reason this exists.
+    /// those ids rather than the string `"1 2 3"`). An N-input text request
+    /// takes the engine lock once, not N times, through `ModelEmbedder`'s
+    /// [`Embedder::embed_batch`] override, and each text is tokenized once
+    /// per request (see [`Self::with_token_aware_model`], which this is).
+    /// Wiring all three by hand and forgetting one is the whole reason this
+    /// exists.
     #[must_use]
-    pub fn with_model(mut self, embedder: Arc<ModelEmbedder>) -> Self {
+    pub fn with_model(self, embedder: Arc<ModelEmbedder>) -> Self {
+        self.with_token_aware_model(embedder)
+    }
+
+    /// Install one backend as the model [`Embedder`], the
+    /// [`EmbeddingTokenCounter`] **and** the [`TokenSequenceEmbedder`]
+    /// (builder) — the generic form of [`Self::with_model`], for any backend
+    /// that owns a tokenizer and can embed ids.
+    ///
+    /// Because all three come from the same object, [`create_embeddings`]
+    /// tokenizes each **text** input exactly once per request: the ids
+    /// [`EmbeddingTokenCounter::token_ids`] returns answer the
+    /// `context_length_exceeded` guard and `usage.prompt_tokens`, and are then
+    /// embedded through [`TokenSequenceEmbedder::embed_token_batches`] rather
+    /// than handed back to [`Embedder::embed_batch`] to be tokenized again.
+    /// A request in which some input gets no ids from `token_ids` is counted
+    /// with [`EmbeddingTokenCounter::count_tokens`] and embedded as text
+    /// instead, so this is also safe for a backend that never hands ids out.
+    ///
+    /// # Contract
+    ///
+    /// Embedding `token_ids(text)` as ids must give the vector `embed(text)`
+    /// gives — true of [`ModelEmbedder`] by construction (same tokenizer, same
+    /// truncation, same engine).
+    #[must_use]
+    pub fn with_token_aware_model<E>(mut self, embedder: Arc<E>) -> Self
+    where
+        E: Embedder + EmbeddingTokenCounter + TokenSequenceEmbedder + 'static,
+    {
         self.token_counter = Some(Arc::clone(&embedder) as Arc<dyn EmbeddingTokenCounter>);
         self.token_embedder = Some(Arc::clone(&embedder) as Arc<dyn TokenSequenceEmbedder>);
-        self.batch_embedder = Some(Arc::clone(&embedder) as Arc<dyn BatchEmbedder>);
         self.model = Some(embedder as Arc<dyn Embedder>);
+        self.reuse_text_tokens = true;
         self
     }
 
@@ -462,7 +538,7 @@ impl EmbedderRegistry {
     /// Independent of the embedding backend: a caller may want honest token
     /// accounting even behind a lexical backend.
     ///
-    /// # Warning: pair this with a model backend (EMBED-WIRE item 4)
+    /// # Warning: pair this with a model backend
     ///
     /// Installing a counter with **no** [`Self::with_model_embedder`] (or
     /// [`Self::with_model`]) leaves [`Self::embedding_dim`] reporting
@@ -476,6 +552,7 @@ impl EmbedderRegistry {
     #[must_use]
     pub fn with_token_counter(mut self, counter: Arc<dyn EmbeddingTokenCounter>) -> Self {
         self.token_counter = Some(counter);
+        self.reuse_text_tokens = false;
         self
     }
 
@@ -490,6 +567,7 @@ impl EmbedderRegistry {
     #[must_use]
     pub fn with_token_embedder(mut self, embedder: Arc<dyn TokenSequenceEmbedder>) -> Self {
         self.token_embedder = Some(embedder);
+        self.reuse_text_tokens = false;
         self
     }
 
@@ -507,6 +585,7 @@ impl EmbedderRegistry {
     #[must_use]
     pub fn with_model_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
         self.model = Some(embedder);
+        self.reuse_text_tokens = false;
         self
     }
 
@@ -565,6 +644,23 @@ impl EmbedderRegistry {
         self.require_model_backend && self.model.is_none()
     }
 
+    /// Record why no model backend is installed (builder): the `501`
+    /// [`create_embeddings`] answers while
+    /// [`Self::model_backend_required_but_missing`] holds then carries
+    /// `reason` — `error.code` is [`EmbedderUnavailable::code`] and the
+    /// message ends with `": <reason.message>"`. Has no effect on a registry
+    /// that serves a backend.
+    #[must_use]
+    pub fn with_unavailable_reason(mut self, reason: EmbedderUnavailable) -> Self {
+        self.unavailable = Some(reason);
+        self
+    }
+
+    /// The recorded reason no model backend is installed, if any.
+    pub fn unavailable_reason(&self) -> Option<&EmbedderUnavailable> {
+        self.unavailable.as_ref()
+    }
+
     /// Name of the backend that would answer the *next* [`Self::embed_texts`]
     /// call, for the response's `model` field: `"model"`, `"tfidf"`, or
     /// `"identity"`. Reflects which backend actually produced a response
@@ -589,25 +685,19 @@ impl EmbedderRegistry {
     /// that fail to embed are silently replaced with a zero vector of the
     /// appropriate dimension.
     ///
-    /// When the installed model backend also implements [`BatchEmbedder`]
-    /// (every [`ModelEmbedder`] installed through [`Self::with_model`]),
-    /// this takes its lock **once** for the whole slice instead of once per
-    /// item (EMBED-WIRE item 2) — the defect the wave-4 verifier's minor[2]
-    /// named: `ModelEmbedder::embed_batch` existed but was never reached
-    /// from this, the one method the HTTP handler actually calls.
+    /// The model backend is reached through [`Embedder::embed_batch`]: the
+    /// default is the per-item loop, and a [`ModelEmbedder`] overrides it to
+    /// take its engine lock **once** for the whole slice instead of once per
+    /// item — so the batched path is the one the HTTP handler's text
+    /// requests actually reach.
     pub fn embed_texts(&self, texts: &[String]) -> Vec<Vec<f32>> {
         if let Some(ref model) = self.model {
             let dim = model.embedding_dim();
-            if let Some(ref batch) = self.batch_embedder {
-                return batch
-                    .embed_batch(texts)
-                    .into_iter()
-                    .map(|r| r.unwrap_or_else(|_| vec![0.0; dim]))
-                    .collect();
-            }
-            return texts
-                .iter()
-                .map(|t| model.embed(t).unwrap_or_else(|_| vec![0.0; dim]))
+            let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+            return model
+                .embed_batch(&refs)
+                .into_iter()
+                .map(|r| r.unwrap_or_else(|_| vec![0.0; dim]))
                 .collect();
         }
         let guard = lock_or_recover(&self.tfidf);
@@ -646,8 +736,8 @@ impl EmbedderRegistry {
     ///
     /// Routes through [`TokenSequenceEmbedder::embed_token_batches`] (a
     /// [`ModelEmbedder`] overrides its default per-item loop to take its
-    /// engine lock once for the whole set — EMBED-WIRE item 2 extended to
-    /// `"input": [[1, 2], [3, 4]]` requests, not just plain text).
+    /// engine lock once for the whole set — for `"input": [[1, 2], [3, 4]]`
+    /// requests as for plain text).
     pub fn embed_token_batches(&self, batches: &[Vec<u32>]) -> Option<Vec<Vec<f32>>> {
         let embedder = self.token_embedder.as_ref()?;
         let dim = self.embedding_dim();
@@ -668,27 +758,48 @@ impl EmbedderRegistry {
     /// no way to improve on without a tokenizer. Every input counts as at
     /// least one token either way, so a non-empty request never reports
     /// `prompt_tokens: 0`.
+    ///
+    /// [`create_embeddings`] does not call this: it tokenizes a request once
+    /// and derives both the `context_length_exceeded` guard and this same
+    /// total from that one pass.
     pub fn count_prompt_tokens(&self, texts: &[String]) -> usize {
-        match self.token_counter.as_ref() {
-            Some(counter) => texts
-                .iter()
-                .map(|t| {
-                    counter
-                        .count_tokens(t)
-                        .unwrap_or_else(|| t.split_whitespace().count())
-                        .max(1)
-                })
-                .sum(),
-            None => texts
-                .iter()
-                .map(|t| t.split_whitespace().count().max(1))
-                .sum(),
+        self.tokenize_texts(texts).prompt_tokens(texts)
+    }
+
+    /// One tokenization pass over a request's **text** inputs, whose result
+    /// answers the `context_length_exceeded` guard, `usage.prompt_tokens` and
+    /// — when the ids come from the embedding backend itself — the embedding
+    /// pass, so [`create_embeddings`] tokenizes each text once rather than
+    /// once to judge its length, once to bill it and once to embed it.
+    fn tokenize_texts(&self, texts: &[String]) -> TextTokens {
+        let Some(counter) = self.token_counter.as_ref() else {
+            return TextTokens::Uncounted;
+        };
+        if !self.reuse_text_tokens {
+            return TextTokens::Counted(texts.iter().map(|t| counter.count_tokens(t)).collect());
         }
+        let ids: Vec<Option<Vec<u32>>> = texts.iter().map(|t| counter.token_ids(t)).collect();
+        if ids.iter().all(Option::is_some) {
+            return TextTokens::Tokenized(ids.into_iter().flatten().collect());
+        }
+        // Some input got no ids (the backend does not hand them out, or
+        // tokenizing that input failed): count only what could not be
+        // tokenized and let the text path embed the whole request, exactly
+        // as it did before ids were reused.
+        TextTokens::Counted(
+            ids.into_iter()
+                .zip(texts)
+                .map(|(ids, text)| match ids {
+                    Some(ids) => Some(ids.len()),
+                    None => counter.count_tokens(text),
+                })
+                .collect(),
+        )
     }
 
     /// The largest number of tokens a single **text** input may tokenize to
     /// before [`create_embeddings`] refuses it with `400
-    /// context_length_exceeded` (EMBED-WIRE item 3), or `None` when no
+    /// context_length_exceeded`, or `None` when no
     /// installed backend reports a ceiling (see
     /// [`EmbeddingTokenCounter::max_input_tokens`]) — in which case no such
     /// guard applies at all.
@@ -698,28 +809,12 @@ impl EmbedderRegistry {
             .and_then(|c| c.max_input_tokens())
     }
 
-    /// The first input (by index) whose token count — per the installed
-    /// [`EmbeddingTokenCounter`] — exceeds `max_tokens`, together with that
-    /// count. `None` when nothing does, or when no counter is installed (an
-    /// input that cannot be counted cannot be judged over-length either).
-    fn first_text_exceeding_token_limit(
-        &self,
-        texts: &[String],
-        max_tokens: usize,
-    ) -> Option<(usize, usize)> {
-        let counter = self.token_counter.as_ref()?;
-        texts.iter().enumerate().find_map(|(index, text)| {
-            let n_tokens = counter.count_tokens(text)?;
-            (n_tokens > max_tokens).then_some((index, n_tokens))
-        })
-    }
-
     /// Whether a token-aware path ([`Self::with_token_counter`] /
     /// [`Self::with_token_embedder`]) was installed without the model-backed
     /// [`Embedder`] that is supposed to own it ([`Self::with_model_embedder`],
     /// or [`Self::with_model`] which wires all of them together) —
     /// the misuse [`EmbeddingAppState::from_registry`]'s `debug_assert!`
-    /// catches (EMBED-WIRE item 4).
+    /// catches.
     fn has_orphaned_token_paths(&self) -> bool {
         self.model.is_none() && (self.token_counter.is_some() || self.token_embedder.is_some())
     }
@@ -785,6 +880,69 @@ impl EmbedderRegistry {
     }
 }
 
+/// What one pass of the registry's token counter learned about a request's
+/// **text** inputs ([`EmbedderRegistry::tokenize_texts`]), reused for the
+/// `context_length_exceeded` guard, for
+/// `usage.prompt_tokens` and, when it holds ids, for the embedding pass.
+#[derive(Debug)]
+enum TextTokens {
+    /// No token counter is installed: nothing was tokenized, no token-length
+    /// guard applies, and usage falls back to the whitespace word count.
+    Uncounted,
+    /// One token count per input (`None` where the counter could not say),
+    /// from a counter whose ids the embedding backend does not reuse.
+    Counted(Vec<Option<usize>>),
+    /// One id sequence per input, from the backend that also embeds them
+    /// ([`EmbedderRegistry::with_token_aware_model`]).
+    Tokenized(Vec<Vec<u32>>),
+}
+
+impl TextTokens {
+    /// Token count of input `index`, when one is known.
+    fn count(&self, index: usize) -> Option<usize> {
+        match self {
+            Self::Uncounted => None,
+            Self::Counted(counts) => counts.get(index).copied().flatten(),
+            Self::Tokenized(ids) => ids.get(index).map(Vec::len),
+        }
+    }
+
+    /// Number of inputs this pass covered (`0` when nothing was counted).
+    fn len(&self) -> usize {
+        match self {
+            Self::Uncounted => 0,
+            Self::Counted(counts) => counts.len(),
+            Self::Tokenized(ids) => ids.len(),
+        }
+    }
+
+    /// The first input (by index) whose token count exceeds `max_tokens`,
+    /// with that count. `None` when nothing does or nothing was counted (an
+    /// input that cannot be counted cannot be judged over-length either).
+    fn first_exceeding(&self, max_tokens: usize) -> Option<(usize, usize)> {
+        (0..self.len()).find_map(|index| {
+            let n_tokens = self.count(index)?;
+            (n_tokens > max_tokens).then_some((index, n_tokens))
+        })
+    }
+
+    /// `usage.prompt_tokens` for `texts` (the inputs this pass covered): the
+    /// counted tokens where known, the whitespace word count otherwise, and
+    /// at least one token per input either way, so a non-empty request never
+    /// reports `prompt_tokens: 0`.
+    fn prompt_tokens(&self, texts: &[String]) -> usize {
+        texts
+            .iter()
+            .enumerate()
+            .map(|(index, text)| {
+                self.count(index)
+                    .unwrap_or_else(|| text.split_whitespace().count())
+                    .max(1)
+            })
+            .sum()
+    }
+}
+
 /// RFC 4648 standard base64 alphabet.
 const BASE64_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -819,17 +977,34 @@ fn base64_encode_bytes(bytes: &[u8]) -> String {
 // ─── App state ────────────────────────────────────────────────────────────────
 
 /// Axum application state for the embeddings sub-router.
+///
+/// Its fields are private: a state is only ever built through
+/// [`EmbeddingAppState::from_registry`], whose builder-misuse check a public
+/// field would let a caller bypass by swapping
+/// the registry afterwards. Read them through [`Self::registry`] and
+/// [`Self::metrics`].
 pub struct EmbeddingAppState {
     /// The active embedding registry.
-    pub registry: EmbedderRegistry,
+    registry: EmbedderRegistry,
     /// The **shared** [`InferenceMetrics`] this route records onto (`SV-25`),
     /// or `None` for a router built without one (which then records nothing —
     /// see the module docs' "Metrics" section for why a private registry is
     /// not an acceptable substitute).
-    pub metrics: Option<Arc<InferenceMetrics>>,
+    metrics: Option<Arc<InferenceMetrics>>,
 }
 
 impl EmbeddingAppState {
+    /// The active embedding registry.
+    pub fn registry(&self) -> &EmbedderRegistry {
+        &self.registry
+    }
+
+    /// The **shared** [`InferenceMetrics`] this route records onto (`SV-25`),
+    /// or `None` for a router built without one.
+    pub fn metrics(&self) -> Option<&Arc<InferenceMetrics>> {
+        self.metrics.as_ref()
+    }
+
     /// Create a new state with the given embedding dimensionality.
     pub fn new(dim: usize) -> Self {
         Self::from_registry(EmbedderRegistry::new(dim))
@@ -851,7 +1026,7 @@ impl EmbeddingAppState {
     /// let router = create_embeddings_router_from_state(state);
     /// ```
     pub fn from_registry(registry: EmbedderRegistry) -> Self {
-        // EMBED-WIRE item 4: catch `with_token_counter`/`with_token_embedder`
+        // Catch `with_token_counter`/`with_token_embedder`
         // installed without the model backend that is meant to own them.
         // Checked here — after the caller's whole builder chain has run,
         // regardless of the order its calls were made in — rather than
@@ -887,9 +1062,8 @@ impl EmbeddingAppState {
 // disconnected mid-request; `SV-25`, the same RAII shape `SV-08` needs for
 // the streaming tail) used to be a fourth local copy here, duplicating
 // `server/chat.rs`'s, `completions.rs`'s and `api_extensions.rs`'s own.
-// `B2-13` made `server`'s copy `pub(crate)` (EMBED-WIRE item 1), so this file
-// now imports `crate::server::ActiveRequestGuard` instead of carrying its own
-// — see this package's `deviations`.
+// `server`'s copy is `pub(crate)`, so this file imports
+// `crate::server::ActiveRequestGuard` instead of carrying its own.
 
 /// Handler for `POST /v1/embeddings`.
 ///
@@ -909,15 +1083,15 @@ pub async fn create_embeddings(
     // `ActiveRequestGuard` has no `enter`-style constructor (see
     // `completions.rs`'s identical call site): increment then wrap, so the
     // wrapped value's `Drop` is the only thing that ever decrements.
-    let _active_guard = state.metrics.as_ref().map(|metrics| {
+    let _active_guard = state.metrics().map(|metrics| {
         metrics.active_requests.inc();
         ActiveRequestGuard(Arc::clone(metrics))
     });
-    if let Some(metrics) = state.metrics.as_ref() {
+    if let Some(metrics) = state.metrics() {
         metrics.requests_total.inc();
     }
     let outcome = create_embeddings_inner(&state, req).await;
-    if let Some(metrics) = state.metrics.as_ref() {
+    if let Some(metrics) = state.metrics() {
         let failed = match &outcome {
             Ok(response) => !response.status().is_success(),
             Err(_) => true,
@@ -932,6 +1106,35 @@ pub async fn create_embeddings(
     outcome
 }
 
+/// The standard text of the `501` a model-only registry answers with when no
+/// model backend is installed.
+pub const MODEL_BACKEND_MISSING_MESSAGE: &str =
+    "no model-backed embedding backend is installed on this server; this deployment was \
+     configured with EmbedderRegistry::with_require_model_backend(true), which disables the \
+     stateless TF-IDF/identity fallback rather than answering with a non-semantic vector";
+
+/// The `501 Not Implemented` of a registry that requires a model backend and
+/// has none: `{"error": {"message", "type": "not_implemented_error", "param":
+/// null, "code"}}` — `code` and a `": <reason>"` message suffix from the
+/// recorded [`EmbedderUnavailable`], else [`EMBEDDINGS_UNAVAILABLE_CODE`]
+/// and [`MODEL_BACKEND_MISSING_MESSAGE`] alone.
+fn model_backend_missing_response(reason: Option<&EmbedderUnavailable>) -> Response {
+    let (message, code) = match reason {
+        Some(reason) => (
+            format!("{MODEL_BACKEND_MISSING_MESSAGE}: {}", reason.message),
+            reason.code(),
+        ),
+        None => (
+            MODEL_BACKEND_MISSING_MESSAGE.to_string(),
+            EMBEDDINGS_UNAVAILABLE_CODE,
+        ),
+    };
+    crate::server::api_error::ApiError::new(StatusCode::NOT_IMPLEMENTED, message)
+        .with_type(NOT_IMPLEMENTED_ERROR_TYPE)
+        .with_code(code)
+        .into_response()
+}
+
 /// Body of [`create_embeddings`], with the metrics wrapper peeled off so
 /// every `return` inside it is still covered by one exit point.
 async fn create_embeddings_inner(
@@ -942,18 +1145,14 @@ async fn create_embeddings_inner(
     // configured to require a model-backed `Embedder`
     // (`with_require_model_backend(true)`) and none is installed, refuse the
     // request outright rather than ever answering with a non-semantic
-    // byte-hash/TF-IDF vector. `server.rs`'s live call site sets it, and
-    // since `EMBED-MODEL` also installs a real `ModelEmbedder` whenever the
-    // server has an engine and a tokenizer, this branch is now reached only
-    // by a deployment that genuinely has no model to embed with.
-    if state.registry.model_backend_required_but_missing() {
-        return Ok(crate::http_error::error_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "no model-backed embedding backend is installed on this server; this deployment \
-             was configured with EmbedderRegistry::with_require_model_backend(true), which \
-             disables the stateless TF-IDF/identity fallback rather than answering with a \
-             non-semantic vector",
-            None,
+    // byte-hash/TF-IDF vector. The served router sets it and installs a real
+    // `ModelEmbedder` whenever the server has an engine and a tokenizer, so
+    // this branch is reached only by a deployment that genuinely has no
+    // model to embed with — and the body names why, when the builder
+    // recorded a reason.
+    if state.registry().model_backend_required_but_missing() {
+        return Ok(model_backend_missing_response(
+            state.registry().unavailable_reason(),
         ));
     }
 
@@ -980,7 +1179,7 @@ async fn create_embeddings_inner(
 
     // SV-02: an `encoding_format` other than the two documented values is
     // rejected by name instead of silently defaulting to `"float"` — the
-    // same accept-and-drop class this package already refuses for
+    // same accept-and-drop class the server already refuses for
     // `/v1/completions`'s unsupported fields.
     let use_base64 = match req.encoding_format.as_deref() {
         None | Some("float") => false,
@@ -998,7 +1197,7 @@ async fn create_embeddings_inner(
 
     // sec-19: cap the batch instead of doing unbounded work for however many
     // inputs a client cares to send. Checked before any embedding work runs.
-    let max_batch_size = state.registry.max_batch_size();
+    let max_batch_size = state.registry().max_batch_size();
     if texts.len() > max_batch_size {
         return Ok(crate::http_error::error_response(
             StatusCode::BAD_REQUEST,
@@ -1014,7 +1213,7 @@ async fn create_embeddings_inner(
     // sec-19: independently of the batch-size cap above, no single input may
     // exceed `max_input_len` characters — otherwise a one-element batch
     // carrying a multi-megabyte string passes the batch check unbounded.
-    let max_input_len = state.registry.max_input_len();
+    let max_input_len = state.registry().max_input_len();
     if let Some(offending_index) = texts.iter().position(|t| t.chars().count() > max_input_len) {
         return Ok(crate::http_error::error_response(
             StatusCode::BAD_REQUEST,
@@ -1031,27 +1230,33 @@ async fn create_embeddings_inner(
     // those ids when the backend can consume them, instead of re-tokenising
     // the decimal string `as_strings` renders — see
     // `EmbeddingInput::as_token_batches`.
-    let token_batches = if state.registry.has_token_embedder() {
+    let token_batches = if state.registry().has_token_embedder() {
         req.input.as_token_batches()
     } else {
         None
     };
 
-    // EMBED-WIRE item 3: a TEXT input that tokenizes past the installed
-    // backend's ceiling is refused outright, OpenAI-style, naming the real
-    // token count — rather than silently truncated and billed in full (the
-    // defect the wave-4 verifier's minor[3] named). This governs the TEXT
+    // A TEXT request is tokenized (or, behind a
+    // counter whose ids the backend cannot reuse, counted) exactly once, and
+    // that one pass answers the length guard, the usage block and — with a
+    // token-aware model backend — the embedding pass below. A raw token-id
+    // request needs none of it: its ids are already the tokens.
+    let text_tokens = match token_batches {
+        Some(_) => TextTokens::Uncounted,
+        None => state.registry().tokenize_texts(&texts),
+    };
+
+    // A TEXT input that tokenizes past the installed backend's ceiling is
+    // refused outright, OpenAI-style, naming the real token count — rather
+    // than silently truncated and billed in full. This governs the TEXT
     // path only: a request that supplied raw token ids (`token_batches`
     // above is `Some`) is NOT covered by this guard and keeps truncating —
     // see `crate::embed_engine`'s "Truncation" module-doc section for why
     // the two paths are allowed to disagree.
-    let max_input_tokens = state.registry.max_input_tokens();
+    let max_input_tokens = state.registry().max_input_tokens();
     if token_batches.is_none() {
         if let Some(max_tokens) = max_input_tokens {
-            if let Some((index, n_tokens)) = state
-                .registry
-                .first_text_exceeding_token_limit(&texts, max_tokens)
-            {
+            if let Some((index, n_tokens)) = text_tokens.first_exceeding(max_tokens) {
                 return Ok(crate::server::ApiError::new(
                     StatusCode::BAD_REQUEST,
                     format!(
@@ -1076,13 +1281,14 @@ async fn create_embeddings_inner(
     // sequence to `max_input_tokens` when one is known, so charging the full
     // supplied length here — as a previous version did — would bill for ids
     // the model never saw whenever a sequence exceeds that ceiling (the
-    // same minor[3] class as the text path, but this path keeps truncating
+    // same over-billing class as the text path, but this path keeps truncating
     // by design rather than erroring, so it is the accounting, not the
     // truncation, that is fixed). Counting the decimal rendering instead of
     // the ids would ALSO be wrong regardless of truncation (`[10, 20, 30]`
     // is 3 tokens; `"10 20 30"` tokenises to 8 under the char-level
     // vocabulary, and to something else again under a real BPE). Otherwise
-    // it is the model's own tokenizer, or the historical whitespace word
+    // it is the model's own tokenizer — read off `text_tokens`, the one pass
+    // above, not a second tokenization — or the historical whitespace word
     // count when no backend owns one (see
     // `EmbedderRegistry::count_prompt_tokens`). Computed from `&texts` /
     // `&token_batches` before either is moved into the blocking task below,
@@ -1095,9 +1301,9 @@ async fn create_embeddings_inner(
                 None => ids.len(),
             })
             .sum(),
-        None => state.registry.count_prompt_tokens(&texts),
+        None => text_tokens.prompt_tokens(&texts),
     };
-    if let Some(metrics) = state.metrics.as_ref() {
+    if let Some(metrics) = state.metrics() {
         metrics.prompt_tokens_total.inc_by(prompt_tokens as u64);
     }
 
@@ -1116,21 +1322,30 @@ async fn create_embeddings_inner(
     // directly on the async handler's tokio worker thread; the same defect
     // class `sec-03` already fixes for `/v1/completions`. `state` is cloned
     // (cheap: `Arc`) and moved into the blocking task; `texts` /
-    // `token_batches` are moved too (not cloned), since nothing after this
-    // point needs the originals.
+    // `token_batches` / `text_tokens` are moved too (not cloned), since
+    // nothing after this point needs the originals.
+    //
+    // Text whose ids the one pass above already produced from the model
+    // backend itself (`TextTokens::Tokenized`) is embedded from those ids —
+    // the same vectors `embed_texts` would compute (see
+    // `EmbedderRegistry::with_token_aware_model`'s contract), without
+    // tokenizing every input a second time.
     let state_for_embed = Arc::clone(state);
     let raw_embeddings = match tokio::task::spawn_blocking(move || {
-        match token_batches {
-            Some(batches) => state_for_embed
-                .registry
-                .embed_token_batches(&batches)
-                // `has_token_embedder()` was true when `token_batches` was
-                // built and the registry is immutable behind an `Arc`, so
-                // this `None` arm is unreachable; falling back to the text
-                // path rather than unwrapping keeps it panic-free anyway.
-                .unwrap_or_else(|| state_for_embed.registry.embed_texts(&texts)),
-            None => state_for_embed.registry.embed_texts(&texts),
-        }
+        let registry = state_for_embed.registry();
+        let ids = match (token_batches, text_tokens) {
+            (Some(batches), _) | (None, TextTokens::Tokenized(batches)) => batches,
+            (None, _) => return registry.embed_texts(&texts),
+        };
+        registry
+            .embed_token_batches(&ids)
+            // Both arms above only hand over ids when a token embedder is
+            // installed (`has_token_embedder()` for request ids,
+            // `with_token_aware_model` for tokenized text) and the registry
+            // is immutable behind an `Arc`, so this `None` arm is
+            // unreachable; falling back to the text path rather than
+            // unwrapping keeps it panic-free anyway.
+            .unwrap_or_else(|| registry.embed_texts(&texts))
     })
     .await
     {
@@ -1148,14 +1363,14 @@ async fn create_embeddings_inner(
     // Report which backend actually answered rather than echoing the
     // client's unverified `model` request field (RT-08's fix item 3: "make
     // the response `model` field report which backend answered").
-    let model_name = format!("bonsai-embeddings-{}", state.registry.backend_name());
+    let model_name = format!("bonsai-embeddings-{}", state.registry().backend_name());
 
     // RT-08 fix item 1's trailing clause ("document the dimension and the
     // normalisation in the response"): `natural_dim` is uniform across the
     // whole batch (every backend has one fixed `embedding_dim()`), so the
     // post-truncation dimension every item in `data` will have can be
     // computed once, up front, rather than re-derived per item.
-    let natural_dim = state.registry.embedding_dim();
+    let natural_dim = state.registry().embedding_dim();
     let final_dim = req
         .dimensions
         .filter(|&d| d < natural_dim)
@@ -1289,9 +1504,8 @@ pub fn create_embeddings_router_with_model(
 /// instead of a silently-wrong, non-semantic `IdentityEmbedder` byte-hash
 /// vector.
 ///
-/// This is orchestrator decision D-1 (wave 2.5, `RT-EMBEDDINGS` blocking 1):
-/// answering with a byte-hash vector that merely *looks* like an embedding is
-/// worse than refusing outright. Since `EMBED-MODEL` landed
+/// Answering with a byte-hash vector that merely *looks* like an embedding
+/// is worse than refusing outright (`RT-08`). With
 /// `BonsaiModel::forward_hidden` and [`ModelEmbedder`], a served deployment
 /// normally *has* a model backend, and this constructor is the honest answer
 /// only for one that does not (no engine loaded, or no tokenizer to encode

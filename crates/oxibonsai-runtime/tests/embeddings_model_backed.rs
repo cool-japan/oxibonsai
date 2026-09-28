@@ -1,13 +1,13 @@
 //! Integration gate for the **real, model-backed** `/v1/embeddings` path
-//! (`EMBED-MODEL`, findings `RT-08` / `SV-02`, orchestrator decision D-1).
+//! (findings `RT-08` / `SV-02`).
 //!
-//! Before this package the endpoint had only lexical backends: a TF-IDF bag of
-//! words whose vector space mutated with every request, and a byte-hash
-//! `IdentityEmbedder`. D-1 decided the product ships a genuine embedding
-//! computed from the loaded model's mean-pooled final hidden state. This file
-//! is the outside-the-crate gate on that: the engine seam, the
-//! [`ModelEmbedder`], the HTTP surface it serves, and a real-model semantic
-//! smoke test.
+//! The endpoint once had only lexical backends: a TF-IDF bag of words whose
+//! vector space mutated with every request, and a byte-hash
+//! `IdentityEmbedder`. It now serves a genuine embedding computed from the
+//! loaded model's mean-pooled final hidden state. This file is the
+//! outside-the-crate gate on that: the engine seam, the [`ModelEmbedder`], the
+//! HTTP surface it serves, a real-model semantic smoke test, and the
+//! benchmark of the batched path against the per-token loop.
 //!
 //! # Why most tests here use a synthetic *weighted* GGUF, not `tiny_test()`
 //!
@@ -32,35 +32,36 @@
 //! so a run that never exercised a real model is distinguishable in the
 //! manifest from one that did.
 //!
-//! # `tiny_test()`'s unit-norm substitution, recorded here as the wave-4
-//! # verifier's minor[1] asked (also in this package's `deviations`)
+//! # `tiny_test()` is asserted for shape, never for unit norm
 //!
 //! `weightless_tiny_test_engine_embeds_to_the_right_shape` asserts SHAPE only
 //! — never unit norm — because `Qwen3Config::tiny_test()` through
 //! `BonsaiModel::new` leaves `blocks` empty and synthesizes an all-zero
 //! `token_embd`, so every hidden state (and therefore the pooled vector) is
-//! exactly zero, which has norm `0`, not `1`. The corresponding unit-norm
-//! assertion runs on the WEIGHTED synthetic ternary GGUF instead
+//! exactly zero, which has norm `0`, not `1`. The unit-norm assertion runs on
+//! the WEIGHTED synthetic ternary GGUF instead
 //! (`engine_embed_returns_hidden_size_floats_with_unit_norm`,
 //! `model_backed_router_answers_200_with_unit_norm_vectors`), never on
-//! `tiny_test()`. This substitution is correct — asserting unit norm against
-//! a model that produces the zero vector would be asserting something false —
-//! but it means the literal spec text ("`tiny_test()` config engine → embed
-//! returns hidden_size floats with unit norm") is satisfied by two tests, not
-//! one; see the module docs above ("Why most tests here use a synthetic
-//! *weighted* GGUF") for the fuller rationale.
+//! `tiny_test()`: asserting unit norm against a model that produces the zero
+//! vector would be asserting something false.
 //!
-//! # EMBED-WIRE additions
+//! # The batched engine lock and the truncation split
 //!
 //! Section 2b proves `EmbedderRegistry::embed_texts` /
 //! `embed_token_batches` — the methods the HTTP handler actually calls —
-//! reach [`ModelEmbedder`]'s batched engine lock (closing the wave-4
-//! verifier's minor[2]: the lock existed but was never reached). Section 3b
-//! proves the same end to end over HTTP, plus the `context_length_exceeded`
-//! / truncation split (EMBED-WIRE item 3): TEXT that tokenizes past the
-//! backend's ceiling is refused rather than silently truncated and billed in
-//! full (closing minor[3]); raw token ids keep truncating, now billed for
+//! reach [`ModelEmbedder`]'s batched engine lock (one acquisition per
+//! request, not per item). Section 3b proves the same end to end over HTTP,
+//! plus the `context_length_exceeded` / truncation split: TEXT that
+//! tokenizes past the backend's ceiling is refused rather than silently
+//! truncated and billed in full; raw token ids keep truncating, billed for
 //! exactly what gets embedded.
+//!
+//! # The benchmark
+//!
+//! `embed_bench_short_and_long` (section 6) times the production
+//! `InferenceEngine::embed` against the per-token loop it replaced, on the
+//! real 1.7B, and asserts the short-input speed-up. It runs only when asked
+//! (`OXIBONSAI_EMBED_BENCH=1`, release build).
 
 // `embeddings` is only compiled with the `server` feature; gate the whole file
 // the same way so `--no-default-features` stays green.
@@ -96,8 +97,6 @@ use oxibonsai_tokenizer::OxiTokenizer;
 /// generate_pipeline_tests.rs` and `cross_backend_determinism_tests.rs`
 /// already use — same shapes, same packing rules — with the vocabulary made a
 /// parameter so it can be matched to the char-level tokenizer's id range.
-/// Inlined here rather than shared through a `tests/` helper module so this
-/// package adds exactly the one test file its work order lists.
 mod fixture {
     use half::f16;
     use oxibonsai_core::gguf::writer::{GgufWriter, MetadataWriteValue, TensorEntry, TensorType};
@@ -551,7 +550,7 @@ fn model_embedder_refuses_text_that_tokenizes_to_nothing() {
 fn embed_batch_agrees_with_per_item_embed() {
     let embedder = weighted_embedder();
     let texts = vec!["one".to_string(), "two".to_string(), "three".to_string()];
-    let batched = embedder.embed_batch(&texts);
+    let batched = embedder.embed_owned_batch(&texts);
     assert_eq!(batched.len(), 3);
     for (i, text) in texts.iter().enumerate() {
         let single = embedder.embed(text).expect("single embed");
@@ -575,14 +574,14 @@ fn embed_tokens_bypasses_the_tokenizer() {
     );
 }
 
-// ─── 2b. EMBED-WIRE item 2: the registry reaches the batched lock ────────────
+// ─── 2b. The registry reaches the batched lock ───────────────────────────────
 //
-// `ModelEmbedder::embed_batch` (section 2 above) always took its lock once
-// for a whole batch, but the wave-4 verifier's minor[2] caught that
+// `ModelEmbedder`'s batch paths (section 2 above) take its lock once for a
+// whole batch, but that is only worth anything if
 // `EmbedderRegistry::embed_texts` — the ONE method the HTTP handler actually
-// calls — never reached it: an N-input request took the engine mutex N
-// times regardless. These tests exercise the registry entry point, not the
-// embedder directly, to prove that wiring now holds.
+// calls — reaches them: otherwise an N-input request takes the engine mutex
+// N times regardless. These tests exercise the registry entry point, not the
+// embedder directly, to prove that wiring holds.
 
 #[test]
 fn embed_texts_through_the_registry_takes_the_engine_lock_once_for_the_whole_batch() {
@@ -663,7 +662,8 @@ async fn model_backed_router_answers_200_with_unit_norm_vectors() {
     assert_eq!(
         status,
         StatusCode::OK,
-        "a router carrying a real model embedder must answer 200, not D-1's 501: {json}"
+        "a router carrying a real model embedder must answer 200, not the no-backend 501: \
+         {json}"
     );
     assert_eq!(json["object"].as_str(), Some("list"));
     assert_eq!(
@@ -815,7 +815,7 @@ async fn empty_input_is_refused_before_any_model_work() {
     );
 }
 
-// ─── 3b. EMBED-WIRE items 2 & 3: batched lock and truncation, end to end ─────
+// ─── 3b. Batched lock and truncation, end to end ─────────────────────────────
 
 #[tokio::test]
 async fn http_batch_request_takes_the_engine_lock_once_for_the_whole_batch() {
@@ -908,7 +908,7 @@ async fn token_id_input_longer_than_max_tokens_still_truncates_and_charges_only_
         .with_metrics(Arc::clone(&metrics)),
     );
     // 6 ids against a ceiling of 4: the raw token-id path must keep
-    // truncating (EMBED-WIRE item 3's explicit carve-out), not error.
+    // truncating (its deliberate carve-out from the text refusal), not error.
     let ids: Vec<u32> = vec![10, 20, 30, 40, 50, 60];
     let (status, json) = post_embeddings(app, serde_json::json!({ "input": ids })).await;
     assert_eq!(
@@ -1034,18 +1034,18 @@ async fn a_router_without_metrics_still_serves() {
 /// CPU): every one-token input — `king`, `queen`, `banana`, `apple`, `the` —
 /// sits within `0.9989 … 0.9996` of every other, and the dominant axis of
 /// variation is the input's *token count*, not its meaning (a two-token word
-/// like `monarch` lands at ~0.81 from `king`). The spec's
+/// like `monarch` lands at ~0.81 from `king`). The ordering
 /// `cos(king, queen) > cos(king, banana)` therefore does hold, but by only
 /// ~2.5e-4 — a true ordering with a margin too narrow to defend on its own.
 ///
 /// Averaging more than one or two hidden states dissolves most of that: two
 /// sentences differing in a single word measure ~0.979, while a sentence about
 /// breakfast measures ~0.619 from either — a margin of ~0.36. Both assertions
-/// are kept: the first because the work order names it, the second because it
-/// is the one that would actually catch a regression.
+/// are kept: the first because it is the classic sanity check, the second
+/// because it is the one that would actually catch a regression.
 ///
-/// This is a property of the mean-pooling recipe the work order specifies, not
-/// a defect in it; a production deployment that needs isotropic vectors
+/// This is a property of the mean-pooling recipe, not a defect in it; a
+/// production deployment that needs isotropic vectors
 /// whitens or centres them downstream, which needs a corpus and is out of this
 /// endpoint's scope.
 #[test]
@@ -1136,5 +1136,237 @@ fn real_model_places_queen_nearer_to_king_than_banana() {
          than either is to a sentence about breakfast: {royal_sentences} vs {fruit_sentences}"
     );
 
+    record_executed(Capability::LegacyModels, TEST_NAME);
+}
+
+// ─── 6. Benchmark: the batched path against the per-token loop ───────────────
+
+/// The request budget the HTTP layer gives one embeddings request; the
+/// benchmark reports whether the longest input fits inside it.
+const EMBED_REQUEST_BUDGET_SECS: f64 = 60.0;
+
+/// Timed runs per leg; every figure the benchmark reports is the minimum —
+/// the sample closest to the machine's own floor under contention.
+const BENCH_RUNS: usize = 3;
+
+/// Input lengths the benchmark measures: a short query, a paragraph, and the
+/// embedder's default token ceiling (`DEFAULT_MAX_EMBEDDING_TOKENS`).
+const BENCH_LENGTHS: [usize; 3] = [10, 200, 2000];
+
+/// The acceptance ratio for the shortest input.
+const SHORT_INPUT_MIN_SPEEDUP: f64 = 10.0;
+
+/// A few paragraphs of ordinary English; repeated, it tokenizes to well over
+/// the longest benchmark length.
+const BENCH_TEXT: &str = "Rivers carve valleys over millions of years. Water collects in the \
+    highlands, gathers speed as it descends, and carries sand and stone that grind the riverbed \
+    deeper with every flood. Where the land flattens, the current slows and drops its load, \
+    building fertile plains and deltas that have fed cities since the first harvests. \
+    Engineers now build dams and levees to tame that energy, trading the old cycle of flood and \
+    renewal for steady water and electricity, and the rivers answer by moving their sediment \
+    somewhere else. A mixture of experts routes every token to a few specialised feed-forward \
+    networks, while a dense model sends every token through all of its weights. Both are \
+    trained end to end, and both are evaluated on the same benchmarks, but their memory and \
+    compute profiles differ sharply at inference time. The quick brown fox jumps over the lazy \
+    dog, and the dog, unimpressed, goes back to sleep in the afternoon sun. ";
+
+/// Best-effort 1/5/15-minute load average for the benchmark record (read
+/// through `uptime`: a printed diagnostic is no reason for a dependency).
+fn load_average() -> String {
+    match std::process::Command::new("uptime").output() {
+        Ok(out) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            match text.split_once("load average") {
+                Some((_, tail)) => tail.trim_start_matches([':', 's', ' ']).trim().to_string(),
+                None => text.trim().to_string(),
+            }
+        }
+        _ => "unavailable".to_string(),
+    }
+}
+
+/// Mean-pool `rows` (`[n x hidden]`) and scale to unit length — the recipe
+/// `embed_mean_pooled` applies, for turning the per-token loop's rows into a
+/// comparable vector.
+fn pool_rows(rows: &[f32], hidden: usize) -> Vec<f32> {
+    let n = rows.len() / hidden;
+    let mut pooled = vec![0.0f32; hidden];
+    for row in rows.chunks_exact(hidden) {
+        for (acc, v) in pooled.iter_mut().zip(row) {
+            *acc += *v;
+        }
+    }
+    let inv = 1.0 / n as f32;
+    pooled.iter_mut().for_each(|v| *v *= inv);
+    let norm = l2_norm(&pooled);
+    if norm > 1e-10 {
+        pooled.iter_mut().for_each(|v| *v /= norm);
+    }
+    pooled
+}
+
+/// Run `f` `runs` times and return every wall time plus the last result.
+fn time_runs<T>(runs: usize, mut f: impl FnMut() -> T) -> (Vec<f64>, T) {
+    let mut times = Vec::with_capacity(runs);
+    let mut last = None;
+    for _ in 0..runs.max(1) {
+        let started = std::time::Instant::now();
+        let value = f();
+        times.push(started.elapsed().as_secs_f64());
+        last = Some(value);
+    }
+    match last {
+        Some(value) => (times, value),
+        None => unreachable!("runs.max(1) >= 1 iterations always ran"),
+    }
+}
+
+fn min_of(times: &[f64]) -> f64 {
+    times.iter().copied().fold(f64::INFINITY, f64::min)
+}
+
+fn fmt_runs(times: &[f64]) -> String {
+    times
+        .iter()
+        .map(|t| format!("{t:.3}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// 10-, 200- and 2000-token embeddings on the real `Ternary-Bonsai-1.7B`:
+/// the production `InferenceEngine::embed` (the batched CPU prefill) against
+/// the per-token host-KV loop the same engine ran before
+/// (`BonsaiModel::forward_hidden_sequential` on a dispatcher built exactly
+/// as the engine's own), minimum of three runs per leg (a single run for the
+/// 2000-token per-token leg, which takes minutes), with the load average
+/// printed before and after.
+///
+/// Asserts the acceptance ratio on the 10-token input and that both legs
+/// agree (pooled cosine >= 0.9999); records the 2000-token wall time against
+/// the request budget. Runs only with `OXIBONSAI_EMBED_BENCH=1` and
+/// `OXIBONSAI_MODELS_DIR` set (release build), and self-skips — recording
+/// the skip — otherwise.
+#[test]
+fn embed_bench_short_and_long() {
+    use oxibonsai_kernels::KernelDispatcher;
+
+    const TEST_NAME: &str =
+        "oxibonsai-runtime::embeddings_model_backed::embed_bench_short_and_long";
+    if !std::env::var("OXIBONSAI_EMBED_BENCH").is_ok_and(|v| v == "1") {
+        eprintln!("{TEST_NAME}: set OXIBONSAI_EMBED_BENCH=1 (release build) to run -- skipping");
+        record_skipped(Capability::LegacyModels, TEST_NAME);
+        return;
+    }
+    if std::env::var_os("OXIBONSAI_MODELS_DIR").is_none_or(|d| d.is_empty()) {
+        eprintln!("{TEST_NAME}: OXIBONSAI_MODELS_DIR is not set -- skipping");
+        record_skipped(Capability::LegacyModels, TEST_NAME);
+        return;
+    }
+    let (Some(model_path), Some(tokenizer_path)) = (
+        find_model("Ternary-Bonsai-1.7B.gguf"),
+        find_model("tokenizer.json"),
+    ) else {
+        eprintln!(
+            "{TEST_NAME}: Ternary-Bonsai-1.7B.gguf or tokenizer.json missing under {:?} -- \
+             skipping",
+            models_dir()
+        );
+        record_skipped(Capability::LegacyModels, TEST_NAME);
+        return;
+    };
+    let tokenizer = TokenizerBridge::from_file(
+        tokenizer_path
+            .to_str()
+            .expect("the models directory path is valid UTF-8"),
+    )
+    .expect("load the real tokenizer.json");
+    let longest = BENCH_LENGTHS.iter().copied().max().unwrap_or(0);
+    let mut text = String::new();
+    let ids = loop {
+        text.push_str(BENCH_TEXT);
+        let ids = tokenizer
+            .encode(&text)
+            .expect("tokenize the benchmark text");
+        if ids.len() >= longest {
+            break ids;
+        }
+    };
+
+    // The production constructor: the engine `oxibonsai serve`'s embedder
+    // builds, on the auto-detected backend.
+    let (mut engine, _gguf) = oxibonsai_runtime::engine::InferenceEngine::from_gguf_path_leaked(
+        &model_path,
+        greedy_params(),
+        42,
+        4096,
+    )
+    .expect("load the real 1.7B through the production constructor");
+    // The dispatcher the engine was built with (`Backend::Auto`), rebuilt so
+    // the per-token leg can borrow the model mutably beside it.
+    let per_token_kernel = KernelDispatcher::auto_detect();
+    assert_eq!(per_token_kernel.tier(), engine.kernel_tier());
+    let hidden = engine.hidden_size();
+    eprintln!(
+        "embed_bench: model {model_path:?}, engine tier {:?}; per-token leg on {:?}; load \
+         average before: {}",
+        engine.kernel_tier(),
+        per_token_kernel.tier(),
+        load_average()
+    );
+
+    let mut short_speedup = None;
+    for n in BENCH_LENGTHS {
+        let tokens = &ids[..n];
+        let (batched_times, batched) =
+            time_runs(BENCH_RUNS, || engine.embed(tokens).expect("batched embed"));
+        let per_token_runs = if n >= 1000 { 1 } else { BENCH_RUNS };
+        let (per_token_times, per_token_rows) = time_runs(per_token_runs, || {
+            engine
+                .dense_model_mut()
+                .expect("the 1.7B is a dense model")
+                .forward_hidden_sequential(tokens, &per_token_kernel)
+                .expect("per-token forward_hidden")
+        });
+        let per_token = pool_rows(&per_token_rows, hidden);
+        let cos = cosine(&batched, &per_token);
+        let batched_min = min_of(&batched_times);
+        let per_token_min = min_of(&per_token_times);
+        let speedup = per_token_min / batched_min.max(f64::MIN_POSITIVE);
+        eprintln!(
+            "embed_bench: {n} tokens: per-token loop min {per_token_min:.3} s [{}] ({} run(s)), \
+             batched min {batched_min:.3} s [{}]: {speedup:.1}x faster; pooled cos {cos:.6}; \
+             load {}",
+            fmt_runs(&per_token_times),
+            per_token_times.len(),
+            fmt_runs(&batched_times),
+            load_average()
+        );
+        assert!(
+            f64::from(cos) >= 0.9999,
+            "{n} tokens: the batched embedding diverged from the per-token loop: cos {cos}"
+        );
+        if n == BENCH_LENGTHS[0] {
+            short_speedup = Some(speedup);
+        }
+        if n == longest {
+            eprintln!(
+                "embed_bench: {n} tokens: batched wall time {batched_min:.3} s against the \
+                 {EMBED_REQUEST_BUDGET_SECS:.0} s request budget ({})",
+                if batched_min < EMBED_REQUEST_BUDGET_SECS {
+                    "under"
+                } else {
+                    "OVER"
+                }
+            );
+        }
+    }
+    eprintln!("embed_bench: load average after: {}", load_average());
+    let short_speedup = short_speedup.unwrap_or(0.0);
+    assert!(
+        short_speedup >= SHORT_INPUT_MIN_SPEEDUP,
+        "{} tokens: the batched path must be at least {SHORT_INPUT_MIN_SPEEDUP}x faster than \
+         the per-token loop, measured {short_speedup:.2}x",
+        BENCH_LENGTHS[0]
+    );
     record_executed(Capability::LegacyModels, TEST_NAME);
 }

@@ -26,7 +26,7 @@
 //! correction costs one `i32` subtraction per block and the scalar tests
 //! below exercise exactly the algebra the blind x86 path relies on.
 //!
-//! ## Two tables, not one (K-01 / VERIFIED.md)
+//! ## Two tables, not one (K-01)
 //!
 //! The legacy ternary `TQ2_0_g128` map sends the reserved code `0b11` to
 //! `0`, while `PQ2_0` / `Q2_0_g64` send it to `+2`. Both tables are
@@ -37,15 +37,25 @@
 //! `int8_dot_tests::biased_luts_match_the_shared_decode_tables` re-checks
 //! all eight entries at test time anyway.
 //!
+//! ## The `SMMLA` GEMM kernel
+//!
+//! `SMMLA` multiplies a 2x8 int8 matrix by the transpose of another in one
+//! instruction, so it pays only when a decoded weight-row *pair* is reused
+//! against many activation-row pairs. `decode_two_bit_pair_for_mmla` /
+//! `decode_one_bit_pair_for_mmla` decode a pair's block once into the
+//! operand layout, and `mmla_pair_tiles` applies it to every batch-row pair
+//! of a GEMM before moving on — the decode-reuse structure the
+//! `Int8Tier::NeonI8mm` GEMMs are built on (`dispatch_int8::i8mm_gemm`).
+//!
 //! ## Why inline `asm!`, not `vdotq_s32`
 //!
 //! `core::arch::aarch64::vdotq_s32` and `vmmlaq_s32` are still unstable
 //! (`stdarch_neon_dotprod` / `stdarch_neon_i8mm`, rustc 1.95), and enabling
-//! a library feature needs a crate-level `#![feature(..)]` this package
-//! cannot add. `asm!` with `.arch_extension` is stable, emits the identical
-//! single instruction, and is guarded at runtime by
-//! `is_aarch64_feature_detected!` in [`crate::dispatch_int8`].
-//! [`dot_i8x16_widening`] is the ARMv8.0 fallback (`SMULL` + `SADALP`); it
+//! a library feature needs a crate-level `#![feature(..)]`, which a crate
+//! built on the stable toolchain cannot use. `asm!` with `.arch_extension`
+//! is stable, emits the identical single instruction, and is guarded at
+//! runtime by `is_aarch64_feature_detected!` in [`crate::dispatch_int8`].
+//! `dot_i8x16_widening` is the ARMv8.0 fallback (`SMULL` + `SADALP`); it
 //! is exact integer arithmetic, so it agrees with `SDOT` **bit for bit**,
 //! which `int8_dot_tests::neon_sdot_matches_the_widening_fallback` asserts
 //! exhaustively over random inputs.
@@ -382,12 +392,189 @@ mod neon {
     pub unsafe fn load_lut(lut16: &[u8; 16]) -> uint8x16_t {
         vld1q_u8(lut16.as_ptr())
     }
+
+    /// Decode one block (`GROUPS` 64-weight groups) of a **weight-row
+    /// pair** into `SMMLA`'s `A`-operand layout — once, so the caller can
+    /// reuse it against every batch-row pair.
+    ///
+    /// Chunk `c = g*8 + s*2 + h` (group `g`, stride-4 lane set `s`, half
+    /// `h`) holds `[w0 lanes h*8..h*8+8 | w1 lanes h*8..h*8+8]` of the
+    /// decoded `(g, s)` vectors: weights `{4i + s : i in h*8..h*8+8}` of
+    /// group `g` for both rows, exactly the elements
+    /// [`crate::quant_activation::Int8Layout::Stride4`] stores at positions
+    /// `g*64 + s*16 + h*8 ..+8`. Chunks past `GROUPS * 8` are zero.
+    ///
+    /// # Safety
+    /// NEON is the AArch64 baseline; `qs0` and `qs1` must each be readable
+    /// for `GROUPS * 16` bytes, and `GROUPS <= 2`.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub unsafe fn decode_two_bit_pair_for_mmla<const GROUPS: usize>(
+        qs0: *const u8,
+        qs1: *const u8,
+        lut: uint8x16_t,
+    ) -> [int8x16_t; super::I8MM_MAX_CHUNKS] {
+        let mut out = [vdupq_n_s8(0); super::I8MM_MAX_CHUNKS];
+        let mut g = 0usize;
+        while g < GROUPS {
+            let w0 = decode_two_bit_group(qs0.add(g * 16), lut);
+            let w1 = decode_two_bit_group(qs1.add(g * 16), lut);
+            let mut s = 0usize;
+            while s < 4 {
+                let a = vreinterpretq_s64_s8(w0[s]);
+                let b = vreinterpretq_s64_s8(w1[s]);
+                out[g * 8 + s * 2] = vreinterpretq_s8_s64(vzip1q_s64(a, b));
+                out[g * 8 + s * 2 + 1] = vreinterpretq_s8_s64(vzip2q_s64(a, b));
+                s += 1;
+            }
+            g += 1;
+        }
+        out
+    }
+
+    /// Decode one 128-weight `Q1_0_g128` block of a **weight-row pair**
+    /// into `SMMLA`'s `A`-operand layout: chunk `c` holds `[w0 weights
+    /// 8c..8c+8 | w1 weights 8c..8c+8]` as biased `0` / `2` bytes — i.e.
+    /// `decode_one_bit_pair` of the two rows' byte `c` — matching the
+    /// [`crate::quant_activation::Int8Layout::Sequential`] activation order.
+    ///
+    /// # Safety
+    /// NEON is the AArch64 baseline; `qs0` and `qs1` must each be readable
+    /// for 16 bytes.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub unsafe fn decode_one_bit_pair_for_mmla(
+        qs0: *const u8,
+        qs1: *const u8,
+    ) -> [int8x16_t; super::I8MM_MAX_CHUNKS] {
+        let mut out = [vdupq_n_s8(0); super::I8MM_MAX_CHUNKS];
+        let mut c = 0usize;
+        while c < super::I8MM_MAX_CHUNKS {
+            out[c] = decode_one_bit_pair(*qs0.add(c), *qs1.add(c));
+            c += 1;
+        }
+        out
+    }
+
+    /// The tile loop of the decode-reuse `SMMLA` GEMM: apply one decoded
+    /// weight-row-pair block `w` (`QUADS * 4` chunks) to each of `pairs`
+    /// batch-row pairs — form the biased 2x2 dot `[w0.x0, w0.x1, w1.x0,
+    /// w1.x1]` with `QUADS * 4` `SMMLA`s, remove the bias, and fold
+    /// `(d * s) * (acc - sum)` into that pair's `f32x4` accumulator.
+    ///
+    /// `codes` points at pair 0's `QUADS * 64` interleaved activation bytes
+    /// for this block, consecutive pairs `QUADS * 64` bytes apart; `scales`
+    /// / `sums` at pair 0's four lanes (`[s0, s1, s0, s1]`, `[sum0, sum1,
+    /// sum0, sum1]`), consecutive pairs 4 lanes apart; `d4` is `[d0, d0, d1,
+    /// d1]`; `accs` holds `pairs * 4` floats.
+    ///
+    /// Four independent accumulators keep four `SMMLA`s in flight instead
+    /// of one latency-bound chain (integer addition is exact, so the split
+    /// cannot change the result), and the `f32` step is a separate multiply
+    /// and add in the scalar kernel's order — never a fused multiply-add —
+    /// so every lane is bit-identical to the `SDOT` / scalar row kernels.
+    ///
+    /// # Safety
+    /// The host must support `i8mm`; `QUADS * 4 <= I8MM_MAX_CHUNKS`; every
+    /// pointer must be valid for the extent described above.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn mmla_pair_tiles<const QUADS: usize>(
+        w: &[int8x16_t; super::I8MM_MAX_CHUNKS],
+        d4: float32x4_t,
+        codes: *const i8,
+        scales: *const f32,
+        sums: *const i32,
+        pairs: usize,
+        accs: *mut f32,
+    ) {
+        let pair_bytes = QUADS * 64;
+        for p in 0..pairs {
+            let x = codes.add(p * pair_bytes);
+            let mut acc0 = vdupq_n_s32(0);
+            let mut acc1 = vdupq_n_s32(0);
+            let mut acc2 = vdupq_n_s32(0);
+            let mut acc3 = vdupq_n_s32(0);
+            let mut q = 0usize;
+            while q < QUADS {
+                let xs = vld1q_s8_x4(x.add(q * 64));
+                acc0 = mmla_i8(acc0, w[q * 4], xs.0);
+                acc1 = mmla_i8(acc1, w[q * 4 + 1], xs.1);
+                acc2 = mmla_i8(acc2, w[q * 4 + 2], xs.2);
+                acc3 = mmla_i8(acc3, w[q * 4 + 3], xs.3);
+                q += 1;
+            }
+            let dot = vaddq_s32(vaddq_s32(acc0, acc1), vaddq_s32(acc2, acc3));
+            let acc = vsubq_s32(dot, vld1q_s32(sums.add(p * 4)));
+            let scale = vmulq_f32(d4, vld1q_f32(scales.add(p * 4)));
+            let term = vmulq_f32(scale, vcvtq_f32_s32(acc));
+            let slot = accs.add(p * 4);
+            vst1q_f32(slot, vaddq_f32(vld1q_f32(slot), term));
+        }
+    }
+
+    /// One block of one 2-bit weight-row pair against every batch-row pair:
+    /// [`decode_two_bit_pair_for_mmla`] once, then [`mmla_pair_tiles`].
+    ///
+    /// # Safety
+    /// The host must support `i8mm`; `GROUPS` must be 1 or 2; see the two
+    /// callees for the pointer extents.
+    #[target_feature(enable = "neon")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn mmla_pair_block<const GROUPS: usize>(
+        qs0: *const u8,
+        qs1: *const u8,
+        lut: uint8x16_t,
+        d4: float32x4_t,
+        codes: *const i8,
+        scales: *const f32,
+        sums: *const i32,
+        pairs: usize,
+        accs: *mut f32,
+    ) {
+        let w = decode_two_bit_pair_for_mmla::<GROUPS>(qs0, qs1, lut);
+        if GROUPS == 2 {
+            mmla_pair_tiles::<4>(&w, d4, codes, scales, sums, pairs, accs);
+        } else {
+            mmla_pair_tiles::<2>(&w, d4, codes, scales, sums, pairs, accs);
+        }
+    }
+
+    /// One `Q1_0_g128` block of one weight-row pair against every batch-row
+    /// pair: [`decode_one_bit_pair_for_mmla`] once, then
+    /// [`mmla_pair_tiles`].
+    ///
+    /// # Safety
+    /// The host must support `i8mm`; see the two callees for the pointer
+    /// extents.
+    #[target_feature(enable = "neon")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn mmla_pair_block_one_bit(
+        qs0: *const u8,
+        qs1: *const u8,
+        d4: float32x4_t,
+        codes: *const i8,
+        scales: *const f32,
+        sums: *const i32,
+        pairs: usize,
+        accs: *mut f32,
+    ) {
+        let w = decode_one_bit_pair_for_mmla(qs0, qs1);
+        mmla_pair_tiles::<4>(&w, d4, codes, scales, sums, pairs, accs);
+    }
 }
+
+/// Most `SMMLA` chunks one block can hold: a 128-weight block is sixteen
+/// 8-weight chunks (see `decode_two_bit_pair_for_mmla` /
+/// `decode_one_bit_pair_for_mmla`).
+pub const I8MM_MAX_CHUNKS: usize = 16;
 
 #[cfg(target_arch = "aarch64")]
 pub use neon::{
-    block_dot_one_bit_neon, block_dot_two_bit_2x2_i8mm, block_dot_two_bit_neon, dot_i8x16_sdot,
-    dot_i8x16_widening, load_lut, mmla_i8,
+    block_dot_one_bit_neon, block_dot_two_bit_2x2_i8mm, block_dot_two_bit_neon,
+    decode_one_bit_pair_for_mmla, decode_two_bit_pair_for_mmla, dot_i8x16_sdot, dot_i8x16_widening,
+    load_lut, mmla_i8, mmla_pair_block, mmla_pair_block_one_bit, mmla_pair_tiles,
 };
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -469,7 +656,7 @@ pub use avx512::{block_dot_one_bit_avx512vnni, block_dot_two_bit_avx512vnni};
 /// It lives **here**, in an architecture-independent module, rather than
 /// beside its only caller, for one reason: `simd_avx512.rs` is
 /// `#[cfg(target_arch = "x86_64")]`, so a test of this table placed there
-/// could never run on the AArch64 machine this package is developed on.
+/// could never run on an AArch64 development machine.
 /// `int8_dot_tests::ternary_f32_lut_matches_the_shared_decode_exhaustively`
 /// checks all 1024 entries on every host instead, which is the only part of
 /// the blind AVX-512 decode that can actually be wrong.
@@ -477,8 +664,8 @@ pub use avx512::{block_dot_one_bit_avx512vnni, block_dot_two_bit_avx512vnni};
 /// Generated by a `const fn` from [`oxibonsai_core::ternary_code_to_i8`],
 /// never transcribed, so K-01's "one table" invariant holds by
 /// construction. (`gemm_ternary.rs` holds a private, identically-generated
-/// copy for its own NEON/AVX2 kernels; that file is not this package's to
-/// edit, and two tables generated from the same `const fn` cannot drift.)
+/// copy for its own NEON/AVX2 kernels; two tables generated from the same
+/// `const fn` cannot drift.)
 pub static TERNARY_BYTE_LUT_F32: [[f32; 4]; 256] = build_ternary_byte_lut_f32();
 
 const fn build_ternary_byte_lut_f32() -> [[f32; 4]; 256] {
@@ -793,6 +980,95 @@ mod int8_dot_tests {
             let w1x0 = block_dot_two_bit_scalar(&qs1, &act0, &PQ2_BIASED_LUT);
             let w1x1 = block_dot_two_bit_scalar(&qs1, &act1, &PQ2_BIASED_LUT);
             assert_eq!(tile, [w0x0, w0x1, w1x0, w1x1], "SMMLA tile lane order");
+        }
+    }
+
+    /// `mmla_pair_block` against the scalar algebra it replaces, on both
+    /// block sizes and both tables: per batch-row pair, each lane must be
+    /// `(d_w * s_x) * (scalar biased dot - sum_x)` bit for bit, accumulated
+    /// onto the lane's previous value with a plain add.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_mmla_pair_block_matches_the_scalar_algebra() {
+        use core::arch::aarch64::*;
+
+        if !(std::arch::is_aarch64_feature_detected!("i8mm")
+            && std::arch::is_aarch64_feature_detected!("dotprod"))
+        {
+            eprintln!("skipping: host has no i8mm+dotprod");
+            return;
+        }
+        let mut rng = Lcg::new(0x3A70);
+        for lut in [&TQ2_BIASED_LUT, &PQ2_BIASED_LUT] {
+            for groups in [1usize, 2] {
+                let pairs = 3usize;
+                let qs0: Vec<u8> = (0..groups * 16).map(|_| rng.next_u8()).collect();
+                let qs1: Vec<u8> = (0..groups * 16).map(|_| rng.next_u8()).collect();
+                let (d0, d1) = (0.0625f32, 0.1875f32);
+                // Per pair: two stride-4 activation rows, their scales and
+                // exact code sums, and the panel's interleaved layout.
+                let mut rows: Vec<(Vec<i8>, Vec<i8>)> = Vec::new();
+                let mut codes = vec![0i8; pairs * groups * 128];
+                let mut scales = vec![0.0f32; pairs * 4];
+                let mut sums = vec![0i32; pairs * 4];
+                for p in 0..pairs {
+                    let x0: Vec<i8> = (0..groups * 64).map(|_| rng.next_i8()).collect();
+                    let x1: Vec<i8> = (0..groups * 64).map(|_| rng.next_i8()).collect();
+                    for c in 0..groups * 8 {
+                        let (g, s, h) = (c / 8, (c / 2) % 4, c % 2);
+                        let src = g * 64 + s * 16 + h * 8;
+                        let dst = p * groups * 128 + c * 16;
+                        codes[dst..dst + 8].copy_from_slice(&x0[src..src + 8]);
+                        codes[dst + 8..dst + 16].copy_from_slice(&x1[src..src + 8]);
+                    }
+                    let (s0, s1) = (0.01f32 * (p + 1) as f32, 0.03f32 / (p + 1) as f32);
+                    let (u0, u1) = (
+                        x0.iter().map(|&v| v as i32).sum::<i32>(),
+                        x1.iter().map(|&v| v as i32).sum::<i32>(),
+                    );
+                    scales[p * 4..p * 4 + 4].copy_from_slice(&[s0, s1, s0, s1]);
+                    sums[p * 4..p * 4 + 4].copy_from_slice(&[u0, u1, u0, u1]);
+                    rows.push((x0, x1));
+                }
+                let prior: Vec<f32> = (0..pairs * 4).map(|i| i as f32 * 0.5 - 1.0).collect();
+                let mut accs = prior.clone();
+                let l16 = biased_lut16(lut);
+                // SAFETY: i8mm + dotprod were just detected; every buffer is
+                // sized exactly as `mmla_pair_block` documents.
+                unsafe {
+                    let lv = load_lut(&l16);
+                    let d4 = vcombine_f32(vdup_n_f32(d0), vdup_n_f32(d1));
+                    let (c, s, u, a) = (
+                        codes.as_ptr(),
+                        scales.as_ptr(),
+                        sums.as_ptr(),
+                        accs.as_mut_ptr(),
+                    );
+                    if groups == 2 {
+                        mmla_pair_block::<2>(qs0.as_ptr(), qs1.as_ptr(), lv, d4, c, s, u, pairs, a);
+                    } else {
+                        mmla_pair_block::<1>(qs0.as_ptr(), qs1.as_ptr(), lv, d4, c, s, u, pairs, a);
+                    }
+                }
+                for (p, (x0, x1)) in rows.iter().enumerate() {
+                    let lanes = [
+                        (d0, &qs0, x0, 0usize),
+                        (d0, &qs0, x1, 1),
+                        (d1, &qs1, x0, 0),
+                        (d1, &qs1, x1, 1),
+                    ];
+                    for (lane, (d, qs, x, xi)) in lanes.iter().enumerate() {
+                        let dot = block_dot_two_bit_scalar(qs, x, lut) - sums[p * 4 + xi];
+                        let expect = prior[p * 4 + lane] + *d * scales[p * 4 + xi] * dot as f32;
+                        assert_eq!(
+                            accs[p * 4 + lane].to_bits(),
+                            expect.to_bits(),
+                            "groups={groups} pair {p} lane {lane}: {} vs {expect}",
+                            accs[p * 4 + lane]
+                        );
+                    }
+                }
+            }
         }
     }
 }

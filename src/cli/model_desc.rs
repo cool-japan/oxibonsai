@@ -206,6 +206,266 @@ pub(crate) fn resolved_engine_summary(
     )
 }
 
+/// The summary line `run`/`chat`/`benchmark` print and `serve` logs after
+/// building an engine (cli-16 / REQUIRED #14), from the ENGINE's own
+/// accessors: the resolved variant (the hybrid model's own detection, or
+/// `BonsaiModel::variant()` — never the raw parse-time tensor type, which
+/// named the 27B "Custom"), the resolved dominant quant type, the effective
+/// kernel tier with its reason, the kernel label and the model description.
+pub(crate) fn engine_summary(engine: &oxibonsai_runtime::InferenceEngine<'_>) -> String {
+    let variant = match (engine.hybrid_model(), engine.dense_model()) {
+        (Some(hybrid), _) => hybrid.variant().map(|v| v.name().to_string()),
+        (None, Some(dense)) => Some(dense.variant().name().to_string()),
+        (None, None) => None,
+    }
+    .unwrap_or_else(|| engine.architecture().to_string());
+    format!(
+        "{} | kernel: {} | {}",
+        resolved_engine_summary(
+            &variant,
+            engine.dominant_quant_type(),
+            engine.kernel_tier(),
+            &engine.effective_tier_reason(),
+        ),
+        engine.kernel_label(),
+        engine.model_description(),
+    )
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Truthful `qwen35` hybrid report (wave-4b addendum, REQUIRED #2)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// The `prism.hadamard.*` contract a Bonsai 2 file declares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HadamardSummary {
+    /// `prism.hadamard.version`.
+    pub(crate) version: u32,
+    /// `prism.hadamard.block_size` (1024).
+    pub(crate) block_size: usize,
+    /// The rotated input widths with a sign vector (5120, 6144, 17408).
+    pub(crate) sign_widths: Vec<usize>,
+    /// Folded weight matrices (`weight_names`, 401 for the 27B).
+    pub(crate) folded: usize,
+    /// Inverse-rotated tensors (`inverse_weight_names`: `token_embd.weight`).
+    pub(crate) inverse: usize,
+    /// `prism.hadamard.gdn_v_grouped`.
+    pub(crate) gdn_v_grouped: bool,
+}
+
+/// Everything `info`/`validate` report about a `qwen35` hybrid.
+#[derive(Debug, Clone)]
+pub(crate) struct HybridReport {
+    pub(crate) layers: usize,
+    pub(crate) full_layers: Vec<usize>,
+    pub(crate) linear_layers: usize,
+    pub(crate) vocab: usize,
+    pub(crate) context_length: usize,
+    pub(crate) hadamard: Option<HadamardSummary>,
+    pub(crate) geometry: super::bonsai2::HybridStateGeometry,
+    /// The dry bind (`HybridModel::from_gguf`): the resolved quant type,
+    /// variant and folded count — or why the model cannot be bound.
+    pub(crate) bind: Result<HybridBind, String>,
+    /// The kernel tier every hybrid runs on in this release, and why.
+    pub(crate) kernel_tier: oxibonsai_kernels::KernelTier,
+}
+
+/// What a successful dry bind resolved.
+#[derive(Debug, Clone)]
+pub(crate) struct HybridBind {
+    pub(crate) quant: GgufTensorType,
+    pub(crate) variant: Option<String>,
+    pub(crate) folded: usize,
+    pub(crate) description: String,
+}
+
+/// KV cache length the dry bind allocates (tiny: the bind validates the
+/// weights, it never decodes).
+const DRY_BIND_CONTEXT: usize = 16;
+
+/// Build the truthful hybrid report for a parsed `qwen35` GGUF: the config
+/// and Hadamard contract from metadata, plus a header-only dry bind of the
+/// hybrid model — the constructor `run` actually uses (weights stay in the
+/// memory map; ~1-2 s for the 27B).
+///
+/// # Errors
+///
+/// The file's `qwen35` hyper-parameters do not parse (a malformed Hadamard
+/// contract or an unbindable model is reported in the result instead).
+pub(crate) fn hybrid_report(
+    gguf: &oxibonsai_core::gguf::reader::GgufFile<'_>,
+) -> anyhow::Result<HybridReport> {
+    let cfg = oxibonsai_core::config_hybrid::HybridConfig::from_metadata(&gguf.metadata)
+        .map_err(|e| anyhow::anyhow!("qwen35 hyper-parameters: {e}"))?;
+    let geometry = super::bonsai2::HybridStateGeometry::from_config(&cfg);
+    let full_layers: Vec<usize> = (0..cfg.base.num_layers)
+        .filter(|&layer| cfg.is_full_attention(layer))
+        .collect();
+    let hadamard =
+        match oxibonsai_core::hadamard_config::HadamardConfig::from_metadata(&gguf.metadata) {
+            Ok(Some(h)) => {
+                let mut sign_widths: Vec<usize> = h.signs.keys().copied().collect();
+                sign_widths.sort_unstable();
+                Some(HadamardSummary {
+                    version: gguf.metadata.get_u32("prism.hadamard.version").unwrap_or(0),
+                    block_size: h.block_size,
+                    sign_widths,
+                    folded: h.folded.len(),
+                    inverse: h.inverse.len(),
+                    gdn_v_grouped: h.gdn_v_grouped,
+                })
+            }
+            Ok(None) => None,
+            Err(e) => anyhow::bail!("prism.hadamard.* contract: {e}"),
+        };
+    let bind = oxibonsai_model::hybrid::HybridModel::from_gguf(gguf, DRY_BIND_CONTEXT)
+        .map(|model| HybridBind {
+            quant: model.quant_type(),
+            variant: model.variant().map(|v| v.name().to_string()),
+            folded: model.folded_count(),
+            description: model.describe(),
+        })
+        .map_err(|e| e.to_string());
+    Ok(HybridReport {
+        layers: cfg.base.num_layers,
+        linear_layers: cfg.num_linear_layers(),
+        full_layers,
+        vocab: cfg.base.vocab_size,
+        context_length: cfg.base.max_context_length,
+        hadamard,
+        geometry,
+        bind,
+        kernel_tier: oxibonsai_kernels::cpu_kernel_tier(),
+    })
+}
+
+impl HybridReport {
+    /// Human-readable report lines (shared by `info` and `validate`).
+    pub(crate) fn lines(&self, weight_bytes: u64) -> Vec<String> {
+        use super::bonsai2::gib;
+        let mut out = Vec::new();
+        out.push(format!(
+            "Hybrid layers: {} ({} full attention / {} Gated-DeltaNet); full-attention layers {:?}",
+            self.layers,
+            self.full_layers.len(),
+            self.linear_layers,
+            self.full_layers
+        ));
+        match &self.bind {
+            Ok(bind) => {
+                out.push(format!(
+                    "Weights: {} (ggml type id {}){}; {} folded tensors bound",
+                    bind.quant,
+                    bind.quant.wire_id(),
+                    bind.variant
+                        .as_deref()
+                        .map(|v| format!(", variant {v}"))
+                        .unwrap_or_default(),
+                    bind.folded
+                ));
+                out.push(format!("Model: {}", bind.description));
+            }
+            Err(e) => out.push(format!("Hybrid bind: FAILED ({e})")),
+        }
+        match &self.hadamard {
+            Some(h) => out.push(format!(
+                "Hadamard: prism.hadamard.version {} | block_size {} | sign_widths {:?} | {} \
+                 weight_names | {} inverse_weight_names | gdn_v_grouped {}",
+                h.version, h.block_size, h.sign_widths, h.folded, h.inverse, h.gdn_v_grouped
+            )),
+            None => out.push("Hadamard: none (no prism.hadamard.* contract)".to_string()),
+        }
+        out.push(format!(
+            "Vocab: {} | declared context: {} tokens",
+            self.vocab, self.context_length
+        ));
+        let default_ctx = super::bonsai2::default_max_seq_len("qwen35");
+        let ram = oxibonsai_runtime::config::total_ram_bytes();
+        let ram_limit = ram.map(|total| {
+            oxibonsai_runtime::config::max_context_for_budget(
+                total,
+                weight_bytes,
+                self.geometry.recurrent_bytes,
+                self.geometry.kv_bytes_per_token,
+                self.context_length,
+            )
+        });
+        out.push(format!(
+            "Per-sequence state: KV {} bytes/token (f16) = {} at the default --ctx {default_ctx}, \
+             {} at the declared {}; recurrent {} bytes ({}); RAM-derived max --ctx on this host: {}",
+            self.geometry.kv_bytes_per_token,
+            gib(self.geometry.kv_bytes_at(default_ctx)),
+            gib(self.geometry.kv_bytes_at(self.context_length)),
+            self.context_length,
+            self.geometry.recurrent_bytes,
+            gib(self.geometry.recurrent_bytes),
+            ram_limit.map_or_else(|| "unknown".to_string(), |l| l.to_string()),
+        ));
+        out.push(format!(
+            "Kernel tier: {} (hybrid qwen35 model: no hybrid GPU encoder exists yet, so every \
+             backend but an explicit `--backend metal` — which is refused — runs it on the best \
+             CPU tier)",
+            self.kernel_tier
+        ));
+        out
+    }
+
+    /// Machine-readable form for `info --json`.
+    pub(crate) fn to_json(&self, weight_bytes: u64) -> serde_json::Value {
+        let ram_limit = oxibonsai_runtime::config::total_ram_bytes().map(|total| {
+            oxibonsai_runtime::config::max_context_for_budget(
+                total,
+                weight_bytes,
+                self.geometry.recurrent_bytes,
+                self.geometry.kv_bytes_per_token,
+                self.context_length,
+            )
+        });
+        let default_ctx = super::bonsai2::default_max_seq_len("qwen35");
+        serde_json::json!({
+            "layers": self.layers,
+            "full_attention_layers": self.full_layers,
+            "gated_deltanet_layers": self.linear_layers,
+            "vocab_size": self.vocab,
+            "context_length": self.context_length,
+            "weights": match &self.bind {
+                Ok(bind) => serde_json::json!({
+                    "quant": bind.quant.to_string(),
+                    "ggml_type_id": bind.quant.wire_id(),
+                    "variant": bind.variant,
+                    "folded_tensors": bind.folded,
+                    "description": bind.description,
+                }),
+                Err(e) => serde_json::json!({ "bind_error": e }),
+            },
+            "hadamard": self.hadamard.as_ref().map(|h| serde_json::json!({
+                "version": h.version,
+                "block_size": h.block_size,
+                "sign_widths": h.sign_widths,
+                "weight_names": h.folded,
+                "inverse_weight_names": h.inverse,
+                "gdn_v_grouped": h.gdn_v_grouped,
+            })),
+            "kv_bytes_per_token": self.geometry.kv_bytes_per_token,
+            "kv_bytes_at_default_ctx": self.geometry.kv_bytes_at(default_ctx),
+            "default_ctx": default_ctx,
+            "recurrent_bytes": self.geometry.recurrent_bytes,
+            "ram_derived_max_ctx": ram_limit,
+            "kernel_tier": self.kernel_tier.to_string(),
+        })
+    }
+}
+
+/// The kernel tier `run` would use for a DENSE model under `--backend
+/// auto`, with the dispatcher's own reason.
+pub(crate) fn dense_auto_tier() -> (String, String) {
+    let dispatcher = oxibonsai_kernels::KernelDispatcher::auto_detect();
+    (
+        dispatcher.tier().to_string(),
+        dispatcher.effective_tier_reason(),
+    )
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // `oxibonsai build-info` (cli-19)
 // ──────────────────────────────────────────────────────────────────────────
@@ -277,15 +537,26 @@ fn build_features() -> Vec<(&'static str, bool)> {
 /// Kernel tiers this specific binary was compiled with support for
 /// (independent of which one the CPU it happens to run on actually uses —
 /// see [`print_build_info`]'s "Detected runtime tier" line for that).
+///
+/// Gatekeeper REQUIRED #13 (waves 3+3.5 review): `simd-neon`/`simd-avx2`/
+/// `simd-avx512` are empty Cargo features in
+/// `crates/oxibonsai-kernels/Cargo.toml` — zero `cfg(feature =
+/// "simd-...")` anywhere in that crate gates on them — so a build-info line
+/// keyed on those features always printed `simd-neon: off` on a real M3
+/// even though `KernelDispatcher::auto_detect()` picks NEON there every
+/// time. The real selection is `target_arch`-based
+/// (`oxibonsai-kernels/src/dispatch.rs`'s `cpu_tier()`: NEON is
+/// unconditionally available on `aarch64`, and AVX2/AVX512 are attempted
+/// unconditionally on `x86_64` via runtime `is_x86_feature_detected!`, with
+/// no Cargo feature gate on either target) — so this mirrors that same
+/// `target_arch` predicate instead of the dead features.
 fn compiled_kernel_tiers() -> Vec<&'static str> {
     let mut tiers = vec!["reference"];
-    if cfg!(all(target_arch = "x86_64", feature = "simd-avx2")) {
+    if cfg!(target_arch = "x86_64") {
         tiers.push("avx2+fma");
-    }
-    if cfg!(all(target_arch = "x86_64", feature = "simd-avx512")) {
         tiers.push("avx512f+bw+vl");
     }
-    if cfg!(all(target_arch = "aarch64", feature = "simd-neon")) {
+    if cfg!(target_arch = "aarch64") {
         tiers.push("neon");
     }
     if cfg!(feature = "gpu") {
@@ -452,6 +723,26 @@ mod tests {
             summary.contains("Q1_0_g128"),
             "summary must name the resolved quant type; got: {summary}"
         );
+    }
+
+    /// Gatekeeper REQUIRED #13: `compiled_kernel_tiers` must report the
+    /// tier this architecture actually gets from `dispatch.rs::cpu_tier()`,
+    /// not the dead `simd-neon`/`simd-avx2`/`simd-avx512` Cargo features
+    /// (which have no `cfg(feature = "simd-...")` anywhere real).
+    #[test]
+    fn compiled_kernel_tiers_matches_target_arch_not_dead_features() {
+        let tiers = compiled_kernel_tiers();
+        assert!(tiers.contains(&"reference"));
+        #[cfg(target_arch = "aarch64")]
+        assert!(
+            tiers.contains(&"neon"),
+            "aarch64 always has NEON compiled in, regardless of the dead simd-neon feature"
+        );
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert!(tiers.contains(&"avx2+fma"));
+            assert!(tiers.contains(&"avx512f+bw+vl"));
+        }
     }
 
     #[test]

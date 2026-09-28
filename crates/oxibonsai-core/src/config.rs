@@ -247,6 +247,123 @@ impl RopeScaling {
     }
 }
 
+// ─── `--rope-scaling auto|on|off` (wave-4b ruling R2, `RULING_bonsai8b_yarn.md`) ──
+
+/// A caller's override of the RoPE scaling a GGUF declares
+/// (`--rope-scaling auto|on|off`).
+///
+/// `Bonsai-8B.gguf` declares YaRN (factor 4, original context 16384);
+/// honouring it (M-08) is what llama.cpp and the PrismML fork do, but it
+/// changes that model's greedy text at every context length versus
+/// OxiBonsai <= 0.2.4, so `Off` exists to reproduce the old, unscaled
+/// behaviour on request, and `On` to assert that a file really declares
+/// scaling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum RopeScalingOverride {
+    /// Honour whatever `<arch>.rope.scaling.*` the file declares. The
+    /// default, and byte-identical to having no override at all.
+    #[default]
+    Auto,
+    /// Force plain (unscaled) RoPE regardless of the declaration.
+    Off,
+    /// Require the file to declare a scaling strategy.
+    On,
+}
+
+impl RopeScalingOverride {
+    /// Stable lower-case name (`"auto"`, `"off"`, `"on"`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Off => "off",
+            Self::On => "on",
+        }
+    }
+
+    /// Apply this override to the scaling a file of architecture `arch`
+    /// declares.
+    ///
+    /// # Errors
+    ///
+    /// [`BonsaiError::InvalidMetadata`] naming `<arch>.rope.scaling.type`
+    /// for [`RopeScalingOverride::On`] on a file that declares no scaling.
+    pub fn apply(self, declared: RopeScaling, arch: &str) -> BonsaiResult<RopeScaling> {
+        match self {
+            Self::Auto => Ok(declared),
+            Self::Off => Ok(RopeScaling::None),
+            Self::On => match declared {
+                RopeScaling::None => Err(BonsaiError::InvalidMetadata {
+                    key: arch_key(arch, "rope.scaling.type"),
+                    reason: format!(
+                        "RoPE scaling was required (`--rope-scaling on`) but this file \
+                         declares no {arch}.rope.scaling.* metadata"
+                    ),
+                }),
+                other => Ok(other),
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for RopeScalingOverride {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+thread_local! {
+    /// The override [`Qwen3Config::from_metadata`] applies on this thread;
+    /// [`RopeScalingOverride::Auto`] (a no-op) unless a
+    /// [`RopeScalingOverrideScope`] is alive on the same thread.
+    static ROPE_SCALING_OVERRIDE: std::cell::Cell<RopeScalingOverride> =
+        const { std::cell::Cell::new(RopeScalingOverride::Auto) };
+}
+
+/// RAII scope that makes every [`Qwen3Config::from_metadata`] /
+/// [`Qwen3Config::from_metadata_and_tensors`] call **on the current thread**
+/// apply `mode` to the file's declared RoPE scaling, until the guard drops.
+///
+/// This is how the override reaches model constructors that build their own
+/// `Qwen3Config` from the GGUF internally (`BonsaiModel::from_gguf*`,
+/// `HybridModel::from_gguf*`) without changing any of their signatures —
+/// the same scoped-knob pattern as the kernels crate's
+/// `CpuOnlyBackendScope`. The engine's additive constructor
+/// (`InferenceEngine::from_gguf_with_backend_and_rope`) enters it around
+/// model construction. Thread-local and `!Send` (so it can never be dropped
+/// on a thread other than the one it set), and restores the previous value
+/// on drop, so scopes nest and never leak into unrelated loads.
+#[must_use = "the override only lasts while the scope guard is alive"]
+#[derive(Debug)]
+pub struct RopeScalingOverrideScope {
+    previous: RopeScalingOverride,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl RopeScalingOverrideScope {
+    /// Install `mode` for this thread until the returned guard drops.
+    pub fn enter(mode: RopeScalingOverride) -> Self {
+        let previous = ROPE_SCALING_OVERRIDE.with(|cell| cell.replace(mode));
+        Self {
+            previous,
+            _not_send: std::marker::PhantomData,
+        }
+    }
+
+    /// The override currently in force on this thread.
+    #[must_use]
+    pub fn active() -> RopeScalingOverride {
+        ROPE_SCALING_OVERRIDE.with(std::cell::Cell::get)
+    }
+}
+
+impl Drop for RopeScalingOverrideScope {
+    fn drop(&mut self) {
+        let previous = self.previous;
+        ROPE_SCALING_OVERRIDE.with(|cell| cell.set(previous));
+    }
+}
+
 /// Read an optional `f32` hyperparameter, trying `<arch>.<suffix>` then the
 /// legacy `llm.<suffix>` key, returning `None` when neither resolves.
 fn optional_f32(metadata: &MetadataStore, arch: &str, suffix: &str) -> Option<f32> {
@@ -404,7 +521,31 @@ impl Qwen3Config {
         Self::build(metadata, Some(tensors))
     }
 
+    /// [`Qwen3Config::from_metadata`] with an explicit RoPE-scaling override
+    /// (`--rope-scaling`), independent of any [`RopeScalingOverrideScope`]
+    /// on this thread.
+    ///
+    /// # Errors
+    ///
+    /// As [`Qwen3Config::from_metadata`], plus
+    /// [`BonsaiError::InvalidMetadata`] for [`RopeScalingOverride::On`] on a
+    /// file that declares no scaling.
+    pub fn from_metadata_with_rope_override(
+        metadata: &MetadataStore,
+        mode: RopeScalingOverride,
+    ) -> BonsaiResult<Self> {
+        Self::build_with(metadata, None, mode)
+    }
+
     fn build(metadata: &MetadataStore, tensors: Option<&TensorStore>) -> BonsaiResult<Self> {
+        Self::build_with(metadata, tensors, RopeScalingOverrideScope::active())
+    }
+
+    fn build_with(
+        metadata: &MetadataStore,
+        tensors: Option<&TensorStore>,
+        rope_override: RopeScalingOverride,
+    ) -> BonsaiResult<Self> {
         let architecture = metadata.get_string(keys::GENERAL_ARCHITECTURE)?.to_string();
         if !is_supported_architecture(&architecture) {
             return Err(BonsaiError::UnsupportedArchitecture { arch: architecture });
@@ -448,7 +589,10 @@ impl Qwen3Config {
             .map(|v| v as usize)
             .unwrap_or(head_dim);
 
-        let rope_scaling = RopeScaling::from_metadata(metadata, arch)?;
+        // `--rope-scaling` (wave-4b ruling R2): `Auto` returns the declared
+        // value unchanged, so the default path is byte-identical.
+        let rope_scaling =
+            rope_override.apply(RopeScaling::from_metadata(metadata, arch)?, arch)?;
 
         let sliding_window = parse_sliding_window(metadata, arch)?;
 
@@ -1103,6 +1247,135 @@ mod tests {
         assert_eq!(config.head_dim, 40);
         assert_eq!(config.value_length, 64);
         assert_ne!(config.head_dim, config.value_length);
+    }
+
+    // ── RopeScalingOverride (`--rope-scaling`, wave-4b ruling R2) ──────────
+
+    /// `full_qwen3_pairs()` plus the exact YaRN declaration
+    /// `models/Bonsai-8B.gguf` carries.
+    fn yarn_qwen3_pairs() -> Vec<(&'static str, MetadataWriteValue)> {
+        let mut pairs = full_qwen3_pairs();
+        pairs.push((
+            "qwen3.rope.scaling.type",
+            MetadataWriteValue::Str("yarn".to_string()),
+        ));
+        pairs.push(("qwen3.rope.scaling.factor", MetadataWriteValue::F32(4.0)));
+        pairs.push((
+            "qwen3.rope.scaling.original_context_length",
+            MetadataWriteValue::U32(16384),
+        ));
+        pairs
+    }
+
+    fn bonsai_8b_yarn() -> RopeScaling {
+        RopeScaling::Yarn {
+            factor: 4.0,
+            original_context_length: 16384,
+            attn_factor: None,
+            beta_fast: None,
+            beta_slow: None,
+        }
+    }
+
+    #[test]
+    fn rope_override_auto_honours_the_declared_yarn() {
+        let metadata = build_metadata_store(yarn_qwen3_pairs());
+        let config =
+            Qwen3Config::from_metadata_with_rope_override(&metadata, RopeScalingOverride::Auto)
+                .expect("parse");
+        assert_eq!(config.rope_scaling, bonsai_8b_yarn());
+    }
+
+    #[test]
+    fn rope_override_off_forces_plain_rope_on_a_yarn_file() {
+        let metadata = build_metadata_store(yarn_qwen3_pairs());
+        let config =
+            Qwen3Config::from_metadata_with_rope_override(&metadata, RopeScalingOverride::Off)
+                .expect("parse");
+        assert_eq!(config.rope_scaling, RopeScaling::None);
+        // Every other field is exactly what `auto` resolves.
+        let auto = Qwen3Config::from_metadata(&metadata).expect("parse");
+        assert_eq!(
+            Qwen3Config {
+                rope_scaling: RopeScaling::None,
+                ..auto
+            },
+            config
+        );
+    }
+
+    #[test]
+    fn rope_override_on_accepts_a_yarn_file_and_refuses_an_unscaled_one() {
+        let yarn = build_metadata_store(yarn_qwen3_pairs());
+        let config = Qwen3Config::from_metadata_with_rope_override(&yarn, RopeScalingOverride::On)
+            .expect("a declared scaling satisfies `on`");
+        assert_eq!(config.rope_scaling, bonsai_8b_yarn());
+
+        let plain = build_metadata_store(full_qwen3_pairs());
+        let err = Qwen3Config::from_metadata_with_rope_override(&plain, RopeScalingOverride::On)
+            .expect_err("`on` on an unscaled file must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("qwen3.rope.scaling.type"), "{msg}");
+        assert!(msg.contains("--rope-scaling on"), "{msg}");
+        assert!(
+            msg.contains("declares no qwen3.rope.scaling.* metadata"),
+            "the reason names the real architecture, never a placeholder: {msg}"
+        );
+    }
+
+    #[test]
+    fn rope_override_scope_applies_to_plain_from_metadata_and_restores() {
+        let metadata = build_metadata_store(yarn_qwen3_pairs());
+        assert_eq!(
+            RopeScalingOverrideScope::active(),
+            RopeScalingOverride::Auto
+        );
+        {
+            let _off = RopeScalingOverrideScope::enter(RopeScalingOverride::Off);
+            assert_eq!(
+                Qwen3Config::from_metadata(&metadata)
+                    .expect("parse")
+                    .rope_scaling,
+                RopeScaling::None,
+                "the scope must reach callers that only use from_metadata"
+            );
+            {
+                let _auto = RopeScalingOverrideScope::enter(RopeScalingOverride::Auto);
+                assert_eq!(
+                    Qwen3Config::from_metadata(&metadata)
+                        .expect("parse")
+                        .rope_scaling,
+                    bonsai_8b_yarn(),
+                    "an inner scope wins"
+                );
+            }
+            assert_eq!(
+                RopeScalingOverrideScope::active(),
+                RopeScalingOverride::Off,
+                "dropping the inner scope restores the outer one"
+            );
+        }
+        assert_eq!(
+            RopeScalingOverrideScope::active(),
+            RopeScalingOverride::Auto
+        );
+        assert_eq!(
+            Qwen3Config::from_metadata(&metadata)
+                .expect("parse")
+                .rope_scaling,
+            bonsai_8b_yarn(),
+            "no scope = the declaration, unchanged"
+        );
+    }
+
+    #[test]
+    fn rope_override_scope_is_thread_local() {
+        let _off = RopeScalingOverrideScope::enter(RopeScalingOverride::Off);
+        let seen_elsewhere = std::thread::spawn(RopeScalingOverrideScope::active)
+            .join()
+            .expect("join");
+        assert_eq!(seen_elsewhere, RopeScalingOverride::Auto);
+        assert_eq!(RopeScalingOverrideScope::active(), RopeScalingOverride::Off);
     }
 
     // ── RopeScaling (M-08) ──────────────────────────────────────────────────

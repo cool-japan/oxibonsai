@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::{CudaSlice, CudaView};
+use cudarc::driver::{CudaSlice, CudaView, CudaViewMut};
 
 use crate::gpu_backend::cuda_full_layer::{
     acquire_prefill_rope_chunk, encode_attn_phase, CudaAttnModules, CudaFullLayerBuffers,
@@ -155,7 +155,8 @@ pub(super) unsafe fn encode_prefill_layer(
 
     // ════════════════════════════════════════════════════════════════════
     // Attention QKV projection is computed PER TOKEN inside `encode_attn_phase`
-    // (which runs its own RMSNorm + fused-QKV GEMV on `st_bufs.d_hidden`).  A
+    // (which runs its own RMSNorm + fused-QKV GEMV on this token's column of
+    // `pb.d_input`).  A
     // batched attn-RMSNorm + batched-QKV GEMM was previously run here into
     // `pb.d_normed` / `pb.d_qkv`, but their outputs were never consumed by the
     // per-token attention loop below — they were pure wasted device work.  They
@@ -167,33 +168,34 @@ pub(super) unsafe fn encode_prefill_layer(
     // ════════════════════════════════════════════════════════════════════
     // Sequential attention for each token
     //
-    // For each token t at sequence position (pos_start + t), we:
-    //   a) Copy this token's hidden state into st_bufs.d_hidden
-    //   b) Run the standard single-token attention kernels (rmsnorm, qkv gemv,
-    //      qk-norm+rope, kv-store, scores, softmax, weighted sum), pointed at
-    //      this token's slice of the chunk-resident position/RoPE upload
-    //   c) Copy attention output back into the column of pb.d_attn_out
+    // For each token t at sequence position (pos_start + t), we run the
+    // standard single-token attention kernels (rmsnorm, qkv gemv,
+    // qk-norm+rope, kv-store, scores, softmax, weighted sum) with:
+    //   - this token's slice of the chunk-resident position/RoPE upload,
+    //   - step 1 reading this token's column of pb.d_input in place, and
+    //   - step 7 writing this token's column of pb.d_attn_out in place.
     //
     // F9 — copy count. This loop used to issue FIVE sub-kilobyte copies per
-    // token: (a), three host-to-device uploads of `[pos, pos+1]` / cos / sin,
-    // and (c). `encode_prefill_layer` runs once per layer and loops over every
-    // token inside, so those three layer-invariant uploads were also repeated
-    // `n_layers` times over — `5 x n_tokens x n_layers` transfers in total.
+    // token: a device-to-device copy of the hidden column into
+    // st_bufs.d_hidden, three host-to-device uploads of `[pos, pos+1]` / cos
+    // / sin, and a device-to-device copy of st_bufs.d_attn_out back into
+    // pb.d_attn_out. `encode_prefill_layer` runs once per layer and loops over
+    // every token inside, so that was `5 x n_tokens x n_layers` transfers in
+    // total.
     //
-    // The three uploads are now one chunk upload each, hoisted out of the loop
+    // The three uploads are one chunk upload each, hoisted out of the loop
     // (`acquire_prefill_rope_chunk`), and the per-token attention reads device
-    // views into that buffer. The transfer count becomes
-    // `2 x n_tokens x n_layers + 3 x n_layers`.
+    // views into that buffer. The two device-to-device copies are gone too:
+    // `encode_attn_phase`'s `hidden_in` / `attn_out` views point steps 1 and
+    // 7 straight at this token's columns, so st_bufs.d_hidden /
+    // st_bufs.d_attn_out are never touched by batch prefill. What is left is
+    // `3 x n_layers` uploads per chunk, the same shape the ternary twin
+    // (`encode_prefill_layer_ternary`) has.
     //
     // The `[pos, pos+1]` pairs are still strictly per token: they are staged
     // per token in the chunk and selected by view. A stale position here writes
     // every token's K/V at the wrong slot of the SHARED decode KV cache, which
     // is a previously-fixed correctness bug, not a tuning detail.
-    //
-    // (a) and (c) remain: `graph.launch_rmsnorm_pub` takes `&CudaSlice` for its
-    // input and `launch_batched_attn_weighted_sum` writes `bufs.d_attn_out`
-    // whole, so removing them needs signature changes in files outside this
-    // package's grant — recorded as a deviation.
     // ════════════════════════════════════════════════════════════════════
 
     // Zero out d_attn_out before the sequential attention loop.
@@ -217,27 +219,24 @@ pub(super) unsafe fn encode_prefill_layer(
     for t in 0..bs {
         let pos = pos_start + t;
 
-        // Copy token t's hidden state column into st_bufs.d_hidden
-        // Column-major: token t's hidden is at pb.d_input[t * h .. (t+1)*h]
-        {
-            let src_view: CudaView<f32> = pb.d_input.slice(t * h..(t + 1) * h);
-            graph
-                .stream_arc()
-                .memcpy_dtod(&src_view, &mut st_bufs.d_hidden)
-                .map_err(|e| CudaGraphError::DriverError(format!("copy hidden t={t}: {e}")))?;
-        }
-
         // Views into the chunk upload: `[pos, pos+1]` plus this token's RoPE
         // cosines and sines. The KV-store kernel reads the write position from
         // element 0 and the attention span from element 1.
         let token_inputs = chunk.token(t)?;
 
+        // This token's hidden-state column (column-major:
+        // pb.d_input[t * h .. (t+1) * h]) and attention-output column
+        // (pb.d_attn_out[t * nq*hd .. (t+1) * nq*hd]), read and written in
+        // place (F9) — no per-token device-to-device copy either side.
+        let hidden_view: CudaView<f32> = pb.d_input.slice(t * h..(t + 1) * h);
+        let mut attn_out_view: CudaViewMut<f32> =
+            pb.d_attn_out.slice_mut(t * nq * hd..(t + 1) * nq * hd);
+
         // Run the single-token attention pipeline (rmsnorm → QKV GEMV →
         // qk-norm+rope → kv-store → scores → softmax → weighted sum).
-        // encode_attn_phase reads from st_bufs.d_hidden (set above) and computes
-        // its own RMSNorm + fused-QKV GEMV — there is no batched QKV to reuse,
-        // which is why the previously-dead batched attn RMSNorm/QKV GEMM above
-        // was removed.
+        // encode_attn_phase computes its own RMSNorm + fused-QKV GEMV from
+        // `hidden_view` — there is no batched QKV to reuse, which is why the
+        // previously-dead batched attn RMSNorm/QKV GEMM above was removed.
         encode_attn_phase(
             graph,
             attn_mods,
@@ -256,18 +255,9 @@ pub(super) unsafe fn encode_prefill_layer(
             h,
             st_bufs,
             Some(&token_inputs),
+            Some(&hidden_view),
+            Some(&mut attn_out_view),
         )?;
-
-        // Copy attention output for this token from st_bufs.d_attn_out into
-        // the column of pb.d_attn_out [t * nq*hd .. (t+1)*nq*hd]
-        {
-            let src_view: CudaView<f32> = st_bufs.d_attn_out.slice(..nq * hd);
-            let mut dst_view = pb.d_attn_out.slice_mut(t * nq * hd..(t + 1) * nq * hd);
-            graph
-                .stream_arc()
-                .memcpy_dtod(&src_view, &mut dst_view)
-                .map_err(|e| CudaGraphError::DriverError(format!("copy attn_out t={t}: {e}")))?;
-        }
     }
     drop(chunk_guard);
 

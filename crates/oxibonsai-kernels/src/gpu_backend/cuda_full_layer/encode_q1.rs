@@ -128,6 +128,11 @@ pub fn encode_full_layer(
             // Decode: one token in flight, its RoPE/position already uploaded
             // into the single-token scratch slots just above (finding F9).
             None,
+            // Its hidden state is already in `bufs.d_hidden` (uploaded above)
+            // and the O-projection below reads `bufs.d_attn_out`, so neither
+            // F9 view is needed here.
+            None,
+            None,
         )?;
     }
 

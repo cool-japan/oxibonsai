@@ -15,10 +15,18 @@
 //! execute (PQ2_0/PTQ1_0 ahead of B2-09) reports the honest interim
 //! status "parses; not runnable by this build" instead of a blanket `OK`
 //! or `FAILED`.
+//!
+//! REQUIRED #2 (wave-4b): loadability is a function of the constructor that
+//! will actually run. A `qwen35` hybrid is `OK` only when a header-only dry
+//! bind of `HybridModel::from_gguf` — exactly what `run` builds — succeeds
+//! (the report then shows the layer split, ggml ids 142/143, the Hadamard
+//! contract and the per-sequence state bytes); a bind failure is `PARSES
+//! (not runnable by this build: <why>)` and a non-zero exit.
 
 use oxibonsai_core::gguf::reader::GgufFile;
 use oxibonsai_core::gguf::tensor_info::keys;
 
+use super::bonsai2;
 use super::model_desc;
 
 pub(crate) fn run(model: String) -> anyhow::Result<()> {
@@ -105,6 +113,25 @@ pub(crate) fn run(model: String) -> anyhow::Result<()> {
     let type_counts = gguf.tensors.count_by_type();
     let unsupported_types = model_desc::unsupported_tensor_types(&type_counts);
 
+    // REQUIRED #2: a hybrid is judged by the dry bind of the constructor
+    // `run` uses, not by the tensor-type allowlist alone.
+    let hybrid = if known_arch && failures.is_empty() && bonsai2::is_qwen35_hybrid(&arch) {
+        match model_desc::hybrid_report(&gguf) {
+            Ok(report) => Some(report),
+            Err(e) => {
+                failures.push(format!("qwen35 hybrid metadata: {e}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(report) = &hybrid {
+        for line in report.lines(mmap.len() as u64) {
+            println!("  {line}");
+        }
+    }
+
     println!();
     if !failures.is_empty() {
         println!("Validation: FAILED");
@@ -135,6 +162,16 @@ pub(crate) fn run(model: String) -> anyhow::Result<()> {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+    }
+
+    if let Some(report) = &hybrid {
+        if let Err(bind_err) = &report.bind {
+            println!("Validation: PARSES (not runnable by this build: {bind_err})");
+            anyhow::bail!(
+                "GGUF parses and is architecturally sound, but the qwen35 hybrid model cannot be \
+                 bound by this build: {bind_err}"
+            );
+        }
     }
 
     println!("Validation: OK");
@@ -192,3 +229,7 @@ fn report_probe_compat_fallback(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "cmd_validate_tests.rs"]
+mod tests;

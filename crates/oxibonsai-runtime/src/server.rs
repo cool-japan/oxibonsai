@@ -36,7 +36,6 @@ use axum::response::{IntoResponse, Json, Response};
 use axum::Router;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, OnceLock};
-use tokio_stream::StreamExt;
 
 use crate::engine::InferenceEngine;
 use crate::engine_pool::{EngineLease, EnginePool, PoolError};
@@ -52,6 +51,8 @@ pub mod auth;
 pub(crate) mod blocking;
 pub mod budget;
 pub mod lifecycle;
+pub(crate) mod response_pipeline;
+pub(crate) mod sampling_scope;
 pub mod sanitize;
 pub(crate) mod sse;
 
@@ -87,10 +88,8 @@ const MAX_N_CHOICES: usize = 1;
 /// matching `.dec()`).
 ///
 /// One implementation, `pub(crate)` here, used by `server/chat.rs`,
-/// `api_extensions.rs` and `completions.rs` — wave-3.5 gatekeeper triage
-/// item (5): each of those three previously carried a byte-identical,
-/// independently-maintained copy because this type was private to
-/// `server::chat`, the one place `use super::*;` could reach it from.
+/// `api_extensions.rs`, `completions.rs` and `embeddings.rs` rather than an
+/// independently-maintained copy in each.
 pub(crate) struct ActiveRequestGuard(pub(crate) Arc<InferenceMetrics>);
 
 impl Drop for ActiveRequestGuard {
@@ -193,7 +192,7 @@ impl ServedModelInfo {
         }
         match self.engines.acquire().await {
             Ok(lease) => {
-                // ENGINE-SEAM: read through the engine, which answers for a
+                // Read through the engine, which answers for a
                 // dense and a hybrid (`qwen35`) model alike.
                 let descriptor = ModelDescriptor {
                     id: lease.model_name().to_string(),
@@ -267,9 +266,15 @@ pub struct AppState {
     /// [`chat_completions_stream`].
     rate_aggregator: Arc<crate::request_metrics::RequestRateAggregator>,
     /// KV-cache pressure policy surfaced via `/admin/cache-stats` (`SV-19`).
-    /// Observed (never acted on — `RT-14` is out of this package's scope)
+    /// Observed (never acted on: tier decisions are reported, not applied)
     /// once per request from the prompt's context utilization.
     kv_cache_policy: Arc<crate::kv_cache_policy::KvCachePolicy>,
+    /// The single token id a tokenizer-less server feeds as the prompt of a
+    /// text request ([`RouterOptions::with_prompt_start_token`]). `None`
+    /// (the default) makes a tokenizer-less server refuse text prompts with
+    /// `400 tokenizer_required` instead of guessing a vocabulary-specific
+    /// id; ignored whenever a tokenizer is attached.
+    prompt_start_token: Option<u32>,
 }
 
 impl AppState {
@@ -347,6 +352,54 @@ impl AppState {
     pub fn kv_cache_policy(&self) -> &Arc<crate::kv_cache_policy::KvCachePolicy> {
         &self.kv_cache_policy
     }
+
+    /// The prompt token a tokenizer-less server feeds for a text prompt
+    /// ([`RouterOptions::with_prompt_start_token`]), if one was configured.
+    pub fn prompt_start_token(&self) -> Option<u32> {
+        self.prompt_start_token
+    }
+
+    /// The prompt ids for a text prompt on a server with **no** tokenizer:
+    /// the configured [`Self::prompt_start_token`], or the typed refusal a
+    /// tokenizer-less server answers with — `400 invalid_request_error`,
+    /// code `tokenizer_required`, naming `param` (`"messages"` for chat,
+    /// `"prompt"` for completions). A server with a tokenizer never calls
+    /// this: it encodes the text.
+    pub(crate) fn tokenizerless_prompt(&self, param: &str) -> Result<Vec<u32>, ApiError> {
+        match self.prompt_start_token {
+            Some(id) => Ok(vec![id]),
+            None => Err(tokenizer_required_error(param)),
+        }
+    }
+}
+
+/// `400 tokenizer_required`: a text prompt reached a server that has no
+/// tokenizer to encode it with and no configured prompt start token.
+pub(crate) fn tokenizer_required_error(param: &str) -> ApiError {
+    ApiError::bad_request(
+        "this server has no tokenizer attached, so a text prompt cannot be tokenized; start the \
+         server with the model's tokenizer (a GGUF that embeds its vocabulary, or a \
+         tokenizer.json)",
+        param,
+    )
+    .with_code(TOKENIZER_REQUIRED_CODE)
+}
+
+/// The `error.code` of the `400` a tokenizer-less server answers a text
+/// prompt with when no prompt start token is configured
+/// ([`RouterOptions::with_prompt_start_token`]).
+pub const TOKENIZER_REQUIRED_CODE: &str = "tokenizer_required";
+
+/// Log the one warning a request generated without a tokenizer gets: its
+/// tokens cannot be rendered as text, so the response's text is empty —
+/// streamed or not — while `usage` (and `logprobs`, where requested) still
+/// count every token.
+pub(crate) fn warn_generating_without_tokenizer(endpoint: &str) {
+    tracing::warn!(
+        endpoint,
+        "generating without a tokenizer: the generated tokens cannot be rendered as text, so \
+         this response's text is empty (attach the model's tokenizer to see its output)"
+    );
 }
 
 /// Resolve whether chat-prompt sanitization should be enabled.
@@ -376,6 +429,12 @@ pub struct ChatMessage {
     /// Text content of the message.  `null` when the assistant returns tool calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// The model's reasoning (`<think>` span) for an assistant message
+    /// (RT-10): filled on a response when the model reasoned, and
+    /// accepted on a replayed assistant turn of a request (the chat template
+    /// re-renders it). Omitted when absent — never an empty string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     /// Tool calls produced by the model (assistant role only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<crate::api_types::ToolCallResult>>,
@@ -390,6 +449,7 @@ impl ChatMessage {
         Self {
             role: role.into(),
             content: Some(content.into()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
         }
@@ -397,6 +457,14 @@ impl ChatMessage {
 }
 
 /// Chat completion request.
+///
+/// Fields outside this list are accepted and ignored rather than refused:
+/// the endpoint also reads `chat_template_kwargs`, `enable_thinking`,
+/// `reasoning_effort` and the raw `tools` text from the same body
+/// (`ChatRequestExtras`), and OpenAI clients send further optional members
+/// (`parallel_tool_calls`, `metadata`, `store`, …), so this struct's field
+/// list is not the request's whole vocabulary and cannot be declared
+/// exhaustively.
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
     /// Conversation history.
@@ -431,14 +499,12 @@ pub struct ChatCompletionRequest {
     /// used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_k: Option<usize>,
-    /// Optional min-p (probabilistic nucleus) threshold (`RT-23`). Validated
-    /// to `[0.0, 1.0]`. A non-zero value is currently rejected with `400`:
-    /// the sampling engine ([`crate::sampling::Sampler::set_min_p`]) supports
-    /// it, but no `InferenceEngine` call seam threads a per-request min-p
-    /// through yet (see this package's recorded deviations) — honoring the
-    /// field would require an `oxibonsai-runtime::engine` change outside
-    /// this package's owned files, so it is refused rather than silently
-    /// dropped.
+    /// Optional min-p (probabilistic nucleus) threshold (`RT-23`; not a
+    /// standard OpenAI field, but accepted the same way vLLM and llama.cpp
+    /// do). Validated to `[0.0, 1.0]`. Applied for this request only, on
+    /// the leased replica's sampler; omitting it samples with the replica's
+    /// own baseline (the server's configured `min_p`), and `0.0` disables
+    /// min-p for the request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_p: Option<f32>,
     /// Optional repetition penalty (`RT-23`; not a standard OpenAI field, but
@@ -463,27 +529,27 @@ pub struct ChatCompletionRequest {
     /// One or more sequences that stop generation when they appear in the
     /// generated text (`SV-12`/`RT-04`). Applied by truncating the decoded
     /// text at the first match; on the streaming path this also cancels the
-    /// in-flight generation early (see [`chat_completions_stream`]).
+    /// in-flight generation early (see `server::chat::chat_completions_stream`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop: Option<crate::api_types::StopSequences>,
-    /// Deterministic sampling seed (`SV-12`). Rejected with `400` when
-    /// combined with `stream: true` or `logprobs: true` — no
-    /// `InferenceEngine` call seam supports either combination (see this
-    /// package's recorded deviations); honored on the plain non-streaming
-    /// path via [`crate::engine::InferenceEngine::generate_with_seed`].
+    /// Deterministic sampling seed (`SV-12` / `RT-12`): the generation runs
+    /// on a freshly seeded sampler carrying the request's params, penalties
+    /// and effective `min_p`, and the replica's own sampler is restored
+    /// afterwards — streamed or not, `logprobs` included — so two identical
+    /// requests with the same seed produce the same tokens (and the same
+    /// logprobs). Omitting it leaves the replica's ambient PRNG advancing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
     /// The format the model's response must follow (`SV-12`). Only
     /// `{"type": "text"}` (or omitting the field, OpenAI's default) is
-    /// honored; any other `format_type` is rejected with `400` rather than
-    /// silently generating unconstrained text — the constrained-decoding
-    /// machinery this would need lives outside this package's owned files.
+    /// honored on this endpoint; any other `format_type` is rejected with
+    /// `400` rather than silently generating unconstrained text (the
+    /// extended endpoint implements JSON mode).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_format: Option<crate::api_types::ResponseFormat>,
     /// Per-token logit bias map, `{token_id_as_string: bias}` (`SV-12`). A
-    /// non-empty map is rejected with `400`: applying it needs a new
-    /// `InferenceEngine`/`Sampler` seam outside this package's owned files
-    /// (see recorded deviations). An empty map (or the field's absence) is a
+    /// non-empty map is rejected with `400`: the sampling pipeline has no
+    /// per-token bias stage. An empty map (or the field's absence) is a
     /// no-op and is accepted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logit_bias: Option<std::collections::HashMap<String, f32>>,
@@ -491,7 +557,10 @@ pub struct ChatCompletionRequest {
     /// and ignored — it carries no decoding behavior in the OpenAI spec.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
-    /// Tools available to the model.
+    /// Tools available to the model, rendered into the prompt by the chat
+    /// template. The model's `<tool_call>` blocks come back as
+    /// `message.tool_calls` — or, streamed, as one `tool_calls` delta per
+    /// completed call — with `finish_reason: "tool_calls"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<crate::api_types::ToolDefinition>>,
     /// Tool choice: `"auto"`, `"none"`, or a specific function selector.
@@ -609,18 +678,6 @@ fn validate_chat_request(
                 "min_p",
             ));
         }
-        if min_p > 0.0 {
-            // `Sampler::set_min_p` exists (RT-23), but no `InferenceEngine`
-            // call seam threads a per-request min_p through yet — see this
-            // package's recorded deviations. Reject rather than silently
-            // ignore (`SV-12`'s "honour or reject" contract).
-            return Err((
-                "min_p is not yet supported by this server: no per-request sampling seam \
-                 exposes it from the inference engine; omit min_p or set it to 0.0"
-                    .to_string(),
-                "min_p",
-            ));
-        }
     }
     if let Some(rp) = req.repetition_penalty {
         if !rp.is_finite() || rp < 1.0 {
@@ -652,22 +709,6 @@ fn validate_chat_request(
                 "response_format",
             ));
         }
-    }
-    if req.seed.is_some() && req.stream {
-        return Err((
-            "seed is not supported together with stream: true: no streaming generation seam \
-             accepts a per-call seed; omit seed or set stream to false"
-                .to_string(),
-            "seed",
-        ));
-    }
-    if req.seed.is_some() && req.logprobs == Some(true) {
-        return Err((
-            "seed is not supported together with logprobs: true: no logits-capturing \
-             generation seam accepts a per-call seed; omit one of the two"
-                .to_string(),
-            "seed",
-        ));
     }
     if !req.temperature.is_finite() || !(0.0..=2.0).contains(&req.temperature) {
         return Err((
@@ -721,7 +762,7 @@ fn validate_chat_request(
             ));
         }
     }
-    // RT-07 correction (B2-13): an unrecognized `role` used to fall into
+    // RT-07 correction: an unrecognized `role` used to fall into
     // `sanitize::chat_prompt_segments`'s `_` arm and be silently spliced
     // into the prompt as bare, unwrapped text — a protocol-correctness gap
     // (an OpenAI-shaped client sending a typo'd or future role should get a
@@ -754,7 +795,7 @@ pub struct ChatCompletionResponse {
     /// Unix timestamp (seconds) the completion was created (`SV-03`). Both
     /// `created` and `model` are non-optional in the real OpenAI chat
     /// completion object; the streaming chunk shape
-    /// ([`ChatCompletionChunk`]) already carried them.
+    /// (`ChatCompletionChunk`) already carried them.
     pub created: u64,
     /// The model that generated the completion (`SV-03`), resolved from the
     /// same [`ServedModelInfo`] the streaming path and `/v1/models` use —
@@ -815,6 +856,15 @@ struct ChunkDelta {
     role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+    /// A `reasoning_content` delta (the model's `<think>` span); omitted on
+    /// every chunk that carries none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
+    /// A `tool_calls` delta: each call whole, in its own chunk, at its
+    /// 0-based index among the response's calls; omitted on every chunk
+    /// that carries none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<response_pipeline::StreamToolCallDelta>>,
 }
 
 /// Everything the router assembly needs beyond the engine pool.
@@ -847,15 +897,37 @@ pub struct RouterOptions {
     /// server is — it must be opted into explicitly rather than shipped on
     /// by default.
     pub enable_ui: bool,
-    /// The real, model-backed embedder behind `/v1/embeddings` (`RT-08`,
-    /// EMBED-MODEL handoff).
+    /// The real, model-backed embedder behind `/v1/embeddings` (`RT-08`).
     ///
     /// `Some` → the endpoint serves mean-pooled hidden states of the loaded
-    /// model; `None` (the default) → it answers the honest `501` (no
-    /// model-backed embedder was configured). A hybrid (`qwen35`) model has
-    /// no embedder yet (`ModelEmbedder` refuses it with the typed
-    /// `NOT_A_DENSE_MODEL` error), so its servers keep the `501`.
+    /// model; `None` (the default) → it is served by
+    /// [`Self::embeddings_registry`] when one is configured, and otherwise
+    /// answers the honest `501` (no model-backed embedder was configured;
+    /// [`Self::embedder_unavailable`] says why in the body).
     pub embedder: Option<Arc<crate::embed_engine::ModelEmbedder>>,
+    /// A caller-configured [`crate::embeddings::EmbedderRegistry`] serving
+    /// `/v1/embeddings` in place of the default model-only registry (e.g. a
+    /// fitted TF-IDF backend). Precedence: [`Self::embedder`] wins — when
+    /// both are set, the model embedder is installed into this registry
+    /// (keeping its batch and input caps), where a model backend outranks
+    /// TF-IDF and the identity fallback; this registry alone is served
+    /// as-is, including its own `require_model_backend` setting; with
+    /// neither, the router builds a registry that requires a model backend
+    /// and answers `501`.
+    pub embeddings_registry: Option<crate::embeddings::EmbedderRegistry>,
+    /// Why this server has no model-backed embedder, carried into the `501`
+    /// body of `/v1/embeddings` (`error.code` and the message suffix) —
+    /// see [`Self::with_embedder_unavailable`].
+    pub embedder_unavailable: Option<crate::embeddings::EmbedderUnavailable>,
+    /// The engine report `/admin/*` shows for the served model
+    /// ([`crate::admin::AdminState::with_engine_report`]). `None` (the
+    /// default) leaves the admin router's own fallback in place.
+    pub engine_report: Option<crate::admin::EngineReport>,
+    /// The single token id a tokenizer-less server feeds as the prompt of a
+    /// text request — see [`Self::with_prompt_start_token`]. `None` (the
+    /// default) makes a tokenizer-less server answer a text prompt with
+    /// `400 tokenizer_required`.
+    pub prompt_start_token: Option<u32>,
 }
 
 impl Default for RouterOptions {
@@ -871,18 +943,68 @@ impl Default for RouterOptions {
             max_output_tokens_ceiling: MAX_OUTPUT_TOKENS,
             enable_ui: false,
             embedder: None,
+            embeddings_registry: None,
+            embedder_unavailable: None,
+            engine_report: None,
+            prompt_start_token: None,
         }
     }
 }
 
 impl RouterOptions {
     /// Attach the model-backed embedder that serves `/v1/embeddings`
-    /// (`RT-08`). `None` keeps the honest `501`.
+    /// (`RT-08`). `None` keeps whatever [`Self::with_embeddings_registry`]
+    /// configured, or the honest `501`.
     pub fn with_embedder(
         mut self,
         embedder: Option<Arc<crate::embed_engine::ModelEmbedder>>,
     ) -> Self {
         self.embedder = embedder;
+        self
+    }
+
+    /// Serve `/v1/embeddings` from `registry` (e.g. a fitted TF-IDF backend)
+    /// instead of the default model-only registry. [`Self::with_embedder`]
+    /// still wins when both are set — see [`Self::embeddings_registry`] for
+    /// the full precedence.
+    pub fn with_embeddings_registry(
+        mut self,
+        registry: crate::embeddings::EmbedderRegistry,
+    ) -> Self {
+        self.embeddings_registry = Some(registry);
+        self
+    }
+
+    /// Record why this server has no model-backed embedder, so the
+    /// `/v1/embeddings` `501` body names it: `error.message` becomes
+    /// `"<the standard text>: <message>"` and `error.code` becomes `code`
+    /// (e.g. an engine refusal's `"NOT_A_DENSE_MODEL"`), or
+    /// `"embeddings_unavailable"` when `code` is `None`.
+    pub fn with_embedder_unavailable(
+        mut self,
+        code: Option<&'static str>,
+        message: impl Into<String>,
+    ) -> Self {
+        self.embedder_unavailable =
+            Some(crate::embeddings::EmbedderUnavailable::new(code, message));
+        self
+    }
+
+    /// Attach the served engine's [`crate::admin::EngineReport`] to the
+    /// `/admin/*` router ([`crate::admin::AdminState::with_engine_report`]).
+    pub fn with_engine_report(mut self, report: crate::admin::EngineReport) -> Self {
+        self.engine_report = Some(report);
+        self
+    }
+
+    /// Let a tokenizer-less server answer text prompts by feeding the single
+    /// token `id` as the prompt (library and test use; a server with a
+    /// tokenizer ignores it). Without it a tokenizer-less server refuses a
+    /// text prompt with `400 tokenizer_required`: there is no vocabulary to
+    /// derive a correct start token from, and a hardcoded one is wrong for
+    /// every model outside the family it was copied from.
+    pub fn with_prompt_start_token(mut self, id: u32) -> Self {
+        self.prompt_start_token = Some(id);
         self
     }
 
@@ -1051,6 +1173,10 @@ pub fn create_router_full(
         max_output_tokens_ceiling,
         enable_ui,
         embedder,
+        embeddings_registry,
+        embedder_unavailable,
+        engine_report,
+        prompt_start_token,
     } = options;
 
     let model_info = Arc::new(ServedModelInfo::new(Arc::clone(&engines)));
@@ -1085,24 +1211,21 @@ pub fn create_router_full(
         max_output_tokens_ceiling: max_output_tokens_ceiling.max(1),
         rate_aggregator: Arc::clone(&rate_aggregator),
         kv_cache_policy: Arc::clone(&kv_cache_policy),
+        prompt_start_token,
     });
 
     // The embeddings router carries its own Arc<EmbeddingAppState>; merge it
     // before attaching the main AppState so the states don't conflict.
     //
-    // EMBED-MODEL / D-1 (`RT-08`): serve REAL model-backed embeddings when
-    // this server was given an embedder; keep the honest `501` only when it
-    // was not (a model-less router, or a hybrid model, which has no
-    // `forward_hidden` yet). Either branch records onto the SAME
-    // `InferenceMetrics` every other route uses (`SV-25`), so the endpoint is
-    // no longer invisible to `/metrics`. The destructured `embedder` binding
-    // is used here -- `options` itself was moved by the destructure above.
+    // `RT-08`: serve REAL model-backed embeddings when this server was given
+    // an embedder; otherwise serve the caller's configured registry (e.g. a
+    // fitted TF-IDF backend) as-is; with neither, a registry that requires a
+    // model backend answers the honest `501`, whose body carries the
+    // recorded `embedder_unavailable` reason. Every branch records onto the
+    // SAME `InferenceMetrics` every other route uses (`SV-25`).
     let embeddings_router = {
-        let mut registry =
-            crate::embeddings::EmbedderRegistry::new(512).with_require_model_backend(true);
-        if let Some(embedder) = embedder.as_ref() {
-            registry = registry.with_model(Arc::clone(embedder));
-        }
+        let registry =
+            build_embeddings_registry(embedder, embeddings_registry, embedder_unavailable);
         crate::embeddings::create_embeddings_router_from_state(
             crate::embeddings::EmbeddingAppState::from_registry(registry)
                 .with_metrics(Arc::clone(&metrics)),
@@ -1112,15 +1235,17 @@ pub fn create_router_full(
     // Admin API, wired to the real metrics + model descriptor so `/admin/config`
     // reports the running configuration instead of hard-coded defaults.
     // SV-19: `with_rate_aggregator`/`with_kv_cache_policy` attach the same
-    // instances `chat_completions_inner`/`chat_completions_stream` feed, so
-    // `/admin/workload-stats` and `/admin/cache-stats` stop being
-    // permanently null.
-    let admin_state = Arc::new(
-        crate::admin::AdminState::new(Arc::clone(&metrics))
-            .with_model_info(Arc::clone(&model_info))
-            .with_rate_aggregator(rate_aggregator)
-            .with_kv_cache_policy(kv_cache_policy),
-    );
+    // instances the chat handlers feed, so `/admin/workload-stats` and
+    // `/admin/cache-stats` stop being permanently null. The served engine's
+    // report, when the caller has one, is attached to the same state.
+    let mut admin_state = crate::admin::AdminState::new(Arc::clone(&metrics))
+        .with_model_info(Arc::clone(&model_info))
+        .with_rate_aggregator(rate_aggregator)
+        .with_kv_cache_policy(kv_cache_policy);
+    if let Some(report) = engine_report {
+        admin_state = admin_state.with_engine_report(report);
+    }
+    let admin_state = Arc::new(admin_state);
     // sec-15: the admin surface is authenticated unconditionally. The layer is
     // attached to the admin sub-router only, so the inference routes are
     // unaffected and a serve binary can still put its own bearer auth in front
@@ -1175,6 +1300,40 @@ pub fn create_router_full(
     let app = app.merge(admin_router);
 
     crate::middleware::apply_middleware(app, middleware_config)
+}
+
+/// Default embedding width of the registry a router builds for itself (the
+/// `IdentityEmbedder` dimension; never served, since that registry requires
+/// a model backend).
+const DEFAULT_ROUTER_EMBEDDING_DIM: usize = 512;
+
+/// The registry `/v1/embeddings` serves, by [`RouterOptions::embeddings_registry`]'s
+/// precedence: a model `embedder` always wins (installed into the caller's
+/// registry when there is one, else into a registry that requires a model
+/// backend); a caller's registry alone is served as configured; with
+/// neither, a model-only registry answers `501`. The `unavailable` reason
+/// is attached to whichever registry is served, so a `501` from any of them
+/// names it.
+fn build_embeddings_registry(
+    embedder: Option<Arc<crate::embed_engine::ModelEmbedder>>,
+    configured: Option<crate::embeddings::EmbedderRegistry>,
+    unavailable: Option<crate::embeddings::EmbedderUnavailable>,
+) -> crate::embeddings::EmbedderRegistry {
+    let registry = match (embedder, configured) {
+        (Some(embedder), Some(configured)) => configured.with_model(embedder),
+        (Some(embedder), None) => {
+            crate::embeddings::EmbedderRegistry::new(DEFAULT_ROUTER_EMBEDDING_DIM)
+                .with_require_model_backend(true)
+                .with_model(embedder)
+        }
+        (None, Some(configured)) => configured,
+        (None, None) => crate::embeddings::EmbedderRegistry::new(DEFAULT_ROUTER_EMBEDDING_DIM)
+            .with_require_model_backend(true),
+    };
+    match unavailable {
+        Some(reason) => registry.with_unavailable_reason(reason),
+        None => registry,
+    }
 }
 
 async fn health() -> &'static str {
@@ -1306,676 +1465,10 @@ async fn readyz(State(state): State<Arc<AppState>>) -> Response {
 mod chat;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod tests;
 
-    // NOTE: the prompt-assembly and marker-neutralization tests moved with
-    // their code into `server::sanitize`; the shutdown / queue-tracker tests
-    // moved into `server::lifecycle`; the tool-call-parsing, streaming
-    // terminal-event and usage-chunk tests moved into `server::chat` (the
-    // 2000-line-file split that also moved `chat_completions` itself).
+#[cfg(test)]
+mod sampling_tests;
 
-    #[test]
-    fn resolve_prompt_sanitization_default_on() {
-        // The env var is process-global; only assert the unset-default here to
-        // avoid racing other tests. When unset, sanitization is on.
-        if std::env::var("OXI_DISABLE_PROMPT_SANITIZATION").is_err() {
-            assert!(resolve_prompt_sanitization());
-        }
-    }
-
-    // ── SV-03: ChatCompletionResponse matches the OpenAI response shape ──
-
-    /// Schema test against the real OpenAI `chat.completion` object
-    /// (`SV-03`): `created`/`model` were found silently missing from the
-    /// canonical response (see [`ChatCompletionResponse`]'s field docs for
-    /// why both are non-optional now) and no test asserted the full member
-    /// set. Serializes a response and checks every documented member is
-    /// present with the right shape, rather than re-checking `created`/
-    /// `model` in isolation.
-    #[test]
-    fn chat_completion_response_matches_openai_schema() {
-        let response = ChatCompletionResponse {
-            id: "chatcmpl-test123".to_string(),
-            object: "chat.completion".to_string(),
-            created: 1_700_000_000,
-            model: "Bonsai-Tiny-Test".to_string(),
-            choices: vec![ChatChoice {
-                index: 0,
-                message: ChatMessage::text("assistant", "hello"),
-                finish_reason: "stop".to_string(),
-                logprobs: None,
-            }],
-            usage: Usage {
-                prompt_tokens: 3,
-                completion_tokens: 1,
-                total_tokens: 4,
-            },
-        };
-
-        let json = serde_json::to_value(&response).expect("response must serialize");
-
-        // Top-level `chat.completion` object members.
-        assert_eq!(json["object"], "chat.completion");
-        assert!(json["id"].is_string(), "id must be a string; got {json}");
-        assert!(
-            json["created"].is_u64(),
-            "created must be a Unix timestamp; got {json}"
-        );
-        assert!(
-            json["model"].is_string(),
-            "model must be a string; got {json}"
-        );
-        assert!(
-            json["choices"].is_array(),
-            "choices must be an array; got {json}"
-        );
-        assert!(
-            json["usage"].is_object(),
-            "usage must be an object; got {json}"
-        );
-
-        // Per-choice members.
-        let choice = &json["choices"][0];
-        assert!(choice["index"].is_u64());
-        assert!(choice["message"].is_object());
-        assert_eq!(choice["message"]["role"], "assistant");
-        assert!(choice["finish_reason"].is_string());
-        // `logprobs: None` must be omitted entirely (OpenAI only includes it
-        // when requested), never serialized as an explicit null member.
-        assert!(
-            choice.get("logprobs").is_none(),
-            "logprobs must be omitted, not null, when not requested; got {json}"
-        );
-
-        // Usage members.
-        let usage = &json["usage"];
-        assert!(usage["prompt_tokens"].is_u64());
-        assert!(usage["completion_tokens"].is_u64());
-        assert!(usage["total_tokens"].is_u64());
-    }
-
-    // ── SV-12: validate_chat_request's honour-or-reject paths ────────────
-
-    /// A `ChatCompletionRequest` with only the required field set and every
-    /// optional field at its post-deserialization default.
-    fn minimal_request() -> ChatCompletionRequest {
-        serde_json::from_value(serde_json::json!({
-            "messages": [{"role": "user", "content": "hi"}]
-        }))
-        .expect("minimal request must deserialize")
-    }
-
-    #[test]
-    fn minimal_request_passes_validation() {
-        let req = minimal_request();
-        validate_chat_request(&req, 256, MAX_OUTPUT_TOKENS).expect("a bare request must be valid");
-    }
-
-    /// Table-driven coverage of SV-12's seven new "honour or reject, naming
-    /// the field" 400 paths added to `validate_chat_request` in this
-    /// package. Each case starts from [`minimal_request`] (already known
-    /// valid), applies one mutation that must fail validation, and checks
-    /// the rejection names the right field.
-    #[test]
-    fn validate_chat_request_rejects_every_unsupported_or_out_of_range_field() {
-        /// One table-driven case: a label, the request mutation to apply, and
-        /// the field name `validate_chat_request` must name in its
-        /// rejection. A named type alias instead of the bare tuple type
-        /// (clippy `type_complexity`, wave-3 verifier review).
-        type ValidationCase = (&'static str, fn(&mut ChatCompletionRequest), &'static str);
-
-        let cases: &[ValidationCase] = &[
-            (
-                "min_p > 0 is not yet supported",
-                |r| r.min_p = Some(0.1),
-                "min_p",
-            ),
-            ("min_p out of [0,1] range", |r| r.min_p = Some(1.5), "min_p"),
-            (
-                "non-empty logit_bias is not yet supported",
-                |r| {
-                    r.logit_bias = Some(std::collections::HashMap::from([("123".to_string(), 1.0)]))
-                },
-                "logit_bias",
-            ),
-            (
-                "response_format other than text is not yet supported",
-                |r| {
-                    r.response_format = Some(crate::api_types::ResponseFormat {
-                        format_type: "json_object".to_string(),
-                        json_schema: None,
-                    })
-                },
-                "response_format",
-            ),
-            (
-                "seed + stream is unsupported",
-                |r| {
-                    r.seed = Some(42);
-                    r.stream = true;
-                },
-                "seed",
-            ),
-            (
-                "seed + logprobs is unsupported",
-                |r| {
-                    r.seed = Some(42);
-                    r.logprobs = Some(true);
-                },
-                "seed",
-            ),
-            (
-                "repetition_penalty below 1.0 is invalid",
-                |r| r.repetition_penalty = Some(0.5),
-                "repetition_penalty",
-            ),
-            (
-                "top_k above the sanity ceiling is invalid",
-                |r| r.top_k = Some(2_000_000),
-                "top_k",
-            ),
-        ];
-
-        for (label, mutate, expected_param) in cases {
-            let mut req = minimal_request();
-            mutate(&mut req);
-            let err = validate_chat_request(&req, 256, MAX_OUTPUT_TOKENS)
-                .expect_err(&format!("case {label:?} must be rejected"));
-            assert_eq!(
-                err.1, *expected_param,
-                "case {label:?} must name the field {expected_param:?}, got {:?}",
-                err.1
-            );
-        }
-    }
-
-    #[test]
-    fn validate_chat_request_accepts_zero_min_p_and_a_supported_response_format() {
-        // `min_p: 0.0` is the documented "disabled" sentinel, and
-        // `{"type": "text"}` is OpenAI's own default -- neither must be
-        // treated as the unsupported cases above.
-        let mut req = minimal_request();
-        req.min_p = Some(0.0);
-        req.response_format = Some(crate::api_types::ResponseFormat {
-            format_type: "text".to_string(),
-            json_schema: None,
-        });
-        req.repetition_penalty = Some(1.0);
-        req.top_k = Some(40);
-        validate_chat_request(&req, 256, MAX_OUTPUT_TOKENS)
-            .expect("explicit-but-benign values must not be rejected");
-    }
-
-    // ── RT-07 correction: unrecognized roles must be a 400, not a silent
-    //    splice into the prompt ────────────────────────────────────────────
-
-    #[test]
-    fn validate_chat_request_accepts_every_known_role() {
-        for role in ["system", "user", "assistant", "tool"] {
-            let mut req = minimal_request();
-            req.messages[0].role = role.to_string();
-            validate_chat_request(&req, 256, MAX_OUTPUT_TOKENS)
-                .unwrap_or_else(|_| panic!("role {role:?} must be accepted"));
-        }
-    }
-
-    #[test]
-    fn validate_chat_request_rejects_an_unrecognized_role() {
-        let mut req = minimal_request();
-        req.messages[0].role = "developer".to_string();
-        let err = validate_chat_request(&req, 256, MAX_OUTPUT_TOKENS)
-            .expect_err("an unrecognized role must be rejected");
-        assert_eq!(err.1, "messages");
-        assert!(
-            err.0.contains("developer"),
-            "the rejection must name the offending role, got: {}",
-            err.0
-        );
-    }
-
-    #[test]
-    fn validate_chat_request_rejects_an_unrecognized_role_on_a_later_message() {
-        let mut req = minimal_request();
-        req.messages.push(crate::server::ChatMessage {
-            role: "narrator".to_string(),
-            content: Some("once upon a time".to_string()),
-            tool_calls: None,
-            tool_call_id: None,
-        });
-        let err = validate_chat_request(&req, 256, MAX_OUTPUT_TOKENS)
-            .expect_err("a bad role anywhere in the list must be rejected");
-        assert_eq!(err.1, "messages");
-        assert!(err.0.contains("messages[1]"), "got: {}", err.0);
-    }
-
-    #[test]
-    fn validate_chat_request_enforces_the_configurable_ceiling_not_just_the_hardcoded_one() {
-        // SV-28: the ceiling passed in, not `MAX_OUTPUT_TOKENS`, is what
-        // must be enforced -- this is what makes it *configurable*.
-        let req = minimal_request();
-        assert!(validate_chat_request(&req, 100, 100).is_ok());
-        let err = validate_chat_request(&req, 101, 100).expect_err("must reject above the ceiling");
-        assert_eq!(err.1, "max_tokens");
-    }
-
-    // ── SV-15(c) / SV-12 (max_completion_tokens): resolve_effective_max_tokens
-
-    #[test]
-    fn resolve_effective_max_tokens_precedence() {
-        let mut req = minimal_request();
-        // Neither set: falls back to the server-configured default.
-        assert_eq!(resolve_effective_max_tokens(&req, 256), 256);
-
-        // Only the deprecated field set: it wins over the server default.
-        req.max_tokens = Some(64);
-        assert_eq!(resolve_effective_max_tokens(&req, 256), 64);
-
-        // Both set: max_completion_tokens (the modern field) wins.
-        req.max_completion_tokens = Some(128);
-        assert_eq!(resolve_effective_max_tokens(&req, 256), 128);
-
-        // Only the modern field set.
-        req.max_tokens = None;
-        assert_eq!(resolve_effective_max_tokens(&req, 256), 128);
-    }
-
-    #[test]
-    fn default_max_tokens_value() {
-        assert_eq!(default_max_tokens(), 256);
-    }
-
-    #[test]
-    fn default_temperature_value() {
-        assert!((default_temperature() - 0.7).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn create_router_builds_without_tokenizer() {
-        // HOTFIX-TESTMEM: this test only needs *a* config to build a router
-        // with, not a production-sized one. `Qwen3Config::bonsai_8b()` made
-        // `InferenceEngine::new` -> `BonsaiModel::new` allocate ~5 GB of
-        // token_embd + output_weight tables (plus a ~1.2 GB KV cache) just to
-        // construct a router in this unit test, ballooning this single test
-        // to > 4 GB RSS. `tiny_test()` exercises the identical construction
-        // path with negligible memory.
-        let config = oxibonsai_core::config::Qwen3Config::tiny_test();
-        let params = crate::sampling::SamplingParams::default();
-        let engine = InferenceEngine::new(config, params, 42);
-        let _router = create_router(engine, None);
-    }
-
-    #[test]
-    fn create_router_with_shared_metrics() {
-        // HOTFIX-TESTMEM: see `create_router_builds_without_tokenizer` above.
-        let config = oxibonsai_core::config::Qwen3Config::tiny_test();
-        let params = crate::sampling::SamplingParams::default();
-        let engine = InferenceEngine::new(config, params, 42);
-        let metrics = Arc::new(InferenceMetrics::new());
-        let _router = create_router_with_metrics(engine, None, Arc::clone(&metrics));
-        // Metrics should be accessible from outside
-        assert_eq!(metrics.requests_total.get(), 0);
-    }
-
-    // ── SV-14 / SV-21: /readyz and /v1/models/{model} actually exist ─────
-
-    mod endpoint_existence {
-        use super::*;
-        use axum::body::Body;
-        use tower::ServiceExt;
-
-        fn tiny_router() -> Router {
-            let config = oxibonsai_core::config::Qwen3Config::tiny_test();
-            let engine = InferenceEngine::new(config, SamplingParams::default(), 42);
-            create_router(engine, None)
-        }
-
-        async fn get_json(app: Router, path: &str) -> (StatusCode, serde_json::Value) {
-            let req = axum::http::Request::get(path)
-                .body(Body::empty())
-                .expect("build request");
-            let resp = app.oneshot(req).await.expect("response");
-            let status = resp.status();
-            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-                .await
-                .expect("body bytes");
-            let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-            (status, json)
-        }
-
-        #[tokio::test]
-        async fn readyz_reports_ready_when_a_model_is_loaded_and_a_slot_is_free() {
-            // README.md previously advertised readiness checks that did not
-            // exist at all (SV-14): a bare `#[test]` that `create_router`
-            // compiles proves nothing about this. This drives a real
-            // request through the real route.
-            let (status, json) = get_json(tiny_router(), "/readyz").await;
-            assert_eq!(status, StatusCode::OK);
-            assert_eq!(json["status"], "ready");
-            assert_eq!(json["model_loaded"], true);
-            assert_eq!(json["engine_slot_available"], true);
-        }
-
-        #[tokio::test]
-        async fn get_model_by_id_returns_the_real_loaded_model() {
-            let app = tiny_router();
-            let descriptor_id = {
-                // Resolve the same id the route itself will report, without
-                // hardcoding `tiny_test()`'s literal model name here.
-                let config = oxibonsai_core::config::Qwen3Config::tiny_test();
-                config.model_name.clone()
-            };
-            let (status, json) = get_json(app, &format!("/v1/models/{descriptor_id}")).await;
-            assert_eq!(status, StatusCode::OK);
-            assert_eq!(json["id"], descriptor_id);
-            assert_eq!(json["object"], "model");
-        }
-
-        #[tokio::test]
-        async fn get_model_by_unknown_id_is_a_real_404_not_axums_bare_default() {
-            let (status, json) = get_json(tiny_router(), "/v1/models/no-such-model").await;
-            assert_eq!(status, StatusCode::NOT_FOUND);
-            assert_eq!(
-                json["error"]["code"], "model_not_found",
-                "must be the canonical OpenAI error envelope, not an empty body: {json}"
-            );
-        }
-    }
-
-    // ── ENGINE-SEAM item 7 / SV-25 / RT-08: the full router's embedder ───
-
-    mod embedder_wiring {
-        use super::*;
-        use axum::body::Body;
-        use tower::ServiceExt;
-
-        /// `create_router_full` over a one-replica pool, exactly as a server
-        /// binary builds it.
-        fn full_router(options: RouterOptions, metrics: &Arc<InferenceMetrics>) -> Router {
-            let engine = InferenceEngine::new(
-                oxibonsai_core::config::Qwen3Config::tiny_test(),
-                SamplingParams::default(),
-                42,
-            );
-            create_router_full(
-                EnginePool::new(vec![engine]),
-                None,
-                Arc::clone(metrics),
-                options,
-            )
-        }
-
-        /// A dedicated, weighted dense embedding engine (real Transformer
-        /// blocks) behind a char-level tokenizer whose ids fit its vocabulary.
-        fn dense_embedder() -> Arc<crate::embed_engine::ModelEmbedder> {
-            let config = oxibonsai_core::config::Qwen3Config {
-                hidden_size: 128,
-                intermediate_size: 256,
-                num_layers: 2,
-                num_attention_heads: 4,
-                num_kv_heads: 2,
-                head_dim: 32,
-                vocab_size: 64,
-                max_context_length: 64,
-                ..oxibonsai_core::config::Qwen3Config::tiny_test()
-            };
-            let engine = InferenceEngine::from_model_with_tier(
-                oxibonsai_model::model::BonsaiModel::new_for_testing_with_blocks(config),
-                oxibonsai_kernels::KernelTier::Reference,
-                SamplingParams::default(),
-                42,
-            );
-            let tokenizer = Arc::new(TokenizerBridge::from_native_tokenizer(
-                oxibonsai_tokenizer::OxiTokenizer::char_level_stub(64),
-            ));
-            crate::embed_engine::ModelEmbedder::from_engine(engine, tokenizer)
-                .expect("a dense engine embeds")
-        }
-
-        async fn post_embeddings(
-            app: Router,
-            body: serde_json::Value,
-        ) -> (StatusCode, serde_json::Value) {
-            let req = axum::http::Request::post("/v1/embeddings")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&body).expect("body serialisation"),
-                ))
-                .expect("build request");
-            let resp = app.oneshot(req).await.expect("response");
-            let status = resp.status();
-            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-                .await
-                .expect("body bytes");
-            let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-            (status, json)
-        }
-
-        /// No embedder configured: the honest `501`, still counted on the
-        /// router's shared metrics (`SV-25`).
-        #[tokio::test]
-        async fn without_an_embedder_the_full_router_refuses_and_counts_it() {
-            let metrics = Arc::new(InferenceMetrics::new());
-            let app = full_router(RouterOptions::default(), &metrics);
-            let (status, json) = post_embeddings(app, serde_json::json!({ "input": "hi" })).await;
-            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{json}");
-            assert_eq!(metrics.requests_total.get(), 1);
-            assert_eq!(metrics.errors_total.get(), 1);
-        }
-
-        /// `RouterOptions::with_embedder` reaches the route through the
-        /// destructured `embedder` binding: real vectors of the model's
-        /// hidden width, recorded on the same metrics every route uses.
-        #[tokio::test]
-        async fn a_configured_embedder_serves_real_vectors_on_the_shared_metrics() {
-            let metrics = Arc::new(InferenceMetrics::new());
-            let app = full_router(
-                RouterOptions::default().with_embedder(Some(dense_embedder())),
-                &metrics,
-            );
-            let (status, json) =
-                post_embeddings(app, serde_json::json!({ "input": "hello" })).await;
-            assert_eq!(status, StatusCode::OK, "{json}");
-            let vector = json["data"][0]["embedding"]
-                .as_array()
-                .unwrap_or_else(|| panic!("an embedding vector: {json}"));
-            assert_eq!(vector.len(), 128, "the model's hidden width");
-            assert!(
-                vector
-                    .iter()
-                    .all(|v| v.as_f64().is_some_and(f64::is_finite)),
-                "{json}"
-            );
-            assert_eq!(metrics.requests_total.get(), 1);
-            assert_eq!(metrics.errors_total.get(), 0);
-            assert!(metrics.prompt_tokens_total.get() > 0);
-        }
-    }
-
-    // ── ADDENDUM FROM GATEKEEPER REQUIRED#1(c): hidden repetition_penalty /
-    //    GPU argmax routing, exercised through the real fused HTTP route ──
-    //
-    // Reproduces the gatekeeper's own cross-check end to end: `POST
-    // /v1/completions` with `temperature: 0` on the real
-    // `models/Ternary-Bonsai-1.7B.gguf` must now (a) apply NO repetition
-    // penalty and (b) take the fused Metal GPU-argmax path
-    // (`InferenceEngine::greedy_gpu_eligible`), matching the corrected
-    // golden text captured via `oxibonsai run` after the fix
-    // (`gatekeeper/greedy_w2/Ternary-Bonsai-1.7B.metal.prompt3.txt` in the
-    // session scratchpad) rather than the OLD CPU-penalised text a hidden
-    // `repetition_penalty: 1.1` used to produce
-    // (`gatekeeper/reppen.p3.txt`): "...her love for the sea, which she
-    // would often explore with her father, who" (penalised) vs "...her love
-    // for the sea. One day, she discovered a mysterious shell that gl"
-    // (correct greedy). The two texts are byte-identical up through "her
-    // love for the sea" and diverge only from there, which is exactly what
-    // makes this pair a real discriminator rather than a coincidence.
-    //
-    // Needs the real (multi-hundred-MB) GGUF this worktree does not ship —
-    // `#[ignore]`d by default, following the same real-model convention as
-    // `cuda_ternary_forward_parity.rs`. Run explicitly with:
-    //   OXI_MODEL=/path/Ternary-Bonsai-1.7B.gguf \
-    //   OXI_TOKENIZER=/path/tokenizer.json \
-    //     cargo test -p oxibonsai-runtime --features metal \
-    //     --lib server::tests::temperature_zero_completion_takes_the_metal_greedy_gpu_path \
-    //     -- --ignored --nocapture
-    //
-    // Gated on `metal` + macOS exactly like the dispatch it exercises
-    // (`InferenceEngine`'s internal `greedy_gpu_eligible` check is itself
-    // `#[cfg(all(feature = "metal", target_os = "macos"))]`) — on any other
-    // build there is no separate GPU-argmax path for this test to
-    // discriminate against, and the CPU tier's own golden text differs from
-    // both of the above (see `golden_legacy/Ternary-Bonsai-1.7B.cpu.prompt3.txt`).
-    #[cfg(all(feature = "metal", target_os = "macos"))]
-    mod gpu_argmax_routing {
-        use super::*;
-        use axum::body::Body;
-        use tower::ServiceExt;
-
-        const P3_PROMPT: &str = "Once upon a time, in a small village by the sea,";
-        /// Corrected (no hidden penalty, fused GPU-argmax) greedy
-        /// continuation for [`P3_PROMPT`] at `max_tokens: 32` on
-        /// `Ternary-Bonsai-1.7B.gguf` — captured post-fix via `oxibonsai
-        /// run --temperature 0` (log line `greedy GPU generation complete`).
-        const P3_METAL_GREEDY_GOLDEN: &str = " there lived a young girl named Lila. She was known for her kindness and her love for the sea. One day, she discovered a mysterious shell that gl";
-        /// The OLD, buggy continuation a hidden `repetition_penalty: 1.1`
-        /// used to produce for the same prompt/settings — asserted absent,
-        /// not just "golden present", so a partial regression (e.g. some
-        /// other penalty creeping back in) still fails loudly even if a
-        /// future model/tokenizer change also moves the golden text.
-        const P3_OLD_PENALISED_TEXT: &str = " there lived a young girl named Lila. She was known for her kindness and her love for the sea, which she would often explore with her father, who";
-
-        fn read_env_or(var: &str, default: &str) -> String {
-            std::env::var(var).unwrap_or_else(|_| default.to_string())
-        }
-
-        #[tokio::test]
-        #[ignore = "requires the real Ternary-Bonsai-1.7B.gguf + tokenizer.json + Metal GPU; run with --ignored"]
-        async fn temperature_zero_completion_takes_the_metal_greedy_gpu_path() {
-            let model_path = read_env_or("OXI_MODEL", "models/Ternary-Bonsai-1.7B.gguf");
-            if !std::path::Path::new(&model_path).exists() {
-                eprintln!("skip: real model not found at {model_path} (set OXI_MODEL)");
-                return;
-            }
-            let tokenizer_path = read_env_or("OXI_TOKENIZER", "models/tokenizer.json");
-            let Ok(tokenizer) = TokenizerBridge::from_file(&tokenizer_path) else {
-                eprintln!("skip: could not load tokenizer at {tokenizer_path} (set OXI_TOKENIZER)");
-                return;
-            };
-
-            // Startup `SamplingParams::default()` — gatekeeper REQUIRED#1(a):
-            // this must carry `repetition_penalty: 1.0`, which is exactly
-            // what makes `chat_completions`'s (and `/v1/completions`'s)
-            // request -> `SamplingParams` mapping produce a genuinely
-            // unpenalised greedy request below, with no per-request
-            // override needed to prove it.
-            let params = crate::sampling::SamplingParams::default();
-            assert!(
-                (params.repetition_penalty - 1.0).abs() < f32::EPSILON,
-                "SamplingParams::default() must be repetition_penalty 1.0 for this test to be a \
-                 meaningful discriminator at all"
-            );
-
-            let engine = InferenceEngine::from_gguf_path(&model_path, params, 42, 4096)
-                .expect("load the real GGUF");
-            assert!(
-                engine.uses_fused_gpu_decode(),
-                "this model/build must decode through the fused Metal graph for \
-                 greedy_gpu_eligible to ever be reachable — if this fails, the environment \
-                 (not the fix) is the problem"
-            );
-
-            let app = create_router(engine, Some(tokenizer));
-
-            let body = serde_json::json!({
-                "prompt": P3_PROMPT,
-                "max_tokens": 32,
-                "temperature": 0.0
-            });
-            let req = axum::http::Request::post("/v1/completions")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&body).expect("serialize request"),
-                ))
-                .expect("build request");
-            let resp = app.oneshot(req).await.expect("response");
-            assert_eq!(resp.status(), StatusCode::OK, "request must succeed");
-            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-                .await
-                .expect("response body");
-            let json: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
-            let text = json["choices"][0]["text"]
-                .as_str()
-                .expect("choices[0].text is a string");
-
-            assert_ne!(
-                text, P3_OLD_PENALISED_TEXT,
-                "temperature:0 through the fused HTTP route reproduced the OLD \
-                 repetition-penalised golden text — a hidden repetition_penalty is back, or \
-                 the request -> SamplingParams mapping stopped seeding from a 1.0 default"
-            );
-            assert_eq!(
-                text, P3_METAL_GREEDY_GOLDEN,
-                "temperature:0 through /v1/completions must match the corrected, unpenalised \
-                 Metal greedy-GPU-argmax golden text for the p3 legacy prompt"
-            );
-        }
-    }
-
-    // ── RT-26 restore invariant ────────────────────────────────────────
-
-    /// Companion to `server::chat::tests`'s
-    /// `logprobs_with_mismatched_temperature_...` tests: those prove a
-    /// per-request `logprobs: true` temperature/top_p override is
-    /// *applied*; this proves it is *restored* afterward. This is
-    /// verify2's drop-safety constraint on the `RT-26` fix
-    /// (`server/chat.rs`'s `lease.sampler.set_params`/restore dance around
-    /// `generate_with_logprobs`) — a request's override must never leak
-    /// onto the next request served by the same pool replica.
-    #[tokio::test]
-    async fn logprobs_temperature_override_does_not_leak_onto_the_next_request() {
-        let ambient = SamplingParams {
-            temperature: 0.9,
-            ..SamplingParams::default()
-        };
-        let config = oxibonsai_core::config::Qwen3Config::tiny_test();
-        let engine = InferenceEngine::new(config, ambient, 42);
-        let pool = EnginePool::new(vec![engine]);
-        let app =
-            create_router_with_pool(Arc::clone(&pool), None, Arc::new(InferenceMetrics::new()));
-
-        let body = serde_json::json!({
-            "messages": [{"role": "user", "content": "hi"}],
-            "max_tokens": 4,
-            "logprobs": true,
-            "temperature": 0.0,
-        });
-        let req = axum::http::Request::post("/v1/chat/completions")
-            .header("content-type", "application/json")
-            .body(axum::body::Body::from(
-                serde_json::to_vec(&body).expect("serialize request"),
-            ))
-            .expect("build request");
-        let resp = tower::ServiceExt::oneshot(app, req)
-            .await
-            .expect("response");
-        assert_eq!(
-            resp.status(),
-            StatusCode::OK,
-            "sanity: the override must be accepted, not rejected"
-        );
-
-        // The pool has exactly one replica; acquiring it again after the
-        // request completed must observe the *ambient* temperature, not
-        // the request's `0.0` override -- proving the swap-then-restore
-        // dance actually restores rather than leaking the override onto
-        // whichever request this replica serves next.
-        let lease = pool.acquire().await.expect("acquire the sole replica back");
-        assert_eq!(
-            lease.sampling_params().temperature,
-            0.9,
-            "the per-request temperature override must be restored after the logprobs call, \
-             not leaked onto the next request served by this pool replica"
-        );
-    }
-}
+#[cfg(test)]
+mod seam_tests;

@@ -1298,6 +1298,118 @@ mod prism_blocked_tests {
         assert_bit_identical(&expect, &got, "gemm_pq2_0(m=MR) vs the gemv sweep");
     }
 
+    /// K-INT8 reverify minor[2]: the three tests just above compare the
+    /// dispatcher against a manual GEMV *sweep* (one `gemv` call per batch
+    /// row) — after this fix-up that is exactly what `prism_gemm_dispatch`
+    /// itself does for `m <= PRISM_GEMM_MR`, so those tests exercise the
+    /// dispatcher against its own equivalent, not against the raw
+    /// register-blocked kernel (`gemm_pq2_0_kernel(tier)` etc.) it defers to
+    /// for `m > PRISM_GEMM_MR`. This is the missing direct comparison: for
+    /// every tier this build can execute and every `m` in `1..=PRISM_GEMM_MR`
+    /// — the whole range the K-INT8 fast path covers — the dispatcher's
+    /// `gemm_{pq2_0,ptq1_0,q2_0_g64}` must still agree, bit for bit, with
+    /// calling the *blocked* kernel function directly at that same `m` (the
+    /// `*_blocked_gemm_is_bit_identical_to_the_gemv_sweep` tests already pin
+    /// that the blocked kernel and the sweep agree at every `m`, so
+    /// transitively so must the dispatcher and the blocked kernel — this
+    /// test proves it is not merely transitively true but actually true of
+    /// the real dispatch code path).
+    ///
+    /// `KernelDispatcher::with_tier` pins a tier, but a host that cannot
+    /// execute it (e.g. `Avx2` off an `x86_64` box without the ISA) would
+    /// silently clamp to a different tier — comparing scalar against Neon
+    /// bits would then fail for the wrong reason, so this asserts
+    /// `dispatcher.prism_tier() == tier` before trusting the comparison.
+    #[test]
+    fn dispatcher_gemm_agrees_with_the_blocked_kernel_for_every_m_up_to_mr() {
+        let _guard = env_guard();
+        let n_rows = PlatformProfile::global_thresholds().par_gemv_min_rows * 2 + 3;
+
+        for tier in tiers() {
+            let kernel_tier = match tier {
+                PrismTier::Scalar => KernelTier::Reference,
+                #[cfg(target_arch = "aarch64")]
+                PrismTier::Neon => KernelTier::Neon,
+                #[cfg(target_arch = "x86_64")]
+                PrismTier::Avx2 => KernelTier::Avx2,
+            };
+            let dispatcher = KernelDispatcher::with_tier(kernel_tier);
+            assert_eq!(
+                dispatcher.prism_tier(),
+                tier,
+                "host cannot actually execute {tier:?} — this comparison would silently \
+                 test the wrong tier"
+            );
+
+            for m in 1..=PRISM_GEMM_MR {
+                // PQ2_0
+                let k = 2 * QK_PQ2_0;
+                let blocks = pq2_blocks(n_rows * (k / QK_PQ2_0), 0xA5A5_0000 ^ m as u32);
+                let input = inputs(m * k, 0x5A5A_0000 ^ m as u32);
+                let mut via_dispatcher = vec![0.0f32; m * n_rows];
+                dispatcher
+                    .gemm_pq2_0(&blocks, &input, &mut via_dispatcher, m, n_rows, k)
+                    .expect("dispatcher gemm_pq2_0");
+                let mut via_kernel = vec![0.0f32; m * n_rows];
+                gemm_pq2_0_kernel(tier)(&blocks, &input, &mut via_kernel, m, n_rows, k)
+                    .expect("blocked gemm_pq2_0_kernel");
+                assert_bit_identical(
+                    &via_dispatcher,
+                    &via_kernel,
+                    &format!("pq2_0 tier={tier:?} m={m}"),
+                );
+
+                // PTQ1_0
+                let k_ptq1 = 2 * QK_PTQ1_0;
+                let ptq1 = ptq1_blocks(n_rows * (k_ptq1 / QK_PTQ1_0), 0xB5B5_0000 ^ m as u32);
+                let input_ptq1 = inputs(m * k_ptq1, 0x5B5B_0000 ^ m as u32);
+                let mut via_dispatcher_ptq1 = vec![0.0f32; m * n_rows];
+                dispatcher
+                    .gemm_ptq1_0(
+                        &ptq1,
+                        &input_ptq1,
+                        &mut via_dispatcher_ptq1,
+                        m,
+                        n_rows,
+                        k_ptq1,
+                    )
+                    .expect("dispatcher gemm_ptq1_0");
+                let mut via_kernel_ptq1 = vec![0.0f32; m * n_rows];
+                gemm_ptq1_0_kernel(tier)(
+                    &ptq1,
+                    &input_ptq1,
+                    &mut via_kernel_ptq1,
+                    m,
+                    n_rows,
+                    k_ptq1,
+                )
+                .expect("blocked gemm_ptq1_0_kernel");
+                assert_bit_identical(
+                    &via_dispatcher_ptq1,
+                    &via_kernel_ptq1,
+                    &format!("ptq1_0 tier={tier:?} m={m}"),
+                );
+
+                // Q2_0G64
+                let k_g64 = 2 * QK_Q2_0_G64;
+                let g64 = q2_g64_blocks(n_rows * (k_g64 / QK_Q2_0_G64), 0xC5C5_0000 ^ m as u32);
+                let input_g64 = inputs(m * k_g64, 0x5C5C_0000 ^ m as u32);
+                let mut via_dispatcher_g64 = vec![0.0f32; m * n_rows];
+                dispatcher
+                    .gemm_q2_0_g64(&g64, &input_g64, &mut via_dispatcher_g64, m, n_rows, k_g64)
+                    .expect("dispatcher gemm_q2_0_g64");
+                let mut via_kernel_g64 = vec![0.0f32; m * n_rows];
+                gemm_q2_0_g64_kernel(tier)(&g64, &input_g64, &mut via_kernel_g64, m, n_rows, k_g64)
+                    .expect("blocked gemm_q2_0_g64_kernel");
+                assert_bit_identical(
+                    &via_dispatcher_g64,
+                    &via_kernel_g64,
+                    &format!("q2_0_g64 tier={tier:?} m={m}"),
+                );
+            }
+        }
+    }
+
     /// Gatekeeper REQUIRED #9's numeric acceptance: a batched CPU prefill of
     /// Bonsai 2 27B shape must stop being a single-threaded GEMV loop.
     ///
@@ -1382,7 +1494,7 @@ mod prism_blocked_tests {
     /// at `M = 1` (decode) instead of `64` — `before` is the plain blocked
     /// kernel (what every `gemm_pq2_0` call used to run at this `m`, since
     /// `1 < par_gemm_min_batch` on every platform profile), `after` is
-    /// [`prism_gemm_dispatch`]'s `m < PRISM_GEMM_MR` fast path.
+    /// [`prism_gemm_dispatch`]'s `m <= PRISM_GEMM_MR` fast path.
     ///
     /// Takes the **min of several trials** on each side rather than one
     /// shot: this dev machine runs under heavy, highly variable background

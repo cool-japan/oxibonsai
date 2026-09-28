@@ -110,6 +110,142 @@ pub(crate) fn parse_max_seq_len(s: &str) -> Result<usize, String> {
     validate_max_seq_len(v)
 }
 
+/// Min-p (probabilistic nucleus) threshold (RT-23 CLI surface). Rejects a
+/// non-finite value or one outside `[0.0, 1.0]` up front — the same
+/// fail-fast convention as [`validate_top_p`] — rather than silently
+/// accepting an out-of-range value that would simply never filter anything
+/// at sample time.
+pub(crate) fn validate_min_p(v: f32) -> Result<f32, String> {
+    if !(0.0..=1.0).contains(&v) || !v.is_finite() {
+        return Err(format!("min-p must be in the range [0.0, 1.0], got {v}"));
+    }
+    Ok(v)
+}
+
+pub(crate) fn parse_min_p(s: &str) -> Result<f32, String> {
+    let v: f32 = s
+        .parse()
+        .map_err(|_| format!("'{s}' is not a valid number"))?;
+    validate_min_p(v)
+}
+
+/// `--backend auto|cpu|metal` (wave-4b ENGINE-SEAM addendum). Parses
+/// through [`oxibonsai_runtime::engine_seam::Backend::parse`] so this CLI's
+/// accepted spellings can never drift from the engine's own, and the
+/// resolved value is the real enum clap stores directly — no intermediate
+/// `String` round trip through `args.rs`.
+pub(crate) fn parse_backend(s: &str) -> Result<oxibonsai_runtime::engine_seam::Backend, String> {
+    oxibonsai_runtime::engine_seam::Backend::parse(s)
+        .ok_or_else(|| format!("invalid --backend value '{s}': expected auto, cpu, or metal"))
+}
+
+/// `--rope-scaling auto|on|off` (wave-4b orchestrator addendum; see
+/// `RULING_bonsai8b_yarn.md`). A thin wrapper over
+/// [`oxibonsai_runtime::config::RopeScalingMode`]'s own `FromStr` (that type
+/// has no `clap::ValueEnum` derive — adding one would need a new `clap`
+/// dependency on `oxibonsai-runtime`, whose `Cargo.toml` is outside this
+/// package's `owned_files` — so a manual `value_parser` function, not
+/// `#[arg(value_enum)]`, is how this flag reaches it).
+pub(crate) fn parse_rope_scaling(
+    s: &str,
+) -> Result<oxibonsai_runtime::config::RopeScalingMode, String> {
+    s.parse()
+}
+
+/// `--reasoning-effort low|medium|xhigh` (cli-11 / Bonsai 2 chat contract,
+/// design §5.7). A plain string (not a `clap::ValueEnum`) because the
+/// resolved value must also be layerable through `--config`'s
+/// `[sampling]`/`[model]` sections the same way every other cli-04 flag is
+/// (`mod.rs`'s `util::resolve_str` + re-validation), which needs a
+/// `parse_x`/`validate_x` pair operating on `&str`/`String` like this
+/// file's other resolved flags, not a `clap`-only enum type.
+pub(crate) fn validate_reasoning_effort(v: &str) -> Result<String, String> {
+    match v {
+        "low" | "medium" | "xhigh" => Ok(v.to_string()),
+        other => Err(format!(
+            "invalid --reasoning-effort value '{other}': expected one of low, medium, xhigh"
+        )),
+    }
+}
+
+pub(crate) fn parse_reasoning_effort(s: &str) -> Result<String, String> {
+    validate_reasoning_effort(s)
+}
+
+/// `--prefill-chunk <N>` (design §5.7): the prompt-ingestion chunk size.
+/// Must be at least 1; the per-model default (512 for a `qwen35` hybrid's
+/// Gated-DeltaNet prefill, the dense stack's own chunk plan otherwise)
+/// applies when the flag is absent.
+pub(crate) fn validate_prefill_chunk(v: usize) -> Result<usize, String> {
+    if v < 1 {
+        return Err("prefill-chunk must be >= 1".to_string());
+    }
+    Ok(v)
+}
+
+pub(crate) fn parse_prefill_chunk(s: &str) -> Result<usize, String> {
+    let v: usize = s
+        .parse()
+        .map_err(|_| format!("'{s}' is not a valid non-negative integer"))?;
+    validate_prefill_chunk(v)
+}
+
+/// `--image-max-tokens <N>` (design §5.7, vision phase 2): the per-image
+/// token budget the downscale guard enforces. Must be at least 1.
+pub(crate) fn validate_image_max_tokens(v: usize) -> Result<usize, String> {
+    if v < 1 {
+        return Err("image-max-tokens must be >= 1".to_string());
+    }
+    Ok(v)
+}
+
+pub(crate) fn parse_image_max_tokens(s: &str) -> Result<usize, String> {
+    let v: usize = s
+        .parse()
+        .map_err(|_| format!("'{s}' is not a valid non-negative integer"))?;
+    validate_image_max_tokens(v)
+}
+
+/// `serve --max-output-tokens <N>`: a hard ceiling on a request's effective
+/// `max_tokens`. `0` is rejected (it would 400 every request instead of
+/// capping it), matching `oxibonsai-serve`'s own parser.
+#[cfg(feature = "server")]
+pub(crate) fn validate_max_output_tokens(v: usize) -> Result<usize, String> {
+    if v < 1 {
+        return Err(
+            "max-output-tokens must be at least 1 (a zero ceiling would reject every request \
+             outright instead of capping it)"
+                .to_string(),
+        );
+    }
+    Ok(v)
+}
+
+#[cfg(feature = "server")]
+pub(crate) fn parse_max_output_tokens(s: &str) -> Result<usize, String> {
+    let v: usize = s
+        .parse()
+        .map_err(|_| format!("'{s}' is not a valid non-negative integer"))?;
+    validate_max_output_tokens(v)
+}
+
+/// Which backend `serve` answers `/v1/embeddings` from
+/// (`--embedding-backend`, RT-EMBEDDINGS residue routed to B2-14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub(crate) enum EmbeddingBackendChoice {
+    /// Mean-pooled hidden states of the loaded model (dense models; a
+    /// hybrid `qwen35` model has no embedder yet and answers the honest 501).
+    #[default]
+    Model,
+    /// Serve no embeddings at all: `/v1/embeddings` always answers 501.
+    None,
+    /// A TF-IDF (lexical, non-semantic) embedder whose vocabulary and IDF
+    /// weights are fitted once, at startup, on `--embedding-corpus` — never
+    /// on client requests, so the vector space is fixed for the server's
+    /// lifetime.
+    Tfidf,
+}
+
 #[derive(Parser)]
 #[command(
     name = "oxibonsai",
@@ -149,30 +285,33 @@ pub(crate) enum Commands {
         #[arg(long, value_parser = parse_max_tokens)]
         max_tokens: Option<usize>,
 
-        /// Sampling temperature; 0.0 = greedy argmax on every backend
-        /// (default: 0.7, or `[sampling].temperature` in --config). Must
-        /// be >= 0.0.
+        /// Sampling temperature; 0.0 = greedy argmax on every backend.
+        /// Precedence (RT-17): this flag, else `[sampling].temperature` in
+        /// --config, else the model's own `general.sampling.temp` (Bonsai
+        /// 2: 1.0), else 0.7. Must be >= 0.0.
         #[arg(long, value_parser = parse_temperature)]
         temperature: Option<f32>,
 
-        /// Top-k sampling, 0 = disabled (default: 40, or
-        /// `[sampling].top_k` in --config).
+        /// Top-k sampling, 0 = disabled. Precedence: this flag, else
+        /// `[sampling].top_k`, else the model's `general.sampling.top_k`
+        /// (Bonsai 2: 20), else 40.
         #[arg(long)]
         top_k: Option<usize>,
 
-        /// Top-p (nucleus) sampling (default: 0.9, or `[sampling].top_p`
-        /// in --config). Must be in (0.0, 1.0].
+        /// Top-p (nucleus) sampling. Precedence: this flag, else
+        /// `[sampling].top_p`, else the model's `general.sampling.top_p`
+        /// (Bonsai 2: 0.95), else 0.9. Must be in (0.0, 1.0].
         #[arg(long, value_parser = parse_top_p)]
         top_p: Option<f32>,
 
         /// Repetition penalty; 1.0 = disabled, applied on every backend
         /// (default: 1.0, or `[sampling].repetition_penalty` in
-        /// --config). Must be > 0.0. Unlike `oxibonsai_runtime`'s
-        /// internal `SamplingParams::default()`, this CLI never applies a
-        /// hidden non-1.0 value, so `--temperature 0` means exactly
-        /// argmax unless a penalty is explicitly requested. A non-default
-        /// value is a hard error when combined with --grammar or --stop
-        /// (that decode loop cannot apply it).
+        /// --config). Must be > 0.0. No hidden non-1.0 value is ever
+        /// applied (every default in this workspace is 1.0 now), so
+        /// `--temperature 0` means exactly argmax unless a penalty is
+        /// explicitly requested. A non-default value is a hard error when
+        /// combined with --grammar or --stop (that decode loop cannot apply
+        /// it).
         #[arg(long, value_parser = parse_repetition_penalty)]
         repetition_penalty: Option<f32>,
 
@@ -192,13 +331,17 @@ pub(crate) enum Commands {
         #[arg(long, value_parser = parse_openai_penalty, allow_negative_numbers = true)]
         presence_penalty: Option<f32>,
 
-        /// Random seed.
+        /// Random seed. Two runs with the same seed, model, prompt and
+        /// sampling flags produce byte-identical output (RT-12).
         #[arg(long, default_value_t = 42)]
         seed: u64,
 
-        /// Maximum sequence length (prompt + generated) (default: 4096,
-        /// or `[model].max_seq_len` in --config). Must be >= 1.
-        #[arg(long, value_parser = parse_max_seq_len)]
+        /// Maximum sequence length (prompt + generated); `--ctx` is an
+        /// alias (default: 8192 for a Bonsai 2 `qwen35` model, 4096
+        /// otherwise, or `[model].max_seq_len` in --config). Must be >= 1,
+        /// and for a `qwen35` model it is refused above both the model's
+        /// declared context and the RAM-derived bound.
+        #[arg(long, visible_alias = "ctx", value_parser = parse_max_seq_len)]
         max_seq_len: Option<usize>,
 
         /// Path to tokenizer.json file (default: auto-detected, or
@@ -209,6 +352,15 @@ pub(crate) enum Commands {
         /// Which tokenizer backend to use.
         #[arg(long, value_enum, default_value_t = TokenizerBackendChoice::Auto)]
         tokenizer_backend: TokenizerBackendChoice,
+
+        /// Render `--prompt` as a single user turn through the model's own
+        /// chat template (the GGUF's `tokenizer.chat_template`, or the
+        /// built-in ChatML/Qwen3 fallback when the file ships none) instead
+        /// of feeding it to the model raw. Required by --think/--no-think,
+        /// --reasoning-effort, --tools and --show-reasoning/--hide-reasoning,
+        /// which only mean something inside the chat contract.
+        #[arg(long, default_value_t = false)]
+        chat: bool,
 
         /// Constrain generation to a grammar: a `.gbnf` file, or any other
         /// extension is parsed as a JSON Schema. Applies on every backend
@@ -221,6 +373,107 @@ pub(crate) enum Commands {
         /// decoded output (may be passed multiple times).
         #[arg(long)]
         stop: Vec<String>,
+
+        /// Min-p (probabilistic nucleus) sampling; 0.0 = disabled. Applied
+        /// after top-k, before top-p (RT-23). Precedence: this flag, else
+        /// `[sampling].min_p`, else the model's `general.sampling.min_p`,
+        /// else 0.0. Only affects sampled decoding (`--temperature` > 0).
+        #[arg(long, value_parser = parse_min_p)]
+        min_p: Option<f32>,
+
+        /// Which compute backend runs the model: `auto` (best available —
+        /// GPU when accelerated, CPU for a hybrid `qwen35` model such as
+        /// Bonsai 2, since no hybrid GPU encoder exists yet), `cpu` (best
+        /// CPU SIMD tier, regardless of GPU availability — including the
+        /// temperature-0 path, which never takes a GPU route under `cpu`),
+        /// or `metal` (the Metal GPU, or a typed, non-zero-exit error —
+        /// always, never a silent CPU fallback — when unavailable on this
+        /// build/host or when the model is a hybrid).
+        #[arg(long, value_parser = parse_backend)]
+        backend: Option<oxibonsai_runtime::engine_seam::Backend>,
+
+        /// RoPE scaling strategy: `auto` (default) honours whatever
+        /// `<arch>.rope.scaling.*` the GGUF declares, exactly like
+        /// llama.cpp; `off` forces plain RoPE even when the file declares
+        /// scaling (reproduces OxiBonsai <= 0.2.4 behaviour on models such
+        /// as Bonsai-8B, which declares YaRN factor 4); `on` requires the
+        /// file to declare scaling and errors when it does not.
+        #[arg(long, value_parser = parse_rope_scaling)]
+        rope_scaling: Option<oxibonsai_runtime::config::RopeScalingMode>,
+
+        /// Enable the chat contract's `<think>` reasoning block
+        /// (`enable_thinking = true` in the chat template). Neither flag
+        /// passed = the template's own default (the Bonsai 2 template
+        /// thinks by default). Requires --chat.
+        #[arg(long, conflicts_with = "no_think")]
+        think: bool,
+
+        /// Disable the `<think>` reasoning block (`enable_thinking =
+        /// false`). Requires --chat.
+        #[arg(long)]
+        no_think: bool,
+
+        /// Reasoning effort passed to the chat template's
+        /// `reasoning_effort` variable (Bonsai 2 chat contract): low,
+        /// medium or xhigh. Requires --chat.
+        #[arg(long, value_parser = parse_reasoning_effort)]
+        reasoning_effort: Option<String>,
+
+        /// Path to a JSON file containing an OpenAI-style `tools` array,
+        /// passed to the chat template verbatim (raw JSON text, so
+        /// key order and number formatting are preserved byte-for-byte
+        /// rather than round-tripped through a Rust value — B2-13's
+        /// tool-call contract requires this for byte-identical template
+        /// output). Requires --chat.
+        #[arg(long)]
+        tools: Option<String>,
+
+        /// Print the model's `<think>` reasoning to stderr while the answer
+        /// streams to stdout (the default in --chat mode). Requires --chat.
+        #[arg(long, conflicts_with = "hide_reasoning")]
+        show_reasoning: bool,
+
+        /// Drop the model's `<think>` reasoning and print only the answer.
+        /// Requires --chat.
+        #[arg(long)]
+        hide_reasoning: bool,
+
+        /// Transcode every PTQ1_0 (1.75-bit) weight matrix to the lossless
+        /// 2-bit PQ2_0 layout at load time (design §2.1) instead of running
+        /// the native PTQ1_0 kernels. Materialises the transcoded weights
+        /// in anonymous RAM (~7.2 GB for the 27B) instead of mmapping them;
+        /// the native path is the default. A no-op (with a log line) for a
+        /// file with no PTQ1_0 tensors.
+        #[arg(long, default_value_t = false)]
+        ptq1_transcode: bool,
+
+        /// Prompt-ingestion chunk size in tokens (design §5.7): the
+        /// Gated-DeltaNet prefill chunk for a `qwen35` hybrid (default
+        /// 512), the chunked-prefill plan for a dense model (default: that
+        /// model's own plan). Must be >= 1.
+        #[arg(long, value_parser = parse_prefill_chunk)]
+        prefill_chunk: Option<usize>,
+
+        /// Vision projector GGUF (`clip` architecture, e.g.
+        /// `Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf`). Parsed and validated
+        /// now; vision inference lands with B2-19/B2-20, so passing it is a
+        /// typed `NOT_YET_SUPPORTED` error, never a silently ignored flag.
+        #[arg(long)]
+        mmproj: Option<String>,
+
+        /// Image input (path or http(s) URL; repeatable). Parsed and
+        /// validated now; vision inference lands with B2-19/B2-20, so
+        /// passing it is a typed `NOT_YET_SUPPORTED` error, never a
+        /// silently ignored flag.
+        #[arg(long)]
+        image: Vec<String>,
+
+        /// Per-image token budget for the vision downscale guard (default
+        /// 1024, matching the reference demo). Must be >= 1. Vision lands
+        /// with B2-19/B2-20: passing it explicitly is a typed
+        /// `NOT_YET_SUPPORTED` error.
+        #[arg(long, value_parser = parse_image_max_tokens)]
+        image_max_tokens: Option<usize>,
 
         /// Proceed even when the resolved tokenizer's vocabulary is
         /// SMALLER than the model's (TOK-08). A smaller vocabulary means a
@@ -248,28 +501,31 @@ pub(crate) enum Commands {
         #[arg(short, long)]
         prompt: String,
 
-        /// Output PNG path.
+        /// Output PNG path. A relative path is placed under
+        /// `[imagen].output_dir` when --config sets one.
         #[arg(short, long)]
         out: String,
 
-        /// RNG seed for the initial noise.
-        #[arg(long, default_value_t = 42)]
-        seed: u64,
+        /// RNG seed for the initial noise (default: 42, or `[imagen].seed`
+        /// in --config).
+        #[arg(long)]
+        seed: Option<u64>,
 
-        /// Number of Euler sampler steps.
-        #[arg(long, default_value_t = 4)]
-        steps: usize,
+        /// Number of Euler sampler steps (default: 4, or `[imagen].steps`).
+        #[arg(long)]
+        steps: Option<usize>,
 
-        /// Image width in pixels.
-        #[arg(long, default_value_t = 512)]
-        width: usize,
+        /// Image width in pixels (default: 512, or `[imagen].width`).
+        #[arg(long)]
+        width: Option<usize>,
 
-        /// Image height in pixels.
-        #[arg(long, default_value_t = 512)]
-        height: usize,
+        /// Image height in pixels (default: 512, or `[imagen].height`).
+        #[arg(long)]
+        height: Option<usize>,
 
-        /// DiT GGUF path. Required: pass this flag or set env OXI_DIT_GGUF
-        /// (there is no default path — never a world-writable directory).
+        /// DiT GGUF path. Required: pass this flag, set `[imagen].model_path`
+        /// in --config, or set env OXI_DIT_GGUF (there is no default path —
+        /// never a world-writable directory).
         #[arg(long)]
         dit: Option<String>,
 
@@ -297,21 +553,24 @@ pub(crate) enum Commands {
     /// inline; elsewhere it is written to a file. Model paths resolve the
     /// same way as `image` (flag → env → error; no default path).
     Repl {
-        /// Initial RNG seed (changeable at runtime with :seed).
-        #[arg(long, default_value_t = 42)]
-        seed: u64,
+        /// Initial RNG seed, changeable at runtime with :seed (default: 42,
+        /// or `[imagen].seed` in --config).
+        #[arg(long)]
+        seed: Option<u64>,
 
-        /// Initial sampler steps (changeable with :steps / :fast / :hq).
-        #[arg(long, default_value_t = 4)]
-        steps: usize,
+        /// Initial sampler steps, changeable with :steps / :fast / :hq
+        /// (default: 4, or `[imagen].steps`).
+        #[arg(long)]
+        steps: Option<usize>,
 
-        /// Initial image width in pixels.
-        #[arg(long, default_value_t = 512)]
-        width: usize,
+        /// Initial image width in pixels (default: 512, or `[imagen].width`).
+        #[arg(long)]
+        width: Option<usize>,
 
-        /// Initial image height in pixels.
-        #[arg(long, default_value_t = 512)]
-        height: usize,
+        /// Initial image height in pixels (default: 512, or
+        /// `[imagen].height`).
+        #[arg(long)]
+        height: Option<usize>,
 
         /// Run the text-encoder GEMM on the CPU instead of the Metal GPU.
         #[arg(long)]
@@ -351,19 +610,22 @@ pub(crate) enum Commands {
         #[arg(long, value_parser = parse_max_tokens)]
         max_tokens: Option<usize>,
 
-        /// Sampling temperature; 0.0 = greedy argmax on every backend
-        /// (default: 0.7, or `[sampling].temperature` in --config). Must
-        /// be >= 0.0.
+        /// Sampling temperature; 0.0 = greedy argmax on every backend.
+        /// Precedence (RT-17): this flag, else `[sampling].temperature`,
+        /// else the model's `general.sampling.temp`, else 0.7. Must be
+        /// >= 0.0.
         #[arg(long, value_parser = parse_temperature)]
         temperature: Option<f32>,
 
-        /// Top-k sampling, 0 = disabled (default: 40, or
-        /// `[sampling].top_k` in --config).
+        /// Top-k sampling, 0 = disabled. Precedence: this flag, else
+        /// `[sampling].top_k`, else the model's `general.sampling.top_k`,
+        /// else 40.
         #[arg(long)]
         top_k: Option<usize>,
 
-        /// Top-p (nucleus) sampling (default: 0.9, or `[sampling].top_p`
-        /// in --config). Must be in (0.0, 1.0].
+        /// Top-p (nucleus) sampling. Precedence: this flag, else
+        /// `[sampling].top_p`, else the model's `general.sampling.top_p`,
+        /// else 0.9. Must be in (0.0, 1.0].
         #[arg(long, value_parser = parse_top_p)]
         top_p: Option<f32>,
 
@@ -391,13 +653,16 @@ pub(crate) enum Commands {
         #[arg(long, value_parser = parse_openai_penalty, allow_negative_numbers = true)]
         presence_penalty: Option<f32>,
 
-        /// Random seed.
+        /// Random seed (RT-12: the same seed reproduces the same session).
         #[arg(long, default_value_t = 42)]
         seed: u64,
 
-        /// Maximum sequence length (default: 4096, or
-        /// `[model].max_seq_len` in --config). Must be >= 1.
-        #[arg(long, value_parser = parse_max_seq_len)]
+        /// Maximum sequence length; `--ctx` is an alias (default: 8192 for
+        /// a Bonsai 2 `qwen35` model, 4096 otherwise, or
+        /// `[model].max_seq_len` in --config). Must be >= 1. The whole
+        /// conversation is re-rendered through the chat template every
+        /// turn, so the oldest turns are dropped once it no longer fits.
+        #[arg(long, visible_alias = "ctx", value_parser = parse_max_seq_len)]
         max_seq_len: Option<usize>,
 
         /// Path to tokenizer.json file (default: auto-detected, or
@@ -419,6 +684,68 @@ pub(crate) enum Commands {
         #[arg(long)]
         stop: Vec<String>,
 
+        /// Min-p (probabilistic nucleus) sampling; 0.0 = disabled. See
+        /// `run --help` for the precedence.
+        #[arg(long, value_parser = parse_min_p)]
+        min_p: Option<f32>,
+
+        /// Which compute backend runs the model. See `run --help`.
+        #[arg(long, value_parser = parse_backend)]
+        backend: Option<oxibonsai_runtime::engine_seam::Backend>,
+
+        /// RoPE scaling strategy. See `run --help`.
+        #[arg(long, value_parser = parse_rope_scaling)]
+        rope_scaling: Option<oxibonsai_runtime::config::RopeScalingMode>,
+
+        /// Enable the `<think>` reasoning block for every turn
+        /// (`enable_thinking = true`). Neither flag = the template's own
+        /// default.
+        #[arg(long, conflicts_with = "no_think")]
+        think: bool,
+
+        /// Disable the `<think>` reasoning block for every turn.
+        #[arg(long)]
+        no_think: bool,
+
+        /// Reasoning effort for every turn: low, medium or xhigh.
+        #[arg(long, value_parser = parse_reasoning_effort)]
+        reasoning_effort: Option<String>,
+
+        /// Path to a JSON file containing an OpenAI-style `tools` array,
+        /// used for the whole session (raw JSON text, key order preserved).
+        #[arg(long)]
+        tools: Option<String>,
+
+        /// Print each turn's `<think>` reasoning to stderr (the default).
+        #[arg(long, conflicts_with = "hide_reasoning")]
+        show_reasoning: bool,
+
+        /// Drop each turn's `<think>` reasoning and print only the answer.
+        #[arg(long)]
+        hide_reasoning: bool,
+
+        /// Transcode PTQ1_0 weights to PQ2_0 at load. See `run --help`.
+        #[arg(long, default_value_t = false)]
+        ptq1_transcode: bool,
+
+        /// Prompt-ingestion chunk size. See `run --help`.
+        #[arg(long, value_parser = parse_prefill_chunk)]
+        prefill_chunk: Option<usize>,
+
+        /// Vision projector GGUF. See `run --help` — a typed
+        /// `NOT_YET_SUPPORTED` error until B2-19/B2-20 land.
+        #[arg(long)]
+        mmproj: Option<String>,
+
+        /// Image input (path or URL; repeatable). See `run --help` — a
+        /// typed `NOT_YET_SUPPORTED` error until B2-19/B2-20 land.
+        #[arg(long)]
+        image: Vec<String>,
+
+        /// Per-image token budget (default 1024). See `run --help`.
+        #[arg(long, value_parser = parse_image_max_tokens)]
+        image_max_tokens: Option<usize>,
+
         /// Proceed even when the resolved tokenizer's vocabulary is
         /// SMALLER than the model's (TOK-08); see `run --help` for the
         /// full explanation. A larger tokenizer vocabulary is always a
@@ -428,6 +755,23 @@ pub(crate) enum Commands {
     },
 
     /// Start an OpenAI-compatible API server.
+    ///
+    /// Environment: before loading, the model file's SHA-256 is checked
+    /// against the checksum manifest when that manifest lists the file (a
+    /// mismatch refuses to start). The manifest path defaults to
+    /// `scripts/checksums.sha256`, resolved RELATIVE TO THE CURRENT WORKING
+    /// DIRECTORY (so it is only found when `oxibonsai serve` is started
+    /// from the repository root); set `OXIBONSAI_CHECKSUMS_FILE=<path>` to
+    /// point at a manifest anywhere else. No manifest, or a manifest that
+    /// does not list this file, means no hash check. Other environment
+    /// knobs: `OXI_MODEL`, `OXI_TOKENIZER`, `OXIBONSAI_BEARER_TOKEN`,
+    /// `OXIBONSAI_BEARER_TOKEN_FILE`, `OXIBONSAI_RATE_LIMIT_RPM`,
+    /// `OXIBONSAI_RATE_LIMIT_BURST`, `OXIBONSAI_CORS_ORIGIN`,
+    /// `OXIBONSAI_CORS_ALLOW_CREDENTIALS`, `OXIBONSAI_MAX_BODY_BYTES`,
+    /// `OXIBONSAI_ENGINE_POOL_SIZE`, `OXIBONSAI_SEED`,
+    /// `OXIBONSAI_INSECURE_NO_AUTH`, `OXIBONSAI_ADMIN_TOKEN` /
+    /// `OXI_ADMIN_TOKEN`, `OXIBONSAI_CUDA_DEVICE` — each flag below wins
+    /// over its environment variable.
     #[cfg(feature = "server")]
     Serve {
         /// Path to the GGUF model file (default: env OXI_MODEL, or
@@ -447,9 +791,12 @@ pub(crate) enum Commands {
         #[arg(long)]
         port: Option<u16>,
 
-        /// Maximum sequence length (default: 4096, or
-        /// `[model].max_seq_len` in --config). Must be >= 1.
-        #[arg(long, value_parser = parse_max_seq_len)]
+        /// Maximum sequence length per request (prompt + generated);
+        /// `--ctx` is an alias (default: 8192 for a Bonsai 2 `qwen35`
+        /// model, 4096 otherwise, or `[model].max_seq_len` in --config).
+        /// Must be >= 1; for a `qwen35` model it is refused above both the
+        /// model's declared context and the RAM-derived bound.
+        #[arg(long, visible_alias = "ctx", value_parser = parse_max_seq_len)]
         max_seq_len: Option<usize>,
 
         /// Path to tokenizer.json file (default: auto-detected, or
@@ -492,6 +839,134 @@ pub(crate) enum Commands {
         #[cfg(feature = "rag")]
         #[arg(long, default_value_t = false)]
         rag: bool,
+
+        /// Which compute backend runs the model. See `oxibonsai run --help`.
+        #[arg(long, value_parser = parse_backend)]
+        backend: Option<oxibonsai_runtime::engine_seam::Backend>,
+
+        /// RoPE scaling strategy. See `oxibonsai run --help`.
+        #[arg(long, value_parser = parse_rope_scaling)]
+        rope_scaling: Option<oxibonsai_runtime::config::RopeScalingMode>,
+
+        /// Server-wide default `enable_thinking = true`, applied to a chat
+        /// request that carries neither `chat_template_kwargs.enable_thinking`
+        /// nor a top-level `enable_thinking` (a request always overrides
+        /// this default).
+        #[arg(long, conflicts_with = "no_think")]
+        think: bool,
+
+        /// Server-wide default `enable_thinking = false` (see `--think`).
+        #[arg(long)]
+        no_think: bool,
+
+        /// Server-wide default reasoning effort (low, medium, xhigh),
+        /// applied to a chat request that carries no `reasoning_effort` of
+        /// its own.
+        #[arg(long, value_parser = parse_reasoning_effort)]
+        reasoning_effort: Option<String>,
+
+        /// Path to a JSON file containing an OpenAI-style `tools` array,
+        /// applied (as raw JSON text, key order preserved) to a chat
+        /// request that carries no `tools` of its own.
+        #[arg(long)]
+        tools: Option<String>,
+
+        /// CUDA device ordinal to bind (maps onto `OXIBONSAI_CUDA_DEVICE`,
+        /// applied before the async runtime starts; only takes effect on a
+        /// native-CUDA build with more than one visible device). Also
+        /// `[server].cuda_device` in --config.
+        #[arg(long)]
+        cuda_device: Option<u32>,
+
+        /// Path to a file whose contents are the bearer token required on
+        /// every OpenAI-compatible endpoint (default: env
+        /// `OXIBONSAI_BEARER_TOKEN_FILE`). Mutually exclusive with
+        /// `--bearer-token`: pass at most one.
+        #[arg(long, conflicts_with = "bearer_token")]
+        bearer_token_file: Option<String>,
+
+        /// Requests admitted per minute per client IP before a `429` is
+        /// returned (default: env `OXIBONSAI_RATE_LIMIT_RPM`, unset =
+        /// disabled).
+        #[arg(long)]
+        rate_limit_rpm: Option<u32>,
+
+        /// Burst allowance on top of `--rate-limit-rpm` (default: env
+        /// `OXIBONSAI_RATE_LIMIT_BURST`, or a small multiple of the RPM
+        /// when unset).
+        #[arg(long)]
+        rate_limit_burst: Option<u32>,
+
+        /// `Access-Control-Allow-Origin` value for every response (default:
+        /// env `OXIBONSAI_CORS_ORIGIN`, unset = no CORS headers added).
+        #[arg(long)]
+        cors_origin: Option<String>,
+
+        /// Send `Access-Control-Allow-Credentials: true` (default: env
+        /// `OXIBONSAI_CORS_ALLOW_CREDENTIALS`). Requires `--cors-origin` to
+        /// be a specific origin, never `*` (the CORS spec forbids
+        /// combining a wildcard origin with credentials).
+        #[arg(long, default_value_t = false)]
+        cors_allow_credentials: bool,
+
+        /// Maximum accepted request body size in bytes before a `413` is
+        /// returned (default: env `OXIBONSAI_MAX_BODY_BYTES`, or a
+        /// conservative built-in default when unset).
+        #[arg(long)]
+        max_body_bytes: Option<u64>,
+
+        /// Mount the bundled minimal chat UI at `GET /ui` (SV-26; off by
+        /// default — the page is unauthenticated whenever the server is).
+        /// Also `[server].enable_ui` in --config.
+        #[arg(long, default_value_t = false)]
+        enable_ui: bool,
+
+        /// Hard ceiling on a request's effective `max_tokens` /
+        /// `max_completion_tokens` (SV-28): a request asking for more is
+        /// rejected with 400, naming the ceiling (default: the server's
+        /// compiled-in 8192). Must be >= 1. Also
+        /// `[server].max_output_tokens` in --config.
+        #[arg(long, value_parser = parse_max_output_tokens)]
+        max_output_tokens: Option<usize>,
+
+        /// Transcode PTQ1_0 weights to PQ2_0 at load. See `oxibonsai run
+        /// --help`.
+        #[arg(long, default_value_t = false)]
+        ptq1_transcode: bool,
+
+        /// Prompt-ingestion chunk size for every replica. See `oxibonsai
+        /// run --help`.
+        #[arg(long, value_parser = parse_prefill_chunk)]
+        prefill_chunk: Option<usize>,
+
+        /// Vision projector GGUF. A typed `NOT_YET_SUPPORTED` error until
+        /// B2-19/B2-20 land (see `oxibonsai run --help`).
+        #[arg(long)]
+        mmproj: Option<String>,
+
+        /// Image input for the vision tower (path or URL; repeatable). A
+        /// typed `NOT_YET_SUPPORTED` error until B2-19/B2-20 land.
+        #[arg(long)]
+        image: Vec<String>,
+
+        /// Per-image token budget (default 1024). A typed
+        /// `NOT_YET_SUPPORTED` error when passed, until B2-19/B2-20 land.
+        #[arg(long, value_parser = parse_image_max_tokens)]
+        image_max_tokens: Option<usize>,
+
+        /// Which backend answers `/v1/embeddings`: `model` (default: the
+        /// loaded model's mean-pooled hidden states; a hybrid `qwen35`
+        /// model has none yet and answers 501), `none` (always 501), or
+        /// `tfidf` (lexical TF-IDF vectors over the vocabulary fitted, once
+        /// at startup, on `--embedding-corpus`).
+        #[arg(long, value_enum, default_value_t = EmbeddingBackendChoice::Model)]
+        embedding_backend: EmbeddingBackendChoice,
+
+        /// The corpus `--embedding-backend tfidf` fits its vocabulary and
+        /// IDF weights on: a UTF-8 text file, one document per line (blank
+        /// lines ignored). Required by, and only valid with, `tfidf`.
+        #[arg(long)]
+        embedding_corpus: Option<String>,
     },
 
     /// Display model info from a GGUF file.
@@ -534,6 +1009,11 @@ pub(crate) enum Commands {
         #[arg(long)]
         tokenizer: Option<String>,
 
+        /// Which tokenizer backend loads the on-disk tokenizer for
+        /// `--model` (same choices as `run --tokenizer-backend`).
+        #[arg(long, value_enum, default_value_t = TokenizerBackendChoice::Auto)]
+        tokenizer_backend: TokenizerBackendChoice,
+
         /// Total tokens to generate during the timed benchmark pass.
         #[arg(long, default_value_t = 100)]
         tokens: usize,
@@ -553,9 +1033,11 @@ pub(crate) enum Commands {
 
     /// Quantize a GGUF model to a lower-precision format.
     ///
-    /// Dequantizes every source tensor to f32 and re-encodes it through
-    /// the real `oxibonsai_model::export` pipeline, writing an actual
-    /// GGUF file at `--output`.
+    /// Streams tensor by tensor (CQ-17): each source tensor is dequantized
+    /// to f32 and re-encoded through the real `oxibonsai_model::export`
+    /// pipeline, so only one tensor is resident at a time, and the source
+    /// file's architecture/tokenizer metadata is carried over into the
+    /// GGUF written at `--output`.
     Quantize {
         /// Path to the input GGUF model file.
         #[arg(long)]
@@ -566,17 +1048,17 @@ pub(crate) enum Commands {
         output: String,
 
         /// Target quantization format: f32, q1_0 (Q1_0_g128), tq2_0_g128
-        /// (ternary), fp8_e4m3, fp8_e5m2, q4_0, q8_0, q4_k, q5_k, q6_k.
+        /// (ternary), fp8_e4m3, fp8_e5m2, q4_0, q8_0, q2_k, q3_k, q4_k,
+        /// q5_k, q6_k, q8_k.
         #[arg(long, default_value = "q1_0")]
         format: String,
 
         /// Skip the up-front memory-estimate guard and proceed even when
-        /// dequantizing every tensor to f32 is estimated to need more RAM
-        /// than this machine reports available (or, when that cannot be
-        /// determined, more than a conservative 8 GiB). This command
-        /// still materialises the whole model in RAM (cli-14); the guard
-        /// exists to fail fast with a clear message instead of the OS OOM
-        /// killer, not to prevent every large quantize.
+        /// dequantizing the single largest tensor to f32 is estimated to
+        /// need more RAM than this machine reports available (or, when
+        /// that cannot be determined, more than a conservative 8 GiB). The
+        /// guard exists to fail fast with a clear message instead of the
+        /// OS OOM killer, not to prevent every large quantize.
         #[arg(long, default_value_t = false)]
         force: bool,
     },
@@ -599,15 +1081,24 @@ pub(crate) enum Commands {
         to: String,
 
         /// Quantization format: "tq2_0_g128" (default, ternary
-        /// {-1,0,+1}) or "q1_0_g128" (1-bit sign + FP16 group scale).
-        /// Any other value is rejected with an error before any work is
-        /// done.
+        /// {-1,0,+1}, group 128), "q1_0_g128" (1-bit sign + FP16 group
+        /// scale), "pq2_0" (PrismML 2-bit ternary, ggml id 142),
+        /// "ptq1_0" (PrismML 1.75-bit ternary, ggml id 143) or "q2_0_g64"
+        /// (mainline group-64 Q2_0). Any other value is rejected with an
+        /// error before any work is done.
         #[arg(long, default_value = "tq2_0_g128")]
         quant: String,
 
         /// Treat --from as an ONNX model file (MatMulNBits, bits=2) and use the ONNX→GGUF converter.
         #[arg(long, default_value_t = false)]
         onnx: bool,
+
+        /// Proceed (with a warning per tensor) when the source checkpoint
+        /// contains tensors the converter cannot map onto a GGUF name,
+        /// instead of failing loudly (CQ-04). Such tensors are dropped
+        /// from the output.
+        #[arg(long, default_value_t = false)]
+        allow_unmapped: bool,
     },
 
     /// Evaluate a model against a real evaluation harness task, wired to
@@ -667,6 +1158,46 @@ pub(crate) enum Commands {
     Tokenizer {
         #[command(subcommand)]
         cmd: TokenizerCmd,
+    },
+
+    /// Download a Bonsai 2 / Bonsai model artifact (cli-05).
+    ///
+    /// `<MODEL_OR_URL>` is either a known name (`bonsai2-27b`,
+    /// `bonsai2-27b-ptq1_0`, `bonsai2-27b-pq2_0`, `bonsai2-27b-mmproj`,
+    /// `bonsai2-27b-q2_0`, `bonsai-27b-q1_0`, `ternary-bonsai-27b-pq2_0`,
+    /// `ternary-bonsai-27b-q2_0`, `bonsai-8b`) or a full `http(s)://` URL.
+    ///
+    /// A named entry is verified FAIL-CLOSED against the SHA-256 and byte
+    /// size compiled into this binary (never a CWD-relative file), after a
+    /// structural check (GGUF magic, the expected `general.architecture`,
+    /// and — for a Bonsai 2 language GGUF — `prism.hadamard.version ==
+    /// 1`). `scripts/checksums.sha256` / `OXIBONSAI_CHECKSUMS_FILE`, when
+    /// readable, is an additional cross-check, and the only hash authority
+    /// for a bare URL. Downloads stream to `<file>.part` with a live
+    /// progress line and resume from it; never auto-downloads at inference
+    /// time. `OXIBONSAI_HF_BASE_URL` points at a mirror;
+    /// `OXI_BONSAI2_REPO` / `OXI_BONSAI2_DEV_REPO` override the two Bonsai
+    /// 2 repositories.
+    Pull {
+        /// Model name or a full http(s) URL.
+        model_or_url: String,
+
+        /// Output directory (default: `models`).
+        #[arg(long, default_value = "models")]
+        out: String,
+
+        /// For `bonsai2-27b`: which quantization band to fetch (`pq2`, the
+        /// default, or `ptq1`).
+        #[arg(long, default_value = "pq2")]
+        band: String,
+
+        /// For `bonsai2-27b`: also fetch the mmproj vision projector.
+        #[arg(long, default_value_t = false)]
+        vision: bool,
+
+        /// Overwrite an existing file without prompting.
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
 }
 
@@ -766,217 +1297,5 @@ pub(crate) enum TokenizerCmd {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_temperature_rejects_negative() {
-        assert!(parse_temperature("-1").is_err());
-        assert!(parse_temperature("-0.0001").is_err());
-    }
-
-    #[test]
-    fn parse_temperature_accepts_zero_and_positive() {
-        assert_eq!(parse_temperature("0").unwrap(), 0.0);
-        assert_eq!(parse_temperature("0.7").unwrap(), 0.7);
-    }
-
-    #[test]
-    fn parse_temperature_rejects_nan_and_infinity() {
-        assert!(parse_temperature("nan").is_err());
-        assert!(parse_temperature("inf").is_err());
-    }
-
-    #[test]
-    fn parse_top_p_rejects_out_of_range() {
-        assert!(
-            parse_top_p("0").is_err(),
-            "0.0 excluded (empty distribution)"
-        );
-        assert!(parse_top_p("1.5").is_err());
-        assert!(parse_top_p("-0.1").is_err());
-    }
-
-    #[test]
-    fn parse_top_p_accepts_valid_range() {
-        assert_eq!(parse_top_p("1.0").unwrap(), 1.0);
-        assert_eq!(parse_top_p("0.9").unwrap(), 0.9);
-        assert!(parse_top_p("0.0001").is_ok());
-    }
-
-    #[test]
-    fn parse_repetition_penalty_rejects_non_positive() {
-        assert!(parse_repetition_penalty("0").is_err());
-        assert!(parse_repetition_penalty("-1.1").is_err());
-    }
-
-    #[test]
-    fn parse_repetition_penalty_accepts_positive() {
-        assert_eq!(parse_repetition_penalty("1.0").unwrap(), 1.0);
-        assert_eq!(parse_repetition_penalty("1.1").unwrap(), 1.1);
-    }
-
-    #[test]
-    fn parse_openai_penalty_accepts_negative_within_range() {
-        assert_eq!(parse_openai_penalty("-2.0").unwrap(), -2.0);
-        assert_eq!(parse_openai_penalty("0.0").unwrap(), 0.0);
-        assert_eq!(parse_openai_penalty("2.0").unwrap(), 2.0);
-    }
-
-    #[test]
-    fn parse_openai_penalty_rejects_out_of_range() {
-        assert!(parse_openai_penalty("-2.1").is_err());
-        assert!(parse_openai_penalty("2.1").is_err());
-    }
-
-    #[test]
-    fn parse_max_tokens_rejects_zero() {
-        assert!(parse_max_tokens("0").is_err());
-    }
-
-    #[test]
-    fn parse_max_tokens_accepts_positive() {
-        assert_eq!(parse_max_tokens("1").unwrap(), 1);
-        assert_eq!(parse_max_tokens("256").unwrap(), 256);
-    }
-
-    #[test]
-    fn parse_max_seq_len_rejects_zero() {
-        assert!(parse_max_seq_len("0").is_err());
-    }
-
-    #[test]
-    fn cli_parses_run_with_new_penalty_flags() {
-        let cli = Cli::try_parse_from([
-            "oxibonsai",
-            "run",
-            "--prompt",
-            "hi",
-            "--repetition-penalty",
-            "1.2",
-            "--frequency-penalty",
-            "-0.5",
-            "--presence-penalty",
-            "0.5",
-        ])
-        .expect("should parse");
-        match cli.command {
-            Commands::Run {
-                repetition_penalty,
-                frequency_penalty,
-                presence_penalty,
-                ..
-            } => {
-                assert_eq!(repetition_penalty, Some(1.2));
-                assert_eq!(frequency_penalty, Some(-0.5));
-                assert_eq!(presence_penalty, Some(0.5));
-            }
-            _ => panic!("expected Run"),
-        }
-    }
-
-    #[test]
-    fn cli_rejects_negative_temperature() {
-        let result =
-            Cli::try_parse_from(["oxibonsai", "run", "--prompt", "hi", "--temperature", "-1"]);
-        assert!(result.is_err(), "negative temperature must be rejected");
-    }
-
-    #[test]
-    fn cli_rejects_top_p_above_one() {
-        let result = Cli::try_parse_from(["oxibonsai", "run", "--prompt", "hi", "--top-p", "5.0"]);
-        assert!(result.is_err(), "top-p > 1.0 must be rejected");
-    }
-
-    #[test]
-    fn cli_rejects_zero_max_tokens() {
-        let result =
-            Cli::try_parse_from(["oxibonsai", "run", "--prompt", "hi", "--max-tokens", "0"]);
-        assert!(result.is_err(), "max-tokens == 0 must be rejected");
-    }
-
-    #[test]
-    fn cli_defaults_are_none_for_config_layering() {
-        let cli = Cli::try_parse_from(["oxibonsai", "run", "--prompt", "hi"]).expect("parse");
-        match cli.command {
-            Commands::Run {
-                temperature,
-                top_k,
-                top_p,
-                repetition_penalty,
-                max_tokens,
-                max_seq_len,
-                ..
-            } => {
-                assert_eq!(temperature, None);
-                assert_eq!(top_k, None);
-                assert_eq!(top_p, None);
-                assert_eq!(repetition_penalty, None);
-                assert_eq!(max_tokens, None);
-                assert_eq!(max_seq_len, None);
-            }
-            _ => panic!("expected Run"),
-        }
-    }
-
-    #[test]
-    fn benchmark_requires_explicit_synthetic_or_model() {
-        let cli = Cli::try_parse_from(["oxibonsai", "benchmark"]).expect("parse");
-        match cli.command {
-            Commands::Benchmark {
-                model, synthetic, ..
-            } => {
-                assert!(model.is_none());
-                assert!(
-                    !synthetic,
-                    "synthetic must default to false, not silently on"
-                );
-            }
-            _ => panic!("expected Benchmark"),
-        }
-    }
-
-    #[test]
-    fn validate_temperature_rejects_a_value_that_never_went_through_clap() {
-        // The scenario a config-file-sourced value hits: parsed by
-        // `mod.rs`'s own `toml_f32` (plain `str::parse`, no clap
-        // `value_parser`), then re-validated by calling this directly.
-        assert!(validate_temperature(-5.0).is_err());
-        assert!(validate_temperature(0.0).is_ok());
-    }
-
-    #[test]
-    fn validate_top_p_rejects_a_value_that_never_went_through_clap() {
-        assert!(validate_top_p(5.0).is_err());
-        assert!(validate_top_p(0.5).is_ok());
-    }
-
-    #[test]
-    fn validate_repetition_penalty_rejects_a_value_that_never_went_through_clap() {
-        assert!(validate_repetition_penalty(-1.0).is_err());
-        assert!(validate_repetition_penalty(1.0).is_ok());
-    }
-
-    #[test]
-    fn validate_max_tokens_rejects_a_value_that_never_went_through_clap() {
-        assert!(validate_max_tokens(0).is_err());
-        assert!(validate_max_tokens(1).is_ok());
-    }
-
-    #[test]
-    fn quantize_force_defaults_to_false() {
-        let cli = Cli::try_parse_from([
-            "oxibonsai",
-            "quantize",
-            "--input",
-            "a.gguf",
-            "--output",
-            "b.gguf",
-        ])
-        .expect("parse");
-        match cli.command {
-            Commands::Quantize { force, .. } => assert!(!force),
-            _ => panic!("expected Quantize"),
-        }
-    }
-}
+#[path = "args_tests.rs"]
+mod tests;

@@ -12,16 +12,20 @@ use super::metal_graph::{div_ceil, set_scalar, MetalGraph, MetalGraphError};
 /// Largest `head_dim` the `batched_attention_scores_v2` MSL kernel computes a
 /// *complete* dot product for.
 ///
-/// The kernel stages the query row into `threadgroup float shared_q[128]` and
-/// accumulates over exactly 128 dims with no bound check
-/// (`kernel_sources/attention.rs`), so a larger `head_dim` silently scores on
-/// the first 128 dims — measured on this M3 as 4.13628 vs the CPU's 7.43115 at
-/// `head_dim 256`, with `MTLCommandBufferStatus == Completed` (MET-01).
-///
-/// Every shipping model here uses `head_dim` 64 or 128. Bonsai 2 uses 256, so
-/// B2-15 makes the kernel `head_dim`-generic (staging sized to
-/// `MAX_HEAD_DIM = 256`) and raises this constant with it.
-pub(crate) const ATTENTION_SCORES_V2_MAX_HEAD_DIM: u32 = 128;
+/// This is the same number the MSL source is generated from —
+/// [`super::kernel_sources::ATTENTION_SCORES_V2_HEAD_DIM_CAPACITY`] — so the
+/// dispatcher's bound and the kernel's `threadgroup float shared_q[…]`
+/// staging array can never drift apart. The kernel stages the query row into
+/// that array and accumulates with a strided loop over `head_dim`
+/// (`kernel_sources/attention.rs`, MET-01), so every `head_dim` up to the
+/// capacity — Bonsai 2's 256 included — scores completely. (Before MET-01 the
+/// array held 128 floats and the loop ran over exactly 128 dims: `head_dim
+/// 256` scored 4.13628 against the CPU's 7.43115 on this M3, with
+/// `MTLCommandBufferStatus == Completed`.) A larger `head_dim` would overrun
+/// the staging array: the kernel returns without writing scores for one, and
+/// the dispatcher asserts against it in debug builds and logs it as an error.
+pub(crate) const ATTENTION_SCORES_V2_MAX_HEAD_DIM: u32 =
+    super::kernel_sources::ATTENTION_SCORES_V2_HEAD_DIM_CAPACITY;
 
 /// Largest `k` [`MetalGraph::dispatch_topk_f32`] accepts.
 ///
@@ -910,13 +914,9 @@ impl MetalGraph {
     ///
     /// `layer_offset` is the `u64` element offset produced by
     /// [`GpuKvCache::layer_offset_elements`](crate::gpu_backend::metal_full_layer::GpuKvCache::layer_offset_elements)
-    /// (MET-07). The MSL parameter is still `constant uint&`, so the scalar is
-    /// bound as 8 bytes of which the kernel reads the low 4 — exact for every
-    /// geometry `GpuKvCache::allocate` admits, because that guard rejects any
-    /// cache whose total element count leaves the 32-bit range
-    /// (`metal_full_layer::types::KV_CACHE_MAX_ELEMENTS`). B2-15 widens the MSL
-    /// binding to `constant ulong&`, after which no cap is needed and this
-    /// binding needs no change.
+    /// (MET-07). The MSL parameter is `constant ulong&` and every offset the
+    /// kernel derives from it is computed in 64 bits, so the full 8-byte
+    /// scalar is honoured.
     ///
     /// Dispatch: `[ceil(head_dim/64), nkv, 1]` threadgroups, `[64, 1, 1]` threads
     #[allow(clippy::too_many_arguments)]
@@ -1181,9 +1181,8 @@ impl MetalGraph {
     ///   (`metal_full_layer::functions_2`) and prefill (`metal_prefill::functions`),
     ///   so the check lives here rather than at each call site.
     /// * `cache_layer_offset` is the `u64` element offset from
-    ///   `GpuKvCache::layer_offset_elements`; see
-    ///   [`Self::dispatch_fused_kv_store`] for why binding it against the
-    ///   kernel's `constant uint&` is exact for every admitted geometry.
+    ///   `GpuKvCache::layer_offset_elements`, bound against the kernel's
+    ///   `constant ulong&` (see [`Self::dispatch_fused_kv_store`]).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch_attention_scores_v2(
         &self,
@@ -1203,15 +1202,14 @@ impl MetalGraph {
         debug_assert!(
             head_dim <= ATTENTION_SCORES_V2_MAX_HEAD_DIM,
             "batched_attention_scores_v2 stages only {ATTENTION_SCORES_V2_MAX_HEAD_DIM} query \
-             dims; head_dim {head_dim} would silently score on a partial dot product"
+             dims; the kernel writes no scores for head_dim {head_dim}"
         );
         if head_dim > ATTENTION_SCORES_V2_MAX_HEAD_DIM {
             tracing::error!(
                 head_dim,
                 max_head_dim = ATTENTION_SCORES_V2_MAX_HEAD_DIM,
                 "batched_attention_scores_v2 staging array is too small for this head_dim; \
-                 scores will be computed over the first {ATTENTION_SCORES_V2_MAX_HEAD_DIM} dims \
-                 only (MET-01 — kernel widening lands with B2-15)"
+                 the kernel writes no scores for it (MET-01)"
             );
         }
         let batch_stride: u32 = 16; // Process 16 positions per TG
@@ -1311,11 +1309,9 @@ mod tests {
     use crate::gpu_backend::metal_full_layer::types::kv_layer_offset_elements;
     use metal::{Device, MTLResourceOptions};
 
-    /// The Rust side now hands `fused_kv_store` a `u64` layer offset while the
-    /// MSL parameter is still `constant uint&`. Prove on the device that the
-    /// store lands at the intended address for a *non-zero* layer — i.e. that
-    /// the 8-byte `set_bytes` against a 4-byte kernel parameter is accepted and
-    /// read as the low word.
+    /// `fused_kv_store` takes a `u64` layer offset, bound as the kernel's
+    /// `constant ulong&` (MET-07). Prove on the device that the store lands
+    /// at the intended address for a *non-zero* layer.
     #[test]
     fn fused_kv_store_honours_a_u64_layer_offset() {
         if Device::system_default().is_none() {
@@ -1399,7 +1395,7 @@ mod tests {
     }
 
     /// The staging-array cap that `batched_attention_scores_v2` relies on must
-    /// stay in sync with the MSL text until B2-15 widens it.
+    /// stay in sync with the MSL text.
     #[test]
     fn attention_scores_v2_head_dim_cap_matches_the_msl_staging_array() {
         use crate::gpu_backend::kernel_sources::MSL_BATCHED_ATTENTION_SCORES_V2;

@@ -10,7 +10,8 @@ use std::sync::Arc;
 use cudarc::driver::{CudaSlice, CudaView};
 
 use crate::gpu_backend::cuda_full_layer::{
-    acquire_full_layer_buffers, get_or_upload_f32_weight, init_attn_modules,
+    acquire_full_layer_buffers, check_batch_prefill_inputs, get_or_upload_f32_weight,
+    init_attn_modules, read_back_kv_cache, KvReadback,
 };
 use crate::gpu_backend::cuda_graph::{CudaGraph, CudaGraphError};
 use crate::gpu_backend::cuda_prefill::init_prefill_modules;
@@ -46,6 +47,17 @@ use super::state::{
 ///   in row-major (token-major) layout. Uploaded to GPU in column-major format.
 /// - `logits_out` / `greedy_token_id_out` — if `Some`, runs final norm and LM
 ///   head for the last token and returns full logits or the argmax token id.
+/// - `kv_readback_out` — if `Some`, filled (finding **F6**) with this call's
+///   `[pos_start, pos_start + batch_size)` window of every layer's K/V,
+///   converted to `f32` (see
+///   [`read_back_kv_cache`](crate::gpu_backend::cuda_full_layer::read_back_kv_cache)
+///   for the exact layout), after the last layer and before the optional
+///   final norm / LM head. The K-quant device KV cache is GPU-private and
+///   decode for this family attends over the host `KvCache`, so a caller
+///   that keeps the prompt's K/V must write this into that host cache.
+///   Left untouched when the call fails.
+///
+/// **CUDA is unvalidated**: no CUDA hardware has run this entry point.
 #[allow(clippy::too_many_arguments)]
 pub fn try_cuda_prefill_k_quant(
     hidden_batch: &[f32],
@@ -72,10 +84,23 @@ pub fn try_cuda_prefill_k_quant(
     lm_head_fmt: KQuantFormat,
     logits_out: Option<&mut Vec<f32>>,
     greedy_token_id_out: Option<&mut u32>,
+    kv_readback_out: Option<&mut KvReadback>,
 ) -> Result<(), CudaGraphError> {
     if batch_size == 0 {
         return Ok(());
     }
+    // Refuse an impossible KV window or short host inputs before any device
+    // work (the window bound is what keeps `fused_kv_store` inside its slab).
+    check_batch_prefill_inputs(
+        "try_cuda_prefill_k_quant",
+        pos_start,
+        batch_size,
+        max_seq_len,
+        hidden_batch.len(),
+        hidden_size,
+        (cos_table.len(), sin_table.len()),
+        head_dim,
+    )?;
 
     // K-quant requires hidden_size to be a multiple of 256 (= QK_K).
     if !hidden_size.is_multiple_of(256) {
@@ -215,6 +240,14 @@ pub fn try_cuda_prefill_k_quant(
                 fmt,
             )?;
         }
+    }
+
+    // F6: hand the prompt's device K/V back to the host so decode does not
+    // attend over stale all-zero KV for these positions. Placed before the
+    // LM-head branch below, which returns early; `kv` is still the live
+    // `&mut CudaKvCache` every layer above wrote through.
+    if let Some(out) = kv_readback_out {
+        *out = unsafe { read_back_kv_cache(&graph, kv, pos_start, batch_size)? };
     }
 
     // ─── Final norm + LM head (optional) ─────────────────────────────────────

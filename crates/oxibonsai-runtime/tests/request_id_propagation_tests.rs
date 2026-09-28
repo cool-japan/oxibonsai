@@ -20,13 +20,32 @@ use oxibonsai_core::config::Qwen3Config;
 use oxibonsai_runtime::engine::InferenceEngine;
 use oxibonsai_runtime::request_id::RequestId;
 use oxibonsai_runtime::sampling::SamplingParams;
-use oxibonsai_runtime::server::{create_router, REQUEST_ID_HEADER};
+use oxibonsai_runtime::server::REQUEST_ID_HEADER;
+
+/// Qwen3's `<|im_start|>` id: the tokenizer-less routers of this suite serve
+/// a `Qwen3Config::tiny_test()` engine (the Qwen3 vocabulary size) and run a
+/// text prompt as this single token.
+const QWEN3_IM_START: u32 = 151_644;
+
+/// A tokenizer-less router over `engine`. Without a tokenizer a server needs
+/// a configured prompt start token to accept a text prompt at all (it
+/// answers `400 tokenizer_required` otherwise), and the answer's text is
+/// empty — nothing to render it with — while `usage` still counts every
+/// generated token.
+fn tokenizerless_router(engine: InferenceEngine<'static>) -> axum::Router {
+    oxibonsai_runtime::server::create_router_full(
+        oxibonsai_runtime::engine_pool::EnginePool::new(vec![engine]),
+        None,
+        std::sync::Arc::new(oxibonsai_runtime::metrics::InferenceMetrics::new()),
+        oxibonsai_runtime::server::RouterOptions::default().with_prompt_start_token(QWEN3_IM_START),
+    )
+}
 
 fn test_router() -> axum::Router {
     let config = Qwen3Config::tiny_test();
     let params = SamplingParams::default();
     let engine = InferenceEngine::new(config, params, 42);
-    create_router(engine, None)
+    tokenizerless_router(engine)
 }
 
 fn chat_body(stream: bool) -> serde_json::Value {

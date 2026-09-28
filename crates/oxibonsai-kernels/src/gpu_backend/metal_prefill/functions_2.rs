@@ -1,11 +1,38 @@
-//! Auto-generated module
+//! Public batched-prefill entry points (`try_metal_full_forward_prefill*`).
 //!
-//! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
+//! Every weight lookup here goes through the shared resolvers of
+//! `metal_full_layer::functions_3`, so the batched prefill binds exactly the
+//! buffers the single-token paths of the same model bind (`MET-02`):
+//!
+//! - **ternary** — all eight per-layer buffers and the tail are keyed
+//!   `WeightKey::new(lp.model_epoch, kind, slot)` ([`resolve_ternary_layer`] /
+//!   [`resolve_ternary_tail`]); a slice mixing epochs is rejected;
+//! - **Q1** — the norms and the tail are keyed under the layers' shared
+//!   `model_epoch`, the projections by their upload-handle ids
+//!   ([`resolve_q1_layer`] / [`resolve_q1_tail`]).
+//!
+//! These lookups used to be spelled out per function against the legacy
+//! epoch, which is why a model keyed under its own epoch missed all of its
+//! resident buffers on the batched prefill and fell back to the CPU.
+//!
+//! 🤖 Originally generated with [SplitRS](https://github.com/cool-japan/splitrs)
 
-use std::sync::Arc;
+use super::super::metal_full_layer::functions_3::{
+    q1_layer_refs, resolve_q1_layer, resolve_q1_tail, resolve_ternary_layer, resolve_ternary_tail,
+    shared_model_epoch, shared_q1_model_epoch, tail_part, ternary_layer_refs,
+};
+use super::super::metal_full_layer::{FullForwardLayerParams, FullForwardLayerParamsTernary};
+use super::super::metal_graph::{MetalGraph, MetalGraphError};
 
-use super::super::metal_full_layer::FullForwardLayerParams;
-use super::super::metal_graph::{MetalGraph, MetalGraphError, MetalWeightHandle};
+/// Reject a `layer_params` slice whose length disagrees with `n_layers`.
+fn check_layer_count(n_layers: usize, given: usize) -> Result<(), MetalGraphError> {
+    if given != n_layers {
+        return Err(MetalGraphError::EncodingFailed(format!(
+            "layer_params length mismatch: need {n_layers}, got {given}"
+        )));
+    }
+    Ok(())
+}
 
 /// Attempt to run batch prefill (ALL transformer layers + LM head) in a
 /// single Metal command buffer for multiple prompt tokens.
@@ -41,66 +68,20 @@ pub fn try_metal_full_forward_prefill(
     logits_out: Option<&mut Vec<f32>>,
     greedy_token_id_out: Option<&mut u32>,
 ) -> Result<(), MetalGraphError> {
-    if layer_params.len() != n_layers {
-        return Err(MetalGraphError::EncodingFailed(format!(
-            "layer_params length mismatch: need {n_layers}, got {}",
-            layer_params.len()
-        )));
-    }
+    check_layer_count(n_layers, layer_params.len())?;
+    let epoch = shared_q1_model_epoch(layer_params)?;
     let graph = MetalGraph::global()?;
-    #[allow(clippy::type_complexity)]
-    let mut layer_weights: Vec<(
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-    )> = Vec::with_capacity(n_layers);
-    for lp in layer_params {
-        let attn_norm_w =
-            graph.get_or_upload_f32_weight(lp.attn_norm_handle, lp.attn_norm_bytes)?;
-        let q_norm_w = graph.get_or_upload_f32_weight(lp.q_norm_handle, lp.q_norm_bytes)?;
-        let k_norm_w = graph.get_or_upload_f32_weight(lp.k_norm_handle, lp.k_norm_bytes)?;
-        let ffn_norm_w = graph.get_or_upload_f32_weight(lp.ffn_norm_handle, lp.ffn_norm_bytes)?;
-        let fused_qkv_w =
-            graph.get_or_upload_q1_weight_soa(lp.fused_qkv_handle, lp.fused_qkv_bytes)?;
-        let attn_proj_w =
-            graph.get_or_upload_q1_weight_soa(lp.attn_proj_handle, lp.attn_proj_bytes)?;
-        let gate_bytes = lp.gate_bytes;
-        let up_bytes = lp.up_bytes;
-        let gate_up_w = graph.get_or_upload_q1_weight_soa_lazy(lp.gate_up_handle, || {
-            let mut fused = Vec::with_capacity(gate_bytes.len() + up_bytes.len());
-            fused.extend_from_slice(gate_bytes);
-            fused.extend_from_slice(up_bytes);
-            fused
-        })?;
-        let down_w = graph.get_or_upload_q1_weight_soa(lp.down_handle, lp.down_bytes)?;
-        layer_weights.push((
-            attn_norm_w,
-            fused_qkv_w,
-            q_norm_w,
-            k_norm_w,
-            attn_proj_w,
-            ffn_norm_w,
-            gate_up_w,
-            down_w,
-        ));
-    }
-    let weight_refs: Vec<_> = layer_weights
+    let layers = layer_params
         .iter()
-        .map(|(a, b, c, d, e, f, g, h)| (a, b, c, d, e, f, g, h))
-        .collect();
-    let final_norm_cached = match (final_norm_handle, final_norm_bytes) {
-        (Some(handle), Some(bytes)) => Some(graph.get_or_upload_f32_weight(handle, bytes)?),
-        _ => None,
-    };
-    let lm_head_cached = match (lm_head_handle, lm_head_bytes) {
-        (Some(handle), Some(bytes)) => Some(graph.get_or_upload_q1_weight_soa(handle, bytes)?),
-        _ => None,
-    };
+        .map(|lp| resolve_q1_layer(&graph, lp))
+        .collect::<Result<Vec<_>, _>>()?;
+    let weight_refs = q1_layer_refs(&layers);
+    let (final_norm_cached, lm_head_cached) = resolve_q1_tail(
+        &graph,
+        epoch,
+        tail_part(final_norm_handle, final_norm_bytes),
+        tail_part(lm_head_handle, lm_head_bytes),
+    )?;
     graph.encode_full_forward_prefill(
         hidden_batch,
         pos_start,
@@ -152,66 +133,20 @@ pub fn try_metal_full_forward_prefill_verify(
     lm_head_out_features: usize,
     batch_token_ids_out: &mut Vec<u32>,
 ) -> Result<(), MetalGraphError> {
-    if layer_params.len() != n_layers {
-        return Err(MetalGraphError::EncodingFailed(format!(
-            "layer_params length mismatch: need {n_layers}, got {}",
-            layer_params.len()
-        )));
-    }
+    check_layer_count(n_layers, layer_params.len())?;
+    let epoch = shared_q1_model_epoch(layer_params)?;
     let graph = MetalGraph::global()?;
-    #[allow(clippy::type_complexity)]
-    let mut layer_weights: Vec<(
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-    )> = Vec::with_capacity(n_layers);
-    for lp in layer_params {
-        let attn_norm_w =
-            graph.get_or_upload_f32_weight(lp.attn_norm_handle, lp.attn_norm_bytes)?;
-        let q_norm_w = graph.get_or_upload_f32_weight(lp.q_norm_handle, lp.q_norm_bytes)?;
-        let k_norm_w = graph.get_or_upload_f32_weight(lp.k_norm_handle, lp.k_norm_bytes)?;
-        let ffn_norm_w = graph.get_or_upload_f32_weight(lp.ffn_norm_handle, lp.ffn_norm_bytes)?;
-        let fused_qkv_w =
-            graph.get_or_upload_q1_weight_soa(lp.fused_qkv_handle, lp.fused_qkv_bytes)?;
-        let attn_proj_w =
-            graph.get_or_upload_q1_weight_soa(lp.attn_proj_handle, lp.attn_proj_bytes)?;
-        let gate_bytes = lp.gate_bytes;
-        let up_bytes = lp.up_bytes;
-        let gate_up_w = graph.get_or_upload_q1_weight_soa_lazy(lp.gate_up_handle, || {
-            let mut fused = Vec::with_capacity(gate_bytes.len() + up_bytes.len());
-            fused.extend_from_slice(gate_bytes);
-            fused.extend_from_slice(up_bytes);
-            fused
-        })?;
-        let down_w = graph.get_or_upload_q1_weight_soa(lp.down_handle, lp.down_bytes)?;
-        layer_weights.push((
-            attn_norm_w,
-            fused_qkv_w,
-            q_norm_w,
-            k_norm_w,
-            attn_proj_w,
-            ffn_norm_w,
-            gate_up_w,
-            down_w,
-        ));
-    }
-    let weight_refs: Vec<_> = layer_weights
+    let layers = layer_params
         .iter()
-        .map(|(a, b, c, d, e, f, g, h)| (a, b, c, d, e, f, g, h))
-        .collect();
-    let final_norm_cached = match (final_norm_handle, final_norm_bytes) {
-        (Some(handle), Some(bytes)) => Some(graph.get_or_upload_f32_weight(handle, bytes)?),
-        _ => None,
-    };
-    let lm_head_cached = match (lm_head_handle, lm_head_bytes) {
-        (Some(handle), Some(bytes)) => Some(graph.get_or_upload_q1_weight_soa(handle, bytes)?),
-        _ => None,
-    };
+        .map(|lp| resolve_q1_layer(&graph, lp))
+        .collect::<Result<Vec<_>, _>>()?;
+    let weight_refs = q1_layer_refs(&layers);
+    let (final_norm_cached, lm_head_cached) = resolve_q1_tail(
+        &graph,
+        epoch,
+        tail_part(final_norm_handle, final_norm_bytes),
+        tail_part(lm_head_handle, lm_head_bytes),
+    )?;
     graph.encode_full_forward_prefill_verify(
         hidden_batch,
         pos_start,
@@ -241,13 +176,19 @@ pub fn try_metal_full_forward_prefill_verify(
 /// dispatches through the TQ2_0_g128 batched GEMM kernel. The final RMSNorm
 /// runs on the last token only and the LM head is dispatched via the TQ2
 /// GEMV. Only the last token's logits (or its greedy argmax) are returned.
+///
+/// Every lookup — eight per layer plus the tail — is keyed under the layers'
+/// shared `model_epoch` (`MET-02`); a slice mixing epochs is rejected. Callers
+/// that hold a `CachedTernaryWeights` use
+/// `try_metal_full_forward_prefill_ternary_cached`, which performs no lookup
+/// at all (`MET-03`).
 #[allow(clippy::too_many_arguments)]
 pub fn try_metal_full_forward_prefill_ternary(
     hidden_batch: &[f32],
     batch_size: usize,
     pos_start: usize,
     n_layers: usize,
-    layer_params: &[super::super::metal_full_layer::FullForwardLayerParamsTernary<'_>],
+    layer_params: &[FullForwardLayerParamsTernary<'_>],
     cos_table: &[f32],
     sin_table: &[f32],
     hidden_size: usize,
@@ -266,66 +207,20 @@ pub fn try_metal_full_forward_prefill_ternary(
     logits_out: Option<&mut Vec<f32>>,
     greedy_token_id_out: Option<&mut u32>,
 ) -> Result<(), MetalGraphError> {
-    if layer_params.len() != n_layers {
-        return Err(MetalGraphError::EncodingFailed(format!(
-            "layer_params length mismatch: need {n_layers}, got {}",
-            layer_params.len()
-        )));
-    }
+    check_layer_count(n_layers, layer_params.len())?;
+    let epoch = shared_model_epoch(layer_params)?;
     let graph = MetalGraph::global()?;
-    #[allow(clippy::type_complexity)]
-    let mut layer_weights: Vec<(
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-    )> = Vec::with_capacity(n_layers);
-    for lp in layer_params {
-        let attn_norm_w =
-            graph.get_or_upload_f32_weight(lp.attn_norm_handle, lp.attn_norm_bytes)?;
-        let q_norm_w = graph.get_or_upload_f32_weight(lp.q_norm_handle, lp.q_norm_bytes)?;
-        let k_norm_w = graph.get_or_upload_f32_weight(lp.k_norm_handle, lp.k_norm_bytes)?;
-        let ffn_norm_w = graph.get_or_upload_f32_weight(lp.ffn_norm_handle, lp.ffn_norm_bytes)?;
-        let fused_qkv_w =
-            graph.get_or_upload_tq2_weight_soa(lp.fused_qkv_handle, lp.fused_qkv_bytes)?;
-        let attn_proj_w =
-            graph.get_or_upload_tq2_weight_soa(lp.attn_proj_handle, lp.attn_proj_bytes)?;
-        let gate_bytes = lp.gate_bytes;
-        let up_bytes = lp.up_bytes;
-        let gate_up_w = graph.get_or_upload_tq2_weight_soa_lazy(lp.gate_up_handle, || {
-            let mut fused = Vec::with_capacity(gate_bytes.len() + up_bytes.len());
-            fused.extend_from_slice(gate_bytes);
-            fused.extend_from_slice(up_bytes);
-            fused
-        })?;
-        let down_w = graph.get_or_upload_tq2_weight_soa(lp.down_handle, lp.down_bytes)?;
-        layer_weights.push((
-            attn_norm_w,
-            fused_qkv_w,
-            q_norm_w,
-            k_norm_w,
-            attn_proj_w,
-            ffn_norm_w,
-            gate_up_w,
-            down_w,
-        ));
-    }
-    let weight_refs: Vec<_> = layer_weights
+    let layers = layer_params
         .iter()
-        .map(|(a, b, c, d, e, f, g, h)| (a, b, c, d, e, f, g, h))
-        .collect();
-    let final_norm_cached = match (final_norm_handle, final_norm_bytes) {
-        (Some(handle), Some(bytes)) => Some(graph.get_or_upload_f32_weight(handle, bytes)?),
-        _ => None,
-    };
-    let lm_head_cached = match (lm_head_handle, lm_head_bytes) {
-        (Some(handle), Some(bytes)) => Some(graph.get_or_upload_tq2_weight_soa(handle, bytes)?),
-        _ => None,
-    };
+        .map(|lp| resolve_ternary_layer(&graph, lp))
+        .collect::<Result<Vec<_>, _>>()?;
+    let weight_refs = ternary_layer_refs(&layers);
+    let (final_norm_w, lm_head_w) = resolve_ternary_tail(
+        &graph,
+        epoch,
+        tail_part(final_norm_handle, final_norm_bytes),
+        tail_part(lm_head_handle, lm_head_bytes),
+    )?;
     graph.encode_full_forward_prefill_ternary(
         hidden_batch,
         pos_start,
@@ -341,9 +236,9 @@ pub fn try_metal_full_forward_prefill_ternary(
         head_dim,
         eps,
         max_seq_len,
-        final_norm_cached.as_ref(),
+        final_norm_w.as_ref(),
         final_norm_eps,
-        lm_head_cached.as_ref(),
+        lm_head_w.as_ref(),
         lm_head_out_features,
         logits_out,
         greedy_token_id_out,
@@ -352,14 +247,15 @@ pub fn try_metal_full_forward_prefill_ternary(
 /// Ternary batch prefill **verify** (speculative decoding).
 ///
 /// Runs all layers + final norm + TQ2 LM head on every batch position and
-/// returns the per-position greedy argmax token IDs.
+/// returns the per-position greedy argmax token IDs. Keyed exactly like
+/// [`try_metal_full_forward_prefill_ternary`].
 #[allow(clippy::too_many_arguments)]
 pub fn try_metal_full_forward_prefill_verify_ternary(
     hidden_batch: &[f32],
     batch_size: usize,
     pos_start: usize,
     n_layers: usize,
-    layer_params: &[super::super::metal_full_layer::FullForwardLayerParamsTernary<'_>],
+    layer_params: &[FullForwardLayerParamsTernary<'_>],
     cos_table: &[f32],
     sin_table: &[f32],
     hidden_size: usize,
@@ -377,66 +273,20 @@ pub fn try_metal_full_forward_prefill_verify_ternary(
     lm_head_out_features: usize,
     batch_token_ids_out: &mut Vec<u32>,
 ) -> Result<(), MetalGraphError> {
-    if layer_params.len() != n_layers {
-        return Err(MetalGraphError::EncodingFailed(format!(
-            "layer_params length mismatch: need {n_layers}, got {}",
-            layer_params.len()
-        )));
-    }
+    check_layer_count(n_layers, layer_params.len())?;
+    let epoch = shared_model_epoch(layer_params)?;
     let graph = MetalGraph::global()?;
-    #[allow(clippy::type_complexity)]
-    let mut layer_weights: Vec<(
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-    )> = Vec::with_capacity(n_layers);
-    for lp in layer_params {
-        let attn_norm_w =
-            graph.get_or_upload_f32_weight(lp.attn_norm_handle, lp.attn_norm_bytes)?;
-        let q_norm_w = graph.get_or_upload_f32_weight(lp.q_norm_handle, lp.q_norm_bytes)?;
-        let k_norm_w = graph.get_or_upload_f32_weight(lp.k_norm_handle, lp.k_norm_bytes)?;
-        let ffn_norm_w = graph.get_or_upload_f32_weight(lp.ffn_norm_handle, lp.ffn_norm_bytes)?;
-        let fused_qkv_w =
-            graph.get_or_upload_tq2_weight_soa(lp.fused_qkv_handle, lp.fused_qkv_bytes)?;
-        let attn_proj_w =
-            graph.get_or_upload_tq2_weight_soa(lp.attn_proj_handle, lp.attn_proj_bytes)?;
-        let gate_bytes = lp.gate_bytes;
-        let up_bytes = lp.up_bytes;
-        let gate_up_w = graph.get_or_upload_tq2_weight_soa_lazy(lp.gate_up_handle, || {
-            let mut fused = Vec::with_capacity(gate_bytes.len() + up_bytes.len());
-            fused.extend_from_slice(gate_bytes);
-            fused.extend_from_slice(up_bytes);
-            fused
-        })?;
-        let down_w = graph.get_or_upload_tq2_weight_soa(lp.down_handle, lp.down_bytes)?;
-        layer_weights.push((
-            attn_norm_w,
-            fused_qkv_w,
-            q_norm_w,
-            k_norm_w,
-            attn_proj_w,
-            ffn_norm_w,
-            gate_up_w,
-            down_w,
-        ));
-    }
-    let weight_refs: Vec<_> = layer_weights
+    let layers = layer_params
         .iter()
-        .map(|(a, b, c, d, e, f, g, h)| (a, b, c, d, e, f, g, h))
-        .collect();
-    let final_norm_cached = match (final_norm_handle, final_norm_bytes) {
-        (Some(handle), Some(bytes)) => Some(graph.get_or_upload_f32_weight(handle, bytes)?),
-        _ => None,
-    };
-    let lm_head_cached = match (lm_head_handle, lm_head_bytes) {
-        (Some(handle), Some(bytes)) => Some(graph.get_or_upload_tq2_weight_soa(handle, bytes)?),
-        _ => None,
-    };
+        .map(|lp| resolve_ternary_layer(&graph, lp))
+        .collect::<Result<Vec<_>, _>>()?;
+    let weight_refs = ternary_layer_refs(&layers);
+    let (final_norm_w, lm_head_w) = resolve_ternary_tail(
+        &graph,
+        epoch,
+        tail_part(final_norm_handle, final_norm_bytes),
+        tail_part(lm_head_handle, lm_head_bytes),
+    )?;
     graph.encode_full_forward_prefill_verify_ternary(
         hidden_batch,
         pos_start,
@@ -452,9 +302,9 @@ pub fn try_metal_full_forward_prefill_verify_ternary(
         head_dim,
         eps,
         max_seq_len,
-        final_norm_cached.as_ref(),
+        final_norm_w.as_ref(),
         final_norm_eps,
-        lm_head_cached.as_ref(),
+        lm_head_w.as_ref(),
         lm_head_out_features,
         batch_token_ids_out,
     )

@@ -112,6 +112,14 @@ const ACTIVE_KERNELS: &[&str] = &[
     "MSL_GEMM_FP8_E5M2_RESIDUAL_V1",
     "MSL_FUSED_GATE_UP_SWIGLU_GEMM_FP8_E5M2_V1",
     "MSL_GEMV_FP8_E5M2_PF_V1",
+    // Batched prefill attention (perf-01), in the combined library
+    "MSL_PREFILL_QKV_PREPARE",
+    "MSL_PREFILL_FLASH_ATTENTION",
+    // Qwen3.5 / Bonsai 2 hybrid stack (MET-09); the common prelude first
+    "MSL_QWEN35_COMMON",
+    "MSL_QWEN35_ROTATE",
+    "MSL_QWEN35_GEMV",
+    "MSL_QWEN35_SSM",
 ];
 
 fn kernel_sources_dir() -> PathBuf {

@@ -281,6 +281,42 @@ pub(crate) fn resolve_tokenizer_vocab_aware(
     }
 }
 
+/// TOK-08 for `oxibonsai serve` (wave-3.5 addendum item 6): the SAME
+/// vocab-aware resolution + hard tokenizer/model compatibility check `run`
+/// and `chat` apply ([`resolve_tokenizer_vocab_aware`] then
+/// [`check_tokenizer_model_compatibility`] via
+/// `cmd_run::resolve_model_tokenizer`, which also attaches the GGUF's own
+/// chat template and falls back to a vocabulary-matching tokenizer embedded
+/// in the GGUF when the auto-detected file does not fit), instead of the
+/// vocab-unaware first-existing-candidate ladder `serve` used to run. An
+/// explicit `--tokenizer` that does not fit the model is a hard error.
+///
+/// Returns the tokenizer (`None` = there is no usable tokenizer at all) and
+/// the lookup, whose `searched` list feeds [`missing_tokenizer_warning`].
+///
+/// # Errors
+///
+/// A tokenizer file that cannot be loaded, a vocabulary mismatch, or a GGUF
+/// chat template that fails to compile.
+#[cfg(feature = "server")]
+pub(crate) fn resolve_serving_tokenizer(
+    explicit: Option<&str>,
+    model_path: &str,
+    gguf: &oxibonsai_core::gguf::reader::GgufFile<'_>,
+) -> anyhow::Result<(Option<oxibonsai_runtime::TokenizerBridge>, TokenizerLookup)> {
+    let expected_vocab = model_vocab_size(gguf).ok();
+    let lookup = resolve_tokenizer_vocab_aware(explicit, model_path, expected_vocab);
+    let tok = super::cmd_run::resolve_model_tokenizer(
+        explicit,
+        &lookup,
+        gguf,
+        expected_vocab,
+        super::tokenizer_backend::TokenizerBackendChoice::Auto,
+        false,
+    )?;
+    Ok((tok, lookup))
+}
+
 /// Build the multi-line "no tokenizer found" warning shown by the run /
 /// chat / serve paths.  Centralized so all three surfaces stay in sync.
 pub(crate) fn missing_tokenizer_warning(searched: &[PathBuf]) -> String {
@@ -437,31 +473,19 @@ impl StopChecker {
 // Shared sampling-parameter construction (orchestrator P0 addendum)
 // ──────────────────────────────────────────────────────────────────────────
 
-/// The single constructor `run`/`chat` use to build [`SamplingParams`].
-///
-/// [`oxibonsai_runtime::sampling::SamplingParams::default`] bakes in
-/// `repetition_penalty: 1.1`; every field this function is given is set
-/// explicitly, so that value is never silently inherited. With no
-/// explicit `--repetition-penalty`, callers resolve to `1.0` (disabled)
-/// before calling this, so `--temperature 0` means exactly argmax on
-/// every backend, never a hidden non-1.0 penalty perturbing it.
-///
-/// [`SamplingParams`]: oxibonsai_runtime::sampling::SamplingParams
 /// Reject `--grammar`/`--stop` when combined with a non-default sampling
 /// penalty.
 ///
-/// `cmd_run::run_constrained_or_stopped` and
-/// `cmd_chat::run_constrained_or_stopped_turn` sample via
-/// [`oxibonsai_runtime::InferenceEngine::sample`], which delegates to
-/// [`oxibonsai_runtime::sampling::Sampler::sample`] — the base, history-free
-/// path that applies **no** penalty. Only `sample_with_history` (used
-/// internally by the engine's own `generate`/`generate_streaming_sync`, the
-/// fast path this loop deliberately does not share) applies repetition,
-/// frequency or presence penalties, and it is not on `InferenceEngine`'s
-/// public surface. Previously a non-default penalty combined with
-/// `--grammar`/`--stop` was silently dropped while `--help` and this
-/// module's own doc comments claimed it was applied on every backend; this
-/// fails fast and names exactly which flag(s) conflict instead.
+/// The buffered constrained/stop loop (`cmd_run::run_constrained_or_stopped`,
+/// shared by `chat`) draws each token either from the grammar's
+/// `ConstrainedSampler` chain or from the CLI's own
+/// [`oxibonsai_runtime::sampling::Sampler::sample`] — both history-free, so
+/// neither applies a repetition, frequency or presence penalty. Only
+/// `sample_with_history` (the engine's own `generate`/
+/// `generate_streaming_sync` loop, and the CLI's min-p loop) applies them.
+/// Previously a non-default penalty combined with `--grammar`/`--stop` was
+/// silently dropped while `--help` claimed it was applied on every backend;
+/// this fails fast and names exactly which flag(s) conflict instead.
 pub(crate) fn reject_penalties_with_constrained_decode(
     use_constrained_or_stop: bool,
     repetition_penalty: f32,
@@ -486,14 +510,41 @@ pub(crate) fn reject_penalties_with_constrained_decode(
     }
     anyhow::bail!(
         "{} cannot be combined with --grammar or --stop: the constrained/stop-checking \
-         decode loop samples via the engine's history-free sampler and never applies \
-         repetition/frequency/presence penalties, so accepting this combination would \
-         silently drop the penalty instead of applying it. Drop the penalty flag(s), or \
-         drop --grammar/--stop.",
+         decode loop samples history-free and never applies repetition/frequency/presence \
+         penalties, so accepting this combination would silently drop the penalty instead \
+         of applying it. Drop the penalty flag(s), or drop --grammar/--stop.",
         offending.join(", ")
     );
 }
 
+/// The pre-RT-17 sampling literals every command falls back to when neither
+/// a flag / `--config` value nor the GGUF's own `general.sampling.*`
+/// declares a value — ONE definition shared by `run`/`chat`
+/// (`cmd_run::resolve_sampling`, `mod.rs`) and `serve`
+/// (`cmd_serve::baseline_sampling_params`), so the two paths cannot drift.
+pub(crate) const DEFAULT_TEMPERATURE: f32 = 0.7;
+/// See [`DEFAULT_TEMPERATURE`].
+pub(crate) const DEFAULT_TOP_K: usize = 40;
+/// See [`DEFAULT_TEMPERATURE`].
+pub(crate) const DEFAULT_TOP_P: f32 = 0.9;
+/// See [`DEFAULT_TEMPERATURE`] (`0.0` = min-p disabled).
+pub(crate) const DEFAULT_MIN_P: f32 = 0.0;
+/// See [`DEFAULT_TEMPERATURE`] (`1.0` = no penalty: `--temperature 0` is
+/// exactly argmax).
+pub(crate) const DEFAULT_REPETITION_PENALTY: f32 = 1.0;
+
+/// The single constructor `run`/`chat`/`serve` use to build
+/// [`SamplingParams`].
+///
+/// Every field this function is given is set explicitly, so nothing is
+/// silently inherited from [`SamplingParams::default`] (whose
+/// `repetition_penalty` is `1.0` workspace-wide since RT-24). With no
+/// explicit `--repetition-penalty`, callers resolve to `1.0` (disabled)
+/// before calling this, so `--temperature 0` means exactly argmax on every
+/// backend, never a hidden non-1.0 penalty perturbing it.
+///
+/// [`SamplingParams`]: oxibonsai_runtime::sampling::SamplingParams
+/// [`SamplingParams::default`]: oxibonsai_runtime::sampling::SamplingParams::default
 pub(crate) fn build_sampling_params(
     temperature: f32,
     top_k: usize,
@@ -601,21 +652,61 @@ pub(crate) fn load_config_strict(
 /// [`oxibonsai_runtime::OxiBonsaiConfig`] (mirrors `ServerConfig`,
 /// `SamplingConfig`, `ModelConfig`, `ObservabilityConfig` field lists).
 const KNOWN_CONFIG_SECTIONS: &[(&str, &[&str])] = &[
-    ("server", &["host", "port"]),
     (
         "sampling",
         &[
             "temperature",
             "top_k",
             "top_p",
+            "min_p",
             "repetition_penalty",
             "frequency_penalty",
             "presence_penalty",
             "max_tokens",
         ],
     ),
-    ("model", &["model_path", "tokenizer_path", "max_seq_len"]),
+    (
+        "model",
+        &[
+            "model_path",
+            "tokenizer_path",
+            "max_seq_len",
+            "backend",
+            "rope_scaling",
+            "reasoning_effort",
+            "enable_thinking",
+            "prefill_chunk",
+            "ptq1_transcode",
+        ],
+    ),
+    (
+        "server",
+        &[
+            "host",
+            "port",
+            "cuda_device",
+            "bearer_token_file",
+            "rate_limit_rpm",
+            "rate_limit_burst",
+            "cors_origin",
+            "max_body_bytes",
+            "max_output_tokens",
+            "enable_ui",
+        ],
+    ),
     ("observability", &["log_level", "json_logs"]),
+    (
+        "imagen",
+        &[
+            "model_path",
+            "width",
+            "height",
+            "steps",
+            "guidance_scale",
+            "seed",
+            "output_dir",
+        ],
+    ),
 ];
 
 /// A `[section] key = value` pair actually present in a config file, as
@@ -636,14 +727,14 @@ pub(crate) type RawTomlSections =
 /// 2. Return which keys were genuinely typed into the file, as raw text.
 ///    This matters beyond validation: [`oxibonsai_runtime::OxiBonsaiConfig`]
 ///    deserializes every field with `#[serde(default)]`, so a strongly-typed
-///    `config.sampling.repetition_penalty` reads as `1.1` (that struct's
-///    own built-in default) even when the file never mentions
-///    `repetition_penalty` at all — which would silently reintroduce
-///    exactly the hidden non-1.0 penalty the orchestrator's P0 addendum
-///    requires this CLI never apply, the moment ANY `--config` file is in
-///    use. Consulting the raw text instead of the typed struct for
-///    fields with this hazard (repetition_penalty in particular) closes
-///    that gap; `mod.rs`'s merge step is the caller.
+///    field reads as that struct's own built-in default even when the file
+///    never mentions it — it cannot tell "absent" from "explicitly the
+///    default". That matters for every RT-17 sampling value (an absent key
+///    must fall through to the GGUF's own `general.sampling.*` default, not
+///    to a struct literal) and it is how `repetition_penalty` once
+///    reintroduced a hidden non-1.0 penalty (its struct default was `1.1`
+///    before RT-24). Consulting the raw text instead of the typed struct
+///    closes that gap; `mod.rs`'s merge step is the caller.
 pub(crate) fn parse_flat_toml_sections(
     content: &str,
     path: &Path,
@@ -668,7 +759,7 @@ pub(crate) fn parse_flat_toml_sections(
                 }
                 None => anyhow::bail!(
                     "config file {}:{}: unknown section [{section_name}] (known sections: \
-                     server, sampling, model, observability)",
+                     server, sampling, model, observability, imagen)",
                     path.display(),
                     line_no + 1
                 ),
@@ -696,7 +787,7 @@ pub(crate) fn parse_flat_toml_sections(
                 None => anyhow::bail!(
                     "config file {}:{}: key '{key}' is not inside any [section]; this schema \
                      has no top-level keys (known sections: server, sampling, model, \
-                     observability)",
+                     observability, imagen)",
                     path.display(),
                     line_no + 1
                 ),
@@ -734,6 +825,102 @@ pub(crate) fn toml_usize(sections: &RawTomlSections, section: &str, key: &str) -
 #[cfg(feature = "server")]
 pub(crate) fn toml_u16(sections: &RawTomlSections, section: &str, key: &str) -> Option<u16> {
     sections.get(section)?.get(key)?.parse().ok()
+}
+
+/// Look up and parse a `u32`-valued key (`serve --cuda-device` /
+/// `--rate-limit-rpm` / `--rate-limit-burst`, `[imagen]` sizes).
+pub(crate) fn toml_u32(sections: &RawTomlSections, section: &str, key: &str) -> Option<u32> {
+    sections.get(section)?.get(key)?.parse().ok()
+}
+
+/// Look up and parse a `u64`-valued key (`serve --max-body-bytes`,
+/// `[imagen].seed`).
+pub(crate) fn toml_u64(sections: &RawTomlSections, section: &str, key: &str) -> Option<u64> {
+    sections.get(section)?.get(key)?.parse().ok()
+}
+
+/// Convert one of `args.rs`'s `validate_*`/`parse_*` `Result<T, String>`
+/// outcomes into `anyhow::Result<T>`. The single copy, shared by `mod.rs`
+/// and every `cmd_*` module that re-validates a value it resolves itself
+/// after the model is loaded (`cmd_run`/`cmd_chat`'s RT-17/REQUIRED #8
+/// resolution, done post-GGUF-load rather than in `mod.rs`).
+pub(crate) fn validated<T>(result: Result<T, String>) -> anyhow::Result<T> {
+    result.map_err(|e| anyhow::anyhow!(e))
+}
+
+/// [`validated`] for an optional value: `None` stays `None`, `Some(v)` is run
+/// through `validate`. `mod.rs` uses this on every CLI-or-`--config` value
+/// that is resolved *before* the model is loaded (the final default, when it
+/// depends on the GGUF, is applied later), so a `[sampling].temperature =
+/// -5.0` is refused up front, naming the field, exactly like `--temperature
+/// -5` — never after an expensive model resolution (cli-12 / cli-04).
+pub(crate) fn validated_opt<T>(
+    value: Option<T>,
+    validate: impl FnOnce(T) -> Result<T, String>,
+) -> anyhow::Result<Option<T>> {
+    value.map(validate).transpose().map_err(anyhow::Error::msg)
+}
+
+/// Look up and parse a `bool`-valued key (`true`/`false`).
+pub(crate) fn toml_bool(sections: &RawTomlSections, section: &str, key: &str) -> Option<bool> {
+    sections.get(section)?.get(key)?.parse().ok()
+}
+
+/// Crate-wide serialization for unit tests that mutate process environment
+/// variables (ENGINE-SEAM addendum (3)): every such test in this binary —
+/// `cmd_serve`'s, `pull`'s, … — holds [`lock`](test_env::lock) for its whole
+/// body and restores what it changed through an [`EnvVarGuard`](test_env::EnvVarGuard),
+/// so no two tests ever race on the same variable, and a panicking test still
+/// puts the environment back (the guard's `Drop` runs during unwinding while
+/// the lock is still held).
+#[cfg(test)]
+pub(crate) mod test_env {
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Take the process-wide environment lock (poison-tolerant: a failed test
+    /// must not cascade into every later one).
+    pub(crate) fn lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Sets (or removes) one variable and restores its prior value on drop.
+    /// Declare it AFTER the lock guard so it drops first.
+    pub(crate) struct EnvVarGuard {
+        key: &'static str,
+        prior: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        pub(crate) fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prior = std::env::var_os(key);
+            // SAFETY (test-only): every caller holds `lock()`, so no other
+            // test thread reads or writes the environment concurrently.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prior }
+        }
+
+        pub(crate) fn remove(key: &'static str) -> Self {
+            let prior = std::env::var_os(key);
+            // SAFETY (test-only): see `set`.
+            unsafe { std::env::remove_var(key) };
+            Self { key, prior }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY (test-only): still under the caller's `lock()` guard.
+            match self.prior.take() {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
 }
 
 // ── Generic "flag > config > hardcoded default" resolvers (cli-04) ──────
@@ -788,6 +975,60 @@ pub(crate) fn resolve_u16(
 ) -> u16 {
     cli.or_else(|| toml_u16(sections, section, key))
         .unwrap_or(default)
+}
+
+/// Resolve `--backend`/`[model].backend` (wave-4b ENGINE-SEAM addendum):
+/// an explicit flag always wins (already parsed and validated by clap's own
+/// `value_parser`, so `cli` arriving `Some` is already a valid [`Backend`]);
+/// otherwise a `[model].backend` TOML string is parsed and validated here
+/// (config-file values never go through clap's `value_parser`, so cli-04's
+/// "every source is checked identically" contract applies just as it does
+/// for the numeric sampling flags); otherwise [`Backend::default`] (`Auto`).
+///
+/// # Errors
+///
+/// Returns an error naming the bad value when `[model].backend` is present
+/// but is not one of `auto`/`cpu`/`metal`.
+pub(crate) fn resolve_backend(
+    cli: Option<oxibonsai_runtime::engine_seam::Backend>,
+    sections: &RawTomlSections,
+    section: &str,
+    key: &str,
+) -> anyhow::Result<oxibonsai_runtime::engine_seam::Backend> {
+    if let Some(b) = cli {
+        return Ok(b);
+    }
+    match toml_str(sections, section, key) {
+        Some(s) => oxibonsai_runtime::engine_seam::Backend::parse(&s).ok_or_else(|| {
+            anyhow::anyhow!("invalid [{section}].{key} value '{s}': expected auto, cpu, or metal")
+        }),
+        None => Ok(oxibonsai_runtime::engine_seam::Backend::default()),
+    }
+}
+
+/// Resolve `--rope-scaling`/`[model].rope_scaling` (wave-4b orchestrator
+/// addendum; see [`oxibonsai_runtime::config::RopeScalingMode`]). Same
+/// "flag > config-string > default" precedence as [`resolve_backend`].
+///
+/// # Errors
+///
+/// Returns an error naming the bad value when `[model].rope_scaling` is
+/// present but is not one of `auto`/`on`/`off`.
+pub(crate) fn resolve_rope_scaling(
+    cli: Option<oxibonsai_runtime::config::RopeScalingMode>,
+    sections: &RawTomlSections,
+    section: &str,
+    key: &str,
+) -> anyhow::Result<oxibonsai_runtime::config::RopeScalingMode> {
+    if let Some(m) = cli {
+        return Ok(m);
+    }
+    match toml_str(sections, section, key) {
+        Some(s) => s
+            .parse::<oxibonsai_runtime::config::RopeScalingMode>()
+            .map_err(|e| anyhow::anyhow!("invalid [{section}].{key} value: {e}")),
+        None => Ok(oxibonsai_runtime::config::RopeScalingMode::default()),
+    }
 }
 
 /// Strip a single layer of matching `"`/`'` quotes from a raw TOML string
@@ -1128,423 +1369,24 @@ pub(crate) fn parse_quantize_format(
         "q4_k" => Ok(ExportFormat::Q4K),
         "q5_k" => Ok(ExportFormat::Q5K),
         "q6_k" => Ok(ExportFormat::Q6K),
+        // Wave-3.5 deviation routing: FIX3-GGUF-WRITE's `encode_quantized_tensor`
+        // already handles `TensorType::{Q2_K,Q3_K,Q8_K}` (the actual writer
+        // support); these three string arms plus `ExportFormat::{Q2K,Q3K,Q8K}`
+        // (`crates/oxibonsai-model/src/export.rs`, also owned by this
+        // package) are the CLI-side wiring that was left unwired end-to-end.
+        "q2_k" => Ok(ExportFormat::Q2K),
+        "q3_k" => Ok(ExportFormat::Q3K),
+        "q8_k" => Ok(ExportFormat::Q8K),
         other => anyhow::bail!(
             "unsupported quantization format '{other}' — the export pipeline can only \
              produce a loadable GGUF file for: f32, q1_0, tq2_0_g128, fp8_e4m3, fp8_e5m2, \
-             q4_0, q8_0, q4_k, q5_k, q6_k (q2_k, q4_1, f16 output are not supported by the \
-             export pipeline; q2_k/q4_1 have no writer, and f16 has no `ExportFormat` \
-             arm — use f32 or a supported quantized format instead)"
+             q4_0, q8_0, q2_k, q3_k, q4_k, q5_k, q6_k, q8_k (q4_1, f16 output are not \
+             supported by the export pipeline; q4_1 has no writer, and f16 has no \
+             `ExportFormat` arm — use f32 or a supported quantized format instead)"
         ),
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        missing_tokenizer_warning, parse_flat_toml_sections, read_prompt_stdin,
-        reject_penalties_with_constrained_decode, resolve_f32, resolve_str, resolve_tokenizer,
-        resolve_usize, strip_quant_suffix, tokenizer_candidates, toml_f32, toml_str, toml_usize,
-        RawTomlSections,
-    };
-    use std::fs;
-    use std::path::PathBuf;
-    use tempfile::TempDir;
-
-    /// Helper: write an empty `tokenizer.json` at the given path, creating
-    /// any missing parent directories.
-    fn touch_tokenizer(path: &std::path::Path) {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).expect("create_dir_all");
-        }
-        fs::write(path, b"{}").expect("write tokenizer.json");
-    }
-
-    #[test]
-    fn resolve_tokenizer_finds_in_same_dir() {
-        let tmp = TempDir::new().expect("tempdir");
-        let model_dir = tmp.path().join("models");
-        fs::create_dir_all(&model_dir).expect("create model_dir");
-        let model_path = model_dir.join("Foo-Q2_0.gguf");
-        fs::write(&model_path, b"").expect("touch model");
-        touch_tokenizer(&model_dir.join("tokenizer.json"));
-
-        let lookup = resolve_tokenizer(None, model_path.to_str().expect("utf8"));
-        let found = lookup.found.as_deref().expect("expected to find tokenizer");
-        assert_eq!(
-            PathBuf::from(found),
-            model_dir.join("tokenizer.json"),
-            "should locate tokenizer in the same dir as the model"
-        );
-    }
-
-    #[test]
-    fn resolve_tokenizer_finds_in_parent_dir() {
-        let tmp = TempDir::new().expect("tempdir");
-        let model_dir = tmp.path().join("models").join("variant");
-        fs::create_dir_all(&model_dir).expect("create model_dir");
-        let model_path = model_dir.join("Foo-Q2_0.gguf");
-        fs::write(&model_path, b"").expect("touch model");
-        // Place tokenizer in the parent directory only.
-        let parent_tokenizer = tmp.path().join("models").join("tokenizer.json");
-        touch_tokenizer(&parent_tokenizer);
-
-        let lookup = resolve_tokenizer(None, model_path.to_str().expect("utf8"));
-        let found = lookup.found.as_deref().expect("expected to find tokenizer");
-        // Either the literal `..` candidate or the canonicalized `models/tokenizer.json`
-        // candidate is acceptable; both refer to the same file.
-        let found_path = PathBuf::from(found);
-        let canon_found = fs::canonicalize(&found_path).expect("canonicalize found");
-        let canon_target = fs::canonicalize(&parent_tokenizer).expect("canonicalize target");
-        assert_eq!(
-            canon_found, canon_target,
-            "should locate tokenizer in the model's parent directory"
-        );
-    }
-
-    #[test]
-    fn resolve_tokenizer_finds_via_unpacked_sibling() {
-        let tmp = TempDir::new().expect("tempdir");
-        let model_dir = tmp.path().join("models");
-        fs::create_dir_all(&model_dir).expect("create model_dir");
-        let model_path = model_dir.join("Ternary-Bonsai-8B-Q2_0.gguf");
-        fs::write(&model_path, b"").expect("touch model");
-        // Tokenizer only lives in the sibling unpacked directory.
-        let unpacked = model_dir.join("Ternary-Bonsai-8B-unpacked");
-        touch_tokenizer(&unpacked.join("tokenizer.json"));
-
-        let lookup = resolve_tokenizer(None, model_path.to_str().expect("utf8"));
-        let found = lookup.found.as_deref().expect("expected to find tokenizer");
-        assert_eq!(
-            PathBuf::from(found),
-            unpacked.join("tokenizer.json"),
-            "should locate tokenizer via <base>-unpacked sibling directory"
-        );
-    }
-
-    #[test]
-    fn resolve_tokenizer_strips_quant_suffix_for_sibling_lookup() {
-        // Verifies the candidate list (without filesystem) for the
-        // `Foo-Q2_0.gguf` case includes Foo/, Foo-unpacked/, Foo-ONNX/.
-        let model_path = PathBuf::from("models/Foo-Q2_0.gguf");
-        let candidates = tokenizer_candidates(&model_path);
-        let candidate_strs: Vec<String> = candidates
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-
-        let expected = [
-            "models/Foo/tokenizer.json",
-            "models/Foo-unpacked/tokenizer.json",
-            "models/Foo-ONNX/tokenizer.json",
-        ];
-        for needle in expected {
-            assert!(
-                candidate_strs.iter().any(|c| c == needle),
-                "missing expected candidate {needle}; got {candidate_strs:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn resolve_tokenizer_records_searched_paths_when_missing() {
-        let tmp = TempDir::new().expect("tempdir");
-        let model_dir = tmp.path().join("models");
-        fs::create_dir_all(&model_dir).expect("create model_dir");
-        let model_path = model_dir.join("Ternary-Bonsai-8B-Q2_0.gguf");
-        fs::write(&model_path, b"").expect("touch model");
-
-        let lookup = resolve_tokenizer(None, model_path.to_str().expect("utf8"));
-        assert!(
-            lookup.found.is_none(),
-            "should not find tokenizer in empty tree"
-        );
-        assert!(
-            !lookup.searched.is_empty(),
-            "searched list must be populated when nothing is found"
-        );
-        // Confirm at least the "same dir" candidate is recorded.
-        assert!(
-            lookup
-                .searched
-                .iter()
-                .any(|p| p == &model_dir.join("tokenizer.json")),
-            "searched list should include the same-directory candidate"
-        );
-        // Warning text must mention every searched path and both remedies.
-        let warning = missing_tokenizer_warning(&lookup.searched);
-        for path in &lookup.searched {
-            assert!(
-                warning.contains(&path.display().to_string()),
-                "warning should list {}, got: {warning}",
-                path.display()
-            );
-        }
-        assert!(
-            warning.contains("--tokenizer"),
-            "warning must mention --tokenizer remedy"
-        );
-        assert!(
-            warning.contains("download_tokenizer.sh"),
-            "warning must mention download_tokenizer.sh remedy"
-        );
-    }
-
-    #[test]
-    fn resolve_tokenizer_explicit_override_skips_search() {
-        let lookup = resolve_tokenizer(Some("/custom/path/tokenizer.json"), "models/foo.gguf");
-        assert_eq!(
-            lookup.found.as_deref(),
-            Some("/custom/path/tokenizer.json"),
-            "explicit override must be returned verbatim"
-        );
-        assert!(
-            lookup.searched.is_empty(),
-            "explicit override must not trigger a filesystem search"
-        );
-    }
-
-    #[test]
-    fn strip_quant_suffix_handles_known_formats() {
-        assert_eq!(
-            strip_quant_suffix("Ternary-Bonsai-8B-Q2_0"),
-            "Ternary-Bonsai-8B"
-        );
-        assert_eq!(strip_quant_suffix("Foo-Q1_0"), "Foo");
-        assert_eq!(strip_quant_suffix("Foo-Q4_K_M"), "Foo");
-        assert_eq!(strip_quant_suffix("Foo-Q8_0"), "Foo");
-        assert_eq!(strip_quant_suffix("Foo-F16"), "Foo");
-        assert_eq!(strip_quant_suffix("Foo-BF16"), "Foo");
-        assert_eq!(strip_quant_suffix("Foo-F32"), "Foo");
-        // Non-quant suffix should be left alone.
-        assert_eq!(strip_quant_suffix("Foo-bar"), "Foo-bar");
-        assert_eq!(strip_quant_suffix("Foo"), "Foo");
-    }
-
-    #[test]
-    fn tokenizer_candidates_includes_top_level_models_dir() {
-        let model_path = PathBuf::from("models/sub/dir/Foo-Q2_0.gguf");
-        let candidates = tokenizer_candidates(&model_path);
-        let candidate_strs: Vec<String> = candidates
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        assert!(
-            candidate_strs.iter().any(|c| c == "models/tokenizer.json"),
-            "expected top-level models/tokenizer.json candidate, got {candidate_strs:?}"
-        );
-    }
-
-    // ── read_prompt_stdin (cli-M4) ──────────────────────────────────────
-
-    #[test]
-    fn read_prompt_stdin_rejects_empty_input_type_check() {
-        // A full stdin-redirection test belongs in an integration test
-        // (tests/cli_surface_tests.rs); this just locks in the new
-        // `Result` signature so callers must handle the error instead of
-        // getting a silently-possibly-truncated `String` back.
-        fn assert_is_result(_: fn() -> anyhow::Result<String>) {}
-        assert_is_result(read_prompt_stdin);
-    }
-
-    // ── config raw-TOML scanner (cli-04) ────────────────────────────────
-
-    #[test]
-    fn parse_flat_toml_sections_accepts_well_formed_config() {
-        let toml = r#"
-            [server]
-            host = "0.0.0.0"
-            port = 9090
-
-            [sampling]
-            temperature = 0.5
-            top_k = 20
-            top_p = 0.95
-            repetition_penalty = 1.05
-            max_tokens = 256
-
-            [model]
-            model_path = "models/foo.gguf"
-            tokenizer_path = "models/tokenizer.json"
-            max_seq_len = 8192
-
-            [observability]
-            log_level = "debug"
-            json_logs = true
-        "#;
-        let sections = parse_flat_toml_sections(toml, std::path::Path::new("test.toml"))
-            .expect("well-formed config must be accepted");
-        assert_eq!(
-            toml_str(&sections, "server", "host").as_deref(),
-            Some("0.0.0.0")
-        );
-        assert_eq!(toml_usize(&sections, "server", "port"), Some(9090));
-        assert_eq!(toml_f32(&sections, "sampling", "temperature"), Some(0.5));
-        assert_eq!(
-            toml_f32(&sections, "sampling", "repetition_penalty"),
-            Some(1.05)
-        );
-        assert_eq!(
-            toml_str(&sections, "model", "model_path").as_deref(),
-            Some("models/foo.gguf")
-        );
-        assert_eq!(
-            toml_str(&sections, "observability", "log_level").as_deref(),
-            Some("debug")
-        );
-    }
-
-    #[test]
-    fn parse_flat_toml_sections_rejects_typo_d_key() {
-        let toml = "[sampling]\ntemperture = 0.5\n";
-        let result = parse_flat_toml_sections(toml, std::path::Path::new("test.toml"));
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("temperture"),
-            "error should name the bad key: {msg}"
-        );
-    }
-
-    #[test]
-    fn parse_flat_toml_sections_rejects_unknown_section() {
-        let toml = "[imagen]\ndit_path = \"x\"\n";
-        let result = parse_flat_toml_sections(toml, std::path::Path::new("test.toml"));
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("imagen"),
-            "error should name the bad section: {msg}"
-        );
-    }
-
-    #[test]
-    fn parse_flat_toml_sections_ignores_comments_and_blank_lines() {
-        let toml =
-            "# a comment\n\n[server]\n# host is bound here\nhost = \"127.0.0.1\" # trailing\n";
-        let sections = parse_flat_toml_sections(toml, std::path::Path::new("test.toml"))
-            .expect("comments must not break parsing");
-        assert_eq!(
-            toml_str(&sections, "server", "host").as_deref(),
-            Some("127.0.0.1")
-        );
-    }
-
-    #[test]
-    fn parse_flat_toml_sections_does_not_false_positive_on_hash_in_string() {
-        let toml = "[observability]\nlog_level = \"info#not-a-comment\"\n";
-        let sections = parse_flat_toml_sections(toml, std::path::Path::new("test.toml"))
-            .expect("a '#' inside a quoted string must not be treated as a comment");
-        assert_eq!(
-            toml_str(&sections, "observability", "log_level").as_deref(),
-            Some("info#not-a-comment")
-        );
-    }
-
-    #[test]
-    fn parse_flat_toml_sections_absent_key_returns_none_not_a_default() {
-        // The whole point of this scanner (vs. the typed, `#[serde(default)]`
-        // struct): a key that was never in the file must read back as
-        // `None`, not silently produce that struct's own built-in default.
-        let toml = "[sampling]\ntemperature = 0.5\n";
-        let sections = parse_flat_toml_sections(toml, std::path::Path::new("test.toml"))
-            .expect("valid config");
-        assert_eq!(toml_f32(&sections, "sampling", "repetition_penalty"), None);
-    }
-
-    // ── resolve_* precedence (cli-04 / orchestrator P0 addendum) ────────
-
-    #[test]
-    fn resolve_f32_prefers_explicit_cli_value_over_config() {
-        let mut sections = RawTomlSections::new();
-        sections
-            .entry("sampling".to_string())
-            .or_default()
-            .insert("repetition_penalty".to_string(), "1.4".to_string());
-        let resolved = resolve_f32(Some(2.0), &sections, "sampling", "repetition_penalty", 1.0);
-        assert_eq!(resolved, 2.0, "an explicit CLI flag must win over --config");
-    }
-
-    #[test]
-    fn resolve_f32_falls_back_to_config_value() {
-        let mut sections = RawTomlSections::new();
-        sections
-            .entry("sampling".to_string())
-            .or_default()
-            .insert("temperature".to_string(), "0.3".to_string());
-        let resolved = resolve_f32(None, &sections, "sampling", "temperature", 0.7);
-        assert_eq!(resolved, 0.3);
-    }
-
-    #[test]
-    fn resolve_f32_repetition_penalty_never_silently_becomes_1_1() {
-        // The whole point of routing repetition_penalty through the raw
-        // scanner instead of `SamplingConfig::default()` (which is 1.1):
-        // an empty (or unrelated) config must resolve to the CLI's own
-        // safe default (1.0), never that struct's built-in value.
-        let sections = RawTomlSections::new();
-        let resolved = resolve_f32(None, &sections, "sampling", "repetition_penalty", 1.0);
-        assert_eq!(resolved, 1.0);
-    }
-
-    #[test]
-    fn resolve_usize_and_str_use_hardcoded_default_with_no_config() {
-        let sections = RawTomlSections::new();
-        assert_eq!(
-            resolve_usize(None, &sections, "sampling", "max_tokens", 256),
-            256
-        );
-        assert_eq!(resolve_str(None, &sections, "model", "model_path"), None);
-    }
-
-    // ── reject_penalties_with_constrained_decode (the --stop/--grammar +
-    // penalty silent-drop finding) ───────────────────────────────────────
-
-    #[test]
-    fn constrained_decode_with_default_penalties_is_allowed() {
-        reject_penalties_with_constrained_decode(true, 1.0, 0.0, 0.0)
-            .expect("all-default penalties never conflict with --grammar/--stop");
-    }
-
-    #[test]
-    fn non_constrained_decode_allows_any_penalty() {
-        // The fast path (`generate`/`generate_streaming_sync`) DOES apply
-        // penalties via `sample_with_history`, so outside a
-        // grammar/stop-checking loop every value is fine.
-        reject_penalties_with_constrained_decode(false, 1.4, 0.5, -0.5)
-            .expect("the fast path applies penalties; no combination is rejected");
-    }
-
-    #[test]
-    fn constrained_decode_rejects_non_default_repetition_penalty() {
-        let err = reject_penalties_with_constrained_decode(true, 1.2, 0.0, 0.0)
-            .expect_err("a non-default repetition penalty must be rejected");
-        let msg = err.to_string();
-        assert!(msg.contains("--repetition-penalty"), "got: {msg}");
-    }
-
-    #[test]
-    fn constrained_decode_rejects_non_default_frequency_penalty() {
-        let err = reject_penalties_with_constrained_decode(true, 1.0, 0.3, 0.0)
-            .expect_err("a non-default frequency penalty must be rejected");
-        let msg = err.to_string();
-        assert!(msg.contains("--frequency-penalty"), "got: {msg}");
-    }
-
-    #[test]
-    fn constrained_decode_rejects_non_default_presence_penalty() {
-        let err = reject_penalties_with_constrained_decode(true, 1.0, 0.0, 0.3)
-            .expect_err("a non-default presence penalty must be rejected");
-        let msg = err.to_string();
-        assert!(msg.contains("--presence-penalty"), "got: {msg}");
-    }
-
-    #[test]
-    fn constrained_decode_rejection_names_every_offending_flag() {
-        let err = reject_penalties_with_constrained_decode(true, 1.5, 0.2, 0.1)
-            .expect_err("all three penalties are non-default");
-        let msg = err.to_string();
-        assert!(msg.contains("--repetition-penalty"), "got: {msg}");
-        assert!(msg.contains("--frequency-penalty"), "got: {msg}");
-        assert!(msg.contains("--presence-penalty"), "got: {msg}");
-    }
-}
+#[path = "util_tests.rs"]
+mod tests;

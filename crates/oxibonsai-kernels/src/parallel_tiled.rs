@@ -6,16 +6,30 @@
 //!
 //! Also provides an adaptive dispatcher that selects the best strategy
 //! (direct, parallel row, or parallel tiled) based on matrix dimensions.
+//!
+//! ## The opt-in INT8 tier (K-14)
+//!
+//! Every public entry point here — the adaptive drivers the model's linear
+//! layers call (`gemv_adaptive` for `Q1_0_g128`, `gemv_adaptive_ternary` /
+//! `gemm_adaptive_ternary` for `TQ2_0_g128`) and the parallel-tiled
+//! strategies themselves — asks [`KernelDispatcher::native_int8_tier`]
+//! once, **before** any strategy is chosen, and hands the whole call to the
+//! matching [`crate::dispatch_int8`] kernel when `OXIBONSAI_KERNEL_TIER`
+//! selects one. Those kernels quantize the activation once and parallelize
+//! themselves, so they must not be re-entered per tile. When no INT8 tier
+//! is selected — the default — the strategy runs exactly as before, its
+//! tiles calling the dispatcher's `*_on_tier` methods (the 1-bit GEMM's
+//! small-batch fallback calls the register-blocked CPU GEMM instead), none
+//! of which re-read the environment.
 
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 
 use crate::dispatch::KernelDispatcher;
+use crate::dispatch_int8;
 use crate::error::{KernelError, KernelResult};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::tiled::{optimal_tile_rows, L2_TILE_ROWS};
-use crate::traits::OneBitKernel;
-use crate::traits::TernaryKernel;
 use crate::tuning::{PlatformProfile, TunedThresholds};
 use oxibonsai_core::tensor::{BlockQ1_0G128, QK1_0_G128};
 use oxibonsai_core::{BlockTQ2_0_g128, QK_TQ2_0_G128};
@@ -146,15 +160,53 @@ fn validate_gemm(
 
 // ─── Parallel tiled kernels ────────────────────────────────────────────
 
+/// Sequential L1-tiled 1-bit GEMV: the same [`crate::tiled::L1_TILE_ROWS`]
+/// tiling as [`crate::tiled::gemv_tiled`], but each tile calls the
+/// dispatcher's own tier directly instead of re-entering
+/// `OneBitKernel::gemv` (the INT8 check already happened at the entry
+/// point, so no tile re-reads the environment). Used as the
+/// below-threshold and WASM fallback for [`gemv_parallel_tiled`].
+fn gemv_tiled_1bit_seq(
+    dispatcher: &KernelDispatcher,
+    blocks: &[BlockQ1_0G128],
+    input: &[f32],
+    output: &mut [f32],
+    n_rows: usize,
+    k: usize,
+    blocks_per_row: usize,
+) -> KernelResult<()> {
+    let mut row_start = 0;
+    while row_start < n_rows {
+        let tile_rows = (n_rows - row_start).min(crate::tiled::L1_TILE_ROWS);
+        let block_start = row_start * blocks_per_row;
+        let block_end = (row_start + tile_rows) * blocks_per_row;
+
+        dispatcher.gemv_1bit_on_tier(
+            &blocks[block_start..block_end],
+            input,
+            &mut output[row_start..row_start + tile_rows],
+            tile_rows,
+            k,
+        )?;
+
+        row_start += tile_rows;
+    }
+    Ok(())
+}
+
 /// Parallel tiled GEMV: distribute L2 tiles across threads.
 ///
 /// Each thread receives an L2-sized chunk of output rows and processes it
 /// using L1 tiling internally. For problems below the platform-tuned
 /// `par_tiled_min_rows` threshold, falls back to sequential tiled execution
-/// via [`crate::tiled::gemv_tiled`].
+/// (the same L1 tiling as [`crate::tiled::gemv_tiled`], on the
+/// dispatcher's own tier).
 ///
 /// The L1 tile size is dynamically computed via [`optimal_tile_rows`] to
 /// account for the actual working set size at the given `k`.
+///
+/// Runs on the opt-in INT8 tier instead when
+/// [`KernelDispatcher::native_int8_tier`] selects one (see the module doc).
 pub fn gemv_parallel_tiled(
     dispatcher: &KernelDispatcher,
     blocks: &[BlockQ1_0G128],
@@ -163,20 +215,33 @@ pub fn gemv_parallel_tiled(
     n_rows: usize,
     k: usize,
 ) -> KernelResult<()> {
-    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(tier) = dispatcher.native_int8_tier() {
+        return dispatch_int8::gemv_1bit_g128_int8(tier, blocks, input, output, n_rows, k);
+    }
+    gemv_parallel_tiled_on_tier(dispatcher, blocks, input, output, n_rows, k)
+}
+
+/// [`gemv_parallel_tiled`] on the dispatcher's own tier, without the INT8
+/// entry check.
+fn gemv_parallel_tiled_on_tier(
+    dispatcher: &KernelDispatcher,
+    blocks: &[BlockQ1_0G128],
+    input: &[f32],
+    output: &mut [f32],
+    n_rows: usize,
+    k: usize,
+) -> KernelResult<()> {
     let blocks_per_row = validate_gemv(blocks, input, output, n_rows, k)?;
-    #[cfg(target_arch = "wasm32")]
-    let _blocks_per_row = validate_gemv(blocks, input, output, n_rows, k)?;
 
     // Sequential fallback for small row counts (platform-tuned threshold).
     if n_rows < PlatformProfile::global_thresholds().par_tiled_min_rows {
-        return crate::tiled::gemv_tiled(dispatcher, blocks, input, output, n_rows, k);
+        return gemv_tiled_1bit_seq(dispatcher, blocks, input, output, n_rows, k, blocks_per_row);
     }
 
     // On WASM: no rayon threads available — fall back to sequential tiled.
     #[cfg(target_arch = "wasm32")]
     {
-        crate::tiled::gemv_tiled(dispatcher, blocks, input, output, n_rows, k)
+        gemv_tiled_1bit_seq(dispatcher, blocks, input, output, n_rows, k, blocks_per_row)
     }
 
     // Compute optimal L1 tile size for this k
@@ -203,7 +268,7 @@ pub fn gemv_parallel_tiled(
                     let l1_block_start = l1_start * blocks_per_row;
                     let l1_block_end = (l1_start + l1_rows) * blocks_per_row;
 
-                    dispatcher.gemv(
+                    dispatcher.gemv_1bit_on_tier(
                         &tile_blocks[l1_block_start..l1_block_end],
                         input,
                         &mut out_chunk[l1_start..l1_start + l1_rows],
@@ -227,7 +292,27 @@ pub fn gemv_parallel_tiled(
 /// L1 tiling on the weight rows within each parallel task. For small
 /// batches (below the platform-tuned `par_gemm_min_batch` threshold),
 /// falls back to sequential tiled.
+///
+/// Runs on the opt-in INT8 tier instead when
+/// [`KernelDispatcher::native_int8_tier`] selects one (see the module doc).
 pub fn gemm_parallel_tiled(
+    dispatcher: &KernelDispatcher,
+    blocks: &[BlockQ1_0G128],
+    input: &[f32],
+    output: &mut [f32],
+    m: usize,
+    n_rows: usize,
+    k: usize,
+) -> KernelResult<()> {
+    if let Some(tier) = dispatcher.native_int8_tier() {
+        return dispatch_int8::gemm_1bit_g128_int8(tier, blocks, input, output, m, n_rows, k);
+    }
+    gemm_parallel_tiled_on_tier(dispatcher, blocks, input, output, m, n_rows, k)
+}
+
+/// [`gemm_parallel_tiled`] on the dispatcher's own tier, without the INT8
+/// entry check.
+fn gemm_parallel_tiled_on_tier(
     dispatcher: &KernelDispatcher,
     blocks: &[BlockQ1_0G128],
     input: &[f32],
@@ -272,7 +357,7 @@ pub fn gemm_parallel_tiled(
                     let block_start = row_start * blocks_per_row;
                     let block_end = (row_start + tile_rows) * blocks_per_row;
 
-                    dispatcher.gemm(
+                    dispatcher.gemm_1bit_on_tier(
                         &blocks[block_start..block_end],
                         &input[input_offset..input_offset + k],
                         &mut out_row[row_start..row_start + tile_rows],
@@ -321,12 +406,11 @@ const TERNARY_TILE_MIN_ROWS: usize = 128;
 ///
 /// Mirrors [`crate::tiled::optimal_tile_rows`]'s L1-budget formula but with
 /// the ternary block's actual size substituted for the 1-bit format's 18
-/// bytes that function hardcodes — `crate::tiled` is not among this
-/// package's owned files, so its constant cannot be parameterized in place,
-/// and reusing it as-is would under-count a ternary row's footprint by
-/// roughly 2x, picking tiles nearly twice as large as actually fit L1. The
-/// lower clamp is [`TERNARY_TILE_MIN_ROWS`], not the 1-bit path's `4` — see
-/// its doc comment for the measurement that motivated raising it.
+/// bytes that function hardcodes — reusing it as-is would under-count a
+/// ternary row's footprint by roughly 2x, picking tiles nearly twice as
+/// large as actually fit L1. The lower clamp is `TERNARY_TILE_MIN_ROWS`,
+/// not the 1-bit path's `4` — see its doc comment for the measurement that
+/// motivated raising it.
 ///
 /// `pub` (like [`crate::tiled::optimal_tile_rows`]) rather than
 /// WASM-cfg-gated: the computation is plain arithmetic with no Rayon/thread
@@ -346,9 +430,9 @@ pub fn optimal_tile_rows_ternary(k: usize) -> usize {
 }
 
 /// Sequential L1-tiled ternary GEMV: the ternary counterpart of
-/// [`crate::tiled::gemv_tiled`] (not added there because `tiled.rs` is not
-/// among this package's owned files). Used as the below-threshold and WASM
-/// fallback for [`gemv_parallel_tiled_ternary`].
+/// [`crate::tiled::gemv_tiled`], calling the dispatcher's own tier (the
+/// INT8 check already happened at the entry point). Used as the
+/// below-threshold and WASM fallback for [`gemv_parallel_tiled_ternary`].
 fn gemv_tiled_ternary_seq(
     dispatcher: &KernelDispatcher,
     blocks: &[BlockTQ2_0_g128],
@@ -364,7 +448,7 @@ fn gemv_tiled_ternary_seq(
         let block_start = row_start * blocks_per_row;
         let block_end = (row_start + tile_rows) * blocks_per_row;
 
-        dispatcher.gemv_ternary_g128(
+        dispatcher.gemv_ternary_on_tier(
             &blocks[block_start..block_end],
             input,
             &mut output[row_start..row_start + tile_rows],
@@ -388,7 +472,26 @@ fn gemv_tiled_ternary_seq(
 /// 248,320-row Bonsai 2 LM head) was computed and then silently discarded.
 /// This mirrors [`gemv_parallel_tiled`]'s structure exactly, parameterized
 /// for the ternary block type/size instead of the 1-bit format.
+///
+/// Runs on the opt-in INT8 tier instead when
+/// [`KernelDispatcher::native_int8_tier`] selects one (see the module doc).
 pub fn gemv_parallel_tiled_ternary(
+    dispatcher: &KernelDispatcher,
+    blocks: &[BlockTQ2_0_g128],
+    input: &[f32],
+    output: &mut [f32],
+    n_rows: usize,
+    k: usize,
+) -> KernelResult<()> {
+    if let Some(tier) = dispatcher.native_int8_tier() {
+        return dispatch_int8::gemv_two_bit_int8(tier, blocks, input, output, n_rows, k);
+    }
+    gemv_parallel_tiled_ternary_on_tier(dispatcher, blocks, input, output, n_rows, k)
+}
+
+/// [`gemv_parallel_tiled_ternary`] on the dispatcher's own tier, without
+/// the INT8 entry check.
+fn gemv_parallel_tiled_ternary_on_tier(
     dispatcher: &KernelDispatcher,
     blocks: &[BlockTQ2_0_g128],
     input: &[f32],
@@ -441,7 +544,7 @@ pub fn gemv_parallel_tiled_ternary(
                     let l1_block_start = l1_start * blocks_per_row;
                     let l1_block_end = (l1_start + l1_rows) * blocks_per_row;
 
-                    dispatcher.gemv_ternary_g128(
+                    dispatcher.gemv_ternary_on_tier(
                         &tile_blocks[l1_block_start..l1_block_end],
                         input,
                         &mut out_chunk[l1_start..l1_start + l1_rows],
@@ -510,6 +613,10 @@ pub fn select_gemv_strategy_with_thresholds(
 /// - **Medium** (`par_gemv_min_rows..par_tiled_min_rows`): parallel row-wise
 ///   via [`crate::parallel::gemv_1bit_g128_par`].
 /// - **Large** (>= `par_tiled_min_rows`): parallel tiled via [`gemv_parallel_tiled`].
+///
+/// Before any strategy is chosen, the opt-in INT8 tier takes the whole call
+/// when [`KernelDispatcher::native_int8_tier`] selects one (see the module
+/// doc). This is `Linear1Bit::forward_vec`'s decode path.
 pub fn gemv_adaptive(
     dispatcher: &KernelDispatcher,
     blocks: &[BlockQ1_0G128],
@@ -518,13 +625,16 @@ pub fn gemv_adaptive(
     n_rows: usize,
     k: usize,
 ) -> KernelResult<()> {
+    if let Some(tier) = dispatcher.native_int8_tier() {
+        return dispatch_int8::gemv_1bit_g128_int8(tier, blocks, input, output, n_rows, k);
+    }
     match select_gemv_strategy(n_rows, k) {
-        AdaptiveStrategy::Direct => dispatcher.gemv(blocks, input, output, n_rows, k),
-        AdaptiveStrategy::ParallelRow => {
-            crate::parallel::gemv_1bit_g128_par(dispatcher, blocks, input, output, n_rows, k)
-        }
+        AdaptiveStrategy::Direct => dispatcher.gemv_1bit_on_tier(blocks, input, output, n_rows, k),
+        AdaptiveStrategy::ParallelRow => crate::parallel::gemv_1bit_g128_par_on_tier(
+            dispatcher, blocks, input, output, n_rows, k,
+        ),
         AdaptiveStrategy::ParallelTiled => {
-            gemv_parallel_tiled(dispatcher, blocks, input, output, n_rows, k)
+            gemv_parallel_tiled_on_tier(dispatcher, blocks, input, output, n_rows, k)
         }
     }
 }
@@ -536,6 +646,11 @@ pub fn gemv_adaptive(
 /// `ParallelRow` still uses [`crate::parallel::gemv_ternary_g128_par`],
 /// which K-16 already changed from one Rayon task per row to a
 /// platform-tuned number of rows per task.
+///
+/// Before any strategy is chosen, the opt-in INT8 tier (the legacy
+/// `{-1, 0, +1, 0}` table, K-01) takes the whole call when
+/// [`KernelDispatcher::native_int8_tier`] selects one (see the module doc).
+/// This is `LinearTernary::forward`'s decode path.
 pub fn gemv_adaptive_ternary(
     dispatcher: &KernelDispatcher,
     blocks: &[BlockTQ2_0_g128],
@@ -544,30 +659,47 @@ pub fn gemv_adaptive_ternary(
     n_rows: usize,
     k: usize,
 ) -> KernelResult<()> {
+    if let Some(tier) = dispatcher.native_int8_tier() {
+        return dispatch_int8::gemv_two_bit_int8(tier, blocks, input, output, n_rows, k);
+    }
     match select_gemv_strategy(n_rows, k) {
-        AdaptiveStrategy::Direct => dispatcher.gemv_ternary_g128(blocks, input, output, n_rows, k),
-        AdaptiveStrategy::ParallelRow => {
-            crate::parallel::gemv_ternary_g128_par(dispatcher, blocks, input, output, n_rows, k)
+        AdaptiveStrategy::Direct => {
+            dispatcher.gemv_ternary_on_tier(blocks, input, output, n_rows, k)
         }
+        AdaptiveStrategy::ParallelRow => crate::parallel::gemv_ternary_g128_par_on_tier(
+            dispatcher, blocks, input, output, n_rows, k,
+        ),
         AdaptiveStrategy::ParallelTiled => {
-            gemv_parallel_tiled_ternary(dispatcher, blocks, input, output, n_rows, k)
+            gemv_parallel_tiled_ternary_on_tier(dispatcher, blocks, input, output, n_rows, k)
         }
     }
 }
 
+/// Adaptive ternary GEMM: the dispatcher's own GEMM below the platform-tuned
+/// `par_gemm_min_batch`, the batch-slab register-blocked
+/// [`crate::parallel::gemm_ternary_g128_par`] driver at or above it.
+///
+/// Before either is chosen, the opt-in INT8 tier takes the whole call when
+/// [`KernelDispatcher::native_int8_tier`] selects one (see the module doc).
+/// This is `LinearTernary::forward_batch`'s path.
 pub fn gemm_adaptive_ternary(
     dispatcher: &KernelDispatcher,
-    blocks: &[oxibonsai_core::BlockTQ2_0_g128],
+    blocks: &[BlockTQ2_0_g128],
     input: &[f32],
     output: &mut [f32],
     m: usize,
     n_rows: usize,
     k: usize,
 ) -> KernelResult<()> {
+    if let Some(tier) = dispatcher.native_int8_tier() {
+        return dispatch_int8::gemm_two_bit_int8(tier, blocks, input, output, m, n_rows, k);
+    }
     if m < PlatformProfile::global_thresholds().par_gemm_min_batch {
-        dispatcher.gemm_ternary_g128(blocks, input, output, m, n_rows, k)
+        dispatcher.gemm_ternary_on_tier(blocks, input, output, m, n_rows, k)
     } else {
-        crate::parallel::gemm_ternary_g128_par(dispatcher, blocks, input, output, m, n_rows, k)
+        crate::parallel::gemm_ternary_g128_par_on_tier(
+            dispatcher, blocks, input, output, m, n_rows, k,
+        )
     }
 }
 
@@ -629,6 +761,7 @@ impl ParallelConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::{OneBitKernel, TernaryKernel};
     use half::f16;
 
     /// Deterministic regression guard for the measured tile-floor fix
@@ -1241,5 +1374,228 @@ mod tests {
         // GEMM not block aligned
         let result = gemm_parallel_tiled(&dispatcher, &blocks, &input, &mut output, 1, 1, 100);
         assert!(result.is_err());
+    }
+
+    // ─── The opt-in INT8 tier at every native entry point ──────────────
+
+    /// Deterministic ternary blocks with every code (incl. the reserved
+    /// `0b11`) and varied scales.
+    fn int8_ternary_blocks(n: usize, seed: u32) -> Vec<BlockTQ2_0_g128> {
+        let mut state = seed | 1;
+        let mut next = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 19) as u8
+        };
+        (0..n)
+            .map(|_| {
+                let mut qs = [0u8; 32];
+                for b in &mut qs {
+                    *b = next();
+                }
+                BlockTQ2_0_g128 {
+                    qs,
+                    d: f16::from_f32(0.0625 + (next() % 16) as f32 / 256.0),
+                }
+            })
+            .collect()
+    }
+
+    fn int8_inputs(len: usize, seed: u32) -> Vec<f32> {
+        let mut state = seed | 1;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((state >> 8) as i32 % 2001 - 1000) as f32 / 512.0
+            })
+            .collect()
+    }
+
+    fn assert_bits(expect: &[f32], got: &[f32], what: &str) {
+        assert_eq!(expect.len(), got.len(), "{what}: length");
+        for (i, (e, g)) in expect.iter().zip(got.iter()).enumerate() {
+            assert_eq!(e.to_bits(), g.to_bits(), "{what}: element {i}: {e} vs {g}");
+        }
+    }
+
+    /// Every public native-format entry point in this file and in
+    /// `parallel.rs` hands the whole call to the INT8 kernel of the selected
+    /// tier when `OXIBONSAI_KERNEL_TIER` names one — bit-identical to calling
+    /// that kernel directly — and returns to the dispatcher's own f32 tier
+    /// once the variable is cleared.
+    #[test]
+    fn native_entry_points_route_to_the_selected_int8_tier() {
+        use crate::dispatch_int8::{
+            gemm_1bit_g128_int8, gemm_two_bit_int8, gemv_1bit_g128_int8, gemv_two_bit_int8,
+            Int8Tier, TierEnvGuard, KERNEL_TIER_ENV,
+        };
+
+        let _guard = TierEnvGuard::acquire();
+        let dispatcher = KernelDispatcher::with_tier(crate::dispatch::cpu_kernel_tier());
+        let (n_rows, k, m) = (300usize, 2 * QK_TQ2_0_G128, 3usize);
+        let tq2 = int8_ternary_blocks(n_rows * (k / QK_TQ2_0_G128), 0x71E1);
+        let (q1, _) = make_test_data(n_rows, k);
+        let gemv_in = int8_inputs(k, 0x71E2);
+        let gemm_in = int8_inputs(m * k, 0x71E3);
+        let tier = Int8Tier::best_available();
+
+        let mut ternary_gemv = vec![0.0f32; n_rows];
+        gemv_two_bit_int8(tier, &tq2, &gemv_in, &mut ternary_gemv, n_rows, k).expect("direct");
+        let mut ternary_gemm = vec![0.0f32; m * n_rows];
+        gemm_two_bit_int8(tier, &tq2, &gemm_in, &mut ternary_gemm, m, n_rows, k).expect("direct");
+        let mut one_bit_gemv = vec![0.0f32; n_rows];
+        gemv_1bit_g128_int8(tier, &q1, &gemv_in, &mut one_bit_gemv, n_rows, k).expect("direct");
+        let mut one_bit_gemm = vec![0.0f32; m * n_rows];
+        gemm_1bit_g128_int8(tier, &q1, &gemm_in, &mut one_bit_gemm, m, n_rows, k).expect("direct");
+
+        // Every entry point's `(name, output)` on dispatcher `d`, in the
+        // order of `expected` below; run once with the tier selected and
+        // once with the variable cleared.
+        let run_all = |d: &KernelDispatcher| -> Vec<(&'static str, Vec<f32>)> {
+            let mut outs = Vec::new();
+            let mut record =
+                |name: &'static str, f: &dyn Fn(&mut [f32]) -> KernelResult<()>, len: usize| {
+                    let mut out = vec![0.0f32; len];
+                    f(&mut out).unwrap_or_else(|e| panic!("{name}: {e}"));
+                    outs.push((name, out));
+                };
+            record(
+                "gemv_adaptive_ternary",
+                &|o| gemv_adaptive_ternary(d, &tq2, &gemv_in, o, n_rows, k),
+                n_rows,
+            );
+            record(
+                "gemv_parallel_tiled_ternary",
+                &|o| gemv_parallel_tiled_ternary(d, &tq2, &gemv_in, o, n_rows, k),
+                n_rows,
+            );
+            record(
+                "parallel::gemv_ternary_g128_par",
+                &|o| crate::parallel::gemv_ternary_g128_par(d, &tq2, &gemv_in, o, n_rows, k),
+                n_rows,
+            );
+            record(
+                "TernaryKernel::gemv_ternary_g128",
+                &|o| d.gemv_ternary_g128(&tq2, &gemv_in, o, n_rows, k),
+                n_rows,
+            );
+            record(
+                "gemm_adaptive_ternary",
+                &|o| gemm_adaptive_ternary(d, &tq2, &gemm_in, o, m, n_rows, k),
+                m * n_rows,
+            );
+            record(
+                "parallel::gemm_ternary_g128_par",
+                &|o| crate::parallel::gemm_ternary_g128_par(d, &tq2, &gemm_in, o, m, n_rows, k),
+                m * n_rows,
+            );
+            record(
+                "TernaryKernel::gemm_ternary_g128",
+                &|o| d.gemm_ternary_g128(&tq2, &gemm_in, o, m, n_rows, k),
+                m * n_rows,
+            );
+            record(
+                "gemv_adaptive",
+                &|o| gemv_adaptive(d, &q1, &gemv_in, o, n_rows, k),
+                n_rows,
+            );
+            record(
+                "gemv_parallel_tiled",
+                &|o| gemv_parallel_tiled(d, &q1, &gemv_in, o, n_rows, k),
+                n_rows,
+            );
+            record(
+                "parallel::gemv_1bit_g128_par",
+                &|o| crate::parallel::gemv_1bit_g128_par(d, &q1, &gemv_in, o, n_rows, k),
+                n_rows,
+            );
+            record(
+                "OneBitKernel::gemv",
+                &|o| d.gemv(&q1, &gemv_in, o, n_rows, k),
+                n_rows,
+            );
+            record(
+                "gemm_parallel_tiled",
+                &|o| gemm_parallel_tiled(d, &q1, &gemm_in, o, m, n_rows, k),
+                m * n_rows,
+            );
+            record(
+                "parallel::gemm_1bit_g128_par",
+                &|o| crate::parallel::gemm_1bit_g128_par(d, &q1, &gemm_in, o, m, n_rows, k),
+                m * n_rows,
+            );
+            record(
+                "OneBitKernel::gemm",
+                &|o| d.gemm(&q1, &gemm_in, o, m, n_rows, k),
+                m * n_rows,
+            );
+            outs
+        };
+        let expected: [&[f32]; 14] = [
+            &ternary_gemv,
+            &ternary_gemv,
+            &ternary_gemv,
+            &ternary_gemv,
+            &ternary_gemm,
+            &ternary_gemm,
+            &ternary_gemm,
+            &one_bit_gemv,
+            &one_bit_gemv,
+            &one_bit_gemv,
+            &one_bit_gemv,
+            &one_bit_gemm,
+            &one_bit_gemm,
+            &one_bit_gemm,
+        ];
+
+        // SAFETY: `_guard` holds the crate's env lock (see `TierEnvGuard`).
+        unsafe {
+            std::env::set_var(KERNEL_TIER_ENV, tier.name());
+        }
+        assert_eq!(dispatcher.native_int8_tier(), Some(tier));
+        let selected = run_all(&dispatcher);
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var(KERNEL_TIER_ENV);
+        }
+        assert_eq!(dispatcher.native_int8_tier(), None);
+        let cleared = run_all(&dispatcher);
+
+        assert_eq!(selected.len(), expected.len());
+        for ((name, sel), ((_, clr), exp)) in
+            selected.iter().zip(cleared.iter().zip(expected.iter()))
+        {
+            assert_bits(exp, sel, &format!("{name} with {KERNEL_TIER_ENV}={tier}"));
+            assert!(
+                sel.iter()
+                    .zip(clr.iter())
+                    .any(|(a, b)| a.to_bits() != b.to_bits()),
+                "{name}: clearing {KERNEL_TIER_ENV} did not return to the f32 path"
+            );
+        }
+    }
+
+    /// A `KernelTier::Gpu` dispatcher is never diverted, whatever the
+    /// variable says.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn a_gpu_tier_dispatcher_is_never_diverted() {
+        use crate::dispatch::KernelTier;
+        use crate::dispatch_int8::{Int8Tier, TierEnvGuard, KERNEL_TIER_ENV};
+
+        let _guard = TierEnvGuard::acquire();
+        let gpu = KernelDispatcher::with_tier(KernelTier::Gpu);
+        let (n_rows, k) = (64usize, 2 * QK_TQ2_0_G128);
+        let tq2 = int8_ternary_blocks(n_rows * (k / QK_TQ2_0_G128), 0x71E4);
+        let input = int8_inputs(k, 0x71E5);
+        let mut cleared = vec![0.0f32; n_rows];
+        gemv_adaptive_ternary(&gpu, &tq2, &input, &mut cleared, n_rows, k).expect("cleared");
+        // SAFETY: `_guard` holds the crate's env lock.
+        unsafe {
+            std::env::set_var(KERNEL_TIER_ENV, Int8Tier::best_available().name());
+        }
+        assert_eq!(gpu.native_int8_tier(), None);
+        let mut selected = vec![0.0f32; n_rows];
+        gemv_adaptive_ternary(&gpu, &tq2, &input, &mut selected, n_rows, k).expect("selected");
+        assert_bits(&cleared, &selected, "Gpu-tier gemv_adaptive_ternary");
     }
 }

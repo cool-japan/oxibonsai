@@ -14,15 +14,42 @@ use tower::ServiceExt;
 
 use oxibonsai_core::config::Qwen3Config;
 use oxibonsai_runtime::engine::InferenceEngine;
+use oxibonsai_runtime::engine_pool::EnginePool;
 use oxibonsai_runtime::metrics::InferenceMetrics;
 use oxibonsai_runtime::sampling::SamplingParams;
-use oxibonsai_runtime::server::{create_router, create_router_with_metrics};
+use oxibonsai_runtime::server::{create_router_full, RouterOptions};
+
+/// Qwen3's `<|im_start|>` id: the tokenizer-less routers below serve a
+/// `Qwen3Config::tiny_test()` engine (the Qwen3 vocabulary size) and run a
+/// text prompt as this single token.
+const QWEN3_IM_START: u32 = 151_644;
+
+/// A tokenizer-less router over `engine`, recording into `metrics`. Without
+/// a tokenizer a server needs a configured prompt start token to accept a
+/// text prompt at all, and the answer's text is empty (nothing to render
+/// it with) while `usage` and `logprobs` still count every generated token.
+fn tokenizerless_router_with_metrics(
+    engine: InferenceEngine<'static>,
+    metrics: Arc<InferenceMetrics>,
+) -> axum::Router {
+    create_router_full(
+        EnginePool::new(vec![engine]),
+        None,
+        metrics,
+        RouterOptions::default().with_prompt_start_token(QWEN3_IM_START),
+    )
+}
+
+/// [`tokenizerless_router_with_metrics`] with its own metrics.
+fn tokenizerless_router(engine: InferenceEngine<'static>) -> axum::Router {
+    tokenizerless_router_with_metrics(engine, Arc::new(InferenceMetrics::new()))
+}
 
 fn test_router() -> axum::Router {
     let config = Qwen3Config::tiny_test();
     let params = SamplingParams::default();
     let engine = InferenceEngine::new(config, params, 42);
-    create_router(engine, None)
+    tokenizerless_router(engine)
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -250,7 +277,7 @@ async fn multi_turn_conversation_via_api() {
 
 #[tokio::test]
 async fn default_max_tokens_applied() {
-    // SV-15(c) gate-fix triage (wave 3): `max_tokens` is `Option<usize>`
+    // SV-15(c): `max_tokens` is `Option<usize>`
     // now, so an omitted value deserializes to `None` -- the configured
     // default (256) is overlaid later, when resolving the effective
     // completion-length budget, not at deserialization time. Verify that
@@ -389,7 +416,7 @@ async fn metrics_track_request_count() {
 
     let initial_count = metrics.requests_total.get();
 
-    let app = create_router_with_metrics(engine, None, Arc::clone(&metrics));
+    let app = tokenizerless_router_with_metrics(engine, Arc::clone(&metrics));
 
     // Fire one chat completion request to increment the counter.
     let body = serde_json::json!({
@@ -418,7 +445,7 @@ async fn metrics_endpoint_shows_incremented_counter_after_request() {
     let params = SamplingParams::default();
     let engine = InferenceEngine::new(config, params, 42);
     let metrics = Arc::new(InferenceMetrics::new());
-    let app = create_router_with_metrics(engine, None, Arc::clone(&metrics));
+    let app = tokenizerless_router_with_metrics(engine, Arc::clone(&metrics));
 
     // Make a chat request, then query /metrics and confirm the counter text.
     let _chat_body = serde_json::json!({
@@ -510,21 +537,23 @@ fn request_temperature_maps_into_sampling_params() {
 }
 
 /// End-to-end (a): two identical `temperature: 0.0` requests through the base
-/// endpoint must produce byte-identical content. Before the fix the handler
-/// discarded `temperature` and always used the startup sampler (effective
-/// temp 0.7 → stochastic), so this would be flaky/non-greedy. Now temp=0 routes
-/// to deterministic greedy argmax, so the two completions must match exactly.
+/// endpoint must generate byte-identical tokens. A handler that discarded
+/// `temperature` would sample with the startup sampler (effective temp 0.7 →
+/// stochastic); temp=0 routes to deterministic greedy argmax, so the two
+/// completions must match exactly. The router has no tokenizer, so the
+/// generated ids are read from `logprobs` (`"<id>"` token strings).
 #[tokio::test]
 async fn base_endpoint_temperature_zero_is_deterministic() {
     async fn run_once() -> String {
         // Fresh engine per call so RNG/KV state cannot leak between the two runs;
         // greedy (temp=0) output must be identical regardless.
         let engine = InferenceEngine::new(Qwen3Config::tiny_test(), SamplingParams::default(), 42);
-        let app = create_router(engine, None);
+        let app = tokenizerless_router(engine);
         let body = serde_json::json!({
             "messages": [{"role": "user", "content": "Hello"}],
             "max_tokens": 8,
-            "temperature": 0.0
+            "temperature": 0.0,
+            "logprobs": true
         });
         let req = Request::post("/v1/chat/completions")
             .header("content-type", "application/json")
@@ -536,10 +565,13 @@ async fn base_endpoint_temperature_zero_is_deterministic() {
             .await
             .expect("body");
         let json: serde_json::Value = serde_json::from_slice(&bytes).expect("parse json");
-        json["choices"][0]["message"]["content"]
-            .as_str()
-            .expect("content should be a string")
-            .to_string()
+        json["choices"][0]["logprobs"]["content"]
+            .as_array()
+            .expect("logprobs.content should be an array")
+            .iter()
+            .filter_map(|entry| entry["token"].as_str())
+            .collect::<Vec<&str>>()
+            .join("")
     }
 
     let first = run_once().await;
@@ -548,7 +580,7 @@ async fn base_endpoint_temperature_zero_is_deterministic() {
     // comparison below isn't just "" == "".
     assert!(
         !first.is_empty(),
-        "temperature=0 greedy run should produce content, got empty"
+        "temperature=0 greedy run should generate tokens, got none"
     );
     assert_eq!(
         first, second,

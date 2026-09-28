@@ -6,11 +6,45 @@
 //! Split out of `engine.rs` to keep that file under the workspace 2000-line
 //! ceiling; these are inherent methods of [`InferenceEngine`].
 
+use oxibonsai_core::config::{RopeScalingOverride, RopeScalingOverrideScope};
 use oxibonsai_core::gguf::reader::GgufFile;
 
 use crate::engine::{Backend, InferenceEngine};
+use crate::engine_seam::resolve_rope_scaling_at_load;
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::sampling::SamplingParams;
+
+impl<'a> InferenceEngine<'a> {
+    /// [`from_gguf_with_backend`](Self::from_gguf_with_backend) with a
+    /// `--rope-scaling auto|on|off` override (wave-4b ruling R2; additive —
+    /// every existing constructor is unchanged).
+    ///
+    /// The override is applied through
+    /// [`RopeScalingOverrideScope`], which the model constructors'
+    /// internal `Qwen3Config::from_metadata` calls consult on this thread:
+    /// [`RopeScalingOverride::Off`] builds a plain (unscaled) RoPE table even
+    /// when the file declares YaRN (OxiBonsai <= 0.2.4 behaviour on
+    /// Bonsai-8B), [`RopeScalingOverride::On`] refuses a file that declares
+    /// no scaling, [`RopeScalingOverride::Auto`] is exactly
+    /// [`from_gguf_with_backend`](Self::from_gguf_with_backend).
+    ///
+    /// # Errors
+    ///
+    /// As [`from_gguf_with_backend`](Self::from_gguf_with_backend), plus the
+    /// refusals of [`resolve_rope_scaling_at_load`].
+    pub fn from_gguf_with_backend_and_rope(
+        gguf: &'a GgufFile<'a>,
+        sampling_params: SamplingParams,
+        seed: u64,
+        max_seq_len: usize,
+        backend: Backend,
+        rope: RopeScalingOverride,
+    ) -> RuntimeResult<Self> {
+        resolve_rope_scaling_at_load(gguf, rope)?;
+        let _rope_scope = RopeScalingOverrideScope::enter(rope);
+        Self::from_gguf_with_backend(gguf, sampling_params, seed, max_seq_len, backend)
+    }
+}
 
 impl InferenceEngine<'static> {
     /// Build an engine from an already-`'static` [`GgufFile`].

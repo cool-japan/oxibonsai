@@ -6,14 +6,14 @@
 //! Metal buffers being reallocated on every distinct prompt length (perf-M3):
 //!
 //! 1. [`PrefillAttnPipelines`] — the `prefill_qkv_prepare` and
-//!    `prefill_flash_attention` compute pipelines, compiled **lazily into
-//!    their own Metal library**. `metal_graph/pipelines.rs`'s combined library
-//!    and `build.rs`'s `ACTIVE_KERNELS` whitelist are outside this package's
-//!    ownership; a separate best-effort library is the same shape the optional
-//!    bf16 TE GEMM already uses (`try_compile_bf16_pipeline`), and it keeps the
-//!    combined metallib — shared with the image crate's DiT/VAE paths — byte
-//!    identical. A compile failure is **not** an error: it yields `None` and
-//!    the caller falls back to the historical per-token attention loop.
+//!    `prefill_flash_attention` compute pipelines, resolved by name from the
+//!    **combined metallib** (`MetalPipelines::pipeline_for`) the first time a
+//!    prefill needs them. Both kernels are part of the one library
+//!    `build.rs` embeds and `metal_graph/pipelines.rs` compiles or loads from
+//!    its disk cache, so a process start pays no separate shader compile, no
+//!    temporary build directory and no second on-disk cache for them. A
+//!    lookup failure is **not** an error: it yields `None` and the caller
+//!    falls back to the historical per-token attention loop.
 //! 2. The two dispatch helpers, which own the grid geometry and must stay in
 //!    sync with the `PFA_*` MSL constants (asserted in
 //!    `kernel_sources::prefill`'s own tests).
@@ -21,7 +21,7 @@
 //!    were allocated for, so the cache can be **grow-only and bucketed**
 //!    instead of exact-match on `batch_size`.
 
-use metal::{Buffer, ComputePipelineState, Device, Library, MTLSize};
+use metal::{Buffer, ComputePipelineState, Device, MTLSize};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::super::kernel_sources;
@@ -71,7 +71,7 @@ pub(crate) fn prefill_batch_capacity(batch_size: usize) -> usize {
 /// allocated for.
 ///
 /// `PrefillBuffers::matches` is exact on its `batch_size` argument and the
-/// field is private (the type is owned by another package), so the capacity is
+/// field is private to `metal_prefill::types`, so the capacity is
 /// tracked here: the buffers are allocated *as if* the batch were
 /// `capacity`, and every smaller batch reuses them. The column-major layout
 /// makes an oversized set harmless — a batch of `n` touches only the first `n`
@@ -204,12 +204,11 @@ pub(crate) struct PrefillAttnDims {
     /// Element offset of this layer's slab in the flat KV cache.
     ///
     /// Held as `u64` on the Rust side (`GpuKvCache::layer_offset_elements`)
-    /// and narrowed to `u32` at the dispatch boundary, because the MSL
-    /// bindings — like `fused_kv_store`'s and
-    /// `batched_attention_scores_v2`'s — declare it `constant uint&`.
+    /// and narrowed to `u32` at the dispatch boundary, because the two
+    /// batched prefill kernels (`prefill_qkv_prepare`,
+    /// `prefill_flash_attention`) declare it `constant uint&`.
     /// `check_kv_cache_geometry` refuses any geometry whose total element
-    /// count leaves the 32-bit range, so the narrowing cannot lose bits;
-    /// widening the bindings to `ulong` belongs with that cap, not here.
+    /// count leaves the 32-bit range, so the narrowing cannot lose bits.
     pub(crate) layer_offset: u64,
 }
 
@@ -248,17 +247,16 @@ pub(crate) struct PrefillAttnPipelines {
 }
 
 impl PrefillAttnPipelines {
-    /// Compile both kernels into their own library, best effort.
+    /// Resolve both kernels from the combined metallib, best effort.
     ///
-    /// Returns `None` — never an error — if the library or either pipeline
-    /// cannot be built (no Metal toolchain and a driver that rejects the
-    /// source, a GPU without `simdgroup_matrix`, …). The caller then runs the
+    /// Returns `None` — never an error — if either entry point cannot be
+    /// turned into a pipeline (a GPU without `simdgroup_matrix`, a combined
+    /// library that failed to load them, …). The caller then runs the
     /// historical per-token attention loop, so the worst case is the old
     /// performance, not a failed prefill.
-    fn compile(device: &Device) -> Option<Self> {
-        let library = load_library(device)?;
-        let qkv_prepare = pipeline_for(&library, device, "prefill_qkv_prepare")?;
-        let flash_attention = pipeline_for(&library, device, "prefill_flash_attention")?;
+    fn resolve(graph: &MetalGraph) -> Option<Self> {
+        let qkv_prepare = resolve_pipeline(graph, "prefill_qkv_prepare")?;
+        let flash_attention = resolve_pipeline(graph, "prefill_flash_attention")?;
         Some(Self {
             qkv_prepare,
             flash_attention,
@@ -282,30 +280,10 @@ pub(crate) fn batched_attention_supported(nq: usize, nkv: usize, head_dim: usize
         && head_dim <= kernel_sources::PREFILL_FLASH_MAX_HEAD_DIM
 }
 
-/// MSL source of the standalone batched-prefill attention library.
-fn library_source() -> String {
-    let mut src = String::with_capacity(
-        kernel_sources::MSL_PREFILL_QKV_PREPARE.len()
-            + kernel_sources::MSL_PREFILL_FLASH_ATTENTION.len()
-            + 2,
-    );
-    src.push_str(kernel_sources::MSL_PREFILL_QKV_PREPARE);
-    src.push('\n');
-    src.push_str(kernel_sources::MSL_PREFILL_FLASH_ATTENTION);
-    src.push('\n');
-    src
-}
-
-/// Extract one named pipeline, returning `None` on any failure.
-fn pipeline_for(library: &Library, device: &Device, name: &str) -> Option<ComputePipelineState> {
-    let func = match library.get_function(name, None) {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::info!("batched prefill attention: function '{name}' unavailable ({e})");
-            return None;
-        }
-    };
-    match device.new_compute_pipeline_state_with_function(&func) {
+/// Resolve one entry point of the combined metallib, logging (not
+/// propagating) a failure.
+fn resolve_pipeline(graph: &MetalGraph, name: &str) -> Option<ComputePipelineState> {
+    match graph.pipeline_for(name) {
         Ok(pso) => Some(pso),
         Err(e) => {
             tracing::info!("batched prefill attention: pipeline '{name}' unavailable ({e})");
@@ -314,117 +292,21 @@ fn pipeline_for(library: &Library, device: &Device, name: &str) -> Option<Comput
     }
 }
 
-/// Load the standalone library: disk cache → `xcrun` → runtime MSL compile.
-///
-/// Mirrors `metal_graph::pipelines::load_or_compile_library` (whose helpers are
-/// private to that module) minus the embedded metallib, which only ever holds
-/// the combined kernel set. The disk cache matters here: without it every
-/// process start would pay a fresh MSL compile on the TTFT path.
-fn load_library(device: &Device) -> Option<Library> {
-    let src = library_source();
-    let hash = source_hash(&src);
-    let cache_name = format!("prefill_attn_{hash:016x}.metallib");
-
-    if let Some(cache_dir) = cache_dir() {
-        let cache_path = cache_dir.join(&cache_name);
-        if let Ok(data) = std::fs::read(&cache_path) {
-            if let Ok(lib) = device.new_library_with_data(&data) {
-                return Some(lib);
-            }
-        }
-        if let Some(lib) = compile_via_xcrun(device, &src, &cache_path) {
-            return Some(lib);
-        }
-    }
-
-    match device.new_library_with_source(&src, &metal::CompileOptions::new()) {
-        Ok(lib) => Some(lib),
-        Err(e) => {
-            tracing::info!("batched prefill attention: MSL compilation failed ({e})");
-            None
-        }
-    }
-}
-
-/// 64-bit hash of the MSL source, used as the disk-cache key.
-fn source_hash(src: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    src.hash(&mut hasher);
-    hasher.finish()
-}
-
-/// `~/.cache/oxibonsai/`, shared with the combined metallib cache.
-fn cache_dir() -> Option<std::path::PathBuf> {
-    std::env::var("HOME")
-        .ok()
-        .map(|h| std::path::PathBuf::from(h).join(".cache").join("oxibonsai"))
-}
-
-/// Compile MSL → `.metallib` via `xcrun`, cache it, and load it.
-///
-/// Intermediates go under `std::env::temp_dir()` in a per-process directory so
-/// concurrent builds (the test suite runs several binaries at once) cannot
-/// overwrite each other's `.air`.
-fn compile_via_xcrun(device: &Device, src: &str, cache_path: &std::path::Path) -> Option<Library> {
-    let tmp_dir =
-        std::env::temp_dir().join(format!("oxibonsai_prefill_attn_{}", std::process::id()));
-    std::fs::create_dir_all(&tmp_dir).ok()?;
-    let metal_path = tmp_dir.join("prefill_attn.metal");
-    let air_path = tmp_dir.join("prefill_attn.air");
-    let lib_path = tmp_dir.join("prefill_attn.metallib");
-    std::fs::write(&metal_path, src).ok()?;
-
-    let metal_str = metal_path.to_str()?;
-    let air_str = air_path.to_str()?;
-    let lib_str = lib_path.to_str()?;
-
-    let out = std::process::Command::new("xcrun")
-        .args(["-sdk", "macosx", "metal", "-c", metal_str, "-o", air_str])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        tracing::debug!(
-            "batched prefill attention: xcrun metal failed: {}",
-            &stderr[..stderr.len().min(500)]
-        );
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        return None;
-    }
-    let out = std::process::Command::new("xcrun")
-        .args(["-sdk", "macosx", "metallib", air_str, "-o", lib_str])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        return None;
-    }
-
-    let data = std::fs::read(&lib_path).ok();
-    let _ = std::fs::remove_dir_all(&tmp_dir);
-    let data = data?;
-    if let Some(parent) = cache_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(cache_path, &data);
-    device.new_library_with_data(&data).ok()
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
 // MetalGraph hooks
 // ═══════════════════════════════════════════════════════════════════════════
 
 impl MetalGraph {
-    /// The batched-prefill attention pipelines, compiled on first use.
+    /// The batched-prefill attention pipelines, resolved from the combined
+    /// metallib on first use.
     ///
-    /// `None` means "unavailable on this device/toolchain"; callers fall back
-    /// to the per-token attention loop. The compile happens **outside** the
+    /// `None` means "unavailable on this device"; callers fall back to the
+    /// per-token attention loop. The lookup happens **outside** the
     /// prefill-buffer and KV-cache locks (see `encode_full_forward_prefill*`),
-    /// so a first-run MSL compile never serialises other GPU work.
+    /// so building the two pipeline states never serialises other GPU work.
     pub(crate) fn prefill_attn_pipelines(&self) -> Option<&PrefillAttnPipelines> {
         self.prefill_attn
-            .get_or_init(|| PrefillAttnPipelines::compile(&self.device))
+            .get_or_init(|| PrefillAttnPipelines::resolve(self))
             .as_ref()
     }
 
@@ -587,10 +469,11 @@ mod tests {
         if Device::system_default().is_none() {
             return;
         }
-        let graph = match MetalGraph::new() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
+        // On a Metal device a combined library that fails to build is a
+        // failure, never a silent skip.
+        let graph = MetalGraph::new().unwrap_or_else(|e| {
+            panic!("the combined Metal library must build on this device: {e}")
+        });
         // Small model dimensions: this test is about the cache, not the GPU.
         let (h, inter, nq, nkv, hd, max_seq) = (128usize, 256, 4, 2, 32, 4096);
         // 20 distinct prompt lengths, deliberately not in bucket order.
@@ -633,8 +516,8 @@ mod tests {
     ///
     /// The batched path and the per-token fallback are numerically equivalent,
     /// so an edit that dropped back to the loop would leave every parity test
-    /// green while quietly restoring the ~13x slower prefill this package
-    /// removed. [`MetalGraph::prefill_batched_attention_count`] catches that at
+    /// green while quietly restoring the ~13x slower per-token prefill.
+    /// [`MetalGraph::prefill_batched_attention_count`] catches that at
     /// runtime; this pins it structurally, the way
     /// `graph_rs_has_no_unchecked_command_buffer_commit` pins MET-04.
     #[test]
@@ -662,21 +545,30 @@ mod tests {
         );
     }
 
-    /// The pipelines must actually build on this machine — otherwise the whole
-    /// package silently degrades to the per-token path it exists to replace.
+    /// The pipelines must actually build on this machine — otherwise batched
+    /// prefill silently degrades to the per-token path it exists to replace —
+    /// and they must come from the combined metallib: both entry points are
+    /// in the combined MSL and resolve through `pipeline_for`.
     #[test]
     fn prefill_attention_pipelines_compile_on_this_device() {
         if Device::system_default().is_none() {
             return;
         }
-        let graph = match MetalGraph::new() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
+        // On a Metal device a combined library that fails to build is a
+        // failure, never a silent skip.
+        let graph = MetalGraph::new().unwrap_or_else(|e| {
+            panic!("the combined Metal library must build on this device: {e}")
+        });
         assert!(
             graph.prefill_attn_pipelines().is_some(),
-            "prefill_qkv_prepare / prefill_flash_attention failed to compile; \
+            "prefill_qkv_prepare / prefill_flash_attention did not resolve; \
              batched prefill would fall back to the per-token loop"
         );
+        for name in ["prefill_qkv_prepare", "prefill_flash_attention"] {
+            assert!(
+                graph.pipeline_for(name).is_ok(),
+                "{name} must resolve from the combined metallib"
+            );
+        }
     }
 }

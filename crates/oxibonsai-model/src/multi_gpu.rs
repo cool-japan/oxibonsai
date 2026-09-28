@@ -11,11 +11,13 @@
 //! partitioning, collective reduction/gather semantics) that a real
 //! multi-device backend would need, without requiring the hardware.
 //!
-//! The crate's public API still re-exports these under the legacy names
-//! [`DeviceMesh`] and [`NcclCollectives`] (type aliases to the `Simulated*`
-//! types below) for backward compatibility with existing callers; new code
-//! should prefer the `Simulated*` names directly, since they do not imply
-//! any relationship to real GPU hardware or to NCCL.
+//! The crate root re-exports only the honest `Simulated*` names (`CQ-11`).
+//! The legacy names [`DeviceMesh`] and [`NcclCollectives`] survive solely as
+//! type aliases in this module, reachable as
+//! `oxibonsai_model::multi_gpu::{DeviceMesh, NcclCollectives}` (with the
+//! `multi-device` feature) — never from the crate root. New code should use
+//! the `Simulated*` names, which do not imply any relationship to real GPU
+//! hardware or to NCCL.
 //!
 //! ## Reachability
 //!
@@ -100,7 +102,7 @@ impl DeviceInfo {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SimulatedDeviceMesh (public alias: DeviceMesh)
+// SimulatedDeviceMesh (module-local legacy alias: multi_gpu::DeviceMesh)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A 2-D logical device mesh: tensor-parallel dimension × pipeline-parallel dimension.
@@ -116,10 +118,10 @@ pub struct SimulatedDeviceMesh {
 
 /// Backward-compatible alias for [`SimulatedDeviceMesh`].
 ///
-/// Kept so the crate root's existing `pub use multi_gpu::{.., DeviceMesh,
-/// ..}` re-export continues to resolve; prefer `SimulatedDeviceMesh`
-/// directly in new code, since `DeviceMesh` on its own does not signal that
-/// this is a CPU simulation rather than a real device topology.
+/// Not re-exported from the crate root (`CQ-11` removed that re-export):
+/// reachable only as `oxibonsai_model::multi_gpu::DeviceMesh`. Prefer
+/// `SimulatedDeviceMesh` in new code, since `DeviceMesh` on its own does not
+/// signal that this is a CPU simulation rather than a real device topology.
 pub type DeviceMesh = SimulatedDeviceMesh;
 
 impl SimulatedDeviceMesh {
@@ -249,7 +251,7 @@ fn check_uniform_shard_len(shards: &[Vec<f32>]) -> Result<usize, MultiGpuError> 
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SimulatedCollectives (public alias: NcclCollectives)
+// SimulatedCollectives (module-local legacy alias: multi_gpu::NcclCollectives)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// CPU-simulated collective communication operations (sum/max/gather/scatter
@@ -260,8 +262,11 @@ fn check_uniform_shard_len(shards: &[Vec<f32>]) -> Result<usize, MultiGpuError> 
 /// for testing sharding logic without GPU hardware.
 pub struct SimulatedCollectives;
 
-/// Backward-compatible alias for [`SimulatedCollectives`]. See the module
-/// docs and [`SimulatedCollectives`]'s own doc comment: prefer the
+/// Backward-compatible alias for [`SimulatedCollectives`].
+///
+/// Not re-exported from the crate root (`CQ-11` removed that re-export):
+/// reachable only as `oxibonsai_model::multi_gpu::NcclCollectives`. See the
+/// module docs and [`SimulatedCollectives`]'s own doc comment: prefer the
 /// `Simulated*` name in new code.
 pub type NcclCollectives = SimulatedCollectives;
 

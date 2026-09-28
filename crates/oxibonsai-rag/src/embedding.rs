@@ -29,6 +29,20 @@ pub trait Embedder: Send + Sync {
 
     /// The fixed number of dimensions produced by this embedder.
     fn embedding_dim(&self) -> usize;
+
+    /// Embed every text in `texts`, returning one result per input, in
+    /// order.
+    ///
+    /// A failure is reported in that item's own slot and never aborts the
+    /// rest of the batch, so a caller can degrade item by item (the HTTP
+    /// embeddings endpoint answers a failed item with a zero vector). The
+    /// default is a plain loop over [`Embedder::embed`]; a backend with a
+    /// cheaper batched path — one lock acquisition, one scheduling unit —
+    /// overrides it, and callers holding a `dyn Embedder` reach that
+    /// override through this method.
+    fn embed_batch(&self, texts: &[&str]) -> Vec<Result<Vec<f32>, RagError>> {
+        texts.iter().map(|text| self.embed(text)).collect()
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -498,6 +512,62 @@ pub(crate) fn tokenize(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Embedder::embed_batch (EMBED-WIRE handover) ─────────────────────────
+
+    /// An embedder that only implements the two required methods, counts
+    /// `embed` calls and fails on one marker input.
+    struct CountingEmbedder {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Embedder for CountingEmbedder {
+        fn embed(&self, text: &str) -> Result<Vec<f32>, RagError> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if text == "fail" {
+                return Err(RagError::EmptyDocument);
+            }
+            Ok(vec![text.len() as f32, 1.0])
+        }
+
+        fn embedding_dim(&self) -> usize {
+            2
+        }
+    }
+
+    /// The default `embed_batch` is the per-item loop: one result per
+    /// input, in order, a failure confined to its own slot, `embed` called
+    /// exactly once per item — through a `dyn Embedder` too.
+    #[test]
+    fn default_embed_batch_is_a_per_item_loop_that_degrades_per_item() {
+        let embedder = CountingEmbedder {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let as_dyn: &dyn Embedder = &embedder;
+        let results = as_dyn.embed_batch(&["a", "fail", "ccc"]);
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].as_ref().ok(), Some(&vec![1.0, 1.0]));
+        assert!(matches!(results[1], Err(RagError::EmptyDocument)));
+        assert_eq!(results[2].as_ref().ok(), Some(&vec![3.0, 1.0]));
+        assert_eq!(
+            embedder.calls.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "the default embeds each item exactly once"
+        );
+        assert!(as_dyn.embed_batch(&[]).is_empty());
+    }
+
+    /// The built-in embedders inherit the default and agree with `embed`.
+    #[test]
+    fn built_in_embedders_batch_like_they_embed() {
+        let identity = IdentityEmbedder::new(8).expect("dim 8");
+        let texts = ["alpha", "beta"];
+        let batched = identity.embed_batch(&texts);
+        for (text, result) in texts.iter().zip(batched) {
+            assert_eq!(result.ok(), identity.embed(text).ok());
+        }
+    }
 
     // ── RAG-EVAL-IMG-21: strict_oov ──────────────────────────────────────────
 

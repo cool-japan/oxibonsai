@@ -1,5 +1,10 @@
 //! Unit tests of [`crate::kv_cache`], split out of `kv_cache.rs`
-//! (B2-11-FIX). Unchanged in substance; only their file moved.
+//! (B2-11-FIX). With the legacy `KvCache::store_key` / `store_value`
+//! forwarders gone (M-26), the two tests that pin the error-swallowing
+//! contract call `store_key_lossy` / `store_value_lossy` by name and every
+//! other store goes through `try_store_*` — an in-range store that fails is a
+//! test failure, not a silent no-op. The `PagedKvCache` tests keep that type's
+//! own `store_key` / `store_value`.
 
 use super::*;
 
@@ -9,10 +14,10 @@ fn store_key_out_of_range_pos_does_not_panic_and_leaves_cache_untouched() {
     // bounds check was `debug_assert!`, which is compiled out in
     // release, so an out-of-range `pos` computed an offset past the
     // end of the pre-allocated `keys` Vec and panicked on the slice
-    // index. `store_key`/`store_value` must now be no-ops instead.
+    // index. The lossy stores must now be no-ops instead.
     let mut cache = KvCache::new(1, 1, 4, 8);
-    cache.store_key(0, 0, 100, &[1.0, 2.0, 3.0, 4.0]);
-    cache.store_value(0, 0, 100, &[5.0, 6.0, 7.0, 8.0]);
+    cache.store_key_lossy(0, 0, 100, &[1.0, 2.0, 3.0, 4.0]);
+    cache.store_value_lossy(0, 0, 100, &[5.0, 6.0, 7.0, 8.0]);
 
     // The cache must remain entirely zeroed: nothing was written.
     cache.set_seq_len(8);
@@ -27,9 +32,9 @@ fn store_key_out_of_range_layer_head_and_bad_len_does_not_panic() {
     let mut cache = KvCache::new(2, 2, 4, 8);
     // Out-of-range layer, out-of-range head, and mismatched slice length
     // must all be silently rejected rather than panicking.
-    cache.store_key(99, 0, 0, &[1.0, 2.0, 3.0, 4.0]);
-    cache.store_value(0, 99, 0, &[1.0, 2.0, 3.0, 4.0]);
-    cache.store_key(0, 0, 0, &[1.0, 2.0]); // wrong length (expects 4)
+    cache.store_key_lossy(99, 0, 0, &[1.0, 2.0, 3.0, 4.0]);
+    cache.store_value_lossy(0, 99, 0, &[1.0, 2.0, 3.0, 4.0]);
+    cache.store_key_lossy(0, 0, 0, &[1.0, 2.0]); // wrong length (expects 4)
 
     let keys = cache.keys_for(0, 0, 1);
     assert!(keys.iter().all(|&x| x == 0.0));
@@ -99,8 +104,12 @@ fn kv_cache_store_and_retrieve() {
     let key = vec![1.0f32; 128];
     let value = vec![2.0f32; 128];
 
-    cache.store_key(0, 0, 0, &key);
-    cache.store_value(0, 0, 0, &value);
+    cache
+        .try_store_key(0, 0, 0, &key)
+        .expect("in-range key store");
+    cache
+        .try_store_value(0, 0, 0, &value)
+        .expect("in-range value store");
     cache.advance();
 
     let keys = cache.keys_for(0, 0, 1);
@@ -116,9 +125,13 @@ fn kv_cache_store_and_retrieve() {
 fn kv_cache_multiple_positions() {
     let mut cache = KvCache::new(1, 1, 4, 8);
 
-    cache.store_key(0, 0, 0, &[1.0, 2.0, 3.0, 4.0]);
+    cache
+        .try_store_key(0, 0, 0, &[1.0, 2.0, 3.0, 4.0])
+        .expect("in-range key store");
     cache.advance();
-    cache.store_key(0, 0, 1, &[5.0, 6.0, 7.0, 8.0]);
+    cache
+        .try_store_key(0, 0, 1, &[5.0, 6.0, 7.0, 8.0])
+        .expect("in-range key store");
     cache.advance();
 
     let keys = cache.keys_for(0, 0, 2);
@@ -172,8 +185,12 @@ fn kv_cache_extract_inject_roundtrip() {
             let value: Vec<f32> = (0..head_dim)
                 .map(|d| (head as f32 + 1.0) * 1000.0 + pos as f32 * 10.0 + d as f32)
                 .collect();
-            cache.store_key(1, head, pos, &key);
-            cache.store_value(1, head, pos, &value);
+            cache
+                .try_store_key(1, head, pos, &key)
+                .expect("in-range key store");
+            cache
+                .try_store_value(1, head, pos, &value)
+                .expect("in-range value store");
         }
     }
 
@@ -216,8 +233,12 @@ fn kv_cache_extract_inject_at_offset() {
     for pos in 0..4 {
         let key = vec![pos as f32, pos as f32 + 0.5];
         let value = vec![-(pos as f32), -(pos as f32) - 0.5];
-        cache.store_key(0, 0, 4 + pos, &key);
-        cache.store_value(0, 0, 4 + pos, &value);
+        cache
+            .try_store_key(0, 0, 4 + pos, &key)
+            .expect("in-range key store");
+        cache
+            .try_store_value(0, 0, 4 + pos, &value)
+            .expect("in-range value store");
     }
     let (k, v) = cache.extract_block(0, 4, 4);
     let mut other = KvCache::new(1, 1, 2, 16);
@@ -454,7 +475,9 @@ fn sparse_keys_for_owned_and_values_for_owned_roundtrip() {
 #[test]
 fn dense_keys_for_owned_matches_keys_for() {
     let mut cache = KvCache::new(1, 1, 4, 8);
-    cache.store_key(0, 0, 2, &[1.0, 2.0, 3.0, 4.0]);
+    cache
+        .try_store_key(0, 0, 2, &[1.0, 2.0, 3.0, 4.0])
+        .expect("in-range key store");
     cache.set_seq_len(3);
     assert_eq!(
         cache.keys_for(0, 0, 3),
@@ -603,8 +626,12 @@ fn grow_to_preserves_dense_data_and_seq_len() {
                 let value: Vec<f32> = (0..head_dim)
                     .map(|d| -value_at(layer, head, pos, d))
                     .collect();
-                cache.store_key(layer, head, pos, &key);
-                cache.store_value(layer, head, pos, &value);
+                cache
+                    .try_store_key(layer, head, pos, &key)
+                    .expect("in-range key store");
+                cache
+                    .try_store_value(layer, head, pos, &value)
+                    .expect("in-range value store");
             }
         }
     }
@@ -708,7 +735,9 @@ fn grow_to_preserves_sparse_data_and_stays_sparse() {
 #[test]
 fn grow_to_is_a_no_op_when_already_large_enough() {
     let mut cache = KvCache::new(1, 1, 4, 100);
-    cache.store_key(0, 0, 0, &[1.0, 2.0, 3.0, 4.0]);
+    cache
+        .try_store_key(0, 0, 0, &[1.0, 2.0, 3.0, 4.0])
+        .expect("in-range key store");
     cache.grow_to(50); // smaller than current — must not shrink or touch data
     assert_eq!(cache.max_seq_len(), 100);
     cache.set_seq_len(1);
@@ -718,7 +747,9 @@ fn grow_to_is_a_no_op_when_already_large_enough() {
 #[test]
 fn try_ensure_capacity_and_try_grow_to_reject_overflow_leaving_cache_unchanged() {
     let mut cache = KvCache::new(1, 1, 4, 8);
-    cache.store_key(0, 0, 0, &[1.0, 2.0, 3.0, 4.0]);
+    cache
+        .try_store_key(0, 0, 0, &[1.0, 2.0, 3.0, 4.0])
+        .expect("in-range key store");
 
     let err = cache
         .try_grow_to(usize::MAX)

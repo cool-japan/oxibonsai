@@ -1,7 +1,8 @@
 //! Tests for the layered configuration system.
 
 use oxibonsai_runtime::config::{
-    ImagenConfig, ModelConfig, ObservabilityConfig, OxiBonsaiConfig, SamplingConfig, ServerConfig,
+    ImagenConfig, ModelConfig, ObservabilityConfig, OxiBonsaiConfig, RopeScalingMode,
+    SamplingConfig, ServerConfig,
 };
 
 // ═══════════════���════════════════��═════════════════════════════
@@ -16,7 +17,11 @@ fn default_config_has_expected_values() {
     assert!((cfg.sampling.temperature - 0.7).abs() < f32::EPSILON);
     assert_eq!(cfg.sampling.top_k, 40);
     assert!((cfg.sampling.top_p - 0.9).abs() < f32::EPSILON);
-    assert!((cfg.sampling.repetition_penalty - 1.1).abs() < f32::EPSILON);
+    // Gatekeeper REQUIRED #18 (waves 3+3.5 review, B2-14): corrected from a
+    // stale `1.1` after `sampling::SamplingParams::default()` was fixed to
+    // `1.0` (RT-24 / gatekeeper REQUIRED #1(a), the P0 CPU-vs-Metal greedy
+    // parity fix) — every default-constructed sampling config must agree.
+    assert!((cfg.sampling.repetition_penalty - 1.0).abs() < f32::EPSILON);
     assert_eq!(cfg.sampling.max_tokens, 512);
     assert!(cfg.model.model_path.is_none());
     assert!(cfg.model.tokenizer_path.is_none());
@@ -38,7 +43,8 @@ fn sampling_config_defaults_match_params() {
     assert!((cfg.temperature - 0.7).abs() < f32::EPSILON);
     assert_eq!(cfg.top_k, 40);
     assert!((cfg.top_p - 0.9).abs() < f32::EPSILON);
-    assert!((cfg.repetition_penalty - 1.1).abs() < f32::EPSILON);
+    // See the identical note in `default_config_has_expected_values` above.
+    assert!((cfg.repetition_penalty - 1.0).abs() < f32::EPSILON);
     assert_eq!(cfg.max_tokens, 512);
 }
 
@@ -242,6 +248,10 @@ fn config_roundtrip_serialize_deserialize() {
             // is in the same crate as the struct.
             max_context: None,
             ctx_budget_bytes: None,
+            // B2-14 (wave 4b) added `rope_scaling` to `ModelConfig` (the
+            // `--rope-scaling auto|on|off` CLI/TOML control) — same
+            // situation as `max_context`/`ctx_budget_bytes` above.
+            rope_scaling: RopeScalingMode::Off,
         },
         observability: ObservabilityConfig {
             log_level: "trace".to_string(),
@@ -278,6 +288,7 @@ fn config_roundtrip_serialize_deserialize() {
     assert_eq!(parsed.model.model_path, original.model.model_path);
     assert_eq!(parsed.model.tokenizer_path, original.model.tokenizer_path);
     assert_eq!(parsed.model.max_seq_len, original.model.max_seq_len);
+    assert_eq!(parsed.model.rope_scaling, original.model.rope_scaling);
     assert_eq!(
         parsed.observability.log_level,
         original.observability.log_level

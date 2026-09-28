@@ -42,41 +42,67 @@ const FORCE_SPLIT_PREFILL_ENV: &str = "OXIBONSAI_FORCE_CUDA_SPLIT_PREFILL";
 /// One-shot latch for the "override is no longer honoured" diagnostic.
 static SPLIT_PREFILL_OVERRIDE_NOTICE: std::sync::Once = std::sync::Once::new();
 
-/// Whether a split-KV-cache CUDA batch prefill may run — finding **F6**.
+/// Whether a split-KV-cache CUDA batch prefill may run for a family whose
+/// caller stores **no** K/V read-back into `self.kv_cache` — finding **F6**.
 ///
-/// Always `false`: no kernels-side entry point can hand the prompt's K/V back
-/// to the host yet (`try_cuda_prefill_q_std` / `_k_quant` / `_fp8` keep their
-/// device KV cache in a module-private slot and expose no read-back), so there
-/// is no configuration in which these paths produce grounded output.
+/// Always `false`. K-quant (`k_quant`) and FP8 (`forward_cuda_fp8`) drive a
+/// GPU-private device KV cache during batch prefill while their decode
+/// attends over the host cache, and their callers do not yet write the
+/// prompt's K/V back into it (the kernels-side `kv_readback_out` of
+/// `try_cuda_prefill_k_quant` / `try_cuda_prefill_fp8_with_kv_readback` is
+/// there; the model side passes `None`), so there is no configuration in
+/// which those paths produce grounded output. The Q4_0/Q8_0 family, whose
+/// caller does store the read-back, is gated by
+/// [`cuda_split_prefill_allowed_with_readback`] instead.
 ///
-/// This is a runtime predicate rather than an unconditional `return Err` so the
-/// batch-prefill implementations below it stay compiled and type-checked
-/// instead of rotting behind dead code — they are complete, and only the KV
-/// hand-off is missing. When the read-back lands, this is the single place that
-/// turns all six entry points back on.
+/// This is a runtime predicate rather than an unconditional `return Err` so
+/// the batch-prefill implementations below it stay compiled and
+/// type-checked instead of rotting behind dead code.
 pub(super) fn cuda_split_prefill_allowed() -> bool {
     false
 }
 
-/// The error the six refusing entry points return — finding **F6**.
+/// Whether a split-KV-cache CUDA batch prefill whose caller writes the
+/// device K/V read-back into `self.kv_cache` may run at `pos_start` —
+/// finding **F6** (the Q4_0/Q8_0 family, `q_std`).
 ///
-/// Refuse a split-KV-cache CUDA batch prefill, and say why.
+/// Only at `pos_start == 0`. Token `t` of the batch attends over device
+/// positions `[0, pos_start + t]`, and the family's device KV cache is
+/// GPU-private and process-global (keyed on geometry alone): positions
+/// before `pos_start` hold whatever an earlier call left there — possibly
+/// for another sequence or model, and never the positions the host-KV
+/// decode path or a sequential fallback wrote — and nothing records which.
+/// At `pos_start == 0` the call itself writes every position it reads, so
+/// the logits and the read-back are both grounded; any later chunk or turn
+/// takes the sequential path, which reads the host cache the read-back
+/// filled.
+pub(super) fn cuda_split_prefill_allowed_with_readback(pos_start: usize) -> bool {
+    pos_start == 0
+}
+
+/// The error the refusing split-KV-cache entry points return — finding
+/// **F6** — for a family whose caller stores no read-back (see
+/// [`cuda_split_prefill_allowed`]).
 ///
-/// Q4_0/Q8_0 (`q_std`), every K-quant (`k_quant`) and FP8 (`forward_cuda_fp8`)
-/// each drive a **GPU-private** device KV cache during batch prefill
-/// (`acquire_q_std_kv_cache` / `acquire_k_quant_kv_cache` /
-/// `acquire_fp8_kv_cache` — three separate process-global slots), while DECODE
-/// for those three families runs CPU attention over `self.kv_cache`. Nothing
-/// ever copies the prompt's K/V from the device cache back to the host one, so
-/// a "successful" GPU prefill leaves decode attending over all-zero prompt KV:
-/// fluent, confident, entirely ungrounded output, with no error anywhere. The
-/// Q1/ternary path does not have this problem because its prefill and decode
-/// share one device KV cache (`cuda_full_layer::acquire_kv_cache`).
+/// Q4_0/Q8_0 (`q_std`), every K-quant (`k_quant`) and FP8
+/// (`forward_cuda_fp8`) each drive a **GPU-private** device KV cache during
+/// batch prefill (`acquire_q_std_kv_cache` / `acquire_k_quant_kv_cache` /
+/// `acquire_fp8_kv_cache` — three separate process-global slots), while
+/// DECODE for those three families runs CPU attention over `self.kv_cache`.
+/// Without a read-back, a "successful" GPU prefill leaves decode attending
+/// over all-zero prompt KV: fluent, confident, entirely ungrounded output,
+/// with no error anywhere. The Q1/ternary path does not have this problem
+/// because its prefill and decode share one device KV cache
+/// (`cuda_full_layer::acquire_kv_cache`).
 ///
-/// Until a GPU→host read-back exists (see the package's recorded deviations for
-/// the exact signature change the three kernels-side entry points need), these
-/// six entry points return `Err` and `forward_prefill` falls back to the
-/// bit-correct sequential per-token path, which populates `self.kv_cache`.
+/// The Q4_0/Q8_0 entry points read the device K/V back
+/// (`cuda_full_layer::read_back_kv_cache`) and write it into
+/// `self.kv_cache` ([`BonsaiModel::store_cuda_kv_readback`]), so they
+/// refuse only a `pos_start > 0` call, through
+/// [`cuda_split_prefill_needs_history`]. The K-quant and FP8 entry points
+/// still return this error on every call, and `forward_prefill` falls back
+/// to the bit-correct sequential per-token path, which populates
+/// `self.kv_cache` directly.
 ///
 /// `OXIBONSAI_FORCE_CUDA_SPLIT_PREFILL` previously turned the guard off and ran
 /// the GPU path anyway, "for throughput microbenchmarks only". It is **no
@@ -87,16 +113,7 @@ pub(super) fn cuda_split_prefill_disabled(
     family: &str,
     verify: bool,
 ) -> Box<dyn std::error::Error> {
-    if std::env::var_os(FORCE_SPLIT_PREFILL_ENV).is_some() {
-        SPLIT_PREFILL_OVERRIDE_NOTICE.call_once(|| {
-            tracing::error!(
-                "{FORCE_SPLIT_PREFILL_ENV} is set but is NO LONGER HONOURED. It used to run the \
-                 Q4_0/Q8_0, K-quant and FP8 CUDA batch prefill against a GPU-private KV cache \
-                 that CPU decode never reads, so generation continued against all-zero prompt \
-                 K/V — fast, and silently wrong. The bit-correct sequential prefill runs instead."
-            );
-        });
-    }
+    warn_on_ignored_force_override();
     let what = if verify {
         "batch prefill verify"
     } else {
@@ -108,6 +125,80 @@ pub(super) fn cuda_split_prefill_disabled(
          sequential fallback"
     )
     .into()
+}
+
+/// The error a read-back-storing split-KV-cache entry point (Q4_0/Q8_0)
+/// returns for a call at `pos_start > 0` — finding **F6**, see
+/// [`cuda_split_prefill_allowed_with_readback`].
+///
+/// The message carries the same "writes a GPU-private KV cache" clause as
+/// [`cuda_split_prefill_disabled`], which is what `prefill_dispatch`'s
+/// fallback logger keys its `debug!` level on: this is a by-construction
+/// refusal, not a failure.
+pub(super) fn cuda_split_prefill_needs_history(
+    family: &str,
+    verify: bool,
+    pos_start: usize,
+) -> Box<dyn std::error::Error> {
+    warn_on_ignored_force_override();
+    let what = if verify {
+        "batch prefill verify"
+    } else {
+        "batch prefill"
+    };
+    format!(
+        "{family} CUDA {what} at pos_start {pos_start} disabled: this path writes a GPU-private \
+         KV cache that holds no history before pos_start (earlier positions live only in the \
+         host cache); using the bit-correct sequential fallback"
+    )
+    .into()
+}
+
+/// Log, once per process, that `OXIBONSAI_FORCE_CUDA_SPLIT_PREFILL` is set
+/// but no longer does anything.
+fn warn_on_ignored_force_override() {
+    if std::env::var_os(FORCE_SPLIT_PREFILL_ENV).is_some() {
+        SPLIT_PREFILL_OVERRIDE_NOTICE.call_once(|| {
+            tracing::error!(
+                "{FORCE_SPLIT_PREFILL_ENV} is set but is NO LONGER HONOURED. It used to run the \
+                 Q4_0/Q8_0, K-quant and FP8 CUDA batch prefill against a GPU-private KV cache \
+                 that CPU decode never reads, so generation continued against all-zero prompt \
+                 K/V — fast, and silently wrong. The bit-correct sequential prefill runs instead."
+            );
+        });
+    }
+}
+
+impl BonsaiModel<'_> {
+    /// Write a CUDA batch prefill's device K/V read-back (finding **F6**)
+    /// into `self.kv_cache` at `[pos_start, pos_start + batch_size)`, one
+    /// `(keys, values)` pair per block in `self.blocks` order (the order the
+    /// batch-prefill entry points lay their layers out in), each stored
+    /// under the block's own `layer_index()` — see
+    /// `prefill_dispatch::store_kv_readback` for the checks.
+    ///
+    /// **Compile-blind**: the device read-back feeding this has never run
+    /// on CUDA hardware; the host-side store is unit-tested.
+    ///
+    /// # Errors
+    /// A layer-count / shape mismatch, a window past the cache's limit, or
+    /// a failed cache growth.
+    pub(super) fn store_cuda_kv_readback(
+        &mut self,
+        readback: &[(Vec<f32>, Vec<f32>)],
+        pos_start: usize,
+        batch_size: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let layer_indices: Vec<usize> = self.blocks.iter().map(|b| b.layer_index()).collect();
+        super::prefill_dispatch::store_kv_readback(
+            &mut self.kv_cache,
+            &layer_indices,
+            readback,
+            pos_start,
+            batch_size,
+        )?;
+        Ok(())
+    }
 }
 
 /// Release this model's CUDA-resident weight buffers when it is dropped
@@ -122,6 +213,19 @@ pub(super) fn cuda_split_prefill_disabled(
 /// [`CudaGraph::release_model_epoch`](oxibonsai_kernels::CudaGraph::release_model_epoch),
 /// which frees everything registered under it.
 ///
+/// It then releases the model's **Q1 slot namespace** too (`MET-02`, CUDA
+/// half — `q1.rs`'s module docs): every norm / final-norm / LM-head /
+/// weight-fallback slot composed over this model's epoch, from all three
+/// CUDA caches — plus the ternary, Q4_0/Q8_0 and K-quant layouts of the same
+/// namespace
+/// ([`SlotNamespace::cuda_ternary_keys`](super::q1_slots::SlotNamespace::cuda_ternary_keys),
+/// [`SlotNamespace::cuda_std_quant_keys`](super::q1_slots::SlotNamespace::cuda_std_quant_keys),
+/// [`SlotNamespace::cuda_k_quant_keys`](super::q1_slots::SlotNamespace::cuda_k_quant_keys)).
+/// Those slots are unique to this model (no other model can compose them),
+/// so evicting them can only ever free this model's buffers; without it,
+/// per-load slots would leak one copy of the norms and LM head per
+/// load/unload cycle (the old shared literals were at least reused).
+///
 /// Mirrors the shape of the Metal branch in `gpu_cache.rs`: the two are
 /// mutually exclusive by `target_os`, so only one `Drop` impl for
 /// `BonsaiModel` is ever compiled.
@@ -130,9 +234,9 @@ pub(super) fn cuda_split_prefill_disabled(
 /// a poisoned lock), and a `Drop` that unwraps would abort the process during
 /// unwinding. Both fallible calls are logged and swallowed.
 ///
-/// **Compile-blind.** This host has no CUDA, so this branch has been written
-/// against the API and mirrored from the Metal path but never compiled or
-/// run; see the package's recorded deviations.
+/// **Compile-blind.** No CUDA hardware ran this branch: it is written
+/// against the driver API and mirrored from the Metal path, type-checked
+/// only by cross-compiling to `x86_64-unknown-linux-gnu`.
 impl Drop for BonsaiModel<'_> {
     fn drop(&mut self) {
         // Gate on "did this process ever open a CUDA context".
@@ -143,7 +247,7 @@ impl Drop for BonsaiModel<'_> {
         // the gate must not be that call.
         //
         // It also must not be `cuda_qkv_cache.is_some()`, which is what it used
-        // to be (wave-2.5 deviation #14): only `q1::get_or_build_cuda_qkv_cache`
+        // to be: only `q1::get_or_build_cuda_qkv_cache`
         // populates that field, while the ternary, Q4_0/Q8_0, K-quant and FP8
         // CUDA paths build their QKV concatenation locally. A model that used
         // one of those skipped its release entirely and leaked its GPU weights
@@ -157,23 +261,44 @@ impl Drop for BonsaiModel<'_> {
 
         let epoch = self.cuda_model_epoch;
         match oxibonsai_kernels::CudaGraph::global() {
-            Ok(graph) => match graph.release_model_epoch(epoch) {
-                Ok(released) => {
-                    if released > 0 {
-                        tracing::debug!(
-                            epoch,
-                            released,
-                            "released this model's CUDA weight buffers on drop"
-                        );
+            Ok(graph) => {
+                match graph.release_model_epoch(epoch) {
+                    Ok(released) => {
+                        if released > 0 {
+                            tracing::debug!(
+                                epoch,
+                                released,
+                                "released this model's CUDA weight buffers on drop"
+                            );
+                        }
                     }
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        epoch,
+                        "BonsaiModel::drop: releasing the CUDA weight cache failed; its GPU \
+                         buffers may outlive it"
+                    ),
                 }
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    epoch,
-                    "BonsaiModel::drop: releasing the CUDA weight cache failed; its GPU \
-                     buffers may outlive it"
-                ),
-            },
+                let slots = self.cuda_q1_slots();
+                let mut slot_keys = slots.cuda_keys(self.blocks.len());
+                slot_keys.extend(slots.cuda_ternary_keys(self.blocks.len()));
+                slot_keys.extend(slots.cuda_std_quant_keys(self.blocks.len()));
+                slot_keys.extend(slots.cuda_k_quant_keys(self.blocks.len()));
+                match graph.release_weights(&slot_keys) {
+                    Ok(0) => {}
+                    Ok(released) => tracing::debug!(
+                        epoch,
+                        released,
+                        "released this model's CUDA Q1 slot namespace on drop"
+                    ),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        epoch,
+                        "BonsaiModel::drop: releasing the CUDA Q1 slot namespace failed; its \
+                         norm / LM-head buffers may outlive it"
+                    ),
+                }
+            }
             // No CUDA context was ever created, so there is nothing cached
             // under this epoch and nothing to release.
             Err(e) => tracing::debug!(

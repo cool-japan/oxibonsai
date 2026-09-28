@@ -349,8 +349,12 @@ fn kv_cache_fill_to_capacity() {
             for head in 0..num_kv_heads {
                 let key = random_tensor(&mut state, head_dim);
                 let value = random_tensor(&mut state, head_dim);
-                cache.store_key(layer, head, pos, &key);
-                cache.store_value(layer, head, pos, &value);
+                cache
+                    .try_store_key(layer, head, pos, &key)
+                    .expect("in-range key store");
+                cache
+                    .try_store_value(layer, head, pos, &value)
+                    .expect("in-range value store");
             }
         }
         cache.advance();
@@ -382,8 +386,12 @@ fn kv_cache_sequential_write_then_read() {
         let value: Vec<f32> = (0..head_dim)
             .map(|d| -((pos * head_dim + d) as f32))
             .collect();
-        cache.store_key(0, 0, pos, &key);
-        cache.store_value(0, 0, pos, &value);
+        cache
+            .try_store_key(0, 0, pos, &key)
+            .expect("in-range key store");
+        cache
+            .try_store_value(0, 0, pos, &value)
+            .expect("in-range value store");
         cache.advance();
     }
 

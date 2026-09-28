@@ -208,10 +208,35 @@ impl ApiError {
             JsonRejection::MissingJsonContentType(_) => "unsupported_media_type",
             _ => "invalid_request_body",
         };
-        Self::new(status, rejection.body_text())
+        let message = rejection.body_text();
+        // A request type that denies unknown fields names the offending one
+        // (serde's "unknown field `x`, expected …"): report it as `param`.
+        if let JsonRejection::JsonDataError(_) = &rejection {
+            if let Some(field) = unknown_field_name(&message) {
+                let field = field.to_string();
+                return Self::new(status, message)
+                    .with_type(ERROR_TYPE_INVALID_REQUEST)
+                    .with_param(&field)
+                    .with_code(UNKNOWN_PARAMETER_CODE);
+            }
+        }
+        Self::new(status, message)
             .with_type(ERROR_TYPE_INVALID_REQUEST)
             .with_code(code)
     }
+}
+
+/// `error.code` of a request body naming a field its endpoint does not
+/// declare ([`ApiError::from_json_rejection`]; `error.param` names the
+/// field).
+pub const UNKNOWN_PARAMETER_CODE: &str = "unknown_parameter";
+
+/// The field name in a serde "unknown field `x`" deserialization message.
+pub(crate) fn unknown_field_name(message: &str) -> Option<&str> {
+    const MARKER: &str = "unknown field `";
+    let start = message.find(MARKER)? + MARKER.len();
+    let len = message[start..].find('`')?;
+    Some(&message[start..start + len])
 }
 
 impl std::fmt::Display for ApiError {
@@ -413,5 +438,50 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// A body type that denies unknown fields.
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Strict {
+        value: u32,
+    }
+
+    #[tokio::test]
+    async fn an_unknown_field_is_named_as_the_param() {
+        let app = Router::new().route(
+            "/",
+            post(|OpenAiJson(body): OpenAiJson<Strict>| async move {
+                if body.value > 0 {
+                    StatusCode::OK
+                } else {
+                    StatusCode::NO_CONTENT
+                }
+            }),
+        );
+        let resp = app
+            .oneshot(
+                Request::post("/")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"value":7,"valeu":8}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let (status, json) = body_json(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"]["param"], "valeu", "{json}");
+        assert_eq!(json["error"]["code"], UNKNOWN_PARAMETER_CODE, "{json}");
+        assert_eq!(json["error"]["type"], ERROR_TYPE_INVALID_REQUEST, "{json}");
+    }
+
+    #[test]
+    fn unknown_field_name_reads_serdes_message() {
+        assert_eq!(
+            unknown_field_name("unknown field `max_tokns`, expected one of `model`"),
+            Some("max_tokns")
+        );
+        assert_eq!(unknown_field_name("missing field `prompt`"), None);
+        assert_eq!(unknown_field_name("unknown field `unterminated"), None);
     }
 }

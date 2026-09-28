@@ -43,16 +43,13 @@ pub enum TokenizerError {
     /// tokenizer definition could not be parsed", just from a different
     /// container).
     ///
-    /// Added by B2-13 per the wave-2.5 addendum: `gguf_vocab.rs`'s own
-    /// loader was written before this variant existed (that file was
-    /// outside its owning package's `owned_files`, so it could not add the
-    /// variant itself) and reused `HfFormat` with a `"GGUF: "` message
-    /// prefix instead — `gguf_vocab.rs` is not in *this* package's
-    /// `owned_files` either, so its two `.map_err` call sites still emit
-    /// `HfFormat("GGUF: …")` rather than this variant; recorded as a
-    /// deviation with the exact one-line diff each site needs
-    /// (`.map_err(|e| TokenizerError::HfFormat(format!("GGUF: {e}")))` →
-    /// `.map_err(|e| TokenizerError::GgufFormat(e.to_string()))`).
+    /// Every failure of [`crate::gguf_vocab::tokenizer_from_gguf_metadata`]
+    /// — a missing or mistyped `tokenizer.ggml.*` key, an unsupported
+    /// `tokenizer.ggml.model`, an empty or inconsistent token array, a
+    /// malformed merge — is reported through this variant (`TOK-17`), so a
+    /// caller can tell a bad GGUF vocabulary from a bad `tokenizer.json` by
+    /// variant alone. The message carries no `"GGUF: "` prefix: this
+    /// variant's own `Display` already names the container.
     #[error("GGUF tokenizer format error: {0}")]
     GgufFormat(String),
 

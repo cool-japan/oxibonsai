@@ -13,9 +13,10 @@
 //! the fused ternary forward in `BonsaiModel::forward`/`forward_prefill`, and
 //! that forward **self-uploads** the CPU-side ternary weight blocks (it owns its
 //! own Metal device/cache), so a `KernelTier::Gpu` engine runs Metal without any
-//! `upload_weights_to_gpu` call or live `gpu_backend`. `auto_detect()` on this
-//! Mac picks NEON, never Gpu — Metal is only reachable by explicitly naming the
-//! Gpu tier, which is exactly what this guard does.
+//! `upload_weights_to_gpu` call or live `gpu_backend`. The guard names both
+//! tiers explicitly rather than relying on `auto_detect()`, so the CPU side is
+//! always the scalar reference and the Metal side runs whether or not
+//! auto-detection would have picked it on this host.
 //!
 //! Greedy semantics: `Sampler::sample` routes `temperature < 1e-6` to argmax, so
 //! the seed feeds an unused RNG and the output is a deterministic argmax chain —
@@ -25,17 +26,91 @@
 //! `oxibonsai-model/tests/metal_prefill_ternary_parity_tests.rs` (h=128,
 //! inter=256, 2 layers, vocab=32, all projections + LM head stored as
 //! `TQ2_0_g128`), reproduced here verbatim so the fixture stays known-good.
+//!
+//! ## `OXIBONSAI_KERNEL_TIER`
+//!
+//! The opt-in INT8 tier (K-14) changes the CPU tiers' native-format GEMV/GEMM
+//! results bit for bit, so the byte-identity contract above is a contract
+//! about the **default** configuration. Every test here therefore takes a
+//! [`TierEnvGuard`], which clears the variable for the test's lifetime (an
+//! ambient export, or a gate that sets it for this binary's throughput leg,
+//! cannot leak into the CPU-vs-Metal comparison) and restores it afterwards.
+//! `metal_greedy_output_ignores_the_int8_tier_selector` pins the other half:
+//! a `KernelTier::Gpu` engine is never diverted, whatever the variable says.
 
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
 use half::f16;
-use oxibonsai_core::gguf::reader::GgufFile;
+use oxibonsai_core::gguf::reader::{mmap_gguf_file, GgufFile};
 use oxibonsai_core::gguf::writer::{GgufWriter, MetadataWriteValue, TensorEntry, TensorType};
 use oxibonsai_kernels::dispatch::KernelTier;
+use oxibonsai_kernels::dispatch_int8::{Int8Tier, KERNEL_TIER_ENV};
 use oxibonsai_model::model::BonsaiModel;
 use oxibonsai_runtime::engine::InferenceEngine;
+use oxibonsai_runtime::engine_seam::Backend;
 use oxibonsai_runtime::sampling::SamplingParams;
+use oxibonsai_testkit::capability::{record_executed, record_skipped, Capability};
 use oxibonsai_testkit::gguf_fixture::Lcg;
+
+/// Serializes every test in this binary: each one owns
+/// `OXIBONSAI_KERNEL_TIER` for its whole run through a [`TierEnvGuard`]
+/// (`std::env::set_var` is `unsafe` because a concurrent read on any key can
+/// observe a torn `environ`), and the real-model tests must not overlap
+/// either — two multi-hundred-MB models resident at once, or a throughput
+/// measurement sharing the cores with a Metal run, would be wrong for other
+/// reasons.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// RAII owner of `OXIBONSAI_KERNEL_TIER` for one test: takes [`ENV_LOCK`],
+/// snapshots and **clears** the variable, and restores the snapshot on drop
+/// (also while unwinding from a failed assertion).
+struct TierEnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    prior: Option<String>,
+}
+
+impl TierEnvGuard {
+    fn cleared() -> Self {
+        let lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = std::env::var(KERNEL_TIER_ENV).ok();
+        // SAFETY: `lock` is held for the lifetime of the returned guard and
+        // serializes every reader and writer of the variable in this binary.
+        unsafe {
+            std::env::remove_var(KERNEL_TIER_ENV);
+        }
+        Self { _lock: lock, prior }
+    }
+
+    /// The value the variable held before this guard cleared it.
+    fn ambient(&self) -> Option<&str> {
+        self.prior.as_deref()
+    }
+
+    /// Set (`Some`) or clear (`None`) the tier selector.
+    fn select(&self, name: Option<&str>) {
+        // SAFETY: `self._lock` is held (see `cleared`).
+        unsafe {
+            match name {
+                Some(n) => std::env::set_var(KERNEL_TIER_ENV, n),
+                None => std::env::remove_var(KERNEL_TIER_ENV),
+            }
+        }
+    }
+}
+
+impl Drop for TierEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: `self._lock` is held for the entire body of `drop`.
+        unsafe {
+            match &self.prior {
+                Some(v) => std::env::set_var(KERNEL_TIER_ENV, v),
+                None => std::env::remove_var(KERNEL_TIER_ENV),
+            }
+        }
+    }
+}
 
 /// KV-cache / context budget for the synthetic model.
 const MAX_SEQ: usize = 512;
@@ -57,21 +132,17 @@ const MAX_SEQ: usize = 512;
 /// To get a reasonably "interesting" weight matrix we vary both the qs pattern
 /// and the scale across blocks based on a 64-bit linear-congruential PRNG seed.
 ///
-/// CQ-14 (wave-2.5 deviation routing #7): `11` (`0b11`) is a *reserved* code,
-/// not a fourth value — `screen_ternary_codes` in
-/// `oxibonsai-model/src/weight_loaders.rs` now rejects it outright, so this
-/// fixture must never emit it. A raw `(state >> 33) as u8` byte (the
-/// previous body) lands on `0b11` in about a quarter of *lanes*; each lane
-/// is folded into `{0, 1, 2}` before packing instead, exactly as
-/// `crates/oxibonsai-model/src/model/types/gpu_cache.rs::tq2_pattern`
-/// already does.
+/// CQ-14: `11` (`0b11`) is a *reserved* code, not a fourth value —
+/// `screen_ternary_codes` in `oxibonsai-model/src/weight_loaders.rs` rejects
+/// it outright, so this fixture must never emit it; each lane is folded into
+/// `{0, 1, 2}` before packing, exactly as
+/// `crates/oxibonsai-model/src/model/types/gpu_cache.rs::tq2_pattern` does.
 ///
-/// T-07 FIX (verifier wave 3): re-pointed at
-/// `oxibonsai_testkit::gguf_fixture::Lcg::next_valid_tq2_byte`, byte-for-byte
-/// identical to the previous hand-rolled state machine (`Lcg::new(s)` stores
-/// `s` as its state directly, so pre-adding the same golden-ratio constant
-/// this file always added before its first `next_u64()` reproduces the exact
-/// sequence) — confirmed by re-running this file's tests unchanged.
+/// T-07: the bytes come from
+/// `oxibonsai_testkit::gguf_fixture::Lcg::next_valid_tq2_byte`; `Lcg::new(s)`
+/// stores `s` as its state directly, and the same golden-ratio constant is
+/// pre-added before the first `next_u64()`, so the byte sequence is the one
+/// this fixture has always produced.
 fn tq2_0_g128_pattern(num_weights: usize, seed: u64) -> Vec<u8> {
     assert_eq!(
         num_weights % 128,
@@ -296,6 +367,7 @@ fn run(gguf_bytes: &[u8], tier: KernelTier, prompt: &[u32], n: usize) -> Vec<u32
 /// on every `--features metal` test run.
 #[test]
 fn cpu_reference_and_metal_agree_greedy_temp0_seed42() {
+    let _env = TierEnvGuard::cleared();
     let gguf = build_synthetic_ternary_gguf();
     // Fixed 6-token prompt, all in [0, vocab=32).
     let prompt: Vec<u32> = vec![1, 4, 7, 10, 13, 16];
@@ -317,6 +389,40 @@ fn cpu_reference_and_metal_agree_greedy_temp0_seed42() {
         "README determinism gate VIOLATED: CPU(Reference) and Metal(Gpu) greedy \
          output diverged at temperature 0 / seed 42.\n  cpu   = {cpu:?}\n  metal = {metal:?}"
     );
+    println!(
+        "synthetic fixture: CPU(Reference) and Metal(Gpu) greedy outputs byte-identical \
+         ({} tokens)",
+        cpu.len()
+    );
+}
+
+/// A `KernelTier::Gpu` engine is never diverted onto the opt-in INT8 tier:
+/// with `OXIBONSAI_KERNEL_TIER` naming one, the Metal greedy chain is
+/// byte-identical to the one it produces with the variable unset.
+#[test]
+fn metal_greedy_output_ignores_the_int8_tier_selector() {
+    let env = TierEnvGuard::cleared();
+    let gguf = build_synthetic_ternary_gguf();
+    let prompt: Vec<u32> = vec![2, 5, 8, 11, 14, 17, 20];
+    let n = 16;
+
+    let unset = run(&gguf, KernelTier::Gpu, &prompt, n);
+    let tier = Int8Tier::best_available();
+    env.select(Some(tier.name()));
+    let selected = run(&gguf, KernelTier::Gpu, &prompt, n);
+    env.select(None);
+
+    assert!(!unset.is_empty(), "Metal produced no tokens");
+    assert_eq!(
+        unset, selected,
+        "the Metal engine's greedy output changed when {KERNEL_TIER_ENV}={tier} was set — \
+         a Gpu-tier dispatcher must never be diverted onto the INT8 tier"
+    );
+    println!(
+        "Metal(Gpu) greedy output byte-identical with {KERNEL_TIER_ENV} unset and ={tier} \
+         ({} tokens)",
+        unset.len()
+    );
 }
 
 /// FAITHFUL guard against a real staged ternary GGUF. Validates the README
@@ -334,6 +440,7 @@ fn cpu_reference_and_metal_agree_greedy_temp0_seed42() {
 #[test]
 #[ignore = "requires OXI_MODEL real ternary GGUF; run on dev Mac"]
 fn real_model_cpu_metal_byte_identical() {
+    let _env = TierEnvGuard::cleared();
     let Some(path) = std::env::var_os("OXI_MODEL") else {
         eprintln!(
             "real_model_cpu_metal_byte_identical: OXI_MODEL not set — skipping. \
@@ -369,6 +476,129 @@ fn real_model_cpu_metal_byte_identical() {
              (first divergence at index {first}).\n  cpu   = {cpu:?}\n  metal = {metal:?}"
         );
     }
+    println!(
+        "real model: CPU(Reference) and Metal(Gpu) greedy outputs byte-identical ({} tokens)",
+        cpu.len()
+    );
+}
+
+/// The 1/5/15-minute load average, for the throughput line.
+fn load_average() -> String {
+    std::process::Command::new("sysctl")
+        .args(["-n", "vm.loadavg"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| {
+            s.trim()
+                .trim_matches(|c| c == '{' || c == '}')
+                .trim()
+                .to_string()
+        })
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// First-index argmax (the greedy sampler's tie-break).
+fn argmax_first(values: &[f32]) -> u32 {
+    let mut best_i = 0usize;
+    let mut best_v = f32::NEG_INFINITY;
+    for (i, &v) in values.iter().enumerate() {
+        if v > best_v {
+            best_v = v;
+            best_i = i;
+        }
+    }
+    best_i as u32
+}
+
+/// Decode steps the throughput measurement times.
+const DECODE_STEPS: usize = 32;
+
+/// Greedy decode of [`DECODE_STEPS`] tokens through `engine`'s own
+/// prefill/decode entry points; returns the tokens and the decode time.
+fn timed_greedy_decode(
+    engine: &mut InferenceEngine<'_>,
+    prompt: &[u32],
+) -> (Vec<u32>, std::time::Duration) {
+    engine.reset();
+    let logits = engine.prefill_from_pos(prompt, 0).expect("prefill");
+    let mut tokens = vec![argmax_first(&logits)];
+    let start = std::time::Instant::now();
+    for step in 0..DECODE_STEPS {
+        let next = engine
+            .decode_step(tokens[step], prompt.len() + step)
+            .expect("decode step");
+        tokens.push(argmax_first(&next));
+    }
+    (tokens, start.elapsed())
+}
+
+/// CPU decode throughput of [`InferenceEngine`] on the real ternary model in
+/// `OXI_MODEL`, with the opt-in INT8 tier (K-14) off and on.
+///
+/// The engine is built on [`Backend::Cpu`], so the model's own per-layer
+/// dispatchers are CPU-tier and the tier genuinely applies (a `Gpu`-tier
+/// engine is never diverted). The tier used is the ambient
+/// `OXIBONSAI_KERNEL_TIER` when one is set — a gate can pick it — else the
+/// best this CPU supports. Reports decode tok/s both ways, the machine's
+/// load, and how far the two greedy chains agree (int8 activation
+/// quantization may legitimately flip a near-tie, so agreement is evidence,
+/// not a gate). Self-skips with a capability record when `OXI_MODEL` is
+/// unset.
+#[test]
+fn real_model_cpu_decode_tok_s_with_and_without_the_int8_tier() {
+    let env = TierEnvGuard::cleared();
+    let test_name = "oxibonsai-runtime::cross_backend_determinism_tests::\
+                     real_model_cpu_decode_tok_s_with_and_without_the_int8_tier";
+    let Some(path) = std::env::var_os("OXI_MODEL") else {
+        eprintln!("skip: OXI_MODEL not set (a real ternary GGUF, e.g. Ternary-Bonsai-1.7B)");
+        record_skipped(Capability::LegacyModels, test_name);
+        return;
+    };
+    let tier = env
+        .ambient()
+        .and_then(Int8Tier::from_name)
+        .map(Int8Tier::clamp_to_cpu)
+        .unwrap_or_else(Int8Tier::best_available);
+
+    let mmap = mmap_gguf_file(std::path::Path::new(&path)).expect("mmap OXI_MODEL");
+    let gguf = GgufFile::parse(&mmap).expect("parse OXI_MODEL");
+    let mut engine =
+        InferenceEngine::from_gguf_with_backend(&gguf, greedy_params(), 42, MAX_SEQ, Backend::Cpu)
+            .expect("CPU-backend engine");
+    // <|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n
+    let prompt: Vec<u32> = vec![151644, 872, 198, 9707, 151645, 198, 151644, 77091, 198];
+
+    // Warm both configurations once (page-in, Rayon pool), then measure.
+    let _ = timed_greedy_decode(&mut engine, &prompt);
+    let (f32_tokens, f32_time) = timed_greedy_decode(&mut engine, &prompt);
+    env.select(Some(tier.name()));
+    let _ = timed_greedy_decode(&mut engine, &prompt);
+    let (int8_tokens, int8_time) = timed_greedy_decode(&mut engine, &prompt);
+    env.select(None);
+
+    let f32_tok_s = DECODE_STEPS as f64 / f32_time.as_secs_f64().max(1e-12);
+    let int8_tok_s = DECODE_STEPS as f64 / int8_time.as_secs_f64().max(1e-12);
+    let agree = f32_tokens
+        .iter()
+        .zip(int8_tokens.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    println!(
+        "InferenceEngine CPU decode on {}: {f32_tok_s:.2} tok/s f32 default -> {int8_tok_s:.2} \
+         tok/s with {KERNEL_TIER_ENV}={tier} ({:.2}x, {DECODE_STEPS} greedy steps, release={}); \
+         greedy chains agree on the first {agree}/{} tokens; load average {}",
+        std::path::Path::new(&path)
+            .file_name()
+            .map_or_else(|| "OXI_MODEL".into(), |n| n.to_string_lossy()),
+        int8_tok_s / f32_tok_s.max(1e-12),
+        !cfg!(debug_assertions),
+        f32_tokens.len(),
+        load_average()
+    );
+    assert_eq!(f32_tokens.len(), DECODE_STEPS + 1);
+    assert_eq!(int8_tokens.len(), DECODE_STEPS + 1);
+    record_executed(Capability::LegacyModels, test_name);
 }
 
 // CUDA variant: same shape, gate on native-cuda + linux/windows, compares

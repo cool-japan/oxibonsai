@@ -86,6 +86,18 @@ pub enum Capability {
     /// real-model parity gate never ran". A distinct name lets a future
     /// `REQUIRED_CAPS` entry gate on this specifically.
     LegacyModels,
+    /// The real Bonsai 2 27B GGUFs (`Ternary-Bonsai-2-27B-{PQ2_0,PTQ1_0}.gguf`)
+    /// are present under `models/` (or `$OXIBONSAI_MODELS_DIR`) — the same
+    /// "model-file presence, not hardware" shape as [`Self::LegacyModels`],
+    /// and deliberately a distinct name for the same reason: any Metal host
+    /// already satisfies [`Self::Metal`] regardless of whether these specific
+    /// 27B gates ever ran, so `REQUIRED_CAPS` needs its own name to gate on
+    /// them. HANDOVER-INFRA (B2-11-FIX deviation\[7\] / ENGINE-SEAM deviation
+    /// \[7\]): this replaces the hand-written `"bonsai2-models"` JSONL record
+    /// `crates/oxibonsai-model/tests/bonsai2_real/harness.rs::record_capability`
+    /// and `crates/oxibonsai-runtime/tests/bonsai2_engine_tests.rs` used to
+    /// write directly, before this variant existed.
+    Bonsai2Models,
 }
 
 impl Capability {
@@ -99,6 +111,7 @@ impl Capability {
             Self::RagRealGeneration => "rag-real-generation",
             Self::ImageParity => "image-parity",
             Self::LegacyModels => "legacy-models",
+            Self::Bonsai2Models => "bonsai2-models",
         }
     }
 }
@@ -488,7 +501,46 @@ mod tests {
         );
         assert_eq!(Capability::ImageParity.as_str(), "image-parity");
         assert_eq!(Capability::LegacyModels.as_str(), "legacy-models");
+        assert_eq!(Capability::Bonsai2Models.as_str(), "bonsai2-models");
         // Display must agree with as_str (call sites use both).
         assert_eq!(Capability::Metal.to_string(), Capability::Metal.as_str());
+        assert_eq!(
+            Capability::Bonsai2Models.to_string(),
+            Capability::Bonsai2Models.as_str()
+        );
+    }
+
+    /// HANDOVER-INFRA spec item 1: `Capability::Bonsai2Models` must write the
+    /// same documented JSONL schema [`record_executed`]/[`record_skipped`]
+    /// write for every other capability — this is the dedicated test for the
+    /// new variant (distinct from
+    /// [`record_executed_and_record_skipped_write_the_documented_flag`],
+    /// which pins the shared behaviour via [`Capability::LegacyModels`]).
+    #[test]
+    fn bonsai2_models_record_executed_and_skipped_write_the_documented_schema() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let path = unique_temp_path("bonsai2-models");
+        std::env::set_var("OXIBONSAI_CAPABILITY_REPORT", &path);
+        record_executed(Capability::Bonsai2Models, "crate::file::bonsai2_ran");
+        record_skipped(Capability::Bonsai2Models, "crate::file::bonsai2_skipped");
+        std::env::remove_var("OXIBONSAI_CAPABILITY_REPORT");
+
+        let contents = std::fs::read_to_string(&path).expect("read manifest");
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2, "expected two records, got: {contents:?}");
+
+        let ran: serde_json::Value = serde_json::from_str(lines[0]).expect("line 1 valid json");
+        assert_eq!(ran["capability"], "bonsai2-models");
+        assert_eq!(ran["executed"], true);
+        assert_eq!(ran["test"], "crate::file::bonsai2_ran");
+
+        let skipped: serde_json::Value = serde_json::from_str(lines[1]).expect("line 2 valid json");
+        assert_eq!(skipped["capability"], "bonsai2-models");
+        assert_eq!(skipped["executed"], false);
+        assert_eq!(skipped["test"], "crate::file::bonsai2_skipped");
+
+        let _ = std::fs::remove_file(&path);
     }
 }

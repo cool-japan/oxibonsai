@@ -8,6 +8,12 @@
 //! stays a thin dispatch point: config loading and the flag/config-file
 //! merge for each subcommand's arguments happen here, in one place, so
 //! every subcommand applies `--config` the same way (cli-04).
+//!
+//! Every value that can be resolved before the model is loaded is
+//! validated here, whichever source it came from (a flag already passed its
+//! clap `value_parser`; a `--config` value only passes through
+//! [`util::validated_opt`]) — so a bad config value is refused, naming the
+//! field, before any model is resolved or loaded.
 
 use std::path::Path;
 
@@ -15,7 +21,10 @@ use oxibonsai_runtime::OxiBonsaiConfig;
 
 #[cfg(feature = "server")]
 mod admission;
+mod bonsai2;
+mod generate;
 mod model_desc;
+mod model_source;
 mod repl;
 mod term;
 mod tokenizer_backend;
@@ -36,46 +45,198 @@ mod cmd_run;
 mod cmd_serve;
 mod cmd_tokenizer;
 mod cmd_validate;
+mod pull;
 
 pub(crate) use args::Cli;
 use args::Commands;
-use util::RawTomlSections;
+use util::{validated, validated_opt, RawTomlSections};
 
-/// cli-24: `oxibonsai repl --cpu-te`-less invocations set `OXI_TE_GPU=1`
-/// so the text encoder's GPU dispatch `OnceCell` latch reads it on the
-/// first forward pass. `std::env::set_var` is only actually safe to call
-/// when no other thread can be concurrently reading the environment (it
-/// becomes an `unsafe fn` outright under edition 2024) — which is true
-/// here, in `main()`, before the tokio runtime (and therefore any worker
-/// thread) has been built, but was NOT reliably true when this used to
-/// run from inside `repl::run`, called from async code already running on
-/// a multi-threaded tokio runtime. Call this before building that
-/// runtime, on the single main thread, with the same [`Cli`] then passed
-/// to [`run_with`].
+/// The `OXIBONSAI_CUDA_DEVICE` variable `oxibonsai-kernels` reads when it
+/// creates its CUDA context (F-M4).
+#[cfg(feature = "server")]
+const CUDA_DEVICE_ENV: &str = "OXIBONSAI_CUDA_DEVICE";
+
+/// Apply every environment-variable latch a subcommand needs, on the single
+/// main thread, BEFORE the tokio runtime (and therefore any worker thread)
+/// exists — the only point where `std::env::set_var` is sound (it becomes
+/// an `unsafe fn` outright under edition 2024).
+///
+/// * cli-24: `oxibonsai repl` without `--cpu-te` sets `OXI_TE_GPU=1` so the
+///   text encoder's GPU dispatch `OnceCell` latch reads it on the first
+///   forward pass.
+/// * F-M4: `oxibonsai serve --cuda-device N` (or `[server].cuda_device` in
+///   `--config`) sets `OXIBONSAI_CUDA_DEVICE=N`, which the CUDA backend
+///   reads when it creates its context. The `--config` file is read here
+///   too (a plain synchronous read); an unreadable or malformed file is
+///   ignored at this point because [`run_with`] reports it as the hard error
+///   it is a moment later.
 pub fn apply_pre_runtime_env(cli: &Cli) {
-    if let Commands::Repl { cpu_te, .. } = &cli.command {
-        if !cpu_te && std::env::var_os("OXI_TE_GPU").is_none() {
+    match &cli.command {
+        Commands::Repl { cpu_te, .. } if !cpu_te && std::env::var_os("OXI_TE_GPU").is_none() => {
             // SAFETY: called from `main()` before the tokio runtime (and
-            // therefore any other thread) is built, so no concurrent
-            // reader of the environment can exist yet.
-            std::env::set_var("OXI_TE_GPU", "1");
+            // therefore any other thread) is built, so no concurrent reader
+            // of the environment can exist yet.
+            unsafe { std::env::set_var("OXI_TE_GPU", "1") };
         }
+        #[cfg(feature = "server")]
+        Commands::Serve { cuda_device, .. } => {
+            let from_config = || -> Option<u32> {
+                let path = cli.config.as_deref()?;
+                let content = std::fs::read_to_string(path).ok()?;
+                let sections = util::parse_flat_toml_sections(&content, Path::new(path)).ok()?;
+                util::toml_u32(&sections, "server", "cuda_device")
+            };
+            if let Some(device) = cuda_device.or_else(from_config) {
+                // SAFETY: see the `Repl` arm — still single-threaded.
+                unsafe { std::env::set_var(CUDA_DEVICE_ENV, device.to_string()) };
+            }
+        }
+        _ => {}
     }
 }
 
-/// Convert one of `args.rs`'s `validate_*`/`parse_*` `Result<T, String>`
-/// outcomes into `anyhow::Result<T>`.
-///
-/// cli-12's range checks live in `args.rs` as clap `value_parser`s, which
-/// only ever see a value that arrived as a `--flag`. A value resolved from
-/// `[sampling]`/`[model]` in `--config` (cli-04) is parsed by this
-/// module's own `toml_f32`/`toml_usize` — plain `str::parse`, with none of
-/// those range checks — so every sampling/length value resolved below is
-/// re-validated here regardless of which side (flag or config) it came
-/// from, closing the gap a config file would otherwise have through a
-/// different door than the one cli-12 closed on `--flag`.
-fn validated<T>(result: Result<T, String>) -> anyhow::Result<T> {
-    result.map_err(|e| anyhow::anyhow!(e))
+/// Resolve `--think`/`--no-think` (cli-11) into the template's
+/// `enable_thinking: Option<bool>`: `Some(true)`/`Some(false)` for an
+/// explicit flag, else `[model].enable_thinking` from `--config`, else
+/// `None` — the template's own undefined branch (see
+/// [`bonsai2::default_enable_thinking`] for what that means per model).
+/// `args.rs`'s `conflicts_with` already makes both flags at once a parse
+/// error.
+fn resolve_enable_thinking(
+    think: bool,
+    no_think: bool,
+    sections: &RawTomlSections,
+) -> Option<bool> {
+    if think {
+        Some(true)
+    } else if no_think {
+        Some(false)
+    } else {
+        util::toml_bool(sections, "model", "enable_thinking")
+    }
+}
+
+/// `--reasoning-effort` or `[model].reasoning_effort`, validated.
+fn resolve_reasoning_effort(
+    cli: Option<String>,
+    sections: &RawTomlSections,
+) -> anyhow::Result<Option<String>> {
+    util::resolve_str(cli, sections, "model", "reasoning_effort")
+        .map(|s| validated(args::validate_reasoning_effort(&s)))
+        .transpose()
+}
+
+/// `--prefill-chunk` or `[model].prefill_chunk`, validated.
+fn resolve_prefill_chunk(
+    cli: Option<usize>,
+    sections: &RawTomlSections,
+) -> anyhow::Result<Option<usize>> {
+    validated_opt(
+        cli.or_else(|| util::toml_usize(sections, "model", "prefill_chunk")),
+        args::validate_prefill_chunk,
+    )
+}
+
+/// The RT-17 sampling values a flag or `--config` supplied, validated; the
+/// model's own `general.sampling.*` defaults (and the final literals) are
+/// applied after the GGUF is loaded, so `None` is kept as "not given".
+struct SamplingOverrides {
+    temperature: Option<f32>,
+    top_k: Option<usize>,
+    top_p: Option<f32>,
+    min_p: Option<f32>,
+}
+
+fn resolve_sampling_overrides(
+    temperature: Option<f32>,
+    top_k: Option<usize>,
+    top_p: Option<f32>,
+    min_p: Option<f32>,
+    sections: &RawTomlSections,
+) -> anyhow::Result<SamplingOverrides> {
+    Ok(SamplingOverrides {
+        temperature: validated_opt(
+            temperature.or_else(|| util::toml_f32(sections, "sampling", "temperature")),
+            args::validate_temperature,
+        )?,
+        top_k: top_k.or_else(|| util::toml_usize(sections, "sampling", "top_k")),
+        top_p: validated_opt(
+            top_p.or_else(|| util::toml_f32(sections, "sampling", "top_p")),
+            args::validate_top_p,
+        )?,
+        min_p: validated_opt(
+            min_p.or_else(|| util::toml_f32(sections, "sampling", "min_p")),
+            args::validate_min_p,
+        )?,
+    })
+}
+
+/// `--max-seq-len`/`--ctx` or `[model].max_seq_len`, validated; the
+/// per-architecture default is applied once the GGUF is parsed.
+fn resolve_max_seq_len(
+    cli: Option<usize>,
+    sections: &RawTomlSections,
+) -> anyhow::Result<Option<usize>> {
+    validated_opt(
+        cli.or_else(|| util::toml_usize(sections, "model", "max_seq_len")),
+        args::validate_max_seq_len,
+    )
+}
+
+/// `oxibonsai image`/`repl`: resolve the `[imagen]` section of `--config`
+/// into an [`oxibonsai_runtime::config::ImagenConfig`] (wave-3.5 addendum
+/// item 3): an explicit flag wins, then `[imagen]`, then the CLI's own
+/// literal default (seed 42, 4 steps, 512 x 512). The result is validated
+/// through `OxiBonsaiConfig::validate` (non-zero size and step count).
+/// `[imagen].guidance_scale` is refused rather than ignored: the FLUX.2
+/// Klein DiT is guidance-distilled and this pipeline has no CFG stage.
+fn resolve_imagen_config(
+    seed: Option<u64>,
+    steps: Option<usize>,
+    width: Option<usize>,
+    height: Option<usize>,
+    sections: &RawTomlSections,
+) -> anyhow::Result<oxibonsai_runtime::config::ImagenConfig> {
+    if util::toml_f32(sections, "imagen", "guidance_scale").is_some() {
+        anyhow::bail!(
+            "[imagen].guidance_scale is not supported: the Bonsai-Image (FLUX.2 Klein) pipeline \
+             is guidance-distilled and has no classifier-free-guidance stage; remove the key"
+        );
+    }
+    let to_u32 = |name: &str, value: usize| {
+        u32::try_from(value).map_err(|_| anyhow::anyhow!("--{name} {value} is out of range"))
+    };
+    let width = match width {
+        Some(w) => to_u32("width", w)?,
+        None => util::toml_u32(sections, "imagen", "width").unwrap_or(512),
+    };
+    let height = match height {
+        Some(h) => to_u32("height", h)?,
+        None => util::toml_u32(sections, "imagen", "height").unwrap_or(512),
+    };
+    let steps = match steps {
+        Some(s) => to_u32("steps", s)?,
+        None => util::toml_u32(sections, "imagen", "steps").unwrap_or(4),
+    };
+    let imagen = oxibonsai_runtime::config::ImagenConfig {
+        model_path: util::toml_str(sections, "imagen", "model_path"),
+        width,
+        height,
+        steps,
+        seed: Some(
+            seed.or_else(|| util::toml_u64(sections, "imagen", "seed"))
+                .unwrap_or(42),
+        ),
+        output_dir: util::toml_str(sections, "imagen", "output_dir"),
+        ..oxibonsai_runtime::config::ImagenConfig::default()
+    };
+    OxiBonsaiConfig {
+        imagen: imagen.clone(),
+        ..OxiBonsaiConfig::default()
+    }
+    .validate()
+    .map_err(|e| anyhow::anyhow!("invalid image settings: {e}"))?;
+    Ok(imagen)
 }
 
 /// Dispatch an already-parsed [`Cli`]. See [`apply_pre_runtime_env`] for
@@ -131,11 +292,27 @@ pub async fn run_with(cli: Cli) -> anyhow::Result<()> {
             max_seq_len,
             tokenizer,
             tokenizer_backend,
+            chat,
             grammar,
             stop,
+            min_p,
+            backend,
+            rope_scaling,
+            think,
+            no_think,
+            reasoning_effort,
+            tools,
+            show_reasoning,
+            hide_reasoning,
+            ptq1_transcode,
+            prefill_chunk,
+            mmproj,
+            image,
+            image_max_tokens,
             allow_vocab_mismatch,
             no_stream,
         } => {
+            let sampling = resolve_sampling_overrides(temperature, top_k, top_p, min_p, &sections)?;
             let run_args = cmd_run::RunArgs {
                 model: util::resolve_str(model, &sections, "model", "model_path"),
                 prompt,
@@ -146,24 +323,17 @@ pub async fn run_with(cli: Cli) -> anyhow::Result<()> {
                     "max_tokens",
                     256,
                 )))?,
-                temperature: validated(args::validate_temperature(util::resolve_f32(
-                    temperature,
-                    &sections,
-                    "sampling",
-                    "temperature",
-                    0.7,
-                )))?,
-                top_k: util::resolve_usize(top_k, &sections, "sampling", "top_k", 40),
-                top_p: validated(args::validate_top_p(util::resolve_f32(
-                    top_p, &sections, "sampling", "top_p", 0.9,
-                )))?,
+                temperature: sampling.temperature,
+                top_k: sampling.top_k,
+                top_p: sampling.top_p,
+                min_p: sampling.min_p,
                 repetition_penalty: validated(args::validate_repetition_penalty(
                     util::resolve_f32(
                         repetition_penalty,
                         &sections,
                         "sampling",
                         "repetition_penalty",
-                        1.0,
+                        util::DEFAULT_REPETITION_PENALTY,
                     ),
                 ))?,
                 frequency_penalty: validated(args::validate_openai_penalty(util::resolve_f32(
@@ -181,17 +351,32 @@ pub async fn run_with(cli: Cli) -> anyhow::Result<()> {
                     0.0,
                 )))?,
                 seed,
-                max_seq_len: validated(args::validate_max_seq_len(util::resolve_usize(
-                    max_seq_len,
-                    &sections,
-                    "model",
-                    "max_seq_len",
-                    4096,
-                )))?,
+                max_seq_len: resolve_max_seq_len(max_seq_len, &sections)?,
                 tokenizer: util::resolve_str(tokenizer, &sections, "model", "tokenizer_path"),
                 tokenizer_backend,
+                chat,
                 grammar,
                 stop,
+                backend: util::resolve_backend(backend, &sections, "model", "backend")?,
+                rope_scaling: util::resolve_rope_scaling(
+                    rope_scaling,
+                    &sections,
+                    "model",
+                    "rope_scaling",
+                )?,
+                enable_thinking: resolve_enable_thinking(think, no_think, &sections),
+                reasoning_effort: resolve_reasoning_effort(reasoning_effort, &sections)?,
+                tools,
+                show_reasoning,
+                hide_reasoning,
+                ptq1_transcode: ptq1_transcode
+                    || util::toml_bool(&sections, "model", "ptq1_transcode").unwrap_or(false),
+                prefill_chunk: resolve_prefill_chunk(prefill_chunk, &sections)?,
+                vision: bonsai2::VisionRequest {
+                    mmproj,
+                    images: image,
+                    image_max_tokens,
+                },
                 allow_vocab_mismatch,
                 no_stream,
             };
@@ -209,9 +394,27 @@ pub async fn run_with(cli: Cli) -> anyhow::Result<()> {
             vae,
             te,
             tokenizer,
-        } => cmd_image::run_image(
-            prompt, out, seed, steps, width, height, dit, vae, te, tokenizer,
-        )?,
+        } => {
+            let imagen = resolve_imagen_config(seed, steps, width, height, &sections)?;
+            let out = match &imagen.output_dir {
+                Some(dir) if Path::new(&out).is_relative() => {
+                    Path::new(dir).join(&out).to_string_lossy().into_owned()
+                }
+                _ => out,
+            };
+            cmd_image::run_image(
+                prompt,
+                out,
+                imagen.seed.unwrap_or(42),
+                imagen.steps as usize,
+                imagen.width as usize,
+                imagen.height as usize,
+                dit.or(imagen.model_path),
+                vae,
+                te,
+                tokenizer,
+            )?
+        }
 
         Commands::Repl {
             seed,
@@ -223,7 +426,20 @@ pub async fn run_with(cli: Cli) -> anyhow::Result<()> {
             vae,
             te,
             tokenizer,
-        } => cmd_image::run_repl(seed, steps, width, height, cpu_te, dit, vae, te, tokenizer)?,
+        } => {
+            let imagen = resolve_imagen_config(seed, steps, width, height, &sections)?;
+            cmd_image::run_repl(
+                imagen.seed.unwrap_or(42),
+                imagen.steps as usize,
+                imagen.width as usize,
+                imagen.height as usize,
+                cpu_te,
+                dit.or(imagen.model_path),
+                vae,
+                te,
+                tokenizer,
+            )?
+        }
 
         Commands::Chat {
             model,
@@ -240,8 +456,23 @@ pub async fn run_with(cli: Cli) -> anyhow::Result<()> {
             tokenizer_backend,
             grammar,
             stop,
+            min_p,
+            backend,
+            rope_scaling,
+            think,
+            no_think,
+            reasoning_effort,
+            tools,
+            show_reasoning,
+            hide_reasoning,
+            ptq1_transcode,
+            prefill_chunk,
+            mmproj,
+            image,
+            image_max_tokens,
             allow_vocab_mismatch,
         } => {
+            let sampling = resolve_sampling_overrides(temperature, top_k, top_p, min_p, &sections)?;
             let chat_args = cmd_chat::ChatArgs {
                 model: util::resolve_str(model, &sections, "model", "model_path"),
                 max_tokens: validated(args::validate_max_tokens(util::resolve_usize(
@@ -251,24 +482,17 @@ pub async fn run_with(cli: Cli) -> anyhow::Result<()> {
                     "max_tokens",
                     512,
                 )))?,
-                temperature: validated(args::validate_temperature(util::resolve_f32(
-                    temperature,
-                    &sections,
-                    "sampling",
-                    "temperature",
-                    0.7,
-                )))?,
-                top_k: util::resolve_usize(top_k, &sections, "sampling", "top_k", 40),
-                top_p: validated(args::validate_top_p(util::resolve_f32(
-                    top_p, &sections, "sampling", "top_p", 0.9,
-                )))?,
+                temperature: sampling.temperature,
+                top_k: sampling.top_k,
+                top_p: sampling.top_p,
+                min_p: sampling.min_p,
                 repetition_penalty: validated(args::validate_repetition_penalty(
                     util::resolve_f32(
                         repetition_penalty,
                         &sections,
                         "sampling",
                         "repetition_penalty",
-                        1.0,
+                        util::DEFAULT_REPETITION_PENALTY,
                     ),
                 ))?,
                 frequency_penalty: validated(args::validate_openai_penalty(util::resolve_f32(
@@ -286,17 +510,31 @@ pub async fn run_with(cli: Cli) -> anyhow::Result<()> {
                     0.0,
                 )))?,
                 seed,
-                max_seq_len: validated(args::validate_max_seq_len(util::resolve_usize(
-                    max_seq_len,
-                    &sections,
-                    "model",
-                    "max_seq_len",
-                    4096,
-                )))?,
+                max_seq_len: resolve_max_seq_len(max_seq_len, &sections)?,
                 tokenizer: util::resolve_str(tokenizer, &sections, "model", "tokenizer_path"),
                 tokenizer_backend,
                 grammar,
                 stop,
+                backend: util::resolve_backend(backend, &sections, "model", "backend")?,
+                rope_scaling: util::resolve_rope_scaling(
+                    rope_scaling,
+                    &sections,
+                    "model",
+                    "rope_scaling",
+                )?,
+                enable_thinking: resolve_enable_thinking(think, no_think, &sections),
+                reasoning_effort: resolve_reasoning_effort(reasoning_effort, &sections)?,
+                tools,
+                show_reasoning,
+                hide_reasoning,
+                ptq1_transcode: ptq1_transcode
+                    || util::toml_bool(&sections, "model", "ptq1_transcode").unwrap_or(false),
+                prefill_chunk: resolve_prefill_chunk(prefill_chunk, &sections)?,
+                vision: bonsai2::VisionRequest {
+                    mmproj,
+                    images: image,
+                    image_max_tokens,
+                },
                 allow_vocab_mismatch,
             };
             cmd_chat::run(chat_args)?
@@ -315,16 +553,31 @@ pub async fn run_with(cli: Cli) -> anyhow::Result<()> {
             request_timeout_ms,
             #[cfg(feature = "rag")]
             rag,
+            backend,
+            rope_scaling,
+            think,
+            no_think,
+            reasoning_effort,
+            tools,
+            cuda_device,
+            bearer_token_file,
+            rate_limit_rpm,
+            rate_limit_burst,
+            cors_origin,
+            cors_allow_credentials,
+            max_body_bytes,
+            enable_ui,
+            max_output_tokens,
+            ptq1_transcode,
+            prefill_chunk,
+            mmproj,
+            image,
+            image_max_tokens,
+            embedding_backend,
+            embedding_corpus,
         } => {
             let model = util::resolve_str(model, &sections, "model", "model_path");
             let tokenizer = util::resolve_str(tokenizer, &sections, "model", "tokenizer_path");
-            let max_seq_len = validated(args::validate_max_seq_len(util::resolve_usize(
-                max_seq_len,
-                &sections,
-                "model",
-                "max_seq_len",
-                4096,
-            )))?;
             // `--host`/`--port` only ever fall back to `[server]` when the
             // flag itself was absent from argv (both are `Option<T>` with
             // no clap default), so a TOML value can never silently widen
@@ -335,33 +588,63 @@ pub async fn run_with(cli: Cli) -> anyhow::Result<()> {
             let port = util::resolve_u16(port, &sections, "server", "port", 8080);
             tracing::info!(host = %host, port, "resolved server bind address");
 
-            #[cfg(feature = "rag")]
-            cmd_serve::run(
+            let serve_args = cmd_serve::ServeArgs {
                 model,
                 host,
                 port,
-                max_seq_len,
+                max_seq_len: resolve_max_seq_len(max_seq_len, &sections)?,
                 tokenizer,
                 pool_size,
                 bearer_token,
                 max_concurrent_requests,
                 request_timeout_ms,
+                #[cfg(feature = "rag")]
                 rag,
-            )
-            .await?;
-            #[cfg(not(feature = "rag"))]
-            cmd_serve::run(
-                model,
-                host,
-                port,
-                max_seq_len,
-                tokenizer,
-                pool_size,
-                bearer_token,
-                max_concurrent_requests,
-                request_timeout_ms,
-            )
-            .await?;
+                backend: util::resolve_backend(backend, &sections, "model", "backend")?,
+                rope_scaling: util::resolve_rope_scaling(
+                    rope_scaling,
+                    &sections,
+                    "model",
+                    "rope_scaling",
+                )?,
+                enable_thinking: resolve_enable_thinking(think, no_think, &sections),
+                reasoning_effort: resolve_reasoning_effort(reasoning_effort, &sections)?,
+                tools,
+                cuda_device: cuda_device
+                    .or_else(|| util::toml_u32(&sections, "server", "cuda_device")),
+                bearer_token_file: util::resolve_str(
+                    bearer_token_file,
+                    &sections,
+                    "server",
+                    "bearer_token_file",
+                ),
+                rate_limit_rpm: rate_limit_rpm
+                    .or_else(|| util::toml_u32(&sections, "server", "rate_limit_rpm")),
+                rate_limit_burst: rate_limit_burst
+                    .or_else(|| util::toml_u32(&sections, "server", "rate_limit_burst")),
+                cors_origin: util::resolve_str(cors_origin, &sections, "server", "cors_origin"),
+                cors_allow_credentials,
+                max_body_bytes: max_body_bytes
+                    .or_else(|| util::toml_u64(&sections, "server", "max_body_bytes")),
+                enable_ui: enable_ui
+                    || util::toml_bool(&sections, "server", "enable_ui").unwrap_or(false),
+                max_output_tokens: validated_opt(
+                    max_output_tokens
+                        .or_else(|| util::toml_usize(&sections, "server", "max_output_tokens")),
+                    args::validate_max_output_tokens,
+                )?,
+                ptq1_transcode: ptq1_transcode
+                    || util::toml_bool(&sections, "model", "ptq1_transcode").unwrap_or(false),
+                prefill_chunk: resolve_prefill_chunk(prefill_chunk, &sections)?,
+                vision: bonsai2::VisionRequest {
+                    mmproj,
+                    images: image,
+                    image_max_tokens,
+                },
+                embedding_backend,
+                embedding_corpus,
+            };
+            cmd_serve::run(serve_args).await?;
         }
 
         Commands::Info { model, json } => cmd_info::run(model, json)?,
@@ -372,6 +655,7 @@ pub async fn run_with(cli: Cli) -> anyhow::Result<()> {
             model,
             synthetic,
             tokenizer,
+            tokenizer_backend,
             tokens,
             warmup,
             temperature,
@@ -380,6 +664,7 @@ pub async fn run_with(cli: Cli) -> anyhow::Result<()> {
             model,
             synthetic,
             tokenizer,
+            tokenizer_backend,
             tokens,
             warmup,
             temperature,
@@ -398,7 +683,8 @@ pub async fn run_with(cli: Cli) -> anyhow::Result<()> {
             to,
             quant,
             onnx,
-        } => cmd_convert::run(from, to, quant, onnx)?,
+            allow_unmapped,
+        } => cmd_convert::run(from, to, quant, onnx, allow_unmapped)?,
 
         #[cfg(feature = "eval")]
         Commands::Eval {
@@ -439,7 +725,31 @@ pub async fn run_with(cli: Cli) -> anyhow::Result<()> {
         Commands::Validate { model } => cmd_validate::run(model)?,
 
         Commands::Tokenizer { cmd: tok_cmd } => cmd_tokenizer::run(tok_cmd)?,
+
+        Commands::Pull {
+            model_or_url,
+            out,
+            band,
+            vision,
+            force,
+        } => {
+            pull::run(pull::PullArgs {
+                model_or_url,
+                out_dir: out,
+                band,
+                vision,
+                force,
+            })
+            .await?
+        }
     }
 
     Ok(())
 }
+
+#[cfg(test)]
+mod test_fixtures;
+
+#[cfg(test)]
+#[path = "dispatch_tests.rs"]
+mod dispatch_tests;

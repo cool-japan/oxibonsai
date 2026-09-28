@@ -65,6 +65,9 @@ pub fn recovery_strategy_for(error: &RuntimeError) -> RecoveryStrategy {
         },
         // Config errors are permanent
         RuntimeError::Config(_) => RecoveryStrategy::Abort,
+        // Typed engine refusals are deterministic (same as their former
+        // `Config("[CODE] ..")` encoding)
+        RuntimeError::Engine(_) => RecoveryStrategy::Abort,
         // File not found is permanent
         RuntimeError::FileNotFound { .. } => RecoveryStrategy::Abort,
         // Tokenizer errors may benefit from fallback
@@ -204,6 +207,7 @@ pub fn classify_error(error: &RuntimeError) -> ErrorClass {
         RuntimeError::CircuitOpen => ErrorClass::Transient,
         RuntimeError::CapacityExhausted { .. } => ErrorClass::ResourceExhaustion,
         RuntimeError::Config(_) => ErrorClass::Permanent,
+        RuntimeError::Engine(_) => ErrorClass::Permanent,
         RuntimeError::FileNotFound { .. } => ErrorClass::Permanent,
         RuntimeError::Tokenizer(_) => ErrorClass::Permanent,
         RuntimeError::GenerationStopped { .. } => ErrorClass::Permanent,

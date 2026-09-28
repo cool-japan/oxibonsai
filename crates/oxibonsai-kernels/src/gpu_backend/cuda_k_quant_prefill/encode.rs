@@ -5,6 +5,11 @@
 //!    fused gate+up+SwiGLU GEMM → format-specific down GEMM + residual add).
 //!  - [`encode_k_quant_prefill_layer`] — full transformer layer with format
 //!    dispatch via [`KQuantFormat`] for all linear projections.
+//!
+//! The K/V these encoders write lands in the K-quant family's GPU-private
+//! device KV cache, one layer per [`encode_k_quant_prefill_layer`] call; the
+//! prompt window is read back to the host once, after the last layer, by
+//! `try_api::try_cuda_prefill_k_quant`'s `kv_readback_out` (finding **F6**).
 
 use std::sync::Arc;
 
@@ -74,16 +79,9 @@ pub(super) unsafe fn encode_k_quant_ffn_phase(
             .map_err(|e| CudaGraphError::DriverError(format!("batched_rmsnorm ffn kquant: {e}")))?;
     }
 
-    // Step 2: Fused gate+up+SwiGLU GEMM (d_normed → d_swiglu).
-    // Zero d_gate_up buffer first (fused kernels write directly, not +=).
-    {
-        let n = 2 * pb.actual_batch_size * pb.intermediate_size;
-        let mut dst_view = pb.d_gate_up.slice_mut(0..n);
-        graph
-            .stream_arc()
-            .memset_zeros(&mut dst_view)
-            .map_err(|e| CudaGraphError::DriverError(format!("zero d_gate_up kquant: {e}")))?;
-    }
+    // Step 2: Fused gate+up+SwiGLU GEMM (d_normed → d_swiglu). The fused
+    // kernels store every output element (no `+=`), so `d_swiglu` needs no
+    // zeroing first.
     match fmt {
         KQuantFormat::Q2K => launch_fused_gate_up_swiglu_q2k(
             graph,

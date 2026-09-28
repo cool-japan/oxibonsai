@@ -412,6 +412,16 @@ impl<'a> GgufFixtureBuilder<'a> {
         self
     }
 
+    /// Append an arbitrary metadata key-value pair — the escape hatch for
+    /// any [`MetadataWriteValue`] variant the typed helpers above don't
+    /// cover (arrays, bools, …), such as the `qwen35`/`prism.hadamard.*`
+    /// array and bool keys [`crate::qwen35_fixture::synthetic_qwen35_gguf`]
+    /// needs.
+    pub fn metadata(&mut self, key: &str, value: MetadataWriteValue) -> &mut Self {
+        self.writer.add_metadata(key, value);
+        self
+    }
+
     /// Append a tensor named `name` with shape `shape` (GGUF order: the
     /// fastest-varying / innermost dimension first), filled with
     /// [`deterministic_weights`] seeded by `seed` and quantized to `quant`.
@@ -675,5 +685,67 @@ mod tests {
     fn builder_default_matches_new() {
         let a = GgufFixtureBuilder::default();
         assert_eq!(a.tensor_count(), 0);
+    }
+
+    /// The generic `metadata()` escape hatch must reach the real reader for
+    /// variants none of the typed helpers (`metadata_str`/`_u32`/`_f32`)
+    /// cover — array and bool values, which `qwen35_fixture` needs for the
+    /// `prism.hadamard.*` contract.
+    #[test]
+    fn metadata_writes_array_and_bool_variants_the_typed_helpers_do_not_cover() {
+        let bytes = GgufFixtureBuilder::new()
+            .metadata_str("general.architecture", "qwen3")
+            .metadata(
+                "qwen3.rope.dimension_sections",
+                MetadataWriteValue::ArrayU32(vec![3, 3, 2, 0]),
+            )
+            .metadata(
+                "prism.hadamard.sign_values",
+                MetadataWriteValue::ArrayI32(vec![-1, 1, 1, -1]),
+            )
+            .metadata(
+                "prism.hadamard.weight_names",
+                MetadataWriteValue::ArrayStr(vec!["output.weight".to_string()]),
+            )
+            .metadata(
+                "prism.hadamard.gdn_v_grouped",
+                MetadataWriteValue::Bool(true),
+            )
+            .tensor("output_norm.weight", &[8], FixtureQuant::F32, 1)
+            .expect("add tensor")
+            .build()
+            .expect("build gguf");
+
+        let file = GgufFile::parse(&bytes).expect("the real reader must parse this fixture");
+        assert_eq!(
+            file.metadata
+                .get("qwen3.rope.dimension_sections")
+                .and_then(|v| v.as_array())
+                .expect("array u32 key")
+                .len(),
+            4
+        );
+        assert_eq!(
+            file.metadata
+                .get("prism.hadamard.sign_values")
+                .and_then(|v| v.as_array())
+                .expect("array i32 key")
+                .len(),
+            4
+        );
+        assert_eq!(
+            file.metadata
+                .get("prism.hadamard.weight_names")
+                .and_then(|v| v.as_array())
+                .expect("array str key")
+                .len(),
+            1
+        );
+        assert_eq!(
+            file.metadata
+                .get("prism.hadamard.gdn_v_grouped")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
     }
 }

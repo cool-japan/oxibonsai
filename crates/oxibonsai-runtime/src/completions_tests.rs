@@ -6,10 +6,9 @@
 //! `build_completion_logprobs`, ...) while `completions.rs` itself stays under
 //! the workspace's 2000-line ceiling — mirrors `server/chat.rs` /
 //! `server/chat_tests.rs` and `api_extensions.rs` / `api_extensions_tests.rs`.
-//! Split out by B2-13 (wave 4b) when the B7/B8/B9/B10 fixes pushed
-//! `completions.rs` past 2000 lines; no test content changed in the move.
 
 use super::*;
+use crate::tokenizer_bridge::chat_render::test_fixtures as fx;
 
 /// `Result::expect_err` requires `T: Debug` (to render the `Ok` value in
 /// its own panic message); `ValidatedRequest` intentionally does not
@@ -42,6 +41,10 @@ fn base_request(prompt: PromptInput) -> CompletionRequest {
         seed: None,
         suffix: None,
         user: None,
+        best_of: None,
+        logit_bias: None,
+        top_k: None,
+        min_p: None,
     }
 }
 
@@ -426,32 +429,32 @@ fn validate_rejects_batch_over_the_cap() {
     assert!(validate_completion_request(req).is_err());
 }
 
-/// `stream: true` is rejected naming the field (RT-32 / SV-22).
+/// A bare `stream: true` with a single prompt validates to the streaming
+/// branch.
 #[test]
 fn validate_accepts_stream_true_alone() {
-    // ORCHESTRATOR RULING D-3 (final) supersedes the wave-2 interim this
-    // test used to assert (`stream: true` -> unconditional 400): a bare
-    // `stream: true` with a single prompt and no `logprobs`/`seed` is now
-    // valid and must resolve to the streaming branch.
     let mut req = base_request(PromptInput::Single("hi".to_string()));
     req.stream = Some(true);
     let validated = validate_completion_request(req).expect("stream: true alone must validate");
     assert!(validated.stream);
 }
 
-/// The three combinations that remain rejected under D-3: a streaming
-/// request has no engine seam for a batch, `logprobs`, or `seed`.
+/// A batched prompt streams (one SSE stream, chunks indexed by prompt), so
+/// `stream: true` with a batch validates to the streaming branch with every
+/// prompt kept — see `completions::stream::tests`'s `batched_prompt_stream_*`
+/// for the end-to-end proof.
 #[test]
-fn validate_rejects_stream_with_batch() {
+fn batched_prompt_stream_validates_to_the_streaming_branch() {
     let mut req = base_request(PromptInput::Batch(vec!["a".to_string(), "b".to_string()]));
     req.stream = Some(true);
-    let err = expect_err(validate_completion_request(req));
-    assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
+    let validated = validate_completion_request(req).expect("a streamed batch must validate");
+    assert!(validated.stream);
+    assert_eq!(validated.prompts, vec!["a".to_string(), "b".to_string()]);
 }
 
-/// B8 correction: `stream` and `logprobs` together are now ACCEPTED by
-/// validation (honoured for real via `completions::stream::stream_completion_with_logprobs`
-/// — see that module's own tests for the end-to-end chunk-shape proof).
+/// `stream` and `logprobs` together are ACCEPTED by validation (honoured
+/// for real by the streaming `logprobs` loop — see `completions::stream`'s
+/// own tests for the end-to-end chunk-shape proof).
 #[test]
 fn validate_accepts_stream_with_logprobs() {
     let mut req = base_request(PromptInput::Single("hi".to_string()));
@@ -462,13 +465,21 @@ fn validate_accepts_stream_with_logprobs() {
     assert_eq!(validated.logprobs_top_k, Some(2));
 }
 
+/// `stream` + `seed` is honoured (a freshly seeded
+/// sampler drives the stream — see `completions::stream`'s
+/// `stream_with_a_seed_is_reproducible_and_seed_dependent`), so validation
+/// must accept it and carry the seed through.
 #[test]
-fn validate_rejects_stream_with_seed() {
+fn validate_accepts_stream_with_seed() {
     let mut req = base_request(PromptInput::Single("hi".to_string()));
     req.stream = Some(true);
     req.seed = Some(7);
-    let err = expect_err(validate_completion_request(req));
-    assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
+    let validated = match validate_completion_request(req) {
+        Ok(validated) => validated,
+        Err(e) => panic!("stream + seed must validate, got {}", e.status()),
+    };
+    assert!(validated.stream);
+    assert_eq!(validated.seed, Some(7), "the seed must reach the stream");
 }
 
 /// `stream: false` is the common, explicit-default case and must not be
@@ -675,11 +686,29 @@ fn validate_filters_empty_stop_sequence_but_keeps_real_ones() {
 // `tests/completions_tests.rs` integration suite and
 // `server/blocking.rs`'s own tests both already use.
 
+/// The tiny test model behind a tokenizer-less router: a text prompt runs
+/// as the configured prompt start token, and the completion text is empty
+/// (no tokenizer to render it) while `usage` and `logprobs` still count
+/// every generated token.
 fn test_router() -> axum::Router {
     let config = oxibonsai_core::config::Qwen3Config::tiny_test();
     let params = SamplingParams::default();
     let engine = crate::engine::InferenceEngine::new(config, params, 42);
-    crate::server::create_router(engine, None)
+    fx::tokenizerless_router(engine)
+}
+
+/// The generated ids of choice 0 as a tokenizer-less server reports them in
+/// `logprobs.tokens` (`"<id>"` strings).
+fn logprob_tokens(json: &serde_json::Value) -> Vec<String> {
+    json["choices"][0]["logprobs"]["tokens"]
+        .as_array()
+        .map(|tokens| {
+            tokens
+                .iter()
+                .filter_map(|token| token.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// POST `body` to `/v1/completions` on `app` and return (status, JSON).
@@ -757,10 +786,7 @@ async fn handler_logprobs_is_still_null_when_not_requested() {
     assert!(json["choices"][0]["logprobs"].is_null());
 }
 
-/// `stream: true` alone now resolves to real SSE (ORCHESTRATOR RULING
-/// D-3, final — supersedes this test's former wave-2-interim
-/// assertion that it was unconditionally rejected with `400`): status
-/// is `200 OK`, and the body is SSE text (not the non-streaming JSON
+/// `stream: true` alone resolves to real SSE: status is `200 OK`, and the body is SSE text (not the non-streaming JSON
 /// object shape), so `post_completion`'s `serde_json::from_slice` on it
 /// falls back to `Value::Null`. The detailed chunk-shape assertions
 /// (`text_completion` chunks, `[DONE]`, `stream_options.include_usage`)
@@ -782,10 +808,9 @@ async fn handler_stream_true_alone_is_ok_not_400() {
     );
 }
 
-/// The two combinations that remain rejected under D-3 (batch, `seed`)
-/// still return `400` naming `stream`, end to end. `logprobs` no longer
-/// does (`B8`) — see `completions::stream::tests` for the detailed,
-/// byte-level SSE chunk-shape proof of the positive case.
+/// `stream: true` with `logprobs` is real SSE end to end — see
+/// `completions::stream::tests` for the detailed, byte-level SSE chunk-shape
+/// proof.
 #[tokio::test]
 async fn handler_stream_with_logprobs_is_ok_not_400() {
     let app = test_router();
@@ -804,12 +829,13 @@ async fn handler_stream_with_logprobs_is_ok_not_400() {
     );
 }
 
-/// B9 correction: `logprobs` combined with `temperature` is now ACCEPTED
-/// end-to-end and the override is GENUINELY applied to the logprobs decode
-/// loop, not silently dropped while returning `200` — proven two-sided:
-/// the router's output must match a direct `generate_with_logprobs` call
-/// with the override applied (same seed, same config) and must NOT match
-/// one that kept the engine's distinct ambient temperature instead.
+/// `logprobs` combined with `temperature` is ACCEPTED end-to-end and the
+/// override is GENUINELY applied to the logprobs decode loop, not silently
+/// dropped while returning `200` — proven two-sided: the router's generated
+/// ids (read from `logprobs.tokens`) must match a direct
+/// `generate_with_logprobs` call with the override applied (same seed, same
+/// config) and must NOT match one that kept the engine's distinct ambient
+/// temperature instead.
 #[tokio::test]
 async fn handler_logprobs_and_temperature_together_is_honoured_not_rejected() {
     let config = oxibonsai_core::config::Qwen3Config::tiny_test();
@@ -817,7 +843,7 @@ async fn handler_logprobs_and_temperature_together_is_honoured_not_rejected() {
         temperature: 0.9, // distinctive; NOT the request's override below
         ..SamplingParams::default()
     };
-    let fallback_prompt = vec![151644u32];
+    let fallback_prompt = vec![fx::QWEN3_IM_START];
     let id_to_token = |id: u32| format!("<{id}>");
 
     let mut with_override =
@@ -829,22 +855,22 @@ async fn handler_logprobs_and_temperature_together_is_honoured_not_rejected() {
     let (override_tokens, _) = with_override
         .generate_with_logprobs(&fallback_prompt, 3, 2, &id_to_token)
         .expect("reference generation (override applied)");
-    let override_text = format!("{override_tokens:?}");
+    let override_ids = fx::id_token_strings(&override_tokens);
 
     let mut without_override =
         crate::engine::InferenceEngine::new(config.clone(), ambient.clone(), 42);
     let (ambient_tokens, _) = without_override
         .generate_with_logprobs(&fallback_prompt, 3, 2, &id_to_token)
         .expect("reference generation (ambient, unmodified)");
-    let ambient_text = format!("{ambient_tokens:?}");
     assert_ne!(
-        override_text, ambient_text,
+        override_ids,
+        fx::id_token_strings(&ambient_tokens),
         "sanity: the override must actually change the deterministic output, \
          or this test cannot discriminate anything"
     );
 
     let router_engine = crate::engine::InferenceEngine::new(config, ambient, 42);
-    let app = crate::server::create_router(router_engine, None);
+    let app = fx::tokenizerless_router(router_engine);
     let (status, json) = post_completion(
         app,
         serde_json::json!({
@@ -861,9 +887,9 @@ async fn handler_logprobs_and_temperature_together_is_honoured_not_rejected() {
         !json["choices"][0]["logprobs"].is_null(),
         "logprobs must still be populated: {json}"
     );
-    let text = json["choices"][0]["text"].as_str().expect("text");
     assert_eq!(
-        text, override_text,
+        logprob_tokens(&json),
+        override_ids,
         "the temperature override must reach the logprobs decode loop, not the ambient sampler"
     );
 }
@@ -877,7 +903,7 @@ async fn handler_logprobs_and_top_p_together_is_honoured_not_rejected() {
         top_p: 1.0, // distinctive; NOT the request's override below
         ..SamplingParams::default()
     };
-    let fallback_prompt = vec![151644u32];
+    let fallback_prompt = vec![fx::QWEN3_IM_START];
     let id_to_token = |id: u32| format!("<{id}>");
 
     let mut with_override =
@@ -889,22 +915,22 @@ async fn handler_logprobs_and_top_p_together_is_honoured_not_rejected() {
     let (override_tokens, _) = with_override
         .generate_with_logprobs(&fallback_prompt, 3, 2, &id_to_token)
         .expect("reference generation (override applied)");
-    let override_text = format!("{override_tokens:?}");
+    let override_ids = fx::id_token_strings(&override_tokens);
 
     let mut without_override =
         crate::engine::InferenceEngine::new(config.clone(), ambient.clone(), 42);
     let (ambient_tokens, _) = without_override
         .generate_with_logprobs(&fallback_prompt, 3, 2, &id_to_token)
         .expect("reference generation (ambient, unmodified)");
-    let ambient_text = format!("{ambient_tokens:?}");
     assert_ne!(
-        override_text, ambient_text,
+        override_ids,
+        fx::id_token_strings(&ambient_tokens),
         "sanity: the override must actually change the deterministic output, \
          or this test cannot discriminate anything"
     );
 
     let router_engine = crate::engine::InferenceEngine::new(config, ambient, 42);
-    let app = crate::server::create_router(router_engine, None);
+    let app = fx::tokenizerless_router(router_engine);
     let (status, json) = post_completion(
         app,
         serde_json::json!({
@@ -917,9 +943,9 @@ async fn handler_logprobs_and_top_p_together_is_honoured_not_rejected() {
         axum::http::StatusCode::OK,
         "must be accepted, not rejected: {json}"
     );
-    let text = json["choices"][0]["text"].as_str().expect("text");
     assert_eq!(
-        text, override_text,
+        logprob_tokens(&json),
+        override_ids,
         "the top_p override must reach the logprobs decode loop, not the ambient sampler"
     );
 }
@@ -940,19 +966,23 @@ async fn handler_logprobs_and_seed_together_is_deterministic() {
     });
 
     let engine1 = crate::engine::InferenceEngine::new(config.clone(), params.clone(), 1);
-    let (status1, json1) =
-        post_completion(crate::server::create_router(engine1, None), body.clone()).await;
+    let (status1, json1) = post_completion(fx::tokenizerless_router(engine1), body.clone()).await;
     let engine2 = crate::engine::InferenceEngine::new(config, params, 99); // different startup seed
-    let (status2, json2) = post_completion(crate::server::create_router(engine2, None), body).await;
+    let (status2, json2) = post_completion(fx::tokenizerless_router(engine2), body).await;
 
     assert_eq!(status1, axum::http::StatusCode::OK, "{json1}");
     assert_eq!(status2, axum::http::StatusCode::OK, "{json2}");
+    assert!(!logprob_tokens(&json1).is_empty(), "{json1}");
     assert_eq!(
-        json1["choices"][0]["text"], json2["choices"][0]["text"],
+        logprob_tokens(&json1),
+        logprob_tokens(&json2),
         "the same explicit seed must reproduce the same logprobs-path output \
          even when the two engines' own startup PRNG seeds differ"
     );
-    assert!(!json1["choices"][0]["logprobs"].is_null());
+    assert_eq!(
+        json1["choices"][0]["logprobs"]["token_logprobs"],
+        json2["choices"][0]["logprobs"]["token_logprobs"]
+    );
 }
 
 /// `logprobs` combined with only a frequency/presence penalty must still
@@ -973,20 +1003,23 @@ async fn handler_logprobs_and_frequency_penalty_together_still_succeeds() {
     assert!(!json["choices"][0]["logprobs"].is_null());
 }
 
+/// A router whose engine emits exactly `[0][1][2]…` (one byte token per
+/// character), decoded by the byte-level fixture tokenizer: deterministic
+/// text starting with `[`, whatever the sampling parameters.
+fn scripted_text_router() -> axum::Router {
+    crate::server::create_router(
+        fx::scripted_byte_engine("[0][1][2][3][4][5][6][7][8][9]"),
+        Some(fx::byte_tokenizer()),
+    )
+}
+
 /// A stop sequence actually truncates the *decoded* completion text
-/// end-to-end through the real handler, not just through
-/// `StopChecker` in isolation.
-///
-/// With no tokenizer configured, the completion text is
-/// `format!("{output_tokens:?}")`, which for a `Vec<u32>` always starts
-/// with `'['` — even `"[]"` for zero generated tokens — regardless of
-/// the tiny test model's own generation length. Using `"["` as the stop
-/// sequence therefore gives a deterministic, model-behaviour-independent
-/// stop-hit: before this fix (`stop` never reaching the engine at all),
-/// the choice text would always be the full, non-empty `"[...]"` string.
+/// end-to-end through the real handler, not just through `StopChecker` in
+/// isolation: the scripted text starts with `[`, so `stop: "["` matches at
+/// position 0 whatever the generation length.
 #[tokio::test]
 async fn handler_stop_sequence_truncates_the_completion_end_to_end() {
-    let app = test_router();
+    let app = scripted_text_router();
     let (status, json) = post_completion(
         app,
         serde_json::json!({ "prompt": "hello", "max_tokens": 4, "stop": "[" }),
@@ -1005,7 +1038,7 @@ async fn handler_stop_sequence_truncates_the_completion_end_to_end() {
 /// empty `stop` entry must not truncate every completion to `""`.
 #[tokio::test]
 async fn handler_empty_stop_sequence_does_not_truncate_everything() {
-    let app = test_router();
+    let app = scripted_text_router();
     let (status, json) = post_completion(
         app,
         serde_json::json!({ "prompt": "hello", "max_tokens": 3, "stop": "" }),
@@ -1090,8 +1123,8 @@ async fn handler_long_completion_does_not_block_a_concurrent_health_check() {
     );
 }
 
-// ── Gatekeeper REQUIRED #3: repetition_penalty validated identically to
-//    chat, and the mandated non-ignored temperature:0 router test ────────
+// ── repetition_penalty validated identically to chat, and the
+//    temperature:0 router test ─────────────────────────────────────────
 
 /// `repetition_penalty` below `1.0` must be rejected, matching
 /// `ChatCompletionRequest`'s `>= 1.0` rule (the earlier `> 0.0` text this
@@ -1120,7 +1153,7 @@ fn validate_accepts_repetition_penalty_above_one() {
     assert!(validate_completion_request(req).is_ok());
 }
 
-/// Gatekeeper `REQUIRED #3`'s mandated NON-ignored router test: a
+/// The synthetic-engine router test for greedy parameter resolution: a
 /// `temperature: 0` `/v1/completions` request, against an engine started
 /// with a DISTINCTIVE ambient `repetition_penalty` (so a bug that silently
 /// keeps the ambient value — or any other hidden penalty — instead of the
@@ -1130,8 +1163,9 @@ fn validate_accepts_repetition_penalty_above_one() {
 ///
 /// `greedy_gpu_eligible` itself is unreachable on a synthetic `tiny_test()`
 /// engine (`uses_fused_gpu_decode()` is always `false` off a real GGUF —
-/// the existing `server::tests::gpu_argmax_routing` module already covers
-/// the real-model, real-GPU case, `#[ignore]`d because it needs both), so
+/// the `server::tests::gpu_argmax_routing` module covers the real-model,
+/// real-GPU case, self-skipping unless `OXI_MODEL`/`OXI_TOKENIZER` name
+/// both files), so
 /// this proves the *params* resolution is correct by output-token equality
 /// against a second, identical engine driven directly with that exact
 /// greedy shape: a tiny_test() model's generation is a deterministic
@@ -1148,11 +1182,10 @@ async fn temperature_zero_resolves_to_the_greedy_gpu_eligible_param_shape() {
         repetition_penalty: 1.35,
         ..SamplingParams::default()
     };
-    // No tokenizer is attached in either half of this test, so every
-    // prompt string resolves to the same fallback `[151644]` prompt token
-    // (see `create_completion`'s `None => vec![151644u32]` arm) — the
-    // reference call below uses that exact fallback for a fair comparison.
-    let fallback_prompt = vec![151644u32];
+    // No tokenizer is attached to the router, so every prompt string runs
+    // as its configured prompt start token — the reference call below uses
+    // that exact prompt for a fair comparison.
+    let fallback_prompt = vec![fx::QWEN3_IM_START];
 
     // Reference: ask the engine directly for the exact greedy_gpu_eligible
     // shape (`InferenceEngine::greedy_gpu_eligible`'s own three conditions).
@@ -1171,27 +1204,168 @@ async fn temperature_zero_resolves_to_the_greedy_gpu_eligible_param_shape() {
             &PenaltyParams::default(),
         )
         .expect("reference generation must succeed");
-    let reference_text = format!("{reference_tokens:?}");
+    let reference_ids = fx::id_token_strings(&reference_tokens);
 
     // Router: the real HTTP route, same ambient config, `temperature: 0`
-    // and no other overrides -- exactly the request shape the gatekeeper
-    // measured taking a hidden penalty on the real model.
+    // and no other sampling overrides -- the request shape that once took a
+    // hidden penalty on the real model. A tokenizer-less completion's text
+    // is empty, so the generated ids are read from `logprobs.tokens`.
     let router_engine = crate::engine::InferenceEngine::new(config, ambient, 42);
-    let app = crate::server::create_router(router_engine, None);
+    let app = fx::tokenizerless_router(router_engine);
     let (status, json) = post_completion(
         app,
-        serde_json::json!({ "prompt": "hello", "max_tokens": 8, "temperature": 0.0 }),
+        serde_json::json!({
+            "prompt": "hello", "max_tokens": 8, "temperature": 0.0, "logprobs": 1
+        }),
     )
     .await;
-    assert_eq!(status, axum::http::StatusCode::OK);
-    let text = json["choices"][0]["text"]
-        .as_str()
-        .expect("choices[0].text is a string");
+    assert_eq!(status, axum::http::StatusCode::OK, "{json}");
+    let router_ids = logprob_tokens(&json);
 
     assert_eq!(
-        text, reference_text,
+        router_ids, reference_ids,
         "temperature:0 through /v1/completions must resolve to EXACTLY the \
          greedy_gpu_eligible params shape (repetition_penalty 1.0), not the \
-         ambient 1.35 or any other hidden penalty; got {text:?} want {reference_text:?}"
+         ambient 1.35 or any other hidden penalty"
+    );
+}
+
+// ── The declared OpenAI field set: honour or refuse by name, deny the rest ──
+
+#[test]
+fn validate_rejects_best_of_other_than_one() {
+    for best_of in [0usize, 2, 5] {
+        let mut req = base_request(PromptInput::Single("hi".to_string()));
+        req.best_of = Some(best_of);
+        let err = expect_err(validate_completion_request(req));
+        assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            err.to_json()["error"]["param"],
+            "best_of",
+            "best_of={best_of}"
+        );
+    }
+}
+
+#[test]
+fn validate_rejects_a_non_empty_logit_bias() {
+    let mut req = base_request(PromptInput::Single("hi".to_string()));
+    req.logit_bias = Some(std::collections::HashMap::from([("42".to_string(), 5.0)]));
+    let err = expect_err(validate_completion_request(req));
+    assert_eq!(err.to_json()["error"]["param"], "logit_bias");
+}
+
+#[test]
+fn validate_accepts_the_declared_no_op_values() {
+    let mut req = base_request(PromptInput::Single("hi".to_string()));
+    req.best_of = Some(1);
+    req.logit_bias = Some(std::collections::HashMap::new());
+    req.echo = Some(true);
+    req.user = Some("u".to_string());
+    req.model = Some("any".to_string());
+    req.suffix = Some(String::new());
+    req.top_k = Some(40);
+    req.min_p = Some(0.05);
+    let validated = validate_completion_request(req).expect("must validate");
+    assert_eq!(validated.req_top_k, Some(40));
+    assert_eq!(validated.min_p, Some(0.05));
+    assert!(
+        validated.custom_sampling,
+        "a top_k override customizes sampling"
+    );
+}
+
+#[test]
+fn validate_rejects_out_of_range_min_p_and_top_k() {
+    for min_p in [-0.1f32, 1.5, f32::NAN] {
+        let mut req = base_request(PromptInput::Single("hi".to_string()));
+        req.min_p = Some(min_p);
+        let err = expect_err(validate_completion_request(req));
+        assert_eq!(err.to_json()["error"]["param"], "min_p", "min_p={min_p}");
+    }
+    let mut req = base_request(PromptInput::Single("hi".to_string()));
+    req.top_k = Some(2_000_000);
+    let err = expect_err(validate_completion_request(req));
+    assert_eq!(err.to_json()["error"]["param"], "top_k");
+}
+
+/// A field outside the declared set is refused with a `400` naming it —
+/// a misspelt parameter is an error, never silently ignored.
+#[tokio::test]
+async fn handler_refuses_an_unknown_field_naming_it() {
+    let (status, json) = post_completion(
+        test_router(),
+        serde_json::json!({ "prompt": "hello", "max_tokns": 3 }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{json}");
+    assert_eq!(json["error"]["param"], "max_tokns", "{json}");
+    assert_eq!(json["error"]["code"], "unknown_parameter", "{json}");
+    assert_eq!(json["error"]["type"], "invalid_request_error", "{json}");
+}
+
+/// Every documented OpenAI completions field (and each sampling extension)
+/// is declared, so a request carrying all of them with supported values is
+/// accepted.
+#[tokio::test]
+async fn handler_accepts_every_declared_field() {
+    let (status, json) = post_completion(
+        test_router(),
+        serde_json::json!({
+            "model": "m", "prompt": "hello", "suffix": "", "max_tokens": 2,
+            "temperature": 0.5, "top_p": 0.9, "n": 1, "stream": false,
+            "stream_options": {"include_usage": false}, "logprobs": 1, "echo": false,
+            "stop": ["zzz"], "presence_penalty": 0.1, "frequency_penalty": 0.1,
+            "best_of": 1, "logit_bias": {}, "user": "u", "seed": 3,
+            "top_k": 5, "min_p": 0.01, "repetition_penalty": 1.1
+        }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{json}");
+}
+
+/// `top_k` is honoured, not just accepted: on an engine whose every step is
+/// an equal choice among 26 letters, `top_k: 1` keeps one candidate, so the
+/// whole completion repeats one letter (without it the letters vary).
+#[tokio::test]
+async fn handler_honours_top_k() {
+    let router =
+        || crate::server::create_router(fx::uniform_letters_engine(8), Some(fx::byte_tokenizer()));
+    let (status, json) = post_completion(
+        router(),
+        serde_json::json!({ "prompt": "go", "max_tokens": 12, "temperature": 1.0, "top_k": 1 }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{json}");
+    let text = json["choices"][0]["text"].as_str().unwrap_or_default();
+    assert_eq!(text.len(), 12, "{json}");
+    assert!(text.bytes().all(|b| b == text.as_bytes()[0]), "{text}");
+
+    let (_, json) = post_completion(
+        router(),
+        serde_json::json!({ "prompt": "go", "max_tokens": 12, "temperature": 1.0 }),
+    )
+    .await;
+    let text = json["choices"][0]["text"].as_str().unwrap_or_default();
+    assert!(!text.bytes().all(|b| b == text.as_bytes()[0]), "{text}");
+}
+
+// ── A tokenizer-less completion: empty text, streamed or not ───────────
+
+/// Without a tokenizer there is no text to render: the non-streamed
+/// completion's text is empty — the same as the stream, which sends no text
+/// — while `usage` counts every generated token.
+#[tokio::test]
+async fn handler_without_a_tokenizer_answers_empty_text_like_the_stream() {
+    let (status, json) = post_completion(
+        test_router(),
+        serde_json::json!({ "prompt": "hello", "max_tokens": 3 }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{json}");
+    assert_eq!(json["choices"][0]["text"], "", "{json}");
+    assert!(
+        json["usage"]["completion_tokens"].as_u64().unwrap_or(0) > 0,
+        "{json}"
     );
 }

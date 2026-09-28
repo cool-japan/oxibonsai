@@ -305,6 +305,19 @@ pub struct InferenceMetrics {
     pub errors_total: Counter,
     /// Total number of prompt tokens processed.
     pub prompt_tokens_total: Counter,
+    /// Sampled decode steps served from a GPU top-k candidate download
+    /// instead of the full logit row (`perf-11`, sampled half) — the
+    /// Prometheus twin of `EngineStats::sampled_topk_steps`.
+    pub sampled_topk_steps_total: Counter,
+    /// Sampled top-k-route decode steps that downloaded the full logit row
+    /// instead (unusable GPU candidates, a Metal failure recovered on the
+    /// CPU, or the full-row reference mode) — the Prometheus twin of
+    /// `EngineStats::sampled_topk_full_row_steps`.
+    pub sampled_topk_full_row_steps_total: Counter,
+    /// Sampled requests on the fused GPU route that were not eligible for
+    /// the top-k route at all and decoded on the full row — the Prometheus
+    /// twin of `EngineStats::sampled_full_row_requests`.
+    pub sampled_full_row_requests_total: Counter,
 
     // ── Histograms ──
     /// Duration of the prefill (prompt processing) phase.
@@ -358,6 +371,18 @@ impl InferenceMetrics {
             prompt_tokens_total: Counter::new(
                 "oxibonsai_prompt_tokens_total",
                 "Total prompt tokens processed",
+            ),
+            sampled_topk_steps_total: Counter::new(
+                "oxibonsai_sampled_topk_steps_total",
+                "Sampled decode steps served from GPU top-k candidates instead of the full logit row",
+            ),
+            sampled_topk_full_row_steps_total: Counter::new(
+                "oxibonsai_sampled_topk_full_row_steps_total",
+                "Sampled top-k-route decode steps that fell back to downloading the full logit row",
+            ),
+            sampled_full_row_requests_total: Counter::new(
+                "oxibonsai_sampled_full_row_requests_total",
+                "Sampled fused-GPU requests not eligible for the top-k route (decoded on the full row)",
             ),
 
             prefill_duration_seconds: Histogram::new(
@@ -441,6 +466,9 @@ impl InferenceMetrics {
         render_counter(&mut out, &self.requests_total);
         render_counter(&mut out, &self.errors_total);
         render_counter(&mut out, &self.prompt_tokens_total);
+        render_counter(&mut out, &self.sampled_topk_steps_total);
+        render_counter(&mut out, &self.sampled_topk_full_row_steps_total);
+        render_counter(&mut out, &self.sampled_full_row_requests_total);
 
         // Histograms
         render_histogram(&mut out, &self.prefill_duration_seconds);
@@ -750,11 +778,33 @@ mod tests {
         let type_count = output.lines().filter(|l| l.starts_with("# TYPE")).count();
         assert_eq!(help_count, type_count);
 
-        // 4 counters + 4 histograms + 8 gauges = 16 metric families.
+        // 7 counters + 4 histograms + 8 gauges = 19 metric families.
         // Gauges added in 0.1.4: request_tokens_per_second,
         // inter_token_latency_p50/p95_seconds, queue_wait_seconds,
-        // kv_cache_compression_level (5 new) plus the original 3.
-        assert_eq!(help_count, 16);
+        // kv_cache_compression_level (5 new) plus the original 3. Counters
+        // added by perf-11: sampled_topk_steps_total,
+        // sampled_topk_full_row_steps_total, sampled_full_row_requests_total.
+        assert_eq!(help_count, 19);
+    }
+
+    /// perf-11: the sampled top-k route's three fallback counters are part
+    /// of the exposition, typed `counter`, and render their live values.
+    #[test]
+    fn render_prometheus_includes_the_sampled_topk_counters() {
+        let m = InferenceMetrics::new();
+        m.sampled_topk_steps_total.inc_by(7);
+        m.sampled_topk_full_row_steps_total.inc_by(2);
+        m.sampled_full_row_requests_total.inc();
+        let output = m.render_prometheus();
+        for (name, value) in [
+            ("oxibonsai_sampled_topk_steps_total", 7),
+            ("oxibonsai_sampled_topk_full_row_steps_total", 2),
+            ("oxibonsai_sampled_full_row_requests_total", 1),
+        ] {
+            assert!(output.contains(&format!("# HELP {name} ")), "{name}");
+            assert!(output.contains(&format!("# TYPE {name} counter")), "{name}");
+            assert!(output.contains(&format!("\n{name} {value}\n")), "{name}");
+        }
     }
 
     #[test]

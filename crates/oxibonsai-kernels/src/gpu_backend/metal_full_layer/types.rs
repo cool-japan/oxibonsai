@@ -159,7 +159,29 @@ pub fn next_model_epoch() -> u64 {
 ///
 /// Contains weight handle IDs and raw byte slices for each layer's
 /// weight matrices. These are used to upload/cache weights on the GPU.
+///
+/// # Weight-cache identity (`MET-02`, Q1 half)
+///
+/// Two families of slot live in here and are keyed differently:
+///
+/// - the four RMSNorm slots (and, through the layers' shared epoch, the
+///   final-norm / LM-head tail the entry points take separately) belong to
+///   the loaded model and are keyed `WeightKey::new(model_epoch, kind, slot)`,
+///   so `MetalGraph::release_model(model_epoch)` frees them with the model and
+///   a different model can never be served them;
+/// - the four projection slots (`fused_qkv`, `attn_proj`, `gate_up`, `down`)
+///   are upload-handle ids, keyed `WeightKey::legacy(WeightKind::Q1Soa, id)`:
+///   the scirs2 backend deduplicates those ids across engine-pool replicas
+///   (so the replicas share one resident copy) and evicts the mirrors itself
+///   when the last replica releases a handle.
+///
+/// All layers passed to one forward must carry the **same** epoch; the entry
+/// points reject a mixed slice rather than bind two models at once.
 pub struct FullForwardLayerParams<'a> {
+    /// Weight-cache epoch the norm / tail slots are keyed under — see
+    /// [`next_model_epoch`] / [`LEGACY_MODEL_EPOCH`] and
+    /// `MetalGraph::release_model`.
+    pub model_epoch: u64,
     pub attn_norm_handle: u64,
     pub attn_norm_bytes: &'a [f32],
     pub fused_qkv_handle: u64,

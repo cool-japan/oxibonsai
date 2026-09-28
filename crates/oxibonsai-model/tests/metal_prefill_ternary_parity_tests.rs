@@ -17,7 +17,8 @@ use oxibonsai_core::gguf::reader::GgufFile;
 use oxibonsai_core::gguf::writer::{GgufWriter, MetadataWriteValue, TensorEntry, TensorType};
 use oxibonsai_kernels::dispatch::{KernelDispatcher, KernelTier};
 use oxibonsai_kernels::{MetalGraph, MetalGraphError, SessionScope};
-use oxibonsai_model::model::BonsaiModel;
+// B5: the uncached binding types are nameable from outside the crate.
+use oxibonsai_model::model::{BonsaiModel, TernaryGpuBinding, TernaryTailBinding};
 use std::sync::Arc;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -639,6 +640,13 @@ fn real_model_tokens(vocab: usize, n: usize) -> Vec<u32> {
 /// and building / using the cache uploads **no** GPU buffer beyond the ones
 /// the uncached path already made resident.
 ///
+/// The uncached arm is the explicit `*_gpu_ternary_uncached` reference entry
+/// of each shape. The model's own ternary routes — `forward_greedy_gpu`,
+/// `try_metal_prefill_with_lm_head_ternary` and
+/// `try_metal_prefill_verify_ternary_path` — dispatch through the cached
+/// entries (HANDOVER-GPU B4), so each is also checked against the cached
+/// result: the routing change is bit-exact on the real model.
+///
 /// Every run gets its own Metal session (`MET-08`), so the device KV caches of
 /// the "before" and "after" runs cannot interact — and all of those sessions
 /// sit on one **isolated** device, so the residency assertions see only this
@@ -715,6 +723,21 @@ fn real_model_cached_ternary_path_is_byte_identical_to_the_uncached_path() {
             );
         }
     });
+    // B4 (a): the model's greedy decode route is the cached entry.
+    let mut greedy_routed: Vec<u32> = Vec::new();
+    in_session(&mut || {
+        for (pos, &t) in tokens.iter().enumerate() {
+            greedy_routed.push(
+                model
+                    .forward_greedy_gpu(t, pos)
+                    .expect("routed ternary greedy decode"),
+            );
+        }
+    });
+    assert_eq!(
+        greedy_routed, greedy,
+        "forward_greedy_gpu must decode exactly like the cached ternary entry"
+    );
     let mut max_abs_logit = 0f32;
     for (pos, (before, after)) in uncached.iter().zip(&cached).enumerate() {
         assert_eq!(before.len(), vocab, "step {pos}: logits length");
@@ -745,7 +768,7 @@ fn real_model_cached_ternary_path_is_byte_identical_to_the_uncached_path() {
     let mut prefill_before = Vec::new();
     in_session(&mut || {
         prefill_before = model
-            .try_metal_prefill_with_lm_head_ternary(&prompt, 0)
+            .prefill_logits_gpu_ternary_uncached(&prompt, 0)
             .expect("uncached batched prefill");
     });
     let mut prefill_after = Vec::new();
@@ -760,10 +783,22 @@ fn real_model_cached_ternary_path_is_byte_identical_to_the_uncached_path() {
         bits(&prefill_after),
         "batched prefill: the cached path diverged from the uncached one"
     );
+    // B4 (d): the model's strict batched-prefill route is the cached entry.
+    let mut prefill_routed = Vec::new();
+    in_session(&mut || {
+        prefill_routed = model
+            .try_metal_prefill_with_lm_head_ternary(&prompt, 0)
+            .expect("routed batched prefill");
+    });
+    assert_eq!(
+        bits(&prefill_routed),
+        bits(&prefill_after),
+        "try_metal_prefill_with_lm_head_ternary must match the cached entry bit for bit"
+    );
     let mut verify_before = Vec::new();
     in_session(&mut || {
         verify_before = model
-            .try_metal_prefill_verify_ternary_path(&prompt, 0)
+            .prefill_verify_gpu_ternary_uncached(&prompt, 0)
             .expect("uncached verify");
     });
     let mut verify_after = Vec::new();
@@ -774,6 +809,17 @@ fn real_model_cached_ternary_path_is_byte_identical_to_the_uncached_path() {
     });
     assert_eq!(verify_before.len(), prompt.len());
     assert_eq!(verify_before, verify_after, "verify ids diverged");
+    // B4 (e): the model's strict verify route is the cached entry.
+    let mut verify_routed = Vec::new();
+    in_session(&mut || {
+        verify_routed = model
+            .try_metal_prefill_verify_ternary_path(&prompt, 0)
+            .expect("routed verify");
+    });
+    assert_eq!(
+        verify_routed, verify_after,
+        "try_metal_prefill_verify_ternary_path must match the cached entry"
+    );
 
     let resident_after = probe.cached_weight_count().expect("count");
     assert_eq!(
@@ -793,4 +839,217 @@ fn real_model_cached_ternary_path_is_byte_identical_to_the_uncached_path() {
     in_session(&mut || {
         let _ = model.release_metal_weights();
     });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// B5 + C1: the uncached binding is public and keyed on the mapping epoch
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The uncached ternary binding — the decode-throughput A/B's uncached arm —
+/// is nameable from outside the crate as
+/// `oxibonsai_model::model::{TernaryGpuBinding, TernaryTailBinding}`, and
+/// everything it binds is keyed under the model's GGUF-mapping epoch, never
+/// the legacy one: every layer's `model_epoch`, and a tail over the model's
+/// own final norm and LM head.
+#[test]
+fn the_uncached_ternary_binding_is_public_and_keyed_on_the_mapping_epoch() {
+    let Ok(_gpu) = gpu_session() else {
+        eprintln!("skip: no Metal device on this host");
+        return;
+    };
+    let gguf_bytes = build_synthetic_ternary_gguf();
+    let gguf = parse_synthetic_gguf(&gguf_bytes);
+    let model = BonsaiModel::from_gguf(&gguf, 64).expect("BonsaiModel::from_gguf");
+    let epoch = model.gpu_mapping_epoch();
+    assert_ne!(
+        epoch,
+        oxibonsai_kernels::LEGACY_MODEL_EPOCH,
+        "a loaded model keys its GPU buffers under its own mapping epoch"
+    );
+    {
+        let binding: TernaryGpuBinding<'_> = model
+            .ternary_gpu_binding()
+            .expect("a ternary model binds on a Metal host");
+        assert_eq!(binding.layer_params.len(), model.num_layers());
+        for (layer, params) in binding.layer_params.iter().enumerate() {
+            assert_eq!(
+                params.model_epoch, epoch,
+                "layer {layer} must be keyed under the mapping epoch"
+            );
+        }
+        let tail: &TernaryTailBinding<'_> = binding
+            .tail
+            .as_ref()
+            .expect("a ternary LM head binds the GPU tail");
+        let config = model.config();
+        assert_eq!(tail.lm_head_out_features, config.vocab_size);
+        assert_eq!(tail.final_norm_bytes.len(), config.hidden_size);
+        assert_eq!(
+            tail.lm_head_bytes.len(),
+            config.vocab_size * config.hidden_size / 128 * 34,
+            "the tail borrows the whole TQ2_0_g128 LM head"
+        );
+    }
+    let _ = model.release_metal_weights();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// C2 (the M-21 residue) on the real model: what `upload_weights_to_gpu` keeps
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The seven projections `TransformerBlock::upload_to_gpu` uploads one by one.
+const BLOCK_PROJECTIONS: [&str; 7] = [
+    "attn_q",
+    "attn_k",
+    "attn_v",
+    "attn_output",
+    "ffn_gate",
+    "ffn_up",
+    "ffn_down",
+];
+
+/// HANDOVER-GPU C2 on the real **Ternary-Bonsai-1.7B**
+/// (`OXI_MODEL=<path to Ternary-Bonsai-1.7B.gguf>`): on Metal,
+/// `BonsaiModel::upload_weights_to_gpu` keeps exactly the model's own tensors
+/// resident in the kernel's weight cache — the seven projections of every
+/// layer plus the LM head, byte for byte — and no longer the per-layer Q‖K‖V
+/// and gate‖up concatenations, which nothing on Metal reads (the block's
+/// fused arms build their own copy in `MetalGraph`'s cache, the one the model
+/// cache shares). The upload puts nothing in `MetalGraph`'s cache.
+///
+/// "Before" is measured, not estimated: replaying on top of it the exact two
+/// `upload_weights_ternary` calls per layer that the pre-C2 `upload_to_gpu`
+/// made grows the resident bytes by exactly the concatenations' size — what
+/// every Metal caller of `upload_weights_to_gpu` used to pay. Everything is
+/// uploaded inside one attribution scope and released at the end, so the
+/// process-wide cache returns to where it started.
+///
+/// Skips with a capability report when `OXI_MODEL` is unset, the host has no
+/// accelerated GPU backend or Metal device, or the model is not ternary.
+#[test]
+fn real_model_upload_weights_to_gpu_keeps_no_ternary_concatenation_on_metal() {
+    use oxibonsai_core::BlockTQ2_0_g128;
+    use oxibonsai_kernels::gpu_backend::{
+        next_gpu_model_epoch, release_model_weights, resident_weight_bytes, GpuUploadScope,
+    };
+    use oxibonsai_kernels::TernaryKernel;
+    use oxibonsai_testkit::capability::{record_executed, record_skipped, Capability};
+
+    const TEST: &str = "metal_prefill_ternary_parity_tests::\
+                        real_model_upload_weights_to_gpu_keeps_no_ternary_concatenation_on_metal";
+    let Some(path) = std::env::var_os("OXI_MODEL").filter(|p| !p.is_empty()) else {
+        eprintln!(
+            "capability report: {TEST} SKIPPED -- $OXI_MODEL is not set (point it at \
+             models/Ternary-Bonsai-1.7B.gguf to run the C2 real-model upload check)"
+        );
+        record_skipped(Capability::LegacyModels, TEST);
+        return;
+    };
+    let Ok(kernel) = KernelDispatcher::try_with_tier(KernelTier::Gpu) else {
+        eprintln!("capability report: {TEST} SKIPPED -- no accelerated GPU backend");
+        record_skipped(Capability::Metal, TEST);
+        return;
+    };
+    let Ok(device) = oxibonsai_kernels::MetalDevice::isolated() else {
+        eprintln!("capability report: {TEST} SKIPPED -- no Metal device");
+        record_skipped(Capability::Metal, TEST);
+        return;
+    };
+    let mmap = oxibonsai_core::gguf::reader::mmap_gguf_file(std::path::Path::new(&path))
+        .expect("mmap OXI_MODEL");
+    let gguf = GgufFile::parse(&mmap).expect("parse OXI_MODEL");
+    let mut model = BonsaiModel::from_gguf(&gguf, REAL_MAX_SEQ).expect("load OXI_MODEL");
+    if model.dominant_quant_type() != oxibonsai_core::GgufTensorType::TQ2_0_g128 {
+        eprintln!(
+            "capability report: {TEST} SKIPPED -- $OXI_MODEL is not a TQ2_0_g128 model (point it \
+             at models/Ternary-Bonsai-1.7B.gguf)"
+        );
+        record_skipped(Capability::LegacyModels, TEST);
+        return;
+    }
+    let tensor = |name: &str| -> &[u8] {
+        gguf.tensor_data(name)
+            .unwrap_or_else(|e| panic!("OXI_MODEL tensor {name}: {e}"))
+    };
+    let n_layers = model.num_layers();
+    let mut own_tensors = tensor("output.weight").len() as u64;
+    let mut concatenations = 0u64;
+    for layer in 0..n_layers {
+        for name in BLOCK_PROJECTIONS {
+            own_tensors += tensor(&format!("blk.{layer}.{name}.weight")).len() as u64;
+        }
+        for name in ["attn_q", "attn_k", "attn_v", "ffn_gate", "ffn_up"] {
+            concatenations += tensor(&format!("blk.{layer}.{name}.weight")).len() as u64;
+        }
+    }
+
+    let epoch = next_gpu_model_epoch();
+    let session = MetalGraph::new_session_on(&device);
+    let resident_start = resident_weight_bytes(&kernel);
+    let (after_c2, before_c2, upload_stats) = {
+        let scope = GpuUploadScope::enter(epoch);
+        MetalGraph::with_session(&session, || model.upload_weights_to_gpu(&kernel));
+        let upload_stats = scope.stats();
+        let after_c2 = resident_weight_bytes(&kernel) - resident_start;
+
+        // Replay what the pre-C2 `upload_to_gpu` additionally uploaded.
+        let blocks = |name: String| -> &[BlockTQ2_0_g128] {
+            BlockTQ2_0_g128::slice_from_bytes(tensor(&name))
+                .unwrap_or_else(|e| panic!("{name} as TQ2_0_g128 blocks: {e}"))
+        };
+        for layer in 0..n_layers {
+            let part = |name: &str| blocks(format!("blk.{layer}.{name}.weight"));
+            let qkv = [part("attn_q"), part("attn_k"), part("attn_v")].concat();
+            let gate_up = [part("ffn_gate"), part("ffn_up")].concat();
+            kernel
+                .upload_weights_ternary(&qkv)
+                .expect("replayed pre-C2 Q‖K‖V upload");
+            kernel
+                .upload_weights_ternary(&gate_up)
+                .expect("replayed pre-C2 gate‖up upload");
+        }
+        let before_c2 = resident_weight_bytes(&kernel) - resident_start;
+        (after_c2, before_c2, upload_stats)
+    };
+
+    assert_eq!(
+        upload_stats.fresh_buffers,
+        n_layers * BLOCK_PROJECTIONS.len() + 1,
+        "upload_weights_to_gpu uploads the seven projections per layer and the LM head — no \
+         concatenation"
+    );
+    assert_eq!(
+        after_c2, own_tensors,
+        "upload_weights_to_gpu must keep exactly the model's own tensors resident"
+    );
+    assert_eq!(upload_stats.fresh_bytes, own_tensors);
+    assert_eq!(
+        session.bytes_uploaded(),
+        0,
+        "upload_weights_to_gpu puts nothing in MetalGraph's cache"
+    );
+    assert_eq!(
+        before_c2 - after_c2,
+        concatenations,
+        "the pre-C2 concatenation uploads cost exactly the Q‖K‖V + gate‖up bytes"
+    );
+    eprintln!(
+        "C2 real-model upload_weights_to_gpu ({n_layers} layers): kernel weight cache resident \
+         +{:.2} MB after C2 vs +{:.2} MB before C2 (the {:.2} MB of per-layer Q‖K‖V + gate‖up \
+         concatenations are no longer uploaded on Metal); MetalGraph resident +{} B",
+        after_c2 as f64 / 1e6,
+        before_c2 as f64 / 1e6,
+        concatenations as f64 / 1e6,
+        session.bytes_uploaded(),
+    );
+
+    let released = release_model_weights(&kernel, epoch).expect("release the test's uploads");
+    assert_eq!(released, n_layers * (BLOCK_PROJECTIONS.len() + 2) + 1);
+    assert_eq!(
+        resident_weight_bytes(&kernel),
+        resident_start,
+        "releasing the scope's epoch frees everything this test uploaded"
+    );
+    record_executed(Capability::Metal, TEST);
+    record_executed(Capability::LegacyModels, TEST);
 }

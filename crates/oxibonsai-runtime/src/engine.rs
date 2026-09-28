@@ -13,22 +13,29 @@
 //!
 //! * [`InferenceEngine::generate`] and friends apply
 //!   [`Sampler::sample_with_history`] (repetition + frequency/presence
-//!   penalties, then temperature/top-k/top-p) at every step.
+//!   penalties, then top-k/temperature/min-p/top-p) at every step.
 //! * The GPU-argmax fast path (`crate::engine_greedy`) is taken **only**
 //!   when the configured sampler is pure greedy with no penalties. `generate`
 //!   / `generate_tracked` / the streaming pair all decide this through the
 //!   single predicate [`InferenceEngine::greedy_gpu_eligible`], which also
 //!   requires
-//!   [`GPU_ARGMAX_TIEBREAK_IS_FIRST_INDEX`](crate::engine_control::GPU_ARGMAX_TIEBREAK_IS_FIRST_INDEX)
-//!   (a wave-2 verifier finding: the GPU argmax kernels were fixed to
-//!   tie-break correctly and the gate is now open — see that constant's
-//!   doc comment for the fix and how to revert it if a regression is found).
+//!   [`GPU_ARGMAX_TIEBREAK_IS_FIRST_INDEX`]
+//!   (the GPU argmax kernels break ties toward the first index, like the
+//!   CPU samplers — see that constant's doc comment for how that is
+//!   verified and how to close the gate if a regression is found).
 //!   [`InferenceEngine::generate_greedy_gpu`] is a separate, *direct* entry
 //!   point that does not go through `greedy_gpu_eligible` — it checks the
 //!   same gate and the same penalty condition itself. Either way, when
 //!   penalties are configured, or the tie-break gate is closed, the call
 //!   decodes the full logit row and applies penalties before the argmax
 //!   instead.
+//! * A sampled request on the fused Metal route with no penalty draws its
+//!   decode steps from the GPU's top-k candidates instead of the full logit
+//!   row (the sampled top-k route, on by default — see
+//!   [`SampledTopKConfig`]). The engine's own sampler makes the draw over a
+//!   candidate sub-row that contains every top-k survivor, in the sampler's
+//!   canonical survivor order, so the tokens are exactly the ones the full
+//!   row gives.
 //!
 //! This closes `RT-24` and the CPU-vs-Metal greedy divergence: before it,
 //! `generate_greedy_gpu` was pure argmax and consulted neither the sampler
@@ -47,7 +54,6 @@ use oxibonsai_kernels::{KernelDispatcher, KernelTier};
 use oxibonsai_model::hybrid::{HybridModel, LoadedModel};
 use oxibonsai_model::model::BonsaiModel;
 
-use crate::batch_engine::{self, BatchResult};
 use crate::engine_control::{
     gguf_fused_metal_route, resolve_eos_token_set, CancellationToken, EosTokenSet, FusedMetalRoute,
     RecurrentState, SpeculativeConfig, GPU_ARGMAX_TIEBREAK_IS_FIRST_INDEX,
@@ -58,8 +64,7 @@ pub use crate::engine_seam::{
 };
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::metrics::InferenceMetrics;
-use crate::request_id::RequestId;
-use crate::request_metrics::{RequestRateAggregator, RequestRateSnapshot, RequestRateTracker};
+use crate::request_metrics::RequestRateAggregator;
 use crate::sampling::{PenaltyParams, Sampler, SamplingParams};
 
 /// Default EOS token id for Qwen3 / Bonsai models.
@@ -141,8 +146,7 @@ pub struct EngineStats {
     /// Sampled requests on the fused GPU route that were not eligible for the
     /// top-k route at all (penalties configured, `top_k` of `0`, above the
     /// candidate count or at/above the vocabulary, or the route disabled —
-    /// which it is by default, see [`SampledTopKConfig`]) and decoded on the
-    /// full row.
+    /// see [`SampledTopKConfig`]) and decoded on the full row.
     pub sampled_full_row_requests: AtomicU64,
 }
 
@@ -240,7 +244,8 @@ pub struct InferenceEngine<'a> {
     /// counter by strictly fewer tokens than its full length.
     prefill_token_count: u64,
     /// Optional workload-level rate aggregator. When attached, every
-    /// `generate_tracked` call records its [`RequestRateSnapshot`] here on
+    /// `generate_tracked` call records its
+    /// [`RequestRateSnapshot`](crate::request_metrics::RequestRateSnapshot) here on
     /// completion, allowing the operator to surface workload-level p50/p95
     /// inter-token latency, EWMA tokens-per-second, and queue-wait gauges
     /// (see [`InferenceMetrics::update_request_rate`]).
@@ -309,8 +314,185 @@ pub struct InferenceEngine<'a> {
     pub(crate) sequence_id: u64,
     /// Sampled decode on the fused GPU route (`perf-11`, sampled half):
     /// whether to download top-k candidates instead of the full logit row
-    /// (off by default — see [`SampledTopKConfig`]) and how many.
+    /// (on by default — see [`SampledTopKConfig`]) and how many.
     pub(crate) sampled_topk: SampledTopKConfig,
+    /// Test-only scripted generation (see [`ScriptedLogits`]); `None` — the
+    /// only value outside `cfg(test)`, where the field does not exist — runs
+    /// the model's real logits.
+    #[cfg(test)]
+    pub(crate) scripted_logits: Option<ScriptedLogits>,
+}
+
+/// Logit value every non-scripted token gets in a [`ScriptedLogits`] row:
+/// finite (a log-probability of it stays JSON-serialisable) yet far enough
+/// below the scripted token's `0.0` that no temperature up to the API's
+/// `2.0` leaves it any probability mass in `f32`.
+#[cfg(test)]
+const SCRIPTED_LOGIT_FLOOR: f32 = -1.0e9;
+
+/// A test-only generation script: make the engine's sampler yield a fixed
+/// id sequence, whatever its temperature, `top_k`, `top_p` or seed.
+///
+/// Every logit row a generation reads — the prefill's last row
+/// ([`InferenceEngine::prefill_for_generate`], once per generation however
+/// the prefill is chunked) and every decode forward
+/// (`InferenceEngine::forward_logits`) — is replaced by a row whose only
+/// non-floor entry is the next scripted id, so any sampler configuration
+/// draws exactly that id. The script restarts at every generation (each
+/// request replays the same sequence) and, once exhausted, scripts the
+/// engine's primary EOS id, so generation ends on its own with a natural
+/// stop. It can instead fail the next logit row with a typed
+/// [`EngineError`], to drive a handler's error mapping end to end; leave
+/// every row an equal choice among a fixed id set, so the sampler's own
+/// PRNG — and therefore its seed — decides each token (a seeded-draw test);
+/// or make every row one fixed, **known** row — a handful of ids with given
+/// logits, every other id the floor — so a test knows the exact
+/// distribution each draw is made from (the min-p tests).
+///
+/// A script can also **hold** its generation once it has drawn a given
+/// number of ids — the next decode row waits (bounded by
+/// [`SCRIPTED_HOLD_LIMIT`]) for the engine's cancellation token — so a test
+/// of "a stop sequence matched on the receiving side really cancels the
+/// generation" does not race a tiny model that would otherwise finish all
+/// its tokens before the receiver has seen the first one. The hold is
+/// one-shot: later generations on the engine run unheld.
+///
+/// Compiled only under `cfg(test)`: production builds have no such field
+/// and no hook, so their behaviour is untouched.
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ScriptedLogits {
+    ids: Vec<u32>,
+    cursor: usize,
+    fail_with: Option<EngineError>,
+    /// When non-empty, every row gives exactly these ids an equal logit
+    /// (and every other id the floor) instead of following `ids`.
+    uniform_over: Vec<u32>,
+    /// When non-empty, every row gives each `(id, logit)` pair its logit
+    /// (and every other id the floor) instead of following `ids`.
+    known_row: Vec<(u32, f32)>,
+    /// Hold the generation once this many ids have been drawn (see above).
+    hold_after: Option<usize>,
+}
+
+/// Longest a held script waits for its generation to be cancelled before
+/// carrying on as if it had not been held (a regression where nothing
+/// cancels then shows up as a test failure, not a hang).
+#[cfg(test)]
+const SCRIPTED_HOLD_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The scripts' setters. Every caller is an HTTP-level test, so they exist
+/// only where those tests do (`cfg(test)` with the `server` feature).
+#[cfg(all(test, feature = "server"))]
+impl InferenceEngine<'_> {
+    /// Script every generation on this engine to emit exactly `ids` (then
+    /// the primary EOS id). See [`ScriptedLogits`].
+    pub(crate) fn script_generation(&mut self, ids: Vec<u32>) {
+        self.scripted_logits = Some(ScriptedLogits {
+            ids,
+            ..ScriptedLogits::default()
+        });
+    }
+
+    /// Make every generation on this engine fail with `error` as soon as it
+    /// reads a logit row. See [`ScriptedLogits`].
+    pub(crate) fn script_failure(&mut self, error: EngineError) {
+        self.scripted_logits = Some(ScriptedLogits {
+            fail_with: Some(error),
+            ..ScriptedLogits::default()
+        });
+    }
+
+    /// Make every logit row an equal choice among `ids` (never EOS, so a
+    /// generation runs to its token limit): which of them each step draws
+    /// is up to the sampler's PRNG alone. See [`ScriptedLogits`].
+    pub(crate) fn script_uniform_choice(&mut self, ids: Vec<u32>) {
+        self.scripted_logits = Some(ScriptedLogits {
+            uniform_over: ids,
+            ..ScriptedLogits::default()
+        });
+    }
+
+    /// [`Self::script_generation`], holding the first generation after
+    /// `hold_after` ids until it is cancelled. See [`ScriptedLogits`].
+    pub(crate) fn script_generation_held(&mut self, ids: Vec<u32>, hold_after: usize) {
+        self.scripted_logits = Some(ScriptedLogits {
+            ids,
+            hold_after: Some(hold_after),
+            ..ScriptedLogits::default()
+        });
+    }
+}
+
+#[cfg(test)]
+impl InferenceEngine<'_> {
+    /// Make every logit row the fixed row `entries` describes: each
+    /// `(id, logit)` pair gets its logit, every other id the floor, so every
+    /// draw of every generation is made from one known distribution. The
+    /// engine-level min-p tests use it (in every feature configuration, so
+    /// it is not `server`-gated like the setters above). See
+    /// [`ScriptedLogits`].
+    pub(crate) fn script_known_row(&mut self, entries: Vec<(u32, f32)>) {
+        self.scripted_logits = Some(ScriptedLogits {
+            known_row: entries,
+            ..ScriptedLogits::default()
+        });
+    }
+
+    /// Apply the script (if any) to one freshly computed logit row;
+    /// `restart` rewinds the script to its first id (a new generation's
+    /// prefill row).
+    pub(crate) fn scripted_row(&mut self, row: Vec<f32>, restart: bool) -> RuntimeResult<Vec<f32>> {
+        let eos = self.eos.primary();
+        let Some(script) = self.scripted_logits.as_mut() else {
+            return Ok(row);
+        };
+        if let Some(error) = script.fail_with.clone() {
+            return Err(error.into());
+        }
+        let mut scripted = vec![SCRIPTED_LOGIT_FLOOR; row.len()];
+        if !script.known_row.is_empty() {
+            for &(id, logit) in &script.known_row {
+                if let Some(slot) = scripted.get_mut(id as usize) {
+                    *slot = logit;
+                }
+            }
+            return Ok(scripted);
+        }
+        if !script.uniform_over.is_empty() {
+            for &id in &script.uniform_over {
+                if let Some(slot) = scripted.get_mut(id as usize) {
+                    *slot = 0.0;
+                }
+            }
+            return Ok(scripted);
+        }
+        if restart {
+            script.cursor = 0;
+        }
+        // A decode row requested once `hold_after` ids were drawn: the last
+        // of them has already been handed to the receiver, which is what
+        // the hold waits on (one-shot).
+        let hold = !restart
+            && script
+                .hold_after
+                .is_some_and(|after| script.cursor >= after);
+        if hold {
+            script.hold_after = None;
+        }
+        let id = script.ids.get(script.cursor).copied().unwrap_or(eos);
+        script.cursor = script.cursor.saturating_add(1);
+        if let Some(slot) = scripted.get_mut(id as usize) {
+            *slot = 0.0;
+        }
+        if hold {
+            let start = std::time::Instant::now();
+            while !self.is_cancelled() && start.elapsed() < SCRIPTED_HOLD_LIMIT {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        Ok(scripted)
+    }
 }
 
 /// `MET-M1`, eviction half: an engine releases exactly its own model epoch
@@ -391,6 +573,8 @@ impl<'a> InferenceEngine<'a> {
             backend: Backend::Auto,
             sequence_id: 0,
             sampled_topk: SampledTopKConfig::default(),
+            #[cfg(test)]
+            scripted_logits: None,
         }
     }
 
@@ -689,7 +873,7 @@ impl<'a> InferenceEngine<'a> {
         // its own epoch, so `Drop` can release exactly this engine's
         // registrations; a deduplicating backend (`Scirs2Backend`) shares a
         // byte-identical resident buffer with a sibling replica instead of
-        // uploading a second copy (verify:METAL-CONCURRENCY blocking #1).
+        // uploading a second copy.
         let model_epoch = oxibonsai_kernels::gpu_backend::next_gpu_model_epoch();
         let upload_scope = GpuUploadScope::enter(model_epoch);
 
@@ -749,7 +933,7 @@ impl<'a> InferenceEngine<'a> {
 
         // Say what was uploaded and what was shared -- a replica that shares
         // a sibling's resident weights must not look like one that uploaded
-        // nothing (verify:METAL-CONCURRENCY blocking #1).
+        // nothing.
         let uploads = upload_scope.finish();
         if !uploads.is_empty() {
             tracing::info!(
@@ -831,7 +1015,9 @@ impl<'a> InferenceEngine<'a> {
     ///
     /// Once attached, every call to [`InferenceEngine::generate_tracked`] (or
     /// [`InferenceEngine::generate_with_request_id`]) will push its
-    /// per-request [`RequestRateSnapshot`] into the aggregator on completion.
+    /// per-request
+    /// [`RequestRateSnapshot`](crate::request_metrics::RequestRateSnapshot)
+    /// into the aggregator on completion.
     /// The aggregator is reference-counted, so the same instance can be shared
     /// with the Prometheus metrics layer or the admin endpoints.
     pub fn set_rate_aggregator(&mut self, aggregator: Arc<RequestRateAggregator>) {
@@ -1093,8 +1279,8 @@ impl<'a> InferenceEngine<'a> {
     /// Attach the model's recurrent (linear-attention) state so the engine
     /// can reset it between requests (`RT-28`).
     ///
-    /// See [`RecurrentState`] for why the hybrid model needs this and what
-    /// `B2-10` has to implement.
+    /// See [`RecurrentState`] for why the hybrid model needs this and what an
+    /// attached state must implement.
     pub fn set_recurrent_state(&mut self, state: Box<dyn RecurrentState>) {
         tracing::debug!(
             name = state.recurrent_name(),
@@ -1108,8 +1294,8 @@ impl<'a> InferenceEngine<'a> {
     ///
     /// The `'static` bound is the `Box<dyn RecurrentState>` field's own: a
     /// `&mut` trait object is invariant in its lifetime, so the bound cannot
-    /// be shortened to the borrow. `B2-10`'s `RecurrentCache` owns its
-    /// buffers, so this costs it nothing.
+    /// be shortened to the borrow. The hybrid model's `RecurrentCache` owns
+    /// its buffers, so this costs it nothing.
     pub fn recurrent_state_mut(&mut self) -> Option<&mut (dyn RecurrentState + 'static)> {
         self.recurrent.as_deref_mut()
     }
@@ -1248,6 +1434,49 @@ impl<'a> InferenceEngine<'a> {
         self.sampler.set_penalties(penalties);
     }
 
+    /// Current min-p (probabilistic nucleus) threshold of this engine's
+    /// sampler (`RT-23`); `0.0` means disabled.
+    ///
+    /// A pure forwarder to [`Sampler::min_p`] on the engine's own sampler —
+    /// the one every generation entry point decodes with. See
+    /// [`set_min_p`](Self::set_min_p) for what the value does and how long it
+    /// lasts.
+    pub fn min_p(&self) -> f32 {
+        self.sampler.min_p()
+    }
+
+    /// Set the min-p (probabilistic nucleus) threshold applied to sampled
+    /// generation (`RT-23`): after top-k, every candidate whose probability
+    /// is below `min_p` times the most likely candidate's is dropped and the
+    /// survivors are renormalised, before top-p.
+    ///
+    /// A pure forwarder to [`Sampler::set_min_p`], so this setter and a
+    /// server's per-request override — which sets the value on the engine's
+    /// sampler for one request and restores the previous one afterwards —
+    /// always agree on what a given `min_p` does.
+    ///
+    /// * **Lifetime.** Sampler configuration, like the penalties of
+    ///   [`set_penalties`](Self::set_penalties): it applies to every request
+    ///   on this engine until changed. [`reset`](Self::reset) keeps it
+    ///   (a reset clears sequence state — the KV cache and any recurrent
+    ///   state — not configuration), and so does every generation entry
+    ///   point: [`generate_with_params`](Self::generate_with_params) and
+    ///   [`generate_with_params_and_penalties`](Self::generate_with_params_and_penalties)
+    ///   swap only the [`SamplingParams`] and penalties, and
+    ///   [`generate_with_seed`](Self::generate_with_seed) carries it into its
+    ///   per-call sampler.
+    /// * **Range.** The value is stored as given and clamped to `[0.0, 1.0]`
+    ///   when a draw applies it: `0.0` or below (or `NaN`) disables the
+    ///   filter, and above `1.0` behaves as `1.0` — only the candidates tied
+    ///   with the most likely one survive, never none.
+    /// * **Greedy.** A temperature-0 request is an argmax and ignores it.
+    /// * **Fused GPU route.** The sampled top-k route draws with this same
+    ///   sampler over candidates that contain every top-k survivor, so min-p
+    ///   applies identically with the route on or off.
+    pub fn set_min_p(&mut self, min_p: f32) {
+        self.sampler.set_min_p(min_p);
+    }
+
     /// Cumulative number of tokens that have been processed by
     /// [`InferenceEngine::prefill_from_pos`] over this engine's lifetime.
     pub fn prefill_token_count(&self) -> u64 {
@@ -1263,7 +1492,7 @@ impl<'a> InferenceEngine<'a> {
     /// position — cannot carry over between requests.
     ///
     /// It deliberately does **not** touch an armed
-    /// [`CancellationToken`](crate::engine_control::CancellationToken):
+    /// [`CancellationToken`]:
     /// `run_blocking_generation` resets the engine *before* running the
     /// caller's closure, so detaching here would silently disarm a token the
     /// request had already armed. A token cannot leak into the *next*
@@ -1282,7 +1511,7 @@ impl<'a> InferenceEngine<'a> {
         self.sequence_id = self.sequence_id.wrapping_add(1);
     }
 
-    /// Create a fresh [`CancellationToken`](crate::engine_control::CancellationToken),
+    /// Create a fresh [`CancellationToken`],
     /// arm this engine with it, and return a handle to the caller.
     ///
     /// The one-line form of
@@ -1307,17 +1536,16 @@ impl<'a> InferenceEngine<'a> {
     ///
     /// All of the following must hold:
     ///
-    /// * [`GPU_ARGMAX_TIEBREAK_IS_FIRST_INDEX`] is `true` — a wave-2
-    ///   verifier finding, kept as an explicit dependency gate rather than
-    ///   removing the route: the MSL/CUDA argmax kernels were fixed to
-    ///   tie-break toward the global first index (`perf-11` / `FIX2-KERN`),
-    ///   so routing here no longer regresses the temperature-0/no-penalty
-    ///   cross-tier determinism invariant on any model whose logits contain
-    ///   exact duplicates (routinely true of a ternary/1-bit quantized
-    ///   model — the only family that can reach this predicate's `true`
-    ///   branch at all). If a future kernel regression forces this constant
-    ///   back to `false`, this condition alone closes the route again. See
-    ///   that constant's doc comment for the verified example and the fix;
+    /// * [`GPU_ARGMAX_TIEBREAK_IS_FIRST_INDEX`] is `true` — an explicit
+    ///   dependency gate: the MSL/CUDA argmax kernels tie-break toward the
+    ///   global first index (`perf-11`), so routing here keeps the
+    ///   temperature-0/no-penalty cross-tier determinism invariant on any
+    ///   model whose logits contain exact duplicates (routinely true of a
+    ///   ternary/1-bit quantized model — the only family that can reach this
+    ///   predicate's `true` branch at all). If a future kernel regression
+    ///   forces this constant back to `false`, this condition alone closes
+    ///   the route again. See that constant's doc comment for the verified
+    ///   example and the kernel-level test;
     /// * the model decodes through the fused Metal graph on a GPU tier —
     ///   `forward_greedy_gpu` maintains only the *GPU-resident* KV cache, so
     ///   a non-fused model would decode against an all-zero cache;
@@ -1325,13 +1553,13 @@ impl<'a> InferenceEngine<'a> {
     ///   log-probabilities cannot be reconstructed from a 4-byte argmax
     ///   readback;
     /// * the configured sampler is exactly greedy: temperature below
-    ///   [`GREEDY_TEMPERATURE_EPS`], repetition penalty `1.0`, and no
+    ///   `GREEDY_TEMPERATURE_EPS` (`1e-6`), repetition penalty `1.0`, and no
     ///   frequency/presence penalty. Anything else has to see the logits.
     ///
-    /// Note `SamplingParams::default()` carries `repetition_penalty: 1.1`,
-    /// so "no penalties" is never the default — it is a deliberate caller
-    /// choice, which is why this predicate reads the *sampler*, not the
-    /// request.
+    /// `SamplingParams::default()` carries `repetition_penalty: 1.0` (no
+    /// penalty, `RT-24`), but a caller can configure one on the engine's
+    /// sampler at any time, which is why this predicate reads the
+    /// *sampler*, not the request.
     pub fn greedy_gpu_eligible(&self, needs_full_logits: bool) -> bool {
         if !GPU_ARGMAX_TIEBREAK_IS_FIRST_INDEX || needs_full_logits || !self.uses_fused_gpu_decode()
         {
@@ -1386,6 +1614,10 @@ impl<'a> InferenceEngine<'a> {
             m.prefill_duration_seconds
                 .observe(prefill_start.elapsed().as_secs_f64());
         }
+        // Test-only scripted generation: once per generation, whatever the
+        // prefill chunking (see `ScriptedLogits`).
+        #[cfg(test)]
+        let logits = self.scripted_row(logits, true)?;
         Ok(Some(logits))
     }
 
@@ -1403,354 +1635,15 @@ impl<'a> InferenceEngine<'a> {
     pub fn session_count(&self) -> u64 {
         self.stats.requests_completed()
     }
-
-    /// Process a batch of prompts, delegating to [`batch_engine::batch_generate`].
-    ///
-    /// Resets the engine state between each prompt. Returns one result per prompt.
-    pub fn batch_generate(
-        &mut self,
-        prompts: &[Vec<u32>],
-        max_tokens: usize,
-    ) -> Vec<RuntimeResult<BatchResult>> {
-        self.stats.active_sessions.fetch_add(1, Ordering::Relaxed);
-
-        let results = batch_engine::batch_generate(self, prompts, max_tokens);
-
-        // Record stats for successful results
-        for br in results.iter().flatten() {
-            self.stats.record_request(br.generated_tokens.len());
-        }
-
-        self.stats.active_sessions.fetch_sub(1, Ordering::Relaxed);
-
-        results
-    }
-
-    /// Generate tokens from a prompt.
-    ///
-    /// Runs prefill (process the entire prompt), then decodes
-    /// token by token until `max_tokens` or EOS is reached.
-    /// Returns the generated token IDs (not including the prompt).
-    #[tracing::instrument(skip(self, prompt_tokens), fields(prompt_len = prompt_tokens.len()))]
-    pub fn generate(
-        &mut self,
-        prompt_tokens: &[u32],
-        max_tokens: usize,
-    ) -> RuntimeResult<Vec<u32>> {
-        if prompt_tokens.is_empty() {
-            return Ok(vec![]);
-        }
-
-        // `perf-11`: a configured-greedy request on the fused Metal route
-        // decodes with the GPU argmax, downloading 4 bytes per token instead
-        // of the whole f32 logit row (993 KB/token at Bonsai 2's 248 320
-        // vocabulary). Eligibility — including "no penalties are configured"
-        // — is decided by the one shared predicate, so this can never become
-        // a second decoding contract.
-        #[cfg(all(feature = "metal", target_os = "macos"))]
-        if self.greedy_gpu_eligible(false) {
-            return self.generate_greedy_gpu_unchecked(prompt_tokens, max_tokens, |_| true);
-        }
-        // `perf-11`, sampled half: a sampled request on the fused route
-        // downloads only its top-k candidates per token when eligible.
-        #[cfg(all(feature = "metal", target_os = "macos"))]
-        if let Some(tokens) = self.try_sampled_topk_route(prompt_tokens, max_tokens, |_| true)? {
-            return Ok(tokens);
-        }
-
-        // ═══════════════════════════════════════════════════════
-        // 1. Prefill: batch process all prompt tokens
-        // ═══════════════════════════════════════════════════════
-        let Some(mut last_logits) = self.prefill_for_generate(prompt_tokens)? else {
-            return Ok(vec![]);
-        };
-
-        // ═══════════════════════════════════════════════════════
-        // 2. Decode: sample and generate
-        // ═══════════════════════════════════════════════════════
-        let decode_start = std::time::Instant::now();
-        let mut output_tokens = Vec::with_capacity(max_tokens.min(MAX_PREALLOC_TOKENS));
-
-        for (pos, _) in (prompt_tokens.len()..).zip(0..max_tokens) {
-            let step_start = std::time::Instant::now();
-
-            // `SV-09`: cooperative cancellation, checked before the (costly)
-            // forward of this step. Returns what has been generated so far.
-            if self.is_cancelled() {
-                tracing::debug!(pos, "generation cancelled");
-                break;
-            }
-
-            // Sample next token, applying repetition/frequency/presence
-            // penalties over the generated-token history so far.
-            let next_token = self
-                .sampler
-                .sample_with_history(&last_logits, &output_tokens)?;
-
-            // Check for EOS (any id in the model's terminator set, RT-18)
-            if self.is_eos(next_token) {
-                tracing::debug!(pos, "EOS token generated");
-                break;
-            }
-
-            output_tokens.push(next_token);
-
-            // Forward the generated token
-            last_logits = self.forward_logits(next_token, pos)?;
-
-            if let Some(m) = &self.metrics {
-                m.decode_token_duration_seconds
-                    .observe(step_start.elapsed().as_secs_f64());
-            }
-        }
-
-        // Record tokens/sec and update memory gauge
-        if let Some(m) = &self.metrics {
-            let decode_elapsed = decode_start.elapsed().as_secs_f64();
-            if decode_elapsed > 0.0 && !output_tokens.is_empty() {
-                let tok_per_sec = output_tokens.len() as f64 / decode_elapsed;
-                m.tokens_per_second.observe(tok_per_sec);
-            }
-            m.tokens_generated_total.inc_by(output_tokens.len() as u64);
-            m.update_memory_from_rss();
-        }
-
-        // Record engine-level stats
-        self.stats.record_request(output_tokens.len());
-
-        tracing::info!(
-            prompt_len = prompt_tokens.len(),
-            generated = output_tokens.len(),
-            "generation complete"
-        );
-
-        Ok(output_tokens)
-    }
-
-    /// Generate tokens from a prompt while populating a [`RequestRateTracker`].
-    ///
-    /// Behaves identically to [`InferenceEngine::generate`] but additionally:
-    /// - records `record_admission()` immediately on entry,
-    /// - records `record_first_token()` for the first sampled token,
-    /// - records `record_token()` for every subsequent sampled token,
-    /// - on success, pushes the resulting [`RequestRateSnapshot`] into the
-    ///   engine's attached [`RequestRateAggregator`] (if any).
-    ///
-    /// The tracker is borrowed mutably so callers can inspect intermediate
-    /// state via [`RequestRateTracker::snapshot`] after the call returns.
-    #[tracing::instrument(skip(self, prompt_tokens, tracker), fields(prompt_len = prompt_tokens.len()))]
-    pub fn generate_tracked(
-        &mut self,
-        prompt_tokens: &[u32],
-        max_tokens: usize,
-        tracker: &mut RequestRateTracker,
-    ) -> RuntimeResult<Vec<u32>> {
-        if prompt_tokens.is_empty() {
-            return Ok(vec![]);
-        }
-        tracker.record_admission();
-
-        // Greedy + fused Metal route → GPU argmax (`perf-11`), with the
-        // per-token tracker events driven from the emit callback so the
-        // recorded latency series is identical to the CPU path's.
-        #[cfg(all(feature = "metal", target_os = "macos"))]
-        if self.greedy_gpu_eligible(false) {
-            let mut first_token_recorded = false;
-            let tokens =
-                self.generate_greedy_gpu_unchecked(prompt_tokens, max_tokens, |_token| {
-                    if first_token_recorded {
-                        tracker.record_token();
-                    } else {
-                        tracker.record_first_token();
-                        first_token_recorded = true;
-                    }
-                    true
-                })?;
-            if let Some(agg) = &self.rate_aggregator {
-                let snap: RequestRateSnapshot = tracker.snapshot();
-                agg.record(snap);
-            }
-            return Ok(tokens);
-        }
-        // Sampled + fused route → top-k candidates (`perf-11`, sampled
-        // half), with the same per-token tracker events.
-        #[cfg(all(feature = "metal", target_os = "macos"))]
-        {
-            let mut first_token_recorded = false;
-            let routed = self.try_sampled_topk_route(prompt_tokens, max_tokens, |_token| {
-                if first_token_recorded {
-                    tracker.record_token();
-                } else {
-                    tracker.record_first_token();
-                    first_token_recorded = true;
-                }
-                true
-            })?;
-            if let Some(tokens) = routed {
-                if let Some(agg) = &self.rate_aggregator {
-                    let snap: RequestRateSnapshot = tracker.snapshot();
-                    agg.record(snap);
-                }
-                return Ok(tokens);
-            }
-        }
-
-        let Some(mut last_logits) = self.prefill_for_generate(prompt_tokens)? else {
-            return Ok(vec![]);
-        };
-
-        let decode_start = std::time::Instant::now();
-        let mut output_tokens = Vec::with_capacity(max_tokens.min(MAX_PREALLOC_TOKENS));
-        let mut first_token_recorded = false;
-
-        for (pos, _) in (prompt_tokens.len()..).zip(0..max_tokens) {
-            let step_start = std::time::Instant::now();
-            if self.is_cancelled() {
-                tracing::debug!(pos, "tracked generation cancelled");
-                break;
-            }
-            let next_token = self
-                .sampler
-                .sample_with_history(&last_logits, &output_tokens)?;
-            if self.is_eos(next_token) {
-                tracing::debug!(pos, "EOS token generated");
-                break;
-            }
-            output_tokens.push(next_token);
-            if !first_token_recorded {
-                tracker.record_first_token();
-                first_token_recorded = true;
-            } else {
-                tracker.record_token();
-            }
-            last_logits = self.forward_logits(next_token, pos)?;
-
-            if let Some(m) = &self.metrics {
-                m.decode_token_duration_seconds
-                    .observe(step_start.elapsed().as_secs_f64());
-            }
-        }
-
-        if let Some(m) = &self.metrics {
-            let decode_elapsed = decode_start.elapsed().as_secs_f64();
-            if decode_elapsed > 0.0 && !output_tokens.is_empty() {
-                let tok_per_sec = output_tokens.len() as f64 / decode_elapsed;
-                m.tokens_per_second.observe(tok_per_sec);
-            }
-            m.tokens_generated_total.inc_by(output_tokens.len() as u64);
-            m.update_memory_from_rss();
-        }
-        self.stats.record_request(output_tokens.len());
-
-        if let Some(agg) = &self.rate_aggregator {
-            let snap: RequestRateSnapshot = tracker.snapshot();
-            agg.record(snap);
-        }
-
-        tracing::info!(
-            prompt_len = prompt_tokens.len(),
-            generated = output_tokens.len(),
-            "tracked generation complete"
-        );
-
-        Ok(output_tokens)
-    }
-
-    /// Generate tokens from a prompt with a [`RequestId`] tagging the
-    /// surrounding tracing span and an internally-managed
-    /// [`RequestRateTracker`].
-    ///
-    /// Returns both the generated tokens and the final tracker so callers
-    /// can extract per-request metrics (e.g. queue-wait, p95 inter-token
-    /// latency) for client-side observability.
-    pub fn generate_with_request_id(
-        &mut self,
-        request_id: RequestId,
-        prompt_tokens: &[u32],
-        max_tokens: usize,
-    ) -> RuntimeResult<(Vec<u32>, RequestRateTracker)> {
-        let span = tracing::info_span!("generate_request", request_id = %request_id);
-        let _enter = span.enter();
-        let mut tracker = RequestRateTracker::new();
-        let tokens = self.generate_tracked(prompt_tokens, max_tokens, &mut tracker)?;
-        Ok((tokens, tracker))
-    }
-
-    /// Generate tokens from a prompt using a specific seed for this run.
-    ///
-    /// Temporarily overrides the sampler seed for deterministic multi-completion
-    /// generation (`n > 1`). The sampler state is replaced for the duration of
-    /// this call and then restored.
-    pub fn generate_with_seed(
-        &mut self,
-        prompt_tokens: &[u32],
-        max_tokens: usize,
-        seed: u64,
-        params: &crate::sampling::SamplingParams,
-    ) -> RuntimeResult<Vec<u32>> {
-        // Swap in a fresh sampler with the given seed, carrying over any
-        // configured frequency/presence penalties so seeded multi-completion
-        // generation honours them just like the primary path.
-        let mut fresh = crate::sampling::Sampler::new(params.clone(), seed);
-        fresh.set_penalties(*self.sampler.penalties());
-        let old_sampler = std::mem::replace(&mut self.sampler, fresh);
-        let result = self.generate(prompt_tokens, max_tokens);
-        // Restore the original sampler
-        self.sampler = old_sampler;
-        result
-    }
-
-    /// Generate tokens from a prompt using caller-supplied sampling parameters
-    /// for the duration of this call only.
-    ///
-    /// Swaps in `params` (temperature, top-k, top-p, repetition penalty) on the
-    /// engine's existing sampler, runs [`InferenceEngine::generate`], then
-    /// restores the previous parameters. Crucially, the sampler's PRNG state is
-    /// **not** reset — only the parameters change — so the RNG sequence for the
-    /// next request is identical to what it would have been had this call used
-    /// the engine's default parameters. This makes the default-parameter case
-    /// bit-identical to calling `generate` directly.
-    pub fn generate_with_params(
-        &mut self,
-        prompt_tokens: &[u32],
-        max_tokens: usize,
-        params: &crate::sampling::SamplingParams,
-    ) -> RuntimeResult<Vec<u32>> {
-        let prev_params = self.sampler.params().clone();
-        self.sampler.set_params(params.clone());
-        let result = self.generate(prompt_tokens, max_tokens);
-        self.sampler.set_params(prev_params);
-        result
-    }
-
-    /// Generate tokens using caller-supplied sampling parameters *and*
-    /// frequency / presence penalties for the duration of this call only.
-    ///
-    /// Behaves like [`InferenceEngine::generate_with_params`] but additionally
-    /// swaps in `penalties` (OpenAI `frequency_penalty` / `presence_penalty`),
-    /// then restores both the previous parameters and penalties on return.
-    /// This is the one-call seam intended for the OpenAI-compatible server:
-    /// combined with `params.repetition_penalty`, it applies all three penalty
-    /// families over the generated-token history. The PRNG state is preserved,
-    /// so the all-default (no-penalty) case is bit-identical to
-    /// [`InferenceEngine::generate`].
-    pub fn generate_with_params_and_penalties(
-        &mut self,
-        prompt_tokens: &[u32],
-        max_tokens: usize,
-        params: &crate::sampling::SamplingParams,
-        penalties: &PenaltyParams,
-    ) -> RuntimeResult<Vec<u32>> {
-        let prev_params = self.sampler.params().clone();
-        let prev_penalties = *self.sampler.penalties();
-        self.sampler.set_params(params.clone());
-        self.sampler.set_penalties(*penalties);
-        let result = self.generate(prompt_tokens, max_tokens);
-        self.sampler.set_params(prev_params);
-        self.sampler.set_penalties(prev_penalties);
-        result
-    }
 }
+
+// The generation entry points (`batch_generate`, `generate`,
+// `generate_tracked`, `generate_with_request_id`, `generate_with_seed`,
+// `generate_with_params`, `generate_with_params_and_penalties`) live in a
+// child module, so they keep access to this module's private fields while
+// this file stays under the 2000-line ceiling.
+#[path = "engine_generate.rs"]
+mod generate;
 
 #[cfg(test)]
 #[path = "engine_tests.rs"]

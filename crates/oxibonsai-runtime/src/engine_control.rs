@@ -618,14 +618,16 @@ impl FusedMetalRoute {
     /// ternary 1.7B.
     ///
     /// Only the **ternary** route can skip it. `build_ternary_gpu_cache`
-    /// copies raw ternary bytes and mints its own handle ids ("no Q1 GPU
-    /// handles exist on the ternary path"), and *every* ternary Metal entry
-    /// point — `try_metal_full_forward_with_lm_head_ternary` (decode),
+    /// uploads every weight straight from the mapped tensors, keyed on their
+    /// addresses under the GGUF mapping's epoch (no host copy, no handle
+    /// ids), and *every* ternary Metal entry point —
+    /// `try_metal_full_forward_with_lm_head_ternary` (decode),
     /// `try_metal_prefill_with_lm_head_ternary` (prefill),
     /// `try_metal_prefill_verify_ternary_path` (speculative verify) and
-    /// `try_metal_full_forward_ternary_inner` — derives its handles from the
-    /// fixed `5_000_000` / `6_000_000` namespaces rather than calling
-    /// `*_gpu_handle()`. Nothing on that route reads the uploaded buffers.
+    /// `try_metal_full_forward_ternary_inner` — binds those buffers (the
+    /// cached MET-03 shape) rather than calling `*_gpu_handle()`. Nothing on
+    /// that route reads the uploaded buffers, and after C2 that upload no
+    /// longer carries the Q‖K‖V / gate‖up concatenations either.
     ///
     /// The **one-bit** route is the opposite: `build_cached_weights` keys the
     /// `MetalGraph` cache on the `fused_qkv` / `attn_proj` / `gate_up` /

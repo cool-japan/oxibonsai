@@ -5,6 +5,17 @@
 //!
 //! On WASM targets (`wasm32`), rayon is unavailable (no threads).
 //! All parallel entry points fall back to sequential execution transparently.
+//!
+//! ## The opt-in INT8 tier (K-14)
+//!
+//! The four native-format drivers (`gemv_1bit_g128_par`,
+//! `gemm_1bit_g128_par`, `gemv_ternary_g128_par`, `gemm_ternary_g128_par`)
+//! ask [`KernelDispatcher::native_int8_tier`] once, at entry, and hand the
+//! whole call to the matching [`crate::dispatch_int8`] kernel when
+//! `OXIBONSAI_KERNEL_TIER` selects one — the model's batched CPU prefill
+//! calls the two GEMM drivers directly, so this is where the tier reaches
+//! it. Otherwise the call runs today's f32 body, whose chunks call the
+//! dispatcher's `*_on_tier` methods and so never re-read the environment.
 
 use oxibonsai_core::tensor::{BlockQ1_0G128, QK1_0_G128};
 #[cfg(not(target_arch = "wasm32"))]
@@ -21,6 +32,10 @@ use crate::gemm_ternary::TERNARY_GEMM_MR;
 use crate::traits::Fp8Kernel;
 use crate::traits::OneBitKernel;
 use crate::traits::StandardQuantKernel;
+// The ternary drivers below call the dispatcher's `*_on_tier` methods, not
+// the trait; the sibling `parallel_tests.rs` (`use super::*`) still calls
+// `TernaryKernel` methods directly.
+#[cfg(test)]
 use crate::traits::TernaryKernel;
 use oxibonsai_core::QK_TQ2_0_G128;
 use oxibonsai_core::{BlockFP8E4M3, BlockFP8E5M2, QK_FP8};
@@ -83,8 +98,27 @@ fn rows_per_task(n_rows: usize) -> usize {
 /// Parallel row-wise 1-bit GEMV.
 ///
 /// Each row's dot product is independent, making this trivially parallelizable.
-/// Falls back to sequential for small `n_rows` to avoid overhead.
+/// Falls back to sequential for small `n_rows` to avoid overhead. Runs on
+/// the opt-in INT8 tier instead when
+/// [`KernelDispatcher::native_int8_tier`] selects one (see the module doc).
 pub fn gemv_1bit_g128_par(
+    dispatcher: &KernelDispatcher,
+    blocks: &[BlockQ1_0G128],
+    input: &[f32],
+    output: &mut [f32],
+    n_rows: usize,
+    k: usize,
+) -> KernelResult<()> {
+    if let Some(tier) = dispatcher.native_int8_tier() {
+        return crate::dispatch_int8::gemv_1bit_g128_int8(tier, blocks, input, output, n_rows, k);
+    }
+    gemv_1bit_g128_par_on_tier(dispatcher, blocks, input, output, n_rows, k)
+}
+
+/// [`gemv_1bit_g128_par`] on the dispatcher's own tier, without the INT8
+/// entry check — for callers that already made it (`parallel_tiled`'s
+/// adaptive driver).
+pub(crate) fn gemv_1bit_g128_par_on_tier(
     dispatcher: &KernelDispatcher,
     blocks: &[BlockQ1_0G128],
     input: &[f32],
@@ -122,13 +156,13 @@ pub fn gemv_1bit_g128_par(
 
     // Sequential fallback for small row counts
     if n_rows < par_gemv_min_rows() {
-        return dispatcher.gemv(blocks, input, output, n_rows, k);
+        return dispatcher.gemv_1bit_on_tier(blocks, input, output, n_rows, k);
     }
 
     // On WASM: no rayon threads available — fall back to sequential.
     #[cfg(target_arch = "wasm32")]
     {
-        dispatcher.gemv(blocks, input, output, n_rows, k)
+        dispatcher.gemv_1bit_on_tier(blocks, input, output, n_rows, k)
     }
 
     // Parallel: each chunk processes `chunk_rows` rows at once (K-16), not
@@ -145,7 +179,7 @@ pub fn gemv_1bit_g128_par(
                 let block_start = row_start * blocks_per_row;
                 let block_end = (row_start + rows) * blocks_per_row;
                 let chunk_blocks = &blocks[block_start..block_end];
-                dispatcher.gemv(chunk_blocks, input, out_chunk, rows, k)
+                dispatcher.gemv_1bit_on_tier(chunk_blocks, input, out_chunk, rows, k)
             })?;
 
         Ok(())
@@ -180,7 +214,7 @@ fn gemm_batch_chunk_rows(m: usize, mr: usize) -> usize {
 /// Parallel batch-wise 1-bit GEMM (K-18 register-blocked).
 ///
 /// Batch rows are independent, so the batch dimension is what Rayon splits —
-/// but in **slabs** ([`gemm_batch_chunk_rows`]), not one row per task, so
+/// but in **slabs** (`gemm_batch_chunk_rows`), not one row per task, so
 /// each task runs a genuine `m > 1` register-blocked GEMM and a decoded
 /// weight block is reused across `ONEBIT_GEMM_MR` rows.
 ///
@@ -190,6 +224,10 @@ fn gemm_batch_chunk_rows(m: usize, mr: usize) -> usize {
 /// takes below its GPU row threshold. Callers that want the Metal/CUDA 1-bit
 /// GEMM call `KernelDispatcher::gemm` (or the model's fused GPU prefill)
 /// directly; nothing in the tree reached the GPU *through* this function.
+///
+/// Runs on the opt-in INT8 tier instead when
+/// [`KernelDispatcher::native_int8_tier`] selects one (see the module doc);
+/// the model's batched CPU prefill reaches the tier through here.
 pub fn gemm_1bit_g128_par(
     dispatcher: &KernelDispatcher,
     blocks: &[BlockQ1_0G128],
@@ -199,6 +237,12 @@ pub fn gemm_1bit_g128_par(
     n_rows: usize,
     k: usize,
 ) -> KernelResult<()> {
+    if let Some(tier) = dispatcher.native_int8_tier() {
+        return crate::dispatch_int8::gemm_1bit_g128_int8(
+            tier, blocks, input, output, m, n_rows, k,
+        );
+    }
+
     // Validation
     if !k.is_multiple_of(QK1_0_G128) {
         return Err(KernelError::NotBlockAligned {
@@ -253,8 +297,27 @@ pub fn gemm_1bit_g128_par(
 /// Parallel row-wise ternary GEMV.
 ///
 /// Each row's dot product is independent, making this trivially parallelizable.
-/// Falls back to sequential for small `n_rows` to avoid overhead.
+/// Falls back to sequential for small `n_rows` to avoid overhead. Runs on
+/// the opt-in INT8 tier instead when
+/// [`KernelDispatcher::native_int8_tier`] selects one (see the module doc).
 pub fn gemv_ternary_g128_par(
+    dispatcher: &KernelDispatcher,
+    blocks: &[oxibonsai_core::BlockTQ2_0_g128],
+    input: &[f32],
+    output: &mut [f32],
+    n_rows: usize,
+    k: usize,
+) -> KernelResult<()> {
+    if let Some(tier) = dispatcher.native_int8_tier() {
+        return crate::dispatch_int8::gemv_two_bit_int8(tier, blocks, input, output, n_rows, k);
+    }
+    gemv_ternary_g128_par_on_tier(dispatcher, blocks, input, output, n_rows, k)
+}
+
+/// [`gemv_ternary_g128_par`] on the dispatcher's own tier, without the INT8
+/// entry check — for callers that already made it (`parallel_tiled`'s
+/// adaptive driver).
+pub(crate) fn gemv_ternary_g128_par_on_tier(
     dispatcher: &KernelDispatcher,
     blocks: &[oxibonsai_core::BlockTQ2_0_g128],
     input: &[f32],
@@ -290,12 +353,12 @@ pub fn gemv_ternary_g128_par(
     }
 
     if n_rows < par_gemv_min_rows() {
-        return dispatcher.gemv_ternary_g128(blocks, input, output, n_rows, k);
+        return dispatcher.gemv_ternary_on_tier(blocks, input, output, n_rows, k);
     }
 
     #[cfg(target_arch = "wasm32")]
     {
-        dispatcher.gemv_ternary_g128(blocks, input, output, n_rows, k)
+        dispatcher.gemv_ternary_on_tier(blocks, input, output, n_rows, k)
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -310,7 +373,7 @@ pub fn gemv_ternary_g128_par(
                 let block_start = row_start * blocks_per_row;
                 let block_end = (row_start + rows) * blocks_per_row;
                 let chunk_blocks = &blocks[block_start..block_end];
-                dispatcher.gemv_ternary_g128(chunk_blocks, input, out_chunk, rows, k)
+                dispatcher.gemv_ternary_on_tier(chunk_blocks, input, out_chunk, rows, k)
             })?;
 
         Ok(())
@@ -320,12 +383,34 @@ pub fn gemv_ternary_g128_par(
 /// Parallel batch-wise ternary GEMM (K-18 register-blocked).
 ///
 /// Batch rows are independent, so the batch dimension is what Rayon splits —
-/// but in **slabs** ([`gemm_batch_chunk_rows`]), not one row per task, so
+/// but in **slabs** (`gemm_batch_chunk_rows`), not one row per task, so
 /// each task runs a genuine `m > 1` register-blocked GEMM and a decoded
 /// weight block is reused across `TERNARY_GEMM_MR` rows. There is no ternary
 /// GPU GEMM kernel at all, so a GPU-tier dispatcher ran this on the CPU
 /// before this change too.
+///
+/// Runs on the opt-in INT8 tier instead when
+/// [`KernelDispatcher::native_int8_tier`] selects one (see the module doc);
+/// the model's batched CPU prefill reaches the tier through here.
 pub fn gemm_ternary_g128_par(
+    dispatcher: &KernelDispatcher,
+    blocks: &[oxibonsai_core::BlockTQ2_0_g128],
+    input: &[f32],
+    output: &mut [f32],
+    m: usize,
+    n_rows: usize,
+    k: usize,
+) -> KernelResult<()> {
+    if let Some(tier) = dispatcher.native_int8_tier() {
+        return crate::dispatch_int8::gemm_two_bit_int8(tier, blocks, input, output, m, n_rows, k);
+    }
+    gemm_ternary_g128_par_on_tier(dispatcher, blocks, input, output, m, n_rows, k)
+}
+
+/// [`gemm_ternary_g128_par`] on the dispatcher's own tier, without the INT8
+/// entry check — for callers that already made it (`parallel_tiled`'s
+/// adaptive driver).
+pub(crate) fn gemm_ternary_g128_par_on_tier(
     dispatcher: &KernelDispatcher,
     blocks: &[oxibonsai_core::BlockTQ2_0_g128],
     input: &[f32],

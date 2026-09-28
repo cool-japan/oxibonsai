@@ -315,9 +315,15 @@ pub struct ExtendedChatRequest {
     pub top_p: Option<f32>,
     /// Whether to stream the response as SSE.
     pub stream: Option<bool>,
+    /// OpenAI `stream_options`; only meaningful with `stream: true`. Only
+    /// `include_usage` is honored: every chunk then carries `"usage": null`
+    /// and a final usage-only chunk precedes `[DONE]`.
+    #[serde(default)]
+    pub stream_options: Option<crate::server::StreamOptions>,
     /// Sequences that stop generation.
     pub stop: Option<StopSequences>,
-    /// Tools available to the model.
+    /// Tools available to the model. Tool calls come back on the choice's
+    /// `tool_calls` (streamed: one `tool_calls` delta per completed call).
     pub tools: Option<Vec<Tool>>,
     /// Controls which tool is called, if any.
     pub tool_choice: Option<ToolChoice>,
@@ -337,13 +343,15 @@ pub struct ExtendedChatRequest {
     pub frequency_penalty: Option<f32>,
     /// Repetition penalty (`1.0` = disabled). When omitted, the handler seeds
     /// from the engine's own startup `SamplingParams` rather than a
-    /// hardcoded literal or `SamplingParams::default()` (gatekeeper
-    /// `REQUIRED #1`): the previous hardcoded `1.1` permanently disqualified
-    /// every extended-endpoint request from the GPU-argmax greedy path
-    /// (`InferenceEngine::greedy_gpu_eligible` requires exactly `1.0`), even
-    /// a `temperature: 0` request against a server started with no
-    /// repetition penalty configured at all.
+    /// hardcoded literal or `SamplingParams::default()`: a hardcoded `1.1`
+    /// would disqualify every extended-endpoint request from the GPU-argmax
+    /// greedy path (`InferenceEngine::greedy_gpu_eligible` requires exactly
+    /// `1.0`), even a `temperature: 0` request against a server started with
+    /// no repetition penalty configured at all.
     pub repetition_penalty: Option<f32>,
+    /// Min-p threshold in `[0.0, 1.0]` for this request only; omitted = the
+    /// serving replica's baseline, `0.0` = disabled.
+    pub min_p: Option<f32>,
     /// An optional identifier for the end user.
     pub user: Option<String>,
 }
@@ -360,11 +368,10 @@ fn default_max_tokens() -> usize {
 // type level with a bare deserialization error before any handler code runs
 // — the type-level block Bonsai 2 vision needs removed (mmproj / Qwen3-VL
 // merger, `<|image_pad|>` token expansion; see `CONTEXT.md`'s Bonsai 2
-// section). `ChatMessage` itself lives in `server.rs`, which this package
-// does not own, so this cannot be wired into it directly this wave (see
-// `deviations`); what *is* fully implemented here, end to end, is the
-// value-level machinery B2-20 (wave 6) will plug straight into
-// `ChatMessage.content: Option<MessageContent>` — deserialization, the
+// section). The chat handlers flatten such an array before the typed
+// parse; what is implemented here, end to end, is the value-level
+// machinery a `ChatMessage.content: Option<MessageContent>` field plugs
+// straight into — deserialization, the
 // text-only extraction used by every prompt builder today, and an honest
 // rejection of `image_url` parts (never a silent drop, never a stub image
 // path: "do not accept `image_url` yet, and say so in the 400 message").
@@ -378,7 +385,7 @@ fn default_max_tokens() -> usize {
 /// [`MessageContent::into_text_only`] can recognize it and produce a clear,
 /// specific rejection message instead of an opaque schema error. Parsing an
 /// `image_url` part is not the same as supporting it: nothing here decodes,
-/// fetches, or otherwise acts on the URL (`B2-20`'s job).
+/// fetches, or otherwise acts on the URL (vision input is not served).
 #[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
@@ -596,7 +603,8 @@ pub fn is_valid_json(text: &str) -> bool {
 /// ```
 ///
 /// Returns `Some(ToolCall)` on success, `None` if the pattern is not found
-/// or the inner JSON cannot be parsed.
+/// or the inner JSON cannot be parsed. Only the first block is read; see
+/// [`parse_json_tool_call_body`] for how its payload is interpreted.
 pub fn parse_tool_call(text: &str, call_id: &str) -> Option<ToolCall> {
     let start_tag = "<tool_call>";
     let end_tag = "</tool_call>";
@@ -605,20 +613,69 @@ pub fn parse_tool_call(text: &str, call_id: &str) -> Option<ToolCall> {
     let inner_start = start + start_tag.len();
     let end = text[inner_start..].find(end_tag).map(|e| inner_start + e)?;
 
-    let inner = text[inner_start..end].trim();
-    let value: serde_json::Value = serde_json::from_str(inner).ok()?;
+    parse_json_tool_call_body(&text[inner_start..end], call_id)
+}
 
-    let name = value.get("name")?.as_str()?.to_string();
-    let arguments = match value.get("arguments") {
-        Some(args) => serde_json::to_string(args).ok()?,
+/// The JSON tool-call payload `{"name": ..., "arguments": ...}`, with
+/// `arguments` borrowed as the model's own JSON text.
+#[derive(serde::Deserialize)]
+struct JsonToolCallPayload<'a> {
+    name: String,
+    #[serde(borrow, default)]
+    arguments: Option<&'a serde_json::value::RawValue>,
+}
+
+/// Parse the interior of one `<tool_call>…</tool_call>` block in the JSON
+/// form (`{"name": "fn", "arguments": {...}}`, surrounding whitespace
+/// allowed) into an OpenAI-shaped [`ToolCall`] with id `call_id`.
+///
+/// `arguments` is the model's own JSON text with its insignificant
+/// whitespace removed ([`compact_json`]) — every key in the order the model
+/// wrote it, rather than re-sorted through a `serde_json::Value`. A missing
+/// (or `null`) `arguments` is `"{}"`. `None` when the text is not a JSON
+/// object with a string `name`.
+pub fn parse_json_tool_call_body(inner: &str, call_id: &str) -> Option<ToolCall> {
+    let payload: JsonToolCallPayload<'_> = serde_json::from_str(inner.trim()).ok()?;
+    let arguments = match payload.arguments {
+        Some(raw) => compact_json(raw.get()),
         None => "{}".to_string(),
     };
-
     Some(ToolCall {
         id: call_id.to_string(),
         tool_type: "function".to_string(),
-        function: FunctionCallResult { name, arguments },
+        function: FunctionCallResult {
+            name: payload.name,
+            arguments,
+        },
     })
+}
+
+/// Remove the insignificant whitespace (space, tab, `\n`, `\r` outside
+/// string literals) from **valid** JSON text, keeping every key, value and
+/// their order exactly as written — string contents, escapes included, are
+/// copied verbatim.
+pub fn compact_json(json: &str) -> String {
+    let mut out = String::with_capacity(json.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    for c in json.chars() {
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+        } else if c == '"' {
+            in_string = true;
+            out.push(c);
+        } else if !matches!(c, ' ' | '\t' | '\n' | '\r') {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Generate a unique tool call identifier with the `call_` prefix.
@@ -640,8 +697,7 @@ pub fn parse_tool_call(text: &str, call_id: &str) -> Option<ToolCall> {
 ///
 /// Formatted as 8 hex characters (`call_1a2b3c4d`), kept at this width —
 /// not the correction's suggested 16 — to stay compatible with
-/// `generate_tool_call_id_prefix`'s existing `id.len() == 13` assertion (an
-/// existing test this package may not weaken to land a fix); 2^32 unique
+/// `generate_tool_call_id_prefix`'s `id.len() == 13` contract; 2^32 unique
 /// ids per process is not a realistic exhaustion risk for a request-scoped
 /// identifier.
 pub fn generate_tool_call_id() -> String {
@@ -724,6 +780,38 @@ mod tests {
     fn parse_tool_call_invalid() {
         let text = "No tool call here";
         assert!(parse_tool_call(text, "call_x").is_none());
+    }
+
+    #[test]
+    fn parse_tool_call_keeps_the_models_argument_key_order() {
+        let text = "<tool_call>\n{\"name\": \"f\", \"arguments\": {\"zeta\": 1, \"alpha\": \
+                    {\"y\": \"a b\", \"x\": [1, 2]}}}\n</tool_call>";
+        let tc = parse_tool_call(text, "call_1").expect("should parse");
+        assert_eq!(
+            tc.function.arguments,
+            r#"{"zeta":1,"alpha":{"y":"a b","x":[1,2]}}"#
+        );
+    }
+
+    #[test]
+    fn parse_json_tool_call_body_defaults_missing_arguments_and_rejects_bad_payloads() {
+        let tc = parse_json_tool_call_body(" {\"name\": \"ping\"} ", "call_2").expect("parses");
+        assert_eq!(tc.function.arguments, "{}");
+        let tc = parse_json_tool_call_body("{\"name\": \"ping\", \"arguments\": null}", "c")
+            .expect("parses");
+        assert_eq!(tc.function.arguments, "{}");
+        assert!(parse_json_tool_call_body("{\"function\": \"x\"}", "c").is_none());
+        assert!(parse_json_tool_call_body("{\"name\": 7}", "c").is_none());
+        assert!(parse_json_tool_call_body("not json", "c").is_none());
+    }
+
+    #[test]
+    fn compact_json_strips_only_insignificant_whitespace() {
+        assert_eq!(
+            compact_json("{ \"a b\" : [ 1 ,\n\t2 ], \"q\": \"x \\\" y\" }"),
+            r#"{"a b":[1,2],"q":"x \" y"}"#
+        );
+        assert_eq!(compact_json("\"\\\\\" "), "\"\\\\\"");
     }
 
     #[test]

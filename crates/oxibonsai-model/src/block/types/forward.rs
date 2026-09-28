@@ -25,31 +25,24 @@ use crate::block::functions::blocks_as_bytes;
 use crate::block::functions::blocks_as_bytes_ternary;
 
 use crate::block::functions::compute_gqa_attention;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+use crate::block::functions::try_metal_gemv_ternary_fused;
 use crate::block::functions::{advance_kv_cache_to, validate_shapes};
 
 use super::block_def::TransformerBlock;
 use super::scratch::ScratchBuffers;
 
-/// Weight-cache epoch this block attributes its CUDA uploads to.
-///
-/// FIX2-CUDA (wave 2.5) added `model_epoch: u64` as the last parameter of
-/// [`oxibonsai_kernels::try_cuda_qkv`] / [`oxibonsai_kernels::try_cuda_ffn`] so
-/// a model's `Drop` can free exactly its own GPU weights (finding **F-M3**).
-/// `TransformerBlock` does not carry the owning model's epoch:
-/// `BonsaiModel::cuda_model_epoch` is minted per load in
-/// `model/types/mod.rs`, and this block borrows its weights without a back
-/// reference to the model. Until `block_def::TransformerBlock` gains an epoch
-/// field, these two call sites register **unattributed**, which the registry
-/// documents as a no-op: the upload is simply never auto-released, i.e. exactly
-/// the pre-FIX2-CUDA lifetime. That is deliberately preferred over passing a
-/// guessed epoch, which would let one model's `Drop` free another's buffers.
-#[cfg(all(
-    feature = "native-cuda",
-    not(all(feature = "metal", target_os = "macos")),
-    any(target_os = "linux", target_os = "windows")
-))]
-const CUDA_BLOCK_MODEL_EPOCH: u64 =
-    oxibonsai_kernels::gpu_backend::cuda_graph_slot::UNATTRIBUTED_CUDA_MODEL_EPOCH;
+// Weight-cache epoch of this block's CUDA uploads (finding F-M3): FIX2-CUDA
+// added `model_epoch: u64` as the last parameter of
+// `oxibonsai_kernels::try_cuda_qkv` / `try_cuda_ffn` so a model's `Drop` can
+// free exactly its own GPU weights, but the block carried no epoch and
+// registered its uploads **unattributed** (never released). The block now
+// carries its model's namespace (`block_def::TransformerBlock::slot_namespace`,
+// set by `BonsaiModel`'s constructors to the model's `cuda_model_epoch` on a
+// CUDA build), so the CUDA arms below attribute their uploads to
+// `self.slot_namespace.epoch()` and the model's drop frees them. A standalone
+// block's namespace is a fresh epoch drawn from the same CUDA counter, so it
+// can never name another model's buffers.
 
 /// Private CUDA weight-cache namespace for the **fused** Q‖K‖V ternary
 /// upload (finding **M-21**, blocking fix).
@@ -189,8 +182,8 @@ fn cuda_tq2_soa_len_bytes(total_rows: usize, k: usize) -> Option<usize> {
 /// Generic over the number of parts (`M-21`): Q‖K‖V passes three, gate‖up
 /// two.
 ///
-/// The upload registers under [`CUDA_BLOCK_MODEL_EPOCH`] (unattributed) for the
-/// reason documented there.
+/// The upload registers under `model_epoch` — the block's namespace epoch,
+/// i.e. its model's `cuda_model_epoch` — so the model's drop releases it.
 ///
 /// **Compile-blind**: this host has no CUDA. Type-checked against the real API
 /// by cross-compiling to `x86_64-unknown-linux-gnu`; never executed.
@@ -206,6 +199,7 @@ fn try_cuda_gemv_ternary_fused(
     aos_parts: &[&[u8]],
     n_rows: usize,
     k: usize,
+    model_epoch: u64,
 ) -> Result<(), oxibonsai_kernels::CudaGraphError> {
     let graph = oxibonsai_kernels::CudaGraph::global()?;
     let expected_bytes = cuda_tq2_soa_len_bytes(n_rows, k).ok_or_else(|| {
@@ -223,7 +217,7 @@ fn try_cuda_gemv_ternary_fused(
             }
             fused
         },
-        CUDA_BLOCK_MODEL_EPOCH,
+        model_epoch,
     )?;
     if d_weight.len() != expected_bytes {
         return Err(oxibonsai_kernels::CudaGraphError::DriverError(format!(
@@ -397,7 +391,7 @@ impl<'a> TransformerBlock<'a> {
                             v_bytes,
                             total_rows,
                             h,
-                            CUDA_BLOCK_MODEL_EPOCH,
+                            self.slot_namespace.epoch(),
                         )
                         .is_ok()
                     } else {
@@ -435,63 +429,21 @@ impl<'a> TransformerBlock<'a> {
                     v_all[..k_rows].copy_from_slice(&fused_qkv[q_rows + k_rows..total_rows]);
                 }
             } else {
-                // M-21: ternary models get no `fused_qkv_handle` (see the
-                // long comment in `upload.rs` for why), so key the Metal
-                // fused-QKV fast path on `blocks_ternary()` directly,
-                // gated on `attn_q.gpu_handle()` so a model that never
-                // opted into GPU residency via `upload_to_gpu()` stays on
-                // the CPU path exactly like the 1-bit branch above does.
-                // The slot itself is that handle's own `.id()` (see the
-                // blocking-fix note on `try_metal_gemv_ternary_fused`), not
-                // the weight's mmap pointer — ids come from the same
-                // process-global monotonic counter 1-bit handles use, so
-                // they are never reused across model loads the way a freed
-                // mmap address can be.
+                // M-21: ternary models get no 1-bit `fused_qkv_handle` (see
+                // the long comment in `upload.rs` for why), so the Metal
+                // fused-QKV fast path is keyed on `blocks_ternary()` directly,
+                // gated on GPU residency (`upload_to_gpu()` ran on a GPU
+                // tier) so a CPU-tier block stays on the CPU path exactly like
+                // the 1-bit branch above does. Its slot is the mapped
+                // `attn_q` address under the block's namespace epoch
+                // (`ternary_fused_qkv_slot`, MET-02): the model's own
+                // full-forward cache keys its fused Q‖K‖V buffer on the very
+                // same (epoch, slot), every replica of the GGUF mapping shares
+                // it, and a model re-loaded at a reused address mints a new
+                // epoch, so a freed mapping's buffer can never be bound.
                 #[cfg(all(feature = "metal", target_os = "macos"))]
-                let ternary_metal_ok = {
-                    if let (Some(q_blk), Some(k_blk), Some(v_blk)) = (
-                        self.attn_q.blocks_ternary(),
-                        self.attn_k.blocks_ternary(),
-                        self.attn_v.blocks_ternary(),
-                    ) {
-                        // M-21: the dedicated fused handle's id when
-                        // `upload_to_gpu` built one (`ternary_fused_qkv_slot`),
-                        // and the kernels-side N-part entry, which refuses a
-                        // resident buffer of the wrong size.
-                        if let Some(slot) = self.ternary_fused_qkv_slot() {
-                            let q_rows = nq * hd;
-                            let k_rows = nkv * hd;
-                            let total_rows = q_rows + k_rows + k_rows;
-                            let q_bytes = blocks_as_bytes_ternary(q_blk);
-                            let k_bytes = blocks_as_bytes_ternary(k_blk);
-                            let v_bytes = blocks_as_bytes_ternary(v_blk);
-                            if oxibonsai_kernels::try_metal_gemv_tq2_fused(
-                                normed,
-                                fused_qkv,
-                                oxibonsai_kernels::LEGACY_MODEL_EPOCH,
-                                slot,
-                                &[q_bytes, k_bytes, v_bytes],
-                                total_rows,
-                                h,
-                            )
-                            .is_ok()
-                            {
-                                q_all[..q_rows].copy_from_slice(&fused_qkv[..q_rows]);
-                                k_all[..k_rows]
-                                    .copy_from_slice(&fused_qkv[q_rows..q_rows + k_rows]);
-                                v_all[..k_rows]
-                                    .copy_from_slice(&fused_qkv[q_rows + k_rows..total_rows]);
-                                true
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                };
+                let ternary_metal_ok =
+                    self.try_fused_qkv_ternary_metal(normed, fused_qkv, q_all, k_all, v_all);
                 #[cfg(not(all(feature = "metal", target_os = "macos")))]
                 let ternary_metal_ok = false;
                 // M-21 (wave-2.5 addendum item 4): the CUDA twin of the Metal
@@ -542,6 +494,7 @@ impl<'a> TransformerBlock<'a> {
                             &[q_bytes, k_bytes, v_bytes],
                             total_rows,
                             h,
+                            self.slot_namespace.epoch(),
                         ) {
                             Ok(()) => {
                                 q_all[..q_rows].copy_from_slice(&fused_qkv[..q_rows]);
@@ -756,7 +709,7 @@ impl<'a> TransformerBlock<'a> {
                             down_bytes,
                             h,
                             inter,
-                            CUDA_BLOCK_MODEL_EPOCH,
+                            self.slot_namespace.epoch(),
                         );
                         if cuda_result.is_ok() {
                             true
@@ -868,12 +821,91 @@ impl<'a> TransformerBlock<'a> {
         Ok(())
     }
 
+    /// `M-21` / `MET-02`: one fused GEMV for a GPU-uploaded **ternary**
+    /// block's Q‖K‖V projection on Metal, writing `q_all` / `k_all` /
+    /// `v_all` — the one ternary fused-QKV arm every block forward kind
+    /// (`forward`, `forward_with_sliding_window`, `forward_with_stats`) runs,
+    /// so they all bind the same `MetalGraph` buffer.
+    ///
+    /// Keyed on [`Self::ternary_fused_qkv_slot`] (the mapped `attn_q`
+    /// address) under the block's namespace epoch — the model's mapping
+    /// epoch, i.e. the exact key the model's full-forward ternary cache holds
+    /// its Q‖K‖V concatenation under, which is byte-identical to the one built
+    /// here — through the size-checked N-part kernels entry, which refuses a
+    /// resident buffer of the wrong length. Returns `false` (and the caller
+    /// runs the three per-matrix projections) for a non-ternary block, a
+    /// block never uploaded to a GPU tier, or any Metal error.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    pub(super) fn try_fused_qkv_ternary_metal(
+        &self,
+        normed: &[f32],
+        fused_qkv: &mut [f32],
+        q_all: &mut [f32],
+        k_all: &mut [f32],
+        v_all: &mut [f32],
+    ) -> bool {
+        let (Some(q_blk), Some(k_blk), Some(v_blk)) = (
+            self.attn_q.blocks_ternary(),
+            self.attn_k.blocks_ternary(),
+            self.attn_v.blocks_ternary(),
+        ) else {
+            return false;
+        };
+        let Some(slot) = self.ternary_fused_qkv_slot() else {
+            return false;
+        };
+        let q_rows = self.num_heads * self.head_dim;
+        let k_rows = self.num_kv_heads * self.head_dim;
+        let total_rows = q_rows + k_rows + k_rows;
+        if fused_qkv.len() < total_rows
+            || q_all.len() < q_rows
+            || k_all.len() < k_rows
+            || v_all.len() < k_rows
+        {
+            return false;
+        }
+        let parts = [
+            blocks_as_bytes_ternary(q_blk),
+            blocks_as_bytes_ternary(k_blk),
+            blocks_as_bytes_ternary(v_blk),
+        ];
+        // Before and after the upload-or-bind: see `MappingState::mark_gpu_used`.
+        self.slot_namespace.mark_gpu_used();
+        let result = try_metal_gemv_ternary_fused(
+            normed,
+            fused_qkv,
+            self.slot_namespace.epoch(),
+            slot,
+            &parts,
+            total_rows,
+            self.hidden_size,
+        );
+        self.slot_namespace.mark_gpu_used();
+        match result {
+            Ok(()) => {
+                q_all[..q_rows].copy_from_slice(&fused_qkv[..q_rows]);
+                k_all[..k_rows].copy_from_slice(&fused_qkv[q_rows..q_rows + k_rows]);
+                v_all[..k_rows].copy_from_slice(&fused_qkv[q_rows + k_rows..total_rows]);
+                true
+            }
+            Err(e) => {
+                tracing::debug!(
+                    layer = self.layer_idx, error = %e,
+                    "fused ternary QKV GEMV on Metal failed, using per-matrix projections"
+                );
+                false
+            }
+        }
+    }
+
     /// `M-21`: one fused GEMV for a **ternary** block's gate‖up projection
-    /// instead of two, writing `gate_out` / `up_out`.
+    /// instead of two, writing `gate_out` / `up_out` — shared by every block
+    /// forward kind.
     ///
     /// Engages only for a block whose gate and up projections are both
     /// `TQ2_0_g128` and that `upload_to_gpu` gave a GPU slot
-    /// ([`Self::ternary_fused_gate_up_slot`] on Metal,
+    /// ([`Self::ternary_fused_gate_up_slot`] under the block's namespace
+    /// epoch on Metal — the model cache's own `gate_up` key —
     /// `cuda_ternary_fused_slot` on CUDA, behind a GPU kernel tier there).
     /// Returns `false` — and the caller runs the two per-matrix projections —
     /// on a CPU tier, a non-ternary block, a never-uploaded block, or any GPU
@@ -890,7 +922,7 @@ impl<'a> TransformerBlock<'a> {
         )),
         allow(unused_variables)
     )]
-    fn try_fused_gate_up_ternary(
+    pub(super) fn try_fused_gate_up_ternary(
         &self,
         normed: &[f32],
         fused_gate_up: &mut [f32],
@@ -916,15 +948,18 @@ impl<'a> TransformerBlock<'a> {
                     blocks_as_bytes_ternary(gate_blk),
                     blocks_as_bytes_ternary(up_blk),
                 ];
-                match oxibonsai_kernels::try_metal_gemv_tq2_fused(
+                self.slot_namespace.mark_gpu_used();
+                let result = try_metal_gemv_ternary_fused(
                     normed,
                     &mut fused_gate_up[..total_rows],
-                    oxibonsai_kernels::LEGACY_MODEL_EPOCH,
+                    self.slot_namespace.epoch(),
                     slot,
                     &parts,
                     total_rows,
                     h,
-                ) {
+                );
+                self.slot_namespace.mark_gpu_used();
+                match result {
                     Ok(()) => true,
                     Err(e) => {
                         tracing::debug!(
@@ -959,6 +994,7 @@ impl<'a> TransformerBlock<'a> {
                     &parts,
                     total_rows,
                     h,
+                    self.slot_namespace.epoch(),
                 ) {
                     Ok(()) => true,
                     Err(e) => {
@@ -1251,25 +1287,35 @@ mod metal_fused_ternary_tests {
             .into()
     }
 
-    /// Residency probe against the bound session's weight cache.
-    fn resident_bytes(graph: &MetalGraph, slot: u64) -> Option<usize> {
+    /// Residency probe against the bound session's weight cache, under the
+    /// key the block's fused arms upload with: `(epoch, Tq2Soa, slot)`.
+    fn resident_bytes(graph: &MetalGraph, epoch: u64, slot: u64) -> Option<usize> {
         graph
-            .get_or_upload_keyed(WeightKey::legacy(WeightKind::Tq2Soa, slot), || {
+            .get_or_upload_keyed(WeightKey::new(epoch, WeightKind::Tq2Soa, slot), || {
                 Err(MetalGraphError::ExecutionFailed("probe".into()))
             })
             .ok()
             .map(|handle| handle.byte_len())
     }
 
+    /// The address of a weight slice — the mapped-tensor slot a block's fused
+    /// arm keys the concatenation starting with it on.
+    fn address_of(blocks: &[BlockTQ2_0_g128]) -> u64 {
+        blocks.as_ptr() as u64
+    }
+
     /// `M-21` end to end on Metal:
     ///
-    /// 1. `upload_to_gpu` builds the two **ternary** fused handles and leaves
-    ///    every 1-bit fused field (and its gated accessor) empty — so the
-    ///    block is not diverted into the 1-bit fused branch;
-    /// 2. `forward` then runs the ternary fused-QKV arm **and** the new fused
+    /// 1. `upload_to_gpu` leaves every 1-bit fused field (and its gated
+    ///    accessor) empty — so the block is not diverted into the 1-bit fused
+    ///    branch — and, on Metal, uploads no ternary concatenation to the
+    ///    kernel's own cache either (C2: nothing on Metal reads it), while the
+    ///    fused slots come alive: the addresses of the Q and gate weights,
+    ///    under the block's namespace epoch;
+    /// 2. `forward` then runs the ternary fused-QKV arm **and** the fused
     ///    gate‖up GEMV — proven by both concatenations being resident in
-    ///    `MetalGraph`'s cache, at the exact fused byte length, under the
-    ///    dedicated handles' ids;
+    ///    `MetalGraph`'s cache, at the exact fused byte length, under exactly
+    ///    that `(epoch, slot)` key and under no legacy one;
     /// 3. and the result matches the CPU reference block (no upload, reference
     ///    tier) over several positions.
     ///
@@ -1287,27 +1333,40 @@ mod metal_fused_ternary_tests {
             let gpu_kernel = Arc::new(KernelDispatcher::auto_detect());
             let reference = weights.block(&cpu_kernel);
             let mut gpu = weights.block(&gpu_kernel);
+            assert_eq!(
+                gpu.ternary_fused_qkv_slot(),
+                None,
+                "a block never uploaded to a GPU tier must not engage the fused arm"
+            );
             gpu.upload_to_gpu(gpu_kernel.as_ref());
 
             assert!(
                 gpu.fused_qkv_gpu_handle().is_none() && gpu.fused_gate_up_gpu_handle().is_none(),
                 "a ternary block must expose no 1-bit fused handle"
             );
-            let fused_qkv = gpu
-                .fused_qkv_gpu_handle_ternary()
-                .expect("a GPU-tier upload must build the ternary fused QKV handle");
-            let fused_gate_up = gpu
-                .fused_gate_up_gpu_handle_ternary()
-                .expect("a GPU-tier upload must build the ternary fused gate+up handle");
-            let qkv_slot = fused_qkv.id();
-            let gate_up_slot = fused_gate_up.id();
+            assert!(
+                gpu.fused_qkv_gpu_handle_ternary().is_none()
+                    && gpu.fused_gate_up_gpu_handle_ternary().is_none(),
+                "C2: on Metal no ternary concatenation goes to the kernel's own cache"
+            );
+            let qkv_slot = gpu
+                .ternary_fused_qkv_slot()
+                .expect("a GPU-uploaded ternary block has a fused-QKV slot");
+            let gate_up_slot = gpu
+                .ternary_fused_gate_up_slot()
+                .expect("a GPU-uploaded ternary block has a fused gate‖up slot");
             assert_ne!(qkv_slot, gate_up_slot);
-            assert_eq!(gpu.ternary_fused_qkv_slot(), Some(qkv_slot));
-            assert_eq!(gpu.ternary_fused_gate_up_slot(), Some(gate_up_slot));
+            assert_eq!(
+                qkv_slot,
+                address_of(&weights.q),
+                "the fused-QKV slot is the mapped Q weight's address, not an upload-handle id"
+            );
+            assert_eq!(gate_up_slot, address_of(&weights.gate));
+            let epoch = gpu.gpu_slot_epoch();
             assert_ne!(
-                gpu.legacy_ternary_fused_qkv_slot(),
-                Some(qkv_slot),
-                "the dedicated handle must not reuse the Q projection's id"
+                epoch,
+                reference.gpu_slot_epoch(),
+                "two standalone blocks never share a namespace"
             );
 
             let rope = RopeTable::new(HD, SEQ, 10_000.0);
@@ -1353,15 +1412,156 @@ mod metal_fused_ternary_tests {
             let bpr = H / 128;
             let qkv_rows = NQ * HD + 2 * NKV * HD;
             assert_eq!(
-                resident_bytes(&isolated, qkv_slot),
+                resident_bytes(&isolated, epoch, qkv_slot),
                 Some(qkv_rows * bpr * 34),
                 "the ternary fused-QKV arm did not run (its Q‖K‖V buffer is not resident)"
             );
             assert_eq!(
-                resident_bytes(&isolated, gate_up_slot),
+                resident_bytes(&isolated, epoch, gate_up_slot),
                 Some(2 * INTER * bpr * 34),
                 "the fused gate‖up GEMV did not run (its gate‖up buffer is not resident)"
             );
+            assert_eq!(
+                resident_bytes(&isolated, oxibonsai_kernels::LEGACY_MODEL_EPOCH, qkv_slot),
+                None,
+                "the fused buffer is keyed under the block's epoch, not the legacy one"
+            );
         });
+    }
+
+    /// The three block forward kinds, as far as the ternary fused arms go.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ForwardKind {
+        Forward,
+        SlidingWindow,
+        Stats,
+    }
+
+    /// Run one forward kind of `block` at position 0 over a fresh KV cache.
+    fn run_forward(
+        kind: ForwardKind,
+        block: &TransformerBlock<'_>,
+        input: &[f32],
+        rope: &RopeTable,
+        kernel: &KernelDispatcher,
+    ) -> Vec<f32> {
+        let mut hidden = input.to_vec();
+        let mut kv = KvCache::new(1, NKV, HD, SEQ);
+        match kind {
+            ForwardKind::Forward => block
+                .forward(&mut hidden, 0, &mut kv, rope, kernel)
+                .expect("forward"),
+            ForwardKind::SlidingWindow => block
+                .forward_with_sliding_window(&mut hidden, 0, &mut kv, rope, kernel, None)
+                .expect("forward_with_sliding_window"),
+            ForwardKind::Stats => {
+                block
+                    .forward_with_stats(&mut hidden, 0, &mut kv, rope, kernel)
+                    .expect("forward_with_stats");
+            }
+        }
+        hidden
+    }
+
+    /// B2 (MC-FIX D4): **every** block forward kind — `forward`,
+    /// `forward_with_sliding_window` and `forward_with_stats` — runs the
+    /// ternary fused arms (Q‖K‖V and gate‖up) on its own, is not diverted into
+    /// the 1-bit branch, matches the CPU reference, and binds the **same**
+    /// resident concatenations: whichever kind runs first uploads exactly the
+    /// two ternary buffers (and nothing of 1-bit kind), and running the other
+    /// two kinds afterwards does not grow `MetalGraph`'s resident bytes.
+    ///
+    /// Before B2 the sliding-window and stats forwards keyed the fused QKV on
+    /// the Q projection's handle id (the legacy slot) and had no fused
+    /// gate‖up arm, so mixing them with `forward` held the Q‖K‖V
+    /// concatenation twice.
+    #[test]
+    fn every_block_forward_kind_runs_the_ternary_fused_arms_on_one_buffer() {
+        if MetalGraph::new().is_err() {
+            return; // no Metal device on this host
+        }
+        let weights = Weights::new();
+        let cpu_kernel = Arc::new(KernelDispatcher::with_tier(KernelTier::Reference));
+        let gpu_kernel = Arc::new(KernelDispatcher::auto_detect());
+        let reference = weights.block(&cpu_kernel);
+        let rope = RopeTable::new(HD, SEQ, 10_000.0);
+        let input: Vec<f32> = (0..H)
+            .map(|i| ((i * 17 + 3) % 31) as f32 * 0.01 - 0.15)
+            .collect();
+        let expected = run_forward(ForwardKind::Forward, &reference, &input, &rope, &cpu_kernel);
+        let bpr = H / 128;
+        let qkv_bytes = (NQ * HD + 2 * NKV * HD) * bpr * 34;
+        let gate_up_bytes = 2 * INTER * bpr * 34;
+        let kinds = [
+            ForwardKind::Forward,
+            ForwardKind::SlidingWindow,
+            ForwardKind::Stats,
+        ];
+        for first in kinds {
+            let Ok(isolated) = MetalGraph::new() else {
+                return;
+            };
+            let isolated = Arc::new(isolated);
+            MetalGraph::with_session(&isolated, || {
+                let mut gpu = weights.block(&gpu_kernel);
+                gpu.upload_to_gpu(gpu_kernel.as_ref());
+                assert!(
+                    gpu.fused_qkv_gpu_handle().is_none()
+                        && gpu.fused_gate_up_gpu_handle().is_none(),
+                    "{first:?}: the ternary block must not reach the 1-bit branch"
+                );
+                let epoch = gpu.gpu_slot_epoch();
+                let qkv_slot = gpu.ternary_fused_qkv_slot().expect("fused-QKV slot");
+                let gate_up_slot = gpu.ternary_fused_gate_up_slot().expect("gate‖up slot");
+
+                let out = run_forward(first, &gpu, &input, &rope, &gpu_kernel);
+                let worst = expected
+                    .iter()
+                    .zip(&out)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                assert!(
+                    worst < 1e-3,
+                    "{first:?}: diverged from the CPU reference by {worst}"
+                );
+                assert_eq!(
+                    resident_bytes(&isolated, epoch, qkv_slot),
+                    Some(qkv_bytes),
+                    "{first:?} did not run the ternary fused-QKV arm"
+                );
+                assert_eq!(
+                    resident_bytes(&isolated, epoch, gate_up_slot),
+                    Some(gate_up_bytes),
+                    "{first:?} did not run the ternary fused gate‖up arm"
+                );
+                assert_eq!(
+                    isolated.cached_weight_count().expect("count"),
+                    2,
+                    "{first:?}: exactly the two ternary concatenations are resident — no 1-bit \
+                     (Q1Soa) buffer, no second copy"
+                );
+                let resident = isolated.bytes_uploaded();
+                assert_eq!(resident, (qkv_bytes + gate_up_bytes) as u64);
+
+                for other in kinds.into_iter().filter(|k| *k != first) {
+                    let out = run_forward(other, &gpu, &input, &rope, &gpu_kernel);
+                    let worst = expected
+                        .iter()
+                        .zip(&out)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0f32, f32::max);
+                    assert!(
+                        worst < 1e-3,
+                        "{other:?} after {first:?}: diverged by {worst}"
+                    );
+                    assert_eq!(
+                        isolated.bytes_uploaded(),
+                        resident,
+                        "{other:?} after {first:?} grew the resident bytes: a second copy of a \
+                         ternary concatenation"
+                    );
+                }
+            });
+        }
     }
 }

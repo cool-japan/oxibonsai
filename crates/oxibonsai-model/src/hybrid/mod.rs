@@ -44,6 +44,7 @@ pub mod block_full;
 pub mod block_linear;
 pub mod forward;
 pub mod hadamard;
+pub mod metal;
 pub mod model;
 pub mod recurrent_cache;
 pub mod vhead_map;

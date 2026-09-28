@@ -11,9 +11,19 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use crate::gpu_backend::kernel_sources;
-
 use super::error::MetalGraphError;
+
+/// Every MSL source the combined library is built from, under one name.
+///
+/// `build_combined_msl` names each source as `kernel_sources::MSL_*` — the
+/// exact text `tests/build_script_kernel_sources.rs` parses to cross-check
+/// the pushes against `build.rs`'s `ACTIVE_KERNELS`. The Qwen3.5 hybrid
+/// kernels live in their own public submodule (`kernel_sources::qwen35`), so
+/// this facade merges that namespace into the flat one the pushes use.
+mod kernel_sources {
+    pub(super) use crate::gpu_backend::kernel_sources::qwen35::*;
+    pub(super) use crate::gpu_backend::kernel_sources::*;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Pre-compiled pipeline states
@@ -50,10 +60,9 @@ pub(crate) struct MetalPipelines {
     /// `(id, value)` pairs from a logits row, so a sampled request no longer
     /// downloads the full row (993 KB/token at Bonsai 2's 248 320 vocab) just
     /// to run `top_k`/`top_p` on the CPU. Dispatched by
-    /// `metal_dispatch.rs::dispatch_topk_f32`; wiring it into the engine's
-    /// sampled decode arm (`engine_greedy.rs`, which the engine-side package
-    /// owns — the item moved there with that file in wave 4) has not landed,
-    /// so nothing in the non-test build calls `dispatch_topk_f32` yet — same
+    /// `metal_dispatch.rs::dispatch_topk_f32`; the engine's sampled decode
+    /// arm (`engine_greedy.rs`) does not dispatch it yet, so nothing in the
+    /// non-test build calls `dispatch_topk_f32` — same
     /// situation as `gemm_tq2_g128_v8_tiled` above, hence
     /// `#[allow(dead_code)]`. `metal_dispatch.rs`'s own tests dispatch this
     /// kernel for real and check its output against a CPU oracle.
@@ -451,6 +460,24 @@ fn build_combined_msl() -> String {
     src.push_str(kernel_sources::MSL_FUSED_GATE_UP_SWIGLU_GEMM_FP8_E5M2_V1);
     src.push('\n');
     src.push_str(kernel_sources::MSL_GEMV_FP8_E5M2_PF_V1);
+    src.push('\n');
+    // ── Batched prefill attention (perf-01) ─────────────────────────────────
+    // Resolved on demand through `MetalPipelines::pipeline_for` by
+    // `metal_prefill::attention::PrefillAttnPipelines`.
+    src.push_str(kernel_sources::MSL_PREFILL_QKV_PREPARE);
+    src.push('\n');
+    src.push_str(kernel_sources::MSL_PREFILL_FLASH_ATTENTION);
+    src.push('\n');
+    // ── Qwen3.5 / Bonsai 2 hybrid stack (MET-09) ─────────────────────────────
+    // The common prelude (helpers, no entry points) must precede the other
+    // three; resolved on demand by `metal_full_layer::qwen35`.
+    src.push_str(kernel_sources::MSL_QWEN35_COMMON);
+    src.push('\n');
+    src.push_str(kernel_sources::MSL_QWEN35_ROTATE);
+    src.push('\n');
+    src.push_str(kernel_sources::MSL_QWEN35_GEMV);
+    src.push('\n');
+    src.push_str(kernel_sources::MSL_QWEN35_SSM);
     src.push('\n');
     src
 }

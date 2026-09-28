@@ -42,7 +42,7 @@ use std::collections::HashSet;
 
 use crate::error::RuntimeResult;
 use crate::server::ChatMessage;
-use crate::tokenizer_bridge::TokenizerBridge;
+use crate::tokenizer_bridge::{TokenizerBridge, VocabTokenClass};
 
 /// One piece of an assembled chat prompt.
 ///
@@ -206,24 +206,47 @@ pub fn neutralize_special_markers(text: &str) -> String {
 
 /// The set of token ids a client's message content must never be able to emit.
 ///
-/// Built from the tokenizer's *added vocabulary* (the entries the added-token
-/// matcher recognises in raw text regardless of `add_special_tokens`). An id is
-/// neutralized when the added token is flagged `special`, or when its content
-/// has the shape of a control marker — `<|im_start|>`, `<think>`,
-/// `<tool_call>`, `</tool_response>` — i.e. it is wrapped in angle brackets and
-/// contains no whitespace. Ordinary added tokens (plain words some vocabularies
-/// register) are left alone, so legitimate text is never mangled.
+/// Built from the classes the loaded vocabulary itself assigns its tokens
+/// ([`TokenizerBridge::token_class`]: a GGUF vocabulary's
+/// `tokenizer.ggml.token_type`, or a `tokenizer.json`'s `added_tokens`
+/// flags):
+///
+/// * every [`VocabTokenClass::Control`] id — `<|im_start|>`,
+///   `<|endoftext|>`, the vision markers `<|vision_start|>` /
+///   `<|image_pad|>` / …, whatever the vocabulary marks as a control
+///   token, bracketed or not;
+/// * every [`VocabTokenClass::UserDefined`] id that is a template marker —
+///   `<think>`, `</think>`, `<tool_call>`, `</tool_response>`, … (wrapped in
+///   angle brackets, no whitespace). A user-defined added token that is a
+///   plain word some vocabulary registers is left alone, so legitimate text
+///   is never mangled.
+///
+/// Normal, unused and byte tokens are never guarded: the encoder only
+/// carves out added tokens atomically, so client text cannot resolve to one
+/// of those as a marker in the first place.
 #[derive(Debug, Clone, Default)]
 pub struct SpecialTokenGuard {
     ids: HashSet<u32>,
 }
 
 impl SpecialTokenGuard {
-    /// Build the guard from a loaded tokenizer.
+    /// Build the guard from a loaded tokenizer's vocabulary classes (see the
+    /// type doc).
     pub fn from_tokenizer(tokenizer: &TokenizerBridge) -> Self {
         let mut ids = HashSet::new();
-        for (id, added) in tokenizer.inner().get_added_tokens_decoder() {
-            if added.special || is_control_token_content(&added.content) {
+        for (id, class) in tokenizer.token_classes() {
+            let guarded = match class {
+                VocabTokenClass::Control => true,
+                VocabTokenClass::UserDefined => tokenizer
+                    .inner()
+                    .id_to_token(id)
+                    .is_some_and(|content| is_control_token_content(&content)),
+                VocabTokenClass::Normal
+                | VocabTokenClass::Unknown
+                | VocabTokenClass::Unused
+                | VocabTokenClass::Byte => false,
+            };
+            if guarded {
                 ids.insert(id);
             }
         }
@@ -536,5 +559,190 @@ mod tests {
         assert!(!is_control_token_content("<not closed"));
         assert!(!is_control_token_content("<has space>"));
         assert!(!is_control_token_content("<>"));
+    }
+
+    // ── TOK-M2: the guard follows the vocabulary's own token classes ─────
+
+    /// A GGUF `tokenizer.ggml.*` metadata block over `tokens` (`(text,
+    /// llama.cpp token type)`), with `eos` as the end-of-sequence id — the
+    /// wire format `MetadataStore::parse` reads.
+    fn gguf_vocab_metadata(tokens: &[(&str, i32)], eos: u32) -> oxibonsai_core::MetadataStore {
+        use oxibonsai_core::gguf::types::GgufValueType;
+        fn str_bytes(s: &str) -> Vec<u8> {
+            let mut bytes = (s.len() as u64).to_le_bytes().to_vec();
+            bytes.extend_from_slice(s.as_bytes());
+            bytes
+        }
+        let mut data = Vec::new();
+        data.extend(str_bytes("tokenizer.ggml.model"));
+        data.extend((GgufValueType::String as u32).to_le_bytes());
+        data.extend(str_bytes("gpt2"));
+        data.extend(str_bytes("tokenizer.ggml.tokens"));
+        data.extend((GgufValueType::Array as u32).to_le_bytes());
+        data.extend((GgufValueType::String as u32).to_le_bytes());
+        data.extend((tokens.len() as u64).to_le_bytes());
+        for (text, _) in tokens {
+            data.extend(str_bytes(text));
+        }
+        data.extend(str_bytes("tokenizer.ggml.token_type"));
+        data.extend((GgufValueType::Array as u32).to_le_bytes());
+        data.extend((GgufValueType::Int32 as u32).to_le_bytes());
+        data.extend((tokens.len() as u64).to_le_bytes());
+        for (_, token_type) in tokens {
+            data.extend(token_type.to_le_bytes());
+        }
+        data.extend(str_bytes("tokenizer.ggml.eos_token_id"));
+        data.extend((GgufValueType::Uint32 as u32).to_le_bytes());
+        data.extend(eos.to_le_bytes());
+        let (store, _) =
+            oxibonsai_core::MetadataStore::parse(&data, 0, 4).expect("well-formed metadata");
+        store
+    }
+
+    /// A vocabulary with one of every class the guard distinguishes.
+    fn classed_vocabulary() -> TokenizerBridge {
+        let md = gguf_vocab_metadata(
+            &[
+                ("a", 1),
+                ("b", 1),
+                ("<br>", 1),
+                ("<|endoftext|>", 3),
+                ("ctl", 3),
+                ("<think>", 4),
+                ("</think>", 4),
+                ("<tool_call>", 4),
+                ("wordy", 4),
+                ("[PAD9]", 5),
+            ],
+            3,
+        );
+        TokenizerBridge::native_from_gguf_metadata(&md).expect("the vocabulary loads")
+    }
+
+    #[test]
+    fn special_token_class_accessor_reports_the_gguf_token_types() {
+        let tok = classed_vocabulary();
+        let expected = [
+            (0, Some(VocabTokenClass::Normal)),
+            (2, Some(VocabTokenClass::Normal)),
+            (3, Some(VocabTokenClass::Control)),
+            (4, Some(VocabTokenClass::Control)),
+            (5, Some(VocabTokenClass::UserDefined)),
+            (8, Some(VocabTokenClass::UserDefined)),
+            (9, Some(VocabTokenClass::Unused)),
+            (10, None),
+        ];
+        for (id, class) in expected {
+            assert_eq!(tok.token_class(id), class, "id {id}");
+        }
+    }
+
+    #[test]
+    fn special_token_class_guard_covers_control_ids_and_user_defined_markers_only() {
+        let guard = SpecialTokenGuard::from_tokenizer(&classed_vocabulary());
+        for id in [3, 4, 5, 6, 7] {
+            assert!(
+                guard.is_special(id),
+                "control / marker id {id} must be guarded"
+            );
+        }
+        for id in [0, 1, 2, 8, 9] {
+            assert!(
+                !guard.is_special(id),
+                "normal, plain user-defined and unused id {id} must not be guarded"
+            );
+        }
+        assert_eq!(guard.len(), 5);
+    }
+
+    #[test]
+    fn special_token_class_guard_strips_injected_markers_from_client_text() {
+        let tok = classed_vocabulary();
+        let guard = SpecialTokenGuard::from_tokenizer(&tok);
+        let ids = guard
+            .encode_content(&tok, "<think>ab</think><tool_call>wordy")
+            .expect("encode");
+        for guarded in [5u32, 6, 7] {
+            assert!(!ids.contains(&guarded), "{guarded} survived: {ids:?}");
+        }
+        assert!(
+            ids.contains(&8),
+            "a plain user-defined word is ordinary text: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn special_token_class_follows_tokenizer_json_added_token_flags() {
+        const TOKENIZER_JSON: &str = r##"{
+            "model": {"type": "BPE", "vocab": {"a": 0, "b": 1}, "merges": []},
+            "added_tokens": [
+                { "id": 2, "content": "<|im_start|>", "special": true },
+                { "id": 3, "content": "plain", "special": true },
+                { "id": 4, "content": "<tool_call>", "special": false },
+                { "id": 5, "content": "wordy", "special": false }
+            ],
+            "pre_tokenizer": { "type": "ByteLevel" },
+            "decoder": { "type": "ByteLevel" }
+        }"##;
+        let tok = TokenizerBridge::native_from_json_str(TOKENIZER_JSON).expect("loads");
+        assert_eq!(tok.token_class(2), Some(VocabTokenClass::Control));
+        assert_eq!(tok.token_class(3), Some(VocabTokenClass::Control));
+        assert_eq!(tok.token_class(4), Some(VocabTokenClass::UserDefined));
+        assert_eq!(tok.token_class(0), Some(VocabTokenClass::Normal));
+        let guard = SpecialTokenGuard::from_tokenizer(&tok);
+        assert!(guard.is_special(2) && guard.is_special(3) && guard.is_special(4));
+        assert!(!guard.is_special(5) && !guard.is_special(0));
+    }
+
+    /// The real Bonsai 2 27B vocabulary (`OXI_BONSAI2_PQ2_GGUF`, header-only
+    /// `mmap` — the metadata, never the tensors): every id in its
+    /// `248044..=248076` special block — the 27 `CONTROL` markers (including
+    /// the vision markers `<|vision_start|>` 248053, `<|vision_end|>`
+    /// 248054, `<|image_pad|>` 248056, `<|video_pad|>` 248057) and the 6
+    /// `USER_DEFINED` reasoning/tool markers — is guarded, and the `UNUSED`
+    /// padding slots after it are not. Self-skips, recording the skip, when
+    /// the variable is unset.
+    #[test]
+    fn special_token_class_real_27b_header() {
+        use oxibonsai_testkit::capability::{record_executed, record_skipped, Capability};
+        const TEST: &str = "oxibonsai-runtime::lib::special_token_class_real_27b_header";
+        let Some(path) = std::env::var_os("OXI_BONSAI2_PQ2_GGUF").filter(|p| !p.is_empty()) else {
+            eprintln!(
+                "capability report: {TEST} SKIPPED — set OXI_BONSAI2_PQ2_GGUF \
+                 (Ternary-Bonsai-2-27B-PQ2_0.gguf)"
+            );
+            record_skipped(Capability::Bonsai2Models, TEST);
+            return;
+        };
+        let mmap = oxibonsai_core::gguf::reader::mmap_gguf_file(std::path::Path::new(&path))
+            .expect("OXI_BONSAI2_PQ2_GGUF maps");
+        let file = oxibonsai_core::gguf::reader::GgufFile::parse(&mmap)
+            .expect("header + metadata + tensor descriptors parse");
+        let tok = TokenizerBridge::native_from_gguf_metadata(&file.metadata)
+            .expect("the vocabulary loads from the real metadata");
+        let guard = SpecialTokenGuard::from_tokenizer(&tok);
+
+        let mut control = 0;
+        let mut user_defined = 0;
+        for id in 248_044u32..=248_076 {
+            assert!(guard.is_special(id), "id {id} must be guarded");
+            match tok.token_class(id) {
+                Some(VocabTokenClass::Control) => control += 1,
+                Some(VocabTokenClass::UserDefined) => user_defined += 1,
+                other => panic!("id {id} has class {other:?}"),
+            }
+        }
+        assert_eq!((control, user_defined), (27, 6));
+        for vision in [248_053u32, 248_054, 248_056, 248_057] {
+            assert_eq!(tok.token_class(vision), Some(VocabTokenClass::Control));
+        }
+        assert_eq!(tok.token_class(248_077), Some(VocabTokenClass::Unused));
+        assert!(!guard.is_special(248_077));
+        assert_eq!(guard.len(), 33, "exactly the special block is guarded");
+        eprintln!(
+            "{TEST}: special block 248044..=248076 guarded ({control} control, {user_defined} \
+             user-defined)"
+        );
+        record_executed(Capability::Bonsai2Models, TEST);
     }
 }

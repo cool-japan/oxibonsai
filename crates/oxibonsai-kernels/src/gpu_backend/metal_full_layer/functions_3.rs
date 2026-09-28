@@ -1,12 +1,18 @@
 //! Public full-layer / full-forward Metal entry points.
 //!
 //! Q1 (1-bit) and ternary (TQ2_0_g128) twins of every entry point live here.
-//! The ternary half is keyed per model epoch (`MET-02`: every lookup is
-//! `WeightKey::new(lp.model_epoch, kind, slot)`) and has a **cached** shape
-//! (`MET-03`): [`build_cached_weights_ternary_only`] resolves every layer's
-//! eight buffers once into a [`CachedTernaryWeights`], and the
-//! `try_metal_*_ternary_cached` entry points bind those handles directly
-//! instead of re-running 8 cache lookups per layer per token.
+//! Both halves are keyed per model epoch (`MET-02`):
+//!
+//! - **ternary** — every lookup is `WeightKey::new(lp.model_epoch, kind,
+//!   slot)`, and the weights have a **cached** shape (`MET-03`):
+//!   [`build_cached_weights_ternary_only`] resolves every layer's eight
+//!   buffers once into a [`CachedTernaryWeights`], and the
+//!   `try_metal_*_ternary_cached` entry points bind those handles directly
+//!   instead of re-running 8 cache lookups per layer per token;
+//! - **Q1** — the RMSNorm weights and the final-norm → LM-head tail are keyed
+//!   `WeightKey::new(lp.model_epoch, kind, slot)` (so a model's release is one
+//!   `MetalGraph::release_model(epoch)`), while the four projections stay on
+//!   their legacy upload-handle keys (see [`FullForwardLayerParams`]).
 //!
 //! 🤖 Originally generated with [SplitRS](https://github.com/cool-japan/splitrs)
 
@@ -169,6 +175,120 @@ pub(crate) fn tail_part<T: ?Sized>(slot: Option<u64>, bytes: Option<&T>) -> Opti
     }
 }
 
+/// The one weight-cache epoch shared by every layer of a **Q1** forward
+/// (`MET-02`, Q1 half) — the twin of [`shared_model_epoch`].
+///
+/// A slice whose layers disagree is rejected (one forward binds one model's
+/// norms); an empty slice resolves to [`LEGACY_MODEL_EPOCH`].
+pub(crate) fn shared_q1_model_epoch(
+    layer_params: &[FullForwardLayerParams<'_>],
+) -> Result<u64, MetalGraphError> {
+    let Some(first) = layer_params.first() else {
+        return Ok(LEGACY_MODEL_EPOCH);
+    };
+    for (i, lp) in layer_params.iter().enumerate() {
+        if lp.model_epoch != first.model_epoch {
+            return Err(MetalGraphError::EncodingFailed(format!(
+                "Q1 layer {i} is keyed under model epoch {} but layer 0 under {}: one forward \
+                 pass must bind a single model's weights",
+                lp.model_epoch, first.model_epoch
+            )));
+        }
+    }
+    Ok(first.model_epoch)
+}
+
+/// Resolve (uploading on a miss) one **Q1** layer's eight buffers.
+///
+/// The four RMSNorm weights are keyed `WeightKey::new(lp.model_epoch,
+/// WeightKind::RawF32, slot)`; the four projections stay on the legacy
+/// `Q1Soa` upload-handle keys, which the scirs2 backend deduplicates across
+/// replicas and evicts itself (see [`FullForwardLayerParams`]). The gate‖up
+/// concatenation is built inside the lazy closure, so a resident slot never
+/// materialises it.
+pub(crate) fn resolve_q1_layer(
+    graph: &MetalGraph,
+    lp: &FullForwardLayerParams<'_>,
+) -> Result<CachedLayerWeights, MetalGraphError> {
+    let epoch = lp.model_epoch;
+    let attn_norm =
+        graph.get_or_upload_f32_weight_for_epoch(epoch, lp.attn_norm_handle, lp.attn_norm_bytes)?;
+    let q_norm =
+        graph.get_or_upload_f32_weight_for_epoch(epoch, lp.q_norm_handle, lp.q_norm_bytes)?;
+    let k_norm =
+        graph.get_or_upload_f32_weight_for_epoch(epoch, lp.k_norm_handle, lp.k_norm_bytes)?;
+    let ffn_norm =
+        graph.get_or_upload_f32_weight_for_epoch(epoch, lp.ffn_norm_handle, lp.ffn_norm_bytes)?;
+    let fused_qkv = graph.get_or_upload_q1_weight_soa(lp.fused_qkv_handle, lp.fused_qkv_bytes)?;
+    let attn_proj = graph.get_or_upload_q1_weight_soa(lp.attn_proj_handle, lp.attn_proj_bytes)?;
+    let (gate_bytes, up_bytes) = (lp.gate_bytes, lp.up_bytes);
+    let gate_up = graph.get_or_upload_q1_weight_soa_lazy(lp.gate_up_handle, || {
+        let mut fused = Vec::with_capacity(gate_bytes.len() + up_bytes.len());
+        fused.extend_from_slice(gate_bytes);
+        fused.extend_from_slice(up_bytes);
+        fused
+    })?;
+    let down = graph.get_or_upload_q1_weight_soa(lp.down_handle, lp.down_bytes)?;
+    Ok(CachedLayerWeights {
+        attn_norm,
+        fused_qkv,
+        q_norm,
+        k_norm,
+        attn_proj,
+        ffn_norm,
+        gate_up,
+        down,
+    })
+}
+
+/// Borrow a Q1 layer cache in the tuple shape the encoders take.
+pub(crate) fn q1_layer_refs(layers: &[CachedLayerWeights]) -> Vec<LayerWeightRefs<'_>> {
+    layers
+        .iter()
+        .map(|lw| {
+            (
+                &lw.attn_norm,
+                &lw.fused_qkv,
+                &lw.q_norm,
+                &lw.k_norm,
+                &lw.attn_proj,
+                &lw.ffn_norm,
+                &lw.gate_up,
+                &lw.down,
+            )
+        })
+        .collect()
+}
+
+/// Resolve the **Q1** final-norm → LM-head tail under `epoch`: the final norm
+/// as `RawF32`, the LM head as `Q1Soa`, both `WeightKey::new(epoch, ..)`.
+/// `None` for an absent part, exactly like [`resolve_ternary_tail`].
+#[allow(clippy::type_complexity)]
+pub(crate) fn resolve_q1_tail(
+    graph: &MetalGraph,
+    epoch: u64,
+    final_norm: Option<(u64, &[f32])>,
+    lm_head: Option<(u64, &[u8])>,
+) -> Result<
+    (
+        Option<Arc<MetalWeightHandle>>,
+        Option<Arc<MetalWeightHandle>>,
+    ),
+    MetalGraphError,
+> {
+    let final_norm = match final_norm {
+        Some((slot, bytes)) => Some(graph.get_or_upload_f32_weight_for_epoch(epoch, slot, bytes)?),
+        None => None,
+    };
+    let lm_head = match lm_head {
+        Some((slot, bytes)) => {
+            Some(graph.get_or_upload_q1_weight_soa_for_epoch(epoch, slot, bytes)?)
+        }
+        None => None,
+    };
+    Ok((final_norm, lm_head))
+}
+
 /// Attempt to run the FFN phase via direct Metal dispatch.
 ///
 /// This is the main entry point for `block.rs`. It:
@@ -251,6 +371,12 @@ pub fn try_metal_qkv(
 /// layer into a single Metal command buffer, eliminating per-kernel
 /// CPU→GPU synchronisation overhead.
 ///
+/// The four RMSNorm weights are keyed `WeightKey::new(model_epoch,
+/// WeightKind::RawF32, slot)` — the same keys the fused full-forward paths
+/// use for the same model, so the per-layer and the fused paths share one
+/// buffer per norm (`MET-02`, Q1 half) — and the projections by their
+/// upload-handle ids, exactly as in [`FullForwardLayerParams`].
+///
 /// Returns `Ok(())` on success. Returns `Err(...)` if Metal is unavailable
 /// or any dispatch step fails.
 #[allow(clippy::too_many_arguments)]
@@ -285,12 +411,23 @@ pub fn try_metal_full_layer(
     eps: f32,
     max_seq_len: usize,
     n_layers: usize,
+    model_epoch: u64,
 ) -> Result<(), MetalGraphError> {
     let graph = MetalGraph::global()?;
-    let attn_norm_w = graph.get_or_upload_f32_weight(attn_norm_handle_id, attn_norm_bytes)?;
-    let q_norm_w = graph.get_or_upload_f32_weight(q_norm_handle_id, q_norm_bytes)?;
-    let k_norm_w = graph.get_or_upload_f32_weight(k_norm_handle_id, k_norm_bytes)?;
-    let ffn_norm_w = graph.get_or_upload_f32_weight(ffn_norm_handle_id, ffn_norm_bytes)?;
+    let attn_norm_w = graph.get_or_upload_f32_weight_for_epoch(
+        model_epoch,
+        attn_norm_handle_id,
+        attn_norm_bytes,
+    )?;
+    let q_norm_w =
+        graph.get_or_upload_f32_weight_for_epoch(model_epoch, q_norm_handle_id, q_norm_bytes)?;
+    let k_norm_w =
+        graph.get_or_upload_f32_weight_for_epoch(model_epoch, k_norm_handle_id, k_norm_bytes)?;
+    let ffn_norm_w = graph.get_or_upload_f32_weight_for_epoch(
+        model_epoch,
+        ffn_norm_handle_id,
+        ffn_norm_bytes,
+    )?;
     let fused_qkv_w = graph.get_or_upload_q1_weight_soa(fused_qkv_handle_id, fused_qkv_bytes)?;
     let attn_proj_w = graph.get_or_upload_q1_weight_soa(attn_proj_handle_id, attn_proj_bytes)?;
     let gate_up_w = graph.get_or_upload_q1_weight_soa_lazy(gate_up_handle_id, || {
@@ -340,6 +477,10 @@ pub fn try_metal_full_layer(
 /// instead of the full logits vector (~607KB), dramatically reducing PCIe/
 /// memory bandwidth overhead for greedy (temperature=0) decoding.
 ///
+/// The norms and the tail are keyed under the layers' shared `model_epoch`
+/// (`MET-02`, Q1 half; a slice mixing epochs is rejected), the projections by
+/// their upload-handle ids — see [`FullForwardLayerParams`].
+///
 /// Returns `Ok(())` on success. Returns `Err(...)` if Metal is unavailable
 /// or any dispatch step fails.
 #[allow(clippy::too_many_arguments)]
@@ -372,60 +513,19 @@ pub fn try_metal_full_forward(
             layer_params.len()
         )));
     }
+    let epoch = shared_q1_model_epoch(layer_params)?;
     let graph = MetalGraph::global()?;
-    #[allow(clippy::type_complexity)]
-    let mut layer_weights: Vec<(
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-        Arc<MetalWeightHandle>,
-    )> = Vec::with_capacity(n_layers);
-    for lp in layer_params {
-        let attn_norm_w =
-            graph.get_or_upload_f32_weight(lp.attn_norm_handle, lp.attn_norm_bytes)?;
-        let q_norm_w = graph.get_or_upload_f32_weight(lp.q_norm_handle, lp.q_norm_bytes)?;
-        let k_norm_w = graph.get_or_upload_f32_weight(lp.k_norm_handle, lp.k_norm_bytes)?;
-        let ffn_norm_w = graph.get_or_upload_f32_weight(lp.ffn_norm_handle, lp.ffn_norm_bytes)?;
-        let fused_qkv_w =
-            graph.get_or_upload_q1_weight_soa(lp.fused_qkv_handle, lp.fused_qkv_bytes)?;
-        let attn_proj_w =
-            graph.get_or_upload_q1_weight_soa(lp.attn_proj_handle, lp.attn_proj_bytes)?;
-        let gate_bytes = lp.gate_bytes;
-        let up_bytes = lp.up_bytes;
-        let gate_up_w = graph.get_or_upload_q1_weight_soa_lazy(lp.gate_up_handle, || {
-            let mut fused = Vec::with_capacity(gate_bytes.len() + up_bytes.len());
-            fused.extend_from_slice(gate_bytes);
-            fused.extend_from_slice(up_bytes);
-            fused
-        })?;
-        let down_w = graph.get_or_upload_q1_weight_soa(lp.down_handle, lp.down_bytes)?;
-        layer_weights.push((
-            attn_norm_w,
-            fused_qkv_w,
-            q_norm_w,
-            k_norm_w,
-            attn_proj_w,
-            ffn_norm_w,
-            gate_up_w,
-            down_w,
-        ));
-    }
-    let weight_refs: Vec<_> = layer_weights
+    let layers = layer_params
         .iter()
-        .map(|(a, b, c, d, e, f, g, h)| (a, b, c, d, e, f, g, h))
-        .collect();
-    let final_norm_cached = match (final_norm_handle, final_norm_bytes) {
-        (Some(handle), Some(bytes)) => Some(graph.get_or_upload_f32_weight(handle, bytes)?),
-        _ => None,
-    };
-    let lm_head_cached = match (lm_head_handle, lm_head_bytes) {
-        (Some(handle), Some(bytes)) => Some(graph.get_or_upload_q1_weight_soa(handle, bytes)?),
-        _ => None,
-    };
+        .map(|lp| resolve_q1_layer(&graph, lp))
+        .collect::<Result<Vec<_>, _>>()?;
+    let weight_refs = q1_layer_refs(&layers);
+    let (final_norm_cached, lm_head_cached) = resolve_q1_tail(
+        &graph,
+        epoch,
+        tail_part(final_norm_handle, final_norm_bytes),
+        tail_part(lm_head_handle, lm_head_bytes),
+    )?;
     graph.encode_full_forward(
         hidden,
         pos,
@@ -530,6 +630,17 @@ pub fn try_metal_full_forward_ternary(
 }
 /// Build the cached weight handles from layer params (called once on first token).
 /// This does all the QKV concatenation, AoS→SoA conversion, and GPU upload.
+///
+/// Keyed exactly like [`try_metal_full_forward`] (norms and tail under the
+/// layers' shared `model_epoch`, projections by upload-handle id), so the
+/// cached greedy path and the uncached fused paths of one model resolve to
+/// the **same** buffers — building the cache after a prefill uploads nothing
+/// (`MET-02`, Q1 half).
+///
+/// # Errors
+///
+/// [`MetalGraphError::EncodingFailed`] for layers keyed under different
+/// epochs; otherwise whatever an upload or cache lookup returns.
 pub fn build_cached_weights(
     layer_params: &[FullForwardLayerParams<'_>],
     final_norm_handle: u64,
@@ -537,39 +648,16 @@ pub fn build_cached_weights(
     lm_head_handle: u64,
     lm_head_bytes: &[u8],
 ) -> Result<CachedModelWeights, MetalGraphError> {
+    let epoch = shared_q1_model_epoch(layer_params)?;
     let graph = MetalGraph::global()?;
-    let mut layers = Vec::with_capacity(layer_params.len());
-    for lp in layer_params {
-        let attn_norm = graph.get_or_upload_f32_weight(lp.attn_norm_handle, lp.attn_norm_bytes)?;
-        let q_norm = graph.get_or_upload_f32_weight(lp.q_norm_handle, lp.q_norm_bytes)?;
-        let k_norm = graph.get_or_upload_f32_weight(lp.k_norm_handle, lp.k_norm_bytes)?;
-        let ffn_norm = graph.get_or_upload_f32_weight(lp.ffn_norm_handle, lp.ffn_norm_bytes)?;
-        let fused_qkv =
-            graph.get_or_upload_q1_weight_soa(lp.fused_qkv_handle, lp.fused_qkv_bytes)?;
-        let attn_proj =
-            graph.get_or_upload_q1_weight_soa(lp.attn_proj_handle, lp.attn_proj_bytes)?;
-        let gate_bytes = lp.gate_bytes;
-        let up_bytes = lp.up_bytes;
-        let gate_up = graph.get_or_upload_q1_weight_soa_lazy(lp.gate_up_handle, || {
-            let mut fused = Vec::with_capacity(gate_bytes.len() + up_bytes.len());
-            fused.extend_from_slice(gate_bytes);
-            fused.extend_from_slice(up_bytes);
-            fused
-        })?;
-        let down = graph.get_or_upload_q1_weight_soa(lp.down_handle, lp.down_bytes)?;
-        layers.push(CachedLayerWeights {
-            attn_norm,
-            fused_qkv,
-            q_norm,
-            k_norm,
-            attn_proj,
-            ffn_norm,
-            gate_up,
-            down,
-        });
-    }
-    let final_norm = graph.get_or_upload_f32_weight(final_norm_handle, final_norm_bytes)?;
-    let lm_head = graph.get_or_upload_q1_weight_soa(lm_head_handle, lm_head_bytes)?;
+    let layers = layer_params
+        .iter()
+        .map(|lp| resolve_q1_layer(&graph, lp))
+        .collect::<Result<Vec<_>, _>>()?;
+    let final_norm =
+        graph.get_or_upload_f32_weight_for_epoch(epoch, final_norm_handle, final_norm_bytes)?;
+    let lm_head =
+        graph.get_or_upload_q1_weight_soa_for_epoch(epoch, lm_head_handle, lm_head_bytes)?;
     Ok(CachedModelWeights::Q1(CachedQ1Weights {
         layers,
         final_norm,

@@ -11,11 +11,51 @@
 //! The two prefill dispatchers route to sibling-module helpers for ternary,
 //! Q-std (Q4_0/Q8_0), FP8 (in `forward_cuda_fp8`), and K-quant paths.  The two
 //! single-token entry points handle Q1 / Ternary inline.
+//!
+//! # Q1 slot identity (`MET-02`, CUDA half)
+//!
+//! `CudaGraph` keeps a `u8` weight cache and two `f32` caches (its own and the
+//! full-layer state's), each a bare `HashMap<u64, _>`. Every Q1 slot this file
+//! hands the kernels is composed over the model's `cuda_model_epoch` by
+//! [`SlotNamespace`] (`TAG | epoch << 24 | local`), per cache:
+//!
+//! | slot | cache | local |
+//! |---|---|---|
+//! | layer `l` norms (`+0..3`) | `f32` | `1_000_000 + l * 10` |
+//! | final norm | `f32` | `2_000_000` |
+//! | LM head | `u8` (Q1 SoA) | `3_000_000` |
+//! | layer `l` weight fallbacks (`+0..3`) | `u8` | `4_000_000 + l * 4` |
+//!
+//! It used to be literals: norms `1_000_000 + l * 10` here but
+//! `2_000_000 + l * 10` in the per-layer path (`block/types/helpers.rs`), a
+//! final norm on `2_000_000` — layer 0's per-layer attention-norm slot, in
+//! the same `f32` cache — an LM head on `4_000_000` for decode but
+//! `3_000_000` for prefill (two copies), weight fallbacks on
+//! `2_000_000 + l * 4`, and every Q1 model in the process on the same set.
+//! Now the per-layer and full-forward paths share each norm, decode and
+//! prefill share the LM head, no two kinds can collide, and two models never
+//! share a slot. The model's `Drop` (`forward_cuda/mod.rs`) releases every
+//! one of these slots. **Compile-blind** (no CUDA device on the development
+//! host): type-checked by cross-compiling to `x86_64-unknown-linux-gnu`.
+//!
+//! The ternary branch of [`BonsaiModel::try_cuda_full_forward_with_lm_head`]
+//! keys its final norm / LM head on
+//! [`SlotNamespace::ternary_final_norm`] / [`SlotNamespace::ternary_lm_head`]
+//! — the same two calls the ternary batch prefill (`forward_cuda/ternary.rs`)
+//! makes over the same model's namespace, so decode and prefill share one
+//! buffer instead of uploading the ternary LM head twice.
 
+use super::super::q1_slots::SlotNamespace;
 use super::super::{BonsaiModel, OutputWeight};
 use crate::block::{blocks_as_bytes, blocks_as_bytes_ternary};
 
 impl<'a> BonsaiModel<'a> {
+    /// This model's CUDA Q1 slot namespace: the composition over its
+    /// `cuda_model_epoch` (see the module docs).
+    pub(super) fn cuda_q1_slots(&self) -> SlotNamespace {
+        SlotNamespace::new(self.cuda_model_epoch)
+    }
+
     /// Get or build the cached per-layer QKV byte concatenations for the CUDA path.
     ///
     /// On first call the vectors are built and stored in `cuda_qkv_cache`.
@@ -65,11 +105,13 @@ impl<'a> BonsaiModel<'a> {
         if n_layers == 0 {
             return Err("no blocks".into());
         }
+        SlotNamespace::check_layer_count(n_layers)?;
+        let slots = self.cuda_q1_slots();
         let mut layer_params: Vec<oxibonsai_kernels::CudaFullForwardLayerParams<'b>> =
             Vec::with_capacity(n_layers);
         for (i, block) in self.blocks.iter().enumerate() {
-            let norm_handle_base = 1_000_000u64 + (block.layer_index() as u64) * 10;
-            let weight_handle_base = 2_000_000u64 + (block.layer_index() as u64) * 4;
+            let norm_handle_base = slots.norm_base(block.layer_index());
+            let weight_handle_base = slots.weight_fallback_base(block.layer_index());
             layer_params.push(oxibonsai_kernels::CudaFullForwardLayerParams {
                 attn_norm_handle: norm_handle_base,
                 attn_norm_bytes: block.attn_norm_weight(),
@@ -193,9 +235,9 @@ impl<'a> BonsaiModel<'a> {
             let hd = self.config.head_dim;
             let heads_per_group = nq.checked_div(nkv).unwrap_or(1);
             let max_seq_len = self.kv_cache.max_seq_len();
-            let final_norm_handle = 5_900_000u64;
+            let final_norm_handle = self.cuda_q1_slots().ternary_final_norm();
             let final_norm_bytes = self.output_norm.weight();
-            let lm_head_handle = 7_000_000u64;
+            let lm_head_handle = self.cuda_q1_slots().ternary_lm_head();
             let lm_head_bytes = blocks_as_bytes_ternary(lm_head_ternary.blocks());
             let vocab_size = lm_head_ternary.out_features();
             let qkv_concats = self.build_cuda_ternary_qkv_concats()?;
@@ -277,9 +319,10 @@ impl<'a> BonsaiModel<'a> {
         let hd = self.config.head_dim;
         let heads_per_group = nq.checked_div(nkv).unwrap_or(1);
         let max_seq_len = self.kv_cache.max_seq_len();
-        let final_norm_handle = 2_000_000u64;
+        let slots = self.cuda_q1_slots();
+        let final_norm_handle = slots.final_norm();
         let final_norm_bytes = self.output_norm.weight();
-        let lm_head_handle = 4_000_000u64;
+        let lm_head_handle = slots.lm_head();
         let lm_head_bytes = blocks_as_bytes(lm_head_linear.blocks());
         let vocab_size = lm_head_linear.out_features();
         let qkv_concats = self.get_or_build_cuda_qkv_cache()?;
@@ -316,9 +359,10 @@ impl<'a> BonsaiModel<'a> {
 
     /// GPU batch prefill implementation (CUDA): all layers + final norm + LM head.
     ///
-    /// Returns the last token's logits.
+    /// Returns the last token's logits. `&mut self` because the Q4_0/Q8_0
+    /// route writes its K/V read-back into `self.kv_cache` (finding **F6**).
     pub(in super::super) fn try_cuda_prefill_with_lm_head(
-        &self,
+        &mut self,
         token_ids: &[u32],
         pos_start: usize,
     ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
@@ -329,10 +373,10 @@ impl<'a> BonsaiModel<'a> {
         }
         // Context-length guard (mirrors the single-token `forward()` check at
         // model/types/mod.rs).  `RopeTable` is sized to exactly `max_seq_len`
-        // rows; the batched RoPE gather below now uses `cos_at_checked` /
-        // `sin_at_checked` (wave-1 addendum P3), so an overflowing position
-        // yields `ModelError::PositionOutOfRange` instead of the out-of-bounds
-        // slice + panic-inside-the-request-task the unchecked pair produced.
+        // rows; the batched RoPE gather below uses `cos_at_checked` /
+        // `sin_at_checked`, so an overflowing position yields
+        // `ModelError::PositionOutOfRange` instead of the out-of-bounds slice +
+        // panic-inside-the-request-task the unchecked pair produced.
         // This guard stays: it is the *early*, named rejection, and returning
         // Err here makes `forward_prefill` fall back to the sequential path,
         // whose per-token `forward()` returns a clean SequenceTooLong error.
@@ -439,10 +483,10 @@ impl<'a> BonsaiModel<'a> {
             cos_table[t * half_dim..(t + 1) * half_dim].copy_from_slice(cos_vals);
             sin_table[t * half_dim..(t + 1) * half_dim].copy_from_slice(sin_vals);
         }
-        let final_norm_handle = 2_000_000u64;
+        let final_norm_handle = self.cuda_q1_slots().final_norm();
         let final_norm_bytes = self.output_norm.weight();
         let final_norm_eps = self.output_norm.eps();
-        let lm_head_handle = 3_000_000u64;
+        let lm_head_handle = self.cuda_q1_slots().lm_head();
         let lm_head_bytes = blocks_as_bytes(lm_head_linear.blocks());
         let lm_head_out_features = lm_head_linear.out_features();
         let qkv_concats = self.get_or_build_cuda_qkv_cache()?;
@@ -482,9 +526,10 @@ impl<'a> BonsaiModel<'a> {
 
     /// GPU batch prefill verify (CUDA): all layers + final norm + LM head + argmax.
     ///
-    /// Returns the greedy argmax token ID for each input position.
+    /// Returns the greedy argmax token ID for each input position. `&mut
+    /// self` for the same reason as [`Self::try_cuda_prefill_with_lm_head`].
     pub(in super::super) fn try_cuda_prefill_verify(
-        &self,
+        &mut self,
         token_ids: &[u32],
         pos_start: usize,
     ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
@@ -591,10 +636,10 @@ impl<'a> BonsaiModel<'a> {
             cos_table[t * half_dim..(t + 1) * half_dim].copy_from_slice(cos_vals);
             sin_table[t * half_dim..(t + 1) * half_dim].copy_from_slice(sin_vals);
         }
-        let final_norm_handle = 2_000_000u64;
+        let final_norm_handle = self.cuda_q1_slots().final_norm();
         let final_norm_bytes = self.output_norm.weight();
         let final_norm_eps = self.output_norm.eps();
-        let lm_head_handle = 3_000_000u64;
+        let lm_head_handle = self.cuda_q1_slots().lm_head();
         let lm_head_bytes = blocks_as_bytes(lm_head_linear.blocks());
         let lm_head_out_features = lm_head_linear.out_features();
         let qkv_concats = self.get_or_build_cuda_qkv_cache()?;

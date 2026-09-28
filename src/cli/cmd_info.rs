@@ -6,10 +6,20 @@
 //! vision projector) never had in the first place. Every numeric field is
 //! probed independently and rendered `"-"` (or `null` in `--json`) when
 //! absent.
+//!
+//! A Bonsai 2 `qwen35` hybrid gets the full truthful report (wave-4b
+//! addendum, REQUIRED #2/#14): the 16 full / 48 Gated-DeltaNet layer split,
+//! the resolved weight type with its ggml id (PQ2_0 = 142, PTQ1_0 = 143),
+//! the `prism.hadamard.*` contract, vocabulary and context, the KV and
+//! recurrent bytes per sequence, a dry bind of the hybrid model (the
+//! constructor `run` actually uses), and the kernel tier the engine seam
+//! really runs it on (the CPU tier — never the GPU tier `auto_detect`
+//! would report for a dense model on this machine).
 
 use oxibonsai_core::gguf::reader::GgufFile;
 use oxibonsai_core::gguf::tensor_info::keys;
 
+use super::bonsai2;
 use super::model_desc;
 
 pub(crate) fn run(model: Option<String>, json: bool) -> anyhow::Result<()> {
@@ -119,7 +129,21 @@ pub(crate) fn run(model: Option<String>, json: bool) -> anyhow::Result<()> {
     // architecture with both values genuinely present, so a CLIP file (or
     // any file missing those keys) never gets a variant guess built from
     // silently-substituted defaults.
-    let variant_name = if known_arch && layers != "-" && hidden_size != "-" {
+    // REQUIRED #14 (waves 3+3.5 review): `from_config_and_resolved_sample`
+    // (not the raw-parse-time `from_config_and_sample_tensor_type`) so a
+    // Bonsai 2 27B file reports its real variant name (e.g.
+    // "Ternary-Bonsai-2-27B-PQ2_0") instead of the generic "Custom" a
+    // ternary/2-bit tensor layout the older classifier does not
+    // special-case would otherwise fall through to.
+    let has_hadamard = gguf.metadata.get("prism.hadamard.version").is_some();
+    let hybrid = bonsai2::is_qwen35_hybrid(&arch).then(|| model_desc::hybrid_report(&gguf));
+    let bound_variant = match &hybrid {
+        Some(Ok(report)) => report.bind.as_ref().ok().and_then(|b| b.variant.clone()),
+        _ => None,
+    };
+    let variant_name = if bound_variant.is_some() {
+        bound_variant
+    } else if known_arch && layers != "-" && hidden_size != "-" {
         oxibonsai_core::config::Qwen3Config::from_metadata(&gguf.metadata)
             .ok()
             .map(|config| {
@@ -128,9 +152,10 @@ pub(crate) fn run(model: Option<String>, json: bool) -> anyhow::Result<()> {
                     .max_by_key(|(_, count)| *count)
                     .map(|(ty, _)| *ty)
                     .unwrap_or(oxibonsai_core::GgufTensorType::Q1_0_g128);
-                oxibonsai_model::ModelVariant::from_config_and_sample_tensor_type(
+                oxibonsai_model::ModelVariant::from_config_and_resolved_sample(
                     &config,
                     dominant_type,
+                    has_hadamard,
                 )
                 .name()
                 .to_string()
@@ -138,6 +163,20 @@ pub(crate) fn run(model: Option<String>, json: bool) -> anyhow::Result<()> {
     } else {
         None
     };
+
+    // REQUIRED #14: the EFFECTIVE kernel tier `run` would dispatch to: the
+    // CPU tier for a hybrid (the engine seam pins it there — no hybrid GPU
+    // encoder exists yet), the auto-detected tier for a dense model.
+    let (kernel_tier, kernel_tier_reason) = match &hybrid {
+        Some(_) => (
+            oxibonsai_kernels::cpu_kernel_tier().to_string(),
+            "hybrid qwen35 model: no hybrid GPU encoder exists yet, so it runs on the best CPU \
+             tier under --backend auto/cpu (--backend metal is refused)"
+                .to_string(),
+        ),
+        None => model_desc::dense_auto_tier(),
+    };
+    let weight_bytes = mmap.len() as u64;
 
     if json {
         let tensor_types: std::collections::HashMap<String, usize> = type_counts
@@ -147,6 +186,8 @@ pub(crate) fn run(model: Option<String>, json: bool) -> anyhow::Result<()> {
 
         let info = serde_json::json!({
             "model": model,
+            "kernel_tier": kernel_tier,
+            "kernel_tier_reason": kernel_tier_reason,
             "gguf_version": gguf.header.version,
             "tensor_count": gguf.header.tensor_count,
             "metadata_entries": gguf.header.metadata_kv_count,
@@ -165,6 +206,11 @@ pub(crate) fn run(model: Option<String>, json: bool) -> anyhow::Result<()> {
             "intermediate_size": null_if_dash(&intermediate_size),
             "tensor_types": tensor_types,
             "unsupported_tensor_types": unsupported_types.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "hybrid": match &hybrid {
+                Some(Ok(report)) => report.to_json(weight_bytes),
+                Some(Err(e)) => serde_json::json!({ "error": e.to_string() }),
+                None => serde_json::Value::Null,
+            },
         });
         println!("{}", serde_json::to_string_pretty(&info)?);
     } else {
@@ -185,6 +231,7 @@ pub(crate) fn run(model: Option<String>, json: bool) -> anyhow::Result<()> {
         if let Some(variant) = &variant_name {
             println!("  Variant:      {variant}");
         }
+        println!("  Kernel tier:  {kernel_tier} ({kernel_tier_reason})");
         println!("  Name:         {general_name}");
         println!("  Tokenizer:    {tokenizer_model}");
         println!("  Layers:       {layers}");
@@ -195,6 +242,15 @@ pub(crate) fn run(model: Option<String>, json: bool) -> anyhow::Result<()> {
         println!("  Vocab:        {vocab_size}");
         println!("  Max context:  {max_context_length}");
         println!("  Intermediate: {intermediate_size}");
+        match &hybrid {
+            Some(Ok(report)) => {
+                for line in report.lines(weight_bytes) {
+                    println!("  {line}");
+                }
+            }
+            Some(Err(e)) => println!("  Hybrid report: FAILED ({e})"),
+            None => {}
+        }
         println!();
 
         println!("Tensor types:");

@@ -9,8 +9,23 @@
 //! 2. AVX2 + FMA (x86-64 only)
 //! 3. NEON (AArch64 only)
 //! 4. Reference (scalar — always available)
+//!
+//! ## The opt-in INT8 tier on the native formats (K-14)
+//!
+//! `OneBitKernel::{gemv, gemm}` (`Q1_0_g128`) and
+//! `TernaryKernel::{gemv_ternary_g128, gemm_ternary_g128}` (`TQ2_0_g128`)
+//! first ask [`KernelDispatcher::native_int8_tier`] whether
+//! `OXIBONSAI_KERNEL_TIER` names an [`Int8Tier`]; when it does (and this is
+//! a CPU-tier dispatcher) the call runs the matching
+//! [`crate::dispatch_int8`] kernel instead. Unset — the default — every
+//! call runs exactly the per-tier body it always ran, now held by the
+//! `*_on_tier` methods below, so the default stays bit-identical. The
+//! `parallel` / `parallel_tiled` drivers make the same check once at their
+//! own entry and then call the `*_on_tier` methods from every tile, so the
+//! environment is read once per call, never per tile.
 
 use crate::dequant;
+use crate::dispatch_int8::{self, Int8Tier};
 use crate::error::KernelResult;
 use crate::gemm;
 use crate::gemv;
@@ -18,18 +33,18 @@ use crate::tier::TierReason;
 use crate::traits::{Fp8Kernel, OneBitKernel, TernaryKernel};
 use crate::weight_cache::GpuWeightHandle;
 use oxibonsai_core::tensor::BlockQ1_0G128;
-use oxibonsai_core::{BlockFP8E4M3, BlockFP8E5M2};
+use oxibonsai_core::{BlockFP8E4M3, BlockFP8E5M2, BlockTQ2_0_g128};
 #[cfg(feature = "gpu")]
 use std::sync::Arc;
 
 // `KernelTier` (the tier enum + its `Display` impl), `TierReason`, and the
 // pure CPU-feature-detection tier selection (`clamp_tier_to_cpu`,
 // `select_tier`, `warn_gpu_unavailable_once`, `cpu_kernel_tier`) live in the
-// sibling `tier` module (wave-1 / wave-1.5 addenda: this file was
-// 1997/2000 lines before the split). Re-exported here so every existing
-// `crate::dispatch::KernelTier` / `oxibonsai_kernels::KernelTier` path (and
-// `lib.rs`'s own `pub use dispatch::{cpu_kernel_tier, KernelDispatcher,
-// KernelTier};`) keeps resolving unchanged.
+// sibling `tier` module, which keeps this file inside its 2000-line budget.
+// Re-exported here so every existing `crate::dispatch::KernelTier` /
+// `oxibonsai_kernels::KernelTier` path (and `lib.rs`'s own `pub use
+// dispatch::{cpu_kernel_tier, KernelDispatcher, KernelTier};`) keeps
+// resolving unchanged.
 pub use crate::tier::{cpu_kernel_tier, KernelTier};
 
 /// Dispatches kernel calls to the best available implementation.
@@ -68,10 +83,32 @@ impl KernelDispatcher {
     /// line that gives no hint the degradation happened. Use
     /// [`Self::try_with_tier`]`(KernelTier::Gpu)` instead of this method
     /// when a missing GPU should be a hard error.
+    ///
+    /// Under an active
+    /// [`CpuOnlyBackendScope`](crate::gpu_backend::CpuOnlyBackendScope) (the
+    /// engine's explicit `Backend::Cpu`) the GPU is neither probed nor
+    /// reported missing: the best CPU tier is chosen with the reason "CPU
+    /// requested explicitly", because an explicit CPU request is not a
+    /// degradation and the one-time "GPU unavailable" warning would
+    /// misdescribe it.
     pub fn auto_detect() -> Self {
+        if crate::gpu_backend::cpu_only_backend_active() {
+            let caps = scirs2_core::simd::detect::get_cpu_features();
+            let tier = Self::select_tier(caps);
+            tracing::info!(tier = %tier, "selected kernel tier (CPU requested explicitly)");
+            return Self {
+                tier,
+                #[cfg(feature = "gpu")]
+                gpu_backend: None,
+                tier_reason: TierReason::CpuRequestedByScope,
+            };
+        }
+
         // Try GPU first when the feature is compiled in.
         #[cfg(feature = "gpu")]
         {
+            #[cfg(test)]
+            tests::note_gpu_probe();
             let backend = crate::gpu_backend::select_backend();
             if backend.is_accelerated() {
                 let name = backend.name();
@@ -105,7 +142,7 @@ impl KernelDispatcher {
     /// Create a dispatcher with a specific tier (for testing/benchmarks).
     ///
     /// The requested tier is re-validated against the CPU's actual feature
-    /// set via [`Self::clamp_tier_to_cpu`] and silently demoted (with a
+    /// set via `Self::clamp_tier_to_cpu` and silently demoted (with a
     /// `tracing::warn!`) if unsupported (K-03/sec-14), so this constructor
     /// can never hand back a dispatcher that would later hit an
     /// illegal-instruction trap in the `unsafe { #[target_feature] }`
@@ -225,13 +262,10 @@ impl KernelDispatcher {
     /// accelerated backend) — `None` on every CPU tier and on a `Gpu`-tier
     /// dispatcher built without the `gpu` feature.
     ///
-    /// Wave-2.5 RT-ENGINE grant: `gpu_backend` was a private field with no
-    /// accessor, so `impl Drop for InferenceEngine`
-    /// (`oxibonsai-runtime/src/engine.rs`, wave 4, not owned by this
-    /// package) could not evict the GPU weight cache
-    /// (`Scirs2Backend::clear_weight_cache`) on drop — the second half of
-    /// MET-M1. That consumer lands in wave 4; this accessor is the piece
-    /// this package can deliver now.
+    /// This is how `impl Drop for InferenceEngine`
+    /// (`oxibonsai-runtime/src/engine.rs`) reaches the backend to evict its
+    /// GPU weight cache (`Scirs2Backend::clear_weight_cache`) on drop
+    /// (MET-M1).
     #[cfg(feature = "gpu")]
     pub fn gpu_backend(&self) -> Option<&Arc<dyn crate::gpu_backend::GpuBackendTrait>> {
         self.gpu_backend.as_ref()
@@ -260,17 +294,11 @@ impl KernelDispatcher {
     /// `"TQ2_0_g128 NEON (128-bit)"` (cli-16).
     ///
     /// [`OneBitKernel::name`] cannot include the quant family for the reason
-    /// [`Self::tier_label`] documents; a caller that already knows which
-    /// type it resolved a model to (e.g. from
-    /// [`crate::traits::OneBitKernel`]-adjacent model codetracking its own
-    /// `dominant_quant_type`) should call this instead. `src/cli/model_desc.rs`'s
-    /// `resolved_engine_summary` builds the same information independently
-    /// today (it does not go through this method); the one remaining
-    /// hardcoded-family caller is `oxibonsai-runtime/src/engine.rs`'s
-    /// `"inference engine loaded from GGUF kernel=..."` log line, which is
-    /// not in this package's `owned_files` — it should switch to
-    /// `dispatcher.kernel_label(model.dominant_quant_type())` in place of
-    /// `kernel.name()`.
+    /// `Self::tier_label` documents; a caller that already knows which
+    /// type it resolved a model to (a model tracking its own
+    /// `dominant_quant_type`) calls this instead — e.g.
+    /// `oxibonsai-runtime/src/engine.rs`'s `"inference engine loaded from
+    /// GGUF kernel=..."` log lines and `InferenceEngine::kernel_label`.
     pub fn kernel_label(&self, dominant_type: oxibonsai_core::GgufTensorType) -> String {
         format!("{dominant_type} {}", self.tier_label())
     }
@@ -298,6 +326,10 @@ impl KernelDispatcher {
             #[cfg(feature = "gpu")]
             TierReason::CpuAutoDetectGpuUnavailable => format!(
                 "{} tier (auto-detected; GPU backend not accelerated, fell back)",
+                self.tier
+            ),
+            TierReason::CpuRequestedByScope => format!(
+                "{} tier (CPU requested explicitly, backend=cpu; no GPU probe)",
                 self.tier
             ),
             TierReason::Requested => format!("{} tier (explicitly requested)", self.tier),
@@ -593,25 +625,39 @@ impl KernelDispatcher {
     }
 }
 
-impl OneBitKernel for KernelDispatcher {
-    fn dequant(&self, blocks: &[BlockQ1_0G128], output: &mut [f32]) -> KernelResult<()> {
-        match self.tier {
-            KernelTier::Reference => dequant::dequant_1bit_g128(blocks, output),
-            #[cfg(target_arch = "x86_64")]
-            KernelTier::Avx2 => unsafe { crate::simd_avx2::dequant_1bit_g128_avx2(blocks, output) },
-            #[cfg(target_arch = "x86_64")]
-            KernelTier::Avx512 => unsafe {
-                crate::simd_avx512::dequant_1bit_g128_avx512(blocks, output)
-            },
-            #[cfg(target_arch = "aarch64")]
-            KernelTier::Neon => unsafe { crate::simd_neon::dequant_1bit_g128_neon(blocks, output) },
-            // GPU dequant is not worth the transfer cost — use best CPU path.
-            #[cfg(feature = "gpu")]
-            KernelTier::Gpu => Self::cpu_dequant(blocks, output),
+// ─── Native-format GEMV/GEMM: INT8 selection + per-tier bodies ────────────
+
+impl KernelDispatcher {
+    /// The opt-in INT8 tier (K-14) this dispatcher's native-format
+    /// (`Q1_0_g128` / `TQ2_0_g128`) GEMV and GEMM calls run on, if any.
+    ///
+    /// `Some` only when `OXIBONSAI_KERNEL_TIER` names an [`Int8Tier`]
+    /// ([`Int8Tier::from_env`], read fresh on every call, clamped to what
+    /// this CPU supports) **and** this is a CPU-tier dispatcher. A
+    /// `KernelTier::Gpu` dispatcher is never diverted — neither its GPU
+    /// kernels nor its CPU fallbacks — so every GPU path and the
+    /// CPU-vs-Metal determinism guard stay independent of the selector.
+    /// `None`, the default, means every native GEMV/GEMM runs exactly the
+    /// per-tier kernel it ran before the INT8 tier existed.
+    ///
+    /// Every native entry point asks this once, at entry:
+    /// `OneBitKernel::{gemv, gemm}`, `TernaryKernel::{gemv_ternary_g128,
+    /// gemm_ternary_g128}`, and the `parallel` / `parallel_tiled` drivers.
+    #[must_use]
+    pub fn native_int8_tier(&self) -> Option<Int8Tier> {
+        #[cfg(feature = "gpu")]
+        if self.tier == KernelTier::Gpu {
+            return None;
         }
+        Int8Tier::from_env()
     }
 
-    fn gemv(
+    /// `Q1_0_g128` GEMV on this dispatcher's own [`KernelTier`], never the
+    /// INT8 tier — the body `OneBitKernel::gemv` runs when
+    /// [`Self::native_int8_tier`] is `None`, and what every f32 tile and
+    /// chunk of the `parallel` / `parallel_tiled` drivers calls after their
+    /// single entry-point check (so no tile re-reads the environment).
+    pub(crate) fn gemv_1bit_on_tier(
         &self,
         blocks: &[BlockQ1_0G128],
         input: &[f32],
@@ -657,7 +703,9 @@ impl OneBitKernel for KernelDispatcher {
         }
     }
 
-    fn gemm(
+    /// `Q1_0_g128` GEMM on this dispatcher's own [`KernelTier`], never the
+    /// INT8 tier — see [`Self::gemv_1bit_on_tier`].
+    pub(crate) fn gemm_1bit_on_tier(
         &self,
         blocks: &[BlockQ1_0G128],
         input: &[f32],
@@ -705,13 +753,133 @@ impl OneBitKernel for KernelDispatcher {
         }
     }
 
+    /// `TQ2_0_g128` GEMV on this dispatcher's own [`KernelTier`], never the
+    /// INT8 tier — see [`Self::gemv_1bit_on_tier`].
+    pub(crate) fn gemv_ternary_on_tier(
+        &self,
+        blocks: &[BlockTQ2_0_g128],
+        input: &[f32],
+        output: &mut [f32],
+        n_rows: usize,
+        k: usize,
+    ) -> KernelResult<()> {
+        match self.tier {
+            KernelTier::Reference => {
+                crate::gemv_ternary::gemv_tq2_0_g128(blocks, input, output, n_rows, k)
+            }
+            #[cfg(target_arch = "x86_64")]
+            KernelTier::Avx2 => unsafe {
+                crate::simd_avx2::gemv_tq2_0_g128_avx2_prefetch(blocks, input, output, n_rows, k)
+            },
+            #[cfg(target_arch = "x86_64")]
+            KernelTier::Avx512 => unsafe {
+                crate::simd_avx512::gemv_tq2_0_g128_avx512_prefetch(
+                    blocks, input, output, n_rows, k,
+                )
+            },
+            #[cfg(target_arch = "aarch64")]
+            KernelTier::Neon => unsafe {
+                crate::simd_neon::gemv_tq2_0_g128_neon_prefetch(blocks, input, output, n_rows, k)
+            },
+            // No ternary GPU kernels — fall back to best CPU SIMD tier.
+            #[cfg(feature = "gpu")]
+            KernelTier::Gpu => Self::cpu_gemv_ternary(blocks, input, output, n_rows, k),
+        }
+    }
+
+    /// `TQ2_0_g128` GEMM on this dispatcher's own [`KernelTier`], never the
+    /// INT8 tier — see [`Self::gemv_1bit_on_tier`].
+    pub(crate) fn gemm_ternary_on_tier(
+        &self,
+        blocks: &[BlockTQ2_0_g128],
+        input: &[f32],
+        output: &mut [f32],
+        m: usize,
+        n_rows: usize,
+        k: usize,
+    ) -> KernelResult<()> {
+        match self.tier {
+            KernelTier::Reference => {
+                crate::gemm_ternary::gemm_tq2_0_g128(blocks, input, output, m, n_rows, k)
+            }
+            #[cfg(target_arch = "x86_64")]
+            KernelTier::Avx2 => unsafe {
+                crate::simd_avx2::gemm_tq2_0_g128_avx2(blocks, input, output, m, n_rows, k)
+            },
+            #[cfg(target_arch = "x86_64")]
+            KernelTier::Avx512 => unsafe {
+                crate::simd_avx512::gemm_tq2_0_g128_avx512(blocks, input, output, m, n_rows, k)
+            },
+            #[cfg(target_arch = "aarch64")]
+            KernelTier::Neon => unsafe {
+                crate::simd_neon::gemm_tq2_0_g128_neon(blocks, input, output, m, n_rows, k)
+            },
+            // No ternary GPU kernels — fall back to best CPU SIMD tier.
+            #[cfg(feature = "gpu")]
+            KernelTier::Gpu => Self::cpu_gemm_ternary(blocks, input, output, m, n_rows, k),
+        }
+    }
+}
+
+impl OneBitKernel for KernelDispatcher {
+    fn dequant(&self, blocks: &[BlockQ1_0G128], output: &mut [f32]) -> KernelResult<()> {
+        match self.tier {
+            KernelTier::Reference => dequant::dequant_1bit_g128(blocks, output),
+            #[cfg(target_arch = "x86_64")]
+            KernelTier::Avx2 => unsafe { crate::simd_avx2::dequant_1bit_g128_avx2(blocks, output) },
+            #[cfg(target_arch = "x86_64")]
+            KernelTier::Avx512 => unsafe {
+                crate::simd_avx512::dequant_1bit_g128_avx512(blocks, output)
+            },
+            #[cfg(target_arch = "aarch64")]
+            KernelTier::Neon => unsafe { crate::simd_neon::dequant_1bit_g128_neon(blocks, output) },
+            // GPU dequant is not worth the transfer cost — use best CPU path.
+            #[cfg(feature = "gpu")]
+            KernelTier::Gpu => Self::cpu_dequant(blocks, output),
+        }
+    }
+
+    /// The opt-in INT8 tier when [`KernelDispatcher::native_int8_tier`]
+    /// selects one, else `KernelDispatcher::gemv_1bit_on_tier` — today's
+    /// per-tier body, unchanged.
+    fn gemv(
+        &self,
+        blocks: &[BlockQ1_0G128],
+        input: &[f32],
+        output: &mut [f32],
+        n_rows: usize,
+        k: usize,
+    ) -> KernelResult<()> {
+        if let Some(tier) = self.native_int8_tier() {
+            return dispatch_int8::gemv_1bit_g128_int8(tier, blocks, input, output, n_rows, k);
+        }
+        self.gemv_1bit_on_tier(blocks, input, output, n_rows, k)
+    }
+
+    /// The opt-in INT8 tier when [`KernelDispatcher::native_int8_tier`]
+    /// selects one, else `KernelDispatcher::gemm_1bit_on_tier`.
+    fn gemm(
+        &self,
+        blocks: &[BlockQ1_0G128],
+        input: &[f32],
+        output: &mut [f32],
+        m: usize,
+        n_rows: usize,
+        k: usize,
+    ) -> KernelResult<()> {
+        if let Some(tier) = self.native_int8_tier() {
+            return dispatch_int8::gemm_1bit_g128_int8(tier, blocks, input, output, m, n_rows, k);
+        }
+        self.gemm_1bit_on_tier(blocks, input, output, m, n_rows, k)
+    }
+
     /// cli-16: this used to hardcode a `"Q1_0_g128 "` prefix regardless of
     /// which quant family the caller was actually running — one
     /// `KernelDispatcher` backs `OneBitKernel`/`TernaryKernel`/
     /// `StandardQuantKernel`/`Fp8Kernel`/`PrismKernel` alike, so it has no
     /// way to know which one a given caller cares about. The tier portion
     /// was always correct; only the quant-family guess was wrong. Fixed by
-    /// dropping the guess (see [`Self::tier_label`]) rather than by
+    /// dropping the guess (see `Self::tier_label`) rather than by
     /// rewriting the tier text. [`Self::kernel_label`] is the parameterized
     /// replacement for a caller that *does* know the model's resolved quant
     /// type.
@@ -882,67 +1050,38 @@ impl TernaryKernel for KernelDispatcher {
         }
     }
 
+    /// The opt-in INT8 tier (the legacy `{-1, 0, +1, 0}` table, K-01) when
+    /// [`KernelDispatcher::native_int8_tier`] selects one, else
+    /// `KernelDispatcher::gemv_ternary_on_tier`.
     fn gemv_ternary_g128(
         &self,
-        blocks: &[oxibonsai_core::BlockTQ2_0_g128],
+        blocks: &[BlockTQ2_0_g128],
         input: &[f32],
         output: &mut [f32],
         n_rows: usize,
         k: usize,
     ) -> KernelResult<()> {
-        match self.tier {
-            KernelTier::Reference => {
-                crate::gemv_ternary::gemv_tq2_0_g128(blocks, input, output, n_rows, k)
-            }
-            #[cfg(target_arch = "x86_64")]
-            KernelTier::Avx2 => unsafe {
-                crate::simd_avx2::gemv_tq2_0_g128_avx2_prefetch(blocks, input, output, n_rows, k)
-            },
-            #[cfg(target_arch = "x86_64")]
-            KernelTier::Avx512 => unsafe {
-                crate::simd_avx512::gemv_tq2_0_g128_avx512_prefetch(
-                    blocks, input, output, n_rows, k,
-                )
-            },
-            #[cfg(target_arch = "aarch64")]
-            KernelTier::Neon => unsafe {
-                crate::simd_neon::gemv_tq2_0_g128_neon_prefetch(blocks, input, output, n_rows, k)
-            },
-            // No ternary GPU kernels — fall back to best CPU SIMD tier.
-            #[cfg(feature = "gpu")]
-            KernelTier::Gpu => Self::cpu_gemv_ternary(blocks, input, output, n_rows, k),
+        if let Some(tier) = self.native_int8_tier() {
+            return dispatch_int8::gemv_two_bit_int8(tier, blocks, input, output, n_rows, k);
         }
+        self.gemv_ternary_on_tier(blocks, input, output, n_rows, k)
     }
 
+    /// The opt-in INT8 tier when [`KernelDispatcher::native_int8_tier`]
+    /// selects one, else `KernelDispatcher::gemm_ternary_on_tier`.
     fn gemm_ternary_g128(
         &self,
-        blocks: &[oxibonsai_core::BlockTQ2_0_g128],
+        blocks: &[BlockTQ2_0_g128],
         input: &[f32],
         output: &mut [f32],
         m: usize,
         n_rows: usize,
         k: usize,
     ) -> KernelResult<()> {
-        match self.tier {
-            KernelTier::Reference => {
-                crate::gemm_ternary::gemm_tq2_0_g128(blocks, input, output, m, n_rows, k)
-            }
-            #[cfg(target_arch = "x86_64")]
-            KernelTier::Avx2 => unsafe {
-                crate::simd_avx2::gemm_tq2_0_g128_avx2(blocks, input, output, m, n_rows, k)
-            },
-            #[cfg(target_arch = "x86_64")]
-            KernelTier::Avx512 => unsafe {
-                crate::simd_avx512::gemm_tq2_0_g128_avx512(blocks, input, output, m, n_rows, k)
-            },
-            #[cfg(target_arch = "aarch64")]
-            KernelTier::Neon => unsafe {
-                crate::simd_neon::gemm_tq2_0_g128_neon(blocks, input, output, m, n_rows, k)
-            },
-            // No ternary GPU kernels — fall back to best CPU SIMD tier.
-            #[cfg(feature = "gpu")]
-            KernelTier::Gpu => Self::cpu_gemm_ternary(blocks, input, output, m, n_rows, k),
+        if let Some(tier) = self.native_int8_tier() {
+            return dispatch_int8::gemm_two_bit_int8(tier, blocks, input, output, m, n_rows, k);
         }
+        self.gemm_ternary_on_tier(blocks, input, output, m, n_rows, k)
     }
 
     fn upload_weights_ternary(
@@ -1340,12 +1479,90 @@ mod tests {
     #[cfg(feature = "gpu")]
     use crate::traits::StandardQuantKernel;
 
+    thread_local! {
+        /// GPU backend probes [`KernelDispatcher::auto_detect`] made on this
+        /// thread — the only path to its one-time "GPU unavailable" warning,
+        /// so "no probe" proves "no warning" without capturing log output.
+        /// Thread-local, so parallel tests cannot disturb each other's count.
+        static GPU_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Record one GPU backend probe (called from `auto_detect`).
+    #[cfg(feature = "gpu")]
+    pub(super) fn note_gpu_probe() {
+        GPU_PROBES.with(|probes| probes.set(probes.get() + 1));
+    }
+
+    fn gpu_probes() -> usize {
+        GPU_PROBES.with(std::cell::Cell::get)
+    }
+
     #[test]
     fn auto_detect_creates_dispatcher() {
         let dispatcher = KernelDispatcher::auto_detect();
         // On x86-64 with AVX2, it should pick Avx2; otherwise Reference
         let _tier = dispatcher.tier();
         let _name = dispatcher.name();
+    }
+
+    /// Under an explicit CPU request
+    /// (`CpuOnlyBackendScope`, the engine's `Backend::Cpu`) `auto_detect`
+    /// must neither probe the GPU nor record the "GPU unavailable" fallback
+    /// reason — it records that the CPU was requested explicitly.
+    #[test]
+    fn auto_detect_under_an_explicit_cpu_scope_skips_the_gpu_probe_and_says_why() {
+        let before = gpu_probes();
+        let dispatcher = {
+            let _scope = crate::gpu_backend::CpuOnlyBackendScope::enter();
+            KernelDispatcher::auto_detect()
+        };
+        assert_eq!(
+            gpu_probes(),
+            before,
+            "an explicit CPU request must not probe (or warn about) the GPU"
+        );
+        assert_eq!(dispatcher.tier_reason, TierReason::CpuRequestedByScope);
+        assert_eq!(dispatcher.tier(), cpu_kernel_tier());
+        let reason = dispatcher.effective_tier_reason();
+        assert!(
+            reason.contains("requested explicitly"),
+            "the reason must describe an explicit request, not a fallback: {reason}"
+        );
+        assert!(
+            !reason.contains("fell back") && !reason.contains("not accelerated"),
+            "{reason}"
+        );
+    }
+
+    /// The other arm: with no scope active, `auto_detect` keeps its
+    /// auto-detection behaviour — it probes the GPU when the feature is
+    /// compiled in (whatever that probe finds on this host), and never
+    /// claims an explicit CPU request.
+    #[test]
+    fn auto_detect_without_the_scope_keeps_auto_detecting() {
+        assert!(
+            !crate::gpu_backend::cpu_only_backend_active(),
+            "precondition: no CPU-only scope on this test thread"
+        );
+        let before = gpu_probes();
+        let dispatcher = KernelDispatcher::auto_detect();
+        assert_ne!(dispatcher.tier_reason, TierReason::CpuRequestedByScope);
+        #[cfg(feature = "gpu")]
+        {
+            assert_eq!(gpu_probes(), before + 1, "the GPU must be probed once");
+            assert!(matches!(
+                dispatcher.tier_reason,
+                TierReason::GpuBackend(_) | TierReason::CpuAutoDetectGpuUnavailable
+            ));
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            assert_eq!(gpu_probes(), before, "no GPU feature, nothing to probe");
+            assert_eq!(
+                dispatcher.tier_reason,
+                TierReason::CpuAutoDetectNoGpuFeature
+            );
+        }
     }
 
     /// K-12/M-23: every tier's `gemv_f32` must be byte-identical to the
@@ -1402,7 +1619,7 @@ mod tests {
     #[test]
     fn gpu_backend_accessor_agrees_with_tier() {
         // A `Gpu`-tier dispatcher must expose a backend handle; a CPU-tier
-        // one must not (RT-ENGINE wave-2.5 grant).
+        // one must not.
         let cpu = KernelDispatcher::with_tier(KernelTier::Reference);
         assert!(cpu.gpu_backend().is_none());
 

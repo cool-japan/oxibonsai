@@ -23,8 +23,8 @@
 //!
 //! The hybrid KV cache has one slot per *full* layer (16 for the 27B), not
 //! one per stack layer (64). Storing at `layer_idx` would be rejected by
-//! the cache's store validation and — through the legacy
-//! `store_key`/`store_value` forwarders — silently dropped; reading at `layer_idx` would return
+//! the cache's store validation and — through the lossy
+//! `store_key_lossy`/`store_value_lossy` forms — silently dropped; reading at `layer_idx` would return
 //! another layer's history. Every cache access below goes through
 //! `block.kv_slot()`.
 //!

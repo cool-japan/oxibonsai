@@ -9,6 +9,7 @@ use super::embedding::EmbeddingTable;
 use super::lm_head;
 use super::WEIGHTLESS_PREALLOC_CONTEXT;
 use super::{BonsaiModel, ModelScratch, OutputWeight, MAX_PREALLOC_CONTEXT};
+use crate::block::TransformerBlock;
 use crate::error::{ModelError, ModelResult};
 use crate::kv_cache::{KvCache, KvCacheBacking, GROWTH_CHUNK_POSITIONS};
 use crate::layers::rms_norm::RmsNorm;
@@ -20,6 +21,74 @@ use crate::model::weight_loaders::{
 use oxibonsai_core::config::Qwen3Config;
 use oxibonsai_core::gguf::reader::GgufFile;
 use oxibonsai_core::gguf::tensor_info::tensor_names;
+
+/// The GPU slot namespaces a new model takes and hands to its blocks
+/// (`MET-02`; HANDOVER-GPU A1 / A3 / A4).
+///
+/// - **Metal:** the model **joins** the namespace of the GGUF mapping its
+///   weights are borrowed from (`super::q1_slots`) — one epoch shared by every
+///   replica of the mapping — and every block gets that same state, so the
+///   per-layer block path keys its norms exactly like the fused paths.
+///   Registration happens here, at construction, so a model's slots are fixed
+///   for its whole life (see the `q1_slots` module docs for why).
+/// - **CUDA:** the model mints its own `cuda_model_epoch` (CUDA pools hold one
+///   replica), composes its Q1 slots over it, and hands its blocks a private
+///   namespace under that epoch; the model's drop releases the tagged slots.
+/// - **Neither:** nothing is keyed on a namespace; blocks keep the standalone
+///   namespace `TransformerBlock::new` gave them.
+pub(super) struct ModelGpuSlots {
+    /// The mapping's Metal namespace.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    pub(super) metal_q1_slots: super::forward_metal::Q1MetalSlots,
+    /// The model's CUDA weight-cache epoch.
+    #[cfg(all(
+        feature = "native-cuda",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    pub(super) cuda_model_epoch: u64,
+}
+
+impl ModelGpuSlots {
+    /// Take the namespaces for a model made of `blocks` and `output`, and give
+    /// every block its share.
+    pub(super) fn attach(blocks: &mut [TransformerBlock<'_>], output: &OutputWeight<'_>) -> Self {
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            let metal_q1_slots = super::forward_metal::Q1MetalSlots::for_mapping(
+                super::q1_slots::mapping_anchor(blocks, output),
+            );
+            for block in blocks.iter_mut() {
+                block.set_slot_namespace(std::sync::Arc::clone(metal_q1_slots.state()));
+            }
+            Self { metal_q1_slots }
+        }
+        #[cfg(all(
+            feature = "native-cuda",
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        {
+            let _ = output;
+            let cuda_model_epoch =
+                oxibonsai_kernels::gpu_backend::cuda_graph_slot::next_cuda_model_epoch();
+            let state = super::q1_slots::MappingState::private(cuda_model_epoch, None);
+            for block in blocks.iter_mut() {
+                block.set_slot_namespace(std::sync::Arc::clone(&state));
+            }
+            Self { cuda_model_epoch }
+        }
+        #[cfg(not(any(
+            all(feature = "metal", target_os = "macos"),
+            all(
+                feature = "native-cuda",
+                any(target_os = "linux", target_os = "windows")
+            )
+        )))]
+        {
+            let _ = (blocks, output);
+            Self {}
+        }
+    }
+}
 
 impl<'a> BonsaiModel<'a> {
     /// Load a model from a parsed GGUF file.
@@ -152,6 +221,19 @@ impl<'a> BonsaiModel<'a> {
             let block = load_transformer_block(gguf, &config, layer_idx, &kernel, resolved_42)?;
             blocks.push(block);
         }
+        // MET-02: join this GGUF mapping's GPU slot namespace (shared with
+        // every replica of it) and hand it to the blocks.
+        #[cfg_attr(
+            not(any(
+                all(feature = "metal", target_os = "macos"),
+                all(
+                    feature = "native-cuda",
+                    any(target_os = "linux", target_os = "windows")
+                )
+            )),
+            allow(unused_variables)
+        )]
+        let gpu_slots = ModelGpuSlots::attach(&mut blocks, &output_weight);
         let max_context = effective_context(&config, Some(max_seq_len), context_cap);
         // The whole effective context is the model's LOGICAL window: the RoPE
         // table covers it from load (a few MB), and the host KV cache reports
@@ -219,7 +301,7 @@ impl<'a> BonsaiModel<'a> {
             #[cfg(all(feature = "metal", target_os = "macos"))]
             gpu_weight_cache: std::sync::Mutex::new(None),
             #[cfg(all(feature = "metal", target_os = "macos"))]
-            metal_q1_slots: super::forward_metal::Q1MetalSlots::fresh(),
+            metal_q1_slots: gpu_slots.metal_q1_slots,
             #[cfg(all(
                 feature = "native-cuda",
                 any(target_os = "linux", target_os = "windows")
@@ -229,8 +311,7 @@ impl<'a> BonsaiModel<'a> {
                 feature = "native-cuda",
                 any(target_os = "linux", target_os = "windows")
             ))]
-            cuda_model_epoch:
-                oxibonsai_kernels::gpu_backend::cuda_graph_slot::next_cuda_model_epoch(),
+            cuda_model_epoch: gpu_slots.cuda_model_epoch,
         })
     }
 
@@ -269,12 +350,26 @@ impl<'a> BonsaiModel<'a> {
         // does. Infallible constructor, so an unusable declaration degrades to
         // an unscaled table with a `tracing::error!` rather than a panic.
         let rope = build_rope_table_or_unscaled(&config, prealloc);
+        // No mapped weights: a private GPU slot namespace (see `ModelGpuSlots`).
+        let output_weight = OutputWeight::zero_fp32(config.vocab_size, h);
+        let mut blocks: Vec<TransformerBlock<'a>> = Vec::new();
+        #[cfg_attr(
+            not(any(
+                all(feature = "metal", target_os = "macos"),
+                all(
+                    feature = "native-cuda",
+                    any(target_os = "linux", target_os = "windows")
+                )
+            )),
+            allow(unused_variables)
+        )]
+        let gpu_slots = ModelGpuSlots::attach(&mut blocks, &output_weight);
         Self {
             token_embd: EmbeddingTable::constant(0.0, config.vocab_size, h),
             shared_embd: std::sync::Arc::from(Vec::new()),
-            blocks: Vec::new(),
+            blocks,
             output_norm: RmsNorm::new(vec![1.0; h], config.rms_norm_eps),
-            output_weight: OutputWeight::zero_fp32(config.vocab_size, h),
+            output_weight,
             rope,
             kv_cache,
             dominant_quant_type: oxibonsai_core::GgufTensorType::Q1_0_g128,
@@ -289,7 +384,7 @@ impl<'a> BonsaiModel<'a> {
             #[cfg(all(feature = "metal", target_os = "macos"))]
             gpu_weight_cache: std::sync::Mutex::new(None),
             #[cfg(all(feature = "metal", target_os = "macos"))]
-            metal_q1_slots: super::forward_metal::Q1MetalSlots::fresh(),
+            metal_q1_slots: gpu_slots.metal_q1_slots,
             #[cfg(all(
                 feature = "native-cuda",
                 any(target_os = "linux", target_os = "windows")
@@ -299,8 +394,7 @@ impl<'a> BonsaiModel<'a> {
                 feature = "native-cuda",
                 any(target_os = "linux", target_os = "windows")
             ))]
-            cuda_model_epoch:
-                oxibonsai_kernels::gpu_backend::cuda_graph_slot::next_cuda_model_epoch(),
+            cuda_model_epoch: gpu_slots.cuda_model_epoch,
             config,
         }
     }

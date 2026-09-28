@@ -1,42 +1,278 @@
 //! `oxibonsai run` — single-shot inference on a GGUF model.
+//!
+//! Decode routing (every path honours `--backend`):
+//!
+//! * `--grammar` / `--stop` → [`run_constrained_or_stopped`], a buffered
+//!   token-by-token loop sampling with the CLI's own [`Sampler`] (or the
+//!   grammar-constrained chain, which includes min-p).
+//! * a sampled request with `--min-p > 0` → the CLI-owned
+//!   [`generate::decode_with_sampler`] loop (the engine has no min-p setter).
+//! * everything else → the engine's own `generate_streaming_sync` /
+//!   `generate`, which route a temperature-0, penalty-free request through
+//!   the GPU argmax **only** when `InferenceEngine::greedy_gpu_eligible`
+//!   holds — i.e. only on a fused-Metal *GPU-tier* engine. The CLI no longer
+//!   has a greedy-GPU shortcut of its own: that shortcut ignored
+//!   `--backend cpu` and decoded a CPU-tier engine against the GPU-resident
+//!   KV cache (garbage output), and it was also the last reason for this file
+//!   to gate on the `metal` Cargo feature (cli-09).
 
-use std::io::{self, Write};
+use oxibonsai_runtime::config::RenderMessage;
+use oxibonsai_runtime::sampling::{PenaltyParams, Sampler, SamplingParams};
 
+use super::args;
+use super::bonsai2;
+use super::generate::{self, ChatContract, ReasoningDisplay, TokenPrinter};
 use super::model_desc;
+use super::model_source::ModelSource;
 use super::tokenizer_backend::{self, TokenizerBackendChoice};
 use super::util::{
     build_sampling_params, check_tokenizer_model_compatibility, missing_tokenizer_warning,
     model_vocab_size, read_prompt_stdin, reject_penalties_with_constrained_decode,
-    resolve_tokenizer_vocab_aware, StopChecker, TokenizerLookup,
+    resolve_tokenizer_vocab_aware, validated, StopChecker, TokenizerLookup,
 };
+
+/// Attach the GGUF's own chat template to `tok` (B2-13 fix-pass LEAD ITEM):
+/// every production deployment must render prompts through the SHIPPED
+/// model's template, not always the hardcoded ChatML fallback.
+/// `ResolvedChatTemplate::from_gguf` falls back to the built-in ChatML/Qwen3
+/// template only when the file ships no `tokenizer.chat_template` at all.
+pub(crate) fn attach_gguf_chat_template(
+    tok: oxibonsai_runtime::TokenizerBridge,
+    md: &oxibonsai_core::MetadataStore,
+) -> anyhow::Result<oxibonsai_runtime::TokenizerBridge> {
+    let template = oxibonsai_runtime::config::ResolvedChatTemplate::from_gguf(md)
+        .map_err(|e| anyhow::anyhow!("failed to compile the GGUF's own chat template: {e}"))?;
+    log_chat_template_source(&template);
+    Ok(tok.with_chat_template(template))
+}
+
+/// Where a resolved chat template came from, for the info log (the choice
+/// must be visible: B2-13 fix-pass LEAD ITEM).
+pub(crate) fn chat_template_source(
+    template: &oxibonsai_runtime::config::ResolvedChatTemplate,
+) -> &'static str {
+    match template {
+        oxibonsai_runtime::config::ResolvedChatTemplate::Jinja(_) => {
+            "the GGUF's own tokenizer.chat_template"
+        }
+        oxibonsai_runtime::config::ResolvedChatTemplate::Canned(_) => {
+            "the built-in ChatML/Qwen3 fallback (the GGUF ships no tokenizer.chat_template)"
+        }
+    }
+}
+
+fn log_chat_template_source(template: &oxibonsai_runtime::config::ResolvedChatTemplate) {
+    tracing::info!(
+        template = chat_template_source(template),
+        "resolved chat template"
+    );
+}
+
+/// REQUIRED #8's context guard plus the `--rope-scaling` pre-flight check,
+/// run once the GGUF is parsed and before any weights are touched. Returns
+/// the resolved `max_seq_len` (the explicit value, or the per-architecture
+/// default: 8192 for `qwen35`, 4096 otherwise).
+///
+/// `weight_bytes` is what the weights occupy (the file, or a
+/// `--ptq1-transcode` image). Shared by `run`, `chat` and `serve`.
+///
+/// # Errors
+///
+/// A refused context (naming both limits and the GiB), or `--rope-scaling
+/// on` on a file that declares no scaling.
+pub(crate) fn apply_bonsai2_load_time_guards(
+    gguf: &oxibonsai_core::gguf::reader::GgufFile<'_>,
+    arch: &str,
+    weight_bytes: u64,
+    max_seq_len: Option<usize>,
+    rope_scaling: oxibonsai_runtime::config::RopeScalingMode,
+) -> anyhow::Result<usize> {
+    let max_seq_len = validated(args::validate_max_seq_len(
+        max_seq_len.unwrap_or_else(|| bonsai2::default_max_seq_len(arch)),
+    ))?;
+    bonsai2::validate_context_for_model(gguf, arch, weight_bytes, max_seq_len)?;
+
+    // `--rope-scaling` pre-flight: fail before any weight is touched, with a
+    // clean message. The engine constructor applies (and logs) the same
+    // resolution when it builds the model.
+    let mode = oxibonsai_core::config::RopeScalingOverride::from(rope_scaling);
+    let declared = oxibonsai_core::config::RopeScaling::from_metadata(&gguf.metadata, arch)
+        .map_err(|e| anyhow::anyhow!("failed to read this model's RoPE scaling metadata: {e}"))?;
+    mode.apply(declared, arch)
+        .map_err(|e| anyhow::anyhow!("--rope-scaling {mode}: {e}"))?;
+    Ok(max_seq_len)
+}
+
+/// The sampling values a request actually runs with (RT-17).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ResolvedSampling {
+    pub(crate) temperature: f32,
+    pub(crate) top_k: usize,
+    pub(crate) top_p: f32,
+    pub(crate) min_p: f32,
+}
+
+/// RT-17's precedence for every sampling default: an explicit value (a CLI
+/// flag, or a `--config` value — merged and validated in `mod.rs`) wins;
+/// otherwise the model's own `general.sampling.*` declaration; otherwise the
+/// shared pre-RT-17 literal (`util::DEFAULT_*`: 0.7 / 40 / 0.9 / 0.0). The
+/// model's value is range checked like a flag would be.
+///
+/// # Errors
+///
+/// A GGUF-declared value outside the flag's accepted range.
+pub(crate) fn resolve_sampling(
+    temperature: Option<f32>,
+    top_k: Option<usize>,
+    top_p: Option<f32>,
+    min_p: Option<f32>,
+    md: &oxibonsai_core::MetadataStore,
+) -> anyhow::Result<ResolvedSampling> {
+    use super::util::{DEFAULT_MIN_P, DEFAULT_TEMPERATURE, DEFAULT_TOP_K, DEFAULT_TOP_P};
+    use oxibonsai_runtime::sampling::{
+        resolve_sampling_default_f32, resolve_sampling_default_usize, GgufSamplingDefaults,
+    };
+    let declared = GgufSamplingDefaults::from_metadata(md);
+    Ok(ResolvedSampling {
+        temperature: validated(args::validate_temperature(resolve_sampling_default_f32(
+            temperature,
+            declared.temperature,
+            DEFAULT_TEMPERATURE,
+        )))?,
+        top_k: resolve_sampling_default_usize(top_k, declared.top_k, DEFAULT_TOP_K),
+        top_p: validated(args::validate_top_p(resolve_sampling_default_f32(
+            top_p,
+            declared.top_p,
+            DEFAULT_TOP_P,
+        )))?,
+        min_p: validated(args::validate_min_p(resolve_sampling_default_f32(
+            min_p,
+            declared.min_p,
+            DEFAULT_MIN_P,
+        )))?,
+    })
+}
+
+/// Everything `run`/`chat` need to build an engine from a parsed GGUF.
+pub(crate) struct EngineLoad {
+    pub(crate) params: SamplingParams,
+    pub(crate) seed: u64,
+    pub(crate) max_seq_len: usize,
+    pub(crate) backend: oxibonsai_runtime::engine_seam::Backend,
+    pub(crate) rope_scaling: oxibonsai_runtime::config::RopeScalingMode,
+    pub(crate) prefill_chunk: Option<usize>,
+    pub(crate) penalties: PenaltyParams,
+}
+
+/// Build the engine (honouring `--backend` and `--rope-scaling`), apply
+/// `--prefill-chunk` and the penalties, and print the resolved-engine
+/// summary line (cli-16 / REQUIRED #14: from the engine's own accessors).
+///
+/// # Errors
+///
+/// Engine construction errors (including the typed backend refusals).
+pub(crate) fn load_engine<'a>(
+    gguf: &'a oxibonsai_core::gguf::reader::GgufFile<'a>,
+    load: &EngineLoad,
+    transcoded_tensors: usize,
+) -> anyhow::Result<oxibonsai_runtime::InferenceEngine<'a>> {
+    let mut engine = oxibonsai_runtime::InferenceEngine::from_gguf_with_backend_and_rope(
+        gguf,
+        load.params.clone(),
+        load.seed,
+        load.max_seq_len,
+        load.backend,
+        load.rope_scaling.into(),
+    )?;
+    bonsai2::apply_prefill_chunk(&mut engine, load.prefill_chunk)?;
+    engine.set_penalties(load.penalties);
+    let mut summary = model_desc::engine_summary(&engine);
+    if transcoded_tensors > 0 {
+        summary.push_str(&format!(
+            " | --ptq1-transcode: {transcoded_tensors} PTQ1_0 tensors re-encoded to PQ2_0"
+        ));
+    }
+    eprintln!("{summary}");
+    Ok(engine)
+}
 
 /// Resolved arguments for `oxibonsai run`, merged from CLI flags and
 /// `--config` in `mod.rs` (cli-04).
 ///
-/// A struct rather than 15+ positional parameters: past a certain field
-/// count, position-based argument passing between `args.rs`'s
-/// destructuring, `mod.rs`'s forwarding call, and this function's
-/// signature becomes error-prone to keep in sync by hand — a struct with
-/// named fields lets the compiler catch a mismatch instead of silently
-/// swapping two `f32` parameters.
+/// A struct rather than many positional parameters: named fields let the
+/// compiler catch a mismatch instead of silently swapping two `f32`s.
 pub(crate) struct RunArgs {
     pub(crate) model: Option<String>,
     pub(crate) prompt: String,
     pub(crate) max_tokens: usize,
-    pub(crate) temperature: f32,
-    pub(crate) top_k: usize,
-    pub(crate) top_p: f32,
+    /// RT-17: `None` = no explicit CLI/TOML value — resolved against the
+    /// GGUF's own `general.sampling.*` default, then the literal, once the
+    /// model is parsed ([`resolve_sampling`]).
+    pub(crate) temperature: Option<f32>,
+    pub(crate) top_k: Option<usize>,
+    pub(crate) top_p: Option<f32>,
+    /// RT-23, RT-17-style precedence (see `temperature`).
+    pub(crate) min_p: Option<f32>,
     pub(crate) repetition_penalty: f32,
     pub(crate) frequency_penalty: f32,
     pub(crate) presence_penalty: f32,
     pub(crate) seed: u64,
-    pub(crate) max_seq_len: usize,
+    /// REQUIRED #8: `None` = the per-architecture default, applied (and
+    /// guarded) once the model is parsed.
+    pub(crate) max_seq_len: Option<usize>,
     pub(crate) tokenizer: Option<String>,
     pub(crate) tokenizer_backend: TokenizerBackendChoice,
+    /// Render the prompt through the model's chat template.
+    pub(crate) chat: bool,
     pub(crate) grammar: Option<String>,
     pub(crate) stop: Vec<String>,
+    pub(crate) backend: oxibonsai_runtime::engine_seam::Backend,
+    pub(crate) rope_scaling: oxibonsai_runtime::config::RopeScalingMode,
+    /// cli-11 chat contract (all require `--chat`).
+    pub(crate) enable_thinking: Option<bool>,
+    pub(crate) reasoning_effort: Option<String>,
+    pub(crate) tools: Option<String>,
+    pub(crate) show_reasoning: bool,
+    pub(crate) hide_reasoning: bool,
+    pub(crate) ptq1_transcode: bool,
+    pub(crate) prefill_chunk: Option<usize>,
+    /// §5.7 vision flags: validated, then a typed `NOT_YET_SUPPORTED`.
+    pub(crate) vision: bonsai2::VisionRequest,
     pub(crate) allow_vocab_mismatch: bool,
     pub(crate) no_stream: bool,
+}
+
+/// Refuse chat-contract flags on a raw (non-`--chat`) run: they only mean
+/// something when the prompt is rendered through the chat template, and a
+/// flag that silently does nothing is never acceptable.
+pub(crate) fn require_chat_for_contract_flags(
+    chat: bool,
+    contract: &ChatContract,
+    display_explicit: bool,
+) -> anyhow::Result<()> {
+    if chat || (contract.is_empty() && !display_explicit) {
+        return Ok(());
+    }
+    let mut flags = Vec::new();
+    match contract.enable_thinking {
+        Some(true) => flags.push("--think"),
+        Some(false) => flags.push("--no-think"),
+        None => {}
+    }
+    if contract.reasoning_effort.is_some() {
+        flags.push("--reasoning-effort");
+    }
+    if contract.tools_json.is_some() {
+        flags.push("--tools");
+    }
+    if display_explicit {
+        flags.push("--show-reasoning/--hide-reasoning");
+    }
+    anyhow::bail!(
+        "{} only apply when the prompt is rendered through the model's chat template: add \
+         --chat (or use `oxibonsai chat`)",
+        flags.join(", ")
+    );
 }
 
 pub(crate) fn run(args: RunArgs) -> anyhow::Result<()> {
@@ -47,6 +283,7 @@ pub(crate) fn run(args: RunArgs) -> anyhow::Result<()> {
         temperature,
         top_k,
         top_p,
+        min_p,
         repetition_penalty,
         frequency_penalty,
         presence_penalty,
@@ -54,8 +291,19 @@ pub(crate) fn run(args: RunArgs) -> anyhow::Result<()> {
         max_seq_len,
         tokenizer,
         tokenizer_backend,
+        chat,
         grammar,
         stop,
+        backend,
+        rope_scaling,
+        enable_thinking,
+        reasoning_effort,
+        tools,
+        show_reasoning,
+        hide_reasoning,
+        ptq1_transcode,
+        prefill_chunk,
+        vision,
         allow_vocab_mismatch,
         no_stream,
     } = args;
@@ -66,90 +314,72 @@ pub(crate) fn run(args: RunArgs) -> anyhow::Result<()> {
             anyhow::anyhow!("no model: pass --model <gguf> or set OXI_MODEL (e.g. in .env)")
         })?;
 
+    vision.reject_until_supported()?;
+    let contract = ChatContract::from_flags(enable_thinking, reasoning_effort, tools.as_deref())?;
+    let (display, display_explicit) = ReasoningDisplay::from_flags(show_reasoning, hide_reasoning);
+    require_chat_for_contract_flags(chat, &contract, display_explicit)?;
+
     let prompt_text = if prompt == "-" {
         read_prompt_stdin()?
     } else {
         prompt
     };
 
+    tracing::info!(model = %model, max_tokens, "starting inference");
+
+    let source = ModelSource::open(&model, ptq1_transcode)?;
+    let gguf = oxibonsai_core::gguf::reader::GgufFile::parse(source.bytes())?;
+    let arch = gguf
+        .metadata
+        .get_string(oxibonsai_core::gguf::tensor_info::keys::GENERAL_ARCHITECTURE)
+        .unwrap_or("")
+        .to_string();
+
+    let max_seq_len = apply_bonsai2_load_time_guards(
+        &gguf,
+        &arch,
+        source.weight_bytes(),
+        max_seq_len,
+        rope_scaling,
+    )?;
+    let sampling = resolve_sampling(temperature, top_k, top_p, min_p, &gguf.metadata)?;
     tracing::info!(
-        model = %model,
-        max_tokens,
-        temperature,
-        "starting inference"
+        temperature = sampling.temperature,
+        top_k = sampling.top_k,
+        top_p = sampling.top_p,
+        min_p = sampling.min_p,
+        "resolved inference"
     );
 
-    // Memory-map the GGUF file
-    let mmap = oxibonsai_core::gguf::reader::mmap_gguf_file(std::path::Path::new(&model))
-        .map_err(|e| anyhow::anyhow!("failed to open model '{model}': {e}"))?;
-    let gguf = oxibonsai_core::gguf::reader::GgufFile::parse(&mmap)?;
+    // The shared constructor (orchestrator P0 addendum): `--temperature 0`
+    // means exactly argmax on every backend — no hidden penalty.
+    let params = build_sampling_params(
+        sampling.temperature,
+        sampling.top_k,
+        sampling.top_p,
+        repetition_penalty,
+    );
+    let penalties = PenaltyParams::new(frequency_penalty, presence_penalty);
+    let mut engine = load_engine(
+        &gguf,
+        &EngineLoad {
+            params: params.clone(),
+            seed,
+            max_seq_len,
+            backend,
+            rope_scaling,
+            prefill_chunk,
+            penalties,
+        },
+        source.transcoded_tensors(),
+    )?;
 
-    // cli-12: `temperature`/`top_p`/`repetition_penalty`/`max_tokens` are
-    // already range-checked by clap's `value_parser`s in args.rs; this is
-    // the shared constructor (orchestrator P0 addendum) so `--temperature
-    // 0` means exactly argmax on every backend — `repetition_penalty`
-    // defaults to 1.0 here (mod.rs resolves it that way), never the
-    // `SamplingParams::default()` struct's own 1.1.
-    let params = build_sampling_params(temperature, top_k, top_p, repetition_penalty);
-
-    let mut engine =
-        oxibonsai_runtime::InferenceEngine::from_gguf(&gguf, params, seed, max_seq_len)?;
-    engine.set_penalties(oxibonsai_runtime::PenaltyParams::new(
-        frequency_penalty,
-        presence_penalty,
-    ));
-
-    // cli-16: report the RESOLVED quant variant + effective kernel tier,
-    // never a hardcoded kernel-family string.
-    if let Some(hybrid) = engine.hybrid_model() {
-        // ENGINE-SEAM: a hybrid (`qwen35`) engine resolved its own variant
-        // and weight quantization at load; the dense tensor-count heuristic
-        // below would misname it.
-        let variant = hybrid.variant().map_or_else(
-            || engine.architecture().to_string(),
-            |v| v.name().to_string(),
-        );
-        eprintln!(
-            "{}",
-            model_desc::resolved_engine_summary(
-                &variant,
-                engine.dominant_quant_type(),
-                engine.kernel_tier(),
-                &engine.effective_tier_reason(),
-            )
-        );
-    } else if let Ok(config) = oxibonsai_core::config::Qwen3Config::from_metadata(&gguf.metadata) {
-        let dominant_type = gguf
-            .tensors
-            .count_by_type()
-            .iter()
-            .max_by_key(|(_, count)| *count)
-            .map(|(ty, _)| *ty)
-            .unwrap_or(oxibonsai_core::GgufTensorType::Q1_0_g128);
-        let variant = oxibonsai_model::ModelVariant::from_config_and_sample_tensor_type(
-            &config,
-            dominant_type,
-        );
-        eprintln!(
-            "{}",
-            model_desc::resolved_engine_summary(
-                variant.name(),
-                dominant_type,
-                engine.kernel_tier(),
-                &engine.kernel().effective_tier_reason(),
-            )
-        );
-    }
-
-    // Tokenize prompt and retain the bridge for streaming decode.
-    // TOK-08: resolution prefers a vocab-matching auto-detected candidate,
-    // and (below) the tokenizer is hard-checked against the model
-    // regardless of whether it was auto-detected or passed explicitly.
-    // ENGINE-SEAM: a GGUF that embeds its own tokenizer (every Bonsai 2
-    // `qwen35` file) uses it when no on-disk candidate fits the model.
+    // Tokenizer (TOK-08 + ENGINE-SEAM): vocab-aware resolution, a hard
+    // compatibility check, the GGUF's own template attached, and the
+    // GGUF-embedded tokenizer as the fallback for a Bonsai 2 file.
     let expected_vocab = model_vocab_size(&gguf).ok();
     let lookup = resolve_tokenizer_vocab_aware(tokenizer.as_deref(), &model, expected_vocab);
-    let resolved = resolve_model_tokenizer(
+    let tok_bridge = resolve_model_tokenizer(
         tokenizer.as_deref(),
         &lookup,
         &gguf,
@@ -157,20 +387,42 @@ pub(crate) fn run(args: RunArgs) -> anyhow::Result<()> {
         tokenizer_backend,
         allow_vocab_mismatch,
     )?;
-    let (prompt_tokens, tok_bridge) = if let Some(tok) = resolved {
-        let tokens = tok.encode(&prompt_text)?;
-        (tokens, Some(tok))
-    } else {
-        tracing::warn!("{}", missing_tokenizer_warning(&lookup.searched));
-        // cli-07: no hardcoded token id. Fall back to the model's own
-        // declared BOS id when present; otherwise there is no honest
-        // prompt token to emit at all (checked below, before any forward
-        // pass runs).
-        let bos = gguf
-            .metadata
-            .get_u32(oxibonsai_core::gguf::tensor_info::keys::TOKENIZER_BOS_TOKEN_ID)
-            .ok();
-        (bos.map(|id| vec![id]).unwrap_or_default(), None)
+
+    let (prompt_tokens, started_in_think) = match (&tok_bridge, chat) {
+        (Some(tok), true) => {
+            let template = tok.resolved_chat_template();
+            if let Ok(default_thinks) = bonsai2::default_enable_thinking(&template) {
+                tracing::info!(
+                    template_thinks_by_default = default_thinks,
+                    enable_thinking = ?contract.enable_thinking,
+                    "chat contract resolved"
+                );
+            }
+            let rendered = generate::render_prompt(
+                &template,
+                &[RenderMessage::new("user", prompt_text.as_str())],
+                &contract,
+            )?;
+            (
+                tok.encode(&rendered)?,
+                bonsai2::prompt_opens_think_block(&rendered),
+            )
+        }
+        (None, true) => anyhow::bail!(
+            "--chat needs a tokenizer to render and encode the chat template, and none was \
+             found; pass --tokenizer <path/to/tokenizer.json>"
+        ),
+        (Some(tok), false) => (tok.encode(&prompt_text)?, false),
+        (None, false) => {
+            tracing::warn!("{}", missing_tokenizer_warning(&lookup.searched));
+            // cli-07: no hardcoded token id — the model's own declared BOS
+            // id, or nothing (refused below).
+            let bos = gguf
+                .metadata
+                .get_u32(oxibonsai_core::gguf::tensor_info::keys::TOKENIZER_BOS_TOKEN_ID)
+                .ok();
+            (bos.map(|id| vec![id]).unwrap_or_default(), false)
+        }
     };
     if prompt_tokens.is_empty() {
         anyhow::bail!(
@@ -179,7 +431,6 @@ pub(crate) fn run(args: RunArgs) -> anyhow::Result<()> {
              <path/to/tokenizer.json>."
         );
     }
-
     if grammar.is_some() && tok_bridge.is_none() {
         anyhow::bail!("--grammar requires a tokenizer; none was found (see the warning above)");
     }
@@ -193,38 +444,61 @@ pub(crate) fn run(args: RunArgs) -> anyhow::Result<()> {
     )?;
 
     tracing::info!(prompt_tokens = prompt_tokens.len(), "prefilling");
-
     let start = std::time::Instant::now();
+    let prompt_len = prompt_tokens.len();
 
-    let (prompt_len, output_count) = if use_constrained_or_stop {
-        run_constrained_or_stopped(
+    let output_count = if use_constrained_or_stop {
+        let mut printer = TokenPrinter::new(tok_bridge.as_ref(), started_in_think, display, false);
+        let count = run_constrained_or_stopped(
             &mut engine,
             &prompt_tokens,
             max_tokens,
             grammar.as_deref(),
             &stop,
             tok_bridge.as_ref(),
-            seed,
-            temperature,
-            top_k,
-            top_p,
-        )?
+            &ConstrainedSampling {
+                params: params.clone(),
+                seed,
+                min_p: sampling.min_p,
+            },
+            &mut printer,
+        )?;
+        let stop_checker = StopChecker::new(stop.clone());
+        let truncate = |text: &str| stop_checker.truncate_at_stop(text);
+        printer.finish(Some(&truncate));
+        count
     } else {
-        run_fast_path(
-            &mut engine,
-            &prompt_tokens,
-            max_tokens,
-            temperature,
-            repetition_penalty,
-            frequency_penalty,
-            presence_penalty,
-            tok_bridge.as_ref(),
-            no_stream,
-        )?
+        let mut printer = TokenPrinter::new(tok_bridge.as_ref(), started_in_think, display, true);
+        let count = if generate::needs_cli_sampler(sampling.temperature, sampling.min_p) {
+            tracing::info!(
+                min_p = sampling.min_p,
+                "min-p sampling: decoding with the CLI's own sampler"
+            );
+            let mut sampler = generate::cli_sampler(params, seed, penalties, sampling.min_p);
+            generate::decode_with_sampler(
+                &mut engine,
+                &prompt_tokens,
+                max_tokens,
+                &mut sampler,
+                |token| {
+                    printer.push(token)?;
+                    Ok(true)
+                },
+            )?
+        } else {
+            run_engine_generation(
+                &mut engine,
+                &prompt_tokens,
+                max_tokens,
+                no_stream,
+                &mut printer,
+            )?
+        };
+        printer.finish(None);
+        count
     };
 
     let elapsed = start.elapsed();
-
     let total_tokens = prompt_len + output_count;
     let tok_per_sec = if elapsed.as_secs_f64() > 0.0 {
         output_count as f64 / elapsed.as_secs_f64()
@@ -242,7 +516,9 @@ pub(crate) fn run(args: RunArgs) -> anyhow::Result<()> {
         tok_per_sec
     );
 
-    // Print GPU profiling summary if OXIBONSAI_PROFILE_GPU=1 was set
+    // GPU profiling summary when OXIBONSAI_PROFILE_GPU=1 was set. The one
+    // remaining `feature = "metal"` gate in this file: the kernels crate
+    // only defines this function in a Metal build.
     #[cfg(all(feature = "metal", target_os = "macos"))]
     {
         let model_size = std::fs::metadata(&model).map(|m| m.len()).unwrap_or(0);
@@ -250,6 +526,48 @@ pub(crate) fn run(args: RunArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// The engine's own decode loop — `generate_streaming_sync` on a worker
+/// thread (tokens printed as they arrive), or `generate` with `--no-stream`.
+/// Either routes a greedy, penalty-free request through the GPU argmax only
+/// when the engine itself says it is eligible (a fused-Metal GPU-tier
+/// engine; never under `--backend cpu`, never for a hybrid model).
+pub(crate) fn run_engine_generation(
+    engine: &mut oxibonsai_runtime::InferenceEngine<'_>,
+    prompt_tokens: &[u32],
+    max_tokens: usize,
+    no_stream: bool,
+    printer: &mut TokenPrinter<'_>,
+) -> anyhow::Result<usize> {
+    if engine.greedy_gpu_eligible(false) {
+        tracing::info!("greedy request on a fused-Metal GPU-tier engine: GPU argmax decode");
+    }
+    if no_stream {
+        let tokens = engine.generate(prompt_tokens, max_tokens)?;
+        for &token in &tokens {
+            printer.push(token)?;
+        }
+        return Ok(tokens.len());
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<u32>();
+    std::thread::scope(|s| -> anyhow::Result<usize> {
+        let thread_tx = tx.clone();
+        let gen_handle =
+            s.spawn(move || engine.generate_streaming_sync(prompt_tokens, max_tokens, &thread_tx));
+        drop(tx);
+        let mut count = 0usize;
+        for token_id in rx {
+            count += 1;
+            printer.push(token_id)?;
+        }
+        match gen_handle.join() {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => return Err(anyhow::anyhow!("generation thread panicked")),
+        }
+        Ok(count)
+    })
 }
 
 /// The tokenizer a model-loading subcommand uses (TOK-08 + ENGINE-SEAM).
@@ -285,7 +603,7 @@ pub(crate) fn resolve_model_tokenizer(
 }
 
 /// [`resolve_model_tokenizer`] with the caller's own loader for the on-disk
-/// candidate (`benchmark` loads through `TokenizerBridge::from_file`).
+/// candidate.
 pub(crate) fn resolve_model_tokenizer_with(
     explicit: Option<&str>,
     lookup: &TokenizerLookup,
@@ -298,6 +616,9 @@ pub(crate) fn resolve_model_tokenizer_with(
         return Ok(gguf_embedded_tokenizer(gguf, expected_vocab));
     };
     let tok = load(path)?;
+    // B2-13 fix-pass LEAD ITEM: the GGUF's own template always wins when
+    // present (falls back to ChatML/Qwen3 when the file ships none).
+    let tok = attach_gguf_chat_template(tok, &gguf.metadata)?;
     match check_tokenizer_model_compatibility(&tok, path, gguf, allow_vocab_mismatch) {
         Ok(()) => Ok(Some(tok)),
         Err(mismatch) if explicit.is_none() => {
@@ -319,13 +640,23 @@ pub(crate) fn resolve_model_tokenizer_with(
 }
 
 /// The tokenizer embedded in `gguf`'s `tokenizer.ggml.*` metadata, when the
-/// file carries one whose vocabulary equals the model's (`expected_vocab`).
+/// file carries one whose vocabulary equals the model's (`expected_vocab`),
+/// with its chat template attached (B2-13 fix-pass LEAD ITEM).
+///
+/// Returns `None` for "there is nothing usable embedded" — no
+/// `expected_vocab`, no `tokenizer.ggml.tokens` at all (the legacy
+/// `Ternary-Bonsai-{1.7B,8B}.gguf` files carry neither an embedded
+/// vocabulary nor a chat template, so this path correctly falls through for
+/// them), a vocabulary that does not match, OR a template this engine's
+/// Jinja subset cannot compile (logged at `warn`: every real template
+/// compiles today, so that is far more likely a regression than an expected
+/// case).
 pub(crate) fn gguf_embedded_tokenizer(
     gguf: &oxibonsai_core::gguf::reader::GgufFile<'_>,
     expected_vocab: Option<usize>,
 ) -> Option<oxibonsai_runtime::TokenizerBridge> {
     let expected = expected_vocab?;
-    match oxibonsai_runtime::engine::tokenizer_from_gguf(gguf) {
+    match gguf_embedded_tokenizer_with_template(gguf) {
         Ok(tok) if tok.vocab_size() == expected => {
             tracing::info!(vocab = expected, "using the tokenizer embedded in the GGUF");
             Some(tok)
@@ -339,323 +670,146 @@ pub(crate) fn gguf_embedded_tokenizer(
             None
         }
         Err(e) => {
-            tracing::debug!(error = %e, "no usable GGUF-embedded tokenizer");
+            tracing::warn!(
+                error = %e,
+                "no usable GGUF-embedded tokenizer (no embedded vocabulary, or its chat \
+                 template failed to compile -- check the error above for which)"
+            );
             None
         }
     }
 }
 
-/// The original three-way fast path (greedy-GPU / native-CUDA /
-/// worker-thread streaming), used whenever neither `--grammar` nor
-/// `--stop` is requested.
-///
-/// F14: the native-CUDA arm used to call `engine.generate()` to
-/// completion and print only afterward. The whole point of collapsing it
-/// into the same `cfg(not(...))` branch as every other non-greedy-GPU
-/// platform is that the cfg ladder must be re-derived as a single unit —
-/// the Metal greedy-GPU branch above it ends in an `unreachable!()`
-/// guarded by the *complement* of this branch's old condition, so editing
-/// one arm in isolation would silently change which cfg combinations
-/// reach that `unreachable!()`. `--no-stream` restores the old
-/// "wait for completion, print once" behavior as an explicit opt-in
-/// (useful for non-interactive benchmarking) instead of a silent,
-/// platform-dependent default.
-#[allow(clippy::too_many_arguments)]
-fn run_fast_path(
-    engine: &mut oxibonsai_runtime::InferenceEngine<'_>,
-    prompt_tokens: &[u32],
-    max_tokens: usize,
-    temperature: f32,
-    repetition_penalty: f32,
-    frequency_penalty: f32,
-    presence_penalty: f32,
-    tok_bridge: Option<&oxibonsai_runtime::TokenizerBridge>,
-    no_stream: bool,
-) -> anyhow::Result<(usize, usize)> {
-    // Greedy GPU path: when temperature=0 and Metal is available,
-    // run argmax on GPU and download only 4-byte token IDs instead
-    // of the full ~607KB logits vector per token.
-    //
-    // `generate_greedy_gpu` is pure argmax: it never consults the
-    // engine's sampler, so it cannot apply a repetition/frequency/presence
-    // penalty even though `engine.set_penalties(...)` was called above.
-    // Gating on `temperature == 0.0` alone (the original condition, from
-    // back when `repetition_penalty` was hardcoded 1.1 and "temperature 0"
-    // was never truly argmax anyway) would silently drop any penalty this
-    // orchestrator P0 addendum's own new flags request the moment they are
-    // combined with `--temperature 0` on a Metal build — exactly the class
-    // of divergence that addendum exists to close. Only the fully
-    // penalty-free case takes this path; any explicit penalty falls
-    // through to the streaming path below, whose sampler does apply them.
-    //
-    // NOTE on cli-09 (wave-1 addendum item 4; STILL BLOCKED, verifier
-    // re-confirmed this on the previous pass): genuinely not closable
-    // from this file alone, not merely deferred. `InferenceEngine::
-    // generate_greedy_gpu` is itself defined only under
-    // `#[cfg(all(feature = "metal", target_os = "macos"))]` in
-    // `oxibonsai-runtime` (verified in `engine.rs`), and this crate's own
-    // `metal` feature (root `Cargo.toml`, NOT this crate's `owned_files`
-    // this wave — verified: `B2-08`'s `owned_files` list includes it,
-    // per its `scratchpad/pkg/B2-08.json`) is off by default
-    // (`default = ["server", "hf-tokenizer"]`). Dropping `feature =
-    // "metal"` from the 5 remaining `#[cfg(all(feature = "metal",
-    // target_os = "macos"))]` sites in this file (this one, and the ones
-    // at the `use_greedy_gpu` binding and its two `#[cfg]` arms just
-    // below) WITHOUT the manifest change landing FIRST breaks a plain
-    // `cargo install oxibonsai-cli` / default `cargo build` on macOS
-    // outright (this package's own gate uses `--all-features` and would
-    // not catch that regression).
-    //
-    // The exact two-sided patch, for whoever next holds root `Cargo.toml`
-    // edit rights this wave (B2-08) plus this file, to land IN THE SAME
-    // integration step:
-    //   1. Root `Cargo.toml`, add:
-    //        [target.'cfg(target_os = "macos")'.dependencies]
-    //        oxibonsai-kernels = { workspace = true, features = ["metal", "gpu"] }
-    //        oxibonsai-model = { workspace = true, features = ["metal"] }
-    //        oxibonsai-runtime = { workspace = true, features = ["metal"] }
-    //        oxibonsai-image = { workspace = true, features = ["metal"] }
-    //      (Cargo unifies features per-target when the same crate also
-    //      appears in the unconditional `[dependencies]` table, so this
-    //      does not need to touch that table — see the Cargo reference on
-    //      platform-specific dependencies. This is the only way to get a
-    //      macOS-only default-on capability: Cargo cannot make a
-    //      package's OWN named feature default-on per target. UNTESTED
-    //      HERE: root `Cargo.toml` is not this package's to edit or build
-    //      against this wave, so this feature-union behavior has not been
-    //      verified against THIS workspace's actual dependency graph.
-    //      Whoever applies step 1 must confirm with a real `cargo build`
-    //      — no `--features`, macOS target — that `oxibonsai-kernels`'s
-    //      `metal` feature is actually active before flipping step 2; if
-    //      it is not, step 2 must wait.)
-    //   2. This file: replace `#[cfg(all(feature = "metal", target_os =
-    //      "macos"))]` with `#[cfg(target_os = "macos")]` (and the
-    //      matching `#[cfg(not(...))]` arms) at every site below.
-    // Not applied here because (1) is outside this package's owned_files
-    // this wave; applying (2) alone, ahead of (1), is the exact
-    // known-to-break-the-default-build half-fix the addendum warns
-    // against. Recorded as an unresolved, cross-package-blocked item in
-    // this package's `deviations`, not silently assumed closed.
-    let penalty_free =
-        repetition_penalty == 1.0 && frequency_penalty == 0.0 && presence_penalty == 0.0;
-    #[cfg(all(feature = "metal", target_os = "macos"))]
-    let use_greedy_gpu = temperature == 0.0 && penalty_free;
-    #[cfg(not(all(feature = "metal", target_os = "macos")))]
-    let use_greedy_gpu = {
-        // `temperature`/`penalty_free` only feed the argmax-fast-path
-        // decision on the metal+macOS cfg arm above; read them
-        // unconditionally here too so neither is ever an unused binding
-        // on other platforms.
-        let _ = (temperature, penalty_free);
-        false
-    };
+/// Build the GGUF-embedded tokenizer WITH its chat template attached
+/// (B2-13 fix-pass LEAD ITEM): vocabulary from `tokenizer.ggml.*`, template
+/// from `tokenizer.chat_template` (a compile failure is an error, per
+/// `ResolvedChatTemplate::from_gguf`'s own contract).
+pub(crate) fn gguf_embedded_tokenizer_with_template(
+    gguf: &oxibonsai_core::gguf::reader::GgufFile<'_>,
+) -> anyhow::Result<oxibonsai_runtime::TokenizerBridge> {
+    let tok = oxibonsai_runtime::TokenizerBridge::native_from_gguf_metadata(&gguf.metadata)?;
+    log_chat_template_source(&tok.resolved_chat_template());
+    Ok(tok)
+}
 
-    if use_greedy_gpu {
-        #[cfg(all(feature = "metal", target_os = "macos"))]
-        {
-            tracing::info!("using greedy GPU path (argmax on Metal, 4-byte download)");
-            let p_len = prompt_tokens.len();
-            let tokens = engine.generate_greedy_gpu(prompt_tokens, max_tokens)?;
-            let mut stream_state = tok_bridge.map(|t| t.new_decode_stream(true));
-            for &token_id in &tokens {
-                match (tok_bridge, stream_state.as_mut()) {
-                    (Some(tok), Some(state)) => {
-                        if let Some(text) = tok.step_decode(state, token_id)? {
-                            print!("{text}");
-                        }
-                    }
-                    _ => {
-                        print!(" {token_id}");
-                    }
-                }
-                let _ = io::stdout().flush();
-            }
-            Ok((p_len, tokens.len()))
-        }
-        #[cfg(not(all(feature = "metal", target_os = "macos")))]
-        unreachable!(
-            "use_greedy_gpu is only ever true on the metal+macOS cfg arm; see the let-binding above"
-        )
-    } else if no_stream {
-        // F14: `--no-stream` is now the ONLY way to get "wait for the
-        // full completion, print once" behavior, on every platform
-        // (including native CUDA, which used to do this unconditionally
-        // and silently with no flag to opt out of it).
-        let p_len = prompt_tokens.len();
-        let tokens = engine.generate(prompt_tokens, max_tokens)?;
-        let mut stream_state = tok_bridge.map(|t| t.new_decode_stream(true));
-        for &token_id in &tokens {
-            match (tok_bridge, stream_state.as_mut()) {
-                (Some(tok), Some(state)) => {
-                    if let Some(text) = tok.step_decode(state, token_id)? {
-                        print!("{text}");
-                    }
-                }
-                _ => {
-                    print!(" {token_id}");
-                }
-            }
-        }
-        let _ = io::stdout().flush();
-        Ok((p_len, tokens.len()))
-    } else {
-        // Every platform (CPU, Metal without the greedy-argmax fast path,
-        // and native CUDA alike): stream via a worker thread so the main
-        // thread can decode and print tokens as they arrive (F14).
-        let (tx, rx) = std::sync::mpsc::channel::<u32>();
-        let p_len = prompt_tokens.len();
-        let count = std::thread::scope(|s| -> anyhow::Result<usize> {
-            let thread_tx = tx.clone();
-            let gen_handle = s.spawn(move || {
-                engine.generate_streaming_sync(prompt_tokens, max_tokens, &thread_tx)
-            });
-            drop(tx);
-
-            let mut stream_state = tok_bridge.map(|t| t.new_decode_stream(true));
-            let mut count = 0usize;
-            for token_id in rx {
-                count += 1;
-                match (tok_bridge, stream_state.as_mut()) {
-                    (Some(tok), Some(state)) => {
-                        if let Some(text) = tok.step_decode(state, token_id)? {
-                            print!("{text}");
-                        }
-                    }
-                    _ => {
-                        if count == 1 {
-                            print!("Tokens:");
-                        }
-                        print!(" {token_id}");
-                    }
-                }
-                let _ = io::stdout().flush();
-            }
-
-            match gen_handle.join() {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => return Err(e.into()),
-                Err(_) => return Err(anyhow::anyhow!("generation thread panicked")),
-            }
-            Ok(count)
-        })?;
-        Ok((p_len, count))
-    }
+/// Sampling configuration of the buffered constrained/stop loop.
+pub(crate) struct ConstrainedSampling {
+    pub(crate) params: SamplingParams,
+    pub(crate) seed: u64,
+    pub(crate) min_p: f32,
 }
 
 /// Grammar-constrained and/or stop-sequence-aware decode loop (cli-17).
 ///
-/// Deliberately a single, portable, token-by-token loop rather than
-/// threading `--grammar`/`--stop` through the fast path's
-/// Metal/CUDA/worker-thread specializations: both features are opt-in and
-/// already change the sampling procedure itself (masked logits for a
-/// grammar; early stop on a matched sequence), so reusing one
-/// straightforward implementation is far less risky than retrofitting
-/// three specialized fast paths to support both. Text is buffered and
-/// printed once generation ends (matched stop sequence, EOS, grammar
-/// completion, or `max_tokens`) rather than streamed live: this sidesteps
-/// the project's known "stop-sequence chunk-boundary leak" limitation
-/// entirely (the accumulated buffer covers the whole output, so
-/// `StopChecker` — the server's own hardened matcher, reused here rather
-/// than a second naive implementation — never sees a sequence split
-/// across print calls) at the cost of not streaming to the terminal.
+/// A single, portable, token-by-token loop rather than threading
+/// `--grammar`/`--stop` through the streaming fast paths: both features
+/// change the sampling procedure itself (masked logits for a grammar; early
+/// stop on a matched sequence). Output is buffered in `printer` and printed
+/// once generation ends, which sidesteps the stop-sequence chunk-boundary
+/// leak entirely (`StopChecker` always sees the whole accumulated text).
 ///
-/// Penalties (`--frequency-penalty`/`--presence-penalty`/
-/// `--repetition-penalty`) are never applied in this loop, with or without
-/// `--grammar`: every token is drawn via [`oxibonsai_runtime::InferenceEngine::sample`]
-/// (or, under `--grammar`, the constrained sampler's own minimal
-/// `SamplerChain` — temperature/top-k/top-p only), neither of which
-/// consults generated-token history the way `sample_with_history` does.
-/// `run`'s caller (`run::run`) refuses to reach this function at all when
-/// any penalty is non-default (see
-/// [`super::util::reject_penalties_with_constrained_decode`]), rather than
-/// silently accepting a flag it cannot honor.
+/// Tokens are drawn by the constrained sampler's own chain
+/// (temperature/top-k/min-p/top-p) under `--grammar`, else by a fresh
+/// [`Sampler`] seeded exactly like the engine's (same params, same seed,
+/// plus `min_p`) — never the engine's history-free `sample`, which cannot
+/// apply min-p. Penalties are refused on this path by the caller
+/// ([`reject_penalties_with_constrained_decode`]).
 #[allow(clippy::too_many_arguments)]
-fn run_constrained_or_stopped(
+pub(crate) fn run_constrained_or_stopped(
     engine: &mut oxibonsai_runtime::InferenceEngine<'_>,
     prompt_tokens: &[u32],
     max_tokens: usize,
     grammar_path: Option<&str>,
     stop: &[String],
     tok_bridge: Option<&oxibonsai_runtime::TokenizerBridge>,
-    seed: u64,
-    temperature: f32,
-    top_k: usize,
-    top_p: f32,
-) -> anyhow::Result<(usize, usize)> {
+    sampling: &ConstrainedSampling,
+    printer: &mut TokenPrinter<'_>,
+) -> anyhow::Result<usize> {
+    let grammar = grammar_path.map(load_grammar).transpose()?;
+    run_constrained_or_stopped_with(
+        engine,
+        prompt_tokens,
+        max_tokens,
+        grammar.as_ref(),
+        stop,
+        tok_bridge,
+        sampling,
+        printer,
+        &|| false,
+    )
+}
+
+/// [`run_constrained_or_stopped`] with an already-loaded grammar and a
+/// cancellation probe (`chat`'s Ctrl-C).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_constrained_or_stopped_with(
+    engine: &mut oxibonsai_runtime::InferenceEngine<'_>,
+    prompt_tokens: &[u32],
+    max_tokens: usize,
+    grammar: Option<&oxibonsai_runtime::Grammar>,
+    stop: &[String],
+    tok_bridge: Option<&oxibonsai_runtime::TokenizerBridge>,
+    sampling: &ConstrainedSampling,
+    printer: &mut TokenPrinter<'_>,
+    interrupted: &dyn Fn() -> bool,
+) -> anyhow::Result<usize> {
     engine.reset();
     let prompt_len = prompt_tokens.len();
     let mut logits = engine.prefill_from_pos(prompt_tokens, 0)?;
 
-    let mut constrained = match grammar_path {
-        Some(path) => Some(build_constrained_sampler(
-            path,
+    let mut constrained = grammar.map(|grammar| {
+        build_constrained_sampler_from_grammar(
+            grammar.clone(),
             tok_bridge,
             tok_bridge.map(|t| t.vocab_size()).unwrap_or(logits.len()),
-            seed,
-            temperature,
-            top_k,
-            top_p,
-        )?),
-        None => None,
-    };
+            sampling.seed,
+            sampling.params.temperature,
+            sampling.params.top_k,
+            sampling.params.top_p,
+            sampling.min_p,
+        )
+    });
+    let mut plain = generate::cli_sampler(
+        sampling.params.clone(),
+        sampling.seed,
+        PenaltyParams::default(),
+        sampling.min_p,
+    );
 
     let stop_checker = StopChecker::new(stop.to_vec());
-    let mut accumulated = String::new();
-    let mut stream_state = tok_bridge.map(|t| t.new_decode_stream(true));
     let mut generated = 0usize;
     let mut pos = prompt_len;
-
     while generated < max_tokens {
-        if logits.is_empty() {
+        if interrupted() || logits.is_empty() {
             break;
         }
         let token = match constrained.as_mut() {
             Some(cs) => cs.sample(&mut logits),
-            None => engine.sample(&logits)?,
+            None => plain.sample(&logits)?,
         };
-        if token == engine.eos_token_id() {
+        if engine.is_eos(token) {
             break;
         }
         generated += 1;
-        match (tok_bridge, stream_state.as_mut()) {
-            (Some(tok), Some(state)) => {
-                if let Some(text) = tok.step_decode(state, token)? {
-                    accumulated.push_str(&text);
-                }
-            }
-            _ => {
-                accumulated.push(' ');
-                accumulated.push_str(&token.to_string());
-            }
-        }
+        printer.push(token)?;
         if let Some(cs) = constrained.as_ref() {
             if cs.is_complete() {
                 break;
             }
         }
-        if !stop_checker.is_empty() && stop_checker.check(&accumulated) {
+        if !stop_checker.is_empty() && stop_checker.check(&printer.full_text()) {
             break;
         }
         logits = engine.decode_step(token, pos)?;
         pos += 1;
     }
-
-    let truncated = stop_checker.truncate_at_stop(&accumulated);
-    print!("{truncated}");
-    io::stdout().flush()?;
-    println!();
-
-    Ok((prompt_len, generated))
+    Ok(generated)
 }
 
 /// Load a grammar file: `.gbnf` is parsed as GBNF, any other extension is
-/// compiled as a JSON Schema.
-///
-/// `pub(crate)` (not `fn`-private): [`super::cmd_chat`] shares this and
-/// [`build_constrained_sampler_from_grammar`] rather than duplicating
-/// grammar loading, since a chat session needs to load the grammar file
-/// once but build a fresh [`oxibonsai_runtime::ConstrainedSampler`] (fresh
-/// recognizer state) for every turn.
+/// compiled as a JSON Schema. Shared with `chat`, which loads it once per
+/// session but builds a fresh constrained sampler (fresh recognizer state)
+/// every turn.
 pub(crate) fn load_grammar(path: &str) -> anyhow::Result<oxibonsai_runtime::Grammar> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("failed to read grammar file '{path}': {e}"))?;
@@ -668,42 +822,13 @@ pub(crate) fn load_grammar(path: &str) -> anyhow::Result<oxibonsai_runtime::Gram
     }
 }
 
-/// Build a [`oxibonsai_runtime::ConstrainedSampler`] enforcing `grammar_path`
-/// (single-shot convenience: loads the file and builds the sampler in one
-/// call, for `run`'s one-generation-per-process use).
-#[allow(clippy::too_many_arguments)]
-fn build_constrained_sampler(
-    grammar_path: &str,
-    tok: Option<&oxibonsai_runtime::TokenizerBridge>,
-    vocab_size: usize,
-    seed: u64,
-    temperature: f32,
-    top_k: usize,
-    top_p: f32,
-) -> anyhow::Result<oxibonsai_runtime::ConstrainedSampler> {
-    let grammar = load_grammar(grammar_path)?;
-    Ok(build_constrained_sampler_from_grammar(
-        grammar,
-        tok,
-        vocab_size,
-        seed,
-        temperature,
-        top_k,
-        top_p,
-    ))
-}
-
 /// Build a [`oxibonsai_runtime::ConstrainedSampler`] from an already-loaded
-/// [`oxibonsai_runtime::Grammar`] — the per-turn half `chat` uses, so a
-/// multi-turn session parses the grammar file only once.
+/// [`oxibonsai_runtime::Grammar`]: temperature → top-k → min-p → top-p
+/// (RT-23's llama.cpp/vLLM order), or greedy at temperature 0.
 ///
-/// Note this still pays `GrammarConstraint::new`'s eager "decode every id
-/// in `0..vocab_size`" cost on every call (fresh recognizer state is
-/// required per turn regardless): a real per-session cache of that decode
-/// table would need `GrammarConstraint` to expose a way to reset its
-/// recognizer without rebuilding the whole constraint, which it does not
-/// today. Correct, not maximally optimized — acceptable for an
-/// already-opt-in advanced feature.
+/// `GrammarConstraint::new` eagerly decodes every id in `0..vocab_size` once
+/// at construction; a per-session cache of that table would need
+/// `GrammarConstraint` to expose a recognizer reset, which it does not.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_constrained_sampler_from_grammar(
     grammar: oxibonsai_runtime::Grammar,
@@ -713,12 +838,10 @@ pub(crate) fn build_constrained_sampler_from_grammar(
     temperature: f32,
     top_k: usize,
     top_p: f32,
+    min_p: f32,
 ) -> oxibonsai_runtime::ConstrainedSampler {
-    // `GrammarConstraint::new` eagerly decodes every id in `0..vocab_size`
-    // exactly once at construction, so precomputing an owned lookup table
-    // up front (rather than capturing `tok` by reference in the closure)
-    // both satisfies the `Send + Sync + 'static` bound the constraint
-    // requires and avoids re-decoding on every `allowed_tokens` call.
+    // An owned lookup table satisfies the constraint's `Send + Sync +
+    // 'static` bound and avoids re-decoding on every `allowed_tokens` call.
     let id_to_bytes: Vec<Vec<u8>> = (0..vocab_size as u32)
         .map(|id| match tok {
             Some(t) => t
@@ -741,6 +864,9 @@ pub(crate) fn build_constrained_sampler_from_grammar(
         if top_k > 0 {
             chain = chain.add(oxibonsai_runtime::SamplerStep::TopK(top_k));
         }
+        if min_p > 0.0 {
+            chain = chain.add(oxibonsai_runtime::SamplerStep::MinP(min_p));
+        }
         if top_p < 1.0 {
             chain = chain.add(oxibonsai_runtime::SamplerStep::TopP(top_p));
         }
@@ -749,3 +875,13 @@ pub(crate) fn build_constrained_sampler_from_grammar(
 
     oxibonsai_runtime::ConstrainedSampler::new(chain, Box::new(constraint), vocab_size)
 }
+
+/// A fresh sampler seeded like the engine's own (kept `pub(crate)` for the
+/// per-session reuse in `chat`).
+pub(crate) fn session_sampler(load: &EngineLoad, min_p: f32) -> Sampler {
+    generate::cli_sampler(load.params.clone(), load.seed, load.penalties, min_p)
+}
+
+#[cfg(test)]
+#[path = "cmd_run_tests.rs"]
+mod tests;

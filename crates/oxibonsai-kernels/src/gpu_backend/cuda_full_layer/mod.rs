@@ -33,7 +33,7 @@
 
 use cudarc::driver::result as cudarc_result;
 use cudarc::driver::sys;
-use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, CudaView};
+use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -80,8 +80,9 @@ use super::cuda_graph_slot::{
 // Attention kernel launchers (extracted to keep this file under 2000 lines).
 mod launchers;
 use launchers::{
-    launch_batched_attn_scores_v2, launch_batched_attn_weighted_sum, launch_batched_softmax,
-    launch_fused_kv_store, launch_fused_qk_norm_rope,
+    launch_batched_attn_scores_v2, launch_batched_attn_weighted_sum,
+    launch_batched_attn_weighted_sum_view, launch_batched_softmax, launch_fused_kv_store,
+    launch_fused_qk_norm_rope,
 };
 
 // Q1 full-layer encode functions.
@@ -112,6 +113,14 @@ unsafe impl Sync for CudaAttnModules {}
 // =============================================================================
 // GPU KV cache
 // =============================================================================
+
+/// One `(keys, values)` pair per layer, in host memory as `f32` — what
+/// [`read_back_kv_cache`] returns and what the Q4_0/Q8_0
+/// (`try_cuda_prefill_q_std`), K-quant (`try_cuda_prefill_k_quant`) and FP8
+/// (`try_cuda_prefill_fp8_with_kv_readback`) batch-prefill entry points'
+/// trailing `kv_readback_out` parameter fills (finding **F6**). See
+/// [`read_back_kv_cache`] for the per-layer element order.
+pub type KvReadback = Vec<(Vec<f32>, Vec<f32>)>;
 
 /// GPU-resident KV cache stored in FP16 to save VRAM.
 ///
@@ -158,6 +167,176 @@ impl CudaKvCache {
             && self.max_seq == max_seq
             && self.head_dim == head_dim
     }
+}
+
+/// Read back `[pos_start, pos_start + batch_size)` of every layer's K/V
+/// cache into host memory, converting the stored `f16` bit pattern to `f32`
+/// (finding **F6**).
+///
+/// The Q4_0/Q8_0, K-quant and FP8 CUDA batch-prefill paths each drive a
+/// GPU-private device KV cache while decode for those families attends over
+/// the host `KvCache` (see `oxibonsai-model`'s
+/// `forward_cuda::cuda_split_prefill_disabled`). This hands the prompt's
+/// K/V back so the model side can write it into that host cache
+/// (`KvCache::try_inject_block`, whose `[head][position][dim]` block layout
+/// is exactly this function's per-layer order).
+///
+/// Returns one `(keys, values)` pair per layer (`0..kv.n_layers`); each of
+/// `keys`/`values` is `[n_kv * batch_size * head_dim]` f32, laid out
+/// `[kv_head][batch position][head_dim element]` (the device cache's own
+/// per-head slab order — see [`CudaKvCache`]'s doc and
+/// `cuda_attn_kernels::fused_kv_store`'s write-side indexing, which this
+/// read-side layout mirrors), so position `t`'s `head_dim`-wide vector for
+/// head `h` is `data[(h * batch_size + t) * head_dim..][..head_dim]`.
+///
+/// Copies only the requested window: one `memcpy_dtoh` per `(layer,
+/// kv_head)` pair (`n_layers * n_kv` calls total, each `batch_size *
+/// head_dim` elements), not the whole cache — a real context can hold far
+/// more than one prefill chunk's worth of positions, so a whole-cache copy
+/// would allocate gigabytes of host memory per call at long contexts.
+///
+/// **CUDA is unvalidated**: no CUDA hardware has run this read-back.
+///
+/// # Errors
+/// [`CudaGraphError::InvalidDimensions`] when `pos_start + batch_size`
+/// overflows or exceeds `kv.max_seq`; [`CudaGraphError::DriverError`] when
+/// a device copy or the synchronise call fails.
+///
+/// # Safety
+/// `graph` must be the context `kv`'s buffers were allocated on, and no
+/// other thread may be concurrently writing `kv.k_cache` / `kv.v_cache`.
+pub unsafe fn read_back_kv_cache(
+    graph: &CudaGraph,
+    kv: &CudaKvCache,
+    pos_start: usize,
+    batch_size: usize,
+) -> Result<KvReadback, CudaGraphError> {
+    if batch_size == 0 || kv.n_layers == 0 {
+        return Ok(vec![(Vec::new(), Vec::new()); kv.n_layers]);
+    }
+    kv_window_end("read_back_kv_cache", pos_start, batch_size, kv.max_seq)?;
+
+    let hd = kv.head_dim;
+    let per_head = kv.max_seq * hd;
+    let window_len = batch_size * hd;
+    let window_start = pos_start * hd;
+    let stream = graph.stream_arc();
+    let mut out = Vec::with_capacity(kv.n_layers);
+    for layer in 0..kv.n_layers {
+        let layer_off = kv.layer_offset_elements(layer) as usize;
+        let mut key_bits = vec![0u16; kv.n_kv * window_len];
+        let mut value_bits = vec![0u16; kv.n_kv * window_len];
+        for head in 0..kv.n_kv {
+            let start = layer_off + head * per_head + window_start;
+            let dst = head * window_len..(head + 1) * window_len;
+            let k_view = kv.k_cache.slice(start..start + window_len);
+            stream
+                .memcpy_dtoh(&k_view, &mut key_bits[dst.clone()])
+                .map_err(|e| {
+                    CudaGraphError::DriverError(format!(
+                        "read_back_kv_cache k layer={layer} head={head}: {e}"
+                    ))
+                })?;
+            let v_view = kv.v_cache.slice(start..start + window_len);
+            stream
+                .memcpy_dtoh(&v_view, &mut value_bits[dst])
+                .map_err(|e| {
+                    CudaGraphError::DriverError(format!(
+                        "read_back_kv_cache v layer={layer} head={head}: {e}"
+                    ))
+                })?;
+        }
+        out.push((key_bits, value_bits));
+    }
+    // `memcpy_dtoh` queues an async copy; synchronise once, after every
+    // layer's copies are queued, rather than per copy.
+    stream
+        .synchronize()
+        .map_err(|e| CudaGraphError::DriverError(format!("read_back_kv_cache sync: {e}")))?;
+
+    Ok(out
+        .into_iter()
+        .map(|(k_bits, v_bits): (Vec<u16>, Vec<u16>)| {
+            let to_f32 = |bits: Vec<u16>| -> Vec<f32> {
+                bits.into_iter()
+                    .map(|b| half::f16::from_bits(b).to_f32())
+                    .collect()
+            };
+            (to_f32(k_bits), to_f32(v_bits))
+        })
+        .collect())
+}
+
+/// `pos_start + batch_size`, refused as [`CudaGraphError::InvalidDimensions`]
+/// when it overflows or the window `[pos_start, pos_start + batch_size)`
+/// does not fit in a `max_seq`-position KV cache.
+fn kv_window_end(
+    what: &str,
+    pos_start: usize,
+    batch_size: usize,
+    max_seq: usize,
+) -> Result<usize, CudaGraphError> {
+    let end = pos_start.checked_add(batch_size).ok_or_else(|| {
+        CudaGraphError::InvalidDimensions(format!(
+            "{what}: pos_start {pos_start} + batch_size {batch_size} overflows"
+        ))
+    })?;
+    if end > max_seq {
+        return Err(CudaGraphError::InvalidDimensions(format!(
+            "{what}: window [{pos_start}, {end}) exceeds max_seq {max_seq}"
+        )));
+    }
+    Ok(end)
+}
+
+/// Refuse a batch-prefill call whose host inputs cannot describe
+/// `batch_size` tokens at `[pos_start, pos_start + batch_size)` of a
+/// `max_seq`-position KV cache — checked by the Q4_0/Q8_0, K-quant and FP8
+/// batch-prefill entry points before any device work.
+///
+/// A window past `max_seq` would make `fused_kv_store` write outside its
+/// layer's slab of the device cache (and [`read_back_kv_cache`] would only
+/// notice after the fact); a `hidden_batch` shorter than `batch_size *
+/// hidden_size`, or RoPE tables shorter than `batch_size * head_dim / 2`,
+/// would make the host-side transpose or the per-token RoPE slice panic.
+///
+/// # Errors
+/// [`CudaGraphError::InvalidDimensions`] naming the first violated bound.
+#[allow(clippy::too_many_arguments)]
+pub fn check_batch_prefill_inputs(
+    what: &str,
+    pos_start: usize,
+    batch_size: usize,
+    max_seq: usize,
+    hidden_batch_len: usize,
+    hidden_size: usize,
+    rope_table_lens: (usize, usize),
+    head_dim: usize,
+) -> Result<(), CudaGraphError> {
+    kv_window_end(what, pos_start, batch_size, max_seq)?;
+    let overflow =
+        |name: &str| CudaGraphError::InvalidDimensions(format!("{what}: {name} size overflows"));
+    let hidden_need = batch_size
+        .checked_mul(hidden_size)
+        .ok_or_else(|| overflow("hidden batch"))?;
+    if hidden_batch_len < hidden_need {
+        return Err(CudaGraphError::InvalidDimensions(format!(
+            "{what}: hidden batch has {hidden_batch_len} elements, need {batch_size} x \
+             {hidden_size} = {hidden_need}"
+        )));
+    }
+    let rope_need = batch_size
+        .checked_mul(head_dim / 2)
+        .ok_or_else(|| overflow("RoPE table"))?;
+    let (cos_len, sin_len) = rope_table_lens;
+    if cos_len < rope_need || sin_len < rope_need {
+        return Err(CudaGraphError::InvalidDimensions(format!(
+            "{what}: RoPE tables have cos={cos_len} sin={sin_len} elements, need \
+             {batch_size} x {} = {rope_need}",
+            head_dim / 2
+        )));
+    }
+    Ok(())
 }
 
 // =============================================================================
@@ -1001,14 +1180,13 @@ pub(super) fn acquire_kv_cache(
         // F4: this was `n_layers * n_kv * max_seq * head_dim` in `usize` with
         // no overflow check at all, so an absurd `--max-seq-len` could wrap
         // before `alloc_zeros` ever saw it and silently allocate a cache far
-        // smaller than every later index assumes.
-        // `CudaGraphError` has no `InvalidDimensions` variant and
-        // `cuda_graph/types.rs` is outside this package's file grant, so the
-        // rejection travels as a prefixed `DriverError` (see deviations).
-        // CUDA is unvalidated: this host has no CUDA hardware, so the check
-        // below has only ever been exercised as plain host-side arithmetic.
+        // smaller than every later index assumes. A geometry that is zero or
+        // overflows is refused as `InvalidDimensions` before any allocation.
+        // CUDA is unvalidated: no CUDA hardware has run this allocation; the
+        // check itself is plain host arithmetic, unit-tested in
+        // `cuda_device_negotiation`.
         let total_elements = check_cuda_kv_cache_geometry(n_layers, n_kv, max_seq, head_dim)
-            .map_err(|e| CudaGraphError::DriverError(format!("invalid KV geometry: {e}")))?
+            .map_err(|e| CudaGraphError::InvalidDimensions(format!("KV cache geometry: {e}")))?
             as usize;
 
         let k_cache = graph
@@ -1085,7 +1263,10 @@ impl CudaPrefillRopeChunk {
     /// built by the model side.
     ///
     /// # Errors
-    /// Mismatched table lengths, or a device allocation / copy failure.
+    /// [`CudaGraphError::InvalidDimensions`] for an overflowing chunk size or
+    /// RoPE tables shorter than `n_tokens * half_dim`;
+    /// [`CudaGraphError::DriverError`] for a device allocation / copy
+    /// failure.
     fn upload(
         &mut self,
         graph: &CudaGraph,
@@ -1096,12 +1277,12 @@ impl CudaPrefillRopeChunk {
         sin_table: &[f32],
     ) -> Result<(), CudaGraphError> {
         let need = n_tokens.checked_mul(half_dim).ok_or_else(|| {
-            CudaGraphError::DriverError(format!(
+            CudaGraphError::InvalidDimensions(format!(
                 "prefill rope chunk: n_tokens {n_tokens} x half_dim {half_dim} overflows"
             ))
         })?;
         if cos_table.len() < need || sin_table.len() < need {
-            return Err(CudaGraphError::DriverError(format!(
+            return Err(CudaGraphError::InvalidDimensions(format!(
                 "prefill rope chunk: need {need} RoPE elements for {n_tokens} tokens at \
                  half_dim {half_dim}, got cos={} sin={}",
                 cos_table.len(),
@@ -1112,7 +1293,7 @@ impl CudaPrefillRopeChunk {
             let tokens = n_tokens.max(self.capacity_tokens);
             let hd = half_dim.max(self.capacity_half_dim);
             let rope_len = tokens.checked_mul(hd).ok_or_else(|| {
-                CudaGraphError::DriverError(format!(
+                CudaGraphError::InvalidDimensions(format!(
                     "prefill rope chunk: capacity {tokens} x {hd} overflows"
                 ))
             })?;
@@ -1163,13 +1344,14 @@ impl CudaPrefillRopeChunk {
     /// Per-token device views into the uploaded chunk.
     ///
     /// # Errors
-    /// `t` outside the last uploaded chunk.
+    /// [`CudaGraphError::InvalidDimensions`] for `t` outside the last
+    /// uploaded chunk.
     pub fn token(&self, t: usize) -> Result<AttnTokenInputs<'_>, CudaGraphError> {
         // The index arithmetic lives in the ungated
         // `gpu_backend::cuda_device_negotiation` so it is unit-tested on hosts
         // that cannot compile this module.
         let (pos, rope) = prefill_chunk_token_ranges(t, self.n_tokens, self.half_dim)
-            .map_err(CudaGraphError::DriverError)?;
+            .map_err(CudaGraphError::InvalidDimensions)?;
         Ok(AttnTokenInputs {
             d_pos_seqlen: self.d_pos_seqlen.slice(pos),
             d_cos: self.d_cos.slice(rope.clone()),
@@ -1201,15 +1383,17 @@ pub struct AttnTokenInputs<'a> {
 /// Three uploads per layer is already the whole of the finding — it replaces
 /// `3 x n_tokens` of them — and it cannot go stale.
 ///
-/// Spec-accurate accounting: `encode_prefill_layer` (the only caller, in the
-/// unowned `cuda_prefill` module) calls this once per layer, so one chunk's
-/// full prefill issues `3 x n_layers` uploads here, not the `3` a true
-/// per-chunk memoisation would give. Closing that gap needs a chunk epoch
-/// threaded down from the prefill loop (see the package's recorded
-/// deviations); this function's contract does not change either way.
+/// Accounting: the Q1 and TQ2 prefill layer encoders (`cuda_prefill::
+/// encode_prefill_layer` / `encode_prefill_layer_ternary`) call this once per
+/// layer, so one chunk's full prefill issues `3 x n_layers` uploads here, not
+/// the `3` a per-chunk memoisation would give. Memoising across layers would
+/// need a chunk identity threaded down from the prefill loop that also
+/// distinguishes models, which the `(pos_start, n_tokens, half_dim)` key above
+/// cannot; this function's contract does not change either way.
 ///
 /// # Errors
-/// Lock poisoning, or any allocation / copy failure.
+/// Lock poisoning, an invalid chunk geometry, or any allocation / copy
+/// failure.
 pub(super) fn acquire_prefill_rope_chunk(
     graph: &CudaGraph,
     pos_start: usize,
@@ -1251,12 +1435,24 @@ pub(super) fn acquire_prefill_rope_chunk(
 }
 
 // =============================================================================
-// encode_attn_phase
+// encode_attn_phase / encode_attn_phase_tq2
 // =============================================================================
 
-/// Encode the full attention sublayer on the CUDA stream (steps 1-7).
+/// Which fused-QKV GEMV kernel step 2 of [`encode_attn_phase_with`] launches.
+#[derive(Clone, Copy)]
+enum AttnQkvGemv {
+    /// `Q1_0_g128` SoA weights (`launch_gemv_pub`).
+    Q1,
+    /// `TQ2_0_g128` SoA weights (`launch_gemv_tq2_v1_pub`).
+    Tq2,
+}
+
+/// Encode the full attention sublayer on the CUDA stream (steps 1-7), with
+/// the `Q1_0_g128` fused-QKV GEMV in step 2.
 ///
-/// On return `bufs.d_attn_out` holds `[nq * head_dim]` attention output values.
+/// On return the `[nq * head_dim]` attention output is in `bufs.d_attn_out`
+/// — or in `attn_out` when that is `Some`, in which case `bufs.d_attn_out`
+/// is left untouched.
 ///
 /// `token` selects where the position pair and the RoPE tables come from
 /// (finding **F9**):
@@ -1265,6 +1461,16 @@ pub(super) fn acquire_prefill_rope_chunk(
 /// - `Some(..)` — the batch-prefill path: views into the chunk-resident
 ///   buffers of [`CudaPrefillRopeChunk`], uploaded once per layer for all
 ///   tokens instead of once per token.
+///
+/// `hidden_in` and `attn_out` (finding **F9**'s last two per-token copies)
+/// let a batch-prefill caller point step 1's RMSNorm input and step 7's
+/// weighted-sum output straight at this token's columns of its own batched
+/// buffers (`pb.d_input` / `pb.d_attn_out`), instead of `memcpy_dtod`-ing
+/// the token into `bufs.d_hidden` and the result back out of
+/// `bufs.d_attn_out`. `None` for both keeps the decode path's shape: read
+/// `bufs.d_hidden`, write `bufs.d_attn_out`.
+///
+/// **CUDA is unvalidated**: no CUDA hardware has run this encoder.
 ///
 /// # Safety
 /// The function launches CUDA kernels.  The caller must ensure all GPU state
@@ -1288,9 +1494,116 @@ pub unsafe fn encode_attn_phase(
     hidden_size: usize,
     bufs: &mut CudaFullLayerBuffers,
     token: Option<&AttnTokenInputs<'_>>,
+    hidden_in: Option<&CudaView<'_, f32>>,
+    attn_out: Option<&mut CudaViewMut<'_, f32>>,
+) -> Result<(), CudaGraphError> {
+    encode_attn_phase_with(
+        AttnQkvGemv::Q1,
+        graph,
+        mods,
+        d_pre_norm_weight,
+        d_fused_qkv_weight,
+        d_q_norm_weight,
+        d_k_norm_weight,
+        kv,
+        layer_idx,
+        nq,
+        nkv,
+        head_dim,
+        heads_per_group,
+        norm_eps,
+        hidden_size,
+        bufs,
+        token,
+        hidden_in,
+        attn_out,
+    )
+}
+
+/// [`encode_attn_phase`] with the `TQ2_0_g128` fused-QKV GEMV
+/// (`graph.launch_gemv_tq2_v1_pub`) in step 2 — the ternary prefill path
+/// (`encode_prefill_layer_ternary`) runs its sequential per-token attention
+/// through this. `token`, `hidden_in` and `attn_out` mean exactly what they
+/// mean there.
+///
+/// **CUDA is unvalidated**: no CUDA hardware has run this encoder.
+///
+/// # Safety
+/// The function launches CUDA kernels.  The caller must ensure all GPU state
+/// is valid and the stream is not concurrently used.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn encode_attn_phase_tq2(
+    graph: &CudaGraph,
+    mods: &CudaAttnModules,
+    d_pre_norm_weight: &CudaSlice<f32>,
+    d_fused_qkv_weight: &Arc<CudaSlice<u8>>,
+    d_q_norm_weight: &CudaSlice<f32>,
+    d_k_norm_weight: &CudaSlice<f32>,
+    kv: &mut CudaKvCache,
+    layer_idx: usize,
+    nq: usize,
+    nkv: usize,
+    head_dim: usize,
+    heads_per_group: usize,
+    norm_eps: f32,
+    hidden_size: usize,
+    bufs: &mut CudaFullLayerBuffers,
+    token: Option<&AttnTokenInputs<'_>>,
+    hidden_in: Option<&CudaView<'_, f32>>,
+    attn_out: Option<&mut CudaViewMut<'_, f32>>,
+) -> Result<(), CudaGraphError> {
+    encode_attn_phase_with(
+        AttnQkvGemv::Tq2,
+        graph,
+        mods,
+        d_pre_norm_weight,
+        d_fused_qkv_weight,
+        d_q_norm_weight,
+        d_k_norm_weight,
+        kv,
+        layer_idx,
+        nq,
+        nkv,
+        head_dim,
+        heads_per_group,
+        norm_eps,
+        hidden_size,
+        bufs,
+        token,
+        hidden_in,
+        attn_out,
+    )
+}
+
+/// The one body behind [`encode_attn_phase`] and [`encode_attn_phase_tq2`]:
+/// the two differ only in step 2's GEMV kernel, so every other step (and
+/// every F9 view routing) is written once here.
+///
+/// # Safety
+/// As [`encode_attn_phase`].
+#[allow(clippy::too_many_arguments)]
+unsafe fn encode_attn_phase_with(
+    qkv_gemv: AttnQkvGemv,
+    graph: &CudaGraph,
+    mods: &CudaAttnModules,
+    d_pre_norm_weight: &CudaSlice<f32>,
+    d_fused_qkv_weight: &Arc<CudaSlice<u8>>,
+    d_q_norm_weight: &CudaSlice<f32>,
+    d_k_norm_weight: &CudaSlice<f32>,
+    kv: &mut CudaKvCache,
+    layer_idx: usize,
+    nq: usize,
+    nkv: usize,
+    head_dim: usize,
+    heads_per_group: usize,
+    norm_eps: f32,
+    hidden_size: usize,
+    bufs: &mut CudaFullLayerBuffers,
+    token: Option<&AttnTokenInputs<'_>>,
+    hidden_in: Option<&CudaView<'_, f32>>,
+    attn_out: Option<&mut CudaViewMut<'_, f32>>,
 ) -> Result<(), CudaGraphError> {
     let h_u32 = hidden_size as u32;
-
     let nq_u32 = nq as u32;
     let nkv_u32 = nkv as u32;
     let hd_u32 = head_dim as u32;
@@ -1310,23 +1623,42 @@ pub unsafe fn encode_attn_phase(
         None => (&fallback_pos, &fallback_cos, &fallback_sin),
     };
 
-    // Step 1: RMSNorm(d_hidden, norm_weight -> d_normed)
-    graph.launch_rmsnorm_pub(
-        &bufs.d_hidden,
-        d_pre_norm_weight,
-        &mut bufs.d_normed,
-        h_u32,
-        norm_eps,
-    )?;
+    // Step 1: RMSNorm(hidden, norm_weight -> d_normed). `hidden_in` routes
+    // this at a caller-owned view (F9) instead of the scratch `bufs.d_hidden`.
+    match hidden_in {
+        Some(view) => graph.launch_rmsnorm_pub_view(
+            view,
+            d_pre_norm_weight,
+            &mut bufs.d_normed,
+            h_u32,
+            norm_eps,
+        ),
+        None => graph.launch_rmsnorm_pub(
+            &bufs.d_hidden,
+            d_pre_norm_weight,
+            &mut bufs.d_normed,
+            h_u32,
+            norm_eps,
+        ),
+    }?;
 
-    // Step 2: Fused QKV GEMV (normed -> d_qkv)
-    graph.launch_gemv_pub(
-        d_fused_qkv_weight,
-        &bufs.d_normed,
-        &mut bufs.d_qkv,
-        qkv_total_rows,
-        h_u32,
-    )?;
+    // Step 2: Fused QKV GEMV (normed -> d_qkv), in the weights' own format.
+    match qkv_gemv {
+        AttnQkvGemv::Q1 => graph.launch_gemv_pub(
+            d_fused_qkv_weight,
+            &bufs.d_normed,
+            &mut bufs.d_qkv,
+            qkv_total_rows,
+            h_u32,
+        ),
+        AttnQkvGemv::Tq2 => graph.launch_gemv_tq2_v1_pub(
+            d_fused_qkv_weight,
+            &bufs.d_normed,
+            &mut bufs.d_qkv,
+            qkv_total_rows,
+            h_u32,
+        ),
+    }?;
 
     // Step 3: Fused QK-Norm + RoPE
     // Q occupies elements [0 .. nq*head_dim] in d_qkv.
@@ -1394,169 +1726,39 @@ pub unsafe fn encode_attn_phase(
         d_pos_seqlen,
     )?;
 
-    // Step 7: Weighted sum — seq_len read from d_pos_seqlen[1]
-    launch_batched_attn_weighted_sum(
-        graph,
-        mods,
-        &bufs.d_scores,
-        &kv.v_cache,
-        &mut bufs.d_attn_out,
-        hd_u32,
-        nq_u32,
-        nkv_u32,
-        heads_per_group_u32,
-        max_seq_u32,
-        d_pos_seqlen,
-        layer_offset,
-    )
-}
-
-// =============================================================================
-// encode_attn_phase_tq2
-// =============================================================================
-
-/// Encode the full attention sublayer using TQ2 (ternary) QKV GEMV on the CUDA stream (steps 1-7).
-///
-/// Identical to `encode_attn_phase` but uses `graph.launch_gemv_tq2_v1_pub` for step 2
-/// instead of `graph.launch_gemv_pub` (Q1). Required by the ternary prefill path
-/// (`encode_prefill_layer_ternary`) which runs sequential per-token attention with TQ2 weights.
-///
-/// On return `bufs.d_attn_out` holds `[nq * head_dim]` attention output values.
-///
-/// # Safety
-/// The function launches CUDA kernels.  The caller must ensure all GPU state
-/// is valid and the stream is not concurrently used.
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn encode_attn_phase_tq2(
-    graph: &CudaGraph,
-    mods: &CudaAttnModules,
-    d_pre_norm_weight: &CudaSlice<f32>,
-    d_fused_qkv_weight: &Arc<CudaSlice<u8>>,
-    d_q_norm_weight: &CudaSlice<f32>,
-    d_k_norm_weight: &CudaSlice<f32>,
-    kv: &mut CudaKvCache,
-    layer_idx: usize,
-    nq: usize,
-    nkv: usize,
-    head_dim: usize,
-    heads_per_group: usize,
-    norm_eps: f32,
-    hidden_size: usize,
-    bufs: &mut CudaFullLayerBuffers,
-) -> Result<(), CudaGraphError> {
-    let h_u32 = hidden_size as u32;
-    let nq_u32 = nq as u32;
-    let nkv_u32 = nkv as u32;
-    let hd_u32 = head_dim as u32;
-    let qkv_total_rows = (nq * head_dim + 2 * nkv * head_dim) as u32;
-    let heads_per_group_u32 = heads_per_group as u32;
-    let max_seq_u32 = bufs.max_seq as u32;
-    let inv_sqrt_hd = 1.0f32 / (head_dim as f32).sqrt();
-    let layer_offset = kv.layer_offset_elements(layer_idx);
-    // F9: the launchers take device views so the prefill path can point them
-    // at chunk-resident buffers; this entry point always uses the single-token
-    // scratch slots.
-    let d_pos_seqlen = &bufs.d_pos_seqlen.slice(0..);
-    let d_cos = &bufs.d_cos.slice(0..);
-    let d_sin = &bufs.d_sin.slice(0..);
-
-    // Step 1: RMSNorm(d_hidden, norm_weight -> d_normed)
-    graph.launch_rmsnorm_pub(
-        &bufs.d_hidden,
-        d_pre_norm_weight,
-        &mut bufs.d_normed,
-        h_u32,
-        norm_eps,
-    )?;
-
-    // Step 2: Fused QKV TQ2 GEMV (normed -> d_qkv)
-    graph.launch_gemv_tq2_v1_pub(
-        d_fused_qkv_weight,
-        &bufs.d_normed,
-        &mut bufs.d_qkv,
-        qkv_total_rows,
-        h_u32,
-    )?;
-
-    // Step 3: Fused QK-Norm + RoPE
-    let k_offset = nq * head_dim;
-    let k_in_view = bufs.d_qkv.slice(k_offset..);
-    launch_fused_qk_norm_rope(
-        graph,
-        mods,
-        &bufs.d_qkv,
-        &k_in_view,
-        &mut bufs.d_q_rope,
-        &mut bufs.d_k_rope,
-        d_q_norm_weight,
-        d_k_norm_weight,
-        d_cos,
-        d_sin,
-        nq_u32,
-        nkv_u32,
-        hd_u32,
-        norm_eps,
-    )?;
-
-    // Step 4: Fused KV-Store — pos read from d_pos_seqlen[0] by the kernel
-    let v_offset = (nq + nkv) * head_dim;
-    let v_view = bufs.d_qkv.slice(v_offset..);
-    launch_fused_kv_store(
-        graph,
-        mods,
-        &bufs.d_k_rope,
-        &v_view,
-        &mut kv.k_cache,
-        &mut kv.v_cache,
-        hd_u32,
-        nkv_u32,
-        max_seq_u32,
-        d_pos_seqlen,
-        layer_offset,
-    )?;
-
-    // Step 5: Batched attention scores V2 — seq_len read from d_pos_seqlen[1]
-    launch_batched_attn_scores_v2(
-        graph,
-        mods,
-        &bufs.d_q_rope,
-        &kv.k_cache,
-        &mut bufs.d_scores,
-        hd_u32,
-        nq_u32,
-        nkv_u32,
-        heads_per_group_u32,
-        max_seq_u32,
-        d_pos_seqlen,
-        inv_sqrt_hd,
-        layer_offset,
-    )?;
-
-    // Step 6: Softmax — seq_len read from d_pos_seqlen[1]
-    launch_batched_softmax(
-        graph,
-        mods,
-        &mut bufs.d_scores,
-        nq_u32,
-        max_seq_u32,
-        d_pos_seqlen,
-    )?;
-
-    // Step 7: Weighted sum — seq_len read from d_pos_seqlen[1]
-    launch_batched_attn_weighted_sum(
-        graph,
-        mods,
-        &bufs.d_scores,
-        &kv.v_cache,
-        &mut bufs.d_attn_out,
-        hd_u32,
-        nq_u32,
-        nkv_u32,
-        heads_per_group_u32,
-        max_seq_u32,
-        d_pos_seqlen,
-        layer_offset,
-    )
+    // Step 7: Weighted sum — seq_len read from d_pos_seqlen[1]. `attn_out`
+    // routes this at a caller-owned view (F9) instead of the scratch
+    // `bufs.d_attn_out`.
+    match attn_out {
+        Some(view) => launch_batched_attn_weighted_sum_view(
+            graph,
+            mods,
+            &bufs.d_scores,
+            &kv.v_cache,
+            view,
+            hd_u32,
+            nq_u32,
+            nkv_u32,
+            heads_per_group_u32,
+            max_seq_u32,
+            d_pos_seqlen,
+            layer_offset,
+        ),
+        None => launch_batched_attn_weighted_sum(
+            graph,
+            mods,
+            &bufs.d_scores,
+            &kv.v_cache,
+            &mut bufs.d_attn_out,
+            hd_u32,
+            nq_u32,
+            nkv_u32,
+            heads_per_group_u32,
+            max_seq_u32,
+            d_pos_seqlen,
+            layer_offset,
+        ),
+    }
 }
 
 // =============================================================================

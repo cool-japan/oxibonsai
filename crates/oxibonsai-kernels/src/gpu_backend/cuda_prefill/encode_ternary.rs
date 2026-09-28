@@ -10,10 +10,11 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::{CudaSlice, CudaView};
+use cudarc::driver::{CudaSlice, CudaView, CudaViewMut};
 
 use crate::gpu_backend::cuda_full_layer::{
-    encode_attn_phase_tq2, CudaAttnModules, CudaFullLayerBuffers, CudaKvCache,
+    acquire_prefill_rope_chunk, encode_attn_phase_tq2, CudaAttnModules, CudaFullLayerBuffers,
+    CudaKvCache,
 };
 use crate::gpu_backend::cuda_graph::{CudaGraph, CudaGraphError};
 
@@ -145,7 +146,8 @@ pub(super) unsafe fn encode_prefill_layer_ternary(
     // ════════════════════════════════════════════════════════════════════
     // Attention QKV projection is computed PER TOKEN inside
     // `encode_attn_phase_tq2` (which runs its own RMSNorm + TQ2 fused-QKV GEMV
-    // on `st_bufs.d_hidden`).  A batched attn-RMSNorm + batched-TQ2-QKV GEMM was
+    // on this token's column of `pb.d_input`).  A batched attn-RMSNorm +
+    // batched-TQ2-QKV GEMM was
     // previously run here into `pb.d_normed` / `pb.d_qkv`, but those outputs were
     // never consumed by the per-token attention loop below — they were pure
     // wasted device work (see finding: "batched prefill QKV GEMM discarded").
@@ -157,12 +159,28 @@ pub(super) unsafe fn encode_prefill_layer_ternary(
     // Sequential attention for each token (TQ2-aware)
     //
     // For each token t at sequence position (pos_start + t):
-    //   a) Copy this token's hidden state into st_bufs.d_hidden
-    //   b) Upload pos/seqlen to st_bufs.d_pos_seqlen
-    //   c) Upload RoPE cos/sin for this token's position
-    //   d) Call encode_attn_phase_tq2: runs rmsnorm + TQ2 QKV GEMV +
-    //      qk-norm+rope + kv-store + scores + softmax + weighted sum
-    //   e) Copy attention output for this token → pb.d_attn_out column t
+    //   a) Read this token's [pos, pos+1] / RoPE cos / RoPE sin from the
+    //      chunk-resident upload below (finding F9)
+    //   b) Call encode_attn_phase_tq2: runs rmsnorm + TQ2 QKV GEMV +
+    //      qk-norm+rope + kv-store + scores + softmax + weighted sum,
+    //      reading this token's hidden state from and writing its attention
+    //      output directly into columns of pb.d_input / pb.d_attn_out
+    //
+    // F9 — copy count. Naively, each token here would need five sub-kilobyte
+    // transfers: three host-to-device uploads of `[pos, pos+1]` / cos / sin,
+    // plus a device-to-device copy in and out of `encode_attn_phase_tq2`'s
+    // scratch slots (`st_bufs.d_hidden` / `st_bufs.d_attn_out`). This
+    // function runs once per layer and loops over every token inside, so all
+    // five would also repeat `n_layers` times over. The three uploads are
+    // one chunk upload each, hoisted out of the loop
+    // (`acquire_prefill_rope_chunk`), with the per-token attention reading
+    // device views into that buffer — mirroring the Q1 prefill path's
+    // identical fix. The remaining two device-to-device copies are
+    // eliminated the same way: `encode_attn_phase_tq2`'s `hidden_in` /
+    // `attn_out` parameters point steps 1 and 7 straight at this token's
+    // column of `pb.d_input` / `pb.d_attn_out`, so `st_bufs.d_hidden` /
+    // `st_bufs.d_attn_out` are never touched by batch prefill at all — they
+    // stay this buffer set's decode-path scratch slots.
     // ════════════════════════════════════════════════════════════════════
     {
         let n = bs * nq * hd;
@@ -173,43 +191,25 @@ pub(super) unsafe fn encode_prefill_layer_ternary(
             .map_err(|e| CudaGraphError::DriverError(format!("zero d_attn_out tq2: {e}")))?;
     }
 
+    // F9: one upload of the whole chunk's positions and RoPE tables,
+    // replacing `3 x bs` per-token uploads.
+    let mut chunk_guard =
+        acquire_prefill_rope_chunk(graph, pos_start, bs, half_dim, cos_table, sin_table)?;
+    let chunk = chunk_guard.as_mut().ok_or_else(|| {
+        CudaGraphError::DriverError("prefill rope chunk missing after upload (tq2)".to_string())
+    })?;
+
     for t in 0..bs {
-        let pos = pos_start + t;
+        // Views into the chunk upload: `[pos, pos+1]` plus this token's RoPE
+        // cosines and sines.
+        let token_inputs = chunk.token(t)?;
 
-        // Copy token t's hidden state column into st_bufs.d_hidden
-        {
-            let src_view: CudaView<f32> = pb.d_input.slice(t * h..(t + 1) * h);
-            graph
-                .stream_arc()
-                .memcpy_dtod(&src_view, &mut st_bufs.d_hidden)
-                .map_err(|e| CudaGraphError::DriverError(format!("copy hidden tq2 t={t}: {e}")))?;
-        }
-
-        // Upload pos/seqlen [pos, pos+1] into st_bufs.d_pos_seqlen
-        let pos_seqlen = [pos as u32, (pos + 1) as u32];
-        graph
-            .stream_arc()
-            .memcpy_htod(&pos_seqlen, &mut st_bufs.d_pos_seqlen)
-            .map_err(|e| {
-                CudaGraphError::DriverError(format!("upload pos_seqlen tq2 t={t}: {e}"))
-            })?;
-
-        // Upload RoPE cos/sin for this token's position.
-        let rope_off = t * half_dim;
-        graph
-            .stream_arc()
-            .memcpy_htod(
-                &cos_table[rope_off..rope_off + half_dim],
-                &mut st_bufs.d_cos,
-            )
-            .map_err(|e| CudaGraphError::DriverError(format!("upload cos tq2 t={t}: {e}")))?;
-        graph
-            .stream_arc()
-            .memcpy_htod(
-                &sin_table[rope_off..rope_off + half_dim],
-                &mut st_bufs.d_sin,
-            )
-            .map_err(|e| CudaGraphError::DriverError(format!("upload sin tq2 t={t}: {e}")))?;
+        // This token's hidden-state column and attention-output column,
+        // read/written in place (F9) — no per-token device-to-device copy
+        // either side.
+        let hidden_view: CudaView<f32> = pb.d_input.slice(t * h..(t + 1) * h);
+        let mut attn_out_view: CudaViewMut<f32> =
+            pb.d_attn_out.slice_mut(t * nq * hd..(t + 1) * nq * hd);
 
         // Run TQ2-aware single-token attention pipeline (RMSNorm + TQ2 GEMV + attention).
         encode_attn_phase_tq2(
@@ -228,20 +228,10 @@ pub(super) unsafe fn encode_prefill_layer_ternary(
             eps,
             h,
             st_bufs,
+            Some(&token_inputs),
+            Some(&hidden_view),
+            Some(&mut attn_out_view),
         )?;
-
-        // Copy attention output for this token from st_bufs.d_attn_out into
-        // the column of pb.d_attn_out [t * nq*hd .. (t+1)*nq*hd]
-        {
-            let src_view: CudaView<f32> = st_bufs.d_attn_out.slice(..nq * hd);
-            let mut dst_view = pb.d_attn_out.slice_mut(t * nq * hd..(t + 1) * nq * hd);
-            graph
-                .stream_arc()
-                .memcpy_dtod(&src_view, &mut dst_view)
-                .map_err(|e| {
-                    CudaGraphError::DriverError(format!("copy attn_out tq2 t={t}: {e}"))
-                })?;
-        }
     }
 
     // ════════════════════════════════════════════════════════════════════

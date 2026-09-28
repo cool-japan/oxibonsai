@@ -8,7 +8,8 @@
 //! | `context.rs` | on-demand growth of the host caches |
 //! | `decode.rs` | `forward` / `forward_into` and the per-block loop |
 //! | `prefill_dispatch.rs` | `forward_prefill*` / verify dispatch ladder |
-//! | `testing_fixture.rs` | `new_for_testing_with_blocks` |
+//! | `q1_slots.rs` | the per-GGUF-mapping GPU slot namespace + registry |
+//! | `testing_fixture.rs` | `new_for_testing_with_blocks` + the Q1 replica fixture |
 
 #[cfg(test)]
 use super::weight_loaders::dominant_from_counts;
@@ -34,6 +35,7 @@ mod forward_hidden;
 mod lm_head;
 mod prefill_cpu;
 mod prefill_dispatch;
+pub mod q1_slots;
 mod testing_fixture;
 #[cfg(test)]
 mod tests;
@@ -72,6 +74,49 @@ pub use forward_metal::Q1MetalSlots;
 mod forward_metal_fp8;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod gpu_cache;
+/// The uncached ternary binding (`BonsaiModel::ternary_gpu_binding`) and its
+/// tail, nameable outside the crate — the decode-throughput A/B drives the
+/// uncached path with them.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub use gpu_cache::{TernaryGpuBinding, TernaryTailBinding};
+
+/// The release hook of a GPU slot namespace on this build: on Metal,
+/// `MetalGraph::release_model(epoch)` through the live session (never opening
+/// a device); `None` elsewhere, where nothing is keyed on the namespace's
+/// epoch (the CUDA build releases its tagged slots in `BonsaiModel`'s drop).
+pub(crate) fn gpu_release_hook() -> Option<q1_slots::ReleaseHook> {
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    {
+        Some(forward_metal::release_metal_mapping)
+    }
+    #[cfg(not(all(feature = "metal", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+/// A fresh, never-reused epoch for a GPU slot namespace nobody else joins (a
+/// standalone `TransformerBlock`): from the CUDA model-epoch counter on a
+/// CUDA build — where every model's slots are composed over its
+/// `cuda_model_epoch`, so drawing from the same counter keeps a standalone
+/// block's slots disjoint from every model's — and from the Metal /
+/// generic GPU counter otherwise.
+pub(crate) fn fresh_slot_epoch() -> u64 {
+    #[cfg(all(
+        feature = "native-cuda",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    {
+        oxibonsai_kernels::gpu_backend::cuda_graph_slot::next_cuda_model_epoch()
+    }
+    #[cfg(not(all(
+        feature = "native-cuda",
+        any(target_os = "linux", target_os = "windows")
+    )))]
+    {
+        oxibonsai_kernels::gpu_backend::next_gpu_model_epoch()
+    }
+}
 
 /// Growth window for a model that pre-allocates lazily but has no smaller
 /// budget of its own, and the fallback context when nothing declares one.
@@ -231,8 +276,10 @@ pub struct BonsaiModel<'a> {
     /// Populated on first GPU forward pass, reused on subsequent calls.
     #[cfg(all(feature = "metal", target_os = "macos"))]
     gpu_weight_cache: std::sync::Mutex<Option<oxibonsai_kernels::CachedModelWeights>>,
-    /// This load's epoch-namespaced Q1 Metal weight-cache slots (MET-02, Q1
-    /// half) — see `forward_metal::Q1MetalSlots`.
+    /// The Metal weight-cache namespace of this model's GGUF **mapping**
+    /// (MET-02): joined at construction, shared by every replica of the
+    /// mapping (and handed to every block), released with its last replica —
+    /// see `forward_metal::Q1MetalSlots` and `q1_slots`.
     #[cfg(all(feature = "metal", target_os = "macos"))]
     metal_q1_slots: forward_metal::Q1MetalSlots,
     /// Cached per-layer QKV concatenated bytes for CUDA path (built once, reused).

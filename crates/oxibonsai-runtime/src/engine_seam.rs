@@ -1,5 +1,5 @@
-//! The `InferenceEngine` ↔ [`LoadedModel`] seam (`ENGINE-SEAM`, gatekeeper
-//! REQUIRED #1(b) of `B2-11`).
+//! The `InferenceEngine` ↔ [`LoadedModel`] seam: one engine type for both the
+//! dense (`qwen3`) and the hybrid (`qwen35`, Bonsai 2) model kinds.
 //!
 //! [`InferenceEngine`] used to hold a concrete [`BonsaiModel`], so a `qwen35`
 //! (PrismML Bonsai 2) file — 48 of whose 64 layers are Gated-DeltaNet
@@ -32,7 +32,11 @@
 //! | `rewind_cache` to an earlier position | KV cursor move | `ModelError::RecurrentRollbackUnsupported` |
 //! | `verify_batch` / speculative decoding | yes | [`EngineError::RecurrentRollbackRequired`] |
 //! | prefix-cache KV block restore | yes | [`EngineError::RecurrentRollbackRequired`] (`PrefixCachedEngine::try_new`) |
-//! | embeddings (`embed`) | yes | [`EngineError::NotADenseModel`] until the hybrid gains `forward_hidden` |
+//! | embeddings (`embed`, `ModelEmbedder`) | yes (batched CPU prefill) | yes (CPU, `HybridModel::forward_hidden`) |
+//!
+//! [`EngineError::NotADenseModel`] remains the refusal for what genuinely is
+//! dense-only: [`InferenceEngine::require_dense`] hands it to any caller that
+//! needs the dense block stack itself.
 //!
 //! # Snapshot semantics
 //!
@@ -46,7 +50,9 @@
 //! prefix cache), and an opaque [`RecurrentState`](crate::engine_control::RecurrentState)
 //! attached through `set_recurrent_state` (the trait has no snapshot hook).
 //! A snapshot is bound to the sequence it was taken from: any reset — explicit,
-//! or the implicit restart of a prefill/decode at position 0 — invalidates it.
+//! or the implicit restart of a prefill/decode at position 0 — invalidates it,
+//! and so does an embedding pass (`InferenceEngine::embed`), which overwrites
+//! the sequence's positions from 0.
 
 use std::sync::Arc;
 
@@ -129,19 +135,68 @@ impl std::str::FromStr for Backend {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// RoPE-scaling knob (`--rope-scaling auto|on|off`)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What `--rope-scaling` resolved to for one GGUF at load time: the scaling
+/// the file declares, and the one the model is actually built with once the
+/// override is applied (see
+/// [`InferenceEngine::from_gguf_with_backend_and_rope`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RopeScalingAtLoad {
+    /// The requested override.
+    pub mode: oxibonsai_core::config::RopeScalingOverride,
+    /// `<arch>.rope.scaling.*` exactly as the file declares it.
+    pub declared: oxibonsai_core::config::RopeScaling,
+    /// What the model's RoPE table is built from.
+    pub effective: oxibonsai_core::config::RopeScaling,
+}
+
+/// Resolve — and log at INFO — which RoPE scaling strategy a load of `gguf`
+/// under `mode` will use.
+///
+/// # Errors
+///
+/// A malformed `<arch>.rope.scaling.*` declaration, or
+/// [`RopeScalingOverride::On`](oxibonsai_core::config::RopeScalingOverride::On)
+/// on a file that declares no scaling — both as [`RuntimeError::Config`],
+/// before any weight is touched.
+pub fn resolve_rope_scaling_at_load(
+    gguf: &GgufFile<'_>,
+    mode: oxibonsai_core::config::RopeScalingOverride,
+) -> RuntimeResult<RopeScalingAtLoad> {
+    let arch = gguf_architecture(gguf);
+    let declared = oxibonsai_core::config::RopeScaling::from_metadata(&gguf.metadata, &arch)
+        .map_err(|e| RuntimeError::Config(format!("RoPE scaling metadata: {e}")))?;
+    let effective = mode
+        .apply(declared.clone(), &arch)
+        .map_err(|e| RuntimeError::Config(format!("--rope-scaling {mode}: {e}")))?;
+    tracing::info!(
+        mode = %mode,
+        declared = ?declared,
+        effective = ?effective,
+        architecture = %arch,
+        "RoPE scaling strategy active at load"
+    );
+    Ok(RopeScalingAtLoad {
+        mode,
+        declared,
+        effective,
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Typed engine errors
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Why the engine refused an operation — the typed half of "never silently
 /// fall back or pretend".
 ///
-/// Carried to callers of [`RuntimeResult`]-returning APIs as
-/// [`RuntimeError::Config`] whose message starts with the stable
-/// `[`[`EngineError::error_code`]`]` prefix; [`engine_error_code`] recovers
-/// the code from such an error. (`RuntimeError` lives in `error.rs`, which a
-/// later package owns; a dedicated `RuntimeError::Engine` variant is the
-/// recorded follow-up.) APIs that can return the enum directly —
-/// [`InferenceEngine::require_dense`] — do.
+/// Carried to callers of [`RuntimeResult`]-returning APIs as the dedicated
+/// [`RuntimeError::Engine`] variant (via `#[from]`), whose display keeps the
+/// stable `[CODE]` from [`EngineError::error_code`]; [`engine_error_code`]
+/// recovers the code from such an error. APIs that can return the enum
+/// directly — [`InferenceEngine::require_dense`] — do.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum EngineError {
@@ -263,21 +318,55 @@ impl EngineError {
     ];
 }
 
-impl From<EngineError> for RuntimeError {
-    fn from(error: EngineError) -> Self {
-        RuntimeError::Config(format!("[{}] {error}", error.error_code()))
+#[cfg(test)]
+impl EngineError {
+    /// One refusal of every kind, in [`Self::ALL_CODES`] order — for tests
+    /// that must cover every code (the error type's own, and the HTTP
+    /// mapping's).
+    pub(crate) fn one_of_each_kind() -> Vec<Self> {
+        vec![
+            Self::NotADenseModel {
+                operation: "op",
+                architecture: "qwen35".into(),
+                reason: "r",
+            },
+            Self::RecurrentRollbackRequired {
+                operation: "op",
+                architecture: "qwen35".into(),
+            },
+            Self::HybridGpuBackendUnsupported {
+                requested: Backend::Metal,
+                architecture: "qwen35".into(),
+            },
+            Self::BackendUnavailable {
+                requested: Backend::Metal,
+                reason: "none".into(),
+            },
+            Self::NonContiguousPosition {
+                expected: 3,
+                got: 5,
+            },
+            Self::SharedEmbeddingUnsupported {
+                architecture: "qwen35".into(),
+                len: 7,
+            },
+            Self::RecurrentStateNotSnapshotable { name: "x".into() },
+            Self::SnapshotMismatch { detail: "d".into() },
+        ]
     }
 }
 
 /// The [`EngineError::error_code`] carried by `error`, if it is an engine
-/// refusal converted to a [`RuntimeError`].
+/// refusal ([`RuntimeError::Engine`]); `None` for every other error.
+///
+/// Also re-exported as `oxibonsai_runtime::engine::engine_error_code`; both
+/// paths are this one function.
 #[must_use]
 pub fn engine_error_code(error: &RuntimeError) -> Option<&'static str> {
-    let RuntimeError::Config(message) = error else {
-        return None;
-    };
-    let code = message.strip_prefix('[')?.split(']').next()?;
-    EngineError::ALL_CODES.iter().copied().find(|c| *c == code)
+    match error {
+        RuntimeError::Engine(refusal) => Some(refusal.error_code()),
+        _ => None,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -691,10 +780,14 @@ impl<'a> InferenceEngine<'a> {
             self.sequence_id = self.sequence_id.wrapping_add(1);
         }
         self.prepare_hybrid_position(pos)?;
-        match &mut self.model {
-            LoadedModel::Dense(model) => Ok(model.forward(token, pos, &self.kernel)?),
-            LoadedModel::Hybrid(model) => Ok(model.forward_alloc(token, pos)?),
-        }
+        let row = match &mut self.model {
+            LoadedModel::Dense(model) => model.forward(token, pos, &self.kernel)?,
+            LoadedModel::Hybrid(model) => model.forward_alloc(token, pos)?,
+        };
+        // Test-only scripted generation (`crate::engine::ScriptedLogits`).
+        #[cfg(test)]
+        let row = self.scripted_row(row, false)?;
+        Ok(row)
     }
 
     /// Single-token forward at `pos` on an explicit dispatcher — the greedy

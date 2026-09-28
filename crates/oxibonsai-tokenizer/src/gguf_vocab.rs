@@ -117,14 +117,13 @@ fn is_byte_fallback_shape(token: &str) -> bool {
 
 /// Build an [`OxiTokenizer`] directly from a GGUF file's metadata store.
 ///
-/// See the module docs for the key set. Errors are surfaced through
-/// [`TokenizerError::HfFormat`] — the same variant [`crate::hf_format`]
-/// uses for a malformed `tokenizer.json` — since both describe "the
-/// serialized tokenizer definition could not be parsed", just from a
-/// different container format. Adding a dedicated `TokenizerError` variant
-/// (e.g. `GgufFormat`) would be the more precise fix but requires editing
-/// `crates/oxibonsai-tokenizer/src/error.rs`, which is outside this
-/// package's `owned_files` — recorded as a deviation.
+/// See the module docs for the key set. Every failure is surfaced through
+/// the dedicated [`TokenizerError::GgufFormat`] variant (`TOK-17`): a
+/// missing or mistyped `tokenizer.ggml.*` key, an unsupported model type,
+/// or a malformed entry — the GGUF-container counterpart of
+/// [`TokenizerError::HfFormat`], which stays reserved for a malformed
+/// `tokenizer.json`, so a caller can tell the two sources apart by variant
+/// rather than by a message prefix.
 ///
 /// # Errors
 /// Returns `Err` if `tokenizer.ggml.model` is missing, is not `"gpt2"`,
@@ -135,29 +134,29 @@ fn is_byte_fallback_shape(token: &str) -> bool {
 pub fn tokenizer_from_gguf_metadata(md: &MetadataStore) -> TokenizerResult<OxiTokenizer> {
     let model = md
         .get_string(KEY_MODEL)
-        .map_err(|e| TokenizerError::HfFormat(format!("GGUF: {e}")))?;
+        .map_err(|e| TokenizerError::GgufFormat(e.to_string()))?;
     if model != "gpt2" {
-        return Err(TokenizerError::HfFormat(format!(
-            "GGUF: unsupported tokenizer.ggml.model {model:?} (only the \
-             byte-level \"gpt2\" BPE vocab is implemented)"
+        return Err(TokenizerError::GgufFormat(format!(
+            "unsupported tokenizer.ggml.model {model:?} (only the byte-level \"gpt2\" BPE \
+             vocab is implemented)"
         )));
     }
 
     let tokens = md
         .get_string_array(KEY_TOKENS)
-        .map_err(|e| TokenizerError::HfFormat(format!("GGUF: {e}")))?;
+        .map_err(|e| TokenizerError::GgufFormat(e.to_string()))?;
     if tokens.is_empty() {
-        return Err(TokenizerError::HfFormat(
-            "GGUF: tokenizer.ggml.tokens is empty".to_owned(),
+        return Err(TokenizerError::GgufFormat(
+            "tokenizer.ggml.tokens is empty".to_owned(),
         ));
     }
 
     let token_types: Option<Vec<i32>> = md.get_i32_array(KEY_TOKEN_TYPE).ok();
     if let Some(types) = &token_types {
         if types.len() != tokens.len() {
-            return Err(TokenizerError::HfFormat(format!(
-                "GGUF: tokenizer.ggml.token_type has {} entries, expected {} \
-                 (one per tokenizer.ggml.tokens entry)",
+            return Err(TokenizerError::GgufFormat(format!(
+                "tokenizer.ggml.token_type has {} entries, expected {} (one per \
+                 tokenizer.ggml.tokens entry)",
                 types.len(),
                 tokens.len()
             )));
@@ -170,7 +169,7 @@ pub fn tokenizer_from_gguf_metadata(md: &MetadataStore) -> TokenizerResult<OxiTo
     let bos_id = md.get(KEY_BOS_TOKEN_ID).and_then(|v| v.as_u32());
     let eos_id = md
         .get_u32(KEY_EOS_TOKEN_ID)
-        .map_err(|e| TokenizerError::HfFormat(format!("GGUF: {e}")))?;
+        .map_err(|e| TokenizerError::GgufFormat(e.to_string()))?;
     let unk_id = md.get(KEY_UNK_TOKEN_ID).and_then(|v| v.as_u32());
     let pad_id = md.get(KEY_PAD_TOKEN_ID).and_then(|v| v.as_u32());
 
@@ -206,8 +205,8 @@ pub fn tokenizer_from_gguf_metadata(md: &MetadataStore) -> TokenizerResult<OxiTo
     let mut vocab = Vocabulary::new();
     for (idx, token) in tokens.iter().enumerate() {
         let id = u32::try_from(idx).map_err(|_| {
-            TokenizerError::HfFormat(
-                "GGUF: tokenizer.ggml.tokens has more entries than fit in a u32".to_owned(),
+            TokenizerError::GgufFormat(
+                "tokenizer.ggml.tokens has more entries than fit in a u32".to_owned(),
             )
         })?;
         let ty = token_types
@@ -245,9 +244,9 @@ pub fn tokenizer_from_gguf_metadata(md: &MetadataStore) -> TokenizerResult<OxiTo
     if let Ok(raw_merges) = md.get_string_array(KEY_MERGES) {
         for (idx, entry) in raw_merges.iter().enumerate() {
             let Some((a, b)) = entry.split_once(' ') else {
-                return Err(TokenizerError::HfFormat(format!(
-                    "GGUF: malformed tokenizer.ggml.merges entry #{idx}: {entry:?} \
-                     (expected \"left right\")"
+                return Err(TokenizerError::GgufFormat(format!(
+                    "malformed tokenizer.ggml.merges entry #{idx}: {entry:?} (expected \
+                     \"left right\")"
                 )));
             };
             let merged = format!("{a}{b}");
@@ -632,8 +631,11 @@ mod tests {
     fn missing_model_key_errors() {
         let store = MetadataStore::new();
         match tokenizer_from_gguf_metadata(&store) {
-            Err(TokenizerError::HfFormat(_)) => {}
-            Err(other) => panic!("expected HfFormat, got: {other}"),
+            Err(TokenizerError::GgufFormat(msg)) => assert!(
+                msg.contains(KEY_MODEL),
+                "the error must name the missing key: {msg}"
+            ),
+            Err(other) => panic!("expected GgufFormat, got: {other}"),
             Ok(_) => panic!("expected an error for a missing model key"),
         }
     }
@@ -650,9 +652,119 @@ mod tests {
         data.extend_from_slice(&str_bytes("llama"));
         let (store, _) = MetadataStore::parse(&data, 0, 1).expect("parses");
         match tokenizer_from_gguf_metadata(&store) {
-            Err(TokenizerError::HfFormat(msg)) => assert!(msg.contains("llama")),
-            Err(other) => panic!("expected HfFormat, got {other}"),
+            Err(TokenizerError::GgufFormat(msg)) => assert!(msg.contains("llama")),
+            Err(other) => panic!("expected GgufFormat, got {other}"),
             Ok(_) => panic!("expected an error for a non-gpt2 model"),
+        }
+    }
+
+    /// `TOK-17`: every GGUF-side failure — a missing key, an empty or
+    /// inconsistent array, a malformed merge — is the dedicated
+    /// `GgufFormat` variant, never the `tokenizer.json` one, and its
+    /// message no longer carries the old `"GGUF: "` prefix (the variant's
+    /// own `Display` names the container).
+    #[test]
+    fn every_gguf_metadata_failure_is_the_gguf_format_variant() {
+        fn str_bytes(s: &str) -> Vec<u8> {
+            let mut bytes = (s.len() as u64).to_le_bytes().to_vec();
+            bytes.extend_from_slice(s.as_bytes());
+            bytes
+        }
+        fn kv_string(key: &str, value: &str) -> Vec<u8> {
+            let mut bytes = str_bytes(key);
+            bytes.extend_from_slice(&(GgufValueType::String as u32).to_le_bytes());
+            bytes.extend_from_slice(&str_bytes(value));
+            bytes
+        }
+        fn kv_u32(key: &str, value: u32) -> Vec<u8> {
+            let mut bytes = str_bytes(key);
+            bytes.extend_from_slice(&(GgufValueType::Uint32 as u32).to_le_bytes());
+            bytes.extend_from_slice(&value.to_le_bytes());
+            bytes
+        }
+        fn kv_string_array(key: &str, values: &[&str]) -> Vec<u8> {
+            let mut bytes = str_bytes(key);
+            bytes.extend_from_slice(&(GgufValueType::Array as u32).to_le_bytes());
+            bytes.extend_from_slice(&(GgufValueType::String as u32).to_le_bytes());
+            bytes.extend_from_slice(&(values.len() as u64).to_le_bytes());
+            for v in values {
+                bytes.extend_from_slice(&str_bytes(v));
+            }
+            bytes
+        }
+        fn kv_i32_array(key: &str, values: &[i32]) -> Vec<u8> {
+            let mut bytes = str_bytes(key);
+            bytes.extend_from_slice(&(GgufValueType::Array as u32).to_le_bytes());
+            bytes.extend_from_slice(&(GgufValueType::Int32 as u32).to_le_bytes());
+            bytes.extend_from_slice(&(values.len() as u64).to_le_bytes());
+            for v in values {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            bytes
+        }
+        fn store(entries: &[Vec<u8>]) -> MetadataStore {
+            let data: Vec<u8> = entries.iter().flatten().copied().collect();
+            let (store, _) = MetadataStore::parse(&data, 0, entries.len() as u64).expect("parses");
+            store
+        }
+
+        let cases: Vec<(&str, MetadataStore, &str)> = vec![
+            (
+                "missing tokens",
+                store(&[kv_string(KEY_MODEL, "gpt2")]),
+                KEY_TOKENS,
+            ),
+            (
+                "empty tokens",
+                store(&[
+                    kv_string(KEY_MODEL, "gpt2"),
+                    kv_string_array(KEY_TOKENS, &[]),
+                ]),
+                "is empty",
+            ),
+            (
+                "token_type length mismatch",
+                store(&[
+                    kv_string(KEY_MODEL, "gpt2"),
+                    kv_string_array(KEY_TOKENS, &["a", "b"]),
+                    kv_i32_array(KEY_TOKEN_TYPE, &[1]),
+                ]),
+                "token_type has 1 entries",
+            ),
+            (
+                "missing eos",
+                store(&[
+                    kv_string(KEY_MODEL, "gpt2"),
+                    kv_string_array(KEY_TOKENS, &["a", "b"]),
+                ]),
+                KEY_EOS_TOKEN_ID,
+            ),
+            (
+                "malformed merge",
+                store(&[
+                    kv_string(KEY_MODEL, "gpt2"),
+                    kv_string_array(KEY_TOKENS, &["a", "b"]),
+                    kv_u32(KEY_EOS_TOKEN_ID, 0),
+                    kv_string_array(KEY_MERGES, &["ab"]),
+                ]),
+                "malformed tokenizer.ggml.merges entry #0",
+            ),
+        ];
+        for (label, md, needle) in cases {
+            match tokenizer_from_gguf_metadata(&md) {
+                Err(TokenizerError::GgufFormat(msg)) => {
+                    assert!(
+                        msg.contains(needle),
+                        "{label}: {msg:?} must name {needle:?}"
+                    );
+                    assert!(
+                        !msg.starts_with("GGUF: "),
+                        "{label}: the variant already names the container: {msg:?}"
+                    );
+                }
+                Err(other) => panic!("{label}: expected GgufFormat, got {other:?}"),
+                Ok(_) => panic!("{label}: expected an error"),
+            }
         }
     }
 

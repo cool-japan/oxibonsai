@@ -2,17 +2,16 @@
 //!
 //! Attached to `chat.rs` as its `#[cfg(test)] mod tests` via `#[path]`, so
 //! the tests keep full access to the module's private items
-//! (`SamplingOverrides`, `parse_base_tool_calls`, `correct_logprob_bytes`,
-//! `StopTracker`, `stream_terminal_payloads`, ...) while `chat.rs` itself
-//! stays under the workspace's 2000-line ceiling — mirrors
-//! `api_extensions.rs` / `api_extensions_tests.rs` (itself modelled on
-//! `engine.rs` / `engine_tests.rs`). Split out by B2-13 when adding the
-//! XML-tool-call and TOK-M1-closing tests pushed `chat.rs` from 1997 to
-//! 2042 lines; no test content changed in the move.
+//! (`SamplingOverrides`, `correct_logprob_bytes`, `StopTracker`,
+//! `stream_terminal_payloads`, ...) while `chat.rs` itself stays under the
+//! workspace's 2000-line ceiling — mirrors `api_extensions.rs` /
+//! `api_extensions_tests.rs` (itself modelled on `engine.rs` /
+//! `engine_tests.rs`).
 
 use super::*;
+use crate::server::response_pipeline::ResponseEnd;
 
-// ── gatekeeper REQUIRED#1(b): SamplingOverrides seeds from the engine's
+// ── SamplingOverrides seeds from the engine's
 //    ambient params, never from SamplingParams::default() ─────────────
 
 /// A discriminating ambient config: every field differs from
@@ -181,7 +180,7 @@ async fn logprobs_with_mismatched_temperature_and_top_p_succeeds_end_to_end() {
     };
     let config = oxibonsai_core::config::Qwen3Config::tiny_test();
     let engine = InferenceEngine::new(config, ambient, 42);
-    let app = create_router(engine, None);
+    let app = crate::tokenizer_bridge::chat_render::test_fixtures::tokenizerless_router(engine);
 
     let body = serde_json::json!({
         "messages": [{"role": "user", "content": "hi"}],
@@ -217,25 +216,34 @@ async fn logprobs_with_mismatched_temperature_and_top_p_succeeds_end_to_end() {
 }
 
 // ── serve-api-03: base-endpoint tool-call parsing ────────────────────
+//
+// The base endpoint parses tool calls out of the generated text through the
+// response pipeline (the one the streaming path runs too); these feed it the
+// ids a model would emit for `text` — `<tool_call>`/`</tool_call>` as the
+// vocabulary's own marker tokens.
+
+/// The non-streamed response the base endpoint builds for a generation that
+/// decodes to `text`, with tool calling on or off.
+fn base_response(text: &str, tools_active: bool) -> CollectedResponse {
+    let tok = crate::tokenizer_bridge::chat_render::test_fixtures::byte_tokenizer_with_markers();
+    let ids = tok.encode(text).expect("the fixture tokenizer encodes");
+    let shape = ResponseShape::resolve(Some(&tok), &[], None, tools_active);
+    ResponsePipeline::new(&shape, Some(&tok), TextStop::new(Vec::new())).collect(Some(&tok), &ids)
+}
 
 #[test]
 fn base_tool_calls_parsed_from_generated_text() {
     let text = r#"sure<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>"#;
-    let (leading, calls) = match parse_base_tool_calls(text, true) {
-        BaseToolCallOutcome::Found {
-            leading_text,
-            calls,
-        } => (leading_text, calls),
-        other => panic!("expected Found, got {other:?}"),
-    };
+    let response = base_response(text, true);
     assert_eq!(
-        leading, "sure",
-        "B6: the natural-language preamble must be kept"
+        response.content, "sure",
+        "the natural-language preamble must be kept"
     );
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].function.name, "get_weather");
-    assert_eq!(calls[0].r#type, "function");
-    assert!(calls[0].id.starts_with("call_"));
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].function.name, "get_weather");
+    assert_eq!(response.tool_calls[0].tool_type, "function");
+    assert!(response.tool_calls[0].id.starts_with("call_"));
+    assert_eq!(response.end.finish_reason(10, 100), "tool_calls");
 }
 
 #[test]
@@ -243,22 +251,20 @@ fn base_tool_calls_none_when_inactive() {
     // Same text, but tool calling disabled (no tools / tool_choice: none)
     // must not fabricate a tool call.
     let text = r#"<tool_call>{"name":"f","arguments":{}}</tool_call>"#;
-    assert_eq!(
-        parse_base_tool_calls(text, false),
-        BaseToolCallOutcome::None
-    );
+    let response = base_response(text, false);
+    assert!(response.tool_calls.is_empty());
+    assert_eq!(response.content, text);
 }
 
 #[test]
 fn base_tool_calls_none_for_plain_text() {
-    assert_eq!(
-        parse_base_tool_calls("just a normal answer", true),
-        BaseToolCallOutcome::None
-    );
+    let response = base_response("just a normal answer", true);
+    assert!(response.tool_calls.is_empty());
+    assert_eq!(response.content, "just a normal answer");
 }
 
-/// B2-13/RT-11: the base endpoint must parse Bonsai 2's real XML tool-call
-/// shape, not just the legacy JSON payload.
+/// RT-11: the base endpoint must parse Bonsai 2's real XML tool-call shape,
+/// not just the legacy JSON payload.
 #[test]
 fn base_tool_calls_parsed_from_xml_shape() {
     let text = concat!(
@@ -266,50 +272,50 @@ fn base_tool_calls_parsed_from_xml_shape() {
         "<parameter=city>\nParis\n</parameter>\n",
         "</function>\n</tool_call>",
     );
-    let calls = match parse_base_tool_calls(text, true) {
-        BaseToolCallOutcome::Found { calls, .. } => calls,
-        other => panic!("expected Found, got {other:?}"),
-    };
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].function.name, "get_weather");
-    let args: serde_json::Value =
-        serde_json::from_str(&calls[0].function.arguments).expect("valid JSON arguments");
+    let response = base_response(text, true);
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].function.name, "get_weather");
+    let args: serde_json::Value = serde_json::from_str(&response.tool_calls[0].function.arguments)
+        .expect("valid JSON arguments");
     assert_eq!(args["city"], "Paris");
+    assert_eq!(response.content, "");
 }
 
-/// A truncated `<tool_call>` (opened but never closed) must not panic
-/// and must not fabricate a call — the minor finding's fix: the partial
-/// XML itself is never reported as content, only whatever real leading
-/// text preceded it (here, none).
+/// A `<tool_call>` still open when the response ends (the model was cut
+/// off) is not a call and never panics: its text is released as content —
+/// what the stream already sent — with the natural finish reason (`length`
+/// for a cut-off generation).
 #[test]
-fn base_tool_calls_truncated_xml_yields_truncated_not_panic() {
+fn base_tool_calls_unclosed_xml_is_released_as_content_not_a_call() {
     let text = "<tool_call>\n<function=get_weather>\nstill going";
-    assert_eq!(
-        parse_base_tool_calls(text, true),
-        BaseToolCallOutcome::Truncated {
-            leading_text: String::new()
-        }
-    );
+    let response = base_response(text, true);
+    assert!(response.tool_calls.is_empty());
+    assert!(response.end.unclosed);
+    assert_eq!(response.content, text);
+    assert_eq!(response.end.finish_reason(7, 7), "length");
 }
 
-/// The minor finding's other half: a truncated call WITH a real preamble
-/// keeps that preamble.
+/// An unclosed call after a real preamble keeps that preamble, followed by
+/// the block's own text.
 #[test]
-fn base_tool_calls_truncated_xml_keeps_the_leading_preamble() {
+fn base_tool_calls_unclosed_xml_keeps_the_preamble_and_the_block_as_content() {
     let text = "Let me check.\n<tool_call>\n<function=get_weather>\nstill going";
-    assert_eq!(
-        parse_base_tool_calls(text, true),
-        BaseToolCallOutcome::Truncated {
-            leading_text: "Let me check.\n".to_string()
-        }
-    );
+    let response = base_response(text, true);
+    assert!(response.tool_calls.is_empty());
+    assert_eq!(response.content, text);
 }
 
 // ── serve-api-01 / serve-api-02: streaming terminal event ────────────
 
 #[test]
 fn stream_terminal_reports_length_when_truncated() {
-    let json = stream_terminal_json(Ok(8), 8, "id", 1, "m", false);
+    let json = stream_terminal_json(
+        Ok(ResponseEnd::default().finish_reason(8, 8)),
+        "id",
+        1,
+        "m",
+        false,
+    );
     assert!(json.contains("\"finish_reason\":\"length\""), "got: {json}");
     assert!(!json.contains("\"error\""));
     assert!(
@@ -320,22 +326,34 @@ fn stream_terminal_reports_length_when_truncated() {
 
 #[test]
 fn stream_terminal_reports_stop_when_natural() {
-    let json = stream_terminal_json(Ok(3), 8, "id", 1, "m", false);
+    let json = stream_terminal_json(
+        Ok(ResponseEnd::default().finish_reason(3, 8)),
+        "id",
+        1,
+        "m",
+        false,
+    );
     assert!(json.contains("\"finish_reason\":\"stop\""), "got: {json}");
+}
+
+#[test]
+fn stream_terminal_reports_tool_calls_when_a_call_was_streamed() {
+    let end = ResponseEnd {
+        calls: 1,
+        ..ResponseEnd::default()
+    };
+    let json = stream_terminal_json(Ok(end.finish_reason(8, 8)), "id", 1, "m", false);
+    assert!(
+        json.contains("\"finish_reason\":\"tool_calls\""),
+        "got: {json}"
+    );
 }
 
 #[test]
 fn stream_terminal_surfaces_error() {
     // A mid-stream failure must produce an error object, never a bogus
     // clean finish chunk (finding serve-api-02).
-    let json = stream_terminal_json(
-        Err("forward pass failed".to_string()),
-        8,
-        "id",
-        1,
-        "m",
-        false,
-    );
+    let json = stream_terminal_json(Err("forward pass failed".to_string()), "id", 1, "m", false);
     let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
     assert_eq!(v["error"]["message"], "forward pass failed");
     assert_eq!(v["error"]["type"], "server_error");
@@ -349,7 +367,7 @@ fn stream_terminal_surfaces_error() {
 
 #[test]
 fn include_usage_adds_a_final_usage_chunk() {
-    let payloads = stream_terminal_payloads(Ok(3), 8, "id", 1, "m", true, 11);
+    let payloads = stream_terminal_payloads(Ok(("stop", 3)), "id", 1, "m", true, 11);
     assert_eq!(
         payloads.len(),
         2,
@@ -375,7 +393,7 @@ fn include_usage_adds_a_final_usage_chunk() {
 
 #[test]
 fn usage_chunk_is_omitted_without_stream_options() {
-    let payloads = stream_terminal_payloads(Ok(3), 8, "id", 1, "m", false, 11);
+    let payloads = stream_terminal_payloads(Ok(("stop", 3)), "id", 1, "m", false, 11);
     assert_eq!(payloads.len(), 1);
     assert!(!payloads[0].contains("usage"));
 }
@@ -383,7 +401,7 @@ fn usage_chunk_is_omitted_without_stream_options() {
 #[test]
 fn failed_generation_emits_no_usage_chunk() {
     // A usage chunk after an error event would imply a clean completion.
-    let payloads = stream_terminal_payloads(Err("boom".to_string()), 8, "id", 1, "m", true, 11);
+    let payloads = stream_terminal_payloads(Err("boom".to_string()), "id", 1, "m", true, 11);
     assert_eq!(payloads.len(), 1);
     let v: serde_json::Value = serde_json::from_str(&payloads[0]).expect("valid JSON");
     assert_eq!(v["error"]["message"], "boom");
@@ -723,6 +741,7 @@ fn structural_per_role_rendering_on_the_serving_path() {
         ChatMessage {
             role: "assistant".to_string(),
             content: Some(String::new()),
+            reasoning_content: None,
             tool_calls: Some(vec![crate::api_types::ToolCallResult::new_function(
                 "call_1".to_string(),
                 "get_weather".to_string(),
@@ -733,6 +752,7 @@ fn structural_per_role_rendering_on_the_serving_path() {
         ChatMessage {
             role: "tool".to_string(),
             content: Some("sunny".to_string()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: Some("call_1".to_string()),
         },
@@ -774,11 +794,14 @@ fn structural_per_role_rendering_on_the_serving_path() {
         text.contains("<|im_start|>user\nhi<|im_end|>\n"),
         "user role must render structurally: {text:?}"
     );
-    // assistant tool_calls -> the real XML shape, not the legacy JSON
-    // payload, and not silently dropped (RT-07's own complaint).
+    // assistant tool_calls -> the form the fallback template teaches (the
+    // official Qwen3 JSON `<tool_call>` block the legacy models were trained
+    // on), not silently dropped (RT-07's own complaint).
     assert!(
-        text.contains("<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>\n</tool_call>"),
-        "assistant tool_calls must render as the XML shape: {text:?}"
+        text.contains(
+            "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tokyo\"}}\n</tool_call>"
+        ),
+        "assistant tool_calls must render in the fallback's Qwen3 JSON form: {text:?}"
     );
     // tool (RT-07's headline bug): must be wrapped in a real
     // `<|im_start|>user` / `<tool_response>` turn, never bare content +
@@ -806,7 +829,7 @@ fn structural_per_role_rendering_on_the_serving_path() {
 
 #[test]
 fn structural_rendering_errors_honestly_never_renders_garbage() {
-    // spec item 1: "an unsupported construct must ERROR" — an unrecognized
+    // TOK-07/RT-09: an unsupported construct must ERROR — an unrecognized
     // role reaching the render layer (validate_chat_request already
     // rejects this before generation in the real handler; this pins the
     // render layer's OWN behavior independently) must error, not silently
@@ -1024,8 +1047,8 @@ async fn base_endpoint_tolerates_a_malformed_chat_template_kwargs_value() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
-/// `messages: []` must now be an honest `400` (spec item 1: "an
-/// unsupported construct must ERROR") instead of the OLD hardcoded
+/// `messages: []` must now be an honest `400` (TOK-07/RT-09: an
+/// unsupported construct must ERROR) instead of the OLD hardcoded
 /// builder's silent "just the generation prompt" behavior — the real
 /// template's own `raise_exception('No messages provided.')` surfaces
 /// through `chat_render::api_error_from_jinja`.
@@ -1198,11 +1221,21 @@ async fn post_legacy_completion(
     (status, String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// The engine is scripted to emit `"[0][1]…"` through a byte-level
+/// tokenizer, so `stop: "["` matches on the very first streamed token
+/// (a stream without a tokenizer shows no text at all, so it could not
+/// match). The chat stream matches stop sequences on the
+/// receiving side, so the script holds its first generation after that
+/// token until it is cancelled (`fx::scripted_byte_engine_held`): the tiny
+/// model cannot outrun the receiver and turn the match into a `length`
+/// finish.
 #[tokio::test]
 async fn a_stream_stopped_by_a_real_cancel_does_not_affect_the_next_request_on_another_endpoint() {
-    let config = oxibonsai_core::config::Qwen3Config::tiny_test();
-    let engine = InferenceEngine::new(config, SamplingParams::default(), 42);
-    let app = create_router(engine, None);
+    use crate::tokenizer_bridge::chat_render::test_fixtures as fx;
+    let app = create_router(
+        fx::scripted_byte_engine_held("[0][1][2][3][4][5][6][7][8][9][10][11][12]"),
+        Some(fx::byte_tokenizer()),
+    );
 
     let (stream_status, body) = post_chat(
         app.clone(),
@@ -1233,4 +1266,243 @@ async fn a_stream_stopped_by_a_real_cancel_does_not_affect_the_next_request_on_a
         "a /v1/completions request right after a REAL cancellation on this \
          replica (via a *different* endpoint) must still generate tokens, got {json}"
     );
+}
+
+// ── native `reasoning_content` and id-gated tool
+//    calls, over the real HTTP route ────────────────────────────────────
+//
+// A weightless engine scripted to emit an exact id sequence
+// (`InferenceEngine::script_generation`) over a byte-level vocabulary whose
+// `<think>`/`</think>`/`<tool_call>`/`</tool_call>` are single ordinary
+// added tokens — the shape of the shipped Qwen3 / Bonsai 2 vocabularies —
+// so each test controls the model's output token by token.
+
+mod reasoning_and_tools_over_http {
+    use super::*;
+    use crate::tokenizer_bridge::chat_render::test_fixtures as fx;
+
+    /// A router whose engine emits exactly `script` (then EOS) on every
+    /// generation, over the marker-carrying vocabulary.
+    fn scripted_marker_router(script: Vec<u32>, template: Option<&str>) -> axum::Router {
+        let mut engine = fx::weightless_engine(fx::MARKER_VOCAB, SamplingParams::default(), 42);
+        engine.script_generation(script);
+        let mut tokenizer = fx::byte_tokenizer_with_markers();
+        if let Some(source) = template {
+            tokenizer = tokenizer.with_chat_template(
+                oxibonsai_tokenizer::chat_templates::ResolvedChatTemplate::Jinja(
+                    std::sync::Arc::new(
+                        oxibonsai_tokenizer::jinja::JinjaTemplate::compile(source)
+                            .expect("the test template compiles"),
+                    ),
+                ),
+            );
+        }
+        create_router(engine, Some(tokenizer))
+    }
+
+    /// The model's own `<think>` + `reasoning` + `</think>` + `answer`: the
+    /// markers as their single ids, the text as ordinary byte tokens.
+    fn think_span(reasoning: &str, answer: &str) -> Vec<u32> {
+        let mut ids = vec![fx::THINK_OPEN];
+        ids.extend(fx::byte_ids(reasoning));
+        ids.push(fx::THINK_CLOSE);
+        ids.extend(fx::byte_ids(answer));
+        ids
+    }
+
+    fn chat_body(stream: bool) -> serde_json::Value {
+        serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 256,
+            "stream": stream,
+        })
+    }
+
+    /// `(channel, text)` of every delta of a chat SSE body, in order.
+    fn delta_sequence(body: &str) -> Vec<(&'static str, String)> {
+        let mut deltas = Vec::new();
+        for chunk in fx::sse_payloads(body) {
+            let delta = &chunk["choices"][0]["delta"];
+            assert!(
+                !(delta["reasoning_content"].is_string() && delta["content"].is_string()),
+                "a delta carries one channel, never both: {chunk}"
+            );
+            if let Some(text) = delta["reasoning_content"].as_str() {
+                deltas.push(("reasoning", text.to_string()));
+            }
+            if let Some(text) = delta["content"].as_str() {
+                deltas.push(("content", text.to_string()));
+            }
+        }
+        deltas
+    }
+
+    fn channel(deltas: &[(&'static str, String)], name: &str) -> String {
+        deltas
+            .iter()
+            .filter(|(channel, _)| *channel == name)
+            .map(|(_, text)| text.as_str())
+            .collect()
+    }
+
+    async fn post_json(app: axum::Router, body: serde_json::Value) -> serde_json::Value {
+        let (status, _, text) = fx::post(app, "/v1/chat/completions", body).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        serde_json::from_str(&text).expect("a JSON chat.completion")
+    }
+
+    /// A model-emitted `<think>` span streams as native
+    /// `reasoning_content` deltas, every one of them strictly before the
+    /// first `content` delta, and neither marker reaches either channel.
+    #[tokio::test]
+    async fn a_model_emitted_think_span_streams_as_reasoning_strictly_before_content() {
+        let app =
+            scripted_marker_router(think_span("\nplan the answer\n", "\n\nThe answer."), None);
+        let (status, _, body) = fx::post(app, "/v1/chat/completions", chat_body(true)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let deltas = delta_sequence(&body);
+        let last_reasoning = deltas
+            .iter()
+            .rposition(|(channel, _)| *channel == "reasoning")
+            .expect("reasoning deltas");
+        let first_content = deltas
+            .iter()
+            .position(|(channel, _)| *channel == "content")
+            .expect("content deltas");
+        assert!(
+            last_reasoning < first_content,
+            "every reasoning delta must precede the first content delta: {deltas:?}"
+        );
+        assert_eq!(channel(&deltas, "reasoning"), "plan the answer\n");
+        assert_eq!(channel(&deltas, "content"), "The answer.");
+        assert!(
+            !body.contains("<think>") && !body.contains("</think>"),
+            "{body}"
+        );
+        assert!(body.contains("\"finish_reason\":\"stop\""), "{body}");
+    }
+
+    /// The same span is the native `message.reasoning_content` of
+    /// the non-streaming response.
+    #[tokio::test]
+    async fn a_model_emitted_think_span_is_native_reasoning_content_in_the_json() {
+        let app =
+            scripted_marker_router(think_span("\nplan the answer\n", "\n\nThe answer."), None);
+        let json = post_json(app, chat_body(false)).await;
+        let message = &json["choices"][0]["message"];
+        assert_eq!(message["reasoning_content"], "plan the answer\n", "{json}");
+        assert_eq!(message["content"], "The answer.", "{json}");
+        assert_eq!(json["choices"][0]["finish_reason"], "stop", "{json}");
+    }
+
+    /// Over HTTP, whitespace-only reasoning is omitted from both
+    /// responses — no `reasoning_content` delta at all, and no
+    /// `reasoning_content` member in the JSON.
+    #[tokio::test]
+    async fn whitespace_only_reasoning_is_omitted_from_the_stream_and_the_json() {
+        let script = think_span("\n \n\t\n", "\n\nHello.");
+        let (status, _, body) = fx::post(
+            scripted_marker_router(script.clone(), None),
+            "/v1/chat/completions",
+            chat_body(true),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let deltas = delta_sequence(&body);
+        assert!(
+            deltas.iter().all(|(channel, _)| *channel == "content"),
+            "{deltas:?}"
+        );
+        assert_eq!(channel(&deltas, "content"), "Hello.");
+
+        let json = post_json(scripted_marker_router(script, None), chat_body(false)).await;
+        let message = &json["choices"][0]["message"];
+        assert!(message.get("reasoning_content").is_none(), "{json}");
+        assert_eq!(message["content"], "Hello.", "{json}");
+    }
+
+    /// A template whose generation prompt itself opens the span
+    /// (`…assistant\n<think>\n`, Bonsai 2's shape): the model's output starts
+    /// inside the reasoning and only closes it, on both paths.
+    #[tokio::test]
+    async fn a_template_opened_think_span_splits_on_the_models_close() {
+        const OPENS_THINK: &str = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n<think>\n{% endif %}";
+        let mut script = fx::byte_ids("weigh the options");
+        script.push(fx::THINK_CLOSE);
+        script.extend(fx::byte_ids("\n\nDone."));
+
+        let app = scripted_marker_router(script.clone(), Some(OPENS_THINK));
+        let (status, _, body) = fx::post(app, "/v1/chat/completions", chat_body(true)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let deltas = delta_sequence(&body);
+        assert_eq!(channel(&deltas, "reasoning"), "weigh the options");
+        assert_eq!(channel(&deltas, "content"), "Done.");
+
+        let json = post_json(
+            scripted_marker_router(script, Some(OPENS_THINK)),
+            chat_body(false),
+        )
+        .await;
+        let message = &json["choices"][0]["message"];
+        assert_eq!(message["reasoning_content"], "weigh the options", "{json}");
+        assert_eq!(message["content"], "Done.", "{json}");
+    }
+
+    fn tools_body() -> serde_json::Value {
+        serde_json::json!({
+            "messages": [{"role": "user", "content": "weather in Tokyo?"}],
+            "max_tokens": 256,
+            "tools": [{"type": "function", "function": {
+                "name": "get_weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }}],
+        })
+    }
+
+    const CALL_JSON: &str = "\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tokyo\"}}\n";
+
+    /// The literal text `<tool_call>…</tool_call>` spelled out of
+    /// ordinary byte tokens (a model writing ABOUT the tag) is content, never
+    /// a call — the vocabulary's own `<tool_call>` id never appeared.
+    #[tokio::test]
+    async fn a_tool_call_spelled_from_ordinary_tokens_is_content_not_a_call() {
+        let mut script = fx::byte_ids("<tool_call>");
+        script.extend(fx::byte_ids(CALL_JSON));
+        script.extend(fx::byte_ids("</tool_call>"));
+        let json = post_json(scripted_marker_router(script, None), tools_body()).await;
+        let choice = &json["choices"][0];
+        assert!(
+            choice["message"]
+                .get("tool_calls")
+                .is_none_or(serde_json::Value::is_null),
+            "{json}"
+        );
+        assert_eq!(choice["finish_reason"], "stop", "{json}");
+        let content = choice["message"]["content"].as_str().unwrap_or_default();
+        assert!(content.contains("<tool_call>"), "{json}");
+    }
+
+    /// The other half: the same call opened by the vocabulary's own
+    /// `<tool_call>` token is parsed into `tool_calls`.
+    #[tokio::test]
+    async fn a_tool_call_opened_by_the_vocabulary_token_is_parsed() {
+        let mut script = vec![fx::TOOL_CALL_OPEN];
+        script.extend(fx::byte_ids(CALL_JSON));
+        script.push(fx::TOOL_CALL_CLOSE);
+        let json = post_json(scripted_marker_router(script, None), tools_body()).await;
+        let choice = &json["choices"][0];
+        assert_eq!(choice["finish_reason"], "tool_calls", "{json}");
+        let calls = choice["message"]["tool_calls"]
+            .as_array()
+            .expect("tool_calls");
+        assert_eq!(calls.len(), 1, "{json}");
+        assert_eq!(calls[0]["function"]["name"], "get_weather", "{json}");
+        let arguments: serde_json::Value = serde_json::from_str(
+            calls[0]["function"]["arguments"]
+                .as_str()
+                .unwrap_or_default(),
+        )
+        .expect("arguments are a JSON string");
+        assert_eq!(arguments["city"], "Tokyo", "{json}");
+    }
 }

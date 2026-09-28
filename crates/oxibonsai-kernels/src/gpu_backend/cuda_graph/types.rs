@@ -53,6 +53,11 @@ pub enum CudaGraphError {
     WeightNotFound(u64),
     /// The internal weight layout conversion failed (malformed bytes).
     WeightLayoutError(String),
+    /// A caller-supplied geometry was rejected before any device work:
+    /// a dimension that is zero, overflows, is not a multiple of the
+    /// kernel's block size, exceeds a kernel's compiled-in or shared-memory
+    /// limit, or disagrees with the length of a buffer it describes.
+    InvalidDimensions(String),
     /// A mutex was poisoned.
     LockPoisoned,
 }
@@ -183,6 +188,28 @@ pub(crate) struct TernaryGemvBuffers {
     pub(crate) output_capacity: usize,
 }
 impl TernaryGemvBuffers {
+    pub(crate) fn fits(&self, input_len: usize, output_len: usize) -> bool {
+        self.input_capacity >= input_len && self.output_capacity >= output_len
+    }
+}
+
+/// Reusable input/output device buffers for `encode_gemv_pq2_cached` (finding
+/// **F16**: PrismML `PQ2_0`, ggml type 142).
+///
+/// Kept as its own pool rather than sharing [`TernaryGemvBuffers`]: the two
+/// formats decode `0b11` differently (`0.0` for `TQ2_0_g128`, `+2.0` for
+/// `PQ2_0`; see `decode_pq2_code` in
+/// [`crate::gpu_backend::kernel_sources::cuda_qwen35_kernels`], the host twin
+/// of the `gemv_pq2_g128_v1` kernel's decode table), and a GEMV run against
+/// the wrong pool's weight cache would silently reuse a buffer of the right
+/// size but the wrong kind. Same growth policy as [`TernaryGemvBuffers`].
+pub(crate) struct Pq2GemvBuffers {
+    pub(crate) d_input: CudaSlice<f32>,
+    pub(crate) d_output: CudaSlice<f32>,
+    pub(crate) input_capacity: usize,
+    pub(crate) output_capacity: usize,
+}
+impl Pq2GemvBuffers {
     pub(crate) fn fits(&self, input_len: usize, output_len: usize) -> bool {
         self.input_capacity >= input_len && self.output_capacity >= output_len
     }

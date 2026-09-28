@@ -8,7 +8,7 @@
 //! The cfg gate on the parent module (`native-cuda` + Linux/Windows) applies
 //! here via module inclusion, so no additional `#[cfg(...)]` is needed.
 
-use cudarc::driver::{CudaSlice, CudaView, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaSlice, CudaView, CudaViewMut, LaunchConfig, PushKernelArg};
 
 use super::super::cuda_device_negotiation::{attn_scores_shared_bytes, ATTN_SCORES_BLOCK_DIM};
 use super::super::cuda_graph::{CudaGraph, CudaGraphError};
@@ -161,9 +161,9 @@ pub(super) unsafe fn launch_fused_qk_norm_rope(
 /// [`CudaKvCache::layer_offset_elements`](super::CudaKvCache::layer_offset_elements);
 /// the kernel parameter is `unsigned long long` (finding **F4**).
 ///
-/// **CUDA is unvalidated.** This session has no CUDA hardware; the widened
-/// argument type has never been exercised by an actual `unsigned long long`
-/// kernel launch.
+/// **CUDA is unvalidated.** No CUDA hardware has run this launch; the
+/// widened argument type has never been exercised by an actual `unsigned
+/// long long` kernel launch.
 ///
 /// # Safety
 /// All slices/views must be valid device pointers allocated on the graph's stream.
@@ -224,11 +224,12 @@ pub(super) unsafe fn launch_fused_kv_store(
 /// is now refused here rather than overrunning shared memory on the device.
 ///
 /// # Errors
-/// [`CudaGraphError::DriverError`] when `head_dim` is zero or wider than the
-/// shared-memory budget allows.
+/// [`CudaGraphError::InvalidDimensions`] when `head_dim` is zero or wider
+/// than the shared-memory budget allows (refused before any launch);
+/// [`CudaGraphError::DriverError`] when the launch itself fails.
 ///
-/// **CUDA is unvalidated.** This session has no CUDA hardware; the shared-
-/// memory sizing and the precondition below are exercised only by
+/// **CUDA is unvalidated.** No CUDA hardware has run this launch; the
+/// shared-memory sizing and the precondition below are exercised only by
 /// [`attn_scores_shared_bytes`]'s host-side unit tests, never by a real
 /// launch.
 ///
@@ -253,7 +254,7 @@ pub(super) unsafe fn launch_batched_attn_scores_v2(
     const BATCH_STRIDE: u32 = 4;
     // F3 precondition: refuse before launch rather than corrupt shared memory.
     let shared_mem_bytes = attn_scores_shared_bytes(head_dim, ATTN_SCORES_BLOCK_DIM)
-        .map_err(|e| CudaGraphError::DriverError(format!("batched_attn_scores_v2 launch: {e}")))?;
+        .map_err(CudaGraphError::InvalidDimensions)?;
     // Fixed grid Y = max_seq / BATCH_STRIDE — constant across all decode positions,
     // allowing the kernel sequence to be captured as a replayable CUDA graph.
     let grid_y = max_seq.div_ceil(BATCH_STRIDE);
@@ -365,4 +366,56 @@ pub(super) unsafe fn launch_batched_attn_weighted_sum(
         .launch(cfg)
         .map(|_| ())
         .map_err(|e| CudaGraphError::DriverError(format!("batched_attn_weighted_sum launch: {e}")))
+}
+
+/// [`launch_batched_attn_weighted_sum`], writing into a device **view**
+/// rather than an owned `&mut CudaSlice<f32>` (finding **F9**'s last
+/// per-token copy): lets a caller point the weighted-sum output directly at
+/// a column of a larger batched buffer (e.g.
+/// `pb.d_attn_out[t*nq*hd..(t+1)*nq*hd]`) without a `memcpy_dtod` afterward.
+/// Same kernel, same launch configuration, same grid/block math as
+/// [`launch_batched_attn_weighted_sum`] — only the destination argument's
+/// type differs.
+///
+/// # Safety
+/// All slices/views must be valid device pointers allocated on the graph's stream.
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn launch_batched_attn_weighted_sum_view(
+    graph: &CudaGraph,
+    mods: &CudaAttnModules,
+    d_scores: &CudaSlice<f32>,
+    d_v_cache: &CudaSlice<u16>,
+    d_attn_out: &mut CudaViewMut<'_, f32>,
+    head_dim: u32,
+    n_q: u32,
+    n_kv: u32,
+    heads_per_group: u32,
+    max_seq: u32,
+    d_pos_seqlen: &CudaView<'_, u32>,
+    cache_layer_offset: u64,
+) -> Result<(), CudaGraphError> {
+    let grid_x = head_dim.div_ceil(64);
+    let cfg = LaunchConfig {
+        grid_dim: (grid_x, n_q, 1),
+        block_dim: (64, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    graph
+        .stream_arc()
+        .launch_builder(&mods.batched_attn_weighted_sum)
+        .arg(d_scores)
+        .arg(d_v_cache)
+        .arg(d_attn_out)
+        .arg(&head_dim)
+        .arg(&n_q)
+        .arg(&n_kv)
+        .arg(&heads_per_group)
+        .arg(&max_seq)
+        .arg(d_pos_seqlen)
+        .arg(&cache_layer_offset)
+        .launch(cfg)
+        .map(|_| ())
+        .map_err(|e| {
+            CudaGraphError::DriverError(format!("batched_attn_weighted_sum (view) launch: {e}"))
+        })
 }

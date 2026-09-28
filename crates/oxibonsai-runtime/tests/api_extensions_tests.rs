@@ -19,16 +19,32 @@ use oxibonsai_runtime::api_types::{
     ToolChoice,
 };
 use oxibonsai_runtime::engine::InferenceEngine;
+use oxibonsai_runtime::engine_pool::EnginePool;
+use oxibonsai_runtime::metrics::InferenceMetrics;
 use oxibonsai_runtime::sampling::SamplingParams;
-use oxibonsai_runtime::server::create_router;
+use oxibonsai_runtime::server::{create_router_full, RouterOptions};
 
 // ── Helper ────────────────────────────────────────────────────────────────────
 
+/// Qwen3's `<|im_start|>` id: the tokenizer-less router below serves a
+/// `Qwen3Config::tiny_test()` engine (the Qwen3 vocabulary size) and runs a
+/// text prompt as this single token.
+const QWEN3_IM_START: u32 = 151_644;
+
+/// A tokenizer-less router over the tiny test model. Without a tokenizer a
+/// server needs a configured prompt start token to accept a text prompt at
+/// all, and the answer's text is empty (nothing to render it with) while
+/// `usage` and `logprobs` still count every generated token.
 fn test_router() -> axum::Router {
     let config = Qwen3Config::tiny_test();
     let params = SamplingParams::default();
     let engine = InferenceEngine::new(config, params, 42);
-    create_router(engine, None)
+    create_router_full(
+        EnginePool::new(vec![engine]),
+        None,
+        std::sync::Arc::new(InferenceMetrics::new()),
+        RouterOptions::default().with_prompt_start_token(QWEN3_IM_START),
+    )
 }
 
 // ── api_types deserialization ─────────────────────────────────────────────────
@@ -525,7 +541,7 @@ async fn test_extended_endpoint_with_logprobs() {
 
     let choices = json["choices"].as_array().expect("choices");
     assert!(!choices.is_empty());
-    // Wave-2: real per-token logprobs are now captured via the engine's
+    // Real per-token logprobs are captured via the engine's
     // logits-capturing variant and returned in the OpenAI shape
     // (`logprobs.content` is an array of {token, logprob, top_logprobs}).
     let content = choices[0]["logprobs"]["content"]
@@ -661,11 +677,11 @@ async fn test_extended_endpoint_stream_returns_sse() {
     );
 }
 
-/// `stream: true` combined with `tools` must be honestly rejected with `400`
-/// (tool-call parsing needs the complete text) rather than silently ignoring
-/// either field.
+/// `stream: true` combined with `tools` streams: each completed tool call is
+/// sent as one `tool_calls` delta (none here — the tiny model writes no
+/// call), ending in a real `finish_reason` and `[DONE]`.
 #[tokio::test]
-async fn test_extended_endpoint_stream_with_tools_rejected() {
+async fn test_extended_endpoint_stream_with_tools_streams_sse() {
     let app = test_router();
     let body = serde_json::json!({
         "messages": [
@@ -686,9 +702,50 @@ async fn test_extended_endpoint_stream_with_tools_rejected() {
     let resp = app.oneshot(req).await.expect("send request");
     assert_eq!(
         resp.status(),
-        StatusCode::BAD_REQUEST,
-        "stream:true + tools must be rejected honestly, not silently ignored"
+        StatusCode::OK,
+        "stream:true + tools must stream, not be refused"
     );
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let body_str = String::from_utf8(bytes.to_vec()).expect("SSE body must be UTF-8");
+    assert!(
+        body_str.contains("\"finish_reason\":\"stop\"")
+            || body_str.contains("\"finish_reason\":\"length\""),
+        "the stream must carry a real finish_reason: {body_str}"
+    );
+    assert!(body_str.trim_end().ends_with("data: [DONE]"), "{body_str}");
+}
+
+/// `stream: true` + `tools` + `n > 1` is refused with `400` naming `n`:
+/// several streamed choices are never interleaved.
+#[tokio::test]
+async fn test_extended_endpoint_stream_with_tools_and_n_rejected_naming_n() {
+    let app = test_router();
+    let body = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": "Call a tool"}
+        ],
+        "max_tokens": 5,
+        "stream": true,
+        "n": 2,
+        "tools": [
+            {"type": "function", "function": {"name": "get_weather"}}
+        ]
+    });
+
+    let req = Request::post("/v1/chat/completions/extended")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+        .expect("build request");
+
+    let resp = app.oneshot(req).await.expect("send request");
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: serde_json::Value = serde_json::from_slice(&bytes).expect("parse JSON");
+    assert_eq!(json["error"]["param"], "n", "{json}");
 }
 
 /// `stream: true` combined with `n > 1` must be honestly rejected with `400`.

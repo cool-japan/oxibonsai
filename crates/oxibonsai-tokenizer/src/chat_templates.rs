@@ -1,13 +1,13 @@
 //! Canned chat-template registry covering the five major open-weight
 //! instruction-tuned families, plus the real Jinja-subset rendering path
-//! (B2-13 / bonsai2-design.md §5.2) used for a model's own
+//! (bonsai2-design.md §5.2) used for a model's own
 //! `tokenizer.chat_template` and for a from-scratch, tool-call-aware
 //! ChatML/Qwen3 replacement.
 //!
 //! The five canned kinds ([`ChatTemplateKind`] / [`ChatMessage`] /
-//! [`ChatTemplateKind::render`]) are unchanged from before this package:
+//! [`ChatTemplateKind::render`]) are deliberately simple:
 //! they use only `{{ role }}` / `{{ content }}` and one `if role == "user"`,
-//! which the crate's minimal [`crate::utils::render_template`] evaluator
+//! which the crate's minimal `crate::utils::render_template` evaluator
 //! renders correctly today (TOK-07 verdict correction — do not rewrite
 //! them). What is new is [`ResolvedChatTemplate`], which renders through
 //! the real Jinja subset engine ([`crate::jinja`]) against either a model's
@@ -170,31 +170,34 @@ impl ChatTemplateKind {
 
     /// The real-Jinja-syntax replacement for this family, used by
     /// [`ResolvedChatTemplate::render_with`] — unlike [`Self::render`]
-    /// (the minimal evaluator above), this understands `tool`-role turns
-    /// and `message.tool_calls` (RT-07), matching the shape the real
-    /// Bonsai 2 template teaches the model to emit
-    /// (`<tool_call><function=NAME><parameter=KEY>…`).
+    /// (the minimal evaluator above), the ChatML/Qwen3 one renders the
+    /// `tools` block, `tool`-role turns and `message.tool_calls` (RT-07) in
+    /// the JSON `<tool_call>{"name": …, "arguments": …}</tool_call>` form
+    /// the Qwen3 models were trained on, and honours `enable_thinking`.
     ///
-    /// Compiled once per family and cached: every one of these constants is
-    /// fixed and hand-verified (see the `fallback_*_compiles` tests), so a
-    /// compile failure here can only be this crate's own regression, not
-    /// attacker- or model-supplied input.
-    pub fn fallback_jinja_template(&self) -> Arc<JinjaTemplate> {
+    /// Compiled once per family and cached (the compile result, success or
+    /// failure, is what is cached): every one of these constants is fixed
+    /// and covered by the `fallback_*_compiles` tests, so an `Err` here can
+    /// only be this crate's own regression — surfaced as the template's
+    /// compile error rather than a panic, never attacker- or model-supplied
+    /// input.
+    ///
+    /// # Errors
+    /// The [`JinjaError`] the family's built-in template failed to compile
+    /// with.
+    pub fn fallback_jinja_template(&self) -> Result<Arc<JinjaTemplate>, JinjaError> {
+        type CachedTemplate = OnceLock<Result<Arc<JinjaTemplate>, JinjaError>>;
         fn cached(
-            cell: &'static OnceLock<Arc<JinjaTemplate>>,
+            cell: &'static CachedTemplate,
             source: &'static str,
-        ) -> Arc<JinjaTemplate> {
-            Arc::clone(cell.get_or_init(|| {
-                Arc::new(JinjaTemplate::compile(source).expect(
-                    "built-in fallback chat templates are fixed, hand-verified constants \
-                     covered by fallback_*_compiles tests",
-                ))
-            }))
+        ) -> Result<Arc<JinjaTemplate>, JinjaError> {
+            cell.get_or_init(|| JinjaTemplate::compile(source).map(Arc::new))
+                .clone()
         }
-        static CHATML_QWEN: OnceLock<Arc<JinjaTemplate>> = OnceLock::new();
-        static LLAMA3: OnceLock<Arc<JinjaTemplate>> = OnceLock::new();
-        static MISTRAL: OnceLock<Arc<JinjaTemplate>> = OnceLock::new();
-        static GEMMA: OnceLock<Arc<JinjaTemplate>> = OnceLock::new();
+        static CHATML_QWEN: CachedTemplate = OnceLock::new();
+        static LLAMA3: CachedTemplate = OnceLock::new();
+        static MISTRAL: CachedTemplate = OnceLock::new();
+        static GEMMA: CachedTemplate = OnceLock::new();
         match self {
             Self::ChatML | Self::Qwen => cached(&CHATML_QWEN, FALLBACK_CHATML_JINJA),
             Self::Llama3 => cached(&LLAMA3, FALLBACK_LLAMA3_JINJA),
@@ -344,7 +347,7 @@ mod tests {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Real Jinja-subset rendering (B2-13, bonsai2-design.md §5.2)
+// Real Jinja-subset rendering (bonsai2-design.md §5.2)
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// One chat turn for [`ResolvedChatTemplate::render_with`].
@@ -442,11 +445,10 @@ pub struct RenderOptions {
     /// template's `tool | tojson` reproduces the caller's own key order
     /// byte-for-byte.
     ///
-    /// **Design-signature deviation, recorded deliberately.**
-    /// bonsai2-design.md §5.2 types this field `Option<serde_json::Value>`.
-    /// That type cannot pass this package's own G7 gate: the workspace's
-    /// `serde_json` (root `Cargo.toml`, not in this package's `owned_files`)
-    /// has neither `preserve_order` nor `raw_value` enabled, so
+    /// **Design-signature deviation.** bonsai2-design.md §5.2 types this
+    /// field `Option<serde_json::Value>`. That type cannot pass the G7
+    /// golden: the workspace's `serde_json` has neither `preserve_order`
+    /// nor `raw_value` enabled, so
     /// `serde_json::Value`'s `Map` is a `BTreeMap` — going through it
     /// *always* re-sorts object keys alphabetically, regardless of how
     /// carefully a caller builds the `Value` (see
@@ -456,15 +458,13 @@ pub struct RenderOptions {
     /// **text** and parsing it with `Value::from_json_str` — this crate's
     /// own hand-written, order-preserving `Deserialize` — is the only way
     /// to reproduce the reference renderer's byte output without either (a)
-    /// a workspace-wide `Cargo.toml` edit outside this package's
-    /// `owned_files` (turning on `serde_json/preserve_order`, which would
-    /// also reorder every other consumer's GGUF-metadata `Value`s — a
-    /// bigger, cross-cutting change than one package should make
-    /// unilaterally) or (b) `serde_json::value::RawValue`, which needs the
-    /// `raw_value` feature the same way. Recorded in this package's
-    /// `deviations`.
+    /// a workspace-wide `serde_json/preserve_order` (which would also
+    /// reorder every other consumer's GGUF-metadata `Value`s — a
+    /// cross-cutting change for a one-field need) or (b)
+    /// `serde_json::value::RawValue`, which needs the `raw_value` feature
+    /// the same way.
     ///
-    /// **Residual gap this does not close**, also recorded: a live HTTP
+    /// **What a caller must do**: a live HTTP
     /// request's `tools[].function.parameters` (an arbitrary, caller-supplied
     /// JSON Schema) is deserialized into a typed Rust request struct
     /// (`crate::api_types`-equivalent in `oxibonsai-runtime`) *before* it
@@ -487,14 +487,13 @@ pub struct RenderOptions {
 /// Kept **separate** from [`ChatTemplateKind`] rather than adding a
 /// `Jinja(Arc<JinjaTemplate>)` variant to it (bonsai2-design.md §5.2's
 /// literal signature): `ChatTemplateKind` derives `Copy, PartialEq, Eq` and
-/// `chat_template_tests.rs` (not owned by this package) relies on all
+/// `chat_template_tests.rs` relies on all
 /// three — `assert_eq!(ChatTemplateKind::infer_from_name(..),
 /// Some(ChatTemplateKind::Qwen))`, `ChatTemplateKind::all()` returning a
 /// `&'static [ChatTemplateKind]` slice by value, etc. `Arc<JinjaTemplate>`
 /// has no `PartialEq` (a `JinjaTemplate` is not meaningfully comparable) and
 /// is not `Copy`, so adding it as a variant would force dropping all three
-/// derives and break that test file, which this package may not weaken.
-/// Recorded as a design-signature deviation.
+/// derives and break that test file. A design-signature deviation.
 #[derive(Debug, Clone)]
 pub enum ResolvedChatTemplate {
     /// One of the five canned families, rendered through its real-Jinja
@@ -510,10 +509,10 @@ impl ResolvedChatTemplate {
     /// built-in Qwen3/ChatML replacement only for a model that ships **no**
     /// `tokenizer.chat_template` at all.
     ///
-    /// **Never renders garbage** (TOK-07/RT-09, spec item 1 "an unsupported
-    /// construct must ERROR"): a template this engine's Jinja subset
+    /// **Never renders garbage** (TOK-07/RT-09: an unsupported construct
+    /// must ERROR): a template this engine's Jinja subset
     /// **cannot compile** is a loud, caller-visible [`Err`], never a silent
-    /// substitution — B5 correction. An earlier revision of this function
+    /// substitution. An earlier revision of this function
     /// swapped in the fallback whenever compilation failed, with only a
     /// `tracing::warn!`; that conflated two very different situations
     /// ("no template shipped" — a legitimate, expected case the fallback
@@ -535,7 +534,7 @@ impl ResolvedChatTemplate {
     }
 
     /// The named fallback for a model that ships no `tokenizer.chat_template`
-    /// (bonsai2-design.md §5.2, spec item 1): the real-Jinja-syntax
+    /// (bonsai2-design.md §5.2): the real-Jinja-syntax
     /// ChatML/Qwen3 replacement, which — unlike the minimal
     /// [`ChatTemplateKind::Qwen`] evaluator path — renders `tool` turns and
     /// `tool_calls` correctly (RT-07's correction: "default to the Qwen3
@@ -544,10 +543,45 @@ impl ResolvedChatTemplate {
         ResolvedChatTemplate::Canned(ChatTemplateKind::Qwen)
     }
 
+    /// Whether this template teaches the Qwen3-Coder XML tool-call form
+    /// (`<tool_call>` / `<function=…>` / `<parameter=…>`, the form Bonsai 2's
+    /// own template uses) rather than the Qwen3 JSON form or none at all.
+    ///
+    /// The reference server (PrismML's llama.cpp fork, `common/chat.cpp`)
+    /// selects its dedicated Qwen3-Coder output parser for exactly the
+    /// templates whose source contains all three markers; a compiled
+    /// template keeps no source, so this renders a fixed probe conversation
+    /// (a tool definition, an assistant tool call, its response) and checks
+    /// the rendered text for the same three markers. A template that raises
+    /// on the probe is not XML-form.
+    pub fn uses_xml_tool_calls(&self) -> bool {
+        const PROBE_TOOLS: &str = r#"[{"type":"function","function":{"name":"probe_tool","description":"probe","parameters":{"type":"object","properties":{"probe_key":{"type":"string"}},"required":["probe_key"]}}}]"#;
+        const PROBE_CALLS: &str = r#"[{"type":"function","function":{"name":"probe_tool","arguments":{"probe_key":"probe_value"}}}]"#;
+        let messages = [
+            RenderMessage::new("user", "probe"),
+            RenderMessage::new("assistant", "").with_tool_calls_json(PROBE_CALLS),
+            RenderMessage::new("tool", "probe result"),
+            RenderMessage::new("user", "probe"),
+        ];
+        let opts = RenderOptions {
+            add_generation_prompt: true,
+            tools: Some(PROBE_TOOLS.to_string()),
+            ..Default::default()
+        };
+        match self.render_with(&messages, &opts) {
+            Ok(text) => {
+                text.contains("<tool_call>")
+                    && text.contains("<function=")
+                    && text.contains("<parameter=")
+            }
+            Err(_) => false,
+        }
+    }
+
     /// The compiled template this will render through.
-    fn template(&self) -> Arc<JinjaTemplate> {
+    fn template(&self) -> Result<Arc<JinjaTemplate>, JinjaError> {
         match self {
-            ResolvedChatTemplate::Jinja(tpl) => Arc::clone(tpl),
+            ResolvedChatTemplate::Jinja(tpl) => Ok(Arc::clone(tpl)),
             ResolvedChatTemplate::Canned(kind) => kind.fallback_jinja_template(),
         }
     }
@@ -565,7 +599,7 @@ impl ResolvedChatTemplate {
         opts: &RenderOptions,
     ) -> Result<String, JinjaError> {
         let ctx = build_context(messages, opts)?;
-        self.template().render(&ctx)
+        self.template()?.render(&ctx)
     }
 }
 
@@ -624,47 +658,60 @@ fn build_context(messages: &[RenderMessage], opts: &RenderOptions) -> Result<Val
 //
 // Real Jinja syntax (not the minimal evaluator's Jinja-lite subset above),
 // compiled once and cached by `ChatTemplateKind::fallback_jinja_template`.
-// The ChatML/Qwen one mirrors the real Bonsai 2 template's `tool` / assistant
-// `tool_calls` handling (`fork`'s reference shape, §5.4) exactly, so a
-// non-Bonsai-2 ChatML/Qwen model that ships no `tokenizer.chat_template`
-// still gets correct tool-call round-tripping instead of the dropped/
-// mis-rendered turns RT-07 found. Llama-3/Mistral/Gemma keep the simpler
-// system/user/assistant shape their canned constants already had — no
-// finding in this package's scope requires more from those three families.
+// The ChatML/Qwen one is the official Qwen3 template's shape: the `tools`
+// block with its JSON call-format instruction, assistant `tool_calls`
+// re-rendered as `<tool_call>{"name": …, "arguments": …}</tool_call>`, `tool`
+// turns wrapped in `<tool_response>`, and `enable_thinking: false` closing an
+// empty think block in the generation prompt — the form the legacy Qwen3
+// models that ship no `tokenizer.chat_template` were trained on (a request
+// with tools on the real ternary 1.7B comes back as a parseable call under
+// it, and not under Bonsai 2's XML instruction). Llama-3/Mistral/Gemma keep
+// the simpler system/user/assistant shape their canned constants already
+// had.
 
-const FALLBACK_CHATML_JINJA: &str = r#"{%- if not messages %}
+const FALLBACK_CHATML_JINJA: &str = r##"{%- if not messages %}
     {{- raise_exception('No messages provided.') }}
+{%- endif %}
+{%- if tools and tools is iterable and tools is not mapping %}
+    {{- '<|im_start|>system\n' }}
+    {%- if messages[0].role == 'system' %}
+        {{- messages[0].content + '\n\n' }}
+    {%- endif %}
+    {{- "# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>" }}
+    {%- for tool in tools %}
+        {{- "\n" }}
+        {{- tool | tojson }}
+    {%- endfor %}
+    {{- "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n" }}
 {%- endif %}
 {%- for message in messages %}
     {%- if message.role == "system" %}
-        {{- '<|im_start|>system\n' + message.content + '<|im_end|>\n' }}
+        {%- if not (loop.first and tools and tools is iterable and tools is not mapping) %}
+            {{- '<|im_start|>system\n' + message.content + '<|im_end|>\n' }}
+        {%- endif %}
     {%- elif message.role == "user" %}
         {{- '<|im_start|>user\n' + message.content + '<|im_end|>\n' }}
     {%- elif message.role == "assistant" %}
         {{- '<|im_start|>assistant\n' + message.content }}
         {%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping %}
             {%- for tool_call in message.tool_calls %}
+                {%- if (loop.first and message.content) or (not loop.first) %}
+                    {{- '\n' }}
+                {%- endif %}
                 {%- if tool_call.function is defined %}
                     {%- set tool_call = tool_call.function %}
                 {%- endif %}
-                {%- if loop.first %}
-                    {%- if message.content|trim %}
-                        {{- '\n\n<tool_call>\n<function=' + tool_call.name + '>\n' }}
-                    {%- else %}
-                        {{- '<tool_call>\n<function=' + tool_call.name + '>\n' }}
-                    {%- endif %}
+                {{- '<tool_call>\n{"name": "' }}
+                {{- tool_call.name }}
+                {{- '", "arguments": ' }}
+                {%- if tool_call.arguments is not defined %}
+                    {{- '{}' }}
+                {%- elif tool_call.arguments is string %}
+                    {{- tool_call.arguments }}
                 {%- else %}
-                    {{- '\n<tool_call>\n<function=' + tool_call.name + '>\n' }}
+                    {{- tool_call.arguments | tojson }}
                 {%- endif %}
-                {%- if tool_call.arguments is defined and tool_call.arguments != '' %}
-                    {%- for args_name, args_value in tool_call.arguments|items %}
-                        {{- '<parameter=' + args_name + '>\n' }}
-                        {%- set args_value = args_value | string if args_value is string else args_value | tojson | safe %}
-                        {{- args_value }}
-                        {{- '\n</parameter>\n' }}
-                    {%- endfor %}
-                {%- endif %}
-                {{- '</function>\n</tool_call>' }}
+                {{- '}\n</tool_call>' }}
             {%- endfor %}
         {%- endif %}
         {{- '<|im_end|>\n' }}
@@ -684,7 +731,10 @@ const FALLBACK_CHATML_JINJA: &str = r#"{%- if not messages %}
 {%- endfor %}
 {%- if add_generation_prompt %}
     {{- '<|im_start|>assistant\n' }}
-{%- endif %}"#;
+    {%- if enable_thinking is defined and enable_thinking is false %}
+        {{- '<think>\n\n</think>\n\n' }}
+    {%- endif %}
+{%- endif %}"##;
 
 const FALLBACK_LLAMA3_JINJA: &str = r#"{%- if not messages %}
     {{- raise_exception('No messages provided.') }}
@@ -724,12 +774,10 @@ const FALLBACK_GEMMA_JINJA: &str = r#"{%- if not messages %}
 mod resolved_template_tests {
     use super::*;
 
-    // bonsai2-design.md §5.2's real `chat_template.jinja` (176 lines,
-    // `scratchpad/hf/mlx/chat_template.jinja` — a session-scratchpad path
-    // that will not exist once this patch is merged) and the 5 golden
-    // input/output pairs of `scratchpad/golden2/apply_template.json` (G7),
-    // embedded verbatim below rather than read from either path at test
-    // time (no-absolute-paths / no-scratchpad-dependency policy).
+    // bonsai2-design.md §5.2's real `chat_template.jinja` (176 lines, the
+    // Bonsai 2 model's own) and the 5 golden input/output pairs of the
+    // reference `apply_template` run (G7), embedded verbatim below so the
+    // tests depend on no file outside the repository.
     // Regenerated byte-for-byte from the reference files by a small script
     // (`json.dumps`/literal-escaping), not hand-transcribed, to rule out
     // transcription error in a 176-line template and 5 multi-hundred-byte
@@ -1030,8 +1078,12 @@ mod resolved_template_tests {
 
     #[test]
     fn fallback_jinja_template_is_cached_same_arc() {
-        let a = ChatTemplateKind::Qwen.fallback_jinja_template();
-        let b = ChatTemplateKind::Qwen.fallback_jinja_template();
+        let a = ChatTemplateKind::Qwen
+            .fallback_jinja_template()
+            .expect("the built-in template compiles");
+        let b = ChatTemplateKind::Qwen
+            .fallback_jinja_template()
+            .expect("the built-in template compiles");
         assert!(Arc::ptr_eq(&a, &b), "must return the cached instance");
     }
 
@@ -1085,8 +1137,10 @@ mod resolved_template_tests {
             "tool role must render as a wrapped user turn, got: {out:?}"
         );
         assert!(
-            out.contains("<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>\n</tool_call>"),
-            "assistant tool_calls must round-trip into the XML shape, got: {out:?}"
+            out.contains(
+                "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tokyo\"}}\n</tool_call>"
+            ),
+            "assistant tool_calls must round-trip into the Qwen3 JSON shape, got: {out:?}"
         );
     }
 
@@ -1110,6 +1164,383 @@ mod resolved_template_tests {
         assert_eq!(out.matches("<|im_start|>user\n<tool_response>").count(), 1);
         assert!(out.contains("A=1"));
         assert!(out.contains("B=2"));
+    }
+
+    // ── The fallback's `tools` block and `enable_thinking: false` ─────────
+    //
+    // The legacy Qwen3 models the fallback serves (they ship no
+    // `tokenizer.chat_template`) were trained on the official Qwen3
+    // template's JSON tool-call form, and on the real ternary 1.7B the
+    // Bonsai 2 XML instruction does not produce a parseable call (the model
+    // drops `</tool_call>` or answers in a JSON shape with the XML's own key
+    // names), so the fallback renders tools exactly the way the official
+    // Qwen3 template does. `QWEN3_REFERENCE_TEMPLATE_FIXTURE` is that
+    // template, vendored verbatim from `Bonsai-8B.gguf`'s own
+    // `tokenizer.chat_template`; the tests below render the same
+    // conversations through both and require byte equality wherever the two
+    // are meant to agree (everything except the generation prompt: the
+    // reference always pre-closes an empty think block there, while the
+    // fallback does so only for `enable_thinking: false`, like the upstream
+    // Qwen3 template).
+
+    pub(crate) const QWEN3_REFERENCE_TEMPLATE_FIXTURE: &str = r###"{%- if tools %}
+    {{- '<|im_start|>system\n' }}
+    {%- if messages[0].role == 'system' %}
+        {{- messages[0].content + '\n\n' }}
+    {%- endif %}
+    {{- "# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>" }}
+    {%- for tool in tools %}
+        {{- "\n" }}
+        {{- tool | tojson }}
+    {%- endfor %}
+    {{- "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n" }}
+{%- else %}
+    {%- if messages[0].role == 'system' %}
+        {{- '<|im_start|>system\n' + messages[0].content + '<|im_end|>\n' }}
+    {%- endif %}
+{%- endif %}
+{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}
+{%- for message in messages[::-1] %}
+    {%- set index = (messages|length - 1) - loop.index0 %}
+    {%- if ns.multi_step_tool and message.role == "user" and message.content is string and not(message.content.startswith('<tool_response>') and message.content.endswith('</tool_response>')) %}
+        {%- set ns.multi_step_tool = false %}
+        {%- set ns.last_query_index = index %}
+    {%- endif %}
+{%- endfor %}
+{%- for message in messages %}
+    {%- if message.content is string %}
+        {%- set content = message.content %}
+    {%- else %}
+        {%- set content = '' %}
+    {%- endif %}
+    {%- if (message.role == "user") or (message.role == "system" and not loop.first) %}
+        {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}
+    {%- elif message.role == "assistant" %}
+        {%- set reasoning_content = '' %}
+        {%- if message.reasoning_content is string %}
+            {%- set reasoning_content = message.reasoning_content %}
+        {%- else %}
+            {%- if '</think>' in content %}
+                {%- set reasoning_content = content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n') %}
+                {%- set content = content.split('</think>')[-1].lstrip('\n') %}
+            {%- endif %}
+        {%- endif %}
+        {%- if loop.index0 > ns.last_query_index %}
+            {%- if loop.last or (not loop.last and reasoning_content) %}
+                {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content.strip('\n') + '\n</think>\n\n' + content.lstrip('\n') }}
+            {%- else %}
+                {{- '<|im_start|>' + message.role + '\n' + content }}
+            {%- endif %}
+        {%- else %}
+            {{- '<|im_start|>' + message.role + '\n' + content }}
+        {%- endif %}
+        {%- if message.tool_calls %}
+            {%- for tool_call in message.tool_calls %}
+                {%- if (loop.first and content) or (not loop.first) %}
+                    {{- '\n' }}
+                {%- endif %}
+                {%- if tool_call.function %}
+                    {%- set tool_call = tool_call.function %}
+                {%- endif %}
+                {{- '<tool_call>\n{"name": "' }}
+                {{- tool_call.name }}
+                {{- '", "arguments": ' }}
+                {%- if tool_call.arguments is string %}
+                    {{- tool_call.arguments }}
+                {%- else %}
+                    {{- tool_call.arguments | tojson }}
+                {%- endif %}
+                {{- '}\n</tool_call>' }}
+            {%- endfor %}
+        {%- endif %}
+        {{- '<|im_end|>\n' }}
+    {%- elif message.role == "tool" %}
+        {%- if loop.first or (messages[loop.index0 - 1].role != "tool") %}
+            {{- '<|im_start|>user' }}
+        {%- endif %}
+        {{- '\n<tool_response>\n' }}
+        {{- content }}
+        {{- '\n</tool_response>' }}
+        {%- if loop.last or (messages[loop.index0 + 1].role != "tool") %}
+            {{- '<|im_end|>\n' }}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n<think>\n\n</think>\n\n' }}
+{%- endif %}"###;
+
+    fn render_fallback(messages: &[RenderMessage], opts: &RenderOptions) -> String {
+        ResolvedChatTemplate::default_fallback()
+            .render_with(messages, opts)
+            .expect("the fallback renders")
+    }
+
+    fn render_qwen3_reference(messages: &[RenderMessage], opts: &RenderOptions) -> String {
+        ResolvedChatTemplate::Jinja(Arc::new(
+            JinjaTemplate::compile(QWEN3_REFERENCE_TEMPLATE_FIXTURE)
+                .expect("the official Qwen3 template compiles against this engine"),
+        ))
+        .render_with(messages, opts)
+        .expect("the official Qwen3 template renders")
+    }
+
+    const WEATHER_TOOLS_JSON: &str = r#"[{"type":"function","function":{"name":"get_weather","description":"Get the weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]"#;
+
+    #[test]
+    fn fallback_template_renders_the_tools_block_like_the_official_qwen3_template() {
+        for messages in [
+            vec![RenderMessage::new("user", "weather in Tokyo?")],
+            vec![
+                RenderMessage::new("system", "Be brief."),
+                RenderMessage::new("user", "weather in Tokyo?"),
+            ],
+        ] {
+            let opts = RenderOptions {
+                tools: Some(WEATHER_TOOLS_JSON.to_string()),
+                ..Default::default()
+            };
+            assert_eq!(
+                render_fallback(&messages, &opts),
+                render_qwen3_reference(&messages, &opts),
+                "messages={messages:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_template_tools_block_names_the_json_call_format_and_the_schema() {
+        let out = render_fallback(
+            &[RenderMessage::new("user", "weather?")],
+            &RenderOptions {
+                add_generation_prompt: true,
+                tools: Some(WEATHER_TOOLS_JSON.to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            out.starts_with("<|im_start|>system\n# Tools\n\n"),
+            "{out:?}"
+        );
+        assert!(
+            out.contains(
+                "\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\""
+            ),
+            "{out:?}"
+        );
+        assert!(
+            out.contains(
+                "<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n\
+                 </tool_call><|im_end|>\n<|im_start|>user\nweather?<|im_end|>\n"
+            ),
+            "{out:?}"
+        );
+        assert!(out.ends_with("<|im_start|>assistant\n"), "{out:?}");
+    }
+
+    #[test]
+    fn fallback_template_tool_call_turns_match_the_official_qwen3_template() {
+        let messages = vec![
+            RenderMessage::new("system", "sys"),
+            RenderMessage::new("user", "compare weather"),
+            RenderMessage::new("assistant", "Checking both.").with_tool_calls_json(
+                r#"[{"type":"function","function":{"name":"get_weather","arguments":{"zeta":1,"city":"Tokyo"}}},{"type":"function","function":{"name":"get_weather","arguments":{"city":"Paris"}}}]"#,
+            ),
+            RenderMessage::new("tool", "{\"temp_c\": 21}"),
+            RenderMessage::new("tool", "{\"temp_c\": 12}"),
+            RenderMessage::new("assistant", "Tokyo is warmer."),
+            RenderMessage::new("user", "thanks"),
+        ];
+        let opts = RenderOptions {
+            tools: Some(WEATHER_TOOLS_JSON.to_string()),
+            ..Default::default()
+        };
+        let fallback = render_fallback(&messages, &opts);
+        assert_eq!(fallback, render_qwen3_reference(&messages, &opts));
+        assert!(
+            fallback.contains(
+                "Checking both.\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": \
+                 {\"zeta\": 1, \"city\": \"Tokyo\"}}\n</tool_call>\n<tool_call>\n"
+            ),
+            "the caller's argument key order survives: {fallback:?}"
+        );
+    }
+
+    #[test]
+    fn fallback_template_without_tools_matches_the_official_qwen3_template() {
+        let messages = vec![
+            RenderMessage::new("system", "sys"),
+            RenderMessage::new("user", "hi"),
+            RenderMessage::new("assistant", "hello"),
+            RenderMessage::new("user", "bye"),
+        ];
+        let opts = RenderOptions::default();
+        assert_eq!(
+            render_fallback(&messages, &opts),
+            render_qwen3_reference(&messages, &opts)
+        );
+    }
+
+    #[test]
+    fn fallback_template_keeps_a_later_system_message_as_its_own_turn_with_tools() {
+        let messages = vec![
+            RenderMessage::new("user", "hi"),
+            RenderMessage::new("system", "late"),
+        ];
+        let opts = RenderOptions {
+            tools: Some(WEATHER_TOOLS_JSON.to_string()),
+            ..Default::default()
+        };
+        let out = render_fallback(&messages, &opts);
+        assert!(
+            out.ends_with("<|im_start|>user\nhi<|im_end|>\n<|im_start|>system\nlate<|im_end|>\n"),
+            "{out:?}"
+        );
+        assert_eq!(out, render_qwen3_reference(&messages, &opts));
+    }
+
+    #[test]
+    fn fallback_template_tools_keep_the_callers_key_order() {
+        let tools = r#"[{"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"string"}}}}}]"#;
+        let out = render_fallback(
+            &[RenderMessage::new("user", "x")],
+            &RenderOptions {
+                tools: Some(tools.to_string()),
+                ..Default::default()
+            },
+        );
+        let zeta = out.find("\"zeta\"").expect("zeta rendered");
+        let alpha = out.find("\"alpha\"").expect("alpha rendered");
+        assert!(zeta < alpha, "{out:?}");
+    }
+
+    #[test]
+    fn fallback_template_without_tools_renders_no_tools_block() {
+        for tools in [None, Some("[]".to_string())] {
+            let out = render_fallback(
+                &[
+                    RenderMessage::new("system", "sys"),
+                    RenderMessage::new("user", "hi"),
+                ],
+                &RenderOptions {
+                    add_generation_prompt: true,
+                    tools: tools.clone(),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                out,
+                "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n\
+                 <|im_start|>assistant\n",
+                "tools={tools:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_template_enable_thinking_false_closes_an_empty_think_block() {
+        let out = render_fallback(
+            &[RenderMessage::new("user", "What is 2+2?")],
+            &RenderOptions {
+                add_generation_prompt: true,
+                enable_thinking: Some(false),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            out,
+            "<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+        // The same generation prompt the official template renders.
+        assert!(render_qwen3_reference(
+            &[RenderMessage::new("user", "What is 2+2?")],
+            &RenderOptions {
+                add_generation_prompt: true,
+                ..Default::default()
+            },
+        )
+        .ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+    }
+
+    #[test]
+    fn fallback_template_enable_thinking_true_or_unset_opens_no_think_block() {
+        for enable_thinking in [None, Some(true)] {
+            let out = render_fallback(
+                &[RenderMessage::new("user", "What is 2+2?")],
+                &RenderOptions {
+                    add_generation_prompt: true,
+                    enable_thinking,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                out, "<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n",
+                "enable_thinking={enable_thinking:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_template_enable_thinking_false_without_a_generation_prompt_adds_nothing() {
+        let out = render_fallback(
+            &[RenderMessage::new("user", "hi")],
+            &RenderOptions {
+                enable_thinking: Some(false),
+                ..Default::default()
+            },
+        );
+        assert_eq!(out, "<|im_start|>user\nhi<|im_end|>\n");
+    }
+
+    #[test]
+    fn fallback_template_renders_a_tool_call_without_arguments_as_an_empty_object() {
+        let out = render_fallback(
+            &[
+                RenderMessage::new("user", "ping"),
+                RenderMessage::new("assistant", "")
+                    .with_tool_calls_json(r#"[{"function":{"name":"ping"}}]"#),
+            ],
+            &RenderOptions::default(),
+        );
+        assert!(
+            out.contains("<tool_call>\n{\"name\": \"ping\", \"arguments\": {}}\n</tool_call>"),
+            "{out:?}"
+        );
+    }
+
+    // ── Tool-call form classification (the reference parser's selector) ──
+
+    #[test]
+    fn uses_xml_tool_calls_recognises_the_real_bonsai2_template() {
+        let tpl = ResolvedChatTemplate::Jinja(Arc::new(compile_real_template()));
+        assert!(tpl.uses_xml_tool_calls());
+    }
+
+    #[test]
+    fn uses_xml_tool_calls_is_false_for_the_json_form_and_the_canned_families() {
+        assert!(!ResolvedChatTemplate::default_fallback().uses_xml_tool_calls());
+        let reference = ResolvedChatTemplate::Jinja(Arc::new(
+            JinjaTemplate::compile(QWEN3_REFERENCE_TEMPLATE_FIXTURE).expect("compiles"),
+        ));
+        assert!(!reference.uses_xml_tool_calls());
+        for kind in [
+            ChatTemplateKind::Llama3,
+            ChatTemplateKind::Mistral,
+            ChatTemplateKind::Gemma,
+        ] {
+            assert!(
+                !ResolvedChatTemplate::Canned(kind).uses_xml_tool_calls(),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn uses_xml_tool_calls_is_false_for_a_template_that_raises_on_the_probe() {
+        let tpl = ResolvedChatTemplate::Jinja(Arc::new(
+            JinjaTemplate::compile("{{ raise_exception('no') }}").expect("compiles"),
+        ));
+        assert!(!tpl.uses_xml_tool_calls());
     }
 
     // ── RenderMessage / RenderOptions plumbing ────────────────────────────
@@ -1199,9 +1630,9 @@ mod resolved_template_tests {
 
     #[test]
     fn from_gguf_errors_on_uncompilable_template() {
-        // B5 correction: a model that SHIPS a `tokenizer.chat_template` this
+        // A model that SHIPS a `tokenizer.chat_template` this
         // engine's Jinja subset cannot compile must surface a loud `Err`
-        // (spec item 1: "an unsupported construct must ERROR"), never
+        // (TOK-07/RT-09: an unsupported construct must ERROR), never
         // silently substitute the fallback template — that would render a
         // real prompt against a template the model was never tuned
         // against, with only a log line as the (easily-missed) signal.

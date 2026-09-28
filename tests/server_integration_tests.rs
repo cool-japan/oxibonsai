@@ -16,18 +16,36 @@ mod server_tests {
     use http_body_util::BodyExt;
     use oxibonsai_core::config::Qwen3Config;
     use oxibonsai_runtime::{
-        admin::AdminState, engine::InferenceEngine, metrics::InferenceMetrics,
-        sampling::SamplingParams, server::create_router_with_metrics,
+        admin::AdminState,
+        engine::InferenceEngine,
+        engine_pool::EnginePool,
+        metrics::InferenceMetrics,
+        sampling::SamplingParams,
+        server::{create_router_full, RouterOptions},
     };
     use serde_json::Value;
     use tower::ServiceExt;
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    /// Qwen3's `<|im_start|>` id: [`make_server`] serves a
+    /// `Qwen3Config::tiny_test()` engine (the Qwen3 vocabulary size) without
+    /// a tokenizer and runs a text prompt as this single token.
+    const QWEN3_IM_START: u32 = 151_644;
+
+    /// A tokenizer-less server over the tiny test model. Without a tokenizer
+    /// a server needs a configured prompt start token to accept a text
+    /// prompt at all (it answers `400 tokenizer_required` otherwise), and the
+    /// answer's text is empty while `usage` still counts every token.
     fn make_server() -> axum::Router {
         let engine = InferenceEngine::new(Qwen3Config::tiny_test(), SamplingParams::default(), 42);
         let metrics = Arc::new(InferenceMetrics::new());
-        create_router_with_metrics(engine, None, metrics)
+        create_router_full(
+            EnginePool::new(vec![engine]),
+            None,
+            metrics,
+            RouterOptions::default().with_prompt_start_token(QWEN3_IM_START),
+        )
     }
 
     async fn collect_body(body: Body) -> Bytes {
@@ -163,21 +181,15 @@ mod server_tests {
 
     #[tokio::test]
     async fn test_embeddings_endpoint_refuses_without_a_model_backend() {
-        // D-1 (wave 2.5, `RT-EMBEDDINGS` blocking 1; re-confirmed FIX3-BUILD,
-        // wave 3.5): `make_server()` builds its router the same way the real
+        // `RT-08`: `make_server()` builds its router the same way the real
         // `oxibonsai serve` binary does (`server.rs::create_router_full`),
-        // which mounts `/v1/embeddings` via
-        // `crate::embeddings::create_embeddings_router_requiring_model`. That
-        // constructor disables the stateless TF-IDF/`IdentityEmbedder`
-        // fallback, so with no model-backed `Embedder` installed (there is no
-        // seam to build one from yet — see `oxibonsai_runtime::embeddings`'s
-        // module docs), the endpoint must refuse honestly with `501 Not
-        // Implemented` naming the missing backend rather than silently
-        // answer `200` with a non-semantic byte-hash vector. This replaces
-        // the former `test_embeddings_endpoint_basic`, which asserted `200`
-        // against this same router and went red the moment D-1 landed; the
-        // bare, unaffected `create_embeddings_router` (still `200` by its
-        // own documented, unchanged contract) is covered elsewhere, e.g.
+        // whose `/v1/embeddings` registry requires a model backend and so
+        // disables the stateless TF-IDF/`IdentityEmbedder` fallback. With no
+        // model-backed `Embedder` installed, the endpoint must refuse
+        // honestly with `501 Not Implemented` naming the missing backend
+        // rather than silently answer `200` with a non-semantic byte-hash
+        // vector. The bare `create_embeddings_router` (still `200` by its own
+        // documented contract) is covered elsewhere, e.g.
         // `tests/cli_surface_tests.rs`'s `embeddings_base64` module and
         // `crates/oxibonsai-runtime/tests/embeddings_tests.rs`.
         let app = make_server();
@@ -199,7 +211,7 @@ mod server_tests {
             resp.status(),
             StatusCode::NOT_IMPLEMENTED,
             "/v1/embeddings must refuse with 501 when no model-backed embedder is installed \
-             (D-1: the stateless TF-IDF/identity fallback is disabled on the running server), \
+             (the stateless TF-IDF/identity fallback is disabled on the running server), \
              not silently answer 200 with a byte-hash vector"
         );
 
@@ -316,21 +328,25 @@ mod server_tests {
     }
 }
 
-/// EMBED-WIRE item 6: the model-backed `/v1/embeddings` path, proven from
+/// The model-backed `/v1/embeddings` path, proven from
 /// OUTSIDE the `oxibonsai-runtime` crate through the exact production seam
 /// (`server::create_router_full` + `RouterOptions::with_embedder`) a real
 /// `oxibonsai serve` binary uses — a distinct, additional gate from
 /// `crates/oxibonsai-runtime/tests/embeddings_model_backed.rs`'s own
 /// outside-the-crate coverage and from `server.rs`'s own in-crate
-/// `embedder_wiring` unit tests, the same way this package's sibling
+/// `embedder_wiring` unit tests, the same way the sibling
 /// `test_embeddings_endpoint_refuses_without_a_model_backend` (below, in
 /// `server_tests`) is a distinct gate from the crate's own `501` unit tests:
 /// it catches an accidental visibility regression (a type or function this
 /// needs turning non-`pub`) that no in-crate test could.
 ///
-/// Needs `native-tokenizer` (the `OxiTokenizer::char_level_stub` fixture
-/// tokenizer) in addition to `server`.
-#[cfg(all(feature = "server", feature = "native-tokenizer"))]
+/// Runs under the default `server` feature only: the synthetic GGUF is built
+/// through `oxibonsai_testkit::gguf_fixture::GgufFixtureBuilder` (a real
+/// `[dev-dependencies]` of the root package)
+/// and the fixture tokenizer is the native backend's own
+/// `TokenizerBridge::native_from_json_str`, so this module no longer needs
+/// `native-tokenizer`'s `oxibonsai-tokenizer` dependency at all.
+#[cfg(feature = "server")]
 mod model_backed_embeddings_tests {
     use std::sync::{Arc, Mutex};
 
@@ -338,10 +354,8 @@ mod model_backed_embeddings_tests {
         body::Body,
         http::{header, Request, StatusCode},
     };
-    use half::f16;
     use oxibonsai_core::config::Qwen3Config;
     use oxibonsai_core::gguf::reader::GgufFile;
-    use oxibonsai_core::gguf::writer::{GgufWriter, MetadataWriteValue, TensorEntry, TensorType};
     use oxibonsai_kernels::dispatch::KernelTier;
     use oxibonsai_model::model::BonsaiModel;
     use oxibonsai_runtime::{
@@ -353,17 +367,16 @@ mod model_backed_embeddings_tests {
         server::{create_router_full, RouterOptions},
         tokenizer_bridge::TokenizerBridge,
     };
-    use oxibonsai_tokenizer::OxiTokenizer;
+    use oxibonsai_testkit::gguf_fixture::{FixtureQuant, GgufFixtureBuilder};
+    use oxibonsai_testkit::workspace;
     use tower::ServiceExt;
 
     // Same shape recipe as
     // `crates/oxibonsai-runtime/tests/embeddings_model_backed.rs`'s own
     // synthetic fixture (proven to load and forward correctly through
-    // `BonsaiModel::from_gguf` for the `qwen3` dense architecture). Built
-    // directly on `oxibonsai_core::gguf::writer` here rather than through
-    // `oxibonsai_testkit::gguf_fixture::GgufFixtureBuilder`, because
-    // `oxibonsai-testkit` is not a dependency of THIS crate
-    // (`oxibonsai-cli`) — see this package's `deviations`.
+    // `BonsaiModel::from_gguf` for the `qwen3` dense architecture) — now
+    // built through the shared testkit builder instead of a hand-rolled
+    // byte-level copy (T-07).
     const HIDDEN: usize = 128;
     const INTER: usize = 256;
     const LAYERS: usize = 2;
@@ -383,175 +396,128 @@ mod model_backed_embeddings_tests {
         }
     }
 
-    /// A minimal deterministic linear-congruential generator, matching
-    /// `oxibonsai_testkit::gguf_fixture::Lcg`'s algorithm exactly (same
-    /// multiplier/increment) so this fixture's byte layout is the same shape
-    /// of "known-good" pattern that crate's own fixtures produce. Local
-    /// rather than imported (see the module comment above).
-    struct FixtureRng(u64);
-
-    impl FixtureRng {
-        fn new(seed: u64) -> Self {
-            Self(if seed == 0 {
-                0x9E37_79B9_7F4A_7C15
-            } else {
-                seed
-            })
-        }
-
-        fn next_u64(&mut self) -> u64 {
-            self.0 = self
-                .0
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1);
-            self.0
-        }
-
-        /// One ternary 2-bit lane in `{0, 1, 2}` — never the reserved `3`
-        /// (`0b11`), which `TQ2_0`-family kernels treat as invalid.
-        fn next_ternary_lane(&mut self) -> u8 {
-            ((self.next_u64() >> 33) % 3) as u8
-        }
-
-        /// One byte packing four valid ternary lanes.
-        fn next_valid_tq2_byte(&mut self) -> u8 {
-            let mut byte = 0u8;
-            for lane in 0..4u8 {
-                byte |= self.next_ternary_lane() << (2 * lane);
-            }
-            byte
-        }
-    }
-
-    /// `TQ2_0_g128` blob: 32 bytes of 2-bit codes (`00->-1, 01->0, 10->+1`;
-    /// `11` is reserved and never emitted) followed by a two-byte FP16
-    /// scale, per 128 weights.
-    fn tq2_0_g128_pattern(num_weights: usize, seed: u64) -> Vec<u8> {
-        assert_eq!(
-            num_weights % 128,
-            0,
-            "num_weights must be a multiple of 128"
-        );
-        let num_blocks = num_weights / 128;
-        let mut data = Vec::with_capacity(num_blocks * 34);
-        let mut rng = FixtureRng::new(seed.wrapping_add(0x9E37_79B9_7F4A_7C15));
-        for _ in 0..num_blocks {
-            for _ in 0..32 {
-                data.push(rng.next_valid_tq2_byte());
-            }
-            let scale =
-                0.25_f32 + ((rng.next_u64() >> 33) as u32 as f32) / (u32::MAX as f32) * 0.5_f32;
-            data.extend_from_slice(&f16::from_f32(scale).to_le_bytes());
-        }
-        data
-    }
-
-    /// An FP32 tensor whose values vary with the index, so no two embedding
-    /// rows are identical.
-    fn f32_pattern(n: usize, scale: f32) -> Vec<u8> {
-        let mut v = Vec::with_capacity(n * 4);
-        for i in 0..n {
-            let phase = (i as f32) * 0.013_f32;
-            let value = scale * (1.0_f32 + 0.25_f32 * phase.sin());
-            v.extend_from_slice(&value.to_le_bytes());
-        }
-        v
-    }
-
     /// A small, fully-ternary (`TQ2_0_g128`) synthetic GGUF with real,
-    /// deterministic weights.
+    /// deterministic weights, built through
+    /// [`oxibonsai_testkit::gguf_fixture::GgufFixtureBuilder`] — the same
+    /// shape (tensor names, shapes, `qwen3.*` metadata) the hand-rolled
+    /// `FixtureRng`/`tq2_0_g128_pattern`/`build_fixture_gguf` trio used to
+    /// produce, minus the local duplicate builder.
     fn build_fixture_gguf() -> Vec<u8> {
-        let mut writer = GgufWriter::new();
+        let mut builder = GgufFixtureBuilder::new();
+        builder
+            .metadata_str("general.architecture", "qwen3")
+            .metadata_str("general.name", "ServerIntegrationEmbedFixture")
+            .metadata_u32("qwen3.embedding_length", HIDDEN as u32)
+            .metadata_u32("qwen3.block_count", LAYERS as u32)
+            .metadata_u32("qwen3.attention.head_count", N_Q as u32)
+            .metadata_u32("qwen3.attention.head_count_kv", N_KV as u32)
+            .metadata_u32("qwen3.feed_forward_length", INTER as u32)
+            .metadata_u32("qwen3.vocab_size", VOCAB as u32)
+            .metadata_u32("qwen3.context_length", 512)
+            .metadata_f32("qwen3.attention.layer_norm_rms_epsilon", 1e-6)
+            .metadata_f32("qwen3.rope.freq_base", 10_000.0);
 
-        writer.add_metadata(
-            "general.architecture",
-            MetadataWriteValue::Str("qwen3".to_string()),
-        );
-        writer.add_metadata(
-            "general.name",
-            MetadataWriteValue::Str("ServerIntegrationEmbedFixture".to_string()),
-        );
-        writer.add_metadata(
-            "qwen3.embedding_length",
-            MetadataWriteValue::U32(HIDDEN as u32),
-        );
-        writer.add_metadata("qwen3.block_count", MetadataWriteValue::U32(LAYERS as u32));
-        writer.add_metadata(
-            "qwen3.attention.head_count",
-            MetadataWriteValue::U32(N_Q as u32),
-        );
-        writer.add_metadata(
-            "qwen3.attention.head_count_kv",
-            MetadataWriteValue::U32(N_KV as u32),
-        );
-        writer.add_metadata(
-            "qwen3.feed_forward_length",
-            MetadataWriteValue::U32(INTER as u32),
-        );
-        writer.add_metadata("qwen3.vocab_size", MetadataWriteValue::U32(VOCAB as u32));
-        writer.add_metadata("qwen3.context_length", MetadataWriteValue::U32(512));
-        writer.add_metadata(
-            "qwen3.attention.layer_norm_rms_epsilon",
-            MetadataWriteValue::F32(1e-6),
-        );
-        writer.add_metadata("qwen3.rope.freq_base", MetadataWriteValue::F32(10_000.0));
+        let mut seed = 1u64;
+        let mut next_seed = || {
+            seed = seed.wrapping_add(7919);
+            seed
+        };
 
-        writer.add_tensor(TensorEntry {
-            name: "token_embd.weight".to_string(),
-            shape: vec![HIDDEN as u64, VOCAB as u64],
-            tensor_type: TensorType::F32,
-            data: f32_pattern(VOCAB * HIDDEN, 0.5),
-        });
-        writer.add_tensor(TensorEntry {
-            name: "output_norm.weight".to_string(),
-            shape: vec![HIDDEN as u64],
-            tensor_type: TensorType::F32,
-            data: f32_pattern(HIDDEN, 1.0),
-        });
-        writer.add_tensor(TensorEntry {
-            name: "output.weight".to_string(),
-            shape: vec![HIDDEN as u64, VOCAB as u64],
-            tensor_type: TensorType::TQ2_0_g128,
-            data: tq2_0_g128_pattern(VOCAB * HIDDEN, 0xCAFE_BABE),
-        });
+        builder
+            .tensor(
+                "token_embd.weight",
+                &[HIDDEN as u64, VOCAB as u64],
+                FixtureQuant::F32,
+                next_seed(),
+            )
+            .expect("token_embd.weight");
+        builder
+            .tensor(
+                "output_norm.weight",
+                &[HIDDEN as u64],
+                FixtureQuant::F32,
+                next_seed(),
+            )
+            .expect("output_norm.weight");
+        builder
+            .tensor(
+                "output.weight",
+                &[HIDDEN as u64, VOCAB as u64],
+                FixtureQuant::TQ2_0_g128,
+                next_seed(),
+            )
+            .expect("output.weight: HIDDEN is a multiple of QK_TQ2_0_G128");
 
         for layer in 0..LAYERS {
             let pfx = format!("blk.{layer}");
-            for (name, dim) in [
-                ("attn_norm.weight", HIDDEN),
-                ("ffn_norm.weight", HIDDEN),
-                ("attn_q_norm.weight", HEAD_DIM),
-                ("attn_k_norm.weight", HEAD_DIM),
-            ] {
-                writer.add_tensor(TensorEntry {
-                    name: format!("{pfx}.{name}"),
-                    shape: vec![dim as u64],
-                    tensor_type: TensorType::F32,
-                    data: f32_pattern(dim, 1.0),
-                });
+            for name in ["attn_norm.weight", "ffn_norm.weight"] {
+                builder
+                    .tensor(
+                        &format!("{pfx}.{name}"),
+                        &[HIDDEN as u64],
+                        FixtureQuant::F32,
+                        next_seed(),
+                    )
+                    .expect(name);
+            }
+            for name in ["attn_q_norm.weight", "attn_k_norm.weight"] {
+                builder
+                    .tensor(
+                        &format!("{pfx}.{name}"),
+                        &[HEAD_DIM as u64],
+                        FixtureQuant::F32,
+                        next_seed(),
+                    )
+                    .expect(name);
             }
 
-            let seed = 0x2000_0000_u64.wrapping_add((layer as u64) << 16);
-            for (name, in_dim, out_dim, bump) in [
-                ("attn_q.weight", HIDDEN, N_Q * HEAD_DIM, 0u64),
-                ("attn_k.weight", HIDDEN, N_KV * HEAD_DIM, 1),
-                ("attn_v.weight", HIDDEN, N_KV * HEAD_DIM, 2),
-                ("attn_output.weight", N_Q * HEAD_DIM, HIDDEN, 3),
-                ("ffn_gate.weight", HIDDEN, INTER, 4),
-                ("ffn_up.weight", HIDDEN, INTER, 5),
-                ("ffn_down.weight", INTER, HIDDEN, 6),
+            for (name, in_dim, out_dim) in [
+                ("attn_q.weight", HIDDEN, N_Q * HEAD_DIM),
+                ("attn_k.weight", HIDDEN, N_KV * HEAD_DIM),
+                ("attn_v.weight", HIDDEN, N_KV * HEAD_DIM),
+                ("attn_output.weight", N_Q * HEAD_DIM, HIDDEN),
+                ("ffn_gate.weight", HIDDEN, INTER),
+                ("ffn_up.weight", HIDDEN, INTER),
+                ("ffn_down.weight", INTER, HIDDEN),
             ] {
-                writer.add_tensor(TensorEntry {
-                    name: format!("{pfx}.{name}"),
-                    shape: vec![in_dim as u64, out_dim as u64],
-                    tensor_type: TensorType::TQ2_0_g128,
-                    data: tq2_0_g128_pattern(in_dim * out_dim, seed.wrapping_add(bump)),
-                });
+                builder
+                    .tensor(
+                        &format!("{pfx}.{name}"),
+                        &[in_dim as u64, out_dim as u64],
+                        FixtureQuant::TQ2_0_g128,
+                        next_seed(),
+                    )
+                    .expect(name);
             }
         }
 
-        writer.to_bytes().expect("GgufWriter::to_bytes")
+        builder.build().expect("GgufFixtureBuilder::build")
     }
+
+    /// A minimal char-level HF `tokenizer.json`: one single-character `BPE`
+    /// vocab entry per lowercase ASCII letter, no merges — so the
+    /// synthetic-fixture test's own request (plain lowercase `"abcd"`,
+    /// [`synthetic_embedder`]'s only caller) always tokenizes to exactly one
+    /// token per character, the same "each char its own token" contract
+    /// `OxiTokenizer::char_level_stub` (the `native-tokenizer`-gated fixture
+    /// this replaces) used to provide — proven by
+    /// [`char_level_tokenizer_json_tokenizes_abcd_to_exactly_four_tokens`]
+    /// below rather than assumed.
+    const CHAR_LEVEL_TOKENIZER_JSON: &str = r##"{
+        "model": {
+            "type": "BPE",
+            "vocab": {
+                "a": 0, "b": 1, "c": 2, "d": 3, "e": 4, "f": 5, "g": 6, "h": 7,
+                "i": 8, "j": 9, "k": 10, "l": 11, "m": 12, "n": 13, "o": 14,
+                "p": 15, "q": 16, "r": 17, "s": 18, "t": 19, "u": 20, "v": 21,
+                "w": 22, "x": 23, "y": 24, "z": 25
+            },
+            "merges": []
+        },
+        "added_tokens": [],
+        "pre_tokenizer": { "type": "ByteLevel" },
+        "decoder": { "type": "ByteLevel" }
+    }"##;
 
     fn synthetic_embedder() -> Arc<ModelEmbedder> {
         let bytes: &'static [u8] = Box::leak(build_fixture_gguf().into_boxed_slice());
@@ -565,9 +531,10 @@ mod model_backed_embeddings_tests {
             greedy_params(),
             42,
         );
-        let tokenizer = Arc::new(TokenizerBridge::from_native_tokenizer(
-            OxiTokenizer::char_level_stub(VOCAB),
-        ));
+        let tokenizer = Arc::new(
+            TokenizerBridge::native_from_json_str(CHAR_LEVEL_TOKENIZER_JSON)
+                .expect("char-level fixture tokenizer.json must parse"),
+        );
         Arc::new(ModelEmbedder::new(Arc::new(Mutex::new(engine)), tokenizer))
     }
 
@@ -612,12 +579,34 @@ mod model_backed_embeddings_tests {
         v.iter().map(|x| x * x).sum::<f32>().sqrt()
     }
 
+    /// Pins [`CHAR_LEVEL_TOKENIZER_JSON`]'s own contract directly (no HTTP
+    /// round trip, no model): every letter of `"abcd"` is its own token, in
+    /// order, none of them the `ByteLevel` pre-tokenizer's ordinary-ASCII
+    /// identity mapping producing anything unexpected. This is what makes
+    /// `expected_tokens == 4` in the test below a checked fact rather than
+    /// an assumption baked into the vocabulary.
+    #[test]
+    fn char_level_tokenizer_json_tokenizes_abcd_to_exactly_four_tokens() {
+        let tokenizer = TokenizerBridge::native_from_json_str(CHAR_LEVEL_TOKENIZER_JSON)
+            .expect("char-level fixture tokenizer.json must parse");
+        let ids = tokenizer.encode("abcd").expect("encode");
+        assert_eq!(
+            ids,
+            vec![0, 1, 2, 3],
+            "\"abcd\" must be exactly a,b,c,d in order"
+        );
+    }
+
     /// The synthetic-fixture half of the spec's "weighted synthetic ternary
     /// GGUF from the testkit, or the real 1.7B when OXI_MODEL is set" — this
     /// one always runs, on every machine, with no model files required.
     #[tokio::test]
     async fn model_backed_embeddings_endpoint_serves_200_with_unit_norm_and_real_usage() {
         let embedder = synthetic_embedder();
+        // Derived from the fixture tokenizer itself (never hardcoded): the
+        // exact count `CHAR_LEVEL_TOKENIZER_JSON` produces for this
+        // request's own input, before `embedder` is moved into the router.
+        let expected_tokens = embedder.tokenize("abcd").expect("tokenize").len() as u64;
         let (app, metrics) = router_with_embedder(embedder);
 
         let (status, json) = post_embeddings(app, serde_json::json!({ "input": "abcd" })).await;
@@ -650,36 +639,30 @@ mod model_backed_embeddings_tests {
             "a model-backed embedding must be L2-normalised; got norm {norm}"
         );
 
-        // char-level tokenizer: "abcd" is unambiguously 4 tokens.
+        // char-level tokenizer: "abcd" is unambiguously 4 tokens — asserted
+        // directly (a fixture sanity check), not
+        // just implied by `expected_tokens`.
+        assert_eq!(
+            expected_tokens, 4,
+            "the char-level fixture must tokenize \"abcd\" to 4 tokens"
+        );
         assert_eq!(
             json["usage"]["prompt_tokens"].as_u64(),
-            Some(4),
+            Some(expected_tokens),
             "usage.prompt_tokens must come from the model's own tokenizer: {json}"
         );
 
         assert_eq!(metrics.requests_total.get(), 1);
         assert_eq!(metrics.errors_total.get(), 0);
-        assert!(metrics.prompt_tokens_total.get() > 0);
+        assert_eq!(
+            metrics.prompt_tokens_total.get(),
+            expected_tokens,
+            "prompt_tokens_total must equal the fixture tokenizer's own count for \"abcd\""
+        );
         assert!(
             (metrics.active_requests.get() - 0.0).abs() < f64::EPSILON,
             "the in-flight gauge must return to zero once the request is done"
         );
-    }
-
-    /// `tokenizer.json`'s directory: `OXIBONSAI_MODELS_DIR` if set (the same
-    /// override `oxibonsai_testkit::workspace::models_dir` honours — not
-    /// depended on directly here, see this package's `deviations`), else
-    /// `<repo-root>/models` resolved from this crate's own
-    /// `CARGO_MANIFEST_DIR` (this crate — `oxibonsai-cli` — IS the workspace
-    /// root, so no `../..` climb is needed, unlike `oxibonsai-testkit`'s own
-    /// two-levels-down crate). Never a hardcoded absolute path.
-    fn models_dir() -> std::path::PathBuf {
-        if let Ok(dir) = std::env::var("OXIBONSAI_MODELS_DIR") {
-            if !dir.trim().is_empty() {
-                return std::path::PathBuf::from(dir);
-            }
-        }
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("models")
     }
 
     /// The real-1.7B half of the spec's "or the real 1.7B when OXI_MODEL is
@@ -687,8 +670,16 @@ mod model_backed_embeddings_tests {
     /// is unset, following the same established convention
     /// `crates/oxibonsai-runtime/tests/metal_concurrency_tests.rs` uses for
     /// this exact environment variable. The tokenizer is resolved
-    /// independently via [`models_dir`], since `tokenizer.json` is a
-    /// separate file from whichever GGUF `OXI_MODEL` names.
+    /// independently via `oxibonsai_testkit::workspace::models_dir`, since
+    /// `tokenizer.json` is a separate file from whichever GGUF `OXI_MODEL`
+    /// names. This crate is a real `[dev-dependencies]` of the root package,
+    /// so this test calls the testkit's own
+    /// `$OXIBONSAI_MODELS_DIR`-or-`<repo-root>/models` resolver directly
+    /// instead of keeping a duplicate local copy; the one behavioural
+    /// difference is that the testkit version does not `trim()` the env var
+    /// before checking it is non-empty, which is immaterial here (nothing in
+    /// this workspace sets `OXIBONSAI_MODELS_DIR` to a whitespace-only
+    /// value).
     #[tokio::test]
     async fn model_backed_embeddings_endpoint_serves_200_on_the_real_1_7b_when_available() {
         let Some(model_path) = std::env::var_os("OXI_MODEL") else {
@@ -699,7 +690,7 @@ mod model_backed_embeddings_tests {
             );
             return;
         };
-        let tokenizer_path = models_dir().join("tokenizer.json");
+        let tokenizer_path = workspace::models_dir().join("tokenizer.json");
         if !tokenizer_path.exists() {
             eprintln!(
                 "model_backed_embeddings_endpoint_serves_200_on_the_real_1_7b_when_available: \
@@ -772,7 +763,11 @@ mod model_backed_embeddings_tests {
         );
         assert_eq!(metrics.requests_total.get(), 1);
         assert_eq!(metrics.errors_total.get(), 0);
-        assert!(metrics.prompt_tokens_total.get() > 0);
+        assert_eq!(
+            metrics.prompt_tokens_total.get(),
+            expected_tokens,
+            "prompt_tokens_total must equal the real tokenizer's own count for the same text"
+        );
     }
 }
 

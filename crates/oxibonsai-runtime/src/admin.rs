@@ -11,6 +11,12 @@
 //! | GET    | `/admin/cache-stats`    | KV/inference cache statistics      |
 //! | GET    | `/admin/workload-stats` | Workload aggregator + KV policy    |
 //!
+//! `/admin/status` and `/admin/config` also carry an `"engine"` object — the
+//! served engine's RESOLVED variant, quant type and EFFECTIVE kernel tier
+//! (B2-09 / REQUIRED #14, [`EngineReport`]) — whenever the serving binary
+//! supplied one ([`AdminState::with_engine_report`], or process-wide via
+//! [`register_served_engine_report`]).
+//!
 //! # Example
 //!
 //! ```rust,ignore
@@ -58,6 +64,80 @@ pub struct ServerStatus {
     pub active_connections: u64,
     /// Process resident-set-size in bytes, if available.
     pub memory_rss_bytes: Option<u64>,
+    /// The served engine's resolved identity and effective kernel tier, when
+    /// the serving binary supplied one (omitted otherwise, never guessed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine: Option<EngineReport>,
+}
+
+// ─── Served-engine report (B2-09 / REQUIRED #14) ─────────────────────────────
+
+/// What `/admin/status` and `/admin/config` report about the served engine:
+/// the RESOLVED model variant (the hybrid model's own detection or
+/// `BonsaiModel::variant()` — never the raw parse-time tensor type, which
+/// named the 27B "Custom") and the EFFECTIVE kernel tier the engine runs,
+/// with its reason. Built from a live engine by [`EngineReport::from_engine`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EngineReport {
+    /// The resolved model variant (e.g. `"Ternary-Bonsai-2-27B"`), or the
+    /// architecture when the classifier does not recognise the model.
+    pub variant: String,
+    /// The resolved dominant weight quantization (e.g. `"PQ2_0"`).
+    pub quant_type: String,
+    /// The effective kernel tier (e.g. `"neon"`, `"gpu"`).
+    pub kernel_tier: String,
+    /// Why that tier runs (`InferenceEngine::effective_tier_reason`).
+    pub kernel_tier_reason: String,
+    /// `"<quant type> <tier>"` (`InferenceEngine::kernel_label`).
+    pub kernel_label: String,
+    /// The backend the engine was built for (`auto` / `cpu` / `metal`).
+    pub backend: String,
+    /// One-line model description (`InferenceEngine::model_description`).
+    pub description: String,
+}
+
+impl EngineReport {
+    /// The report of a live `engine`, from its own accessors.
+    pub fn from_engine(engine: &crate::engine::InferenceEngine<'_>) -> Self {
+        let variant = match (engine.hybrid_model(), engine.dense_model()) {
+            (Some(hybrid), _) => hybrid.variant().map(|v| v.name().to_string()),
+            (None, Some(dense)) => Some(dense.variant().name().to_string()),
+            (None, None) => None,
+        }
+        .unwrap_or_else(|| engine.architecture().to_string());
+        Self {
+            variant,
+            quant_type: engine.dominant_quant_type().to_string(),
+            kernel_tier: engine.kernel_tier().to_string(),
+            kernel_tier_reason: engine.effective_tier_reason(),
+            kernel_label: engine.kernel_label(),
+            backend: engine.backend().as_str().to_string(),
+            description: engine.model_description(),
+        }
+    }
+}
+
+/// The process-wide served-engine report (see [`register_served_engine_report`]).
+static SERVED_ENGINE_REPORT: std::sync::RwLock<Option<EngineReport>> = std::sync::RwLock::new(None);
+
+/// Announce the engine this process serves, for every [`AdminState`] that
+/// was not given one explicitly. `oxibonsai serve` calls this once its pool
+/// is built — the admin state itself is constructed inside the router
+/// builder, which has no report parameter. A later call replaces the report
+/// (a process serves one model).
+pub fn register_served_engine_report(report: EngineReport) {
+    match SERVED_ENGINE_REPORT.write() {
+        Ok(mut slot) => *slot = Some(report),
+        Err(poisoned) => *poisoned.into_inner() = Some(report),
+    }
+}
+
+/// The report registered by [`register_served_engine_report`], if any.
+pub fn served_engine_report() -> Option<EngineReport> {
+    match SERVED_ENGINE_REPORT.read() {
+        Ok(slot) => slot.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
 }
 
 // ─── Config snapshot response ────────────────────────────────────────────────
@@ -93,6 +173,10 @@ pub struct AdminState {
     /// Optional handle to the served model's descriptor, so `/admin/config` can
     /// report the real loaded model rather than only the sampling defaults.
     pub model_info: Option<Arc<crate::server::ServedModelInfo>>,
+    /// The served engine's resolved variant and effective kernel tier
+    /// (B2-09). When unset, the process-wide
+    /// [`register_served_engine_report`] value is reported instead.
+    pub engine_report: Option<EngineReport>,
     /// Baseline snapshot of `metrics.requests_total` recorded at the last
     /// `/admin/reset-metrics` call (`0` if never reset). See
     /// [`AdminState::requests_total`] (RT-19/SV-18).
@@ -121,6 +205,7 @@ impl AdminState {
             rate_aggregator: None,
             kv_cache_policy: None,
             model_info: None,
+            engine_report: None,
             requests_baseline: AtomicU64::new(0),
             tokens_baseline: AtomicU64::new(0),
             errors_baseline: AtomicU64::new(0),
@@ -148,6 +233,19 @@ impl AdminState {
     pub fn with_model_info(mut self, info: Arc<crate::server::ServedModelInfo>) -> Self {
         self.model_info = Some(info);
         self
+    }
+
+    /// Attach the served engine's [`EngineReport`] (preferred over the
+    /// process-wide one). Builder-style consuming setter.
+    pub fn with_engine_report(mut self, report: EngineReport) -> Self {
+        self.engine_report = Some(report);
+        self
+    }
+
+    /// The engine report this admin view shows: its own, else the
+    /// process-wide one, else `None` (never guessed).
+    pub fn engine_report(&self) -> Option<EngineReport> {
+        self.engine_report.clone().or_else(served_engine_report)
     }
 
     /// Return the number of whole seconds the server has been running.
@@ -334,6 +432,7 @@ pub async fn get_status(State(state): State<Arc<AdminState>>) -> impl IntoRespon
         tokens_generated: state.tokens_generated(),
         active_connections: state.metrics.active_requests.get() as u64,
         memory_rss_bytes: rss,
+        engine: state.engine_report(),
     };
 
     (StatusCode::OK, Json(status))
@@ -355,6 +454,11 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
     };
 
     let mut body = serde_json::to_value(&snapshot).unwrap_or_else(|_| serde_json::json!({}));
+    if let (Some(report), serde_json::Value::Object(map)) = (state.engine_report(), &mut body) {
+        if let Ok(value) = serde_json::to_value(&report) {
+            map.insert("engine".to_string(), value);
+        }
+    }
     if let (Some(info), serde_json::Value::Object(map)) = (&state.model_info, &mut body) {
         let descriptor = info.descriptor().await;
         map.insert(
@@ -811,5 +915,109 @@ mod tests {
     fn iso8601_handles_leap_day() {
         // 2000-02-29 is a real leap day (divisible by 400).
         assert_eq!(unix_secs_to_iso8601(951_782_400), "2000-02-29T00:00:00Z");
+    }
+
+    // ── B2-09 / REQUIRED #14: the served engine's variant + effective tier ──
+
+    fn tiny_engine_report() -> EngineReport {
+        let engine = crate::engine::InferenceEngine::new(
+            oxibonsai_core::config::Qwen3Config::tiny_test(),
+            crate::sampling::SamplingParams::default(),
+            42,
+        );
+        EngineReport::from_engine(&engine)
+    }
+
+    #[test]
+    fn engine_report_comes_from_the_engines_own_accessors() {
+        let engine = crate::engine::InferenceEngine::new(
+            oxibonsai_core::config::Qwen3Config::tiny_test(),
+            crate::sampling::SamplingParams::default(),
+            42,
+        );
+        let report = EngineReport::from_engine(&engine);
+        assert_eq!(report.kernel_tier, engine.kernel_tier().to_string());
+        assert_eq!(report.kernel_label, engine.kernel_label());
+        assert_eq!(report.kernel_tier_reason, engine.effective_tier_reason());
+        assert_eq!(report.quant_type, engine.dominant_quant_type().to_string());
+        assert_eq!(report.backend, engine.backend().as_str());
+        assert_eq!(report.description, engine.model_description());
+        assert!(!report.variant.is_empty());
+        assert!(
+            report.kernel_label.contains(&report.quant_type),
+            "the label names the resolved quant type: {report:?}"
+        );
+    }
+
+    async fn status_and_config_json(
+        state: Arc<AdminState>,
+    ) -> (serde_json::Value, serde_json::Value) {
+        let read = |response: axum::response::Response| async move {
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            serde_json::from_slice::<serde_json::Value>(&bytes).expect("JSON")
+        };
+        let status = read(get_status(State(Arc::clone(&state))).await.into_response()).await;
+        let config = read(get_config(State(state)).await.into_response()).await;
+        (status, config)
+    }
+
+    #[tokio::test]
+    async fn status_and_config_report_the_attached_engine() {
+        let report = tiny_engine_report();
+        let state = Arc::new(
+            AdminState::new(Arc::new(InferenceMetrics::new())).with_engine_report(report.clone()),
+        );
+        let (status, config) = status_and_config_json(state).await;
+        for body in [&status, &config] {
+            assert_eq!(body["engine"]["variant"], serde_json::json!(report.variant));
+            assert_eq!(
+                body["engine"]["kernel_tier"],
+                serde_json::json!(report.kernel_tier)
+            );
+            assert_eq!(
+                body["engine"]["quant_type"],
+                serde_json::json!(report.quant_type)
+            );
+            assert_eq!(
+                body["engine"]["kernel_tier_reason"],
+                serde_json::json!(report.kernel_tier_reason)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_registered_report_is_the_fallback_and_an_attached_one_wins() {
+        let registered = EngineReport {
+            variant: "Registered-Variant".to_string(),
+            ..tiny_engine_report()
+        };
+        register_served_engine_report(registered.clone());
+        assert_eq!(served_engine_report(), Some(registered.clone()));
+
+        let fallback = Arc::new(AdminState::new(Arc::new(InferenceMetrics::new())));
+        let (status, config) = status_and_config_json(fallback).await;
+        assert_eq!(
+            status["engine"]["variant"],
+            serde_json::json!("Registered-Variant")
+        );
+        assert_eq!(
+            config["engine"]["variant"],
+            serde_json::json!("Registered-Variant")
+        );
+
+        let attached = EngineReport {
+            variant: "Attached-Variant".to_string(),
+            ..registered
+        };
+        let explicit = Arc::new(
+            AdminState::new(Arc::new(InferenceMetrics::new())).with_engine_report(attached),
+        );
+        let (status, _) = status_and_config_json(explicit).await;
+        assert_eq!(
+            status["engine"]["variant"],
+            serde_json::json!("Attached-Variant")
+        );
     }
 }

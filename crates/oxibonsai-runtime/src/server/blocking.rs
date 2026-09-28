@@ -14,8 +14,8 @@
 //! acquisition, so KV state from the previous request served by that pool
 //! replica cannot leak into this one.
 //!
-//! `completions.rs` (wave 2) and the extended non-streaming `n`-loop in
-//! `api_extensions.rs` (wave 3) have the same defect and are meant to adopt
+//! `completions.rs` and the extended non-streaming `n`-loop in
+//! `api_extensions.rs` had the same defect and are meant to adopt
 //! this helper; it is `pub(crate)` for exactly that reason.
 
 use crate::engine_pool::EngineLease;

@@ -1,10 +1,28 @@
 //! `oxibonsai chat` — interactive multi-turn conversation.
+//!
+//! Every turn renders the WHOLE conversation through the model's own chat
+//! template ([`generate::render_prompt`], B2-13 fix-pass LEAD ITEM +
+//! cli-11): the GGUF's `tokenizer.chat_template` (or the ChatML/Qwen3
+//! fallback for a file that ships none), with `--think`/`--no-think`,
+//! `--reasoning-effort` and `--tools` applied. The reply is split on the
+//! `</think>` token id into reasoning (printed to stderr, or dropped with
+//! `--hide-reasoning`) and content, and the assistant turn is appended to
+//! the history with its `reasoning_content`, so the next turn re-renders it
+//! exactly the way the reference renderer does (golden2/apply_template.json
+//! case 4). When the rendered conversation no longer fits the context
+//! window, the oldest turns are dropped (system messages are kept).
 
 use std::io::{self, BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use super::model_desc;
+use oxibonsai_runtime::config::{RenderMessage, ResolvedChatTemplate};
+use oxibonsai_runtime::sampling::PenaltyParams;
+
+use super::bonsai2;
+use super::cmd_run::{self, ConstrainedSampling, EngineLoad};
+use super::generate::{self, ChatContract, ReasoningDisplay, TokenPrinter};
+use super::model_source::ModelSource;
 use super::tokenizer_backend::TokenizerBackendChoice;
 use super::util::{
     build_sampling_params, missing_tokenizer_warning, model_vocab_size,
@@ -12,24 +30,93 @@ use super::util::{
 };
 
 /// Resolved arguments for `oxibonsai chat`, merged from CLI flags and
-/// `--config` in `mod.rs` (cli-04). See [`super::cmd_run::RunArgs`] for why
-/// this is a struct rather than positional parameters.
+/// `--config` in `mod.rs` (cli-04). See [`cmd_run::RunArgs`] for the field
+/// semantics this mirrors.
 pub(crate) struct ChatArgs {
     pub(crate) model: Option<String>,
     pub(crate) max_tokens: usize,
-    pub(crate) temperature: f32,
-    pub(crate) top_k: usize,
-    pub(crate) top_p: f32,
+    pub(crate) temperature: Option<f32>,
+    pub(crate) top_k: Option<usize>,
+    pub(crate) top_p: Option<f32>,
+    pub(crate) min_p: Option<f32>,
     pub(crate) repetition_penalty: f32,
     pub(crate) frequency_penalty: f32,
     pub(crate) presence_penalty: f32,
     pub(crate) seed: u64,
-    pub(crate) max_seq_len: usize,
+    pub(crate) max_seq_len: Option<usize>,
     pub(crate) tokenizer: Option<String>,
     pub(crate) tokenizer_backend: TokenizerBackendChoice,
     pub(crate) grammar: Option<String>,
     pub(crate) stop: Vec<String>,
+    pub(crate) backend: oxibonsai_runtime::engine_seam::Backend,
+    pub(crate) rope_scaling: oxibonsai_runtime::config::RopeScalingMode,
+    pub(crate) enable_thinking: Option<bool>,
+    pub(crate) reasoning_effort: Option<String>,
+    pub(crate) tools: Option<String>,
+    pub(crate) show_reasoning: bool,
+    pub(crate) hide_reasoning: bool,
+    pub(crate) ptq1_transcode: bool,
+    pub(crate) prefill_chunk: Option<usize>,
+    pub(crate) vision: bonsai2::VisionRequest,
     pub(crate) allow_vocab_mismatch: bool,
+}
+
+/// One rendered turn, ready to generate from.
+pub(crate) struct RenderedTurn {
+    /// The prompt token ids.
+    pub(crate) tokens: Vec<u32>,
+    /// Whether the rendered prompt left the model inside an open `<think>`.
+    pub(crate) started_in_think: bool,
+    /// How many of the oldest history messages had to be dropped to fit.
+    pub(crate) dropped_messages: usize,
+}
+
+/// Render `history` through `template` under `contract` and encode it,
+/// dropping the oldest non-system messages until the prompt plus
+/// `max_tokens` fits in `max_context` (the dropped messages are removed from
+/// `history` itself, so the conversation stays consistent with what the
+/// model saw).
+///
+/// # Errors
+///
+/// A render/encode error, or a latest message that alone does not fit.
+pub(crate) fn render_turn(
+    tok: &oxibonsai_runtime::TokenizerBridge,
+    template: &ResolvedChatTemplate,
+    history: &mut Vec<RenderMessage>,
+    contract: &ChatContract,
+    max_tokens: usize,
+    max_context: usize,
+) -> anyhow::Result<RenderedTurn> {
+    let mut dropped = 0usize;
+    loop {
+        let rendered = generate::render_prompt(template, history, contract)?;
+        let tokens = tok.encode(&rendered)?;
+        if tokens.len().saturating_add(max_tokens) <= max_context {
+            return Ok(RenderedTurn {
+                tokens,
+                started_in_think: bonsai2::prompt_opens_think_block(&rendered),
+                dropped_messages: dropped,
+            });
+        }
+        // Drop the oldest non-system message; never the latest user turn.
+        let oldest = history
+            .iter()
+            .position(|m| m.role != "system")
+            .filter(|&i| i + 1 < history.len());
+        match oldest {
+            Some(i) => {
+                history.remove(i);
+                dropped += 1;
+            }
+            None => anyhow::bail!(
+                "this message is too long for the context window: the rendered prompt is {} \
+                 tokens and --max-tokens is {max_tokens}, but --ctx is {max_context}; shorten \
+                 the message, lower --max-tokens, or raise --ctx",
+                tokens.len()
+            ),
+        }
+    }
 }
 
 pub(crate) fn run(args: ChatArgs) -> anyhow::Result<()> {
@@ -39,6 +126,7 @@ pub(crate) fn run(args: ChatArgs) -> anyhow::Result<()> {
         temperature,
         top_k,
         top_p,
+        min_p,
         repetition_penalty,
         frequency_penalty,
         presence_penalty,
@@ -48,6 +136,16 @@ pub(crate) fn run(args: ChatArgs) -> anyhow::Result<()> {
         tokenizer_backend,
         grammar,
         stop,
+        backend,
+        rope_scaling,
+        enable_thinking,
+        reasoning_effort,
+        tools,
+        show_reasoning,
+        hide_reasoning,
+        ptq1_transcode,
+        prefill_chunk,
+        vision,
         allow_vocab_mismatch,
     } = args;
 
@@ -57,78 +155,82 @@ pub(crate) fn run(args: ChatArgs) -> anyhow::Result<()> {
             anyhow::anyhow!("no model: pass --model <gguf> or set OXI_MODEL (e.g. in .env)")
         })?;
 
-    // Memory-map the GGUF file
-    let mmap = oxibonsai_core::gguf::reader::mmap_gguf_file(std::path::Path::new(&model))
-        .map_err(|e| anyhow::anyhow!("failed to open model '{model}': {e}"))?;
-    let gguf = oxibonsai_core::gguf::reader::GgufFile::parse(&mmap)?;
+    vision.reject_until_supported()?;
+    let contract = ChatContract::from_flags(enable_thinking, reasoning_effort, tools.as_deref())?;
+    let (display, _) = ReasoningDisplay::from_flags(show_reasoning, hide_reasoning);
+
+    let source = ModelSource::open(&model, ptq1_transcode)?;
+    let gguf = oxibonsai_core::gguf::reader::GgufFile::parse(source.bytes())?;
+    let arch = gguf
+        .metadata
+        .get_string(oxibonsai_core::gguf::tensor_info::keys::GENERAL_ARCHITECTURE)
+        .unwrap_or("")
+        .to_string();
+
+    let max_seq_len = cmd_run::apply_bonsai2_load_time_guards(
+        &gguf,
+        &arch,
+        source.weight_bytes(),
+        max_seq_len,
+        rope_scaling,
+    )?;
+    let sampling = cmd_run::resolve_sampling(temperature, top_k, top_p, min_p, &gguf.metadata)?;
 
     // cli-12 / orchestrator P0 addendum: same shared constructor as `run`,
     // with the same 1.0/0.0/0.0 no-hidden-penalty defaults.
-    let params = build_sampling_params(temperature, top_k, top_p, repetition_penalty);
-
-    let mut engine =
-        oxibonsai_runtime::InferenceEngine::from_gguf(&gguf, params, seed, max_seq_len)?;
-    engine.set_penalties(oxibonsai_runtime::PenaltyParams::new(
-        frequency_penalty,
-        presence_penalty,
-    ));
-
-    // cli-16: report the RESOLVED quant variant + effective kernel tier.
-    if let Ok(config) = oxibonsai_core::config::Qwen3Config::from_metadata(&gguf.metadata) {
-        let dominant_type = gguf
-            .tensors
-            .count_by_type()
-            .iter()
-            .max_by_key(|(_, count)| *count)
-            .map(|(ty, _)| *ty)
-            .unwrap_or(oxibonsai_core::GgufTensorType::Q1_0_g128);
-        let variant = oxibonsai_model::ModelVariant::from_config_and_sample_tensor_type(
-            &config,
-            dominant_type,
-        );
-        eprintln!(
-            "{}",
-            model_desc::resolved_engine_summary(
-                variant.name(),
-                dominant_type,
-                engine.kernel_tier(),
-                &engine.kernel().effective_tier_reason(),
-            )
-        );
-    }
-
-    // TOK-08: vocab-aware resolution + a hard compatibility check,
-    // regardless of whether the tokenizer path came from auto-detection
-    // or an explicit --tokenizer.
-    let expected_vocab = model_vocab_size(&gguf).ok();
-    // ENGINE-SEAM: shared with `run` (GGUF-embedded tokenizer fallback).
-    let tok = {
-        let lookup = resolve_tokenizer_vocab_aware(tokenizer.as_deref(), &model, expected_vocab);
-        let resolved = super::cmd_run::resolve_model_tokenizer(
-            tokenizer.as_deref(),
-            &lookup,
-            &gguf,
-            expected_vocab,
-            tokenizer_backend,
-            allow_vocab_mismatch,
-        )?;
-        if resolved.is_none() {
-            tracing::warn!("{}", missing_tokenizer_warning(&lookup.searched));
-        }
-        resolved
+    let params = build_sampling_params(
+        sampling.temperature,
+        sampling.top_k,
+        sampling.top_p,
+        repetition_penalty,
+    );
+    let load = EngineLoad {
+        params: params.clone(),
+        seed,
+        max_seq_len,
+        backend,
+        rope_scaling,
+        prefill_chunk,
+        penalties: PenaltyParams::new(frequency_penalty, presence_penalty),
     };
+    let mut engine = cmd_run::load_engine(&gguf, &load, source.transcoded_tensors())?;
 
-    if grammar.is_some() && tok.is_none() {
-        anyhow::bail!("--grammar requires a tokenizer; none was found (see the warning above)");
-    }
-    // Loaded once for the whole session; a fresh `ConstrainedSampler` (and
-    // therefore fresh recognizer state) is built from it every turn — see
-    // `cmd_run::build_constrained_sampler_from_grammar`'s doc.
+    // TOK-08: vocab-aware resolution + a hard compatibility check, the
+    // GGUF's own template attached, the GGUF-embedded tokenizer as the
+    // fallback (ENGINE-SEAM).
+    let expected_vocab = model_vocab_size(&gguf).ok();
+    let lookup = resolve_tokenizer_vocab_aware(tokenizer.as_deref(), &model, expected_vocab);
+    let tok = cmd_run::resolve_model_tokenizer(
+        tokenizer.as_deref(),
+        &lookup,
+        &gguf,
+        expected_vocab,
+        tokenizer_backend,
+        allow_vocab_mismatch,
+    )?;
+    let Some(tok) = tok else {
+        tracing::warn!("{}", missing_tokenizer_warning(&lookup.searched));
+        anyhow::bail!(
+            "`oxibonsai chat` renders every turn through the model's chat template and needs a \
+             tokenizer to do it; none was found. Pass --tokenizer <path/to/tokenizer.json>."
+        );
+    };
+    let template = tok.resolved_chat_template();
+    tracing::info!(
+        template = cmd_run::chat_template_source(&template),
+        template_thinks_by_default = ?bonsai2::default_enable_thinking(&template).ok(),
+        enable_thinking = ?contract.enable_thinking,
+        reasoning_effort = ?contract.reasoning_effort,
+        tools = contract.tools_json.is_some(),
+        "chat contract resolved"
+    );
+
+    // Loaded once for the whole session; a fresh `ConstrainedSampler`
+    // (fresh recognizer state) is built from it every turn.
     let cached_grammar = match &grammar {
-        Some(path) => Some(super::cmd_run::load_grammar(path)?),
+        Some(path) => Some(cmd_run::load_grammar(path)?),
         None => None,
     };
-
     let use_constrained_or_stop = cached_grammar.is_some() || !stop.is_empty();
     reject_penalties_with_constrained_decode(
         use_constrained_or_stop,
@@ -136,15 +238,17 @@ pub(crate) fn run(args: ChatArgs) -> anyhow::Result<()> {
         frequency_penalty,
         presence_penalty,
     )?;
+    // Min-p needs the CLI's own sampler; it persists across turns exactly
+    // like the engine's own sampler does, so a seeded session reproduces.
+    let mut session_sampler = generate::needs_cli_sampler(sampling.temperature, sampling.min_p)
+        .then(|| cmd_run::session_sampler(&load, sampling.min_p));
 
-    println!("OxiBonsai Interactive Chat (type 'quit' or Ctrl-D to exit)");
+    println!("OxiBonsai Interactive Chat (type 'quit' or Ctrl-D to exit, '/reset' to clear)");
     println!("Tip: press Ctrl-C during generation to interrupt output without exiting.");
     println!("---");
 
-    // Shared cancellation flag.  The ctrlc handler sets this to true;
-    // the generation receive loop checks it and drops the receiver,
-    // which causes tx.send() in generate_streaming_sync to fail and
-    // stop the generation thread naturally.
+    // Shared cancellation flag. The ctrlc handler sets it; the decode
+    // loops check it and stop within one token step.
     let interrupted = Arc::new(AtomicBool::new(false));
     {
         let flag = Arc::clone(&interrupted);
@@ -154,6 +258,7 @@ pub(crate) fn run(args: ChatArgs) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to install Ctrl-C handler: {e}"))?;
     }
 
+    let mut history: Vec<RenderMessage> = Vec::new();
     let stdin = io::stdin();
     loop {
         print!("> ");
@@ -168,7 +273,6 @@ pub(crate) fn run(args: ChatArgs) -> anyhow::Result<()> {
             }
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {
-                // Ctrl-C while waiting for input (not during generation).
                 interrupted.store(false, Ordering::SeqCst);
                 println!();
                 eprintln!("[Ctrl-C: type 'quit' or press Ctrl-D to exit]");
@@ -178,7 +282,6 @@ pub(crate) fn run(args: ChatArgs) -> anyhow::Result<()> {
         }
         let input = input.trim();
         if input.is_empty() {
-            // Reset stale interrupt flag that fired just before the prompt
             interrupted.store(false, Ordering::SeqCst);
             continue;
         }
@@ -187,52 +290,95 @@ pub(crate) fn run(args: ChatArgs) -> anyhow::Result<()> {
         }
         if input == "/reset" {
             engine.reset();
+            history.clear();
             println!("[context cleared]");
             continue;
         }
 
-        let prompt_tokens = if let Some(tok) = &tok {
-            tok.encode(input)?
-        } else {
-            // cli-07: no hardcoded token id. Without a tokenizer there is
-            // no honest way to turn `input` into token ids at all.
-            anyhow::bail!(
-                "cannot encode input: no tokenizer was found. Pass --tokenizer \
-                 <path/to/tokenizer.json>."
-            );
+        history.push(RenderMessage::new("user", input));
+        let turn = match render_turn(
+            &tok,
+            &template,
+            &mut history,
+            &contract,
+            max_tokens,
+            engine.max_context(),
+        ) {
+            Ok(turn) => turn,
+            Err(e) => {
+                history.pop();
+                eprintln!("[{e}]");
+                continue;
+            }
         };
+        if turn.dropped_messages > 0 {
+            eprintln!(
+                "[dropped the {} oldest message(s) to fit the context window]",
+                turn.dropped_messages
+            );
+        }
 
-        // Clear any stale interrupt before starting generation
         interrupted.store(false, Ordering::SeqCst);
-
         let start = std::time::Instant::now();
+        let is_interrupted = || interrupted.load(Ordering::SeqCst);
 
-        let output_count = if use_constrained_or_stop {
-            run_constrained_or_stopped_turn(
+        let (output_count, reasoning, content) = if use_constrained_or_stop {
+            let mut printer = TokenPrinter::new(Some(&tok), turn.started_in_think, display, false);
+            let count = cmd_run::run_constrained_or_stopped_with(
                 &mut engine,
-                &prompt_tokens,
+                &turn.tokens,
                 max_tokens,
                 cached_grammar.as_ref(),
                 &stop,
-                tok.as_ref(),
-                seed,
-                temperature,
-                top_k,
-                top_p,
-                &interrupted,
-            )?
+                Some(&tok),
+                &ConstrainedSampling {
+                    params: params.clone(),
+                    seed,
+                    min_p: sampling.min_p,
+                },
+                &mut printer,
+                &is_interrupted,
+            )?;
+            let stop_checker = StopChecker::new(stop.clone());
+            let truncate = |text: &str| stop_checker.truncate_at_stop(text);
+            let (reasoning, content) = printer.finish(Some(&truncate));
+            (count, reasoning, content)
         } else {
-            run_streaming_turn(
-                &mut engine,
-                &prompt_tokens,
-                max_tokens,
-                tok.as_ref(),
-                &interrupted,
-            )?
+            let mut printer = TokenPrinter::new(Some(&tok), turn.started_in_think, display, true);
+            let count = match session_sampler.as_mut() {
+                Some(sampler) => generate::decode_with_sampler(
+                    &mut engine,
+                    &turn.tokens,
+                    max_tokens,
+                    sampler,
+                    |token| {
+                        if is_interrupted() {
+                            return Ok(false);
+                        }
+                        printer.push(token)?;
+                        Ok(true)
+                    },
+                )?,
+                None => run_streaming_turn(
+                    &mut engine,
+                    &turn.tokens,
+                    max_tokens,
+                    &mut printer,
+                    &interrupted,
+                )?,
+            };
+            let (reasoning, content) = printer.finish(None);
+            (count, reasoning, content)
         };
 
         let elapsed = start.elapsed();
         println!(); // newline after streamed output
+
+        let mut reply = RenderMessage::new("assistant", content);
+        if let Some(reasoning) = reasoning {
+            reply = reply.with_reasoning_content(reasoning);
+        }
+        history.push(reply);
 
         if interrupted.swap(false, Ordering::SeqCst) {
             eprintln!("[interrupted after {output_count} tokens]");
@@ -252,21 +398,19 @@ pub(crate) fn run(args: ChatArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// One turn of the original streaming decode loop (no `--grammar`/`--stop`).
+/// One turn of the engine's own streaming decode loop (no `--grammar` /
+/// `--stop` / min-p): `generate_streaming_sync` on a worker thread, tokens
+/// printed as they arrive. Breaking out on Ctrl-C drops the receiver, which
+/// stops the generation thread within one token step.
 fn run_streaming_turn(
     engine: &mut oxibonsai_runtime::InferenceEngine<'_>,
     prompt_tokens: &[u32],
     max_tokens: usize,
-    tok: Option<&oxibonsai_runtime::TokenizerBridge>,
+    printer: &mut TokenPrinter<'_>,
     interrupted: &Arc<AtomicBool>,
 ) -> anyhow::Result<usize> {
     let (tx, rx) = std::sync::mpsc::channel::<u32>();
-
-    // Fresh decode-stream state per chat turn: each `> ` cycle is an
-    // independent generation request, so multi-byte UTF-8 buffering
-    // must NOT carry across turns.
-    let mut stream_state = tok.map(|t| t.new_decode_stream(true));
-    let output_count = std::thread::scope(|s| -> anyhow::Result<usize> {
+    std::thread::scope(|s| -> anyhow::Result<usize> {
         let thread_tx = tx.clone();
         let gen_handle =
             s.spawn(move || engine.generate_streaming_sync(prompt_tokens, max_tokens, &thread_tx));
@@ -274,121 +418,21 @@ fn run_streaming_turn(
 
         let mut count = 0usize;
         for token_id in rx {
-            // Check cancellation before printing each token. Breaking
-            // here drops the Receiver, which makes the next tx.send() in
-            // the generation thread return Err, stopping generation after
-            // at most one more forward pass.
             if interrupted.load(Ordering::SeqCst) {
                 break;
             }
             count += 1;
-            match (tok, stream_state.as_mut()) {
-                (Some(tok), Some(state)) => {
-                    if let Some(text) = tok.step_decode(state, token_id)? {
-                        print!("{text}");
-                    }
-                }
-                _ => {
-                    if count == 1 {
-                        print!("Tokens:");
-                    }
-                    print!(" {token_id}");
-                }
-            }
-            let _ = io::stdout().flush();
+            printer.push(token_id)?;
         }
-        // rx is dropped here; gen_handle will stop within one token step
-
         match gen_handle.join() {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => return Err(e.into()),
             Err(_) => return Err(anyhow::anyhow!("generation thread panicked")),
         }
         Ok(count)
-    })?;
-    Ok(output_count)
+    })
 }
 
-/// One turn of the grammar-constrained and/or stop-sequence-aware decode
-/// loop (cli-17). See [`super::cmd_run`]'s equivalent for the design
-/// rationale (single portable loop, buffered-then-printed output, no
-/// penalties applied — with or without a grammar; `run`'s caller rejects a
-/// non-default penalty before this is ever reached, see
-/// [`super::util::reject_penalties_with_constrained_decode`]).
-#[allow(clippy::too_many_arguments)]
-fn run_constrained_or_stopped_turn(
-    engine: &mut oxibonsai_runtime::InferenceEngine<'_>,
-    prompt_tokens: &[u32],
-    max_tokens: usize,
-    cached_grammar: Option<&oxibonsai_runtime::Grammar>,
-    stop: &[String],
-    tok: Option<&oxibonsai_runtime::TokenizerBridge>,
-    seed: u64,
-    temperature: f32,
-    top_k: usize,
-    top_p: f32,
-    interrupted: &Arc<AtomicBool>,
-) -> anyhow::Result<usize> {
-    engine.reset();
-    let prompt_len = prompt_tokens.len();
-    let mut logits = engine.prefill_from_pos(prompt_tokens, 0)?;
-
-    let mut constrained = cached_grammar.map(|g| {
-        super::cmd_run::build_constrained_sampler_from_grammar(
-            g.clone(),
-            tok,
-            tok.map(|t| t.vocab_size()).unwrap_or(logits.len()),
-            seed,
-            temperature,
-            top_k,
-            top_p,
-        )
-    });
-
-    let stop_checker = StopChecker::new(stop.to_vec());
-    let mut accumulated = String::new();
-    let mut stream_state = tok.map(|t| t.new_decode_stream(true));
-    let mut generated = 0usize;
-    let mut pos = prompt_len;
-
-    while generated < max_tokens {
-        if interrupted.load(Ordering::SeqCst) || logits.is_empty() {
-            break;
-        }
-        let token = match constrained.as_mut() {
-            Some(cs) => cs.sample(&mut logits),
-            None => engine.sample(&logits)?,
-        };
-        if token == engine.eos_token_id() {
-            break;
-        }
-        generated += 1;
-        match (tok, stream_state.as_mut()) {
-            (Some(tok), Some(state)) => {
-                if let Some(text) = tok.step_decode(state, token)? {
-                    accumulated.push_str(&text);
-                }
-            }
-            _ => {
-                accumulated.push(' ');
-                accumulated.push_str(&token.to_string());
-            }
-        }
-        if let Some(cs) = constrained.as_ref() {
-            if cs.is_complete() {
-                break;
-            }
-        }
-        if !stop_checker.is_empty() && stop_checker.check(&accumulated) {
-            break;
-        }
-        logits = engine.decode_step(token, pos)?;
-        pos += 1;
-    }
-
-    let truncated = stop_checker.truncate_at_stop(&accumulated);
-    print!("{truncated}");
-    io::stdout().flush()?;
-
-    Ok(generated)
-}
+#[cfg(test)]
+#[path = "cmd_chat_tests.rs"]
+mod tests;

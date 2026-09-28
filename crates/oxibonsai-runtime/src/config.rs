@@ -7,6 +7,17 @@ use std::path::Path;
 
 use crate::error::{RuntimeError, RuntimeResult};
 
+/// Chat-template rendering types (B2-13's real Jinja subset), re-exported
+/// here as part of the chat-contract configuration surface
+/// (`--think`/`--no-think`, `--reasoning-effort`, `--tools`,
+/// `[model].reasoning_effort`): a caller that depends only on
+/// `oxibonsai-runtime` — the `oxibonsai` CLI in a default build, where
+/// `oxibonsai-tokenizer` is not a direct dependency — can then render a
+/// prompt through a model's own `tokenizer.chat_template`
+/// ([`crate::TokenizerBridge::resolved_chat_template`]) with those options
+/// applied, instead of being limited to raw-text encoding.
+pub use oxibonsai_tokenizer::chat_templates::{RenderMessage, RenderOptions, ResolvedChatTemplate};
+
 /// Top-level OxiBonsai configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -19,14 +30,12 @@ pub struct OxiBonsaiConfig {
     pub model: ModelConfig,
     /// Observability settings.
     pub observability: ObservabilityConfig,
-    /// Text-to-image (Bonsai-Image) generation defaults.
-    ///
-    /// CLI-CORE deviation (B2-12 addendum item 6): this is the *enabling*
-    /// half only — an `[imagen]` config-file section that round-trips
-    /// through `OxiBonsaiConfig` and is validated like every other section.
-    /// No `run`/`chat`/`serve` code path or CLI flag reads it yet (the
-    /// `[sampling]` section has that wiring; `[imagen]` does not) — that is
-    /// B2-14's `oxibonsai image` CLI half, deliberately left to it.
+    /// Text-to-image (Bonsai-Image) generation defaults — the `[imagen]`
+    /// section. `oxibonsai image` / `oxibonsai repl` resolve their
+    /// `--width`/`--height`/`--steps`/`--seed` flags against it (flag wins,
+    /// then this section, then the CLI's own literal default), and
+    /// `output_dir`/`model_path` fill in a relative `--out` and a missing
+    /// `--dit` (B2-14).
     pub imagen: ImagenConfig,
 }
 
@@ -97,6 +106,81 @@ pub struct ModelConfig {
     /// forward/serving path yet (same integration gap as `max_context`).
     #[serde(default)]
     pub ctx_budget_bytes: Option<u64>,
+    /// RoPE long-context scaling override (wave-4b orchestrator addendum,
+    /// `RULING_bonsai8b_yarn.md`): `auto` (default) honours the GGUF's own
+    /// `<arch>.rope.scaling.*` metadata exactly; `off` forces plain RoPE;
+    /// `on` requires the file to declare scaling. Applied at model load by
+    /// [`crate::InferenceEngine::from_gguf_with_backend_and_rope`] (and the
+    /// matching engine-pool builder), which scope
+    /// [`oxibonsai_core::config::RopeScalingOverrideScope`] around the model
+    /// constructor.
+    #[serde(default)]
+    pub rope_scaling: RopeScalingMode,
+}
+
+/// `--rope-scaling`/`[model].rope_scaling` control (wave-4b orchestrator
+/// addendum, 2026-09-23; see `RULING_bonsai8b_yarn.md`).
+///
+/// Bonsai-8B's GGUF declares `qwen3.rope.scaling.{type=yarn,factor=4.0,
+/// original_context_length=16384}`; OxiBonsai <= 0.2.4 ignored it (plain
+/// RoPE at every position), while the wiring this session landed
+/// (`oxibonsai_core::config::RopeScaling::from_metadata`, M-08) honours it
+/// exactly like llama.cpp — which changes that model's decoded text at
+/// every context length, not just past 16 384 tokens. This type exists so a
+/// caller can opt back into the old behaviour (`Off`) or assert a model
+/// declares scaling at all (`On`), instead of only ever getting `Auto`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RopeScalingMode {
+    /// Honour the GGUF's own `<arch>.rope.scaling.*` metadata exactly, the
+    /// same as llama.cpp. The shipped default.
+    #[default]
+    Auto,
+    /// Force plain (unscaled) RoPE regardless of what the GGUF declares —
+    /// reproduces OxiBonsai <= 0.2.4 behaviour on a model such as Bonsai-8B
+    /// that declares YaRN.
+    Off,
+    /// Require the GGUF to declare a scaling strategy; an error (not a
+    /// silent fallback to unscaled RoPE) when it does not.
+    On,
+}
+
+impl std::fmt::Display for RopeScalingMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Auto => "auto",
+            Self::Off => "off",
+            Self::On => "on",
+        })
+    }
+}
+
+impl std::str::FromStr for RopeScalingMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            "off" => Ok(Self::Off),
+            "on" => Ok(Self::On),
+            other => Err(format!(
+                "invalid --rope-scaling value '{other}': expected one of auto, on, off"
+            )),
+        }
+    }
+}
+
+/// The serde-free core twin that the model constructors actually consult
+/// (`oxibonsai-core` has no `serde` dependency, so the configuration-facing
+/// type lives here and converts at the engine boundary).
+impl From<RopeScalingMode> for oxibonsai_core::config::RopeScalingOverride {
+    fn from(mode: RopeScalingMode) -> Self {
+        match mode {
+            RopeScalingMode::Auto => Self::Auto,
+            RopeScalingMode::Off => Self::Off,
+            RopeScalingMode::On => Self::On,
+        }
+    }
 }
 
 /// Text-to-image (Bonsai-Image / FLUX.2 Klein DiT) generation defaults.
@@ -180,8 +264,37 @@ impl Default for SamplingConfig {
             temperature: 0.7,
             top_k: 40,
             top_p: 0.9,
-            repetition_penalty: 1.1,
+            // Gatekeeper REQUIRED #18 (waves 3+3.5 review): this used to be
+            // `1.1`, one of the residual `repetition_penalty: 1.1` seeds
+            // left over after `sampling.rs`'s own `SamplingParams::default()`
+            // was corrected to `1.0` (RT-24 / gatekeeper REQUIRED #1(a)).
+            // `1.0` (no-op) matches every other penalty default in this
+            // struct and keeps `OxiBonsaiConfig::load`'s `#[serde(default)]`
+            // path and `EngineBuilder::build` from silently reintroducing a
+            // non-1.0 penalty this crate has otherwise standardised away.
+            repetition_penalty: 1.0,
             max_tokens: 512,
+        }
+    }
+}
+
+impl SamplingConfig {
+    /// Seed the defaults from a GGUF's own `general.sampling.*` metadata
+    /// (design §5.5, RT-17): `temperature`/`top_p`/`top_k` take the model's
+    /// declared values when present (Bonsai 2: 1.0 / 0.95 / 20) and fall
+    /// back to [`SamplingConfig::default`] field by field otherwise. An
+    /// explicit CLI flag, `--config` value or per-request API field is
+    /// still applied on top of this by the caller — see
+    /// [`crate::sampling::resolve_sampling_default_f32`].
+    #[must_use]
+    pub fn from_gguf_defaults(md: &oxibonsai_core::MetadataStore) -> Self {
+        let declared = crate::sampling::GgufSamplingDefaults::from_metadata(md);
+        let base = Self::default();
+        Self {
+            temperature: declared.temperature.unwrap_or(base.temperature),
+            top_k: declared.top_k.unwrap_or(base.top_k),
+            top_p: declared.top_p.unwrap_or(base.top_p),
+            ..base
         }
     }
 }
@@ -194,6 +307,7 @@ impl Default for ModelConfig {
             max_seq_len: 4096,
             max_context: None,
             ctx_budget_bytes: None,
+            rope_scaling: RopeScalingMode::default(),
         }
     }
 }
@@ -274,9 +388,18 @@ pub const OS_RESERVE_DIVISOR: u64 = 4; // 1/4 = 25%
 pub const OS_RESERVE_MIN_BYTES: u64 = 3 * 1024 * 1024 * 1024; // 3 GiB
 
 /// Bonsai 2 27B's recurrent (Gated-DeltaNet) state size per sequence, in
-/// bytes: `157_286_400` (SSM state) `+ 5_898_240` (conv1d state) — Appendix
-/// A.3/A.4's verified constant, copied verbatim rather than re-derived.
-pub const BONSAI2_RECURRENT_BYTES: u64 = 163_184_640;
+/// bytes, derived from `RecurrentCache::memory_bytes()`
+/// (`crates/oxibonsai-model/src/hybrid/model.rs`, not owned by this
+/// package): 48 linear-attention layers, each holding a conv1d state
+/// (`[3][10240]` f32 = `122_880` B — 3 = `ssm.conv_kernel - 1` causal taps
+/// over the concatenated qkv width) plus a per-v-head recurrent state `S`
+/// (`[48][128][128]` f32 = `3_145_728` B — `ssm.time_step_rank=48` v-heads x
+/// `ssm.state_size=128` x `head_v_dim=128`): `48 * (122_880 + 3_145_728) =
+/// 156_893_184`. Gatekeeper REQUIRED #8 (waves 3+3.5 review) corrected this
+/// from a stale `163_184_640` that did not match the real cache formula;
+/// this is the CODE-side half of that fix (REQUIRED #19 covers the design
+/// doc's own "~166 K" napkin-math text separately).
+pub const BONSAI2_RECURRENT_BYTES: u64 = 156_893_184;
 
 /// Bonsai 2 27B's KV cost per token at f16, from its Appendix A.3 geometry
 /// (16 full-attention slots x 4 KV heads x 256 head_dim x 2 (K+V) x 2 bytes):
@@ -285,9 +408,10 @@ pub const BONSAI2_KV_BYTES_PER_TOKEN: u64 = 65_536;
 
 /// Shipped operational default context length for Bonsai 2 (design doc
 /// §3.7/Appendix A.3: "the default stays 8192 by policy"). Deliberately far
-/// below the RAM-derived ceiling (~166 K on a 24 GiB host with PQ2_0
-/// weights): a conservative out-of-the-box default that a caller can raise
-/// explicitly, checked against [`max_context_for_budget`] via
+/// below the RAM-derived ceiling (178 176 tokens on a 24 GiB host with the
+/// PQ2_0 weights, Appendix A.3 as corrected by gatekeeper fix #19): a
+/// conservative out-of-the-box default that a caller can raise explicitly,
+/// checked against [`max_context_for_budget`] via
 /// [`validate_requested_context`].
 ///
 /// This is **not** [`ModelConfig::max_seq_len`]'s `Default::default()`
@@ -758,7 +882,9 @@ mod tests {
         assert!((cfg.sampling.temperature - 0.7).abs() < f32::EPSILON);
         assert_eq!(cfg.sampling.top_k, 40);
         assert!((cfg.sampling.top_p - 0.9).abs() < f32::EPSILON);
-        assert!((cfg.sampling.repetition_penalty - 1.1).abs() < f32::EPSILON);
+        // Gatekeeper REQUIRED #18: corrected from a stale `1.1` (see the
+        // identical note on `SamplingConfig`'s `Default` impl above).
+        assert!((cfg.sampling.repetition_penalty - 1.0).abs() < f32::EPSILON);
         assert_eq!(cfg.sampling.max_tokens, 512);
         assert_eq!(cfg.model.max_seq_len, 4096);
         assert!(cfg.model.model_path.is_none());
@@ -1163,12 +1289,14 @@ port = 4444
     /// document's illustrative "~166 K", which mixes GiB/GB units in its
     /// napkin math — "the formula, not the number, is the contract"). Using
     /// the *exact* PQ2_0 file size from Appendix A.4 (`7_206_168_928` B) and
-    /// `BONSAI2_RECURRENT_BYTES`/`BONSAI2_KV_BYTES_PER_TOKEN` on a real
-    /// 24 GiB host: `usable = 24 GiB - 7_206_168_928 - 163_184_640 -
-    /// 256 MiB - 6 GiB(=25%) = 11_689_563_808`; `11_689_563_808 / 65_536 =
-    /// 178_368`, rounded down to 1024 = `178_176` — comfortably below the
-    /// model's own 262 144 limit, and comfortably above the 8192 shipped
-    /// default.
+    /// the corrected `BONSAI2_RECURRENT_BYTES`/`BONSAI2_KV_BYTES_PER_TOKEN`
+    /// on a real 24 GiB host: `usable = 24 GiB - 7_206_168_928 -
+    /// 156_893_184 - 256 MiB - 6 GiB(=25%) = 11_695_855_264`;
+    /// `11_695_855_264 / 65_536 = 178_464`, rounded down to 1024 =
+    /// `178_176` (unchanged from the pre-fix constant's `178_368 -> 178_176`
+    /// rounding, since both fall in the same 1024-wide bucket) —
+    /// comfortably below the model's own 262 144 limit, and comfortably
+    /// above the 8192 shipped default.
     #[test]
     fn max_context_for_budget_bonsai2_27b_worked_example() {
         let total_ram = 24 * 1024 * 1024 * 1024u64;
@@ -1416,5 +1544,172 @@ port = 4444
             .validate_context_budget_for_model(&missing, 0, 65_536, 262_144)
             .expect_err("a missing model file must be a Config error, not a panic");
         assert!(matches!(err, RuntimeError::Config(_)));
+    }
+
+    // ── RopeScalingMode (wave-4b orchestrator addendum) ──
+
+    #[test]
+    fn rope_scaling_mode_defaults_to_auto() {
+        assert_eq!(RopeScalingMode::default(), RopeScalingMode::Auto);
+        assert_eq!(ModelConfig::default().rope_scaling, RopeScalingMode::Auto);
+    }
+
+    #[test]
+    fn rope_scaling_mode_from_str_round_trips_all_variants() {
+        for (s, mode) in [
+            ("auto", RopeScalingMode::Auto),
+            ("on", RopeScalingMode::On),
+            ("off", RopeScalingMode::Off),
+        ] {
+            assert_eq!(s.parse::<RopeScalingMode>().expect("valid"), mode);
+            assert_eq!(mode.to_string(), s);
+        }
+    }
+
+    #[test]
+    fn rope_scaling_mode_from_str_rejects_unknown_values() {
+        let err = "yarn".parse::<RopeScalingMode>().expect_err("must reject");
+        assert!(err.contains("yarn"));
+        assert!(err.contains("auto"));
+    }
+
+    #[test]
+    fn rope_scaling_mode_toml_round_trip() {
+        let toml_str = r#"
+[model]
+rope_scaling = "off"
+"#;
+        let cfg: OxiBonsaiConfig = toml::from_str(toml_str).expect("should parse");
+        assert_eq!(cfg.model.rope_scaling, RopeScalingMode::Off);
+
+        let empty: OxiBonsaiConfig = toml::from_str("").expect("empty parses to defaults");
+        assert_eq!(empty.model.rope_scaling, RopeScalingMode::Auto);
+    }
+
+    #[test]
+    fn rope_scaling_mode_converts_to_the_core_override() {
+        use oxibonsai_core::config::RopeScalingOverride;
+        assert_eq!(
+            RopeScalingOverride::from(RopeScalingMode::Auto),
+            RopeScalingOverride::Auto
+        );
+        assert_eq!(
+            RopeScalingOverride::from(RopeScalingMode::Off),
+            RopeScalingOverride::Off
+        );
+        assert_eq!(
+            RopeScalingOverride::from(RopeScalingMode::On),
+            RopeScalingOverride::On
+        );
+    }
+
+    /// The real Bonsai 2 27B `qwen35` hybrid geometry (design Appendix A.4),
+    /// written out field by field so these cross-checks do not depend on a
+    /// 7 GB file being present.
+    fn bonsai2_27b_hybrid_config() -> oxibonsai_core::config_hybrid::HybridConfig {
+        oxibonsai_core::config_hybrid::HybridConfig {
+            base: oxibonsai_core::config::Qwen3Config {
+                hidden_size: 5120,
+                intermediate_size: 17408,
+                num_layers: 64,
+                num_attention_heads: 24,
+                num_kv_heads: 4,
+                head_dim: 256,
+                value_length: 256,
+                vocab_size: 248_320,
+                max_context_length: 262_144,
+                rms_norm_eps: 1e-6,
+                rope_freq_base: 1.0e7,
+                rope_scaling: oxibonsai_core::config::RopeScaling::None,
+                sliding_window: None,
+                architecture: "qwen35".to_string(),
+                model_name: "Ternary-Bonsai-2-27B".to_string(),
+            },
+            full_attention_interval: 4,
+            rope_dimension_count: 64,
+            rope_sections: [11, 11, 10, 0],
+            ssm_conv_kernel: 4,
+            ssm_state_size: 128,
+            ssm_group_count: 16,
+            ssm_time_step_rank: 48,
+            ssm_inner_size: 6144,
+            nextn_predict_layers: 0,
+            sampling_top_k: Some(20),
+            sampling_top_p: Some(0.95),
+            sampling_temperature: Some(1.0),
+        }
+    }
+
+    /// Gatekeeper REQUIRED #8: `BONSAI2_RECURRENT_BYTES` must BE what the
+    /// model's own recurrent cache allocates, not a hand-copied number —
+    /// asserted against a real `RecurrentCache` built for the 27B geometry
+    /// (zero-initialised, so the ~157 MB are lazily committed pages).
+    #[test]
+    fn bonsai2_recurrent_bytes_equals_the_real_recurrent_cache() {
+        let cfg = bonsai2_27b_hybrid_config();
+        cfg.validate().expect("the 27B geometry is valid");
+        let cache = oxibonsai_model::hybrid::RecurrentCache::new(&cfg).expect("allocate cache");
+        assert_eq!(cache.memory_bytes() as u64, BONSAI2_RECURRENT_BYTES);
+        assert_eq!(BONSAI2_RECURRENT_BYTES, 156_893_184);
+    }
+
+    /// The companion constant: 16 full-attention layers x 4 KV heads x 256
+    /// head dim x 2 (K+V) x 2 bytes (f16) = 64 KiB per token.
+    #[test]
+    fn bonsai2_kv_bytes_per_token_matches_the_hybrid_geometry() {
+        let cfg = bonsai2_27b_hybrid_config();
+        assert_eq!(cfg.num_full_layers(), 16);
+        assert_eq!(cfg.num_linear_layers(), 48);
+        let derived = kv_bytes_per_token(
+            cfg.num_full_layers() as u64,
+            cfg.base.num_kv_heads as u64,
+            cfg.base.head_dim as u64,
+            2,
+        );
+        assert_eq!(derived, BONSAI2_KV_BYTES_PER_TOKEN);
+        assert_eq!(BONSAI2_KV_BYTES_PER_TOKEN, 65_536);
+    }
+
+    /// Design §5.5's `SamplingConfig::from_gguf_defaults`: the model's
+    /// declared `general.sampling.{temp,top_p,top_k}` seed the defaults,
+    /// every other field (and every undeclared one) keeps
+    /// `SamplingConfig::default()`.
+    #[test]
+    fn sampling_config_from_gguf_defaults_reads_general_sampling() {
+        use oxibonsai_core::gguf::writer::{GgufWriter, MetadataWriteValue};
+        // `general.sampling.top_k` is written as GGUF INT32 (type 5) —
+        // the type the real Bonsai 2 27B file stores it as.
+        let mut writer = GgufWriter::new();
+        writer.add_metadata(
+            "general.architecture",
+            MetadataWriteValue::Str("qwen35".to_string()),
+        );
+        writer.add_metadata("general.sampling.temp", MetadataWriteValue::F32(1.0));
+        writer.add_metadata("general.sampling.top_p", MetadataWriteValue::F32(0.95));
+        writer.add_metadata("general.sampling.top_k", MetadataWriteValue::I32(20));
+        let bytes = writer.to_bytes().expect("build fixture gguf");
+        let gguf = oxibonsai_core::gguf::reader::GgufFile::parse(&bytes).expect("parse fixture");
+
+        let cfg = SamplingConfig::from_gguf_defaults(&gguf.metadata);
+        assert!((cfg.temperature - 1.0).abs() < f32::EPSILON);
+        assert!((cfg.top_p - 0.95).abs() < f32::EPSILON);
+        assert_eq!(cfg.top_k, 20);
+        let base = SamplingConfig::default();
+        assert!((cfg.repetition_penalty - base.repetition_penalty).abs() < f32::EPSILON);
+        assert_eq!(cfg.max_tokens, base.max_tokens);
+    }
+
+    #[test]
+    fn sampling_config_from_gguf_defaults_falls_back_when_undeclared() {
+        let mut builder = oxibonsai_testkit::gguf_fixture::GgufFixtureBuilder::new();
+        builder.metadata_str("general.architecture", "qwen3");
+        let bytes = builder.build().expect("build fixture gguf");
+        let gguf = oxibonsai_core::gguf::reader::GgufFile::parse(&bytes).expect("parse fixture");
+
+        let cfg = SamplingConfig::from_gguf_defaults(&gguf.metadata);
+        let base = SamplingConfig::default();
+        assert!((cfg.temperature - base.temperature).abs() < f32::EPSILON);
+        assert!((cfg.top_p - base.top_p).abs() < f32::EPSILON);
+        assert_eq!(cfg.top_k, base.top_k);
     }
 }

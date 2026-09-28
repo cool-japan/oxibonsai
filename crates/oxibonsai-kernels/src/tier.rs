@@ -1,5 +1,5 @@
 //! [`KernelTier`] selection: the enum itself, why a [`KernelDispatcher`]
-//! ended up on its current tier ([`TierReason`]), and the pure CPU-feature
+//! ended up on its current tier (`TierReason`), and the pure CPU-feature
 //! detection logic (no [`KernelDispatcher`] field access) that picks one.
 //!
 //! Split out of `dispatch.rs` purely for file size (wave-1 / wave-1.5
@@ -76,6 +76,12 @@ pub(crate) enum TierReason {
     /// backend was tried but was not accelerated (perf-13).
     #[cfg(feature = "gpu")]
     CpuAutoDetectGpuUnavailable,
+    /// CPU tier chosen by [`KernelDispatcher::auto_detect`] because a
+    /// [`CpuOnlyBackendScope`](crate::gpu_backend::CpuOnlyBackendScope) is
+    /// active on this thread — the CPU was requested explicitly (the engine's
+    /// `Backend::Cpu`), so no GPU backend was probed and no
+    /// "GPU unavailable" warning applies.
+    CpuRequestedByScope,
     /// Tier explicitly requested via `with_tier`/`try_with_tier` and valid
     /// on this CPU (no demotion).
     Requested,

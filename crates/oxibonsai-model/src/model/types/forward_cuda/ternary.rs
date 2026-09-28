@@ -1,5 +1,6 @@
 //! TQ2 ternary CUDA path helpers and dedicated batch-prefill methods.
 
+use super::super::q1_slots::SlotNamespace;
 use super::super::{BonsaiModel, OutputWeight};
 use crate::block::blocks_as_bytes_ternary;
 
@@ -39,11 +40,24 @@ impl<'a> BonsaiModel<'a> {
         Ok(qkv_concats)
     }
 
+    /// This model's CUDA ternary slot namespace: the composition over its
+    /// `cuda_model_epoch`, shared with the Q1 slot namespace
+    /// ([`BonsaiModel::cuda_q1_slots`](super::super::q1::BonsaiModel::cuda_q1_slots))
+    /// so a model with mixed-format layers (none exist today, but the
+    /// namespace makes no such assumption) never collides a ternary layer's
+    /// slots with a Q1 one's.
+    fn cuda_ternary_slots(&self) -> SlotNamespace {
+        SlotNamespace::new(self.cuda_model_epoch)
+    }
+
     /// Build per-layer `CudaFullForwardLayerParamsTernary` for the CUDA ternary path.
     ///
-    /// Handle namespaces (distinct from Q1 CUDA ranges 1M–4M and CUDA ternary norms 5M):
-    ///   norm    handles: `5_000_000 + layer * 10 + offset`
-    ///   weight  handles: `6_000_000 + layer * 10 + offset`
+    /// Handle namespaces: every norm / weight handle is composed over this
+    /// model's `cuda_model_epoch` via [`SlotNamespace::ternary_norm_base`] /
+    /// [`SlotNamespace::ternary_weight_base`] — distinct from the Q1 ranges
+    /// ([`SlotNamespace::norm_base`]/[`SlotNamespace::weight_fallback_base`])
+    /// composed under the same namespace, and from every other model's
+    /// namespace.
     pub(super) fn build_cuda_ternary_layer_params<'b>(
         &'b self,
         qkv_concats: &'b [Vec<u8>],
@@ -55,11 +69,13 @@ impl<'a> BonsaiModel<'a> {
         if n_layers == 0 {
             return Err("no blocks".into());
         }
+        SlotNamespace::check_layer_count(n_layers)?;
+        let slots = self.cuda_ternary_slots();
         let mut layer_params: Vec<oxibonsai_kernels::CudaFullForwardLayerParamsTernary<'b>> =
             Vec::with_capacity(n_layers);
         for (i, block) in self.blocks.iter().enumerate() {
-            let norm_handle_base = 5_000_000u64 + (block.layer_index() as u64) * 10;
-            let weight_handle_base = 6_000_000u64 + (block.layer_index() as u64) * 10;
+            let norm_handle_base = slots.ternary_norm_base(block.layer_index());
+            let weight_handle_base = slots.ternary_weight_base(block.layer_index());
             layer_params.push(oxibonsai_kernels::CudaFullForwardLayerParamsTernary {
                 attn_norm_handle: norm_handle_base,
                 attn_norm_bytes: block.attn_norm_weight(),
@@ -159,10 +175,10 @@ impl<'a> BonsaiModel<'a> {
             sin_table[t * half_dim..(t + 1) * half_dim].copy_from_slice(sin_vals);
         }
 
-        let final_norm_handle = 5_900_000u64;
+        let final_norm_handle = self.cuda_ternary_slots().ternary_final_norm();
         let final_norm_bytes = self.output_norm.weight();
         let final_norm_eps = self.output_norm.eps();
-        let lm_head_handle = 7_000_000u64;
+        let lm_head_handle = self.cuda_ternary_slots().ternary_lm_head();
         let lm_head_bytes = blocks_as_bytes_ternary(lm_head_ternary.blocks());
         let lm_head_out_features = lm_head_ternary.out_features();
 
@@ -237,10 +253,10 @@ impl<'a> BonsaiModel<'a> {
         let heads_per_group = nq.checked_div(nkv).unwrap_or(1);
         let max_seq_len = self.kv_cache.max_seq_len();
 
-        let final_norm_handle = 5_900_000u64;
+        let final_norm_handle = self.cuda_ternary_slots().ternary_final_norm();
         let final_norm_bytes = self.output_norm.weight();
         let final_norm_eps = self.output_norm.eps();
-        let lm_head_handle = 7_000_000u64;
+        let lm_head_handle = self.cuda_ternary_slots().ternary_lm_head();
         let lm_head_bytes = blocks_as_bytes_ternary(lm_head_ternary.blocks());
         let lm_head_out_features = lm_head_ternary.out_features();
 

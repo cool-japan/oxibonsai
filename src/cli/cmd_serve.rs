@@ -1,19 +1,36 @@
 //! `oxibonsai serve` — OpenAI-compatible HTTP API server.
 //!
 //! Mirrors the hardening the standalone `oxibonsai-serve` binary applies
-//! (`crates/oxibonsai-serve/src/main.rs`), adapted to the flags this
-//! subcommand actually exposes (`src/cli/args.rs`'s `Serve` variant, owned
-//! by CLI-CORE this wave — not touched here). Knobs with no CLI flag yet
-//! (CORS, rate limiting, the admin token, `--insecure-no-auth`, the request
-//! body ceiling) are read from `OXIBONSAI_*` environment variables instead;
-//! see this package's recorded deviations for the exact flags CLI-CORE
-//! should add to `args.rs` next.
+//! (`crates/oxibonsai-serve/src/hardening.rs`) with the same layer order —
+//! routes → admission (concurrency + timeout) → `DefaultBodyLimit` →
+//! `Content-Length` precheck → rate limit → bearer auth → CORS — and exposes
+//! every hardening knob as a flag (each wins over its `OXIBONSAI_*`
+//! environment variable; see `oxibonsai serve --help`).
+//!
+//! Model-dependent behaviour is resolved once the GGUF is parsed:
+//!
+//! * the context window defaults to 8192 for a Bonsai 2 `qwen35` model
+//!   (4096 otherwise) and is refused above the model's own limit or the
+//!   RAM-derived one (REQUIRED #8);
+//! * the pool's baseline sampling parameters are the model's own
+//!   `general.sampling.*` defaults (RT-17; Bonsai 2: 1.0 / 0.95 / 20), each
+//!   per-request field overriding them;
+//! * the tokenizer goes through the same vocab-aware ladder and hard
+//!   compatibility check as `run` (TOK-08), with the GGUF's own chat
+//!   template attached (B2-13 fix-pass LEAD ITEM);
+//! * `--think`/`--no-think`, `--reasoning-effort` and `--tools` become the
+//!   server-wide defaults a chat request inherits when it carries none of
+//!   its own ([`inject_chat_defaults`]).
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use axum::extract::DefaultBodyLimit;
+use axum::body::Body;
+use axum::extract::{DefaultBodyLimit, State};
+use axum::http::{Request, StatusCode};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use axum::Router;
 use oxibonsai_runtime::middleware::{apply_middleware, CorsConfig, MiddlewareConfig};
 use oxibonsai_runtime::rate_limiter::{rate_limit_layer, RateLimitConfig};
@@ -24,53 +41,140 @@ use oxibonsai_runtime::server::{
 };
 
 use super::admission;
-use super::util::{build_sampling_params, missing_tokenizer_warning, resolve_tokenizer};
+use super::args::EmbeddingBackendChoice;
+use super::bonsai2;
+use super::generate::ChatContract;
+use super::model_desc;
+use super::model_source::ModelSource;
+use super::util::{build_sampling_params, missing_tokenizer_warning};
 
-// ─── FIX2-SERVE item 6: the same resolved defaults `src/cli/mod.rs` uses ───
+// ─── RT-17: the pool's baseline sampling parameters ────────────────────────
 //
-// `run`/`chat`/`benchmark`/`eval` resolve their `--temperature`/`--top-k`/
-// `--top-p`/`--repetition-penalty` flags (all `Option<T>` in `args.rs`) to
-// these exact literals when the operator passes none of them (see
-// `src/cli/mod.rs`'s `util::resolve_f32(.., "sampling", "temperature", 0.7)`
-// and siblings). This subcommand has no equivalent flags yet (B2-14, wave
-// 4), so these constants stand in for "what the flag would have defaulted
-// to" and are passed to the SAME shared `build_sampling_params` constructor,
-// so a test can assert the two paths agree byte-for-byte.
-const DEFAULT_SAMPLING_TEMPERATURE: f32 = 0.7;
-const DEFAULT_SAMPLING_TOP_K: usize = 40;
-const DEFAULT_SAMPLING_TOP_P: f32 = 0.9;
-const DEFAULT_SAMPLING_REPETITION_PENALTY: f32 = 1.0;
+// The pre-RT-17 literals (`run`/`chat`'s own final fallbacks) apply only
+// when the model declares no `general.sampling.*` value; `repetition_penalty`
+// is always the no-op 1.0 (FIX2-SERVE item 6: never the hidden non-1.0 value
+// an old `SamplingParams::default()` carried).
 
-/// The baseline `SamplingParams` this server builds its engine pool with,
-/// before any per-request JSON-body override (FIX2-SERVE item 6). Routed
-/// through the same shared `build_sampling_params` constructor CLI-CORE
-/// added for `run`/`chat`/`benchmark`/`eval`, with the same resolved
-/// defaults, instead of `SamplingParams::default()` (whose own
-/// `repetition_penalty` is `1.1`). Factored out of [`run`] so it is
-/// directly unit-testable against the run path's own resolved defaults
-/// without needing a real GGUF model.
-fn default_sampling_params() -> oxibonsai_runtime::sampling::SamplingParams {
+/// The baseline `SamplingParams` the engine pool is built with, before any
+/// per-request JSON-body override: the model's own `general.sampling.*`
+/// defaults (RT-17), else the shared `util::DEFAULT_*` literals — through the
+/// SAME shared `build_sampling_params` constructor `run`/`chat` use.
+fn baseline_sampling_params(
+    declared: &oxibonsai_runtime::sampling::GgufSamplingDefaults,
+) -> oxibonsai_runtime::sampling::SamplingParams {
+    use super::util::{
+        DEFAULT_REPETITION_PENALTY, DEFAULT_TEMPERATURE, DEFAULT_TOP_K, DEFAULT_TOP_P,
+    };
+    use oxibonsai_runtime::sampling::{
+        resolve_sampling_default_f32, resolve_sampling_default_usize,
+    };
     build_sampling_params(
-        DEFAULT_SAMPLING_TEMPERATURE,
-        DEFAULT_SAMPLING_TOP_K,
-        DEFAULT_SAMPLING_TOP_P,
-        DEFAULT_SAMPLING_REPETITION_PENALTY,
+        resolve_sampling_default_f32(None, declared.temperature, DEFAULT_TEMPERATURE),
+        resolve_sampling_default_usize(None, declared.top_k, DEFAULT_TOP_K),
+        resolve_sampling_default_f32(None, declared.top_p, DEFAULT_TOP_P),
+        DEFAULT_REPETITION_PENALTY,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn run(
-    model: Option<String>,
-    host: String,
-    port: u16,
-    max_seq_len: usize,
-    tokenizer: Option<String>,
-    pool_size: Option<usize>,
-    bearer_token: Option<String>,
-    max_concurrent_requests: usize,
-    request_timeout_ms: u64,
-    #[cfg(feature = "rag")] rag: bool,
-) -> anyhow::Result<()> {
+/// The baseline for a model that declares no sampling defaults at all
+/// (exactly what `run`/`chat` resolve to with no flag, no config value and
+/// no `general.sampling.*` metadata).
+#[cfg(test)]
+fn default_sampling_params() -> oxibonsai_runtime::sampling::SamplingParams {
+    baseline_sampling_params(&oxibonsai_runtime::sampling::GgufSamplingDefaults::default())
+}
+
+/// Resolved arguments for `oxibonsai serve`, merged from CLI flags and
+/// `--config` in `mod.rs` (cli-04).
+pub(crate) struct ServeArgs {
+    pub(crate) model: Option<String>,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    /// `None` = the per-architecture default (8192 for `qwen35`, else 4096).
+    pub(crate) max_seq_len: Option<usize>,
+    pub(crate) tokenizer: Option<String>,
+    pub(crate) pool_size: Option<usize>,
+    pub(crate) bearer_token: Option<String>,
+    pub(crate) max_concurrent_requests: usize,
+    pub(crate) request_timeout_ms: u64,
+    #[cfg(feature = "rag")]
+    pub(crate) rag: bool,
+    pub(crate) backend: oxibonsai_runtime::engine_seam::Backend,
+    pub(crate) rope_scaling: oxibonsai_runtime::config::RopeScalingMode,
+    /// cli-11 server-wide defaults (a request's own fields always win).
+    pub(crate) enable_thinking: Option<bool>,
+    pub(crate) reasoning_effort: Option<String>,
+    pub(crate) tools: Option<String>,
+    /// F-M4: already applied to `OXIBONSAI_CUDA_DEVICE` before the async
+    /// runtime started (`mod.rs::apply_pre_runtime_env`); kept for the log.
+    pub(crate) cuda_device: Option<u32>,
+    pub(crate) bearer_token_file: Option<String>,
+    pub(crate) rate_limit_rpm: Option<u32>,
+    pub(crate) rate_limit_burst: Option<u32>,
+    pub(crate) cors_origin: Option<String>,
+    pub(crate) cors_allow_credentials: bool,
+    pub(crate) max_body_bytes: Option<u64>,
+    /// SV-26: mount the bundled UI at `GET /ui`.
+    pub(crate) enable_ui: bool,
+    /// SV-28: hard ceiling on a request's effective `max_tokens`.
+    pub(crate) max_output_tokens: Option<usize>,
+    pub(crate) ptq1_transcode: bool,
+    pub(crate) prefill_chunk: Option<usize>,
+    /// §5.7 vision flags: validated, then a typed `NOT_YET_SUPPORTED`.
+    pub(crate) vision: bonsai2::VisionRequest,
+    pub(crate) embedding_backend: EmbeddingBackendChoice,
+    /// `--embedding-corpus`: the documents `--embedding-backend tfidf`
+    /// fits its vocabulary on.
+    pub(crate) embedding_corpus: Option<String>,
+}
+
+pub(crate) async fn run(args: ServeArgs) -> anyhow::Result<()> {
+    let ServeArgs {
+        model,
+        host,
+        port,
+        max_seq_len,
+        tokenizer,
+        pool_size,
+        bearer_token,
+        max_concurrent_requests,
+        request_timeout_ms,
+        #[cfg(feature = "rag")]
+        rag,
+        backend,
+        rope_scaling,
+        enable_thinking,
+        reasoning_effort,
+        tools,
+        cuda_device,
+        bearer_token_file,
+        rate_limit_rpm,
+        rate_limit_burst,
+        cors_origin,
+        cors_allow_credentials,
+        max_body_bytes,
+        enable_ui,
+        max_output_tokens,
+        ptq1_transcode,
+        prefill_chunk,
+        vision,
+        embedding_backend,
+        embedding_corpus,
+    } = args;
+
+    vision.reject_until_supported()?;
+    // `--embedding-backend tfidf`: the corpus is read and validated before
+    // any model is resolved or loaded.
+    let tfidf_corpus = resolve_tfidf_corpus(embedding_backend, embedding_corpus.as_deref())?;
+    if let Some(device) = cuda_device {
+        tracing::info!(
+            device,
+            "CUDA device ordinal applied via OXIBONSAI_CUDA_DEVICE before the async runtime \
+             started (takes effect on a native-CUDA build)"
+        );
+    }
+    let contract = ChatContract::from_flags(enable_thinking, reasoning_effort, tools.as_deref())?;
+
     let model = model
         .or_else(|| std::env::var("OXI_MODEL").ok().filter(|s| !s.is_empty()))
         .ok_or_else(|| {
@@ -83,33 +187,29 @@ pub(crate) async fn run(
     });
 
     // SV-33: `--bearer-token` is visible to other local users via `ps` (and
-    // lands in shell history) -- warn when it was the source, and let
-    // `OXIBONSAI_BEARER_TOKEN_FILE` (ps-safe) override it. No
-    // `--bearer-token-file` flag exists on this subcommand yet
-    // (`src/cli/args.rs` is owned by CLI-CORE this wave -- see this
-    // package's recorded deviations for the exact flag to add).
+    // lands in shell history) — warn when it was the source, and let a
+    // token FILE (`--bearer-token-file`, else `OXIBONSAI_BEARER_TOKEN_FILE`;
+    // ps-safe) override it. The flag path is passed explicitly: the process
+    // environment is never mutated on this (multi-threaded) runtime.
     let bearer_token_flag_used = bearer_token.is_some();
     let bearer_token = bearer_token.or_else(|| {
         std::env::var("OXIBONSAI_BEARER_TOKEN")
             .ok()
             .filter(|s| !s.is_empty())
     });
-    let bearer_token = resolve_bearer_token_file_override(bearer_token)?;
+    let bearer_token =
+        resolve_bearer_token_file_override(bearer_token_file.as_deref(), bearer_token)?;
     if bearer_token_flag_used {
         tracing::warn!(
             "--bearer-token was passed on the command line, which is visible to other local \
-             users via `ps` (and lands in shell history); prefer OXIBONSAI_BEARER_TOKEN_FILE \
-             or the OXIBONSAI_BEARER_TOKEN environment variable instead"
+             users via `ps` (and lands in shell history); prefer --bearer-token-file / \
+             OXIBONSAI_BEARER_TOKEN_FILE or the OXIBONSAI_BEARER_TOKEN environment variable"
         );
     }
 
-    // sec-M3 / SV-30: validate the three hardening flags this binary
-    // accepts but historically checked none of (`oxibonsai-serve`'s
-    // `validation.rs` already validated all three) -- a zero here used to
-    // admit a permanently broken server (`--max-concurrent-requests 0`
-    // rejects every request forever; `--request-timeout-ms 0` times every
-    // request out immediately; a one-character `--bearer-token` is a
-    // trivially guessable credential).
+    // sec-M3 / SV-30: validate the hardening knobs (a zero concurrency or
+    // timeout admits a permanently broken server; a one-character token is
+    // trivially guessable).
     admission::validate_serve_args(
         bearer_token.as_deref(),
         max_concurrent_requests,
@@ -117,10 +217,7 @@ pub(crate) async fn run(
     )
     .map_err(|e| anyhow::anyhow!(e))?;
 
-    // sec-15 / SV-07 / sec-M2: refuse an unsafe bind. `--host` already
-    // defaults to `127.0.0.1` (`src/cli/args.rs`, owned by CLI-CORE this
-    // wave), so this specifically catches an *explicit* non-loopback host
-    // with no auth configured.
+    // sec-15 / SV-07 / sec-M2: refuse a non-loopback bind with no auth.
     let insecure_no_auth = env_flag("OXIBONSAI_INSECURE_NO_AUTH");
     bind_safety_check(&host, bearer_token.as_deref(), insecure_no_auth)?;
 
@@ -130,12 +227,8 @@ pub(crate) async fn run(
         .unwrap_or_else(|_| PathBuf::from("scripts/checksums.sha256"));
     verify_model_checksum(Path::new(&model), &checksums_path).map_err(|e| anyhow::anyhow!(e))?;
 
-    // Engine-pool size precedence: --pool-size flag > env
-    // OXIBONSAI_ENGINE_POOL_SIZE > unset. When unset we pass `None`
-    // so `build_pool_from_gguf`/`resolve_pool_size` apply the CPU
-    // default of `min(4, cores)` — replicas now share one `Arc<[f32]>`
-    // token-embedding table, so the extra per-replica cost is just a
-    // KV cache. GPU/Metal is always clamped back to 1 by the resolver.
+    // Engine-pool size precedence: --pool-size > OXIBONSAI_ENGINE_POOL_SIZE
+    // > the resolver's own default (hybrid 1; CPU min(4, cores); GPU 1).
     let requested_pool_size: Option<usize> = pool_size.or_else(|| {
         std::env::var("OXIBONSAI_ENGINE_POOL_SIZE")
             .ok()
@@ -144,109 +237,158 @@ pub(crate) async fn run(
 
     tracing::info!(model = %model, host = %host, port, "starting server");
 
-    // FIX2-SERVE item 6, the serve half of the orchestrator's P0
-    // CPU-vs-Metal divergence fix: `oxibonsai_runtime::sampling::SamplingParams::default()`
-    // carries `repetition_penalty: 1.1` -- a hidden, undocumented penalty
-    // baked into this server's own greedy baseline, with no flag surface on
-    // this subcommand to override it (no `--temperature`/`--top-k`/`--top-p`/
-    // `--repetition-penalty` flags exist here yet; that is B2-14's, wave 4).
-    // `default_sampling_params()` routes through the SAME shared
-    // `build_sampling_params` constructor CLI-CORE already applied to
-    // `run`/`chat`/`benchmark`/`eval`, with `repetition_penalty` resolved to
-    // `1.0`, not the struct's own `1.1` -- so `oxibonsai serve`'s baseline
-    // sampling config is byte-for-byte what `oxibonsai run`/`chat` resolve
-    // to when no CLI flag overrides them, and "greedy means greedy" (a
-    // per-request `temperature: 0` in the JSON body) now holds on
-    // `oxibonsai serve` too.
-    let params = default_sampling_params();
+    // One mapping (or `--ptq1-transcode` image), leaked for the process
+    // lifetime: the guards below and every pool replica read the same bytes.
+    let source = ModelSource::open(&model, ptq1_transcode)?;
+    let weight_bytes = source.weight_bytes();
+    let transcoded = source.transcoded_tensors();
+    let bytes = source.into_static();
+    let gguf: &'static oxibonsai_core::gguf::reader::GgufFile<'static> = Box::leak(Box::new(
+        oxibonsai_core::gguf::reader::GgufFile::parse(bytes)?,
+    ));
+    let arch = gguf
+        .metadata
+        .get_string(oxibonsai_core::gguf::tensor_info::keys::GENERAL_ARCHITECTURE)
+        .unwrap_or("")
+        .to_string();
+
+    // REQUIRED #8: qwen35 → 8192 default + the RAM/model-limit guard; the
+    // `--rope-scaling` pre-flight (shared with run/chat).
+    let max_seq_len = super::cmd_run::apply_bonsai2_load_time_guards(
+        gguf,
+        &arch,
+        weight_bytes,
+        max_seq_len,
+        rope_scaling,
+    )?;
+
+    // RT-17: the model's own sampling defaults are the pool's baseline.
+    let declared = oxibonsai_runtime::sampling::GgufSamplingDefaults::from_metadata(&gguf.metadata);
+    let params = baseline_sampling_params(&declared);
+    tracing::info!(
+        temperature = params.temperature,
+        top_k = params.top_k,
+        top_p = params.top_p,
+        from_gguf =
+            declared.temperature.is_some() || declared.top_p.is_some() || declared.top_k.is_some(),
+        "baseline sampling parameters (per-request fields override)"
+    );
+    if let Some(min_p) = declared.min_p.filter(|&m| m > 0.0) {
+        tracing::info!(
+            min_p,
+            "the model declares general.sampling.min_p, but the HTTP API has no per-request \
+             min-p seam yet (a request's min_p > 0 is refused), so the server does not apply \
+             it; `oxibonsai run`/`chat` do"
+        );
+    }
     let metrics = Arc::new(oxibonsai_runtime::InferenceMetrics::new());
 
-    // cli-M5: default to a pseudo-random seed instead of the hardcoded 42
-    // (no `--seed` flag exists on this subcommand yet -- see the module
-    // docs -- so `OXIBONSAI_SEED` is the interim override).
+    // cli-M5: a pseudo-random seed unless OXIBONSAI_SEED pins one.
     let seed = resolve_seed();
     tracing::info!(seed, "resolved RNG seed");
 
-    // Build a pool of engine replicas sharing one leaked `'static`
-    // GGUF (replica #1 mmaps + leaks; the rest reuse it zero-copy).
-    // ENGINE-SEAM: the `_parts` variant also hands back the leaked GGUF and
-    // the shared token-embedding table the embedding engine below reuses.
-    let built = oxibonsai_runtime::engine_pool::build_pool_from_gguf_parts(
-        &model,
+    let built = oxibonsai_runtime::engine_pool::build_pool_from_static_gguf_with_rope(
+        gguf,
         params.clone(),
         seed,
         max_seq_len,
         requested_pool_size,
-        oxibonsai_runtime::engine::Backend::Auto,
+        backend,
+        rope_scaling.into(),
     )?;
     let pool = Arc::clone(&built.pool);
-    // Wire the shared metrics onto every replica, preserving the
-    // per-engine telemetry the single-engine path recorded.
     pool.set_metrics_all(&metrics)?;
-    // sec-20/perf-M1: capture the REAL pool size before `pool` is consumed
-    // by `create_router_full` below.
     let pool_size_actual = pool.size();
+    // `--prefill-chunk` on every replica, and the engine-accessor summary
+    // line (cli-16 / REQUIRED #14) — held all at once, before serving.
+    {
+        let mut leases = Vec::with_capacity(pool_size_actual);
+        for _ in 0..pool_size_actual {
+            leases.push(
+                pool.acquire()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("engine pool: {e}"))?,
+            );
+        }
+        for lease in &mut leases {
+            bonsai2::apply_prefill_chunk(lease, prefill_chunk)?;
+        }
+        if let Some(first) = leases.first() {
+            let mut summary = model_desc::engine_summary(first);
+            if transcoded > 0 {
+                summary.push_str(&format!(
+                    " | --ptq1-transcode: {transcoded} PTQ1_0 tensors re-encoded to PQ2_0"
+                ));
+            }
+            tracing::info!(replicas = pool_size_actual, "{summary}");
+            // B2-09 / REQUIRED #14: `/admin/status` and `/admin/config`
+            // report the resolved variant and the effective kernel tier.
+            oxibonsai_runtime::admin::register_served_engine_report(
+                oxibonsai_runtime::admin::EngineReport::from_engine(first),
+            );
+        }
+    }
 
-    // Resolve the tokenizer path once; a fresh `TokenizerBridge` is
-    // built per router below since `TokenizerBridge` does not
-    // implement `Clone` and the RAG router (when mounted) needs its
-    // own independent handle.
-    let lookup = resolve_tokenizer(tokenizer.as_deref(), &model);
-    // ENGINE-SEAM: an auto-detected tokenizer that does not fit the model
-    // yields to one embedded in the GGUF (every Bonsai 2 `qwen35` file
-    // carries its own; `models/tokenizer.json` is the legacy Qwen3 one and
-    // would mis-tokenize every prompt). Anything else loads as before.
-    let embedded_tokenizer = tokenizer.is_none()
-        && serve_prefers_embedded_tokenizer(lookup.found.as_deref(), built.gguf);
-    if lookup.found.is_none() && !embedded_tokenizer {
+    // TOK-08 + B2-13 LEAD ITEM: every tokenizer instance comes from the same
+    // vocab-aware ladder with the GGUF's own template attached.
+    let (tok, lookup) = load_serving_tokenizer(tokenizer.as_deref(), &model, gguf)?;
+    if tok.is_none() {
         tracing::warn!("{}", missing_tokenizer_warning(&lookup.searched));
     }
-    let load_tok = || -> anyhow::Result<Option<oxibonsai_runtime::TokenizerBridge>> {
-        if embedded_tokenizer {
-            return Ok(Some(oxibonsai_runtime::engine::tokenizer_from_gguf(
-                built.gguf,
-            )?));
+
+    // SV-25 / RT-08: `/v1/embeddings` from a dedicated embedding engine
+    // (dense models); a hybrid model answers the honest 501.
+    let mut tfidf_embeddings = None;
+    let embedder = match embedding_backend {
+        EmbeddingBackendChoice::Model => {
+            let (embed_tok, _) = load_serving_tokenizer(tokenizer.as_deref(), &model, gguf)?;
+            build_embedder(
+                &built,
+                embed_tok,
+                EmbeddingEngineLoad {
+                    params,
+                    seed,
+                    max_seq_len,
+                    backend,
+                    rope_scaling,
+                },
+            )
         }
-        match &lookup.found {
-            Some(p) => Ok(Some(oxibonsai_runtime::TokenizerBridge::from_file(p)?)),
-            None => Ok(None),
+        EmbeddingBackendChoice::Tfidf => {
+            let corpus = tfidf_corpus.unwrap_or_default();
+            let router = build_tfidf_embeddings_router(&corpus, Arc::clone(&metrics));
+            tracing::info!(
+                documents = corpus.len(),
+                max_features = TFIDF_MAX_FEATURES,
+                "serving /v1/embeddings from a TF-IDF vocabulary fitted on --embedding-corpus \
+                 (lexical, non-semantic vectors)"
+            );
+            tfidf_embeddings = Some(router);
+            None
+        }
+        EmbeddingBackendChoice::None => {
+            tracing::info!("--embedding-backend none: /v1/embeddings answers 501");
+            None
         }
     };
 
-    let tok = load_tok()?;
-
-    // SV-25 / RT-08: `/v1/embeddings` is served by a dedicated embedding
-    // engine built off the pool's own leaked mapping and shared
-    // token-embedding table (no second mapping, no second table), and the
-    // router records its traffic in the same `InferenceMetrics`.
-    let embedder = build_embedder(&built, load_tok()?, params, seed, max_seq_len);
-
-    // sec-15: admin auth is independent of the inference bearer token.
-    // FIX2-SERVE item 4 (admin-token env asymmetry): honour
-    // `OXIBONSAI_ADMIN_TOKEN` first -- matching
-    // `crates/oxibonsai-serve/src/hardening.rs::resolve_admin_auth` (via
-    // that binary's `apply_extra_env_overrides`) -- then fall back to
-    // `OXI_ADMIN_TOKEN` (`AuthConfig::from_env`, the pre-existing
-    // convention every router constructor already honors). Before this
-    // fix, an operator who set `OXIBONSAI_ADMIN_TOKEN` got a token-gated
-    // `/admin` on the standalone `oxibonsai-serve` binary and a
-    // 403-locked `/admin` on this one (`oxibonsai serve`).
     let admin_auth = resolve_admin_auth();
 
-    // SV-15/SV-16/SV-23: thread `max_seq_len` through as the admission-time
-    // `max_input_tokens` ceiling too (mirroring `oxibonsai-serve`'s single
-    // `limits.max_input_tokens` field, which serves both the KV-cache size
-    // and the per-request prompt budget), and `request_timeout_ms` as the
-    // per-request deadline the chat handlers already consult once it is
-    // non-`None`.
-    let router_options = RouterOptions::default()
+    let mut router_options = RouterOptions::default()
         .with_limits(
             RequestLimits::default()
                 .with_max_input_tokens(Some(max_seq_len))
                 .with_timeout_ms(request_timeout_ms),
         )
         .with_auth(admin_auth)
-        .with_embedder(embedder);
+        .with_embedder(embedder)
+        .with_enable_ui(enable_ui);
+    if let Some(ceiling) = max_output_tokens {
+        router_options = router_options.with_max_output_tokens_ceiling(ceiling);
+    }
+    if enable_ui {
+        tracing::info!("serving the bundled chat UI at GET /ui (--enable-ui)");
+    }
 
     #[cfg_attr(not(feature = "rag"), allow(unused_mut))]
     let mut router =
@@ -254,7 +396,7 @@ pub(crate) async fn run(
 
     #[cfg(feature = "rag")]
     if rag {
-        let rag_tok = load_tok()?;
+        let (rag_tok, _) = load_serving_tokenizer(tokenizer.as_deref(), &model, gguf)?;
         tracing::info!("mounting RAG HTTP API (/rag/index, /rag/query, /rag/stats)");
         router = router.merge(oxibonsai_runtime::rag_server::create_rag_router_with_pool(
             Arc::clone(&pool),
@@ -262,17 +404,39 @@ pub(crate) async fn run(
         ));
     }
 
-    // ── Hardening: body limit + admission + rate limit + bearer auth + CORS ──
+    // ── Hardening: a flag wins over its `OXIBONSAI_*` env var ──────────────
+    let max_body_bytes = max_body_bytes
+        .map(|b| usize::try_from(b).unwrap_or(usize::MAX))
+        .or_else(|| env_usize("OXIBONSAI_MAX_BODY_BYTES"))
+        .unwrap_or(4 * 1024 * 1024);
     let opts = HardeningOptions {
         bearer_token,
         max_concurrent_requests,
         request_timeout_ms,
-        max_body_bytes: env_usize("OXIBONSAI_MAX_BODY_BYTES").unwrap_or(4 * 1024 * 1024),
-        cors_origins: env_cors_origins(),
-        cors_allow_credentials: env_flag("OXIBONSAI_CORS_ALLOW_CREDENTIALS"),
-        rate_limit_rpm: env_f64("OXIBONSAI_RATE_LIMIT_RPM"),
-        rate_limit_burst: env_f64("OXIBONSAI_RATE_LIMIT_BURST").unwrap_or(20.0),
+        max_body_bytes,
+        cors_origins: cors_origin
+            .map(|o| vec![o])
+            .unwrap_or_else(env_cors_origins),
+        cors_allow_credentials: cors_allow_credentials
+            || env_flag("OXIBONSAI_CORS_ALLOW_CREDENTIALS"),
+        rate_limit_rpm: rate_limit_rpm
+            .map(f64::from)
+            .or_else(|| env_f64("OXIBONSAI_RATE_LIMIT_RPM")),
+        rate_limit_burst: rate_limit_burst
+            .map(f64::from)
+            .or_else(|| env_f64("OXIBONSAI_RATE_LIMIT_BURST"))
+            .unwrap_or(20.0),
+        chat_defaults: ChatDefaults::from_contract(&contract),
+        embeddings_override: tfidf_embeddings,
     };
+    if !opts.chat_defaults.is_empty() {
+        tracing::info!(
+            enable_thinking = ?opts.chat_defaults.enable_thinking,
+            reasoning_effort = ?opts.chat_defaults.reasoning_effort,
+            tools = opts.chat_defaults.tools_json.is_some(),
+            "server-wide chat defaults (applied to a request that carries none of its own)"
+        );
+    }
     let router = harden_router(router, pool_size_actual, &opts, &host);
 
     let addr_str = format!("{host}:{port}");
@@ -280,23 +444,9 @@ pub(crate) async fn run(
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid bind address '{addr_str}': {e}"))?;
 
-    // Serve with graceful shutdown (SIGTERM + Ctrl+C) and
-    // connect-info wiring (`into_make_service_with_connect_info::
-    // <SocketAddr>`), mirroring the standalone `oxibonsai-serve`
-    // binary's `serve_with_shutdown` helper
-    // (crates/oxibonsai-serve/src/main.rs) instead of handing the
-    // router straight to a bare `axum::serve(listener,
-    // router).await?`. This both (a) lets in-flight requests
-    // finish before the process exits and (b) lets the wave-2
-    // trusted-proxy rate limiter's `MaybePeerAddr` extractor
-    // (oxibonsai-runtime::middleware) see the real TCP peer
-    // address instead of falling back to a single shared
-    // "unknown" bucket for every direct client.
-    //
-    // SV-29: a failed signal-handler registration now refuses to start
-    // instead of degrading (`install_shutdown_signals` propagates the
-    // `io::Error`), rather than the old `shutdown_signal()` which only
-    // ever logged and fell back silently.
+    // Graceful shutdown (SIGTERM + Ctrl+C) and connect-info wiring, exactly
+    // as the standalone `oxibonsai-serve` binary; a failed signal-handler
+    // registration refuses to start (SV-29).
     let signals = install_shutdown_signals()?;
     serve_with_shutdown(router, addr, signals)
         .await
@@ -305,63 +455,188 @@ pub(crate) async fn run(
     Ok(())
 }
 
-/// Whether `oxibonsai serve` should use the tokenizer embedded in `gguf`
-/// instead of the auto-detected on-disk one (ENGINE-SEAM).
+// ─── `--embedding-backend tfidf` (RT-EMBEDDINGS residue) ────────────────────
+
+/// Vocabulary cap (`max_features`) of the TF-IDF embedder: the same
+/// dimension the runtime router's own embeddings registry is built with.
+const TFIDF_MAX_FEATURES: usize = 512;
+
+/// Validate the `--embedding-backend` / `--embedding-corpus` pair and read
+/// the corpus (one document per non-blank line). `Ok(None)` for every
+/// backend but `tfidf`.
 ///
-/// Only when the on-disk candidate is absent, unreadable, or fails the same
-/// compatibility check `run` enforces, *and* the GGUF embeds a tokenizer whose
-/// vocabulary equals the model's. An on-disk tokenizer that fits is always
-/// kept, so every model that served before serves exactly as before.
-fn serve_prefers_embedded_tokenizer(
-    found: Option<&str>,
-    gguf: &oxibonsai_core::gguf::reader::GgufFile<'_>,
-) -> bool {
-    let on_disk_fits = found.is_some_and(|path| {
-        oxibonsai_runtime::TokenizerBridge::from_file(path).is_ok_and(|tok| {
-            super::util::check_tokenizer_model_compatibility(&tok, path, gguf, false).is_ok()
-        })
-    });
-    if on_disk_fits {
-        return false;
+/// # Errors
+///
+/// `tfidf` without a corpus, a corpus with any other backend, an unreadable
+/// corpus file, or one with no documents.
+fn resolve_tfidf_corpus(
+    backend: EmbeddingBackendChoice,
+    corpus_path: Option<&str>,
+) -> anyhow::Result<Option<Vec<String>>> {
+    match (backend, corpus_path) {
+        (EmbeddingBackendChoice::Tfidf, None) => anyhow::bail!(
+            "--embedding-backend tfidf needs --embedding-corpus <file> (one document per line): \
+             the TF-IDF vocabulary is fitted once, at startup, never on client requests"
+        ),
+        (EmbeddingBackendChoice::Tfidf, Some(path)) => load_embedding_corpus(path).map(Some),
+        (_, Some(_)) => {
+            anyhow::bail!("--embedding-corpus only applies with --embedding-backend tfidf")
+        }
+        (_, None) => Ok(None),
     }
-    let expected_vocab = super::util::model_vocab_size(gguf).ok();
-    super::cmd_run::gguf_embedded_tokenizer(gguf, expected_vocab).is_some()
+}
+
+/// Read a TF-IDF corpus: one document per line, surrounding whitespace
+/// trimmed, blank lines skipped.
+///
+/// # Errors
+///
+/// An unreadable file, or one that holds no document at all.
+fn load_embedding_corpus(path: &str) -> anyhow::Result<Vec<String>> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("failed to read --embedding-corpus '{path}': {e}"))?;
+    let documents: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    if documents.is_empty() {
+        anyhow::bail!("--embedding-corpus '{path}' holds no documents (one per line)");
+    }
+    Ok(documents)
+}
+
+/// The `/v1/embeddings` router of `--embedding-backend tfidf`: the runtime's
+/// own embeddings handler over a registry whose TF-IDF vocabulary is fitted
+/// once, here, on `corpus`, recording onto the server's shared metrics.
+fn build_tfidf_embeddings_router(
+    corpus: &[String],
+    metrics: Arc<oxibonsai_runtime::InferenceMetrics>,
+) -> Router {
+    let registry = oxibonsai_runtime::embeddings::EmbedderRegistry::new(TFIDF_MAX_FEATURES);
+    registry.fit_tfidf(corpus);
+    oxibonsai_runtime::embeddings::create_embeddings_router_from_state(
+        oxibonsai_runtime::embeddings::EmbeddingAppState::from_registry(registry)
+            .with_metrics(metrics),
+    )
+}
+
+/// Answers `POST /v1/embeddings` from the TF-IDF router instead of the
+/// runtime router's model-only route (which answers 501 without a model
+/// embedder); every other request passes through untouched. Mounted
+/// innermost by [`harden_router`], so auth, rate limiting, the body limit
+/// and admission apply exactly as for the built-in route.
+async fn embeddings_override_mw(
+    State(embeddings): State<Router>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    if req.method() == axum::http::Method::POST && req.uri().path() == "/v1/embeddings" {
+        use tower::ServiceExt as _;
+        return match embeddings.oneshot(req).await {
+            Ok(response) => response,
+            Err(never) => match never {},
+        };
+    }
+    next.run(req).await
+}
+
+/// One serving tokenizer instance (B2-13 fix-pass LEAD ITEM + TOK-08): the
+/// `run`/`chat` ladder — an explicit `--tokenizer`, else a vocab-matching
+/// `tokenizer.json` next to the model, else the vocabulary embedded in the
+/// GGUF — with the hard compatibility check and the GGUF's own
+/// `tokenizer.chat_template` attached (the built-in ChatML fallback only
+/// for a file that ships none). Called once per consumer (router, embedder,
+/// RAG) because `TokenizerBridge` is not `Clone`.
+fn load_serving_tokenizer(
+    explicit: Option<&str>,
+    model: &str,
+    gguf: &oxibonsai_core::gguf::reader::GgufFile<'_>,
+) -> anyhow::Result<(
+    Option<oxibonsai_runtime::TokenizerBridge>,
+    super::util::TokenizerLookup,
+)> {
+    super::util::resolve_serving_tokenizer(explicit, model, gguf)
+}
+
+/// How the dedicated embedding engine is built: the pool's own sampling
+/// baseline and seed, and the SAME `--backend` / `--rope-scaling` the pool
+/// honours (a `--backend cpu` server must never upload weights to the GPU
+/// for its embedder).
+struct EmbeddingEngineLoad {
+    params: oxibonsai_runtime::sampling::SamplingParams,
+    seed: u64,
+    max_seq_len: usize,
+    backend: oxibonsai_runtime::engine_seam::Backend,
+    rope_scaling: oxibonsai_runtime::config::RopeScalingMode,
+}
+
+/// The dense embedding engine: built off the pool's own leaked GGUF and
+/// shared token-embedding table, with `--backend` and `--rope-scaling`
+/// applied exactly as for the pool's replicas.
+fn build_embedding_engine(
+    built: &oxibonsai_runtime::engine_pool::PoolBuild,
+    load: &EmbeddingEngineLoad,
+    window: usize,
+) -> oxibonsai_runtime::RuntimeResult<oxibonsai_runtime::InferenceEngine<'static>> {
+    let rope: oxibonsai_core::config::RopeScalingOverride = load.rope_scaling.into();
+    oxibonsai_runtime::engine_seam::resolve_rope_scaling_at_load(built.gguf, rope)?;
+    let _rope_scope = oxibonsai_core::config::RopeScalingOverrideScope::enter(rope);
+    oxibonsai_runtime::InferenceEngine::from_gguf_static_with_embd_and_backend(
+        built.gguf,
+        load.params.clone(),
+        load.seed,
+        window,
+        Arc::clone(&built.shared_token_embd),
+        load.backend,
+    )
 }
 
 /// The model-backed embedder `/v1/embeddings` is served from (SV-25 /
 /// RT-08), or `None` — the route's honest `501` — when there can be none.
 ///
-/// A dense model gets a dedicated embedding engine built off the pool's own
-/// leaked GGUF and shared token-embedding table, with its KV window bounded
-/// by the embedder's input ceiling. A hybrid (`qwen35`) model is refused with
-/// the typed `NOT_A_DENSE_MODEL` error — a known limitation until the hybrid
-/// model exposes its pre-LM-head hidden states — which is logged, not fatal.
+/// A dense model gets a dedicated embedding engine
+/// ([`build_embedding_engine`]) with its KV window bounded by the embedder's
+/// input ceiling. A hybrid (`qwen35`) model is refused with the typed
+/// `NOT_A_DENSE_MODEL` error before any second model instance is built — a
+/// known limitation until the hybrid model exposes its pre-LM-head hidden
+/// states — which is logged, not fatal.
 fn build_embedder(
     built: &oxibonsai_runtime::engine_pool::PoolBuild,
     tokenizer: Option<oxibonsai_runtime::TokenizerBridge>,
-    params: oxibonsai_runtime::sampling::SamplingParams,
-    seed: u64,
-    max_seq_len: usize,
+    load: EmbeddingEngineLoad,
 ) -> Option<Arc<oxibonsai_runtime::embed_engine::ModelEmbedder>> {
     let Some(tokenizer) = tokenizer else {
         tracing::info!("no tokenizer: /v1/embeddings answers 501 (an embedder needs one)");
         return None;
     };
-    let window = max_seq_len.clamp(
+    let window = load.max_seq_len.clamp(
         1,
         oxibonsai_runtime::embed_engine::DEFAULT_MAX_EMBEDDING_TOKENS,
     );
-    match oxibonsai_runtime::embed_engine::ModelEmbedder::from_static_gguf(
-        built.gguf,
-        Arc::clone(&built.shared_token_embd),
-        Arc::new(tokenizer),
-        params,
-        seed,
-        window,
-    ) {
+    let tokenizer = Arc::new(tokenizer);
+    let result = if oxibonsai_model::hybrid::LoadedModel::is_hybrid_gguf(built.gguf) {
+        // The runtime's own constructor refuses a hybrid file with the typed
+        // error before building anything.
+        oxibonsai_runtime::embed_engine::ModelEmbedder::from_static_gguf(
+            built.gguf,
+            Arc::clone(&built.shared_token_embd),
+            tokenizer,
+            load.params,
+            load.seed,
+            window,
+        )
+    } else {
+        build_embedding_engine(built, &load, window).and_then(|engine| {
+            oxibonsai_runtime::embed_engine::ModelEmbedder::from_engine(engine, tokenizer)
+        })
+    };
+    match result {
         Ok(embedder) => {
             tracing::info!(
                 window,
+                backend = %load.backend,
                 "serving /v1/embeddings from a dedicated embedding engine"
             );
             Some(embedder)
@@ -384,6 +659,175 @@ fn build_embedder(
     }
 }
 
+// ─── cli-11: server-wide chat defaults ─────────────────────────────────────
+
+/// The chat paths the server-wide defaults apply to.
+const CHAT_PATHS: [&str; 2] = ["/v1/chat/completions", "/v1/chat/completions/extended"];
+
+/// `--think`/`--no-think`, `--reasoning-effort` and `--tools` as
+/// server-wide defaults.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ChatDefaults {
+    enable_thinking: Option<bool>,
+    reasoning_effort: Option<String>,
+    /// Raw JSON text (key order preserved end to end).
+    tools_json: Option<String>,
+}
+
+impl ChatDefaults {
+    fn from_contract(contract: &ChatContract) -> Self {
+        Self {
+            enable_thinking: contract.enable_thinking,
+            reasoning_effort: contract.reasoning_effort.clone(),
+            tools_json: contract.tools_json.clone(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.enable_thinking.is_none()
+            && self.reasoning_effort.is_none()
+            && self.tools_json.is_none()
+    }
+}
+
+/// Apply the server-wide defaults to one chat request body: each default is
+/// inserted as a TOP-LEVEL field only when the request carries neither that
+/// top-level field nor its `chat_template_kwargs.*` twin (the server reads
+/// both; the nested one wins). Returns `None` — forward the ORIGINAL bytes
+/// untouched — when nothing needs adding or the body is not a JSON object.
+///
+/// Pure text splicing, never a `serde_json::Value` round trip: the body is
+/// parsed only to learn which keys exist, and the new fields are inserted
+/// right after the opening `{`, so every byte of the client's own JSON
+/// (including a tools schema's key order) reaches the handler unchanged.
+pub(crate) fn inject_chat_defaults(body: &[u8], defaults: &ChatDefaults) -> Option<Vec<u8>> {
+    if defaults.is_empty() {
+        return None;
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let object = parsed.as_object()?;
+    let kwargs = object
+        .get("chat_template_kwargs")
+        .and_then(serde_json::Value::as_object);
+    let has = |key: &str| object.contains_key(key) || kwargs.is_some_and(|k| k.contains_key(key));
+
+    let mut fields: Vec<String> = Vec::new();
+    if let Some(enable) = defaults.enable_thinking {
+        if !has("enable_thinking") {
+            fields.push(format!("\"enable_thinking\":{enable}"));
+        }
+    }
+    if let Some(effort) = &defaults.reasoning_effort {
+        if !has("reasoning_effort") {
+            let quoted = serde_json::to_string(effort).ok()?;
+            fields.push(format!("\"reasoning_effort\":{quoted}"));
+        }
+    }
+    if let Some(tools) = &defaults.tools_json {
+        if !object.contains_key("tools") {
+            fields.push(format!("\"tools\":{tools}"));
+        }
+    }
+    if fields.is_empty() {
+        return None;
+    }
+    let open = body.iter().position(|b| !b.is_ascii_whitespace())?;
+    if body[open] != b'{' {
+        return None;
+    }
+    let mut insert = fields.join(",");
+    if !object.is_empty() {
+        insert.push(',');
+    }
+    let mut out = Vec::with_capacity(body.len() + insert.len());
+    out.extend_from_slice(&body[..=open]);
+    out.extend_from_slice(insert.as_bytes());
+    out.extend_from_slice(&body[open + 1..]);
+    Some(out)
+}
+
+/// State of [`chat_defaults_mw`].
+struct ChatDefaultsState {
+    defaults: ChatDefaults,
+    max_body_bytes: usize,
+}
+
+/// Rewrite a chat request's body with the server-wide defaults (see
+/// [`inject_chat_defaults`]); every other request passes through untouched.
+/// The body is read bounded by `max_body_bytes` (the `Content-Length` guard
+/// outside this layer already refused a declared oversize).
+async fn chat_defaults_mw(
+    State(state): State<Arc<ChatDefaultsState>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    if req.method() != axum::http::Method::POST || !CHAT_PATHS.contains(&req.uri().path()) {
+        return next.run(req).await;
+    }
+    let (mut parts, body) = req.into_parts();
+    let bytes = match axum::body::to_bytes(body, state.max_body_bytes).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            let body = serde_json::json!({
+                "error": {
+                    "message": format!("failed to read the request body: {e}"),
+                    "type": "invalid_request_error",
+                    "param": serde_json::Value::Null,
+                    "code": "content_too_large",
+                }
+            });
+            return (StatusCode::PAYLOAD_TOO_LARGE, axum::Json(body)).into_response();
+        }
+    };
+    let body = match inject_chat_defaults(&bytes, &state.defaults) {
+        Some(rewritten) => {
+            parts.headers.insert(
+                axum::http::header::CONTENT_LENGTH,
+                axum::http::HeaderValue::from(rewritten.len()),
+            );
+            Body::from(rewritten)
+        }
+        None => Body::from(bytes),
+    };
+    next.run(Request::from_parts(parts, body)).await
+}
+
+/// Active `Content-Length` precheck — the identical guard
+/// `crates/oxibonsai-serve/src/hardening.rs::content_length_guard_mw`
+/// mounts (wave-2.5 routing (3), SV-30/sec-M3 "one shared stack"): a request
+/// whose *declared* size exceeds the limit gets a synchronous `413` before
+/// it can take (or queue for) an admission permit. Only the header is
+/// inspected; a request without `Content-Length` (chunked) passes, and is
+/// still bounded by `DefaultBodyLimit` inside.
+async fn content_length_guard_mw(
+    State(max_body_bytes): State<Arc<usize>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let declared_len = req
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok());
+    if let Some(len) = declared_len {
+        if len > *max_body_bytes {
+            let body = serde_json::json!({
+                "error": {
+                    "message": format!(
+                        "request body is {len} bytes (Content-Length), which exceeds the \
+                         server's limit of {max_body_bytes} bytes"
+                    ),
+                    "type": "invalid_request_error",
+                    "param": serde_json::Value::Null,
+                    "code": "content_too_large",
+                }
+            });
+            return (StatusCode::PAYLOAD_TOO_LARGE, axum::Json(body)).into_response();
+        }
+    }
+    next.run(req).await
+}
+
 // ─── Router hardening (SV-06 / sec-06 / sec-07 / SV-10 / cli-18) ───────────
 
 /// Everything [`harden_router`] needs beyond the base router and the real
@@ -399,6 +843,11 @@ struct HardeningOptions {
     cors_allow_credentials: bool,
     rate_limit_rpm: Option<f64>,
     rate_limit_burst: f64,
+    /// cli-11 server-wide chat defaults (empty = no rewriting layer).
+    chat_defaults: ChatDefaults,
+    /// `--embedding-backend tfidf`: the router `POST /v1/embeddings` is
+    /// answered from (`None` = the runtime router's own route).
+    embeddings_override: Option<Router>,
 }
 
 /// Apply the full hardening stack to an already-assembled base router
@@ -410,15 +859,15 @@ struct HardeningOptions {
 /// `sec-07` / `SV-10` / `cli-18`):
 ///
 /// ```text
-/// routes -> admission (concurrency+timeout) -> DefaultBodyLimit
-///        -> rate-limit -> bearer-auth -> CORS (outermost)
+/// routes -> [TF-IDF embeddings] -> [chat-defaults rewrite] -> admission (concurrency+timeout)
+///        -> DefaultBodyLimit -> Content-Length precheck -> rate-limit
+///        -> bearer-auth -> CORS (outermost)
 /// ```
 ///
-/// (FIX2-SERVE item 3: `DefaultBodyLimit` moved from inside `admission` to
-/// outside it, still inside rate-limit, mirroring
-/// `crates/oxibonsai-serve/src/hardening.rs::build_router`'s matching fix —
-/// see the note at its call site below for what this reorder does and does
-/// not achieve.)
+/// — the same stack `crates/oxibonsai-serve/src/hardening.rs::build_router`
+/// builds (wave-2.5 routing (3)), plus the optional chat-defaults rewrite
+/// innermost (only mounted when `--think`/`--no-think`/`--reasoning-effort`/
+/// `--tools` set a server-wide default).
 ///
 /// Split out from [`run`] (which cannot be unit tested directly — it loads
 /// a real GGUF model) so this composition is directly testable against a
@@ -437,6 +886,26 @@ fn harden_router(
     // FIX2-SERVE item 3: applied here, BEFORE `DefaultBodyLimit` below, so
     // `DefaultBodyLimit` ends up mounted OUTSIDE (more outer than) this
     // admission stack.
+    // `--embedding-backend tfidf`: innermost, so every outer guard applies
+    // to the TF-IDF route exactly as to the built-in one.
+    if let Some(embeddings) = &opts.embeddings_override {
+        router = router.layer(axum::middleware::from_fn_with_state(
+            embeddings.clone(),
+            embeddings_override_mw,
+        ));
+    }
+    // cli-11: the server-wide chat defaults, innermost so the body read is
+    // covered by admission's timeout exactly like the handler's own read.
+    if !opts.chat_defaults.is_empty() {
+        router = router.layer(axum::middleware::from_fn_with_state(
+            Arc::new(ChatDefaultsState {
+                defaults: opts.chat_defaults.clone(),
+                max_body_bytes: opts.max_body_bytes,
+            }),
+            chat_defaults_mw,
+        ));
+    }
+
     let effective_max_concurrent_requests =
         admission::resolve_admission_limit(opts.max_concurrent_requests, pool_size);
     router = admission::apply_admission(
@@ -460,11 +929,19 @@ fn harden_router(
     // version of this note on `crates/oxibonsai-serve/src/hardening.rs::build_router`.
     router = router.layer(DefaultBodyLimit::max(opts.max_body_bytes));
 
+    // Wave-2.5 routing (3): the ACTIVE synchronous `Content-Length`
+    // precheck `oxibonsai-serve`'s `build_router` mounts at this same
+    // position — a request whose declared size exceeds the limit is refused
+    // with a real 413 before it can hold (or wait for) an admission permit.
+    router = router.layer(axum::middleware::from_fn_with_state(
+        Arc::new(opts.max_body_bytes),
+        content_length_guard_mw,
+    ));
+
     // sec-07/RT-34/SV-10/cli-10: rate limiting, mounted *outside* admission
     // so a rate-limited request never consumes a concurrency permit
-    // (cli-18). No `--rate-limit-rpm`/`--rate-limit-burst` flag exists on
-    // this subcommand yet (see the module docs), so this is
-    // `OXIBONSAI_RATE_LIMIT_RPM`/`_BURST`-only for now.
+    // (cli-18). `--rate-limit-rpm`/`--rate-limit-burst` (else
+    // `OXIBONSAI_RATE_LIMIT_RPM`/`_BURST`).
     if let Some(rpm) = opts.rate_limit_rpm {
         let rate_cfg = RateLimitConfig::from_rpm(rpm, opts.rate_limit_burst);
         router = router.layer(rate_limit_layer(rate_cfg));
@@ -506,9 +983,7 @@ fn harden_router(
 
     // SV-06/sec-06/cli-10: CORS is the outermost layer, so its `OPTIONS`
     // preflight short-circuit runs *before* the nested bearer-auth layer
-    // ever sees the request. No `--cors-origin` flag exists on this
-    // subcommand yet (see the module docs), so this is
-    // `OXIBONSAI_CORS_ORIGIN`-only for now.
+    // ever sees the request (`--cors-origin`, else `OXIBONSAI_CORS_ORIGIN`).
     if opts.cors_origins.is_empty() {
         router
     } else {
@@ -643,38 +1118,47 @@ fn resolve_admin_auth_from(new_token: Option<&str>, legacy: AdminAuthConfig) -> 
 
 // ─── SV-33: ps-safe bearer token override ──────────────────────────────────
 
-/// Override `flag_or_env` with the contents of `OXIBONSAI_BEARER_TOKEN_FILE`
-/// (read and trimmed) when that variable is set — the `ps`-safe option
-/// finding `SV-33` recommends. Returns `flag_or_env` unchanged when the
-/// variable is unset.
+/// Override `flag_or_env` with the contents of a bearer-token FILE — the
+/// `ps`-safe option finding `SV-33` recommends: `flag_path`
+/// (`--bearer-token-file`) when given, else `OXIBONSAI_BEARER_TOKEN_FILE`.
+/// The flag path is an explicit parameter, never written into the process
+/// environment (that would be a `set_var` on the multi-threaded runtime).
+/// Returns `flag_or_env` unchanged when neither names a file.
 fn resolve_bearer_token_file_override(
+    flag_path: Option<&str>,
     flag_or_env: Option<String>,
 ) -> anyhow::Result<Option<String>> {
-    let Ok(path) = std::env::var("OXIBONSAI_BEARER_TOKEN_FILE") else {
-        return Ok(flag_or_env);
+    let (path, source) = match flag_path {
+        Some(path) => (path.to_string(), "--bearer-token-file"),
+        None => match std::env::var("OXIBONSAI_BEARER_TOKEN_FILE") {
+            Ok(path) => (path, "OXIBONSAI_BEARER_TOKEN_FILE"),
+            Err(_) => return Ok(flag_or_env),
+        },
     };
-    let raw = std::fs::read_to_string(&path)
-        .map_err(|e| anyhow::anyhow!("failed to read OXIBONSAI_BEARER_TOKEN_FILE {path}: {e}"))?;
+    read_bearer_token_file(&path, source).map(Some)
+}
+
+/// Read and trim one bearer-token file (`source` names where the path came
+/// from, for the error).
+fn read_bearer_token_file(path: &str, source: &str) -> anyhow::Result<String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("failed to read {source} {path}: {e}"))?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Err(anyhow::anyhow!(
-            "OXIBONSAI_BEARER_TOKEN_FILE {path} is empty"
-        ));
+        return Err(anyhow::anyhow!("{source} {path} is empty"));
     }
-    Ok(Some(trimmed.to_string()))
+    Ok(trimmed.to_string())
 }
 
 // ─── cli-M5: pseudo-random default seed ─────────────────────────────────────
 
 /// Resolve the RNG seed: an `OXIBONSAI_SEED` env override, else a
 /// process/time-derived pseudo-random value (finding `cli-M5`: the previous
-/// literal `42` never varied). No `--seed` flag exists on this subcommand
-/// yet (`src/cli/args.rs`'s `Serve` variant is owned by CLI-CORE this wave
-/// -- see this package's recorded deviations for the exact flag to add),
-/// and no `rand` crate is reachable from this crate without a new Cargo
-/// dependency this package cannot add (`Cargo.toml` is not in its
-/// `owned_files`). Not cryptographically random; it only needs to differ
-/// from one server start to the next.
+/// literal `42` never varied). Per-request reproducibility comes from a
+/// request's own `seed` field; this is only the replicas' starting state.
+/// No `rand` crate is reachable from this crate without a new Cargo
+/// dependency, and none is needed: this is not cryptographically random, it
+/// only needs to differ from one server start to the next.
 fn resolve_seed() -> u64 {
     if let Ok(v) = std::env::var("OXIBONSAI_SEED") {
         if let Ok(seed) = v.parse::<u64>() {
@@ -705,7 +1189,7 @@ fn resolve_seed() -> u64 {
 // this module's own tests, which are the only place in this crate that
 // still reference it by name.
 
-// ─── OXIBONSAI_* env var helpers (no --flag surface yet; see module docs) ──
+// ─── OXIBONSAI_* env var helpers (the fallbacks behind each serve flag) ────
 
 fn env_flag(name: &str) -> bool {
     std::env::var(name)
@@ -743,838 +1227,5 @@ fn env_cors_origins() -> Vec<String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ── is_loopback_host / bind_safety_check ────────────────────────────────
-
-    #[test]
-    fn loopback_hosts_are_recognized() {
-        for host in ["127.0.0.1", "127.5.5.5", "::1", "localhost", "LOCALHOST"] {
-            assert!(is_loopback_host(host), "{host} should be loopback");
-        }
-    }
-
-    #[test]
-    fn non_loopback_hosts_are_not_loopback() {
-        for host in ["0.0.0.0", "192.168.1.1", "example.com", ""] {
-            assert!(!is_loopback_host(host), "{host} should not be loopback");
-        }
-    }
-
-    #[test]
-    fn loopback_bind_never_needs_auth() {
-        bind_safety_check("127.0.0.1", None, false).expect("loopback bind is always safe");
-    }
-
-    #[test]
-    fn non_loopback_bind_without_auth_is_refused() {
-        let err = bind_safety_check("0.0.0.0", None, false).expect_err("must refuse");
-        assert!(err.to_string().contains("0.0.0.0"));
-    }
-
-    #[test]
-    fn non_loopback_bind_with_bearer_token_is_allowed() {
-        bind_safety_check("0.0.0.0", Some(&"x".repeat(20)), false)
-            .expect("a configured bearer token makes this safe");
-    }
-
-    #[test]
-    fn non_loopback_bind_with_insecure_no_auth_is_allowed() {
-        bind_safety_check("0.0.0.0", None, true).expect("explicit opt-out is honored");
-    }
-
-    // ── resolve_admin_auth_from (FIX2-SERVE item 4: admin-token env asymmetry) ──
-    //
-    // Rewritten as a verifier follow-up on this same finding: these used to
-    // exercise `resolve_admin_auth` directly by mutating the two SAME
-    // process-global env vars (`OXIBONSAI_ADMIN_TOKEN`, `OXI_ADMIN_TOKEN`)
-    // via `unsafe { std::env::set_var / remove_var }` with no
-    // serialization -- flaky against each other under `cargo test`'s
-    // default parallel test threads, and unsound against `router_tests`'
-    // concurrent `getenv` on `OXI_ADMIN_TOKEN` (see `resolve_admin_auth_from`'s
-    // doc comment above for the full explanation). They now call the pure
-    // `resolve_admin_auth_from` with both the candidate token and the
-    // pre-resolved legacy policy as plain arguments, so none of them touch
-    // either environment variable at all -- and each asserts a distinct,
-    // concrete expected outcome rather than delegating to a fresh
-    // `AdminAuthConfig::from_env()` call, so a broken fallback arm cannot
-    // hide behind `OXI_ADMIN_TOKEN` happening to be unset in the test
-    // environment.
-
-    #[test]
-    fn resolve_admin_auth_from_prefers_new_token_over_legacy() {
-        let resolved = resolve_admin_auth_from(
-            Some("new-convention-token-value"),
-            AdminAuthConfig::with_admin_token("legacy-convention-token-value"),
-        );
-        assert_eq!(
-            resolved,
-            AdminAuthConfig::with_admin_token("new-convention-token-value")
-        );
-    }
-
-    #[test]
-    fn resolve_admin_auth_from_falls_back_to_legacy_when_new_token_is_none() {
-        let resolved = resolve_admin_auth_from(
-            None,
-            AdminAuthConfig::with_admin_token("legacy-convention-token-value"),
-        );
-        assert_eq!(
-            resolved,
-            AdminAuthConfig::with_admin_token("legacy-convention-token-value")
-        );
-    }
-
-    #[test]
-    fn resolve_admin_auth_from_falls_back_to_legacy_when_new_token_is_empty() {
-        let resolved = resolve_admin_auth_from(
-            Some(""),
-            AdminAuthConfig::with_admin_token("legacy-convention-token-value"),
-        );
-        assert_eq!(
-            resolved,
-            AdminAuthConfig::with_admin_token("legacy-convention-token-value")
-        );
-    }
-
-    #[test]
-    fn resolve_admin_auth_from_locked_when_neither_is_configured() {
-        let resolved = resolve_admin_auth_from(None, AdminAuthConfig::locked());
-        assert_eq!(resolved, AdminAuthConfig::locked());
-    }
-
-    #[test]
-    fn resolve_admin_auth_from_ignores_legacy_when_new_token_is_whitespace_only() {
-        // A previously-untested edge case documented on
-        // `resolve_admin_auth_from`'s doc comment: a whitespace-only new
-        // token is non-empty (so it does NOT hit the fallback arm), but
-        // `AdminAuthConfig::with_admin_token` itself treats whitespace-only
-        // as "not configured", so this locks even though a legacy token is
-        // available -- unlike an *empty* new token
-        // (`resolve_admin_auth_from_falls_back_to_legacy_when_new_token_is_empty`
-        // above), which does fall back to it.
-        let resolved = resolve_admin_auth_from(
-            Some("   "),
-            AdminAuthConfig::with_admin_token("legacy-convention-token-value"),
-        );
-        assert_eq!(resolved, AdminAuthConfig::locked());
-    }
-
-    // ── default_sampling_params (FIX2-SERVE item 6: greedy penalties) ───────
-
-    /// THE regression test for the serve half of the P0 CPU-vs-Metal
-    /// divergence: `oxibonsai serve`'s baseline `SamplingParams` must match
-    /// what `oxibonsai run`/`chat`/`benchmark`/`eval` resolve to for the
-    /// same (default, no-flag) inputs -- both now go through the identical
-    /// shared `build_sampling_params` constructor. `SamplingParams` carries
-    /// no `PartialEq` (it is owned by `oxibonsai-runtime`, not this
-    /// package), so fields are compared individually.
-    ///
-    /// KNOWN LIMITATION (verifier-noted, acknowledged rather than papered
-    /// over): `default_sampling_params()` above is *itself* defined as
-    /// `build_sampling_params(DEFAULT_SAMPLING_TEMPERATURE, ...)`, so
-    /// comparing it here against `build_sampling_params(0.7, 40, 0.9, 1.0)`
-    /// feeds the identical pure constructor the identical literals on both
-    /// sides and cannot catch `src/cli/mod.rs`'s own independent
-    /// `--temperature`/`--top-k`/`--top-p`/`--repetition-penalty` flag
-    /// resolution drifting away from these values -- `mod.rs` is not in
-    /// this package's `owned_files`, and it inlines its fallback literals
-    /// directly into `util::resolve_f32(..)` calls with no exported
-    /// constant this test could import instead. Asserting the run-path
-    /// literals explicitly (e.g. `run_path_params.temperature == 0.7`)
-    /// would not close this gap either: `build_sampling_params` is a pure
-    /// field-literal passthrough (`src/cli/util.rs`), so such an assertion
-    /// would be tautological by construction, not a real check. What this
-    /// test DOES verify, non-tautologically: `default_sampling_params()`'s
-    /// own `DEFAULT_SAMPLING_*` constants (this module) have not drifted
-    /// from what they are supposed to mirror, and -- the concrete
-    /// regression at the bottom of this test -- that the server's baseline
-    /// never again silently reverts to `SamplingParams::default()`'s
-    /// hidden `repetition_penalty` of `1.1`. A future owner of `mod.rs`
-    /// closing the remaining gap would export its literals as named
-    /// constants for this test to import.
-    #[test]
-    fn serve_default_sampling_params_match_the_run_path_for_the_same_inputs() {
-        let serve_params = default_sampling_params();
-        // "The run path, same inputs": the literal defaults `src/cli/mod.rs`
-        // resolves `run`'s `--temperature`/`--top-k`/`--top-p`/
-        // `--repetition-penalty` flags to when none of them are passed.
-        let run_path_params = build_sampling_params(0.7, 40, 0.9, 1.0);
-
-        assert!(
-            (serve_params.temperature - run_path_params.temperature).abs() < f32::EPSILON,
-            "temperature mismatch: serve={} run={}",
-            serve_params.temperature,
-            run_path_params.temperature
-        );
-        assert_eq!(serve_params.top_k, run_path_params.top_k);
-        assert!(
-            (serve_params.top_p - run_path_params.top_p).abs() < f32::EPSILON,
-            "top_p mismatch: serve={} run={}",
-            serve_params.top_p,
-            run_path_params.top_p
-        );
-        assert!(
-            (serve_params.repetition_penalty - run_path_params.repetition_penalty).abs()
-                < f32::EPSILON,
-            "repetition_penalty mismatch: serve={} run={}",
-            serve_params.repetition_penalty,
-            run_path_params.repetition_penalty
-        );
-        assert_eq!(serve_params.max_tokens, run_path_params.max_tokens);
-
-        // The concrete regression this guards against: the server's
-        // baseline must never again silently carry
-        // `SamplingParams::default()`'s hidden `repetition_penalty` of
-        // `1.1` -- "greedy means greedy" (a per-request `temperature: 0`)
-        // must hold on `oxibonsai serve` exactly as it does on `oxibonsai
-        // run`.
-        assert!((serve_params.repetition_penalty - 1.0).abs() < f32::EPSILON);
-    }
-
-    // ── resolve_seed ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn resolve_seed_env_override_wins() {
-        // SAFETY (test-only): `std::env::set_var`/`remove_var` are process
-        // wide; this test is careful to always restore the prior value so
-        // it cannot leak into a sibling test running in the same process.
-        let prior = std::env::var("OXIBONSAI_SEED").ok();
-        unsafe {
-            std::env::set_var("OXIBONSAI_SEED", "123456789");
-        }
-        let seed = resolve_seed();
-        match prior {
-            Some(v) => unsafe { std::env::set_var("OXIBONSAI_SEED", v) },
-            None => unsafe { std::env::remove_var("OXIBONSAI_SEED") },
-        }
-        assert_eq!(seed, 123_456_789);
-    }
-
-    #[test]
-    fn resolve_seed_ignores_malformed_override() {
-        let prior = std::env::var("OXIBONSAI_SEED").ok();
-        unsafe {
-            std::env::set_var("OXIBONSAI_SEED", "not-a-number");
-        }
-        // Falls back to the pseudo-random (time-derived) path; two calls a
-        // moment apart must not be a hardcoded constant. This is a real
-        // assertion (not a `!= 42` probabilistic guess): the nanosecond
-        // component alone makes two calls separated by any measurable delay
-        // collide with astronomically low probability, and a constant
-        // fallback -- the actual regression this guards against -- would
-        // fail it deterministically.
-        let first = resolve_seed();
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        let second = resolve_seed();
-        match prior {
-            Some(v) => unsafe { std::env::set_var("OXIBONSAI_SEED", v) },
-            None => unsafe { std::env::remove_var("OXIBONSAI_SEED") },
-        }
-        assert_ne!(
-            first, second,
-            "the pseudo-random fallback must not be a constant"
-        );
-    }
-
-    // ── resolve_bearer_token_file_override (SV-33) ──────────────────────────
-
-    #[test]
-    fn bearer_token_file_override_passes_through_when_unset() {
-        let prior = std::env::var("OXIBONSAI_BEARER_TOKEN_FILE").ok();
-        unsafe {
-            std::env::remove_var("OXIBONSAI_BEARER_TOKEN_FILE");
-        }
-        let result = resolve_bearer_token_file_override(Some("flag-value".to_string()))
-            .expect("unset var must not error");
-        if let Some(v) = prior {
-            unsafe { std::env::set_var("OXIBONSAI_BEARER_TOKEN_FILE", v) };
-        }
-        assert_eq!(result, Some("flag-value".to_string()));
-    }
-
-    #[test]
-    fn bearer_token_file_override_wins_and_is_trimmed() {
-        let dir = std::env::temp_dir().join(format!(
-            "oxibonsai_cli_bearer_token_file_test_{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        let path = dir.join("token");
-        std::fs::write(&path, "  from-file  \n").expect("write token file");
-
-        let prior = std::env::var("OXIBONSAI_BEARER_TOKEN_FILE").ok();
-        unsafe {
-            std::env::set_var(
-                "OXIBONSAI_BEARER_TOKEN_FILE",
-                path.to_string_lossy().as_ref(),
-            );
-        }
-        let result = resolve_bearer_token_file_override(Some("flag-value".to_string()));
-        match prior {
-            Some(v) => unsafe { std::env::set_var("OXIBONSAI_BEARER_TOKEN_FILE", v) },
-            None => unsafe { std::env::remove_var("OXIBONSAI_BEARER_TOKEN_FILE") },
-        }
-        assert_eq!(result.expect("resolve"), Some("from-file".to_string()));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn bearer_token_file_override_errors_on_missing_file() {
-        // Never a hardcoded absolute path (project policy): a process-unique
-        // path under the real temp dir, mirroring the sibling test in
-        // `crates/oxibonsai-serve/src/hardening.rs`
-        // (`resolve_bearer_token_errors_when_file_is_unreadable`).
-        let missing = std::env::temp_dir().join(format!(
-            "oxibonsai_cli_definitely_missing_bearer_token_file_{}",
-            std::process::id()
-        ));
-        let prior = std::env::var("OXIBONSAI_BEARER_TOKEN_FILE").ok();
-        unsafe {
-            std::env::set_var("OXIBONSAI_BEARER_TOKEN_FILE", &missing);
-        }
-        let result = resolve_bearer_token_file_override(None);
-        match prior {
-            Some(v) => unsafe { std::env::set_var("OXIBONSAI_BEARER_TOKEN_FILE", v) },
-            None => unsafe { std::env::remove_var("OXIBONSAI_BEARER_TOKEN_FILE") },
-        }
-        assert!(result.is_err());
-    }
-
-    // ── checksum helpers ─────────────────────────────────────────────────────
-    //
-    // `lookup_expected_checksum` has no non-test call site left in this
-    // *binary* target now that `verify_model_checksum`'s implementation
-    // lives in `oxibonsai_runtime::serve_shared` -- imported here, inside
-    // `#[cfg(test)]`, rather than at module level, so a non-test build of
-    // this bin target does not see (and cannot warn about) an otherwise
-    // -unused import.
-    use oxibonsai_runtime::serve_shared::lookup_expected_checksum;
-
-    #[test]
-    fn lookup_matches_by_bare_filename() {
-        let text =
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  models/Foo.gguf\n";
-        let got = lookup_expected_checksum(text, Path::new("/elsewhere/Foo.gguf"));
-        assert_eq!(
-            got,
-            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
-        );
-    }
-
-    #[test]
-    fn lookup_is_none_for_unknown_file() {
-        let text =
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  models/Foo.gguf\n";
-        assert!(lookup_expected_checksum(text, Path::new("models/Unknown.gguf")).is_none());
-    }
-
-    #[test]
-    fn verify_is_a_noop_when_checksums_file_is_absent() {
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "oxibonsai_cli_checksum_test_{}",
-            std::process::id()
-        ));
-        let missing_checksums = tmp_dir.join("does-not-exist.sha256");
-        let model = tmp_dir.join("Model.gguf");
-        verify_model_checksum(&model, &missing_checksums)
-            .expect("missing checksums file must not block loading");
-    }
-
-    // NOTE (sec-12 verifier finding): the previous version of this test
-    // ("verify_warns_but_does_not_fail_when_hasher_is_unavailable") never
-    // actually wrote a model file, only the checksums entry -- so it
-    // exercised `verify_model_checksum`'s `Err(_)` (unreadable file)
-    // branch, not an "unavailable hasher" branch, regardless of what
-    // `compute_sha256_hex` returned. It is replaced below by tests that
-    // exercise the real equality/mismatch branches end to end through this
-    // binary's own imported `verify_model_checksum`, plus one correctly
-    // named/scoped test for the unreadable-file case it was accidentally
-    // covering.
-
-    #[test]
-    fn verify_succeeds_when_the_checksum_really_matches() {
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "oxibonsai_cli_checksum_test_matches_{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
-        let model = tmp_dir.join("Model.gguf");
-        std::fs::write(&model, b"the real bytes of a model file").expect("write model");
-        let hex = oxibonsai_runtime::serve_shared::compute_sha256_hex(&model)
-            .expect("compute hex")
-            .expect("digest is always Some for a readable file");
-        let checksums_path = tmp_dir.join("checksums.sha256");
-        std::fs::write(
-            &checksums_path,
-            format!(
-                "{hex}  {}\n",
-                model.file_name().expect("filename").to_string_lossy()
-            ),
-        )
-        .expect("write checksums file");
-
-        verify_model_checksum(&model, &checksums_path)
-            .expect("a genuinely matching checksum must not block loading");
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-    }
-
-    /// THE regression test finding `sec-12` was missing: a known-good
-    /// checksum entry that no longer matches the file on disk must be
-    /// **fatal** -- this is `verify_model_checksum`'s one fatal branch, and
-    /// it was unreachable dead code while `compute_sha256_hex` always
-    /// returned `Ok(None)`.
-    #[test]
-    fn verify_fails_when_a_known_good_entry_no_longer_matches_a_corrupted_file() {
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "oxibonsai_cli_checksum_test_corrupted_{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
-        let model = tmp_dir.join("Model.gguf");
-
-        std::fs::write(&model, b"the original, known-good model bytes").expect("write model");
-        let good_hex = oxibonsai_runtime::serve_shared::compute_sha256_hex(&model)
-            .expect("compute hex")
-            .expect("digest is always Some for a readable file");
-        let checksums_path = tmp_dir.join("checksums.sha256");
-        std::fs::write(
-            &checksums_path,
-            format!(
-                "{good_hex}  {}\n",
-                model.file_name().expect("filename").to_string_lossy()
-            ),
-        )
-        .expect("write checksums file");
-
-        // Corrupt the file in place; the checksums file still lists the
-        // ORIGINAL (now stale) digest as "known-good".
-        std::fs::write(
-            &model,
-            b"corrupted! these are not the original bytes at all",
-        )
-        .expect("corrupt model");
-
-        let err = verify_model_checksum(&model, &checksums_path)
-            .expect_err("a stale known-good entry against corrupted bytes must be fatal");
-        assert!(
-            err.contains("checksum mismatch"),
-            "error should explain the mismatch: {err}"
-        );
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-    }
-
-    #[test]
-    fn verify_degrades_gracefully_when_the_model_file_cannot_be_opened() {
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "oxibonsai_cli_checksum_test_missing_model_{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
-        let model = tmp_dir.join("Model.gguf"); // Deliberately never created.
-        let checksums_path = tmp_dir.join("checksums.sha256");
-        std::fs::write(&checksums_path, format!("{}  Model.gguf\n", "c".repeat(64)))
-            .expect("write checksums file");
-        verify_model_checksum(&model, &checksums_path)
-            .expect("an unreadable model file must not block loading (degrades to a warning)");
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-    }
-
-    // ── env helpers ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn env_cors_origins_splits_and_trims_when_set() {
-        let prior = std::env::var("OXIBONSAI_CORS_ORIGIN").ok();
-        unsafe {
-            std::env::set_var(
-                "OXIBONSAI_CORS_ORIGIN",
-                "https://a.example.com, https://b.example.com ,",
-            );
-        }
-        let origins = env_cors_origins();
-        match prior {
-            Some(v) => unsafe { std::env::set_var("OXIBONSAI_CORS_ORIGIN", v) },
-            None => unsafe { std::env::remove_var("OXIBONSAI_CORS_ORIGIN") },
-        }
-        assert_eq!(
-            origins,
-            vec![
-                "https://a.example.com".to_string(),
-                "https://b.example.com".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn env_flag_accepts_common_spellings() {
-        for (raw, expected) in [
-            ("1", true),
-            ("true", true),
-            ("YES", true),
-            ("on", true),
-            ("0", false),
-            ("false", false),
-            ("no", false),
-            ("garbage", false),
-        ] {
-            let prior = std::env::var("OXIBONSAI_TEST_FLAG_CMD_SERVE").ok();
-            unsafe {
-                std::env::set_var("OXIBONSAI_TEST_FLAG_CMD_SERVE", raw);
-            }
-            let got = env_flag("OXIBONSAI_TEST_FLAG_CMD_SERVE");
-            match &prior {
-                Some(v) => unsafe { std::env::set_var("OXIBONSAI_TEST_FLAG_CMD_SERVE", v) },
-                None => unsafe { std::env::remove_var("OXIBONSAI_TEST_FLAG_CMD_SERVE") },
-            }
-            assert_eq!(got, expected, "raw={raw:?}");
-        }
-    }
-
-    // ── harden_router: full composition against a tiny in-memory pool ──────
-
-    mod router_tests {
-        use super::*;
-        use axum::body::Body;
-        use axum::http::{Request, StatusCode};
-        use oxibonsai_core::config::Qwen3Config;
-        use oxibonsai_runtime::engine::InferenceEngine;
-        use oxibonsai_runtime::engine_pool::EnginePool;
-        use oxibonsai_runtime::metrics::InferenceMetrics;
-        use oxibonsai_runtime::sampling::SamplingParams;
-        use std::time::Duration;
-        use tower::ServiceExt;
-
-        fn default_opts() -> HardeningOptions {
-            HardeningOptions {
-                bearer_token: None,
-                max_concurrent_requests: 32,
-                request_timeout_ms: 60_000,
-                max_body_bytes: 4 * 1024 * 1024,
-                cors_origins: Vec::new(),
-                cors_allow_credentials: false,
-                rate_limit_rpm: None,
-                rate_limit_burst: 20.0,
-            }
-        }
-
-        fn router_for(opts: HardeningOptions) -> Router {
-            let engine =
-                InferenceEngine::new(Qwen3Config::tiny_test(), SamplingParams::default(), 42);
-            let pool = EnginePool::new(vec![engine]);
-            let pool_size = pool.size();
-            let metrics = Arc::new(InferenceMetrics::new());
-            let router_options = RouterOptions::default().with_auth(AdminAuthConfig::locked());
-            let base = create_router_full(pool, None, metrics, router_options);
-            harden_router(base, pool_size, &opts, "127.0.0.1")
-        }
-
-        #[tokio::test]
-        async fn health_is_reachable_with_no_config() {
-            let router = router_for(default_opts());
-            let resp = router
-                .oneshot(
-                    Request::get("/health")
-                        .body(Body::empty())
-                        .expect("request"),
-                )
-                .await
-                .expect("response");
-            assert_eq!(resp.status(), StatusCode::OK);
-        }
-
-        #[tokio::test]
-        async fn admin_is_refused_by_default() {
-            let router = router_for(default_opts());
-            let resp = router
-                .oneshot(
-                    Request::get("/admin/status")
-                        .body(Body::empty())
-                        .expect("request"),
-                )
-                .await
-                .expect("response");
-            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        }
-
-        #[tokio::test]
-        async fn bearer_auth_protects_inference_routes_when_configured() {
-            let mut opts = default_opts();
-            opts.bearer_token = Some("x".repeat(20));
-            let router = router_for(opts);
-
-            let unauth = router
-                .clone()
-                .oneshot(
-                    Request::get("/v1/models")
-                        .body(Body::empty())
-                        .expect("request"),
-                )
-                .await
-                .expect("response");
-            assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
-
-            let health = router
-                .oneshot(
-                    Request::get("/health")
-                        .body(Body::empty())
-                        .expect("request"),
-                )
-                .await
-                .expect("response");
-            assert_eq!(health.status(), StatusCode::OK, "/health must stay exempt");
-        }
-
-        /// cli-18: two consecutive unauthenticated requests must be
-        /// rejected identically. **Not discriminating on its own**: both
-        /// requests run sequentially through `oneshot`, so the sole permit
-        /// (if bearer auth were ever mounted inside the admission stack)
-        /// would already be released before the second request starts, and
-        /// this assertion would hold under BOTH layer orderings. Kept as a
-        /// cheap idempotency check; `unauthenticated_request_is_401_while_the_sole_permit_is_held`
-        /// below is the test that actually proves the layer ordering.
-        #[tokio::test]
-        async fn unauthenticated_request_never_reaches_admission() {
-            let mut opts = default_opts();
-            opts.bearer_token = Some("x".repeat(20));
-            opts.max_concurrent_requests = 1;
-            let router = router_for(opts);
-
-            for _ in 0..2 {
-                let resp = router
-                    .clone()
-                    .oneshot(
-                        Request::get("/v1/models")
-                            .body(Body::empty())
-                            .expect("request"),
-                    )
-                    .await
-                    .expect("response");
-                assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-            }
-        }
-
-        /// VERIFIER-ADDED (cli-18), ported from the discriminating version
-        /// added to `crates/oxibonsai-serve/src/hardening.rs`'s
-        /// `build_router_tests`: the sibling
-        /// `unauthenticated_request_never_reaches_admission` above drives
-        /// its two requests sequentially through `oneshot`, so the permit
-        /// is released before the second request starts and the assertion
-        /// holds under BOTH layer orderings -- it does not actually
-        /// discriminate. Here a slow *authenticated* chat completion is
-        /// kept in flight on a separate task, holding the sole concurrency
-        /// permit (effective ceiling = `resolve_admission_limit(1, 1)` =
-        /// `1`); an unauthenticated request issued while it runs must still
-        /// be `401`. If bearer auth were mounted INSIDE the admission
-        /// stack, `load_shed` would answer `503` instead.
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn unauthenticated_request_is_401_while_the_sole_permit_is_held() {
-            let mut opts = default_opts();
-            opts.bearer_token = Some("x".repeat(20));
-            opts.max_concurrent_requests = 1;
-            let router = router_for(opts);
-
-            let slow_router = router.clone();
-            let slow = tokio::spawn(async move {
-                let payload = serde_json::json!({
-                    "messages": [{"role": "user", "content": "hello"}],
-                    "max_tokens": 500,
-                });
-                let req = Request::builder()
-                    .method("POST")
-                    .uri("/v1/chat/completions")
-                    .header("content-type", "application/json")
-                    .header("authorization", format!("Bearer {}", "x".repeat(20)))
-                    .body(Body::from(payload.to_string()))
-                    .expect("request");
-                slow_router.oneshot(req).await.map(|r| r.status())
-            });
-
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            let resp = router
-                .oneshot(
-                    Request::get("/v1/models")
-                        .body(Body::empty())
-                        .expect("request"),
-                )
-                .await
-                .expect("response");
-            let slow_status = slow.await.expect("join").expect("slow response");
-            assert_eq!(
-                slow_status,
-                StatusCode::OK,
-                "the authenticated request must have been the one holding the permit"
-            );
-            assert_eq!(
-                resp.status(),
-                StatusCode::UNAUTHORIZED,
-                "an unauthenticated request must be 401 even while the sole admission permit \
-                 is held (a 503 means bearer auth sits INSIDE the admission stack)"
-            );
-        }
-
-        /// sec-20/perf-M1: the `503` an overloaded admission layer returns
-        /// must carry `Retry-After` -- previously an omission (only the
-        /// `429` rate-limit path below set it). Same permit-holding trick
-        /// as `unauthenticated_request_is_401_while_the_sole_permit_is_held`,
-        /// but with no bearer token configured, so the second request
-        /// actually reaches (and is shed by) the admission layer instead of
-        /// being rejected by auth first.
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn overloaded_request_gets_503_with_retry_after() {
-            let mut opts = default_opts();
-            opts.max_concurrent_requests = 1;
-            let router = router_for(opts);
-
-            let slow_router = router.clone();
-            let slow = tokio::spawn(async move {
-                let payload = serde_json::json!({
-                    "messages": [{"role": "user", "content": "hello"}],
-                    "max_tokens": 500,
-                });
-                let req = Request::builder()
-                    .method("POST")
-                    .uri("/v1/chat/completions")
-                    .header("content-type", "application/json")
-                    .body(Body::from(payload.to_string()))
-                    .expect("request");
-                slow_router.oneshot(req).await.map(|r| r.status())
-            });
-
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            let resp = router
-                .oneshot(
-                    Request::get("/v1/models")
-                        .body(Body::empty())
-                        .expect("request"),
-                )
-                .await
-                .expect("response");
-            let slow_status = slow.await.expect("join").expect("slow response");
-            assert_eq!(
-                slow_status,
-                StatusCode::OK,
-                "the in-flight request must have been the one holding the sole permit"
-            );
-            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-            assert!(
-                resp.headers().get("retry-after").is_some(),
-                "a 503 from the admission layer must carry Retry-After"
-            );
-        }
-
-        #[tokio::test]
-        async fn rate_limit_returns_429_with_retry_after() {
-            let mut opts = default_opts();
-            opts.rate_limit_rpm = Some(60.0);
-            opts.rate_limit_burst = 1.0;
-            let router = router_for(opts);
-
-            let first = router
-                .clone()
-                .oneshot(
-                    Request::get("/v1/models")
-                        .body(Body::empty())
-                        .expect("request"),
-                )
-                .await
-                .expect("response");
-            assert_eq!(first.status(), StatusCode::OK);
-
-            let second = router
-                .oneshot(
-                    Request::get("/v1/models")
-                        .body(Body::empty())
-                        .expect("request"),
-                )
-                .await
-                .expect("response");
-            assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
-            assert!(second.headers().get("retry-after").is_some());
-        }
-
-        #[tokio::test]
-        async fn cors_preflight_bypasses_bearer_auth() {
-            let mut opts = default_opts();
-            opts.bearer_token = Some("x".repeat(20));
-            opts.cors_origins = vec!["https://app.example.com".to_string()];
-            let router = router_for(opts);
-
-            let preflight = Request::builder()
-                .method("OPTIONS")
-                .uri("/v1/chat/completions")
-                .header("origin", "https://app.example.com")
-                .body(Body::empty())
-                .expect("preflight request");
-            let resp = router.oneshot(preflight).await.expect("response");
-            assert_eq!(
-                resp.status(),
-                StatusCode::OK,
-                "an OPTIONS preflight must bypass bearer auth entirely (SV-06)"
-            );
-        }
-
-        #[tokio::test]
-        async fn no_cors_configured_emits_no_cors_headers() {
-            let router = router_for(default_opts());
-            let resp = router
-                .oneshot(
-                    Request::get("/health")
-                        .header("origin", "https://anything.example.com")
-                        .body(Body::empty())
-                        .expect("request"),
-                )
-                .await
-                .expect("response");
-            assert!(resp.headers().get("access-control-allow-origin").is_none());
-        }
-
-        #[tokio::test]
-        async fn oversized_body_is_rejected_with_413() {
-            let mut opts = default_opts();
-            opts.max_body_bytes = 16;
-            let router = router_for(opts);
-
-            let body = Body::from(vec![b'a'; 4096]);
-            let req = Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .body(body)
-                .expect("request");
-            let resp = router.oneshot(req).await.expect("response");
-            assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        }
-
-        /// FIX2-SERVE item 3, ported from the sibling test added to
-        /// `crates/oxibonsai-serve/src/hardening.rs`'s `build_router_tests`:
-        /// `DefaultBodyLimit` was reordered from inside the admission stack
-        /// to outside it (still inside rate-limiting). **Not discriminating
-        /// on its own** (same caveat as
-        /// `unauthenticated_request_never_reaches_admission` above for a
-        /// different layer pair): `axum::extract::DefaultBodyLimit` only
-        /// inserts a request extension consulted later by the handler's own
-        /// extractor and never rejects anything itself at either position,
-        /// so this only proves the ceiling still applies once
-        /// `max_concurrent_requests` is tightened to its minimum (1), and
-        /// that the response is genuinely `413`, not a `408`/`504` timeout
-        /// from admission's own `.timeout(..)`.
-        #[tokio::test]
-        async fn oversized_body_is_rejected_with_413_even_with_a_single_permit() {
-            let mut opts = default_opts();
-            opts.max_body_bytes = 16;
-            opts.max_concurrent_requests = 1;
-            let router = router_for(opts);
-
-            let body = Body::from(vec![b'a'; 4096]);
-            let req = Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .body(body)
-                .expect("request");
-            let resp = router.oneshot(req).await.expect("response");
-            assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        }
-    }
-}
+#[path = "cmd_serve_tests.rs"]
+mod tests;

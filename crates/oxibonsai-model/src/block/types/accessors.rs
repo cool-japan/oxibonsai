@@ -9,6 +9,34 @@ use oxibonsai_kernels::GpuWeightHandle;
 use super::block_def::TransformerBlock;
 
 impl<'a> TransformerBlock<'a> {
+    // ── GPU slot namespace (MET-02) ──────────────────────────────────────────
+
+    /// Hand this block the GPU slot namespace of the model it belongs to —
+    /// called by `BonsaiModel`'s constructors, so the block's per-layer GPU
+    /// path and the model's fused paths key the same buffers. Only the Metal
+    /// and CUDA builds key anything on a namespace, so only they have it.
+    #[cfg(any(
+        all(feature = "metal", target_os = "macos"),
+        all(
+            feature = "native-cuda",
+            any(target_os = "linux", target_os = "windows")
+        )
+    ))]
+    pub(crate) fn set_slot_namespace(
+        &mut self,
+        namespace: std::sync::Arc<crate::model::types::q1_slots::MappingState>,
+    ) {
+        self.slot_namespace = namespace;
+    }
+
+    /// The epoch of the GPU slot namespace this block keys its model-owned GPU
+    /// buffers under: the model's mapping epoch for a block of a loaded model
+    /// (shared by every replica of that GGUF mapping), a private one for a
+    /// block built on its own.
+    pub fn gpu_slot_epoch(&self) -> u64 {
+        self.slot_namespace.epoch()
+    }
+
     // ── Norm weights & layer index ───────────────────────────────────────────
 
     /// Attention norm weight slice.
@@ -66,45 +94,66 @@ impl<'a> TransformerBlock<'a> {
         self.fused_gate_up_handle
     }
     /// Fused Q‖K‖V GPU handle of a **ternary** block (`M-21`), if
-    /// `upload_to_gpu` ran on a GPU-tier kernel.
+    /// `upload_to_gpu` ran on a GPU-tier kernel of a build that uploads the
+    /// concatenation to the kernel's own cache — every GPU build but Metal,
+    /// whose fused arms key their buffer on the block's mapping namespace
+    /// instead ([`Self::ternary_fused_qkv_slot`]), so this is always `None`
+    /// there.
     pub fn fused_qkv_gpu_handle_ternary(&self) -> Option<GpuWeightHandle> {
         self.fused_qkv_handle_ternary
     }
-    /// Fused gate‖up GPU handle of a **ternary** block (`M-21`), if
-    /// `upload_to_gpu` ran on a GPU-tier kernel.
+    /// Fused gate‖up GPU handle of a **ternary** block (`M-21`); built exactly
+    /// like [`Self::fused_qkv_gpu_handle_ternary`] (`None` on Metal).
     pub fn fused_gate_up_gpu_handle_ternary(&self) -> Option<GpuWeightHandle> {
         self.fused_gate_up_handle_ternary
     }
     /// GPU weight-cache slot of a ternary block's fused Q‖K‖V buffer
-    /// (`M-21`): the dedicated fused handle's id when `upload_to_gpu` built
-    /// one, else the Q projection's handle id (the slot the fused arm keyed
-    /// on before the dedicated handle existed); `None` when the block was
-    /// never uploaded, i.e. the fused arm must not engage.
+    /// (`M-21`); `None` when the block was never uploaded to a GPU tier, i.e.
+    /// the fused arm must not engage.
     ///
-    /// Every forward path that runs the ternary fused-QKV GEMV must derive its
-    /// slot here so they all bind **one** GPU buffer — `forward` does;
-    /// `forward_with_sliding_window` / `forward_with_stats` still key on
-    /// [`Self::legacy_ternary_fused_qkv_slot`] until their owner switches them
-    /// (a recorded one-line change each).
+    /// **Metal:** the address of the block's mapped `attn_q` tensor — the very
+    /// slot the model's full-forward ternary cache keys its fused Q‖K‖V buffer
+    /// on (`gpu_cache::TernaryLayerSlots::fused_qkv`) — under the block's
+    /// namespace epoch ([`Self::gpu_slot_epoch`], the model's mapping epoch).
+    /// Every forward kind (`forward`, `forward_with_sliding_window`,
+    /// `forward_with_stats`) and the whole-model paths therefore bind **one**
+    /// buffer, and every replica of the mapping shares it. **Elsewhere:** the
+    /// dedicated fused handle's id when `upload_to_gpu` built one, else the Q
+    /// projection's handle id.
     pub fn ternary_fused_qkv_slot(&self) -> Option<u64> {
-        self.fused_qkv_handle_ternary
-            .or_else(|| self.attn_q.gpu_handle())
-            .map(|handle| handle.id())
-    }
-    /// The Q projection's handle id — the fused-QKV slot every ternary Metal
-    /// forward path keyed on before `M-21` gave the concatenation its own
-    /// handle. Kept so the paths not yet switched to
-    /// [`Self::ternary_fused_qkv_slot`] have a named source for it.
-    pub fn legacy_ternary_fused_qkv_slot(&self) -> Option<u64> {
-        self.attn_q.gpu_handle().map(|handle| handle.id())
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            self.attn_q.gpu_handle()?;
+            crate::model::types::q1_slots::mapped_tensor_slot(
+                crate::block::blocks_as_bytes_ternary(self.attn_q.blocks_ternary()?),
+            )
+        }
+        #[cfg(not(all(feature = "metal", target_os = "macos")))]
+        {
+            self.fused_qkv_handle_ternary
+                .or_else(|| self.attn_q.gpu_handle())
+                .map(|handle| handle.id())
+        }
     }
     /// GPU weight-cache slot of a ternary block's fused gate‖up buffer
-    /// (`M-21`): the dedicated fused handle's id when present, else the gate
-    /// projection's handle id; `None` when the block was never uploaded.
+    /// (`M-21`): on Metal the address of the mapped `ffn_gate` tensor (the
+    /// model cache's `gate_up` slot) under [`Self::gpu_slot_epoch`];
+    /// elsewhere the dedicated fused handle's id when present, else the gate
+    /// projection's handle id. `None` when the block was never uploaded.
     pub fn ternary_fused_gate_up_slot(&self) -> Option<u64> {
-        self.fused_gate_up_handle_ternary
-            .or_else(|| self.ffn_gate.gpu_handle())
-            .map(|handle| handle.id())
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            self.ffn_gate.gpu_handle()?;
+            crate::model::types::q1_slots::mapped_tensor_slot(
+                crate::block::blocks_as_bytes_ternary(self.ffn_gate.blocks_ternary()?),
+            )
+        }
+        #[cfg(not(all(feature = "metal", target_os = "macos")))]
+        {
+            self.fused_gate_up_handle_ternary
+                .or_else(|| self.ffn_gate.gpu_handle())
+                .map(|handle| handle.id())
+        }
     }
     /// FFN down projection GPU handle (if uploaded).
     pub fn ffn_down_gpu_handle(&self) -> Option<GpuWeightHandle> {

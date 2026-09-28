@@ -24,8 +24,8 @@ use oxibonsai_runtime::middleware::MiddlewareConfig;
 use oxibonsai_runtime::rate_limiter::RateLimitConfig;
 use oxibonsai_runtime::sampling::SamplingParams;
 use oxibonsai_runtime::server::{
-    create_router, create_router_full, create_router_with_auth, create_router_with_options,
-    AuthConfig, RouterOptions, MAX_OUTPUT_TOKENS,
+    create_router_full, create_router_with_auth, create_router_with_options, AuthConfig,
+    RouterOptions, MAX_OUTPUT_TOKENS,
 };
 
 /// Admin credential used by the `/admin/*` tests below (finding `sec-15`).
@@ -40,8 +40,27 @@ fn engine() -> InferenceEngine<'static> {
     InferenceEngine::new(Qwen3Config::tiny_test(), SamplingParams::default(), 42)
 }
 
+/// Qwen3's `<|im_start|>` id: the tokenizer-less routers of this suite serve
+/// a `Qwen3Config::tiny_test()` engine (the Qwen3 vocabulary size) and run a
+/// text prompt as this single token.
+const QWEN3_IM_START: u32 = 151_644;
+
+/// A tokenizer-less router over `engine`. Without a tokenizer a server needs
+/// a configured prompt start token to accept a text prompt at all (it
+/// answers `400 tokenizer_required` otherwise), and the answer's text is
+/// empty — nothing to render it with — while `usage` still counts every
+/// generated token.
+fn tokenizerless_router(engine: InferenceEngine<'static>) -> axum::Router {
+    oxibonsai_runtime::server::create_router_full(
+        oxibonsai_runtime::engine_pool::EnginePool::new(vec![engine]),
+        None,
+        std::sync::Arc::new(oxibonsai_runtime::metrics::InferenceMetrics::new()),
+        oxibonsai_runtime::server::RouterOptions::default().with_prompt_start_token(QWEN3_IM_START),
+    )
+}
+
 fn router() -> axum::Router {
-    create_router(engine(), None)
+    tokenizerless_router(engine())
 }
 
 /// A router with the bundled chat UI explicitly opted into (`SV-26`'s
@@ -54,7 +73,9 @@ fn ui_enabled_router() -> axum::Router {
         EnginePool::new(vec![engine()]),
         None,
         Arc::new(InferenceMetrics::new()),
-        RouterOptions::default().with_enable_ui(true),
+        RouterOptions::default()
+            .with_enable_ui(true)
+            .with_prompt_start_token(QWEN3_IM_START),
     )
 }
 
@@ -318,7 +339,7 @@ async fn ui_health_is_served() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
-/// SV-26 gate-fix triage (wave 3): the chat UI is opt-in, so the shared
+/// SV-26: the chat UI is opt-in, so the shared
 /// [`router()`] helper -- built the same way every convenience constructor
 /// builds a router, `RouterOptions::default()` -- must get a `404` at `/ui`,
 /// not the `200` the two tests above intentionally opt into via
@@ -342,7 +363,7 @@ async fn ui_is_not_mounted_by_default() {
 /// convenience constructor with no admin credential configured refuses every
 /// `/admin/*` request instead of publishing the running configuration.
 ///
-/// Gatekeeper REQUIRED #10 (waves 1+1.5 review): this used to call
+/// This used to call
 /// `router()`, which builds its `AuthConfig` via `AuthConfig::from_env()` —
 /// so an operator/CI environment with `OXI_ADMIN_TOKEN` exported flips the
 /// expected 403 (`admin_auth_not_configured`) to 401 (a real, but
@@ -417,7 +438,7 @@ async fn admin_cache_stats_is_honest_about_unwired_caches() {
         "prefix_cache must be null when not wired; got {json}"
     );
     assert_eq!(json["prefix_cache_enabled"], false);
-    // SV-19 gate-fix triage (wave 3): `create_router_full` now always
+    // SV-19: `create_router_full` now always
     // attaches a real `KvCachePolicy` (fed from real per-request context
     // pressure — see `chat.rs`), so the *served* router's `/admin/cache-stats`
     // is genuinely populated, not fabricated. The null case is exercised
@@ -446,7 +467,7 @@ async fn admin_cache_stats_is_honest_about_unwired_caches() {
     );
 }
 
-/// Companion to the test above (SV-19 gate-fix triage, wave 3): a bare
+/// Companion to the test above (SV-19): a bare
 /// [`oxibonsai_runtime::admin::AdminState`] with no `KvCachePolicy` attached
 /// -- the shape every `/admin/*` test predating `create_router_full`'s
 /// unconditional `with_kv_cache_policy` wiring used -- must still report

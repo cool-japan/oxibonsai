@@ -1,8 +1,15 @@
 //! `BonsaiModel::new_for_testing_with_blocks`: a tiny, deterministic model
 //! with real Transformer blocks for the prefix-cache tests. Split out of
 //! `model/types/mod.rs` (B2-11-FIX).
+//!
+//! Also the test-only [`Q1ReplicaFixture`]: a tiny all-`Q1_0_g128` model —
+//! blocks **and** LM head — whose weights are leaked once and shared by every
+//! replica built from them, i.e. the in-process image of engine-pool replicas
+//! of one GGUF mapping (HANDOVER-GPU A5).
 
-use super::constructors::{effective_context, force_cpu_decode_after_from_env, prealloc_context};
+use super::constructors::{
+    effective_context, force_cpu_decode_after_from_env, prealloc_context, ModelGpuSlots,
+};
 use super::embedding::EmbeddingTable;
 use super::{BonsaiModel, ModelScratch, OutputWeight, MAX_PREALLOC_CONTEXT};
 use crate::kv_cache::{KvCache, GROWTH_CHUNK_POSITIONS};
@@ -140,6 +147,20 @@ impl BonsaiModel<'static> {
             blocks.push(block);
         }
 
+        let output_weight = OutputWeight::zero_fp32(config.vocab_size, h);
+        // MET-02: the leaked blocks anchor this model's own GPU slot namespace.
+        #[cfg_attr(
+            not(any(
+                all(feature = "metal", target_os = "macos"),
+                all(
+                    feature = "native-cuda",
+                    any(target_os = "linux", target_os = "windows")
+                )
+            )),
+            allow(unused_variables)
+        )]
+        let gpu_slots = ModelGpuSlots::attach(&mut blocks, &output_weight);
+
         Self {
             // The fixture's embedding is a constant 0.01 in every element, as
             // before — now synthesized per row instead of materialized.
@@ -147,7 +168,7 @@ impl BonsaiModel<'static> {
             shared_embd: std::sync::Arc::from(Vec::new()),
             blocks,
             output_norm: RmsNorm::new(vec![1.0; h], config.rms_norm_eps),
-            output_weight: OutputWeight::zero_fp32(config.vocab_size, h),
+            output_weight,
             rope,
             kv_cache,
             dominant_quant_type: oxibonsai_core::GgufTensorType::Q1_0_g128,
@@ -162,7 +183,7 @@ impl BonsaiModel<'static> {
             #[cfg(all(feature = "metal", target_os = "macos"))]
             gpu_weight_cache: std::sync::Mutex::new(None),
             #[cfg(all(feature = "metal", target_os = "macos"))]
-            metal_q1_slots: super::forward_metal::Q1MetalSlots::fresh(),
+            metal_q1_slots: gpu_slots.metal_q1_slots,
             #[cfg(all(
                 feature = "native-cuda",
                 any(target_os = "linux", target_os = "windows")
@@ -172,9 +193,223 @@ impl BonsaiModel<'static> {
                 feature = "native-cuda",
                 any(target_os = "linux", target_os = "windows")
             ))]
-            cuda_model_epoch:
-                oxibonsai_kernels::gpu_backend::cuda_graph_slot::next_cuda_model_epoch(),
+            cuda_model_epoch: gpu_slots.cuda_model_epoch,
             config,
         }
     }
+}
+
+/// One layer's leaked `Q1_0_g128` projections, in `TransformerBlock::new`
+/// order: q, k, v, attention output, gate, up, down.
+#[cfg(all(test, feature = "metal", target_os = "macos"))]
+type Q1FixtureLayer = [&'static [oxibonsai_core::tensor::BlockQ1_0G128]; 7];
+
+/// A tiny all-`Q1_0_g128` model — blocks **and** LM head — whose weights are
+/// leaked once and shared by every [`Self::replica`], so two replicas borrow
+/// the very same weight addresses exactly like two engine-pool replicas of
+/// one GGUF mapping do. The layers are built on the caller's dispatcher (a
+/// GPU tier gives every projection a GPU upload handle, which the Q1 fused
+/// Metal paths require), and the weights are varied so every projection and
+/// the LM head are genuinely different matrices. Only the Metal tests (the
+/// namespace-sharing acceptance) use it, so only that build compiles it.
+#[cfg(all(test, feature = "metal", target_os = "macos"))]
+pub(crate) struct Q1ReplicaFixture {
+    config: Qwen3Config,
+    kernel: std::sync::Arc<oxibonsai_kernels::KernelDispatcher>,
+    layers: Vec<Q1FixtureLayer>,
+    norms: &'static [f32],
+    lm_head: &'static [oxibonsai_core::tensor::BlockQ1_0G128],
+    embedding: std::sync::Arc<[f32]>,
+}
+
+#[cfg(all(test, feature = "metal", target_os = "macos"))]
+impl Q1ReplicaFixture {
+    /// Leak one deterministic weight set for `config` (which must have
+    /// `hidden_size` and `intermediate_size` multiples of 128).
+    pub(crate) fn new(
+        config: Qwen3Config,
+        kernel: std::sync::Arc<oxibonsai_kernels::KernelDispatcher>,
+        seed: u64,
+    ) -> Self {
+        let (h, inter) = (config.hidden_size, config.intermediate_size);
+        let (nq, nkv, hd) = (
+            config.num_attention_heads,
+            config.num_kv_heads,
+            config.head_dim,
+        );
+        assert!(
+            h.is_multiple_of(128) && inter.is_multiple_of(128) && (nq * hd).is_multiple_of(128),
+            "the Q1 replica fixture needs 128-multiple projection widths"
+        );
+        let layers = (0..config.num_layers)
+            .map(|layer| {
+                let s = seed.wrapping_add((layer as u64) << 8);
+                [
+                    leak_q1_blocks(nq * hd * (h / 128), s + 1),
+                    leak_q1_blocks(nkv * hd * (h / 128), s + 2),
+                    leak_q1_blocks(nkv * hd * (h / 128), s + 3),
+                    leak_q1_blocks(h * (nq * hd / 128), s + 4),
+                    leak_q1_blocks(inter * (h / 128), s + 5),
+                    leak_q1_blocks(inter * (h / 128), s + 6),
+                    leak_q1_blocks(h * (inter / 128), s + 7),
+                ]
+            })
+            .collect();
+        let norms: Vec<f32> = (0..h.max(hd))
+            .map(|i| 0.75 + 0.5 * (((i as u64 ^ seed) % 17) as f32) / 17.0)
+            .collect();
+        let embedding: Vec<f32> = (0..config.vocab_size * h)
+            .map(|i| 0.5 * (1.0 + 0.25 * ((i as f32) * 0.013 + seed as f32).sin()))
+            .collect();
+        Self {
+            lm_head: leak_q1_blocks(config.vocab_size * (h / 128), seed ^ 0xABCD),
+            kernel,
+            layers,
+            norms: Box::leak(norms.into_boxed_slice()),
+            embedding: std::sync::Arc::from(embedding),
+            config,
+        }
+    }
+
+    /// The fixture's configuration.
+    pub(crate) fn config(&self) -> &Qwen3Config {
+        &self.config
+    }
+
+    /// One more replica over the shared weights: its own KV cache, scratch
+    /// and GPU weight-cache marker; the weights (and therefore the GGUF-mapping
+    /// namespace it joins) are the fixture's.
+    pub(crate) fn replica(&self) -> crate::error::ModelResult<BonsaiModel<'static>> {
+        use crate::block::TransformerBlock;
+        use crate::layers::linear::{Linear1Bit, LinearLayer};
+        use oxibonsai_core::tensor::BlockQ1_0G128;
+
+        let config = self.config.clone();
+        let (h, inter) = (config.hidden_size, config.intermediate_size);
+        let (nq, nkv, hd) = (
+            config.num_attention_heads,
+            config.num_kv_heads,
+            config.head_dim,
+        );
+        let eps = config.rms_norm_eps;
+        let norm = |len: usize| RmsNorm::new(self.norms[..len].to_vec(), eps);
+        let linear = |blocks: &'static [BlockQ1_0G128],
+                      out: usize,
+                      inp: usize|
+         -> crate::error::ModelResult<LinearLayer<'static>> {
+            Ok(Linear1Bit::new(blocks, out, inp, std::sync::Arc::clone(&self.kernel))?.into())
+        };
+        let mut blocks = Vec::with_capacity(self.layers.len());
+        for (layer_idx, &[q, k, v, o, gate, up, down]) in self.layers.iter().enumerate() {
+            blocks.push(TransformerBlock::new(
+                layer_idx,
+                norm(h),
+                linear(q, nq * hd, h)?,
+                linear(k, nkv * hd, h)?,
+                linear(v, nkv * hd, h)?,
+                linear(o, h, nq * hd)?,
+                norm(hd),
+                norm(hd),
+                norm(h),
+                linear(gate, inter, h)?,
+                linear(up, inter, h)?,
+                linear(down, h, inter)?,
+                nq,
+                nkv,
+                hd,
+                h,
+            ));
+        }
+        let output_weight = OutputWeight::OneBit(Linear1Bit::new(
+            self.lm_head,
+            config.vocab_size,
+            h,
+            std::sync::Arc::clone(&self.kernel),
+        )?);
+        let max_context = effective_context(&config, None, None);
+        let prealloc = prealloc_context(max_context, None);
+        let kv_cache = KvCache::new_lazy_f16(
+            config.num_layers,
+            config.num_kv_heads,
+            config.head_dim,
+            max_context,
+            prealloc.min(GROWTH_CHUNK_POSITIONS),
+        );
+        let rope = build_rope_table_or_unscaled(&config, prealloc);
+        #[cfg_attr(
+            not(any(
+                all(feature = "metal", target_os = "macos"),
+                all(
+                    feature = "native-cuda",
+                    any(target_os = "linux", target_os = "windows")
+                )
+            )),
+            allow(unused_variables)
+        )]
+        let gpu_slots = ModelGpuSlots::attach(&mut blocks, &output_weight);
+        Ok(BonsaiModel {
+            token_embd: EmbeddingTable::dense(
+                std::sync::Arc::clone(&self.embedding),
+                config.vocab_size,
+                h,
+            ),
+            shared_embd: std::sync::Arc::from(Vec::new()),
+            blocks,
+            output_norm: norm(h),
+            output_weight,
+            rope,
+            kv_cache,
+            dominant_quant_type: oxibonsai_core::GgufTensorType::Q1_0_g128,
+            has_hadamard: false,
+            scratch: ModelScratch::default(),
+            max_context,
+            host_kv_written: 0,
+            gpu_path_active: std::sync::atomic::AtomicBool::new(false),
+            prefill_chunk_tokens: crate::chunked_prefill::DEFAULT_PREFILL_CHUNK_TOKENS,
+            lm_head_kernel: std::sync::Arc::clone(&self.kernel),
+            force_cpu_decode_after: force_cpu_decode_after_from_env(),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            gpu_weight_cache: std::sync::Mutex::new(None),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            metal_q1_slots: gpu_slots.metal_q1_slots,
+            #[cfg(all(
+                feature = "native-cuda",
+                any(target_os = "linux", target_os = "windows")
+            ))]
+            cuda_qkv_cache: std::sync::Mutex::new(None),
+            #[cfg(all(
+                feature = "native-cuda",
+                any(target_os = "linux", target_os = "windows")
+            ))]
+            cuda_model_epoch: gpu_slots.cuda_model_epoch,
+            config,
+        })
+    }
+}
+
+/// `n` deterministic, varied `Q1_0_g128` blocks, leaked for `'static`.
+#[cfg(all(test, feature = "metal", target_os = "macos"))]
+fn leak_q1_blocks(n: usize, seed: u64) -> &'static [oxibonsai_core::tensor::BlockQ1_0G128] {
+    use half::f16;
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        state
+    };
+    let blocks: Vec<oxibonsai_core::tensor::BlockQ1_0G128> = (0..n)
+        .map(|_| {
+            let scale = 0.01 + ((next() >> 40) % 1000) as f32 * 0.00002;
+            let mut qs = [0u8; 16];
+            for byte in qs.iter_mut() {
+                *byte = (next() >> 33) as u8;
+            }
+            oxibonsai_core::tensor::BlockQ1_0G128 {
+                d: f16::from_f32(scale),
+                qs,
+            }
+        })
+        .collect();
+    Box::leak(blocks.into_boxed_slice())
 }

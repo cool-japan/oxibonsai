@@ -165,19 +165,18 @@ impl Int8Activation {
             let row = &input[r * k..(r + 1) * k];
             for b in 0..blocks_per_row {
                 let block = &row[b * qk..(b + 1) * qk];
-                // K-INT8 wave-4b (minor[6]): `f32::max` follows IEEE 754's
-                // `maxNum` and silently ignores a NaN operand, so folding
-                // `amax` with it would make a NaN activation element quantize
-                // to code `0` whenever another element in the same block was
-                // large enough to give a finite, nonzero `scale` — the block
-                // would reconstruct as if that NaN had never been there, the
-                // opposite of the f32 reference path's NaN contagion (any
-                // NaN weight-activation product poisons the whole sum). A
-                // block that holds *any* NaN gets a NaN `scale` instead, so
-                // it propagates through `two_bit_rows`' `scale * acc as f32`
-                // exactly like the f32 path would — silent divergence here
-                // would otherwise hide a real upstream numerical fault
-                // whenever the INT8 tier is on.
+                // `f32::max` follows IEEE 754's `maxNum` and silently
+                // ignores a NaN operand, so folding `amax` with it would make
+                // a NaN activation element quantize to code `0` whenever
+                // another element in the same block was large enough to give
+                // a finite, nonzero `scale` — the block would reconstruct as
+                // if that NaN had never been there, the opposite of the f32
+                // reference path's NaN contagion (any NaN weight-activation
+                // product poisons the whole sum). A block that holds *any*
+                // NaN gets a NaN `scale` instead, so it propagates through
+                // the row kernels' `scale * acc as f32` exactly like the f32
+                // path would — silent divergence here would otherwise hide a
+                // real upstream numerical fault whenever the INT8 tier is on.
                 let mut amax = 0.0f32;
                 let mut has_nan = false;
                 for &v in block {
@@ -448,7 +447,7 @@ mod int8_activation_tests {
         assert_eq!(act.relative_error(&input).expect("relative_error"), 0.0);
     }
 
-    /// K-INT8 wave-4b (minor[6]): a NaN activation element must poison its
+    /// A NaN activation element must poison its
     /// whole block's `scale` (and therefore, downstream, that block's
     /// contribution to the dot product) rather than silently quantizing to
     /// code `0` and vanishing — `f32::max` alone would do exactly that,

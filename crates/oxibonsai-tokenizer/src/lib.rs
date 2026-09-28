@@ -59,7 +59,8 @@ pub mod hf_format;
 pub mod jinja;
 pub mod serialization;
 pub mod streaming;
-pub mod tests;
+#[cfg(test)]
+mod tests;
 pub mod tokenizer;
 pub mod trainer;
 pub mod unigram;

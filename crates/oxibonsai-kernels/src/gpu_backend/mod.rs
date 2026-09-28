@@ -128,6 +128,8 @@ pub mod cuda_q_std_prefill;
     any(target_os = "linux", target_os = "windows")
 ))]
 pub mod cuda_q_std_prefill_kernels;
+#[cfg(feature = "native-cuda")]
+pub mod cuda_qwen35;
 pub mod kernel_artifact_cache;
 pub mod kernel_sources;
 #[cfg(all(feature = "metal", target_os = "macos"))]

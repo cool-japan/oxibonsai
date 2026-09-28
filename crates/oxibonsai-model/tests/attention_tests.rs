@@ -247,8 +247,12 @@ fn kv_cache_store_and_retrieve_position_0() {
 
     let key = vec![1.0, 2.0, 3.0, 4.0];
     let value = vec![5.0, 6.0, 7.0, 8.0];
-    cache.store_key(0, 0, 0, &key);
-    cache.store_value(0, 0, 0, &value);
+    cache
+        .try_store_key(0, 0, 0, &key)
+        .expect("in-range key store");
+    cache
+        .try_store_value(0, 0, 0, &value)
+        .expect("in-range value store");
     cache.advance();
 
     let keys = cache.keys_for(0, 0, 1);
@@ -262,11 +266,17 @@ fn kv_cache_store_and_retrieve_position_0() {
 fn kv_cache_multiple_positions_stored_correctly() {
     let mut cache = KvCache::new(1, 1, 4, 16);
 
-    cache.store_key(0, 0, 0, &[1.0, 0.0, 0.0, 0.0]);
+    cache
+        .try_store_key(0, 0, 0, &[1.0, 0.0, 0.0, 0.0])
+        .expect("in-range key store");
     cache.advance();
-    cache.store_key(0, 0, 1, &[0.0, 1.0, 0.0, 0.0]);
+    cache
+        .try_store_key(0, 0, 1, &[0.0, 1.0, 0.0, 0.0])
+        .expect("in-range key store");
     cache.advance();
-    cache.store_key(0, 0, 2, &[0.0, 0.0, 1.0, 0.0]);
+    cache
+        .try_store_key(0, 0, 2, &[0.0, 0.0, 1.0, 0.0])
+        .expect("in-range key store");
     cache.advance();
 
     let keys = cache.keys_for(0, 0, 3);
@@ -282,8 +292,12 @@ fn kv_cache_multiple_positions_stored_correctly() {
 fn kv_cache_keys_and_values_are_independent() {
     let mut cache = KvCache::new(1, 1, 4, 16);
 
-    cache.store_key(0, 0, 0, &[1.0, 1.0, 1.0, 1.0]);
-    cache.store_value(0, 0, 0, &[2.0, 2.0, 2.0, 2.0]);
+    cache
+        .try_store_key(0, 0, 0, &[1.0, 1.0, 1.0, 1.0])
+        .expect("in-range key store");
+    cache
+        .try_store_value(0, 0, 0, &[2.0, 2.0, 2.0, 2.0])
+        .expect("in-range value store");
 
     let keys = cache.keys_for(0, 0, 1);
     let values = cache.values_for(0, 0, 1);
@@ -305,7 +319,9 @@ fn kv_cache_capacity_matches_config() {
 #[test]
 fn kv_cache_clear_resets_seq_len() {
     let mut cache = KvCache::new(1, 1, 4, 16);
-    cache.store_key(0, 0, 0, &[1.0; 4]);
+    cache
+        .try_store_key(0, 0, 0, &[1.0; 4])
+        .expect("in-range key store");
     cache.advance();
     cache.advance();
     assert_eq!(cache.seq_len(), 2);
@@ -319,13 +335,21 @@ fn kv_cache_multi_layer_multi_head() {
     let mut cache = KvCache::new(2, 2, 4, 8);
 
     // Layer 0, Head 0
-    cache.store_key(0, 0, 0, &[1.0, 0.0, 0.0, 0.0]);
+    cache
+        .try_store_key(0, 0, 0, &[1.0, 0.0, 0.0, 0.0])
+        .expect("in-range key store");
     // Layer 0, Head 1
-    cache.store_key(0, 1, 0, &[0.0, 1.0, 0.0, 0.0]);
+    cache
+        .try_store_key(0, 1, 0, &[0.0, 1.0, 0.0, 0.0])
+        .expect("in-range key store");
     // Layer 1, Head 0
-    cache.store_key(1, 0, 0, &[0.0, 0.0, 1.0, 0.0]);
+    cache
+        .try_store_key(1, 0, 0, &[0.0, 0.0, 1.0, 0.0])
+        .expect("in-range key store");
     // Layer 1, Head 1
-    cache.store_key(1, 1, 0, &[0.0, 0.0, 0.0, 1.0]);
+    cache
+        .try_store_key(1, 1, 0, &[0.0, 0.0, 0.0, 1.0])
+        .expect("in-range key store");
 
     let k00 = cache.keys_for(0, 0, 1);
     let k01 = cache.keys_for(0, 1, 1);

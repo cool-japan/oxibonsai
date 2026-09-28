@@ -44,20 +44,16 @@ pub struct CudaPrefillBuffers {
     pub d_qkv: CudaSlice<f32>,
     /// Batched attention output: `[capacity * nq*head_dim]` f32 (column-major).
     pub d_attn_out: CudaSlice<f32>,
-    /// Batched gate+up GEMM output: `[capacity * intermediate_size]` f32,
-    /// laid out `[gate: bs*inter | up: bs*inter]`.
-    ///
-    /// Staging only. Both shipping prefill paths
-    /// (`encode_q1.rs` / `encode_ternary.rs`) use the fused
-    /// `fused_gate_up_swiglu_gemm_{q1,tq2}` kernels, which apply the SwiGLU
-    /// epilogue in-kernel and write straight to [`Self::d_swiglu`], so nothing
-    /// currently reads this buffer. It was the input of the separate
-    /// `batched_swiglu` kernel, deleted as dead in finding **F15** (the fused
-    /// kernels are strictly faster, so the verdict prefers deletion to wiring).
-    /// The allocation is kept so a future unfused format that needs a two-step
-    /// gate+up → SwiGLU has the staging slot already sized.
-    pub d_gate_up: CudaSlice<f32>,
     /// Batched SwiGLU output: `[capacity * intermediate_size]` f32 (column-major).
+    ///
+    /// Every prefill family (Q1, ternary, Q4_0/Q8_0, K-quant, FP8) computes
+    /// gate, up and SwiGLU in one fused `fused_gate_up_swiglu_gemm_*` kernel
+    /// that writes straight here, so this struct carries no separate
+    /// `[gate | up]` staging buffer: the old `d_gate_up` field was only the
+    /// input of the separate `batched_swiglu` kernel (finding **F15**, deleted
+    /// as dead) and nothing read it afterwards — `2 x capacity x
+    /// intermediate_size` floats of dead VRAM per family (~71 MB at the 27B's
+    /// `intermediate_size = 17408` and a 512-token capacity).
     pub d_swiglu: CudaSlice<f32>,
     /// Allocated capacity (max batch_size for which buffers are valid).
     pub capacity: usize,
@@ -264,7 +260,6 @@ pub(super) fn acquire_prefill_buffers(
             d_normed: alloc(capacity * hidden_size)?,
             d_qkv: alloc(capacity * qkv_total)?,
             d_attn_out: alloc(capacity * nq * head_dim)?,
-            d_gate_up: alloc(2 * capacity * intermediate_size)?,
             d_swiglu: alloc(capacity * intermediate_size)?,
             capacity,
             actual_batch_size: batch_size,
@@ -277,10 +272,12 @@ pub(super) fn acquire_prefill_buffers(
         });
     } else {
         // Reusing existing allocation — just update the active batch size.
-        // SAFETY: needs_alloc is false only when guard is Some(b), so this is infallible.
+        // `needs_alloc` is false only when the guard holds `Some`.
         guard
             .as_mut()
-            .expect("guard is Some when needs_alloc is false")
+            .ok_or_else(|| {
+                CudaGraphError::DriverError("prefill buffers missing on reuse".to_string())
+            })?
             .actual_batch_size = batch_size;
     }
 
@@ -355,8 +352,16 @@ pub(super) fn acquire_single_token_buffers(
             d_sin: alloc(half_dim)?,
             d_scores: alloc(nq * max_seq)?,
             d_attn_out: alloc(nq * head_dim)?,
-            d_gate_up: alloc(2 * intermediate_size)?,
-            d_swiglu: alloc(intermediate_size)?,
+            // 1-element placeholders: this buffer set serves only
+            // `encode_attn_phase`/`encode_attn_phase_tq2` for the batch-
+            // prefill path's per-token attention (`try_apis.rs`), which
+            // never runs an FFN sublayer against it — the prefill FFN phase
+            // uses the separate `CudaPrefillBuffers.d_swiglu` instead. The
+            // decode path's own full-layer buffers (`cuda_full_layer::
+            // acquire_full_layer_buffers`), which do run FFN, are a
+            // different singleton with real-sized fields.
+            d_gate_up: alloc(1)?,
+            d_swiglu: alloc(1)?,
             d_pos_seqlen: alloc_u32(2)?,
             hidden_size,
             nq,

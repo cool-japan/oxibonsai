@@ -1,6 +1,7 @@
 //! Unit tests for [`crate::engine_seam`]: the `InferenceEngine` ↔
-//! `LoadedModel` seam, driven end to end on a complete synthetic `qwen35`
-//! (Bonsai 2 hybrid) GGUF built in-process, plus the dense-side seam
+//! `LoadedModel` seam, driven end to end on the workspace's synthetic `qwen35`
+//! (Bonsai 2 hybrid) GGUF — `oxibonsai_testkit::qwen35_fixture`, the same
+//! file this crate's external tests load — plus the dense-side seam
 //! behaviour (snapshots, rewinds, the backend knob).
 //!
 //! The hybrid fixture carries every tensor name, dtype and shape
@@ -10,352 +11,17 @@
 
 use super::*;
 
-use oxibonsai_core::gguf::writer::{GgufWriter, MetadataWriteValue, TensorEntry, TensorType};
 use oxibonsai_kernels::gpu_backend::UNATTRIBUTED_MODEL_EPOCH;
 use oxibonsai_kernels::KernelTier;
-use oxibonsai_model::quantize::{encode_quantized_tensor, ScaleRule};
+use oxibonsai_testkit::qwen35_fixture::{
+    full_layer_count, synthetic_qwen35_gguf, CONTEXT_LENGTH, EOS_TOKEN_ID, HEAD_DIM, HIDDEN,
+    MODEL_NAME, N_KV_HEADS, N_LAYERS, VOCAB,
+};
 
 use crate::sampling::SamplingParams;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Synthetic qwen35 fixture
-// ─────────────────────────────────────────────────────────────────────────────
-
-const HIDDEN: usize = 256;
-const INTERMEDIATE: usize = 512;
-const N_LAYERS: usize = 8;
-const N_HEADS: usize = 4;
-const N_KV_HEADS: usize = 2;
-const HEAD_DIM: usize = 64;
-const VOCAB: usize = 512;
-const STATE: usize = 64;
-const N_K_HEADS: usize = 2;
-const N_V_HEADS: usize = 6;
-const CONV_KERNEL: usize = 4;
-const HADAMARD_BLOCK: usize = 128;
+/// KV window every hybrid engine in this file is built with.
 const MAX_SEQ: usize = 64;
-
-fn inner() -> usize {
-    N_V_HEADS * STATE
-}
-
-fn conv_dim() -> usize {
-    2 * STATE * N_K_HEADS + inner()
-}
-
-fn heads_width() -> usize {
-    N_HEADS * HEAD_DIM
-}
-
-fn is_full(layer: usize) -> bool {
-    (layer + 1).is_multiple_of(4)
-}
-
-/// Deterministic pseudo-random values in `[-1, 1)`.
-fn ramp(n: usize, seed: u64) -> Vec<f32> {
-    let mut state = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-    (0..n)
-        .map(|_| {
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            ((state >> 40) as f32 / 8_388_608.0) - 1.0
-        })
-        .collect()
-}
-
-fn quant_tensor(name: &str, ne0: usize, ne1: usize, seed: u64) -> TensorEntry {
-    let values = ramp(ne0 * ne1, seed);
-    let data = encode_quantized_tensor(&values, ne0, TensorType::PQ2_0, ScaleRule::AbsMax)
-        .unwrap_or_else(|e| panic!("fixture {name}: {e}"));
-    TensorEntry {
-        name: name.to_string(),
-        shape: vec![ne0 as u64, ne1 as u64],
-        tensor_type: TensorType::PQ2_0,
-        data,
-    }
-}
-
-fn f32_tensor(name: &str, shape: &[usize], values: Vec<f32>) -> TensorEntry {
-    let mut data = Vec::with_capacity(values.len() * 4);
-    for v in &values {
-        data.extend_from_slice(&v.to_le_bytes());
-    }
-    TensorEntry {
-        name: name.to_string(),
-        shape: shape.iter().map(|d| *d as u64).collect(),
-        tensor_type: TensorType::F32,
-        data,
-    }
-}
-
-fn bf16_tensor(name: &str, ne0: usize, ne1: usize, seed: u64) -> TensorEntry {
-    let values = ramp(ne0 * ne1, seed);
-    let mut data = Vec::with_capacity(values.len() * 2);
-    for v in &values {
-        let bits = v.to_bits();
-        let rounded = ((bits >> 16) & 1).wrapping_add(0x7fff).wrapping_add(bits);
-        data.extend_from_slice(&((rounded >> 16) as u16).to_le_bytes());
-    }
-    TensorEntry {
-        name: name.to_string(),
-        shape: vec![ne0 as u64, ne1 as u64],
-        tensor_type: TensorType::BF16,
-        data,
-    }
-}
-
-/// A complete synthetic `qwen35` GGUF: PQ2_0 weights, Hadamard-folded,
-/// grouped v-heads, EOS id 3.
-pub(crate) fn synthetic_qwen35_gguf() -> Vec<u8> {
-    let u32v = |v: usize| MetadataWriteValue::U32(v as u32);
-    let mut writer = GgufWriter::new();
-    writer
-        .add_metadata(
-            "general.architecture",
-            MetadataWriteValue::Str("qwen35".into()),
-        )
-        .add_metadata(
-            "general.name",
-            MetadataWriteValue::Str("synthetic-qwen35-engine".into()),
-        )
-        .add_metadata("qwen35.embedding_length", u32v(HIDDEN))
-        .add_metadata("qwen35.feed_forward_length", u32v(INTERMEDIATE))
-        .add_metadata("qwen35.block_count", u32v(N_LAYERS))
-        .add_metadata("qwen35.attention.head_count", u32v(N_HEADS))
-        .add_metadata("qwen35.attention.head_count_kv", u32v(N_KV_HEADS))
-        .add_metadata("qwen35.attention.key_length", u32v(HEAD_DIM))
-        .add_metadata("qwen35.attention.value_length", u32v(HEAD_DIM))
-        .add_metadata("qwen35.vocab_size", u32v(VOCAB))
-        .add_metadata("qwen35.context_length", u32v(4096))
-        .add_metadata(
-            "qwen35.attention.layer_norm_rms_epsilon",
-            MetadataWriteValue::F32(1e-6),
-        )
-        .add_metadata("qwen35.rope.freq_base", MetadataWriteValue::F32(1e7))
-        .add_metadata("qwen35.rope.dimension_count", u32v(16))
-        .add_metadata(
-            "qwen35.rope.dimension_sections",
-            MetadataWriteValue::ArrayU32(vec![3, 3, 2, 0]),
-        )
-        .add_metadata("qwen35.full_attention_interval", u32v(4))
-        .add_metadata("qwen35.ssm.conv_kernel", u32v(CONV_KERNEL))
-        .add_metadata("qwen35.ssm.state_size", u32v(STATE))
-        .add_metadata("qwen35.ssm.group_count", u32v(N_K_HEADS))
-        .add_metadata("qwen35.ssm.time_step_rank", u32v(N_V_HEADS))
-        .add_metadata("qwen35.ssm.inner_size", u32v(inner()))
-        .add_metadata("tokenizer.ggml.eos_token_id", u32v(3));
-
-    let mut widths = vec![HIDDEN, heads_width(), inner(), INTERMEDIATE];
-    widths.sort_unstable();
-    widths.dedup();
-    let mut sign_values: Vec<i32> = Vec::new();
-    for width in &widths {
-        for i in 0..*width {
-            sign_values.push(if i % 3 == 0 { -1 } else { 1 });
-        }
-    }
-    let mut weight_names = vec!["output.weight".to_string()];
-    for layer in 0..N_LAYERS {
-        let folded: &[&str] = if is_full(layer) {
-            &[
-                "attn_q",
-                "attn_k",
-                "attn_v",
-                "attn_output",
-                "ffn_gate",
-                "ffn_up",
-                "ffn_down",
-            ]
-        } else {
-            &[
-                "attn_qkv",
-                "attn_gate",
-                "ssm_out",
-                "ffn_gate",
-                "ffn_up",
-                "ffn_down",
-            ]
-        };
-        for suffix in folded {
-            weight_names.push(format!("blk.{layer}.{suffix}.weight"));
-        }
-    }
-    writer
-        .add_metadata("prism.hadamard.version", MetadataWriteValue::U32(1))
-        .add_metadata("prism.hadamard.block_size", u32v(HADAMARD_BLOCK))
-        .add_metadata(
-            "prism.hadamard.transform",
-            MetadataWriteValue::Str("normalized-sylvester-walsh-hadamard".into()),
-        )
-        .add_metadata(
-            "prism.hadamard.axis",
-            MetadataWriteValue::Str("input-last-dimension".into()),
-        )
-        .add_metadata(
-            "prism.hadamard.sign_mode",
-            MetadataWriteValue::Str("explicit".into()),
-        )
-        .add_metadata(
-            "prism.hadamard.sign_widths",
-            MetadataWriteValue::ArrayU32(widths.iter().map(|w| *w as u32).collect()),
-        )
-        .add_metadata(
-            "prism.hadamard.sign_values",
-            MetadataWriteValue::ArrayI32(sign_values),
-        )
-        .add_metadata(
-            "prism.hadamard.weight_names",
-            MetadataWriteValue::ArrayStr(weight_names),
-        )
-        .add_metadata(
-            "prism.hadamard.inverse_weight_names",
-            MetadataWriteValue::ArrayStr(vec!["token_embd.weight".to_string()]),
-        )
-        .add_metadata(
-            "prism.hadamard.gdn_v_grouped",
-            MetadataWriteValue::Bool(true),
-        );
-
-    let mut seed = 1u64;
-    let mut next_seed = || {
-        seed = seed.wrapping_add(7919);
-        seed
-    };
-    writer.add_tensor(quant_tensor(
-        "token_embd.weight",
-        HIDDEN,
-        VOCAB,
-        next_seed(),
-    ));
-    writer.add_tensor(quant_tensor("output.weight", HIDDEN, VOCAB, next_seed()));
-    writer.add_tensor(f32_tensor(
-        "output_norm.weight",
-        &[HIDDEN],
-        vec![1.0; HIDDEN],
-    ));
-    for layer in 0..N_LAYERS {
-        let blk = |suffix: &str| format!("blk.{layer}.{suffix}");
-        writer.add_tensor(f32_tensor(
-            &blk("attn_norm.weight"),
-            &[HIDDEN],
-            vec![1.0; HIDDEN],
-        ));
-        writer.add_tensor(f32_tensor(
-            &blk("post_attention_norm.weight"),
-            &[HIDDEN],
-            vec![1.0; HIDDEN],
-        ));
-        writer.add_tensor(quant_tensor(
-            &blk("ffn_gate.weight"),
-            HIDDEN,
-            INTERMEDIATE,
-            next_seed(),
-        ));
-        writer.add_tensor(quant_tensor(
-            &blk("ffn_up.weight"),
-            HIDDEN,
-            INTERMEDIATE,
-            next_seed(),
-        ));
-        writer.add_tensor(quant_tensor(
-            &blk("ffn_down.weight"),
-            INTERMEDIATE,
-            HIDDEN,
-            next_seed(),
-        ));
-        if is_full(layer) {
-            writer.add_tensor(quant_tensor(
-                &blk("attn_q.weight"),
-                HIDDEN,
-                heads_width() * 2,
-                next_seed(),
-            ));
-            writer.add_tensor(quant_tensor(
-                &blk("attn_k.weight"),
-                HIDDEN,
-                N_KV_HEADS * HEAD_DIM,
-                next_seed(),
-            ));
-            writer.add_tensor(quant_tensor(
-                &blk("attn_v.weight"),
-                HIDDEN,
-                N_KV_HEADS * HEAD_DIM,
-                next_seed(),
-            ));
-            writer.add_tensor(quant_tensor(
-                &blk("attn_output.weight"),
-                heads_width(),
-                HIDDEN,
-                next_seed(),
-            ));
-            writer.add_tensor(f32_tensor(
-                &blk("attn_q_norm.weight"),
-                &[HEAD_DIM],
-                vec![1.0; HEAD_DIM],
-            ));
-            writer.add_tensor(f32_tensor(
-                &blk("attn_k_norm.weight"),
-                &[HEAD_DIM],
-                vec![1.0; HEAD_DIM],
-            ));
-        } else {
-            writer.add_tensor(quant_tensor(
-                &blk("attn_qkv.weight"),
-                HIDDEN,
-                conv_dim(),
-                next_seed(),
-            ));
-            writer.add_tensor(quant_tensor(
-                &blk("attn_gate.weight"),
-                HIDDEN,
-                inner(),
-                next_seed(),
-            ));
-            writer.add_tensor(quant_tensor(
-                &blk("ssm_out.weight"),
-                inner(),
-                HIDDEN,
-                next_seed(),
-            ));
-            writer.add_tensor(bf16_tensor(
-                &blk("ssm_alpha.weight"),
-                HIDDEN,
-                N_V_HEADS,
-                next_seed(),
-            ));
-            writer.add_tensor(bf16_tensor(
-                &blk("ssm_beta.weight"),
-                HIDDEN,
-                N_V_HEADS,
-                next_seed(),
-            ));
-            writer.add_tensor(f32_tensor(
-                &blk("ssm_conv1d.weight"),
-                &[CONV_KERNEL, conv_dim()],
-                ramp(CONV_KERNEL * conv_dim(), next_seed()),
-            ));
-            writer.add_tensor(f32_tensor(
-                &blk("ssm_a"),
-                &[N_V_HEADS],
-                (0..N_V_HEADS).map(|h| -0.25 - (h as f32) * 0.5).collect(),
-            ));
-            writer.add_tensor(f32_tensor(
-                &blk("ssm_dt.bias"),
-                &[N_V_HEADS],
-                (0..N_V_HEADS).map(|h| -2.0 + (h as f32) * 0.125).collect(),
-            ));
-            writer.add_tensor(f32_tensor(
-                &blk("ssm_norm.weight"),
-                &[STATE],
-                vec![1.0; STATE],
-            ));
-        }
-    }
-    writer
-        .to_bytes()
-        .expect("synthetic qwen35 fixture serialises")
-}
 
 fn greedy_params() -> SamplingParams {
     SamplingParams {
@@ -441,6 +107,40 @@ fn every_engine_error_round_trips_its_code_through_runtime_error() {
     assert_eq!(engine_error_code(&RuntimeError::CircuitOpen), None);
 }
 
+/// `engine_error_code` is one function reachable at
+/// two paths — here and the `crate::engine` re-export the CLI calls — with
+/// one signature (both coerce to the same `fn` pointer type), answering
+/// identically on both: the engine's code for every refusal kind (the code
+/// `RuntimeError::error_code` now reports too), `None` for anything else —
+/// including a `Config` error whose text merely spells a code, which the
+/// old string-encoded refusal would have matched.
+#[test]
+fn engine_error_code_answers_identically_on_both_paths() {
+    type CodeOf = fn(&RuntimeError) -> Option<&'static str>;
+    let via_seam: CodeOf = crate::engine_seam::engine_error_code;
+    let via_engine: CodeOf = crate::engine::engine_error_code;
+    let refusals = EngineError::one_of_each_kind();
+    assert_eq!(refusals.len(), EngineError::ALL_CODES.len());
+    for (refusal, code) in refusals.into_iter().zip(EngineError::ALL_CODES) {
+        let runtime = RuntimeError::from(refusal);
+        assert_eq!(via_seam(&runtime), Some(code), "{runtime}");
+        assert_eq!(via_engine(&runtime), Some(code), "{runtime}");
+        assert_eq!(runtime.error_code(), code, "{runtime}");
+        assert!(
+            runtime.to_string().contains(&format!("[{code}]")),
+            "{runtime}"
+        );
+    }
+    for other in [
+        RuntimeError::Config("[NOT_A_DENSE_MODEL] spelled, not typed".into()),
+        RuntimeError::Server("down".into()),
+        RuntimeError::CircuitOpen,
+    ] {
+        assert_eq!(via_seam(&other), None, "{other}");
+        assert_eq!(via_engine(&other), None, "{other}");
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Hybrid engine: construction and introspection
 // ─────────────────────────────────────────────────────────────────────────────
@@ -457,16 +157,20 @@ fn a_qwen35_gguf_loads_as_a_cpu_hybrid_engine() {
     assert!(engine.hybrid_model().is_some());
     assert!(engine.loaded_model().is_hybrid());
     assert_eq!(engine.architecture(), "qwen35");
-    assert_eq!(engine.model_name(), "synthetic-qwen35-engine");
+    assert_eq!(engine.model_name(), MODEL_NAME);
     assert_eq!(engine.vocab_size(), VOCAB);
     assert_eq!(engine.hidden_size(), HIDDEN);
     assert_eq!(engine.num_layers(), N_LAYERS);
     assert_eq!(engine.max_seq_len(), MAX_SEQ);
     assert_eq!(engine.max_context(), MAX_SEQ);
-    assert_eq!(engine.context_length(), 4096);
+    assert_eq!(engine.context_length(), CONTEXT_LENGTH);
     assert_eq!(engine.sequence_position(), 0);
     // KV only for the two full-attention layers.
-    assert_eq!(engine.kv_cache_geometry(), (2, N_KV_HEADS, HEAD_DIM));
+    assert_eq!(full_layer_count(), 2);
+    assert_eq!(
+        engine.kv_cache_geometry(),
+        (full_layer_count(), N_KV_HEADS, HEAD_DIM)
+    );
     assert!(engine.recurrent_memory_bytes() > 0);
     assert!(engine.sequence_state_bytes() > engine.recurrent_memory_bytes());
     // CPU only: no hybrid GPU encoder exists yet.
@@ -487,7 +191,7 @@ fn a_qwen35_gguf_loads_as_a_cpu_hybrid_engine() {
     );
     assert!(engine.model_description().contains("qwen35"));
     // EOS resolved from the file, not the Qwen3 fallback.
-    assert!(engine.is_eos(3));
+    assert!(engine.is_eos(EOS_TOKEN_ID));
     assert!(!engine.recurrent_rollback_supported());
     // The shared-embedding handle a pool hands replicas 2..N is empty.
     assert!(engine.model_token_embd().is_empty());
@@ -505,11 +209,11 @@ fn a_qwen35_gguf_loads_as_a_cpu_hybrid_engine() {
 }
 
 /// What `oxibonsai serve` builds for a hybrid file: a pool that defaults to
-/// one CPU replica (an explicit size is honoured) and no embedder — the
-/// embedding engine is refused with the typed code before a second model
-/// instance is ever built.
+/// one CPU replica (an explicit size is honoured) and a model-backed
+/// embedder over a dedicated engine that shares the pool's mapping — the
+/// hybrid serves `/v1/embeddings` like a dense model does.
 #[test]
-fn a_hybrid_pool_defaults_to_one_cpu_replica_and_refuses_an_embedder() {
+fn a_hybrid_pool_defaults_to_one_cpu_replica_and_builds_an_embedder() {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
@@ -538,7 +242,7 @@ fn a_hybrid_pool_defaults_to_one_cpu_replica_and_refuses_an_embedder() {
     let tokenizer = Arc::new(TokenizerBridge::from_native_tokenizer(
         oxibonsai_tokenizer::OxiTokenizer::char_level_stub(VOCAB),
     ));
-    let refusal = crate::embed_engine::ModelEmbedder::from_static_gguf(
+    let embedder = crate::embed_engine::ModelEmbedder::from_static_gguf(
         built.gguf,
         Arc::clone(&built.shared_token_embd),
         tokenizer,
@@ -546,8 +250,14 @@ fn a_hybrid_pool_defaults_to_one_cpu_replica_and_refuses_an_embedder() {
         42,
         MAX_SEQ,
     )
-    .expect_err("a hybrid model has no embedder yet");
-    assert_eq!(engine_error_code(&refusal), Some("NOT_A_DENSE_MODEL"));
+    .expect("a hybrid model builds an embedder");
+    assert_eq!(embedder.dimension(), HIDDEN);
+    let vector = embedder
+        .embed_tokens(&PROMPT)
+        .expect("the hybrid embedder embeds");
+    assert_eq!(vector.len(), HIDDEN);
+    let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+    assert!((norm - 1.0).abs() < 1e-4, "unit norm, got {norm}");
 
     let two = crate::engine_pool::build_pool_from_gguf_parts(
         &path,
@@ -891,13 +601,133 @@ fn hybrid_engine_refuses_dense_only_features_with_typed_errors() {
         Some("RECURRENT_ROLLBACK_REQUIRED")
     );
 
-    let embed = engine
-        .embed(&PROMPT)
-        .expect_err("the hybrid has no forward_hidden yet");
-    assert_eq!(engine_error_code(&embed), Some("NOT_A_DENSE_MODEL"));
-
     let snapshot_ok = engine.snapshot_sequence();
     assert!(snapshot_ok.is_ok(), "a hybrid sequence IS snapshot-able");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Hybrid engine: embeddings
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A hybrid engine embeds: a finite, unit-length, `hidden_size`-wide vector,
+/// deterministic across two fresh engines, input-dependent, and — since the
+/// pass clears the sequence on both sides — leaving no position behind.
+#[test]
+fn hybrid_engine_embeds_to_a_deterministic_unit_vector() {
+    let bytes = synthetic_qwen35_gguf();
+    let gguf = GgufFile::parse(&bytes).expect("fixture parses");
+    let mut first_engine =
+        InferenceEngine::from_gguf(&gguf, greedy_params(), 42, MAX_SEQ).expect("hybrid engine");
+    let mut second_engine =
+        InferenceEngine::from_gguf(&gguf, greedy_params(), 7, MAX_SEQ).expect("hybrid engine");
+    assert_eq!(first_engine.embedding_dim(), HIDDEN);
+    assert_eq!(first_engine.embedding_max_tokens(), MAX_SEQ);
+
+    let first = first_engine.embed(&PROMPT).expect("the hybrid embeds");
+    assert_eq!(first.len(), HIDDEN);
+    assert!(first.iter().all(|v| v.is_finite()));
+    let norm = first.iter().map(|x| x * x).sum::<f32>().sqrt();
+    assert!((norm - 1.0).abs() < 1e-4, "unit norm, got {norm}");
+    let second = second_engine.embed(&PROMPT).expect("the hybrid embeds");
+    assert_eq!(
+        bits(&first),
+        bits(&second),
+        "two fresh engines over the same file must embed identically"
+    );
+    let other = first_engine.embed(&PROMPT[..3]).expect("a shorter input");
+    assert_ne!(
+        bits(&first),
+        bits(&other),
+        "a different input embeds differently"
+    );
+    assert_eq!(first_engine.sequence_position(), 0, "no position survives");
+
+    // Exactly the model-level recipe, pooled from the model's own rows.
+    let direct = first_engine
+        .hybrid_model_mut()
+        .expect("hybrid")
+        .embed_mean_pooled(&PROMPT)
+        .expect("model-level embedding");
+    assert_eq!(bits(&direct), bits(&first));
+}
+
+/// An embedding in the middle of a conversation leaves the engine usable:
+/// the next generation starts a fresh sequence and matches a clean engine,
+/// and a snapshot of the abandoned sequence can no longer be restored.
+#[test]
+fn a_hybrid_embedding_ends_the_current_sequence_cleanly() {
+    let bytes = synthetic_qwen35_gguf();
+    let gguf = GgufFile::parse(&bytes).expect("fixture parses");
+    let mut engine =
+        InferenceEngine::from_gguf(&gguf, greedy_params(), 42, MAX_SEQ).expect("hybrid engine");
+    let mut clean =
+        InferenceEngine::from_gguf(&gguf, greedy_params(), 42, MAX_SEQ).expect("hybrid engine");
+    let expected = clean.generate(&PROMPT, 4).expect("clean generate");
+
+    engine.prefill_from_pos(&PROMPT, 0).expect("prefill");
+    let snapshot = engine.snapshot_sequence().expect("snapshot");
+    engine.embed(&PROMPT[..2]).expect("embed mid-conversation");
+    let stale = engine
+        .restore_sequence(&snapshot)
+        .expect_err("the embedding ended the snapshotted sequence");
+    assert_eq!(engine_error_code(&stale), Some("SNAPSHOT_MISMATCH"));
+    assert_eq!(engine.generate(&PROMPT, 4).expect("generate"), expected);
+}
+
+/// The dense twin of the snapshot rule: an embedding on a dense engine ends
+/// its sequence too.
+#[test]
+fn a_dense_embedding_ends_the_current_sequence() {
+    let config = oxibonsai_core::config::Qwen3Config {
+        hidden_size: 128,
+        intermediate_size: 256,
+        num_layers: 2,
+        num_attention_heads: 4,
+        num_kv_heads: 2,
+        head_dim: 32,
+        vocab_size: 64,
+        max_context_length: 64,
+        ..oxibonsai_core::config::Qwen3Config::tiny_test()
+    };
+    let mut dense = InferenceEngine::from_model_with_tier(
+        BonsaiModel::new_for_testing_with_blocks(config),
+        KernelTier::Reference,
+        greedy_params(),
+        42,
+    );
+    dense.prefill_from_pos(&[1, 2, 3], 0).expect("prefill");
+    let snapshot = dense.snapshot_sequence().expect("snapshot");
+    let vector = dense.embed(&[4, 5, 6]).expect("dense embed");
+    assert_eq!(vector.len(), 128);
+    let stale = dense
+        .restore_sequence(&snapshot)
+        .expect_err("the embedding ended the snapshotted sequence");
+    assert_eq!(engine_error_code(&stale), Some("SNAPSHOT_MISMATCH"));
+    assert_eq!(dense.sequence_position(), 0);
+}
+
+/// `ModelEmbedder::from_engine` wraps a hybrid engine, and the embedder
+/// serves exactly the engine's own vector.
+#[test]
+fn model_embedder_wraps_a_hybrid_engine() {
+    let bytes = synthetic_qwen35_gguf();
+    let gguf: &'static GgufFile<'static> = Box::leak(Box::new(
+        GgufFile::parse(Box::leak(bytes.into_boxed_slice())).expect("fixture parses"),
+    ));
+    let mut reference =
+        InferenceEngine::from_gguf(gguf, greedy_params(), 42, MAX_SEQ).expect("hybrid engine");
+    let expected = reference.embed(&PROMPT).expect("reference embedding");
+    let engine =
+        InferenceEngine::from_gguf(gguf, greedy_params(), 42, MAX_SEQ).expect("hybrid engine");
+    let tokenizer = Arc::new(TokenizerBridge::from_native_tokenizer(
+        oxibonsai_tokenizer::OxiTokenizer::char_level_stub(VOCAB),
+    ));
+    let embedder = crate::embed_engine::ModelEmbedder::from_engine(engine, tokenizer)
+        .expect("a hybrid engine builds an embedder");
+    assert_eq!(embedder.dimension(), HIDDEN);
+    assert_eq!(embedder.max_tokens(), MAX_SEQ);
+    let served = embedder.embed_tokens(&PROMPT).expect("served");
+    assert_eq!(bits(&served), bits(&expected));
 }
 
 #[test]
@@ -965,7 +795,7 @@ fn beam_search_on_a_hybrid_engine_replays_exactly() {
     let cfg = BeamSearchConfig {
         beam_width: 2,
         max_tokens: 3,
-        eos_token_id: 3,
+        eos_token_id: EOS_TOKEN_ID,
         early_stopping: false,
         ..Default::default()
     };

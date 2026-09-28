@@ -1,16 +1,36 @@
 //! Sampling strategies for text generation.
 //!
-//! Supports temperature scaling, top-k filtering, top-p (nucleus) filtering,
-//! and — via [`Sampler::sample_with_history`] — repetition, frequency, and
-//! presence penalties applied over the generated-token history. The base
-//! [`Sampler::sample`] converts a logit vector into a single token ID using
-//! these strategies in order:
+//! Supports temperature scaling, top-k filtering, min-p filtering, top-p
+//! (nucleus) filtering, and — via [`Sampler::sample_with_history`] —
+//! repetition, frequency, and presence penalties applied over the
+//! generated-token history. The base [`Sampler::sample`] converts a logit
+//! vector into a single token ID; a temperature of (almost) `0` is a
+//! first-index argmax, anything else runs these stages in order:
 //!
-//! 1. **Temperature scaling** — divide logits by temperature (0 = greedy argmax)
-//! 2. **Top-k** — keep only the k highest-probability candidates
+//! 1. **Top-k** — keep only the k highest logits, ranked on the raw logits in
+//!    a canonical order (raw logit descending, an exact tie to the lower
+//!    index) that every later stage walks
+//! 2. **Temperature scaling** — divide the survivors' logits by the
+//!    temperature (monotone, so the rank order is kept)
 //! 3. **Softmax** — convert scaled logits to probabilities
-//! 4. **Top-p** — keep the smallest set of tokens whose cumulative probability exceeds p
-//! 5. **Weighted random selection** — sample from the filtered distribution
+//! 4. **Min-p** — drop every candidate whose probability is below `min_p`
+//!    times the most likely one's ([`Sampler::set_min_p`], off by default)
+//! 5. **Top-p** — keep the smallest set of tokens whose cumulative probability exceeds p
+//! 6. **Weighted random selection** — sample from the filtered distribution
+//!    with one draw of the seeded PRNG
+//!
+//! ## Canonical survivor order (`perf-11`)
+//!
+//! With top-k active, the survivors are selected and walked — softmax sum,
+//! min-p/top-p, the weighted draw — in `canonical_rank` order, a total order
+//! on the logits alone. A seeded draw is therefore a function of the survivor
+//! set only, not of how a partial selection over the whole row happened to
+//! arrange it; sampling any candidate sub-row that contains the survivors
+//! (the fused GPU route's top-k download,
+//! `crate::engine_greedy::SampledTopKMode::GpuCandidates`) is byte-identical
+//! to sampling the full row. With top-k disabled (`top_k == 0`) the full row is
+//! walked in index order, exactly as before, so seeded output of a `top_k == 0`
+//! request is unchanged.
 //!
 //! [`Sampler::sample_with_history`] additionally applies the repetition penalty
 //! (from [`SamplingParams::repetition_penalty`]) and the frequency / presence
@@ -29,11 +49,11 @@ use crate::sampling_advanced::apply_repetition_penalty;
 /// **Do not add fields to this struct without auditing every
 /// `SamplingParams { .. }` struct-literal construction workspace-wide.**
 /// Several construct it field-by-field without `..SamplingParams::default()`
-/// (e.g. `engine_greedy.rs`, `engine_control.rs`, `builders.rs` — verified by
-/// a full `cargo check --workspace --all-features --all-targets` while
-/// developing this fix, which failed at `builders.rs:105` with `missing
-/// field min_p` the moment a field was added here), so a new field is a
-/// breaking change to files this package does not own. [`Sampler`] carries
+/// (e.g. `engine_greedy.rs`, `engine_control.rs`, `builders.rs` — a
+/// `cargo check --workspace --all-features --all-targets` fails at
+/// `builders.rs` with `missing field` the moment a field is added here), so
+/// a new field is a source-breaking change for every such construction,
+/// downstream crates included. [`Sampler`] carries
 /// [`Sampler::min_p`]/[`Sampler::set_min_p`] as a *sampler-level* setting
 /// instead, precisely to add min-p support without this hazard — see its
 /// doc comment.
@@ -57,7 +77,7 @@ impl Default for SamplingParams {
             temperature: 0.7,
             top_k: 40,
             top_p: 0.9,
-            // `RT-24`/gatekeeper-REQUIRED#1(a): this used to be `1.1`, which
+            // `RT-24`: this used to be `1.1`, which
             // meant EVERY caller that builds a per-request `SamplingParams`
             // via `..SamplingParams::default()` (the OpenAI server's chat,
             // completions and extended handlers, `async_engine.rs`,
@@ -168,12 +188,15 @@ pub struct Sampler {
     /// before top-p, matching llama.cpp / vLLM ordering.
     min_p: f32,
     rng_state: u64,
-    /// Reusable working buffer for `(token_index, scaled_logit)` pairs.
+    /// Reusable working buffer for `(token_index, logit)` pairs (raw logits
+    /// until the survivor set and order are fixed, then temperature-scaled,
+    /// then probabilities).
     ///
-    /// After `select_nth_unstable_by` + `drain` the buffer holds only the top-k
-    /// candidates (capacity stays at `vocab_size`).  `clear()` on the next call
-    /// resets length to zero without freeing the backing store, so subsequent
-    /// `extend()` calls never reallocate.
+    /// After the top-k selection + `truncate` the buffer holds only the top-k
+    /// candidates, in [`canonical_rank`] order (capacity stays at
+    /// `vocab_size`).  `clear()` on the next call resets length to zero
+    /// without freeing the backing store, so subsequent `extend()` calls never
+    /// reallocate.
     probs_buf: Vec<(usize, f32)>,
     /// Reusable scratch copy of the raw logits used by
     /// [`Sampler::sample_with_history`] when a penalty is active. Grown on
@@ -215,8 +238,8 @@ fn seed_to_rng_state(seed: u64) -> u64 {
 impl Sampler {
     /// Create a new sampler with the given parameters and seed.
     ///
-    /// `seed` is mixed through [`seed_to_rng_state`] (SplitMix64, RT-25)
-    /// before becoming the xorshift64 PRNG's initial state, so every `u64`
+    /// `seed` is mixed through SplitMix64 (the private `seed_to_rng_state`,
+    /// RT-25) before becoming the xorshift64 PRNG's initial state, so every `u64`
     /// seed — including `0`, which callers use routinely (e.g.
     /// `PipelineBuilder`'s documented default) — produces a well-distributed,
     /// non-degenerate stream. This is the *only* place `rng_state` is ever
@@ -325,30 +348,44 @@ impl Sampler {
             return Ok(argmax(logits) as u32);
         }
 
-        // Populate the reusable buffer with temperature-scaled logits.
+        // Populate the reusable buffer with the RAW logits, in index order.
         // On the first call this allocates `vocab_size × 12` bytes; every
         // subsequent call reuses the existing backing store (len is reset to 0
         // by `clear()`, capacity is preserved from the previous call).
         self.probs_buf.clear();
-        self.probs_buf.extend(
-            logits
-                .iter()
-                .enumerate()
-                .map(|(i, &v)| (i, v / self.params.temperature)),
-        );
+        self.probs_buf.extend(logits.iter().copied().enumerate());
 
-        // Top-k filtering — O(n) average via partial selection rather than O(n log n) full sort.
-        // `select_nth_unstable_by` rearranges `probs_buf` so that element at index `cutoff` is in
-        // its fully-sorted position, all elements before it are ≤ it (lower scaled logits), and all
-        // elements after it are ≥ it (higher scaled logits).  Draining the prefix leaves exactly
-        // the top-k elements in arbitrary order, which is sufficient for softmax + sampling.
-        if self.params.top_k > 0 && self.params.top_k < self.probs_buf.len() {
-            let k = self.params.top_k;
-            let cutoff = self.probs_buf.len() - k;
-            self.probs_buf.select_nth_unstable_by(cutoff, |a, b| {
-                a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal)
-            });
-            self.probs_buf.drain(..cutoff);
+        // Top-k filtering in the canonical survivor order (`perf-11`): an O(n)
+        // average partial selection of the `top_k` best by `canonical_rank`
+        // (raw logit descending, NaN last, an exact tie to the lower index),
+        // then a sort of just those `top_k` by the same total order. Ranking the
+        // RAW logits (before temperature scaling, which can merge two distinct
+        // logits into one scaled value) keeps the order a function of the
+        // logits alone, so the softmax sum and the weighted draw below depend
+        // only on the survivor set — never on how the partial selection
+        // happened to arrange the rest of the row. That is what makes a
+        // candidate sub-row containing the survivors sample byte-identically
+        // to the full row (see the module docs).
+        //
+        // Top-k enabled means ranked, even when `top_k` is at or above the
+        // row length (nothing to cut, but the walk order is still the rank
+        // order): a sub-row exactly `top_k` wide and the full row it was
+        // taken from must be walked the same way.
+        let ranked = self.params.top_k > 0;
+        if ranked {
+            let k = self.params.top_k.min(self.probs_buf.len());
+            if k < self.probs_buf.len() {
+                self.probs_buf.select_nth_unstable_by(k - 1, canonical_rank);
+                self.probs_buf.truncate(k);
+            }
+            self.probs_buf.sort_unstable_by(canonical_rank);
+        }
+
+        // Temperature scaling. Dividing by a positive temperature is monotone,
+        // so the rank order established above is preserved.
+        let temperature = self.params.temperature;
+        for (_, v) in self.probs_buf.iter_mut() {
+            *v /= temperature;
         }
 
         // Softmax
@@ -395,9 +432,17 @@ impl Sampler {
             truncate_to_min_p(&mut self.probs_buf, self.min_p);
         }
 
-        // Top-p (nucleus) filtering.
+        // Top-p (nucleus) filtering. A ranked buffer is already in
+        // non-increasing probability order (min-p's `retain` keeps that
+        // order), so the nucleus is a prefix scan — re-sorting it would
+        // reorder tied probabilities. An unranked (`top_k` disabled) buffer is
+        // in index order and takes the windowed selection (perf-12).
         if self.params.top_p < 1.0 {
-            truncate_to_top_p(&mut self.probs_buf, self.params.top_p);
+            if ranked {
+                truncate_ranked_to_top_p(&mut self.probs_buf, self.params.top_p);
+            } else {
+                truncate_to_top_p(&mut self.probs_buf, self.params.top_p);
+            }
         }
 
         // Pre-compute random value before the immutable borrow of `probs_buf`
@@ -459,9 +504,11 @@ impl Sampler {
     /// Replace the min-p threshold in place, preserving the PRNG state and
     /// every other setting.
     ///
-    /// Values outside `[0.0, 1.0]` are clamped by [`truncate_to_min_p`] at
-    /// sample time, not here, so this setter never fails; `0.0` (or any
-    /// non-positive value) disables the filter.
+    /// Values outside `[0.0, 1.0]` are clamped by the min-p filter (the
+    /// private `truncate_to_min_p`) at sample time, not here, so this setter
+    /// never fails; `0.0` (or any non-positive value, or `NaN`) disables the
+    /// filter, and a value above `1.0` keeps only the candidates tied with
+    /// the most likely one.
     pub fn set_min_p(&mut self, min_p: f32) {
         self.min_p = min_p;
     }
@@ -499,6 +546,56 @@ fn argmax(values: &[f32]) -> usize {
         }
     }
     best_idx
+}
+
+/// The canonical survivor order of [`Sampler::sample_core`]'s top-k
+/// (`perf-11`): raw logit **descending**, `NaN` after every number, an exact
+/// tie (including `-0.0` against `0.0`) to the **lower** index.
+///
+/// A total order, so the selected survivor set and the order it is walked in
+/// are a function of the logits alone — the property that lets a candidate
+/// sub-row (the fused GPU route's top-k download, which orders its
+/// candidates exactly this way and never selects a `NaN`) sample
+/// byte-identically to the full row.
+fn canonical_rank(a: &(usize, f32), b: &(usize, f32)) -> Ordering {
+    match (a.1.is_nan(), b.1.is_nan()) {
+        (false, false) => {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        }
+        (false, true) => Ordering::Less,
+        (true, false) => Ordering::Greater,
+        (true, true) => a.0.cmp(&b.0),
+    }
+}
+
+/// Top-p over a candidate buffer already in [`canonical_rank`] order, i.e. in
+/// non-increasing probability order: keep the shortest prefix whose
+/// cumulative probability exceeds `top_p` (everything when none does), then
+/// re-normalise the kept prefix to sum to `1.0`.
+///
+/// Selects the same nucleus [`truncate_to_top_p`] does, but by a prefix scan
+/// instead of a re-sort, so tied probabilities keep their canonical order
+/// (an unstable re-sort would not) and the result stays a function of the
+/// survivor set alone.
+fn truncate_ranked_to_top_p(buf: &mut Vec<(usize, f32)>, top_p: f32) {
+    if buf.len() <= 1 {
+        return;
+    }
+    let mut cum = 0.0f32;
+    let keep = buf
+        .iter()
+        .position(|&(_, p)| {
+            cum += p;
+            cum > top_p
+        })
+        .map_or(buf.len(), |i| i + 1);
+    buf.truncate(keep);
+    let sum: f32 = buf.iter().map(|(_, p)| *p).sum();
+    for (_, p) in buf.iter_mut() {
+        *p /= sum;
+    }
 }
 
 /// Returns the index of the highest-probability candidate in `buf`, or an
@@ -545,6 +642,75 @@ fn warn_zero_mass_once(vocab_size: usize, sum: f32) {
              arbitrary token (this warning is logged once per process)"
         );
     });
+}
+
+// ─── RT-17: sampling defaults sourced from the GGUF's own metadata ─────────
+
+/// A GGUF's own recommended sampling defaults (`general.sampling.*`), when
+/// it declares any (RT-17). Each field is independently optional — a file
+/// may declare only some of the three (or none at all, like the legacy
+/// `Ternary-Bonsai-{1.7B,8B}.gguf` files, which carry no `general.sampling.*`
+/// keys whatsoever).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct GgufSamplingDefaults {
+    /// `general.sampling.temp` (NOT `.temperature` — verified against the
+    /// real on-disk key PrismML's own writer emits, in both
+    /// `Bonsai-8B.gguf` and `Ternary-Bonsai-2-27B-{PTQ1_0,PQ2_0}.gguf`;
+    /// `general.sampling.temperature` does not occur in any real file).
+    pub temperature: Option<f32>,
+    /// `general.sampling.top_p`.
+    pub top_p: Option<f32>,
+    /// `general.sampling.top_k`.
+    pub top_k: Option<usize>,
+    /// `general.sampling.min_p`, present on `Bonsai-8B.gguf` (not part of
+    /// RT-17's required three, but read for symmetry since it costs
+    /// nothing extra to check the same metadata store).
+    pub min_p: Option<f32>,
+}
+
+impl GgufSamplingDefaults {
+    /// Read `general.sampling.{temp,top_p,top_k,min_p}` from `md`. Never
+    /// fails — a key that is absent, or present with the wrong GGUF value
+    /// type, simply resolves to `None` for that field, matching the design
+    /// intent that a model declaring no (or partial) sampling metadata must
+    /// fall through to the caller's own hardcoded default rather than error.
+    #[must_use]
+    pub fn from_metadata(md: &oxibonsai_core::MetadataStore) -> Self {
+        Self {
+            temperature: md.get_f32("general.sampling.temp").ok(),
+            top_p: md.get_f32("general.sampling.top_p").ok(),
+            top_k: md
+                .get_u32("general.sampling.top_k")
+                .ok()
+                .map(|v| v as usize),
+            min_p: md.get_f32("general.sampling.min_p").ok(),
+        }
+    }
+}
+
+/// RT-17's three-way precedence for one `f32` sampling default: an
+/// `explicit` value (already merged from an even higher-precedence source
+/// by the caller — a CLI flag, a `--config` TOML value, or a per-request API
+/// field) always wins; otherwise the model's own declared default
+/// (`gguf_value`); otherwise `hardcoded` (the literal this crate/CLI used
+/// before RT-17, e.g. [`SamplingParams::default`]'s `0.7`).
+#[must_use]
+pub fn resolve_sampling_default_f32(
+    explicit: Option<f32>,
+    gguf_value: Option<f32>,
+    hardcoded: f32,
+) -> f32 {
+    explicit.or(gguf_value).unwrap_or(hardcoded)
+}
+
+/// As [`resolve_sampling_default_f32`], for a `usize` default (`top_k`).
+#[must_use]
+pub fn resolve_sampling_default_usize(
+    explicit: Option<usize>,
+    gguf_value: Option<usize>,
+    hardcoded: usize,
+) -> usize {
+    explicit.or(gguf_value).unwrap_or(hardcoded)
 }
 
 /// Truncates `buf` — a set of `(token_index, probability)` pairs whose
@@ -1134,6 +1300,211 @@ mod tests {
         );
     }
 
+    // ── Canonical survivor order (perf-11) ──────────────────────────────
+
+    fn next_xorshift(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// The top-`width` candidate sub-row of `row` exactly as the fused GPU
+    /// route downloads it (and `engine_greedy::top_k_candidates` extracts
+    /// it): `canonical_rank` order, `NaN` and `-inf` never selected.
+    fn candidate_sub_row(row: &[f32], width: usize) -> (Vec<usize>, Vec<f32>) {
+        let mut ranked: Vec<(usize, f32)> = row
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, v)| *v > f32::NEG_INFINITY)
+            .collect();
+        ranked.sort_by(canonical_rank);
+        ranked.truncate(width);
+        ranked.into_iter().unzip()
+    }
+
+    #[test]
+    fn canonical_rank_is_a_total_order_with_nan_last_and_ties_to_the_lower_index() {
+        let mut v = [
+            (0usize, 1.0f32),
+            (1, f32::NAN),
+            (2, 3.0),
+            (3, 1.0),
+            (4, -0.0),
+            (5, 0.0),
+            (6, f32::NEG_INFINITY),
+            (7, f32::NAN),
+        ];
+        v.sort_by(canonical_rank);
+        let ids: Vec<usize> = v.iter().map(|(i, _)| *i).collect();
+        assert_eq!(ids, vec![2, 0, 3, 4, 5, 6, 1, 7]);
+    }
+
+    /// The perf-11 property: with top-k enabled, a seeded draw over the full
+    /// row and a seeded draw over any candidate sub-row containing the
+    /// survivors pick the same token — on tie-heavy rows, at `top_p` 1.0 and
+    /// below, with and without min-p, and with `top_k` equal to the sub-row
+    /// width. (Before the canonical order, 125 of 200 such rows differed at
+    /// `top_k 20, top_p 1.0`.)
+    #[test]
+    fn a_top_k_draw_depends_only_on_the_survivor_set() {
+        let mut state = 0x1234_5678_9abc_def0u64;
+        for (top_k, top_p, min_p, temperature) in [
+            (20usize, 1.0f32, 0.0f32, 0.8f32),
+            (20, 0.9, 0.0, 0.8),
+            (40, 0.95, 0.05, 1.0),
+            (1, 1.0, 0.0, 0.7),
+            (64, 0.9, 0.0, 0.8),
+            (64, 1.0, 0.1, 1.3),
+        ] {
+            let params = SamplingParams {
+                temperature,
+                top_k,
+                top_p,
+                repetition_penalty: 1.0,
+                max_tokens: 1,
+            };
+            let mut full = Sampler::new(params.clone(), 11);
+            let mut sub = Sampler::new(params, 11);
+            full.set_min_p(min_p);
+            sub.set_min_p(min_p);
+            for row_index in 0..200 {
+                // Values in [0, 10) on a 0.001 grid: exact ties everywhere,
+                // including across the top-k boundary.
+                let row: Vec<f32> = (0..1000)
+                    .map(|_| ((next_xorshift(&mut state) >> 40) % 10_000) as f32 / 1000.0)
+                    .collect();
+                let (ids, values) = candidate_sub_row(&row, 64);
+                let a = full.sample(&row).expect("full-row draw") as usize;
+                let b = ids[sub.sample(&values).expect("sub-row draw") as usize];
+                assert_eq!(
+                    a, b,
+                    "row {row_index}: top_k {top_k} top_p {top_p} min_p {min_p} t {temperature}"
+                );
+            }
+        }
+    }
+
+    /// Ranking the RAW logits, not the temperature-scaled ones: two adjacent
+    /// f32 logits can collapse into one scaled value, and a scaled-value tie
+    /// broken by index would then walk the full row and a sub-row (whose
+    /// positions follow the raw order) differently.
+    #[test]
+    fn the_rank_is_taken_before_temperature_scaling() {
+        // Find two adjacent f32 logits that one scaling by 1/0.7 merges into
+        // a single value (it maps [0.7, 1.0)'s grid onto [1.0, 1.43)'s,
+        // twice as coarse, so such pairs are everywhere there).
+        let temperature = 0.7f32;
+        let mut base = 0.8f32;
+        let mut merged = None;
+        for _ in 0..64 {
+            let above = f32::from_bits(base.to_bits() + 1);
+            if base / temperature == above / temperature {
+                merged = Some((base, above));
+                break;
+            }
+            base = above;
+        }
+        let (base, above) = merged.expect("adjacent logits that merge once scaled");
+        // `above` > `base` as raw logits, placed at the HIGHER index, so a
+        // scaled-value rank (tie to the lower index) would walk them 3, 9
+        // while the raw rank (and the candidate sub-row) walks them 9, 3.
+        let mut row = vec![-5.0f32; 16];
+        row[3] = base;
+        row[9] = above;
+        for seed in 0..64u64 {
+            let params = SamplingParams {
+                temperature,
+                top_k: 2,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                max_tokens: 1,
+            };
+            let mut full = Sampler::new(params.clone(), seed);
+            let mut sub = Sampler::new(params, seed);
+            let (ids, values) = candidate_sub_row(&row, 4);
+            assert_eq!(ids[..2], [9, 3], "raw order: the larger logit first");
+            let a = full.sample(&row).expect("full") as usize;
+            let b = ids[sub.sample(&values).expect("sub") as usize];
+            assert_eq!(a, b, "seed {seed}");
+        }
+    }
+
+    /// `top_k == 0` keeps the pre-canonical path: index order, windowed
+    /// top-p. Pinned against a direct transcription of that path.
+    #[test]
+    fn a_disabled_top_k_keeps_the_index_order_path() {
+        fn reference(logits: &[f32], params: &SamplingParams, rand_val: f32) -> usize {
+            let mut buf: Vec<(usize, f32)> = logits
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| (i, v / params.temperature))
+                .collect();
+            let max_val = buf
+                .iter()
+                .map(|(_, v)| *v)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0f32;
+            for (_, v) in buf.iter_mut() {
+                *v = (*v - max_val).exp();
+                sum += *v;
+            }
+            for (_, v) in buf.iter_mut() {
+                *v /= sum;
+            }
+            if params.top_p < 1.0 {
+                truncate_to_top_p(&mut buf, params.top_p);
+            }
+            let mut cum = 0.0f32;
+            for &(idx, p) in &buf {
+                cum += p;
+                if rand_val <= cum {
+                    return idx;
+                }
+            }
+            pick_highest_probability(&buf).expect("non-empty") as usize
+        }
+        let mut state = 0x0bad_c0de_1234_5678u64;
+        for top_p in [1.0f32, 0.9] {
+            let params = SamplingParams {
+                temperature: 0.9,
+                top_k: 0,
+                top_p,
+                repetition_penalty: 1.0,
+                max_tokens: 1,
+            };
+            let mut sampler = Sampler::new(params.clone(), 99);
+            let mut shadow_rng = Sampler::new(params.clone(), 99);
+            for _ in 0..100 {
+                let row: Vec<f32> = (0..300)
+                    .map(|_| ((next_xorshift(&mut state) >> 40) % 1000) as f32 / 100.0)
+                    .collect();
+                let rand_val = (shadow_rng.next_u64() as f64 / u64::MAX as f64) as f32;
+                let got = sampler.sample(&row).expect("sample") as usize;
+                assert_eq!(got, reference(&row, &params, rand_val), "top_p {top_p}");
+            }
+        }
+    }
+
+    #[test]
+    fn ranked_top_p_keeps_the_reference_nucleus() {
+        let mut buf = vec![(4usize, 0.5f32), (1, 0.3), (7, 0.15), (2, 0.05)];
+        truncate_ranked_to_top_p(&mut buf, 0.7);
+        let ids: Vec<usize> = buf.iter().map(|(i, _)| *i).collect();
+        assert_eq!(ids, vec![4, 1]);
+        let sum: f32 = buf.iter().map(|(_, p)| *p).sum();
+        assert!((sum - 1.0).abs() < 1e-6);
+        // Nothing crosses top_p: keep everything.
+        let mut all = vec![(0usize, 0.5f32), (1, 0.5)];
+        truncate_ranked_to_top_p(&mut all, 0.999_999_9);
+        assert_eq!(all.len(), 2);
+        // A single candidate is left alone.
+        let mut one = vec![(3usize, 1.0f32)];
+        truncate_ranked_to_top_p(&mut one, 0.1);
+        assert_eq!(one, vec![(3usize, 1.0f32)]);
+    }
+
     /// Reference (pre-perf-12) top-p implementation: a full descending sort
     /// followed by a linear cumulative-sum scan — exactly what
     /// `truncate_to_top_p` replaced. Used only to check that the
@@ -1153,6 +1524,113 @@ mod tests {
             })
             .unwrap_or(sorted.len().saturating_sub(1));
         sorted[..=cutoff].iter().map(|&(idx, _)| idx).collect()
+    }
+
+    // ── RT-17: GGUF-sourced sampling defaults ──────────────────────────────
+
+    #[test]
+    fn resolve_sampling_default_f32_explicit_always_wins() {
+        // Precedence 1 of 3: an explicit (CLI/TOML/API) value beats both the
+        // GGUF's own default and the hardcoded literal.
+        assert_eq!(resolve_sampling_default_f32(Some(0.3), Some(1.0), 0.7), 0.3);
+    }
+
+    #[test]
+    fn resolve_sampling_default_f32_falls_back_to_gguf_value() {
+        // Precedence 2 of 3: no explicit value -> the model's own declared
+        // default wins over the hardcoded literal.
+        assert_eq!(resolve_sampling_default_f32(None, Some(1.0), 0.7), 1.0);
+    }
+
+    #[test]
+    fn resolve_sampling_default_f32_falls_back_to_hardcoded_when_nothing_else_is_set() {
+        // Precedence 3 of 3: neither explicit nor GGUF -> the final
+        // hardcoded literal (e.g. legacy files with no `general.sampling.*`
+        // metadata at all, such as Ternary-Bonsai-{1.7B,8B}.gguf).
+        assert_eq!(resolve_sampling_default_f32(None, None, 0.7), 0.7);
+    }
+
+    #[test]
+    fn resolve_sampling_default_usize_all_three_precedences() {
+        assert_eq!(resolve_sampling_default_usize(Some(10), Some(20), 40), 10);
+        assert_eq!(resolve_sampling_default_usize(None, Some(20), 40), 20);
+        assert_eq!(resolve_sampling_default_usize(None, None, 40), 40);
+    }
+
+    #[test]
+    fn gguf_sampling_defaults_default_is_all_none() {
+        assert_eq!(
+            GgufSamplingDefaults::default(),
+            GgufSamplingDefaults {
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                min_p: None,
+            }
+        );
+    }
+
+    /// End-to-end through the real GGUF writer/reader round trip (not a
+    /// hand-rolled fake `MetadataStore`): builds a tiny metadata-only GGUF
+    /// with `general.sampling.{temp,top_p,top_k,min_p}` — the Bonsai 2 /
+    /// Bonsai-8B recommended values — and confirms
+    /// `GgufSamplingDefaults::from_metadata` reads exactly the on-disk key
+    /// `general.sampling.temp` (NOT `.temperature`, which no real file
+    /// uses).
+    #[test]
+    fn gguf_sampling_defaults_reads_the_real_on_disk_keys() {
+        use oxibonsai_core::gguf::writer::{GgufWriter, MetadataWriteValue};
+        // `general.sampling.top_k` is written as GGUF INT32 (type 5), the
+        // type the real Bonsai 2 27B header stores it as (verified by
+        // parsing the header), so this exercises the real on-disk type
+        // rather than a `u32` stand-in.
+        let mut writer = GgufWriter::new();
+        writer.add_metadata(
+            "general.architecture",
+            MetadataWriteValue::Str("qwen35".to_string()),
+        );
+        writer.add_metadata("general.sampling.temp", MetadataWriteValue::F32(1.0));
+        writer.add_metadata("general.sampling.top_p", MetadataWriteValue::F32(0.95));
+        writer.add_metadata("general.sampling.top_k", MetadataWriteValue::I32(20));
+        writer.add_metadata("general.sampling.min_p", MetadataWriteValue::F32(0.05));
+        let bytes = writer.to_bytes().expect("build fixture gguf");
+        let gguf = oxibonsai_core::gguf::reader::GgufFile::parse(&bytes).expect("parse fixture");
+
+        let defaults = GgufSamplingDefaults::from_metadata(&gguf.metadata);
+        assert_eq!(defaults.temperature, Some(1.0));
+        assert_eq!(defaults.top_p, Some(0.95));
+        assert_eq!(defaults.top_k, Some(20));
+        assert_eq!(defaults.min_p, Some(0.05));
+    }
+
+    #[test]
+    fn gguf_sampling_defaults_is_all_none_when_the_file_declares_nothing() {
+        // The legacy Ternary-Bonsai-{1.7B,8B}.gguf shape: no
+        // `general.sampling.*` metadata at all.
+        let mut builder = oxibonsai_testkit::gguf_fixture::GgufFixtureBuilder::new();
+        builder.metadata_str("general.architecture", "qwen3");
+        let bytes = builder.build().expect("build fixture gguf");
+        let gguf = oxibonsai_core::gguf::reader::GgufFile::parse(&bytes).expect("parse fixture");
+
+        let defaults = GgufSamplingDefaults::from_metadata(&gguf.metadata);
+        assert_eq!(defaults, GgufSamplingDefaults::default());
+    }
+
+    #[test]
+    fn gguf_sampling_defaults_reads_partial_metadata() {
+        // A file may declare only some of the fields (e.g. temp + top_p but
+        // not top_k) -- each field resolves independently.
+        let mut builder = oxibonsai_testkit::gguf_fixture::GgufFixtureBuilder::new();
+        builder
+            .metadata_str("general.architecture", "qwen35")
+            .metadata_f32("general.sampling.temp", 1.0);
+        let bytes = builder.build().expect("build fixture gguf");
+        let gguf = oxibonsai_core::gguf::reader::GgufFile::parse(&bytes).expect("parse fixture");
+
+        let defaults = GgufSamplingDefaults::from_metadata(&gguf.metadata);
+        assert_eq!(defaults.temperature, Some(1.0));
+        assert_eq!(defaults.top_p, None);
+        assert_eq!(defaults.top_k, None);
     }
 
     proptest! {

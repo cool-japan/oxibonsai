@@ -152,6 +152,14 @@ pub struct LimitsConfig {
     /// Large` before the JSON body is fully buffered.
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
+    /// Hard ceiling on a request's effective `max_tokens` (finding `SV-28`):
+    /// `--max-output-tokens`, `[limits] max_output_tokens` or
+    /// `OXIBONSAI_MAX_OUTPUT_TOKENS`. A request above it is refused with
+    /// `400`. `None` keeps `oxibonsai_runtime::server::MAX_OUTPUT_TOKENS`'s
+    /// compiled-in default; `0` is rejected at parse time (it would refuse
+    /// every request instead of capping it).
+    #[serde(default)]
+    pub max_output_tokens: Option<usize>,
 }
 
 /// Default request body ceiling: 4 MiB. Comfortably above axum's implicit
@@ -170,6 +178,7 @@ impl Default for LimitsConfig {
             per_request_timeout_ms: 60_000,
             engine_pool_size: None,
             max_body_bytes: default_max_body_bytes(),
+            max_output_tokens: None,
         }
     }
 }
@@ -285,6 +294,16 @@ impl Default for ObservabilityConfig {
     }
 }
 
+/// Browser-UI section (finding `SV-26`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct UiSection {
+    /// Mount the bundled chat UI at `GET /ui`: `--enable-ui`, `[ui] enabled`
+    /// or `OXIBONSAI_ENABLE_UI`. Off by default — the UI is a debugging
+    /// convenience, unauthenticated whenever the whole server is.
+    pub enabled: bool,
+}
+
 // ─── Top-level config ────────────────────────────────────────────────────
 
 /// Production-ready server configuration.
@@ -322,6 +341,9 @@ pub struct ServerConfig {
     /// Per-client rate limiting.
     #[serde(default)]
     pub rate_limit: RateLimitSection,
+    /// Browser UI.
+    #[serde(default)]
+    pub ui: UiSection,
     /// RNG seed (for deterministic sampling).
     #[serde(default = "default_seed")]
     pub seed: u64,
@@ -343,6 +365,7 @@ impl Default for ServerConfig {
             observability: ObservabilityConfig::default(),
             cors: CorsSection::default(),
             rate_limit: RateLimitSection::default(),
+            ui: UiSection::default(),
             seed: default_seed(),
         }
     }
@@ -412,6 +435,10 @@ pub struct PartialServerConfig {
     pub rate_limit_rpm: Option<f64>,
     /// Rate limit: burst capacity.
     pub rate_limit_burst: Option<f64>,
+    /// Mount the bundled chat UI at `GET /ui` (see [`UiSection::enabled`]).
+    pub enable_ui: Option<bool>,
+    /// Per-request `max_tokens` ceiling (see [`LimitsConfig::max_output_tokens`]).
+    pub max_output_tokens: Option<usize>,
     /// RNG seed.
     pub seed: Option<u64>,
 }
@@ -452,6 +479,8 @@ impl PartialServerConfig {
         merge_field!(cors_allow_credentials);
         merge_field!(rate_limit_rpm);
         merge_field!(rate_limit_burst);
+        merge_field!(enable_ui);
+        merge_field!(max_output_tokens);
         merge_field!(seed);
         self
     }
@@ -465,8 +494,75 @@ impl PartialServerConfig {
         // extra fields are rejected and section-based layout is preserved.
         let helper: TomlHelper =
             toml::from_str(s).map_err(|e| ConfigError::TomlParse(e.to_string()))?;
-        Ok(helper.into_partial())
+        let partial = helper.into_partial();
+        reject_zero_output_ceiling(partial.max_output_tokens, "[limits] max_output_tokens")?;
+        Ok(partial)
     }
+}
+
+/// `0` as the `max_tokens` ceiling would refuse every request outright
+/// instead of capping it — the same rule `--max-output-tokens` applies.
+fn reject_zero_output_ceiling(value: Option<usize>, source: &str) -> Result<(), ConfigError> {
+    if value == Some(0) {
+        return Err(ConfigError::Validation(format!(
+            "{source} must be at least 1 (a zero ceiling would reject every request outright \
+             instead of capping it)"
+        )));
+    }
+    Ok(())
+}
+
+/// The environment layer of the two SRV-OPENAI knobs: `OXIBONSAI_ENABLE_UI`
+/// (`true`/`false`/`1`/`0`) and `OXIBONSAI_MAX_OUTPUT_TOKENS` (a positive
+/// integer). Unrelated variables are ignored. Kept next to the fields it
+/// fills; `crate::env::parse_env_map` merges it into the full env layer.
+///
+/// # Errors
+///
+/// [`ConfigError::EnvParse`] for a malformed value (including a `0`
+/// ceiling).
+pub fn parse_ui_env_map<I>(vars: I) -> Result<PartialServerConfig, ConfigError>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut out = PartialServerConfig::default();
+    for (name, value) in vars {
+        match name.as_str() {
+            "OXIBONSAI_ENABLE_UI" => {
+                let enabled = match value.trim().to_ascii_lowercase().as_str() {
+                    "1" | "true" | "yes" | "on" => true,
+                    "0" | "false" | "no" | "off" => false,
+                    _ => {
+                        return Err(ConfigError::EnvParse {
+                            name,
+                            reason: format!("expected a boolean, got '{value}'"),
+                        })
+                    }
+                };
+                out.enable_ui = Some(enabled);
+            }
+            "OXIBONSAI_MAX_OUTPUT_TOKENS" => {
+                let ceiling = value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|e| ConfigError::EnvParse {
+                        name: name.clone(),
+                        reason: format!("expected a positive integer ({e})"),
+                    })?;
+                if ceiling == 0 {
+                    return Err(ConfigError::EnvParse {
+                        name,
+                        reason: "must be at least 1 (a zero ceiling would reject every \
+                                 request outright instead of capping it)"
+                            .to_string(),
+                    });
+                }
+                out.max_output_tokens = Some(ceiling);
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
 }
 
 // ─── TOML helper shape ────────────────────────────────────────────────────
@@ -492,6 +588,8 @@ struct TomlHelper {
     cors: Option<CorsPartial>,
     #[serde(default)]
     rate_limit: Option<RateLimitPartial>,
+    #[serde(default)]
+    ui: Option<UiPartial>,
     #[serde(default)]
     seed: Option<u64>,
 }
@@ -524,6 +622,11 @@ struct LimitsPartial {
     engine_pool_size: Option<usize>,
     per_request_timeout_ms: Option<u64>,
     max_body_bytes: Option<usize>,
+    max_output_tokens: Option<usize>,
+}
+#[derive(Debug, Default, Deserialize)]
+struct UiPartial {
+    enabled: Option<bool>,
 }
 #[derive(Debug, Default, Deserialize)]
 struct AuthPartial {
@@ -560,6 +663,7 @@ impl TomlHelper {
         let obs = self.observability.unwrap_or_default();
         let cors = self.cors.unwrap_or_default();
         let rl = self.rate_limit.unwrap_or_default();
+        let ui = self.ui.unwrap_or_default();
         PartialServerConfig {
             host: bind.host,
             port: bind.port,
@@ -586,6 +690,8 @@ impl TomlHelper {
             cors_allow_credentials: cors.allow_credentials,
             rate_limit_rpm: rl.rpm,
             rate_limit_burst: rl.burst,
+            enable_ui: ui.enabled,
+            max_output_tokens: lim.max_output_tokens,
             seed: self.seed,
         }
     }
@@ -679,6 +785,12 @@ impl ServerConfig {
         }
         if let Some(v) = p.rate_limit_burst {
             out.rate_limit.burst = v;
+        }
+        if let Some(v) = p.enable_ui {
+            out.ui.enabled = v;
+        }
+        if let Some(v) = p.max_output_tokens {
+            out.limits.max_output_tokens = Some(v);
         }
         if let Some(v) = p.seed {
             out.seed = v;
@@ -938,6 +1050,80 @@ bearer_token_file = "/etc/oxibonsai/bearer-token"
         );
     }
 
+    // ─── SRV-OPENAI: `--enable-ui` / `--max-output-tokens` gain TOML + env ──
+
+    #[test]
+    fn ui_and_output_ceiling_default_to_off_and_unset() {
+        let cfg = ServerConfig::default();
+        assert!(!cfg.ui.enabled);
+        assert_eq!(cfg.limits.max_output_tokens, None);
+        let p = PartialServerConfig::default();
+        assert!(p.enable_ui.is_none());
+        assert!(p.max_output_tokens.is_none());
+    }
+
+    #[test]
+    fn ui_and_output_ceiling_parse_from_toml() {
+        let cfg =
+            ServerConfig::from_toml("[ui]\nenabled = true\n[limits]\nmax_output_tokens = 2048\n")
+                .expect("parse");
+        assert!(cfg.ui.enabled);
+        assert_eq!(cfg.limits.max_output_tokens, Some(2048));
+        // ...and round-trip through the serialized form.
+        let text = cfg.to_toml_string().expect("serialize");
+        assert_eq!(ServerConfig::from_toml(&text).expect("reparse"), cfg);
+    }
+
+    #[test]
+    fn a_zero_output_ceiling_is_refused_in_toml_and_env() {
+        let err = PartialServerConfig::from_toml_str("[limits]\nmax_output_tokens = 0\n")
+            .expect_err("a zero ceiling");
+        assert!(err.to_string().contains("max_output_tokens"), "{err}");
+        let err = parse_ui_env_map([("OXIBONSAI_MAX_OUTPUT_TOKENS".to_string(), "0".to_string())])
+            .expect_err("a zero ceiling");
+        assert!(
+            err.to_string().contains("OXIBONSAI_MAX_OUTPUT_TOKENS"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn ui_env_layer_parses_both_variables_and_ignores_others() {
+        let partial = parse_ui_env_map([
+            ("OXIBONSAI_ENABLE_UI".to_string(), "true".to_string()),
+            ("OXIBONSAI_MAX_OUTPUT_TOKENS".to_string(), "512".to_string()),
+            ("OXIBONSAI_PORT".to_string(), "not-mine".to_string()),
+        ])
+        .expect("parse");
+        assert_eq!(partial.enable_ui, Some(true));
+        assert_eq!(partial.max_output_tokens, Some(512));
+        assert_eq!(partial.port, None, "other variables belong to crate::env");
+        let off = parse_ui_env_map([("OXIBONSAI_ENABLE_UI".to_string(), "0".to_string())])
+            .expect("parse");
+        assert_eq!(off.enable_ui, Some(false));
+        let err = parse_ui_env_map([("OXIBONSAI_ENABLE_UI".to_string(), "maybe".to_string())])
+            .expect_err("not a boolean");
+        assert!(err.to_string().contains("OXIBONSAI_ENABLE_UI"), "{err}");
+    }
+
+    #[test]
+    fn ui_and_output_ceiling_layer_cli_over_env_over_toml() {
+        let toml_layer = PartialServerConfig::from_toml_str(
+            "[ui]\nenabled = false\n[limits]\nmax_output_tokens = 100\n",
+        )
+        .expect("toml");
+        let env_layer =
+            parse_ui_env_map([("OXIBONSAI_MAX_OUTPUT_TOKENS".to_string(), "200".to_string())])
+                .expect("env");
+        let cli_layer = PartialServerConfig {
+            enable_ui: Some(true),
+            ..Default::default()
+        };
+        let cfg = ServerConfig::from_partial(toml_layer.merge(env_layer).merge(cli_layer));
+        assert!(cfg.ui.enabled, "the CLI layer wins");
+        assert_eq!(cfg.limits.max_output_tokens, Some(200), "env beats TOML");
+    }
+
     // ─── SV-15/SV-16/SV-23: every config field must have a real consumer ───
 
     /// Exhaustive struct destructure of [`ServerConfig`] and every
@@ -961,6 +1147,7 @@ bearer_token_file = "/etc/oxibonsai/bearer-token"
             observability,
             cors,
             rate_limit,
+            ui,
             seed,
         } = cfg;
 
@@ -981,6 +1168,7 @@ bearer_token_file = "/etc/oxibonsai/bearer-token"
             per_request_timeout_ms: _,
             engine_pool_size: _,
             max_body_bytes: _,
+            max_output_tokens: _, // KNOWN GAP (B2-14 deviation): main.rs still passes `cli_args.max_output_tokens` to `RouterBuildOptions::new`; it must pass `config.limits.max_output_tokens` (which already layers the CLI flag over TOML/env once `args.rs::to_partial` sets it).
         } = limits; // main.rs: RequestLimits::with_max_input_tokens/with_timeout_ms, GlobalConcurrencyLimitLayer, DefaultBodyLimit::max.
         let AuthConfig {
             bearer_token: _,
@@ -998,6 +1186,7 @@ bearer_token_file = "/etc/oxibonsai/bearer-token"
             allow_credentials: _,
         } = cors; // main.rs: CorsConfig::from_origins(..) -> apply_middleware.
         let RateLimitSection { rpm: _, burst: _ } = rate_limit; // main.rs: rpm/60.0 -> RateLimitConfig.rps, fed to rate_limiter::rate_limit_layer.
+        let UiSection { enabled: _ } = ui; // KNOWN GAP (B2-14 deviation): main.rs must pass `config.ui.enabled` instead of `cli_args.enable_ui` to `RouterBuildOptions::new`.
         let _seed: u64 = seed; // main.rs: build_pool_from_gguf(.., seed, ..).
     }
 }

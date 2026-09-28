@@ -1,4 +1,4 @@
-//! Shared chat-prompt rendering pipeline (B2-13, bonsai2-design.md §5.2-§5.3).
+//! Shared chat-prompt rendering pipeline (bonsai2-design.md §5.2-§5.3).
 //!
 //! Renders a model's own chat template ([`TokenizerBridge::resolved_chat_template`])
 //! through the real Jinja engine and encodes the result in ONE whole-prompt
@@ -47,21 +47,17 @@ use crate::server::sanitize::{neutralize_special_markers, SpecialTokenGuard};
 use crate::tokenizer_bridge::TokenizerBridge;
 use oxibonsai_tokenizer::chat_templates::{RenderMessage, RenderOptions};
 use oxibonsai_tokenizer::jinja::JinjaError;
-use serde::Serialize;
 
 /// Extra request fields the base (`server::chat`) and extended
-/// (`api_extensions`) endpoints must both read but cannot add to their own
-/// typed request structs this wave: `chat_template_kwargs.enable_thinking`
+/// (`api_extensions`) endpoints both read from the raw request body rather
+/// than from their typed request structs: `chat_template_kwargs.enable_thinking`
 /// / `.reasoning_effort` / `.preserve_thinking` (also accepted un-nested,
-/// matching real vLLM-family servers) — `ChatCompletionRequest` (`server.rs`)
-/// is owned by ENGINE-SEAM this wave; `ExtendedChatRequest` (`api_types.rs`,
-/// owned) COULD take these as real typed fields, but sharing one
-/// implementation with the base endpoint (which cannot) is simpler than
-/// two diverging ones — plus `tools` as raw JSON **text** (B4) rather than
-/// a typed `Vec<ToolDefinition>`/`Vec<Tool>` field: re-serializing either
-/// through `serde_json::Value` (this workspace's `serde_json` has neither
-/// `preserve_order` nor is a manifest edit in either package's
-/// `owned_files`) re-sorts each tool's `parameters` schema keys — measured
+/// matching real vLLM-family servers) — one shared implementation for both
+/// endpoints rather than two diverging typed copies — plus `tools` as raw
+/// JSON **text** rather than a typed `Vec<ToolDefinition>`/`Vec<Tool>`
+/// field: re-serializing either
+/// through `serde_json::Value` (this workspace's `serde_json` has no
+/// `preserve_order`) re-sorts each tool's `parameters` schema keys — measured
 /// diverging from G7 case 5 at byte 393 — because the schema is ALREADY a
 /// `serde_json::Value` (a `BTreeMap`-backed `Value::Object`) by the time it
 /// is deserialized into the typed field, before any handler code runs; the
@@ -120,27 +116,128 @@ impl ChatRequestExtras {
             .and_then(|k| k.preserve_thinking)
     }
 
-    /// The `tools` array's raw JSON text, if present (B4).
+    /// The `tools` array's raw JSON text, if present.
     pub(crate) fn tools_raw_json(&self) -> Option<String> {
         self.tools.as_ref().map(|rv| rv.get().to_string())
     }
 }
 
-/// Patch one extra string field into a serialized chunk/response's
-/// `choices[0].message` or `choices[0].delta` object — the seam that lets
-/// `reasoning_content` reach the client without either endpoint's chunk/
-/// message type declaring the field.
-pub(crate) fn with_extra_delta_field<T: Serialize>(
-    value: &T,
-    pointer: &str,
-    key: &str,
-    text: String,
-) -> String {
-    let mut v = serde_json::to_value(value).unwrap_or_default();
-    if let Some(obj) = v.pointer_mut(pointer).and_then(|p| p.as_object_mut()) {
-        obj.insert(key.to_string(), serde_json::Value::String(text));
+/// What one generated token contributes to the client-visible text of a
+/// response — [`PieceDecoder::next`]'s answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DecodedPiece {
+    /// Complete text for this token (and any bytes buffered before it).
+    Text(String),
+    /// Nothing to show *yet*: the token carries only part of a multi-byte
+    /// character (the text arrives with a later token), or it is a
+    /// `special` token that decodes to nothing.
+    Pending,
+    /// Nothing will ever be shown for this token: no tokenizer is attached,
+    /// so there is no text to render it as.
+    Omitted,
+}
+
+/// Whether the process already warned about a lossy decode fallback.
+static WARNED_LOSSY_DECODE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Per-response, UTF-8-safe token-to-text decoding shared by every
+/// generation loop of the chat, extended-chat and legacy-completions
+/// endpoints (no id syntax ever reaches `content`).
+///
+/// The contract, deliberately:
+///
+/// * **A tokenizer is attached** — each token goes through the tokenizer's
+///   streaming decoder ([`TokenizerBridge::step_decode`]). If that decoder
+///   rejects a token (a desynchronised window, an id outside the
+///   vocabulary), the token is rendered **lossily** from its own raw
+///   vocabulary bytes ([`TokenizerBridge::piece`], invalid UTF-8 as
+///   `U+FFFD`), the decode window restarts, and a warning is logged once per
+///   process. Earlier revisions emitted the literal `"[<id>]"` here, which a
+///   client could not tell from model output.
+/// * **No tokenizer is attached** — nothing is shown for the token
+///   ([`DecodedPiece::Omitted`]): there is no text to render, and inventing
+///   one would put id syntax into `content`. The count is kept per response;
+///   the request handler logs the one warning such a request gets
+///   (`crate::server::warn_generating_without_tokenizer`). The token itself
+///   still counts toward `usage` and still carries its logprobs where
+///   requested.
+#[derive(Default)]
+pub(crate) struct PieceDecoder {
+    state: Option<crate::tokenizer_bridge::DecodeStreamState>,
+    omitted: usize,
+    lossy: usize,
+}
+
+impl std::fmt::Debug for PieceDecoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PieceDecoder")
+            .field("has_tokenizer", &self.state.is_some())
+            .field("omitted", &self.omitted)
+            .field("lossy", &self.lossy)
+            .finish()
     }
-    serde_json::to_string(&v).unwrap_or_default()
+}
+
+impl PieceDecoder {
+    /// A decoder for one response.
+    pub(crate) fn new(tokenizer: Option<&TokenizerBridge>) -> Self {
+        Self {
+            state: tokenizer.map(|t| t.new_decode_stream(true)),
+            omitted: 0,
+            lossy: 0,
+        }
+    }
+
+    /// Decode the next generated token, `id`.
+    pub(crate) fn next(&mut self, tokenizer: Option<&TokenizerBridge>, id: u32) -> DecodedPiece {
+        let (Some(tok), Some(state)) = (tokenizer, self.state.as_mut()) else {
+            self.omitted = self.omitted.saturating_add(1);
+            return DecodedPiece::Omitted;
+        };
+        match tok.step_decode(state, id) {
+            Ok(Some(text)) => DecodedPiece::Text(text),
+            Ok(None) => DecodedPiece::Pending,
+            Err(e) => {
+                self.lossy = self.lossy.saturating_add(1);
+                if !WARNED_LOSSY_DECODE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        error = %e,
+                        token_id = id,
+                        "streaming decode rejected a token; rendering it lossily from its raw \
+                         vocabulary bytes and restarting the decode window"
+                    );
+                }
+                state.reset();
+                DecodedPiece::Text(String::from_utf8_lossy(&tok.piece(id)).into_owned())
+            }
+        }
+    }
+
+    /// Tokens this response could not render because no tokenizer is
+    /// attached.
+    #[cfg(test)]
+    pub(crate) fn omitted(&self) -> usize {
+        self.omitted
+    }
+
+    /// Tokens this response rendered lossily after a decode error.
+    #[cfg(test)]
+    pub(crate) fn lossy(&self) -> usize {
+        self.lossy
+    }
+}
+
+impl Drop for PieceDecoder {
+    fn drop(&mut self) {
+        if self.omitted > 0 || self.lossy > 0 {
+            tracing::debug!(
+                omitted = self.omitted,
+                lossy = self.lossy,
+                "response finished with tokens that could not be rendered exactly"
+            );
+        }
+    }
 }
 
 /// One assistant-turn tool call in the shape this pipeline needs: a
@@ -170,19 +267,17 @@ pub(crate) struct RenderableMessage {
 /// and the extended endpoint's `ExtendedChatRequest`) into the
 /// backend-neutral shape [`render_chat_prompt`] needs.
 ///
-/// `reasoning_content` comes from `reasoning_contents`, not from `messages`
-/// itself: `ChatMessage` (`server.rs`, owned by ENGINE-SEAM this wave) has
-/// no such field to read from a replayed assistant turn, so the caller
-/// recovers it from the request's own raw JSON first
-/// ([`preprocess_message_content_and_reasoning`]) and passes it in here,
-/// indexed the same way `messages` is (`reasoning_contents[i]` for
-/// `messages[i]`; a short or absent side list — no tokenizer attached at
-/// all skips the whole pre-pass — just means every message past its end
-/// gets `None`, same as today). `tool_calls`' `arguments` is threaded
-/// through as the RAW string OpenAI's own wire format already gives it in
-/// (`FunctionCallResult::arguments: String`) — never re-parsed into a
-/// `serde_json::Value`, for the same key-order reason
-/// [`tool_calls_to_render_json`] documents.
+/// `reasoning_content` is read from the message's own typed
+/// [`crate::server::ChatMessage::reasoning_content`] field (a replayed
+/// assistant turn carries it), falling back to `reasoning_contents` — the
+/// same value, recovered from the request's raw JSON by
+/// [`preprocess_message_content_and_reasoning`] and indexed the same way
+/// `messages` is (`reasoning_contents[i]` for `messages[i]`; a short or
+/// absent side list just means every message past its end gets `None`).
+/// `tool_calls`' `arguments` is threaded through as the RAW string OpenAI's
+/// own wire format already gives it in (`FunctionCallResult::arguments:
+/// String`) — never re-parsed into a `serde_json::Value`, for the same
+/// key-order reason [`tool_calls_to_render_json`] documents.
 pub(crate) fn to_render_messages(
     messages: &[crate::server::ChatMessage],
     reasoning_contents: &[Option<String>],
@@ -193,7 +288,10 @@ pub(crate) fn to_render_messages(
         .map(|(i, m)| RenderableMessage {
             role: m.role.clone(),
             content: m.content.clone().unwrap_or_default(),
-            reasoning_content: reasoning_contents.get(i).cloned().flatten(),
+            reasoning_content: m
+                .reasoning_content
+                .clone()
+                .or_else(|| reasoning_contents.get(i).cloned().flatten()),
             tool_calls: m
                 .tool_calls
                 .as_ref()
@@ -214,9 +312,7 @@ pub(crate) fn to_render_messages(
 
 /// Pre-parse `raw_json` (a chat request body, generically, BEFORE it is
 /// deserialized into either endpoint's typed request struct) to recover
-/// two things `ChatMessage`'s `content: Option<String>` field (`server.rs`,
-/// unowned this wave) cannot represent on its own, closing the rest of
-/// `B11`/`SV-11` entirely in owned code:
+/// two things for the typed parse that follows (`SV-11`):
 ///
 /// 1. **Vision-shaped `content` arrays.** A client sending the OpenAI
 ///    multipart shape (`content: [{"type":"text",...}, {"type":"image_url",...}]`)
@@ -231,9 +327,11 @@ pub(crate) fn to_render_messages(
 ///    sees the plain string it already knows how to handle.
 /// 2. **Per-message `reasoning_content`.** A client replaying assistant
 ///    history from a reasoning-capable response includes this field on
-///    that turn; `ChatMessage` has no such field, so it is captured here
-///    into a side list indexed the same way `messages` is, for
-///    [`to_render_messages`] to merge back in.
+///    that turn; it is captured here into a side list indexed the same way
+///    `messages` is — the same value `ChatMessage::reasoning_content`
+///    deserializes into, which [`to_render_messages`] prefers — so a
+///    message type without the field (or a body the typed parse rewrites)
+///    still renders it.
 ///
 /// Returns `(rewritten_json_text, reasoning_contents)`. The rewritten text
 /// is what the caller then feeds to `serde_json::from_str::<ChatCompletionRequest>`
@@ -242,8 +340,8 @@ pub(crate) fn to_render_messages(
 /// [`ChatRequestExtras`] (`tools`, `chat_template_kwargs`, ...) from the
 /// ORIGINAL, un-rewritten bytes — `tools_raw_json`'s key-order guarantee
 /// depends on that text never round-tripping through `serde_json::Value`,
-/// which re-sorts object keys (`B4`'s own finding, unrelated to this
-/// rewrite's `messages`-only scope).
+/// which re-sorts object keys (unrelated to this rewrite's
+/// `messages`-only scope).
 ///
 /// A body with no `messages` array at all, or a non-array `messages`, is
 /// left completely untouched (`reasoning_contents` comes back empty) —
@@ -293,11 +391,11 @@ pub(crate) fn preprocess_message_content_and_reasoning(
 /// Build one assistant tool_calls array's JSON **text** from
 /// [`RenderableToolCall`]s, splicing each call's raw arguments text
 /// directly into the array rather than parsing it into a
-/// `serde_json::Value` and re-serializing (B1(d) / B4).
+/// `serde_json::Value` and re-serializing.
 ///
 /// Two independent reasons this must stay text-level, both measured:
 ///
-/// 1. **Key order (B4).** This workspace's `serde_json` (root `Cargo.toml`)
+/// 1. **Key order.** This workspace's `serde_json` (root `Cargo.toml`)
 ///    has neither `preserve_order` nor is a parse-then-reserialize round
 ///    trip order-preserving without it — `serde_json::Map` is a
 ///    `BTreeMap`, so parsing `arguments` into a `Value` and re-emitting it
@@ -311,7 +409,7 @@ pub(crate) fn preprocess_message_content_and_reasoning(
 ///    `{}`, the documented "no arguments" convention
 ///    [`crate::tool_calling::xml_tool_calls_to_openai`] itself produces)
 ///    reproduces it byte-for-byte.
-/// 2. **`arguments|items` needs a mapping (B1(d)).** The real template
+/// 2. **`arguments|items` needs a mapping.** The real template
 ///    iterates `tool_call.arguments|items` — `.items()` on a JSON STRING
 ///    raises `'str' object has no items()` in both Python jinja2 and this
 ///    crate's own engine (verified: `chat_templates.rs`'s embedded fixture
@@ -327,7 +425,7 @@ pub(crate) fn preprocess_message_content_and_reasoning(
 /// genuinely malformed history) is spliced as-is too: the WHOLE resulting
 /// `tool_calls` array text then fails to parse in
 /// [`RenderMessage::with_tool_calls_json`]'s consumer, which surfaces as an
-/// honest [`JinjaError::Runtime`] — an ERROR, never garbage (spec item 1)
+/// honest [`JinjaError::Runtime`] — an ERROR, never garbage (TOK-07/RT-09)
 /// — rather than this function guessing at a recovery.
 pub(crate) fn tool_calls_to_render_json(calls: &[RenderableToolCall]) -> String {
     let mut out = String::from("[");
@@ -417,8 +515,8 @@ pub(crate) fn neutralize_message_text(
     Ok(decoded)
 }
 
-/// Map a template render failure to an honest client-facing `400` (spec
-/// item 1: "an unsupported construct must ERROR") rather than a `500` —
+/// Map a template render failure to an honest client-facing `400`
+/// (TOK-07/RT-09: an unsupported construct must ERROR) rather than a `500` —
 /// every documented `raise_exception` (empty messages, an unsupported
 /// `reasoning_effort`, a system message not first, no user query found,
 /// ...) and every malformed-JSON runtime error (invalid `tools` /
@@ -546,7 +644,7 @@ pub(crate) fn render_chat_prompt(
 }
 
 /// Whether the rendered+encoded prompt ends inside an open `<think>` span
-/// (B3 / RT-10): the MOST RECENT think-marker id in `prompt_tokens` —
+/// (RT-10): the MOST RECENT think-marker id in `prompt_tokens` —
 /// scanning backward past any trailing non-marker ids (e.g. the newline
 /// token(s) after `enable_thinking: false`'s own `</think>\n\n`) — decides
 /// it, never just the prompt's own last id.
@@ -801,10 +899,12 @@ mod tests {
             true,
         )
         .expect("must render");
-        // The fallback template's tojson-free `<parameter=KEY>` shape
-        // preserves argument order directly in the rendered text.
-        let z_pos = text.find("<parameter=z>").expect("z parameter present");
-        let a_pos = text.find("<parameter=a>").expect("a parameter present");
+        // The fallback template renders an assistant call in the Qwen3 JSON
+        // form, `{"name": …, "arguments": …}`, with the arguments in the
+        // client's own key order.
+        assert!(text.contains("\"name\": \"f\""), "{text:?}");
+        let z_pos = text.find("\"z\"").expect("z argument present");
+        let a_pos = text.find("\"a\"").expect("a argument present");
         assert!(
             z_pos < a_pos,
             "z must render before a (original order): {text:?}"
@@ -956,7 +1056,7 @@ mod tests {
         );
     }
 
-    // ── B11/SV-11: reasoning_content + vision-content-array pre-pass ──────
+    // ── SV-11: reasoning_content + vision-content-array pre-pass ─────────
 
     #[test]
     fn preprocess_extracts_reasoning_content_by_index() {
@@ -1052,7 +1152,7 @@ mod tests {
     /// (`chat_templates.rs`'s own `g7_case_3_multi_turn_with_reasoning_content`
     /// pins that template's exact formatting; this pins that the HTTP-layer
     /// wiring actually delivers a client's `reasoning_content` to it at
-    /// all, which before this fix it never did — B11).
+    /// all).
     #[test]
     fn reasoning_content_survives_the_whole_pipeline_from_raw_body_to_rendered_prompt() {
         let tok = native_tokenizer_with_specials();
@@ -1086,5 +1186,362 @@ mod tests {
         )
         .expect("must render");
         assert_eq!(text, "user[]:hi;assistant[user greets]:Hello!;");
+    }
+
+    // ── The shared piece decoder ─────────────────────────────────────────
+
+    #[test]
+    fn piece_decoder_omits_every_token_without_a_tokenizer() {
+        let mut decoder = PieceDecoder::new(None);
+        for id in [0u32, 7, 151_644] {
+            assert_eq!(decoder.next(None, id), DecodedPiece::Omitted);
+        }
+        assert_eq!(decoder.omitted(), 3);
+        assert_eq!(decoder.lossy(), 0);
+    }
+
+    #[test]
+    fn piece_decoder_streams_complete_utf8_and_waits_for_partial_bytes() {
+        let tok = super::test_fixtures::byte_tokenizer();
+        let mut decoder = PieceDecoder::new(Some(&tok));
+        // "é" is two bytes: the first alone is not yet text.
+        let [first, second] = [0xC3u32, 0xA9];
+        assert_eq!(decoder.next(Some(&tok), first), DecodedPiece::Pending);
+        assert_eq!(
+            decoder.next(Some(&tok), second),
+            DecodedPiece::Text("é".to_string())
+        );
+        assert_eq!(
+            decoder.next(Some(&tok), u32::from(b'a')),
+            DecodedPiece::Text("a".to_string())
+        );
+        assert_eq!(decoder.omitted(), 0);
+    }
+
+    /// An id outside the vocabulary never becomes `"[<id>]"`: the decode
+    /// window either waits (the streaming decoder renders an unknown id as
+    /// `U+FFFD`, which it holds back as an incomplete sequence) or the
+    /// lossy fallback renders the raw piece — and no id digits appear.
+    #[test]
+    fn an_out_of_vocabulary_id_never_renders_as_id_syntax() {
+        let tok = super::test_fixtures::byte_tokenizer();
+        let mut decoder = PieceDecoder::new(Some(&tok));
+        let mut text = String::new();
+        for id in [999_999u32, u32::from(b'o'), u32::from(b'k')] {
+            if let DecodedPiece::Text(piece) = decoder.next(Some(&tok), id) {
+                text.push_str(&piece);
+            }
+        }
+        assert!(!text.contains("999999"), "{text:?}");
+        assert!(!text.contains('['), "{text:?}");
+        assert!(text.ends_with("ok"), "{text:?}");
+    }
+
+    // ── The fallback template's generation prompt vs `started_in_think` ──
+
+    fn fallback_prompt_ids(enable_thinking: Option<bool>) -> (String, Vec<u32>) {
+        let tok = super::test_fixtures::byte_tokenizer_with_markers();
+        let guard = SpecialTokenGuard::from_tokenizer(&tok);
+        let messages = vec![RenderableMessage {
+            role: "user".to_string(),
+            content: "What is 2+2?".to_string(),
+            ..Default::default()
+        }];
+        render_chat_prompt(
+            &tok,
+            &guard,
+            &messages,
+            &RenderOptions {
+                add_generation_prompt: true,
+                enable_thinking,
+                ..Default::default()
+            },
+            true,
+        )
+        .expect("the fallback renders")
+    }
+
+    /// `enable_thinking: false` under the fallback pre-closes an empty think
+    /// block, so the rendered prompt does NOT end inside a think span and
+    /// the answer starts in `content`.
+    #[test]
+    fn fallback_template_enable_thinking_false_does_not_start_in_think() {
+        use super::test_fixtures::{THINK_CLOSE, THINK_OPEN};
+        let (rendered, ids) = fallback_prompt_ids(Some(false));
+        assert!(
+            rendered.ends_with("<think>\n\n</think>\n\n"),
+            "{rendered:?}"
+        );
+        assert!(ids.contains(&THINK_OPEN) && ids.contains(&THINK_CLOSE));
+        assert!(!started_in_think(&ids, Some(THINK_OPEN), Some(THINK_CLOSE)));
+    }
+
+    /// Thinking on (or unset) opens no think block in the fallback's
+    /// generation prompt either: the legacy model opens its own.
+    #[test]
+    fn fallback_template_enable_thinking_unset_opens_no_think_block() {
+        use super::test_fixtures::{THINK_CLOSE, THINK_OPEN};
+        for enable_thinking in [None, Some(true)] {
+            let (rendered, ids) = fallback_prompt_ids(enable_thinking);
+            assert!(
+                rendered.ends_with("<|im_start|>assistant\n"),
+                "{rendered:?}"
+            );
+            assert!(!started_in_think(&ids, Some(THINK_OPEN), Some(THINK_CLOSE)));
+        }
+    }
+}
+
+/// Fixtures shared by the HTTP-level tests of the chat, extended-chat and
+/// legacy-completions endpoints: a byte-level tokenizer that can decode
+/// every id a small weightless engine can sample, the matching engine, and
+/// SSE/JSON body helpers.
+///
+/// Both fixture vocabularies end with a special `<|im_end|>` token, and
+/// [`weightless_engine`] makes that last id the engine's EOS, so a scripted
+/// generation ([`InferenceEngine::script_generation`]) stops on its own once
+/// its script is exhausted.
+#[cfg(test)]
+pub(crate) mod test_fixtures {
+    use crate::engine::InferenceEngine;
+    use crate::sampling::SamplingParams;
+    use crate::tokenizer_bridge::TokenizerBridge;
+
+    /// Ids of the added tokens [`byte_tokenizer_with_markers`] defines, right
+    /// after the 256 byte tokens.
+    pub(crate) const THINK_OPEN: u32 = 256;
+    /// `</think>`.
+    pub(crate) const THINK_CLOSE: u32 = 257;
+    /// `<tool_call>`.
+    pub(crate) const TOOL_CALL_OPEN: u32 = 258;
+    /// `</tool_call>`.
+    pub(crate) const TOOL_CALL_CLOSE: u32 = 259;
+    /// Vocabulary size of [`byte_tokenizer`] — the 256 byte tokens plus
+    /// `<|im_end|>` — and of the engine that pairs with it.
+    pub(crate) const BYTE_VOCAB: usize = 257;
+    /// Vocabulary size of [`byte_tokenizer_with_markers`] — the 256 byte
+    /// tokens, the four markers and `<|im_end|>` — and of the engine that
+    /// pairs with it.
+    pub(crate) const MARKER_VOCAB: usize = 261;
+
+    /// A HuggingFace-format byte-level BPE `tokenizer.json` whose vocabulary
+    /// is exactly the 256 GPT-2 byte symbols (id = byte value) followed by
+    /// `added` (`(content, special)`), so every id below `256 + added.len()`
+    /// decodes, and any text encodes to ids inside that range.
+    pub(crate) fn byte_tokenizer_json(added: &[(&str, bool)]) -> String {
+        let mut vocab = serde_json::Map::new();
+        for byte in 0..=255u8 {
+            vocab.insert(
+                oxibonsai_tokenizer::byte_to_unicode(byte).to_string(),
+                serde_json::Value::from(u32::from(byte)),
+            );
+        }
+        let added_tokens: Vec<serde_json::Value> = added
+            .iter()
+            .enumerate()
+            .map(|(i, (content, special))| {
+                serde_json::json!({
+                    "id": 256 + i,
+                    "content": content,
+                    "special": special,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "model": { "type": "BPE", "vocab": vocab, "merges": [] },
+            "added_tokens": added_tokens,
+            "pre_tokenizer": { "type": "ByteLevel" },
+            "decoder": { "type": "ByteLevel" },
+        })
+        .to_string()
+    }
+
+    /// [`byte_tokenizer_json`] with only `<|im_end|>` added (id 256, the
+    /// EOS of a [`weightless_engine`] of [`BYTE_VOCAB`]).
+    pub(crate) fn byte_tokenizer() -> TokenizerBridge {
+        TokenizerBridge::native_from_json_str(&byte_tokenizer_json(&[("<|im_end|>", true)]))
+            .expect("the byte-level fixture tokenizer loads")
+    }
+
+    /// [`byte_tokenizer_json`] plus `<think>`, `</think>`, `<tool_call>`,
+    /// `</tool_call>` as ordinary (non-`special`) added tokens at
+    /// [`THINK_OPEN`]..=[`TOOL_CALL_CLOSE`] — the shape of the shipped
+    /// Qwen3 / Bonsai 2 vocabularies — then `<|im_end|>` (id 260, the EOS of
+    /// a [`weightless_engine`] of [`MARKER_VOCAB`]).
+    pub(crate) fn byte_tokenizer_with_markers() -> TokenizerBridge {
+        let json = byte_tokenizer_json(&[
+            ("<think>", false),
+            ("</think>", false),
+            ("<tool_call>", false),
+            ("</tool_call>", false),
+            ("<|im_end|>", true),
+        ]);
+        let tok = TokenizerBridge::native_from_json_str(&json)
+            .expect("the byte-level fixture tokenizer loads");
+        assert_eq!(tok.think_open_id(), Some(THINK_OPEN));
+        assert_eq!(tok.think_close_id(), Some(THINK_CLOSE));
+        assert_eq!(tok.tool_call_open_id(), Some(TOOL_CALL_OPEN));
+        assert_eq!(tok.tool_call_close_id(), Some(TOOL_CALL_CLOSE));
+        tok
+    }
+
+    /// Context length of a [`weightless_engine`]: the byte-level fixture
+    /// vocabularies spend one token per byte, so a prompt that renders a
+    /// `tools` block (the fallback template's instructions and the schema)
+    /// runs to several hundred tokens.
+    pub(crate) const FIXTURE_CONTEXT: usize = 4096;
+
+    /// A weightless `tiny_test()` engine with a `vocab`-wide LM head whose
+    /// EOS is the last id (`<|im_end|>` in both fixture vocabularies) and a
+    /// [`FIXTURE_CONTEXT`]-token context: every logit is equal, so a sampled
+    /// draw is decided by the seed alone (and a greedy one always picks id
+    /// 0).
+    pub(crate) fn weightless_engine(
+        vocab: usize,
+        params: SamplingParams,
+        seed: u64,
+    ) -> InferenceEngine<'static> {
+        let config = oxibonsai_core::config::Qwen3Config {
+            vocab_size: vocab,
+            max_context_length: FIXTURE_CONTEXT,
+            ..oxibonsai_core::config::Qwen3Config::tiny_test()
+        };
+        let mut engine = InferenceEngine::new(config, params, seed);
+        let eos = u32::try_from(vocab.saturating_sub(1)).expect("a fixture vocabulary fits u32");
+        engine.set_eos_token_ids([eos]);
+        engine
+    }
+
+    /// A [`weightless_engine`] over [`byte_tokenizer`]'s vocabulary whose
+    /// every generation emits exactly the bytes of `text`, then stops.
+    pub(crate) fn scripted_byte_engine(text: &str) -> InferenceEngine<'static> {
+        let mut engine = weightless_engine(BYTE_VOCAB, SamplingParams::default(), 42);
+        engine.script_generation(byte_ids(text));
+        engine
+    }
+
+    /// [`scripted_byte_engine`] whose first generation, once its first
+    /// token has reached the receiver, waits to be cancelled before going on
+    /// (`InferenceEngine::script_generation_held`): a stop sequence matching
+    /// that first token must cancel the generation, and the test observes
+    /// it deterministically instead of racing a model that finishes every
+    /// token before the receiver has read one.
+    pub(crate) fn scripted_byte_engine_held(text: &str) -> InferenceEngine<'static> {
+        let mut engine = weightless_engine(BYTE_VOCAB, SamplingParams::default(), 42);
+        engine.script_generation_held(byte_ids(text), 1);
+        engine
+    }
+
+    /// A [`weightless_engine`] over [`byte_tokenizer`]'s vocabulary (ambient
+    /// `temperature` 0.9, seeded with `ambient_seed`) whose every step is an
+    /// equal choice among the 26 lowercase ASCII letters: each token is
+    /// visible text chosen by the sampler's PRNG alone, and generation runs
+    /// to `max_tokens` — the fixture for "does the seed drive the stream".
+    pub(crate) fn uniform_letters_engine(ambient_seed: u64) -> InferenceEngine<'static> {
+        let params = SamplingParams {
+            temperature: 0.9,
+            ..SamplingParams::default()
+        };
+        let mut engine = weightless_engine(BYTE_VOCAB, params, ambient_seed);
+        engine.script_uniform_choice(byte_ids("abcdefghijklmnopqrstuvwxyz"));
+        engine
+    }
+
+    /// The byte ids of `text` (the fixture tokenizers map byte `b` to id
+    /// `b`), for scripting ordinary-text output.
+    pub(crate) fn byte_ids(text: &str) -> Vec<u32> {
+        text.bytes().map(u32::from).collect()
+    }
+
+    /// The prompt start token of the tokenizer-less test routers below:
+    /// Qwen3's `<|im_start|>` id. Every such router serves a
+    /// `Qwen3Config::tiny_test()`-vocabulary engine, and a tokenizer-less
+    /// server runs a text prompt as its configured start token
+    /// (`RouterOptions::with_prompt_start_token`).
+    pub(crate) const QWEN3_IM_START: u32 = 151_644;
+
+    /// A tokenizer-less router over `engine` whose text prompts run as
+    /// [`QWEN3_IM_START`].
+    pub(crate) fn tokenizerless_router(engine: InferenceEngine<'static>) -> axum::Router {
+        tokenizerless_router_with_metrics(
+            engine,
+            std::sync::Arc::new(crate::metrics::InferenceMetrics::new()),
+        )
+    }
+
+    /// [`tokenizerless_router`] recording into `metrics`.
+    pub(crate) fn tokenizerless_router_with_metrics(
+        engine: InferenceEngine<'static>,
+        metrics: std::sync::Arc<crate::metrics::InferenceMetrics>,
+    ) -> axum::Router {
+        tokenizerless_router_with_pool(crate::engine_pool::EnginePool::new(vec![engine]), metrics)
+    }
+
+    /// [`tokenizerless_router`] over a pre-built pool.
+    pub(crate) fn tokenizerless_router_with_pool(
+        pool: std::sync::Arc<crate::engine_pool::EnginePool>,
+        metrics: std::sync::Arc<crate::metrics::InferenceMetrics>,
+    ) -> axum::Router {
+        crate::server::create_router_full(
+            pool,
+            None,
+            metrics,
+            crate::server::RouterOptions::default().with_prompt_start_token(QWEN3_IM_START),
+        )
+    }
+
+    /// The `<id>` token strings a tokenizer-less server reports in
+    /// `logprobs` for `ids`.
+    pub(crate) fn id_token_strings(ids: &[u32]) -> Vec<String> {
+        ids.iter().map(|id| format!("<{id}>")).collect()
+    }
+
+    /// Every JSON payload of an SSE body, in order (`[DONE]` excluded).
+    pub(crate) fn sse_payloads(body: &str) -> Vec<serde_json::Value> {
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .filter_map(|data| serde_json::from_str(data).ok())
+            .collect()
+    }
+
+    /// The `choices[0].delta.<field>` strings of a chat SSE body, in order.
+    pub(crate) fn delta_texts(body: &str, field: &str) -> Vec<String> {
+        sse_payloads(body)
+            .iter()
+            .filter_map(|chunk| {
+                chunk["choices"][0]["delta"][field]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    /// POST `body` to `path` on `app`, returning the status, the response
+    /// headers and the body text.
+    pub(crate) async fn post(
+        app: axum::Router,
+        path: &str,
+        body: serde_json::Value,
+    ) -> (axum::http::StatusCode, axum::http::HeaderMap, String) {
+        let req = axum::http::Request::post(path)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&body).expect("serialize the request"),
+            ))
+            .expect("build the request");
+        let resp = tower::ServiceExt::oneshot(app, req)
+            .await
+            .expect("response");
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        (
+            status,
+            headers,
+            String::from_utf8_lossy(&bytes).into_owned(),
+        )
     }
 }

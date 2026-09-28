@@ -505,8 +505,10 @@ pub enum HybridEmbedding<'a> {
     Ternary(&'a [BlockTQ2_0_g128]),
     /// 1-bit `Q1_0_g128` (gen-1 `Bonsai-27B-Q1_0`).
     OneBit(&'a [BlockQ1_0G128]),
-    /// An unquantized table, already widened to `f32`.
-    Dense(Vec<f32>),
+    /// An unquantized table, already widened to `f32`. Shared, so a second
+    /// handle on the table (a Metal runner's) is a reference count, not a
+    /// multi-GB copy.
+    Dense(Arc<[f32]>),
 }
 
 impl HybridEmbedding<'_> {
@@ -991,7 +993,7 @@ fn widen_dense(
     data: &[u8],
     resolved: GgufTensorType,
     n: usize,
-) -> ModelResult<Vec<f32>> {
+) -> ModelResult<Arc<[f32]>> {
     let width = match resolved {
         GgufTensorType::F32 => 4usize,
         GgufTensorType::F16 | GgufTensorType::BF16 => 2,
@@ -1015,9 +1017,10 @@ fn widen_dense(
             expected: vec![needed],
             actual: vec![data.len()],
         })?;
-    let mut out = Vec::with_capacity(n);
-    for chunk in bytes.chunks_exact(width) {
-        let value = match (resolved, chunk) {
+    // Collected straight into the shared slice the table is held in.
+    Ok(bytes
+        .chunks_exact(width)
+        .map(|chunk| match (resolved, chunk) {
             (GgufTensorType::F32, [a, b, c, d]) => f32::from_le_bytes([*a, *b, *c, *d]),
             (GgufTensorType::F16, [a, b]) => {
                 half::f16::from_bits(u16::from_le_bytes([*a, *b])).to_f32()
@@ -1026,10 +1029,8 @@ fn widen_dense(
             // Unreachable: `chunks_exact(width)` yields exactly `width`
             // bytes and `width` is 4 for F32, 2 otherwise.
             _ => 0.0,
-        };
-        out.push(value);
-    }
-    Ok(out)
+        })
+        .collect())
 }
 
 /// Bind the LM head, refusing a tied head (design §3.5).

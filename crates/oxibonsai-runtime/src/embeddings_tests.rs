@@ -7,8 +7,8 @@
 //! workspace 2000-line ceiling — the same split `api_extensions.rs` /
 //! `api_extensions_tests.rs` and `engine.rs` / `engine_tests.rs` already use.
 //!
-//! Every test here is byte-for-byte the one that used to live inline in
-//! `embeddings.rs`; the move added no test and removed none.
+//! Later sections cover the single-tokenization pass and the read-only
+//! `EmbeddingAppState` accessors.
 //!
 //! Distinct from the crate's external integration files
 //! `tests/embeddings_tests.rs` and `tests/embeddings_model_backed.rs`, which
@@ -951,7 +951,7 @@ async fn default_router_is_unaffected_by_the_require_model_backend_gate() {
     assert_eq!(status, StatusCode::OK);
 }
 
-// ── EMBED-WIRE item 3: text over the token ceiling refuses ────────────────
+// ── text over the token ceiling refuses ───────────────────────────────────
 
 /// A deterministic double implementing both [`Embedder`] and
 /// [`EmbeddingTokenCounter`], so the `context_length_exceeded` guard can be
@@ -989,7 +989,7 @@ impl crate::embed_engine::EmbeddingTokenCounter for CountingEmbedder {
 /// A registry with `CountingEmbedder` wired as both the model backend
 /// ([`EmbedderRegistry::with_model_embedder`]) and the token counter
 /// ([`EmbedderRegistry::with_token_counter`]) — pairing them is what keeps
-/// [`EmbeddingAppState::from_registry`]'s debug_assert from firing (item 4).
+/// [`EmbeddingAppState::from_registry`]'s debug_assert from firing.
 fn counting_registry(max_tokens: usize) -> EmbedderRegistry {
     let double = Arc::new(CountingEmbedder { dim: 4, max_tokens });
     EmbedderRegistry::new(4)
@@ -1042,7 +1042,7 @@ async fn only_the_offending_batch_item_is_named_in_a_multi_input_request() {
     );
 }
 
-// ── EMBED-WIRE item 4: builder misuse guard ────────────────────────────────
+// ── builder misuse guard ───────────────────────────────────────────────────
 
 #[test]
 #[cfg(debug_assertions)]
@@ -1084,7 +1084,7 @@ fn with_token_counter_paired_with_a_model_embedder_does_not_panic() {
 
 #[test]
 fn embedding_dim_agrees_with_the_vectors_the_with_model_embedder_path_returns() {
-    // Spec item 4's other half: once a model backend IS installed (even the
+    // The builder guard's other half: once a model backend IS installed (even the
     // generic `with_model_embedder` path, not just `with_model`),
     // `embedding_dim()` must equal the length of the vectors that path
     // actually returns.
@@ -1098,4 +1098,292 @@ fn embedding_dim_agrees_with_the_vectors_the_with_model_embedder_path_returns() 
             "item {i}: embedding_dim() must agree with the vectors actually returned"
         );
     }
+}
+
+// ── one tokenization per text per request ─────────────────────────────────
+
+/// A backend implementing all three token-aware traits that counts every
+/// tokenization and every embedding call, so a test can prove how often a
+/// request tokenized each text. `token_ids` hands out one id per byte (when
+/// `hands_out_ids`), `count_tokens` the same count, and both embedding paths
+/// map an input of length `n` to the same unit vector — so the id path and
+/// the text path are interchangeable, which is the contract
+/// [`EmbedderRegistry::with_token_aware_model`] requires.
+struct TokenizationProbe {
+    max_tokens: usize,
+    hands_out_ids: bool,
+    token_id_calls: std::sync::atomic::AtomicUsize,
+    count_calls: std::sync::atomic::AtomicUsize,
+    text_embeds: std::sync::atomic::AtomicUsize,
+    id_batch_calls: std::sync::atomic::AtomicUsize,
+}
+
+impl TokenizationProbe {
+    fn new(max_tokens: usize, hands_out_ids: bool) -> Arc<Self> {
+        Arc::new(Self {
+            max_tokens,
+            hands_out_ids,
+            token_id_calls: Default::default(),
+            count_calls: Default::default(),
+            text_embeds: Default::default(),
+            id_batch_calls: Default::default(),
+        })
+    }
+
+    /// The unit vector both embedding paths return for an input of `len`
+    /// tokens (bytes).
+    fn vector_for_len(len: usize) -> Vec<f32> {
+        let mut v = vec![0.0f32; 4];
+        v[len % 4] = 1.0;
+        v
+    }
+
+    fn calls(counter: &std::sync::atomic::AtomicUsize) -> usize {
+        counter.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn bump(counter: &std::sync::atomic::AtomicUsize) {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Embedder for TokenizationProbe {
+    fn embed(&self, text: &str) -> Result<Vec<f32>, oxibonsai_rag::error::RagError> {
+        Self::bump(&self.text_embeds);
+        Ok(Self::vector_for_len(text.len()))
+    }
+
+    fn embedding_dim(&self) -> usize {
+        4
+    }
+}
+
+impl EmbeddingTokenCounter for TokenizationProbe {
+    fn count_tokens(&self, text: &str) -> Option<usize> {
+        Self::bump(&self.count_calls);
+        Some(text.len())
+    }
+
+    fn max_input_tokens(&self) -> Option<usize> {
+        Some(self.max_tokens)
+    }
+
+    fn token_ids(&self, text: &str) -> Option<Vec<u32>> {
+        Self::bump(&self.token_id_calls);
+        self.hands_out_ids
+            .then(|| text.bytes().map(u32::from).collect())
+    }
+}
+
+impl TokenSequenceEmbedder for TokenizationProbe {
+    fn embed_token_ids(&self, tokens: &[u32]) -> Result<Vec<f32>, oxibonsai_rag::error::RagError> {
+        Ok(Self::vector_for_len(tokens.len()))
+    }
+
+    fn embed_token_batches(
+        &self,
+        batches: &[Vec<u32>],
+    ) -> Vec<Result<Vec<f32>, oxibonsai_rag::error::RagError>> {
+        Self::bump(&self.id_batch_calls);
+        batches
+            .iter()
+            .map(|ids| self.embed_token_ids(ids))
+            .collect()
+    }
+}
+
+fn probe_router(registry: EmbedderRegistry) -> Router {
+    create_embeddings_router_from_state(EmbeddingAppState::from_registry(registry))
+}
+
+fn response_vector(json: &serde_json::Value, index: usize) -> Vec<f32> {
+    json["data"][index]["embedding"]
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .map(|v| v.as_f64().unwrap_or(f64::NAN) as f32)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn a_token_aware_model_tokenizes_each_text_exactly_once_per_request() {
+    let probe = TokenizationProbe::new(100, true);
+    let app = probe_router(EmbedderRegistry::new(4).with_token_aware_model(Arc::clone(&probe)));
+    let texts = ["ab", "cde", "f"];
+    let (status, json) = post(app, serde_json::json!({ "input": texts })).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(
+        TokenizationProbe::calls(&probe.token_id_calls),
+        texts.len(),
+        "each text must be tokenized exactly once"
+    );
+    assert_eq!(
+        TokenizationProbe::calls(&probe.count_calls),
+        0,
+        "the length guard and the usage block must reuse the ids, not count again"
+    );
+    assert_eq!(
+        TokenizationProbe::calls(&probe.text_embeds),
+        0,
+        "the ids must be embedded; the text must not be tokenized a third time"
+    );
+    assert_eq!(TokenizationProbe::calls(&probe.id_batch_calls), 1);
+    assert_eq!(json["usage"]["prompt_tokens"].as_u64(), Some(6), "{json}");
+    for (index, text) in texts.iter().enumerate() {
+        assert_eq!(
+            response_vector(&json, index),
+            TokenizationProbe::vector_for_len(text.len()),
+            "input[{index}] must get the vector the text path would have computed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_token_aware_model_refuses_an_over_long_text_from_the_same_single_pass() {
+    let probe = TokenizationProbe::new(3, true);
+    let app = probe_router(EmbedderRegistry::new(4).with_token_aware_model(Arc::clone(&probe)));
+    let (status, json) = post(app, serde_json::json!({ "input": ["ab", "abcdef"] })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+    assert_eq!(
+        json["error"]["code"].as_str(),
+        Some("context_length_exceeded"),
+        "{json}"
+    );
+    assert_eq!(json["error"]["n_tokens"].as_u64(), Some(6), "{json}");
+    assert_eq!(TokenizationProbe::calls(&probe.token_id_calls), 2);
+    assert_eq!(TokenizationProbe::calls(&probe.count_calls), 0);
+    assert_eq!(
+        TokenizationProbe::calls(&probe.text_embeds)
+            + TokenizationProbe::calls(&probe.id_batch_calls),
+        0,
+        "a refused request must do no embedding work"
+    );
+}
+
+/// A counter that is not wired to the embedder by `with_token_aware_model`
+/// cannot have its ids reused, but its count is still taken once per text
+/// and shared by the guard and the usage block (it used to be taken twice).
+#[tokio::test]
+async fn a_counter_that_is_not_the_embedder_is_consulted_once_per_text() {
+    let probe = TokenizationProbe::new(100, true);
+    let registry = EmbedderRegistry::new(4)
+        .with_model_embedder(Arc::clone(&probe) as Arc<dyn Embedder>)
+        .with_token_counter(Arc::clone(&probe) as Arc<dyn EmbeddingTokenCounter>);
+    let (status, json) = post(
+        probe_router(registry),
+        serde_json::json!({ "input": ["ab", "cde"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(TokenizationProbe::calls(&probe.count_calls), 2);
+    assert_eq!(TokenizationProbe::calls(&probe.token_id_calls), 0);
+    assert_eq!(TokenizationProbe::calls(&probe.text_embeds), 2);
+    assert_eq!(TokenizationProbe::calls(&probe.id_batch_calls), 0);
+    assert_eq!(json["usage"]["prompt_tokens"].as_u64(), Some(5), "{json}");
+}
+
+/// A backend that declines to hand out ids is counted once and embedded as
+/// text — `with_token_aware_model` never embeds an input it has no ids for.
+#[tokio::test]
+async fn a_token_aware_model_without_ids_falls_back_to_one_count_and_the_text_path() {
+    let probe = TokenizationProbe::new(100, false);
+    let app = probe_router(EmbedderRegistry::new(4).with_token_aware_model(Arc::clone(&probe)));
+    let (status, json) = post(app, serde_json::json!({ "input": ["ab", "cde"] })).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(TokenizationProbe::calls(&probe.token_id_calls), 2);
+    assert_eq!(TokenizationProbe::calls(&probe.count_calls), 2);
+    assert_eq!(TokenizationProbe::calls(&probe.text_embeds), 2);
+    assert_eq!(TokenizationProbe::calls(&probe.id_batch_calls), 0);
+    assert_eq!(json["usage"]["prompt_tokens"].as_u64(), Some(5), "{json}");
+    assert_eq!(
+        response_vector(&json, 1),
+        TokenizationProbe::vector_for_len(3)
+    );
+}
+
+/// Replacing any one of the three pieces `with_token_aware_model` wired
+/// together breaks the "these ids are the embedder's ids" guarantee, so it
+/// must stop the registry from reusing ids.
+#[tokio::test]
+async fn replacing_any_token_aware_piece_stops_reusing_ids() {
+    let fresh =
+        || EmbedderRegistry::new(4).with_token_aware_model(TokenizationProbe::new(100, true));
+    assert!(fresh().reuse_text_tokens);
+    assert!(
+        !fresh()
+            .with_token_counter(TokenizationProbe::new(100, true))
+            .reuse_text_tokens
+    );
+    assert!(
+        !fresh()
+            .with_token_embedder(TokenizationProbe::new(100, true))
+            .reuse_text_tokens
+    );
+    assert!(
+        !fresh()
+            .with_model_embedder(TokenizationProbe::new(100, true))
+            .reuse_text_tokens
+    );
+
+    // Behaviourally: after a new model embedder replaces the token-aware
+    // one, the text is embedded by the NEW model, never from the old ids.
+    let original = TokenizationProbe::new(100, true);
+    let replacement = TokenizationProbe::new(100, true);
+    let registry = EmbedderRegistry::new(4)
+        .with_token_aware_model(Arc::clone(&original))
+        .with_model_embedder(Arc::clone(&replacement) as Arc<dyn Embedder>);
+    let (status, json) = post(
+        probe_router(registry),
+        serde_json::json!({ "input": ["ab", "cde"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(TokenizationProbe::calls(&replacement.text_embeds), 2);
+    assert_eq!(TokenizationProbe::calls(&original.id_batch_calls), 0);
+    assert_eq!(TokenizationProbe::calls(&original.token_id_calls), 0);
+    assert_eq!(
+        TokenizationProbe::calls(&original.count_calls),
+        2,
+        "the original counter still answers the guard and usage, once per text"
+    );
+}
+
+#[test]
+fn count_prompt_tokens_matches_the_single_pass_on_every_path() {
+    let texts = vec!["ab".to_string(), "cde fg".to_string(), String::new()];
+    // Token-aware: ids lengths, at least one per input.
+    let aware = EmbedderRegistry::new(4).with_token_aware_model(TokenizationProbe::new(100, true));
+    assert_eq!(aware.count_prompt_tokens(&texts), 2 + 6 + 1);
+    // Plain counter.
+    let counted = EmbedderRegistry::new(4)
+        .with_model_embedder(TokenizationProbe::new(100, true))
+        .with_token_counter(TokenizationProbe::new(100, true));
+    assert_eq!(counted.count_prompt_tokens(&texts), 2 + 6 + 1);
+    // No counter: the whitespace word count, at least one per input.
+    let uncounted = EmbedderRegistry::new(4);
+    assert_eq!(uncounted.count_prompt_tokens(&texts), 1 + 2 + 1);
+}
+
+// ── read-only EmbeddingAppState ───────────────────────────────────────────
+
+#[test]
+fn embedding_app_state_exposes_its_registry_and_metrics_read_only() {
+    let bare = EmbeddingAppState::new(8);
+    assert_eq!(bare.registry().backend_name(), "identity");
+    assert_eq!(bare.registry().embedding_dim(), 8);
+    assert!(bare.metrics().is_none());
+
+    let metrics = Arc::new(InferenceMetrics::new());
+    let wired = EmbeddingAppState::from_registry(
+        EmbedderRegistry::new(4).with_token_aware_model(TokenizationProbe::new(100, true)),
+    )
+    .with_metrics(Arc::clone(&metrics));
+    assert_eq!(wired.registry().backend_name(), "model");
+    assert!(
+        wired.metrics().is_some_and(|m| Arc::ptr_eq(m, &metrics)),
+        "the accessor must hand back the shared metrics, not a copy"
+    );
 }

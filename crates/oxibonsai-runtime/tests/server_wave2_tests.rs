@@ -1,4 +1,4 @@
-//! Wave-2 regression tests for the OpenAI-compatible surface integration:
+//! Regression tests for the OpenAI-compatible surface integration:
 //!
 //! * `deferred-features-03` — the base `/v1/chat/completions` endpoint accepts
 //!   (and no longer silently ignores) `frequency_penalty` / `presence_penalty`
@@ -27,13 +27,30 @@ use tower::ServiceExt;
 use oxibonsai_core::config::Qwen3Config;
 use oxibonsai_runtime::engine::InferenceEngine;
 use oxibonsai_runtime::sampling::SamplingParams;
-use oxibonsai_runtime::server::create_router;
+/// Qwen3's `<|im_start|>` id: the tokenizer-less routers of this suite serve
+/// a `Qwen3Config::tiny_test()` engine (the Qwen3 vocabulary size) and run a
+/// text prompt as this single token.
+const QWEN3_IM_START: u32 = 151_644;
+
+/// A tokenizer-less router over `engine`. Without a tokenizer a server needs
+/// a configured prompt start token to accept a text prompt at all (it
+/// answers `400 tokenizer_required` otherwise), and the answer's text is
+/// empty — nothing to render it with — while `usage` still counts every
+/// generated token.
+fn tokenizerless_router(engine: InferenceEngine<'static>) -> axum::Router {
+    oxibonsai_runtime::server::create_router_full(
+        oxibonsai_runtime::engine_pool::EnginePool::new(vec![engine]),
+        None,
+        std::sync::Arc::new(oxibonsai_runtime::metrics::InferenceMetrics::new()),
+        oxibonsai_runtime::server::RouterOptions::default().with_prompt_start_token(QWEN3_IM_START),
+    )
+}
 
 fn test_router() -> axum::Router {
     let config = Qwen3Config::tiny_test();
     let params = SamplingParams::default();
     let engine = InferenceEngine::new(config, params, 42);
-    create_router(engine, None)
+    tokenizerless_router(engine)
 }
 
 async fn post(
@@ -204,8 +221,11 @@ async fn base_finish_reason_matches_token_count() {
 
 // ── serve-api-03: tools no longer silently ignored on the base endpoint ────────
 
+/// `stream: true` with `tools` streams (each completed call would arrive as
+/// one `tool_calls` delta): the request is accepted with an SSE body, which
+/// does not parse as one JSON document.
 #[tokio::test]
-async fn base_stream_plus_tools_is_rejected() {
+async fn base_stream_plus_tools_streams() {
     let (status, json) = post(
         test_router(),
         "/v1/chat/completions",
@@ -220,8 +240,35 @@ async fn base_stream_plus_tools_is_rejected() {
         }),
     )
     .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(
+        json,
+        serde_json::Value::Null,
+        "an SSE body, not a JSON error"
+    );
+}
+
+/// `stream: true` with `tools` and `n > 1` is refused naming `n` (the base
+/// endpoint generates one choice).
+#[tokio::test]
+async fn base_stream_plus_tools_and_n_is_rejected_naming_n() {
+    let (status, json) = post(
+        test_router(),
+        "/v1/chat/completions",
+        serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 2,
+            "stream": true,
+            "n": 2,
+            "tools": [{
+                "type": "function",
+                "function": {"name": "f", "parameters": {"type": "object"}}
+            }],
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(json["error"]["param"], "stream");
+    assert_eq!(json["error"]["param"], "n");
 }
 
 #[tokio::test]
@@ -246,7 +293,7 @@ async fn base_non_stream_tools_are_processed() {
     // With tools supplied (non-streaming) the request is honored rather than
     // rejected; the response is a well-formed chat completion. (Whether an
     // actual tool_call is produced depends on the generated text, covered by
-    // the `parse_base_tool_calls` unit tests.)
+    // the `base_tool_calls_*` and `stream_tools_*` unit tests.)
     let (status, json) = post(
         test_router(),
         "/v1/chat/completions",
@@ -289,7 +336,7 @@ async fn error_envelope_is_uniform_across_routes() {
             serde_json::json!({"messages": [{"role": "user", "content": "x"}], "max_tokens": 0}),
             StatusCode::BAD_REQUEST,
         ),
-        // D-1 (wave 2.5, gate-fix triage wave 3): the base server has no
+        // D-1: the base server has no
         // model-backed embedder installed
         // (`create_embeddings_router_requiring_model`), so an
         // otherwise-invalid empty-batch request never reaches the
