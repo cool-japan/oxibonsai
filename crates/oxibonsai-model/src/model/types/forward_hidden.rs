@@ -98,9 +98,10 @@ impl BonsaiModel<'_> {
     ///   a zero `hidden_size`.
     /// * [`ModelError::SequenceTooLong`] — the prompt is longer than the
     ///   model's effective context (sec-11).
-    /// * Anything the embedding lookup, the blocks, or `output_norm` return
-    ///   (e.g. [`ModelError::ShapeMismatch`] for a token id past the
-    ///   vocabulary).
+    /// * [`ModelError::MissingTensor`] — a token id past the vocabulary: the
+    ///   embedding table has no row for it (the error the row lookup
+    ///   returns, naming the id and the vocabulary size).
+    /// * Anything the blocks or `output_norm` return.
     pub fn forward_hidden(
         &mut self,
         tokens: &[u32],
@@ -350,6 +351,27 @@ mod tests {
             matches!(err, ModelError::SequenceTooLong { .. }),
             "over-long prompt must be SequenceTooLong, got {err:?}"
         );
+    }
+
+    /// Pins the documented `# Errors` entry: a token past the vocabulary is
+    /// `MissingTensor` (the embedding has no such row), not a shape error —
+    /// and the pass still leaves no KV history behind.
+    #[test]
+    fn forward_hidden_refuses_a_token_past_the_vocabulary_as_missing_tensor() {
+        let config = Qwen3Config::tiny_test();
+        let vocab = u32::try_from(config.vocab_size).expect("tiny vocab fits u32");
+        let mut model = BonsaiModel::new(config);
+        let err = model
+            .forward_hidden(&[1, vocab], &reference_kernel())
+            .expect_err("a token past the vocabulary must be refused");
+        match &err {
+            ModelError::MissingTensor { name } => assert!(
+                name.contains(&format!("token_id {vocab}")),
+                "the error must name the offending id: {name}"
+            ),
+            other => panic!("a token past the vocabulary must be MissingTensor, got {other:?}"),
+        }
+        assert_eq!(model.kv_cache().seq_len(), 0);
     }
 
     #[test]

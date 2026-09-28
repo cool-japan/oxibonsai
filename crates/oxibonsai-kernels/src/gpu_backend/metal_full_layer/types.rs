@@ -182,7 +182,23 @@ pub struct FullForwardLayerParams<'a> {
 ///
 /// Mirrors [`FullForwardLayerParams`] but carries AoS-packed TQ2_0_g128 block
 /// bytes (34 bytes/block) for every GEMV weight.
+///
+/// # Weight-cache identity (`MET-02`)
+///
+/// Every `*_handle` below is a **slot**, and every lookup the ternary entry
+/// points make — the four RMSNorm weights, the four projections and, through
+/// the layers' shared epoch, the final-norm / LM-head tail — is keyed
+/// `WeightKey::new(model_epoch, kind, slot)`. Before `MET-02` the kernels
+/// hard-coded [`WeightKey::legacy`] for all of them, so a caller that owned a
+/// real epoch could upload under it and then simply miss its own buffers on
+/// the next lookup. All layers passed to one forward must carry the **same**
+/// epoch (one forward binds one model's weights); the entry points reject a
+/// mixed slice rather than guess.
 pub struct FullForwardLayerParamsTernary<'a> {
+    /// Weight-cache epoch this layer's buffers are keyed under — see
+    /// [`next_model_epoch`] / [`LEGACY_MODEL_EPOCH`] and
+    /// `MetalGraph::release_model`.
+    pub model_epoch: u64,
     pub attn_norm_handle: u64,
     pub attn_norm_bytes: &'a [f32],
     pub fused_qkv_handle: u64,
@@ -481,38 +497,70 @@ pub struct CachedQ1Weights {
     pub final_norm: Arc<MetalWeightHandle>,
     pub lm_head: Arc<MetalWeightHandle>,
 }
-/// Pre-cached raw ternary (TQ2_0_g128) weight bytes for a ternary model.
+/// Pre-cached GPU weight handles for one **ternary** (TQ2_0_g128) transformer
+/// layer (`MET-03`).
 ///
-/// Layer params are NOT stored here (they borrow from these vecs); callers
-/// rebuild `FullForwardLayerParamsTernary` each decode call by referencing the
-/// slices below — cheap struct literals, no leaks.
+/// The ternary twin of [`CachedLayerWeights`]: the same eight handles, but
+/// every quantized one holds a [`WeightKind::Tq2Soa`] buffer (the norms are
+/// [`WeightKind::RawF32`]). A separate type rather than a reuse of the Q1
+/// struct so a ternary cache can never be handed to the Q1 encoder by
+/// accident — the two layouts are not interchangeable.
+pub struct CachedTernaryLayerWeights {
+    /// Attention RMSNorm weight (`RawF32`).
+    pub attn_norm: Arc<MetalWeightHandle>,
+    /// Concatenated Q‖K‖V projection (`Tq2Soa`).
+    pub fused_qkv: Arc<MetalWeightHandle>,
+    /// Q RMSNorm weight (`RawF32`).
+    pub q_norm: Arc<MetalWeightHandle>,
+    /// K RMSNorm weight (`RawF32`).
+    pub k_norm: Arc<MetalWeightHandle>,
+    /// Attention output projection (`Tq2Soa`).
+    pub attn_proj: Arc<MetalWeightHandle>,
+    /// FFN RMSNorm weight (`RawF32`).
+    pub ffn_norm: Arc<MetalWeightHandle>,
+    /// Concatenated gate‖up projection (`Tq2Soa`).
+    pub gate_up: Arc<MetalWeightHandle>,
+    /// FFN down projection (`Tq2Soa`).
+    pub down: Arc<MetalWeightHandle>,
+}
+/// Pre-cached GPU weight handles for a ternary (TQ2_0_g128) model (`MET-03`).
 ///
-/// Handle ID allocation (distinct from the Q1 namespace):
-///   norm    handles: 5_000_000 + layer * 10 + offset
-///   weight  handles: 6_000_000 + layer * 10 + offset
-///   lm_head handle : 7_000_000
+/// Mirrors [`CachedQ1Weights`]: built **once** by
+/// [`build_cached_weights_ternary_only`](super::functions_3::build_cached_weights_ternary_only),
+/// which uploads (or finds resident) every layer's eight buffers under
+/// `model_epoch`, after which the `try_metal_*_ternary_cached` entry points
+/// bind these handles directly — no per-token cache lookups, no per-token
+/// `FullForwardLayerParamsTernary` rebuild, and **no host copy of any weight**:
+/// the struct holds only reference-counted GPU buffers.
+///
+/// This replaces the pre-`MET-03` shape, which held `Vec<Vec<u8>>` host copies
+/// of every projection (`qkv_concats`, `attn_proj_bytes`, `gate_bytes`,
+/// `up_bytes`, `down_bytes`, `lm_head_bytes`) for the life of the model and
+/// uploaded nothing; with that shape the whole process's peak memory
+/// footprint on Ternary-Bonsai-8B was measured at 4.4× the GGUF's size.
 pub struct CachedTernaryWeights {
-    pub qkv_concats: Vec<Vec<u8>>,
-    pub attn_proj_bytes: Vec<Vec<u8>>,
-    /// Gate projection bytes per layer (separate from up, kernel concatenates lazily).
-    pub gate_bytes: Vec<Vec<u8>>,
-    /// Up projection bytes per layer.
-    pub up_bytes: Vec<Vec<u8>>,
-    pub down_bytes: Vec<Vec<u8>>,
-    pub lm_head_bytes: Vec<u8>,
+    /// Weight-cache epoch every handle below was resolved under (`MET-02`).
+    pub model_epoch: u64,
+    /// Per-layer handles, in layer order.
+    pub layers: Vec<CachedTernaryLayerWeights>,
+    /// Final RMSNorm weight; `Some` exactly when `lm_head` is.
+    pub final_norm: Option<Arc<MetalWeightHandle>>,
+    /// TQ2 LM-head projection; `None` for a model whose LM head is not ternary
+    /// (the caller then runs its own tail on the returned hidden state).
+    pub lm_head: Option<Arc<MetalWeightHandle>>,
+    /// Rows of the LM head (the logits length); `0` when there is no tail.
     pub lm_head_out_features: usize,
 }
 /// Pre-cached GPU weights for the whole model — one variant per weight format.
 ///
-/// The Q1 and ternary decode paths cache fundamentally different data
-/// (pre-uploaded GPU handles vs. raw re-referenced byte blobs), so each is its
-/// own variant rather than a single struct with half its fields perpetually
-/// unused.
+/// Both variants hold pre-uploaded, reference-counted GPU handles and nothing
+/// else; they are separate types so a Q1 cache can never reach the ternary
+/// encoder (or vice versa) — the SoA layouts differ.
 pub enum CachedModelWeights {
     /// 1-bit (Q1_0_g128) cache: pre-uploaded per-layer + LM-head GPU handles.
     Q1(CachedQ1Weights),
-    /// Ternary (TQ2_0_g128) cache: raw per-layer weight bytes, re-referenced
-    /// into `FullForwardLayerParamsTernary` on every decode step.
+    /// Ternary (TQ2_0_g128) cache: pre-uploaded per-layer + tail GPU handles
+    /// (`MET-03`).
     Ternary(CachedTernaryWeights),
 }
 

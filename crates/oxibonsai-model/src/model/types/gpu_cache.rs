@@ -48,13 +48,31 @@
 //! **per call**, with no memoization (perf-03).
 //!
 //! Now [`BonsaiModel::get_or_create_gpu_cache`] uploads every ternary weight
-//! once and the `CachedModelWeights::Ternary` value it stores carries **no bytes
-//! at all** — only `lm_head_out_features`. Every forward path rebuilds its
-//! `FullForwardLayerParamsTernary` from borrowed mmap slices, and the two
-//! layouts that need a real allocation (the Q‖K‖V concatenation and the
-//! gate‖up concatenation) are built inside `get_or_upload_*_lazy` closures, so
-//! they exist only on a cache miss and are dropped as soon as the GPU buffer is
-//! written.
+//! once, and the `CachedModelWeights::Ternary` value it stores holds **only
+//! reference-counted GPU handles** — a `CachedTernaryWeights` of eight handles
+//! per layer plus the final-norm / LM-head tail, built by
+//! `build_cached_weights_ternary_only` (the MET-03 *shape*: it mirrors the Q1
+//! `CachedQ1Weights`). No host byte of any weight is retained. The two layouts
+//! that need a real allocation (the Q‖K‖V and gate‖up concatenations) are built
+//! in one reused staging buffer at load time, or inside
+//! `get_or_upload_*_lazy` closures on a later miss, and are dropped as soon as
+//! the GPU buffer is written.
+//!
+//! The cached decode entry points on this type
+//! ([`BonsaiModel::forward_greedy_gpu_ternary_cached`],
+//! [`BonsaiModel::forward_logits_gpu_ternary_cached`],
+//! [`BonsaiModel::prefill_logits_gpu_ternary_cached`],
+//! [`BonsaiModel::prefill_verify_gpu_ternary_cached`]) bind those handles
+//! directly — no per-token `FullForwardLayerParamsTernary` rebuild and no
+//! per-token cache lookup — and are bit-identical to the uncached paths,
+//! because they bind the very same buffers.
+//!
+//! # Weight-cache epoch (MET-02)
+//!
+//! The kernels key every ternary lookup on
+//! `FullForwardLayerParamsTernary::model_epoch`. This module sets it to
+//! [`TERNARY_GPU_EPOCH`], which is deliberately the legacy epoch — see that
+//! constant for why a per-load epoch cannot be switched on from here yet.
 //!
 //! # Release on unload, without a struct field on `BonsaiModel` (spec 1(b)/1(c))
 //!
@@ -63,8 +81,8 @@
 //! epoch in one `MetalGraph::release_model(epoch)` call. The full design
 //! threads a `metal_model_epoch: u64` field through `BonsaiModel`, allocated
 //! once per load by `MetalGraph::next_model_epoch()`. `BonsaiModel` is defined
-//! in `mod.rs`, owned by `MODEL-CORE-FWD` this wave, so that field cannot land
-//! from this package — see the package deviations.
+//! in `mod.rs`, which this module's owner does not own, so that field cannot
+//! land from here — see the package deviations.
 //!
 //! What *can* land here, from data this module already computes, is the
 //! safety property the epoch exists for: **a model's slots never outlive the
@@ -94,13 +112,42 @@
 use super::{BonsaiModel, OutputWeight};
 use crate::block::{blocks_as_bytes, blocks_as_bytes_ternary, TransformerBlock};
 use crate::layers::linear::LinearTernary;
-use oxibonsai_kernels::gpu_backend::metal_full_layer::types::{WeightKey, WeightKind};
-use oxibonsai_kernels::{FullForwardLayerParamsTernary, MetalGraph};
+use oxibonsai_kernels::gpu_backend::metal_full_layer::types::{
+    WeightKey, WeightKind, LEGACY_MODEL_EPOCH,
+};
+use oxibonsai_kernels::{CachedModelWeights, FullForwardLayerParamsTernary, MetalGraph};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 /// Convenience alias for the boxed error every Metal entry point here returns.
 type GpuResult<T> = Result<T, Box<dyn std::error::Error>>;
+
+/// Weight-cache epoch the ternary slot table is keyed under (`MET-02`).
+///
+/// The kernels key every ternary lookup — eight per layer plus the tail — on
+/// `FullForwardLayerParamsTernary::model_epoch`, and this module fills that
+/// field (and keys its own uploads, probes and evictions) with this value.
+/// It is **the legacy epoch on purpose**, for two reasons:
+///
+/// 1. It loses nothing today. Ternary slots are derived from the addresses of
+///    the mapped tensors ([`tensor_slot`]), which already makes them unique
+///    per mapping and shared by every replica of one `GgufFile` — the two
+///    properties a per-load epoch exists to provide — and the refcounted
+///    `Drop` below releases a model's slots before its mapping can be reused.
+/// 2. A different value would break the flagship prefill. Two of the five
+///    ternary paths, the batched prefill and its verify twin
+///    (`try_metal_full_forward_prefill_ternary` /
+///    `…_prefill_verify_ternary`, `metal_prefill/functions_2.rs`), still look
+///    their weights up under the legacy key regardless of `model_epoch`. With
+///    any other epoch here every prompt prefill would miss its resident
+///    buffers, try to upload the deliberately empty
+///    [`FUSED_QKV_ALREADY_RESIDENT`], fail closed and fall back to the CPU.
+///
+/// Moving to a per-load epoch therefore waits on one of: those two lookups
+/// keyed on `lp.model_epoch`, or `forward_metal.rs` routing its batched
+/// prefill through the cached entry points (which perform no lookup at all).
+/// Both are recorded as deviations of this package.
+pub(super) const TERNARY_GPU_EPOCH: u64 = LEGACY_MODEL_EPOCH;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Slot table — one namespace for every ternary Metal path (MET-02)
@@ -295,7 +342,12 @@ impl TernaryTailSlots {
 /// five ternary paths: derive the slots, make each layer's fused Q‖K‖V buffer
 /// resident, then build the per-layer parameter structs from borrowed mmap
 /// slices. Nothing in here owns weight bytes.
-pub(super) struct TernaryGpuBinding<'b> {
+///
+/// `pub` so the binding is usable outside the crate (the decode-throughput
+/// A/B in `BENCHES` drives the uncached path with it); the type is reachable
+/// by value and field today, and nameable once `model/types/mod.rs`
+/// re-exports it (a deviation of the package that made it `pub`).
+pub struct TernaryGpuBinding<'b> {
     /// Per-layer parameters, in layer order.
     pub layer_params: Vec<FullForwardLayerParamsTernary<'b>>,
     /// Final-norm → LM-head parameters; `None` when the model's output weight
@@ -304,7 +356,7 @@ pub(super) struct TernaryGpuBinding<'b> {
 }
 
 /// Final-norm → LM-head half of a [`TernaryGpuBinding`].
-pub(super) struct TernaryTailBinding<'b> {
+pub struct TernaryTailBinding<'b> {
     /// Slot of the final RMSNorm weight.
     pub final_norm_handle: u64,
     /// Borrowed final RMSNorm weights.
@@ -334,7 +386,7 @@ fn ensure_fused_qkv(graph: &MetalGraph, block: &TransformerBlock<'_>, slot: u64)
     let k_bytes = ternary_bytes(block.attn_k_blocks_ternary(), "attn_k")?;
     let v_bytes = ternary_bytes(block.attn_v_blocks_ternary(), "attn_v")?;
     graph
-        .get_or_upload_tq2_weight_soa_lazy(slot, || {
+        .get_or_upload_tq2_weight_soa_lazy_for_epoch(TERNARY_GPU_EPOCH, slot, || {
             let mut concat = Vec::with_capacity(q_bytes.len() + k_bytes.len() + v_bytes.len());
             concat.extend_from_slice(q_bytes);
             concat.extend_from_slice(k_bytes);
@@ -369,10 +421,11 @@ fn upload_ternary_layer(
     slots: &TernaryLayerSlots,
     scratch: &mut Vec<u8>,
 ) -> GpuResult<()> {
-    graph.get_or_upload_f32_weight(slots.attn_norm, block.attn_norm_weight())?;
-    graph.get_or_upload_f32_weight(slots.q_norm, block.q_norm_weight())?;
-    graph.get_or_upload_f32_weight(slots.k_norm, block.k_norm_weight())?;
-    graph.get_or_upload_f32_weight(slots.ffn_norm, block.ffn_norm_weight())?;
+    let epoch = TERNARY_GPU_EPOCH;
+    graph.get_or_upload_f32_weight_for_epoch(epoch, slots.attn_norm, block.attn_norm_weight())?;
+    graph.get_or_upload_f32_weight_for_epoch(epoch, slots.q_norm, block.q_norm_weight())?;
+    graph.get_or_upload_f32_weight_for_epoch(epoch, slots.k_norm, block.k_norm_weight())?;
+    graph.get_or_upload_f32_weight_for_epoch(epoch, slots.ffn_norm, block.ffn_norm_weight())?;
 
     fill_scratch(
         scratch,
@@ -382,9 +435,10 @@ fn upload_ternary_layer(
             ternary_bytes(block.attn_v_blocks_ternary(), "attn_v")?,
         ],
     );
-    graph.get_or_upload_tq2_weight_soa(slots.fused_qkv, scratch)?;
+    graph.get_or_upload_tq2_weight_soa_for_epoch(epoch, slots.fused_qkv, scratch)?;
 
-    graph.get_or_upload_tq2_weight_soa(
+    graph.get_or_upload_tq2_weight_soa_for_epoch(
+        epoch,
         slots.attn_proj,
         ternary_bytes(block.attn_output_blocks_ternary(), "attn_output")?,
     )?;
@@ -396,9 +450,10 @@ fn upload_ternary_layer(
             ternary_bytes(block.ffn_up_blocks_ternary(), "ffn_up")?,
         ],
     );
-    graph.get_or_upload_tq2_weight_soa(slots.gate_up, scratch)?;
+    graph.get_or_upload_tq2_weight_soa_for_epoch(epoch, slots.gate_up, scratch)?;
 
-    graph.get_or_upload_tq2_weight_soa(
+    graph.get_or_upload_tq2_weight_soa_for_epoch(
+        epoch,
         slots.down,
         ternary_bytes(block.ffn_down_blocks_ternary(), "ffn_down")?,
     )?;
@@ -424,6 +479,7 @@ fn ternary_layer_params<'b>(
     slots: &TernaryLayerSlots,
 ) -> GpuResult<FullForwardLayerParamsTernary<'b>> {
     Ok(FullForwardLayerParamsTernary {
+        model_epoch: TERNARY_GPU_EPOCH,
         attn_norm_handle: slots.attn_norm,
         attn_norm_bytes: block.attn_norm_weight(),
         fused_qkv_handle: slots.fused_qkv,
@@ -501,7 +557,18 @@ impl<'a> BonsaiModel<'a> {
     /// allocates one `Vec` of parameter structs and nothing else — which is why
     /// the five paths that used to deep-copy the whole model per call (perf-03)
     /// can now call it on the decode hot path.
-    pub(super) fn ternary_gpu_binding(&self) -> GpuResult<TernaryGpuBinding<'_>> {
+    ///
+    /// Public (the `BENCHES` enabler): together with the kernels'
+    /// `try_metal_*_ternary` entry points this is the **uncached** ternary
+    /// dispatch, and [`Self::forward_greedy_gpu_ternary_cached`] /
+    /// [`Self::forward_logits_gpu_ternary_cached`] are the cached one — the
+    /// two arms of the decode-throughput A/B.
+    ///
+    /// # Errors
+    ///
+    /// A model without blocks, a non-ternary layer, an unavailable Metal
+    /// device, or a failed fused-QKV upload.
+    pub fn ternary_gpu_binding(&self) -> GpuResult<TernaryGpuBinding<'_>> {
         if self.blocks.is_empty() {
             return Err("no blocks".into());
         }
@@ -640,13 +707,13 @@ impl<'a> BonsaiModel<'a> {
         let mut released = 0usize;
         for slots in &layer_slots {
             for (slot, kind) in slots.cache_keys() {
-                graph.evict_weight(WeightKey::legacy(kind, slot))?;
+                graph.evict_weight(WeightKey::new(TERNARY_GPU_EPOCH, kind, slot))?;
                 released += 1;
             }
         }
         if let Some(tail) = tail_slots {
             for (slot, kind) in tail.cache_keys() {
-                graph.evict_weight(WeightKey::legacy(kind, slot))?;
+                graph.evict_weight(WeightKey::new(TERNARY_GPU_EPOCH, kind, slot))?;
                 released += 1;
             }
         }
@@ -819,14 +886,16 @@ impl<'a> BonsaiModel<'a> {
         Ok(())
     }
 
-    /// Upload the ternary (TQ2_0_g128) weights and record that it happened.
+    /// Upload the ternary (TQ2_0_g128) weights and cache their GPU handles.
     ///
     /// Every projection goes to the GPU here, once, keyed by the address of the
-    /// mapped tensor it came from, and **no host bytes are retained**: the
-    /// `CachedModelWeights::Ternary` value stored on the model carries empty
-    /// vectors and only `lm_head_out_features` is meaningful (MET-03). It exists
-    /// purely as the "weights are up" marker that makes this function idempotent
-    /// and that lets a decode path notice a Q1 cache on a ternary model.
+    /// mapped tensor it came from, through one reused staging buffer (see
+    /// [`upload_ternary_layer`]). The kernels' `build_cached_weights_ternary_only`
+    /// then resolves those now-resident buffers — pure cache hits — into the
+    /// MET-03 shape: eight `Arc<MetalWeightHandle>` per layer plus the tail,
+    /// and **no host bytes**. That value is both the "weights are up" marker
+    /// that makes this function idempotent and what the cached decode entry
+    /// points bind directly.
     fn build_ternary_gpu_cache(
         &self,
         n_layers: usize,
@@ -846,26 +915,25 @@ impl<'a> BonsaiModel<'a> {
         }
         drop(scratch);
         let tail = TernaryTailSlots::for_lm_head(lm_head_ternary)?;
-        graph.get_or_upload_f32_weight(tail.final_norm, self.output_norm.weight())?;
-        graph.get_or_upload_tq2_weight_soa(
-            tail.lm_head,
-            blocks_as_bytes_ternary(lm_head_ternary.blocks()),
-        )?;
+        let lm_head_bytes = blocks_as_bytes_ternary(lm_head_ternary.blocks());
         let ternary_lm_head_out_features = lm_head_ternary.out_features();
 
-        // The ternary-only builder takes the byte blobs by value; passing empty
-        // vectors is what makes "the cache holds no host copy of the weights"
-        // true by construction. `Vec::new()` does not allocate.
+        // Every weight is resident now, so the builder's lookups are all hits:
+        // `fused_qkv_bytes` is the empty `FUSED_QKV_ALREADY_RESIDENT` and the
+        // gate‖up closure never runs. Its parameter structs borrow from the
+        // mapping and are dropped at the end of this function.
+        let mut layer_params = Vec::with_capacity(n_layers);
+        for (block, slots) in self.blocks.iter().zip(layer_slots.iter()) {
+            layer_params.push(ternary_layer_params(block, slots)?);
+        }
         let cached = oxibonsai_kernels::build_cached_weights_ternary_only(
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
+            &layer_params,
+            Some((tail.final_norm, self.output_norm.weight())),
+            Some((tail.lm_head, lm_head_bytes)),
             ternary_lm_head_out_features,
         )
         .map_err(|e| format!("build_cached_weights_ternary_only: {e}"))?;
+        drop(layer_params);
 
         let mut guard = self
             .gpu_weight_cache
@@ -895,7 +963,6 @@ impl<'a> BonsaiModel<'a> {
     /// Also the guard that a ternary decode path is not running against a Q1
     /// cache, which the byte-slice length checks used to provide.
     pub(super) fn ternary_gpu_cache_out_features(&self) -> GpuResult<usize> {
-        use oxibonsai_kernels::CachedModelWeights;
         let guard = self
             .gpu_weight_cache
             .lock()
@@ -906,6 +973,296 @@ impl<'a> BonsaiModel<'a> {
                 Err("ternary GPU path invoked with a Q1 weight cache".into())
             }
         }
+    }
+
+    /// Run `f` against this model's ternary GPU weight cache (`MET-03`),
+    /// building it first if needed.
+    ///
+    /// The seam every cached ternary dispatch goes through: it guarantees the
+    /// cache is populated and is the **ternary** variant (a Q1 cache on a
+    /// ternary model is an error, not a misdecode), and it holds the cache lock
+    /// only for the duration of `f` — one dispatch.
+    pub(super) fn with_ternary_gpu_cache<R>(
+        &self,
+        f: impl FnOnce(&CachedModelWeights) -> R,
+    ) -> GpuResult<R> {
+        self.get_or_create_gpu_cache()?;
+        let guard = self
+            .gpu_weight_cache
+            .lock()
+            .map_err(|e| format!("gpu_weight_cache lock: {e}"))?;
+        let cached = guard.as_ref().ok_or("GPU weight cache not populated")?;
+        if !matches!(cached, CachedModelWeights::Ternary(_)) {
+            return Err("ternary GPU path invoked with a Q1 weight cache".into());
+        }
+        Ok(f(cached))
+    }
+
+    /// Shared guard + embedding prologue of the single-token cached decode
+    /// entry points: the context-length and sliding-window refusals of the
+    /// uncached twins, then this token's hidden state and RoPE rows.
+    fn ternary_decode_prologue(
+        &self,
+        token_id: u32,
+        pos: usize,
+    ) -> GpuResult<(Vec<f32>, &[f32], &[f32])> {
+        if !matches!(self.output_weight, OutputWeight::Ternary(_)) {
+            return Err("cached ternary decode called on a non-ternary model".into());
+        }
+        if self.blocks.is_empty() {
+            return Err("no blocks".into());
+        }
+        if pos >= self.kv_cache.max_seq_len() {
+            return Err(format!(
+                "ternary cached decode sequence too long: pos {pos} exceeds max_seq_len {}",
+                self.kv_cache.max_seq_len()
+            )
+            .into());
+        }
+        // The fused path attends over the full device KV cache with no
+        // windowing; a sliding-window model must take the windowed CPU path
+        // (M-17, same refusal as `forward_greedy_gpu`).
+        if self.config.sliding_window.is_some() {
+            return Err(
+                "sliding-window model: fused Metal decode is full-causal; falling back to CPU"
+                    .into(),
+            );
+        }
+        let mut hidden = vec![0.0f32; self.config.hidden_size];
+        self.token_embd.copy_row(token_id, &mut hidden)?;
+        let rope_cos = self.rope.cos_at_checked(pos)?;
+        let rope_sin = self.rope.sin_at_checked(pos)?;
+        Ok((hidden, rope_cos, rope_sin))
+    }
+
+    /// Greedy single-token decode through the **cached** ternary GPU weights
+    /// (`MET-03`): all layers, the final norm, the TQ2 LM head and the argmax
+    /// in one command buffer, binding the handles `get_or_create_gpu_cache`
+    /// resolved once instead of looking all eight per layer up again.
+    ///
+    /// Bit-identical to the uncached `forward_greedy_gpu` on a ternary model
+    /// (same buffers, same kernels). Maintains the device KV cache of the
+    /// session this thread dispatches in, exactly like that path.
+    ///
+    /// # Errors
+    ///
+    /// A non-ternary model, a position past the context, a sliding-window
+    /// model, a Q1 cache, or any Metal failure — never a CPU fallback.
+    pub fn forward_greedy_gpu_ternary_cached(
+        &self,
+        token_id: u32,
+        pos: usize,
+    ) -> Result<u32, Box<dyn std::error::Error>> {
+        let (mut hidden, rope_cos, rope_sin) = self.ternary_decode_prologue(token_id, pos)?;
+        let mut token: u32 = 0;
+        self.with_ternary_gpu_cache(|cached| {
+            oxibonsai_kernels::try_metal_forward_greedy_ternary_cached(
+                &mut hidden,
+                pos,
+                cached,
+                rope_cos,
+                rope_sin,
+                self.config.hidden_size,
+                self.config.intermediate_size,
+                self.config.num_attention_heads,
+                self.config.num_kv_heads,
+                self.config.head_dim,
+                self.blocks[0].attn_norm_eps(),
+                self.kv_cache.max_seq_len(),
+                self.output_norm.eps(),
+                &mut token,
+            )
+        })??;
+        // MET-05: the device KV cache now holds this position, the host one
+        // does not.
+        self.note_device_kv_used();
+        Ok(token)
+    }
+
+    /// Logits of one token through the **cached** ternary GPU weights
+    /// (`MET-03`) — the sampled-decode twin of
+    /// [`Self::forward_greedy_gpu_ternary_cached`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::forward_greedy_gpu_ternary_cached`].
+    pub fn forward_logits_gpu_ternary_cached(
+        &self,
+        token_id: u32,
+        pos: usize,
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        let (mut hidden, rope_cos, rope_sin) = self.ternary_decode_prologue(token_id, pos)?;
+        let mut logits = Vec::new();
+        self.with_ternary_gpu_cache(|cached| {
+            oxibonsai_kernels::try_metal_prefill_ternary_cached(
+                &mut hidden,
+                pos,
+                cached,
+                rope_cos,
+                rope_sin,
+                self.config.hidden_size,
+                self.config.intermediate_size,
+                self.config.num_attention_heads,
+                self.config.num_kv_heads,
+                self.config.head_dim,
+                self.blocks[0].attn_norm_eps(),
+                self.kv_cache.max_seq_len(),
+                self.output_norm.eps(),
+                &mut logits,
+            )
+        })??;
+        self.note_device_kv_used();
+        Ok(logits)
+    }
+
+    /// Logits of one token through the **uncached** ternary GPU path, strictly
+    /// (no CPU fallback): the per-call `FullForwardLayerParamsTernary` binding
+    /// and eight weight-cache lookups per layer that `forward()` makes first on
+    /// a ternary model.
+    ///
+    /// It exists as the reference the cached shape is proven against — the
+    /// MET-03 parity evidence compares this path and
+    /// [`Self::forward_logits_gpu_ternary_cached`] bit for bit on the real
+    /// model — and as the explicit "no fallback" entry a caller can use to
+    /// tell a GPU failure from a CPU answer.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::forward_greedy_gpu_ternary_cached`].
+    pub fn forward_logits_gpu_ternary_uncached(
+        &self,
+        token_id: u32,
+        pos: usize,
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        let (mut hidden, _, _) = self.ternary_decode_prologue(token_id, pos)?;
+        let mut logits = Vec::new();
+        self.try_metal_full_forward_with_lm_head_ternary(&mut hidden, pos, &mut logits)?;
+        self.note_device_kv_used();
+        Ok(logits)
+    }
+
+    /// Embed `token_ids` column-major and build the per-position RoPE tables
+    /// for a batched prefill starting at `pos_start`.
+    #[allow(clippy::type_complexity)]
+    fn ternary_prefill_inputs(
+        &self,
+        token_ids: &[u32],
+        pos_start: usize,
+    ) -> GpuResult<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        if !matches!(self.output_weight, OutputWeight::Ternary(_)) {
+            return Err("cached ternary prefill called on a non-ternary model".into());
+        }
+        if self.blocks.is_empty() {
+            return Err("no blocks".into());
+        }
+        let batch = token_ids.len();
+        if batch == 0 {
+            return Err("cached ternary prefill needs at least one token".into());
+        }
+        if pos_start + batch > self.kv_cache.max_seq_len() {
+            return Err(format!(
+                "ternary cached prefill sequence too long: {batch} tokens at pos {pos_start} \
+                 exceeds max_seq_len {}",
+                self.kv_cache.max_seq_len()
+            )
+            .into());
+        }
+        let h = self.config.hidden_size;
+        let half_dim = self.config.head_dim / 2;
+        let mut hidden_batch = vec![0.0f32; batch * h];
+        self.token_embd.copy_rows(token_ids, &mut hidden_batch)?;
+        let mut cos_table = vec![0.0f32; batch * half_dim];
+        let mut sin_table = vec![0.0f32; batch * half_dim];
+        for t in 0..batch {
+            let pos = pos_start + t;
+            cos_table[t * half_dim..(t + 1) * half_dim]
+                .copy_from_slice(self.rope.cos_at_checked(pos)?);
+            sin_table[t * half_dim..(t + 1) * half_dim]
+                .copy_from_slice(self.rope.sin_at_checked(pos)?);
+        }
+        Ok((hidden_batch, cos_table, sin_table))
+    }
+
+    /// Batched prefill through the **cached** ternary GPU weights (`MET-03`):
+    /// the cached twin of `try_metal_prefill_with_lm_head_ternary`, returning
+    /// the last position's logits.
+    ///
+    /// It performs no weight-cache lookup at all, which is what takes the
+    /// ternary prefill off the legacy-keyed lookups of the uncached
+    /// `metal_prefill` entry (see [`TERNARY_GPU_EPOCH`]).
+    ///
+    /// # Errors
+    ///
+    /// A non-ternary model, an empty or over-long batch, a Q1 cache, or any
+    /// Metal failure — never a CPU fallback.
+    pub fn prefill_logits_gpu_ternary_cached(
+        &self,
+        token_ids: &[u32],
+        pos_start: usize,
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        let (hidden_batch, cos_table, sin_table) =
+            self.ternary_prefill_inputs(token_ids, pos_start)?;
+        let mut logits = Vec::new();
+        self.with_ternary_gpu_cache(|cached| {
+            oxibonsai_kernels::try_metal_full_forward_prefill_ternary_cached(
+                &hidden_batch,
+                token_ids.len(),
+                pos_start,
+                cached,
+                &cos_table,
+                &sin_table,
+                self.config.hidden_size,
+                self.config.intermediate_size,
+                self.config.num_attention_heads,
+                self.config.num_kv_heads,
+                self.config.head_dim,
+                self.blocks[0].attn_norm_eps(),
+                self.kv_cache.max_seq_len(),
+                self.output_norm.eps(),
+                Some(&mut logits),
+                None,
+            )
+        })??;
+        self.note_device_kv_used();
+        Ok(logits)
+    }
+
+    /// Batched speculative-verify prefill through the **cached** ternary GPU
+    /// weights (`MET-03`): every position's greedy argmax — the cached twin of
+    /// `try_metal_prefill_verify_ternary_path`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::prefill_logits_gpu_ternary_cached`].
+    pub fn prefill_verify_gpu_ternary_cached(
+        &self,
+        token_ids: &[u32],
+        pos_start: usize,
+    ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+        let (hidden_batch, cos_table, sin_table) =
+            self.ternary_prefill_inputs(token_ids, pos_start)?;
+        let mut ids = Vec::with_capacity(token_ids.len());
+        self.with_ternary_gpu_cache(|cached| {
+            oxibonsai_kernels::try_metal_full_forward_prefill_verify_ternary_cached(
+                &hidden_batch,
+                token_ids.len(),
+                pos_start,
+                cached,
+                &cos_table,
+                &sin_table,
+                self.config.hidden_size,
+                self.config.intermediate_size,
+                self.config.num_attention_heads,
+                self.config.num_kv_heads,
+                self.config.head_dim,
+                self.blocks[0].attn_norm_eps(),
+                self.kv_cache.max_seq_len(),
+                self.output_norm.eps(),
+                &mut ids,
+            )
+        })??;
+        self.note_device_kv_used();
+        Ok(ids)
     }
 }
 
@@ -983,748 +1340,5 @@ impl<'a> Drop for BonsaiModel<'a> {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_alloc::count_allocations;
-    use half::f16;
-    use oxibonsai_core::gguf::reader::GgufFile;
-    use oxibonsai_core::gguf::writer::{GgufWriter, MetadataWriteValue, TensorEntry, TensorType};
-    use oxibonsai_kernels::{CachedModelWeights, MetalGraphError, MetalWeightHandle};
-    use std::sync::{Arc, Mutex, MutexGuard};
-
-    // ── Synthetic fully-ternary fixture ──────────────────────────────────
-
-    /// Hidden size of the fixture (≥ 128: one `TQ2_0_g128` block).
-    const FIXTURE_HIDDEN: usize = 128;
-    /// FFN intermediate size of the fixture (multiple of 128).
-    const FIXTURE_INTER: usize = 256;
-    /// Transformer layers in the fixture.
-    const FIXTURE_LAYERS: usize = 2;
-    /// Attention heads in the fixture.
-    const FIXTURE_NQ: usize = 4;
-    /// KV heads in the fixture.
-    const FIXTURE_NKV: usize = 2;
-    /// Head dimension of the fixture (`FIXTURE_HIDDEN / FIXTURE_NQ`).
-    const FIXTURE_HD: usize = 32;
-    /// Vocabulary size of the fixture.
-    const FIXTURE_VOCAB: usize = 32;
-    /// Context length the fixture's models are built with.
-    const FIXTURE_MAX_SEQ: usize = 64;
-
-    /// Build a `TQ2_0_g128` blob that emits only the three ternary codes.
-    ///
-    /// Blocks are 34 bytes: 32 bytes of 2-bit codes (four per byte, LSB-first)
-    /// then an f16 scale. The reserved code `0b11` is the `PQ2_0` `+2` encoding
-    /// and `upload_tq2_weight_soa` rejects any block containing it, so the
-    /// generator folds each lane into `{0, 1, 2}`.
-    fn tq2_pattern(num_weights: usize, seed: u64) -> Vec<u8> {
-        assert_eq!(
-            num_weights % 128,
-            0,
-            "num_weights must be a multiple of 128"
-        );
-        let mut data = Vec::with_capacity(num_weights / 128 * 34);
-        let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        for _ in 0..num_weights / 128 {
-            for _ in 0..32 {
-                let mut byte = 0u8;
-                for lane in 0..4 {
-                    state = state
-                        .wrapping_mul(6_364_136_223_846_793_005)
-                        .wrapping_add(1);
-                    byte |= (((state >> 33) % 3) as u8) << (2 * lane);
-                }
-                data.push(byte);
-            }
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1);
-            let scale = 0.25_f32 + ((state >> 33) as u32 as f32) / (u32::MAX as f32) * 0.5_f32;
-            data.extend_from_slice(&f16::from_f32(scale).to_le_bytes());
-        }
-        data
-    }
-
-    /// Build an index-varying FP32 tensor, so nothing degenerates to a constant.
-    fn f32_pattern(n: usize, scale: f32) -> Vec<u8> {
-        let mut v = Vec::with_capacity(n * 4);
-        for i in 0..n {
-            let val = scale * (1.0_f32 + 0.25_f32 * ((i as f32) * 0.013_f32).sin());
-            v.extend_from_slice(&val.to_le_bytes());
-        }
-        v
-    }
-
-    /// Assemble a synthetic fully-ternary GGUF in memory.
-    ///
-    /// `salt` perturbs the weight seeds so two fixtures are distinguishable;
-    /// each `Vec` is its own allocation, so two fixtures also mean two distinct
-    /// sets of tensor addresses — which is what the slot table keys on.
-    fn synthetic_ternary_gguf(salt: u64) -> Vec<u8> {
-        let (h, inter, nq, nkv, hd, vocab) = (
-            FIXTURE_HIDDEN,
-            FIXTURE_INTER,
-            FIXTURE_NQ,
-            FIXTURE_NKV,
-            FIXTURE_HD,
-            FIXTURE_VOCAB,
-        );
-        let mut writer = GgufWriter::new();
-        writer.add_metadata(
-            "general.architecture",
-            MetadataWriteValue::Str("qwen3".to_string()),
-        );
-        writer.add_metadata(
-            "general.name",
-            MetadataWriteValue::Str("GpuCacheSlotTest".to_string()),
-        );
-        writer.add_metadata("qwen3.embedding_length", MetadataWriteValue::U32(h as u32));
-        writer.add_metadata(
-            "qwen3.block_count",
-            MetadataWriteValue::U32(FIXTURE_LAYERS as u32),
-        );
-        writer.add_metadata(
-            "qwen3.attention.head_count",
-            MetadataWriteValue::U32(nq as u32),
-        );
-        writer.add_metadata(
-            "qwen3.attention.head_count_kv",
-            MetadataWriteValue::U32(nkv as u32),
-        );
-        writer.add_metadata(
-            "qwen3.feed_forward_length",
-            MetadataWriteValue::U32(inter as u32),
-        );
-        writer.add_metadata("qwen3.vocab_size", MetadataWriteValue::U32(vocab as u32));
-        writer.add_metadata("qwen3.context_length", MetadataWriteValue::U32(512));
-        writer.add_metadata(
-            "qwen3.attention.layer_norm_rms_epsilon",
-            MetadataWriteValue::F32(1e-6),
-        );
-        writer.add_metadata("qwen3.rope.freq_base", MetadataWriteValue::F32(10_000.0));
-
-        writer.add_tensor(TensorEntry {
-            name: "token_embd.weight".to_string(),
-            shape: vec![h as u64, vocab as u64],
-            tensor_type: TensorType::F32,
-            data: f32_pattern(vocab * h, 0.5),
-        });
-        writer.add_tensor(TensorEntry {
-            name: "output_norm.weight".to_string(),
-            shape: vec![h as u64],
-            tensor_type: TensorType::F32,
-            data: f32_pattern(h, 1.0),
-        });
-        writer.add_tensor(TensorEntry {
-            name: "output.weight".to_string(),
-            shape: vec![h as u64, vocab as u64],
-            tensor_type: TensorType::TQ2_0_g128,
-            data: tq2_pattern(vocab * h, 0xCAFE_BABE ^ salt),
-        });
-
-        for layer in 0..FIXTURE_LAYERS {
-            let pfx = format!("blk.{layer}");
-            for (name, len) in [
-                (format!("{pfx}.attn_norm.weight"), h),
-                (format!("{pfx}.ffn_norm.weight"), h),
-                (format!("{pfx}.attn_q_norm.weight"), hd),
-                (format!("{pfx}.attn_k_norm.weight"), hd),
-            ] {
-                writer.add_tensor(TensorEntry {
-                    name,
-                    shape: vec![len as u64],
-                    tensor_type: TensorType::F32,
-                    data: f32_pattern(len, 1.0),
-                });
-            }
-            let seed = 0x1000_0000_u64.wrapping_add((layer as u64) << 16) ^ salt;
-            for (name, rows, cols, bump) in [
-                (format!("{pfx}.attn_q.weight"), h, nq * hd, 0),
-                (format!("{pfx}.attn_k.weight"), h, nkv * hd, 1),
-                (format!("{pfx}.attn_v.weight"), h, nkv * hd, 2),
-                (format!("{pfx}.attn_output.weight"), nq * hd, h, 3),
-                (format!("{pfx}.ffn_gate.weight"), h, inter, 4),
-                (format!("{pfx}.ffn_up.weight"), h, inter, 5),
-                (format!("{pfx}.ffn_down.weight"), inter, h, 6),
-            ] {
-                writer.add_tensor(TensorEntry {
-                    name,
-                    shape: vec![rows as u64, cols as u64],
-                    tensor_type: TensorType::TQ2_0_g128,
-                    data: tq2_pattern(rows * cols, seed.wrapping_add(bump)),
-                });
-            }
-        }
-        writer.to_bytes().expect("GgufWriter::to_bytes")
-    }
-
-    /// Serialise every GPU-touching test in this binary.
-    ///
-    /// `MetalGraph` is a process-global singleton (one device, one weight
-    /// cache, one KV cache) and the tail-failure seam these tests flip is
-    /// process-global too, so two of them running concurrently would observe
-    /// each other. A poisoned lock is recovered rather than propagated: one
-    /// panicking test must not turn every sibling into a second failure.
-    fn gpu_serial() -> MutexGuard<'static, ()> {
-        static GPU_LOCK: Mutex<()> = Mutex::new(());
-        GPU_LOCK.lock().unwrap_or_else(|p| p.into_inner())
-    }
-
-    /// Look a slot up **without** being willing to upload it.
-    ///
-    /// `get_or_upload_keyed` only runs the closure on a miss, so a closure that
-    /// always fails turns the call into a pure residency probe: `Some` means the
-    /// buffer is cached under exactly this `(kind, slot)`, `None` means it is
-    /// not (or is cached under a different kind).
-    fn probe(graph: &MetalGraph, slot: u64, kind: WeightKind) -> Option<Arc<MetalWeightHandle>> {
-        graph
-            .get_or_upload_keyed(WeightKey::legacy(kind, slot), || {
-                Err(MetalGraphError::ExecutionFailed(
-                    "probe: not resident".into(),
-                ))
-            })
-            .ok()
-    }
-
-    /// Every `(slot, kind)` pair a ternary model owns, layers then tail.
-    fn all_cache_keys(
-        layers: &[TernaryLayerSlots],
-        tail: Option<TernaryTailSlots>,
-    ) -> Vec<(u64, WeightKind)> {
-        let mut keys: Vec<(u64, WeightKind)> = layers.iter().flat_map(|s| s.cache_keys()).collect();
-        if let Some(tail) = tail {
-            keys.extend(tail.cache_keys());
-        }
-        keys
-    }
-
-    // ── Pure tests: the slot table ───────────────────────────────────────
-
-    /// The mapped-tensor namespace cannot reach the Q1 path's literal handles.
-    ///
-    /// The Q1 decode path keys its norms on `1_000_000 + layer * 10 + off`, its
-    /// final norm on `2_000_000` and its LM head on `3_000_000`. Before MET-02
-    /// the ternary fallback path used `2_000_000 + layer * 10` for **its**
-    /// norms, so a mixed process handed the ternary layer-0 attention norm the
-    /// Q1 final-norm buffer — same `WeightKind::RawF32`, so a silent stale hit
-    /// rather than an error.
-    #[test]
-    fn mapped_tensor_slots_cannot_reach_the_q1_literal_handles() {
-        let highest_q1_literal = 3_000_000u64 + 100_000 * 10 + 3;
-        assert!(
-            MIN_TENSOR_SLOT > highest_q1_literal,
-            "the mapped-tensor floor {MIN_TENSOR_SLOT} must sit above every Q1 literal handle \
-             ({highest_q1_literal})"
-        );
-    }
-
-    /// A slot below the floor is refused rather than keyed on.
-    #[test]
-    fn tensor_slot_rejects_an_address_below_the_floor() {
-        // SAFETY: `from_raw_parts` with `len == 0` requires only a non-null,
-        // aligned pointer — `0x1000` is both for `u8` — and the slice is never
-        // dereferenced: `tensor_slot` reads `as_ptr()` and nothing else.
-        let below: &[u8] =
-            unsafe { std::slice::from_raw_parts(std::ptr::without_provenance(0x1000), 0) };
-        let err = tensor_slot(below, "fake_tensor").expect_err("below-floor slot must be refused");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("fake_tensor"),
-            "error must name the tensor: {msg}"
-        );
-    }
-
-    /// Every slot of a real ternary model is distinct, above the floor and
-    /// stable across repeated derivation — which is what makes the fused path
-    /// and the fallback path agree (MET-02).
-    #[test]
-    fn ternary_slots_are_distinct_stable_and_above_the_floor() {
-        let bytes = synthetic_ternary_gguf(0);
-        let gguf = GgufFile::parse(&bytes).expect("parse synthetic ternary GGUF");
-        let model = BonsaiModel::from_gguf(&gguf, FIXTURE_MAX_SEQ).expect("load synthetic model");
-
-        let (layers, tail) = model.ternary_gpu_slots().expect("derive ternary slots");
-        assert_eq!(layers.len(), FIXTURE_LAYERS);
-        let tail = tail.expect("synthetic fixture has a ternary LM head");
-
-        let keys = all_cache_keys(&layers, Some(tail));
-        assert_eq!(keys.len(), FIXTURE_LAYERS * 8 + 2);
-        for (slot, _) in &keys {
-            assert!(
-                *slot >= MIN_TENSOR_SLOT,
-                "slot {slot:#x} is below the mapped-tensor floor"
-            );
-        }
-        let mut sorted: Vec<u64> = keys.iter().map(|(slot, _)| *slot).collect();
-        sorted.sort_unstable();
-        let before = sorted.len();
-        sorted.dedup();
-        assert_eq!(
-            sorted.len(),
-            before,
-            "two ternary weights resolved to the same slot"
-        );
-
-        let (layers_again, tail_again) =
-            model.ternary_gpu_slots().expect("re-derive ternary slots");
-        assert_eq!(layers, layers_again, "slot derivation must be stable");
-        assert_eq!(
-            Some(tail),
-            tail_again,
-            "tail slot derivation must be stable"
-        );
-    }
-
-    /// Two models loaded from two GGUFs never share a slot.
-    ///
-    /// The old per-layer literals (`5_000_000 + layer * 10`, …) were identical
-    /// for every ternary model in the process, so a draft model and a target
-    /// model decoded through each other's weights.
-    #[test]
-    fn two_models_do_not_share_slots() {
-        let bytes_a = synthetic_ternary_gguf(0);
-        let bytes_b = synthetic_ternary_gguf(0xABCD);
-        let gguf_a = GgufFile::parse(&bytes_a).expect("parse model A");
-        let gguf_b = GgufFile::parse(&bytes_b).expect("parse model B");
-        let model_a = BonsaiModel::from_gguf(&gguf_a, FIXTURE_MAX_SEQ).expect("load model A");
-        let model_b = BonsaiModel::from_gguf(&gguf_b, FIXTURE_MAX_SEQ).expect("load model B");
-
-        let (layers_a, tail_a) = model_a.ternary_gpu_slots().expect("slots A");
-        let (layers_b, tail_b) = model_b.ternary_gpu_slots().expect("slots B");
-        let keys_a = all_cache_keys(&layers_a, tail_a);
-        let keys_b = all_cache_keys(&layers_b, tail_b);
-        for key in &keys_a {
-            assert!(
-                !keys_b.contains(key),
-                "slot {:#x} is shared between two independently loaded models",
-                key.0
-            );
-        }
-    }
-
-    // ── GPU tests ────────────────────────────────────────────────────────
-
-    /// The ternary GPU cache keeps no host copy of the weights (MET-03).
-    ///
-    /// `CachedTernaryWeights` used to hold `Vec<Vec<u8>>` copies of every
-    /// projection for the life of the model — measured at 9.51 GB peak
-    /// footprint for the 2.18 GB 8B. The weights now live only on the GPU (and
-    /// in the mapping they were read from, which is clean, file-backed and
-    /// reclaimable), and the cached value carries nothing but the LM-head row
-    /// count.
-    #[test]
-    fn ternary_gpu_cache_retains_no_host_bytes() {
-        let _gpu = gpu_serial();
-        let Ok(graph) = MetalGraph::global() else {
-            return; // no Metal device in this environment
-        };
-        let bytes = synthetic_ternary_gguf(0x11);
-        let gguf = GgufFile::parse(&bytes).expect("parse synthetic ternary GGUF");
-        let model = BonsaiModel::from_gguf(&gguf, FIXTURE_MAX_SEQ).expect("load synthetic model");
-        model
-            .get_or_create_gpu_cache()
-            .expect("build the ternary GPU weight cache");
-
-        {
-            let guard = model
-                .gpu_weight_cache
-                .lock()
-                .expect("gpu_weight_cache lock");
-            match guard.as_ref().expect("cache populated") {
-                CachedModelWeights::Ternary(tern) => {
-                    // Both emptiness *and* capacity: `Vec::new()` never
-                    // allocates, so a zero capacity proves no host buffer was
-                    // retained rather than merely cleared.
-                    for (name, vecs) in [
-                        ("qkv_concats", &tern.qkv_concats),
-                        ("attn_proj_bytes", &tern.attn_proj_bytes),
-                        ("gate_bytes", &tern.gate_bytes),
-                        ("up_bytes", &tern.up_bytes),
-                        ("down_bytes", &tern.down_bytes),
-                    ] {
-                        assert!(vecs.is_empty(), "{name} still holds host weight bytes");
-                        assert_eq!(vecs.capacity(), 0, "{name} still owns a host allocation");
-                    }
-                    assert!(tern.lm_head_bytes.is_empty(), "lm_head_bytes retained");
-                    assert_eq!(tern.lm_head_bytes.capacity(), 0, "lm_head_bytes allocated");
-                    assert_eq!(tern.lm_head_out_features, FIXTURE_VOCAB);
-                }
-                CachedModelWeights::Q1(_) => panic!("ternary model produced a Q1 cache"),
-            }
-        }
-
-        // The bytes really did go to the GPU: every slot is resident and the
-        // fused QKV buffer is exactly Q‖K‖V long.
-        let (layers, tail) = model.ternary_gpu_slots().expect("derive ternary slots");
-        for (slot, kind) in all_cache_keys(&layers, tail) {
-            let handle = probe(&graph, slot, kind)
-                .unwrap_or_else(|| panic!("slot {slot:#x} ({kind}) is not GPU-resident"));
-            assert!(
-                handle.byte_len() > 0,
-                "slot {slot:#x} uploaded an empty buffer"
-            );
-            assert_eq!(
-                handle.kind(),
-                kind,
-                "slot {slot:#x} cached under the wrong kind"
-            );
-        }
-        let block = &model.blocks[0];
-        let expected_qkv = [
-            block.attn_q_blocks_ternary().expect("attn_q").len(),
-            block.attn_k_blocks_ternary().expect("attn_k").len(),
-            block.attn_v_blocks_ternary().expect("attn_v").len(),
-        ]
-        .iter()
-        .sum::<usize>()
-            * 34;
-        let qkv = probe(&graph, layers[0].fused_qkv, WeightKind::Tq2Soa).expect("fused qkv");
-        assert_eq!(
-            qkv.byte_len(),
-            expected_qkv,
-            "the fused QKV buffer must hold all three projections"
-        );
-
-        let _ = model.release_metal_weights();
-    }
-
-    /// The empty [`FUSED_QKV_ALREADY_RESIDENT`] slice fails closed.
-    ///
-    /// Every ternary path binds `fused_qkv_bytes` to an empty slice because the
-    /// buffer is known resident by then (the Q‖K‖V concatenation cannot be
-    /// borrowed from the mapping, and keeping a host copy of it is MET-03).
-    /// This pins the property that makes that safe: were the residency
-    /// invariant ever broken, the kernel-side upload **errors** rather than
-    /// binding a zero-length buffer to the GEMV, so the caller falls back to
-    /// the CPU instead of reading garbage.
-    #[test]
-    fn an_empty_fused_qkv_upload_fails_closed() {
-        let _gpu = gpu_serial();
-        let Ok(graph) = MetalGraph::global() else {
-            return;
-        };
-        let bytes = synthetic_ternary_gguf(0x55);
-        let gguf = GgufFile::parse(&bytes).expect("parse synthetic ternary GGUF");
-        let model = BonsaiModel::from_gguf(&gguf, FIXTURE_MAX_SEQ).expect("load synthetic model");
-        let (layers, _tail) = model.ternary_gpu_slots().expect("derive ternary slots");
-        let slot = layers[0].fused_qkv;
-        // Start from a genuinely free slot, so the upload cannot be short-cut
-        // by a cache hit.
-        let _ = model.release_metal_weights();
-        assert!(
-            probe(&graph, slot, WeightKind::Tq2Soa).is_none(),
-            "slot {slot:#x} must be free for this test to mean anything"
-        );
-
-        graph
-            .get_or_upload_tq2_weight_soa(slot, FUSED_QKV_ALREADY_RESIDENT)
-            .expect_err("an empty TQ2 upload must fail, not allocate a zero-length buffer");
-        assert!(
-            probe(&graph, slot, WeightKind::Tq2Soa).is_none(),
-            "a failed upload must leave nothing behind in the cache"
-        );
-    }
-
-    /// Binding the ternary weights allocates a bounded, weight-size-independent
-    /// amount of host memory (perf-03).
-    ///
-    /// Every batched prefill call used to rebuild five `Vec<Vec<u8>>` holding
-    /// the entire quantized model — `5 × n_layers + 1` allocations totalling the
-    /// whole model, per call, with no memoization. The binding now borrows from
-    /// the mapping, so the only allocations left are the parameter vector and
-    /// the slot vector.
-    #[test]
-    fn ternary_binding_does_not_copy_the_model_per_call() {
-        let _gpu = gpu_serial();
-        let Ok(_graph) = MetalGraph::global() else {
-            return;
-        };
-        let bytes = synthetic_ternary_gguf(0x22);
-        let gguf = GgufFile::parse(&bytes).expect("parse synthetic ternary GGUF");
-        let model = BonsaiModel::from_gguf(&gguf, FIXTURE_MAX_SEQ).expect("load synthetic model");
-        model.get_or_create_gpu_cache().expect("warm the GPU cache");
-
-        // Warm any lazily-initialised global the first binding would touch, so
-        // the measured call sees only its own allocations.
-        let warm = model.ternary_gpu_binding().expect("warm-up binding");
-        drop(warm);
-
-        let (result, allocations) = count_allocations(|| model.ternary_gpu_binding());
-        let binding = result.expect("binding on a warm cache");
-        assert_eq!(binding.layer_params.len(), FIXTURE_LAYERS);
-        assert!(
-            allocations <= 8,
-            "binding the ternary weights made {allocations} allocations; it must be a small \
-             constant (the parameter vector and the slot vector), not a copy of the model"
-        );
-
-        let _ = model.release_metal_weights();
-    }
-
-    /// A tail failure followed by the fallback path must not upload a second
-    /// copy of the model (MET-02).
-    ///
-    /// `try_metal_full_forward_with_lm_head_ternary` uploads every layer's
-    /// weights and only then runs the final-norm → LM-head tail, so a
-    /// deterministic tail failure leaves the model fully resident and sends
-    /// `BonsaiModel::forward()` into `try_metal_full_forward_ternary_inner`.
-    /// That path used to own a different handle namespace, so the fallback
-    /// doubled GPU residency on the very first token.
-    ///
-    /// **Assertion (b), the `cached_weight_count()` delta, is the load-bearing
-    /// one.** A second namespace uploads its duplicate at a *different* slot
-    /// and leaves the canonical entries untouched, so (a)'s per-slot
-    /// `Arc::ptr_eq` check passes straight through it — verified by
-    /// reintroducing a shifted `attn_proj`/`down` namespace, which (a) missed
-    /// and (b) caught as `left: 22, right: 18`. The price is that (b) is a
-    /// process-global count: it would also trip if some future test elsewhere
-    /// in this lib-test binary uploaded a Metal weight concurrently (none does
-    /// today — `gpu_serial()` covers every GPU test here). Assertions (a) and
-    /// (c) are immune to that, so a red (b) with green (a)/(c) means look for a
-    /// concurrent GPU test before suspecting the slot table.
-    #[test]
-    fn forced_tail_failure_does_not_duplicate_gpu_weights() {
-        let _gpu = gpu_serial();
-        let Ok(graph) = MetalGraph::global() else {
-            return;
-        };
-        let bytes = synthetic_ternary_gguf(0x33);
-        let gguf = GgufFile::parse(&bytes).expect("parse synthetic ternary GGUF");
-        let model = BonsaiModel::from_gguf(&gguf, FIXTURE_MAX_SEQ).expect("load synthetic model");
-
-        let (layers, tail) = model.ternary_gpu_slots().expect("derive ternary slots");
-        let keys = all_cache_keys(&layers, tail);
-
-        // ── Fused path, with the tail forced to fail after the uploads ──
-        let mut hidden = vec![0.05_f32; FIXTURE_HIDDEN];
-        let mut logits = Vec::new();
-        crate::model::types::forward_metal::set_force_ternary_tail_failure(true);
-        let fused = model.try_metal_full_forward_with_lm_head_ternary(&mut hidden, 0, &mut logits);
-        crate::model::types::forward_metal::set_force_ternary_tail_failure(false);
-        let err = fused.expect_err("the tail failure seam must make the fused path fail");
-        assert!(
-            err.to_string().contains("OXIBONSAI_FORCE_METAL_TAIL_FAIL"),
-            "the failure must come from the seam, not from something else: {err}"
-        );
-
-        let before: Vec<Arc<MetalWeightHandle>> = keys
-            .iter()
-            .map(|(slot, kind)| {
-                probe(&graph, *slot, *kind)
-                    .unwrap_or_else(|| panic!("slot {slot:#x} not resident after the fused path"))
-            })
-            .collect();
-        let cached_before = graph.cached_weight_count().expect("cached weight count");
-
-        // ── The fallback `forward()` takes on that failure ──────────────
-        model
-            .try_metal_full_forward_ternary_inner(&mut hidden, 0)
-            .expect("the ternary fallback path must run on the already-resident weights");
-
-        // (a) The canonical slots still hold the very same buffers.
-        for (i, (slot, kind)) in keys.iter().enumerate() {
-            let after = probe(&graph, *slot, *kind)
-                .unwrap_or_else(|| panic!("slot {slot:#x} disappeared during the fallback"));
-            assert!(
-                Arc::ptr_eq(&before[i], &after),
-                "slot {slot:#x} ({kind}) was re-uploaded by the fallback path: the two ternary \
-                 handle namespaces are back"
-            );
-        }
-
-        // (b) …and no buffer appeared *anywhere else* either, which is what the
-        // old 2M/3M namespace did: it left the 5M/6M entries untouched and
-        // uploaded a whole second copy beside them.
-        let cached_after = graph.cached_weight_count().expect("cached weight count");
-        assert_eq!(
-            cached_after,
-            cached_before,
-            "the ternary fallback path added {} GPU weight buffers; every weight it binds must \
-             already be resident under this model's slots",
-            cached_after.saturating_sub(cached_before)
-        );
-
-        // (c) Structurally: every handle the fallback binds is one of this
-        // model's canonical slots, so there is no second namespace to drift
-        // into in the first place.
-        let canonical: Vec<u64> = keys.iter().map(|(slot, _)| *slot).collect();
-        let binding = model.ternary_gpu_binding().expect("rebuild the binding");
-        for (i, lp) in binding.layer_params.iter().enumerate() {
-            for (name, handle) in [
-                ("attn_norm", lp.attn_norm_handle),
-                ("q_norm", lp.q_norm_handle),
-                ("k_norm", lp.k_norm_handle),
-                ("ffn_norm", lp.ffn_norm_handle),
-                ("fused_qkv", lp.fused_qkv_handle),
-                ("attn_proj", lp.attn_proj_handle),
-                ("gate_up", lp.gate_up_handle),
-                ("down", lp.down_handle),
-            ] {
-                assert!(
-                    canonical.contains(&handle),
-                    "layer {i} binds {name} to {handle:#x}, which is not one of this model's slots"
-                );
-            }
-        }
-
-        drop(before);
-        let _ = model.release_metal_weights();
-    }
-
-    /// Unloading a model releases its GPU buffers.
-    ///
-    /// Nothing evicts `MetalGraph`'s weight cache on its own, so without this a
-    /// model that is unloaded keeps its whole quantized self on the GPU — 7.2 GB
-    /// per load for the 27B `PQ2_0`.
-    #[test]
-    fn release_metal_weights_drops_this_models_buffers() {
-        let _gpu = gpu_serial();
-        let Ok(graph) = MetalGraph::global() else {
-            return;
-        };
-        let bytes = synthetic_ternary_gguf(0x44);
-        let gguf = GgufFile::parse(&bytes).expect("parse synthetic ternary GGUF");
-        let model = BonsaiModel::from_gguf(&gguf, FIXTURE_MAX_SEQ).expect("load synthetic model");
-        model
-            .get_or_create_gpu_cache()
-            .expect("build the GPU cache");
-
-        let (layers, tail) = model.ternary_gpu_slots().expect("derive ternary slots");
-        let keys = all_cache_keys(&layers, tail);
-        for (slot, kind) in &keys {
-            assert!(
-                probe(&graph, *slot, *kind).is_some(),
-                "slot {slot:#x} should be resident before release"
-            );
-        }
-
-        let resident_before = graph.resident_weight_bytes().expect("resident bytes");
-        let released = model.release_metal_weights().expect("release this model");
-        assert_eq!(released, keys.len(), "every owned slot must be released");
-
-        for (slot, kind) in &keys {
-            assert!(
-                probe(&graph, *slot, *kind).is_none(),
-                "slot {slot:#x} is still cached after release"
-            );
-        }
-        let resident_after = graph.resident_weight_bytes().expect("resident bytes");
-        assert!(
-            resident_after < resident_before,
-            "releasing {} buffers must lower the resident-byte gauge ({resident_before} → \
-             {resident_after})",
-            keys.len()
-        );
-
-        // The model rebuilds its cache on demand afterwards.
-        model
-            .get_or_create_gpu_cache()
-            .expect("the cache must rebuild after a release");
-        for (slot, kind) in &keys {
-            assert!(
-                probe(&graph, *slot, *kind).is_some(),
-                "slot {slot:#x} should be resident again after a rebuild"
-            );
-        }
-        let _ = model.release_metal_weights();
-    }
-
-    /// Dropping the *last* (here, only) replica sharing a model's ternary GPU
-    /// buffers releases them — spec 1(c) / ACCEPTANCE "`release_model` drops
-    /// the handles on Drop" — with no explicit `release_metal_weights()` call
-    /// anywhere in this test.
-    #[test]
-    fn drop_of_the_last_ternary_replica_releases_the_shared_gpu_buffers() {
-        let _gpu = gpu_serial();
-        let Ok(graph) = MetalGraph::global() else {
-            return;
-        };
-        let bytes = synthetic_ternary_gguf(0x66);
-        let gguf = GgufFile::parse(&bytes).expect("parse synthetic ternary GGUF");
-        let keys = {
-            let model = BonsaiModel::from_gguf(&gguf, FIXTURE_MAX_SEQ).expect("load model");
-            model.get_or_create_gpu_cache().expect("warm the GPU cache");
-            let (layers, tail) = model.ternary_gpu_slots().expect("derive slots");
-            let keys = all_cache_keys(&layers, tail);
-            for (slot, kind) in &keys {
-                assert!(
-                    probe(&graph, *slot, *kind).is_some(),
-                    "slot {slot:#x} should be resident before drop"
-                );
-            }
-            keys
-            // `model` is dropped here, at the end of this block — nothing
-            // else calls `release_metal_weights()` in this test.
-        };
-        for (slot, kind) in &keys {
-            assert!(
-                probe(&graph, *slot, *kind).is_none(),
-                "slot {slot:#x} is still cached after its only model dropped"
-            );
-        }
-    }
-
-    /// Dropping one of several replicas that share a model's ternary GPU
-    /// buffers must NOT evict them out from under the replicas still alive —
-    /// the failure mode a bare, unconditional `Drop -> release_metal_weights`
-    /// would reintroduce (a 27B pool re-uploading 7.2 GB mid-serve). Once the
-    /// last replica drops, the buffers must still be released.
-    #[test]
-    fn drop_of_a_non_last_ternary_replica_does_not_evict_the_shared_buffers() {
-        let _gpu = gpu_serial();
-        let Ok(graph) = MetalGraph::global() else {
-            return;
-        };
-        let bytes = synthetic_ternary_gguf(0x88);
-        let gguf = GgufFile::parse(&bytes).expect("parse synthetic ternary GGUF");
-
-        let replica_a = BonsaiModel::from_gguf(&gguf, FIXTURE_MAX_SEQ).expect("load replica A");
-        let replica_b = BonsaiModel::from_gguf(&gguf, FIXTURE_MAX_SEQ).expect("load replica B");
-        replica_a.get_or_create_gpu_cache().expect("warm A");
-        replica_b.get_or_create_gpu_cache().expect("warm B");
-
-        // Non-vacuous: both replicas must resolve to the very same slots
-        // (MET-02's "engine-pool replicas share one upload"), or dropping one
-        // trivially wouldn't touch the other's and the rest of this test
-        // would pass for the wrong reason.
-        let (layers_a, tail_a) = replica_a.ternary_gpu_slots().expect("slots A");
-        let (layers_b, tail_b) = replica_b.ternary_gpu_slots().expect("slots B");
-        assert_eq!(
-            layers_a, layers_b,
-            "two replicas of one GgufFile must resolve to the same layer slots"
-        );
-        assert_eq!(
-            tail_a, tail_b,
-            "two replicas of one GgufFile must resolve to the same tail slots"
-        );
-        let keys = all_cache_keys(&layers_a, tail_a);
-
-        for (slot, kind) in &keys {
-            assert!(
-                probe(&graph, *slot, *kind).is_some(),
-                "slot {slot:#x} should be resident once both replicas are warm"
-            );
-        }
-
-        drop(replica_a);
-
-        // Replica B is still alive and shares these exact slots: none of them
-        // may have been evicted by A's drop.
-        for (slot, kind) in &keys {
-            assert!(
-                probe(&graph, *slot, *kind).is_some(),
-                "slot {slot:#x} was evicted while a sibling replica was still alive"
-            );
-        }
-
-        drop(replica_b);
-
-        // Now the last replica is gone: the shared buffers must be released.
-        for (slot, kind) in &keys {
-            assert!(
-                probe(&graph, *slot, *kind).is_none(),
-                "slot {slot:#x} is still cached after the last replica dropped"
-            );
-        }
-    }
-}
+#[path = "gpu_cache_tests.rs"]
+mod tests;

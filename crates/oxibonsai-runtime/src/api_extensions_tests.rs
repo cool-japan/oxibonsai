@@ -365,6 +365,81 @@ fn stream_decode_state_flushes_realistic_held_back_prefix_before_id_stop() {
     );
 }
 
+/// Post-verifier-review, narrower residual of the `step_decode`-`Ok(None)`
+/// fix: reproduces `extended_chat_completions_stream`'s exact fixed
+/// ordering (the id-fast-path check now runs BEFORE
+/// `reasoning_splitter.push`, gated on `!in_reasoning()`) for the one case
+/// the fix specifically targets and the old ordering could not reach at
+/// all — a stop-configured id landing in the post-`</think>`
+/// newline-swallow window (`Phase::JustClosed`), before any real content
+/// token. Confirmed live on the real 27B model: `<|im_end|>` really is
+/// vocabulary-flagged `special` there, so it really does decode to `""`
+/// via `step_decode`, and a model that stops immediately after its
+/// reasoning (no separate content at all) would hit exactly this.
+///
+/// Pins the precondition the reordering exists for: with the OLD ordering
+/// (check `hit_stop_by_id` only after `push`), `push` returns `Boundary`
+/// for this empty piece in `JustClosed` (`reasoning.rs::push`'s own
+/// `trimmed.is_empty()` arm) and the loop's `Boundary => continue` would
+/// skip the id check entirely, past `break`, on to the next token — this
+/// test demonstrates both halves: the id fast path trips when checked
+/// first (the fix), and `push` alone, for the exact same id/phase, really
+/// would have produced the `Boundary` a bare `continue` swallows (the
+/// precondition — a post-`push`-only check could not have reached the id
+/// check at all for this case).
+#[test]
+fn a_stop_id_landing_in_the_post_think_newline_window_still_stops_generation() {
+    const CLOSE_THINK_ID: u32 = 248069;
+    const IM_END_ID: u32 = 248046; // confirmed special on the real 27B model
+    let mut stop_ids = HashSet::new();
+    stop_ids.insert(IM_END_ID);
+    let mut decode_loop = StreamDecodeState::new(&["<|im_end|>".to_string()], stop_ids);
+    let mut splitter = crate::reasoning::ReasoningSplitter::new(true, Some(CLOSE_THINK_ID));
+
+    // A token or two of reasoning, matching the loop's own per-token shape.
+    assert!(!matches!(
+        splitter.push(1, "thinking"),
+        crate::reasoning::ReasoningChunk::Boundary
+    ));
+
+    // `</think>` — enters `Phase::JustClosed`.
+    assert_eq!(
+        splitter.push(CLOSE_THINK_ID, "</think>"),
+        crate::reasoning::ReasoningChunk::Boundary
+    );
+
+    // `<|im_end|>` arrives immediately after, decoding to `""` (special,
+    // `step_decode` returns `None`) -- the loop's fixed ordering: check the
+    // id fast path first, since we are (correctly) not `in_reasoning()`
+    // here (`JustClosed`, not `Reasoning`).
+    assert!(
+        !splitter.in_reasoning(),
+        "must be in JustClosed, not Reasoning, for this to be the case under test"
+    );
+    assert!(
+        decode_loop.hit_stop_by_id(IM_END_ID),
+        "the id fast path must trip for the configured stop id regardless of reasoning phase"
+    );
+    // The loop `break`s here, exactly as the fixed code does -- `push` for
+    // this token is never even called once the id fast path has already
+    // claimed it.
+
+    // The precondition itself: had the OLD ordering run `push` for this
+    // same (id, "") FIRST, it would have returned `Boundary` -- a bare
+    // `continue` (the pre-fix code) discards that outcome and skips the
+    // very id check the assertion above just proved catches it. This is
+    // what makes the reordering necessary, not merely harmless.
+    let mut old_ordering_splitter =
+        crate::reasoning::ReasoningSplitter::new(true, Some(CLOSE_THINK_ID));
+    let _ = old_ordering_splitter.push(1, "thinking");
+    let _ = old_ordering_splitter.push(CLOSE_THINK_ID, "</think>");
+    assert_eq!(
+        old_ordering_splitter.push(IM_END_ID, ""),
+        crate::reasoning::ReasoningChunk::Boundary,
+        "a post-push-only check would have seen Boundary here, not a chance to stop"
+    );
+}
+
 #[test]
 fn stream_decode_state_flushes_held_back_tail_on_finish() {
     // Generation ends (EOS / max_tokens) before an unfinished prefix
@@ -1175,4 +1250,181 @@ async fn extended_endpoint_drops_guarded_control_token_in_message_content() {
          base /v1/chat/completions endpoint does, not encode it as the \
          model's real control-token id"
     );
+}
+
+// ── B1/B2/B3: real chat-template rendering + reasoning split wired into
+//    the extended endpoint too (non-streaming AND streaming) ────────────
+
+/// A vocabulary that DOES define `<think>`/`</think>` (RT-10: the shipped
+/// Qwen3 1.7B/8B do not, which is exactly why `tokenizer_with_control_token`
+/// above cannot double as this fixture) plus full printable-ASCII coverage
+/// so ordinary message text round-trips.
+fn think_capable_tokenizer() -> crate::tokenizer_bridge::TokenizerBridge {
+    use oxibonsai_tokenizer::{BpeMerges, OxiTokenizer, TokenizerConfig, Vocabulary};
+
+    let mut vocab = Vocabulary::new();
+    vocab.add_special("<unk>", 0);
+    vocab.add_special("<bos>", 1);
+    vocab.add_special("<eos>", 2);
+    vocab.add_special("<pad>", 3);
+    vocab.add_protected("<|im_start|>", 4);
+    vocab.add_protected("<|im_end|>", 5);
+    vocab.add_protected("<think>", 6);
+    vocab.add_protected("</think>", 7);
+
+    let mut next_id = 10u32;
+    for byte in 0x20u8..=0x7Eu8 {
+        vocab.insert(&char::from(byte).to_string(), next_id);
+        next_id += 1;
+    }
+    vocab.insert("\n", next_id);
+
+    let tokenizer = OxiTokenizer::new(vocab, BpeMerges::new(), TokenizerConfig::default());
+    crate::tokenizer_bridge::TokenizerBridge::from_native_tokenizer(tokenizer)
+}
+
+fn think_capable_router() -> axum::Router {
+    let config = oxibonsai_core::config::Qwen3Config::tiny_test();
+    let params = SamplingParams::default();
+    let engine = InferenceEngine::new(config, params, 42);
+    crate::server::create_router(engine, Some(think_capable_tokenizer()))
+}
+
+/// The extended endpoint must render through the real Jinja engine (B1)
+/// and stay a valid `200` end to end for a tokenizer whose vocabulary DOES
+/// define `<think>`/`</think>` — `reasoning_content`, if present, must be
+/// a well-formed string patched into the JSON response despite
+/// `ChatMessage` (`server.rs`) not declaring the field.
+#[tokio::test]
+async fn extended_endpoint_renders_through_the_real_template_with_a_think_capable_tokenizer() {
+    let app = think_capable_router();
+    let body = serde_json::json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 4
+    });
+    let resp = post_extended(app, body, None).await;
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let json: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
+    assert_eq!(status, StatusCode::OK, "{json}");
+    if let Some(rc) = json["choices"][0]["message"].get("reasoning_content") {
+        assert!(rc.is_string(), "reasoning_content must be a string: {json}");
+    }
+}
+
+/// Same tokenizer, streaming: the reasoning-split wiring in
+/// `extended_chat_completions_stream`'s decode task must not crash and
+/// must still produce a well-formed SSE stream ending in `[DONE]`.
+#[tokio::test]
+async fn extended_endpoint_stream_with_a_think_capable_tokenizer_is_well_formed_sse() {
+    let app = think_capable_router();
+    let body = serde_json::json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 4,
+        "stream": true
+    });
+    let resp = post_extended(app, body, None).await;
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let text = String::from_utf8_lossy(&bytes);
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert!(
+        text.trim_end().ends_with("data: [DONE]"),
+        "must terminate with [DONE]: {text}"
+    );
+    // Every SSE data line must be valid JSON (whether an ordinary content
+    // delta or a `reasoning_content` one).
+    for line in text.lines() {
+        if let Some(data) = line.strip_prefix("data: ") {
+            if data == "[DONE]" {
+                continue;
+            }
+            let _: serde_json::Value = serde_json::from_str(data)
+                .unwrap_or_else(|e| panic!("SSE data line must be valid JSON ({e}): {data}"));
+        }
+    }
+}
+
+/// spec item 1 ("an unsupported construct must ERROR"): `messages: []`
+/// reaching the render layer must be an honest `400`/`500`-free error
+/// response, not a silent bare prompt (the old `build_extended_prompt`
+/// behavior) or a panic.
+#[tokio::test]
+async fn extended_endpoint_empty_messages_errors_honestly() {
+    let app = think_capable_router();
+    let body = serde_json::json!({ "messages": [], "max_tokens": 4 });
+    let resp = post_extended(app, body, None).await;
+    assert!(
+        resp.status().is_client_error(),
+        "empty messages must be a client error, got {}",
+        resp.status()
+    );
+}
+
+// ── B11/SV-11 wiring, exercised over the real HTTP route ──────────────
+//
+// Mirrors `server/chat.rs`'s identical tests: `chat_render.rs`'s own tests
+// pin that `preprocess_message_content_and_reasoning` + `to_render_messages`
+// + `render_chat_prompt` together deliver a raw body's `reasoning_content`
+// into the actual rendered text; these confirm `extended_chat_completions`
+// really does call that pre-pass and thread its result through, end to
+// end, over the real route.
+
+#[tokio::test]
+async fn extended_endpoint_accepts_reasoning_content_on_a_replayed_assistant_turn() {
+    let app = think_capable_router();
+    let body = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "Hello!", "reasoning_content": "user greets"},
+            {"role": "user", "content": "thanks"}
+        ],
+        "max_tokens": 4
+    });
+    let resp = post_extended(app, body, None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn extended_endpoint_flattens_a_text_only_vision_content_array() {
+    let app = think_capable_router();
+    let body = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "hello"},
+                {"type": "text", "text": " world"}
+            ]}
+        ],
+        "max_tokens": 4
+    });
+    let resp = post_extended(app, body, None).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a text-only content array must be flattened and accepted, not rejected at the schema level"
+    );
+}
+
+#[tokio::test]
+async fn extended_endpoint_rejects_an_image_url_content_part_honestly() {
+    let app = think_capable_router();
+    let body = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "https://example.invalid/x.png"}}
+            ]}
+        ],
+        "max_tokens": 4
+    });
+    let resp = post_extended(app, body, None).await;
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("body bytes");
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
 }

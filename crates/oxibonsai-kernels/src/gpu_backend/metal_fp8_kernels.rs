@@ -4,8 +4,16 @@
 //!
 //! # Architecture
 //!
-//! - Independent singleton (own [`metal::Device`] + [`metal::CommandQueue`])
-//! - Two compute pipelines: `gemv_fp8_e4m3` and `gemv_fp8_e5m2`
+//! - **No private Metal state** (`MET-10`). The two pipelines,
+//!   `gemv_fp8_e4m3` and `gemv_fp8_e5m2`, are resolved by entry-point name
+//!   from the combined metallib `build.rs` embeds (`ACTIVE_KERNELS` lists
+//!   `MSL_GEMV_FP8_E4M3_V1` / `MSL_GEMV_FP8_E5M2_V1`) through
+//!   [`MetalGraph::pipeline_for`] — the embedded → disk-cached → `xcrun` →
+//!   runtime-source cascade every kernel family shares. This file used to
+//!   compile two private `MTLLibrary`s from source on first use.
+//! - Dispatch runs on the *current session's* command queue
+//!   ([`MetalGraph::global`]), so an engine-pool replica's GEMVs stay on that
+//!   replica's queue (`MET-08`).
 //! - All buffers use shared storage (`MTLResourceOptions::StorageModeShared`)
 //!   so CPU-side reads/writes do not require explicit blit copies.
 //!
@@ -25,77 +33,9 @@
 
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
-use std::sync::OnceLock;
+use metal::MTLResourceOptions;
 
-use metal::{CompileOptions, ComputePipelineState, MTLResourceOptions};
-
-use super::kernel_sources::{MSL_GEMV_FP8_E4M3_V1, MSL_GEMV_FP8_E5M2_V1};
 use super::metal_graph::{commit_and_wait, MetalGraph, MetalGraphError};
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Singleton state
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Process-wide Metal FP8 dispatch state.
-///
-/// Holds the Metal device, command queue, and compiled pipelines.  Initialized
-/// lazily on first call to [`metal_gemv_fp8_e4m3`] / [`metal_gemv_fp8_e5m2`].
-struct MetalFp8State {
-    pipeline_e4m3: ComputePipelineState,
-    pipeline_e5m2: ComputePipelineState,
-}
-
-// SAFETY: The underlying `metal::Device` and `metal::CommandQueue` are
-// reference-counted Objective-C objects that are safe to share across threads
-// once initialised.  Apple's Metal API documents these types as thread-safe.
-unsafe impl Send for MetalFp8State {}
-unsafe impl Sync for MetalFp8State {}
-
-impl MetalFp8State {
-    fn new() -> Result<Self, MetalGraphError> {
-        // `MET-10`: compile against the **shared** device rather than opening
-        // a second `Device::system_default()` handle with its own queue.
-        let device = MetalGraph::global()?.device().to_owned();
-
-        let options = CompileOptions::new();
-
-        let lib_e4m3 = device
-            .new_library_with_source(MSL_GEMV_FP8_E4M3_V1, &options)
-            .map_err(|e| MetalGraphError::CompilationFailed(format!("FP8 E4M3 library: {e}")))?;
-        let func_e4m3 = lib_e4m3
-            .get_function("gemv_fp8_e4m3", None)
-            .map_err(|e| MetalGraphError::CompilationFailed(format!("FP8 E4M3 function: {e}")))?;
-        let pipeline_e4m3 = device
-            .new_compute_pipeline_state_with_function(&func_e4m3)
-            .map_err(|e| MetalGraphError::CompilationFailed(format!("FP8 E4M3 pipeline: {e}")))?;
-
-        let lib_e5m2 = device
-            .new_library_with_source(MSL_GEMV_FP8_E5M2_V1, &options)
-            .map_err(|e| MetalGraphError::CompilationFailed(format!("FP8 E5M2 library: {e}")))?;
-        let func_e5m2 = lib_e5m2
-            .get_function("gemv_fp8_e5m2", None)
-            .map_err(|e| MetalGraphError::CompilationFailed(format!("FP8 E5M2 function: {e}")))?;
-        let pipeline_e5m2 = device
-            .new_compute_pipeline_state_with_function(&func_e5m2)
-            .map_err(|e| MetalGraphError::CompilationFailed(format!("FP8 E5M2 pipeline: {e}")))?;
-
-        Ok(Self {
-            pipeline_e4m3,
-            pipeline_e5m2,
-        })
-    }
-}
-
-/// Lazy process-wide singleton.
-fn state() -> Result<&'static MetalFp8State, MetalGraphError> {
-    static STATE: OnceLock<Result<MetalFp8State, MetalGraphError>> = OnceLock::new();
-    match STATE.get_or_init(MetalFp8State::new) {
-        Ok(s) => Ok(s),
-        // `MetalGraphError` derives `Clone` (`O3`), so the four hand-written
-        // exhaustive `clone_err` matches this file used to carry are gone.
-        Err(e) => Err(e.clone()),
-    }
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Public dispatch functions
@@ -109,6 +49,13 @@ const FP8_BLOCK_K: usize = 32;
 const SIMDS_PER_TG: usize = 8;
 /// Threads per threadgroup (8 simdgroups × 32 lanes).
 const THREADS_PER_TG: u64 = 256;
+
+/// Entry point of the FP8 E4M3 GEMV kernel in the combined metallib
+/// (`kernel_sources::MSL_GEMV_FP8_E4M3_V1`).
+pub(crate) const GEMV_FP8_E4M3_ENTRY: &str = "gemv_fp8_e4m3";
+/// Entry point of the FP8 E5M2 GEMV kernel in the combined metallib
+/// (`kernel_sources::MSL_GEMV_FP8_E5M2_V1`).
+pub(crate) const GEMV_FP8_E5M2_ENTRY: &str = "gemv_fp8_e5m2";
 
 /// FP8 E4M3FN GEMV on Metal GPU.
 ///
@@ -150,6 +97,16 @@ enum Fp8Variant {
     E5M2,
 }
 
+impl Fp8Variant {
+    /// The variant's GEMV entry point in the combined metallib.
+    const fn entry(self) -> &'static str {
+        match self {
+            Self::E4M3 => GEMV_FP8_E4M3_ENTRY,
+            Self::E5M2 => GEMV_FP8_E5M2_ENTRY,
+        }
+    }
+}
+
 fn dispatch_metal_fp8_gemv(
     blocks: &[u8],
     input: &[f32],
@@ -186,18 +143,13 @@ fn dispatch_metal_fp8_gemv(
         )));
     }
 
-    let s = state()?;
-    // `MET-10`: dispatch on the **shared** device and on the *current
-    // session's* command queue, instead of the private
-    // `Device::system_default()` + `new_command_queue()` this family used to
-    // own. Five independent `MTLCommandQueue`s on one device is what made
-    // these kernel families invisible to the `MET-08` session split; routed
-    // through `MetalGraph::global()` they inherit the caller's session, so a
-    // replica's submissions stay on that replica's queue. (The pipelines
-    // themselves still live in this family's own Metal library — folding them
-    // into the combined metallib is the other, separately-owned half of
-    // `MET-10`.)
+    // `MET-10`: the shared device, the *current session's* command queue, and
+    // a pipeline resolved by name from the combined metallib — no private
+    // device, queue or library. `MetalGraph::global()` resolves to the session
+    // bound to this thread (an engine-pool replica's), else the process
+    // default; `pipeline_for` caches the pipeline state by name.
     let graph = MetalGraph::global()?;
+    let pipeline = graph.pipeline_for(variant.entry())?;
 
     // ── Allocate buffers ────────────────────────────────────────────────────
     let block_buf = graph.device().new_buffer_with_data(
@@ -229,11 +181,7 @@ fn dispatch_metal_fp8_gemv(
     let cmd = graph.command_queue.new_command_buffer();
     let encoder = cmd.new_compute_command_encoder();
 
-    let pipeline = match variant {
-        Fp8Variant::E4M3 => &s.pipeline_e4m3,
-        Fp8Variant::E5M2 => &s.pipeline_e5m2,
-    };
-    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_compute_pipeline_state(&pipeline);
     encoder.set_buffer(0, Some(&block_buf), 0);
     encoder.set_buffer(1, Some(&input_buf), 0);
     encoder.set_buffer(2, Some(&output_buf), 0);
@@ -273,10 +221,29 @@ fn dispatch_metal_fp8_gemv(
 mod tests {
     use super::*;
 
+    /// `true` when this host has no usable Metal device (CPU-only CI).
+    fn no_metal() -> bool {
+        MetalGraph::global().is_err()
+    }
+
     #[test]
     fn fp8_variant_enum_compiles() {
-        let _ = Fp8Variant::E4M3;
-        let _ = Fp8Variant::E5M2;
+        assert_eq!(Fp8Variant::E4M3.entry(), GEMV_FP8_E4M3_ENTRY);
+        assert_eq!(Fp8Variant::E5M2.entry(), GEMV_FP8_E5M2_ENTRY);
+    }
+
+    /// `MET-10`: both FP8 GEMV entry points resolve from the **combined**
+    /// metallib — this family no longer compiles a library of its own.
+    #[test]
+    fn fp8_gemv_entries_resolve_from_the_combined_metallib() {
+        let Ok(graph) = MetalGraph::global() else {
+            return; // no Metal device on this host
+        };
+        for entry in [GEMV_FP8_E4M3_ENTRY, GEMV_FP8_E5M2_ENTRY] {
+            graph
+                .pipeline_for(entry)
+                .unwrap_or_else(|e| panic!("{entry} must resolve from the combined metallib: {e}"));
+        }
     }
 
     #[test]
@@ -290,7 +257,7 @@ mod tests {
     /// Skipped silently on hosts without a Metal device (CI runners, Linux/Windows).
     #[test]
     fn metal_gemv_fp8_e4m3_matches_cpu_reference() {
-        if state().is_err() {
+        if no_metal() {
             // No Metal device — skip on CPU-only CI hosts.
             return;
         }
@@ -357,7 +324,7 @@ mod tests {
     /// CPU-vs-GPU parity for FP8 E5M2 GEMV. CI-GPU-gated like the E4M3 test.
     #[test]
     fn metal_gemv_fp8_e5m2_matches_cpu_reference() {
-        if state().is_err() {
+        if no_metal() {
             return;
         }
 

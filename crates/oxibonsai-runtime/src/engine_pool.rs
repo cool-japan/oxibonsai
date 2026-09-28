@@ -25,7 +25,14 @@
 //!   serialising on one another's `MutexGuard`s. The pool size is therefore
 //!   `min(requested, MetalGraph::max_sessions())` — a *memory* bound (604 MB
 //!   of device KV per session for the 8B at `ctx = 4096`), not a correctness
-//!   one.
+//!   one. The weights really are held once: the ternary fused route keys its
+//!   device buffers on the mapped tensors' addresses (shared by every replica
+//!   of one `GgufFile`), and the 1-bit route's per-replica
+//!   `upload_weights_to_gpu` is deduplicated by content in `Scirs2Backend` —
+//!   a replica uploading byte-identical weights gets the resident handle back,
+//!   so the `MetalGraph` slots keyed on those handles coincide too. Each
+//!   replica's registrations are released when it drops (`MET-M1`), and a
+//!   buffer is freed only with its last replica.
 //! - On the CUDA tier the process-global `CudaGraph` singleton is unchanged,
 //!   so `N > 1` replicas would still corrupt each other's KV: the clamp to `1`
 //!   stays there (see [`resolve_pool_sizing`]).
@@ -620,12 +627,96 @@ pub fn build_pool_from_gguf(
     max_seq_len: usize,
     requested_size: Option<usize>,
 ) -> crate::error::RuntimeResult<(Arc<EnginePool>, oxibonsai_kernels::KernelTier, usize)> {
+    let built = build_pool_from_gguf_parts(
+        path,
+        sampling_params,
+        seed,
+        max_seq_len,
+        requested_size,
+        crate::engine_seam::Backend::Auto,
+    )?;
+    Ok((built.pool, built.tier, built.size))
+}
+
+/// Everything [`build_pool_from_gguf_parts`] built, including the pieces a
+/// server needs to construct *further* engines off the same weights without
+/// a second mapping — e.g. the dedicated embedding engine of
+/// `ModelEmbedder::from_static_gguf`.
+pub struct PoolBuild {
+    /// The replica pool.
+    pub pool: Arc<EnginePool>,
+    /// The kernel tier replica `#1` resolved to.
+    pub tier: oxibonsai_kernels::KernelTier,
+    /// The effective replica count.
+    pub size: usize,
+    /// The leaked, process-lifetime GGUF every replica borrows.
+    pub gguf: &'static oxibonsai_core::gguf::reader::GgufFile<'static>,
+    /// The shared token-embedding handle every replica was built with (empty
+    /// for a quantized or hybrid embedding, which is read from the mapping).
+    pub shared_token_embd: Arc<[f32]>,
+    /// Whether the replicas hold a hybrid (`qwen35`) model.
+    pub hybrid: bool,
+}
+
+impl std::fmt::Debug for PoolBuild {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PoolBuild")
+            .field("pool", &self.pool)
+            .field("tier", &self.tier)
+            .field("size", &self.size)
+            .field("hybrid", &self.hybrid)
+            .finish_non_exhaustive()
+    }
+}
+
+/// [`build_pool_from_gguf`] on an explicit [`crate::engine_seam::Backend`],
+/// returning every part of the build ([`PoolBuild`]).
+///
+/// A **hybrid** (`qwen35`) model runs on a CPU tier, where the generic sizing
+/// would default to `min(4, cores)` replicas. Each 27B replica carries its own
+/// KV cache, a ~157 MB recurrent state and its chunk scratch, and a single
+/// CPU replica already saturates memory bandwidth, so an *unspecified* size
+/// is 1 for a hybrid model (logged); an explicit `requested_size` is honoured.
+///
+/// # Errors
+///
+/// Anything replica construction returns (see
+/// [`InferenceEngine::from_gguf_path_leaked_with_backend`]).
+pub fn build_pool_from_gguf_parts(
+    path: impl AsRef<std::path::Path>,
+    sampling_params: crate::sampling::SamplingParams,
+    seed: u64,
+    max_seq_len: usize,
+    requested_size: Option<usize>,
+    backend: crate::engine_seam::Backend,
+) -> crate::error::RuntimeResult<PoolBuild> {
     // Replica #1 — this leaks the mmap + parsed GGUF to `'static`.
-    let (first, gguf) =
-        InferenceEngine::from_gguf_path_leaked(path, sampling_params.clone(), seed, max_seq_len)?;
+    let (first, gguf) = InferenceEngine::from_gguf_path_leaked_with_backend(
+        path,
+        sampling_params.clone(),
+        seed,
+        max_seq_len,
+        backend,
+    )?;
 
     let tier = first.kernel_tier();
-    let sizing = resolve_pool_sizing(requested_size, tier);
+    let hybrid = first.is_hybrid();
+    let sizing = if hybrid && requested_size.is_none() {
+        tracing::info!(
+            architecture = %first.architecture(),
+            "hybrid model: defaulting the engine pool to 1 replica (each replica holds its own \
+             KV cache and recurrent state, and one CPU replica already saturates memory \
+             bandwidth); pass an explicit pool size to run more"
+        );
+        PoolSizing {
+            requested: None,
+            effective: 1,
+            clamped_by_gpu_tier: false,
+            gpu_max: None,
+        }
+    } else {
+        resolve_pool_sizing(requested_size, tier)
+    };
     let size = sizing.effective;
 
     // The effective size is what an admission controller must budget against
@@ -652,17 +743,25 @@ pub fn build_pool_from_gguf(
     // Replicas 2..size reuse the already-`'static` GGUF (zero extra mmap/copy)
     // and the shared `Arc<[f32]>` token-embedding table (zero extra dequant/copy).
     for _ in 1..size {
-        let replica = InferenceEngine::from_gguf_static_with_embd(
+        let replica = InferenceEngine::from_gguf_static_with_embd_and_backend(
             gguf,
             sampling_params.clone(),
             seed,
             max_seq_len,
             Arc::clone(&shared_token_embd),
+            backend,
         )?;
         engines.push(replica);
     }
 
-    Ok((EnginePool::new(engines), tier, size))
+    Ok(PoolBuild {
+        pool: EnginePool::new(engines),
+        tier,
+        size,
+        gguf,
+        shared_token_embd,
+        hybrid,
+    })
 }
 
 #[cfg(test)]
@@ -1128,7 +1227,11 @@ mod tests {
         // KV caches must be DISTINCT per replica (per-request mutable state).
         let kv_ptrs: Vec<*const _> = leases
             .iter()
-            .map(|l| l.model().kv_cache() as *const _)
+            .map(|l| {
+                l.dense_model()
+                    .expect("the Q1 fixture is a dense model")
+                    .kv_cache() as *const _
+            })
             .collect();
         for i in 0..kv_ptrs.len() {
             for j in (i + 1)..kv_ptrs.len() {

@@ -401,6 +401,98 @@ fn prism_gemv_par<B: Sync>(
     }
 }
 
+/// `m`-dispatching Prism GEMM entry (minor[0], K-INT8 wave-4b gatekeeper
+/// re-verify): [`prism_gemm_chunk_rows`] floors the parallel slab width at
+/// [`PRISM_GEMM_MR`] (`chunk_rows = max(m.div_ceil(threads), MR)`), so the
+/// batch-parallel path collapses to a **single** slab — `min(chunk_rows, m)
+/// == m` — for every `m <= MR`, not only `m < MR`: at `m == MR` exactly,
+/// `m.div_ceil(threads) <= MR` for any `threads >= 1`, so the `max` still
+/// picks `MR == m` and one task covers the whole batch. Decode (`m == 1`)
+/// always hit this, and so does every `m` up to and including `MR` (8 on
+/// this host) even once `m` clears
+/// [`crate::tuning::PlatformThresholds::par_gemm_min_batch`]. Measured on
+/// this M3 at the 27B `ffn_up` shape (`[5120, 17408]`): `f32`
+/// `gemm_pq2_0(m=1)` 26.7ms vs `gemv_pq2_0` 5.2ms (5.1x), and `m=5` 120ms —
+/// *slower* than `m=64`'s 98.6ms despite doing 12x less work, because `m=64`
+/// gets real 8-way slab parallelism and `m=5` gets none.
+///
+/// The fix loops [`prism_gemv_par`] once per batch row instead of taking the
+/// single-threaded blocked path, which gets each row real
+/// weight-row-parallel fan-out (`n_rows` — 17408 above — is normally far
+/// larger than `PRISM_GEMM_MR`, so this is where the real parallelism is for
+/// small `m`). This is **bit-exact**, not an approximation: a register
+/// block's per-`(batch row, weight row)` accumulation order already matches
+/// the plain GEMV sweep exactly (this module's doc comment, and
+/// `*_blocked_gemm_is_bit_identical_to_the_gemv_sweep`'s `TAIL_M = 13`
+/// case), so looping the GEMV per row reproduces the blocked kernel's bits
+/// for every `m`, not only `m == 1`.
+///
+/// The shape is validated whole, before any row is sliced out of `input` /
+/// `output`, so a mismatched buffer still reports the same named error the
+/// blocked path would have (never a slice-index panic).
+///
+/// Note on `m` just above [`PRISM_GEMM_MR`] (e.g. 9..~63 on an 8-thread, MR=8
+/// host): [`prism_gemm_chunk_rows`]'s own floor still caps the slab width at
+/// `MR`, so parallelism there ramps up gradually with `m` (2 slabs at
+/// `m=9..15`, not the full thread count) rather than jumping straight to
+/// `m=64`'s full 8-way split. That is strictly better than the pre-K-INT8
+/// single-slab behavior this function replaces for `m <= MR`, and matches
+/// the pre-existing, previously-accepted chunking this function defers to
+/// for `m > MR` — narrowing it further is a distinct, separate
+/// optimization, not part of this fix-up's scope.
+#[allow(clippy::too_many_arguments)]
+fn prism_gemm_dispatch<B: Sync>(
+    blocks: &[B],
+    input: &[f32],
+    output: &mut [f32],
+    m: usize,
+    n_rows: usize,
+    k: usize,
+    qk: usize,
+    gemv_kernel: PrismGemvFn<B>,
+    blocked: PrismGemmFn<B>,
+) -> KernelResult<()> {
+    crate::dequant_prism::validate_prism_gemm(
+        blocks.len(),
+        input.len(),
+        output.len(),
+        m,
+        n_rows,
+        k,
+        qk,
+    )?;
+    if m == 0 || n_rows == 0 {
+        return Ok(());
+    }
+
+    // On WASM there is no Rayon worker pool (`prism_gemv_par`'s own
+    // WASM arm is already sequential, and so is `prism_gemm_par`'s), so
+    // `PRISM_GEMM_MR` — a *parallel* slab-width floor — has nothing to do
+    // with the choice there; always take the register-blocked path below,
+    // which still gets weight-decode reuse across batch rows even
+    // single-threaded. `gemv_kernel` genuinely goes unused on this arch.
+    #[cfg(target_arch = "wasm32")]
+    let _ = gemv_kernel;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    if m <= PRISM_GEMM_MR {
+        for mi in 0..m {
+            prism_gemv_par(
+                blocks,
+                &input[mi * k..(mi + 1) * k],
+                &mut output[mi * n_rows..(mi + 1) * n_rows],
+                n_rows,
+                k,
+                qk,
+                gemv_kernel,
+            )?;
+        }
+        return Ok(());
+    }
+
+    prism_gemm_par(blocks, input, output, m, n_rows, k, qk, blocked)
+}
+
 /// Batch-parallel, register-blocked Prism GEMM driver.
 ///
 /// Rayon splits the **batch** dimension into slabs of whole batch rows, so
@@ -490,8 +582,18 @@ impl PrismKernel for KernelDispatcher {
         if let Some(tier) = Int8Tier::from_env() {
             return dispatch_int8::gemm_two_bit_int8(tier, blocks, input, output, m, n_rows, k);
         }
-        let kernel = gemm_pq2_0_kernel(self.prism_tier());
-        prism_gemm_par(blocks, input, output, m, n_rows, k, QK_PQ2_0, kernel)
+        let tier = self.prism_tier();
+        prism_gemm_dispatch(
+            blocks,
+            input,
+            output,
+            m,
+            n_rows,
+            k,
+            QK_PQ2_0,
+            gemv_pq2_0_kernel(tier),
+            gemm_pq2_0_kernel(tier),
+        )
     }
 
     /// **Not** wired to [`Int8Tier`]: see this module's doc comment
@@ -519,8 +621,18 @@ impl PrismKernel for KernelDispatcher {
         n_rows: usize,
         k: usize,
     ) -> KernelResult<()> {
-        let kernel = gemm_ptq1_0_kernel(self.prism_tier());
-        prism_gemm_par(blocks, input, output, m, n_rows, k, QK_PTQ1_0, kernel)
+        let tier = self.prism_tier();
+        prism_gemm_dispatch(
+            blocks,
+            input,
+            output,
+            m,
+            n_rows,
+            k,
+            QK_PTQ1_0,
+            gemv_ptq1_0_kernel(tier),
+            gemm_ptq1_0_kernel(tier),
+        )
     }
 
     fn gemv_q2_0_g64(
@@ -552,8 +664,18 @@ impl PrismKernel for KernelDispatcher {
         if let Some(tier) = Int8Tier::from_env() {
             return dispatch_int8::gemm_two_bit_int8(tier, blocks, input, output, m, n_rows, k);
         }
-        let kernel = gemm_q2_0_g64_kernel(self.prism_tier());
-        prism_gemm_par(blocks, input, output, m, n_rows, k, QK_Q2_0_G64, kernel)
+        let tier = self.prism_tier();
+        prism_gemm_dispatch(
+            blocks,
+            input,
+            output,
+            m,
+            n_rows,
+            k,
+            QK_Q2_0_G64,
+            gemv_q2_0_g64_kernel(tier),
+            gemm_q2_0_g64_kernel(tier),
+        )
     }
 
     // ── Hybrid math primitives: every tier converges on one self-dispatching
@@ -671,13 +793,12 @@ mod tests {
     /// Guards every test in this module that calls a wired `PrismKernel`
     /// method (`gemv_pq2_0`/`gemm_pq2_0`/`gemv_q2_0_g64`/`gemm_q2_0_g64`),
     /// which now reads [`crate::dispatch_int8::Int8Tier::from_env`] on
-    /// every call — see `crate::dispatch_int8::KERNEL_TIER_ENV_LOCK`'s doc
-    /// comment for why this must be the *same* lock
-    /// `dispatch_int8.rs`'s env-mutating test takes.
-    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        crate::dispatch_int8::KERNEL_TIER_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    /// every call. Returns [`crate::dispatch_int8::TierEnvGuard`], the same
+    /// lock `dispatch_int8.rs`'s env-mutating test takes, which additionally
+    /// snapshots/restores the variable so a panic here can't leak a
+    /// mutated `OXIBONSAI_KERNEL_TIER` to later tests (K-INT8 wave-4b).
+    fn env_guard() -> crate::dispatch_int8::TierEnvGuard {
+        crate::dispatch_int8::TierEnvGuard::acquire()
     }
 
     fn pq2_0_block(scale: f32) -> BlockPQ2_0 {
@@ -797,15 +918,14 @@ mod prism_blocked_tests {
     use half::f16;
 
     /// See `tests::env_guard` (this file's other `#[cfg(test)]` module) —
-    /// same lock, same reason: any test here that goes through the
+    /// same guard, same reason: any test here that goes through the
     /// dispatcher (`KernelDispatcher::gemv_pq2_0` etc., not the raw
     /// `gemv_pq2_0_kernel(tier)(..)` functions) now reads
     /// `Int8Tier::from_env` and must be serialized against
-    /// `dispatch_int8.rs`'s env-mutating test.
-    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        crate::dispatch_int8::KERNEL_TIER_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    /// `dispatch_int8.rs`'s env-mutating test, with the environment
+    /// snapshotted and restored around the call (K-INT8 wave-4b).
+    fn env_guard() -> crate::dispatch_int8::TierEnvGuard {
+        crate::dispatch_int8::TierEnvGuard::acquire()
     }
 
     /// Deterministic LCG — no `rand` dependency, reproducible across runs.
@@ -1077,6 +1197,107 @@ mod prism_blocked_tests {
         assert!((out[1] + 128.0).abs() < 1e-3, "got {}", out[1]);
     }
 
+    /// K-INT8 wave-4b minor[0] fix-up: `m == 1` (decode) must route through
+    /// weight-row-parallel `gemv_pq2_0` (via [`prism_gemm_dispatch`]), not
+    /// the single-threaded blocked GEMM path — and must be bit-for-bit
+    /// identical either way. `n_rows` is sized off `par_gemv_min_rows`
+    /// (never hardcoded) so `prism_gemv_par`'s own Rayon split is really
+    /// exercised, not just its below-threshold direct path.
+    #[test]
+    fn gemm_pq2_0_dispatcher_m1_matches_gemv_par() {
+        let _guard = env_guard();
+        let dispatcher = KernelDispatcher::auto_detect();
+        let n_rows = PlatformProfile::global_thresholds().par_gemv_min_rows * 3 + 7;
+        let k = 2 * QK_PQ2_0;
+        let blocks = pq2_blocks(n_rows * (k / QK_PQ2_0), 0x5EED_0010);
+        let input = inputs(k, 0x1234_0010);
+
+        let mut via_gemv = vec![0.0f32; n_rows];
+        dispatcher
+            .gemv_pq2_0(&blocks, &input, &mut via_gemv, n_rows, k)
+            .expect("gemv_pq2_0");
+
+        let mut via_gemm = vec![0.0f32; n_rows];
+        dispatcher
+            .gemm_pq2_0(&blocks, &input, &mut via_gemm, 1, n_rows, k)
+            .expect("gemm_pq2_0 with m=1");
+
+        assert_bit_identical(&via_gemv, &via_gemm, "gemm_pq2_0(m=1) vs gemv_pq2_0");
+    }
+
+    /// Same contract at `m == 5`, inside `(1, PRISM_GEMM_MR)` — the range
+    /// that used to collapse to a single slab regardless of thread count
+    /// (see [`prism_gemm_dispatch`]'s doc comment).
+    #[test]
+    fn gemm_pq2_0_dispatcher_m5_matches_gemv_sweep() {
+        let _guard = env_guard();
+        let dispatcher = KernelDispatcher::auto_detect();
+        let n_rows = PlatformProfile::global_thresholds().par_gemv_min_rows * 2 + 3;
+        let k = 2 * QK_PQ2_0;
+        let m = 5usize;
+        let blocks = pq2_blocks(n_rows * (k / QK_PQ2_0), 0x5EED_0011);
+        let input = inputs(m * k, 0x1234_0011);
+
+        let mut expect = vec![0.0f32; m * n_rows];
+        for mi in 0..m {
+            dispatcher
+                .gemv_pq2_0(
+                    &blocks,
+                    &input[mi * k..(mi + 1) * k],
+                    &mut expect[mi * n_rows..(mi + 1) * n_rows],
+                    n_rows,
+                    k,
+                )
+                .expect("gemv sweep row");
+        }
+
+        let mut got = vec![0.0f32; m * n_rows];
+        dispatcher
+            .gemm_pq2_0(&blocks, &input, &mut got, m, n_rows, k)
+            .expect("gemm_pq2_0 with m=5");
+
+        assert_bit_identical(&expect, &got, "gemm_pq2_0(m=5) vs the gemv sweep");
+    }
+
+    /// Boundary case for [`prism_gemm_dispatch`]: `m == PRISM_GEMM_MR`
+    /// exactly (not `m < PRISM_GEMM_MR`) is the case that was still missed
+    /// by an earlier, off-by-one version of this fix-up — at `m == MR`,
+    /// `prism_gemm_chunk_rows`'s own floor makes `chunk_rows == m` too, so
+    /// the *old* boundary (`m < MR`) would still hand this exact `m` to the
+    /// single-slab blocked path. Bit-exactness is the only thing a unit
+    /// test can pin cheaply; the parallelism win itself is measured by the
+    /// `#[ignore]`d wall-clock tests.
+    #[test]
+    fn gemm_pq2_0_dispatcher_at_m_equals_mr_matches_gemv_sweep() {
+        let _guard = env_guard();
+        let dispatcher = KernelDispatcher::auto_detect();
+        let n_rows = PlatformProfile::global_thresholds().par_gemv_min_rows * 2 + 5;
+        let k = 2 * QK_PQ2_0;
+        let m = PRISM_GEMM_MR; // exactly the boundary this fix-up must cover
+        let blocks = pq2_blocks(n_rows * (k / QK_PQ2_0), 0x5EED_0012);
+        let input = inputs(m * k, 0x1234_0012);
+
+        let mut expect = vec![0.0f32; m * n_rows];
+        for mi in 0..m {
+            dispatcher
+                .gemv_pq2_0(
+                    &blocks,
+                    &input[mi * k..(mi + 1) * k],
+                    &mut expect[mi * n_rows..(mi + 1) * n_rows],
+                    n_rows,
+                    k,
+                )
+                .expect("gemv sweep row");
+        }
+
+        let mut got = vec![0.0f32; m * n_rows];
+        dispatcher
+            .gemm_pq2_0(&blocks, &input, &mut got, m, n_rows, k)
+            .expect("gemm_pq2_0 with m=PRISM_GEMM_MR");
+
+        assert_bit_identical(&expect, &got, "gemm_pq2_0(m=MR) vs the gemv sweep");
+    }
+
     /// Gatekeeper REQUIRED #9's numeric acceptance: a batched CPU prefill of
     /// Bonsai 2 27B shape must stop being a single-threaded GEMV loop.
     ///
@@ -1153,6 +1374,94 @@ mod prism_blocked_tests {
             speedup >= 4.0,
             "tiled + rayon Prism GEMM must be >= 4x the single-threaded GEMV loop \
              at M=64 (got {speedup:.2}x: {before:?} -> {after:?})"
+        );
+    }
+
+    /// K-INT8 wave-4b minor[0]'s numeric acceptance: the same before/after
+    /// shape as [`prism_prefill_m64_is_no_longer_a_single_threaded_gemv_loop`],
+    /// at `M = 1` (decode) instead of `64` — `before` is the plain blocked
+    /// kernel (what every `gemm_pq2_0` call used to run at this `m`, since
+    /// `1 < par_gemm_min_batch` on every platform profile), `after` is
+    /// [`prism_gemm_dispatch`]'s `m < PRISM_GEMM_MR` fast path.
+    ///
+    /// Takes the **min of several trials** on each side rather than one
+    /// shot: this dev machine runs under heavy, highly variable background
+    /// load from sibling sessions (observed load average 30-60 on 8 cores
+    /// while developing this test), and a single sample swings from ~0.6x
+    /// to ~4x depending on what else the scheduler is doing to the process
+    /// in that instant — the min isolates the code path's own cost from
+    /// that noise (standard microbenchmark practice under contention).
+    /// Observed range across repeated runs while developing this fix:
+    /// 1.4x-3.9x; the assertion below picks a floor comfortably under the
+    /// worst of those, not the best case. Same `#[ignore]` reason as the
+    /// `M = 64` test: a wall-clock comparison, meaningless in a debug
+    /// build, and still sensitive to how loaded the machine is. Run
+    /// deliberately: `cargo test -p oxibonsai-kernels --release
+    /// --all-features prism_decode_m1 -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "wall-clock perf comparison; run manually in --release, not under concurrent-build CI"]
+    fn prism_decode_m1_is_no_longer_a_single_threaded_blocked_task() {
+        use std::time::{Duration, Instant};
+
+        /// Wall-clock min of `TRIALS` calls to `f`, discarding scheduler
+        /// noise spikes rather than averaging them in.
+        fn min_of_trials(trials: u32, mut f: impl FnMut()) -> Duration {
+            let mut best = Duration::MAX;
+            for _ in 0..trials {
+                let t0 = Instant::now();
+                f();
+                best = best.min(t0.elapsed());
+            }
+            best
+        }
+
+        let _guard = env_guard();
+        let (n_rows, k) = (17408usize, 5120usize);
+        let blocks = pq2_blocks(n_rows * (k / QK_PQ2_0), 0xB00C_0011);
+        let input = inputs(k, 0xB00C_0012);
+        let dispatcher = KernelDispatcher::auto_detect();
+        let tier = dispatcher.prism_tier();
+        let blocked = gemm_pq2_0_kernel(tier);
+        const TRIALS: u32 = 15;
+
+        // Warm the caches/branch predictors once on each path before timing.
+        let mut before_out = vec![0.0f32; n_rows];
+        let mut after_out = vec![0.0f32; n_rows];
+        blocked(&blocks, &input, &mut before_out, 1, n_rows, k).expect("warmup blocked");
+        dispatcher
+            .gemm_pq2_0(&blocks, &input, &mut after_out, 1, n_rows, k)
+            .expect("warmup dispatcher");
+
+        let before = min_of_trials(TRIALS, || {
+            blocked(&blocks, &input, &mut before_out, 1, n_rows, k)
+                .expect("before: single-threaded blocked m=1");
+        });
+        let after = min_of_trials(TRIALS, || {
+            dispatcher
+                .gemm_pq2_0(&blocks, &input, &mut after_out, 1, n_rows, k)
+                .expect("after: dispatcher gemm_pq2_0 m=1");
+        });
+
+        assert_bit_identical(
+            &before_out,
+            &after_out,
+            "before/after m=1 must still agree bit for bit",
+        );
+
+        let speedup = before.as_secs_f64() / after.as_secs_f64().max(1e-9);
+        println!(
+            "prism decode M=1 ffn_up[{k},{n_rows}] tier={tier:?} threads={}: \
+             before {:?} -> after {:?} = {speedup:.2}x (min of {TRIALS} trials each)",
+            rayon::current_num_threads(),
+            before,
+            after
+        );
+        assert!(
+            speedup >= 1.3,
+            "gemm_pq2_0(m=1) must be faster once routed through prism_gemv_par \
+             (got {speedup:.2}x: {before:?} -> {after:?}); if this fails on a \
+             quiet machine (not just under shared-CI-style load), that is a \
+             real regression, not noise"
         );
     }
 
@@ -1279,7 +1588,25 @@ mod prism_blocked_tests {
                 .iter()
                 .zip(env_selected.iter())
                 .any(|(a, b)| a.to_bits() != b.to_bits()),
-            "the int8-tier result was bit-identical to the f32 result -- \
+            "the int8-tier GEMV result was bit-identical to the f32 result -- \
+             the env var did not actually change which kernel ran"
+        );
+
+        // K-INT8 wave-4b test-hygiene fix-up: the GEMV divergence check
+        // above does not prove `gemm_pq2_0` reads the tier too -- only the
+        // bit-identity-to-`dispatch_int8` checks earlier in this test did
+        // that, and only against the int8 path. Prove GEMM also diverges
+        // from the f32 path once the env var is cleared.
+        let mut f32_path_gemm = vec![0.0f32; 3 * n_rows];
+        dispatcher
+            .gemm_pq2_0(&blocks, &batched_input, &mut f32_path_gemm, 3, n_rows, k)
+            .expect("f32 gemm_pq2_0 after clearing the env var");
+        assert!(
+            f32_path_gemm
+                .iter()
+                .zip(env_selected_gemm.iter())
+                .any(|(a, b)| a.to_bits() != b.to_bits()),
+            "the int8-tier GEMM result was bit-identical to the f32 GEMM result -- \
              the env var did not actually change which kernel ran"
         );
     }
@@ -1352,6 +1679,37 @@ mod prism_blocked_tests {
         unsafe {
             std::env::remove_var(dispatch_int8::KERNEL_TIER_ENV);
         }
+
+        // K-INT8 wave-4b test-hygiene fix-up: this test previously stopped
+        // at the int8-vs-int8 bit-identity checks above and never proved
+        // the env var changes anything relative to the plain f32 path (the
+        // pq2_0 sibling test only checked this for GEMV). Check both GEMV
+        // and GEMM diverge from the f32 path once the variable is cleared.
+        let mut f32_path = vec![0.0f32; n_rows];
+        dispatcher
+            .gemv_q2_0_g64(&blocks, &input, &mut f32_path, n_rows, k)
+            .expect("f32 gemv_q2_0_g64 after clearing the env var");
+        assert!(
+            f32_path
+                .iter()
+                .zip(env_selected.iter())
+                .any(|(a, b)| a.to_bits() != b.to_bits()),
+            "the int8-tier GEMV result was bit-identical to the f32 result -- \
+             the env var did not actually change which kernel ran"
+        );
+
+        let mut f32_path_gemm = vec![0.0f32; 3 * n_rows];
+        dispatcher
+            .gemm_q2_0_g64(&blocks, &batched_input, &mut f32_path_gemm, 3, n_rows, k)
+            .expect("f32 gemm_q2_0_g64 after clearing the env var");
+        assert!(
+            f32_path_gemm
+                .iter()
+                .zip(env_selected_gemm.iter())
+                .any(|(a, b)| a.to_bits() != b.to_bits()),
+            "the int8-tier GEMM result was bit-identical to the f32 GEMM result -- \
+             the env var did not actually change which kernel ran"
+        );
     }
 
     /// Pins the deliberate non-wiring this module's doc comment explains:

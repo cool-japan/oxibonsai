@@ -7,7 +7,7 @@ use super::tokenizer_backend::{self, TokenizerBackendChoice};
 use super::util::{
     build_sampling_params, check_tokenizer_model_compatibility, missing_tokenizer_warning,
     model_vocab_size, read_prompt_stdin, reject_penalties_with_constrained_decode,
-    resolve_tokenizer_vocab_aware, StopChecker,
+    resolve_tokenizer_vocab_aware, StopChecker, TokenizerLookup,
 };
 
 /// Resolved arguments for `oxibonsai run`, merged from CLI flags and
@@ -101,7 +101,24 @@ pub(crate) fn run(args: RunArgs) -> anyhow::Result<()> {
 
     // cli-16: report the RESOLVED quant variant + effective kernel tier,
     // never a hardcoded kernel-family string.
-    if let Ok(config) = oxibonsai_core::config::Qwen3Config::from_metadata(&gguf.metadata) {
+    if let Some(hybrid) = engine.hybrid_model() {
+        // ENGINE-SEAM: a hybrid (`qwen35`) engine resolved its own variant
+        // and weight quantization at load; the dense tensor-count heuristic
+        // below would misname it.
+        let variant = hybrid.variant().map_or_else(
+            || engine.architecture().to_string(),
+            |v| v.name().to_string(),
+        );
+        eprintln!(
+            "{}",
+            model_desc::resolved_engine_summary(
+                &variant,
+                engine.dominant_quant_type(),
+                engine.kernel_tier(),
+                &engine.effective_tier_reason(),
+            )
+        );
+    } else if let Ok(config) = oxibonsai_core::config::Qwen3Config::from_metadata(&gguf.metadata) {
         let dominant_type = gguf
             .tensors
             .count_by_type()
@@ -128,11 +145,19 @@ pub(crate) fn run(args: RunArgs) -> anyhow::Result<()> {
     // TOK-08: resolution prefers a vocab-matching auto-detected candidate,
     // and (below) the tokenizer is hard-checked against the model
     // regardless of whether it was auto-detected or passed explicitly.
+    // ENGINE-SEAM: a GGUF that embeds its own tokenizer (every Bonsai 2
+    // `qwen35` file) uses it when no on-disk candidate fits the model.
     let expected_vocab = model_vocab_size(&gguf).ok();
     let lookup = resolve_tokenizer_vocab_aware(tokenizer.as_deref(), &model, expected_vocab);
-    let (prompt_tokens, tok_bridge) = if let Some(tok_path) = &lookup.found {
-        let tok = tokenizer_backend::load_tokenizer_bridge(tok_path, tokenizer_backend)?;
-        check_tokenizer_model_compatibility(&tok, tok_path, &gguf, allow_vocab_mismatch)?;
+    let resolved = resolve_model_tokenizer(
+        tokenizer.as_deref(),
+        &lookup,
+        &gguf,
+        expected_vocab,
+        tokenizer_backend,
+        allow_vocab_mismatch,
+    )?;
+    let (prompt_tokens, tok_bridge) = if let Some(tok) = resolved {
         let tokens = tok.encode(&prompt_text)?;
         (tokens, Some(tok))
     } else {
@@ -225,6 +250,99 @@ pub(crate) fn run(args: RunArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// The tokenizer a model-loading subcommand uses (TOK-08 + ENGINE-SEAM).
+///
+/// An explicit `--tokenizer`, or an auto-detected `tokenizer.json` that
+/// passes [`check_tokenizer_model_compatibility`], is used exactly as before.
+/// When no on-disk candidate exists, or an *auto-detected* one does not fit
+/// the model, a tokenizer embedded in the GGUF itself (`tokenizer.ggml.*`)
+/// whose vocabulary matches the model is used instead: every Bonsai 2
+/// `qwen35` file carries its `pre = qwen35` tokenizer, while the repository's
+/// `models/tokenizer.json` is the legacy Qwen3 one, so without this fallback a
+/// Bonsai 2 run either failed the compatibility check or mis-tokenized. An
+/// explicit `--tokenizer` that does not fit still fails loudly.
+///
+/// Returns `Ok(None)` when there is no usable tokenizer at all (the caller's
+/// existing "no tokenizer" handling applies).
+pub(crate) fn resolve_model_tokenizer(
+    explicit: Option<&str>,
+    lookup: &TokenizerLookup,
+    gguf: &oxibonsai_core::gguf::reader::GgufFile<'_>,
+    expected_vocab: Option<usize>,
+    backend: TokenizerBackendChoice,
+    allow_vocab_mismatch: bool,
+) -> anyhow::Result<Option<oxibonsai_runtime::TokenizerBridge>> {
+    resolve_model_tokenizer_with(
+        explicit,
+        lookup,
+        gguf,
+        expected_vocab,
+        allow_vocab_mismatch,
+        |path| tokenizer_backend::load_tokenizer_bridge(path, backend),
+    )
+}
+
+/// [`resolve_model_tokenizer`] with the caller's own loader for the on-disk
+/// candidate (`benchmark` loads through `TokenizerBridge::from_file`).
+pub(crate) fn resolve_model_tokenizer_with(
+    explicit: Option<&str>,
+    lookup: &TokenizerLookup,
+    gguf: &oxibonsai_core::gguf::reader::GgufFile<'_>,
+    expected_vocab: Option<usize>,
+    allow_vocab_mismatch: bool,
+    load: impl FnOnce(&str) -> anyhow::Result<oxibonsai_runtime::TokenizerBridge>,
+) -> anyhow::Result<Option<oxibonsai_runtime::TokenizerBridge>> {
+    let Some(path) = &lookup.found else {
+        return Ok(gguf_embedded_tokenizer(gguf, expected_vocab));
+    };
+    let tok = load(path)?;
+    match check_tokenizer_model_compatibility(&tok, path, gguf, allow_vocab_mismatch) {
+        Ok(()) => Ok(Some(tok)),
+        Err(mismatch) if explicit.is_none() => {
+            match gguf_embedded_tokenizer(gguf, expected_vocab) {
+                Some(embedded) => {
+                    tracing::info!(
+                        skipped = %path,
+                        reason = %mismatch,
+                        "the auto-detected tokenizer does not fit this model; using the tokenizer \
+                         embedded in the GGUF instead"
+                    );
+                    Ok(Some(embedded))
+                }
+                None => Err(mismatch),
+            }
+        }
+        Err(mismatch) => Err(mismatch),
+    }
+}
+
+/// The tokenizer embedded in `gguf`'s `tokenizer.ggml.*` metadata, when the
+/// file carries one whose vocabulary equals the model's (`expected_vocab`).
+pub(crate) fn gguf_embedded_tokenizer(
+    gguf: &oxibonsai_core::gguf::reader::GgufFile<'_>,
+    expected_vocab: Option<usize>,
+) -> Option<oxibonsai_runtime::TokenizerBridge> {
+    let expected = expected_vocab?;
+    match oxibonsai_runtime::engine::tokenizer_from_gguf(gguf) {
+        Ok(tok) if tok.vocab_size() == expected => {
+            tracing::info!(vocab = expected, "using the tokenizer embedded in the GGUF");
+            Some(tok)
+        }
+        Ok(tok) => {
+            tracing::debug!(
+                embedded_vocab = tok.vocab_size(),
+                model_vocab = expected,
+                "the GGUF-embedded tokenizer does not match the model's vocabulary; not used"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "no usable GGUF-embedded tokenizer");
+            None
+        }
+    }
 }
 
 /// The original three-way fast path (greedy-GPU / native-CUDA /

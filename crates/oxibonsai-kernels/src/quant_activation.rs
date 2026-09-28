@@ -165,13 +165,40 @@ impl Int8Activation {
             let row = &input[r * k..(r + 1) * k];
             for b in 0..blocks_per_row {
                 let block = &row[b * qk..(b + 1) * qk];
-                let amax = block.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
-                let scale = amax / INT8_ACTIVATION_MAX;
+                // K-INT8 wave-4b (minor[6]): `f32::max` follows IEEE 754's
+                // `maxNum` and silently ignores a NaN operand, so folding
+                // `amax` with it would make a NaN activation element quantize
+                // to code `0` whenever another element in the same block was
+                // large enough to give a finite, nonzero `scale` — the block
+                // would reconstruct as if that NaN had never been there, the
+                // opposite of the f32 reference path's NaN contagion (any
+                // NaN weight-activation product poisons the whole sum). A
+                // block that holds *any* NaN gets a NaN `scale` instead, so
+                // it propagates through `two_bit_rows`' `scale * acc as f32`
+                // exactly like the f32 path would — silent divergence here
+                // would otherwise hide a real upstream numerical fault
+                // whenever the INT8 tier is on.
+                let mut amax = 0.0f32;
+                let mut has_nan = false;
+                for &v in block {
+                    if v.is_nan() {
+                        has_nan = true;
+                    } else {
+                        amax = amax.max(v.abs());
+                    }
+                }
+                let scale = if has_nan {
+                    f32::NAN
+                } else {
+                    amax / INT8_ACTIVATION_MAX
+                };
                 scales[r * blocks_per_row + b] = scale;
                 if scale <= 0.0 || !scale.is_finite() {
-                    // All-zero block (or one whose `amax` is not finite):
-                    // every code stays 0, and so does the sum, which the
-                    // reconstruction multiplies by a zero scale anyway.
+                    // All-zero block, a NaN-holding block (scale forced to
+                    // NaN above), or one whose `amax` is otherwise not
+                    // finite: every code stays 0, and so does `sum`, which
+                    // the reconstruction multiplies by a non-finite scale
+                    // anyway (propagating NaN, not silently dropping it).
                     continue;
                 }
                 let inv = 1.0f32 / scale;
@@ -419,6 +446,51 @@ mod int8_activation_tests {
         assert_eq!(act.sums_row(0), &[0]);
         assert!(act.codes_row(0).iter().all(|&c| c == 0));
         assert_eq!(act.relative_error(&input).expect("relative_error"), 0.0);
+    }
+
+    /// K-INT8 wave-4b (minor[6]): a NaN activation element must poison its
+    /// whole block's `scale` (and therefore, downstream, that block's
+    /// contribution to the dot product) rather than silently quantizing to
+    /// code `0` and vanishing — `f32::max` alone would do exactly that,
+    /// since IEEE 754 `maxNum` ignores a NaN operand.
+    #[test]
+    fn a_nan_element_poisons_its_blocks_scale_instead_of_vanishing() {
+        let mut input = vec![1.0f32; 128];
+        input[5] = f32::NAN;
+        let act =
+            Int8Activation::quantize(&input, 1, 128, 128, Int8Layout::Stride4).expect("quantize");
+        assert!(
+            act.scales_row(0)[0].is_nan(),
+            "a block containing a NaN element must get a NaN scale, not a \
+             finite one derived from the other elements"
+        );
+        // Without the fix, the other (finite, all equal to 1.0) elements
+        // would still set a well-defined, nonzero scale via `f32::max`, so
+        // this negative check pins that the fix is really in effect, not
+        // just that *some* non-finite path was hit.
+        assert_ne!(
+            act.scales_row(0)[0].to_bits(),
+            (1.0f32 / INT8_ACTIVATION_MAX).to_bits(),
+            "the NaN must not have been silently dropped from the amax fold"
+        );
+    }
+
+    /// Companion to the single-block test above: a block with **no** NaN in
+    /// the same row as one that does must be entirely unaffected — NaN
+    /// contagion is per-block, not per-row.
+    #[test]
+    fn a_nan_in_one_block_does_not_poison_a_sibling_block_in_the_same_row() {
+        let mut input = vec![1.0f32; 256]; // two 128-wide blocks
+        input[10] = f32::NAN; // only block 0
+        let act =
+            Int8Activation::quantize(&input, 1, 256, 128, Int8Layout::Stride4).expect("quantize");
+        assert!(act.scales_row(0)[0].is_nan(), "block 0 must be poisoned");
+        assert!(
+            (act.scales_row(0)[1] - 1.0 / INT8_ACTIVATION_MAX).abs() < 1e-9,
+            "block 1 (no NaN) must quantize normally: got {}",
+            act.scales_row(0)[1]
+        );
+        assert!(act.codes_row(0)[128..].iter().all(|&c| c == 127));
     }
 
     #[test]

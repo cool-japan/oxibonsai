@@ -62,8 +62,11 @@ pub mod embeddings;
 pub mod engine;
 pub mod engine_control;
 pub mod engine_greedy;
+mod engine_load;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod engine_pool;
+pub mod engine_seam;
+mod engine_stream;
 pub mod error;
 pub mod grammar;
 pub mod health;

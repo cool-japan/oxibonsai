@@ -155,6 +155,21 @@ pub enum ModelError {
         tokens: usize,
     },
 
+    /// A recurrent (Gated-DeltaNet) state handed to a model does not match
+    /// that model's recurrent geometry (REQUIRED #6).
+    ///
+    /// Installing a state from another model — or into a dense stack, which
+    /// has no recurrent layers at all — would either index out of bounds or,
+    /// worse, silently run the recurrence on another model's history. The
+    /// setter refuses instead, naming both geometries.
+    #[error("recurrent state mismatch: the model expects {expected}, the state has {actual}")]
+    RecurrentStateMismatch {
+        /// The geometry the model's recurrent layers need.
+        expected: String,
+        /// The geometry of the state that was offered.
+        actual: String,
+    },
+
     /// A hybrid (`qwen35`) GGUF has no `output.weight` (design §3.5).
     ///
     /// Every shipped Bonsai 2 file carries an explicit, Hadamard-folded LM
@@ -222,6 +237,7 @@ impl ModelError {
             Self::InvalidTensor(_) => "INVALID_TENSOR",
             Self::UngroupedFoldedGdnOutput { .. } => "UNGROUPED_FOLDED_GDN_OUTPUT",
             Self::RecurrentRollbackUnsupported { .. } => "RECURRENT_ROLLBACK_UNSUPPORTED",
+            Self::RecurrentStateMismatch { .. } => "RECURRENT_STATE_MISMATCH",
             Self::TiedLmHeadUnsupported { .. } => "TIED_LM_HEAD_UNSUPPORTED",
             Self::KvAllocation { .. } => "KV_ALLOCATION",
             Self::Core(_) => "CORE_ERROR",

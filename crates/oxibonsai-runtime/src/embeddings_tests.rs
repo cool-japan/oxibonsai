@@ -950,3 +950,152 @@ async fn default_router_is_unaffected_by_the_require_model_backend_gate() {
     let (status, _json) = post(app, serde_json::json!({ "input": "hello" })).await;
     assert_eq!(status, StatusCode::OK);
 }
+
+// ── EMBED-WIRE item 3: text over the token ceiling refuses ────────────────
+
+/// A deterministic double implementing both [`Embedder`] and
+/// [`EmbeddingTokenCounter`], so the `context_length_exceeded` guard can be
+/// exercised without a real model or tokenizer: `count_tokens` is simply the
+/// character count, which makes the assertions below exact and easy to
+/// reason about.
+struct CountingEmbedder {
+    dim: usize,
+    max_tokens: usize,
+}
+
+impl Embedder for CountingEmbedder {
+    fn embed(&self, text: &str) -> Result<Vec<f32>, oxibonsai_rag::error::RagError> {
+        let mut v = vec![0.0f32; self.dim];
+        v[0] = text.len() as f32 + 1.0;
+        l2_normalize(&mut v);
+        Ok(v)
+    }
+
+    fn embedding_dim(&self) -> usize {
+        self.dim
+    }
+}
+
+impl crate::embed_engine::EmbeddingTokenCounter for CountingEmbedder {
+    fn count_tokens(&self, text: &str) -> Option<usize> {
+        Some(text.chars().count())
+    }
+
+    fn max_input_tokens(&self) -> Option<usize> {
+        Some(self.max_tokens)
+    }
+}
+
+/// A registry with `CountingEmbedder` wired as both the model backend
+/// ([`EmbedderRegistry::with_model_embedder`]) and the token counter
+/// ([`EmbedderRegistry::with_token_counter`]) — pairing them is what keeps
+/// [`EmbeddingAppState::from_registry`]'s debug_assert from firing (item 4).
+fn counting_registry(max_tokens: usize) -> EmbedderRegistry {
+    let double = Arc::new(CountingEmbedder { dim: 4, max_tokens });
+    EmbedderRegistry::new(4)
+        .with_model_embedder(Arc::clone(&double) as Arc<dyn Embedder>)
+        .with_token_counter(
+            Arc::clone(&double) as Arc<dyn crate::embed_engine::EmbeddingTokenCounter>
+        )
+}
+
+#[tokio::test]
+async fn text_input_over_the_token_ceiling_is_refused_with_context_length_exceeded() {
+    let app =
+        create_embeddings_router_from_state(EmbeddingAppState::from_registry(counting_registry(5)));
+    let (status, json) = post(app, serde_json::json!({ "input": "123456" })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+    assert_eq!(
+        json["error"]["code"].as_str(),
+        Some("context_length_exceeded"),
+        "{json}"
+    );
+    assert_eq!(json["error"]["param"].as_str(), Some("input"), "{json}");
+    assert_eq!(json["error"]["n_tokens"].as_u64(), Some(6), "{json}");
+    assert_eq!(json["error"]["max_tokens"].as_u64(), Some(5), "{json}");
+}
+
+#[tokio::test]
+async fn text_input_at_the_token_ceiling_is_accepted() {
+    let app =
+        create_embeddings_router_from_state(EmbeddingAppState::from_registry(counting_registry(5)));
+    let (status, json) = post(app, serde_json::json!({ "input": "12345" })).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+}
+
+#[tokio::test]
+async fn only_the_offending_batch_item_is_named_in_a_multi_input_request() {
+    let app =
+        create_embeddings_router_from_state(EmbeddingAppState::from_registry(counting_registry(5)));
+    let (status, json) = post(
+        app,
+        serde_json::json!({ "input": ["short", "way too long an input"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("input[1]"),
+        "the second (over-length) item must be named, not the first: {json}"
+    );
+}
+
+// ── EMBED-WIRE item 4: builder misuse guard ────────────────────────────────
+
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "with_token_counter/with_token_embedder was installed without")]
+fn with_token_counter_without_a_model_embedder_trips_the_debug_assert() {
+    let orphaned = EmbedderRegistry::new(8).with_token_counter(Arc::new(CountingEmbedder {
+        dim: 8,
+        max_tokens: 100,
+    }));
+    let _ = EmbeddingAppState::from_registry(orphaned);
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "with_token_counter/with_token_embedder was installed without")]
+fn with_token_embedder_without_a_model_embedder_trips_the_debug_assert() {
+    struct NoOpTokenEmbedder;
+    impl crate::embed_engine::TokenSequenceEmbedder for NoOpTokenEmbedder {
+        fn embed_token_ids(
+            &self,
+            _tokens: &[u32],
+        ) -> Result<Vec<f32>, oxibonsai_rag::error::RagError> {
+            Ok(vec![0.0; 4])
+        }
+    }
+    let orphaned = EmbedderRegistry::new(8).with_token_embedder(Arc::new(NoOpTokenEmbedder));
+    let _ = EmbeddingAppState::from_registry(orphaned);
+}
+
+#[test]
+fn with_token_counter_paired_with_a_model_embedder_does_not_panic() {
+    // The non-misuse case: pairing `with_token_counter` with
+    // `with_model_embedder` (what `counting_registry` above does, and what
+    // `EmbedderRegistry::with_model` does automatically for a `ModelEmbedder`)
+    // must NOT trip the guard, regardless of build profile.
+    let registry = counting_registry(100);
+    let _state = EmbeddingAppState::from_registry(registry);
+}
+
+#[test]
+fn embedding_dim_agrees_with_the_vectors_the_with_model_embedder_path_returns() {
+    // Spec item 4's other half: once a model backend IS installed (even the
+    // generic `with_model_embedder` path, not just `with_model`),
+    // `embedding_dim()` must equal the length of the vectors that path
+    // actually returns.
+    let registry =
+        EmbedderRegistry::new(999).with_model_embedder(Arc::new(FixedVectorEmbedder { dim: 4 }));
+    let vectors = registry.embed_texts(&["hello".to_string(), "world".to_string()]);
+    for (i, v) in vectors.iter().enumerate() {
+        assert_eq!(
+            v.len(),
+            registry.embedding_dim(),
+            "item {i}: embedding_dim() must agree with the vectors actually returned"
+        );
+    }
+}

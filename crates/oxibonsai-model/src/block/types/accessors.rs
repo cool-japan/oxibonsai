@@ -38,17 +38,73 @@ impl<'a> TransformerBlock<'a> {
 
     // ── GPU weight handles ───────────────────────────────────────────────────
 
-    /// Fused QKV GPU handle (if uploaded).
+    /// Fused QKV GPU handle (if uploaded) — the **1-bit** one.
+    ///
+    /// Every caller decodes this handle's buffer as `Q1_0_g128` (the Q1 GPU
+    /// weight cache, the Q1 fused-forward and CUDA paths), so it is gated on
+    /// the block's format (`M-21`): a ternary block always answers `None`
+    /// here, even if a handle were ever stored in the 1-bit field, and exposes
+    /// its own through [`Self::fused_qkv_gpu_handle_ternary`].
     pub fn fused_qkv_gpu_handle(&self) -> Option<GpuWeightHandle> {
+        if self.attn_q.blocks_ternary().is_some() {
+            return None;
+        }
         self.fused_qkv_handle
     }
     /// Attention output projection GPU handle (if uploaded).
     pub fn attn_output_gpu_handle(&self) -> Option<GpuWeightHandle> {
         self.attn_output.gpu_handle()
     }
-    /// Fused gate+up GPU handle (if uploaded).
+    /// Fused gate+up GPU handle (if uploaded) — the **1-bit** one, gated on
+    /// the block's format exactly like [`Self::fused_qkv_gpu_handle`]
+    /// (`M-21`); see [`Self::fused_gate_up_gpu_handle_ternary`] for ternary
+    /// blocks.
     pub fn fused_gate_up_gpu_handle(&self) -> Option<GpuWeightHandle> {
+        if self.ffn_gate.blocks_ternary().is_some() {
+            return None;
+        }
         self.fused_gate_up_handle
+    }
+    /// Fused Q‖K‖V GPU handle of a **ternary** block (`M-21`), if
+    /// `upload_to_gpu` ran on a GPU-tier kernel.
+    pub fn fused_qkv_gpu_handle_ternary(&self) -> Option<GpuWeightHandle> {
+        self.fused_qkv_handle_ternary
+    }
+    /// Fused gate‖up GPU handle of a **ternary** block (`M-21`), if
+    /// `upload_to_gpu` ran on a GPU-tier kernel.
+    pub fn fused_gate_up_gpu_handle_ternary(&self) -> Option<GpuWeightHandle> {
+        self.fused_gate_up_handle_ternary
+    }
+    /// GPU weight-cache slot of a ternary block's fused Q‖K‖V buffer
+    /// (`M-21`): the dedicated fused handle's id when `upload_to_gpu` built
+    /// one, else the Q projection's handle id (the slot the fused arm keyed
+    /// on before the dedicated handle existed); `None` when the block was
+    /// never uploaded, i.e. the fused arm must not engage.
+    ///
+    /// Every forward path that runs the ternary fused-QKV GEMV must derive its
+    /// slot here so they all bind **one** GPU buffer — `forward` does;
+    /// `forward_with_sliding_window` / `forward_with_stats` still key on
+    /// [`Self::legacy_ternary_fused_qkv_slot`] until their owner switches them
+    /// (a recorded one-line change each).
+    pub fn ternary_fused_qkv_slot(&self) -> Option<u64> {
+        self.fused_qkv_handle_ternary
+            .or_else(|| self.attn_q.gpu_handle())
+            .map(|handle| handle.id())
+    }
+    /// The Q projection's handle id — the fused-QKV slot every ternary Metal
+    /// forward path keyed on before `M-21` gave the concatenation its own
+    /// handle. Kept so the paths not yet switched to
+    /// [`Self::ternary_fused_qkv_slot`] have a named source for it.
+    pub fn legacy_ternary_fused_qkv_slot(&self) -> Option<u64> {
+        self.attn_q.gpu_handle().map(|handle| handle.id())
+    }
+    /// GPU weight-cache slot of a ternary block's fused gate‖up buffer
+    /// (`M-21`): the dedicated fused handle's id when present, else the gate
+    /// projection's handle id; `None` when the block was never uploaded.
+    pub fn ternary_fused_gate_up_slot(&self) -> Option<u64> {
+        self.fused_gate_up_handle_ternary
+            .or_else(|| self.ffn_gate.gpu_handle())
+            .map(|handle| handle.id())
     }
     /// FFN down projection GPU handle (if uploaded).
     pub fn ffn_down_gpu_handle(&self) -> Option<GpuWeightHandle> {

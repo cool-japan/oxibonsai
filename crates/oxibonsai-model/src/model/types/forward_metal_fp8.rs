@@ -20,8 +20,10 @@
 //!   processing every prompt position in one dispatch instead of the per-token
 //!   sequential GEMV loop.
 //! - Attention and the K/V store run on the **CPU** against `self.kv_cache`,
-//!   using the exact same [`fused_attention_head_contiguous`] the per-token path
-//!   uses. Decode then reads real prompt K/V — no split cache, no read-back.
+//!   through the exact same reader the per-token path uses
+//!   ([`crate::kv_cache::KvCache::attend_group`], whichever element type the
+//!   host cache stores). Decode then reads real prompt K/V — no split cache,
+//!   no read-back.
 //!
 //! This is still a large speedup over the per-token path (one GEMM per weight
 //! matrix per layer instead of `batch` sequential GEMVs) while remaining
@@ -30,7 +32,6 @@
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
 use super::{BonsaiModel, OutputWeight};
-use crate::layers::attention_fused::fused_attention_head_contiguous;
 use crate::layers::rms_norm::RmsNorm;
 use oxibonsai_kernels::MetalGraphError;
 
@@ -301,6 +302,10 @@ impl<'a> BonsaiModel<'a> {
             )
             .into());
         }
+        // Lazy host KV (REQUIRED #4 (4)): make every prompt position resident
+        // before the first GEMM, so a refused allocation fails the prefill
+        // cleanly instead of part-way through a layer.
+        self.kv_cache.try_ensure_capacity(pos_start + batch_size)?;
 
         let h = self.config.hidden_size;
         let inter = self.config.intermediate_size;
@@ -398,22 +403,21 @@ impl<'a> BonsaiModel<'a> {
             }
 
             // 4. GQA attention (per position) against `self.kv_cache` — causal
-            //    via `seq_len = pos + 1`. Identical math to the per-token path.
+            //    via `seq_len = pos + 1`. The per-token path's own reader
+            //    (`KvCache::attend_group`, one call per KV head), so the two
+            //    are identical whatever element type the host cache stores.
+            let group_width = heads_per_group * hd;
             for t in 0..batch_size {
                 let seq_len = pos_start + t + 1;
                 let q_base = t * q_rows;
-                for q_head in 0..nq {
-                    let kv_head = q_head / heads_per_group;
-                    let qh = q_base + q_head * hd;
-                    let keys = self.kv_cache.keys_for(layer_idx, kv_head, seq_len);
-                    let values = self.kv_cache.values_for(layer_idx, kv_head, seq_len);
-                    fused_attention_head_contiguous(
-                        &q_rope_batch[qh..qh + hd],
-                        keys,
-                        values,
-                        &mut attn_out[qh..qh + hd],
+                for kv_head in 0..nkv {
+                    let lo = q_base + kv_head * group_width;
+                    self.kv_cache.attend_group(
+                        layer_idx,
+                        kv_head,
                         seq_len,
-                        hd,
+                        &q_rope_batch[lo..lo + group_width],
+                        &mut attn_out[lo..lo + group_width],
                     )?;
                 }
             }

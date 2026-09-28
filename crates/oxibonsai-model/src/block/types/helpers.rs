@@ -64,9 +64,17 @@ impl<'a> TransformerBlock<'a> {
         rope: &RopeTable,
         kv_cache: &KvCache,
     ) -> Option<ModelResult<()>> {
-        let fused_qkv_handle = self.fused_qkv_handle?;
+        // M-21 gate: `try_metal_full_layer` decodes every buffer as
+        // `Q1_0_g128`. A ternary block's fused handles live in the separate
+        // `*_ternary` fields and are consumed by `forward`'s fused GEMV arms,
+        // so this path must never be entered for one — checked on the block's
+        // format, not merely on which fields happen to be populated.
+        if self.attn_q.blocks_ternary().is_some() || self.ffn_gate.blocks_ternary().is_some() {
+            return None;
+        }
+        let fused_qkv_handle = self.fused_qkv_gpu_handle()?;
         let attn_proj_handle = self.attn_output.gpu_handle()?;
-        let fused_gate_up_handle = self.fused_gate_up_handle?;
+        let fused_gate_up_handle = self.fused_gate_up_gpu_handle()?;
         let down_handle = self.ffn_down.gpu_handle()?;
         let h = self.hidden_size;
         let hd = self.head_dim;
@@ -181,9 +189,14 @@ impl<'a> TransformerBlock<'a> {
         rope: &RopeTable,
         kv_cache: &KvCache,
     ) -> Option<ModelResult<()>> {
-        let fused_qkv_handle = self.fused_qkv_handle?;
+        // M-21 gate: same as `try_full_layer_gpu` — the CUDA full-layer path
+        // decodes `Q1_0_g128` only, so a ternary block never enters it.
+        if self.attn_q.blocks_ternary().is_some() || self.ffn_gate.blocks_ternary().is_some() {
+            return None;
+        }
+        let fused_qkv_handle = self.fused_qkv_gpu_handle()?;
         let attn_proj_handle = self.attn_output.gpu_handle()?;
-        let fused_gate_up_handle = self.fused_gate_up_handle?;
+        let fused_gate_up_handle = self.fused_gate_up_gpu_handle()?;
         let down_handle = self.ffn_down.gpu_handle()?;
         let h = self.hidden_size;
         let hd = self.head_dim;

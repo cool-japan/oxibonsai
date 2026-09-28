@@ -169,13 +169,17 @@ pub(crate) async fn run(
 
     // Build a pool of engine replicas sharing one leaked `'static`
     // GGUF (replica #1 mmaps + leaks; the rest reuse it zero-copy).
-    let (pool, _tier, _size) = oxibonsai_runtime::engine_pool::build_pool_from_gguf(
+    // ENGINE-SEAM: the `_parts` variant also hands back the leaked GGUF and
+    // the shared token-embedding table the embedding engine below reuses.
+    let built = oxibonsai_runtime::engine_pool::build_pool_from_gguf_parts(
         &model,
-        params,
+        params.clone(),
         seed,
         max_seq_len,
         requested_pool_size,
+        oxibonsai_runtime::engine::Backend::Auto,
     )?;
+    let pool = Arc::clone(&built.pool);
     // Wire the shared metrics onto every replica, preserving the
     // per-engine telemetry the single-engine path recorded.
     pool.set_metrics_all(&metrics)?;
@@ -188,10 +192,21 @@ pub(crate) async fn run(
     // implement `Clone` and the RAG router (when mounted) needs its
     // own independent handle.
     let lookup = resolve_tokenizer(tokenizer.as_deref(), &model);
-    if lookup.found.is_none() {
+    // ENGINE-SEAM: an auto-detected tokenizer that does not fit the model
+    // yields to one embedded in the GGUF (every Bonsai 2 `qwen35` file
+    // carries its own; `models/tokenizer.json` is the legacy Qwen3 one and
+    // would mis-tokenize every prompt). Anything else loads as before.
+    let embedded_tokenizer = tokenizer.is_none()
+        && serve_prefers_embedded_tokenizer(lookup.found.as_deref(), built.gguf);
+    if lookup.found.is_none() && !embedded_tokenizer {
         tracing::warn!("{}", missing_tokenizer_warning(&lookup.searched));
     }
     let load_tok = || -> anyhow::Result<Option<oxibonsai_runtime::TokenizerBridge>> {
+        if embedded_tokenizer {
+            return Ok(Some(oxibonsai_runtime::engine::tokenizer_from_gguf(
+                built.gguf,
+            )?));
+        }
         match &lookup.found {
             Some(p) => Ok(Some(oxibonsai_runtime::TokenizerBridge::from_file(p)?)),
             None => Ok(None),
@@ -199,6 +214,12 @@ pub(crate) async fn run(
     };
 
     let tok = load_tok()?;
+
+    // SV-25 / RT-08: `/v1/embeddings` is served by a dedicated embedding
+    // engine built off the pool's own leaked mapping and shared
+    // token-embedding table (no second mapping, no second table), and the
+    // router records its traffic in the same `InferenceMetrics`.
+    let embedder = build_embedder(&built, load_tok()?, params, seed, max_seq_len);
 
     // sec-15: admin auth is independent of the inference bearer token.
     // FIX2-SERVE item 4 (admin-token env asymmetry): honour
@@ -224,7 +245,8 @@ pub(crate) async fn run(
                 .with_max_input_tokens(Some(max_seq_len))
                 .with_timeout_ms(request_timeout_ms),
         )
-        .with_auth(admin_auth);
+        .with_auth(admin_auth)
+        .with_embedder(embedder);
 
     #[cfg_attr(not(feature = "rag"), allow(unused_mut))]
     let mut router =
@@ -281,6 +303,85 @@ pub(crate) async fn run(
         .map_err(anyhow::Error::from_boxed)?;
 
     Ok(())
+}
+
+/// Whether `oxibonsai serve` should use the tokenizer embedded in `gguf`
+/// instead of the auto-detected on-disk one (ENGINE-SEAM).
+///
+/// Only when the on-disk candidate is absent, unreadable, or fails the same
+/// compatibility check `run` enforces, *and* the GGUF embeds a tokenizer whose
+/// vocabulary equals the model's. An on-disk tokenizer that fits is always
+/// kept, so every model that served before serves exactly as before.
+fn serve_prefers_embedded_tokenizer(
+    found: Option<&str>,
+    gguf: &oxibonsai_core::gguf::reader::GgufFile<'_>,
+) -> bool {
+    let on_disk_fits = found.is_some_and(|path| {
+        oxibonsai_runtime::TokenizerBridge::from_file(path).is_ok_and(|tok| {
+            super::util::check_tokenizer_model_compatibility(&tok, path, gguf, false).is_ok()
+        })
+    });
+    if on_disk_fits {
+        return false;
+    }
+    let expected_vocab = super::util::model_vocab_size(gguf).ok();
+    super::cmd_run::gguf_embedded_tokenizer(gguf, expected_vocab).is_some()
+}
+
+/// The model-backed embedder `/v1/embeddings` is served from (SV-25 /
+/// RT-08), or `None` — the route's honest `501` — when there can be none.
+///
+/// A dense model gets a dedicated embedding engine built off the pool's own
+/// leaked GGUF and shared token-embedding table, with its KV window bounded
+/// by the embedder's input ceiling. A hybrid (`qwen35`) model is refused with
+/// the typed `NOT_A_DENSE_MODEL` error — a known limitation until the hybrid
+/// model exposes its pre-LM-head hidden states — which is logged, not fatal.
+fn build_embedder(
+    built: &oxibonsai_runtime::engine_pool::PoolBuild,
+    tokenizer: Option<oxibonsai_runtime::TokenizerBridge>,
+    params: oxibonsai_runtime::sampling::SamplingParams,
+    seed: u64,
+    max_seq_len: usize,
+) -> Option<Arc<oxibonsai_runtime::embed_engine::ModelEmbedder>> {
+    let Some(tokenizer) = tokenizer else {
+        tracing::info!("no tokenizer: /v1/embeddings answers 501 (an embedder needs one)");
+        return None;
+    };
+    let window = max_seq_len.clamp(
+        1,
+        oxibonsai_runtime::embed_engine::DEFAULT_MAX_EMBEDDING_TOKENS,
+    );
+    match oxibonsai_runtime::embed_engine::ModelEmbedder::from_static_gguf(
+        built.gguf,
+        Arc::clone(&built.shared_token_embd),
+        Arc::new(tokenizer),
+        params,
+        seed,
+        window,
+    ) {
+        Ok(embedder) => {
+            tracing::info!(
+                window,
+                "serving /v1/embeddings from a dedicated embedding engine"
+            );
+            Some(embedder)
+        }
+        Err(e) if oxibonsai_runtime::engine::engine_error_code(&e) == Some("NOT_A_DENSE_MODEL") => {
+            tracing::info!(
+                error = %e,
+                "embeddings are not supported for this model yet (known limitation); \
+                 /v1/embeddings answers 501"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "failed to build the embedding engine; /v1/embeddings answers 501"
+            );
+            None
+        }
+    }
 }
 
 // ─── Router hardening (SV-06 / sec-06 / sec-07 / SV-10 / cli-18) ───────────

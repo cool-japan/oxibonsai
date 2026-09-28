@@ -255,7 +255,7 @@ fn generate_max_tokens_zero_returns_empty_or_minimal() {
 // never reads the model's weights. Calling it directly on the config proves
 // the identical detection result with no model construction at all.
 // `model_variant_detection_tiny_config_is_custom` below separately keeps the
-// real `engine.model().variant()` method chain covered end to end.
+// real `engine.dense_model()?.variant()` method chain covered end to end.
 
 #[test]
 fn model_variant_detection_8b() {
@@ -281,16 +281,19 @@ fn model_variant_detection_1_7b() {
 }
 
 /// Coverage twin for the three tests above: exercises the real
-/// `engine.model().variant()` method (config -> `BonsaiModel` -> registry),
-/// which the direct `ModelVariant::from_config` calls above bypass on
-/// purpose to avoid constructing a multi-GB model. `tiny_test()`'s (2, 64)
+/// `engine.dense_model()?.variant()` method (config -> `BonsaiModel` ->
+/// registry), which the direct `ModelVariant::from_config` calls above bypass
+/// on purpose to avoid constructing a multi-GB model. `tiny_test()`'s (2, 64)
 /// doesn't match any known architecture, so detection correctly falls back
 /// to `Custom`.
 #[test]
 fn model_variant_detection_tiny_config_is_custom() {
     let engine = make_tiny_engine();
-    assert_eq!(engine.model().variant(), ModelVariant::Custom);
-    assert_eq!(engine.model().variant().name(), "Custom");
+    let model = engine
+        .dense_model()
+        .expect("a config-built engine holds a dense model");
+    assert_eq!(model.variant(), ModelVariant::Custom);
+    assert_eq!(model.variant().name(), "Custom");
 }
 
 // ── 11. Convenience functions ────────────────────────────────────────────
@@ -468,7 +471,9 @@ fn engine_session_initial_state() {
             `model_info_from_engine_tiny_config` for the default-run twin."]
 fn model_info_from_engine() {
     let engine = make_8b_engine();
-    let model = engine.model();
+    let model = engine
+        .dense_model()
+        .expect("a config-built engine holds a dense model");
     assert_eq!(model.num_layers(), 36);
     assert_eq!(model.hidden_size(), 4096);
     assert_eq!(model.context_length(), 65536);
@@ -487,7 +492,9 @@ fn model_info_from_engine() {
 #[test]
 fn model_info_from_engine_tiny_config() {
     let engine = make_tiny_engine();
-    let model = engine.model();
+    let model = engine
+        .dense_model()
+        .expect("a config-built engine holds a dense model");
     assert_eq!(model.num_layers(), 2);
     assert_eq!(model.hidden_size(), 64);
     assert_eq!(model.context_length(), 512);
@@ -507,7 +514,9 @@ fn model_info_from_engine_tiny_config() {
 #[test]
 fn tiny_model_info() {
     let engine = make_tiny_engine();
-    let model = engine.model();
+    let model = engine
+        .dense_model()
+        .expect("a config-built engine holds a dense model");
     assert_eq!(model.num_layers(), 2);
     assert_eq!(model.hidden_size(), 64);
     assert_eq!(model.context_length(), 512);

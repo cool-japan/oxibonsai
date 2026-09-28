@@ -4,10 +4,17 @@
 //!
 //! # Architecture
 //!
-//! - Independent singleton (own [`metal::Device`] + [`metal::CommandQueue`]) — kept
-//!   separate from [`metal_fp8_kernels`](super::metal_fp8_kernels)'s singleton so
-//!   the batch-prefill pipelines compile lazily without paying single-token GEMV's
-//!   init cost on processes that never touch prefill.
+//! - **No private Metal state** (`MET-10`). Every pipeline is resolved by
+//!   entry-point name from the combined metallib `build.rs` embeds
+//!   (`ACTIVE_KERNELS` lists `MSL_GEMM_FP8_*` and
+//!   `MSL_FUSED_GATE_UP_SWIGLU_GEMM_FP8_*`) through
+//!   [`MetalGraph::pipeline_for`], which caches each pipeline state by name —
+//!   so a process that never prefills FP8 still never builds these pipeline
+//!   states, and one that does pays a by-name lookup instead of compiling six
+//!   private `MTLLibrary`s from source (what this file used to do).
+//! - Dispatch runs on the *current session's* command queue
+//!   ([`MetalGraph::global`]), so an engine-pool replica's prefill stays on
+//!   that replica's queue (`MET-08`).
 //! - 6 compute pipelines, all `[[buffer(N)]]`-annotated:
 //!   - `gemm_fp8_e4m3`                          / `gemm_fp8_e5m2`
 //!   - `gemm_fp8_e4m3_residual`                 / `gemm_fp8_e5m2_residual`
@@ -39,111 +46,9 @@
 
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
-use std::sync::OnceLock;
+use metal::MTLResourceOptions;
 
-use metal::{CompileOptions, ComputePipelineState, Device, MTLResourceOptions};
-
-use super::kernel_sources::{
-    MSL_FUSED_GATE_UP_SWIGLU_GEMM_FP8_E4M3_V1, MSL_FUSED_GATE_UP_SWIGLU_GEMM_FP8_E5M2_V1,
-    MSL_GEMM_FP8_E4M3_RESIDUAL_V1, MSL_GEMM_FP8_E4M3_V1, MSL_GEMM_FP8_E5M2_RESIDUAL_V1,
-    MSL_GEMM_FP8_E5M2_V1,
-};
 use super::metal_graph::{commit_and_wait, MetalGraph, MetalGraphError};
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Singleton state
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Process-wide Metal FP8 prefill dispatch state.
-struct MetalFp8PrefillState {
-    gemm_e4m3: ComputePipelineState,
-    gemm_e4m3_residual: ComputePipelineState,
-    fused_gate_up_swiglu_e4m3: ComputePipelineState,
-    gemm_e5m2: ComputePipelineState,
-    gemm_e5m2_residual: ComputePipelineState,
-    fused_gate_up_swiglu_e5m2: ComputePipelineState,
-}
-
-// SAFETY: `metal::Device` / `metal::CommandQueue` / `metal::ComputePipelineState`
-// are reference-counted ObjC objects documented as thread-safe by Apple's Metal SDK.
-unsafe impl Send for MetalFp8PrefillState {}
-unsafe impl Sync for MetalFp8PrefillState {}
-
-impl MetalFp8PrefillState {
-    fn new() -> Result<Self, MetalGraphError> {
-        // `MET-10`: compile against the **shared** device rather than opening
-        // a second `Device::system_default()` handle with its own queue.
-        let device = MetalGraph::global()?.device().to_owned();
-
-        let opts = CompileOptions::new();
-
-        let gemm_e4m3 = compile_pipeline(&device, &opts, MSL_GEMM_FP8_E4M3_V1, "gemm_fp8_e4m3")?;
-        let gemm_e4m3_residual = compile_pipeline(
-            &device,
-            &opts,
-            MSL_GEMM_FP8_E4M3_RESIDUAL_V1,
-            "gemm_fp8_e4m3_residual",
-        )?;
-        let fused_gate_up_swiglu_e4m3 = compile_pipeline(
-            &device,
-            &opts,
-            MSL_FUSED_GATE_UP_SWIGLU_GEMM_FP8_E4M3_V1,
-            "fused_gate_up_swiglu_gemm_fp8_e4m3",
-        )?;
-        let gemm_e5m2 = compile_pipeline(&device, &opts, MSL_GEMM_FP8_E5M2_V1, "gemm_fp8_e5m2")?;
-        let gemm_e5m2_residual = compile_pipeline(
-            &device,
-            &opts,
-            MSL_GEMM_FP8_E5M2_RESIDUAL_V1,
-            "gemm_fp8_e5m2_residual",
-        )?;
-        let fused_gate_up_swiglu_e5m2 = compile_pipeline(
-            &device,
-            &opts,
-            MSL_FUSED_GATE_UP_SWIGLU_GEMM_FP8_E5M2_V1,
-            "fused_gate_up_swiglu_gemm_fp8_e5m2",
-        )?;
-
-        Ok(Self {
-            gemm_e4m3,
-            gemm_e4m3_residual,
-            fused_gate_up_swiglu_e4m3,
-            gemm_e5m2,
-            gemm_e5m2_residual,
-            fused_gate_up_swiglu_e5m2,
-        })
-    }
-}
-
-fn compile_pipeline(
-    device: &Device,
-    opts: &CompileOptions,
-    src: &str,
-    entry: &str,
-) -> Result<ComputePipelineState, MetalGraphError> {
-    let lib = device.new_library_with_source(src, opts).map_err(|e| {
-        MetalGraphError::CompilationFailed(format!("FP8 prefill library `{entry}`: {e}"))
-    })?;
-    let func = lib.get_function(entry, None).map_err(|e| {
-        MetalGraphError::CompilationFailed(format!("FP8 prefill function `{entry}`: {e}"))
-    })?;
-    device
-        .new_compute_pipeline_state_with_function(&func)
-        .map_err(|e| {
-            MetalGraphError::CompilationFailed(format!("FP8 prefill pipeline `{entry}`: {e}"))
-        })
-}
-
-/// Lazy process-wide singleton (separate from the Phase 27 GEMV singleton).
-fn state() -> Result<&'static MetalFp8PrefillState, MetalGraphError> {
-    static STATE: OnceLock<Result<MetalFp8PrefillState, MetalGraphError>> = OnceLock::new();
-    match STATE.get_or_init(MetalFp8PrefillState::new) {
-        Ok(s) => Ok(s),
-        // `MetalGraphError` derives `Clone` (`O3`), so the four hand-written
-        // exhaustive `clone_err` matches this file used to carry are gone.
-        Err(e) => Err(e.clone()),
-    }
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Constants
@@ -158,6 +63,19 @@ const SIMDS_PER_TG: usize = 8;
 /// Threads per threadgroup (8 simdgroups × 32 lanes).
 const THREADS_PER_TG: u64 = 256;
 
+/// `kernel_sources::MSL_GEMM_FP8_E4M3_V1`.
+const GEMM_FP8_E4M3_ENTRY: &str = "gemm_fp8_e4m3";
+/// `kernel_sources::MSL_GEMM_FP8_E4M3_RESIDUAL_V1`.
+const GEMM_FP8_E4M3_RESIDUAL_ENTRY: &str = "gemm_fp8_e4m3_residual";
+/// `kernel_sources::MSL_FUSED_GATE_UP_SWIGLU_GEMM_FP8_E4M3_V1`.
+const FUSED_GATE_UP_SWIGLU_FP8_E4M3_ENTRY: &str = "fused_gate_up_swiglu_gemm_fp8_e4m3";
+/// `kernel_sources::MSL_GEMM_FP8_E5M2_V1`.
+const GEMM_FP8_E5M2_ENTRY: &str = "gemm_fp8_e5m2";
+/// `kernel_sources::MSL_GEMM_FP8_E5M2_RESIDUAL_V1`.
+const GEMM_FP8_E5M2_RESIDUAL_ENTRY: &str = "gemm_fp8_e5m2_residual";
+/// `kernel_sources::MSL_FUSED_GATE_UP_SWIGLU_GEMM_FP8_E5M2_V1`.
+const FUSED_GATE_UP_SWIGLU_FP8_E5M2_ENTRY: &str = "fused_gate_up_swiglu_gemm_fp8_e5m2";
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Variant selectors
 // ═══════════════════════════════════════════════════════════════════════════
@@ -167,6 +85,27 @@ const THREADS_PER_TG: u64 = 256;
 enum Fp8Variant {
     E4M3,
     E5M2,
+}
+
+impl Fp8Variant {
+    /// Entry point of this variant's batch GEMM (`residual` selects the
+    /// fused-residual-add twin).
+    const fn gemm_entry(self, residual: bool) -> &'static str {
+        match (self, residual) {
+            (Self::E4M3, false) => GEMM_FP8_E4M3_ENTRY,
+            (Self::E5M2, false) => GEMM_FP8_E5M2_ENTRY,
+            (Self::E4M3, true) => GEMM_FP8_E4M3_RESIDUAL_ENTRY,
+            (Self::E5M2, true) => GEMM_FP8_E5M2_RESIDUAL_ENTRY,
+        }
+    }
+
+    /// Entry point of this variant's fused gate + up + SwiGLU GEMM.
+    const fn fused_gate_up_entry(self) -> &'static str {
+        match self {
+            Self::E4M3 => FUSED_GATE_UP_SWIGLU_FP8_E4M3_ENTRY,
+            Self::E5M2 => FUSED_GATE_UP_SWIGLU_FP8_E5M2_ENTRY,
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -356,18 +295,11 @@ fn dispatch_gemm(
         }
     }
 
-    let s = state()?;
-    // `MET-10`: dispatch on the **shared** device and on the *current
-    // session's* command queue, instead of the private
-    // `Device::system_default()` + `new_command_queue()` this family used to
-    // own. Five independent `MTLCommandQueue`s on one device is what made
-    // these kernel families invisible to the `MET-08` session split; routed
-    // through `MetalGraph::global()` they inherit the caller's session, so a
-    // replica's submissions stay on that replica's queue. (The pipelines
-    // themselves still live in this family's own Metal library — folding them
-    // into the combined metallib is the other, separately-owned half of
-    // `MET-10`.)
+    // `MET-10`: the shared device, the *current session's* command queue, and
+    // a pipeline resolved by name from the combined metallib — no private
+    // device, queue or library (`pipeline_for` caches the state by name).
     let graph = MetalGraph::global()?;
+    let pipeline = graph.pipeline_for(variant.gemm_entry(residual.is_some()))?;
 
     let block_buf = graph.device().new_buffer_with_data(
         blocks.as_ptr() as *const std::ffi::c_void,
@@ -404,13 +336,7 @@ fn dispatch_gemm(
     let cmd = graph.command_queue.new_command_buffer();
     let encoder = cmd.new_compute_command_encoder();
 
-    let pipeline = match (variant, residual.is_some()) {
-        (Fp8Variant::E4M3, false) => &s.gemm_e4m3,
-        (Fp8Variant::E5M2, false) => &s.gemm_e5m2,
-        (Fp8Variant::E4M3, true) => &s.gemm_e4m3_residual,
-        (Fp8Variant::E5M2, true) => &s.gemm_e5m2_residual,
-    };
-    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_compute_pipeline_state(&pipeline);
     encoder.set_buffer(0, Some(&block_buf), 0);
     encoder.set_buffer(1, Some(&input_buf), 0);
     encoder.set_buffer(2, Some(&output_buf), 0);
@@ -481,18 +407,10 @@ fn dispatch_fused_gate_up_swiglu(
         )));
     }
 
-    let s = state()?;
-    // `MET-10`: dispatch on the **shared** device and on the *current
-    // session's* command queue, instead of the private
-    // `Device::system_default()` + `new_command_queue()` this family used to
-    // own. Five independent `MTLCommandQueue`s on one device is what made
-    // these kernel families invisible to the `MET-08` session split; routed
-    // through `MetalGraph::global()` they inherit the caller's session, so a
-    // replica's submissions stay on that replica's queue. (The pipelines
-    // themselves still live in this family's own Metal library — folding them
-    // into the combined metallib is the other, separately-owned half of
-    // `MET-10`.)
+    // `MET-10`: see `dispatch_gemm` — shared device, current session's queue,
+    // pipeline resolved by name from the combined metallib.
     let graph = MetalGraph::global()?;
+    let pipeline = graph.pipeline_for(variant.fused_gate_up_entry())?;
 
     let block_buf = graph.device().new_buffer_with_data(
         blocks.as_ptr() as *const std::ffi::c_void,
@@ -521,11 +439,7 @@ fn dispatch_fused_gate_up_swiglu(
     let cmd = graph.command_queue.new_command_buffer();
     let encoder = cmd.new_compute_command_encoder();
 
-    let pipeline = match variant {
-        Fp8Variant::E4M3 => &s.fused_gate_up_swiglu_e4m3,
-        Fp8Variant::E5M2 => &s.fused_gate_up_swiglu_e5m2,
-    };
-    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_compute_pipeline_state(&pipeline);
     encoder.set_buffer(0, Some(&block_buf), 0);
     encoder.set_buffer(1, Some(&input_buf), 0);
     encoder.set_buffer(2, Some(&output_buf), 0);
@@ -619,8 +533,43 @@ mod tests {
 
     // ─── CI-GPU-gated correctness tests ────────────────────────────────────
     //
-    // Each test calls `state()` first and returns silently on hosts without a
-    // Metal device. On Apple Silicon CI this exercises the real GPU dispatch.
+    // Each test calls `no_metal()` first and returns silently on hosts without
+    // a Metal device. On Apple Silicon CI this exercises the real GPU dispatch.
+
+    /// `true` when this host has no usable Metal device (CPU-only CI).
+    fn no_metal() -> bool {
+        MetalGraph::global().is_err()
+    }
+
+    /// `MET-10`: all six FP8 batch-prefill entry points resolve from the
+    /// **combined** metallib — this family no longer compiles a library of
+    /// its own.
+    #[test]
+    fn fp8_prefill_entries_resolve_from_the_combined_metallib() {
+        let Ok(graph) = MetalGraph::global() else {
+            return; // no Metal device on this host
+        };
+        for entry in [
+            GEMM_FP8_E4M3_ENTRY,
+            GEMM_FP8_E4M3_RESIDUAL_ENTRY,
+            FUSED_GATE_UP_SWIGLU_FP8_E4M3_ENTRY,
+            GEMM_FP8_E5M2_ENTRY,
+            GEMM_FP8_E5M2_RESIDUAL_ENTRY,
+            FUSED_GATE_UP_SWIGLU_FP8_E5M2_ENTRY,
+        ] {
+            graph
+                .pipeline_for(entry)
+                .unwrap_or_else(|e| panic!("{entry} must resolve from the combined metallib: {e}"));
+        }
+        assert_eq!(
+            Fp8Variant::E4M3.gemm_entry(true),
+            GEMM_FP8_E4M3_RESIDUAL_ENTRY
+        );
+        assert_eq!(
+            Fp8Variant::E5M2.fused_gate_up_entry(),
+            FUSED_GATE_UP_SWIGLU_FP8_E5M2_ENTRY
+        );
+    }
 
     fn make_fp8_e4m3_blocks(
         n_rows: usize,
@@ -767,7 +716,7 @@ mod tests {
 
     #[test]
     fn metal_gemm_fp8_e4m3_matches_cpu_reference() {
-        if state().is_err() {
+        if no_metal() {
             return;
         }
         let n_rows = 16usize;
@@ -797,7 +746,7 @@ mod tests {
     /// `col_base += 8u` chunk loop processes the trailing cols correctly.
     #[test]
     fn metal_gemm_fp8_e4m3_capof8_batch12() {
-        if state().is_err() {
+        if no_metal() {
             return;
         }
         let n_rows = 24usize;
@@ -825,7 +774,7 @@ mod tests {
 
     #[test]
     fn metal_gemm_fp8_e4m3_residual_matches_cpu_reference() {
-        if state().is_err() {
+        if no_metal() {
             return;
         }
         let n_rows = 16usize;
@@ -867,7 +816,7 @@ mod tests {
 
     #[test]
     fn metal_gemm_fp8_e5m2_matches_cpu_reference() {
-        if state().is_err() {
+        if no_metal() {
             return;
         }
         let n_rows = 17usize; // boundary: row count not a multiple of 8
@@ -895,7 +844,7 @@ mod tests {
 
     #[test]
     fn metal_gemm_fp8_e5m2_residual_matches_cpu_reference() {
-        if state().is_err() {
+        if no_metal() {
             return;
         }
         let n_rows = 16usize;
@@ -937,7 +886,7 @@ mod tests {
 
     #[test]
     fn metal_fused_gate_up_swiglu_fp8_e4m3_matches_cpu_reference() {
-        if state().is_err() {
+        if no_metal() {
             return;
         }
         let n_ffn_rows = 16usize;
@@ -1002,7 +951,7 @@ mod tests {
 
     #[test]
     fn metal_fused_gate_up_swiglu_fp8_e5m2_matches_cpu_reference() {
-        if state().is_err() {
+        if no_metal() {
             return;
         }
         let n_ffn_rows = 16usize;

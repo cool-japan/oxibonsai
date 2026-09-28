@@ -15,6 +15,7 @@ pub mod attention_sink;
 pub mod cross_attention;
 pub mod flash_decode;
 pub mod linear;
+pub mod linear_dense;
 pub mod linear_kquant_ext;
 pub mod linear_kquant_full;
 pub mod linear_standard;

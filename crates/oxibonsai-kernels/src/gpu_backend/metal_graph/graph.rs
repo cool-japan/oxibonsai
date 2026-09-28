@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::gpu_backend::metal_full_layer;
-use crate::gpu_backend::metal_full_layer::types::{next_model_epoch, WeightKey, WeightKind};
+use crate::gpu_backend::metal_full_layer::types::{
+    next_model_epoch, WeightKey, WeightKind, LEGACY_MODEL_EPOCH,
+};
 use crate::gpu_backend::metal_prefill;
 
 use super::buffers::{
@@ -34,7 +36,7 @@ mod weight_cache;
 #[path = "session.rs"]
 pub mod session;
 
-pub use session::MetalDevice;
+pub use session::{MetalDevice, SessionScope};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // MetalGraph
@@ -118,8 +120,10 @@ pub(super) struct JointAttnIoPool {
 /// intermediates, its own logits and argmax output buffers. Everything that is
 /// immutable or deliberately shared — the `Device`, the compiled pipelines,
 /// the weight cache and the DiT I/O pools — lives on the process-global
-/// [`MetalDevice`] behind `shared`, so N sessions cost N KV caches but **1x**
-/// the model weights.
+/// [`MetalDevice`] behind `shared`. N sessions therefore cost N KV caches, and
+/// 1x the weights of a model whose replicas key each weight to one slot — the
+/// ternary route today; the Q1 route still uploads one copy per replica (see
+/// the `session` module's *Sizing reality* for the byte numbers).
 ///
 /// Sessions are what make concurrent GPU inference possible: the `MutexGuard`s
 /// a fused forward holds from `acquire_full_layer_buffers` through submission
@@ -144,6 +148,11 @@ pub struct MetalGraph {
     pub(crate) pipelines: Arc<MetalPipelines>,
     /// Process-unique session id, used by the thread-local binding.
     session_id: u64,
+    /// Binding token of the thread that bound this session last (`0` =
+    /// never bound). A thread whose binding no longer matches has had the
+    /// session claimed away and treats its binding as stale — see the
+    /// `session` module docs.
+    pub(super) owner_thread: AtomicU64,
     /// Lazily allocated intermediate buffers, protected by a mutex for
     /// interior mutability (buffer contents are mutated on each dispatch).
     buffers: Mutex<Option<MetalBuffers>>,
@@ -381,14 +390,15 @@ impl MetalGraph {
     }
 
     /// Get a cached TQ2 SoA weight handle or reformat AoS→SoA and upload.
+    ///
+    /// Keyed under [`LEGACY_MODEL_EPOCH`]; callers that own a model epoch use
+    /// [`Self::get_or_upload_tq2_weight_soa_for_epoch`].
     pub fn get_or_upload_tq2_weight_soa(
         &self,
         key: u64,
         aos_bytes: &[u8],
     ) -> Result<Arc<MetalWeightHandle>, MetalGraphError> {
-        self.get_or_upload_keyed(WeightKey::legacy(WeightKind::Tq2Soa, key), || {
-            self.upload_tq2_weight_soa(aos_bytes)
-        })
+        self.get_or_upload_tq2_weight_soa_for_epoch(LEGACY_MODEL_EPOCH, key, aos_bytes)
     }
 
     /// Like `get_or_upload_tq2_weight_soa`, but accepts a closure that produces AoS bytes.
@@ -397,9 +407,50 @@ impl MetalGraph {
         key: u64,
         data_fn: impl FnOnce() -> Vec<u8>,
     ) -> Result<Arc<MetalWeightHandle>, MetalGraphError> {
-        self.get_or_upload_keyed(WeightKey::legacy(WeightKind::Tq2Soa, key), || {
-            self.upload_tq2_weight_soa(&data_fn())
-        })
+        self.get_or_upload_tq2_weight_soa_lazy_for_epoch(LEGACY_MODEL_EPOCH, key, data_fn)
+    }
+
+    /// Epoch-keyed TQ2 SoA lookup-or-upload (`MET-02`).
+    ///
+    /// The buffer is cached under
+    /// `WeightKey::new(model_epoch, WeightKind::Tq2Soa, slot)`, so
+    /// [`Self::release_model`]`(model_epoch)` frees it together with the rest
+    /// of that model, and a caller keyed under a *different* epoch can never
+    /// be served it.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the upload's validation/allocation failure, or a kind
+    /// mismatch on the slot.
+    pub fn get_or_upload_tq2_weight_soa_for_epoch(
+        &self,
+        model_epoch: u64,
+        slot: u64,
+        aos_bytes: &[u8],
+    ) -> Result<Arc<MetalWeightHandle>, MetalGraphError> {
+        self.get_or_upload_keyed(
+            WeightKey::new(model_epoch, WeightKind::Tq2Soa, slot),
+            || self.upload_tq2_weight_soa(aos_bytes),
+        )
+    }
+
+    /// Lazy twin of [`Self::get_or_upload_tq2_weight_soa_for_epoch`]: `data_fn`
+    /// runs only on a cache miss, so a resident buffer never materialises its
+    /// AoS bytes (the Q‖K‖V / gate‖up concatenations).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::get_or_upload_tq2_weight_soa_for_epoch`].
+    pub fn get_or_upload_tq2_weight_soa_lazy_for_epoch(
+        &self,
+        model_epoch: u64,
+        slot: u64,
+        data_fn: impl FnOnce() -> Vec<u8>,
+    ) -> Result<Arc<MetalWeightHandle>, MetalGraphError> {
+        self.get_or_upload_keyed(
+            WeightKey::new(model_epoch, WeightKind::Tq2Soa, slot),
+            || self.upload_tq2_weight_soa(&data_fn()),
+        )
     }
 
     /// Upload `PQ2_0` (PrismML ggml type 142) weight bytes in SoA layout.

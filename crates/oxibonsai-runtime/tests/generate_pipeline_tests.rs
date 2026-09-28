@@ -1411,7 +1411,7 @@ mod rt33_beam_search_kv_reuse_correctness {
                 greedy_params(),
                 42,
             );
-            let vocab_size = engine.model().config().vocab_size;
+            let vocab_size = engine.vocab_size();
             let cfg = BeamSearchConfig {
                 beam_width,
                 max_tokens,

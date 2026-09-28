@@ -248,19 +248,14 @@ impl<'a> TransformerBlock<'a> {
                 crate::layers::sliding_window::attention_range(pos, full_seq_len, sw_config);
             let num_kv_heads = nq / heads_per_group;
             let windowed_len = positions.len();
+            // Read only the window's rows (widened from `f16` when the
+            // cache stores `f16`), never the whole `0..full_seq_len` history.
             let windowed_kv: Vec<(Vec<f32>, Vec<f32>)> = (0..num_kv_heads)
                 .map(|kv_h| {
-                    let all_keys = kv_cache.keys_for(self.layer_idx, kv_h, full_seq_len);
-                    let all_values = kv_cache.values_for(self.layer_idx, kv_h, full_seq_len);
-                    let wk: Vec<f32> = positions
-                        .iter()
-                        .flat_map(|&p| all_keys[p * hd..(p + 1) * hd].iter().copied())
-                        .collect();
-                    let wv: Vec<f32> = positions
-                        .iter()
-                        .flat_map(|&p| all_values[p * hd..(p + 1) * hd].iter().copied())
-                        .collect();
-                    (wk, wv)
+                    (
+                        kv_cache.gather_keys(self.layer_idx, kv_h, &positions),
+                        kv_cache.gather_values(self.layer_idx, kv_h, &positions),
+                    )
                 })
                 .collect();
             if nq >= PAR_HEAD_MIN_HEADS {

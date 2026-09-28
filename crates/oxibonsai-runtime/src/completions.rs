@@ -43,26 +43,30 @@
 //! - `logprobs` — when set, per-token log probabilities are captured via
 //!   [`crate::engine::InferenceEngine::generate_with_logprobs`] and returned
 //!   in the legacy `{tokens, token_logprobs, top_logprobs, text_offset}`
-//!   shape (`RT-32`; previously always `null`). `logprobs` is mutually
-//!   exclusive with **both** `seed` and `temperature`/`top_p`: the engine has
-//!   no seam that combines logit capture with either a seeded sampler or
-//!   caller-supplied sampling parameters
-//!   (`generate_with_logprobs` always samples with the engine's ambient,
-//!   unmodified sampler — there is no public accessor to install custom
-//!   `SamplingParams` on it first), so each combination is rejected with
-//!   `400` naming the offending field rather than silently favouring one
-//!   over the other. `frequency_penalty`/`presence_penalty` remain honoured
-//!   alongside `logprobs` (applied via `set_penalties` before the
-//!   logprobs-capturing decode loop runs), since that combination has no
-//!   such gap.
+//!   shape (`RT-32`; previously always `null`). **`B9`**: `logprobs` now
+//!   combines with `seed`, `temperature`, `top_p` and `repetition_penalty`
+//!   — `create_completion`'s logprobs branch swaps the resolved
+//!   [`crate::sampling::SamplingParams`] (and, when `seed` is set, a
+//!   freshly-seeded whole [`crate::sampling::Sampler`]) onto the engine
+//!   lease for the duration of that one call and restores it afterward,
+//!   the same seam [`crate::server::chat`]'s non-streaming path and
+//!   `api_extensions.rs`'s seeded streaming path already use
+//!   (`InferenceEngine::sampler` is `pub(crate)`). An earlier revision of
+//!   this endpoint rejected every one of those combinations with `400`,
+//!   citing "no public seam" — that claim was stale.
+//!   `frequency_penalty`/`presence_penalty` are honoured the same way they
+//!   always were (applied via `set_penalties` before the logprobs-capturing
+//!   decode loop runs).
 //! - `stream: true` streams real SSE (see the `B2-13` section above and
-//!   [`stream`]) for the single-prompt, non-`logprobs`, non-`seed` case;
-//!   those three combinations are rejected with `400 Bad Request` naming
-//!   the field, since none has a streaming-capable engine seam. A
-//!   non-empty `suffix` is rejected the same way regardless of `stream`
-//!   (`RT-32` / `SV-22`): the engine has no fill-in-the-middle generation
-//!   mode. `stream: false` (or the field omitted, the common case) is
-//!   unaffected by any of this.
+//!   [`stream`]) for a single prompt, `logprobs` INCLUDED (`B8`:
+//!   [`stream::stream_completion_with_logprobs`] streams each token's own
+//!   logprobs in its `text_completion` chunk). Only a batched prompt
+//!   (more than one entry) or `seed` are still rejected with `400 Bad
+//!   Request` naming the field, since neither has a streaming-capable
+//!   engine seam. A non-empty `suffix` is rejected the same way regardless
+//!   of `stream` (`RT-32` / `SV-22`): the engine has no fill-in-the-middle
+//!   generation mode. `stream: false` (or the field omitted, the common
+//!   case) is unaffected by any of this.
 //! - Every prompt in a batch is generated: the engine lease is held for the
 //!   whole request and every prompt's generation runs inside a single
 //!   [`crate::server::blocking::run_blocking_generation`] call (`sec-03`) —
@@ -174,8 +178,8 @@ pub struct CompletionRequest {
     /// Number of completions to generate (only 1 is currently supported).
     pub n: Option<usize>,
     /// Whether to stream the response as SSE (B2-13 / ORCHESTRATOR RULING
-    /// D-3). Real SSE for the single-prompt, non-`logprobs`, non-`seed`
-    /// case; those three combinations are rejected with `400` naming the
+    /// D-3). Real SSE for a single prompt, `logprobs` included (`B8`); a
+    /// batched prompt or `seed` are rejected with `400` naming the
     /// offending field rather than `stream` itself (see the module docs and
     /// [`stream`]).
     pub stream: Option<bool>,
@@ -196,18 +200,29 @@ pub struct CompletionRequest {
     /// name (gatekeeper `REQUIRED #3`; not a standard OpenAI Completions
     /// field, but accepted the same way vLLM does — and this endpoint
     /// already accepted the analogous non-standard `top_p`/`temperature`
-    /// overrides). Validated `> 0.0`. When omitted, the engine's own
-    /// startup value is used (never `SamplingParams::default`'s).
+    /// overrides). Validated `>= 1.0` (gatekeeper `REQUIRED #3`'s
+    /// `B2-13` wave-4b follow-up — a value below `1.0` would REWARD
+    /// repeated tokens instead of suppressing them). When omitted, the
+    /// engine's own startup value is used (never `SamplingParams::default`'s).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repetition_penalty: Option<f32>,
-    /// Return the log probabilities for the top-N tokens at each step.
-    /// Mutually exclusive with `seed` and with `stream: true` (see the
-    /// module docs).
+    /// Return the log probabilities for the top-N tokens at each step. A
+    /// real, honored combination with both `seed` and `stream: true` (`B9`
+    /// / `B8`, `B2-13` wave-4b): `create_completion`'s logprobs branch
+    /// swaps a resolved `SamplingParams` — a freshly-seeded whole `Sampler`
+    /// when `seed` is also set — onto `lease.sampler` for the call and
+    /// restores it unconditionally afterward, and
+    /// [`stream::stream_completion_with_logprobs`] builds a dedicated
+    /// per-token streaming decode + logit-capture loop for the `stream`
+    /// case. `seed` together with `stream: true` remains rejected (no
+    /// engine path streams deterministically-seeded generation yet).
     pub logprobs: Option<usize>,
     /// If `true`, the prompt is echoed back at the start of the completion text.
     pub echo: Option<bool>,
-    /// Random seed for deterministic generation. Mutually exclusive with
-    /// `logprobs` and with `stream: true` (see the module docs).
+    /// Random seed for deterministic generation. A real, honored
+    /// combination with `logprobs` (`B9`, `B2-13` wave-4b — see that
+    /// field's own doc); still mutually exclusive with `stream: true` (see
+    /// the module docs).
     ///
     /// Seeded from the engine's own ambient `SamplingParams`
     /// ([`crate::engine::InferenceEngine::sampling_params`], via
@@ -422,12 +437,17 @@ fn validate_completion_request(req: CompletionRequest) -> Result<ValidatedReques
     // Gatekeeper `REQUIRED #3`: `repetition_penalty` was entirely absent
     // from this request type, so a client sending it got no validation and
     // no effect at all (silently dropped as an unknown field) — validated
-    // identically to `ChatCompletionRequest`/`ExtendedChatRequest`'s field
-    // of the same name.
+    // identically to `ChatCompletionRequest`'s field of the same name
+    // (`server.rs:624-630`, `>= 1.0`), not the earlier `> 0.0` this file and
+    // `ExtendedChatRequest` used: the later gatekeeper text ("validated
+    // identically to chat") supersedes the wave-3.5 `> 0.0` text, and a
+    // value in `(0.0, 1.0)` would otherwise silently REWARD repeated
+    // tokens instead of just failing to penalise them, on this endpoint
+    // only — a real cross-endpoint discrepancy, not a cosmetic one.
     if let Some(rp) = req.repetition_penalty {
-        if !rp.is_finite() || rp <= 0.0 {
+        if !rp.is_finite() || rp < 1.0 {
             return Err(ApiError::bad_request(
-                "repetition_penalty must be a finite number greater than 0.0",
+                "repetition_penalty must be a finite number >= 1.0",
                 "repetition_penalty",
             ));
         }
@@ -443,24 +463,21 @@ fn validate_completion_request(req: CompletionRequest) -> Result<ValidatedReques
 
     // B2-13 / ORCHESTRATOR RULING D-3: `stream: true` is real SSE, but only
     // for the shapes that have a streaming-capable engine seam — a single
-    // prompt, no `logprobs` (`generate_streaming_with_params` has no
-    // logit-capturing counterpart) and no `seed`
-    // (`generate_streaming_with_params` has no seeded counterpart either;
-    // see `crate::engine::InferenceEngine`). Each unsupported combination is
-    // rejected by name rather than silently falling back to a non-streaming
-    // response the client's `Accept: text/event-stream` never expected.
+    // prompt and no `seed` (no engine path streams deterministically-seeded
+    // generation). `logprobs` is no longer in this list (`B8`):
+    // `completions::stream::stream_completion_with_logprobs` builds a
+    // dedicated per-token streaming decode + logit-capture loop directly
+    // over `InferenceEngine`'s `pub(crate)` `model`/`kernel`/`sampler`
+    // fields, so `stream + logprobs` is a real, honoured combination now,
+    // not a rejected one. Each REMAINING unsupported combination is still
+    // rejected by name rather than silently falling back to a
+    // non-streaming response the client's `Accept: text/event-stream`
+    // never expected.
     let stream = req.stream.unwrap_or(false);
     if stream && prompts.len() > 1 {
         return Err(ApiError::bad_request(
             "stream: true does not support a batched prompt (more than one entry); \
              send one prompt per streaming request",
-            "stream",
-        ));
-    }
-    if stream && req.logprobs.is_some() {
-        return Err(ApiError::bad_request(
-            "stream: true cannot be combined with logprobs (no engine path streams \
-             per-token log probabilities yet); omit one",
             "stream",
         ));
     }
@@ -476,45 +493,18 @@ fn validate_completion_request(req: CompletionRequest) -> Result<ValidatedReques
         .as_ref()
         .is_some_and(|opts| opts.include_usage);
 
-    // RT-32: `seed` and `logprobs` each have an existing engine seam
-    // (`generate_with_seed`, `generate_with_logprobs`), but no *combined*
-    // one: `generate_with_logprobs` samples with the engine's ambient
-    // sampler rather than a freshly-seeded one, and this crate has no public
-    // way to install a seeded sampler and then still reach the
-    // logits-capturing decode loop (`InferenceEngine`'s sampler field is
-    // private). Reject the combination honestly instead of silently
-    // honouring only one of the two documented fields.
-    if req.seed.is_some() && req.logprobs.is_some() {
-        return Err(ApiError::bad_request(
-            "seed and logprobs cannot both be honoured in the same /v1/completions request \
-             (no engine path combines a seeded sampler with logit capture yet); omit one",
-            "seed",
-        ));
-    }
-
-    // RT-32 / SV-22: the same gap as the seed+logprobs guard immediately
-    // above, for `temperature`/`top_p` instead of `seed`.
-    // `generate_with_logprobs` always samples with the engine's ambient
-    // sampler — there is no public seam to install caller-supplied
-    // `SamplingParams` on it first (`InferenceEngine` exposes no
-    // sampling-params setter; only `Sampler::params`/`set_params`, behind a
-    // private field) — so without this guard a request combining `logprobs`
-    // with `temperature`/`top_p` would silently take the logprobs branch and
-    // generate at the engine's default sampler, dropping the client's
-    // sampling customization without any error (the exact accept-and-drop
-    // defect class this endpoint exists to remove). Frequency/presence
-    // penalties are deliberately excluded from this guard: they ARE honoured
-    // on the logprobs path (`set_penalties` is called before
-    // `generate_with_logprobs` runs), so there is no dropped field to guard
-    // against there.
-    if req.logprobs.is_some() && (req.temperature.is_some() || req.top_p.is_some()) {
-        return Err(ApiError::bad_request(
-            "logprobs cannot be combined with temperature or top_p in the same \
-             /v1/completions request (no engine path combines logit capture with a \
-             customized sampler yet); omit logprobs, or omit temperature and top_p",
-            "logprobs",
-        ));
-    }
+    // B9 correction (this file's own module doc claimed "no public seam" —
+    // stale: `engine.rs:187`'s `pub(crate) sampler` field exists, and
+    // `server/chat.rs`'s RT-26 fix / `api_extensions.rs`'s seeded-streaming
+    // swap already use it the same way). `seed`, `temperature` and `top_p`
+    // now ALL combine with `logprobs`: `create_completion`'s logprobs
+    // branch swaps a resolved `SamplingParams` (and, when `seed` is set, a
+    // freshly-seeded whole `Sampler`) onto `lease.sampler` for the
+    // duration of the `generate_with_logprobs` call and restores it
+    // unconditionally afterward — see that closure. No rejection needed
+    // here any more; every one of `stop`/`suffix`/`logprobs`/`seed`/`user`
+    // (and now `temperature`/`top_p`/`repetition_penalty` alongside
+    // `logprobs`) is honoured for real.
 
     // An empty stop sequence would make `StopChecker::truncate_at_stop`'s
     // `text.find("")` match at position 0 of every completion — truncating
@@ -618,6 +608,7 @@ pub async fn create_completion(
                 echo,
                 stop_checker,
                 include_usage,
+                logprobs_top_k,
                 active_guard: _active_guard,
             },
         )
@@ -686,16 +677,54 @@ pub async fn create_completion(
                             None => format!("<{id}>"),
                         }
                     };
+                    // B9: `generate_with_logprobs` has no per-call
+                    // params/seed argument of its own — it always samples
+                    // with whatever `lease.sampler` currently holds live.
+                    // `sampler` is `pub(crate)` (`engine.rs`), so this
+                    // crate swaps in the resolved `sampling_params` (and,
+                    // when the client also set `seed`, a freshly-seeded
+                    // whole `Sampler` carrying those same params — the
+                    // identical swap `InferenceEngine::generate_with_seed`
+                    // performs internally) for the duration of this one
+                    // call and restores the previous sampler
+                    // unconditionally afterward, exactly like
+                    // `server/chat.rs`'s RT-26 fix and
+                    // `api_extensions.rs`'s seeded-streaming swap already
+                    // do. This is what lets `temperature`/`top_p`/`seed`
+                    // combine with `logprobs` instead of the 400 an
+                    // earlier revision of this endpoint required.
                     let prev_penalties = lease.penalties();
                     lease.set_penalties(penalties);
-                    let result = lease
-                        .generate_with_logprobs(prompt_tokens, max_tokens, top_k, &id_to_token)
-                        .map(|(tokens, logprobs)| PromptOutcome {
-                            tokens,
-                            logprobs: Some(logprobs),
-                        });
+                    let result = if let Some(seed) = seed {
+                        let mut fresh =
+                            crate::sampling::Sampler::new(sampling_params.clone(), seed);
+                        fresh.set_penalties(penalties);
+                        let old_sampler = std::mem::replace(&mut lease.sampler, fresh);
+                        let r = lease.generate_with_logprobs(
+                            prompt_tokens,
+                            max_tokens,
+                            top_k,
+                            &id_to_token,
+                        );
+                        lease.sampler = old_sampler;
+                        r
+                    } else {
+                        let prev_params = lease.sampler.params().clone();
+                        lease.sampler.set_params(sampling_params.clone());
+                        let r = lease.generate_with_logprobs(
+                            prompt_tokens,
+                            max_tokens,
+                            top_k,
+                            &id_to_token,
+                        );
+                        lease.sampler.set_params(prev_params);
+                        r
+                    };
                     lease.set_penalties(prev_penalties);
-                    result
+                    result.map(|(tokens, logprobs)| PromptOutcome {
+                        tokens,
+                        logprobs: Some(logprobs),
+                    })
                 } else if let Some(seed) = seed {
                     // Each prompt in the batch gets a distinct seed (the base
                     // seed offset by its position), matching the `base_seed +
@@ -1002,960 +1031,5 @@ fn completion_id_from_nanos() -> String {
 // ─── Unit tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `Result::expect_err` requires `T: Debug` (to render the `Ok` value in
-    /// its own panic message); `ValidatedRequest` intentionally does not
-    /// derive `Debug` (it embeds `StopChecker`, which does not either since
-    /// it lives in `api_extensions.rs`, outside this file's ownership), so
-    /// this local helper extracts the error without that bound.
-    fn expect_err(result: Result<ValidatedRequest, ApiError>) -> ApiError {
-        match result {
-            Ok(_) => panic!("expected validation to reject the request, but it succeeded"),
-            Err(e) => e,
-        }
-    }
-
-    fn base_request(prompt: PromptInput) -> CompletionRequest {
-        CompletionRequest {
-            model: None,
-            prompt,
-            max_tokens: 16,
-            temperature: None,
-            top_p: None,
-            n: None,
-            stream: None,
-            stream_options: None,
-            stop: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            repetition_penalty: None,
-            logprobs: None,
-            echo: None,
-            seed: None,
-            suffix: None,
-            user: None,
-        }
-    }
-
-    #[test]
-    fn prompt_input_single_as_strings() {
-        let p = PromptInput::Single("hello world".to_string());
-        assert_eq!(p.as_strings(), vec!["hello world"]);
-    }
-
-    #[test]
-    fn prompt_input_batch_as_strings() {
-        let p = PromptInput::Batch(vec!["foo".to_string(), "bar".to_string()]);
-        assert_eq!(p.as_strings(), vec!["foo", "bar"]);
-    }
-
-    #[test]
-    fn prompt_input_single_first() {
-        let p = PromptInput::Single("hello".to_string());
-        assert_eq!(p.first(), "hello");
-    }
-
-    #[test]
-    fn prompt_input_batch_first() {
-        let p = PromptInput::Batch(vec!["alpha".to_string(), "beta".to_string()]);
-        assert_eq!(p.first(), "alpha");
-    }
-
-    #[test]
-    fn prompt_input_empty_batch_first() {
-        let p = PromptInput::Batch(vec![]);
-        assert_eq!(p.first(), "");
-    }
-
-    #[test]
-    fn build_completion_response_no_echo() {
-        let choice = build_completion_choice(ChoiceInputs {
-            index: 0,
-            prompt: "Say hello",
-            completion: " world",
-            echo: false,
-            completion_tokens: 2,
-            max_tokens: 16,
-            hit_stop: false,
-            logprobs: None,
-        });
-        let resp =
-            build_completion_response("cmpl-abc", "bonsai-8b", 1_000_000, vec![choice], 4, 2);
-        assert_eq!(resp.object, "text_completion");
-        assert_eq!(resp.choices[0].text, " world");
-        assert_eq!(resp.usage.prompt_tokens, 4);
-        assert_eq!(resp.usage.completion_tokens, 2);
-        assert_eq!(resp.usage.total_tokens, 6);
-    }
-
-    #[test]
-    fn build_completion_response_with_echo() {
-        let choice = build_completion_choice(ChoiceInputs {
-            index: 0,
-            prompt: "Say hello",
-            completion: " world",
-            echo: true,
-            completion_tokens: 2,
-            max_tokens: 16,
-            hit_stop: false,
-            logprobs: None,
-        });
-        let resp =
-            build_completion_response("cmpl-abc", "bonsai-8b", 1_000_000, vec![choice], 4, 2);
-        assert_eq!(resp.choices[0].text, "Say hello world");
-    }
-
-    #[test]
-    fn build_completion_response_id_preserved() {
-        let choice = build_completion_choice(ChoiceInputs {
-            index: 0,
-            prompt: "prompt",
-            completion: "completion",
-            echo: false,
-            completion_tokens: 1,
-            max_tokens: 16,
-            hit_stop: false,
-            logprobs: None,
-        });
-        let resp = build_completion_response("cmpl-xyz", "bonsai-8b", 42, vec![choice], 1, 1);
-        assert_eq!(resp.id, "cmpl-xyz");
-        assert_eq!(resp.created, 42);
-    }
-
-    /// Regression test for finding 31: `build_completion_choice` must derive
-    /// `finish_reason` from the *caller-supplied* `max_tokens`, not the
-    /// hardcoded literal `16` the field defaults to. A request that
-    /// overrides `max_tokens` away from `16` and is truncated exactly at
-    /// that limit must report `"length"`, not `"stop"`.
-    #[test]
-    fn build_completion_response_uses_real_max_tokens_for_finish_reason() {
-        // max_tokens = 5, completion_tokens = 5 (exhausted the limit) ->
-        // "length". Under the old hardcoded-16 bug this would incorrectly
-        // report "stop" because 5 < 16.
-        let truncated = build_completion_choice(ChoiceInputs {
-            index: 0,
-            prompt: "prompt",
-            completion: "completion",
-            echo: false,
-            completion_tokens: 5,
-            max_tokens: 5,
-            hit_stop: false,
-            logprobs: None,
-        });
-        assert_eq!(truncated.finish_reason, "length");
-
-        // max_tokens = 100, completion_tokens = 30 (stopped early on EOS,
-        // well under the limit) -> "stop". Under the old hardcoded-16 bug
-        // this would incorrectly report "length" because 30 >= 16.
-        let natural_stop = build_completion_choice(ChoiceInputs {
-            index: 0,
-            prompt: "prompt",
-            completion: "completion",
-            echo: false,
-            completion_tokens: 30,
-            max_tokens: 100,
-            hit_stop: false,
-            logprobs: None,
-        });
-        assert_eq!(natural_stop.finish_reason, "stop");
-    }
-
-    /// A stop-sequence hit always reports `"stop"`, even if (by construction
-    /// of the caller) `completion_tokens >= max_tokens` — the point of
-    /// `hit_stop` is that it wins over the length-based determination.
-    #[test]
-    fn hit_stop_forces_stop_finish_reason_even_at_the_token_limit() {
-        let choice = build_completion_choice(ChoiceInputs {
-            index: 0,
-            prompt: "prompt",
-            completion: "trunc",
-            echo: false,
-            completion_tokens: 16,
-            max_tokens: 16,
-            hit_stop: true,
-            logprobs: None,
-        });
-        assert_eq!(choice.finish_reason, "stop");
-    }
-
-    /// Regression test for finding serve-api-09: every prompt in a batch
-    /// must produce its own [`CompletionChoice`] with a matching `index`,
-    /// not just the first one.
-    #[test]
-    fn build_completion_response_batch_has_one_choice_per_prompt() {
-        let choices = vec![
-            build_completion_choice(ChoiceInputs {
-                index: 0,
-                prompt: "first",
-                completion: "alpha",
-                echo: false,
-                completion_tokens: 1,
-                max_tokens: 16,
-                hit_stop: false,
-                logprobs: None,
-            }),
-            build_completion_choice(ChoiceInputs {
-                index: 1,
-                prompt: "second",
-                completion: "beta",
-                echo: false,
-                completion_tokens: 1,
-                max_tokens: 16,
-                hit_stop: false,
-                logprobs: None,
-            }),
-            build_completion_choice(ChoiceInputs {
-                index: 2,
-                prompt: "third",
-                completion: "gamma",
-                echo: false,
-                completion_tokens: 1,
-                max_tokens: 16,
-                hit_stop: false,
-                logprobs: None,
-            }),
-        ];
-        let resp = build_completion_response("cmpl-batch", "bonsai-8b", 1, choices, 3, 3);
-        assert_eq!(resp.choices.len(), 3, "one choice per batch prompt");
-        assert_eq!(resp.choices[0].index, 0);
-        assert_eq!(resp.choices[0].text, "alpha");
-        assert_eq!(resp.choices[1].index, 1);
-        assert_eq!(resp.choices[1].text, "beta");
-        assert_eq!(resp.choices[2].index, 2);
-        assert_eq!(resp.choices[2].text, "gamma");
-    }
-
-    #[test]
-    fn determine_finish_reason_stop() {
-        assert_eq!(determine_finish_reason(8, 16, false), "stop");
-    }
-
-    #[test]
-    fn determine_finish_reason_length() {
-        assert_eq!(determine_finish_reason(16, 16, false), "length");
-    }
-
-    #[test]
-    fn determine_finish_reason_hit_stop_overrides_length() {
-        assert_eq!(determine_finish_reason(16, 16, true), "stop");
-    }
-
-    #[test]
-    fn completion_id_from_nanos_nonempty() {
-        let id = completion_id_from_nanos();
-        assert!(!id.is_empty());
-    }
-
-    #[test]
-    fn unix_timestamp_secs_nonzero() {
-        let ts = unix_timestamp_secs();
-        // Any reasonable Unix timestamp will be well above 0
-        assert!(ts > 1_000_000_000);
-    }
-
-    #[test]
-    fn serialise_completion_response() {
-        let choice = build_completion_choice(ChoiceInputs {
-            index: 0,
-            prompt: "prompt",
-            completion: "result",
-            echo: false,
-            completion_tokens: 5,
-            max_tokens: 16,
-            hit_stop: false,
-            logprobs: None,
-        });
-        let resp = build_completion_response("cmpl-test", "bonsai-8b", 99, vec![choice], 3, 5);
-        let json = serde_json::to_string(&resp).expect("serialisation must succeed");
-        assert!(json.contains("\"object\":\"text_completion\""));
-        assert!(json.contains("\"finish_reason\""));
-    }
-
-    // ── build_completion_logprobs ────────────────────────────────────────────
-
-    fn logprobs_content(token: &str, logprob: f32) -> LogprobsContent {
-        LogprobsContent {
-            id: 0,
-            token: token.to_string(),
-            logprob,
-            bytes: None,
-            top_logprobs: vec![],
-        }
-    }
-
-    #[test]
-    fn build_completion_logprobs_untruncated_keeps_every_token() {
-        let content = vec![logprobs_content("ab", -0.1), logprobs_content("cd", -0.2)];
-        // "abcd" is 4 chars, nothing truncated.
-        let logprobs = build_completion_logprobs(&content, 4, 0);
-        assert_eq!(logprobs.tokens, vec!["ab", "cd"]);
-        assert_eq!(logprobs.token_logprobs, vec![-0.1, -0.2]);
-        assert_eq!(logprobs.text_offset, vec![0, 2]);
-    }
-
-    #[test]
-    fn build_completion_logprobs_applies_base_offset_for_echo() {
-        let content = vec![logprobs_content("hi", -0.1)];
-        let logprobs = build_completion_logprobs(&content, 2, 10);
-        assert_eq!(logprobs.text_offset, vec![10]);
-    }
-
-    #[test]
-    fn build_completion_logprobs_drops_tokens_past_the_stop_truncation() {
-        let content = vec![
-            logprobs_content("ab", -0.1),
-            logprobs_content("cd", -0.2),
-            logprobs_content("ef", -0.3),
-        ];
-        // Only the first 3 characters ("abc") survived stop-truncation, so
-        // the second token (starting at char 2, "cd") is still partially
-        // visible and kept, but the third ("ef", starting at char 4) must be
-        // dropped entirely.
-        let logprobs = build_completion_logprobs(&content, 3, 0);
-        assert_eq!(logprobs.tokens, vec!["ab", "cd"]);
-        assert_eq!(logprobs.token_logprobs, vec![-0.1, -0.2]);
-    }
-
-    #[test]
-    fn build_completion_logprobs_zero_length_truncation_drops_everything() {
-        let content = vec![logprobs_content("ab", -0.1)];
-        let logprobs = build_completion_logprobs(&content, 0, 0);
-        assert!(logprobs.tokens.is_empty());
-        assert!(logprobs.token_logprobs.is_empty());
-        assert!(logprobs.text_offset.is_empty());
-    }
-
-    #[test]
-    fn build_completion_logprobs_top_logprobs_are_json_objects() {
-        let mut content = logprobs_content("a", -0.05);
-        content.top_logprobs = vec![
-            crate::api_types::TopLogprob {
-                id: 0,
-                token: "a".to_string(),
-                logprob: -0.05,
-                bytes: None,
-            },
-            crate::api_types::TopLogprob {
-                id: 1,
-                token: "b".to_string(),
-                logprob: -1.2,
-                bytes: None,
-            },
-        ];
-        let logprobs = build_completion_logprobs(&[content], 1, 0);
-        let obj = logprobs.top_logprobs[0]
-            .as_object()
-            .expect("top_logprobs entry must be a JSON object");
-        // `top.logprob` is `f32`; round-tripping it through
-        // `serde_json::json!` widens it to `f64`, so compare after narrowing
-        // back to `f32` rather than against an `f64` literal (which is not
-        // bit-identical to the widened `f32` value).
-        assert_eq!(
-            obj.get("a")
-                .and_then(serde_json::Value::as_f64)
-                .map(|v| v as f32),
-            Some(-0.05_f32)
-        );
-        assert_eq!(
-            obj.get("b")
-                .and_then(serde_json::Value::as_f64)
-                .map(|v| v as f32),
-            Some(-1.2_f32)
-        );
-    }
-
-    // ── validate_completion_request ──────────────────────────────────────────
-
-    #[test]
-    fn validate_accepts_a_plain_request() {
-        let req = base_request(PromptInput::Single("hello".to_string()));
-        let validated = validate_completion_request(req).expect("must validate");
-        assert_eq!(validated.prompts, vec!["hello".to_string()]);
-        assert!(!validated.custom_sampling);
-        assert!(validated.seed.is_none());
-        assert!(validated.logprobs_top_k.is_none());
-    }
-
-    #[test]
-    fn validate_rejects_max_tokens_zero() {
-        let mut req = base_request(PromptInput::Single("hi".to_string()));
-        req.max_tokens = 0;
-        let err = expect_err(validate_completion_request(req));
-        assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn validate_rejects_max_tokens_over_the_ceiling() {
-        let mut req = base_request(PromptInput::Single("hi".to_string()));
-        req.max_tokens = MAX_OUTPUT_TOKENS + 1;
-        assert!(validate_completion_request(req).is_err());
-    }
-
-    #[test]
-    fn validate_rejects_n_other_than_one() {
-        let mut req = base_request(PromptInput::Single("hi".to_string()));
-        req.n = Some(2);
-        assert!(validate_completion_request(req).is_err());
-    }
-
-    #[test]
-    fn validate_accepts_n_equal_to_one() {
-        let mut req = base_request(PromptInput::Single("hi".to_string()));
-        req.n = Some(1);
-        assert!(validate_completion_request(req).is_ok());
-    }
-
-    #[test]
-    fn validate_rejects_empty_batch() {
-        let req = base_request(PromptInput::Batch(vec![]));
-        assert!(validate_completion_request(req).is_err());
-    }
-
-    #[test]
-    fn validate_rejects_batch_over_the_cap() {
-        let prompts: Vec<String> = (0..(MAX_COMPLETION_BATCH_SIZE + 1))
-            .map(|i| format!("p{i}"))
-            .collect();
-        let req = base_request(PromptInput::Batch(prompts));
-        assert!(validate_completion_request(req).is_err());
-    }
-
-    /// `stream: true` is rejected naming the field (RT-32 / SV-22).
-    #[test]
-    fn validate_accepts_stream_true_alone() {
-        // ORCHESTRATOR RULING D-3 (final) supersedes the wave-2 interim this
-        // test used to assert (`stream: true` -> unconditional 400): a bare
-        // `stream: true` with a single prompt and no `logprobs`/`seed` is now
-        // valid and must resolve to the streaming branch.
-        let mut req = base_request(PromptInput::Single("hi".to_string()));
-        req.stream = Some(true);
-        let validated = validate_completion_request(req).expect("stream: true alone must validate");
-        assert!(validated.stream);
-    }
-
-    /// The three combinations that remain rejected under D-3: a streaming
-    /// request has no engine seam for a batch, `logprobs`, or `seed`.
-    #[test]
-    fn validate_rejects_stream_with_batch() {
-        let mut req = base_request(PromptInput::Batch(vec!["a".to_string(), "b".to_string()]));
-        req.stream = Some(true);
-        let err = expect_err(validate_completion_request(req));
-        assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn validate_rejects_stream_with_logprobs() {
-        let mut req = base_request(PromptInput::Single("hi".to_string()));
-        req.stream = Some(true);
-        req.logprobs = Some(2);
-        let err = expect_err(validate_completion_request(req));
-        assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn validate_rejects_stream_with_seed() {
-        let mut req = base_request(PromptInput::Single("hi".to_string()));
-        req.stream = Some(true);
-        req.seed = Some(7);
-        let err = expect_err(validate_completion_request(req));
-        assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
-    }
-
-    /// `stream: false` is the common, explicit-default case and must not be
-    /// rejected.
-    #[test]
-    fn validate_accepts_stream_false() {
-        let mut req = base_request(PromptInput::Single("hi".to_string()));
-        req.stream = Some(false);
-        assert!(validate_completion_request(req).is_ok());
-    }
-
-    /// `stream` omitted entirely must not be rejected.
-    #[test]
-    fn validate_accepts_stream_omitted() {
-        let req = base_request(PromptInput::Single("hi".to_string()));
-        assert!(validate_completion_request(req).is_ok());
-    }
-
-    /// A non-empty `suffix` is rejected naming the field (RT-32).
-    #[test]
-    fn validate_rejects_nonempty_suffix() {
-        let mut req = base_request(PromptInput::Single("hi".to_string()));
-        req.suffix = Some("the end".to_string());
-        assert!(validate_completion_request(req).is_err());
-    }
-
-    /// An empty-string `suffix` is a no-op, not a rejection — a client that
-    /// always sends `suffix: ""` must not be broken by this fix.
-    #[test]
-    fn validate_accepts_empty_suffix() {
-        let mut req = base_request(PromptInput::Single("hi".to_string()));
-        req.suffix = Some(String::new());
-        assert!(validate_completion_request(req).is_ok());
-    }
-
-    #[test]
-    fn validate_rejects_frequency_penalty_out_of_range() {
-        let mut req = base_request(PromptInput::Single("hi".to_string()));
-        req.frequency_penalty = Some(3.0);
-        assert!(validate_completion_request(req).is_err());
-    }
-
-    #[test]
-    fn validate_rejects_presence_penalty_out_of_range() {
-        let mut req = base_request(PromptInput::Single("hi".to_string()));
-        req.presence_penalty = Some(-3.0);
-        assert!(validate_completion_request(req).is_err());
-    }
-
-    #[test]
-    fn validate_rejects_non_finite_temperature() {
-        let mut req = base_request(PromptInput::Single("hi".to_string()));
-        req.temperature = Some(f32::NAN);
-        assert!(validate_completion_request(req).is_err());
-    }
-
-    #[test]
-    fn validate_rejects_top_p_out_of_range() {
-        let mut req = base_request(PromptInput::Single("hi".to_string()));
-        req.top_p = Some(0.0);
-        assert!(validate_completion_request(req).is_err());
-    }
-
-    #[test]
-    fn validate_marks_custom_sampling_when_temperature_set() {
-        let mut req = base_request(PromptInput::Single("hi".to_string()));
-        req.temperature = Some(0.5);
-        let validated = validate_completion_request(req).expect("must validate");
-        assert!(validated.custom_sampling);
-    }
-
-    /// `seed` and `logprobs` together are rejected — there is no engine seam
-    /// combining a seeded sampler with logit capture (RT-32).
-    #[test]
-    fn validate_rejects_seed_and_logprobs_together() {
-        let mut req = base_request(PromptInput::Single("hi".to_string()));
-        req.seed = Some(42);
-        req.logprobs = Some(3);
-        let err = expect_err(validate_completion_request(req));
-        assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
-    }
-
-    /// `logprobs` and `temperature` together are rejected — `generate_with_logprobs`
-    /// always samples with the engine's ambient sampler, so a caller-supplied
-    /// `temperature` would otherwise be silently dropped without ever
-    /// erroring (RT-32 / SV-22: the same defect class this file's other
-    /// field-honouring fixes exist to remove).
-    #[test]
-    fn validate_rejects_logprobs_and_temperature_together() {
-        let mut req = base_request(PromptInput::Single("hi".to_string()));
-        req.logprobs = Some(3);
-        req.temperature = Some(0.1);
-        let err = expect_err(validate_completion_request(req));
-        assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
-    }
-
-    /// Same guard, for `top_p` instead of `temperature`.
-    #[test]
-    fn validate_rejects_logprobs_and_top_p_together() {
-        let mut req = base_request(PromptInput::Single("hi".to_string()));
-        req.logprobs = Some(3);
-        req.top_p = Some(0.5);
-        let err = expect_err(validate_completion_request(req));
-        assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
-    }
-
-    /// `logprobs` combined with only frequency/presence penalties (no
-    /// `temperature`/`top_p`) must still be ACCEPTED: penalties are honoured
-    /// on the logprobs path via `set_penalties` before the logits-capturing
-    /// decode loop runs, so there is no dropped field to guard against here
-    /// — the new guard must not over-reject this working combination.
-    #[test]
-    fn validate_accepts_logprobs_and_penalties_together() {
-        let mut req = base_request(PromptInput::Single("hi".to_string()));
-        req.logprobs = Some(3);
-        req.frequency_penalty = Some(0.5);
-        let validated = validate_completion_request(req).expect("must validate");
-        assert_eq!(validated.logprobs_top_k, Some(3));
-        assert!(validated.penalties.is_active());
-    }
-
-    #[test]
-    fn validate_accepts_seed_alone() {
-        let mut req = base_request(PromptInput::Single("hi".to_string()));
-        req.seed = Some(42);
-        let validated = validate_completion_request(req).expect("must validate");
-        assert_eq!(validated.seed, Some(42));
-    }
-
-    #[test]
-    fn validate_accepts_logprobs_alone() {
-        let mut req = base_request(PromptInput::Single("hi".to_string()));
-        req.logprobs = Some(3);
-        let validated = validate_completion_request(req).expect("must validate");
-        assert_eq!(validated.logprobs_top_k, Some(3));
-    }
-
-    #[test]
-    fn validate_stop_sequences_reach_the_stop_checker() {
-        let mut req = base_request(PromptInput::Single("hi".to_string()));
-        req.stop = Some(StopSequences::Single("STOP".to_string()));
-        let validated = validate_completion_request(req).expect("must validate");
-        assert!(!validated.stop_checker.is_empty());
-        let (truncated, hit) = validated.stop_checker.truncate_at_stop("hello STOP world");
-        assert!(hit);
-        assert_eq!(truncated, "hello ");
-    }
-
-    #[test]
-    fn validate_no_stop_sequences_yields_an_empty_stop_checker() {
-        let req = base_request(PromptInput::Single("hi".to_string()));
-        let validated = validate_completion_request(req).expect("must validate");
-        assert!(validated.stop_checker.is_empty());
-    }
-
-    /// Regression: `StopChecker::truncate_at_stop` does `text.find("")`,
-    /// which matches at position 0 of *any* string — an unfiltered empty
-    /// stop sequence would truncate every completion to `""`. Before this
-    /// fix `stop` was never read at all, so `stop: [""]` was harmless by
-    /// omission; now that `stop` is honoured, an empty entry must be
-    /// filtered out rather than newly breaking every response that sets it
-    /// (mirroring `pipeline.rs`'s own `StopMatcher`, which drops empty
-    /// strings for the identical reason).
-    #[test]
-    fn validate_filters_out_an_empty_stop_sequence() {
-        let mut req = base_request(PromptInput::Single("hi".to_string()));
-        req.stop = Some(StopSequences::Single(String::new()));
-        let validated = validate_completion_request(req).expect("must validate");
-        assert!(
-            validated.stop_checker.is_empty(),
-            "an empty stop sequence must be dropped, not installed"
-        );
-        let (truncated, hit) = validated.stop_checker.truncate_at_stop("hello world");
-        assert!(!hit, "an empty stop sequence must never match");
-        assert_eq!(truncated, "hello world");
-    }
-
-    /// Same regression, in a batch that mixes an empty entry with a real one
-    /// — only the empty entry is dropped, the real one still works.
-    #[test]
-    fn validate_filters_empty_stop_sequence_but_keeps_real_ones() {
-        let mut req = base_request(PromptInput::Single("hi".to_string()));
-        req.stop = Some(StopSequences::Multiple(vec![
-            String::new(),
-            "STOP".to_string(),
-        ]));
-        let validated = validate_completion_request(req).expect("must validate");
-        assert!(!validated.stop_checker.is_empty());
-        let (truncated, hit) = validated.stop_checker.truncate_at_stop("hello STOP world");
-        assert!(hit);
-        assert_eq!(truncated, "hello ");
-    }
-
-    // ── Handler-level (end-to-end) tests ─────────────────────────────────────
-    //
-    // Everything above exercises `validate_completion_request` and the pure
-    // helper functions directly. The three headline `RT-32` / `SV-22`
-    // behaviors — logprobs actually populated (not always `null`), `stream:
-    // true` actually rejected, and a stop sequence actually truncating the
-    // *decoded* text — only really live in the handler itself (the
-    // `run_blocking_generation` closure, the post-generation decode +
-    // `StopChecker::truncate_at_stop` pass), which the pure-function tests
-    // cannot reach. These build a real router with the workspace's tiny test
-    // model, the same pattern the sibling (unowned)
-    // `tests/completions_tests.rs` integration suite and
-    // `server/blocking.rs`'s own tests both already use.
-
-    fn test_router() -> axum::Router {
-        let config = oxibonsai_core::config::Qwen3Config::tiny_test();
-        let params = SamplingParams::default();
-        let engine = crate::engine::InferenceEngine::new(config, params, 42);
-        crate::server::create_router(engine, None)
-    }
-
-    /// POST `body` to `/v1/completions` on `app` and return (status, JSON).
-    async fn post_completion(
-        app: axum::Router,
-        body: serde_json::Value,
-    ) -> (axum::http::StatusCode, serde_json::Value) {
-        use axum::body::Body;
-        use axum::http::Request;
-        use tower::ServiceExt;
-
-        let req = Request::post("/v1/completions")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&body).expect("body serialisation"),
-            ))
-            .expect("request build");
-        let resp = app.oneshot(req).await.expect("response");
-        let status = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .expect("body bytes");
-        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-        (status, json)
-    }
-
-    /// `logprobs` must actually be populated, not the `null` SV-22 named.
-    /// With no tokenizer configured (`test_router`'s `None`), per-token
-    /// decoding falls back to `<id>` strings, so the exact token count
-    /// varies with the tiny test model's own (deterministic, but
-    /// implementation-detail) generation length — assert the field is
-    /// *present* and internally consistent (equal-length parallel arrays),
-    /// not an exact count.
-    #[tokio::test]
-    async fn handler_logprobs_field_is_populated_not_null() {
-        let app = test_router();
-        let (status, json) = post_completion(
-            app,
-            serde_json::json!({ "prompt": "hello", "max_tokens": 3, "logprobs": 2 }),
-        )
-        .await;
-        assert_eq!(status, axum::http::StatusCode::OK);
-
-        let logprobs = &json["choices"][0]["logprobs"];
-        assert!(
-            !logprobs.is_null(),
-            "logprobs must be populated when requested, not always null (SV-22); got {json}"
-        );
-        let tokens = logprobs["tokens"].as_array().expect("tokens array");
-        let token_logprobs = logprobs["token_logprobs"]
-            .as_array()
-            .expect("token_logprobs array");
-        let top_logprobs = logprobs["top_logprobs"]
-            .as_array()
-            .expect("top_logprobs array");
-        let text_offset = logprobs["text_offset"]
-            .as_array()
-            .expect("text_offset array");
-        assert_eq!(tokens.len(), token_logprobs.len());
-        assert_eq!(tokens.len(), top_logprobs.len());
-        assert_eq!(tokens.len(), text_offset.len());
-    }
-
-    /// A request without `logprobs` must still report `null` — the fix adds
-    /// the field, it does not turn it on unconditionally.
-    #[tokio::test]
-    async fn handler_logprobs_is_still_null_when_not_requested() {
-        let app = test_router();
-        let (status, json) = post_completion(
-            app,
-            serde_json::json!({ "prompt": "hello", "max_tokens": 3 }),
-        )
-        .await;
-        assert_eq!(status, axum::http::StatusCode::OK);
-        assert!(json["choices"][0]["logprobs"].is_null());
-    }
-
-    /// `stream: true` alone now resolves to real SSE (ORCHESTRATOR RULING
-    /// D-3, final — supersedes this test's former wave-2-interim
-    /// assertion that it was unconditionally rejected with `400`): status
-    /// is `200 OK`, and the body is SSE text (not the non-streaming JSON
-    /// object shape), so `post_completion`'s `serde_json::from_slice` on it
-    /// falls back to `Value::Null`. The detailed chunk-shape assertions
-    /// (`text_completion` chunks, `[DONE]`, `stream_options.include_usage`)
-    /// live in `stream::tests`, which reads the raw body as text rather
-    /// than attempting a JSON parse.
-    #[tokio::test]
-    async fn handler_stream_true_alone_is_ok_not_400() {
-        let app = test_router();
-        let (status, json) = post_completion(
-            app,
-            serde_json::json!({ "prompt": "hello", "max_tokens": 3, "stream": true }),
-        )
-        .await;
-        assert_eq!(status, axum::http::StatusCode::OK);
-        assert_eq!(
-            json,
-            serde_json::Value::Null,
-            "an SSE body must not parse as a single JSON document"
-        );
-    }
-
-    /// The three combinations that remain rejected under D-3 (batch,
-    /// `logprobs`, `seed`) still return `400` naming `stream`, end to end.
-    #[tokio::test]
-    async fn handler_stream_with_logprobs_is_rejected_with_400() {
-        let app = test_router();
-        let (status, json) = post_completion(
-            app,
-            serde_json::json!({
-                "prompt": "hello", "max_tokens": 3, "stream": true, "logprobs": 2
-            }),
-        )
-        .await;
-        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
-        assert_eq!(json["error"]["param"], "stream");
-    }
-
-    /// `logprobs` combined with `temperature` is rejected end-to-end with
-    /// `400`, naming `logprobs` — not silently generating at the engine's
-    /// ambient sampler while pretending the client's `temperature` was
-    /// honoured (RT-32 / SV-22).
-    #[tokio::test]
-    async fn handler_logprobs_and_temperature_together_is_rejected_with_400() {
-        let app = test_router();
-        let (status, json) = post_completion(
-            app,
-            serde_json::json!({
-                "prompt": "hello", "max_tokens": 3, "logprobs": 2, "temperature": 0.1
-            }),
-        )
-        .await;
-        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
-        assert_eq!(json["error"]["param"], "logprobs");
-    }
-
-    /// Same guard, for `top_p` instead of `temperature`.
-    #[tokio::test]
-    async fn handler_logprobs_and_top_p_together_is_rejected_with_400() {
-        let app = test_router();
-        let (status, json) = post_completion(
-            app,
-            serde_json::json!({
-                "prompt": "hello", "max_tokens": 3, "logprobs": 2, "top_p": 0.5
-            }),
-        )
-        .await;
-        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
-        assert_eq!(json["error"]["param"], "logprobs");
-    }
-
-    /// `logprobs` combined with only a frequency/presence penalty must still
-    /// succeed end-to-end — the new guard must not over-reject a combination
-    /// that is actually honoured correctly (penalties are applied on the
-    /// logprobs path via `set_penalties`).
-    #[tokio::test]
-    async fn handler_logprobs_and_frequency_penalty_together_still_succeeds() {
-        let app = test_router();
-        let (status, json) = post_completion(
-            app,
-            serde_json::json!({
-                "prompt": "hello", "max_tokens": 3, "logprobs": 2, "frequency_penalty": 0.5
-            }),
-        )
-        .await;
-        assert_eq!(status, axum::http::StatusCode::OK);
-        assert!(!json["choices"][0]["logprobs"].is_null());
-    }
-
-    /// A stop sequence actually truncates the *decoded* completion text
-    /// end-to-end through the real handler, not just through
-    /// `StopChecker` in isolation.
-    ///
-    /// With no tokenizer configured, the completion text is
-    /// `format!("{output_tokens:?}")`, which for a `Vec<u32>` always starts
-    /// with `'['` — even `"[]"` for zero generated tokens — regardless of
-    /// the tiny test model's own generation length. Using `"["` as the stop
-    /// sequence therefore gives a deterministic, model-behaviour-independent
-    /// stop-hit: before this fix (`stop` never reaching the engine at all),
-    /// the choice text would always be the full, non-empty `"[...]"` string.
-    #[tokio::test]
-    async fn handler_stop_sequence_truncates_the_completion_end_to_end() {
-        let app = test_router();
-        let (status, json) = post_completion(
-            app,
-            serde_json::json!({ "prompt": "hello", "max_tokens": 4, "stop": "[" }),
-        )
-        .await;
-        assert_eq!(status, axum::http::StatusCode::OK);
-        let text = json["choices"][0]["text"].as_str().expect("text field");
-        assert_eq!(
-            text, "",
-            "text must be truncated at the stop sequence found at position 0, got {text:?}"
-        );
-        assert_eq!(json["choices"][0]["finish_reason"], "stop");
-    }
-
-    /// Regression guard for the empty-stop-sequence bug, end-to-end: an
-    /// empty `stop` entry must not truncate every completion to `""`.
-    #[tokio::test]
-    async fn handler_empty_stop_sequence_does_not_truncate_everything() {
-        let app = test_router();
-        let (status, json) = post_completion(
-            app,
-            serde_json::json!({ "prompt": "hello", "max_tokens": 3, "stop": "" }),
-        )
-        .await;
-        assert_eq!(status, axum::http::StatusCode::OK);
-        let text = json["choices"][0]["text"].as_str().expect("text field");
-        assert!(
-            text.starts_with('['),
-            "an empty stop sequence must not truncate the completion; got {text:?}"
-        );
-    }
-
-    /// `sec-03` concurrency guard, pinned on this route specifically: a long
-    /// `/v1/completions` generation must not block a concurrent `/health`
-    /// request on the same runtime. The underlying seam
-    /// (`run_blocking_generation`) already has its own unit tests in
-    /// `server/blocking.rs`, but nothing previously exercised the property
-    /// through the real `/v1/completions` handler; this mirrors
-    /// `server_hardening_round4.rs`'s
-    /// `a_second_request_is_served_while_a_long_generation_runs`, which
-    /// pins the identical property for the base `/v1/chat/completions`
-    /// route.
-    #[tokio::test]
-    async fn handler_long_completion_does_not_block_a_concurrent_health_check() {
-        use std::time::{Duration, Instant};
-
-        let app = test_router();
-
-        // Calibrate the tiny engine's speed so the "long" completion is long
-        // enough to be unambiguous on any machine without being needlessly
-        // slow on a fast one.
-        let probe_start = Instant::now();
-        let (probe_status, _) = post_completion(
-            app.clone(),
-            serde_json::json!({ "prompt": "hello", "max_tokens": 4 }),
-        )
-        .await;
-        assert_eq!(probe_status, axum::http::StatusCode::OK);
-        let per_token = probe_start.elapsed() / 4;
-        let target = Duration::from_millis(1_500);
-        let long_tokens = (target.as_nanos() / per_token.as_nanos().max(1)).clamp(16, 400) as usize;
-
-        let app_for_completion = app.clone();
-        let completion = tokio::spawn(async move {
-            let started = Instant::now();
-            let (status, _) = post_completion(
-                app_for_completion,
-                serde_json::json!({ "prompt": "hello", "max_tokens": long_tokens }),
-            )
-            .await;
-            (status, started.elapsed())
-        });
-
-        // Let the generation task actually start before timing the
-        // concurrent request.
-        tokio::task::yield_now().await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
-
-        let health_start = Instant::now();
-        let health = {
-            use axum::body::Body;
-            use axum::http::Request;
-            use tower::ServiceExt;
-            app.oneshot(
-                Request::get("/health")
-                    .body(Body::empty())
-                    .expect("health request"),
-            )
-            .await
-            .expect("health response")
-        };
-        let health_elapsed = health_start.elapsed();
-        assert_eq!(health.status(), axum::http::StatusCode::OK);
-
-        let (completion_status, completion_elapsed) = completion.await.expect("completion task");
-        assert_eq!(completion_status, axum::http::StatusCode::OK);
-        assert!(
-            health_elapsed < completion_elapsed,
-            "the concurrent health check ({health_elapsed:?}) must finish before the long \
-             completion ({completion_elapsed:?}); generation is blocking the runtime"
-        );
-    }
-}
+#[path = "completions_tests.rs"]
+mod tests;

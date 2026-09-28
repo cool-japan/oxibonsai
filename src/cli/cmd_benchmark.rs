@@ -6,8 +6,8 @@
 
 use super::model_desc;
 use super::util::{
-    build_sampling_params, check_tokenizer_model_compatibility, missing_tokenizer_warning,
-    model_vocab_size, resolve_tokenizer_vocab_aware,
+    build_sampling_params, missing_tokenizer_warning, model_vocab_size,
+    resolve_tokenizer_vocab_aware,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -79,9 +79,16 @@ fn run_real_model(
 
     let expected_vocab = model_vocab_size(&gguf).ok();
     let lookup = resolve_tokenizer_vocab_aware(tokenizer.as_deref(), model, expected_vocab);
-    let prompt_tokens: Vec<u32> = if let Some(tok_path) = &lookup.found {
-        let tok = oxibonsai_runtime::TokenizerBridge::from_file(tok_path)?;
-        check_tokenizer_model_compatibility(&tok, tok_path, &gguf, false)?;
+    // ENGINE-SEAM: shared with `run` (GGUF-embedded tokenizer fallback).
+    let resolved = super::cmd_run::resolve_model_tokenizer_with(
+        tokenizer.as_deref(),
+        &lookup,
+        &gguf,
+        expected_vocab,
+        false,
+        |path| Ok(oxibonsai_runtime::TokenizerBridge::from_file(path)?),
+    )?;
+    let prompt_tokens: Vec<u32> = if let Some(tok) = resolved {
         // A short, fixed benchmark prompt: real tokenization, not a
         // synthetic byte-derived sequence.
         tok.encode("The quick brown fox jumps over the lazy dog.")?

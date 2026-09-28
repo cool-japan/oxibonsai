@@ -1,12 +1,18 @@
 //! Direct Metal dispatch engine for OxiBonsai K-quant GEMV
 //! (`Q2_K` / `Q3_K` / `Q4_K` / `Q5_K` / `Q6_K` / `Q8_K`).
 //!
-//! Metal counterpart of `cuda_k_quant_kernels.rs`, mirroring the Phase 27
-//! `metal_fp8_kernels.rs` architecture:
+//! Metal counterpart of `cuda_k_quant_kernels.rs`:
 //!
-//! - Independent singleton (own [`metal::Device`] + [`metal::CommandQueue`]).
-//! - Six compute pipelines, compiled lazily from MSL source at first use (no
-//!   offline Metal Toolchain required).
+//! - **No private Metal state** (`MET-10`). All six pipelines are resolved by
+//!   entry-point name from the combined metallib `build.rs` embeds
+//!   (`ACTIVE_KERNELS` lists `MSL_GEMV_Q2K_V1` … `MSL_GEMV_Q8K_V1`) through
+//!   [`MetalGraph::pipeline_for`] — the embedded → disk-cached → `xcrun` →
+//!   runtime-source cascade shared by every kernel family. This file used to
+//!   open its own device and compile six separate `MTLLibrary`s from source on
+//!   first use, uncached, every process start.
+//! - Dispatch runs on the *current session's* command queue
+//!   ([`MetalGraph::global`]), so an engine-pool replica's GEMVs stay on that
+//!   replica's queue (`MET-08`).
 //! - All buffers use shared storage (`MTLResourceOptions::StorageModeShared`).
 //!
 //! All K-quant formats use `QK_K = 256` weights per super-block, so `k` must be
@@ -19,14 +25,8 @@
 
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
-use std::sync::OnceLock;
+use metal::MTLResourceOptions;
 
-use metal::{CompileOptions, ComputePipelineState, Device, MTLResourceOptions};
-
-use super::kernel_sources::{
-    MSL_GEMV_Q2K_V1, MSL_GEMV_Q3K_V1, MSL_GEMV_Q4K_V1, MSL_GEMV_Q5K_V1, MSL_GEMV_Q6K_V1,
-    MSL_GEMV_Q8K_V1,
-};
 use super::metal_graph::{commit_and_wait, MetalGraph, MetalGraphError};
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -52,72 +52,11 @@ const SIMDS_PER_TG: usize = 8;
 /// Threads per threadgroup (8 simdgroups × 32 lanes).
 const THREADS_PER_TG: u64 = 256;
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Singleton state
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Process-wide Metal K-quant dispatch state (six compiled pipelines).
-struct MetalKQuantState {
-    pipeline_q2k: ComputePipelineState,
-    pipeline_q3k: ComputePipelineState,
-    pipeline_q4k: ComputePipelineState,
-    pipeline_q5k: ComputePipelineState,
-    pipeline_q6k: ComputePipelineState,
-    pipeline_q8k: ComputePipelineState,
-}
-
-// SAFETY: `metal::Device` / `metal::CommandQueue` are reference-counted
-// Objective-C objects documented by Apple as safe to share across threads once
-// initialised. This mirrors `metal_fp8_kernels::MetalFp8State`.
-unsafe impl Send for MetalKQuantState {}
-unsafe impl Sync for MetalKQuantState {}
-
-impl MetalKQuantState {
-    fn new() -> Result<Self, MetalGraphError> {
-        // `MET-10`: compile against the **shared** device rather than opening
-        // a second `Device::system_default()` handle with its own queue.
-        let device = MetalGraph::global()?.device().to_owned();
-        let options = CompileOptions::new();
-
-        Ok(Self {
-            pipeline_q2k: compile_pipeline(&device, &options, MSL_GEMV_Q2K_V1, "gemv_q2k")?,
-            pipeline_q3k: compile_pipeline(&device, &options, MSL_GEMV_Q3K_V1, "gemv_q3k")?,
-            pipeline_q4k: compile_pipeline(&device, &options, MSL_GEMV_Q4K_V1, "gemv_q4k")?,
-            pipeline_q5k: compile_pipeline(&device, &options, MSL_GEMV_Q5K_V1, "gemv_q5k")?,
-            pipeline_q6k: compile_pipeline(&device, &options, MSL_GEMV_Q6K_V1, "gemv_q6k")?,
-            pipeline_q8k: compile_pipeline(&device, &options, MSL_GEMV_Q8K_V1, "gemv_q8k")?,
-        })
-    }
-}
-
-/// Compile one MSL source string into a named compute pipeline.
-fn compile_pipeline(
-    device: &Device,
-    options: &CompileOptions,
-    source: &str,
-    entry: &str,
-) -> Result<ComputePipelineState, MetalGraphError> {
-    let library = device
-        .new_library_with_source(source, options)
-        .map_err(|e| MetalGraphError::CompilationFailed(format!("{entry} library: {e}")))?;
-    let function = library
-        .get_function(entry, None)
-        .map_err(|e| MetalGraphError::CompilationFailed(format!("{entry} function: {e}")))?;
-    device
-        .new_compute_pipeline_state_with_function(&function)
-        .map_err(|e| MetalGraphError::CompilationFailed(format!("{entry} pipeline: {e}")))
-}
-
-/// Lazy process-wide singleton.
-fn state() -> Result<&'static MetalKQuantState, MetalGraphError> {
-    static STATE: OnceLock<Result<MetalKQuantState, MetalGraphError>> = OnceLock::new();
-    match STATE.get_or_init(MetalKQuantState::new) {
-        Ok(s) => Ok(s),
-        // `MetalGraphError` derives `Clone` (`O3`), so the four hand-written
-        // exhaustive `clone_err` matches this file used to carry are gone.
-        Err(e) => Err(e.clone()),
-    }
-}
+/// Entry points of the six K-quant GEMV kernels in the combined metallib, in
+/// `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, `Q8_K` order.
+pub(crate) const K_QUANT_GEMV_ENTRIES: [&str; 6] = [
+    "gemv_q2k", "gemv_q3k", "gemv_q4k", "gemv_q5k", "gemv_q6k", "gemv_q8k",
+];
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Public dispatch functions
@@ -143,9 +82,8 @@ pub fn metal_gemv_q2k(
     n_rows: usize,
     k: usize,
 ) -> Result<(), MetalGraphError> {
-    let s = state()?;
     dispatch_k_quant_gemv(
-        &s.pipeline_q2k,
+        K_QUANT_GEMV_ENTRIES[0],
         blocks,
         input,
         output,
@@ -164,9 +102,8 @@ pub fn metal_gemv_q3k(
     n_rows: usize,
     k: usize,
 ) -> Result<(), MetalGraphError> {
-    let s = state()?;
     dispatch_k_quant_gemv(
-        &s.pipeline_q3k,
+        K_QUANT_GEMV_ENTRIES[1],
         blocks,
         input,
         output,
@@ -185,9 +122,8 @@ pub fn metal_gemv_q4k(
     n_rows: usize,
     k: usize,
 ) -> Result<(), MetalGraphError> {
-    let s = state()?;
     dispatch_k_quant_gemv(
-        &s.pipeline_q4k,
+        K_QUANT_GEMV_ENTRIES[2],
         blocks,
         input,
         output,
@@ -206,9 +142,8 @@ pub fn metal_gemv_q5k(
     n_rows: usize,
     k: usize,
 ) -> Result<(), MetalGraphError> {
-    let s = state()?;
     dispatch_k_quant_gemv(
-        &s.pipeline_q5k,
+        K_QUANT_GEMV_ENTRIES[3],
         blocks,
         input,
         output,
@@ -227,9 +162,8 @@ pub fn metal_gemv_q6k(
     n_rows: usize,
     k: usize,
 ) -> Result<(), MetalGraphError> {
-    let s = state()?;
     dispatch_k_quant_gemv(
-        &s.pipeline_q6k,
+        K_QUANT_GEMV_ENTRIES[4],
         blocks,
         input,
         output,
@@ -248,9 +182,8 @@ pub fn metal_gemv_q8k(
     n_rows: usize,
     k: usize,
 ) -> Result<(), MetalGraphError> {
-    let s = state()?;
     dispatch_k_quant_gemv(
-        &s.pipeline_q8k,
+        K_QUANT_GEMV_ENTRIES[5],
         blocks,
         input,
         output,
@@ -263,7 +196,7 @@ pub fn metal_gemv_q8k(
 
 #[allow(clippy::too_many_arguments)]
 fn dispatch_k_quant_gemv(
-    pipeline: &ComputePipelineState,
+    entry: &str,
     blocks: &[u8],
     input: &[f32],
     output: &mut [f32],
@@ -272,18 +205,9 @@ fn dispatch_k_quant_gemv(
     block_bytes: usize,
     format: &str,
 ) -> Result<(), MetalGraphError> {
-    // `MET-10`: dispatch on the **shared** device and on the *current
-    // session's* command queue, instead of the private
-    // `Device::system_default()` + `new_command_queue()` this family used to
-    // own. Five independent `MTLCommandQueue`s on one device is what made
-    // these kernel families invisible to the `MET-08` session split; routed
-    // through `MetalGraph::global()` they inherit the caller's session, so a
-    // replica's submissions stay on that replica's queue. (The pipelines
-    // themselves still live in this family's own Metal library — folding them
-    // into the combined metallib is the other, separately-owned half of
-    // `MET-10`.)
-    let graph = MetalGraph::global()?;
     // ── Validate dimensions ─────────────────────────────────────────────────
+    // Shape errors are reported before the device is touched, so a malformed
+    // call fails the same way on a host with no Metal GPU at all.
     if k == 0 || !k.is_multiple_of(QK_K) {
         return Err(MetalGraphError::EncodingFailed(format!(
             "{format} GEMV: k = {k} must be a non-zero multiple of {QK_K}"
@@ -312,6 +236,13 @@ fn dispatch_k_quant_gemv(
     if n_rows == 0 {
         return Ok(());
     }
+
+    // `MET-10`: the shared device, the *current session's* command queue, and
+    // a pipeline resolved by name from the combined metallib — no private
+    // device, queue or library. `pipeline_for` caches the pipeline state by
+    // name, so after the first call this is a map lookup and a refcount bump.
+    let graph = MetalGraph::global()?;
+    let pipeline = graph.pipeline_for(entry)?;
 
     // ── Allocate buffers (shared storage) ───────────────────────────────────
     let block_buf = graph.device().new_buffer_with_data(
@@ -343,7 +274,7 @@ fn dispatch_k_quant_gemv(
     let cmd = graph.command_queue.new_command_buffer();
     let encoder = cmd.new_compute_command_encoder();
 
-    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_compute_pipeline_state(&pipeline);
     encoder.set_buffer(0, Some(&block_buf), 0);
     encoder.set_buffer(1, Some(&input_buf), 0);
     encoder.set_buffer(2, Some(&output_buf), 0);
@@ -396,16 +327,34 @@ mod tests {
         assert_eq!(Q8K_BLOCK_BYTES, oxibonsai_core::BLOCK_Q8K_BYTES);
     }
 
-    /// `k` not a multiple of 256 is rejected before any GPU work.
+    /// `k` not a multiple of 256 is rejected before any GPU work — literally:
+    /// validation runs before `MetalGraph::global()`, so this also runs on a
+    /// host with no Metal device.
     #[test]
     fn q4k_bad_k_rejected() {
-        if state().is_err() {
-            return;
-        }
         let blocks = vec![0u8; Q4K_BLOCK_BYTES];
         let input = vec![0.0f32; 255];
         let mut output = vec![0.0f32; 1];
-        assert!(metal_gemv_q4k(&blocks, &input, &mut output, 1, 255).is_err());
+        match metal_gemv_q4k(&blocks, &input, &mut output, 1, 255) {
+            Err(MetalGraphError::EncodingFailed(msg)) => {
+                assert!(msg.contains("multiple of 256"), "msg = {msg}");
+            }
+            other => panic!("expected EncodingFailed, got {other:?}"),
+        }
+    }
+
+    /// `MET-10`: every K-quant entry point resolves from the **combined**
+    /// metallib — no family compiles its own library any more.
+    #[test]
+    fn k_quant_entries_resolve_from_the_combined_metallib() {
+        let Ok(graph) = MetalGraph::global() else {
+            return; // no Metal device on this host
+        };
+        for entry in K_QUANT_GEMV_ENTRIES {
+            graph
+                .pipeline_for(entry)
+                .unwrap_or_else(|e| panic!("{entry} must resolve from the combined metallib: {e}"));
+        }
     }
 
     // ───────────────────────────────────────────────────────────────────────

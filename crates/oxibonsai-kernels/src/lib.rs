@@ -102,6 +102,24 @@ pub use gpu_backend::{
     MetalWeightHandle,
 };
 
+/// `MET-08`: the process-shared Metal device and the RAII session binding,
+/// nameable from outside the crate. Re-exported straight from the public
+/// `gpu_backend::metal_graph` module.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub use gpu_backend::metal_graph::{MetalDevice, SessionScope};
+
+/// `MET-03` / `M-21`: the cached ternary weight shape and its entry points,
+/// plus the N-part fused TQ2 GEMV. Re-exported straight from the public
+/// `gpu_backend::metal_full_layer` module.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub use gpu_backend::metal_full_layer::{
+    try_metal_forward_greedy_ternary_cached, try_metal_full_forward_prefill_ternary_cached,
+    try_metal_full_forward_prefill_verify_ternary_cached, try_metal_full_forward_ternary_cached,
+    try_metal_gemv_tq2_fused, try_metal_prefill_ternary_cached,
+    try_metal_prefill_verify_ternary_cached, CachedTernaryLayerWeights, CachedTernaryWeights,
+    LEGACY_MODEL_EPOCH,
+};
+
 #[cfg(all(
     feature = "native-cuda",
     any(target_os = "linux", target_os = "windows")

@@ -37,7 +37,8 @@ fn test_weight_upload() {
     assert_eq!(handle.byte_len(), 1024);
 }
 
-/// Test the singleton accessor.
+/// Test the process-default session accessor (`MetalGraph::global()` on an
+/// unbound thread resolves to one session, every time).
 #[test]
 fn test_global_singleton() {
     if Device::system_default().is_none() {
@@ -469,7 +470,7 @@ fn test_batched_rmsnorm() {
 /// non-resident callers).
 ///
 /// Ignored by default: requires a Metal GPU and must not run concurrently
-/// with other tests that share the global `MetalGraph` singleton's weight cache.
+/// with other tests that share the process-shared device's weight cache.
 #[test]
 #[ignore = "requires Metal GPU; run with --test-threads=1"]
 fn test_weight_upload_count_increments_on_new_key() {
@@ -500,6 +501,6 @@ fn test_weight_upload_count_increments_on_new_key() {
         before + 1,
         "upload count must NOT increment on a cache hit"
     );
-    // Cleanup: evict so the test leaves no residue in the global singleton.
+    // Cleanup: evict so the test leaves no residue in the shared weight cache.
     graph.evict_f32_weight(key).expect("cleanup evict failed");
 }

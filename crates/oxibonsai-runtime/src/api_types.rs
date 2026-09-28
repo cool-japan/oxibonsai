@@ -51,7 +51,7 @@ impl ToolDefinition {
 }
 
 /// A function call made by the model (name + serialised arguments).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolFunctionCall {
     /// Name of the function invoked.
     pub name: String,
@@ -62,7 +62,7 @@ pub struct ToolFunctionCall {
 /// A tool call produced by the model in a chat completion response.
 ///
 /// Uses `r#type` (serialised as `"type"`) to avoid the reserved keyword.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolCallResult {
     /// Unique identifier for this tool call (prefix `call_`).
     pub id: String,

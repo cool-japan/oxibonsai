@@ -16,6 +16,7 @@ use half::f16;
 use oxibonsai_core::gguf::reader::GgufFile;
 use oxibonsai_core::gguf::writer::{GgufWriter, MetadataWriteValue, TensorEntry, TensorType};
 use oxibonsai_kernels::dispatch::{KernelDispatcher, KernelTier};
+use oxibonsai_kernels::{MetalGraph, MetalGraphError, SessionScope};
 use oxibonsai_model::model::BonsaiModel;
 use std::sync::Arc;
 
@@ -288,14 +289,10 @@ fn parse_synthetic_gguf(gguf_bytes: &[u8]) -> GgufFile<'_> {
 /// That is the acceptance evidence for `MET-08`; if these tests ever need a
 /// lock again, the session split has regressed.
 ///
-/// The guard is inert on a host without a Metal device, where every test
-/// below early-returns anyway.
-///
-/// (The concrete guard type is `metal_graph::SessionScope`; it is returned
-/// opaquely here only because the crate root does not re-export it yet — see
-/// this package's deviations.)
-fn gpu_session() -> impl Sized {
-    oxibonsai_kernels::MetalGraph::bind_new_session()
+/// The guard is inert on a host without a Metal device (`Err`), where every
+/// test below early-returns anyway.
+fn gpu_session() -> Result<SessionScope, MetalGraphError> {
+    MetalGraph::bind_new_session()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -608,4 +605,192 @@ fn test_ternary_greedy_gpu_last_valid_pos_not_guarded() {
             "last valid position must not trip the context-length guard, got: {e}"
         );
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MET-03 on the real model: the cached ternary shape is byte-identical
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Context the real-model run is loaded with (small: only the device KV cache
+/// scales with it, and every sequence below fits).
+const REAL_MAX_SEQ: usize = 256;
+
+/// Teacher-forced token ids for the real-model run: deterministic, spread over
+/// the vocabulary, never a special-token-only prefix.
+fn real_model_tokens(vocab: usize, n: usize) -> Vec<u32> {
+    (0..n)
+        .map(|i| ((i * 7919 + 1013) % vocab.max(1)) as u32)
+        .collect()
+}
+
+/// `MET-03` acceptance on the real **Ternary-Bonsai-1.7B**
+/// (`OXI_MODEL=<path to Ternary-Bonsai-1.7B.gguf>`): the cached ternary shape
+/// (`CachedTernaryWeights` — eight GPU handles per layer bound directly) is
+/// **byte-identical** to the uncached path it replaces (eight weight-cache
+/// lookups per layer per token over a freshly rebuilt
+/// `FullForwardLayerParamsTernary`), for
+///
+/// 1. 12 teacher-forced single-token decode steps — every logit, bit for bit;
+/// 2. the greedy token of each step (cached GPU argmax == argmax of those
+///    logits);
+/// 3. a 9-token batched prefill (last-position logits) and its verify twin
+///    (every position's greedy id);
+///
+/// and building / using the cache uploads **no** GPU buffer beyond the ones
+/// the uncached path already made resident.
+///
+/// Every run gets its own Metal session (`MET-08`), so the device KV caches of
+/// the "before" and "after" runs cannot interact — and all of those sessions
+/// sit on one **isolated** device, so the residency assertions see only this
+/// test's uploads even while the synthetic tests above run in parallel. Skips
+/// with a capability report when `OXI_MODEL` is unset or the host has no
+/// Metal device.
+#[test]
+fn real_model_cached_ternary_path_is_byte_identical_to_the_uncached_path() {
+    let Some(path) = std::env::var_os("OXI_MODEL") else {
+        eprintln!(
+            "real_model_cached_ternary_path_is_byte_identical_to_the_uncached_path: \
+             OXI_MODEL not set — skipping (set OXI_MODEL=<Ternary-Bonsai-1.7B.gguf> to run \
+             the MET-03 real-model parity check)"
+        );
+        return;
+    };
+    let Ok(device) = oxibonsai_kernels::MetalDevice::isolated() else {
+        eprintln!(
+            "real_model_cached_ternary_path_is_byte_identical_to_the_uncached_path: no Metal \
+             device — skipping"
+        );
+        return;
+    };
+    // Run `f` in a fresh session on the isolated device.
+    let in_session = |f: &mut dyn FnMut()| {
+        let session = MetalGraph::new_session_on(&device);
+        MetalGraph::with_session(&session, f);
+    };
+    let mmap = oxibonsai_core::gguf::reader::mmap_gguf_file(std::path::Path::new(&path))
+        .expect("mmap OXI_MODEL");
+    let gguf = GgufFile::parse(&mmap).expect("parse OXI_MODEL");
+    let model = BonsaiModel::from_gguf(&gguf, REAL_MAX_SEQ).expect("load OXI_MODEL");
+    in_session(&mut || {
+        model
+            .get_or_create_gpu_cache()
+            .expect("build the GPU weight cache (OXI_MODEL must be a ternary GGUF)");
+    });
+
+    let vocab = model.config().vocab_size;
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+    let probe = MetalGraph::new_session_on(&device);
+    let resident_before = probe.cached_weight_count().expect("count");
+    let bytes_before = probe.bytes_uploaded();
+
+    // 1 + 2: teacher-forced decode.
+    let tokens = real_model_tokens(vocab, 12);
+    let mut uncached: Vec<Vec<f32>> = Vec::new();
+    in_session(&mut || {
+        for (pos, &t) in tokens.iter().enumerate() {
+            uncached.push(
+                model
+                    .forward_logits_gpu_ternary_uncached(t, pos)
+                    .expect("uncached ternary decode"),
+            );
+        }
+    });
+    let mut cached: Vec<Vec<f32>> = Vec::new();
+    in_session(&mut || {
+        for (pos, &t) in tokens.iter().enumerate() {
+            cached.push(
+                model
+                    .forward_logits_gpu_ternary_cached(t, pos)
+                    .expect("cached ternary decode"),
+            );
+        }
+    });
+    let mut greedy: Vec<u32> = Vec::new();
+    in_session(&mut || {
+        for (pos, &t) in tokens.iter().enumerate() {
+            greedy.push(
+                model
+                    .forward_greedy_gpu_ternary_cached(t, pos)
+                    .expect("cached ternary greedy"),
+            );
+        }
+    });
+    let mut max_abs_logit = 0f32;
+    for (pos, (before, after)) in uncached.iter().zip(&cached).enumerate() {
+        assert_eq!(before.len(), vocab, "step {pos}: logits length");
+        assert!(
+            before.iter().all(|x| x.is_finite()),
+            "step {pos}: non-finite logit"
+        );
+        assert_eq!(
+            bits(before),
+            bits(after),
+            "step {pos}: the cached ternary path diverged from the uncached one"
+        );
+        let mut best = 0usize;
+        for (i, v) in before.iter().enumerate() {
+            max_abs_logit = max_abs_logit.max(v.abs());
+            if *v > before[best] {
+                best = i;
+            }
+        }
+        assert_eq!(
+            greedy[pos] as usize, best,
+            "step {pos}: cached GPU argmax != argmax of the logits"
+        );
+    }
+
+    // 3: batched prefill + verify.
+    let prompt = real_model_tokens(vocab, 9);
+    let mut prefill_before = Vec::new();
+    in_session(&mut || {
+        prefill_before = model
+            .try_metal_prefill_with_lm_head_ternary(&prompt, 0)
+            .expect("uncached batched prefill");
+    });
+    let mut prefill_after = Vec::new();
+    in_session(&mut || {
+        prefill_after = model
+            .prefill_logits_gpu_ternary_cached(&prompt, 0)
+            .expect("cached batched prefill");
+    });
+    assert_eq!(prefill_before.len(), vocab);
+    assert_eq!(
+        bits(&prefill_before),
+        bits(&prefill_after),
+        "batched prefill: the cached path diverged from the uncached one"
+    );
+    let mut verify_before = Vec::new();
+    in_session(&mut || {
+        verify_before = model
+            .try_metal_prefill_verify_ternary_path(&prompt, 0)
+            .expect("uncached verify");
+    });
+    let mut verify_after = Vec::new();
+    in_session(&mut || {
+        verify_after = model
+            .prefill_verify_gpu_ternary_cached(&prompt, 0)
+            .expect("cached verify");
+    });
+    assert_eq!(verify_before.len(), prompt.len());
+    assert_eq!(verify_before, verify_after, "verify ids diverged");
+
+    let resident_after = probe.cached_weight_count().expect("count");
+    assert_eq!(
+        resident_after, resident_before,
+        "the cached and uncached paths must bind the same resident buffers (no second upload)"
+    );
+    assert_eq!(probe.bytes_uploaded(), bytes_before);
+    eprintln!(
+        "MET-03 real-model parity: {} decode steps + {}-token prefill/verify byte-identical \
+         (vocab {vocab}, max |logit| {max_abs_logit:.3}); {} resident weight buffers = \
+         {:.2} MB of GPU weights, unchanged by every run",
+        tokens.len(),
+        prompt.len(),
+        resident_after,
+        bytes_before as f64 / 1e6,
+    );
+    in_session(&mut || {
+        let _ = model.release_metal_weights();
+    });
 }

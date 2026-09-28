@@ -193,12 +193,13 @@ impl ServedModelInfo {
         }
         match self.engines.acquire().await {
             Ok(lease) => {
-                let cfg = lease.model().config();
+                // ENGINE-SEAM: read through the engine, which answers for a
+                // dense and a hybrid (`qwen35`) model alike.
                 let descriptor = ModelDescriptor {
-                    id: cfg.model_name.clone(),
-                    architecture: cfg.architecture.clone(),
-                    max_context_length: cfg.max_context_length,
-                    vocab_size: cfg.vocab_size,
+                    id: lease.model_name().to_string(),
+                    architecture: lease.architecture().to_string(),
+                    max_context_length: lease.context_length(),
+                    vocab_size: lease.vocab_size(),
                     created: self.created,
                 };
                 drop(lease);
@@ -846,6 +847,15 @@ pub struct RouterOptions {
     /// server is — it must be opted into explicitly rather than shipped on
     /// by default.
     pub enable_ui: bool,
+    /// The real, model-backed embedder behind `/v1/embeddings` (`RT-08`,
+    /// EMBED-MODEL handoff).
+    ///
+    /// `Some` → the endpoint serves mean-pooled hidden states of the loaded
+    /// model; `None` (the default) → it answers the honest `501` (no
+    /// model-backed embedder was configured). A hybrid (`qwen35`) model has
+    /// no embedder yet (`ModelEmbedder` refuses it with the typed
+    /// `NOT_A_DENSE_MODEL` error), so its servers keep the `501`.
+    pub embedder: Option<Arc<crate::embed_engine::ModelEmbedder>>,
 }
 
 impl Default for RouterOptions {
@@ -860,11 +870,22 @@ impl Default for RouterOptions {
             default_max_tokens: default_max_tokens_value(),
             max_output_tokens_ceiling: MAX_OUTPUT_TOKENS,
             enable_ui: false,
+            embedder: None,
         }
     }
 }
 
 impl RouterOptions {
+    /// Attach the model-backed embedder that serves `/v1/embeddings`
+    /// (`RT-08`). `None` keeps the honest `501`.
+    pub fn with_embedder(
+        mut self,
+        embedder: Option<Arc<crate::embed_engine::ModelEmbedder>>,
+    ) -> Self {
+        self.embedder = embedder;
+        self
+    }
+
     /// Attach a multi-model router.
     pub fn with_model_router(mut self, model_router: Option<Arc<ModelRouter>>) -> Self {
         self.model_router = model_router;
@@ -1029,6 +1050,7 @@ pub fn create_router_full(
         default_max_tokens,
         max_output_tokens_ceiling,
         enable_ui,
+        embedder,
     } = options;
 
     let model_info = Arc::new(ServedModelInfo::new(Arc::clone(&engines)));
@@ -1068,14 +1090,24 @@ pub fn create_router_full(
     // The embeddings router carries its own Arc<EmbeddingAppState>; merge it
     // before attaching the main AppState so the states don't conflict.
     //
-    // Orchestrator decision D-1 (wave 2.5, `RT-EMBEDDINGS` blocking 1): a
-    // real model-backed embedder needs `BonsaiModel::forward_hidden` (does
-    // not exist yet, outside this crate) and was explicitly scoped out of
-    // this wave as "a genuine feature, not a fix". Until it lands, this
-    // deployment refuses `/v1/embeddings` honestly (`501`) rather than
-    // silently answer with a non-semantic `IdentityEmbedder` byte-hash
-    // vector — see `create_embeddings_router_requiring_model`'s doc comment.
-    let embeddings_router = crate::embeddings::create_embeddings_router_requiring_model(512);
+    // EMBED-MODEL / D-1 (`RT-08`): serve REAL model-backed embeddings when
+    // this server was given an embedder; keep the honest `501` only when it
+    // was not (a model-less router, or a hybrid model, which has no
+    // `forward_hidden` yet). Either branch records onto the SAME
+    // `InferenceMetrics` every other route uses (`SV-25`), so the endpoint is
+    // no longer invisible to `/metrics`. The destructured `embedder` binding
+    // is used here -- `options` itself was moved by the destructure above.
+    let embeddings_router = {
+        let mut registry =
+            crate::embeddings::EmbedderRegistry::new(512).with_require_model_backend(true);
+        if let Some(embedder) = embedder.as_ref() {
+            registry = registry.with_model(Arc::clone(embedder));
+        }
+        crate::embeddings::create_embeddings_router_from_state(
+            crate::embeddings::EmbeddingAppState::from_registry(registry)
+                .with_metrics(Arc::clone(&metrics)),
+        )
+    };
 
     // Admin API, wired to the real metrics + model descriptor so `/admin/config`
     // reports the running configuration instead of hard-coded defaults.
@@ -1647,6 +1679,116 @@ mod tests {
                 json["error"]["code"], "model_not_found",
                 "must be the canonical OpenAI error envelope, not an empty body: {json}"
             );
+        }
+    }
+
+    // ── ENGINE-SEAM item 7 / SV-25 / RT-08: the full router's embedder ───
+
+    mod embedder_wiring {
+        use super::*;
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        /// `create_router_full` over a one-replica pool, exactly as a server
+        /// binary builds it.
+        fn full_router(options: RouterOptions, metrics: &Arc<InferenceMetrics>) -> Router {
+            let engine = InferenceEngine::new(
+                oxibonsai_core::config::Qwen3Config::tiny_test(),
+                SamplingParams::default(),
+                42,
+            );
+            create_router_full(
+                EnginePool::new(vec![engine]),
+                None,
+                Arc::clone(metrics),
+                options,
+            )
+        }
+
+        /// A dedicated, weighted dense embedding engine (real Transformer
+        /// blocks) behind a char-level tokenizer whose ids fit its vocabulary.
+        fn dense_embedder() -> Arc<crate::embed_engine::ModelEmbedder> {
+            let config = oxibonsai_core::config::Qwen3Config {
+                hidden_size: 128,
+                intermediate_size: 256,
+                num_layers: 2,
+                num_attention_heads: 4,
+                num_kv_heads: 2,
+                head_dim: 32,
+                vocab_size: 64,
+                max_context_length: 64,
+                ..oxibonsai_core::config::Qwen3Config::tiny_test()
+            };
+            let engine = InferenceEngine::from_model_with_tier(
+                oxibonsai_model::model::BonsaiModel::new_for_testing_with_blocks(config),
+                oxibonsai_kernels::KernelTier::Reference,
+                SamplingParams::default(),
+                42,
+            );
+            let tokenizer = Arc::new(TokenizerBridge::from_native_tokenizer(
+                oxibonsai_tokenizer::OxiTokenizer::char_level_stub(64),
+            ));
+            crate::embed_engine::ModelEmbedder::from_engine(engine, tokenizer)
+                .expect("a dense engine embeds")
+        }
+
+        async fn post_embeddings(
+            app: Router,
+            body: serde_json::Value,
+        ) -> (StatusCode, serde_json::Value) {
+            let req = axum::http::Request::post("/v1/embeddings")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&body).expect("body serialisation"),
+                ))
+                .expect("build request");
+            let resp = app.oneshot(req).await.expect("response");
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("body bytes");
+            let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            (status, json)
+        }
+
+        /// No embedder configured: the honest `501`, still counted on the
+        /// router's shared metrics (`SV-25`).
+        #[tokio::test]
+        async fn without_an_embedder_the_full_router_refuses_and_counts_it() {
+            let metrics = Arc::new(InferenceMetrics::new());
+            let app = full_router(RouterOptions::default(), &metrics);
+            let (status, json) = post_embeddings(app, serde_json::json!({ "input": "hi" })).await;
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{json}");
+            assert_eq!(metrics.requests_total.get(), 1);
+            assert_eq!(metrics.errors_total.get(), 1);
+        }
+
+        /// `RouterOptions::with_embedder` reaches the route through the
+        /// destructured `embedder` binding: real vectors of the model's
+        /// hidden width, recorded on the same metrics every route uses.
+        #[tokio::test]
+        async fn a_configured_embedder_serves_real_vectors_on_the_shared_metrics() {
+            let metrics = Arc::new(InferenceMetrics::new());
+            let app = full_router(
+                RouterOptions::default().with_embedder(Some(dense_embedder())),
+                &metrics,
+            );
+            let (status, json) =
+                post_embeddings(app, serde_json::json!({ "input": "hello" })).await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            let vector = json["data"][0]["embedding"]
+                .as_array()
+                .unwrap_or_else(|| panic!("an embedding vector: {json}"));
+            assert_eq!(vector.len(), 128, "the model's hidden width");
+            assert!(
+                vector
+                    .iter()
+                    .all(|v| v.as_f64().is_some_and(f64::is_finite)),
+                "{json}"
+            );
+            assert_eq!(metrics.requests_total.get(), 1);
+            assert_eq!(metrics.errors_total.get(), 0);
+            assert!(metrics.prompt_tokens_total.get() > 0);
         }
     }
 

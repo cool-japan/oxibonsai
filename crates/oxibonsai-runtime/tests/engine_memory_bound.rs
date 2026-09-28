@@ -79,12 +79,18 @@ fn engine_and_router_construction_stays_within_memory_bound() {
     let engine = InferenceEngine::new(config, SamplingParams::default(), 42);
 
     // Assert on the config the already-constructed engine actually carries
-    // (`engine.model().config()`), not on a separately re-constructed
+    // (`engine.dense_model()?.config()`), not on a separately re-constructed
     // `Qwen3Config::tiny_test()` value. That makes the bound self-checking:
     // if this test is ever edited to build the engine from a larger config
     // (e.g. `bonsai_8b()`), the assertion below fails loudly instead of
     // silently passing against a stale, independently computed number.
-    let carried = engine.model().config();
+    let carried = engine
+        .dense_model()
+        .expect("a config-built engine holds a dense model")
+        .config();
+    // The engine-level seam reports the same geometry.
+    assert_eq!(engine.vocab_size(), carried.vocab_size);
+    assert_eq!(engine.hidden_size(), carried.hidden_size);
     let embed_table_bytes = carried
         .vocab_size
         .saturating_mul(carried.hidden_size)
@@ -105,4 +111,149 @@ fn engine_and_router_construction_stays_within_memory_bound() {
     // the test process gets OOM-killed here exactly as the bug described,
     // rather than silently passing.
     let _router = create_router(engine, None);
+}
+
+/// Replica sharing on a **real** model (verify:METAL-CONCURRENCY blocking
+/// #1, ENGINE-SEAM item 6): three replicas of the dense model at
+/// `$OXI_MODEL`, built exactly the way `build_pool_from_gguf_parts` builds a
+/// pool (replica 1 maps and leaks the file, replicas 2 and 3 borrow the same
+/// `&'static GgufFile` and the shared token-embedding table), must place the
+/// model's weights on the GPU **once**:
+///
+/// * `MetalGraph::bytes_uploaded` — the Metal weight cache's resident gauge —
+///   grows with replica 1 and not at all with replicas 2 and 3;
+/// * the scirs2 backend's cumulative fresh-upload counter likewise (for a
+///   `Q1_0_g128` model every replica runs `upload_weights_to_gpu`, and each
+///   used to mint fresh handles — N replicas, N copies — while the ternary
+///   fused route skips that upload outright, so there it stays at zero);
+/// * each later replica reports zero fresh buffers and exactly replica 1's
+///   buffers as shared, and decodes the same greedy tokens.
+///
+/// Point `OXI_MODEL` at `models/Bonsai-8B.gguf` (the `Q1_0_g128` case this
+/// sharing was built for) or `models/Ternary-Bonsai-1.7B.gguf`. Unset, the
+/// test prints a capability report and records a skip.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+fn real_model_replicas_place_their_weights_on_the_gpu_once() {
+    use oxibonsai_kernels::gpu_backend::weight_bytes_uploaded_total;
+    use oxibonsai_kernels::{KernelDispatcher, KernelTier, MetalGraph};
+    use oxibonsai_runtime::engine::Backend;
+    use oxibonsai_testkit::capability::{record_executed, record_skipped, Capability};
+
+    const TEST: &str =
+        "engine_memory_bound::real_model_replicas_place_their_weights_on_the_gpu_once";
+    const REPLICAS: usize = 3;
+    const MAX_SEQ_LEN: usize = 256;
+    const MIB: f64 = 1024.0 * 1024.0;
+
+    let Some(path) = std::env::var_os("OXI_MODEL").filter(|p| !p.is_empty()) else {
+        eprintln!(
+            "capability report: {TEST} SKIPPED -- $OXI_MODEL is not set (point it at \
+             models/Bonsai-8B.gguf or models/Ternary-Bonsai-1.7B.gguf)"
+        );
+        record_skipped(Capability::LegacyModels, TEST);
+        return;
+    };
+    let path = std::path::PathBuf::from(path);
+    assert!(
+        path.is_file(),
+        "$OXI_MODEL={} is not a file",
+        path.display()
+    );
+
+    let params = SamplingParams {
+        temperature: 0.0,
+        top_k: 0,
+        top_p: 1.0,
+        repetition_penalty: 1.0,
+        max_tokens: 4,
+    };
+    // "The capital of Japan is" in the Qwen3 vocabulary.
+    let prompt = [785u32, 6722, 315, 6323, 374];
+
+    let graph = MetalGraph::global().expect("an accelerated Metal device");
+    let probe = KernelDispatcher::auto_detect();
+    let graph_start = graph.bytes_uploaded();
+    let scirs2_start = weight_bytes_uploaded_total(&probe);
+
+    let (mut first, gguf) = InferenceEngine::from_gguf_path_leaked_with_backend(
+        &path,
+        params.clone(),
+        42,
+        MAX_SEQ_LEN,
+        Backend::Auto,
+    )
+    .expect("replica 1 loads");
+    if first.is_hybrid() || first.kernel_tier() != KernelTier::Gpu {
+        eprintln!(
+            "capability report: {TEST} SKIPPED -- {} runs on {} (only a dense model on the GPU \
+             tier uploads weights to share)",
+            first.model_description(),
+            first.kernel_tier()
+        );
+        record_skipped(Capability::LegacyModels, TEST);
+        return;
+    }
+    let reference = first.generate(&prompt, 4).expect("replica 1 decodes");
+    let graph_one = graph.bytes_uploaded().saturating_sub(graph_start);
+    let scirs2_one = weight_bytes_uploaded_total(&probe).saturating_sub(scirs2_start);
+    let first_uploads = first.gpu_upload_stats();
+    assert!(
+        graph_one > 0,
+        "replica 1 must place the model in the Metal weight cache"
+    );
+    eprintln!(
+        "[{}] replica 1: MetalGraph +{:.1} MiB, scirs2 +{:.1} MiB ({} fresh / {} shared \
+         buffers), tokens {reference:?}",
+        first.kernel_label(),
+        graph_one as f64 / MIB,
+        scirs2_one as f64 / MIB,
+        first_uploads.fresh_buffers,
+        first_uploads.shared_buffers
+    );
+
+    let shared_token_embd = first.model_token_embd();
+    let mut replicas = vec![first];
+    for n in 2..=REPLICAS {
+        let mut replica = InferenceEngine::from_gguf_static_with_embd_and_backend(
+            gguf,
+            params.clone(),
+            42,
+            MAX_SEQ_LEN,
+            std::sync::Arc::clone(&shared_token_embd),
+            Backend::Auto,
+        )
+        .expect("replica loads");
+        let tokens = replica.generate(&prompt, 4).expect("replica decodes");
+        let uploads = replica.gpu_upload_stats();
+        let graph_now = graph.bytes_uploaded().saturating_sub(graph_start);
+        let scirs2_now = weight_bytes_uploaded_total(&probe).saturating_sub(scirs2_start);
+        eprintln!(
+            "replica {n}: MetalGraph total +{:.1} MiB, scirs2 total +{:.1} MiB ({} fresh / {} \
+             shared buffers, {:.1} MiB shared), tokens {tokens:?}",
+            graph_now as f64 / MIB,
+            scirs2_now as f64 / MIB,
+            uploads.fresh_buffers,
+            uploads.shared_buffers,
+            uploads.shared_bytes as f64 / MIB
+        );
+        assert_eq!(tokens, reference, "replica {n} decodes like replica 1");
+        assert_eq!(
+            graph_now, graph_one,
+            "replica {n} must not grow MetalGraph::bytes_uploaded"
+        );
+        assert_eq!(
+            scirs2_now, scirs2_one,
+            "replica {n} must not upload a second scirs2 copy"
+        );
+        assert_eq!(uploads.fresh_buffers, 0, "replica {n}: fresh uploads");
+        assert_eq!(
+            uploads.shared_buffers,
+            first_uploads.total_buffers(),
+            "replica {n} registers every buffer replica 1 retained"
+        );
+        replicas.push(replica);
+    }
+    assert_eq!(replicas.len(), REPLICAS);
+    record_executed(Capability::LegacyModels, TEST);
 }

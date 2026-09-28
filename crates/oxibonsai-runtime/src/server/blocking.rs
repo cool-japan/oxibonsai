@@ -77,7 +77,7 @@ mod tests {
     async fn returns_the_closure_value_and_releases_the_lease() {
         let pool = pool();
         let lease = pool.acquire().await.expect("acquire");
-        let value = run_blocking_generation(lease, |lease| lease.model().config().vocab_size)
+        let value = run_blocking_generation(lease, |lease| lease.vocab_size())
             .await
             .expect("blocking task");
         assert_eq!(

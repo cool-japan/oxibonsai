@@ -1,11 +1,16 @@
 //! Tokenizer bridge: Pure-Rust native backend, optional HuggingFace backend.
 //!
-//! [`TokenizerBridge`] is an enum over two interchangeable backends:
+//! [`TokenizerBridge`] is a struct wrapping a private [`TokenizerBackend`]
+//! enum over two interchangeable backends (`B2-13` widened it from a bare
+//! public enum to carry the chat-template/special-id fields below —
+//! [`TokenizerBridge::backend`] is the read-only accessor for which one is
+//! active; there is no longer a public `TokenizerBridge::Native(..)` /
+//! `::Hf(..)` path to match on):
 //!
-//! * [`TokenizerBridge::Native`] — the workspace's own Pure-Rust BPE
+//! * The native backend — the workspace's own Pure-Rust BPE
 //!   ([`oxibonsai_tokenizer::OxiTokenizer`]).  Always compiled in, including
 //!   on `wasm32` targets and in a `--no-default-features` build.
-//! * [`TokenizerBridge::Hf`] — HuggingFace `tokenizers`.  Compiled only when
+//! * The HF backend — HuggingFace `tokenizers`.  Compiled only when
 //!   the crate feature `hf-tokenizer` is enabled **and** the target is not
 //!   `wasm32` (the dependency itself is declared under
 //!   `[target.'cfg(not(target_arch = "wasm32"))'.dependencies]`, so the
@@ -20,10 +25,32 @@
 //! the native backend covers every operation, so `--no-default-features`
 //! compiles and serves real traffic instead of returning "unavailable"
 //! errors (the pre-split `wasm32` stubs did exactly that).
+//!
+//! On top of the backend, this type also carries the model's resolved chat
+//! template and its `<think>`/`</think>`/`<tool_call>`/`</tool_call>`
+//! special ids (`B2-13`): see [`TokenizerBridge::native_from_gguf_metadata`],
+//! [`TokenizerBridge::with_chat_template`] and
+//! [`TokenizerBridge::resolved_chat_template`].
 
 use crate::error::{RuntimeError, RuntimeResult};
+use oxibonsai_tokenizer::chat_templates::ResolvedChatTemplate;
 use oxibonsai_tokenizer::OxiTokenizer;
 use std::collections::HashMap;
+
+/// Shared chat-prompt rendering pipeline (B2-13), built on top of
+/// [`TokenizerBridge`] — see that module's own doc. `pub(crate)` (not
+/// `pub`): an internal seam `server::chat` and `api_extensions` share,
+/// not part of this crate's public API surface.
+///
+/// `#[cfg(feature = "server")]`: unlike the rest of this file,
+/// `chat_render` reaches into `crate::server` (gated the same way,
+/// `lib.rs`) and uses `serde_json`'s `raw_value` feature (pulled in only
+/// through `axum`/the `server` feature's own dependency set) — this module
+/// alone would otherwise break the `--no-default-features` / `wasm32`
+/// build this file's own module doc promises stays available
+/// (`runtime_compiles_for_wasm32_unknown_unknown_no_default_features`).
+#[cfg(feature = "server")]
+pub(crate) mod chat_render;
 
 /// Which backend a [`TokenizerBridge`] is currently using.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -66,8 +93,8 @@ impl TokenizerVocabView<'_> {
     /// it is flagged `special` — the flag is carried in
     /// [`AddedTokenInfo::special`].
     pub fn get_added_tokens_decoder(&self) -> HashMap<u32, AddedTokenInfo> {
-        match self.bridge {
-            TokenizerBridge::Native(tok) => {
+        match &self.bridge.backend {
+            TokenizerBackend::Native(tok) => {
                 let vocab = tok.vocab();
                 vocab
                     .protected_tokens()
@@ -83,7 +110,7 @@ impl TokenizerVocabView<'_> {
                     .collect()
             }
             #[cfg(all(feature = "hf-tokenizer", not(target_arch = "wasm32")))]
-            TokenizerBridge::Hf(tok) => tok
+            TokenizerBackend::Hf(tok) => tok
                 .get_added_tokens_decoder()
                 .into_iter()
                 .map(|(id, added)| {
@@ -106,32 +133,77 @@ impl TokenizerVocabView<'_> {
 
     /// Resolve a token string to its id, if the vocabulary contains it.
     pub fn token_to_id(&self, token: &str) -> Option<u32> {
-        match self.bridge {
-            TokenizerBridge::Native(tok) => tok.vocab().get_id(token),
+        match &self.bridge.backend {
+            TokenizerBackend::Native(tok) => tok.vocab().get_id(token),
             #[cfg(all(feature = "hf-tokenizer", not(target_arch = "wasm32")))]
-            TokenizerBridge::Hf(tok) => tok.token_to_id(token),
+            TokenizerBackend::Hf(tok) => tok.token_to_id(token),
         }
     }
 
     /// Resolve a token id to its literal token string, if it exists.
     pub fn id_to_token(&self, id: u32) -> Option<String> {
-        match self.bridge {
-            TokenizerBridge::Native(tok) => tok.vocab().get_token(id).map(ToOwned::to_owned),
+        match &self.bridge.backend {
+            TokenizerBackend::Native(tok) => tok.vocab().get_token(id).map(ToOwned::to_owned),
             #[cfg(all(feature = "hf-tokenizer", not(target_arch = "wasm32")))]
-            TokenizerBridge::Hf(tok) => tok.id_to_token(id),
+            TokenizerBackend::Hf(tok) => tok.id_to_token(id),
         }
     }
 }
 
-/// Tokenizer used by the inference engine, server and CLI.
+/// The two interchangeable tokenizer backends — see the [module docs](self).
 ///
-/// See the [module docs](self) for the backend split.
-pub enum TokenizerBridge {
+/// Private to this module: [`TokenizerBridge`] (the public type every other
+/// crate/module constructs and calls) wraps this rather than being this
+/// enum directly, so it can carry a resolved chat template and special-token
+/// ids *alongside* whichever backend is loaded (B2-13 / RT-09 / cli-11) —
+/// see [`TokenizerBridge`]'s own doc for why.
+enum TokenizerBackend {
     /// Pure-Rust BPE backend — always available.
     Native(Box<OxiTokenizer>),
     /// HuggingFace `tokenizers` backend (feature `hf-tokenizer`, non-wasm).
     #[cfg(all(feature = "hf-tokenizer", not(target_arch = "wasm32")))]
     Hf(Box<tokenizers::Tokenizer>),
+}
+
+/// Tokenizer used by the inference engine, server and CLI.
+///
+/// See the [module docs](self) for the backend split ([`TokenizerBackend`]).
+///
+/// Beyond the raw encode/decode backend, a bridge optionally carries the
+/// loaded model's own resolved chat template and its `<think>`/`</think>`/
+/// `<tool_call>`/`</tool_call>` special-token ids (B2-13 finding B1(a): "a
+/// model's `ResolvedChatTemplate` resolved once per loaded model and
+/// carried on `TokenizerBridge` or next to it"; cli-11: the single runtime
+/// entry point B2-14's `--think`/`--no-think`/`--reasoning-effort`/`--tools`
+/// flags need). [`Self::with_chat_template`] attaches one explicitly (the
+/// seam a caller with a `MetadataStore` — e.g. GGUF-loading code — plugs
+/// into); [`Self::native_from_gguf_metadata`] resolves both the tokenizer
+/// AND the template from the same GGUF metadata in one call, matching
+/// spec item 1's "named ChatML/Qwen3 fallback for models that ship none"
+/// (via [`Self::resolved_chat_template`], which never returns `None` to a
+/// caller). A bridge built through any of the other constructors — which
+/// have no `MetadataStore` to resolve a template from — still resolves its
+/// think/tool-call ids from whichever vocabulary it loaded (`None` for a
+/// vocabulary that defines no such tokens, e.g. the shipped Qwen3
+/// 1.7B/8B — RT-10's "models without `<think>`" correction) and falls back
+/// to the built-in template on [`Self::resolved_chat_template`].
+pub struct TokenizerBridge {
+    backend: TokenizerBackend,
+    /// The loaded model's own resolved chat template, when one has been
+    /// attached via [`Self::with_chat_template`] /
+    /// [`Self::native_from_gguf_metadata`]. `None` for every other
+    /// constructor (no `MetadataStore` was available to resolve one from);
+    /// [`Self::resolved_chat_template`] is the caller-facing accessor that
+    /// never exposes this `None` state directly.
+    chat_template: Option<ResolvedChatTemplate>,
+    /// This vocabulary's `<think>` token id, if it defines one.
+    think_open_id: Option<u32>,
+    /// This vocabulary's `</think>` token id, if it defines one.
+    think_close_id: Option<u32>,
+    /// This vocabulary's `<tool_call>` token id, if it defines one.
+    tool_call_open_id: Option<u32>,
+    /// This vocabulary's `</tool_call>` token id, if it defines one.
+    tool_call_close_id: Option<u32>,
 }
 
 /// Per-stream UTF-8-safe decode state. Owned by the caller.
@@ -177,6 +249,27 @@ impl DecodeStreamState {
 }
 
 impl TokenizerBridge {
+    /// Finish building a bridge from an already-constructed backend: resolve
+    /// this vocabulary's `<think>`/`</think>`/`<tool_call>`/`</tool_call>`
+    /// ids (`None` for any the vocabulary does not define — RT-10) and
+    /// start with no chat template attached. Every constructor below funnels
+    /// through this one place so the id-resolution logic lives exactly once.
+    fn from_backend(backend: TokenizerBackend) -> Self {
+        let mut bridge = Self {
+            backend,
+            chat_template: None,
+            think_open_id: None,
+            think_close_id: None,
+            tool_call_open_id: None,
+            tool_call_close_id: None,
+        };
+        bridge.think_open_id = bridge.inner().token_to_id("<think>");
+        bridge.think_close_id = bridge.inner().token_to_id("</think>");
+        bridge.tool_call_open_id = bridge.inner().token_to_id("<tool_call>");
+        bridge.tool_call_close_id = bridge.inner().token_to_id("</tool_call>");
+        bridge
+    }
+
     /// Load a tokenizer from a HuggingFace-format `tokenizer.json` file.
     ///
     /// Uses the HuggingFace backend when it is compiled in (the default
@@ -187,7 +280,7 @@ impl TokenizerBridge {
         {
             let inner = tokenizers::Tokenizer::from_file(path)
                 .map_err(|e| RuntimeError::Tokenizer(e.to_string()))?;
-            Ok(Self::Hf(Box::new(inner)))
+            Ok(Self::from_backend(TokenizerBackend::Hf(Box::new(inner))))
         }
         #[cfg(not(all(feature = "hf-tokenizer", not(target_arch = "wasm32"))))]
         {
@@ -200,7 +293,9 @@ impl TokenizerBridge {
     pub fn native_from_file(path: &str) -> RuntimeResult<Self> {
         let inner = OxiTokenizer::from_json_file(path)
             .map_err(|e| RuntimeError::Tokenizer(e.to_string()))?;
-        Ok(Self::Native(Box::new(inner)))
+        Ok(Self::from_backend(TokenizerBackend::Native(Box::new(
+            inner,
+        ))))
     }
 
     /// Load a tokenizer from the *contents* of a HuggingFace-format
@@ -211,37 +306,122 @@ impl TokenizerBridge {
     pub fn native_from_json_str(json: &str) -> RuntimeResult<Self> {
         let inner = OxiTokenizer::from_hf_tokenizer_json(json)
             .map_err(|e| RuntimeError::Tokenizer(e.to_string()))?;
-        Ok(Self::Native(Box::new(inner)))
+        Ok(Self::from_backend(TokenizerBackend::Native(Box::new(
+            inner,
+        ))))
+    }
+
+    /// Build a bridge over the native backend directly from a GGUF's own
+    /// embedded tokenizer metadata (`tokenizer.ggml.*`) — the same source a
+    /// loaded model's weights come from — and additionally resolve its
+    /// `tokenizer.chat_template` (B2-13 spec item 1 / cli-11).
+    ///
+    /// This is the single entry point that closes RT-09/TOK-07/cli-03's "no
+    /// runtime API hands \[the caller\] the loaded model's template" gap:
+    /// [`Self::resolved_chat_template`] on the returned bridge never falls
+    /// through to `None` (a model shipping none still gets the named
+    /// Qwen3/ChatML fallback), and [`Self::think_open_id`] /
+    /// [`Self::think_close_id`] / [`Self::tool_call_open_id`] /
+    /// [`Self::tool_call_close_id`] expose the vocabulary's own special ids
+    /// for `<think>`/`</think>`/`<tool_call>`/`</tool_call>` — everything
+    /// B2-14's `--think`/`--no-think`/`--reasoning-effort`/`--tools` flags
+    /// and this crate's own chat-completion handlers need.
+    ///
+    /// # Errors
+    /// Propagates a tokenizer-construction failure, or — B5 — a shipped
+    /// `tokenizer.chat_template` this engine's Jinja subset cannot compile
+    /// (never silently substitutes the fallback for a template that DID
+    /// ship; see [`ResolvedChatTemplate::from_gguf`]).
+    pub fn native_from_gguf_metadata(md: &oxibonsai_core::MetadataStore) -> RuntimeResult<Self> {
+        let inner = OxiTokenizer::from_gguf_metadata(md)
+            .map_err(|e| RuntimeError::Tokenizer(e.to_string()))?;
+        let template = ResolvedChatTemplate::from_gguf(md)
+            .map_err(|e| RuntimeError::Tokenizer(e.to_string()))?;
+        Ok(
+            Self::from_backend(TokenizerBackend::Native(Box::new(inner)))
+                .with_chat_template(template),
+        )
     }
 
     /// Wrap an already-constructed native tokenizer.
     pub fn from_native_tokenizer(tokenizer: OxiTokenizer) -> Self {
-        Self::Native(Box::new(tokenizer))
+        Self::from_backend(TokenizerBackend::Native(Box::new(tokenizer)))
     }
 
     /// Wrap an already-constructed HuggingFace tokenizer.
     #[cfg(all(feature = "hf-tokenizer", not(target_arch = "wasm32")))]
     pub fn from_hf_tokenizer(tokenizer: tokenizers::Tokenizer) -> Self {
-        Self::Hf(Box::new(tokenizer))
+        Self::from_backend(TokenizerBackend::Hf(Box::new(tokenizer)))
+    }
+
+    /// Attach a resolved chat template (e.g. from
+    /// [`ResolvedChatTemplate::from_gguf`], when the caller has a
+    /// `MetadataStore` this constructor's own [`Self::native_from_gguf_metadata`]
+    /// did not build the bridge from). Builder-style; does not touch the
+    /// already-resolved think/tool-call ids (those come from the
+    /// vocabulary, not the template).
+    #[must_use]
+    pub fn with_chat_template(mut self, template: ResolvedChatTemplate) -> Self {
+        self.chat_template = Some(template);
+        self
+    }
+
+    /// The model's own resolved chat template, or the named Qwen3/ChatML
+    /// fallback when none was ever attached (B2-13 spec item 1: "the
+    /// ChatML/Qwen3 template as a named fallback for models that ship
+    /// none"). Never `None` — this is the accessor every prompt-rendering
+    /// call site should use, rather than matching on [`Self::chat_template`]'s
+    /// private `Option` directly. Cheap to call per request: the returned
+    /// value's expensive part (a compiled [`oxibonsai_tokenizer::jinja::JinjaTemplate`])
+    /// is behind an `Arc` that this only clones.
+    pub fn resolved_chat_template(&self) -> ResolvedChatTemplate {
+        self.chat_template
+            .clone()
+            .unwrap_or_else(ResolvedChatTemplate::default_fallback)
+    }
+
+    /// This vocabulary's `<think>` token id (single-token, design Appendix
+    /// A.1), or `None` when it defines no such token (RT-10's "models
+    /// without `<think>`" — the shipped Qwen3 1.7B/8B).
+    pub fn think_open_id(&self) -> Option<u32> {
+        self.think_open_id
+    }
+
+    /// This vocabulary's `</think>` token id, or `None`. See
+    /// [`Self::think_open_id`].
+    pub fn think_close_id(&self) -> Option<u32> {
+        self.think_close_id
+    }
+
+    /// This vocabulary's `<tool_call>` token id, or `None` when it defines
+    /// no such token.
+    pub fn tool_call_open_id(&self) -> Option<u32> {
+        self.tool_call_open_id
+    }
+
+    /// This vocabulary's `</tool_call>` token id, or `None`. See
+    /// [`Self::tool_call_open_id`].
+    pub fn tool_call_close_id(&self) -> Option<u32> {
+        self.tool_call_close_id
     }
 
     /// Which backend this bridge is using.
     pub fn backend(&self) -> TokenizerBackendKind {
-        match self {
-            Self::Native(_) => TokenizerBackendKind::Native,
+        match &self.backend {
+            TokenizerBackend::Native(_) => TokenizerBackendKind::Native,
             #[cfg(all(feature = "hf-tokenizer", not(target_arch = "wasm32")))]
-            Self::Hf(_) => TokenizerBackendKind::Hf,
+            TokenizerBackend::Hf(_) => TokenizerBackendKind::Hf,
         }
     }
 
     /// Encode text to token IDs (no special tokens added).
     pub fn encode(&self, text: &str) -> RuntimeResult<Vec<u32>> {
-        match self {
-            Self::Native(tok) => tok
+        match &self.backend {
+            TokenizerBackend::Native(tok) => tok
                 .encode(text)
                 .map_err(|e| RuntimeError::Tokenizer(e.to_string())),
             #[cfg(all(feature = "hf-tokenizer", not(target_arch = "wasm32")))]
-            Self::Hf(tok) => {
+            TokenizerBackend::Hf(tok) => {
                 let encoding = tok
                     .encode(text, false)
                     .map_err(|e| RuntimeError::Tokenizer(e.to_string()))?;
@@ -252,10 +432,10 @@ impl TokenizerBridge {
 
     /// Decode token IDs to text, skipping special tokens.
     pub fn decode(&self, ids: &[u32]) -> RuntimeResult<String> {
-        match self {
-            Self::Native(tok) => Ok(native_decode(tok, ids, true)),
+        match &self.backend {
+            TokenizerBackend::Native(tok) => Ok(native_decode(tok, ids, true)),
             #[cfg(all(feature = "hf-tokenizer", not(target_arch = "wasm32")))]
-            Self::Hf(tok) => tok
+            TokenizerBackend::Hf(tok) => tok
                 .decode(ids, true)
                 .map_err(|e| RuntimeError::Tokenizer(e.to_string())),
         }
@@ -263,10 +443,10 @@ impl TokenizerBridge {
 
     /// Get the vocabulary size.
     pub fn vocab_size(&self) -> usize {
-        match self {
-            Self::Native(tok) => tok.vocab_size(),
+        match &self.backend {
+            TokenizerBackend::Native(tok) => tok.vocab_size(),
             #[cfg(all(feature = "hf-tokenizer", not(target_arch = "wasm32")))]
-            Self::Hf(tok) => tok.get_vocab_size(true),
+            TokenizerBackend::Hf(tok) => tok.get_vocab_size(true),
         }
     }
 
@@ -285,18 +465,18 @@ impl TokenizerBridge {
     /// `hf-tokenizer` feature is on and the target can link `tokenizers`.
     #[cfg(all(feature = "hf-tokenizer", not(target_arch = "wasm32")))]
     pub fn hf(&self) -> Option<&tokenizers::Tokenizer> {
-        match self {
-            Self::Hf(tok) => Some(tok),
-            Self::Native(_) => None,
+        match &self.backend {
+            TokenizerBackend::Hf(tok) => Some(tok),
+            TokenizerBackend::Native(_) => None,
         }
     }
 
     /// The underlying native tokenizer, when this bridge is native-backed.
     pub fn native(&self) -> Option<&OxiTokenizer> {
-        match self {
-            Self::Native(tok) => Some(tok),
+        match &self.backend {
+            TokenizerBackend::Native(tok) => Some(tok),
             #[cfg(all(feature = "hf-tokenizer", not(target_arch = "wasm32")))]
-            Self::Hf(_) => None,
+            TokenizerBackend::Hf(_) => None,
         }
     }
 
@@ -307,10 +487,10 @@ impl TokenizerBridge {
     /// (`248044..248076`), and this works for either because it asks the
     /// backend's own added-vocabulary registry rather than assuming a range.
     pub fn is_special(&self, id: u32) -> bool {
-        match self {
-            Self::Native(tok) => tok.vocab().is_special_id(id),
+        match &self.backend {
+            TokenizerBackend::Native(tok) => tok.vocab().is_special_id(id),
             #[cfg(all(feature = "hf-tokenizer", not(target_arch = "wasm32")))]
-            Self::Hf(tok) => match tok.id_to_token(id) {
+            TokenizerBackend::Hf(tok) => match tok.id_to_token(id) {
                 Some(token) => tok.get_added_vocabulary().is_special_token(&token),
                 None => false,
             },
@@ -338,10 +518,10 @@ impl TokenizerBridge {
     /// leading space), a standalone piece has no such context to consult, so
     /// a leading space marker always resolves to a literal space here.
     pub fn piece(&self, id: u32) -> Vec<u8> {
-        match self {
-            Self::Native(tok) => native_token_piece_bytes(tok, id),
+        match &self.backend {
+            TokenizerBackend::Native(tok) => native_token_piece_bytes(tok, id),
             #[cfg(all(feature = "hf-tokenizer", not(target_arch = "wasm32")))]
-            Self::Hf(tok) => match tok.id_to_token(id) {
+            TokenizerBackend::Hf(tok) => match tok.id_to_token(id) {
                 Some(token) => hf_token_piece_bytes(&token, hf_decoder_is_byte_level(tok)),
                 None => "\u{FFFD}".as_bytes().to_vec(),
             },
@@ -392,8 +572,8 @@ impl TokenizerBridge {
         // `match`, not `if let`: with the `hf-tokenizer` feature off,
         // `Native` is this enum's only variant, and an `if let` against it
         // would be flagged `irrefutable_let_patterns` under `-D warnings`.
-        match self {
-            Self::Native(tok) => {
+        match &self.backend {
+            TokenizerBackend::Native(tok) => {
                 let configured = tok.config().eos_token_id;
                 // The native backend's `TokenizerConfig::eos_token_id`
                 // defaults to `2` (see
@@ -413,7 +593,7 @@ impl TokenizerBridge {
                 }
             }
             #[cfg(all(feature = "hf-tokenizer", not(target_arch = "wasm32")))]
-            Self::Hf(_) => {
+            TokenizerBackend::Hf(_) => {
                 // `tokenizers::Tokenizer` carries no `eos_token_id` config of
                 // its own (that lives in a sibling `tokenizer_config.json`
                 // this bridge does not parse) — only the marker-spelling
@@ -452,10 +632,10 @@ impl TokenizerBridge {
         state: &mut DecodeStreamState,
         id: u32,
     ) -> RuntimeResult<Option<String>> {
-        match self {
-            Self::Native(tok) => native_step_decode(tok, state, id),
+        match &self.backend {
+            TokenizerBackend::Native(tok) => native_step_decode(tok, state, id),
             #[cfg(all(feature = "hf-tokenizer", not(target_arch = "wasm32")))]
-            Self::Hf(tok) => tokenizers::step_decode_stream(
+            TokenizerBackend::Hf(tok) => tokenizers::step_decode_stream(
                 tok.as_ref(),
                 vec![id],
                 state.skip_special_tokens,
@@ -473,6 +653,12 @@ impl std::fmt::Debug for TokenizerBridge {
         f.debug_struct("TokenizerBridge")
             .field("backend", &self.backend())
             .field("vocab_size", &self.vocab_size())
+            .field("has_chat_template", &self.chat_template.is_some())
+            .field("think_ids", &(self.think_open_id, self.think_close_id))
+            .field(
+                "tool_call_ids",
+                &(self.tool_call_open_id, self.tool_call_close_id),
+            )
             .finish()
     }
 }
@@ -776,15 +962,29 @@ mod tests {
             .expect("tiny tokenizer fixture should load")
     }
 
+    /// `FIXTURE_TOKENIZER`'s default resolves relative to this crate's own
+    /// directory (`cargo test`'s cwd), which this worktree's `models/` does
+    /// not populate (`.gitkeep` only) — `OXI_TOKENIZER`, when set, overrides
+    /// it with an absolute path instead, the same override
+    /// `server::tests::gpu_argmax_routing` and
+    /// `completions::stream::tests::real_model_router` already establish
+    /// for the real GGUF itself. Additive: every existing call site that
+    /// never sets the variable keeps resolving `FIXTURE_TOKENIZER` exactly
+    /// as before.
+    fn fixture_tokenizer_path() -> String {
+        std::env::var("OXI_TOKENIZER").unwrap_or_else(|_| FIXTURE_TOKENIZER.to_string())
+    }
+
     fn maybe_load_fixture() -> Option<TokenizerBridge> {
-        if !Path::new(FIXTURE_TOKENIZER).exists() {
+        let path = fixture_tokenizer_path();
+        if !Path::new(&path).exists() {
             eprintln!(
-                "skipped: tokenizer fixture not found at {FIXTURE_TOKENIZER} \
-                 (run scripts/download_tokenizer.sh to enable)",
+                "skipped: tokenizer fixture not found at {path} \
+                 (run scripts/download_tokenizer.sh, or set OXI_TOKENIZER, to enable)",
             );
             return None;
         }
-        match TokenizerBridge::from_file(FIXTURE_TOKENIZER) {
+        match TokenizerBridge::from_file(&path) {
             Ok(t) => Some(t),
             Err(e) => {
                 eprintln!("skipped: failed to load tokenizer fixture: {e}");
@@ -794,11 +994,12 @@ mod tests {
     }
 
     fn maybe_load_native_fixture() -> Option<TokenizerBridge> {
-        if !Path::new(FIXTURE_TOKENIZER).exists() {
-            eprintln!("skipped: tokenizer fixture not found at {FIXTURE_TOKENIZER}");
+        let path = fixture_tokenizer_path();
+        if !Path::new(&path).exists() {
+            eprintln!("skipped: tokenizer fixture not found at {path}");
             return None;
         }
-        match TokenizerBridge::native_from_file(FIXTURE_TOKENIZER) {
+        match TokenizerBridge::native_from_file(&path) {
             Ok(t) => Some(t),
             Err(e) => {
                 eprintln!("skipped: failed to load native tokenizer fixture: {e}");
@@ -1324,6 +1525,421 @@ mod tests {
                     "piece must agree on id {id} for {input:?}"
                 );
             }
+        }
+    }
+
+    // ── B2-13: chat template + think/tool-call ids carried on the bridge ──
+
+    /// A GGUF metadata block carrying a full `tokenizer.ggml.*` vocabulary
+    /// (so [`OxiTokenizer::from_gguf_metadata`] succeeds) that ALSO defines
+    /// `<think>`, `</think>`, `<tool_call>` and `</tool_call>` as
+    /// `USER_DEFINED` added tokens, plus `tokenizer.chat_template` — the
+    /// same byte-identical wire-format construction
+    /// `gguf_vocab.rs::tests::make_metadata` uses (that helper is private to
+    /// its own module, so this crate builds its own minimal one).
+    fn gguf_metadata_with_think_and_tools(chat_template: &str) -> oxibonsai_core::MetadataStore {
+        use oxibonsai_core::gguf::types::GgufValueType;
+
+        fn kv_string(key: &str, value: &str) -> Vec<u8> {
+            let mut bytes = str_bytes(key);
+            bytes.extend_from_slice(&(GgufValueType::String as u32).to_le_bytes());
+            bytes.extend_from_slice(&str_bytes(value));
+            bytes
+        }
+        fn kv_u32(key: &str, value: u32) -> Vec<u8> {
+            let mut bytes = str_bytes(key);
+            bytes.extend_from_slice(&(GgufValueType::Uint32 as u32).to_le_bytes());
+            bytes.extend_from_slice(&value.to_le_bytes());
+            bytes
+        }
+        fn kv_string_array(key: &str, values: &[&str]) -> Vec<u8> {
+            let mut bytes = str_bytes(key);
+            bytes.extend_from_slice(&(GgufValueType::Array as u32).to_le_bytes());
+            bytes.extend_from_slice(&(GgufValueType::String as u32).to_le_bytes());
+            bytes.extend_from_slice(&(values.len() as u64).to_le_bytes());
+            for v in values {
+                bytes.extend_from_slice(&str_bytes(v));
+            }
+            bytes
+        }
+        fn kv_i32_array(key: &str, values: &[i32]) -> Vec<u8> {
+            let mut bytes = str_bytes(key);
+            bytes.extend_from_slice(&(GgufValueType::Array as u32).to_le_bytes());
+            bytes.extend_from_slice(&(GgufValueType::Int32 as u32).to_le_bytes());
+            bytes.extend_from_slice(&(values.len() as u64).to_le_bytes());
+            for v in values {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            bytes
+        }
+        fn str_bytes(s: &str) -> Vec<u8> {
+            let mut bytes = (s.len() as u64).to_le_bytes().to_vec();
+            bytes.extend_from_slice(s.as_bytes());
+            bytes
+        }
+
+        let tokens = [
+            "a",
+            "b",
+            "c",
+            "<|endoftext|>",
+            "<think>",
+            "</think>",
+            "<tool_call>",
+            "</tool_call>",
+        ];
+        // NORMAL x3, then <|endoftext|> is CONTROL, the four reasoning/tool
+        // markers are USER_DEFINED (matches the real Bonsai 2 histogram's
+        // token_type split documented in `gguf_vocab.rs`).
+        let token_types = [1i32, 1, 1, 3, 4, 4, 4, 4];
+
+        let mut data = Vec::new();
+        let mut count = 0u64;
+        macro_rules! push {
+            ($bytes:expr) => {{
+                data.extend_from_slice(&$bytes);
+                count += 1;
+            }};
+        }
+        push!(kv_string("tokenizer.ggml.model", "gpt2"));
+        push!(kv_string_array("tokenizer.ggml.tokens", &tokens));
+        push!(kv_i32_array("tokenizer.ggml.token_type", &token_types));
+        push!(kv_u32("tokenizer.ggml.eos_token_id", 3)); // <|endoftext|>
+        push!(kv_string("tokenizer.chat_template", chat_template));
+
+        let (store, _) =
+            oxibonsai_core::MetadataStore::parse(&data, 0, count).expect("well-formed metadata");
+        store
+    }
+
+    /// A minimal, definitely-compiling real-Jinja template (the subset
+    /// `chat_templates.rs`'s own fallback templates already demonstrate:
+    /// `{% for %}`, `{{ dotted.field }}`).
+    const TINY_VALID_JINJA_TEMPLATE: &str =
+        "{% for m in messages %}{{ m.role }}:{{ m.content }};{% endfor %}";
+
+    #[test]
+    fn native_from_gguf_metadata_builds_a_working_tokenizer_and_attaches_the_template() {
+        let md = gguf_metadata_with_think_and_tools(TINY_VALID_JINJA_TEMPLATE);
+        let bridge =
+            TokenizerBridge::native_from_gguf_metadata(&md).expect("well-formed GGUF metadata");
+        assert_eq!(bridge.backend(), TokenizerBackendKind::Native);
+        // The tokenizer itself works (round-trips ordinary vocabulary).
+        let ids = bridge.encode("ab").expect("encode");
+        assert!(!ids.is_empty());
+
+        // The GGUF's own template is attached and actually rendered
+        // through, not the built-in fallback.
+        let rendered = bridge
+            .resolved_chat_template()
+            .render_with(
+                &[oxibonsai_tokenizer::chat_templates::RenderMessage::new(
+                    "user", "hi",
+                )],
+                &oxibonsai_tokenizer::chat_templates::RenderOptions::default(),
+            )
+            .expect("render");
+        assert_eq!(rendered, "user:hi;");
+    }
+
+    #[test]
+    fn native_from_gguf_metadata_resolves_think_and_tool_call_ids() {
+        let md = gguf_metadata_with_think_and_tools(TINY_VALID_JINJA_TEMPLATE);
+        let bridge = TokenizerBridge::native_from_gguf_metadata(&md).expect("well-formed metadata");
+        assert_eq!(bridge.think_open_id(), Some(4));
+        assert_eq!(bridge.think_close_id(), Some(5));
+        assert_eq!(bridge.tool_call_open_id(), Some(6));
+        assert_eq!(bridge.tool_call_close_id(), Some(7));
+    }
+
+    #[test]
+    fn native_from_gguf_metadata_errors_on_an_uncompilable_shipped_template() {
+        // B5: a shipped-but-uncompilable template must error, not silently
+        // substitute the fallback.
+        let md = gguf_metadata_with_think_and_tools("{% this is not valid jinja %}");
+        assert!(TokenizerBridge::native_from_gguf_metadata(&md).is_err());
+    }
+
+    #[test]
+    fn resolved_chat_template_falls_back_when_none_was_ever_attached() {
+        // A bridge built through any constructor OTHER than
+        // `native_from_gguf_metadata` / `with_chat_template` has no
+        // GgufMetadata-derived template -- `resolved_chat_template` must
+        // still return something usable (spec item 1's named fallback),
+        // never a `None` the caller has to special-case.
+        let bridge = tiny_native_bridge();
+        let out = bridge
+            .resolved_chat_template()
+            .render_with(
+                &[oxibonsai_tokenizer::chat_templates::RenderMessage::new(
+                    "user", "hi",
+                )],
+                &oxibonsai_tokenizer::chat_templates::RenderOptions {
+                    add_generation_prompt: true,
+                    ..Default::default()
+                },
+            )
+            .expect("fallback must render");
+        assert_eq!(
+            out, "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n",
+            "must be the named Qwen3/ChatML fallback"
+        );
+    }
+
+    #[test]
+    fn a_vocabulary_with_no_think_tokens_resolves_no_think_ids() {
+        // RT-10 correction: the shipped Qwen3 1.7B/8B vocabularies define no
+        // `<think>`/`</think>` at all -- `tiny_native_bridge`'s fixture is
+        // the same shape (no reasoning markers in its vocab).
+        let bridge = tiny_native_bridge();
+        assert_eq!(bridge.think_open_id(), None);
+        assert_eq!(bridge.think_close_id(), None);
+    }
+
+    #[test]
+    fn with_chat_template_attaches_without_disturbing_already_resolved_ids() {
+        let md = gguf_metadata_with_think_and_tools(TINY_VALID_JINJA_TEMPLATE);
+        // Build the tokenizer half without the metadata-driven template...
+        let tok =
+            oxibonsai_tokenizer::OxiTokenizer::from_gguf_metadata(&md).expect("tokenizer build");
+        let bridge = TokenizerBridge::from_native_tokenizer(tok);
+        assert_eq!(
+            bridge.think_open_id(),
+            Some(4),
+            "ids resolve from the vocabulary regardless of how the template was attached"
+        );
+        // ...then attach a template explicitly, mirroring a caller that
+        // resolves `ResolvedChatTemplate::from_gguf` itself.
+        let template = oxibonsai_tokenizer::chat_templates::ResolvedChatTemplate::from_gguf(&md)
+            .expect("compiles");
+        let bridge = bridge.with_chat_template(template);
+        assert_eq!(
+            bridge.think_open_id(),
+            Some(4),
+            "unchanged by with_chat_template"
+        );
+        let rendered = bridge
+            .resolved_chat_template()
+            .render_with(
+                &[oxibonsai_tokenizer::chat_templates::RenderMessage::new(
+                    "user", "hi",
+                )],
+                &oxibonsai_tokenizer::chat_templates::RenderOptions::default(),
+            )
+            .expect("render");
+        assert_eq!(rendered, "user:hi;");
+    }
+
+    #[test]
+    fn debug_impl_reports_the_new_chat_fields() {
+        let bridge = tiny_native_bridge();
+        let dbg = format!("{bridge:?}");
+        assert!(dbg.contains("has_chat_template"));
+        assert!(dbg.contains("think_ids"));
+        assert!(dbg.contains("tool_call_ids"));
+    }
+
+    // ── post-verifier-review fix: a special-flagged close marker must
+    //    still reach the reasoning splitter ──────────────────────────────
+    //
+    // `server/chat.rs` and `api_extensions.rs` each run a per-token loop of
+    // `step_decode` feeding `reasoning::ReasoningSplitter::push`. A token
+    // flagged `special` in the vocabulary — real chat-model `<|...|>`
+    // markers commonly are, and `<think>`/`</think>` themselves could be
+    // for a given model — decodes to `Ok(None)` (no bytes of its own).
+    // Before the fix, all four call sites treated `Ok(None)` as a reason to
+    // skip the token entirely (`continue` / early `return None` / no
+    // `pieces.push`), so the splitter never learned that id occurred at
+    // all: a special-flagged `</think>` would never be seen, and every
+    // token after it would stay misclassified as reasoning for the rest of
+    // the response. The fix flows an empty piece through instead
+    // (`piece.unwrap_or_default()` / `Ok(None) => String::new()`) so the
+    // splitter still sees every id. This test pins the two building blocks
+    // that fix connects: `step_decode` really does return `Ok(None)` for a
+    // special-flagged id, and feeding that id (with empty text) to the
+    // splitter still correctly detects the boundary — the same pattern all
+    // four call sites now use.
+    #[test]
+    fn step_decode_returns_none_for_a_special_flagged_id_yet_the_splitter_still_sees_it() {
+        let tok = tiny_native_bridge();
+        // `<|im_start|>` (id 12) is flagged `"special": true` in
+        // `TINY_TOKENIZER_JSON` — stands in for a model whose `</think>` is
+        // also special; only the flag matters here, not the token's own
+        // text.
+        let close_id = 12u32;
+        let mut decode_state = tok.new_decode_stream(true);
+
+        // Sanity: confirm the precondition this whole fix exists for.
+        let close_piece = tok
+            .step_decode(&mut decode_state, close_id)
+            .expect("decode must not error");
+        assert_eq!(
+            close_piece, None,
+            "a special-flagged id must decode to no visible text"
+        );
+
+        // Mirrors the fixed handler pattern exactly: every id is pushed to
+        // the splitter, using an empty string when `step_decode` returned
+        // `None`, regardless of whether that id is the close marker.
+        let mut splitter = crate::reasoning::ReasoningSplitter::new(true, Some(close_id));
+        assert!(splitter.in_reasoning());
+
+        match splitter.push(close_id, close_piece.as_deref().unwrap_or("")) {
+            crate::reasoning::ReasoningChunk::Boundary => {}
+            other => panic!(
+                "a special-flagged close id must still be seen as the boundary, got {other:?}"
+            ),
+        }
+        assert!(
+            !splitter.in_reasoning(),
+            "the splitter must have left the reasoning phase"
+        );
+
+        // And a real, decodable token right after it is ordinary content —
+        // proving the splitter did not just get stuck, but genuinely
+        // resumed normal classification.
+        let mut decode_state = tok.new_decode_stream(true);
+        let piece = tok
+            .step_decode(&mut decode_state, 7) // "a"
+            .expect("decode must not error")
+            .unwrap_or_default();
+        match splitter.push(7, &piece) {
+            crate::reasoning::ReasoningChunk::Content(s) => assert_eq!(s, "a"),
+            other => panic!("expected Content(\"a\") after the boundary, got {other:?}"),
+        }
+    }
+
+    /// Post-verifier-review: `render_chat_prompt` (whole-prompt Jinja
+    /// rendering, B1) replaced `server::sanitize::encode_chat_prompt` (the
+    /// old hardcoded ChatML-segment builder) everywhere — that function now
+    /// has no callers left in the crate at all. `cmd_serve.rs` does not yet
+    /// attach a real model's own `tokenizer.chat_template` (see this
+    /// package's `deviations`), so in production TODAY every deployment
+    /// still renders through `ResolvedChatTemplate::default_fallback` — the
+    /// exact template `render_chat_prompt` uses here with no
+    /// `.with_chat_template` call. For a plain system/user/assistant
+    /// conversation (no tools, no reasoning — the overwhelmingly common
+    /// case, and the only shape the old builder ever handled), the two
+    /// paths must therefore produce byte-identical prompt token ids on the
+    /// REAL shipped 1.7B/8B tokenizer, or this rewrite silently changed
+    /// live chat output for every existing deployment.
+    #[cfg(feature = "server")]
+    #[test]
+    fn fallback_render_chat_prompt_matches_the_old_chatml_builder_on_the_real_tokenizer() {
+        let Some(tok) = maybe_load_fixture() else {
+            return;
+        };
+        let guard = crate::server::sanitize::SpecialTokenGuard::from_tokenizer(&tok);
+        let messages = vec![
+            crate::server::ChatMessage::text("system", "You are a helpful assistant."),
+            crate::server::ChatMessage::text("user", "Hello, who are you?"),
+            crate::server::ChatMessage::text("assistant", "I am OxiBonsai."),
+            crate::server::ChatMessage::text("user", "Nice to meet you."),
+        ];
+
+        let old_ids = crate::server::sanitize::encode_chat_prompt(&tok, &messages, &guard, true)
+            .expect("old builder must encode");
+
+        let render_messages =
+            crate::tokenizer_bridge::chat_render::to_render_messages(&messages, &[]);
+        let opts = oxibonsai_tokenizer::chat_templates::RenderOptions {
+            add_generation_prompt: true,
+            ..Default::default()
+        };
+        let (_rendered, new_ids) = crate::tokenizer_bridge::chat_render::render_chat_prompt(
+            &tok,
+            &guard,
+            &render_messages,
+            &opts,
+            true,
+        )
+        .expect("new pipeline must render");
+
+        assert_eq!(
+            old_ids, new_ids,
+            "the new whole-prompt Jinja rendering must reproduce the old ChatML-segment \
+             builder's exact token ids for a plain conversation on the real tokenizer"
+        );
+    }
+
+    /// Post-verifier-review, cheapest real-data proof available now that
+    /// `models/Ternary-Bonsai-2-27B-*.gguf` is on disk: reads ONLY the
+    /// header + metadata KV table + tensor descriptors (`GgufFile::parse`
+    /// over an `mmap`, never the multi-GB tensor bytes themselves — this is
+    /// the same reader every real load goes through, just without a
+    /// `from_gguf_path` weight load), builds a `TokenizerBridge` from that
+    /// metadata alone, and checks the three things B5/B3/finding-#3 depend
+    /// on for THIS specific model: the shipped template actually resolves
+    /// (B5 now errors loudly on an uncompilable one — this is the only
+    /// check in the suite that proves B5 does not break loading the real
+    /// 27B model), the think ids are the design's own 248068/248069, and
+    /// whether `</think>`/`<|im_end|>` are vocabulary-flagged `special` —
+    /// which is exactly the precondition the post-verifier-review
+    /// `step_decode` returning `Ok(None)` fix (this file's
+    /// `step_decode_returns_none_for_a_special_flagged_id_yet_the_splitter_still_sees_it`)
+    /// is *for*, so this settles whether that fix is live in production for
+    /// this model, not just reachable in principle.
+    #[test]
+    #[ignore = "requires the real Ternary-Bonsai-2-27B GGUF on disk; run with --ignored --nocapture"]
+    fn real_27b_gguf_metadata_resolves_a_real_template_and_the_design_think_ids() {
+        let gguf_path = std::env::var("OXI_MODEL_27B")
+            .unwrap_or_else(|_| "models/Ternary-Bonsai-2-27B-PQ2_0.gguf".to_string());
+        if !Path::new(&gguf_path).exists() {
+            eprintln!("skipped: real 27B GGUF not found at {gguf_path} (set OXI_MODEL_27B)");
+            return;
+        }
+        let mmap = match oxibonsai_core::gguf::reader::mmap_gguf_file(Path::new(&gguf_path)) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("skipped: failed to mmap {gguf_path}: {e}");
+                return;
+            }
+        };
+        let file = oxibonsai_core::gguf::reader::GgufFile::parse(&mmap)
+            .expect("header + metadata + tensor descriptors must parse");
+        eprintln!(
+            "27B GGUF: {} metadata entries, {} tensors",
+            file.metadata.len(),
+            file.tensors.len()
+        );
+
+        let bridge = TokenizerBridge::native_from_gguf_metadata(&file.metadata)
+            .expect("vocab + chat template must both load from the real 27B metadata");
+
+        let template = bridge.resolved_chat_template();
+        assert!(
+            matches!(
+                template,
+                oxibonsai_tokenizer::chat_templates::ResolvedChatTemplate::Jinja(_)
+            ),
+            "the shipped model's own tokenizer.chat_template must resolve (B5), not silently \
+             fall back, for a real model that does ship one"
+        );
+
+        assert_eq!(
+            bridge.think_open_id(),
+            Some(248068),
+            "the design's own <think> id (Appendix A.1) must resolve against the real vocabulary"
+        );
+        assert_eq!(
+            bridge.think_close_id(),
+            Some(248069),
+            "the design's own </think> id (Appendix A.1) must resolve against the real vocabulary"
+        );
+
+        eprintln!(
+            "</think> (248069) flagged special: {}",
+            bridge.is_special(248069)
+        );
+        if let Some(im_end_id) = bridge
+            .encode("<|im_end|>")
+            .ok()
+            .and_then(|ids| (ids.len() == 1).then_some(ids[0]))
+        {
+            eprintln!(
+                "<|im_end|> ({im_end_id}) flagged special: {}",
+                bridge.is_special(im_end_id)
+            );
         }
     }
 }

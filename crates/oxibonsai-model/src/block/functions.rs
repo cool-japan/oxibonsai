@@ -2,13 +2,10 @@
 //!
 //! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
 
-use std::borrow::Cow;
-
 #[cfg(test)]
 use crate::block::types::{LayerStats, TransformerBlock};
 use crate::error::{ModelError, ModelResult};
 use crate::kv_cache::KvCache;
-use crate::layers::attention_fused::fused_attention_head_contiguous;
 #[cfg(test)]
 use crate::layers::linear::Linear1Bit;
 #[cfg(test)]
@@ -64,51 +61,12 @@ pub(crate) fn blocks_as_bytes_ternary(blocks: &[oxibonsai_core::BlockTQ2_0_g128]
 /// small to amortise Rayon's thread-pool overhead, so we fall back to the
 /// sequential loop.
 pub(super) const PAR_HEAD_MIN_HEADS: usize = 8;
-/// Borrow (dense) or copy (sparse) one head's key history.
-///
-/// `KvCache::keys_for`/`values_for` return an **empty** `&[f32]` for the
-/// `f16`-backed sparse storage a hybrid model allocates, because a
-/// zero-copy `&[f32]` view of `f16` bytes does not exist. The round-2
-/// mitigation for that was a `#[cfg(not(test))] debug_assert!`, which
-/// compiles out in release: an attention pass over an empty history
-/// returns zeros and every downstream logit is wrong with no signal.
-///
-/// This helper closes that hole without paying for it on the dense path
-/// every shipping Qwen3 model uses: `Cow::Borrowed` there (unchanged,
-/// zero-copy), `Cow::Owned` only when the cache really is sparse.
-#[inline]
-pub(crate) fn keys_for_cow(
-    cache: &KvCache,
-    layer: usize,
-    head: usize,
-    seq_len: usize,
-) -> Cow<'_, [f32]> {
-    if cache.is_sparse() {
-        Cow::Owned(cache.keys_for_owned(layer, head, seq_len))
-    } else {
-        Cow::Borrowed(cache.keys_for(layer, head, seq_len))
-    }
-}
-
-/// [`keys_for_cow`]'s value counterpart.
-#[inline]
-pub(crate) fn values_for_cow(
-    cache: &KvCache,
-    layer: usize,
-    head: usize,
-    seq_len: usize,
-) -> Cow<'_, [f32]> {
-    if cache.is_sparse() {
-        Cow::Owned(cache.values_for_owned(layer, head, seq_len))
-    } else {
-        Cow::Borrowed(cache.values_for(layer, head, seq_len))
-    }
-}
 
 /// Run GQA attention for all Q heads, writing results into `attn_out`.
 ///
 /// Dispatches to a parallel Rayon loop when `num_q_heads >= PAR_HEAD_MIN_HEADS`,
 /// otherwise runs sequentially to avoid thread-pool overhead on small models.
+/// See [`gqa_attention`] for how the cache is read.
 ///
 /// # Arguments
 /// - `q_rope`: All Q-head vectors concatenated `[num_q_heads * head_dim]`.
@@ -130,38 +88,80 @@ pub(super) fn compute_gqa_attention(
     head_dim: usize,
     seq_len: usize,
 ) -> ModelResult<()> {
-    if num_q_heads >= PAR_HEAD_MIN_HEADS {
-        attn_out.par_chunks_mut(head_dim).enumerate().try_for_each(
-            |(q_head, out_slice)| -> ModelResult<()> {
-                let kv_head = q_head / heads_per_group;
-                let q_start = q_head * head_dim;
-                let keys = keys_for_cow(kv_cache, layer_idx, kv_head, seq_len);
-                let values = values_for_cow(kv_cache, layer_idx, kv_head, seq_len);
-                fused_attention_head_contiguous(
-                    &q_rope[q_start..q_start + head_dim],
-                    &keys,
-                    &values,
-                    out_slice,
-                    seq_len,
-                    head_dim,
-                )
-                .map_err(|e| ModelError::Internal(format!("parallel head {q_head} attention: {e}")))
-            },
-        )
+    gqa_attention(
+        q_rope,
+        attn_out,
+        kv_cache,
+        layer_idx,
+        num_q_heads,
+        heads_per_group,
+        head_dim,
+        seq_len,
+        num_q_heads >= PAR_HEAD_MIN_HEADS,
+    )
+}
+
+/// GQA attention of every query head of one position against `layer_idx`'s
+/// cached history `0..seq_len`, one [`KvCache::attend_group`] call per KV
+/// head (optionally in parallel across KV heads).
+///
+/// The cache is read in place whatever its element type (B2-11-FIX): an
+/// `f32` cache runs each query head through `fused_attention_head_contiguous`
+/// over zero-copy slices — the exact bits this function has always
+/// produced — and an `f16` cache (the host default) widens each history row
+/// once per KV head on the stack. There is no history copy on either path;
+/// the `Cow`/`keys_for_owned` detour the sparse cache used to take (one
+/// `seq_len × head_dim` allocation per head per token) is gone.
+///
+/// Shared by the per-block decode path and the batched CPU prefill
+/// (`model/types/prefill_cpu.rs`), so the two cannot drift.
+///
+/// # Errors
+///
+/// [`ModelError::ShapeInvariant`] for a zero GQA group or head width, or a
+/// `q_rope`/`attn_out` shorter than `num_q_heads * head_dim`; anything
+/// [`KvCache::attend_group`] returns.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gqa_attention(
+    q_rope: &[f32],
+    attn_out: &mut [f32],
+    kv_cache: &KvCache,
+    layer_idx: usize,
+    num_q_heads: usize,
+    heads_per_group: usize,
+    head_dim: usize,
+    seq_len: usize,
+    parallel: bool,
+) -> ModelResult<()> {
+    let group_width = heads_per_group * head_dim;
+    let width = num_q_heads * head_dim;
+    if group_width == 0 || q_rope.len() < width || attn_out.len() < width {
+        return Err(ModelError::ShapeInvariant {
+            tensor: format!("layer {layer_idx}: attention buffers"),
+            expected: format!("a nonzero GQA group and >= {width} floats of queries and output"),
+            actual: format!(
+                "group {heads_per_group} x head_dim {head_dim}, q {} / out {}",
+                q_rope.len(),
+                attn_out.len()
+            ),
+        });
+    }
+    let (queries, outputs) = (&q_rope[..width], &mut attn_out[..width]);
+    if parallel {
+        outputs
+            .par_chunks_mut(group_width)
+            .zip(queries.par_chunks(group_width))
+            .enumerate()
+            .try_for_each(|(kv_head, (out_group, q_group))| {
+                kv_cache.attend_group(layer_idx, kv_head, seq_len, q_group, out_group)
+            })
     } else {
-        for q_head in 0..num_q_heads {
-            let kv_head = q_head / heads_per_group;
-            let q_start = q_head * head_dim;
-            let keys = keys_for_cow(kv_cache, layer_idx, kv_head, seq_len);
-            let values = values_for_cow(kv_cache, layer_idx, kv_head, seq_len);
-            fused_attention_head_contiguous(
-                &q_rope[q_start..q_start + head_dim],
-                &keys,
-                &values,
-                &mut attn_out[q_start..q_start + head_dim],
-                seq_len,
-                head_dim,
-            )?;
+        for (kv_head, (out_group, q_group)) in outputs
+            .chunks_mut(group_width)
+            .zip(queries.chunks(group_width))
+            .enumerate()
+        {
+            kv_cache.attend_group(layer_idx, kv_head, seq_len, q_group, out_group)?;
         }
         Ok(())
     }

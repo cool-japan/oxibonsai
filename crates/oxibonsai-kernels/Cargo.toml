@@ -21,18 +21,17 @@ simd-neon = []
 wasm = []
 cuda = ["gpu", "scirs2-core/gpu"]  # scirs2-core retired its "cuda" Cargo feature in 0.6.x (CUDA now lives in oxicuda-*); GpuBackend::Cuda stays available unconditionally
 native-cuda = ["gpu", "dep:cudarc"]
-# deps-17 (objc -> objc2): DEFERRED, and this is the FOURTH pass it has been deferred in.
-# Three raw-objc sites: src/lib.rs:83 `extern crate objc;`; metal_graph/buffers.rs:255-263
-# (error / localizedDescription / UTF8String); metal_full_layer/functions.rs:50-51
-# (GPUStartTime / GPUEndTime). metal 0.33.0 has NO safe accessor for any of them:
-# `grep -rn 'gpu_start_time|gpu_end_time|GPUStartTime' ~/.cargo/registry/src/*/metal-0.33.0/src/`
-# is empty, and `localizedDescription` appears only in metal's own device.rs/lib.rs/library.rs.
-# NOT a Pure-Rust-policy item: metal 0.33 itself declares `[dependencies.objc] 0.2.4`, so
-# `cargo tree -i objc` terminates at metal either way — the port is HYGIENE ONLY (one fewer
-# direct dep), and nothing in this repo may claim it is compliance work. Resolving it is a
-# one-step orchestrator choice: grant the root Cargo.toml (an `objc2` [workspace.dependencies]
-# entry is required and no wave-3.5 package has it) to a wave>=4 package, or waive the item.
-metal = ["gpu", "scirs2-core/gpu", "scirs2-core/metal", "dep:metal", "dep:objc"]
+# deps-17: the library has no direct `objc` dependency. The three raw
+# Objective-C sites (the command-buffer `error` / `localizedDescription` /
+# `UTF8String` reads in metal_graph/buffers.rs and `GPUStartTime` /
+# `GPUEndTime` in metal_full_layer/functions.rs) use the `objc` crate that
+# `metal` 0.33 re-exports (`metal::objc::{msg_send, sel, sel_impl}`), so no
+# objc2 port is needed. This is manifest hygiene, not a Pure-Rust item: metal
+# 0.33 still pulls objc 0.2.7 transitively. Every normal/build edge of
+# `cargo tree -p oxibonsai-kernels --features metal -e normal,build -i objc`
+# ends at `metal`; the plain `cargo tree -i objc` additionally lists the one
+# test-only `[dev-dependencies]` edge declared at the bottom of this file.
+metal = ["gpu", "scirs2-core/gpu", "scirs2-core/metal", "dep:metal"]
 gpu = ["scirs2-core/gpu"]
 avx2 = []
 neon = []
@@ -70,12 +69,20 @@ rayon.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = { workspace = true, optional = true }
-objc = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion.workspace = true
 proptest.workspace = true
 oxibonsai-testkit.workspace = true
+
+# deps-17 residue, TEST-ONLY: `tests/gpu_argmax_tiebreak.rs` calls
+# `objc::rc::autoreleasepool` by the bare crate name, so its test binary needs
+# `objc` in its extern prelude. This table is the `[dev-dependencies]` edge
+# `cargo tree -i objc` still prints; the library itself no longer depends on
+# `objc` (see the `metal` feature above). Once that test says
+# `metal::objc::rc::autoreleasepool` instead, delete this table.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc.workspace = true
 
 [[bench]]
 name = "kernel_benchmarks"

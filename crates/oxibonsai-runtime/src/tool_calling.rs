@@ -557,7 +557,14 @@ pub enum ToolCallParseOutcome {
     /// A `<tool_call>` was opened but never closed. The caller must not
     /// treat this as "no tool call" (which would leak the partial XML as
     /// visible assistant content) — see [`ToolParseError::Truncated`].
-    Truncated,
+    Truncated {
+        /// Text before the truncated `<tool_call>` block — the model's
+        /// natural-language preamble, if any. The partial `<tool_call>...`
+        /// markup itself is never included here: a caller that reports
+        /// this text as `message.content` must never surface a half-formed
+        /// tool-call tag as if it were prose.
+        leading_text: String,
+    },
 }
 
 /// Parse tool calls out of a finished assistant message: tries the Bonsai 2
@@ -571,12 +578,26 @@ pub fn parse_tool_calls(text: &str) -> ToolCallParseOutcome {
             leading_text: leading,
             calls: xml_tool_calls_to_openai(calls),
         },
-        Err(ToolParseError::Truncated) => ToolCallParseOutcome::Truncated,
+        Err(ToolParseError::Truncated) => ToolCallParseOutcome::Truncated {
+            leading_text: leading_text_before_tool_call(text).to_string(),
+        },
         // No `<tool_call>` tag at all, or one that closed but whose
         // interior isn't the XML shape: try the legacy JSON payload before
         // concluding there is no tool call.
         Ok(_) | Err(ToolParseError::Malformed(_)) => legacy_json_tool_call(text),
     }
+}
+
+/// Text before the first `<tool_call>` marker, or the whole string when
+/// there is none. Used to recover [`ToolCallParseOutcome::Truncated`]'s
+/// `leading_text` — [`ToolParseError::Truncated`] itself stays a plain unit
+/// variant (its own extensive `assert_eq!` coverage below pins that shape),
+/// so the higher-level [`parse_tool_calls`] re-derives the preamble here
+/// rather than threading it through the lower-level error type.
+fn leading_text_before_tool_call(text: &str) -> &str {
+    text.find(TOOL_CALL_OPEN)
+        .map(|i| &text[..i])
+        .unwrap_or(text)
 }
 
 /// The legacy `<tool_call>{"name": ..., "arguments": {...}}</tool_call>`
@@ -847,7 +868,23 @@ mod xml_tool_call_tests {
     fn parse_tool_calls_truncated_propagates() {
         assert_eq!(
             parse_tool_calls("<tool_call>\n<function=foo"),
-            ToolCallParseOutcome::Truncated
+            ToolCallParseOutcome::Truncated {
+                leading_text: String::new()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_truncated_preserves_the_leading_preamble() {
+        // A truncated call must still report whatever natural-language text
+        // came before it, not just an empty string -- the caller uses this
+        // as `message.content` instead of the half-formed XML itself.
+        let outcome = parse_tool_calls("Let me check.\n<tool_call>\n<function=foo");
+        assert_eq!(
+            outcome,
+            ToolCallParseOutcome::Truncated {
+                leading_text: "Let me check.\n".to_string()
+            }
         );
     }
 

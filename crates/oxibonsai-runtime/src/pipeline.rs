@@ -499,7 +499,7 @@ impl InferencePipeline {
         };
 
         let healer = TokenHealer::new(healing_cfg);
-        let vocab_size = engine.model().config().vocab_size;
+        let vocab_size = engine.vocab_size();
 
         // The healer calls back once with the prefix; feed it real model
         // logits. A forward-pass error is captured and surfaced after the
@@ -541,7 +541,7 @@ impl InferencePipeline {
         context_tokens: &[u32],
         engine: &mut InferenceEngine,
     ) -> RuntimeResult<(Vec<u32>, StopReason)> {
-        let vocab_size = engine.model().config().vocab_size;
+        let vocab_size = engine.vocab_size();
         let max = self.config.max_tokens;
         let context_len = context_tokens.len();
 
@@ -774,7 +774,7 @@ impl InferencePipeline {
         beam_cfg: BeamSearchConfig,
         engine: &mut InferenceEngine,
     ) -> RuntimeResult<(Vec<u32>, StopReason)> {
-        let vocab_size = engine.model().config().vocab_size;
+        let vocab_size = engine.vocab_size();
 
         // Inherit the engine's real (GGUF-resolved) EOS id when the caller
         // left `eos_token_id` at its default sentinel; an explicit override
@@ -820,9 +820,21 @@ impl InferencePipeline {
                     // least one token pending so a beam identical to the
                     // previous one still gets freshly computed logits
                     // instead of a stale/absent forward pass.
-                    let common =
+                    let mut common =
                         common_prefix_len(&cached_tokens, beam_tokens).min(beam_tokens.len() - 1);
-                    engine.rewind_cache(common);
+                    if engine.recurrent_rollback_supported() {
+                        engine.rewind_cache(common);
+                    } else if common != cached_tokens.len() {
+                        // ENGINE-SEAM: a hybrid (recurrent) engine cannot move
+                        // a cursor back -- its Gated-DeltaNet state after the
+                        // cached tokens does not determine the state after the
+                        // shorter common prefix. Unless the beam purely
+                        // extends what is cached, replay it from scratch:
+                        // exact (the "reset and replay" rollback), just not
+                        // KV-reusing.
+                        engine.reset();
+                        common = 0;
+                    }
                     match engine.prefill_from_pos(&beam_tokens[common..], common) {
                         Ok(logits) => {
                             cached_tokens = beam_tokens.to_vec();

@@ -23,19 +23,19 @@
 //!
 //! The hybrid KV cache has one slot per *full* layer (16 for the 27B), not
 //! one per stack layer (64). Storing at `layer_idx` would be rejected by
-//! `validate_store` and — through the legacy `store_key`/`store_value`
-//! forwarders — silently dropped; reading at `layer_idx` would return
+//! the cache's store validation and — through the legacy
+//! `store_key`/`store_value` forwarders — silently dropped; reading at `layer_idx` would return
 //! another layer's history. Every cache access below goes through
 //! `block.kv_slot()`.
 //!
-//! # Reading a sparse cache
+//! # Reading the `f16` cache
 //!
-//! `KvCache::keys_for`/`values_for` return an **empty** slice for the
-//! `f16`-backed sparse storage a hybrid model allocates, so this body uses
-//! `keys_for_owned`/`values_for_owned`, which work for either storage mode.
-//! The copy is taken **once per (token, kv-head)** and shared by the
-//! `heads_per_group` query heads that read it, so the 27B copies 4 (not 24)
-//! histories per token.
+//! Attention reads the slot through `KvCache::attend_group`, once per
+//! (token, kv-head): the `heads_per_group` query heads sharing a KV head walk
+//! its history together, each `f16` row widened once on the stack. Nothing
+//! is copied out of the cache, and the result is bit-identical to widening
+//! the history first and running `fused_attention_head_contiguous` per head
+//! (which is what this body used to do, through `keys_for_owned`).
 
 use oxibonsai_kernels::norms::sigmoid_mul_simd;
 use oxibonsai_kernels::rope_mrope::rope_partial_splithalf_simd;
@@ -45,7 +45,6 @@ use crate::hybrid::block::{FullAttnBlock, HybridBlock};
 use crate::hybrid::forward::{
     folded_input, forward_ffn_chunk, norm_and_rotate, residual_add, scratch_short, ForwardCtx,
 };
-use crate::layers::attention_fused::fused_attention_head_contiguous;
 
 /// Run one full-attention layer over a chunk of `t_len` tokens whose first
 /// token sits at absolute position `start_pos`.
@@ -218,33 +217,37 @@ pub(crate) fn forward_full_chunk(
     }
 
     // ── GQA attention over this layer's slot ────────────────────────────
+    //
+    // One `attend_group` per (token, kv-head): the `heads_per_group` query
+    // heads that share the KV head walk its history together, read in place
+    // from the `f16` cache (each row widened once, on the stack) — no
+    // per-token history copy, which at chunk 512 / ctx 8192 used to move
+    // ~17 GB per full-attention layer per chunk.
+    let group_width = heads_per_group * head_dim;
     for t in 0..t_len {
         let seq_len = start_pos + t + 1;
+        let sc = &mut *ctx.scratch;
         for kh in 0..n_kv_heads {
-            // One owned copy per (token, kv-head), shared by the
-            // `heads_per_group` query heads that read it.
-            let keys = ctx.kv.keys_for_owned(kv_slot, kh, seq_len);
-            let values = ctx.kv.values_for_owned(kv_slot, kh, seq_len);
-            if keys.len() < seq_len * head_dim || values.len() < seq_len * head_dim {
-                return Err(ModelError::ShapeInvariant {
-                    tensor: format!("layer {index}: kv slot {kv_slot} head {kh}"),
-                    expected: format!("{} floats of history", seq_len * head_dim),
-                    actual: format!("keys {}, values {}", keys.len(), values.len()),
-                });
-            }
-            let sc = &mut *ctx.scratch;
-            for g in 0..heads_per_group {
-                let h = kh * heads_per_group + g;
-                let lo = t * heads_width + h * head_dim;
-                let query =
-                    sc.q.get(lo..lo + head_dim)
-                        .ok_or_else(|| scratch_short("q", lo + head_dim))?;
-                let out = sc
-                    .attn
-                    .get_mut(lo..lo + head_dim)
-                    .ok_or_else(|| scratch_short("attn", lo + head_dim))?;
-                fused_attention_head_contiguous(query, &keys, &values, out, seq_len, head_dim)?;
-            }
+            let lo = t * heads_width + kh * group_width;
+            let queries =
+                sc.q.get(lo..lo + group_width)
+                    .ok_or_else(|| scratch_short("q", lo + group_width))?;
+            let out = sc
+                .attn
+                .get_mut(lo..lo + group_width)
+                .ok_or_else(|| scratch_short("attn", lo + group_width))?;
+            ctx.kv
+                .attend_group(kv_slot, kh, seq_len, queries, out)
+                .map_err(|e| match e {
+                    ModelError::ShapeInvariant { .. } | ModelError::SequenceTooLong { .. } => {
+                        ModelError::ShapeInvariant {
+                            tensor: format!("layer {index}: kv slot {kv_slot} head {kh}"),
+                            expected: format!("{seq_len} positions of stored history"),
+                            actual: e.to_string(),
+                        }
+                    }
+                    other => other,
+                })?;
         }
     }
 

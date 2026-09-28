@@ -20,12 +20,14 @@
 //! [`DEFAULT_MAX_SEQ_LEN`] is 8192, not the model maximum; the context guard
 //! that turns a RAM budget into a ceiling is B2-12's.
 //!
-//! The host cache is the **f16**, layer-sparse `KvCache::try_new_sparse` of
-//! design §3.7 — 16 slots × 4 kv heads × 256 dims × 2 (K+V) × 2 B =
-//! 64 KiB/token for the 27B, and the same `f16` KV the PrismML fork's own
-//! goldens were produced with. [`KvPrecision::F32`] doubles that and exists
-//! so a differential test can tell `f16` rounding apart from an arithmetic
-//! bug.
+//! The host cache is the **f16**, layer-sparse cache of design §3.7
+//! (`KvCacheBacking::SparseF16`) — 16 slots × 4 kv heads × 256 dims × 2
+//! (K+V) × 2 B = 64 KiB/token for the 27B, and the same `f16` KV the PrismML
+//! fork's own goldens were produced with. It is allocated **lazily**: one
+//! growth chunk up front, grown by the forward driver as positions are
+//! reached, never beyond `max_seq_len`. [`KvPrecision::F32`] doubles the
+//! per-token cost and exists so a differential test can tell `f16` rounding
+//! apart from an arithmetic bug.
 
 use std::sync::Arc;
 
@@ -49,7 +51,7 @@ use crate::hybrid::weights::{
     bind_conv1d, bind_embedding, bind_gate_projection, bind_gdn_gates, bind_linear, bind_lm_head,
     block_tensor, load_norm, names, resolve_id42, HybridEmbedding,
 };
-use crate::kv_cache::KvCache;
+use crate::kv_cache::{KvCache, KvCacheBacking, GROWTH_CHUNK_POSITIONS};
 use crate::layers::linear::LinearLayer;
 use crate::layers::rms_norm::RmsNorm;
 use crate::model_registry::ModelVariant;
@@ -327,23 +329,25 @@ impl<'a> HybridModel<'a> {
 
         // ── Caches ──────────────────────────────────────────────────────
         // Indexed by `kv_slot` (0..16 for the 27B), never by `layer_idx`,
-        // and allocated through the *fallible* constructors: a 27B at the
-        // model's declared 262 144-token context is 16 GiB of KV even at
-        // `f16`, which must surface as an error rather than an abort.
-        let kv_cache = match kv_precision {
-            KvPrecision::F16 => KvCache::try_new_sparse(
-                split.full_layers().len(),
-                config.base.num_kv_heads,
-                config.base.head_dim,
-                max_seq_len,
-            )?,
-            KvPrecision::F32 => KvCache::try_new(
-                split.full_layers().len(),
-                config.base.num_kv_heads,
-                config.base.head_dim,
-                max_seq_len,
-            )?,
+        // and allocated through the *fallible*, **lazy** constructor
+        // (REQUIRED #4 (4)): `max_seq_len` is the cache's fixed logical
+        // limit, but only one growth chunk is resident up front and the
+        // decode loop grows it (`run_chunk` -> `try_ensure_capacity`) as
+        // positions are reached. A 27B at the model's declared 262 144-token
+        // context would be 16 GiB of KV even at `f16`, which must surface as
+        // an error at the position that needs it rather than as an abort.
+        let backing = match kv_precision {
+            KvPrecision::F16 => KvCacheBacking::SparseF16,
+            KvPrecision::F32 => KvCacheBacking::DenseF32,
         };
+        let kv_cache = KvCache::try_new_lazy(
+            backing,
+            split.full_layers().len(),
+            config.base.num_kv_heads,
+            config.base.head_dim,
+            max_seq_len,
+            GROWTH_CHUNK_POSITIONS,
+        )?;
         let recurrent = RecurrentCache::new(&config)?;
         let rope = RopeTables::new(
             config.rope_dimension_count,
@@ -495,6 +499,29 @@ impl<'a> HybridModel<'a> {
         Ok(std::mem::replace(&mut self.recurrent, replacement))
     }
 
+    /// Install `state` as this model's recurrent state (REQUIRED #6 / RT-28:
+    /// hand back a state taken with [`HybridModel::take_recurrent`], or one
+    /// built for this geometry), after validating its geometry.
+    ///
+    /// # Errors
+    ///
+    /// [`ModelError::RecurrentStateMismatch`] when the recurrent layer
+    /// count, the Gated-DeltaNet geometry or the conv window differs from
+    /// this model's — a state from another model is never installed, since
+    /// it would either index out of bounds or silently run the recurrence on
+    /// another model's history. The model's own state is left untouched.
+    pub fn set_recurrent_state(&mut self, state: RecurrentCache) -> ModelResult<()> {
+        check_recurrent_geometry(&self.recurrent, &state)?;
+        self.recurrent = state;
+        Ok(())
+    }
+
+    /// Clear only the recurrent state, leaving the KV cursor alone (RT-28's
+    /// recurrent half of [`HybridModel::reset`]).
+    pub fn reset_recurrent(&mut self) {
+        self.recurrent.reset();
+    }
+
     /// KV window this model was built with.
     #[inline]
     #[must_use]
@@ -559,11 +586,12 @@ impl<'a> HybridModel<'a> {
         Ok(())
     }
 
-    /// Whether the KV cache is the `f16`, layer-sparse one of design SS3.7.
+    /// Whether the KV cache stores `f16` elements (the layer-sparse cache of
+    /// design SS3.7, the shipped default).
     #[inline]
     #[must_use]
     pub fn kv_is_f16(&self) -> bool {
-        self.kv_cache.is_sparse()
+        self.kv_cache.is_f16()
     }
 
     /// Borrow every part one forward needs, field by field, so the driver
@@ -722,6 +750,44 @@ impl<'a> HybridModel<'a> {
             self.quant_type.name(),
         )
     }
+}
+
+/// One-line description of a recurrent state's geometry, for
+/// [`ModelError::RecurrentStateMismatch`].
+fn describe_recurrent(state: &RecurrentCache) -> String {
+    let dims = state.dims();
+    format!(
+        "{} recurrent layers x [{} v-heads x {} x {}] (k-heads {}), conv {} ch x {} taps",
+        state.n_layers(),
+        dims.n_v_heads,
+        dims.head_v_dim,
+        dims.head_k_dim,
+        dims.n_k_heads,
+        state.conv_dim(),
+        state.conv_taps(),
+    )
+}
+
+/// Refuse a recurrent state whose geometry differs from `expected`'s.
+///
+/// # Errors
+///
+/// [`ModelError::RecurrentStateMismatch`] naming both geometries.
+pub(crate) fn check_recurrent_geometry(
+    expected: &RecurrentCache,
+    offered: &RecurrentCache,
+) -> ModelResult<()> {
+    if expected.n_layers() != offered.n_layers()
+        || expected.dims() != offered.dims()
+        || expected.conv_dim() != offered.conv_dim()
+        || expected.conv_taps() != offered.conv_taps()
+    {
+        return Err(ModelError::RecurrentStateMismatch {
+            expected: describe_recurrent(expected),
+            actual: describe_recurrent(offered),
+        });
+    }
+    Ok(())
 }
 
 /// Bind one full-attention layer (design §3.8).
@@ -1058,6 +1124,129 @@ mod tests {
             .iter()
             .all(|v| *v == 0.0));
         assert_eq!(model.kv_cache().seq_len(), 0);
+    }
+
+    /// REQUIRED #6: `reset` clears the KV cursor AND the recurrent state for
+    /// real — proven by replaying the same tokens after a reset and getting
+    /// bit-identical logits (a stale `S` or conv window would change them).
+    #[test]
+    fn reset_clears_both_caches_so_a_replay_is_bit_identical() {
+        let bytes = synthetic_gguf(FixtureShape::default(), FixtureOptions::default());
+        let gguf = GgufFile::parse(&bytes).expect("fixture parses");
+        let mut model = HybridModel::from_gguf(&gguf, 32).expect("model loads");
+        let vocab = model.config().base.vocab_size;
+        let tokens = [3u32, 9, 1, 4];
+
+        let mut first = vec![0.0f32; vocab];
+        model
+            .forward_prefill(&tokens, 0, &mut first)
+            .expect("first run");
+        assert_eq!(model.kv_cache().seq_len(), tokens.len());
+        assert_eq!(model.recurrent().token_count(), tokens.len());
+        assert!(
+            model
+                .recurrent()
+                .ssm(0)
+                .expect("slot 0")
+                .iter()
+                .any(|v| *v != 0.0),
+            "the run must have written recurrent state"
+        );
+
+        model.reset();
+        assert_eq!(model.kv_cache().seq_len(), 0);
+        assert_eq!(model.recurrent().token_count(), 0);
+        for slot in 0..model.recurrent().n_layers() {
+            assert!(model
+                .recurrent()
+                .ssm(slot)
+                .expect("ssm")
+                .iter()
+                .all(|v| *v == 0.0));
+            assert!(model
+                .recurrent()
+                .conv(slot)
+                .expect("conv")
+                .iter()
+                .all(|v| *v == 0.0));
+        }
+
+        let mut second = vec![0.0f32; vocab];
+        model
+            .forward_prefill(&tokens, 0, &mut second)
+            .expect("replay");
+        assert_eq!(
+            first.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            second.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            "a replay after reset must be bit-identical"
+        );
+    }
+
+    /// REQUIRED #6: `set_recurrent_state` validates the geometry and returns
+    /// a typed error on mismatch, leaving the model's own state untouched.
+    #[test]
+    fn set_recurrent_state_installs_a_matching_state_and_refuses_a_foreign_one() {
+        let bytes = synthetic_gguf(FixtureShape::default(), FixtureOptions::default());
+        let gguf = GgufFile::parse(&bytes).expect("fixture parses");
+        let mut model = HybridModel::from_gguf(&gguf, 32).expect("model loads");
+
+        let mut state = model.take_recurrent().expect("take");
+        state.ssm_mut(0).expect("slot 0")[5] = 2.5;
+        state.advance(3);
+        model
+            .set_recurrent_state(state)
+            .expect("a matching geometry installs");
+        assert_eq!(model.recurrent().token_count(), 3);
+        assert_eq!(model.recurrent().ssm(0).expect("slot 0")[5], 2.5);
+
+        // Fewer layers => fewer recurrent slots: a foreign geometry.
+        let mut other = model.config().clone();
+        other.base.num_layers = 4;
+        let foreign = RecurrentCache::new(&other).expect("foreign cache");
+        assert_ne!(foreign.n_layers(), model.recurrent().n_layers());
+        let err = model
+            .set_recurrent_state(foreign)
+            .expect_err("a foreign geometry must be refused");
+        assert_eq!(err.error_code(), "RECURRENT_STATE_MISMATCH");
+        assert!(matches!(err, ModelError::RecurrentStateMismatch { .. }));
+        assert_eq!(
+            model.recurrent().token_count(),
+            3,
+            "a refused state leaves the model's own untouched"
+        );
+
+        model.reset_recurrent();
+        assert_eq!(model.recurrent().token_count(), 0);
+        assert_eq!(model.recurrent().ssm(0).expect("slot 0")[5], 0.0);
+    }
+
+    #[test]
+    fn the_hybrid_kv_cache_is_lazy_f16_and_grows_with_the_sequence() {
+        let bytes = synthetic_gguf(FixtureShape::default(), FixtureOptions::default());
+        let gguf = GgufFile::parse(&bytes).expect("fixture parses");
+        let mut model = HybridModel::from_gguf(&gguf, 1024).expect("model loads");
+        assert!(model.kv_is_f16());
+        assert!(model.kv_cache().is_lazy());
+        assert!(model.kv_cache().is_sparse());
+        assert_eq!(model.kv_cache().max_seq_len(), 1024);
+        let first = model.kv_cache().allocated_seq_len();
+        assert_eq!(first, crate::kv_cache::GROWTH_CHUNK_POSITIONS);
+        let vocab = model.config().base.vocab_size;
+        let tokens: Vec<u32> = (0..u32::try_from(first + 2).expect("fits"))
+            .map(|i| i % 7)
+            .collect();
+        let mut logits = vec![0.0f32; vocab];
+        model.set_prefill_chunk(64).expect("chunk");
+        model
+            .forward_prefill(&tokens, 0, &mut logits)
+            .expect("prefill across the first chunk boundary");
+        assert!(model.kv_cache().allocated_seq_len() >= first + 2);
+        assert_eq!(
+            model.kv_cache().max_seq_len(),
+            1024,
+            "the limit never moves"
+        );
+        assert!(logits.iter().all(|v| v.is_finite()));
     }
 
     #[test]

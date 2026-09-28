@@ -6,9 +6,17 @@
 //!
 //! # Architecture
 //!
-//! - Single `metal::Device` (system default, singleton)
-//! - Dedicated `metal::CommandQueue` per graph
-//! - Pre-compiled compute pipeline states from concatenated MSL sources
+//! - One process-shared [`MetalDevice`]: the system default `metal::Device`,
+//!   the compiled pipelines and the weight cache (`MET-08`)
+//! - One [`MetalGraph`] per **session**, each with its own
+//!   `metal::CommandQueue` and lazily allocated workspace; a thread selects
+//!   its session with [`MetalGraph::with_session`] / [`SessionScope`]
+//! - Pre-compiled compute pipeline states from concatenated MSL sources — one
+//!   combined metallib (plus its best-effort bf16 sidecar) that the kernel
+//!   families resolve their pipelines from by name (`MET-10`: the K-quant,
+//!   standard-quant and FP8 families no longer compile private libraries);
+//!   the batched prefill-attention library (`metal_prefill/attention.rs`) is
+//!   the one library still compiled separately
 //! - Lazily pre-allocated intermediate GPU buffers (shared mode + hazard tracking)
 //!
 //! # Buffer hazard tracking
@@ -46,7 +54,7 @@ mod reformat;
 mod vae;
 
 pub use error::{MetalGraphError, MetalWeightHandle};
-pub use graph::MetalGraph;
+pub use graph::{MetalDevice, MetalGraph, SessionScope};
 
 // Crate-internal helpers used by sibling modules
 // (`metal_dispatch`, `metal_full_layer`, `metal_prefill`, `metal_fp8_*`).
@@ -64,5 +72,7 @@ mod tests_gemm_f32;
 mod tests_gemm_tq2;
 #[cfg(test)]
 mod tests_gemv_tq2;
+#[cfg(test)]
+mod tests_no_private_library;
 #[cfg(test)]
 mod tests_vae;

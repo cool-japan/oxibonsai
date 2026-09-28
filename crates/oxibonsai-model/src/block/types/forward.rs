@@ -25,8 +25,6 @@ use crate::block::functions::blocks_as_bytes;
 use crate::block::functions::blocks_as_bytes_ternary;
 
 use crate::block::functions::compute_gqa_attention;
-#[cfg(all(feature = "metal", target_os = "macos"))]
-use crate::block::functions::try_metal_gemv_ternary_fused;
 use crate::block::functions::{advance_kv_cache_to, validate_shapes};
 
 use super::block_def::TransformerBlock;
@@ -96,6 +94,32 @@ fn cuda_fused_qkv_slot(handle_id: u64) -> u64 {
     handle_id | CUDA_FUSED_QKV_SLOT_TAG
 }
 
+/// CUDA weight-cache slot for a ternary fused GEMV (`M-21`).
+///
+/// A **dedicated** fused handle (`fused_*_handle_ternary`, minted by
+/// `upload_to_gpu` for exactly this concatenation) is used as-is: no other
+/// producer writes that id, and with `NativeCudaBackend` the upload already
+/// put the concatenation's SoA there, so tagging it would only upload a
+/// second copy. Without one, the slot is derived from a single projection's
+/// handle (`fallback`), whose raw id that projection's own per-matrix upload
+/// already owns — so it is moved into the private tagged namespace
+/// ([`cuda_fused_qkv_slot`]). `None` when the block was never uploaded.
+#[cfg(any(
+    all(
+        feature = "native-cuda",
+        not(all(feature = "metal", target_os = "macos")),
+        any(target_os = "linux", target_os = "windows")
+    ),
+    test
+))]
+fn cuda_ternary_fused_slot(dedicated_id: Option<u64>, fallback_id: Option<u64>) -> Option<u64> {
+    match (dedicated_id, fallback_id) {
+        (Some(fused), _) => Some(fused),
+        (None, Some(single)) => Some(cuda_fused_qkv_slot(single)),
+        (None, None) => None,
+    }
+}
+
 /// Byte length a `TQ2_0_g128` SoA weight buffer must have for `total_rows`
 /// output rows and `k` input columns, or `None` when `k` is not a whole number
 /// of 128-wide quant groups.
@@ -152,12 +176,18 @@ fn cuda_tq2_soa_len_bytes(total_rows: usize, k: usize) -> Option<usize> {
 /// was not faithful.
 ///
 /// Both halves of the fix are required and both are here:
-/// 1. [`cuda_fused_qkv_slot`] moves the fused upload into a namespace no other
-///    producer writes, and the **same** value keys the upload and the launch.
+/// 1. The caller derives `fused_slot` with [`cuda_ternary_fused_slot`]: a
+///    dedicated fused handle's own id (`M-21`, a namespace no other producer
+///    writes), or a single projection's id moved into the private tagged
+///    namespace by [`cuda_fused_qkv_slot`]. The **same** value keys the
+///    upload and the launch below.
 /// 2. The cached buffer’s byte length is checked against
 ///    [`cuda_tq2_soa_len_bytes`] before the launch, so any future second
 ///    consumer of the map is caught as an `Err` and the caller’s existing CPU
 ///    fallback engages instead of a `CUDA_ERROR_ILLEGAL_ADDRESS`.
+///
+/// Generic over the number of parts (`M-21`): Q‖K‖V passes three, gate‖up
+/// two.
 ///
 /// The upload registers under [`CUDA_BLOCK_MODEL_EPOCH`] (unattributed) for the
 /// reason documented there.
@@ -172,15 +202,12 @@ fn cuda_tq2_soa_len_bytes(total_rows: usize, k: usize) -> Option<usize> {
 fn try_cuda_gemv_ternary_fused(
     input: &[f32],
     output: &mut [f32],
-    handle_id: u64,
+    fused_slot: u64,
     aos_parts: &[&[u8]],
     n_rows: usize,
     k: usize,
 ) -> Result<(), oxibonsai_kernels::CudaGraphError> {
     let graph = oxibonsai_kernels::CudaGraph::global()?;
-    // One value for both the upload and the launch — deriving it here rather
-    // than at the call site makes it impossible for them to disagree.
-    let fused_slot = cuda_fused_qkv_slot(handle_id);
     let expected_bytes = cuda_tq2_soa_len_bytes(n_rows, k).ok_or_else(|| {
         oxibonsai_kernels::CudaGraphError::DriverError(format!(
             "fused ternary QKV GEMV needs k to be a multiple of 128, got k={k}"
@@ -427,17 +454,21 @@ impl<'a> TransformerBlock<'a> {
                         self.attn_k.blocks_ternary(),
                         self.attn_v.blocks_ternary(),
                     ) {
-                        if let Some(hnd) = self.attn_q.gpu_handle() {
+                        // M-21: the dedicated fused handle's id when
+                        // `upload_to_gpu` built one (`ternary_fused_qkv_slot`),
+                        // and the kernels-side N-part entry, which refuses a
+                        // resident buffer of the wrong size.
+                        if let Some(slot) = self.ternary_fused_qkv_slot() {
                             let q_rows = nq * hd;
                             let k_rows = nkv * hd;
                             let total_rows = q_rows + k_rows + k_rows;
                             let q_bytes = blocks_as_bytes_ternary(q_blk);
                             let k_bytes = blocks_as_bytes_ternary(k_blk);
                             let v_bytes = blocks_as_bytes_ternary(v_blk);
-                            let slot = hnd.id();
-                            if try_metal_gemv_ternary_fused(
+                            if oxibonsai_kernels::try_metal_gemv_tq2_fused(
                                 normed,
                                 fused_qkv,
+                                oxibonsai_kernels::LEGACY_MODEL_EPOCH,
                                 slot,
                                 &[q_bytes, k_bytes, v_bytes],
                                 total_rows,
@@ -465,15 +496,17 @@ impl<'a> TransformerBlock<'a> {
                 let ternary_metal_ok = false;
                 // M-21 (wave-2.5 addendum item 4): the CUDA twin of the Metal
                 // branch above. Same gating — real ternary blocks on all three
-                // projections, an `attn_q` GPU handle whose id seeds the upload
-                // slot, and a GPU kernel tier (F-M2) so a CPU-tier run never
-                // opens the device — and the same fall-through to the CPU
-                // projections when any of that is missing or the GEMV fails.
+                // projections, a GPU handle that seeds the upload slot, and a
+                // GPU kernel tier (F-M2) so a CPU-tier run never opens the
+                // device — and the same fall-through to the CPU projections
+                // when any of that is missing or the GEMV fails.
                 //
-                // `hnd.id()` is passed RAW: `try_cuda_gemv_ternary_fused`
-                // derives the private fused slot from it with
-                // `cuda_fused_qkv_slot`, because the raw id is already owned by
-                // the Q projection's own per-matrix upload (M-21 blocking fix).
+                // The slot comes from `cuda_ternary_fused_slot`: the dedicated
+                // `fused_qkv_handle_ternary` id when `upload_to_gpu` built one
+                // (its buffer already IS the concatenation on
+                // `NativeCudaBackend`), else `attn_q`'s id moved into the
+                // private tagged namespace, because that raw id is owned by the
+                // Q projection's own per-matrix upload (M-21 blocking fix).
                 #[cfg(all(
                     feature = "native-cuda",
                     not(all(feature = "metal", target_os = "macos")),
@@ -489,9 +522,13 @@ impl<'a> TransformerBlock<'a> {
                     } else {
                         (None, None, None)
                     };
-                    if let ((Some(q_blk), Some(k_blk), Some(v_blk)), Some(hnd)) =
-                        (blocks, self.attn_q.gpu_handle())
-                    {
+                    if let ((Some(q_blk), Some(k_blk), Some(v_blk)), Some(fused_slot)) = (
+                        blocks,
+                        cuda_ternary_fused_slot(
+                            self.fused_qkv_handle_ternary.map(|hnd| hnd.id()),
+                            self.attn_q.gpu_handle().map(|hnd| hnd.id()),
+                        ),
+                    ) {
                         let q_rows = nq * hd;
                         let k_rows = nkv * hd;
                         let total_rows = q_rows + k_rows + k_rows;
@@ -501,7 +538,7 @@ impl<'a> TransformerBlock<'a> {
                         match try_cuda_gemv_ternary_fused(
                             normed,
                             fused_qkv,
-                            hnd.id(),
+                            fused_slot,
                             &[q_bytes, k_bytes, v_bytes],
                             total_rows,
                             h,
@@ -573,8 +610,12 @@ impl<'a> TransformerBlock<'a> {
         let cache_start = Instant::now();
         for head in 0..nkv {
             let start = head * hd;
-            kv_cache.store_key(self.layer_idx, head, pos, &k_rope[start..start + hd]);
-            kv_cache.store_value(self.layer_idx, head, pos, &v_all[start..start + hd]);
+            // REQUIRED #4 (sparse-KV cross-note): the fallible stores, so an
+            // out-of-range layer/head/position or a wrong-width key surfaces
+            // as an error here instead of being silently dropped and read
+            // back as zeros by the attention below.
+            kv_cache.try_store_key(self.layer_idx, head, pos, &k_rope[start..start + hd])?;
+            kv_cache.try_store_value(self.layer_idx, head, pos, &v_all[start..start + hd])?;
         }
         cache_us = cache_start.elapsed().as_micros();
         let seq_len = pos + 1;
@@ -799,7 +840,15 @@ impl<'a> TransformerBlock<'a> {
                     self.ffn_gate.forward_vec(normed, gate_out)?;
                     self.ffn_up.forward_vec(normed, up_out)?;
                 }
-            } else {
+            } else if !self.try_fused_gate_up_ternary(
+                normed,
+                fused_gate_up,
+                gate_out,
+                up_out,
+                kernel,
+            ) {
+                // Not a GPU-uploaded ternary block (or the fused GEMV
+                // failed): the two projections, per matrix.
                 self.ffn_gate.forward_vec(normed, gate_out)?;
                 self.ffn_up.forward_vec(normed, up_out)?;
             }
@@ -818,6 +867,125 @@ impl<'a> TransformerBlock<'a> {
         );
         Ok(())
     }
+
+    /// `M-21`: one fused GEMV for a **ternary** block's gate‖up projection
+    /// instead of two, writing `gate_out` / `up_out`.
+    ///
+    /// Engages only for a block whose gate and up projections are both
+    /// `TQ2_0_g128` and that `upload_to_gpu` gave a GPU slot
+    /// ([`Self::ternary_fused_gate_up_slot`] on Metal,
+    /// `cuda_ternary_fused_slot` on CUDA, behind a GPU kernel tier there).
+    /// Returns `false` — and the caller runs the two per-matrix projections —
+    /// on a CPU tier, a non-ternary block, a never-uploaded block, or any GPU
+    /// error; a CPU-tier run therefore behaves exactly as before.
+    ///
+    /// `kernel` is read only by the CUDA arm (its F-M2 tier gate): on Metal a
+    /// CPU-tier kernel never produced the GPU handles the slot needs, and a
+    /// build with neither backend never fuses.
+    #[cfg_attr(
+        not(all(
+            feature = "native-cuda",
+            not(all(feature = "metal", target_os = "macos")),
+            any(target_os = "linux", target_os = "windows")
+        )),
+        allow(unused_variables)
+    )]
+    fn try_fused_gate_up_ternary(
+        &self,
+        normed: &[f32],
+        fused_gate_up: &mut [f32],
+        gate_out: &mut [f32],
+        up_out: &mut [f32],
+        kernel: &dyn OneBitKernel,
+    ) -> bool {
+        let (Some(gate_blk), Some(up_blk)) =
+            (self.ffn_gate.blocks_ternary(), self.ffn_up.blocks_ternary())
+        else {
+            return false;
+        };
+        let inter = gate_out.len();
+        let total_rows = inter * 2;
+        if up_out.len() != inter || fused_gate_up.len() < total_rows {
+            return false;
+        }
+        let h = self.hidden_size;
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        let fused_ok = match self.ternary_fused_gate_up_slot() {
+            Some(slot) => {
+                let parts = [
+                    blocks_as_bytes_ternary(gate_blk),
+                    blocks_as_bytes_ternary(up_blk),
+                ];
+                match oxibonsai_kernels::try_metal_gemv_tq2_fused(
+                    normed,
+                    &mut fused_gate_up[..total_rows],
+                    oxibonsai_kernels::LEGACY_MODEL_EPOCH,
+                    slot,
+                    &parts,
+                    total_rows,
+                    h,
+                ) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::debug!(
+                            layer = self.layer_idx, error = %e,
+                            "fused ternary gate+up GEMV on Metal failed, using per-matrix projections"
+                        );
+                        false
+                    }
+                }
+            }
+            None => false,
+        };
+        #[cfg(all(
+            feature = "native-cuda",
+            not(all(feature = "metal", target_os = "macos")),
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        let fused_ok = match cuda_ternary_fused_slot(
+            self.fused_gate_up_handle_ternary.map(|hnd| hnd.id()),
+            self.ffn_gate.gpu_handle().map(|hnd| hnd.id()),
+        ) {
+            // F-M2: a CPU-tier run never opens the CUDA device.
+            Some(slot) if kernel.is_gpu_accelerated() => {
+                let parts = [
+                    blocks_as_bytes_ternary(gate_blk),
+                    blocks_as_bytes_ternary(up_blk),
+                ];
+                match try_cuda_gemv_ternary_fused(
+                    normed,
+                    &mut fused_gate_up[..total_rows],
+                    slot,
+                    &parts,
+                    total_rows,
+                    h,
+                ) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "fused ternary gate+up GEMV on CUDA failed, falling back to CPU"
+                        );
+                        false
+                    }
+                }
+            }
+            _ => false,
+        };
+        #[cfg(not(any(
+            all(feature = "metal", target_os = "macos"),
+            all(
+                feature = "native-cuda",
+                any(target_os = "linux", target_os = "windows")
+            )
+        )))]
+        let fused_ok = false;
+        if fused_ok {
+            gate_out.copy_from_slice(&fused_gate_up[..inter]);
+            up_out.copy_from_slice(&fused_gate_up[inter..total_rows]);
+        }
+        fused_ok
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -830,7 +998,25 @@ impl<'a> TransformerBlock<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cuda_fused_qkv_slot, cuda_tq2_soa_len_bytes, CUDA_FUSED_QKV_SLOT_TAG};
+    use super::{
+        cuda_fused_qkv_slot, cuda_ternary_fused_slot, cuda_tq2_soa_len_bytes,
+        CUDA_FUSED_QKV_SLOT_TAG,
+    };
+
+    /// M-21: a dedicated fused handle keys the CUDA fused GEMV untagged (its
+    /// id is private to the concatenation), a single projection's handle only
+    /// through the tagged namespace, and a never-uploaded block not at all.
+    #[test]
+    fn cuda_ternary_fused_slot_prefers_the_dedicated_handle() {
+        assert_eq!(cuda_ternary_fused_slot(Some(41), Some(7)), Some(41));
+        assert_eq!(cuda_ternary_fused_slot(Some(41), None), Some(41));
+        assert_eq!(
+            cuda_ternary_fused_slot(None, Some(7)),
+            Some(cuda_fused_qkv_slot(7))
+        );
+        assert_ne!(cuda_ternary_fused_slot(None, Some(7)), Some(7));
+        assert_eq!(cuda_ternary_fused_slot(None, None), None);
+    }
 
     /// Every id the allocator can mint is moved into a disjoint namespace, and
     /// the original id survives in the low 63 bits.
@@ -956,5 +1142,226 @@ mod tests {
         ] {
             assert_eq!(cuda_tq2_soa_len_bytes(rows, k), Some(blocks * 34));
         }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests — M-21 on Metal: the ternary fused QKV and gate+up arms engage, stay
+// on the ternary path, and match the CPU reference
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(all(test, feature = "metal", target_os = "macos"))]
+mod metal_fused_ternary_tests {
+    use crate::block::TransformerBlock;
+    use crate::kv_cache::KvCache;
+    use crate::layers::linear::{LinearLayer, LinearTernary};
+    use crate::layers::rms_norm::RmsNorm;
+    use crate::layers::rope::RopeTable;
+    use half::f16;
+    use oxibonsai_core::BlockTQ2_0_g128;
+    use oxibonsai_kernels::gpu_backend::metal_full_layer::types::{WeightKey, WeightKind};
+    use oxibonsai_kernels::{KernelDispatcher, KernelTier, MetalGraph, MetalGraphError};
+    use std::sync::Arc;
+
+    const H: usize = 256;
+    const HD: usize = 64;
+    const NQ: usize = 4;
+    const NKV: usize = 2;
+    const INTER: usize = 512;
+    const SEQ: usize = 16;
+
+    /// Varied ternary blocks (codes in {0, 1, 2} only — never the reserved
+    /// `0b11`), so every projection is a genuinely different matrix.
+    fn blocks(n: usize, seed: u64) -> Vec<BlockTQ2_0_g128> {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..n)
+            .map(|_| {
+                let mut qs = [0u8; 32];
+                for byte in qs.iter_mut() {
+                    for lane in 0..4 {
+                        state = state
+                            .wrapping_mul(6_364_136_223_846_793_005)
+                            .wrapping_add(1_442_695_040_888_963_407);
+                        *byte |= (((state >> 33) % 3) as u8) << (2 * lane);
+                    }
+                }
+                BlockTQ2_0_g128 {
+                    qs,
+                    d: f16::from_f32(0.02 + (seed % 7) as f32 * 0.003),
+                }
+            })
+            .collect()
+    }
+
+    struct Weights {
+        q: Vec<BlockTQ2_0_g128>,
+        k: Vec<BlockTQ2_0_g128>,
+        v: Vec<BlockTQ2_0_g128>,
+        o: Vec<BlockTQ2_0_g128>,
+        gate: Vec<BlockTQ2_0_g128>,
+        up: Vec<BlockTQ2_0_g128>,
+        down: Vec<BlockTQ2_0_g128>,
+    }
+
+    impl Weights {
+        fn new() -> Self {
+            let bpr = H / 128;
+            Self {
+                q: blocks(NQ * HD * bpr, 1),
+                k: blocks(NKV * HD * bpr, 2),
+                v: blocks(NKV * HD * bpr, 3),
+                o: blocks(H * (NQ * HD / 128), 4),
+                gate: blocks(INTER * bpr, 5),
+                up: blocks(INTER * bpr, 6),
+                down: blocks(H * (INTER / 128), 7),
+            }
+        }
+
+        fn block(&self, kernel: &Arc<KernelDispatcher>) -> TransformerBlock<'_> {
+            TransformerBlock::new(
+                0,
+                RmsNorm::new(vec![1.0; H], 1e-6),
+                lin(&self.q, NQ * HD, H, kernel),
+                lin(&self.k, NKV * HD, H, kernel),
+                lin(&self.v, NKV * HD, H, kernel),
+                lin(&self.o, H, NQ * HD, kernel),
+                RmsNorm::new(vec![1.0; HD], 1e-6),
+                RmsNorm::new(vec![1.0; HD], 1e-6),
+                RmsNorm::new(vec![1.0; H], 1e-6),
+                lin(&self.gate, INTER, H, kernel),
+                lin(&self.up, INTER, H, kernel),
+                lin(&self.down, H, INTER, kernel),
+                NQ,
+                NKV,
+                HD,
+                H,
+            )
+        }
+    }
+
+    /// A ternary linear layer over borrowed blocks.
+    fn lin<'w>(
+        blocks: &'w [BlockTQ2_0_g128],
+        out: usize,
+        inp: usize,
+        kernel: &Arc<KernelDispatcher>,
+    ) -> LinearLayer<'w> {
+        LinearTernary::new(blocks, out, inp, Arc::clone(kernel))
+            .expect("ternary linear")
+            .into()
+    }
+
+    /// Residency probe against the bound session's weight cache.
+    fn resident_bytes(graph: &MetalGraph, slot: u64) -> Option<usize> {
+        graph
+            .get_or_upload_keyed(WeightKey::legacy(WeightKind::Tq2Soa, slot), || {
+                Err(MetalGraphError::ExecutionFailed("probe".into()))
+            })
+            .ok()
+            .map(|handle| handle.byte_len())
+    }
+
+    /// `M-21` end to end on Metal:
+    ///
+    /// 1. `upload_to_gpu` builds the two **ternary** fused handles and leaves
+    ///    every 1-bit fused field (and its gated accessor) empty — so the
+    ///    block is not diverted into the 1-bit fused branch;
+    /// 2. `forward` then runs the ternary fused-QKV arm **and** the new fused
+    ///    gate‖up GEMV — proven by both concatenations being resident in
+    ///    `MetalGraph`'s cache, at the exact fused byte length, under the
+    ///    dedicated handles' ids;
+    /// 3. and the result matches the CPU reference block (no upload, reference
+    ///    tier) over several positions.
+    ///
+    /// Runs in its own isolated device so the residency probes see only this
+    /// test's uploads.
+    #[test]
+    fn ternary_fused_qkv_and_gate_up_engage_and_match_the_cpu_reference() {
+        let Ok(isolated) = MetalGraph::new() else {
+            return; // no Metal device on this host
+        };
+        let isolated = Arc::new(isolated);
+        MetalGraph::with_session(&isolated, || {
+            let weights = Weights::new();
+            let cpu_kernel = Arc::new(KernelDispatcher::with_tier(KernelTier::Reference));
+            let gpu_kernel = Arc::new(KernelDispatcher::auto_detect());
+            let reference = weights.block(&cpu_kernel);
+            let mut gpu = weights.block(&gpu_kernel);
+            gpu.upload_to_gpu(gpu_kernel.as_ref());
+
+            assert!(
+                gpu.fused_qkv_gpu_handle().is_none() && gpu.fused_gate_up_gpu_handle().is_none(),
+                "a ternary block must expose no 1-bit fused handle"
+            );
+            let fused_qkv = gpu
+                .fused_qkv_gpu_handle_ternary()
+                .expect("a GPU-tier upload must build the ternary fused QKV handle");
+            let fused_gate_up = gpu
+                .fused_gate_up_gpu_handle_ternary()
+                .expect("a GPU-tier upload must build the ternary fused gate+up handle");
+            let qkv_slot = fused_qkv.id();
+            let gate_up_slot = fused_gate_up.id();
+            assert_ne!(qkv_slot, gate_up_slot);
+            assert_eq!(gpu.ternary_fused_qkv_slot(), Some(qkv_slot));
+            assert_eq!(gpu.ternary_fused_gate_up_slot(), Some(gate_up_slot));
+            assert_ne!(
+                gpu.legacy_ternary_fused_qkv_slot(),
+                Some(qkv_slot),
+                "the dedicated handle must not reuse the Q projection's id"
+            );
+
+            let rope = RopeTable::new(HD, SEQ, 10_000.0);
+            let mut ref_kv = KvCache::new(1, NKV, HD, SEQ);
+            let mut gpu_kv = KvCache::new(1, NKV, HD, SEQ);
+            let mut worst = 0f32;
+            for pos in 0..4usize {
+                let input: Vec<f32> = (0..H)
+                    .map(|i| ((i * 13 + pos * 5) % 29) as f32 * 0.01 - 0.14)
+                    .collect();
+                let mut ref_hidden = input.clone();
+                reference
+                    .forward(
+                        &mut ref_hidden,
+                        pos,
+                        &mut ref_kv,
+                        &rope,
+                        cpu_kernel.as_ref(),
+                    )
+                    .expect("CPU reference forward");
+                let mut gpu_hidden = input.clone();
+                gpu.forward(
+                    &mut gpu_hidden,
+                    pos,
+                    &mut gpu_kv,
+                    &rope,
+                    gpu_kernel.as_ref(),
+                )
+                .expect("GPU-uploaded forward");
+                assert_ne!(
+                    ref_hidden, input,
+                    "the forward must change the hidden state"
+                );
+                for (a, b) in ref_hidden.iter().zip(&gpu_hidden) {
+                    worst = worst.max((a - b).abs());
+                }
+            }
+            assert!(
+                worst < 1e-3,
+                "fused ternary forward diverged from the CPU reference: max |diff| = {worst}"
+            );
+
+            let bpr = H / 128;
+            let qkv_rows = NQ * HD + 2 * NKV * HD;
+            assert_eq!(
+                resident_bytes(&isolated, qkv_slot),
+                Some(qkv_rows * bpr * 34),
+                "the ternary fused-QKV arm did not run (its Q‖K‖V buffer is not resident)"
+            );
+            assert_eq!(
+                resident_bytes(&isolated, gate_up_slot),
+                Some(2 * INTER * bpr * 34),
+                "the fused gate‖up GEMV did not run (its gate‖up buffer is not resident)"
+            );
+        });
     }
 }

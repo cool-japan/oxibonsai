@@ -1,75 +1,139 @@
 //! KV Cache for autoregressive generation.
 //!
 //! Stores key and value tensors for each layer to avoid recomputation
-//! during token-by-token generation. Provides both a standard contiguous
-//! cache and a page-based cache for memory-efficient allocation.
+//! during token-by-token generation.
+//!
+//! # Element type, layout and lazy growth (M-07, B2-11-FIX)
+//!
+//! A [`KvCache`] is described by three independent facts:
+//!
+//! * **element type** — `f32` (4 B) or `f16` (2 B), [`KvCache::is_f16`];
+//! * **layout** — *dense* (one slot per transformer layer) or *sparse* (one
+//!   slot per KV-bearing layer of a hybrid stack, the caller mapping
+//!   `layer_idx -> kv_slot`), [`KvCache::is_sparse`];
+//! * **capacity** — the **logical** limit [`KvCache::max_seq_len`] (the most
+//!   positions this cache may ever hold, what every caller sizing a context
+//!   or a device-side cache reads) and the **allocated** capacity
+//!   [`KvCache::allocated_seq_len`] (what is resident right now).
+//!
+//! The legacy constructors ([`KvCache::new`], [`KvCache::try_new`],
+//! [`KvCache::new_sparse`], [`KvCache::try_new_sparse`]) allocate their
+//! whole limit up front, exactly as before, and [`KvCache::ensure_capacity`]
+//! still raises *both* numbers on such a cache. [`KvCache::try_new_lazy`]
+//! builds a **bounded** cache instead: it starts at a small allocation and
+//! grows it — by whole [`GROWTH_CHUNK_POSITIONS`] chunks, doubling once it is
+//! large — towards a fixed logical limit, either explicitly
+//! ([`KvCache::try_ensure_capacity`], which the model decode loops call with
+//! `pos + 1` before running any layer) or implicitly on a store past the
+//! allocation. `max_seq_len()` never moves on a bounded cache, so a
+//! device-side cache sized from it keeps its geometry while the host grows.
+//!
+//! # Reading back
+//!
+//! Attention reads the cache in place through [`KvCache::attend_group`],
+//! which never materialises a history copy for either element type.
+//!
+//! [`KvCache::keys_for`]/[`KvCache::values_for`] keep their `&[f32]`
+//! signature and are correct for every storage mode (they used to return an
+//! **empty** slice for `f16` storage — the release-build-silent footgun the
+//! wave-3.5 triage flagged, guarded only by a `debug_assert!`). An `f32`
+//! cache is borrowed zero-copy; an `f16` cache is served from an `f32`
+//! read-back mirror built on the first such read after a write and dropped
+//! by the next write. They are diagnostic / inspection accessors: no hot
+//! path calls them, so the mirror is never built during inference.
+//!
+//! The standalone page-based cache lives in [`PagedKvCache`]; the storage
+//! vocabulary ([`KvCacheBacking`], [`KvCachePolicy`]) in its own file.
+
+use std::sync::OnceLock;
 
 use half::f16;
 
 use crate::error::{ModelError, ModelResult};
 
-/// Policy for KV cache storage format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum KvCachePolicy {
-    /// Standard FP32 cache (contiguous allocation).
-    #[default]
-    Standard,
-    /// FP16 cache (half the memory of Standard).
-    Fp16,
-    /// Sliding window cache: only retain the most recent N positions.
-    SlidingWindow(usize),
-}
+#[path = "kv_cache_attention.rs"]
+mod attention;
+#[path = "kv_cache_backing.rs"]
+mod backing;
+#[cfg(test)]
+#[path = "kv_cache_lazy_tests.rs"]
+mod lazy_tests;
+#[path = "kv_cache_paged.rs"]
+mod paged;
+#[cfg(test)]
+#[path = "kv_cache_tests.rs"]
+mod tests;
+
+pub use attention::attend_f16_group;
+pub use backing::{KvCacheBacking, KvCachePolicy};
+pub use paged::PagedKvCache;
 
 /// Backing element storage for a [`KvCache`].
 ///
-/// `KvCache` is one nominal type with two possible representations so that
-/// [`KvCache::new_sparse`] can return `Self` (matching the design doc's
-/// signature) while still halving the per-element footprint (M-07): a plain
-/// `enum KvCache { Dense, Sparse }` cannot exist because the type name would
-/// then be a variant, not the struct every existing caller already imports.
+/// Private: callers see the element type through [`KvCache::is_f16`] and
+/// the full description through [`KvCache::backing`].
 #[derive(Debug)]
 enum KvStorage {
-    /// Classic contiguous storage, one `f32` per element (4 bytes). Built by
-    /// [`KvCache::new`]/[`KvCache::try_new`]; every pre-existing accessor
-    /// (`keys_for`, `values_for`, ...) is defined in terms of this variant
-    /// and is unchanged from before this type existed.
-    Dense { keys: Vec<f32>, values: Vec<f32> },
-    /// Half-precision storage, one [`f16`] per element (2 bytes). Built by
-    /// [`KvCache::new_sparse`]/[`KvCache::try_new_sparse`] for hybrid models
-    /// (Bonsai 2) where only a subset of transformer layers carry a KV cache
-    /// at all: `num_layers` on a sparse-backed `KvCache` counts **slots**
-    /// (0..16 for Bonsai 2), not raw transformer layer indices (0..64) — the
-    /// caller maps `layer_idx -> kv_slot` before calling `store_key`/
-    /// `store_value` (see [`KvCache::new_sparse`]'s doc for the exact
-    /// contract). Converts to/from `f32` at the `store_*`/`*_owned` read
-    /// boundary; see the module docs on why `keys_for`/`values_for`
-    /// themselves cannot serve this variant (M-07 / M-13).
-    Sparse { keys: Vec<f16>, values: Vec<f16> },
+    /// One `f32` per element (4 bytes).
+    F32 { keys: Vec<f32>, values: Vec<f32> },
+    /// One [`f16`] per element (2 bytes): half the footprint, and the
+    /// element type the PrismML fork's own goldens were produced with.
+    /// Converts to/from `f32` at the store / read boundary.
+    F16 { keys: Vec<f16>, values: Vec<f16> },
 }
 
 impl KvStorage {
     /// Total element count across both key and value buffers.
     fn total_elements(&self) -> usize {
         match self {
-            Self::Dense { keys, values } => keys.len() + values.len(),
-            Self::Sparse { keys, values } => keys.len() + values.len(),
+            Self::F32 { keys, values } => keys.len() + values.len(),
+            Self::F16 { keys, values } => keys.len() + values.len(),
         }
     }
 
-    /// Resident byte count, honest about the element width of whichever
-    /// variant is active (M-07's "exactly 64 KiB/token" gate depends on this
-    /// being 2 bytes/element for `Sparse`, not 4).
-    fn memory_bytes(&self) -> usize {
+    /// Bytes per stored element.
+    fn element_bytes(&self) -> usize {
         match self {
-            Self::Dense { .. } => self.total_elements() * std::mem::size_of::<f32>(),
-            Self::Sparse { .. } => self.total_elements() * std::mem::size_of::<f16>(),
+            Self::F32 { .. } => std::mem::size_of::<f32>(),
+            Self::F16 { .. } => std::mem::size_of::<f16>(),
+        }
+    }
+
+    /// Resident byte count, honest about the element width (M-07's "exactly
+    /// 64 KiB/token" gate depends on this being 2 bytes/element for `f16`).
+    fn memory_bytes(&self) -> usize {
+        self.total_elements() * self.element_bytes()
+    }
+
+    /// Allocate zeroed storage of `total` elements per buffer, of the same
+    /// element type as `self` (or `f16` when `f16` is set).
+    fn try_alloc(f16_elements: bool, total: usize, requested_bytes: usize) -> ModelResult<Self> {
+        if f16_elements {
+            Ok(Self::F16 {
+                keys: try_alloc_zeroed(total, f16::ZERO, requested_bytes)?,
+                values: try_alloc_zeroed(total, f16::ZERO, requested_bytes)?,
+            })
+        } else {
+            Ok(Self::F32 {
+                keys: try_alloc_zeroed(total, 0.0f32, requested_bytes)?,
+                values: try_alloc_zeroed(total, 0.0f32, requested_bytes)?,
+            })
         }
     }
 }
 
-/// Per-layer KV cache storing key and value vectors, either densely (one
-/// slot per transformer layer, `f32`) or sparsely (one slot per
-/// full-attention layer only, `f16` — see [`KvCache::new_sparse`], M-07).
+/// Which layers a cache has slots for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KvLayout {
+    /// One slot per transformer layer.
+    Dense,
+    /// One slot per KV-bearing layer of a hybrid stack (Bonsai 2: 16 of 64);
+    /// the caller maps `layer_idx -> kv_slot` before every access.
+    Sparse,
+}
+
+/// Per-layer KV cache storing key and value vectors — see the module docs
+/// for the element-type / layout / capacity model.
 #[derive(Debug)]
 pub struct KvCache {
     /// Number of Transformer layers (dense) or KV slots (sparse).
@@ -78,19 +142,34 @@ pub struct KvCache {
     num_kv_heads: usize,
     /// Dimension per head.
     head_dim: usize,
-    /// Maximum sequence length.
+    /// **Logical** capacity: the most positions this cache may hold.
     max_seq_len: usize,
+    /// **Allocated** capacity: positions resident right now, and the
+    /// per-(layer, head) stride of the storage. `capacity <= max_seq_len`.
+    capacity: usize,
+    /// `true` for a [`KvCache::try_new_lazy`] cache, whose `max_seq_len` is a
+    /// fixed ceiling; `false` for the legacy eager caches, which growth may
+    /// enlarge past their original size.
+    bounded: bool,
     /// Current sequence length (number of tokens cached).
     seq_len: usize,
-    /// Backing storage (dense f32 or sparse f16 — see [`KvStorage`]).
+    /// Slot layout (dense or sparse).
+    layout: KvLayout,
+    /// Backing storage (`f32` or `f16` — see [`KvStorage`]).
     storage: KvStorage,
+    /// `f32` read-back mirror of an `f16` key buffer, built by the first
+    /// [`KvCache::keys_for`] after a write and dropped by the next write
+    /// (see the module docs). Always empty for `f32` storage.
+    key_mirror: OnceLock<Vec<f32>>,
+    /// Value counterpart of `key_mirror`.
+    value_mirror: OnceLock<Vec<f32>>,
 }
 
 /// Growth increment, in positions, for [`KvCache::ensure_capacity`] (M-07:
-/// "lazy growth in chunks rather than `max_seq_len` up front"). Matches
-/// [`DEFAULT_PAGE_SIZE`]'s value (this file's other lazy-allocation
-/// primitive, [`PagedKvCache`]) for consistency, not because the two are
-/// otherwise related.
+/// "lazy growth in chunks rather than `max_seq_len` up front"), and the
+/// default first allocation of a lazy cache. Matches the page size of
+/// [`PagedKvCache`] for consistency, not because the two are otherwise
+/// related.
 pub const GROWTH_CHUNK_POSITIONS: usize = 256;
 
 /// Compute `num_layers * num_kv_heads * max_seq_len * head_dim`, saturating
@@ -131,8 +210,48 @@ fn try_alloc_zeroed<T: Clone>(len: usize, zero: T, requested_bytes: usize) -> Mo
     Ok(buf)
 }
 
+/// Validate a geometry and return `(elements per buffer, total bytes)` for
+/// `element_bytes`-wide elements (keys + values).
+fn checked_geometry(
+    what: &str,
+    num_layers: usize,
+    num_kv_heads: usize,
+    positions: usize,
+    head_dim: usize,
+    element_bytes: usize,
+) -> ModelResult<(usize, usize)> {
+    let total =
+        checked_element_count(num_layers, num_kv_heads, positions, head_dim).ok_or_else(|| {
+            ModelError::KvAllocation {
+                requested_bytes: None,
+                detail: format!(
+                    "{what}{num_layers} layers x {num_kv_heads} kv_heads x \
+                 {positions} max_seq_len x {head_dim} head_dim overflows usize"
+                ),
+            }
+        })?;
+    let requested_bytes = total
+        .checked_mul(2) // keys + values
+        .and_then(|n| n.checked_mul(element_bytes))
+        .ok_or_else(|| ModelError::KvAllocation {
+            requested_bytes: None,
+            detail: format!("{what}{total} elements overflow a byte count"),
+        })?;
+    // A byte count past `isize::MAX` cannot be a valid `Vec` allocation on
+    // any target this crate ships for; fail cleanly with the computed size
+    // named instead of letting the allocator abort the process with
+    // "capacity overflow".
+    if requested_bytes > isize::MAX as usize {
+        return Err(ModelError::KvAllocation {
+            requested_bytes: Some(requested_bytes),
+            detail: "exceeds the largest representable allocation".to_string(),
+        });
+    }
+    Ok((total, requested_bytes))
+}
+
 impl KvCache {
-    /// Create a new, dense, FP32-backed KV cache.
+    /// Create a new, dense, FP32-backed KV cache, fully allocated.
     ///
     /// Infallible: a combination of dimensions whose element count would
     /// overflow `usize` saturates to `usize::MAX` elements instead of
@@ -154,21 +273,24 @@ impl KvCache {
             num_kv_heads,
             head_dim,
             max_seq_len,
+            capacity: max_seq_len,
+            bounded: false,
             seq_len: 0,
-            storage: KvStorage::Dense {
+            layout: KvLayout::Dense,
+            storage: KvStorage::F32 {
                 keys: vec![0.0; total],
                 values: vec![0.0; total],
             },
+            key_mirror: OnceLock::new(),
+            value_mirror: OnceLock::new(),
         }
     }
 
     /// Fallible counterpart of [`KvCache::new`] (M-07).
     ///
-    /// Fallible in **two** senses: an overflowing geometry is rejected (as
-    /// before), and — since the wave-3 verifier review — a real allocator
-    /// failure on the (non-overflowing, in-range) request is surfaced the
-    /// same way instead of aborting the process. `Self::new` remains
-    /// deliberately infallible-by-abort for callers that want that.
+    /// Fallible in **two** senses: an overflowing geometry is rejected, and a
+    /// real allocator failure on an in-range request is surfaced the same
+    /// way instead of aborting the process.
     ///
     /// # Errors
     ///
@@ -183,40 +305,26 @@ impl KvCache {
         head_dim: usize,
         max_seq_len: usize,
     ) -> ModelResult<Self> {
-        let total = checked_element_count(num_layers, num_kv_heads, max_seq_len, head_dim)
-            .ok_or_else(|| ModelError::KvAllocation {
-                requested_bytes: None,
-                detail: format!(
-                    "{num_layers} layers x {num_kv_heads} kv_heads x \
-                         {max_seq_len} max_seq_len x {head_dim} head_dim overflows usize"
-                ),
-            })?;
-        let requested_bytes = total
-            .checked_mul(2) // keys + values
-            .and_then(|n| n.checked_mul(std::mem::size_of::<f32>()))
-            .ok_or_else(|| ModelError::KvAllocation {
-                requested_bytes: None,
-                detail: format!("{total} elements overflow a byte count"),
-            })?;
-        // A byte count past `isize::MAX` cannot be a valid `Vec` allocation
-        // on any target this crate ships for; fail cleanly with the
-        // computed size named instead of letting the allocator abort the
-        // process with "capacity overflow".
-        if requested_bytes > isize::MAX as usize {
-            return Err(ModelError::KvAllocation {
-                requested_bytes: Some(requested_bytes),
-                detail: "exceeds the largest representable allocation".to_string(),
-            });
-        }
-        let keys = try_alloc_zeroed(total, 0.0f32, requested_bytes)?;
-        let values = try_alloc_zeroed(total, 0.0f32, requested_bytes)?;
+        let (total, requested_bytes) = checked_geometry(
+            "",
+            num_layers,
+            num_kv_heads,
+            max_seq_len,
+            head_dim,
+            std::mem::size_of::<f32>(),
+        )?;
         Ok(Self {
             num_layers,
             num_kv_heads,
             head_dim,
             max_seq_len,
+            capacity: max_seq_len,
+            bounded: false,
             seq_len: 0,
-            storage: KvStorage::Dense { keys, values },
+            layout: KvLayout::Dense,
+            storage: KvStorage::try_alloc(false, total, requested_bytes)?,
+            key_mirror: OnceLock::new(),
+            value_mirror: OnceLock::new(),
         })
     }
 
@@ -232,9 +340,8 @@ impl KvCache {
     ///   the cache's `num_layers()` after construction. **Not** the model's
     ///   raw transformer layer count: the caller maps a real layer index
     ///   (e.g. `3, 7, 11, ..., 63` for Bonsai 2's `(i+1) % 4 == 0` rule) down
-    ///   to its slot `0..n_slots` (e.g. `layer_idx / 4`) before calling
-    ///   [`store_key`](Self::store_key)/[`store_value`](Self::store_value) —
-    ///   this cache does not itself hold that mapping.
+    ///   to its slot `0..n_slots` before every store or read — this cache
+    ///   does not itself hold that mapping.
     /// - `n_kv_heads`, `head_dim`, `max_seq` — as for [`KvCache::new`].
     ///
     /// # Memory
@@ -242,24 +349,6 @@ impl KvCache {
     /// Exactly `n_slots * n_kv_heads * head_dim * 2 (K+V) * 2 bytes (f16)`
     /// per token: for the Bonsai 2 27B (`n_slots=16, n_kv_heads=4,
     /// head_dim=256`) that is **65 536 bytes = 64 KiB/token** exactly.
-    ///
-    /// # Reading back
-    ///
-    /// [`keys_for`](Self::keys_for)/[`values_for`](Self::values_for) return
-    /// a zero-copy `&[f32]`, which an `f16`-packed buffer cannot produce
-    /// without an owned conversion; on a sparse-backed cache they return an
-    /// empty slice instead of panicking or fabricating data. Use
-    /// [`keys_for_owned`](Self::keys_for_owned)/
-    /// [`values_for_owned`](Self::values_for_owned) instead, which work for
-    /// either storage mode. [`store_key`](Self::store_key)/
-    /// [`try_store_key`](Self::try_store_key) and their `_value` siblings,
-    /// and [`extract_block`](Self::extract_block)/
-    /// [`inject_block`](Self::inject_block), all take/return `f32` and work
-    /// unchanged on a sparse-backed cache — prefer the fallible
-    /// `try_store_key`/`try_store_value` for new (sparse-consuming) call
-    /// sites, since a silently-dropped store into a 16-slot hybrid cache is
-    /// a full-attention-layer's history lost, not one stale row in a
-    /// 64-layer dense cache.
     pub fn new_sparse(n_slots: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize) -> Self {
         let total =
             checked_element_count(n_slots, n_kv_heads, max_seq, head_dim).unwrap_or(usize::MAX);
@@ -268,22 +357,22 @@ impl KvCache {
             num_kv_heads: n_kv_heads,
             head_dim,
             max_seq_len: max_seq,
+            capacity: max_seq,
+            bounded: false,
             seq_len: 0,
-            storage: KvStorage::Sparse {
+            layout: KvLayout::Sparse,
+            storage: KvStorage::F16 {
                 keys: vec![f16::ZERO; total],
                 values: vec![f16::ZERO; total],
             },
+            key_mirror: OnceLock::new(),
+            value_mirror: OnceLock::new(),
         }
     }
 
-    /// Fallible counterpart of [`KvCache::new_sparse`] (M-07).
-    ///
-    /// Same overflow/oversize detection as [`KvCache::try_new`], sized for
-    /// 2-byte (`f16`) elements rather than 4-byte (`f32`) ones, and — since
-    /// the wave-3 verifier review — the same real-allocator-failure
-    /// detection: this builds its buffers via [`try_alloc_zeroed`] rather
-    /// than delegating to [`KvCache::new_sparse`], whose plain `vec![]`
-    /// would abort the process on an `Err` from the allocator itself.
+    /// Fallible counterpart of [`KvCache::new_sparse`] (M-07): the same
+    /// overflow / oversize / allocator-failure detection as
+    /// [`KvCache::try_new`], sized for 2-byte (`f16`) elements.
     ///
     /// # Errors
     ///
@@ -297,208 +386,317 @@ impl KvCache {
         head_dim: usize,
         max_seq: usize,
     ) -> ModelResult<Self> {
-        let total =
-            checked_element_count(n_slots, n_kv_heads, max_seq, head_dim).ok_or_else(|| {
-                ModelError::KvAllocation {
-                    requested_bytes: None,
-                    detail: format!(
-                        "sparse: {n_slots} slots x {n_kv_heads} kv_heads x \
-                         {max_seq} max_seq_len x {head_dim} head_dim overflows usize"
-                    ),
-                }
-            })?;
-        let requested_bytes = total
-            .checked_mul(2) // keys + values
-            .and_then(|n| n.checked_mul(std::mem::size_of::<f16>()))
-            .ok_or_else(|| ModelError::KvAllocation {
-                requested_bytes: None,
-                detail: format!("sparse: {total} elements overflow a byte count"),
-            })?;
-        if requested_bytes > isize::MAX as usize {
-            return Err(ModelError::KvAllocation {
-                requested_bytes: Some(requested_bytes),
-                detail: "exceeds the largest representable allocation".to_string(),
-            });
-        }
-        let keys = try_alloc_zeroed(total, f16::ZERO, requested_bytes)?;
-        let values = try_alloc_zeroed(total, f16::ZERO, requested_bytes)?;
+        let (total, requested_bytes) = checked_geometry(
+            "sparse: ",
+            n_slots,
+            n_kv_heads,
+            max_seq,
+            head_dim,
+            std::mem::size_of::<f16>(),
+        )?;
         Ok(Self {
             num_layers: n_slots,
             num_kv_heads: n_kv_heads,
             head_dim,
             max_seq_len: max_seq,
+            capacity: max_seq,
+            bounded: false,
             seq_len: 0,
-            storage: KvStorage::Sparse { keys, values },
+            layout: KvLayout::Sparse,
+            storage: KvStorage::try_alloc(true, total, requested_bytes)?,
+            key_mirror: OnceLock::new(),
+            value_mirror: OnceLock::new(),
         })
     }
 
-    /// Whether this cache uses the half-precision, layer-sparse
-    /// representation built by [`KvCache::new_sparse`]/
-    /// [`KvCache::try_new_sparse`] (`true`) or the classic dense `f32` one
-    /// built by [`KvCache::new`]/[`KvCache::try_new`] (`false`).
-    pub fn is_sparse(&self) -> bool {
-        matches!(self.storage, KvStorage::Sparse { .. })
+    /// Build a **bounded, lazily allocated** cache (M-07 / REQUIRED #4 (4)).
+    ///
+    /// `backing` selects element type and layout:
+    ///
+    /// | backing | elements | layout |
+    /// |---|---|---|
+    /// | [`KvCacheBacking::DenseF32`] | `f32` | one slot per layer |
+    /// | [`KvCacheBacking::DenseF16`] | `f16` | one slot per layer |
+    /// | [`KvCacheBacking::SparseF16`] | `f16` | one slot per KV-bearing layer |
+    ///
+    /// `max_seq_len` is the fixed logical limit reported by
+    /// [`KvCache::max_seq_len`]; only `initial_capacity` positions (clamped
+    /// to `1..=max_seq_len`) are allocated now, and the rest on demand —
+    /// see [`KvCache::try_ensure_capacity`].
+    ///
+    /// # Errors
+    ///
+    /// [`ModelError::ShapeInvariant`] for a backing this type does not
+    /// implement (the quantized `Dense{Q8,Fp8,Q4}` tiers live in
+    /// [`crate::kv_cache_quant`]); [`ModelError::KvAllocation`] when the
+    /// limit's geometry overflows or the first allocation fails.
+    pub fn try_new_lazy(
+        backing: KvCacheBacking,
+        n_slots: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        initial_capacity: usize,
+    ) -> ModelResult<Self> {
+        let (f16_elements, layout) = match backing {
+            KvCacheBacking::DenseF32 => (false, KvLayout::Dense),
+            KvCacheBacking::DenseF16 => (true, KvLayout::Dense),
+            KvCacheBacking::SparseF16 => (true, KvLayout::Sparse),
+            other => {
+                return Err(ModelError::ShapeInvariant {
+                    tensor: "KvCache backing".to_string(),
+                    expected: "DenseF32, DenseF16 or SparseF16".to_string(),
+                    actual: format!("{other:?} (see crate::kv_cache_quant)"),
+                })
+            }
+        };
+        let element_bytes = backing.bytes_per_element();
+        // The whole limit must be representable, or growth could overflow
+        // later; checked now, without allocating it.
+        checked_geometry(
+            "lazy limit: ",
+            n_slots,
+            n_kv_heads,
+            max_seq_len,
+            head_dim,
+            element_bytes,
+        )?;
+        let capacity = initial_capacity
+            .clamp(1, max_seq_len.max(1))
+            .min(max_seq_len);
+        let (total, requested_bytes) = checked_geometry(
+            "lazy: ",
+            n_slots,
+            n_kv_heads,
+            capacity,
+            head_dim,
+            element_bytes,
+        )?;
+        Ok(Self {
+            num_layers: n_slots,
+            num_kv_heads: n_kv_heads,
+            head_dim,
+            max_seq_len,
+            capacity,
+            bounded: true,
+            seq_len: 0,
+            layout,
+            storage: KvStorage::try_alloc(f16_elements, total, requested_bytes)?,
+            key_mirror: OnceLock::new(),
+            value_mirror: OnceLock::new(),
+        })
     }
 
-    /// Grow this cache's capacity to at least `min_seq_len` positions if it
-    /// is not already that large, rounding **up** to the next multiple of
-    /// [`GROWTH_CHUNK_POSITIONS`] (M-07: "lazy growth in chunks rather than
-    /// `max_seq_len` up front") — a caller advancing one position at a time
-    /// reallocates roughly every [`GROWTH_CHUNK_POSITIONS`] tokens instead
-    /// of on every single one, and never allocates the model's full
-    /// `max_context_length` up front just because the caller *might*
-    /// eventually reach it.
+    /// Infallible, dense-`f16` counterpart of [`KvCache::try_new_lazy`] for
+    /// constructors that cannot return an error (the config-only
+    /// `BonsaiModel::new*` seams), mirroring [`KvCache::new`]'s contract: a
+    /// geometry whose *initial allocation* overflows saturates and fails in
+    /// the allocator. The limit itself is never allocated here — an absurd
+    /// limit only surfaces later, as a typed [`ModelError::KvAllocation`]
+    /// from the growth that would need it.
+    pub fn new_lazy_f16(
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        initial_capacity: usize,
+    ) -> Self {
+        let capacity = initial_capacity
+            .clamp(1, max_seq_len.max(1))
+            .min(max_seq_len);
+        let total = checked_element_count(num_layers, num_kv_heads, capacity, head_dim)
+            .unwrap_or(usize::MAX);
+        Self {
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            max_seq_len,
+            capacity,
+            bounded: true,
+            seq_len: 0,
+            layout: KvLayout::Dense,
+            storage: KvStorage::F16 {
+                keys: vec![f16::ZERO; total],
+                values: vec![f16::ZERO; total],
+            },
+            key_mirror: OnceLock::new(),
+            value_mirror: OnceLock::new(),
+        }
+    }
+
+    /// Whether this cache has one slot per KV-bearing layer of a hybrid
+    /// stack ([`KvCache::new_sparse`], [`KvCacheBacking::SparseF16`]) rather
+    /// than one per transformer layer. A layout fact — see
+    /// [`KvCache::is_f16`] for the element type.
+    pub fn is_sparse(&self) -> bool {
+        self.layout == KvLayout::Sparse
+    }
+
+    /// Whether elements are stored as `f16` (2 bytes) rather than `f32`.
+    pub fn is_f16(&self) -> bool {
+        matches!(self.storage, KvStorage::F16 { .. })
+    }
+
+    /// Whether this is a bounded, lazily allocated cache
+    /// ([`KvCache::try_new_lazy`]).
+    pub fn is_lazy(&self) -> bool {
+        self.bounded
+    }
+
+    /// The [`KvCacheBacking`] this cache implements.
+    pub fn backing(&self) -> KvCacheBacking {
+        match (self.layout, self.is_f16()) {
+            (KvLayout::Sparse, _) => KvCacheBacking::SparseF16,
+            (KvLayout::Dense, true) => KvCacheBacking::DenseF16,
+            (KvLayout::Dense, false) => KvCacheBacking::DenseF32,
+        }
+    }
+
+    /// Grow the allocation to at least `min_seq_len` positions if it is not
+    /// already that large, rounding **up** to the next multiple of
+    /// [`GROWTH_CHUNK_POSITIONS`] (and doubling once the cache is already
+    /// large) — a caller advancing one position at a time reallocates
+    /// rarely, never on every token, and never allocates its whole limit up
+    /// front just because it *might* reach it.
     ///
-    /// A no-op when `min_seq_len <= self.max_seq_len()` already. Infallible:
+    /// A no-op when `min_seq_len <= self.allocated_seq_len()`. Infallible:
     /// see [`try_ensure_capacity`](Self::try_ensure_capacity) to detect and
-    /// react to an allocation that would overflow instead of leaving the
-    /// cache at its current (smaller than requested) capacity.
+    /// react to a refused growth instead of leaving the cache unchanged.
     pub fn ensure_capacity(&mut self, min_seq_len: usize) {
-        let _ = self.try_ensure_capacity(min_seq_len);
+        if let Err(e) = self.try_ensure_capacity(min_seq_len) {
+            tracing::warn!(error = %e, min_seq_len, "KV cache growth refused");
+        }
     }
 
     /// Fallible counterpart of [`ensure_capacity`](Self::ensure_capacity).
     ///
+    /// On an eager cache (the legacy constructors) growth raises the
+    /// allocation *and* [`max_seq_len`](Self::max_seq_len), as it always
+    /// has. On a lazy cache ([`KvCache::try_new_lazy`]) `max_seq_len` is a
+    /// ceiling: growth is clamped to it and a request beyond it is refused.
+    ///
     /// # Errors
     ///
-    /// Returns [`ModelError::KvAllocation`] when the grown geometry's element or
-    /// byte count would overflow (see [`try_new`](Self::try_new)/
-    /// [`try_new_sparse`](Self::try_new_sparse)); the cache is left
-    /// completely unchanged in that case.
+    /// [`ModelError::SequenceTooLong`] when a lazy cache is asked for more
+    /// than its limit; [`ModelError::KvAllocation`] when the grown geometry
+    /// overflows or the allocator refuses it. The cache is left completely
+    /// unchanged in either case.
     pub fn try_ensure_capacity(&mut self, min_seq_len: usize) -> ModelResult<()> {
-        if min_seq_len <= self.max_seq_len {
+        if min_seq_len <= self.capacity {
             return Ok(());
         }
+        if self.bounded && min_seq_len > self.max_seq_len {
+            return Err(ModelError::SequenceTooLong {
+                seq_len: min_seq_len,
+                max_ctx: self.max_seq_len,
+            });
+        }
         let chunks = min_seq_len.div_ceil(GROWTH_CHUNK_POSITIONS).max(1);
-        // Perf minor (wave-3 review): growing by exactly one
-        // `GROWTH_CHUNK_POSITIONS`-sized chunk at a time makes `try_grow_to`'s
-        // full-copy cost O(n^2) in total bytes moved once the cache is
-        // already much larger than one chunk (a long decode loop near a
-        // large context reallocates — and re-copies everything kept so far —
-        // every `GROWTH_CHUNK_POSITIONS` tokens). Once the existing capacity
-        // dominates the chunk-rounded target, double it instead, the
-        // standard amortized-growth strategy; this only ever widens the
-        // grown size (`.max`), so `min_seq_len` is still always satisfied.
-        let new_max = chunks
+        // Growing by exactly one chunk at a time makes `try_grow_to`'s
+        // full-copy cost O(n^2) in total bytes moved once the cache is much
+        // larger than a chunk; past that point double instead (standard
+        // amortized growth). Only ever widens, so `min_seq_len` is always
+        // satisfied.
+        let mut new_capacity = chunks
             .saturating_mul(GROWTH_CHUNK_POSITIONS)
             .max(min_seq_len)
-            .max(self.max_seq_len.saturating_mul(2));
-        self.try_grow_to(new_max)
+            .max(self.capacity.saturating_mul(2));
+        if self.bounded {
+            new_capacity = new_capacity.min(self.max_seq_len);
+        }
+        self.try_grow_to(new_capacity)
     }
 
-    /// Reallocate this cache to exactly `new_max_seq_len` positions,
-    /// preserving every currently-valid position (`0..self.seq_len()`, every
-    /// layer and head) — [`self.seq_len()`](Self::seq_len) itself is
-    /// unchanged, the caller still owns advancing it. A no-op when
-    /// `new_max_seq_len <= self.max_seq_len()` (this method never shrinks;
-    /// see [`truncate`](Self::truncate)/[`clear`](Self::clear) for that).
-    /// Stays in the same storage mode it started in (a sparse-backed cache
-    /// stays sparse `f16` after growing).
+    /// Reallocate this cache to exactly `new_capacity` positions, preserving
+    /// every allocated position of every layer and head.
+    /// [`seq_len`](Self::seq_len) is unchanged — the caller still owns
+    /// advancing it. A no-op when `new_capacity <= allocated_seq_len()`
+    /// (this method never shrinks; see [`truncate`](Self::truncate) /
+    /// [`clear`](Self::clear) for the cursor). Stays in the same element
+    /// type and layout it started in.
     ///
-    /// Infallible; see [`try_grow_to`](Self::try_grow_to) for the fallible
-    /// form [`ensure_capacity`](Self::ensure_capacity) is built on.
-    pub fn grow_to(&mut self, new_max_seq_len: usize) {
-        let _ = self.try_grow_to(new_max_seq_len);
+    /// Infallible; see [`try_grow_to`](Self::try_grow_to).
+    pub fn grow_to(&mut self, new_capacity: usize) {
+        if let Err(e) = self.try_grow_to(new_capacity) {
+            tracing::warn!(error = %e, new_capacity, "KV cache growth refused");
+        }
     }
 
     /// Fallible counterpart of [`grow_to`](Self::grow_to).
     ///
+    /// Copies every **allocated** position, not only `0..seq_len`: a
+    /// batched prefill stores a whole chunk before it advances the cursor,
+    /// so a growth triggered mid-chunk must not drop the positions it has
+    /// already written.
+    ///
     /// # Errors
     ///
-    /// Returns [`ModelError::KvAllocation`] when the new geometry's element or
-    /// byte count would overflow; the cache is left completely unchanged
-    /// (the old, smaller storage is never dropped until the new one is
-    /// fully built and populated).
-    pub fn try_grow_to(&mut self, new_max_seq_len: usize) -> ModelResult<()> {
-        if new_max_seq_len <= self.max_seq_len {
+    /// [`ModelError::SequenceTooLong`] past a lazy cache's limit;
+    /// [`ModelError::KvAllocation`] when the new geometry overflows or the
+    /// allocator refuses it. The cache is left completely unchanged (the old
+    /// storage is never dropped until the new one is fully built).
+    pub fn try_grow_to(&mut self, new_capacity: usize) -> ModelResult<()> {
+        if new_capacity <= self.capacity {
             return Ok(());
         }
-        let mut grown = match &self.storage {
-            KvStorage::Dense { .. } => Self::try_new(
-                self.num_layers,
-                self.num_kv_heads,
-                self.head_dim,
-                new_max_seq_len,
-            )?,
-            KvStorage::Sparse { .. } => Self::try_new_sparse(
-                self.num_layers,
-                self.num_kv_heads,
-                self.head_dim,
-                new_max_seq_len,
-            )?,
-        };
-        let keep = self.seq_len.min(self.max_seq_len);
-        if keep > 0 {
-            // Perf minor (wave-3 review): positions `0..keep` are one
-            // contiguous run of `keep * head_dim` elements for a fixed
-            // `(layer, head)` in both the old and new storage (`cache_offset`
-            // varies `pos` fastest) — copy each run directly instead of
-            // round-tripping through `extract_block`/`inject_block`, which
-            // allocates a fresh `num_kv_heads * keep * head_dim` `Vec<f32>`
-            // pair as pure scratch space per layer (≈1.46 GB transient at
-            // the 27B sparse geometry near full context). This also removes
-            // the f16->f32->f16 round-trip `extract_block`/`inject_block`
-            // would otherwise perform on a sparse-backed cache: the element
-            // type never changes here (f32->f32 dense, f16->f16 sparse).
-            let run_len = keep * self.head_dim;
-            let num_layers = self.num_layers;
-            let num_kv_heads = self.num_kv_heads;
-            let head_dim = self.head_dim;
-            let old_max_seq_len = self.max_seq_len;
-            match (&self.storage, &mut grown.storage) {
+        if self.bounded && new_capacity > self.max_seq_len {
+            return Err(ModelError::SequenceTooLong {
+                seq_len: new_capacity,
+                max_ctx: self.max_seq_len,
+            });
+        }
+        let (total, requested_bytes) = checked_geometry(
+            "grow: ",
+            self.num_layers,
+            self.num_kv_heads,
+            new_capacity,
+            self.head_dim,
+            self.storage.element_bytes(),
+        )?;
+        let mut grown = KvStorage::try_alloc(self.is_f16(), total, requested_bytes)?;
+        // Positions `0..capacity` are one contiguous run of `capacity *
+        // head_dim` elements for a fixed `(layer, head)` in both the old and
+        // the new storage (`cache_offset` varies `pos` fastest): copy each
+        // run directly, element type unchanged (f32->f32, f16->f16).
+        let run_len = self.capacity * self.head_dim;
+        if run_len > 0 {
+            let slabs = self.num_layers * self.num_kv_heads;
+            let old_stride = run_len;
+            let new_stride = new_capacity * self.head_dim;
+            match (&self.storage, &mut grown) {
                 (
-                    KvStorage::Dense {
+                    KvStorage::F32 {
                         keys: sk,
                         values: sv,
                     },
-                    KvStorage::Dense {
+                    KvStorage::F32 {
                         keys: gk,
                         values: gv,
                     },
-                ) => {
-                    for layer in 0..num_layers {
-                        for head in 0..num_kv_heads {
-                            let old_start =
-                                (layer * num_kv_heads + head) * old_max_seq_len * head_dim;
-                            let new_start =
-                                (layer * num_kv_heads + head) * new_max_seq_len * head_dim;
-                            gk[new_start..new_start + run_len]
-                                .copy_from_slice(&sk[old_start..old_start + run_len]);
-                            gv[new_start..new_start + run_len]
-                                .copy_from_slice(&sv[old_start..old_start + run_len]);
-                        }
-                    }
-                }
+                ) => copy_runs(sk, sv, gk, gv, slabs, old_stride, new_stride, run_len),
                 (
-                    KvStorage::Sparse {
+                    KvStorage::F16 {
                         keys: sk,
                         values: sv,
                     },
-                    KvStorage::Sparse {
+                    KvStorage::F16 {
                         keys: gk,
                         values: gv,
                     },
-                ) => {
-                    for layer in 0..num_layers {
-                        for head in 0..num_kv_heads {
-                            let old_start =
-                                (layer * num_kv_heads + head) * old_max_seq_len * head_dim;
-                            let new_start =
-                                (layer * num_kv_heads + head) * new_max_seq_len * head_dim;
-                            gk[new_start..new_start + run_len]
-                                .copy_from_slice(&sk[old_start..old_start + run_len]);
-                            gv[new_start..new_start + run_len]
-                                .copy_from_slice(&sv[old_start..old_start + run_len]);
-                        }
-                    }
+                ) => copy_runs(sk, sv, gk, gv, slabs, old_stride, new_stride, run_len),
+                _ => {
+                    return Err(ModelError::Internal(
+                        "KvCache::try_grow_to: grown storage changed element type".to_string(),
+                    ))
                 }
-                _ => unreachable!(
-                    "grown was just constructed by matching self's own storage variant above"
-                ),
             }
         }
-        self.storage = grown.storage;
-        self.max_seq_len = grown.max_seq_len;
+        self.storage = grown;
+        self.drop_mirrors();
+        self.capacity = new_capacity;
+        if !self.bounded {
+            self.max_seq_len = new_capacity;
+        }
         Ok(())
     }
 
@@ -507,17 +705,30 @@ impl KvCache {
         self.seq_len
     }
 
-    /// Maximum sequence length.
+    /// **Logical** capacity: the most positions this cache may hold. Stable
+    /// on a lazy cache (sizing a context or a device-side cache from it is
+    /// safe); equal to the allocation on an eager one.
     pub fn max_seq_len(&self) -> usize {
         self.max_seq_len
     }
 
-    /// Validate a `store_key`/`store_value` call before it touches the
-    /// underlying buffers.
+    /// **Allocated** capacity: positions resident right now.
+    pub fn allocated_seq_len(&self) -> usize {
+        self.capacity
+    }
+
+    /// Validate a `store_key`/`store_value` call and make sure `pos` is
+    /// allocated (growing a lazy cache on demand).
     ///
     /// Mirrors the checks performed by [`crate::kv_cache_fp16::KvCacheFp16::store`]
     /// so both caches fail the same way for the same inputs.
-    fn validate_store(&self, layer: usize, head: usize, pos: usize, len: usize) -> ModelResult<()> {
+    fn prepare_store(
+        &mut self,
+        layer: usize,
+        head: usize,
+        pos: usize,
+        len: usize,
+    ) -> ModelResult<()> {
         if layer >= self.num_layers {
             return Err(ModelError::ShapeMismatch {
                 name: "kv_cache layer".to_string(),
@@ -545,73 +756,60 @@ impl KvCache {
                 actual: vec![len],
             });
         }
+        if pos >= self.capacity {
+            self.try_ensure_capacity(pos + 1)?;
+        }
         Ok(())
     }
 
-    /// Write `key` at `offset` in whichever storage variant is active,
-    /// converting to `f16` for [`KvStorage::Sparse`]. Caller (`try_store_key`)
-    /// has already validated `offset..offset+head_dim` is in bounds.
-    fn write_key(&mut self, offset: usize, key: &[f32]) {
+    /// Write `src` at `offset` into the key (`is_key`) or value buffer,
+    /// converting to `f16` where the storage is `f16`. The caller has
+    /// validated `offset..offset + head_dim`.
+    fn write_row(&mut self, is_key: bool, offset: usize, src: &[f32]) {
+        self.drop_mirrors();
+        let hd = self.head_dim;
         match &mut self.storage {
-            KvStorage::Dense { keys, .. } => {
-                keys[offset..offset + self.head_dim].copy_from_slice(key);
+            KvStorage::F32 { keys, values } => {
+                let dst = if is_key { keys } else { values };
+                dst[offset..offset + hd].copy_from_slice(src);
             }
-            KvStorage::Sparse { keys, .. } => {
-                for (dst, &src) in keys[offset..offset + self.head_dim].iter_mut().zip(key) {
-                    *dst = f16::from_f32(src);
+            KvStorage::F16 { keys, values } => {
+                let dst = if is_key { keys } else { values };
+                for (d, &s) in dst[offset..offset + hd].iter_mut().zip(src) {
+                    *d = f16::from_f32(s);
                 }
             }
         }
     }
 
-    /// Write `value` at `offset` — see [`write_key`](Self::write_key).
-    fn write_value(&mut self, offset: usize, value: &[f32]) {
-        match &mut self.storage {
-            KvStorage::Dense { values, .. } => {
-                values[offset..offset + self.head_dim].copy_from_slice(value);
-            }
-            KvStorage::Sparse { values, .. } => {
-                for (dst, &src) in values[offset..offset + self.head_dim].iter_mut().zip(value) {
-                    *dst = f16::from_f32(src);
-                }
-            }
-        }
-    }
-
-    /// Store a key vector for a specific layer, head, and position.
-    ///
-    /// Bounds- and shape-checked: an out-of-range `layer`/`head`/`pos`, or a
-    /// `key` whose length doesn't match `head_dim`, leaves the cache
-    /// unchanged instead of indexing past the end of the pre-allocated
-    /// buffer (which would panic even in release builds).
+    /// Store a key vector, **silently ignoring** an out-of-range call.
     ///
     /// This form exists only for source compatibility with call sites that
-    /// pre-date [`try_store_key`](Self::try_store_key) (M-26): it silently
-    /// drops the error instead of returning it, which is exactly the defect
-    /// M-26 flags. Prefer `try_store_key` for every new call site — in
-    /// particular for a sparse-backed ([`KvCache::new_sparse`]) cache, where
-    /// a dropped store loses an entire full-attention layer's KV history for
-    /// the position, not one stale row in a much larger dense cache.
+    /// pre-date [`try_store_key`](Self::try_store_key) (M-26): it drops the
+    /// error instead of returning it. Prefer `try_store_key` for every new
+    /// call site — in particular for a sparse cache, where a dropped store
+    /// loses an entire full-attention layer's history for the position.
     pub fn store_key_lossy(&mut self, layer: usize, head: usize, pos: usize, key: &[f32]) {
         let _ = self.try_store_key(layer, head, pos, key);
     }
 
-    /// Legacy spelling of [`store_key_lossy`](Self::store_key_lossy).
-    ///
-    /// Kept only so call sites that pre-date the rename keep compiling; it
-    /// has the same error-swallowing behaviour and the same warning. New
-    /// code uses [`try_store_key`](Self::try_store_key).
+    /// Legacy spelling of [`store_key_lossy`](Self::store_key_lossy), kept
+    /// only so call sites that pre-date the rename keep compiling; same
+    /// error-swallowing behaviour. New code uses
+    /// [`try_store_key`](Self::try_store_key).
     pub fn store_key(&mut self, layer: usize, head: usize, pos: usize, key: &[f32]) {
         self.store_key_lossy(layer, head, pos, key);
     }
 
-    /// Fallible counterpart of [`store_key`](Self::store_key).
+    /// Store a key vector for `(layer, head, pos)`, growing a lazy cache's
+    /// allocation when `pos` is past it.
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::ShapeMismatch`] for an out-of-range `layer`,
-    /// `head`, or a `key` length that doesn't match `head_dim`; returns
-    /// [`ModelError::SequenceTooLong`] when `pos >= max_seq_len`.
+    /// [`ModelError::ShapeMismatch`] for an out-of-range `layer`, `head`, or
+    /// a `key` length that doesn't match `head_dim`;
+    /// [`ModelError::SequenceTooLong`] when `pos >= max_seq_len`;
+    /// [`ModelError::KvAllocation`] when the on-demand growth fails.
     pub fn try_store_key(
         &mut self,
         layer: usize,
@@ -619,33 +817,29 @@ impl KvCache {
         pos: usize,
         key: &[f32],
     ) -> ModelResult<()> {
-        self.validate_store(layer, head, pos, key.len())?;
+        self.prepare_store(layer, head, pos, key.len())?;
         let offset = self.cache_offset(layer, head, pos);
-        self.write_key(offset, key);
+        self.write_row(true, offset, key);
         Ok(())
     }
 
-    /// Store a value vector for a specific layer, head, and position.
-    ///
-    /// See [`store_key`](Self::store_key) for the bounds-checking contract
-    /// and the M-26 compatibility note; out-of-range calls are silently
-    /// ignored rather than panicking or returning an error.
+    /// Store a value vector, silently ignoring an out-of-range call — see
+    /// [`store_key_lossy`](Self::store_key_lossy).
     pub fn store_value_lossy(&mut self, layer: usize, head: usize, pos: usize, value: &[f32]) {
         let _ = self.try_store_value(layer, head, pos, value);
     }
 
     /// Legacy spelling of [`store_value_lossy`](Self::store_value_lossy).
-    ///
-    /// Kept only so call sites that pre-date the rename keep compiling.
     pub fn store_value(&mut self, layer: usize, head: usize, pos: usize, value: &[f32]) {
         self.store_value_lossy(layer, head, pos, value);
     }
 
-    /// Fallible counterpart of [`store_value`](Self::store_value).
+    /// Fallible value store; same contract as
+    /// [`try_store_key`](Self::try_store_key).
     ///
     /// # Errors
     ///
-    /// Same error contract as [`try_store_key`](Self::try_store_key).
+    /// As [`try_store_key`](Self::try_store_key).
     pub fn try_store_value(
         &mut self,
         layer: usize,
@@ -653,111 +847,120 @@ impl KvCache {
         pos: usize,
         value: &[f32],
     ) -> ModelResult<()> {
-        self.validate_store(layer, head, pos, value.len())?;
+        self.prepare_store(layer, head, pos, value.len())?;
         let offset = self.cache_offset(layer, head, pos);
-        self.write_value(offset, value);
+        self.write_row(false, offset, value);
         Ok(())
     }
 
-    /// Get all cached keys for a layer and head up to `seq_len`, borrowed
-    /// zero-copy.
+    /// Drop the `f16` read-back mirrors (every write and every growth calls
+    /// this). Free when they were never built.
+    fn drop_mirrors(&mut self) {
+        self.key_mirror.take();
+        self.value_mirror.take();
+    }
+
+    /// Rows `0..seq_len` of the key or value buffer of `(layer, head)`.
     ///
-    /// Returns a slice of [seq_len × head_dim] in row-major order.
+    /// `seq_len` is clamped to the allocated capacity: rows past the
+    /// allocation were never stored, and are not fabricated. An out-of-range
+    /// `layer`/`head` yields an empty slice rather than a panic.
+    fn rows(&self, is_key: bool, layer: usize, head: usize, seq_len: usize) -> &[f32] {
+        if layer >= self.num_layers || head >= self.num_kv_heads {
+            return &[];
+        }
+        let hd = self.head_dim;
+        let start = self.cache_offset(layer, head, 0);
+        let end = start + seq_len.min(self.capacity) * hd;
+        match &self.storage {
+            KvStorage::F32 { keys, values } => {
+                let src = if is_key { keys } else { values };
+                &src[start..end]
+            }
+            KvStorage::F16 { keys, values } => {
+                let (src, mirror) = if is_key {
+                    (keys, &self.key_mirror)
+                } else {
+                    (values, &self.value_mirror)
+                };
+                let widened = mirror.get_or_init(|| src.iter().map(|h| h.to_f32()).collect());
+                &widened[start..end]
+            }
+        }
+    }
+
+    /// Cached keys of `(layer, head)` for positions `0..seq_len`,
+    /// `[seq_len × head_dim]` row-major (`seq_len` clamped to the
+    /// allocation).
     ///
-    /// # Sparse-backed caches
-    ///
-    /// A cache built by [`KvCache::new_sparse`]/[`KvCache::try_new_sparse`]
-    /// stores `f16` elements, so a zero-copy `&[f32]` view of its contents
-    /// does not exist. Calling this method on a sparse-backed cache returns
-    /// an **empty slice** rather than the real (non-empty) data — use
-    /// [`keys_for_owned`](Self::keys_for_owned) instead, which works
-    /// correctly for either storage mode. Check [`is_sparse`](Self::is_sparse)
-    /// if a call site cannot otherwise know which mode it holds.
-    ///
-    /// # Debug-build trap (verifier B2-12 wave-3 review)
-    ///
-    /// `keys_for`/`values_for` are live production accessors on the CPU
-    /// attention path ([`crate::block::functions::compute_gqa_attention`],
-    /// not owned by this package) — handing them a sparse-backed cache
-    /// silently returns an empty history instead of an error, which reads to
-    /// the caller as "no tokens cached yet" rather than "wrong accessor for
-    /// this storage mode", and attention over that empty history produces
-    /// plausible-looking garbage instead of a loud failure. In a
-    /// `debug_assertions`-enabled build (any ordinary `cargo build`/`cargo
-    /// run`, and any out-of-crate caller's own test suite) that mistake now
-    /// panics instead. `#[cfg(not(test))]` keeps this crate's *own* unit
-    /// test — [`sparse_keys_for_and_values_for_return_empty_slice_not_wrong_data`],
-    /// which deliberately exercises this exact call to pin the documented
-    /// empty-slice return contract — passing rather than panicking: `cfg(test)`
-    /// is set for this entire crate while it is compiled as its own test
-    /// target, so the gate disappears only there, never for `tests/*.rs`,
-    /// doctests, examples, or any other crate that depends on this one.
-    /// Written as `!self.is_sparse()` rather than a literal `false` so the
-    /// condition is not constant — a constant condition trips this
-    /// workspace's own `-D warnings` gate via `clippy::assertions_on_constants`.
+    /// Zero-copy for an `f32` cache. For an `f16` cache the rows come from
+    /// the `f32` read-back mirror (see the module docs): exact, since every
+    /// `f16` value is representable in `f32`, and built at most once between
+    /// writes. Hot paths use [`attend_group`](Self::attend_group) instead,
+    /// which reads either storage in place.
     pub fn keys_for(&self, layer: usize, head: usize, seq_len: usize) -> &[f32] {
-        #[cfg(not(test))]
-        debug_assert!(
-            !self.is_sparse(),
-            "keys_for cannot serve a sparse (f16) cache; use keys_for_owned"
-        );
-        match &self.storage {
-            KvStorage::Dense { keys, .. } => {
-                let start = self.cache_offset(layer, head, 0);
-                let end = start + seq_len * self.head_dim;
-                &keys[start..end]
-            }
-            KvStorage::Sparse { .. } => &[],
-        }
+        self.rows(true, layer, head, seq_len)
     }
 
-    /// Get all cached values for a layer and head up to `seq_len`, borrowed
-    /// zero-copy. See [`keys_for`](Self::keys_for) for the sparse-mode caveat
-    /// and its debug-build trap.
+    /// Cached values of `(layer, head)` for positions `0..seq_len`. See
+    /// [`keys_for`](Self::keys_for).
     pub fn values_for(&self, layer: usize, head: usize, seq_len: usize) -> &[f32] {
-        #[cfg(not(test))]
-        debug_assert!(
-            !self.is_sparse(),
-            "values_for cannot serve a sparse (f16) cache; use values_for_owned"
-        );
-        match &self.storage {
-            KvStorage::Dense { values, .. } => {
-                let start = self.cache_offset(layer, head, 0);
-                let end = start + seq_len * self.head_dim;
-                &values[start..end]
-            }
-            KvStorage::Sparse { .. } => &[],
-        }
+        self.rows(false, layer, head, seq_len)
     }
 
-    /// Get all cached keys for a layer and head up to `seq_len`, as an owned,
-    /// `f32`-dequantized buffer — works for both [`KvStorage::Dense`] (a
-    /// copy of the same data [`keys_for`](Self::keys_for) borrows) and
-    /// [`KvStorage::Sparse`] (an `f16 -> f32` conversion), unlike
-    /// `keys_for`, which cannot serve the sparse case zero-copy.
+    /// Gather the key rows at `positions` of `(layer, head)` into one owned
+    /// `[positions.len() × head_dim]` buffer — only those rows are read (and,
+    /// for an `f16` cache, widened), which is what a windowed attention
+    /// needs. Never-allocated positions read as zeros; an out-of-range
+    /// `layer`/`head` yields zeros too.
+    pub fn gather_keys(&self, layer: usize, head: usize, positions: &[usize]) -> Vec<f32> {
+        self.gather(true, layer, head, positions)
+    }
+
+    /// Value counterpart of [`gather_keys`](Self::gather_keys).
+    pub fn gather_values(&self, layer: usize, head: usize, positions: &[usize]) -> Vec<f32> {
+        self.gather(false, layer, head, positions)
+    }
+
+    fn gather(&self, is_key: bool, layer: usize, head: usize, positions: &[usize]) -> Vec<f32> {
+        let hd = self.head_dim;
+        let mut out = vec![0.0f32; positions.len() * hd];
+        if layer >= self.num_layers || head >= self.num_kv_heads {
+            return out;
+        }
+        for (dst, &pos) in out.chunks_exact_mut(hd.max(1)).zip(positions) {
+            if pos >= self.capacity {
+                continue;
+            }
+            let src = self.cache_offset(layer, head, pos);
+            match &self.storage {
+                KvStorage::F32 { keys, values } => {
+                    let buf = if is_key { keys } else { values };
+                    dst.copy_from_slice(&buf[src..src + hd]);
+                }
+                KvStorage::F16 { keys, values } => {
+                    let buf = if is_key { keys } else { values };
+                    for (d, s) in dst.iter_mut().zip(&buf[src..src + hd]) {
+                        *d = s.to_f32();
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Cached keys of `(layer, head)` for positions `0..seq_len` as an owned
+    /// buffer, widened row by row for an `f16` cache (no whole-buffer
+    /// mirror); `seq_len` is clamped to the allocation.
     pub fn keys_for_owned(&self, layer: usize, head: usize, seq_len: usize) -> Vec<f32> {
-        match &self.storage {
-            KvStorage::Dense { .. } => self.keys_for(layer, head, seq_len).to_vec(),
-            KvStorage::Sparse { keys, .. } => {
-                let start = self.cache_offset(layer, head, 0);
-                let end = start + seq_len * self.head_dim;
-                keys[start..end].iter().map(|h| h.to_f32()).collect()
-            }
-        }
+        let rows: Vec<usize> = (0..seq_len.min(self.capacity)).collect();
+        self.gather(true, layer, head, &rows)
     }
 
-    /// Get all cached values for a layer and head up to `seq_len`, as an
-    /// owned, `f32`-dequantized buffer. See
-    /// [`keys_for_owned`](Self::keys_for_owned).
+    /// Value counterpart of [`keys_for_owned`](Self::keys_for_owned).
     pub fn values_for_owned(&self, layer: usize, head: usize, seq_len: usize) -> Vec<f32> {
-        match &self.storage {
-            KvStorage::Dense { .. } => self.values_for(layer, head, seq_len).to_vec(),
-            KvStorage::Sparse { values, .. } => {
-                let start = self.cache_offset(layer, head, 0);
-                let end = start + seq_len * self.head_dim;
-                values[start..end].iter().map(|h| h.to_f32()).collect()
-            }
-        }
+        let rows: Vec<usize> = (0..seq_len.min(self.capacity)).collect();
+        self.gather(false, layer, head, &rows)
     }
 
     /// Advance the sequence position by one token.
@@ -765,10 +968,10 @@ impl KvCache {
         self.seq_len += 1;
     }
 
-    /// Reset the cache (clear all stored KV pairs).
+    /// Reset the cache cursor (clear all stored KV pairs). The allocation is
+    /// kept, so the next sequence re-grows nothing it already reached.
     pub fn clear(&mut self) {
         self.seq_len = 0;
-        // Optionally zero out for security, but not required for correctness
     }
 
     /// Roll the cache cursor back to `new_len`, logically discarding all cached
@@ -781,34 +984,36 @@ impl KvCache {
         }
     }
 
-    /// Compute flat offset into cache arrays.
+    /// Compute flat offset into the storage (the stride is the allocated
+    /// capacity, not the logical limit).
     fn cache_offset(&self, layer: usize, head: usize, pos: usize) -> usize {
-        ((layer * self.num_kv_heads + head) * self.max_seq_len + pos) * self.head_dim
+        ((layer * self.num_kv_heads + head) * self.capacity + pos) * self.head_dim
     }
 
-    /// Total memory used by this cache in bytes.
-    ///
-    /// Honest about the active storage width: 4 bytes/element for a dense
-    /// (`f32`) cache, 2 bytes/element for a sparse (`f16`) one (M-07) — see
-    /// [`KvStorage::memory_bytes`].
+    /// Bytes resident right now (the allocation, honest about the element
+    /// width: 4 bytes/element for `f32`, 2 for `f16`).
     pub fn memory_bytes(&self) -> usize {
         self.storage.memory_bytes()
     }
 
-    // `utilization_ratio` (M-19): removed. It had zero production callers —
-    // only its own tests and the identically-named, equally-uncalled sibling
-    // on `PagedKvCache` — and `pub(crate)` (the finding's other suggested
-    // fix) turns it into a hard `-D warnings` `dead_code` build failure under
-    // this crate's own `--all-targets` gate (verified: `cargo clippy -p
-    // oxibonsai-model --all-features --all-targets -- -D warnings` fails
-    // with "method `utilization_ratio` is never used" for exactly this
-    // reason, since the `#[cfg(test)]` callers do not exist in the plain
-    // `--lib` compilation unit `--all-targets` also builds). Re-add it
-    // (trivial: `seq_len as f64 / max_seq_len as f64`, clamped to 0.0 when
-    // `max_seq_len == 0`) if a real consumer — e.g. an admin/metrics
-    // endpoint reporting live KV pressure — needs it.
+    /// Bytes this cache would hold at its full logical limit.
+    pub fn max_memory_bytes(&self) -> usize {
+        checked_element_count(
+            self.num_layers,
+            self.num_kv_heads,
+            self.max_seq_len,
+            self.head_dim,
+        )
+        .and_then(|n| n.checked_mul(2 * self.storage.element_bytes()))
+        .unwrap_or(usize::MAX)
+    }
 
-    /// Number of layers in this cache.
+    // `utilization_ratio` (M-19): removed — zero production callers, and
+    // `pub(crate)` fails this crate's `-D warnings --all-targets` gate via
+    // `dead_code`. Re-add it (`seq_len / max_seq_len`) if a real consumer
+    // (e.g. an admin endpoint reporting live KV pressure) needs it.
+
+    /// Number of layers (dense) or KV slots (sparse) in this cache.
     pub fn num_layers(&self) -> usize {
         self.num_layers
     }
@@ -844,54 +1049,47 @@ impl KvCache {
     ///
     /// Mirrors the layout used by [`crate::prefix_cache::CacheBlock`].
     ///
-    /// Returns `(keys, values)`. If the requested range exceeds
-    /// `max_seq_len`, the trailing positions are returned as zeros.
-    ///
-    /// Works for either storage mode: a sparse-backed cache dequantizes
-    /// `f16 -> f32` into the returned owned buffers, unlike
-    /// [`keys_for`](Self::keys_for)/[`values_for`](Self::values_for).
+    /// Returns `(keys, values)`. Positions past the allocation (never
+    /// stored) read as zeros; so does an out-of-range `layer`.
     pub fn extract_block(
         &self,
         layer: usize,
         start_pos: usize,
         block_size: usize,
     ) -> (Vec<f32>, Vec<f32>) {
-        debug_assert!(layer < self.num_layers);
-        let per_layer = self.num_kv_heads * block_size * self.head_dim;
+        let hd = self.head_dim;
+        let per_layer = self.num_kv_heads * block_size * hd;
         let mut keys = vec![0.0f32; per_layer];
         let mut values = vec![0.0f32; per_layer];
-
+        if layer >= self.num_layers {
+            return (keys, values);
+        }
         for head in 0..self.num_kv_heads {
             for off in 0..block_size {
                 let pos = start_pos + off;
-                if pos >= self.max_seq_len {
+                if pos >= self.capacity {
                     continue;
                 }
                 let src = self.cache_offset(layer, head, pos);
-                let dst = (head * block_size + off) * self.head_dim;
+                let dst = (head * block_size + off) * hd;
                 match &self.storage {
-                    KvStorage::Dense {
+                    KvStorage::F32 {
                         keys: src_keys,
                         values: src_values,
                     } => {
-                        keys[dst..dst + self.head_dim]
-                            .copy_from_slice(&src_keys[src..src + self.head_dim]);
-                        values[dst..dst + self.head_dim]
-                            .copy_from_slice(&src_values[src..src + self.head_dim]);
+                        keys[dst..dst + hd].copy_from_slice(&src_keys[src..src + hd]);
+                        values[dst..dst + hd].copy_from_slice(&src_values[src..src + hd]);
                     }
-                    KvStorage::Sparse {
+                    KvStorage::F16 {
                         keys: src_keys,
                         values: src_values,
                     } => {
-                        for (d, s) in keys[dst..dst + self.head_dim]
-                            .iter_mut()
-                            .zip(&src_keys[src..src + self.head_dim])
-                        {
+                        for (d, s) in keys[dst..dst + hd].iter_mut().zip(&src_keys[src..src + hd]) {
                             *d = s.to_f32();
                         }
-                        for (d, s) in values[dst..dst + self.head_dim]
+                        for (d, s) in values[dst..dst + hd]
                             .iter_mut()
-                            .zip(&src_values[src..src + self.head_dim])
+                            .zip(&src_values[src..src + hd])
                         {
                             *d = s.to_f32();
                         }
@@ -899,22 +1097,68 @@ impl KvCache {
                 }
             }
         }
-
         (keys, values)
     }
 
-    /// Inject a previously extracted block back into the cache for a single layer.
+    /// Inject a previously extracted block back into the cache for a single
+    /// layer, growing a lazy cache's allocation to cover it.
     ///
-    /// `keys` and `values` must have the same `[head][pos_in_block][dim]`
-    /// layout produced by [`extract_block`](Self::extract_block); they are
-    /// expected to be of length `num_kv_heads * block_size * head_dim`.
-    /// Positions outside `max_seq_len` are silently skipped.
+    /// `keys` and `values` must have the `[head][pos_in_block][dim]` layout
+    /// produced by [`extract_block`](Self::extract_block), of length
+    /// `num_kv_heads * block_size * head_dim`.
     ///
-    /// Works for either storage mode: on a sparse-backed cache the injected
-    /// `f32` values are quantized to `f16` on the way in, via the same
-    /// [`write_key`](Self::write_key)/[`write_value`](Self::write_value)
-    /// helpers [`try_store_key`](Self::try_store_key)/
-    /// [`try_store_value`](Self::try_store_value) use.
+    /// # Errors
+    ///
+    /// [`ModelError::ShapeMismatch`] for an out-of-range `layer` or wrongly
+    /// sized `keys`/`values`; [`ModelError::KvAllocation`] when the growth
+    /// fails. Positions at or past [`max_seq_len`](Self::max_seq_len) are
+    /// skipped (the block straddles the end of the context).
+    pub fn try_inject_block(
+        &mut self,
+        layer: usize,
+        start_pos: usize,
+        block_size: usize,
+        keys: &[f32],
+        values: &[f32],
+    ) -> ModelResult<()> {
+        let hd = self.head_dim;
+        let per_layer = self.num_kv_heads * block_size * hd;
+        if layer >= self.num_layers {
+            return Err(ModelError::ShapeMismatch {
+                name: "kv_cache inject layer".to_string(),
+                expected: vec![self.num_layers],
+                actual: vec![layer],
+            });
+        }
+        if keys.len() != per_layer || values.len() != per_layer {
+            return Err(ModelError::ShapeMismatch {
+                name: "kv_cache inject block".to_string(),
+                expected: vec![per_layer],
+                actual: vec![keys.len(), values.len()],
+            });
+        }
+        let end = start_pos.saturating_add(block_size).min(self.max_seq_len);
+        if end > self.capacity {
+            self.try_ensure_capacity(end)?;
+        }
+        for head in 0..self.num_kv_heads {
+            for off in 0..block_size {
+                let pos = start_pos + off;
+                if pos >= self.max_seq_len {
+                    continue;
+                }
+                let src = (head * block_size + off) * hd;
+                let dst = self.cache_offset(layer, head, pos);
+                self.write_row(true, dst, &keys[src..src + hd]);
+                self.write_row(false, dst, &values[src..src + hd]);
+            }
+        }
+        Ok(())
+    }
+
+    /// Infallible form of [`try_inject_block`](Self::try_inject_block) (the
+    /// prefix cache's historical API): a rejected injection is logged at
+    /// `warn` and leaves the cache unchanged.
     pub fn inject_block(
         &mut self,
         layer: usize,
@@ -923,1086 +1167,30 @@ impl KvCache {
         keys: &[f32],
         values: &[f32],
     ) {
-        debug_assert!(layer < self.num_layers);
-        let per_layer = self.num_kv_heads * block_size * self.head_dim;
-        debug_assert_eq!(keys.len(), per_layer);
-        debug_assert_eq!(values.len(), per_layer);
-
-        for head in 0..self.num_kv_heads {
-            for off in 0..block_size {
-                let pos = start_pos + off;
-                if pos >= self.max_seq_len {
-                    continue;
-                }
-                let src = (head * block_size + off) * self.head_dim;
-                let dst = self.cache_offset(layer, head, pos);
-                self.write_key(dst, &keys[src..src + self.head_dim]);
-                self.write_value(dst, &values[src..src + self.head_dim]);
-            }
+        if let Err(e) = self.try_inject_block(layer, start_pos, block_size, keys, values) {
+            tracing::warn!(error = %e, layer, start_pos, block_size, "KV block injection refused");
         }
     }
 }
 
-/// Selects which concrete backing a [`crate::model::BonsaiModel`] should
-/// build/use for its KV cache (RT-14 / M-13).
-///
-/// This is the data half of the "ideal fix" the M-13/RT-14 verifier
-/// correction describes: the sibling `oxibonsai-runtime` crate's
-/// `kv_cache_policy` module (not a dependency of this crate, so named here
-/// only in prose, not as a doc link) has a `KvCachePolicy` whose
-/// `observe`/`with_action`/`set_action` already fire a real callback on
-/// every genuine tier transition (see that module's docs) — what is still
-/// missing is a `BonsaiModel::set_kv_backing(&mut self, backing:
-/// KvCacheBacking)` seam for that callback to call, which would require
-/// changing the block-forward signature across `block/types/forward.rs`,
-/// `forward_metal.rs` and `forward_cuda/*` (none of which this package
-/// owns) — precisely the cost the verifier's correction identifies as the
-/// blocker, agreeing with the option-2 ("this is real work, not a one-line
-/// wire-up") framing over pretending a partial wire-up is the real fix.
-/// `oxibonsai_runtime::kv_cache_policy` implements `From<KvCacheLevel> for
-/// KvCacheBacking` so that, once such a seam exists, wiring it is exactly
-/// `policy.set_action(move |level| model.set_kv_backing(level.into()))`.
-///
-/// Variants mirror that crate's `KvCacheLevel`'s four pressure-driven tiers
-/// 1:1 (`Fp16`/`Q8`/`Fp8`/`Q4`, each `Dense*`
-/// because every existing standalone implementation of that tier —
-/// [`KvCacheFp16`](crate::kv_cache_fp16::KvCacheFp16),
-/// [`kv_cache_quant::QuantizedKvCache`](crate::kv_cache_quant::QuantizedKvCache),
-/// [`kv_cache_quant::Fp8KvCache`](crate::kv_cache_quant::Fp8KvCache) — is
-/// dense), plus the two variants a *dynamic* precision policy cannot
-/// recommend because they are load-time, architecture-driven facts rather
-/// than pressure-driven choices: [`Self::DenseF32`] (today's actual
-/// baseline, one tier *above* the policy's own `Fp16` baseline) and
-/// [`Self::SparseF16`] (M-07 — only reachable for a hybrid model, which
-/// `KvCacheLevel` has no notion of). `is_sparse`/precision are therefore
-/// deliberately coupled one level too coarsely for a hybrid model running a
-/// *dynamically re-quantized sparse* cache to be representable — that
-/// combination does not exist anywhere in this codebase yet either, so
-/// `KvCacheBacking` does not claim to model it; widen this enum (or split it
-/// into an orthogonal `{layout, precision}` pair) when it does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum KvCacheBacking {
-    /// Dense `f32` storage for every transformer layer — [`KvCache::new`] /
-    /// [`KvCache::try_new`]. The only backing `BonsaiModel` actually builds
-    /// today for a non-hybrid model.
-    DenseF32,
-    /// Dense, `f16`-per-element storage — half the memory of
-    /// [`Self::DenseF32`] at equal geometry. Mirrors
-    /// `KvCacheLevel::Fp16`.
-    DenseF16,
-    /// Dense, INT8-quantized storage. Mirrors `KvCacheLevel::Q8`.
-    DenseQ8,
-    /// Dense, FP8-quantized storage. Mirrors `KvCacheLevel::Fp8`.
-    DenseFp8,
-    /// Dense, INT4-quantized storage. Mirrors `KvCacheLevel::Q4`.
-    DenseQ4,
-    /// Sparse storage: only the KV-bearing layers, `f16` per element —
-    /// [`KvCache::new_sparse`] / [`KvCache::try_new_sparse`] (M-07). The
-    /// backing a hybrid model (Bonsai 2) needs; not reachable from
-    /// [`From<KvCacheLevel>`](#impl-From<KvCacheLevel>-for-KvCacheBacking)
-    /// since the policy has no notion of "this model is hybrid".
-    SparseF16,
-}
-
-impl KvCacheBacking {
-    /// Bytes per **code** element this backing stores — `f32`/`f16` are
-    /// exact (no separate scale exists); `Q8`/`Fp8`/`Q4` report their code
-    /// width only (1, 1, and 1-rounded-up-from-0.5 bytes respectively) and
-    /// omit each format's shared per-block scale, which is amortized across
-    /// many elements rather than a fixed per-element cost.
-    pub const fn bytes_per_element(self) -> usize {
-        match self {
-            Self::DenseF32 => std::mem::size_of::<f32>(),
-            Self::DenseF16 | Self::SparseF16 => std::mem::size_of::<f16>(),
-            Self::DenseQ8 | Self::DenseFp8 | Self::DenseQ4 => 1,
-        }
-    }
-
-    /// Whether this backing allocates only the KV-bearing layers
-    /// ([`Self::SparseF16`]) rather than every transformer layer.
-    pub const fn is_sparse(self) -> bool {
-        matches!(self, Self::SparseF16)
-    }
-}
-
-// ──────────────────────────────────────────────────────────────────
-// Paged KV Cache
-// ──────────────────────────────────────────────────────────────────
-
-/// Default number of positions per page.
-const DEFAULT_PAGE_SIZE: usize = 256;
-
-/// A single page in the paged KV cache.
-///
-/// Each page holds `page_size` positions worth of key and value data
-/// for a single layer and head.
-#[derive(Debug, Clone)]
-struct KvPage {
-    /// Key data: [page_size * head_dim] floats.
-    keys: Vec<f32>,
-    /// Value data: [page_size * head_dim] floats.
-    values: Vec<f32>,
-    /// Number of positions actually used in this page.
-    used: usize,
-}
-
-impl KvPage {
-    fn new(page_size: usize, head_dim: usize) -> Self {
-        Self {
-            keys: vec![0.0; page_size * head_dim],
-            values: vec![0.0; page_size * head_dim],
-            used: 0,
-        }
-    }
-}
-
-/// Page-based KV cache for memory-efficient allocation.
-///
-/// Instead of pre-allocating the full `max_seq_len` contiguously,
-/// pages of `page_size` positions are allocated on demand. This is
-/// beneficial when the actual sequence length is much shorter than
-/// `max_seq_len`.
-///
-/// **Experimental.** `BonsaiModel` never builds this type — it holds a
-/// single, always-dense [`KvCache`] (or, since M-07, [`KvCache::new_sparse`]
-/// for a hybrid model) — so nothing here is on a production forward path
-/// today. Implemented: lazy per-page allocation, `store_key`/`store_value`/
-/// `keys_for`/`values_for`, utilization accounting. **Not** implemented:
-/// PagedAttention's actual GPU/kernel-side benefit (a fused attention kernel
-/// that reads pages directly) and eviction/preemption — this is the
-/// primitive-only building block, not a wired-up PagedAttention scheduler
-/// (README.md's "Known Limitations" documents this as shipped-but-unwired,
-/// not advertised-but-missing). A second, more elaborate PagedAttention/vLLM
-/// -style implementation with its own `BlockPool`/`BlockTable`/`KvPage`
-/// lives in [`crate::paged_kv_cache`] under the *same* type name
-/// `PagedKvCache` — the two are unrelated and neither is a re-export of the
-/// other; do not conflate them when reading call sites. The real plan for
-/// either to become selectable lives with the M-13/RT-14 `KvCacheBacking`
-/// work (see [`KvCacheBacking`]): wire behind a bit-exactness parity test
-/// against the dense `KvCache` before either becomes reachable from
-/// `BonsaiModel`.
-#[derive(Debug)]
-pub struct PagedKvCache {
-    /// Pages indexed as [layer][head][page_index].
-    pages: Vec<Vec<Vec<KvPage>>>,
-    /// Number of transformer layers.
-    num_layers: usize,
-    /// Number of KV heads per layer.
-    num_kv_heads: usize,
-    /// Dimension per head.
-    head_dim: usize,
-    /// Positions per page.
-    page_size: usize,
-    /// Maximum sequence length (total capacity).
-    max_seq_len: usize,
-    /// Current sequence length.
-    seq_len: usize,
-}
-
-impl PagedKvCache {
-    /// Create a new paged KV cache.
-    ///
-    /// Pages are allocated lazily as positions are stored.
-    pub fn new(
-        num_layers: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-    ) -> Self {
-        Self::with_page_size(
-            num_layers,
-            num_kv_heads,
-            head_dim,
-            max_seq_len,
-            DEFAULT_PAGE_SIZE,
-        )
-    }
-
-    /// Create a new paged KV cache with a custom page size.
-    pub fn with_page_size(
-        num_layers: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-        page_size: usize,
-    ) -> Self {
-        let pages = (0..num_layers)
-            .map(|_| (0..num_kv_heads).map(|_| Vec::new()).collect())
-            .collect();
-
-        Self {
-            pages,
-            num_layers,
-            num_kv_heads,
-            head_dim,
-            page_size,
-            max_seq_len,
-            seq_len: 0,
-        }
-    }
-
-    /// Store a key vector for a specific layer, head, and position.
-    pub fn store_key(&mut self, layer: usize, head: usize, pos: usize, key: &[f32]) {
-        debug_assert!(layer < self.num_layers);
-        debug_assert!(head < self.num_kv_heads);
-        debug_assert!(pos < self.max_seq_len);
-        debug_assert_eq!(key.len(), self.head_dim);
-
-        let page_idx = pos / self.page_size;
-        let offset_in_page = pos % self.page_size;
-
-        self.ensure_page(layer, head, page_idx);
-
-        let page = &mut self.pages[layer][head][page_idx];
-        let start = offset_in_page * self.head_dim;
-        page.keys[start..start + self.head_dim].copy_from_slice(key);
-        if offset_in_page >= page.used {
-            page.used = offset_in_page + 1;
-        }
-    }
-
-    /// Store a value vector for a specific layer, head, and position.
-    pub fn store_value(&mut self, layer: usize, head: usize, pos: usize, value: &[f32]) {
-        debug_assert!(layer < self.num_layers);
-        debug_assert!(head < self.num_kv_heads);
-        debug_assert!(pos < self.max_seq_len);
-        debug_assert_eq!(value.len(), self.head_dim);
-
-        let page_idx = pos / self.page_size;
-        let offset_in_page = pos % self.page_size;
-
-        self.ensure_page(layer, head, page_idx);
-
-        let page = &mut self.pages[layer][head][page_idx];
-        let start = offset_in_page * self.head_dim;
-        page.values[start..start + self.head_dim].copy_from_slice(value);
-        if offset_in_page >= page.used {
-            page.used = offset_in_page + 1;
-        }
-    }
-
-    /// Get all cached keys for a layer and head up to `seq_len`, assembled into a contiguous buffer.
-    pub fn keys_for(&self, layer: usize, head: usize, seq_len: usize) -> Vec<f32> {
-        let mut result = Vec::with_capacity(seq_len * self.head_dim);
-        let head_pages = &self.pages[layer][head];
-
-        for pos in 0..seq_len {
-            let page_idx = pos / self.page_size;
-            let offset_in_page = pos % self.page_size;
-
-            if page_idx < head_pages.len() {
-                let page = &head_pages[page_idx];
-                let start = offset_in_page * self.head_dim;
-                result.extend_from_slice(&page.keys[start..start + self.head_dim]);
-            } else {
-                // Page not yet allocated; fill with zeros
-                result.extend(std::iter::repeat_n(0.0f32, self.head_dim));
-            }
-        }
-
-        result
-    }
-
-    /// Get all cached values for a layer and head up to `seq_len`.
-    pub fn values_for(&self, layer: usize, head: usize, seq_len: usize) -> Vec<f32> {
-        let mut result = Vec::with_capacity(seq_len * self.head_dim);
-        let head_pages = &self.pages[layer][head];
-
-        for pos in 0..seq_len {
-            let page_idx = pos / self.page_size;
-            let offset_in_page = pos % self.page_size;
-
-            if page_idx < head_pages.len() {
-                let page = &head_pages[page_idx];
-                let start = offset_in_page * self.head_dim;
-                result.extend_from_slice(&page.values[start..start + self.head_dim]);
-            } else {
-                result.extend(std::iter::repeat_n(0.0f32, self.head_dim));
-            }
-        }
-
-        result
-    }
-
-    /// Current sequence length.
-    pub fn seq_len(&self) -> usize {
-        self.seq_len
-    }
-
-    /// Advance the sequence position by one token.
-    pub fn advance(&mut self) {
-        self.seq_len += 1;
-    }
-
-    /// Reset the cache (deallocate all pages).
-    pub fn clear(&mut self) {
-        self.seq_len = 0;
-        for layer_pages in &mut self.pages {
-            for head_pages in layer_pages.iter_mut() {
-                head_pages.clear();
-            }
-        }
-    }
-
-    /// Total memory currently allocated by this cache in bytes.
-    ///
-    /// Only counts allocated pages, not the full capacity.
-    pub fn memory_usage_bytes(&self) -> usize {
-        let mut total_pages = 0usize;
-        for layer_pages in &self.pages {
-            for head_pages in layer_pages {
-                total_pages += head_pages.len();
-            }
-        }
-        // Each page has keys + values, each of page_size * head_dim floats
-        total_pages * self.page_size * self.head_dim * std::mem::size_of::<f32>() * 2
-    }
-
-    // `utilization_ratio` (M-19): removed — same reasoning as
-    // `KvCache::utilization_ratio` above (zero production callers, and
-    // `pub(crate)` fails this crate's own `-D warnings --all-targets` gate
-    // via `dead_code`, verified empirically).
-
-    /// Total number of pages allocated.
-    pub fn total_pages(&self) -> usize {
-        let mut count = 0usize;
-        for layer_pages in &self.pages {
-            for head_pages in layer_pages {
-                count += head_pages.len();
-            }
-        }
-        count
-    }
-
-    /// Page size (positions per page).
-    pub fn page_size(&self) -> usize {
-        self.page_size
-    }
-
-    /// Ensure a page exists at the given index, allocating it if needed.
-    fn ensure_page(&mut self, layer: usize, head: usize, page_idx: usize) {
-        let head_pages = &mut self.pages[layer][head];
-        while head_pages.len() <= page_idx {
-            head_pages.push(KvPage::new(self.page_size, self.head_dim));
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn store_key_out_of_range_pos_does_not_panic_and_leaves_cache_untouched() {
-        // Regression test for a release-build panic: previously the only
-        // bounds check was `debug_assert!`, which is compiled out in
-        // release, so an out-of-range `pos` computed an offset past the
-        // end of the pre-allocated `keys` Vec and panicked on the slice
-        // index. `store_key`/`store_value` must now be no-ops instead.
-        let mut cache = KvCache::new(1, 1, 4, 8);
-        cache.store_key(0, 0, 100, &[1.0, 2.0, 3.0, 4.0]);
-        cache.store_value(0, 0, 100, &[5.0, 6.0, 7.0, 8.0]);
-
-        // The cache must remain entirely zeroed: nothing was written.
-        cache.set_seq_len(8);
-        let keys = cache.keys_for(0, 0, 8);
-        let values = cache.values_for(0, 0, 8);
-        assert!(keys.iter().all(|&x| x == 0.0));
-        assert!(values.iter().all(|&x| x == 0.0));
-    }
-
-    #[test]
-    fn store_key_out_of_range_layer_head_and_bad_len_does_not_panic() {
-        let mut cache = KvCache::new(2, 2, 4, 8);
-        // Out-of-range layer, out-of-range head, and mismatched slice length
-        // must all be silently rejected rather than panicking.
-        cache.store_key(99, 0, 0, &[1.0, 2.0, 3.0, 4.0]);
-        cache.store_value(0, 99, 0, &[1.0, 2.0, 3.0, 4.0]);
-        cache.store_key(0, 0, 0, &[1.0, 2.0]); // wrong length (expects 4)
-
-        let keys = cache.keys_for(0, 0, 1);
-        assert!(keys.iter().all(|&x| x == 0.0));
-    }
-
-    #[test]
-    fn try_store_key_reports_sequence_too_long() {
-        let mut cache = KvCache::new(1, 1, 4, 8);
-        let err = cache
-            .try_store_key(0, 0, 8, &[1.0, 2.0, 3.0, 4.0])
-            .expect_err("pos == max_seq_len must be rejected");
-        match err {
-            ModelError::SequenceTooLong { seq_len, max_ctx } => {
-                assert_eq!(seq_len, 9);
-                assert_eq!(max_ctx, 8);
-            }
-            other => panic!("expected SequenceTooLong, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn try_store_value_reports_shape_mismatch_for_bad_layer_head_and_len() {
-        let mut cache = KvCache::new(2, 2, 4, 8);
-
-        let layer_err = cache
-            .try_store_value(5, 0, 0, &[0.0; 4])
-            .expect_err("out-of-range layer must be rejected");
-        assert!(matches!(layer_err, ModelError::ShapeMismatch { .. }));
-
-        let head_err = cache
-            .try_store_value(0, 5, 0, &[0.0; 4])
-            .expect_err("out-of-range head must be rejected");
-        assert!(matches!(head_err, ModelError::ShapeMismatch { .. }));
-
-        let len_err = cache
-            .try_store_value(0, 0, 0, &[0.0; 3])
-            .expect_err("wrong-length value must be rejected");
-        assert!(matches!(len_err, ModelError::ShapeMismatch { .. }));
-    }
-
-    #[test]
-    fn try_store_key_succeeds_and_is_readable() {
-        let mut cache = KvCache::new(1, 1, 4, 8);
-        cache
-            .try_store_key(0, 0, 2, &[1.0, 2.0, 3.0, 4.0])
-            .expect("in-range store must succeed");
-        cache.set_seq_len(3);
-        let keys = cache.keys_for(0, 0, 3);
-        assert_eq!(&keys[8..12], &[1.0, 2.0, 3.0, 4.0]);
-    }
-
-    #[test]
-    fn truncate_clamps_down_never_grows() {
-        let mut c = KvCache::new(1, 1, 4, 16);
-        c.set_seq_len(10);
-        c.truncate(6);
-        assert_eq!(c.seq_len(), 6);
-        // truncate past current len is a no-op
-        c.truncate(20);
-        assert_eq!(c.seq_len(), 6);
-    }
-
-    #[test]
-    fn kv_cache_store_and_retrieve() {
-        let mut cache = KvCache::new(2, 8, 128, 16);
-
-        let key = vec![1.0f32; 128];
-        let value = vec![2.0f32; 128];
-
-        cache.store_key(0, 0, 0, &key);
-        cache.store_value(0, 0, 0, &value);
-        cache.advance();
-
-        let keys = cache.keys_for(0, 0, 1);
-        let values = cache.values_for(0, 0, 1);
-
-        assert_eq!(keys.len(), 128);
-        assert_eq!(values.len(), 128);
-        assert!((keys[0] - 1.0).abs() < 1e-5);
-        assert!((values[0] - 2.0).abs() < 1e-5);
-    }
-
-    #[test]
-    fn kv_cache_multiple_positions() {
-        let mut cache = KvCache::new(1, 1, 4, 8);
-
-        cache.store_key(0, 0, 0, &[1.0, 2.0, 3.0, 4.0]);
-        cache.advance();
-        cache.store_key(0, 0, 1, &[5.0, 6.0, 7.0, 8.0]);
-        cache.advance();
-
-        let keys = cache.keys_for(0, 0, 2);
-        assert_eq!(keys.len(), 8);
-        assert!((keys[0] - 1.0).abs() < 1e-5);
-        assert!((keys[4] - 5.0).abs() < 1e-5);
-    }
-
-    #[test]
-    fn kv_cache_memory_size() {
-        let cache = KvCache::new(36, 8, 128, 4096);
-        // 36 layers * 8 heads * 4096 seq * 128 dim * 4 bytes * 2 (K+V)
-        let expected = 36 * 8 * 4096 * 128 * 4 * 2;
-        assert_eq!(cache.memory_bytes(), expected);
-    }
-
-    // `kv_cache_utilization` removed with `KvCache::utilization_ratio`
-    // itself (M-19) — see the removal note left at its former call site.
-
-    #[test]
-    fn kv_cache_policy_default() {
-        let policy = KvCachePolicy::default();
-        assert_eq!(policy, KvCachePolicy::Standard);
-    }
-
-    #[test]
-    fn kv_cache_set_seq_len_clamps_to_max() {
-        let mut cache = KvCache::new(1, 1, 4, 8);
-        cache.set_seq_len(4);
-        assert_eq!(cache.seq_len(), 4);
-        cache.set_seq_len(100);
-        assert_eq!(cache.seq_len(), 8); // clamped
-    }
-
-    #[test]
-    fn kv_cache_extract_inject_roundtrip() {
-        // Two layers, two KV heads, head_dim=4, block_size=4 → per_layer = 32 floats.
-        let num_layers = 2;
-        let num_kv_heads = 2;
-        let head_dim = 4;
-        let block_size = 4;
-        let max_seq = 16;
-        let mut cache = KvCache::new(num_layers, num_kv_heads, head_dim, max_seq);
-
-        // Populate layer 1 at positions 0..4 with deterministic key/value patterns.
-        for head in 0..num_kv_heads {
-            for pos in 0..block_size {
-                let key: Vec<f32> = (0..head_dim)
-                    .map(|d| (head as f32 + 1.0) * 100.0 + pos as f32 * 10.0 + d as f32)
-                    .collect();
-                let value: Vec<f32> = (0..head_dim)
-                    .map(|d| (head as f32 + 1.0) * 1000.0 + pos as f32 * 10.0 + d as f32)
-                    .collect();
-                cache.store_key(1, head, pos, &key);
-                cache.store_value(1, head, pos, &value);
-            }
-        }
-
-        // Extract, then inject into a fresh cache and re-extract.
-        let (k_block, v_block) = cache.extract_block(1, 0, block_size);
-        let per_layer = num_kv_heads * block_size * head_dim;
-        assert_eq!(k_block.len(), per_layer);
-        assert_eq!(v_block.len(), per_layer);
-
-        let mut fresh = KvCache::new(num_layers, num_kv_heads, head_dim, max_seq);
-        fresh.inject_block(1, 0, block_size, &k_block, &v_block);
-        fresh.set_seq_len(block_size);
-
-        let (k_block_2, v_block_2) = fresh.extract_block(1, 0, block_size);
-        assert_eq!(k_block_2, k_block);
-        assert_eq!(v_block_2, v_block);
-
-        // Re-read via keys_for / values_for to verify the position-major layout.
-        for head in 0..num_kv_heads {
-            let original_keys = cache.keys_for(1, head, block_size);
-            let restored_keys = fresh.keys_for(1, head, block_size);
-            assert_eq!(
-                original_keys, restored_keys,
-                "head {head} keys must round-trip"
-            );
-            let original_values = cache.values_for(1, head, block_size);
-            let restored_values = fresh.values_for(1, head, block_size);
-            assert_eq!(
-                original_values, restored_values,
-                "head {head} values must round-trip"
-            );
-        }
-    }
-
-    #[test]
-    fn kv_cache_extract_inject_at_offset() {
-        // Verify extract/inject behave correctly for non-zero start_pos.
-        let mut cache = KvCache::new(1, 1, 2, 16);
-        // Write a recognisable pattern at positions 4..8.
-        for pos in 0..4 {
-            let key = vec![pos as f32, pos as f32 + 0.5];
-            let value = vec![-(pos as f32), -(pos as f32) - 0.5];
-            cache.store_key(0, 0, 4 + pos, &key);
-            cache.store_value(0, 0, 4 + pos, &value);
-        }
-        let (k, v) = cache.extract_block(0, 4, 4);
-        let mut other = KvCache::new(1, 1, 2, 16);
-        other.inject_block(0, 4, 4, &k, &v);
-        for pos in 0..4 {
-            let original_k = cache.keys_for(0, 0, 8);
-            let restored_k = other.keys_for(0, 0, 8);
-            // positions 0..4 are zeros in both; positions 4..8 must match.
-            let off = (4 + pos) * 2;
-            assert!((restored_k[off] - original_k[off]).abs() < 1e-6);
-            assert!((restored_k[off + 1] - original_k[off + 1]).abs() < 1e-6);
-        }
-    }
-
-    // ── Paged KV Cache tests ──
-
-    #[test]
-    fn paged_kv_cache_store_and_retrieve() {
-        let mut cache = PagedKvCache::with_page_size(2, 1, 4, 16, 4);
-
-        let key = vec![1.0, 2.0, 3.0, 4.0];
-        let value = vec![5.0, 6.0, 7.0, 8.0];
-
-        cache.store_key(0, 0, 0, &key);
-        cache.store_value(0, 0, 0, &value);
-        cache.advance();
-
-        let keys = cache.keys_for(0, 0, 1);
-        let values = cache.values_for(0, 0, 1);
-
-        assert_eq!(keys.len(), 4);
-        assert_eq!(values.len(), 4);
-        assert!((keys[0] - 1.0).abs() < 1e-5);
-        assert!((values[0] - 5.0).abs() < 1e-5);
-    }
-
-    #[test]
-    fn paged_kv_cache_cross_page_boundary() {
-        let mut cache = PagedKvCache::with_page_size(1, 1, 4, 16, 2);
-
-        // Store in page 0 (positions 0, 1)
-        cache.store_key(0, 0, 0, &[1.0, 2.0, 3.0, 4.0]);
-        cache.store_key(0, 0, 1, &[5.0, 6.0, 7.0, 8.0]);
-        // Store in page 1 (positions 2, 3)
-        cache.store_key(0, 0, 2, &[9.0, 10.0, 11.0, 12.0]);
-
-        let keys = cache.keys_for(0, 0, 3);
-        assert_eq!(keys.len(), 12);
-        assert!((keys[0] - 1.0).abs() < 1e-5);
-        assert!((keys[4] - 5.0).abs() < 1e-5);
-        assert!((keys[8] - 9.0).abs() < 1e-5);
-    }
-
-    #[test]
-    fn paged_kv_cache_lazy_allocation() {
-        let cache = PagedKvCache::with_page_size(1, 1, 4, 1024, 256);
-        assert_eq!(cache.total_pages(), 0);
-        assert_eq!(cache.memory_usage_bytes(), 0);
-    }
-
-    #[test]
-    fn paged_kv_cache_memory_grows() {
-        let mut cache = PagedKvCache::with_page_size(1, 1, 4, 1024, 4);
-
-        assert_eq!(cache.memory_usage_bytes(), 0);
-
-        cache.store_key(0, 0, 0, &[1.0; 4]);
-        // 1 page allocated: 4 positions * 4 dims * 4 bytes * 2 (K+V)
-        let one_page_bytes = 4 * 4 * 4 * 2;
-        assert_eq!(cache.memory_usage_bytes(), one_page_bytes);
-
-        // Trigger second page allocation
-        cache.store_key(0, 0, 4, &[1.0; 4]);
-        assert_eq!(cache.memory_usage_bytes(), one_page_bytes * 2);
-    }
-
-    #[test]
-    fn paged_kv_cache_clear() {
-        let mut cache = PagedKvCache::with_page_size(1, 1, 4, 16, 4);
-        cache.store_key(0, 0, 0, &[1.0; 4]);
-        cache.advance();
-
-        assert!(cache.total_pages() > 0);
-        cache.clear();
-        assert_eq!(cache.total_pages(), 0);
-        assert_eq!(cache.seq_len(), 0);
-    }
-
-    // `paged_kv_cache_utilization` removed with `PagedKvCache::utilization_ratio`
-    // itself (M-19) — see the removal note left at its former call site.
-
-    // ── M-07: sparse (f16) KV cache ──────────────────────────────────────
-
-    /// THE gate: `new_sparse(16, ...)` for the Bonsai 2 27B geometry
-    /// (16 full-attention slots x 4 KV heads x 256 head_dim) allocates
-    /// exactly 64 KiB/token = 65_536 bytes when `max_seq == 1`.
-    #[test]
-    fn new_sparse_bonsai2_27b_geometry_is_exactly_64_kib_per_token() {
-        let cache = KvCache::new_sparse(16, 4, 256, 1);
-        assert_eq!(
-            cache.memory_bytes(),
-            65_536,
-            "16 slots x 4 kv heads x 256 head_dim x 2 (K+V) x 2 bytes (f16) must be 65536"
-        );
-        // And the per-token figure scales linearly with context length.
-        let cache_2k = KvCache::new_sparse(16, 4, 256, 2048);
-        assert_eq!(cache_2k.memory_bytes(), 65_536 * 2048);
-    }
-
-    #[test]
-    fn new_sparse_reports_slot_count_as_num_layers_and_is_sparse() {
-        let cache = KvCache::new_sparse(16, 4, 256, 4096);
-        assert_eq!(cache.num_layers(), 16);
-        assert_eq!(cache.num_kv_heads(), 4);
-        assert_eq!(cache.head_dim(), 256);
-        assert_eq!(cache.max_seq_len(), 4096);
-        assert!(cache.is_sparse());
-
-        let dense = KvCache::new(64, 4, 256, 4096);
-        assert!(!dense.is_sparse());
-    }
-
-    /// A dense cache with the *same* nominal geometry is exactly 2x the
-    /// bytes of a sparse one with the same layer/head/dim/seq numbers —
-    /// isolating the f16-vs-f32 half of the M-07 win from the
-    /// layer-count-reduction half (already covered by comparing 16 vs 64
-    /// layers in the acceptance test above).
-    #[test]
-    fn sparse_is_exactly_half_the_bytes_of_dense_at_equal_geometry() {
-        let dense = KvCache::new(16, 4, 256, 100);
-        let sparse = KvCache::new_sparse(16, 4, 256, 100);
-        assert_eq!(sparse.memory_bytes() * 2, dense.memory_bytes());
-    }
-
-    #[test]
-    fn try_new_sparse_succeeds_for_reasonable_geometry() {
-        let cache = KvCache::try_new_sparse(16, 4, 256, 8192)
-            .expect("reasonable sparse alloc must succeed");
-        assert_eq!(cache.memory_bytes(), 65_536 * 8192);
-    }
-
-    #[test]
-    fn try_new_and_try_new_sparse_reject_overflowing_geometry_instead_of_panicking() {
-        let err = KvCache::try_new(usize::MAX, usize::MAX, usize::MAX, usize::MAX)
-            .expect_err("an overflowing element count must be rejected, not panic");
-        assert!(matches!(err, ModelError::KvAllocation { .. }), "{err}");
-
-        let err = KvCache::try_new_sparse(usize::MAX, usize::MAX, usize::MAX, usize::MAX)
-            .expect_err("an overflowing sparse element count must be rejected, not panic");
-        assert!(matches!(err, ModelError::KvAllocation { .. }), "{err}");
-
-        // A count that does not overflow `usize` but whose *byte* total does
-        // (elements * 2 (K+V) * size_of::<f32>()) must also be rejected
-        // rather than reaching the allocation itself.
-        let huge_but_not_overflowing = usize::MAX / 4;
-        let err = KvCache::try_new(huge_but_not_overflowing, 1, 1, 1)
-            .expect_err("a byte count past isize::MAX must be rejected");
-        assert!(matches!(err, ModelError::KvAllocation { .. }), "{err}");
-    }
-
-    #[test]
-    fn try_new_accepts_the_same_geometry_new_would_build() {
-        let cache = KvCache::try_new(2, 4, 64, 128).expect("small geometry must succeed");
-        assert_eq!(cache.num_layers(), 2);
-        assert_eq!(
-            cache.memory_bytes(),
-            KvCache::new(2, 4, 64, 128).memory_bytes()
-        );
-    }
-
-    #[test]
-    fn sparse_keys_for_and_values_for_return_empty_slice_not_wrong_data() {
-        let mut cache = KvCache::new_sparse(1, 1, 4, 8);
-        cache
-            .try_store_key(0, 0, 0, &[1.0, 2.0, 3.0, 4.0])
-            .expect("store must succeed on a sparse cache");
-        cache.set_seq_len(1);
-        assert_eq!(
-            cache.keys_for(0, 0, 1),
-            &[] as &[f32],
-            "zero-copy keys_for cannot serve f16 storage; must return empty, not garbage"
-        );
-        assert_eq!(cache.values_for(0, 0, 1), &[] as &[f32]);
-    }
-
-    #[test]
-    fn sparse_keys_for_owned_and_values_for_owned_roundtrip() {
-        let mut cache = KvCache::new_sparse(2, 2, 4, 8);
-        let key = vec![1.0f32, -2.5, 3.25, 0.125];
-        let value = vec![-0.5f32, 6.0, -7.0, 8.5];
-        cache
-            .try_store_key(1, 1, 3, &key)
-            .expect("sparse store_key must succeed");
-        cache
-            .try_store_value(1, 1, 3, &value)
-            .expect("sparse store_value must succeed");
-        cache.set_seq_len(4);
-
-        let read_key = cache.keys_for_owned(1, 1, 4);
-        let read_value = cache.values_for_owned(1, 1, 4);
-        assert_eq!(read_key.len(), 16);
-        assert_eq!(read_value.len(), 16);
-        // f16 round-trip: exact for these values (all representable in f16).
-        for (orig, got) in key.iter().zip(&read_key[12..16]) {
-            assert!((orig - got).abs() < 1e-3, "orig={orig} got={got}");
-        }
-        for (orig, got) in value.iter().zip(&read_value[12..16]) {
-            assert!((orig - got).abs() < 1e-3, "orig={orig} got={got}");
-        }
-        // Untouched positions/heads must read back as zero.
-        assert!(read_key[0..12].iter().all(|&x| x == 0.0));
-    }
-
-    #[test]
-    fn dense_keys_for_owned_matches_keys_for() {
-        let mut cache = KvCache::new(1, 1, 4, 8);
-        cache.store_key(0, 0, 2, &[1.0, 2.0, 3.0, 4.0]);
-        cache.set_seq_len(3);
-        assert_eq!(
-            cache.keys_for(0, 0, 3),
-            cache.keys_for_owned(0, 0, 3).as_slice()
-        );
-    }
-
-    #[test]
-    fn sparse_extract_inject_roundtrip() {
-        let num_layers = 2;
-        let num_kv_heads = 2;
-        let head_dim = 4;
-        let block_size = 4;
-        let max_seq = 16;
-        let mut cache = KvCache::new_sparse(num_layers, num_kv_heads, head_dim, max_seq);
-        assert!(cache.is_sparse());
-
-        for head in 0..num_kv_heads {
-            for pos in 0..block_size {
-                let key: Vec<f32> = (0..head_dim)
-                    .map(|d| (head as f32 + 1.0) * 10.0 + pos as f32 + d as f32 * 0.25)
-                    .collect();
-                let value: Vec<f32> = (0..head_dim)
-                    .map(|d| -((head as f32 + 1.0) * 10.0 + pos as f32 + d as f32 * 0.25))
-                    .collect();
-                cache
-                    .try_store_key(1, head, pos, &key)
-                    .expect("sparse try_store_key");
-                cache
-                    .try_store_value(1, head, pos, &value)
-                    .expect("sparse try_store_value");
-            }
-        }
-
-        let (k_block, v_block) = cache.extract_block(1, 0, block_size);
-        let mut fresh = KvCache::new_sparse(num_layers, num_kv_heads, head_dim, max_seq);
-        fresh.inject_block(1, 0, block_size, &k_block, &v_block);
-        fresh.set_seq_len(block_size);
-
-        for head in 0..num_kv_heads {
-            let original = cache.keys_for_owned(1, head, block_size);
-            let restored = fresh.keys_for_owned(1, head, block_size);
-            for (o, r) in original.iter().zip(&restored) {
-                assert!((o - r).abs() < 1e-2, "head {head}: orig={o} restored={r}");
-            }
-        }
-    }
-
-    #[test]
-    fn kv_cache_backing_bytes_per_element_and_is_sparse() {
-        assert_eq!(KvCacheBacking::DenseF32.bytes_per_element(), 4);
-        assert_eq!(KvCacheBacking::DenseF16.bytes_per_element(), 2);
-        assert_eq!(KvCacheBacking::DenseQ8.bytes_per_element(), 1);
-        assert_eq!(KvCacheBacking::DenseFp8.bytes_per_element(), 1);
-        assert_eq!(KvCacheBacking::DenseQ4.bytes_per_element(), 1);
-        assert_eq!(KvCacheBacking::SparseF16.bytes_per_element(), 2);
-
-        assert!(!KvCacheBacking::DenseF32.is_sparse());
-        assert!(!KvCacheBacking::DenseF16.is_sparse());
-        assert!(!KvCacheBacking::DenseQ8.is_sparse());
-        assert!(!KvCacheBacking::DenseFp8.is_sparse());
-        assert!(!KvCacheBacking::DenseQ4.is_sparse());
-        assert!(KvCacheBacking::SparseF16.is_sparse());
-    }
-
-    #[test]
-    fn kv_cache_backing_variants_are_distinct() {
-        // `#[non_exhaustive]` + `PartialEq, Eq, Hash` must actually
-        // distinguish every variant (regression guard against a copy-paste
-        // derive that quietly makes two variants compare equal).
-        use std::collections::HashSet;
-        let all = [
-            KvCacheBacking::DenseF32,
-            KvCacheBacking::DenseF16,
-            KvCacheBacking::DenseQ8,
-            KvCacheBacking::DenseFp8,
-            KvCacheBacking::DenseQ4,
-            KvCacheBacking::SparseF16,
-        ];
-        let unique: HashSet<_> = all.iter().copied().collect();
-        assert_eq!(unique.len(), all.len());
-    }
-
-    // ── M-07: lazy growth in chunks ─────────────────────────────────────────
-
-    #[test]
-    fn ensure_capacity_rounds_up_to_the_next_growth_chunk() {
-        let mut cache = KvCache::new(1, 1, 4, 10);
-        assert_eq!(cache.max_seq_len(), 10);
-        cache.ensure_capacity(10); // already satisfied: no-op
-        assert_eq!(cache.max_seq_len(), 10);
-
-        cache.ensure_capacity(11); // one past capacity: grow by a full chunk
-        assert_eq!(cache.max_seq_len(), GROWTH_CHUNK_POSITIONS);
-
-        cache.ensure_capacity(GROWTH_CHUNK_POSITIONS + 1);
-        assert_eq!(cache.max_seq_len(), GROWTH_CHUNK_POSITIONS * 2);
-    }
-
-    #[test]
-    fn ensure_capacity_never_shrinks() {
-        let mut cache = KvCache::new(1, 1, 4, GROWTH_CHUNK_POSITIONS * 4);
-        let before = cache.max_seq_len();
-        cache.ensure_capacity(1);
-        assert_eq!(cache.max_seq_len(), before, "must never shrink");
-    }
-
-    #[test]
-    fn ensure_capacity_doubles_instead_of_creeping_by_one_chunk_once_the_cache_is_large() {
-        // Perf minor (wave-3 review): once a cache is already much larger
-        // than one growth chunk, growing by exactly one
-        // `GROWTH_CHUNK_POSITIONS` chunk at a time makes every
-        // `try_grow_to` re-copy roughly the cache's whole existing content
-        // again, for O(n^2) total bytes moved across a long decode loop
-        // (the review measured ~696 reallocs averaging ~89K positions at a
-        // 178K context). Past that point growth must double the existing
-        // capacity instead of creeping forward by one chunk.
-        let mut cache = KvCache::new(1, 1, 1, 100_000);
-        cache.ensure_capacity(100_001);
-        assert_eq!(
-            cache.max_seq_len(),
-            200_000,
-            "once max_seq_len dominates one growth chunk, growth must double it \
-             rather than creep forward by GROWTH_CHUNK_POSITIONS"
-        );
-    }
-
-    #[test]
-    fn grow_to_preserves_dense_data_and_seq_len() {
-        // Distinct values for every (layer, head, pos, dim) combination, not
-        // just one (layer, head) pair, so a base-offset mistake in the
-        // direct-copy growth path (wrong layer/head stride, or mixing up the
-        // old vs. new `max_seq_len` in the offset formula) shows up as a
-        // mismatch instead of coincidentally reading back correct data.
-        let (num_layers, num_kv_heads, head_dim) = (2, 2, 4);
-        let value_at = |layer: usize, head: usize, pos: usize, d: usize| -> f32 {
-            (layer * 1000 + head * 100 + pos * 10 + d) as f32
-        };
-        let mut cache = KvCache::new(num_layers, num_kv_heads, head_dim, 8);
-        for layer in 0..num_layers {
-            for head in 0..num_kv_heads {
-                for pos in 0..6 {
-                    let key: Vec<f32> = (0..head_dim)
-                        .map(|d| value_at(layer, head, pos, d))
-                        .collect();
-                    let value: Vec<f32> = (0..head_dim)
-                        .map(|d| -value_at(layer, head, pos, d))
-                        .collect();
-                    cache.store_key(layer, head, pos, &key);
-                    cache.store_value(layer, head, pos, &value);
-                }
-            }
-        }
-        cache.set_seq_len(6);
-
-        cache.grow_to(1024);
-        assert_eq!(cache.max_seq_len(), 1024);
-        assert_eq!(cache.seq_len(), 6, "grow_to must not change seq_len");
-        assert!(!cache.is_sparse());
-
-        for layer in 0..num_layers {
-            for head in 0..num_kv_heads {
-                let keys = cache.keys_for(layer, head, 6);
-                let values = cache.values_for(layer, head, 6);
-                for pos in 0..6 {
-                    let expected: Vec<f32> = (0..head_dim)
-                        .map(|d| value_at(layer, head, pos, d))
-                        .collect();
-                    assert_eq!(
-                        &keys[pos * head_dim..pos * head_dim + head_dim],
-                        expected.as_slice(),
-                        "layer {layer} head {head} pos {pos} keys must survive growth"
-                    );
-                    let expected_v: Vec<f32> = (0..head_dim)
-                        .map(|d| -value_at(layer, head, pos, d))
-                        .collect();
-                    assert_eq!(
-                        &values[pos * head_dim..pos * head_dim + head_dim],
-                        expected_v.as_slice(),
-                        "layer {layer} head {head} pos {pos} values must survive growth"
-                    );
-                }
-            }
-        }
-        // A position beyond what was written must still read zero.
-        assert!(cache.extract_block(0, 6, 1).0.iter().all(|&x| x == 0.0));
-    }
-
-    #[test]
-    fn grow_to_preserves_sparse_data_and_stays_sparse() {
-        // Same multi-(layer, head) regression guard as the dense version
-        // above, for the f16-backed copy path.
-        let (num_layers, num_kv_heads, head_dim) = (2, 2, 4);
-        let value_at = |layer: usize, head: usize, pos: usize, d: usize| -> f32 {
-            (layer * 100 + head * 10 + pos) as f32 + d as f32 * 0.25
-        };
-        let mut cache = KvCache::new_sparse(num_layers, num_kv_heads, head_dim, 8);
-        for layer in 0..num_layers {
-            for head in 0..num_kv_heads {
-                for pos in 0..4 {
-                    let key: Vec<f32> = (0..head_dim)
-                        .map(|d| value_at(layer, head, pos, d))
-                        .collect();
-                    let value: Vec<f32> = (0..head_dim)
-                        .map(|d| -value_at(layer, head, pos, d))
-                        .collect();
-                    cache
-                        .try_store_key(layer, head, pos, &key)
-                        .expect("sparse store must succeed");
-                    cache
-                        .try_store_value(layer, head, pos, &value)
-                        .expect("sparse store must succeed");
-                }
-            }
-        }
-        cache.set_seq_len(4);
-
-        cache.grow_to(512);
-        assert!(cache.is_sparse(), "grow_to must preserve the storage mode");
-        assert_eq!(cache.max_seq_len(), 512);
-        assert_eq!(
-            cache.memory_bytes(),
-            num_layers * num_kv_heads * head_dim * 512 * 2 * 2,
-            "grown sparse cache must still cost 2 bytes/element, not silently become dense"
-        );
-
-        for layer in 0..num_layers {
-            for head in 0..num_kv_heads {
-                let read_key = cache.keys_for_owned(layer, head, 4);
-                let read_value = cache.values_for_owned(layer, head, 4);
-                for pos in 0..4 {
-                    for d in 0..head_dim {
-                        let expected = value_at(layer, head, pos, d);
-                        let got_k = read_key[pos * head_dim + d];
-                        assert!(
-                            (expected - got_k).abs() < 1e-2,
-                            "layer {layer} head {head} pos {pos} d {d}: expected={expected} got={got_k}"
-                        );
-                        let got_v = read_value[pos * head_dim + d];
-                        assert!(
-                            (-expected - got_v).abs() < 1e-2,
-                            "layer {layer} head {head} pos {pos} d {d} (value): expected={} got={got_v}",
-                            -expected
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn grow_to_is_a_no_op_when_already_large_enough() {
-        let mut cache = KvCache::new(1, 1, 4, 100);
-        cache.store_key(0, 0, 0, &[1.0, 2.0, 3.0, 4.0]);
-        cache.grow_to(50); // smaller than current — must not shrink or touch data
-        assert_eq!(cache.max_seq_len(), 100);
-        cache.set_seq_len(1);
-        assert_eq!(cache.keys_for(0, 0, 1), &[1.0, 2.0, 3.0, 4.0]);
-    }
-
-    #[test]
-    fn try_ensure_capacity_and_try_grow_to_reject_overflow_leaving_cache_unchanged() {
-        let mut cache = KvCache::new(1, 1, 4, 8);
-        cache.store_key(0, 0, 0, &[1.0, 2.0, 3.0, 4.0]);
-
-        let err = cache
-            .try_grow_to(usize::MAX)
-            .expect_err("an overflowing grow target must be rejected");
-        assert!(matches!(err, ModelError::KvAllocation { .. }), "{err}");
-        // The cache must be completely unchanged after a rejected grow.
-        assert_eq!(cache.max_seq_len(), 8);
-        cache.set_seq_len(1);
-        assert_eq!(cache.keys_for(0, 0, 1), &[1.0, 2.0, 3.0, 4.0]);
-
-        let err = cache
-            .try_ensure_capacity(usize::MAX)
-            .expect_err("an overflowing ensure_capacity target must be rejected");
-        assert!(matches!(err, ModelError::KvAllocation { .. }), "{err}");
-        assert_eq!(cache.max_seq_len(), 8);
+/// Copy `slabs` runs of `run_len` elements from `old_stride`-strided key /
+/// value buffers into `new_stride`-strided ones.
+#[allow(clippy::too_many_arguments)]
+fn copy_runs<T: Copy>(
+    src_keys: &[T],
+    src_values: &[T],
+    dst_keys: &mut [T],
+    dst_values: &mut [T],
+    slabs: usize,
+    old_stride: usize,
+    new_stride: usize,
+    run_len: usize,
+) {
+    for slab in 0..slabs {
+        let (old_start, new_start) = (slab * old_stride, slab * new_stride);
+        dst_keys[new_start..new_start + run_len]
+            .copy_from_slice(&src_keys[old_start..old_start + run_len]);
+        dst_values[new_start..new_start + run_len]
+            .copy_from_slice(&src_values[old_start..old_start + run_len]);
     }
 }

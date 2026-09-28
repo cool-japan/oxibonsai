@@ -16,11 +16,14 @@
 //!
 //! let config = Qwen3Config::tiny_test();
 //! let engine = InferenceEngine::new(config, SamplingParams::default(), 42);
-//! let mut cached = PrefixCachedEngine::new(engine, 64, 42);
+//! // `try_new` is the recommended constructor: it refuses, with a typed
+//! // error, an engine the prefix cache cannot serve (a hybrid model).
+//! let mut cached = PrefixCachedEngine::try_new(engine, 64, 42)?;
 //!
 //! let tokens = cached.generate(&[1, 2, 3, 4], &SamplingParams::default());
 //! let stats = cached.cache_stats();
 //! println!("hit rate: {:.1}%", stats.hit_rate * 100.0);
+//! # Ok::<(), oxibonsai_runtime::error::RuntimeError>(())
 //! ```
 //!
 //! ## Limitations (M-35)
@@ -47,9 +50,11 @@
 //!   carry Gated-DeltaNet-style recurrent state (e.g. Bonsai 2 27B, GGUF
 //!   `general.architecture = "qwen35"`) has no block-KV representation for
 //!   that state at all — there is nothing to extract or inject, so prefix
-//!   caching is refused unconditionally for such a model (to be recorded in
-//!   TODO.md by B2-21-DOCS, the docs package; tracked upstream as B2-12
-//!   wiring the real recurrent-state cache).
+//!   caching is refused unconditionally for such a model.
+//!   [`PrefixCachedEngine::try_new`] — the recommended constructor — turns
+//!   that into the typed [`EngineError::RecurrentRollbackRequired`];
+//!   [`PrefixCachedEngine::new`] keeps serving it uncached (always correct)
+//!   and reports the bypass once at `warn` — never silently.
 //!
 //! Within the cache-aware path, every candidate block is checksummed against
 //! its own live extracted content — not against an unrelated sample range —
@@ -72,6 +77,7 @@
 //! hybrid-architecture check `generate()` uses. `store_new_blocks` consults
 //! **both** this flag and the checksum; neither replaces the other.
 
+use oxibonsai_core::config_hybrid::HYBRID_ARCHITECTURE as HYBRID_RECURRENT_ARCHITECTURE;
 use oxibonsai_kernels::traits::OneBitKernel;
 use oxibonsai_model::model::BonsaiModel;
 use oxibonsai_model::prefix_cache::{
@@ -79,6 +85,8 @@ use oxibonsai_model::prefix_cache::{
 };
 
 use crate::engine::InferenceEngine;
+use crate::engine_seam::EngineError;
+use crate::error::RuntimeResult;
 use crate::sampling::{Sampler, SamplingParams};
 
 /// Whether `model`'s CPU-resident `KvCache` currently holds the true,
@@ -92,7 +100,9 @@ use crate::sampling::{Sampler, SamplingParams};
 /// [`OneBitKernel::is_gpu_accelerated`], which asks "can this kernel tier
 /// run on the GPU at all" rather than "did the last forward call actually
 /// use it") and a hybrid recurrent-attention architecture (no block-KV
-/// representation exists to be authoritative about in the first place).
+/// representation exists to be authoritative about in the first place). A
+/// real hybrid engine holds no [`BonsaiModel`] at all, so it never gets
+/// this far — see [`prefix_cache_refused`].
 fn cpu_kv_is_authoritative(model: &BonsaiModel) -> bool {
     !model.gpu_path_active() && model.config().architecture != HYBRID_RECURRENT_ARCHITECTURE
 }
@@ -100,14 +110,24 @@ fn cpu_kv_is_authoritative(model: &BonsaiModel) -> bool {
 /// Tokens per cache block — must divide evenly into most prompt lengths.
 const BLOCK_SIZE: usize = 16;
 
-/// GGUF `general.architecture` tag for the hybrid model family that mixes
-/// recurrent linear-attention layers with full-attention layers (Bonsai 2
-/// 27B). No `oxibonsai-model`/`oxibonsai-core` file this package owns
-/// defines a shared constant for it yet, so it is spelled out here — see the
-/// module docs' M-35 note on why prefix caching is refused unconditionally
-/// for it (recurrent state has no block-KV representation to extract or
-/// inject).
-const HYBRID_RECURRENT_ARCHITECTURE: &str = "qwen35";
+/// Whether prefix caching must be refused for `engine` outright: its
+/// sequence state includes a recurrence (a real hybrid `qwen35` model, or an
+/// attached `RecurrentState`), or its configuration declares the hybrid
+/// architecture.
+fn prefix_cache_refused(engine: &InferenceEngine<'_>) -> bool {
+    !engine.recurrent_rollback_supported() || engine.architecture() == HYBRID_RECURRENT_ARCHITECTURE
+}
+
+/// The typed refusal for prefix caching on an engine whose sequence state
+/// includes a recurrence (a hybrid `qwen35` model): restoring a cached KV
+/// prefix would need the recurrent state *at that position*, which the
+/// block trie has no representation for.
+fn recurrent_prefix_refusal(engine: &InferenceEngine<'_>) -> EngineError {
+    EngineError::RecurrentRollbackRequired {
+        operation: "prefix-cache KV block restore",
+        architecture: engine.architecture().to_string(),
+    }
+}
 
 /// An [`InferenceEngine`] augmented with prefix KV-cache reuse.
 ///
@@ -138,10 +158,45 @@ pub struct PrefixCachedEngine<'a> {
     /// [`InferenceEngine::generate_with_params`]'s "swap params, keep RNG
     /// state" pattern rather than re-seeding on every call.
     sampler: Sampler,
+    /// Whether the uncached bypass for a hybrid engine has already been
+    /// reported (it is logged once per wrapper, at `warn`, never silently).
+    hybrid_bypass_reported: bool,
 }
 
 impl<'a> PrefixCachedEngine<'a> {
+    /// [`PrefixCachedEngine::new`], refusing an engine prefix caching cannot
+    /// serve.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::RecurrentRollbackRequired`] (as a
+    /// [`RuntimeError`](crate::error::RuntimeError)) for an engine whose
+    /// sequence state includes a recurrence — a hybrid (`qwen35`) model:
+    /// restoring a cached KV prefix would need its recurrent state at that
+    /// position, which the block trie cannot represent. Use this constructor
+    /// where serving without a cache would be a misconfiguration;
+    /// [`PrefixCachedEngine::new`] accepts such an engine and serves it
+    /// uncached (reported at `warn`).
+    pub fn try_new(
+        engine: InferenceEngine<'a>,
+        max_cache_blocks: usize,
+        seed: u64,
+    ) -> RuntimeResult<Self> {
+        if prefix_cache_refused(&engine) {
+            return Err(recurrent_prefix_refusal(&engine).into());
+        }
+        Ok(Self::new(engine, max_cache_blocks, seed))
+    }
+
     /// Wrap an existing [`InferenceEngine`] with a prefix cache.
+    ///
+    /// **Prefer [`PrefixCachedEngine::try_new`]**, the recommended
+    /// constructor: it refuses, with a typed error, an engine the cache
+    /// cannot serve. This infallible form exists for callers that must not
+    /// fail; it accepts such an engine — a hybrid (`qwen35`) model, whose
+    /// recurrent state the block trie cannot restore — and serves it
+    /// correctly but **uncached**, reporting that once at `warn` on the first
+    /// [`generate`](Self::generate). It never pretends to cache.
     ///
     /// Derives `num_layers`, `num_kv_heads`, and `head_dim` directly from
     /// the engine's model configuration, so no manual wiring is required.
@@ -159,13 +214,16 @@ impl<'a> PrefixCachedEngine<'a> {
     ///   "random" value forever), matching the precedent in
     ///   `crate::speculative`.
     pub fn new(engine: InferenceEngine<'a>, max_cache_blocks: usize, seed: u64) -> Self {
-        let cfg = engine.model().config();
+        // The KV geometry the engine's cache really has: every layer for a
+        // dense model, only the full-attention layers for a hybrid one
+        // (whose trie then stays unused -- see `generate`).
+        let (num_layers, num_kv_heads, head_dim) = engine.kv_cache_geometry();
         let cache = PrefixCache::new(
             max_cache_blocks,
             BLOCK_SIZE,
-            cfg.num_layers,
-            cfg.num_kv_heads,
-            cfg.head_dim,
+            num_layers,
+            num_kv_heads,
+            head_dim,
         );
         let prefix_cache = PrefixAwarePrefill::new(cache);
         let effective_seed = if seed == 0 { 0xdeadbeef_cafebabe } else { seed };
@@ -174,6 +232,7 @@ impl<'a> PrefixCachedEngine<'a> {
             inner: engine,
             prefix_cache,
             sampler,
+            hybrid_bypass_reported: false,
         }
     }
 
@@ -198,20 +257,32 @@ impl<'a> PrefixCachedEngine<'a> {
         // `BonsaiModel::forward`/`prefill` use to pick the Metal path —
         // rather than re-derived locally, so this refusal cannot silently
         // drift out of sync with the forward path it is guarding against.
-        if self.inner.kernel().is_gpu_accelerated()
-            || self.inner.model().config().architecture == HYBRID_RECURRENT_ARCHITECTURE
-        {
+        if prefix_cache_refused(&self.inner) {
+            // A hybrid (recurrent) engine: restoring a KV prefix would need the
+            // recurrent state at that position, which the trie cannot hold.
+            // Serve it correctly -- uncached -- and say so once, loudly.
+            if !self.hybrid_bypass_reported {
+                self.hybrid_bypass_reported = true;
+                tracing::warn!(
+                    refusal = %recurrent_prefix_refusal(&self.inner),
+                    "prefix cache disabled for this engine: generating without prefix reuse \
+                     (construct with PrefixCachedEngine::try_new to make this an error)"
+                );
+            }
+            return self.generate_without_prefix_cache(prompt_tokens, params);
+        }
+        if self.inner.kernel().is_gpu_accelerated() {
             return self.generate_without_prefix_cache(prompt_tokens, params);
         }
 
         // ── Step 1: reset model KV cache ─────────────────────────────────────
         // We treat the wrapper as a single-engine, sequential request server.
-        self.inner.model_mut().reset();
+        self.inner.reset();
 
         // ── Step 2: query the prefix cache ───────────────────────────────────
         let (session, uncached_start) = self.prefix_cache.prepare(prompt_tokens);
         let block_size = self.prefix_cache.cache.block_size();
-        let num_layers = self.inner.model().config().num_layers;
+        let (num_layers, _, _) = self.inner.kv_cache_geometry();
 
         // ── Step 3: restore cached blocks into the model's CPU KV cache ──────
         if uncached_start > 0 && !session.block_indices.is_empty() {
@@ -231,15 +302,17 @@ impl<'a> PrefixCachedEngine<'a> {
                     None => continue,
                 };
                 let block_start = block_num * block_size;
-                let kv = self.inner.model_mut().kv_cache_mut();
-                for (layer, (keys, values)) in snapshots.into_iter().enumerate() {
-                    kv.inject_block(layer, block_start, block_size, &keys, &values);
+                // Dense by the gate above (`recurrent_rollback_supported`).
+                if let Some(model) = self.inner.dense_model_mut() {
+                    let kv = model.kv_cache_mut();
+                    for (layer, (keys, values)) in snapshots.into_iter().enumerate() {
+                        kv.inject_block(layer, block_start, block_size, &keys, &values);
+                    }
                 }
             }
-            self.inner
-                .model_mut()
-                .kv_cache_mut()
-                .set_seq_len(uncached_start);
+            if let Some(model) = self.inner.dense_model_mut() {
+                model.kv_cache_mut().set_seq_len(uncached_start);
+            }
         }
 
         // ── Step 4: prefill on the uncached suffix only ──────────────────────
@@ -290,7 +363,7 @@ impl<'a> PrefixCachedEngine<'a> {
         prompt_tokens: &[u32],
         params: &SamplingParams,
     ) -> Vec<u32> {
-        self.inner.model_mut().reset();
+        self.inner.reset();
         let last_logits = match self.inner.prefill_from_pos(prompt_tokens, 0) {
             Ok(logits) => logits,
             Err(e) => {
@@ -344,7 +417,11 @@ impl<'a> PrefixCachedEngine<'a> {
         // cannot see). See `cpu_kv_is_authoritative`'s doc for why this is
         // additive rather than a replacement for `generate()`'s existing
         // up-front `is_gpu_accelerated()` gate.
-        if !cpu_kv_is_authoritative(self.inner.model()) {
+        if !self
+            .inner
+            .dense_model()
+            .is_some_and(cpu_kv_is_authoritative)
+        {
             tracing::warn!(
                 uncached_start,
                 "prefix-cache: skipping store — the model's CPU KV cache is not \
@@ -354,17 +431,17 @@ impl<'a> PrefixCachedEngine<'a> {
             return;
         }
 
+        // Authoritative implies dense (checked just above).
+        let Some(model) = self.inner.dense_model() else {
+            return;
+        };
         let mut keys_by_block: Vec<KvBlockPair> = Vec::with_capacity(new_blocks_count);
         for blk in 0..new_blocks_count {
             let block_pos = uncached_start + blk * block_size;
             let mut layer_keys: Vec<Vec<f32>> = Vec::with_capacity(num_layers);
             let mut layer_values: Vec<Vec<f32>> = Vec::with_capacity(num_layers);
             for layer in 0..num_layers {
-                let (k, v) = self
-                    .inner
-                    .model()
-                    .kv_cache()
-                    .extract_block(layer, block_pos, block_size);
+                let (k, v) = model.kv_cache().extract_block(layer, block_pos, block_size);
                 layer_keys.push(k);
                 layer_values.push(v);
             }

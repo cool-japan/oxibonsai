@@ -497,16 +497,14 @@ fn softmax_neon(values: &mut [f32]) {
 /// tail through this exact function rather than falling back to `f32::exp()`,
 /// so a value is bit-identical no matter where in the buffer it lands.
 ///
-/// Private, not `pub(crate)` (PERF-CPU-PREFILL): B2-06 widened this to
-/// `pub(crate)` intending `norms.rs` to call it instead of holding its own
-/// verbatim copy, but never made that call site change, and `norms.rs` is
-/// not this package's file to edit. A visibility widening nothing calls is
-/// dead surface, so it is reverted here; deleting `norms.rs`'s duplicate
-/// (`norms.rs:369-437`) and re-widening this is a follow-up for whoever
-/// owns that file.
+/// `pub(crate)` (K-INT8 wave-4b): `norms.rs` imports this instead of holding
+/// its own verbatim copy — see its module doc comment and
+/// `norms::dedup_parity` for the bit-identity proof.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn exp_neon_f32x4(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
+pub(crate) unsafe fn exp_neon_f32x4(
+    x: std::arch::aarch64::float32x4_t,
+) -> std::arch::aarch64::float32x4_t {
     use std::arch::aarch64::*;
 
     const EXP_HI: f32 = 88.376_26;
@@ -563,11 +561,10 @@ unsafe fn exp_neon_f32x4(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch
 /// scalar tail, so the same call could return two different roundings for
 /// different elements. A single division strategy removes that hazard.
 ///
-/// Private, not `pub(crate)` — see [`exp_neon_f32x4`]'s doc: same reverted
-/// widening, same follow-up.
+/// `pub(crate)` — see [`exp_neon_f32x4`]'s doc comment.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn silu_core_neon_f32x4(
+pub(crate) unsafe fn silu_core_neon_f32x4(
     x: std::arch::aarch64::float32x4_t,
 ) -> std::arch::aarch64::float32x4_t {
     use std::arch::aarch64::*;

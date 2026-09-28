@@ -452,12 +452,22 @@ fn positions_beyond_the_configured_context_are_rejected() {
 #[test]
 fn kv_cache_grows_on_demand_and_keeps_its_contents() {
     let mut model = BonsaiModel::new(small_config(2, 32, 512));
-    let start = model.kv_cache().max_seq_len();
+    let start = model.kv_cache().allocated_seq_len();
     assert!(
         start <= WEIGHTLESS_PREALLOC_CONTEXT,
         "the config-only constructor must start small, got {start}"
     );
+    assert_eq!(
+        model.kv_cache().max_seq_len(),
+        512,
+        "the cache's logical limit is the effective context from the start"
+    );
+    assert!(
+        model.kv_cache().is_f16() && model.kv_cache().is_lazy(),
+        "REQUIRED #4 (3)+(4): the host default is a lazy f16 cache"
+    );
     let head_dim = model.config().head_dim;
+    // Exactly representable in f16, so the round trip is exact.
     let key: Vec<f32> = (0..head_dim).map(|i| i as f32 + 0.5).collect();
     model
         .kv_cache_mut()
@@ -468,10 +478,14 @@ fn kv_cache_grows_on_demand_and_keeps_its_contents() {
     let kernel = cpu_kernel();
     model.forward(0, start + 5, &kernel).expect("grown forward");
     assert!(
-        model.kv_cache().max_seq_len() > start + 5,
+        model.kv_cache().allocated_seq_len() > start + 5,
         "cache must have grown past the requested position"
     );
-    assert_eq!(model.rope.max_seq_len(), model.kv_cache().max_seq_len());
+    assert_eq!(model.kv_cache().max_seq_len(), 512, "the limit never moves");
+    assert_eq!(
+        model.rope.max_seq_len(),
+        model.kv_cache().allocated_seq_len()
+    );
     let kept = model.kv_cache().keys_for(0, 0, 4);
     assert_eq!(
         &kept[3 * head_dim..4 * head_dim],
@@ -480,21 +494,69 @@ fn kv_cache_grows_on_demand_and_keeps_its_contents() {
     );
 }
 
+/// Replaces "a loaded model's caches do not grow behind the GPU's back"
+/// (REQUIRED #4 (4) makes every model's host KV grow lazily): the invariant
+/// that rule protected — a device-side KV cache must never be re-geometried
+/// mid-sequence — now holds by construction, because every device cache is
+/// sized from the host cache's fixed LOGICAL limit (`max_seq_len()`), which
+/// growth never changes. So growth is allowed even while the MET-05 GPU
+/// latch is set, and the device geometry stays put across it.
 #[test]
-fn a_loaded_models_caches_do_not_grow_behind_the_gpus_back() {
-    // `kv_growth` is off for GGUF-loaded models because the device KV cache is
-    // allocated from `kv_cache.max_seq_len()`; re-geometrying it mid-sequence
-    // is exactly the class of bug MET-05 exists for.
+fn host_kv_growth_never_changes_the_device_kv_geometry() {
     let mut model = BonsaiModel::new(small_config(0, 32, 4096));
-    model.kv_growth = false;
-    let allocated = model.kv_cache().max_seq_len();
-    let kernel = cpu_kernel();
+    let device_geometry = model.kv_cache().max_seq_len();
+    assert_eq!(device_geometry, 4096);
+    let before = model.kv_cache().allocated_seq_len();
+    model.note_device_kv_used();
+    assert!(model.gpu_path_active());
+    model
+        .ensure_context_capacity(1000)
+        .expect("growth within the effective context, GPU latch or not");
+    assert!(model.kv_cache().allocated_seq_len() > 1000);
+    assert!(model.kv_cache().allocated_seq_len() > before);
+    assert_eq!(
+        model.kv_cache().max_seq_len(),
+        device_geometry,
+        "host growth must never move the geometry a device KV cache is sized from"
+    );
+    // The effective context is still the hard ceiling.
     let err = model
-        .forward(0, allocated, &kernel)
-        .expect_err("a non-growing model must report its allocated limit");
+        .ensure_context_capacity(4096)
+        .expect_err("position 4096 is past a 4096-token context");
     match err {
-        ModelError::SequenceTooLong { max_ctx, .. } => assert_eq!(max_ctx, allocated),
+        ModelError::SequenceTooLong { seq_len, max_ctx } => {
+            assert_eq!((seq_len, max_ctx), (4097, 4096));
+        }
         other => panic!("expected SequenceTooLong, got {other}"),
+    }
+}
+
+/// Lazy growth across a chunk boundary on the real decode loop, with a
+/// populated model: every position written before the growth is still
+/// there after it (REQUIRED #4 (4)'s "growth across a chunk boundary").
+#[test]
+fn decode_loop_grows_the_host_kv_across_a_chunk_boundary() {
+    let config = small_config(1, 32, 1024);
+    let mut model = BonsaiModel::new_for_testing_with_blocks(config.clone());
+    let kernel = cpu_kernel();
+    let first = model.kv_cache().allocated_seq_len();
+    assert_eq!(first, crate::kv_cache::GROWTH_CHUNK_POSITIONS);
+    for pos in 0..first + 3 {
+        model
+            .forward(u32::try_from(pos % 32).expect("fits"), pos, &kernel)
+            .expect("decode step");
+    }
+    assert!(model.kv_cache().allocated_seq_len() > first);
+    let seq = first + 3;
+    let keys = model.kv_cache().keys_for(0, 0, seq);
+    // Positions before the boundary were written and survive the growth
+    // (a fresh position's key is never all-zero on this fixture).
+    for pos in [0usize, first / 2, first - 1, first, first + 2] {
+        let row = &keys[pos * config.head_dim..(pos + 1) * config.head_dim];
+        assert!(
+            row.iter().any(|&x| x != 0.0),
+            "position {pos}: key lost across the chunk-boundary growth"
+        );
     }
 }
 
@@ -527,6 +589,7 @@ fn a_growing_model_reaches_the_context_its_config_declares() {
     let kernel = cpu_kernel();
     model.forward(0, 599, &kernel).expect("last valid position");
     assert!(model.kv_cache().max_seq_len() >= 600);
+    assert!(model.kv_cache().allocated_seq_len() >= 600);
     assert!(model.forward(0, 600, &kernel).is_err());
 }
 

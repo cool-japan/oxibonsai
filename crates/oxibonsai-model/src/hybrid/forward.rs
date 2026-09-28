@@ -490,6 +490,10 @@ pub fn run_chunk(
             max: ctx.rope.max_pos(),
         });
     }
+    // Lazy KV growth (REQUIRED #4 (4)): make every position of the chunk
+    // resident BEFORE any layer runs, so an allocation failure surfaces as
+    // a typed error with no layer half-written, instead of mid-stack.
+    ctx.kv.try_ensure_capacity(end_pos)?;
 
     ctx.scratch.ensure(t_len);
 
@@ -989,6 +993,75 @@ impl<'a> LoadedModel<'a> {
             Self::Hybrid(m) => m.reset(),
         }
     }
+
+    /// Whether this model carries recurrent (Gated-DeltaNet) state at all —
+    /// `false` for a dense stack, which has no recurrent layers.
+    #[must_use]
+    pub fn has_recurrent_state(&self) -> bool {
+        match self {
+            Self::Dense(_) => false,
+            Self::Hybrid(m) => m.recurrent().n_layers() > 0,
+        }
+    }
+
+    /// The recurrent state, when there is one.
+    #[must_use]
+    pub fn recurrent_state(&self) -> Option<&crate::hybrid::recurrent_cache::RecurrentCache> {
+        match self {
+            Self::Dense(_) => None,
+            Self::Hybrid(m) => Some(m.recurrent()),
+        }
+    }
+
+    /// Clear the recurrent state only (REQUIRED #6 / RT-28): the hybrid
+    /// arm zeroes every Gated-DeltaNet state and conv window; the dense arm
+    /// has no recurrent layers, so there is nothing to clear.
+    pub fn reset_recurrent(&mut self) {
+        match self {
+            Self::Dense(m) => m.reset_recurrent(),
+            Self::Hybrid(m) => m.reset_recurrent(),
+        }
+    }
+
+    /// Install a recurrent state after validating its geometry (REQUIRED #6).
+    ///
+    /// # Errors
+    ///
+    /// [`ModelError::RecurrentStateMismatch`] when the geometry differs from
+    /// the hybrid model's — and always for the dense arm, which has no
+    /// recurrent layers to receive a (non-empty) state.
+    pub fn set_recurrent_state(
+        &mut self,
+        state: crate::hybrid::recurrent_cache::RecurrentCache,
+    ) -> ModelResult<()> {
+        match self {
+            Self::Dense(_) => {
+                if state.n_layers() == 0 {
+                    return Ok(());
+                }
+                Err(ModelError::RecurrentStateMismatch {
+                    expected: "no recurrent layers (a dense qwen3 stack)".to_string(),
+                    actual: format!("{} recurrent layers", state.n_layers()),
+                })
+            }
+            Self::Hybrid(m) => m.set_recurrent_state(state),
+        }
+    }
+
+    /// Take the recurrent state out (leaving a zeroed one of the same
+    /// geometry behind), or `None` for the dense arm.
+    ///
+    /// # Errors
+    ///
+    /// As [`HybridModel::take_recurrent`](crate::hybrid::model::HybridModel::take_recurrent).
+    pub fn take_recurrent_state(
+        &mut self,
+    ) -> ModelResult<Option<crate::hybrid::recurrent_cache::RecurrentCache>> {
+        match self {
+            Self::Dense(_) => Ok(None),
+            Self::Hybrid(m) => m.take_recurrent().map(Some),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1084,6 +1157,55 @@ mod tests {
         let plain = folded_input(&normed, &rotated, None, 4).expect("in range");
         assert_eq!(plain, &normed[..]);
         assert!(folded_input(&normed, &rotated, None, 5).is_err());
+    }
+
+    /// REQUIRED #6 at the seam the runtime dispatches through: the hybrid
+    /// arm resets / takes / installs its recurrent state (validated), the
+    /// dense arm has none and refuses a non-empty one with a typed error.
+    #[test]
+    fn loaded_model_recurrent_seam_dispatches_by_arm_bonsai2() {
+        use crate::hybrid::recurrent_cache::RecurrentCache;
+        use crate::hybrid::tests_support::{synthetic_gguf, FixtureOptions, FixtureShape};
+        use oxibonsai_core::gguf::reader::GgufFile;
+
+        let bytes = synthetic_gguf(FixtureShape::default(), FixtureOptions::default());
+        let gguf = GgufFile::parse(&bytes).expect("fixture parses");
+        let mut hybrid = LoadedModel::from_gguf(&gguf, 32).expect("hybrid loads");
+        assert!(hybrid.is_hybrid());
+        assert!(hybrid.has_recurrent_state());
+        let config = hybrid
+            .as_hybrid()
+            .map(|m| m.config().clone())
+            .expect("hybrid arm");
+        if let Some(model) = hybrid.as_hybrid_mut() {
+            model.recurrent_mut().advance(2);
+            model.recurrent_mut().ssm_mut(0).expect("slot 0")[1] = 1.0;
+        }
+        hybrid.reset_recurrent();
+        let state = hybrid.recurrent_state().expect("hybrid state");
+        assert_eq!(state.token_count(), 0);
+        assert!(state.ssm(0).expect("slot 0").iter().all(|v| *v == 0.0));
+
+        let taken = hybrid
+            .take_recurrent_state()
+            .expect("take succeeds")
+            .expect("the hybrid arm has a state");
+        hybrid
+            .set_recurrent_state(taken)
+            .expect("its own state round-trips");
+
+        let mut dense = LoadedModel::Dense(Box::new(crate::model::BonsaiModel::new(
+            oxibonsai_core::config::Qwen3Config::tiny_test(),
+        )));
+        assert!(!dense.has_recurrent_state());
+        assert!(dense.recurrent_state().is_none());
+        assert!(dense.take_recurrent_state().expect("ok").is_none());
+        dense.reset_recurrent();
+        let foreign = RecurrentCache::new(&config).expect("state");
+        let err = dense
+            .set_recurrent_state(foreign)
+            .expect_err("a dense stack has no recurrent layers");
+        assert_eq!(err.error_code(), "RECURRENT_STATE_MISMATCH");
     }
 
     #[test]

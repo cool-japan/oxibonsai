@@ -57,13 +57,180 @@
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use oxibonsai_kernels::{KernelDispatcher, KernelTier};
+#[cfg(all(feature = "metal", target_os = "macos"))]
+use oxibonsai_model::hybrid::LoadedModel;
 
-use crate::engine::{InferenceEngine, MAX_PREALLOC_TOKENS};
+use crate::engine::{InferenceEngine, GREEDY_TEMPERATURE_EPS, MAX_PREALLOC_TOKENS};
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use crate::engine_control::GPU_ARGMAX_TIEBREAK_IS_FIRST_INDEX;
 use crate::error::RuntimeResult;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use crate::ngram_cache::NgramCache;
+
+/// Default number of top-k candidates a sampled request on the fused GPU
+/// route downloads per token instead of the full logit row (`perf-11`), once
+/// the route is opted into (see [`SampledTopKConfig`]).
+pub const DEFAULT_SAMPLED_TOPK_CANDIDATES: usize = 64;
+
+/// Where sampled decode on the fused GPU route gets its candidates from
+/// (`perf-11`, sampled half).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SampledTopKMode {
+    /// Route disabled — **the default**. A sampled request decodes every
+    /// step's full logit row through the classic sampler
+    /// (`Sampler::sample_with_history`), exactly as it did before the route
+    /// existed, so a seeded sampled request reproduces the pre-route output
+    /// token for token. [`SampledTopKConfig`] says why this is the default
+    /// and what lets it flip.
+    #[default]
+    Off,
+    /// Opt-in: download only the top-`k` `(id, logit)` pairs of each decode
+    /// step's logit row (the GPU `topk_f32` kernel over the resident logits)
+    /// and draw the step's token from them.
+    GpuCandidates,
+    /// Download the full row and extract the very same top-`k` on the CPU,
+    /// then draw from them exactly as [`Self::GpuCandidates`] does: the
+    /// **reference** the GPU candidate download is proven bit-for-bit equal
+    /// to. Costs the full download; for verification.
+    FullRowCandidates,
+}
+
+/// Configuration of the sampled top-k route (`perf-11`, sampled half).
+///
+/// # Eligibility
+///
+/// With the route enabled, a sampled request (temperature above zero) on the
+/// fused GPU route takes it when no penalty is configured (a penalty must see
+/// every logit), the caller does not need the full row (log-probabilities),
+/// and the sampler's `top_k` is in `1..=candidates` **and** below the
+/// vocabulary. Then the sampler's whole support lies inside the downloaded
+/// candidates — temperature, `top_k`, then `min_p`/`top_p` over the
+/// `top_k`-renormalised distribution need no tail mass — and both the full
+/// row and the candidate sub-row are narrowed by a real top-`k` selection.
+/// Anything else decodes the full row and is counted in
+/// [`EngineStats::sampled_full_row_requests`](crate::engine::EngineStats::sampled_full_row_requests):
+/// a `top_k` of `0` (top-p over the whole vocabulary, whose softmax needs
+/// every logit — a GPU tail-mass sum could not be bit-identical to the host
+/// sampler's sequential `f32` sum, so the route does not try), a `top_k`
+/// above the candidate count or at/above the vocabulary, a penalty, or the
+/// route disabled. Under the default [`SampledTopKMode::Off`] that counter
+/// therefore counts every sampled request on the fused route.
+///
+/// # Default: [`SampledTopKMode::Off`]
+///
+/// The route changes the *realisation* of a seeded draw, not its
+/// distribution. The classic sampler (`sampling.rs`'s `Sampler::sample_core`)
+/// selects its `top_k` survivors with `select_nth_unstable_by` and walks them
+/// — the softmax sum and, at `top_p = 1.0`, the weighted draw — in whatever
+/// order that partial selection leaves them, which is a function of the
+/// **whole** row. A candidate sub-row cannot reproduce that order, so for the
+/// same seed the route draws a different, equally distributed token on some
+/// steps: on tie-heavy 1000-wide rows, 125 of 200 seeded draws differ at
+/// `top_k 20, top_p 1.0` and 7 of 200 at `top_p 0.9`. A seeded request's
+/// output is a contract (`generate_with_seed`, the API's `seed` field), so,
+/// exactly like [`SpeculativeConfig`](crate::engine_control::SpeculativeConfig),
+/// the route stays opt-in ([`InferenceEngine::set_sampled_topk`]) until
+/// `Sampler::sample_core` walks its survivors in a canonical order — raw
+/// logit descending, `NaN` last, an exact tie to the lower index, top-p as a
+/// prefix scan of that order. That order depends only on the survivor set,
+/// which the candidates contain, so from then on the route is byte-identical
+/// to the full-row sampler and the default can flip to
+/// [`SampledTopKMode::GpuCandidates`] (the `sampling.rs` change is a recorded
+/// handover: that file is owned by another package).
+///
+/// # What the opt-in route guarantees today
+///
+/// * Every step whose full row is on the host anyway — the prefill row, and
+///   every fallback step — is drawn by the classic sampler over that full
+///   row, exactly as under [`SampledTopKMode::Off`].
+/// * A candidate step draws with the engine's own sampler over the candidate
+///   sub-row (descending logit, an exact tie to the lower id), consuming
+///   exactly one random draw as the classic sampler does. The GPU download is
+///   bit-identical to the CPU extraction of the same row
+///   ([`SampledTopKMode::FullRowCandidates`]; tested on a fused fixture and
+///   on the real 1.7B).
+/// * Candidates that cannot stand in for the row — a non-finite value inside
+///   the sampler's `top_k`, a GPU top-k / fused-argmax disagreement, a failed
+///   download — fall back to the resident full row, and a failed fused
+///   forward to a coherent CPU replay; both are counted in
+///   [`EngineStats::sampled_topk_full_row_steps`](crate::engine::EngineStats::sampled_topk_full_row_steps).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SampledTopKConfig {
+    /// Where the candidates come from.
+    pub mode: SampledTopKMode,
+    /// How many candidates to download per token (clamped to
+    /// `1..=MAX_RESIDENT_TOPK` and to the vocabulary).
+    pub candidates: usize,
+}
+
+impl Default for SampledTopKConfig {
+    /// The route disabled ([`SampledTopKMode::Off`]), with
+    /// [`DEFAULT_SAMPLED_TOPK_CANDIDATES`] candidates ready for an opt-in.
+    fn default() -> Self {
+        Self {
+            mode: SampledTopKMode::Off,
+            candidates: DEFAULT_SAMPLED_TOPK_CANDIDATES,
+        }
+    }
+}
+
+impl SampledTopKConfig {
+    /// The opt-in configuration: [`SampledTopKMode::GpuCandidates`] with
+    /// [`DEFAULT_SAMPLED_TOPK_CANDIDATES`] candidates per decode step.
+    #[must_use]
+    pub fn gpu_candidates() -> Self {
+        Self {
+            mode: SampledTopKMode::GpuCandidates,
+            ..Self::default()
+        }
+    }
+
+    /// The candidate count actually used for a `vocab`-wide logit row.
+    #[must_use]
+    pub fn effective_candidates(&self, vocab: usize) -> usize {
+        self.candidates
+            .clamp(1, oxibonsai_kernels::gpu_backend::MAX_RESIDENT_TOPK)
+            .min(vocab.max(1))
+    }
+}
+
+/// The top-`k` `(id, logit)` candidates of a full logit row, in exactly the
+/// order the GPU `topk_f32` kernel produces them: descending logit, an exact
+/// tie to the **smaller** id, `NaN` and `-inf` never selected, unfilled slots
+/// padded with `(0, -inf)`.
+///
+/// This is the CPU half of the sampled top-k route's byte-identity: sampling
+/// this sub-row and sampling the GPU's downloaded one are the same
+/// computation on the same numbers.
+pub fn top_k_candidates(row: &[f32], k: usize) -> (Vec<u32>, Vec<f32>) {
+    let mut ranked: Vec<(u32, f32)> = row
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| **v > f32::NEG_INFINITY)
+        .map(|(i, v)| (u32::try_from(i).unwrap_or(u32::MAX), *v))
+        .collect();
+    let order = |a: &(u32, f32), b: &(u32, f32)| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    };
+    if k < ranked.len() {
+        ranked.select_nth_unstable_by(k, order);
+        ranked.truncate(k);
+    }
+    ranked.sort_unstable_by(order);
+    let mut ids = Vec::with_capacity(k);
+    let mut values = Vec::with_capacity(k);
+    for (id, value) in ranked.into_iter().take(k) {
+        ids.push(id);
+        values.push(value);
+    }
+    while ids.len() < k {
+        ids.push(0);
+        values.push(f32::NEG_INFINITY);
+    }
+    (ids, values)
+}
 
 /// Index of the maximum value, ties broken toward the **first** index.
 ///
@@ -144,6 +311,16 @@ impl<'a> InferenceEngine<'a> {
         prompt_tokens: &[u32],
         max_tokens: usize,
     ) -> RuntimeResult<Vec<u32>> {
+        if self.is_hybrid() {
+            // No hybrid GPU encoder exists yet (waves 5+): the explicit
+            // greedy entry point decodes the full logit row on the CPU with
+            // a first-index argmax -- the same answer, not a pretend GPU run.
+            tracing::info!(
+                "generate_greedy_gpu: hybrid model has no fused GPU decode path; decoding \
+                 greedily on the CPU"
+            );
+            return self.generate_greedy_penalised(prompt_tokens, max_tokens, |_| true);
+        }
         if !GPU_ARGMAX_TIEBREAK_IS_FIRST_INDEX {
             tracing::info!(
                 "generate_greedy_gpu: GPU_ARGMAX_TIEBREAK_IS_FIRST_INDEX is false \
@@ -229,7 +406,7 @@ impl<'a> InferenceEngine<'a> {
                     break;
                 }
                 output_tokens.push(next_token);
-                logits = self.model.forward(next_token, pos, &self.kernel)?;
+                logits = self.forward_logits(next_token, pos)?;
                 if let Some(m) = &self.metrics {
                     m.decode_token_duration_seconds
                         .observe(step_start.elapsed().as_secs_f64());
@@ -304,8 +481,17 @@ impl<'a> InferenceEngine<'a> {
         cpu_fallback_active: &mut bool,
         force_cpu: bool,
     ) -> RuntimeResult<u32> {
-        if !*cpu_fallback_active && !force_cpu {
-            match self.model.forward_greedy_gpu(next_token, pos - 1) {
+        // Only a dense model has a fused GPU greedy decode; a hybrid engine
+        // (never routed here -- see `generate_greedy_gpu`) goes straight to
+        // the CPU arm below.
+        let gpu_attempt = match &self.model {
+            LoadedModel::Dense(model) if !*cpu_fallback_active && !force_cpu => {
+                Some(model.forward_greedy_gpu(next_token, pos - 1))
+            }
+            _ => None,
+        };
+        if let Some(attempt) = gpu_attempt {
+            match attempt {
                 Ok(token_id) => return Ok(token_id),
                 // The DESIGNED signal (MET-05): the fused GPU path kept its
                 // own device KV cache, so the host cache holds no history
@@ -351,7 +537,7 @@ impl<'a> InferenceEngine<'a> {
         }
         let logits = if *cpu_fallback_active {
             // Cache already coherent from an earlier rebuild — normal CPU forward.
-            self.model.forward(next_token, pos - 1, cpu_kernel)?
+            self.forward_logits_on(next_token, pos - 1, cpu_kernel)?
         } else {
             // First CPU fall-through: reconstruct the CPU KV cache from scratch by
             // replaying the committed tokens (positions 0..committed.len()) — this
@@ -367,7 +553,7 @@ impl<'a> InferenceEngine<'a> {
             self.model.reset();
             let mut last = Vec::new();
             for (p, &tok) in committed.iter().enumerate() {
-                last = self.model.forward(tok, p, cpu_kernel)?;
+                last = self.forward_logits_on(tok, p, cpu_kernel)?;
             }
             *cpu_fallback_active = true;
             last
@@ -500,10 +686,7 @@ impl<'a> InferenceEngine<'a> {
                 batch.push(next_token);
                 batch.extend_from_slice(&draft);
 
-                match self
-                    .model
-                    .forward_prefill_verify(&batch, pos - 1, &self.kernel)
-                {
+                match self.verify_batch(&batch, pos - 1) {
                     Ok(model_preds) => {
                         spec_attempts += 1;
 
@@ -654,6 +837,371 @@ impl<'a> InferenceEngine<'a> {
         Ok(output_tokens)
     }
 }
+
+// ═════════════════════════════════════════════════════════════════════════
+//  Sampled decode on the fused GPU route: top-k candidates, not full rows
+//  (`perf-11`, sampled half)
+// ═════════════════════════════════════════════════════════════════════════
+
+impl InferenceEngine<'_> {
+    /// The sampled top-k route's configuration (`perf-11`).
+    pub fn sampled_topk(&self) -> SampledTopKConfig {
+        self.sampled_topk
+    }
+
+    /// Configure the sampled top-k route: opt in with
+    /// [`SampledTopKConfig::gpu_candidates`], choose the candidate count, or
+    /// select the full-row reference / disabled (default) modes.
+    pub fn set_sampled_topk(&mut self, config: SampledTopKConfig) {
+        self.sampled_topk = config;
+    }
+
+    /// Whether the configured sampler actually samples (temperature at or
+    /// above [`GREEDY_TEMPERATURE_EPS`]).
+    fn sampler_is_sampled(&self) -> bool {
+        self.sampler.params().temperature >= GREEDY_TEMPERATURE_EPS
+    }
+
+    /// The single predicate deciding whether a sampled generation may take
+    /// the top-k route (`perf-11`, sampled half): the fused GPU route, a
+    /// truly sampled request, no penalty (a penalty must see every logit),
+    /// no need for the full row (`needs_full_logits`: logprobs), the route
+    /// enabled (it is **off** by default), and the sampler's `top_k` within
+    /// `1..=candidates` and below the vocabulary — see [`SampledTopKConfig`]
+    /// for why those last two conditions are what make the candidate sub-row
+    /// an exact stand-in for the full row.
+    pub fn sampled_topk_eligible(&self, needs_full_logits: bool) -> bool {
+        if needs_full_logits
+            || !self.uses_fused_gpu_decode()
+            || self.sampled_topk.mode == SampledTopKMode::Off
+            || !self.sampler_is_sampled()
+            || self.greedy_penalties_active()
+        {
+            return false;
+        }
+        let top_k = self.sampler.params().top_k;
+        let vocab = self.vocab_size();
+        // `top_k < vocab`: at `top_k >= vocab` the full-row sampler performs
+        // no top-k selection at all (it walks the row in index order) while
+        // the candidate sub-row is walked in rank order, so the two could
+        // not share one realisation even with a canonical sampler.
+        top_k >= 1 && top_k < vocab && top_k <= self.sampled_topk.effective_candidates(vocab)
+    }
+
+    /// Count a sampled request on the fused GPU route that is about to decode
+    /// the full logit row because it is not eligible for the top-k route.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    pub(crate) fn note_sampled_full_row_request(&self) {
+        if self.uses_fused_gpu_decode() && self.sampler_is_sampled() {
+            self.stats
+                .sampled_full_row_requests
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Sample one token from a candidate sub-row (`ids`/`values` in the
+    /// kernel's order): the engine's own sampler runs temperature, `top_k`,
+    /// `min_p`, `top_p` and the weighted draw over the `values`, consuming
+    /// exactly one random draw, and the winning index maps back to its id.
+    #[cfg(any(test, all(feature = "metal", target_os = "macos")))]
+    pub(crate) fn sample_candidates(&mut self, ids: &[u32], values: &[f32]) -> RuntimeResult<u32> {
+        let index = self.sampler.sample(values)? as usize;
+        ids.get(index).copied().ok_or_else(|| {
+            crate::error::RuntimeError::Config(format!(
+                "sampled top-k: sampler returned candidate {index} of {}",
+                ids.len()
+            ))
+        })
+    }
+
+    /// Sample one token from the top-`k` candidates of a full host logit row:
+    /// the CPU extraction ([`top_k_candidates`]) followed by
+    /// [`Self::sample_candidates`] — the computation a GPU candidate step
+    /// performs, and what [`SampledTopKMode::FullRowCandidates`] runs as its
+    /// bit-exact reference.
+    ///
+    /// This is the opt-in route's *candidate* realisation, **not** the
+    /// classic full-row sampler: until `Sampler::sample_core` walks its
+    /// survivors in a canonical order (see [`SampledTopKConfig`]), a seeded
+    /// draw through this function and a seeded `Sampler::sample` over the
+    /// same full row pick different — equally distributed — tokens on a
+    /// share of rows (measured: 125 of 200 tie-heavy rows at `top_k 20,
+    /// top_p 1.0`). That is exactly why the route is off by default; the
+    /// shipped default path never calls this.
+    #[cfg(test)]
+    pub(crate) fn sample_row_candidates(&mut self, row: &[f32], k: usize) -> RuntimeResult<u32> {
+        let (ids, values) = top_k_candidates(row, k);
+        self.sample_candidates(&ids, &values)
+    }
+
+    /// Sample one token from a full host logit row with the classic sampler
+    /// — exactly the draw [`SampledTopKMode::Off`] makes at every step. The
+    /// route uses it for every step whose full row is on the host anyway
+    /// (the prefill row and every fallback), so those steps can never differ
+    /// from the default path.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    fn sample_full_row(&mut self, row: &[f32]) -> RuntimeResult<u32> {
+        self.sampler.sample(row)
+    }
+
+    /// Whether top-`k` candidates (`ids`/`values`, descending) can stand in
+    /// for the full row this step: their winner agrees with the fused
+    /// forward's own argmax, and every value the sampler's `top_k` will read
+    /// is finite (a `-inf` pad inside it means fewer finite logits than
+    /// `top_k`, and a `NaN` is never selected).
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    fn candidates_usable(&self, ids: &[u32], values: &[f32], argmax_id: u32) -> bool {
+        let top_k = self.sampler.params().top_k;
+        ids.first() == Some(&argmax_id)
+            && values.len() >= top_k
+            && values[..top_k].iter().all(|v| v.is_finite())
+    }
+
+    /// Download the fused forward's resident `[vocab]` logit row.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    fn download_resident_row(vocab: usize) -> RuntimeResult<Vec<f32>> {
+        oxibonsai_kernels::gpu_backend::metal_resident_logits_download(vocab).map_err(|e| {
+            crate::error::RuntimeError::Kernel(oxibonsai_kernels::error::KernelError::GpuError(
+                e.to_string(),
+            ))
+        })
+    }
+
+    /// One sampled decode step on the fused route: forward `token` at `pos`
+    /// on the GPU (logits stay resident), then draw the step's token.
+    ///
+    /// * [`SampledTopKMode::GpuCandidates`]: download only the top-`k`
+    ///   candidates and draw from them; when they cannot stand in for the
+    ///   row, download the resident row and draw with the classic sampler.
+    /// * [`SampledTopKMode::FullRowCandidates`]: download the resident row and
+    ///   run the very same candidate draw on its CPU extraction — the
+    ///   bit-exact reference of the GPU download — with the same classic
+    ///   fallback.
+    ///
+    /// A fused forward that fails (or `force_cpu`) falls back to a coherent
+    /// CPU replay (exactly the greedy path's MET-05 machinery) and the
+    /// classic sampler. Every step not served by GPU candidates is counted in
+    /// `sampled_topk_full_row_steps`.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[allow(clippy::too_many_arguments)]
+    fn sampled_topk_step(
+        &mut self,
+        committed: &[u32],
+        token: u32,
+        pos: usize,
+        k: usize,
+        cpu_kernel: &KernelDispatcher,
+        cpu_fallback_active: &mut bool,
+        force_cpu: bool,
+    ) -> RuntimeResult<u32> {
+        use std::sync::atomic::Ordering;
+
+        let gpu_attempt = match &self.model {
+            LoadedModel::Dense(model) if !*cpu_fallback_active && !force_cpu => {
+                Some(model.forward_greedy_gpu(token, pos))
+            }
+            _ => None,
+        };
+        match gpu_attempt {
+            Some(Ok(argmax_id)) => {
+                let vocab = self.vocab_size();
+                if self.sampled_topk.mode == SampledTopKMode::GpuCandidates {
+                    match oxibonsai_kernels::gpu_backend::metal_resident_logits_topk(vocab, k) {
+                        Ok(candidates)
+                            if self.candidates_usable(
+                                &candidates.ids,
+                                &candidates.values,
+                                argmax_id,
+                            ) =>
+                        {
+                            self.stats
+                                .sampled_topk_steps
+                                .fetch_add(1, Ordering::Relaxed);
+                            return self.sample_candidates(&candidates.ids, &candidates.values);
+                        }
+                        Ok(candidates) => tracing::debug!(
+                            pos,
+                            argmax_id,
+                            gpu_first = ?candidates.ids.first(),
+                            "sampled top-k: GPU candidates cannot stand in for the full row this \
+                             step; downloading the resident row"
+                        ),
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            pos,
+                            "sampled top-k: GPU candidate download failed; downloading the \
+                             resident row"
+                        ),
+                    }
+                }
+                // The logits are still resident: no second forward needed.
+                self.stats
+                    .sampled_topk_full_row_steps
+                    .fetch_add(1, Ordering::Relaxed);
+                let row = Self::download_resident_row(vocab)?;
+                if self.sampled_topk.mode == SampledTopKMode::FullRowCandidates {
+                    let (ids, values) = top_k_candidates(&row, k);
+                    if self.candidates_usable(&ids, &values, argmax_id) {
+                        return self.sample_candidates(&ids, &values);
+                    }
+                }
+                return self.sample_full_row(&row);
+            }
+            Some(Err(e)) => {
+                let rebuild = e
+                    .downcast_ref::<oxibonsai_model::error::ModelError>()
+                    .and_then(oxibonsai_model::model::gpu_fallback_cache_rebuild_pos);
+                if rebuild.is_some() {
+                    tracing::warn!(
+                        error = %e, pos, ?rebuild,
+                        "sampled GPU decode requires a host KV-cache rebuild (MET-05); replaying \
+                         the committed sequence on the CPU"
+                    );
+                } else {
+                    tracing::error!(
+                        error = %e,
+                        pos,
+                        "sampled Metal GPU decode FAILED; rebuilding the CPU KV cache and \
+                         continuing on the CPU -- a real GPU error, not expected control flow"
+                    );
+                }
+            }
+            None => {}
+        }
+
+        self.stats
+            .sampled_topk_full_row_steps
+            .fetch_add(1, Ordering::Relaxed);
+        let logits = if *cpu_fallback_active {
+            self.forward_logits_on(token, pos, cpu_kernel)?
+        } else {
+            // Rebuild the host KV cache coherently: replay every committed
+            // token (the last of which is `token`, at `pos`).
+            self.model.reset();
+            let mut last = Vec::new();
+            for (p, &tok) in committed.iter().enumerate() {
+                last = self.forward_logits_on(tok, p, cpu_kernel)?;
+            }
+            *cpu_fallback_active = true;
+            last
+        };
+        self.sample_full_row(&logits)
+    }
+
+    /// The sampled top-k decode loop (`perf-11`, sampled half).
+    ///
+    /// `unchecked` like [`Self::generate_greedy_gpu_unchecked`]: the caller
+    /// has gone through [`Self::sampled_topk_eligible`]. The first token is
+    /// drawn from the prefill row — already on the host — by the classic
+    /// sampler, exactly as [`SampledTopKMode::Off`] draws it; only the decode
+    /// steps after it read GPU candidates.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    pub(crate) fn generate_sampled_gpu_topk_unchecked<F>(
+        &mut self,
+        prompt_tokens: &[u32],
+        max_tokens: usize,
+        mut emit: F,
+    ) -> RuntimeResult<Vec<u32>>
+    where
+        F: FnMut(u32) -> bool,
+    {
+        if prompt_tokens.is_empty() {
+            return Ok(vec![]);
+        }
+        let Some(prefill_row) = self.prefill_for_generate(prompt_tokens)? else {
+            return Ok(vec![]);
+        };
+        let k = self.sampled_topk.effective_candidates(self.vocab_size());
+        let decode_start = std::time::Instant::now();
+        let mut output_tokens = Vec::with_capacity(max_tokens.min(MAX_PREALLOC_TOKENS));
+        let mut context: Vec<u32> = prompt_tokens.to_vec();
+        let cpu_kernel = KernelDispatcher::with_tier(KernelTier::Reference);
+        let mut cpu_fallback_active = false;
+        let force_cpu_after = self.speculative.force_cpu_decode_after;
+        let mut pos = prompt_tokens.len();
+
+        for step in 0..max_tokens {
+            let step_start = std::time::Instant::now();
+            if self.is_cancelled() {
+                tracing::debug!(pos, "sampled top-k generation cancelled");
+                break;
+            }
+            let next = if step == 0 {
+                self.sample_full_row(&prefill_row)?
+            } else {
+                let fed = *context.last().ok_or_else(|| {
+                    crate::error::RuntimeError::Config(
+                        "sampled top-k: empty decode context".to_string(),
+                    )
+                })?;
+                let force_cpu = force_cpu_after.is_some_and(|n| output_tokens.len() >= n);
+                let token = self.sampled_topk_step(
+                    &context,
+                    fed,
+                    pos,
+                    k,
+                    &cpu_kernel,
+                    &mut cpu_fallback_active,
+                    force_cpu,
+                )?;
+                pos += 1;
+                token
+            };
+            if self.is_eos(next) {
+                tracing::debug!(pos, "EOS token generated (sampled top-k)");
+                break;
+            }
+            if !emit(next) {
+                tracing::debug!(pos, "receiver dropped, stopping generation");
+                break;
+            }
+            output_tokens.push(next);
+            context.push(next);
+            if let Some(m) = &self.metrics {
+                m.decode_token_duration_seconds
+                    .observe(step_start.elapsed().as_secs_f64());
+            }
+        }
+
+        self.record_decode_metrics(decode_start, output_tokens.len());
+        self.stats.record_request(output_tokens.len());
+        tracing::info!(
+            prompt_len = prompt_tokens.len(),
+            generated = output_tokens.len(),
+            candidates = k,
+            "sampled top-k generation complete"
+        );
+        Ok(output_tokens)
+    }
+
+    /// Route a sampled request that reached `generate`/`generate_tracked`/the
+    /// streaming pair: through the top-k route when eligible, else count it
+    /// as a full-row request and let the caller run its classic loop.
+    ///
+    /// Returns `Some(tokens)` when the top-k route ran.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    pub(crate) fn try_sampled_topk_route<F>(
+        &mut self,
+        prompt_tokens: &[u32],
+        max_tokens: usize,
+        emit: F,
+    ) -> RuntimeResult<Option<Vec<u32>>>
+    where
+        F: FnMut(u32) -> bool,
+    {
+        if self.sampled_topk_eligible(false) {
+            return self
+                .generate_sampled_gpu_topk_unchecked(prompt_tokens, max_tokens, emit)
+                .map(Some);
+        }
+        self.note_sampled_full_row_request();
+        Ok(None)
+    }
+}
+
+#[cfg(test)]
+#[path = "engine_topk_tests.rs"]
+mod topk_tests;
 
 #[cfg(test)]
 mod tests {

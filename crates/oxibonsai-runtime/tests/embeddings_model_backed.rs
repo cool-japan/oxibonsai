@@ -31,6 +31,36 @@
 //! (`Capability::LegacyModels`, `record_skipped`) rather than returning green,
 //! so a run that never exercised a real model is distinguishable in the
 //! manifest from one that did.
+//!
+//! # `tiny_test()`'s unit-norm substitution, recorded here as the wave-4
+//! # verifier's minor[1] asked (also in this package's `deviations`)
+//!
+//! `weightless_tiny_test_engine_embeds_to_the_right_shape` asserts SHAPE only
+//! — never unit norm — because `Qwen3Config::tiny_test()` through
+//! `BonsaiModel::new` leaves `blocks` empty and synthesizes an all-zero
+//! `token_embd`, so every hidden state (and therefore the pooled vector) is
+//! exactly zero, which has norm `0`, not `1`. The corresponding unit-norm
+//! assertion runs on the WEIGHTED synthetic ternary GGUF instead
+//! (`engine_embed_returns_hidden_size_floats_with_unit_norm`,
+//! `model_backed_router_answers_200_with_unit_norm_vectors`), never on
+//! `tiny_test()`. This substitution is correct — asserting unit norm against
+//! a model that produces the zero vector would be asserting something false —
+//! but it means the literal spec text ("`tiny_test()` config engine → embed
+//! returns hidden_size floats with unit norm") is satisfied by two tests, not
+//! one; see the module docs above ("Why most tests here use a synthetic
+//! *weighted* GGUF") for the fuller rationale.
+//!
+//! # EMBED-WIRE additions
+//!
+//! Section 2b proves `EmbedderRegistry::embed_texts` /
+//! `embed_token_batches` — the methods the HTTP handler actually calls —
+//! reach [`ModelEmbedder`]'s batched engine lock (closing the wave-4
+//! verifier's minor[2]: the lock existed but was never reached). Section 3b
+//! proves the same end to end over HTTP, plus the `context_length_exceeded`
+//! / truncation split (EMBED-WIRE item 3): TEXT that tokenizes past the
+//! backend's ceiling is refused rather than silently truncated and billed in
+//! full (closing minor[3]); raw token ids keep truncating, now billed for
+//! exactly what gets embedded.
 
 // `embeddings` is only compiled with the `server` feature; gate the whole file
 // the same way so `--no-default-features` stays green.
@@ -427,7 +457,11 @@ fn engine_embed_does_not_disturb_the_kv_cache() {
     let mut engine = weighted_engine();
     let _ = engine.embed(&[5, 6, 7]).expect("embed");
     assert_eq!(
-        engine.model().kv_cache().seq_len(),
+        engine
+            .dense_model()
+            .expect("the weighted fixture is a dense model")
+            .kv_cache()
+            .seq_len(),
         0,
         "embedding must leave no per-sequence state behind for the next request"
     );
@@ -539,6 +573,84 @@ fn embed_tokens_bypasses_the_tokenizer() {
         from_text, from_ids,
         "embedding the ids of a text must equal embedding the text"
     );
+}
+
+// ─── 2b. EMBED-WIRE item 2: the registry reaches the batched lock ────────────
+//
+// `ModelEmbedder::embed_batch` (section 2 above) always took its lock once
+// for a whole batch, but the wave-4 verifier's minor[2] caught that
+// `EmbedderRegistry::embed_texts` — the ONE method the HTTP handler actually
+// calls — never reached it: an N-input request took the engine mutex N
+// times regardless. These tests exercise the registry entry point, not the
+// embedder directly, to prove that wiring now holds.
+
+#[test]
+fn embed_texts_through_the_registry_takes_the_engine_lock_once_for_the_whole_batch() {
+    let embedder = weighted_embedder();
+    let registry = EmbedderRegistry::new(32).with_model(Arc::clone(&embedder));
+    let before = embedder.lock_acquisitions();
+    let texts = vec![
+        "one".to_string(),
+        "two".to_string(),
+        "three".to_string(),
+        "four".to_string(),
+    ];
+    let batched = registry.embed_texts(&texts);
+    assert_eq!(
+        embedder.lock_acquisitions() - before,
+        1,
+        "EmbedderRegistry::embed_texts must take the engine lock once for the whole batch, \
+         not once per item"
+    );
+    for (i, text) in texts.iter().enumerate() {
+        let single = embedder.embed(text).expect("single embed");
+        assert_eq!(
+            batched[i], single,
+            "the batched result must equal the per-item path for item {i}"
+        );
+    }
+}
+
+#[test]
+fn token_id_batches_through_the_registry_take_the_engine_lock_once_for_the_whole_batch() {
+    let embedder = weighted_embedder();
+    let registry = EmbedderRegistry::new(32).with_model(Arc::clone(&embedder));
+    let before = embedder.lock_acquisitions();
+    let batches = vec![vec![1u32, 2, 3], vec![4u32, 5], vec![6u32]];
+    let batched = registry
+        .embed_token_batches(&batches)
+        .expect("a model backend installs a token embedder");
+    assert_eq!(
+        embedder.lock_acquisitions() - before,
+        1,
+        "a 3-batch `\"input\": [[..], [..], [..]]` request must take the engine lock once, \
+         not once per sequence"
+    );
+    for (i, ids) in batches.iter().enumerate() {
+        let single = embedder.embed_tokens(ids).expect("single embed_tokens");
+        assert_eq!(
+            batched[i], single,
+            "the batched result must equal the per-item path for batch {i}"
+        );
+    }
+}
+
+#[test]
+fn embedding_dim_agrees_with_the_vectors_the_model_path_actually_returns() {
+    let embedder = weighted_embedder();
+    // Deliberately mismatched `default_dim` (999): if `embedding_dim()` ever
+    // fell back to it instead of asking the installed model backend, this
+    // assertion would catch it immediately.
+    let registry = EmbedderRegistry::new(999).with_model(Arc::clone(&embedder));
+    let vectors = registry.embed_texts(&["hello".to_string(), "world".to_string()]);
+    for (i, v) in vectors.iter().enumerate() {
+        assert_eq!(
+            v.len(),
+            registry.embedding_dim(),
+            "item {i}: EmbedderRegistry::embedding_dim() must agree with the vectors the \
+             installed model backend actually returns"
+        );
+    }
 }
 
 // ─── 3. HTTP surface ─────────────────────────────────────────────────────────
@@ -701,6 +813,134 @@ async fn empty_input_is_refused_before_any_model_work() {
         1,
         "a refused request is still an error in /metrics"
     );
+}
+
+// ─── 3b. EMBED-WIRE items 2 & 3: batched lock and truncation, end to end ─────
+
+#[tokio::test]
+async fn http_batch_request_takes_the_engine_lock_once_for_the_whole_batch() {
+    let embedder = weighted_embedder();
+    let metrics = Arc::new(InferenceMetrics::new());
+    let app = create_embeddings_router_from_state(
+        EmbeddingAppState::from_registry(
+            EmbedderRegistry::new(32)
+                .with_require_model_backend(true)
+                .with_model(Arc::clone(&embedder)),
+        )
+        .with_metrics(Arc::clone(&metrics)),
+    );
+    let before = embedder.lock_acquisitions();
+    let (status, json) = post_embeddings(
+        app,
+        serde_json::json!({ "input": ["one", "two", "three", "four"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["data"].as_array().expect("data").len(), 4);
+    assert_eq!(
+        embedder.lock_acquisitions() - before,
+        1,
+        "a 4-input POST /v1/embeddings request must take the engine lock exactly once end to \
+         end, not once per item"
+    );
+}
+
+/// A [`ModelEmbedder`] with a deliberately tiny token ceiling, for the
+/// truncation tests below.
+fn embedder_with_max_tokens(max_tokens: usize) -> Arc<ModelEmbedder> {
+    Arc::new(
+        ModelEmbedder::new(Arc::new(Mutex::new(weighted_engine())), fixture_tokenizer())
+            .with_max_tokens(max_tokens),
+    )
+}
+
+#[tokio::test]
+async fn text_longer_than_max_tokens_is_refused_with_context_length_exceeded() {
+    let metrics = Arc::new(InferenceMetrics::new());
+    let embedder = embedder_with_max_tokens(4);
+    let app = create_embeddings_router_from_state(
+        EmbeddingAppState::from_registry(
+            EmbedderRegistry::new(32)
+                .with_require_model_backend(true)
+                .with_model(Arc::clone(&embedder)),
+        )
+        .with_metrics(Arc::clone(&metrics)),
+    );
+    // The char-level fixture tokenizer maps one id per character, so 10
+    // characters is unambiguously 10 tokens against a ceiling of 4.
+    let (status, json) = post_embeddings(app, serde_json::json!({ "input": "0123456789" })).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an over-length TEXT input must be refused, not silently truncated and billed in \
+         full: {json}"
+    );
+    assert_eq!(
+        json["error"]["code"].as_str(),
+        Some("context_length_exceeded"),
+        "{json}"
+    );
+    assert_eq!(json["error"]["n_tokens"].as_u64(), Some(10), "{json}");
+    assert_eq!(json["error"]["max_tokens"].as_u64(), Some(4), "{json}");
+    assert_eq!(
+        metrics.errors_total.get(),
+        1,
+        "a refused over-long request is still an error in /metrics"
+    );
+    assert_eq!(
+        metrics.prompt_tokens_total.get(),
+        0,
+        "a request refused before any embedding work must not be billed at all"
+    );
+}
+
+#[tokio::test]
+async fn token_id_input_longer_than_max_tokens_still_truncates_and_charges_only_what_was_embedded()
+{
+    let metrics = Arc::new(InferenceMetrics::new());
+    let embedder = embedder_with_max_tokens(4);
+    let app = create_embeddings_router_from_state(
+        EmbeddingAppState::from_registry(
+            EmbedderRegistry::new(32)
+                .with_require_model_backend(true)
+                .with_model(Arc::clone(&embedder)),
+        )
+        .with_metrics(Arc::clone(&metrics)),
+    );
+    // 6 ids against a ceiling of 4: the raw token-id path must keep
+    // truncating (EMBED-WIRE item 3's explicit carve-out), not error.
+    let ids: Vec<u32> = vec![10, 20, 30, 40, 50, 60];
+    let (status, json) = post_embeddings(app, serde_json::json!({ "input": ids })).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the raw token-id path must keep truncating rather than erroring: {json}"
+    );
+    assert_eq!(
+        json["usage"]["prompt_tokens"].as_u64(),
+        Some(4),
+        "usage must charge exactly the 4 ids actually embedded after truncation, not the 6 \
+         supplied: {json}"
+    );
+    assert_eq!(
+        metrics.prompt_tokens_total.get(),
+        4,
+        "the shared metrics must see the same corrected (truncated) count: {json}"
+    );
+
+    // And the vector actually served must equal embedding only the first 4
+    // ids directly — proving this is really truncation, not a coincidence
+    // in the token count alone.
+    let expected = embedder
+        .embed_tokens(&ids[..4])
+        .expect("direct truncated embed");
+    let served = float_vector(&json["data"][0]);
+    for (i, (got, want)) in served.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            (got - want).abs() < 1e-5,
+            "component {i}: got {got} want {want}"
+        );
+    }
 }
 
 // ─── 4. SV-25: both branches are instrumented ────────────────────────────────

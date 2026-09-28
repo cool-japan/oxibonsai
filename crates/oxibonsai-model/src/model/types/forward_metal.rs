@@ -3,11 +3,188 @@
 //! All ternary (TQ2_0_g128) paths here share one weight-handle namespace and
 //! one weight-binding prologue, both owned by [`super::gpu_cache`]; see that
 //! module for why (MET-02 / MET-03 / perf-03).
+//!
+//! The 1-bit (Q1) fused paths key the norm and LM-head buffers they hand the
+//! kernels on [`Q1MetalSlots`]: slots namespaced by a per-load model epoch,
+//! so two different Q1 models in one process can never be served each
+//! other's weights (MET-02, Q1 half).
 
 use super::{BonsaiModel, OutputWeight};
 use crate::block::blocks_as_bytes;
-use std::sync::atomic::{AtomicBool, Ordering};
+use oxibonsai_kernels::gpu_backend::metal_full_layer::types::{
+    next_model_epoch, WeightKey, WeightKind,
+};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::OnceLock;
+
+/// Tag bit of every [`Q1MetalSlots`] slot. User-space addresses (which the
+/// ternary and image caches key on) never set bit 63, and the per-upload
+/// handle ids (`NEXT_HANDLE_ID`) are small counters, so a tagged slot cannot
+/// collide with either namespace.
+const Q1_SLOT_TAG: u64 = 1 << 63;
+
+/// Bits below the epoch: the per-model local slot (`< 2^24`).
+const Q1_SLOT_LOCAL_BITS: u32 = 24;
+
+/// Mask keeping the epoch clear of the tag bit (`2^39` model loads).
+const Q1_SLOT_EPOCH_MASK: u64 = (1 << (63 - Q1_SLOT_LOCAL_BITS)) - 1;
+
+/// Local slot of layer `l`'s first norm (`+0` attn, `+1` q, `+2` k, `+3` ffn).
+const Q1_NORM_LOCAL_BASE: u64 = 1_000_000;
+/// Local slot of the final `output_norm`.
+const Q1_FINAL_NORM_LOCAL: u64 = 2_000_000;
+/// Local slot of the 1-bit LM head.
+const Q1_LM_HEAD_LOCAL: u64 = 3_000_000;
+
+/// The Metal weight-cache slots of one Q1 model's fused paths (MET-02, Q1
+/// half).
+///
+/// The kernels' Q1 entry points (`try_metal_full_forward*`,
+/// `try_metal_full_forward_prefill*`) take `u64` slot ids for the norms and
+/// the LM head and key each upload as `WeightKey::legacy(kind, slot)`. Every
+/// Q1 model used to pass the same literals — `1_000_000 + layer * 10 + k`,
+/// `2_000_000`, `3_000_000` — so a second, different Q1 model loaded into the
+/// same process was silently served the first model's norms and LM head from
+/// the cache. Each load now mints a fresh epoch
+/// ([`next_model_epoch`], never reused) and composes its slots as
+/// `TAG | epoch << 24 | local`: the old locals, namespaced per model.
+///
+/// # Lifetime
+///
+/// Per-load slots would otherwise leak one copy of a model's norms and LM
+/// head per load/unload cycle (the shared literals were at least reused), so
+/// the slots release what they populated: explicitly through
+/// [`Self::release`] / [`BonsaiModel::release_q1_metal_slots`], and on
+/// `Drop` — i.e. when the owning model is dropped. Evicting only removes the
+/// cache entries; a dispatch already encoded keeps its buffers alive through
+/// its own `Arc`s.
+#[derive(Debug)]
+pub struct Q1MetalSlots {
+    epoch: u64,
+    /// Layer count of the model a fused Q1 path last handed these slots to
+    /// the kernels for; `0` while no path has. [`Self::release`] sweeps
+    /// exactly the keys that can then be populated, and a model that never
+    /// ran a fused Q1 path never touches (or initialises) the Metal graph.
+    used_layers: AtomicUsize,
+}
+
+impl Q1MetalSlots {
+    /// Slots for a freshly loaded model (a new, never-reused epoch).
+    #[must_use]
+    pub fn fresh() -> Self {
+        Self::with_epoch(next_model_epoch())
+    }
+
+    /// Slots for a given epoch — for a caller that already holds one. Two
+    /// values built from the same epoch address the same buffers, and
+    /// either one's release (or drop) evicts them for both: the other simply
+    /// re-uploads on its next miss.
+    #[must_use]
+    pub fn with_epoch(epoch: u64) -> Self {
+        Self {
+            epoch,
+            used_layers: AtomicUsize::new(0),
+        }
+    }
+
+    /// The model epoch these slots are namespaced by.
+    #[must_use]
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    fn slot(&self, local: u64) -> u64 {
+        Q1_SLOT_TAG | ((self.epoch & Q1_SLOT_EPOCH_MASK) << Q1_SLOT_LOCAL_BITS) | local
+    }
+
+    /// Base of layer `layer`'s four norm slots (`+0` attn, `+1` q, `+2` k,
+    /// `+3` ffn).
+    #[must_use]
+    pub fn norm_base(&self, layer: usize) -> u64 {
+        self.slot(Q1_NORM_LOCAL_BASE + (layer as u64) * 10)
+    }
+
+    /// Slot of the final `output_norm`.
+    #[must_use]
+    pub fn final_norm(&self) -> u64 {
+        self.slot(Q1_FINAL_NORM_LOCAL)
+    }
+
+    /// Slot of the 1-bit LM head.
+    #[must_use]
+    pub fn lm_head(&self) -> u64 {
+        self.slot(Q1_LM_HEAD_LOCAL)
+    }
+
+    /// Record that a fused path is about to hand these slots to the kernels
+    /// for an `n_layers`-layer model. `pub(super)` so every `BonsaiModel`
+    /// path that keys Q1 buffers on these slots can record it.
+    pub(super) fn mark_used(&self, n_layers: usize) {
+        self.used_layers
+            .fetch_max(n_layers.max(1), Ordering::Relaxed);
+    }
+
+    /// Whether a fused Q1 path has handed these slots to the kernels since
+    /// they were created or last released.
+    #[must_use]
+    pub fn is_in_use(&self) -> bool {
+        self.used_layers.load(Ordering::Relaxed) > 0
+    }
+
+    /// Every `(slot, kind)` these slots can have populated for an
+    /// `n_layers`-layer model.
+    #[must_use]
+    pub fn cache_keys(&self, n_layers: usize) -> Vec<(u64, WeightKind)> {
+        let mut keys = Vec::with_capacity(n_layers * 4 + 2);
+        for layer in 0..n_layers {
+            let base = self.norm_base(layer);
+            keys.extend((0..4).map(|k| (base + k, WeightKind::RawF32)));
+        }
+        keys.push((self.final_norm(), WeightKind::RawF32));
+        keys.push((self.lm_head(), WeightKind::Q1Soa));
+        keys
+    }
+
+    /// Evict every buffer these slots can have populated from the Metal
+    /// weight cache of the session this thread dispatches into
+    /// ([`oxibonsai_kernels::MetalGraph::global`]), returning how many slots
+    /// were swept — `Ok(0)`, without touching the Metal graph, when no fused
+    /// Q1 path has used them since they were created or last released.
+    ///
+    /// # Errors
+    ///
+    /// The Metal graph cannot be reached, or its cache lock is poisoned; the
+    /// slots then stay marked in use, so a later call sweeps them again.
+    pub fn release(&self) -> Result<usize, oxibonsai_kernels::MetalGraphError> {
+        let n_layers = self.used_layers.swap(0, Ordering::Relaxed);
+        if n_layers == 0 {
+            return Ok(0);
+        }
+        let swept = oxibonsai_kernels::MetalGraph::global().and_then(|graph| {
+            let keys = self.cache_keys(n_layers);
+            for &(slot, kind) in &keys {
+                graph.evict_weight(WeightKey::legacy(kind, slot))?;
+            }
+            Ok(keys.len())
+        });
+        if swept.is_err() {
+            self.used_layers.fetch_max(n_layers, Ordering::Relaxed);
+        }
+        swept
+    }
+}
+
+impl Drop for Q1MetalSlots {
+    fn drop(&mut self) {
+        if let Err(e) = self.release() {
+            tracing::debug!(
+                error = %e,
+                epoch = self.epoch,
+                "could not release a dropped Q1 model's Metal norm / LM-head buffers"
+            );
+        }
+    }
+}
 
 /// Test-only override for [`force_ternary_tail_failure`].
 static FORCE_TERNARY_TAIL_FAIL: AtomicBool = AtomicBool::new(false);
@@ -92,7 +269,7 @@ impl<'a> BonsaiModel<'a> {
         }
         let mut layer_params: Vec<FullForwardLayerParams<'_>> = Vec::with_capacity(n_layers);
         for (i, block) in self.blocks.iter().enumerate() {
-            let norm_handle_base = 1_000_000u64 + (block.layer_index() as u64) * 10;
+            let norm_handle_base = self.metal_q1_slots.norm_base(block.layer_index());
             layer_params.push(FullForwardLayerParams {
                 attn_norm_handle: norm_handle_base,
                 attn_norm_bytes: block.attn_norm_weight(),
@@ -132,6 +309,7 @@ impl<'a> BonsaiModel<'a> {
         }
         let rope_cos = self.rope.cos_at_checked(pos)?;
         let rope_sin = self.rope.sin_at_checked(pos)?;
+        self.metal_q1_slots.mark_used(n_layers);
         oxibonsai_kernels::try_metal_full_forward(
             hidden,
             pos,
@@ -173,8 +351,8 @@ impl<'a> BonsaiModel<'a> {
     ///
     /// This is the path `BonsaiModel::forward()` drops into when the fused
     /// final-norm → LM-head route fails. It used to carry its own weight-handle
-    /// namespace (`2_000_000` / `3_000_000` bases), so that fallback uploaded a
-    /// **second full copy** of the model; it now shares the one
+    /// namespace (the Q1 path's literal norm / LM-head bases), so that fallback
+    /// uploaded a **second full copy** of the model; it now shares the one
     /// address-derived slot table with every other ternary path
     /// ([`super::gpu_cache`]), so the fallback is a sequence of cache hits
     /// (MET-02).
@@ -312,7 +490,7 @@ impl<'a> BonsaiModel<'a> {
         }
         let mut layer_params: Vec<FullForwardLayerParams<'_>> = Vec::with_capacity(n_layers);
         for (i, block) in self.blocks.iter().enumerate() {
-            let norm_handle_base = 1_000_000u64 + (block.layer_index() as u64) * 10;
+            let norm_handle_base = self.metal_q1_slots.norm_base(block.layer_index());
             layer_params.push(FullForwardLayerParams {
                 attn_norm_handle: norm_handle_base,
                 attn_norm_bytes: block.attn_norm_weight(),
@@ -352,12 +530,13 @@ impl<'a> BonsaiModel<'a> {
         }
         let rope_cos = self.rope.cos_at_checked(pos)?;
         let rope_sin = self.rope.sin_at_checked(pos)?;
-        let final_norm_handle = 2_000_000u64;
+        let final_norm_handle = self.metal_q1_slots.final_norm();
         let final_norm_bytes = self.output_norm.weight();
         let final_norm_eps = self.output_norm.eps();
-        let lm_head_handle = 3_000_000u64;
+        let lm_head_handle = self.metal_q1_slots.lm_head();
         let lm_head_bytes = blocks_as_bytes(lm_head_linear.blocks());
         let lm_head_out_features = lm_head_linear.out_features();
+        self.metal_q1_slots.mark_used(n_layers);
         oxibonsai_kernels::try_metal_full_forward(
             hidden,
             pos,
@@ -502,7 +681,7 @@ impl<'a> BonsaiModel<'a> {
         }
         let mut layer_params: Vec<FullForwardLayerParams<'_>> = Vec::with_capacity(n_layers);
         for (i, block) in self.blocks.iter().enumerate() {
-            let norm_handle_base = 1_000_000u64 + (block.layer_index() as u64) * 10;
+            let norm_handle_base = self.metal_q1_slots.norm_base(block.layer_index());
             layer_params.push(FullForwardLayerParams {
                 attn_norm_handle: norm_handle_base,
                 attn_norm_bytes: block.attn_norm_weight(),
@@ -546,13 +725,14 @@ impl<'a> BonsaiModel<'a> {
                 ),
             });
         }
-        let final_norm_handle = 2_000_000u64;
+        let final_norm_handle = self.metal_q1_slots.final_norm();
         let final_norm_bytes = self.output_norm.weight();
         let final_norm_eps = self.output_norm.eps();
-        let lm_head_handle = 3_000_000u64;
+        let lm_head_handle = self.metal_q1_slots.lm_head();
         let lm_head_bytes = blocks_as_bytes(lm_head_linear.blocks());
         let lm_head_out_features = lm_head_linear.out_features();
         let mut logits = vec![0.0f32; lm_head_out_features];
+        self.metal_q1_slots.mark_used(n_layers);
         oxibonsai_kernels::try_metal_full_forward_prefill(
             &hidden_batch,
             batch_size,
@@ -691,7 +871,7 @@ impl<'a> BonsaiModel<'a> {
         }
         let mut layer_params: Vec<FullForwardLayerParams<'_>> = Vec::with_capacity(n_layers);
         for (i, block) in self.blocks.iter().enumerate() {
-            let norm_handle_base = 1_000_000u64 + (block.layer_index() as u64) * 10;
+            let norm_handle_base = self.metal_q1_slots.norm_base(block.layer_index());
             layer_params.push(FullForwardLayerParams {
                 attn_norm_handle: norm_handle_base,
                 attn_norm_bytes: block.attn_norm_weight(),
@@ -735,13 +915,14 @@ impl<'a> BonsaiModel<'a> {
                 ),
             });
         }
-        let final_norm_handle = 2_000_000u64;
+        let final_norm_handle = self.metal_q1_slots.final_norm();
         let final_norm_bytes = self.output_norm.weight();
         let final_norm_eps = self.output_norm.eps();
-        let lm_head_handle = 3_000_000u64;
+        let lm_head_handle = self.metal_q1_slots.lm_head();
         let lm_head_bytes = blocks_as_bytes(lm_head_linear.blocks());
         let lm_head_out_features = lm_head_linear.out_features();
         let mut batch_token_ids: Vec<u32> = Vec::with_capacity(batch_size);
+        self.metal_q1_slots.mark_used(n_layers);
         oxibonsai_kernels::try_metal_full_forward_prefill_verify(
             &hidden_batch,
             batch_size,
@@ -1297,5 +1478,29 @@ impl<'a> BonsaiModel<'a> {
             Box::new(e) as Box<dyn std::error::Error>
         })?;
         Ok(batch_token_ids)
+    }
+}
+
+impl BonsaiModel<'_> {
+    /// This model's Q1 Metal weight-cache slots (MET-02, Q1 half).
+    #[must_use]
+    pub fn q1_metal_slots(&self) -> &Q1MetalSlots {
+        &self.metal_q1_slots
+    }
+
+    /// Evict every norm / LM-head buffer this model's fused Q1 paths put in
+    /// the Metal weight cache, returning how many slots were swept. A model
+    /// whose Q1 fused paths never ran (or were already released) returns
+    /// `Ok(0)` without touching (or initialising) the Metal graph. Dropping
+    /// the model does the same.
+    ///
+    /// Safe for engine-pool replicas: every load has its own epoch, so this
+    /// can only ever release this model's own buffers.
+    ///
+    /// # Errors
+    ///
+    /// The Metal graph cannot be reached, or its cache lock is poisoned.
+    pub fn release_q1_metal_slots(&self) -> Result<usize, Box<dyn std::error::Error>> {
+        Ok(self.metal_q1_slots.release()?)
     }
 }

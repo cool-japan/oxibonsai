@@ -41,14 +41,20 @@ use std::time::Instant;
 
 use oxibonsai_core::config::Qwen3Config;
 use oxibonsai_core::gguf::reader::GgufFile;
+use oxibonsai_kernels::gpu_backend::{GpuUploadScope, UploadStats, UNATTRIBUTED_MODEL_EPOCH};
 use oxibonsai_kernels::traits::OneBitKernel;
 use oxibonsai_kernels::{KernelDispatcher, KernelTier};
+use oxibonsai_model::hybrid::{HybridModel, LoadedModel};
 use oxibonsai_model::model::BonsaiModel;
 
 use crate::batch_engine::{self, BatchResult};
 use crate::engine_control::{
     gguf_fused_metal_route, resolve_eos_token_set, CancellationToken, EosTokenSet, FusedMetalRoute,
     RecurrentState, SpeculativeConfig, GPU_ARGMAX_TIEBREAK_IS_FIRST_INDEX,
+};
+use crate::engine_greedy::SampledTopKConfig;
+pub use crate::engine_seam::{
+    engine_error_code, tokenizer_from_gguf, Backend, EngineError, SequenceSnapshot,
 };
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::metrics::InferenceMetrics;
@@ -124,6 +130,20 @@ pub struct EngineStats {
     pub active_sessions: AtomicUsize,
     /// Engine start time.
     pub start_time: Instant,
+    /// Sampled decode steps served from a GPU top-k candidate download
+    /// instead of the full logit row (`perf-11`, sampled half).
+    pub sampled_topk_steps: AtomicU64,
+    /// Sampled decode steps on the top-k route that had to download the full
+    /// logit row instead: unusable GPU candidates (a non-finite value inside
+    /// the sampler's `top_k`, or a GPU argmax/top-k disagreement), a Metal
+    /// failure recovered on the CPU, or the full-row reference mode.
+    pub sampled_topk_full_row_steps: AtomicU64,
+    /// Sampled requests on the fused GPU route that were not eligible for the
+    /// top-k route at all (penalties configured, `top_k` of `0`, above the
+    /// candidate count or at/above the vocabulary, or the route disabled —
+    /// which it is by default, see [`SampledTopKConfig`]) and decoded on the
+    /// full row.
+    pub sampled_full_row_requests: AtomicU64,
 }
 
 impl EngineStats {
@@ -134,7 +154,25 @@ impl EngineStats {
             total_requests: AtomicU64::new(0),
             active_sessions: AtomicUsize::new(0),
             start_time: Instant::now(),
+            sampled_topk_steps: AtomicU64::new(0),
+            sampled_topk_full_row_steps: AtomicU64::new(0),
+            sampled_full_row_requests: AtomicU64::new(0),
         }
+    }
+
+    /// Sampled decode steps served from GPU top-k candidates (`perf-11`).
+    pub fn sampled_topk_steps(&self) -> u64 {
+        self.sampled_topk_steps.load(Ordering::Relaxed)
+    }
+
+    /// Sampled top-k-route steps that fell back to the full logit row.
+    pub fn sampled_topk_full_row_steps(&self) -> u64 {
+        self.sampled_topk_full_row_steps.load(Ordering::Relaxed)
+    }
+
+    /// Sampled fused-route requests ineligible for the top-k route.
+    pub fn sampled_full_row_requests(&self) -> u64 {
+        self.sampled_full_row_requests.load(Ordering::Relaxed)
     }
 
     /// Engine uptime in seconds.
@@ -181,8 +219,14 @@ impl Default for EngineStats {
 }
 
 /// Top-level inference engine.
+///
+/// Holds either kind of model through [`LoadedModel`]: a dense Qwen3-family
+/// [`BonsaiModel`] or a `qwen35` (PrismML Bonsai 2) [`HybridModel`]. Every
+/// generation path dispatches through the seam in [`crate::engine_seam`];
+/// see that module for what a hybrid engine does and the typed errors it
+/// returns for what it does not.
 pub struct InferenceEngine<'a> {
-    pub(crate) model: BonsaiModel<'a>,
+    pub(crate) model: LoadedModel<'a>,
     pub(crate) kernel: KernelDispatcher,
     pub(crate) sampler: Sampler,
     pub(crate) metrics: Option<Arc<InferenceMetrics>>,
@@ -222,7 +266,7 @@ pub struct InferenceEngine<'a> {
     /// Cleared by [`InferenceEngine::reset_recurrent`], which
     /// [`InferenceEngine::reset`] — and therefore the server's per-request
     /// reset — always calls.
-    recurrent: Option<Box<dyn RecurrentState>>,
+    pub(crate) recurrent: Option<Box<dyn RecurrentState>>,
     /// Speculative-decode configuration for the GPU greedy path
     /// (`RT-27` / `perf-16`).
     pub(crate) speculative: SpeculativeConfig,
@@ -244,6 +288,55 @@ pub struct InferenceEngine<'a> {
     /// engines built from a synthetic config, which therefore keep exactly
     /// their previous behaviour.
     pub(crate) fused_gpu_decode: bool,
+    /// Model epoch this engine's GPU weight uploads were attributed to
+    /// (`MET-M1`), released — and only it — when the engine drops.
+    /// [`UNATTRIBUTED_MODEL_EPOCH`] for engines that uploaded nothing under
+    /// their own scope (every synthetic-config / `from_model*` engine, every
+    /// hybrid engine).
+    pub(crate) model_epoch: u64,
+    /// What this engine's construction uploaded to the GPU weight cache under
+    /// [`Self::model_epoch`]: fresh buffers versus buffers shared with a
+    /// sibling replica that already held byte-identical weights (`MET-M1` /
+    /// replica sharing). Empty for engines that uploaded nothing.
+    pub(crate) gpu_uploads: UploadStats,
+    /// The backend this engine was asked for ([`Backend::Auto`] for every
+    /// constructor that takes none).
+    pub(crate) backend: Backend,
+    /// Identity of the current sequence: bumped by every reset, explicit or
+    /// implicit (a prefill/decode restart at position 0). A
+    /// [`SequenceSnapshot`] is only restorable onto the sequence it was
+    /// taken from.
+    pub(crate) sequence_id: u64,
+    /// Sampled decode on the fused GPU route (`perf-11`, sampled half):
+    /// whether to download top-k candidates instead of the full logit row
+    /// (off by default — see [`SampledTopKConfig`]) and how many.
+    pub(crate) sampled_topk: SampledTopKConfig,
+}
+
+/// `MET-M1`, eviction half: an engine releases exactly its own model epoch
+/// from the GPU weight cache when it drops — never the process-wide clear,
+/// because a pool's replicas share one resident copy by reference and
+/// dropping one replica must not pull weights out from under its siblings
+/// (the backend frees a buffer only when its last epoch lets go).
+impl Drop for InferenceEngine<'_> {
+    fn drop(&mut self) {
+        if self.model_epoch == UNATTRIBUTED_MODEL_EPOCH {
+            return;
+        }
+        match oxibonsai_kernels::gpu_backend::release_model_weights(&self.kernel, self.model_epoch)
+        {
+            Ok(freed) => tracing::debug!(
+                model_epoch = self.model_epoch,
+                freed_buffers = freed,
+                "engine dropped: released its GPU weight registrations"
+            ),
+            Err(e) => tracing::warn!(
+                model_epoch = self.model_epoch,
+                error = %e,
+                "engine dropped: releasing its GPU weight registrations failed"
+            ),
+        }
+    }
 }
 
 impl<'a> InferenceEngine<'a> {
@@ -256,7 +349,7 @@ impl<'a> InferenceEngine<'a> {
         tracing::info!(kernel = kernel.name(), "inference engine initialized");
 
         Self::assemble(
-            model,
+            LoadedModel::Dense(Box::new(model)),
             kernel,
             sampler,
             EosTokenSet::single(EOS_TOKEN_ID),
@@ -268,9 +361,9 @@ impl<'a> InferenceEngine<'a> {
     ///
     /// The single place the non-model fields get their initial values, so a
     /// new control-plane field cannot be silently forgotten by one of the
-    /// six public constructors.
+    /// public constructors.
     fn assemble(
-        model: BonsaiModel<'a>,
+        model: LoadedModel<'a>,
         kernel: KernelDispatcher,
         sampler: Sampler,
         eos: EosTokenSet,
@@ -293,7 +386,53 @@ impl<'a> InferenceEngine<'a> {
             speculative: SpeculativeConfig::default().with_env_override(),
             prefill_chunk_tokens: None,
             fused_gpu_decode,
+            model_epoch: UNATTRIBUTED_MODEL_EPOCH,
+            gpu_uploads: UploadStats::default(),
+            backend: Backend::Auto,
+            sequence_id: 0,
+            sampled_topk: SampledTopKConfig::default(),
         }
+    }
+
+    /// Wrap an already-loaded model of either kind with a caller-supplied
+    /// dispatcher.
+    ///
+    /// For a [`LoadedModel::Hybrid`] the dispatcher is used for everything
+    /// the engine itself dispatches (the hybrid model carries its own inside
+    /// its layers); pass a CPU tier — no hybrid GPU encoder exists yet, and a
+    /// GPU tier would make the engine report a GPU it never uses.
+    pub fn from_loaded_model(
+        model: LoadedModel<'a>,
+        kernel: KernelDispatcher,
+        sampling_params: SamplingParams,
+        seed: u64,
+    ) -> Self {
+        let sampler = Sampler::new(sampling_params, seed);
+        Self::assemble(
+            model,
+            kernel,
+            sampler,
+            EosTokenSet::single(EOS_TOKEN_ID),
+            false,
+        )
+    }
+
+    /// Wrap an already-constructed [`HybridModel`] (on the best CPU tier).
+    ///
+    /// The EOS set falls back to [`EOS_TOKEN_ID`] exactly as the dense
+    /// `from_model*` constructors do; a GGUF-loaded hybrid engine resolves it
+    /// from the file ([`InferenceEngine::from_gguf`]).
+    pub fn from_hybrid_model(
+        model: HybridModel<'a>,
+        sampling_params: SamplingParams,
+        seed: u64,
+    ) -> Self {
+        Self::from_loaded_model(
+            LoadedModel::Hybrid(Box::new(model)),
+            crate::engine_seam::cpu_dispatcher(),
+            sampling_params,
+            seed,
+        )
     }
 
     /// Wrap an already-constructed [`BonsaiModel`] in an inference engine.
@@ -324,7 +463,7 @@ impl<'a> InferenceEngine<'a> {
     ) -> Self {
         let sampler = Sampler::new(sampling_params, seed);
         Self::assemble(
-            model,
+            LoadedModel::Dense(Box::new(model)),
             kernel,
             sampler,
             EosTokenSet::single(EOS_TOKEN_ID),
@@ -392,31 +531,44 @@ impl<'a> InferenceEngine<'a> {
         ))
     }
 
-    /// Create a new inference engine from a loaded GGUF file.
+    /// Create a new inference engine from a loaded GGUF file, on
+    /// [`Backend::Auto`].
+    ///
+    /// Either kind of model: a `qwen35` (PrismML Bonsai 2) file loads as a
+    /// hybrid engine on the best CPU tier (no hybrid GPU encoder exists yet),
+    /// anything else as a dense one exactly as before.
     pub fn from_gguf(
         gguf: &'a GgufFile<'a>,
         sampling_params: SamplingParams,
         seed: u64,
         max_seq_len: usize,
     ) -> RuntimeResult<Self> {
-        let eos = resolve_eos_token_set(gguf, EOS_TOKEN_ID);
-        let route = gguf_fused_metal_route(gguf);
-        // A `qwen35` (PrismML Bonsai 2) file is structurally a different
-        // stack -- 48 of its 64 layers have no `attn_q.weight` at all -- so
-        // `BonsaiModel::from_gguf` would fail on a missing tensor and say
-        // nothing about why. Name the seam instead (gatekeeper REQUIRED
-        // #1(b)); `LoadedModel` is what routes the two kinds.
-        if oxibonsai_model::hybrid::LoadedModel::is_hybrid_gguf(gguf) {
-            return Err(RuntimeError::Config(format!(
-                "this GGUF declares general.architecture = \"{}\", a hybrid stack the dense \
-                 InferenceEngine cannot execute; load it through \
-                 oxibonsai_model::hybrid::LoadedModel::from_gguf (or HybridModel::from_gguf), \
-                 which selects the hybrid forward driver",
-                oxibonsai_model::hybrid::LoadedModel::architecture_of(gguf)
-            )));
-        }
-        let model = BonsaiModel::from_gguf(gguf, max_seq_len)?;
-        Self::from_model_with_gpu_warmup(model, sampling_params, seed, eos, route)
+        Self::from_gguf_with_backend(gguf, sampling_params, seed, max_seq_len, Backend::Auto)
+    }
+
+    /// [`from_gguf`](Self::from_gguf) on an explicit [`Backend`].
+    ///
+    /// # Errors
+    ///
+    /// Model-load errors; [`EngineError::HybridGpuBackendUnsupported`] for
+    /// [`Backend::Metal`] on a hybrid file; [`EngineError::BackendUnavailable`]
+    /// for [`Backend::Metal`] on a build or host without an accelerated Metal
+    /// device.
+    pub fn from_gguf_with_backend(
+        gguf: &'a GgufFile<'a>,
+        sampling_params: SamplingParams,
+        seed: u64,
+        max_seq_len: usize,
+        backend: Backend,
+    ) -> RuntimeResult<Self> {
+        Self::from_gguf_with_embd_and_backend(
+            gguf,
+            sampling_params,
+            seed,
+            max_seq_len,
+            std::sync::Arc::from(Vec::new()),
+            backend,
+        )
     }
 
     /// Create an engine from a loaded GGUF file, reusing a pre-loaded, shared
@@ -429,7 +581,10 @@ impl<'a> InferenceEngine<'a> {
     /// replicas (see [`build_pool_from_gguf`](crate::engine_pool::build_pool_from_gguf)).
     ///
     /// `token_embd` MUST be the dequantized `token_embd.weight` for this exact
-    /// GGUF; see [`BonsaiModel::from_gguf_with_embd`] for the contract.
+    /// GGUF; see [`BonsaiModel::from_gguf_with_embd`] for the contract. A
+    /// hybrid model decodes its embedding row-wise from the file, so for one
+    /// `token_embd` must be empty (which is exactly what
+    /// [`model_token_embd`](Self::model_token_embd) hands out for it).
     pub fn from_gguf_with_embd(
         gguf: &'a GgufFile<'a>,
         sampling_params: SamplingParams,
@@ -437,27 +592,106 @@ impl<'a> InferenceEngine<'a> {
         max_seq_len: usize,
         token_embd: std::sync::Arc<[f32]>,
     ) -> RuntimeResult<Self> {
-        let eos = resolve_eos_token_set(gguf, EOS_TOKEN_ID);
-        let route = gguf_fused_metal_route(gguf);
-        let model = BonsaiModel::from_gguf_with_embd(gguf, max_seq_len, token_embd)?;
-        Self::from_model_with_gpu_warmup(model, sampling_params, seed, eos, route)
+        Self::from_gguf_with_embd_and_backend(
+            gguf,
+            sampling_params,
+            seed,
+            max_seq_len,
+            token_embd,
+            Backend::Auto,
+        )
     }
 
-    /// Shared core of [`from_gguf`](Self::from_gguf) and
-    /// [`from_gguf_with_embd`](Self::from_gguf_with_embd): given an
-    /// already-constructed [`BonsaiModel`], auto-detect the kernel, upload
-    /// weights to GPU, run the per-tier warmups, and assemble the engine.
+    /// The one GGUF constructor every other one funnels into.
+    ///
+    /// # Errors
+    ///
+    /// As [`from_gguf_with_backend`](Self::from_gguf_with_backend), plus
+    /// [`EngineError::SharedEmbeddingUnsupported`] for a non-empty
+    /// `token_embd` on a hybrid file.
+    pub fn from_gguf_with_embd_and_backend(
+        gguf: &'a GgufFile<'a>,
+        sampling_params: SamplingParams,
+        seed: u64,
+        max_seq_len: usize,
+        token_embd: std::sync::Arc<[f32]>,
+        backend: Backend,
+    ) -> RuntimeResult<Self> {
+        let eos = resolve_eos_token_set(gguf, EOS_TOKEN_ID);
+
+        // A `qwen35` (PrismML Bonsai 2) file is structurally a different
+        // stack -- 48 of its 64 layers are Gated-DeltaNet recurrences with no
+        // `attn_q.weight` at all -- so it loads through the hybrid driver.
+        // `gguf_fused_metal_route` is deliberately NOT consulted for it: an
+        // all-PQ2_0 file classifies as a "ternary fused route", and the fused
+        // Metal graph cannot run a hybrid stack.
+        if LoadedModel::is_hybrid_gguf(gguf) {
+            if !token_embd.is_empty() {
+                return Err(EngineError::SharedEmbeddingUnsupported {
+                    architecture: crate::engine_seam::gguf_architecture(gguf),
+                    len: token_embd.len(),
+                }
+                .into());
+            }
+            let (model, kernel) = crate::engine_seam::load_hybrid(gguf, max_seq_len, backend)?;
+            let sampler = Sampler::new(sampling_params, seed);
+            tracing::info!(
+                kernel = %kernel.kernel_label(model.quant_type()),
+                eos = ?eos.as_slice(),
+                model = %model.describe(),
+                "inference engine loaded from GGUF (hybrid)"
+            );
+            let mut engine = Self::assemble(
+                LoadedModel::Hybrid(Box::new(model)),
+                kernel,
+                sampler,
+                eos,
+                false,
+            );
+            engine.backend = backend;
+            return Ok(engine);
+        }
+
+        let route = gguf_fused_metal_route(gguf);
+        let kernel = crate::engine_seam::dense_dispatcher(backend)?;
+        let model = {
+            // `Backend::Cpu`: `BonsaiModel::from_gguf*` builds its layers'
+            // dispatchers with `KernelDispatcher::auto_detect()` internally,
+            // so pinning only the engine's dispatcher would leave every GEMV
+            // on the GPU. The scope makes those internal auto-detects land on
+            // the CPU tier too.
+            let _cpu_only = (backend == Backend::Cpu)
+                .then(oxibonsai_kernels::gpu_backend::CpuOnlyBackendScope::enter);
+            BonsaiModel::from_gguf_with_embd(gguf, max_seq_len, token_embd)?
+        };
+        let mut engine =
+            Self::from_model_with_gpu_warmup(model, kernel, sampling_params, seed, eos, route)?;
+        engine.backend = backend;
+        Ok(engine)
+    }
+
+    /// Shared core of the dense GGUF constructors: given an
+    /// already-constructed [`BonsaiModel`] and the engine's dispatcher,
+    /// upload weights to the GPU (attributed to a fresh model epoch), run the
+    /// per-tier warmups, and assemble the engine.
     ///
     /// Factored out so the (substantial) GPU/CUDA warmup logic has exactly one
     /// implementation regardless of how `token_embd` was obtained.
     fn from_model_with_gpu_warmup(
         mut model: BonsaiModel<'a>,
+        kernel: KernelDispatcher,
         sampling_params: SamplingParams,
         seed: u64,
         eos: EosTokenSet,
         route: FusedMetalRoute,
     ) -> RuntimeResult<Self> {
-        let kernel = KernelDispatcher::auto_detect();
+        // `MET-M1`: every GPU weight upload this engine makes is attributed to
+        // its own epoch, so `Drop` can release exactly this engine's
+        // registrations; a deduplicating backend (`Scirs2Backend`) shares a
+        // byte-identical resident buffer with a sibling replica instead of
+        // uploading a second copy (verify:METAL-CONCURRENCY blocking #1).
+        let model_epoch = oxibonsai_kernels::gpu_backend::next_gpu_model_epoch();
+        let upload_scope = GpuUploadScope::enter(model_epoch);
 
         // `MET-M1`: `upload_weights_to_gpu` fills `Scirs2Backend::weight_cache`
         // — a second, never-evicted, GPU-resident copy of every quantized
@@ -480,20 +714,53 @@ impl<'a> InferenceEngine<'a> {
                 "skipping the scirs2 GPU weight upload: this ternary model decodes through the \
                  fused Metal graph, which keeps its own weight cache (MET-M1)"
             );
-        } else {
-            // Upload all model weights to GPU memory once (no-op on CPU-only tiers).
+        } else if kernel_is_gpu_tier(&kernel) {
+            // Upload all model weights to GPU memory once. On a CPU tier
+            // (including an explicit `Backend::Cpu`) there is nothing to
+            // upload and the call is skipped outright.
             model.upload_weights_to_gpu(&kernel);
         }
 
         // Pre-build GPU weight cache eagerly so it's outside the timing window.
+        // Only on a GPU tier: a CPU engine never reads it, and building it
+        // would open the Metal device for nothing.
         #[cfg(all(feature = "metal", target_os = "macos"))]
-        {
+        if kernel_is_gpu_tier(&kernel) {
             tracing::info!("pre-building GPU weight cache");
             model.get_or_create_gpu_cache().map_err(|e| {
+                // `MET-M1`: this load already registered its uploads under
+                // `model_epoch`, and no engine will exist to release them on
+                // drop -- release them here, or a failed load pins its
+                // weights on the device for the life of the process.
+                if let Err(release) =
+                    oxibonsai_kernels::gpu_backend::release_model_weights(&kernel, model_epoch)
+                {
+                    tracing::warn!(
+                        error = %release,
+                        model_epoch,
+                        "failed to release a failed load's GPU weight registrations"
+                    );
+                }
                 RuntimeError::Model(oxibonsai_model::error::ModelError::Internal(format!(
                     "GPU weight cache init: {e}"
                 )))
             })?;
+        }
+
+        // Say what was uploaded and what was shared -- a replica that shares
+        // a sibling's resident weights must not look like one that uploaded
+        // nothing (verify:METAL-CONCURRENCY blocking #1).
+        let uploads = upload_scope.finish();
+        if !uploads.is_empty() {
+            tracing::info!(
+                model_epoch,
+                fresh_buffers = uploads.fresh_buffers,
+                fresh_mib = uploads.fresh_bytes as f64 / (1024.0 * 1024.0),
+                shared_buffers = uploads.shared_buffers,
+                shared_mib = uploads.shared_bytes as f64 / (1024.0 * 1024.0),
+                "GPU weight upload: fresh buffers were placed on the device, shared buffers \
+                 reused a byte-identical copy another replica already holds"
+            );
         }
 
         // Pre-warm both CUDA code paths so all first-call overhead (CUDA driver graph
@@ -532,20 +799,27 @@ impl<'a> InferenceEngine<'a> {
 
         let sampler = Sampler::new(sampling_params, seed);
 
+        // cli-16: name the resolved dominant tensor type together with the
+        // effective tier (e.g. "TQ2_0_g128 GPU (accelerated)"), never a
+        // hardcoded kernel family.
         tracing::info!(
-            kernel = kernel.name(),
+            kernel = %kernel.kernel_label(model.dominant_quant_type()),
+            tier_reason = %kernel.effective_tier_reason(),
             eos = ?eos.as_slice(),
             fused_route = ?route,
             "inference engine loaded from GGUF"
         );
 
-        Ok(Self::assemble(
-            model,
+        let mut engine = Self::assemble(
+            LoadedModel::Dense(Box::new(model)),
             kernel,
             sampler,
             eos,
             route.is_fused() && cfg!(all(feature = "metal", target_os = "macos")),
-        ))
+        );
+        engine.model_epoch = model_epoch;
+        engine.gpu_uploads = uploads;
+        Ok(engine)
     }
 
     /// Attach shared metrics to this engine for recording inference telemetry.
@@ -569,11 +843,6 @@ impl<'a> InferenceEngine<'a> {
         self.rate_aggregator.as_ref()
     }
 
-    /// Get a reference to the model.
-    pub fn model(&self) -> &BonsaiModel<'a> {
-        &self.model
-    }
-
     /// Cheaply clone a handle to this engine's shared token-embedding table.
     ///
     /// Thin delegate to [`BonsaiModel::shared_token_embd`]. The engine pool
@@ -581,16 +850,15 @@ impl<'a> InferenceEngine<'a> {
     /// it then hands to [`InferenceEngine::from_gguf_static_with_embd`] when
     /// building replicas `2..N` — so every replica's `token_embd` is a clone of
     /// the same allocation (one ~1.16 GiB table for the 1.7B, not N).
-    pub fn model_token_embd(&self) -> std::sync::Arc<[f32]> {
-        self.model.shared_token_embd()
-    }
-
-    /// Get a mutable reference to the model.
     ///
-    /// Used by the prefix-cache integration to inject restored KV blocks
-    /// before running the abbreviated prefill.
-    pub fn model_mut(&mut self) -> &mut BonsaiModel<'a> {
-        &mut self.model
+    /// A hybrid model has no dense table to share (its embedding is decoded
+    /// row-wise straight out of the memory map, which every replica already
+    /// shares), so it hands out the empty "load it from the GGUF" handle.
+    pub fn model_token_embd(&self) -> std::sync::Arc<[f32]> {
+        match &self.model {
+            LoadedModel::Dense(model) => model.shared_token_embd(),
+            LoadedModel::Hybrid(_) => std::sync::Arc::from(Vec::new()),
+        }
     }
 
     /// Get a reference to the kernel dispatcher.
@@ -600,9 +868,9 @@ impl<'a> InferenceEngine<'a> {
 
     /// Kernel tier this engine dispatches to.
     ///
-    /// Feature-agnostic convenience used by the engine pool to decide how many
-    /// replicas may safely run in parallel (GPU tiers funnel through a
-    /// process-global singleton and are pinned to a single replica).
+    /// Feature-agnostic convenience used by the engine pool to size itself:
+    /// a GPU tier gets one Metal session per replica, a CPU tier (every
+    /// hybrid engine) runs replicas fully in parallel.
     pub fn kernel_tier(&self) -> KernelTier {
         self.kernel.tier()
     }
@@ -612,6 +880,9 @@ impl<'a> InferenceEngine<'a> {
     /// Unlike [`InferenceEngine::generate`], this does **not** reset the
     /// model's KV cache before execution: callers (e.g. the prefix-cache
     /// engine) are expected to have prepared the cache state explicitly.
+    /// A hybrid model can only continue from its next position (or restart at
+    /// `0`); any other `pos_start` is a typed error — see
+    /// [`crate::engine_seam`].
     ///
     /// Increments the [`prefill_token_count`](Self::prefill_token_count)
     /// counter by `prompt_tokens.len()` on success.
@@ -620,9 +891,7 @@ impl<'a> InferenceEngine<'a> {
         prompt_tokens: &[u32],
         pos_start: usize,
     ) -> RuntimeResult<Vec<f32>> {
-        let logits = self
-            .model
-            .forward_prefill(prompt_tokens, pos_start, &self.kernel)?;
+        let logits = self.prefill_logits(prompt_tokens, pos_start)?;
         self.prefill_token_count = self
             .prefill_token_count
             .saturating_add(prompt_tokens.len() as u64);
@@ -631,7 +900,7 @@ impl<'a> InferenceEngine<'a> {
 
     /// Forward one token at the given absolute position.
     pub fn decode_step(&mut self, token: u32, pos: usize) -> RuntimeResult<Vec<f32>> {
-        Ok(self.model.forward(token, pos, &self.kernel)?)
+        self.forward_logits(token, pos)
     }
 
     /// Speculative-verify a batch of tokens starting at `pos_start`.
@@ -645,10 +914,23 @@ impl<'a> InferenceEngine<'a> {
     /// Like [`prefill_from_pos`](Self::prefill_from_pos), this does **not**
     /// reset the KV cache: the caller manages committed positions and is
     /// responsible for having primed the cache up to `pos_start`.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::RecurrentRollbackRequired`] on a hybrid engine:
+    /// verification writes state for every draft position, and the rejected
+    /// ones cannot be rolled back out of a recurrence.
     pub fn verify_batch(&mut self, tokens: &[u32], pos_start: usize) -> RuntimeResult<Vec<u32>> {
-        Ok(self
-            .model
-            .forward_prefill_verify(tokens, pos_start, &self.kernel)?)
+        match &mut self.model {
+            LoadedModel::Dense(model) => {
+                Ok(model.forward_prefill_verify(tokens, pos_start, &self.kernel)?)
+            }
+            LoadedModel::Hybrid(model) => Err(EngineError::RecurrentRollbackRequired {
+                operation: "verify_batch (speculative verification)",
+                architecture: model.config().base.architecture.clone(),
+            }
+            .into()),
+        }
     }
 
     /// Roll the model's KV cache back to `committed_len`, discarding any
@@ -684,32 +966,47 @@ impl<'a> InferenceEngine<'a> {
     /// [`RecurrentCache::snapshot`](oxibonsai_model::hybrid::RecurrentCache::snapshot)
     /// at the draft start and restore it, or refuse hybrid models.
     ///
+    /// Rolling back to the **current** position is the identity and always
+    /// succeeds, recurrent state or not.
+    ///
     /// # Errors
     ///
-    /// [`ModelError::RecurrentRollbackUnsupported`] when recurrent state is
-    /// attached to this engine.
+    /// [`ModelError::RecurrentRollbackUnsupported`](oxibonsai_model::error::ModelError::RecurrentRollbackUnsupported)
+    /// when the sequence state includes a recurrence — a hybrid (`qwen35`)
+    /// model, or an attached `RecurrentState` — and `committed_len` is not
+    /// the current position. `tokens` reports how many tokens the state has
+    /// consumed. Use [`snapshot_sequence`](Self::snapshot_sequence) /
+    /// [`restore_sequence`](Self::restore_sequence) for an exact rollback
+    /// point.
     pub fn try_rewind_cache(&mut self, committed_len: usize) -> RuntimeResult<()> {
-        if let Some(state) = self.recurrent.as_ref() {
-            let bytes = state.recurrent_memory_bytes();
+        let consumed = self.sequence_position();
+        if committed_len == consumed {
+            return Ok(());
+        }
+        if !self.recurrent_rollback_supported() {
             return Err(RuntimeError::Model(
                 oxibonsai_model::error::ModelError::RecurrentRollbackUnsupported {
                     pos: committed_len,
-                    tokens: bytes,
+                    tokens: consumed,
                 },
             ));
         }
-        self.model.kv_cache_mut().truncate(committed_len);
+        if let LoadedModel::Dense(model) = &mut self.model {
+            model.kv_cache_mut().truncate(committed_len);
+        }
         Ok(())
     }
 
-    /// `true` when this engine holds recurrent state, i.e. when
-    /// [`try_rewind_cache`](Self::try_rewind_cache) will refuse.
+    /// `true` when a KV-cursor rollback is exact for this engine, i.e. when
+    /// [`try_rewind_cache`](Self::try_rewind_cache) can move backwards:
+    /// `false` for a hybrid model and for an engine with an attached
+    /// `RecurrentState`.
     ///
     /// Speculative decoding and the pipeline check this before starting a
     /// draft window rather than discovering it at rollback time.
     #[must_use]
     pub fn recurrent_rollback_supported(&self) -> bool {
-        self.recurrent.is_none()
+        self.recurrent.is_none() && !self.model.is_hybrid()
     }
 
     /// Sample one token from `logits` using the engine's current sampler.
@@ -822,25 +1119,35 @@ impl<'a> InferenceEngine<'a> {
         self.recurrent.take()
     }
 
-    /// Bytes of recurrent state held by this engine (`0` when none is
-    /// attached).
+    /// Bytes of recurrent state held by this engine: the hybrid model's own
+    /// Gated-DeltaNet state (~157 MB for the 27B) plus any attached
+    /// `RecurrentState`; `0` for a dense engine with nothing attached.
     pub fn recurrent_memory_bytes(&self) -> usize {
-        self.recurrent
+        let attached = self
+            .recurrent
             .as_ref()
-            .map_or(0, |s| s.recurrent_memory_bytes())
+            .map_or(0, |s| s.recurrent_memory_bytes());
+        let own = self
+            .model
+            .as_hybrid()
+            .map_or(0, |model| model.recurrent().memory_bytes());
+        attached + own
     }
 
-    /// Clear the hybrid model's recurrent/conv state (`RT-28`).
+    /// Clear the recurrent/conv state (`RT-28`): the hybrid model's own and
+    /// any attached `RecurrentState`.
     ///
-    /// A no-op when no recurrent state is attached (every non-hybrid model
-    /// today). Called by [`reset`](Self::reset), so the server's
-    /// per-request reset (`RT-03`) already covers it — unlike a KV cache,
-    /// recurrent state is not masked by position, so a stale `S` matrix
-    /// would silently contaminate the next request rather than being
-    /// overwritten.
+    /// A no-op for a dense engine with nothing attached. Called by
+    /// [`reset`](Self::reset), so the server's per-request reset (`RT-03`)
+    /// already covers it — unlike a KV cache, recurrent state is not masked
+    /// by position, so a stale `S` matrix would silently contaminate the
+    /// next request rather than being overwritten.
     pub fn reset_recurrent(&mut self) {
         if let Some(state) = self.recurrent.as_deref_mut() {
             state.reset_recurrent();
+        }
+        if let Some(model) = self.model.as_hybrid_mut() {
+            model.recurrent_mut().reset();
         }
     }
 
@@ -886,7 +1193,21 @@ impl<'a> InferenceEngine<'a> {
     /// backend runs everything on the CPU fallback). For the CLI build-info
     /// surface (`cli-19`) and `/admin/status`, so that degradation is
     /// observable rather than inferred from throughput.
+    ///
+    /// A hybrid (`qwen35`) engine always runs on a CPU tier (no hybrid GPU
+    /// encoder exists yet); its reason says so instead of the pinned CPU
+    /// dispatcher's own "explicitly requested", which would misdescribe a
+    /// [`Backend::Auto`] load.
     pub fn effective_tier_reason(&self) -> String {
+        if self.model.is_hybrid() {
+            return format!(
+                "{} tier (hybrid `{}` model, backend={}: no hybrid GPU encoder exists yet, so \
+                 it runs on the best CPU tier)",
+                self.kernel.tier(),
+                self.architecture(),
+                self.backend
+            );
+        }
         self.kernel.effective_tier_reason()
     }
 
@@ -951,8 +1272,14 @@ impl<'a> InferenceEngine<'a> {
     /// replica returns to the pool; a caller owning an engine directly uses
     /// [`clear_cancellation_token`](Self::clear_cancellation_token).
     pub fn reset(&mut self) {
+        // `LoadedModel::reset` clears the KV cursor on both arms and the
+        // hybrid model's own recurrent state; only an attached
+        // `RecurrentState` is left for this engine to clear.
         self.model.reset();
-        self.reset_recurrent();
+        if let Some(state) = self.recurrent.as_deref_mut() {
+            state.reset_recurrent();
+        }
+        self.sequence_id = self.sequence_id.wrapping_add(1);
     }
 
     /// Create a fresh [`CancellationToken`](crate::engine_control::CancellationToken),
@@ -1038,7 +1365,7 @@ impl<'a> InferenceEngine<'a> {
             .filter(|&n| n > 0 && n < prompt_tokens.len());
 
         let logits = match chunk {
-            None => self.model.forward_prefill(prompt_tokens, 0, &self.kernel)?,
+            None => self.prefill_logits(prompt_tokens, 0)?,
             Some(chunk) => {
                 let mut last = Vec::new();
                 for (i, window) in prompt_tokens.chunks(chunk).enumerate() {
@@ -1049,9 +1376,7 @@ impl<'a> InferenceEngine<'a> {
                         );
                         return Ok(None);
                     }
-                    last = self
-                        .model
-                        .forward_prefill(window, i * chunk, &self.kernel)?;
+                    last = self.prefill_logits(window, i * chunk)?;
                 }
                 last
             }
@@ -1126,6 +1451,12 @@ impl<'a> InferenceEngine<'a> {
         if self.greedy_gpu_eligible(false) {
             return self.generate_greedy_gpu_unchecked(prompt_tokens, max_tokens, |_| true);
         }
+        // `perf-11`, sampled half: a sampled request on the fused route
+        // downloads only its top-k candidates per token when eligible.
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if let Some(tokens) = self.try_sampled_topk_route(prompt_tokens, max_tokens, |_| true)? {
+            return Ok(tokens);
+        }
 
         // ═══════════════════════════════════════════════════════
         // 1. Prefill: batch process all prompt tokens
@@ -1165,7 +1496,7 @@ impl<'a> InferenceEngine<'a> {
             output_tokens.push(next_token);
 
             // Forward the generated token
-            last_logits = self.model.forward(next_token, pos, &self.kernel)?;
+            last_logits = self.forward_logits(next_token, pos)?;
 
             if let Some(m) = &self.metrics {
                 m.decode_token_duration_seconds
@@ -1241,6 +1572,28 @@ impl<'a> InferenceEngine<'a> {
             }
             return Ok(tokens);
         }
+        // Sampled + fused route → top-k candidates (`perf-11`, sampled
+        // half), with the same per-token tracker events.
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            let mut first_token_recorded = false;
+            let routed = self.try_sampled_topk_route(prompt_tokens, max_tokens, |_token| {
+                if first_token_recorded {
+                    tracker.record_token();
+                } else {
+                    tracker.record_first_token();
+                    first_token_recorded = true;
+                }
+                true
+            })?;
+            if let Some(tokens) = routed {
+                if let Some(agg) = &self.rate_aggregator {
+                    let snap: RequestRateSnapshot = tracker.snapshot();
+                    agg.record(snap);
+                }
+                return Ok(tokens);
+            }
+        }
 
         let Some(mut last_logits) = self.prefill_for_generate(prompt_tokens)? else {
             return Ok(vec![]);
@@ -1270,7 +1623,7 @@ impl<'a> InferenceEngine<'a> {
             } else {
                 tracker.record_token();
             }
-            last_logits = self.model.forward(next_token, pos, &self.kernel)?;
+            last_logits = self.forward_logits(next_token, pos)?;
 
             if let Some(m) = &self.metrics {
                 m.decode_token_duration_seconds
@@ -1396,409 +1749,6 @@ impl<'a> InferenceEngine<'a> {
         self.sampler.set_params(prev_params);
         self.sampler.set_penalties(prev_penalties);
         result
-    }
-
-    /// Generate tokens while capturing per-step top-k log probabilities.
-    ///
-    /// Mirrors [`InferenceEngine::generate`] (prefill → token-by-token decode,
-    /// penalties applied over the generated-token history), but for every
-    /// emitted token it also records a
-    /// [`LogprobsContent`](crate::api_types::LogprobsContent) computed from the
-    /// model's raw output logits at that step: the chosen token's log
-    /// probability plus the `top_k` highest-probability alternatives (OpenAI
-    /// `top_logprobs`, clamped to 20).
-    ///
-    /// `id_to_token` maps a token id to its string form (typically the
-    /// tokenizer's single-id decode); the engine has no tokenizer of its own,
-    /// so the caller supplies it. The returned logprobs vector has exactly one
-    /// entry per generated token, aligned with the returned token ids.
-    ///
-    /// Available only with the `server` feature, where the logprob types live.
-    #[cfg(feature = "server")]
-    pub fn generate_with_logprobs(
-        &mut self,
-        prompt_tokens: &[u32],
-        max_tokens: usize,
-        top_k: usize,
-        id_to_token: &dyn Fn(u32) -> String,
-    ) -> RuntimeResult<(Vec<u32>, Vec<crate::api_types::LogprobsContent>)> {
-        if prompt_tokens.is_empty() {
-            return Ok((vec![], vec![]));
-        }
-
-        // OpenAI caps top_logprobs at 20.
-        let top_k = top_k.min(20);
-
-        // No GPU-argmax routing here, by construction: a 4-byte token
-        // readback cannot produce `top_logprobs`, which is why
-        // `greedy_gpu_eligible` takes a `needs_full_logits` argument at all
-        // (`perf-11`'s correction names logprobs and logit_bias explicitly).
-        // This path always decodes the full logit row.
-
-        let Some(mut last_logits) = self.prefill_for_generate(prompt_tokens)? else {
-            return Ok((vec![], vec![]));
-        };
-        let cap = max_tokens.min(MAX_PREALLOC_TOKENS);
-        let mut output_tokens = Vec::with_capacity(cap);
-        let mut logprobs: Vec<crate::api_types::LogprobsContent> = Vec::with_capacity(cap);
-
-        for (pos, _) in (prompt_tokens.len()..).zip(0..max_tokens) {
-            if self.is_cancelled() {
-                tracing::debug!(pos, "logprobs generation cancelled");
-                break;
-            }
-            let next_token = self
-                .sampler
-                .sample_with_history(&last_logits, &output_tokens)?;
-
-            if self.is_eos(next_token) {
-                tracing::debug!(pos, "EOS token generated (logprobs)");
-                break;
-            }
-
-            // Capture logprobs from the model's raw (pre-penalty) output
-            // distribution — the reported logprob is the model's, while the
-            // chosen token already reflects any active penalties.
-            logprobs.push(crate::api_types::compute_logprobs(
-                &last_logits,
-                next_token,
-                top_k,
-                id_to_token,
-            ));
-            output_tokens.push(next_token);
-
-            last_logits = self.model.forward(next_token, pos, &self.kernel)?;
-        }
-
-        self.stats.record_request(output_tokens.len());
-
-        tracing::info!(
-            prompt_len = prompt_tokens.len(),
-            generated = output_tokens.len(),
-            "logprobs generation complete"
-        );
-
-        Ok((output_tokens, logprobs))
-    }
-
-    /// Generate tokens one at a time, sending each through the channel.
-    /// Returns the total count of generated tokens.
-    ///
-    /// Not available on WASM targets (tokio channels not supported on wasm32-unknown-unknown).
-    #[cfg(not(target_arch = "wasm32"))]
-    #[tracing::instrument(skip(self, prompt_tokens, tx), fields(prompt_len = prompt_tokens.len()))]
-    pub fn generate_streaming(
-        &mut self,
-        prompt_tokens: &[u32],
-        max_tokens: usize,
-        tx: &tokio::sync::mpsc::UnboundedSender<u32>,
-    ) -> RuntimeResult<usize> {
-        if prompt_tokens.is_empty() {
-            return Ok(0);
-        }
-
-        // `perf-11`: the server streams through this path, so routing it
-        // through the GPU argmax is what actually removes the per-token
-        // full-logit download from `serve`/`chat` — the CLI-only shortcut
-        // was the whole finding.
-        #[cfg(all(feature = "metal", target_os = "macos"))]
-        if self.greedy_gpu_eligible(false) {
-            let tokens =
-                self.generate_greedy_gpu_unchecked(prompt_tokens, max_tokens, |token| {
-                    // A send failure means the receiver was dropped (client
-                    // disconnected): stop generating, exactly as below.
-                    tx.send(token).is_ok()
-                })?;
-            return Ok(tokens.len());
-        }
-
-        // Prefill: batch process all prompt tokens
-        let Some(mut logits) = self.prefill_for_generate(prompt_tokens)? else {
-            return Ok(0);
-        };
-
-        let decode_start = std::time::Instant::now();
-        let mut generated = 0;
-        // Generated-token history for repetition/frequency/presence penalties.
-        let mut history: Vec<u32> = Vec::new();
-
-        for (pos, _) in (prompt_tokens.len()..).zip(0..max_tokens) {
-            let step_start = std::time::Instant::now();
-            if self.is_cancelled() {
-                tracing::debug!(pos, "streaming generation cancelled");
-                break;
-            }
-            let next_token = self.sampler.sample_with_history(&logits, &history)?;
-
-            if self.is_eos(next_token) {
-                tracing::debug!(pos, "EOS token generated (streaming)");
-                break;
-            }
-
-            // Send token through channel; if receiver dropped, stop generating
-            if tx.send(next_token).is_err() {
-                tracing::debug!(pos, "receiver dropped, stopping generation");
-                break;
-            }
-            history.push(next_token);
-
-            logits = self.model.forward(next_token, pos, &self.kernel)?;
-            generated += 1;
-
-            if let Some(m) = &self.metrics {
-                m.decode_token_duration_seconds
-                    .observe(step_start.elapsed().as_secs_f64());
-            }
-        }
-
-        // Record tokens/sec and update memory gauge
-        if let Some(m) = &self.metrics {
-            let decode_elapsed = decode_start.elapsed().as_secs_f64();
-            if decode_elapsed > 0.0 && generated > 0 {
-                let tok_per_sec = generated as f64 / decode_elapsed;
-                m.tokens_per_second.observe(tok_per_sec);
-            }
-            m.tokens_generated_total.inc_by(generated as u64);
-            m.update_memory_from_rss();
-        }
-        // Record engine-level stats. Kept symmetric with `generate` /
-        // `generate_tracked`'s CPU tails and with the GPU-argmax path's
-        // `generate_greedy_gpu_unchecked` (a wave-2 verifier finding: this
-        // call was previously missing here, so `EngineStats::requests_completed`
-        // / `tokens_generated` depended on which decode route a given
-        // request happened to take).
-        self.stats.record_request(generated);
-
-        tracing::info!(
-            prompt_len = prompt_tokens.len(),
-            generated,
-            "streaming generation complete"
-        );
-
-        Ok(generated)
-    }
-
-    /// Streaming generation using caller-supplied sampling parameters for the
-    /// duration of this call only.
-    ///
-    /// Swaps in `params` on the engine's existing sampler, runs
-    /// [`InferenceEngine::generate_streaming`], then restores the previous
-    /// parameters. As with [`InferenceEngine::generate_with_params`], the
-    /// sampler's PRNG state is preserved (only the parameters change), so the
-    /// default-parameter case is bit-identical to calling
-    /// `generate_streaming` directly.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn generate_streaming_with_params(
-        &mut self,
-        prompt_tokens: &[u32],
-        max_tokens: usize,
-        params: &crate::sampling::SamplingParams,
-        tx: &tokio::sync::mpsc::UnboundedSender<u32>,
-    ) -> RuntimeResult<usize> {
-        let prev_params = self.sampler.params().clone();
-        self.sampler.set_params(params.clone());
-        let result = self.generate_streaming(prompt_tokens, max_tokens, tx);
-        self.sampler.set_params(prev_params);
-        result
-    }
-
-    /// Streaming generation using a synchronous `std::sync::mpsc::Sender`.
-    ///
-    /// Each generated token is sent through the channel immediately, allowing
-    /// the consumer to print tokens as they arrive without requiring a tokio runtime.
-    #[tracing::instrument(skip(self, prompt_tokens, tx), fields(prompt_len = prompt_tokens.len()))]
-    pub fn generate_streaming_sync(
-        &mut self,
-        prompt_tokens: &[u32],
-        max_tokens: usize,
-        tx: &std::sync::mpsc::Sender<u32>,
-    ) -> RuntimeResult<usize> {
-        if prompt_tokens.is_empty() {
-            return Ok(0);
-        }
-
-        // Greedy + fused Metal route → GPU argmax (`perf-11`). The CLI's
-        // streaming path reaches this function.
-        #[cfg(all(feature = "metal", target_os = "macos"))]
-        if self.greedy_gpu_eligible(false) {
-            let tokens =
-                self.generate_greedy_gpu_unchecked(prompt_tokens, max_tokens, |token| {
-                    tx.send(token).is_ok()
-                })?;
-            return Ok(tokens.len());
-        }
-
-        // Prefill: batch process all prompt tokens
-        let Some(mut logits) = self.prefill_for_generate(prompt_tokens)? else {
-            return Ok(0);
-        };
-
-        let decode_start = std::time::Instant::now();
-        let mut generated = 0;
-        // Generated-token history for repetition/frequency/presence penalties.
-        let mut history: Vec<u32> = Vec::new();
-
-        for (pos, _) in (prompt_tokens.len()..).zip(0..max_tokens) {
-            let step_start = std::time::Instant::now();
-            if self.is_cancelled() {
-                tracing::debug!(pos, "streaming sync generation cancelled");
-                break;
-            }
-
-            let next_token = self.sampler.sample_with_history(&logits, &history)?;
-
-            if self.is_eos(next_token) {
-                tracing::debug!(pos, "EOS token generated (streaming_sync)");
-                break;
-            }
-
-            if tx.send(next_token).is_err() {
-                tracing::debug!(pos, "receiver dropped, stopping generation");
-                break;
-            }
-            history.push(next_token);
-
-            logits = self.model.forward(next_token, pos, &self.kernel)?;
-            generated += 1;
-
-            if let Some(m) = &self.metrics {
-                m.decode_token_duration_seconds
-                    .observe(step_start.elapsed().as_secs_f64());
-            }
-        }
-
-        if let Some(m) = &self.metrics {
-            let decode_elapsed = decode_start.elapsed().as_secs_f64();
-            if decode_elapsed > 0.0 && generated > 0 {
-                let tok_per_sec = generated as f64 / decode_elapsed;
-                m.tokens_per_second.observe(tok_per_sec);
-            }
-            m.tokens_generated_total.inc_by(generated as u64);
-            m.update_memory_from_rss();
-        }
-        // See the identical comment in `generate_streaming`'s CPU tail
-        // (wave-2 verifier finding): keeps `EngineStats` symmetric across
-        // every decode route.
-        self.stats.record_request(generated);
-
-        tracing::info!(
-            prompt_len = prompt_tokens.len(),
-            generated,
-            "streaming sync generation complete"
-        );
-
-        Ok(generated)
-    }
-}
-
-impl InferenceEngine<'static> {
-    /// Build an engine from an already-`'static` [`GgufFile`].
-    ///
-    /// This is the shared core used both by [`from_gguf_path`](Self::from_gguf_path)
-    /// (after it has leaked the mmap + parsed container to `'static`) and by the
-    /// engine pool when constructing additional replicas off a single leaked
-    /// GGUF — every replica borrows the *same* `&'static GgufFile` zero-copy, so
-    /// only per-replica state (KV cache, light wrappers) is duplicated. The
-    /// immutable `token_embd` table is shared across replicas via one
-    /// `Arc<[f32]>` when the pool builder uses
-    /// [`from_gguf_static_with_embd`](Self::from_gguf_static_with_embd).
-    ///
-    /// Performs no leaking itself; the caller owns the `'static` lifetime.
-    ///
-    /// # Errors
-    ///
-    /// Propagates model-init / GPU-cache errors through [`RuntimeError`].
-    pub fn from_gguf_static(
-        gguf: &'static GgufFile<'static>,
-        sampling_params: SamplingParams,
-        seed: u64,
-        max_seq_len: usize,
-    ) -> RuntimeResult<Self> {
-        // `from_gguf` is generic over the GGUF borrow lifetime; instantiating it
-        // at `'static` yields an `InferenceEngine<'static>` directly.
-        Self::from_gguf(gguf, sampling_params, seed, max_seq_len)
-    }
-
-    /// Build an engine from an already-`'static` [`GgufFile`], reusing a
-    /// pre-loaded, shared token-embedding table.
-    ///
-    /// The `'static`-lifetime twin of
-    /// [`from_gguf_with_embd`](Self::from_gguf_with_embd). The engine pool calls
-    /// this for replicas `2..N`, passing the `Arc<[f32]>` extracted from replica
-    /// `#1` (via [`InferenceEngine::model_token_embd`]) so every replica shares a
-    /// single token-embedding allocation instead of re-dequantizing its own
-    /// copy. KV caches and light wrappers remain per-replica.
-    ///
-    /// `token_embd` MUST be the dequantized `token_embd.weight` for this exact
-    /// GGUF; see [`BonsaiModel::from_gguf_with_embd`] for the contract.
-    pub fn from_gguf_static_with_embd(
-        gguf: &'static GgufFile<'static>,
-        sampling_params: SamplingParams,
-        seed: u64,
-        max_seq_len: usize,
-        token_embd: std::sync::Arc<[f32]>,
-    ) -> RuntimeResult<Self> {
-        Self::from_gguf_with_embd(gguf, sampling_params, seed, max_seq_len, token_embd)
-    }
-
-    /// Memory-map + parse a GGUF file and leak both allocations to `'static`,
-    /// returning the constructed engine *and* the leaked `&'static GgufFile`.
-    ///
-    /// The leaked reference lets callers (e.g. the engine pool) build additional
-    /// engine replicas off the *same* weights via [`from_gguf_static`](Self::from_gguf_static)
-    /// without a second mmap or weight copy. The leaked memory is intentional —
-    /// the GGUF is expected to live for the process lifetime.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RuntimeError::FileNotFound`] if `path` does not exist.  Other
-    /// IO / parse / model-init errors propagate through [`RuntimeError`].
-    pub fn from_gguf_path_leaked(
-        path: impl AsRef<std::path::Path>,
-        sampling_params: SamplingParams,
-        seed: u64,
-        max_seq_len: usize,
-    ) -> RuntimeResult<(Self, &'static GgufFile<'static>)> {
-        let path_ref = path.as_ref();
-        if !path_ref.exists() {
-            return Err(RuntimeError::FileNotFound {
-                path: path_ref.display().to_string(),
-            });
-        }
-
-        // Memory-map and parse, then leak both so the resulting `GgufFile`
-        // can live for `'static` without RAII concerns.
-        let mmap = oxibonsai_core::gguf::reader::mmap_gguf_file(path_ref)?;
-        let mmap: &'static memmap2::Mmap = Box::leak(Box::new(mmap));
-        let gguf = oxibonsai_core::gguf::reader::GgufFile::parse(mmap)?;
-        let gguf: &'static GgufFile<'static> = Box::leak(Box::new(gguf));
-
-        let engine = Self::from_gguf_static(gguf, sampling_params, seed, max_seq_len)?;
-        Ok((engine, gguf))
-    }
-
-    /// Load an [`InferenceEngine`] directly from a path to a GGUF file.
-    ///
-    /// This is a convenience wrapper intended for server/CLI entry points that
-    /// need an owned, `'static` engine.  It memory-maps the file, parses the
-    /// GGUF container, and leaks both allocations so that the borrowed
-    /// `GgufFile<'a>` lifetime can be promoted to `'static`.
-    ///
-    /// The leaked memory is intentional — the engine is expected to live for
-    /// the process lifetime.  Do not call this in hot-paths.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RuntimeError::FileNotFound`] if `path` does not exist.  Other
-    /// IO / parse / model-init errors propagate through [`RuntimeError`].
-    pub fn from_gguf_path(
-        path: impl AsRef<std::path::Path>,
-        sampling_params: SamplingParams,
-        seed: u64,
-        max_seq_len: usize,
-    ) -> RuntimeResult<Self> {
-        Self::from_gguf_path_leaked(path, sampling_params, seed, max_seq_len)
-            .map(|(engine, _gguf)| engine)
     }
 }
 

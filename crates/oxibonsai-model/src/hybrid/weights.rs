@@ -71,13 +71,9 @@
 use std::sync::Arc;
 
 use oxibonsai_core::config_hybrid::HybridConfig;
-use oxibonsai_core::gguf::quant_resolve::{
-    compute_extents, resolve_type_42_with_sample, AMBIGUOUS_TYPE_ID,
-};
 use oxibonsai_core::gguf::reader::GgufFile;
-use oxibonsai_core::gguf::tensor_info::{row_size_bytes, TensorInfo};
+use oxibonsai_core::gguf::tensor_info::TensorInfo;
 use oxibonsai_core::gguf::types::GgufTensorType;
-use oxibonsai_core::quant_ternary::{sniff_sample_byte_cap, SNIFF_DEFAULT_BLOCKS};
 use oxibonsai_core::tensor::QK1_0_G128;
 use oxibonsai_core::{
     BlockPQ2_0, BlockPTQ1_0, BlockQ1_0G128, BlockQ2_0G64, BlockTQ2_0_g128, BonsaiError, QK_PQ2_0,
@@ -89,9 +85,10 @@ use oxibonsai_kernels::KernelDispatcher;
 use crate::error::{ModelError, ModelResult};
 use crate::hybrid::vhead_map::VHeadMap;
 use crate::layers::linear::{
-    Linear1Bit, LinearLayer, LinearPQ2_0, LinearPTQ1_0, LinearQ2_0G64, LinearTernary,
+    Linear1Bit, LinearDense, LinearLayer, LinearPQ2_0, LinearPTQ1_0, LinearQ2_0G64, LinearTernary,
 };
 use crate::layers::rms_norm::RmsNorm;
+use crate::model::types::tensor_data_resolved;
 use oxibonsai_core::bf16::bf16_to_f32;
 
 /// Tensor names a hybrid stack binds, as GGUF spells them.
@@ -700,10 +697,10 @@ pub fn parse_forced_q2_layout(raw: &str) -> ModelResult<Option<GgufTensorType>> 
 /// tensor offset and sniffs real block bytes, so the answer is computed once
 /// per file and threaded through the per-layer loop.
 ///
-/// Mirrors `model::weight_loaders::resolve_id42_once`, which is `pub(super)`
-/// to `crate::model` and so unreachable from here (recorded as this
-/// package's deviation: the requested change is to widen those three helpers
-/// to `pub(crate)`).
+/// This **is** the dense loader's resolver
+/// (`model::weight_loaders::resolve_id42_once`, B2-10), not a copy of it:
+/// the two load paths can never disagree about a file's layout, and design
+/// SS1.3's [`FORCE_Q2_LAYOUT_ENV`] override applies to both identically.
 ///
 /// # Errors
 ///
@@ -711,109 +708,22 @@ pub fn parse_forced_q2_layout(raw: &str) -> ModelResult<Option<GgufTensorType>> 
 /// the sniff actively contradicts a declared legacy tag. A merely
 /// *inconclusive* sniff (an all-zero or too-small sample, i.e. a synthetic
 /// fixture) falls back to the historical qs-first reading, exactly as the
-/// dense loader does.
+/// dense loader does. [`ModelError::InvalidTensor`] for an unrecognised
+/// [`FORCE_Q2_LAYOUT_ENV`] value.
 pub fn resolve_id42(gguf: &GgufFile<'_>) -> ModelResult<Option<GgufTensorType>> {
-    // Design SS1.3's operator override, shared with the dense loader so the
-    // two paths cannot disagree about what a forced layout means.
-    if let Some(forced) = forced_q2_layout()? {
-        tracing::debug!(
-            layout = ?forced,
-            env = FORCE_Q2_LAYOUT_ENV,
-            "qwen35: ggml wire id 42 layout forced by the environment"
-        );
-        return Ok(Some(forced));
-    }
-    let infos: Vec<TensorInfo> = gguf
-        .tensors
-        .sorted_by_offset()
-        .into_iter()
-        .cloned()
-        .collect();
-    let Some(sample_info) = infos
-        .iter()
-        .find(|i| i.tensor_type.wire_id() == AMBIGUOUS_TYPE_ID)
-    else {
-        return Ok(None);
-    };
-    let sample_name = sample_info.name.clone();
-    let data_len = (gguf.data.len() as u64).saturating_sub(gguf.data_offset as u64);
-    let extents = compute_extents(&infos, data_len).map_err(ModelError::Core)?;
-    let alignment = gguf
-        .metadata
-        .get("general.alignment")
-        .and_then(|v| v.as_u32())
-        .unwrap_or(32) as u64;
-    let sample = gguf.tensor_data(&sample_name).map_err(ModelError::Core)?;
-    let sample = &sample[..sample
-        .len()
-        .min(sniff_sample_byte_cap(SNIFF_DEFAULT_BLOCKS))];
-    match resolve_type_42_with_sample(
-        &infos,
-        alignment,
-        gguf.metadata.get("general.quantization_version"),
-        Some(&extents),
-        sample,
-    ) {
-        Ok(resolved) => Ok(Some(resolved.tensor_type)),
-        Err(BonsaiError::AmbiguousQuantType { hint, .. }) => {
-            tracing::warn!(
-                tensor = %sample_name,
-                reason = %hint,
-                env = FORCE_Q2_LAYOUT_ENV,
-                "qwen35: ggml wire id 42 could not be conclusively resolved; falling back to \
-                 the legacy qs-first TQ2_0_g128 reading -- set OXI_FORCE_Q2_LAYOUT=d-first if \
-                 this file is a PrismML d-first checkpoint"
-            );
-            Ok(None)
-        }
-        Err(other) => Err(ModelError::Core(other)),
-    }
+    crate::model::types::resolve_id42_once(gguf)
 }
 
-/// Apply [`resolve_id42`]'s answer to one tensor's parse-time type.
+/// Apply [`resolve_id42`]'s answer to one tensor's parse-time type: every
+/// type but wire id 42 passes through unchanged. The dense loader's own
+/// function (B2-10), shared rather than copied.
 #[inline]
 #[must_use]
 pub fn apply_resolved_type(
     raw: GgufTensorType,
     resolved_42: Option<GgufTensorType>,
 ) -> GgufTensorType {
-    if raw.wire_id() != AMBIGUOUS_TYPE_ID {
-        return raw;
-    }
-    resolved_42.unwrap_or(raw)
-}
-
-/// [`GgufFile::tensor_data`] sized from a **resolved** type.
-///
-/// `TensorInfo::data_size` sizes every wire-id-42 tensor as the group-128
-/// reading, which under-counts a genuine group-64 tensor by 2 bytes per 128
-/// elements.
-fn tensor_data_resolved<'a>(
-    gguf: &'a GgufFile<'a>,
-    name: &str,
-    resolved_type: GgufTensorType,
-) -> ModelResult<&'a [u8]> {
-    let info = gguf.tensors.require(name).map_err(ModelError::Core)?;
-    if resolved_type == info.tensor_type {
-        return gguf.tensor_data(name).map_err(ModelError::Core);
-    }
-    let size = row_size_bytes(resolved_type, &info.shape);
-    let start = (gguf.data_offset as u64)
-        .checked_add(info.offset)
-        .ok_or(ModelError::Core(BonsaiError::UnexpectedEof {
-            offset: u64::MAX,
-        }))?;
-    let end = start
-        .checked_add(size)
-        .ok_or(ModelError::Core(BonsaiError::UnexpectedEof {
-            offset: u64::MAX,
-        }))?;
-    if end > gguf.data.len() as u64 {
-        return Err(ModelError::Core(BonsaiError::UnexpectedEof { offset: end }));
-    }
-    gguf.data
-        .get(start as usize..end as usize)
-        .ok_or(ModelError::Core(BonsaiError::UnexpectedEof { offset: end }))
+    crate::model::types::apply_resolved_type(raw, resolved_42)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -981,25 +891,14 @@ pub fn bind_linear<'a>(
                 kernel.clone(),
             )?)
         }
-        // `dequant_any` CAN decode these, and `HybridEmbedding::Dense`
-        // already consumes them for `token_embd.weight`, but `LinearLayer`
-        // has no dense variant in this build, so there is no kernel to run
-        // the projection through. Deliberately NOT
-        // `non_executable_quant_type`: that error's generated "executable
-        // types are ..." list names F32 itself, contradicting the refusal
-        // it is attached to (gatekeeper REQUIRED #5 / OPTIONAL #O8). The
-        // fix that makes these executable is a `LinearLayer::Dense`
-        // variant in `layers/linear.rs`; until it exists this says so.
-        GgufTensorType::F32 | GgufTensorType::F16 | GgufTensorType::BF16 => {
-            return Err(ModelError::InvalidTensor(format!(
-                "{name}: {} (id {}) is stored unquantized, and this build has no dense \
-                 LinearLayer variant to run a qwen35 projection through - add \
-                 `LinearLayer::Dense` (mirroring `weight_loaders.rs`'s `OutputWeight::Fp32`) \
-                 or quantize the file",
-                resolved,
-                resolved.wire_id(),
-            )))
-        }
+        // Unquantized matrices (the synthetic fixture's reference variants,
+        // any dequantised or converted `qwen35` file): widened once to a
+        // dense `f32` layer that projects through the dispatcher's `f32`
+        // GEMV (gatekeeper REQUIRED #5). Every `F16`/`BF16` value is exactly
+        // representable in `f32`, so the widening is lossless.
+        GgufTensorType::F32 | GgufTensorType::F16 | GgufTensorType::BF16 => LinearLayer::Dense(
+            LinearDense::from_le_bytes(data, resolved, out_features, in_features, kernel.clone())?,
+        ),
         other => {
             return Err(ModelError::Core(BonsaiError::non_executable_quant_type(
                 name, other,

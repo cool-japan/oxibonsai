@@ -238,11 +238,15 @@ impl<'a> SpeculativeDecoder<'a> {
         // cached prefix no longer matches `context`. Rewind the draft cache and
         // re-prime from scratch instead of indexing past the end of `context`
         // (which previously panicked with an out-of-bounds slice access).
+        // ENGINE-SEAM: drafting K tokens and rewinding the rejected ones is
+        // a KV-cursor rollback; a hybrid draft model's recurrent state
+        // cannot follow it.
+        refuse_recurrent_engine(&self.draft_engine, "speculative drafting (draft engine)")?;
         if context.len() < self.committed_len {
             self.draft_engine.reset();
             self.committed_len = 0;
         }
-        let max_ctx = self.draft_engine.model().kv_cache().max_seq_len();
+        let max_ctx = self.draft_engine.max_seq_len();
 
         // (a) Commit the delta: tokens in context not yet in the cache.
         let committed = self.committed_len;
@@ -252,10 +256,7 @@ impl<'a> SpeculativeDecoder<'a> {
                 .prefill_from_pos(&context[committed..], committed)?;
             // Advance the cache's seq_len to the committed prefix length so
             // committed_position() == kv_cache().seq_len() is a testable invariant.
-            self.draft_engine
-                .model_mut()
-                .kv_cache_mut()
-                .set_seq_len(context.len());
+            set_dense_kv_cursor(&mut self.draft_engine, context.len());
             logits
         } else {
             // Nothing new to commit: re-derive logits by forwarding the last
@@ -310,23 +311,21 @@ impl<'a> SpeculativeDecoder<'a> {
         if context.is_empty() {
             return Ok(None);
         }
+        refuse_recurrent_engine(&self.draft_engine, "speculative drafting (draft engine)")?;
         // Same reuse-on-shorter-context guard as `draft_delta`: rewind rather
         // than index past the end of `context`.
         if context.len() < self.committed_len {
             self.draft_engine.reset();
             self.committed_len = 0;
         }
-        let max_ctx = self.draft_engine.model().kv_cache().max_seq_len();
+        let max_ctx = self.draft_engine.max_seq_len();
         let committed = self.committed_len;
 
         let last_logits = if context.len() > committed {
             let logits = self
                 .draft_engine
                 .prefill_from_pos(&context[committed..], committed)?;
-            self.draft_engine
-                .model_mut()
-                .kv_cache_mut()
-                .set_seq_len(context.len());
+            set_dense_kv_cursor(&mut self.draft_engine, context.len());
             logits
         } else {
             let last_pos = committed.saturating_sub(1);
@@ -345,10 +344,7 @@ impl<'a> SpeculativeDecoder<'a> {
         let token = self.draft_engine.sample(&last_logits)?;
         // Forward the bonus token and KEEP its KV (no rewind).
         self.draft_engine.decode_step(token, pos)?;
-        self.draft_engine
-            .model_mut()
-            .kv_cache_mut()
-            .set_seq_len(pos + 1);
+        set_dense_kv_cursor(&mut self.draft_engine, pos + 1);
         self.committed_len = pos + 1;
         Ok(Some(token))
     }
@@ -585,10 +581,15 @@ impl<'a> SpeculativeDecoder<'a> {
         if prompt_tokens.is_empty() || max_tokens == 0 {
             return Ok(Vec::new());
         }
+        // ENGINE-SEAM: verification writes state for every draft position
+        // and rolls the rejected ones back; neither engine may carry a
+        // recurrent state that cannot follow that rollback.
+        refuse_recurrent_engine(target, "speculative decoding (target engine)")?;
+        refuse_recurrent_engine(&self.draft_engine, "speculative decoding (draft engine)")?;
         self.reset();
         target.reset();
 
-        let max_ctx = target.model().kv_cache().max_seq_len();
+        let max_ctx = target.max_seq_len();
         let mut output: Vec<u32> = Vec::with_capacity(max_tokens.min(MAX_PREALLOC_TOKENS));
         let mut context: Vec<u32> = prompt_tokens.to_vec();
 
@@ -770,6 +771,60 @@ impl<'a> SpeculativeDecoder<'a> {
             let effective_threshold = accept_prob - threshold;
             rng_sample < effective_threshold
         }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────
+// ENGINE-SEAM helpers
+// ──────────────────────────────────────────────────────────────────
+
+/// Refuse an engine whose sequence state cannot be rolled back by moving the
+/// KV cursor (a hybrid `qwen35` model, or an attached `RecurrentState`):
+/// speculative decoding discards rejected drafts by exactly such a rollback,
+/// and doing it on a recurrence would silently keep the rejected tokens in
+/// the state.
+///
+/// # Errors
+///
+/// [`EngineError::RecurrentRollbackRequired`](crate::engine_seam::EngineError::RecurrentRollbackRequired).
+fn refuse_recurrent_engine(
+    engine: &InferenceEngine<'_>,
+    operation: &'static str,
+) -> Result<(), crate::engine_seam::EngineError> {
+    if engine.recurrent_rollback_supported() {
+        return Ok(());
+    }
+    Err(crate::engine_seam::EngineError::RecurrentRollbackRequired {
+        operation,
+        architecture: engine.architecture().to_string(),
+    })
+}
+
+/// Advertise `len` committed positions on a dense engine's KV cache — the
+/// `committed_position() == kv_cache().seq_len()` invariant this decoder
+/// keeps. The decoder refuses non-dense engines up front
+/// ([`refuse_recurrent_engine`]), so a hybrid engine never reaches here; if
+/// one did, its model tracks its own position and there is nothing to move.
+fn set_dense_kv_cursor(engine: &mut InferenceEngine<'_>, len: usize) {
+    if let Some(model) = engine.dense_model_mut() {
+        model.kv_cache_mut().set_seq_len(len);
+    }
+}
+
+impl<'a> SpeculativeDecoder<'a> {
+    /// [`SpeculativeDecoder::new`], refusing a draft engine whose state
+    /// cannot be rolled back (a hybrid `qwen35` model).
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::RecurrentRollbackRequired`](crate::engine_seam::EngineError::RecurrentRollbackRequired)
+    /// (as a [`RuntimeError`](crate::error::RuntimeError)).
+    pub fn try_new(
+        draft_engine: InferenceEngine<'a>,
+        config: SpeculativeConfig,
+    ) -> RuntimeResult<Self> {
+        refuse_recurrent_engine(&draft_engine, "speculative decoding (draft engine)")?;
+        Ok(Self::new(draft_engine, config))
     }
 }
 
@@ -1186,8 +1241,17 @@ mod tests {
         );
         assert_eq!(
             dec.committed_position(),
-            dec.draft_engine.model().kv_cache().seq_len(),
+            dec.draft_engine
+                .dense_model()
+                .expect("tiny_test draft engine is dense")
+                .kv_cache()
+                .seq_len(),
             "committed_position must mirror kv_cache seq_len"
+        );
+        // The engine-level position accessor agrees for a dense engine.
+        assert_eq!(
+            dec.committed_position(),
+            dec.draft_engine.sequence_position()
         );
     }
 

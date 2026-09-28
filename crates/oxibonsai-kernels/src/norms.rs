@@ -19,14 +19,14 @@
 //!
 //! ## NEON transcendental helpers
 //!
-//! `exp_neon_f32x4` and `silu_core_neon_f32x4` below are intentionally a
-//! **verbatim copy** of the private helpers of the same name in
-//! `simd_float_ops.rs` (KERN-SOUND's K-M3 fix): that file does not export
-//! them (they are private `fn`s, not `pub(crate)`), and this module does not
-//! own `simd_float_ops.rs`, so the only way to reuse the vectorized-exp
-//! approach without editing a file outside this package's `owned_files` is
-//! to duplicate it. Recorded as a deviation: a follow-up package should mark
-//! the originals `pub(crate)` and delete this copy.
+//! `exp_neon_f32x4` and `silu_core_neon_f32x4` are `simd_float_ops.rs`'s
+//! (KERN-SOUND's K-M3 fix), imported below rather than duplicated (K-INT8
+//! wave-4b: both files are owned by the same package, so the prior verbatim
+//! copy here — kept only because `simd_float_ops.rs` was out of reach at
+//! the time — is gone). `norms::dedup_parity` pins that every entry point
+//! built on them (`sigmoid_simd`, `sigmoid_mul_simd`, `softplus_simd`,
+//! `rms_norm_gated_simd`) produces bit-identical output to the old
+//! duplicated implementation.
 //!
 //! [`ln_neon_f32x4`] is new: `softplus_simd` needs `ln(1+exp(x))` and no
 //! vectorized `ln` exists anywhere in this workspace (checked). Rather than
@@ -42,6 +42,8 @@
 //! header-room, not load-bearing.
 
 use crate::error::{KernelError, KernelResult};
+#[cfg(target_arch = "aarch64")]
+use crate::simd_float_ops::{exp_neon_f32x4, silu_core_neon_f32x4};
 
 // ═════════════════════════════════════════════════════════════════
 //  Public entry points
@@ -369,78 +371,6 @@ fn softplus_scalar(input: &[f32], output: &mut [f32]) {
 // ═════════════════════════════════════════════════════════════════
 //  AArch64 NEON implementations
 // ═════════════════════════════════════════════════════════════════
-
-/// Vectorized `exp(x)` for 4 `f32` lanes.
-///
-/// **Verbatim copy** of `simd_float_ops::exp_neon_f32x4` (K-M3) — see the
-/// module doc comment above for why this is duplicated rather than shared.
-/// Classic Cephes-derived range reduction + 5th-degree minimax polynomial:
-/// write `x = k*ln2 + r` with `k = round(x * log2(e))` and `|r| <= ln2/2`,
-/// then `exp(x) = 2^k * poly(r)`, with `2^k` built by inserting the biased
-/// exponent directly into an IEEE-754 bit pattern. Inputs are clamped to
-/// `±88.3762626647950` (the range where `f32::exp` is finite).
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn exp_neon_f32x4(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
-    use std::arch::aarch64::*;
-
-    const EXP_HI: f32 = 88.376_26;
-    const EXP_LO: f32 = -88.376_26;
-    const LOG2EF: f32 = std::f32::consts::LOG2_E;
-    const EXP_C1: f32 = 0.693_359_4;
-    const EXP_C2: f32 = -2.121_944_4e-4;
-    const P0: f32 = 1.987_569_1e-4;
-    const P1: f32 = 1.398_2e-3;
-    const P2: f32 = 8.333_452e-3;
-    const P3: f32 = 4.166_579_6e-2;
-    const P4: f32 = 1.666_666_6e-1;
-    const P5: f32 = 5e-1;
-
-    let one = vdupq_n_f32(1.0);
-    let x = vminq_f32(x, vdupq_n_f32(EXP_HI));
-    let x = vmaxq_f32(x, vdupq_n_f32(EXP_LO));
-
-    let fx0 = vfmaq_f32(vdupq_n_f32(0.5), x, vdupq_n_f32(LOG2EF));
-    let fx_trunc = vcvtq_f32_s32(vcvtq_s32_f32(fx0));
-    let overshot = vcgtq_f32(fx_trunc, fx0);
-    let overshot_f = vreinterpretq_f32_u32(vandq_u32(overshot, vreinterpretq_u32_f32(one)));
-    let fx = vsubq_f32(fx_trunc, overshot_f);
-
-    let x = vfmsq_f32(x, fx, vdupq_n_f32(EXP_C1));
-    let x = vfmsq_f32(x, fx, vdupq_n_f32(EXP_C2));
-
-    let z = vmulq_f32(x, x);
-
-    let mut y = vdupq_n_f32(P0);
-    y = vfmaq_f32(vdupq_n_f32(P1), y, x);
-    y = vfmaq_f32(vdupq_n_f32(P2), y, x);
-    y = vfmaq_f32(vdupq_n_f32(P3), y, x);
-    y = vfmaq_f32(vdupq_n_f32(P4), y, x);
-    y = vfmaq_f32(vdupq_n_f32(P5), y, x);
-    y = vfmaq_f32(vaddq_f32(x, one), y, z);
-
-    let emm0 = vaddq_s32(vcvtq_s32_f32(fx), vdupq_n_s32(127));
-    let pow2n = vreinterpretq_f32_s32(vshlq_n_s32(emm0, 23));
-
-    vmulq_f32(y, pow2n)
-}
-
-/// SIMD SiLU on 4 lanes: `x / (1 + exp(-x))`.
-///
-/// Verbatim copy of `simd_float_ops::silu_core_neon_f32x4` (K-M3) — see the
-/// module doc comment. Uses `vdivq_f32` (correctly-rounded division) rather
-/// than a reciprocal-approximation Newton step, so every lane uses one
-/// division strategy.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn silu_core_neon_f32x4(
-    x: std::arch::aarch64::float32x4_t,
-) -> std::arch::aarch64::float32x4_t {
-    use std::arch::aarch64::*;
-    let one = vdupq_n_f32(1.0);
-    let denom = vaddq_f32(one, exp_neon_f32x4(vnegq_f32(x)));
-    vdivq_f32(x, denom)
-}
 
 /// SIMD sigmoid on 4 lanes: `1 / (1 + exp(-x))`.
 #[cfg(target_arch = "aarch64")]
@@ -1256,5 +1186,130 @@ mod tests {
                 "ln_neon_f32x4({y}) = {out}, expected {expected}"
             );
         }
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════
+//  K-INT8 wave-4b: exp_neon_f32x4 / silu_core_neon_f32x4 de-dup proof
+// ═════════════════════════════════════════════════════════════════
+//
+// `norms.rs` used to carry its own verbatim copy of
+// `simd_float_ops::{exp_neon_f32x4, silu_core_neon_f32x4}` (see the module
+// doc comment above `use crate::error::...`). This module fingerprints
+// every `norms.rs` entry point that transitively calls them --
+// `sigmoid_simd`, `sigmoid_mul_simd`, `softplus_simd`, `rms_norm_gated_simd`
+// -- over a fixed sweep, captured BEFORE the de-dup (the verbatim-copy
+// implementation) and pinned below. The de-dup (deleting the local copies,
+// importing the `pub(crate)` originals from `simd_float_ops`) must not move
+// this fingerprint by even one bit -- that is the proof, not an assertion
+// taken on faith.
+#[cfg(all(test, target_arch = "aarch64"))]
+mod dedup_parity {
+    use super::*;
+
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    /// FNV-1a over the little-endian `to_bits()` byte stream of `data`.
+    fn fnv1a_extend(mut hash: u64, data: &[f32]) -> u64 {
+        for &v in data {
+            for byte in v.to_bits().to_le_bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(FNV_PRIME);
+            }
+        }
+        hash
+    }
+
+    /// Deterministic LCG sweep in `[-100, 100]`, seeded so results are
+    /// reproducible across runs (no `rand` dependency). `len` need not be a
+    /// multiple of 4, so the padded scalar-tail path in every `*_neon`
+    /// function under test here runs in addition to the vectorized body.
+    fn lcg_sweep(len: usize, seed: u64) -> Vec<f32> {
+        // Explicit boundary values guarantee both sides of the
+        // `exp_neon_f32x4` clamp (+/-88.376) and the softplus `20.0`
+        // cutoff are exercised regardless of what the LCG happens to draw
+        // -- "must include", per the finding, not "probably includes".
+        const BOUNDARY: [f32; 15] = [
+            -100.0, -88.4, -88.376_3, -88.376_2, -20.001, -20.0, -19.999, 0.0, 19.999, 20.0,
+            20.001, 88.376_2, 88.376_3, 88.4, 100.0,
+        ];
+        let mut out = Vec::with_capacity(len);
+        for &b in BOUNDARY.iter().take(len) {
+            out.push(b);
+        }
+        let mut state = seed | 1;
+        while out.len() < len {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let unit = ((state >> 40) as u32) as f32 / (1u32 << 24) as f32; // [0, 1)
+            out.push(unit * 200.0 - 100.0);
+        }
+        out
+    }
+
+    /// Bit-exact fingerprint of `sigmoid_simd`/`sigmoid_mul_simd`/
+    /// `softplus_simd`/`rms_norm_gated_simd` over several lengths, most of
+    /// them deliberately NOT multiples of 4.
+    fn fingerprint_all() -> u64 {
+        let mut hash = FNV_OFFSET_BASIS;
+        let lengths_and_seeds: [(usize, u64); 16] = [
+            (1, 1),
+            (2, 2),
+            (3, 3),
+            (5, 5),
+            (7, 7),
+            (9, 11),
+            (13, 13),
+            (17, 17),
+            (31, 29),
+            (37, 41),
+            (63, 61),
+            (100, 97),
+            (101, 101),
+            (137, 131),
+            (199, 191),
+            (255, 251),
+        ];
+        for (len, seed) in lengths_and_seeds {
+            let input = lcg_sweep(len, seed);
+            let gate = lcg_sweep(len, seed.wrapping_add(1_000_003));
+            let weight: Vec<f32> = (0..len).map(|i| 0.3 + i as f32 * 0.017).collect();
+
+            let mut sig = vec![0.0f32; len];
+            sigmoid_simd(&input, &mut sig).expect("valid");
+            hash = fnv1a_extend(hash, &sig);
+
+            let mut sig_mul = vec![0.0f32; len];
+            sigmoid_mul_simd(&input, &gate, &mut sig_mul).expect("valid");
+            hash = fnv1a_extend(hash, &sig_mul);
+
+            let mut sp = vec![0.0f32; len];
+            softplus_simd(&input, &mut sp).expect("valid");
+            hash = fnv1a_extend(hash, &sp);
+
+            let mut rmsg = vec![0.0f32; len];
+            rms_norm_gated_simd(&input, &weight, &gate, &mut rmsg, 1e-6).expect("valid");
+            hash = fnv1a_extend(hash, &rmsg);
+        }
+        hash
+    }
+
+    /// Pinned against the verbatim-copy implementation, captured BEFORE the
+    /// K-INT8 wave-4b `exp_neon_f32x4`/`silu_core_neon_f32x4` de-dup
+    /// landed. If this ever needs to change, the de-dup broke bit
+    /// exactness -- fix the code, never this constant.
+    const PINNED_FINGERPRINT_BEFORE_DEDUP: u64 = 0xe189_a559_1b7d_149f;
+
+    #[test]
+    fn sigmoid_softplus_and_rms_norm_gated_are_bit_identical_across_the_dedup() {
+        let got = fingerprint_all();
+        assert_eq!(
+            got, PINNED_FINGERPRINT_BEFORE_DEDUP,
+            "output of sigmoid_simd/sigmoid_mul_simd/softplus_simd/rms_norm_gated_simd \
+             changed bit-for-bit ({got:#018x} vs pinned {PINNED_FINGERPRINT_BEFORE_DEDUP:#018x}) \
+             across the exp_neon_f32x4/silu_core_neon_f32x4 de-dup"
+        );
     }
 }

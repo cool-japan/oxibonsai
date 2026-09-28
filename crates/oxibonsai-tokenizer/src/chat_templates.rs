@@ -507,30 +507,31 @@ pub enum ResolvedChatTemplate {
 
 impl ResolvedChatTemplate {
     /// Prefer the GGUF's own `tokenizer.chat_template`; fall back to the
-    /// built-in Qwen3/ChatML replacement for a model that ships none, or
-    /// whose template this engine's supported Jinja subset cannot compile.
+    /// built-in Qwen3/ChatML replacement only for a model that ships **no**
+    /// `tokenizer.chat_template` at all.
     ///
-    /// **Never renders garbage** (TOK-07/RT-09): a template this engine
-    /// cannot compile is never used partially or leniently — compilation
-    /// either fully succeeds or the caller gets the fallback, logged loudly
-    /// via `tracing::warn!` so the gap is operationally visible rather than
-    /// silently swallowed.
-    pub fn from_gguf(md: &oxibonsai_core::MetadataStore) -> Self {
-        if let Some(text) = crate::gguf_vocab::chat_template_from_gguf_metadata(md) {
-            match JinjaTemplate::compile(&text) {
-                Ok(tpl) => return ResolvedChatTemplate::Jinja(Arc::new(tpl)),
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        "tokenizer.chat_template failed to compile against the Jinja subset \
-                         engine; falling back to the built-in Qwen3/ChatML template rather \
-                         than rendering garbage (never partially render an unsupported \
-                         construct — TOK-07/RT-09)"
-                    );
-                }
+    /// **Never renders garbage** (TOK-07/RT-09, spec item 1 "an unsupported
+    /// construct must ERROR"): a template this engine's Jinja subset
+    /// **cannot compile** is a loud, caller-visible [`Err`], never a silent
+    /// substitution — B5 correction. An earlier revision of this function
+    /// swapped in the fallback whenever compilation failed, with only a
+    /// `tracing::warn!`; that conflated two very different situations
+    /// ("no template shipped" — a legitimate, expected case the fallback
+    /// exists for) and ("a template shipped but this engine's Jinja subset
+    /// rejects it" — an engine-capability gap that must surface as an
+    /// operator-visible error, not a prompt silently rendered against the
+    /// *wrong* template the model was never tuned against). Both shipped
+    /// real templates (Bonsai 2 27B and the legacy Bonsai-8B Qwen3 one)
+    /// compile cleanly against this engine, so this tightening is safe for
+    /// every model this crate ships against today.
+    pub fn from_gguf(md: &oxibonsai_core::MetadataStore) -> Result<Self, JinjaError> {
+        match crate::gguf_vocab::chat_template_from_gguf_metadata(md) {
+            Some(text) => {
+                let tpl = JinjaTemplate::compile(&text)?;
+                Ok(ResolvedChatTemplate::Jinja(Arc::new(tpl)))
             }
+            None => Ok(Self::default_fallback()),
         }
-        Self::default_fallback()
     }
 
     /// The named fallback for a model that ships no `tokenizer.chat_template`
@@ -1157,7 +1158,8 @@ mod resolved_template_tests {
     #[test]
     fn from_gguf_falls_back_when_no_template_present() {
         let md = oxibonsai_core::MetadataStore::new();
-        let resolved = ResolvedChatTemplate::from_gguf(&md);
+        let resolved =
+            ResolvedChatTemplate::from_gguf(&md).expect("no template -> fallback, not an error");
         let out = resolved
             .render_with(
                 &[RenderMessage::new("user", "hi")],
@@ -1180,7 +1182,8 @@ mod resolved_template_tests {
         // template, proving `from_gguf` picks it up rather than only ever
         // falling back.
         let md = build_metadata_with_chat_template(BONSAI2_REAL_TEMPLATE_FIXTURE);
-        let resolved = ResolvedChatTemplate::from_gguf(&md);
+        let resolved =
+            ResolvedChatTemplate::from_gguf(&md).expect("the real template must compile");
         assert!(matches!(resolved, ResolvedChatTemplate::Jinja(_)));
         let out = resolved
             .render_with(
@@ -1195,22 +1198,20 @@ mod resolved_template_tests {
     }
 
     #[test]
-    fn from_gguf_falls_back_on_uncompilable_template() {
+    fn from_gguf_errors_on_uncompilable_template() {
+        // B5 correction: a model that SHIPS a `tokenizer.chat_template` this
+        // engine's Jinja subset cannot compile must surface a loud `Err`
+        // (spec item 1: "an unsupported construct must ERROR"), never
+        // silently substitute the fallback template — that would render a
+        // real prompt against a template the model was never tuned
+        // against, with only a log line as the (easily-missed) signal.
         let md = build_metadata_with_chat_template("{% this is not valid jinja %}");
-        let resolved = ResolvedChatTemplate::from_gguf(&md);
-        // Never a hard failure and never garbage: the fallback renders.
-        let out = resolved
-            .render_with(
-                &[RenderMessage::new("user", "hi")],
-                &RenderOptions {
-                    add_generation_prompt: true,
-                    ..Default::default()
-                },
-            )
-            .expect("render");
-        assert_eq!(
-            out,
-            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
+        let err = ResolvedChatTemplate::from_gguf(&md)
+            .expect_err("an uncompilable shipped template must error, not silently fall back");
+        // A real compile failure, not some other unrelated error shape.
+        assert!(
+            !err.to_string().is_empty(),
+            "the error must carry a real diagnostic"
         );
     }
 

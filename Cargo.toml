@@ -325,6 +325,13 @@ name = "controllers_bench"
 harness = false
 required-features = ["bench"]
 
+# MET-08: GPU engine-pool serving throughput vs pool size on a real model
+# (`OXI_MODEL`); measures nothing without it or off the Metal tier.
+[[bench]]
+name = "metal_pool_scaling"
+harness = false
+required-features = ["bench", "metal"]
+
 [profile.release]
 lto = true
 codegen-units = 1

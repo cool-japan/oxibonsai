@@ -146,7 +146,27 @@ pub mod metal_k_quant_kernels;
 mod metal_prefill;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal_q_std_kernels;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+mod resident_logits;
 pub mod scirs2_backend;
+mod upload_scope;
+
+pub use upload_scope::{
+    cpu_only_backend_active, current_upload_epoch, next_gpu_model_epoch, note_weight_upload,
+    CpuOnlyBackendScope, GpuUploadScope, UploadStats, UNATTRIBUTED_MODEL_EPOCH,
+};
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub use resident_logits::{
+    metal_resident_logits_download, metal_resident_logits_topk, ResidentLogitsTopK,
+};
+
+/// Largest candidate count the fused-route sampled top-k
+/// (`metal_resident_logits_topk`, `perf-11`) accepts: the `topk_f32` Metal
+/// kernel's fixed `picked[256]` bound (`MAX_TOPK_F32` in `metal_dispatch.rs`,
+/// asserted equal in `resident_logits`'s tests). Defined on every build so a
+/// caller can size its candidate set without a `cfg`.
+pub const MAX_RESIDENT_TOPK: usize = 256;
 
 use thiserror::Error;
 #[allow(unused_imports)]
@@ -172,8 +192,16 @@ pub use metal_fp8_prefill::{
     metal_gemm_fp8_e4m3_residual, metal_gemm_fp8_e5m2, metal_gemm_fp8_e5m2_residual,
 };
 
+/// The public Metal graph types, nameable as `gpu_backend::X` (`MET-08`):
+/// `MetalGraph`, `MetalGraphError` and `MetalWeightHandle`, plus the
+/// process-shared `MetalDevice` and the RAII session binding `SessionScope`
+/// from the moment `metal_graph` exports them (its `pub use
+/// graph::{MetalDevice, MetalGraph, SessionScope}`, landed by the
+/// METAL-CONCURRENCY package). The glob is deliberate: it re-exports exactly
+/// what `metal_graph` makes public, so this module can never lag behind — or
+/// name a type ahead of — that module.
 #[cfg(all(feature = "metal", target_os = "macos"))]
-pub use metal_graph::{MetalGraph, MetalGraphError, MetalWeightHandle};
+pub use metal_graph::*;
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub use metal_full_layer::{
@@ -578,6 +606,60 @@ pub trait GpuBackendTrait: Send + Sync {
     ) -> Result<bool, GpuError> {
         Ok(false)
     }
+
+    /// Release every GPU-resident weight buffer registered under
+    /// `model_epoch` (`MET-M1`, eviction half).
+    ///
+    /// Uploads made inside a [`GpuUploadScope`] are attributed to that
+    /// scope's epoch; a backend that deduplicates identical uploads (see
+    /// `Scirs2Backend`) keeps one resident buffer per distinct content and a
+    /// reference count per epoch, so releasing one epoch frees only the
+    /// buffers **no other** live epoch still references. That is what makes
+    /// it safe to call from `InferenceEngine`'s `Drop`: a pool of replicas of
+    /// the same model shares one resident copy, and dropping one replica
+    /// never pulls weights out from under its siblings.
+    ///
+    /// [`UNATTRIBUTED_MODEL_EPOCH`] is never released (it holds uploads made
+    /// outside any scope, whose owner cannot be known).
+    ///
+    /// Returns the number of buffers actually freed. The default — for a
+    /// backend that keeps no weight cache at all — has nothing to free.
+    ///
+    /// # Errors
+    ///
+    /// Backend-specific (e.g. a poisoned cache lock).
+    fn release_model(&self, model_epoch: u64) -> Result<usize, GpuError> {
+        let _ = model_epoch;
+        Ok(0)
+    }
+
+    /// Bytes of weight data currently resident in this backend's weight
+    /// cache. `0` for a backend that keeps none.
+    fn resident_weight_bytes(&self) -> u64 {
+        0
+    }
+
+    /// Number of weight buffers currently resident in this backend's weight
+    /// cache. `0` for a backend that keeps none.
+    fn resident_weight_count(&self) -> usize {
+        0
+    }
+
+    /// Cumulative bytes this backend has **freshly** uploaded to the device
+    /// over its lifetime — a deduplicated upload does not count. A monotonic
+    /// counter: it is the observable that proves `N` replicas of one model
+    /// upload the weights once, not `N` times.
+    fn weight_bytes_uploaded_total(&self) -> u64 {
+        0
+    }
+
+    /// Number of upload registrations `model_epoch` currently holds (one per
+    /// retained upload made inside a [`GpuUploadScope`] for that epoch,
+    /// whether it minted a new buffer or shared an existing one).
+    fn model_registration_count(&self, model_epoch: u64) -> usize {
+        let _ = model_epoch;
+        0
+    }
 }
 
 /// Backwards-compatible type alias for the GPU backend trait.
@@ -891,6 +973,113 @@ impl GpuBackendTrait for Scirs2BackendHandle {
             }
         }
     }
+
+    // `MET-M1`: this handle is what every `KernelDispatcher::auto_detect()`
+    // holds, so `InferenceEngine`'s `Drop` reaches the process-global backend
+    // only through these forwards — without them it would hit the trait's
+    // `Ok(0)` defaults and release nothing.
+    fn release_model(&self, model_epoch: u64) -> Result<usize, GpuError> {
+        self.0.release_model(model_epoch)
+    }
+
+    fn resident_weight_bytes(&self) -> u64 {
+        GpuBackendTrait::resident_weight_bytes(self.0.as_ref())
+    }
+
+    fn resident_weight_count(&self) -> usize {
+        GpuBackendTrait::resident_weight_count(self.0.as_ref())
+    }
+
+    fn weight_bytes_uploaded_total(&self) -> u64 {
+        GpuBackendTrait::weight_bytes_uploaded_total(self.0.as_ref())
+    }
+
+    fn model_registration_count(&self, model_epoch: u64) -> usize {
+        GpuBackendTrait::model_registration_count(self.0.as_ref(), model_epoch)
+    }
+}
+
+/// Release every weight `model_epoch` registered on `dispatcher`'s GPU
+/// backend (`MET-M1`), returning the number of buffers freed.
+///
+/// The single seam `InferenceEngine`'s `Drop` goes through: it resolves the
+/// backend via [`KernelDispatcher::gpu_backend`](crate::KernelDispatcher::gpu_backend)
+/// — `None` on every CPU tier, in which case nothing was uploaded under the
+/// engine's epoch and there is nothing to do — and never touches any other
+/// epoch, unlike the process-wide `Scirs2Backend::clear_weight_cache`, which
+/// multi-replica pools make unsafe to call from a single replica's drop.
+/// Always compiled, so a caller need not mirror this crate's `gpu` feature.
+///
+/// # Errors
+///
+/// Whatever the backend's [`GpuBackendTrait::release_model`] returns.
+pub fn release_model_weights(
+    dispatcher: &crate::KernelDispatcher,
+    model_epoch: u64,
+) -> Result<usize, GpuError> {
+    #[cfg(feature = "gpu")]
+    {
+        match dispatcher.gpu_backend() {
+            Some(backend) => backend.release_model(model_epoch),
+            None => Ok(0),
+        }
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = (dispatcher, model_epoch);
+        Ok(0)
+    }
+}
+
+/// Bytes resident in `dispatcher`'s GPU backend weight cache (`0` on a CPU
+/// tier). Always compiled; see [`release_model_weights`].
+#[must_use]
+pub fn resident_weight_bytes(dispatcher: &crate::KernelDispatcher) -> u64 {
+    #[cfg(feature = "gpu")]
+    {
+        dispatcher
+            .gpu_backend()
+            .map_or(0, |backend| backend.resident_weight_bytes())
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = dispatcher;
+        0
+    }
+}
+
+/// Cumulative freshly-uploaded bytes of `dispatcher`'s GPU backend (`0` on a
+/// CPU tier). Always compiled; see [`release_model_weights`].
+#[must_use]
+pub fn weight_bytes_uploaded_total(dispatcher: &crate::KernelDispatcher) -> u64 {
+    #[cfg(feature = "gpu")]
+    {
+        dispatcher
+            .gpu_backend()
+            .map_or(0, |backend| backend.weight_bytes_uploaded_total())
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = dispatcher;
+        0
+    }
+}
+
+/// Upload registrations `model_epoch` holds on `dispatcher`'s GPU backend
+/// (`0` on a CPU tier). Always compiled; see [`release_model_weights`].
+#[must_use]
+pub fn model_registration_count(dispatcher: &crate::KernelDispatcher, model_epoch: u64) -> usize {
+    #[cfg(feature = "gpu")]
+    {
+        dispatcher
+            .gpu_backend()
+            .map_or(0, |backend| backend.model_registration_count(model_epoch))
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = (dispatcher, model_epoch);
+        0
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -914,6 +1103,13 @@ impl GpuBackendTrait for Scirs2BackendHandle {
 /// `CpuBackend` behind a `warn!`, advertising acceleration that did not exist.
 /// Both types are gone and this falls straight to `CpuBackend`.
 pub fn select_backend() -> Box<dyn GpuBackendTrait> {
+    // An explicit CPU request (`CpuOnlyBackendScope`) outranks auto-detection:
+    // it is how an engine built with `Backend::Cpu` makes the model's own
+    // internally-created dispatchers land on the CPU tier as well.
+    if cpu_only_backend_active() {
+        return Box::new(CpuBackend::new());
+    }
+
     // `select_backend` may be called several times in a process (model load,
     // engine init, tests). The "scirs2 not accelerated" / "init failed" warnings
     // are properties of the host environment, not of any individual call site,
@@ -1160,6 +1356,26 @@ fn cpu_gemv_1bit_fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_helpers_are_inert_on_a_cpu_dispatcher() {
+        let cpu = crate::KernelDispatcher::with_tier(crate::KernelTier::Reference);
+        let epoch = next_gpu_model_epoch();
+        assert_eq!(release_model_weights(&cpu, epoch).expect("no-op"), 0);
+        assert_eq!(resident_weight_bytes(&cpu), 0);
+        assert_eq!(weight_bytes_uploaded_total(&cpu), 0);
+        assert_eq!(model_registration_count(&cpu, epoch), 0);
+    }
+
+    #[test]
+    fn default_trait_release_is_a_no_op() {
+        let backend = CpuBackend::new();
+        assert_eq!(backend.release_model(42).expect("default"), 0);
+        assert_eq!(backend.resident_weight_bytes(), 0);
+        assert_eq!(backend.resident_weight_count(), 0);
+        assert_eq!(backend.weight_bytes_uploaded_total(), 0);
+        assert_eq!(backend.model_registration_count(42), 0);
+    }
 
     #[test]
     fn device_buffer_new_zeroed() {

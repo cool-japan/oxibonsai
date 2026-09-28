@@ -1056,20 +1056,14 @@ impl MetalGraph {
     /// Convenience wrapper around [`MetalPipelines::pipeline_for`] for a
     /// caller that already holds a `&MetalGraph` (e.g. via
     /// `MetalGraph::global()`) and so has both the library and the device it
-    /// needs without threading the device through separately. This is the
-    /// MET-10 escape hatch: `metal_fp8_prefill.rs`, `metal_k_quant_kernels.rs`
-    /// and `metal_q_std_kernels.rs` (not owned by this package) can port
-    /// their per-kernel `device.new_library_with_source(...)` call sites onto
-    /// `graph.pipeline_for("gemv_q4k")` (etc.) one at a time, reusing this
-    /// `MetalGraph`'s device, command queue and the embedded/disk-cached
-    /// metallib instead of compiling their own library from source on first
-    /// use.
+    /// needs without threading the device through separately.
     ///
-    /// Those three ports are someone else's follow-up, so nothing in the
-    /// non-test build calls this yet —
-    /// `pipeline_for_resolves_and_dispatches_a_kquant_kernel_by_name` below
-    /// does, end to end, hence `#[allow(dead_code)]`.
-    #[allow(dead_code)]
+    /// MET-10: the K-quant, standard-quant, FP8 GEMV and FP8 batch-prefill
+    /// families resolve every pipeline through this —
+    /// `graph.pipeline_for("gemv_q4k")` (etc.) — reusing the session's
+    /// device and command queue and the embedded/disk-cached combined
+    /// metallib, instead of compiling a private library from source per
+    /// kernel on first use as they used to.
     pub(crate) fn pipeline_for(&self, name: &str) -> Result<ComputePipelineState, MetalGraphError> {
         self.pipelines.pipeline_for(&self.device, name)
     }
@@ -1793,13 +1787,16 @@ mod tests {
         }
     }
 
-    /// MET-10 first-use latency: `metal_k_quant_kernels.rs` (not owned by
-    /// this package) still calls `device.new_library_with_source(...)`,
-    /// once per kernel, uncached, on first use of that kernel — the finding
-    /// cites ~0.3-1s per library for this class of call. `pipeline_for`
-    /// instead resolves the same kernel against the combined
-    /// embedded/disk-cached metallib `MetalGraph::global()` already loaded
-    /// once for every other kernel family, so once that singleton exists, a
+    /// MET-10 first-use latency: the K-quant / Q-std / FP8 families used to
+    /// call `device.new_library_with_source(...)` once per kernel, uncached,
+    /// on first use of that kernel — the finding cites ~0.3-1s per library
+    /// for this class of call. They now resolve through `pipeline_for`
+    /// (`metal_graph/tests_no_private_library.rs` is the guard that keeps it
+    /// that way); "before" below reproduces the retired call shape
+    /// for comparison only. `pipeline_for` resolves the same kernel against
+    /// the combined
+    /// embedded/disk-cached metallib the shared `MetalDevice` already loaded
+    /// once for every other kernel family, so once that device exists, a
     /// first `pipeline_for` call for a K-quant/Q-std/FP8 kernel is a
     /// `get_function` + pipeline-state creation against an *already-loaded*
     /// library, not a fresh `MTLLibrary` compile from source text — that
@@ -1846,8 +1843,8 @@ mod tests {
         let device = Device::system_default().expect("checked is_none() above");
 
         // BEFORE: `new_library_with_source` on one K-quant kernel's MSL
-        // alone — exactly the call shape `metal_k_quant_kernels.rs` still
-        // uses per kernel (see the doc above for why "before" here may be
+        // alone — exactly the call shape `metal_k_quant_kernels.rs` used per
+        // kernel until MET-10 (see the doc above for why "before" here may be
         // warm rather than truly cold).
         let src = crate::gpu_backend::kernel_sources::MSL_GEMV_Q4K_V1;
         let before_start = std::time::Instant::now();

@@ -11,9 +11,6 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(feature = "gpu")]
-use std::collections::HashMap;
-
-#[cfg(feature = "gpu")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(feature = "gpu")]
@@ -121,8 +118,10 @@ pub struct Scirs2Backend {
     q1_kernels: OnceLock<Result<Q1Kernels, String>>,
     /// Lazily compiled TQ2_0_g128 (ternary) kernels.
     tq2_kernels: OnceLock<Result<TQ2Kernels, String>>,
-    /// Cached GPU-resident weight buffers, keyed by [`GpuWeightHandle`] ID.
-    weight_cache: Mutex<HashMap<u64, GpuBuffer<u8>>>,
+    /// Cached GPU-resident weight buffers, keyed by [`GpuWeightHandle`] ID,
+    /// deduplicated by content and reference-counted per model epoch (see
+    /// [`WeightCacheState`]).
+    weight_cache: Mutex<WeightCacheState>,
     /// Whether [`upload_weights`](Self::upload_weights) /
     /// [`upload_weights_ternary`](Self::upload_weights_ternary) retain their
     /// uploaded buffer in `weight_cache` for later
@@ -156,22 +155,40 @@ pub struct Scirs2Backend {
     /// non-deterministic wrong numbers under `cargo test`'s in-process
     /// parallelism, invisible to `cargo nextest` (one process per test).
     ///
-    /// **Trade-off:** GPU dispatch through `Scirs2Backend` is now strictly
-    /// serial. That costs nothing today — the shipping Metal decode path is
-    /// already a process-global singleton with GPU concurrency 1
-    /// (`GLOBAL_METAL_GRAPH`) and every dispatch here ends in a synchronous
-    /// readback, so overlapping callers never had real parallelism to lose,
-    /// only corruption to gain. Per-call I/O buffers would permit
-    /// concurrency but reintroduce the allocation churn the pool exists to
-    /// remove *and* leave the kernel-parameter race untouched. Lock order:
-    /// `dispatch` is acquired **last**, after any `weight_cache` /
-    /// `pipeline_buffers` guard is dropped.
+    /// **Trade-off:** GPU dispatch through `Scirs2Backend` is strictly
+    /// serial. The shipping fused decode paths do not go through here — since
+    /// `MET-08` they run in per-replica `MetalGraph` sessions, each with its
+    /// own command queue — so what this mutex serialises is the per-layer
+    /// block-dispatch fallback and the Q1 batch phases, every one of which
+    /// ends in a synchronous readback of a shared I/O buffer. Per-call I/O
+    /// buffers would permit concurrency there but reintroduce the allocation
+    /// churn the pool exists to remove *and* leave the kernel-parameter race
+    /// untouched. Lock order: `dispatch` is acquired **last**, after any
+    /// `weight_cache` / `pipeline_buffers` guard is dropped.
     dispatch: Mutex<DispatchState>,
     /// Lazily compiled helper kernels (SwiGLU, residual_add, RMSNorm weighted).
     helper_kernels: OnceLock<Result<HelperKernels, String>>,
     /// Pre-allocated pipeline buffers for FFN dispatch operations.
     pipeline_buffers: Mutex<Option<PipelineBuffers>>,
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Content-deduplicated, epoch-refcounted weight cache (MET-M1 / Q1 replicas)
+// ─────────────────────────────────────────────────────────────────────────
+
+// The cache state, its content fingerprint and the MetalGraph mirror
+// eviction live in a sibling file so this module stays under the 2000-line
+// ceiling; `#[path]` keeps it a child of `scirs2_backend` (same pattern as
+// the test module below).
+#[cfg(feature = "gpu")]
+#[path = "scirs2_weight_cache.rs"]
+mod weight_cache_state;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+use weight_cache_state::release_metal_mirrors;
+#[cfg(feature = "gpu")]
+use weight_cache_state::{
+    content_fingerprint, resident_bytes_equal, ContentKey, UploadLayout, WeightCacheState,
+};
 
 /// Shared dispatch state: the reusable I/O buffers, behind the mutex that
 /// also serialises kernel binding and dispatch. Capacities live here rather
@@ -247,7 +264,7 @@ impl Scirs2Backend {
             kernels: OnceLock::new(),
             q1_kernels: OnceLock::new(),
             tq2_kernels: OnceLock::new(),
-            weight_cache: Mutex::new(HashMap::new()),
+            weight_cache: Mutex::new(WeightCacheState::default()),
             weight_cache_enabled: std::sync::atomic::AtomicBool::new(true),
             dispatch: Mutex::new(DispatchState::default()),
             helper_kernels: OnceLock::new(),
@@ -285,7 +302,7 @@ impl Scirs2Backend {
             kernels: OnceLock::new(),
             q1_kernels: OnceLock::new(),
             tq2_kernels: OnceLock::new(),
-            weight_cache: Mutex::new(HashMap::new()),
+            weight_cache: Mutex::new(WeightCacheState::default()),
             weight_cache_enabled: std::sync::atomic::AtomicBool::new(true),
             dispatch: Mutex::new(DispatchState::default()),
             helper_kernels: OnceLock::new(),
@@ -741,6 +758,26 @@ impl GpuBackendTrait for Scirs2Backend {
         let free = self.ctx.get_available_memory().unwrap_or(total / 2);
         Ok((free, total))
     }
+
+    fn release_model(&self, model_epoch: u64) -> Result<usize, GpuError> {
+        self.release_model_weights(model_epoch)
+    }
+
+    fn resident_weight_bytes(&self) -> u64 {
+        self.cached_weight_bytes()
+    }
+
+    fn resident_weight_count(&self) -> usize {
+        self.cached_weight_count()
+    }
+
+    fn weight_bytes_uploaded_total(&self) -> u64 {
+        self.uploaded_weight_bytes_total()
+    }
+
+    fn model_registration_count(&self, model_epoch: u64) -> usize {
+        self.epoch_registration_count(model_epoch)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1072,27 +1109,105 @@ impl Scirs2Backend {
         &self,
         block_bytes: &[u8],
     ) -> Result<crate::weight_cache::GpuWeightHandle, GpuError> {
-        let buf: GpuBuffer<u8> = self.ctx.create_buffer_from_slice(block_bytes);
-        let id = NEXT_HANDLE_ID.fetch_add(1, Ordering::Relaxed);
-        if self.weight_cache_enabled.load(Ordering::Relaxed) {
-            let mut cache = self
-                .weight_cache
-                .lock()
-                .map_err(|_| GpuError::NotAvailable("weight cache lock poisoned".into()))?;
-            cache.insert(id, buf);
-            debug!(
-                handle = id,
-                bytes = block_bytes.len(),
-                "uploaded weights to GPU"
-            );
-        } else {
+        if !self.weight_cache_enabled.load(Ordering::Relaxed) {
+            let _buf: GpuBuffer<u8> = self.ctx.create_buffer_from_slice(block_bytes);
+            let id = NEXT_HANDLE_ID.fetch_add(1, Ordering::Relaxed);
             debug!(
                 handle = id,
                 bytes = block_bytes.len(),
                 "weight cache disabled (MET-M1): upload not retained"
             );
+            return Ok(crate::weight_cache::GpuWeightHandle(id));
         }
-        Ok(crate::weight_cache::GpuWeightHandle(id))
+        self.retain_upload(UploadLayout::RawBlocks, block_bytes)
+    }
+
+    /// Retain `stored` (already in its on-device layout) in the weight
+    /// cache, sharing an existing byte-identical buffer when there is one.
+    ///
+    /// Two phases, so the potentially large byte comparison never runs under
+    /// the cache lock: (1) look the content fingerprint up and, on a hit,
+    /// compare the resident bytes outside the lock, then re-lock and register
+    /// a reference only if that very buffer is still resident; (2) otherwise
+    /// upload a fresh buffer under a new handle id. Either way the upload is
+    /// attributed to the calling thread's [`super::current_upload_epoch`] and
+    /// reported to the active [`super::GpuUploadScope`], so the engine can
+    /// log exactly what it shared.
+    fn retain_upload(
+        &self,
+        layout: UploadLayout,
+        stored: &[u8],
+    ) -> Result<crate::weight_cache::GpuWeightHandle, GpuError> {
+        let (lo, hi) = content_fingerprint(stored);
+        let content = ContentKey {
+            layout,
+            len: stored.len(),
+            lo,
+            hi,
+        };
+        let epoch = super::current_upload_epoch();
+
+        // Phase 1: a byte-identical buffer may already be resident.
+        let candidate = {
+            let cache = self
+                .weight_cache
+                .lock()
+                .map_err(|_| GpuError::NotAvailable("weight cache lock poisoned".into()))?;
+            cache
+                .by_content
+                .get(&content)
+                .and_then(|&handle| cache.get(handle).map(|buf| (handle, buf)))
+        };
+        if let Some((handle, resident)) = candidate {
+            if resident_bytes_equal(&resident, stored) {
+                let mut cache = self
+                    .weight_cache
+                    .lock()
+                    .map_err(|_| GpuError::NotAvailable("weight cache lock poisoned".into()))?;
+                let still_resident = cache
+                    .entries
+                    .get(&handle)
+                    .is_some_and(|entry| entry.content == content);
+                if still_resident {
+                    cache.register(epoch, handle);
+                    drop(cache);
+                    super::note_weight_upload(stored.len() as u64, true);
+                    debug!(
+                        handle,
+                        bytes = stored.len(),
+                        epoch,
+                        "weight upload shared an identical resident buffer"
+                    );
+                    return Ok(crate::weight_cache::GpuWeightHandle(handle));
+                }
+                // Released between the two phases: upload afresh below.
+            } else {
+                debug!(
+                    handle,
+                    bytes = stored.len(),
+                    "content fingerprint matched but bytes differ; uploading a distinct buffer"
+                );
+            }
+        }
+
+        // Phase 2: a fresh buffer under a fresh handle id.
+        let buf: GpuBuffer<u8> = self.ctx.create_buffer_from_slice(stored);
+        let handle = NEXT_HANDLE_ID.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut cache = self
+                .weight_cache
+                .lock()
+                .map_err(|_| GpuError::NotAvailable("weight cache lock poisoned".into()))?;
+            cache.insert_fresh(epoch, handle, buf, content, stored.len());
+        }
+        super::note_weight_upload(stored.len() as u64, false);
+        debug!(
+            handle,
+            bytes = stored.len(),
+            epoch,
+            "uploaded weights to GPU"
+        );
+        Ok(crate::weight_cache::GpuWeightHandle(handle))
     }
 
     /// Q1_0_g128 GEMV using a pre-uploaded weight buffer.
@@ -1125,7 +1240,7 @@ impl Scirs2Backend {
                 .weight_cache
                 .lock()
                 .map_err(|_| GpuError::NotAvailable("weight cache lock poisoned".into()))?;
-            cache.get(&handle.0).cloned().ok_or_else(|| {
+            cache.get(handle.0).ok_or_else(|| {
                 GpuError::InvalidArgument(format!("invalid weight handle: {:?}", handle))
             })?
         };
@@ -1153,16 +1268,90 @@ impl Scirs2Backend {
 
     /// Number of cached weight entries currently resident on GPU.
     pub fn cached_weight_count(&self) -> usize {
-        self.weight_cache.lock().map(|c| c.len()).unwrap_or(0)
+        self.weight_cache
+            .lock()
+            .map(|c| c.entries.len())
+            .unwrap_or(0)
+    }
+
+    /// Bytes of weight data currently resident in this backend's cache.
+    pub fn cached_weight_bytes(&self) -> u64 {
+        self.weight_cache
+            .lock()
+            .map(|c| c.resident_bytes)
+            .unwrap_or(0)
+    }
+
+    /// Cumulative bytes this backend has **freshly** uploaded into its
+    /// weight cache (a deduplicated upload adds nothing). Monotonic: not
+    /// reduced by a release or a clear.
+    pub fn uploaded_weight_bytes_total(&self) -> u64 {
+        self.weight_cache
+            .lock()
+            .map(|c| c.uploaded_total)
+            .unwrap_or(0)
+    }
+
+    /// Upload registrations `model_epoch` currently holds.
+    pub fn epoch_registration_count(&self, model_epoch: u64) -> usize {
+        self.weight_cache
+            .lock()
+            .map(|c| c.registrations(model_epoch))
+            .unwrap_or(0)
+    }
+
+    /// Release one model epoch's registrations (`MET-M1`, eviction half):
+    /// every buffer whose last reference belonged to `model_epoch` is freed
+    /// — together with its `MetalGraph` mirror on a Metal build — and every
+    /// buffer another epoch still references stays resident.
+    ///
+    /// This is what `InferenceEngine`'s `Drop` reaches (through
+    /// [`super::release_model_weights`]); unlike
+    /// [`clear_weight_cache`](Self::clear_weight_cache) it is safe with any
+    /// number of live replicas, because a pool's replicas share buffers by
+    /// reference, not by epoch. [`super::UNATTRIBUTED_MODEL_EPOCH`] is never
+    /// released: its uploads have no known owner.
+    ///
+    /// Returns the number of buffers freed.
+    ///
+    /// # Errors
+    ///
+    /// [`GpuError::NotAvailable`] if the cache lock is poisoned.
+    pub fn release_model_weights(&self, model_epoch: u64) -> Result<usize, GpuError> {
+        if model_epoch == super::UNATTRIBUTED_MODEL_EPOCH {
+            return Ok(0);
+        }
+        let (freed, remaining_bytes) = {
+            let mut cache = self
+                .weight_cache
+                .lock()
+                .map_err(|_| GpuError::NotAvailable("weight cache lock poisoned".into()))?;
+            let freed = cache.release_epoch(model_epoch);
+            (freed, cache.resident_bytes)
+        };
+        // The freed `GpuBuffer`s were dropped with their entries above; the
+        // mirror eviction below only has ids to work with.
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        release_metal_mirrors(&freed, model_epoch);
+        let freed_bytes: usize = freed.iter().map(|&(_, bytes)| bytes).sum();
+        debug!(
+            model_epoch,
+            freed_buffers = freed.len(),
+            freed_bytes,
+            remaining_bytes,
+            "released a model epoch's GPU weights (MET-M1)"
+        );
+        Ok(freed.len())
     }
 
     /// Evict every cached weight buffer, freeing its GPU memory.
     ///
-    /// MET-M1: intended for the moment the fused `MetalGraph` decode path
+    /// **Process-wide.** Every epoch's registrations go with it, so this must
+    /// not be called while any engine that uploaded into this backend is
+    /// still alive — use [`release_model_weights`](Self::release_model_weights)
+    /// for one model. Kept for the moment the fused `MetalGraph` decode path
     /// (which maintains its own, separately-keyed weight cache — see MET-02)
-    /// takes over and this backend's copy becomes a redundant second
-    /// GPU-resident copy of every quantized tensor, or for when a model is
-    /// dropped and its weights should not linger GPU-resident. Combine with
+    /// takes over for a whole process. Combine with
     /// [`set_weight_cache_enabled(false)`](Self::set_weight_cache_enabled)
     /// to also stop new uploads from being retained.
     ///
@@ -1172,8 +1361,7 @@ impl Scirs2Backend {
             .weight_cache
             .lock()
             .map_err(|_| GpuError::NotAvailable("weight cache lock poisoned".into()))?;
-        let evicted = cache.len();
-        cache.clear();
+        let evicted = cache.clear();
         debug!(evicted, "cleared Scirs2Backend GPU weight cache (MET-M1)");
         Ok(evicted)
     }
@@ -1205,29 +1393,18 @@ impl Scirs2Backend {
         for block in blocks {
             soa.extend_from_slice(&block.qs);
         }
-        let buf: scirs2_core::gpu::GpuBuffer<u8> = self.ctx.create_buffer_from_slice(&soa);
-        let id = NEXT_HANDLE_ID.fetch_add(1, Ordering::Relaxed);
-        if self.weight_cache_enabled.load(Ordering::Relaxed) {
-            let mut cache = self
-                .weight_cache
-                .lock()
-                .map_err(|_| GpuError::NotAvailable("weight cache lock poisoned".into()))?;
-            cache.insert(id, buf);
-            debug!(
-                handle = id,
-                blocks = n,
-                bytes = soa.len(),
-                "uploaded ternary weights to GPU (SoA)"
-            );
-        } else {
+        if !self.weight_cache_enabled.load(Ordering::Relaxed) {
+            let _buf: scirs2_core::gpu::GpuBuffer<u8> = self.ctx.create_buffer_from_slice(&soa);
+            let id = NEXT_HANDLE_ID.fetch_add(1, Ordering::Relaxed);
             debug!(
                 handle = id,
                 blocks = n,
                 bytes = soa.len(),
                 "weight cache disabled (MET-M1): ternary upload not retained"
             );
+            return Ok(crate::weight_cache::GpuWeightHandle(id));
         }
-        Ok(crate::weight_cache::GpuWeightHandle(id))
+        self.retain_upload(UploadLayout::TernarySoa, &soa)
     }
 
     /// TQ2_0_g128 (ternary) GEMV using a pre-uploaded SoA weight buffer.
@@ -1260,7 +1437,7 @@ impl Scirs2Backend {
                 .weight_cache
                 .lock()
                 .map_err(|_| GpuError::NotAvailable("weight cache lock poisoned".into()))?;
-            cache.get(&handle.0).cloned().ok_or_else(|| {
+            cache.get(handle.0).ok_or_else(|| {
                 GpuError::InvalidArgument(format!("invalid ternary weight handle: {:?}", handle))
             })?
         };
@@ -1301,7 +1478,7 @@ impl Scirs2Backend {
             .weight_cache
             .lock()
             .map_err(|_| GpuError::NotAvailable("weight cache lock poisoned".into()))?;
-        cache.get(&handle.0).cloned().ok_or_else(|| {
+        cache.get(handle.0).ok_or_else(|| {
             GpuError::InvalidArgument(format!("invalid weight handle: {:?}", handle))
         })
     }

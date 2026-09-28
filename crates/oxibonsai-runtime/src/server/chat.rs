@@ -12,8 +12,34 @@
 //! / `PenaltyParams`, `TokenizerBridge`, the `budget`/`sanitize`/`sse`/
 //! `blocking` sibling submodules, …) — the same pattern `server.rs`'s own
 //! `#[cfg(test)] mod tests` already uses to reach its parent's private items.
+//!
+//! # B2-13 (wave 4b): real chat-template rendering + `<think>` split
+//!
+//! Prompt construction now goes through [`crate::tokenizer_bridge::chat_render::render_chat_prompt`]
+//! (B1) — the model's own resolved chat template, rendered through the
+//! real Jinja engine, in place of the hardcoded ChatML segment builder
+//! (`sanitize::encode_chat_prompt`, still used only for the no-tokenizer
+//! fallback shape and unaffected otherwise) — and the raw `<think>`/
+//! `</think>` token-id split (`B3`,
+//! [`crate::reasoning::ReasoningSplitter`]) is wired into both the
+//! non-streaming and streaming paths, surfacing `reasoning_content`
+//! alongside `content`.
+//!
+//! `reasoning_content` and `chat_template_kwargs`/`enable_thinking`/
+//! `reasoning_effort` have no field on `ChatCompletionRequest`/`ChatMessage`/
+//! `ChunkDelta` (`server.rs`, owned by ENGINE-SEAM this wave — see
+//! `deviations` for the exact diff those types need once this package owns
+//! `server.rs` again): the request side is read from the RAW request body
+//! via [`ChatRequestExtras`] (captured alongside the typed
+//! `ChatCompletionRequest`, from the same bytes — this is also B4's raw-JSON
+//! seam for `tools`, preserving the client's own key order instead of
+//! re-sorting it through a `serde_json::Value` round trip); the response
+//! side is patched into the JSON `Value` after serializing the typed
+//! response/chunk structs (see [`with_extra_delta_field`] /
+//! [`chat_completions_non_stream`]'s own response-building tail).
 
 use super::*;
+use crate::tokenizer_bridge::chat_render::{self, to_render_messages, ChatRequestExtras};
 
 /// Sampling-parameter overrides extracted from a request.
 ///
@@ -284,14 +310,60 @@ impl StopTracker {
     }
 }
 
-#[tracing::instrument(skip(state, headers, body), fields(request_id))]
+#[tracing::instrument(skip(state, headers, raw), fields(request_id))]
 pub(super) async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    OpenAiJson(body): OpenAiJson<ChatCompletionRequest>,
+    // B4: `Box<RawValue>` in place of `OpenAiJson<ChatCompletionRequest>`
+    // directly — still goes through `OpenAiJson`, so a genuinely malformed
+    // body (wrong content-type, unparseable JSON syntax) still hits
+    // axum's `JsonRejection` -> `ApiError::from_json_rejection` exactly as
+    // before (`RawValue` only requires syntactically valid JSON, not any
+    // particular shape). The typed `ChatCompletionRequest` is then parsed
+    // from these SAME bytes below, alongside `ChatRequestExtras` — the
+    // seam that lets this package read `tools`' raw text and
+    // `chat_template_kwargs` without `ChatCompletionRequest` declaring
+    // them (see the module doc).
+    OpenAiJson(raw): OpenAiJson<Box<serde_json::value::RawValue>>,
 ) -> Result<Response, ApiError> {
     let request_id = resolve_request_id(&headers);
     tracing::Span::current().record("request_id", tracing::field::display(&request_id));
+
+    // B11/SV-11: recover what `ChatMessage.content: Option<String>` cannot
+    // represent (a vision-shaped content array — flattened here or
+    // honestly rejected, never silently schema-error'd) and what it has no
+    // field for at all (`reasoning_content` on a replayed assistant turn)
+    // from the raw body, BEFORE the typed parse below. `extras` still
+    // parses from the ORIGINAL `raw.get()` text (not `rewritten`) — see
+    // `preprocess_message_content_and_reasoning`'s own doc for why that
+    // matters for `tools`' key order.
+    let (rewritten, reasoning_contents) =
+        chat_render::preprocess_message_content_and_reasoning(raw.get()).map_err(|e| {
+            state.metrics.errors_total.inc();
+            e.with_request_id(request_id)
+        })?;
+    let body: ChatCompletionRequest = match serde_json::from_str(&rewritten) {
+        Ok(b) => b,
+        Err(e) => {
+            state.metrics.errors_total.inc();
+            // Mirrors `ApiError::from_json_rejection`'s `JsonDataError`
+            // shape exactly (`400`, `invalid_request_error`,
+            // `invalid_request_body`) — this is "valid JSON, wrong shape
+            // for `ChatCompletionRequest`", the same case axum's own
+            // `Json<T>` extractor would have reported had it been asked to
+            // deserialize the typed struct directly.
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, e.to_string())
+                .with_type(crate::server::api_error::ERROR_TYPE_INVALID_REQUEST)
+                .with_code("invalid_request_body")
+                .with_request_id(request_id));
+        }
+    };
+    // Best-effort: a client that sends none of these extra fields still
+    // gets `ChatRequestExtras::default()` here, never a hard failure — the
+    // fields are all optional and `ChatCompletionRequest`'s own
+    // deserialization above already validated the body is well-formed
+    // JSON matching its own shape.
+    let extras: ChatRequestExtras = serde_json::from_str(raw.get()).unwrap_or_default();
 
     // SV-09 server wiring: this slot lets the timeout branch below cancel
     // whichever generation `chat_completions_inner` starts, once it starts
@@ -306,7 +378,14 @@ pub(super) async fn chat_completions(
         Some(limit) => {
             match tokio::time::timeout(
                 limit,
-                chat_completions_inner(Arc::clone(&state), body, request_id, cancel_slot.clone()),
+                chat_completions_inner(
+                    Arc::clone(&state),
+                    body,
+                    extras,
+                    reasoning_contents,
+                    request_id,
+                    cancel_slot.clone(),
+                ),
             )
             .await
             {
@@ -329,7 +408,17 @@ pub(super) async fn chat_completions(
                 }
             }
         }
-        None => chat_completions_inner(Arc::clone(&state), body, request_id, cancel_slot).await,
+        None => {
+            chat_completions_inner(
+                Arc::clone(&state),
+                body,
+                extras,
+                reasoning_contents,
+                request_id,
+                cancel_slot,
+            )
+            .await
+        }
     };
 
     result.map_err(|err| err.with_request_id(request_id))
@@ -340,6 +429,8 @@ pub(super) async fn chat_completions(
 async fn chat_completions_inner(
     state: Arc<AppState>,
     body: ChatCompletionRequest,
+    extras: ChatRequestExtras,
+    reasoning_contents: Vec<Option<String>>,
     request_id: RequestId,
     cancel_slot: CancelSlot,
 ) -> Result<Response, ApiError> {
@@ -463,24 +554,46 @@ async fn chat_completions_inner(
         },
     )?;
 
-    // Build the prompt. With a tokenizer attached this neutralizes control
-    // tokens by ID after a per-segment encode (finding `TOK-M2`); the
-    // `<|...|>` raw-text guard still runs first (finding `sec-01`).
+    // Build the prompt (B1): the model's own resolved chat template,
+    // rendered through the real Jinja engine and encoded in one
+    // whole-prompt call — see `chat_render`'s module doc for why one call,
+    // and for how TOK-M2 (finding `sec-01`'s id-level half) is preserved
+    // despite it. The no-tokenizer fallback (`None` arm) is unchanged.
     let prompt_tokens = match &state.tokenizer {
-        Some(tok) => sanitize::encode_chat_prompt(
-            tok,
-            &body.messages,
-            &state.special_tokens,
-            state.sanitize_prompt(),
-        )
-        .map_err(|e| {
-            tracing::error!(error = %e, "prompt tokenization failed");
-            state.metrics.errors_total.inc();
-            ApiError::internal("failed to tokenize the prompt")
-        })?,
+        Some(tok) => {
+            let render_messages = to_render_messages(&body.messages, &reasoning_contents);
+            let opts = oxibonsai_tokenizer::chat_templates::RenderOptions {
+                add_generation_prompt: true,
+                enable_thinking: extras.effective_enable_thinking(),
+                reasoning_effort: extras.effective_reasoning_effort(),
+                preserve_thinking: extras.effective_preserve_thinking(),
+                add_vision_id: false,
+                tools: extras.tools_raw_json(),
+            };
+            let (_rendered, tokens) = chat_render::render_chat_prompt(
+                tok,
+                &state.special_tokens,
+                &render_messages,
+                &opts,
+                state.sanitize_prompt(),
+            )
+            .inspect_err(|_| {
+                state.metrics.errors_total.inc();
+            })?;
+            tokens
+        }
         // Fallback: single start token
         None => vec![151644],
     };
+
+    // B3: resolve once from the loaded vocabulary + the actual rendered
+    // prompt — never assumed from `enable_thinking` alone, since the
+    // real template's OWN generation-prompt tail already closes the think
+    // span again when thinking is disabled (see `started_in_think`'s doc).
+    let think_close_id = state.tokenizer.as_ref().and_then(|t| t.think_close_id());
+    let think_open_id = state.tokenizer.as_ref().and_then(|t| t.think_open_id());
+    let started_in_think =
+        chat_render::started_in_think(&prompt_tokens, think_open_id, think_close_id);
 
     // sec-05 (token half): reject an over-long prompt with a 400 naming the
     // real numbers instead of letting it become an opaque 500 in the engine.
@@ -537,6 +650,8 @@ async fn chat_completions_inner(
                     .as_ref()
                     .map(|o| o.include_usage)
                     .unwrap_or(false),
+                started_in_think,
+                think_close_id,
                 request_id,
                 request_start,
                 active_guard,
@@ -562,6 +677,8 @@ async fn chat_completions_inner(
                 tools_active,
                 want_logprobs,
                 top_logprobs,
+                started_in_think,
+                think_close_id,
                 request_id,
                 created,
                 model_id,
@@ -618,6 +735,12 @@ struct StreamRequest {
     /// Whether the client set `stream_options.include_usage`, which adds the
     /// final usage chunk before `[DONE]` (finding `sec-08`).
     include_usage: bool,
+    /// B3: whether the rendered+encoded prompt ends inside an open
+    /// `<think>` span — see [`chat_render::started_in_think`].
+    started_in_think: bool,
+    /// B3: this vocabulary's `</think>` token id, or `None` for a model
+    /// whose vocabulary defines no `<think>` at all (RT-10).
+    think_close_id: Option<u32>,
     request_id: RequestId,
     /// SV-08: the whole request's start instant, carried into
     /// [`StreamLifecycleGuard`] so the latency histogram is observed at
@@ -654,6 +777,12 @@ struct NonStreamRequest {
     want_logprobs: bool,
     /// Number of top alternatives to report per token (`top_logprobs`, 0..=20).
     top_logprobs: usize,
+    /// B3: whether the rendered+encoded prompt ends inside an open
+    /// `<think>` span — see [`chat_render::started_in_think`].
+    started_in_think: bool,
+    /// B3: this vocabulary's `</think>` token id, or `None` for a model
+    /// whose vocabulary defines no `<think>` at all (RT-10).
+    think_close_id: Option<u32>,
     request_id: RequestId,
     /// Unix timestamp for the response's `created` field (`SV-03`).
     created: u64,
@@ -661,14 +790,34 @@ struct NonStreamRequest {
     model_id: String,
 }
 
+/// The outcome of [`parse_base_tool_calls`] — a base-endpoint-shaped mirror
+/// of [`crate::tool_calling::ToolCallParseOutcome`] carrying OpenAI
+/// [`crate::api_types::ToolCallResult`]s instead of the lower-level
+/// [`crate::api_types::ToolCall`].
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BaseToolCallOutcome {
+    /// No tool-call markup found; the whole text is ordinary content.
+    None,
+    /// One or more complete tool calls were found, plus whatever
+    /// natural-language text preceded the first one.
+    Found {
+        leading_text: String,
+        calls: Vec<crate::api_types::ToolCallResult>,
+    },
+    /// A `<tool_call>` was opened but never closed — the model was cut off.
+    /// Carries the (non-tool-call) text that preceded it.
+    Truncated { leading_text: String },
+}
+
 /// Parse a tool call out of generated assistant text, reusing the same
 /// `<tool_call>...</tool_call>` parser the extended endpoint uses.
 ///
-/// Returns `None` when tool calling is inactive (no `tools` supplied, or
-/// `tool_choice: "none"`) or when the text contains no parseable tool-call
-/// block. This is the seam that stops the base `/v1/chat/completions` endpoint
-/// from silently discarding an advertised `tools` field (finding
-/// `serve-api-03`).
+/// Returns [`BaseToolCallOutcome::None`] when tool calling is inactive (no
+/// `tools` supplied, or `tool_choice: "none"`) or when the text contains no
+/// parseable tool-call block. This is the seam that stops the base
+/// `/v1/chat/completions` endpoint from silently discarding an advertised
+/// `tools` field (finding `serve-api-03`).
+///
 /// B2-13/RT-11: was JSON-only (`crate::api_types::parse_tool_call`), so
 /// Bonsai 2's `<tool_call><function=NAME>…</function></tool_call>` XML
 /// shape (design §5.4) came back as `None` and its raw XML rendered
@@ -676,21 +825,24 @@ struct NonStreamRequest {
 /// [`crate::tool_calling::parse_tool_calls`] (XML-first, legacy-JSON
 /// fallback) and collects every call found, not just the first — matching
 /// `finish_reason: "tool_calls"` semantics for a model that emits several
-/// calls in one turn. A [`crate::tool_calling::ToolCallParseOutcome::Truncated`]
-/// result (an opened-but-unclosed `<tool_call>`) is treated as "no tool
-/// call" here rather than surfaced as an error: the caller already has the
-/// complete raw text and reports it as ordinary content, which is the
-/// correct non-streaming fallback for a block the model never finished.
-pub(crate) fn parse_base_tool_calls(
-    content: &str,
-    tools_active: bool,
-) -> Option<Vec<crate::api_types::ToolCallResult>> {
+/// calls in one turn.
+///
+/// B6 (RT-11 / design §5.4 "text before the first `<tool_call>` is kept"):
+/// [`BaseToolCallOutcome::Found`] carries `leading_text` — the caller must
+/// use its trimmed, non-empty value as `message.content` instead of
+/// discarding it, matching the extended endpoint's own behavior (the two
+/// endpoints previously disagreed).
+pub(crate) fn parse_base_tool_calls(content: &str, tools_active: bool) -> BaseToolCallOutcome {
     if !tools_active {
-        return None;
+        return BaseToolCallOutcome::None;
     }
     match crate::tool_calling::parse_tool_calls(content) {
-        crate::tool_calling::ToolCallParseOutcome::Found { calls, .. } => Some(
-            calls
+        crate::tool_calling::ToolCallParseOutcome::Found {
+            leading_text,
+            calls,
+        } => BaseToolCallOutcome::Found {
+            leading_text,
+            calls: calls
                 .into_iter()
                 .map(|tc| {
                     crate::api_types::ToolCallResult::new_function(
@@ -700,9 +852,11 @@ pub(crate) fn parse_base_tool_calls(
                     )
                 })
                 .collect(),
-        ),
-        crate::tool_calling::ToolCallParseOutcome::None
-        | crate::tool_calling::ToolCallParseOutcome::Truncated => None,
+        },
+        crate::tool_calling::ToolCallParseOutcome::Truncated { leading_text } => {
+            BaseToolCallOutcome::Truncated { leading_text }
+        }
+        crate::tool_calling::ToolCallParseOutcome::None => BaseToolCallOutcome::None,
     }
 }
 
@@ -778,6 +932,8 @@ async fn chat_completions_non_stream(
         tools_active,
         want_logprobs,
         top_logprobs,
+        started_in_think,
+        think_close_id,
         request_id,
         created,
         model_id,
@@ -862,17 +1018,48 @@ async fn chat_completions_non_stream(
         .tokens_generated_total
         .inc_by(completion_len as u64);
 
-    // Decode
-    let content = if let Some(tok) = &state.tokenizer {
-        tok.decode(&output_tokens).map_err(|e| {
-            tracing::error!(error = %e, "decoding the generated tokens failed");
-            ApiError::internal(format!("failed to decode the generated tokens: {e}"))
-        })?
+    // Decode, per-token (not a single batch `decode` call): B3 needs each
+    // token's own id alongside its decoded piece to classify it into the
+    // `reasoning_content`/`content` channels
+    // ([`crate::reasoning::split_reasoning`]) — `step_decode`'s UTF-8-safe
+    // windowing means a piece can still legitimately represent more than
+    // one id (a multi-byte character split across tokens); which of that
+    // piece's own ids gets carried alongside it does not affect
+    // classification, since only the SINGLE-TOKEN `</think>` id itself is
+    // ever compared against.
+    let (reasoning_content, content) = if let Some(tok) = &state.tokenizer {
+        let mut decode_state = tok.new_decode_stream(true);
+        let mut pieces: Vec<(u32, String)> = Vec::with_capacity(output_tokens.len());
+        for &id in &output_tokens {
+            let piece = tok.step_decode(&mut decode_state, id).map_err(|e| {
+                tracing::error!(error = %e, "decoding the generated tokens failed");
+                ApiError::internal(format!("failed to decode the generated tokens: {e}"))
+            })?;
+            // Post-verifier-review fix: a token flagged `special` in the
+            // vocabulary (real chat-model `<|...|>`-family markers commonly
+            // are, and `<think>`/`</think>` themselves could be) decodes to
+            // `Ok(None)` — no bytes of its own — but it must still reach
+            // `split_reasoning` below by id, or a special-flagged
+            // `</think>` would never be seen at all and every token after
+            // it would stay misclassified as reasoning for the rest of the
+            // response. `unwrap_or_default()` keeps every id in `pieces`
+            // (an empty piece classifies to an empty, harmless chunk).
+            pieces.push((id, piece.unwrap_or_default()));
+        }
+        crate::reasoning::split_reasoning(
+            pieces.iter().map(|(id, p)| (*id, p.as_str())),
+            started_in_think,
+            think_close_id,
+        )
     } else {
-        format!("{output_tokens:?}")
+        (None, format!("{output_tokens:?}"))
     };
 
-    // SV-12/RT-04: stop sequences. Applied post-hoc — the engine returns the
+    // SV-12/RT-04: stop sequences, applied to the CONTENT channel only —
+    // B3/RT-10 correction (`reasoning.rs`'s own doc): evaluating this
+    // BEFORE the reasoning split would let a stop string occurring inside
+    // the reasoning span truncate the real answer before it is even
+    // reached. Applied post-hoc — the engine returns the
     // complete text in one shot on this path, so there is no incremental
     // hook to stop the *model* early (that would need an
     // `InferenceEngine`-level per-token text callback, outside this
@@ -890,15 +1077,42 @@ async fn chat_completions_non_stream(
     // `tool_choice: "none"`), parse the generated text for a `<tool_call>` block
     // using the same machinery as `/v1/chat/completions/extended` instead of
     // silently dropping the advertised `tools` field (finding `serve-api-03`).
-    let tool_calls = parse_base_tool_calls(&content, tools_active);
+    //
+    // B6: a `Found` result's `leading_text` — the model's natural-language
+    // preamble before the call — becomes `message.content` (trimmed,
+    // `None` when empty) instead of being discarded; a `Truncated` result
+    // (opened but never closed) similarly keeps its own leading text as
+    // content and forces `finish_reason: "length"` rather than reporting
+    // the partial `<tool_call>` XML as if it were prose (the model was cut
+    // off, it did not finish normally).
+    let (message_content, tool_calls, forced_length) =
+        match parse_base_tool_calls(&content, tools_active) {
+            BaseToolCallOutcome::Found {
+                leading_text,
+                calls,
+            } => {
+                let trimmed = leading_text.trim();
+                let content = (!trimmed.is_empty()).then(|| trimmed.to_string());
+                (content, Some(calls), false)
+            }
+            BaseToolCallOutcome::Truncated { leading_text } => {
+                let trimmed = leading_text.trim();
+                let content = (!trimmed.is_empty()).then(|| trimmed.to_string());
+                (content, None, true)
+            }
+            BaseToolCallOutcome::None => (Some(content), None, false),
+        };
     let has_tool_calls = tool_calls.is_some();
 
-    // Honest finish_reason: a parsed tool call wins; a stop-sequence match
-    // wins next; otherwise report "length" when generation was truncated at
-    // max_tokens and "stop" when it ended naturally on EOS (finding
-    // `serve-api-01`).
+    // Honest finish_reason: a parsed tool call wins; a truncated tool call
+    // is an honest "length" (the model was cut off mid-call); a
+    // stop-sequence match wins next; otherwise report "length" when
+    // generation was truncated at max_tokens and "stop" when it ended
+    // naturally on EOS (finding `serve-api-01`).
     let finish_reason = if has_tool_calls {
         "tool_calls".to_string()
+    } else if forced_length {
+        "length".to_string()
     } else if stopped {
         "stop".to_string()
     } else if completion_len >= max_tokens {
@@ -906,10 +1120,6 @@ async fn chat_completions_non_stream(
     } else {
         "stop".to_string()
     };
-
-    // When the assistant emitted a tool call, OpenAI reports `content: null`
-    // and carries the call in `message.tool_calls`.
-    let message_content = if has_tool_calls { None } else { Some(content) };
 
     let response = ChatCompletionResponse {
         id: format!("chatcmpl-{}", rand_id()),
@@ -940,8 +1150,25 @@ async fn chat_completions_non_stream(
         },
     };
 
+    // B3: `reasoning_content` has no field on `ChatMessage` (`server.rs`,
+    // owned by ENGINE-SEAM this wave) — patched into the serialized
+    // response's `choices[0].message` object instead (see the module doc).
+    let mut response_json = serde_json::to_value(&response)
+        .map_err(|e| ApiError::internal(format!("failed to serialize the response: {e}")))?;
+    if let Some(reasoning) = reasoning_content {
+        if let Some(obj) = response_json
+            .pointer_mut("/choices/0/message")
+            .and_then(|m| m.as_object_mut())
+        {
+            obj.insert(
+                "reasoning_content".to_string(),
+                serde_json::Value::String(reasoning),
+            );
+        }
+    }
+
     let headers = request_id_header_map(request_id);
-    Ok((headers, Json(response)).into_response())
+    Ok((headers, Json(response_json)).into_response())
 }
 
 /// Build the JSON payload for the terminal SSE event of a streaming chat
@@ -1074,6 +1301,8 @@ async fn chat_completions_stream(
         seed: _seed, // always None here: stream + seed is rejected by validate_chat_request.
         cancel_slot,
         include_usage,
+        started_in_think,
+        think_close_id,
         request_id,
         request_start,
         active_guard,
@@ -1250,6 +1479,14 @@ async fn chat_completions_stream(
     let stop_state = Arc::new(std::sync::Mutex::new(StopTracker::default()));
     let stop_state_for_stream = Arc::clone(&stop_state);
 
+    // B3: classifies each token's decoded piece into `reasoning_content`
+    // vs `content` — fed BEFORE stop-sequence tracking (see that struct's
+    // module doc: a stop string occurring inside the reasoning span must
+    // never truncate the real answer before it is even reached, and
+    // `stop` describes the visible answer, not the reasoning trace).
+    let mut reasoning_splitter =
+        crate::reasoning::ReasoningSplitter::new(started_in_think, think_close_id);
+
     let content_stream = token_stream.filter_map(move |token_id| {
         if let Ok(mut t) = tracker_for_stream.lock() {
             if t.tokens_emitted() == 0 {
@@ -1270,11 +1507,53 @@ async fn chat_completions_stream(
         let text = match (&state_for_stream.tokenizer, stream_state.as_mut()) {
             (Some(tok), Some(state)) => match tok.step_decode(state, token_id) {
                 Ok(Some(txt)) => txt,
-                Ok(None) => return None,
+                // Post-verifier-review fix: must NOT short-circuit before
+                // `reasoning_splitter.push` sees this id — a special-flagged
+                // `</think>` decodes to exactly this, and skipping the push
+                // would leave the splitter stuck in reasoning for the rest
+                // of the stream. An empty piece classifies to an empty,
+                // harmless chunk in every `Phase` (see `reasoning.rs::push`).
+                Ok(None) => String::new(),
                 Err(_) => format!("[{token_id}]"),
             },
             _ => format!("[{token_id}]"),
         };
+
+        let (is_reasoning, text) = match reasoning_splitter.push(token_id, &text) {
+            crate::reasoning::ReasoningChunk::Reasoning(s) => (true, s),
+            crate::reasoning::ReasoningChunk::Content(s) => (false, s),
+            // The `</think>` token itself, or a swallowed post-boundary
+            // newline: neither channel shows it (see `reasoning.rs`'s
+            // module doc's "post-boundary gap").
+            crate::reasoning::ReasoningChunk::Boundary => return None,
+        };
+
+        if is_reasoning {
+            if text.is_empty() {
+                return None;
+            }
+            let chunk = ChatCompletionChunk {
+                id: id_clone.clone(),
+                object: "chat.completion.chunk".to_string(),
+                created,
+                model: model_for_stream.clone(),
+                choices: vec![ChunkChoice {
+                    index: 0,
+                    delta: ChunkDelta {
+                        role: None,
+                        content: None,
+                    },
+                    finish_reason: None,
+                }],
+                usage: usage_placeholder(include_usage),
+            };
+            return Some(chat_render::with_extra_delta_field(
+                &chunk,
+                "/choices/0/delta",
+                "reasoning_content",
+                text,
+            ));
+        }
 
         let text = if stop_sequences.is_empty() {
             text

@@ -21,8 +21,10 @@
 //! - [`MetalDevice`] — process-global, `Arc`-shared, effectively immutable:
 //!   the `Device`, the compiled [`MetalPipelines`], the lazily compiled
 //!   prefill-attention library, the correctly-keyed weight cache (`MET-02`)
-//!   and the two DiT I/O pools. **Sharing the weight cache is the point**: it
-//!   keeps an N-session process at 1x weights instead of Nx.
+//!   and the two DiT I/O pools. Sharing the weight cache is what *lets* N
+//!   sessions hold one copy of a model's weights — whether they actually do
+//!   depends on the callers keying the same weight to the same slot (see
+//!   *Sizing reality*).
 //! - [`MetalGraph`] — one per session (one per engine replica): its own
 //!   `CommandQueue`, its own device KV cache, full-layer buffers, prefill
 //!   buffers, logits buffer and argmax token buffer. No cross-session mutex is
@@ -32,11 +34,49 @@
 //! # Sizing reality
 //!
 //! A session is cheap to *create* (one `CommandQueue`; every workspace buffer
-//! is allocated lazily on first use) but not cheap to *use*: the device KV
-//! cache for the 8B at `ctx = 4096` is **604 MB per session**. On a 24 GB box
-//! the practical GPU pool is therefore 2–3 sessions even with weights shared
-//! 1x, which is why [`MetalGraph::max_sessions`] defaults to a small number
-//! and is the bound `engine_pool::resolve_pool_sizing` uses on the GPU tier.
+//! is allocated lazily on first use) but not cheap to *use*. What N engine
+//! replicas — N sessions — cost today:
+//!
+//! - **KV cache: N×, always.** Each session owns a device KV cache of
+//!   `n_layers × n_kv_heads × max_seq × head_dim × 2 B (f16) × 2 (K, V)`:
+//!   **604 MB** for the 8B at `ctx = 4096` (36 × 8 × 4096 × 128 × 4 B) and
+//!   **470 MB** for Ternary-Bonsai-1.7B at the same context (28 × 8 × 4096 ×
+//!   128 × 4 B), plus a few MB of full-layer / prefill scratch.
+//! - **Weights, ternary route: 1×.** The ternary slot table is derived from
+//!   the addresses of the mapped GGUF tensors (`model/types/gpu_cache.rs`),
+//!   and every replica of one `GgufFile` maps the same tensors, so all N
+//!   sessions bind the same buffers. Measured on Ternary-Bonsai-1.7B: the
+//!   shared device holds the same resident weight bytes with 1, 2 or 3
+//!   replicas warm (see `metal_concurrency_tests.rs`, the pool-scaling
+//!   measurement).
+//! - **Weights, Q1 (1-bit) route: N× — not shared yet.** Each replica runs its
+//!   own `BonsaiModel::upload_weights_to_gpu`, which mints fresh
+//!   `GpuWeightHandle` ids, and the Q1 fused path keys this cache on those
+//!   ids, so N replicas hold N copies here — on top of N copies of the same
+//!   blocks (plus the fused Q‖K‖V and gate‖up concatenations) in the
+//!   process-wide `Scirs2Backend` cache. For the 8B Q1 that is on the order of
+//!   the quantized model (~1.1 GB) here plus ~1.85 GB in the `Scirs2Backend`
+//!   cache **per replica**. De-duplicating the Q1 uploads across replicas is
+//!   the engine seam's job (`ENGINE-SEAM`: `engine.rs` / `engine_pool.rs`),
+//!   not this module's; until it lands, size a Q1 GPU pool as N full models.
+//!
+//! On a 24 GB box the practical GPU pool is therefore 2–3 sessions for the
+//! ternary 1.7B/8B and fewer for a Q1 8B, which is why
+//! [`MetalGraph::max_sessions`] defaults to a small number and is the bound
+//! `engine_pool::resolve_pool_sizing` uses on the GPU tier.
+//!
+//! What more sessions buy is **concurrency, not GPU throughput**. Measured on
+//! an M3 with Ternary-Bonsai-1.7B, 8 concurrent greedy requests, over several
+//! runs on a shared host: comparing the pools round by round, 2 or 3 replicas
+//! serve the batch at a median 1.03–1.05× the aggregate tokens/s of 1 replica
+//! (single rounds swing with background load; e.g. best-of-round 52.4 → 53.8
+//! / 54.3 tok/s), with byte-identical outputs. A single stream already keeps
+//! the GPU busy for the whole token (`wall ≈ gpu_exec ≈ 13–15 ms`); with two
+//! streams each session's command buffer is submitted while the other's runs
+//! — no host lock holds it back any more — and the GPU executes the two back
+//! to back (`wall ≈ 2 × gpu_exec`). Replicas let requests progress side by
+//! side and overlap their host-side work; multiplying throughput would take
+//! batched decode (several sequences per weight read).
 //!
 //! # How a session is selected
 //!
@@ -50,6 +90,13 @@
 //! [`MetalGraph::bind_current`] / [`MetalGraph::unbind_current_if`] primitives
 //! (for RAII wrappers such as `engine_pool::EngineLease`, where the bind and
 //! the release live in different functions).
+//!
+//! A binding is **owned by the thread that bound the session last**. Binding
+//! claims the session for the calling thread, and a thread whose binding was
+//! claimed away since — a lease dereferenced on a tokio worker and then moved
+//! into `spawn_blocking` and used there — sees that binding as stale: it
+//! resolves to the process-default session again instead of dispatching into
+//! (or clearing the KV cache of) a replica that another thread is running.
 
 use metal::{CommandQueue, Device};
 use std::cell::RefCell;
@@ -71,10 +118,12 @@ pub(crate) const MAX_SESSIONS_ENV: &str = "OXIBONSAI_METAL_MAX_SESSIONS";
 
 /// Default ceiling on concurrently live Metal sessions.
 ///
-/// Deliberately small: the bound that matters is not the queue count but the
-/// per-session device KV cache (604 MB for the 8B at `ctx = 4096`), so a 24 GB
-/// box saturates at 2–3 sessions. Raise it with [`MAX_SESSIONS_ENV`] on a
-/// machine with more unified memory.
+/// Deliberately small: the bound that matters is not the queue count but
+/// memory — the per-session device KV cache (604 MB for the 8B at
+/// `ctx = 4096`) and, on the Q1 route, a full copy of the weights per replica
+/// until the engine seam shares them (see the module's *Sizing reality*), so a
+/// 24 GB box saturates at 2–3 sessions. Raise it with [`MAX_SESSIONS_ENV`] on
+/// a machine with more unified memory.
 pub(crate) const DEFAULT_MAX_SESSIONS: usize = 4;
 
 /// The process-global shared device, created on first use.
@@ -88,6 +137,9 @@ static DEFAULT_SESSION: OnceLock<Mutex<Option<Arc<MetalGraph>>>> = OnceLock::new
 /// and in the thread-local binding check.
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Source of per-thread binding tokens (`0` is reserved for "no thread").
+static NEXT_THREAD_TOKEN: AtomicU64 = AtomicU64::new(1);
+
 thread_local! {
     /// The session bound to this thread, if any.
     ///
@@ -97,6 +149,40 @@ thread_local! {
     /// instead of an `Arc` clone.
     static CURRENT_SESSION: RefCell<Option<(u64, Arc<MetalGraph>)>> =
         const { RefCell::new(None) };
+
+    /// This thread's binding token: what a session records as its owner when
+    /// this thread binds it (see [`MetalGraph::bind_current`]).
+    static THREAD_TOKEN: u64 = NEXT_THREAD_TOKEN.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The calling thread's binding token, or `0` once its thread-locals are
+/// being torn down (a token no session ever records as its owner).
+fn this_thread_token() -> u64 {
+    THREAD_TOKEN.try_with(|token| *token).unwrap_or(0)
+}
+
+/// This thread's binding, if it is still **live**: bound here and not claimed
+/// by another thread since. A stale binding is dropped on the spot, so the
+/// thread falls back to the process-default session.
+fn live_binding() -> Option<(u64, Arc<MetalGraph>)> {
+    let token = this_thread_token();
+    CURRENT_SESSION
+        .try_with(|cell| {
+            let mut slot = cell.borrow_mut();
+            let live = slot
+                .as_ref()
+                .is_some_and(|(_, session)| session.owner_thread.load(Ordering::Acquire) == token);
+            if live {
+                slot.clone()
+            } else {
+                // Unbound, or claimed away by another thread: either way this
+                // thread must not dispatch into it.
+                slot.take();
+                None
+            }
+        })
+        .ok()
+        .flatten()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -128,9 +214,11 @@ pub struct MetalDevice {
     /// Lazy cache of GPU-resident weight buffers, keyed by
     /// [`WeightKey`] `{ model_epoch, kind, slot }` (`MET-02`).
     ///
-    /// Shared across sessions **by design**: N replicas of one model hold one
-    /// copy of its weights, so per-session memory is the KV cache plus
-    /// scratch, not another 1.85 GB of matrices.
+    /// Shared across sessions **by design**: N replicas that key the same
+    /// weight to the same slot hold one copy of it. The ternary route does
+    /// (address-derived slots), so its replicas cost the KV cache plus
+    /// scratch and no second copy of the matrices; the Q1 route does not yet
+    /// (per-replica handle ids — see the module's *Sizing reality*).
     weight_cache: Mutex<WeightCache<Arc<MetalWeightHandle>>>,
     /// Resizable shared-storage I/O scratch for the DiT `encode_gemm_tq2`
     /// path (image crate only — see [`GemmIoPool`]).
@@ -306,6 +394,7 @@ impl MetalGraph {
             pipelines,
             prefill_attn,
             session_id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
+            owner_thread: AtomicU64::new(0),
             shared,
             buffers: Mutex::new(None),
             kv_cache: Mutex::new(None),
@@ -341,7 +430,10 @@ impl MetalGraph {
     /// full-layer buffers, prefill buffers, logits buffer and argmax token
     /// buffer — the state whose sharing made concurrent GPU inference
     /// impossible — while the device, the compiled pipelines and the weight
-    /// cache stay shared, so N sessions hold **1x** the model weights.
+    /// cache stay shared: N sessions cost N KV caches, and 1x the weights of
+    /// every model whose callers key a weight to one slot across replicas
+    /// (the ternary route today; the Q1 route still Nx — see the module's
+    /// *Sizing reality*).
     ///
     /// Bind it with [`Self::with_session`] (or [`Self::bind_current`]) for the
     /// duration of the work that should run in it; unbound threads keep using
@@ -352,6 +444,18 @@ impl MetalGraph {
     /// Propagates [`MetalDevice::global`]'s device/compilation errors.
     pub fn new_session() -> Result<Arc<Self>, MetalGraphError> {
         Ok(Arc::new(Self::from_shared(MetalDevice::global()?)))
+    }
+
+    /// Create a new session on a **specific** device — typically an
+    /// [`MetalDevice::isolated`] one, so that several sessions share a private
+    /// weight cache and upload counters instead of the process-global ones.
+    ///
+    /// That is what a test (or a benchmark) needs to compare two runs in two
+    /// sessions — two device KV caches — while asserting exact residency and
+    /// upload counts that no sibling test running in parallel can perturb.
+    #[must_use]
+    pub fn new_session_on(device: &Arc<MetalDevice>) -> Arc<Self> {
+        Arc::new(Self::from_shared(Arc::clone(device)))
     }
 
     /// The process-default session, created on first use.
@@ -372,9 +476,10 @@ impl MetalGraph {
     ///
     /// Returns the session bound to the current thread by
     /// [`Self::with_session`] / [`Self::bind_current`], or the process-default
-    /// session when this thread has no binding. A process that never binds
-    /// sees exactly the pre-`MET-08` behaviour: one session, one queue, one
-    /// device KV cache, byte-identical output.
+    /// session when this thread has no **live** binding (none, or one another
+    /// thread has since claimed — see the module docs). A process that never
+    /// binds sees exactly the pre-`MET-08` behaviour: one session, one queue,
+    /// one device KV cache, byte-identical output.
     ///
     /// # Errors
     ///
@@ -393,24 +498,22 @@ impl MetalGraph {
         self.session_id
     }
 
-    /// The session bound to the current thread, if any.
+    /// The session bound to the current thread, if the binding is live.
+    ///
+    /// A binding goes stale when another thread binds the same session
+    /// afterwards (see the module docs): this returns `None` for it — and
+    /// drops it — so the thread falls back to the process-default session
+    /// rather than dispatching into a replica someone else is running.
     #[must_use]
     pub fn current_session() -> Option<Arc<Self>> {
-        CURRENT_SESSION
-            .try_with(|cell| cell.borrow().as_ref().map(|(_, s)| Arc::clone(s)))
-            .ok()
-            .flatten()
+        live_binding().map(|(_, session)| session)
     }
 
-    /// The id of the session bound to the current thread, if any.
-    ///
-    /// Cheaper than [`Self::current_session`]: no `Arc` clone.
+    /// The id of the session bound to the current thread, if the binding is
+    /// live (same staleness rule as [`Self::current_session`]).
     #[must_use]
     pub fn current_session_id() -> Option<u64> {
-        CURRENT_SESSION
-            .try_with(|cell| cell.borrow().as_ref().map(|(id, _)| *id))
-            .ok()
-            .flatten()
+        live_binding().map(|(id, _)| id)
     }
 
     /// Bind `session` to the current thread, returning the previous binding.
@@ -420,10 +523,16 @@ impl MetalGraph {
     /// live in different functions (`engine_pool::EngineLease` binds in
     /// `Deref` and releases in `Drop`).
     ///
-    /// Binding is a no-op when `session` is already the current binding, so
-    /// calling it on every `Deref` costs an integer compare.
+    /// Binding **claims** the session for the calling thread — also when it is
+    /// already this thread's binding — so the last thread to bind a session
+    /// owns it and any earlier thread's binding of it goes stale. Re-binding
+    /// the already-bound session is otherwise a no-op: an atomic store and an
+    /// integer compare, cheap enough for every `Deref`.
     pub fn bind_current(session: &Arc<Self>) -> Option<Arc<Self>> {
         let id = session.session_id;
+        session
+            .owner_thread
+            .store(this_thread_token(), Ordering::Release);
         CURRENT_SESSION
             .try_with(|cell| {
                 let mut slot = cell.borrow_mut();
@@ -572,7 +681,9 @@ impl MetalGraph {
     ///
     /// This is the number `engine_pool::resolve_pool_sizing` clamps a GPU
     /// pool to. It is a *memory* bound, not a queue bound: each session's
-    /// device KV cache is 604 MB for the 8B at `ctx = 4096`, so the default is
+    /// device KV cache is 604 MB for the 8B at `ctx = 4096`, and a Q1 replica
+    /// additionally carries its own copy of the weights until the engine seam
+    /// shares them (module docs, *Sizing reality*), so the default is
     /// deliberately small ([`DEFAULT_MAX_SESSIONS`]). Override with the
     /// `OXIBONSAI_METAL_MAX_SESSIONS` environment variable.
     #[must_use]
@@ -654,8 +765,10 @@ impl Drop for MetalGraph {
 impl MetalGraph {
     /// Cache-aware upload keyed by the composite [`WeightKey`].
     ///
-    /// Delegates to the shared device, so every session of a model sees the
-    /// same GPU buffer for the same key: N replicas, 1x weights.
+    /// Delegates to the shared device, so every session sees the same GPU
+    /// buffer for the same key: replicas that key a weight identically share
+    /// one copy of it (the ternary route does; see the module's *Sizing
+    /// reality* for the Q1 route, which does not yet).
     ///
     /// # Errors
     ///
@@ -866,7 +979,12 @@ impl MetalGraph {
     ///
     /// Sibling sessions are deliberately **not** touched: another replica may
     /// be mid-sequence in its own KV cache, and freeing it from under that
-    /// replica is exactly the cross-session trampling `MET-08` removes.
+    /// replica is exactly the cross-session trampling `MET-08` removes. That
+    /// includes a session this thread *used to* have bound: once another
+    /// thread claimed it (a lease moved into `spawn_blocking`), this thread's
+    /// binding is stale and is not honoured here, so a model `reset()` on the
+    /// old thread cannot clear the KV cache of the replica now running
+    /// elsewhere.
     ///
     /// # Errors
     ///
@@ -916,5 +1034,88 @@ mod tests {
         assert_eq!(max_sessions_from(Some("1")), 1);
         assert_eq!(max_sessions_from(Some("7")), 7);
         assert_eq!(max_sessions_from(Some("  3 ")), 3);
+    }
+
+    /// The engine-pool shape the binding must survive: a lease dereferenced
+    /// on one thread (a tokio worker — `acquire` + one `Deref` for logging)
+    /// and then moved to another (`spawn_blocking`) and used there. The first
+    /// thread's binding must go stale the moment the second binds, so an
+    /// unleased `MetalGraph::global()` there — or
+    /// `clear_global_kv_cache_if_present` from a `BonsaiModel::reset()` —
+    /// can never reach the replica the second thread is running.
+    #[test]
+    fn a_session_claimed_by_another_thread_is_no_longer_bound_here() {
+        let Ok(replica) = MetalGraph::new_session() else {
+            return; // no Metal device on this host
+        };
+        let id = replica.session_id();
+
+        // "tokio worker": binds the replica, as `EngineLease::deref` does.
+        MetalGraph::bind_current(&replica);
+        assert_eq!(MetalGraph::current_session_id(), Some(id));
+
+        // "blocking thread": the lease moves there and is used there.
+        let moved = Arc::clone(&replica);
+        let seen_there = std::thread::spawn(move || {
+            MetalGraph::bind_current(&moved);
+            let seen = MetalGraph::current_session_id();
+            // The lease drops on this thread.
+            MetalGraph::unbind_current_if(moved.session_id());
+            seen
+        })
+        .join()
+        .expect("blocking thread");
+        assert_eq!(
+            seen_there,
+            Some(id),
+            "the using thread must own the binding"
+        );
+
+        // Back on the worker: the binding was claimed away, so it is stale.
+        assert_eq!(
+            MetalGraph::current_session_id(),
+            None,
+            "a binding claimed by another thread must not stay live here"
+        );
+        let global = MetalGraph::global().expect("global");
+        assert_ne!(
+            global.session_id(),
+            id,
+            "an unleased dispatch on the worker must resolve to the default session, not the \
+             replica"
+        );
+        assert!(MetalGraph::current_session().is_none());
+
+        // Re-binding on the worker claims it back (a new lease of the replica
+        // used here), exactly like the first bind.
+        MetalGraph::bind_current(&replica);
+        assert_eq!(MetalGraph::current_session_id(), Some(id));
+        assert!(MetalGraph::unbind_current_if(id));
+        assert_eq!(MetalGraph::current_session_id(), None);
+    }
+
+    /// Re-binding the session a thread already holds re-claims it: after
+    /// another thread bound it in between, a `Deref` on the first thread must
+    /// make the first thread the owner again (the fast path must not skip the
+    /// claim).
+    #[test]
+    fn rebinding_the_already_bound_session_reclaims_it() {
+        let Ok(replica) = MetalGraph::new_session() else {
+            return;
+        };
+        let id = replica.session_id();
+        MetalGraph::bind_current(&replica);
+        let other = Arc::clone(&replica);
+        std::thread::spawn(move || {
+            MetalGraph::bind_current(&other);
+            MetalGraph::unbind_current_if(other.session_id());
+        })
+        .join()
+        .expect("other thread");
+        // Stale now; a fresh bind (which hits the "already in my slot" fast
+        // path only if the stale entry were still there) must re-claim.
+        MetalGraph::bind_current(&replica);
+        assert_eq!(MetalGraph::current_session_id(), Some(id));
+        MetalGraph::unbind_current_if(id);
     }
 }

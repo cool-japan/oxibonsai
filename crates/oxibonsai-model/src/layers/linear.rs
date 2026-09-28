@@ -1,8 +1,10 @@
-//! 1-bit, ternary, FP8, Q4_0, and Q8_0 Linear layer implementations.
+//! 1-bit, ternary, FP8, Q4_0, Q8_0, PrismML and dense Linear layer
+//! implementations.
 //!
 //! Wraps the kernel GEMV/GEMM operations with a unified layer abstraction
 //! that dispatches to the appropriate quantization-specific kernel.
 
+use oxibonsai_core::gguf::types::GgufTensorType;
 use oxibonsai_core::tensor::BlockQ1_0G128;
 use oxibonsai_core::{BlockPQ2_0, BlockPTQ1_0, BlockQ2_0G64, QK_PQ2_0, QK_PTQ1_0, QK_Q2_0_G64};
 use oxibonsai_kernels::traits::OneBitKernel;
@@ -11,6 +13,7 @@ use oxibonsai_kernels::{GpuWeightHandle, PrismKernel};
 use crate::error::ModelResult;
 
 // Re-export standard quant types so callers can use `layers::linear::LinearQ4_0`.
+pub use crate::layers::linear_dense::LinearDense;
 pub use crate::layers::linear_kquant_ext::{LinearQ5K, LinearQ6K};
 pub use crate::layers::linear_kquant_full::{LinearQ2K, LinearQ3K, LinearQ4K, LinearQ8K};
 pub use crate::layers::linear_standard::{LinearQ4_0, LinearQ8_0};
@@ -862,7 +865,8 @@ impl<'a> LinearQ2_0G64<'a> {
     }
 }
 
-/// Sum type dispatching to Q1\_0\_g128, TQ2\_0\_g128, FP8, Q4_0, Q8_0, Q5_K, or Q6_K linear layers.
+/// Sum type dispatching to Q1\_0\_g128, TQ2\_0\_g128, FP8, Q4_0, Q8_0, the
+/// K-quants, the PrismML Bonsai 2 formats, or a dense `f32` matrix.
 #[derive(Debug)]
 pub enum LinearLayer<'a> {
     /// 1-bit (Q1\_0\_g128) linear layer.
@@ -895,6 +899,9 @@ pub enum LinearLayer<'a> {
     PTQ1_0(LinearPTQ1_0<'a>),
     /// Mainline group-64 `Q2_0` linear layer (B2-09).
     Q2_0G64(LinearQ2_0G64<'a>),
+    /// Dense (unquantized) `f32` linear layer (B2-11-FIX, gatekeeper
+    /// REQUIRED #5): an `F32` / `F16` / `BF16` matrix, widened to `f32`.
+    Dense(LinearDense<'a>),
 }
 
 impl<'a> LinearLayer<'a> {
@@ -916,6 +923,7 @@ impl<'a> LinearLayer<'a> {
             Self::PQ2_0(l) => l.out_features(),
             Self::PTQ1_0(l) => l.out_features(),
             Self::Q2_0G64(l) => l.out_features(),
+            Self::Dense(l) => l.out_features(),
         }
     }
 
@@ -937,6 +945,7 @@ impl<'a> LinearLayer<'a> {
             Self::PQ2_0(l) => l.in_features(),
             Self::PTQ1_0(l) => l.in_features(),
             Self::Q2_0G64(l) => l.in_features(),
+            Self::Dense(l) => l.in_features(),
         }
     }
 
@@ -960,7 +969,8 @@ impl<'a> LinearLayer<'a> {
             | Self::Q8K(_)
             | Self::PQ2_0(_)
             | Self::PTQ1_0(_)
-            | Self::Q2_0G64(_) => None,
+            | Self::Q2_0G64(_)
+            | Self::Dense(_) => None,
         }
     }
 
@@ -981,7 +991,8 @@ impl<'a> LinearLayer<'a> {
             | Self::Q8K(_)
             | Self::PQ2_0(_)
             | Self::PTQ1_0(_)
-            | Self::Q2_0G64(_) => None,
+            | Self::Q2_0G64(_)
+            | Self::Dense(_) => None,
         }
     }
 
@@ -1002,7 +1013,8 @@ impl<'a> LinearLayer<'a> {
             | Self::Q6K(_)
             | Self::PQ2_0(_)
             | Self::PTQ1_0(_)
-            | Self::Q2_0G64(_) => None,
+            | Self::Q2_0G64(_)
+            | Self::Dense(_) => None,
         }
     }
 
@@ -1131,7 +1143,8 @@ impl<'a> LinearLayer<'a> {
             | Self::Q8K(_)
             | Self::PQ2_0(_)
             | Self::PTQ1_0(_)
-            | Self::Q2_0G64(_) => {}
+            | Self::Q2_0G64(_)
+            | Self::Dense(_) => {}
         }
     }
 
@@ -1153,6 +1166,7 @@ impl<'a> LinearLayer<'a> {
             Self::PQ2_0(l) => l.forward(input, output),
             Self::PTQ1_0(l) => l.forward(input, output),
             Self::Q2_0G64(l) => l.forward(input, output),
+            Self::Dense(l) => l.forward(input, output),
         }
     }
 
@@ -1174,6 +1188,40 @@ impl<'a> LinearLayer<'a> {
             Self::PQ2_0(l) => l.forward_batch(input, output, m),
             Self::PTQ1_0(l) => l.forward_batch(input, output, m),
             Self::Q2_0G64(l) => l.forward_batch(input, output, m),
+            Self::Dense(l) => l.forward_batch(input, output, m),
+        }
+    }
+
+    /// Returns the dense `f32` weights if this is a dense layer, `None`
+    /// otherwise.
+    pub fn dense_weights(&self) -> Option<&[f32]> {
+        match self {
+            Self::Dense(l) => Some(l.weights()),
+            _ => None,
+        }
+    }
+
+    /// The tensor type this layer computes in: the quantization format for
+    /// a quantized layer, [`GgufTensorType::F32`] for a dense one (whose
+    /// weights are widened to `f32` whatever their on-disk element type).
+    pub fn quant_type(&self) -> GgufTensorType {
+        match self {
+            Self::OneBit(_) => GgufTensorType::Q1_0_g128,
+            Self::Ternary(_) => GgufTensorType::TQ2_0_g128,
+            Self::FP8E4M3(_) => GgufTensorType::F8_E4M3,
+            Self::FP8E5M2(_) => GgufTensorType::F8_E5M2,
+            Self::Q4_0(_) => GgufTensorType::Q4_0,
+            Self::Q8_0(_) => GgufTensorType::Q8_0,
+            Self::Q5K(_) => GgufTensorType::Q5_K,
+            Self::Q6K(_) => GgufTensorType::Q6_K,
+            Self::Q2K(_) => GgufTensorType::Q2_K,
+            Self::Q3K(_) => GgufTensorType::Q3_K,
+            Self::Q4K(_) => GgufTensorType::Q4_K,
+            Self::Q8K(_) => GgufTensorType::Q8_K,
+            Self::PQ2_0(_) => GgufTensorType::PQ2_0,
+            Self::PTQ1_0(_) => GgufTensorType::PTQ1_0,
+            Self::Q2_0G64(_) => GgufTensorType::Q2_0G64,
+            Self::Dense(_) => GgufTensorType::F32,
         }
     }
 }
@@ -1261,6 +1309,12 @@ impl<'a> From<LinearPTQ1_0<'a>> for LinearLayer<'a> {
 impl<'a> From<LinearQ2_0G64<'a>> for LinearLayer<'a> {
     fn from(l: LinearQ2_0G64<'a>) -> Self {
         Self::Q2_0G64(l)
+    }
+}
+
+impl<'a> From<LinearDense<'a>> for LinearLayer<'a> {
+    fn from(l: LinearDense<'a>) -> Self {
+        Self::Dense(l)
     }
 }
 

@@ -28,6 +28,18 @@
 #[path = "fixtures/hybrid_gguf.rs"]
 mod hybrid_gguf;
 
+#[path = "bonsai2_real/harness.rs"]
+mod harness;
+
+#[path = "bonsai2_real/greedy_gates.rs"]
+mod greedy_gates;
+
+#[path = "bonsai2_real/f64_layer.rs"]
+mod f64_layer;
+
+#[path = "bonsai2_real/layer_gate.rs"]
+mod layer_gate;
+
 use std::sync::Arc;
 
 use oxibonsai_core::gguf::reader::GgufFile;
@@ -35,6 +47,7 @@ use oxibonsai_core::gguf::writer::TensorType;
 use oxibonsai_kernels::KernelDispatcher;
 use oxibonsai_model::hybrid::model::{HybridModel, KvPrecision};
 
+use harness::{log_softmax, parse_golden_steps, parse_prompt_tokens, top_n};
 use hybrid_gguf::{all_variant_specs, build, HybridFixtureSpec, T_TOKENS};
 
 const BASE_SEED: u64 = 0xB211_0F0A_5E11_0000;
@@ -48,9 +61,8 @@ const BASE_SEED: u64 = 0xB211_0F0A_5E11_0000;
 const ATOL: f64 = 1e-4;
 const RTOL: f64 = 1e-4;
 
-/// `true` for the four `F32` fixture variants, which the hybrid binder
-/// cannot execute in this build (see the module-level note on the test
-/// that pins the refusal).
+/// `true` for the four `F32` fixture variants, which bind every projection
+/// through the dense `LinearLayer::Dense` arm (gatekeeper REQUIRED #5).
 fn is_dense_variant(spec: &HybridFixtureSpec) -> bool {
     matches!(spec.quant, TensorType::F32)
 }
@@ -105,13 +117,9 @@ fn hybrid_forward_matches_f64_reference_on_every_bonsai2_variant() {
 
     let kernel = Arc::new(KernelDispatcher::auto_detect());
     let mut checked = 0usize;
-    let mut skipped_dense = 0usize;
+    let mut checked_dense = 0usize;
 
     for spec in &specs {
-        if is_dense_variant(spec) {
-            skipped_dense += 1;
-            continue;
-        }
         let fixture = build(spec).expect("fixture builds");
         let bytes = std::fs::read(&fixture.path).expect("fixture file readable");
         let gguf = GgufFile::parse(&bytes).expect("fixture parses");
@@ -151,15 +159,18 @@ fn hybrid_forward_matches_f64_reference_on_every_bonsai2_variant() {
             );
         }
         checked += 1;
+        if is_dense_variant(spec) {
+            checked_dense += 1;
+        }
     }
 
     assert_eq!(
-        checked, 20,
-        "every quantized variant must have been checked"
+        checked, 24,
+        "every variant — quantized and dense — must load and be checked"
     );
     assert_eq!(
-        skipped_dense, 4,
-        "exactly the four F32 variants are skipped"
+        checked_dense, 4,
+        "the four F32 variants run through the dense LinearLayer arm"
     );
 }
 
@@ -172,7 +183,7 @@ fn hybrid_prefill_equals_sequential_decode_bonsai2() {
     let kernel = Arc::new(KernelDispatcher::auto_detect());
     let specs = all_variant_specs(BASE_SEED ^ 0x5151_5151);
 
-    for spec in specs.iter().filter(|s| !is_dense_variant(s)) {
+    for spec in &specs {
         let fixture = build(spec).expect("fixture builds");
         let bytes = std::fs::read(&fixture.path).expect("fixture file readable");
         let gguf = GgufFile::parse(&bytes).expect("fixture parses");
@@ -440,225 +451,132 @@ fn relative_l2(actual: &[f32], reference: &[f64]) -> f64 {
 }
 
 // ═════════════════════════════════════════════════════════════════════════
-//  The F32 refusal this build still carries (see the package deviations)
+//  The dense arm: an F32 qwen35 file loads and runs (gatekeeper REQUIRED #5)
 // ═════════════════════════════════════════════════════════════════════════
 
+/// The `F32` variants used to be refused outright (no dense `LinearLayer`
+/// existed). They now bind every projection as `LinearLayer::Dense`, run,
+/// and track the f64 reference within design §8.2's 1e-4 band — the same
+/// band the quantized variants are held to (the residual error is `f32`
+/// accumulation order, which a dense matrix does not remove).
 #[test]
-fn hybrid_dense_f32_variant_is_refused_with_a_precise_reason_bonsai2() {
+fn hybrid_dense_f32_variant_binds_the_dense_arm_and_matches_the_reference_bonsai2() {
+    use oxibonsai_core::gguf::types::GgufTensorType;
+    use oxibonsai_model::hybrid::HybridBlock;
+    use oxibonsai_model::layers::linear::LinearLayer;
+
     let kernel = Arc::new(KernelDispatcher::auto_detect());
-    let spec = all_variant_specs(BASE_SEED ^ 0x3232_3232)
+    let dense_specs: Vec<HybridFixtureSpec> = all_variant_specs(BASE_SEED ^ 0x3232_3232)
         .into_iter()
-        .find(|s| matches!(s.quant, TensorType::F32) && s.hadamard && s.gdn_v_grouped)
-        .expect("an F32 variant exists");
-    let fixture = build(&spec).expect("fixture builds");
-    let bytes = std::fs::read(&fixture.path).expect("fixture readable");
-    let gguf = GgufFile::parse(&bytes).expect("fixture parses");
-    let error = HybridModel::from_gguf_with_precision(
-        &gguf,
-        fixture.cfg.clone(),
-        64,
-        &kernel,
-        KvPrecision::F32,
-    )
-    .expect_err("an F32 qwen35 file cannot be executed by this build");
-    let message = error.to_string();
-    assert!(
-        message.contains("F32") && message.contains("no dense"),
-        "the refusal must say plainly that no dense LinearLayer variant exists, not list F32 \
-         among the executable types it just refused; got: {message}"
-    );
-}
-
-// ═════════════════════════════════════════════════════════════════════════
-//  G1 / G4 — the real 27B against the fork goldens
-// ═════════════════════════════════════════════════════════════════════════
-
-/// One golden decode step: the token the fork chose and its top-10.
-struct GoldenStep {
-    id: u32,
-    top: Vec<(u32, f64)>,
-}
-
-/// Parse the fork server's `completion_probabilities` array.
-fn parse_golden_steps(json: &str) -> Vec<GoldenStep> {
-    let root: serde_json::Value = serde_json::from_str(json).expect("golden JSON parses");
-    let entries = root
-        .get("completion_probabilities")
-        .and_then(serde_json::Value::as_array)
-        .expect("golden carries completion_probabilities");
-    entries
-        .iter()
-        .map(|entry| {
-            let id = entry
-                .get("id")
-                .and_then(serde_json::Value::as_u64)
-                .expect("step id") as u32;
-            let top = entry
-                .get("top_logprobs")
-                .and_then(serde_json::Value::as_array)
-                .expect("top_logprobs")
-                .iter()
-                .map(|alt| {
-                    let alt_id = alt
-                        .get("id")
-                        .and_then(serde_json::Value::as_u64)
-                        .expect("alt id") as u32;
-                    let logprob = alt
-                        .get("logprob")
-                        .and_then(serde_json::Value::as_f64)
-                        .expect("alt logprob");
-                    (alt_id, logprob)
-                })
-                .collect();
-            GoldenStep { id, top }
-        })
-        .collect()
-}
-
-/// The prompt token ids out of `llama-cli`'s tokenisation dump, whose lines
-/// look like `0.04.926.888 I    760 -> 'The'`.
-fn parse_prompt_tokens(dump: &str) -> Vec<u32> {
-    dump.lines()
-        .filter_map(|line| {
-            let (left, _) = line.split_once("->")?;
-            left.split_whitespace().next_back()?.parse().ok()
-        })
-        .collect()
-}
-
-/// `log_softmax` of a logit row: what the fork server reports as `logprob`.
-fn log_softmax(logits: &[f32]) -> Vec<f64> {
-    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let sum: f64 = logits.iter().map(|&l| f64::from(l - max).exp()).sum();
-    let log_sum = sum.ln();
-    logits
-        .iter()
-        .map(|&l| f64::from(l - max) - log_sum)
-        .collect()
-}
-
-/// The `n` highest-scoring `(id, logprob)` pairs, ties broken by id so the
-/// order is deterministic.
-fn top_n(logprobs: &[f64], n: usize) -> Vec<(u32, f64)> {
-    let mut indexed: Vec<(u32, f64)> = logprobs
-        .iter()
-        .enumerate()
-        .map(|(i, &lp)| (u32::try_from(i).unwrap_or(u32::MAX), lp))
+        .filter(is_dense_variant)
         .collect();
-    indexed.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.0.cmp(&b.0))
-    });
-    indexed.truncate(n);
-    indexed
-}
+    assert_eq!(dense_specs.len(), 4, "four F32 variants");
 
-/// Greedy continuation of the real `Ternary-Bonsai-2-27B-PQ2_0.gguf`,
-/// compared token-for-token with the PrismML fork's own server dump
-/// (design §8.2 **G1**) and its top-10 logprobs to 1e-3 (**G4**).
-///
-/// `#[ignore]` because the 7.2 GB weight file is not in the repository and
-/// has never been on this machine (only its 64 MB header, under
-/// `scratchpad/hf/`), so **this gate has not been run**. Point
-/// `OXI_BONSAI2_PQ2_GGUF` at a local copy and `OXI_BONSAI2_GOLDEN_DIR` at
-/// `scratchpad/golden2`, then `cargo test -p oxibonsai-model --release \
-/// --all-features hybrid_real_27b -- --ignored --nocapture`.
-///
-/// Nothing here is skipped when a golden is missing: an opt-in test that
-/// silently validates nothing is worse than no test at all.
-#[test]
-#[ignore = "needs the real 27B GGUF: set OXI_BONSAI2_PQ2_GGUF and OXI_BONSAI2_GOLDEN_DIR"]
-fn hybrid_real_27b_greedy_matches_fork_goldens_bonsai2() {
-    let path = std::env::var("OXI_BONSAI2_PQ2_GGUF")
-        .expect("set OXI_BONSAI2_PQ2_GGUF to the real Ternary-Bonsai-2-27B-PQ2_0.gguf");
-    let golden_dir = std::env::var("OXI_BONSAI2_GOLDEN_DIR")
-        .expect("set OXI_BONSAI2_GOLDEN_DIR to the scratchpad golden2 directory");
+    for spec in &dense_specs {
+        let fixture = build(spec).expect("fixture builds");
+        let bytes = std::fs::read(&fixture.path).expect("fixture readable");
+        let gguf = GgufFile::parse(&bytes).expect("fixture parses");
+        let mut model = HybridModel::from_gguf_with_precision(
+            &gguf,
+            fixture.cfg.clone(),
+            64,
+            &kernel,
+            KvPrecision::F32,
+        )
+        .unwrap_or_else(|e| panic!("{spec:?}: an F32 qwen35 file must load: {e}"));
 
-    let bytes = std::fs::read(&path).expect("27B GGUF readable");
-    let gguf = GgufFile::parse(&bytes).expect("27B GGUF parses");
-    let mut model = HybridModel::from_gguf(&gguf, 4096).expect("27B loads");
-    assert_eq!(model.config().base.num_layers, 64);
-    assert_eq!(model.split().full_layers().len(), 16);
-    assert_eq!(model.split().linear_layers().len(), 48);
-    assert!(
-        model.kv_is_f16(),
-        "the fork's goldens were produced with an f16 KV cache (no -ctk/-ctv), so the \
-         comparison must run against the same element type"
-    );
-
-    let vocab = model.config().base.vocab_size;
-    for prompt in 1..=3u32 {
-        let token_file =
-            format!("{golden_dir}/Ternary-Bonsai-2-27B-PQ2_0.prompt{prompt}.prompt_tokens.txt");
-        let dump =
-            std::fs::read_to_string(&token_file).unwrap_or_else(|e| panic!("{token_file}: {e}"));
-        let tokens = parse_prompt_tokens(&dump);
-        assert!(!tokens.is_empty(), "{token_file} held no tokens");
-
-        let server_file = format!("{golden_dir}/PQ2_0.prompt{prompt}.server.json");
-        let server =
-            std::fs::read_to_string(&server_file).unwrap_or_else(|e| panic!("{server_file}: {e}"));
-        let steps = parse_golden_steps(&server);
-        assert!(!steps.is_empty(), "{server_file} held no decode steps");
-
-        // The fork's own prompt tokenisation, so a tokenizer difference
-        // cannot be mistaken for a forward-pass difference.
-        model.reset();
-        let mut logits = vec![0.0f32; vocab];
-        model
-            .forward_prefill(&tokens, 0, &mut logits)
-            .expect("prefill the golden prompt");
-
-        let mut produced = Vec::with_capacity(steps.len());
-        for (step_index, step) in steps.iter().enumerate() {
-            let logprobs = log_softmax(&logits);
-
-            // G4: the top-10 the fork reported, ids and logprobs.
-            let ours = top_n(&logprobs, step.top.len());
-            for (rank, ((got_id, got_lp), (want_id, want_lp))) in
-                ours.iter().zip(&step.top).enumerate()
-            {
-                assert_eq!(
-                    got_id, want_id,
-                    "prompt {prompt} step {step_index} rank {rank}: token id {got_id} != \
-                     golden {want_id}"
-                );
-                assert!(
-                    (got_lp - want_lp).abs() <= 1e-3,
-                    "prompt {prompt} step {step_index} rank {rank} (token {got_id}): logprob \
-                     {got_lp} vs golden {want_lp}"
-                );
-            }
-
-            // G1: the greedy choice itself.
-            let next = u32::try_from(argmax(&logits)).expect("token id fits u32");
-            assert_eq!(
-                next, step.id,
-                "prompt {prompt} step {step_index}: greedy token {next} != golden {}",
-                step.id
+        // Every projection is the dense arm, reporting F32.
+        let assert_dense = |layer: &LinearLayer<'_>, what: &str| {
+            assert!(
+                matches!(layer, LinearLayer::Dense(_)),
+                "{spec:?}: {what} must bind as LinearLayer::Dense"
             );
-            produced.push(next);
-
-            let pos = tokens.len() + step_index;
-            model
-                .forward(next, pos, &mut logits)
-                .expect("greedy decode");
+            assert_eq!(layer.quant_type(), GgufTensorType::F32, "{spec:?}: {what}");
+            assert!(layer.gpu_handle().is_none(), "{spec:?}: {what}");
+            let weights = layer.dense_weights().expect("dense weights");
+            assert_eq!(
+                weights.len(),
+                layer.out_features() * layer.in_features(),
+                "{spec:?}: {what} weight count"
+            );
+        };
+        assert_dense(model.lm_head(), "output.weight");
+        for block in model.blocks() {
+            match block {
+                HybridBlock::Full(full) => {
+                    for (layer, what) in [
+                        (full.attn_q(), "attn_q"),
+                        (full.attn_k(), "attn_k"),
+                        (full.attn_v(), "attn_v"),
+                        (full.attn_output(), "attn_output"),
+                        (full.ffn_gate(), "ffn_gate"),
+                        (full.ffn_up(), "ffn_up"),
+                        (full.ffn_down(), "ffn_down"),
+                    ] {
+                        assert_dense(layer, what);
+                    }
+                }
+                HybridBlock::Linear(linear) => {
+                    for (layer, what) in [
+                        (linear.attn_qkv(), "attn_qkv"),
+                        (linear.attn_gate(), "attn_gate"),
+                        (linear.ssm_out(), "ssm_out"),
+                        (linear.ffn_gate(), "ffn_gate"),
+                        (linear.ffn_up(), "ffn_up"),
+                        (linear.ffn_down(), "ffn_down"),
+                    ] {
+                        assert_dense(layer, what);
+                    }
+                }
+            }
         }
 
-        let golden_ids: Vec<u32> = steps.iter().map(|s| s.id).collect();
-        assert_eq!(
-            produced, golden_ids,
-            "prompt {prompt}: greedy continuation diverged from the fork"
-        );
+        // Batched projection == per-row projection, bit for bit (one
+        // dispatched GEMV per row either way).
+        let head = model.lm_head();
+        let (out_f, in_f) = (head.out_features(), head.in_features());
+        let rows = 3usize;
+        let input: Vec<f32> = (0..rows * in_f)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.01)
+            .collect();
+        let mut batched = vec![0.0f32; rows * out_f];
+        head.forward_mat(&input, &mut batched, rows)
+            .expect("dense batched projection");
+        for r in 0..rows {
+            let mut single = vec![0.0f32; out_f];
+            head.forward_vec(&input[r * in_f..(r + 1) * in_f], &mut single)
+                .expect("dense single-row projection");
+            assert_eq!(
+                &batched[r * out_f..(r + 1) * out_f],
+                single.as_slice(),
+                "{spec:?}: batched row {r} must equal the single-row projection bit for bit"
+            );
+        }
 
-        // The raw continuation dump must exist too, so a human can read the
-        // text behind the ids that just matched.
-        let continuation = format!("{golden_dir}/Ternary-Bonsai-2-27B-PQ2_0.prompt{prompt}.txt");
-        assert!(
-            std::path::Path::new(&continuation).exists(),
-            "{continuation} must exist beside the server dump"
-        );
+        // The whole model runs and tracks the f64 reference within the
+        // design's 1e-4 band.
+        let vocab = fixture.cfg.base.vocab_size;
+        let mut logits = vec![0.0f32; vocab];
+        for (t, &token) in fixture.reference.token_ids.iter().enumerate() {
+            let token = u32::try_from(token).expect("fixture token fits u32");
+            model
+                .forward(token, t, &mut logits)
+                .unwrap_or_else(|e| panic!("{spec:?}: forward at pos {t}: {e}"));
+            let reference = &fixture.reference.logits[t];
+            let (miss, index) = worst_miss(&logits, reference);
+            assert!(
+                miss <= 0.0,
+                "{spec:?}: token {t} logit[{index}] = {} vs reference {} (misses the 1e-4 \
+                 tolerance by {miss:.3e})",
+                logits[index],
+                reference[index],
+            );
+            assert_eq!(
+                argmax(&logits),
+                argmax_f64(reference),
+                "{spec:?}: token {t} greedy choice"
+            );
+        }
     }
 }
 
@@ -721,6 +639,96 @@ fn hybrid_golden_harness_parses_the_fork_formats_bonsai2() {
                 not a token line at all\n";
     assert_eq!(parse_prompt_tokens(dump), vec![760, 6511, 314, 6124, 369]);
     assert!(parse_prompt_tokens("").is_empty());
+}
+
+/// The vendored oracle (`tests/fixtures/bonsai2_golden{,_cpu}/`) is
+/// complete and self-consistent, so the real-model gates never depend on a
+/// session scratchpad — checked on every run, model files or not. Reads the
+/// vendored copies directly, whatever `OXI_BONSAI2_GOLDEN_DIR` says.
+#[test]
+fn hybrid_vendored_fork_goldens_are_complete_and_consistent_bonsai2() {
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let metal_dir = fixtures.join("bonsai2_golden");
+    let cpu_dir = fixtures.join("bonsai2_golden_cpu");
+    let read = |dir: &std::path::Path, name: &str| -> String {
+        let path = dir.join(name);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    };
+    for prompt_index in 1..=3usize {
+        let prompt = harness::PROMPTS[prompt_index - 1];
+        let mut greedy_ids = Vec::new();
+        for (dir, backend) in [(&metal_dir, "metal"), (&cpu_dir, "cpu")] {
+            let server = read(dir, &format!("PQ2_0.prompt{prompt_index}.server.json"));
+            // Redacted capture path: no local path of the capture machine.
+            assert!(
+                !server.contains("/Users/") && !server.contains("/home/"),
+                "{backend} prompt {prompt_index}: an absolute path was vendored"
+            );
+            let root: serde_json::Value = serde_json::from_str(&server).expect("golden parses");
+            assert_eq!(
+                root.get("model").and_then(serde_json::Value::as_str),
+                Some(harness::PQ2_FILE),
+                "{backend} prompt {prompt_index}: the dump names the release file"
+            );
+            let steps = parse_golden_steps(&server);
+            assert_eq!(steps.len(), 24, "{backend} prompt {prompt_index}: 24 steps");
+            for (step, golden) in steps.iter().enumerate() {
+                assert_eq!(
+                    golden.top.len(),
+                    harness::TOP_N,
+                    "{backend} prompt {prompt_index} step {step}: top-{}",
+                    harness::TOP_N
+                );
+                assert_eq!(
+                    golden.top[0].0, golden.id,
+                    "{backend} prompt {prompt_index} step {step}: greedy = top-1"
+                );
+                assert!(
+                    golden.top.windows(2).all(|w| w[0].1 >= w[1].1),
+                    "{backend} prompt {prompt_index} step {step}: logprobs descend"
+                );
+            }
+            if backend == "metal" {
+                greedy_ids = steps.iter().map(|s| s.id).collect();
+                // The server's 24-token content is the prefix of the
+                // `llama-cli` 32-token dumps of both builds.
+                let content = root
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("server content");
+                for build in ["PQ2_0", "PTQ1_0"] {
+                    let text = read(
+                        &metal_dir,
+                        &format!("Ternary-Bonsai-2-27B-{build}.prompt{prompt_index}.txt"),
+                    );
+                    assert!(
+                        text.starts_with(content) && text.ends_with("\n\n"),
+                        "{build} prompt {prompt_index}: text dump vs server content"
+                    );
+                }
+            }
+        }
+        assert_eq!(greedy_ids.len(), 24);
+        // Both builds tokenise the raw prompt identically, into no more ids
+        // than it has bytes.
+        let pq2 = parse_prompt_tokens(&read(
+            &metal_dir,
+            &format!("Ternary-Bonsai-2-27B-PQ2_0.prompt{prompt_index}.prompt_tokens.txt"),
+        ));
+        let ptq1 = parse_prompt_tokens(&read(
+            &metal_dir,
+            &format!("Ternary-Bonsai-2-27B-PTQ1_0.prompt{prompt_index}.prompt_tokens.txt"),
+        ));
+        assert!(!pq2.is_empty(), "prompt {prompt_index}: tokens");
+        assert_eq!(
+            pq2, ptq1,
+            "prompt {prompt_index}: {prompt:?} tokenises alike"
+        );
+        assert!(
+            pq2.len() <= prompt.len(),
+            "prompt {prompt_index}: token count"
+        );
+    }
 }
 
 #[test]

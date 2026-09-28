@@ -989,7 +989,7 @@ fn upload_ternary_weight_for_pool_test(
 /// # Why this is robust to parallel test execution
 ///
 /// The alloc counter [`MetalGraph::gemm_pool_alloc_count`] is process-wide and
-/// the `MetalGraph` is a shared singleton, so *other* tests calling
+/// the pool lives on the process-shared `MetalDevice`, so *other* tests calling
 /// `encode_gemm_tq2` concurrently can grow the pool inside a naive measurement
 /// window. The two sibling tests that share this pool
 /// (`test_encode_gemm_tq2_matches_reference`, `test_encode_gemm_tq2_v8_tiled_parity`)

@@ -86,12 +86,26 @@ impl ReasoningChunk {
 enum Phase {
     /// Emitting into the reasoning channel.
     Reasoning,
-    /// The close token was just consumed; the next non-newline piece starts
-    /// the content channel (see the module doc's "post-boundary gap").
-    JustClosed,
+    /// The close token was just consumed; the next piece(s) may still be
+    /// swallowed by the post-boundary newline skip (see the module doc),
+    /// up to the fixed budget carried here (see [`POST_CLOSE_NEWLINE_BUDGET`]).
+    /// Once a piece exhausts the remaining budget, or the budget is already
+    /// `0`, every further piece — newlines included — is real content.
+    JustClosed(u8),
     /// Emitting into the content channel.
     Content,
 }
+
+/// How many leading newline characters immediately after `</think>` the
+/// post-boundary gap swallows, **in total**, however many separate decode
+/// tokens they are split across.
+///
+/// Matches the reference fork's own `optspace(end)` bound rather than an
+/// unbounded fixpoint strip: the template's historical assistant
+/// re-rendering convention is exactly `'\n</think>\n\n' + content` — two
+/// newlines — so anything beyond that is real model output, not template
+/// boilerplate, even if it happens to also be a bare newline.
+const POST_CLOSE_NEWLINE_BUDGET: u8 = 2;
 
 /// Splits a raw, per-token generation stream into `reasoning_content` and
 /// `content`. See the module docs for the id-keyed design and the
@@ -120,6 +134,15 @@ impl ReasoningSplitter {
             Phase::Content
         };
         Self { close_id, phase }
+    }
+
+    /// Reconstruct the current phase's `JustClosed` budget as `Phase::Content`
+    /// once it hits zero — shared by every `push` arm that discovers the
+    /// budget is already exhausted, so the "budget spent" transition happens
+    /// in exactly one place.
+    fn just_closed_budget_used_up(&mut self, piece: &str) -> ReasoningChunk {
+        self.phase = Phase::Content;
+        ReasoningChunk::Content(piece.to_string())
     }
 
     /// Convenience: build a pass-through splitter (every push is `Content`).
@@ -155,17 +178,28 @@ impl ReasoningSplitter {
         match self.phase {
             Phase::Reasoning => {
                 if self.close_id == Some(id) {
-                    self.phase = Phase::JustClosed;
+                    self.phase = Phase::JustClosed(0);
                     return ReasoningChunk::Boundary;
                 }
                 ReasoningChunk::Reasoning(piece.to_string())
             }
-            Phase::JustClosed => {
-                let trimmed = piece.trim_start_matches('\n');
+            Phase::JustClosed(swallowed) => {
+                let budget = POST_CLOSE_NEWLINE_BUDGET.saturating_sub(swallowed);
+                if budget == 0 {
+                    // The fixed post-boundary budget is already spent by
+                    // earlier tokens; this piece — even if it is itself
+                    // more bare newlines — is real content from here on.
+                    return self.just_closed_budget_used_up(piece);
+                }
+                let leading = piece.chars().take_while(|&c| c == '\n').count();
+                let take = leading.min(budget as usize);
+                let trimmed = &piece[take..];
                 if trimmed.is_empty() {
-                    // Entirely swallowed by the post-boundary newline skip;
-                    // stay in `JustClosed` in case more leading newlines
-                    // arrive as separate tokens.
+                    // Entirely swallowed by the post-boundary newline skip,
+                    // within budget; stay in `JustClosed` (with the updated
+                    // remaining budget) in case more leading newlines arrive
+                    // as separate tokens.
+                    self.phase = Phase::JustClosed(swallowed + take as u8);
                     return ReasoningChunk::Boundary;
                 }
                 self.phase = Phase::Content;
@@ -201,7 +235,11 @@ where
             ReasoningChunk::Boundary => {}
         }
     }
-    let reasoning = if reasoning.is_empty() {
+    // Whitespace-only reasoning is treated the same as none at all —
+    // matching the reference fork's parser, which discards it rather than
+    // reporting an OpenAI `reasoning_content` field that is present but
+    // carries nothing a client could ever show.
+    let reasoning = if reasoning.trim().is_empty() {
         None
     } else {
         Some(reasoning)
@@ -280,19 +318,48 @@ mod tests {
         let mut splitter = ReasoningSplitter::new(true, Some(248069));
         let _ = splitter.push(1, "r");
         assert_eq!(splitter.push(248069, "</think>"), ReasoningChunk::Boundary);
-        // A run of pure-newline tokens right after the boundary is dropped…
+        // A run of pure-newline tokens right after the boundary is dropped,
+        // up to the fixed 2-newline budget (matching the reference fork's
+        // `optspace(end)` bound, not an unbounded fixpoint strip)…
         assert_eq!(splitter.push(2, "\n"), ReasoningChunk::Boundary);
         assert_eq!(splitter.push(3, "\n"), ReasoningChunk::Boundary);
-        // …the first token carrying anything else starts content, stripped
-        // of only its own leading newlines…
+        // …the budget (2 newlines) is already spent by tokens 2 and 3, so a
+        // THIRD bare-newline token is real content, not swallowed…
         assert_eq!(
             splitter.push(4, "\n\n4"),
-            ReasoningChunk::Content("4".to_string())
+            ReasoningChunk::Content("\n\n4".to_string()),
+            "the post-boundary budget is per-splitter, not per-token: once spent, \
+             even more newlines are real content"
         );
         // …and a later, real newline (mid-answer) is content, unstripped.
         assert_eq!(
             splitter.push(5, "\nmore"),
             ReasoningChunk::Content("\nmore".to_string())
+        );
+    }
+
+    #[test]
+    fn swallows_at_most_two_newlines_within_a_single_piece() {
+        // The common case (G8's own shape): both newlines arrive in ONE
+        // token immediately after the close, then content starts cleanly.
+        let mut splitter = ReasoningSplitter::new(true, Some(248069));
+        assert_eq!(splitter.push(248069, "</think>"), ReasoningChunk::Boundary);
+        assert_eq!(splitter.push(1, "\n\n"), ReasoningChunk::Boundary);
+        assert_eq!(
+            splitter.push(2, "4"),
+            ReasoningChunk::Content("4".to_string())
+        );
+    }
+
+    #[test]
+    fn a_single_piece_with_more_than_two_leading_newlines_keeps_the_extra_ones_as_content() {
+        let mut splitter = ReasoningSplitter::new(true, Some(248069));
+        assert_eq!(splitter.push(248069, "</think>"), ReasoningChunk::Boundary);
+        // 3 leading newlines in one piece: only 2 are budget, the 3rd (and
+        // the real text after it) is content.
+        assert_eq!(
+            splitter.push(1, "\n\n\nreal"),
+            ReasoningChunk::Content("\nreal".to_string())
         );
     }
 
@@ -310,11 +377,16 @@ mod tests {
     //
     // `reasoning_content` == "We need to answer user: \"What is 2+2? Answer
     // briefly.\" Simple. Final: 4.\n" (kept, trailing newline and all) and
-    // `content` == "4" exactly — this package's real-model E2E case is
-    // `#[ignore]`d elsewhere (no Bonsai 2 27B GGUF in this environment);
-    // this test proves the *splitter* reproduces the documented pass/fail
-    // criterion (design §7.3 G8: "content == \"4\", reasoning non-empty")
-    // against a hand-built token stream shaped like the golden's own text.
+    // `content` == "4" exactly. This test proves the *splitter* reproduces
+    // the documented pass/fail criterion (design §7.3 G8: "content ==
+    // \"4\", reasoning non-empty") against a hand-built, collapsed token
+    // stream shaped like the golden's own text; the real golden's actual 29
+    // separate `(id, token)` pairs (`Ternary-Bonsai-2-27B-*.gguf` is on
+    // disk in this environment as of 2026-09-21) are replayed verbatim,
+    // both as one batch call and one token at a time, by
+    // `g8_real_trace_split_reasoning_matches_the_golden_response_exactly` /
+    // `g8_real_trace_streaming_replay_matches_the_golden_response_exactly`
+    // below (post-verifier-review).
     #[test]
     fn g8_reasoning_split_matches_golden_shape() {
         const CLOSE_THINK_ID: u32 = 248069;
@@ -336,6 +408,107 @@ mod tests {
         );
     }
 
+    /// The real golden trace behind G8 (`scratchpad/golden2/chat.prompt1.server.json`,
+    /// `choices[0].logprobs.content`, a real Bonsai 2 27B server response to
+    /// "What is 2+2? Answer briefly."): the model's own 29 separate
+    /// `(id, token)` pairs, extracted verbatim, not the single collapsed
+    /// `(id, whole_reasoning_text)` shape
+    /// [`g8_reasoning_split_matches_golden_shape`] above uses. That
+    /// collapsed shape cannot exercise anything about how MANY separate
+    /// tokens the post-boundary newline swallow spans, or what a
+    /// special-flagged, empty-decoding EOS-shaped id (`248046`, the real
+    /// trace's own last token, decoding to `""`) does to the split — this
+    /// replay can. `close_id = 248069` and `248068` (the `<think>` opener)
+    /// never appears among the 29: the real prompt already ends with
+    /// `<think>\n`, so every one of these ids is a genuinely GENERATED
+    /// token, `started_in_think: true` from the first one.
+    const G8_REAL_TRACE: &[(u32, &str)] = &[
+        (1596, "We"),
+        (1144, " need"),
+        (310, " to"),
+        (4087, " answer"),
+        (1156, " user"),
+        (25, ":"),
+        (328, " \""),
+        (3710, "What"),
+        (369, " is"),
+        (220, " "),
+        (17, "2"),
+        (10, "+"),
+        (17, "2"),
+        (30, "?"),
+        (21134, " Answer"),
+        (25899, " briefly"),
+        (1149, ".\""),
+        (8722, " Simple"),
+        (13, "."),
+        (12650, " Final"),
+        (25, ":"),
+        (220, " "),
+        (19, "4"),
+        (13, "."),
+        (198, "\n"),
+        (248069, "</think>"),
+        (271, "\n\n"),
+        (19, "4"),
+        (248046, ""),
+    ];
+    const G8_REAL_TRACE_REASONING: &str =
+        "We need to answer user: \"What is 2+2? Answer briefly.\" Simple. Final: 4.\n";
+    const G8_REAL_TRACE_CONTENT: &str = "4";
+
+    #[test]
+    fn g8_real_trace_split_reasoning_matches_the_golden_response_exactly() {
+        let (reasoning, content) =
+            split_reasoning(G8_REAL_TRACE.iter().copied(), true, Some(248069));
+        assert_eq!(
+            reasoning.as_deref(),
+            Some(G8_REAL_TRACE_REASONING),
+            "must byte-match the real server response's own reasoning_content"
+        );
+        assert_eq!(
+            content, G8_REAL_TRACE_CONTENT,
+            "must byte-match the real server response's own content"
+        );
+    }
+
+    /// Same trace, replayed one token at a time through `push` — the shape
+    /// `server/chat.rs`'s and `api_extensions.rs`'s streaming decode loops
+    /// actually use, as opposed to [`split_reasoning`]'s one-shot batch
+    /// call. In particular this exercises the newline swallow spanning
+    /// exactly one piece (`(271, "\n\n")`, both newlines in a single token,
+    /// budget exactly exhausted) and confirms a token that decodes to `""`
+    /// (`248046`, standing in for a special-flagged token whose own
+    /// `step_decode` returned `None` — the post-verifier-review fix
+    /// elsewhere in this crate feeds exactly this shape to `push`) is a
+    /// harmless no-op once already in `Phase::Content`.
+    #[test]
+    fn g8_real_trace_streaming_replay_matches_the_golden_response_exactly() {
+        let mut splitter = ReasoningSplitter::new(true, Some(248069));
+        assert!(splitter.in_reasoning());
+        let mut reasoning = String::new();
+        let mut content = String::new();
+        for &(id, piece) in G8_REAL_TRACE {
+            match splitter.push(id, piece) {
+                ReasoningChunk::Reasoning(s) => reasoning.push_str(&s),
+                ReasoningChunk::Content(s) => content.push_str(&s),
+                ReasoningChunk::Boundary => {}
+            }
+        }
+        assert!(
+            !splitter.in_reasoning(),
+            "must have left the reasoning phase by the end"
+        );
+        assert_eq!(
+            reasoning, G8_REAL_TRACE_REASONING,
+            "streamed reasoning_content must byte-match the real server response"
+        );
+        assert_eq!(
+            content, G8_REAL_TRACE_CONTENT,
+            "streamed content must byte-match the real server response"
+        );
+    }
+
     #[test]
     fn split_reasoning_pass_through_has_no_reasoning_content() {
         let tokens: Vec<(u32, &str)> = vec![(1, "hello "), (2, "world")];
@@ -350,6 +523,19 @@ mod tests {
         let (reasoning, content) = split_reasoning(tokens, false, Some(248069));
         assert_eq!(reasoning, None);
         assert_eq!(content, "hello");
+    }
+
+    #[test]
+    fn split_reasoning_whitespace_only_reasoning_is_none() {
+        // Matches the reference fork's parser: reasoning that is present
+        // but carries only whitespace is discarded, the same as if there
+        // had been no reasoning at all — never an OpenAI `reasoning_content`
+        // field that is technically `Some("")`-ish but shows nothing.
+        const CLOSE: u32 = 248069;
+        let tokens: Vec<(u32, &str)> = vec![(1, "   \n  "), (CLOSE, "</think>"), (2, "answer")];
+        let (reasoning, content) = split_reasoning(tokens, true, Some(CLOSE));
+        assert_eq!(reasoning, None, "whitespace-only reasoning must be None");
+        assert_eq!(content, "answer");
     }
 
     // ── ReasoningChunk helpers ─────────────────────────────────────────────

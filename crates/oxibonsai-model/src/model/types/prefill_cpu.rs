@@ -156,13 +156,11 @@
 use oxibonsai_core::tensor::{BlockQ1_0G128, QK1_0_G128};
 use oxibonsai_core::BlockTQ2_0_g128;
 use oxibonsai_kernels::KernelDispatcher;
-use rayon::prelude::*;
 use std::sync::OnceLock;
 
 use crate::block::TransformerBlock;
 use crate::error::{ModelError, ModelResult};
 use crate::kv_cache::KvCache;
-use crate::layers::attention_fused::fused_attention_head_contiguous;
 use crate::layers::rope::RopeTable;
 use crate::layers::swiglu::try_swiglu;
 
@@ -746,12 +744,12 @@ fn add_into(dst: &mut [f32], src: &[f32], len: usize) {
     }
 }
 
-/// Causal grouped-query attention for one position, parallel over Q heads.
+/// Causal grouped-query attention for one position, parallel over KV heads.
 ///
-/// Mirrors `crate::block::functions::compute_gqa_attention` — the same
-/// per-head [`fused_attention_head_contiguous`] call and the same GQA head
-/// mapping — which is private to `crate::block` and so cannot be called from
-/// here.
+/// The very function the per-block decode path runs
+/// ([`crate::block::functions::gqa_attention`], shared since B2-11-FIX), so
+/// the batched prefill and the sequential decode read the cache — `f32` or
+/// `f16` — through one body and cannot drift.
 fn gqa_attention_row(
     q_rope: &[f32],
     attn_out: &mut [f32],
@@ -760,26 +758,16 @@ fn gqa_attention_row(
     geom: &PrefillGeometry,
     seq_len: usize,
 ) -> ModelResult<()> {
-    let head_dim = geom.head_dim;
-    attn_out.par_chunks_mut(head_dim).enumerate().try_for_each(
-        |(q_head, out_slice)| -> ModelResult<()> {
-            let kv_head = q_head / geom.heads_per_group;
-            let q_start = q_head * head_dim;
-            let keys = crate::block::functions::keys_for_cow(kv_cache, layer_idx, kv_head, seq_len);
-            let values =
-                crate::block::functions::values_for_cow(kv_cache, layer_idx, kv_head, seq_len);
-            fused_attention_head_contiguous(
-                &q_rope[q_start..q_start + head_dim],
-                &keys,
-                &values,
-                out_slice,
-                seq_len,
-                head_dim,
-            )
-            .map_err(|e| {
-                ModelError::Internal(format!("batched prefill head {q_head} attention: {e}"))
-            })
-        },
+    crate::block::functions::gqa_attention(
+        q_rope,
+        attn_out,
+        kv_cache,
+        layer_idx,
+        geom.num_heads,
+        geom.heads_per_group,
+        geom.head_dim,
+        seq_len,
+        true,
     )
 }
 

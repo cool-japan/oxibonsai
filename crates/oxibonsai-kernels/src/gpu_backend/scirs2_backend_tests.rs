@@ -405,3 +405,246 @@ fn concurrent_gemv_and_gemm_q1_callers_do_not_corrupt_each_other() {
     }
     join_workers(handles);
 }
+
+// ── Q1 replica sharing + per-epoch release (MET-M1 / verify:METAL-CONCURRENCY) ──
+
+/// Two distinct 18-byte Q1 blocks, so "same bytes" and "different bytes"
+/// cases are unambiguous.
+fn block_a() -> Vec<u8> {
+    q1_block(1.0, [0x5Au8; 16])
+}
+
+fn block_b() -> Vec<u8> {
+    q1_block(2.0, [0xA5u8; 16])
+}
+
+/// Run `f` with this thread's uploads attributed to `epoch`, returning its
+/// result and what the scope saw.
+fn in_epoch<T>(epoch: u64, f: impl FnOnce() -> T) -> (T, crate::gpu_backend::UploadStats) {
+    let scope = crate::gpu_backend::GpuUploadScope::enter(epoch);
+    let out = f();
+    (out, scope.finish())
+}
+
+#[test]
+fn content_fingerprint_separates_content_and_length() {
+    let a = content_fingerprint(&block_a());
+    let b = content_fingerprint(&block_b());
+    assert_ne!(a, b, "different content must fingerprint differently");
+    assert_eq!(a, content_fingerprint(&block_a()), "deterministic");
+    // A zero-padded tail must not collide with the shorter input.
+    let short = [1u8, 2, 3];
+    let padded = [1u8, 2, 3, 0];
+    assert_ne!(content_fingerprint(&short), content_fingerprint(&padded));
+    assert_ne!(content_fingerprint(&[]), content_fingerprint(&[0u8]));
+}
+
+/// The verify:METAL-CONCURRENCY blocking finding, at the backend: a second
+/// upload of byte-identical weights from another replica (another epoch)
+/// must return the SAME handle — which is also what makes the Q1 fused
+/// path's `MetalGraph` slots coincide — and place nothing new on the device.
+#[test]
+fn identical_uploads_from_two_epochs_share_one_resident_buffer() {
+    let Some(b) = make_backend() else { return };
+    let epoch_a = crate::gpu_backend::next_gpu_model_epoch();
+    let epoch_b = crate::gpu_backend::next_gpu_model_epoch();
+    let bytes = block_a();
+
+    let (handle_a, stats_a) = in_epoch(epoch_a, || b.upload_weights(&bytes));
+    let (handle_b, stats_b) = in_epoch(epoch_b, || b.upload_weights(&bytes));
+    let handle_a = handle_a.expect("upload A");
+    let handle_b = handle_b.expect("upload B");
+
+    assert_eq!(handle_a, handle_b, "identical bytes must share one handle");
+    assert_eq!(b.cached_weight_count(), 1, "one resident buffer, not two");
+    assert_eq!(b.cached_weight_bytes(), bytes.len() as u64);
+    assert_eq!(
+        b.uploaded_weight_bytes_total(),
+        bytes.len() as u64,
+        "bytes uploaded must grow once, not per replica"
+    );
+    assert_eq!(stats_a.fresh_buffers, 1);
+    assert_eq!(stats_a.shared_buffers, 0);
+    assert_eq!(stats_b.fresh_buffers, 0);
+    assert_eq!(stats_b.shared_buffers, 1);
+    assert_eq!(stats_b.shared_bytes, bytes.len() as u64);
+    assert_eq!(b.epoch_registration_count(epoch_a), 1);
+    assert_eq!(b.epoch_registration_count(epoch_b), 1);
+}
+
+/// Releasing one replica's epoch must never pull weights out from under a
+/// sibling: the buffer survives until the LAST epoch referencing it goes.
+#[test]
+fn release_frees_a_shared_buffer_only_with_its_last_epoch() {
+    let Some(b) = make_backend() else { return };
+    let epoch_a = crate::gpu_backend::next_gpu_model_epoch();
+    let epoch_b = crate::gpu_backend::next_gpu_model_epoch();
+    let bytes = block_a();
+    let (handle, _) = in_epoch(epoch_a, || b.upload_weights(&bytes));
+    let handle = handle.expect("upload A");
+    let (_, _) = in_epoch(epoch_b, || b.upload_weights(&bytes));
+
+    assert_eq!(b.release_model_weights(epoch_a).expect("release A"), 0);
+    assert_eq!(b.cached_weight_count(), 1, "epoch B still references it");
+    assert_eq!(b.epoch_registration_count(epoch_a), 0);
+    if b.is_accelerated() {
+        let input = vec![1.0f32; 128];
+        assert!(
+            b.gemv_q1_g128_cached(handle, &input, 1, 128).is_ok(),
+            "the surviving replica's handle must still resolve"
+        );
+    }
+
+    assert_eq!(b.release_model_weights(epoch_b).expect("release B"), 1);
+    assert_eq!(b.cached_weight_count(), 0);
+    assert_eq!(b.cached_weight_bytes(), 0);
+    assert!(
+        b.gemv_q1_g128_cached(handle, &[1.0f32; 128], 1, 128)
+            .is_err(),
+        "a freed handle must not resolve to anything"
+    );
+    // Monotonic: freeing does not rewrite history.
+    assert_eq!(b.uploaded_weight_bytes_total(), bytes.len() as u64);
+}
+
+#[test]
+fn distinct_bytes_never_share_a_handle() {
+    let Some(b) = make_backend() else { return };
+    let epoch = crate::gpu_backend::next_gpu_model_epoch();
+    let (handles, stats) = in_epoch(epoch, || {
+        (
+            b.upload_weights(&block_a()).expect("A"),
+            b.upload_weights(&block_b()).expect("B"),
+        )
+    });
+    assert_ne!(handles.0, handles.1);
+    assert_eq!(b.cached_weight_count(), 2);
+    assert_eq!(stats.fresh_buffers, 2);
+    assert_eq!(stats.shared_buffers, 0);
+}
+
+/// The same input bytes through the raw and the ternary (SoA-reformatting)
+/// upload are different device buffers read by different kernels; sharing
+/// them would feed a Q1 kernel ternary SoA data or vice versa.
+#[test]
+fn raw_and_ternary_layouts_never_alias() {
+    use half::f16;
+    use oxibonsai_core::BlockTQ2_0_g128;
+    let Some(b) = make_backend() else { return };
+    let block = BlockTQ2_0_g128 {
+        qs: [0x55u8; 32],
+        d: f16::from_f32(1.0),
+    };
+    // The AoS bytes of the block, uploaded raw.
+    let mut aos = Vec::with_capacity(34);
+    aos.extend_from_slice(&block.qs);
+    aos.extend_from_slice(&block.d.to_bits().to_le_bytes());
+    let epoch = crate::gpu_backend::next_gpu_model_epoch();
+    let (handles, _) = in_epoch(epoch, || {
+        (
+            b.upload_weights(&aos).expect("raw"),
+            b.upload_weights_ternary(&[block]).expect("ternary"),
+        )
+    });
+    assert_ne!(handles.0, handles.1);
+    assert_eq!(b.cached_weight_count(), 2);
+}
+
+/// An upload made outside any scope has no known owner, so no release —
+/// not even of the unattributed epoch itself — may free it.
+#[test]
+fn unattributed_uploads_survive_every_release() {
+    let Some(b) = make_backend() else { return };
+    let handle = b.upload_weights(&block_a()).expect("unscoped upload");
+    assert_eq!(
+        b.release_model_weights(crate::gpu_backend::UNATTRIBUTED_MODEL_EPOCH)
+            .expect("release unattributed"),
+        0
+    );
+    let unrelated = crate::gpu_backend::next_gpu_model_epoch();
+    assert_eq!(
+        b.release_model_weights(unrelated).expect("unknown epoch"),
+        0
+    );
+    assert_eq!(b.cached_weight_count(), 1);
+
+    // A scoped upload of the same bytes shares the unattributed buffer; its
+    // release drops only its own reference.
+    let epoch = crate::gpu_backend::next_gpu_model_epoch();
+    let (shared, stats) = in_epoch(epoch, || b.upload_weights(&block_a()));
+    assert_eq!(shared.expect("scoped upload"), handle);
+    assert_eq!(stats.shared_buffers, 1);
+    assert_eq!(b.release_model_weights(epoch).expect("release"), 0);
+    assert_eq!(b.cached_weight_count(), 1);
+}
+
+/// Two uploads of the same bytes inside ONE epoch are two references; one
+/// release drops both.
+#[test]
+fn one_epoch_uploading_twice_holds_two_references() {
+    let Some(b) = make_backend() else { return };
+    let epoch = crate::gpu_backend::next_gpu_model_epoch();
+    let (handles, stats) = in_epoch(epoch, || {
+        (
+            b.upload_weights(&block_b()).expect("first"),
+            b.upload_weights(&block_b()).expect("second"),
+        )
+    });
+    assert_eq!(handles.0, handles.1);
+    assert_eq!(stats.fresh_buffers, 1);
+    assert_eq!(stats.shared_buffers, 1);
+    assert_eq!(b.epoch_registration_count(epoch), 2);
+    assert_eq!(b.release_model_weights(epoch).expect("release"), 1);
+    assert_eq!(b.cached_weight_count(), 0);
+}
+
+#[test]
+fn clear_weight_cache_also_forgets_every_registration() {
+    let Some(b) = make_backend() else { return };
+    let epoch = crate::gpu_backend::next_gpu_model_epoch();
+    let (_, _) = in_epoch(epoch, || b.upload_weights(&block_a()));
+    assert_eq!(b.clear_weight_cache().expect("clear"), 1);
+    assert_eq!(b.epoch_registration_count(epoch), 0);
+    assert_eq!(
+        b.release_model_weights(epoch).expect("release after clear"),
+        0
+    );
+}
+
+/// With retention disabled nothing is shared, registered or counted.
+#[test]
+fn disabled_cache_never_registers_or_shares() {
+    let Some(b) = make_backend() else { return };
+    b.set_weight_cache_enabled(false);
+    let epoch = crate::gpu_backend::next_gpu_model_epoch();
+    let (handles, stats) = in_epoch(epoch, || {
+        (
+            b.upload_weights(&block_a()).expect("first"),
+            b.upload_weights(&block_a()).expect("second"),
+        )
+    });
+    assert_ne!(handles.0, handles.1, "no dedupe without retention");
+    assert!(stats.is_empty());
+    assert_eq!(b.epoch_registration_count(epoch), 0);
+    assert_eq!(b.cached_weight_count(), 0);
+    assert_eq!(b.uploaded_weight_bytes_total(), 0);
+}
+
+/// The trait surface `KernelDispatcher::gpu_backend()` exposes must reach the
+/// same accounting (the engine's `Drop` only ever sees the trait object).
+#[test]
+fn trait_surface_reports_and_releases_the_same_state() {
+    let Some(b) = make_backend() else { return };
+    let epoch = crate::gpu_backend::next_gpu_model_epoch();
+    let (_, _) = in_epoch(epoch, || b.upload_weights(&block_a()));
+    let dyn_backend: &dyn GpuBackendTrait = &b;
+    assert_eq!(dyn_backend.resident_weight_count(), 1);
+    assert_eq!(dyn_backend.resident_weight_bytes(), block_a().len() as u64);
+    assert_eq!(
+        dyn_backend.weight_bytes_uploaded_total(),
+        block_a().len() as u64
+    );
+    assert_eq!(dyn_backend.model_registration_count(epoch), 1);
+    assert_eq!(dyn_backend.release_model(epoch).expect("release"), 1);
+    assert_eq!(dyn_backend.resident_weight_count(), 0);
+}

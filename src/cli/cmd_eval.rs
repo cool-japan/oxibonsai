@@ -15,9 +15,9 @@
 //!   specify — [`score_choices_logprob`] teacher-forces every candidate
 //!   continuation and sums its per-token log-probability, reusing
 //!   [`oxibonsai_runtime::InferenceEngine::prefill_from_pos`] /
-//!   `decode_step` / `rewind_cache` (the same trio the speculative
-//!   decoder uses) so the shared context is prefilled once per question
-//!   and only rewound between candidates, and
+//!   `decode_step` / `snapshot_sequence` + `restore_sequence` (exact for
+//!   dense and hybrid models alike) so the shared context is prefilled once
+//!   per question and only restored between candidates, and
 //!   [`oxibonsai_runtime::api_types::compute_logprobs`] for the
 //!   log-softmax rather than a fourth reimplementation of it.
 
@@ -33,8 +33,8 @@ use oxibonsai_runtime::{InferenceEngine, TokenizerBridge};
 
 use super::args::EvalTask;
 use super::util::{
-    build_sampling_params, check_tokenizer_model_compatibility, missing_tokenizer_warning,
-    model_vocab_size, resolve_tokenizer_vocab_aware,
+    build_sampling_params, missing_tokenizer_warning, model_vocab_size,
+    resolve_tokenizer_vocab_aware,
 };
 
 /// Resolved arguments for `oxibonsai eval`, merged from CLI flags and
@@ -105,14 +105,19 @@ pub(crate) fn run(args: EvalArgs) -> anyhow::Result<()> {
     let mut engine = InferenceEngine::from_gguf(&gguf, params, 42, max_seq_len)?;
 
     // TOK-08: vocab-aware resolution + a hard compatibility check.
+    // ENGINE-SEAM: shared with `run` (GGUF-embedded tokenizer fallback).
     let expected_vocab = model_vocab_size(&gguf).ok();
     let lookup = resolve_tokenizer_vocab_aware(tokenizer.as_deref(), &model, expected_vocab);
-    let tok = match &lookup.found {
-        Some(p) => {
-            let tok = TokenizerBridge::from_file(p)?;
-            check_tokenizer_model_compatibility(&tok, p, &gguf, allow_vocab_mismatch)?;
-            tok
-        }
+    let resolved = super::cmd_run::resolve_model_tokenizer_with(
+        tokenizer.as_deref(),
+        &lookup,
+        &gguf,
+        expected_vocab,
+        allow_vocab_mismatch,
+        |path| Ok(TokenizerBridge::from_file(path)?),
+    )?;
+    let tok = match resolved {
+        Some(tok) => tok,
         None => anyhow::bail!(
             "eval requires a tokenizer to encode dataset prompts, but none was found: {}",
             missing_tokenizer_warning(&lookup.searched)
@@ -357,12 +362,14 @@ fn score_mc_dataset(
 /// string and take each choice's continuation tokens as whatever lies
 /// beyond the trimmed context's token count in that joint encoding.
 ///
-/// The context is prefilled once (`prefill_from_pos`); each choice then
-/// only replays its own continuation tokens via `decode_step` before
-/// `rewind_cache` discards that choice's KV writes, so every choice after
-/// the first reuses the same prefilled context instead of reprocessing it.
-/// This is the same prefill → decode_step → rewind_cache trio the
-/// speculative decoder uses, applied to scoring instead of drafting.
+/// The context is prefilled once (`prefill_from_pos`) and snapshotted
+/// (`snapshot_sequence`); each choice then only replays its own
+/// continuation tokens via `decode_step` before `restore_sequence` returns
+/// the sequence to the snapshot, so every choice after the first reuses the
+/// same prefilled context instead of reprocessing it. For a dense model the
+/// restore is the KV-cursor rewind the speculative decoder uses; for a
+/// hybrid (`qwen35`) model it also restores the recurrent state, which no
+/// cursor move can rewind.
 ///
 /// Deliberately NOT length-normalized: `lm-evaluation-harness` reports
 /// `acc_norm` (dividing by each continuation's byte length) as the
@@ -386,6 +393,12 @@ fn score_choices_logprob(
     }
     let ctx_len = ctx_tokens.len();
     let first_logits = engine.prefill_from_pos(&ctx_tokens, 0)?;
+    // ENGINE-SEAM: the rollback point every choice returns to. A sequence
+    // snapshot rather than `rewind_cache(ctx_len)`: a hybrid (`qwen35`)
+    // model's recurrent state cannot be rewound by moving a KV cursor (the
+    // engine refuses that), while for a dense model restoring the snapshot
+    // is exactly the old cursor rewind.
+    let context_point = engine.snapshot_sequence()?;
 
     let mut scores = Vec::with_capacity(choices.len());
     for choice in choices {
@@ -413,7 +426,7 @@ fn score_choices_logprob(
             cur_logits = engine.decode_step(token_id, ctx_len + i)?;
         }
         scores.push(logprob_sum);
-        engine.rewind_cache(ctx_len);
+        engine.restore_sequence(&context_point)?;
     }
     Ok(scores)
 }

@@ -7,7 +7,7 @@ use super::super::metal_graph::{
     MetalGraphError, MetalWeightHandle,
 };
 use super::functions::gpu_profile;
-use super::types::{FullLayerBuffers, GpuKvCache};
+use super::types::{FullLayerBuffers, GpuKvCache, WeightKey, WeightKind, LEGACY_MODEL_EPOCH};
 use metal::{MTLResourceOptions, MTLSize};
 use std::sync::Arc;
 
@@ -21,10 +21,34 @@ impl MetalGraph {
         key: u64,
         data: &[f32],
     ) -> Result<Arc<MetalWeightHandle>, MetalGraphError> {
+        self.get_or_upload_f32_weight_for_epoch(LEGACY_MODEL_EPOCH, key, data)
+    }
+    /// Epoch-keyed twin of [`Self::get_or_upload_f32_weight`] (`MET-02`).
+    ///
+    /// Caches under `WeightKey::new(model_epoch, WeightKind::RawF32, slot)`,
+    /// so `release_model(model_epoch)` frees the buffer with the rest of its
+    /// model.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the upload's allocation failure, or a kind mismatch on the
+    /// slot.
+    pub fn get_or_upload_f32_weight_for_epoch(
+        &self,
+        model_epoch: u64,
+        slot: u64,
+        data: &[f32],
+    ) -> Result<Arc<MetalWeightHandle>, MetalGraphError> {
+        // SAFETY: `data` is a live `&[f32]`; viewing its storage as bytes of
+        // the same total length is valid for reads (u8 has no alignment or
+        // validity requirements) and the view does not outlive `data`.
         let byte_slice = unsafe {
             std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data))
         };
-        self.get_or_upload_weight(key, byte_slice)
+        self.get_or_upload_keyed(
+            WeightKey::new(model_epoch, WeightKind::RawF32, slot),
+            || self.upload_weight(byte_slice),
+        )
     }
     /// Acquire the full-layer buffer set, allocating if needed.
     fn acquire_full_layer_buffers(

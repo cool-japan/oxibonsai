@@ -641,6 +641,81 @@ mod int8_tier_parity {
         }
     }
 
+    /// K-INT8 wave-4b minors[1]/[2]: `gemm_two_bit_int8` used to run
+    /// single-threaded regardless of `m`, and `Int8Tier::NeonI8mm` used the
+    /// `SMMLA` 2x2 tile for GEMM, which on this M3 measured *slower* than
+    /// the plain `SDOT` row loop at every `M >= 2` — together those made
+    /// *opting in* to the INT8 tier at a real prefill batch size (27B
+    /// `ffn_up`, M=64) slower than the tiled + Rayon f32 default (326ms
+    /// `neon-i8mm` vs 98.6ms f32). This checks that gap is closed: the
+    /// opt-in path, parallelized and no longer routed through the tile, is
+    /// no longer slower than the default.
+    #[test]
+    fn int8_gemm_at_m64_is_not_slower_than_the_f32_default() {
+        use oxibonsai_kernels::dispatch::KernelDispatcher;
+        use oxibonsai_kernels::traits::PrismKernel;
+        use std::time::Instant;
+
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (m, n_rows, k) = (64usize, 17408usize, 5120usize);
+        let blocks = pq2_blocks(n_rows * (k / QK_PQ2_0), 0xC0DE_0064);
+        let input = activations(m * k, 0xFACE_0064);
+        let tier = Int8Tier::best_available();
+        let dispatcher = KernelDispatcher::auto_detect();
+
+        let mut f32_out = vec![0.0f32; m * n_rows];
+        let mut int8_out = vec![0.0f32; m * n_rows];
+
+        // Warm up both paths (page-in, branch predictors, Rayon pool).
+        dispatcher
+            .gemm_pq2_0(&blocks, &input, &mut f32_out, m, n_rows, k)
+            .expect("f32 default gemm warmup");
+        gemm_two_bit_int8(tier, &blocks, &input, &mut int8_out, m, n_rows, k)
+            .expect("int8 gemm warmup");
+
+        // Min of a few trials on each side: this dev machine runs under
+        // heavy, variable background load from sibling sessions, and a
+        // single wall-clock sample is dominated by that noise.
+        let trials = if cfg!(debug_assertions) { 1 } else { 9 };
+        let mut f32_time = std::time::Duration::MAX;
+        for _ in 0..trials {
+            let t0 = Instant::now();
+            dispatcher
+                .gemm_pq2_0(&blocks, &input, &mut f32_out, m, n_rows, k)
+                .expect("f32 default gemm");
+            f32_time = f32_time.min(t0.elapsed());
+        }
+        let mut int8_time = std::time::Duration::MAX;
+        for _ in 0..trials {
+            let t1 = Instant::now();
+            gemm_two_bit_int8(tier, &blocks, &input, &mut int8_out, m, n_rows, k)
+                .expect("int8 gemm");
+            int8_time = int8_time.min(t1.elapsed());
+        }
+
+        let ratio = f32_time.as_secs_f64() / int8_time.as_secs_f64().max(1e-12);
+        println!(
+            "int8 GEMM at M={m} ffn_up[{k}x{n_rows}] {tier}: f32-default {f32_time:?} -> \
+             int8-opt-in {int8_time:?} = {ratio:.2}x ({trials} trials each, \
+             debug_assertions={})",
+            cfg!(debug_assertions)
+        );
+
+        let cos = cosine(&f32_out, &int8_out);
+        assert!(cos >= COS_GATE, "int8 GEMM output diverged: cos {cos}");
+
+        if std::env::var("OXIBONSAI_INT8_BENCH").as_deref() == Ok("1") {
+            assert!(
+                ratio >= 0.8,
+                "opting into the INT8 tier at M=64 must not be meaningfully \
+                 slower than the tiled + Rayon f32 default any more (got \
+                 {ratio:.2}x: f32 {f32_time:?} vs int8 {int8_time:?})"
+            );
+        }
+    }
+
     /// The best f32 CPU GEMV available here: the NEON tier on AArch64, the
     /// scalar reference elsewhere.
     fn f32_gemv(

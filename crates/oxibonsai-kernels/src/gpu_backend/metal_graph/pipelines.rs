@@ -51,9 +51,10 @@ pub(crate) struct MetalPipelines {
     /// downloads the full row (993 KB/token at Bonsai 2's 248 320 vocab) just
     /// to run `top_k`/`top_p` on the CPU. Dispatched by
     /// `metal_dispatch.rs::dispatch_topk_f32`; wiring it into the engine's
-    /// sampled decode arm (`engine_greedy.rs`) is METAL-CONCURRENCY's (wave
-    /// 4), so nothing in the non-test build calls `dispatch_topk_f32` yet —
-    /// same situation as `gemm_tq2_g128_v8_tiled` above, hence
+    /// sampled decode arm (`engine_greedy.rs`, which the engine-side package
+    /// owns — the item moved there with that file in wave 4) has not landed,
+    /// so nothing in the non-test build calls `dispatch_topk_f32` yet — same
+    /// situation as `gemm_tq2_g128_v8_tiled` above, hence
     /// `#[allow(dead_code)]`. `metal_dispatch.rs`'s own tests dispatch this
     /// kernel for real and check its output against a CPU oracle.
     #[allow(dead_code)]
@@ -154,27 +155,19 @@ pub(crate) struct MetalPipelines {
     /// [`MetalPipelines::pipeline_for`] can resolve *additional* entry points
     /// on demand.
     ///
-    /// MET-10: `metal_fp8_prefill.rs`, `metal_k_quant_kernels.rs` and
-    /// `metal_q_std_kernels.rs` (not owned by this package) still compile
-    /// their own per-kernel `MTLLibrary` from source on first use — 14
-    /// separate uncached compilations. Their MSL now rides this combined,
-    /// embedded/disk-cached library too (`build_combined_msl` below), but
-    /// none of those 18 K-quant/Q-std/FP8 entry points are extracted into a
-    /// named field here: nothing in this crate calls them yet, and doing so
-    /// would add 18 fields that `-D warnings` flags as dead code until a
-    /// later package ports those three call sites over. `pipeline_for`
-    /// resolves them by name instead, against this retained library.
-    ///
-    /// Ported those three call sites are still someone else's follow-up
-    /// (see `pipeline_for`'s doc), so nothing in the non-test build reads
-    /// this field yet either — `metal_dispatch.rs`'s own tests do, hence
-    /// `#[allow(dead_code)]`.
-    #[allow(dead_code)]
+    /// MET-10: the K-quant (`metal_k_quant_kernels.rs`), standard-quant
+    /// (`metal_q_std_kernels.rs`), FP8 GEMV (`metal_fp8_kernels.rs`) and FP8
+    /// batch-prefill (`metal_fp8_prefill.rs`) families used to compile their
+    /// own per-kernel `MTLLibrary` from source on first use — 16 separate,
+    /// uncached compilations on private devices and queues. Their MSL rides
+    /// this combined, embedded/disk-cached library (`build_combined_msl`
+    /// below), and all four families now resolve their 16 entry points by
+    /// name through `pipeline_for` against this retained library instead of
+    /// growing 16 named fields here that only one family each would read.
     library: Library,
     /// Lazily-populated cache backing [`MetalPipelines::pipeline_for`], so a
     /// repeat lookup by name is an `Arc`-free pointer-retain instead of a
     /// fresh `get_function` + `new_compute_pipeline_state_with_function`.
-    #[allow(dead_code)]
     by_name: Mutex<HashMap<String, ComputePipelineState>>,
 }
 
@@ -279,15 +272,15 @@ impl MetalPipelines {
     /// embedded metallib, compiling it into a pipeline state on first request
     /// and cloning the cached state on every later one.
     ///
-    /// MET-10's escape hatch: this exists so kernel families that still
-    /// compile their own `MTLLibrary` per kernel from source —
-    /// `metal_fp8_prefill.rs`, `metal_k_quant_kernels.rs`,
-    /// `metal_q_std_kernels.rs` (not owned by this package; see the
-    /// `library` field doc) — can be ported one call site at a time onto
-    /// this shared, disk-cached, embedded metallib and the shared
-    /// `MetalGraph` device/command queue, without this struct growing an
-    /// always-dead field for every one of the 18 K-quant/Q-std/FP8 entry
-    /// points `build_combined_msl` now embeds.
+    /// MET-10: this is how the K-quant, standard-quant, FP8 GEMV and FP8
+    /// batch-prefill kernel families (`metal_k_quant_kernels.rs`,
+    /// `metal_q_std_kernels.rs`, `metal_fp8_kernels.rs`,
+    /// `metal_fp8_prefill.rs`) obtain their pipelines — against this shared,
+    /// disk-cached, embedded metallib and the shared `MetalGraph`
+    /// device/command queue, instead of compiling a private `MTLLibrary` per
+    /// kernel from source — without this struct growing a field for every
+    /// one of the 16 entry points those families use (see the `library`
+    /// field doc).
     ///
     /// Returns [`MetalGraphError::EncodingFailed`] if `name` is not a
     /// `kernel void` anywhere in the combined MSL, or if the cache mutex is
@@ -296,13 +289,6 @@ impl MetalPipelines {
     /// (`combined_msl_matches_active_kernels_exactly` in
     /// `tests/build_script_kernel_sources.rs` and the runtime entry-point
     /// verification in [`load_or_compile_library`] both guard that).
-    ///
-    /// The three call sites this exists for have not been ported yet
-    /// (someone else's follow-up), so nothing in the non-test build calls
-    /// this method — `metal_dispatch.rs`'s
-    /// `pipeline_for_resolves_and_dispatches_a_kquant_kernel_by_name` test
-    /// dispatches a real K-quant kernel through it end-to-end, hence
-    /// `#[allow(dead_code)]`, matching `gemm_tq2_g128_v8_tiled` above.
     ///
     /// Not a strict single-compile guarantee under concurrent callers: the
     /// mutex only serialises the cache read/insert, not the whole
@@ -314,7 +300,6 @@ impl MetalPipelines {
     /// this is a redundant compile on a cold name under contention, never a
     /// correctness issue; every caller still gets back a working pipeline
     /// for `name`, including the one whose insert lost the race.
-    #[allow(dead_code)]
     pub(crate) fn pipeline_for(
         &self,
         device: &Device,

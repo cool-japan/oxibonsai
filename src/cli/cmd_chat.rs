@@ -5,11 +5,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use super::model_desc;
-use super::tokenizer_backend::{self, TokenizerBackendChoice};
+use super::tokenizer_backend::TokenizerBackendChoice;
 use super::util::{
-    build_sampling_params, check_tokenizer_model_compatibility, missing_tokenizer_warning,
-    model_vocab_size, reject_penalties_with_constrained_decode, resolve_tokenizer_vocab_aware,
-    StopChecker,
+    build_sampling_params, missing_tokenizer_warning, model_vocab_size,
+    reject_penalties_with_constrained_decode, resolve_tokenizer_vocab_aware, StopChecker,
 };
 
 /// Resolved arguments for `oxibonsai chat`, merged from CLI flags and
@@ -102,16 +101,21 @@ pub(crate) fn run(args: ChatArgs) -> anyhow::Result<()> {
     // regardless of whether the tokenizer path came from auto-detection
     // or an explicit --tokenizer.
     let expected_vocab = model_vocab_size(&gguf).ok();
+    // ENGINE-SEAM: shared with `run` (GGUF-embedded tokenizer fallback).
     let tok = {
         let lookup = resolve_tokenizer_vocab_aware(tokenizer.as_deref(), &model, expected_vocab);
-        if let Some(tok_path) = lookup.found {
-            let tok = tokenizer_backend::load_tokenizer_bridge(&tok_path, tokenizer_backend)?;
-            check_tokenizer_model_compatibility(&tok, &tok_path, &gguf, allow_vocab_mismatch)?;
-            Some(tok)
-        } else {
+        let resolved = super::cmd_run::resolve_model_tokenizer(
+            tokenizer.as_deref(),
+            &lookup,
+            &gguf,
+            expected_vocab,
+            tokenizer_backend,
+            allow_vocab_mismatch,
+        )?;
+        if resolved.is_none() {
             tracing::warn!("{}", missing_tokenizer_warning(&lookup.searched));
-            None
         }
+        resolved
     };
 
     if grammar.is_some() && tok.is_none() {

@@ -20,8 +20,15 @@ fn engine_creation() {
     let engine = InferenceEngine::new(config, SamplingParams::default(), 42);
     // tiny_test()'s num_layers (2), not bonsai_8b()'s (36): the assertion
     // only needs to prove the config passed to `new` is the config
-    // `model().config()` reports back, which holds for any config.
-    assert_eq!(engine.model().config().num_layers, 2);
+    // the dense model reports back, which holds for any config.
+    let dense = engine
+        .dense_model()
+        .expect("a config-built engine holds a dense model");
+    assert_eq!(dense.config().num_layers, 2);
+    // The seam's own accessor answers the same for a dense engine.
+    assert_eq!(engine.num_layers(), 2);
+    assert!(!engine.is_hybrid());
+    assert!(engine.hybrid_model().is_none());
 }
 
 #[test]
@@ -683,7 +690,7 @@ fn greedy_gpu_eligible_reflects_the_tiebreak_gate_state() {
     let sampler = Sampler::new(greedy_params(), 42);
 
     let engine = InferenceEngine::assemble(
-        model,
+        LoadedModel::Dense(Box::new(model)),
         kernel,
         sampler,
         EosTokenSet::single(EOS_TOKEN_ID),
@@ -763,4 +770,240 @@ fn generate_streaming_records_engine_stats() {
         "generate_streaming's CPU tail must record engine stats \
          symmetrically with generate_streaming_sync's"
     );
+}
+
+// ── MET-M1: GPU weight lifecycle (eviction half + replica sharing) ─────
+
+/// A 2-layer, all-`Q1_0_g128` GGUF whose every quantized tensor carries
+/// distinct pseudo-random bits drawn from `seed`.
+///
+/// Distinct per tensor *and* per seed on purpose: the GPU backend shares
+/// byte-identical uploads, so a fixture of uniform blocks would share
+/// buffers between its own tensors and with any other test's fixture,
+/// and the sharing assertions below would measure the wrong thing.
+fn distinct_q1_gguf(seed: u64) -> Vec<u8> {
+    use oxibonsai_core::gguf::writer::{GgufWriter, MetadataWriteValue, TensorEntry, TensorType};
+
+    let (h, inter, layers, nq, nkv, hd, vocab) = (128usize, 256usize, 2usize, 4usize, 2, 32, 32);
+    let mut state = seed | 1;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut q1 = |num_weights: usize| -> Vec<u8> {
+        let mut data = Vec::with_capacity(num_weights / 128 * 18);
+        for _ in 0..num_weights / 128 {
+            let scale = 0.02 + ((next() >> 40) % 1000) as f32 * 1e-5;
+            data.extend_from_slice(&half::f16::from_f32(scale).to_le_bytes());
+            for _ in 0..2 {
+                data.extend_from_slice(&next().to_le_bytes());
+            }
+        }
+        data
+    };
+    let f32_bytes = |n: usize, value: f32| -> Vec<u8> {
+        (0..n)
+            .flat_map(|i| (value * (1.0 + 0.01 * (i % 7) as f32)).to_le_bytes())
+            .collect()
+    };
+
+    let mut w = GgufWriter::new();
+    w.add_metadata(
+        "general.architecture",
+        MetadataWriteValue::Str("qwen3".into()),
+    );
+    w.add_metadata(
+        "general.name",
+        MetadataWriteValue::Str("GpuLifecycle".into()),
+    );
+    w.add_metadata("qwen3.embedding_length", MetadataWriteValue::U32(h as u32));
+    w.add_metadata("qwen3.block_count", MetadataWriteValue::U32(layers as u32));
+    w.add_metadata(
+        "qwen3.attention.head_count",
+        MetadataWriteValue::U32(nq as u32),
+    );
+    w.add_metadata(
+        "qwen3.attention.head_count_kv",
+        MetadataWriteValue::U32(nkv as u32),
+    );
+    w.add_metadata(
+        "qwen3.feed_forward_length",
+        MetadataWriteValue::U32(inter as u32),
+    );
+    w.add_metadata("qwen3.vocab_size", MetadataWriteValue::U32(vocab as u32));
+    w.add_metadata("qwen3.context_length", MetadataWriteValue::U32(512));
+    w.add_metadata(
+        "qwen3.attention.layer_norm_rms_epsilon",
+        MetadataWriteValue::F32(1e-6),
+    );
+    w.add_metadata("qwen3.rope.freq_base", MetadataWriteValue::F32(10_000.0));
+    w.add_tensor(TensorEntry {
+        name: "token_embd.weight".into(),
+        shape: vec![h as u64, vocab as u64],
+        tensor_type: TensorType::F32,
+        data: f32_bytes(vocab * h, 0.5),
+    });
+    w.add_tensor(TensorEntry {
+        name: "output_norm.weight".into(),
+        shape: vec![h as u64],
+        tensor_type: TensorType::F32,
+        data: f32_bytes(h, 1.0),
+    });
+    w.add_tensor(TensorEntry {
+        name: "output.weight".into(),
+        shape: vec![h as u64, vocab as u64],
+        tensor_type: TensorType::Q1_0G128,
+        data: q1(vocab * h),
+    });
+    for layer in 0..layers {
+        let p = format!("blk.{layer}");
+        for (name, n) in [
+            ("attn_norm", h),
+            ("ffn_norm", h),
+            ("attn_q_norm", hd),
+            ("attn_k_norm", hd),
+        ] {
+            w.add_tensor(TensorEntry {
+                name: format!("{p}.{name}.weight"),
+                shape: vec![n as u64],
+                tensor_type: TensorType::F32,
+                data: f32_bytes(n, 1.0),
+            });
+        }
+        for (name, ne0, ne1) in [
+            ("attn_q", h, nq * hd),
+            ("attn_k", h, nkv * hd),
+            ("attn_v", h, nkv * hd),
+            ("attn_output", nq * hd, h),
+            ("ffn_gate", h, inter),
+            ("ffn_up", h, inter),
+            ("ffn_down", inter, h),
+        ] {
+            w.add_tensor(TensorEntry {
+                name: format!("{p}.{name}.weight"),
+                shape: vec![ne0 as u64, ne1 as u64],
+                tensor_type: TensorType::Q1_0G128,
+                data: q1(ne0 * ne1),
+            });
+        }
+    }
+    w.to_bytes().expect("fixture serialises")
+}
+
+/// An engine that never uploaded under an epoch of its own reports nothing
+/// and releases nothing when it drops (the `Drop` impl must be inert for
+/// every synthetic-config engine, i.e. most of this suite).
+#[test]
+fn an_engine_without_its_own_epoch_reports_and_releases_nothing() {
+    let engine = InferenceEngine::new(Qwen3Config::tiny_test(), greedy_params(), 42);
+    assert_eq!(engine.model_epoch(), UNATTRIBUTED_MODEL_EPOCH);
+    assert!(engine.gpu_upload_stats().is_empty());
+    assert_eq!(engine.gpu_weight_registrations(), 0);
+    drop(engine);
+}
+
+/// `Backend::Cpu` places nothing on the GPU even on a Metal build: the
+/// engine gets an epoch (the constructor mints one before it knows) but
+/// registers no upload under it.
+#[test]
+fn a_cpu_backend_engine_uploads_nothing() {
+    let bytes = distinct_q1_gguf(0x0C0F_FEE0_0000_0001);
+    let gguf = GgufFile::parse(&bytes).expect("fixture parses");
+    let engine =
+        InferenceEngine::from_gguf_with_backend(&gguf, greedy_params(), 42, 64, Backend::Cpu)
+            .expect("cpu engine");
+    assert_eq!(engine.backend(), Backend::Cpu);
+    #[cfg(any(feature = "metal", feature = "native-cuda"))]
+    assert_ne!(engine.kernel_tier(), KernelTier::Gpu);
+    assert!(engine.gpu_upload_stats().is_empty());
+    assert_eq!(engine.gpu_weight_registrations(), 0);
+}
+
+/// `MET-M1` end to end at the engine level: two replicas of one Q1 model
+/// share every resident buffer (the second uploads nothing), dropping one
+/// releases exactly its own epoch while its sibling keeps decoding the same
+/// tokens through the still-resident buffers, and the last release frees
+/// them (a later load uploads afresh).
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+fn replicas_share_resident_weights_and_drop_releases_only_their_own_epoch() {
+    let bytes = distinct_q1_gguf(0x0005_EED0_A11C_E001);
+    let gguf = GgufFile::parse(&bytes).expect("fixture parses");
+    let prompt = [1u32, 5, 9];
+
+    let mut first = InferenceEngine::from_gguf(&gguf, greedy_params(), 42, 64).expect("replica 1");
+    if first.kernel_tier() != KernelTier::Gpu {
+        eprintln!(
+            "capability report: replicas_share_resident_weights_and_drop_releases_only_their_own_epoch \
+             SKIPPED -- no accelerated Metal device on this host"
+        );
+        return;
+    }
+    let first_uploads = first.gpu_upload_stats();
+    assert!(
+        first_uploads.fresh_buffers > 0,
+        "a Q1 engine on the GPU tier uploads its weights: {first_uploads:?}"
+    );
+    assert_eq!(
+        first_uploads.shared_buffers, 0,
+        "every tensor of the fixture is distinct: nothing to share within one model"
+    );
+    assert_eq!(
+        first.gpu_weight_registrations(),
+        first_uploads.total_buffers()
+    );
+
+    let mut second = InferenceEngine::from_gguf(&gguf, greedy_params(), 42, 64).expect("replica 2");
+    let second_uploads = second.gpu_upload_stats();
+    assert_ne!(second.model_epoch(), first.model_epoch());
+    assert_eq!(
+        second_uploads.fresh_buffers, 0,
+        "replica 2 must reuse replica 1's resident buffers, not upload a second copy"
+    );
+    assert_eq!(second_uploads.shared_buffers, first_uploads.fresh_buffers);
+    assert_eq!(second_uploads.shared_bytes, first_uploads.fresh_bytes);
+    assert_eq!(
+        second.gpu_weight_registrations(),
+        second_uploads.total_buffers()
+    );
+
+    let from_first = first.generate(&prompt, 6).expect("replica 1 decodes");
+    let from_second = second.generate(&prompt, 6).expect("replica 2 decodes");
+    assert_eq!(from_first, from_second, "shared buffers, identical output");
+
+    let probe = KernelDispatcher::auto_detect();
+    let first_epoch = first.model_epoch();
+    drop(first);
+    assert_eq!(
+        oxibonsai_kernels::gpu_backend::model_registration_count(&probe, first_epoch),
+        0,
+        "dropping replica 1 releases its epoch"
+    );
+    assert_eq!(
+        second.gpu_weight_registrations(),
+        second_uploads.total_buffers(),
+        "and only its epoch: the sibling's registrations are untouched"
+    );
+    second.reset();
+    let survivor = second.generate(&prompt, 6).expect("the survivor decodes");
+    assert_eq!(
+        survivor, from_first,
+        "the survivor's buffers stayed resident through its sibling's release"
+    );
+
+    let second_epoch = second.model_epoch();
+    drop(second);
+    assert_eq!(
+        oxibonsai_kernels::gpu_backend::model_registration_count(&probe, second_epoch),
+        0
+    );
+
+    // The last release freed the buffers: a new load uploads afresh.
+    let third = InferenceEngine::from_gguf(&gguf, greedy_params(), 42, 64).expect("replica 3");
+    let third_uploads = third.gpu_upload_stats();
+    assert_eq!(third_uploads.fresh_buffers, first_uploads.fresh_buffers);
+    assert_eq!(third_uploads.fresh_bytes, first_uploads.fresh_bytes);
+    assert_eq!(third_uploads.shared_buffers, 0);
 }
