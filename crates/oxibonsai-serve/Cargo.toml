@@ -61,3 +61,4 @@ proptest.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
+oxibonsai-testkit.workspace = true

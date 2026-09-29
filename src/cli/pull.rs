@@ -36,7 +36,7 @@
 //! `OXIBONSAI_HF_BASE_URL` points the whole manifest at a mirror (or a local
 //! test server).
 //!
-//! Bonsai-8B (orchestrator ruling R-B8HASH): upstream re-uploaded the file
+//! Bonsai-8B: upstream re-uploaded the file
 //! (same size) after this project's legacy goldens were captured. The
 //! current upstream digest is the primary; the previously known-good digest
 //! the goldens were captured on (`scripts/checksums.sha256`) is accepted as
@@ -59,7 +59,7 @@ const HF_BASE_URL: &str = "https://huggingface.co";
 pub(crate) const MAX_STALLED_ATTEMPTS: u32 = 5;
 
 /// Which repository a manifest entry lives in — the two Bonsai 2 repos are
-/// overridable via env (wave-1 addendum); every other one is fixed.
+/// overridable via env; every other one is fixed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Repo {
     Bonsai2,
@@ -111,10 +111,10 @@ pub(crate) struct ManifestEntry {
     pub(crate) requires_hadamard: bool,
 }
 
-/// The download manifest. Sizes and digests are the upstream HuggingFace
-/// LFS objects (`orchestration/hf_sha256.txt`, cross-checked against the
-/// repository's `scripts/checksums.sha256` by
-/// `tests::pull_manifest_agrees_with_the_repo_checksums_file`).
+/// The download manifest. Sizes and digests are the upstream HuggingFace LFS
+/// objects' own SHA-256, cross-checked against the repository's
+/// `scripts/checksums.sha256` by
+/// `tests::pull_manifest_agrees_with_the_repo_checksums_file`.
 pub(crate) const MANIFEST: &[ManifestEntry] = &[
     ManifestEntry {
         name: "bonsai2-27b-ptq1_0",
@@ -190,7 +190,7 @@ pub(crate) const MANIFEST: &[ManifestEntry] = &[
         expected_arch: "qwen35",
         requires_hadamard: false,
     },
-    // Ruling R-B8HASH: current upstream object first; the digest this
+    // The current upstream object's digest is primary; the digest this
     // project's legacy goldens were captured on is a warned alternate.
     ManifestEntry {
         name: "bonsai-8b",

@@ -1,29 +1,27 @@
-//! Bonsai 2 (`qwen35` hybrid) specific CLI glue (design §5.6-§5.8, spec
-//! item 5).
+//! Bonsai 2 (`qwen35` hybrid) specific CLI glue (design §5.6-§5.8).
 //!
 //! Everything here answers "does the loaded model belong to the Bonsai 2
 //! family, and if so what must the CLI do differently":
 //!
 //! 1. [`is_qwen35_hybrid`] — model-family detection from
 //!    `general.architecture`.
-//! 2. [`default_max_seq_len`] — the default context policy (REQUIRED #8):
+//! 2. [`default_max_seq_len`] — the default context policy (design §5.6):
 //!    `BONSAI2_DEFAULT_CONTEXT` (8192) for a `qwen35` hybrid, the
 //!    model-agnostic `4096` for every other architecture.
 //! 3. [`HybridStateGeometry`] + [`check_context_budget`] +
 //!    [`validate_context_for_model`] — the RAM + model-limit context guard
-//!    (REQUIRED #8, design §5.6 / Appendix A.3). The per-token KV cost and
+//!    (design §5.6 / Appendix A.3). The per-token KV cost and
 //!    the per-sequence recurrent-state size are derived from the file's own
 //!    [`HybridConfig`] (never a hardcoded 27B constant), and the refusal
 //!    names the request, the model's own limit, the RAM-derived limit and the
 //!    resulting GiB.
 //! 4. [`default_enable_thinking`] — the `--think` default derived from the
-//!    model's chat template (spec item 5): whether the template opens its
-//!    generation prompt inside a `<think>` block when `enable_thinking` is
-//!    left undefined.
+//!    model's chat template: whether the template opens its generation
+//!    prompt inside a `<think>` block when `enable_thinking` is left
+//!    undefined.
 //! 5. [`VisionRequest`] — the §5.7 vision flags (`--mmproj`, `--image`,
 //!    `--image-max-tokens`): parsed and validated, then refused with the
-//!    typed [`NOT_YET_SUPPORTED`] error until B2-19/B2-20 land the vision
-//!    tower (orchestrator ruling R3).
+//!    typed [`NOT_YET_SUPPORTED`] error until the vision tower lands.
 //! 6. [`apply_prefill_chunk`] — `--prefill-chunk <N>`.
 //!
 //! Scope note: the context guard applies to the `qwen35` architecture. A
@@ -37,7 +35,7 @@ use oxibonsai_runtime::config::{
 };
 
 /// The stable code of every "accepted, validated, but not implemented in
-/// this release" refusal (orchestrator ruling R3).
+/// this release" refusal.
 pub(crate) const NOT_YET_SUPPORTED: &str = "NOT_YET_SUPPORTED";
 
 /// Build the typed [`NOT_YET_SUPPORTED`] error: `[NOT_YET_SUPPORTED]
@@ -54,7 +52,7 @@ pub(crate) fn is_qwen35_hybrid(arch: &str) -> bool {
 }
 
 /// The `--max-seq-len`/`--ctx` default to apply when neither the CLI flag
-/// nor `--config`'s `[model].max_seq_len` was given (REQUIRED #8): `8192`
+/// nor `--config`'s `[model].max_seq_len` was given (design §5.6): `8192`
 /// for a `qwen35` hybrid, the pre-existing model-agnostic `4096` otherwise.
 #[must_use]
 pub(crate) fn default_max_seq_len(arch: &str) -> usize {
@@ -134,7 +132,7 @@ pub(crate) fn gib(bytes: u64) -> String {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Context guard (REQUIRED #8, design §5.6 / Appendix A.3)
+// Context guard (design §5.6 / Appendix A.3)
 // ──────────────────────────────────────────────────────────────────────────
 
 /// Every input of the context guard as plain numbers, so the decision (and
@@ -271,7 +269,7 @@ pub(crate) fn validate_context_for_model(
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// `--think` default derived from the template (spec item 5)
+// `--think` default derived from the template
 // ──────────────────────────────────────────────────────────────────────────
 
 /// Whether `rendered` (a fully rendered prompt) leaves the model inside an
@@ -313,7 +311,7 @@ pub(crate) fn default_enable_thinking(template: &ResolvedChatTemplate) -> anyhow
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// §5.7 vision flags (orchestrator ruling R3)
+// §5.7 vision flags
 // ──────────────────────────────────────────────────────────────────────────
 
 /// The §5.7 vision inputs one command received.
@@ -368,7 +366,7 @@ impl VisionRequest {
             "vision input (--mmproj / --image / --image-max-tokens)",
             &format!(
                 "validated ({} image(s), budget {} tokens/image{}), but the Qwen3-VL vision \
-                 tower lands with B2-19/B2-20 (wave 6); rerun without the vision flags for \
+                 tower is not wired up yet; rerun without the vision flags for \
                  text-only inference",
                 self.images.len(),
                 self.effective_image_max_tokens(),

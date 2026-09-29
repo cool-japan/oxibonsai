@@ -5,8 +5,9 @@ use oxibonsai_core::{
 };
 use oxibonsai_kernels::dequant_prism::gemv_pq2_0;
 use oxibonsai_kernels::dispatch::KernelDispatcher;
+use oxibonsai_kernels::dispatch_int8::KERNEL_TIER_ENV;
 use oxibonsai_kernels::gemv_ptq1::gemv_ptq1_0;
-use oxibonsai_kernels::traits::TernaryKernel;
+use oxibonsai_kernels::traits::{PrismKernel, TernaryKernel};
 use oxibonsai_kernels::{cpu_kernel_tier, KernelTier};
 use std::hint::black_box;
 use std::time::Duration;
@@ -511,6 +512,118 @@ fn bench_gemv_parallel_efficiency_lm_head(c: &mut Criterion) {
     group.finish();
 }
 
+// ─── INT8 dot-product tier vs the f32 default, on `gemv_pq2_0` (K-14) ──────
+
+/// A `PQ2_0`-quantized weight matrix of `n_rows x k`, built from
+/// [`random_ternary_weights`] so its `PQ2_0` encoding is lossless (exactly
+/// representable ternary values) and comparable across shapes.
+fn make_pq2_0_blocks(n_rows: usize, k: usize) -> Vec<BlockPQ2_0> {
+    let weights = random_ternary_weights(n_rows, k);
+    BlockPQ2_0::quantize(&weights).expect("PQ2_0 quantize should succeed for a block-aligned input")
+}
+
+/// Runs `dispatcher.gemv_pq2_0` under a specific [`KERNEL_TIER_ENV`] value
+/// (or unset for the f32 default), restoring whatever the variable held
+/// before this call on the way out — this bench binary is the only reader
+/// of the variable in its own process, but leaving a stray override behind
+/// for a later group in the same run would silently change what "f32" means
+/// for it.
+///
+/// # Safety contract
+///
+/// `std::env::set_var`/`remove_var` are `unsafe fn` (edition 2024) because a
+/// concurrent `std::env::var` on ANY key can observe a torn `environ` while
+/// another thread mutates it. This bench binary's `main` (criterion's
+/// generated entry point) runs every benchmark function to completion,
+/// sequentially, on one thread before the process exits, so no other reader
+/// of the environment is ever concurrent with these calls.
+fn with_kernel_tier_env<R>(tier: Option<&str>, f: impl FnOnce() -> R) -> R {
+    let prior = std::env::var(KERNEL_TIER_ENV).ok();
+    // SAFETY: see this function's doc comment — no concurrent env reader
+    // exists in this single-threaded benchmark binary.
+    unsafe {
+        match tier {
+            Some(t) => std::env::set_var(KERNEL_TIER_ENV, t),
+            None => std::env::remove_var(KERNEL_TIER_ENV),
+        }
+    }
+    let result = f();
+    // SAFETY: same contract as above.
+    unsafe {
+        match &prior {
+            Some(p) => std::env::set_var(KERNEL_TIER_ENV, p),
+            None => std::env::remove_var(KERNEL_TIER_ENV),
+        }
+    }
+    result
+}
+
+/// K-14's criterion form: the INT8 `SDOT` dot-product tier
+/// (`OXIBONSAI_KERNEL_TIER=neon-dot`, aarch64-only — a no-op tier-selection
+/// on other architectures, so this group degenerates to f32-vs-f32 there
+/// rather than failing) against the f32 default, for `gemv_pq2_0`, through
+/// the public [`KernelDispatcher`]/[`TernaryKernel`] API only — never a
+/// direct call into `oxibonsai_kernels::dispatch_int8`'s own functions, so
+/// the bench measures what callers reach and survives internal changes to
+/// how the INT8 tier is dispatched.
+///
+/// Two shapes: the real Bonsai 2 27B `ffn_up` matrix (`[5120, 17408]`,
+/// `embedding_length` x `feed_forward_length` from the real GGUF header),
+/// and a smaller, 1.7B-scale shape (`[2048, 5504]`) for comparison — not
+/// this repository's own `Ternary-Bonsai-1.7B.gguf` (that file predates
+/// `PQ2_0`; a `PQ2_0` tensor of its exact shape does not exist on disk), a
+/// representative smaller matrix at the same order of magnitude.
+fn bench_int8_gemv_pq2_0(c: &mut Criterion) {
+    let dispatcher = KernelDispatcher::auto_detect();
+    let mut group = c.benchmark_group("int8_gemv");
+    group.sample_size(10);
+
+    for (label, n_rows, k) in [
+        ("bonsai2_27b_ffn_up", 17408usize, 5120usize),
+        ("1_7b_scale", 5504usize, 2048usize),
+    ] {
+        let blocks = make_pq2_0_blocks(n_rows, k);
+        let input = vec![0.1f32; k];
+        let mut output = vec![0.0f32; n_rows];
+        group.throughput(Throughput::Elements((n_rows * k) as u64));
+
+        group.bench_with_input(BenchmarkId::new("f32", label), &(), |b, ()| {
+            b.iter(|| {
+                with_kernel_tier_env(None, || {
+                    dispatcher
+                        .gemv_pq2_0(
+                            black_box(&blocks),
+                            black_box(&input),
+                            black_box(&mut output),
+                            n_rows,
+                            k,
+                        )
+                        .expect("gemv_pq2_0 (f32 default) should succeed");
+                });
+            });
+        });
+
+        #[cfg(target_arch = "aarch64")]
+        group.bench_with_input(BenchmarkId::new("neon-dot", label), &(), |b, ()| {
+            b.iter(|| {
+                with_kernel_tier_env(Some("neon-dot"), || {
+                    dispatcher
+                        .gemv_pq2_0(
+                            black_box(&blocks),
+                            black_box(&input),
+                            black_box(&mut output),
+                            n_rows,
+                            k,
+                        )
+                        .expect("gemv_pq2_0 (neon-dot INT8 tier) should succeed");
+                });
+            });
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_dequant_ternary,
@@ -521,5 +634,6 @@ criterion_group!(
     bench_gemv_ptq1_0_vs_ternary,
     bench_gemv_pq2_0_vs_ternary,
     bench_gemv_parallel_efficiency_lm_head,
+    bench_int8_gemv_pq2_0,
 );
 criterion_main!(benches);

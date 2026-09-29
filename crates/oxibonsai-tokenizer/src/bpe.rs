@@ -46,7 +46,7 @@ struct MergeEntry {
 /// every lookup to allocate two fresh `String`s just to build a throwaway
 /// key. The nested shape lets each level's lookup use `HashMap<String,
 /// V>::get(&str)` (`String: Borrow<str>`), so probing a pair by two `&str`
-/// slices — the hot path inside [`bpe_merge_symbols`] — is allocation-free.
+/// slices — the hot path inside `bpe_merge_symbols` — is allocation-free.
 /// `add_merge` (called only at load time, never per-encode) still pays one
 /// `to_owned()` per distinct left symbol to *insert*, which is off the hot
 /// path this finding is about.
@@ -389,7 +389,7 @@ fn next_char_boundary(text: &str, from: usize) -> usize {
 
 /// GPT-2 / ByteLevel pre-tokenization that **preserves whitespace-run
 /// structure** (tabs, newlines, carriage returns, and runs of multiple
-/// spaces), driven by [`PATTERN_GPT2_QWEN2`] through a real regex engine
+/// spaces), driven by `PATTERN_GPT2_QWEN2` through a real regex engine
 /// (`fancy-regex` — see [`pretokenize_regex`]).
 ///
 /// Used (with `Isolated` behaviour) by the HuggingFace `tokenizers`
@@ -407,7 +407,7 @@ pub fn pretokenize_gpt2(text: &str) -> Vec<String> {
     pretokenize_regex(text, compiled_pattern(PreTokenizerKind::Gpt2))
 }
 
-/// `qwen35`'s `Split` pre-tokenizer: [`PATTERN_GPT2_QWEN2`] plus `\p{M}`
+/// `qwen35`'s `Split` pre-tokenizer: `PATTERN_GPT2_QWEN2` plus `\p{M}`
 /// (combining marks) in the two letter-related alternatives — see
 /// [`PreTokenizerKind::Qwen35`].
 pub fn pretokenize_qwen35(text: &str) -> Vec<String> {
@@ -498,32 +498,52 @@ struct SymbolNode {
     alive: bool,
 }
 
-// Test-only work counter for `bpe_merge_symbols`'s merge loop (defined
-// *before* that function's own doc comment below, not between it and the
-// `fn` — a doc comment attaches to the very next item, and `thread_local!`
-// is a macro invocation rustdoc cannot attach documentation to, so putting
-// this block in between would silently detach `bpe_merge_symbols`'s real
-// doc comment and trip `-D unused-doc-comments`).
+// Merge-loop work counter for `bpe_merge_symbols` (TOK-06), defined *before*
+// that function's own doc comment below rather than between it and the `fn`:
+// a doc comment attaches to the very next item, and `thread_local!` is a
+// macro invocation rustdoc cannot attach documentation to, so a block placed
+// in between would silently detach `bpe_merge_symbols`'s doc comment and trip
+// `-D unused-doc-comments` (hence `//`, not `///`, here too).
 //
-// Incremented once per heap-pop "candidate considered" (whether ultimately
-// stale or actually applied) — a deterministic proxy for the algorithm's
-// real work that lets `bpe_merge_symbols_is_not_quadratic` assert `O(n log
-// n)` growth without an `Instant`/`Duration` wall-clock measurement, which
-// flakes on a shared machine running other agents' concurrent builds (see
-// `CONTEXT.md`; confirmed empirically once in the between-wave gate).
-// (`//`, not `///`: same rustdoc-macro-attachment reason as above.)
-#[cfg(test)]
+// The counter grows by one per heap pop inside the merge loop — every
+// candidate considered, whether it turns out stale or is actually applied —
+// a deterministic measure of the loop's real work. The complexity guards
+// (`bpe_merge_symbols_is_not_quadratic` below and
+// `tests/tokenizer_encode_complexity.rs`, which drives it through the public
+// `OxiTokenizer::encode` path) assert its growth instead of a wall-clock
+// ratio, which flakes under co-scheduled CPU load.
+//
+// Always compiled, because an integration-test binary links the ordinary
+// rlib and never sees `#[cfg(test)]` items. Production pays for it with one
+// thread-local read per `bpe_merge_symbols` call: counting is off until the
+// calling thread calls `reset_merge_work_counter` (the only function that
+// turns it on), the per-pop tally is a plain local, and it is published to
+// the thread-local counter only when counting is on. Both cells are
+// thread-local, so concurrently running tests never perturb each other's
+// counts.
 thread_local! {
+    static MERGE_WORK_COUNTING_ENABLED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
     static MERGE_WORK_COUNTER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(test)]
-fn reset_merge_work_counter() {
-    MERGE_WORK_COUNTER.with(|c| c.set(0));
+/// Turn merge-loop work counting on for the calling thread and zero its
+/// counter (TOK-06 complexity guards only).
+///
+/// This is the only function that enables counting, and counting then stays
+/// on for the rest of the thread's life, so a thread that never calls it —
+/// every production caller — never counts.
+#[doc(hidden)]
+pub fn reset_merge_work_counter() {
+    MERGE_WORK_COUNTING_ENABLED.with(|enabled| enabled.set(true));
+    MERGE_WORK_COUNTER.with(|counter| counter.set(0));
 }
 
-#[cfg(test)]
-fn merge_work_counter() -> u64 {
+/// Merge-loop heap pops counted on the calling thread since its last
+/// `reset_merge_work_counter` call; zero on a thread that never called it.
+#[doc(hidden)]
+#[must_use]
+pub fn merge_work_counter() -> u64 {
     MERGE_WORK_COUNTER.with(std::cell::Cell::get)
 }
 
@@ -600,9 +620,14 @@ fn bpe_merge_symbols(word: &str, merges: &BpeMerges) -> Vec<String> {
         push_candidate(&mut heap, &nodes, word, merges, i);
     }
 
+    // The TOK-06 work counter's one thread-local read for this call (see
+    // `MERGE_WORK_COUNTER` above); `heap_pops` is published after the loop
+    // only when the calling thread has counting enabled.
+    let counting = MERGE_WORK_COUNTING_ENABLED.with(std::cell::Cell::get);
+    let mut heap_pops: u64 = 0;
+
     while let Some(Reverse((rank, left))) = heap.pop() {
-        #[cfg(test)]
-        MERGE_WORK_COUNTER.with(|c| c.set(c.get() + 1));
+        heap_pops += 1;
 
         if !nodes[left].alive {
             continue; // Stale: `left` was already merged into another node.
@@ -645,6 +670,10 @@ fn bpe_merge_symbols(word: &str, merges: &BpeMerges) -> Vec<String> {
             push_candidate(&mut heap, &nodes, word, merges, prev);
         }
         push_candidate(&mut heap, &nodes, word, merges, left);
+    }
+
+    if counting {
+        MERGE_WORK_COUNTER.with(|counter| counter.set(counter.get() + heap_pops));
     }
 
     // Walk the surviving list left to right, materialising the final symbol
@@ -1194,17 +1223,15 @@ mod tests {
         (vocab, merges, word)
     }
 
-    /// ADDENDUM (orchestrator, 2026-09-22): the previous version of this
-    /// test used `Instant`/`Duration` wall-clock timing for its *only*
-    /// assertion and flaked once in the between-wave gate under concurrent
-    /// builds (passed in isolation in 0.00s). Replaced with a deterministic
-    /// work counter (`MERGE_WORK_COUNTER`, incremented once per heap-pop
-    /// inside `bpe_merge_symbols`'s merge loop): `O(n log n)` predicts
+    /// TOK-06 complexity guard on a deterministic work counter
+    /// (`MERGE_WORK_COUNTER`, one unit per heap pop inside
+    /// `bpe_merge_symbols`'s merge loop) rather than a wall-clock ratio,
+    /// which flakes under co-scheduled CPU load: `O(n log n)` predicts
     /// `count(4n)/count(n) -> 4` as `n` grows; `O(n^2)` predicts `16`. No
-    /// `Instant`/`Duration` anywhere in this test — it cannot flake under
-    /// concurrent load. See `bpe_merge_symbols_is_not_quadratic_wall_clock`
-    /// below for the original timing-based check, kept `#[ignore]`d as a
-    /// human-run sanity check on quiet hardware.
+    /// `Instant`/`Duration` anywhere in this test, so concurrent load cannot
+    /// move it. `bpe_merge_symbols_is_not_quadratic_wall_clock` below keeps
+    /// the timing-based form, `#[ignore]`d, as a human-run sanity check on
+    /// quiet hardware.
     #[test]
     fn bpe_merge_symbols_is_not_quadratic() {
         fn work_for(n_chars: usize) -> u64 {
@@ -1238,12 +1265,12 @@ mod tests {
     /// bpe_merge_symbols_is_not_quadratic_wall_clock`) rather than as part of
     /// the always-run gate the deterministic counter test above now covers.
     ///
-    /// Gatekeeper (waves 2+2.5 review) REQUIRED #2: the absolute-ms floor is
-    /// additionally gated on `cfg(not(debug_assertions))` — an unoptimized
-    /// debug build is measurably slower and would false-positive under a
-    /// fixed millisecond budget on exactly the kind of degraded/shared
-    /// hardware this test already tries to tolerate. The *ratio* assertion
-    /// (the real complexity guard, not what flaked) stays unconditional.
+    /// The absolute-ms floor is additionally gated on
+    /// `cfg(not(debug_assertions))` — an unoptimized debug build is
+    /// measurably slower and would false-positive under a fixed millisecond
+    /// budget on exactly the kind of degraded/shared hardware this test
+    /// already tries to tolerate. The *ratio* assertion (the real complexity
+    /// guard, not what flaked) stays unconditional.
     #[test]
     #[ignore = "wall-clock sanity check; the deterministic work-counter test \
                 above is what the gate runs"]
@@ -1319,10 +1346,10 @@ mod tests {
             let _ = bpe_encode(&piece, &vocab, &merges);
         }
         let elapsed = start.elapsed();
-        // Gatekeeper (waves 2+2.5 review) REQUIRED #2: an unoptimized debug
-        // build is measurably slower than release, so the bound is lifted
-        // (not dropped — a test with no assertion in some build profile is
-        // its own bug class, T-09) rather than gated away in debug.
+        // An unoptimized debug build is measurably slower than release, so
+        // the bound is lifted (not dropped — a test with no assertion in some
+        // build profile is its own bug class, T-09) rather than gated away in
+        // debug.
         let bound = if cfg!(debug_assertions) {
             Duration::from_secs(2)
         } else {

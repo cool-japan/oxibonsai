@@ -2,7 +2,7 @@
 //! recognized language-model architecture, and is actually runnable by
 //! this build.
 //!
-//! cli-02 / gatekeeper REQUIRED #1: `Validation: OK` used to mean only
+//! cli-02: `Validation: OK` used to mean only
 //! "`Qwen3Config::from_metadata` did not return `Err`" — which it never
 //! does (every field defaults), so a CLIP vision-projector GGUF reported
 //! `OK` with the 8B config's fabricated numbers. `OK` now requires:
@@ -12,12 +12,12 @@
 //! type in the file to have a real load path in this build (not merely a
 //! known id — see `model_desc`'s doc). A file that parses and is
 //! architecturally sound but carries a tensor type this build cannot yet
-//! execute (PQ2_0/PTQ1_0 ahead of B2-09) reports the honest interim
-//! status "parses; not runnable by this build" instead of a blanket `OK`
-//! or `FAILED`.
+//! execute (e.g. PQ2_0/PTQ1_0 before their loaders landed) reports the
+//! honest interim status "parses; not runnable by this build" instead of a
+//! blanket `OK` or `FAILED`.
 //!
-//! REQUIRED #2 (wave-4b): loadability is a function of the constructor that
-//! will actually run. A `qwen35` hybrid is `OK` only when a header-only dry
+//! Loadability is a function of the constructor that will actually run. A
+//! `qwen35` hybrid is `OK` only when a header-only dry
 //! bind of `HybridModel::from_gguf` — exactly what `run` builds — succeeds
 //! (the report then shows the layer split, ggml ids 142/143, the Hadamard
 //! contract and the per-sequence state bytes); a bind failure is `PARSES
@@ -113,8 +113,8 @@ pub(crate) fn run(model: String) -> anyhow::Result<()> {
     let type_counts = gguf.tensors.count_by_type();
     let unsupported_types = model_desc::unsupported_tensor_types(&type_counts);
 
-    // REQUIRED #2: a hybrid is judged by the dry bind of the constructor
-    // `run` uses, not by the tensor-type allowlist alone.
+    // A hybrid is judged by the dry bind of the constructor `run` uses,
+    // not by the tensor-type allowlist alone.
     let hybrid = if known_arch && failures.is_empty() && bonsai2::is_qwen35_hybrid(&arch) {
         match model_desc::hybrid_report(&gguf) {
             Ok(report) => Some(report),
@@ -142,7 +142,7 @@ pub(crate) fn run(model: String) -> anyhow::Result<()> {
     }
 
     if !unsupported_types.is_empty() {
-        // Interim wording until B2-09 lands the missing loaders (wave 3).
+        // Interim wording for tensor types with no load path yet.
         println!("Validation: PARSES (not runnable by this build)");
         println!(
             "  - tensor type(s) with no load path in this build: {} (loader lands in a future \

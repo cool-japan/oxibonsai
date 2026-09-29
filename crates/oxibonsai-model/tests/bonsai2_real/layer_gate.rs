@@ -1,5 +1,4 @@
-//! Design §8.2 **G3**, re-specified by ruling R2'' (`pkg/wave4b.rulings.md`):
-//! "f64-reference self-consistency of our hybrid forward on the real 27B at
+//! Design §8.2 **G3**: "f64-reference self-consistency of our hybrid forward on the real 27B at
 //! layers 0, 3, 7, 31, 63 (cos >= 0.99999 f32 vs f64 on the same weights)".
 //!
 //! The fork has no per-layer activation dump to compare against (its build
@@ -24,7 +23,7 @@
 //!   worst layer sits at 2.7e-7 of its activation scale, every cosine
 //!   rounds to 1.000000000).
 //!
-//! Memory (ruling R3): the model is mmapped and never widened to `f32`
+//! Memory: the model is mmapped and never widened to `f32`
 //! weights; the `f64` reference dequantizes one weight row at a time. The
 //! measured run peaks at a 380 MB process footprint (7.2 GB resident, all
 //! of it the shared file mapping).
@@ -34,8 +33,9 @@
 //! would otherwise be indistinguishable from an arithmetic error.
 //!
 //! The reference itself is validated first, on the synthetic fixture, by
-//! chaining it through every layer and matching B2-16's independent `f64`
-//! model (`hybrid_f64_layer_reference_matches_the_fixture_bonsai2`).
+//! chaining it through every layer and matching the fixture's own
+//! independent `f64` model
+//! (`hybrid_f64_layer_reference_matches_the_fixture_bonsai2`).
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -48,18 +48,18 @@ use oxibonsai_model::hybrid::model::{HybridModel, KvPrecision};
 use crate::f64_layer::{self, agreement, Fold, Weights};
 use crate::harness::{
     golden_dir, locate_model, parse_golden_steps, parse_prompt_tokens, read_golden,
-    real_model_serial, record_capability, PQ2_ENV, PQ2_FILE,
+    real_model_serial, record_capability_timed, PQ2_ENV, PQ2_FILE,
 };
 use crate::hybrid_gguf::{all_variant_specs, build};
 
-/// Ruling R2'': the per-layer activation cosine, f32 vs f64.
+/// G3's per-layer activation cosine floor, f32 vs f64.
 const G3_COS_MIN: f64 = 0.99999;
 
 /// Floor on the cosine of a layer's contribution (`output - input`).
 const G3_DELTA_COS_MIN: f64 = 0.9999;
 
 /// Band on `max |f32 - f64|`, relative to the layer's largest reference
-/// activation — the documented max-abs band of ruling R2''.
+/// activation — G3's documented max-abs band.
 ///
 /// Measured on the real `PQ2_0` 27B (12 teacher-forced positions of
 /// prompt 1, this box's NEON kernels):
@@ -98,7 +98,8 @@ fn to_f32_rows(flat: &[f32], hidden: usize) -> Vec<Vec<f32>> {
     flat.chunks_exact(hidden).map(<[f32]>::to_vec).collect()
 }
 
-/// The reference, validated against B2-16's independent f64 model: chained
+/// The reference, validated against the fixture's own independent f64
+/// model: chained
 /// from the embedding through every layer of the folded, grouped `PQ2_0`
 /// fixture (and its unfolded twin), it must reproduce that model's final
 /// residual stream; and fed the production path's per-layer inputs, it
@@ -142,8 +143,8 @@ fn hybrid_f64_layer_reference_matches_the_fixture_bonsai2() {
             let rel = (num / den.max(f64::MIN_POSITIVE)).sqrt();
             assert!(
                 rel <= 1e-9,
-                "{spec:?} token {t}: the f64 layer reference disagrees with B2-16's f64 \
-                 model (relative L2 {rel:.3e})"
+                "{spec:?} token {t}: the f64 layer reference disagrees with the fixture's own \
+                 f64 model (relative L2 {rel:.3e})"
             );
         }
 
@@ -178,7 +179,7 @@ fn hybrid_f64_layer_reference_matches_the_fixture_bonsai2() {
     }
 }
 
-/// G3 on the real `PQ2_0` 27B (ruling R2'').
+/// G3 on the real `PQ2_0` 27B.
 #[test]
 fn hybrid_real_27b_layers_match_the_f64_reference_bonsai2() {
     const TEST: &str = "oxibonsai-model::hybrid_forward_parity_tests::\
@@ -186,6 +187,7 @@ fn hybrid_real_27b_layers_match_the_f64_reference_bonsai2() {
     let Some(path) = locate_model(PQ2_ENV, PQ2_FILE, TEST) else {
         return;
     };
+    let gate_start = Instant::now();
     let _one_real_model_at_a_time = real_model_serial();
     let mmap = mmap_gguf_file(&path).unwrap_or_else(|e| panic!("mmap {}: {e}", path.display()));
     let gguf = GgufFile::parse(&mmap).expect("27B PQ2_0 GGUF parses");
@@ -265,5 +267,5 @@ fn hybrid_real_27b_layers_match_the_f64_reference_bonsai2() {
         }
     }
     assert!(failures.is_empty(), "G3:\n{}", failures.join("\n"));
-    record_capability(true, TEST);
+    record_capability_timed(true, TEST, Some(gate_start.elapsed()));
 }

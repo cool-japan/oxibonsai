@@ -604,14 +604,31 @@ fn truncate_ranked_to_top_p(buf: &mut Vec<(usize, f32)>, top_p: f32) {
 /// This is `sample_core`'s final fallback for the residual
 /// floating-point-rounding case where the weighted-selection loop's
 /// cumulative sum falls just short of `rand_val` on the very last element.
-/// It deliberately does *not* assume `buf` is sorted by probability — when
-/// top-p filtering is skipped (`top_p == 1.0`), `buf` is left in
-/// top-k/insertion order, so its first element is not necessarily the most
-/// likely one — nor that it is non-empty: the `top_k < len` guard in
-/// `sample_core` means it always is today, but returning an error rather
-/// than indexing keeps this safe even if that invariant is ever broken by a
-/// future refactor, and is preferable to silently returning token id `0`,
-/// which a caller could mistake for a real (if unlikely) choice.
+/// `buf` is `sample_core`'s `probs_buf` at that point:
+///
+/// * with top-k enabled (`top_k > 0`), it is in `canonical_rank` order
+///   (non-increasing probability, ties broken by index) —
+///   `select_nth_unstable_by` + `sort_unstable_by(canonical_rank)` put it
+///   there, and `truncate_to_min_p` / `truncate_ranked_to_top_p` only ever
+///   `retain`/prefix-truncate it afterwards, never reorder it — so its
+///   first element genuinely is the most likely one;
+/// * with top-k disabled, `buf` stays in the logits' original index order
+///   (the windowed top-p path never sorts it), so its first element is not
+///   necessarily the most likely one.
+///
+/// This function deliberately does *not* assume either shape and searches
+/// the whole buffer, so it is correct either way. It also does not assume
+/// `buf` is non-empty by construction here — though it always is by this
+/// point: `sample_core` returns before this path for empty `logits`, top-k
+/// (when enabled) always keeps at least `top_k.min(logits.len()) >= 1`
+/// entries, and both `truncate_to_min_p` and
+/// `truncate_ranked_to_top_p`/`truncate_to_top_p` guarantee at least one
+/// surviving candidate (each is a no-op at `buf.len() <= 1`, and each keeps
+/// at least the single highest-probability entry otherwise). Returning an
+/// error rather than indexing keeps this safe even if that chain of
+/// invariants is ever broken by a future refactor, and is preferable to
+/// silently returning token id `0`, which a caller could mistake for a real
+/// (if unlikely) choice.
 fn pick_highest_probability(buf: &[(usize, f32)]) -> RuntimeResult<u32> {
     buf.iter()
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal))
@@ -1114,7 +1131,7 @@ mod tests {
     #[test]
     fn pick_highest_probability_finds_max_regardless_of_order() {
         // Deliberately unsorted and not starting at index 0 — exercises the
-        // `top_p == 1.0` case where `probs_buf` is left in top-k/insertion
+        // top-k-disabled case where `probs_buf` is left in index (insertion)
         // order, which the previous `probs_buf[0]` fallback got wrong.
         let buf = vec![(3usize, 0.1f32), (1, 0.6), (0, 0.3)];
         let idx = pick_highest_probability(&buf).expect("non-empty buffer must succeed");

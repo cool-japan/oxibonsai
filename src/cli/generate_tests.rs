@@ -204,17 +204,15 @@ fn without_a_tokenizer_the_printer_counts_raw_ids() {
     assert_eq!(printer.finish(None), (None, String::new()));
 }
 
-// ── The CLI-owned sampler (min-p) ───────────────────────────────────────────
-
-#[test]
-fn only_a_sampled_request_with_min_p_needs_the_cli_sampler() {
-    assert!(!needs_cli_sampler(0.0, 0.1), "greedy ignores min-p");
-    assert!(
-        !needs_cli_sampler(0.7, 0.0),
-        "min-p 0 is the engine's own sampler"
-    );
-    assert!(needs_cli_sampler(0.7, 0.05));
-}
+// ── The CLI's own sampler (grammar / `--stop` path only) ────────────────────
+//
+// `only_a_sampled_request_with_min_p_needs_the_cli_sampler` tested
+// `needs_cli_sampler`, retired along with the CLI-owned min-p decode loop it
+// gated: the engine's own decode path applies `min_p` directly now,
+// proven token-for-token identical by
+// `cmd_run_tests::min_p_engine_path_matches_the_cli_loop`). `cli_sampler`
+// itself stays (the grammar/`--stop` path still builds its plain sampler
+// from it), so its own tests below are unchanged.
 
 fn unfiltered_params(temperature: f32) -> SamplingParams {
     SamplingParams {

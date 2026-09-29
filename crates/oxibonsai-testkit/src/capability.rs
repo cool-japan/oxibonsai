@@ -5,9 +5,9 @@
 //! "fixture file missing" simply `return`ed early from inside the test body,
 //! which a passing `cargo nextest` exit code cannot distinguish from the test
 //! having actually validated the capability it claims to. This module is the
-//! *producer* half of the fix; `scripts/release-gate.sh` (owned by CI-GATE,
-//! not this package) is the *consumer* half that fails the release gate when
-//! a required capability has zero fresh `executed: true` evidence.
+//! *producer* half of the fix; `scripts/release-gate.sh` is the *consumer*
+//! half that fails the release gate when a required capability has zero
+//! fresh `executed: true` evidence.
 //!
 //! # The contract (read `scripts/release-gate.sh`'s header before changing this file)
 //!
@@ -22,13 +22,18 @@
 //! syscall of one complete, newline-terminated line.
 //!
 //! Each line: `{"capability": "metal", "executed": true, "test":
-//! "oxibonsai-kernels::metal_k_quant_gemv_parity::metal_gemv_q2k_matches_scalar"}`.
-//! `executed: false` means the test body actually reached and took the
-//! self-skip path (hardware/fixture absent) — it must still write a record,
-//! so an all-skipped run is visibly distinct in the manifest from a manifest
-//! that is simply missing (meaning no producer test uses this contract yet).
+//! "oxibonsai-kernels::metal_k_quant_gemv_parity::metal_gemv_q2k_matches_scalar"}`,
+//! optionally with a trailing `"duration_ms": <integer>` ([`record_timed`] /
+//! [`record_executed_timed`]) — the record's own measured wall-clock cost,
+//! omitted entirely (not `null`) by every call site that has not opted into
+//! measuring it, so an older or unmeasured record stays exactly the shape
+//! above. `executed: false` means the test body actually reached and took
+//! the self-skip path (hardware/fixture absent) — it must still write a
+//! record, so an all-skipped run is visibly distinct in the manifest from a
+//! manifest that is simply missing (meaning no producer test uses this
+//! contract yet).
 //!
-//! # THE INVARIANT (FIX3-PARITY item 2, wave-1 addendum (1)(b))
+//! # THE INVARIANT
 //!
 //! **`executed: true` means the work the record names has already finished in
 //! this process — never merely that the hardware or fixture it needs was
@@ -43,12 +48,31 @@
 //!
 //! # Cross-crate wiring
 //!
-//! This is the canonical implementation, and since wave 3 it is also the only
-//! one: `oxibonsai-testkit` is a real workspace member (root `Cargo.toml`'s
-//! `[workspace] members`) taken as a `[dev-dependencies]` entry by every
-//! producer crate, and the byte-for-byte inline copies of
-//! [`record`]/[`report_path`] that the producer test files used to carry are
-//! deleted in favour of `oxibonsai_testkit::capability::…` calls.
+//! This is the canonical implementation: `oxibonsai-testkit` is a real
+//! workspace member (root `Cargo.toml`'s `[workspace] members`) taken as a
+//! `[dev-dependencies]` entry by every producer crate, so no producer test
+//! file carries its own inline copy of [`record`]/[`report_path`].
+//!
+//! # The `test` field's naming scheme
+//!
+//! Every record's `test` field is `<cargo package>::<test target>::<fn>`:
+//! `<cargo package>` is the crate name as `cargo test -p` spells it (e.g.
+//! `oxibonsai-model`, `oxibonsai-runtime`, `oxibonsai-cli`); `<test target>`
+//! is the integration-test binary's own file stem (e.g.
+//! `hybrid_forward_parity_tests`, `bonsai2_engine_tests`) for a case that
+//! lives under a crate's `tests/` directory, `lib` for a `#[test]` inside a
+//! library crate's own `src/` (reached via `cargo test --lib`), or `bin` for
+//! one inside a binary crate's `src/main.rs` (`cargo test --bin <name>`);
+//! `<fn>` is the test function's own **bare name only** — never the `mod`
+//! path nextest would print ahead of it for a test pulled in via `#[path]
+//! mod …;` (e.g. a case in `bonsai2_real/greedy_gates.rs`, wired into
+//! `hybrid_forward_parity_tests.rs` as `mod greedy_gates;`, nextest lists as
+//! `greedy_gates::hybrid_real_27b_pq2_0_…`, but records here as
+//! `oxibonsai-model::hybrid_forward_parity_tests::hybrid_real_27b_pq2_0_…`
+//! — no `greedy_gates::` segment). Every producer in this workspace follows
+//! the bare-name form, confirmed against this project's own real-27B
+//! capability manifest; `scripts/release-gate.sh`'s `--require-tests` names
+//! are written the same way, and a `mod`-qualified name would never match.
 
 use std::fs::OpenOptions;
 use std::io::Write as _;
@@ -75,8 +99,8 @@ pub enum Capability {
     /// The image crate's parity-GGUF fixture / real-model file is present.
     ImageParity,
     /// The real, multi-GB legacy model GGUFs (+ tokenizer) are present under
-    /// `models/` (verifier wave 3, MINOR "CAPABILITY-NAME OVERLOAD"): this is
-    /// about *model-file* presence, not Metal/CUDA hardware. The two
+    /// `models/`: this is about *model-file* presence, not Metal/CUDA
+    /// hardware. The two
     /// `legacy_parity_tests.rs` files (model + runtime) used to record their
     /// missing-model self-skip under [`Self::Metal`], which is always
     /// already satisfied elsewhere on any Metal host (e.g.
@@ -92,11 +116,10 @@ pub enum Capability {
     /// and deliberately a distinct name for the same reason: any Metal host
     /// already satisfies [`Self::Metal`] regardless of whether these specific
     /// 27B gates ever ran, so `REQUIRED_CAPS` needs its own name to gate on
-    /// them. HANDOVER-INFRA (B2-11-FIX deviation\[7\] / ENGINE-SEAM deviation
-    /// \[7\]): this replaces the hand-written `"bonsai2-models"` JSONL record
-    /// `crates/oxibonsai-model/tests/bonsai2_real/harness.rs::record_capability`
-    /// and `crates/oxibonsai-runtime/tests/bonsai2_engine_tests.rs` used to
-    /// write directly, before this variant existed.
+    /// them. `crates/oxibonsai-model/tests/bonsai2_real/harness.rs` and
+    /// `crates/oxibonsai-runtime/tests/bonsai2_engine_tests.rs` both record
+    /// through this variant rather than writing the `"bonsai2-models"` JSONL
+    /// line by hand.
     Bonsai2Models,
 }
 
@@ -122,13 +145,21 @@ impl std::fmt::Display for Capability {
     }
 }
 
-/// One JSONL record, matching `scripts/release-gate.sh`'s documented schema
-/// exactly (field names and order are part of the contract).
+/// One JSONL record, matching `scripts/release-gate.sh`'s documented schema.
+/// `capability`/`executed`/`test` are the original, required fields (field
+/// names and order are part of the contract); `duration_ms` is a later,
+/// OPTIONAL addition (`skip_serializing_if`, so a record written by this
+/// exact shape is byte-identical to the pre-`duration_ms` format when no
+/// duration is given) — a record's own measured wall-clock cost, for a
+/// human reading the manifest to see which real-model gates dominate a
+/// release-gate run without re-running it under a stopwatch.
 #[derive(Debug, Clone, Serialize)]
 struct CapabilityRecord<'a> {
     capability: &'a str,
     executed: bool,
     test: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<u64>,
 }
 
 /// Resolve the capability-manifest path per the contract in
@@ -173,11 +204,18 @@ pub fn report_path() -> PathBuf {
 /// Never panics: a producer test's pass/fail must depend on the capability
 /// it exercises, not on this bookkeeping write, so an I/O error here is
 /// logged to stderr and swallowed rather than propagated.
-fn record_at(path: &Path, capability: Capability, executed: bool, test_name: &str) {
+fn record_at(
+    path: &Path,
+    capability: Capability,
+    executed: bool,
+    test_name: &str,
+    duration_ms: Option<u64>,
+) {
     let record = CapabilityRecord {
         capability: capability.as_str(),
         executed,
         test: test_name,
+        duration_ms,
     };
     let line = match serde_json::to_string(&record) {
         Ok(s) => s,
@@ -201,7 +239,7 @@ fn record_at(path: &Path, capability: Capability, executed: bool, test_name: &st
             return;
         }
     };
-    // RELEASE-BLOCKING FIX (verifier, wave 3): `writeln!(file, "{line}")` on a
+    // `writeln!(file, "{line}")` on a
     // `std::fs::File` performs TWO separate `write(2)` syscalls (the payload,
     // then `"\n"`). Concurrent `nextest` processes/threads all appending to
     // the same manifest can then interleave mid-record, producing malformed
@@ -237,7 +275,29 @@ fn record_at(path: &Path, capability: Capability, executed: bool, test_name: &st
 /// `test_name` should be the fully-qualified test name, e.g.
 /// `"oxibonsai-kernels::metal_k_quant_gemv_parity::metal_gemv_q2k_matches_scalar"`.
 pub fn record(capability: Capability, executed: bool, test_name: &str) {
-    record_at(&report_path(), capability, executed, test_name);
+    record_at(&report_path(), capability, executed, test_name, None);
+}
+
+/// [`record`], additionally attaching `duration` (rounded to the
+/// millisecond) as the record's `duration_ms` field — the wall-clock cost
+/// of the work this record names, so a human reading the manifest sees
+/// which real-model gates dominate a release-gate run without re-running it
+/// under a stopwatch. Every call site that already used [`record`] keeps
+/// compiling unchanged (this is a new, additive function, not a signature
+/// change to the existing ones), so this is opt-in per call site.
+pub fn record_timed(
+    capability: Capability,
+    executed: bool,
+    test_name: &str,
+    duration: std::time::Duration,
+) {
+    record_at(
+        &report_path(),
+        capability,
+        executed,
+        test_name,
+        Some(duration.as_millis().min(u128::from(u64::MAX)) as u64),
+    );
 }
 
 /// Record that `test_name` **actually exercised** `capability` this run.
@@ -262,6 +322,35 @@ pub fn record(capability: Capability, executed: bool, test_name: &str) {
 /// ```
 pub fn record_executed(capability: Capability, test_name: &str) {
     record(capability, true, test_name);
+}
+
+/// [`record_executed`], additionally attaching `duration` as the record's
+/// `duration_ms` field (see [`record_timed`]). For a real-model gate whose
+/// own wall-clock cost is worth surfacing in the capability report without
+/// re-running it under a stopwatch — measure from just before the real work
+/// starts (after locating/loading a required fixture, not before) to the
+/// call site itself.
+///
+/// ```no_run
+/// // `no_run`: see `record_executed`'s own example — a doctest must never
+/// // append to the real capability manifest.
+/// use std::time::Instant;
+///
+/// use oxibonsai_testkit::capability::{record_executed_timed, Capability};
+///
+/// fn parity_gate() {
+///     let start = Instant::now();
+///     // ... every assertion the capability's evidence consists of ...
+///     record_executed_timed(Capability::Metal, "mycrate::myfile::parity_gate", start.elapsed());
+/// }
+/// # parity_gate();
+/// ```
+pub fn record_executed_timed(
+    capability: Capability,
+    test_name: &str,
+    duration: std::time::Duration,
+) {
+    record_timed(capability, true, test_name, duration);
 }
 
 /// Record that `test_name` **self-skipped**: the hardware or fixture
@@ -313,10 +402,10 @@ mod tests {
         p
     }
 
-    /// Enforces the invariant the RELEASE-BLOCKING fix restored (verifier,
-    /// wave 3): many threads appending to the SAME manifest path concurrently
-    /// must never interleave mid-record. Before the `write_all`-of-one-buffer
-    /// fix, `writeln!`'s two separate `write(2)` syscalls made this flaky —
+    /// Enforces the invariant that many threads appending to the SAME
+    /// manifest path concurrently must never interleave mid-record. Before
+    /// the `write_all`-of-one-buffer fix, `writeln!`'s two separate
+    /// `write(2)` syscalls made this flaky —
     /// reproduced empirically (30 valid / 3 malformed / 3 blank lines from a
     /// single real test binary's parallel threads). 64 threads x 20 records
     /// each is intentionally far more contention than any real `nextest`
@@ -338,6 +427,7 @@ mod tests {
                             Capability::Metal,
                             i % 2 == 0,
                             &format!("thread-{t}-record-{i}"),
+                            None,
                         );
                     }
                 });
@@ -370,8 +460,8 @@ mod tests {
     #[test]
     fn record_appends_one_jsonl_line_per_call() {
         let path = unique_temp_path("append");
-        record_at(&path, Capability::Metal, true, "crate::file::test_a");
-        record_at(&path, Capability::Cuda, false, "crate::file::test_b");
+        record_at(&path, Capability::Metal, true, "crate::file::test_a", None);
+        record_at(&path, Capability::Cuda, false, "crate::file::test_b", None);
 
         let contents = std::fs::read_to_string(&path).expect("read manifest");
         let lines: Vec<&str> = contents.lines().collect();
@@ -395,12 +485,73 @@ mod tests {
     }
 
     #[test]
+    fn duration_ms_is_omitted_when_not_given_and_present_when_given() {
+        let path = unique_temp_path("duration-ms");
+        record_at(
+            &path,
+            Capability::Metal,
+            true,
+            "crate::file::no_duration",
+            None,
+        );
+        record_at(
+            &path,
+            Capability::Metal,
+            true,
+            "crate::file::with_duration",
+            Some(1234),
+        );
+
+        let contents = std::fs::read_to_string(&path).expect("read manifest");
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2);
+
+        // `None` must OMIT the field entirely (not serialize it as `null`),
+        // so a record written without a duration stays byte-identical to
+        // the pre-`duration_ms` schema.
+        assert!(
+            !lines[0].contains("duration_ms"),
+            "a record with no duration must not mention duration_ms at all: {:?}",
+            lines[0]
+        );
+        let first: serde_json::Value = serde_json::from_str(lines[0]).expect("line 1 valid json");
+        assert!(first.get("duration_ms").is_none());
+
+        let second: serde_json::Value = serde_json::from_str(lines[1]).expect("line 2 valid json");
+        assert_eq!(second["duration_ms"], 1234);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn record_executed_timed_writes_a_millisecond_duration() {
+        let path = unique_temp_path("record-executed-timed");
+        // `report_path()` cannot be redirected from inside this test (it is
+        // an env-var-driven free function, not parametrised), so this
+        // exercises `record_timed` — the same code `record_executed_timed`
+        // calls with `executed = true` — directly against a scratch path,
+        // matching this file's other `record_at`-level tests.
+        record_at(
+            &path,
+            Capability::Metal,
+            true,
+            "crate::file::timed",
+            Some(std::time::Duration::from_millis(42).as_millis() as u64),
+        );
+        let contents = std::fs::read_to_string(&path).expect("read manifest");
+        let record: serde_json::Value =
+            serde_json::from_str(contents.lines().next().expect("one line")).expect("valid json");
+        assert_eq!(record["duration_ms"], 42);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn record_creates_missing_parent_directories() {
         let mut path = unique_temp_path("nested-dir");
         path.push("a");
         path.push("b");
         path.push("capability-report.json");
-        record_at(&path, Capability::ImageParity, true, "t");
+        record_at(&path, Capability::ImageParity, true, "t", None);
         assert!(path.exists(), "record_at must create {path:?}'s parents");
         // Clean up the whole unique subtree, not just the leaf file.
         let root = path
@@ -460,9 +611,8 @@ mod tests {
     }
 
     /// The [`record_executed`]/[`record_skipped`] pair must be exactly
-    /// [`record`] with the flag spelled out — nothing about the on-disk
-    /// format changes, which is the constraint FIX3-PARITY item 2 works
-    /// under ("do not change the on-disk manifest format").
+    /// [`record`] with the flag spelled out — neither changes the on-disk
+    /// manifest format.
     #[test]
     fn record_executed_and_record_skipped_write_the_documented_flag() {
         let _guard = ENV_LOCK
@@ -510,7 +660,7 @@ mod tests {
         );
     }
 
-    /// HANDOVER-INFRA spec item 1: `Capability::Bonsai2Models` must write the
+    /// `Capability::Bonsai2Models` must write the
     /// same documented JSONL schema [`record_executed`]/[`record_skipped`]
     /// write for every other capability — this is the dedicated test for the
     /// new variant (distinct from

@@ -121,9 +121,12 @@ pub const fn full_layer_count() -> usize {
 }
 
 /// A round-to-nearest-even `f32 -> bf16` encode, matching
-/// `engine_seam_tests.rs::bf16_tensor`'s bit manipulation exactly: `bf16` is
-/// simply the top 16 bits of an IEEE-754 `f32`, rounded rather than
-/// truncated.
+/// [`oxibonsai_core::bf16::f32_to_bf16`] — the **core** crate's own BF16
+/// packer, per this module's doc — for every non-NaN input, bit for bit:
+/// `bf16` is simply the top 16 bits of an IEEE-754 `f32`, rounded rather
+/// than truncated. (Core canonicalises a NaN input to the quiet-NaN pattern
+/// `0x7FC0` instead of rounding its payload bits; this fixture never
+/// encodes NaN, so that one divergence never applies here.)
 fn f32_to_bf16_bits(v: f32) -> u16 {
     let bits = v.to_bits();
     let rounded = ((bits >> 16) & 1).wrapping_add(0x7fff).wrapping_add(bits);

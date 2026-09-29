@@ -900,10 +900,12 @@ pub struct RouterOptions {
     /// The real, model-backed embedder behind `/v1/embeddings` (`RT-08`).
     ///
     /// `Some` → the endpoint serves mean-pooled hidden states of the loaded
-    /// model; `None` (the default) → it is served by
-    /// [`Self::embeddings_registry`] when one is configured, and otherwise
-    /// answers the honest `501` (no model-backed embedder was configured;
-    /// [`Self::embedder_unavailable`] says why in the body).
+    /// model — a dense model and a hybrid (`qwen35`) one are embedded the
+    /// same way, through `InferenceEngine::embed`; `None` (the default) →
+    /// it is served by [`Self::embeddings_registry`] when one is
+    /// configured, and otherwise answers the honest `501` (no model-backed
+    /// embedder was configured; [`Self::embedder_unavailable`] says why in
+    /// the body).
     pub embedder: Option<Arc<crate::embed_engine::ModelEmbedder>>,
     /// A caller-configured [`crate::embeddings::EmbedderRegistry`] serving
     /// `/v1/embeddings` in place of the default model-only registry (e.g. a
@@ -978,7 +980,9 @@ impl RouterOptions {
     /// Record why this server has no model-backed embedder, so the
     /// `/v1/embeddings` `501` body names it: `error.message` becomes
     /// `"<the standard text>: <message>"` and `error.code` becomes `code`
-    /// (e.g. an engine refusal's `"NOT_A_DENSE_MODEL"`), or
+    /// when the caller supplies one (e.g. a typed engine refusal's own
+    /// error code — dense and hybrid models are both embedded today, so
+    /// this is no longer `NOT_A_DENSE_MODEL` in practice), or
     /// `"embeddings_unavailable"` when `code` is `None`.
     pub fn with_embedder_unavailable(
         mut self,

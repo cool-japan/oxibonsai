@@ -140,8 +140,34 @@ fn a_latest_message_that_cannot_fit_alone_is_refused() {
         Ok(_) => panic!("cannot fit in 16 tokens"),
         Err(e) => e.to_string(),
     };
-    assert!(err.contains("too long for the context window"), "{err}");
-    assert!(err.contains("--ctx is 16"), "{err}");
+    assert!(err.contains("exceeds max context 16"), "{err}");
+    assert!(err.contains("this message alone does not fit"), "{err}");
+}
+
+/// When the prompt itself fits but
+/// nothing is left to drop and the requested `--max-tokens` would still
+/// carry it past `--ctx`, the turn is NOT refused — the budget is clamped
+/// to exactly what remains and generation proceeds (a graceful "context
+/// window full" stop, not a crash).
+#[test]
+fn a_fitting_prompt_with_no_room_to_drop_clamps_the_budget_instead_of_erroring() {
+    let tok = tokenizer_with_thinking_template();
+    let template = tok.resolved_chat_template();
+    let contract = ChatContract::default();
+    let mut history = vec![RenderMessage::new("user", "Hi")];
+    let prompt_len = {
+        let rendered = generate::render_prompt(&template, &history, &contract).expect("render");
+        tok.encode(&rendered).expect("encode").len()
+    };
+    let max_context = prompt_len + 3;
+    let turn = render_turn(&tok, &template, &mut history, &contract, 50, max_context)
+        .expect("the prompt itself fits; this must not be an error");
+    assert_eq!(turn.dropped_messages, 0, "nothing WAS droppable");
+    assert_eq!(
+        turn.effective_max_tokens, 3,
+        "clamped to exactly what remains of the context"
+    );
+    assert_eq!(history.len(), 1, "the sole message is kept, never dropped");
 }
 
 // ── golden2/apply_template.json: all 5 cases byte-identical (B2-13 G7) ──────

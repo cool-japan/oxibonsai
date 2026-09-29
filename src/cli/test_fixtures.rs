@@ -126,6 +126,24 @@ pub(crate) fn byte_level_tokenizer_json() -> String {
 #[cfg(feature = "server")]
 pub(crate) const BYTE_LEVEL_VOCAB: u64 = 262;
 
+/// A minimal, byte-level-shaped `tokenizer.json` of exactly `n` plain vocab
+/// entries and no added tokens — for a TOK-08 vocabulary-mismatch fixture
+/// that needs a size other than [`BYTE_LEVEL_VOCAB`] (that constant's own
+/// [`byte_level_tokenizer_json`] is a fixed size).
+#[cfg(feature = "server")]
+pub(crate) fn tokenizer_json_with_vocab(n: u64) -> String {
+    let mut vocab = serde_json::Map::new();
+    for id in 0..n {
+        vocab.insert(format!("t{id}"), serde_json::Value::from(id));
+    }
+    serde_json::json!({
+        "model": { "type": "BPE", "vocab": vocab, "merges": [] },
+        "pre_tokenizer": { "type": "ByteLevel" },
+        "decoder": { "type": "ByteLevel" }
+    })
+    .to_string()
+}
+
 /// A metadata+tensor GGUF a tokenizer can be checked against: `qwen3`
 /// architecture, a `token_embd.weight` of `vocab` rows (so
 /// `model_vocab_size` resolves), optionally a `tokenizer.chat_template` and
@@ -388,13 +406,44 @@ pub(crate) fn real_model_lock() -> std::sync::MutexGuard<'static, ()> {
 
 /// A minimal `tracing` subscriber that records every event as
 /// `"field=value ..."` text, so a test can assert that a code path logged
-/// what it promises (e.g. the hybrid-embeddings 501 info line) without a
-/// `tracing-subscriber` dependency. Install it with
-/// `tracing::subscriber::with_default` around synchronous code.
+/// what it promises, without a `tracing-subscriber` dependency. Install a
+/// fresh `CapturedEvents::default()` with `tracing::subscriber::with_default`
+/// around the synchronous code under test, while holding
+/// [`tracing_capture_lock`] for the whole test -- see that function's doc
+/// for why the lock is not optional. A global install
+/// (`tracing::subscriber::set_global_default`) would capture every
+/// concurrent test's events, not just this scope's own.
 #[cfg(feature = "server")]
 #[derive(Clone, Default)]
 pub(crate) struct CapturedEvents {
     events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+/// Process-wide serialization for a test that asserts on [`CapturedEvents`]
+/// counts, AND for every sibling test in the same module that reaches the
+/// same `tracing::info!`/`warn!` call sites (in this file, every test in
+/// `serving_tokenizer_tests`) -- all of them hold this for their whole body,
+/// not only the one that captures.
+///
+/// A call site's interest (`tracing_core`'s `DefaultCallsite`) is one
+/// process-wide value, set at first registration. While only one
+/// `tracing::Dispatch` exists -- this binary creates exactly one, via
+/// `with_default` -- registration consults only the registering thread's
+/// own default. A sibling test that first reaches a shared call site such
+/// as `log_chat_template_source` while the capturing scope is open
+/// registers it as `never`, dropping the captured event for good (an
+/// ordinary event firing never re-registers; only an explicit
+/// `rebuild_interest_cache()` call does, which each call site below makes,
+/// though that alone does not stop a sibling from losing the same race).
+/// Every test in `serving_tokenizer_tests` holds this lock, so none can
+/// register the call site while another is mid-capture. `cmd_run_tests.rs`
+/// and `cmd_chat_tests.rs` reach that call site without it. Poison-tolerant:
+/// one failing capture test must not cascade into every later one.
+#[cfg(feature = "server")]
+pub(crate) fn tracing_capture_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(feature = "server")]
@@ -423,6 +472,25 @@ impl tracing::field::Visit for EventText {
 impl tracing::Subscriber for CapturedEvents {
     fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
         true
+    }
+    /// `Interest::sometimes()`, not the default `always()`/`never()`: this
+    /// subscriber always wants every call site re-asked per event rather
+    /// than permanently cached either way. On its own this does not make a
+    /// per-scope, thread-local install (`with_default`) safe in a shared,
+    /// multi-threaded test binary -- see [`tracing_capture_lock`]'s doc for
+    /// what does -- but it is still the honest, least-surprising answer for
+    /// a subscriber whose whole purpose is to see everything.
+    fn register_callsite(
+        &self,
+        _metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+    /// Explicitly TRACE, for the same reason: this subscriber wants every
+    /// event regardless of level, so it says so rather than relying on the
+    /// default `None`.
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(tracing::level_filters::LevelFilter::TRACE)
     }
     fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
         tracing::span::Id::from_u64(1)

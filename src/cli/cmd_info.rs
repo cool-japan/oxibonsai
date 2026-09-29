@@ -1,14 +1,14 @@
 //! `oxibonsai info` — display model info from a GGUF file.
 //!
-//! cli-02 / gatekeeper REQUIRED #1: prints only values actually present in
+//! cli-02: prints only values actually present in
 //! the file's metadata — never `Qwen3Config::from_metadata`'s fabricated
 //! defaults standing in for a key a non-language-model GGUF (e.g. a CLIP
 //! vision projector) never had in the first place. Every numeric field is
 //! probed independently and rendered `"-"` (or `null` in `--json`) when
 //! absent.
 //!
-//! A Bonsai 2 `qwen35` hybrid gets the full truthful report (wave-4b
-//! addendum, REQUIRED #2/#14): the 16 full / 48 Gated-DeltaNet layer split,
+//! A Bonsai 2 `qwen35` hybrid gets the full truthful report: the 16 full /
+//! 48 Gated-DeltaNet layer split,
 //! the resolved weight type with its ggml id (PQ2_0 = 142, PTQ1_0 = 143),
 //! the `prism.hadamard.*` contract, vocabulary and context, the KV and
 //! recurrent bytes per sequence, a dry bind of the hybrid model (the
@@ -106,8 +106,8 @@ pub(crate) fn run(model: Option<String>, json: bool) -> anyhow::Result<()> {
         "context_length",
         keys::LLM_CONTEXT_LENGTH,
     );
-    // Vocab: the tokenizer's own token array length is authoritative (per
-    // gatekeeper REQUIRED #1) when present; otherwise fall back to the
+    // Vocab: the tokenizer's own token array length is authoritative when
+    // present; otherwise fall back to the
     // arch-scoped `vocab_size` metadata key, honestly "-" if neither
     // exists.
     let vocab_size = gguf
@@ -129,8 +129,8 @@ pub(crate) fn run(model: Option<String>, json: bool) -> anyhow::Result<()> {
     // architecture with both values genuinely present, so a CLIP file (or
     // any file missing those keys) never gets a variant guess built from
     // silently-substituted defaults.
-    // REQUIRED #14 (waves 3+3.5 review): `from_config_and_resolved_sample`
-    // (not the raw-parse-time `from_config_and_sample_tensor_type`) so a
+    // `from_config_and_resolved_sample` (not the raw-parse-time
+    // `from_config_and_sample_tensor_type`) so a
     // Bonsai 2 27B file reports its real variant name (e.g.
     // "Ternary-Bonsai-2-27B-PQ2_0") instead of the generic "Custom" a
     // ternary/2-bit tensor layout the older classifier does not
@@ -164,9 +164,9 @@ pub(crate) fn run(model: Option<String>, json: bool) -> anyhow::Result<()> {
         None
     };
 
-    // REQUIRED #14: the EFFECTIVE kernel tier `run` would dispatch to: the
-    // CPU tier for a hybrid (the engine seam pins it there — no hybrid GPU
-    // encoder exists yet), the auto-detected tier for a dense model.
+    // The EFFECTIVE kernel tier `run` would dispatch to: the CPU tier for a
+    // hybrid (the engine seam pins it there — no hybrid GPU encoder exists
+    // yet), the auto-detected tier for a dense model.
     let (kernel_tier, kernel_tier_reason) = match &hybrid {
         Some(_) => (
             oxibonsai_kernels::cpu_kernel_tier().to_string(),
@@ -231,7 +231,15 @@ pub(crate) fn run(model: Option<String>, json: bool) -> anyhow::Result<()> {
         if let Some(variant) = &variant_name {
             println!("  Variant:      {variant}");
         }
-        println!("  Kernel tier:  {kernel_tier} ({kernel_tier_reason})");
+        // A hybrid report's own lines (below) already carry a single
+        // "Kernel tier:" line with the hybrid-specific reason
+        // (`HybridReport::lines`) — print this header one only when there
+        // is no such report to double up with (a dense model, or a hybrid
+        // whose report failed to bind, in which case the header's own
+        // reason is the only "Kernel tier:" line printed at all).
+        if !matches!(&hybrid, Some(Ok(_))) {
+            println!("  Kernel tier:  {kernel_tier} ({kernel_tier_reason})");
+        }
         println!("  Name:         {general_name}");
         println!("  Tokenizer:    {tokenizer_model}");
         println!("  Layers:       {layers}");

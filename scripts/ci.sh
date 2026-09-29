@@ -32,9 +32,23 @@
 #               meant to be usable on a laptop that does not have every
 #               optional toolchain installed.
 #
+# --with-models: two more stages (`real-model-legacy`, `real-model-bonsai2`,
+#   SKIPPED by default without it) additionally run the real-model gates
+#   this workspace ships (`legacy_parity_tests`/`hybrid_forward_parity_tests`/
+#   `bonsai2_engine_tests`/`bonsai2_runtime_tests`) directly, once each,
+#   `--release --test-threads=1`.
+#   This script is not itself the serialization boundary those gates need
+#   across MULTIPLE real-model binaries — `scripts/release-gate.sh`'s
+#   stages 1b-1d are (they run one real-model binary completely before
+#   starting the next) — so `--with-models` is the "I want to see the
+#   real-model gates run as part of an ordinary CI pass" convenience for a
+#   single unattended host, not a substitute for the release gate's own
+#   stronger sequencing guarantees.
+#
 # Usage:
 #   ./scripts/ci.sh                 # dev mode, all stages
 #   ./scripts/ci.sh --release       # release mode (see above)
+#   ./scripts/ci.sh --with-models   # also run the real-model gates (see above)
 #   ./scripts/ci.sh --only build    # run a single stage by short name (see STAGE names below), for iterating
 #   ./scripts/ci.sh --list          # list stage short names and exit
 #
@@ -55,14 +69,16 @@ cd "$PROJECT_ROOT" || exit 2
 RELEASE_MODE=0
 ONLY_STAGE=""
 LIST_ONLY=0
+WITH_MODELS=0
 for arg in "$@"; do
     case "$arg" in
         --release) RELEASE_MODE=1 ;;
+        --with-models) WITH_MODELS=1 ;;
         --only)    : ;; # value consumed below
         --only=*)  ONLY_STAGE="${arg#--only=}" ;;
         --list)    LIST_ONLY=1 ;;
         --help|-h)
-            echo "Usage: $0 [--release] [--only=<stage>] [--list]"
+            echo "Usage: $0 [--release] [--with-models] [--only=<stage>] [--list]"
             exit 0
             ;;
         *)
@@ -111,8 +127,9 @@ STAGE_NAMES=(
     fmt build-default build-all-features
     facade-image facade-metal facade-server-metal-image
     clippy-all-features clippy-default
-    nextest-all-features nextest-default doctests docs-build deny
+    nextest-all-features nextest-default doctests docs-build docs-strict deny
     pure-rust cuda-syntax wasm-tokenizer llvm-cov tmp-hardcode-advisory
+    real-model-legacy real-model-bonsai2
 )
 
 if [[ -n "$ONLY_STAGE" ]]; then
@@ -234,6 +251,38 @@ run_required_stage() {
     fi
 }
 
+# Runs a stage that only executes with `--with-models`, in EITHER dev or
+# release mode: unlike `run_optional_stage`'s "missing tool" trichotomy,
+# skipping this stage is never a release-mode failure — real-model GGUFs
+# are gitignored working-tree data, not an installable tool, and
+# `scripts/release-gate.sh` (which always invokes `ci.sh --release` without
+# `--with-models`) is what actually enforces they ran with real evidence
+# before a release, through its own stages 1b-1d. Without `--with-models`
+# this always reports SKIPPED and returns 0, regardless of `$RELEASE_MODE`.
+run_with_models_stage() {
+    local short="$1" fn="$2"
+    STAGE_NUM=$((STAGE_NUM + 1))
+    only_filter_skips "$short" && return 0
+    banner "$short"
+    if [[ "$WITH_MODELS" -ne 1 ]]; then
+        echo "SKIPPED: --with-models was not passed."
+        STAGE_RESULTS+=("$short:SKIPPED")
+        return 0
+    fi
+    echo "+ $fn"
+    if "$fn"; then
+        echo "OK: $short"
+        STAGE_RESULTS+=("$short:OK")
+        return 0
+    else
+        local rc=$?
+        echo "FAILED ($rc): $short"
+        STAGE_RESULTS+=("$short:FAILED")
+        print_summary
+        exit "$rc"
+    fi
+}
+
 # Runs an advisory stage: prints its own PASS/WARN, never fails the gate.
 run_advisory_stage() {
     local short="$1"
@@ -343,15 +392,20 @@ if [[ -z "$ONLY_STAGE" || "$ONLY_STAGE" == "nextest-all-features" || "$ONLY_STAG
 fi
 
 # ── Stage 5: nextest, all features ──────────────────────────────────────
+# `env -u OXIBONSAI_M08_RUN_LONG`: M-08's opt-in 20000-token YaRN gate (two
+# real Bonsai-8B decodes of roughly an hour each) belongs to the serialized,
+# release-profile real-model stage of `scripts/release-gate.sh` (stage 1b),
+# never to these parallel nextest runs — with the variable unset here it
+# self-skips in well under a second, as in any ordinary run.
 NEXTEST_PRESENT="$(tool_ok cargo-nextest)"
 run_optional_stage "nextest-all-features" "$NEXTEST_PRESENT" \
     "install nextest: cargo install cargo-nextest --locked" \
-    cargo nextest run --workspace --all-features --profile ci
+    env -u OXIBONSAI_M08_RUN_LONG cargo nextest run --workspace --all-features --profile ci
 
 # ── Stage 6: nextest, default features (T-11) ───────────────────────────
 run_optional_stage "nextest-default" "$NEXTEST_PRESENT" \
     "install nextest: cargo install cargo-nextest --locked" \
-    cargo nextest run --workspace --profile ci
+    env -u OXIBONSAI_M08_RUN_LONG cargo nextest run --workspace --profile ci
 
 # ── Stage 7: doctests (T-02 — nextest cannot run these at all) ──────────
 run_required_stage "doctests" cargo test --doc --workspace --all-features
@@ -363,6 +417,19 @@ run_required_stage "doctests" cargo test --doc --workspace --all-features
 # relies on. Not part of the T-01 12-stage list verbatim, same reasoning
 # as the fmt stage above.
 run_required_stage "docs-build" cargo doc --workspace --all-features --no-deps
+
+# ── Stage 7c: docs build, rustdoc warnings fail-closed ──────────────────
+# `docs-build` above only fails on a hard rustdoc ERROR (broken intra-doc
+# links, invalid syntax); a rustdoc WARNING (e.g. a bare URL that should be
+# a markdown link) is silent there. This stage re-runs the same build with
+# `RUSTDOCFLAGS="-D warnings"`, so a warning fails the gate exactly like a
+# clippy warning does. Cargo's own build cache means this rebuilds only the
+# doc pass, not the whole workspace, when stage 7b already ran.
+# shellcheck disable=SC2329  # invoked indirectly via run_required_stage "$@"
+docs_strict_stage() {
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
+}
+run_required_stage "docs-strict" docs_strict_stage
 
 # ── Stage 8: cargo-deny ─────────────────────────────────────────────────
 DENY_PRESENT="$(tool_ok cargo-deny)"
@@ -482,6 +549,59 @@ tmp_hardcode_advisory() {
     return 0
 }
 run_advisory_stage "tmp-hardcode-advisory" tmp_hardcode_advisory
+
+# ── Stage 14/15: real-model gates (--with-models only) ──────────────────
+# Off by default (`WITH_MODELS=0`): these gates each map a real, multi-GB
+# GGUF under `models/` and take real minutes even when they self-skip a
+# missing file cleanly is fast, but a present file means a full decode.
+# `--with-models` is the explicit "yes, actually run them here" request;
+# without it these two stages report SKIPPED, in both dev and release mode
+# (a missing MODEL FILE is a different situation from a missing TOOL, so
+# release mode's usual "a skip must be loud" rule does not apply — the
+# model files are gitignored and not expected to exist on every host).
+# `scripts/release-gate.sh` remains the place that enforces they MUST have
+# run with real evidence before a release; this is the "run them as part of
+# an ordinary CI pass, if you have the weights" convenience.
+# shellcheck disable=SC2329  # invoked indirectly via run_optional_stage "$@"
+real_model_legacy_stage() {
+    local models_dir="${OXIBONSAI_MODELS_DIR:-$PROJECT_ROOT/models}"
+    for pkg in oxibonsai-model oxibonsai-runtime; do
+        echo "+ OXIBONSAI_MODELS_DIR=$models_dir cargo test --release -p $pkg --features metal --test legacy_parity_tests -- --test-threads=1 --nocapture"
+        OXIBONSAI_MODELS_DIR="$models_dir" \
+            cargo test --release -p "$pkg" --features metal \
+            --test legacy_parity_tests -- --test-threads=1 --nocapture || return $?
+    done
+}
+run_with_models_stage "real-model-legacy" real_model_legacy_stage
+
+# shellcheck disable=SC2329  # invoked indirectly via run_optional_stage "$@"
+real_model_bonsai2_stage() {
+    local models_dir="${OXIBONSAI_MODELS_DIR:-$PROJECT_ROOT/models}"
+    local golden_dir="$PROJECT_ROOT/crates/oxibonsai-model/tests/fixtures/bonsai2_golden"
+    echo "+ OXIBONSAI_MODELS_DIR=$models_dir cargo test --release -p oxibonsai-model --all-features --test hybrid_forward_parity_tests -- --test-threads=1 --nocapture"
+    OXIBONSAI_MODELS_DIR="$models_dir" \
+        cargo test --release -p oxibonsai-model --all-features \
+        --test hybrid_forward_parity_tests -- --test-threads=1 --nocapture || return $?
+    local pq2="$models_dir/Ternary-Bonsai-2-27B-PQ2_0.gguf"
+    local ptq1="$models_dir/Ternary-Bonsai-2-27B-PTQ1_0.gguf"
+    local engine_env=("OXIBONSAI_MODELS_DIR=$models_dir" "OXI_BONSAI2_GOLDEN_DIR=$golden_dir")
+    [[ -s "$pq2" ]] && engine_env+=("OXI_BONSAI2_PQ2_GGUF=$pq2")
+    [[ -s "$ptq1" ]] && engine_env+=("OXI_BONSAI2_PTQ1_GGUF=$ptq1")
+    echo "+ env ${engine_env[*]} cargo test --release -p oxibonsai-runtime --all-features --test bonsai2_engine_tests -- --test-threads=1 --nocapture"
+    env "${engine_env[@]}" \
+        cargo test --release -p oxibonsai-runtime --all-features \
+        --test bonsai2_engine_tests -- --test-threads=1 --nocapture || return $?
+    # G6/G7 (tokenization, chat-template rendering) and G9 (`oxibonsai info
+    # --json`) against the real 27B files.
+    local runtime_env=("OXIBONSAI_MODELS_DIR=$models_dir")
+    [[ -s "$pq2" ]] && runtime_env+=("OXI_BONSAI2_PQ2_GGUF=$pq2")
+    [[ -s "$ptq1" ]] && runtime_env+=("OXI_BONSAI2_PTQ1_GGUF=$ptq1")
+    echo "+ env ${runtime_env[*]} cargo test --release -p oxibonsai-runtime --all-features --test bonsai2_runtime_tests -- --test-threads=1 --nocapture"
+    env "${runtime_env[@]}" \
+        cargo test --release -p oxibonsai-runtime --all-features \
+        --test bonsai2_runtime_tests -- --test-threads=1 --nocapture || return $?
+}
+run_with_models_stage "real-model-bonsai2" real_model_bonsai2_stage
 
 # ── Done ─────────────────────────────────────────────────────────────────
 print_summary

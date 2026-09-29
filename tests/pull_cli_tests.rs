@@ -632,7 +632,7 @@ fn pull_real_named_entry(name: &str, file_name: &str, source: PathBuf) -> String
 ///   digest (`checksum OK`), architecture `clip`;
 /// * `Bonsai-8B.gguf` (`OXIBONSAI_MODELS_DIR`) — this checkout's copy is the
 ///   previously known-good object the legacy goldens were captured on, so it
-///   is accepted as the named alternate WITH a warning (ruling R-B8HASH);
+///   is accepted as the named alternate WITH a warning;
 /// * the Bonsai 2 27B PTQ1_0 (`OXI_BONSAI2_PTQ1_GGUF`) — `qwen35` with
 ///   `prism.hadamard.version = 1`, verified against the embedded digest.
 #[test]

@@ -16,7 +16,7 @@
 //!        -> rate-limit -> bearer-auth -> CORS (outermost)
 //! ```
 //!
-//! (FIX2-SERVE item 3: `DefaultBodyLimit` moved from inside `admission` to
+//! (`DefaultBodyLimit` moved from inside `admission` to
 //! outside it, still inside rate-limit -- see the note at its call site in
 //! [`build_router`] for what this does and does not achieve.)
 
@@ -134,7 +134,7 @@ pub fn bind_safety_check(config: &ServerConfig, admin_enabled: bool) -> Result<(
 
 /// SV-15(c): the per-request fallback `max_tokens` (`ChatCompletionRequest`'s
 /// `#[serde(default = "default_max_tokens")]`, in
-/// `crates/oxibonsai-runtime/src/server.rs`, not owned by this package) is a
+/// `crates/oxibonsai-runtime/src/server.rs`) is a
 /// hardcoded literal with no config seam. Rather than silently discarding a
 /// configured `sampling.default_max_tokens` that disagrees with it, name the
 /// discrepancy loudly so an operator who set it is not left guessing why
@@ -175,17 +175,14 @@ pub use oxibonsai_runtime::serve_shared::verify_model_checksum;
 
 // ─── OXIBONSAI_* env vars this crate's `env.rs` does not (yet) map ─────────
 
-/// Fold the `OXIBONSAI_*` environment variables introduced by this package
+/// Fold the `OXIBONSAI_*` environment variables introduced in this crate
 /// (admin token, insecure-no-auth, CORS, rate limit, body size) into an
 /// already-parsed [`PartialServerConfig`], preserving the documented
 /// `defaults < TOML < env < CLI` precedence (this runs at the "env" layer,
 /// before the CLI partial is merged on top in `main.rs::run()`).
 ///
-/// Kept here rather than in `oxibonsai_serve::env` because that module is
-/// not in this package's `owned_files` (see this package's recorded
-/// deviations) — a future consolidation should fold this back into
-/// `env::parse_env_map` once that file is granted to whichever package owns
-/// it next.
+/// Kept here rather than in `oxibonsai_serve::env` — a future consolidation
+/// should fold this back into `env::parse_env_map`.
 pub fn apply_extra_env_overrides<I>(partial: &mut PartialServerConfig, vars: I)
 where
     I: IntoIterator<Item = (String, String)>,
@@ -281,11 +278,11 @@ pub use oxibonsai_runtime::serve_shared::resolve_admission_limit;
 /// Bundles [`build_router`]'s knobs that aren't the pool/tokenizer/metrics
 /// triple or `config` itself.
 ///
-/// Wave-3 verifier review: once `enable_ui` and `max_output_tokens_ceiling`
-/// joined `admin_auth` and `pool_size` as positional parameters,
-/// `build_router` tripped clippy's `too_many_arguments` (9 args, limit 7).
-/// Grouping them here (rather than adding `#[allow(...)]`) also gives the
-/// two call sites (`main.rs`'s real server and this module's own
+/// `enable_ui` and `max_output_tokens_ceiling` join `admin_auth` and
+/// `pool_size` here rather than as positional parameters: nine positional
+/// arguments would trip clippy's `too_many_arguments` (limit 7). Grouping
+/// them here (rather than adding `#[allow(...)]`) also gives the two call
+/// sites (`main.rs`'s real server and this module's own
 /// `build_router_tests`) one named place to construct the bundle instead of
 /// a positional list that silently tolerates argument-order mistakes.
 pub struct RouterBuildOptions {
@@ -294,21 +291,37 @@ pub struct RouterBuildOptions {
     /// The engine pool's real size, used to derive the admission ceiling
     /// (findings `sec-20`/`perf-M1` — see [`resolve_admission_limit`]).
     pub pool_size: usize,
-    /// Whether to mount the bundled chat UI (`SV-26`, from `--enable-ui`).
+    /// Whether to mount the bundled chat UI (`SV-26`) — the merged config's
+    /// `ui.enabled` (CLI flag > env > TOML > `false`).
     pub enable_ui: bool,
-    /// The hard `max_tokens` ceiling override (`SV-28`, from
-    /// `--max-output-tokens`), when the CLI passed one.
+    /// The hard `max_tokens` ceiling override (`SV-28`) — the merged
+    /// config's `limits.max_output_tokens` (CLI flag > env > TOML), `None`
+    /// to keep the router's own default ceiling.
     pub max_output_tokens_ceiling: Option<usize>,
     /// The model-backed embedder `/v1/embeddings` answers from
-    /// (`HANDOVER-RT` item 13, built by `oxibonsai_serve::embedder`), or
+    /// (built by `oxibonsai_serve::embedder`), or
     /// `None` for the route's honest `501`.
     pub embedder: Option<Arc<oxibonsai_runtime::embed_engine::ModelEmbedder>>,
+    /// Why there is no model-backed embedder, carried into the `/v1/embeddings`
+    /// `501` body (`error.code` and the message suffix) when [`Self::embedder`]
+    /// is `None` — see [`Self::with_embedder_unavailable`].
+    pub embedder_unavailable: Option<(Option<&'static str>, String)>,
+    /// The served engine's resolved variant and effective kernel tier, shown
+    /// by `/admin/status` and `/admin/config` — see
+    /// [`Self::with_engine_report`].
+    pub engine_report: Option<oxibonsai_runtime::admin::EngineReport>,
+    /// The single token id a tokenizer-less server feeds as the prompt of a
+    /// text request — see [`Self::with_prompt_start_token`]. Library/test
+    /// use only: a served model always resolves a real tokenizer or a real
+    /// GGUF-embedded one.
+    pub prompt_start_token: Option<u32>,
 }
 
 impl RouterBuildOptions {
     /// Name every field positionally -- the shape both call sites already
-    /// had before this bundle existed. No embedder: see
-    /// [`Self::with_embedder`].
+    /// had before this bundle existed. No embedder, unavailability reason,
+    /// engine report or prompt-start-token override: see the `with_*`
+    /// builders.
     pub fn new(
         admin_auth: AdminAuthConfig,
         pool_size: usize,
@@ -321,6 +334,9 @@ impl RouterBuildOptions {
             enable_ui,
             max_output_tokens_ceiling,
             embedder: None,
+            embedder_unavailable: None,
+            engine_report: None,
+            prompt_start_token: None,
         }
     }
 
@@ -331,6 +347,37 @@ impl RouterBuildOptions {
         embedder: Option<Arc<oxibonsai_runtime::embed_engine::ModelEmbedder>>,
     ) -> Self {
         self.embedder = embedder;
+        self
+    }
+
+    /// Record why this server has no model-backed embedder, so the
+    /// `/v1/embeddings` `501` body names it (builder).
+    #[must_use]
+    pub fn with_embedder_unavailable(
+        mut self,
+        code: Option<&'static str>,
+        message: impl Into<String>,
+    ) -> Self {
+        self.embedder_unavailable = Some((code, message.into()));
+        self
+    }
+
+    /// Attach the served engine's [`oxibonsai_runtime::admin::EngineReport`]
+    /// to the `/admin/*` router (builder).
+    #[must_use]
+    pub fn with_engine_report(mut self, report: oxibonsai_runtime::admin::EngineReport) -> Self {
+        self.engine_report = Some(report);
+        self
+    }
+
+    /// Let a tokenizer-less server answer text prompts by feeding the single
+    /// token `id` as the prompt (builder). Test-only: the standalone binary
+    /// always resolves a real tokenizer or refuses to start; a production
+    /// build of this crate has no caller.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_prompt_start_token(mut self, id: u32) -> Self {
+        self.prompt_start_token = Some(id);
         self
     }
 }
@@ -355,16 +402,13 @@ impl RouterBuildOptions {
 /// admission ceiling (findings `sec-20`/`perf-M1` — see
 /// [`resolve_admission_limit`]).
 ///
-/// `build_options.enable_ui` (`SV-26`, from `--enable-ui`) and
-/// `build_options.max_output_tokens_ceiling` (`SV-28`, from
-/// `--max-output-tokens`) are `ServerArgs`-only knobs: neither has a
-/// matching field on `ServerConfig`/`PartialServerConfig`
-/// (`oxibonsai-serve/src/config.rs`, outside this package's owned files), so
-/// they cannot flow through the usual CLI/TOML/env-merged `config` parameter
-/// like everything else `build_router` reads — `main.rs` reads them directly
-/// off `ServerArgs` and passes them here (via [`RouterBuildOptions`])
-/// instead. See this package's recorded deviations for the config-file-side
-/// follow-up this implies.
+/// `build_options.enable_ui` (`SV-26`) and
+/// `build_options.max_output_tokens_ceiling` (`SV-28`) come from the merged
+/// `config`'s own `ui.enabled` / `limits.max_output_tokens`
+/// (`oxibonsai-serve/src/config.rs`, CLI flag > env > TOML > default) —
+/// `main.rs` reads them off `config` (not off `ServerArgs` directly) and
+/// passes them here via [`RouterBuildOptions`], the same way every other
+/// `build_router` knob arrives.
 pub fn build_router(
     pool: Arc<EnginePool>,
     tokenizer: Option<TokenizerBridge>,
@@ -379,6 +423,9 @@ pub fn build_router(
         enable_ui,
         max_output_tokens_ceiling,
         embedder,
+        embedder_unavailable,
+        engine_report,
+        prompt_start_token,
     } = build_options;
 
     let mut router_options = RouterOptions::default()
@@ -389,6 +436,15 @@ pub fn build_router(
         .with_embedder(embedder);
     if let Some(ceiling) = max_output_tokens_ceiling {
         router_options = router_options.with_max_output_tokens_ceiling(ceiling);
+    }
+    if let Some((code, message)) = embedder_unavailable {
+        router_options = router_options.with_embedder_unavailable(code, message);
+    }
+    if let Some(report) = engine_report {
+        router_options = router_options.with_engine_report(report);
+    }
+    if let Some(id) = prompt_start_token {
+        router_options = router_options.with_prompt_start_token(id);
     }
 
     let mut base_router = create_router_full(pool, tokenizer, Arc::clone(&metrics), router_options);
@@ -460,7 +516,7 @@ pub fn build_router(
     // silently create one independent semaphore *per route* instead of one
     // shared budget across the whole HTTP surface.
     //
-    // FIX2-SERVE item 3: applied here, BEFORE `DefaultBodyLimit` below, so
+    // Applied here, BEFORE `DefaultBodyLimit` below, so
     // `DefaultBodyLimit` ends up mounted OUTSIDE (more outer than) this
     // admission stack -- see that call site's note for what this reorder
     // does and does not achieve.
@@ -478,7 +534,7 @@ pub fn build_router(
     // SV-27/sec-16: explicit, configurable request body ceiling instead of
     // axum's implicit 2 MiB default.
     //
-    // FIX2-SERVE item 3: moved from *inside* `admission` (above) to
+    // Moved from *inside* `admission` (above) to
     // *outside* it (still inside rate-limit, below) so the mandated
     // ordering documented at the top of this file holds. This reorder is a
     // correctness-neutral, forward-looking position fix, not a fix for the
@@ -495,11 +551,11 @@ pub fn build_router(
     // here is still the right relative position for when a real
     // synchronous body-size guard (e.g. a `Content-Length` precheck, or
     // `tower_http::limit::RequestBodyLimitLayer`) is added outside
-    // `admission` -- see this package's recorded deviations.
+    // `admission`.
     router = router.layer(DefaultBodyLimit::max(config.limits.max_body_bytes));
 
-    // Deviation #19 fix: an ACTIVE synchronous `Content-Length` precheck,
-    // mounted at this same "outside admission" position, so a request whose
+    // An ACTIVE synchronous `Content-Length` precheck, mounted at this same
+    // "outside admission" position, so a request whose
     // *declared* size already exceeds the limit is rejected with a real
     // `413` before it can hold (or wait for) a concurrency permit at all --
     // closing the gap `DefaultBodyLimit` alone does not (see the note on
@@ -710,7 +766,7 @@ struct MetricsGateConfig {
 /// it differs from `/metrics` — all three behind `observability.metrics_enabled`
 /// (finding `SV-15`(b)). A no-op for every other path.
 ///
-/// FIX2-SERVE item 2: `/metrics/serve` was previously missing from this
+/// `/metrics/serve` was previously missing from this
 /// check, so it stayed reachable even when an operator explicitly set
 /// `observability.metrics_enabled = false` — and `/metrics/serve` is also in
 /// `bearer_auth`'s exempt list (`main.rs`'s `middleware::bearer_auth`,
@@ -737,7 +793,7 @@ async fn metrics_gate_mw(
     next.run(req).await
 }
 
-/// Active `Content-Length` precheck (deviation #19's required fix).
+/// Active `Content-Length` precheck.
 ///
 /// `DefaultBodyLimit` (see the note where [`build_router`] applies it)
 /// enforces nothing by itself at either layer position: it only stamps a
@@ -761,11 +817,10 @@ async fn metrics_gate_mw(
 /// the case `DefaultBodyLimit`'s own extension-based enforcement still
 /// covers once the handler starts buffering it.
 ///
-/// `src/cli/cmd_serve.rs::harden_router` (`B2-14`, wave 4) mounts the
+/// `src/cli/cmd_serve.rs::harden_router` mounts the
 /// identical guard for the CLI `serve` subcommand's own admission stack,
-/// per the SV-30/sec-M3 "one shared module" intent -- flagged in that
-/// package's own addendum, since that file is outside this package's owned
-/// files.
+/// per the SV-30/sec-M3 "one shared module" intent; that file lives in a
+/// different crate, so the two copies are kept in sync by hand.
 async fn content_length_guard_mw(
     State(max_body_bytes): State<Arc<usize>>,
     req: Request<Body>,
@@ -1023,7 +1078,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  models/Bar.ggu
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
-    // NOTE (sec-12 verifier finding): the previous version of this test
+    // NOTE (sec-12): an earlier version of this test
     // ("verify_warns_but_does_not_fail_when_hasher_is_unavailable") never
     // actually wrote a model file, only the checksums entry -- so it
     // exercised `verify_model_checksum`'s `Err(_)` (unreadable file)
@@ -1207,677 +1262,5 @@ mod env_override_tests {
 }
 
 #[cfg(test)]
-mod build_router_tests {
-    use super::*;
-    use axum::http::Request;
-    use oxibonsai_core::config::Qwen3Config;
-    use oxibonsai_runtime::engine::InferenceEngine;
-    use oxibonsai_runtime::sampling::SamplingParams;
-    use tower::ServiceExt;
-
-    fn tiny_pool() -> Arc<EnginePool> {
-        let engine = InferenceEngine::new(Qwen3Config::tiny_test(), SamplingParams::default(), 42);
-        EnginePool::new(vec![engine])
-    }
-
-    fn router_for(config: &ServerConfig) -> Router {
-        let pool = tiny_pool();
-        let pool_size = pool.size();
-        build_router(
-            pool,
-            None,
-            Arc::new(InferenceMetrics::new()),
-            Arc::new(MetricsRegistry::new()),
-            config,
-            RouterBuildOptions::new(AdminAuthConfig::locked(), pool_size, false, None),
-        )
-    }
-
-    #[tokio::test]
-    async fn health_is_reachable_with_no_config() {
-        let cfg = ServerConfig::default();
-        let router = router_for(&cfg);
-        let resp = router
-            .oneshot(
-                Request::get("/health")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    // ── deviation #19: active Content-Length precheck ────────────────────
-
-    #[tokio::test]
-    async fn content_length_guard_rejects_a_declared_oversized_body_with_413() {
-        let mut cfg = ServerConfig::default();
-        cfg.limits.max_body_bytes = 100;
-        let router = router_for(&cfg);
-
-        let resp = router
-            .oneshot(
-                Request::post("/v1/chat/completions")
-                    .header("content-type", "application/json")
-                    .header("content-length", "1000")
-                    // The actual body bytes are irrelevant -- the guard
-                    // rejects on the *declared* Content-Length alone,
-                    // before the body is ever read.
-                    .body(Body::from(vec![b'x'; 10]))
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(
-            resp.status(),
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "a declared Content-Length above the configured limit must be rejected \
-             synchronously, before admission"
-        );
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .expect("body bytes");
-        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON envelope");
-        assert_eq!(json["error"]["code"], "content_too_large");
-    }
-
-    #[tokio::test]
-    async fn content_length_guard_allows_a_request_within_the_limit() {
-        let mut cfg = ServerConfig::default();
-        cfg.limits.max_body_bytes = 1_000_000;
-        let router = router_for(&cfg);
-
-        let resp = router
-            .oneshot(
-                Request::post("/v1/chat/completions")
-                    .header("content-type", "application/json")
-                    .header("content-length", "2")
-                    .body(Body::from(b"{}".to_vec()))
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_ne!(
-            resp.status(),
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "a request within the configured limit must not be rejected by this guard \
-             (whatever else it gets rejected for downstream, e.g. a malformed body, is a \
-             different concern)"
-        );
-    }
-
-    #[tokio::test]
-    async fn content_length_guard_lets_through_a_request_with_no_content_length_header() {
-        // A request with no declared Content-Length (e.g. genuine
-        // Transfer-Encoding: chunked) must not be rejected by *this guard*.
-        // `max_body_bytes` is deliberately generous here (unlike the two
-        // tests above) so the body's *actual* size cannot itself trip
-        // `DefaultBodyLimit`'s own separate, extension-based enforcement
-        // once the handler reads it -- this test isolates "no header ->
-        // this guard is a no-op", not the unrelated real-size check.
-        let mut cfg = ServerConfig::default();
-        cfg.limits.max_body_bytes = 1_000_000;
-        let router = router_for(&cfg);
-
-        let resp = router
-            .oneshot(
-                Request::post("/v1/chat/completions")
-                    .header("content-type", "application/json")
-                    .body(Body::from(b"{}".to_vec()))
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_ne!(
-            resp.status(),
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "no Content-Length header means this guard has nothing to check and must not block"
-        );
-    }
-
-    #[tokio::test]
-    async fn admin_is_refused_by_default() {
-        let cfg = ServerConfig::default();
-        let router = router_for(&cfg);
-        let resp = router
-            .oneshot(
-                Request::get("/admin/status")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    }
-
-    #[tokio::test]
-    async fn bearer_auth_protects_inference_routes_when_configured() {
-        let mut cfg = ServerConfig::default();
-        cfg.auth.bearer_token = Some("x".repeat(20));
-        let router = router_for(&cfg);
-
-        let unauth = router
-            .clone()
-            .oneshot(
-                Request::get("/v1/models")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
-
-        let health = router
-            .oneshot(
-                Request::get("/health")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(health.status(), StatusCode::OK, "/health must stay exempt");
-    }
-
-    /// cli-18: two unauthenticated requests in a row must be rejected
-    /// identically. **Not discriminating on its own**: both requests run
-    /// sequentially through `oneshot`, so the sole permit (if bearer auth
-    /// were ever mounted inside the admission stack) would already be
-    /// released before the second request starts, and this assertion would
-    /// hold under BOTH layer orderings. Kept as a cheap idempotency check;
-    /// the sibling `unauthenticated_request_is_401_while_the_sole_permit_is_held`
-    /// below is the test that actually proves the layer ordering.
-    #[tokio::test]
-    async fn unauthenticated_request_never_reaches_admission() {
-        let mut cfg = ServerConfig::default();
-        cfg.auth.bearer_token = Some("x".repeat(20));
-        cfg.limits.max_concurrent_requests = 1;
-        let router = router_for(&cfg);
-
-        // Two unauthenticated requests in a row: if the first one consumed
-        // the sole concurrency permit, a bug would make this observable via
-        // a 503 instead of a consistent 401 -- but since bearer-auth sits
-        // outside admission, both must be rejected identically.
-        for _ in 0..2 {
-            let resp = router
-                .clone()
-                .oneshot(
-                    Request::get("/v1/models")
-                        .body(Body::empty())
-                        .expect("request"),
-                )
-                .await
-                .expect("response");
-            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        }
-    }
-
-    /// VERIFIER-ADDED (cli-18): a genuinely discriminating version of the
-    /// sibling `unauthenticated_request_never_reaches_admission`, which
-    /// drives its two requests sequentially and therefore passes under BOTH
-    /// layer orderings. Here a slow *authenticated* chat completion is kept
-    /// in flight on a separate task, holding the sole concurrency permit
-    /// (effective ceiling = min(1, 1*4) = 1); an unauthenticated request
-    /// issued while it runs must still be `401`. If bearer auth were mounted
-    /// INSIDE the admission stack, `load_shed` would answer `503` instead.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn unauthenticated_request_is_401_while_the_sole_permit_is_held() {
-        let mut cfg = ServerConfig::default();
-        cfg.auth.bearer_token = Some("x".repeat(20));
-        cfg.limits.max_concurrent_requests = 1;
-        let router = router_for(&cfg);
-
-        let slow_router = router.clone();
-        let slow = tokio::spawn(async move {
-            let payload = serde_json::json!({
-                "messages": [{"role": "user", "content": "hello"}],
-                "max_tokens": 500,
-            });
-            let req = Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .header("authorization", format!("Bearer {}", "x".repeat(20)))
-                .body(Body::from(payload.to_string()))
-                .expect("request");
-            slow_router.oneshot(req).await.map(|r| r.status())
-        });
-
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        let resp = router
-            .oneshot(
-                Request::get("/v1/models")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        let slow_status = slow.await.expect("join").expect("slow response");
-        assert_eq!(
-            slow_status,
-            StatusCode::OK,
-            "the authenticated request must have been the one holding the permit"
-        );
-        assert_eq!(
-            resp.status(),
-            StatusCode::UNAUTHORIZED,
-            "an unauthenticated request must be 401 even while the sole admission permit \
-             is held (a 503 means bearer auth sits INSIDE the admission stack)"
-        );
-    }
-
-    /// sec-20/perf-M1: the `503` an overloaded admission layer returns must
-    /// carry `Retry-After`, matching this module's own doc comment on
-    /// [`resolve_admission_limit`] ("shedding it immediately with a fast
-    /// `503` + `Retry-After`") -- previously an omission (only the `429`
-    /// rate-limit path below set it). Same permit-holding trick as
-    /// `unauthenticated_request_is_401_while_the_sole_permit_is_held`, but
-    /// with no bearer token configured, so the second request actually
-    /// reaches (and is shed by) the admission layer instead of being
-    /// rejected by auth first.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn overloaded_request_gets_503_with_retry_after() {
-        let mut cfg = ServerConfig::default();
-        cfg.limits.max_concurrent_requests = 1;
-        let router = router_for(&cfg);
-
-        let slow_router = router.clone();
-        let slow = tokio::spawn(async move {
-            let payload = serde_json::json!({
-                "messages": [{"role": "user", "content": "hello"}],
-                "max_tokens": 500,
-            });
-            let req = Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .body(Body::from(payload.to_string()))
-                .expect("request");
-            slow_router.oneshot(req).await.map(|r| r.status())
-        });
-
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        let resp = router
-            .oneshot(
-                Request::get("/v1/models")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        let slow_status = slow.await.expect("join").expect("slow response");
-        assert_eq!(
-            slow_status,
-            StatusCode::OK,
-            "the in-flight request must have been the one holding the sole permit"
-        );
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert!(
-            resp.headers().get("retry-after").is_some(),
-            "a 503 from the admission layer must carry Retry-After"
-        );
-    }
-
-    #[tokio::test]
-    async fn rate_limit_returns_429_with_retry_after() {
-        let mut cfg = ServerConfig::default();
-        cfg.rate_limit.rpm = Some(60.0);
-        cfg.rate_limit.burst = 1.0;
-        let router = router_for(&cfg);
-
-        let first = router
-            .clone()
-            .oneshot(
-                Request::get("/v1/models")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(first.status(), StatusCode::OK);
-
-        let second = router
-            .oneshot(
-                Request::get("/v1/models")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert!(second.headers().get("retry-after").is_some());
-    }
-
-    #[tokio::test]
-    async fn cors_preflight_bypasses_bearer_auth() {
-        let mut cfg = ServerConfig::default();
-        cfg.auth.bearer_token = Some("x".repeat(20));
-        cfg.cors.allowed_origins = vec!["https://app.example.com".to_string()];
-        let router = router_for(&cfg);
-
-        let preflight = Request::builder()
-            .method("OPTIONS")
-            .uri("/v1/chat/completions")
-            .header("origin", "https://app.example.com")
-            .body(Body::empty())
-            .expect("preflight request");
-        let resp = router.oneshot(preflight).await.expect("response");
-        assert_eq!(
-            resp.status(),
-            StatusCode::OK,
-            "an OPTIONS preflight must bypass bearer auth entirely (SV-06)"
-        );
-    }
-
-    #[tokio::test]
-    async fn no_cors_configured_emits_no_cors_headers() {
-        let cfg = ServerConfig::default();
-        let router = router_for(&cfg);
-        let resp = router
-            .oneshot(
-                Request::get("/health")
-                    .header("origin", "https://anything.example.com")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert!(resp.headers().get("access-control-allow-origin").is_none());
-    }
-
-    #[tokio::test]
-    async fn oversized_body_is_rejected_with_413() {
-        let mut cfg = ServerConfig::default();
-        cfg.limits.max_body_bytes = 16;
-        let router = router_for(&cfg);
-
-        let body = Body::from(vec![b'a'; 4096]);
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header("content-type", "application/json")
-            .body(body)
-            .expect("request");
-        let resp = router.oneshot(req).await.expect("response");
-        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    }
-
-    /// FIX2-SERVE item 3: `DefaultBodyLimit` was reordered from inside the
-    /// admission stack (`metrics_gate_mw -> DefaultBodyLimit -> admission`)
-    /// to outside it (`metrics_gate_mw -> admission -> DefaultBodyLimit`),
-    /// still inside rate-limiting, matching this module's own doc comment.
-    /// **Not discriminating on its own** (the same caveat
-    /// `unauthenticated_request_never_reaches_admission` above carries for a
-    /// different layer pair): `axum::extract::DefaultBodyLimit`'s `Layer`
-    /// implementation only inserts a request extension consulted later by
-    /// the `Bytes`/`Json` extractors deep inside the handler -- it never
-    /// rejects anything itself, at either position, and `tower::load_shed`
-    /// decides a genuine "is a permit available" race before either
-    /// position is reached (see the deviation recorded for this package).
-    /// This test only proves the ceiling still applies once
-    /// `max_concurrent_requests` is tightened to its minimum (1) -- i.e.
-    /// the reorder must not regress `oversized_body_is_rejected_with_413`
-    /// above -- and that the response is genuinely `413`, not a `408`/`504`
-    /// timeout from the admission layer's own `.timeout(..)`.
-    #[tokio::test]
-    async fn oversized_body_is_rejected_with_413_even_with_a_single_permit() {
-        let mut cfg = ServerConfig::default();
-        cfg.limits.max_body_bytes = 16;
-        cfg.limits.max_concurrent_requests = 1;
-        let router = router_for(&cfg);
-
-        let body = Body::from(vec![b'a'; 4096]);
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header("content-type", "application/json")
-            .body(body)
-            .expect("request");
-        let resp = router.oneshot(req).await.expect("response");
-        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    }
-
-    #[tokio::test]
-    async fn serve_metrics_registry_is_mounted_and_counts_requests() {
-        let cfg = ServerConfig::default();
-        let router = router_for(&cfg);
-
-        let _ = router
-            .clone()
-            .oneshot(
-                Request::get("/health")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-
-        let resp = router
-            .oneshot(
-                Request::get("/metrics/serve")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .expect("read body");
-        let text = String::from_utf8_lossy(&body);
-        assert!(
-            text.contains("oxibonsai_serve_http_requests_total"),
-            "the mounted registry must report the /health request it just counted: {text}"
-        );
-    }
-
-    /// THE regression test for the blocking finding: five distinct,
-    /// never-registered paths must collapse into exactly ONE
-    /// `route="other"` counter series (aggregating all five hits), never
-    /// five independent series keyed by the raw client-chosen path.
-    /// Reproduced (pre-fix) as: `GET /attacker-path-0..4` each produced
-    /// their own `oxibonsai_serve_http_requests_total{route="/attacker-path-N",...}`
-    /// line plus a full ~12-line histogram, an unbounded-cardinality
-    /// remote memory-growth vector.
-    #[tokio::test]
-    async fn unmatched_paths_collapse_into_a_single_other_metrics_series() {
-        let cfg = ServerConfig::default();
-        let router = router_for(&cfg);
-
-        for i in 0..5 {
-            let resp = router
-                .clone()
-                .oneshot(
-                    Request::get(format!("/attacker-path-{i}"))
-                        .body(Body::empty())
-                        .expect("request"),
-                )
-                .await
-                .expect("response");
-            // Unmatched paths hit axum's default fallback: 404.
-            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        }
-
-        let resp = router
-            .oneshot(
-                Request::get("/metrics/serve")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .expect("read body");
-        let text = String::from_utf8_lossy(&body);
-
-        for i in 0..5 {
-            assert!(
-                !text.contains(&format!("attacker-path-{i}")),
-                "a raw client-chosen path must never appear as a metric label: {text}"
-            );
-        }
-
-        let other_counter_lines: Vec<&str> = text
-            .lines()
-            .filter(|l| {
-                l.starts_with("oxibonsai_serve_http_requests_total{")
-                    && l.contains("route=\"other\"")
-            })
-            .collect();
-        assert_eq!(
-            other_counter_lines.len(),
-            1,
-            "5 distinct unmatched paths must collapse into exactly one route=\"other\" \
-             counter series, got: {other_counter_lines:?}\nfull body:\n{text}"
-        );
-        assert!(
-            other_counter_lines[0].trim_end().ends_with(" 5"),
-            "the single other-labelled series must have aggregated all 5 requests: \
-             {other_counter_lines:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn metrics_disabled_returns_404() {
-        let mut cfg = ServerConfig::default();
-        cfg.observability.metrics_enabled = false;
-        let router = router_for(&cfg);
-        let resp = router
-            .oneshot(
-                Request::get("/metrics")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    /// FIX2-SERVE item 2: `/metrics/serve` must obey
-    /// `observability.metrics_enabled` too -- it previously stayed live (and
-    /// is separately exempt from `bearer_auth`, alongside `/health` and
-    /// `/metrics`, so Prometheus scrapers work unauthenticated), so an
-    /// operator who explicitly disabled metrics still exposed the full
-    /// serve registry unauthenticated.
-    #[tokio::test]
-    async fn metrics_disabled_also_blocks_the_serve_registry() {
-        let mut cfg = ServerConfig::default();
-        cfg.observability.metrics_enabled = false;
-        let router = router_for(&cfg);
-        let resp = router
-            .oneshot(
-                Request::get("/metrics/serve")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn custom_metrics_path_reaches_the_real_handler() {
-        let mut cfg = ServerConfig::default();
-        cfg.observability.metrics_path = "/custom-metrics".to_string();
-        let router = router_for(&cfg);
-        let resp = router
-            .oneshot(
-                Request::get("/custom-metrics")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    // ─── sec-20 / perf-M1: pool-size-derived admission limit ───────────────
-
-    #[test]
-    fn admission_limit_is_clamped_by_a_small_pool() {
-        // The exact regression: default 32, single-replica GPU-tier pool.
-        assert_eq!(resolve_admission_limit(32, 1), 4);
-    }
-
-    #[test]
-    fn admission_limit_respects_a_lower_explicit_configuration() {
-        // An operator who deliberately tightened it below the heuristic is
-        // never loosened back up.
-        assert_eq!(resolve_admission_limit(2, 1), 2);
-    }
-
-    #[test]
-    fn admission_limit_is_unaffected_by_a_large_enough_pool() {
-        assert_eq!(resolve_admission_limit(32, 8), 32);
-    }
-
-    #[test]
-    fn admission_limit_is_never_zero() {
-        assert_eq!(resolve_admission_limit(0, 0), 1);
-    }
-
-    /// Direct, deterministic proof that `config.limits.max_input_tokens` /
-    /// `per_request_timeout_ms` are actually converted into the
-    /// `RequestLimits` `build_router` passes into `RouterOptions` -- the
-    /// specific wiring gap findings `SV-15`/`SV-16`/`SV-23` describe
-    /// (validation existed, the value never reached `AppState`).
-    #[test]
-    fn resolve_request_limits_derives_from_config() {
-        let mut cfg = ServerConfig::default();
-        cfg.limits.max_input_tokens = 777;
-        cfg.limits.per_request_timeout_ms = 4321;
-        let limits = resolve_request_limits(&cfg);
-        assert_eq!(limits.max_input_tokens, Some(777));
-        assert_eq!(
-            limits.per_request_timeout,
-            Some(Duration::from_millis(4321))
-        );
-    }
-
-    /// End-to-end proof that `per_request_timeout_ms` actually bounds the
-    /// handler (not just that the value is threaded through, which the test
-    /// above already covers deterministically): the tokio-level timeout
-    /// wraps engine acquisition + tokenization + generation as a whole, so
-    /// an implausibly short 1ms budget must trip it even on the tiny
-    /// in-memory test model. `max_tokens` is the largest value that still
-    /// fits `Qwen3Config::tiny_test()`'s `max_context_length` (512) against
-    /// the single-token no-tokenizer fallback prompt this test's router
-    /// uses, so the request is admitted (not rejected as
-    /// `context_length_exceeded`) and actually reaches generation.
-    #[tokio::test]
-    async fn per_request_timeout_returns_408_for_a_slow_request() {
-        let mut cfg = ServerConfig::default();
-        cfg.limits.per_request_timeout_ms = 1;
-        let router = router_for(&cfg);
-
-        let payload = serde_json::json!({
-            "messages": [{"role": "user", "content": "hello"}],
-            "max_tokens": 500,
-        });
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header("content-type", "application/json")
-            .body(Body::from(payload.to_string()))
-            .expect("request");
-        let resp = router.oneshot(req).await.expect("response");
-        // The same `per_request_timeout_ms` value bounds two independent
-        // layers that race on a slow request: the outer tower
-        // admission-layer `.timeout(..)` (`handle_admission_error` maps its
-        // `Elapsed` to `408`) and the inner `RequestLimits.per_request_timeout`
-        // this test exists to prove is wired (`chat_completions` maps its
-        // `tokio::time::timeout` to `ApiError::timeout()` = `504`). Either
-        // one firing proves the 1ms budget took effect instead of the
-        // request completing normally with `200`.
-        assert!(
-            matches!(
-                resp.status(),
-                StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT
-            ),
-            "expected a timeout status (408 or 504), got {}",
-            resp.status()
-        );
-    }
-}
+#[path = "hardening/build_router_tests.rs"]
+mod build_router_tests;

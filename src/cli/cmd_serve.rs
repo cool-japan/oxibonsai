@@ -11,13 +11,18 @@
 //!
 //! * the context window defaults to 8192 for a Bonsai 2 `qwen35` model
 //!   (4096 otherwise) and is refused above the model's own limit or the
-//!   RAM-derived one (REQUIRED #8);
+//!   RAM-derived one (design §5.6 / Appendix A.3);
 //! * the pool's baseline sampling parameters are the model's own
 //!   `general.sampling.*` defaults (RT-17; Bonsai 2: 1.0 / 0.95 / 20), each
 //!   per-request field overriding them;
 //! * the tokenizer goes through the same vocab-aware ladder and hard
 //!   compatibility check as `run` (TOK-08), with the GGUF's own chat
-//!   template attached (B2-13 fix-pass LEAD ITEM);
+//!   template attached — resolved ONCE for the
+//!   whole startup, however many consumers (router, embedder, RAG) need
+//!   their own instance ([`resolve_all_serving_tokenizers`]);
+//! * the model's declared `general.sampling.min_p` becomes every replica's
+//!   sampling baseline; a request's own `min_p` overrides it for that
+//!   request only;
 //! * `--think`/`--no-think`, `--reasoning-effort` and `--tools` become the
 //!   server-wide defaults a chat request inherits when it carries none of
 //!   its own ([`inject_chat_defaults`]).
@@ -52,7 +57,7 @@ use super::util::{build_sampling_params, missing_tokenizer_warning};
 //
 // The pre-RT-17 literals (`run`/`chat`'s own final fallbacks) apply only
 // when the model declares no `general.sampling.*` value; `repetition_penalty`
-// is always the no-op 1.0 (FIX2-SERVE item 6: never the hidden non-1.0 value
+// is always the no-op 1.0 (never the hidden non-1.0 value
 // an old `SamplingParams::default()` carried).
 
 /// The baseline `SamplingParams` the engine pool is built with, before any
@@ -92,6 +97,11 @@ pub(crate) struct ServeArgs {
     pub(crate) port: u16,
     /// `None` = the per-architecture default (8192 for `qwen35`, else 4096).
     pub(crate) max_seq_len: Option<usize>,
+    /// `[sampling].seed` from `--config`, already validated (`mod.rs`'s
+    /// `resolve_seed_override`; serve has no `--seed` flag of its own).
+    /// `None` when unset, in which case [`resolve_seed`] falls back to
+    /// `OXIBONSAI_SEED` or a pseudo-random value.
+    pub(crate) toml_seed: Option<u64>,
     pub(crate) tokenizer: Option<String>,
     pub(crate) pool_size: Option<usize>,
     pub(crate) bearer_token: Option<String>,
@@ -134,6 +144,7 @@ pub(crate) async fn run(args: ServeArgs) -> anyhow::Result<()> {
         host,
         port,
         max_seq_len,
+        toml_seed,
         tokenizer,
         pool_size,
         bearer_token,
@@ -252,8 +263,9 @@ pub(crate) async fn run(args: ServeArgs) -> anyhow::Result<()> {
         .unwrap_or("")
         .to_string();
 
-    // REQUIRED #8: qwen35 → 8192 default + the RAM/model-limit guard; the
-    // `--rope-scaling` pre-flight (shared with run/chat).
+    // The context guard (design §5.6 / Appendix A.3): qwen35 → 8192
+    // default + the RAM/model-limit guard; the `--rope-scaling` pre-flight
+    // (shared with run/chat).
     let max_seq_len = super::cmd_run::apply_bonsai2_load_time_guards(
         gguf,
         &arch,
@@ -273,18 +285,23 @@ pub(crate) async fn run(args: ServeArgs) -> anyhow::Result<()> {
             declared.temperature.is_some() || declared.top_p.is_some() || declared.top_k.is_some(),
         "baseline sampling parameters (per-request fields override)"
     );
-    if let Some(min_p) = declared.min_p.filter(|&m| m > 0.0) {
+    // GGUF-declared `general.sampling.min_p` becomes every replica's
+    // baseline (`InferenceEngine::set_min_p`, applied pool-wide below once
+    // the pool exists): a request's own `min_p` overrides it for that
+    // request only and is restored afterwards (`server/sampling_scope.rs`).
+    let declared_min_p = declared.min_p.unwrap_or(0.0);
+    if declared_min_p > 0.0 {
         tracing::info!(
-            min_p,
-            "the model declares general.sampling.min_p, but the HTTP API has no per-request \
-             min-p seam yet (a request's min_p > 0 is refused), so the server does not apply \
-             it; `oxibonsai run`/`chat` do"
+            min_p = declared_min_p,
+            "applying the model's declared general.sampling.min_p as every replica's baseline \
+             (a request's own min_p overrides it for that request only)"
         );
     }
     let metrics = Arc::new(oxibonsai_runtime::InferenceMetrics::new());
 
-    // cli-M5: a pseudo-random seed unless OXIBONSAI_SEED pins one.
-    let seed = resolve_seed();
+    // cli-M5: a pseudo-random seed unless OXIBONSAI_SEED or `[sampling].seed`
+    // (--config) pins one.
+    let seed = resolve_seed(toml_seed);
     tracing::info!(seed, "resolved RNG seed");
 
     let built = oxibonsai_runtime::engine_pool::build_pool_from_static_gguf_with_rope(
@@ -298,9 +315,16 @@ pub(crate) async fn run(args: ServeArgs) -> anyhow::Result<()> {
     )?;
     let pool = Arc::clone(&built.pool);
     pool.set_metrics_all(&metrics)?;
+    // The GGUF-declared min_p (or 0.0, disabling the filter) is every
+    // replica's baseline BEFORE the first lease is ever handed out.
+    pool.set_min_p_all(declared_min_p)?;
     let pool_size_actual = pool.size();
     // `--prefill-chunk` on every replica, and the engine-accessor summary
-    // line (cli-16 / REQUIRED #14) — held all at once, before serving.
+    // line (cli-16) — held all at once, before serving. The admin engine
+    // report is captured here too (replica #1 is only ever reachable
+    // through a lease) and threaded through `RouterOptions` below, rather
+    // than a process-wide registration.
+    let mut engine_report = None;
     {
         let mut leases = Vec::with_capacity(pool_size_actual);
         for _ in 0..pool_size_actual {
@@ -321,30 +345,45 @@ pub(crate) async fn run(args: ServeArgs) -> anyhow::Result<()> {
                 ));
             }
             tracing::info!(replicas = pool_size_actual, "{summary}");
-            // B2-09 / REQUIRED #14: `/admin/status` and `/admin/config`
+            // `/admin/status` and `/admin/config`
             // report the resolved variant and the effective kernel tier.
-            oxibonsai_runtime::admin::register_served_engine_report(
-                oxibonsai_runtime::admin::EngineReport::from_engine(first),
-            );
+            engine_report = Some(oxibonsai_runtime::admin::EngineReport::from_engine(first));
         }
     }
 
-    // TOK-08 + B2-13 LEAD ITEM: every tokenizer instance comes from the same
-    // vocab-aware ladder with the GGUF's own template attached.
-    let (tok, lookup) = load_serving_tokenizer(tokenizer.as_deref(), &model, gguf)?;
-    if tok.is_none() {
-        tracing::warn!("{}", missing_tokenizer_warning(&lookup.searched));
+    // TOK-08: every tokenizer instance the server
+    // needs (router, embedder, RAG) comes from ONE authoritative
+    // resolution, with the GGUF's own template attached; further instances
+    // are derived quietly (`TokenizerBridge` is not `Clone`), instead of
+    // repeating the resolution's own logging and TOK-08 compatibility check
+    // once per consumer.
+    #[cfg(feature = "rag")]
+    let need_rag = rag;
+    #[cfg(not(feature = "rag"))]
+    let need_rag = false;
+    let tokenizers = resolve_all_serving_tokenizers(
+        tokenizer.as_deref(),
+        &model,
+        gguf,
+        matches!(embedding_backend, EmbeddingBackendChoice::Model),
+        need_rag,
+    )?;
+    if tokenizers.router.is_none() {
+        tracing::warn!("{}", missing_tokenizer_warning(&tokenizers.lookup.searched));
     }
 
     // SV-25 / RT-08: `/v1/embeddings` from a dedicated embedding engine
-    // (dense models); a hybrid model answers the honest 501.
-    let mut tfidf_embeddings = None;
+    // (dense OR hybrid models alike); TF-IDF from a fitted
+    // registry through the SAME router seam as the model-backed embedder
+    // (no CLI-side interceptor); `None` from either arm carries its
+    // reason into the `501` body.
+    let mut embeddings_registry = None;
+    let mut embedder_unavailable = None;
     let embedder = match embedding_backend {
         EmbeddingBackendChoice::Model => {
-            let (embed_tok, _) = load_serving_tokenizer(tokenizer.as_deref(), &model, gguf)?;
-            build_embedder(
+            let (built_embedder, reason) = build_embedder(
                 &built,
-                embed_tok,
+                tokenizers.embedder,
                 EmbeddingEngineLoad {
                     params,
                     seed,
@@ -352,22 +391,26 @@ pub(crate) async fn run(args: ServeArgs) -> anyhow::Result<()> {
                     backend,
                     rope_scaling,
                 },
-            )
+            );
+            embedder_unavailable = reason;
+            built_embedder
         }
         EmbeddingBackendChoice::Tfidf => {
             let corpus = tfidf_corpus.unwrap_or_default();
-            let router = build_tfidf_embeddings_router(&corpus, Arc::clone(&metrics));
+            let registry = oxibonsai_runtime::embeddings::EmbedderRegistry::new(TFIDF_MAX_FEATURES);
+            registry.fit_tfidf(&corpus);
             tracing::info!(
                 documents = corpus.len(),
                 max_features = TFIDF_MAX_FEATURES,
                 "serving /v1/embeddings from a TF-IDF vocabulary fitted on --embedding-corpus \
                  (lexical, non-semantic vectors)"
             );
-            tfidf_embeddings = Some(router);
+            embeddings_registry = Some(registry);
             None
         }
         EmbeddingBackendChoice::None => {
             tracing::info!("--embedding-backend none: /v1/embeddings answers 501");
+            embedder_unavailable = Some((None, "--embedding-backend none".to_string()));
             None
         }
     };
@@ -386,21 +429,33 @@ pub(crate) async fn run(args: ServeArgs) -> anyhow::Result<()> {
     if let Some(ceiling) = max_output_tokens {
         router_options = router_options.with_max_output_tokens_ceiling(ceiling);
     }
+    if let Some(registry) = embeddings_registry {
+        router_options = router_options.with_embeddings_registry(registry);
+    }
+    if let Some((code, message)) = embedder_unavailable {
+        router_options = router_options.with_embedder_unavailable(code, message);
+    }
+    if let Some(report) = engine_report {
+        router_options = router_options.with_engine_report(report);
+    }
     if enable_ui {
         tracing::info!("serving the bundled chat UI at GET /ui (--enable-ui)");
     }
 
     #[cfg_attr(not(feature = "rag"), allow(unused_mut))]
-    let mut router =
-        create_router_full(Arc::clone(&pool), tok, Arc::clone(&metrics), router_options);
+    let mut router = create_router_full(
+        Arc::clone(&pool),
+        tokenizers.router,
+        Arc::clone(&metrics),
+        router_options,
+    );
 
     #[cfg(feature = "rag")]
     if rag {
-        let (rag_tok, _) = load_serving_tokenizer(tokenizer.as_deref(), &model, gguf)?;
         tracing::info!("mounting RAG HTTP API (/rag/index, /rag/query, /rag/stats)");
         router = router.merge(oxibonsai_runtime::rag_server::create_rag_router_with_pool(
             Arc::clone(&pool),
-            rag_tok,
+            tokenizers.rag,
         ));
     }
 
@@ -427,7 +482,6 @@ pub(crate) async fn run(args: ServeArgs) -> anyhow::Result<()> {
             .or_else(|| env_f64("OXIBONSAI_RATE_LIMIT_BURST"))
             .unwrap_or(20.0),
         chat_defaults: ChatDefaults::from_contract(&contract),
-        embeddings_override: tfidf_embeddings,
     };
     if !opts.chat_defaults.is_empty() {
         tracing::info!(
@@ -507,48 +561,17 @@ fn load_embedding_corpus(path: &str) -> anyhow::Result<Vec<String>> {
     Ok(documents)
 }
 
-/// The `/v1/embeddings` router of `--embedding-backend tfidf`: the runtime's
-/// own embeddings handler over a registry whose TF-IDF vocabulary is fitted
-/// once, here, on `corpus`, recording onto the server's shared metrics.
-fn build_tfidf_embeddings_router(
-    corpus: &[String],
-    metrics: Arc<oxibonsai_runtime::InferenceMetrics>,
-) -> Router {
-    let registry = oxibonsai_runtime::embeddings::EmbedderRegistry::new(TFIDF_MAX_FEATURES);
-    registry.fit_tfidf(corpus);
-    oxibonsai_runtime::embeddings::create_embeddings_router_from_state(
-        oxibonsai_runtime::embeddings::EmbeddingAppState::from_registry(registry)
-            .with_metrics(metrics),
-    )
-}
-
-/// Answers `POST /v1/embeddings` from the TF-IDF router instead of the
-/// runtime router's model-only route (which answers 501 without a model
-/// embedder); every other request passes through untouched. Mounted
-/// innermost by [`harden_router`], so auth, rate limiting, the body limit
-/// and admission apply exactly as for the built-in route.
-async fn embeddings_override_mw(
-    State(embeddings): State<Router>,
-    req: Request<Body>,
-    next: Next,
-) -> Response {
-    if req.method() == axum::http::Method::POST && req.uri().path() == "/v1/embeddings" {
-        use tower::ServiceExt as _;
-        return match embeddings.oneshot(req).await {
-            Ok(response) => response,
-            Err(never) => match never {},
-        };
-    }
-    next.run(req).await
-}
-
-/// One serving tokenizer instance (B2-13 fix-pass LEAD ITEM + TOK-08): the
+/// One serving tokenizer instance (TOK-08): the
 /// `run`/`chat` ladder — an explicit `--tokenizer`, else a vocab-matching
 /// `tokenizer.json` next to the model, else the vocabulary embedded in the
 /// GGUF — with the hard compatibility check and the GGUF's own
 /// `tokenizer.chat_template` attached (the built-in ChatML fallback only
-/// for a file that ships none). Called once per consumer (router, embedder,
-/// RAG) because `TokenizerBridge` is not `Clone`.
+/// for a file that ships none). Logs "resolved chat template" and the
+/// tokenizer-source line exactly once, whatever the outcome. Test-only:
+/// `run` itself resolves through [`resolve_all_serving_tokenizers`], which
+/// covers the multi-consumer case this single-tokenizer helper does not
+/// need to.
+#[cfg(test)]
 fn load_serving_tokenizer(
     explicit: Option<&str>,
     model: &str,
@@ -557,7 +580,63 @@ fn load_serving_tokenizer(
     Option<oxibonsai_runtime::TokenizerBridge>,
     super::util::TokenizerLookup,
 )> {
-    super::util::resolve_serving_tokenizer(explicit, model, gguf)
+    let (tok, lookup, _source) = super::util::resolve_serving_tokenizer(explicit, model, gguf)?;
+    Ok((tok, lookup))
+}
+
+/// Every `TokenizerBridge` instance `serve` needs, all derived from ONE
+/// authoritative resolution: `TokenizerBridge` is not `Clone`, so the
+/// router, the model-backed embedder and the RAG router each need their own
+/// instance. Resolving once — the vocab-aware ladder plus the TOK-08
+/// compatibility check, with their "resolved chat template" and
+/// tokenizer-source logging — and deriving any further instances quietly
+/// ([`super::util::rebuild_serving_tokenizer`]) logs each line exactly once
+/// per startup, however many consumers need their own instance.
+struct ServingTokenizers {
+    /// The router's own tokenizer (`None` = no usable tokenizer at all).
+    router: Option<oxibonsai_runtime::TokenizerBridge>,
+    /// `router`'s lookup, for [`missing_tokenizer_warning`].
+    lookup: super::util::TokenizerLookup,
+    /// A further instance for the model-backed embedder, when requested.
+    embedder: Option<oxibonsai_runtime::TokenizerBridge>,
+    /// A further instance for the RAG router, when requested (only the
+    /// `rag` feature has a consumer for it).
+    #[cfg(feature = "rag")]
+    rag: Option<oxibonsai_runtime::TokenizerBridge>,
+}
+
+/// Resolve [`ServingTokenizers`]. Sync and free of any I/O beyond parsing
+/// `gguf`'s already-loaded metadata, so it is directly unit-testable (unlike
+/// `run`, which is async and loads a real model) under
+/// `tracing::subscriber::with_default`.
+fn resolve_all_serving_tokenizers(
+    explicit: Option<&str>,
+    model: &str,
+    gguf: &oxibonsai_core::gguf::reader::GgufFile<'_>,
+    need_embedder: bool,
+    need_rag: bool,
+) -> anyhow::Result<ServingTokenizers> {
+    let (router, lookup, source) = super::util::resolve_serving_tokenizer(explicit, model, gguf)?;
+    let rebuild = |need: bool| -> anyhow::Result<Option<oxibonsai_runtime::TokenizerBridge>> {
+        match (need, &source) {
+            (true, Some(source)) => super::util::rebuild_serving_tokenizer(source, gguf).map(Some),
+            _ => Ok(None),
+        }
+    };
+    let embedder = rebuild(need_embedder)?;
+    #[cfg(feature = "rag")]
+    let rag = rebuild(need_rag)?;
+    // Without the `rag` feature nothing consumes a RAG tokenizer, so the
+    // request is honoured by not building one.
+    #[cfg(not(feature = "rag"))]
+    let _ = need_rag;
+    Ok(ServingTokenizers {
+        router,
+        lookup,
+        embedder,
+        #[cfg(feature = "rag")]
+        rag,
+    })
 }
 
 /// How the dedicated embedding engine is built: the pool's own sampling
@@ -593,23 +672,37 @@ fn build_embedding_engine(
     )
 }
 
+/// Why there is no model-backed embedder: an `error.code` (an engine
+/// refusal's own code, e.g. `NOT_A_DENSE_MODEL`), or `None` for a generic
+/// reason, and a human-readable message — for
+/// `RouterOptions::with_embedder_unavailable`.
+type EmbedderUnavailable = (Option<&'static str>, String);
+
 /// The model-backed embedder `/v1/embeddings` is served from (SV-25 /
-/// RT-08), or `None` — the route's honest `501` — when there can be none.
+/// RT-08), or `None` — the route's honest `501` — when there can be none,
+/// alongside why: `error.code` (an engine refusal's own code, e.g.
+/// `NOT_A_DENSE_MODEL`) and a human-readable message, carried into the
+/// `501` body through `RouterOptions::with_embedder_unavailable` instead of
+/// staying log-only.
 ///
-/// A dense model gets a dedicated embedding engine
-/// ([`build_embedding_engine`]) with its KV window bounded by the embedder's
-/// input ceiling. A hybrid (`qwen35`) model is refused with the typed
-/// `NOT_A_DENSE_MODEL` error before any second model instance is built — a
-/// known limitation until the hybrid model exposes its pre-LM-head hidden
-/// states — which is logged, not fatal.
+/// A dense OR hybrid (`qwen35`) model (hybrids embed too) gets a
+/// dedicated embedding engine ([`build_embedding_engine`]) with its KV
+/// window bounded by the embedder's input ceiling. The `NOT_A_DENSE_MODEL`
+/// arm stays as a defensive branch for a future dense-only refinement of the
+/// engine seam; it is not reachable for the models this build actually
+/// supports.
 fn build_embedder(
     built: &oxibonsai_runtime::engine_pool::PoolBuild,
     tokenizer: Option<oxibonsai_runtime::TokenizerBridge>,
     load: EmbeddingEngineLoad,
-) -> Option<Arc<oxibonsai_runtime::embed_engine::ModelEmbedder>> {
+) -> (
+    Option<Arc<oxibonsai_runtime::embed_engine::ModelEmbedder>>,
+    Option<EmbedderUnavailable>,
+) {
     let Some(tokenizer) = tokenizer else {
-        tracing::info!("no tokenizer: /v1/embeddings answers 501 (an embedder needs one)");
-        return None;
+        let reason = "no tokenizer: an embedder needs one to encode text".to_string();
+        tracing::info!("{reason}; /v1/embeddings answers 501");
+        return (None, Some((None, reason)));
     };
     let window = load.max_seq_len.clamp(
         1,
@@ -617,8 +710,6 @@ fn build_embedder(
     );
     let tokenizer = Arc::new(tokenizer);
     let result = if oxibonsai_model::hybrid::LoadedModel::is_hybrid_gguf(built.gguf) {
-        // The runtime's own constructor refuses a hybrid file with the typed
-        // error before building anything.
         oxibonsai_runtime::embed_engine::ModelEmbedder::from_static_gguf(
             built.gguf,
             Arc::clone(&built.shared_token_embd),
@@ -639,22 +730,33 @@ fn build_embedder(
                 backend = %load.backend,
                 "serving /v1/embeddings from a dedicated embedding engine"
             );
-            Some(embedder)
+            (Some(embedder), None)
         }
         Err(e) if oxibonsai_runtime::engine::engine_error_code(&e) == Some("NOT_A_DENSE_MODEL") => {
             tracing::info!(
                 error = %e,
-                "embeddings are not supported for this model yet (known limitation); \
-                 /v1/embeddings answers 501"
+                "embeddings are unavailable for this model; /v1/embeddings answers 501"
             );
-            None
+            (
+                None,
+                Some((
+                    oxibonsai_runtime::engine::engine_error_code(&e),
+                    format!("embeddings are unavailable for this model: {e}"),
+                )),
+            )
         }
         Err(e) => {
             tracing::warn!(
                 error = %e,
                 "failed to build the embedding engine; /v1/embeddings answers 501"
             );
-            None
+            (
+                None,
+                Some((
+                    oxibonsai_runtime::engine::engine_error_code(&e),
+                    format!("failed to build the embedding engine: {e}"),
+                )),
+            )
         }
     }
 }
@@ -794,7 +896,7 @@ async fn chat_defaults_mw(
 
 /// Active `Content-Length` precheck — the identical guard
 /// `crates/oxibonsai-serve/src/hardening.rs::content_length_guard_mw`
-/// mounts (wave-2.5 routing (3), SV-30/sec-M3 "one shared stack"): a request
+/// mounts (SV-30/sec-M3 "one shared stack"): a request
 /// whose *declared* size exceeds the limit gets a synchronous `413` before
 /// it can take (or queue for) an admission permit. Only the header is
 /// inspected; a request without `Content-Length` (chunked) passes, and is
@@ -845,9 +947,6 @@ struct HardeningOptions {
     rate_limit_burst: f64,
     /// cli-11 server-wide chat defaults (empty = no rewriting layer).
     chat_defaults: ChatDefaults,
-    /// `--embedding-backend tfidf`: the router `POST /v1/embeddings` is
-    /// answered from (`None` = the runtime router's own route).
-    embeddings_override: Option<Router>,
 }
 
 /// Apply the full hardening stack to an already-assembled base router
@@ -859,13 +958,19 @@ struct HardeningOptions {
 /// `sec-07` / `SV-10` / `cli-18`):
 ///
 /// ```text
-/// routes -> [TF-IDF embeddings] -> [chat-defaults rewrite] -> admission (concurrency+timeout)
+/// routes -> [chat-defaults rewrite] -> admission (concurrency+timeout)
 ///        -> DefaultBodyLimit -> Content-Length precheck -> rate-limit
 ///        -> bearer-auth -> CORS (outermost)
 /// ```
 ///
+/// `--embedding-backend tfidf` is no longer a separate layer here: `run`
+/// passes its fitted `EmbedderRegistry` into `RouterOptions::with_embeddings_registry`
+/// before the base router is even built, so `POST /v1/embeddings` is one
+/// of `router`'s own routes and every layer below applies to it
+/// exactly as to any other route.
+///
 /// — the same stack `crates/oxibonsai-serve/src/hardening.rs::build_router`
-/// builds (wave-2.5 routing (3)), plus the optional chat-defaults rewrite
+/// builds, plus the optional chat-defaults rewrite
 /// innermost (only mounted when `--think`/`--no-think`/`--reasoning-effort`/
 /// `--tools` set a server-wide default).
 ///
@@ -883,17 +988,9 @@ fn harden_router(
     // pool size rather than admitting `max_concurrent_requests` (default
     // 32) against a single-replica GPU-tier pool.
     //
-    // FIX2-SERVE item 3: applied here, BEFORE `DefaultBodyLimit` below, so
+    // Applied here, BEFORE `DefaultBodyLimit` below, so
     // `DefaultBodyLimit` ends up mounted OUTSIDE (more outer than) this
     // admission stack.
-    // `--embedding-backend tfidf`: innermost, so every outer guard applies
-    // to the TF-IDF route exactly as to the built-in one.
-    if let Some(embeddings) = &opts.embeddings_override {
-        router = router.layer(axum::middleware::from_fn_with_state(
-            embeddings.clone(),
-            embeddings_override_mw,
-        ));
-    }
     // cli-11: the server-wide chat defaults, innermost so the body read is
     // covered by admission's timeout exactly like the handler's own read.
     if !opts.chat_defaults.is_empty() {
@@ -917,7 +1014,7 @@ fn harden_router(
     // SV-27/sec-16: explicit, configurable request body ceiling instead of
     // axum's implicit 2 MiB default.
     //
-    // FIX2-SERVE item 3: moved from *inside* `admission` (above) to
+    // Moved from *inside* `admission` (above) to
     // *outside* it (still inside rate-limit, below). This reorder is
     // correctness-neutral for the permit-holding concern the finding named
     // -- `axum`'s `DefaultBodyLimit` only inserts a request extension
@@ -925,11 +1022,11 @@ fn harden_router(
     // eventual handler, unconditionally calling its inner service with no
     // check of its own at either position -- but it is the right relative
     // position for when a real synchronous body-size guard is added outside
-    // `admission`; see this package's recorded deviations, and the fuller
-    // version of this note on `crates/oxibonsai-serve/src/hardening.rs::build_router`.
+    // `admission`. The fuller
+    // version of this note lives on `crates/oxibonsai-serve/src/hardening.rs::build_router`.
     router = router.layer(DefaultBodyLimit::max(opts.max_body_bytes));
 
-    // Wave-2.5 routing (3): the ACTIVE synchronous `Content-Length`
+    // The ACTIVE synchronous `Content-Length`
     // precheck `oxibonsai-serve`'s `build_router` mounts at this same
     // position — a request whose declared size exceeds the limit is refused
     // with a real 413 before it can hold (or wait for) an admission permit.
@@ -965,11 +1062,10 @@ fn harden_router(
             ))
         }
         None => {
-            // sec-M2's correction, `REQUIRED #6`: this used to claim
-            // `/admin/*` was unauthenticated too, which stopped being true
-            // once `create_router_full` started gating it unconditionally
-            // (403 without a configured admin token) -- state the real
-            // sec-15 behavior instead.
+            // sec-M2/sec-15: `/admin/*` is always gated by
+            // `create_router_full` (403 without a configured admin token)
+            // regardless of this branch; the warning below is about the
+            // inference endpoints only.
             tracing::warn!(
                 host = %host_for_log,
                 "no --bearer-token / OXIBONSAI_BEARER_TOKEN configured: the inference \
@@ -1012,8 +1108,7 @@ fn is_loopback_host(host: &str) -> bool {
 /// operator explicitly acknowledges the risk (findings `sec-15` / `SV-07` /
 /// `sec-M2`). Kept identical in spirit to
 /// `crates/oxibonsai-serve/src/main.rs::bind_safety_check` (that crate
-/// cannot be depended on from here -- see this package's recorded
-/// deviations).
+/// cannot be depended on from here).
 fn bind_safety_check(
     host: &str,
     bearer_token: Option<&str>,
@@ -1033,7 +1128,7 @@ fn bind_safety_check(
     ))
 }
 
-// ─── FIX2-SERVE item 4: admin-token env asymmetry between the two binaries ──
+// ─── Admin-token env asymmetry between the two binaries ────────────────────
 
 /// Resolve the `/admin/*` authentication policy the same way
 /// `crates/oxibonsai-serve/src/hardening.rs::resolve_admin_auth` does: an
@@ -1056,8 +1151,8 @@ fn bind_safety_check(
 ///
 /// This is the only place in the module that reads either admin-token
 /// environment variable; the actual decision lives in the pure
-/// [`resolve_admin_auth_from`] below (verifier follow-up on this same
-/// finding -- see its doc comment for why the split exists).
+/// [`resolve_admin_auth_from`] below -- see its doc comment for why the
+/// split exists.
 fn resolve_admin_auth() -> AdminAuthConfig {
     resolve_admin_auth_from(
         std::env::var("OXIBONSAI_ADMIN_TOKEN").ok().as_deref(),
@@ -1152,18 +1247,23 @@ fn read_bearer_token_file(path: &str, source: &str) -> anyhow::Result<String> {
 
 // ─── cli-M5: pseudo-random default seed ─────────────────────────────────────
 
-/// Resolve the RNG seed: an `OXIBONSAI_SEED` env override, else a
-/// process/time-derived pseudo-random value (finding `cli-M5`: the previous
-/// literal `42` never varied). Per-request reproducibility comes from a
-/// request's own `seed` field; this is only the replicas' starting state.
-/// No `rand` crate is reachable from this crate without a new Cargo
-/// dependency, and none is needed: this is not cryptographically random, it
-/// only needs to differ from one server start to the next.
-fn resolve_seed() -> u64 {
+/// Resolve the RNG seed: an `OXIBONSAI_SEED` env override, else `toml_seed`
+/// (`[sampling].seed` from `--config`, already validated by
+/// `resolve_seed_override` in `mod.rs`), else a process/time-derived
+/// pseudo-random value (finding `cli-M5`: a hardcoded `42` never varies).
+/// Per-request reproducibility comes from a request's own `seed` field;
+/// this is only the replicas' starting state. No `rand` crate is reachable
+/// from this crate without a new Cargo dependency, and none is needed: this
+/// is not cryptographically random, it only needs to differ from one server
+/// start to the next.
+fn resolve_seed(toml_seed: Option<u64>) -> u64 {
     if let Ok(v) = std::env::var("OXIBONSAI_SEED") {
         if let Ok(seed) = v.parse::<u64>() {
             return seed;
         }
+    }
+    if let Some(seed) = toml_seed {
+        return seed;
     }
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

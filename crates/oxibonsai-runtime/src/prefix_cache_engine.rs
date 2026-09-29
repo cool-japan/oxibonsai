@@ -87,6 +87,8 @@ use oxibonsai_model::prefix_cache::{
 use crate::engine::InferenceEngine;
 use crate::engine_seam::EngineError;
 use crate::error::RuntimeResult;
+#[cfg(test)]
+use crate::sampling::PenaltyParams;
 use crate::sampling::{Sampler, SamplingParams};
 
 /// Whether `model`'s CPU-resident `KvCache` currently holds the true,
@@ -227,14 +229,21 @@ impl<'a> PrefixCachedEngine<'a> {
         );
         let prefix_cache = PrefixAwarePrefill::new(cache);
         let effective_seed = if seed == 0 { 0xdeadbeef_cafebabe } else { seed };
-        // Gatekeeper REQUIRED #18 (waves 3+3.5 review): seed the wrapper's
-        // own decode sampler from the WRAPPED engine's own configured
-        // sampling params (e.g. GGUF-derived defaults per RT-17) rather
-        // than a bare `SamplingParams::default()`, so this "at rest"
-        // baseline (restored by `decode_loop` between calls, see its own
-        // doc comment) never silently diverges from what the engine itself
-        // was actually built with.
-        let sampler = Sampler::new(engine.sampling_params().clone(), effective_seed);
+        // Seed the wrapper's own decode sampler from the WRAPPED engine's
+        // own configured sampling params (e.g. GGUF-derived defaults per
+        // RT-17) rather than a bare `SamplingParams::default()`, so this "at
+        // rest" baseline (restored by `decode_loop` between calls, see its
+        // own doc comment) never silently diverges from what the engine
+        // itself was actually built with. `min_p` and the frequency/presence
+        // `penalties` live outside `SamplingParams`, on the `Sampler`
+        // itself, so `Sampler::new` alone would leave them at their
+        // defaults (`0.0` / disabled) even when the wrapped engine
+        // configures both non-default — carry them across explicitly so the
+        // wrapper's sampler matches the engine's on every axis, not only
+        // the fields `SamplingParams` covers.
+        let mut sampler = Sampler::new(engine.sampling_params().clone(), effective_seed);
+        sampler.set_min_p(engine.min_p());
+        sampler.set_penalties(engine.penalties());
         Self {
             inner: engine,
             prefix_cache,
@@ -478,6 +487,16 @@ impl<'a> PrefixCachedEngine<'a> {
     /// advancing across calls — the same "swap params, keep RNG state"
     /// pattern [`InferenceEngine::generate_with_params`] uses, rather than
     /// discarding the configured seed and re-seeding at 0 every call.
+    ///
+    /// Samples with [`Sampler::sample_with_history`], not the plain
+    /// [`Sampler::sample`], so the repetition/frequency/presence penalties
+    /// carried onto this sampler in [`PrefixCachedEngine::new`] actually take
+    /// effect (M-35 addendum: `new()` alone only stores them). `output` is
+    /// the recent-token history: it starts empty for each `generate()` call
+    /// and grows with every token this loop emits, mirroring exactly how
+    /// [`InferenceEngine::generate`]'s own decode loop seeds
+    /// `sample_with_history` from its `output_tokens` — the prompt itself is
+    /// never included, only what this call has generated so far.
     fn decode_loop(
         &mut self,
         prompt_len: usize,
@@ -488,7 +507,7 @@ impl<'a> PrefixCachedEngine<'a> {
         self.sampler.set_params(params.clone());
         let mut output = Vec::with_capacity(params.max_tokens);
         for (pos, _) in (prompt_len..).zip(0..params.max_tokens) {
-            let next_token = match self.sampler.sample(&last_logits) {
+            let next_token = match self.sampler.sample_with_history(&last_logits, &output) {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::warn!(error = %e, "prefix-cache sampler error");
@@ -791,6 +810,124 @@ mod tests {
             out_a, out_b,
             "two different configured seeds produced identical output; the wrapper is not \
              using the caller-supplied seed"
+        );
+    }
+
+    /// `PrefixCachedEngine::new` must carry the wrapped engine's `min_p` and
+    /// penalties onto its own decode sampler — before this fix it only
+    /// carried `SamplingParams` (via `sampling_params().clone()`), silently
+    /// leaving `min_p` at `0.0` and the penalties at their default
+    /// (disabled) even when the wrapped engine was configured otherwise.
+    #[test]
+    fn new_carries_the_wrapped_engines_min_p_and_penalties_onto_the_decode_sampler() {
+        use oxibonsai_kernels::{KernelDispatcher, KernelTier};
+
+        let config = small_real_config();
+        let model = BonsaiModel::new_for_testing_with_blocks(config);
+        let kernel = KernelDispatcher::with_tier(KernelTier::Reference);
+        // Repetition penalty lives on `SamplingParams` itself, already
+        // carried by `sampling_params().clone()` before this fix — set it
+        // through the constructor too, so this test also confirms that path
+        // kept working.
+        let params = SamplingParams {
+            repetition_penalty: 1.3,
+            ..SamplingParams::default()
+        };
+        let mut engine = InferenceEngine::from_model_with_kernel(model, kernel, params, 42);
+        engine.set_min_p(0.25);
+        engine.set_penalties(PenaltyParams::new(0.6, 0.4));
+
+        let wrapped = PrefixCachedEngine::new(engine, 64, 42);
+
+        assert_eq!(wrapped.sampler.min_p(), 0.25);
+        assert_eq!(*wrapped.sampler.penalties(), PenaltyParams::new(0.6, 0.4));
+        assert_eq!(wrapped.sampler.params().repetition_penalty, 1.3);
+    }
+
+    /// M-35 addendum, closing the gap `new_carries_the_wrapped_engines_*`
+    /// above does not: carrying the penalties onto the wrapper's sampler is
+    /// not enough by itself — `decode_loop` must also *apply* them by
+    /// sampling with [`Sampler::sample_with_history`] instead of the
+    /// unpenalised [`Sampler::sample`]. This proves both that the wrapper
+    /// now matches an independently-constructed plain engine token-for-token
+    /// under the same repetition/frequency/presence penalties, seed and
+    /// params, and that the penalty is not a no-op (a disabled-penalty
+    /// wrapper must diverge from it).
+    #[test]
+    fn decode_loop_applies_the_carried_penalties_like_the_plain_engines_own_loop() {
+        use oxibonsai_kernels::{KernelDispatcher, KernelTier};
+
+        let prompt: Vec<u32> = (0..32).collect();
+        let params = SamplingParams {
+            max_tokens: 8,
+            top_k: 0,
+            top_p: 1.0,
+            temperature: 2.0,
+            repetition_penalty: 1.8,
+        };
+        let penalties = PenaltyParams::new(0.5, 0.3);
+
+        // The wrapped path: same model bytes (deterministic weight init from
+        // `small_real_config()`), same seed, same penalties as the plain
+        // engine below, driven through `PrefixCachedEngine::generate`.
+        let wrapped_model = BonsaiModel::new_for_testing_with_blocks(small_real_config());
+        let wrapped_kernel = KernelDispatcher::with_tier(KernelTier::Reference);
+        let mut wrapped_engine = InferenceEngine::from_model_with_kernel(
+            wrapped_model,
+            wrapped_kernel,
+            params.clone(),
+            99,
+        );
+        wrapped_engine.set_penalties(penalties);
+        let mut wrapped = PrefixCachedEngine::new(wrapped_engine, 64, 99);
+        let wrapped_out = wrapped.generate(&prompt, &params);
+
+        // The reference: an independently-constructed plain `InferenceEngine`
+        // (never wrapped), driven through its own classic decode loop, which
+        // already calls `sample_with_history(&logits, &output_tokens)`.
+        let plain_model = BonsaiModel::new_for_testing_with_blocks(small_real_config());
+        let plain_kernel = KernelDispatcher::with_tier(KernelTier::Reference);
+        let mut plain_engine =
+            InferenceEngine::from_model_with_kernel(plain_model, plain_kernel, params.clone(), 99);
+        plain_engine.set_penalties(penalties);
+        let plain_out = plain_engine
+            .generate(&prompt, params.max_tokens)
+            .expect("plain engine generate");
+
+        assert_eq!(
+            wrapped_out, plain_out,
+            "PrefixCachedEngine::decode_loop must apply the carried penalties exactly like the \
+             plain engine's own decode loop ({wrapped_out:?} vs {plain_out:?})"
+        );
+
+        // Same model/seed, but every penalty this test controls is neutral:
+        // `PenaltyParams` is left at its default (never set on this engine)
+        // *and* `repetition_penalty` is reset to `1.0` (`params.clone()`
+        // alone would not do this -- `repetition_penalty` lives on
+        // `SamplingParams`, so leaving it at 1.8 would keep it active on
+        // this "no-penalty" leg too and the assertion below would only be
+        // exercising the frequency/presence penalties, not the repetition
+        // penalty the M-35 addendum names specifically). The output must
+        // differ from `wrapped_out`, or this test cannot tell "penalties
+        // applied" from "penalties ignored".
+        let no_penalty_params = SamplingParams {
+            repetition_penalty: 1.0,
+            ..params.clone()
+        };
+        let no_penalty_model = BonsaiModel::new_for_testing_with_blocks(small_real_config());
+        let no_penalty_kernel = KernelDispatcher::with_tier(KernelTier::Reference);
+        let no_penalty_engine = InferenceEngine::from_model_with_kernel(
+            no_penalty_model,
+            no_penalty_kernel,
+            no_penalty_params.clone(),
+            99,
+        );
+        let mut no_penalty_wrapped = PrefixCachedEngine::new(no_penalty_engine, 64, 99);
+        let no_penalty_out = no_penalty_wrapped.generate(&prompt, &no_penalty_params);
+        assert_ne!(
+            wrapped_out, no_penalty_out,
+            "the carried penalties (repetition + frequency/presence) must actually change the \
+             sampled ids, or the two decode paths above cannot be distinguished by this test"
         );
     }
 

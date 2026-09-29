@@ -306,7 +306,7 @@ fn the_embedding_engine_honours_backend_and_rope_scaling() {
 fn resolve_seed_env_override_wins() {
     let _env = test_env::lock();
     let _seed = EnvVarGuard::set("OXIBONSAI_SEED", "123456789");
-    assert_eq!(resolve_seed(), 123_456_789);
+    assert_eq!(resolve_seed(None), 123_456_789);
 }
 
 #[test]
@@ -319,12 +319,30 @@ fn resolve_seed_ignores_malformed_override() {
     // collide with astronomically low probability, and a constant
     // fallback -- the actual regression this guards against -- would
     // fail it deterministically.
-    let first = resolve_seed();
+    let first = resolve_seed(None);
     std::thread::sleep(std::time::Duration::from_millis(2));
-    let second = resolve_seed();
+    let second = resolve_seed(None);
     assert_ne!(
         first, second,
         "the pseudo-random fallback must not be a constant"
+    );
+}
+
+#[test]
+fn resolve_seed_toml_wins_over_random_when_env_is_unset() {
+    let _env = test_env::lock();
+    let _seed = EnvVarGuard::remove("OXIBONSAI_SEED");
+    assert_eq!(resolve_seed(Some(777)), 777);
+}
+
+#[test]
+fn resolve_seed_env_beats_toml() {
+    let _env = test_env::lock();
+    let _seed = EnvVarGuard::set("OXIBONSAI_SEED", "123456789");
+    assert_eq!(
+        resolve_seed(Some(777)),
+        123_456_789,
+        "OXIBONSAI_SEED must win over `[sampling].seed`"
     );
 }
 
@@ -461,16 +479,10 @@ fn verify_is_a_noop_when_checksums_file_is_absent() {
         .expect("missing checksums file must not block loading");
 }
 
-// NOTE (sec-12 verifier finding): the previous version of this test
-// ("verify_warns_but_does_not_fail_when_hasher_is_unavailable") never
-// actually wrote a model file, only the checksums entry -- so it
-// exercised `verify_model_checksum`'s `Err(_)` (unreadable file)
-// branch, not an "unavailable hasher" branch, regardless of what
-// `compute_sha256_hex` returned. It is replaced below by tests that
-// exercise the real equality/mismatch branches end to end through this
-// binary's own imported `verify_model_checksum`, plus one correctly
-// named/scoped test for the unreadable-file case it was accidentally
-// covering.
+// sec-12: `verify_model_checksum`'s real equality/mismatch branches,
+// exercised end to end through this binary's own imported function
+// against a model file that actually exists on disk, plus one correctly
+// named/scoped test for the unreadable-file case (`Err(_)`).
 
 #[test]
 fn verify_succeeds_when_the_checksum_really_matches() {
@@ -675,8 +687,15 @@ mod router_tests {
             rate_limit_rpm: None,
             rate_limit_burst: 20.0,
             chat_defaults: ChatDefaults::default(),
-            embeddings_override: None,
         }
+    }
+
+    /// A fitted TF-IDF [`oxibonsai_runtime::embeddings::EmbedderRegistry`],
+    /// for `RouterOptions::with_embeddings_registry`.
+    fn tfidf_registry(corpus: &[String]) -> oxibonsai_runtime::embeddings::EmbedderRegistry {
+        let registry = oxibonsai_runtime::embeddings::EmbedderRegistry::new(TFIDF_MAX_FEATURES);
+        registry.fit_tfidf(corpus);
+        registry
     }
 
     // ── --embedding-backend tfidf ──────────────────────────────────────────
@@ -700,10 +719,14 @@ mod router_tests {
         (status, json)
     }
 
-    /// Without an override the runtime router's model-only route answers
-    /// the honest 501; with `--embedding-backend tfidf` the same request is
-    /// answered from the vocabulary fitted on the corpus — deterministic,
-    /// reported as `"tfidf"`, and still behind the bearer layer.
+    /// Without a registry the runtime router's model-only route answers the
+    /// honest 501; with `--embedding-backend tfidf`'s registry attached via
+    /// `RouterOptions::with_embeddings_registry` (no CLI-side interceptor)
+    /// the same request is answered from the vocabulary fitted
+    /// on the corpus — deterministic, reported as `"tfidf"`, and still
+    /// behind every hardening layer (this router build wraps the base
+    /// router in the FULL stack, so the TF-IDF route is never a special
+    /// case).
     #[tokio::test]
     async fn tfidf_embeddings_are_served_from_the_fitted_corpus() {
         let body = r#"{"input":["the cat sat on the mat","a dog ran"],"model":"m"}"#;
@@ -719,12 +742,10 @@ mod router_tests {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        let mut opts = default_opts();
-        opts.embeddings_override = Some(build_tfidf_embeddings_router(
-            &corpus,
-            Arc::new(InferenceMetrics::new()),
-        ));
-        let router = router_for(opts);
+        let router = router_for_with_options(
+            default_opts(),
+            RouterOptions::default().with_embeddings_registry(tfidf_registry(&corpus)),
+        );
         let (status, first) = post_embeddings(&router, body).await;
         assert_eq!(status, StatusCode::OK, "{first}");
         assert_eq!(
@@ -742,7 +763,7 @@ mod router_tests {
             "the fitted space never drifts"
         );
 
-        // Other routes are untouched by the override.
+        // Other routes are untouched.
         let health = router
             .clone()
             .oneshot(
@@ -754,27 +775,69 @@ mod router_tests {
             .expect("response");
         assert_eq!(health.status(), StatusCode::OK);
 
-        // ...and the bearer layer still guards the overridden route.
+        // ...and the bearer layer still guards the TF-IDF route.
         let mut guarded = default_opts();
         guarded.bearer_token = Some("y".repeat(20));
-        guarded.embeddings_override = Some(build_tfidf_embeddings_router(
-            &corpus,
-            Arc::new(InferenceMetrics::new()),
-        ));
-        let (status, _) = post_embeddings(&router_for(guarded), body).await;
+        let guarded_router = router_for_with_options(
+            guarded,
+            RouterOptions::default().with_embeddings_registry(tfidf_registry(&corpus)),
+        );
+        let (status, _) = post_embeddings(&guarded_router, body).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// The `/v1/embeddings` `501` body carries the reason `build_embedder`
+    /// handed the router via `RouterOptions::with_embedder_unavailable`
+    /// (`error.code` and a message naming it), not just the server log —
+    /// the CLI mirror of the serve crate's own
+    /// `the_serve_path_without_a_tokenizer_keeps_the_honest_501`.
+    #[tokio::test]
+    async fn embeddings_501_body_carries_the_unavailable_reason() {
+        let router = router_for_with_options(
+            default_opts(),
+            RouterOptions::default().with_embedder_unavailable(
+                Some("NOT_A_DENSE_MODEL"),
+                "no dense embedder for this model",
+            ),
+        );
+        let (status, json) = post_embeddings(&router, r#"{"input":"king","model":"m"}"#).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{json}");
+        assert_eq!(json["error"]["code"], "NOT_A_DENSE_MODEL", "{json}");
+        let message = json["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("no dense embedder for this model"),
+            "the 501 body must name why: {json}"
+        );
+    }
+
+    /// [`router_for_with_options`] with no extra `RouterOptions` beyond the
+    /// locked admin auth and the fixed prompt-start token every test in this
+    /// module relies on.
+    fn router_for(opts: HardeningOptions) -> Router {
+        router_for_with_options(opts, RouterOptions::default())
     }
 
     /// Built under the crate-wide env lock: `RouterOptions::default()` reads
     /// `OXI_ADMIN_TOKEN`, which sibling tests may be mutating (the lock is
-    /// released before any `.await`).
-    fn router_for(opts: HardeningOptions) -> Router {
+    /// released before any `.await`). `extra` lets a test attach further
+    /// `RouterOptions` (e.g. `with_embeddings_registry`) before the fixed
+    /// auth and prompt-start-token are applied on top.
+    ///
+    /// This router carries no tokenizer (`create_router_full(pool, None,
+    /// ..)`), so every text-prompting request needs
+    /// `RouterOptions::with_prompt_start_token` or it would fail fast with
+    /// `400 tokenizer_required` before ever reaching the admission/auth/
+    /// rate-limit/body-limit layers these tests actually exercise; no test
+    /// in this module asserts that contract, so it is set unconditionally.
+    fn router_for_with_options(opts: HardeningOptions, extra: RouterOptions) -> Router {
         let _env = test_env::lock();
         let engine = InferenceEngine::new(Qwen3Config::tiny_test(), SamplingParams::default(), 42);
         let pool = EnginePool::new(vec![engine]);
         let pool_size = pool.size();
         let metrics = Arc::new(InferenceMetrics::new());
-        let router_options = RouterOptions::default().with_auth(AdminAuthConfig::locked());
+        let router_options = extra
+            .with_auth(AdminAuthConfig::locked())
+            .with_prompt_start_token(151_644);
         let base = create_router_full(pool, None, metrics, router_options);
         harden_router(base, pool_size, &opts, "127.0.0.1")
     }
@@ -805,6 +868,62 @@ mod router_tests {
             .await
             .expect("response");
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// `/admin/status` and `/admin/config` report the served engine's
+    /// resolved variant and effective kernel tier through the CLI's own
+    /// hardened router (`harden_router`), attached via
+    /// `RouterOptions::with_engine_report` rather than a process-wide
+    /// static.
+    #[tokio::test]
+    async fn admin_reports_the_resolved_variant_and_kernel_tier_through_harden_router() {
+        const TOKEN: &str = "cli-admin-report-token";
+        let report_engine =
+            InferenceEngine::new(Qwen3Config::tiny_test(), SamplingParams::default(), 42);
+        let report = oxibonsai_runtime::admin::EngineReport::from_engine(&report_engine);
+        let engine = InferenceEngine::new(Qwen3Config::tiny_test(), SamplingParams::default(), 42);
+        let pool = EnginePool::new(vec![engine]);
+        let pool_size = pool.size();
+        let metrics = Arc::new(InferenceMetrics::new());
+        // The lock guards only `RouterOptions::default()`'s own
+        // `OXI_ADMIN_TOKEN` read (immediately overridden below by
+        // `with_auth`); it is released here, before any `.await`, matching
+        // `router_for_with_options`'s own convention. This test cannot use
+        // `router_for_with_options` itself: that helper always overwrites
+        // its `RouterOptions` with a locked admin auth, which would keep
+        // every request in this test at 403.
+        let router = {
+            let _env = test_env::lock();
+            let router_options = RouterOptions::default()
+                .with_auth(AdminAuthConfig::with_admin_token(TOKEN))
+                .with_prompt_start_token(151_644)
+                .with_engine_report(report.clone());
+            let base = create_router_full(pool, None, metrics, router_options);
+            harden_router(base, pool_size, &default_opts(), "127.0.0.1")
+        };
+
+        for path in ["/admin/status", "/admin/config"] {
+            let resp = router
+                .clone()
+                .oneshot(
+                    Request::get(path)
+                        .header("x-admin-token", TOKEN)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+            assert_eq!(json["engine"]["variant"], report.variant, "{path}: {json}");
+            assert_eq!(
+                json["engine"]["kernel_tier"], report.kernel_tier,
+                "{path}: {json}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -864,8 +983,8 @@ mod router_tests {
         }
     }
 
-    /// VERIFIER-ADDED (cli-18), ported from the discriminating version
-    /// added to `crates/oxibonsai-serve/src/hardening.rs`'s
+    /// cli-18, mirroring the discriminating version in
+    /// `crates/oxibonsai-serve/src/hardening.rs`'s
     /// `build_router_tests`: the sibling
     /// `unauthenticated_request_never_reaches_admission` above drives
     /// its two requests sequentially through `oneshot`, so the permit
@@ -1087,7 +1206,7 @@ mod router_tests {
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
-    /// Wave-2.5 routing (3): the mirrored `Content-Length` precheck refuses
+    /// The mirrored `Content-Length` precheck refuses
     /// a declared oversize with 413 WHILE the sole admission permit is held
     /// by a slow request — i.e. before admission. Without the guard the
     /// oversized request would queue behind the permit (load-shed 503).
@@ -1322,12 +1441,23 @@ mod serving_tokenizer_tests {
     /// A model file (and optionally a `tokenizer.json` beside it) in a
     /// fresh directory.
     fn fixture(tag: &str, gguf: &[u8], tokenizer_json: bool) -> Fixture {
+        let content = tokenizer_json.then(byte_level_tokenizer_json);
+        fixture_with_tokenizer_json_content(tag, gguf, content.as_deref())
+    }
+
+    /// [`fixture`] with the on-disk `tokenizer.json`'s exact content
+    /// controlled by the caller (`None` = write none) — for a fixture whose
+    /// candidate needs a vocabulary other than [`BYTE_LEVEL_VOCAB`].
+    fn fixture_with_tokenizer_json_content(
+        tag: &str,
+        gguf: &[u8],
+        tokenizer_json_content: Option<&str>,
+    ) -> Fixture {
         let dir = crate::cli::test_fixtures::scratch_dir(&format!("serve_tok_{tag}"));
         let model = dir.join("Model.gguf");
         std::fs::write(&model, gguf).expect("write model");
-        if tokenizer_json {
-            std::fs::write(dir.join("tokenizer.json"), byte_level_tokenizer_json())
-                .expect("write tokenizer.json");
+        if let Some(content) = tokenizer_json_content {
+            std::fs::write(dir.join("tokenizer.json"), content).expect("write tokenizer.json");
         }
         Fixture {
             model: model.to_string_lossy().into_owned(),
@@ -1352,6 +1482,9 @@ mod serving_tokenizer_tests {
 
     #[test]
     fn embedded_vocabulary_and_template_come_from_the_gguf() {
+        // See `tracing_capture_lock`'s doc: every test in this module shares
+        // tokenizer-resolution call sites with the capturing test below.
+        let _tracing_guard = crate::cli::test_fixtures::tracing_capture_lock();
         let fix = fixture(
             "embedded",
             &tokenizer_host_gguf(BYTE_LEVEL_VOCAB, Some(THINKING_TEMPLATE), true),
@@ -1368,6 +1501,8 @@ mod serving_tokenizer_tests {
 
     #[test]
     fn a_tokenizer_json_gets_the_gguf_template_attached() {
+        // See `tracing_capture_lock`'s doc.
+        let _tracing_guard = crate::cli::test_fixtures::tracing_capture_lock();
         let fix = fixture(
             "json_plus_template",
             &tokenizer_host_gguf(BYTE_LEVEL_VOCAB, Some(THINKING_TEMPLATE), false),
@@ -1386,6 +1521,8 @@ mod serving_tokenizer_tests {
 
     #[test]
     fn a_tokenizer_json_with_no_gguf_template_falls_back_to_chatml() {
+        // See `tracing_capture_lock`'s doc.
+        let _tracing_guard = crate::cli::test_fixtures::tracing_capture_lock();
         let fix = fixture(
             "json_no_template",
             &tokenizer_host_gguf(BYTE_LEVEL_VOCAB, None, false),
@@ -1403,6 +1540,8 @@ mod serving_tokenizer_tests {
     fn a_vocabulary_mismatch_is_refused_for_an_explicit_tokenizer() {
         // TOK-08 on serve: the model declares 300 rows, the explicit
         // tokenizer has 262 — a different BPE, a hard error.
+        // See `tracing_capture_lock`'s doc.
+        let _tracing_guard = crate::cli::test_fixtures::tracing_capture_lock();
         let fix = fixture("mismatch", &tokenizer_host_gguf(300, None, false), true);
         let explicit = fix
             .dir
@@ -1413,9 +1552,86 @@ mod serving_tokenizer_tests {
             oxibonsai_core::gguf::reader::mmap_gguf_file(Path::new(&fix.model)).expect("map");
         let gguf = oxibonsai_core::gguf::reader::GgufFile::parse(&mmap).expect("parse");
         let err = load_serving_tokenizer(Some(&explicit), &fix.model, &gguf)
-            .err()
-            .expect("mismatch must be refused");
+            .expect_err("mismatch must be refused");
         assert!(err.to_string().contains("vocabulary mismatch"), "{err}");
+    }
+
+    /// On the 27B-with-a-legacy-`tokenizer.json`-next-to-it shape (an
+    /// auto-detected candidate that does not fit the model, so
+    /// the ladder falls back to the GGUF's own embedded vocabulary), one
+    /// startup that needs THREE independent `TokenizerBridge` instances
+    /// (router, embedder, RAG — none `Clone`) must still log "resolved chat
+    /// template" and the tokenizer-source line exactly ONCE each, not once
+    /// per consumer and not twice within the single resolution itself (the
+    /// original bug: the losing on-disk candidate's template was resolved
+    /// and logged, then the embedded fallback's was too).
+    #[test]
+    fn one_startup_with_three_tokenizer_consumers_logs_each_line_exactly_once() {
+        // Exclusive for the whole test: see `tracing_capture_lock`'s doc.
+        let _tracing_guard = crate::cli::test_fixtures::tracing_capture_lock();
+        let fix = fixture_with_tokenizer_json_content(
+            "resolve_once",
+            &tokenizer_host_gguf(BYTE_LEVEL_VOCAB, Some(THINKING_TEMPLATE), true),
+            // A legacy on-disk candidate whose vocabulary does NOT match
+            // the model's declared (and embedded) BYTE_LEVEL_VOCAB (262) --
+            // exactly the shape that sends a real Bonsai 2 serve through
+            // the mismatch -> embedded-fallback branch.
+            Some(&crate::cli::test_fixtures::tokenizer_json_with_vocab(300)),
+        );
+        let mmap =
+            oxibonsai_core::gguf::reader::mmap_gguf_file(Path::new(&fix.model)).expect("map");
+        let gguf = oxibonsai_core::gguf::reader::GgufFile::parse(&mmap).expect("parse");
+
+        let capture = crate::cli::test_fixtures::CapturedEvents::default();
+        let tokenizers = tracing::subscriber::with_default(capture.clone(), || {
+            // Forces one fresh interest recomputation while `capture` is
+            // this thread's current dispatcher; see `tracing_capture_lock`'s
+            // doc for what actually makes this deterministic (the lock held
+            // above, by this test and every sibling in this module).
+            tracing::callsite::rebuild_interest_cache();
+            resolve_all_serving_tokenizers(None, &fix.model, &gguf, true, true)
+        })
+        .expect("resolve");
+
+        // Every consumer (three with the `rag` feature, two without) got its
+        // own, independently usable instance of the SAME (embedded-fallback)
+        // source.
+        let router = tokenizers.router.expect("router tokenizer");
+        let embedder = tokenizers.embedder.expect("embedder tokenizer");
+        #[cfg(feature = "rag")]
+        let rag = tokenizers.rag.expect("rag tokenizer");
+        #[cfg(feature = "rag")]
+        let rag_ref = Some(&rag);
+        #[cfg(not(feature = "rag"))]
+        let rag_ref: Option<&oxibonsai_runtime::TokenizerBridge> = None;
+        for tok in [Some(&router), Some(&embedder), rag_ref]
+            .into_iter()
+            .flatten()
+        {
+            assert_eq!(tok.vocab_size() as u64, BYTE_LEVEL_VOCAB);
+            assert!(matches!(
+                tok.resolved_chat_template(),
+                ResolvedChatTemplate::Jinja(_)
+            ));
+        }
+
+        let events = capture.events();
+        let template_lines = events
+            .iter()
+            .filter(|e| e.contains("resolved chat template"))
+            .count();
+        let source_lines = events
+            .iter()
+            .filter(|e| e.contains("using the tokenizer embedded in the GGUF"))
+            .count();
+        assert_eq!(
+            template_lines, 1,
+            "\"resolved chat template\" must log exactly once for the whole startup: {events:?}"
+        );
+        assert_eq!(
+            source_lines, 1,
+            "the tokenizer-source line must log exactly once for the whole startup: {events:?}"
+        );
     }
 
     /// The real Bonsai 2 27B header (`OXI_BONSAI2_PQ2_GGUF`): the serving
@@ -1448,44 +1664,71 @@ mod serving_tokenizer_tests {
     }
 }
 
-// ── ENGINE-SEAM (4): a hybrid model's /v1/embeddings is an honest 501 ───────
+// ── A hybrid model's /v1/embeddings ─────────────────────────────────────
 
-/// Real 27B (`OXI_BONSAI2_PQ2_GGUF`): `build_embedder` refuses the hybrid
-/// with the typed `NOT_A_DENSE_MODEL` error, logs the known limitation at
-/// info, and the served router answers `/v1/embeddings` with 501.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_hybrid_model_serves_embeddings_as_an_honest_501_with_an_info_log() {
+/// Real 27B (`OXI_BONSAI2_PQ2_GGUF`): `build_embedder`
+/// builds a real embedder for a hybrid (`qwen35`) model exactly as for a
+/// dense one, and the served router answers `/v1/embeddings` with 200 — a
+/// unit-norm, `hidden_size`-dimensional vector and a real (non-zero) token
+/// count, superseding the old honest-501 contract this model now outgrows.
+///
+/// Gated and self-skipping like every other real-27B test in this crate: a
+/// 27B model's RSS is large enough that only one process on this host may
+/// hold one at a time, so this self-skips whenever `OXI_BONSAI2_PQ2_GGUF`
+/// is unset and is meant to be run on its own, with that variable set,
+/// rather than as part of a routine full-suite pass.
+// A plain `#[test]` building its own runtime (rather than
+// `#[tokio::test]`) so `real_model_lock()`'s `std::sync::MutexGuard` is
+// held, in sync code, for the whole test body around one `block_on` call
+// -- including the embedding request below, which must run before the 27B
+// mapping is released -- without ever being captured across an `.await`
+// itself.
+#[test]
+fn real_27b_hybrid_model_serves_embeddings() {
     use axum::http::Request;
     use tower::ServiceExt;
+    const TEST: &str = "oxibonsai-cli::bin::real_27b_hybrid_model_serves_embeddings";
     let Some(path) = crate::cli::test_fixtures::env_path(
         "OXI_BONSAI2_PQ2_GGUF",
         "the real Ternary-Bonsai-2-27B-PQ2_0.gguf",
     ) else {
+        oxibonsai_testkit::capability::record_skipped(
+            oxibonsai_testkit::capability::Capability::Bonsai2Models,
+            TEST,
+        );
         return;
     };
-    let (router, events) = {
-        let _real = crate::cli::test_fixtures::real_model_lock();
-        let model = path.to_string_lossy().into_owned();
-        let bytes = ModelSource::open(&model, false).expect("map").into_static();
-        let gguf: &'static oxibonsai_core::gguf::reader::GgufFile<'static> = Box::leak(Box::new(
-            oxibonsai_core::gguf::reader::GgufFile::parse(bytes).expect("parse"),
-        ));
-        let params = default_sampling_params();
-        let built = oxibonsai_runtime::engine_pool::build_pool_from_static_gguf_with_rope(
-            gguf,
-            params.clone(),
-            42,
-            64,
-            Some(1),
-            oxibonsai_runtime::engine_seam::Backend::Cpu,
-            oxibonsai_core::config::RopeScalingOverride::Auto,
-        )
-        .expect("the hybrid pool loads on the CPU tier");
-        assert!(built.hybrid);
-        let (tok, _) = load_serving_tokenizer(None, &model, gguf).expect("tokenizer");
-        let capture = crate::cli::test_fixtures::CapturedEvents::default();
-        let embedder = tracing::subscriber::with_default(capture.clone(), || {
-            build_embedder(
+    // Held for the whole test body, not just the router-building block: the
+    // leaked 27B mapping stays resident for as long as this process is the
+    // one real-model process on the host, which includes the embedding
+    // request below.
+    let _real = crate::cli::test_fixtures::real_model_lock();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build a tokio runtime");
+    rt.block_on(async {
+        let router = {
+            let model = path.to_string_lossy().into_owned();
+            let bytes = ModelSource::open(&model, false).expect("map").into_static();
+            let gguf: &'static oxibonsai_core::gguf::reader::GgufFile<'static> = Box::leak(
+                Box::new(oxibonsai_core::gguf::reader::GgufFile::parse(bytes).expect("parse")),
+            );
+            let params = default_sampling_params();
+            let built = oxibonsai_runtime::engine_pool::build_pool_from_static_gguf_with_rope(
+                gguf,
+                params.clone(),
+                42,
+                64,
+                Some(1),
+                oxibonsai_runtime::engine_seam::Backend::Cpu,
+                oxibonsai_core::config::RopeScalingOverride::Auto,
+            )
+            .expect("the hybrid pool loads on the CPU tier");
+            assert!(built.hybrid);
+            let (tok, _) = load_serving_tokenizer(None, &model, gguf).expect("tokenizer");
+            let (embedder, reason) = build_embedder(
                 &built,
                 tok,
                 EmbeddingEngineLoad {
@@ -1495,10 +1738,11 @@ async fn a_hybrid_model_serves_embeddings_as_an_honest_501_with_an_info_log() {
                     backend: oxibonsai_runtime::engine_seam::Backend::Cpu,
                     rope_scaling: oxibonsai_runtime::config::RopeScalingMode::Auto,
                 },
-            )
-        });
-        assert!(embedder.is_none(), "a hybrid model has no embedder yet");
-        let router = {
+            );
+            assert!(
+                embedder.is_some(),
+                "a hybrid model now has a real embedder: {reason:?}"
+            );
             let _env = test_env::lock();
             create_router_full(
                 Arc::clone(&built.pool),
@@ -1509,20 +1753,45 @@ async fn a_hybrid_model_serves_embeddings_as_an_honest_501_with_an_info_log() {
                     .with_embedder(embedder),
             )
         };
-        (router, capture.events())
-    };
-    assert!(
-        events.iter().any(|e| e.contains("[INFO]")
-            && e.contains("embeddings are not supported for this model yet")
-            && e.contains("NOT_A_DENSE_MODEL")),
-        "the known limitation must be logged at info: {events:?}"
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"input":"hello","model":"m"}"#))
+            .expect("request");
+        let resp = router.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
+        let vector = json["data"][0]["embedding"]
+            .as_array()
+            .expect("embedding vector");
+        assert_eq!(vector.len(), 5120, "the 27B's hidden_size: {json}");
+        let norm: f64 = vector
+            .iter()
+            .map(|v| {
+                let f = v.as_f64().expect("float component");
+                f * f
+            })
+            .sum::<f64>()
+            .sqrt();
+        assert!(
+            (norm - 1.0).abs() < 1e-3,
+            "embedding must be unit-norm: {norm}"
+        );
+        let prompt_tokens = json["usage"]["prompt_tokens"]
+            .as_u64()
+            .expect("usage.prompt_tokens");
+        assert!(
+            prompt_tokens > 0,
+            "usage must be a real token count: {json}"
+        );
+    });
+
+    oxibonsai_testkit::capability::record_executed(
+        oxibonsai_testkit::capability::Capability::Bonsai2Models,
+        TEST,
     );
-    let req = Request::builder()
-        .method("POST")
-        .uri("/v1/embeddings")
-        .header("content-type", "application/json")
-        .body(Body::from(r#"{"input":"hello","model":"m"}"#))
-        .expect("request");
-    let resp = router.oneshot(req).await.expect("response");
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
 }

@@ -129,7 +129,7 @@ pub(crate) fn parse_min_p(s: &str) -> Result<f32, String> {
     validate_min_p(v)
 }
 
-/// `--backend auto|cpu|metal` (wave-4b ENGINE-SEAM addendum). Parses
+/// `--backend auto|cpu|metal`. Parses
 /// through [`oxibonsai_runtime::engine_seam::Backend::parse`] so this CLI's
 /// accepted spellings can never drift from the engine's own, and the
 /// resolved value is the real enum clap stores directly — no intermediate
@@ -139,13 +139,13 @@ pub(crate) fn parse_backend(s: &str) -> Result<oxibonsai_runtime::engine_seam::B
         .ok_or_else(|| format!("invalid --backend value '{s}': expected auto, cpu, or metal"))
 }
 
-/// `--rope-scaling auto|on|off` (wave-4b orchestrator addendum; see
-/// `RULING_bonsai8b_yarn.md`). A thin wrapper over
-/// [`oxibonsai_runtime::config::RopeScalingMode`]'s own `FromStr` (that type
-/// has no `clap::ValueEnum` derive — adding one would need a new `clap`
-/// dependency on `oxibonsai-runtime`, whose `Cargo.toml` is outside this
-/// package's `owned_files` — so a manual `value_parser` function, not
-/// `#[arg(value_enum)]`, is how this flag reaches it).
+/// `--rope-scaling auto|on|off` (`auto` applies YaRN only when the GGUF's
+/// own RoPE-scaling metadata calls for it, matching Bonsai-8B's shipped
+/// config). A thin wrapper over [`oxibonsai_runtime::config::RopeScalingMode`]'s own
+/// `FromStr` (that type has no `clap::ValueEnum` derive — adding one would
+/// need a new `clap` dependency on `oxibonsai-runtime` — so a manual
+/// `value_parser` function, not `#[arg(value_enum)]`, is how this flag
+/// reaches it).
 pub(crate) fn parse_rope_scaling(
     s: &str,
 ) -> Result<oxibonsai_runtime::config::RopeScalingMode, String> {
@@ -230,7 +230,7 @@ pub(crate) fn parse_max_output_tokens(s: &str) -> Result<usize, String> {
 }
 
 /// Which backend `serve` answers `/v1/embeddings` from
-/// (`--embedding-backend`, RT-EMBEDDINGS residue routed to B2-14).
+/// (`--embedding-backend`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub(crate) enum EmbeddingBackendChoice {
     /// Mean-pooled hidden states of the loaded model (dense models; a
@@ -333,8 +333,10 @@ pub(crate) enum Commands {
 
         /// Random seed. Two runs with the same seed, model, prompt and
         /// sampling flags produce byte-identical output (RT-12).
-        #[arg(long, default_value_t = 42)]
-        seed: u64,
+        /// Precedence: this flag, else `[sampling].seed` in --config, else
+        /// 42.
+        #[arg(long)]
+        seed: Option<u64>,
 
         /// Maximum sequence length (prompt + generated); `--ctx` is an
         /// alias (default: 8192 for a Bonsai 2 `qwen35` model, 4096
@@ -422,7 +424,7 @@ pub(crate) enum Commands {
         /// Path to a JSON file containing an OpenAI-style `tools` array,
         /// passed to the chat template verbatim (raw JSON text, so
         /// key order and number formatting are preserved byte-for-byte
-        /// rather than round-tripped through a Rust value — B2-13's
+        /// rather than round-tripped through a Rust value — the
         /// tool-call contract requires this for byte-identical template
         /// output). Requires --chat.
         #[arg(long)]
@@ -456,21 +458,21 @@ pub(crate) enum Commands {
 
         /// Vision projector GGUF (`clip` architecture, e.g.
         /// `Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf`). Parsed and validated
-        /// now; vision inference lands with B2-19/B2-20, so passing it is a
+        /// now; the vision tower isn't wired up yet, so passing it is a
         /// typed `NOT_YET_SUPPORTED` error, never a silently ignored flag.
         #[arg(long)]
         mmproj: Option<String>,
 
         /// Image input (path or http(s) URL; repeatable). Parsed and
-        /// validated now; vision inference lands with B2-19/B2-20, so
+        /// validated now; the vision tower isn't wired up yet, so
         /// passing it is a typed `NOT_YET_SUPPORTED` error, never a
         /// silently ignored flag.
         #[arg(long)]
         image: Vec<String>,
 
         /// Per-image token budget for the vision downscale guard (default
-        /// 1024, matching the reference demo). Must be >= 1. Vision lands
-        /// with B2-19/B2-20: passing it explicitly is a typed
+        /// 1024, matching the reference demo). Must be >= 1. The vision
+        /// tower isn't wired up yet: passing it explicitly is a typed
         /// `NOT_YET_SUPPORTED` error.
         #[arg(long, value_parser = parse_image_max_tokens)]
         image_max_tokens: Option<usize>,
@@ -654,8 +656,10 @@ pub(crate) enum Commands {
         presence_penalty: Option<f32>,
 
         /// Random seed (RT-12: the same seed reproduces the same session).
-        #[arg(long, default_value_t = 42)]
-        seed: u64,
+        /// Precedence: this flag, else `[sampling].seed` in --config, else
+        /// 42.
+        #[arg(long)]
+        seed: Option<u64>,
 
         /// Maximum sequence length; `--ctx` is an alias (default: 8192 for
         /// a Bonsai 2 `qwen35` model, 4096 otherwise, or
@@ -733,12 +737,12 @@ pub(crate) enum Commands {
         prefill_chunk: Option<usize>,
 
         /// Vision projector GGUF. See `run --help` — a typed
-        /// `NOT_YET_SUPPORTED` error until B2-19/B2-20 land.
+        /// `NOT_YET_SUPPORTED` error until the vision tower lands.
         #[arg(long)]
         mmproj: Option<String>,
 
         /// Image input (path or URL; repeatable). See `run --help` — a
-        /// typed `NOT_YET_SUPPORTED` error until B2-19/B2-20 land.
+        /// typed `NOT_YET_SUPPORTED` error until the vision tower lands.
         #[arg(long)]
         image: Vec<String>,
 
@@ -940,17 +944,17 @@ pub(crate) enum Commands {
         prefill_chunk: Option<usize>,
 
         /// Vision projector GGUF. A typed `NOT_YET_SUPPORTED` error until
-        /// B2-19/B2-20 land (see `oxibonsai run --help`).
+        /// the vision tower lands (see `oxibonsai run --help`).
         #[arg(long)]
         mmproj: Option<String>,
 
         /// Image input for the vision tower (path or URL; repeatable). A
-        /// typed `NOT_YET_SUPPORTED` error until B2-19/B2-20 land.
+        /// typed `NOT_YET_SUPPORTED` error until the vision tower lands.
         #[arg(long)]
         image: Vec<String>,
 
         /// Per-image token budget (default 1024). A typed
-        /// `NOT_YET_SUPPORTED` error when passed, until B2-19/B2-20 land.
+        /// `NOT_YET_SUPPORTED` error when passed, until the vision tower lands.
         #[arg(long, value_parser = parse_image_max_tokens)]
         image_max_tokens: Option<usize>,
 
@@ -1026,9 +1030,10 @@ pub(crate) enum Commands {
         #[arg(long, value_parser = parse_temperature, default_value_t = 0.7)]
         temperature: f32,
 
-        /// Random seed.
-        #[arg(long, default_value_t = 42)]
-        seed: u64,
+        /// Random seed. Precedence: this flag, else `[sampling].seed` in
+        /// --config, else 42.
+        #[arg(long)]
+        seed: Option<u64>,
     },
 
     /// Quantize a GGUF model to a lower-precision format.
@@ -1137,6 +1142,10 @@ pub(crate) enum Commands {
         /// Path to tokenizer.json file.
         #[arg(long)]
         tokenizer: Option<String>,
+
+        /// Which tokenizer backend to use.
+        #[arg(long, value_enum, default_value_t = TokenizerBackendChoice::Auto)]
+        tokenizer_backend: TokenizerBackendChoice,
 
         /// Also write the report as JSON to this path.
         #[arg(long)]

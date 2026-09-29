@@ -1,5 +1,5 @@
 //! Synthetic hybrid (`qwen35`) GGUF fixture generator + independent f64
-//! scalar reference model — B2-16 (`bonsai2-design.md` §7.1/§7.2/§8.2).
+//! scalar reference model (`bonsai2-design.md` §7.1/§7.2/§8.2).
 //!
 //! This is the workhorse that lets every other Bonsai 2 package be tested
 //! without 7 GB of real weights. It has two halves:
@@ -9,7 +9,9 @@
 //!    `ssm.*` key set, a real `prism.hadamard.*` contract, and every tensor
 //!    the hybrid loader binds, in any of six quantization formats (`F32`,
 //!    `PQ2_0`, `PTQ1_0`, `Q2_0_g64`, `TQ2_0_g128`, `Q1_0_g128`) crossed with
-//!    Hadamard on/off and V-head grouping on/off.
+//!    Hadamard on/off and V-head grouping on/off, at either the narrow
+//!    ([`HIDDEN`]) or the real 27B's own 1024-wide ([`HIDDEN_WIDE`])
+//!    Hadamard block geometry (see [`HybridFixtureSpec`]).
 //! 2. An independent, from-scratch **f64 scalar reference model** of the
 //!    same graph (embedding + inverse Hadamard, per-layer full-attention and
 //!    Gated-DeltaNet linear-attention, final norm + LM head), built
@@ -20,22 +22,29 @@
 //!    wrong V-head permutation or a wrong RoPE pairing — both of which pass
 //!    every per-kernel norm check.
 //!
-//! `pub` dev-only API: exposed so a shared test-support crate (T-07) can
-//! reuse this builder instead of writing an 18th one-off GGUF fixture
-//! function. Every generated file lands in [`std::env::temp_dir`] and is
-//! removed when the returned [`HybridFixture`] is dropped; nothing here
-//! ever hardcodes an absolute path.
+//! `pub` dev-only API: exposed so a shared test-support crate can reuse this
+//! builder instead of writing another one-off GGUF fixture function. Every
+//! generated file lands in [`std::env::temp_dir`] and is removed when the
+//! returned [`HybridFixture`] is dropped; nothing here ever hardcodes an
+//! absolute path.
 //!
-//! ## What "matches the f64 reference model" means in this package
+//! ## What "matches the f64 reference model" means here
 //!
-//! `bonsai2-design.md` §8.2's acceptance line for this package
-//! ("all 16 variants build, load through the real hybrid loader and match
-//! the embedded f64 scalar model") describes the **release-gate** shape of
-//! this fixture, which is exercised once `oxibonsai_model::hybrid` exists
-//! (owned by the sibling B2-09/B2-10/B2-11 packages) and wired up by B2-18
-//! (whose spec explicitly depends on B2-16 **and** B2-11). That model does
-//! not exist in this package's dependency graph. What this package
-//! delivers and *can* verify on its own:
+//! `bonsai2-design.md` §8.2's acceptance line ("all variants build, load
+//! through the real hybrid loader and match the embedded f64 scalar
+//! model") is exercised end to end:
+//! `oxibonsai_model::hybrid::model::HybridModel` (the real hybrid loader)
+//! lives in this same crate, and `hybrid_forward_parity_tests.rs` loads
+//! every variant this file's [`build`]/[`all_variant_specs`]/
+//! [`hadamard_1024_variant_spec`] produce through it, teacher-forced
+//! against this file's own f64 reference — both the final logits and, via
+//! [`ReferenceForward::per_layer_hidden`], every intermediate layer's
+//! residual stream. `hybrid_fixture_tests.rs` (this file's own test
+//! binary) additionally cross-checks the f64 primitives directly against
+//! their `oxibonsai_kernels` counterparts (`fwht_forward_signed`,
+//! `gdn_step_with`, `causal_conv1d_k4_decode`, `l2_norm_simd`,
+//! `rms_norm_gated_simd`, `rope_partial_splithalf_simd`) on deterministic
+//! random inputs, and checks:
 //!
 //! - the generator's byte layout round-trips exactly through the real,
 //!   already-merged block codecs (`BlockPQ2_0`/`BlockPTQ1_0`/
@@ -96,7 +105,7 @@ impl Xorshift64Star {
     }
 
     /// Uniform in `[lo, hi)`.
-    fn next_range_f64(&mut self, lo: f64, hi: f64) -> f64 {
+    pub fn next_range_f64(&mut self, lo: f64, hi: f64) -> f64 {
         lo + self.next_unit_f64() * (hi - lo)
     }
 
@@ -143,8 +152,8 @@ fn silu_f64(x: f64) -> f64 {
 }
 
 /// `x > 20 ? x : ln(1 + exp(x))` — the exact ggml softplus cutoff (design
-/// §2.3), verified against the already-merged `softplus_scalar_elem`
-/// (`oxibonsai-kernels/src/norms.rs`) during this package's design pass.
+/// §2.3), matching the kernels' own `softplus_scalar_elem`
+/// (`oxibonsai-kernels/src/norms.rs`).
 fn softplus_f64(x: f64) -> f64 {
     if x > 20.0 {
         x
@@ -162,7 +171,7 @@ fn softplus_f64(x: f64) -> f64 {
 /// [`l2_norm_heads_f64`] below; conflating the two is a real, documented
 /// trap in this codebase's history (see `oxibonsai-kernels/src/norms.rs`'s
 /// `l2_norm_simd` doc comment).
-fn rms_norm_f64(x: &[f64], weight: &[f64], eps: f64) -> Vec<f64> {
+pub fn rms_norm_f64(x: &[f64], weight: &[f64], eps: f64) -> Vec<f64> {
     let n = x.len() as f64;
     let sum_sq: f64 = x.iter().map(|v| v * v).sum();
     let inv_rms = 1.0 / (sum_sq / n + eps).sqrt();
@@ -175,7 +184,7 @@ fn rms_norm_f64(x: &[f64], weight: &[f64], eps: f64) -> Vec<f64> {
 /// `L2Norm`: `out[i] = x[i] / max(sqrt(sum(x^2)), eps)` — no mean, no
 /// weight. `eps` floors the denominator; it is not added under the
 /// radical. Applied per-head over the joint Q/K region in Gated DeltaNet.
-fn l2_norm_f64(x: &[f64], eps: f64) -> Vec<f64> {
+pub fn l2_norm_f64(x: &[f64], eps: f64) -> Vec<f64> {
     let sum_sq: f64 = x.iter().map(|v| v * v).sum();
     let denom = sum_sq.sqrt().max(eps);
     x.iter().map(|&v| v / denom).collect()
@@ -185,7 +194,7 @@ fn l2_norm_f64(x: &[f64], eps: f64) -> Vec<f64> {
 /// silu(z[j])`, `inv_rms` from the *mean*-based RMSNorm formula over this
 /// head's slice only (mirrors `rms_norm_gated_scalar` in
 /// `oxibonsai-kernels/src/norms.rs`, read for verification, not called).
-fn gated_rms_norm_head_f64(o: &[f64], z: &[f64], weight: &[f64], eps: f64) -> Vec<f64> {
+pub fn gated_rms_norm_head_f64(o: &[f64], z: &[f64], weight: &[f64], eps: f64) -> Vec<f64> {
     let n = o.len() as f64;
     let sum_sq: f64 = o.iter().map(|v| v * v).sum();
     let inv_rms = 1.0 / (sum_sq / n + eps).sqrt();
@@ -198,7 +207,7 @@ fn gated_rms_norm_head_f64(o: &[f64], z: &[f64], weight: &[f64], eps: f64) -> Ve
 /// Pairs `(ic, ic + n_rot/2)` for `ic in 0..n_rot/2`; dims `n_rot..head_dim`
 /// are copied unchanged (design §2.5's proof that text-only IMROPE
 /// degenerates to standard partial RoPE).
-fn apply_partial_rope_f64(x: &mut [f64], pos: usize, n_rot: usize, freq_base: f64) {
+pub fn apply_partial_rope_f64(x: &mut [f64], pos: usize, n_rot: usize, freq_base: f64) {
     let half = n_rot / 2;
     for ic in 0..half {
         let theta = pos as f64 * freq_base.powf(-2.0 * ic as f64 / n_rot as f64);
@@ -242,7 +251,7 @@ fn fwht_butterfly_f64(buf: &mut [f64]) {
 /// Forward fold: `x <- FWHT_block(x ⊙ signs) * (1/sqrt(block))`, applied
 /// independently to each `block`-wide slice. `signs` and `x` are the same
 /// length (a whole number of `block`-wide chunks).
-fn fwht_forward_signed_f64(x: &[f64], signs: &[f64], block: usize) -> Vec<f64> {
+pub fn fwht_forward_signed_f64(x: &[f64], signs: &[f64], block: usize) -> Vec<f64> {
     let inv_sqrt = 1.0 / (block as f64).sqrt();
     let mut out = x.to_vec();
     for (chunk_idx, chunk) in out.chunks_mut(block).enumerate() {
@@ -318,7 +327,7 @@ impl VHeadMap {
 /// design §2.3's chosen memory order). Returns `(out, decay, delta)` so the
 /// caller can build the O(T²) cross-check.
 #[allow(clippy::too_many_arguments)]
-fn gdn_step_fused_f64(
+pub fn gdn_step_fused_f64(
     state: &mut [f64],
     q: &[f64],
     k: &[f64],
@@ -449,7 +458,7 @@ fn gdn_quadratic_reconstruction_f64(
 /// kernel width `kc`. `state` is `[channels][kc-1]`, oldest-first, updated
 /// in place. `w` is `[channels][kc]` (matches GGUF `ssm_conv1d.weight`'s
 /// `ne=[kc, channels]` row-major-per-channel layout).
-fn causal_conv1d_step_f64(
+pub fn causal_conv1d_step_f64(
     state: &mut [Vec<f64>],
     x: &[f64],
     w: &[Vec<f64>],
@@ -494,14 +503,55 @@ pub const SSM_TIME_STEP_RANK: usize = 4; // n_v_heads
 pub const VOCAB: usize = 64;
 pub const CONTEXT_LENGTH: usize = 512;
 pub const HADAMARD_BLOCK_SIZE: usize = 128;
+/// The real 27B's own Hadamard block size (`prism.hadamard.block_size`,
+/// design §7.0): every fixture variant with `hidden == HIDDEN_WIDE` uses
+/// this instead of [`HADAMARD_BLOCK_SIZE`], so a single tensor's folded
+/// width spans exactly one block (`HIDDEN_WIDE`) or a small whole number of
+/// them (`FFN_WIDE`), rather than the many small `HADAMARD_BLOCK_SIZE`-wide
+/// blocks the narrow fixtures use.
+pub const HADAMARD_BLOCK_SIZE_WIDE: usize = 1024;
+/// A hidden width that is itself exactly one Hadamard block: the narrow
+/// fixtures' `HIDDEN` (256) is only two 128-wide blocks, so they never
+/// exercise the kernel's `128->1024` NEON butterfly stages the real 27B's
+/// own 1024-wide blocks need.
+/// [`HybridFixtureSpec::hidden`]/[`HybridFixtureSpec::hadamard_block`]
+/// select between this and [`HIDDEN`]/[`HADAMARD_BLOCK_SIZE`] per variant.
+pub const HIDDEN_WIDE: usize = 1024;
+/// Attention head width at [`HIDDEN_WIDE`]: `N_HEAD * HEAD_DIM_WIDE ==
+/// 2048`, so `attn_output`'s folded (input) width is two whole Hadamard
+/// blocks — the real 27B's `attn_output`/`ssm_out` share this same
+/// property (both fold on a width that is a whole multiple of 1024).
+/// Reused for the Gated-DeltaNet `head_k_dim`/`head_v_dim` too, so
+/// `inner_size = SSM_TIME_STEP_RANK * HEAD_DIM_WIDE == 2048` gives
+/// `ssm_out` the same width, mirroring the real model's own
+/// `attn_output`/`ssm_out` share.
+///
+/// Distinct from [`HIDDEN_WIDE`] to mirror the real 27B, whose rotated
+/// widths (5120 / 6144 / 17408) are pairwise distinct except that one
+/// designed share. It is not an aliasing guard: `HadamardHook::rotate`
+/// returns a slice that mutably borrows its `HadamardScratch`, so two claims
+/// on one width are sequential by construction. At a 256-wide head (where
+/// `attn_output`'s width equals `HIDDEN_WIDE`) the worst per-token logit
+/// miss was 1.6e-4 over the absolute 1e-4 band — consistent with f32
+/// accumulation over a wider rotated reduction, judged by an absolute rather
+/// than a scale-relative band; that geometry would need a scale-relative
+/// bound, not a different buffer layout. At this width the variant passes
+/// at the same 1e-4 band the narrow variants use.
+pub const HEAD_DIM_WIDE: usize = 512;
+/// FFN width at [`HIDDEN_WIDE`]: three whole [`HADAMARD_BLOCK_SIZE_WIDE`]
+/// blocks, distinct from both [`HIDDEN_WIDE`] and the
+/// `attn_output`/`ssm_out` width above (same reasoning as
+/// [`HEAD_DIM_WIDE`]'s own doc comment) — exercising multi-block folding
+/// within a single tensor (the narrow fixtures' `FFN` is not a whole
+/// multiple of `HADAMARD_BLOCK_SIZE` at all, so this is also new coverage).
+pub const FFN_WIDE: usize = 3072;
 pub const RMS_EPS: f64 = 1e-6;
 /// Number of tokens the embedded reference forward runs over — long enough
 /// to exceed the conv1d kernel width and exercise multi-position causal
 /// attention and multi-step GDN recurrence.
 pub const T_TOKENS: usize = 6;
 
-/// The six quantization formats a hybrid loader must bind (design §1.1 +
-/// the B2-16 work order's format list).
+/// The six quantization formats a hybrid loader must bind (design §1.1).
 pub const ALL_QUANT_TYPES: [TensorType; 6] = [
     TensorType::F32,
     TensorType::PQ2_0,
@@ -512,19 +562,31 @@ pub const ALL_QUANT_TYPES: [TensorType; 6] = [
 ];
 
 /// One fixture variant: a quantization format crossed with Hadamard
-/// on/off and V-head grouping on/off (design §7.1's `HybridFixtureSpec`).
+/// on/off and V-head grouping on/off (design §7.1's `HybridFixtureSpec`),
+/// plus the Hadamard-block geometry: `hidden`/`hadamard_block` are
+/// independent spec fields — not bare constants — precisely so a variant
+/// can ask for a wider hidden size than the default
+/// [`HIDDEN`]/[`HADAMARD_BLOCK_SIZE`] pair without touching every other
+/// variant. [`all_variant_specs`]'s 24 canonical variants all use the
+/// narrow (`HIDDEN`, `HADAMARD_BLOCK_SIZE`) pair, reproducing their
+/// previous byte-for-byte output exactly; [`hadamard_1024_variant_spec`]
+/// is the one wide variant.
 #[derive(Debug, Clone, Copy)]
 pub struct HybridFixtureSpec {
     pub quant: TensorType,
     pub hadamard: bool,
     pub gdn_v_grouped: bool,
     pub seed: u64,
+    pub hidden: usize,
+    pub hadamard_block: usize,
 }
 
 /// Every canonical (quant, hadamard, grouped) combination — the full cross
-/// product (`6 x 2 x 2 = 24`), a strict superset of both design §7.1's
-/// original 16-variant matrix (4 quant formats it named explicitly) and
-/// this package's work order's 6-format list.
+/// product (`6 x 2 x 2 = 24`), a strict superset of design §7.1's original
+/// 16-variant matrix (4 quant formats it named explicitly) and this
+/// generator's own 6-format list. Every variant uses the narrow
+/// `HIDDEN`/`HADAMARD_BLOCK_SIZE` pair; see [`hadamard_1024_variant_spec`]
+/// for the wide one.
 pub fn all_variant_specs(base_seed: u64) -> Vec<HybridFixtureSpec> {
     let mut specs = Vec::with_capacity(ALL_QUANT_TYPES.len() * 4);
     for (qi, &quant) in ALL_QUANT_TYPES.iter().enumerate() {
@@ -537,11 +599,39 @@ pub fn all_variant_specs(base_seed: u64) -> Vec<HybridFixtureSpec> {
                     hadamard,
                     gdn_v_grouped,
                     seed,
+                    hidden: HIDDEN,
+                    hadamard_block: HADAMARD_BLOCK_SIZE,
                 });
             }
         }
     }
     specs
+}
+
+/// The one 1024-wide variant: `hidden == HIDDEN_WIDE == hadamard_block`, so
+/// `token_embd`/`output`/`ffn_gate`/`ffn_up`/`attn_q`/`attn_k`/`attn_v`/
+/// `attn_qkv`/`attn_gate` each fold on exactly one 1024-wide Hadamard
+/// block, `ffn_down` on three, and `attn_output`/`ssm_out` on two
+/// (`HEAD_DIM_WIDE`-derived, see its own doc comment) — every foldable
+/// tensor's input width is a whole multiple of 1024, the same property the
+/// real 27B's own widths (5120/17408/6144) have, and every one of the
+/// three widths is pairwise distinct except for the `attn_output`/`ssm_out`
+/// share, mirroring the real 27B's own three-distinct-width shape exactly
+/// (see `HEAD_DIM_WIDE`'s doc comment for why that distinctness matters).
+/// `PQ2_0`, Hadamard on, V-head grouped: the real release band, and — like
+/// every ternary quant format this generator draws from `{-1, 0, +1}` — an
+/// exact (lossless) dequantization oracle, so any mismatch this variant
+/// finds is arithmetic, never quantization noise.
+#[must_use]
+pub fn hadamard_1024_variant_spec(base_seed: u64) -> HybridFixtureSpec {
+    HybridFixtureSpec {
+        quant: TensorType::PQ2_0,
+        hadamard: true,
+        gdn_v_grouped: true,
+        seed: base_seed ^ 0x1024_1024_1024_1024,
+        hidden: HIDDEN_WIDE,
+        hadamard_block: HADAMARD_BLOCK_SIZE_WIDE,
+    }
 }
 
 /// Every dimension derivable from a [`HybridFixtureSpec`]. `gdn_v_grouped`
@@ -559,16 +649,39 @@ pub struct Dims {
     pub head_v_dim: usize,
     pub inner_size: usize,
     pub conv_dim: usize,
+    /// [`HybridFixtureSpec::hidden`], repeated here so every place that
+    /// already threads `Dims`/`plan.dims` through can read the variant's
+    /// hidden width without a second lookup into `spec`.
+    pub hidden: usize,
+    /// [`HybridFixtureSpec::hadamard_block`], repeated here for the same
+    /// reason as `hidden`.
+    pub hadamard_block: usize,
+    /// Attention head width: [`HEAD_DIM`] at the narrow `hidden`,
+    /// [`HEAD_DIM_WIDE`] at [`HIDDEN_WIDE`] (`N_HEAD * head_dim ==
+    /// hidden` either way, by construction of the two constant pairs).
+    pub head_dim: usize,
+    /// FFN width: [`FFN`] at the narrow `hidden`, [`FFN_WIDE`] at
+    /// [`HIDDEN_WIDE`].
+    pub ffn: usize,
 }
 
 impl Dims {
     pub fn from_spec(spec: &HybridFixtureSpec) -> Self {
         let n_v_heads = SSM_TIME_STEP_RANK;
         let n_k_heads = if spec.gdn_v_grouped { 2 } else { n_v_heads };
-        let head_k_dim = SSM_STATE_SIZE;
-        let head_v_dim = SSM_STATE_SIZE;
+        // `spec.hidden != HIDDEN` selects the wide preset as a whole (there
+        // are exactly two: narrow and [`HIDDEN_WIDE`] — see
+        // [`hadamard_1024_variant_spec`]). Every dimension that a folded
+        // tensor's input width depends on scales together, so a mismatched
+        // pair (e.g. a wide `hidden` with the narrow `head_dim`) can never
+        // arise from a spec built by this file's own two constructors.
+        let wide = spec.hidden != HIDDEN;
+        let head_k_dim = if wide { HEAD_DIM_WIDE } else { SSM_STATE_SIZE };
+        let head_v_dim = head_k_dim;
         let inner_size = n_v_heads * head_v_dim;
         let conv_dim = 2 * head_k_dim * n_k_heads + inner_size;
+        let head_dim = if wide { HEAD_DIM_WIDE } else { HEAD_DIM };
+        let ffn = if wide { FFN_WIDE } else { FFN };
         Self {
             n_k_heads,
             n_v_heads,
@@ -576,6 +689,10 @@ impl Dims {
             head_v_dim,
             inner_size,
             conv_dim,
+            hidden: spec.hidden,
+            hadamard_block: spec.hadamard_block,
+            head_dim,
+            ffn,
         }
     }
 
@@ -588,7 +705,7 @@ impl Dims {
     }
 
     pub fn attn_output_input_width(&self) -> usize {
-        N_HEAD * HEAD_DIM
+        N_HEAD * self.head_dim
     }
 }
 
@@ -715,51 +832,57 @@ fn build_plan(spec: &HybridFixtureSpec) -> FixturePlan {
     };
 
     // ── Globals ────────────────────────────────────────────────────────
-    push_quant(&mut tensors, &mut rng, "token_embd.weight", HIDDEN, VOCAB);
+    push_quant(
+        &mut tensors,
+        &mut rng,
+        "token_embd.weight",
+        dims.hidden,
+        VOCAB,
+    );
     push_plain_f32(
         &mut tensors,
         &mut rng,
         "output_norm.weight",
-        vec![HIDDEN as u64],
+        vec![dims.hidden as u64],
         (0.5, 1.5),
     );
-    push_quant(&mut tensors, &mut rng, "output.weight", HIDDEN, VOCAB);
+    push_quant(&mut tensors, &mut rng, "output.weight", dims.hidden, VOCAB);
 
     for layer in 0..BLOCK_COUNT {
         push_plain_f32(
             &mut tensors,
             &mut rng,
             &tname(layer, "attn_norm.weight"),
-            vec![HIDDEN as u64],
+            vec![dims.hidden as u64],
             (0.5, 1.5),
         );
         push_plain_f32(
             &mut tensors,
             &mut rng,
             &tname(layer, "post_attention_norm.weight"),
-            vec![HIDDEN as u64],
+            vec![dims.hidden as u64],
             (0.5, 1.5),
         );
         push_quant(
             &mut tensors,
             &mut rng,
             &tname(layer, "ffn_gate.weight"),
-            HIDDEN,
-            FFN,
+            dims.hidden,
+            dims.ffn,
         );
         push_quant(
             &mut tensors,
             &mut rng,
             &tname(layer, "ffn_up.weight"),
-            HIDDEN,
-            FFN,
+            dims.hidden,
+            dims.ffn,
         );
         push_quant(
             &mut tensors,
             &mut rng,
             &tname(layer, "ffn_down.weight"),
-            FFN,
-            HIDDEN,
+            dims.ffn,
+            dims.hidden,
         );
 
         if dims.is_full_attention(layer) {
@@ -767,42 +890,42 @@ fn build_plan(spec: &HybridFixtureSpec) -> FixturePlan {
                 &mut tensors,
                 &mut rng,
                 &tname(layer, "attn_q.weight"),
-                HIDDEN,
-                N_HEAD * HEAD_DIM * 2,
+                dims.hidden,
+                N_HEAD * dims.head_dim * 2,
             );
             push_quant(
                 &mut tensors,
                 &mut rng,
                 &tname(layer, "attn_k.weight"),
-                HIDDEN,
-                N_KV * HEAD_DIM,
+                dims.hidden,
+                N_KV * dims.head_dim,
             );
             push_quant(
                 &mut tensors,
                 &mut rng,
                 &tname(layer, "attn_v.weight"),
-                HIDDEN,
-                N_KV * HEAD_DIM,
+                dims.hidden,
+                N_KV * dims.head_dim,
             );
             push_quant(
                 &mut tensors,
                 &mut rng,
                 &tname(layer, "attn_output.weight"),
                 dims.attn_output_input_width(),
-                HIDDEN,
+                dims.hidden,
             );
             push_plain_f32(
                 &mut tensors,
                 &mut rng,
                 &tname(layer, "attn_q_norm.weight"),
-                vec![HEAD_DIM as u64],
+                vec![dims.head_dim as u64],
                 (0.5, 1.5),
             );
             push_plain_f32(
                 &mut tensors,
                 &mut rng,
                 &tname(layer, "attn_k_norm.weight"),
-                vec![HEAD_DIM as u64],
+                vec![dims.head_dim as u64],
                 (0.5, 1.5),
             );
         } else {
@@ -810,28 +933,28 @@ fn build_plan(spec: &HybridFixtureSpec) -> FixturePlan {
                 &mut tensors,
                 &mut rng,
                 &tname(layer, "attn_qkv.weight"),
-                HIDDEN,
+                dims.hidden,
                 dims.conv_dim,
             );
             push_quant(
                 &mut tensors,
                 &mut rng,
                 &tname(layer, "attn_gate.weight"),
-                HIDDEN,
+                dims.hidden,
                 dims.inner_size,
             );
             push_bf16(
                 &mut tensors,
                 &mut rng,
                 &tname(layer, "ssm_alpha.weight"),
-                HIDDEN,
+                dims.hidden,
                 dims.n_v_heads,
             );
             push_bf16(
                 &mut tensors,
                 &mut rng,
                 &tname(layer, "ssm_beta.weight"),
-                HIDDEN,
+                dims.hidden,
                 dims.n_v_heads,
             );
             push_plain_f32(
@@ -868,7 +991,7 @@ fn build_plan(spec: &HybridFixtureSpec) -> FixturePlan {
                 &mut rng,
                 &tname(layer, "ssm_out.weight"),
                 dims.inner_size,
-                HIDDEN,
+                dims.hidden,
             );
         }
     }
@@ -877,7 +1000,7 @@ fn build_plan(spec: &HybridFixtureSpec) -> FixturePlan {
     let mut signs = BTreeMap::new();
     let mut folded_names = Vec::new();
     if spec.hadamard {
-        for &width in &[HIDDEN, dims.attn_output_input_width(), FFN] {
+        for &width in &[dims.hidden, dims.attn_output_input_width(), dims.ffn] {
             signs.entry(width).or_insert_with(|| {
                 (0..width)
                     .map(|_| {
@@ -1032,7 +1155,15 @@ pub struct ReferenceForward {
     /// `[T_TOKENS][vocab]` logits.
     pub logits: Vec<Vec<f64>>,
     /// `[T_TOKENS][hidden]` pre-final-norm residual stream, for diagnostics.
+    /// Equal to `per_layer_hidden[BLOCK_COUNT - 1]`; kept as its own field
+    /// since it predates `per_layer_hidden` and existing callers read it.
     pub final_hidden: Vec<Vec<f64>>,
+    /// `per_layer_hidden[layer]` is the residual stream after block
+    /// `layer`, `[t][hidden]` row-major — the same shape and meaning as
+    /// `oxibonsai_model::hybrid::forward::LayerDump.layers[layer]`, so a
+    /// caller with a real `LayerDump` can compare layer by layer instead of
+    /// only at the end.
+    pub per_layer_hidden: Vec<Vec<f64>>,
 }
 
 /// A generated hybrid GGUF fixture: the file on disk, its parsed
@@ -1092,8 +1223,8 @@ impl Drop for InvalidUngroupedFixture {
 /// hadamard on (`gdn_v_grouped` only exists as a key at all when the
 /// Hadamard contract is present), but `gdn_v_grouped = false` in the
 /// metadata while the weight layout still uses `n_k_heads = 2` (`v_per_k ==
-/// 2`) — exactly the combination the design says must be rejected once a
-/// loader exists (B2-10/B2-18).
+/// 2`) — exactly the combination the design says the hybrid loader must
+/// reject.
 pub fn build_invalid_ungrouped_fixture(
     seed: u64,
     quant: TensorType,
@@ -1106,6 +1237,8 @@ pub fn build_invalid_ungrouped_fixture(
         hadamard: true,
         gdn_v_grouped: true,
         seed,
+        hidden: HIDDEN,
+        hadamard_block: HADAMARD_BLOCK_SIZE,
     };
     let plan = build_plan(&spec);
     let path = unique_temp_path("invalid_ungrouped", seed);
@@ -1160,7 +1293,7 @@ fn write_gguf(
     );
     w.add_metadata(
         "qwen35.embedding_length",
-        MetadataWriteValue::U32(HIDDEN as u32),
+        MetadataWriteValue::U32(plan.dims.hidden as u32),
     );
     w.add_metadata(
         "qwen35.block_count",
@@ -1176,15 +1309,15 @@ fn write_gguf(
     );
     w.add_metadata(
         "qwen35.attention.key_length",
-        MetadataWriteValue::U32(HEAD_DIM as u32),
+        MetadataWriteValue::U32(plan.dims.head_dim as u32),
     );
     w.add_metadata(
         "qwen35.attention.value_length",
-        MetadataWriteValue::U32(HEAD_DIM as u32),
+        MetadataWriteValue::U32(plan.dims.head_dim as u32),
     );
     w.add_metadata(
         "qwen35.feed_forward_length",
-        MetadataWriteValue::U32(FFN as u32),
+        MetadataWriteValue::U32(plan.dims.ffn as u32),
     );
     w.add_metadata("qwen35.vocab_size", MetadataWriteValue::U32(VOCAB as u32));
     w.add_metadata(
@@ -1217,7 +1350,7 @@ fn write_gguf(
     );
     w.add_metadata(
         "qwen35.ssm.state_size",
-        MetadataWriteValue::U32(SSM_STATE_SIZE as u32),
+        MetadataWriteValue::U32(plan.dims.head_k_dim as u32),
     );
     w.add_metadata(
         "qwen35.ssm.group_count",
@@ -1235,8 +1368,8 @@ fn write_gguf(
     w.add_metadata("general.sampling.top_p", MetadataWriteValue::F32(0.95));
     w.add_metadata("general.sampling.top_k", MetadataWriteValue::U32(20));
 
-    // ── id-42 disambiguation metadata (design §7.2 "id-42 resolution" row,
-    // wave-2.5 addendum item 4): `general.quantization_version` is the only
+    // ── id-42 disambiguation metadata (design §7.2 "id-42 resolution"
+    // row): `general.quantization_version` is the only
     // real discriminator between the on-disk readings of wire id 42
     // (`oxibonsai_core::gguf::quant_resolve` module docs) — the mainline
     // `Q2_0_g64` reading carries the numeric `u32 2` PrismML files use,
@@ -1286,7 +1419,7 @@ fn write_gguf(
         w.add_metadata("prism.hadamard.version", MetadataWriteValue::U32(1));
         w.add_metadata(
             "prism.hadamard.block_size",
-            MetadataWriteValue::U32(HADAMARD_BLOCK_SIZE as u32),
+            MetadataWriteValue::U32(plan.dims.hadamard_block as u32),
         );
         w.add_metadata(
             "prism.hadamard.transform",
@@ -1421,7 +1554,7 @@ fn run_reference_forward(spec: &HybridFixtureSpec, plan: &FixturePlan) -> Refere
     let dims = plan.dims;
     let hadamard = if spec.hadamard {
         Some(HadamardRuntime {
-            block_size: HADAMARD_BLOCK_SIZE,
+            block_size: dims.hadamard_block,
             signs: plan.signs.clone(),
         })
     } else {
@@ -1477,9 +1610,17 @@ fn run_reference_forward(spec: &HybridFixtureSpec, plan: &FixturePlan) -> Refere
 
     let mut logits = Vec::with_capacity(T_TOKENS);
     let mut final_hidden = Vec::with_capacity(T_TOKENS);
+    // `per_layer_hidden[layer]` is `[t][hidden]` row-major, matching
+    // `oxibonsai_model::hybrid::forward::LayerDump.layers[layer]` exactly:
+    // capturing the residual stream after every block, not only the final
+    // one, so a mismatch against the real loader localises to one block
+    // instead of only showing up in the final logits.
+    let mut per_layer_hidden: Vec<Vec<f64>> = (0..BLOCK_COUNT)
+        .map(|_| Vec::with_capacity(T_TOKENS * dims.hidden))
+        .collect();
 
     for (pos, &tok) in token_ids.iter().enumerate() {
-        let embed_row: Vec<f64> = token_embd[tok * HIDDEN..(tok + 1) * HIDDEN].to_vec();
+        let embed_row: Vec<f64> = token_embd[tok * dims.hidden..(tok + 1) * dims.hidden].to_vec();
         let mut h = match &hadamard {
             Some(hr) => hr.inverse_embedding(&embed_row),
             None => embed_row,
@@ -1495,19 +1636,19 @@ fn run_reference_forward(spec: &HybridFixtureSpec, plan: &FixturePlan) -> Refere
                 let wq = f64_values(plan, &tname(layer, "attn_q.weight"));
                 let wk = f64_values(plan, &tname(layer, "attn_k.weight"));
                 let wv = f64_values(plan, &tname(layer, "attn_v.weight"));
-                let qfull = matmul_row_major(&wq, HIDDEN, N_HEAD * HEAD_DIM * 2, &a_rot);
-                let kfull = matmul_row_major(&wk, HIDDEN, N_KV * HEAD_DIM, &a_rot);
-                let vfull = matmul_row_major(&wv, HIDDEN, N_KV * HEAD_DIM, &a_rot);
+                let qfull = matmul_row_major(&wq, dims.hidden, N_HEAD * dims.head_dim * 2, &a_rot);
+                let kfull = matmul_row_major(&wk, dims.hidden, N_KV * dims.head_dim, &a_rot);
+                let vfull = matmul_row_major(&wv, dims.hidden, N_KV * dims.head_dim, &a_rot);
 
                 let q_norm_w = f64_values(plan, &tname(layer, "attn_q_norm.weight"));
                 let k_norm_w = f64_values(plan, &tname(layer, "attn_k_norm.weight"));
 
                 // K/V for this position, per KV head, RMS-normed + RoPE'd.
                 for kv in 0..N_KV {
-                    let mut k_h = kfull[kv * HEAD_DIM..(kv + 1) * HEAD_DIM].to_vec();
+                    let mut k_h = kfull[kv * dims.head_dim..(kv + 1) * dims.head_dim].to_vec();
                     k_h = rms_norm_f64(&k_h, &k_norm_w, RMS_EPS);
                     apply_partial_rope_f64(&mut k_h, pos, ROPE_DIM, ROPE_FREQ_BASE);
-                    let v_h = vfull[kv * HEAD_DIM..(kv + 1) * HEAD_DIM].to_vec();
+                    let v_h = vfull[kv * dims.head_dim..(kv + 1) * dims.head_dim].to_vec();
                     // `k_hist`/`v_hist` were pre-populated with one N_KV-slot
                     // vector for every layer satisfying `is_full_attention`,
                     // using that same predicate; we are inside the branch
@@ -1528,13 +1669,13 @@ fn run_reference_forward(spec: &HybridFixtureSpec, plan: &FixturePlan) -> Refere
                 }
 
                 let group_size = N_HEAD / N_KV;
-                let scale = 1.0 / (HEAD_DIM as f64).sqrt();
-                let mut attn_out = vec![0.0f64; N_HEAD * HEAD_DIM];
-                let mut gate_all = vec![0.0f64; N_HEAD * HEAD_DIM];
+                let scale = 1.0 / (dims.head_dim as f64).sqrt();
+                let mut attn_out = vec![0.0f64; N_HEAD * dims.head_dim];
+                let mut gate_all = vec![0.0f64; N_HEAD * dims.head_dim];
                 for head in 0..N_HEAD {
-                    let base = head * 2 * HEAD_DIM;
-                    let mut q_h = qfull[base..base + HEAD_DIM].to_vec();
-                    let gate_h = &qfull[base + HEAD_DIM..base + 2 * HEAD_DIM];
+                    let base = head * 2 * dims.head_dim;
+                    let mut q_h = qfull[base..base + dims.head_dim].to_vec();
+                    let gate_h = &qfull[base + dims.head_dim..base + 2 * dims.head_dim];
                     q_h = rms_norm_f64(&q_h, &q_norm_w, RMS_EPS);
                     apply_partial_rope_f64(&mut q_h, pos, ROPE_DIM, ROPE_FREQ_BASE);
 
@@ -1549,14 +1690,16 @@ fn run_reference_forward(spec: &HybridFixtureSpec, plan: &FixturePlan) -> Refere
                     let exp_s: Vec<f64> = scores.iter().map(|&s| (s - max_s).exp()).collect();
                     let sum_s: f64 = exp_s.iter().sum();
                     let weights: Vec<f64> = exp_s.iter().map(|&e| e / sum_s).collect();
-                    let mut o_h = vec![0.0f64; HEAD_DIM];
+                    let mut o_h = vec![0.0f64; dims.head_dim];
                     for (t, v) in vs.iter().enumerate() {
-                        for d in 0..HEAD_DIM {
+                        for d in 0..dims.head_dim {
                             o_h[d] += weights[t] * v[d];
                         }
                     }
-                    attn_out[head * HEAD_DIM..(head + 1) * HEAD_DIM].copy_from_slice(&o_h);
-                    gate_all[head * HEAD_DIM..(head + 1) * HEAD_DIM].copy_from_slice(gate_h);
+                    attn_out[head * dims.head_dim..(head + 1) * dims.head_dim]
+                        .copy_from_slice(&o_h);
+                    gate_all[head * dims.head_dim..(head + 1) * dims.head_dim]
+                        .copy_from_slice(gate_h);
                 }
                 debug_assert_eq!(attn_out.len(), full_output_in);
                 let gated: Vec<f64> = attn_out
@@ -1566,7 +1709,7 @@ fn run_reference_forward(spec: &HybridFixtureSpec, plan: &FixturePlan) -> Refere
                     .collect();
                 let o_rot = rotate(&gated);
                 let wo = f64_values(plan, &tname(layer, "attn_output.weight"));
-                let attn_result = matmul_row_major(&wo, full_output_in, HIDDEN, &o_rot);
+                let attn_result = matmul_row_major(&wo, full_output_in, dims.hidden, &o_rot);
                 h = residual
                     .iter()
                     .zip(&attn_result)
@@ -1576,15 +1719,17 @@ fn run_reference_forward(spec: &HybridFixtureSpec, plan: &FixturePlan) -> Refere
                 let a_rot = rotate(&normed);
                 let wqkv = f64_values(plan, &tname(layer, "attn_qkv.weight"));
                 let wgate = f64_values(plan, &tname(layer, "attn_gate.weight"));
-                let mut qkv = matmul_row_major(&wqkv, HIDDEN, dims.conv_dim, &a_rot);
-                let z_tiled = matmul_row_major(&wgate, HIDDEN, dims.inner_size, &a_rot);
+                let mut qkv = matmul_row_major(&wqkv, dims.hidden, dims.conv_dim, &a_rot);
+                let z_tiled = matmul_row_major(&wgate, dims.hidden, dims.inner_size, &a_rot);
 
                 // ssm_alpha/ssm_beta are NOT folded: consume the unrotated
                 // `normed` (design §3.4's "easy-to-miss" trap).
                 let w_alpha = f64_values(plan, &tname(layer, "ssm_alpha.weight"));
                 let w_beta = f64_values(plan, &tname(layer, "ssm_beta.weight"));
-                let alpha_raw_tiled = matmul_row_major(&w_alpha, HIDDEN, dims.n_v_heads, &normed);
-                let beta_raw_tiled = matmul_row_major(&w_beta, HIDDEN, dims.n_v_heads, &normed);
+                let alpha_raw_tiled =
+                    matmul_row_major(&w_alpha, dims.hidden, dims.n_v_heads, &normed);
+                let beta_raw_tiled =
+                    matmul_row_major(&w_beta, dims.hidden, dims.n_v_heads, &normed);
 
                 let conv_w_flat = f64_values(plan, &tname(layer, "ssm_conv1d.weight"));
                 // ne=[kc, conv_dim] row-major-per-channel: channel c's kc
@@ -1667,7 +1812,7 @@ fn run_reference_forward(spec: &HybridFixtureSpec, plan: &FixturePlan) -> Refere
                 // `ssm_out`'s fold degenerates to a plain `rotate`.
                 let o_rot = rotate(&gated_out);
                 let w_out = f64_values(plan, &tname(layer, "ssm_out.weight"));
-                let ssm_result = matmul_row_major(&w_out, dims.inner_size, HIDDEN, &o_rot);
+                let ssm_result = matmul_row_major(&w_out, dims.inner_size, dims.hidden, &o_rot);
                 h = residual
                     .iter()
                     .zip(&ssm_result)
@@ -1682,8 +1827,8 @@ fn run_reference_forward(spec: &HybridFixtureSpec, plan: &FixturePlan) -> Refere
             let f_rot = rotate(&f);
             let w_gate = f64_values(plan, &tname(layer, "ffn_gate.weight"));
             let w_up = f64_values(plan, &tname(layer, "ffn_up.weight"));
-            let gate_out = matmul_row_major(&w_gate, HIDDEN, FFN, &f_rot);
-            let up_out = matmul_row_major(&w_up, HIDDEN, FFN, &f_rot);
+            let gate_out = matmul_row_major(&w_gate, dims.hidden, dims.ffn, &f_rot);
+            let up_out = matmul_row_major(&w_up, dims.hidden, dims.ffn, &f_rot);
             let m_vec: Vec<f64> = gate_out
                 .iter()
                 .zip(&up_out)
@@ -1691,18 +1836,20 @@ fn run_reference_forward(spec: &HybridFixtureSpec, plan: &FixturePlan) -> Refere
                 .collect();
             let m_rot = rotate(&m_vec);
             let w_down = f64_values(plan, &tname(layer, "ffn_down.weight"));
-            let down_out = matmul_row_major(&w_down, FFN, HIDDEN, &m_rot);
+            let down_out = matmul_row_major(&w_down, dims.ffn, dims.hidden, &m_rot);
             h = residual2
                 .iter()
                 .zip(&down_out)
                 .map(|(&r, &d)| r + d)
                 .collect();
+
+            per_layer_hidden[layer].extend_from_slice(&h);
         }
 
         final_hidden.push(h.clone());
         let normed_final = rms_norm_f64(&h, &output_norm_w, RMS_EPS);
         let final_rot = rotate(&normed_final);
-        let token_logits = matmul_row_major(&output_w, HIDDEN, VOCAB, &final_rot);
+        let token_logits = matmul_row_major(&output_w, dims.hidden, VOCAB, &final_rot);
         logits.push(token_logits);
     }
 
@@ -1710,6 +1857,7 @@ fn run_reference_forward(spec: &HybridFixtureSpec, plan: &FixturePlan) -> Refere
         token_ids,
         logits,
         final_hidden,
+        per_layer_hidden,
     }
 }
 

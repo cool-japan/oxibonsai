@@ -3,10 +3,10 @@
 //! `#[path]`, so `super` still names that module).
 
 use super::{
-    missing_tokenizer_warning, parse_flat_toml_sections, read_prompt_stdin,
-    reject_penalties_with_constrained_decode, resolve_backend, resolve_f32, resolve_rope_scaling,
-    resolve_str, resolve_tokenizer, resolve_usize, strip_quant_suffix, tokenizer_candidates,
-    toml_f32, toml_str, toml_usize, RawTomlSections,
+    clamp_generation_budget, missing_tokenizer_warning, parse_flat_toml_sections,
+    read_prompt_stdin, reject_penalties_with_constrained_decode, resolve_backend, resolve_f32,
+    resolve_rope_scaling, resolve_str, resolve_tokenizer, resolve_usize, strip_quant_suffix,
+    tokenizer_candidates, toml_f32, toml_str, toml_usize, RawTomlSections,
 };
 use oxibonsai_runtime::config::RopeScalingMode;
 use oxibonsai_runtime::engine_seam::Backend;
@@ -412,7 +412,7 @@ fn constrained_decode_rejection_names_every_offending_flag() {
     assert!(msg.contains("--presence-penalty"), "got: {msg}");
 }
 
-// ── resolve_backend / resolve_rope_scaling (wave-4b addenda) ──
+// ── resolve_backend / resolve_rope_scaling ──────────────────────────────
 
 #[test]
 fn resolve_backend_prefers_explicit_cli_value() {
@@ -490,7 +490,7 @@ fn resolve_rope_scaling_rejects_an_invalid_toml_value() {
     assert!(err.to_string().contains("yarn"));
 }
 
-// ── wave-4b config surface: [imagen], the new keys, validated_opt ──────────
+// ── config surface: [imagen], the new keys, validated_opt ──────────────────
 
 #[test]
 fn parse_flat_toml_sections_rejects_a_section_outside_the_schema() {
@@ -596,4 +596,35 @@ fn env_var_guard_restores_the_prior_value_even_when_it_was_unset() {
         );
     }
     assert_eq!(std::env::var(KEY).ok(), None);
+}
+
+// ── clamp_generation_budget ──────────────────────────────────────────────
+
+#[test]
+fn clamp_generation_budget_is_a_no_op_when_everything_fits() {
+    assert_eq!(clamp_generation_budget(5, 10, 100).expect("fits"), 10);
+}
+
+#[test]
+fn clamp_generation_budget_shrinks_to_what_remains() {
+    // prompt 10, ctx 16: only 6 slots remain, even though 64 were requested.
+    assert_eq!(clamp_generation_budget(10, 64, 16).expect("clamped"), 6);
+}
+
+#[test]
+fn clamp_generation_budget_allows_exactly_filling_the_context() {
+    assert_eq!(clamp_generation_budget(10, 6, 16).expect("exact fit"), 6);
+}
+
+#[test]
+fn clamp_generation_budget_can_clamp_to_zero_when_the_prompt_fills_the_context() {
+    assert_eq!(clamp_generation_budget(16, 8, 16).expect("zero left"), 0);
+}
+
+#[test]
+fn clamp_generation_budget_refuses_a_prompt_that_alone_overflows() {
+    let err = clamp_generation_budget(17, 1, 16).expect_err("prompt alone too long");
+    let msg = err.to_string();
+    assert!(msg.contains("17"), "{msg}");
+    assert!(msg.contains("16"), "{msg}");
 }

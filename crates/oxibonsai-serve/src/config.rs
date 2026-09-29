@@ -1168,7 +1168,7 @@ bearer_token_file = "/etc/oxibonsai/bearer-token"
             per_request_timeout_ms: _,
             engine_pool_size: _,
             max_body_bytes: _,
-            max_output_tokens: _, // KNOWN GAP (B2-14 deviation): main.rs still passes `cli_args.max_output_tokens` to `RouterBuildOptions::new`; it must pass `config.limits.max_output_tokens` (which already layers the CLI flag over TOML/env once `args.rs::to_partial` sets it).
+            max_output_tokens: _, // main.rs: RouterBuildOptions::new's ceiling (CLI flag > env > TOML > None, args.rs::to_partial + env.rs::parse_env_map).
         } = limits; // main.rs: RequestLimits::with_max_input_tokens/with_timeout_ms, GlobalConcurrencyLimitLayer, DefaultBodyLimit::max.
         let AuthConfig {
             bearer_token: _,
@@ -1186,7 +1186,7 @@ bearer_token_file = "/etc/oxibonsai/bearer-token"
             allow_credentials: _,
         } = cors; // main.rs: CorsConfig::from_origins(..) -> apply_middleware.
         let RateLimitSection { rpm: _, burst: _ } = rate_limit; // main.rs: rpm/60.0 -> RateLimitConfig.rps, fed to rate_limiter::rate_limit_layer.
-        let UiSection { enabled: _ } = ui; // KNOWN GAP (B2-14 deviation): main.rs must pass `config.ui.enabled` instead of `cli_args.enable_ui` to `RouterBuildOptions::new`.
+        let UiSection { enabled: _ } = ui; // main.rs: RouterBuildOptions::new's enable_ui (CLI flag > env > TOML > false).
         let _seed: u64 = seed; // main.rs: build_pool_from_gguf(.., seed, ..).
     }
 }

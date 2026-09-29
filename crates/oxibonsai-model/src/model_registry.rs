@@ -892,12 +892,22 @@ mod tests {
     /// that every case really ran.
     #[test]
     fn detect_qwen35_27b_on_real_files() {
-        use oxibonsai_core::gguf::reader::GgufFile;
+        use oxibonsai_core::gguf::reader::{mmap_gguf_file, GgufFile};
 
         let require_real_files = std::env::var("OXI_REQUIRE_MODEL_FILES")
             .map(|v| v == "1")
             .unwrap_or(false);
-        let models_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models");
+        // `OXIBONSAI_MODELS_DIR` overrides the repo-relative default — the
+        // same convention every other real-model test in this workspace
+        // uses, and the only way to point this test at the real files from
+        // an isolated git worktree (whose own `../../models` has no weights).
+        let models_dir = std::env::var("OXIBONSAI_MODELS_DIR")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models")
+            });
 
         let cases_27b: &[(&str, ModelVariant)] = &[
             (
@@ -918,7 +928,14 @@ mod tests {
         ];
         for (filename, expected) in cases_27b {
             let path = models_dir.join(filename);
-            let Ok(bytes) = std::fs::read(&path) else {
+            // A raw `std::fs::read` of the whole GGUF (up to 7.2 GB for the
+            // PQ2_0 band) just to read its header/metadata would be a real
+            // memory spike under nextest
+            // parallelism on a 24 GB host. `mmap_gguf_file` maps the file
+            // instead; `GgufFile::parse` only ever touches the header,
+            // metadata KV table and tensor descriptors, never the tensor
+            // bytes themselves, for this detection-only test.
+            let Ok(mmap) = mmap_gguf_file(&path) else {
                 assert!(
                     !require_real_files,
                     "OXI_REQUIRE_MODEL_FILES=1: {filename} must be present at {}",
@@ -927,7 +944,7 @@ mod tests {
                 eprintln!("skipping {filename}: not present at {}", path.display());
                 continue;
             };
-            let gguf = GgufFile::parse(&bytes)
+            let gguf = GgufFile::parse(&mmap)
                 .unwrap_or_else(|e| panic!("{filename}: real file must parse cleanly: {e}"));
             let arch = gguf
                 .metadata
@@ -959,8 +976,8 @@ mod tests {
         }
 
         let mmproj_path = models_dir.join("Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf");
-        if let Ok(bytes) = std::fs::read(&mmproj_path) {
-            let gguf = GgufFile::parse(&bytes).expect("mmproj file must parse cleanly");
+        if let Ok(mmap) = mmap_gguf_file(&mmproj_path) {
+            let gguf = GgufFile::parse(&mmap).expect("mmproj file must parse cleanly");
             let arch = gguf
                 .metadata
                 .get_string("general.architecture")
@@ -996,12 +1013,22 @@ mod tests {
     /// `detect_qwen35_27b_on_real_files`).
     #[test]
     fn legacy_model_variants_unaffected_by_27b_detection() {
-        use oxibonsai_core::gguf::reader::GgufFile;
+        use oxibonsai_core::gguf::reader::{mmap_gguf_file, GgufFile};
 
         let require_real_files = std::env::var("OXI_REQUIRE_MODEL_FILES")
             .map(|v| v == "1")
             .unwrap_or(false);
-        let models_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models");
+        // `OXIBONSAI_MODELS_DIR` overrides the repo-relative default — the
+        // same convention every other real-model test in this workspace
+        // uses, and the only way to point this test at the real files from
+        // an isolated git worktree (whose own `../../models` has no weights).
+        let models_dir = std::env::var("OXIBONSAI_MODELS_DIR")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models")
+            });
         let cases: &[(&str, ModelVariant)] = &[
             ("Ternary-Bonsai-1.7B.gguf", ModelVariant::TernaryBonsai1_7B),
             ("Ternary-Bonsai-8B.gguf", ModelVariant::TernaryBonsai8B),
@@ -1009,7 +1036,9 @@ mod tests {
         ];
         for (filename, expected) in cases {
             let path = models_dir.join(filename);
-            let Ok(bytes) = std::fs::read(&path) else {
+            // Same mmap approach as `detect_qwen35_27b_on_real_files`
+            // above: mmap instead of reading the whole (up to 2.2 GB) file.
+            let Ok(mmap) = mmap_gguf_file(&path) else {
                 assert!(
                     !require_real_files,
                     "OXI_REQUIRE_MODEL_FILES=1: {filename} must be present at {}",
@@ -1018,7 +1047,7 @@ mod tests {
                 eprintln!("skipping {filename}: not present at {}", path.display());
                 continue;
             };
-            let gguf = GgufFile::parse(&bytes)
+            let gguf = GgufFile::parse(&mmap)
                 .unwrap_or_else(|e| panic!("{filename}: real file must parse cleanly: {e}"));
             let config = Qwen3Config::from_metadata(&gguf.metadata)
                 .unwrap_or_else(|e| panic!("{filename}: config parse failed: {e}"));

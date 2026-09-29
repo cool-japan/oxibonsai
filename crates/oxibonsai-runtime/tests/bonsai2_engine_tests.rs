@@ -46,7 +46,7 @@ use std::sync::Mutex;
 use oxibonsai_core::gguf::reader::{mmap_gguf_file, GgufFile};
 use oxibonsai_runtime::engine::{tokenizer_from_gguf, InferenceEngine};
 use oxibonsai_runtime::sampling::SamplingParams;
-use oxibonsai_testkit::capability::{record_executed, record_skipped, Capability};
+use oxibonsai_testkit::capability::{record_executed_timed, record_skipped, Capability};
 
 /// The three raw (un-templated) golden prompts of `make_golden2.sh`.
 const PROMPTS: [&str; 3] = [
@@ -223,34 +223,38 @@ fn check_engine_against_goldens(model_path: &Path, golden_dir: &Path, quant: &st
 
 #[test]
 fn bonsai2_pq2_engine_greedy_matches_the_fork_goldens() {
-    const TEST: &str = "bonsai2_engine_tests::bonsai2_pq2_engine_greedy_matches_the_fork_goldens";
+    const TEST: &str =
+        "oxibonsai-runtime::bonsai2_engine_tests::bonsai2_pq2_engine_greedy_matches_the_fork_goldens";
     let Some(model) = env_path("OXI_BONSAI2_PQ2_GGUF", TEST) else {
         return;
     };
     let Some(golden_dir) = env_path("OXI_BONSAI2_GOLDEN_DIR", TEST) else {
         return;
     };
+    let gate_start = std::time::Instant::now();
     let _serial = REAL_MODEL_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     check_engine_against_goldens(&model, &golden_dir, "PQ2_0");
-    record_executed(Capability::Bonsai2Models, TEST);
+    record_executed_timed(Capability::Bonsai2Models, TEST, gate_start.elapsed());
 }
 
 #[test]
 fn bonsai2_ptq1_engine_greedy_matches_the_fork_goldens() {
-    const TEST: &str = "bonsai2_engine_tests::bonsai2_ptq1_engine_greedy_matches_the_fork_goldens";
+    const TEST: &str =
+        "oxibonsai-runtime::bonsai2_engine_tests::bonsai2_ptq1_engine_greedy_matches_the_fork_goldens";
     let Some(model) = env_path("OXI_BONSAI2_PTQ1_GGUF", TEST) else {
         return;
     };
     let Some(golden_dir) = env_path("OXI_BONSAI2_GOLDEN_DIR", TEST) else {
         return;
     };
+    let gate_start = std::time::Instant::now();
     let _serial = REAL_MODEL_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     check_engine_against_goldens(&model, &golden_dir, "PTQ1_0");
-    record_executed(Capability::Bonsai2Models, TEST);
+    record_executed_timed(Capability::Bonsai2Models, TEST, gate_start.elapsed());
 }
 
 /// The golden parsers themselves, proven on inline copies of both fork

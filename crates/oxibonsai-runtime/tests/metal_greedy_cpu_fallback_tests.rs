@@ -31,6 +31,7 @@ use oxibonsai_kernels::dispatch::KernelTier;
 use oxibonsai_model::model::BonsaiModel;
 use oxibonsai_runtime::engine::InferenceEngine;
 use oxibonsai_runtime::sampling::SamplingParams;
+use oxibonsai_testkit::capability::{record_executed, record_skipped, Capability};
 use oxibonsai_testkit::gguf_fixture::Lcg;
 
 /// KV-cache / context budget for the synthetic model.
@@ -300,28 +301,27 @@ fn run_cpu_reference(gguf_bytes: &[u8], prompt: &[u32], n: usize) -> Vec<u32> {
 
 /// Serializes every test below that calls [`run_greedy_gpu`].
 ///
-/// MINOR fix (verifier wave 3, round 2 empirical finding): `run_greedy_gpu`
-/// mutates the process-global `OXIBONSAI_FORCE_CPU_DECODE_AFTER` env var and
-/// dispatches through Metal. MET-08 (METAL-CONCURRENCY, landed wave 4) split
-/// the old single mutable `GLOBAL_METAL_GRAPH` into a process-shared,
-/// immutable `MetalDevice` and a per-session `MetalGraph` bound to a thread
-/// via `SessionScope`, so N sessions can now genuinely overlap on the GPU —
-/// but no test in this file binds one, so `MetalGraph::global()` still falls
-/// through to the single process-default session (`session.rs`'s documented
-/// fallback for a caller that never binds), exactly the pre-MET-08 shared
-/// state this guard was written against. `cargo test`'s default in-binary
-/// thread parallelism let two of this file's tests race — one setting/
-/// clearing the env var and touching GPU state while another read it —
-/// which was empirically proven to be the real cause of the intermittent
-/// argmax divergence this file's tests once "fixed" by reseeding the
-/// fixture (see `build_synthetic_ternary_gguf`'s doc comment). The
-/// precedent for this exact fix is
+/// `run_greedy_gpu` mutates the process-global `OXIBONSAI_FORCE_CPU_DECODE_AFTER`
+/// env var and dispatches through Metal. MET-08 split the old single mutable
+/// `GLOBAL_METAL_GRAPH` into a process-shared, immutable `MetalDevice` and a
+/// per-session `MetalGraph` bound to a thread via `SessionScope`, so N
+/// sessions can now genuinely overlap on the GPU — but no test in this file
+/// binds one, so `MetalGraph::global()` still falls through to the single
+/// process-default session (`session.rs`'s documented fallback for a caller
+/// that never binds), exactly the shared state this guard is written
+/// against. `cargo test`'s default in-binary thread parallelism lets two of
+/// this file's tests race — one setting/clearing the env var and touching
+/// GPU state while another read it — which is the real cause of the
+/// intermittent argmax divergence this file's tests once "fixed" by
+/// reseeding the fixture (see `build_synthetic_ternary_gguf`'s doc comment).
+/// The precedent for this exact fix is
 /// `crates/oxibonsai-model/tests/metal_prefill_ternary_parity_tests.rs::gpu_serial`
-/// (FIX-06-KERN-MODEL) / `crates/oxibonsai-kernels/tests/gpu_backend_tests.rs::gpu_serial`
-/// (wave-1.5 addendum 3); rewriting this file's tests to bind their own
+/// and `crates/oxibonsai-kernels/tests/gpu_backend_tests.rs::gpu_serial`;
+/// rewriting this file's tests to bind their own
 /// `MetalGraph::bind_new_session()` (rather than relying on the shared
 /// default) would let this helper (and every `let _gpu = gpu_serial();` call
-/// site below) go, but that rewrite is out of this package's scope.
+/// site below) go, but is a larger change than this file's own tests need
+/// today.
 fn gpu_serial() -> std::sync::MutexGuard<'static, ()> {
     static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     GPU_LOCK
@@ -403,25 +403,31 @@ fn metal_greedy_cpu_fallback_matches_cpu_reference() {
 /// FAITHFUL real-model guard: on the shipped 1.7B ternary GGUF, the Metal greedy
 /// GPU path (`generate_greedy_gpu`, the CLI's temperature-0 path) must produce a
 /// byte-identical ≥64-token sequence to the pure-CPU reference, AND forcing the
-/// mid-stream CPU fallback must not change a single token. Ignored by default
-/// (needs a multi-hundred-MB model file + a dev Mac with Metal).
+/// mid-stream CPU fallback must not change a single token.
+///
+/// Needs a multi-hundred-MB model file and a dev Mac with Metal: not
+/// `#[ignore]`d — self-skips with a `legacy-models` capability record when
+/// `OXI_MODEL` is unset, so a run without the file is visibly SKIPPED, never
+/// silently passed.
 ///
 /// Run with:
 /// ```text
 /// OXI_MODEL=/path/to/Ternary-Bonsai-1.7B.gguf \
-///   cargo test -p oxibonsai-runtime --features metal \
+///   cargo test -p oxibonsai-runtime --release --features metal \
 ///   --test metal_greedy_cpu_fallback_tests \
-///   real_model_greedy_gpu_fallback_byte_identical -- --ignored --nocapture
+///   real_model_greedy_gpu_fallback_byte_identical -- --nocapture
 /// ```
 #[test]
-#[ignore = "requires OXI_MODEL real ternary GGUF; run on dev Mac"]
 fn real_model_greedy_gpu_fallback_byte_identical() {
+    const TEST: &str =
+        "oxibonsai-runtime::metal_greedy_cpu_fallback_tests::real_model_greedy_gpu_fallback_byte_identical";
     let _gpu = gpu_serial();
     let Some(path) = std::env::var_os("OXI_MODEL") else {
         eprintln!(
-            "real_model_greedy_gpu_fallback_byte_identical: OXI_MODEL not set — skipping. \
-             Set OXI_MODEL=/path/to/Ternary-Bonsai-1.7B.gguf to run."
+            "skip {TEST}: OXI_MODEL not set. Set OXI_MODEL=/path/to/Ternary-Bonsai-1.7B.gguf to \
+             run."
         );
+        record_skipped(Capability::LegacyModels, TEST);
         return;
     };
     let gguf = std::fs::read(&path).expect("read OXI_MODEL gguf");
@@ -451,4 +457,5 @@ fn real_model_greedy_gpu_fallback_byte_identical() {
          all-GPU / forced-CPU-fallback / pure-CPU",
         all_gpu.len()
     );
+    record_executed(Capability::LegacyModels, TEST);
 }

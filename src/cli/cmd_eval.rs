@@ -32,6 +32,7 @@ use oxibonsai_eval::{
 use oxibonsai_runtime::{InferenceEngine, TokenizerBridge};
 
 use super::args::EvalTask;
+use super::tokenizer_backend::TokenizerBackendChoice;
 use super::util::{
     build_sampling_params, missing_tokenizer_warning, model_vocab_size,
     resolve_tokenizer_vocab_aware,
@@ -47,6 +48,7 @@ pub(crate) struct EvalArgs {
     pub(crate) max_tokens: usize,
     pub(crate) max_seq_len: usize,
     pub(crate) tokenizer: Option<String>,
+    pub(crate) tokenizer_backend: TokenizerBackendChoice,
     pub(crate) report_json: Option<String>,
     pub(crate) report_markdown: Option<String>,
     pub(crate) allow_vocab_mismatch: bool,
@@ -72,6 +74,7 @@ pub(crate) fn run(args: EvalArgs) -> anyhow::Result<()> {
         max_tokens,
         max_seq_len,
         tokenizer,
+        tokenizer_backend,
         report_json,
         report_markdown,
         allow_vocab_mismatch,
@@ -98,14 +101,14 @@ pub(crate) fn run(args: EvalArgs) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to open model '{model}': {e}"))?;
     let gguf = oxibonsai_core::gguf::reader::GgufFile::parse(&mmap)?;
 
-    // Eval is greedy-by-construction: the shared constructor (orchestrator
-    // P0 addendum) with repetition_penalty=1.0 so it is exactly argmax,
+    // Eval is greedy-by-construction: the shared constructor
+    // with repetition_penalty=1.0 so it is exactly argmax,
     // matching every other backend's `--temperature 0` contract.
     let params = build_sampling_params(0.0, 40, 0.9, 1.0);
     let mut engine = InferenceEngine::from_gguf(&gguf, params, 42, max_seq_len)?;
 
     // TOK-08: vocab-aware resolution + a hard compatibility check.
-    // ENGINE-SEAM: shared with `run` (GGUF-embedded tokenizer fallback).
+    // Shared with `run` (GGUF-embedded tokenizer fallback).
     let expected_vocab = model_vocab_size(&gguf).ok();
     let lookup = resolve_tokenizer_vocab_aware(tokenizer.as_deref(), &model, expected_vocab);
     let resolved = super::cmd_run::resolve_model_tokenizer_with(
@@ -114,7 +117,7 @@ pub(crate) fn run(args: EvalArgs) -> anyhow::Result<()> {
         &gguf,
         expected_vocab,
         allow_vocab_mismatch,
-        |path| Ok(TokenizerBridge::from_file(path)?),
+        |path| super::tokenizer_backend::load_tokenizer_bridge(path, tokenizer_backend),
     )?;
     let tok = match resolved {
         Some(tok) => tok,
@@ -227,9 +230,8 @@ fn load_dataset_for_task(
     }
 }
 
-/// `BoolQDataset` has no `from_jsonl` in `oxibonsai-eval` (that crate file
-/// is not in this package's `owned_files`); its `BoolQItem` fields are
-/// `pub`, so this reads the JSONL directly and builds the dataset through
+/// `BoolQDataset` has no `from_jsonl` in `oxibonsai-eval`; its `BoolQItem`
+/// fields are `pub`, so this reads the JSONL directly and builds the dataset through
 /// the existing `from_items` constructor instead.
 fn load_boolq_dataset(dataset_path: &str) -> anyhow::Result<BoolQDataset> {
     let content = std::fs::read_to_string(dataset_path)
@@ -393,7 +395,7 @@ fn score_choices_logprob(
     }
     let ctx_len = ctx_tokens.len();
     let first_logits = engine.prefill_from_pos(&ctx_tokens, 0)?;
-    // ENGINE-SEAM: the rollback point every choice returns to. A sequence
+    // The rollback point every choice returns to. A sequence
     // snapshot rather than `rewind_cache(ctx_len)`: a hybrid (`qwen35`)
     // model's recurrent state cannot be rewound by moving a KV cursor (the
     // engine refuses that), while for a dense model restoring the snapshot

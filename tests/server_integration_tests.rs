@@ -665,75 +665,86 @@ mod model_backed_embeddings_tests {
         );
     }
 
-    /// The real-1.7B half of the spec's "or the real 1.7B when OXI_MODEL is
+    /// The real-model half of the spec's "or a real model when OXI_MODEL is
     /// set" — self-skips (prints and returns, does not fail) when `OXI_MODEL`
     /// is unset, following the same established convention
     /// `crates/oxibonsai-runtime/tests/metal_concurrency_tests.rs` uses for
-    /// this exact environment variable. The tokenizer is resolved
-    /// independently via `oxibonsai_testkit::workspace::models_dir`, since
-    /// `tokenizer.json` is a separate file from whichever GGUF `OXI_MODEL`
-    /// names. This crate is a real `[dev-dependencies]` of the root package,
-    /// so this test calls the testkit's own
-    /// `$OXIBONSAI_MODELS_DIR`-or-`<repo-root>/models` resolver directly
-    /// instead of keeping a duplicate local copy; the one behavioural
-    /// difference is that the testkit version does not `trim()` the env var
-    /// before checking it is non-empty, which is immaterial here (nothing in
-    /// this workspace sets `OXIBONSAI_MODELS_DIR` to a whitespace-only
-    /// value).
+    /// this exact environment variable. `OXI_MODEL` accepts a dense or a
+    /// hybrid (`qwen35`) GGUF (see the comment below): the tokenizer is
+    /// resolved from that same file's own embedded metadata when it has one
+    /// (`TokenizerBridge::native_from_gguf_metadata`, the same source
+    /// `InferenceEngine::from_gguf_path` uses in production), falling back to
+    /// `models/tokenizer.json` only for a *dense* `OXI_MODEL` — this repo's
+    /// own `Ternary-Bonsai-1.7B.gguf` predates embedded tokenizer metadata
+    /// and has none. A hybrid GGUF is never paired with that fallback: its
+    /// vocabulary genuinely differs from the dense Qwen3 tokenizer
+    /// `tokenizer.json` holds (in-range ids, wrong token identities), so a
+    /// hybrid `OXI_MODEL` whose own metadata has no tokenizer fails loudly
+    /// instead of silently mismatching.
     #[tokio::test]
-    async fn model_backed_embeddings_endpoint_serves_200_on_the_real_1_7b_when_available() {
+    async fn model_backed_embeddings_endpoint_serves_200_on_a_real_model_when_available() {
         let Some(model_path) = std::env::var_os("OXI_MODEL") else {
             eprintln!(
-                "model_backed_embeddings_endpoint_serves_200_on_the_real_1_7b_when_available: \
-                 OXI_MODEL not set -- skipping (set OXI_MODEL=<path to a dense GGUF, e.g. \
-                 Ternary-Bonsai-1.7B.gguf> to run this against a real model)"
+                "model_backed_embeddings_endpoint_serves_200_on_a_real_model_when_available: \
+                 OXI_MODEL not set -- skipping (set OXI_MODEL=<path to a GGUF, dense or hybrid, \
+                 e.g. Ternary-Bonsai-1.7B.gguf> to run this against a real model)"
             );
             return;
         };
-        let tokenizer_path = workspace::models_dir().join("tokenizer.json");
-        if !tokenizer_path.exists() {
-            eprintln!(
-                "model_backed_embeddings_endpoint_serves_200_on_the_real_1_7b_when_available: \
-                 {} not found -- skipping (set OXIBONSAI_MODELS_DIR)",
-                tokenizer_path.display()
-            );
-            return;
-        }
-        let tokenizer_path_str = tokenizer_path
-            .to_str()
-            .expect("models/ path is valid UTF-8");
-        let tokenizer = Arc::new(
-            TokenizerBridge::from_file(tokenizer_path_str).expect("load the real tokenizer.json"),
-        );
 
-        let embedder = match ModelEmbedder::from_gguf_path(
-            &model_path,
-            tokenizer,
-            greedy_params(),
-            42,
-            MAX_SEQ,
-        ) {
-            Ok(embedder) => embedder,
-            // `OXI_MODEL` is this repo's general "which GGUF to test with"
-            // variable and is NOT guaranteed to name a dense model (a
-            // hybrid `qwen35` file is a legitimate value elsewhere, e.g.
-            // `embed_engine.rs`'s own hybrid-refusal test avoids reusing it
-            // for exactly this reason). Skip gracefully rather than panic
-            // when it points at one here, instead of asserting this test's
-            // own precondition on the caller's environment.
-            Err(err)
-                if oxibonsai_runtime::engine_seam::engine_error_code(&err)
-                    == Some("NOT_A_DENSE_MODEL") =>
-            {
-                eprintln!(
-                    "model_backed_embeddings_endpoint_serves_200_on_the_real_1_7b_when_available: \
-                     OXI_MODEL ({}) is a hybrid (qwen35) model, not a dense one -- skipping",
-                    model_path.to_string_lossy()
+        let mmap = oxibonsai_core::gguf::reader::mmap_gguf_file(std::path::Path::new(&model_path))
+            .unwrap_or_else(|err| panic!("OXI_MODEL must map as a readable GGUF file: {err}"));
+        let gguf_file = GgufFile::parse(&mmap)
+            .unwrap_or_else(|err| panic!("OXI_MODEL's GGUF header must parse: {err}"));
+        let is_hybrid = gguf_file.metadata.get_string("general.architecture").ok()
+            == Some(oxibonsai_core::config_hybrid::HYBRID_ARCHITECTURE);
+        let tokenizer = match TokenizerBridge::native_from_gguf_metadata(&gguf_file.metadata) {
+            // `OXI_MODEL` embeds its own tokenizer -- the faithful source for
+            // both dense and hybrid GGUFs, and the only correct one for a
+            // hybrid GGUF (its vocabulary differs from the dense
+            // `tokenizer.json` below).
+            Ok(bridge) => Arc::new(bridge),
+            Err(_) if is_hybrid => {
+                panic!(
+                    "OXI_MODEL is a hybrid (qwen35) GGUF with no embedded tokenizer metadata -- \
+                     refusing to fall back to the dense Qwen3 tokenizer.json, which does not \
+                     share its vocabulary"
                 );
-                return;
             }
-            Err(err) => panic!("the real GGUF named by OXI_MODEL must load: {err}"),
+            // A dense GGUF with no embedded tokenizer -- true today of this
+            // repo's own `Ternary-Bonsai-1.7B.gguf`, which predates
+            // metadata-embedded vocab/merges. `models/tokenizer.json` is the
+            // dense Qwen3 tokenizer, the correct (and only established)
+            // pairing for a dense `OXI_MODEL`.
+            Err(_) => {
+                let tokenizer_path = workspace::models_dir().join("tokenizer.json");
+                if !tokenizer_path.exists() {
+                    eprintln!(
+                        "model_backed_embeddings_endpoint_serves_200_on_a_real_model_when_available: \
+                         {} not found -- skipping (set OXIBONSAI_MODELS_DIR)",
+                        tokenizer_path.display()
+                    );
+                    return;
+                }
+                let tokenizer_path_str = tokenizer_path
+                    .to_str()
+                    .expect("models/ path is valid UTF-8");
+                Arc::new(
+                    TokenizerBridge::from_file(tokenizer_path_str)
+                        .expect("load the real tokenizer.json"),
+                )
+            }
         };
+
+        // `OXI_MODEL` is this repo's general "which GGUF to test with"
+        // variable, and a hybrid `qwen35` file is as legitimate a value here
+        // as a dense one: `ModelEmbedder::from_gguf_path` embeds both kinds
+        // of engine, so this no longer needs a dense-vs-hybrid branch —
+        // whichever `OXI_MODEL` names, this call must succeed and the
+        // endpoint below exercises it either way.
+        let embedder =
+            ModelEmbedder::from_gguf_path(&model_path, tokenizer, greedy_params(), 42, MAX_SEQ)
+                .unwrap_or_else(|err| panic!("the real GGUF named by OXI_MODEL must load: {err}"));
         let expected_dim = embedder.dimension();
         let expected_tokens = embedder.tokenize("hello world").expect("tokenize").len() as u64;
 

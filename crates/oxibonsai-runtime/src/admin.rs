@@ -13,9 +13,11 @@
 //!
 //! `/admin/status` and `/admin/config` also carry an `"engine"` object — the
 //! served engine's RESOLVED variant, quant type and EFFECTIVE kernel tier
-//! (B2-09 / REQUIRED #14, [`EngineReport`]) — whenever the serving binary
-//! supplied one ([`AdminState::with_engine_report`], or process-wide via
-//! [`register_served_engine_report`]).
+//! ([`EngineReport`]) — whenever the serving binary
+//! attached one, through [`AdminState::with_engine_report`] or (for
+//! `oxibonsai serve` and the standalone `oxibonsai-serve` binary)
+//! `server::RouterOptions::with_engine_report`, which `create_router_full`
+//! chains onto the `AdminState` it builds.
 //!
 //! # Example
 //!
@@ -70,7 +72,7 @@ pub struct ServerStatus {
     pub engine: Option<EngineReport>,
 }
 
-// ─── Served-engine report (B2-09 / REQUIRED #14) ─────────────────────────────
+// ─── Served-engine report ─────────────────────────────────────────────────
 
 /// What `/admin/status` and `/admin/config` report about the served engine:
 /// the RESOLVED model variant (the hybrid model's own detection or
@@ -117,29 +119,6 @@ impl EngineReport {
     }
 }
 
-/// The process-wide served-engine report (see [`register_served_engine_report`]).
-static SERVED_ENGINE_REPORT: std::sync::RwLock<Option<EngineReport>> = std::sync::RwLock::new(None);
-
-/// Announce the engine this process serves, for every [`AdminState`] that
-/// was not given one explicitly. `oxibonsai serve` calls this once its pool
-/// is built — the admin state itself is constructed inside the router
-/// builder, which has no report parameter. A later call replaces the report
-/// (a process serves one model).
-pub fn register_served_engine_report(report: EngineReport) {
-    match SERVED_ENGINE_REPORT.write() {
-        Ok(mut slot) => *slot = Some(report),
-        Err(poisoned) => *poisoned.into_inner() = Some(report),
-    }
-}
-
-/// The report registered by [`register_served_engine_report`], if any.
-pub fn served_engine_report() -> Option<EngineReport> {
-    match SERVED_ENGINE_REPORT.read() {
-        Ok(slot) => slot.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
-    }
-}
-
 // ─── Config snapshot response ────────────────────────────────────────────────
 
 /// Snapshot of key server configuration values.
@@ -173,9 +152,11 @@ pub struct AdminState {
     /// Optional handle to the served model's descriptor, so `/admin/config` can
     /// report the real loaded model rather than only the sampling defaults.
     pub model_info: Option<Arc<crate::server::ServedModelInfo>>,
-    /// The served engine's resolved variant and effective kernel tier
-    /// (B2-09). When unset, the process-wide
-    /// [`register_served_engine_report`] value is reported instead.
+    /// The served engine's resolved variant and effective kernel tier,
+    /// attached by [`Self::with_engine_report`] (or, for
+    /// `oxibonsai serve`/the standalone binary, `RouterOptions`'s own
+    /// builder). `None` when the serving binary supplied none — never
+    /// guessed.
     pub engine_report: Option<EngineReport>,
     /// Baseline snapshot of `metrics.requests_total` recorded at the last
     /// `/admin/reset-metrics` call (`0` if never reset). See
@@ -242,10 +223,10 @@ impl AdminState {
         self
     }
 
-    /// The engine report this admin view shows: its own, else the
-    /// process-wide one, else `None` (never guessed).
+    /// The engine report this admin view shows, or `None` when the serving
+    /// binary attached none (never guessed).
     pub fn engine_report(&self) -> Option<EngineReport> {
-        self.engine_report.clone().or_else(served_engine_report)
+        self.engine_report.clone()
     }
 
     /// Return the number of whole seconds the server has been running.
@@ -917,7 +898,7 @@ mod tests {
         assert_eq!(unix_secs_to_iso8601(951_782_400), "2000-02-29T00:00:00Z");
     }
 
-    // ── B2-09 / REQUIRED #14: the served engine's variant + effective tier ──
+    // ── The served engine's variant + effective tier ──────────────────────
 
     fn tiny_engine_report() -> EngineReport {
         let engine = crate::engine::InferenceEngine::new(
@@ -987,34 +968,38 @@ mod tests {
         }
     }
 
+    /// There is no process-wide engine-report fallback: every server
+    /// attaches its report through the router seam
+    /// (`RouterOptions::with_engine_report` -> `AdminState::with_engine_report`).
+    /// With no report attached, `/admin/status` and `/admin/config` must
+    /// carry no `"engine"` key at all (never a stale or guessed one).
     #[tokio::test]
-    async fn the_registered_report_is_the_fallback_and_an_attached_one_wins() {
-        let registered = EngineReport {
-            variant: "Registered-Variant".to_string(),
-            ..tiny_engine_report()
-        };
-        register_served_engine_report(registered.clone());
-        assert_eq!(served_engine_report(), Some(registered.clone()));
-
-        let fallback = Arc::new(AdminState::new(Arc::new(InferenceMetrics::new())));
-        let (status, config) = status_and_config_json(fallback).await;
-        assert_eq!(
-            status["engine"]["variant"],
-            serde_json::json!("Registered-Variant")
+    async fn no_engine_report_attached_means_no_engine_key_in_status_or_config() {
+        let state = Arc::new(AdminState::new(Arc::new(InferenceMetrics::new())));
+        let (status, config) = status_and_config_json(state).await;
+        assert!(
+            status.get("engine").is_none(),
+            "no report was attached, so /admin/status must carry no engine key: {status}"
         );
-        assert_eq!(
-            config["engine"]["variant"],
-            serde_json::json!("Registered-Variant")
+        assert!(
+            config.get("engine").is_none(),
+            "no report was attached, so /admin/config must carry no engine key: {config}"
         );
+    }
 
+    /// The other half: an explicitly attached report IS shown (a plain
+    /// re-assertion of `status_and_config_report_the_attached_engine` above,
+    /// naming the field that changes between the two states).
+    #[tokio::test]
+    async fn an_explicitly_attached_engine_report_wins() {
         let attached = EngineReport {
             variant: "Attached-Variant".to_string(),
-            ..registered
+            ..tiny_engine_report()
         };
-        let explicit = Arc::new(
+        let state = Arc::new(
             AdminState::new(Arc::new(InferenceMetrics::new())).with_engine_report(attached),
         );
-        let (status, _) = status_and_config_json(explicit).await;
+        let (status, _) = status_and_config_json(state).await;
         assert_eq!(
             status["engine"]["variant"],
             serde_json::json!("Attached-Variant")

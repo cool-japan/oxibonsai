@@ -4,7 +4,7 @@
 use super::*;
 
 /// A `qwen35` file whose metadata parses but whose tensors are missing: the
-/// hybrid dry bind fails, so `validate` must NOT say OK (REQUIRED #2).
+/// hybrid dry bind fails, so `validate` must NOT say OK.
 #[test]
 fn a_qwen35_file_that_cannot_be_bound_is_not_ok() {
     use oxibonsai_core::gguf::writer::{GgufWriter, TensorEntry, TensorType};
@@ -54,9 +54,9 @@ fn run_can_load(path: &std::path::Path) -> bool {
     loads
 }
 
-/// REQUIRED #2's acceptance test: `validate` and `run` agree on EVERY
-/// `models/*.gguf` present (`OXIBONSAI_MODELS_DIR`) — OK exactly when the
-/// engine loads. One model at a time (the real-model lock).
+/// `validate` and `run` agree on EVERY `models/*.gguf` present
+/// (`OXIBONSAI_MODELS_DIR`) — OK exactly when the engine loads. One model
+/// at a time (the real-model lock).
 #[test]
 fn validate_and_run_agree_on_every_real_model() {
     let Some(dir) = crate::cli::test_fixtures::env_path(

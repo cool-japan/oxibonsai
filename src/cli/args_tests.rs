@@ -213,7 +213,7 @@ fn quantize_force_defaults_to_false() {
     }
 }
 
-// ── §5.7 / wave-4b flag surface: every new flag parses (ACCEPTANCE) ────────
+// ── every subcommand's flag surface parses ──────────────────────────────────
 
 fn run_cli(extra: &[&str]) -> Commands {
     let mut argv = vec!["oxibonsai", "run", "--prompt", "hi"];
@@ -465,7 +465,7 @@ fn chat_parses_every_new_flag() {
             assert_eq!(mmproj.as_deref(), Some("m.gguf"));
             assert_eq!(image, vec!["x.png".to_string()]);
             assert_eq!(image_max_tokens, Some(256));
-            assert_eq!(seed, 7);
+            assert_eq!(seed, Some(7));
         }
         _ => panic!("expected Chat"),
     }
@@ -758,5 +758,37 @@ fn benchmark_parses_tokenizer_backend_and_image_flags_are_optional() {
             assert_eq!((seed, steps, width, height), (None, None, None, None));
         }
         _ => panic!("expected Image"),
+    }
+}
+
+/// `--tokenizer-backend` reaches `eval` the same
+/// way it already does `run`/`chat`/`benchmark`, and defaults to `Auto`
+/// when not given.
+#[cfg(feature = "eval")]
+#[test]
+fn eval_parses_tokenizer_backend_and_defaults_to_auto() {
+    let cli = Cli::try_parse_from([
+        "oxibonsai",
+        "eval",
+        "--dataset",
+        "d.jsonl",
+        "--tokenizer-backend",
+        "native",
+    ])
+    .expect("eval flags parse");
+    match cli.command {
+        Commands::Eval {
+            tokenizer_backend, ..
+        } => assert_eq!(tokenizer_backend, TokenizerBackendChoice::Native),
+        _ => panic!("expected Eval"),
+    }
+
+    let cli = Cli::try_parse_from(["oxibonsai", "eval", "--dataset", "d.jsonl"])
+        .expect("eval without --tokenizer-backend still parses");
+    match cli.command {
+        Commands::Eval {
+            tokenizer_backend, ..
+        } => assert_eq!(tokenizer_backend, TokenizerBackendChoice::Auto),
+        _ => panic!("expected Eval"),
     }
 }

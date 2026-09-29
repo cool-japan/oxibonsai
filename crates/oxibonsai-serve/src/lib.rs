@@ -12,7 +12,10 @@
 //! - [`metrics`]    — hand-rolled Prometheus text-exposition registry
 //!
 //! [`embedder`] builds the model-backed `/v1/embeddings` embedder the binary
-//! hands its router, exactly as `oxibonsai serve` does.
+//! hands its router, exactly as `oxibonsai serve` does. [`tokenizer_ladder`]
+//! is this binary's own TOK-08 vocab-aware tokenizer resolution, built only
+//! on `oxibonsai-runtime` public APIs since this crate cannot depend on the
+//! `oxibonsai-cli` package.
 
 pub mod args;
 pub mod banner;
@@ -20,6 +23,7 @@ pub mod config;
 pub mod embedder;
 pub mod env;
 pub mod metrics;
+pub mod tokenizer_ladder;
 pub mod validation;
 
 pub use args::{ParseError, ServerArgs};

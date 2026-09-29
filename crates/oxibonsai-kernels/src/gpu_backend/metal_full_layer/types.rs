@@ -244,14 +244,17 @@ pub(crate) const KV_ELEMENT_BYTES: u64 = 2;
 
 /// Largest KV-cache element count the **current** MSL address math can reach.
 ///
-/// `fused_kv_store`, `batched_attention_scores(_v2)` and
-/// `batched_attention_weighted_sum` still declare the layer base as
-/// `constant uint&` and derive `dst_offset = layer_offset + (head * max_seq +
-/// pos) * head_dim + d` in 32-bit (`kernel_sources/attention.rs:256,264,307,
-/// 366,521`). The Rust side now carries the offset as `u64`
-/// ([`kv_layer_offset_elements`]) so nothing truncates *here*, but until B2-15
-/// widens those four bindings to `ulong` the **whole linear index** must still
-/// fit in a `uint`, which is what this cap enforces.
+/// After MET-07, every attention kernel (`fused_kv_store`,
+/// `batched_attention_scores(_v2)`, `batched_attention_weighted_sum`) binds
+/// the layer base as `constant ulong&` and derives its offset in 64 bits
+/// (`kernel_sources/attention.rs`), so none of them need this cap any more.
+/// The two **batched prefill** kernels — `prefill_qkv_prepare` and
+/// `prefill_flash_attention` (`kernel_sources/prefill.rs`) — still declare
+/// `layer_offset` as `constant uint&` and derive their KV-cache addresses in
+/// 32 bits. The Rust side carries the offset as `u64`
+/// ([`kv_layer_offset_elements`]) so nothing truncates *here*, but for those
+/// two kernels the **whole linear index** must still fit in a `uint`, which
+/// is what this cap enforces.
 ///
 /// Note this is the *total element* bound, not the weaker "base offset of the
 /// last layer" bound quoted in the MET-07 write-up (8B `max_seq 119_837`,
@@ -341,7 +344,8 @@ pub(crate) fn check_kv_cache_geometry(
             "KV cache exceeds the 32-bit GPU address range: {n_layers} layers × {n_kv} KV heads × \
              {max_seq} positions × {head_dim} dims = {total_elements} elements, above the \
              {KV_CACHE_MAX_ELEMENTS}-element limit of the `constant uint&` layer offset in the \
-             attention kernels. Maximum usable --max-seq-len for this model: {max_usable_seq}"
+             batched prefill kernels (prefill_qkv_prepare, prefill_flash_attention). Maximum \
+             usable --max-seq-len for this model: {max_usable_seq}"
         )));
     }
     Ok(total_elements)
@@ -652,6 +656,12 @@ mod tests {
         assert!(msg.contains("32-bit GPU address range"), "{msg}");
         assert!(msg.contains("--max-seq-len"), "{msg}");
         assert!(msg.contains("116508"), "{msg}");
+        assert!(
+            msg.contains("prefill_qkv_prepare") && msg.contains("prefill_flash_attention"),
+            "the message must name the two batched-prefill kernels that still bind the layer \
+             offset as `constant uint&` (MET-07 widened every other attention kernel to \
+             `ulong`): {msg}"
+        );
     }
 
     #[test]

@@ -294,9 +294,8 @@ async fn batched_prompt_stream_stops_each_prompt_on_its_own() {
 /// `text_completion` chunk carrying non-empty text must carry its own
 /// `logprobs` object with the legacy-completions parallel-array shape
 /// (`tokens`/`token_logprobs`/`top_logprobs`/`text_offset`, all the
-/// same length) — B8's "stream per-token logprobs in the
-/// text_completion chunks" — ending in a real `finish_reason` and
-/// `[DONE]`.
+/// same length) — streaming per-token logprobs in the `text_completion`
+/// chunks — ending in a real `finish_reason` and `[DONE]`.
 #[tokio::test]
 async fn stream_with_logprobs_emits_a_logprobs_object_per_chunk() {
     let app = test_router();
@@ -398,8 +397,8 @@ async fn stream_with_logprobs_text_offset_accumulates_across_chunks() {
 }
 
 /// `logprobs` + `stream` + `stop` together: the stream must still stop
-/// emitting once the stop sequence is found — proving B8's dedicated
-/// pipeline honours `stop` too, not just the plain content path.
+/// emitting once the stop sequence is found — proving the streaming
+/// logprobs pipeline honours `stop` too, not just the plain content path.
 #[tokio::test]
 async fn stream_with_logprobs_and_stop_sequence_truncates() {
     let app = test_router();

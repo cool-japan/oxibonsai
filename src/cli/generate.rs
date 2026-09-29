@@ -3,20 +3,22 @@
 //! * [`ChatContract`] — the Bonsai 2 chat-contract options (`--think` /
 //!   `--no-think`, `--reasoning-effort`, `--tools`; cli-11), rendered
 //!   through the model's own chat template ([`render_prompt`]) so the
-//!   prompt the model sees is byte-identical to the reference renderer's
-//!   (`golden2/apply_template.json`, B2-13's G7 contract). Tool definitions
-//!   are kept as raw JSON **text** end to end — never a `serde_json::Value`,
-//!   whose `BTreeMap` would re-sort the schema's keys.
+//!   prompt the model sees is byte-identical to the PrismML fork's own
+//!   reference renderer. Tool definitions are kept as raw JSON **text** end
+//!   to end — never a `serde_json::Value`, whose `BTreeMap` would re-sort
+//!   the schema's keys.
 //! * [`TokenPrinter`] — streams decoded tokens to the terminal, routing a
 //!   model's `<think>` reasoning (split on the `</think>` token id, design
 //!   §5.3) to stderr or dropping it (`--show-reasoning` /
 //!   `--hide-reasoning`), and collecting the final `(reasoning, content)`
 //!   pair for a chat history.
-//! * [`decode_with_sampler`] — a token-by-token decode loop driven by the
-//!   CLI's own [`Sampler`]. `InferenceEngine` exposes no `min_p` setter, so a
-//!   sampled request with `--min-p > 0` decodes through this loop, which
-//!   applies temperature → top-k → min-p → top-p and the penalty history
-//!   with the very same [`Sampler`] math the engine's own loop uses.
+//! * [`cli_sampler`] — the CLI's own [`Sampler`], built with the same
+//!   parameters/seed/penalties/`min_p` the engine's own decode path uses.
+//!   `run`/`chat`'s ordinary sampled decoding goes through the engine
+//!   itself now (`InferenceEngine::set_min_p`): only
+//!   `run_constrained_or_stopped_with` (the `--grammar`/`--stop` path, which
+//!   cannot run through the engine's own loop) still builds its plain
+//!   sampler from this.
 
 use std::io::{self, Write};
 
@@ -306,8 +308,22 @@ impl TextPrinter<'_> {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// CLI-owned sampled decode loop (min-p)
+// The CLI's own sampler (grammar / `--stop` path only)
 // ──────────────────────────────────────────────────────────────────────────
+//
+// Previously, a sampled request with `min_p > 0` also decoded through a
+// dedicated CLI-owned loop (`decode_with_sampler`) built on this same
+// sampler, because the engine had no `min_p` setter. `InferenceEngine::set_min_p`
+// closed that gap: `run`/`chat` now call it once at engine
+// construction (`cmd_run::load_engine`) and route every sampled request
+// through the engine's own decode path uniformly
+// (`cmd_run_tests::min_p_engine_path_matches_the_cli_loop` proves the two
+// were token-for-token identical on both the tiny testkit fixture and the
+// real 1.7B before the CLI loop was retired). [`cli_sampler`] itself stays:
+// `run_constrained_or_stopped_with` (the `--grammar`/`--stop` path, which
+// cannot run through the engine's own loop — a grammar mask or a
+// stop-sequence check has no engine-side seam) still builds its plain
+// (non-constrained) sampler from it.
 
 /// Build the CLI's own [`Sampler`] for a request: the same parameters and
 /// seed the engine was built with, plus the penalties and `min_p`.
@@ -321,55 +337,6 @@ pub(crate) fn cli_sampler(
     sampler.set_penalties(penalties);
     sampler.set_min_p(min_p);
     sampler
-}
-
-/// Whether a request must decode through [`decode_with_sampler`] rather than
-/// the engine's own loop: only a sampled request (`temperature > 0`) with
-/// `min_p > 0` needs it — greedy decoding ignores min-p, and `min_p == 0`
-/// is exactly what the engine's own sampler already does.
-pub(crate) fn needs_cli_sampler(temperature: f32, min_p: f32) -> bool {
-    temperature > 0.0 && min_p > 0.0
-}
-
-/// Prefill `prompt_tokens` from position 0, then decode up to `max_tokens`
-/// tokens with `sampler` (history-aware, so repetition/frequency/presence
-/// penalties apply), stopping at the engine's EOS set or when `on_token`
-/// returns `false`. Mirrors `InferenceEngine::generate_streaming_sync`'s own
-/// loop order: sample → EOS check → emit → record history → forward.
-///
-/// Returns the number of tokens emitted.
-///
-/// # Errors
-///
-/// Engine prefill/forward errors, sampler errors, or `on_token`'s error.
-pub(crate) fn decode_with_sampler(
-    engine: &mut oxibonsai_runtime::InferenceEngine<'_>,
-    prompt_tokens: &[u32],
-    max_tokens: usize,
-    sampler: &mut Sampler,
-    mut on_token: impl FnMut(u32) -> anyhow::Result<bool>,
-) -> anyhow::Result<usize> {
-    if prompt_tokens.is_empty() || max_tokens == 0 {
-        return Ok(0);
-    }
-    engine.reset();
-    let mut logits = engine.prefill_from_pos(prompt_tokens, 0)?;
-    let mut history: Vec<u32> = Vec::new();
-    let mut generated = 0usize;
-    for (pos, _) in (prompt_tokens.len()..).zip(0..max_tokens) {
-        let token = sampler.sample_with_history(&logits, &history)?;
-        if engine.is_eos(token) {
-            break;
-        }
-        generated += 1;
-        let keep_going = on_token(token)?;
-        history.push(token);
-        if !keep_going {
-            break;
-        }
-        logits = engine.decode_step(token, pos)?;
-    }
-    Ok(generated)
 }
 
 #[cfg(test)]

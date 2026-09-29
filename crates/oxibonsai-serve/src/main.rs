@@ -21,7 +21,7 @@
 mod hardening;
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -41,6 +41,7 @@ use oxibonsai_serve::{
     embedder,
     env::parse_process_env,
     metrics::MetricsRegistry,
+    tokenizer_ladder,
 };
 use tracing::{error, info, warn};
 
@@ -179,7 +180,7 @@ async fn run() -> Result<(), StartupError> {
     // `InferenceEngine::from_gguf_path`. Any failure is *fatal* — the
     // operator asked for a specific model, so silently falling back to a
     // tiny test config would be misleading.
-    // gatekeeper REQUIRED#1(b): `repetition_penalty` is named explicitly
+    // `repetition_penalty` is named explicitly
     // here rather than left to `..SamplingParams::default()`'s spread. The
     // `Default` impl is already `1.0` (the same fix), so this is behaviorally
     // a no-op today -- it exists so a *future* change to that default cannot
@@ -224,28 +225,28 @@ async fn run() -> Result<(), StartupError> {
         }
     }
 
-    // ── 8. Load tokenizer (optional) ──────────────────────────────────────
-    //
-    // Resolution order:
-    //   (a) explicit `config.tokenizer.path` (CLI / TOML / env)
-    //   (b) auto-detect alongside the configured model
-    //   (c) give up but tell the user *exactly* where we looked and how to fix it
-    let tokenizer_path = resolve_tokenizer_path(&config);
-    let tokenizer = match tokenizer_path.as_ref() {
-        Some(resolved) => {
-            let tokenizer = load_tokenizer(resolved)?;
-            if resolved.auto_detected {
-                info!(path = %resolved.path, "auto-detected tokenizer alongside model");
-            } else {
-                info!(path = %resolved.path, "tokenizer loaded");
-            }
-            Some(tokenizer)
-        }
-        None => None,
-    };
+    // ── 8. Load tokenizer (optional; TOK-08 vocab-aware) ──────────────────
+    let (tokenizer, tokenizer_source) = resolve_serving_tokenizer(built.as_ref(), &config)?;
 
-    // ── 8b. Model-backed `/v1/embeddings` (HANDOVER-RT item 13) ──────────
-    let embedder = serve_embedder(built.as_ref(), tokenizer_path.as_ref(), &sampling, &config)?;
+    // ── 8b. Model-backed `/v1/embeddings` ─────────────────────────────────
+    let (embedder, embedder_unavailable) = serve_embedder(
+        built.as_ref(),
+        tokenizer_source.as_ref(),
+        &sampling,
+        &config,
+    )?;
+
+    // The served engine's resolved variant + effective kernel tier, for
+    // `/admin/status` and `/admin/config` — captured from a lease (the
+    // engine itself is never exposed by `EnginePool`) rather than a
+    // process-wide registration.
+    let engine_report = {
+        let lease = pool
+            .acquire()
+            .await
+            .map_err(|e| format!("engine pool: {e}"))?;
+        oxibonsai_runtime::admin::EngineReport::from_engine(&lease)
+    };
 
     // ── 9. Build the fully-hardened router ────────────────────────────────
     //
@@ -260,22 +261,28 @@ async fn run() -> Result<(), StartupError> {
     // sec-20/perf-M1: capture the REAL pool size before `pool` is consumed
     // by `hardening::build_router` -> `create_router_full`.
     let pool_size = pool.size();
+    let mut router_build_options = hardening::RouterBuildOptions::new(
+        admin_auth,
+        pool_size,
+        // SV-26 / SV-28: the merged config's own `ui.enabled` /
+        // `limits.max_output_tokens` (CLI flag > env > TOML > default,
+        // already layered by `ServerConfig::load`) — not the raw CLI-only
+        // fields, which would silently ignore a TOML/env-set value.
+        config.ui.enabled,
+        config.limits.max_output_tokens,
+    )
+    .with_embedder(embedder)
+    .with_engine_report(engine_report);
+    if let Some((code, message)) = embedder_unavailable {
+        router_build_options = router_build_options.with_embedder_unavailable(code, message);
+    }
     let router = hardening::build_router(
         Arc::clone(&pool),
         tokenizer,
         Arc::clone(&metrics),
         Arc::clone(&serve_metrics),
         &config,
-        // SV-26 / SV-28: `enable_ui` / `max_output_tokens` are
-        // `ServerArgs`-only knobs with no `ServerConfig` counterpart yet
-        // (see `build_router`'s own doc comment).
-        hardening::RouterBuildOptions::new(
-            admin_auth,
-            pool_size,
-            cli_args.enable_ui,
-            cli_args.max_output_tokens,
-        )
-        .with_embedder(embedder),
+        router_build_options,
     );
 
     // ── 10. Resolve bind address ───────────────────────────────────────────
@@ -361,27 +368,112 @@ fn load_pool(
     }
 }
 
-/// Step 8b of `run`: the model-backed embedder `/v1/embeddings` answers from
-/// (`HANDOVER-RT` item 13).
+/// Step 8 of `run`: resolve the serving tokenizer (TOK-08).
+///
+/// With a real GGUF model, [`tokenizer_ladder::resolve`] is the SAME
+/// contract `run`/`chat`/`oxibonsai serve` apply: an explicit
+/// `tokenizer.path` (hard error if it does not fit), else an auto-detected
+/// candidate that fits, else the GGUF's own embedded vocabulary, else none —
+/// resolved ONCE (it logs its own outcome). Without one (the `tiny_test` dev
+/// fallback used only when no `--model` was given), there is no vocabulary
+/// to check an explicit path against, so it loads as-is.
+fn resolve_serving_tokenizer(
+    built: Option<&PoolBuild>,
+    config: &ServerConfig,
+) -> Result<
+    (
+        Option<TokenizerBridge>,
+        Option<tokenizer_ladder::TokenizerSource>,
+    ),
+    StartupError,
+> {
+    let Some(built) = built else {
+        return Ok(match config.tokenizer.path.as_ref() {
+            Some(path) => {
+                let tok = load_explicit_tokenizer(path)?;
+                info!(path = %path.display(), "tokenizer loaded");
+                (Some(tok), None)
+            }
+            None => (None, None),
+        });
+    };
+    let model_path = config
+        .model
+        .path
+        .as_deref()
+        .unwrap_or_else(|| Path::new(""));
+    match tokenizer_ladder::resolve(config.tokenizer.path.as_deref(), model_path, built.gguf) {
+        Ok(Some((tok, source))) => Ok((Some(tok), Some(source))),
+        Ok(None) => {
+            let searched = tokenizer_ladder::searched_candidates(model_path);
+            let mut msg = String::from("no tokenizer found. Searched:\n");
+            for path in &searched {
+                msg.push_str(&format!("  - {}\n", path.display()));
+            }
+            msg.push_str(
+                "To fix: pass tokenizer.path (or --tokenizer-path); some endpoints will \
+                 answer with raw token ids or refuse text prompts in the meantime.",
+            );
+            warn!("{msg}");
+            Ok((None, None))
+        }
+        Err(e) => {
+            error!(%e, "failed to resolve the serving tokenizer");
+            Err(e.into())
+        }
+    }
+}
+
+/// Load a single, unchecked tokenizer instance from an explicit path (the
+/// no-GGUF-model fallback only — there is no model vocabulary to check it
+/// against). A failure is fatal: the operator configured a file this
+/// process cannot read.
+///
+/// Uses the same Pure-Rust native backend as [`tokenizer_ladder::resolve`]
+/// (`TokenizerBridge::native_from_file`, not [`TokenizerBridge::from_file`]):
+/// a mixed-backend build (the `hf-tokenizer` feature compiled in) would
+/// otherwise route this one load through the HuggingFace `tokenizers`
+/// crate, which rejects a `tokenizer.json` whose `pre_tokenizer`/`decoder`
+/// omit fields (e.g. `add_prefix_space`) the native backend never required.
+fn load_explicit_tokenizer(path: &std::path::Path) -> Result<TokenizerBridge, StartupError> {
+    TokenizerBridge::native_from_file(&path.display().to_string()).map_err(|err| {
+        error!(path = %path.display(), %err, "failed to load tokenizer");
+        format!("failed to load tokenizer: {err}").into()
+    })
+}
+
+/// Step 8b of `run`: the model-backed embedder `/v1/embeddings` answers
+/// from, alongside why there is none.
 ///
 /// A dedicated embedding engine off the pool's own leaked GGUF and shared
 /// token-embedding table, exactly as `oxibonsai serve` builds it
 /// ([`embedder::build_embedder`]); `None` — the route's honest `501` — without
-/// a GGUF model, without a tokenizer, or for a hybrid model. A
-/// `TokenizerBridge` is not `Clone`, so the embedder gets its own instance of
-/// the same file.
+/// a GGUF model, without a tokenizer, or when construction genuinely fails.
+/// `tokenizer_source` is [`resolve_serving_tokenizer`]'s own resolved
+/// source, rebuilt quietly into a second instance
+/// ([`tokenizer_ladder::rebuild`]) — a `TokenizerBridge` is not `Clone`.
 fn serve_embedder(
     built: Option<&PoolBuild>,
-    tokenizer_path: Option<&ResolvedTokenizer>,
+    tokenizer_source: Option<&tokenizer_ladder::TokenizerSource>,
     sampling: &SamplingParams,
     config: &ServerConfig,
-) -> Result<Option<Arc<ModelEmbedder>>, StartupError> {
+) -> Result<
+    (
+        Option<Arc<ModelEmbedder>>,
+        Option<embedder::EmbedderUnavailable>,
+    ),
+    StartupError,
+> {
     let Some(built) = built else {
-        info!("no GGUF model: /v1/embeddings answers 501 (an embedder needs a real model)");
-        return Ok(None);
+        let reason = "no GGUF model: an embedder needs a real model".to_string();
+        info!("{reason}; /v1/embeddings answers 501");
+        return Ok((None, Some((None, reason))));
     };
-    let embedder_tokenizer = match tokenizer_path {
-        Some(resolved) => Some(load_tokenizer(resolved)?),
+    let embedder_tokenizer = match tokenizer_source {
+        Some(source) => Some(tokenizer_ladder::rebuild(source, built.gguf).map_err(|e| {
+            error!(error = %e, "failed to rebuild the embedder's own tokenizer instance");
+            StartupError::from(e)
+        })?),
         None => None,
     };
     Ok(embedder::build_embedder(
@@ -391,59 +483,6 @@ fn serve_embedder(
         config.seed,
         config.limits.max_input_tokens,
     ))
-}
-
-/// Where the server's tokenizer comes from, resolved once (step 8) and loaded
-/// as many times as the server needs an instance of it.
-struct ResolvedTokenizer {
-    /// The `tokenizer.json` path.
-    path: String,
-    /// Whether it was found next to the model rather than configured.
-    auto_detected: bool,
-}
-
-/// Resolve the tokenizer path: the configured `tokenizer.path` if any, else
-/// auto-detection next to the model; `None` (after warning where it looked
-/// and how to fix it) when there is neither.
-fn resolve_tokenizer_path(config: &ServerConfig) -> Option<ResolvedTokenizer> {
-    if let Some(path) = config.tokenizer.path.as_ref() {
-        return Some(ResolvedTokenizer {
-            path: path.display().to_string(),
-            auto_detected: false,
-        });
-    }
-    // Try auto-detection only if we know the model path. Otherwise there is
-    // nothing to derive candidate paths from.
-    let lookup = match config.model.path.as_ref() {
-        Some(model_path) => tokenizer_lookup::resolve_tokenizer_for_model(model_path),
-        None => tokenizer_lookup::TokenizerLookup::default(),
-    };
-    match lookup.found {
-        Some(found) => Some(ResolvedTokenizer {
-            path: found,
-            auto_detected: true,
-        }),
-        None => {
-            warn!(
-                "{}",
-                tokenizer_lookup::missing_tokenizer_warning(&lookup.searched)
-            );
-            None
-        }
-    }
-}
-
-/// Load one instance of the resolved tokenizer; a failure is fatal (the
-/// operator configured, or the server found, a file it cannot read).
-fn load_tokenizer(resolved: &ResolvedTokenizer) -> Result<TokenizerBridge, StartupError> {
-    TokenizerBridge::from_file(&resolved.path).map_err(|err| {
-        if resolved.auto_detected {
-            error!(path = %resolved.path, %err, "failed to load auto-detected tokenizer");
-        } else {
-            error!(path = %resolved.path, %err, "failed to load tokenizer");
-        }
-        format!("failed to load tokenizer: {err}").into()
-    })
 }
 
 /// Every quantization-type name the current build of OxiBonsai actually
@@ -475,142 +514,6 @@ fn quantization_hint_recognized(hint: &str) -> bool {
             || name_upper.starts_with(&hint_upper)
             || hint_upper.starts_with(&name_upper)
     })
-}
-
-/// Tokenizer auto-discovery used when the operator does not pass an explicit
-/// `--tokenizer` / `tokenizer.path`.  Mirrors the helper in the `oxibonsai`
-/// CLI binary so both surfaces present the same searched-paths list and the
-/// same "to fix" instructions.
-mod tokenizer_lookup {
-    use std::path::{Path, PathBuf};
-
-    /// Result of attempting to locate a `tokenizer.json` for a given model.
-    #[derive(Debug, Default)]
-    pub struct TokenizerLookup {
-        /// Resolved tokenizer path (UTF-8 `String` so the existing
-        /// `TokenizerBridge::from_file(&str)` API can consume it directly).
-        pub found: Option<String>,
-        /// Every candidate path that was inspected during auto-detection,
-        /// in the order they were probed.
-        pub searched: Vec<PathBuf>,
-    }
-
-    /// Strip a trailing GGUF quantization suffix (e.g. `-Q2_0`, `-Q4_K_M`,
-    /// `-F16`, `-BF16`, `-F32`) from a model basename.
-    fn strip_quant_suffix(basename: &str) -> &str {
-        let Some(dash_pos) = basename.rfind('-') else {
-            return basename;
-        };
-        let suffix = &basename[dash_pos + 1..];
-        if suffix.is_empty() {
-            return basename;
-        }
-        let is_float = matches!(suffix, "F16" | "BF16" | "F32");
-        let is_quant = {
-            let mut chars = suffix.chars();
-            match chars.next() {
-                Some('Q') => {
-                    let rest: String = chars.collect();
-                    if rest.is_empty() {
-                        false
-                    } else {
-                        let mut parts = rest.split('_');
-                        let first = parts.next().unwrap_or("");
-                        if first.is_empty() || !first.chars().all(|c| c.is_ascii_digit()) {
-                            false
-                        } else {
-                            parts.all(|p| {
-                                !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric())
-                            })
-                        }
-                    }
-                }
-                _ => false,
-            }
-        };
-        if is_float || is_quant {
-            &basename[..dash_pos]
-        } else {
-            basename
-        }
-    }
-
-    /// Build the ordered list of candidate `tokenizer.json` paths to probe
-    /// for a given model file.  Duplicates are removed so the warning stays
-    /// compact.
-    fn tokenizer_candidates(model_path: &Path) -> Vec<PathBuf> {
-        let parent = model_path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
-
-        let mut out: Vec<PathBuf> = Vec::new();
-        let push_unique = |p: PathBuf, out: &mut Vec<PathBuf>| {
-            if !out.iter().any(|existing| existing == &p) {
-                out.push(p);
-            }
-        };
-
-        push_unique(parent.join("tokenizer.json"), &mut out);
-        push_unique(parent.join("..").join("tokenizer.json"), &mut out);
-
-        if let Some(stem) = model_path.file_stem().and_then(|s| s.to_str()) {
-            let base = strip_quant_suffix(stem);
-            for variant in [
-                base.to_string(),
-                format!("{base}-unpacked"),
-                format!("{base}-ONNX"),
-            ] {
-                push_unique(parent.join(&variant).join("tokenizer.json"), &mut out);
-            }
-        }
-
-        for ancestor in model_path.ancestors().skip(1) {
-            if ancestor.file_name().and_then(|n| n.to_str()) == Some("models") {
-                push_unique(ancestor.join("tokenizer.json"), &mut out);
-                break;
-            }
-        }
-
-        out
-    }
-
-    /// Resolve a tokenizer next to a configured model path.
-    pub fn resolve_tokenizer_for_model(model_path: &Path) -> TokenizerLookup {
-        let candidates = tokenizer_candidates(model_path);
-        for candidate in &candidates {
-            if candidate.exists() {
-                return TokenizerLookup {
-                    found: Some(candidate.to_string_lossy().into_owned()),
-                    searched: candidates,
-                };
-            }
-        }
-        TokenizerLookup {
-            found: None,
-            searched: candidates,
-        }
-    }
-
-    /// Build the multi-line "no tokenizer found" warning message.
-    pub fn missing_tokenizer_warning(searched: &[PathBuf]) -> String {
-        let mut msg = String::from("no tokenizer found. Searched:\n");
-        if searched.is_empty() {
-            msg.push_str("  (no candidate paths — model path was not provided)\n");
-        } else {
-            for path in searched {
-                msg.push_str(&format!("  - {}\n", path.display()));
-            }
-        }
-        msg.push_str("To fix:\n");
-        msg.push_str("  - Pass --tokenizer <path/to/tokenizer.json>, OR\n");
-        msg.push_str(
-            "  - Run ./scripts/download_tokenizer.sh to fetch the Qwen3 tokenizer to models/tokenizer.json\n",
-        );
-        msg.push_str("Continuing with raw token IDs in output.");
-        msg
-    }
 }
 
 /// Bearer-auth middleware.
@@ -802,162 +705,42 @@ mod quant_hint_tests {
     }
 }
 
-/// `HANDOVER-RT` item 13 through the binary's own composition: a
+/// Exercises `/v1/embeddings` through the binary's own composition: a
 /// [`ServerConfig`] naming a (synthetic, weighted, dense) GGUF and a
 /// tokenizer, then exactly `run`'s steps — [`load_pool`],
-/// [`resolve_tokenizer_path`] / [`load_tokenizer`], [`serve_embedder`] and
+/// [`resolve_serving_tokenizer`], [`serve_embedder`] and
 /// `hardening::build_router` with the embedder in its
 /// `RouterBuildOptions` — so the forced wiring through the binary-private
 /// router composition is what answers `/v1/embeddings`.
+///
+/// The fixture itself is the shared
+/// `oxibonsai_testkit::dense_fixture` — this module used to hand-roll a
+/// byte-for-byte near-duplicate of the copy in
+/// `tests/server_integration_tests.rs`.
 #[cfg(test)]
 mod embeddings_route_tests {
     use super::*;
-    use oxibonsai_core::gguf::writer::{GgufWriter, MetadataWriteValue, TensorEntry, TensorType};
+    use oxibonsai_testkit::dense_fixture::{
+        byte_tokenizer_json, weighted_dense_gguf, write_atomic, HIDDEN,
+    };
     use tower::ServiceExt;
-
-    const HIDDEN: usize = 128;
-    const INTER: usize = 256;
-    const LAYERS: usize = 2;
-    const N_Q: usize = 4;
-    const N_KV: usize = 2;
-    const HEAD_DIM: usize = 32;
-    const VOCAB: usize = 256;
-
-    /// `TQ2_0_g128` blocks of seeded ternary codes (`11` is reserved and
-    /// never emitted) with the FP16 scale `0.5` (`0x3800`).
-    fn tq2_blocks(num_weights: usize, seed: u64) -> Vec<u8> {
-        let mut data = Vec::with_capacity(num_weights / 128 * 34);
-        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-        for _ in 0..num_weights / 128 {
-            for _ in 0..32 {
-                let mut byte = 0u8;
-                for lane in 0..4 {
-                    state = state
-                        .wrapping_mul(6_364_136_223_846_793_005)
-                        .wrapping_add(1_442_695_040_888_963_407);
-                    byte |= (((state >> 33) % 3) as u8) << (2 * lane);
-                }
-                data.push(byte);
-            }
-            data.extend_from_slice(&0x3800u16.to_le_bytes());
-        }
-        data
-    }
-
-    fn f32_varied(n: usize, scale: f32) -> Vec<u8> {
-        (0..n)
-            .flat_map(|i| (scale * (1.0 + 0.25 * (i as f32 * 0.013).sin())).to_le_bytes())
-            .collect()
-    }
-
-    fn weighted_dense_gguf() -> Vec<u8> {
-        let mut writer = GgufWriter::new();
-        let text = |value: &str| MetadataWriteValue::Str(value.to_string());
-        let count = |value: usize| MetadataWriteValue::U32(u32::try_from(value).expect("fits"));
-        writer.add_metadata("general.architecture", text("qwen3"));
-        writer.add_metadata("general.name", text("ServeBinaryEmbeddingFixture"));
-        writer.add_metadata("qwen3.embedding_length", count(HIDDEN));
-        writer.add_metadata("qwen3.block_count", count(LAYERS));
-        writer.add_metadata("qwen3.attention.head_count", count(N_Q));
-        writer.add_metadata("qwen3.attention.head_count_kv", count(N_KV));
-        writer.add_metadata("qwen3.feed_forward_length", count(INTER));
-        writer.add_metadata("qwen3.vocab_size", count(VOCAB));
-        writer.add_metadata("qwen3.context_length", count(512));
-        writer.add_metadata(
-            "qwen3.attention.layer_norm_rms_epsilon",
-            MetadataWriteValue::F32(1e-6),
-        );
-        writer.add_metadata("qwen3.rope.freq_base", MetadataWriteValue::F32(10_000.0));
-        let f32_tensor = |name: String, dim: usize, data: Vec<u8>| TensorEntry {
-            name,
-            shape: vec![dim as u64],
-            tensor_type: TensorType::F32,
-            data,
-        };
-        writer.add_tensor(TensorEntry {
-            name: "token_embd.weight".to_string(),
-            shape: vec![HIDDEN as u64, VOCAB as u64],
-            tensor_type: TensorType::F32,
-            data: f32_varied(VOCAB * HIDDEN, 0.5),
-        });
-        writer.add_tensor(f32_tensor(
-            "output_norm.weight".to_string(),
-            HIDDEN,
-            f32_varied(HIDDEN, 1.0),
-        ));
-        writer.add_tensor(TensorEntry {
-            name: "output.weight".to_string(),
-            shape: vec![HIDDEN as u64, VOCAB as u64],
-            tensor_type: TensorType::TQ2_0_g128,
-            data: tq2_blocks(VOCAB * HIDDEN, 0xBEEF),
-        });
-        for layer in 0..LAYERS {
-            for (name, dim) in [
-                ("attn_norm.weight", HIDDEN),
-                ("ffn_norm.weight", HIDDEN),
-                ("attn_q_norm.weight", HEAD_DIM),
-                ("attn_k_norm.weight", HEAD_DIM),
-            ] {
-                writer.add_tensor(f32_tensor(
-                    format!("blk.{layer}.{name}"),
-                    dim,
-                    f32_varied(dim, 1.0),
-                ));
-            }
-            for (bump, (name, in_dim, out_dim)) in [
-                ("attn_q.weight", HIDDEN, N_Q * HEAD_DIM),
-                ("attn_k.weight", HIDDEN, N_KV * HEAD_DIM),
-                ("attn_v.weight", HIDDEN, N_KV * HEAD_DIM),
-                ("attn_output.weight", N_Q * HEAD_DIM, HIDDEN),
-                ("ffn_gate.weight", HIDDEN, INTER),
-                ("ffn_up.weight", HIDDEN, INTER),
-                ("ffn_down.weight", INTER, HIDDEN),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                writer.add_tensor(TensorEntry {
-                    name: format!("blk.{layer}.{name}"),
-                    shape: vec![in_dim as u64, out_dim as u64],
-                    tensor_type: TensorType::TQ2_0_g128,
-                    data: tq2_blocks(in_dim * out_dim, ((layer as u64) << 8) + bump as u64),
-                });
-            }
-        }
-        writer.to_bytes().expect("serialize the GGUF fixture")
-    }
-
-    /// GPT-2's byte-level alphabet: printable bytes map to themselves, the
-    /// other 68 to `U+0100 + n` in byte order.
-    fn byte_to_unicode(byte: u8) -> char {
-        let printable =
-            |b: u8| (b'!'..=b'~').contains(&b) || (0xA1..=0xAC).contains(&b) || b >= 0xAE;
-        if printable(byte) {
-            return char::from(byte);
-        }
-        let rank = (0..byte).filter(|&b| !printable(b)).count();
-        char::from_u32(256 + u32::try_from(rank).expect("fits")).expect("a valid scalar")
-    }
-
-    /// A byte-level `tokenizer.json` whose 256 ids are the 256 bytes.
-    fn byte_tokenizer_json() -> String {
-        let vocab: serde_json::Map<String, serde_json::Value> = (0..=255u8)
-            .map(|byte| (byte_to_unicode(byte).to_string(), u32::from(byte).into()))
-            .collect();
-        serde_json::json!({
-            "model": { "type": "BPE", "vocab": vocab, "merges": [] },
-            "added_tokens": [],
-            "pre_tokenizer": { "type": "ByteLevel" },
-            "decoder": { "type": "ByteLevel" },
-        })
-        .to_string()
-    }
 
     /// A private directory under the system temp dir holding the model (and,
     /// when asked, the tokenizer), plus the config naming them — kept alive
     /// by the returned guard. The model sits one level down, so every
     /// candidate the tokenizer auto-detection probes next to it (its own
     /// directory and that directory's parent) is inside this private tree.
+    ///
+    /// Both files are written atomically (`write_atomic`, a temp name then
+    /// `rename`): `std::fs::write` alone is not atomic, and a reader racing
+    /// a torn write would see a partial file. A `missing field
+    /// add_prefix_space` deserialize failure observed under a loaded,
+    /// workspace-wide `--all-features` run had a different cause — feature
+    /// unification turns on the HuggingFace `tokenizers` backend, which
+    /// [`tokenizer_ladder::resolve`] now avoids by always using
+    /// `TokenizerBridge::native_from_file` — but this atomic write stays:
+    /// it is still the correct way to publish a fixture file to a path a
+    /// concurrent test process may probe.
     fn served_config(with_tokenizer: bool) -> (ServerConfig, tempfile::TempDir) {
         let dir = tempfile::Builder::new()
             .prefix("oxibonsai-serve-bin-embeddings-")
@@ -966,14 +749,15 @@ mod embeddings_route_tests {
         let model_dir = dir.path().join("weights");
         std::fs::create_dir(&model_dir).expect("create the model dir");
         let model = model_dir.join("model.gguf");
-        std::fs::write(&model, weighted_dense_gguf()).expect("write the GGUF");
+        write_atomic(&model, &weighted_dense_gguf()).expect("write the GGUF");
         let mut config = ServerConfig::default();
         config.model.path = Some(model);
         config.limits.max_input_tokens = 256;
         config.limits.engine_pool_size = Some(1);
         if with_tokenizer {
             let tokenizer = dir.path().join("byte-tokenizer.json");
-            std::fs::write(&tokenizer, byte_tokenizer_json()).expect("write the tokenizer");
+            write_atomic(&tokenizer, byte_tokenizer_json().as_bytes())
+                .expect("write the tokenizer");
             config.tokenizer.path = Some(tokenizer);
         }
         (config, dir)
@@ -983,12 +767,11 @@ mod embeddings_route_tests {
     fn served_router(config: &ServerConfig) -> axum::Router {
         let sampling = SamplingParams::default();
         let (pool, built) = load_pool(config, &sampling).expect("the pool builds");
-        let tokenizer_path = resolve_tokenizer_path(config);
-        let tokenizer = tokenizer_path
-            .as_ref()
-            .map(|resolved| load_tokenizer(resolved).expect("the tokenizer loads"));
-        let embedder = serve_embedder(built.as_ref(), tokenizer_path.as_ref(), &sampling, config)
-            .expect("the embedder step");
+        let (tokenizer, tokenizer_source) =
+            resolve_serving_tokenizer(built.as_ref(), config).expect("the tokenizer step");
+        let (embedder, _reason) =
+            serve_embedder(built.as_ref(), tokenizer_source.as_ref(), &sampling, config)
+                .expect("the embedder step");
         let pool_size = pool.size();
         hardening::build_router(
             pool,

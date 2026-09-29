@@ -75,13 +75,13 @@ fn run_real_model(
         super::bonsai2::default_max_seq_len(&arch),
     )?;
 
-    // cli-16 / REQUIRED #14: the engine's own resolved variant, quant type,
-    // kernel label and tier — never the raw parse-time tensor-type guess.
+    // cli-16: the engine's own resolved variant, quant type, kernel label
+    // and tier — never the raw parse-time tensor-type guess.
     eprintln!("{}", model_desc::engine_summary(&engine));
 
     let expected_vocab = model_vocab_size(&gguf).ok();
     let lookup = resolve_tokenizer_vocab_aware(tokenizer.as_deref(), model, expected_vocab);
-    // ENGINE-SEAM: shared with `run` (GGUF-embedded tokenizer fallback, the
+    // Shared with `run` (GGUF-embedded tokenizer fallback, the
     // GGUF's own chat template, the TOK-08 compatibility check), loading the
     // on-disk candidate through the chosen `--tokenizer-backend`.
     let resolved = super::cmd_run::resolve_model_tokenizer(

@@ -21,14 +21,20 @@
 //!   `cosine_similarity`, `assert_allclose`) for parity tests.
 //! - [`workspace`] — resolving this workspace's root and its (gitignored,
 //!   often-absent-in-a-worktree) `models/` directory robustly.
+//! - [`parity`] — the cross-tier per-step logit/token comparison a
+//!   real-model greedy parity gate needs (token chain first, then a
+//!   bit-exact or relative-bound numeric check), generic over the caller's
+//!   own kernel-tier type so this crate never depends on
+//!   `oxibonsai-kernels`.
 //!
-//! See this crate's `Cargo.toml` doc comment for why it is currently its
-//! own one-crate Cargo workspace rather than a registered member of the
-//! main one, and this module's doc comments for the deviation that follows
-//! from that (existing duplicate builders could not be re-pointed here yet).
+//! This crate is a real member of the main Cargo workspace (root
+//! `Cargo.toml`'s `[workspace] members`), taken as a `[dev-dependencies]`
+//! entry by every producer crate above.
 
 pub mod capability;
+pub mod dense_fixture;
 pub mod gguf_fixture;
+pub mod parity;
 pub mod qwen35_fixture;
 
 /// Collision-free temp-path helpers built on `std::env::temp_dir()`.

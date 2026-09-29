@@ -244,9 +244,18 @@ enum GemmRoute {
 }
 
 impl GemmRoute {
-    /// The route for one call, read from the environment once.
+    /// The route for one call, decided once.
+    ///
+    /// Keys on [`prefill_dispatcher`]'s own
+    /// [`KernelDispatcher::native_int8_tier`] — the same predicate every
+    /// native GEMV/GEMM entry point in the kernel crate asks — rather than
+    /// a locally re-derived `Int8Tier::from_env().is_some()`:
+    /// an exact drop-in for this always-CPU dispatcher today, and it stays
+    /// correct without another edit here if `prefill_dispatcher` is ever
+    /// changed to hand back a GPU-tier dispatcher, which
+    /// `native_int8_tier` always answers `None` for.
     fn for_this_call() -> Self {
-        if oxibonsai_kernels::dispatch_int8::Int8Tier::from_env().is_some() {
+        if prefill_dispatcher().native_int8_tier().is_some() {
             Self::KernelDriver
         } else {
             Self::Blocked2d

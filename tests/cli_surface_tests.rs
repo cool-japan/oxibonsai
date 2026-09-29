@@ -515,9 +515,16 @@ fn config_missing_file_is_a_hard_error_naming_the_path() {
 
 #[test]
 fn config_unrecognized_section_is_a_hard_error() {
+    // `[imagen]` is itself a KNOWN section (`KNOWN_CONFIG_SECTIONS`,
+    // util.rs), so a bad KEY inside it (e.g. `dit_path`, never a real
+    // `[imagen]` key) is rejected for a different reason -- "unknown key
+    // ... in section [imagen]" -- which used to make this test pass for
+    // the wrong reason (its weak `contains("imagen")` assertion matches
+    // either message). `[vision]` names a section this schema has never
+    // heard of at all, so only the SECTION-level rejection can fire.
     let dir = scratch_dir("config_unknown_section");
     let path = dir.join("bad.toml");
-    std::fs::write(&path, "[imagen]\ndit_path = \"x\"\n").expect("write config");
+    std::fs::write(&path, "[vision]\nmmproj = \"x\"\n").expect("write config");
 
     let output = run_bin(&["--config", path.to_str().unwrap(), "run", "--prompt", "hi"]);
     assert!(
@@ -526,8 +533,8 @@ fn config_unrecognized_section_is_a_hard_error() {
     );
     let stderr = stderr_of(&output);
     assert!(
-        stderr.contains("imagen"),
-        "error should name the unknown section; got: {stderr}"
+        stderr.contains("unknown section [vision]"),
+        "error should name the unknown section by util.rs's own message shape; got: {stderr}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -697,5 +704,79 @@ fn config_observability_section_is_actually_applied() {
          address' log line render as JSON instead of the human-readable default, proving the \
          section was actually applied; got stdout+stderr: {combined}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `serve` honours `[sampling].seed` (cli-04): a malformed value is
+/// rejected by name, and the rejection happens before `cmd_serve::run`'s
+/// "no model" check even runs — `mod.rs` validates `[sampling].seed` while
+/// building `ServeArgs`, ahead of calling into `serve` at all.
+#[test]
+fn config_bad_sampling_seed_is_rejected_before_serve_resolves_a_model() {
+    let dir = scratch_dir("config_bad_seed_serve");
+    let config_path = dir.join("cfg.toml");
+    std::fs::write(&config_path, "[sampling]\nseed = -1\n").expect("write config");
+
+    let output = run_bin(&["--config", config_path.to_str().unwrap(), "serve"]);
+    assert!(
+        !output.status.success(),
+        "a malformed [sampling].seed must be rejected"
+    );
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("[sampling].seed"),
+        "error must name the offending field \"[sampling].seed\"; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("no model"),
+        "seed validation must fail before model resolution is ever reached (no --model/OXI_MODEL \
+         was given either, so this would otherwise also fail there); got: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── `info` prints `Kernel tier:` exactly once ───────────────────────────────
+
+/// A qwen35 hybrid file's report already carries its own `Kernel tier:`
+/// line (with the hybrid-specific reason); `info`'s header block must not
+/// print a second one. A dense fixture's single header line is unchanged.
+#[test]
+fn info_prints_kernel_tier_exactly_once_for_a_hybrid_model_and_a_dense_one() {
+    let dir = scratch_dir("kernel_tier_once");
+
+    let hybrid_path = write_gguf(
+        &dir,
+        "Hybrid.gguf",
+        &oxibonsai_testkit::qwen35_fixture::synthetic_qwen35_gguf(),
+    );
+    let output = run_bin(&["info", "--model", hybrid_path.to_str().unwrap()]);
+    assert!(output.status.success(), "stderr={}", stderr_of(&output));
+    let stdout = stdout_of(&output);
+    let kernel_tier_lines = stdout
+        .lines()
+        .filter(|l| l.contains("Kernel tier:"))
+        .count();
+    assert_eq!(
+        kernel_tier_lines, 1,
+        "a qwen35 hybrid file must print exactly one Kernel tier line:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("hybrid qwen35 model"),
+        "the single line must keep the hybrid-specific reason: {stdout}"
+    );
+
+    let dense_path = write_gguf(&dir, "Dense.gguf", &build_minimal_gguf("qwen3", &[]));
+    let output = run_bin(&["info", "--model", dense_path.to_str().unwrap()]);
+    assert!(output.status.success(), "stderr={}", stderr_of(&output));
+    let stdout = stdout_of(&output);
+    let kernel_tier_lines = stdout
+        .lines()
+        .filter(|l| l.contains("Kernel tier:"))
+        .count();
+    assert_eq!(
+        kernel_tier_lines, 1,
+        "a dense (non-hybrid) file's single Kernel tier line must be unchanged:\n{stdout}"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }

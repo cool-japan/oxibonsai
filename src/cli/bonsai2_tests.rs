@@ -65,7 +65,7 @@ fn hybrid_geometry_matches_the_real_27b_numbers_and_the_runtime_constants() {
     );
 }
 
-// ── check_context_budget (REQUIRED #8, design §5.6) ─────────────────────────
+// ── check_context_budget (design §5.6) ──────────────────────────────────────
 
 /// The 24 GiB M3 + real PQ2_0 file worked example of Appendix A.3.
 fn pq2_on_24_gib(requested: usize) -> ContextBudgetInputs {
@@ -164,7 +164,7 @@ fn qwen35_ctx_300000_is_refused_naming_the_model_limit() {
     );
 }
 
-// ── `--think` default derived from the template (spec item 5) ───────────────
+// ── `--think` default derived from the template ─────────────────────────────
 
 #[test]
 fn prompt_opens_think_block_tracks_the_last_open_and_close() {
@@ -251,7 +251,7 @@ fn an_image_url_is_validated_then_refused_with_the_typed_code() {
         .expect_err("vision is not supported yet")
         .to_string();
     assert!(msg.starts_with("[NOT_YET_SUPPORTED]"), "{msg}");
-    assert!(msg.contains("B2-19/B2-20"), "{msg}");
+    assert!(msg.contains("vision tower"), "{msg}");
     assert!(
         msg.contains("1024"),
         "names the default image budget: {msg}"

@@ -51,6 +51,7 @@ pub(crate) fn read_prompt_stdin() -> anyhow::Result<String> {
 /// or auto-detection succeeded.  `searched` lists every candidate path
 /// inspected during auto-detection so the user can see exactly where we
 /// looked when nothing turned up.
+#[derive(Debug)]
 pub(crate) struct TokenizerLookup {
     pub(crate) found: Option<String>,
     pub(crate) searched: Vec<PathBuf>,
@@ -281,18 +282,27 @@ pub(crate) fn resolve_tokenizer_vocab_aware(
     }
 }
 
-/// TOK-08 for `oxibonsai serve` (wave-3.5 addendum item 6): the SAME
+/// TOK-08 for `oxibonsai serve`: the SAME
 /// vocab-aware resolution + hard tokenizer/model compatibility check `run`
 /// and `chat` apply ([`resolve_tokenizer_vocab_aware`] then
 /// [`check_tokenizer_model_compatibility`] via
-/// `cmd_run::resolve_model_tokenizer`, which also attaches the GGUF's own
-/// chat template and falls back to a vocabulary-matching tokenizer embedded
-/// in the GGUF when the auto-detected file does not fit), instead of the
-/// vocab-unaware first-existing-candidate ladder `serve` used to run. An
-/// explicit `--tokenizer` that does not fit the model is a hard error.
+/// `cmd_run::resolve_model_tokenizer_with_source`, which also attaches the
+/// GGUF's own chat template and falls back to a vocabulary-matching
+/// tokenizer embedded in the GGUF when the auto-detected file does not
+/// fit), instead of the vocab-unaware first-existing-candidate ladder
+/// `serve` used to run. An explicit `--tokenizer` that does not fit the
+/// model is a hard error.
 ///
-/// Returns the tokenizer (`None` = there is no usable tokenizer at all) and
-/// the lookup, whose `searched` list feeds [`missing_tokenizer_warning`].
+/// This is the server's ONE authoritative resolution: it logs "resolved
+/// chat template" and the tokenizer-source line exactly once. A
+/// server that needs further `TokenizerBridge` instances of the same
+/// resolved source (the embedder, RAG — `TokenizerBridge` is not `Clone`)
+/// must build them with [`rebuild_serving_tokenizer`] instead of calling
+/// this again, which would re-run the compatibility check and re-log.
+///
+/// Returns the tokenizer (`None` = there is no usable tokenizer at all), the
+/// lookup (whose `searched` list feeds [`missing_tokenizer_warning`]), and
+/// the resolved source (`None` alongside a `None` tokenizer).
 ///
 /// # Errors
 ///
@@ -303,18 +313,69 @@ pub(crate) fn resolve_serving_tokenizer(
     explicit: Option<&str>,
     model_path: &str,
     gguf: &oxibonsai_core::gguf::reader::GgufFile<'_>,
-) -> anyhow::Result<(Option<oxibonsai_runtime::TokenizerBridge>, TokenizerLookup)> {
+) -> anyhow::Result<(
+    Option<oxibonsai_runtime::TokenizerBridge>,
+    TokenizerLookup,
+    Option<super::cmd_run::TokenizerSource>,
+)> {
     let expected_vocab = model_vocab_size(gguf).ok();
     let lookup = resolve_tokenizer_vocab_aware(explicit, model_path, expected_vocab);
-    let tok = super::cmd_run::resolve_model_tokenizer(
+    let resolved = super::cmd_run::resolve_model_tokenizer_with_source(
         explicit,
         &lookup,
         gguf,
         expected_vocab,
-        super::tokenizer_backend::TokenizerBackendChoice::Auto,
         false,
+        |path| {
+            super::tokenizer_backend::load_tokenizer_bridge(
+                path,
+                super::tokenizer_backend::TokenizerBackendChoice::Auto,
+            )
+        },
     )?;
-    Ok((tok, lookup))
+    match resolved {
+        Some((tok, source)) => Ok((Some(tok), lookup, Some(source))),
+        None => Ok((None, lookup, None)),
+    }
+}
+
+/// A further `TokenizerBridge` instance of the very same source
+/// [`resolve_serving_tokenizer`] already resolved and validated once —
+/// `serve`'s embedder and RAG consumers need their own instance because
+/// `TokenizerBridge` is not `Clone`. Neither re-logs (the "resolved chat
+/// template" / tokenizer-source lines already happened once, in the
+/// primary resolution) nor re-runs the TOK-08 compatibility check (the
+/// source already passed it).
+///
+/// # Errors
+///
+/// The on-disk file becoming unreadable between the two loads, or (for the
+/// embedded source) the GGUF's chat template failing to compile — both
+/// already-impossible-in-practice regressions the primary resolution would
+/// have surfaced first.
+#[cfg(feature = "server")]
+pub(crate) fn rebuild_serving_tokenizer(
+    source: &super::cmd_run::TokenizerSource,
+    gguf: &oxibonsai_core::gguf::reader::GgufFile<'_>,
+) -> anyhow::Result<oxibonsai_runtime::TokenizerBridge> {
+    match source {
+        super::cmd_run::TokenizerSource::File(path) => {
+            let tok = super::tokenizer_backend::load_tokenizer_bridge(
+                path,
+                super::tokenizer_backend::TokenizerBackendChoice::Auto,
+            )?;
+            let template =
+                oxibonsai_runtime::config::ResolvedChatTemplate::from_gguf(&gguf.metadata)
+                    .map_err(|e| {
+                        anyhow::anyhow!("failed to compile the GGUF's own chat template: {e}")
+                    })?;
+            Ok(tok.with_chat_template(template))
+        }
+        super::cmd_run::TokenizerSource::GgufEmbedded => {
+            oxibonsai_runtime::TokenizerBridge::native_from_gguf_metadata(&gguf.metadata)
+                .map_err(|e| anyhow::anyhow!("failed to rebuild the GGUF-embedded tokenizer: {e}"))
+        }
+    }
 }
 
 /// Build the multi-line "no tokenizer found" warning shown by the run /
@@ -420,6 +481,48 @@ pub(crate) fn check_tokenizer_model_compatibility(
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+// Graceful "context full" stop
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Clamp a requested generation budget to what the context window has left
+/// after the prompt, instead of letting decode run into the hard
+/// `sequence length N exceeds max context M` engine error once position
+/// `max_context` is reached (previously an uncaught crash, exit 1, for any
+/// `--max-tokens` that would carry the sequence past `--ctx`).
+///
+/// Returns the (possibly smaller) effective budget: `max_tokens` unchanged
+/// when everything already fits, otherwise the exact number of token slots
+/// left, printing one stderr notice naming why (the natural stop this
+/// produces once decode reaches it is already an ordinary "hit the token
+/// budget" length stop, on every decode path — nothing else changes).
+///
+/// # Errors
+///
+/// The PROMPT ALONE already exceeds `max_context` (nothing to clamp: a
+/// single token would still overflow) — a hard error naming both numbers,
+/// same as before.
+pub(crate) fn clamp_generation_budget(
+    prompt_len: usize,
+    max_tokens: usize,
+    max_context: usize,
+) -> anyhow::Result<usize> {
+    if prompt_len > max_context {
+        anyhow::bail!(
+            "sequence length {prompt_len} exceeds max context {max_context}: the prompt alone \
+             does not fit; shorten it or raise --ctx"
+        );
+    }
+    let budget = max_tokens.min(max_context - prompt_len);
+    if budget < max_tokens {
+        eprintln!(
+            "[context window full: {prompt_len} prompt token(s) + {max_tokens} requested would \
+             exceed --ctx {max_context}; generating {budget} more token(s) instead]"
+        );
+    }
+    Ok(budget)
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // cli-17: stop-sequence matching for `run`/`chat`
 // ──────────────────────────────────────────────────────────────────────────
 
@@ -470,7 +573,7 @@ impl StopChecker {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Shared sampling-parameter construction (orchestrator P0 addendum)
+// Shared sampling-parameter construction
 // ──────────────────────────────────────────────────────────────────────────
 
 /// Reject `--grammar`/`--stop` when combined with a non-default sampling
@@ -532,6 +635,11 @@ pub(crate) const DEFAULT_MIN_P: f32 = 0.0;
 /// See [`DEFAULT_TEMPERATURE`] (`1.0` = no penalty: `--temperature 0` is
 /// exactly argmax).
 pub(crate) const DEFAULT_REPETITION_PENALTY: f32 = 1.0;
+/// `--seed`/`[sampling].seed`'s final default: reproducible by
+/// construction (RT-12), not random, since a bug report that says
+/// "reproduce this with `oxibonsai run --prompt ...`" (no `--seed`) must
+/// mean the same thing on every machine.
+pub(crate) const DEFAULT_SEED: u64 = 42;
 
 /// The single constructor `run`/`chat`/`serve` use to build
 /// [`SamplingParams`].
@@ -565,9 +673,8 @@ pub(crate) fn build_sampling_params(
 // ──────────────────────────────────────────────────────────────────────────
 
 /// A per-user data directory this process owns, equivalent in spirit to
-/// the `dirs` crate's `data_dir()` (not added as a dependency: the root
-/// `Cargo.toml` manifest is outside this package's `owned_files` this
-/// wave — recorded in `deviations`). Never `/tmp` or any other
+/// the `dirs` crate's `data_dir()` (not added as a dependency, so this
+/// implements the platform resolution directly). Never `/tmp` or any other
 /// world-writable path.
 ///
 /// Resolution: `$XDG_DATA_HOME`, else `~/Library/Application Support` on
@@ -624,19 +731,17 @@ pub(crate) fn oxibonsai_data_dir() -> PathBuf {
 /// — `mod.rs` used to read the file once for that scan and a second time
 /// here, a redundant read with a TOCTOU window in which the two reads
 /// could observe different file content. One read remains unavoidable
-/// within this package alone:
+/// here:
 /// [`oxibonsai_runtime::OxiBonsaiConfig::load`] takes a `&Path` and reads
-/// the file itself internally (`oxibonsai-runtime/src/config.rs`, outside
-/// this package's `owned_files` this wave — recorded in `deviations`); a
+/// the file itself internally (`oxibonsai-runtime/src/config.rs`); a
 /// `from_str`/content-based constructor there, or a `toml` crate
-/// dependency edge for this package in the (also out-of-scope) root
-/// `Cargo.toml`, would close that second read too.
+/// dependency edge in the root `Cargo.toml`, would close that second read
+/// too.
 ///
 /// `OxiBonsaiConfig`'s own `#[serde(default)]` deserialization silently
 /// ignores unknown keys rather than erroring (`#[serde(deny_unknown_fields)]`
 /// would fix this at the source, but that struct lives in
-/// `oxibonsai-runtime/src/config.rs`, outside this package's
-/// `owned_files` this wave — recorded in `deviations`). This performs an
+/// `oxibonsai-runtime/src/config.rs`). This performs an
 /// equivalent check by hand via [`parse_flat_toml_sections`].
 pub(crate) fn load_config_strict(
     content: &str,
@@ -663,6 +768,7 @@ const KNOWN_CONFIG_SECTIONS: &[(&str, &[&str])] = &[
             "frequency_penalty",
             "presence_penalty",
             "max_tokens",
+            "seed",
         ],
     ),
     (
@@ -842,8 +948,9 @@ pub(crate) fn toml_u64(sections: &RawTomlSections, section: &str, key: &str) -> 
 /// Convert one of `args.rs`'s `validate_*`/`parse_*` `Result<T, String>`
 /// outcomes into `anyhow::Result<T>`. The single copy, shared by `mod.rs`
 /// and every `cmd_*` module that re-validates a value it resolves itself
-/// after the model is loaded (`cmd_run`/`cmd_chat`'s RT-17/REQUIRED #8
-/// resolution, done post-GGUF-load rather than in `mod.rs`).
+/// after the model is loaded (`cmd_run`/`cmd_chat`'s RT-17 sampling
+/// defaults and design §5.6 context-guard resolution, done post-GGUF-load
+/// rather than in `mod.rs`).
 pub(crate) fn validated<T>(result: Result<T, String>) -> anyhow::Result<T> {
     result.map_err(|e| anyhow::anyhow!(e))
 }
@@ -867,7 +974,7 @@ pub(crate) fn toml_bool(sections: &RawTomlSections, section: &str, key: &str) ->
 }
 
 /// Crate-wide serialization for unit tests that mutate process environment
-/// variables (ENGINE-SEAM addendum (3)): every such test in this binary —
+/// variables: every such test in this binary —
 /// `cmd_serve`'s, `pull`'s, … — holds [`lock`](test_env::lock) for its whole
 /// body and restores what it changed through an [`EnvVarGuard`](test_env::EnvVarGuard),
 /// so no two tests ever race on the same variable, and a panicking test still
@@ -977,13 +1084,15 @@ pub(crate) fn resolve_u16(
         .unwrap_or(default)
 }
 
-/// Resolve `--backend`/`[model].backend` (wave-4b ENGINE-SEAM addendum):
+/// Resolve `--backend`/`[model].backend`:
 /// an explicit flag always wins (already parsed and validated by clap's own
-/// `value_parser`, so `cli` arriving `Some` is already a valid [`Backend`]);
+/// `value_parser`, so `cli` arriving `Some` is already a valid
+/// [`oxibonsai_runtime::engine_seam::Backend`]);
 /// otherwise a `[model].backend` TOML string is parsed and validated here
 /// (config-file values never go through clap's `value_parser`, so cli-04's
 /// "every source is checked identically" contract applies just as it does
-/// for the numeric sampling flags); otherwise [`Backend::default`] (`Auto`).
+/// for the numeric sampling flags); otherwise
+/// [`oxibonsai_runtime::engine_seam::Backend::default`] (`Auto`).
 ///
 /// # Errors
 ///
@@ -1006,8 +1115,8 @@ pub(crate) fn resolve_backend(
     }
 }
 
-/// Resolve `--rope-scaling`/`[model].rope_scaling` (wave-4b orchestrator
-/// addendum; see [`oxibonsai_runtime::config::RopeScalingMode`]). Same
+/// Resolve `--rope-scaling`/`[model].rope_scaling`
+/// (see [`oxibonsai_runtime::config::RopeScalingMode`]). Same
 /// "flag > config-string > default" precedence as [`resolve_backend`].
 ///
 /// # Errors
@@ -1070,7 +1179,7 @@ fn strip_toml_comment(line: &str) -> &str {
 /// caller's `KNOWN_CONFIG_SECTIONS` lookup below correctly rejects both as
 /// an unknown section instead of either misattributing a dotted header's
 /// `key = value` lines to the last-seen plain section, or a top-level
-/// error blaming "not inside any [section]" for what is actually an
+/// error blaming "not inside any \[section\]" for what is actually an
 /// unsupported header shape.
 fn parse_section_header(line: &str) -> Option<&str> {
     let inner = line.strip_prefix('[')?.strip_suffix(']')?;
@@ -1105,7 +1214,7 @@ fn parse_key_line(line: &str) -> Option<(String, String)> {
 /// Linux: `MemAvailable` from `/proc/meminfo`. macOS: total physical RAM
 /// via `sysctl -n hw.memsize` (not "available", but a reasonable
 /// conservative stand-in — no portable "available" query exists without
-/// an FFI/library dependency this package cannot add, see `deviations`).
+/// an FFI/library dependency).
 /// Other platforms: `None` (callers fall back to a fixed conservative
 /// threshold).
 pub(crate) fn available_memory_bytes() -> Option<u64> {
@@ -1369,11 +1478,10 @@ pub(crate) fn parse_quantize_format(
         "q4_k" => Ok(ExportFormat::Q4K),
         "q5_k" => Ok(ExportFormat::Q5K),
         "q6_k" => Ok(ExportFormat::Q6K),
-        // Wave-3.5 deviation routing: FIX3-GGUF-WRITE's `encode_quantized_tensor`
+        // `encode_quantized_tensor` in `crates/oxibonsai-model/src/export.rs`
         // already handles `TensorType::{Q2_K,Q3_K,Q8_K}` (the actual writer
         // support); these three string arms plus `ExportFormat::{Q2K,Q3K,Q8K}`
-        // (`crates/oxibonsai-model/src/export.rs`, also owned by this
-        // package) are the CLI-side wiring that was left unwired end-to-end.
+        // are the CLI-side wiring that was left unwired end-to-end.
         "q2_k" => Ok(ExportFormat::Q2K),
         "q3_k" => Ok(ExportFormat::Q3K),
         "q8_k" => Ok(ExportFormat::Q8K),

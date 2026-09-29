@@ -657,167 +657,22 @@ async fn server_config_load_composes_across_layers() {
 
 mod model_backed_embeddings {
     use super::*;
-    use oxibonsai_core::gguf::writer::{GgufWriter, MetadataWriteValue, TensorEntry, TensorType};
     use oxibonsai_runtime::engine::Backend;
     use oxibonsai_runtime::engine_pool::{build_pool_from_gguf_parts, PoolBuild};
     use oxibonsai_runtime::metrics::InferenceMetrics;
     use oxibonsai_runtime::server::{create_router_full, RouterOptions};
     use oxibonsai_runtime::tokenizer_bridge::TokenizerBridge;
     use oxibonsai_serve::embedder::build_embedder;
+    use oxibonsai_testkit::dense_fixture::{
+        byte_tokenizer_json, weighted_dense_gguf, HIDDEN, MAX_SEQ,
+    };
     use tower::ServiceExt;
 
-    const HIDDEN: usize = 128;
-    const INTER: usize = 256;
-    const LAYERS: usize = 2;
-    const N_Q: usize = 4;
-    const N_KV: usize = 2;
-    const HEAD_DIM: usize = 32;
-    /// One id per byte, matching [`byte_tokenizer`].
-    const VOCAB: usize = 256;
-    const MAX_SEQ: usize = 256;
-
-    /// `TQ2_0_g128` blocks: 32 bytes of 2-bit codes drawn from `{00, 01, 10}`
-    /// (`11` is reserved) by a seeded counter, then the FP16 scale `0.5`
-    /// (`0x3800`), per 128 weights — real, varied ternary weights.
-    fn tq2_blocks(num_weights: usize, seed: u64) -> Vec<u8> {
-        let mut data = Vec::with_capacity(num_weights / 128 * 34);
-        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-        for _ in 0..num_weights / 128 {
-            for _ in 0..32 {
-                let mut byte = 0u8;
-                for lane in 0..4 {
-                    state = state
-                        .wrapping_mul(6_364_136_223_846_793_005)
-                        .wrapping_add(1_442_695_040_888_963_407);
-                    let code = ((state >> 33) % 3) as u8;
-                    byte |= code << (2 * lane);
-                }
-                data.push(byte);
-            }
-            data.extend_from_slice(&0x3800u16.to_le_bytes());
-        }
-        data
-    }
-
-    /// An FP32 tensor whose values vary with the index (so no two embedding
-    /// rows are equal).
-    fn f32_varied(n: usize, scale: f32) -> Vec<u8> {
-        (0..n)
-            .flat_map(|i| (scale * (1.0 + 0.25 * (i as f32 * 0.013).sin())).to_le_bytes())
-            .collect()
-    }
-
-    /// A small dense (`qwen3`) GGUF with real ternary weights.
-    fn weighted_dense_gguf() -> Vec<u8> {
-        let mut writer = GgufWriter::new();
-        let meta_u32 = |writer: &mut GgufWriter, key: &str, value: usize| {
-            writer.add_metadata(
-                key,
-                MetadataWriteValue::U32(u32::try_from(value).expect("fits u32")),
-            );
-        };
-        writer.add_metadata(
-            "general.architecture",
-            MetadataWriteValue::Str("qwen3".to_string()),
-        );
-        writer.add_metadata(
-            "general.name",
-            MetadataWriteValue::Str("ServeEmbeddingFixture".to_string()),
-        );
-        meta_u32(&mut writer, "qwen3.embedding_length", HIDDEN);
-        meta_u32(&mut writer, "qwen3.block_count", LAYERS);
-        meta_u32(&mut writer, "qwen3.attention.head_count", N_Q);
-        meta_u32(&mut writer, "qwen3.attention.head_count_kv", N_KV);
-        meta_u32(&mut writer, "qwen3.feed_forward_length", INTER);
-        meta_u32(&mut writer, "qwen3.vocab_size", VOCAB);
-        meta_u32(&mut writer, "qwen3.context_length", 512);
-        writer.add_metadata(
-            "qwen3.attention.layer_norm_rms_epsilon",
-            MetadataWriteValue::F32(1e-6),
-        );
-        writer.add_metadata("qwen3.rope.freq_base", MetadataWriteValue::F32(10_000.0));
-
-        writer.add_tensor(TensorEntry {
-            name: "token_embd.weight".to_string(),
-            shape: vec![HIDDEN as u64, VOCAB as u64],
-            tensor_type: TensorType::F32,
-            data: f32_varied(VOCAB * HIDDEN, 0.5),
-        });
-        writer.add_tensor(TensorEntry {
-            name: "output_norm.weight".to_string(),
-            shape: vec![HIDDEN as u64],
-            tensor_type: TensorType::F32,
-            data: f32_varied(HIDDEN, 1.0),
-        });
-        writer.add_tensor(TensorEntry {
-            name: "output.weight".to_string(),
-            shape: vec![HIDDEN as u64, VOCAB as u64],
-            tensor_type: TensorType::TQ2_0_g128,
-            data: tq2_blocks(VOCAB * HIDDEN, 0xCAFE),
-        });
-        for layer in 0..LAYERS {
-            let prefix = format!("blk.{layer}");
-            for (name, dim) in [
-                ("attn_norm.weight", HIDDEN),
-                ("ffn_norm.weight", HIDDEN),
-                ("attn_q_norm.weight", HEAD_DIM),
-                ("attn_k_norm.weight", HEAD_DIM),
-            ] {
-                writer.add_tensor(TensorEntry {
-                    name: format!("{prefix}.{name}"),
-                    shape: vec![dim as u64],
-                    tensor_type: TensorType::F32,
-                    data: f32_varied(dim, 1.0),
-                });
-            }
-            for (bump, (name, in_dim, out_dim)) in [
-                ("attn_q.weight", HIDDEN, N_Q * HEAD_DIM),
-                ("attn_k.weight", HIDDEN, N_KV * HEAD_DIM),
-                ("attn_v.weight", HIDDEN, N_KV * HEAD_DIM),
-                ("attn_output.weight", N_Q * HEAD_DIM, HIDDEN),
-                ("ffn_gate.weight", HIDDEN, INTER),
-                ("ffn_up.weight", HIDDEN, INTER),
-                ("ffn_down.weight", INTER, HIDDEN),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                writer.add_tensor(TensorEntry {
-                    name: format!("{prefix}.{name}"),
-                    shape: vec![in_dim as u64, out_dim as u64],
-                    tensor_type: TensorType::TQ2_0_g128,
-                    data: tq2_blocks(in_dim * out_dim, ((layer as u64) << 8) + bump as u64),
-                });
-            }
-        }
-        writer.to_bytes().expect("serialize the GGUF fixture")
-    }
-
-    /// GPT-2's byte-level alphabet (`bytes_to_unicode`): printable bytes map
-    /// to themselves, the other 68 to `U+0100 + n` in byte order.
-    fn byte_to_unicode(byte: u8) -> char {
-        let printable =
-            |b: u8| (b'!'..=b'~').contains(&b) || (0xA1..=0xAC).contains(&b) || b >= 0xAE;
-        if printable(byte) {
-            return char::from(byte);
-        }
-        let rank = (0..byte).filter(|&b| !printable(b)).count();
-        char::from_u32(256 + u32::try_from(rank).expect("fits u32")).expect("a valid scalar")
-    }
-
-    /// A byte-level `tokenizer.json` whose 256 ids are the 256 bytes, so
-    /// every text encodes to ids inside the fixture's vocabulary.
+    /// A byte-level tokenizer whose 256 ids are the 256 bytes, so every text
+    /// encodes to ids inside the fixture's vocabulary
+    /// ([`oxibonsai_testkit::dense_fixture::VOCAB`]).
     fn byte_tokenizer() -> TokenizerBridge {
-        let vocab: serde_json::Map<String, serde_json::Value> = (0..=255u8)
-            .map(|byte| (byte_to_unicode(byte).to_string(), u32::from(byte).into()))
-            .collect();
-        let json = serde_json::json!({
-            "model": { "type": "BPE", "vocab": vocab, "merges": [] },
-            "added_tokens": [],
-            "pre_tokenizer": { "type": "ByteLevel" },
-            "decoder": { "type": "ByteLevel" },
-        });
-        TokenizerBridge::native_from_json_str(&json.to_string()).expect("the tokenizer loads")
+        TokenizerBridge::native_from_json_str(&byte_tokenizer_json()).expect("the tokenizer loads")
     }
 
     /// The pool the binary builds for `--model <path>`: the fixture written
@@ -843,18 +698,22 @@ mod model_backed_embeddings {
     }
 
     fn router_with(built: &PoolBuild, embedder_tokenizer: Option<TokenizerBridge>) -> Router {
-        let embedder = build_embedder(
+        let (embedder, reason) = build_embedder(
             built,
             embedder_tokenizer,
             SamplingParams::default(),
             42,
             MAX_SEQ,
         );
+        let mut opts = RouterOptions::default().with_embedder(embedder);
+        if let Some((code, message)) = reason {
+            opts = opts.with_embedder_unavailable(code, message);
+        }
         create_router_full(
             Arc::clone(&built.pool),
             Some(byte_tokenizer()),
             Arc::new(InferenceMetrics::new()),
-            RouterOptions::default().with_embedder(embedder),
+            opts,
         )
     }
 
@@ -915,9 +774,18 @@ mod model_backed_embeddings {
     #[tokio::test]
     async fn the_serve_path_without_a_tokenizer_keeps_the_honest_501() {
         let (built, _file) = serve_pool();
-        assert!(build_embedder(&built, None, SamplingParams::default(), 42, MAX_SEQ).is_none());
+        let (embedder, reason) =
+            build_embedder(&built, None, SamplingParams::default(), 42, MAX_SEQ);
+        assert!(embedder.is_none());
+        assert!(reason.is_some(), "the 501 body must carry a reason");
         let app = router_with(&built, None);
         let (status, json) = post_embeddings(app, serde_json::json!({ "input": "king" })).await;
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{json}");
+        // The 501 body carries the reason, not just the server log.
+        let message = json["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("no tokenizer: an embedder needs one to encode text"),
+            "the 501 body must name why: {json}"
+        );
     }
 }

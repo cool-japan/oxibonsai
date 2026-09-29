@@ -21,6 +21,8 @@
 //! | `OXIBONSAI_METRICS_ENABLED`    | `observability.metrics_enabled`        | bool   |
 //! | `OXIBONSAI_METRICS_PATH`       | `observability.metrics_path`           | string |
 //! | `OXIBONSAI_SEED`               | `seed`                                 | u64    |
+//! | `OXIBONSAI_ENABLE_UI`          | `ui.enabled`                           | bool   |
+//! | `OXIBONSAI_MAX_OUTPUT_TOKENS`  | `limits.max_output_tokens`             | usize  |
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -99,6 +101,21 @@ where
     if let Some(v) = map.get("OXIBONSAI_METRICS_ENABLED") {
         out.metrics_enabled = Some(parse_bool("OXIBONSAI_METRICS_ENABLED", v)?);
     }
+
+    // `OXIBONSAI_ENABLE_UI` / `OXIBONSAI_MAX_OUTPUT_TOKENS`: kept next to the
+    // `ServerConfig` fields they fill, in `crate::config::parse_ui_env_map`.
+    let ui_vars = map
+        .iter()
+        .filter(|(k, _)| {
+            matches!(
+                k.as_str(),
+                "OXIBONSAI_ENABLE_UI" | "OXIBONSAI_MAX_OUTPUT_TOKENS"
+            )
+        })
+        .map(|(k, v)| (k.clone(), v.clone()));
+    let ui_partial = crate::config::parse_ui_env_map(ui_vars)?;
+    out.enable_ui = ui_partial.enable_ui;
+    out.max_output_tokens = ui_partial.max_output_tokens;
 
     Ok(out)
 }
@@ -201,5 +218,29 @@ mod tests {
     #[test]
     fn bool_bad_errors() {
         assert!(parse_bool("X", "maybe").is_err());
+    }
+
+    /// `parse_env_map` (not just `config::parse_ui_env_map` directly) must
+    /// pick up `OXIBONSAI_ENABLE_UI` / `OXIBONSAI_MAX_OUTPUT_TOKENS` — this
+    /// is the entry point `parse_process_env`/`main.rs` actually calls.
+    #[test]
+    fn parse_env_map_picks_up_enable_ui_and_max_output_tokens() {
+        let p = parse_env_map([
+            ("OXIBONSAI_ENABLE_UI".to_string(), "true".to_string()),
+            (
+                "OXIBONSAI_MAX_OUTPUT_TOKENS".to_string(),
+                "4096".to_string(),
+            ),
+        ])
+        .expect("parse");
+        assert_eq!(p.enable_ui, Some(true));
+        assert_eq!(p.max_output_tokens, Some(4096));
+    }
+
+    #[test]
+    fn parse_env_map_rejects_a_malformed_enable_ui_value() {
+        let err = parse_env_map([("OXIBONSAI_ENABLE_UI".to_string(), "maybe".to_string())])
+            .expect_err("not a boolean");
+        assert!(matches!(err, ConfigError::EnvParse { .. }), "{err}");
     }
 }

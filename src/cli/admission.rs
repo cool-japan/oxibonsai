@@ -419,12 +419,17 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// Deterministic by construction, not by a race between a fixed sleep
+    /// and a fixed timeout. The handler awaits [`std::future::pending`],
+    /// which by definition never completes, so ANY finite timeout must
+    /// fire — there is no wall-clock value the handler could "win" a race
+    /// against, on however loaded a machine.
     #[tokio::test]
     async fn apply_admission_times_out_slow_handlers() {
         let slow = Router::new().route(
             "/slow",
             get(|| async {
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                std::future::pending::<()>().await;
                 "too slow"
             }),
         );
@@ -443,13 +448,35 @@ mod tests {
     /// rate-limit path set it). A concurrency ceiling of 1 plus a slow
     /// in-flight request means a second concurrent request must be shed
     /// immediately by `load_shed` rather than queued.
+    ///
+    /// Deterministic by construction, not by a fixed
+    /// 20ms sleep racing a fixed 100ms handler (a loaded machine can starve
+    /// the "wait 20ms" task past the handler's own 100ms, making the second
+    /// request arrive AFTER the first already released its permit — a
+    /// spurious 200 instead of the intended 503). A barrier instead: the
+    /// in-flight request signals (`Notify`) the instant it is actually
+    /// running INSIDE the handler (i.e. it already holds the sole permit,
+    /// admission having already accepted it), then parks on a second
+    /// `Notify` until released; the second request is sent ONLY after that
+    /// signal, so it is structurally guaranteed to observe the permit held,
+    /// on any machine at any load.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn apply_admission_returns_503_with_retry_after_when_overloaded() {
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let entered_for_handler = std::sync::Arc::clone(&entered);
+        let release_for_handler = std::sync::Arc::clone(&release);
+
         let slow = Router::new().route(
             "/slow",
-            get(|| async {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                "done"
+            get(move || {
+                let entered = std::sync::Arc::clone(&entered_for_handler);
+                let release = std::sync::Arc::clone(&release_for_handler);
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    "done"
+                }
             }),
         );
         let app = apply_admission(slow, 1, 60_000);
@@ -464,7 +491,10 @@ mod tests {
             first_app.oneshot(req).await.map(|r| r.status())
         });
 
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Waits until the in-flight request is genuinely INSIDE the handler
+        // (so admission has already granted it the sole permit) before the
+        // second request is even built — no sleep, no race window.
+        entered.notified().await;
         let second_req = Request::builder()
             .method(Method::GET)
             .uri("/slow")
@@ -472,6 +502,8 @@ mod tests {
             .expect("request builds");
         let second_resp = app.oneshot(second_req).await.expect("oneshot succeeds");
 
+        // Now let the first request finish.
+        release.notify_one();
         let first_status = first.await.expect("join").expect("first response");
         assert_eq!(
             first_status,

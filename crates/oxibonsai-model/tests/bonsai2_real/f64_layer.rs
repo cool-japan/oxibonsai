@@ -1,7 +1,6 @@
 //! An independent `f64` evaluation of single `qwen35` layers, straight from
-//! a GGUF's bytes — design §8.2 **G3** as re-specified by ruling R2''
-//! (`pkg/wave4b.rulings.md`): "f64-reference self-consistency of our hybrid
-//! forward on the real 27B at layers 0, 3, 7, 31, 63".
+//! a GGUF's bytes — design §8.2 **G3**: "f64-reference self-consistency of
+//! our hybrid forward on the real 27B at layers 0, 3, 7, 31, 63".
 //!
 //! # Independence
 //!
@@ -13,8 +12,8 @@
 //! and every norm, the partial NeoX RoPE, the GQA attention, the causal
 //! conv, the L2 norm and the gated delta rule are written out in `f64` from
 //! the design text (§2.3–§2.6, §3.2–§3.5). The whole reference is itself
-//! validated end to end against B2-16's independent `f64` model of the
-//! synthetic fixture (`hybrid_f64_layer_reference_matches_the_fixture_bonsai2`).
+//! validated end to end against the synthetic fixture's own independent
+//! `f64` model (`hybrid_f64_layer_reference_matches_the_fixture_bonsai2`).
 //!
 //! # Memory
 //!

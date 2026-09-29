@@ -11,6 +11,27 @@
 //! The tiling interacts with the kernel dispatcher, calling the
 //! tier-appropriate SIMD kernel on each tile. This gives us cache
 //! optimization without duplicating SIMD code for each tier.
+//!
+//! ## The opt-in INT8 tier (K-14)
+//!
+//! [`gemv_tiled`] and [`gemv_tiled_par`] ask
+//! [`KernelDispatcher::native_int8_tier`] once, at entry, exactly like
+//! `parallel::gemv_1bit_g128_par` — and, when it selects a tier, hand the
+//! *whole* (untiled) call straight to `dispatch_int8::gemv_1bit_g128_int8`
+//! instead of tiling at all. Before this, each L1/L2 tile called
+//! `OneBitKernel::gemv` independently, which already carries its own INT8
+//! check: with the tier selected, every tile would re-quantize the
+//! identical, untiled `input` activation on its own — same values, wasted
+//! work. With the tier unset, both functions' tiling loops now call the
+//! dispatcher's `pub(crate)` `gemv_1bit_on_tier` per tile directly — the
+//! tier-only f32 body `OneBitKernel::gemv` itself falls back to once its own
+//! entry check finds nothing selected — rather than re-entering `gemv`
+//! (and so re-checking the environment) once per tile.
+//!
+//! [`gemm_tiled`] and [`gemm_tiled_par`] need no equivalent change: they
+//! call the free function `gemm_1bit_g128_blocked` directly, never
+//! `OneBitKernel::gemm`, so they never reach the INT8 selector at all (see
+//! that function's own doc for why).
 
 use oxibonsai_core::tensor::{BlockQ1_0G128, QK1_0_G128};
 #[cfg(not(target_arch = "wasm32"))]
@@ -19,6 +40,10 @@ use rayon::prelude::*;
 use crate::dispatch::KernelDispatcher;
 use crate::error::{KernelError, KernelResult};
 use crate::gemm_onebit::gemm_1bit_g128_blocked;
+// Only the tests call `KernelDispatcher::gemv`/`gemm` directly any more —
+// both production entry points now call `gemv_1bit_on_tier` directly or the
+// once-at-entry INT8 check, neither of which needs this trait import.
+#[cfg(test)]
 use crate::traits::OneBitKernel;
 
 /// Number of rows per L1-sized tile.
@@ -125,7 +150,32 @@ fn validate_gemm_params(
 ///
 /// For small `n_rows` (< `L1_TILE_ROWS`), this degrades gracefully
 /// to a single-tile call.
+///
+/// Asks [`KernelDispatcher::native_int8_tier`] once, before any tiling —
+/// see this module's doc comment.
 pub fn gemv_tiled(
+    dispatcher: &KernelDispatcher,
+    blocks: &[BlockQ1_0G128],
+    input: &[f32],
+    output: &mut [f32],
+    n_rows: usize,
+    k: usize,
+) -> KernelResult<()> {
+    if let Some(tier) = dispatcher.native_int8_tier() {
+        return crate::dispatch_int8::gemv_1bit_g128_int8(tier, blocks, input, output, n_rows, k);
+    }
+    gemv_tiled_f32(dispatcher, blocks, input, output, n_rows, k)
+}
+
+/// The L1-tiling loop [`gemv_tiled`] runs once its own entry check finds no
+/// INT8 tier selected.
+///
+/// Split out so [`gemv_tiled_par`]'s small-`n_rows`/WASM fallback can call it
+/// directly instead of re-entering [`gemv_tiled`] and so re-reading
+/// [`KernelDispatcher::native_int8_tier`] a second time for the same call —
+/// harmless (the answer cannot have changed in between), but this way each
+/// public entry point still asks exactly once, matching the module doc.
+fn gemv_tiled_f32(
     dispatcher: &KernelDispatcher,
     blocks: &[BlockQ1_0G128],
     input: &[f32],
@@ -142,7 +192,7 @@ pub fn gemv_tiled(
         let block_start = row_start * blocks_per_row;
         let block_end = (row_start + tile_rows) * blocks_per_row;
 
-        dispatcher.gemv(
+        dispatcher.gemv_1bit_on_tier(
             &blocks[block_start..block_end],
             input,
             &mut output[row_start..row_start + tile_rows],
@@ -223,6 +273,9 @@ pub fn gemm_tiled(
 /// with fine-grained cache optimization (L1 tiles within each core).
 ///
 /// Falls back to sequential `gemv_tiled` for small row counts.
+///
+/// Asks [`KernelDispatcher::native_int8_tier`] once, before any tiling —
+/// see this module's doc comment.
 pub fn gemv_tiled_par(
     dispatcher: &KernelDispatcher,
     blocks: &[BlockQ1_0G128],
@@ -231,20 +284,28 @@ pub fn gemv_tiled_par(
     n_rows: usize,
     k: usize,
 ) -> KernelResult<()> {
+    if let Some(tier) = dispatcher.native_int8_tier() {
+        return crate::dispatch_int8::gemv_1bit_g128_int8(tier, blocks, input, output, n_rows, k);
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     let blocks_per_row = validate_gemv_params(blocks, input, output, n_rows, k)?;
     #[cfg(target_arch = "wasm32")]
     let _blocks_per_row = validate_gemv_params(blocks, input, output, n_rows, k)?;
 
-    // Sequential fallback for small row counts
+    // Sequential fallback for small row counts. Calls the tier-check-free
+    // `gemv_tiled_f32` directly, not `gemv_tiled`: the entry check just
+    // above already asked `native_int8_tier()` and found `None`, so
+    // re-entering `gemv_tiled` would only re-read the same answer.
     if n_rows < PAR_TILED_GEMV_MIN_ROWS {
-        return gemv_tiled(dispatcher, blocks, input, output, n_rows, k);
+        return gemv_tiled_f32(dispatcher, blocks, input, output, n_rows, k);
     }
 
-    // On WASM: no rayon threads — fall back to sequential tiled.
+    // On WASM: no rayon threads — fall back to sequential tiled (same
+    // already-known-`None` reasoning as the small-row-count fallback above).
     #[cfg(target_arch = "wasm32")]
     {
-        gemv_tiled(dispatcher, blocks, input, output, n_rows, k)
+        gemv_tiled_f32(dispatcher, blocks, input, output, n_rows, k)
     }
 
     // Parallel L2 tiles, each internally using L1 tiling
@@ -267,7 +328,7 @@ pub fn gemv_tiled_par(
                     let l1_block_start = l1_start * blocks_per_row;
                     let l1_block_end = (l1_start + l1_rows) * blocks_per_row;
 
-                    dispatcher.gemv(
+                    dispatcher.gemv_1bit_on_tier(
                         &tile_blocks[l1_block_start..l1_block_end],
                         input,
                         &mut out_chunk[l1_start..l1_start + l1_rows],
@@ -650,5 +711,99 @@ mod tests {
         // 32 rows * 1 block * 18 bytes + 128 * 4 (input) + 32 * 4 (output)
         let expected = 32 * 18 + 128 * 4 + 32 * 4;
         assert_eq!(ws, expected);
+    }
+
+    // ── The once-at-entry INT8 tier check (K-14) ─────────────────────────
+
+    fn to_bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|f| f.to_bits()).collect()
+    }
+
+    /// With the tier unset, both tiled entry points must still be
+    /// bit-identical to `OneBitKernel::gemv` — not merely close — because
+    /// they now call `gemv_1bit_on_tier` directly instead of re-entering
+    /// `gemv`, and that is the exact same per-tier body `gemv` itself falls
+    /// back to once its own entry check finds nothing selected.
+    #[test]
+    fn tiled_gemv_and_par_are_bit_identical_to_direct_gemv_with_the_tier_unset() {
+        let _guard = crate::dispatch_int8::TierEnvGuard::acquire();
+        let (n_rows, k) = (300usize, 256usize);
+        let (blocks, input) = make_test_data(n_rows, k);
+        let dispatcher = KernelDispatcher::with_tier(crate::dispatch::KernelTier::Reference);
+
+        let mut out_direct = vec![0.0f32; n_rows];
+        dispatcher
+            .gemv(&blocks, &input, &mut out_direct, n_rows, k)
+            .expect("direct gemv");
+
+        let mut out_tiled = vec![0.0f32; n_rows];
+        gemv_tiled(&dispatcher, &blocks, &input, &mut out_tiled, n_rows, k).expect("tiled gemv");
+        assert_eq!(
+            to_bits(&out_direct),
+            to_bits(&out_tiled),
+            "gemv_tiled must be bit-identical to OneBitKernel::gemv with the tier unset"
+        );
+
+        let mut out_tiled_par = vec![0.0f32; n_rows];
+        gemv_tiled_par(&dispatcher, &blocks, &input, &mut out_tiled_par, n_rows, k)
+            .expect("tiled par gemv");
+        assert_eq!(
+            to_bits(&out_direct),
+            to_bits(&out_tiled_par),
+            "gemv_tiled_par must be bit-identical to OneBitKernel::gemv with the tier unset"
+        );
+    }
+
+    /// With the tier set, both tiled entry points must be bit-identical to
+    /// the **un-tiled** INT8 GEMV: the whole call is now handed to
+    /// `dispatch_int8::gemv_1bit_g128_int8` once, ahead of any tiling,
+    /// rather than every L1/L2 tile re-quantizing the identical, untiled
+    /// activation on its own.
+    #[test]
+    fn tiled_gemv_and_par_are_bit_identical_to_the_untiled_int8_gemv_with_the_tier_set() {
+        let _guard = crate::dispatch_int8::TierEnvGuard::acquire();
+        // SAFETY: serialized by `_guard` above.
+        unsafe {
+            std::env::set_var(
+                crate::dispatch_int8::KERNEL_TIER_ENV,
+                crate::dispatch_int8::Int8Tier::Scalar.name(),
+            );
+        }
+
+        let (n_rows, k) = (300usize, 256usize);
+        let (blocks, input) = make_test_data(n_rows, k);
+        let dispatcher = KernelDispatcher::with_tier(crate::dispatch::KernelTier::Reference);
+        assert!(
+            dispatcher.native_int8_tier().is_some(),
+            "the guard must have actually selected a tier"
+        );
+
+        let mut expect = vec![0.0f32; n_rows];
+        crate::dispatch_int8::gemv_1bit_g128_int8(
+            crate::dispatch_int8::Int8Tier::Scalar,
+            &blocks,
+            &input,
+            &mut expect,
+            n_rows,
+            k,
+        )
+        .expect("direct int8 gemv");
+
+        let mut out_tiled = vec![0.0f32; n_rows];
+        gemv_tiled(&dispatcher, &blocks, &input, &mut out_tiled, n_rows, k).expect("tiled gemv");
+        assert_eq!(
+            to_bits(&expect),
+            to_bits(&out_tiled),
+            "gemv_tiled must be bit-identical to the un-tiled INT8 gemv with the tier set"
+        );
+
+        let mut out_tiled_par = vec![0.0f32; n_rows];
+        gemv_tiled_par(&dispatcher, &blocks, &input, &mut out_tiled_par, n_rows, k)
+            .expect("tiled par gemv");
+        assert_eq!(
+            to_bits(&expect),
+            to_bits(&out_tiled_par),
+            "gemv_tiled_par must be bit-identical to the un-tiled INT8 gemv with the tier set"
+        );
     }
 }

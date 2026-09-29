@@ -1,11 +1,10 @@
 //! Design §8.2 **G1** and **G4** on the real Bonsai 2 27B, against the
-//! PrismML fork's own goldens (B2-11-FIX; ruling R2' of
-//! `pkg/wave4b.rulings.md`).
+//! PrismML fork's own goldens.
 //!
 //! # What is asserted
 //!
 //! `PQ2_0` (`OXI_BONSAI2_PQ2_GGUF`), all three raw prompts × 24 steps,
-//! against `golden2/PQ2_0.prompt{i}.server.json` (the fork on **Metal**):
+//! against the fork's own `PQ2_0.prompt{i}.server.json` dump (Metal):
 //!
 //! 1. **G1** — our greedy token equals the fork's at every step (hard);
 //! 2. **G4** — our top-10 id *set* equals the fork's at every step (hard);
@@ -36,7 +35,7 @@
 //! Steps 24..32 (the text-only tail, which has no id oracle) feed our own
 //! argmax.
 //!
-//! # Measured results (ruling R2' item 5)
+//! # Measured results
 //!
 //! Real 27B on the 24 GB M3, CPU path, `f16` KV, teacher-forced as above
 //! (the run re-prints all of this: one table row per step and a `LOCALISE`
@@ -74,7 +73,7 @@ use oxibonsai_model::hybrid::model::HybridModel;
 use crate::harness::{
     argmax, compare_step, detokenize, gguf_vocab, golden_cpu_dir, golden_dir, gpt2_byte_decoder,
     locate_model, log_softmax, parse_golden_steps, parse_prompt_tokens, read_golden,
-    read_golden_bytes, real_model_serial, record_capability, show_bytes, top_n, GoldenStep,
+    read_golden_bytes, real_model_serial, record_capability_timed, show_bytes, top_n, GoldenStep,
     StepComparison, G4_LOGPROB_BAND, PQ2_ENV, PQ2_FILE, PROMPTS, PTQ1_ENV, PTQ1_FILE, TOP_N,
 };
 
@@ -199,7 +198,7 @@ fn run_prompt(
     run
 }
 
-/// The worst-step localisation line (ruling R2' item 5).
+/// The worst-step localisation line.
 fn localise(label: &str, prompt_index: usize, run: &PromptRun) -> Option<(usize, f64)> {
     let (step, cmp) = run.vs_metal.iter().enumerate().max_by(|a, b| {
         a.1.worst_delta
@@ -328,7 +327,7 @@ fn g1_g4_failures(
     failures
 }
 
-/// G1 + G4 (ruling R2') + the 32-token text on the real `PQ2_0` 27B.
+/// G1 + G4 + the 32-token text on the real `PQ2_0` 27B.
 #[test]
 fn hybrid_real_27b_pq2_0_matches_the_fork_goldens_bonsai2() {
     const TEST: &str = "oxibonsai-model::hybrid_forward_parity_tests::\
@@ -336,6 +335,7 @@ fn hybrid_real_27b_pq2_0_matches_the_fork_goldens_bonsai2() {
     let Some(path) = locate_model(PQ2_ENV, PQ2_FILE, TEST) else {
         return;
     };
+    let gate_start = Instant::now();
     let _one_real_model_at_a_time = real_model_serial();
     let mmap = mmap_gguf_file(&path).unwrap_or_else(|e| panic!("mmap {}: {e}", path.display()));
     let gguf = GgufFile::parse(&mmap).expect("27B PQ2_0 GGUF parses");
@@ -392,7 +392,7 @@ fn hybrid_real_27b_pq2_0_matches_the_fork_goldens_bonsai2() {
         "real PQ2_0 27B vs the fork goldens:\n{}",
         failures.join("\n")
     );
-    record_capability(true, TEST);
+    record_capability_timed(true, TEST, Some(gate_start.elapsed()));
 }
 
 /// G1 on the real `PTQ1_0` 27B against the `PQ2_0` greedy ids, plus its
@@ -404,6 +404,7 @@ fn hybrid_real_27b_ptq1_0_greedy_matches_the_fork_goldens_bonsai2() {
     let Some(path) = locate_model(PTQ1_ENV, PTQ1_FILE, TEST) else {
         return;
     };
+    let gate_start = Instant::now();
     let _one_real_model_at_a_time = real_model_serial();
     let mmap = mmap_gguf_file(&path).unwrap_or_else(|e| panic!("mmap {}: {e}", path.display()));
     let gguf = GgufFile::parse(&mmap).expect("27B PTQ1_0 GGUF parses");
@@ -444,5 +445,5 @@ fn hybrid_real_27b_ptq1_0_greedy_matches_the_fork_goldens_bonsai2() {
         "real PTQ1_0 27B vs the fork goldens:\n{}",
         failures.join("\n")
     );
-    record_capability(true, TEST);
+    record_capability_timed(true, TEST, Some(gate_start.elapsed()));
 }

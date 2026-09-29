@@ -141,17 +141,17 @@ pub struct ServerArgs {
     /// `false` — the UI is a debugging convenience, unauthenticated by
     /// construction whenever the whole server is, and must be opted into).
     ///
-    /// Read directly by `main.rs` and passed straight to
-    /// `hardening::build_router`, bypassing `PartialServerConfig`/
-    /// `ServerConfig` (`oxibonsai-serve/src/config.rs`, outside this
-    /// package's owned files) entirely — this flag is CLI-only, not
-    /// settable from a TOML config file, until that struct grows a matching
-    /// field. See this package's recorded deviations.
+    /// [`Self::to_partial`] carries an explicit `--enable-ui` into
+    /// `PartialServerConfig::enable_ui`, so it layers under `[ui] enabled`
+    /// (TOML) and `OXIBONSAI_ENABLE_UI` (env) the same way every other
+    /// hardening knob does; `main.rs` reads the merged
+    /// `config.ui.enabled`, never this field directly.
     pub enable_ui: bool,
     /// Hard ceiling on a request's effective `max_tokens` (finding `SV-28`).
     /// `None` keeps `oxibonsai_runtime::server::MAX_OUTPUT_TOKENS`'s
-    /// compiled-in default (8192). Same CLI-only caveat as
-    /// [`Self::enable_ui`].
+    /// compiled-in default (8192). Layers through `PartialServerConfig`
+    /// exactly like [`Self::enable_ui`]; `main.rs` reads the merged
+    /// `config.limits.max_output_tokens`.
     pub max_output_tokens: Option<usize>,
     /// Names of value-bearing flags that were *literally present* on the
     /// command line, as opposed to left at their built-in default.
@@ -168,15 +168,15 @@ pub struct ServerArgs {
 }
 
 impl Default for ServerArgs {
-    // NOTE (sec-15/SV-07, corrected by FIX2-SERVE item 5): this `host` value
+    // NOTE (sec-15/SV-07): this `host` value
     // is never actually reachable at runtime -- `to_partial()` forwards
     // `host` only when `--host` was *explicitly* passed (tracked via
     // `explicit_flags`), never from this struct's own default, so the real,
     // effective default bind address is `crate::config::BindConfig::default()`
-    // (`"127.0.0.1"`, the safe loopback default this package's fix set it
-    // to). This field used to be kept at the stale historical `"0.0.0.0"`
-    // value solely because `crates/oxibonsai-serve/tests/args_tests.rs` (now
-    // owned by this same package -- see its two updated assertions) asserted
+    // (`"127.0.0.1"`, the safe loopback default). This field used to be kept
+    // at the stale historical `"0.0.0.0"`
+    // value solely because `crates/oxibonsai-serve/tests/args_tests.rs`
+    // (see its two updated assertions) asserted
     // on it by name; both are now updated in the same change as this field,
     // so the struct default and the real, effective default agree, and the
     // printed `--help` text below (which always stated the real, effective
@@ -285,6 +285,12 @@ impl ServerArgs {
         }
         if self.max_body_bytes.is_some() {
             partial.max_body_bytes = self.max_body_bytes;
+        }
+        if self.explicit_flags.contains("enable-ui") {
+            partial.enable_ui = Some(self.enable_ui);
+        }
+        if self.max_output_tokens.is_some() {
+            partial.max_output_tokens = self.max_output_tokens;
         }
 
         partial
@@ -444,7 +450,7 @@ pub fn parse_args_from(argv: &[String]) -> Result<Option<ServerArgs>, ParseError
                     value: val.to_string(),
                     reason: "must be a non-negative integer".to_string(),
                 })?;
-                // Gate-fix triage (wave 3): `0` used to parse successfully
+                // `0` used to parse successfully
                 // and get silently clamped to `1` downstream
                 // (`RouterOptions::with_max_output_tokens_ceiling`), which
                 // would then 400 every request with an effective
@@ -703,8 +709,8 @@ mod tests {
         // Every one of these equals `ServerArgs::default()`'s value, but was
         // *typed* on the command line and must therefore win over a
         // lower-precedence (TOML/env) layer that set something else.
-        // `--host 127.0.0.1` matches the struct default post-FIX2-SERVE
-        // item 5 (was `0.0.0.0` before the struct default was corrected).
+        // `--host 127.0.0.1` matches the struct default
+        // (was `0.0.0.0` before the struct default was corrected).
         let parsed = parse_args_from(&args(&[
             "--host",
             "127.0.0.1",
@@ -759,6 +765,21 @@ mod tests {
         assert!(partial.default_temperature.is_none());
         assert!(partial.seed.is_none());
         assert!(partial.log_level.is_none());
+        assert!(partial.enable_ui.is_none());
+        assert!(partial.max_output_tokens.is_none());
+    }
+
+    /// `--enable-ui` / `--max-output-tokens` reach `PartialServerConfig`
+    /// (rather than being read directly off `ServerArgs` by `main.rs`,
+    /// which would bypass TOML/env entirely).
+    #[test]
+    fn to_partial_forwards_enable_ui_and_max_output_tokens() {
+        let parsed = parse_args_from(&args(&["--enable-ui", "--max-output-tokens", "1024"]))
+            .expect("should parse")
+            .expect("should not be help/version");
+        let partial = parsed.to_partial();
+        assert_eq!(partial.enable_ui, Some(true));
+        assert_eq!(partial.max_output_tokens, Some(1024));
     }
 
     // ─── New hardening flags (SV-06/sec-07/RT-34/SV-10/sec-15/SV-27) ───────

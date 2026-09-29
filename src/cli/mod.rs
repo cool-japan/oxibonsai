@@ -137,6 +137,42 @@ fn resolve_prefill_chunk(
     )
 }
 
+/// `--seed`/`[sampling].seed`, validated: precedence flag > TOML > `None`
+/// (`run`/`chat`/`benchmark` each apply their own final default, 42, after
+/// this; `serve` has no `--seed` flag, so it calls this with `cli: None`
+/// and applies its own final default, `OXIBONSAI_SEED`-or-pseudo-random,
+/// after this). Unlike [`resolve_sampling_overrides`]'s
+/// `f32`/`usize` fields (whose `toml_*` lookups already treat an unparsable
+/// value as merely absent, deferring entirely to
+/// [`args::validate_temperature`] et al. for range checks), a malformed
+/// `[sampling].seed` — present in the file but not a valid non-negative
+/// 64-bit integer, e.g. `seed = -1` or `seed = "x"` — must be REJECTED by
+/// name rather than silently treated as unset and defaulted: a typo'd seed
+/// silently losing reproducibility is exactly the class of bug cli-04
+/// exists to catch.
+///
+/// Underscore digit separators (`seed = 1_000`, valid TOML integer syntax)
+/// are stripped before parsing: [`util::parse_flat_toml_sections`] hands
+/// this function the raw source text of the value, and `u64::from_str`
+/// alone does not accept `_` the way a TOML (or Rust literal) parser does.
+fn resolve_seed_override(
+    cli: Option<u64>,
+    sections: &RawTomlSections,
+) -> anyhow::Result<Option<u64>> {
+    if let Some(seed) = cli {
+        return Ok(Some(seed));
+    }
+    match sections.get("sampling").and_then(|s| s.get("seed")) {
+        Some(raw) => raw.replace('_', "").parse::<u64>().map(Some).map_err(|_| {
+            anyhow::anyhow!(
+                "config [sampling].seed = {raw}: not a valid seed (must be a non-negative \
+                 64-bit integer)"
+            )
+        }),
+        None => Ok(None),
+    }
+}
+
 /// The RT-17 sampling values a flag or `--config` supplied, validated; the
 /// model's own `general.sampling.*` defaults (and the final literals) are
 /// applied after the GGUF is loaded, so `None` is kept as "not given".
@@ -184,8 +220,8 @@ fn resolve_max_seq_len(
 }
 
 /// `oxibonsai image`/`repl`: resolve the `[imagen]` section of `--config`
-/// into an [`oxibonsai_runtime::config::ImagenConfig`] (wave-3.5 addendum
-/// item 3): an explicit flag wins, then `[imagen]`, then the CLI's own
+/// into an [`oxibonsai_runtime::config::ImagenConfig`]: an explicit flag
+/// wins, then `[imagen]`, then the CLI's own
 /// literal default (seed 42, 4 steps, 512 x 512). The result is validated
 /// through `OxiBonsaiConfig::validate` (non-zero size and step count).
 /// `[imagen].guidance_scale` is refused rather than ignored: the FLUX.2
@@ -350,7 +386,7 @@ pub async fn run_with(cli: Cli) -> anyhow::Result<()> {
                     "presence_penalty",
                     0.0,
                 )))?,
-                seed,
+                seed: resolve_seed_override(seed, &sections)?.unwrap_or(util::DEFAULT_SEED),
                 max_seq_len: resolve_max_seq_len(max_seq_len, &sections)?,
                 tokenizer: util::resolve_str(tokenizer, &sections, "model", "tokenizer_path"),
                 tokenizer_backend,
@@ -509,7 +545,7 @@ pub async fn run_with(cli: Cli) -> anyhow::Result<()> {
                     "presence_penalty",
                     0.0,
                 )))?,
-                seed,
+                seed: resolve_seed_override(seed, &sections)?.unwrap_or(util::DEFAULT_SEED),
                 max_seq_len: resolve_max_seq_len(max_seq_len, &sections)?,
                 tokenizer: util::resolve_str(tokenizer, &sections, "model", "tokenizer_path"),
                 tokenizer_backend,
@@ -582,7 +618,7 @@ pub async fn run_with(cli: Cli) -> anyhow::Result<()> {
             // flag itself was absent from argv (both are `Option<T>` with
             // no clap default), so a TOML value can never silently widen
             // the bind address a user explicitly chose on the command
-            // line (wave-1 addendum correction on cli-04).
+            // line (cli-04).
             let host = util::resolve_str(host, &sections, "server", "host")
                 .unwrap_or_else(|| "127.0.0.1".to_string());
             let port = util::resolve_u16(port, &sections, "server", "port", 8080);
@@ -593,6 +629,11 @@ pub async fn run_with(cli: Cli) -> anyhow::Result<()> {
                 host,
                 port,
                 max_seq_len: resolve_max_seq_len(max_seq_len, &sections)?,
+                // `serve` has no `--seed` flag of its own (unlike
+                // run/chat/benchmark), so `cli` is always `None` here: this
+                // validates and surfaces only `[sampling].seed` from
+                // --config, naming a malformed value by field (cli-04).
+                toml_seed: resolve_seed_override(None, &sections)?,
                 tokenizer,
                 pool_size,
                 bearer_token,
@@ -668,7 +709,7 @@ pub async fn run_with(cli: Cli) -> anyhow::Result<()> {
             tokens,
             warmup,
             temperature,
-            seed,
+            resolve_seed_override(seed, &sections)?.unwrap_or(util::DEFAULT_SEED),
         )?,
 
         Commands::Quantize {
@@ -695,6 +736,7 @@ pub async fn run_with(cli: Cli) -> anyhow::Result<()> {
             max_tokens,
             max_seq_len,
             tokenizer,
+            tokenizer_backend,
             report_json,
             report_markdown,
             allow_vocab_mismatch,
@@ -716,6 +758,7 @@ pub async fn run_with(cli: Cli) -> anyhow::Result<()> {
                 max_tokens,
                 max_seq_len,
                 tokenizer,
+                tokenizer_backend,
                 report_json,
                 report_markdown,
                 allow_vocab_mismatch,

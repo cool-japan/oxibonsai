@@ -1,15 +1,16 @@
 //! `oxibonsai chat` — interactive multi-turn conversation.
 //!
 //! Every turn renders the WHOLE conversation through the model's own chat
-//! template ([`generate::render_prompt`], B2-13 fix-pass LEAD ITEM +
-//! cli-11): the GGUF's `tokenizer.chat_template` (or the ChatML/Qwen3
-//! fallback for a file that ships none), with `--think`/`--no-think`,
-//! `--reasoning-effort` and `--tools` applied. The reply is split on the
-//! `</think>` token id into reasoning (printed to stderr, or dropped with
-//! `--hide-reasoning`) and content, and the assistant turn is appended to
-//! the history with its `reasoning_content`, so the next turn re-renders it
-//! exactly the way the reference renderer does (golden2/apply_template.json
-//! case 4). When the rendered conversation no longer fits the context
+//! template ([`generate::render_prompt`]; cli-11): the GGUF's
+//! `tokenizer.chat_template` (or the ChatML/Qwen3 fallback for a file that
+//! ships none), with `--think`/`--no-think`, `--reasoning-effort` and
+//! `--tools` applied. The reply is split on the `</think>` token id into
+//! reasoning (printed to stderr, or dropped with `--hide-reasoning`) and
+//! content, and the assistant turn is appended to the history with its
+//! `reasoning_content`, so the next turn re-renders it exactly the way the
+//! PrismML fork's own reference renderer does for a prior assistant turn
+//! carrying reasoning content. When the rendered conversation no longer
+//! fits the context
 //! window, the oldest turns are dropped (system messages are kept).
 
 use std::io::{self, BufRead, Write};
@@ -69,17 +70,32 @@ pub(crate) struct RenderedTurn {
     pub(crate) started_in_think: bool,
     /// How many of the oldest history messages had to be dropped to fit.
     pub(crate) dropped_messages: usize,
+    /// The generation budget to actually decode with: equal to the
+    /// requested `max_tokens` unless
+    /// even dropping every droppable message left no room for the full
+    /// request, in which case it is clamped to exactly what remains (a
+    /// stderr notice was already printed) — never an error by itself, since
+    /// the PROMPT does fit.
+    pub(crate) effective_max_tokens: usize,
 }
 
 /// Render `history` through `template` under `contract` and encode it,
-/// dropping the oldest non-system messages until the prompt plus
-/// `max_tokens` fits in `max_context` (the dropped messages are removed from
-/// `history` itself, so the conversation stays consistent with what the
-/// model saw).
+/// dropping the oldest non-system messages until the rendered prompt itself
+/// fits `max_context` (a hard error once nothing more can be dropped: the
+/// graceful "context full" clamp below applies only when the prompt fits
+/// and just the requested `max_tokens` does not). The dropped messages are
+/// removed from `history` itself, so the conversation stays consistent with
+/// what the model saw.
+///
+/// When the prompt fits but `max_tokens` would still carry it past
+/// `max_context` after every droppable message is gone,
+/// [`RenderedTurn::effective_max_tokens`] is clamped to exactly what
+/// remains instead of erroring (a stderr notice is printed).
 ///
 /// # Errors
 ///
-/// A render/encode error, or a latest message that alone does not fit.
+/// A render/encode error, or the latest message ALONE (nothing left to
+/// drop) exceeding `max_context`.
 pub(crate) fn render_turn(
     tok: &oxibonsai_runtime::TokenizerBridge,
     template: &ResolvedChatTemplate,
@@ -92,29 +108,58 @@ pub(crate) fn render_turn(
     loop {
         let rendered = generate::render_prompt(template, history, contract)?;
         let tokens = tok.encode(&rendered)?;
-        if tokens.len().saturating_add(max_tokens) <= max_context {
+        let prompt_len = tokens.len();
+        let oldest = || {
+            history
+                .iter()
+                .position(|m| m.role != "system")
+                .filter(|&i| i + 1 < history.len())
+        };
+
+        if prompt_len > max_context {
+            match oldest() {
+                Some(i) => {
+                    history.remove(i);
+                    dropped += 1;
+                    continue;
+                }
+                None => anyhow::bail!(
+                    "sequence length {prompt_len} exceeds max context {max_context}: this \
+                     message alone does not fit; shorten it or raise --ctx"
+                ),
+            }
+        }
+
+        if prompt_len.saturating_add(max_tokens) <= max_context {
             return Ok(RenderedTurn {
                 tokens,
                 started_in_think: bonsai2::prompt_opens_think_block(&rendered),
                 dropped_messages: dropped,
+                effective_max_tokens: max_tokens,
             });
         }
-        // Drop the oldest non-system message; never the latest user turn.
-        let oldest = history
-            .iter()
-            .position(|m| m.role != "system")
-            .filter(|&i| i + 1 < history.len());
-        match oldest {
+        // The prompt fits, but the full requested budget would not: drop
+        // more history first (frees room for the SAME full budget); only
+        // once nothing more can be dropped does the graceful clamp apply.
+        match oldest() {
             Some(i) => {
                 history.remove(i);
                 dropped += 1;
             }
-            None => anyhow::bail!(
-                "this message is too long for the context window: the rendered prompt is {} \
-                 tokens and --max-tokens is {max_tokens}, but --ctx is {max_context}; shorten \
-                 the message, lower --max-tokens, or raise --ctx",
-                tokens.len()
-            ),
+            None => {
+                let clamped = max_context.saturating_sub(prompt_len);
+                eprintln!(
+                    "[context window full: {prompt_len} prompt token(s) + {max_tokens} \
+                     requested would exceed --ctx {max_context}; generating {clamped} more \
+                     token(s) instead]"
+                );
+                return Ok(RenderedTurn {
+                    tokens,
+                    started_in_think: bonsai2::prompt_opens_think_block(&rendered),
+                    dropped_messages: dropped,
+                    effective_max_tokens: clamped,
+                });
+            }
         }
     }
 }
@@ -176,7 +221,7 @@ pub(crate) fn run(args: ChatArgs) -> anyhow::Result<()> {
     )?;
     let sampling = cmd_run::resolve_sampling(temperature, top_k, top_p, min_p, &gguf.metadata)?;
 
-    // cli-12 / orchestrator P0 addendum: same shared constructor as `run`,
+    // cli-12: same shared constructor as `run`,
     // with the same 1.0/0.0/0.0 no-hidden-penalty defaults.
     let params = build_sampling_params(
         sampling.temperature,
@@ -192,12 +237,13 @@ pub(crate) fn run(args: ChatArgs) -> anyhow::Result<()> {
         rope_scaling,
         prefill_chunk,
         penalties: PenaltyParams::new(frequency_penalty, presence_penalty),
+        min_p: sampling.min_p,
     };
     let mut engine = cmd_run::load_engine(&gguf, &load, source.transcoded_tensors())?;
 
     // TOK-08: vocab-aware resolution + a hard compatibility check, the
     // GGUF's own template attached, the GGUF-embedded tokenizer as the
-    // fallback (ENGINE-SEAM).
+    // fallback.
     let expected_vocab = model_vocab_size(&gguf).ok();
     let lookup = resolve_tokenizer_vocab_aware(tokenizer.as_deref(), &model, expected_vocab);
     let tok = cmd_run::resolve_model_tokenizer(
@@ -238,11 +284,6 @@ pub(crate) fn run(args: ChatArgs) -> anyhow::Result<()> {
         frequency_penalty,
         presence_penalty,
     )?;
-    // Min-p needs the CLI's own sampler; it persists across turns exactly
-    // like the engine's own sampler does, so a seeded session reproduces.
-    let mut session_sampler = generate::needs_cli_sampler(sampling.temperature, sampling.min_p)
-        .then(|| cmd_run::session_sampler(&load, sampling.min_p));
-
     println!("OxiBonsai Interactive Chat (type 'quit' or Ctrl-D to exit, '/reset' to clear)");
     println!("Tip: press Ctrl-C during generation to interrupt output without exiting.");
     println!("---");
@@ -327,7 +368,7 @@ pub(crate) fn run(args: ChatArgs) -> anyhow::Result<()> {
             let count = cmd_run::run_constrained_or_stopped_with(
                 &mut engine,
                 &turn.tokens,
-                max_tokens,
+                turn.effective_max_tokens,
                 cached_grammar.as_ref(),
                 &stop,
                 Some(&tok),
@@ -345,28 +386,16 @@ pub(crate) fn run(args: ChatArgs) -> anyhow::Result<()> {
             (count, reasoning, content)
         } else {
             let mut printer = TokenPrinter::new(Some(&tok), turn.started_in_think, display, true);
-            let count = match session_sampler.as_mut() {
-                Some(sampler) => generate::decode_with_sampler(
-                    &mut engine,
-                    &turn.tokens,
-                    max_tokens,
-                    sampler,
-                    |token| {
-                        if is_interrupted() {
-                            return Ok(false);
-                        }
-                        printer.push(token)?;
-                        Ok(true)
-                    },
-                )?,
-                None => run_streaming_turn(
-                    &mut engine,
-                    &turn.tokens,
-                    max_tokens,
-                    &mut printer,
-                    &interrupted,
-                )?,
-            };
+            // The engine's own decode path applies `min_p` directly
+            // (`load_engine` already called `set_min_p` above),
+            // token-for-token identical to the former CLI sampler loop.
+            let count = run_streaming_turn(
+                &mut engine,
+                &turn.tokens,
+                turn.effective_max_tokens,
+                &mut printer,
+                &interrupted,
+            )?;
             let (reasoning, content) = printer.finish(None);
             (count, reasoning, content)
         };

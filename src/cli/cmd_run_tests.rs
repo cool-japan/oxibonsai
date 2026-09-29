@@ -224,6 +224,7 @@ fn greedy_load(backend: Backend, seed: u64, temperature: f32) -> EngineLoad {
         rope_scaling: RopeScalingMode::Auto,
         prefill_chunk: None,
         penalties: PenaltyParams::default(),
+        min_p: 0.0,
     }
 }
 
@@ -293,26 +294,20 @@ fn the_default_build_resolves_to_a_cpu_kernel_tier() {
 
 fn sampled_tokens(bytes: &[u8], seed: u64, min_p: f32) -> Vec<u32> {
     let gguf = GgufFile::parse(bytes).expect("parse");
-    let load = greedy_load(Backend::Cpu, seed, 0.8);
+    // `load_engine` applies `min_p` directly (`set_min_p`); there is no
+    // CLI-owned branch to choose between.
+    let load = EngineLoad {
+        min_p,
+        ..greedy_load(Backend::Cpu, seed, 0.8)
+    };
     let mut engine = load_engine(&gguf, &load, 0).expect("load");
     let prompt = [1u32, 2, 3];
-    let mut out = Vec::new();
-    if generate::needs_cli_sampler(0.8, min_p) {
-        let mut sampler = session_sampler(&load, min_p);
-        generate::decode_with_sampler(&mut engine, &prompt, 16, &mut sampler, |token| {
-            out.push(token);
-            Ok(true)
-        })
-        .expect("min-p decode");
-    } else {
-        let (tx, rx) = std::sync::mpsc::channel::<u32>();
-        engine
-            .generate_streaming_sync(&prompt, 16, &tx)
-            .expect("engine decode");
-        drop(tx);
-        out.extend(rx);
-    }
-    out
+    let (tx, rx) = std::sync::mpsc::channel::<u32>();
+    engine
+        .generate_streaming_sync(&prompt, 16, &tx)
+        .expect("engine decode");
+    drop(tx);
+    rx.into_iter().collect()
 }
 
 #[test]
@@ -334,6 +329,220 @@ fn the_same_seed_reproduces_a_sampled_run_and_another_seed_does_not() {
             "seed 7 vs 8 (min_p {min_p})"
         );
     }
+}
+
+// ── the engine's min-p route vs. the old CLI loop ───────────────────────────
+
+/// A test-only reference copy of the CLI's former min-p decode loop
+/// (retired from production once `InferenceEngine::set_min_p` let the
+/// engine's own decode path apply `min_p` directly).
+/// Kept ONLY here, so this comparison has an independent implementation to
+/// check the production route against; mirrors the retired
+/// `generate::decode_with_sampler`'s exact loop order (sample → EOS check →
+/// emit → record history → forward).
+fn reference_cli_min_p_decode(
+    engine: &mut oxibonsai_runtime::InferenceEngine<'_>,
+    prompt_tokens: &[u32],
+    max_tokens: usize,
+    sampler: &mut oxibonsai_runtime::sampling::Sampler,
+) -> Vec<u32> {
+    if prompt_tokens.is_empty() || max_tokens == 0 {
+        return Vec::new();
+    }
+    engine.reset();
+    let mut logits = engine.prefill_from_pos(prompt_tokens, 0).expect("prefill");
+    let mut history: Vec<u32> = Vec::new();
+    let mut out = Vec::new();
+    for (pos, _) in (prompt_tokens.len()..).zip(0..max_tokens) {
+        let token = sampler
+            .sample_with_history(&logits, &history)
+            .expect("sample");
+        if engine.is_eos(token) {
+            break;
+        }
+        out.push(token);
+        history.push(token);
+        logits = engine.decode_step(token, pos).expect("decode_step");
+    }
+    out
+}
+
+/// The production route: `load_engine` already called `set_min_p`, so a
+/// plain `generate_streaming_sync` applies `min_p` directly — exactly what
+/// `run_engine_generation` (`run`'s own decode call) does for a sampled
+/// request now.
+fn engine_min_p_decode(
+    engine: &mut oxibonsai_runtime::InferenceEngine<'_>,
+    prompt_tokens: &[u32],
+    max_tokens: usize,
+) -> Vec<u32> {
+    let (tx, rx) = std::sync::mpsc::channel::<u32>();
+    engine
+        .generate_streaming_sync(prompt_tokens, max_tokens, &tx)
+        .expect("engine decode");
+    drop(tx);
+    rx.into_iter().collect()
+}
+
+/// The engine's own decode path (`min_p` applied via `set_min_p`) is
+/// token-for-token identical to the CLI's former min-p loop, at
+/// temperature 0.8 / min_p 0.1 / 32 tokens, for seeds 1-3 — the empirical
+/// proof the CLI-owned loop was safe to retire from production. Two legs:
+/// the tiny, deterministic testkit fixture (always runs) and the real 1.7B
+/// (env-gated `OXI_MODEL`/`OXI_TOKENIZER`; `Backend::Auto`, exactly `run`'s
+/// own default, which is the fused-Metal GPU tier on this machine — the
+/// whole point of this leg is to prove the comparison holds on the SAME
+/// tier a real `oxibonsai run` actually decodes with, not only on CPU).
+#[test]
+fn min_p_engine_path_matches_the_cli_loop() {
+    const TEST: &str = "oxibonsai-cli::bin::min_p_engine_path_matches_the_cli_loop";
+
+    // Leg 1: the tiny, deterministic testkit fixture.
+    {
+        let bytes = tiny_dense_gguf(Vec::new());
+        let gguf = GgufFile::parse(&bytes).expect("parse");
+        let prompt = [1u32, 2, 3, 4, 5];
+        for seed in 1..4u64 {
+            let load = EngineLoad {
+                min_p: 0.1,
+                ..greedy_load(Backend::Cpu, seed, 0.8)
+            };
+            let mut reference_engine = load_engine(&gguf, &load, 0).expect("load reference");
+            let mut sampler =
+                generate::cli_sampler(load.params.clone(), load.seed, load.penalties, load.min_p);
+            let reference =
+                reference_cli_min_p_decode(&mut reference_engine, &prompt, 32, &mut sampler);
+
+            let mut engine_under_test = load_engine(&gguf, &load, 0).expect("load engine route");
+            let via_engine = engine_min_p_decode(&mut engine_under_test, &prompt, 32);
+
+            assert_eq!(
+                reference, via_engine,
+                "seed {seed}: the engine's min-p route must match the CLI loop exactly \
+                 (tiny fixture)"
+            );
+        }
+    }
+
+    // Leg 2: the real 1.7B (env-gated; self-skips, records LegacyModels).
+    let (Some(model), Some(tokenizer)) = (
+        test_fixtures::env_path("OXI_MODEL", "the real Ternary-Bonsai-1.7B.gguf"),
+        test_fixtures::env_path("OXI_TOKENIZER", "the real tokenizer.json"),
+    ) else {
+        oxibonsai_testkit::capability::record_skipped(
+            oxibonsai_testkit::capability::Capability::LegacyModels,
+            TEST,
+        );
+        return;
+    };
+    let _real = test_fixtures::real_model_lock();
+    let mmap = oxibonsai_core::gguf::reader::mmap_gguf_file(&model).expect("mmap");
+    let gguf = GgufFile::parse(&mmap).expect("parse");
+    let tok = oxibonsai_runtime::TokenizerBridge::from_file(&tokenizer.to_string_lossy())
+        .expect("load the real tokenizer");
+    let prompt = tok
+        .encode("The capital of Japan is")
+        .expect("encode the real prompt");
+
+    for seed in 1..4u64 {
+        let load = EngineLoad {
+            min_p: 0.1,
+            ..greedy_load(Backend::Auto, seed, 0.8)
+        };
+        let mut reference_engine = load_engine(&gguf, &load, 0).expect("load reference");
+        let mut sampler =
+            generate::cli_sampler(load.params.clone(), load.seed, load.penalties, load.min_p);
+        let reference =
+            reference_cli_min_p_decode(&mut reference_engine, &prompt, 32, &mut sampler);
+
+        let mut engine_under_test = load_engine(&gguf, &load, 0).expect("load engine route");
+        let via_engine = engine_min_p_decode(&mut engine_under_test, &prompt, 32);
+
+        assert!(
+            reference == via_engine,
+            "seed {seed}: the real 1.7B's engine min-p route diverges from the CLI loop -- \
+             first divergence at step {:?}; reference={reference:?} via_engine={via_engine:?}",
+            reference
+                .iter()
+                .zip(via_engine.iter())
+                .position(|(a, b)| a != b)
+        );
+    }
+
+    oxibonsai_testkit::capability::record_executed(
+        oxibonsai_testkit::capability::Capability::LegacyModels,
+        TEST,
+    );
+}
+
+// ── graceful "context full" stop, on the tiny GGUF ──────────────────────────
+
+/// With a small `--ctx`, [`clamp_generation_budget`]
+/// shrinks the requested budget to exactly what the context window has left
+/// after the prompt, and decoding through it — the engine path
+/// (streamed, [`run_engine_generation`]) and the buffered constrained/stop
+/// path ([`run_constrained_or_stopped_with`], with a `--stop` that never
+/// matches) alike — completes with no error and exactly `ctx - prompt_len`
+/// generated tokens: the hard `sequence length N exceeds max context M`
+/// engine error is never reached on either path. A prompt that alone
+/// overflows the context stays a hard error naming both numbers.
+#[test]
+fn clamped_generation_reaches_exactly_the_context_ceiling_on_both_decode_paths() {
+    let bytes = tiny_dense_gguf(Vec::new());
+    let gguf = GgufFile::parse(&bytes).expect("parse");
+    let prompt = [1u32, 2, 3, 4, 5];
+    let tiny_ctx_load = |seed: u64| EngineLoad {
+        max_seq_len: 16,
+        ..greedy_load(Backend::Cpu, seed, 0.0)
+    };
+
+    // The engine path: `run_engine_generation`, streamed
+    // (`InferenceEngine::generate_streaming_sync` underneath).
+    let mut engine = load_engine(&gguf, &tiny_ctx_load(42), 0).expect("load");
+    let ctx = engine.max_context();
+    let budget = clamp_generation_budget(prompt.len(), 9_999, ctx)
+        .expect("a 5-token prompt fits a 16-token context");
+    assert_eq!(budget, ctx - prompt.len());
+    let mut printer = TokenPrinter::new(None, false, ReasoningDisplay::Show, true);
+    let generated = run_engine_generation(&mut engine, &prompt, budget, false, &mut printer)
+        .expect("decode to the context ceiling must not hit the hard context-overflow error");
+    assert_eq!(
+        generated, budget,
+        "the clamped budget must be filled exactly, never stopped short"
+    );
+
+    // The buffered constrained/stop path: `run_constrained_or_stopped_with`,
+    // a fresh engine, the same clamp, and a `--stop` that never matches.
+    let mut engine = load_engine(&gguf, &tiny_ctx_load(42), 0).expect("load");
+    let ctx = engine.max_context();
+    let budget = clamp_generation_budget(prompt.len(), 9_999, ctx).expect("fits");
+    let mut printer = TokenPrinter::new(None, false, ReasoningDisplay::Show, false);
+    let generated = run_constrained_or_stopped_with(
+        &mut engine,
+        &prompt,
+        budget,
+        None,
+        &["ZZZZ_NEVER_MATCHES_THIS_STOP_XYZ".to_string()],
+        None,
+        &ConstrainedSampling {
+            params: build_sampling_params(0.0, 40, 0.9, 1.0),
+            seed: 42,
+            min_p: 0.0,
+        },
+        &mut printer,
+        &|| false,
+    )
+    .expect("the constrained/stop loop must not hit the hard context-overflow error either");
+    assert_eq!(
+        generated, budget,
+        "the constrained/stop path must also fill the clamped budget exactly"
+    );
+
+    // A prompt that alone overflows the context stays a hard error naming
+    // both numbers.
+    let err = clamp_generation_budget(20, 5, 16).expect_err("the prompt alone overflows");
+    let msg = err.to_string();
+    assert!(msg.contains("20") && msg.contains("16"), "{msg}");
 }
 
 // ── Real models (env-gated, one at a time) ──────────────────────────────────
@@ -405,9 +614,8 @@ fn a_cpu_greedy_run_reproduces_the_legacy_1_7b_greedy_golden() {
     );
 }
 
-/// Ruling R-ROPEOFF: `--rope-scaling off` reproduces the pre-YaRN
-/// Bonsai-8B prompt-3 text (the pre-session anchor), while `auto` (the
-/// default) reproduces the PrismML fork's YaRN text.
+/// `--rope-scaling off` reproduces the pre-YaRN Bonsai-8B prompt-3 text,
+/// while `auto` (the default) reproduces the PrismML fork's YaRN text.
 #[test]
 fn rope_scaling_off_reproduces_the_pre_yarn_bonsai_8b_text() {
     let Some(model) = test_fixtures::models_dir_file("Bonsai-8B.gguf") else {

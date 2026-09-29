@@ -9,14 +9,12 @@
 //! [`oxibonsai_core::GgufWriter`] for tests that need a complete, parseable
 //! GGUF file rather than raw block bytes.
 //!
-//! # Cross-crate wiring (deviation)
+//! # Cross-crate wiring
 //!
-//! See this crate's `Cargo.toml` doc comment: `oxibonsai-testkit` is not yet
-//! a registered workspace member, so the 13 pre-existing duplicate builders
-//! could not be re-pointed at this module without editing Cargo manifests
-//! outside this package's `owned_files`. That re-point is recorded as a
-//! deviation; this module is nonetheless the complete, tested, canonical
-//! implementation those call sites should adopt once the wiring lands.
+//! `oxibonsai-testkit` is a workspace member and a dev-dependency of the
+//! crates whose tests use it; any remaining hand-rolled builder elsewhere is
+//! a candidate to re-point at this module, which is the complete, tested,
+//! canonical implementation.
 
 use half::f16;
 use oxibonsai_core::tensor::{BlockQ1_0G128, QK1_0_G128};
@@ -495,10 +493,297 @@ impl Default for GgufFixtureBuilder<'_> {
     }
 }
 
+// ─── A non-degenerate tiny dense `qwen3` model ──────────────────────────────
+
+/// [`tiny_dense_qwen3_gguf`]'s dimensions, matching
+/// `oxibonsai_core::config::Qwen3Config::tiny_test()` exactly except for
+/// the vocabulary (32, not `tiny_test`'s real 151936 — small enough to
+/// keep the embedding/output tensors cheap; every other dimension is the
+/// same size).
+pub const TINY_DENSE_HIDDEN: usize = 64;
+pub const TINY_DENSE_INTERMEDIATE: usize = 128;
+pub const TINY_DENSE_LAYERS: usize = 2;
+pub const TINY_DENSE_HEADS: usize = 4;
+pub const TINY_DENSE_KV_HEADS: usize = 2;
+pub const TINY_DENSE_HEAD_DIM: usize = 16;
+pub const TINY_DENSE_VOCAB: usize = 32;
+pub const TINY_DENSE_CONTEXT: usize = 512;
+
+/// A complete, parseable, non-degenerate dense `qwen3` GGUF: every weight is
+/// [`deterministic_weights`] seeded from `seed` (never all-zero, never
+/// constant across a tensor), at [`TINY_DENSE_HIDDEN`]/[`TINY_DENSE_INTERMEDIATE`]/
+/// [`TINY_DENSE_LAYERS`]/[`TINY_DENSE_HEADS`]/[`TINY_DENSE_KV_HEADS`]/
+/// [`TINY_DENSE_HEAD_DIM`] — `Qwen3Config::tiny_test()`'s own sizes.
+///
+/// `Qwen3Config::tiny_test()` combined with an all-zero-weight model (e.g.
+/// `BonsaiModel::new`, which leaves `blocks` empty) produces an all-zero
+/// logit vector, under which a logit-shape setting such as a repetition
+/// penalty is the identity on every logit and so cannot be observed to do
+/// anything. This fixture, loaded through the real `BonsaiModel::from_gguf`,
+/// gives such a test real, moving logits to check a setting against instead.
+///
+/// Every 2-D weight matrix is [`FixtureQuant::Q8_0`] (32-element row
+/// groups): [`FixtureQuant::TQ2_0_g128`]/[`FixtureQuant::Q1_0G128`] need a
+/// row length that is a whole multiple of 128, which [`TINY_DENSE_HIDDEN`]
+/// (64) does not satisfy. The 1-D norm vectors stay [`FixtureQuant::F32`].
+///
+/// # Errors
+/// Propagates [`FixtureError`] from an underlying [`GgufFixtureBuilder::tensor`]
+/// call (e.g. an unsupported quant/writer mismatch) or from
+/// [`GgufFixtureBuilder::build`] (e.g. a duplicate tensor name).
+pub fn tiny_dense_qwen3_gguf(seed: u64) -> Result<Vec<u8>, FixtureError> {
+    let h = TINY_DENSE_HIDDEN;
+    let inter = TINY_DENSE_INTERMEDIATE;
+    let nq = TINY_DENSE_HEADS;
+    let nkv = TINY_DENSE_KV_HEADS;
+    let hd = TINY_DENSE_HEAD_DIM;
+    let vocab = TINY_DENSE_VOCAB;
+
+    let mut b = GgufFixtureBuilder::new();
+    b.metadata_str("general.architecture", "qwen3");
+    b.metadata_str("general.name", "testkit-tiny-dense-qwen3");
+    b.metadata_u32("qwen3.embedding_length", h as u32);
+    b.metadata_u32("qwen3.block_count", TINY_DENSE_LAYERS as u32);
+    b.metadata_u32("qwen3.attention.head_count", nq as u32);
+    b.metadata_u32("qwen3.attention.head_count_kv", nkv as u32);
+    b.metadata_u32("qwen3.attention.key_length", hd as u32);
+    b.metadata_u32("qwen3.attention.value_length", hd as u32);
+    b.metadata_u32("qwen3.feed_forward_length", inter as u32);
+    b.metadata_u32("qwen3.vocab_size", vocab as u32);
+    b.metadata_u32("qwen3.context_length", TINY_DENSE_CONTEXT as u32);
+    b.metadata_f32("qwen3.attention.layer_norm_rms_epsilon", 1e-6);
+    b.metadata_f32("qwen3.rope.freq_base", 10_000.0);
+
+    // A distinct seed per tensor, deterministically derived from `seed`, so
+    // no two tensors are byte-identical copies of each other.
+    let mut state = seed ^ 0x7151_7151_7151_7151;
+    let mut next_seed = move || {
+        state = state.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+        state
+    };
+
+    b.tensor(
+        "token_embd.weight",
+        &[h as u64, vocab as u64],
+        FixtureQuant::Q8_0,
+        next_seed(),
+    )?;
+    b.tensor(
+        "output_norm.weight",
+        &[h as u64],
+        FixtureQuant::F32,
+        next_seed(),
+    )?;
+    b.tensor(
+        "output.weight",
+        &[h as u64, vocab as u64],
+        FixtureQuant::Q8_0,
+        next_seed(),
+    )?;
+
+    for layer in 0..TINY_DENSE_LAYERS {
+        let pfx = format!("blk.{layer}");
+        for name in ["attn_norm.weight", "ffn_norm.weight"] {
+            b.tensor(
+                &format!("{pfx}.{name}"),
+                &[h as u64],
+                FixtureQuant::F32,
+                next_seed(),
+            )?;
+        }
+        for name in ["attn_q_norm.weight", "attn_k_norm.weight"] {
+            b.tensor(
+                &format!("{pfx}.{name}"),
+                &[hd as u64],
+                FixtureQuant::F32,
+                next_seed(),
+            )?;
+        }
+        b.tensor(
+            &format!("{pfx}.attn_q.weight"),
+            &[h as u64, (nq * hd) as u64],
+            FixtureQuant::Q8_0,
+            next_seed(),
+        )?;
+        b.tensor(
+            &format!("{pfx}.attn_k.weight"),
+            &[h as u64, (nkv * hd) as u64],
+            FixtureQuant::Q8_0,
+            next_seed(),
+        )?;
+        b.tensor(
+            &format!("{pfx}.attn_v.weight"),
+            &[h as u64, (nkv * hd) as u64],
+            FixtureQuant::Q8_0,
+            next_seed(),
+        )?;
+        b.tensor(
+            &format!("{pfx}.attn_output.weight"),
+            &[(nq * hd) as u64, h as u64],
+            FixtureQuant::Q8_0,
+            next_seed(),
+        )?;
+        b.tensor(
+            &format!("{pfx}.ffn_gate.weight"),
+            &[h as u64, inter as u64],
+            FixtureQuant::Q8_0,
+            next_seed(),
+        )?;
+        b.tensor(
+            &format!("{pfx}.ffn_up.weight"),
+            &[h as u64, inter as u64],
+            FixtureQuant::Q8_0,
+            next_seed(),
+        )?;
+        b.tensor(
+            &format!("{pfx}.ffn_down.weight"),
+            &[inter as u64, h as u64],
+            FixtureQuant::Q8_0,
+            next_seed(),
+        )?;
+    }
+    b.build()
+}
+
+// ─── In-place patch of one metadata value in a real GGUF image ──────────────
+
+/// GGUF's type tag for a `FLOAT32` metadata value.
+const GGUF_METADATA_TYPE_FLOAT32: u32 = 6;
+
+/// Overwrite one `FLOAT32` metadata value of a GGUF file image in place,
+/// changing nothing else — how a real-model test builds a counterpart of a
+/// shipped file that differs in exactly one hyperparameter (e.g.
+/// `qwen3.rope.scaling.factor` 4.0 -> 1.0 on `Bonsai-8B.gguf`), since a
+/// parsed `GgufFile`'s metadata store has no mutator.
+///
+/// A GGUF metadata key is a `u64` little-endian byte length followed by the
+/// key bytes with no terminator, then a `u32` type tag, then the value. The
+/// key is located by its literal bytes, and nothing is written unless every
+/// check passes: the key occurs exactly once in the whole image, the 8 bytes
+/// before it are a `u64` equal to its length, the tag after it is `FLOAT32`,
+/// and the current value equals `expected` exactly.
+///
+/// # Errors
+///
+/// A description of the first check that failed.
+pub fn patch_gguf_f32_metadata(
+    bytes: &mut [u8],
+    key: &str,
+    expected: f32,
+    replacement: f32,
+) -> Result<(), String> {
+    let needle = key.as_bytes();
+    if needle.is_empty() {
+        return Err("empty metadata key".to_string());
+    }
+    let occurrences: Vec<usize> = bytes
+        .windows(needle.len())
+        .enumerate()
+        .filter_map(|(i, window)| (window == needle).then_some(i))
+        .collect();
+    let [key_offset] = occurrences[..] else {
+        return Err(format!(
+            "expected exactly one occurrence of the key {key:?} in the GGUF image, found {} \
+             -- refusing to patch blind",
+            occurrences.len()
+        ));
+    };
+
+    let length_prefix: [u8; 8] = key_offset
+        .checked_sub(8)
+        .and_then(|start| bytes.get(start..key_offset))
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or_else(|| format!("{key:?} sits too close to the start of the image"))?;
+    let declared_len = u64::from_le_bytes(length_prefix);
+    if declared_len != needle.len() as u64 {
+        return Err(format!(
+            "the 8 bytes before {key:?} read {declared_len}, not its length {} -- not a \
+             metadata key at this offset",
+            needle.len()
+        ));
+    }
+
+    let tag_offset = key_offset + needle.len();
+    let tag: [u8; 4] = bytes
+        .get(tag_offset..tag_offset + 4)
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or_else(|| format!("{key:?} is truncated before its type tag"))?;
+    let tag = u32::from_le_bytes(tag);
+    if tag != GGUF_METADATA_TYPE_FLOAT32 {
+        return Err(format!(
+            "{key:?} has type tag {tag}, not FLOAT32 ({GGUF_METADATA_TYPE_FLOAT32})"
+        ));
+    }
+
+    let value_offset = tag_offset + 4;
+    let value_slot = bytes
+        .get_mut(value_offset..value_offset + 4)
+        .ok_or_else(|| format!("{key:?} is truncated before its value"))?;
+    let mut current = [0u8; 4];
+    current.copy_from_slice(value_slot);
+    let current = f32::from_le_bytes(current);
+    if current.to_bits() != expected.to_bits() {
+        return Err(format!(
+            "{key:?} currently holds {current}, not the expected {expected}"
+        ));
+    }
+    value_slot.copy_from_slice(&replacement.to_le_bytes());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use oxibonsai_core::gguf::reader::GgufFile;
+
+    #[test]
+    fn patch_gguf_f32_metadata_changes_exactly_the_one_value() {
+        const KEY: &str = "qwen3.rope.scaling.factor";
+        let original = GgufFixtureBuilder::new()
+            .metadata_str("general.architecture", "qwen3")
+            .metadata_f32(KEY, 4.0)
+            .metadata_f32("qwen3.rope.freq_base", 1_000_000.0)
+            .tensor("output_norm.weight", &[8], FixtureQuant::F32, 3)
+            .expect("add tensor")
+            .build()
+            .expect("build gguf");
+
+        let mut patched = original.clone();
+        patch_gguf_f32_metadata(&mut patched, KEY, 4.0, 1.0).expect("patch the factor");
+
+        let gguf = GgufFile::parse(&patched).expect("the patched image still parses");
+        assert_eq!(gguf.metadata.get_f32(KEY).expect("factor"), 1.0);
+        assert_eq!(
+            gguf.metadata
+                .get_f32("qwen3.rope.freq_base")
+                .expect("freq_base"),
+            1_000_000.0,
+            "a neighbouring value must be untouched"
+        );
+        let changed = original
+            .iter()
+            .zip(&patched)
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(
+            (1..=4).contains(&changed),
+            "only the value's own 4 bytes may change, {changed} bytes did"
+        );
+    }
+
+    #[test]
+    fn patch_gguf_f32_metadata_refuses_a_wrong_expectation_or_type() {
+        let mut bytes = GgufFixtureBuilder::new()
+            .metadata_f32("a.float", 2.0)
+            .metadata_u32("a.int", 7)
+            .build()
+            .expect("build gguf");
+        let pristine = bytes.clone();
+        assert!(patch_gguf_f32_metadata(&mut bytes, "a.float", 3.0, 1.0).is_err());
+        assert!(patch_gguf_f32_metadata(&mut bytes, "a.int", 7.0, 1.0).is_err());
+        assert!(patch_gguf_f32_metadata(&mut bytes, "a.missing", 1.0, 2.0).is_err());
+        assert_eq!(bytes, pristine, "a refused patch must write nothing");
+    }
 
     #[test]
     fn deterministic_weights_are_reproducible_and_bounded() {
@@ -521,6 +806,58 @@ mod tests {
         assert!(
             w.iter().any(|&x| x != first),
             "a real PRNG must not produce a constant sequence"
+        );
+    }
+
+    #[test]
+    fn tiny_dense_qwen3_gguf_builds_and_parses() {
+        let bytes = tiny_dense_qwen3_gguf(0xD1_5E).expect("build tiny dense qwen3 gguf");
+        assert!(bytes.starts_with(b"GGUF"));
+        let gguf = GgufFile::parse(&bytes).expect("parse tiny dense qwen3 gguf");
+        assert_eq!(
+            gguf.metadata
+                .get_string("general.architecture")
+                .expect("general.architecture"),
+            "qwen3"
+        );
+        // Every layer's tensors are present.
+        for layer in 0..TINY_DENSE_LAYERS {
+            for suffix in [
+                "attn_norm.weight",
+                "ffn_norm.weight",
+                "attn_q_norm.weight",
+                "attn_k_norm.weight",
+                "attn_q.weight",
+                "attn_k.weight",
+                "attn_v.weight",
+                "attn_output.weight",
+                "ffn_gate.weight",
+                "ffn_up.weight",
+                "ffn_down.weight",
+            ] {
+                let name = format!("blk.{layer}.{suffix}");
+                assert!(gguf.tensors.require(&name).is_ok(), "missing tensor {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn tiny_dense_qwen3_gguf_is_deterministic_and_not_all_zero() {
+        let a = tiny_dense_qwen3_gguf(0xD1_5E).expect("build a");
+        let b = tiny_dense_qwen3_gguf(0xD1_5E).expect("build b");
+        assert_eq!(a, b, "same seed must reproduce byte-identical output");
+        let c = tiny_dense_qwen3_gguf(0xD1_5F).expect("build c");
+        assert_ne!(a, c, "different seeds should not collide");
+
+        // The embedding tensor's raw bytes must not be all-zero — the
+        // degenerate case this fixture exists to avoid.
+        let gguf = GgufFile::parse(&a).expect("parse");
+        let info = gguf.tensors.require("token_embd.weight").expect("tensor");
+        let start = gguf.data_offset + info.offset as usize;
+        let row_bytes = TensorType::F32.row_bytes(&info.shape) as usize;
+        assert!(
+            a[start..start + row_bytes].iter().any(|&byte| byte != 0),
+            "token_embd.weight must not be all-zero bytes"
         );
     }
 

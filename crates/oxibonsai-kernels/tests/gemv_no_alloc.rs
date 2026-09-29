@@ -102,6 +102,16 @@
 //! reuse. The thread-local `KQUANT_ROW_SCRATCH` path this test was written for
 //! (`gemv_kquant_row_parallel`) is the non-AArch64 branch, and the driver is
 //! `pub(crate)`, so an integration test cannot call it directly on this host.
+//!
+//! ## `OXIBONSAI_KERNEL_TIER` (K-14)
+//!
+//! The opt-in INT8 dot-product tier quantizes its activation once per
+//! GEMV/GEMM call, an allocation this file's whole premise asserts is zero.
+//! [`TierEnvGuard::cleared`] therefore clears the variable for this
+//! process's one test, so an ambient shell export cannot turn the
+//! zero-allocation assertion into a false failure, and the gate proves the
+//! guard actually works by exporting `OXIBONSAI_KERNEL_TIER=neon-dot` around
+//! this binary anyway.
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -115,7 +125,51 @@ use oxibonsai_core::{
     BlockFP8E4M3, BlockFP8E5M2, BlockQ1_0G128, BlockQ4K, BlockQ4_0, BlockQ6K, BlockQ8K, BlockQ8_0,
     BlockTQ2_0_g128,
 };
+use oxibonsai_kernels::dispatch_int8::KERNEL_TIER_ENV;
 use oxibonsai_kernels::{cpu_kernel_tier, KernelDispatcher, PlatformProfile};
+
+/// Serializes this binary's own access to `OXIBONSAI_KERNEL_TIER`; mirrors
+/// `cross_backend_determinism_tests.rs`'s `TierEnvGuard` /
+/// `int8_tier_parity.rs`'s `EnvGuard` in the same crate. This file has a
+/// single `#[test]`, so nothing else in-process can race it today, but the
+/// guard is still process-wide (not merely a local snapshot) so it stays
+/// correct if a second test is ever added here.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// RAII owner of `OXIBONSAI_KERNEL_TIER` for one test: takes [`ENV_LOCK`],
+/// snapshots and clears the variable, and restores the snapshot on drop —
+/// also while unwinding from a failed assertion.
+struct TierEnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    prior: Option<String>,
+}
+
+impl TierEnvGuard {
+    fn cleared() -> Self {
+        let lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = std::env::var(KERNEL_TIER_ENV).ok();
+        // SAFETY: `lock` is held for the lifetime of the returned guard and
+        // serializes every reader/writer of the variable in this binary.
+        unsafe {
+            std::env::remove_var(KERNEL_TIER_ENV);
+        }
+        Self { _lock: lock, prior }
+    }
+}
+
+impl Drop for TierEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: `self._lock` is held for the entire body of `drop`.
+        unsafe {
+            match &self.prior {
+                Some(v) => std::env::set_var(KERNEL_TIER_ENV, v),
+                None => std::env::remove_var(KERNEL_TIER_ENV),
+            }
+        }
+    }
+}
 
 // ── counting global allocator ───────────────────────────────────────────────
 
@@ -655,6 +709,13 @@ fn warm_then_measure(paths: &mut [Path]) -> Vec<(String, Measurement)> {
 
 #[test]
 fn gemv_call_paths_do_not_allocate_after_warmup() {
+    // Clear the tier selector for this test's whole run — see the
+    // module doc's `OXIBONSAI_KERNEL_TIER` section. Held for the entire
+    // test, not just the measured windows, so a concurrent mutation from
+    // elsewhere in this process (there is none today; see `ENV_LOCK`'s doc)
+    // could never straddle a `warm_then_measure` call.
+    let _env = TierEnvGuard::cleared();
+
     assert_instrument_is_armed();
 
     let thresholds = PlatformProfile::global_thresholds();

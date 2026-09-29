@@ -3,23 +3,20 @@
 //!
 //! Centralizes two allowlists both `cmd_info` and `cmd_validate` need to
 //! close the "fabricated architecture" / "false `Validation: OK`" defects
-//! (cli-02, gatekeeper REQUIRED #1):
+//! (cli-02):
 //!
-//! * [`is_known_language_model_architecture`] — until B2-02 lands a shared,
-//!   required-key config with its own architecture allowlist, this is this
-//!   package's own interim allowlist of `general.architecture` values that
-//!   name an actual language model (as opposed to e.g. a `clip` vision
-//!   projector GGUF). Keep this in sync with B2-02's allowlist once it
-//!   lands (recorded in this package's `deviations`).
+//! * [`is_known_language_model_architecture`] — an interim allowlist of
+//!   `general.architecture` values that name an actual language model (as
+//!   opposed to e.g. a `clip` vision projector GGUF), pending a shared,
+//!   required-key config with its own architecture allowlist elsewhere in
+//!   the workspace.
 //! * [`unsupported_tensor_types`] — mirrors the tensor types
 //!   `oxibonsai_model`'s weight loader actually has a load arm for, which is
 //!   narrower than `GgufTensorType::is_executable()` (a parser-level "the
 //!   format is a known id" check that currently reports `true` for ids the
-//!   model loader cannot yet run end-to-end, e.g. PQ2_0/PTQ1_0 ahead of
-//!   B2-09 landing their loaders in wave 3). A shared
-//!   `oxibonsai_model::supported_tensor_types()` would remove this
-//!   duplication; recorded as a deviation since `oxibonsai-model` is not in
-//!   this package's `owned_files`.
+//!   model loader cannot yet run end-to-end, e.g. PQ2_0/PTQ1_0 before their
+//!   loaders landed). A shared `oxibonsai_model::supported_tensor_types()`
+//!   would remove this duplication.
 //!
 //! Also carries the resolved quant-variant + kernel-tier summary line
 //! `run`/`chat` print after loading the engine (cli-16), and the
@@ -31,7 +28,7 @@ use oxibonsai_core::gguf::metadata::{MetadataStore, MetadataValue};
 use oxibonsai_core::GgufTensorType;
 
 // ──────────────────────────────────────────────────────────────────────────
-// Architecture allowlist (cli-02 / gatekeeper REQUIRED #1)
+// Architecture allowlist (cli-02)
 // ──────────────────────────────────────────────────────────────────────────
 
 /// `general.architecture` values this build recognises as an actual
@@ -45,20 +42,18 @@ pub(crate) fn is_known_language_model_architecture(arch: &str) -> bool {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Tensor-type "actually loadable" allowlist (cli-02 / gatekeeper REQUIRED #1)
+// Tensor-type "actually loadable" allowlist (cli-02)
 // ──────────────────────────────────────────────────────────────────────────
 
 /// Tensor types `oxibonsai_model`'s weight loader has an actual load arm
 /// for today. Mirrors `crates/oxibonsai-model/src/model/weight_loaders.rs`'s
-/// match arms -- that file IS in this package's `owned_files` (B2-09 owns
-/// it for the wave-3 kernel-dispatch/loader integration), so this list is
-/// kept in sync directly rather than as an external reference — NOT the
-/// same set as `GgufTensorType::is_executable()`, see the module doc.
+/// match arms, kept in sync by hand rather than as an external reference
+/// since that file lives in a different crate — NOT the same set as
+/// `GgufTensorType::is_executable()`, see the module doc.
 pub(crate) const MODEL_LOADABLE_TENSOR_TYPES: &[GgufTensorType] = &[
     GgufTensorType::F32,
     GgufTensorType::F16,
-    // Gatekeeper REQUIRED #4 (waves 2+2.5 review): `weight_loaders.rs`
-    // (owned by this package) loads BF16 on both the flat-tensor path
+    // `weight_loaders.rs` loads BF16 on both the flat-tensor path
     // (`dequant_any`'s BF16 arm) and the output/LM-head path
     // (`load_output_weight`'s `F32 | F16 | BF16` arm), so omitting it here
     // made `oxibonsai validate`/`info` print "no load path in this build:
@@ -66,7 +61,7 @@ pub(crate) const MODEL_LOADABLE_TENSOR_TYPES: &[GgufTensorType] = &[
     GgufTensorType::BF16,
     GgufTensorType::Q1_0_g128,
     GgufTensorType::TQ2_0_g128,
-    // B2-09: `weight_loaders.rs::load_transformer_block` now has real
+    // `weight_loaders.rs::load_transformer_block` has real
     // `Linear{PQ2_0,PTQ1_0,Q2_0G64}` arms for these four RESOLVED types
     // (`Q2_0G128DFirst` is the PrismML gen-1 reading of ambiguous ggml id
     // 42, wire-identical to `PQ2_0`; `Q2_0G64` is the mainline group-64
@@ -191,9 +186,8 @@ pub(crate) fn display_arch_scoped_u32(
 ///
 /// Printed by the CLI itself rather than relying solely on the runtime's
 /// `"inference engine loaded from GGUF kernel=..."` log line
-/// (`oxibonsai-runtime/src/engine.rs`, not in this package's `owned_files`),
-/// which still hardcodes the 1-bit family name in that label — see this
-/// package's `deviations`.
+/// (`oxibonsai-runtime/src/engine.rs`), which still hardcodes the 1-bit
+/// family name in that label.
 pub(crate) fn resolved_engine_summary(
     variant_name: &str,
     dominant_quant_type: oxibonsai_core::GgufTensorType,
@@ -207,7 +201,7 @@ pub(crate) fn resolved_engine_summary(
 }
 
 /// The summary line `run`/`chat`/`benchmark` print and `serve` logs after
-/// building an engine (cli-16 / REQUIRED #14), from the ENGINE's own
+/// building an engine (cli-16), from the ENGINE's own
 /// accessors: the resolved variant (the hybrid model's own detection, or
 /// `BonsaiModel::variant()` — never the raw parse-time tensor type, which
 /// named the 27B "Custom"), the resolved dominant quant type, the effective
@@ -233,7 +227,7 @@ pub(crate) fn engine_summary(engine: &oxibonsai_runtime::InferenceEngine<'_>) ->
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Truthful `qwen35` hybrid report (wave-4b addendum, REQUIRED #2)
+// Truthful `qwen35` hybrid report
 // ──────────────────────────────────────────────────────────────────────────
 
 /// The `prism.hadamard.*` contract a Bonsai 2 file declares.
@@ -538,13 +532,12 @@ fn build_features() -> Vec<(&'static str, bool)> {
 /// (independent of which one the CPU it happens to run on actually uses —
 /// see [`print_build_info`]'s "Detected runtime tier" line for that).
 ///
-/// Gatekeeper REQUIRED #13 (waves 3+3.5 review): `simd-neon`/`simd-avx2`/
-/// `simd-avx512` are empty Cargo features in
+/// `simd-neon`/`simd-avx2`/`simd-avx512` are empty Cargo features in
 /// `crates/oxibonsai-kernels/Cargo.toml` — zero `cfg(feature =
 /// "simd-...")` anywhere in that crate gates on them — so a build-info line
-/// keyed on those features always printed `simd-neon: off` on a real M3
-/// even though `KernelDispatcher::auto_detect()` picks NEON there every
-/// time. The real selection is `target_arch`-based
+/// keyed on those features would print `simd-neon: off` on a real M3 even
+/// though `KernelDispatcher::auto_detect()` picks NEON there every time.
+/// The real selection is `target_arch`-based
 /// (`oxibonsai-kernels/src/dispatch.rs`'s `cpu_tier()`: NEON is
 /// unconditionally available on `aarch64`, and AVX2/AVX512 are attempted
 /// unconditionally on `x86_64` via runtime `is_x86_feature_detected!`, with
@@ -569,9 +562,8 @@ fn compiled_kernel_tiers() -> Vec<&'static str> {
 /// RUNTIME rather than baked in by a `build.rs`.
 ///
 /// A `build.rs` would report the commit the binary was *compiled* from
-/// (the more correct answer) but is a new file outside this package's
-/// `owned_files` this wave; recorded in `deviations`. This runtime
-/// fallback instead reports the checkout the binary happens to be *run*
+/// (the more correct answer), but that is a larger change than this runtime
+/// fallback, which instead reports the checkout the binary happens to be *run*
 /// from — the right answer for `cargo run`/a workspace binary invoked from
 /// the repo root, but not necessarily meaningful after `cargo install`
 /// (which ships no `.git` at all) or when run from an unrelated directory.
@@ -605,12 +597,10 @@ mod tests {
         assert!(!is_known_language_model_architecture("llama"));
     }
 
-    /// B2-09 landed real `weight_loaders.rs` loaders for PTQ1_0/PQ2_0/
-    /// Q2_0G64/Q2_0G128DFirst (see
-    /// `prism_ternary_family_is_not_flagged_unsupported` below), so this
-    /// test -- which used to assert PTQ1_0 was flagged unsupported, true
-    /// only *before* those loaders landed -- now uses mainline `TQ2_0`
-    /// (ggml id 35) as its still-genuinely-unsupported example:
+    /// `weight_loaders.rs` has real loaders for PTQ1_0/PQ2_0/Q2_0G64/
+    /// Q2_0G128DFirst (see `prism_ternary_family_is_not_flagged_unsupported`
+    /// below), so this test uses mainline `TQ2_0` (ggml id 35) as its
+    /// still-genuinely-unsupported example:
     /// `weight_loaders.rs` can `dequant_any` it but has no
     /// transformer-block/output-projection `Linear*` wrapper for it in any
     /// build.
@@ -631,7 +621,7 @@ mod tests {
         assert!(unsupported_tensor_types(&counts).is_empty());
     }
 
-    /// Gatekeeper REQUIRED #4: BF16 is loaded by `weight_loaders.rs`'s
+    /// BF16 is loaded by `weight_loaders.rs`'s
     /// `dequant_any`/`load_output_weight` (`ssm_alpha`/`ssm_beta` flat
     /// tensors and an FP32-widened output/LM-head), so it must not be
     /// reported as unsupported.
@@ -643,11 +633,10 @@ mod tests {
         assert!(MODEL_LOADABLE_TENSOR_TYPES.contains(&GgufTensorType::BF16));
     }
 
-    /// B2-09 blocking fix: `weight_loaders.rs::load_transformer_block` gained
-    /// real arms for the four RESOLVED ambiguous-id-42 / PrismML PQ2_0
-    /// family types this wave, so none of them may be reported as
-    /// unsupported (a Bonsai-2 27B PQ2_0/PTQ1_0 file must not print "no
-    /// load path in this build: PQ2_0").
+    /// `weight_loaders.rs::load_transformer_block` has real arms for the
+    /// four RESOLVED ambiguous-id-42 / PrismML PQ2_0 family types, so none
+    /// of them may be reported as unsupported (a Bonsai-2 27B PQ2_0/PTQ1_0
+    /// file must not print "no load path in this build: PQ2_0").
     #[test]
     fn prism_ternary_family_is_not_flagged_unsupported() {
         let mut counts = HashMap::new();
@@ -725,8 +714,8 @@ mod tests {
         );
     }
 
-    /// Gatekeeper REQUIRED #13: `compiled_kernel_tiers` must report the
-    /// tier this architecture actually gets from `dispatch.rs::cpu_tier()`,
+    /// `compiled_kernel_tiers` must report the tier this architecture
+    /// actually gets from `dispatch.rs::cpu_tier()`,
     /// not the dead `simd-neon`/`simd-avx2`/`simd-avx512` Cargo features
     /// (which have no `cfg(feature = "simd-...")` anywhere real).
     #[test]

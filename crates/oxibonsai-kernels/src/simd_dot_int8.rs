@@ -350,6 +350,14 @@ mod neon {
     /// `[w0.x0, w0.x1, w1.x0, w1.x1]` — lane 1 is *weight row 0 against
     /// activation row 1*.
     ///
+    /// This is the per-block reference the crate's own unit test,
+    /// `neon_i8mm_2x2_tile_matches_four_scalar_dots`, pins against four
+    /// independent scalar dots (one per weight/activation-row pair) —
+    /// production uses [`mmla_pair_block`]'s wider, block-major-panel tiling
+    /// instead of this exact call shape, so nothing else calls this
+    /// function directly. Kept, not deleted, because it is what that test
+    /// verifies the lane layout (`A[i].B[j]` in lane `2*i + j`) against.
+    ///
     /// # Safety
     /// The host must support `i8mm`; `qs0`/`qs1` must be whole 16-byte
     /// groups and each `act` must hold `qs0.len() * 4` codes.

@@ -3,21 +3,24 @@
 //! Decode routing (every path honours `--backend`):
 //!
 //! * `--grammar` / `--stop` → [`run_constrained_or_stopped`], a buffered
-//!   token-by-token loop sampling with the CLI's own [`Sampler`] (or the
-//!   grammar-constrained chain, which includes min-p).
-//! * a sampled request with `--min-p > 0` → the CLI-owned
-//!   [`generate::decode_with_sampler`] loop (the engine has no min-p setter).
-//! * everything else → the engine's own `generate_streaming_sync` /
-//!   `generate`, which route a temperature-0, penalty-free request through
-//!   the GPU argmax **only** when `InferenceEngine::greedy_gpu_eligible`
-//!   holds — i.e. only on a fused-Metal *GPU-tier* engine. The CLI no longer
-//!   has a greedy-GPU shortcut of its own: that shortcut ignored
-//!   `--backend cpu` and decoded a CPU-tier engine against the GPU-resident
-//!   KV cache (garbage output), and it was also the last reason for this file
-//!   to gate on the `metal` Cargo feature (cli-09).
+//!   token-by-token loop sampling with the CLI's own
+//!   [`oxibonsai_runtime::sampling::Sampler`] (or the grammar-constrained
+//!   chain, which includes min-p).
+//! * everything else (including a sampled request with `--min-p > 0`) →
+//!   the engine's own `generate_streaming_sync` / `generate`
+//!   ([`run_engine_generation`]), which applies `--min-p` directly
+//!   (`InferenceEngine::set_min_p`, applied once at construction —
+//!   [`load_engine`]) and routes a temperature-0, penalty-free
+//!   request through the GPU argmax **only** when
+//!   `InferenceEngine::greedy_gpu_eligible` holds — i.e. only on a
+//!   fused-Metal *GPU-tier* engine. The CLI no longer has a greedy-GPU
+//!   shortcut of its own: that shortcut ignored `--backend cpu` and decoded
+//!   a CPU-tier engine against the GPU-resident KV cache (garbage output),
+//!   and it was also the last reason for this file to gate on the `metal`
+//!   Cargo feature (cli-09).
 
 use oxibonsai_runtime::config::RenderMessage;
-use oxibonsai_runtime::sampling::{PenaltyParams, Sampler, SamplingParams};
+use oxibonsai_runtime::sampling::{PenaltyParams, SamplingParams};
 
 use super::args;
 use super::bonsai2;
@@ -26,12 +29,13 @@ use super::model_desc;
 use super::model_source::ModelSource;
 use super::tokenizer_backend::{self, TokenizerBackendChoice};
 use super::util::{
-    build_sampling_params, check_tokenizer_model_compatibility, missing_tokenizer_warning,
-    model_vocab_size, read_prompt_stdin, reject_penalties_with_constrained_decode,
-    resolve_tokenizer_vocab_aware, validated, StopChecker, TokenizerLookup,
+    build_sampling_params, check_tokenizer_model_compatibility, clamp_generation_budget,
+    missing_tokenizer_warning, model_vocab_size, read_prompt_stdin,
+    reject_penalties_with_constrained_decode, resolve_tokenizer_vocab_aware, validated,
+    StopChecker, TokenizerLookup,
 };
 
-/// Attach the GGUF's own chat template to `tok` (B2-13 fix-pass LEAD ITEM):
+/// Attach the GGUF's own chat template to `tok`:
 /// every production deployment must render prompts through the SHIPPED
 /// model's template, not always the hardcoded ChatML fallback.
 /// `ResolvedChatTemplate::from_gguf` falls back to the built-in ChatML/Qwen3
@@ -47,7 +51,7 @@ pub(crate) fn attach_gguf_chat_template(
 }
 
 /// Where a resolved chat template came from, for the info log (the choice
-/// must be visible: B2-13 fix-pass LEAD ITEM).
+/// must be visible).
 pub(crate) fn chat_template_source(
     template: &oxibonsai_runtime::config::ResolvedChatTemplate,
 ) -> &'static str {
@@ -68,10 +72,10 @@ fn log_chat_template_source(template: &oxibonsai_runtime::config::ResolvedChatTe
     );
 }
 
-/// REQUIRED #8's context guard plus the `--rope-scaling` pre-flight check,
-/// run once the GGUF is parsed and before any weights are touched. Returns
-/// the resolved `max_seq_len` (the explicit value, or the per-architecture
-/// default: 8192 for `qwen35`, 4096 otherwise).
+/// The context guard (design §5.6 / Appendix A.3) plus the `--rope-scaling`
+/// pre-flight check, run once the GGUF is parsed and before any weights are
+/// touched. Returns the resolved `max_seq_len` (the explicit value, or the
+/// per-architecture default: 8192 for `qwen35`, 4096 otherwise).
 ///
 /// `weight_bytes` is what the weights occupy (the file, or a
 /// `--ptq1-transcode` image). Shared by `run`, `chat` and `serve`.
@@ -162,11 +166,16 @@ pub(crate) struct EngineLoad {
     pub(crate) rope_scaling: oxibonsai_runtime::config::RopeScalingMode,
     pub(crate) prefill_chunk: Option<usize>,
     pub(crate) penalties: PenaltyParams,
+    /// The resolved `--min-p`: the engine's own decode path applies it
+    /// directly (`InferenceEngine::set_min_p`), so `run`/`chat` need no
+    /// separate CLI-owned sampler loop for a sampled request with
+    /// `min_p > 0`.
+    pub(crate) min_p: f32,
 }
 
 /// Build the engine (honouring `--backend` and `--rope-scaling`), apply
-/// `--prefill-chunk` and the penalties, and print the resolved-engine
-/// summary line (cli-16 / REQUIRED #14: from the engine's own accessors).
+/// `--prefill-chunk`, the penalties and `--min-p`, and print the
+/// resolved-engine summary line (cli-16: from the engine's own accessors).
 ///
 /// # Errors
 ///
@@ -186,6 +195,7 @@ pub(crate) fn load_engine<'a>(
     )?;
     bonsai2::apply_prefill_chunk(&mut engine, load.prefill_chunk)?;
     engine.set_penalties(load.penalties);
+    engine.set_min_p(load.min_p);
     let mut summary = model_desc::engine_summary(&engine);
     if transcoded_tensors > 0 {
         summary.push_str(&format!(
@@ -217,8 +227,9 @@ pub(crate) struct RunArgs {
     pub(crate) frequency_penalty: f32,
     pub(crate) presence_penalty: f32,
     pub(crate) seed: u64,
-    /// REQUIRED #8: `None` = the per-architecture default, applied (and
-    /// guarded) once the model is parsed.
+    /// The context guard's default (design §5.6 / Appendix A.3): `None` =
+    /// the per-architecture default, applied (and guarded) once the model
+    /// is parsed.
     pub(crate) max_seq_len: Option<usize>,
     pub(crate) tokenizer: Option<String>,
     pub(crate) tokenizer_backend: TokenizerBackendChoice,
@@ -351,7 +362,7 @@ pub(crate) fn run(args: RunArgs) -> anyhow::Result<()> {
         "resolved inference"
     );
 
-    // The shared constructor (orchestrator P0 addendum): `--temperature 0`
+    // The shared constructor: `--temperature 0`
     // means exactly argmax on every backend — no hidden penalty.
     let params = build_sampling_params(
         sampling.temperature,
@@ -370,11 +381,12 @@ pub(crate) fn run(args: RunArgs) -> anyhow::Result<()> {
             rope_scaling,
             prefill_chunk,
             penalties,
+            min_p: sampling.min_p,
         },
         source.transcoded_tensors(),
     )?;
 
-    // Tokenizer (TOK-08 + ENGINE-SEAM): vocab-aware resolution, a hard
+    // Tokenizer (TOK-08): vocab-aware resolution, a hard
     // compatibility check, the GGUF's own template attached, and the
     // GGUF-embedded tokenizer as the fallback for a Bonsai 2 file.
     let expected_vocab = model_vocab_size(&gguf).ok();
@@ -446,6 +458,11 @@ pub(crate) fn run(args: RunArgs) -> anyhow::Result<()> {
     tracing::info!(prompt_tokens = prompt_tokens.len(), "prefilling");
     let start = std::time::Instant::now();
     let prompt_len = prompt_tokens.len();
+    // Clamp the budget to what the
+    // context window has left, on every decode path alike, instead of
+    // crashing once decode reaches `--ctx`. A prompt that alone overflows
+    // stays a hard error (both numbers named).
+    let max_tokens = clamp_generation_budget(prompt_len, max_tokens, engine.max_context())?;
 
     let output_count = if use_constrained_or_stop {
         let mut printer = TokenPrinter::new(tok_bridge.as_ref(), started_in_think, display, false);
@@ -469,31 +486,18 @@ pub(crate) fn run(args: RunArgs) -> anyhow::Result<()> {
         count
     } else {
         let mut printer = TokenPrinter::new(tok_bridge.as_ref(), started_in_think, display, true);
-        let count = if generate::needs_cli_sampler(sampling.temperature, sampling.min_p) {
-            tracing::info!(
-                min_p = sampling.min_p,
-                "min-p sampling: decoding with the CLI's own sampler"
-            );
-            let mut sampler = generate::cli_sampler(params, seed, penalties, sampling.min_p);
-            generate::decode_with_sampler(
-                &mut engine,
-                &prompt_tokens,
-                max_tokens,
-                &mut sampler,
-                |token| {
-                    printer.push(token)?;
-                    Ok(true)
-                },
-            )?
-        } else {
-            run_engine_generation(
-                &mut engine,
-                &prompt_tokens,
-                max_tokens,
-                no_stream,
-                &mut printer,
-            )?
-        };
+        // The engine's own decode path applies `min_p` directly
+        // (`load_engine` already called `set_min_p` above) and is
+        // token-for-token identical to the CLI's former sampler loop
+        // (`min_p_engine_path_matches_the_cli_loop`), so every sampled
+        // request routes through it uniformly now.
+        let count = run_engine_generation(
+            &mut engine,
+            &prompt_tokens,
+            max_tokens,
+            no_stream,
+            &mut printer,
+        )?;
         printer.finish(None);
         count
     };
@@ -570,7 +574,7 @@ pub(crate) fn run_engine_generation(
     })
 }
 
-/// The tokenizer a model-loading subcommand uses (TOK-08 + ENGINE-SEAM).
+/// The tokenizer a model-loading subcommand uses (TOK-08).
 ///
 /// An explicit `--tokenizer`, or an auto-detected `tokenizer.json` that
 /// passes [`check_tokenizer_model_compatibility`], is used exactly as before.
@@ -612,25 +616,77 @@ pub(crate) fn resolve_model_tokenizer_with(
     allow_vocab_mismatch: bool,
     load: impl FnOnce(&str) -> anyhow::Result<oxibonsai_runtime::TokenizerBridge>,
 ) -> anyhow::Result<Option<oxibonsai_runtime::TokenizerBridge>> {
+    resolve_model_tokenizer_with_source(
+        explicit,
+        lookup,
+        gguf,
+        expected_vocab,
+        allow_vocab_mismatch,
+        load,
+    )
+    .map(|resolved| resolved.map(|(tok, _source)| tok))
+}
+
+/// Where [`resolve_model_tokenizer_with_source`] found its tokenizer: enough
+/// to rebuild a FURTHER instance of the very same resolved source (`serve`'s
+/// embedder/RAG consumers need their own `TokenizerBridge`, since it is not
+/// `Clone`) without repeating the resolution's own logging or the TOK-08
+/// compatibility check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TokenizerSource {
+    /// An on-disk tokenizer file (already validated) at this path.
+    File(String),
+    /// The vocabulary + chat template embedded in the GGUF itself.
+    GgufEmbedded,
+}
+
+/// [`resolve_model_tokenizer_with`], additionally reporting which source
+/// won.
+pub(crate) fn resolve_model_tokenizer_with_source(
+    explicit: Option<&str>,
+    lookup: &TokenizerLookup,
+    gguf: &oxibonsai_core::gguf::reader::GgufFile<'_>,
+    expected_vocab: Option<usize>,
+    allow_vocab_mismatch: bool,
+    load: impl FnOnce(&str) -> anyhow::Result<oxibonsai_runtime::TokenizerBridge>,
+) -> anyhow::Result<Option<(oxibonsai_runtime::TokenizerBridge, TokenizerSource)>> {
     let Some(path) = &lookup.found else {
-        return Ok(gguf_embedded_tokenizer(gguf, expected_vocab));
+        return Ok(gguf_embedded_tokenizer(gguf, expected_vocab)
+            .map(|tok| (tok, TokenizerSource::GgufEmbedded)));
     };
     let tok = load(path)?;
-    // B2-13 fix-pass LEAD ITEM: the GGUF's own template always wins when
-    // present (falls back to ChatML/Qwen3 when the file ships none).
-    let tok = attach_gguf_chat_template(tok, &gguf.metadata)?;
+    // TOK-08: check compatibility BEFORE attaching (and logging) a
+    // chat template. Attaching first and only then discovering the
+    // candidate is a vocabulary mismatch used to log "resolved chat
+    // template" for a template nothing ends up using, then log it AGAIN
+    // for the GGUF-embedded fallback that actually wins -- doubling the
+    // log line on every mismatch (the common case for a Bonsai 2 file next
+    // to a legacy `tokenizer.json`). Checking first means exactly one
+    // candidate is ever template-attached, so it logs exactly once.
     match check_tokenizer_model_compatibility(&tok, path, gguf, allow_vocab_mismatch) {
-        Ok(()) => Ok(Some(tok)),
+        Ok(()) => {
+            // The GGUF's own template always wins
+            // when present (falls back to ChatML/Qwen3 when the file ships
+            // none).
+            let tok = attach_gguf_chat_template(tok, &gguf.metadata)?;
+            Ok(Some((tok, TokenizerSource::File(path.clone()))))
+        }
         Err(mismatch) if explicit.is_none() => {
-            match gguf_embedded_tokenizer(gguf, expected_vocab) {
+            match gguf_embedded_tokenizer_quiet(gguf, expected_vocab) {
                 Some(embedded) => {
+                    // Exactly one "resolved chat template" line for the
+                    // WINNING source (the embedded fallback), plus one
+                    // tokenizer-source line naming why the auto-detected
+                    // candidate was skipped -- never the mismatched
+                    // candidate's own (about-to-be-discarded) template too.
+                    log_chat_template_source(&embedded.resolved_chat_template());
                     tracing::info!(
                         skipped = %path,
                         reason = %mismatch,
                         "the auto-detected tokenizer does not fit this model; using the tokenizer \
                          embedded in the GGUF instead"
                     );
-                    Ok(Some(embedded))
+                    Ok(Some((embedded, TokenizerSource::GgufEmbedded)))
                 }
                 None => Err(mismatch),
             }
@@ -641,7 +697,7 @@ pub(crate) fn resolve_model_tokenizer_with(
 
 /// The tokenizer embedded in `gguf`'s `tokenizer.ggml.*` metadata, when the
 /// file carries one whose vocabulary equals the model's (`expected_vocab`),
-/// with its chat template attached (B2-13 fix-pass LEAD ITEM).
+/// with its chat template attached.
 ///
 /// Returns `None` for "there is nothing usable embedded" — no
 /// `expected_vocab`, no `tokenizer.ggml.tokens` at all (the legacy
@@ -680,8 +736,23 @@ pub(crate) fn gguf_embedded_tokenizer(
     }
 }
 
-/// Build the GGUF-embedded tokenizer WITH its chat template attached
-/// (B2-13 fix-pass LEAD ITEM): vocabulary from `tokenizer.ggml.*`, template
+/// [`gguf_embedded_tokenizer`] without any logging of its own: used only as
+/// the fallback after an auto-detected on-disk candidate failed the
+/// compatibility check, where the caller already logs ONE combined message
+/// naming both the skipped candidate and the resolved template —
+/// this avoids that single resolution logging "using the tokenizer embedded
+/// in the GGUF" (and "resolved chat template") a second, redundant time.
+pub(crate) fn gguf_embedded_tokenizer_quiet(
+    gguf: &oxibonsai_core::gguf::reader::GgufFile<'_>,
+    expected_vocab: Option<usize>,
+) -> Option<oxibonsai_runtime::TokenizerBridge> {
+    let expected = expected_vocab?;
+    let tok = oxibonsai_runtime::TokenizerBridge::native_from_gguf_metadata(&gguf.metadata).ok()?;
+    (tok.vocab_size() == expected).then_some(tok)
+}
+
+/// Build the GGUF-embedded tokenizer WITH its chat template attached:
+/// vocabulary from `tokenizer.ggml.*`, template
 /// from `tokenizer.chat_template` (a compile failure is an error, per
 /// `ResolvedChatTemplate::from_gguf`'s own contract).
 pub(crate) fn gguf_embedded_tokenizer_with_template(
@@ -710,9 +781,10 @@ pub(crate) struct ConstrainedSampling {
 ///
 /// Tokens are drawn by the constrained sampler's own chain
 /// (temperature/top-k/min-p/top-p) under `--grammar`, else by a fresh
-/// [`Sampler`] seeded exactly like the engine's (same params, same seed,
-/// plus `min_p`) — never the engine's history-free `sample`, which cannot
-/// apply min-p. Penalties are refused on this path by the caller
+/// [`oxibonsai_runtime::sampling::Sampler`] seeded exactly like the
+/// engine's (same params, same seed, plus `min_p`) — never the engine's
+/// history-free `sample`, which cannot apply min-p. Penalties are refused
+/// on this path by the caller
 /// ([`reject_penalties_with_constrained_decode`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_constrained_or_stopped(
@@ -874,12 +946,6 @@ pub(crate) fn build_constrained_sampler_from_grammar(
     };
 
     oxibonsai_runtime::ConstrainedSampler::new(chain, Box::new(constraint), vocab_size)
-}
-
-/// A fresh sampler seeded like the engine's own (kept `pub(crate)` for the
-/// per-session reuse in `chat`).
-pub(crate) fn session_sampler(load: &EngineLoad, min_p: f32) -> Sampler {
-    generate::cli_sampler(load.params.clone(), load.seed, load.penalties, min_p)
 }
 
 #[cfg(test)]

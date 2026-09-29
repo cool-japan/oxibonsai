@@ -45,7 +45,7 @@ enum Control {
 pub fn run(paths: ReplPaths, mut params: RenderParams, gpu_te: bool) -> anyhow::Result<()> {
     println!("Loading models (resident)…");
     let t = std::time::Instant::now();
-    // RAG-EVAL-IMG-25 / wave-1.5 addendum: an interactive, multi-prompt
+    // RAG-EVAL-IMG-25: an interactive, multi-prompt
     // REPL is exactly the scenario text-encoder residency exists for —
     // force it on regardless of the source's own default (transient for
     // `TeSource::Mlx4bit`), so warm-up and every render after it actually

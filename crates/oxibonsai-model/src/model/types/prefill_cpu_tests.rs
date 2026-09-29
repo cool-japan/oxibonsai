@@ -1,11 +1,107 @@
 //! The batched prefill's tests, and the fixtures `forward_hidden`'s tests
 //! share with them (`pub(in crate::model::types)`: test-only, and only for
 //! this module's siblings).
+//!
+//! ## `OXIBONSAI_KERNEL_TIER` (K-14)
+//!
+//! This module is a `#[cfg(test)] mod` inside the crate's one `--lib` test
+//! binary, not a standalone `tests/*.rs` file, so `cargo nextest` (one
+//! process per test) is not what serializes its access to the tier
+//! selector — plain `cargo test` runs every test here as a thread of one
+//! shared process, and this crate's build of `oxibonsai_kernels` is a plain
+//! (non-`cfg(test)`) dependency, so `Int8Tier::from_env` has none of that
+//! crate's own per-thread test gate: every thread in the shared process
+//! reads the live process environment on every native GEMV/GEMM call,
+//! unconditionally.
+//!
+//! [`TierEnvGuard`] (mirroring `tests/int8_native_forward_tests.rs`'s own
+//! guard in this same crate — a genuinely separate test binary, hence a
+//! separate process) takes a process-wide lock and snapshots/restores the
+//! variable around a *clear*. Every test in this file whose assertion
+//! depends on which `GemmRoute` a call resolves to — directly, through
+//! [`PrefillMatrix::gemm`], or through
+//! [`BonsaiModel::forward_prefill_cpu`]/[`BonsaiModel::forward`] — takes the
+//! guard defensively, so a developer's own ambient `OXIBONSAI_KERNEL_TIER`
+//! export can never perturb a test that expects the default f32 route.
+//!
+//! That lock only serializes this *file's* writers against each other,
+//! though — it cannot stop an unguarded reader in a different file from
+//! observing a real value while the lock is held, and this crate's tests
+//! span many files (`hybrid/metal_tests.rs`, `model/types/tests.rs`,
+//! `forward_hidden.rs`, ...), none of which coordinate with this one.
+//! [`int8_tier_reaches_the_batched_prefill`] is the one test in this binary
+//! that genuinely needs the tier to hold a real value for a call — proving
+//! the opt-in reaches the batched prefill requires actually selecting it —
+//! so a same-process lock cannot make that test safe under plain
+//! `cargo test`: any sibling test anywhere in the binary that happens to run
+//! a CPU-tier `Q1_0_g128`/`TQ2_0_g128` GEMM while the variable is set would
+//! observe it. That test's fix is therefore structural, not another guard:
+//! its parent invocation never calls `std::env::set_var`/`remove_var` on
+//! itself at all, and instead re-execs [`std::env::current_exe`] filtered to
+//! exactly itself (`--exact ... --test-threads=1`), so the mutation happens
+//! only inside a freshly spawned, single-test, single-thread child process —
+//! never in the shared `--lib` binary's process, where every other test in
+//! this binary (in this file and every other one) runs. See that test's own
+//! doc comment for the full design; [`TierEnvGuard`] remains exactly what it
+//! was for every other test here: a defensive, restore-on-drop clear.
 
 use super::*;
 use crate::model::types::OutputWeight;
 use oxibonsai_core::config::{Qwen3Config, RopeScaling};
+use oxibonsai_kernels::dispatch_int8::KERNEL_TIER_ENV;
 use oxibonsai_kernels::{KernelDispatcher, KernelTier};
+
+/// Serializes this file's own access to [`KERNEL_TIER_ENV`] — see the
+/// module doc.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// RAII owner of [`KERNEL_TIER_ENV`] for one test: takes [`ENV_LOCK`],
+/// snapshots and clears the variable (so an ambient shell export cannot
+/// perturb a test that expects the default f32 route), and restores the
+/// snapshot on drop — also while unwinding from a failed assertion.
+pub(in crate::model::types) struct TierEnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    prior: Option<String>,
+}
+
+impl TierEnvGuard {
+    pub(in crate::model::types) fn acquire() -> Self {
+        let lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = std::env::var(KERNEL_TIER_ENV).ok();
+        // SAFETY: `lock` is held for the lifetime of the returned guard, and
+        // it serializes every reader and writer of the variable in this
+        // binary that goes through this guard.
+        unsafe {
+            std::env::remove_var(KERNEL_TIER_ENV);
+        }
+        Self { _lock: lock, prior }
+    }
+
+    /// Set (`Some`) or clear (`None`) the tier selector.
+    fn select(&self, name: Option<&str>) {
+        // SAFETY: `self._lock` is held (see `acquire`).
+        unsafe {
+            match name {
+                Some(n) => std::env::set_var(KERNEL_TIER_ENV, n),
+                None => std::env::remove_var(KERNEL_TIER_ENV),
+            }
+        }
+    }
+}
+
+impl Drop for TierEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: `self._lock` is held for the entire body of `drop`.
+        unsafe {
+            match &self.prior {
+                Some(v) => std::env::set_var(KERNEL_TIER_ENV, v),
+                None => std::env::remove_var(KERNEL_TIER_ENV),
+            }
+        }
+    }
+}
 
 /// Small config satisfying the `Q1_0_g128` fixture's constraints
 /// (`hidden % 128 == 0`, `intermediate % 128 == 0`), with genuine GQA
@@ -244,6 +340,7 @@ fn sequential_logits(cfg: &Qwen3Config, prompt: &[u32]) -> Vec<f32> {
 /// sequential per-token reference on the last position.
 #[test]
 fn batched_prefill_matches_the_sequential_reference() {
+    let _env = TierEnvGuard::acquire();
     let cfg = tiny_config(2);
     let prompt: Vec<u32> = (0..12u32).map(|i| (i * 5) % 96).collect();
     let expected = sequential_logits(&cfg, &prompt);
@@ -282,6 +379,7 @@ fn batched_prefill_matches_the_sequential_reference() {
 /// sequential GEMV reference this compares against.
 #[test]
 fn batched_prefill_matches_the_sequential_reference_ternary() {
+    let _env = TierEnvGuard::acquire();
     let cfg = tiny_config(2);
     let prompt: Vec<u32> = (0..12u32).map(|i| (i * 5) % 96).collect();
     let expected = sequential_logits_with(&cfg, &prompt, ternary_fixture);
@@ -312,6 +410,7 @@ fn batched_prefill_matches_the_sequential_reference_ternary() {
 /// per-position KV writes stayed ordered and causal.
 #[test]
 fn batched_prefill_leaves_a_usable_kv_cache() {
+    let _env = TierEnvGuard::acquire();
     let cfg = tiny_config(2);
     let kernel = KernelDispatcher::with_tier(KernelTier::Reference);
     let prompt: Vec<u32> = (0..9u32).map(|i| (i * 7 + 1) % 96).collect();
@@ -394,6 +493,7 @@ pub(in crate::model::types) fn max_scaled_diff(a: &[f32], b: &[f32]) -> (f32, us
 /// per-block reduction order differs by design.
 #[test]
 fn batched_prefill_kv_cache_matches_position_by_position() {
+    let _env = TierEnvGuard::acquire();
     let cfg = tiny_config(2);
     let kernel = KernelDispatcher::with_tier(KernelTier::Reference);
     let prompt: Vec<u32> = (0..10u32).map(|i| (i * 11 + 3) % 96).collect();
@@ -447,6 +547,7 @@ fn batched_prefill_kv_cache_matches_position_by_position() {
 /// block's `m % MR` tail is exercised.
 #[test]
 fn micro_batch_boundary_is_invisible() {
+    let _env = TierEnvGuard::acquire();
     let cfg = tiny_config(1);
     let prompt: Vec<u32> = (0..CPU_PREFILL_MICRO_BATCH as u32 + 5)
         .map(|i| (i * 3) % 96)
@@ -469,6 +570,7 @@ fn micro_batch_boundary_is_invisible() {
 /// rather than restarting it.
 #[test]
 fn batched_prefill_continues_from_a_non_zero_position() {
+    let _env = TierEnvGuard::acquire();
     let cfg = tiny_config(2);
     let kernel = KernelDispatcher::with_tier(KernelTier::Reference);
     let head: Vec<u32> = vec![5, 9, 17];
@@ -639,9 +741,11 @@ fn activations(n: usize, seed: u32) -> Vec<f32> {
 /// the full micro-batch with a tail).
 #[test]
 fn gemm_blocked_2d_is_bit_identical_to_the_kernel_driver() {
-    if int8_tier_selected() {
-        return;
-    }
+    let _env = TierEnvGuard::acquire();
+    assert!(
+        !int8_tier_selected(),
+        "TierEnvGuard::acquire must clear the tier selector"
+    );
     let dispatcher = prefill_dispatcher();
     let k = 256;
     let bpr = k / GROUP_WEIGHTS;
@@ -688,9 +792,11 @@ fn gemm_blocked_2d_is_bit_identical_to_the_kernel_driver() {
 /// the default configuration.
 #[test]
 fn both_gemm_routes_agree_bit_for_bit() {
-    if int8_tier_selected() {
-        return;
-    }
+    let _env = TierEnvGuard::acquire();
+    assert!(
+        !int8_tier_selected(),
+        "TierEnvGuard::acquire must clear the tier selector"
+    );
     let (k, n_rows, m) = (384usize, 70usize, 11usize);
     let bpr = k / GROUP_WEIGHTS;
     let tq2 = ternary_blocks(n_rows * bpr, 9);
@@ -710,6 +816,365 @@ fn both_gemm_routes_agree_bit_for_bit() {
             driver.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
         );
     }
+}
+
+/// Marker env var: presence (any value) means this process is the
+/// re-exec'd, single-test child process for
+/// [`int8_tier_reaches_the_batched_prefill`] — see that test's own doc
+/// comment. Set only via [`std::process::Command::env`] on the child, never
+/// through [`std::env::set_var`] on the parent's own process.
+const PREFILL_INT8_CHILD_ENV: &str = "OXIBONSAI_PREFILL_INT8_CHILD";
+
+/// Printed by the child (with `--nocapture`, so it reaches the real
+/// process, not libtest's own capture buffer) immediately after its last
+/// assertion passes. `--exact` matching zero tests would also exit
+/// `status.success()` with "0 passed" and no failure at all, so the parent
+/// checks for this line -- not just the exit code -- before trusting the
+/// child ran the test it asked for.
+const PREFILL_INT8_CHILD_SENTINEL: &str = "OXIBONSAI_PREFILL_INT8_CHILD: all assertions passed";
+
+/// This test's fully qualified path, exactly as `--exact` expects it --
+/// matches this module's location (`model::types::prefill_cpu::tests`,
+/// wired by `prefill_cpu.rs`'s `#[path = "prefill_cpu_tests.rs"]
+/// pub(super) mod tests;`) so a future rename of this test or its enclosing
+/// modules cannot leave this pointing at a path `--exact` silently matches
+/// zero tests against (guarded by [`PREFILL_INT8_CHILD_SENTINEL`] too).
+const PREFILL_INT8_TEST_PATH: &str =
+    "model::types::prefill_cpu::tests::int8_tier_reaches_the_batched_prefill";
+
+/// `GemmRoute::for_this_call` asks `prefill_dispatcher().native_int8_tier()`
+/// instead of a locally re-derived `Int8Tier::from_env().is_some()`. Proves
+/// the opt-in still reaches the batched CPU prefill end to end, not just
+/// the isolated GEMM call `both_gemm_routes_agree_bit_for_bit` already
+/// pins: the route itself resolves to `Blocked2d`/`KernelDriver` exactly
+/// when expected, the f32 route is bit-identical whether or not the tier
+/// was ever selected on this dispatcher, with the tier selected
+/// `forward_prefill_cpu`'s own GEMMs resolve to exactly what calling
+/// `gemm_1bit_g128_par`/`gemm_ternary_g128_par` directly gives for the same
+/// shape (both native formats, not `Q1_0_g128` alone), and the batched
+/// output differs from (but stays close to) the f32 route.
+///
+/// # Why this test re-execs itself
+///
+/// Selecting the tier for a real call means `OXIBONSAI_KERNEL_TIER` has to
+/// hold a real value in this process for the duration of a batched prefill.
+/// Under plain `cargo test`, this `--lib` binary runs every test as a
+/// thread of one shared process, and (see the module doc) nothing gates
+/// `Int8Tier::from_env` per-thread the way `oxibonsai_kernels`' own
+/// unit-test build does -- so a `set_var` here used to be observable,
+/// mid-call, by whatever unrelated test happened to be decoding a
+/// `Q1_0_g128`/`TQ2_0_g128` layer on another thread at that exact moment,
+/// in files this one has no relationship to at all
+/// (`hybrid/metal_tests.rs`, `model/types/tests.rs`, `forward_hidden.rs`).
+/// A lock only serializes this file's own writers against each other; it
+/// cannot stop an unguarded reader in another file from observing the value
+/// while the lock is held. The only fix that actually closes that hole is
+/// to never let the tier take a real value in the shared process at all:
+/// [`int8_tier_reaches_the_batched_prefill_parent`] never calls
+/// `std::env::set_var`/`remove_var`, and instead re-execs
+/// [`std::env::current_exe`] filtered to exactly this one test
+/// (`--exact ... --test-threads=1`), so the mutation happens only inside a
+/// freshly spawned, single-test, single-thread child process
+/// ([`int8_tier_reaches_the_batched_prefill_child`]) that exits as soon as
+/// the test is done. This works whether the outer run is plain
+/// `cargo test` or `cargo nextest` (which already gives every test its own
+/// process, and simply pays the extra re-exec as overhead).
+#[test]
+fn int8_tier_reaches_the_batched_prefill() {
+    if std::env::var_os(PREFILL_INT8_CHILD_ENV).is_some() {
+        int8_tier_reaches_the_batched_prefill_child();
+        return;
+    }
+    int8_tier_reaches_the_batched_prefill_parent();
+}
+
+/// The tier-*unset* half, run directly in whatever process called
+/// [`int8_tier_reaches_the_batched_prefill`] -- reading
+/// [`GemmRoute::for_this_call`] only, never writing
+/// `OXIBONSAI_KERNEL_TIER` -- followed by a re-exec'd child that proves the
+/// tier-*selected* half. See that test's own doc for the full design.
+fn int8_tier_reaches_the_batched_prefill_parent() {
+    assert_eq!(
+        GemmRoute::for_this_call(),
+        GemmRoute::Blocked2d,
+        "tier unset: the route must be the f32 one"
+    );
+    let cfg = tiny_config(2);
+    let prompt: Vec<u32> = (0..12u32).map(|i| (i * 5) % 96).collect();
+
+    // Tier unset: exactly today's f32 route, run twice (fresh fixtures)
+    // to prove it is bit-identical to itself -- the strongest form of
+    // "unaffected by this fix" a unit test can pin without a pre-fix
+    // binary to compare against.
+    let f32_logits = fixture(cfg.clone())
+        .forward_prefill_cpu(&prompt, 0)
+        .expect("f32 batched prefill")
+        .expect("fixture is in scope for the batched path");
+    let f32_logits_again = fixture(cfg.clone())
+        .forward_prefill_cpu(&prompt, 0)
+        .expect("f32 batched prefill (repeat)")
+        .expect("fixture is in scope for the batched path");
+    assert_eq!(
+        f32_logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        f32_logits_again
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        "tier unset: the f32 route must be bit-identical across two runs"
+    );
+    // Cross-checked against the sequential per-token reference too, the
+    // same bound every other test in this module uses.
+    let expected = sequential_logits(&cfg, &prompt);
+    let f32_cos = cosine(&f32_logits, &expected);
+    assert!(
+        f32_cos >= 0.9999,
+        "tier unset: batched prefill diverged from the sequential reference: cos={f32_cos}"
+    );
+
+    // The `TQ2_0_g128` (ternary) twin of the two f32 checks above.
+    let f32_ternary_logits = ternary_fixture(cfg.clone())
+        .forward_prefill_cpu(&prompt, 0)
+        .expect("f32 ternary batched prefill")
+        .expect("ternary_fixture is in scope for the batched path");
+    let ternary_expected = sequential_logits_with(&cfg, &prompt, ternary_fixture);
+    let f32_ternary_cos = cosine(&f32_ternary_logits, &ternary_expected);
+    assert!(
+        f32_ternary_cos >= 0.9999,
+        "tier unset: ternary batched prefill diverged from the sequential reference: \
+         cos={f32_ternary_cos}"
+    );
+
+    // The tier-selected half needs `OXIBONSAI_KERNEL_TIER` to hold a real
+    // value for the duration of a batched prefill -- see this test's own
+    // doc comment for why that can only happen in a re-exec'd child, never
+    // in this (possibly shared) process.
+    let exe = std::env::current_exe()
+        .expect("current_exe: the running test binary must have a resolvable path");
+    let output = std::process::Command::new(&exe)
+        .args([
+            PREFILL_INT8_TEST_PATH,
+            "--exact",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env(PREFILL_INT8_CHILD_ENV, "1")
+        .output()
+        .unwrap_or_else(|err| {
+            panic!("failed to re-exec {exe:?} for the INT8-tier child process: {err}")
+        });
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "INT8-tier child process failed: status={:?}\n--- child stdout ---\n{stdout}\n\
+         --- child stderr ---\n{stderr}",
+        output.status
+    );
+    // A stale `--exact` path would also exit `status.success()` (libtest
+    // reports "0 passed" and no failure), so the exit code alone is not
+    // proof the child ran -- and passed -- the test it was asked to.
+    assert!(
+        stdout.contains("1 passed"),
+        "INT8-tier child process reported no passing test (a stale --exact path matches zero \
+         tests and still exits successfully): status={:?}\n--- child stdout ---\n{stdout}\n\
+         --- child stderr ---\n{stderr}",
+        output.status
+    );
+    assert!(
+        stderr.contains(PREFILL_INT8_CHILD_SENTINEL),
+        "INT8-tier child process exited successfully but never printed its completion \
+         sentinel: status={:?}\n--- child stdout ---\n{stdout}\n--- child stderr ---\n{stderr}",
+        output.status
+    );
+}
+
+/// The tier-*selected* half of [`int8_tier_reaches_the_batched_prefill`],
+/// run only inside the re-exec'd child process
+/// [`int8_tier_reaches_the_batched_prefill_parent`] spawns. This process
+/// runs exactly one test on one thread (`--exact ... --test-threads=1`), so
+/// unlike the shared `--lib` binary process, mutating `OXIBONSAI_KERNEL_TIER`
+/// here through [`TierEnvGuard`] cannot be observed by any other test --
+/// there is no other test in this process to observe it.
+fn int8_tier_reaches_the_batched_prefill_child() {
+    let env = TierEnvGuard::acquire();
+    assert_eq!(
+        GemmRoute::for_this_call(),
+        GemmRoute::Blocked2d,
+        "tier unset: the route must be the f32 one"
+    );
+    let cfg = tiny_config(2);
+    let prompt: Vec<u32> = (0..12u32).map(|i| (i * 5) % 96).collect();
+
+    // The f32 reference the tier-selected checks below compare the INT8
+    // output against -- recomputed here rather than received from the
+    // parent process (which runs as a genuinely separate process; there is
+    // no shared memory to pass it through), and cross-checked against the
+    // sequential per-token reference first, the same bound every other test
+    // in this module uses.
+    let f32_logits = fixture(cfg.clone())
+        .forward_prefill_cpu(&prompt, 0)
+        .expect("f32 batched prefill")
+        .expect("fixture is in scope for the batched path");
+    let expected = sequential_logits(&cfg, &prompt);
+    let f32_cos = cosine(&f32_logits, &expected);
+    assert!(
+        f32_cos >= 0.9999,
+        "tier unset: batched prefill diverged from the sequential reference: cos={f32_cos}"
+    );
+
+    // The `TQ2_0_g128` (ternary) twin of the f32 check above, computed here
+    // -- before the tier is selected below -- so this reference is itself
+    // unaffected by the tier this test is about to turn on.
+    let f32_ternary_logits = ternary_fixture(cfg.clone())
+        .forward_prefill_cpu(&prompt, 0)
+        .expect("f32 ternary batched prefill")
+        .expect("ternary_fixture is in scope for the batched path");
+    let ternary_expected = sequential_logits_with(&cfg, &prompt, ternary_fixture);
+    let f32_ternary_cos = cosine(&f32_ternary_logits, &ternary_expected);
+    assert!(
+        f32_ternary_cos >= 0.9999,
+        "tier unset: ternary batched prefill diverged from the sequential reference: \
+         cos={f32_ternary_cos}"
+    );
+
+    // Select the tier and re-run the identical batched prefill. Safe here,
+    // and only here: this process runs this one test, alone, on one thread.
+    env.select(Some(
+        oxibonsai_kernels::dispatch_int8::Int8Tier::Scalar.name(),
+    ));
+    assert!(
+        prefill_dispatcher().native_int8_tier().is_some(),
+        "the guard must have actually selected a tier"
+    );
+    assert_eq!(
+        GemmRoute::for_this_call(),
+        GemmRoute::KernelDriver,
+        "tier selected: the route must switch to the kernel-crate driver"
+    );
+    let int8_logits = fixture(cfg.clone())
+        .forward_prefill_cpu(&prompt, 0)
+        .expect("int8 batched prefill")
+        .expect("fixture is in scope for the batched path");
+
+    assert_ne!(
+        int8_logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        f32_logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        "selecting the INT8 tier must change the batched prefill's output"
+    );
+    let cos = cosine(&f32_logits, &int8_logits);
+    assert!(
+        cos >= 0.999,
+        "INT8 batched prefill diverged too far from the f32 route: cos={cos}"
+    );
+
+    // With the tier selected, the GEMM the automatic `GemmRoute` selection
+    // now takes must be exactly what calling `gemm_1bit_g128_par` directly
+    // gives for the same shape -- not merely "close to" it. This pins the
+    // `GemmRoute::KernelDriver` arm's own delegation, complementing the
+    // route-identity asserts above (which pin *which* route is chosen).
+    let (k, n_rows, m) = (cfg.hidden_size, cfg.hidden_size, prompt.len());
+    let bpr = k / GROUP_WEIGHTS;
+    let blocks = onebit_blocks(n_rows * bpr, 21);
+    let input = activations(m * k, 999);
+    let matrix = PrefillMatrix::OneBit(&blocks);
+    let mut via_route = vec![0.0f32; m * n_rows];
+    matrix
+        .gemm(
+            GemmRoute::for_this_call(),
+            &input,
+            &mut via_route,
+            m,
+            n_rows,
+            k,
+        )
+        .expect("auto-routed gemm");
+    let mut via_driver = vec![0.0f32; m * n_rows];
+    oxibonsai_kernels::parallel::gemm_1bit_g128_par(
+        prefill_dispatcher(),
+        &blocks,
+        &input,
+        &mut via_driver,
+        m,
+        n_rows,
+        k,
+    )
+    .expect("direct kernel driver");
+    assert_eq!(
+        via_route.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        via_driver.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        "GemmRoute::for_this_call() must resolve to gemm_1bit_g128_par's own INT8 output \
+         bit for bit once the tier is selected"
+    );
+
+    // The `TQ2_0_g128` (ternary) twin of every check above, still with the
+    // same tier selected: the batched ternary prefill differs from (but
+    // stays close to) its f32 counterpart, and the route it resolves to is
+    // exactly `gemm_ternary_g128_par`'s own output, bit for bit -- not only
+    // `Q1_0_g128`.
+    let int8_ternary_logits = ternary_fixture(cfg.clone())
+        .forward_prefill_cpu(&prompt, 0)
+        .expect("int8 ternary batched prefill")
+        .expect("ternary_fixture is in scope for the batched path");
+    assert_ne!(
+        int8_ternary_logits
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        f32_ternary_logits
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        "selecting the INT8 tier must change the ternary batched prefill's output"
+    );
+    let ternary_cos = cosine(&f32_ternary_logits, &int8_ternary_logits);
+    assert!(
+        ternary_cos >= 0.999,
+        "INT8 ternary batched prefill diverged too far from the f32 route: cos={ternary_cos}"
+    );
+
+    let ternary_blocks_for_route = ternary_blocks(n_rows * bpr, 22);
+    let ternary_matrix = PrefillMatrix::Ternary(&ternary_blocks_for_route);
+    let mut ternary_via_route = vec![0.0f32; m * n_rows];
+    ternary_matrix
+        .gemm(
+            GemmRoute::for_this_call(),
+            &input,
+            &mut ternary_via_route,
+            m,
+            n_rows,
+            k,
+        )
+        .expect("auto-routed ternary gemm");
+    let mut ternary_via_driver = vec![0.0f32; m * n_rows];
+    oxibonsai_kernels::parallel::gemm_ternary_g128_par(
+        prefill_dispatcher(),
+        &ternary_blocks_for_route,
+        &input,
+        &mut ternary_via_driver,
+        m,
+        n_rows,
+        k,
+    )
+    .expect("direct ternary kernel driver");
+    assert_eq!(
+        ternary_via_route
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        ternary_via_driver
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        "GemmRoute::for_this_call() must resolve to gemm_ternary_g128_par's own INT8 output \
+         bit for bit once the tier is selected"
+    );
+
+    // Printed last (with `--nocapture`, straight to the real stderr) so the
+    // parent process can tell a genuine pass from `--exact` matching zero
+    // tests, which would also exit successfully -- see
+    // `int8_tier_reaches_the_batched_prefill_parent`.
+    eprintln!("{PREFILL_INT8_CHILD_SENTINEL}");
 }
 
 /// Shape errors are typed errors, never a slice-index panic.
@@ -925,6 +1390,7 @@ fn real_model_cpu_prefill_outruns_the_sequential_prefill() {
     use oxibonsai_core::gguf::reader::GgufFile;
     use std::time::{Duration, Instant};
 
+    let _env = TierEnvGuard::acquire();
     let Some(path) = std::env::var_os("OXI_MODEL") else {
         eprintln!(
             "real_model_cpu_prefill_outruns_the_sequential_prefill: OXI_MODEL not set — \

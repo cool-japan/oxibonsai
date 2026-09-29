@@ -25,11 +25,11 @@
 //! That one mapping now lives in [`KernelDispatcher::prism_tier`] instead of
 //! six near-identical `cpu_*_fallback` methods (K-INT8): the six differed
 //! only in which kernel they called, and only the three GEMV ones recorded
-//! the fallback tier for the K-17 regression tests — the gatekeeper's
-//! REQUIRED #9 asked for the three GEMM sites to record it too, which a
-//! single shared mapping gives for free and cannot drift out of again.
+//! the fallback tier for the K-17 regression tests. The three GEMM sites
+//! now record it too, which a single shared mapping gives for free and
+//! cannot drift out of again.
 //!
-//! ## Tiling and row/batch parallelism (gatekeeper REQUIRED #9)
+//! ## Tiling and row/batch parallelism
 //!
 //! Until K-INT8 every Prism GEMM was a literal loop of GEMVs and every entry
 //! point was single-threaded: `rg rayon` over the four Prism kernel files
@@ -60,42 +60,28 @@
 //! self-dispatches NEON/AVX2/scalar internally, so every tier converges on
 //! the one free function.
 //!
-//! ## INT8 tier wiring (K-INT8 wave-4 fix-up)
+//! ## INT8 tier wiring (K-14)
 //!
-//! The wave-4 verifier found `OXIBONSAI_KERNEL_TIER` parsed and tested
-//! (`dispatch_int8.rs`) but consulted by **no** production forward path:
-//! `rg 'dispatch_int8|Int8Tier' crates/ src/` returned zero hits outside
-//! `crates/oxibonsai-kernels/`. The fix does not touch
-//! `oxibonsai-model/src/layers/linear.rs` (never in this package's
-//! `owned_files`) — it does not need to. `LinearPQ2_0::forward`/
-//! `forward_batch` and `LinearQ2_0G64::forward`/`forward_batch` already
-//! call `self.kernel.gemv_pq2_0(..)` / `.gemm_pq2_0(..)` /
+//! `LinearPQ2_0::forward`/`forward_batch` and `LinearQ2_0G64::forward`/
+//! `forward_batch` call `self.kernel.gemv_pq2_0(..)` / `.gemm_pq2_0(..)` /
 //! `.gemv_q2_0_g64(..)` / `.gemm_q2_0_g64(..)` on their stored
-//! `Arc<KernelDispatcher>`, and `impl PrismKernel for KernelDispatcher`
-//! **is** those four methods, right here, in an owned file. Wiring the
-//! selector into this `impl` block makes `OXIBONSAI_KERNEL_TIER=neon-dot`
-//! change those two layers' real output with zero edits outside
-//! `owned_files` — the model crate's call sites stay byte-for-byte
-//! unchanged. Consequently, a re-run of the verifier's exact grep will
-//! *still* show hits only under `crates/oxibonsai-kernels/`: that is
-//! expected, not a miss, because the interception point was always meant
-//! to live at the dispatcher the model crate already calls through, not at
-//! the call site itself. The right check is not the grep but whether
-//! `KernelDispatcher::gemv_pq2_0`'s (etc.) *output* moves when the
-//! environment variable is set — `prism_blocked_tests`'s
-//! `*_routes_through_the_int8_tier_when_asked` tests assert exactly that.
+//! `Arc<KernelDispatcher>`, and `impl PrismKernel for KernelDispatcher` is
+//! those four methods: each reads [`Int8Tier::from_env`] first and, when
+//! `OXIBONSAI_KERNEL_TIER` names a tier, runs the matching `dispatch_int8`
+//! kernel. The Prism formats have no GPU kernel, so this applies whichever
+//! `KernelTier` the dispatcher is on.
+//! `gemv_and_gemm_pq2_0_route_through_the_int8_tier_when_asked` and
+//! `gemv_and_gemm_q2_0_g64_route_through_the_int8_tier_when_asked` pin it.
 //!
-//! Each call reads [`Int8Tier::from_env`] fresh — **never** cached behind a
-//! `OnceLock` — because this crate's `--lib` test binary runs
-//! `dispatch_int8.rs`'s env-mutating test and this file's bit-exact tests
-//! as threads in one process; a cached value latched while that test is
-//! mid-mutation would make the bit-exact assertions below flaky. See
-//! [`crate::dispatch_int8::KERNEL_TIER_ENV_LOCK`] for the serialization
-//! that keeps that from happening, and note that a fresh `env::var` read
-//! per GEMV/GEMM call (not per weight row) is not a measurable cost next
-//! to the matmul it gates.
+//! Each call reads [`Int8Tier::from_env`] fresh — never cached — so a
+//! change to the variable takes effect on the next call; one `env::var` per
+//! GEMV/GEMM call (not per weight row) is not measurable next to the matmul
+//! it gates. In this crate's unit-test build the variable is honoured only
+//! on a thread holding `dispatch_int8::TierEnvGuard` (see
+//! `dispatch_int8::KERNEL_TIER_ENV_LOCK`), so the bit-exact tests below
+//! cannot observe another test's value.
 //!
-//! Two formats are deliberately **not** wired here:
+//! One format is deliberately **not** wired here:
 //!
 //! - `gemv_ptq1_0`/`gemm_ptq1_0` (`PTQ1_0`, ggml id 143): its 28-byte block
 //!   packs five base-3 trits per byte (`qs[24]` + `qh[2]`), not the
@@ -104,36 +90,17 @@
 //!   [`BlockPTQ1_0`] (only [`oxibonsai_core::BlockTQ2_0_g128`],
 //!   [`BlockPQ2_0`] and [`BlockQ2_0G64`] at `simd_dot_int8.rs:524/537/550`
 //!   do), and the K-INT8 spec's own "TWO TABLES, not one" requirement
-//!   scoped exactly those three — never a fourth for PTQ1_0. A prior
-//!   verifier finding's exact-recipe text named
-//!   `dispatch_int8::gemv_1bit_g128_int8` for this format; that does not
-//!   typecheck (it takes `&[BlockQ1_0G128]`, the *native* 1-bit format, not
-//!   `&[BlockPTQ1_0]`) — a fact, not a matter of judgment, and the
-//!   strongest evidence the finding conflated the two. Building a
+//!   scoped exactly those three — never a fourth for PTQ1_0. Building a
 //!   base-3 int8 decode kernel is a real, separate undertaking, not a
-//!   fix-up-sized change; `gemv_ptq1_0_ignores_the_int8_tier_env_var`
+//!   small change; `gemv_ptq1_0_ignores_the_int8_tier_env_var`
 //!   pins this as the intended behaviour, not a gap.
-//! - The **native** ternary ([`oxibonsai_core::BlockTQ2_0_g128`], via
-//!   `LinearTernary`) and 1-bit ([`oxibonsai_core::tensor::BlockQ1_0G128`],
-//!   via `Linear1Bit`) formats — the *original* K-14 target, and the one
-//!   the measured 16.1x GEMV speedup was on
-//!   (`int8_tier_parity::int8_gemv_is_faster_than_the_f32_gemv` benchmarks
-//!   `BlockTQ2_0_g128`). Both have a compatible `Int8TwoBitBlock`
-//!   (ternary) / `gemv_1bit_g128_int8` (1-bit) kernel ready to receive
-//!   them, but their call chain never passes through this file:
-//!   `LinearTernary::forward` calls `KernelDispatcher::gemv_ternary_g128_cached`
-//!   / `gemv_ternary_g128` (`impl TernaryKernel for KernelDispatcher`,
-//!   `dispatch.rs:857`) or `crate::parallel_tiled::gemv_adaptive_ternary`
-//!   (`parallel_tiled.rs:523`); `Linear1Bit::forward_vec` calls
-//!   `crate::parallel_tiled::gemv_adaptive` (`parallel_tiled.rs:497`),
-//!   which calls `KernelDispatcher::gemv`/`gemm`
-//!   (`impl OneBitKernel for KernelDispatcher`, `dispatch.rs:594`). Every
-//!   file on that chain (`dispatch.rs`, `parallel_tiled.rs`, `traits.rs`)
-//!   is outside this package's `owned_files` — unlike the Prism formats
-//!   above, no owned seam exists for the native formats, so this half of
-//!   the wiring gap is a genuine ownership-boundary block. Closing it
-//!   needs `dispatch.rs` + `parallel_tiled.rs` granted to this or a
-//!   follow-up package; this fix-up does not touch them.
+//!
+//! (The native ternary `TQ2_0_g128` and 1-bit `Q1_0_g128` formats are wired
+//! too, in `dispatch.rs` — `OneBitKernel::{gemv, gemm}`,
+//! `TernaryKernel::{gemv_ternary_g128, gemm_ternary_g128}` — and at the
+//! entry of the `parallel` / `parallel_tiled` drivers; see
+//! `KernelDispatcher::native_int8_tier`. Unlike the Prism formats they never
+//! divert a `KernelTier::Gpu` dispatcher.)
 
 use oxibonsai_core::{BlockPQ2_0, BlockPTQ1_0, BlockQ2_0G64, QK_PQ2_0, QK_PTQ1_0, QK_Q2_0_G64};
 
@@ -196,8 +163,8 @@ impl KernelDispatcher {
     /// [`KernelDispatcher::cpu_tier`] (K-17: no Metal/CUDA Prism kernel
     /// exists yet) and records the routing decision so
     /// `dispatch.rs::LAST_GPU_FALLBACK_TIER` sees it — for **every** Prism
-    /// entry point, GEMV and GEMM alike (gatekeeper REQUIRED #9; previously
-    /// only the three GEMV fallbacks recorded).
+    /// entry point, GEMV and GEMM alike (previously only the three GEMV
+    /// fallbacks recorded).
     pub(crate) fn prism_tier(&self) -> PrismTier {
         match self.tier() {
             #[cfg(feature = "gpu")]
@@ -401,8 +368,8 @@ fn prism_gemv_par<B: Sync>(
     }
 }
 
-/// `m`-dispatching Prism GEMM entry (minor[0], K-INT8 wave-4b gatekeeper
-/// re-verify): [`prism_gemm_chunk_rows`] floors the parallel slab width at
+/// `m`-dispatching Prism GEMM entry: [`prism_gemm_chunk_rows`] floors the
+/// parallel slab width at
 /// [`PRISM_GEMM_MR`] (`chunk_rows = max(m.div_ceil(threads), MR)`), so the
 /// batch-parallel path collapses to a **single** slab — `min(chunk_rows, m)
 /// == m` — for every `m <= MR`, not only `m < MR`: at `m == MR` exactly,
@@ -439,7 +406,7 @@ fn prism_gemv_par<B: Sync>(
 /// single-slab behavior this function replaces for `m <= MR`, and matches
 /// the pre-existing, previously-accepted chunking this function defers to
 /// for `m > MR` — narrowing it further is a distinct, separate
-/// optimization, not part of this fix-up's scope.
+/// optimization.
 #[allow(clippy::too_many_arguments)]
 fn prism_gemm_dispatch<B: Sync>(
     blocks: &[B],
@@ -559,9 +526,9 @@ impl PrismKernel for KernelDispatcher {
         n_rows: usize,
         k: usize,
     ) -> KernelResult<()> {
-        // K-INT8 wave-4 fix-up: see this module's doc comment. `None` (the
-        // default, unset environment) falls through to exactly today's
-        // call, unchanged, so the default stays bit-identical.
+        // See this module's doc comment. `None` (the default, unset
+        // environment) falls through to exactly today's call, unchanged,
+        // so the default stays bit-identical.
         if let Some(tier) = Int8Tier::from_env() {
             return dispatch_int8::gemv_two_bit_int8(tier, blocks, input, output, n_rows, k);
         }
@@ -596,8 +563,8 @@ impl PrismKernel for KernelDispatcher {
         )
     }
 
-    /// **Not** wired to [`Int8Tier`]: see this module's doc comment
-    /// ("Two formats are deliberately not wired here") for why `PTQ1_0`'s
+    /// **Not** wired to [`Int8Tier`]: see this module's doc comment ("One
+    /// format is deliberately not wired here") for why `PTQ1_0`'s
     /// base-3-trit block has no compatible INT8 kernel.
     fn gemv_ptq1_0(
         &self,
@@ -796,7 +763,7 @@ mod tests {
     /// every call. Returns [`crate::dispatch_int8::TierEnvGuard`], the same
     /// lock `dispatch_int8.rs`'s env-mutating test takes, which additionally
     /// snapshots/restores the variable so a panic here can't leak a
-    /// mutated `OXIBONSAI_KERNEL_TIER` to later tests (K-INT8 wave-4b).
+    /// mutated `OXIBONSAI_KERNEL_TIER` to later tests.
     fn env_guard() -> crate::dispatch_int8::TierEnvGuard {
         crate::dispatch_int8::TierEnvGuard::acquire()
     }
@@ -905,7 +872,7 @@ mod tests {
 }
 
 /// Bit-exactness and routing guards for the register-blocked + Rayon Prism
-/// GEMM/GEMV path (K-INT8, gatekeeper REQUIRED #9).
+/// GEMM/GEMV path (K-INT8).
 ///
 /// Every comparison here is `assert_eq!` on raw `f32` values, never a
 /// tolerance: register blocking and a Rayon split are both defined to leave
@@ -923,7 +890,7 @@ mod prism_blocked_tests {
     /// `gemv_pq2_0_kernel(tier)(..)` functions) now reads
     /// `Int8Tier::from_env` and must be serialized against
     /// `dispatch_int8.rs`'s env-mutating test, with the environment
-    /// snapshotted and restored around the call (K-INT8 wave-4b).
+    /// snapshotted and restored around the call.
     fn env_guard() -> crate::dispatch_int8::TierEnvGuard {
         crate::dispatch_int8::TierEnvGuard::acquire()
     }
@@ -1197,7 +1164,7 @@ mod prism_blocked_tests {
         assert!((out[1] + 128.0).abs() < 1e-3, "got {}", out[1]);
     }
 
-    /// K-INT8 wave-4b minor[0] fix-up: `m == 1` (decode) must route through
+    /// Regression coverage: `m == 1` (decode) must route through
     /// weight-row-parallel `gemv_pq2_0` (via [`prism_gemm_dispatch`]), not
     /// the single-threaded blocked GEMM path — and must be bit-for-bit
     /// identical either way. `n_rows` is sized off `par_gemv_min_rows`
@@ -1261,7 +1228,7 @@ mod prism_blocked_tests {
 
     /// Boundary case for [`prism_gemm_dispatch`]: `m == PRISM_GEMM_MR`
     /// exactly (not `m < PRISM_GEMM_MR`) is the case that was still missed
-    /// by an earlier, off-by-one version of this fix-up — at `m == MR`,
+    /// by an earlier, off-by-one version of this dispatcher — at `m == MR`,
     /// `prism_gemm_chunk_rows`'s own floor makes `chunk_rows == m` too, so
     /// the *old* boundary (`m < MR`) would still hand this exact `m` to the
     /// single-slab blocked path. Bit-exactness is the only thing a unit
@@ -1273,7 +1240,7 @@ mod prism_blocked_tests {
         let dispatcher = KernelDispatcher::auto_detect();
         let n_rows = PlatformProfile::global_thresholds().par_gemv_min_rows * 2 + 5;
         let k = 2 * QK_PQ2_0;
-        let m = PRISM_GEMM_MR; // exactly the boundary this fix-up must cover
+        let m = PRISM_GEMM_MR; // exactly the boundary this dispatch logic must cover
         let blocks = pq2_blocks(n_rows * (k / QK_PQ2_0), 0x5EED_0012);
         let input = inputs(m * k, 0x1234_0012);
 
@@ -1298,9 +1265,9 @@ mod prism_blocked_tests {
         assert_bit_identical(&expect, &got, "gemm_pq2_0(m=MR) vs the gemv sweep");
     }
 
-    /// K-INT8 reverify minor[2]: the three tests just above compare the
+    /// The three tests just above compare the
     /// dispatcher against a manual GEMV *sweep* (one `gemv` call per batch
-    /// row) — after this fix-up that is exactly what `prism_gemm_dispatch`
+    /// row) — that is exactly what `prism_gemm_dispatch`
     /// itself does for `m <= PRISM_GEMM_MR`, so those tests exercise the
     /// dispatcher against its own equivalent, not against the raw
     /// register-blocked kernel (`gemm_pq2_0_kernel(tier)` etc.) it defers to
@@ -1410,7 +1377,7 @@ mod prism_blocked_tests {
         }
     }
 
-    /// Gatekeeper REQUIRED #9's numeric acceptance: a batched CPU prefill of
+    /// Numeric acceptance: a batched CPU prefill of
     /// Bonsai 2 27B shape must stop being a single-threaded GEMV loop.
     ///
     /// Shape: `ffn_up [5120, 17408]` (the 27B's widest per-layer matrix) at
@@ -1489,7 +1456,7 @@ mod prism_blocked_tests {
         );
     }
 
-    /// K-INT8 wave-4b minor[0]'s numeric acceptance: the same before/after
+    /// Numeric acceptance: the same before/after
     /// shape as [`prism_prefill_m64_is_no_longer_a_single_threaded_gemv_loop`],
     /// at `M = 1` (decode) instead of `64` — `before` is the plain blocked
     /// kernel (what every `gemm_pq2_0` call used to run at this `m`, since
@@ -1577,7 +1544,7 @@ mod prism_blocked_tests {
         );
     }
 
-    /// Gatekeeper REQUIRED #9: the three **GEMM** entry points must record
+    /// The three **GEMM** entry points must record
     /// the CPU tier a `KernelTier::Gpu` dispatcher fell back onto, which
     /// only the GEMV ones did before.
     #[cfg(feature = "gpu")]
@@ -1615,9 +1582,9 @@ mod prism_blocked_tests {
         assert_eq!(LAST_GPU_FALLBACK_TIER.with(|c| c.get()), Some(expect));
     }
 
-    // ─── K-INT8 wave-4 fix-up: end-to-end INT8 tier wiring ───────────────
+    // ─── End-to-end INT8 tier wiring ───────────────────────────────────
 
-    /// The blocking finding's own acceptance: `OXIBONSAI_KERNEL_TIER` must
+    /// Acceptance: `OXIBONSAI_KERNEL_TIER` must
     /// change `gemv_pq2_0`/`gemm_pq2_0`'s actual output, by producing
     /// exactly what calling `dispatch_int8::{gemv,gemm}_two_bit_int8`
     /// directly would (the wiring is a straight delegation, not a second
@@ -1704,7 +1671,7 @@ mod prism_blocked_tests {
              the env var did not actually change which kernel ran"
         );
 
-        // K-INT8 wave-4b test-hygiene fix-up: the GEMV divergence check
+        // The GEMV divergence check
         // above does not prove `gemm_pq2_0` reads the tier too -- only the
         // bit-identity-to-`dispatch_int8` checks earlier in this test did
         // that, and only against the int8 path. Prove GEMM also diverges
@@ -1792,7 +1759,7 @@ mod prism_blocked_tests {
             std::env::remove_var(dispatch_int8::KERNEL_TIER_ENV);
         }
 
-        // K-INT8 wave-4b test-hygiene fix-up: this test previously stopped
+        // This test previously stopped
         // at the int8-vs-int8 bit-identity checks above and never proved
         // the env var changes anything relative to the plain f32 path (the
         // pq2_0 sibling test only checked this for GEMV). Check both GEMV

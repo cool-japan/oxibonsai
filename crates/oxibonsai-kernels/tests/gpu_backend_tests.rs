@@ -280,16 +280,15 @@ fn device_buffer_size() {
 
 /// Serializes every test below that calls [`gpu_gemv_1bit`].
 ///
-/// Wave-1.5 addendum (3): under `--all-features` (or `--features metal`),
-/// `gpu_gemv_1bit` routes through `Scirs2Backend::global()`, which in turn
-/// resolves a Metal session. MET-08 (METAL-CONCURRENCY, landed wave 4) split
-/// the old single mutable `GLOBAL_METAL_GRAPH` into a process-shared,
-/// immutable `MetalDevice` and a per-session `MetalGraph` bound to a thread
-/// via `SessionScope` — but none of the tests below bind one, so
-/// `MetalGraph::global()` still falls through to the single
+/// Under `--all-features` (or `--features metal`), `gpu_gemv_1bit` routes
+/// through `Scirs2Backend::global()`, which in turn resolves a Metal
+/// session. MET-08 split the old single mutable `GLOBAL_METAL_GRAPH` into a
+/// process-shared, immutable `MetalDevice` and a per-session `MetalGraph`
+/// bound to a thread via `SessionScope` — but none of the tests below bind
+/// one, so `MetalGraph::global()` still falls through to the single
 /// process-default session (`session.rs`'s documented fallback for a caller
-/// that never binds), the same shared mutable GPU state this guard was
-/// written against. `cargo test`'s default in-binary thread parallelism let
+/// that never binds), the same shared mutable GPU state this guard is
+/// written against. `cargo test`'s default in-binary thread parallelism lets
 /// two of these tests race and intermittently observe each other's
 /// half-finished GPU state (symptom: "got 0 expected 8128", i.e. a
 /// GEMV result read before the corresponding command buffer completed).
@@ -297,11 +296,10 @@ fn device_buffer_size() {
 /// `--test-threads=1` run doesn't reproduce it either, but the *default*
 /// `cargo test` invocation is real and part of this project's gate. The
 /// precedent for this exact fix is
-/// `crates/oxibonsai-model/tests/metal_prefill_ternary_parity_tests.rs::gpu_serial`
-/// (FIX-06-KERN-MODEL); rewriting these tests to bind their own
-/// `MetalGraph::bind_new_session()` would let this helper (and every
-/// `let _gpu = gpu_serial();` call site below) go, but that rewrite is out
-/// of this package's scope.
+/// `crates/oxibonsai-model/tests/metal_prefill_ternary_parity_tests.rs::gpu_serial`;
+/// rewriting these tests to bind their own `MetalGraph::bind_new_session()`
+/// would let this helper (and every `let _gpu = gpu_serial();` call site
+/// below) go, but is a larger change than this file's own tests need today.
 fn gpu_serial() -> std::sync::MutexGuard<'static, ()> {
     static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     GPU_LOCK

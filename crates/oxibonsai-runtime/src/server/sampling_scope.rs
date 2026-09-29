@@ -252,6 +252,122 @@ mod tests {
         }
     }
 
+    /// Table-style proof of every property this module's doc comment
+    /// promises for a fresh seeded *or* unseeded sampler, in one pass: a
+    /// request's own `min_p` wins over the replica's baseline, an omitted
+    /// `min_p` falls back to it, penalties are carried the same way (the
+    /// request's own, or the replica's when the request sends none), and a
+    /// seeded request reproduces the same ids across two separate calls.
+    #[test]
+    fn min_p_and_penalties_follow_the_table_seeded_and_unseeded() {
+        struct Row {
+            seed: Option<u64>,
+            min_p: Option<f32>,
+            penalties: Option<PenaltyParams>,
+            want_min_p: f32,
+            want_penalties: PenaltyParams,
+        }
+        // The replica baseline (see `engine()`, below): min_p 0.25,
+        // penalties (0.5, 0.0).
+        let request_penalties = PenaltyParams::new(1.0, 1.5);
+        let rows = [
+            Row {
+                seed: None,
+                min_p: Some(0.6),
+                penalties: Some(request_penalties),
+                want_min_p: 0.6,
+                want_penalties: request_penalties,
+            },
+            Row {
+                seed: None,
+                min_p: None,
+                penalties: Some(request_penalties),
+                want_min_p: 0.25,
+                want_penalties: request_penalties,
+            },
+            Row {
+                seed: Some(11),
+                min_p: Some(0.6),
+                penalties: Some(request_penalties),
+                want_min_p: 0.6,
+                want_penalties: request_penalties,
+            },
+            Row {
+                seed: Some(11),
+                min_p: None,
+                penalties: Some(request_penalties),
+                want_min_p: 0.25,
+                want_penalties: request_penalties,
+            },
+            Row {
+                seed: Some(11),
+                min_p: Some(0.6),
+                penalties: None,
+                want_min_p: 0.6,
+                want_penalties: PenaltyParams::new(0.5, 0.0),
+            },
+        ];
+        // Non-uniform, non-degenerate logits: a flat row would make min_p
+        // and the seeded draw vacuous checks.
+        let logits: Vec<f32> = (0..64)
+            .map(|i| ((i as f32) * 0.37).sin() * 5.0 + (i as f32) * 0.01)
+            .collect();
+
+        for (row_idx, row) in rows.iter().enumerate() {
+            let mut replica = engine();
+            let sampling = RequestSampling {
+                params: SamplingParams {
+                    temperature: 0.7,
+                    ..SamplingParams::default()
+                },
+                penalties: row.penalties,
+                min_p: row.min_p,
+                seed: row.seed,
+            };
+            let (seen_min_p, seen_penalties, draws) = sampling.run(&mut replica, |e| {
+                let seen_min_p = e.sampler.min_p();
+                let seen_penalties = *e.sampler.penalties();
+                let draws: Vec<u32> = (0..8)
+                    .map(|_| e.sampler.sample(&logits).unwrap_or_default())
+                    .collect();
+                (seen_min_p, seen_penalties, draws)
+            });
+            assert_eq!(seen_min_p, row.want_min_p, "row {row_idx}: effective min_p");
+            assert_eq!(
+                seen_penalties, row.want_penalties,
+                "row {row_idx}: effective penalties"
+            );
+            // The replica must always come back exactly as it started.
+            assert_eq!(
+                replica.sampler.min_p(),
+                0.25,
+                "row {row_idx}: replica min_p not restored"
+            );
+            assert_eq!(
+                *replica.sampler.penalties(),
+                PenaltyParams::new(0.5, 0.0),
+                "row {row_idx}: replica penalties not restored"
+            );
+
+            if let Some(seed) = row.seed {
+                // A fresh replica with the identical baseline `engine()`
+                // builds — a seeded run's PRNG state must not carry over
+                // from the first call, so this is a new engine, not a
+                // second draw on the same one.
+                let mut replica_again = engine();
+                let draws_again = sampling.run(&mut replica_again, |e| {
+                    (0..8)
+                        .map(|_| e.sampler.sample(&logits).unwrap_or_default())
+                        .collect::<Vec<u32>>()
+                });
+                assert_eq!(
+                    draws, draws_again,
+                    "row {row_idx}: seed {seed} must reproduce the same ids on two calls"
+                );
+            }
+        }
+    }
+
     #[test]
     fn the_replica_state_is_restored_even_when_the_generation_panics() {
         let mut engine = engine();

@@ -300,6 +300,26 @@ impl EnginePool {
         Ok(())
     }
 
+    /// Set every replica's baseline sampler `min_p` (a GGUF-declared
+    /// `general.sampling.min_p`): a post-build visitor rather than a
+    /// builder parameter, so every existing pool-builder signature stays
+    /// unchanged. Mirrors [`Self::set_metrics_all`] — same "call while the
+    /// pool is idle" contract.
+    ///
+    /// A per-request `min_p` in an HTTP body overrides this baseline for
+    /// that request only and restores it afterwards
+    /// (`server/sampling_scope.rs`); this call sets what an *unspecified*
+    /// request's `min_p` samples with.
+    ///
+    /// Returns [`PoolError::Poisoned`] if the idle mutex was poisoned.
+    pub fn set_min_p_all(&self, min_p: f32) -> Result<(), PoolError> {
+        let mut idle = self.idle.lock().map_err(|_| PoolError::Poisoned)?;
+        for replica in idle.iter_mut() {
+            replica.engine.set_min_p(min_p);
+        }
+        Ok(())
+    }
+
     /// Acquire an engine from the pool, waiting asynchronously if all replicas
     /// are currently in use.
     ///
@@ -703,7 +723,36 @@ pub fn build_pool_from_gguf_parts(
         max_seq_len,
         backend,
     )?;
+    finish_pool_from_first_replica(
+        first,
+        gguf,
+        sampling_params,
+        seed,
+        max_seq_len,
+        requested_size,
+        backend,
+    )
+}
 
+/// Shared by every builder in this module: given replica
+/// `#1` and the already-`'static` `gguf` it was built from, resolve the
+/// pool's effective size (logged), build replicas `2..size` off the same
+/// GGUF and replica `#1`'s shared token-embedding table, and assemble the
+/// [`PoolBuild`]. `build_pool_from_gguf_parts` and
+/// `build_pool_from_static_gguf_with_rope` differ only in how replica `#1`
+/// itself is obtained (from a path vs. an already-`'static` GGUF, with or
+/// without a RoPE-scaling override in scope); everything after that is
+/// byte-for-byte identical sizing/logging/replica-loop/assembly, so it lives
+/// here once instead of twice.
+fn finish_pool_from_first_replica(
+    first: InferenceEngine<'static>,
+    gguf: &'static oxibonsai_core::gguf::reader::GgufFile<'static>,
+    sampling_params: crate::sampling::SamplingParams,
+    seed: u64,
+    max_seq_len: usize,
+    requested_size: Option<usize>,
+    backend: crate::engine_seam::Backend,
+) -> crate::error::RuntimeResult<PoolBuild> {
     let tier = first.kernel_tier();
     let hybrid = first.is_hybrid();
     let sizing = if hybrid && requested_size.is_none() {
@@ -770,7 +819,7 @@ pub fn build_pool_from_gguf_parts(
 }
 
 /// [`build_pool_from_gguf_parts`] with a `--rope-scaling auto|on|off`
-/// override (wave-4b ruling R2; additive — the existing builders are
+/// override (additive — the existing builders are
 /// unchanged). Memory-maps and leaks the GGUF exactly as
 /// [`InferenceEngine::from_gguf_path_leaked_with_backend`] does, then
 /// defers to [`build_pool_from_static_gguf_with_rope`].
@@ -812,7 +861,7 @@ pub fn build_pool_from_gguf_parts_with_rope(
 
 /// Build an [`EnginePool`] off an already-`'static` GGUF — a leaked memory
 /// map, or an in-memory image such as the CLI's `--ptq1-transcode` output —
-/// with a `--rope-scaling` override (wave-4b ruling R2; additive).
+/// with a `--rope-scaling` override (additive).
 ///
 /// Same sizing policy and replica sharing as [`build_pool_from_gguf_parts`]
 /// (hybrid → 1 replica unless asked; replicas `2..size` share replica
@@ -845,57 +894,15 @@ pub fn build_pool_from_static_gguf_with_rope(
         Arc::from(Vec::new()),
         backend,
     )?;
-
-    let tier = first.kernel_tier();
-    let hybrid = first.is_hybrid();
-    let sizing = if hybrid && requested_size.is_none() {
-        tracing::info!(
-            architecture = %first.architecture(),
-            "hybrid model: defaulting the engine pool to 1 replica (each replica holds its own \
-             KV cache and recurrent state, and one CPU replica already saturates memory \
-             bandwidth); pass an explicit pool size to run more"
-        );
-        PoolSizing {
-            requested: None,
-            effective: 1,
-            clamped_by_gpu_tier: false,
-            gpu_max: None,
-        }
-    } else {
-        resolve_pool_sizing(requested_size, tier)
-    };
-    let size = sizing.effective;
-    tracing::info!(
-        tier = %tier,
-        effective = size,
-        clamped = sizing.clamped_by_gpu_tier,
-        "{}",
-        sizing.reason()
-    );
-
-    let shared_token_embd = first.model_token_embd();
-    let mut engines = Vec::with_capacity(size);
-    engines.push(first);
-    for _ in 1..size {
-        let replica = InferenceEngine::from_gguf_static_with_embd_and_backend(
-            gguf,
-            sampling_params.clone(),
-            seed,
-            max_seq_len,
-            Arc::clone(&shared_token_embd),
-            backend,
-        )?;
-        engines.push(replica);
-    }
-
-    Ok(PoolBuild {
-        pool: EnginePool::new(engines),
-        tier,
-        size,
+    finish_pool_from_first_replica(
+        first,
         gguf,
-        shared_token_embd,
-        hybrid,
-    })
+        sampling_params,
+        seed,
+        max_seq_len,
+        requested_size,
+        backend,
+    )
 }
 
 #[cfg(test)]
@@ -1585,7 +1592,7 @@ pub(crate) mod tests {
         assert_eq!(a_again.gpu_session_id(), a_id);
     }
 
-    // ── `--rope-scaling auto|on|off` (wave-4b ruling R2) ─────────────────────
+    // ── `--rope-scaling auto|on|off` ──────────────────────────────────────
 
     /// The exact YaRN declaration `models/Bonsai-8B.gguf` carries, on the
     /// tiny dense fixture.
@@ -1668,6 +1675,10 @@ pub(crate) mod tests {
     }
 
     #[test]
+    // `expect_err` needs `T: Debug`; `InferenceEngine` does not implement it
+    // (by design — it can hold multi-GB weights), so this reaches the same
+    // outcome through `.err().expect(..)` instead.
+    #[allow(clippy::err_expect)]
     fn rope_override_on_refuses_a_gguf_without_scaling() {
         use oxibonsai_core::config::RopeScalingOverride;
         let bytes = build_tiny_gguf_bytes();
@@ -1719,7 +1730,7 @@ pub(crate) mod tests {
     }
 
     /// `GpuSession::for_tier(KernelTier::Gpu)` twice hands out two **real,
-    /// distinct** sessions (METAL-CONCURRENCY verify minor[1]).
+    /// distinct** sessions.
     /// `every_replica_gets_its_own_gpu_session` runs on a CPU-tier fixture,
     /// where both ids are `None` and its distinctness check is vacuous; this
     /// calls the constructor on the GPU tier directly. A CPU tier still gets
@@ -1791,5 +1802,75 @@ pub(crate) mod tests {
         );
         eprintln!("capability report: {TEST} SKIPPED -- built without a GPU backend");
         record_skipped(Capability::Metal, TEST);
+    }
+
+    // ── EnginePool::set_min_p_all ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn set_min_p_all_reaches_every_idle_replica() {
+        let pool = EnginePool::new(vec![tiny_engine(), tiny_engine()]);
+        pool.set_min_p_all(0.37).expect("set_min_p_all");
+        for _ in 0..pool.size() {
+            let lease = pool.acquire().await.expect("acquire");
+            assert!(
+                (lease.min_p() - 0.37).abs() < f32::EPSILON,
+                "min_p was not applied to every replica: got {}",
+                lease.min_p()
+            );
+        }
+    }
+
+    // ── pool-builder dedupe ──────────────────────────────────────────────────
+
+    /// `build_pool_from_gguf_parts` and `build_pool_from_gguf_parts_with_rope`
+    /// (which defers to `build_pool_from_static_gguf_with_rope`) now share one
+    /// private `finish_pool_from_first_replica` for everything past replica
+    /// #1's own construction. Both builders on the SAME tiny GGUF must
+    /// therefore still produce identical replica counts and tier reports.
+    #[test]
+    fn both_pool_builders_agree_on_size_and_tier_for_the_same_gguf() {
+        let bytes = build_tiny_gguf_bytes();
+        let path = {
+            let mut p = std::env::temp_dir();
+            p.push(format!(
+                "oxibonsai_pool_builder_dedupe_{}_{}.gguf",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            p
+        };
+        std::fs::write(&path, &bytes).expect("write temp GGUF");
+
+        let plain = build_pool_from_gguf_parts(
+            &path,
+            SamplingParams::default(),
+            42,
+            512,
+            Some(2),
+            crate::engine_seam::Backend::Auto,
+        )
+        .expect("build_pool_from_gguf_parts");
+        let with_rope = build_pool_from_gguf_parts_with_rope(
+            &path,
+            SamplingParams::default(),
+            42,
+            512,
+            Some(2),
+            crate::engine_seam::Backend::Auto,
+            oxibonsai_core::config::RopeScalingOverride::Auto,
+        )
+        .expect("build_pool_from_gguf_parts_with_rope");
+
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(plain.size, with_rope.size, "replica counts must agree");
+        assert_eq!(
+            plain.tier, with_rope.tier,
+            "resolved kernel tiers must agree"
+        );
+        assert_eq!(plain.hybrid, with_rope.hybrid);
     }
 }

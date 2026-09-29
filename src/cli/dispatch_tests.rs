@@ -127,6 +127,126 @@ fn a_valid_config_value_reaches_model_resolution() {
     assert!(msg.contains("no model"), "{msg}");
 }
 
+// ── --seed / [sampling].seed layering ───────────────────────────────────────
+
+#[test]
+fn resolve_seed_override_layers_flag_over_toml_over_absent() {
+    let mut sections = RawTomlSections::new();
+    // Neither flag nor TOML: the caller applies its own final default.
+    assert_eq!(resolve_seed_override(None, &sections).expect("ok"), None);
+
+    sections
+        .entry("sampling".to_string())
+        .or_default()
+        .insert("seed".to_string(), "123".to_string());
+    // TOML alone.
+    assert_eq!(
+        resolve_seed_override(None, &sections).expect("ok"),
+        Some(123)
+    );
+    // The flag always wins over TOML.
+    assert_eq!(
+        resolve_seed_override(Some(7), &sections).expect("ok"),
+        Some(7)
+    );
+}
+
+/// `seed = 1_000` is valid TOML integer syntax (underscore digit
+/// separators); the raw-text lookup [`parse_flat_toml_sections`] hands
+/// [`resolve_seed_override`] must not reject it.
+#[test]
+fn resolve_seed_override_accepts_a_toml_underscore_separated_integer() {
+    let mut sections = RawTomlSections::new();
+    sections
+        .entry("sampling".to_string())
+        .or_default()
+        .insert("seed".to_string(), "1_000_000".to_string());
+    assert_eq!(
+        resolve_seed_override(None, &sections).expect("underscore separators are valid TOML"),
+        Some(1_000_000)
+    );
+}
+
+#[test]
+fn resolve_seed_override_rejects_a_malformed_toml_value_naming_seed() {
+    let mut sections = RawTomlSections::new();
+    sections
+        .entry("sampling".to_string())
+        .or_default()
+        .insert("seed".to_string(), "-1".to_string());
+    let err = resolve_seed_override(None, &sections).expect_err("negative is not a valid u64");
+    assert!(err.to_string().contains("seed"), "{err}");
+
+    let mut sections = RawTomlSections::new();
+    sections
+        .entry("sampling".to_string())
+        .or_default()
+        .insert("seed".to_string(), "banana".to_string());
+    let err = resolve_seed_override(None, &sections).expect_err("not an integer at all");
+    assert!(err.to_string().contains("seed"), "{err}");
+
+    // The flag being present short-circuits before the malformed TOML value
+    // is even parsed.
+    assert_eq!(
+        resolve_seed_override(Some(9), &sections).expect("flag wins, TOML never consulted"),
+        Some(9)
+    );
+}
+
+/// End-to-end: a `[sampling].seed` in `--config` reaches model resolution
+/// (i.e. it is a genuinely accepted value, not rejected before "no model"),
+/// exactly like every other RT-17 sampling field.
+#[test]
+fn config_seed_reaches_model_resolution() {
+    let msg = run_with_config(
+        "seed_ok",
+        "[sampling]\nseed = 123\n",
+        &["run", "--prompt", "hi"],
+    );
+    assert!(msg.contains("no model"), "{msg}");
+}
+
+/// A malformed `[sampling].seed` is refused BEFORE model resolution, naming
+/// the field — the same contract every other sampling value already has
+/// (`config_negative_temperature_is_refused_naming_the_field_before_model_resolution`),
+/// which `seed`'s old `default_value_t = 42` (no TOML layering at all)
+/// could never even be asked to honour.
+#[test]
+fn config_malformed_seed_is_refused_naming_the_field_before_model_resolution() {
+    let msg = run_with_config(
+        "seed_bad",
+        "[sampling]\nseed = -1\n",
+        &["run", "--prompt", "hi"],
+    );
+    assert!(msg.contains("seed"), "{msg}");
+    assert!(
+        !msg.contains("no model"),
+        "validated before model resolution: {msg}"
+    );
+}
+
+/// `--seed` on the command line wins over a conflicting `[sampling].seed`.
+#[test]
+fn cli_seed_flag_wins_over_config_seed() {
+    let (dir, path) = config_file("seed_flag_wins", "[sampling]\nseed = 999\n");
+    let cli = Cli::try_parse_from([
+        "oxibonsai",
+        "--config",
+        path.as_str(),
+        "run",
+        "--prompt",
+        "hi",
+        "--seed",
+        "5",
+    ])
+    .expect("argv parses");
+    match cli.command {
+        Commands::Run { seed, .. } => assert_eq!(seed, Some(5)),
+        _ => panic!("expected Run"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ── resolvers ───────────────────────────────────────────────────────────────
 
 #[test]

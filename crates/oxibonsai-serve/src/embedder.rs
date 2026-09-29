@@ -1,5 +1,5 @@
 //! The model-backed embedder the standalone server answers `/v1/embeddings`
-//! from (`HANDOVER-RT` item 13).
+//! from.
 //!
 //! Until this module the `oxibonsai-serve` binary built its engine pool
 //! without keeping the parts an embedder needs and never handed the router
@@ -21,10 +21,12 @@
 //!   [`RouterOptions::with_embedder`](oxibonsai_runtime::server::RouterOptions::with_embedder).
 //!
 //! When there can be no embedder — no tokenizer to encode text with, or a
-//! hybrid (`qwen35`) model, whose pre-LM-head hidden states are not exposed
-//! yet (the typed `NOT_A_DENSE_MODEL` refusal) — [`build_embedder`] logs why
-//! and returns `None`, and the route keeps answering `501`: a missing
-//! embedder is never fatal to serving chat.
+//! model whose embedder construction genuinely fails — [`build_embedder`]
+//! logs why and returns `None` alongside the reason (`error.code` and a
+//! human-readable message), which the caller hands to the router via
+//! `RouterOptions::with_embedder_unavailable` so the `501` body names it
+//! too, not just the log: a missing embedder is never fatal to serving
+//! chat.
 
 use std::sync::Arc;
 
@@ -33,6 +35,12 @@ use oxibonsai_runtime::engine::engine_error_code;
 use oxibonsai_runtime::engine_pool::PoolBuild;
 use oxibonsai_runtime::sampling::SamplingParams;
 use oxibonsai_runtime::tokenizer_bridge::TokenizerBridge;
+
+/// Why there is no model-backed embedder: an `error.code` (an engine
+/// refusal's own code, e.g. `NOT_A_DENSE_MODEL`), or `None` for a generic
+/// reason, and a human-readable message — for
+/// `RouterOptions::with_embedder_unavailable`.
+pub type EmbedderUnavailable = (Option<&'static str>, String);
 
 /// The KV window of the dedicated embedding engine for a server whose
 /// engines run with a `max_seq_len` context: that context, capped at the
@@ -44,7 +52,9 @@ pub fn embedding_window(max_seq_len: usize) -> usize {
 }
 
 /// The model-backed embedder `/v1/embeddings` is served from, or `None` —
-/// the route's honest `501` — when there can be none (see the module docs).
+/// the route's honest `501` — when there can be none (see the module docs),
+/// alongside why: an `error.code` (an engine refusal's own code, e.g.
+/// `NOT_A_DENSE_MODEL`) and a human-readable message.
 ///
 /// Mirrors `oxibonsai serve`'s own construction exactly: `tokenizer` becomes
 /// the embedder's (a `TokenizerBridge` is not `Clone`, so the caller loads a
@@ -57,10 +67,11 @@ pub fn build_embedder(
     params: SamplingParams,
     seed: u64,
     max_seq_len: usize,
-) -> Option<Arc<ModelEmbedder>> {
+) -> (Option<Arc<ModelEmbedder>>, Option<EmbedderUnavailable>) {
     let Some(tokenizer) = tokenizer else {
-        tracing::info!("no tokenizer: /v1/embeddings answers 501 (an embedder needs one)");
-        return None;
+        let reason = "no tokenizer: an embedder needs one to encode text".to_string();
+        tracing::info!("{reason}; /v1/embeddings answers 501");
+        return (None, Some((None, reason)));
     };
     let window = embedding_window(max_seq_len);
     match ModelEmbedder::from_static_gguf(
@@ -76,22 +87,33 @@ pub fn build_embedder(
                 window,
                 "serving /v1/embeddings from a dedicated embedding engine"
             );
-            Some(embedder)
+            (Some(embedder), None)
         }
         Err(e) if engine_error_code(&e) == Some("NOT_A_DENSE_MODEL") => {
             tracing::info!(
                 error = %e,
-                "embeddings are not supported for this model yet (known limitation); \
-                 /v1/embeddings answers 501"
+                "embeddings are unavailable for this model; /v1/embeddings answers 501"
             );
-            None
+            (
+                None,
+                Some((
+                    engine_error_code(&e),
+                    format!("embeddings are unavailable for this model: {e}"),
+                )),
+            )
         }
         Err(e) => {
             tracing::warn!(
                 error = %e,
                 "failed to build the embedding engine; /v1/embeddings answers 501"
             );
-            None
+            (
+                None,
+                Some((
+                    engine_error_code(&e),
+                    format!("failed to build the embedding engine: {e}"),
+                )),
+            )
         }
     }
 }

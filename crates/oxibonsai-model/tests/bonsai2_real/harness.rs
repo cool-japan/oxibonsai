@@ -1,4 +1,4 @@
-//! Shared harness for the real Bonsai 2 27B acceptance gates (B2-11-FIX):
+//! Shared harness for the real Bonsai 2 27B acceptance gates:
 //! locating the model files and the fork's goldens, the capability report,
 //! the golden parsers, `log_softmax`/top-N ranking and a GPT-2 byte-level
 //! detokeniser built from the GGUF's own vocabulary.
@@ -13,7 +13,7 @@
 //! | `OXI_BONSAI2_PQ2_GGUF` | `Ternary-Bonsai-2-27B-PQ2_0.gguf` |
 //! | `OXI_BONSAI2_PTQ1_GGUF` | `Ternary-Bonsai-2-27B-PTQ1_0.gguf` |
 //! | `OXIBONSAI_MODELS_DIR` | a directory holding either file under its release name |
-//! | `OXI_BONSAI2_GOLDEN_DIR` | the fork's Metal goldens (`golden2/`) |
+//! | `OXI_BONSAI2_GOLDEN_DIR` | the fork's Metal goldens directory |
 //! | `OXI_BONSAI2_GOLDEN_CPU_DIR` | the fork's CPU goldens (`golden_cpu/`) |
 //!
 //! When a model variable is unset the gate **skips with a capability
@@ -25,11 +25,14 @@
 //!
 //! The goldens are vendored under `tests/fixtures/bonsai2_golden/` and
 //! `tests/fixtures/bonsai2_golden_cpu/` — the fork's own `llama-server`
-//! per-step dumps and `llama-cli` prompt-token / text dumps, byte-for-byte
-//! except one field: each server dump's `"model"` value, the capture
-//! machine's absolute GGUF path, is reduced to the release file name — so
-//! the oracle lives in the repository rather than only in a session
-//! scratchpad, and no local path does. The environment variables above take
+//! per-step dumps and `llama-cli` prompt-token / text dumps. The vendored
+//! copy comes from a separate capture run of the same fork against the same
+//! GGUFs: its ids, logprobs and texts are identical to the reference
+//! capture; only `timings`, the server dump's `"model"` field (the capture
+//! machine's absolute GGUF path, reduced here to the release file name) and
+//! the `llama-cli` tool's own timestamps differ. The oracle therefore lives
+//! in the repository, with no local path in it, rather than depending on any
+//! single machine's capture. The environment variables above take
 //! precedence when set; `hybrid_vendored_fork_goldens_are_complete_and_consistent_bonsai2`
 //! checks the vendored copy on every run.
 
@@ -69,7 +72,7 @@ pub const PROMPTS: [&str; 3] = [
 /// Top-N width the fork's server reported (`n_probs = 10`).
 pub const TOP_N: usize = 10;
 
-/// Ruling R2' (`pkg/wave4b.rulings.md`): the worst `|Δlogprob|` over the
+/// The worst `|Δlogprob|` over the
 /// common top-10 at every step must stay at or below this absolute bound —
 /// itself below the fork's own Metal-vs-CPU spread (1e-2..6e-2, 2e-1 at one
 /// near-tie).
@@ -90,36 +93,52 @@ pub fn require_model_files() -> bool {
 /// `oxibonsai_testkit::capability`'s own canonical, single-`write_all`
 /// implementation (`oxibonsai_testkit::capability::Capability::Bonsai2Models`,
 /// which writes exactly [`CAPABILITY`]'s string) — never a second,
-/// hand-written JSONL writer.
-///
-/// HANDOVER-INFRA: `oxibonsai_testkit::capability::Capability` used to have
-/// no Bonsai 2 variant, so this function used to open and append to the
-/// manifest by hand. Now that the variant exists, this is a thin wrapper
-/// (kept, rather than inlined at each of this binary's call sites, because
-/// `greedy_gates.rs`/`layer_gate.rs` call it by this name and are not owned
-/// here) that also keeps printing the `CAPABILITY-REPORT` stderr line every
-/// gate's own log output already greps for.
+/// hand-written JSONL writer. A thin wrapper, kept rather than inlined at
+/// each call site, so it can also print the `CAPABILITY-REPORT` stderr line
+/// every gate's own log output already greps for.
 pub fn record_capability(executed: bool, test_name: &str) {
-    if executed {
-        oxibonsai_testkit::capability::record_executed(
+    record_capability_timed(executed, test_name, None);
+}
+
+/// [`record_capability`], additionally attaching `duration` as the record's
+/// `duration_ms` field when given — these gates each map a multi-GB GGUF
+/// and decode for minutes, so surfacing which one dominates a release-gate
+/// run (without re-running it under a stopwatch) is worth the one extra
+/// `Instant::now()` at the top of the gate function.
+pub fn record_capability_timed(
+    executed: bool,
+    test_name: &str,
+    duration: Option<std::time::Duration>,
+) {
+    match (executed, duration) {
+        (true, Some(d)) => oxibonsai_testkit::capability::record_executed_timed(
             oxibonsai_testkit::capability::Capability::Bonsai2Models,
             test_name,
-        );
-    } else {
-        oxibonsai_testkit::capability::record_skipped(
+            d,
+        ),
+        (true, None) => oxibonsai_testkit::capability::record_executed(
             oxibonsai_testkit::capability::Capability::Bonsai2Models,
             test_name,
-        );
+        ),
+        (false, _) => oxibonsai_testkit::capability::record_skipped(
+            oxibonsai_testkit::capability::Capability::Bonsai2Models,
+            test_name,
+        ),
     }
-    eprintln!("CAPABILITY-REPORT capability={CAPABILITY} executed={executed} test={test_name}");
+    let duration_suffix =
+        duration.map_or_else(String::new, |d| format!(" duration_ms={}", d.as_millis()));
+    eprintln!(
+        "CAPABILITY-REPORT capability={CAPABILITY} executed={executed} test={test_name}{duration_suffix}"
+    );
 }
 
 /// Serialise this binary's real-27B gates.
 ///
 /// Each gate maps a 5.9–7.2 GB GGUF and decodes for minutes. Under libtest's
 /// default parallelism the three of them would map ~20 GB at once — the
-/// line past which this machine's peer process kills a test (ruling R3: one
-/// real-27B process at a time) — and fight over the same cores. The gate
+/// line past which this machine's peer process kills a test — the memory
+/// budget only holds with one real-27B process at a time — and fight over
+/// the same cores. The gate
 /// command already passes `--test-threads=1`; this lock makes a plain
 /// `cargo test` just as safe. Take it only after [`locate_model`] found the
 /// file, so a skipping gate never waits. A poisoned lock (a sibling gate
@@ -156,8 +175,8 @@ pub fn locate_model(env_var: &str, file_name: &str, test_name: &str) -> Option<P
     found
 }
 
-/// The fork's Metal goldens (`golden2/`): `OXI_BONSAI2_GOLDEN_DIR`, else the
-/// vendored copy.
+/// The fork's Metal goldens: `OXI_BONSAI2_GOLDEN_DIR`, else the vendored
+/// copy.
 #[must_use]
 pub fn golden_dir() -> PathBuf {
     env_nonempty(GOLDEN_ENV).map_or_else(
@@ -291,7 +310,7 @@ pub fn argmax(values: &[f32]) -> usize {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-//  Per-step comparison against one golden (ruling R2')
+//  Per-step comparison against one golden (the G4 logprob-band rule)
 // ─────────────────────────────────────────────────────────────────────────
 
 /// How one decode step compares with one golden step.

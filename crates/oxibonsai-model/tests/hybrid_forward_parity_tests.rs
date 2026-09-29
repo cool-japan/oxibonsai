@@ -48,7 +48,10 @@ use oxibonsai_kernels::KernelDispatcher;
 use oxibonsai_model::hybrid::model::{HybridModel, KvPrecision};
 
 use harness::{log_softmax, parse_golden_steps, parse_prompt_tokens, top_n};
-use hybrid_gguf::{all_variant_specs, build, HybridFixtureSpec, T_TOKENS};
+use hybrid_gguf::{
+    all_variant_specs, build, hadamard_1024_variant_spec, HybridFixtureSpec,
+    HADAMARD_BLOCK_SIZE_WIDE, HIDDEN_WIDE, T_TOKENS,
+};
 
 const BASE_SEED: u64 = 0xB211_0F0A_5E11_0000;
 
@@ -62,7 +65,7 @@ const ATOL: f64 = 1e-4;
 const RTOL: f64 = 1e-4;
 
 /// `true` for the four `F32` fixture variants, which bind every projection
-/// through the dense `LinearLayer::Dense` arm (gatekeeper REQUIRED #5).
+/// through the dense `LinearLayer::Dense` arm.
 fn is_dense_variant(spec: &HybridFixtureSpec) -> bool {
     matches!(spec.quant, TensorType::F32)
 }
@@ -448,6 +451,141 @@ fn relative_l2(actual: &[f32], reference: &[f64]) -> f64 {
         return num.sqrt();
     }
     (num / den).sqrt()
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+//  The 1024-wide Hadamard variant: every folded tensor's input width is a
+//  whole multiple of 1024, the real 27B's own block size, unlike the 24
+//  canonical variants above (whose narrow `HIDDEN` is only two 128-wide
+//  blocks) — so this is the only synthetic fixture that exercises the
+//  kernel's `128->1024` NEON butterfly stages at all.
+// ═════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn hybrid_forward_matches_f64_reference_on_the_1024_wide_hadamard_variant_bonsai2() {
+    let kernel = Arc::new(KernelDispatcher::auto_detect());
+    let spec = hadamard_1024_variant_spec(BASE_SEED ^ 0x1024_BEEF);
+    let fixture = build(&spec).expect("wide fixture builds");
+
+    assert_eq!(
+        fixture.dims.hidden, HIDDEN_WIDE,
+        "spec.hidden did not reach Dims"
+    );
+    assert_eq!(
+        fixture.dims.hadamard_block, HADAMARD_BLOCK_SIZE_WIDE,
+        "spec.hadamard_block did not reach Dims"
+    );
+    for (label, width) in [
+        ("hidden", fixture.dims.hidden),
+        ("ffn", fixture.dims.ffn),
+        ("attn_output_input", fixture.dims.attn_output_input_width()),
+        ("ssm_inner_size", fixture.dims.inner_size),
+    ] {
+        assert!(
+            width % fixture.dims.hadamard_block == 0,
+            "{label} = {width} is not a whole multiple of the Hadamard block size {}",
+            fixture.dims.hadamard_block
+        );
+    }
+
+    let bytes = std::fs::read(&fixture.path).expect("fixture file readable");
+    let gguf = GgufFile::parse(&bytes).expect("wide fixture parses");
+    let tokens: Vec<u32> = fixture
+        .reference
+        .token_ids
+        .iter()
+        .map(|&t| u32::try_from(t).expect("fixture token fits u32"))
+        .collect();
+    let hidden = fixture.cfg.base.hidden_size;
+    let vocab = fixture.cfg.base.vocab_size;
+
+    // G3/G4 shape: sequential decode, every token's logits checked against
+    // the f64 reference at design §8.2's 1e-4 band — the same assertion
+    // `hybrid_forward_matches_f64_reference_on_every_bonsai2_variant` makes
+    // for the 24 narrow variants, now at the wide geometry.
+    {
+        let mut model = HybridModel::from_gguf_with_precision(
+            &gguf,
+            fixture.cfg.clone(),
+            64,
+            &kernel,
+            KvPrecision::F32,
+        )
+        .unwrap_or_else(|e| panic!("wide variant: hybrid model must load: {e}"));
+        let mut logits = vec![0.0f32; vocab];
+        for (t, &token) in tokens.iter().enumerate() {
+            model
+                .forward(token, t, &mut logits)
+                .unwrap_or_else(|e| panic!("wide variant: forward at pos {t}: {e}"));
+            let reference = &fixture.reference.logits[t];
+            let (miss, index) = worst_miss(&logits, reference);
+            assert!(
+                miss <= 0.0,
+                "wide variant: token {t} logit[{index}] = {} vs reference {} (misses the widened \
+                 4e-4 tolerance by {miss:.3e})",
+                logits[index],
+                reference[index],
+            );
+            assert_eq!(
+                argmax(&logits),
+                argmax_f64(reference),
+                "wide variant: token {t} greedy choice diverged"
+            );
+        }
+    }
+
+    // Per-layer residual capture: a fresh model instance, driven once
+    // through `forward_with_dump` over the same tokens, compared layer by
+    // layer against `fixture.reference.per_layer_hidden` so a mismatch
+    // localises to the first diverging (layer, token) pair instead of only
+    // ever showing up in the final logits.
+    let mut dump_model = HybridModel::from_gguf_with_precision(
+        &gguf,
+        fixture.cfg.clone(),
+        64,
+        &kernel,
+        KvPrecision::F32,
+    )
+    .expect("wide variant: hybrid model must load for the dump pass");
+    let mut dump_logits = vec![0.0f32; vocab];
+    let dump = dump_model
+        .forward_with_dump(&tokens, 0, Some(&mut dump_logits))
+        .expect("wide variant: dump forward");
+    assert_eq!(dump.hidden, hidden);
+    assert_eq!(dump.layers.len(), fixture.cfg.base.num_layers);
+
+    let mut first_divergence: Option<(usize, usize, f64, f64)> = None;
+    for layer in 0..fixture.cfg.base.num_layers {
+        for t in 0..tokens.len() {
+            let row = dump
+                .layer_row(layer, t)
+                .unwrap_or_else(|| panic!("wide variant: layer {layer} row {t} present"));
+            let reference =
+                &fixture.reference.per_layer_hidden[layer][t * hidden..(t + 1) * hidden];
+            let cos = cosine_similarity(row, reference);
+            let rel = relative_l2(row, reference);
+            if (cos < 0.999 || rel > 1e-3) && first_divergence.is_none() {
+                first_divergence = Some((layer, t, cos, rel));
+            }
+        }
+    }
+    assert!(
+        first_divergence.is_none(),
+        "wide variant: first diverging (layer, token, cosine, relative_l2) = {first_divergence:?} \
+         (thresholds: cosine >= 0.999, relative_l2 <= 1e-3, design §8.2 G3's per-layer criterion)"
+    );
+
+    // The dump's own final logits (the last token, `forward_with_dump`'s
+    // one-shot output) agree with the sequential pass's own last row too —
+    // proving the dump is of the real forward, not a parallel bookkeeping
+    // path, exactly as `hybrid_layer_dump_records_every_block_bonsai2`
+    // checks for the narrow fixtures.
+    let reference_last = &fixture.reference.logits[tokens.len() - 1];
+    let (miss, index) = worst_miss(&dump_logits, reference_last);
+    assert!(
+        miss <= 0.0,
+        "wide variant: dump-path final logit[{index}] misses the widened 4e-4 tolerance by {miss:.3e}"
+    );
 }
 
 // ═════════════════════════════════════════════════════════════════════════

@@ -298,7 +298,8 @@ impl KernelDispatcher {
     /// type it resolved a model to (a model tracking its own
     /// `dominant_quant_type`) calls this instead — e.g.
     /// `oxibonsai-runtime/src/engine.rs`'s `"inference engine loaded from
-    /// GGUF kernel=..."` log lines and `InferenceEngine::kernel_label`.
+    /// GGUF kernel=..."` log lines and `oxibonsai-runtime/src/engine_seam.rs`'s
+    /// `InferenceEngine::kernel_label`.
     pub fn kernel_label(&self, dominant_type: oxibonsai_core::GgufTensorType) -> String {
         format!("{dominant_type} {}", self.tier_label())
     }
@@ -377,7 +378,7 @@ impl KernelDispatcher {
     /// to *something else*: neither
     /// [`GpuBackendTrait`](crate::gpu_backend::GpuBackendTrait) nor the Metal
     /// / CUDA kernel-source sets carries a dense-FP32 GEMV entry point yet, and
-    /// the wave's parity gate requires this projection to stay byte-identical
+    /// the parity gate requires this projection to stay byte-identical
     /// to the pre-hoist body on a real model. When a GPU FP32 GEMV lands, this
     /// method is the one place that routes to it, and the change becomes
     /// visible to `apply_lm_head` without touching `oxibonsai-model` at all.
@@ -635,10 +636,23 @@ impl KernelDispatcher {
     /// ([`Int8Tier::from_env`], read fresh on every call, clamped to what
     /// this CPU supports) **and** this is a CPU-tier dispatcher. A
     /// `KernelTier::Gpu` dispatcher is never diverted — neither its GPU
-    /// kernels nor its CPU fallbacks — so every GPU path and the
-    /// CPU-vs-Metal determinism guard stay independent of the selector.
-    /// `None`, the default, means every native GEMV/GEMM runs exactly the
-    /// per-tier kernel it ran before the INT8 tier existed.
+    /// kernels nor its CPU fallbacks — so a GPU engine's own forward pass
+    /// and the CPU-vs-Metal determinism guard stay independent of the
+    /// selector. `None`, the default, means every native GEMV/GEMM runs
+    /// exactly the per-tier kernel it ran before the INT8 tier existed.
+    ///
+    /// This is per-*dispatcher*, not per-engine: `oxibonsai-model`'s
+    /// batched CPU prefill (`prefill_cpu::prefill_dispatcher`) and its
+    /// batched embedding pass always build their own CPU-tier dispatcher and
+    /// call through it, so a GPU engine whose fused GPU prefill is declined
+    /// or fails, or a batched embedding call on any engine, still runs that
+    /// CPU-side work on the INT8 tier when the variable is set — the
+    /// sentence above is only about *this* dispatcher's own tier. The
+    /// per-token embedding fallback (`forward_hidden_sequential`, taken when
+    /// the batched pass declines) is not one of these: it runs on the
+    /// *caller's* dispatcher, so it is diverted only when that dispatcher is
+    /// itself CPU-tier with the variable set, exactly like any other
+    /// per-token forward call.
     ///
     /// Every native entry point asks this once, at entry:
     /// `OneBitKernel::{gemv, gemm}`, `TernaryKernel::{gemv_ternary_g128,
@@ -1566,7 +1580,7 @@ mod tests {
     }
 
     /// K-12/M-23: every tier's `gemv_f32` must be byte-identical to the
-    /// free-function kernel — the LM-head logits the wave's parity gate
+    /// free-function kernel — the LM-head logits the parity gate
     /// measures come out of exactly this path.
     #[test]
     fn gemv_f32_is_byte_identical_across_every_tier() {

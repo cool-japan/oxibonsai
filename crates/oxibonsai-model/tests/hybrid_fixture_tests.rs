@@ -1,12 +1,16 @@
 //! Integration tests for the synthetic hybrid GGUF fixture generator and
-//! its embedded f64 scalar reference model (B2-16, `bonsai2-design.md`
+//! its embedded f64 scalar reference model (`bonsai2-design.md`
 //! §7.1/§7.2/§8.2, findings T-06/T-07).
 //!
 //! See `fixtures/hybrid_gguf.rs`'s module doc for exactly what "matches the
-//! f64 reference model" means for this package (the real hybrid loader
-//! this fixture will eventually feed does not exist in this package's
-//! dependency graph — see that doc for the honest accounting of what is,
-//! and is not, verified here).
+//! f64 reference model" means here. The real hybrid loader
+//! (`oxibonsai_model::hybrid::model::HybridModel`) lives in this same
+//! crate and is exercised against this fixture in
+//! `hybrid_forward_parity_tests.rs`, which is why the checks in *this*
+//! file stay at the generator/reference level: byte fidelity of the
+//! written GGUF, the f64 reference's own internal self-consistency, and —
+//! below — the f64 primitives' agreement with the real, SIMD `oxibonsai_kernels`
+//! implementations they model.
 //!
 //! Every test name below contains `hybrid_fixture` so the package gate's
 //! substring filter (`cargo test -p oxibonsai-model --all-features
@@ -30,11 +34,18 @@ use oxibonsai_core::quant_ternary::{
 use oxibonsai_core::{
     count_plus_two_codes, BlockPQ2_0, BlockPTQ1_0, BlockQ1_0G128, BlockQ2_0G64, BlockTQ2_0_g128,
 };
+use oxibonsai_kernels::gated_delta_net::{gdn_step_with, GdnDims, GdnGates, GdnHeadOrder, GdnPath};
+use oxibonsai_kernels::hadamard::fwht_forward_signed;
+use oxibonsai_kernels::norms::{l2_norm_simd, rms_norm_gated_simd};
+use oxibonsai_kernels::rope_mrope::rope_partial_splithalf_simd;
+use oxibonsai_kernels::ssm_ops::causal_conv1d_k4_decode;
 
 use hybrid_gguf::{
-    all_variant_specs, build, build_invalid_ungrouped_fixture, fwht_round_trip_check,
-    gdn_cross_check, partial_rope_check, HybridFixtureSpec, ALL_QUANT_TYPES, FFN,
-    HADAMARD_BLOCK_SIZE, HEAD_DIM, HIDDEN, ROPE_DIM, T_TOKENS, VOCAB,
+    all_variant_specs, apply_partial_rope_f64, build, build_invalid_ungrouped_fixture,
+    causal_conv1d_step_f64, fwht_forward_signed_f64, fwht_round_trip_check,
+    gated_rms_norm_head_f64, gdn_cross_check, gdn_step_fused_f64, l2_norm_f64, partial_rope_check,
+    HybridFixtureSpec, Xorshift64Star, ALL_QUANT_TYPES, FFN, HADAMARD_BLOCK_SIZE,
+    HADAMARD_BLOCK_SIZE_WIDE, HEAD_DIM, HIDDEN, ROPE_DIM, T_TOKENS, VOCAB,
 };
 
 const BASE_SEED: u64 = 0xB0A5_1234_5678_9ABC;
@@ -179,6 +190,8 @@ fn hybrid_fixture_dequant_reproduces_planned_values_for_every_quant_format() {
             hadamard: true,
             gdn_v_grouped: true,
             seed: BASE_SEED ^ 0xAAAA,
+            hidden: HIDDEN,
+            hadamard_block: HADAMARD_BLOCK_SIZE,
         };
         let fixture = build(&spec).expect("fixture should build");
         let bytes = std::fs::read(&fixture.path).expect("read fixture file");
@@ -274,6 +287,8 @@ fn hybrid_fixture_plain_f32_tensors_round_trip_regardless_of_quant_choice() {
         hadamard: false,
         gdn_v_grouped: false,
         seed: BASE_SEED ^ 0xBEEF,
+        hidden: HIDDEN,
+        hadamard_block: HADAMARD_BLOCK_SIZE,
     };
     let fixture = build(&spec).expect("fixture should build");
     let bytes = std::fs::read(&fixture.path).expect("read fixture file");
@@ -311,6 +326,8 @@ fn hybrid_fixture_bf16_tensors_round_trip_and_are_never_folded() {
         hadamard: true,
         gdn_v_grouped: true,
         seed: BASE_SEED ^ 0xC0DE,
+        hidden: HIDDEN,
+        hadamard_block: HADAMARD_BLOCK_SIZE,
     };
     let fixture = build(&spec).expect("fixture should build");
     let bytes = std::fs::read(&fixture.path).expect("read fixture file");
@@ -350,6 +367,8 @@ fn hybrid_fixture_tq2_0_g128_bytes_sniff_as_qs_first() {
         hadamard: false,
         gdn_v_grouped: false,
         seed: BASE_SEED ^ 1,
+        hidden: HIDDEN,
+        hadamard_block: HADAMARD_BLOCK_SIZE,
     };
     let fixture = build(&spec).expect("fixture should build");
     let bytes = std::fs::read(&fixture.path).expect("read fixture file");
@@ -370,6 +389,8 @@ fn hybrid_fixture_q2_0_g64_bytes_sniff_as_d_first_18() {
         hadamard: false,
         gdn_v_grouped: false,
         seed: BASE_SEED ^ 2,
+        hidden: HIDDEN,
+        hadamard_block: HADAMARD_BLOCK_SIZE,
     };
     let fixture = build(&spec).expect("fixture should build");
     let bytes = std::fs::read(&fixture.path).expect("read fixture file");
@@ -397,6 +418,8 @@ fn hybrid_fixture_pq2_0_bytes_sniff_as_d_first_34() {
         hadamard: false,
         gdn_v_grouped: false,
         seed: BASE_SEED ^ 3,
+        hidden: HIDDEN,
+        hadamard_block: HADAMARD_BLOCK_SIZE,
     };
     let fixture = build(&spec).expect("fixture should build");
     let bytes = std::fs::read(&fixture.path).expect("read fixture file");
@@ -412,7 +435,7 @@ fn hybrid_fixture_pq2_0_bytes_sniff_as_d_first_34() {
 
 // ═════════════════════════════════════════════════════════════════════════
 // id-42 resolution via the real entry point (design §7.2 "id-42 resolution"
-// row, wave-2.5 addendum item 4): `general.quantization_version` plus
+// row): `general.quantization_version` plus
 // `resolve_type_42_with_sample` — not just the lower-level
 // `sniff_two_bit_layout` probe above — must resolve each wire-id-42 fixture
 // variant to the right `GgufTensorType`.
@@ -425,6 +448,8 @@ fn hybrid_fixture_tq2_0_g128_resolves_via_resolve_type_42_with_sample() {
         hadamard: false,
         gdn_v_grouped: false,
         seed: BASE_SEED ^ 4,
+        hidden: HIDDEN,
+        hadamard_block: HADAMARD_BLOCK_SIZE,
     };
     let fixture = build(&spec).expect("fixture should build");
     let bytes = std::fs::read(&fixture.path).expect("read fixture file");
@@ -478,6 +503,8 @@ fn hybrid_fixture_q2_0_g64_resolves_via_resolve_type_42_with_sample() {
         hadamard: false,
         gdn_v_grouped: false,
         seed: BASE_SEED ^ 5,
+        hidden: HIDDEN,
+        hadamard_block: HADAMARD_BLOCK_SIZE,
     };
     let fixture = build(&spec).expect("fixture should build");
     let bytes = std::fs::read(&fixture.path).expect("read fixture file");
@@ -530,6 +557,8 @@ fn hybrid_fixture_same_seed_is_byte_identical_and_reference_identical() {
         hadamard: true,
         gdn_v_grouped: true,
         seed: 424242,
+        hidden: HIDDEN,
+        hadamard_block: HADAMARD_BLOCK_SIZE,
     };
     let a = build(&spec).expect("first build");
     let b = build(&spec).expect("second build");
@@ -557,6 +586,8 @@ fn hybrid_fixture_different_seeds_produce_different_bytes_and_reference() {
         hadamard: true,
         gdn_v_grouped: true,
         seed: 1,
+        hidden: HIDDEN,
+        hadamard_block: HADAMARD_BLOCK_SIZE,
     };
     let spec_b = HybridFixtureSpec { seed: 2, ..spec_a };
     let a = build(&spec_a).expect("build a");
@@ -580,6 +611,8 @@ fn hybrid_fixture_temp_file_is_removed_on_drop() {
         hadamard: false,
         gdn_v_grouped: false,
         seed: 7,
+        hidden: HIDDEN,
+        hadamard_block: HADAMARD_BLOCK_SIZE,
     };
     let fixture = build(&spec).expect("build");
     let path = fixture.path.clone();
@@ -706,6 +739,8 @@ fn hybrid_fixture_hadamard_on_changes_the_forward_output_vs_off() {
         hadamard: true,
         gdn_v_grouped: true,
         seed: 555,
+        hidden: HIDDEN,
+        hadamard_block: HADAMARD_BLOCK_SIZE,
     };
     let with_had = build(&base).expect("build with hadamard");
     let without_had = build(&HybridFixtureSpec {
@@ -726,6 +761,8 @@ fn hybrid_fixture_v_head_grouping_changes_v_per_k_and_the_forward_output() {
         hadamard: true,
         gdn_v_grouped: true,
         seed: 777,
+        hidden: HIDDEN,
+        hadamard_block: HADAMARD_BLOCK_SIZE,
     };
     let grouped = build(&base).expect("build grouped");
     let trivial = build(&HybridFixtureSpec {
@@ -752,6 +789,8 @@ fn hybrid_fixture_tensor_set_covers_every_binding_the_hybrid_loader_needs() {
         hadamard: true,
         gdn_v_grouped: true,
         seed: 42,
+        hidden: HIDDEN,
+        hadamard_block: HADAMARD_BLOCK_SIZE,
     };
     let fixture = build(&spec).expect("build");
     let names: BTreeSet<&str> = fixture.tensor_names().collect();
@@ -811,4 +850,246 @@ fn hybrid_fixture_tensor_set_covers_every_binding_the_hybrid_loader_needs() {
 #[test]
 fn hybrid_fixture_q1_0_g128_scale_is_exactly_representable_in_f16() {
     assert_eq!(f16::from_f32(1.0).to_f32(), 1.0);
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// Kernel cross-checks: every f64 primitive `fixtures/hybrid_gguf.rs`'s
+// reference forward is built from is checked above only against itself, in
+// a different algebraic form (`fwht_round_trip_check`/`gdn_cross_check`/
+// `partial_rope_check`). The six tests below instead compare each f64
+// primitive directly against the real, SIMD `oxibonsai_kernels` function it
+// models, on deterministic random inputs neither side has seen before — an
+// `f32` kernel vs an `f64` scalar reference, so agreement is checked to a
+// relative tolerance (`REL_TOL`) rather than bit-exactly.
+const REL_TOL: f32 = 1e-4;
+
+fn assert_allclose_f32_f64(actual: &[f32], reference: &[f64], context: &str) {
+    assert_eq!(actual.len(), reference.len(), "{context}: length mismatch");
+    for (i, (&a, &b)) in actual.iter().zip(reference).enumerate() {
+        let b32 = b as f32;
+        let diff = (a - b32).abs();
+        let bound = REL_TOL * b32.abs().max(1.0);
+        assert!(
+            diff <= bound,
+            "{context}[{i}]: kernel={a} f64_reference={b} diff={diff:.3e} > bound={bound:.3e}"
+        );
+    }
+}
+
+/// `fwht_forward_signed` (kernel) vs `fwht_forward_signed_f64` (reference),
+/// at both the narrow fixtures' block size and the real 27B's own 1024 —
+/// the width the 24 canonical fixture variants never exercise.
+#[test]
+fn hybrid_fixture_fwht_forward_signed_matches_the_kernel_at_block_128_and_1024() {
+    for block in [HADAMARD_BLOCK_SIZE, HADAMARD_BLOCK_SIZE_WIDE] {
+        let mut rng = Xorshift64Star::new(0xF00D_0000 ^ block as u64);
+        let n_blocks = 3;
+        let width = block * n_blocks;
+        let x64: Vec<f64> = (0..width).map(|_| rng.next_range_f64(-2.0, 2.0)).collect();
+        let signs64: Vec<f64> = (0..width)
+            .map(|_| {
+                if rng.next_range_f64(-1.0, 1.0) < 0.0 {
+                    -1.0
+                } else {
+                    1.0
+                }
+            })
+            .collect();
+        let reference = fwht_forward_signed_f64(&x64, &signs64, block);
+
+        let mut x32: Vec<f32> = x64.iter().map(|&v| v as f32).collect();
+        let signs32: Vec<f32> = signs64.iter().map(|&v| v as f32).collect();
+        fwht_forward_signed(&mut x32, &signs32, block).expect("fwht_forward_signed");
+
+        assert_allclose_f32_f64(&x32, &reference, &format!("fwht block={block}"));
+    }
+}
+
+/// `l2_norm_simd` (kernel) vs `l2_norm_f64` (reference).
+#[test]
+fn hybrid_fixture_l2_norm_simd_matches_the_f64_reference() {
+    let mut rng = Xorshift64Star::new(0x1207_0000);
+    let n = HEAD_DIM;
+    let eps = 1e-6;
+    let x64: Vec<f64> = (0..n).map(|_| rng.next_range_f64(-3.0, 3.0)).collect();
+    let reference = l2_norm_f64(&x64, eps);
+
+    let x32: Vec<f32> = x64.iter().map(|&v| v as f32).collect();
+    let mut out32 = vec![0.0f32; n];
+    l2_norm_simd(&x32, &mut out32, eps as f32).expect("l2_norm_simd");
+
+    assert_allclose_f32_f64(&out32, &reference, "l2_norm");
+}
+
+/// `rms_norm_gated_simd` (kernel) vs `gated_rms_norm_head_f64` (reference).
+#[test]
+fn hybrid_fixture_rms_norm_gated_simd_matches_the_f64_reference() {
+    let mut rng = Xorshift64Star::new(0x6A7E_D000);
+    let n = HEAD_DIM;
+    let eps = 1e-6;
+    let o64: Vec<f64> = (0..n).map(|_| rng.next_range_f64(-2.0, 2.0)).collect();
+    let z64: Vec<f64> = (0..n).map(|_| rng.next_range_f64(-2.0, 2.0)).collect();
+    let w64: Vec<f64> = (0..n).map(|_| rng.next_range_f64(0.5, 1.5)).collect();
+    let reference = gated_rms_norm_head_f64(&o64, &z64, &w64, eps);
+
+    let o32: Vec<f32> = o64.iter().map(|&v| v as f32).collect();
+    let z32: Vec<f32> = z64.iter().map(|&v| v as f32).collect();
+    let w32: Vec<f32> = w64.iter().map(|&v| v as f32).collect();
+    let mut out32 = vec![0.0f32; n];
+    rms_norm_gated_simd(&o32, &w32, &z32, &mut out32, eps as f32).expect("rms_norm_gated_simd");
+
+    assert_allclose_f32_f64(&out32, &reference, "rms_norm_gated");
+}
+
+/// `rope_partial_splithalf_simd` (kernel, precomputed cos/sin) vs
+/// `apply_partial_rope_f64` (reference, computes `theta` internally) — the
+/// same `theta = pos * freq_base^(-2*ic/n_rot)` formula, fed to the kernel
+/// as the `cos`/`sin` tables it expects.
+#[test]
+fn hybrid_fixture_rope_partial_splithalf_simd_matches_the_f64_reference() {
+    let mut rng = Xorshift64Star::new(0x40E5_0000);
+    let head_dim = HEAD_DIM;
+    let n_rot = ROPE_DIM;
+    let pos = 17usize;
+    let freq_base = 10_000.0f64;
+    let x64: Vec<f64> = (0..head_dim)
+        .map(|_| rng.next_range_f64(-2.0, 2.0))
+        .collect();
+    let mut reference = x64.clone();
+    apply_partial_rope_f64(&mut reference, pos, n_rot, freq_base);
+
+    let half = n_rot / 2;
+    let mut cos = vec![0.0f32; half];
+    let mut sin = vec![0.0f32; half];
+    for (ic, (c, s)) in cos.iter_mut().zip(sin.iter_mut()).enumerate() {
+        let theta = pos as f64 * freq_base.powf(-2.0 * ic as f64 / n_rot as f64);
+        *c = theta.cos() as f32;
+        *s = theta.sin() as f32;
+    }
+    let x32: Vec<f32> = x64.iter().map(|&v| v as f32).collect();
+    let mut out32 = vec![0.0f32; head_dim];
+    rope_partial_splithalf_simd(&x32, &mut out32, head_dim, n_rot, &cos, &sin)
+        .expect("rope_partial_splithalf_simd");
+
+    assert_allclose_f32_f64(&out32, &reference, "rope_partial_splithalf");
+}
+
+/// `causal_conv1d_k4_decode` (kernel) vs `causal_conv1d_step_f64`
+/// (reference) — same channel-major `[channels][KC-1]` state layout and
+/// `[channels][KC]` weight layout, so this cross-check translates only the
+/// flat-vs-nested `Vec` representation, not the semantics.
+#[test]
+fn hybrid_fixture_causal_conv1d_k4_decode_matches_the_f64_reference() {
+    const KC: usize = 4;
+    let channels = HEAD_DIM;
+    let mut rng = Xorshift64Star::new(0xC04F_0000);
+
+    let state_nested: Vec<Vec<f64>> = (0..channels)
+        .map(|_| (0..KC - 1).map(|_| rng.next_range_f64(-1.0, 1.0)).collect())
+        .collect();
+    let w_nested: Vec<Vec<f64>> = (0..channels)
+        .map(|_| (0..KC).map(|_| rng.next_range_f64(-1.0, 1.0)).collect())
+        .collect();
+    let x64: Vec<f64> = (0..channels)
+        .map(|_| rng.next_range_f64(-1.0, 1.0))
+        .collect();
+
+    let mut state_ref = state_nested.clone();
+    let reference = causal_conv1d_step_f64(&mut state_ref, &x64, &w_nested, channels, KC);
+
+    let mut state_flat: Vec<f32> = state_nested
+        .iter()
+        .flat_map(|row| row.iter().map(|&v| v as f32))
+        .collect();
+    let w_flat: Vec<f32> = w_nested
+        .iter()
+        .flat_map(|row| row.iter().map(|&v| v as f32))
+        .collect();
+    let x32: Vec<f32> = x64.iter().map(|&v| v as f32).collect();
+    let mut out32 = vec![0.0f32; channels];
+    causal_conv1d_k4_decode(&mut state_flat, &x32, &w_flat, &mut out32)
+        .expect("causal_conv1d_k4_decode");
+
+    assert_allclose_f32_f64(&out32, &reference, "causal_conv1d_k4_decode output");
+
+    // The post-step state must agree too — the same shift-and-append the
+    // reference performs on `state_ref` in place.
+    let state_ref_flat: Vec<f64> = state_ref.into_iter().flatten().collect();
+    assert_allclose_f32_f64(
+        &state_flat,
+        &state_ref_flat,
+        "causal_conv1d_k4_decode state",
+    );
+}
+
+/// `gdn_step_with` (kernel) vs `gdn_step_fused_f64` (reference), at a
+/// single head (`n_k_heads = n_v_heads = 1`) so the cross-check is of the
+/// per-head recurrence math itself, not the multi-head grouping/tiling this
+/// crate's own `gdn_cross_check`/`hybrid_fixture_v_head_grouping_...` tests
+/// already cover separately.
+#[test]
+fn hybrid_fixture_gdn_step_with_matches_the_f64_reference() {
+    let mut rng = Xorshift64Star::new(0x6D17_0000);
+    let head_k_dim = HEAD_DIM;
+    let head_v_dim = HEAD_DIM;
+    let state_len = head_k_dim * head_v_dim;
+
+    let state64: Vec<f64> = (0..state_len)
+        .map(|_| rng.next_range_f64(-1.0, 1.0))
+        .collect();
+    let q64: Vec<f64> = (0..head_k_dim)
+        .map(|_| rng.next_range_f64(-1.0, 1.0))
+        .collect();
+    let k64: Vec<f64> = (0..head_k_dim)
+        .map(|_| rng.next_range_f64(-1.0, 1.0))
+        .collect();
+    let v64: Vec<f64> = (0..head_v_dim)
+        .map(|_| rng.next_range_f64(-1.0, 1.0))
+        .collect();
+    let alpha_raw = rng.next_range_f64(-2.0, 2.0);
+    let beta_raw = rng.next_range_f64(-2.0, 2.0);
+    let dt_bias = rng.next_range_f64(-1.0, 1.0);
+    // `a_neg` (`ssm_a`, `A = -exp(A_log)`) is always negative (design §7.0).
+    let a_neg = -rng.next_range_f64(0.1, 2.0);
+
+    let mut state_ref = state64.clone();
+    let (out_ref, _decay, _delta) = gdn_step_fused_f64(
+        &mut state_ref,
+        &q64,
+        &k64,
+        &v64,
+        alpha_raw,
+        beta_raw,
+        dt_bias,
+        a_neg,
+        head_k_dim,
+        head_v_dim,
+    );
+
+    let mut state32: Vec<f32> = state64.iter().map(|&v| v as f32).collect();
+    let q32: Vec<f32> = q64.iter().map(|&v| v as f32).collect();
+    let k32: Vec<f32> = k64.iter().map(|&v| v as f32).collect();
+    let v32: Vec<f32> = v64.iter().map(|&v| v as f32).collect();
+    let alpha_raw32 = [alpha_raw as f32];
+    let beta_raw32 = [beta_raw as f32];
+    let dt_bias32 = [dt_bias as f32];
+    let a_neg32 = [a_neg as f32];
+    let gates = GdnGates::bonsai2(&alpha_raw32, &beta_raw32, &dt_bias32, &a_neg32);
+    let dims = GdnDims::new(1, 1, head_k_dim, head_v_dim);
+    let mut out32 = vec![0.0f32; head_v_dim];
+    gdn_step_with(
+        &mut state32,
+        &q32,
+        &k32,
+        &v32,
+        &gates,
+        &mut out32,
+        &dims,
+        GdnHeadOrder::default(),
+        GdnPath::default(),
+    )
+    .expect("gdn_step_with");
+
+    assert_allclose_f32_f64(&out32, &out_ref, "gdn_step_with output");
+    assert_allclose_f32_f64(&state32, &state_ref, "gdn_step_with state");
 }

@@ -1,0 +1,38 @@
+{
+  "_provenance": "Vendored from the PrismML llama.cpp fork's own /v1/chat/completions response for prompt 1 ('What is 2+2? Answer briefly.', default xhigh reasoning effort, add_generation_prompt=true). Trimmed to the fields this crate's G8 gate (reasoning.rs's ReasoningSplitter vs this capture) actually needs: the final reasoning_content/content split and the raw per-token generation stream (id + token only -- bytes/logprob/top_logprobs and the run-specific model path/timings/usage/id fields are dropped, since they carry no information this gate checks and the model path is a local filesystem path from the capturing host).",
+  "message": {
+    "content": "4",
+    "reasoning_content": "We need to answer user: \"What is 2+2? Answer briefly.\" Simple. Final: 4.\n"
+  },
+  "token_stream": [
+    { "id": 1596, "token": "We" },
+    { "id": 1144, "token": " need" },
+    { "id": 310, "token": " to" },
+    { "id": 4087, "token": " answer" },
+    { "id": 1156, "token": " user" },
+    { "id": 25, "token": ":" },
+    { "id": 328, "token": " \"" },
+    { "id": 3710, "token": "What" },
+    { "id": 369, "token": " is" },
+    { "id": 220, "token": " " },
+    { "id": 17, "token": "2" },
+    { "id": 10, "token": "+" },
+    { "id": 17, "token": "2" },
+    { "id": 30, "token": "?" },
+    { "id": 21134, "token": " Answer" },
+    { "id": 25899, "token": " briefly" },
+    { "id": 1149, "token": ".\"" },
+    { "id": 8722, "token": " Simple" },
+    { "id": 13, "token": "." },
+    { "id": 12650, "token": " Final" },
+    { "id": 25, "token": ":" },
+    { "id": 220, "token": " " },
+    { "id": 19, "token": "4" },
+    { "id": 13, "token": "." },
+    { "id": 198, "token": "\n" },
+    { "id": 248069, "token": "</think>" },
+    { "id": 271, "token": "\n\n" },
+    { "id": 19, "token": "4" },
+    { "id": 248046, "token": "" }
+  ]
+}

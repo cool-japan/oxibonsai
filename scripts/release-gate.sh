@@ -62,6 +62,14 @@
 #     producer test was never converted to use this contract at all).
 #   - "test" (string, required): the fully-qualified test name, for
 #     diagnostics when a required capability's evidence is missing/stale.
+#   - "duration_ms" (integer, OPTIONAL): the record's own measured
+#     wall-clock cost in milliseconds (`oxibonsai_testkit::capability::
+#     record_timed`/`record_executed_timed`), omitted entirely by any call
+#     site that has not opted into measuring it. `check_capability_manifest`
+#     below prints it on each capability's own "OK" line when at least one
+#     matching record carries it, so the real-model gates' relative cost is
+#     visible in this script's own output without re-running under a
+#     stopwatch.
 # This script DELETES the manifest before invoking scripts/ci.sh and only
 # trusts entries written *during this run* (mtime check) — a leftover file
 # from a previous invocation, or one for a different feature set, must
@@ -85,84 +93,51 @@
 #     a run without the operator saying so out loud. --skip-legacy-models is
 #     that explicit statement; it is visible in this script's own output.
 #   - "bonsai2-models" is required on Darwin unless --skip-bonsai2-models is
-#     passed (HANDOVER-INFRA, same shape as "legacy-models" above, for the
-#     Bonsai 2 27B target instead of the 1.7B/8B/1-bit legacy models): the
-#     evidence that `oxibonsai-model::hybrid_forward_parity_tests`'s three
-#     real-27B gates (PQ2_0, PTQ1_0, the f64-layer reference) and
-#     `oxibonsai-runtime::bonsai2_engine_tests`'s two real-27B gates actually
-#     RAN against the shipped `Ternary-Bonsai-2-27B-{PQ2_0,PTQ1_0}.gguf`
-#     files, not merely that they self-skipped cleanly. --skip-bonsai2-models
-#     is the explicit "this release carries no such evidence" statement.
+#     passed, same shape as "legacy-models" above, for the Bonsai 2 27B
+#     target instead of the 1.7B/8B/1-bit legacy models: the evidence that
+#     `oxibonsai-model::hybrid_forward_parity_tests`'s three real-27B gates
+#     (PQ2_0, PTQ1_0, the f64-layer reference),
+#     `oxibonsai-runtime::bonsai2_engine_tests`'s two real-27B gates and
+#     `oxibonsai-runtime::bonsai2_runtime_tests`'s two real-vocabulary/
+#     chat-template gates (G6/G7) and two `oxibonsai info --json` gates (G9,
+#     one per quant band) actually RAN against the shipped
+#     `Ternary-Bonsai-2-27B-{PQ2_0,PTQ1_0}.gguf` files, not merely that they
+#     self-skipped cleanly. --skip-bonsai2-models is the explicit "this
+#     release carries no such evidence" statement. This script additionally
+#     requires each of those nine gates' OWN test name to have an
+#     `executed: true` record (`check_capability_manifest`'s
+#     `--require-tests` option, below) — a single record from any one of them
+#     is not enough, unlike a plain capability name.
+#   - "bonsai2-models" ALSO covers, on Darwin unless --skip-bonsai2-metal is
+#     passed, `oxibonsai-model::hybrid_metal_gates`'s two Metal 27B gates
+#     (CPU-vs-Metal token parity and decode throughput) — required by name,
+#     same as the five gates above. --skip-bonsai2-metal is the narrower opt
+#     out: it drops only the Metal-specific evidence requirement, not the
+#     whole "bonsai2-models" capability.
 #
 # ── THE REAL-MODEL PARITY STAGE MUST BE SERIALIZED ──────────────────────────
-# The six real-model parity tests (three in oxibonsai-model, three in
-# oxibonsai-runtime) each load a multi-GB GGUF per kernel tier and decode 64
-# greedy tokens through it. Run in parallel on an 8-core/24 GB M3 they drove
-# the machine to load average 96 (measured, wave-3.5 triage). Stage 1b below
-# therefore invokes them directly with `--test-threads=1`, and they carry an
-# in-binary mutex ([`gpu_serial`]) because the Metal decode path is a
-# process-global singleton.
+# Stage 1b's real legacy-model gates (the six cross-tier parity tests, three
+# in oxibonsai-model and three in oxibonsai-runtime, plus the M-18 / M-02 /
+# M-08 / CLI-CORE / CONVERT-EXPORT measurement gates, all in the two
+# `legacy_parity_tests` binaries), stage 1c's nine real
+# Bonsai 2 27B gates (`hybrid_forward_parity_tests`'s three
+# `hybrid_real_27b_*_bonsai2` cases, `bonsai2_engine_tests`'s two
+# `bonsai2_*_engine_greedy_matches_the_fork_goldens` cases, and
+# `bonsai2_runtime_tests`'s four `real_27b_*_bonsai2` G6/G7/G9 cases) plus, on
+# Darwin, `hybrid_metal_gates`'s two Metal 27B cases, and stage 1d's real-model
+# lib/bin cases each load a multi-GB GGUF and decode through it. Run
+# concurrently on an 8-core/24 GB M3 they have driven the machine's load
+# average past 90. Stages 1b-1d therefore invoke every real-model test
+# binary directly with `--test-threads=1`, one binary at a time, and the
+# heavier tests additionally carry an in-binary mutex
+# (`real_model_serial`/`gpu_serial`/`REAL_MODEL_LOCK`) because the Metal
+# decode path is a process-global singleton. `.config/nextest.toml`
+# separately excludes the real-27B and legacy real-model cases from a plain
+# `cargo nextest run` via `default-filter`, and pins the ones it does list
+# through nextest to a single-threaded `real-model-gate` test group — a
+# nextest invocation is never how this gate itself collects real-model
+# evidence; stages 1b-1d's direct `cargo test --release` calls are.
 #
-# NOTE for whoever is granted `.config/nextest.toml` (wave3.5.md SS6: it has
-# no wave-3.5 owner — CI-GATE (wave 1) and FIX-02-CI (wave 1.5), its only
-# prior owners, are both closed, and this exact gap was measured but is
-# OUT OF SCOPE for this file's package to fix): `scripts/ci.sh`'s
-# `cargo nextest run --workspace [--all-features] --profile ci`/`--profile
-# default` stages (both invoked regardless of `--release`; ci.sh's
-# `--release` only affects missing-tool strictness and CUDA_ARGS, NOT the
-# cargo profile of these two nextest stages, which build DEBUG) run each
-# test in its OWN PROCESS, which neither `gpu_serial`'s in-binary mutex nor
-# this script's `--test-threads=1` (stage 1b, above) constrains. On a host
-# whose checkout has a populated `models/` (unlike the isolated worktree
-# this exact gap was measured in, whose `models/` carries only a
-# `.gitkeep` — that is the only reason this has not yet redded a real
-# `--workspace` nextest run) those two stages will schedule the six
-# real-model `legacy_parity_tests`
-# gates CONCURRENTLY, in a DEBUG build, which measured a load average of 96
-# on this 8-core/24 GB M3 (wave-3.5 triage). Two fixes were drafted and
-# verified not to regress `cargo nextest list`'s parse, but NEITHER was
-# applied here because `.config/nextest.toml` is not this package's file to
-# edit (edit-only-owned-files is a hard rule this session runs under) —
-# whoever is granted it should pick ONE:
-#
-#   (A, preferred) exclude the binary from these nextest stages entirely,
-#   via `default-filter` (confirmed supported: `cargo nextest run --help`
-#   lists `--ignore-default-filter` on nextest 0.9.108, the version on this
-#   host) on `[profile.default]` and `[profile.ci]`:
-#       default-filter = 'not binary(legacy_parity_tests)'
-#   This does NOT reintroduce `#[ignore]` / D-6(4)'s hole: the tests still
-#   run, fully, serialized, in release, right here in stage 1b — they are
-#   just never SCHEDULED by nextest, which has no way to serialize them
-#   across its own process-per-test model anyway. A developer who wants to
-#   run them through nextest locally still can, explicitly, with
-#   `cargo nextest run -E 'binary(legacy_parity_tests)' --ignore-default-filter`.
-#   This sidesteps fix (B)'s timeout-calibration problem entirely.
-#
-#   (B, the alternative, if (A) is rejected for some reason) a `test-group`
-#   with `max-threads = 1` over `binary(legacy_parity_tests)`, e.g.:
-#       [test-groups]
-#       real-model-gate = { max-threads = 1 }
-#       [[profile.default.overrides]]
-#       filter = 'binary(legacy_parity_tests)'
-#       test-group = 'real-model-gate'
-#       slow-timeout = { period = "300s", terminate-after = 8 }
-#       [[profile.ci.overrides]]
-#       filter = 'binary(legacy_parity_tests)'
-#       test-group = 'real-model-gate'
-#       slow-timeout = { period = "300s", terminate-after = 8 }
-#   CAVEAT (measured, wave-3.5 verifier, not previously stated): the 300s x
-#   8 = 2400s ceiling above is calibrated on the RELEASE-profile timings this
-#   triage measured (776.92s for the model crate's 3 gates, 1109.20s for the
-#   runtime crate's 3 gates) — but ci.sh's nextest stages build DEBUG (see
-#   above), where these gates run measurably slower and 2400s is UNVALIDATED
-#   and likely insufficient; measure the debug timing before trusting it.
-#   TOML FOOTGUN: `.config/nextest.toml` already has bare-key
-#   `[profile.default]`/`[profile.ci]`/`[profile.fast]` tables; append BOTH
-#   new array-of-tables (`[[profile.default.overrides]]`,
-#   `[[profile.ci.overrides]]`) and `[test-groups]` at the END of the file —
-#   an array-of-tables placed mid-file silently re-parents every bare key
-#   that follows it into the array's own table. `cargo nextest list` is the
-#   cheap way to validate the result parses as intended.
 # A capability with zero "executed": true records for this run — including
 # because the manifest has zero records for it at all, e.g. because no
 # producer test has adopted this contract yet — is INCOMPLETE, and this
@@ -181,6 +156,25 @@
 #   ./scripts/release-gate.sh --skip-bonsai2-models  # release WITHOUT real Bonsai 2
 #                                                     # 27B evidence (state it in the
 #                                                     # release notes)
+#   OXIBONSAI_M08_RUN_LONG=1 ./scripts/release-gate.sh
+#                                                     # MANDATORY SEPARATE RELEASE STEP:
+#                                                     # also run and require M-08's
+#                                                     # 20000-token YaRN gate (below)
+#
+# ── M-08: the 20000-token YaRN gate is a separate, mandatory release step ──
+# `oxibonsai-runtime::legacy_parity_tests::
+# m08_yarn_scaling_moves_real_bonsai_8b_logits_at_20000_tokens` proves that
+# `Bonsai-8B.gguf`'s declared YaRN scaling (factor 4, original context 16384)
+# moves the real model's logits beyond float noise after a 20000-token
+# natural-text prompt, against a copy of the same file patched to factor 1.0.
+# It takes two real decodes of roughly an hour each, so a default run of this
+# script leaves it out (it self-skips with `executed: false`). Every release
+# still needs one passing run of it on the release commit: run this script
+# once with `OXIBONSAI_M08_RUN_LONG=1` exported. Stage 1b then runs the gate
+# (serialized, release profile — `scripts/ci.sh` keeps it out of its own
+# parallel nextest stages) and the capability check requires its
+# `executed: true` record by name (`legacy_models_require_tests_arg`); a
+# self-skip, a timeout or a failure is a failed release gate.
 #
 # Copyright 2026 COOLJAPAN OU (Team KitaSan)
 # SPDX-License-Identifier: Apache-2.0
@@ -191,6 +185,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT" || exit 2
 
+# Release file names of the two Bonsai 2 27B bands, shared by the real
+# Bonsai 2 27B stage below and its `--self-test` stub scenarios.
+BONSAI2_PQ2_FILE="Ternary-Bonsai-2-27B-PQ2_0.gguf"
+BONSAI2_PTQ1_FILE="Ternary-Bonsai-2-27B-PTQ1_0.gguf"
+
 # Parses the JSONL capability manifest at `report_path` and verifies that
 # every capability named in the remaining arguments has at least one
 # `"executed": true` record written no earlier than `run_start_epoch`.
@@ -200,6 +199,17 @@ cd "$PROJECT_ROOT" || exit 2
 # than an inline heredoc at the call site) so `--self-test` below can
 # exercise this exact parsing logic against synthetic manifests, with no
 # cargo run and no hardware involved.
+#
+# Each remaining argument is either a bare capability name (the check
+# above: at least one `executed: true` record, from ANY test, is enough),
+# or `--require-tests=<capability>:<name1>,<name2>,...` (repeatable, one
+# per capability that needs it), which ADDITIONALLY requires an
+# `executed: true` record for EACH named test individually — a capability
+# several tests can satisfy on their own (e.g. any one of
+# `legacy_parity_tests`'s cases) is not the same guarantee as "these five
+# SPECIFIC gates all ran"; `--require-tests` is how this script asks for
+# the stronger one without weakening the plain check for capabilities that
+# do not need it.
 check_capability_manifest() {
     local report_path="$1" run_start_epoch="$2"
     shift 2
@@ -213,7 +223,24 @@ import json, sys, os
 
 report_path = sys.argv[1]
 run_start_epoch = int(sys.argv[2])
-required = sys.argv[3:]
+args = sys.argv[3:]
+
+required = []          # capability names, in first-seen order
+required_tests = {}    # capability -> [test name, ...]
+for arg in args:
+    if arg.startswith("--require-tests="):
+        rest = arg[len("--require-tests="):]
+        cap, sep, names = rest.partition(":")
+        if not sep:
+            print(f"FAIL: malformed --require-tests argument (expected cap:name1,name2): {arg!r}")
+            sys.exit(2)
+        names_list = [n for n in names.split(",") if n]
+        required_tests.setdefault(cap, []).extend(names_list)
+        if cap not in required:
+            required.append(cap)
+    else:
+        if arg not in required:
+            required.append(arg)
 
 if not os.path.isfile(report_path):
     print(f"FAIL: capability manifest does not exist: {report_path}")
@@ -242,19 +269,28 @@ with open(report_path, "r", encoding="utf-8", errors="replace") as f:
         cap = rec.get("capability")
         executed = rec.get("executed")
         test = rec.get("test", "<unnamed test>")
+        duration_ms = rec.get("duration_ms")
         if not isinstance(cap, str) or not isinstance(executed, bool):
             print(f"WARN: manifest line {lineno} missing required fields "
                   f"'capability'(str)/'executed'(bool); ignoring: {line!r}")
             malformed += 1
             continue
-        executed_by_cap.setdefault(cap, []).append((executed, test))
+        if duration_ms is not None and not isinstance(duration_ms, (int, float)):
+            duration_ms = None
+        executed_by_cap.setdefault(cap, []).append((executed, test, duration_ms))
 
 ok = True
 for cap in required:
     entries = executed_by_cap.get(cap, [])
-    ran = [t for (executed, t) in entries if executed]
+    ran = [(t, d) for (executed, t, d) in entries if executed]
     if ran:
-        print(f"OK: '{cap}' executed by {len(ran)} test(s), e.g. {ran[0]}")
+        total_ms = sum(d for (_, d) in ran if d is not None)
+        timed_count = sum(1 for (_, d) in ran if d is not None)
+        if timed_count:
+            print(f"OK: '{cap}' executed by {len(ran)} test(s), e.g. {ran[0][0]} "
+                  f"({timed_count} with duration_ms, totalling {total_ms:.0f}ms)")
+        else:
+            print(f"OK: '{cap}' executed by {len(ran)} test(s), e.g. {ran[0][0]}")
     else:
         ok = False
         if entries:
@@ -263,6 +299,19 @@ for cap in required:
         else:
             print(f"FAIL: '{cap}' has NO manifest records at all — either no producer "
                   f"test has adopted the capability-manifest contract yet, or none ran.")
+
+    names_needed = required_tests.get(cap)
+    if names_needed:
+        have = {t for (t, _d) in ran}
+        missing_names = [n for n in names_needed if n not in have]
+        if missing_names:
+            ok = False
+            print(f"FAIL: '{cap}' is missing executed=true evidence for {len(missing_names)} "
+                  f"required test(s):")
+            for name in missing_names:
+                print(f"  - {name}")
+        else:
+            print(f"OK: '{cap}' has executed=true for all {len(names_needed)} required test(s).")
 
 if malformed:
     print(f"FAIL: {malformed} malformed manifest line(s) found — a partially-corrupted "
@@ -275,6 +324,140 @@ sys.exit(0 if ok else 1)
 PYEOF
 }
 
+# The `--require-tests=legacy-models:...` argument the capability check
+# below passes for the "legacy-models" capability: every real-model gate
+# stage 1b and stage 1d run against the legacy GGUFs, by name, so a release
+# can never be cut when only some of the legacy models' files (or the ONNX
+# export, or the tokenizer) are present — without naming them all, a host
+# with only Ternary-Bonsai-1.7B.gguf present still satisfies the plain
+# "legacy-models" capability check (that model's own gates run and record
+# `executed: true`) while every other gate silently self-skips. The list:
+# the six core cross-tier greedy gates (three models x {numeric parity in
+# oxibonsai-model, golden text in oxibonsai-runtime}), the three stage-1d
+# cases, the M-18 / M-02 / M-08-control / CLI-CORE real-model measurement
+# gates and the CONVERT-EXPORT round trip (ONNX export -> GGUF -> real
+# tokenizer). With `m08_long` = 1 (`OXIBONSAI_M08_RUN_LONG=1` in this
+# script's environment) it also names M-08's 20000-token YaRN gate, which
+# only runs when that variable is set — see the usage notes at the top of
+# this file for why that run is a separate, mandatory release step.
+#   legacy_models_require_tests_arg <m08_long:0|1>
+legacy_models_require_tests_arg() {
+    local m08_long="$1"
+    local names="\
+oxibonsai-model::legacy_parity_tests::ternary_1_7b_greedy_parity_across_tiers,\
+oxibonsai-model::legacy_parity_tests::ternary_8b_greedy_parity_across_tiers,\
+oxibonsai-model::legacy_parity_tests::bonsai_8b_greedy_parity_across_tiers,\
+oxibonsai-runtime::legacy_parity_tests::ternary_1_7b_greedy_text_matches_golden_across_tiers,\
+oxibonsai-runtime::legacy_parity_tests::ternary_8b_greedy_text_matches_golden_across_tiers,\
+oxibonsai-runtime::legacy_parity_tests::bonsai_8b_greedy_text_matches_golden_across_tiers,\
+oxibonsai-runtime::lib::temperature_zero_completion_takes_the_metal_greedy_gpu_path,\
+oxibonsai-runtime::lib::real_model_stream_stop_sequence_matches_the_non_stream_text_and_reports_stop,\
+oxibonsai-runtime::metal_greedy_cpu_fallback_tests::real_model_greedy_gpu_fallback_byte_identical,\
+oxibonsai-model::legacy_parity_tests::prefill_chunk_size_is_a_dispatch_knob_not_a_numerics_knob_on_a_real_long_prompt,\
+oxibonsai-model::legacy_parity_tests::footprint_and_measured_rss_confirm_the_embedding_table_stays_unmaterialized_bonsai_8b,\
+oxibonsai-model::legacy_parity_tests::m08_yarn_scaling_wiring_takes_effect_on_the_real_bonsai_8b_file,\
+oxibonsai-runtime::legacy_parity_tests::eval_cli_scores_a_real_mmlu_style_dataset_through_score_choices_logprob,\
+oxibonsai-runtime::legacy_parity_tests::onnx_converted_gguf_loads_through_the_real_tokenizer_round_trip"
+    if [[ "$m08_long" -eq 1 ]]; then
+        names="$names,oxibonsai-runtime::legacy_parity_tests::m08_yarn_scaling_moves_real_bonsai_8b_logits_at_20000_tokens"
+    fi
+    printf '%s' "--require-tests=legacy-models:$names"
+}
+
+# Runs the real Bonsai 2 27B gates, one after another, never in parallel, so
+# this script never maps more than one multi-GB 27B GGUF at a time:
+# oxibonsai-model's `hybrid_forward_parity_tests` (three gates: PQ2_0,
+# PTQ1_0, the f64-layer reference), oxibonsai-runtime's `bonsai2_engine_tests`
+# (two gates), then — on Darwin, unless `skip_metal`, and only once the test
+# file exists in this checkout — oxibonsai-model's `hybrid_metal_gates`
+# (CPU-vs-Metal token parity + decode throughput).
+#
+# Fails CLOSED, before invoking cargo at all, when either release GGUF is
+# missing from `models_dir` and `skip` is not set: a partial 27B evidence
+# run is refused outright (naming what is missing and both ways out) rather
+# than left to run for several minutes and self-skip, which the capability
+# check at the end of this script would catch anyway but only after paying
+# the wall-clock cost of everything that DID have its file.
+#
+# All inputs are explicit arguments — never a global — so `--self-test`
+# below can drive this exact function against a scratch directory and a
+# PATH-shimmed `cargo` that only logs its own invocations, with no real
+# build, hardware or GGUF involved.
+#   run_bonsai2_models_stage <skip:0|1> <skip_metal:0|1> <models_dir> \
+#       <golden_dir> <metal_test_file> <is_darwin:0|1>
+run_bonsai2_models_stage() {
+    local skip="$1" skip_metal="$2" models_dir="$3" golden_dir="$4" \
+        metal_test_file="$5" is_darwin="$6"
+
+    if [[ "$skip" -eq 1 ]]; then
+        echo "--skip-bonsai2-models was passed: this release carries NO real Bonsai 2"
+        echo "27B parity evidence. Say so in the release notes."
+        return 0
+    fi
+    if [[ "$is_darwin" -ne 1 ]]; then
+        echo "Both gates target the Metal-capable CPU/GPU tiers on Apple Silicon;"
+        echo "there is no non-macOS run of them on this machine. Nothing to run."
+        return 0
+    fi
+
+    local pq2_path="$models_dir/$BONSAI2_PQ2_FILE" ptq1_path="$models_dir/$BONSAI2_PTQ1_FILE"
+    local missing=()
+    [[ -s "$pq2_path" ]] || missing+=("$BONSAI2_PQ2_FILE")
+    [[ -s "$ptq1_path" ]] || missing+=("$BONSAI2_PTQ1_FILE")
+    if [[ "${#missing[@]}" -gt 0 ]]; then
+        echo "MISSING fixtures: ${missing[*]}"
+        echo "Refusing to run a partial Bonsai 2 27B gate: put the missing file(s) under"
+        echo "$models_dir (or point OXIBONSAI_MODELS_DIR at them), or pass"
+        echo "--skip-bonsai2-models to release deliberately without this evidence."
+        return 1
+    fi
+
+    echo "── oxibonsai-model::hybrid_forward_parity_tests (real 27B gates) ──────"
+    OXIBONSAI_MODELS_DIR="$models_dir" \
+        cargo test --release -p oxibonsai-model --all-features \
+        --test hybrid_forward_parity_tests -- --test-threads=1 --nocapture || return $?
+
+    echo "── oxibonsai-runtime::bonsai2_engine_tests (real 27B gates) ───────────"
+    env "OXIBONSAI_MODELS_DIR=$models_dir" "OXI_BONSAI2_GOLDEN_DIR=$golden_dir" \
+        "OXI_BONSAI2_PQ2_GGUF=$pq2_path" "OXI_BONSAI2_PTQ1_GGUF=$ptq1_path" \
+        cargo test --release -p oxibonsai-runtime --all-features \
+        --test bonsai2_engine_tests -- --test-threads=1 --nocapture || return $?
+
+    # G6/G7/G9 all live in one binary: G6 (tokenization) and G7 (chat
+    # template) are header-only (`mmap` + metadata parse, never a tensor
+    # byte) and self-locate under `models_dir` on their own; G9 (`oxibonsai
+    # info --json`, one case per band) needs its own per-band env var (see
+    # `locate_named_27b_gguf`'s doc comment: it spawns a `cargo build` and a
+    # fresh process per case, so it deliberately has no `models/` fallback).
+    # One invocation with every var set covers all of it — this also avoids
+    # a G9 case ever reaching its `OXI_REQUIRE_MODEL_FILES=1` hard-failure
+    # branch just because a *different* leg forgot to export its env var.
+    echo "── oxibonsai-runtime::bonsai2_runtime_tests (G6/G7/G9) ─────────────────"
+    env "OXIBONSAI_MODELS_DIR=$models_dir" "OXI_BONSAI2_PQ2_GGUF=$pq2_path" \
+        "OXI_BONSAI2_PTQ1_GGUF=$ptq1_path" \
+        cargo test --release -p oxibonsai-runtime --all-features \
+        --test bonsai2_runtime_tests -- --test-threads=1 --nocapture || return $?
+
+    if [[ "$skip_metal" -eq 1 ]]; then
+        echo "--skip-bonsai2-metal was passed: this release carries NO Metal 27B"
+        echo "CPU-vs-Metal parity / decode-throughput evidence. Say so in the release notes."
+        return 0
+    fi
+    if [[ ! -f "$metal_test_file" ]]; then
+        echo "NOTE: $metal_test_file is not present in this checkout — the Metal 27B leg"
+        echo "(CPU-vs-Metal token parity, decode throughput) cannot run yet. The capability"
+        echo "check below still requires its two gates by name unless --skip-bonsai2-metal"
+        echo "is passed, so this is visible as a failure there, not a silent pass here."
+        return 0
+    fi
+    echo "── oxibonsai-model::hybrid_metal_gates (real 27B Metal gates) ─────────"
+    env "OXI_BONSAI2_PQ2_GGUF=$pq2_path" "OXI_BONSAI2_PTQ1_GGUF=$ptq1_path" \
+        "OXI_BONSAI2_GOLDEN_DIR=$golden_dir" \
+        cargo test --release -p oxibonsai-model --features metal \
+        --test hybrid_metal_gates -- --test-threads=1 --nocapture || return $?
+    return 0
+}
+
 # ── --self-test: exercise check_capability_manifest() offline ───────────
 # No cargo, no hardware, no network: builds synthetic JSONL manifests under
 # a throwaway `mktemp -d` (honours $TMPDIR; never a hardcoded /tmp path)
@@ -285,6 +468,7 @@ PYEOF
 # this failing.
 release_gate_self_test() {
     local failures=0
+    local total=0
     local work_dir
     work_dir="$(mktemp -d "${TMPDIR:-/tmp}/oxibonsai_release_gate_selftest.XXXXXX")" || {
         echo "FAIL: self-test: could not create a scratch directory" >&2
@@ -304,6 +488,7 @@ release_gate_self_test() {
         shift 2
         echo ""
         echo "-- self-test: $label --"
+        total=$((total + 1))
         local rc=0
         check_capability_manifest "$@" || rc=$?
         if [[ "$rc" -ne "$expect_rc" ]]; then
@@ -366,25 +551,199 @@ release_gate_self_test() {
         >"$work_dir/bonsai2_models_true.jsonl"
     check "bonsai2-models executed:true" 0 "$work_dir/bonsai2_models_true.jsonl" "$now" bonsai2-models
 
-    rm -rf "$work_dir"
+    # 10/11. `--require-tests`: a capability can have `executed: true`
+    # records yet still be missing one of the SPECIFIC gates this script
+    # requires by name (item 1(b)'s per-capability required-test-name list).
+    printf '%s\n%s\n' \
+        '{"capability":"bonsai2-models","executed":true,"test":"gate::a"}' \
+        '{"capability":"bonsai2-models","executed":true,"test":"gate::b"}' \
+        >"$work_dir/require_tests_two.jsonl"
+    check "require-tests: every named test present" 0 \
+        "$work_dir/require_tests_two.jsonl" "$now" \
+        "--require-tests=bonsai2-models:gate::a,gate::b"
+    check "require-tests: one named test missing" 1 \
+        "$work_dir/require_tests_two.jsonl" "$now" \
+        "--require-tests=bonsai2-models:gate::a,gate::c"
+
+    # `duration_ms`: an optional field (`oxibonsai_testkit::capability::
+    # record_executed_timed`). A record that carries it must still pass the
+    # ordinary check (and print a total on the "OK" line, verified by eye
+    # above, not asserted here); a non-numeric value must not crash the
+    # parser, just be treated as if the field were absent.
+    printf '%s\n%s\n' \
+        '{"capability":"metal","executed":true,"test":"t::timed","duration_ms":1500}' \
+        '{"capability":"metal","executed":true,"test":"t::bad_duration","duration_ms":"not-a-number"}' \
+        >"$work_dir/duration_ms.jsonl"
+    check "duration_ms: numeric and non-numeric values both still pass" 0 \
+        "$work_dir/duration_ms.jsonl" "$now" metal
+
+    # 12-... : `run_bonsai2_models_stage`'s fail-closed and leg-ordering
+    # behaviour, via a PATH-shimmed `cargo` that only logs its own
+    # invocations (one line per call) instead of building or running
+    # anything — no real 27B GGUF, build or hardware involved.
+    local fake_bin fake_log stub_output
+    fake_bin="$(mktemp -d "${TMPDIR:-/tmp}/oxibonsai_release_gate_selftest_bin.XXXXXX")" || {
+        echo "FAIL: self-test: could not create a scratch bin directory" >&2
+        failures=$((failures + 1))
+        fake_bin=""
+    }
+    if [[ -n "$fake_bin" ]]; then
+        fake_log="$work_dir/fake_cargo_invocations.log"
+        stub_output="$work_dir/stage_stub_output.log"
+        cat >"$fake_bin/cargo" <<'CARGO_STUB_EOF'
+#!/usr/bin/env bash
+echo "$@" >>"$OXIBONSAI_SELFTEST_CARGO_LOG"
+exit 0
+CARGO_STUB_EOF
+        chmod +x "$fake_bin/cargo"
+
+        run_stage_stub() {
+            local label="$1" expect_rc="$2" expect_calls="$3"
+            shift 3
+            echo ""
+            echo "-- self-test: $label --"
+            total=$((total + 1))
+            : >"$fake_log"
+            local rc=0
+            OXIBONSAI_SELFTEST_CARGO_LOG="$fake_log" PATH="$fake_bin:$PATH" \
+                run_bonsai2_models_stage "$@" >"$stub_output" 2>&1 || rc=$?
+            local calls
+            calls="$(wc -l <"$fake_log" | tr -d ' ')"
+            if [[ "$rc" -ne "$expect_rc" ]]; then
+                echo "FAIL: self-test '$label': expected exit $expect_rc, got $rc"
+                echo "  stage output: $(cat "$stub_output")"
+                failures=$((failures + 1))
+            elif [[ "$calls" -ne "$expect_calls" ]]; then
+                echo "FAIL: self-test '$label': expected $expect_calls cargo invocation(s), got $calls"
+                echo "  invocation log: $(cat "$fake_log")"
+                failures=$((failures + 1))
+            else
+                echo "OK: self-test '$label' (exit $rc, $calls cargo invocation(s), as expected)"
+            fi
+        }
+
+        local models_half models_full golden_stub metal_present metal_absent
+        models_half="$work_dir/models_half"
+        mkdir -p "$models_half"
+        printf 'x' >"$models_half/$BONSAI2_PQ2_FILE"   # PTQ1_0 deliberately absent
+        models_full="$work_dir/models_full"
+        mkdir -p "$models_full"
+        printf 'x' >"$models_full/$BONSAI2_PQ2_FILE"
+        printf 'x' >"$models_full/$BONSAI2_PTQ1_FILE"
+        golden_stub="$work_dir/golden_stub"
+        mkdir -p "$golden_stub"
+        metal_present="$work_dir/hybrid_metal_gates.rs"
+        printf '// self-test stub\n' >"$metal_present"
+        metal_absent="$work_dir/does-not-exist/hybrid_metal_gates.rs"
+
+        run_stage_stub "stage1c stub: half-populated models dir refuses before any cargo call" \
+            1 0 0 0 "$models_half" "$golden_stub" "$metal_present" 1
+        run_stage_stub "stage1c stub: --skip-bonsai2-models never invokes cargo" \
+            0 0 1 0 "$models_half" "$golden_stub" "$metal_present" 1
+        run_stage_stub "stage1c stub: non-Darwin host runs nothing" \
+            0 0 0 0 "$models_full" "$golden_stub" "$metal_present" 0
+        run_stage_stub "stage1c stub: fully populated + metal file present runs all four legs" \
+            0 4 0 0 "$models_full" "$golden_stub" "$metal_present" 1
+        total=$((total + 1))
+        if [[ -f "$fake_log" ]] && [[ "$(grep -o 'hybrid_forward_parity_tests\|bonsai2_engine_tests\|bonsai2_runtime_tests\|hybrid_metal_gates' "$fake_log" | tr '\n' ',')" \
+            == "hybrid_forward_parity_tests,bonsai2_engine_tests,bonsai2_runtime_tests,hybrid_metal_gates," ]]; then
+            echo "OK: self-test 'stage1c stub: the four legs run in the documented order (bonsai2_runtime_tests covers G6/G7/G9 in one invocation)'"
+        else
+            echo "FAIL: self-test 'stage1c stub: the four legs run in the documented order'"
+            failures=$((failures + 1))
+        fi
+        run_stage_stub "stage1c stub: fully populated, metal test file absent, only three legs run" \
+            0 3 0 0 "$models_full" "$golden_stub" "$metal_absent" 1
+        run_stage_stub "stage1c stub: --skip-bonsai2-metal runs only the first three legs" \
+            0 3 0 1 "$models_full" "$golden_stub" "$metal_present" 1
+    fi
+
+    # "legacy-models" through `--require-tests`, exercised by name (same
+    # reasoning as scenario 9's bonsai2-models check): a host with only
+    # Ternary-Bonsai-1.7B.gguf present writes executed=true for that model's
+    # two gates but executed=false for Ternary-Bonsai-8B.gguf's and
+    # Bonsai-8B.gguf's four — the exact partial-fixture shape this script's
+    # REQUIRED_CAPS entry for "legacy-models" must fail on.
+    printf '%s\n%s\n%s\n%s\n%s\n%s\n' \
+        '{"capability":"legacy-models","executed":true,"test":"oxibonsai-model::legacy_parity_tests::ternary_1_7b_greedy_parity_across_tiers"}' \
+        '{"capability":"legacy-models","executed":true,"test":"oxibonsai-runtime::legacy_parity_tests::ternary_1_7b_greedy_text_matches_golden_across_tiers"}' \
+        '{"capability":"legacy-models","executed":false,"test":"oxibonsai-model::legacy_parity_tests::ternary_8b_greedy_parity_across_tiers"}' \
+        '{"capability":"legacy-models","executed":false,"test":"oxibonsai-runtime::legacy_parity_tests::ternary_8b_greedy_text_matches_golden_across_tiers"}' \
+        '{"capability":"legacy-models","executed":false,"test":"oxibonsai-model::legacy_parity_tests::bonsai_8b_greedy_parity_across_tiers"}' \
+        '{"capability":"legacy-models","executed":false,"test":"oxibonsai-runtime::legacy_parity_tests::bonsai_8b_greedy_text_matches_golden_across_tiers"}' \
+        >"$work_dir/legacy_models_partial.jsonl"
+    check "legacy-models require-tests: only the 1.7B pair ran -> FAIL" 1 \
+        "$work_dir/legacy_models_partial.jsonl" "$now" \
+        "--require-tests=legacy-models:\
+oxibonsai-model::legacy_parity_tests::ternary_1_7b_greedy_parity_across_tiers,\
+oxibonsai-model::legacy_parity_tests::ternary_8b_greedy_parity_across_tiers,\
+oxibonsai-model::legacy_parity_tests::bonsai_8b_greedy_parity_across_tiers,\
+oxibonsai-runtime::legacy_parity_tests::ternary_1_7b_greedy_text_matches_golden_across_tiers,\
+oxibonsai-runtime::legacy_parity_tests::ternary_8b_greedy_text_matches_golden_across_tiers,\
+oxibonsai-runtime::legacy_parity_tests::bonsai_8b_greedy_text_matches_golden_across_tiers"
+
+    # `legacy_models_require_tests_arg`'s own list, both ways: every legacy
+    # gate has an executed=true record except M-08's 20000-token YaRN gate,
+    # which self-skipped. Without OXIBONSAI_M08_RUN_LONG=1 that gate is not
+    # required (PASS); with it, its self-skip fails the gate; once it has
+    # really run, the gate passes. A self-skipped CONVERT-EXPORT round trip
+    # (no ONNX export on the host) fails either way.
+    local m08_long_name="oxibonsai-runtime::legacy_parity_tests::m08_yarn_scaling_moves_real_bonsai_8b_logits_at_20000_tokens"
+    local onnx_name="oxibonsai-runtime::legacy_parity_tests::onnx_converted_gguf_loads_through_the_real_tokenizer_round_trip"
+    local legacy_arg legacy_names legacy_name
+    legacy_arg="$(legacy_models_require_tests_arg 0)"
+    IFS=',' read -r -a legacy_names <<<"${legacy_arg#--require-tests=legacy-models:}"
+    : >"$work_dir/legacy_m08_skipped.jsonl"
+    : >"$work_dir/legacy_onnx_skipped.jsonl"
+    for legacy_name in "${legacy_names[@]}"; do
+        printf '{"capability":"legacy-models","executed":true,"test":"%s"}\n' "$legacy_name" \
+            >>"$work_dir/legacy_m08_skipped.jsonl"
+        if [[ "$legacy_name" != "$onnx_name" ]]; then
+            printf '{"capability":"legacy-models","executed":true,"test":"%s"}\n' "$legacy_name" \
+                >>"$work_dir/legacy_onnx_skipped.jsonl"
+        fi
+    done
+    printf '{"capability":"legacy-models","executed":false,"test":"%s"}\n' "$m08_long_name" \
+        >>"$work_dir/legacy_m08_skipped.jsonl"
+    printf '{"capability":"legacy-models","executed":false,"test":"%s"}\n' "$onnx_name" \
+        >>"$work_dir/legacy_onnx_skipped.jsonl"
+    cp "$work_dir/legacy_m08_skipped.jsonl" "$work_dir/legacy_m08_ran.jsonl"
+    printf '{"capability":"legacy-models","executed":true,"test":"%s"}\n' "$m08_long_name" \
+        >>"$work_dir/legacy_m08_ran.jsonl"
+    check "legacy-models: M-08 long gate self-skipped, OXIBONSAI_M08_RUN_LONG unset -> PASS" 0 \
+        "$work_dir/legacy_m08_skipped.jsonl" "$now" "$(legacy_models_require_tests_arg 0)"
+    check "legacy-models: M-08 long gate self-skipped under OXIBONSAI_M08_RUN_LONG=1 -> FAIL" 1 \
+        "$work_dir/legacy_m08_skipped.jsonl" "$now" "$(legacy_models_require_tests_arg 1)"
+    check "legacy-models: M-08 long gate ran under OXIBONSAI_M08_RUN_LONG=1 -> PASS" 0 \
+        "$work_dir/legacy_m08_ran.jsonl" "$now" "$(legacy_models_require_tests_arg 1)"
+    check "legacy-models: CONVERT-EXPORT round trip self-skipped -> FAIL" 1 \
+        "$work_dir/legacy_onnx_skipped.jsonl" "$now" "$(legacy_models_require_tests_arg 0)"
+
+    rm -rf "$work_dir" "$fake_bin"
     if [[ "$failures" -eq 0 ]]; then
         echo ""
-        echo "OK: release-gate.sh self-test — all 9 scenarios matched their expected verdict."
+        echo "OK: release-gate.sh self-test — all $total scenarios matched their expected verdict."
         return 0
     fi
     echo ""
-    echo "FAILED: release-gate.sh self-test — $failures scenario(s) did not match."
+    echo "FAILED: release-gate.sh self-test — $failures/$total scenario(s) did not match."
     return 1
 }
 
 REQUIRE_CUDA=0
 SKIP_LEGACY_MODELS=0
 SKIP_BONSAI2_MODELS=0
+SKIP_BONSAI2_METAL=0
+# M-08's 20000-token YaRN gate runs (and is then required by name) only when
+# this is exactly "1" — see the usage notes at the top of this file.
+M08_RUN_LONG=0
+[[ "${OXIBONSAI_M08_RUN_LONG:-}" == "1" ]] && M08_RUN_LONG=1
 for arg in "$@"; do
     case "$arg" in
         --require-cuda) REQUIRE_CUDA=1 ;;
         --skip-legacy-models) SKIP_LEGACY_MODELS=1 ;;
         --skip-bonsai2-models) SKIP_BONSAI2_MODELS=1 ;;
+        --skip-bonsai2-metal) SKIP_BONSAI2_METAL=1 ;;
         --self-test)
             release_gate_self_test
             exit $?
@@ -392,7 +751,8 @@ for arg in "$@"; do
         --help|-h)
             cat <<'HELP_EOF'
 Usage: release-gate.sh [--require-cuda] [--skip-legacy-models]
-                        [--skip-bonsai2-models] [--self-test]
+                        [--skip-bonsai2-models] [--skip-bonsai2-metal]
+                        [--self-test]
 
   --require-cuda        Also require fresh "cuda" capability-manifest
                          evidence (see the capability-manifest contract at
@@ -432,10 +792,32 @@ Usage: release-gate.sh [--require-cuda] [--skip-legacy-models]
                          explicitly in the release notes when used; it is
                          never applied implicitly.
 
+  --skip-bonsai2-metal   Opt out only of the Metal-specific half of
+                         "bonsai2-models" evidence: oxibonsai-model's
+                         hybrid_metal_gates (CPU-vs-Metal token parity and
+                         decode throughput on the real Bonsai 2 27B). The
+                         non-Metal Bonsai 2 27B gates (stage 1c's first two
+                         legs) are still required. Passing this flag
+                         releases WITHOUT Metal 27B evidence and must be
+                         stated explicitly in the release notes when used.
+
   --self-test            Run this script's own capability-manifest-parsing
                          self-test scenarios and exit (no release gate).
 
   --help, -h             Show this message and exit.
+
+Environment:
+  OXIBONSAI_M08_RUN_LONG=1
+                         MANDATORY SEPARATE RELEASE STEP. Also runs M-08's
+                         20000-token YaRN gate on Bonsai-8B.gguf
+                         (oxibonsai-runtime legacy_parity_tests::
+                         m08_yarn_scaling_moves_real_bonsai_8b_logits_at_20000_tokens,
+                         two real decodes of roughly an hour each) inside
+                         stage 1b, and requires its executed=true record by
+                         name. A default run leaves the gate out only because
+                         of that runtime: every release needs one passing run
+                         of this script with the variable set, on the release
+                         commit.
 HELP_EOF
             exit 0
             ;;
@@ -482,6 +864,20 @@ if [[ "$SKIP_BONSAI2_MODELS" -eq 1 ]]; then
 elif [[ "$(uname -s)" == "Darwin" ]]; then
     echo "  -> real Bonsai 2 27B parity evidence (\"bonsai2-models\") is REQUIRED"
     echo "     on this host; pass --skip-bonsai2-models to opt out."
+fi
+echo "m08-long (OXIBONSAI_M08_RUN_LONG=1): $([[ "$M08_RUN_LONG" -eq 1 ]] && echo yes || echo no)"
+if [[ "$M08_RUN_LONG" -eq 0 ]]; then
+    echo "  -> M-08's 20000-token YaRN gate is NOT run this time. It is a separate,"
+    echo "     mandatory release step: rerun with OXIBONSAI_M08_RUN_LONG=1 exported."
+fi
+echo "skip-bonsai2-metal: $([[ "$SKIP_BONSAI2_METAL" -eq 1 ]] && echo yes || echo no)"
+if [[ "$SKIP_BONSAI2_METAL" -eq 1 ]]; then
+    echo "  -> the Metal-specific half of \"bonsai2-models\" evidence (CPU-vs-Metal"
+    echo "     token parity, decode throughput) will NOT be required or collected"
+    echo "     this run; state this explicitly in the release notes."
+elif [[ "$(uname -s)" == "Darwin" ]]; then
+    echo "  -> the Metal-specific half of \"bonsai2-models\" evidence is REQUIRED on"
+    echo "     this host; pass --skip-bonsai2-metal to opt out."
 fi
 echo ""
 
@@ -546,6 +942,7 @@ else
         "Ternary-Bonsai-8B.gguf"
         "Bonsai-8B.gguf"
         "tokenizer.json"
+        "Ternary-Bonsai-1.7B-ONNX/onnx/model_q2.onnx"
     )
     LEGACY_MISSING=()
     for fixture in "${LEGACY_FIXTURES[@]}"; do
@@ -565,10 +962,17 @@ else
         echo "--skip-legacy-models deliberately."
     fi
 
+    if [[ "$M08_RUN_LONG" -eq 1 ]]; then
+        echo "OXIBONSAI_M08_RUN_LONG=1: oxibonsai-runtime's legacy_parity_tests also"
+        echo "runs M-08's 20000-token YaRN gate on Bonsai-8B.gguf (two child"
+        echo "processes of roughly an hour each) and the capability check requires it."
+    fi
+
     # Both crates, both halves: oxibonsai-model is the tokenizer-free
     # cross-tier numeric gate, oxibonsai-runtime is the golden-TEXT half
-    # (scratchpad/golden_legacy/legacy_golden.json's captured Metal output,
-    # through the real TokenizerBridge and the real SamplingParams).
+    # (the captured Metal reference output, embedded in the runtime crate's
+    # own test file, compared through the real TokenizerBridge and the real
+    # SamplingParams).
     for legacy_pkg in oxibonsai-model oxibonsai-runtime; do
         echo ""
         echo "── $legacy_pkg::legacy_parity_tests ──────────────────────────"
@@ -589,102 +993,130 @@ else
     done
 fi
 
-# ── 1c. Real Bonsai 2 27B gates, SERIALIZED, RELEASE (HANDOVER-INFRA) ────
-# Same shape as stage 1b, for the Bonsai 2 27B target: two `cargo test`
-# invocations (`oxibonsai-model`'s `hybrid_forward_parity_tests`, then
-# `oxibonsai-runtime`'s `bonsai2_engine_tests`), each `--test-threads=1`, run
-# ONE AFTER THE OTHER — never backgrounded, never `&`ed — so this script maps
-# at most one 27B GGUF (5.9-7.2 GB) at a time, honouring the memory rule
-# every producer test's own in-binary/engine-level lock only enforces WITHIN
-# its own process (ruling R3: one real-27B process at a time on this 24 GB
-# machine). Each binary is NOT `#[ignore]`d: on a host with the GGUFs it runs
-# the real gates and records `executed: true`; on a host without them it
-# self-skips and records `executed: false`, which the capability check below
-# turns into a failed gate unless --skip-bonsai2-models was passed.
-if [[ "$SKIP_BONSAI2_MODELS" -eq 1 ]]; then
+# ── 1c. Real Bonsai 2 27B gates, SERIALIZED, RELEASE ─────────────────────
+# `run_bonsai2_models_stage` (defined above `check_capability_manifest`)
+# runs the model-crate gates, then the runtime-crate engine gates, then —
+# on Darwin, unless --skip-bonsai2-metal, and once the test file exists —
+# the Metal gates, one after another, never in parallel, so this script
+# never maps more than one 27B GGUF (5.9-7.2 GB) at a time. It fails CLOSED
+# before invoking cargo at all when either release GGUF is missing and
+# --skip-bonsai2-models was not passed.
+BONSAI2_MODELS_DIR="${OXIBONSAI_MODELS_DIR:-$PROJECT_ROOT/models}"
+BONSAI2_GOLDEN_DIR="$PROJECT_ROOT/crates/oxibonsai-model/tests/fixtures/bonsai2_golden"
+BONSAI2_METAL_TEST_FILE="$PROJECT_ROOT/crates/oxibonsai-model/tests/hybrid_metal_gates.rs"
+BONSAI2_IS_DARWIN=0
+[[ "$(uname -s)" == "Darwin" ]] && BONSAI2_IS_DARWIN=1
+
+echo ""
+echo "═══════════════════════════════════════════════════════════════"
+echo "  Real Bonsai 2 27B gate (--test-threads=1, one 27B process at a time)"
+echo "═══════════════════════════════════════════════════════════════"
+echo "models dir: $BONSAI2_MODELS_DIR"
+echo "golden dir: $BONSAI2_GOLDEN_DIR (vendored)"
+run_bonsai2_models_stage "$SKIP_BONSAI2_MODELS" "$SKIP_BONSAI2_METAL" \
+    "$BONSAI2_MODELS_DIR" "$BONSAI2_GOLDEN_DIR" "$BONSAI2_METAL_TEST_FILE" \
+    "$BONSAI2_IS_DARWIN" || {
+    rc=$?
     echo ""
     echo "═══════════════════════════════════════════════════════════════"
-    echo "  Real Bonsai 2 27B gate: SKIPPED BY REQUEST"
+    echo "RELEASE GATE FAILED: the real Bonsai 2 27B gate did not pass (exit $rc)."
+    echo "See its output above for which leg failed, or which file is missing."
     echo "═══════════════════════════════════════════════════════════════"
-    echo "--skip-bonsai2-models was passed: this release carries NO real Bonsai 2"
-    echo "27B parity evidence. Say so in the release notes."
+    exit "$rc"
+}
+
+# ── 1d. Real-model lib/bin acceptance cases, SERIALIZED, RELEASE ────────
+# The remaining real-model acceptance cases live as ordinary `#[test]`s
+# inside library/binary crates rather than their own integration-test
+# binary, so they cannot be selected by `--test <name>` the way stages 1b/1c
+# select a whole file: each is run by its own name, `--test-threads=1`,
+# strictly after every earlier real-model stage has fully exited (one
+# real-model process at a time). Every case here is env-gated and
+# self-skips with a capability record when its own variable is unset —
+# never `#[ignore]`d — so this stage's own exit code is meaningful even
+# before every model file is in place; the required-test-name check in the
+# capability-manifest stage below is what turns "self-skipped" into a
+# failed release gate when the evidence is supposed to be required.
+LEGACY_MODELS_DIR_1D="${OXIBONSAI_MODELS_DIR:-$PROJECT_ROOT/models}"
+echo ""
+echo "═══════════════════════════════════════════════════════════════"
+echo "  Real-model lib/bin acceptance cases (--test-threads=1)"
+echo "═══════════════════════════════════════════════════════════════"
+# Same three-way gate as stage 1b (skip flag / non-Darwin / run): these
+# three cases (two `--lib`, one `--test metal_greedy_cpu_fallback_tests`)
+# are the Metal-fused-decode, stream-stop and Metal↔CPU byte-parity
+# legacy-models evidence, so they must not run — or be required — under the
+# exact conditions stage 1b itself does not run.
+if [[ "$SKIP_LEGACY_MODELS" -eq 1 ]]; then
+    echo ""
+    echo "── oxibonsai-runtime::lib (legacy-models): SKIPPED BY REQUEST ──"
+    echo "--skip-legacy-models was passed: these three real-model cases are not run."
 elif [[ "$(uname -s)" != "Darwin" ]]; then
     echo ""
-    echo "═══════════════════════════════════════════════════════════════"
-    echo "  Real Bonsai 2 27B gate: NOT AVAILABLE ON THIS HOST"
-    echo "═══════════════════════════════════════════════════════════════"
-    echo "Both gates target the Metal-capable CPU/GPU tiers on Apple Silicon;"
-    echo "there is no non-macOS run of them on this machine. Nothing to run."
+    echo "── oxibonsai-runtime::lib (legacy-models): NOT AVAILABLE ON THIS HOST ──"
+    echo "Both cases need the fused Metal greedy-decode path; nothing to run here."
 else
-    BONSAI2_MODELS_DIR="${OXIBONSAI_MODELS_DIR:-$PROJECT_ROOT/models}"
-    BONSAI2_GOLDEN_DIR="$PROJECT_ROOT/crates/oxibonsai-model/tests/fixtures/bonsai2_golden"
-    BONSAI2_PQ2_PATH="$BONSAI2_MODELS_DIR/Ternary-Bonsai-2-27B-PQ2_0.gguf"
-    BONSAI2_PTQ1_PATH="$BONSAI2_MODELS_DIR/Ternary-Bonsai-2-27B-PTQ1_0.gguf"
-
-    echo ""
-    echo "═══════════════════════════════════════════════════════════════"
-    echo "  Real Bonsai 2 27B gate (--test-threads=1, one 27B process at a time)"
-    echo "═══════════════════════════════════════════════════════════════"
-    echo "models dir: $BONSAI2_MODELS_DIR"
-    echo "golden dir: $BONSAI2_GOLDEN_DIR (vendored)"
-    BONSAI2_MISSING=()
-    [[ -s "$BONSAI2_PQ2_PATH" ]] || BONSAI2_MISSING+=("Ternary-Bonsai-2-27B-PQ2_0.gguf")
-    [[ -s "$BONSAI2_PTQ1_PATH" ]] || BONSAI2_MISSING+=("Ternary-Bonsai-2-27B-PTQ1_0.gguf")
-    if [[ "${#BONSAI2_MISSING[@]}" -gt 0 ]]; then
-        echo "MISSING fixtures: ${BONSAI2_MISSING[*]}"
-        echo "The gates below will self-skip and record executed=false for whichever"
-        echo "GGUF is absent, which the capability check will report as a FAILED"
-        echo "release gate. Put the GGUFs in place, point OXIBONSAI_MODELS_DIR at"
-        echo "them, or pass --skip-bonsai2-models deliberately."
-    fi
-
-    # oxibonsai-model's harness (`bonsai2_real/harness.rs::locate_model`)
-    # resolves each file from `OXIBONSAI_MODELS_DIR` itself plus the release
-    # file name, and self-skips per-file when one is absent — so this one
-    # variable is always safe to export, present or not.
-    echo ""
-    echo "── oxibonsai-model::hybrid_forward_parity_tests (real 27B gates) ──────"
-    OXIBONSAI_MODELS_DIR="$BONSAI2_MODELS_DIR" \
-        cargo test --release -p oxibonsai-model --all-features \
-        --test hybrid_forward_parity_tests -- --test-threads=1 --nocapture || {
+    echo "── oxibonsai-runtime::lib (legacy-models: temperature-0 GPU path, stream stop) ──"
+    OXI_MODEL="$LEGACY_MODELS_DIR_1D/Ternary-Bonsai-1.7B.gguf" \
+        OXI_TOKENIZER="$LEGACY_MODELS_DIR_1D/tokenizer.json" \
+        cargo test --release -p oxibonsai-runtime --all-features --lib \
+        -- --test-threads=1 \
+        temperature_zero_completion_takes_the_metal_greedy_gpu_path \
+        real_model_stream_stop_sequence_matches_the_non_stream_text_and_reports_stop || {
         rc=$?
         echo ""
         echo "═══════════════════════════════════════════════════════════════"
-        echo "RELEASE GATE FAILED: oxibonsai-model's real Bonsai 2 27B gate did"
-        echo "not pass (exit $rc). Read the per-step/per-layer comparison above."
+        echo "RELEASE GATE FAILED: oxibonsai-runtime's real-model lib cases did not"
+        echo "pass (exit $rc)."
+        echo "═══════════════════════════════════════════════════════════════"
+        exit "$rc"
+    }
+    echo ""
+    echo "── oxibonsai-runtime::metal_greedy_cpu_fallback_tests (legacy-models: Metal↔CPU byte parity + mid-stream fallback) ──"
+    OXI_MODEL="$LEGACY_MODELS_DIR_1D/Ternary-Bonsai-1.7B.gguf" \
+        cargo test --release -p oxibonsai-runtime --features metal \
+        --test metal_greedy_cpu_fallback_tests -- --test-threads=1 \
+        real_model_greedy_gpu_fallback_byte_identical || {
+        rc=$?
+        echo ""
+        echo "═══════════════════════════════════════════════════════════════"
+        echo "RELEASE GATE FAILED: real_model_greedy_gpu_fallback_byte_identical did"
+        echo "not pass (exit $rc)."
+        echo "═══════════════════════════════════════════════════════════════"
+        exit "$rc"
+    }
+fi
+
+if [[ "$SKIP_BONSAI2_MODELS" -eq 1 ]]; then
+    echo ""
+    echo "── oxibonsai-runtime::lib / oxibonsai-cli::bin (bonsai2-models): SKIPPED ──"
+    echo "--skip-bonsai2-models was passed: these two real-27B lib/bin cases are not run."
+else
+    BONSAI2_PQ2_PATH_1D="$BONSAI2_MODELS_DIR/$BONSAI2_PQ2_FILE"
+    echo ""
+    echo "── oxibonsai-runtime::lib (bonsai2-models: real_27b_ embedding case) ───"
+    OXI_BONSAI2_PQ2_GGUF="$BONSAI2_PQ2_PATH_1D" \
+        cargo test --release -p oxibonsai-runtime --all-features --lib \
+        -- --test-threads=1 real_27b_ || {
+        rc=$?
+        echo ""
+        echo "═══════════════════════════════════════════════════════════════"
+        echo "RELEASE GATE FAILED: oxibonsai-runtime's real_27b_ lib case did not"
+        echo "pass (exit $rc)."
         echo "═══════════════════════════════════════════════════════════════"
         exit "$rc"
     }
 
-    # oxibonsai-runtime's harness (`bonsai2_engine_tests.rs::env_path`), by
-    # contrast, treats a SET-but-missing `OXI_BONSAI2_{PQ2,PTQ1}_GGUF` as a
-    # hard failure (`check_engine_against_goldens` asserts `model_path.
-    # is_file()`), not a skip — unlike `locate_model` above, it does not
-    # itself re-check the file's existence before trusting the variable. So
-    # each is exported here only when its own file actually exists; the
-    # unconditional `OXIBONSAI_MODELS_DIR` and vendored `OXI_BONSAI2_GOLDEN_DIR`
-    # are always safe (both are simply directories `env_path`/`locate_model`
-    # never assert the existence of on their own).
-    BONSAI2_ENGINE_ENV=(
-        "OXIBONSAI_MODELS_DIR=$BONSAI2_MODELS_DIR"
-        "OXI_BONSAI2_GOLDEN_DIR=$BONSAI2_GOLDEN_DIR"
-    )
-    [[ -s "$BONSAI2_PQ2_PATH" ]] && BONSAI2_ENGINE_ENV+=("OXI_BONSAI2_PQ2_GGUF=$BONSAI2_PQ2_PATH")
-    [[ -s "$BONSAI2_PTQ1_PATH" ]] && BONSAI2_ENGINE_ENV+=("OXI_BONSAI2_PTQ1_GGUF=$BONSAI2_PTQ1_PATH")
-
-    # Run strictly AFTER the model-crate gate above has fully exited — never
-    # in parallel with it — so this script never holds two 27B mappings at
-    # once (the memory rule this section's header comment states).
     echo ""
-    echo "── oxibonsai-runtime::bonsai2_engine_tests (real 27B gates) ───────────"
-    env "${BONSAI2_ENGINE_ENV[@]}" \
-        cargo test --release -p oxibonsai-runtime --all-features \
-        --test bonsai2_engine_tests -- --test-threads=1 --nocapture || {
+    echo "── oxibonsai-cli::bin (bonsai2-models: real_27b_ embedding-serving case) ──"
+    OXI_BONSAI2_PQ2_GGUF="$BONSAI2_PQ2_PATH_1D" \
+        cargo test --release -p oxibonsai-cli --all-features --bin oxibonsai \
+        -- --test-threads=1 real_27b_ || {
         rc=$?
         echo ""
         echo "═══════════════════════════════════════════════════════════════"
-        echo "RELEASE GATE FAILED: oxibonsai-runtime's real Bonsai 2 27B engine"
-        echo "gate did not pass (exit $rc). Read the per-prompt comparison above."
+        echo "RELEASE GATE FAILED: oxibonsai-cli's real_27b_ bin case did not pass"
+        echo "(exit $rc)."
         echo "═══════════════════════════════════════════════════════════════"
         exit "$rc"
     }
@@ -699,18 +1131,52 @@ echo "════════════════════════�
 REQUIRED_CAPS=()
 if [[ "$(uname -s)" == "Darwin" ]]; then
     REQUIRED_CAPS+=("metal")
-    # T-05's whole point: a capability that self-skipped must not read as
-    # covered. "metal" alone cannot express this one — `metal_k_quant_gemv_parity`
-    # writes 30+ metal/executed=true records on any Metal host regardless of
-    # whether the real models were ever touched — so the real-model gate has
-    # its own name. See the --skip-legacy-models note in this file's header.
+    # A capability that self-skipped must not read as covered. "metal" alone
+    # cannot express this one — `metal_k_quant_gemv_parity` writes 30+
+    # metal/executed=true records on any Metal host regardless of whether
+    # the real models were ever touched — so the real-model gate has its own
+    # name. See the --skip-legacy-models note in this file's header.
     if [[ "$SKIP_LEGACY_MODELS" -eq 0 ]]; then
         REQUIRED_CAPS+=("legacy-models")
+        # "legacy-models" has records from other, lighter tests too (the
+        # gguf_loader.rs/model_registry.rs detection-only cases) — require
+        # every real legacy-model gate individually, by name; see
+        # `legacy_models_require_tests_arg` for the list and why. The M-08
+        # 20000-token YaRN gate is on it exactly when
+        # OXIBONSAI_M08_RUN_LONG=1 (the separate release step described at
+        # the top of this file).
+        REQUIRED_CAPS+=("$(legacy_models_require_tests_arg "$M08_RUN_LONG")")
     fi
-    # Same reasoning, for the Bonsai 2 27B target (HANDOVER-INFRA): see the
+    # Same reasoning, for the Bonsai 2 27B target: see the
     # --skip-bonsai2-models note in this file's header.
     if [[ "$SKIP_BONSAI2_MODELS" -eq 0 ]]; then
         REQUIRED_CAPS+=("bonsai2-models")
+        # "bonsai2-models" has records from OTHER, lighter tests too (e.g.
+        # header-only metadata checks) — require these five core gates (the
+        # three model-crate gates, the two runtime-engine gates) and the
+        # two stage-1d lib/bin cases individually, so a release can never be
+        # cut on the strength of only the cheaper ones.
+        BONSAI2_REQUIRED_NAMES="\
+oxibonsai-model::hybrid_forward_parity_tests::hybrid_real_27b_pq2_0_matches_the_fork_goldens_bonsai2,\
+oxibonsai-model::hybrid_forward_parity_tests::hybrid_real_27b_ptq1_0_greedy_matches_the_fork_goldens_bonsai2,\
+oxibonsai-model::hybrid_forward_parity_tests::hybrid_real_27b_layers_match_the_f64_reference_bonsai2,\
+oxibonsai-runtime::bonsai2_engine_tests::bonsai2_pq2_engine_greedy_matches_the_fork_goldens,\
+oxibonsai-runtime::bonsai2_engine_tests::bonsai2_ptq1_engine_greedy_matches_the_fork_goldens,\
+oxibonsai-runtime::bonsai2_runtime_tests::real_27b_tokenize_matches_the_fork_for_all_five_golden_texts_bonsai2,\
+oxibonsai-runtime::bonsai2_runtime_tests::real_27b_chat_template_matches_the_fork_for_all_five_golden_cases_bonsai2,\
+oxibonsai-runtime::bonsai2_runtime_tests::real_27b_info_reports_pq2_0_variant_and_layer_split_bonsai2,\
+oxibonsai-runtime::bonsai2_runtime_tests::real_27b_info_reports_ptq1_0_variant_and_layer_split_bonsai2,\
+oxibonsai-runtime::lib::real_27b_hybrid_embed_returns_a_unit_vector,\
+oxibonsai-cli::bin::real_27b_hybrid_model_serves_embeddings"
+        if [[ "$SKIP_BONSAI2_METAL" -eq 0 ]]; then
+            # The two Metal 27B gates (CPU-vs-Metal token parity, decode
+            # throughput), required on Darwin unless
+            # explicitly opted out — see the --skip-bonsai2-metal note above.
+            BONSAI2_REQUIRED_NAMES="$BONSAI2_REQUIRED_NAMES,\
+oxibonsai-model::hybrid_metal_gates::hybrid_real_27b_metal_matches_cpu_tokens_bonsai2,\
+oxibonsai-model::hybrid_metal_gates::hybrid_real_27b_metal_decode_throughput_bonsai2"
+        fi
+        REQUIRED_CAPS+=("--require-tests=bonsai2-models:$BONSAI2_REQUIRED_NAMES")
     fi
 fi
 if [[ "$REQUIRE_CUDA" -eq 1 ]]; then
