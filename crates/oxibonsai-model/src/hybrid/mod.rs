@@ -1,6 +1,6 @@
 //! Qwen3.5 / PrismML **Bonsai 2** hybrid model (`general.architecture =
-//! "qwen35"`) — blocks, recurrent cache, v-head map, Hadamard hook and
-//! weight binding (B2-10; design §3).
+//! "qwen35"`) — blocks, recurrent cache, v-head map, Hadamard hook, weight
+//! binding (design §3) and the vision splice (design §6.2).
 //!
 //! # Why a sibling module tree and not a wider `TransformerBlock`
 //!
@@ -22,21 +22,23 @@
 //!
 //! # What is here
 //!
-//! B2-10 landed the skeleton (every weight bound and validated, every cache
-//! allocated, the v-head index map, the Hadamard hook and its scratch);
-//! B2-11 landed the two per-layer forward bodies, the driver that runs them
-//! and the model seam the runtime dispatches through.
+//! The skeleton (every weight bound and validated, every cache allocated,
+//! the v-head index map, the Hadamard hook and its scratch), the two
+//! per-layer forward bodies, the driver that runs them, the model seam the
+//! runtime dispatches through, and the prefill of caller-supplied rows that
+//! splices vision-tower output into a prompt.
 //!
 //! | file | role |
 //! |---|---|
 //! | [`block`] | [`HybridBlock`] enum + the two layer kinds + their scratch |
-//! | [`block_full`] | the full-attention layer's forward body (M-16, §3.2) |
+//! | [`block_full`] | the full-attention layer's forward body (M-16, §3.2), 3-axis M-RoPE for image rows |
 //! | [`block_linear`] | the Gated-DeltaNet layer's forward body (M-04, §2.3) |
-//! | [`forward`] | the driver, [`RopeTables`], [`HybridScratch`], [`LayerDump`], [`LoadedModel`] |
+//! | [`forward`] | the driver, [`ChunkInput`], [`RopeTables`], [`HybridScratch`], [`LayerDump`], [`LoadedModel`] |
 //! | [`hadamard`] | [`HadamardHook`] / [`HadamardScratch`] (design §3.4/§3.5) |
-//! | [`model`] | [`HybridModel`]: construction, layer split, forward, reset |
+//! | [`model`] | [`HybridModel`]: construction, layer split, forward, reset, M-RoPE offset |
 //! | [`recurrent_cache`] | [`RecurrentCache`]: GDN state + conv window (§3.6) |
 //! | [`vhead_map`] | [`VHeadMap`]: tiled ↔ grouped v-head indices (§3.3) |
+//! | [`vision_prefill`] | [`PromptPiece`], `HybridModel::forward_prefill_rows`: image rows bypass the inverse Hadamard (§6.2) |
 //! | [`weights`] | GGUF name → field binding, with hard shape errors (§3.8) |
 
 pub mod block;
@@ -48,16 +50,19 @@ pub mod metal;
 pub mod model;
 pub mod recurrent_cache;
 pub mod vhead_map;
+pub mod vision_prefill;
 pub mod weights;
 
 pub use block::{FullAttnBlock, FullScratch, HybridBlock, LinearAttnBlock, LinearScratch};
 pub use forward::{
-    ForwardCtx, HybridScratch, LayerDump, LoadedModel, RopeTables, DEFAULT_PREFILL_CHUNK,
+    ChunkInput, ForwardCtx, HybridScratch, LayerDump, LoadedModel, RopeTables,
+    DEFAULT_PREFILL_CHUNK,
 };
 pub use hadamard::{rotated_widths, HadamardHook, HadamardScratch};
 pub use model::{HybridModel, LayerSplit, DEFAULT_MAX_SEQ_LEN};
 pub use recurrent_cache::{RecurrentCache, RecurrentSnapshot, RECURRENT_NAME};
 pub use vhead_map::{VHeadMap, GDN_HEAD_ORDER};
+pub use vision_prefill::{AssembledPrompt, PromptPiece};
 pub use weights::{
     block_tensor, names as tensor_names, Bf16Matrix, GdnGateWeights, HybridEmbedding,
     FULL_LAYER_TENSORS, LINEAR_LAYER_TENSORS, SHARED_LAYER_TENSORS,

@@ -469,12 +469,19 @@ fn test_batched_rmsnorm() {
 /// `evict_f32_weight` removes the entry (enabling safe key reuse for
 /// non-resident callers).
 ///
-/// Ignored by default: requires a Metal GPU and must not run concurrently
-/// with other tests that share the process-shared device's weight cache.
+/// Runs on an **isolated** graph ([`MetalGraph::new`]): its own weight cache
+/// and upload counters, which no other test in this process can move, so the
+/// exact `+1` deltas below hold under the parallel test runner. (On the
+/// process-shared device's session the counters are process-global state
+/// that every concurrently running GPU test increments.) Self-skips without
+/// a Metal device, like its siblings.
 #[test]
-#[ignore = "requires Metal GPU; run with --test-threads=1"]
 fn test_weight_upload_count_increments_on_new_key() {
-    let graph = MetalGraph::global().expect("Metal not available");
+    if metal::Device::system_default().is_none() {
+        return;
+    }
+    let graph = MetalGraph::new()
+        .unwrap_or_else(|e| panic!("the combined Metal library must build on this device: {e}"));
     let before = graph.weight_upload_count();
     let data = vec![1.0f32; 16];
     // Use an address offset unlikely to collide with any live weight.
@@ -503,4 +510,81 @@ fn test_weight_upload_count_increments_on_new_key() {
     );
     // Cleanup: evict so the test leaves no residue in the shared weight cache.
     graph.evict_f32_weight(key).expect("cleanup evict failed");
+}
+
+/// Every command buffer these dispatch sources create lives inside an
+/// Objective-C autorelease pool.
+///
+/// `-[MTLCommandQueue commandBuffer]` and
+/// `-[MTLCommandBuffer computeCommandEncoder]` return autoreleased objects,
+/// which a thread without a pool keeps until it exits (~1.8 KiB per
+/// dispatch). The model crate's
+/// `metal_dense_forwards_do_not_grow_the_process_footprint` measures the
+/// routes a model drives; this pins the structural half for every dispatch
+/// site here, including the ones no model route reaches (the DiT GEMM and
+/// joint-attention entry points): in the function that creates a command
+/// buffer, an `autoreleasepool(` scope opens before the buffer is created.
+#[test]
+fn metal_command_buffers_are_created_inside_autorelease_pools() {
+    let sources = [
+        ("metal_graph/graph.rs", include_str!("graph.rs")),
+        ("metal_graph/buffers.rs", include_str!("buffers.rs")),
+        ("metal_graph/session.rs", include_str!("session.rs")),
+        (
+            "metal_prefill/functions.rs",
+            include_str!("../metal_prefill/functions.rs"),
+        ),
+        (
+            "metal_prefill/functions_2.rs",
+            include_str!("../metal_prefill/functions_2.rs"),
+        ),
+        (
+            "metal_prefill/hidden.rs",
+            include_str!("../metal_prefill/hidden.rs"),
+        ),
+        (
+            "metal_prefill/attention.rs",
+            include_str!("../metal_prefill/attention.rs"),
+        ),
+    ];
+    let is_fn_start = |line: &str| {
+        let code = line.trim_start();
+        ["fn ", "pub fn ", "pub(crate) fn ", "pub(super) fn "]
+            .iter()
+            .any(|prefix| code.starts_with(prefix))
+    };
+    let mut sites = 0usize;
+    for (file, src) in sources {
+        let lines: Vec<&str> = src.lines().collect();
+        // A file's own test module (always last) builds throwaway command
+        // buffers of its own; only the dispatch code above it is pinned.
+        let end = lines
+            .iter()
+            .position(|line| {
+                let code = line.trim_start();
+                code.starts_with("#[cfg(test)]") || code.starts_with("#[cfg(all(test")
+            })
+            .unwrap_or(lines.len());
+        for (i, line) in lines[..end].iter().enumerate() {
+            let code = line.trim_start();
+            if code.starts_with("//") || !code.contains(".new_command_buffer()") {
+                continue;
+            }
+            sites += 1;
+            let fn_start = lines[..i].iter().rposition(|l| is_fn_start(l)).unwrap_or(0);
+            assert!(
+                lines[fn_start..i]
+                    .iter()
+                    .any(|l| l.contains("autoreleasepool(")),
+                "{file}:{}: command buffer created outside an autoreleasepool scope",
+                i + 1
+            );
+        }
+    }
+    // `>=`: the eight graph.rs dispatches and the prefill runner's
+    // micro-batch must be found (a dispatch site added later is pinned too).
+    assert!(
+        sites >= 9,
+        "expected at least the 9 known command-buffer sites, found {sites}"
+    );
 }

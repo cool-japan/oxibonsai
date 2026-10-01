@@ -394,6 +394,8 @@ fn run_parses_ctx_prefill_chunk_transcode_and_the_vision_flags() {
     for bad in [
         vec!["--prefill-chunk", "0"],
         vec!["--image-max-tokens", "0"],
+        vec!["--image-max-tokens", "16385"],
+        vec!["--image-max-tokens", "-1"],
         vec!["--ctx", "0"],
     ] {
         let mut argv = vec!["oxibonsai", "run", "--prompt", "hi"];
@@ -401,6 +403,37 @@ fn run_parses_ctx_prefill_chunk_transcode_and_the_vision_flags() {
         assert!(
             Cli::try_parse_from(argv).is_err(),
             "{bad:?} must be rejected"
+        );
+    }
+}
+
+/// `--image-max-tokens` accepts exactly the preprocessing's own range,
+/// `1..=16384`, on every command that takes it.
+#[test]
+fn image_max_tokens_accepts_exactly_its_range() {
+    assert_eq!(parse_image_max_tokens("1"), Ok(1));
+    assert_eq!(parse_image_max_tokens("1024"), Ok(1024));
+    assert_eq!(parse_image_max_tokens("16384"), Ok(16_384));
+    let over = parse_image_max_tokens("16385").expect_err("above the range");
+    assert!(over.contains("<= 16384"), "{over}");
+    let zero = parse_image_max_tokens("0").expect_err("zero");
+    assert!(zero.contains(">= 1"), "{zero}");
+    assert!(parse_image_max_tokens("many").is_err());
+    for command in ["run", "chat", "serve"] {
+        let mut argv = vec!["oxibonsai", command];
+        if command == "run" {
+            argv.extend(["--prompt", "hi"]);
+        }
+        argv.extend(["--image-max-tokens", "16384"]);
+        assert!(
+            Cli::try_parse_from(argv.clone()).is_ok(),
+            "{command}: the upper bound itself is accepted"
+        );
+        let last = argv.len() - 1;
+        argv[last] = "16385";
+        assert!(
+            Cli::try_parse_from(argv).is_err(),
+            "{command}: one above the bound is rejected"
         );
     }
 }

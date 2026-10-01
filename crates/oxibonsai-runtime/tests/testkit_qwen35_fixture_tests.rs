@@ -58,7 +58,7 @@ fn testkit_qwen35_fixture_loads_as_a_cpu_hybrid_engine_and_runs_a_greedy_step() 
     assert_eq!(engine.backend(), Backend::Cpu);
     assert!(
         !engine.uses_fused_gpu_decode(),
-        "no hybrid GPU encoder exists yet: the engine must run on the CPU"
+        "`--backend cpu` pins a hybrid to its CPU model: no fused GPU route"
     );
 
     // A real greedy step runs on the CPU hybrid path.

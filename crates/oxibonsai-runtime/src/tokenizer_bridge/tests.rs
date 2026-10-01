@@ -957,7 +957,7 @@ fn fallback_render_chat_prompt_matches_the_old_chatml_builder_on_the_real_tokeni
 fn real_27b_gguf_metadata_resolves_a_real_template_and_the_design_think_ids() {
     const TEST: &str = "oxibonsai-runtime::lib::\
                         real_27b_gguf_metadata_resolves_a_real_template_and_the_design_think_ids";
-    use oxibonsai_testkit::capability::{record_executed, record_skipped, Capability};
+    use oxibonsai_testkit::capability::{record_executed_timed, record_skipped, Capability};
     let Some(gguf_path) = std::env::var("OXI_BONSAI2_PQ2_GGUF")
         .ok()
         .filter(|path| !path.is_empty())
@@ -969,6 +969,7 @@ fn real_27b_gguf_metadata_resolves_a_real_template_and_the_design_think_ids() {
         record_skipped(Capability::Bonsai2Models, TEST);
         return;
     };
+    let start = std::time::Instant::now();
     let mmap = oxibonsai_core::gguf::reader::mmap_gguf_file(Path::new(&gguf_path))
         .expect("OXI_BONSAI2_PQ2_GGUF must name a readable GGUF file");
     let file = oxibonsai_core::gguf::reader::GgufFile::parse(&mmap)
@@ -1017,5 +1018,5 @@ fn real_27b_gguf_metadata_resolves_a_real_template_and_the_design_think_ids() {
             bridge.is_special(im_end_id)
         );
     }
-    record_executed(Capability::Bonsai2Models, TEST);
+    record_executed_timed(Capability::Bonsai2Models, TEST, start.elapsed());
 }

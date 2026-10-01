@@ -10,8 +10,10 @@
 //! * **forward / prefill** — `InferenceEngine::forward_logits` and
 //!   `InferenceEngine::prefill_logits` (crate-internal) call the *exact* dense
 //!   `BonsaiModel::forward` / `forward_prefill` the engine always called (so
-//!   a dense engine is byte-identical to before), and the hybrid model's
-//!   `forward` / chunked `forward_prefill` for a hybrid one;
+//!   a dense engine is byte-identical to before); for a hybrid one, the
+//!   Metal hybrid runner's `forward_into` / chunked `forward_prefill` when
+//!   the engine was built with one ([`InferenceEngine::hybrid_backend`] is
+//!   `Metal`), else the CPU model's `forward` / chunked `forward_prefill`;
 //! * **introspection** — vocabulary, context, architecture, dominant quant
 //!   type, cache geometry, memory, for both kinds;
 //! * **dense-only access** — [`InferenceEngine::dense_model`] /
@@ -20,19 +22,33 @@
 //!   [`EngineError::NotADenseModel`];
 //! * **sequence state** — [`InferenceEngine::snapshot_sequence`] /
 //!   [`InferenceEngine::restore_sequence`], the one exact rollback point a
-//!   recurrent model supports.
+//!   recurrent model supports, on either hybrid executor.
+//!
+//! # Which executor a hybrid engine decodes on
+//!
+//! `--backend auto` ([`Backend::Auto`]) builds the Metal hybrid runner when
+//! this is a Metal build, a Metal device exists, the model's geometry and
+//! weight formats are ones the runner serves and a KV window fits
+//! ([`crate::engine_hybrid_gpu::hybrid_backend_plan`]); otherwise it runs
+//! the CPU tier and logs why at `info`. [`Backend::Metal`] builds the runner
+//! or refuses with [`EngineError::HybridGpuBackendUnsupported`] naming the
+//! violated constraint. [`Backend::Cpu`] never touches Metal. The CPU model
+//! stays loaded beside a runner (the runner reads its weight slices in place
+//! from the same mapping; the embedding pass runs on the CPU model), so the
+//! KV window is budgeted over both residents
+//! ([`crate::engine_hybrid_gpu::plan_hybrid_metal_window`]).
 //!
 //! # What a hybrid engine does not do (typed refusals, never silent)
 //!
 //! | Operation | Dense | Hybrid |
 //! |---|---|---|
-//! | `generate*` / streaming / logprobs / cancellation / reset | yes | yes (CPU) |
-//! | GPU-argmax greedy, fused-GPU sampled top-k | Metal fused route | no — CPU full-row path (no hybrid GPU encoder yet) |
-//! | `--backend metal` ([`Backend::Metal`]) | yes | [`EngineError::HybridGpuBackendUnsupported`] |
+//! | `generate*` / streaming / logprobs / cancellation / reset | yes | yes (Metal runner or CPU) |
+//! | GPU-argmax greedy, fused-GPU sampled top-k | Metal fused route | no — full-row decode on the hybrid executor (the runner downloads the logit row) |
+//! | `--backend metal` ([`Backend::Metal`]) | yes | yes (the Metal hybrid runner), or [`EngineError::HybridGpuBackendUnsupported`] naming why not |
 //! | `rewind_cache` to an earlier position | KV cursor move | `ModelError::RecurrentRollbackUnsupported` |
 //! | `verify_batch` / speculative decoding | yes | [`EngineError::RecurrentRollbackRequired`] |
 //! | prefix-cache KV block restore | yes | [`EngineError::RecurrentRollbackRequired`] (`PrefixCachedEngine::try_new`) |
-//! | embeddings (`embed`, `ModelEmbedder`) | yes (batched CPU prefill) | yes (CPU, `HybridModel::forward_hidden`) |
+//! | embeddings (`embed`, `ModelEmbedder`) | yes (batched CPU prefill) | yes (CPU, `HybridModel::forward_hidden`, on either executor) |
 //!
 //! [`EngineError::NotADenseModel`] remains the refusal for what genuinely is
 //! dense-only: [`InferenceEngine::require_dense`] hands it to any caller that
@@ -43,7 +59,11 @@
 //! A [`SequenceSnapshot`] captures the sequence **at the current position**:
 //! the KV cursor (every stored key/value below it is immutable until a
 //! reset) plus, for a hybrid model, a deep copy of the whole recurrent state
-//! (`RecurrentCache::snapshot`, ~157 MB for the 27B). Restoring it is exact.
+//! — the CPU model's (`RecurrentCache::snapshot`, ~157 MB for the 27B) or
+//! the Metal runner's device state (`HybridMetalRunner::snapshot_state`,
+//! ~150 MiB; the device KV needs no copy, as the runner writes every
+//! position before any query reads it). Restoring it is exact, and both
+//! executors refuse the same misuse with the same error codes.
 //! What is **not** snapshot-able: an arbitrary *past* position of a hybrid
 //! model (a recurrence has no positional masking — that needs a checkpoint
 //! ring, design §8.4 item 2), a KV-only block of a hybrid sequence (the
@@ -64,6 +84,10 @@ use oxibonsai_model::hybrid::{HybridModel, LoadedModel, RecurrentSnapshot};
 use oxibonsai_model::model::BonsaiModel;
 
 use crate::engine::InferenceEngine;
+use crate::engine_hybrid_gpu::{
+    hybrid_backend_plan, HybridBackend, HybridBackendPlan, HybridGpu, HybridGpuState,
+    HYBRID_RUNNER_LABEL,
+};
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::tokenizer_bridge::TokenizerBridge;
 
@@ -74,20 +98,28 @@ use crate::tokenizer_bridge::TokenizerBridge;
 /// Which compute backend an engine is asked to run on (the engine-level knob
 /// behind the CLI's `--backend`).
 ///
-/// * [`Backend::Auto`] — today's behaviour: the best available tier (the GPU
-///   when one is accelerated). A **hybrid** model has no GPU encoder yet, so
-///   it logs that at `info` and runs on the best CPU tier.
+/// * [`Backend::Auto`] — the best available tier: the GPU when one is
+///   accelerated. A **hybrid** model runs on the Metal hybrid runner when
+///   one serves it on this host, and otherwise on the best CPU tier, with
+///   one `info` line naming why.
 /// * [`Backend::Cpu`] — the best CPU SIMD tier, all the way down: a dense
 ///   model is constructed inside a
 ///   [`CpuOnlyBackendScope`](oxibonsai_kernels::gpu_backend::CpuOnlyBackendScope),
 ///   so the per-layer dispatchers `oxibonsai-model` creates internally land
-///   on the CPU as well, and nothing is uploaded to a GPU.
-/// * [`Backend::Metal`] — the Metal GPU, or a typed error: unavailable on this
-///   build/host ([`EngineError::BackendUnavailable`]), or a hybrid model
-///   ([`EngineError::HybridGpuBackendUnsupported`]).
+///   on the CPU as well, and nothing is uploaded to a GPU; a hybrid model
+///   never builds the Metal runner.
+/// * [`Backend::Metal`] — the Metal GPU, or a typed error: a dense model on a
+///   build/host without it ([`EngineError::BackendUnavailable`]), or a hybrid
+///   model the Metal runner cannot serve here
+///   ([`EngineError::HybridGpuBackendUnsupported`], naming the constraint).
+///
+/// [`InferenceEngine::backend`] reports the knob an engine was built with;
+/// [`InferenceEngine::hybrid_backend`] reports the executor a hybrid engine
+/// actually decodes on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Backend {
-    /// Best available tier (GPU when accelerated; CPU for a hybrid model).
+    /// Best available tier (GPU when accelerated; the Metal hybrid runner or
+    /// the CPU for a hybrid model).
     #[default]
     Auto,
     /// Best CPU SIMD tier.
@@ -226,17 +258,21 @@ pub enum EngineError {
         /// `general.architecture` of the loaded model.
         architecture: String,
     },
-    /// A GPU backend was explicitly requested for a hybrid model.
+    /// A GPU backend was explicitly requested for a hybrid model the Metal
+    /// hybrid runner cannot serve on this build or host.
     #[error(
         "backend `{requested}` was explicitly requested for a hybrid `{architecture}` model, but \
-         no hybrid GPU encoder exists yet (the Metal/CUDA hybrid decode path is future work); \
-         use backend auto or cpu"
+         the Metal hybrid runner cannot serve it here: {reason}; use backend auto or cpu"
     )]
     HybridGpuBackendUnsupported {
         /// The backend that was asked for.
         requested: Backend,
         /// `general.architecture` of the model.
         architecture: String,
+        /// The violated constraint: no Metal build or device, a geometry or
+        /// weight format the runner does not serve, or no room for a KV
+        /// window.
+        reason: String,
     },
     /// The requested backend is not available in this build or on this host.
     #[error("backend `{requested}` is unavailable: {reason}")]
@@ -337,6 +373,7 @@ impl EngineError {
             Self::HybridGpuBackendUnsupported {
                 requested: Backend::Metal,
                 architecture: "qwen35".into(),
+                reason: "no Metal device was found on this host".into(),
             },
             Self::BackendUnavailable {
                 requested: Backend::Metal,
@@ -381,8 +418,33 @@ pub struct SequenceSnapshot {
     position: usize,
     /// The engine sequence the snapshot belongs to.
     sequence_id: u64,
-    /// Deep copy of the recurrent state (hybrid engines only).
-    recurrent: Option<RecurrentSnapshot>,
+    /// What besides the KV cursor the snapshot restores.
+    state: SnapshotState,
+}
+
+/// The per-sequence state a [`SequenceSnapshot`] carries besides the KV
+/// cursor, by executor.
+#[derive(Debug, Clone)]
+enum SnapshotState {
+    /// A dense engine: the KV cursor is the whole state.
+    Dense,
+    /// A hybrid engine on the CPU: a deep copy of the model's recurrent
+    /// cache.
+    HybridCpu(Box<RecurrentSnapshot>),
+    /// A hybrid engine on the Metal runner: a copy of the device recurrent
+    /// state (the device KV needs none — see the module docs).
+    HybridMetal(Box<HybridGpuState>),
+}
+
+impl SnapshotState {
+    /// The executor kind, for mismatch messages.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Dense => "a dense model",
+            Self::HybridCpu(_) => "a hybrid model on the CPU",
+            Self::HybridMetal(_) => "a hybrid model on the Metal runner",
+        }
+    }
 }
 
 impl SequenceSnapshot {
@@ -393,10 +455,20 @@ impl SequenceSnapshot {
     }
 
     /// Whether this snapshot carries a recurrent state (i.e. was taken from a
-    /// hybrid engine).
+    /// hybrid engine, on either executor).
     #[must_use]
     pub fn has_recurrent_state(&self) -> bool {
-        self.recurrent.is_some()
+        !matches!(self.state, SnapshotState::Dense)
+    }
+
+    /// The executor the snapshot was taken on: `None` for a dense engine.
+    #[must_use]
+    pub fn hybrid_backend(&self) -> Option<HybridBackend> {
+        match self.state {
+            SnapshotState::Dense => None,
+            SnapshotState::HybridCpu(_) => Some(HybridBackend::Cpu),
+            SnapshotState::HybridMetal(_) => Some(HybridBackend::Metal),
+        }
     }
 }
 
@@ -414,52 +486,127 @@ pub(crate) fn gguf_architecture(gguf: &GgufFile<'_>) -> String {
     LoadedModel::architecture_of(gguf)
 }
 
-/// Build the hybrid half of an engine: refuse an explicit GPU request, pin a
-/// CPU dispatcher, clamp the KV window to the model's declared context and
-/// bind the model.
+/// The hybrid half of an engine, as [`load_hybrid`] built it.
+pub(crate) struct HybridLoad<'a> {
+    /// The CPU model (bound at the engine's KV window).
+    pub(crate) model: HybridModel<'a>,
+    /// The CPU dispatcher the engine holds.
+    pub(crate) kernel: KernelDispatcher,
+    /// The Metal hybrid runner, when one serves the model.
+    pub(crate) gpu: Option<HybridGpu<'a>>,
+}
+
+/// Build the hybrid half of an engine (see the module docs): the CPU model on
+/// a pinned CPU dispatcher, its KV window clamped to the model's declared
+/// context, and — for [`Backend::Metal`] and [`Backend::Auto`] — the Metal
+/// hybrid runner when one serves the model on this host, with the window
+/// budgeted for the CPU model and the runner together (the CPU model is
+/// rebound at that window when the budget is the tighter limit).
 ///
-/// Returns the model and the CPU dispatcher the engine should hold.
+/// # Errors
+///
+/// Model-load errors, and for [`Backend::Metal`] the typed
+/// [`EngineError::HybridGpuBackendUnsupported`] naming why no runner serves
+/// the model: no Metal build or device, a geometry or weight format the
+/// runner does not serve, no room for a KV window, or a failed construction.
 pub(crate) fn load_hybrid<'a>(
     gguf: &'a GgufFile<'a>,
     max_seq_len: usize,
     backend: Backend,
-) -> RuntimeResult<(HybridModel<'a>, KernelDispatcher)> {
+) -> RuntimeResult<HybridLoad<'a>> {
     let architecture = gguf_architecture(gguf);
-    if backend == Backend::Metal {
-        return Err(EngineError::HybridGpuBackendUnsupported {
-            requested: backend,
-            architecture,
-        }
-        .into());
-    }
     let kernel = cpu_dispatcher();
-    if backend == Backend::Auto {
-        // Logged on every build, GPU-capable or not: `auto` never means a GPU
-        // for a hybrid model today, and the operator should see why.
+    let config = HybridModel::config_from_gguf(gguf)?;
+    let declared = config.base.max_context_length.max(1);
+    let cpu_window = max_seq_len.min(declared);
+    let bind = |window: usize| -> RuntimeResult<HybridModel<'a>> {
+        Ok(HybridModel::from_gguf_with(
+            gguf,
+            config.clone(),
+            window,
+            &Arc::new(cpu_dispatcher_clone(&kernel)),
+        )?)
+    };
+    let refuse = |reason: String| -> RuntimeError {
+        EngineError::HybridGpuBackendUnsupported {
+            requested: backend,
+            architecture: architecture.clone(),
+            reason,
+        }
+        .into()
+    };
+    let fall_back = |reason: &str| {
         tracing::info!(
             architecture = %architecture,
             tier = %kernel.tier(),
-            "hybrid model: no hybrid GPU encoder exists yet, so backend `auto` runs this model on \
-             the CPU tier (Metal/CUDA hybrid decode is future work)"
+            reason,
+            "hybrid model: the Metal hybrid runner does not serve it here, so backend `auto` runs \
+             it on the CPU tier"
         );
-    }
-    let config = HybridModel::config_from_gguf(gguf)?;
-    let declared = config.base.max_context_length.max(1);
-    let window = max_seq_len.min(declared);
-    if window < max_seq_len {
+    };
+
+    let model = bind(cpu_window)?;
+    let (model, gpu) = match backend {
+        Backend::Cpu => (model, None),
+        Backend::Auto | Backend::Metal => match hybrid_backend_plan(gguf, &model, max_seq_len) {
+            HybridBackendPlan::Cpu { reason } => {
+                if backend == Backend::Metal {
+                    return Err(refuse(reason));
+                }
+                fall_back(&reason);
+                (model, None)
+            }
+            HybridBackendPlan::Metal { window, mapped } => {
+                if window.clamped() {
+                    tracing::warn!(
+                        requested = window.requested,
+                        window = window.window,
+                        limits = ?window.limits_applied,
+                        "hybrid model on the Metal runner: the requested KV window is clamped to \
+                         {} positions ({})",
+                        window.window,
+                        window.describe_limits()
+                    );
+                }
+                let model = if window.window == model.max_seq_len() {
+                    model
+                } else {
+                    bind(window.window)?
+                };
+                let summary = window.summary();
+                match HybridGpu::build(gguf, &model, window) {
+                    Ok(gpu) => {
+                        tracing::info!(
+                            architecture = %architecture,
+                            mapped,
+                            "hybrid model: decoding on the Metal hybrid runner; {summary}"
+                        );
+                        (model, Some(gpu))
+                    }
+                    Err(reason) => {
+                        if backend == Backend::Metal {
+                            return Err(refuse(reason));
+                        }
+                        fall_back(&reason);
+                        let model = if model.max_seq_len() == cpu_window {
+                            model
+                        } else {
+                            bind(cpu_window)?
+                        };
+                        (model, None)
+                    }
+                }
+            }
+        },
+    };
+    if gpu.is_none() && cpu_window < max_seq_len {
         tracing::warn!(
             requested = max_seq_len,
             declared,
             "requested max_seq_len exceeds the hybrid model's declared context; clamped"
         );
     }
-    let model = HybridModel::from_gguf_with(
-        gguf,
-        config,
-        window,
-        &Arc::new(cpu_dispatcher_clone(&kernel)),
-    )?;
-    Ok((model, kernel))
+    Ok(HybridLoad { model, kernel, gpu })
 }
 
 /// A second dispatcher on the same CPU tier (a `KernelDispatcher` is not
@@ -581,6 +728,44 @@ impl<'a> InferenceEngine<'a> {
         self.model.is_hybrid()
     }
 
+    /// The executor a hybrid engine decodes on — the Metal hybrid runner or
+    /// the CPU model — or `None` for a dense engine.
+    ///
+    /// Unlike [`backend`](Self::backend), which reports the knob the engine
+    /// was built with (`auto` stays `auto`), this is what `auto` resolved to.
+    pub fn hybrid_backend(&self) -> Option<HybridBackend> {
+        if !self.model.is_hybrid() {
+            return None;
+        }
+        Some(if self.hybrid_gpu.is_some() {
+            HybridBackend::Metal
+        } else {
+            HybridBackend::Cpu
+        })
+    }
+
+    /// The KV window of a Metal-backed hybrid engine and every limit that
+    /// went into it; `None` for any other engine.
+    pub fn hybrid_metal_window(&self) -> Option<&crate::engine_hybrid_gpu::HybridMetalWindow> {
+        self.hybrid_gpu.as_ref().map(HybridGpu::window)
+    }
+
+    /// Whether a Metal-backed hybrid engine's runner reads the weights in
+    /// place from the file mapping (`Some(false)`: it copied them); `None`
+    /// for any other engine.
+    pub fn hybrid_metal_weights_mapped(&self) -> Option<bool> {
+        self.hybrid_gpu.as_ref().map(HybridGpu::is_mapped)
+    }
+
+    /// Bytes the Metal device reports as allocated by this process
+    /// (`MTLDevice.currentAllocatedSize`), read through a Metal-backed
+    /// hybrid engine's runner; `None` for any other engine.
+    pub fn hybrid_metal_device_allocated_bytes(&self) -> Option<u64> {
+        self.hybrid_gpu
+            .as_ref()
+            .map(HybridGpu::device_allocated_bytes)
+    }
+
     /// `general.architecture` of the loaded model (`"qwen3"`, `"qwen35"`, …).
     pub fn architecture(&self) -> &str {
         match &self.model {
@@ -636,8 +821,12 @@ impl<'a> InferenceEngine<'a> {
     }
 
     /// Tokens the current sequence has consumed (the KV cursor; for a hybrid
-    /// model also the recurrent state's token count).
+    /// model the recurrent state's token count — the Metal runner's when the
+    /// engine decodes on it).
     pub fn sequence_position(&self) -> usize {
+        if let Some(gpu) = &self.hybrid_gpu {
+            return gpu.token_count();
+        }
         match &self.model {
             LoadedModel::Dense(model) => model.kv_cache().seq_len(),
             LoadedModel::Hybrid(model) => model.recurrent().token_count(),
@@ -670,8 +859,13 @@ impl<'a> InferenceEngine<'a> {
 
     /// `"<dominant quant type> <kernel tier>"`, e.g. `"PQ2_0 NEON (128-bit)"`
     /// (cli-16) — the resolved quant family plus the effective tier, never a
-    /// hardcoded kernel-family string.
+    /// hardcoded kernel-family string. A Metal-backed hybrid engine reports
+    /// `"<quant type> Metal (hybrid runner)"`: its decode runs the runner's
+    /// own kernels, not the CPU dispatcher the engine also holds.
     pub fn kernel_label(&self) -> String {
+        if self.hybrid_gpu.is_some() {
+            return format!("{} {}", self.dominant_quant_type(), HYBRID_RUNNER_LABEL);
+        }
         self.kernel.kernel_label(self.dominant_quant_type())
     }
 
@@ -680,12 +874,18 @@ impl<'a> InferenceEngine<'a> {
         self.model.describe()
     }
 
-    /// Bytes held by the KV cache.
+    /// Bytes held by the KV cache — for a Metal-backed hybrid engine both
+    /// residents': the CPU model's (grown only as far as its own passes
+    /// reached) and the runner's (allocated for the whole window).
     pub fn kv_cache_memory_bytes(&self) -> usize {
-        match &self.model {
+        let runner = self.hybrid_gpu.as_ref().map_or(0, |gpu| {
+            usize::try_from(gpu.kv_cache_bytes()).unwrap_or(usize::MAX)
+        });
+        let own = match &self.model {
             LoadedModel::Dense(model) => model.kv_cache_memory_bytes(),
             LoadedModel::Hybrid(model) => model.kv_cache().memory_bytes(),
-        }
+        };
+        own.saturating_add(runner)
     }
 
     /// Bytes of per-sequence state: the KV cache plus the hybrid model's
@@ -735,15 +935,22 @@ impl<'a> InferenceEngine<'a> {
     ///
     /// The implicit reset clears everything an explicit
     /// [`reset`](InferenceEngine::reset) clears: the hybrid model's KV cursor
-    /// and its own recurrent state, **and** an attached opaque
+    /// and its own recurrent state, the Metal runner's state when the engine
+    /// decodes on it, **and** an attached opaque
     /// [`RecurrentState`](crate::engine_control::RecurrentState) — it belongs
     /// to the sequence being abandoned, and unlike a KV cache it is not
     /// masked by position, so keeping it would contaminate the new sequence.
+    ///
+    /// On a Metal-backed engine the count is the runner's: its device state
+    /// is the one every forward advances.
     fn prepare_hybrid_position(&mut self, pos: usize) -> RuntimeResult<()> {
         let LoadedModel::Hybrid(model) = &mut self.model else {
             return Ok(());
         };
-        let expected = model.recurrent().token_count();
+        let expected = match &self.hybrid_gpu {
+            Some(gpu) => gpu.token_count(),
+            None => model.recurrent().token_count(),
+        };
         if pos == expected {
             return Ok(());
         }
@@ -753,6 +960,9 @@ impl<'a> InferenceEngine<'a> {
                 "hybrid forward at position 0: starting a new sequence (implicit reset)"
             );
             model.reset();
+            if let Some(gpu) = self.hybrid_gpu.as_mut() {
+                gpu.reset();
+            }
             if let Some(state) = self.recurrent.as_deref_mut() {
                 state.reset_recurrent();
             }
@@ -774,15 +984,17 @@ impl<'a> InferenceEngine<'a> {
     /// returning the `[vocab]` logit row.
     ///
     /// Dense: exactly `BonsaiModel::forward(token, pos, &self.kernel)`.
-    /// Hybrid: `HybridModel::forward`, after the position contract.
+    /// Hybrid: the Metal runner's `forward_into` on a Metal-backed engine,
+    /// else `HybridModel::forward`, after the position contract.
     pub(crate) fn forward_logits(&mut self, token: u32, pos: usize) -> RuntimeResult<Vec<f32>> {
         if pos == 0 && !self.model.is_hybrid() {
             self.sequence_id = self.sequence_id.wrapping_add(1);
         }
         self.prepare_hybrid_position(pos)?;
-        let row = match &mut self.model {
-            LoadedModel::Dense(model) => model.forward(token, pos, &self.kernel)?,
-            LoadedModel::Hybrid(model) => model.forward_alloc(token, pos)?,
+        let row = match (&mut self.model, self.hybrid_gpu.as_mut()) {
+            (LoadedModel::Dense(model), _) => model.forward(token, pos, &self.kernel)?,
+            (LoadedModel::Hybrid(_), Some(gpu)) => gpu.forward_logits(token, pos)?,
+            (LoadedModel::Hybrid(model), None) => model.forward_alloc(token, pos)?,
         };
         // Test-only scripted generation (`crate::engine::ScriptedLogits`).
         #[cfg(test)]
@@ -792,7 +1004,8 @@ impl<'a> InferenceEngine<'a> {
 
     /// Single-token forward at `pos` on an explicit dispatcher — the greedy
     /// path's coherent CPU-fallback replay. A hybrid model carries its
-    /// dispatcher inside its layers, so `kernel` only reaches the dense arm.
+    /// dispatcher inside its layers (and a Metal-backed one decodes on its
+    /// runner), so `kernel` only reaches the dense arm.
     #[cfg(all(feature = "metal", target_os = "macos"))]
     pub(crate) fn forward_logits_on(
         &mut self,
@@ -804,9 +1017,10 @@ impl<'a> InferenceEngine<'a> {
             self.sequence_id = self.sequence_id.wrapping_add(1);
         }
         self.prepare_hybrid_position(pos)?;
-        match &mut self.model {
-            LoadedModel::Dense(model) => Ok(model.forward(token, pos, kernel)?),
-            LoadedModel::Hybrid(model) => Ok(model.forward_alloc(token, pos)?),
+        match (&mut self.model, self.hybrid_gpu.as_mut()) {
+            (LoadedModel::Dense(model), _) => Ok(model.forward(token, pos, kernel)?),
+            (LoadedModel::Hybrid(_), Some(gpu)) => gpu.forward_logits(token, pos),
+            (LoadedModel::Hybrid(model), None) => Ok(model.forward_alloc(token, pos)?),
         }
     }
 
@@ -814,9 +1028,13 @@ impl<'a> InferenceEngine<'a> {
     /// token's `[vocab]` logit row.
     ///
     /// Dense: exactly `BonsaiModel::forward_prefill(tokens, pos_start,
-    /// &self.kernel)`. Hybrid: `HybridModel::forward_prefill`, which runs the
-    /// prompt in `prefill_chunk`-token chunks (design §3.10), after the
-    /// position contract.
+    /// &self.kernel)`. Hybrid: the prompt in `prefill_chunk`-token chunks
+    /// (design §3.10) after the position contract — through the Metal
+    /// runner's `forward_prefill` on a Metal-backed engine (each chunk also
+    /// capped at the runner's own batch size, fixed when it was built), else
+    /// `HybridModel::forward_prefill`. Either way the recurrent state
+    /// advances once per token, in order, so the chunking never changes the
+    /// result.
     pub(crate) fn prefill_logits(
         &mut self,
         tokens: &[u32],
@@ -826,15 +1044,18 @@ impl<'a> InferenceEngine<'a> {
             self.sequence_id = self.sequence_id.wrapping_add(1);
         }
         self.prepare_hybrid_position(pos_start)?;
-        match &mut self.model {
-            LoadedModel::Dense(model) => {
+        match (&mut self.model, self.hybrid_gpu.as_mut()) {
+            (LoadedModel::Dense(model), _) => {
                 Ok(model.forward_prefill(tokens, pos_start, &self.kernel)?)
             }
-            LoadedModel::Hybrid(model) => {
+            (LoadedModel::Hybrid(model), gpu) => {
                 if tokens.is_empty() {
                     return Err(RuntimeError::Model(ModelError::MissingTensor {
                         name: "forward_prefill: empty token_ids".into(),
                     }));
+                }
+                if let Some(gpu) = gpu {
+                    return gpu.prefill_logits(tokens, pos_start, model.prefill_chunk());
                 }
                 let mut logits = vec![0.0f32; model.config().base.vocab_size];
                 model.forward_prefill(tokens, pos_start, &mut logits)?;
@@ -846,7 +1067,8 @@ impl<'a> InferenceEngine<'a> {
     // ── Sequence snapshots ──────────────────────────────────────────────
 
     /// Take an exact rollback point at the current position (see the module
-    /// docs).
+    /// docs) — on a Metal-backed hybrid engine, a copy of the runner's
+    /// device recurrent state.
     ///
     /// # Errors
     ///
@@ -859,26 +1081,33 @@ impl<'a> InferenceEngine<'a> {
             }
             .into());
         }
-        let recurrent = self
-            .hybrid_model()
-            .map(|model| model.recurrent().snapshot());
+        let state = match (&self.model, &self.hybrid_gpu) {
+            (LoadedModel::Dense(_), _) => SnapshotState::Dense,
+            (LoadedModel::Hybrid(_), Some(gpu)) => {
+                SnapshotState::HybridMetal(Box::new(gpu.snapshot()?))
+            }
+            (LoadedModel::Hybrid(model), None) => {
+                SnapshotState::HybridCpu(Box::new(model.recurrent().snapshot()))
+            }
+        };
         Ok(SequenceSnapshot {
             position: self.sequence_position(),
             sequence_id: self.sequence_id,
-            recurrent,
+            state,
         })
     }
 
     /// Restore a [`SequenceSnapshot`] taken from this engine's **current**
     /// sequence: the KV cursor moves back to the snapshot's position (the
     /// entries below it were never overwritten) and a hybrid model's
-    /// recurrent state is restored from the snapshot's deep copy.
+    /// recurrent state is restored from the snapshot's deep copy — the CPU
+    /// model's, or the Metal runner's device state.
     ///
     /// # Errors
     ///
     /// [`EngineError::SnapshotMismatch`] when the snapshot belongs to another
-    /// sequence (any reset since it was taken), to the other model kind, or
-    /// lies beyond the current position.
+    /// sequence (any reset since it was taken), to the other model kind or
+    /// the other hybrid executor, or lies beyond the current position.
     pub fn restore_sequence(&mut self, snapshot: &SequenceSnapshot) -> RuntimeResult<()> {
         if snapshot.sequence_id != self.sequence_id {
             return Err(EngineError::SnapshotMismatch {
@@ -900,24 +1129,33 @@ impl<'a> InferenceEngine<'a> {
             }
             .into());
         }
-        match (&mut self.model, snapshot.recurrent.as_ref()) {
-            (LoadedModel::Dense(model), None) => {
+        match (&mut self.model, self.hybrid_gpu.as_mut(), &snapshot.state) {
+            (LoadedModel::Dense(model), _, SnapshotState::Dense) => {
                 model.kv_cache_mut().truncate(snapshot.position);
                 Ok(())
             }
-            (LoadedModel::Hybrid(model), Some(recurrent)) => {
+            (LoadedModel::Hybrid(model), None, SnapshotState::HybridCpu(recurrent)) => {
                 model.recurrent_mut().restore(recurrent)?;
                 model.kv_cache_mut().set_seq_len(snapshot.position);
                 Ok(())
             }
-            (LoadedModel::Dense(_), Some(_)) => Err(EngineError::SnapshotMismatch {
-                detail: "it carries a recurrent state but this engine holds a dense model".into(),
+            (LoadedModel::Hybrid(_), Some(gpu), SnapshotState::HybridMetal(state)) => {
+                gpu.restore(state)
             }
-            .into()),
-            (LoadedModel::Hybrid(_), None) => Err(EngineError::SnapshotMismatch {
-                detail: "it carries no recurrent state but this engine holds a hybrid model".into(),
+            (model, gpu, state) => {
+                let engine = match (model.is_hybrid(), gpu.is_some()) {
+                    (false, _) => "a dense model",
+                    (true, false) => "a hybrid model on the CPU",
+                    (true, true) => "a hybrid model on the Metal runner",
+                };
+                Err(EngineError::SnapshotMismatch {
+                    detail: format!(
+                        "it was taken from {} but this engine holds {engine}",
+                        state.kind()
+                    ),
+                }
+                .into())
             }
-            .into()),
         }
     }
 }

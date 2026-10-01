@@ -546,3 +546,694 @@ fn q1_prefill_then_greedy_decode_uploads_the_lm_head_once_and_replicas_share_it(
     );
     drop(lm_head);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// M-18: the Metal prefill router (sequential route, timeout fallback) and
+// the head-free Metal hidden prefill of `forward_hidden`
+// ═══════════════════════════════════════════════════════════════════════════
+
+use oxibonsai_kernels::gpu_backend::PrefillRoute;
+
+/// `TQ2_0_g128` bytes (qs first, then the f16 scale), every 2-bit code valid.
+fn tq2_blocks(num_weights: usize, seed: u64) -> Vec<u8> {
+    let mut lcg = oxibonsai_testkit::gguf_fixture::Lcg::new(seed.wrapping_add(0x5157_4A12));
+    let mut data = Vec::with_capacity(num_weights / 128 * 34);
+    for _ in 0..num_weights / 128 {
+        for _ in 0..32 {
+            data.push(lcg.next_valid_tq2_byte());
+        }
+        let scale = 0.25_f32 + ((lcg.next_u64() >> 33) as u32 as f32) / (u32::MAX as f32) * 0.5;
+        data.extend_from_slice(&f16::from_f32(scale).to_le_bytes());
+    }
+    data
+}
+
+/// The [`q1_gguf`] geometry with every projection and the LM head
+/// `TQ2_0_g128` — the ternary Metal route.
+fn tq2_gguf(head_seed: u64) -> Vec<u8> {
+    let mut w = GgufWriter::new();
+    w.add_metadata(
+        "general.architecture",
+        MetadataWriteValue::Str("qwen3".to_string()),
+    );
+    w.add_metadata(
+        "general.name",
+        MetadataWriteValue::Str("M18Tq2".to_string()),
+    );
+    for (k, v) in [
+        ("qwen3.embedding_length", H),
+        ("qwen3.block_count", LAYERS),
+        ("qwen3.attention.head_count", NQ),
+        ("qwen3.attention.head_count_kv", NKV),
+        ("qwen3.feed_forward_length", INTER),
+        ("qwen3.vocab_size", VOCAB),
+        ("qwen3.context_length", CONTEXT),
+    ] {
+        w.add_metadata(k, MetadataWriteValue::U32(v as u32));
+    }
+    w.add_metadata(
+        "qwen3.attention.layer_norm_rms_epsilon",
+        MetadataWriteValue::F32(1e-6),
+    );
+    w.add_metadata("qwen3.rope.freq_base", MetadataWriteValue::F32(10_000.0));
+    let mut add = |name: String, shape: Vec<u64>, tensor_type: TensorType, data: Vec<u8>| {
+        w.add_tensor(TensorEntry {
+            name,
+            shape,
+            tensor_type,
+            data,
+        });
+    };
+    add(
+        "token_embd.weight".to_string(),
+        vec![H as u64, VOCAB as u64],
+        TensorType::F32,
+        f32_bytes(H * VOCAB, 0.5),
+    );
+    add(
+        "output_norm.weight".to_string(),
+        vec![H as u64],
+        TensorType::F32,
+        f32_bytes(H, 1.0),
+    );
+    add(
+        "output.weight".to_string(),
+        vec![H as u64, VOCAB as u64],
+        TensorType::TQ2_0_g128,
+        tq2_blocks(H * VOCAB, head_seed),
+    );
+    for layer in 0..LAYERS {
+        for (name, len) in [
+            ("attn_norm", H),
+            ("ffn_norm", H),
+            ("attn_q_norm", HD),
+            ("attn_k_norm", HD),
+        ] {
+            add(
+                format!("blk.{layer}.{name}.weight"),
+                vec![len as u64],
+                TensorType::F32,
+                f32_bytes(len, 1.0),
+            );
+        }
+        for (name, rows, cols, bump) in [
+            ("attn_q", H, NQ * HD, 0u64),
+            ("attn_k", H, NKV * HD, 1),
+            ("attn_v", H, NKV * HD, 2),
+            ("attn_output", NQ * HD, H, 3),
+            ("ffn_gate", H, INTER, 4),
+            ("ffn_up", H, INTER, 5),
+            ("ffn_down", INTER, H, 6),
+        ] {
+            add(
+                format!("blk.{layer}.{name}.weight"),
+                vec![rows as u64, cols as u64],
+                TensorType::TQ2_0_g128,
+                tq2_blocks(rows * cols, 0x3000 + (layer as u64) * 16 + bump),
+            );
+        }
+    }
+    w.to_bytes().expect("GgufWriter::to_bytes")
+}
+
+/// A GPU-tier dispatcher wired to a live backend, or `None` (skip).
+fn gpu_dispatcher() -> Option<KernelDispatcher> {
+    let gpu = KernelDispatcher::auto_detect();
+    (gpu.tier() == KernelTier::Gpu).then_some(gpu)
+}
+
+/// A private Metal graph bound to this thread, so nothing these tests leave
+/// in a session (device KV, parked command buffers) reaches another test.
+fn private_metal_graph() -> Option<(Arc<MetalGraph>, oxibonsai_kernels::SessionScope)> {
+    let graph = Arc::new(MetalGraph::new().ok()?);
+    let scope = MetalGraph::bind_scope(Arc::clone(&graph));
+    Some((graph, scope))
+}
+
+/// A model made GPU-resident the way a production Metal engine is: the
+/// weight upload and the eager fused-weight cache.
+fn gpu_ready<'a>(gguf: &'a GgufFile<'a>, gpu: &KernelDispatcher) -> BonsaiModel<'a> {
+    let mut model = BonsaiModel::from_gguf(gguf, CONTEXT).expect("fixture loads");
+    model.upload_weights_to_gpu(gpu);
+    model
+        .get_or_create_gpu_cache()
+        .unwrap_or_else(|e| panic!("fused weight cache: {e}"));
+    model
+}
+
+fn logit_bits(v: &[f32]) -> Vec<u32> {
+    v.iter().map(|x| x.to_bits()).collect()
+}
+
+fn argmax(v: &[f32]) -> u32 {
+    let mut best = 0usize;
+    for (i, x) in v.iter().enumerate() {
+        if *x > v[best] {
+            best = i;
+        }
+    }
+    best as u32
+}
+
+/// Prefill `prompt` through `forward_prefill`, then decode three greedy
+/// steps; every step's logits.
+fn prefill_then_decode(
+    model: &mut BonsaiModel<'_>,
+    gpu: &KernelDispatcher,
+    prompt: &[u32],
+) -> Vec<Vec<f32>> {
+    let mut steps = vec![model.forward_prefill(prompt, 0, gpu).expect("prefill")];
+    for step in 0..3 {
+        let token = argmax(steps.last().map_or(&[][..], Vec::as_slice));
+        steps.push(
+            model
+                .forward(token, prompt.len() + step, gpu)
+                .expect("decode step"),
+        );
+    }
+    steps
+}
+
+/// The same, with the prompt fed one `forward` per token — the sequential
+/// prefill the M-18 router's sequential route must reproduce exactly.
+fn forward_each_then_decode(
+    model: &mut BonsaiModel<'_>,
+    gpu: &KernelDispatcher,
+    prompt: &[u32],
+) -> Vec<Vec<f32>> {
+    let mut last = Vec::new();
+    for (pos, &token) in prompt.iter().enumerate() {
+        last = model.forward(token, pos, gpu).expect("forward");
+    }
+    let mut steps = vec![last];
+    for step in 0..3 {
+        let token = argmax(steps.last().map_or(&[][..], Vec::as_slice));
+        steps.push(
+            model
+                .forward(token, prompt.len() + step, gpu)
+                .expect("decode step"),
+        );
+    }
+    steps
+}
+
+const M18_PROMPT: [u32; 12] = [3, 17, 5, 29, 11, 2, 7, 19, 23, 1, 4, 9];
+
+/// M-18 (c): with the route pinned to sequential (the "fused path predicted
+/// slower" decision), `forward_prefill` runs no fused batch call and produces
+/// exactly what `forward` token by token produces — the prefill logits and
+/// the three decode steps after it, bit for bit, on both weight formats.
+#[test]
+fn forward_prefill_on_the_sequential_route_is_bit_identical_to_forward() {
+    let Some(gpu) = gpu_dispatcher() else {
+        eprintln!("skip: no accelerated GPU backend on this host");
+        return;
+    };
+    let Some((graph, _scope)) = private_metal_graph() else {
+        eprintln!("skip: no Metal device");
+        return;
+    };
+    for (label, bytes) in [("Q1", q1_gguf(1.0, 0xA11CE)), ("TQ2", tq2_gguf(0x7E57))] {
+        let gguf = GgufFile::parse(&bytes).expect("fixture parses");
+        let mut model = gpu_ready(&gguf, &gpu);
+        model.force_metal_prefill_route(Some(PrefillRoute::Sequential));
+        let fused_before = graph.prefill_run_count();
+        let routed = prefill_then_decode(&mut model, &gpu, &M18_PROMPT);
+        assert_eq!(
+            graph.prefill_run_count(),
+            fused_before,
+            "{label}: the sequential route must not run the fused batch prefill"
+        );
+        assert!(
+            model.gpu_path_active(),
+            "{label}: the device KV latch is set"
+        );
+        model.force_metal_prefill_route(None);
+        model.reset();
+        let reference = forward_each_then_decode(&mut model, &gpu, &M18_PROMPT);
+        for (step, (a, b)) in routed.iter().zip(&reference).enumerate() {
+            assert_eq!(
+                logit_bits(a),
+                logit_bits(b),
+                "{label}: step {step} differs between the sequential route and forward"
+            );
+        }
+    }
+}
+
+/// Counts WARN-or-worse events while installed.
+struct WarnCounter(Arc<std::sync::atomic::AtomicUsize>);
+
+impl tracing::Subscriber for WarnCounter {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.level() <= &tracing::Level::WARN
+    }
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        if *event.metadata().level() <= tracing::Level::WARN {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    fn enter(&self, _span: &tracing::span::Id) {}
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+/// M-18 (a) + (c): a fused prefill that misses its deadline (injected) falls
+/// back to the sequential route with exactly one warning, and the logits and
+/// the next decode steps are those of a sequential prefill, bit for bit.
+#[test]
+fn forward_prefill_timeout_falls_back_to_sequential_with_one_warning() {
+    let Some(gpu) = gpu_dispatcher() else {
+        eprintln!("skip: no accelerated GPU backend on this host");
+        return;
+    };
+    let Some((graph, _scope)) = private_metal_graph() else {
+        eprintln!("skip: no Metal device");
+        return;
+    };
+    for (label, bytes) in [("Q1", q1_gguf(1.0, 0xB0B0)), ("TQ2", tq2_gguf(0x0D0D))] {
+        let gguf = GgufFile::parse(&bytes).expect("fixture parses");
+        let mut model = gpu_ready(&gguf, &gpu);
+        let reference = forward_each_then_decode(&mut model, &gpu, &M18_PROMPT);
+        model.reset();
+
+        let warnings = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fused_before = graph.prefill_run_count();
+        MetalGraph::force_prefill_timeouts(1);
+        let prefill = tracing::subscriber::with_default(WarnCounter(Arc::clone(&warnings)), || {
+            model.forward_prefill(&M18_PROMPT, 0, &gpu)
+        });
+        MetalGraph::force_prefill_timeouts(0);
+        let prefill = prefill.expect("the timeout falls back instead of failing");
+        assert_eq!(
+            warnings.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "{label}: a missed prefill deadline logs exactly one warning"
+        );
+        assert_eq!(
+            graph.prefill_run_count(),
+            fused_before,
+            "{label}: the timed-out fused call did not complete"
+        );
+        assert_eq!(
+            logit_bits(&prefill),
+            logit_bits(&reference[0]),
+            "{label}: the fallback prefill is the sequential prefill"
+        );
+        let mut last = prefill;
+        for (step, want) in reference.iter().enumerate().skip(1) {
+            let token = argmax(&last);
+            last = model
+                .forward(token, M18_PROMPT.len() + step - 1, &gpu)
+                .expect("decode after the fallback");
+            assert_eq!(
+                logit_bits(&last),
+                logit_bits(want),
+                "{label}: decode step {step} after the fallback"
+            );
+        }
+        let cost = model.metal_prefill_cost();
+        assert!(
+            !cost.fused_buckets.is_empty(),
+            "{label}: the timeout is recorded in the cost model"
+        );
+    }
+}
+
+/// The head-free Metal hidden prefill: `forward_hidden` on a GPU dispatcher
+/// takes it (its rows are the direct Metal pass's, the MET-05 latch stays
+/// clear) and its rows match the per-token CPU reference — every row to a
+/// cosine of at least 0.999, the pooled vector to at least 0.9999 — on both
+/// weight formats.
+#[test]
+fn forward_hidden_on_the_metal_route_matches_the_sequential_reference() {
+    let Some(gpu) = gpu_dispatcher() else {
+        eprintln!("skip: no accelerated GPU backend on this host");
+        return;
+    };
+    let Some((_graph, _scope)) = private_metal_graph() else {
+        eprintln!("skip: no Metal device");
+        return;
+    };
+    let reference_kernel = KernelDispatcher::with_tier(KernelTier::Reference);
+    let tokens: Vec<u32> = (0..40u32).map(|i| (i * 7 + 3) % VOCAB as u32).collect();
+    for (label, bytes) in [("Q1", q1_gguf(1.0, 0xE3BE)), ("TQ2", tq2_gguf(0xE3BF))] {
+        let gguf = GgufFile::parse(&bytes).expect("fixture parses");
+        let mut model = gpu_ready(&gguf, &gpu);
+        let direct = model
+            .try_metal_forward_hidden(&tokens, &gpu)
+            .expect("the Metal hidden prefill runs")
+            .expect("a GPU dispatcher and a resident cache take the Metal route");
+        let rows = model.forward_hidden(&tokens, &gpu).expect("forward_hidden");
+        // Bit-equal to the direct Metal pass: the batched CPU pass computes
+        // the same rows in a different arithmetic order and would not be.
+        assert_eq!(
+            logit_bits(&rows),
+            logit_bits(&direct),
+            "{label}: forward_hidden took the Metal route"
+        );
+        assert!(!model.gpu_path_active(), "{label}: no device-KV latch");
+        let reference = model
+            .forward_hidden_sequential(&tokens, &reference_kernel)
+            .expect("the per-token reference");
+        assert_eq!(rows.len(), reference.len());
+        for (row, (a, b)) in rows
+            .chunks_exact(H)
+            .zip(reference.chunks_exact(H))
+            .enumerate()
+        {
+            let cos = cosine(a, b);
+            assert!(cos >= 0.999, "{label}: row {row} cos {cos}");
+        }
+        let pool = |r: &[f32]| {
+            BonsaiModel::mean_pool_normalized(r, H, tokens.len(), "pool").expect("pool")
+        };
+        let pooled = cosine(&pool(&rows), &pool(&reference));
+        assert!(pooled >= 0.9999, "{label}: pooled cos {pooled}");
+    }
+}
+
+/// The Metal hidden prefill declines — `Ok(None)`, nothing run — what it
+/// does not serve: a CPU dispatcher, a sliding-window model, a model whose
+/// fused weight cache is not resident.
+#[test]
+fn forward_hidden_metal_route_declines_what_it_does_not_serve() {
+    let Some(gpu) = gpu_dispatcher() else {
+        eprintln!("skip: no accelerated GPU backend on this host");
+        return;
+    };
+    let Some((_graph, _scope)) = private_metal_graph() else {
+        eprintln!("skip: no Metal device");
+        return;
+    };
+    let tokens = [5u32, 6, 7, 8];
+    let bytes = tq2_gguf(0xDEC1);
+    let gguf = GgufFile::parse(&bytes).expect("fixture parses");
+    let cold = BonsaiModel::from_gguf(&gguf, CONTEXT).expect("loads");
+    assert!(
+        cold.try_metal_forward_hidden(&tokens, &gpu)
+            .expect("declining is not an error")
+            .is_none(),
+        "no resident fused weight cache"
+    );
+    let mut model = gpu_ready(&gguf, &gpu);
+    let cpu = KernelDispatcher::with_tier(KernelTier::Reference);
+    assert!(model
+        .try_metal_forward_hidden(&tokens, &cpu)
+        .expect("declining is not an error")
+        .is_none());
+    model.config.sliding_window = Some(4);
+    assert!(model
+        .try_metal_forward_hidden(&tokens, &gpu)
+        .expect("declining is not an error")
+        .is_none());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Autorelease pools: the dense Metal path does not grow the process
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// `-[MTLCommandQueue commandBuffer]` and
+// `-[MTLCommandBuffer computeCommandEncoder]` return autoreleased objects. A
+// thread with no autorelease pool keeps every one of them until it exits, so
+// a long-lived decode thread that does not drain a pool per forward grows by
+// the size of a command buffer and its encoder on every token. The test
+// below measures the process footprint across many forwards of every dense
+// Metal route (decode, greedy decode, fused batch prefill, speculative
+// verify, head-free hidden prefill) on both weight formats, in a child
+// process of its own so that no other test of this binary allocates while
+// it measures.
+
+/// Set in the child process the footprint test re-runs itself in; the child
+/// does the measuring.
+const FOOTPRINT_CHILD_ENV: &str = "OXIBONSAI_METAL_FOOTPRINT_PROBE";
+
+/// Prefix of the one line the child prints per measured phase.
+const FOOTPRINT_REPORT: &str = "metal-footprint:";
+
+/// Growth one measured phase may add. An undrained command buffer and its
+/// encoder cost well over 1 KiB per forward, so a phase of
+/// [`FOOTPRINT_FORWARDS`] undrained forwards grows by several MiB.
+const FOOTPRINT_GROWTH_CEILING: i64 = 1 << 20;
+
+/// Forwards per measured phase (decode: 50 rounds of 31 steps).
+const FOOTPRINT_FORWARDS: usize = 1550;
+
+/// Decode steps per decode round of the footprint test.
+const FOOTPRINT_DECODE_STEPS: usize = 31;
+
+/// Measured phases: five routes on two weight formats.
+const FOOTPRINT_PHASES: usize = 10;
+
+/// `TASK_VM_INFO`, the `task_info` flavor carrying `phys_footprint`.
+const TASK_VM_INFO: u32 = 22;
+
+/// `TASK_VM_INFO_REV1_COUNT`: `task_vm_info` up to and including
+/// `phys_footprint`, in 32-bit words.
+const TASK_VM_INFO_REV1_WORDS: usize = 38;
+
+/// Word offset of `phys_footprint` (a 64-bit field) in `task_vm_info`.
+const PHYS_FOOTPRINT_WORD: usize = 36;
+
+// SAFETY (declarations): the Mach `task_info` call and the `mach_task_self_`
+// port as `<mach/task.h>` / `<mach/mach_init.h>` declare them; both live in
+// libSystem, which every macOS process links.
+extern "C" {
+    #[link_name = "mach_task_self_"]
+    static MACH_TASK_SELF: u32;
+    fn task_info(
+        target_task: u32,
+        flavor: u32,
+        task_info_out: *mut i32,
+        task_info_out_cnt: *mut u32,
+    ) -> i32;
+}
+
+/// This process's `phys_footprint` (`task_info(TASK_VM_INFO)`): dirty
+/// anonymous memory, compressed pages and device allocations — what the
+/// kernel's memory ledger charges the process, clean file pages excluded.
+fn phys_footprint_bytes() -> i64 {
+    let mut words = [0i32; TASK_VM_INFO_REV1_WORDS];
+    let mut count = TASK_VM_INFO_REV1_WORDS as u32;
+    // SAFETY: `words` is a caller-owned buffer of `count` 32-bit words, so
+    // the kernel writes only inside it; `MACH_TASK_SELF` is initialised by
+    // libSystem before `main`.
+    let rc = unsafe { task_info(MACH_TASK_SELF, TASK_VM_INFO, words.as_mut_ptr(), &mut count) };
+    assert_eq!(rc, 0, "task_info(TASK_VM_INFO) failed: kern_return_t {rc}");
+    assert!(
+        count as usize >= TASK_VM_INFO_REV1_WORDS,
+        "task_info(TASK_VM_INFO) returned {count} words, fewer than rev1's {TASK_VM_INFO_REV1_WORDS}"
+    );
+    let low = u64::from(words[PHYS_FOOTPRINT_WORD] as u32);
+    let high = u64::from(words[PHYS_FOOTPRINT_WORD + 1] as u32);
+    let bytes = i64::try_from(low | (high << 32)).expect("footprint fits i64");
+    assert!(
+        bytes > 0,
+        "task_info(TASK_VM_INFO) reported a zero footprint"
+    );
+    bytes
+}
+
+/// `bytes` as signed MiB.
+fn mib(bytes: i64) -> String {
+    format!("{:+.3} MiB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+/// Run `warm` untimed units of `unit`, then `units` measured ones; print the
+/// phase's report line and return the footprint growth over the measured
+/// units.
+fn measure_footprint(
+    label: &str,
+    forwards: usize,
+    warm: usize,
+    units: usize,
+    mut unit: impl FnMut(),
+) -> i64 {
+    for _ in 0..warm {
+        unit();
+    }
+    let before = phys_footprint_bytes();
+    for _ in 0..units {
+        unit();
+    }
+    let after = phys_footprint_bytes();
+    let growth = after - before;
+    println!(
+        "{FOOTPRINT_REPORT} {label}: {forwards} forwards grew the process footprint by {} \
+         ({before} -> {after} bytes)",
+        mib(growth)
+    );
+    growth
+}
+
+/// Record a phase whose growth passed [`FOOTPRINT_GROWTH_CEILING`].
+fn note_footprint(failures: &mut Vec<String>, label: &str, growth: i64) {
+    if growth > FOOTPRINT_GROWTH_CEILING {
+        failures.push(format!("{label}: {}", mib(growth)));
+    }
+}
+
+/// The measuring half of
+/// [`metal_dense_forwards_do_not_grow_the_process_footprint`], run in the
+/// child process: every dense Metal route on both weight formats, each
+/// phase warmed up first (pipelines, scratch, allocator high-water marks),
+/// then measured.
+fn footprint_probe() {
+    let gpu = gpu_dispatcher().expect("the parent process saw an accelerated GPU backend");
+    let (graph, _scope) = private_metal_graph().expect("the parent process saw a Metal device");
+    let hidden_tokens: Vec<u32> = (0..40u32).map(|i| (i * 5 + 1) % VOCAB as u32).collect();
+    let rounds = FOOTPRINT_FORWARDS / FOOTPRINT_DECODE_STEPS;
+    let mut failures = Vec::new();
+    for (format, bytes) in [("Q1", q1_gguf(1.0, 0xF007)), ("TQ2", tq2_gguf(0xF008))] {
+        let gguf = GgufFile::parse(&bytes).expect("fixture parses");
+        let mut model = gpu_ready(&gguf, &gpu);
+
+        // Single-token fused decode + LM head (`forward`), reset every round.
+        let label = format!("{format} decode");
+        let growth = measure_footprint(&label, FOOTPRINT_FORWARDS, 10, rounds, || {
+            model.reset();
+            let mut token = 3u32;
+            for pos in 0..FOOTPRINT_DECODE_STEPS {
+                let logits = model.forward(token, pos, &gpu).expect("fused decode");
+                token = argmax(&logits);
+            }
+            assert!(model.gpu_path_active(), "{format}: decode ran on Metal");
+        });
+        note_footprint(&mut failures, &label, growth);
+
+        // Greedy fused decode (`forward_greedy_gpu`: argmax on the GPU).
+        let label = format!("{format} greedy decode");
+        let growth = measure_footprint(&label, FOOTPRINT_FORWARDS, 10, rounds, || {
+            model.reset();
+            let mut token = 3u32;
+            for pos in 0..FOOTPRINT_DECODE_STEPS {
+                token = model
+                    .forward_greedy_gpu(token, pos)
+                    .expect("fused greedy decode");
+            }
+            assert!(
+                model.gpu_path_active(),
+                "{format}: greedy decode ran on Metal"
+            );
+        });
+        note_footprint(&mut failures, &label, growth);
+
+        // Fused batch prefill (`forward_prefill` pinned to the fused route).
+        model.force_metal_prefill_route(Some(PrefillRoute::Fused));
+        let runs_before = graph.prefill_run_count();
+        let label = format!("{format} fused prefill");
+        let growth = measure_footprint(&label, FOOTPRINT_FORWARDS, 20, FOOTPRINT_FORWARDS, || {
+            model.reset();
+            model
+                .forward_prefill(&M18_PROMPT, 0, &gpu)
+                .expect("fused prefill");
+        });
+        model.force_metal_prefill_route(None);
+        assert_eq!(
+            graph.prefill_run_count() - runs_before,
+            (20 + FOOTPRINT_FORWARDS) as u64,
+            "{format}: every prefill ran the fused batch path"
+        );
+        note_footprint(&mut failures, &label, growth);
+
+        // Batched speculative verify (every row's argmax).
+        let runs_before = graph.prefill_run_count();
+        let label = format!("{format} verify prefill");
+        let growth = measure_footprint(&label, FOOTPRINT_FORWARDS, 20, FOOTPRINT_FORWARDS, || {
+            model.reset();
+            let ids = model
+                .try_metal_prefill_verify(&M18_PROMPT, 0)
+                .expect("verify prefill");
+            assert_eq!(ids.len(), M18_PROMPT.len());
+        });
+        assert_eq!(
+            graph.prefill_run_count() - runs_before,
+            (20 + FOOTPRINT_FORWARDS) as u64,
+            "{format}: every verify ran the batched prefill"
+        );
+        note_footprint(&mut failures, &label, growth);
+
+        // Head-free hidden prefill (the Metal half of `forward_hidden`).
+        let label = format!("{format} hidden prefill");
+        let growth = measure_footprint(&label, FOOTPRINT_FORWARDS, 20, FOOTPRINT_FORWARDS, || {
+            let rows = model
+                .try_metal_forward_hidden(&hidden_tokens, &gpu)
+                .expect("hidden prefill")
+                .expect("a resident fused cache takes the Metal route");
+            assert_eq!(rows.len(), hidden_tokens.len() * H);
+        });
+        note_footprint(&mut failures, &label, growth);
+    }
+    assert!(
+        failures.is_empty(),
+        "dense Metal forwards grew the process footprint past {} per phase — something \
+         each forward creates outlives it (an undrained autorelease pool?): {failures:?}",
+        mib(FOOTPRINT_GROWTH_CEILING)
+    );
+}
+
+/// The dense Metal path does not grow the process: 1550 forwards of each
+/// route — fused single-token decode, fused greedy decode, fused batch
+/// prefill, batched speculative verify, head-free hidden prefill — on the Q1
+/// and the TQ2 fixture, weights uploaded, grow the process footprint by at
+/// most 1 MiB per route. Every forward's command buffers and encoders are
+/// autoreleased objects the Metal path drains per call; left to the thread
+/// they cost well over 1 KiB per forward until it exits.
+///
+/// The measurement runs in a child process running only this test (the
+/// test binary re-executed with `--exact`), since other tests of this
+/// binary allocate on their own threads meanwhile.
+#[test]
+fn metal_dense_forwards_do_not_grow_the_process_footprint() {
+    if std::env::var_os(FOOTPRINT_CHILD_ENV).is_some() {
+        footprint_probe();
+        return;
+    }
+    if gpu_dispatcher().is_none() {
+        eprintln!("skip: no accelerated GPU backend on this host");
+        return;
+    }
+    if MetalGraph::new().is_err() {
+        eprintln!("skip: no Metal device");
+        return;
+    }
+    let path = module_path!();
+    let module = path.split_once("::").map_or(path, |(_, rest)| rest);
+    let name = format!("{module}::metal_dense_forwards_do_not_grow_the_process_footprint");
+    let exe = std::env::current_exe().expect("the test binary's path");
+    let output = std::process::Command::new(exe)
+        .args([name.as_str(), "--exact", "--nocapture", "--test-threads=1"])
+        .env(FOOTPRINT_CHILD_ENV, "1")
+        .output()
+        .expect("the footprint probe process starts");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // `--nocapture` lets the first report share a line with libtest's own
+    // `test <name> ... ` prefix, so a report is found anywhere in a line.
+    let reports: Vec<&str> = stdout
+        .lines()
+        .chain(stderr.lines())
+        .filter_map(|line| line.find(FOOTPRINT_REPORT).map(|at| &line[at..]))
+        .collect();
+    for line in &reports {
+        eprintln!("{line}");
+    }
+    assert!(
+        output.status.success(),
+        "the footprint probe failed ({}):\n{stdout}\n{stderr}",
+        output.status
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "the probe process ran no test named {name}:\n{stdout}"
+    );
+    assert_eq!(
+        reports.len(),
+        FOOTPRINT_PHASES,
+        "every measured phase reports once:\n{stdout}\n{stderr}"
+    );
+}

@@ -410,12 +410,15 @@ impl ModelEmbedder {
     /// and no second copy of the `vocab × hidden` table. For a hybrid
     /// (`qwen35`) file the pool's handle is the empty "decode rows from the
     /// GGUF" one, and the engine adds its KV cache, recurrent state and
-    /// activation scratch.
+    /// activation scratch. A hybrid's embedding pass runs on its CPU model,
+    /// so its embedding engine is pinned to the CPU backend: a Metal hybrid
+    /// runner there would allocate its whole-window KV cache, recurrent
+    /// state and gates and never run.
     ///
     /// # Errors
     ///
-    /// Anything [`InferenceEngine::from_gguf_static_with_embd`] returns —
-    /// including a non-empty dense `token_embd` for a hybrid file, whose
+    /// Anything [`InferenceEngine::from_gguf_with_embd_and_backend`] returns
+    /// — including a non-empty dense `token_embd` for a hybrid file, whose
     /// embedding is decoded row-wise in the rotated basis
     /// (`SHARED_EMBEDDING_UNSUPPORTED`).
     pub fn from_static_gguf(
@@ -426,12 +429,18 @@ impl ModelEmbedder {
         seed: u64,
         max_seq_len: usize,
     ) -> RuntimeResult<Arc<Self>> {
-        let engine = InferenceEngine::from_gguf_static_with_embd(
+        let backend = if oxibonsai_model::hybrid::LoadedModel::is_hybrid_gguf(gguf) {
+            crate::engine_seam::Backend::Cpu
+        } else {
+            crate::engine_seam::Backend::Auto
+        };
+        let engine = InferenceEngine::from_gguf_with_embd_and_backend(
             gguf,
             sampling_params,
             seed,
             max_seq_len,
             token_embd,
+            backend,
         )?;
         Self::from_engine(engine, tokenizer)
     }

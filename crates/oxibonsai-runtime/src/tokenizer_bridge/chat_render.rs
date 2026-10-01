@@ -45,7 +45,9 @@
 use crate::server::api_error::ApiError;
 use crate::server::sanitize::{neutralize_special_markers, SpecialTokenGuard};
 use crate::tokenizer_bridge::TokenizerBridge;
-use oxibonsai_tokenizer::chat_templates::{RenderMessage, RenderOptions};
+use oxibonsai_tokenizer::chat_templates::{
+    RenderContent, RenderContentPart, RenderMessage, RenderOptions,
+};
 use oxibonsai_tokenizer::jinja::JinjaError;
 
 /// Extra request fields the base (`server::chat`) and extended
@@ -91,6 +93,11 @@ struct ChatTemplateKwargsWire {
     reasoning_effort: Option<String>,
     #[serde(default)]
     preserve_thinking: Option<bool>,
+    /// The real Bonsai 2 template's `add_vision_id`: label each image
+    /// `Picture N: ` (off unless the client asks, like the reference
+    /// server).
+    #[serde(default)]
+    add_vision_id: Option<bool>,
 }
 
 impl ChatRequestExtras {
@@ -114,6 +121,14 @@ impl ChatRequestExtras {
         self.chat_template_kwargs
             .as_ref()
             .and_then(|k| k.preserve_thinking)
+    }
+
+    /// `chat_template_kwargs.add_vision_id` (default `false`).
+    pub(crate) fn effective_add_vision_id(&self) -> bool {
+        self.chat_template_kwargs
+            .as_ref()
+            .and_then(|k| k.add_vision_id)
+            .unwrap_or(false)
     }
 
     /// The `tools` array's raw JSON text, if present.
@@ -253,10 +268,15 @@ pub(crate) struct RenderableToolCall {
 /// One message in the shape this pipeline needs, independent of which
 /// concrete request type (`server::ChatMessage` / the extended endpoint's
 /// message list) the caller actually has.
+///
+/// `content` is a plain string for every text-only message (a text-only
+/// `content` array was already flattened into one) and content parts only
+/// for a message carrying images, so a text-only request renders exactly
+/// as it always has.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RenderableMessage {
     pub role: String,
-    pub content: String,
+    pub content: RenderContent,
     pub reasoning_content: Option<String>,
     pub tool_calls: Vec<RenderableToolCall>,
     pub tool_call_id: Option<String>,
@@ -278,16 +298,52 @@ pub(crate) struct RenderableMessage {
 /// own wire format already gives it in (`FunctionCallResult::arguments:
 /// String`) — never re-parsed into a `serde_json::Value`, for the same
 /// key-order reason [`tool_calls_to_render_json`] documents.
+///
+/// The text-only form of [`to_render_messages_with_parts`] (every message
+/// renders from its typed `content` string); the endpoints themselves call
+/// the parts-aware form, so this one is compiled for the tests that pin the
+/// conversion.
+#[cfg(test)]
 pub(crate) fn to_render_messages(
     messages: &[crate::server::ChatMessage],
     reasoning_contents: &[Option<String>],
+) -> Vec<RenderableMessage> {
+    to_render_messages_with_parts(messages, reasoning_contents, &[])
+}
+
+/// [`to_render_messages`] for a request whose messages may carry images:
+/// `content_parts[i]` (from [`preprocess_message_content_and_reasoning`])
+/// holds message `i`'s content parts when they include an `image_url`,
+/// and that message then renders from its parts — text parts verbatim,
+/// each image as the template's placeholder — instead of from the
+/// flattened text in its typed `content`. A short or absent side list
+/// renders every message past its end from its text.
+pub(crate) fn to_render_messages_with_parts(
+    messages: &[crate::server::ChatMessage],
+    reasoning_contents: &[Option<String>],
+    content_parts: &[Option<Vec<crate::api_types::ContentPart>>],
 ) -> Vec<RenderableMessage> {
     messages
         .iter()
         .enumerate()
         .map(|(i, m)| RenderableMessage {
             role: m.role.clone(),
-            content: m.content.clone().unwrap_or_default(),
+            content: match content_parts.get(i).and_then(Option::as_ref) {
+                Some(parts) => RenderContent::Parts(
+                    parts
+                        .iter()
+                        .map(|part| match part {
+                            crate::api_types::ContentPart::Text { text } => {
+                                RenderContentPart::Text(text.clone())
+                            }
+                            crate::api_types::ContentPart::ImageUrl { .. } => {
+                                RenderContentPart::Image
+                            }
+                        })
+                        .collect(),
+                ),
+                None => RenderContent::Text(m.content.clone().unwrap_or_default()),
+            },
             reasoning_content: m
                 .reasoning_content
                 .clone()
@@ -310,21 +366,55 @@ pub(crate) fn to_render_messages(
         .collect()
 }
 
+/// What [`preprocess_message_content_and_reasoning`] recovers from a raw
+/// chat request body.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct PreprocessedChat {
+    /// The body with every `content` array replaced by the string its text
+    /// parts concatenate to — what the typed request parse reads.
+    pub rewritten: String,
+    /// Message `i`'s `reasoning_content`, when it carries one.
+    pub reasoning_contents: Vec<Option<String>>,
+    /// Message `i`'s content parts, when they include an `image_url` part
+    /// (`None` for a string content or a text-only array, which the
+    /// flattened string already renders exactly).
+    pub content_parts: Vec<Option<Vec<crate::api_types::ContentPart>>>,
+}
+
+impl PreprocessedChat {
+    /// The image references of the whole request, in the order the
+    /// template renders their placeholders (message order, then part
+    /// order).
+    pub(crate) fn image_references(&self) -> Vec<String> {
+        self.content_parts
+            .iter()
+            .flatten()
+            .flatten()
+            .filter_map(|part| match part {
+                crate::api_types::ContentPart::ImageUrl { image_url } => {
+                    Some(image_url.url.clone())
+                }
+                crate::api_types::ContentPart::Text { .. } => None,
+            })
+            .collect()
+    }
+}
+
 /// Pre-parse `raw_json` (a chat request body, generically, BEFORE it is
 /// deserialized into either endpoint's typed request struct) to recover
-/// two things for the typed parse that follows (`SV-11`):
+/// what the typed parse cannot represent (`SV-11`):
 ///
-/// 1. **Vision-shaped `content` arrays.** A client sending the OpenAI
-///    multipart shape (`content: [{"type":"text",...}, {"type":"image_url",...}]`)
-///    would otherwise fail `ChatMessage`'s own deserialization with an
-///    opaque schema error before any handler code runs. Each message's
-///    `content`, if it is a JSON array, is parsed as
-///    [`crate::api_types::MessageContent`] and flattened with
-///    [`crate::api_types::MessageContent::into_text_only`] — an honest
-///    `400` naming the `image_url` part specifically (never a silent drop)
-///    if one is present — and the flattened string is spliced back into
+/// 1. **`content` arrays.** A client sending the OpenAI multipart shape
+///    (`content: [{"type":"text",...}, {"type":"image_url",...}]`) would
+///    otherwise fail `ChatMessage`'s own deserialization with an opaque
+///    schema error. Each message's `content`, if it is a JSON array, is
+///    parsed as [`crate::api_types::MessageContent`] (a malformed part is a
+///    `400`), and the concatenation of its text parts is spliced back into
 ///    the JSON value in `content`'s place, so the typed parse that follows
-///    sees the plain string it already knows how to handle.
+///    sees the plain string it knows how to handle. When the array holds
+///    `image_url` parts, the parts themselves are kept in
+///    [`PreprocessedChat::content_parts`] so the message renders from them
+///    (image placeholders included) — never a silent drop.
 /// 2. **Per-message `reasoning_content`.** A client replaying assistant
 ///    history from a reasoning-capable response includes this field on
 ///    that turn; it is captured here into a side list indexed the same way
@@ -333,9 +423,9 @@ pub(crate) fn to_render_messages(
 ///    message type without the field (or a body the typed parse rewrites)
 ///    still renders it.
 ///
-/// Returns `(rewritten_json_text, reasoning_contents)`. The rewritten text
-/// is what the caller then feeds to `serde_json::from_str::<ChatCompletionRequest>`
-/// (or `ExtendedChatRequest`) in place of the original body bytes; nothing
+/// The rewritten text is what the caller then feeds to
+/// `serde_json::from_str::<ChatCompletionRequest>` (or
+/// `ExtendedChatRequest`) in place of the original body bytes; nothing
 /// else in the value is touched, and callers still parse
 /// [`ChatRequestExtras`] (`tools`, `chat_template_kwargs`, ...) from the
 /// ORIGINAL, un-rewritten bytes — `tools_raw_json`'s key-order guarantee
@@ -344,24 +434,31 @@ pub(crate) fn to_render_messages(
 /// `messages`-only scope).
 ///
 /// A body with no `messages` array at all, or a non-array `messages`, is
-/// left completely untouched (`reasoning_contents` comes back empty) —
+/// left completely untouched (both side lists come back empty) —
 /// `ChatCompletionRequest`'s own deserialization is still what rejects
 /// that shape, with its own message, not this function.
 pub(crate) fn preprocess_message_content_and_reasoning(
     raw_json: &str,
-) -> Result<(String, Vec<Option<String>>), ApiError> {
+) -> Result<PreprocessedChat, ApiError> {
     let mut value: serde_json::Value = match serde_json::from_str(raw_json) {
         Ok(v) => v,
         // Malformed JSON syntax: leave it for the typed parse right after
         // this call to report with its own, already-established error
         // shape rather than duplicating that here.
-        Err(_) => return Ok((raw_json.to_string(), Vec::new())),
+        Err(_) => {
+            return Ok(PreprocessedChat {
+                rewritten: raw_json.to_string(),
+                ..PreprocessedChat::default()
+            })
+        }
     };
     let mut reasoning_contents = Vec::new();
+    let mut content_parts = Vec::new();
     if let Some(messages) = value.get_mut("messages").and_then(|m| m.as_array_mut()) {
         for msg in messages.iter_mut() {
             let Some(obj) = msg.as_object_mut() else {
                 reasoning_contents.push(None);
+                content_parts.push(None);
                 continue;
             };
             reasoning_contents.push(
@@ -370,22 +467,156 @@ pub(crate) fn preprocess_message_content_and_reasoning(
                     .map(str::to_string),
             );
             let is_array = obj.get("content").is_some_and(serde_json::Value::is_array);
-            if is_array {
-                let parts_value = obj.get("content").cloned().unwrap_or_default();
-                let content: crate::api_types::MessageContent = serde_json::from_value(parts_value)
-                    .map_err(|e| {
-                        ApiError::bad_request(format!("invalid message content: {e}"), "messages")
-                    })?;
-                let text = content
-                    .into_text_only()
-                    .map_err(|e| ApiError::bad_request(e, "messages"))?;
-                obj.insert("content".to_string(), serde_json::Value::String(text));
+            if !is_array {
+                content_parts.push(None);
+                continue;
             }
+            let parts_value = obj.get("content").cloned().unwrap_or_default();
+            let content: crate::api_types::MessageContent = serde_json::from_value(parts_value)
+                .map_err(|e| {
+                    ApiError::bad_request(format!("invalid message content: {e}"), "messages")
+                })?;
+            obj.insert(
+                "content".to_string(),
+                serde_json::Value::String(content.text()),
+            );
+            content_parts.push(match content {
+                crate::api_types::MessageContent::Parts(parts) if parts_have_images(&parts) => {
+                    Some(parts)
+                }
+                _ => None,
+            });
         }
     }
     let rewritten = serde_json::to_string(&value)
         .map_err(|e| ApiError::internal(format!("failed to re-serialize request body: {e}")))?;
-    Ok((rewritten, reasoning_contents))
+    Ok(PreprocessedChat {
+        rewritten,
+        reasoning_contents,
+        content_parts,
+    })
+}
+
+fn parts_have_images(parts: &[crate::api_types::ContentPart]) -> bool {
+    parts
+        .iter()
+        .any(|p| matches!(p, crate::api_types::ContentPart::ImageUrl { .. }))
+}
+
+/// A [`crate::vision_prefill::MultimodalError`] as the API error both chat
+/// endpoints answer with: a `400` naming the reason (its stable code) for
+/// anything the request is at fault for, a `500` for a tower failure on an
+/// accepted image.
+pub(crate) fn api_error_from_multimodal(err: &crate::vision_prefill::MultimodalError) -> ApiError {
+    let base = if err.is_client_error() {
+        ApiError::bad_request(err.to_string(), "messages")
+    } else {
+        ApiError::internal(err.to_string())
+    };
+    base.with_code(err.code())
+}
+
+/// A chat request's prompt between rendering and generation (SV-11): the
+/// rendered token ids, and — for a request with images — every image
+/// decoded and brought to the tower's geometry, with the splice already
+/// checked, but not yet encoded. Its [`PendingChatPrompt::len`] is the
+/// expanded prompt length, so the context budget is enforced before any
+/// vision-tower work is spent.
+pub(crate) enum PendingChatPrompt {
+    /// No image: the token ids, byte-identical to before.
+    Text(Vec<u32>),
+    /// Images prepared, not yet encoded.
+    Multimodal {
+        tokens: Vec<u32>,
+        prepared: Vec<oxibonsai_model::vision::PreparedImage>,
+        service: std::sync::Arc<crate::vision_prefill::VisionService>,
+        rows: usize,
+    },
+}
+
+impl PendingChatPrompt {
+    /// The rendered prompt's token ids (placeholders unexpanded).
+    pub(crate) fn tokens(&self) -> &[u32] {
+        match self {
+            Self::Text(tokens) | Self::Multimodal { tokens, .. } => tokens,
+        }
+    }
+
+    /// Sequence positions the prompt occupies once every placeholder is
+    /// replaced by its image's rows (what `usage.prompt_tokens` reports).
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Text(tokens) => tokens.len(),
+            Self::Multimodal { rows, .. } => *rows,
+        }
+    }
+
+    /// Encode the images (on the blocking pool) and splice them in.
+    ///
+    /// # Errors
+    ///
+    /// A tower failure, as [`api_error_from_multimodal`] maps it.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) async fn encode(self) -> Result<crate::vision_prefill::ChatPrompt, ApiError> {
+        use crate::vision_prefill::{encode_prepared_blocking, ChatPrompt, MultimodalPrompt};
+        match self {
+            Self::Text(tokens) => Ok(ChatPrompt::Text(tokens)),
+            Self::Multimodal {
+                tokens,
+                prepared,
+                service,
+                ..
+            } => {
+                let ids = service.token_ids();
+                let images = encode_prepared_blocking(service, prepared)
+                    .await
+                    .map_err(|e| api_error_from_multimodal(&e))?;
+                MultimodalPrompt::new(tokens, images, ids)
+                    .map(ChatPrompt::Multimodal)
+                    .map_err(|e| api_error_from_multimodal(&e))
+            }
+        }
+    }
+}
+
+/// Prepare a chat request's prompt (SV-11): the rendered token ids as they
+/// are when the request carries no image; otherwise every image resolved,
+/// decoded and preprocessed by `vision` (on the blocking pool) and the
+/// splice checked against the rendered ids (one bracketed `<|image_pad|>`
+/// per image).
+///
+/// # Errors
+///
+/// `400 vision_unavailable` when the request has images but the server has
+/// no vision projector; the image/splice errors of
+/// [`crate::vision_prefill`] as [`api_error_from_multimodal`] maps them.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) async fn prepare_chat_prompt(
+    prompt_tokens: Vec<u32>,
+    image_references: Vec<String>,
+    vision: Option<std::sync::Arc<crate::vision_prefill::VisionService>>,
+) -> Result<PendingChatPrompt, ApiError> {
+    use crate::vision_prefill::{prepare_references_blocking, MultimodalError};
+    if image_references.is_empty() {
+        return Ok(PendingChatPrompt::Text(prompt_tokens));
+    }
+    let Some(service) = vision else {
+        return Err(api_error_from_multimodal(
+            &MultimodalError::VisionUnavailable,
+        ));
+    };
+    let prepared = prepare_references_blocking(std::sync::Arc::clone(&service), image_references)
+        .await
+        .map_err(|e| api_error_from_multimodal(&e))?;
+    let grids: Vec<_> = prepared.iter().map(|p| p.grid).collect();
+    let plan = oxibonsai_model::vision::plan_splice(&prompt_tokens, &grids, service.token_ids())
+        .map_err(|e| api_error_from_multimodal(&MultimodalError::from(e)))?;
+    Ok(PendingChatPrompt::Multimodal {
+        tokens: prompt_tokens,
+        prepared,
+        service,
+        rows: plan.total_rows(),
+    })
 }
 
 /// Build one assistant tool_calls array's JSON **text** from
@@ -587,7 +818,24 @@ pub(crate) fn render_chat_prompt(
 ) -> Result<(String, Vec<u32>), ApiError> {
     let mut render_messages = Vec::with_capacity(messages.len());
     for msg in messages {
-        let content = neutralize_message_text(tokenizer, guard, &msg.content, sanitize)?;
+        // TOK-M2 applies to every text part of a multimodal message exactly
+        // as to a plain one; an image part is the template's own markup.
+        let content = match &msg.content {
+            RenderContent::Text(text) => {
+                RenderContent::Text(neutralize_message_text(tokenizer, guard, text, sanitize)?)
+            }
+            RenderContent::Parts(parts) => RenderContent::Parts(
+                parts
+                    .iter()
+                    .map(|part| match part {
+                        RenderContentPart::Text(text) => Ok(RenderContentPart::Text(
+                            neutralize_message_text(tokenizer, guard, text, sanitize)?,
+                        )),
+                        other => Ok(other.clone()),
+                    })
+                    .collect::<Result<Vec<_>, ApiError>>()?,
+            ),
+        };
         let mut rm = RenderMessage::new(msg.role.clone(), content);
         if let Some(reasoning) = &msg.reasoning_content {
             let cleaned = neutralize_message_text(tokenizer, guard, reasoning, sanitize)?;
@@ -841,7 +1089,7 @@ mod tests {
         let guard = SpecialTokenGuard::from_tokenizer(&tok);
         let messages = vec![RenderableMessage {
             role: "user".to_string(),
-            content: "Hi".to_string(),
+            content: "Hi".into(),
             ..Default::default()
         }];
         let opts = RenderOptions {
@@ -875,12 +1123,12 @@ mod tests {
         let messages = vec![
             RenderableMessage {
                 role: "user".to_string(),
-                content: "hi".to_string(),
+                content: "hi".into(),
                 ..Default::default()
             },
             RenderableMessage {
                 role: "assistant".to_string(),
-                content: String::new(),
+                content: RenderContent::default(),
                 tool_calls: vec![RenderableToolCall {
                     name: "f".to_string(),
                     arguments_json_text: r#"{"z":1,"a":2}"#.to_string(),
@@ -925,7 +1173,7 @@ mod tests {
         let guard = SpecialTokenGuard::from_tokenizer(&tok);
         let messages = vec![RenderableMessage {
             role: "assistant".to_string(),
-            content: String::new(),
+            content: RenderContent::default(),
             // "<think>" is a real added token (id 100) in this fixture.
             // Unguarded, this would let a replayed tool-call name inject a
             // real control-token id into the middle of the rendered prompt.
@@ -958,7 +1206,7 @@ mod tests {
         let guard = SpecialTokenGuard::from_tokenizer(&tok);
         let messages = vec![RenderableMessage {
             role: "assistant".to_string(),
-            content: String::new(),
+            content: RenderContent::default(),
             // "<tool_call>" (id 102) sits inside the JSON *value*, exactly
             // where a client-supplied argument string would put it.
             tool_calls: vec![RenderableToolCall {
@@ -999,7 +1247,7 @@ mod tests {
         );
         let messages = vec![RenderableMessage {
             role: "user".to_string(),
-            content: "hi".to_string(),
+            content: "hi".into(),
             ..Default::default()
         }];
         // A tool *name* carrying the real added-token text, spliced by the
@@ -1064,9 +1312,12 @@ mod tests {
             {"role": "assistant", "content": "hi", "reasoning_content": "thinking"},
             {"role": "user", "content": "thanks"}
         ]}"#;
-        let (_, reasoning_contents) =
-            preprocess_message_content_and_reasoning(raw).expect("must succeed");
-        assert_eq!(reasoning_contents, vec![Some("thinking".to_string()), None]);
+        let pre = preprocess_message_content_and_reasoning(raw).expect("must succeed");
+        assert_eq!(
+            pre.reasoning_contents,
+            vec![Some("thinking".to_string()), None]
+        );
+        assert_eq!(pre.content_parts, vec![None, None]);
     }
 
     #[test]
@@ -1074,51 +1325,120 @@ mod tests {
         let raw = r#"{"messages": [
             {"role": "user", "content": [{"type":"text","text":"hello"},{"type":"text","text":" world"}]}
         ]}"#;
-        let (rewritten, _) = preprocess_message_content_and_reasoning(raw).expect("must succeed");
-        let v: serde_json::Value = serde_json::from_str(&rewritten).expect("valid JSON");
+        let pre = preprocess_message_content_and_reasoning(raw).expect("must succeed");
+        let v: serde_json::Value = serde_json::from_str(&pre.rewritten).expect("valid JSON");
         assert_eq!(
             v["messages"][0]["content"],
             serde_json::json!("hello world")
         );
+        // Text-only parts render from the flattened string (byte-unchanged).
+        assert_eq!(pre.content_parts, vec![None]);
+        assert!(pre.image_references().is_empty());
+    }
+
+    /// An `image_url` part is never silently dropped: the parts are kept for
+    /// the renderer (the text still flattened into the typed field), and
+    /// the image reference is recovered in order. Whether it can be served
+    /// is the endpoint's decision (`vision_unavailable` without a
+    /// projector).
+    #[test]
+    fn preprocess_keeps_an_image_url_part_for_the_renderer() {
+        let raw = r#"{"messages": [
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": [{"type":"image_url","image_url":{"url":"http://x"}},{"type":"text","text":"what is it?"}]},
+            {"role": "user", "content": [{"type":"text","text":"and "},{"type":"image_url","image_url":{"url":"data:image/png;base64,AA"}}]}
+        ]}"#;
+        let pre = preprocess_message_content_and_reasoning(raw).expect("must succeed");
+        let v: serde_json::Value = serde_json::from_str(&pre.rewritten).expect("valid JSON");
+        assert_eq!(
+            v["messages"][1]["content"],
+            serde_json::json!("what is it?")
+        );
+        assert_eq!(v["messages"][2]["content"], serde_json::json!("and "));
+        assert!(pre.content_parts[0].is_none());
+        assert_eq!(pre.content_parts[1].as_ref().map(Vec::len), Some(2));
+        assert_eq!(
+            pre.image_references(),
+            vec![
+                "http://x".to_string(),
+                "data:image/png;base64,AA".to_string()
+            ]
+        );
     }
 
     #[test]
-    fn preprocess_rejects_an_image_url_part_honestly() {
+    fn preprocess_rejects_a_malformed_content_part() {
         let raw = r#"{"messages": [
-            {"role": "user", "content": [{"type":"image_url","image_url":{"url":"http://x"}}]}
+            {"role": "user", "content": [{"type":"image_url"}]}
         ]}"#;
         let err = preprocess_message_content_and_reasoning(raw)
-            .expect_err("an image_url part must be rejected, not silently dropped");
+            .expect_err("an image_url part without its object is malformed");
         assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 
     #[test]
     fn preprocess_leaves_plain_string_content_untouched() {
         let raw = r#"{"messages": [{"role": "user", "content": "hi"}]}"#;
-        let (rewritten, reasoning_contents) =
-            preprocess_message_content_and_reasoning(raw).expect("must succeed");
-        let v: serde_json::Value = serde_json::from_str(&rewritten).expect("valid JSON");
+        let pre = preprocess_message_content_and_reasoning(raw).expect("must succeed");
+        let v: serde_json::Value = serde_json::from_str(&pre.rewritten).expect("valid JSON");
         assert_eq!(v["messages"][0]["content"], serde_json::json!("hi"));
-        assert_eq!(reasoning_contents, vec![None]);
+        assert_eq!(pre.reasoning_contents, vec![None]);
     }
 
     #[test]
     fn preprocess_leaves_malformed_json_for_the_typed_parse_to_reject() {
         let raw = "{not json";
-        let (rewritten, reasoning_contents) =
-            preprocess_message_content_and_reasoning(raw).expect("must not itself error");
-        assert_eq!(rewritten, raw);
-        assert!(reasoning_contents.is_empty());
+        let pre = preprocess_message_content_and_reasoning(raw).expect("must not itself error");
+        assert_eq!(pre.rewritten, raw);
+        assert!(pre.reasoning_contents.is_empty());
+        assert!(pre.content_parts.is_empty());
     }
 
     #[test]
     fn preprocess_leaves_a_missing_messages_array_untouched() {
         let raw = r#"{"model": "x"}"#;
-        let (rewritten, reasoning_contents) =
-            preprocess_message_content_and_reasoning(raw).expect("must succeed");
-        let v: serde_json::Value = serde_json::from_str(&rewritten).expect("valid JSON");
+        let pre = preprocess_message_content_and_reasoning(raw).expect("must succeed");
+        let v: serde_json::Value = serde_json::from_str(&pre.rewritten).expect("valid JSON");
         assert_eq!(v["model"], serde_json::json!("x"));
-        assert!(reasoning_contents.is_empty());
+        assert!(pre.reasoning_contents.is_empty());
+    }
+
+    /// A message with image parts renders from its parts: each image as the
+    /// template's placeholder, the text parts guarded like any content.
+    #[test]
+    fn image_parts_render_through_the_template_as_placeholders() {
+        let tok = native_tokenizer_with_specials().with_chat_template(
+            oxibonsai_tokenizer::chat_templates::ResolvedChatTemplate::Jinja(std::sync::Arc::new(
+                oxibonsai_tokenizer::jinja::JinjaTemplate::compile(
+                    "{% for m in messages %}{% if m.content is string %}{{ m.content }}\
+                     {% else %}{% for p in m.content %}{% if p.type == 'image' %}[IMG]\
+                     {% else %}{{ p.text }}{% endif %}{% endfor %}{% endif %};{% endfor %}",
+                )
+                .expect("test template compiles"),
+            )),
+        );
+        let guard = SpecialTokenGuard::from_tokenizer(&tok);
+        let raw = r#"{"messages": [
+            {"role": "user", "content": [{"type":"image_url","image_url":{"url":"data:,"}},{"type":"text","text":"cat?"}]},
+            {"role": "user", "content": "plain"}
+        ]}"#;
+        let pre = preprocess_message_content_and_reasoning(raw).expect("must succeed");
+        let value: serde_json::Value = serde_json::from_str(&pre.rewritten).expect("valid JSON");
+        let messages: Vec<crate::server::ChatMessage> =
+            serde_json::from_value(value["messages"].clone()).expect("must deserialize");
+        let render_messages =
+            to_render_messages_with_parts(&messages, &pre.reasoning_contents, &pre.content_parts);
+        assert_eq!(render_messages[0].content.image_count(), 1);
+        assert_eq!(render_messages[1].content, "plain");
+        let (text, _) = render_chat_prompt(
+            &tok,
+            &guard,
+            &render_messages,
+            &RenderOptions::default(),
+            true,
+        )
+        .expect("renders");
+        assert_eq!(text, "[IMG]cat?;plain;");
     }
 
     #[test]
@@ -1170,12 +1490,11 @@ mod tests {
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": "Hello!", "reasoning_content": "user greets"}
         ]}"#;
-        let (rewritten, reasoning_contents) =
-            preprocess_message_content_and_reasoning(raw).expect("must succeed");
-        let value: serde_json::Value = serde_json::from_str(&rewritten).expect("valid JSON");
+        let pre = preprocess_message_content_and_reasoning(raw).expect("must succeed");
+        let value: serde_json::Value = serde_json::from_str(&pre.rewritten).expect("valid JSON");
         let messages: Vec<crate::server::ChatMessage> =
             serde_json::from_value(value["messages"].clone()).expect("must deserialize");
-        let render_messages = to_render_messages(&messages, &reasoning_contents);
+        let render_messages = to_render_messages(&messages, &pre.reasoning_contents);
 
         let (text, _) = render_chat_prompt(
             &tok,
@@ -1244,7 +1563,7 @@ mod tests {
         let guard = SpecialTokenGuard::from_tokenizer(&tok);
         let messages = vec![RenderableMessage {
             role: "user".to_string(),
-            content: "What is 2+2?".to_string(),
+            content: "What is 2+2?".into(),
             ..Default::default()
         }];
         render_chat_prompt(

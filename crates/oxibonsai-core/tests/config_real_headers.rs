@@ -13,30 +13,32 @@
 //! - `OXIBONSAI_BONSAI2_HEADERS_DIR`: a directory of the real 27B family's
 //!   `*.gguf.head` files (the first ~64 MB of each real GGUF — full magic,
 //!   header, metadata and tensor-info sections, but no tensor data), staged
-//!   for a validation session. These fixtures are session-scratchpad-only
-//!   and never present in an ordinary checkout or CI image, so the two
-//!   tests that need them are additionally `#[ignore]`d: run them with
+//!   for a validation run. These fixtures are never checked into the
+//!   repository or shipped in an ordinary checkout or CI image, so the two
+//!   tests that need them self-skip and record the miss under
+//!   `Capability::Bonsai2Models`: run them with
 //!   `OXIBONSAI_BONSAI2_HEADERS_DIR=<dir> cargo test -p oxibonsai-core
-//!   --test config_real_headers -- --ignored`. The runtime check is kept
-//!   too, as a defensive skip-not-fail for anyone who runs with `--ignored`
-//!   but without the variable set.
-//! - `models/*.gguf` at the workspace root (`../../models` relative to this
-//!   crate, mirroring the existing `models_dir()` helper in
-//!   `quant_prism_golden.rs`): the real dense Bonsai models, when a
-//!   workstation happens to have them checked out locally. These are
-//!   deliberately **not** `#[ignore]`d — a checkout that has the real
-//!   weight files (e.g. the primary repo, post-merge) must exercise the
-//!   M-34 named-constructor-vs-real-file assertions by default, since that
-//!   is exactly the gate that caught B2-02's `ternary_bonsai_8b()` YaRN
-//!   defect. Skipped (not failed) only when the specific file is absent.
+//!   --test config_real_headers`.
+//! - `models/*.gguf` (the testkit `models/`/`$OXIBONSAI_MODELS_DIR`
+//!   resolver, shared with every other real-model test in this workspace):
+//!   the real dense Bonsai models, when a workstation happens to have them
+//!   checked out locally. The M-34 named-constructor-vs-real-file
+//!   assertions run by default whenever the specific file is present (e.g.
+//!   the primary repo, post-merge) — this is exactly the gate that caught
+//!   B2-02's `ternary_bonsai_8b()` YaRN defect — and self-skip (recording
+//!   the miss under `Capability::LegacyModels`) only when it is absent.
 
 use std::path::{Path, PathBuf};
 
 use oxibonsai_core::config::Qwen3Config;
 use oxibonsai_core::config_hybrid::HybridConfig;
+use oxibonsai_core::gguf::header::GgufHeader;
+use oxibonsai_core::gguf::metadata::{MetadataStore, MetadataValue};
 use oxibonsai_core::gguf::reader::{mmap_gguf_file, GgufFile};
+use oxibonsai_core::gguf::tensor_info::TensorStore;
 use oxibonsai_core::hadamard_config::HadamardConfig;
 use oxibonsai_core::BonsaiError;
+use oxibonsai_testkit::capability::{record_executed_timed, record_skipped, Capability};
 
 /// Directory holding the staged real-27B `.gguf.head` fixtures, if any.
 fn real_headers_dir() -> Option<PathBuf> {
@@ -45,10 +47,13 @@ fn real_headers_dir() -> Option<PathBuf> {
     path.is_dir().then_some(path)
 }
 
-/// Workspace `models/` directory (present only on a workstation that has
-/// the real weight files checked out; never shipped in the repository).
+/// The real-model directory: the testkit `models/`/`$OXIBONSAI_MODELS_DIR`
+/// resolver, so this leg's env var matches every other real-model test in
+/// the workspace instead of a hardcoded `../../models` relative to this
+/// crate alone (which a checkout without the untracked model files never
+/// populates).
 fn models_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models")
+    oxibonsai_testkit::workspace::models_dir()
 }
 
 /// The six real 27B language-model GGUF header filenames this test suite
@@ -81,21 +86,57 @@ fn read_header(dir: &Path, name: &str) -> memmap2::Mmap {
         .unwrap_or_else(|e| panic!("failed to mmap staged fixture '{name}': {e}"))
 }
 
+/// Re-slice a `.gguf.head` fixture down to exactly its header + metadata +
+/// tensor-info section, dropping the partial, truncated prefix of real
+/// tensor bytes the fixture also carries.
+///
+/// [`GgufFile::parse`]'s own tensor-layout validation only skips checking
+/// that the data section holds every declared tensor's bytes when the byte
+/// slice given to it ends at or before the point tensor data begins — a
+/// deliberate "metadata-only read" the reader documents and tests for
+/// directly. A `.gguf.head` fixture (the first ~64 MB of a real, multi-GB
+/// GGUF) is too long for that: it carries header, metadata and tensor-info
+/// in full, but also a partial chunk of the first tensor's real bytes, which
+/// is enough for `validate_tensor_layout` to see tensors whose declared
+/// extents run far past the fixture's actual length and reject the file as
+/// truncated/corrupt — correctly, for a file that were genuinely meant to be
+/// loaded whole. This re-derives the same data offset `GgufFile::parse`
+/// computes internally (header → metadata → tensor-info →
+/// `general.alignment`-padded offset, replicated here since that alignment
+/// step is a private helper) and truncates to exactly that boundary, turning
+/// the over-long fixture into the metadata-only read it is actually meant to
+/// be.
+fn header_only(data: &[u8]) -> &[u8] {
+    let (header, offset) = GgufHeader::parse(data, 0).expect("gguf header");
+    let (metadata, offset) =
+        MetadataStore::parse(data, offset, header.metadata_kv_count).expect("gguf metadata");
+    let (_tensors, offset) =
+        TensorStore::parse(data, offset, header.tensor_count).expect("gguf tensor info");
+    let alignment: usize = match metadata.get("general.alignment") {
+        Some(MetadataValue::Uint32(v)) => *v as usize,
+        _ => 32,
+    };
+    let data_offset = (offset + alignment - 1) & !(alignment - 1);
+    &data[..data_offset.min(data.len())]
+}
+
 #[test]
-#[ignore = "requires OXIBONSAI_BONSAI2_HEADERS_DIR staged with the real 27B \
-            .gguf.head fixtures; run with `-- --ignored`"]
 fn all_six_real_27b_headers_parse_as_hybrid_qwen35() {
+    const TEST: &str =
+        "oxibonsai-core::config_real_headers::all_six_real_27b_headers_parse_as_hybrid_qwen35";
     let Some(dir) = real_headers_dir() else {
         eprintln!(
             "skipping all_six_real_27b_headers_parse_as_hybrid_qwen35: set \
              OXIBONSAI_BONSAI2_HEADERS_DIR to a directory of staged .gguf.head fixtures to run it"
         );
+        record_skipped(Capability::Bonsai2Models, TEST);
         return;
     };
+    let start = std::time::Instant::now();
 
     for name in REAL_27B_HEADERS {
         let mmap = read_header(&dir, name);
-        let file = GgufFile::parse(&mmap)
+        let file = GgufFile::parse(header_only(&mmap))
             .unwrap_or_else(|e| panic!("{name}: GgufFile::parse failed: {e}"));
 
         // ── Qwen3Config (dense fields shared with HybridConfig::base) ──────
@@ -228,21 +269,25 @@ fn all_six_real_27b_headers_parse_as_hybrid_qwen35() {
             );
         }
     }
+    record_executed_timed(Capability::Bonsai2Models, TEST, start.elapsed());
 }
 
 #[test]
-#[ignore = "requires OXIBONSAI_BONSAI2_HEADERS_DIR staged with the real 27B \
-            .gguf.head fixtures; run with `-- --ignored`"]
 fn mmproj_clip_architecture_is_rejected_not_silently_defaulted() {
+    const TEST: &str =
+        "oxibonsai-core::config_real_headers::mmproj_clip_architecture_is_rejected_not_silently_defaulted";
     let Some(dir) = real_headers_dir() else {
         eprintln!(
             "skipping mmproj_clip_architecture_is_rejected_not_silently_defaulted: set \
              OXIBONSAI_BONSAI2_HEADERS_DIR"
         );
+        record_skipped(Capability::Bonsai2Models, TEST);
         return;
     };
+    let start = std::time::Instant::now();
     let mmap = read_header(&dir, MMPROJ_HEADER);
-    let file = GgufFile::parse(&mmap).expect("mmproj header should still structurally parse");
+    let file =
+        GgufFile::parse(header_only(&mmap)).expect("mmproj header should still structurally parse");
     let err = Qwen3Config::from_metadata(&file.metadata)
         .expect_err("a `clip` architecture file must be rejected, not silently defaulted to Qwen3");
     match err {
@@ -255,6 +300,7 @@ fn mmproj_clip_architecture_is_rejected_not_silently_defaulted() {
     assert!(HadamardConfig::from_metadata(&file.metadata)
         .expect("no prism.hadamard.version key: must be Ok(None), not an error")
         .is_none());
+    record_executed_timed(Capability::Bonsai2Models, TEST, start.elapsed());
 }
 
 // ── Real dense Bonsai/Ternary-Bonsai models (M-34) ─────────────────────────
@@ -327,36 +373,51 @@ fn load_real_config(path: &Path) -> Qwen3Config {
 
 #[test]
 fn bonsai_8b_named_constructor_matches_from_metadata_on_real_file() {
+    const TEST: &str =
+        "oxibonsai-core::config_real_headers::bonsai_8b_named_constructor_matches_from_metadata_on_real_file";
     let path = models_dir().join("Bonsai-8B.gguf");
     if !path.exists() {
         eprintln!("skipping bonsai_8b_named_constructor_matches_from_metadata_on_real_file: models/Bonsai-8B.gguf not present");
+        record_skipped(Capability::LegacyModels, TEST);
         return;
     }
+    let start = std::time::Instant::now();
     let real = load_real_config(&path);
     let hardcoded = Qwen3Config::bonsai_8b();
     assert_named_constructor_matches_real_file("Bonsai-8B.gguf", &real, &hardcoded);
+    record_executed_timed(Capability::LegacyModels, TEST, start.elapsed());
 }
 
 #[test]
 fn ternary_bonsai_8b_named_constructor_matches_from_metadata_on_real_file() {
+    const TEST: &str =
+        "oxibonsai-core::config_real_headers::ternary_bonsai_8b_named_constructor_matches_from_metadata_on_real_file";
     let path = models_dir().join("Ternary-Bonsai-8B.gguf");
     if !path.exists() {
         eprintln!("skipping ternary_bonsai_8b_named_constructor_matches_from_metadata_on_real_file: models/Ternary-Bonsai-8B.gguf not present");
+        record_skipped(Capability::LegacyModels, TEST);
         return;
     }
+    let start = std::time::Instant::now();
     let real = load_real_config(&path);
     let hardcoded = Qwen3Config::ternary_bonsai_8b();
     assert_named_constructor_matches_real_file("Ternary-Bonsai-8B.gguf", &real, &hardcoded);
+    record_executed_timed(Capability::LegacyModels, TEST, start.elapsed());
 }
 
 #[test]
 fn ternary_bonsai_1_7b_named_constructor_matches_from_metadata_on_real_file() {
+    const TEST: &str =
+        "oxibonsai-core::config_real_headers::ternary_bonsai_1_7b_named_constructor_matches_from_metadata_on_real_file";
     let path = models_dir().join("Ternary-Bonsai-1.7B.gguf");
     if !path.exists() {
         eprintln!("skipping ternary_bonsai_1_7b_named_constructor_matches_from_metadata_on_real_file: models/Ternary-Bonsai-1.7B.gguf not present");
+        record_skipped(Capability::LegacyModels, TEST);
         return;
     }
+    let start = std::time::Instant::now();
     let real = load_real_config(&path);
     let hardcoded = Qwen3Config::ternary_bonsai_1_7b();
     assert_named_constructor_matches_real_file("Ternary-Bonsai-1.7B.gguf", &real, &hardcoded);
+    record_executed_timed(Capability::LegacyModels, TEST, start.elapsed());
 }

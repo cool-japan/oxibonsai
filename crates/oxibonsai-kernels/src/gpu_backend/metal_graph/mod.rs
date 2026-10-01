@@ -18,6 +18,8 @@
 //!   the batched prefill-attention library (`metal_prefill/attention.rs`) is
 //!   the one library still compiled separately
 //! - Lazily pre-allocated intermediate GPU buffers (shared mode + hazard tracking)
+//! - Objective-C autorelease pools around command-buffer lifetimes (see
+//!   [`with_autorelease_pool`])
 //!
 //! # Buffer hazard tracking
 //!
@@ -54,13 +56,47 @@ mod reformat;
 mod vae;
 
 pub use error::{MetalGraphError, MetalWeightHandle};
-pub use graph::{MetalDevice, MetalGraph, SessionScope};
+pub use graph::{
+    default_prefill_budget, MetalDevice, MetalGraph, MetalPrefillPolicy, PrefillCostSnapshot,
+    PrefillDeadlineScope, PrefillDecision, PrefillRoute, PrefillWorkShape, SessionScope,
+    FUSED_BUDGET_FACTOR, FUSED_BUDGET_SLACK,
+};
+
+/// The head-free hidden-state prefill (the dense embedding pass, MET-05) and
+/// the logits prefill's micro-batch size, nameable from outside the crate
+/// through this public module (`metal_prefill` itself is private).
+pub use crate::gpu_backend::metal_prefill::{
+    try_metal_full_forward_prefill_hidden, try_metal_full_forward_prefill_hidden_cached,
+    try_metal_full_forward_prefill_hidden_ternary, try_metal_full_forward_prefill_q1_cached,
+    HiddenPrefillInput, HiddenPrefillShape, HIDDEN_PREFILL_MICRO_BATCH, PREFILL_LOGITS_MICRO_BATCH,
+};
+
+/// Run `f` inside a fresh Objective-C autorelease pool, drained when `f`
+/// returns (or unwinds).
+///
+/// Metal methods outside the `new`/`alloc`/`copy` families that return an
+/// object — `-[MTLCommandQueue commandBuffer]`,
+/// `-[MTLCommandBuffer computeCommandEncoder]`, `-[MTLCommandBuffer error]` —
+/// hand back autoreleased objects, as do the `NSString`s the `metal` crate
+/// builds for names and labels, and a thread with no pool of its own keeps
+/// them until it exits: about 1.8 KiB per command buffer and encoder, i.e.
+/// per decoded token on a long-lived server thread. [`MetalGraph`]'s own
+/// GEMV / GEMM / attention / FFN dispatches and the batched prefill runner
+/// drain a pool per command buffer; a caller that drives whole forwards
+/// through the Metal backend (a model's fused decode, prefill and
+/// hidden-state passes) wraps each call in this as well, so nothing a
+/// forward autoreleases outlives it whichever entry point it reaches.
+pub fn with_autorelease_pool<T>(f: impl FnOnce() -> T) -> T {
+    metal::objc::rc::autoreleasepool(f)
+}
 
 // Crate-internal helpers used by sibling modules
 // (`metal_dispatch`, `metal_full_layer`, `metal_prefill`, `metal_fp8_*`).
 pub(crate) use buffers::{
-    alloc_buf, commit_and_wait, div_ceil, download_f32, set_scalar, upload_f32,
+    alloc_buf, commit_and_wait, commit_and_wait_bounded, div_ceil, download_f32, set_scalar,
+    upload_f32, wait_bounded,
 };
+pub(crate) use graph::effective_prefill_deadline;
 
 #[cfg(test)]
 mod tests;
@@ -72,6 +108,8 @@ mod tests_gemm_f32;
 mod tests_gemm_tq2;
 #[cfg(test)]
 mod tests_gemv_tq2;
+#[cfg(test)]
+mod tests_hidden;
 #[cfg(test)]
 mod tests_no_private_library;
 #[cfg(test)]

@@ -69,6 +69,7 @@ pub mod smoothquant;
 pub mod tensor_parallel;
 #[cfg(test)]
 pub(crate) mod test_alloc;
+pub mod vision;
 pub mod weight_tying;
 
 #[cfg(feature = "training")]

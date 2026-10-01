@@ -97,6 +97,10 @@ impl PrefillBuffers {
             max_seq,
         })
     }
+    /// Hidden width these buffers were allocated for.
+    pub fn hidden_size(&self) -> usize {
+        self.hidden_size
+    }
     /// Check whether existing buffers match the requested dimensions.
     #[allow(clippy::too_many_arguments)]
     pub fn matches(

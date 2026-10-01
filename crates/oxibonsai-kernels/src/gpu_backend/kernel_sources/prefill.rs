@@ -144,6 +144,160 @@ kernel void gemm_q1_g128_v7(
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// gemm_q1_g128_simdgroup — tiled simdgroup_matrix Q1_0_g128 GEMM (M-18)
+// ─────────────────────────────────────────────────────────────────────────
+//
+// out[M,N] = A[M,K] · dequant(W[N,K])ᵀ  (+ residual[M,N] when `mode == 1`)
+//
+// Same op, same SoA weight buffer and same column-major activation layout as
+// gemm_q1_g128_v7 above (`inputs[col*k + e]`, `outputs[col*n_rows + row]`),
+// but tiled: one threadgroup owns a 64 (M) x 64 (N) output tile, stages each
+// 32-wide K slice of the activations (f32) and of the dequantised weights
+// (half) into threadgroup memory ONCE, and drives the 8x8 hardware matrix
+// units over it. gemm_q1_g128_v7 instead re-reads every input column once per
+// weight row, which makes its cost per token grow with the batch once the
+// activations fall out of cache (the M-18 super-linear prefill).
+//
+// The weight is staged EXACTLY: a Q1 weight is `bit ? +d : -d` with `d` the
+// block's own f16 scale, so it is representable in half with no rounding.
+// The activations stay f32 and every product accumulates in f32; the result
+// differs from v7 only by summation order.
+//
+// Grid: [ceil(N/64), ceil(M/64), 1] threadgroups of 128 threads (4 simdgroups,
+// a 32x32 quadrant each). K must be a multiple of 128 (one Q1 block row).
+constant constexpr uint Q1S_TM = 64u;
+constant constexpr uint Q1S_TN = 64u;
+constant constexpr uint Q1S_TK = 32u;
+constant constexpr uint Q1S_SIMDGROUPS = 4u;
+constant constexpr uint Q1S_THREADS = Q1S_SIMDGROUPS * 32u;   // 128
+constant constexpr uint Q1S_SG_M = 32u;
+constant constexpr uint Q1S_SG_N = 32u;
+constant constexpr uint Q1S_FRAG = 8u;
+constant constexpr uint Q1S_MFRAGS = Q1S_SG_M / Q1S_FRAG;     // 4
+constant constexpr uint Q1S_NFRAGS = Q1S_SG_N / Q1S_FRAG;     // 4
+constant constexpr uint Q1S_KFRAGS = Q1S_TK / Q1S_FRAG;       // 4
+constant constexpr uint Q1S_A_VEC4 = Q1S_TM * Q1S_TK / 4u;    // 512 float4 per K slice
+
+kernel void gemm_q1_g128_simdgroup(
+    device const uchar* blocks_raw  [[buffer(0)]],
+    device const float* inputs      [[buffer(1)]],
+    device float*       outputs     [[buffer(2)]],
+    constant uint&      n_rows      [[buffer(3)]],
+    constant uint&      batch_size  [[buffer(4)]],
+    constant uint&      k           [[buffer(5)]],
+    device const float* residual    [[buffer(6)]],
+    constant uint&      mode        [[buffer(7)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  lid  [[thread_index_in_threadgroup]],
+    uint  sgid [[simdgroup_index_in_threadgroup]])
+{
+    const uint row_base = tgid.x * Q1S_TN;          // first weight row (N)
+    const uint col_base = tgid.y * Q1S_TM;          // first batch column (M)
+    const uint sg_m0 = (sgid / 2u) * Q1S_SG_M;      // quadrant origin in the tile
+    const uint sg_n0 = (sgid % 2u) * Q1S_SG_N;
+
+    const uint blocks_per_row = k / 128u;
+    const uint data_offset = n_rows * blocks_per_row * 2u;   // sign bits follow the scales
+    const uint k_tiles = k / Q1S_TK;
+    const uint valid_rows = (row_base < n_rows) ? min(Q1S_TN, n_rows - row_base) : 0u;
+    const uint valid_cols = (col_base < batch_size) ? min(Q1S_TM, batch_size - col_base) : 0u;
+
+    threadgroup float Ash[Q1S_TM * Q1S_TK];   // [m][kk], 8 KiB
+    threadgroup half  Dsh[Q1S_TK * Q1S_TN];   // [kk][n], 4 KiB
+
+    simdgroup_float8x8 acc[Q1S_MFRAGS][Q1S_NFRAGS];
+    for (uint mi = 0u; mi < Q1S_MFRAGS; mi++) {
+        for (uint ni = 0u; ni < Q1S_NFRAGS; ni++) {
+            acc[mi][ni] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+    }
+
+    // Dequant work-item of this thread: one weight row, one 16-bit half of the
+    // K slice's 32 sign bits.
+    const uint d_row = lid % Q1S_TN;
+    const uint d_half = lid / Q1S_TN;               // 0 or 1
+
+    for (uint kt = 0u; kt < k_tiles; kt++) {
+        const uint k_off = kt * Q1S_TK;
+        const uint kb = k_off / 128u;
+        const uint byte0 = (k_off % 128u) / 8u + d_half * 2u;
+
+        // -- Dsh: 16 weights of row `d_row` per thread, exact in half.
+        {
+            const uint kk0 = d_half * 16u;
+            if (d_row < valid_rows) {
+                const uint block_idx = (row_base + d_row) * blocks_per_row + kb;
+                const half d = *(device const half*)(blocks_raw + block_idx * 2u);
+                device const uchar* bits = blocks_raw + data_offset + block_idx * 16u + byte0;
+                const uint word = uint(bits[0]) | (uint(bits[1]) << 8u);
+                for (uint j = 0u; j < 16u; j++) {
+                    Dsh[(kk0 + j) * Q1S_TN + d_row] = ((word >> j) & 1u) ? d : -d;
+                }
+            } else {
+                for (uint j = 0u; j < 16u; j++) {
+                    Dsh[(kk0 + j) * Q1S_TN + d_row] = half(0.0);
+                }
+            }
+        }
+
+        // -- Ash: the tile's activation slice, float4 at a time.
+        for (uint i = lid; i < Q1S_A_VEC4; i += Q1S_THREADS) {
+            const uint a_row = i / (Q1S_TK / 4u);
+            const uint a_k4 = i % (Q1S_TK / 4u);
+            float4 v = float4(0.0f);
+            if (a_row < valid_cols) {
+                v = *(device const float4*)(inputs + (col_base + a_row) * k + k_off + a_k4 * 4u);
+            }
+            *(threadgroup float4*)(Ash + a_row * Q1S_TK + a_k4 * 4u) = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kf = 0u; kf < Q1S_KFRAGS; kf++) {
+            simdgroup_float8x8 afrag[Q1S_MFRAGS];
+            simdgroup_half8x8  dfrag[Q1S_NFRAGS];
+            for (uint mi = 0u; mi < Q1S_MFRAGS; mi++) {
+                simdgroup_load(afrag[mi], Ash + (sg_m0 + mi * Q1S_FRAG) * Q1S_TK + kf * Q1S_FRAG, Q1S_TK);
+            }
+            for (uint ni = 0u; ni < Q1S_NFRAGS; ni++) {
+                simdgroup_load(dfrag[ni], Dsh + (kf * Q1S_FRAG) * Q1S_TN + sg_n0 + ni * Q1S_FRAG, Q1S_TN);
+            }
+            for (uint mi = 0u; mi < Q1S_MFRAGS; mi++) {
+                for (uint ni = 0u; ni < Q1S_NFRAGS; ni++) {
+                    simdgroup_multiply_accumulate(acc[mi][ni], afrag[mi], dfrag[ni], acc[mi][ni]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // -- Write-back through threadgroup memory (the output is column-major, so
+    // a per-element scatter with the boundary clamp is needed anyway).
+    threadgroup float* Csh = Ash;
+    for (uint sg = 0u; sg < Q1S_SIMDGROUPS; sg++) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == sgid) {
+            for (uint mi = 0u; mi < Q1S_MFRAGS; mi++) {
+                for (uint ni = 0u; ni < Q1S_NFRAGS; ni++) {
+                    simdgroup_store(acc[mi][ni], Csh + (mi * Q1S_FRAG) * Q1S_SG_N + ni * Q1S_FRAG, Q1S_SG_N);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == sgid) {
+            for (uint idx = lid % 32u; idx < Q1S_SG_M * Q1S_SG_N; idx += 32u) {
+                const uint m_local = sg_m0 + idx / Q1S_SG_N;
+                const uint n_local = sg_n0 + idx % Q1S_SG_N;
+                if (m_local < valid_cols && n_local < valid_rows) {
+                    const uint o = (col_base + m_local) * n_rows + row_base + n_local;
+                    const float v = Csh[idx];
+                    outputs[o] = (mode == 1u) ? (residual[o] + v) : v;
+                }
+            }
+        }
+    }
+}
 "#;
 
 /// V7-based GEMM with residual addition.
@@ -764,6 +918,146 @@ kernel void gemm_tq2_g128_v7(
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// gemm_tq2_g128_simdgroup — the prefill's tiled TQ2_0_g128 GEMM
+// ─────────────────────────────────────────────────────────────────────────
+//
+// out[M,N] = A[M,K] · dequant(W[N,K])ᵀ, the op, SoA weight buffer, 64x64 tile,
+// 128-thread / 4-simdgroup shape, 32-wide K slices and 8x8 MAC order of
+// gemm_tq2_g128_v10_simdgroup — so it produces the same bits — with a cheaper
+// staging step: each thread dequantises 16 consecutive weights of one row
+// from a single 32-bit word of codes (v10 decodes four codes per work-item
+// and re-reads the block scale for every item), and the activation slice is
+// staged a float4 at a time. The dequantised weight `scale * {-1, 0, +1}` is
+// computed exactly as v10 computes it (in half, which is exact).
+//
+// Grid: [ceil(N/64), ceil(M/64), 1] threadgroups of 128 threads. K must be a
+// multiple of 128.
+constant constexpr uint T2S_TM = 64u;
+constant constexpr uint T2S_TN = 64u;
+constant constexpr uint T2S_TK = 32u;
+constant constexpr uint T2S_SIMDGROUPS = 4u;
+constant constexpr uint T2S_THREADS = T2S_SIMDGROUPS * 32u;   // 128
+constant constexpr uint T2S_SG_M = 32u;
+constant constexpr uint T2S_SG_N = 32u;
+constant constexpr uint T2S_FRAG = 8u;
+constant constexpr uint T2S_MFRAGS = T2S_SG_M / T2S_FRAG;     // 4
+constant constexpr uint T2S_NFRAGS = T2S_SG_N / T2S_FRAG;     // 4
+constant constexpr uint T2S_KFRAGS = T2S_TK / T2S_FRAG;       // 4
+constant constexpr uint T2S_A_VEC4 = T2S_TM * T2S_TK / 4u;    // 512 float4 per K slice
+
+kernel void gemm_tq2_g128_simdgroup(
+    device const uchar* soa_raw     [[buffer(0)]],
+    device const float* inputs      [[buffer(1)]],
+    device float*       outputs     [[buffer(2)]],
+    constant uint&      n_rows      [[buffer(3)]],
+    constant uint&      batch_size  [[buffer(4)]],
+    constant uint&      k           [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  lid  [[thread_index_in_threadgroup]],
+    uint  sgid [[simdgroup_index_in_threadgroup]])
+{
+    const uint row_base = tgid.x * T2S_TN;
+    const uint col_base = tgid.y * T2S_TM;
+    const uint sg_m0 = (sgid / 2u) * T2S_SG_M;
+    const uint sg_n0 = (sgid % 2u) * T2S_SG_N;
+
+    const uint blocks_per_row = k / 128u;
+    const uint qs_offset = n_rows * blocks_per_row * 2u;   // codes follow the scales
+    const uint k_tiles = k / T2S_TK;
+    const uint valid_rows = (row_base < n_rows) ? min(T2S_TN, n_rows - row_base) : 0u;
+    const uint valid_cols = (col_base < batch_size) ? min(T2S_TM, batch_size - col_base) : 0u;
+
+    threadgroup float Ash[T2S_TM * T2S_TK];   // [m][kk], 8 KiB
+    threadgroup half  Dsh[T2S_TK * T2S_TN];   // [kk][n], 4 KiB
+
+    simdgroup_float8x8 acc[T2S_MFRAGS][T2S_NFRAGS];
+    for (uint mi = 0u; mi < T2S_MFRAGS; mi++) {
+        for (uint ni = 0u; ni < T2S_NFRAGS; ni++) {
+            acc[mi][ni] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+    }
+
+    // Dequant work-item of this thread: one weight row, one 16-weight half of
+    // the K slice (four code bytes).
+    const uint d_row = lid % T2S_TN;
+    const uint d_half = lid / T2S_TN;               // 0 or 1
+
+    for (uint kt = 0u; kt < k_tiles; kt++) {
+        const uint k_off = kt * T2S_TK;
+        const uint kb = k_off / 128u;
+        const uint byte0 = (k_off % 128u) / 4u + d_half * 4u;
+        const uint kk0 = d_half * 16u;
+
+        if (d_row < valid_rows) {
+            const uint block_idx = (row_base + d_row) * blocks_per_row + kb;
+            const half scale_h = *(device const half*)(soa_raw + block_idx * 2u);
+            device const uchar* qs = soa_raw + qs_offset + block_idx * 32u + byte0;
+            const uint word = uint(qs[0]) | (uint(qs[1]) << 8u)
+                            | (uint(qs[2]) << 16u) | (uint(qs[3]) << 24u);
+            for (uint j = 0u; j < 16u; j++) {
+                const uint code = (word >> (2u * j)) & 3u;
+                const float w = select(select(0.0f, -1.0f, code == 0u), 1.0f, code == 2u);
+                Dsh[(kk0 + j) * T2S_TN + d_row] = scale_h * half(w);
+            }
+        } else {
+            for (uint j = 0u; j < 16u; j++) {
+                Dsh[(kk0 + j) * T2S_TN + d_row] = half(0.0);
+            }
+        }
+
+        for (uint i = lid; i < T2S_A_VEC4; i += T2S_THREADS) {
+            const uint a_row = i / (T2S_TK / 4u);
+            const uint a_k4 = i % (T2S_TK / 4u);
+            float4 v = float4(0.0f);
+            if (a_row < valid_cols) {
+                v = *(device const float4*)(inputs + (col_base + a_row) * k + k_off + a_k4 * 4u);
+            }
+            *(threadgroup float4*)(Ash + a_row * T2S_TK + a_k4 * 4u) = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kf = 0u; kf < T2S_KFRAGS; kf++) {
+            simdgroup_float8x8 afrag[T2S_MFRAGS];
+            simdgroup_half8x8  dfrag[T2S_NFRAGS];
+            for (uint mi = 0u; mi < T2S_MFRAGS; mi++) {
+                simdgroup_load(afrag[mi], Ash + (sg_m0 + mi * T2S_FRAG) * T2S_TK + kf * T2S_FRAG, T2S_TK);
+            }
+            for (uint ni = 0u; ni < T2S_NFRAGS; ni++) {
+                simdgroup_load(dfrag[ni], Dsh + (kf * T2S_FRAG) * T2S_TN + sg_n0 + ni * T2S_FRAG, T2S_TN);
+            }
+            for (uint mi = 0u; mi < T2S_MFRAGS; mi++) {
+                for (uint ni = 0u; ni < T2S_NFRAGS; ni++) {
+                    simdgroup_multiply_accumulate(acc[mi][ni], afrag[mi], dfrag[ni], acc[mi][ni]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    threadgroup float* Csh = Ash;
+    for (uint sg = 0u; sg < T2S_SIMDGROUPS; sg++) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == sgid) {
+            for (uint mi = 0u; mi < T2S_MFRAGS; mi++) {
+                for (uint ni = 0u; ni < T2S_NFRAGS; ni++) {
+                    simdgroup_store(acc[mi][ni], Csh + (mi * T2S_FRAG) * T2S_SG_N + ni * T2S_FRAG, T2S_SG_N);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == sgid) {
+            for (uint idx = lid % 32u; idx < T2S_SG_M * T2S_SG_N; idx += 32u) {
+                const uint m_local = sg_m0 + idx / T2S_SG_N;
+                const uint n_local = sg_n0 + idx % T2S_SG_N;
+                if (m_local < valid_cols && n_local < valid_rows) {
+                    outputs[(col_base + m_local) * n_rows + row_base + n_local] = Csh[idx];
+                }
+            }
+        }
+    }
+}
 "#;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -985,6 +1279,15 @@ kernel void prefill_qkv_prepare(
 /// The online softmax is mathematically exact versus the full-row softmax the
 /// per-token path computed (f32 reassociation only).
 ///
+/// Per key tile the work is spread without changing a single result bit
+/// (M-18: 1.38x faster at the 1.7B head geometry over a 4096-token prompt,
+/// 1.41x at the 8B one): K and V are staged four values per thread and step;
+/// each query row's softmax is shared by four lanes — the row max reduced
+/// across them (exact in any order), every `P` written in parallel from the
+/// same expression, the row sum still one pass in column order; and a
+/// simdgroup whose rows all kept their running max skips the O rescale,
+/// since `diag(1)·O` is `O`.
+///
 /// Buffers:
 ///   - `q`        `[batch × q_row_stride]` f32 (post-norm, post-RoPE Q section)
 ///   - `k_cache`  `[n_layers × nkv × max_seq × head_dim]` f16
@@ -1015,6 +1318,11 @@ constant constexpr uint PFA_MFRAGS = PFA_SG_M / PFA_FRAG;   // 1 M-fragment / si
 constant constexpr uint PFA_NFRAGS = PFA_BK / PFA_FRAG;     // 4 S-column fragments
 constant constexpr uint PFA_DMAX = 128u;                    // head_dim cap
 constant constexpr uint PFA_DFRAGS_MAX = PFA_DMAX / PFA_FRAG;
+constant constexpr uint PFA_SM_LANES = PFA_THREADS / PFA_BQ; // 4 lanes per softmax row
+constant constexpr uint PFA_SM_COLS = PFA_BK / PFA_SM_LANES; // 8 columns per lane
+static_assert(PFA_SM_LANES * PFA_BQ == PFA_THREADS, "every thread owns part of one row");
+static_assert(PFA_SM_LANES == 4u, "the row-max reduction shuffles across 4 lanes");
+static_assert(PFA_SG_M <= 32u, "one lane checks each row of its simdgroup");
 
 kernel void prefill_flash_attention(
     device const float* q            [[buffer(0)]],
@@ -1078,15 +1386,20 @@ kernel void prefill_flash_attention(
         const uint k0 = kt * PFA_BK;
         const uint k_valid = min(PFA_BK, kv_len - k0);
 
-        // Stage K-transposed: KVsh[d*PFA_BK + j] = k_cache[kv_head, k0+j, d].
-        for (uint i = lid; i < head_dim * PFA_BK; i += PFA_THREADS) {
-            const uint d = i / PFA_BK;
+        // Stage K-transposed: KVsh[d*PFA_BK + j] = k_cache[kv_head, k0+j, d],
+        // four head dimensions per thread and step; the lanes walk the keys,
+        // so each of the four transposed stores is conflict-free.
+        for (uint i = lid; i < (head_dim / 4u) * PFA_BK; i += PFA_THREADS) {
+            const uint d = (i / PFA_BK) * 4u;
             const uint j = i % PFA_BK;
-            float val = 0.0f;
+            float4 val = float4(0.0f);
             if (j < k_valid) {
-                val = float(k_cache[head_off + (k0 + j) * head_dim + d]);
+                val = float4(*((device const half4*)(k_cache + head_off + (k0 + j) * head_dim + d)));
             }
-            KVsh[d * PFA_BK + j] = val;
+            KVsh[(d + 0u) * PFA_BK + j] = val.x;
+            KVsh[(d + 1u) * PFA_BK + j] = val.y;
+            KVsh[(d + 2u) * PFA_BK + j] = val.z;
+            KVsh[(d + 3u) * PFA_BK + j] = val.w;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1128,10 +1441,18 @@ kernel void prefill_flash_attention(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Causal online softmax (one query row per strided thread).
-        for (uint r = lid; r < PFA_BQ; r += PFA_THREADS) {
-            float c = 1.0f;
-            // Keys of THIS tile visible to row r: j < row_valid.
+        // Causal online softmax. The PFA_SM_LANES adjacent lanes of one
+        // simdgroup that share query row r each own PFA_SM_COLS of its
+        // columns: they reduce the row max (exact in any order) and write
+        // every P = exp(S*scale - m_new) in parallel, and the row's first
+        // lane then sums P in column order — the same single pass, and the
+        // same bits, as one thread walking the whole row.
+        {
+            const uint r = lid / PFA_SM_LANES;
+            const uint j0 = (lid % PFA_SM_LANES) * PFA_SM_COLS;
+            // Keys of THIS tile visible to row r: j < row_valid. A padded
+            // query row, or a key-tile entirely in this row's future, has
+            // none: it contributes P = 0 and leaves (m, l, O) untouched.
             uint row_valid = 0u;
             if (r < q_valid) {
                 const uint qpos = pos_start + q0 + r;
@@ -1139,76 +1460,91 @@ kernel void prefill_flash_attention(
                     row_valid = min(k_valid, qpos - k0 + 1u);
                 }
             }
-            if (row_valid == 0u) {
-                // Padded query row, or a key-tile entirely in this row's
-                // future: contribute nothing and leave (m, l, O) untouched.
-                for (uint j = 0u; j < PFA_BK; j++) {
-                    Ssh[r * PFA_BK + j] = 0.0f;
+            float part_max = -INFINITY;
+            for (uint j = j0; j < j0 + PFA_SM_COLS; j++) {
+                if (j < row_valid) {
+                    part_max = max(part_max, Ssh[r * PFA_BK + j] * scale);
                 }
-            } else {
-                float tile_max = -INFINITY;
-                for (uint j = 0u; j < row_valid; j++) {
-                    tile_max = max(tile_max, Ssh[r * PFA_BK + j] * scale);
+            }
+            float tile_max = max(part_max, simd_shuffle_xor(part_max, ushort(1)));
+            tile_max = max(tile_max, simd_shuffle_xor(tile_max, ushort(2)));
+            const float m_old = mrow[r];
+            const float m_new = max(m_old, tile_max);
+            for (uint j = j0; j < j0 + PFA_SM_COLS; j++) {
+                float p = 0.0f;
+                if (j < row_valid) {
+                    p = exp(Ssh[r * PFA_BK + j] * scale - m_new);
                 }
-                const float m_old = mrow[r];
-                const float m_new = max(m_old, tile_max);
-                float tile_sum = 0.0f;
-                for (uint j = 0u; j < PFA_BK; j++) {
-                    float p = 0.0f;
-                    if (j < row_valid) {
-                        p = exp(Ssh[r * PFA_BK + j] * scale - m_new);
+                Ssh[r * PFA_BK + j] = p;
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            if (j0 == 0u) {
+                float c = 1.0f;
+                if (row_valid != 0u) {
+                    float tile_sum = 0.0f;
+                    for (uint j = 0u; j < PFA_BK; j++) {
+                        tile_sum += Ssh[r * PFA_BK + j];
                     }
-                    Ssh[r * PFA_BK + j] = p;
-                    tile_sum += p;
+                    c = (m_old == -INFINITY) ? 0.0f : exp(m_old - m_new);
+                    lrow[r] = lrow[r] * c + tile_sum;
+                    mrow[r] = m_new;
                 }
-                c = (m_old == -INFINITY) ? 0.0f : exp(m_old - m_new);
-                lrow[r] = lrow[r] * c + tile_sum;
-                mrow[r] = m_new;
+                corr[r] = c;
             }
-            corr[r] = c;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Rescale the O accumulator: O = diag(corr) * O.
-        {
-            const uint dbase = (sgid * PFA_MFRAGS) * (PFA_FRAG * PFA_FRAG);
-            const uint lane = lid % 32u;
-            for (uint idx = lane; idx < PFA_MFRAGS * PFA_FRAG * PFA_FRAG; idx += 32u) {
-                const uint mi = idx / (PFA_FRAG * PFA_FRAG);
-                const uint e  = idx % (PFA_FRAG * PFA_FRAG);
-                const uint rr = e / PFA_FRAG;
-                const uint cc = e % PFA_FRAG;
-                float val = 0.0f;
-                if (rr == cc) {
-                    val = corr[sg_m0 + mi * PFA_FRAG + rr];
-                }
-                diagsh[dbase + idx] = val;
-            }
+        // Rescale the O accumulator: O = diag(corr) * O. A simdgroup whose
+        // rows all kept their running max (corr == 1 on every row) skips it:
+        // diag(1) * O is O itself, bit for bit, since O never holds a
+        // negative zero (it starts at +0 and only ever gains P * V sums).
+        const uint sm_lane = lid % 32u;
+        bool row_rescaled = false;
+        if (sm_lane < PFA_SG_M) {
+            row_rescaled = corr[sg_m0 + sm_lane] != 1.0f;
         }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-        {
-            const uint dbase = (sgid * PFA_MFRAGS) * (PFA_FRAG * PFA_FRAG);
-            for (uint mi = 0u; mi < PFA_MFRAGS; mi++) {
-                simdgroup_float8x8 dfrag;
-                simdgroup_load(dfrag, diagsh + dbase + mi * (PFA_FRAG * PFA_FRAG), PFA_FRAG);
-                for (uint di = 0u; di < d_frags; di++) {
-                    simdgroup_float8x8 tmp;
-                    simdgroup_multiply(tmp, dfrag, oacc[mi][di]);
-                    oacc[mi][di] = tmp;
+        if (simd_any(row_rescaled)) {
+            {
+                const uint dbase = (sgid * PFA_MFRAGS) * (PFA_FRAG * PFA_FRAG);
+                for (uint idx = sm_lane; idx < PFA_MFRAGS * PFA_FRAG * PFA_FRAG; idx += 32u) {
+                    const uint mi = idx / (PFA_FRAG * PFA_FRAG);
+                    const uint e  = idx % (PFA_FRAG * PFA_FRAG);
+                    const uint rr = e / PFA_FRAG;
+                    const uint cc = e % PFA_FRAG;
+                    float val = 0.0f;
+                    if (rr == cc) {
+                        val = corr[sg_m0 + mi * PFA_FRAG + rr];
+                    }
+                    diagsh[dbase + idx] = val;
+                }
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            {
+                const uint dbase = (sgid * PFA_MFRAGS) * (PFA_FRAG * PFA_FRAG);
+                for (uint mi = 0u; mi < PFA_MFRAGS; mi++) {
+                    simdgroup_float8x8 dfrag;
+                    simdgroup_load(dfrag, diagsh + dbase + mi * (PFA_FRAG * PFA_FRAG), PFA_FRAG);
+                    for (uint di = 0u; di < d_frags; di++) {
+                        simdgroup_float8x8 tmp;
+                        simdgroup_multiply(tmp, dfrag, oacc[mi][di]);
+                        oacc[mi][di] = tmp;
+                    }
                 }
             }
         }
 
-        // Stage V over the (now dead) K tile, then O += P * V.
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint i = lid; i < PFA_BK * head_dim; i += PFA_THREADS) {
+        // Stage V over the K tile, then O += P * V. Every read of the K
+        // tile happened before the barrier that published S, so the tile is
+        // already dead here. Four values per thread and step: head_dim is a
+        // multiple of 8, so a quad never straddles two keys.
+        for (uint i = lid * 4u; i < PFA_BK * head_dim; i += PFA_THREADS * 4u) {
             const uint j = i / head_dim;
             const uint d = i % head_dim;
-            float val = 0.0f;
+            float4 val = float4(0.0f);
             if (j < k_valid) {
-                val = float(v_cache[head_off + (k0 + j) * head_dim + d]);
+                val = float4(*((device const half4*)(v_cache + head_off + (k0 + j) * head_dim + d)));
             }
-            KVsh[j * head_dim + d] = val;
+            *((threadgroup float4*)(KVsh + j * head_dim + d)) = val;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 

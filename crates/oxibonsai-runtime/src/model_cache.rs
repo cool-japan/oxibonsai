@@ -360,11 +360,73 @@ impl ModelCache {
 /// Runs a small number of dummy inference passes on a freshly-initialised
 /// [`InferenceEngine`] to prime internal allocation caches and JIT paths
 /// before the first real request arrives.
+///
+/// An empty [`warmup_prompt`](Self::warmup_prompt) warms up from a single
+/// token resolved from the loaded tokenizer's own special-token map
+/// ([`Self::with_tokenizer`], [`WarmupStartToken`]) — never a literal id,
+/// which would name `<|im_start|>` in one vocabulary (`151644` in
+/// Qwen3's) and an unrelated or out-of-range token in another (Bonsai 2's
+/// specials sit at `248044..248076`).
 pub struct ModelWarmup {
     /// Number of tokens to generate during the warmup pass.
     pub num_warmup_tokens: usize,
     /// Prompt text fed to the engine during warmup.
     pub warmup_prompt: String,
+    /// The token an empty warm-up prompt starts from.
+    start_token: WarmupStartToken,
+}
+
+/// The single token an empty warm-up prompt feeds, and where it came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WarmupStartToken {
+    /// The loaded tokenizer's `<|im_start|>` special token (the ChatML
+    /// turn opener every Qwen-family chat prompt starts with).
+    ChatStart(u32),
+    /// The tokenizer's BOS id, when it has no `<|im_start|>` but its
+    /// vocabulary marks the BOS token special.
+    Bos(u32),
+    /// The first vocabulary id, `0`, when neither resolves (no tokenizer
+    /// was given, or its vocabulary has neither special token): present in
+    /// every vocabulary.
+    FirstVocabId,
+}
+
+impl WarmupStartToken {
+    /// The ChatML turn opener this resolution looks up first.
+    pub const CHAT_START: &'static str = "<|im_start|>";
+
+    /// Resolve from `tokenizer`'s own special-token map: `<|im_start|>`,
+    /// else a special BOS, else [`Self::FirstVocabId`].
+    #[must_use]
+    pub fn resolve(tokenizer: Option<&crate::tokenizer_bridge::TokenizerBridge>) -> Self {
+        let Some(tokenizer) = tokenizer else {
+            return Self::FirstVocabId;
+        };
+        if let Some(id) = tokenizer
+            .inner()
+            .token_to_id(Self::CHAT_START)
+            .filter(|&id| tokenizer.is_special(id))
+        {
+            return Self::ChatStart(id);
+        }
+        match tokenizer
+            .native()
+            .map(oxibonsai_tokenizer::OxiTokenizer::bos_id)
+            .filter(|&id| tokenizer.is_special(id))
+        {
+            Some(id) => Self::Bos(id),
+            None => Self::FirstVocabId,
+        }
+    }
+
+    /// The token id.
+    #[must_use]
+    pub const fn id(self) -> u32 {
+        match self {
+            Self::ChatStart(id) | Self::Bos(id) => id,
+            Self::FirstVocabId => 0,
+        }
+    }
 }
 
 impl Default for ModelWarmup {
@@ -374,11 +436,49 @@ impl Default for ModelWarmup {
 }
 
 impl ModelWarmup {
-    /// Create a warmup helper with sensible defaults (32 tokens, generic prompt).
+    /// Create a warmup helper with sensible defaults (32 tokens, generic
+    /// prompt, and — until [`Self::with_tokenizer`] resolves one — the first
+    /// vocabulary id as the start token of an empty prompt).
     pub fn new() -> Self {
         Self {
             num_warmup_tokens: 32,
             warmup_prompt: "Warm up the inference engine.".to_owned(),
+            start_token: WarmupStartToken::FirstVocabId,
+        }
+    }
+
+    /// Resolve the start token of an empty warm-up prompt from the loaded
+    /// tokenizer's special-token map ([`WarmupStartToken::resolve`]).
+    pub fn with_tokenizer(mut self, tokenizer: &crate::tokenizer_bridge::TokenizerBridge) -> Self {
+        self.start_token = WarmupStartToken::resolve(Some(tokenizer));
+        self
+    }
+
+    /// The token an empty warm-up prompt starts from.
+    pub fn start_token(&self) -> WarmupStartToken {
+        self.start_token
+    }
+
+    /// The prompt [`Self::run`] feeds an engine whose vocabulary holds
+    /// `vocab_size` ids: the warm-up text's first 16 bytes as ids (each
+    /// reduced into the vocabulary), or — for an empty text — the single
+    /// [`Self::start_token`].
+    pub fn prompt_tokens(&self, vocab_size: usize) -> Vec<u32> {
+        // Byte ids are already below 32000, the smallest real vocabulary
+        // this runtime serves; a tiny synthetic vocabulary folds them in.
+        let modulus = u32::try_from(vocab_size)
+            .unwrap_or(u32::MAX)
+            .clamp(1, 32_000);
+        let dummy_tokens: Vec<u32> = self
+            .warmup_prompt
+            .bytes()
+            .take(16)
+            .map(|b| u32::from(b) % modulus)
+            .collect();
+        if dummy_tokens.is_empty() {
+            vec![self.start_token.id()]
+        } else {
+            dummy_tokens
         }
     }
 
@@ -405,20 +505,25 @@ impl ModelWarmup {
     pub fn run(&self, engine: &mut InferenceEngine<'_>, params: &SamplingParams) -> u64 {
         let start = Instant::now();
 
-        // Build a minimal synthetic prompt from the warmup text.
-        // Without a real tokenizer we use a fixed representative token sequence.
-        let dummy_tokens: Vec<u32> = self
-            .warmup_prompt
-            .bytes()
-            .take(16)
-            .map(|b| u32::from(b) % 32000)
-            .collect();
-
-        let prompt_tokens = if dummy_tokens.is_empty() {
-            vec![151644u32] // <|im_start|>
-        } else {
-            dummy_tokens
-        };
+        // A minimal synthetic prompt: the warm-up text's bytes as ids, or
+        // the resolved start token for an empty text.
+        let prompt_tokens = self.prompt_tokens(engine.vocab_size());
+        if self.warmup_prompt.is_empty() {
+            match self.start_token {
+                WarmupStartToken::ChatStart(id) => {
+                    tracing::debug!(id, "warm-up starts from the tokenizer's <|im_start|>");
+                }
+                WarmupStartToken::Bos(id) => tracing::info!(
+                    id,
+                    "warm-up: the tokenizer has no <|im_start|> special token; starting from its \
+                     BOS id"
+                ),
+                WarmupStartToken::FirstVocabId => tracing::info!(
+                    "warm-up: no chat-start or BOS special token was resolved (no tokenizer \
+                     given, or none in its vocabulary); starting from the first vocabulary id 0"
+                ),
+            }
+        }
 
         // Temporarily swap in the caller-supplied params via generate_with_seed.
         match engine.generate_with_seed(&prompt_tokens, self.num_warmup_tokens, 0, params) {
@@ -609,5 +714,138 @@ mod tests {
         // We just check it didn't panic and returned a sensible elapsed time.
         assert!(elapsed_ms < 60_000, "warmup should complete in under 60 s");
         assert!(ModelWarmup::needs_warmup(&engine));
+    }
+
+    /// A minimal byte-level `tokenizer.json` whose added tokens include
+    /// `<|im_start|>` as a special token at id 12.
+    const CHATML_TOKENIZER_JSON: &str = r##"{
+        "model": {
+            "type": "BPE",
+            "vocab": { "a": 0, "b": 1, "c": 2, "Ġ": 3 },
+            "merges": []
+        },
+        "added_tokens": [
+            { "id": 12, "content": "<|im_start|>", "special": true },
+            { "id": 13, "content": "<|im_end|>", "special": true }
+        ],
+        "pre_tokenizer": { "type": "ByteLevel" },
+        "decoder": { "type": "ByteLevel" }
+    }"##;
+
+    /// An empty warm-up text starts from the loaded tokenizer's own
+    /// `<|im_start|>` — whatever id its vocabulary gives it — never a
+    /// literal from another vocabulary.
+    #[test]
+    fn an_empty_warmup_starts_from_the_tokenizers_chat_start_token() {
+        let tokenizer =
+            crate::tokenizer_bridge::TokenizerBridge::native_from_json_str(CHATML_TOKENIZER_JSON)
+                .expect("tokenizer fixture loads");
+        let warmup = ModelWarmup::new()
+            .with_prompt("")
+            .with_tokenizer(&tokenizer);
+        assert_eq!(warmup.start_token(), WarmupStartToken::ChatStart(12));
+        assert_eq!(warmup.prompt_tokens(64), vec![12]);
+
+        // It drives a real engine without error (vocabulary 64 > id 12).
+        let mut engine = InferenceEngine::new(Qwen3Config::tiny_test(), greedy(), 42);
+        let _ = warmup.run(&mut engine, &greedy());
+        assert_eq!(
+            engine.sequence_position(),
+            0,
+            "warm-up leaves the engine reset"
+        );
+    }
+
+    /// Without a resolvable chat-start token the warm-up falls back to a
+    /// special BOS when the vocabulary has one, else to the first
+    /// vocabulary id — both present in the vocabulary the engine serves.
+    #[test]
+    fn an_empty_warmup_falls_back_to_the_bos_or_the_first_vocabulary_id() {
+        use oxibonsai_core::gguf::writer::{GgufWriter, MetadataWriteValue};
+
+        // No tokenizer at all.
+        assert_eq!(
+            WarmupStartToken::resolve(None),
+            WarmupStartToken::FirstVocabId
+        );
+        let bare = ModelWarmup::new().with_prompt("");
+        assert_eq!(bare.start_token(), WarmupStartToken::FirstVocabId);
+        assert_eq!(bare.prompt_tokens(32), vec![0]);
+
+        // A vocabulary with no special tokens at all: its configured BOS id
+        // (the default 1) is an ordinary token, so it is not used.
+        let plain = crate::tokenizer_bridge::TokenizerBridge::native_from_json_str(
+            r##"{
+                "model": { "type": "BPE", "vocab": { "a": 0, "b": 1, "c": 2 }, "merges": [] },
+                "added_tokens": [],
+                "pre_tokenizer": { "type": "ByteLevel" },
+                "decoder": { "type": "ByteLevel" }
+            }"##,
+        )
+        .expect("plain tokenizer loads");
+        assert_eq!(
+            WarmupStartToken::resolve(Some(&plain)),
+            WarmupStartToken::FirstVocabId
+        );
+        // The character-level stub declares a special `<bos>` at id 1.
+        let stub = crate::tokenizer_bridge::TokenizerBridge::from_native_tokenizer(
+            oxibonsai_tokenizer::OxiTokenizer::char_level_stub(32),
+        );
+        assert_eq!(
+            WarmupStartToken::resolve(Some(&stub)),
+            WarmupStartToken::Bos(1)
+        );
+
+        // A GGUF vocabulary whose BOS (`<|endoftext|>`, a control token) is
+        // special but which has no `<|im_start|>`.
+        let mut writer = GgufWriter::new();
+        writer.add_metadata(
+            "tokenizer.ggml.model",
+            MetadataWriteValue::Str("gpt2".to_string()),
+        );
+        writer.add_metadata(
+            "tokenizer.ggml.tokens",
+            MetadataWriteValue::ArrayStr(vec![
+                "a".to_string(),
+                "b".to_string(),
+                "<|endoftext|>".to_string(),
+            ]),
+        );
+        writer.add_metadata(
+            "tokenizer.ggml.token_type",
+            MetadataWriteValue::ArrayI32(vec![1, 1, 3]),
+        );
+        writer.add_metadata(
+            "tokenizer.ggml.merges",
+            MetadataWriteValue::ArrayStr(Vec::new()),
+        );
+        writer.add_metadata("tokenizer.ggml.bos_token_id", MetadataWriteValue::U32(2));
+        writer.add_metadata("tokenizer.ggml.eos_token_id", MetadataWriteValue::U32(2));
+        let bytes = writer.to_bytes().expect("serialize");
+        let gguf =
+            oxibonsai_core::gguf::reader::GgufFile::parse(&bytes).expect("tokenizer-only GGUF");
+        let tokenizer =
+            crate::tokenizer_bridge::TokenizerBridge::native_from_gguf_metadata(&gguf.metadata)
+                .expect("GGUF vocabulary loads");
+        let warmup = ModelWarmup::new()
+            .with_prompt("")
+            .with_tokenizer(&tokenizer);
+        assert_eq!(warmup.start_token(), WarmupStartToken::Bos(2));
+        assert_eq!(warmup.prompt_tokens(32), vec![2]);
+
+        // A non-empty text never consults the start token, and its byte ids
+        // fold into a tiny vocabulary.
+        let text = ModelWarmup::new()
+            .with_prompt("zz")
+            .with_tokenizer(&tokenizer);
+        assert_eq!(text.prompt_tokens(32), vec![u32::from(b'z') % 32; 2]);
+        assert_eq!(text.prompt_tokens(151_936), vec![u32::from(b'z'); 2]);
+    }
+
+    fn greedy() -> SamplingParams {
+        SamplingParams {
+            temperature: 0.0,
+            ..SamplingParams::default()
+        }
     }
 }

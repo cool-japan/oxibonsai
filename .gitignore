@@ -43,3 +43,4 @@ bonsai-te/
 bonsai-vae/
 flux2/
 *.png
+!crates/oxibonsai-model/tests/fixtures/bonsai2_golden_vision/fixture_256x192.png

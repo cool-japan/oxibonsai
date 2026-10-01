@@ -7,82 +7,98 @@
 //! earlier — the final-normed hidden state, `[n_tokens × hidden_size]` — which
 //! [`BonsaiModel::forward_hidden`] returns.
 //!
-//! # Two paths, one contract
+//! # Three routes, one contract
 //!
-//! [`forward_hidden`](BonsaiModel::forward_hidden) runs the **batched CPU
-//! prefill** (`prefill_cpu.rs`): every projection is a register-blocked GEMM
-//! over a micro-batch of prompt rows instead of one GEMV sweep over the
-//! weights per token, and the pass hands each micro-batch's post-block rows
-//! to a sink that applies `output_norm` to every row. Those rows are exactly
-//! what the per-token path would have fed to the LM head, computed by the
-//! same pass the generation prefill uses, so the two cannot disagree about a
-//! hidden state. The batched pass runs its GEMMs on the best **CPU** tier
-//! whatever dispatcher the caller supplies — including a GPU engine's — see
-//! "Why the CPU" below.
+//! [`forward_hidden`](BonsaiModel::forward_hidden) tries, in order:
 //!
-//! When the batched pass declines — a single token, a model that declares a
-//! sliding attention window, a layer outside `Q1_0_g128` / `TQ2_0_g128`, a
-//! geometry it does not handle; every decline is decided before anything is
-//! written — the call falls back to
-//! [`forward_hidden_sequential`](BonsaiModel::forward_hidden_sequential): the
-//! per-token host-KV block loop, whose per-layer GEMVs dispatch to the
-//! supplied tier. That function is public because it is also the parity
-//! reference the batched path is measured against, numerically (tests bound
-//! every row) and in time (the runtime's embedding benchmark).
+//! 1. **The head-free Metal prefill** (`forward_metal_hidden.rs`, Metal
+//!    builds only), when the caller's dispatcher is a GPU tier and the
+//!    model's fused weight cache is resident: every layer as batched GEMMs
+//!    and flash attention on the GPU over 128-row micro-batches, the
+//!    `output_norm` of every row read back, no LM head. It runs in a
+//!    request-scoped Metal session with its own device KV cache, so it never
+//!    touches the KV cache of a generation the process is decoding (MET-05).
+//!    It declines (a CPU dispatcher, a sliding window, a non-Q1/TQ2 head, no
+//!    resident cache) without doing anything, and any error it returns sends
+//!    the call on to the next route with one `debug` line.
+//! 2. **The batched CPU prefill** (`prefill_cpu.rs`): every projection is a
+//!    register-blocked GEMM over a micro-batch of prompt rows instead of one
+//!    GEMV sweep over the weights per token, and the pass hands each
+//!    micro-batch's post-block rows to a sink that applies `output_norm` to
+//!    every row. Those rows are exactly what the per-token path would have
+//!    fed to the LM head, computed by the same pass the generation prefill
+//!    uses, so the two cannot disagree about a hidden state. It runs its
+//!    GEMMs on the best **CPU** tier whatever dispatcher the caller supplies.
+//! 3. When the batched pass declines too — a single token, a model that
+//!    declares a sliding attention window, a layer outside `Q1_0_g128` /
+//!    `TQ2_0_g128`, a geometry it does not handle; every decline is decided
+//!    before anything is written —
+//!    [`forward_hidden_sequential`](BonsaiModel::forward_hidden_sequential):
+//!    the per-token host-KV block loop, whose per-layer GEMVs dispatch to the
+//!    supplied tier. That function is public because it is also the parity
+//!    reference both batched routes are measured against, numerically (tests
+//!    bound every row and the pooled vector) and in time (the runtime's
+//!    embedding benchmark).
 //!
-//! # Why the CPU, and not a fused GPU dispatch
+//! # Why a request-scoped Metal session, and not the decode entry points
 //!
-//! No head-free batched GPU entry point exists. Every batched fused entry
-//! point — `forward_metal.rs`'s `try_metal_prefill_with_lm_head` (and its
-//! `_ternary` twin), `try_metal_full_forward_with_lm_head`, and on CUDA every
+//! Every other batched fused entry point — `forward_metal.rs`'s
+//! `try_metal_prefill_with_lm_head` (and its `_ternary` twin),
+//! `try_metal_full_forward_with_lm_head`, and on CUDA every
 //! `try_cuda_prefill_with_lm_head*` (logits) or `try_cuda_prefill_verify*`
 //! (argmax ids) — fuses the LM head into the same dispatch, with the pre-head
-//! hidden state never leaving device memory. The head-free fused entry points
-//! (`try_metal_full_forward_inner`, `try_metal_full_forward_ternary_inner`,
-//! `try_cuda_full_forward_inner`) are **single-token decode** paths that read
-//! and write the **process-global** device KV cache; driving them from an
+//! hidden state never leaving device memory, and the head-free fused entry
+//! points (`try_metal_full_forward_inner`,
+//! `try_metal_full_forward_ternary_inner`, `try_cuda_full_forward_inner`) are
+//! **single-token decode** paths that read and write the device KV cache of
+//! the session the calling thread dispatches in. Driving any of them from an
 //! embedding request would interleave its positions with whatever a
-//! concurrent chat completion is decoding through the same singleton. They
-//! are deliberately not used, for correctness rather than convenience.
+//! concurrent chat completion is decoding through that same cache. The Metal
+//! route instead runs the prefill kernels in a sibling session of its own and
+//! drops it on return. CUDA has no head-free batched route; there the batched
+//! CPU pass stays the embedding path.
 //!
 //! # Measured (real `Ternary-Bonsai-1.7B.gguf`, Apple M3, release)
 //!
-//! The runtime's `embed_bench_short_and_long` (`OXIBONSAI_EMBED_BENCH=1`)
-//! times the production `InferenceEngine::embed` — this batched path —
-//! against the per-token loop the same engine ran before
+//! The runtime's `embed_bench_short_and_long` (`OXI_MODEL` or
+//! `OXIBONSAI_EMBED_BENCH=1`) times the production `InferenceEngine::embed`
+//! on a Metal engine — the head-free Metal prefill — against the batched CPU
+//! pass (`forward_hidden` on a CPU-tier dispatcher, the production path
+//! before the Metal route existed) and the per-token loop both replaced
 //! (`forward_hidden_sequential` on a dispatcher built exactly as the
-//! engine's own), minimum of three runs per leg (a single run for the
-//! 2000-token per-token leg), with the load average printed beside every
-//! figure. Two runs on a shared machine:
+//! engine's own), minimum of three runs per leg (a single run for the two
+//! slow legs at 2000 tokens), load average 10-12:
 //!
-//! | tokens | per-token loop | batched | speed-up | load avg (1 min) |
+//! | tokens | per-token loop | batched CPU | Metal | Metal vs per-token |
 //! |---|---|---|---|---|
-//! | 10 | 4.798 s | 0.408 s | **11.8x** | 26.9 |
-//! | 200 | 80.86 s | 5.77 s | **14.0x** | 20.8 |
-//! | 2000 | 547.9 s (one run) | **48.2 s** | **11.4x** | 21.2 |
-//! | 10 | 5.776 s | 0.468 s | **12.3x** | 43.8 |
-//! | 200 | 144.1 s | 8.06 s | **17.9x** | 39.0 |
-//! | 2000 | 1982.9 s (one run) | 95.7 s | **20.7x** | 95.9 |
+//! | 10 | 1.521 s | 0.202 s | **0.084 s** | 18.1x |
+//! | 200 | 42.32 s | 3.245 s | **0.330 s** | 128.2x |
+//! | 2000 | 352.5 s (one run) | 45.40 s (one run) | **3.250 s** | 108.5x |
 //!
-//! The pooled vectors agree to cosine >= 0.999999 at every length. Absolute
-//! times move with the machine's load (the 2000-token input fits the HTTP
-//! layer's 60 s request budget at load ~21, not at ~96), so the speed-ups
-//! are the figures to compare; the benchmark asserts the 10-token one. The
-//! per-token loop is this slow on a GPU engine because each of its per-layer
-//! GEMVs is a separate Metal dispatch with its own wait; the batched pass
-//! issues one GEMM per projection per micro-batch on the CPU instead.
+//! The pooled vectors of all three routes agree to cosine >= 0.999999 at
+//! every length; the real-model gate (`metal_hidden_parity_tests`) holds the
+//! Metal rows of all three dense models to per-row cosine >= 0.999 and
+//! pooled >= 0.9999 against the per-token reference at 10, 300 and 2000
+//! tokens (measured worst row 0.99995, on Ternary-Bonsai-8B at 2000 tokens).
+//! Before the Metal route, the batched CPU pass needed 48.2 s for the
+//! 2000-token input at load ~21 and 95.7 s at load ~96 — over the HTTP
+//! layer's 60 s request budget under load; the Metal pass stays an order of
+//! magnitude inside it. The per-token loop is this slow on a GPU engine
+//! because each of its per-layer GEMVs is a separate Metal dispatch with its
+//! own wait.
 //!
 //! # Per-sequence state: this call clobbers **this model's**, and nothing else's
 //!
-//! Both paths write positions `0..tokens.len()` of the host KV cache, so they
-//! **cannot** be interleaved with an ongoing generation on the same model.
-//! Each therefore clears this model's per-sequence state on both sides of
-//! the pass: once before, so it never attends over a previous sequence's
-//! history (and so the MET-05 device-KV latch is cleared, making the host-KV
-//! path legal again), and once after, so it leaves nothing behind for whoever
-//! runs next.
+//! Both CPU routes write positions `0..tokens.len()` of the host KV cache, so
+//! they **cannot** be interleaved with an ongoing generation on the same
+//! model (the Metal route writes only its own request-scoped device KV).
+//! `forward_hidden` therefore clears this model's per-sequence state on both
+//! sides of the pass, whichever route runs: once before, so it never attends
+//! over a previous sequence's history (and so the MET-05 device-KV latch is
+//! cleared, making the host-KV path legal again), and once after, so it
+//! leaves nothing behind for whoever runs next.
 //!
-//! Neither goes through [`BonsaiModel::reset`], even though that is the
+//! None goes through [`BonsaiModel::reset`], even though that is the
 //! obvious way to say the same thing. `reset` additionally calls
 //! `MetalGraph::clear_global_kv_cache_if_present()`, and that cache is
 //! **process-global**: a `reset` issued by an embedding request would wipe the
@@ -120,10 +136,11 @@ impl BonsaiModel<'_> {
     /// what [`forward_core`](Self::forward) would have fed into
     /// `apply_lm_head`.
     ///
-    /// Runs the batched CPU prefill (see the module docs), whose GEMMs use
-    /// the best CPU tier regardless of `kernel`; `kernel` is what the
-    /// per-token fallback dispatches to when the batched pass declines this
-    /// model or input.
+    /// Runs the head-free Metal prefill when `kernel` is a GPU tier and the
+    /// model's fused weight cache is resident, else the batched CPU prefill
+    /// (see the module docs), whose GEMMs use the best CPU tier regardless of
+    /// `kernel`; `kernel` is also what the per-token fallback dispatches to
+    /// when the batched CPU pass declines this model or input.
     ///
     /// Resets per-sequence state before *and* after the pass — see the module
     /// docs. Positions are assigned `0..tokens.len()`, so the caller does not
@@ -155,6 +172,22 @@ impl BonsaiModel<'_> {
         // left by a fused GPU decode — would make position 0 attend over
         // another sequence's history.
         self.reset_embedding_sequence_state();
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        match self.try_metal_forward_hidden(tokens, kernel) {
+            Ok(Some(rows)) => {
+                // The Metal pass wrote nothing of this model's state; the
+                // reset keeps the "nothing survives an embedding" contract
+                // uniform across the routes.
+                self.reset_embedding_sequence_state();
+                return Ok(rows);
+            }
+            Ok(None) => {}
+            Err(e) => tracing::debug!(
+                error = %e,
+                tokens = tokens.len(),
+                "forward_hidden: the head-free Metal prefill failed; running the batched CPU pass"
+            ),
+        }
         let result = match self.forward_hidden_batched(tokens, hidden_size) {
             Ok(Some(rows)) => Ok(rows),
             Ok(None) => {

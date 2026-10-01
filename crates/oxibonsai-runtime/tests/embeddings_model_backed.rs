@@ -59,9 +59,11 @@
 //! # The benchmark
 //!
 //! `embed_bench_short_and_long` (section 6) times the production
-//! `InferenceEngine::embed` against the per-token loop it replaced, on the
-//! real 1.7B, and asserts the short-input speed-up. It runs only when asked
-//! (`OXIBONSAI_EMBED_BENCH=1`, release build).
+//! `InferenceEngine::embed` (the head-free Metal prefill on a GPU engine)
+//! against the batched CPU pass it superseded and the per-token loop both
+//! replaced, on a real model, and asserts parity, the short-input speed-up
+//! and the long-input wall-time target. It runs only when asked (`OXI_MODEL`
+//! or `OXIBONSAI_EMBED_BENCH=1`, release build).
 
 // `embeddings` is only compiled with the `server` feature; gate the whole file
 // the same way so `--no-default-features` stays green.
@@ -1233,42 +1235,61 @@ fn fmt_runs(times: &[f64]) -> String {
         .join(", ")
 }
 
-/// 10-, 200- and 2000-token embeddings on the real `Ternary-Bonsai-1.7B`:
-/// the production `InferenceEngine::embed` (the batched CPU prefill) against
-/// the per-token host-KV loop the same engine ran before
-/// (`BonsaiModel::forward_hidden_sequential` on a dispatcher built exactly
-/// as the engine's own), minimum of three runs per leg (a single run for the
-/// 2000-token per-token leg, which takes minutes), with the load average
-/// printed before and after.
+/// The 2000-token embedding's wall-time target on the production (Metal)
+/// route, seconds: a third of the request budget, so a long input still fits
+/// it on a loaded host.
+const LONG_INPUT_TARGET_SECS: f64 = 20.0;
+
+/// The real model and tokenizer the benchmark runs on: `$OXI_MODEL`, else the
+/// testkit resolver's `Ternary-Bonsai-1.7B.gguf`; the tokenizer from the
+/// resolver, else next to the model file. `None` when either is missing.
+fn bench_model_and_tokenizer() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let model = match std::env::var_os("OXI_MODEL").filter(|p| !p.is_empty()) {
+        Some(path) => std::path::PathBuf::from(path),
+        None => find_model("Ternary-Bonsai-1.7B.gguf")?,
+    };
+    let tokenizer = find_model("tokenizer.json").or_else(|| {
+        let beside = model.parent()?.join("tokenizer.json");
+        beside.is_file().then_some(beside)
+    })?;
+    Some((model, tokenizer))
+}
+
+/// 10-, 200- and 2000-token embeddings on a real model (the 1.7B by default):
+/// the production `InferenceEngine::embed` — the head-free Metal prefill on a
+/// GPU engine — against the batched CPU pass the same engine ran before it
+/// (`forward_hidden` on a CPU-tier dispatcher) and the per-token host-KV loop
+/// both replaced (`BonsaiModel::forward_hidden_sequential` on a dispatcher
+/// built exactly as the engine's own), minimum of three runs per leg (one
+/// run for the two slow legs at 1000+ tokens), with the load average printed
+/// beside every figure.
 ///
-/// Asserts the acceptance ratio on the 10-token input and that both legs
-/// agree (pooled cosine >= 0.9999); records the 2000-token wall time against
-/// the request budget. Runs only with `OXIBONSAI_EMBED_BENCH=1` and
-/// `OXIBONSAI_MODELS_DIR` set (release build), and self-skips — recording
-/// the skip — otherwise.
+/// Asserts that every leg agrees with the per-token reference (a pooled
+/// cosine of at least 0.9999), the acceptance ratio on the 10-token input,
+/// and — on a GPU
+/// engine — that the 2000-token embedding takes at most
+/// [`LONG_INPUT_TARGET_SECS`]. Runs when `OXI_MODEL` names a model or
+/// `OXIBONSAI_EMBED_BENCH=1` (release build), and self-skips — recording
+/// the skip — otherwise or when a file is missing.
 #[test]
 fn embed_bench_short_and_long() {
-    use oxibonsai_kernels::KernelDispatcher;
+    use oxibonsai_kernels::{KernelDispatcher, OneBitKernel};
 
     const TEST_NAME: &str =
         "oxibonsai-runtime::embeddings_model_backed::embed_bench_short_and_long";
-    if !std::env::var("OXIBONSAI_EMBED_BENCH").is_ok_and(|v| v == "1") {
-        eprintln!("{TEST_NAME}: set OXIBONSAI_EMBED_BENCH=1 (release build) to run -- skipping");
-        record_skipped(Capability::LegacyModels, TEST_NAME);
-        return;
-    }
-    if std::env::var_os("OXIBONSAI_MODELS_DIR").is_none_or(|d| d.is_empty()) {
-        eprintln!("{TEST_NAME}: OXIBONSAI_MODELS_DIR is not set -- skipping");
-        record_skipped(Capability::LegacyModels, TEST_NAME);
-        return;
-    }
-    let (Some(model_path), Some(tokenizer_path)) = (
-        find_model("Ternary-Bonsai-1.7B.gguf"),
-        find_model("tokenizer.json"),
-    ) else {
+    let requested = std::env::var("OXIBONSAI_EMBED_BENCH").is_ok_and(|v| v == "1")
+        || std::env::var_os("OXI_MODEL").is_some_and(|p| !p.is_empty());
+    if !requested {
         eprintln!(
-            "{TEST_NAME}: Ternary-Bonsai-1.7B.gguf or tokenizer.json missing under {:?} -- \
-             skipping",
+            "{TEST_NAME}: set OXI_MODEL (or OXIBONSAI_EMBED_BENCH=1) in a release build to \
+             run -- skipping"
+        );
+        record_skipped(Capability::LegacyModels, TEST_NAME);
+        return;
+    }
+    let Some((model_path, tokenizer_path)) = bench_model_and_tokenizer() else {
+        eprintln!(
+            "{TEST_NAME}: the model or tokenizer.json is missing (OXI_MODEL / {:?}) -- skipping",
             models_dir()
         );
         record_skipped(Capability::LegacyModels, TEST_NAME);
@@ -1277,7 +1298,7 @@ fn embed_bench_short_and_long() {
     let tokenizer = TokenizerBridge::from_file(
         tokenizer_path
             .to_str()
-            .expect("the models directory path is valid UTF-8"),
+            .expect("the tokenizer path is valid UTF-8"),
     )
     .expect("load the real tokenizer.json");
     let longest = BENCH_LENGTHS.iter().copied().max().unwrap_or(0);
@@ -1300,71 +1321,108 @@ fn embed_bench_short_and_long() {
         42,
         4096,
     )
-    .expect("load the real 1.7B through the production constructor");
+    .expect("load the real model through the production constructor");
     // The dispatcher the engine was built with (`Backend::Auto`), rebuilt so
     // the per-token leg can borrow the model mutably beside it.
     let per_token_kernel = KernelDispatcher::auto_detect();
     assert_eq!(per_token_kernel.tier(), engine.kernel_tier());
+    let cpu_kernel = KernelDispatcher::with_tier(oxibonsai_kernels::cpu_kernel_tier());
+    // `KernelTier::Gpu` exists only with the kernels' `gpu` feature; the
+    // dispatcher answers on every build.
+    let gpu_engine = per_token_kernel.is_gpu_accelerated();
     let hidden = engine.hidden_size();
     eprintln!(
-        "embed_bench: model {model_path:?}, engine tier {:?}; per-token leg on {:?}; load \
-         average before: {}",
+        "embed_bench: model {model_path:?}, engine tier {:?}; per-token leg on {:?}; batched \
+         CPU leg on {:?}; load average before: {}",
         engine.kernel_tier(),
         per_token_kernel.tier(),
+        cpu_kernel.tier(),
         load_average()
     );
 
     let mut short_speedup = None;
     for n in BENCH_LENGTHS {
         let tokens = &ids[..n];
-        let (batched_times, batched) =
-            time_runs(BENCH_RUNS, || engine.embed(tokens).expect("batched embed"));
-        let per_token_runs = if n >= 1000 { 1 } else { BENCH_RUNS };
-        let (per_token_times, per_token_rows) = time_runs(per_token_runs, || {
+        let slow_runs = if n >= 1000 { 1 } else { BENCH_RUNS };
+        let (production_times, production) = time_runs(BENCH_RUNS, || {
+            engine.embed(tokens).expect("production embed")
+        });
+        let (cpu_times, cpu_rows) = time_runs(slow_runs, || {
             engine
                 .dense_model_mut()
-                .expect("the 1.7B is a dense model")
+                .expect("a dense model")
+                .forward_hidden(tokens, &cpu_kernel)
+                .expect("batched CPU forward_hidden")
+        });
+        let (per_token_times, per_token_rows) = time_runs(slow_runs, || {
+            engine
+                .dense_model_mut()
+                .expect("a dense model")
                 .forward_hidden_sequential(tokens, &per_token_kernel)
                 .expect("per-token forward_hidden")
         });
         let per_token = pool_rows(&per_token_rows, hidden);
-        let cos = cosine(&batched, &per_token);
-        let batched_min = min_of(&batched_times);
+        let cpu = pool_rows(&cpu_rows, hidden);
+        let cos_production = cosine(&production, &per_token);
+        let cos_cpu = cosine(&cpu, &per_token);
+        let production_min = min_of(&production_times);
+        let cpu_min = min_of(&cpu_times);
         let per_token_min = min_of(&per_token_times);
-        let speedup = per_token_min / batched_min.max(f64::MIN_POSITIVE);
+        let speedup = per_token_min / production_min.max(f64::MIN_POSITIVE);
         eprintln!(
-            "embed_bench: {n} tokens: per-token loop min {per_token_min:.3} s [{}] ({} run(s)), \
-             batched min {batched_min:.3} s [{}]: {speedup:.1}x faster; pooled cos {cos:.6}; \
-             load {}",
+            "embed_bench: {n} tokens: production ({}) min {production_min:.3} s [{}]; batched \
+             CPU min {cpu_min:.3} s [{}] ({:.1}x slower than production); per-token loop min \
+             {per_token_min:.3} s [{}]: production {speedup:.1}x faster; pooled cos vs \
+             per-token: production {cos_production:.6}, batched CPU {cos_cpu:.6}; load {}",
+            if gpu_engine {
+                "Metal hidden prefill"
+            } else {
+                "batched CPU prefill"
+            },
+            fmt_runs(&production_times),
+            fmt_runs(&cpu_times),
+            cpu_min / production_min.max(f64::MIN_POSITIVE),
             fmt_runs(&per_token_times),
-            per_token_times.len(),
-            fmt_runs(&batched_times),
             load_average()
         );
         assert!(
-            f64::from(cos) >= 0.9999,
-            "{n} tokens: the batched embedding diverged from the per-token loop: cos {cos}"
+            f64::from(cos_production) >= 0.9999,
+            "{n} tokens: the production embedding diverged from the per-token loop: \
+             cos {cos_production}"
+        );
+        assert!(
+            f64::from(cos_cpu) >= 0.9999,
+            "{n} tokens: the batched CPU embedding diverged from the per-token loop: cos {cos_cpu}"
         );
         if n == BENCH_LENGTHS[0] {
             short_speedup = Some(speedup);
         }
         if n == longest {
             eprintln!(
-                "embed_bench: {n} tokens: batched wall time {batched_min:.3} s against the \
-                 {EMBED_REQUEST_BUDGET_SECS:.0} s request budget ({})",
-                if batched_min < EMBED_REQUEST_BUDGET_SECS {
-                    "under"
+                "embed_bench: {n} tokens: production wall time {production_min:.3} s (target \
+                 {LONG_INPUT_TARGET_SECS:.0} s, request budget {EMBED_REQUEST_BUDGET_SECS:.0} s: \
+                 {}); load {}",
+                if production_min <= LONG_INPUT_TARGET_SECS {
+                    "met"
                 } else {
-                    "OVER"
-                }
+                    "MISSED"
+                },
+                load_average()
             );
+            if gpu_engine {
+                assert!(
+                    production_min <= LONG_INPUT_TARGET_SECS,
+                    "{n} tokens: the Metal embedding took {production_min:.3} s, over the \
+                     {LONG_INPUT_TARGET_SECS} s target"
+                );
+            }
         }
     }
     eprintln!("embed_bench: load average after: {}", load_average());
     let short_speedup = short_speedup.unwrap_or(0.0);
     assert!(
         short_speedup >= SHORT_INPUT_MIN_SPEEDUP,
-        "{} tokens: the batched path must be at least {SHORT_INPUT_MIN_SPEEDUP}x faster than \
+        "{} tokens: the production path must be at least {SHORT_INPUT_MIN_SPEEDUP}x faster than \
          the per-token loop, measured {short_speedup:.2}x",
         BENCH_LENGTHS[0]
     );

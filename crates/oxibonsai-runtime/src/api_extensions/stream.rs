@@ -329,7 +329,8 @@ impl StreamChunks for ExtendedChunks {
 /// [`extended_chat_completions`] before it hands the lease over.
 pub(super) struct ExtendedStream {
     pub(super) lease: EngineLease,
-    pub(super) prompt_tokens: Vec<u32>,
+    /// The prompt: token ids, or text with images spliced in (SV-11).
+    pub(super) prompt: crate::vision_prefill::ChatPrompt,
     pub(super) max_tokens: usize,
     /// The request's sampling configuration ([`RequestSampling`]).
     pub(super) sampling: RequestSampling,
@@ -349,10 +350,13 @@ pub(super) struct ExtendedStream {
 ///
 /// Reachable for a single choice without JSON mode (`n > 1` and a
 /// `json_object`/`json_schema` `response_format` are refused with `400`
-/// before this runs); `tools` stream. The generation runs on the blocking
-/// pool under the request's [`RequestSampling`] (a seeded request on a
-/// freshly seeded sampler, so two identical seeded requests produce
-/// byte-identical streams), and a [`StreamDriver`] task feeds each token
+/// before this runs); `tools` and image content (SV-11) stream. The
+/// generation runs on the blocking pool under the request's
+/// [`RequestSampling`] (a seeded request on a freshly seeded sampler, so two
+/// identical seeded requests produce byte-identical streams), through
+/// [`crate::vision_prefill::ChatPrompt::generate_streaming`]: a text prompt
+/// as token ids, a multimodal one through the engine's multimodal prefill
+/// and the same decode loop. A [`StreamDriver`] task feeds each token
 /// through the response's [`ResponsePipeline`] — reasoning split, tool-call
 /// extraction, then the stop stage ([`stop_stage`], `RT-06`: text is only
 /// sent once it is provably outside any window that could still grow into a
@@ -366,7 +370,7 @@ pub(super) async fn extended_chat_completions_stream(
 ) -> axum::response::Response {
     let ExtendedStream {
         mut lease,
-        prompt_tokens,
+        prompt,
         max_tokens,
         sampling,
         stop_sequences,
@@ -381,7 +385,9 @@ pub(super) async fn extended_chat_completions_stream(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let prompt_len = prompt_tokens.len();
+    // An image counts as the rows it expands to, as on the non-streaming
+    // path.
+    let prompt_len = prompt.len();
 
     // A stop-sequence match (or a vanished client) cancels the generation.
     let cancel_token = lease.arm_cancellation();
@@ -396,7 +402,7 @@ pub(super) async fn extended_chat_completions_stream(
     tokio::task::spawn_blocking(move || {
         lease.reset();
         let result = sampling.run(&mut lease, |engine| {
-            engine.generate_streaming(&prompt_tokens, max_tokens, &token_tx)
+            prompt.generate_streaming(engine, max_tokens, &token_tx)
         });
         // A failed generation ends the stream with an error object, never
         // with a clean `"stop"` that would pass the failure off as an empty

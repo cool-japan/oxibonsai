@@ -190,11 +190,15 @@ pub(crate) fn parse_prefill_chunk(s: &str) -> Result<usize, String> {
     validate_prefill_chunk(v)
 }
 
-/// `--image-max-tokens <N>` (design §5.7, vision phase 2): the per-image
-/// token budget the downscale guard enforces. Must be at least 1.
+/// `--image-max-tokens <N>` (design §5.7 / §6.2): the per-image merged-token
+/// budget the preprocessing enforces. Must be in `1..=16384`.
 pub(crate) fn validate_image_max_tokens(v: usize) -> Result<usize, String> {
     if v < 1 {
         return Err("image-max-tokens must be >= 1".to_string());
+    }
+    let max = oxibonsai_model::vision::MAX_IMAGE_MAX_TOKENS;
+    if v > max {
+        return Err(format!("image-max-tokens must be <= {max}"));
     }
     Ok(v)
 }
@@ -384,13 +388,14 @@ pub(crate) enum Commands {
         min_p: Option<f32>,
 
         /// Which compute backend runs the model: `auto` (best available —
-        /// GPU when accelerated, CPU for a hybrid `qwen35` model such as
-        /// Bonsai 2, since no hybrid GPU encoder exists yet), `cpu` (best
-        /// CPU SIMD tier, regardless of GPU availability — including the
-        /// temperature-0 path, which never takes a GPU route under `cpu`),
-        /// or `metal` (the Metal GPU, or a typed, non-zero-exit error —
-        /// always, never a silent CPU fallback — when unavailable on this
-        /// build/host or when the model is a hybrid).
+        /// GPU when accelerated; for a hybrid `qwen35` model such as
+        /// Bonsai 2, the Metal hybrid runner when this build and host serve
+        /// it, else the best CPU tier), `cpu` (best CPU SIMD tier,
+        /// regardless of GPU availability — including the temperature-0
+        /// path, which never takes a GPU route under `cpu`), or `metal` (the
+        /// Metal GPU — the Metal hybrid runner for a hybrid model — or a
+        /// typed, non-zero-exit error, never a silent CPU fallback, when it
+        /// is unavailable on this build/host or cannot serve the model).
         #[arg(long, value_parser = parse_backend)]
         backend: Option<oxibonsai_runtime::engine_seam::Backend>,
 
@@ -457,23 +462,32 @@ pub(crate) enum Commands {
         prefill_chunk: Option<usize>,
 
         /// Vision projector GGUF (`clip` architecture, e.g.
-        /// `Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf`). Parsed and validated
-        /// now; the vision tower isn't wired up yet, so passing it is a
-        /// typed `NOT_YET_SUPPORTED` error, never a silently ignored flag.
+        /// `Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf`) for a Bonsai 2 (`qwen35`)
+        /// model: the Qwen3-VL tower is loaded once (about 1.7 GiB of `f32`
+        /// weights) and every `--image` is encoded into the prompt. Refused
+        /// for any other architecture, and for a projector the tower does
+        /// not recognise.
         #[arg(long)]
         mmproj: Option<String>,
 
-        /// Image input (path or http(s) URL; repeatable). Parsed and
-        /// validated now; the vision tower isn't wired up yet, so
-        /// passing it is a typed `NOT_YET_SUPPORTED` error, never a
-        /// silently ignored flag.
+        /// Image input (repeatable; needs --mmproj): a PNG or JPEG file, or
+        /// a base64 `data:image/...;base64,` URI. Implies --chat: each image
+        /// becomes a `<|vision_start|><|image_pad|><|vision_end|>` part of
+        /// the user turn, ahead of the prompt text, and its placeholder is
+        /// replaced by the image's merged rows. Remote `http(s)` URLs are
+        /// never fetched (a typed `image_url_fetch_disabled` error), even
+        /// with `OXI_ALLOW_IMAGE_URL_FETCH=1`, which only changes the
+        /// reason.
         #[arg(long)]
         image: Vec<String>,
 
-        /// Per-image token budget for the vision downscale guard (default
-        /// 1024, matching the reference demo). Must be >= 1. The vision
-        /// tower isn't wired up yet: passing it explicitly is a typed
-        /// `NOT_YET_SUPPORTED` error.
+        /// Per-image token budget (default 1024, the Bonsai demo's): an
+        /// image is smart-resized to multiples of 32 pixels exactly like
+        /// the reference (Pillow bicubic, aspect preserved) and downscaled
+        /// until its `(H / 32) * (W / 32)` merged grid fits; one that cannot
+        /// fit even at its smallest aspect-preserving size is refused
+        /// (`image_too_many_tokens`). Never upscales to reach it. Range
+        /// 1..=16384; needs --mmproj.
         #[arg(long, value_parser = parse_image_max_tokens)]
         image_max_tokens: Option<usize>,
 
@@ -736,17 +750,20 @@ pub(crate) enum Commands {
         #[arg(long, value_parser = parse_prefill_chunk)]
         prefill_chunk: Option<usize>,
 
-        /// Vision projector GGUF. See `run --help` — a typed
-        /// `NOT_YET_SUPPORTED` error until the vision tower lands.
+        /// Vision projector GGUF for a Bonsai 2 model, loaded once for the
+        /// session. See `run --help`.
         #[arg(long)]
         mmproj: Option<String>,
 
-        /// Image input (path or URL; repeatable). See `run --help` — a
-        /// typed `NOT_YET_SUPPORTED` error until the vision tower lands.
+        /// Image input (repeatable; needs --mmproj): attached to the first
+        /// user message of the session, ahead of its text, and re-sent with
+        /// every turn while that message stays in the context window. See
+        /// `run --help`.
         #[arg(long)]
         image: Vec<String>,
 
-        /// Per-image token budget (default 1024). See `run --help`.
+        /// Per-image token budget (default 1024; needs --mmproj). See
+        /// `run --help`.
         #[arg(long, value_parser = parse_image_max_tokens)]
         image_max_tokens: Option<usize>,
 
@@ -943,18 +960,27 @@ pub(crate) enum Commands {
         #[arg(long, value_parser = parse_prefill_chunk)]
         prefill_chunk: Option<usize>,
 
-        /// Vision projector GGUF. A typed `NOT_YET_SUPPORTED` error until
-        /// the vision tower lands (see `oxibonsai run --help`).
+        /// Vision projector GGUF for a Bonsai 2 model, loaded once at
+        /// startup: both chat endpoints then accept OpenAI `image_url`
+        /// content parts — base64 `data:` URIs, and `file://` references
+        /// inside the directory named by `OXI_MEDIA_PATH` when it is set.
+        /// Remote `http(s)` image URLs are never fetched (server-side
+        /// request forgery): a `400 image_url_fetch_disabled`, whatever
+        /// `OXI_ALLOW_IMAGE_URL_FETCH` says. Without this flag an image
+        /// request is a `400 vision_unavailable`. Image rows prefill on the
+        /// CPU model, so an image turn can outlast the default
+        /// --request-timeout-ms (a startup warning says so).
         #[arg(long)]
         mmproj: Option<String>,
 
-        /// Image input for the vision tower (path or URL; repeatable). A
-        /// typed `NOT_YET_SUPPORTED` error until the vision tower lands.
+        /// Not for `serve` (an error when given): a server receives images
+        /// as `image_url` content parts of each request. See `run --help`.
         #[arg(long)]
         image: Vec<String>,
 
-        /// Per-image token budget (default 1024). A typed
-        /// `NOT_YET_SUPPORTED` error when passed, until the vision tower lands.
+        /// Per-image token budget for request images (default 1024; needs
+        /// --mmproj). An image that cannot fit is a `400
+        /// image_too_many_tokens`. See `run --help`.
         #[arg(long, value_parser = parse_image_max_tokens)]
         image_max_tokens: Option<usize>,
 

@@ -21,7 +21,9 @@ use super::super::metal_full_layer::functions_3::{
     q1_layer_refs, resolve_q1_layer, resolve_q1_tail, resolve_ternary_layer, resolve_ternary_tail,
     shared_model_epoch, shared_q1_model_epoch, tail_part, ternary_layer_refs,
 };
-use super::super::metal_full_layer::{FullForwardLayerParams, FullForwardLayerParamsTernary};
+use super::super::metal_full_layer::{
+    CachedModelWeights, FullForwardLayerParams, FullForwardLayerParamsTernary,
+};
 use super::super::metal_graph::{MetalGraph, MetalGraphError};
 
 /// Reject a `layer_params` slice whose length disagrees with `n_layers`.
@@ -105,6 +107,73 @@ pub fn try_metal_full_forward_prefill(
         greedy_token_id_out,
     )
 }
+/// Cached twin of [`try_metal_full_forward_prefill`] for a **Q1** model:
+/// binds the handles of a [`CachedModelWeights::Q1`] (built once by
+/// `build_cached_weights`) instead of concatenating every layer's Q‖K‖V bytes
+/// and looking every weight up per call (perf-03). The handles are keyed
+/// exactly like the uncached path's, so both bind the same buffers and
+/// produce the same logits.
+///
+/// # Errors
+///
+/// A ternary cache, a zero-row LM head, or any encode / command-buffer
+/// failure, including a timeout.
+#[allow(clippy::too_many_arguments)]
+pub fn try_metal_full_forward_prefill_q1_cached(
+    hidden_batch: &[f32],
+    batch_size: usize,
+    pos_start: usize,
+    cached: &CachedModelWeights,
+    cos_table: &[f32],
+    sin_table: &[f32],
+    hidden_size: usize,
+    intermediate_size: usize,
+    nq: usize,
+    nkv: usize,
+    head_dim: usize,
+    eps: f32,
+    max_seq_len: usize,
+    final_norm_eps: f32,
+    lm_head_out_features: usize,
+    logits_out: Option<&mut Vec<f32>>,
+    greedy_token_id_out: Option<&mut u32>,
+) -> Result<(), MetalGraphError> {
+    let CachedModelWeights::Q1(q1) = cached else {
+        return Err(MetalGraphError::EncodingFailed(
+            "try_metal_full_forward_prefill_q1_cached invoked with a ternary weight cache".into(),
+        ));
+    };
+    if lm_head_out_features == 0 {
+        return Err(MetalGraphError::EncodingFailed(
+            "the cached Q1 prefill needs the LM head's row count".into(),
+        ));
+    }
+    let graph = MetalGraph::global()?;
+    let weight_refs = q1_layer_refs(&q1.layers);
+    graph.encode_full_forward_prefill(
+        hidden_batch,
+        pos_start,
+        batch_size,
+        q1.layers.len(),
+        &weight_refs,
+        cos_table,
+        sin_table,
+        hidden_size,
+        intermediate_size,
+        nq,
+        nkv,
+        head_dim,
+        eps,
+        max_seq_len,
+        Some(&q1.final_norm),
+        final_norm_eps,
+        Some(&q1.lm_head),
+        lm_head_out_features,
+        logits_out,
+        greedy_token_id_out,
+    )
+}
+
 /// Full-forward prefill for **verification** (speculative decoding).
 ///
 /// Runs all transformer layers then final-norm + LM-head on **every** batch

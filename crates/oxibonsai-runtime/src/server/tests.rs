@@ -501,27 +501,44 @@ mod embedder_wiring {
 
 // ── Real-model gates on the legacy ternary 1.7B (`OXI_MODEL` + `OXI_TOKENIZER`) ──
 //
-// Each test self-skips when either variable is unset, recording
-// `executed: false` under `Capability::LegacyModels` with the reason, and
-// records `executed: true` only after every assertion has passed. Neither
-// ever falls back to a relative `models/…` path. `gpu_argmax_routing` holds
-// the greedy-route gate, `real_model` the fallback-template gate. Run them
-// with:
+// Each test resolves the model/tokenizer from `OXI_MODEL`/`OXI_TOKENIZER`
+// when set, else through the testkit `models/`/`$OXIBONSAI_MODELS_DIR`
+// resolver (`real_model_paths`), and self-skips when neither locates a
+// file, recording `executed: false` under `Capability::LegacyModels` with
+// the reason. Each records `executed: true` only after every assertion has
+// passed. `gpu_argmax_routing` holds the greedy-route gate, `real_model` the
+// fallback-template gate. Run them with:
 //
 //   OXI_MODEL=<path>/Ternary-Bonsai-1.7B.gguf OXI_TOKENIZER=<path>/tokenizer.json \
 //     cargo test -p oxibonsai-runtime --release --all-features --lib -- \
 //     --test-threads=1 temperature_zero_completion_takes_the_metal_greedy_gpu_path \
 //     real_model_fallback_template_tool_call_and_no_think
 
-/// `OXI_MODEL` and `OXI_TOKENIZER`, or the recorded self-skip.
+/// `OXI_MODEL` and `OXI_TOKENIZER` when both are set explicitly, else the
+/// legacy 1.7B GGUF and its tokenizer resolved through the testkit
+/// `models/`/`$OXIBONSAI_MODELS_DIR` fallback (the same resolver
+/// `int8_native_forward_tests.rs` and its siblings use), else the recorded
+/// self-skip. An explicit `OXI_MODEL`/`OXI_TOKENIZER` always wins over the
+/// fallback for either half independently, so a developer pointing at a
+/// non-default file still gets it honoured.
 fn real_model_paths(test: &str) -> Option<(String, String)> {
     let var = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
-    match (var("OXI_MODEL"), var("OXI_TOKENIZER")) {
+    let model = var("OXI_MODEL").or_else(|| {
+        oxibonsai_testkit::workspace::find_model("Ternary-Bonsai-1.7B.gguf")
+            .map(|p| p.to_string_lossy().into_owned())
+    });
+    let tokenizer = var("OXI_TOKENIZER").or_else(|| {
+        oxibonsai_testkit::workspace::find_model("tokenizer.json")
+            .map(|p| p.to_string_lossy().into_owned())
+    });
+    match (model, tokenizer) {
         (Some(model), Some(tokenizer)) => Some((model, tokenizer)),
         _ => {
             eprintln!(
-                "capability report: {test} SKIPPED — set OXI_MODEL \
-                 (Ternary-Bonsai-1.7B.gguf) and OXI_TOKENIZER (its tokenizer.json)"
+                "capability report: {test} SKIPPED — set OXI_MODEL/OXI_TOKENIZER, or \
+                 OXIBONSAI_MODELS_DIR to a directory holding Ternary-Bonsai-1.7B.gguf and \
+                 tokenizer.json (checked: {:?})",
+                oxibonsai_testkit::workspace::models_dir()
             );
             oxibonsai_testkit::capability::record_skipped(
                 oxibonsai_testkit::capability::Capability::LegacyModels,
@@ -553,7 +570,7 @@ async fn post_text(app: Router, path: &str, body: &serde_json::Value) -> (Status
 /// `temperature: 0` on the real 1.7B: the fused Metal GPU-argmax route.
 mod gpu_argmax_routing {
     use super::*;
-    use oxibonsai_testkit::capability::{record_executed, record_skipped, Capability};
+    use oxibonsai_testkit::capability::{record_executed_timed, record_skipped, Capability};
 
     /// Legacy prompt 3.
     const P3_PROMPT: &str = "Once upon a time, in a small village by the sea,";
@@ -590,6 +607,7 @@ mod gpu_argmax_routing {
             record_skipped(Capability::LegacyModels, TEST);
             return;
         }
+        let start = std::time::Instant::now();
         let tokenizer = TokenizerBridge::from_file(&tokenizer_path).expect("OXI_TOKENIZER loads");
 
         // `SamplingParams::default()` carries `repetition_penalty: 1.0`,
@@ -627,7 +645,7 @@ mod gpu_argmax_routing {
              repetition_penalty is back"
         );
         assert_eq!(completion, P3_METAL_GREEDY_GOLDEN);
-        record_executed(Capability::LegacyModels, TEST);
+        record_executed_timed(Capability::LegacyModels, TEST, start.elapsed());
     }
 }
 
@@ -635,7 +653,7 @@ mod gpu_argmax_routing {
 /// and `enable_thinking: false`.
 mod real_model {
     use super::*;
-    use oxibonsai_testkit::capability::{record_executed, Capability};
+    use oxibonsai_testkit::capability::{record_executed_timed, Capability};
 
     /// The weather tool every tool-calling request below advertises.
     fn weather_tools() -> serde_json::Value {
@@ -675,6 +693,7 @@ mod real_model {
         let Some((model_path, tokenizer_path)) = real_model_paths(TEST) else {
             return;
         };
+        let start = std::time::Instant::now();
         let tokenizer = TokenizerBridge::from_file(&tokenizer_path).expect("OXI_TOKENIZER loads");
         let engine = InferenceEngine::from_gguf_path(
             &model_path,
@@ -781,7 +800,7 @@ mod real_model {
             message.get("reasoning_content").is_none(),
             "reasoning_content must be absent: {json}"
         );
-        record_executed(Capability::LegacyModels, TEST);
+        record_executed_timed(Capability::LegacyModels, TEST, start.elapsed());
     }
 }
 

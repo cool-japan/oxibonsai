@@ -36,6 +36,17 @@
 //! text) are refused with `400`. `stream_options.include_usage` adds the
 //! usage chunk, as on the base endpoint.
 //!
+//! # Images
+//!
+//! `SV-11` — with a vision projector loaded at startup, `image_url` content
+//! parts are honoured exactly as on the base endpoint, streamed or not: the
+//! template renders each image as its vision placeholder, the image is
+//! resolved (a base64 `data:` URI, or a `file://` reference inside the
+//! server's media directory), decoded, preprocessed and encoded, and its
+//! rows replace the placeholder (`crate::vision_prefill`). Each image counts
+//! as the rows it expands to — in `usage.prompt_tokens` and in the context
+//! budget, which is checked before any vision-tower work is spent.
+//!
 //! # Other behaviour
 //!
 //! - `RT-05` — `usage.completion_tokens` is the real number of tokens the
@@ -51,6 +62,10 @@
 //! - `TOK-M2` — the prompt goes through the same template render and
 //!   vocabulary-driven special-token guard as the base endpoint
 //!   (`chat_render::render_chat_prompt`).
+//! - `sec-05` (token half) — a prompt that cannot fit is refused with `400`
+//!   naming the real numbers (`context_length_exceeded` /
+//!   `max_input_tokens_exceeded`), exactly as the base endpoint refuses it,
+//!   instead of failing inside the engine.
 
 use axum::{
     extract::State,
@@ -231,6 +246,26 @@ fn idempotency_cache_key(header_value: &str, req: &ExtendedChatRequest) -> Strin
     format!("{header_value}:{:x}", hasher.finish())
 }
 
+/// [`idempotency_cache_key`] for a request that may carry images (SV-11):
+/// the typed request only holds each message's flattened text, so the
+/// image references are folded in too — two requests that differ only in
+/// their pictures must never replay each other's completion. A request
+/// without images keeps exactly the text-only key.
+fn idempotency_cache_key_with_images(
+    header_value: &str,
+    req: &ExtendedChatRequest,
+    image_references: &[String],
+) -> String {
+    use std::hash::{Hash, Hasher};
+    let key = idempotency_cache_key(header_value, req);
+    if image_references.is_empty() {
+        return key;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    image_references.hash(&mut hasher);
+    format!("{key}:img{:x}", hasher.finish())
+}
+
 /// Handler for `POST /v1/chat/completions/extended`.
 ///
 /// Supports all standard fields plus `tools`, `tool_choice`, `logprobs`,
@@ -240,6 +275,9 @@ fn idempotency_cache_key(header_value: &str, req: &ExtendedChatRequest) -> Strin
 /// rather than silently clamped.
 pub async fn extended_chat_completions(
     State(state): State<Arc<AppState>>,
+    // SV-11: the vision projector loaded at startup (`--mmproj`), attached
+    // to the router as an extension; `None` for a text-only server.
+    vision: Option<axum::Extension<Arc<crate::vision_prefill::VisionService>>>,
     headers: HeaderMap,
     // Raw JSON in place of `Json<ExtendedChatRequest>` directly — the typed
     // request is still built from these same bytes immediately below
@@ -255,23 +293,32 @@ pub async fn extended_chat_completions(
     Json(raw): Json<Box<serde_json::value::RawValue>>,
 ) -> impl IntoResponse {
     // SV-11: recover what `ChatMessage.content: Option<String>` cannot
-    // represent (a vision-shaped content array — flattened here or
-    // honestly rejected, never silently schema-error'd) and what it has no
-    // field for at all (`reasoning_content` on a replayed assistant turn)
-    // from the raw body, BEFORE the typed parse below — mirrors
+    // represent (a content-parts array — its text flattened into the typed
+    // field, its image parts kept for the renderer, never silently
+    // schema-error'd or dropped) and what it has no field for at all
+    // (`reasoning_content` on a replayed assistant turn) from the raw body,
+    // BEFORE the typed parse below — mirrors
     // `server/chat.rs::chat_completions`'s identical wiring. `extras` still
-    // parses from the ORIGINAL `raw.get()` text (not `rewritten`) — see
+    // parses from the ORIGINAL `raw.get()` text (not the rewrite) — see
     // `preprocess_message_content_and_reasoning`'s own doc for why that
     // matters for `tools`' key order.
-    let (rewritten, reasoning_contents) =
-        match chat_render::preprocess_message_content_and_reasoning(raw.get()) {
-            Ok(pair) => pair,
-            Err(e) => {
-                state.metrics().errors_total.inc();
-                return crate::http_error::error_response(e.status(), e.message(), None);
-            }
-        };
-    let req: ExtendedChatRequest = match serde_json::from_str(&rewritten) {
+    let preprocessed = match chat_render::preprocess_message_content_and_reasoning(raw.get()) {
+        Ok(pre) => pre,
+        Err(e) => {
+            state.metrics().errors_total.inc();
+            return crate::http_error::error_response(e.status(), e.message(), None);
+        }
+    };
+    let vision = vision.map(|axum::Extension(service)| service);
+    let image_references = preprocessed.image_references();
+    if !image_references.is_empty() && vision.is_none() {
+        state.metrics().errors_total.inc();
+        return chat_render::api_error_from_multimodal(
+            &crate::vision_prefill::MultimodalError::VisionUnavailable,
+        )
+        .into_response();
+    }
+    let req: ExtendedChatRequest = match serde_json::from_str(&preprocessed.rewritten) {
         Ok(r) => r,
         Err(e) => {
             state.metrics().errors_total.inc();
@@ -414,8 +461,9 @@ pub async fn extended_chat_completions(
     // `SV-32`: only the non-streaming path is idempotency-cached — see
     // `idempotency_cache`'s docs for why streaming is excluded. The cache
     // key folds in a fingerprint of the request body
-    // (`idempotency_cache_key`) so a repeated header value with a different
-    // body cannot return a different client's cached completion.
+    // (`idempotency_cache_key`, plus the image references of a multimodal
+    // request) so a repeated header value with a different body cannot
+    // return a different client's cached completion.
     let idempotency_key = if stream {
         None
     } else {
@@ -423,7 +471,9 @@ pub async fn extended_chat_completions(
             .get("idempotency-key")
             .and_then(|v| v.to_str().ok())
             .filter(|s| !s.is_empty())
-            .map(|header_value| idempotency_cache_key(header_value, &req))
+            .map(|header_value| {
+                idempotency_cache_key_with_images(header_value, &req, &image_references)
+            })
     };
     if let Some(key) = idempotency_key.as_deref() {
         if let Some((status, body)) = idempotency_cache().get(key) {
@@ -466,14 +516,19 @@ pub async fn extended_chat_completions(
     // tokens) is preserved despite the single combined encode.
     let (prompt_tokens, rendered) = match state.tokenizer() {
         Some(tok) => {
-            let render_messages =
-                chat_render::to_render_messages(&req.messages, &reasoning_contents);
+            // A message carrying images renders from its content parts,
+            // each image as the template's placeholder (SV-11).
+            let render_messages = chat_render::to_render_messages_with_parts(
+                &req.messages,
+                &preprocessed.reasoning_contents,
+                &preprocessed.content_parts,
+            );
             let opts = oxibonsai_tokenizer::chat_templates::RenderOptions {
                 add_generation_prompt: true,
                 enable_thinking: extras.effective_enable_thinking(),
                 reasoning_effort: extras.effective_reasoning_effort(),
                 preserve_thinking: extras.effective_preserve_thinking(),
-                add_vision_id: false,
+                add_vision_id: extras.effective_add_vision_id(),
                 tools: extras.tools_raw_json(),
             };
             match chat_render::render_chat_prompt(
@@ -492,7 +547,18 @@ pub async fn extended_chat_completions(
             }
         }
         // No vocabulary to render into: the configured prompt start token,
-        // or `400 tokenizer_required`.
+        // or `400 tokenizer_required` — always for image content, whose
+        // placeholders only exist in a rendered template.
+        None if !image_references.is_empty() => {
+            state.metrics().errors_total.inc();
+            return crate::server::api_error::ApiError::bad_request(
+                "image content needs the model's tokenizer to render its placeholders, and this \
+                 server has none",
+                "messages",
+            )
+            .with_code("tokenizer_required")
+            .into_response();
+        }
         None => match state.tokenizerless_prompt("messages") {
             Ok(tokens) => {
                 crate::server::warn_generating_without_tokenizer("/v1/chat/completions/extended");
@@ -505,29 +571,67 @@ pub async fn extended_chat_completions(
         },
     };
 
+    // SV-11: images resolved, decoded, preprocessed and spliced against the
+    // rendered ids, then encoded; a text-only request is its token ids.
+    let pending =
+        match chat_render::prepare_chat_prompt(prompt_tokens, image_references, vision).await {
+            Ok(pending) => pending,
+            Err(err) => {
+                state.metrics().errors_total.inc();
+                return err.into_response();
+            }
+        };
+
     // How each choice's tokens split into reasoning, content and tool
     // calls, from the loaded vocabulary and the actual rendered prompt.
     let shape = ResponseShape::resolve(
         state.tokenizer(),
-        &prompt_tokens,
+        pending.tokens(),
         rendered.as_deref(),
         tools.is_some(),
     );
 
-    let prompt_len = prompt_tokens.len();
+    // The real loaded-model descriptor, resolved once: its context length
+    // bounds the request just below, its id is the response `model` field.
+    // MUST run before the engine is acquired below: on an uncached first
+    // call, `ServedModelInfo::descriptor` acquires its own (briefly held)
+    // lease from this same pool, so calling it while `lease` below is already
+    // held would self-deadlock a single-replica pool waiting on a permit only
+    // this request holds.
+    let descriptor = state.model_info().descriptor().await;
+
+    // sec-05 (token half), as on the base endpoint: an over-long prompt is a
+    // `400` naming the real numbers rather than an engine failure midway
+    // through generation, and — an image counting as the rows it expands
+    // to — it is refused before any vision-tower work is spent on it. Each
+    // of the `n` choices generates from the same prompt independently, so
+    // the per-choice budget is the whole budget.
+    if let Err(err) = crate::server::validate_request_budget(
+        pending.len(),
+        max_tokens,
+        descriptor.max_context_length,
+        state.limits().max_input_tokens,
+    ) {
+        state.metrics().errors_total.inc();
+        return err.into_response();
+    }
+
+    // An image counts as the rows it expands to.
+    let prompt_len = pending.len();
+    let prompt = match pending.encode().await {
+        Ok(prompt) => prompt,
+        Err(err) => {
+            state.metrics().errors_total.inc();
+            return err.into_response();
+        }
+    };
     state
         .metrics()
         .prompt_tokens_total
         .inc_by(prompt_len as u64);
 
-    // Resolve the real loaded-model id once, for both the response `model`
-    // field and the fingerprint input. MUST run before the engine is
-    // acquired below: on an uncached first call,
-    // `ServedModelInfo::descriptor` acquires its own (briefly held) lease
-    // from this same pool, so calling it while `lease` below is already held
-    // would self-deadlock a single-replica pool waiting on a permit only
-    // this request holds.
-    let model_id = state.model_info().descriptor().await.id;
+    // The response `model` field and the fingerprint input.
+    let model_id = descriptor.id;
 
     // Acquire the engine once, both to serve the request and to seed the
     // per-request `SamplingParams` from the engine's own ambient/startup
@@ -556,11 +660,13 @@ pub async fn extended_chat_completions(
     );
 
     if stream {
+        // A text prompt streams from its token ids, a multimodal one through
+        // the engine's multimodal prefill (SV-11).
         return extended_chat_completions_stream(
             Arc::clone(&state),
             ExtendedStream {
                 lease,
-                prompt_tokens,
+                prompt,
                 max_tokens,
                 sampling: RequestSampling {
                     params: sampling_params,
@@ -606,18 +712,11 @@ pub async fn extended_chat_completions(
                             None => format!("<{id}>"),
                         }
                     };
-                    engine
-                        .generate_with_logprobs(
-                            &prompt_tokens,
-                            max_tokens,
-                            top_logprobs_k,
-                            &id_to_token,
-                        )
+                    prompt
+                        .generate_with_logprobs(engine, max_tokens, top_logprobs_k, &id_to_token)
                         .map(|(toks, lp)| (toks, Some(lp)))
                 } else {
-                    engine
-                        .generate(&prompt_tokens, max_tokens)
-                        .map(|toks| (toks, None))
+                    prompt.generate(engine, max_tokens).map(|toks| (toks, None))
                 }
             });
             match outcome {

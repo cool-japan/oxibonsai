@@ -130,7 +130,9 @@ pub(crate) struct ServeArgs {
     pub(crate) max_output_tokens: Option<usize>,
     pub(crate) ptq1_transcode: bool,
     pub(crate) prefill_chunk: Option<usize>,
-    /// §5.7 vision flags: validated, then a typed `NOT_YET_SUPPORTED`.
+    /// §5.7 vision flags: `--mmproj` loads the projector once and every
+    /// chat endpoint accepts `image_url` content parts (`--image` is
+    /// refused: a server takes images from requests).
     pub(crate) vision: bonsai2::VisionRequest,
     pub(crate) embedding_backend: EmbeddingBackendChoice,
     /// `--embedding-corpus`: the documents `--embedding-backend tfidf`
@@ -173,7 +175,7 @@ pub(crate) async fn run(args: ServeArgs) -> anyhow::Result<()> {
         embedding_corpus,
     } = args;
 
-    vision.reject_until_supported()?;
+    vision.validate(false)?;
     // `--embedding-backend tfidf`: the corpus is read and validated before
     // any model is resolved or loaded.
     let tfidf_corpus = resolve_tfidf_corpus(embedding_backend, embedding_corpus.as_deref())?;
@@ -273,6 +275,26 @@ pub(crate) async fn run(args: ServeArgs) -> anyhow::Result<()> {
         max_seq_len,
         rope_scaling,
     )?;
+    // The vision projector (design §6.2), loaded once and shared read-only
+    // by every request: `image_url` content parts resolve under the server
+    // policy (`data:` URIs; `file://` only inside `OXI_MEDIA_PATH`).
+    let vision_service = vision.load_service(&arch, bonsai2::server_image_policy())?;
+    if vision_service.is_some() {
+        tracing::info!(
+            media_root = ?std::env::var(bonsai2::MEDIA_PATH_ENV).ok(),
+            "serving image_url content parts on /v1/chat/completions and \
+             /v1/chat/completions/extended"
+        );
+        if request_timeout_ms < VISION_REQUEST_TIMEOUT_HINT_MS {
+            tracing::warn!(
+                request_timeout_ms,
+                "an image turn runs its vision encode and the prefill of every image row on the \
+                 CPU model (on the 27B a 48-row image prompt takes about 40 s to prefill, and \
+                 the prefill grows with the image's rows): raise --request-timeout-ms if image \
+                 requests time out"
+            );
+        }
+    }
 
     // RT-17: the model's own sampling defaults are the pool's baseline.
     let declared = oxibonsai_runtime::sampling::GgufSamplingDefaults::from_metadata(&gguf.metadata);
@@ -459,6 +481,13 @@ pub(crate) async fn run(args: ServeArgs) -> anyhow::Result<()> {
         ));
     }
 
+    // The chat endpoints pick the projector up from this extension; without
+    // it an image request is a typed `vision_unavailable` refusal.
+    let router = match vision_service {
+        Some(service) => router.layer(axum::Extension(service)),
+        None => router,
+    };
+
     // ── Hardening: a flag wins over its `OXIBONSAI_*` env var ──────────────
     let max_body_bytes = max_body_bytes
         .map(|b| usize::try_from(b).unwrap_or(usize::MAX))
@@ -514,6 +543,11 @@ pub(crate) async fn run(args: ServeArgs) -> anyhow::Result<()> {
 /// Vocabulary cap (`max_features`) of the TF-IDF embedder: the same
 /// dimension the runtime router's own embeddings registry is built with.
 const TFIDF_MAX_FEATURES: usize = 512;
+
+/// Below this `--request-timeout-ms`, a server that loaded `--mmproj` warns
+/// at startup: an image turn's CPU prefill alone can take minutes on the
+/// 27B.
+const VISION_REQUEST_TIMEOUT_HINT_MS: u64 = 300_000;
 
 /// Validate the `--embedding-backend` / `--embedding-corpus` pair and read
 /// the corpus (one document per non-blank line). `Ok(None)` for every

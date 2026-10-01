@@ -21,6 +21,7 @@
 //!    were allocated for, so the cache can be **grow-only and bucketed**
 //!    instead of exact-match on `batch_size`.
 
+use metal::objc::rc::autoreleasepool;
 use metal::{Buffer, ComputePipelineState, Device, MTLSize};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -281,9 +282,10 @@ pub(crate) fn batched_attention_supported(nq: usize, nkv: usize, head_dim: usize
 }
 
 /// Resolve one entry point of the combined metallib, logging (not
-/// propagating) a failure.
+/// propagating) a failure. The lookup autoreleases the name string it hands
+/// Metal (and any error it reads back); both are drained before it returns.
 fn resolve_pipeline(graph: &MetalGraph, name: &str) -> Option<ComputePipelineState> {
-    match graph.pipeline_for(name) {
+    match autoreleasepool(|| graph.pipeline_for(name)) {
         Ok(pso) => Some(pso),
         Err(e) => {
             tracing::info!("batched prefill attention: pipeline '{name}' unavailable ({e})");
@@ -430,6 +432,12 @@ impl MetalGraph {
 mod tests {
     use super::*;
 
+    /// A drain deadline no idle session gets near: nothing is parked in a
+    /// freshly built graph, so the drain returns at once.
+    fn far_deadline() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(60)
+    }
+
     #[test]
     fn capacity_buckets_round_up_and_are_monotone() {
         assert_eq!(prefill_batch_capacity(0), PREFILL_BATCH_BUCKET);
@@ -482,7 +490,7 @@ mod tests {
         let before_first = MetalGraph::prefill_buffer_alloc_count();
         for &n in &lengths {
             let guard = graph
-                .acquire_prefill_buffers(n, h, inter, nq, nkv, hd, max_seq)
+                .acquire_prefill_buffers(n, h, inter, nq, nkv, hd, max_seq, far_deadline())
                 .expect("acquire_prefill_buffers");
             let cache = guard.as_ref().expect("buffers allocated");
             assert!(cache.capacity() >= n);
@@ -500,7 +508,7 @@ mod tests {
         let before_second = MetalGraph::prefill_buffer_alloc_count();
         for &n in &lengths {
             let _guard = graph
-                .acquire_prefill_buffers(n, h, inter, nq, nkv, hd, max_seq)
+                .acquire_prefill_buffers(n, h, inter, nq, nkv, hd, max_seq, far_deadline())
                 .expect("acquire_prefill_buffers");
         }
         assert_eq!(
@@ -542,6 +550,21 @@ mod tests {
             src.matches("self.dispatch_gemm_tq2_prefill(").count(),
             4,
             "all four ternary prefill GEMMs must go through the v10/v7 selector (perf-02)"
+        );
+        assert_eq!(
+            src.matches("self.dispatch_gemm_q1_prefill(").count(),
+            4,
+            "the Q1 prefill's QKV, O, gate-up and down GEMMs must all go through the \
+             tiled/row-wise selector (M-18): the row-wise kernel alone is the super-linear prefill"
+        );
+        assert_eq!(
+            src.matches("self.dispatch_gate_up_q1_prefill(").count(),
+            1,
+            "the Q1 layer encoder must route gate-up + SwiGLU through its selector (M-18)"
+        );
+        assert!(
+            src.contains("commit_and_wait_bounded(cmd, run.label, deadline)"),
+            "every prefill command buffer must be waited on against the deadline (M-18)"
         );
     }
 

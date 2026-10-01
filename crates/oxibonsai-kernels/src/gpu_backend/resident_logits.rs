@@ -8,6 +8,7 @@
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
 use super::{metal_graph, MetalGraph, MetalGraphError, MAX_RESIDENT_TOPK};
+use metal::objc::rc::autoreleasepool;
 
 /// The `k` highest `(token id, logit)` pairs of the last fused forward's
 /// logit row, as the GPU `topk_f32` kernel produced them.
@@ -54,60 +55,62 @@ pub fn metal_resident_logits_topk(
     vocab: usize,
     k: usize,
 ) -> Result<ResidentLogitsTopK, MetalGraphError> {
-    use metal::MTLResourceOptions;
+    autoreleasepool(|| {
+        use metal::MTLResourceOptions;
 
-    if vocab == 0 || k == 0 {
-        return Err(MetalGraphError::InvalidDimensions(format!(
-            "metal_resident_logits_topk: vocab={vocab} and k={k} must both be > 0"
-        )));
-    }
-    let k = k.min(vocab).min(MAX_RESIDENT_TOPK);
-    let vocab_u32 = u32::try_from(vocab).map_err(|_| {
-        MetalGraphError::InvalidDimensions(format!(
-            "metal_resident_logits_topk: vocab={vocab} does not fit u32"
-        ))
-    })?;
-    let k_u32 = u32::try_from(k).map_err(|_| {
-        MetalGraphError::InvalidDimensions(format!(
-            "metal_resident_logits_topk: k={k} does not fit u32"
-        ))
-    })?;
+        if vocab == 0 || k == 0 {
+            return Err(MetalGraphError::InvalidDimensions(format!(
+                "metal_resident_logits_topk: vocab={vocab} and k={k} must both be > 0"
+            )));
+        }
+        let k = k.min(vocab).min(MAX_RESIDENT_TOPK);
+        let vocab_u32 = u32::try_from(vocab).map_err(|_| {
+            MetalGraphError::InvalidDimensions(format!(
+                "metal_resident_logits_topk: vocab={vocab} does not fit u32"
+            ))
+        })?;
+        let k_u32 = u32::try_from(k).map_err(|_| {
+            MetalGraphError::InvalidDimensions(format!(
+                "metal_resident_logits_topk: k={k} does not fit u32"
+            ))
+        })?;
 
-    let graph = MetalGraph::global()?;
-    let guard = graph
-        .logits_buf
-        .lock()
-        .map_err(|_| MetalGraphError::ExecutionFailed("logits_buf lock poisoned".into()))?;
-    let logits = guard
-        .as_ref()
-        .ok_or(MetalGraphError::BufferCreationFailed)?;
-    let needed = (vocab as u64).saturating_mul(4);
-    if logits.length() < needed {
-        return Err(MetalGraphError::BufferCreationFailed);
-    }
+        let graph = MetalGraph::global()?;
+        let guard = graph
+            .logits_buf
+            .lock()
+            .map_err(|_| MetalGraphError::ExecutionFailed("logits_buf lock poisoned".into()))?;
+        let logits = guard
+            .as_ref()
+            .ok_or(MetalGraphError::BufferCreationFailed)?;
+        let needed = (vocab as u64).saturating_mul(4);
+        if logits.length() < needed {
+            return Err(MetalGraphError::BufferCreationFailed);
+        }
 
-    let shared = MTLResourceOptions::StorageModeShared;
-    let ids_buf = metal_graph::alloc_buf(&graph.device, (k as u64) * 4, shared)?;
-    let vals_buf = metal_graph::alloc_buf(&graph.device, (k as u64) * 4, shared)?;
+        let shared = MTLResourceOptions::StorageModeShared;
+        let ids_buf = metal_graph::alloc_buf(&graph.device, (k as u64) * 4, shared)?;
+        let vals_buf = metal_graph::alloc_buf(&graph.device, (k as u64) * 4, shared)?;
 
-    let cmd = graph.command_queue.new_command_buffer();
-    let encoder = cmd.new_compute_command_encoder();
-    let dispatched =
-        graph.dispatch_topk_f32(encoder, logits, &ids_buf, &vals_buf, vocab_u32, k_u32);
-    encoder.end_encoding();
-    dispatched?;
-    metal_graph::commit_and_wait(cmd, "resident logits top-k")?;
+        let cmd = graph.command_queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+        let dispatched =
+            graph.dispatch_topk_f32(encoder, logits, &ids_buf, &vals_buf, vocab_u32, k_u32);
+        encoder.end_encoding();
+        dispatched?;
+        metal_graph::commit_and_wait(cmd, "resident logits top-k")?;
 
-    let mut ids = vec![0u32; k];
-    let mut values = vec![0.0f32; k];
-    // SAFETY: both buffers are `StorageModeShared`, non-null (checked by
-    // `alloc_buf`), hold exactly `k` 4-byte elements, and the command buffer
-    // that wrote them has completed (`commit_and_wait` returned `Ok`).
-    unsafe {
-        std::ptr::copy_nonoverlapping(ids_buf.contents() as *const u32, ids.as_mut_ptr(), k);
-        metal_graph::download_f32(&vals_buf, &mut values);
-    }
-    Ok(ResidentLogitsTopK { ids, values })
+        let mut ids = vec![0u32; k];
+        let mut values = vec![0.0f32; k];
+        // SAFETY: both buffers are `StorageModeShared`, non-null (checked by
+        // `alloc_buf`), hold exactly `k` 4-byte elements, and the command buffer
+        // that wrote them has completed (`commit_and_wait` returned `Ok`).
+        unsafe {
+            std::ptr::copy_nonoverlapping(ids_buf.contents() as *const u32, ids.as_mut_ptr(), k);
+            metal_graph::download_f32(&vals_buf, &mut values);
+        }
+        Ok(ResidentLogitsTopK { ids, values })
+    })
 }
 
 /// Download the full logit row the last fused forward on this thread's Metal

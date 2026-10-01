@@ -363,69 +363,55 @@ impl PrefillMemoryEstimate {
 /// Default prompt length above which [`crate::model::BonsaiModel::forward_prefill`]
 /// splits a prompt into chunks (M-18).
 ///
-/// **How this number was chosen.** The caveat carried from M-18's verdict is
-/// real: on macOS `forward_prefill` attempts a fused Metal batch path *per
-/// call*, so chunking changes GPU dispatch granularity for long prompts, and
-/// a small default could cost more than the peak-memory bound it buys. That
-/// trade-off needed a real model on real hardware to settle, and the wave
-/// that first wrote this constant ran in a worktree whose `models/` was
-/// empty — the measurement below (PERF-CPU-PREFILL verifier pass) is what
-/// closed it. Independently of that measurement, 4096 was already a safe
-/// starting point:
+/// On macOS `forward_prefill` runs the fused Metal batch prefill **per
+/// chunk**, so this is that path's per-call granularity: every call pays its
+/// own embedding gather, RoPE tables and weight binding, and inside a call
+/// the kernels already run the prompt in bounded micro-batches
+/// (`PREFILL_LOGITS_MICRO_BATCH` rows per command buffer), so a chunk no
+/// longer bounds GPU memory or the length of a command buffer. The CPU path
+/// is indifferent too: `BonsaiModel::forward_prefill_cpu` sub-divides every
+/// call into `CPU_PREFILL_MICRO_BATCH`-row passes of its own.
 ///
-/// * The longest prompt any test in the workspace hands to `forward_prefill`
-///   is 20 tokens (`cuda_synthetic_prefill_parity`), so at 4096 every test
-///   takes exactly the single-shot path it took before, byte for byte.
-/// * 4096 is also the historical `MAX_PREALLOC_CONTEXT`, i.e. the context most
-///   deployments actually run with, so the default changes nothing for them
-///   either.
+/// **Measured** (`real_model_metal_prefill_chunk_size_sweep`: the real
+/// GGUF loaded the way a Metal engine loads it — weights uploaded, fused
+/// weight cache resident, the fused route pinned — Apple M3, release,
+/// microseconds per prompt token; "sequential" is `forward` token by token,
+/// the path the fused prefill replaces; load average 6-20 on a shared
+/// host). Before the tiled Q1 prefill GEMM, the Bonsai-8B one-bit route was
+/// slower than sequential decode at every size (the M-18 finding; its
+/// row-wise GEMM re-read every input column once per weight row, so its
+/// per-token cost grew with the call). "After" is the tiled Q1 / ternary
+/// prefill GEMMs with the reworked flash attention:
 ///
-/// Callers that *want* chunking set it explicitly through
+/// | model, prompt | chunk 0 | 128 | 256 | 512 | 1024 | 4096 | sequential |
+/// |---|---:|---:|---:|---:|---:|---:|---:|
+/// | Bonsai-8B, 512 tokens, before | 147 414 | 60 054 | 80 330 | 147 414 | 147 414 | 147 414 | 48 009 |
+/// | Bonsai-8B, 4096 tokens, after | 6 702 | 7 014 | 6 738 | 6 759 | 7 165 | 6 702 | 78 507 |
+/// | Ternary-Bonsai-1.7B, 4096 tokens, before | 2 571 | 2 849 | 2 603 | 2 422 | 2 443 | 2 571 | 33 514 |
+/// | Ternary-Bonsai-1.7B, 4096 tokens, after | 1 819 | 1 937 | 1 800 | 1 694 | 1 706 | 1 819 | 32 729 |
+///
+/// At 256 tokens in one call the fused prefill costs 5 635 µs/token on
+/// Bonsai-8B against 46 245 for sequential decode (8.2x; before: 82 951
+/// against 43 413, 0.52x) and 1 276 against 15 137 on Ternary-Bonsai-1.7B
+/// (11.9x). A whole 4096-token prompt takes 27.5 s fused against 321.6 s
+/// decoded token by token on Bonsai-8B (7.4 s against 134.1 s on the 1.7B),
+/// and the per-token cost grows 1.19x (1.43x) from 256 to 4096 tokens — the
+/// attention term, which is inherently quadratic.
+///
+/// Chunking moves the cost by less than 10 % either way — within the load
+/// drift of a shared host, the arms running one after another — except that
+/// 128-token chunks are dearer than one call on both models: per-call
+/// overhead, repeated 32 times. So the default is the largest chunk that
+/// still bounds a call's host-side staging (the `[chunk x hidden]` embedding
+/// batch, 64 MiB on the 8B at 4096): **4096** — one call for every prompt of
+/// the historical 4096-token context, 4096-token chunks beyond it. It is
+/// ratified together with the prefill router in `forward_metal.rs`, which
+/// keeps a model whose fused path measures slower than decode on the
+/// sequential route and bounds every fused call by a deadline.
+///
+/// Callers that *want* smaller chunks set them through
 /// [`crate::model::BonsaiModel::set_prefill_chunk_tokens`]; the runtime's own
 /// `InferenceEngine::set_prefill_chunk_tokens` is the same knob one level up.
-///
-/// **What the batched CPU prefill changed, and what it did not (PERF-CPU-PREFILL).**
-/// `BonsaiModel::forward_prefill_cpu` now sub-divides a prompt internally
-/// into `CPU_PREFILL_MICRO_BATCH`-token passes (128 today), each attending
-/// over every position the earlier passes committed. So on the **CPU path**
-/// this constant no longer governs peak activation memory at all: the CPU
-/// prefill's working set is `128 x intermediate_size` floats whatever
-/// `chunk_size` says, and the register-blocked GEMM decodes each weight
-/// block once per `MR` rows however the batch is split, so a smaller chunk
-/// size can no longer buy memory *or* cost throughput there. Raising it
-/// would not help either — the micro-batch, not the chunk, is the CPU's
-/// unit of batching.
-///
-/// **The GPU half of M-18's caveat, measured (PERF-CPU-PREFILL verifier
-/// pass, 2026-09-22).** `chunked_prefill::tests::real_model_metal_prefill_chunk_size_sweep`
-/// runs the real, shipped `Ternary-Bonsai-1.7B.gguf` through the fused Metal
-/// `forward_prefill` path, a 1200-token prompt, at
-/// `chunk_size in {256, 512, 1024, 2048, 4096}` (1 to 5 dispatches). One real
-/// run measured:
-///
-/// | chunk_size | n_chunks | elapsed |
-/// |-----------:|---------:|--------:|
-/// |        256 |        5 | 28.17 s |
-/// |        512 |        3 | 28.13 s |
-/// |       1024 |        2 | 29.42 s |
-/// |       2048 |        1 | 29.96 s |
-/// |       4096 |        1 | 29.95 s |
-///
-/// Total wall time is **flat within about 6 %** across a 16x range of chunk
-/// sizes (5 dispatches down to 1) — if anything, the *smallest* chunk size
-/// tried was fastest here, the opposite of "more dispatches cost more". At
-/// this prompt length, this M3, and this run's machine load, there is no
-/// measured GPU dispatch-overhead tax for chunking smaller, and therefore no
-/// measured reason to move `DEFAULT_PREFILL_CHUNK_TOKENS` off 4096. This
-/// closes the "not measured" caveat with a real number rather than removing
-/// it: the ~6 % spread is within what shared, contended hardware can produce
-/// on its own (see the similar caveat on the CPU-side measurement in
-/// `crate::model::types::prefill_cpu`'s module doc), so read this as "no
-/// effect detected at this scale", not "provably zero effect at every
-/// prompt length" — a prompt spanning dozens of chunks was not tried here.
-/// It therefore stays at 4096 — a deliberate no-op for every prompt the
-/// workspace's tests and the historical 4096-token context produce, and now
-/// also the value this measurement did not find a reason to change.
 pub const DEFAULT_PREFILL_CHUNK_TOKENS: usize = 4096;
 
 /// Decide whether a prompt of `prompt_len` tokens should be chunked at
@@ -825,74 +811,310 @@ mod tests {
         assert_eq!(decode_calls, 0);
     }
 
-    // ── Wave-2.5 addendum (6) part 2: the GPU dispatch-granularity
-    // measurement `DEFAULT_PREFILL_CHUNK_TOKENS`'s doc says is still open ──
+    // ── M-18: the chunk-size sweep on a real model through the fused Metal path ──
 
-    /// On macOS, `BonsaiModel::forward_prefill` tries the fused Metal batch
-    /// path before anything else, so `chunk_size` is that path's per-call
-    /// dispatch granularity for a long prompt — the measurement
-    /// `DEFAULT_PREFILL_CHUNK_TOKENS`'s doc says "can only be read off a
-    /// real model on real hardware" (PERF-CPU-PREFILL verifier pass: the
-    /// prior "models/ is empty in the isolated worktree" excuse does not
-    /// hold — the real GGUFs are readable at the primary worktree's
-    /// `models/`). Ignored by default (needs a multi-hundred-MB real model
-    /// + a dev Mac with Metal).
+    /// Chunk sizes the sweep measures. `0` disables chunking (one fused call
+    /// for the whole prompt); a size at or above the prompt length is the same
+    /// dispatch as `0` and is measured once and reported for every such size.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    const SWEEP_CHUNK_SIZES: [usize; 6] = [0, 128, 256, 512, 1024, 4096];
+
+    /// Default sweep prompt length: the largest chunk size, so every entry of
+    /// [`SWEEP_CHUNK_SIZES`] is a distinct dispatch pattern.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    const SWEEP_DEFAULT_PROMPT_TOKENS: usize = 4096;
+
+    /// Prompt length of the "short prompt" leg the per-token ratios are
+    /// quoted at.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    const SWEEP_SHORT_PROMPT_TOKENS: usize = 256;
+
+    /// M-18 acceptance: fused prefill per-token speed-up over sequential
+    /// decode on the short prompt.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    const SWEEP_MIN_SHORT_SPEEDUP: f64 = 3.0;
+
+    /// M-18 acceptance: fused per-token cost on the full prompt over the
+    /// short prompt's (the attention term is the only super-linear part).
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    const SWEEP_MAX_GROWTH: f64 = 1.5;
+
+    /// Whether `InferenceEngine::from_gguf` would skip the scirs2 weight
+    /// upload for this file: an all-ternary file binds every fused Metal path
+    /// through its own cached weight set, while a one-bit file's fused paths
+    /// need the uploaded handles (mirrors `engine_control`'s
+    /// `gpu_weight_upload_redundant`, which this crate cannot depend on).
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    fn sweep_upload_redundant(gguf: &oxibonsai_core::gguf::reader::GgufFile<'_>) -> bool {
+        let ternary_head = gguf
+            .tensors
+            .get("output.weight")
+            .is_some_and(|head| head.tensor_type.is_ternary());
+        ternary_head
+            && gguf.tensors.iter().all(|(name, info)| {
+                let blocked_matrix = (name.starts_with("blk.") && name.ends_with(".weight"))
+                    || name == "token_embd.weight";
+                !blocked_matrix
+                    || info.tensor_type.block_size() <= 1
+                    || info.tensor_type.is_ternary()
+            })
+    }
+
+    /// A model loaded and made GPU-resident exactly the way
+    /// `InferenceEngine::from_gguf` prepares a Metal engine: the
+    /// auto-detected dispatcher, the weight upload where the route needs it,
+    /// and the eager fused-weight cache.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    fn sweep_gpu_model<'a>(
+        gguf: &'a oxibonsai_core::gguf::reader::GgufFile<'a>,
+        kernel: &oxibonsai_kernels::KernelDispatcher,
+        max_seq: usize,
+    ) -> crate::model::BonsaiModel<'a> {
+        let mut model =
+            crate::model::BonsaiModel::from_gguf(gguf, max_seq).expect("BonsaiModel::from_gguf");
+        if !sweep_upload_redundant(gguf) {
+            model.upload_weights_to_gpu(kernel);
+        }
+        model
+            .get_or_create_gpu_cache()
+            .unwrap_or_else(|e| panic!("fused GPU weight cache: {e}"));
+        model
+    }
+
+    /// One timed `forward_prefill` of `prompt` at `chunk_tokens` on a fresh,
+    /// warmed-up GPU model with the fused route pinned (the M-18 router would
+    /// otherwise be free to measure the sequential path instead); returns the
+    /// wall time and the number of fused batch-prefill calls that completed
+    /// (zero means the fused path never ran).
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    fn sweep_timed_prefill(
+        gguf: &oxibonsai_core::gguf::reader::GgufFile<'_>,
+        kernel: &oxibonsai_kernels::KernelDispatcher,
+        max_seq: usize,
+        prompt: &[u32],
+        chunk_tokens: usize,
+    ) -> (std::time::Duration, u64) {
+        use oxibonsai_kernels::gpu_backend::PrefillRoute;
+        use oxibonsai_kernels::MetalGraph;
+        let mut model = sweep_gpu_model(gguf, kernel, max_seq);
+        model.force_metal_prefill_route(Some(PrefillRoute::Fused));
+        // Warm-up: first-use weight residency and pipeline resolution are
+        // paid here, not inside the timed call.
+        model
+            .forward_prefill(&prompt[..prompt.len().min(8)], 0, kernel)
+            .expect("warm-up prefill");
+        model.reset();
+        model.set_prefill_chunk_tokens(chunk_tokens);
+        let before = MetalGraph::prefill_fused_call_count();
+        let started = std::time::Instant::now();
+        let logits = model
+            .forward_prefill(prompt, 0, kernel)
+            .expect("fused Metal prefill on the real model");
+        let elapsed = started.elapsed();
+        let fused_calls = MetalGraph::prefill_fused_call_count() - before;
+        model.force_metal_prefill_route(None);
+        assert!(
+            logits.iter().all(|v| v.is_finite()),
+            "chunk_tokens={chunk_tokens}: non-finite prefill logits"
+        );
+        (elapsed, fused_calls)
+    }
+
+    /// The same prompt decoded one token at a time through `forward` on a
+    /// fresh GPU model — the sequential path the fused prefill replaces.
+    /// Returns the wall time after `short` positions and after all of them.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    fn sweep_sequential(
+        gguf: &oxibonsai_core::gguf::reader::GgufFile<'_>,
+        kernel: &oxibonsai_kernels::KernelDispatcher,
+        max_seq: usize,
+        prompt: &[u32],
+        short: usize,
+    ) -> (std::time::Duration, std::time::Duration) {
+        let mut model = sweep_gpu_model(gguf, kernel, max_seq);
+        model
+            .forward(prompt[0], 0, kernel)
+            .expect("warm-up decode step");
+        model.reset();
+        let started = std::time::Instant::now();
+        let mut at_short = None;
+        for (pos, &token) in prompt.iter().enumerate() {
+            let logits = model
+                .forward(token, pos, kernel)
+                .expect("sequential decode step");
+            assert!(
+                logits.iter().all(|v| v.is_finite()),
+                "non-finite decode logits at {pos}"
+            );
+            if pos + 1 == short {
+                at_short = Some(started.elapsed());
+            }
+        }
+        let total = started.elapsed();
+        (at_short.unwrap_or(total), total)
+    }
+
+    /// Microseconds per token.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    fn us_per_token(elapsed: std::time::Duration, tokens: usize) -> f64 {
+        elapsed.as_secs_f64() * 1e6 / tokens.max(1) as f64
+    }
+
+    /// Best-effort 1/5/15-minute load average, printed beside every figure.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    fn sweep_load_average() -> String {
+        match std::process::Command::new("uptime").output() {
+            Ok(out) if out.status.success() => {
+                let text = String::from_utf8_lossy(&out.stdout);
+                match text.split_once("load average") {
+                    Some((_, tail)) => tail.trim_start_matches([':', 's', ' ']).trim().to_string(),
+                    None => text.trim().to_string(),
+                }
+            }
+            _ => "unavailable".to_string(),
+        }
+    }
+
+    /// M-18: the chunk-size sweep of the fused Metal prefill on a real model,
+    /// against the sequential single-token decode it replaces.
     ///
-    /// Run with:
-    /// ```text
-    /// OXI_MODEL=/path/to/Ternary-Bonsai-1.7B.gguf \
-    ///   cargo test -p oxibonsai-model --release --features metal --lib \
-    ///   chunked_prefill::tests::real_model_metal_prefill_chunk_size_sweep \
-    ///   -- --ignored --nocapture
-    /// ```
+    /// Loads `$OXI_MODEL` the way a production Metal engine does
+    /// (auto-detected dispatcher, the weight upload where the route needs it,
+    /// the eager fused weight cache) and, for every chunk size in
+    /// [`SWEEP_CHUNK_SIZES`], prefills a `$OXIBONSAI_PREFILL_SWEEP_TOKENS`-token
+    /// prompt (default [`SWEEP_DEFAULT_PROMPT_TOKENS`]) through
+    /// `forward_prefill` on a fresh, warmed-up model with the fused route
+    /// pinned, then decodes the same prompt one token at a time. Every arm must
+    /// actually run the fused batch path (the fused-call counter moves by one
+    /// per chunk); the per-token rates are printed for the
+    /// `DEFAULT_PREFILL_CHUNK_TOKENS` table, and the M-18 acceptance is
+    /// asserted: on the 256-token prompt the fused prefill is at least
+    /// [`SWEEP_MIN_SHORT_SPEEDUP`]x faster per token than sequential decode,
+    /// the whole prompt prefills faster fused than decoded, and the fused
+    /// per-token cost grows at most [`SWEEP_MAX_GROWTH`]x from the short
+    /// prompt to the full one.
+    ///
+    /// Self-skips — recording the skip — when `OXI_MODEL` is unset.
     #[test]
-    #[ignore = "requires OXI_MODEL real ternary GGUF + Metal; run on dev Mac"]
     #[cfg(all(feature = "metal", target_os = "macos"))]
     fn real_model_metal_prefill_chunk_size_sweep() {
-        use crate::model::BonsaiModel;
-        use oxibonsai_core::gguf::reader::GgufFile;
+        use oxibonsai_core::gguf::reader::{mmap_gguf_file, GgufFile};
         use oxibonsai_kernels::{KernelDispatcher, KernelTier};
-        use std::time::Instant;
+        use oxibonsai_testkit::capability::{record_executed_timed, record_skipped, Capability};
 
-        let Some(path) = std::env::var_os("OXI_MODEL") else {
+        const TEST_NAME: &str = "oxibonsai-model::lib::real_model_metal_prefill_chunk_size_sweep";
+        let Some(path) = std::env::var_os("OXI_MODEL").filter(|p| !p.is_empty()) else {
             eprintln!(
-                "real_model_metal_prefill_chunk_size_sweep: OXI_MODEL not set — skipping. \
-                 Set OXI_MODEL=/path/to/Ternary-Bonsai-1.7B.gguf to run."
+                "{TEST_NAME}: OXI_MODEL is not set -- skipping (set it to a real \
+                 Ternary-Bonsai-1.7B / Bonsai-8B GGUF)"
             );
+            record_skipped(Capability::LegacyModels, TEST_NAME);
             return;
         };
-        let bytes = std::fs::read(&path).expect("read OXI_MODEL gguf");
-        let gguf = GgufFile::parse(&bytes).expect("GgufFile::parse OXI_MODEL");
+        let started = std::time::Instant::now();
+        let prompt_len = std::env::var("OXIBONSAI_PREFILL_SWEEP_TOKENS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n >= 2)
+            .unwrap_or(SWEEP_DEFAULT_PROMPT_TOKENS);
+        let mmap = mmap_gguf_file(std::path::Path::new(&path)).expect("mmap OXI_MODEL");
+        let gguf = GgufFile::parse(&mmap).expect("GgufFile::parse OXI_MODEL");
         let cfg = oxibonsai_core::config::Qwen3Config::from_metadata(&gguf.metadata)
             .expect("Qwen3Config::from_metadata OXI_MODEL");
-
-        const MAX_SEQ: usize = 4096;
-        const PROMPT_LEN: usize = 1200;
-        let vocab = cfg.vocab_size as u32;
-        assert!(vocab > 1, "real model must have a non-trivial vocabulary");
-        let prompt: Vec<u32> = (0..PROMPT_LEN as u32)
+        let vocab = u32::try_from(cfg.vocab_size).expect("vocabulary fits u32");
+        assert!(vocab > 1, "a real model has a non-trivial vocabulary");
+        let n_layers = cfg.num_layers as u64;
+        let max_seq = prompt_len + 64;
+        let prompt: Vec<u32> = (0..prompt_len as u32)
             .map(|i| 1 + (i * 97) % (vocab - 1))
             .collect();
-
-        // A fresh model per chunk size: `forward_prefill` writes the KV
-        // cache, so each trial needs its own empty one to prefill from
-        // `pos_start = 0` cleanly, exactly like the previous trial did.
-        let kernel = KernelDispatcher::with_tier(KernelTier::Gpu);
-        eprintln!("\nM-18 chunk-size sweep, Metal fused prefill, {PROMPT_LEN}-token prompt:");
-        eprintln!(
-            "{:>10}  {:>10}  {:>12}",
-            "chunk_size", "n_chunks", "elapsed_ms"
+        let kernel = KernelDispatcher::auto_detect();
+        assert_eq!(
+            kernel.tier(),
+            KernelTier::Gpu,
+            "the sweep measures the Metal route: auto-detection must pick the GPU tier"
         );
-        for &chunk_size in &[256usize, 512, 1024, 2048, 4096] {
-            let mut model = BonsaiModel::from_gguf(&gguf, MAX_SEQ).expect("BonsaiModel::from_gguf");
-            model.set_prefill_chunk_tokens(chunk_size);
-            let n_chunks = PROMPT_LEN.div_ceil(chunk_size.max(1));
-            let t0 = Instant::now();
-            model
-                .forward_prefill(&prompt, 0, &kernel)
-                .expect("metal fused prefill should succeed on the real model");
-            let elapsed_ms = t0.elapsed().as_secs_f64() * 1e3;
-            eprintln!("{chunk_size:>10}  {n_chunks:>10}  {elapsed_ms:>12.2}");
+        eprintln!(
+            "M18_SWEEP model={path:?} layers={n_layers} prompt={prompt_len} load={}",
+            sweep_load_average()
+        );
+
+        let mut measured: Vec<(usize, std::time::Duration)> = Vec::new();
+        for &chunk in &SWEEP_CHUNK_SIZES {
+            let effective = if chunk >= prompt_len { 0 } else { chunk };
+            let calls = if effective == 0 {
+                1
+            } else {
+                prompt_len.div_ceil(effective)
+            };
+            let elapsed = match measured.iter().find(|(c, _)| *c == effective) {
+                Some(&(_, elapsed)) => elapsed,
+                None => {
+                    let (elapsed, fused_calls) =
+                        sweep_timed_prefill(&gguf, &kernel, max_seq, &prompt, effective);
+                    assert_eq!(
+                        fused_calls, calls as u64,
+                        "chunk_tokens={chunk}: the fused Metal batch path did not run for every \
+                         call ({fused_calls} fused calls, expected {calls})"
+                    );
+                    measured.push((effective, elapsed));
+                    elapsed
+                }
+            };
+            eprintln!(
+                "M18_SWEEP chunk_tokens={chunk} calls={calls} prefill_ms={:.1} \
+                 prefill_us/token={:.1}",
+                elapsed.as_secs_f64() * 1e3,
+                us_per_token(elapsed, prompt_len)
+            );
         }
+
+        let short = SWEEP_SHORT_PROMPT_TOKENS.min(prompt_len);
+        let (short_fused, short_calls) =
+            sweep_timed_prefill(&gguf, &kernel, max_seq, &prompt[..short], 0);
+        assert_eq!(short_calls, 1, "the {short}-token fused prefill ran");
+        let (seq_short, seq_total) = sweep_sequential(&gguf, &kernel, max_seq, &prompt, short);
+        let fused_short_us = us_per_token(short_fused, short);
+        let seq_short_us = us_per_token(seq_short, short);
+        let seq_total_us = us_per_token(seq_total, prompt_len);
+        let fused_full = measured
+            .iter()
+            .find(|(c, _)| *c == 0)
+            .map(|&(_, e)| e)
+            .expect("the one-shot arm always runs");
+        let fused_full_us = us_per_token(fused_full, prompt_len);
+        eprintln!(
+            "M18_SWEEP short prompt={short} fused_us/token={fused_short_us:.1} \
+             sequential_us/token={seq_short_us:.1} ratio={:.2}x",
+            seq_short_us / fused_short_us.max(f64::MIN_POSITIVE)
+        );
+        let growth = fused_full_us / fused_short_us.max(f64::MIN_POSITIVE);
+        eprintln!(
+            "M18_SWEEP full prompt={prompt_len} fused_ms={:.1} fused_us/token={fused_full_us:.1} \
+             sequential_ms={:.1} sequential_us/token={seq_total_us:.1} \
+             fused_growth_vs_short={growth:.2}x load={}",
+            fused_full.as_secs_f64() * 1e3,
+            seq_total.as_secs_f64() * 1e3,
+            sweep_load_average()
+        );
+        // M-18 acceptance: the fused prefill beats sequential decode by 3x per
+        // token on a short prompt, beats it outright on the whole prompt, and
+        // stays near-linear (the attention term only) up to the full length.
+        assert!(
+            seq_short_us >= SWEEP_MIN_SHORT_SPEEDUP * fused_short_us,
+            "{short} tokens: the fused prefill ({fused_short_us:.1} us/token) must be at least \
+             {SWEEP_MIN_SHORT_SPEEDUP}x faster than sequential decode ({seq_short_us:.1} us/token)"
+        );
+        assert!(
+            fused_full < seq_total,
+            "{prompt_len} tokens: the fused prefill ({fused_full:?}) must beat sequential decode \
+             ({seq_total:?})"
+        );
+        assert!(
+            growth <= SWEEP_MAX_GROWTH,
+            "the fused per-token cost grew {growth:.2}x from {short} to {prompt_len} tokens, above \
+             {SWEEP_MAX_GROWTH}x"
+        );
+        record_executed_timed(Capability::LegacyModels, TEST_NAME, started.elapsed());
     }
 }

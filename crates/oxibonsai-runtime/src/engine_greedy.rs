@@ -320,12 +320,13 @@ impl<'a> InferenceEngine<'a> {
         max_tokens: usize,
     ) -> RuntimeResult<Vec<u32>> {
         if self.is_hybrid() {
-            // No hybrid GPU encoder exists yet (waves 5+): the explicit
-            // greedy entry point decodes the full logit row on the CPU with
-            // a first-index argmax -- the same answer, not a pretend GPU run.
+            // A hybrid model has no fused dense GPU decode route: the
+            // explicit greedy entry point decodes the full logit row on the
+            // hybrid's own executor (the Metal hybrid runner or the CPU
+            // model) with a first-index argmax.
             tracing::info!(
-                "generate_greedy_gpu: hybrid model has no fused GPU decode path; decoding \
-                 greedily on the CPU"
+                "generate_greedy_gpu: a hybrid model has no fused dense GPU decode path; \
+                 decoding greedily on its own executor (full logit row)"
             );
             return self.generate_greedy_penalised(prompt_tokens, max_tokens, |_| true);
         }

@@ -33,6 +33,7 @@
 
 use super::{BonsaiModel, OutputWeight};
 use crate::layers::rms_norm::RmsNorm;
+use oxibonsai_kernels::gpu_backend::with_autorelease_pool;
 use oxibonsai_kernels::MetalGraphError;
 
 // ── FP8 block → raw-byte reinterpretation ────────────────────────────────────
@@ -63,6 +64,10 @@ fn fp8_e5m2_as_bytes(blocks: &[oxibonsai_core::BlockFP8E5M2]) -> &[u8] {
 }
 
 // ── Variant-dispatched GEMM wrappers ─────────────────────────────────────────
+//
+// Each GEMM commits and waits on a command buffer of its own; the call runs
+// inside an autorelease pool so the autoreleased command buffer and encoder
+// are released when it returns, not when the prefilling thread exits.
 
 /// Batched FP8 GEMM (accumulate): `outputs += W · inputs`. Column/token-major.
 fn gemm_fp8(
@@ -75,9 +80,13 @@ fn gemm_fp8(
     batch_size: usize,
 ) -> Result<(), MetalGraphError> {
     if is_e4m3 {
-        oxibonsai_kernels::metal_gemm_fp8_e4m3(blocks, inputs, outputs, n_rows, k, batch_size)
+        with_autorelease_pool(|| {
+            oxibonsai_kernels::metal_gemm_fp8_e4m3(blocks, inputs, outputs, n_rows, k, batch_size)
+        })
     } else {
-        oxibonsai_kernels::metal_gemm_fp8_e5m2(blocks, inputs, outputs, n_rows, k, batch_size)
+        with_autorelease_pool(|| {
+            oxibonsai_kernels::metal_gemm_fp8_e5m2(blocks, inputs, outputs, n_rows, k, batch_size)
+        })
     }
 }
 
@@ -94,13 +103,17 @@ fn gemm_fp8_residual(
     batch_size: usize,
 ) -> Result<(), MetalGraphError> {
     if is_e4m3 {
-        oxibonsai_kernels::metal_gemm_fp8_e4m3_residual(
-            blocks, inputs, outputs, residual, n_rows, k, batch_size,
-        )
+        with_autorelease_pool(|| {
+            oxibonsai_kernels::metal_gemm_fp8_e4m3_residual(
+                blocks, inputs, outputs, residual, n_rows, k, batch_size,
+            )
+        })
     } else {
-        oxibonsai_kernels::metal_gemm_fp8_e5m2_residual(
-            blocks, inputs, outputs, residual, n_rows, k, batch_size,
-        )
+        with_autorelease_pool(|| {
+            oxibonsai_kernels::metal_gemm_fp8_e5m2_residual(
+                blocks, inputs, outputs, residual, n_rows, k, batch_size,
+            )
+        })
     }
 }
 
@@ -115,13 +128,17 @@ fn fused_gate_up_swiglu_fp8(
     batch_size: usize,
 ) -> Result<(), MetalGraphError> {
     if is_e4m3 {
-        oxibonsai_kernels::metal_fused_gate_up_swiglu_fp8_e4m3(
-            blocks, inputs, outputs, n_ffn_rows, k, batch_size,
-        )
+        with_autorelease_pool(|| {
+            oxibonsai_kernels::metal_fused_gate_up_swiglu_fp8_e4m3(
+                blocks, inputs, outputs, n_ffn_rows, k, batch_size,
+            )
+        })
     } else {
-        oxibonsai_kernels::metal_fused_gate_up_swiglu_fp8_e5m2(
-            blocks, inputs, outputs, n_ffn_rows, k, batch_size,
-        )
+        with_autorelease_pool(|| {
+            oxibonsai_kernels::metal_fused_gate_up_swiglu_fp8_e5m2(
+                blocks, inputs, outputs, n_ffn_rows, k, batch_size,
+            )
+        })
     }
 }
 

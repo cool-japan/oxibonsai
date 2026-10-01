@@ -33,17 +33,43 @@
 //! [`BonsaiModel::prefill_verify_gpu_ternary_uncached`]) and as the only
 //! route for a ternary body under a non-ternary LM head, whose cache has no
 //! tail.
+//!
+//! # Autorelease pools
+//!
+//! Every forward this module sends to the Metal kernels — the fused decode
+//! and greedy decode, the fused and verify batch prefills, the per-layer
+//! fallbacks and the uncached references — runs inside its own Objective-C
+//! autorelease pool
+//! ([`oxibonsai_kernels::gpu_backend::with_autorelease_pool`]). A forward's
+//! command buffers and encoders are autoreleased objects, and a decode
+//! thread without a pool would keep ~1.8 KiB of them per token until it
+//! exits. The pool around each call releases them as soon as the call
+//! returns, whichever entry point it reaches and whether or not that entry
+//! point drains a pool of its own.
 
 use super::q1_slots::{MappingRegistration, MappingState, SlotNamespace};
 use super::{BonsaiModel, OutputWeight};
 use crate::block::blocks_as_bytes;
 use oxibonsai_kernels::gpu_backend::metal_full_layer::types::{next_model_epoch, WeightKind};
-use oxibonsai_kernels::{FullForwardLayerParams, GpuWeightHandle, MetalGraph};
+use oxibonsai_kernels::gpu_backend::{
+    try_metal_full_forward_prefill_q1_cached, with_autorelease_pool, MetalPrefillPolicy,
+    PrefillCostSnapshot, PrefillRoute,
+};
+use oxibonsai_kernels::{FullForwardLayerParams, GpuWeightHandle, MetalGraph, MetalGraphError};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 /// Convenience alias for the boxed error every Metal entry point here returns.
 type GpuResult<T> = Result<T, Box<dyn std::error::Error>>;
+
+/// Whether `e` is a batched-prefill wait that missed its deadline (M-18) —
+/// the typed timeout of `MetalGraphError::is_command_buffer_timeout`, however
+/// deep in the Metal entry points it was boxed.
+pub(super) fn is_prefill_timeout(e: &(dyn std::error::Error + 'static)) -> bool {
+    e.downcast_ref::<MetalGraphError>()
+        .is_some_and(MetalGraphError::is_command_buffer_timeout)
+}
 
 /// Release every buffer keyed under `epoch` from the Metal weight cache —
 /// the [`super::q1_slots::ReleaseHook`] of the Metal build, run once when the
@@ -56,6 +82,8 @@ type GpuResult<T> = Result<T, Box<dyn std::error::Error>>;
 /// no Metal state exists in this process on the shared device, so nothing can
 /// be resident under the epoch there.
 pub(crate) fn release_metal_mapping(epoch: u64) {
+    // The mapping's M-18 prefill cost model leaves with it.
+    MetalPrefillPolicy::forget(epoch);
     let graph = match MetalGraph::current_session() {
         Some(session) => session,
         None if MetalGraph::live_session_count() > 0 => match MetalGraph::global() {
@@ -93,12 +121,12 @@ pub(crate) fn release_metal_mapping(epoch: u64) {
 /// The kernels' Q1 entry points take the norm and LM-head slots as `u64`s
 /// composed `TAG | epoch << 24 | local` (the historical locals —
 /// `1_000_000 + layer * 10 + k`, `2_000_000`, `3_000_000` — namespaced by the
-/// epoch; see [`SlotNamespace`]) and key each upload
+/// epoch; see `q1_slots::SlotNamespace`) and key each upload
 /// `WeightKey::new(epoch, kind, slot)`.
 ///
 /// # Sharing and lifetime
 ///
-/// - [`Self::for_mapping`] — what every loaded model uses — **joins** the
+/// - `Q1MetalSlots::for_mapping` — what every loaded model uses — **joins** the
 ///   namespace of the mapping its weights are borrowed from: every
 ///   engine-pool replica of one GGUF gets the same epoch and therefore the
 ///   same buffers, and a different mapping always gets a different epoch.
@@ -469,29 +497,31 @@ impl<'a> BonsaiModel<'a> {
         let layer_params = self.q1_layer_params(&qkv_concats)?;
         let rope_cos = self.rope.cos_at_checked(pos)?;
         let rope_sin = self.rope.sin_at_checked(pos)?;
-        let result = oxibonsai_kernels::try_metal_full_forward(
-            hidden,
-            pos,
-            n_layers,
-            &layer_params,
-            rope_cos,
-            rope_sin,
-            h,
-            inter,
-            nq,
-            nkv,
-            hd,
-            eps,
-            max_seq_len,
-            None,
-            None,
-            eps,
-            None,
-            None,
-            0,
-            None,
-            None,
-        );
+        let result = with_autorelease_pool(|| {
+            oxibonsai_kernels::try_metal_full_forward(
+                hidden,
+                pos,
+                n_layers,
+                &layer_params,
+                rope_cos,
+                rope_sin,
+                h,
+                inter,
+                nq,
+                nkv,
+                hd,
+                eps,
+                max_seq_len,
+                None,
+                None,
+                eps,
+                None,
+                None,
+                0,
+                None,
+                None,
+            )
+        });
         self.metal_q1_slots.mark_used(n_layers);
         result.map_err(|e| {
             tracing::warn!(
@@ -536,10 +566,34 @@ impl<'a> BonsaiModel<'a> {
         let rope_sin = self.rope.sin_at_checked(pos)?;
         let result = if matches!(self.output_weight, OutputWeight::Ternary(_)) {
             self.with_ternary_gpu_cache(|cached| {
-                oxibonsai_kernels::try_metal_full_forward_ternary_cached(
+                with_autorelease_pool(|| {
+                    oxibonsai_kernels::try_metal_full_forward_ternary_cached(
+                        hidden,
+                        pos,
+                        cached,
+                        rope_cos,
+                        rope_sin,
+                        h,
+                        inter,
+                        nq,
+                        nkv,
+                        hd,
+                        eps,
+                        max_seq_len,
+                        eps,
+                        None,
+                        None,
+                    )
+                })
+            })?
+        } else {
+            let binding = self.ternary_gpu_binding()?;
+            with_autorelease_pool(|| {
+                oxibonsai_kernels::try_metal_full_forward_ternary(
                     hidden,
                     pos,
-                    cached,
+                    n_layers,
+                    &binding.layer_params,
                     rope_cos,
                     rope_sin,
                     h,
@@ -549,36 +603,16 @@ impl<'a> BonsaiModel<'a> {
                     hd,
                     eps,
                     max_seq_len,
+                    None,
+                    None,
                     eps,
                     None,
                     None,
+                    0,
+                    None,
+                    None,
                 )
-            })?
-        } else {
-            let binding = self.ternary_gpu_binding()?;
-            oxibonsai_kernels::try_metal_full_forward_ternary(
-                hidden,
-                pos,
-                n_layers,
-                &binding.layer_params,
-                rope_cos,
-                rope_sin,
-                h,
-                inter,
-                nq,
-                nkv,
-                hd,
-                eps,
-                max_seq_len,
-                None,
-                None,
-                eps,
-                None,
-                None,
-                0,
-                None,
-                None,
-            )
+            })
         };
         result.map_err(|e| {
             tracing::warn!(
@@ -596,7 +630,24 @@ impl<'a> BonsaiModel<'a> {
     /// any precondition is not met (missing GPU handles, FP32 LM head, etc.).
     ///
     /// Ternary models are delegated to the cached ternary route.
+    ///
+    /// Every successful step is timed into the model's M-18 prefill cost
+    /// model: this is the decode `forward` runs per token on the GPU route,
+    /// i.e. the sequential path a fused prefill is compared against.
     pub(super) fn try_metal_full_forward_with_lm_head(
+        &self,
+        hidden: &mut [f32],
+        pos: usize,
+        logits: &mut Vec<f32>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let started = Instant::now();
+        self.try_metal_full_forward_with_lm_head_untimed(hidden, pos, logits)?;
+        MetalPrefillPolicy::record_decode(self.gpu_mapping_epoch(), started.elapsed());
+        Ok(())
+    }
+
+    /// Body of [`Self::try_metal_full_forward_with_lm_head`].
+    fn try_metal_full_forward_with_lm_head_untimed(
         &self,
         hidden: &mut [f32],
         pos: usize,
@@ -655,29 +706,31 @@ impl<'a> BonsaiModel<'a> {
         let lm_head_handle = self.metal_q1_slots.lm_head();
         let lm_head_bytes = blocks_as_bytes(lm_head_linear.blocks());
         let lm_head_out_features = lm_head_linear.out_features();
-        let result = oxibonsai_kernels::try_metal_full_forward(
-            hidden,
-            pos,
-            n_layers,
-            &layer_params,
-            rope_cos,
-            rope_sin,
-            h,
-            inter,
-            nq,
-            nkv,
-            hd,
-            eps,
-            max_seq_len,
-            Some(final_norm_handle),
-            Some(final_norm_bytes),
-            final_norm_eps,
-            Some(lm_head_handle),
-            Some(lm_head_bytes),
-            lm_head_out_features,
-            Some(logits),
-            None,
-        );
+        let result = with_autorelease_pool(|| {
+            oxibonsai_kernels::try_metal_full_forward(
+                hidden,
+                pos,
+                n_layers,
+                &layer_params,
+                rope_cos,
+                rope_sin,
+                h,
+                inter,
+                nq,
+                nkv,
+                hd,
+                eps,
+                max_seq_len,
+                Some(final_norm_handle),
+                Some(final_norm_bytes),
+                final_norm_eps,
+                Some(lm_head_handle),
+                Some(lm_head_bytes),
+                lm_head_out_features,
+                Some(logits),
+                None,
+            )
+        });
         self.metal_q1_slots.mark_used(n_layers);
         result.map_err(|e| {
             tracing::warn!(
@@ -687,15 +740,91 @@ impl<'a> BonsaiModel<'a> {
         })
     }
 
-    /// GPU batch prefill implementation: all layers + final norm + LM head.
+    /// GPU batch prefill: all layers + final norm + LM head, behind the M-18
+    /// guard. This is the call `forward_prefill` makes on the Metal route.
+    ///
+    /// # Route
+    ///
+    /// The model's measured prefill cost model (`MetalPrefillPolicy`, keyed by
+    /// the mapping epoch) picks the route: the fused batch prefill
+    /// ([`Self::try_metal_prefill_with_lm_head_fused`]) unless fused calls of a
+    /// comparable size were measured slower per token than the single-token
+    /// decode, in which case the prompt runs through
+    /// [`Self::metal_prefill_sequential`] — exactly the per-token fused
+    /// decode `forward` performs, so the logits, the device KV cache and the
+    /// position are those of a sequential prefill. A model with no
+    /// measurement yet always takes the fused path.
+    ///
+    /// # Deadline
+    ///
+    /// The fused route runs under a deadline of
+    /// [`oxibonsai_kernels::gpu_backend::FUSED_BUDGET_FACTOR`] times the
+    /// predicted sequential time. A fused prefill that misses it stops
+    /// committing work (at most one micro-batch is still running on the GPU),
+    /// logs one warning, records the timeout against the cost model and
+    /// prefills the prompt sequentially instead — so no prompt waits on the GPU
+    /// without a bound, and the next prompt of that size goes straight to the
+    /// cheaper route.
+    pub fn try_metal_prefill_with_lm_head(
+        &self,
+        token_ids: &[u32],
+        pos_start: usize,
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        let epoch = self.gpu_mapping_epoch();
+        let tokens = token_ids.len();
+        let decision = MetalPrefillPolicy::decide(epoch, tokens, self.decode_prior_s_per_token());
+        if decision.route == PrefillRoute::Sequential {
+            tracing::debug!(
+                tokens,
+                pos_start,
+                predicted_fused_s = ?decision.predicted_fused_s,
+                predicted_sequential_s = decision.predicted_sequential_s,
+                "metal prefill: the cost model routes this prompt through sequential decode"
+            );
+            return self.metal_prefill_sequential(token_ids, pos_start);
+        }
+        let started = Instant::now();
+        let fused = {
+            let _deadline = MetalGraph::prefill_deadline_scope(started + decision.fused_budget);
+            self.try_metal_prefill_with_lm_head_fused(token_ids, pos_start)
+        };
+        match fused {
+            Ok(logits) => {
+                MetalPrefillPolicy::record_fused(epoch, tokens, started.elapsed());
+                Ok(logits)
+            }
+            Err(e) if is_prefill_timeout(e.as_ref()) => {
+                let waited = started.elapsed();
+                MetalPrefillPolicy::record_fused_timeout(epoch, tokens, waited);
+                tracing::warn!(
+                    tokens,
+                    pos_start,
+                    waited_ms = waited.as_millis() as u64,
+                    budget_ms = decision.fused_budget.as_millis() as u64,
+                    error = %e,
+                    "fused Metal prefill missed its deadline; prefilling the prompt through \
+                     sequential decode instead"
+                );
+                self.metal_prefill_sequential(token_ids, pos_start)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The fused Metal batch prefill, **strictly**: no route decision, no
+    /// fallback — a dispatch failure or a missed deadline comes back as the
+    /// error (a timeout satisfies
+    /// `MetalGraphError::is_command_buffer_timeout`).
     ///
     /// Both 1-bit and ternary (TQ2_0_g128) LM-head models are supported; the
-    /// ternary one runs the cached ternary prefill.
+    /// ternary one runs the cached ternary prefill, and a 1-bit model whose
+    /// fused weight cache is resident binds it instead of rebuilding its
+    /// Q‖K‖V concatenation per call (perf-03).
     ///
-    /// Marked `pub` so parity tests can invoke this **strict** path
-    /// directly, bypassing the silent fallback in [`Self::forward_prefill`]
-    /// that masks GPU dispatch failures.
-    pub fn try_metal_prefill_with_lm_head(
+    /// Marked `pub` so parity tests can invoke the fused path directly,
+    /// bypassing both the M-18 router and the silent fallback in
+    /// [`Self::forward_prefill`] that masks GPU dispatch failures.
+    pub fn try_metal_prefill_with_lm_head_fused(
         &self,
         token_ids: &[u32],
         pos_start: usize,
@@ -756,45 +885,165 @@ impl<'a> BonsaiModel<'a> {
         let max_seq_len = self.kv_cache.max_seq_len();
         self.require_q1_gpu_handles()?;
         let (hidden_batch, cos_table, sin_table) = self.q1_prefill_inputs(token_ids, pos_start)?;
-        let qkv_concats = self.q1_qkv_concats()?;
-        let layer_params = self.q1_layer_params(&qkv_concats)?;
-        let final_norm_handle = self.metal_q1_slots.final_norm();
-        let final_norm_bytes = self.output_norm.weight();
         let final_norm_eps = self.output_norm.eps();
-        let lm_head_handle = self.metal_q1_slots.lm_head();
-        let lm_head_bytes = blocks_as_bytes(lm_head_linear.blocks());
         let lm_head_out_features = lm_head_linear.out_features();
         let mut logits = vec![0.0f32; lm_head_out_features];
-        let result = oxibonsai_kernels::try_metal_full_forward_prefill(
-            &hidden_batch,
-            batch_size,
-            pos_start,
-            n_layers,
-            &layer_params,
-            &cos_table,
-            &sin_table,
-            h,
-            inter,
-            nq,
-            nkv,
-            hd,
-            eps,
-            max_seq_len,
-            Some(final_norm_handle),
-            Some(final_norm_bytes),
-            final_norm_eps,
-            Some(lm_head_handle),
-            Some(lm_head_bytes),
-            lm_head_out_features,
-            Some(&mut logits),
-            None,
-        );
+        let cached_result = {
+            let guard = self
+                .gpu_weight_cache
+                .lock()
+                .map_err(|e| format!("gpu_weight_cache lock: {e}"))?;
+            match guard.as_ref() {
+                Some(cached @ oxibonsai_kernels::CachedModelWeights::Q1(_)) => {
+                    Some(with_autorelease_pool(|| {
+                        try_metal_full_forward_prefill_q1_cached(
+                            &hidden_batch,
+                            batch_size,
+                            pos_start,
+                            cached,
+                            &cos_table,
+                            &sin_table,
+                            h,
+                            inter,
+                            nq,
+                            nkv,
+                            hd,
+                            eps,
+                            max_seq_len,
+                            final_norm_eps,
+                            lm_head_out_features,
+                            Some(&mut logits),
+                            None,
+                        )
+                    }))
+                }
+                _ => None,
+            }
+        };
+        let result = match cached_result {
+            Some(result) => result,
+            None => {
+                let qkv_concats = self.q1_qkv_concats()?;
+                let layer_params = self.q1_layer_params(&qkv_concats)?;
+                let final_norm_handle = self.metal_q1_slots.final_norm();
+                let final_norm_bytes = self.output_norm.weight();
+                let lm_head_handle = self.metal_q1_slots.lm_head();
+                let lm_head_bytes = blocks_as_bytes(lm_head_linear.blocks());
+                with_autorelease_pool(|| {
+                    oxibonsai_kernels::try_metal_full_forward_prefill(
+                        &hidden_batch,
+                        batch_size,
+                        pos_start,
+                        n_layers,
+                        &layer_params,
+                        &cos_table,
+                        &sin_table,
+                        h,
+                        inter,
+                        nq,
+                        nkv,
+                        hd,
+                        eps,
+                        max_seq_len,
+                        Some(final_norm_handle),
+                        Some(final_norm_bytes),
+                        final_norm_eps,
+                        Some(lm_head_handle),
+                        Some(lm_head_bytes),
+                        lm_head_out_features,
+                        Some(&mut logits),
+                        None,
+                    )
+                })
+            }
+        };
         self.metal_q1_slots.mark_used(n_layers);
         result.map_err(|e| {
-            tracing::warn!(error = % e, "batch prefill GPU dispatch failed");
+            // A missed deadline is reported once, by the router.
+            if !e.is_command_buffer_timeout() {
+                tracing::warn!(error = % e, "batch prefill GPU dispatch failed");
+            }
             Box::new(e) as Box<dyn std::error::Error>
         })?;
         Ok(logits)
+    }
+
+    /// The **sequential** Metal prefill route: every prompt token through
+    /// the single-token fused decode + LM head, one command buffer each.
+    ///
+    /// Exactly what `forward` does per token on the GPU route — the same entry
+    /// point (`try_metal_full_forward_with_lm_head`) on the same
+    /// hidden state — so the returned last-position logits, the device KV
+    /// cache and the MET-05 latch equal those of `forward` called token by
+    /// token. It is the route the M-18 guard takes when the fused batch
+    /// prefill is measured (or forced) slower, and the fallback after a fused
+    /// prefill misses its deadline.
+    ///
+    /// # Errors
+    ///
+    /// An empty prompt, a position past the context, or any Metal failure of
+    /// a decode step.
+    pub fn metal_prefill_sequential(
+        &self,
+        token_ids: &[u32],
+        pos_start: usize,
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        if token_ids.is_empty() {
+            return Err("metal_prefill_sequential: empty prompt".into());
+        }
+        if pos_start + token_ids.len() > self.kv_cache.max_seq_len() {
+            return Err(format!(
+                "prefill sequence too long: {} tokens at pos {pos_start} exceeds max_seq_len {}",
+                token_ids.len(),
+                self.kv_cache.max_seq_len()
+            )
+            .into());
+        }
+        let mut hidden = vec![0.0f32; self.config.hidden_size];
+        let mut logits = vec![0.0f32; self.config.vocab_size];
+        for (i, &token) in token_ids.iter().enumerate() {
+            let pos = pos_start + i;
+            self.token_embd.copy_row(token, &mut hidden)?;
+            self.try_metal_full_forward_with_lm_head(&mut hidden, pos, &mut logits)?;
+            // As `forward` does after every fused step (MET-05).
+            self.note_device_kv_used();
+        }
+        Ok(logits)
+    }
+
+    /// The model's decode-cost prior for the M-18 router, seconds per token:
+    /// a fused decode step streams every quantized weight once, so its cost
+    /// is the weight bytes at a conservative 20 GB/s (Bonsai-8B: 58 ms,
+    /// Ternary-Bonsai-1.7B: 27 ms against the ~45 / ~20 ms measured). It only
+    /// stands in until the first real decode step is measured.
+    fn decode_prior_s_per_token(&self) -> f64 {
+        const PRIOR_BYTES_PER_SECOND: f64 = 20.0e9;
+        let c = &self.config;
+        let qkv = (c.num_attention_heads + 2 * c.num_kv_heads) * c.head_dim;
+        let attn = c.num_attention_heads * c.head_dim;
+        let per_layer =
+            c.hidden_size * qkv + attn * c.hidden_size + 3 * c.hidden_size * c.intermediate_size;
+        let weights = (per_layer * c.num_layers + c.vocab_size * c.hidden_size) as f64;
+        let bytes_per_weight = match &self.output_weight {
+            OutputWeight::OneBit(_) => 18.0 / 128.0,
+            OutputWeight::Ternary(_) => 34.0 / 128.0,
+            _ => 0.5,
+        };
+        weights * bytes_per_weight / PRIOR_BYTES_PER_SECOND
+    }
+
+    /// Pin this model's Metal prefill route (`None` returns it to the
+    /// measured decision) — for every replica of its GGUF mapping, which share
+    /// the cost model (M-18). Tests and measurement harnesses use it to take a
+    /// route regardless of what the cost model has seen.
+    pub fn force_metal_prefill_route(&self, route: Option<PrefillRoute>) {
+        MetalPrefillPolicy::force_route(self.gpu_mapping_epoch(), route);
+    }
+
+    /// The M-18 prefill cost model of this model's mapping, for diagnostics.
+    #[must_use]
+    pub fn metal_prefill_cost(&self) -> PrefillCostSnapshot {
+        MetalPrefillPolicy::snapshot(self.gpu_mapping_epoch(), self.decode_prior_s_per_token())
     }
 
     /// GPU batch prefill verify: all layers + final norm + LM head + per-position argmax.
@@ -869,29 +1118,31 @@ impl<'a> BonsaiModel<'a> {
         let lm_head_bytes = blocks_as_bytes(lm_head_linear.blocks());
         let lm_head_out_features = lm_head_linear.out_features();
         let mut batch_token_ids: Vec<u32> = Vec::with_capacity(batch_size);
-        let result = oxibonsai_kernels::try_metal_full_forward_prefill_verify(
-            &hidden_batch,
-            batch_size,
-            pos_start,
-            n_layers,
-            &layer_params,
-            &cos_table,
-            &sin_table,
-            h,
-            inter,
-            nq,
-            nkv,
-            hd,
-            eps,
-            max_seq_len,
-            Some(final_norm_handle),
-            Some(final_norm_bytes),
-            final_norm_eps,
-            Some(lm_head_handle),
-            Some(lm_head_bytes),
-            lm_head_out_features,
-            &mut batch_token_ids,
-        );
+        let result = with_autorelease_pool(|| {
+            oxibonsai_kernels::try_metal_full_forward_prefill_verify(
+                &hidden_batch,
+                batch_size,
+                pos_start,
+                n_layers,
+                &layer_params,
+                &cos_table,
+                &sin_table,
+                h,
+                inter,
+                nq,
+                nkv,
+                hd,
+                eps,
+                max_seq_len,
+                Some(final_norm_handle),
+                Some(final_norm_bytes),
+                final_norm_eps,
+                Some(lm_head_handle),
+                Some(lm_head_bytes),
+                lm_head_out_features,
+                &mut batch_token_ids,
+            )
+        });
         self.metal_q1_slots.mark_used(n_layers);
         result.map_err(|e| {
             tracing::warn!(error = % e, "batch prefill verify GPU dispatch failed");
@@ -1006,24 +1257,26 @@ impl<'a> BonsaiModel<'a> {
             .lock()
             .map_err(|e| format!("gpu_weight_cache lock: {e}"))?;
         let cached = guard.as_ref().ok_or("GPU weight cache not populated")?;
-        oxibonsai_kernels::try_metal_full_forward_cached(
-            &mut hidden,
-            pos,
-            cached,
-            rope_cos,
-            rope_sin,
-            h,
-            inter,
-            nq,
-            nkv,
-            hd,
-            eps,
-            max_seq_len,
-            final_norm_eps,
-            lm_head_out_features,
-            None,
-            Some(&mut greedy_token_id),
-        )
+        with_autorelease_pool(|| {
+            oxibonsai_kernels::try_metal_full_forward_cached(
+                &mut hidden,
+                pos,
+                cached,
+                rope_cos,
+                rope_sin,
+                h,
+                inter,
+                nq,
+                nkv,
+                hd,
+                eps,
+                max_seq_len,
+                final_norm_eps,
+                lm_head_out_features,
+                None,
+                Some(&mut greedy_token_id),
+            )
+        })
         .map_err(|e| {
             tracing::warn!(error = % e, "cached greedy GPU forward failed");
             Box::new(e) as Box<dyn std::error::Error>
@@ -1055,11 +1308,12 @@ impl<'a> BonsaiModel<'a> {
             )
             .into());
         }
-        self.forward_greedy_gpu_ternary_cached(token_id, pos)
-            .map_err(|e| {
+        with_autorelease_pool(|| self.forward_greedy_gpu_ternary_cached(token_id, pos)).map_err(
+            |e| {
                 tracing::warn!(error = % e, "ternary greedy GPU forward failed");
                 e
-            })
+            },
+        )
     }
 
     /// Ternary fused forward + LM head (single token, non-greedy sampling).
@@ -1110,22 +1364,24 @@ impl<'a> BonsaiModel<'a> {
         let rope_cos = self.rope.cos_at_checked(pos)?;
         let rope_sin = self.rope.sin_at_checked(pos)?;
         self.with_ternary_gpu_cache(|cached| {
-            oxibonsai_kernels::try_metal_prefill_ternary_cached(
-                hidden,
-                pos,
-                cached,
-                rope_cos,
-                rope_sin,
-                h,
-                inter,
-                nq,
-                nkv,
-                hd,
-                eps,
-                max_seq_len,
-                final_norm_eps,
-                logits,
-            )
+            with_autorelease_pool(|| {
+                oxibonsai_kernels::try_metal_prefill_ternary_cached(
+                    hidden,
+                    pos,
+                    cached,
+                    rope_cos,
+                    rope_sin,
+                    h,
+                    inter,
+                    nq,
+                    nkv,
+                    hd,
+                    eps,
+                    max_seq_len,
+                    final_norm_eps,
+                    logits,
+                )
+            })
         })?
         .map_err(|e| {
             tracing::warn!(error = % e, "ternary fused GPU forward failed");
@@ -1162,9 +1418,12 @@ impl<'a> BonsaiModel<'a> {
         if !matches!(&self.output_weight, OutputWeight::Ternary(_)) {
             return Err("ternary prefill called on non-ternary model".into());
         }
-        self.prefill_logits_gpu_ternary_cached(token_ids, pos_start)
+        with_autorelease_pool(|| self.prefill_logits_gpu_ternary_cached(token_ids, pos_start))
             .map_err(|e| {
-                tracing::warn!(error = % e, "ternary batch prefill GPU dispatch failed");
+                // A missed deadline is reported once, by the M-18 router.
+                if !is_prefill_timeout(e.as_ref()) {
+                    tracing::warn!(error = % e, "ternary batch prefill GPU dispatch failed");
+                }
                 e
             })
     }
@@ -1198,7 +1457,7 @@ impl<'a> BonsaiModel<'a> {
         if !matches!(&self.output_weight, OutputWeight::Ternary(_)) {
             return Err("ternary prefill verify called on non-ternary model".into());
         }
-        self.prefill_verify_gpu_ternary_cached(token_ids, pos_start)
+        with_autorelease_pool(|| self.prefill_verify_gpu_ternary_cached(token_ids, pos_start))
             .map_err(|e| {
                 tracing::warn!(error = % e, "ternary batch prefill verify GPU dispatch failed");
                 e
@@ -1233,28 +1492,30 @@ impl<'a> BonsaiModel<'a> {
             .tail
             .ok_or("the uncached ternary logits path requires a ternary LM head")?;
         let mut logits = Vec::new();
-        let result = oxibonsai_kernels::try_metal_prefill_ternary(
-            &mut hidden,
-            pos,
-            self.blocks.len(),
-            &binding.layer_params,
-            rope_cos,
-            rope_sin,
-            self.config.hidden_size,
-            self.config.intermediate_size,
-            self.config.num_attention_heads,
-            self.config.num_kv_heads,
-            self.config.head_dim,
-            self.blocks[0].attn_norm_eps(),
-            self.kv_cache.max_seq_len(),
-            Some(tail.final_norm_handle),
-            Some(tail.final_norm_bytes),
-            self.output_norm.eps(),
-            Some(tail.lm_head_handle),
-            Some(tail.lm_head_bytes),
-            tail.lm_head_out_features,
-            &mut logits,
-        );
+        let result = with_autorelease_pool(|| {
+            oxibonsai_kernels::try_metal_prefill_ternary(
+                &mut hidden,
+                pos,
+                self.blocks.len(),
+                &binding.layer_params,
+                rope_cos,
+                rope_sin,
+                self.config.hidden_size,
+                self.config.intermediate_size,
+                self.config.num_attention_heads,
+                self.config.num_kv_heads,
+                self.config.head_dim,
+                self.blocks[0].attn_norm_eps(),
+                self.kv_cache.max_seq_len(),
+                Some(tail.final_norm_handle),
+                Some(tail.final_norm_bytes),
+                self.output_norm.eps(),
+                Some(tail.lm_head_handle),
+                Some(tail.lm_head_bytes),
+                tail.lm_head_out_features,
+                &mut logits,
+            )
+        });
         self.metal_q1_slots.mark_used(self.blocks.len());
         result?;
         self.note_device_kv_used();
@@ -1284,30 +1545,32 @@ impl<'a> BonsaiModel<'a> {
             .tail
             .ok_or("the uncached ternary prefill requires a ternary LM head")?;
         let mut logits = vec![0.0f32; tail.lm_head_out_features];
-        let result = oxibonsai_kernels::try_metal_full_forward_prefill_ternary(
-            &hidden_batch,
-            token_ids.len(),
-            pos_start,
-            self.blocks.len(),
-            &binding.layer_params,
-            &cos_table,
-            &sin_table,
-            self.config.hidden_size,
-            self.config.intermediate_size,
-            self.config.num_attention_heads,
-            self.config.num_kv_heads,
-            self.config.head_dim,
-            self.blocks[0].attn_norm_eps(),
-            self.kv_cache.max_seq_len(),
-            Some(tail.final_norm_handle),
-            Some(tail.final_norm_bytes),
-            self.output_norm.eps(),
-            Some(tail.lm_head_handle),
-            Some(tail.lm_head_bytes),
-            tail.lm_head_out_features,
-            Some(&mut logits),
-            None,
-        );
+        let result = with_autorelease_pool(|| {
+            oxibonsai_kernels::try_metal_full_forward_prefill_ternary(
+                &hidden_batch,
+                token_ids.len(),
+                pos_start,
+                self.blocks.len(),
+                &binding.layer_params,
+                &cos_table,
+                &sin_table,
+                self.config.hidden_size,
+                self.config.intermediate_size,
+                self.config.num_attention_heads,
+                self.config.num_kv_heads,
+                self.config.head_dim,
+                self.blocks[0].attn_norm_eps(),
+                self.kv_cache.max_seq_len(),
+                Some(tail.final_norm_handle),
+                Some(tail.final_norm_bytes),
+                self.output_norm.eps(),
+                Some(tail.lm_head_handle),
+                Some(tail.lm_head_bytes),
+                tail.lm_head_out_features,
+                Some(&mut logits),
+                None,
+            )
+        });
         self.metal_q1_slots.mark_used(self.blocks.len());
         result?;
         self.note_device_kv_used();
@@ -1334,29 +1597,31 @@ impl<'a> BonsaiModel<'a> {
             .tail
             .ok_or("the uncached ternary prefill verify requires a ternary LM head")?;
         let mut ids: Vec<u32> = Vec::with_capacity(token_ids.len());
-        let result = oxibonsai_kernels::try_metal_full_forward_prefill_verify_ternary(
-            &hidden_batch,
-            token_ids.len(),
-            pos_start,
-            self.blocks.len(),
-            &binding.layer_params,
-            &cos_table,
-            &sin_table,
-            self.config.hidden_size,
-            self.config.intermediate_size,
-            self.config.num_attention_heads,
-            self.config.num_kv_heads,
-            self.config.head_dim,
-            self.blocks[0].attn_norm_eps(),
-            self.kv_cache.max_seq_len(),
-            Some(tail.final_norm_handle),
-            Some(tail.final_norm_bytes),
-            self.output_norm.eps(),
-            Some(tail.lm_head_handle),
-            Some(tail.lm_head_bytes),
-            tail.lm_head_out_features,
-            &mut ids,
-        );
+        let result = with_autorelease_pool(|| {
+            oxibonsai_kernels::try_metal_full_forward_prefill_verify_ternary(
+                &hidden_batch,
+                token_ids.len(),
+                pos_start,
+                self.blocks.len(),
+                &binding.layer_params,
+                &cos_table,
+                &sin_table,
+                self.config.hidden_size,
+                self.config.intermediate_size,
+                self.config.num_attention_heads,
+                self.config.num_kv_heads,
+                self.config.head_dim,
+                self.blocks[0].attn_norm_eps(),
+                self.kv_cache.max_seq_len(),
+                Some(tail.final_norm_handle),
+                Some(tail.final_norm_bytes),
+                self.output_norm.eps(),
+                Some(tail.lm_head_handle),
+                Some(tail.lm_head_bytes),
+                tail.lm_head_out_features,
+                &mut ids,
+            )
+        });
         self.metal_q1_slots.mark_used(self.blocks.len());
         result?;
         self.note_device_kv_used();

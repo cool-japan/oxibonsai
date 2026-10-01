@@ -62,6 +62,7 @@ pub mod embeddings;
 pub mod engine;
 pub mod engine_control;
 pub mod engine_greedy;
+pub mod engine_hybrid_gpu;
 mod engine_load;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod engine_pool;
@@ -112,6 +113,7 @@ pub mod tokenizer_bridge;
 #[cfg(feature = "server")]
 pub mod tool_calling;
 pub mod tracing_setup;
+pub mod vision_prefill;
 pub mod wasm_api;
 #[cfg(feature = "server")]
 pub mod web_ui;

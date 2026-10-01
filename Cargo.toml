@@ -53,6 +53,19 @@ oxibonsai-testkit = { path = "crates/oxibonsai-testkit" }
 scirs2-core = { version = "0.6.5", default-features = false }
 oxiarc-deflate = "0.4.2"
 
+# ── Image decoding (Bonsai 2 vision input) ──
+# `oxibonsai-model`'s `vision::image_decode` decodes PNG in-house over
+# `oxiarc-deflate` and JPEG through `jpeg-decoder` (Pure Rust, image-rs;
+# baseline and progressive, with an IDCT derived from stb_image's — the
+# decoder the PrismML fork's `libmtmd` reads images with). The COOLJAPAN
+# `oximedia-image` 0.2.1 was evaluated first and is not used: it depends on
+# `oxifft` unconditionally, whose `spin` 0.12 duplicates the `spin` 0.9 that
+# `lazy_static` already brings in, which `deny.toml`'s
+# `multiple-versions = "deny"` refuses; its JPEG decoder is also
+# baseline-only. `jpeg-decoder`'s default `rayon` feature stays off: one
+# request-scoped image does not need a thread pool.
+jpeg-decoder = { version = "0.3.2", default-features = false }
+
 # ── GPU backends ──
 metal = "0.33.0"
 cudarc = { version = "0.19", features = ["nvrtc", "cuda-version-from-build-system", "fallback-latest"] }

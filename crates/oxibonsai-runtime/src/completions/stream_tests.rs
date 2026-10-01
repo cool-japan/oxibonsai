@@ -768,22 +768,34 @@ async fn a_stream_stopped_by_a_real_cancel_does_not_affect_the_next_request() {
 // `InferenceEngine`, but not real generation, so a byte-accurate
 // stop-sequence match landing inside real, unpredictable model output is
 // untested there. The real GGUF and its tokenizer come from `OXI_MODEL` /
-// `OXI_TOKENIZER` only; without them the test records a skip, so a fresh
-// clone still passes `cargo test`.
+// `OXI_TOKENIZER` when set, else the testkit `models/`/
+// `$OXIBONSAI_MODELS_DIR` resolver; without either the test records a skip,
+// so a fresh clone still passes `cargo test`.
 
 /// The capability record name of the real-model test below.
 const REAL_STREAM_STOP_TEST: &str = "oxibonsai-runtime::lib::\
      real_model_stream_stop_sequence_matches_the_non_stream_text_and_reports_stop";
 
 /// The real-GGUF `InferenceEngine` + tokenizer as a router, or `None` —
-/// with the skip recorded — when `OXI_MODEL` / `OXI_TOKENIZER` are not set.
+/// with the skip recorded — when neither `OXI_MODEL`/`OXI_TOKENIZER` nor the
+/// testkit `models/` fallback locates both files.
 fn real_model_router() -> Option<axum::Router> {
     use oxibonsai_testkit::capability::{record_skipped, Capability};
     let var = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
-    let (Some(model_path), Some(tokenizer_path)) = (var("OXI_MODEL"), var("OXI_TOKENIZER")) else {
+    let model_path = var("OXI_MODEL").or_else(|| {
+        oxibonsai_testkit::workspace::find_model("Ternary-Bonsai-1.7B.gguf")
+            .map(|p| p.to_string_lossy().into_owned())
+    });
+    let tokenizer_path = var("OXI_TOKENIZER").or_else(|| {
+        oxibonsai_testkit::workspace::find_model("tokenizer.json")
+            .map(|p| p.to_string_lossy().into_owned())
+    });
+    let (Some(model_path), Some(tokenizer_path)) = (model_path, tokenizer_path) else {
         eprintln!(
-            "capability report: {REAL_STREAM_STOP_TEST} SKIPPED — set OXI_MODEL \
-             (Ternary-Bonsai-1.7B.gguf) and OXI_TOKENIZER (its tokenizer.json)"
+            "capability report: {REAL_STREAM_STOP_TEST} SKIPPED — set OXI_MODEL/OXI_TOKENIZER, \
+             or OXIBONSAI_MODELS_DIR to a directory holding Ternary-Bonsai-1.7B.gguf and \
+             tokenizer.json (checked: {:?})",
+            oxibonsai_testkit::workspace::models_dir()
         );
         record_skipped(Capability::LegacyModels, REAL_STREAM_STOP_TEST);
         return None;
@@ -807,6 +819,7 @@ async fn real_model_stream_stop_sequence_matches_the_non_stream_text_and_reports
     let Some(app) = real_model_router() else {
         return;
     };
+    let start = std::time::Instant::now();
     let stream_body = serde_json::json!({
         "prompt": "Once upon a time, in a small village by the sea,",
         "max_tokens": 32,
@@ -858,9 +871,10 @@ async fn real_model_stream_stop_sequence_matches_the_non_stream_text_and_reports
         stream_text, non_stream_text,
         "streamed text must equal the non-streaming path's text byte for byte"
     );
-    oxibonsai_testkit::capability::record_executed(
+    oxibonsai_testkit::capability::record_executed_timed(
         oxibonsai_testkit::capability::Capability::LegacyModels,
         REAL_STREAM_STOP_TEST,
+        start.elapsed(),
     );
 }
 

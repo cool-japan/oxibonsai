@@ -91,8 +91,7 @@ fn bench_gemv_ternary_par(c: &mut Criterion) {
     group.finish();
 }
 
-/// Batch sizes the ternary GEMM is benchmarked at (PERF-CPU-PREFILL
-/// ACCEPTANCE: "a criterion bench for gemm at m in {1, 4, 8, 64, 512}").
+/// Batch sizes the ternary GEMM is benchmarked at: `m` in {1, 4, 8, 64, 512}.
 ///
 /// The sweep spans the whole K-18 regression surface: `m = 1` is a decode
 /// step (a plain GEMV, no reuse to win), `m = 4`/`8` bracket
@@ -187,7 +186,7 @@ fn bench_gemm_dispatch(c: &mut Criterion) {
     group.finish();
 }
 
-// ─── PTQ1_0 / PQ2_0 vs TQ2_0_g128 GEMV comparison (B2-03) ───────────────────
+// ─── PTQ1_0 / PQ2_0 vs TQ2_0_g128 GEMV comparison ───────────────────────────
 
 /// A deterministic ternary-valued (-1/0/+1) weight vector, fixed-seed LCG
 /// so every format quantizes *the same* logical weights: this makes the
@@ -208,14 +207,13 @@ fn random_ternary_weights(n_rows: usize, k: usize) -> Vec<f32> {
         .collect()
 }
 
-/// B2-03's acceptance criterion ("`gemv_ptq1_0` within 15% of
-/// `gemv_tq2_0_g128`"), made visible in tracked `cargo bench` output. The
+/// The acceptance criterion that `gemv_ptq1_0` stays within 15% of
+/// `gemv_tq2_0_g128`, made visible in tracked `cargo bench` output. The
 /// pass/fail assertion itself lives in `gemv_ptq1.rs`'s `#[ignore]`d
 /// `prism_ptq1_0_gemv_within_15pct_of_tq2` (wall-clock ratio assertions are
-/// unreliable on this shared, multi-agent build machine per session
-/// CONTEXT.md and must never gate CI); this benchmark is the missing
-/// criterion form so the comparison is measured on every `cargo bench` run,
-/// not only on demand.
+/// unreliable on a shared build machine and must never gate CI); this
+/// benchmark is the criterion form, so the comparison is measured on every
+/// `cargo bench` run, not only on demand.
 fn bench_gemv_ptq1_0_vs_ternary(c: &mut Criterion) {
     let k = 4096usize;
     let mut group = c.benchmark_group("gemv_ptq1_0_vs_tq2_0_g128");
@@ -445,15 +443,14 @@ fn bench_gemv_pq2_0_vs_ternary(c: &mut Criterion) {
     group.finish();
 }
 
-// ─── KERN-PARALLEL: parallel-efficiency at the Bonsai-2 LM-head shape ──────
+// ─── Parallel efficiency at the Bonsai-2 LM-head shape ─────────────────────
 
 /// `token_embd.weight` / `output.weight`'s shape for Bonsai 2 27B
-/// (`n_rows=248320` (vocab), `k=5120` (embedding_length) — see CONTEXT.md's
-/// model facts). The substance of KERN-PARALLEL's finding (a 4.28-4.64x
-/// speedup on 8 cores going from direct to the adaptive tiled path) was
-/// previously only checked by an `#[ignore]`d in-crate `Instant` timing
-/// test; this is the missing criterion form, tracked on every `cargo
-/// bench` run.
+/// (`n_rows=248320` (vocab), `k=5120` (embedding_length), from the real GGUF
+/// header). The 4.28-4.64x speedup on 8 cores going from the direct to the
+/// adaptive tiled path is also checked by an `#[ignore]`d in-crate `Instant`
+/// timing test; this is its criterion form, tracked on every `cargo bench`
+/// run.
 fn bench_gemv_parallel_efficiency_lm_head(c: &mut Criterion) {
     const N_ROWS: usize = 248_320;
     const K: usize = 5120;
@@ -624,6 +621,92 @@ fn bench_int8_gemv_pq2_0(c: &mut Criterion) {
     group.finish();
 }
 
+// ─── Dense FP32 GEMM vs the per-row GEMV loop ───────────────────────────────
+
+/// Deterministic pseudo-random `f32` values in `[-0.5, 0.5)`.
+fn random_f32_values(n: usize, seed: u64) -> Vec<f32> {
+    let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    (0..n)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            ((state >> 40) as u32 as f32) / (1u32 << 24) as f32 - 0.5
+        })
+        .collect()
+}
+
+/// [`oxibonsai_kernels::gemm_f32`] against the loop it replaces — one
+/// [`oxibonsai_kernels::gemv_f32`] per row of the input — at the two shapes a
+/// ViT block runs (`k = 1152 -> n = 4304`, the MLP up-projection, and
+/// `k = 4304 -> n = 1152`, the down-projection) for `m` = 1 (a single row,
+/// which `gemm_f32` runs as the same GEMV, so the two should tie), 16, 64 and
+/// 576 (a full image's worth of patches).
+///
+/// The two are bit-identical (asserted once per shape before timing, so the
+/// bench can never time an implementation that computes something else), and
+/// the throughput is declared in floating-point operations (two per
+/// multiply-accumulate), so criterion's `Gelem/s` reads as GFLOP/s.
+fn bench_gemm_f32(c: &mut Criterion) {
+    let mut group = c.benchmark_group("gemm_f32");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(3));
+
+    for (k, n) in [(1152usize, 4304usize), (4304, 1152)] {
+        let weights = random_f32_values(n * k, 1);
+        for m in [1usize, 16, 64, 576] {
+            let input = random_f32_values(m * k, 2);
+            let mut output = vec![0.0f32; m * n];
+            let mut reference = vec![0.0f32; m * n];
+            let per_row = |out: &mut [f32]| {
+                for i in 0..m {
+                    oxibonsai_kernels::gemv_f32(
+                        black_box(&weights),
+                        black_box(&input[i * k..(i + 1) * k]),
+                        black_box(&mut out[i * n..(i + 1) * n]),
+                        n,
+                        k,
+                    )
+                    .expect("gemv_f32 should succeed on well-formed shapes");
+                }
+            };
+
+            per_row(&mut reference);
+            oxibonsai_kernels::gemm_f32(&input, &weights, None, m, k, n, &mut output)
+                .expect("gemm_f32 should succeed on well-formed shapes");
+            assert!(
+                output
+                    .iter()
+                    .zip(&reference)
+                    .all(|(g, r)| g.to_bits() == r.to_bits()),
+                "gemm_f32 must be bit-identical to the per-row gemv_f32 loop (m={m}, k={k}, n={n})"
+            );
+
+            let label = format!("m{m}_k{k}_n{n}");
+            group.throughput(Throughput::Elements((2 * m * n * k) as u64));
+            group.bench_function(BenchmarkId::new("blocked_rayon", &label), |b| {
+                b.iter(|| {
+                    oxibonsai_kernels::gemm_f32(
+                        black_box(&input),
+                        black_box(&weights),
+                        None,
+                        m,
+                        k,
+                        n,
+                        black_box(&mut output),
+                    )
+                    .expect("gemm_f32 should succeed on well-formed shapes");
+                });
+            });
+            group.bench_function(BenchmarkId::new("per_row_gemv", &label), |b| {
+                b.iter(|| per_row(black_box(&mut reference)));
+            });
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_dequant_ternary,
@@ -635,5 +718,6 @@ criterion_group!(
     bench_gemv_pq2_0_vs_ternary,
     bench_gemv_parallel_efficiency_lm_head,
     bench_int8_gemv_pq2_0,
+    bench_gemm_f32,
 );
 criterion_main!(benches);

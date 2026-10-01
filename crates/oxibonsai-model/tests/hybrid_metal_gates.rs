@@ -63,10 +63,50 @@ const G11_TEST: &str =
 const G10_TEST: &str =
     "oxibonsai-model::hybrid_metal_gates::hybrid_real_27b_metal_decode_throughput_bonsai2";
 
+/// Serialises the two gates of this binary (one 27B mapping at a time).
+static GATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Holds [`GATE_LOCK`] and keeps `OXIBONSAI_KERNEL_TIER` cleared for one
+/// gate, restoring its prior value on drop (also while unwinding). The CPU
+/// model's `PQ2_0` GEMV honours that INT8 selector on any tier (K-14) while
+/// the Metal runner never reads it, so a developer's exported value would
+/// otherwise flip the CPU-vs-Metal comparison.
+struct TierEnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    prior: Option<String>,
+}
+
+impl TierEnvGuard {
+    fn cleared() -> Self {
+        let lock = GATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = std::env::var(oxibonsai_kernels::dispatch_int8::KERNEL_TIER_ENV).ok();
+        // SAFETY: `lock` is held for the guard's lifetime and serialises
+        // every reader and writer of the environment in this binary.
+        unsafe { std::env::remove_var(oxibonsai_kernels::dispatch_int8::KERNEL_TIER_ENV) };
+        Self { _lock: lock, prior }
+    }
+}
+
+impl Drop for TierEnvGuard {
+    fn drop(&mut self) {
+        let key = oxibonsai_kernels::dispatch_int8::KERNEL_TIER_ENV;
+        // SAFETY: still under `GATE_LOCK` (see `cleared`).
+        unsafe {
+            match &self.prior {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
 /// G11 on the real 27B: per-kernel parity on real activations, then greedy
 /// runner tokens == CPU tokens == the fork's text, both bands.
 #[test]
 fn hybrid_real_27b_metal_matches_cpu_tokens_bonsai2() {
+    let _env = TierEnvGuard::cleared();
     #[cfg(all(feature = "metal", target_os = "macos"))]
     gates::g11(G11_TEST);
     #[cfg(not(all(feature = "metal", target_os = "macos")))]
@@ -76,6 +116,7 @@ fn hybrid_real_27b_metal_matches_cpu_tokens_bonsai2() {
 /// G10 on the real 27B: Metal decode throughput, both bands.
 #[test]
 fn hybrid_real_27b_metal_decode_throughput_bonsai2() {
+    let _env = TierEnvGuard::cleared();
     #[cfg(all(feature = "metal", target_os = "macos"))]
     gates::g10(G10_TEST);
     #[cfg(not(all(feature = "metal", target_os = "macos")))]

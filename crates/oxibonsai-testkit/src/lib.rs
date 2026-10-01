@@ -12,6 +12,10 @@
 //!   (`qwen35`) GGUF built on [`gguf_fixture`], for any crate that needs a
 //!   loadable hybrid model without a multi-GB real one (EMBED-WIRE handover
 //!   (3)).
+//! - [`mmproj_fixture`] — a small synthetic Qwen3-VL vision projector
+//!   (`clip` architecture, `qwen3vl_merger` projector) GGUF with the same
+//!   tensor inventory and type mix as the real Bonsai 2 mmproj, for
+//!   vision-tower tests that must not need the 0.63 GB real file.
 //! - [`capability`] — the JSONL hardware/fixture-capability self-skip
 //!   report contract (T-05), so a skipped hardware-dependent test is
 //!   visibly distinct from one that ran and passed.
@@ -36,6 +40,500 @@ pub mod dense_fixture;
 pub mod gguf_fixture;
 pub mod parity;
 pub mod qwen35_fixture;
+
+/// A synthetic Qwen3-VL vision projector (`mmproj`) GGUF.
+///
+/// The real Bonsai 2 projector (`Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf`) is
+/// a `general.architecture = "clip"` file with the `qwen3vl_merger`
+/// projector: a patch-embedding convolution stored as two temporal slices
+/// (`v.patch_embd.weight`, `v.patch_embd.weight.1`) plus `v.patch_embd.bias`,
+/// a learned `v.position_embd.weight` over a square grid, `block_count`
+/// pre-LayerNorm ViT blocks (`v.blk.N.{ln1,attn_qkv,attn_out,ln2,ffn_up,
+/// ffn_down}`), `v.post_ln` and the two-layer merger MLP `mm.0` / `mm.2`.
+/// This module builds the same inventory at toy sizes with the real file's
+/// type mix — `Q8_0` for `attn_qkv` / `attn_out` / `ffn_up` / `mm.0` /
+/// `mm.2`, `F16` for `ffn_down`, `F32` for everything else — so a loader and
+/// a tower can be exercised end to end (and against an independent
+/// reference) without the real weights.
+///
+/// Every value is [`gguf_fixture::deterministic_weights`] output scaled to a
+/// range that keeps activations of order one through the whole graph:
+/// matrices by roughly `1 / sqrt(fan_in)` (the fused QKV projection twice
+/// that, so the attention is visibly non-uniform), LayerNorm scales around
+/// one, biases and position embeddings small.
+///
+/// The builder is split into [`mmproj_fixture::metadata`],
+/// [`mmproj_fixture::tensors`] and [`mmproj_fixture::assemble`] so a negative
+/// test can drop, reshape, retype or add a tensor, or change a metadata key,
+/// before the bytes are written.
+pub mod mmproj_fixture {
+    use oxibonsai_core::MetadataWriteValue;
+
+    use crate::gguf_fixture::{
+        deterministic_weights, quantize_bytes, FixtureError, FixtureQuant, GgufFixtureBuilder,
+    };
+
+    /// Dimensions of a synthetic projector. [`MmprojFixtureSpec::tiny`] is
+    /// the canonical small configuration (2 blocks, hidden 64, 4 heads,
+    /// patch 16, spatial merge 2).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct MmprojFixtureSpec {
+        /// `clip.vision.embedding_length`.
+        pub hidden: usize,
+        /// `clip.vision.attention.head_count`.
+        pub heads: usize,
+        /// `clip.vision.feed_forward_length`.
+        pub ffn: usize,
+        /// `clip.vision.block_count`.
+        pub blocks: usize,
+        /// `clip.vision.patch_size`.
+        pub patch: usize,
+        /// Side of the stored square position-embedding grid
+        /// (`v.position_embd.weight` holds `pos_side * pos_side` rows).
+        pub pos_side: usize,
+        /// Output width of `mm.0` (the real file uses `4 * hidden`).
+        pub merger_hidden: usize,
+        /// `clip.vision.projection_dim` — the output width of `mm.2`.
+        pub projection_dim: usize,
+        /// Base seed; every tensor derives its own seed from it.
+        pub seed: u64,
+    }
+
+    impl MmprojFixtureSpec {
+        /// 2 blocks, hidden 64, 4 heads (head dim 16), FFN 96, patch 16, an
+        /// 8 x 8 stored position grid (image size 128), merger
+        /// 256 -> 256 -> 80.
+        #[must_use]
+        pub const fn tiny() -> Self {
+            Self {
+                hidden: 64,
+                heads: 4,
+                ffn: 96,
+                blocks: 2,
+                patch: 16,
+                pos_side: 8,
+                merger_hidden: 256,
+                projection_dim: 80,
+                seed: 0x5EED_C11F,
+            }
+        }
+    }
+
+    /// One tensor of the fixture: its GGUF-order shape (`ne0` first), the
+    /// format it is written in and its values before quantisation.
+    #[derive(Debug, Clone)]
+    pub struct FixtureTensor {
+        /// Tensor name, e.g. `v.blk.0.attn_qkv.weight`.
+        pub name: String,
+        /// GGUF-order shape (fastest-varying dimension first).
+        pub shape: Vec<u64>,
+        /// Storage format.
+        pub quant: FixtureQuant,
+        /// `shape.iter().product()` values, quantised to `quant` on write.
+        pub values: Vec<f32>,
+    }
+
+    fn tensor(
+        name: String,
+        shape: &[usize],
+        quant: FixtureQuant,
+        values: Vec<f32>,
+    ) -> FixtureTensor {
+        FixtureTensor {
+            name,
+            shape: shape.iter().map(|&d| d as u64).collect(),
+            quant,
+            values,
+        }
+    }
+
+    /// `n` deterministic values in `[offset - scale, offset + scale]`.
+    fn values(n: usize, seed: u64, scale: f32, offset: f32) -> Vec<f32> {
+        deterministic_weights(n, seed)
+            .into_iter()
+            .map(|v| v * scale + offset)
+            .collect()
+    }
+
+    /// The metadata of the fixture, in the real file's key spelling.
+    #[must_use]
+    pub fn metadata(spec: &MmprojFixtureSpec) -> Vec<(String, MetadataWriteValue)> {
+        let u32_of = |v: usize| MetadataWriteValue::U32(u32::try_from(v).unwrap_or(u32::MAX));
+        let text = |v: &str| MetadataWriteValue::Str(v.to_string());
+        vec![
+            ("general.architecture".to_string(), text("clip")),
+            ("general.type".to_string(), text("mmproj")),
+            (
+                "general.quantization_version".to_string(),
+                MetadataWriteValue::U32(2),
+            ),
+            (
+                "clip.has_vision_encoder".to_string(),
+                MetadataWriteValue::Bool(true),
+            ),
+            ("clip.projector_type".to_string(), text("qwen3vl_merger")),
+            ("clip.use_gelu".to_string(), MetadataWriteValue::Bool(true)),
+            (
+                "clip.vision.image_size".to_string(),
+                u32_of(spec.pos_side * spec.patch),
+            ),
+            ("clip.vision.patch_size".to_string(), u32_of(spec.patch)),
+            (
+                "clip.vision.embedding_length".to_string(),
+                u32_of(spec.hidden),
+            ),
+            (
+                "clip.vision.feed_forward_length".to_string(),
+                u32_of(spec.ffn),
+            ),
+            ("clip.vision.block_count".to_string(), u32_of(spec.blocks)),
+            (
+                "clip.vision.attention.head_count".to_string(),
+                u32_of(spec.heads),
+            ),
+            (
+                "clip.vision.attention.layer_norm_epsilon".to_string(),
+                MetadataWriteValue::F32(1e-6),
+            ),
+            (
+                "clip.vision.projection_dim".to_string(),
+                u32_of(spec.projection_dim),
+            ),
+            (
+                "clip.vision.spatial_merge_size".to_string(),
+                MetadataWriteValue::U32(2),
+            ),
+            (
+                "clip.vision.image_mean".to_string(),
+                MetadataWriteValue::ArrayF32(vec![0.5, 0.5, 0.5]),
+            ),
+            (
+                "clip.vision.image_std".to_string(),
+                MetadataWriteValue::ArrayF32(vec![0.5, 0.5, 0.5]),
+            ),
+            (
+                "clip.vision.is_deepstack_layers".to_string(),
+                MetadataWriteValue::ArrayBool(vec![false; spec.blocks]),
+            ),
+        ]
+    }
+
+    /// Every tensor of the fixture, named and shaped exactly as in the real
+    /// projector (`12 * blocks + 10` tensors).
+    #[must_use]
+    pub fn tensors(spec: &MmprojFixtureSpec) -> Vec<FixtureTensor> {
+        let h = spec.hidden;
+        let ffn = spec.ffn;
+        let inv_sqrt = |n: usize| 1.0 / (n.max(1) as f32).sqrt();
+        let mut seed = spec.seed;
+        let mut next_seed = move || {
+            seed = seed
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(0x2545_F491);
+            seed
+        };
+        let mut out = Vec::with_capacity(12 * spec.blocks + 10);
+        for il in 0..spec.blocks {
+            let name = |suffix: &str| format!("v.blk.{il}.{suffix}");
+            let norm_scale = |seed: u64| values(h, seed, 0.2, 1.0);
+            let small = |n: usize, seed: u64| values(n, seed, 0.1, 0.0);
+            out.push(tensor(
+                name("ln1.weight"),
+                &[h],
+                FixtureQuant::F32,
+                norm_scale(next_seed()),
+            ));
+            out.push(tensor(
+                name("ln1.bias"),
+                &[h],
+                FixtureQuant::F32,
+                small(h, next_seed()),
+            ));
+            out.push(tensor(
+                name("attn_qkv.weight"),
+                &[h, 3 * h],
+                FixtureQuant::Q8_0,
+                values(3 * h * h, next_seed(), 2.0 * inv_sqrt(h), 0.0),
+            ));
+            out.push(tensor(
+                name("attn_qkv.bias"),
+                &[3 * h],
+                FixtureQuant::F32,
+                small(3 * h, next_seed()),
+            ));
+            out.push(tensor(
+                name("attn_out.weight"),
+                &[h, h],
+                FixtureQuant::Q8_0,
+                values(h * h, next_seed(), inv_sqrt(h), 0.0),
+            ));
+            out.push(tensor(
+                name("attn_out.bias"),
+                &[h],
+                FixtureQuant::F32,
+                small(h, next_seed()),
+            ));
+            out.push(tensor(
+                name("ln2.weight"),
+                &[h],
+                FixtureQuant::F32,
+                norm_scale(next_seed()),
+            ));
+            out.push(tensor(
+                name("ln2.bias"),
+                &[h],
+                FixtureQuant::F32,
+                small(h, next_seed()),
+            ));
+            out.push(tensor(
+                name("ffn_up.weight"),
+                &[h, ffn],
+                FixtureQuant::Q8_0,
+                values(h * ffn, next_seed(), inv_sqrt(h), 0.0),
+            ));
+            out.push(tensor(
+                name("ffn_up.bias"),
+                &[ffn],
+                FixtureQuant::F32,
+                small(ffn, next_seed()),
+            ));
+            out.push(tensor(
+                name("ffn_down.weight"),
+                &[ffn, h],
+                FixtureQuant::F16,
+                values(ffn * h, next_seed(), inv_sqrt(ffn), 0.0),
+            ));
+            out.push(tensor(
+                name("ffn_down.bias"),
+                &[h],
+                FixtureQuant::F32,
+                small(h, next_seed()),
+            ));
+        }
+        let merged = 4 * h;
+        let mid = spec.merger_hidden;
+        let proj = spec.projection_dim;
+        out.push(tensor(
+            "mm.0.weight".to_string(),
+            &[merged, mid],
+            FixtureQuant::Q8_0,
+            values(merged * mid, next_seed(), inv_sqrt(merged), 0.0),
+        ));
+        out.push(tensor(
+            "mm.0.bias".to_string(),
+            &[mid],
+            FixtureQuant::F32,
+            values(mid, next_seed(), 0.1, 0.0),
+        ));
+        out.push(tensor(
+            "mm.2.weight".to_string(),
+            &[mid, proj],
+            FixtureQuant::Q8_0,
+            values(mid * proj, next_seed(), inv_sqrt(mid), 0.0),
+        ));
+        out.push(tensor(
+            "mm.2.bias".to_string(),
+            &[proj],
+            FixtureQuant::F32,
+            values(proj, next_seed(), 0.1, 0.0),
+        ));
+        out.push(tensor(
+            "v.post_ln.weight".to_string(),
+            &[h],
+            FixtureQuant::F32,
+            values(h, next_seed(), 0.2, 1.0),
+        ));
+        out.push(tensor(
+            "v.post_ln.bias".to_string(),
+            &[h],
+            FixtureQuant::F32,
+            values(h, next_seed(), 0.1, 0.0),
+        ));
+        let p = spec.patch;
+        let patch_len = p * p * 3;
+        out.push(tensor(
+            "v.patch_embd.bias".to_string(),
+            &[h],
+            FixtureQuant::F32,
+            values(h, next_seed(), 0.1, 0.0),
+        ));
+        out.push(tensor(
+            "v.patch_embd.weight".to_string(),
+            &[p, p, 3, h],
+            FixtureQuant::F32,
+            values(patch_len * h, next_seed(), inv_sqrt(patch_len), 0.0),
+        ));
+        out.push(tensor(
+            "v.patch_embd.weight.1".to_string(),
+            &[p, p, 3, h],
+            FixtureQuant::F32,
+            values(patch_len * h, next_seed(), inv_sqrt(patch_len), 0.0),
+        ));
+        let n_pos = spec.pos_side * spec.pos_side;
+        out.push(tensor(
+            "v.position_embd.weight".to_string(),
+            &[h, n_pos],
+            FixtureQuant::F32,
+            values(h * n_pos, next_seed(), 0.5, 0.0),
+        ));
+        out
+    }
+
+    /// Write `metadata` and `tensors` as one GGUF file.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`quantize_bytes`] (a value count that is not a multiple
+    /// of the format's block size) and the writer's own errors, and reports
+    /// [`FixtureError::UnsupportedByWriter`] for a format with no GGUF
+    /// writer mapping.
+    pub fn assemble(
+        metadata: &[(String, MetadataWriteValue)],
+        tensors: &[FixtureTensor],
+    ) -> Result<Vec<u8>, FixtureError> {
+        let mut builder = GgufFixtureBuilder::new();
+        for (key, value) in metadata {
+            builder.metadata(key, value.clone());
+        }
+        for t in tensors {
+            let tensor_type = t
+                .quant
+                .writer_type()
+                .ok_or(FixtureError::UnsupportedByWriter { quant: t.quant })?;
+            let data = quantize_bytes(t.quant, &t.values)?;
+            builder.tensor_raw(&t.name, &t.shape, tensor_type, data);
+        }
+        builder.build()
+    }
+
+    /// The complete synthetic projector for `spec`.
+    ///
+    /// # Errors
+    ///
+    /// See [`assemble`].
+    pub fn synthetic_mmproj_gguf(spec: &MmprojFixtureSpec) -> Result<Vec<u8>, FixtureError> {
+        assemble(&metadata(spec), &tensors(spec))
+    }
+
+    /// A deterministic `width x height` RGB8 test image (row-major, three
+    /// bytes per pixel), built from integer arithmetic only so it is
+    /// identical on every platform.
+    ///
+    /// It is deliberately asymmetric: red is a horizontal ramp, green a
+    /// vertical one, blue an irregular block pattern, and a diagonal band
+    /// inverts the red channel — so a transposed axis, a swapped colour
+    /// plane or a mis-ordered patch changes the picture a vision tower
+    /// sees, and different regions of the image look different.
+    #[must_use]
+    pub fn pattern_rgb8(width: usize, height: usize) -> Vec<u8> {
+        let mut data = Vec::with_capacity(width * height * 3);
+        let wd = width.saturating_sub(1).max(1);
+        let hd = height.saturating_sub(1).max(1);
+        for y in 0..height {
+            for x in 0..width {
+                let mut r = x * 255 / wd;
+                let g = y * 255 / hd;
+                let b = if (x / 24 + y / 20).is_multiple_of(3) {
+                    230
+                } else {
+                    (x * y / 7) % 97 + 40
+                };
+                if (x + 2 * y) % 64 < 8 {
+                    r = 255 - r;
+                }
+                data.extend([r as u8, g as u8, b as u8]);
+            }
+        }
+        data
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use oxibonsai_core::gguf::reader::GgufFile;
+        use oxibonsai_core::GgufTensorType;
+
+        #[test]
+        fn tiny_fixture_parses_with_the_real_inventory_and_type_mix() {
+            let spec = MmprojFixtureSpec::tiny();
+            let bytes = synthetic_mmproj_gguf(&spec).expect("build fixture");
+            let gguf = GgufFile::parse(&bytes).expect("parse fixture");
+            assert_eq!(gguf.tensors.len(), 12 * spec.blocks + 10);
+            assert_eq!(
+                gguf.metadata
+                    .get_string("general.architecture")
+                    .expect("arch"),
+                "clip"
+            );
+            assert_eq!(
+                gguf.metadata
+                    .get_string("clip.projector_type")
+                    .expect("projector"),
+                "qwen3vl_merger"
+            );
+            let qkv = gguf
+                .tensors
+                .get("v.blk.1.attn_qkv.weight")
+                .expect("qkv present");
+            assert_eq!(qkv.shape, vec![64, 192]);
+            assert_eq!(qkv.tensor_type, GgufTensorType::Q8_0);
+            let down = gguf
+                .tensors
+                .get("v.blk.0.ffn_down.weight")
+                .expect("ffn_down present");
+            assert_eq!(down.tensor_type, GgufTensorType::F16);
+            let patch = gguf
+                .tensors
+                .get("v.patch_embd.weight.1")
+                .expect("second temporal slice present");
+            assert_eq!(patch.shape, vec![16, 16, 3, 64]);
+            let pos = gguf
+                .tensors
+                .get("v.position_embd.weight")
+                .expect("position embedding present");
+            assert_eq!(pos.shape, vec![64, 64]);
+        }
+
+        #[test]
+        fn fixture_is_deterministic_and_seeded() {
+            let spec = MmprojFixtureSpec::tiny();
+            let a = synthetic_mmproj_gguf(&spec).expect("first build");
+            let b = synthetic_mmproj_gguf(&spec).expect("second build");
+            assert_eq!(a, b);
+            let mut other = spec.clone();
+            other.seed ^= 1;
+            let c = synthetic_mmproj_gguf(&other).expect("reseeded build");
+            assert_ne!(a, c, "a different seed must change the weights");
+        }
+
+        #[test]
+        fn pattern_is_sized_deterministic_and_asymmetric() {
+            let img = pattern_rgb8(64, 32);
+            assert_eq!(img.len(), 64 * 32 * 3);
+            assert_eq!(img, pattern_rgb8(64, 32));
+            let px = |x: usize, y: usize| img[(y * 64 + x) * 3..(y * 64 + x) * 3 + 3].to_vec();
+            // Transposing a coordinate pair changes the pixel...
+            assert_ne!(px(5, 1), px(1, 5));
+            // ...and so does swapping two channels of one pixel.
+            let p = px(40, 20);
+            assert!(
+                p[0] != p[1] || p[1] != p[2],
+                "pixel channels all equal: {p:?}"
+            );
+        }
+
+        #[test]
+        fn assemble_lets_a_test_drop_a_tensor() {
+            let spec = MmprojFixtureSpec::tiny();
+            let mut all = tensors(&spec);
+            all.retain(|t| t.name != "v.patch_embd.bias");
+            let bytes = assemble(&metadata(&spec), &all).expect("build");
+            let gguf = GgufFile::parse(&bytes).expect("parse");
+            assert!(gguf.tensors.get("v.patch_embd.bias").is_none());
+            assert_eq!(gguf.tensors.len(), 12 * spec.blocks + 9);
+        }
+    }
+}
 
 /// Collision-free temp-path helpers built on `std::env::temp_dir()`.
 ///

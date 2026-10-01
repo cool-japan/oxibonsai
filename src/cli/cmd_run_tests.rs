@@ -244,14 +244,15 @@ fn a_cpu_backend_greedy_run_never_takes_the_gpu_argmax_route() {
         !engine.greedy_gpu_eligible(false),
         "a --backend cpu engine must never be GPU-argmax eligible"
     );
+    let chat_prompt = ChatPrompt::Text(prompt.to_vec());
     let mut printer = TokenPrinter::new(None, false, ReasoningDisplay::Show, true);
-    let streamed = run_engine_generation(&mut engine, &prompt, 8, false, &mut printer)
+    let streamed = run_engine_generation(&mut engine, &chat_prompt, 8, false, &mut printer)
         .expect("streamed decode");
     assert!(matches!(printer, TokenPrinter::Raw { count } if count == streamed));
 
     let mut engine = load_engine(&gguf, &greedy_load(Backend::Cpu, 42, 0.0), 0).expect("load");
     let mut printer = TokenPrinter::new(None, false, ReasoningDisplay::Show, true);
-    let buffered = run_engine_generation(&mut engine, &prompt, 8, true, &mut printer)
+    let buffered = run_engine_generation(&mut engine, &chat_prompt, 8, true, &mut printer)
         .expect("--no-stream decode");
     assert_eq!(streamed, buffered);
 
@@ -503,8 +504,9 @@ fn clamped_generation_reaches_exactly_the_context_ceiling_on_both_decode_paths()
     let budget = clamp_generation_budget(prompt.len(), 9_999, ctx)
         .expect("a 5-token prompt fits a 16-token context");
     assert_eq!(budget, ctx - prompt.len());
+    let chat_prompt = ChatPrompt::Text(prompt.to_vec());
     let mut printer = TokenPrinter::new(None, false, ReasoningDisplay::Show, true);
-    let generated = run_engine_generation(&mut engine, &prompt, budget, false, &mut printer)
+    let generated = run_engine_generation(&mut engine, &chat_prompt, budget, false, &mut printer)
         .expect("decode to the context ceiling must not hit the hard context-overflow error");
     assert_eq!(
         generated, budget,
@@ -519,7 +521,7 @@ fn clamped_generation_reaches_exactly_the_context_ceiling_on_both_decode_paths()
     let mut printer = TokenPrinter::new(None, false, ReasoningDisplay::Show, false);
     let generated = run_constrained_or_stopped_with(
         &mut engine,
-        &prompt,
+        &chat_prompt,
         budget,
         None,
         &["ZZZZ_NEVER_MATCHES_THIS_STOP_XYZ".to_string()],
@@ -578,7 +580,7 @@ fn cli_greedy_text(
     )
     .expect("tokenizer resolution")
     .expect("a tokenizer for the real model");
-    let prompt_tokens = tok.encode(prompt).expect("encode");
+    let prompt_tokens = ChatPrompt::Text(tok.encode(prompt).expect("encode"));
     let mut printer = TokenPrinter::new(Some(&tok), false, ReasoningDisplay::Show, false);
     run_engine_generation(&mut engine, &prompt_tokens, max_tokens, false, &mut printer)
         .expect("decode");
@@ -634,5 +636,95 @@ fn rope_scaling_off_reproduces_the_pre_yarn_bonsai_8b_text() {
         auto,
         " there lived a young girl named Lila. She was known for her curious nature and her \
          love of the sea. Lila often spent her days exploring the cliffs"
+    );
+}
+
+// ── --image: the user turn and the spliced prompt ───────────────────────────
+
+#[test]
+fn a_run_user_turn_carries_its_images_ahead_of_the_text() {
+    let plain = user_turn("Describe this image briefly.", 0);
+    assert_eq!(plain.role, "user");
+    assert_eq!(
+        plain.content.as_text(),
+        Some("Describe this image briefly."),
+        "a text-only run renders exactly as before"
+    );
+
+    let with_images = user_turn("Compare them.", 2);
+    assert_eq!(
+        with_images.content,
+        oxibonsai_runtime::vision_prefill::RenderContent::Parts(vec![
+            RenderContentPart::Image,
+            RenderContentPart::Image,
+            RenderContentPart::Text("Compare them.".to_string()),
+        ])
+    );
+    assert_eq!(with_images.content.image_count(), 2);
+}
+
+#[test]
+fn a_prompt_without_images_stays_its_token_ids() {
+    let tokens = vec![7u32, 8, 9];
+    let prompt = multimodal_prompt(tokens.clone(), &bonsai2::VisionRequest::default(), None, 16)
+        .expect("text prompt");
+    assert_eq!(prompt, ChatPrompt::Text(tokens));
+}
+
+fn vision_request_for_a_test_image(dir: &std::path::Path) -> bonsai2::VisionRequest {
+    bonsai2::VisionRequest {
+        mmproj: Some(bonsai2::tests::synthetic_projector(dir)),
+        images: vec![bonsai2::tests::pattern_png_file(dir)],
+        image_max_tokens: None,
+    }
+}
+
+#[test]
+fn an_image_is_encoded_and_spliced_in_place_of_its_placeholder() {
+    let dir = test_fixtures::scratch_dir("run_splice");
+    let vision = vision_request_for_a_test_image(&dir);
+    let service = vision
+        .load_service("qwen35", bonsai2::cli_image_policy())
+        .expect("load")
+        .expect("requested");
+    let ids = service.token_ids();
+    let tokens = vec![1u32, ids.vision_start, ids.image_pad, ids.vision_end, 2];
+    let prompt =
+        multimodal_prompt(tokens.clone(), &vision, Some(&service), 4096).expect("spliced prompt");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(prompt.image_count(), 1);
+    assert_eq!(prompt.tokens(), tokens.as_slice());
+    assert_eq!(
+        prompt.len(),
+        tokens.len() - 1 + 48,
+        "the placeholder became the 8 x 6 grid's rows"
+    );
+}
+
+#[test]
+fn an_image_prompt_is_checked_against_the_context_before_any_encode() {
+    let dir = test_fixtures::scratch_dir("run_splice_ctx");
+    let vision = vision_request_for_a_test_image(&dir);
+    let service = vision
+        .load_service("qwen35", bonsai2::cli_image_policy())
+        .expect("load")
+        .expect("requested");
+    let ids = service.token_ids();
+    let tokens = vec![1u32, ids.vision_start, ids.image_pad, ids.vision_end, 2];
+    let msg = multimodal_prompt(tokens, &vision, Some(&service), 40)
+        .expect_err("52 rows cannot fit a 40-position context")
+        .to_string();
+
+    // A prompt with no placeholder for the image is refused, too.
+    let orphan = multimodal_prompt(vec![1u32, 2, 3], &vision, Some(&service), 4096)
+        .expect_err("the image has no placeholder")
+        .to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(msg.contains("sequence length 52"), "{msg}");
+    assert!(msg.contains("max context 40"), "{msg}");
+    assert!(msg.contains("--image-max-tokens"), "{msg}");
+    assert!(
+        orphan.starts_with("[image_placeholder_count_mismatch]"),
+        "{orphan}"
     );
 }

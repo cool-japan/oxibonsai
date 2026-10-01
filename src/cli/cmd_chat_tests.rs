@@ -45,6 +45,7 @@ fn every_turn_renders_the_whole_history_through_the_gguf_template() {
         &ChatContract::default(),
         16,
         4096,
+        &text_rows,
     )
     .expect("fits");
     let expected = "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n\
@@ -73,7 +74,16 @@ fn no_think_closes_the_generation_prompts_think_block() {
         enable_thinking: Some(false),
         ..ChatContract::default()
     };
-    let turn = render_turn(&tok, &template, &mut history, &contract, 16, 4096).expect("fits");
+    let turn = render_turn(
+        &tok,
+        &template,
+        &mut history,
+        &contract,
+        16,
+        4096,
+        &text_rows,
+    )
+    .expect("fits");
     assert!(!turn.started_in_think);
     let rendered = generate::render_prompt(&template, &history, &contract).expect("render");
     assert!(
@@ -101,6 +111,7 @@ fn the_oldest_non_system_messages_are_dropped_to_fit_the_context() {
         &contract,
         max_tokens,
         full_len + max_tokens - 1,
+        &text_rows,
     )
     .expect("fits after dropping");
     assert!(turn.dropped_messages >= 1);
@@ -114,7 +125,7 @@ fn the_oldest_non_system_messages_are_dropped_to_fit_the_context() {
         "system is kept"
     );
     assert_eq!(
-        history.last().map(|m| m.content.as_str()),
+        history.last().and_then(|m| m.content.as_text()),
         Some("Bye"),
         "the latest user turn is never dropped"
     );
@@ -136,6 +147,7 @@ fn a_latest_message_that_cannot_fit_alone_is_refused() {
         &ChatContract::default(),
         8,
         16,
+        &text_rows,
     ) {
         Ok(_) => panic!("cannot fit in 16 tokens"),
         Err(e) => e.to_string(),
@@ -160,8 +172,16 @@ fn a_fitting_prompt_with_no_room_to_drop_clamps_the_budget_instead_of_erroring()
         tok.encode(&rendered).expect("encode").len()
     };
     let max_context = prompt_len + 3;
-    let turn = render_turn(&tok, &template, &mut history, &contract, 50, max_context)
-        .expect("the prompt itself fits; this must not be an error");
+    let turn = render_turn(
+        &tok,
+        &template,
+        &mut history,
+        &contract,
+        50,
+        max_context,
+        &text_rows,
+    )
+    .expect("the prompt itself fits; this must not be an error");
     assert_eq!(turn.dropped_messages, 0, "nothing WAS droppable");
     assert_eq!(
         turn.effective_max_tokens, 3,
@@ -334,8 +354,16 @@ fn chat_renders_all_five_apply_template_cases_byte_identically() {
         let expected = case["output"]["prompt"].as_str().expect("golden prompt");
         let rendered = generate::render_prompt(&template, &history, &contract).expect("render");
         assert_eq!(rendered, expected, "apply_template case {index} differs");
-        let turn = render_turn(&tok, &template, &mut history, &contract, 16, 262_144)
-            .expect("render_turn");
+        let turn = render_turn(
+            &tok,
+            &template,
+            &mut history,
+            &contract,
+            16,
+            262_144,
+            &text_rows,
+        )
+        .expect("render_turn");
         assert_eq!(
             turn.tokens,
             tok.encode(expected).expect("encode"),
@@ -348,4 +376,160 @@ fn chat_renders_all_five_apply_template_cases_byte_identically() {
         );
     }
     let _ = std::fs::remove_dir_all(&scratch);
+}
+
+// ── --image sessions ────────────────────────────────────────────────────────
+
+/// One already-encoded 8 x 6 image (48 rows of width 4) under the Bonsai 2
+/// marker ids.
+fn one_image_session() -> SessionImages {
+    let grid = GridSize { h: 6, w: 8 };
+    SessionImages::new(
+        vec![EncodedImage {
+            rows: vec![0.25; 48 * 4],
+            grid,
+            source: (256, 192),
+        }],
+        VisionTokenIds::BONSAI2,
+    )
+}
+
+#[test]
+fn a_session_prompt_is_multimodal_while_it_holds_the_image_message() {
+    let session = one_image_session();
+    let ids = VisionTokenIds::BONSAI2;
+    assert_eq!(session.len(), 1);
+    let with_image = vec![1u32, ids.vision_start, ids.image_pad, ids.vision_end, 2, 3];
+    assert!(session.placed_in(&with_image));
+    assert_eq!(session.rows(&with_image).expect("rows"), 6 - 1 + 48);
+    let prompt = session.prompt(with_image.clone()).expect("spliced");
+    assert_eq!(prompt.image_count(), 1);
+    assert_eq!(prompt.len(), 53);
+    assert_eq!(prompt.tokens(), with_image.as_slice());
+
+    // Once the image message is dropped the conversation is plain text.
+    let text_only = vec![1u32, 2, 3];
+    assert!(!session.placed_in(&text_only));
+    assert_eq!(session.rows(&text_only).expect("rows"), 3);
+    assert_eq!(
+        session.prompt(text_only.clone()).expect("text"),
+        ChatPrompt::Text(text_only)
+    );
+
+    // A second placeholder (a pasted `<|image_pad|>`) cannot splice.
+    let two_pads = vec![
+        ids.vision_start,
+        ids.image_pad,
+        ids.vision_end,
+        ids.vision_start,
+        ids.image_pad,
+        ids.vision_end,
+    ];
+    let msg = session
+        .prompt(two_pads.clone())
+        .expect_err("two placeholders, one image")
+        .to_string();
+    assert!(
+        msg.starts_with("[image_placeholder_count_mismatch]"),
+        "{msg}"
+    );
+    assert!(session.rows(&two_pads).is_err());
+}
+
+/// The context check counts what the model will see: with the image rows
+/// the same conversation no longer fits, so the oldest turns are dropped;
+/// an error from the row count refuses the turn.
+#[test]
+fn render_turn_budgets_with_the_expanded_row_count() {
+    let tok = tokenizer_with_thinking_template();
+    let template = tok.resolved_chat_template();
+    let contract = ChatContract::default();
+    let full_len = {
+        let rendered =
+            generate::render_prompt(&template, &conversation(), &contract).expect("render");
+        tok.encode(&rendered).expect("encode").len()
+    };
+    let max_tokens = 8;
+    let max_context = full_len + max_tokens;
+
+    let mut history = conversation();
+    let turn = render_turn(
+        &tok,
+        &template,
+        &mut history,
+        &contract,
+        max_tokens,
+        max_context,
+        &text_rows,
+    )
+    .expect("fits as text");
+    assert_eq!(turn.dropped_messages, 0);
+
+    let mut history = conversation();
+    let with_image_rows = |tokens: &[u32]| Ok(tokens.len() + 47);
+    let turn = render_turn(
+        &tok,
+        &template,
+        &mut history,
+        &contract,
+        max_tokens,
+        max_context,
+        &with_image_rows,
+    )
+    .expect("fits after dropping");
+    assert!(
+        turn.dropped_messages >= 1,
+        "the image rows count against the context"
+    );
+
+    let mut history = conversation();
+    let refused = |_: &[u32]| -> anyhow::Result<usize> { anyhow::bail!("[code] no splice") };
+    let err = match render_turn(
+        &tok,
+        &template,
+        &mut history,
+        &contract,
+        max_tokens,
+        max_context,
+        &refused,
+    ) {
+        Ok(_) => panic!("the row count refused the prompt"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("no splice"), "{err}");
+}
+
+/// The images of a `chat --image` session: prepared, context-checked and
+/// encoded once, before the first turn.
+#[test]
+fn session_images_are_encoded_once_and_checked_against_the_context() {
+    let dir = crate::cli::test_fixtures::scratch_dir("chat_session_images");
+    let vision = crate::cli::bonsai2::VisionRequest {
+        mmproj: Some(crate::cli::bonsai2::tests::synthetic_projector(&dir)),
+        images: vec![crate::cli::bonsai2::tests::pattern_png_file(&dir)],
+        image_max_tokens: None,
+    };
+    let service = vision
+        .load_service("qwen35", crate::cli::bonsai2::cli_image_policy())
+        .expect("load")
+        .expect("requested");
+    assert!(
+        encode_session_images(&crate::cli::bonsai2::VisionRequest::default(), None, 64)
+            .expect("no images")
+            .is_none()
+    );
+    let too_small = match encode_session_images(&vision, Some(&service), 40) {
+        Ok(_) => panic!("48 image rows cannot fit 40 positions"),
+        Err(e) => e.to_string(),
+    };
+    let session = encode_session_images(&vision, Some(&service), 4096)
+        .expect("encode")
+        .expect("one image");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(too_small.contains("occupy 48 positions"), "{too_small}");
+    assert!(too_small.contains("max context 40"), "{too_small}");
+    assert_eq!(session.len(), 1);
+    let ids = VisionTokenIds::BONSAI2;
+    let tokens = vec![ids.vision_start, ids.image_pad, ids.vision_end];
+    assert_eq!(session.rows(&tokens).expect("rows"), 2 + 48);
 }

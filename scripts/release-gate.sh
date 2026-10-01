@@ -50,9 +50,20 @@
 # Each line's object:
 #   {"capability": "metal", "executed": true, "test": "oxibonsai-kernels::metal_k_quant_gemv_parity::metal_gemv_q2k_matches_scalar"}
 #   - "capability" (string, required): one of "metal", "cuda", "rag-real-generation",
-#     "image-parity", "legacy-models", "bonsai2-models" (extend this list
-#     here, in the same edit that adds a new gated capability, so this file
-#     stays the single source of truth).
+#     "image-parity", "legacy-models", "bonsai2-models", "bonsai2-metal-engine",
+#     "cuda-hardware"
+#     (extend this list here, in the same edit that adds a new gated
+#     capability, so this file stays the single source of truth).
+#     "cuda-hardware" is distinct from "cuda": it names validation whose own
+#     claim is stronger than "the CUDA code path did not panic" (an
+#     end-to-end numeric parity result, or a checklist item never yet
+#     exercised on real hardware) — see
+#     `crates/oxibonsai-testkit/src/capability.rs`'s
+#     `Capability::CudaHardware` doc comment. No `REQUIRED_CAPS` entry
+#     currently gates on it, since no host that has ever produced this
+#     project's capability manifest has had a CUDA device, but a future
+#     host that does have one can require it the same way `--require-cuda`
+#     requires "cuda".
 #   - "executed" (bool, required): true iff the test body actually reached
 #     and ran the hardware/fixture-dependent code path this run — NOT
 #     merely "the process exited 0". A test that detects the capability is
@@ -111,9 +122,14 @@
 #   - "bonsai2-models" ALSO covers, on Darwin unless --skip-bonsai2-metal is
 #     passed, `oxibonsai-model::hybrid_metal_gates`'s two Metal 27B gates
 #     (CPU-vs-Metal token parity and decode throughput) — required by name,
-#     same as the five gates above. --skip-bonsai2-metal is the narrower opt
-#     out: it drops only the Metal-specific evidence requirement, not the
-#     whole "bonsai2-models" capability.
+#     same as the five gates above — and "bonsai2-metal-engine" is required
+#     alongside it: `oxibonsai-runtime::bonsai2_metal_engine_tests`'s four
+#     Metal engine gates (the engine on the Metal hybrid runner vs the CPU
+#     engine and the fork for each band, engine decode throughput and
+#     memory, and a `/v1/chat/completions` round trip), also by name.
+#     --skip-bonsai2-metal is the narrower opt out: it drops only the
+#     Metal-specific evidence requirements, not the whole "bonsai2-models"
+#     capability.
 #
 # ── THE REAL-MODEL PARITY STAGE MUST BE SERIALIZED ──────────────────────────
 # Stage 1b's real legacy-model gates (the six cross-tier parity tests, three
@@ -124,8 +140,9 @@
 # `hybrid_real_27b_*_bonsai2` cases, `bonsai2_engine_tests`'s two
 # `bonsai2_*_engine_greedy_matches_the_fork_goldens` cases, and
 # `bonsai2_runtime_tests`'s four `real_27b_*_bonsai2` G6/G7/G9 cases) plus, on
-# Darwin, `hybrid_metal_gates`'s two Metal 27B cases, and stage 1d's real-model
-# lib/bin cases each load a multi-GB GGUF and decode through it. Run
+# Darwin, `hybrid_metal_gates`'s two Metal 27B cases and
+# `bonsai2_metal_engine_tests`'s four `real_27b_metal_engine_*` cases, and stage
+# 1d's real-model lib/bin cases each load a multi-GB GGUF and decode through it. Run
 # concurrently on an 8-core/24 GB M3 they have driven the machine's load
 # average past 90. Stages 1b-1d therefore invoke every real-model test
 # binary directly with `--test-threads=1`, one binary at a time, and the
@@ -370,7 +387,10 @@ oxibonsai-runtime::legacy_parity_tests::onnx_converted_gguf_loads_through_the_re
 # PTQ1_0, the f64-layer reference), oxibonsai-runtime's `bonsai2_engine_tests`
 # (two gates), then — on Darwin, unless `skip_metal`, and only once the test
 # file exists in this checkout — oxibonsai-model's `hybrid_metal_gates`
-# (CPU-vs-Metal token parity + decode throughput).
+# (CPU-vs-Metal token parity + decode throughput) and oxibonsai-runtime's
+# `bonsai2_metal_engine_tests` (the same on the product path: the Metal
+# engine vs the CPU engine and the fork, engine decode throughput and
+# memory, and a `/v1/chat/completions` round trip).
 #
 # Fails CLOSED, before invoking cargo at all, when either release GGUF is
 # missing from `models_dir` and `skip` is not set: a partial 27B evidence
@@ -378,6 +398,12 @@ oxibonsai-runtime::legacy_parity_tests::onnx_converted_gguf_loads_through_the_re
 # than left to run for several minutes and self-skip, which the capability
 # check at the end of this script would catch anyway but only after paying
 # the wall-clock cost of everything that DID have its file.
+#
+# Every leg runs with `OXIBONSAI_KERNEL_TIER` removed from its environment
+# (`env -u`): the CPU model's `PQ2_0` GEMV honours that INT8 tier selector
+# (K-14), so a value a developer exported would move the CPU legs off the
+# fork's ids and break CPU-vs-Metal identity. The release evidence is the
+# default configuration's.
 #
 # All inputs are explicit arguments — never a global — so `--self-test`
 # below can drive this exact function against a scratch directory and a
@@ -413,12 +439,13 @@ run_bonsai2_models_stage() {
     fi
 
     echo "── oxibonsai-model::hybrid_forward_parity_tests (real 27B gates) ──────"
-    OXIBONSAI_MODELS_DIR="$models_dir" \
+    env -u OXIBONSAI_KERNEL_TIER "OXIBONSAI_MODELS_DIR=$models_dir" \
         cargo test --release -p oxibonsai-model --all-features \
         --test hybrid_forward_parity_tests -- --test-threads=1 --nocapture || return $?
 
     echo "── oxibonsai-runtime::bonsai2_engine_tests (real 27B gates) ───────────"
-    env "OXIBONSAI_MODELS_DIR=$models_dir" "OXI_BONSAI2_GOLDEN_DIR=$golden_dir" \
+    env -u OXIBONSAI_KERNEL_TIER "OXIBONSAI_MODELS_DIR=$models_dir" \
+        "OXI_BONSAI2_GOLDEN_DIR=$golden_dir" \
         "OXI_BONSAI2_PQ2_GGUF=$pq2_path" "OXI_BONSAI2_PTQ1_GGUF=$ptq1_path" \
         cargo test --release -p oxibonsai-runtime --all-features \
         --test bonsai2_engine_tests -- --test-threads=1 --nocapture || return $?
@@ -433,8 +460,8 @@ run_bonsai2_models_stage() {
     # a G9 case ever reaching its `OXI_REQUIRE_MODEL_FILES=1` hard-failure
     # branch just because a *different* leg forgot to export its env var.
     echo "── oxibonsai-runtime::bonsai2_runtime_tests (G6/G7/G9) ─────────────────"
-    env "OXIBONSAI_MODELS_DIR=$models_dir" "OXI_BONSAI2_PQ2_GGUF=$pq2_path" \
-        "OXI_BONSAI2_PTQ1_GGUF=$ptq1_path" \
+    env -u OXIBONSAI_KERNEL_TIER "OXIBONSAI_MODELS_DIR=$models_dir" \
+        "OXI_BONSAI2_PQ2_GGUF=$pq2_path" "OXI_BONSAI2_PTQ1_GGUF=$ptq1_path" \
         cargo test --release -p oxibonsai-runtime --all-features \
         --test bonsai2_runtime_tests -- --test-threads=1 --nocapture || return $?
 
@@ -451,10 +478,19 @@ run_bonsai2_models_stage() {
         return 0
     fi
     echo "── oxibonsai-model::hybrid_metal_gates (real 27B Metal gates) ─────────"
-    env "OXI_BONSAI2_PQ2_GGUF=$pq2_path" "OXI_BONSAI2_PTQ1_GGUF=$ptq1_path" \
-        "OXI_BONSAI2_GOLDEN_DIR=$golden_dir" \
+    env -u OXIBONSAI_KERNEL_TIER "OXI_BONSAI2_PQ2_GGUF=$pq2_path" \
+        "OXI_BONSAI2_PTQ1_GGUF=$ptq1_path" "OXI_BONSAI2_GOLDEN_DIR=$golden_dir" \
         cargo test --release -p oxibonsai-model --features metal \
         --test hybrid_metal_gates -- --test-threads=1 --nocapture || return $?
+    # The same runner behind the product path: `InferenceEngine` on the Metal
+    # hybrid runner (what `run`/`chat`/`serve --backend auto` pick on this
+    # host) against the CPU engine and the fork, its decode throughput and
+    # memory, and one `/v1/chat/completions` round trip — both bands.
+    echo "── oxibonsai-runtime::bonsai2_metal_engine_tests (real 27B Metal engine gates) ─"
+    env -u OXIBONSAI_KERNEL_TIER "OXI_BONSAI2_PQ2_GGUF=$pq2_path" \
+        "OXI_BONSAI2_PTQ1_GGUF=$ptq1_path" "OXI_BONSAI2_GOLDEN_DIR=$golden_dir" \
+        cargo test --release -p oxibonsai-runtime --all-features \
+        --test bonsai2_metal_engine_tests -- --test-threads=1 --nocapture || return $?
     return 0
 }
 
@@ -592,7 +628,7 @@ release_gate_self_test() {
         stub_output="$work_dir/stage_stub_output.log"
         cat >"$fake_bin/cargo" <<'CARGO_STUB_EOF'
 #!/usr/bin/env bash
-echo "$@" >>"$OXIBONSAI_SELFTEST_CARGO_LOG"
+echo "$* [OXIBONSAI_KERNEL_TIER=${OXIBONSAI_KERNEL_TIER-unset}]" >>"$OXIBONSAI_SELFTEST_CARGO_LOG"
 exit 0
 CARGO_STUB_EOF
         chmod +x "$fake_bin/cargo"
@@ -642,15 +678,36 @@ CARGO_STUB_EOF
             0 0 1 0 "$models_half" "$golden_stub" "$metal_present" 1
         run_stage_stub "stage1c stub: non-Darwin host runs nothing" \
             0 0 0 0 "$models_full" "$golden_stub" "$metal_present" 0
-        run_stage_stub "stage1c stub: fully populated + metal file present runs all four legs" \
-            0 4 0 0 "$models_full" "$golden_stub" "$metal_present" 1
+        run_stage_stub "stage1c stub: fully populated + metal file present runs all five legs" \
+            0 5 0 0 "$models_full" "$golden_stub" "$metal_present" 1
         total=$((total + 1))
-        if [[ -f "$fake_log" ]] && [[ "$(grep -o 'hybrid_forward_parity_tests\|bonsai2_engine_tests\|bonsai2_runtime_tests\|hybrid_metal_gates' "$fake_log" | tr '\n' ',')" \
-            == "hybrid_forward_parity_tests,bonsai2_engine_tests,bonsai2_runtime_tests,hybrid_metal_gates," ]]; then
-            echo "OK: self-test 'stage1c stub: the four legs run in the documented order (bonsai2_runtime_tests covers G6/G7/G9 in one invocation)'"
+        if [[ -f "$fake_log" ]] && [[ "$(grep -o 'hybrid_forward_parity_tests\|bonsai2_engine_tests\|bonsai2_runtime_tests\|hybrid_metal_gates\|bonsai2_metal_engine_tests' "$fake_log" | tr '\n' ',')" \
+            == "hybrid_forward_parity_tests,bonsai2_engine_tests,bonsai2_runtime_tests,hybrid_metal_gates,bonsai2_metal_engine_tests," ]]; then
+            echo "OK: self-test 'stage1c stub: the five legs run in the documented order (bonsai2_runtime_tests covers G6/G7/G9 in one invocation; the Metal engine leg runs last)'"
         else
-            echo "FAIL: self-test 'stage1c stub: the four legs run in the documented order'"
+            echo "FAIL: self-test 'stage1c stub: the five legs run in the documented order'"
             failures=$((failures + 1))
+        fi
+        # An exported INT8 tier selector must never reach a leg (see
+        # `run_bonsai2_models_stage`): the stub logs what each call saw.
+        local had_tier=0 prior_tier="${OXIBONSAI_KERNEL_TIER-}"
+        [[ -n "${OXIBONSAI_KERNEL_TIER+set}" ]] && had_tier=1
+        export OXIBONSAI_KERNEL_TIER=int8-scalar
+        run_stage_stub "stage1c stub: an exported OXIBONSAI_KERNEL_TIER still runs all five legs" \
+            0 5 0 0 "$models_full" "$golden_stub" "$metal_present" 1
+        total=$((total + 1))
+        if [[ -f "$fake_log" ]] \
+            && [[ "$(grep -c -F 'OXIBONSAI_KERNEL_TIER=unset]' "$fake_log")" -eq 5 ]]; then
+            echo "OK: self-test 'stage1c stub: every leg runs with OXIBONSAI_KERNEL_TIER removed from its environment'"
+        else
+            echo "FAIL: self-test 'stage1c stub: every leg runs with OXIBONSAI_KERNEL_TIER removed from its environment'"
+            echo "  invocation log: $(cat "$fake_log")"
+            failures=$((failures + 1))
+        fi
+        if [[ "$had_tier" -eq 1 ]]; then
+            export OXIBONSAI_KERNEL_TIER="$prior_tier"
+        else
+            unset OXIBONSAI_KERNEL_TIER
         fi
         run_stage_stub "stage1c stub: fully populated, metal test file absent, only three legs run" \
             0 3 0 0 "$models_full" "$golden_stub" "$metal_absent" 1
@@ -1170,13 +1227,23 @@ oxibonsai-runtime::lib::real_27b_hybrid_embed_returns_a_unit_vector,\
 oxibonsai-cli::bin::real_27b_hybrid_model_serves_embeddings"
         if [[ "$SKIP_BONSAI2_METAL" -eq 0 ]]; then
             # The two Metal 27B gates (CPU-vs-Metal token parity, decode
-            # throughput), required on Darwin unless
-            # explicitly opted out — see the --skip-bonsai2-metal note above.
+            # throughput), required on Darwin unless explicitly opted out —
+            # see the --skip-bonsai2-metal note above.
             BONSAI2_REQUIRED_NAMES="$BONSAI2_REQUIRED_NAMES,\
 oxibonsai-model::hybrid_metal_gates::hybrid_real_27b_metal_matches_cpu_tokens_bonsai2,\
 oxibonsai-model::hybrid_metal_gates::hybrid_real_27b_metal_decode_throughput_bonsai2"
         fi
         REQUIRED_CAPS+=("--require-tests=bonsai2-models:$BONSAI2_REQUIRED_NAMES")
+        if [[ "$SKIP_BONSAI2_METAL" -eq 0 ]]; then
+            # The four Metal engine gates on the product path record under
+            # their own name.
+            REQUIRED_CAPS+=("bonsai2-metal-engine")
+            REQUIRED_CAPS+=("--require-tests=bonsai2-metal-engine:\
+oxibonsai-runtime::bonsai2_metal_engine_tests::real_27b_metal_engine_pq2_0_matches_cpu_and_fork_bonsai2,\
+oxibonsai-runtime::bonsai2_metal_engine_tests::real_27b_metal_engine_ptq1_0_matches_cpu_and_fork_bonsai2,\
+oxibonsai-runtime::bonsai2_metal_engine_tests::real_27b_metal_engine_decode_throughput_and_memory_bonsai2,\
+oxibonsai-runtime::bonsai2_metal_engine_tests::real_27b_metal_engine_serves_chat_like_the_cpu_engine_bonsai2")
+        fi
     fi
 fi
 if [[ "$REQUIRE_CUDA" -eq 1 ]]; then

@@ -2,9 +2,13 @@
 //! (`encode_gemm_f32`, wired via [`oxibonsai_image::te::gpu::te_matmul_gpu`])
 //! vs the CPU [`oxibonsai_image::gemm::gemm_abt`].
 //!
-//! Both are `#[ignore]` (run explicitly) and gated on
-//! `cfg(all(feature = "metal", target_os = "macos"))`; they skip cleanly when no
-//! Metal device is present.
+//! Both are gated on `cfg(all(feature = "metal", target_os = "macos"))` and
+//! skip cleanly when no Metal device is present.
+//! [`bench_te_gemm_f32_cpu_vs_gpu_ratio`] is a wall-clock timing comparison
+//! and stays `#[ignore]`d (run explicitly, never part of the default gate);
+//! [`bench_te_forward_cold_vs_warm`] is a real-model gate — it self-skips
+//! with a capability record when the TE weights are absent instead, and is
+//! not `#[ignore]`d.
 //!
 //! Run:
 //! ```text
@@ -20,6 +24,7 @@ use std::time::Instant;
 use oxibonsai_image::gemm::gemm_abt;
 use oxibonsai_image::te::gpu::{te_gpu_enabled, te_gpu_was_used, te_matmul_gpu};
 use oxibonsai_image::te::{TeWeights, TextEncoder};
+use oxibonsai_testkit::capability::{record_executed_timed, record_skipped, Capability};
 
 /// Build a deterministic row-major f32 weight `[n, k]` (bounded values).
 fn build_weight(n: usize, k: usize) -> Vec<f32> {
@@ -151,36 +156,62 @@ fn bench_te_gemm_f32_cpu_vs_gpu_ratio() {
 /// End-to-end TE forward wall-time, isolating the one-time weight upload.
 ///
 /// Loads the real TE weights once and runs the full Qwen3-4B encoder forward
-/// **twice**, reporting the cold forward (first — pays the ~16 GB f32 weight
-/// upload to the GPU) and the warm forward (second — weights cached). With
-/// `OXI_TE_GPU=1` this shows the production-relevant warm GPU wall-time vs the
-/// cold one; without it (CPU), the two are ~equal. Compare across two process
-/// runs for CPU-vs-GPU. Skips cleanly if the TE weights are not present.
+/// **twice**, reporting the cold forward (first) and the warm forward
+/// (second). The [`TeWeights::open_mlx_4bit`] source only *caches* the
+/// dequantised weights across forwards once `OXI_TE_RESIDENT=1` turns on
+/// [`TeWeights::set_resident`] (its documented opt-in for a high-memory
+/// machine); left unset, [`TeWeights::get`] re-dequantises every tensor on
+/// every forward by design (the low-RAM default), so cold and warm report
+/// the same cost — a real, not a missing-warm-up, result. With
+/// `OXI_TE_RESIDENT=1`, the warm forward measures the production-relevant
+/// cost of a resident session instead. With `OXI_TE_GPU=1` this also shows
+/// GPU wall-time; without it (CPU), compare across two process runs for
+/// CPU-vs-GPU.
+///
+/// Resolves the native ~2.1 GB 4-bit MLX safetensors from `OXI_TE_4BIT`
+/// (the same variable `examples/generate.rs` and `examples/te_parity.rs`
+/// check, via [`TeWeights::open_mlx_4bit`]) and self-skips, recording the
+/// miss under `Capability::ImageParity`, when it is unset — this
+/// deliberately never falls back to the legacy ~15/16 GB f32 `.npy` dump
+/// directory `TeWeights::open` reads — loading that much is exactly what
+/// resolving through the native 4-bit source instead of the legacy one
+/// avoids.
 #[test]
-#[ignore = "loads ~16 GB TE weights — run explicitly with --ignored --nocapture"]
 fn bench_te_forward_cold_vs_warm() {
-    // Policy: no hardcoded absolute paths anywhere (they are wrong on Windows,
-    // and wrong wherever `TMPDIR`/the platform temp dir is redirected). This is
-    // a fallback for a read-only path behind `#[ignore]` plus the `is_dir()`
-    // guard below, so `std::env::temp_dir()` is a drop-in, policy-correct
-    // replacement; `TE_WEIGHTS_DIR` remains the primary override.
-    let weights_dir = std::env::var("TE_WEIGHTS_DIR")
+    const TEST: &str = "oxibonsai-image::te_gpu_bench::bench_te_forward_cold_vs_warm";
+    let Some(safetensors_path) = std::env::var("OXI_TE_4BIT")
+        .ok()
+        .filter(|p| !p.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir().join("bonsai_golden/te/weights"));
-    if !weights_dir.is_dir() {
+    else {
         eprintln!(
-            "TE weights dir not found ({}) — skipping end-to-end wall-time bench",
-            weights_dir.display()
+            "OXI_TE_4BIT not set — skipping end-to-end wall-time bench (point it at the native \
+             4-bit text_encoder-mlx-4bit/model.safetensors to run)"
         );
+        record_skipped(Capability::ImageParity, TEST);
+        return;
+    };
+    if !safetensors_path.is_file() {
+        eprintln!(
+            "OXI_TE_4BIT names {} which is not a file — skipping",
+            safetensors_path.display()
+        );
+        record_skipped(Capability::ImageParity, TEST);
         return;
     }
-    let weights = match TeWeights::open(&weights_dir) {
+    let start = Instant::now();
+    let weights = match TeWeights::open_mlx_4bit(&safetensors_path) {
         Ok(w) => w,
         Err(e) => {
             eprintln!("open TE weights failed: {e} — skipping");
+            record_skipped(Capability::ImageParity, TEST);
             return;
         }
     };
+    let resident = std::env::var("OXI_TE_RESIDENT")
+        .ok()
+        .is_some_and(|v| v == "1");
+    weights.set_resident(resident);
     let encoder = TextEncoder::new(&weights);
 
     // Short prompt-like input (causal, all real tokens). 32 tokens keeps the
@@ -191,8 +222,9 @@ fn bench_te_forward_cold_vs_warm() {
 
     let gpu = te_gpu_enabled();
     eprintln!(
-        "TE end-to-end (seq={seq}, OXI_TE_GPU={}):",
-        if gpu { "1 (GPU)" } else { "0 (CPU)" }
+        "TE end-to-end (seq={seq}, OXI_TE_GPU={}, OXI_TE_RESIDENT={}):",
+        if gpu { "1 (GPU)" } else { "0 (CPU)" },
+        i32::from(resident)
     );
 
     let t0 = Instant::now();
@@ -209,7 +241,8 @@ fn bench_te_forward_cold_vs_warm() {
 
     eprintln!(
         "  cold forward = {cold:.2}s   warm forward = {warm:.2}s   (cold includes one-time weight \
-         upload when GPU)"
+         upload when GPU; cold ~= warm is expected with OXI_TE_RESIDENT unset — every tensor is \
+         re-dequantised on both forwards by design)"
     );
     if gpu {
         assert!(
@@ -217,4 +250,5 @@ fn bench_te_forward_cold_vs_warm() {
             "OXI_TE_GPU=1 but te_gpu_was_used() == false (CPU fallback)"
         );
     }
+    record_executed_timed(Capability::ImageParity, TEST, start.elapsed());
 }

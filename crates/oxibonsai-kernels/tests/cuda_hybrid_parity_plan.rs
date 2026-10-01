@@ -18,15 +18,11 @@
 //! - [`cuda_hardware_parity_plan_names_every_required_run`] checks the plan
 //!   itself (host-only, runs everywhere);
 //! - [`cuda_hardware_parity_plan_self_skips`] self-skips on every host and
-//!   files a `"cuda-hardware"` capability record with `"executed": false`
+//!   files a [`Capability::CudaHardware`] record with `"executed": false`
 //!   in the release-gate capability manifest, so the manifest shows the plan
 //!   exists and has not been executed. It never writes `"executed": true`.
 
-use std::fs::OpenOptions;
-use std::io::Write as _;
-
-/// The capability-manifest name this plan's records are filed under.
-const CAPABILITY: &str = "cuda-hardware";
+use oxibonsai_testkit::capability::{record_skipped, Capability};
 
 /// Cosine-similarity threshold every run in the plan must meet.
 const COS_THRESHOLD: &str = "cos >= 0.999";
@@ -141,44 +137,6 @@ fn plan_runs() -> Vec<&'static str> {
         .collect()
 }
 
-/// Append one `"cuda-hardware"` record with `"executed": false` to the
-/// release-gate capability manifest (`oxibonsai_testkit::capability::
-/// report_path`), as one complete newline-terminated line in a single write
-/// — the manifest contract `scripts/release-gate.sh` documents. Never
-/// panics: a bookkeeping failure is reported on stderr only.
-///
-/// Written by hand because `oxibonsai_testkit::capability::Capability` has
-/// no `cuda-hardware` variant; the record shape is the contract's exactly.
-fn record_cuda_hardware_skipped(test_name: &str) {
-    let json_safe = test_name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '-'));
-    if !json_safe {
-        eprintln!("cuda-hardware record not written: test name {test_name:?} needs escaping");
-        return;
-    }
-    let line = format!(
-        "{{\"capability\":\"{CAPABILITY}\",\"executed\":false,\"test\":\"{test_name}\"}}\n"
-    );
-    let path = oxibonsai_testkit::capability::report_path();
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                eprintln!("cuda-hardware record not written: create {parent:?}: {e}");
-                return;
-            }
-        }
-    }
-    match OpenOptions::new().create(true).append(true).open(&path) {
-        Ok(mut file) => {
-            if let Err(e) = file.write_all(line.as_bytes()) {
-                eprintln!("cuda-hardware record not written to {path:?}: {e}");
-            }
-        }
-        Err(e) => eprintln!("cuda-hardware record not written: open {path:?}: {e}"),
-    }
-}
-
 #[test]
 fn cuda_hardware_parity_plan_names_every_required_run() {
     let runs = plan_runs();
@@ -222,5 +180,5 @@ fn cuda_hardware_parity_plan_self_skips() {
          (no CUDA hardware ran them); checklist:\n{CUDA_HARDWARE_PARITY_PLAN}",
         plan_runs().len()
     );
-    record_cuda_hardware_skipped(TEST_NAME);
+    record_skipped(Capability::CudaHardware, TEST_NAME);
 }

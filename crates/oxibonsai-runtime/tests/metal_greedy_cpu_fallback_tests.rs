@@ -28,6 +28,7 @@ use half::f16;
 use oxibonsai_core::gguf::reader::GgufFile;
 use oxibonsai_core::gguf::writer::{GgufWriter, MetadataWriteValue, TensorEntry, TensorType};
 use oxibonsai_kernels::dispatch::KernelTier;
+use oxibonsai_kernels::dispatch_int8::KERNEL_TIER_ENV;
 use oxibonsai_model::model::BonsaiModel;
 use oxibonsai_runtime::engine::InferenceEngine;
 use oxibonsai_runtime::sampling::SamplingParams;
@@ -322,11 +323,43 @@ fn run_cpu_reference(gguf_bytes: &[u8], prompt: &[u32], n: usize) -> Vec<u32> {
 /// default) would let this helper (and every `let _gpu = gpu_serial();` call
 /// site below) go, but is a larger change than this file's own tests need
 /// today.
-fn gpu_serial() -> std::sync::MutexGuard<'static, ()> {
+///
+/// The guard also keeps `OXIBONSAI_KERNEL_TIER` cleared while it is held (and
+/// restores it on drop): every test here compares a CPU-tier decode with a
+/// Metal one, and the CPU tier's native GEMV honours that INT8 selector
+/// (K-14) while a GPU-tier dispatcher never does, so a developer's exported
+/// value would otherwise flip CPU-vs-Metal identity.
+fn gpu_serial() -> GpuSerial {
     static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    GPU_LOCK
+    let lock = GPU_LOCK
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let prior_tier = std::env::var(KERNEL_TIER_ENV).ok();
+    // SAFETY: `lock` is held for the guard's lifetime and serialises every
+    // reader and writer of the environment in this binary.
+    unsafe { std::env::remove_var(KERNEL_TIER_ENV) };
+    GpuSerial {
+        _lock: lock,
+        prior_tier,
+    }
+}
+
+/// See [`gpu_serial`].
+struct GpuSerial {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    prior_tier: Option<String>,
+}
+
+impl Drop for GpuSerial {
+    fn drop(&mut self) {
+        // SAFETY: still under the lock (see `gpu_serial`).
+        unsafe {
+            match &self.prior_tier {
+                Some(v) => std::env::set_var(KERNEL_TIER_ENV, v),
+                None => std::env::remove_var(KERNEL_TIER_ENV),
+            }
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -458,4 +491,53 @@ fn real_model_greedy_gpu_fallback_byte_identical() {
         all_gpu.len()
     );
     record_executed(Capability::LegacyModels, TEST);
+}
+
+/// A hybrid (`qwen35`) engine on the Metal hybrid runner has no mid-stream
+/// Metal-to-CPU fallback to corrupt: `generate_greedy_gpu` decodes the full
+/// logit row on the runner, so forcing the dense fallback knob changes
+/// nothing, and the greedy entry point equals the engine's own `generate`.
+#[test]
+fn a_metal_hybrid_greedy_decode_ignores_the_forced_cpu_fallback() {
+    let _gpu = gpu_serial();
+    match oxibonsai_kernels::MetalGraph::shared_device() {
+        Ok(_) => {}
+        Err(oxibonsai_kernels::MetalGraphError::DeviceNotFound) => return,
+        Err(e) => panic!("the Metal device must open on this host: {e}"),
+    }
+    let bytes = oxibonsai_testkit::qwen35_fixture::synthetic_qwen35_gguf();
+    let gguf = GgufFile::parse(&bytes).expect("fixture parses");
+    let prompt: Vec<u32> = vec![7, 11, 13, 17, 19];
+    let n = 12;
+    let run = |force: Option<usize>| -> Vec<u32> {
+        match force {
+            Some(k) => std::env::set_var("OXIBONSAI_FORCE_CPU_DECODE_AFTER", k.to_string()),
+            None => std::env::remove_var("OXIBONSAI_FORCE_CPU_DECODE_AFTER"),
+        }
+        let mut engine = InferenceEngine::from_gguf_with_backend(
+            &gguf,
+            greedy_params(),
+            42,
+            64,
+            oxibonsai_runtime::engine_seam::Backend::Metal,
+        )
+        .expect("a Metal hybrid engine");
+        assert_eq!(
+            engine.hybrid_backend(),
+            Some(oxibonsai_runtime::engine_hybrid_gpu::HybridBackend::Metal)
+        );
+        let out = engine
+            .generate_greedy_gpu(&prompt, n)
+            .expect("generate_greedy_gpu");
+        std::env::remove_var("OXIBONSAI_FORCE_CPU_DECODE_AFTER");
+        let reference = engine.generate(&prompt, n).expect("generate");
+        assert_eq!(
+            out, reference,
+            "the greedy entry point is the engine's own decode"
+        );
+        out
+    };
+    let plain = run(None);
+    assert!(!plain.is_empty());
+    assert_eq!(run(Some(3)), plain);
 }

@@ -350,6 +350,158 @@ mod tests {
 // Real Jinja-subset rendering (bonsai2-design.md §5.2)
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// One part of a multimodal message's content, in the shape the real
+/// Bonsai 2 template's `render_content` macro iterates: text parts are
+/// emitted verbatim, an image part as
+/// `<|vision_start|><|image_pad|><|vision_end|>` (a video part with
+/// `<|video_pad|>`), preceded by `Picture N: ` / `Video N: ` only under
+/// [`RenderOptions::add_vision_id`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenderContentPart {
+    /// A text segment (`{"type": "text", "text": ...}`).
+    Text(String),
+    /// One image (`{"type": "image"}`). The pixels travel separately; the
+    /// template only places the placeholder.
+    Image,
+    /// One video (`{"type": "video"}`).
+    Video,
+}
+
+/// A message's content at the rendering layer: a plain string — every
+/// text-only message, rendered exactly as before — or a list of parts, for
+/// a message that carries images (bonsai2-design.md §5.2 / §6.2).
+///
+/// Never `None`: a tool-calls-only assistant turn with no natural-language
+/// preamble uses the empty string, which renders identically to the
+/// reference template's own `content is none` branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenderContent {
+    /// Plain text (the template sees a string).
+    Text(String),
+    /// Content parts (the template sees a list of part mappings).
+    Parts(Vec<RenderContentPart>),
+}
+
+impl Default for RenderContent {
+    fn default() -> Self {
+        Self::Text(String::new())
+    }
+}
+
+impl From<String> for RenderContent {
+    fn from(text: String) -> Self {
+        Self::Text(text)
+    }
+}
+
+impl From<&str> for RenderContent {
+    fn from(text: &str) -> Self {
+        Self::Text(text.to_string())
+    }
+}
+
+impl From<&String> for RenderContent {
+    fn from(text: &String) -> Self {
+        Self::Text(text.clone())
+    }
+}
+
+impl From<Vec<RenderContentPart>> for RenderContent {
+    fn from(parts: Vec<RenderContentPart>) -> Self {
+        Self::Parts(parts)
+    }
+}
+
+impl RenderContent {
+    /// The text of a [`RenderContent::Text`] content; `None` for parts.
+    #[must_use]
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text),
+            Self::Parts(_) => None,
+        }
+    }
+
+    /// Every text segment, concatenated with no separator (the whole text
+    /// of a plain content; the text parts of a multimodal one).
+    #[must_use]
+    pub fn text(&self) -> String {
+        match self {
+            Self::Text(text) => text.clone(),
+            Self::Parts(parts) => parts
+                .iter()
+                .filter_map(|part| match part {
+                    RenderContentPart::Text(text) => Some(text.as_str()),
+                    RenderContentPart::Image | RenderContentPart::Video => None,
+                })
+                .collect(),
+        }
+    }
+
+    /// Image parts in this content.
+    #[must_use]
+    pub fn image_count(&self) -> usize {
+        match self {
+            Self::Text(_) => 0,
+            Self::Parts(parts) => parts
+                .iter()
+                .filter(|part| matches!(part, RenderContentPart::Image))
+                .count(),
+        }
+    }
+
+    /// Whether the content is empty text or an empty part list.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Text(text) => text.is_empty(),
+            Self::Parts(parts) => parts.is_empty(),
+        }
+    }
+
+    /// The Jinja value the template sees: a string, or a list of part
+    /// mappings (`{"type": "text", "text": ...}` / `{"type": "image"}` /
+    /// `{"type": "video"}`).
+    fn to_value(&self) -> Value {
+        match self {
+            Self::Text(text) => Value::str(text),
+            Self::Parts(parts) => Value::list(
+                parts
+                    .iter()
+                    .map(|part| {
+                        let mut entry = ValueMap::new();
+                        match part {
+                            RenderContentPart::Text(text) => {
+                                entry.insert("type", Value::str("text"));
+                                entry.insert("text", Value::str(text));
+                            }
+                            RenderContentPart::Image => {
+                                entry.insert("type", Value::str("image"));
+                            }
+                            RenderContentPart::Video => {
+                                entry.insert("type", Value::str("video"));
+                            }
+                        }
+                        Value::map(entry)
+                    })
+                    .collect(),
+            ),
+        }
+    }
+}
+
+impl PartialEq<str> for RenderContent {
+    fn eq(&self, other: &str) -> bool {
+        self.as_text() == Some(other)
+    }
+}
+
+impl PartialEq<&str> for RenderContent {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_text() == Some(*other)
+    }
+}
+
 /// One chat turn for [`ResolvedChatTemplate::render_with`].
 ///
 /// Distinct from [`ChatMessage`] (which the five canned, string-substitution
@@ -357,16 +509,14 @@ mod tests {
 /// `chat_template_tests.rs` construct and compare it directly): the real
 /// Jinja engine needs the fuller OpenAI message shape the design's own
 /// `apply_template.json` golden exercises (`reasoning_content`, assistant
-/// `tool_calls`).
+/// `tool_calls`, content parts with images).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RenderMessage {
     /// Conventional role: `"system"`, `"user"`, `"assistant"`, or `"tool"`.
     pub role: String,
-    /// Message text. Never `None` at this layer — a tool-calls-only
-    /// assistant turn with no natural-language preamble uses `""`, which
-    /// renders identically to the reference template's own `content is
-    /// none` branch (both emit nothing for the content slot).
-    pub content: String,
+    /// Message content: a string, or content parts for a message carrying
+    /// images ([`RenderContent`]).
+    pub content: RenderContent,
     /// The `<think>…</think>` span already produced for this turn (a past
     /// assistant message being re-rendered back into a follow-up prompt).
     pub reasoning_content: Option<String>,
@@ -385,13 +535,19 @@ pub struct RenderMessage {
 }
 
 impl RenderMessage {
-    /// Construct a plain text turn.
-    pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
+    /// Construct a turn from its role and content (a string, or content
+    /// parts).
+    pub fn new(role: impl Into<String>, content: impl Into<RenderContent>) -> Self {
         Self {
             role: role.into(),
             content: content.into(),
             ..Default::default()
         }
+    }
+
+    /// Construct a multimodal turn from its content parts.
+    pub fn with_parts(role: impl Into<String>, parts: Vec<RenderContentPart>) -> Self {
+        Self::new(role, RenderContent::Parts(parts))
     }
 
     /// Attach reasoning content (assistant turns only; ignored by every
@@ -434,10 +590,10 @@ pub struct RenderOptions {
     /// `chat_template_kwargs.preserve_thinking`. `None` = template default
     /// (`true`).
     pub preserve_thinking: Option<bool>,
-    /// Whether multi-image/video turns get a `"Picture N: "` / `"Video N:
-    /// "` label (vision, phase 2 — accepted here for API completeness;
-    /// no template this crate renders today has image/video content parts
-    /// to label).
+    /// Whether image/video content parts get a `"Picture N: "` /
+    /// `"Video N: "` label before their placeholder (the real Bonsai 2
+    /// template's `add_vision_id`; off by default, as in the reference
+    /// server).
     pub add_vision_id: bool,
     /// Raw JSON **text** of the OpenAI-shaped `tools` array (e.g.
     /// `[{"type":"function","function":{"name":...,"description":...,
@@ -619,7 +775,7 @@ fn build_context(messages: &[RenderMessage], opts: &RenderOptions) -> Result<Val
     for message in messages {
         let mut entry = ValueMap::new();
         entry.insert("role", Value::str(&message.role));
-        entry.insert("content", Value::str(&message.content));
+        entry.insert("content", message.content.to_value());
         if let Some(reasoning_content) = &message.reasoning_content {
             entry.insert("reasoning_content", Value::str(reasoning_content));
         }
@@ -1039,6 +1195,131 @@ mod resolved_template_tests {
         };
         let out = tpl.render_with(&messages, &opts).expect("render");
         assert_eq!(out, GOLDEN_CASE_4_EXPECTED);
+    }
+
+    /// The PrismML fork's `apply_template` output for the golden vision
+    /// request (`[image_url, text]`, `enable_thinking: false`). The fork
+    /// renders the image as its internal `<__media_...__>` marker, which its
+    /// `mtmd_tokenize` then expands into `<|vision_start|>` + the image's
+    /// rows + `<|vision_end|>` — the same bracket this template emits
+    /// around its single `<|image_pad|>`.
+    const GOLDEN_VISION_APPLY_TEMPLATE: &str = "<|im_start|>user\n<__media_22HY8zOtvOvbto1XrBFMlnA4CWB4sS2F__>Describe this image briefly.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+
+    fn golden_vision_prompt() -> String {
+        GOLDEN_VISION_APPLY_TEMPLATE.replace(
+            "<__media_22HY8zOtvOvbto1XrBFMlnA4CWB4sS2F__>",
+            "<|vision_start|><|image_pad|><|vision_end|>",
+        )
+    }
+
+    #[test]
+    fn image_parts_render_like_the_reference_apply_template() {
+        let tpl = ResolvedChatTemplate::Jinja(Arc::new(compile_real_template()));
+        let messages = vec![RenderMessage::with_parts(
+            "user",
+            vec![
+                RenderContentPart::Image,
+                RenderContentPart::Text("Describe this image briefly.".to_string()),
+            ],
+        )];
+        let opts = RenderOptions {
+            add_generation_prompt: true,
+            enable_thinking: Some(false),
+            ..Default::default()
+        };
+        let out = tpl.render_with(&messages, &opts).expect("render");
+        assert_eq!(out, golden_vision_prompt());
+        assert_eq!(messages[0].content.image_count(), 1);
+    }
+
+    #[test]
+    fn add_vision_id_numbers_each_picture_across_messages() {
+        let tpl = ResolvedChatTemplate::Jinja(Arc::new(compile_real_template()));
+        let messages = vec![
+            RenderMessage::with_parts(
+                "user",
+                vec![
+                    RenderContentPart::Text("Compare ".to_string()),
+                    RenderContentPart::Image,
+                    RenderContentPart::Text(" and ".to_string()),
+                    RenderContentPart::Image,
+                ],
+            ),
+            RenderMessage::new("assistant", "Two shapes.").with_reasoning_content("look"),
+            RenderMessage::with_parts("user", vec![RenderContentPart::Image]),
+        ];
+        let opts = RenderOptions {
+            add_generation_prompt: true,
+            enable_thinking: Some(false),
+            add_vision_id: true,
+            ..Default::default()
+        };
+        let out = tpl.render_with(&messages, &opts).expect("render");
+        let placeholder = "<|vision_start|><|image_pad|><|vision_end|>";
+        assert!(out.contains(&format!(
+            "Compare Picture 1: {placeholder} and Picture 2: {placeholder}<|im_end|>"
+        )));
+        assert!(out.contains(&format!(
+            "<|im_start|>user\nPicture 3: {placeholder}<|im_end|>"
+        )));
+        // Without the label the placeholders stand alone.
+        let plain = tpl
+            .render_with(
+                &messages,
+                &RenderOptions {
+                    add_vision_id: false,
+                    ..opts
+                },
+            )
+            .expect("render");
+        assert!(!plain.contains("Picture"));
+        assert_eq!(plain.matches("<|image_pad|>").count(), 3);
+    }
+
+    /// Text-only parts render byte-identically to the same text as a plain
+    /// string, so flattening them (what the servers do) changes nothing.
+    #[test]
+    fn text_only_parts_render_like_the_flattened_string() {
+        let tpl = ResolvedChatTemplate::Jinja(Arc::new(compile_real_template()));
+        let opts = RenderOptions {
+            add_generation_prompt: true,
+            ..Default::default()
+        };
+        let parts = vec![RenderMessage::with_parts(
+            "user",
+            vec![
+                RenderContentPart::Text("What is ".to_string()),
+                RenderContentPart::Text("2+2? Answer briefly.".to_string()),
+            ],
+        )];
+        let flat = vec![RenderMessage::new("user", "What is 2+2? Answer briefly.")];
+        assert_eq!(
+            tpl.render_with(&parts, &opts).expect("parts"),
+            tpl.render_with(&flat, &opts).expect("flat")
+        );
+        assert_eq!(parts[0].content.text(), "What is 2+2? Answer briefly.");
+        assert_eq!(flat[0].content, "What is 2+2? Answer briefly.");
+        assert_eq!(
+            flat[0].content.as_text(),
+            Some("What is 2+2? Answer briefly.")
+        );
+        assert_eq!(parts[0].content.as_text(), None);
+    }
+
+    #[test]
+    fn an_image_in_the_system_message_is_refused_by_the_template() {
+        let tpl = ResolvedChatTemplate::Jinja(Arc::new(compile_real_template()));
+        let messages = vec![
+            RenderMessage::with_parts("system", vec![RenderContentPart::Image]),
+            RenderMessage::new("user", "hi"),
+        ];
+        let err = tpl
+            .render_with(&messages, &RenderOptions::default())
+            .expect_err("must raise");
+        assert_eq!(
+            err.template_raise_message(),
+            Some("System message cannot contain images.")
+        );
     }
 
     #[test]

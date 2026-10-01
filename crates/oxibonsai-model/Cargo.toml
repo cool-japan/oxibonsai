@@ -63,12 +63,20 @@ anyhow.workspace = true
 serde_json.workspace = true
 oxionnx-proto.workspace = true
 memmap2.workspace = true
+# `vision::image_decode`: PNG in-house over `oxiarc-deflate`, baseline and
+# progressive JPEG through `jpeg-decoder` (both Pure Rust; see the workspace
+# manifest for why not `oximedia-image`).
+oxiarc-deflate.workspace = true
+jpeg-decoder.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
 serde_json.workspace = true
 criterion.workspace = true
 oxibonsai-testkit.workspace = true
+# `tests/bonsai2_vision_tests.rs` tokenizes the real Bonsai 2 prompt with the
+# GGUF-embedded tokenizer (the tokenizer crate does not depend on this one).
+oxibonsai-tokenizer.workspace = true
 
 [[bench]]
 name = "attention_bench"

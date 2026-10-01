@@ -35,6 +35,7 @@
 //! | [`dequant::dequant_1bit_g128`] | Unpack 128 sign bits + FP16 scale → FP32 |
 //! | [`gemv::gemv_1bit_g128`] | 1-bit weight matrix × FP32 vector (single-token decode) |
 //! | [`gemm::gemm_1bit_g128`] | 1-bit weight matrix × FP32 matrix (multi-token prefill) |
+//! | [`gemm_f32::gemm_f32`] | Dense FP32 weight matrix × FP32 matrix, bit-identical to [`gemv_f32::gemv_f32`] per row |
 //!
 //! ## Trait
 //!
@@ -167,6 +168,7 @@ pub mod fp8_lut;
 pub mod gated_delta_net;
 pub mod gated_delta_net_chunk;
 pub mod gemm;
+pub mod gemm_f32;
 pub mod gemm_fp8;
 pub mod gemm_onebit;
 pub mod gemm_ternary;
@@ -229,6 +231,7 @@ pub mod tuning;
 pub use aligned::{AlignedBlocks, AlignedBuffer};
 pub use dispatch::{cpu_kernel_tier, KernelDispatcher, KernelTier};
 pub use error::{KernelError, KernelResult};
+pub use gemm_f32::gemm_f32;
 pub use gemv_f32::{dot_f32, gemv_f32};
 pub use gemv_q2k::gemv_q2k;
 pub use gemv_q3k::gemv_q3k;

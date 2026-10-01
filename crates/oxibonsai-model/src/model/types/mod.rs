@@ -8,6 +8,8 @@
 //! | `context.rs` | on-demand growth of the host caches |
 //! | `decode.rs` | `forward` / `forward_into` and the per-block loop |
 //! | `prefill_dispatch.rs` | `forward_prefill*` / verify dispatch ladder |
+//! | `forward_metal.rs` | the fused Metal decode / prefill entry points and the M-18 prefill router |
+//! | `forward_metal_hidden.rs` | the head-free Metal prefill `forward_hidden` tries first |
 //! | `q1_slots.rs` | the per-GGUF-mapping GPU slot namespace + registry |
 //! | `testing_fixture.rs` | `new_for_testing_with_blocks` + the Q1 replica fixture |
 
@@ -35,7 +37,7 @@ mod forward_hidden;
 mod lm_head;
 mod prefill_cpu;
 mod prefill_dispatch;
-pub mod q1_slots;
+pub(crate) mod q1_slots;
 mod testing_fixture;
 #[cfg(test)]
 mod tests;
@@ -43,7 +45,7 @@ mod tests;
 #[cfg(test)]
 use crate::model::weight_loaders::load_f32_tensor;
 /// The wire-id-42 layout helpers the hybrid (`qwen35`) loader shares with
-/// the dense loader (B2-10), re-exported crate-wide from here because the
+/// the dense loader, re-exported crate-wide from here because the
 /// parent `model` module keeps `weight_loaders` private: one resolver, so
 /// the two load paths can never disagree about a file's layout.
 pub(crate) use crate::model::weight_loaders::{
@@ -72,6 +74,8 @@ mod forward_metal_tests;
 pub use forward_metal::Q1MetalSlots;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod forward_metal_fp8;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+mod forward_metal_hidden;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod gpu_cache;
 /// The uncached ternary binding (`BonsaiModel::ternary_gpu_binding`) and its
@@ -226,7 +230,7 @@ pub struct BonsaiModel<'a> {
     /// Dominant tensor quantization type, detected at load time for variant
     /// identification (M-25: weight tensors only, deterministic on ties).
     dominant_quant_type: oxibonsai_core::GgufTensorType,
-    /// Whether the file declares `prism.hadamard.*` metadata (B2-09):
+    /// Whether the file declares `prism.hadamard.*` metadata:
     /// distinguishes the Hadamard-folded Bonsai 2 27B family
     /// (`TernaryBonsai227b{Pq2,Ptq1,Q2g64}`) from the un-folded gen-1
     /// `Bonsai27B`, which `dominant_quant_type` alone cannot (both can
@@ -401,10 +405,10 @@ impl<'a> BonsaiModel<'a> {
     /// recurrent layers do — in [`crate::hybrid::HybridModel`], whose
     /// `reset_recurrent` zeroes every Gated-DeltaNet state and conv window,
     /// and which [`crate::hybrid::LoadedModel::reset_recurrent`] /
-    /// [`crate::hybrid::LoadedModel::set_recurrent_state`] dispatch to
-    /// (REQUIRED #6). A `qwen35` file can never load as a `BonsaiModel`
-    /// (see [`crate::hybrid::LoadedModel`]), so this can never be the
-    /// no-op standing in for state that exists.
+    /// [`crate::hybrid::LoadedModel::set_recurrent_state`] dispatch to. A
+    /// `qwen35` file can never load as a `BonsaiModel` (see
+    /// [`crate::hybrid::LoadedModel`]), so this can never be the no-op
+    /// standing in for state that exists.
     pub fn reset_recurrent(&mut self) {}
 
     /// Whether a fused GPU path with its own device KV cache has run for the
@@ -481,12 +485,13 @@ impl<'a> BonsaiModel<'a> {
     ///
     /// Widened so [`TransformerBlock::upload_to_gpu`] can reach
     /// [`TernaryKernel::upload_weights_ternary`](oxibonsai_kernels::TernaryKernel::upload_weights_ternary)
-    /// as well as [`OneBitKernel::upload_weights`] — a `dyn OneBitKernel`
-    /// trait object cannot, and that erasure is what pinned the fused
-    /// QKV / gate-up handles to the 1-bit path. `FusedKernel` has a blanket
-    /// impl for every `OneBitKernel + TernaryKernel`, so every existing
-    /// caller — all of which pass the concrete `KernelDispatcher` — compiles
-    /// unchanged.
+    /// as well as
+    /// [`OneBitKernel::upload_weights`](oxibonsai_kernels::OneBitKernel::upload_weights)
+    /// — a `dyn OneBitKernel` trait object cannot, and that erasure is what
+    /// pinned the fused QKV / gate-up handles to the 1-bit path. `FusedKernel`
+    /// has a blanket impl for every `OneBitKernel + TernaryKernel`, so every
+    /// existing caller — all of which pass the concrete `KernelDispatcher` —
+    /// compiles unchanged.
     pub fn upload_weights_to_gpu(&mut self, kernel: &dyn FusedKernel) {
         let n_blocks = self.blocks.len();
         if n_blocks == 0 {

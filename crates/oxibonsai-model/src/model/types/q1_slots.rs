@@ -66,6 +66,17 @@
 //! This module holds no GPU code at all (the release hook is a plain function
 //! pointer supplied by the Metal build), so its tests run on every host.
 
+// Dead-code policy. Each GPU backend's half of this module is plain arithmetic
+// compiled on every host, so that its tests run everywhere, but a given build
+// calls only its own half: the Metal build the mapping registry, the
+// native-CUDA build the CUDA slot layouts, any other build neither. An item
+// (or impl block) that only some backends' builds call therefore carries
+// `cfg_attr(not(<the backends that call it>), allow(dead_code))`. There is no
+// module-wide allow: in a build that does use a half, an item that loses its
+// last caller is still reported (rustc counts whatever an exempt item calls as
+// live, so the exemption reaches exactly that far). Helpers only the unit
+// tests call are `cfg(test)`.
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -287,6 +298,16 @@ pub struct SlotNamespace {
     epoch: u64,
 }
 
+#[cfg_attr(
+    not(any(
+        all(feature = "metal", target_os = "macos"),
+        all(
+            feature = "native-cuda",
+            any(target_os = "linux", target_os = "windows")
+        )
+    )),
+    allow(dead_code)
+)]
 impl SlotNamespace {
     /// The namespace of `epoch`.
     #[must_use]
@@ -295,6 +316,10 @@ impl SlotNamespace {
     }
 
     /// The epoch this namespace composes.
+    ///
+    /// Only the Metal build's per-layer GPU dispatch reads it back; a CUDA
+    /// model keys its slots on its own model counter.
+    #[cfg_attr(not(all(feature = "metal", target_os = "macos")), allow(dead_code))]
     #[must_use]
     pub const fn epoch(self) -> u64 {
         self.epoch
@@ -325,14 +350,6 @@ impl SlotNamespace {
         self.slot(LM_HEAD_LOCAL)
     }
 
-    /// Base of layer `layer`'s four CUDA weight-fallback slots (`+0` fused
-    /// QKV, `+1` attention output, `+2` gate‖up, `+3` down). `layer` must be
-    /// below [`MAX_SLOT_LAYERS`].
-    #[must_use]
-    pub const fn weight_fallback_base(self, layer: usize) -> u64 {
-        self.slot(WEIGHT_FALLBACK_LOCAL_BASE + (layer as u64) * WEIGHT_FALLBACK_LOCAL_STRIDE)
-    }
-
     /// Refuse a layer count whose norm slots would leave their range.
     ///
     /// # Errors
@@ -361,6 +378,26 @@ impl SlotNamespace {
         keys.push((self.final_norm(), SlotCache::Norm));
         keys.push((self.lm_head(), SlotCache::Quant));
         keys
+    }
+}
+
+// The slot layouts only the native-CUDA build derives (its models key their
+// weights on `cuda_model_epoch`-composed slots, the Metal build on upload
+// handles and mapped-tensor addresses).
+#[cfg_attr(
+    not(all(
+        feature = "native-cuda",
+        any(target_os = "linux", target_os = "windows")
+    )),
+    allow(dead_code)
+)]
+impl SlotNamespace {
+    /// Base of layer `layer`'s four CUDA weight-fallback slots (`+0` fused
+    /// QKV, `+1` attention output, `+2` gate‖up, `+3` down). `layer` must be
+    /// below [`MAX_SLOT_LAYERS`].
+    #[must_use]
+    pub const fn weight_fallback_base(self, layer: usize) -> u64 {
+        self.slot(WEIGHT_FALLBACK_LOCAL_BASE + (layer as u64) * WEIGHT_FALLBACK_LOCAL_STRIDE)
     }
 
     /// Every slot the CUDA Q1 paths can populate for an `n_layers`-layer
@@ -559,6 +596,9 @@ impl SlotNamespace {
 /// The weight-cache slot of a mapped tensor: its address, checked against
 /// [`MIN_TENSOR_SLOT`] and against the tag bit. `None` for an empty slice
 /// (which has no stable address) or an address outside that range.
+///
+/// Only the Metal ternary cache keys its buffers on mapped-tensor addresses.
+#[cfg_attr(not(all(feature = "metal", target_os = "macos")), allow(dead_code))]
 #[must_use]
 pub fn mapped_tensor_slot(bytes: &[u8]) -> Option<u64> {
     if bytes.is_empty() {
@@ -624,6 +664,8 @@ pub type ReleaseHook = fn(u64);
 /// GPU under that epoch.
 #[derive(Debug)]
 pub struct MappingState {
+    /// Read only through the mapping registry (the Metal build) and by tests.
+    #[cfg_attr(not(all(feature = "metal", target_os = "macos")), allow(dead_code))]
     anchor: Option<u64>,
     epoch: u64,
     gpu_used: AtomicBool,
@@ -649,6 +691,7 @@ impl MappingState {
     }
 
     /// The mapping's anchor address; `None` for a private namespace.
+    #[cfg(test)]
     #[must_use]
     pub fn anchor(&self) -> Option<u64> {
         self.anchor
@@ -661,11 +704,26 @@ impl MappingState {
     }
 
     /// The slot namespace of [`Self::epoch`].
+    #[cfg_attr(
+        not(any(
+            all(feature = "metal", target_os = "macos"),
+            all(
+                feature = "native-cuda",
+                any(target_os = "linux", target_os = "windows")
+            )
+        )),
+        allow(dead_code)
+    )]
     #[must_use]
     pub fn slots(&self) -> SlotNamespace {
         SlotNamespace::new(self.epoch)
     }
+}
 
+// The GPU-residency flag and its release hook are exercised only by the Metal
+// build, the one whose buffers are released per mapping.
+#[cfg_attr(not(all(feature = "metal", target_os = "macos")), allow(dead_code))]
+impl MappingState {
     /// Record that a path is putting (or has put) buffers on the GPU under
     /// this mapping's epoch. Paths call it before **and** after their
     /// dispatch, so an explicit release racing a sibling's upload can never
@@ -714,6 +772,7 @@ pub struct MappingRegistry {
     entries: HashMap<u64, RegistryEntry>,
 }
 
+#[cfg_attr(not(all(feature = "metal", target_os = "macos")), allow(dead_code))]
 impl MappingRegistry {
     /// An empty registry.
     #[must_use]
@@ -767,18 +826,21 @@ impl MappingRegistry {
     }
 
     /// The epoch of the live mapping anchored at `anchor`.
+    #[cfg(test)]
     #[must_use]
     pub fn epoch_of(&self, anchor: u64) -> Option<u64> {
         self.entries.get(&anchor).map(|entry| entry.state.epoch)
     }
 
     /// Number of live mappings.
+    #[cfg(test)]
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// Whether no mapping is live.
+    #[cfg(test)]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
@@ -801,12 +863,14 @@ fn lock_global() -> MutexGuard<'static, MappingRegistry> {
 }
 
 /// Live replicas of the mapping anchored at `anchor`, process-wide.
+#[cfg_attr(not(all(feature = "metal", target_os = "macos")), allow(dead_code))]
 #[must_use]
 pub fn global_replicas(anchor: u64) -> usize {
     lock_global().replicas(anchor)
 }
 
 /// The epoch of the live mapping anchored at `anchor`, process-wide.
+#[cfg(test)]
 #[must_use]
 pub fn global_epoch_of(anchor: u64) -> Option<u64> {
     lock_global().epoch_of(anchor)
@@ -823,6 +887,7 @@ pub struct MappingRegistration {
     registered: bool,
 }
 
+#[cfg_attr(not(all(feature = "metal", target_os = "macos")), allow(dead_code))]
 impl MappingRegistration {
     /// Join the mapping anchored at `anchor` (shared with every live replica
     /// of it), or — for `None` — take a private namespace. `mint` supplies the
@@ -1281,6 +1346,9 @@ mod tests {
             "the entry is gone"
         );
         assert_eq!(registry.len(), 1);
+        assert!(!registry.is_empty(), "the other mapping is still live");
+        assert!(registry.leave(0xBBBB_0000_0000, other.epoch()).is_some());
+        assert!(registry.is_empty(), "no mapping is live once both left");
     }
 
     #[test]

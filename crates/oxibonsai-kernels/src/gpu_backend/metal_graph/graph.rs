@@ -4,7 +4,18 @@
 //! weight uploads, single-GEMV dispatch, the DiT GEMM/attention entry points
 //! and the fused FFN phase; construction, session binding and the shared
 //! weight cache live in the `session` sibling module.
+//!
+//! # Autorelease pools
+//!
+//! `-[MTLCommandQueue commandBuffer]` and
+//! `-[MTLCommandBuffer computeCommandEncoder]` return autoreleased objects,
+//! and a thread with no pool of its own keeps every one of them until it
+//! exits — about 1.8 KiB per dispatch on a long-lived decode or server
+//! thread. Every command buffer here is created, encoded, committed and
+//! waited on inside one [`autoreleasepool`], so a dispatch leaves nothing
+//! behind on the calling thread.
 
+use metal::objc::rc::autoreleasepool;
 use metal::{Buffer, CommandQueue, Device, MTLResourceOptions};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -26,7 +37,16 @@ use super::reformat::{
     validate_tq2_ternary_codes, Q2_BLOCK_BYTES, Q2_QS_BYTES, Q2_SCALE_BYTES,
 };
 
+mod prefill_budget;
+mod prefill_policy;
 mod weight_cache;
+
+pub use prefill_budget::{default_prefill_budget, PrefillDeadlineScope, PrefillWorkShape};
+pub(crate) use prefill_budget::{effective_prefill_deadline, take_forced_prefill_timeout};
+pub use prefill_policy::{
+    MetalPrefillPolicy, PrefillCostSnapshot, PrefillDecision, PrefillRoute, FUSED_BUDGET_FACTOR,
+    FUSED_BUDGET_SLACK,
+};
 
 /// Shared-device / per-session split (`MET-08`); see [`session`].
 ///
@@ -184,6 +204,27 @@ pub struct MetalGraph {
     /// not workspace state — a new session must not re-compile it. See
     /// `metal_prefill::attention`.
     pub(crate) prefill_attn: Arc<OnceLock<Option<metal_prefill::attention::PrefillAttnPipelines>>>,
+    /// Lazily resolved tiled simdgroup Q1 prefill GEMM pipeline (M-18),
+    /// shared across sessions like `prefill_attn`; `None` inside the
+    /// `OnceLock` keeps the Q1 prefill on the row-wise kernel. See
+    /// `metal_prefill::functions::MetalGraph::prefill_q1_tiled_pipeline`.
+    pub(crate) prefill_q1_tiled: Arc<OnceLock<Option<metal::ComputePipelineState>>>,
+    /// The ternary twin of `prefill_q1_tiled` (`gemm_tq2_g128_simdgroup`);
+    /// `None` inside the `OnceLock` keeps the ternary prefill on `v10`.
+    pub(crate) prefill_tq2_tiled: Arc<OnceLock<Option<metal::ComputePipelineState>>>,
+    /// A batched-prefill command buffer whose bounded wait gave up (M-18).
+    ///
+    /// Metal cannot cancel committed work, so a timed-out prefill keeps
+    /// running on this session's queue and keeps reading and writing the
+    /// session's shared prefill buffers. Parked here, it is drained (with its
+    /// own bound) before those buffers are handed to the next prefill, so the
+    /// CPU never uploads into a buffer the GPU is still using. GPU-side
+    /// ordering against later work on the same queue (the KV cache, the
+    /// logits buffer) is Metal's automatic hazard tracking.
+    pub(crate) prefill_inflight: Mutex<Option<metal::CommandBuffer>>,
+    /// Batched prefill runs this session completed (see
+    /// [`MetalGraph::prefill_run_count`]).
+    pub(crate) prefill_runs: AtomicU64,
 }
 
 // Metal objects (Device, CommandQueue, etc.) are Send+Sync in the metal crate.
@@ -547,20 +588,22 @@ impl MetalGraph {
 
         unsafe { upload_f32(&input_buf, input) };
 
-        let cmd_buf = self.command_queue.new_command_buffer();
-        let encoder = cmd_buf.new_compute_command_encoder();
+        autoreleasepool(|| {
+            let cmd_buf = self.command_queue.new_command_buffer();
+            let encoder = cmd_buf.new_compute_command_encoder();
 
-        self.dispatch_gemv_q1(
-            encoder,
-            &weight.buffer,
-            &input_buf,
-            &output_buf,
-            n_rows as u32,
-            k as u32,
-        );
+            self.dispatch_gemv_q1(
+                encoder,
+                &weight.buffer,
+                &input_buf,
+                &output_buf,
+                n_rows as u32,
+                k as u32,
+            );
 
-        encoder.end_encoding();
-        commit_and_wait(cmd_buf, "encode_gemv_q1")?;
+            encoder.end_encoding();
+            commit_and_wait(cmd_buf, "encode_gemv_q1")
+        })?;
 
         unsafe { download_f32(&output_buf, &mut output[..n_rows]) };
 
@@ -601,20 +644,22 @@ impl MetalGraph {
 
         unsafe { upload_f32(&input_buf, input) };
 
-        let cmd_buf = self.command_queue.new_command_buffer();
-        let encoder = cmd_buf.new_compute_command_encoder();
+        autoreleasepool(|| {
+            let cmd_buf = self.command_queue.new_command_buffer();
+            let encoder = cmd_buf.new_compute_command_encoder();
 
-        self.dispatch_gemv_tq2(
-            encoder,
-            &weight.buffer,
-            &input_buf,
-            &output_buf,
-            n_rows as u32,
-            k as u32,
-        );
+            self.dispatch_gemv_tq2(
+                encoder,
+                &weight.buffer,
+                &input_buf,
+                &output_buf,
+                n_rows as u32,
+                k as u32,
+            );
 
-        encoder.end_encoding();
-        commit_and_wait(cmd_buf, "encode_gemv_tq2")?;
+            encoder.end_encoding();
+            commit_and_wait(cmd_buf, "encode_gemv_tq2")
+        })?;
 
         unsafe { download_f32(&output_buf, &mut output[..n_rows]) };
 
@@ -734,31 +779,33 @@ impl MetalGraph {
 
         unsafe { upload_f32(&pool.input, input) };
 
-        let cmd_buf = self.command_queue.new_command_buffer();
-        let encoder = cmd_buf.new_compute_command_encoder();
+        autoreleasepool(|| {
+            let cmd_buf = self.command_queue.new_command_buffer();
+            let encoder = cmd_buf.new_compute_command_encoder();
 
-        // DiT large-M path: use the staging-optimized simdgroup_matrix v10 GEMM,
-        // which drives Apple's 8×8×8 hardware MAC units (f32 accumulate) but
-        // optimizes v9's threadgroup staging — it stages the dequantized weight
-        // as half (EXACT for ternary code×scale ∈ {-scale,0,+scale}, zero added
-        // rounding) and spreads the dequant-scatter across all 128 threads. It
-        // is numerically equivalent to v7/v8/v9 (unit parity max-abs err ≲
-        // 1.2e-5 ≪ 1e-3; dit_parity cos ≥ 0.999) and measures ~3.86× faster than
-        // v9 (≈2.6× over v8) on the big DiT shapes (M=1536, N∈{3072,27648},
-        // K=3072). v8/v9 are retained as fallbacks; every LLM forward/prefill
-        // path still calls dispatch_gemm_tq2_v7 unchanged.
-        self.dispatch_gemm_tq2_v10(
-            encoder,
-            &weight.buffer,
-            &pool.input,
-            &pool.output,
-            n_rows as u32,
-            k as u32,
-            m as u32,
-        );
+            // DiT large-M path: use the staging-optimized simdgroup_matrix v10 GEMM,
+            // which drives Apple's 8×8×8 hardware MAC units (f32 accumulate) but
+            // optimizes v9's threadgroup staging — it stages the dequantized weight
+            // as half (EXACT for ternary code×scale ∈ {-scale,0,+scale}, zero added
+            // rounding) and spreads the dequant-scatter across all 128 threads. It
+            // is numerically equivalent to v7/v8/v9 (unit parity max-abs err ≲
+            // 1.2e-5 ≪ 1e-3; dit_parity cos ≥ 0.999) and measures ~3.86× faster than
+            // v9 (≈2.6× over v8) on the big DiT shapes (M=1536, N∈{3072,27648},
+            // K=3072). v8/v9 are retained as fallbacks; every LLM forward/prefill
+            // path still calls dispatch_gemm_tq2_v7 unchanged.
+            self.dispatch_gemm_tq2_v10(
+                encoder,
+                &weight.buffer,
+                &pool.input,
+                &pool.output,
+                n_rows as u32,
+                k as u32,
+                m as u32,
+            );
 
-        encoder.end_encoding();
-        commit_and_wait(cmd_buf, "encode_gemm_tq2")?;
+            encoder.end_encoding();
+            commit_and_wait(cmd_buf, "encode_gemm_tq2")
+        })?;
 
         // `output.len()` is authoritative (== expected_out); the pooled output
         // buffer may be larger after a grow, so copy exactly the requested span.
@@ -945,49 +992,52 @@ impl MetalGraph {
 
         unsafe { upload_f32(&pool.input, input) };
 
-        let cmd_buf = self.command_queue.new_command_buffer();
-        let encoder = cmd_buf.new_compute_command_encoder();
+        autoreleasepool(|| {
+            let cmd_buf = self.command_queue.new_command_buffer();
+            let encoder = cmd_buf.new_compute_command_encoder();
 
-        // Text-encoder large-M path: the simdgroup_matrix GEMM. Same 64×64-tile /
-        // 4-simdgroup shape as the ternary v9/v10, staging the f32 weight tile
-        // directly (no dequant). The f32 kernel accumulates in f32 (parity with
-        // the CPU gemm_abt, cos ≥ 0.999); the bf16 kernel rounds the operands to
-        // bf16 — the model's native precision — for ~2× throughput at
-        // render-level parity (cos ≈ 1.0).
-        // bf16 is dispatched only when it was requested *and* the optional bf16
-        // kernel actually compiled on this device (M3+/Metal 3.1). On M1/M2 or an
-        // older toolchain `gemm_bf16_simdgroup` is `None`, so this transparently
-        // falls back to the exact f32 kernel — same result shape, f32 numerics.
-        let use_bf16 = bf16_dispatch_selected(bf16, self.pipelines.gemm_bf16_simdgroup.is_some());
-        let bf16_pso = if use_bf16 {
-            self.pipelines.gemm_bf16_simdgroup.as_ref()
-        } else {
-            None
-        };
-        match bf16_pso {
-            Some(pso) => self.dispatch_gemm_bf16(
-                pso,
-                encoder,
-                &weight.buffer,
-                &pool.input,
-                &pool.output,
-                n_rows as u32,
-                k as u32,
-                m as u32,
-            ),
-            None => self.dispatch_gemm_f32(
-                encoder,
-                &weight.buffer,
-                &pool.input,
-                &pool.output,
-                n_rows as u32,
-                k as u32,
-                m as u32,
-            ),
-        }
+            // Text-encoder large-M path: the simdgroup_matrix GEMM. Same 64×64-tile /
+            // 4-simdgroup shape as the ternary v9/v10, staging the f32 weight tile
+            // directly (no dequant). The f32 kernel accumulates in f32 (parity with
+            // the CPU gemm_abt, cos ≥ 0.999); the bf16 kernel rounds the operands to
+            // bf16 — the model's native precision — for ~2× throughput at
+            // render-level parity (cos ≈ 1.0).
+            // bf16 is dispatched only when it was requested *and* the optional bf16
+            // kernel actually compiled on this device (M3+/Metal 3.1). On M1/M2 or an
+            // older toolchain `gemm_bf16_simdgroup` is `None`, so this transparently
+            // falls back to the exact f32 kernel — same result shape, f32 numerics.
+            let use_bf16 =
+                bf16_dispatch_selected(bf16, self.pipelines.gemm_bf16_simdgroup.is_some());
+            let bf16_pso = if use_bf16 {
+                self.pipelines.gemm_bf16_simdgroup.as_ref()
+            } else {
+                None
+            };
+            match bf16_pso {
+                Some(pso) => self.dispatch_gemm_bf16(
+                    pso,
+                    encoder,
+                    &weight.buffer,
+                    &pool.input,
+                    &pool.output,
+                    n_rows as u32,
+                    k as u32,
+                    m as u32,
+                ),
+                None => self.dispatch_gemm_f32(
+                    encoder,
+                    &weight.buffer,
+                    &pool.input,
+                    &pool.output,
+                    n_rows as u32,
+                    k as u32,
+                    m as u32,
+                ),
+            }
 
-        encoder.end_encoding();
-        commit_and_wait(cmd_buf, "encode_gemm_simdgroup")?;
+            encoder.end_encoding();
+            commit_and_wait(cmd_buf, "encode_gemm_simdgroup")
+        })?;
 
         // `output.len()` is authoritative (== expected_out); the pooled output
         // buffer may be larger after a grow, so copy exactly the requested span.
@@ -1332,21 +1382,23 @@ impl MetalGraph {
             upload_f32(&v_buf, &v[..qkv_len]);
         }
 
-        let cmd_buf = self.command_queue.new_command_buffer();
-        let encoder = cmd_buf.new_compute_command_encoder();
-        self.dispatch_joint_attention_flash(
-            encoder,
-            &q_buf,
-            &k_buf,
-            &v_buf,
-            &out_buf,
-            num_heads as u32,
-            seq as u32,
-            head_dim as u32,
-            scale,
-        );
-        encoder.end_encoding();
-        commit_and_wait(cmd_buf, "encode_joint_attention_flash")?;
+        autoreleasepool(|| {
+            let cmd_buf = self.command_queue.new_command_buffer();
+            let encoder = cmd_buf.new_compute_command_encoder();
+            self.dispatch_joint_attention_flash(
+                encoder,
+                &q_buf,
+                &k_buf,
+                &v_buf,
+                &out_buf,
+                num_heads as u32,
+                seq as u32,
+                head_dim as u32,
+                scale,
+            );
+            encoder.end_encoding();
+            commit_and_wait(cmd_buf, "encode_joint_attention_flash")
+        })?;
 
         unsafe { download_f32(&out_buf, &mut out[..out_len]) };
 
@@ -1388,21 +1440,23 @@ impl MetalGraph {
             upload_f32(&pool.v, &v[..qkv_len]);
         }
 
-        let cmd_buf = self.command_queue.new_command_buffer();
-        let encoder = cmd_buf.new_compute_command_encoder();
-        self.dispatch_joint_attention_flash(
-            encoder,
-            &pool.q,
-            &pool.k,
-            &pool.v,
-            &pool.out,
-            num_heads as u32,
-            seq as u32,
-            head_dim as u32,
-            scale,
-        );
-        encoder.end_encoding();
-        commit_and_wait(cmd_buf, "encode_joint_attention_flash_pooled")?;
+        autoreleasepool(|| {
+            let cmd_buf = self.command_queue.new_command_buffer();
+            let encoder = cmd_buf.new_compute_command_encoder();
+            self.dispatch_joint_attention_flash(
+                encoder,
+                &pool.q,
+                &pool.k,
+                &pool.v,
+                &pool.out,
+                num_heads as u32,
+                seq as u32,
+                head_dim as u32,
+                scale,
+            );
+            encoder.end_encoding();
+            commit_and_wait(cmd_buf, "encode_joint_attention_flash_pooled")
+        })?;
 
         unsafe { download_f32(&pool.out, &mut out[..out_len]) };
 
@@ -1467,21 +1521,23 @@ impl MetalGraph {
             ));
         }
 
-        let cmd_buf = self.command_queue.new_command_buffer();
-        let encoder = cmd_buf.new_compute_command_encoder();
-        self.dispatch_joint_attention_flash(
-            encoder,
-            &pool.q,
-            &pool.k,
-            &pool.v,
-            &pool.out,
-            num_heads as u32,
-            seq as u32,
-            head_dim as u32,
-            scale,
-        );
-        encoder.end_encoding();
-        commit_and_wait(cmd_buf, "joint_attn_flash_resident_dispatch")?;
+        autoreleasepool(|| {
+            let cmd_buf = self.command_queue.new_command_buffer();
+            let encoder = cmd_buf.new_compute_command_encoder();
+            self.dispatch_joint_attention_flash(
+                encoder,
+                &pool.q,
+                &pool.k,
+                &pool.v,
+                &pool.out,
+                num_heads as u32,
+                seq as u32,
+                head_dim as u32,
+                scale,
+            );
+            encoder.end_encoding();
+            commit_and_wait(cmd_buf, "joint_attn_flash_resident_dispatch")
+        })?;
         Ok(())
     }
 
@@ -1572,75 +1628,78 @@ impl MetalGraph {
         }
         let dt_upload = t1.elapsed();
 
-        // ── Create command buffer + single encoder ───────────────────────
-        let t2 = Instant::now();
-        let cmd_buf = self.command_queue.new_command_buffer();
-        let encoder = cmd_buf.new_compute_command_encoder();
-        let dt_encode_setup = t2.elapsed();
+        // ── Command buffer + single encoder ──────────────────────────────
+        // Both are autoreleased: the pool drains them once the wait returns.
+        let (dt_encode_setup, dt_gpu_wait) = autoreleasepool(|| {
+            let t2 = Instant::now();
+            let cmd_buf = self.command_queue.new_command_buffer();
+            let encoder = cmd_buf.new_compute_command_encoder();
+            let dt_encode_setup = t2.elapsed();
 
-        let h = hidden_size as u32;
-        let inter = intermediate_size as u32;
+            let h = hidden_size as u32;
+            let inter = intermediate_size as u32;
 
-        // ── Step 2: GEMV(attn_proj, attn_out) → proj_buf ────────────────
-        // n_rows = hidden_size, k = hidden_size
-        self.dispatch_gemv_q1(
-            encoder,
-            &attn_proj_weight.buffer,
-            &bufs.attn_out_buf,
-            &bufs.proj_buf,
-            h,
-            h,
-        );
+            // ── Step 2: GEMV(attn_proj, attn_out) → proj_buf ────────────────
+            // n_rows = hidden_size, k = hidden_size
+            self.dispatch_gemv_q1(
+                encoder,
+                &attn_proj_weight.buffer,
+                &bufs.attn_out_buf,
+                &bufs.proj_buf,
+                h,
+                h,
+            );
 
-        // ── Step 3: residual_add(hidden_buf, proj_buf) ───────────────────
-        self.dispatch_residual_add(encoder, &bufs.hidden_buf, &bufs.proj_buf, h);
+            // ── Step 3: residual_add(hidden_buf, proj_buf) ───────────────────
+            self.dispatch_residual_add(encoder, &bufs.hidden_buf, &bufs.proj_buf, h);
 
-        // ── Step 4: rmsnorm_weighted(hidden_buf, norm_weight_buf) → normed_buf
-        self.dispatch_rmsnorm(
-            encoder,
-            &bufs.hidden_buf,
-            &bufs.norm_weight_buf,
-            &bufs.normed_buf,
-            eps,
-            h,
-        );
+            // ── Step 4: rmsnorm_weighted(hidden_buf, norm_weight_buf) → normed_buf
+            self.dispatch_rmsnorm(
+                encoder,
+                &bufs.hidden_buf,
+                &bufs.norm_weight_buf,
+                &bufs.normed_buf,
+                eps,
+                h,
+            );
 
-        // ── Step 5: Fused gate+up+SwiGLU → swiglu_buf ──────────────────
-        self.dispatch_fused_gate_up_swiglu(
-            encoder,
-            &gate_up_weight.buffer,
-            &bufs.normed_buf,
-            &bufs.swiglu_buf,
-            inter,
-            h,
-        );
+            // ── Step 5: Fused gate+up+SwiGLU → swiglu_buf ──────────────────
+            self.dispatch_fused_gate_up_swiglu(
+                encoder,
+                &gate_up_weight.buffer,
+                &bufs.normed_buf,
+                &bufs.swiglu_buf,
+                inter,
+                h,
+            );
 
-        // ── Step 7: GEMV(down, swiglu) → down_buf ───────────────────────
-        // n_rows = hidden_size, k = intermediate_size
-        self.dispatch_gemv_q1(
-            encoder,
-            &down_weight.buffer,
-            &bufs.swiglu_buf,
-            &bufs.down_buf,
-            h,
-            inter,
-        );
+            // ── Step 7: GEMV(down, swiglu) → down_buf ───────────────────────
+            // n_rows = hidden_size, k = intermediate_size
+            self.dispatch_gemv_q1(
+                encoder,
+                &down_weight.buffer,
+                &bufs.swiglu_buf,
+                &bufs.down_buf,
+                h,
+                inter,
+            );
 
-        // ── Step 8: residual_add(hidden_buf, down_buf) ──────────────────
-        self.dispatch_residual_add(encoder, &bufs.hidden_buf, &bufs.down_buf, h);
+            // ── Step 8: residual_add(hidden_buf, down_buf) ──────────────────
+            self.dispatch_residual_add(encoder, &bufs.hidden_buf, &bufs.down_buf, h);
 
-        // ── Commit and wait ──────────────────────────────────────────────
-        encoder.end_encoding();
-        // MET-04: `commit_and_wait` replaces the raw commit/wait pair and turns a
-        // non-`Completed` command-buffer status into a named error instead of
-        // letting the readback below hand back the previous token's bytes. The
-        // `Instant` now spans commit+wait rather than wait alone — at batch 1
-        // `commit()` is a submission, not a sync, so the measured GPU wait is
-        // unchanged in practice, and `dt_gpu_wait` remains the GPU-bound term
-        // of the per-call breakdown below.
-        let t3 = Instant::now();
-        commit_and_wait(cmd_buf, "encode_ffn_phase")?;
-        let dt_gpu_wait = t3.elapsed();
+            // ── Commit and wait ──────────────────────────────────────────────
+            encoder.end_encoding();
+            // MET-04: `commit_and_wait` replaces the raw commit/wait pair and turns a
+            // non-`Completed` command-buffer status into a named error instead of
+            // letting the readback below hand back the previous token's bytes. The
+            // `Instant` now spans commit+wait rather than wait alone — at batch 1
+            // `commit()` is a submission, not a sync, so the measured GPU wait is
+            // unchanged in practice, and `dt_gpu_wait` remains the GPU-bound term
+            // of the per-call breakdown below.
+            let t3 = Instant::now();
+            commit_and_wait(cmd_buf, "encode_ffn_phase")?;
+            Ok::<_, MetalGraphError>((dt_encode_setup, t3.elapsed()))
+        })?;
 
         // ── Step 9: Read back ────────────────────────────────────────────
         let t4 = Instant::now();

@@ -260,8 +260,13 @@ pub(crate) struct HybridReport {
     /// The dry bind (`HybridModel::from_gguf`): the resolved quant type,
     /// variant and folded count — or why the model cannot be bound.
     pub(crate) bind: Result<HybridBind, String>,
-    /// The kernel tier every hybrid runs on in this release, and why.
+    /// The CPU tier the CPU model runs on (`--backend cpu`, the embedding
+    /// pass, and `--backend auto` when no Metal runner serves the model).
     pub(crate) kernel_tier: oxibonsai_kernels::KernelTier,
+    /// What `--backend auto` does with the model on this host at the
+    /// default `--ctx`: the Metal hybrid runner with its KV window, or the
+    /// CPU tier and why (`None` when the model did not bind).
+    pub(crate) backend_plan: Option<oxibonsai_runtime::engine_hybrid_gpu::HybridBackendPlan>,
 }
 
 /// What a successful dry bind resolved.
@@ -280,7 +285,10 @@ const DRY_BIND_CONTEXT: usize = 16;
 /// Build the truthful hybrid report for a parsed `qwen35` GGUF: the config
 /// and Hadamard contract from metadata, plus a header-only dry bind of the
 /// hybrid model — the constructor `run` actually uses (weights stay in the
-/// memory map; ~1-2 s for the 27B).
+/// memory map; ~1-2 s for the 27B) — and the backend `--backend auto`
+/// resolves to for it at the default `--ctx` (the Metal hybrid runner's
+/// footprint and window, computed without building one; the Metal device is
+/// opened only to read its limits).
 ///
 /// # Errors
 ///
@@ -312,14 +320,24 @@ pub(crate) fn hybrid_report(
             Ok(None) => None,
             Err(e) => anyhow::bail!("prism.hadamard.* contract: {e}"),
         };
-    let bind = oxibonsai_model::hybrid::HybridModel::from_gguf(gguf, DRY_BIND_CONTEXT)
-        .map(|model| HybridBind {
-            quant: model.quant_type(),
-            variant: model.variant().map(|v| v.name().to_string()),
-            folded: model.folded_count(),
-            description: model.describe(),
-        })
-        .map_err(|e| e.to_string());
+    let default_ctx = super::bonsai2::default_max_seq_len("qwen35");
+    let (bind, backend_plan) =
+        match oxibonsai_model::hybrid::HybridModel::from_gguf(gguf, DRY_BIND_CONTEXT) {
+            Ok(model) => (
+                Ok(HybridBind {
+                    quant: model.quant_type(),
+                    variant: model.variant().map(|v| v.name().to_string()),
+                    folded: model.folded_count(),
+                    description: model.describe(),
+                }),
+                Some(oxibonsai_runtime::engine_hybrid_gpu::hybrid_backend_plan(
+                    gguf,
+                    &model,
+                    default_ctx,
+                )),
+            ),
+            Err(e) => (Err(e.to_string()), None),
+        };
     Ok(HybridReport {
         layers: cfg.base.num_layers,
         linear_layers: cfg.num_linear_layers(),
@@ -330,7 +348,38 @@ pub(crate) fn hybrid_report(
         geometry,
         bind,
         kernel_tier: oxibonsai_kernels::cpu_kernel_tier(),
+        backend_plan,
     })
+}
+
+/// The effective decode tier of a hybrid under `--backend auto`, and the
+/// one-line reason `info` prints for it (the reason always names the model
+/// kind, "hybrid qwen35 model").
+pub(crate) fn hybrid_auto_tier(report: &HybridReport) -> (String, String) {
+    use oxibonsai_runtime::engine_hybrid_gpu::{HybridBackendPlan, HYBRID_RUNNER_LABEL};
+    match &report.backend_plan {
+        Some(HybridBackendPlan::Metal { window, .. }) => (
+            "gpu".to_string(),
+            format!(
+                "hybrid qwen35 model: executor {HYBRID_RUNNER_LABEL} under --backend auto/metal \
+                 (KV window {} positions at the default --ctx, device ceiling {} positions for a \
+                 runner alone); --backend cpu runs it on the {} CPU tier",
+                window.window, window.device_ceiling, report.kernel_tier
+            ),
+        ),
+        Some(HybridBackendPlan::Cpu { reason }) => (
+            report.kernel_tier.to_string(),
+            format!(
+                "hybrid qwen35 model: runs on the best CPU tier under --backend auto/cpu, and \
+                 --backend metal is refused, because the Metal hybrid runner does not serve it \
+                 here: {reason}"
+            ),
+        ),
+        None => (
+            report.kernel_tier.to_string(),
+            "hybrid qwen35 model: the dry bind failed, so no backend was resolved".to_string(),
+        ),
+    }
 }
 
 impl HybridReport {
@@ -395,12 +444,38 @@ impl HybridReport {
             gib(self.geometry.recurrent_bytes),
             ram_limit.map_or_else(|| "unknown".to_string(), |l| l.to_string()),
         ));
-        out.push(format!(
-            "Kernel tier: {} (hybrid qwen35 model: no hybrid GPU encoder exists yet, so every \
-             backend but an explicit `--backend metal` — which is refused — runs it on the best \
-             CPU tier)",
-            self.kernel_tier
-        ));
+        let (tier, reason) = hybrid_auto_tier(self);
+        out.push(format!("Kernel tier: {tier} ({reason})"));
+        if let Some(oxibonsai_runtime::engine_hybrid_gpu::HybridBackendPlan::Metal {
+            window,
+            mapped,
+        }) = &self.backend_plan
+        {
+            out.push(format!(
+                "Backend: {} — {}",
+                oxibonsai_runtime::engine_hybrid_gpu::HYBRID_RUNNER_LABEL,
+                window.summary()
+            ));
+            out.push(format!(
+                "Metal residents: {}; the runner reads the weights {} and allocates its f16 KV \
+                 for the whole window at load ({} bytes/position: {} for the {}-position window \
+                 the default --ctx {} wires)",
+                window.residents.describe(),
+                if *mapped {
+                    "in place from the file mapping"
+                } else {
+                    "from a copy (the image is not page-aligned)"
+                },
+                if window.window == 0 {
+                    0
+                } else {
+                    window.runner_kv_bytes / window.window as u64
+                },
+                gib(window.runner_kv_bytes),
+                window.window,
+                window.requested,
+            ));
+        }
         out
     }
 
@@ -445,8 +520,42 @@ impl HybridReport {
             "default_ctx": default_ctx,
             "recurrent_bytes": self.geometry.recurrent_bytes,
             "ram_derived_max_ctx": ram_limit,
-            "kernel_tier": self.kernel_tier.to_string(),
+            "kernel_tier": hybrid_auto_tier(self).0,
+            "cpu_kernel_tier": self.kernel_tier.to_string(),
+            "backend": self.backend_json(),
         })
+    }
+
+    /// The `--backend auto` resolution for `info --json`.
+    fn backend_json(&self) -> serde_json::Value {
+        use oxibonsai_runtime::engine_hybrid_gpu::HybridBackendPlan;
+        match &self.backend_plan {
+            Some(HybridBackendPlan::Metal { window, mapped }) => serde_json::json!({
+                "executor": "metal",
+                "label": oxibonsai_runtime::engine_hybrid_gpu::HYBRID_RUNNER_LABEL,
+                "weights_mapped": mapped,
+                "window": window.window,
+                "requested": window.requested,
+                "declared": window.declared,
+                "ram_guard": window.ram_guard,
+                "resident_budget": window.resident_budget,
+                "runner_alone_budget": window.runner_alone_budget,
+                "device_ceiling": window.device_ceiling,
+                "residents": window.residents.describe(),
+                "limits_applied": window
+                    .limits_applied
+                    .iter()
+                    .map(|l| l.as_str())
+                    .collect::<Vec<_>>(),
+                "runner_allocated_bytes": window.runner_allocated_bytes,
+                "runner_kv_bytes": window.runner_kv_bytes,
+            }),
+            Some(HybridBackendPlan::Cpu { reason }) => serde_json::json!({
+                "executor": "cpu",
+                "reason": reason,
+            }),
+            None => serde_json::Value::Null,
+        }
     }
 }
 
@@ -741,3 +850,7 @@ mod tests {
         print_build_info();
     }
 }
+
+#[cfg(test)]
+#[path = "model_desc_tests.rs"]
+mod hybrid_report_tests;

@@ -12,13 +12,23 @@
 //! carrying reasoning content. When the rendered conversation no longer
 //! fits the context
 //! window, the oldest turns are dropped (system messages are kept).
+//!
+//! With `--mmproj` and `--image` (a Bonsai 2 model), the images are encoded
+//! once when the session starts and attached as content parts to the first
+//! user message (ahead of its text), so every turn that still holds that
+//! message re-prefills them in place of their `<|image_pad|>` placeholders
+//! (design §6.2). Context accounting counts the image rows; once the image
+//! message has to be dropped to fit, the conversation continues as text.
+//! `/reset` starts over with the images attached to the next message.
 
 use std::io::{self, BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use oxibonsai_model::vision::{GridSize, VisionTokenIds};
 use oxibonsai_runtime::config::{RenderMessage, ResolvedChatTemplate};
 use oxibonsai_runtime::sampling::PenaltyParams;
+use oxibonsai_runtime::vision_prefill::{ChatPrompt, EncodedImage, MultimodalPrompt};
 
 use super::bonsai2;
 use super::cmd_run::{self, ConstrainedSampling, EngineLoad};
@@ -87,6 +97,12 @@ pub(crate) struct RenderedTurn {
 /// removed from `history` itself, so the conversation stays consistent with
 /// what the model saw.
 ///
+/// `prompt_rows` counts the sequence positions an encoded prompt occupies:
+/// its token count for a text-only session ([`text_rows`]), and — when the
+/// session carries images — the count with every `<|image_pad|>` expanded
+/// to its image's rows ([`SessionImages::rows`]), so the context check sees
+/// what the model will.
+///
 /// When the prompt fits but `max_tokens` would still carry it past
 /// `max_context` after every droppable message is gone,
 /// [`RenderedTurn::effective_max_tokens`] is clamped to exactly what
@@ -94,8 +110,9 @@ pub(crate) struct RenderedTurn {
 ///
 /// # Errors
 ///
-/// A render/encode error, or the latest message ALONE (nothing left to
-/// drop) exceeding `max_context`.
+/// A render/encode error, a `prompt_rows` error (placeholders that do not
+/// match the session's images), or the latest message ALONE (nothing left
+/// to drop) exceeding `max_context`.
 pub(crate) fn render_turn(
     tok: &oxibonsai_runtime::TokenizerBridge,
     template: &ResolvedChatTemplate,
@@ -103,12 +120,13 @@ pub(crate) fn render_turn(
     contract: &ChatContract,
     max_tokens: usize,
     max_context: usize,
+    prompt_rows: &dyn Fn(&[u32]) -> anyhow::Result<usize>,
 ) -> anyhow::Result<RenderedTurn> {
     let mut dropped = 0usize;
     loop {
         let rendered = generate::render_prompt(template, history, contract)?;
         let tokens = tok.encode(&rendered)?;
-        let prompt_len = tokens.len();
+        let prompt_len = prompt_rows(&tokens)?;
         let oldest = || {
             history
                 .iter()
@@ -164,6 +182,101 @@ pub(crate) fn render_turn(
     }
 }
 
+/// [`render_turn`]'s row count for a text-only session: the token count.
+///
+/// # Errors
+///
+/// Never; the signature matches [`SessionImages::rows`].
+pub(crate) fn text_rows(tokens: &[u32]) -> anyhow::Result<usize> {
+    Ok(tokens.len())
+}
+
+/// The images of a `chat --image` session, encoded once at start-up.
+pub(crate) struct SessionImages {
+    /// The encoded images, in `--image` order.
+    images: Vec<EncodedImage>,
+    /// Their merged grids (the splice geometry).
+    grids: Vec<GridSize>,
+    /// The vision marker ids the splice keys on.
+    ids: VisionTokenIds,
+}
+
+impl SessionImages {
+    /// Wrap already-encoded images.
+    pub(crate) fn new(images: Vec<EncodedImage>, ids: VisionTokenIds) -> Self {
+        let grids = images.iter().map(|image| image.grid).collect();
+        Self { images, grids, ids }
+    }
+
+    /// Images in the session.
+    pub(crate) fn len(&self) -> usize {
+        self.images.len()
+    }
+
+    /// Sequence positions a rendered conversation occupies with the images
+    /// expanded (the plain token count once the image message is gone).
+    ///
+    /// # Errors
+    ///
+    /// Placeholders that do not match the session's images.
+    pub(crate) fn rows(&self, tokens: &[u32]) -> anyhow::Result<usize> {
+        bonsai2::prompt_rows(tokens, &self.grids, self.ids)
+    }
+
+    /// Whether a rendered conversation still holds the image message.
+    pub(crate) fn placed_in(&self, tokens: &[u32]) -> bool {
+        tokens.contains(&self.ids.image_pad)
+    }
+
+    /// The prompt for one rendered conversation: multimodal while it holds
+    /// the image message, text once that message was dropped.
+    ///
+    /// # Errors
+    ///
+    /// Placeholders that do not match the session's images
+    /// (`[<code>] <reason>`).
+    pub(crate) fn prompt(&self, tokens: Vec<u32>) -> anyhow::Result<ChatPrompt> {
+        if !self.placed_in(&tokens) {
+            return Ok(ChatPrompt::Text(tokens));
+        }
+        MultimodalPrompt::new(tokens, self.images.clone(), self.ids)
+            .map(ChatPrompt::Multimodal)
+            .map_err(|e| anyhow::anyhow!("[{}] {e}", e.code()))
+    }
+}
+
+/// Prepare, context-check and encode every `--image` of a `chat` session
+/// (`None` when the session has none).
+///
+/// # Errors
+///
+/// An image that cannot be prepared or encoded, or images whose rows alone
+/// exceed `max_context`.
+fn encode_session_images(
+    vision: &bonsai2::VisionRequest,
+    service: Option<&oxibonsai_runtime::vision_prefill::VisionService>,
+    max_context: usize,
+) -> anyhow::Result<Option<SessionImages>> {
+    let Some(service) = service.filter(|_| !vision.images.is_empty()) else {
+        return Ok(None);
+    };
+    let prepared = vision.prepare_images(service)?;
+    let rows: usize = prepared.iter().map(|p| p.grid.n_tokens()).sum();
+    if rows > max_context {
+        anyhow::bail!(
+            "the {} image(s) alone occupy {rows} positions, more than max context \
+             {max_context}; lower --image-max-tokens or raise --ctx",
+            prepared.len()
+        );
+    }
+    let images = vision.encode_prepared(service, &prepared)?;
+    eprintln!(
+        "[{} image(s) ({rows} image tokens) will be attached to your first message]",
+        images.len()
+    );
+    Ok(Some(SessionImages::new(images, service.token_ids())))
+}
+
 pub(crate) fn run(args: ChatArgs) -> anyhow::Result<()> {
     let ChatArgs {
         model,
@@ -200,7 +313,7 @@ pub(crate) fn run(args: ChatArgs) -> anyhow::Result<()> {
             anyhow::anyhow!("no model: pass --model <gguf> or set OXI_MODEL (e.g. in .env)")
         })?;
 
-    vision.reject_until_supported()?;
+    vision.validate(true)?;
     let contract = ChatContract::from_flags(enable_thinking, reasoning_effort, tools.as_deref())?;
     let (display, _) = ReasoningDisplay::from_flags(show_reasoning, hide_reasoning);
 
@@ -219,6 +332,14 @@ pub(crate) fn run(args: ChatArgs) -> anyhow::Result<()> {
         max_seq_len,
         rope_scaling,
     )?;
+    // The vision projector (design §6.2), before any language-model weight
+    // is bound: a wrong architecture or a variant projector fails fast.
+    let vision_service = vision.load_service(&arch, bonsai2::cli_image_policy())?;
+    if vision_service.is_some() && vision.images.is_empty() {
+        tracing::warn!(
+            "--mmproj without --image: the projector is loaded but no image is attached"
+        );
+    }
     let sampling = cmd_run::resolve_sampling(temperature, top_k, top_p, min_p, &gguf.metadata)?;
 
     // cli-12: same shared constructor as `run`,
@@ -284,6 +405,13 @@ pub(crate) fn run(args: ChatArgs) -> anyhow::Result<()> {
         frequency_penalty,
         presence_penalty,
     )?;
+    // Every `--image`, encoded once for the whole session.
+    let session_images =
+        encode_session_images(&vision, vision_service.as_deref(), engine.max_context())?;
+    let prompt_rows = |tokens: &[u32]| match &session_images {
+        Some(images) => images.rows(tokens),
+        None => text_rows(tokens),
+    };
     println!("OxiBonsai Interactive Chat (type 'quit' or Ctrl-D to exit, '/reset' to clear)");
     println!("Tip: press Ctrl-C during generation to interrupt output without exiting.");
     println!("---");
@@ -300,6 +428,11 @@ pub(crate) fn run(args: ChatArgs) -> anyhow::Result<()> {
     }
 
     let mut history: Vec<RenderMessage> = Vec::new();
+    // Whether the next user message carries the session's images (the
+    // first one, and the first one after `/reset`), and whether the history
+    // currently holds the message that does.
+    let mut attach_images = session_images.is_some();
+    let mut images_in_history = false;
     let stdin = io::stdin();
     loop {
         print!("> ");
@@ -332,11 +465,21 @@ pub(crate) fn run(args: ChatArgs) -> anyhow::Result<()> {
         if input == "/reset" {
             engine.reset();
             history.clear();
-            println!("[context cleared]");
+            attach_images = session_images.is_some();
+            images_in_history = false;
+            if attach_images {
+                println!("[context cleared; the image(s) will be attached to your next message]");
+            } else {
+                println!("[context cleared]");
+            }
             continue;
         }
 
-        history.push(RenderMessage::new("user", input));
+        let images_now = match &session_images {
+            Some(images) if attach_images => images.len(),
+            _ => 0,
+        };
+        history.push(cmd_run::user_turn(input, images_now));
         let turn = match render_turn(
             &tok,
             &template,
@@ -344,6 +487,7 @@ pub(crate) fn run(args: ChatArgs) -> anyhow::Result<()> {
             &contract,
             max_tokens,
             engine.max_context(),
+            &prompt_rows,
         ) {
             Ok(turn) => turn,
             Err(e) => {
@@ -358,6 +502,38 @@ pub(crate) fn run(args: ChatArgs) -> anyhow::Result<()> {
                 turn.dropped_messages
             );
         }
+        let prompt = match &session_images {
+            Some(images) => images.prompt(turn.tokens),
+            None => Ok(ChatPrompt::Text(turn.tokens)),
+        };
+        let prompt = prompt.and_then(|prompt| {
+            if images_now > 0 && prompt.image_count() == 0 {
+                anyhow::bail!(
+                    "[image_placeholder_count_mismatch] the chat template rendered no \
+                     <|image_pad|> placeholder for the {images_now} attached image(s); this \
+                     model's template does not support image content"
+                );
+            }
+            Ok(prompt)
+        });
+        let prompt = match prompt {
+            Ok(prompt) => prompt,
+            Err(e) => {
+                history.pop();
+                eprintln!("[{e}]");
+                continue;
+            }
+        };
+        if images_now > 0 {
+            attach_images = false;
+            images_in_history = true;
+        } else if images_in_history && prompt.image_count() == 0 {
+            images_in_history = false;
+            eprintln!(
+                "[the message carrying the image(s) was dropped to fit the context window; the \
+                 conversation continues without them ('/reset' re-attaches them)]"
+            );
+        }
 
         interrupted.store(false, Ordering::SeqCst);
         let start = std::time::Instant::now();
@@ -367,7 +543,7 @@ pub(crate) fn run(args: ChatArgs) -> anyhow::Result<()> {
             let mut printer = TokenPrinter::new(Some(&tok), turn.started_in_think, display, false);
             let count = cmd_run::run_constrained_or_stopped_with(
                 &mut engine,
-                &turn.tokens,
+                &prompt,
                 turn.effective_max_tokens,
                 cached_grammar.as_ref(),
                 &stop,
@@ -391,7 +567,7 @@ pub(crate) fn run(args: ChatArgs) -> anyhow::Result<()> {
             // token-for-token identical to the former CLI sampler loop.
             let count = run_streaming_turn(
                 &mut engine,
-                &turn.tokens,
+                &prompt,
                 turn.effective_max_tokens,
                 &mut printer,
                 &interrupted,
@@ -428,12 +604,13 @@ pub(crate) fn run(args: ChatArgs) -> anyhow::Result<()> {
 }
 
 /// One turn of the engine's own streaming decode loop (no `--grammar` /
-/// `--stop` / min-p): `generate_streaming_sync` on a worker thread, tokens
-/// printed as they arrive. Breaking out on Ctrl-C drops the receiver, which
-/// stops the generation thread within one token step.
+/// `--stop` / min-p): `generate_streaming_sync` (its multimodal form for a
+/// prompt with images) on a worker thread, tokens printed as they arrive.
+/// Breaking out on Ctrl-C drops the receiver, which stops the generation
+/// thread within one token step.
 fn run_streaming_turn(
     engine: &mut oxibonsai_runtime::InferenceEngine<'_>,
-    prompt_tokens: &[u32],
+    prompt: &ChatPrompt,
     max_tokens: usize,
     printer: &mut TokenPrinter<'_>,
     interrupted: &Arc<AtomicBool>,
@@ -442,7 +619,7 @@ fn run_streaming_turn(
     std::thread::scope(|s| -> anyhow::Result<usize> {
         let thread_tx = tx.clone();
         let gen_handle =
-            s.spawn(move || engine.generate_streaming_sync(prompt_tokens, max_tokens, &thread_tx));
+            s.spawn(move || prompt.generate_streaming_sync(engine, max_tokens, &thread_tx));
         drop(tx);
 
         let mut count = 0usize;

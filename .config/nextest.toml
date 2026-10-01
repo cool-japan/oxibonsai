@@ -31,8 +31,9 @@ fail-fast = false
 # forever.
 slow-timeout = { period = "120s", terminate-after = 3 }
 # Excludes the real Bonsai 2 27B gate tests, the real Metal 27B gate tests
-# and the two full-weight-load `real_27b_` lib/bin cases from every
-# `cargo nextest run` that does not explicitly ask for them. Without this, a
+# (model-level `hybrid_real_27b_metal_*` and engine-level
+# `real_27b_metal_engine_*`) and the two full-weight-load `real_27b_` lib/bin
+# cases from every `cargo nextest run` that does not explicitly ask for them. Without this, a
 # workspace `cargo nextest run --all-features` with `OXIBONSAI_MODELS_DIR`
 # set schedules `hybrid_forward_parity_tests`'s and `bonsai2_engine_tests`'s
 # real-27B cases as DEBUG builds — each maps a 5.9-7.2 GB GGUF, so a handful
@@ -49,7 +50,18 @@ slow-timeout = { period = "120s", terminate-after = 3 }
 # cases (an `mmap` + metadata parse, no weight load) are deliberately NOT
 # excluded here — they cost about as much as any other test and belong in a
 # plain nextest run.
-default-filter = 'not (binary(hybrid_forward_parity_tests) & test(/hybrid_real_27b_/)) & not (binary(bonsai2_engine_tests) & test(/_engine_greedy_matches_the_fork_goldens$/)) & not test(/hybrid_real_27b_metal_/) & not test(/real_27b_hybrid_embed_returns_a_unit_vector/) & not test(/real_27b_hybrid_model_serves_embeddings/)'
+#
+# The two real 27B vision legs (`bonsai2_vision_tests`'s golden gate in
+# oxibonsai-model and `bonsai2_vision_runtime_tests`'s `real_27b_` server
+# round trip in oxibonsai-runtime) are excluded for the same reason: both
+# find the weights through the test kit's `models/` fallback, and each is a
+# full 27B weight load plus a vision encode, prefill and 32-token decode.
+# They run in `--release`, one at a time (`cargo test --release
+# --all-features --test bonsai2_vision_tests` / `--test
+# bonsai2_vision_runtime_tests` with `OXI_BONSAI2_PQ2_GGUF` and
+# `OXI_BONSAI2_MMPROJ_GGUF` set); the synthetic cases of
+# `bonsai2_vision_runtime_tests` stay in.
+default-filter = 'not (binary(hybrid_forward_parity_tests) & test(/hybrid_real_27b_/)) & not (binary(bonsai2_engine_tests) & test(/_engine_greedy_matches_the_fork_goldens$/)) & not test(/hybrid_real_27b_metal_/) & not test(/real_27b_hybrid_embed_returns_a_unit_vector/) & not test(/real_27b_hybrid_model_serves_embeddings/) & not test(/^real_27b_metal_engine_/) & not (binary(bonsai2_vision_tests) & test(/real_27b/)) & not (binary(bonsai2_vision_runtime_tests) & test(/^real_27b_/))'
 
 # M-08's opt-in long-context gate (`oxibonsai-runtime::legacy_parity_tests::
 # m08_yarn_scaling_moves_real_bonsai_8b_logits_at_20000_tokens`) self-skips in
@@ -137,6 +149,9 @@ slow-timeout = { period = "900s", terminate-after = 8 }
 #   - `int8_tier_parity`'s `*_on_the_real_*` legs (1.7B / 8B / 27B PQ2_0
 #     weights) and `cross_backend_determinism_tests`'s `real_model_*` legs
 #     (CPU-vs-Metal byte identity, INT8-tier decode tok/s).
+#   - `real_model_cpu_prefill_outruns_the_sequential_prefill` (oxibonsai-model
+#     lib): the batched-vs-sequential CPU prefill throughput gate on a real
+#     GGUF, same one-real-model-process-at-a-time reasoning.
 [[profile.default.overrides]]
 filter = 'package(oxibonsai-model) & kind(lib) & test(/real_model_batched_hidden_matches_sequential$/)'
 test-group = 'real-model-gate'
@@ -157,6 +172,11 @@ filter = '(binary(int8_tier_parity) & test(/_on_the_real_/)) | (binary(cross_bac
 test-group = 'real-model-gate'
 slow-timeout = { period = "600s", terminate-after = 10 }
 
+[[profile.default.overrides]]
+filter = 'package(oxibonsai-model) & kind(lib) & test(/real_model_cpu_prefill_outruns_the_sequential_prefill$/)'
+test-group = 'real-model-gate'
+slow-timeout = { period = "600s", terminate-after = 10 }
+
 # The real Metal 27B gates (CPU-vs-Metal token parity, decode throughput —
 # oxibonsai-model's `hybrid_metal_gates`, named `hybrid_real_27b_metal_*`):
 # `default-filter` above already excludes them from a plain run, but pin
@@ -172,19 +192,21 @@ filter = 'test(/hybrid_real_27b_metal_/)'
 test-group = 'real-model-gate'
 slow-timeout = { period = "900s", terminate-after = 8 }
 
-# The four real-model lib/bin acceptance cases (`scripts/release-gate.sh`
-# stage 1d): two on the 1.7B legacy model
+# The five real-model lib/bin acceptance cases (`scripts/release-gate.sh`
+# stage 1d): three on the 1.7B legacy model
 # (`temperature_zero_completion_takes_the_metal_greedy_gpu_path`,
 # `real_model_stream_stop_sequence_matches_the_non_stream_text_and_reports_stop`,
-# both inside `oxibonsai-runtime`'s own `--lib` tests) and two on the real
-# Bonsai 2 27B (`real_27b_hybrid_embed_returns_a_unit_vector` in
-# `oxibonsai-runtime`'s `--lib`, `real_27b_hybrid_model_serves_embeddings` in
-# `oxibonsai-cli`'s `--bin`). Only the 27B pair is excluded by
-# `default-filter` above (a full weight load); all four are still pinned to
-# `real-model-gate` here so an explicit `--ignore-default-filter` run never
-# schedules one of them alongside another real-model case.
+# `real_model_fallback_template_tool_call_and_no_think`, all three inside
+# `oxibonsai-runtime`'s own `--lib` tests and reachable through the same
+# testkit `models/` resolver) and two on the real Bonsai 2 27B
+# (`real_27b_hybrid_embed_returns_a_unit_vector` in `oxibonsai-runtime`'s
+# `--lib`, `real_27b_hybrid_model_serves_embeddings` in `oxibonsai-cli`'s
+# `--bin`). Only the 27B pair is excluded by `default-filter` above (a full
+# weight load); all five are still pinned to `real-model-gate` here so an
+# explicit `--ignore-default-filter` run never schedules one of them
+# alongside another real-model case.
 [[profile.default.overrides]]
-filter = 'test(/temperature_zero_completion_takes_the_metal_greedy_gpu_path|real_model_stream_stop_sequence_matches_the_non_stream_text_and_reports_stop|real_27b_hybrid_embed_returns_a_unit_vector|real_27b_hybrid_model_serves_embeddings/)'
+filter = 'test(/temperature_zero_completion_takes_the_metal_greedy_gpu_path|real_model_stream_stop_sequence_matches_the_non_stream_text_and_reports_stop|real_model_fallback_template_tool_call_and_no_think|real_27b_hybrid_embed_returns_a_unit_vector|real_27b_hybrid_model_serves_embeddings/)'
 test-group = 'real-model-gate'
 slow-timeout = { period = "900s", terminate-after = 8 }
 
@@ -201,6 +223,70 @@ filter = 'test(/real_27b_info_reports_/)'
 test-group = 'real-model-gate'
 slow-timeout = { period = "900s", terminate-after = 8 }
 
+# The real Bonsai 2 vision projector gate (`oxibonsai-model`'s
+# `vision_mmproj_tests`, `real_mmproj_*`): it maps the 0.63 GB mmproj,
+# dequantises it to ~1.8 GB of resident f32 weights, runs the f64 reference
+# on two images and encodes a full 768 x 768 image — one real-model process
+# at a time, like every other real-weight gate. It self-skips in well under
+# a second when the projector is absent, so it stays in `default-filter`.
+# The synthetic and text-only cases of the same binary keep full
+# parallelism.
+[[profile.default.overrides]]
+filter = 'binary(vision_mmproj_tests) & test(/^real_mmproj_/)'
+test-group = 'real-model-gate'
+slow-timeout = { period = "600s", terminate-after = 10 }
+
+# The engine-level Metal 27B gates (`oxibonsai-runtime`'s
+# `bonsai2_metal_engine_tests`: the engine on the Metal hybrid runner vs the
+# CPU engine and the fork, decode throughput and memory, a chat round trip)
+# and the binary's one synthetic, environment-mutating case join the same
+# one-at-a-time group. `default-filter` above keeps the `real_27b_metal_engine_*`
+# cases out of a plain run; this pins them for an explicit
+# `--ignore-default-filter` run. Each G11-engine case also decodes the three
+# golden prompts on the CPU engine, hence the 600s x 10 ceiling.
+[[profile.default.overrides]]
+filter = 'binary(bonsai2_metal_engine_tests)'
+test-group = 'real-model-gate'
+slow-timeout = { period = "600s", terminate-after = 10 }
+
+# The real Bonsai 2 27B vision legs (`bonsai2-vision` capability): the
+# model-level golden gate (`bonsai2_vision_tests`: the 27B `PQ2_0` plus its
+# projector, the fixture image encoded, two prompts prefilled and decoded
+# against the fork's goldens) and the server round trip
+# (`bonsai2_vision_runtime_tests`'s `real_27b_` case: the same weights
+# behind the chat endpoint). `default-filter` above keeps them out of a
+# plain run; pinned here for an explicit `--ignore-default-filter` run, one
+# real-model process at a time. The synthetic cases of the runtime binary
+# keep full parallelism.
+[[profile.default.overrides]]
+filter = 'binary(bonsai2_vision_tests) & test(/real_27b/)'
+test-group = 'real-model-gate'
+slow-timeout = { period = "600s", terminate-after = 10 }
+
+[[profile.default.overrides]]
+filter = 'binary(bonsai2_vision_runtime_tests) & test(/^real_27b_/)'
+test-group = 'real-model-gate'
+slow-timeout = { period = "600s", terminate-after = 10 }
+
+# The head-free Metal hidden-prefill parity gate (`metal_hidden_parity_tests`,
+# oxibonsai-model: the three dense real models at 10/300/2000 tokens against
+# the per-token reference) and the M-18 fused-prefill chunk-size sweep
+# (`real_model_metal_prefill_chunk_size_sweep`, oxibonsai-model lib: a
+# 4096-token prompt at six chunk sizes plus its full sequential decode) —
+# both real-model legs of the same one-at-a-time group. Each self-skips in
+# well under a second without its model (`OXI_MODEL` / the testkit models
+# directory); with one, the parity leg's 2000-token per-token reference and
+# the sweep's 4096-step sequential decode run for minutes.
+[[profile.default.overrides]]
+filter = 'binary(metal_hidden_parity_tests)'
+test-group = 'real-model-gate'
+slow-timeout = { period = "600s", terminate-after = 10 }
+
+[[profile.default.overrides]]
+filter = 'package(oxibonsai-model) & kind(lib) & test(/real_model_metal_prefill_chunk_size_sweep$/)'
+test-group = 'real-model-gate'
+slow-timeout = { period = "600s", terminate-after = 10 }
+
 [profile.ci]
 retries = 0
 fail-fast = false
@@ -216,7 +302,7 @@ final-status-level = "flaky"
 # See `[profile.default]`'s own `default-filter` comment — same exclusion,
 # same reason, kept in sync by hand (nextest does not support inheriting one
 # profile's `default-filter` into another).
-default-filter = 'not (binary(hybrid_forward_parity_tests) & test(/hybrid_real_27b_/)) & not (binary(bonsai2_engine_tests) & test(/_engine_greedy_matches_the_fork_goldens$/)) & not test(/hybrid_real_27b_metal_/) & not test(/real_27b_hybrid_embed_returns_a_unit_vector/) & not test(/real_27b_hybrid_model_serves_embeddings/)'
+default-filter = 'not (binary(hybrid_forward_parity_tests) & test(/hybrid_real_27b_/)) & not (binary(bonsai2_engine_tests) & test(/_engine_greedy_matches_the_fork_goldens$/)) & not test(/hybrid_real_27b_metal_/) & not test(/real_27b_hybrid_embed_returns_a_unit_vector/) & not test(/real_27b_hybrid_model_serves_embeddings/) & not test(/^real_27b_metal_engine_/) & not (binary(bonsai2_vision_tests) & test(/real_27b/)) & not (binary(bonsai2_vision_runtime_tests) & test(/^real_27b_/))'
 
 # See `[profile.default]`'s own M-08 override — same filter, same reason.
 [[profile.ci.overrides]]
@@ -261,6 +347,13 @@ filter = '(binary(int8_tier_parity) & test(/_on_the_real_/)) | (binary(cross_bac
 test-group = 'real-model-gate'
 slow-timeout = { period = "600s", terminate-after = 10 }
 
+# See `[profile.default]`'s own matching override just above the
+# `[profile.ci]` header — same filter, same reason, kept in sync by hand.
+[[profile.ci.overrides]]
+filter = 'package(oxibonsai-model) & kind(lib) & test(/real_model_cpu_prefill_outruns_the_sequential_prefill$/)'
+test-group = 'real-model-gate'
+slow-timeout = { period = "600s", terminate-after = 10 }
+
 # See `[profile.default]`'s own two matching overrides just above the
 # `[profile.ci]` header — same filters, same reason, kept in sync by hand.
 [[profile.ci.overrides]]
@@ -269,7 +362,7 @@ test-group = 'real-model-gate'
 slow-timeout = { period = "900s", terminate-after = 8 }
 
 [[profile.ci.overrides]]
-filter = 'test(/temperature_zero_completion_takes_the_metal_greedy_gpu_path|real_model_stream_stop_sequence_matches_the_non_stream_text_and_reports_stop|real_27b_hybrid_embed_returns_a_unit_vector|real_27b_hybrid_model_serves_embeddings/)'
+filter = 'test(/temperature_zero_completion_takes_the_metal_greedy_gpu_path|real_model_stream_stop_sequence_matches_the_non_stream_text_and_reports_stop|real_model_fallback_template_tool_call_and_no_think|real_27b_hybrid_embed_returns_a_unit_vector|real_27b_hybrid_model_serves_embeddings/)'
 test-group = 'real-model-gate'
 slow-timeout = { period = "900s", terminate-after = 8 }
 
@@ -279,6 +372,47 @@ slow-timeout = { period = "900s", terminate-after = 8 }
 filter = 'test(/real_27b_info_reports_/)'
 test-group = 'real-model-gate'
 slow-timeout = { period = "900s", terminate-after = 8 }
+
+# See `[profile.default]`'s own matching vision-projector override just
+# above the `[profile.ci]` header — same filter, same reason, kept in sync
+# by hand.
+[[profile.ci.overrides]]
+filter = 'binary(vision_mmproj_tests) & test(/^real_mmproj_/)'
+test-group = 'real-model-gate'
+slow-timeout = { period = "600s", terminate-after = 10 }
+
+# See `[profile.default]`'s own matching Metal engine override just above the
+# `[profile.ci]` header — same filter, same reason, kept in sync by hand.
+[[profile.ci.overrides]]
+filter = 'binary(bonsai2_metal_engine_tests)'
+test-group = 'real-model-gate'
+slow-timeout = { period = "600s", terminate-after = 10 }
+
+# See `[profile.default]`'s own two matching real 27B vision overrides just
+# above the `[profile.ci]` header — same filters, same reason, kept in sync
+# by hand.
+[[profile.ci.overrides]]
+filter = 'binary(bonsai2_vision_tests) & test(/real_27b/)'
+test-group = 'real-model-gate'
+slow-timeout = { period = "600s", terminate-after = 10 }
+
+[[profile.ci.overrides]]
+filter = 'binary(bonsai2_vision_runtime_tests) & test(/^real_27b_/)'
+test-group = 'real-model-gate'
+slow-timeout = { period = "600s", terminate-after = 10 }
+
+# See `[profile.default]`'s own two matching overrides (the Metal
+# hidden-prefill parity gate and the M-18 chunk-size sweep) — same filters,
+# same reason, kept in sync by hand.
+[[profile.ci.overrides]]
+filter = 'binary(metal_hidden_parity_tests)'
+test-group = 'real-model-gate'
+slow-timeout = { period = "600s", terminate-after = 10 }
+
+[[profile.ci.overrides]]
+filter = 'package(oxibonsai-model) & kind(lib) & test(/real_model_metal_prefill_chunk_size_sweep$/)'
+test-group = 'real-model-gate'
+slow-timeout = { period = "600s", terminate-after = 10 }
 
 [profile.fast]
 # For the inner dev loop: run a narrow `-E` filter while iterating on one

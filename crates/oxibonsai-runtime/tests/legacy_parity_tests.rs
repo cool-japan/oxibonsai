@@ -136,6 +136,7 @@ use std::path::PathBuf;
 
 use oxibonsai_core::gguf::reader::GgufFile;
 use oxibonsai_kernels::dispatch::{cpu_kernel_tier, KernelDispatcher, KernelTier};
+use oxibonsai_kernels::dispatch_int8::KERNEL_TIER_ENV;
 use oxibonsai_model::model::BonsaiModel;
 use oxibonsai_runtime::engine::InferenceEngine;
 use oxibonsai_runtime::engine_control::gguf_fused_metal_route;
@@ -144,6 +145,98 @@ use oxibonsai_runtime::sampling_advanced::apply_repetition_penalty;
 use oxibonsai_runtime::tokenizer_bridge::TokenizerBridge;
 use oxibonsai_testkit::capability::{record_executed_timed, record_skipped, Capability};
 use oxibonsai_testkit::gguf_fixture::tiny_dense_qwen3_gguf;
+
+// ── OXIBONSAI_KERNEL_TIER scrub ─────────────────────────────────────────────
+//
+// The opt-in INT8 tier (K-14) diverts the CPU tiers' native-format GEMV/GEMM
+// but never Metal, so an exported `OXIBONSAI_KERNEL_TIER` would make this
+// gate's CPU arms compute something its Metal arm does not, and the greedy
+// chains could flip. Every test below that runs a model (or spawns a process
+// that does) owns the variable for its whole run through a [`TierEnvGuard`];
+// children inherit the cleared value.
+
+/// Serializes every [`TierEnvGuard`]: `std::env::set_var` / `remove_var` are
+/// `unsafe` because a concurrent read of any key can observe a torn `environ`.
+static TIER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_tier_env() -> std::sync::MutexGuard<'static, ()> {
+    TIER_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// RAII owner of `OXIBONSAI_KERNEL_TIER` for one test: holds the lock, clears
+/// the variable, and restores its previous value on drop (also when unwinding
+/// from a failed assertion).
+struct TierEnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    prior: Option<String>,
+}
+
+impl TierEnvGuard {
+    fn cleared() -> Self {
+        Self::cleared_under(lock_tier_env())
+    }
+
+    /// [`Self::cleared`] for a caller that already holds the lock.
+    fn cleared_under(lock: std::sync::MutexGuard<'static, ()>) -> Self {
+        let prior = std::env::var(KERNEL_TIER_ENV).ok();
+        // SAFETY: `lock` serializes every reader and writer of the variable in
+        // this binary and is held for the guard's whole life.
+        unsafe {
+            std::env::remove_var(KERNEL_TIER_ENV);
+        }
+        Self { _lock: lock, prior }
+    }
+}
+
+impl Drop for TierEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: `self._lock` is still held (fields drop after this body).
+        unsafe {
+            match &self.prior {
+                Some(value) => std::env::set_var(KERNEL_TIER_ENV, value),
+                None => std::env::remove_var(KERNEL_TIER_ENV),
+            }
+        }
+    }
+}
+
+/// The guard clears a selector that is set, keeps every other guard out while
+/// it lives, and puts the previous value back on drop.
+#[test]
+fn the_tier_env_guard_clears_the_selector_and_restores_it() {
+    let lock = lock_tier_env();
+    let ambient = std::env::var(KERNEL_TIER_ENV).ok();
+    // SAFETY: `lock` is held.
+    unsafe {
+        std::env::set_var(KERNEL_TIER_ENV, "neon-dot");
+    }
+    let guard = TierEnvGuard::cleared_under(lock);
+    assert!(
+        std::env::var(KERNEL_TIER_ENV).is_err(),
+        "cleared while held"
+    );
+    assert!(
+        TIER_ENV_LOCK.try_lock().is_err(),
+        "the guard holds the lock"
+    );
+    drop(guard);
+    assert_eq!(
+        std::env::var(KERNEL_TIER_ENV).as_deref(),
+        Ok("neon-dot"),
+        "the previous value is restored on drop"
+    );
+    // Leave the process as it was found.
+    let _lock = lock_tier_env();
+    // SAFETY: `_lock` is held.
+    unsafe {
+        match ambient {
+            Some(value) => std::env::set_var(KERNEL_TIER_ENV, value),
+            None => std::env::remove_var(KERNEL_TIER_ENV),
+        }
+    }
+}
 
 /// Generation budget for the LOGIT pass's cross-tier comparison: long
 /// enough to reach a repetition-inducing tail on every golden prompt, so a
@@ -745,6 +838,7 @@ fn run_logit_pass(
 /// real) or superseded by a logit-pass panic that reports the true failure
 /// — never asserted without having been checked.
 fn run_model_gate(model_file: &'static str, test_name: &str) {
+    let _tier_env = TierEnvGuard::cleared();
     let gate_start = std::time::Instant::now();
     // Serialized against this binary's other real-model gates — see
     // [`gpu_serial`]. Taken before the fixture probes so the whole gate,
@@ -864,6 +958,7 @@ fn bonsai_8b_greedy_text_matches_golden_across_tiers() {
 /// penalty actually moves them, needing no model file and no real weights.
 #[test]
 fn tiny_dense_qwen3_fixture_produces_non_degenerate_logits_the_repetition_penalty_can_move() {
+    let _tier_env = TierEnvGuard::cleared();
     let bytes = tiny_dense_qwen3_gguf(0xF00D_BEEF).expect("build tiny dense qwen3 fixture");
     let gguf = GgufFile::parse(&bytes).expect("parse tiny dense qwen3 fixture");
     let mut model = BonsaiModel::from_gguf(&gguf, 64).expect("load tiny dense qwen3 fixture");
@@ -904,6 +999,7 @@ fn tiny_dense_qwen3_fixture_produces_non_degenerate_logits_the_repetition_penalt
 #[test]
 fn onnx_converted_gguf_loads_through_the_real_tokenizer_round_trip() {
     const TEST: &str = "oxibonsai-runtime::legacy_parity_tests::onnx_converted_gguf_loads_through_the_real_tokenizer_round_trip";
+    let _tier_env = TierEnvGuard::cleared();
     let require_real_files = std::env::var("OXI_REQUIRE_MODEL_FILES")
         .map(|v| v == "1")
         .unwrap_or(false);
@@ -1005,6 +1101,7 @@ fn write_mmlu_fixture() -> std::path::PathBuf {
 fn eval_cli_scores_a_real_mmlu_style_dataset_through_score_choices_logprob() {
     const TEST: &str = "oxibonsai-runtime::legacy_parity_tests::\
                         eval_cli_scores_a_real_mmlu_style_dataset_through_score_choices_logprob";
+    let _tier_env = TierEnvGuard::cleared();
     let gate_start = std::time::Instant::now();
 
     let Some(model_path) = find_model("Ternary-Bonsai-1.7B.gguf") else {
@@ -1622,6 +1719,7 @@ impl M08Row {
 fn m08_yarn_scaling_moves_real_bonsai_8b_logits_at_20000_tokens() {
     const TEST: &str = "oxibonsai-runtime::legacy_parity_tests::\
                         m08_yarn_scaling_moves_real_bonsai_8b_logits_at_20000_tokens";
+    let _tier_env = TierEnvGuard::cleared();
 
     if let Ok(arm) = std::env::var(M08_CHILD_ARM_ENV) {
         run_m08_child(&arm);

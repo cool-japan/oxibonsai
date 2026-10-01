@@ -61,15 +61,17 @@
 //! (the CPU's 64 KiB KV + 256 B of rope angles, plus the runner's 65 888 B)
 //! after both states, the runner's gates, logits and prefill scratch, i.e.
 //! **83 968** positions for `PQ2_0` and **93 184** for `PTQ1_0` (each
-//! floored to 1024). The runtime guard picks the working window; this check
-//! only guarantees an allocation never exceeds what the device can keep
-//! resident.
+//! floored to 1024). The runtime engine picks the working window from those
+//! budgets and this ceiling (`oxibonsai_runtime::engine_hybrid_gpu`, reading
+//! the same [`qwen35_footprint`]); this check only guarantees an allocation
+//! never exceeds what the device can keep resident.
 
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
 use metal::foreign_types::ForeignType;
+use metal::objc::rc::autoreleasepool;
 use metal::objc::{msg_send, sel, sel_impl};
 use metal::{Buffer, ComputeCommandEncoderRef, ComputePipelineState, MTLResourceOptions, MTLSize};
 use oxibonsai_core::quant_prism::{BlockPQ2_0, BlockPTQ1_0, BlockQ2_0G64};
@@ -132,6 +134,20 @@ impl Qwen35MatrixData<'_> {
                 Self::F32(v) => as_bytes(v),
             }
         }
+    }
+
+    /// Bytes the matrix occupies as stored — what binding it reads from the
+    /// file mapping, or copies when it is not mapped.
+    #[must_use]
+    pub fn byte_len(&self) -> usize {
+        self.bytes().len()
+    }
+
+    /// Whether the encoder always copies this format (unquantized `f32`
+    /// rows are never bound in place, even from a mapping).
+    #[must_use]
+    pub fn always_copied(&self) -> bool {
+        matches!(self, Self::F32(_))
     }
 
     /// The GEMV entry point for this format.
@@ -431,11 +447,6 @@ impl Qwen35GpuConfig {
         Ok(())
     }
 
-    /// Floats of `f16` KV per position, both K and V, over `n_full` slots.
-    fn kv_bytes_per_position(&self, n_full: usize) -> u64 {
-        (n_full * self.n_kv_heads * self.head_dim * 2 * 2) as u64
-    }
-
     /// Span (threads, and elements rotated together) of the rotating
     /// producers for one width.
     fn span(&self) -> usize {
@@ -508,6 +519,37 @@ impl<'m> Qwen35MappedRegion<'m> {
     #[must_use]
     pub unsafe fn from_mapping(bytes: &'m [u8]) -> Self {
         Self { bytes }
+    }
+
+    /// Wrap `bytes` for zero-copy binding when it starts on a host page
+    /// boundary; `None` for an empty or unaligned slice (the caller then
+    /// copies the weights instead).
+    ///
+    /// No caller contract is needed here, unlike [`Self::from_mapping`]:
+    /// memory is mapped and protected in whole pages, so every page from the
+    /// first byte of a live, readable slice through the page holding its
+    /// last byte is mapped and readable for as long as the slice is
+    /// borrowed. For a slice that starts on a page boundary those pages are
+    /// exactly `bytes.len()` rounded up to the page size — the span the
+    /// no-copy buffer covers — whether the slice is a whole-file mapping
+    /// (always page-aligned) or an allocation that happens to be.
+    #[must_use]
+    pub fn page_aligned(bytes: &'m [u8]) -> Option<Self> {
+        let aligned = (bytes.as_ptr() as usize).is_multiple_of(host_page_size());
+        (!bytes.is_empty() && aligned).then_some(Self { bytes })
+    }
+
+    /// Bytes the region spans.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Whether the region is empty (never true for one built by
+    /// [`Self::page_aligned`]).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
     }
 
     fn contains(&self, inner: &[u8]) -> Option<u64> {
@@ -877,7 +919,7 @@ impl Binder<'_, '_> {
         }
         let pso = self.graph.pipeline_for(m.data.kernel())?;
         let mapped = match (&self.region, &m.data) {
-            (Some((region, buffer)), data) if !matches!(data, Qwen35MatrixData::F32(_)) => region
+            (Some((region, buffer)), data) if !data.always_copied() => region
                 .contains(bytes)
                 .filter(|offset| offset % 4 == 0)
                 .map(|offset| (buffer.clone(), offset)),
@@ -1369,7 +1411,11 @@ impl<'m> Qwen35GpuModel<'m> {
     /// state once per token and storing every key/value; when `logits` is
     /// `Some`, write the last token's `[vocab]` logits into it.
     ///
-    /// One command buffer, one encoder, one wait.
+    /// One command buffer, one encoder, one wait, inside one autorelease
+    /// pool: `commandBuffer` and `computeCommandEncoder` hand back
+    /// autoreleased objects, and without a pool they would pile up on the
+    /// calling thread — about 1.8 KiB per call, i.e. per decoded token of a
+    /// long-lived server thread — until that thread exits.
     ///
     /// # Errors
     ///
@@ -1379,6 +1425,15 @@ impl<'m> Qwen35GpuModel<'m> {
     /// sign vector it needs (nothing is committed then); a failed command
     /// buffer.
     pub fn forward(
+        &mut self,
+        hidden_rows: &[f32],
+        start_pos: usize,
+        logits: Option<&mut [f32]>,
+    ) -> Result<(), MetalGraphError> {
+        autoreleasepool(|| self.forward_unpooled(hidden_rows, start_pos, logits))
+    }
+
+    fn forward_unpooled(
         &mut self,
         hidden_rows: &[f32],
         start_pos: usize,
@@ -1442,6 +1497,14 @@ impl<'m> Qwen35GpuModel<'m> {
         hidden_rows: &[f32],
         start_pos: usize,
     ) -> Result<(Vec<Vec<f32>>, Vec<f32>), MetalGraphError> {
+        autoreleasepool(|| self.forward_with_dump_unpooled(hidden_rows, start_pos))
+    }
+
+    fn forward_with_dump_unpooled(
+        &mut self,
+        hidden_rows: &[f32],
+        start_pos: usize,
+    ) -> Result<(Vec<Vec<f32>>, Vec<f32>), MetalGraphError> {
         let t_len = self.load_rows(hidden_rows)?;
         self.check_window(t_len, start_pos)?;
         let n = t_len * self.cfg.hidden;
@@ -1473,6 +1536,15 @@ impl<'m> Qwen35GpuModel<'m> {
     ///
     /// As [`Self::forward`], plus an out-of-range `layer`.
     pub fn trace_layer(
+        &mut self,
+        layer: usize,
+        hidden_rows: &[f32],
+        start_pos: usize,
+    ) -> Result<Qwen35LayerTrace, MetalGraphError> {
+        autoreleasepool(|| self.trace_layer_unpooled(layer, hidden_rows, start_pos))
+    }
+
+    fn trace_layer_unpooled(
         &mut self,
         layer: usize,
         hidden_rows: &[f32],
@@ -1519,6 +1591,15 @@ impl<'m> Qwen35GpuModel<'m> {
         matrix: Qwen35MatrixId,
         x: &[f32],
     ) -> Result<Vec<f32>, MetalGraphError> {
+        autoreleasepool(|| self.gemv_probe_unpooled(layer, matrix, x))
+    }
+
+    fn gemv_probe_unpooled(
+        &mut self,
+        layer: usize,
+        matrix: Qwen35MatrixId,
+        x: &[f32],
+    ) -> Result<Vec<f32>, MetalGraphError> {
         let m = self.matrix(layer, matrix)?.clone();
         check_len("gemv_probe input", x.len(), m.cols)?;
         let xb = upload_f32(&self.graph, x)?;
@@ -1540,6 +1621,15 @@ impl<'m> Qwen35GpuModel<'m> {
     /// [`MetalGraphError::InvalidDimensions`] when the model is not folded,
     /// has no signs for the width, or `x` is not `rows` whole rows.
     pub fn rotate(
+        &mut self,
+        x: &[f32],
+        width: usize,
+        inverse: bool,
+    ) -> Result<Vec<f32>, MetalGraphError> {
+        autoreleasepool(|| self.rotate_unpooled(x, width, inverse))
+    }
+
+    fn rotate_unpooled(
         &mut self,
         x: &[f32],
         width: usize,
@@ -1657,6 +1747,9 @@ pub enum Qwen35MatrixId {
 ///   scratch at `cfg.max_batch` tokens (the most one forward grows it to),
 ///   plus per position the `f16` K + V cache, the rope angles and one row
 ///   of attention scores.
+///
+/// Both bounds read [`qwen35_footprint`], the one place the resident
+/// arithmetic lives.
 #[must_use]
 pub fn qwen35_context_capacity(
     cfg: &Qwen35GpuConfig,
@@ -1666,24 +1759,11 @@ pub fn qwen35_context_capacity(
     max_buffer_length: u64,
     recommended_working_set: u64,
 ) -> usize {
-    let bytes = |elements: usize, width: u64| (elements as u64).saturating_mul(width);
-    let kv_one_buffer = bytes(n_full.max(1) * cfg.n_kv_heads * cfg.head_dim, 2);
-    let by_buffer = max_buffer_length / kv_one_buffer.max(1);
-    let per_position = cfg
-        .kv_bytes_per_position(n_full.max(1))
-        .saturating_add(bytes(cfg.n_rot, 4))
-        .saturating_add(bytes(cfg.n_heads, 4));
-    let fixed = weight_bytes
-        .saturating_add(bytes(
-            n_linear * cfg.n_v_heads * cfg.head_v_dim * cfg.head_k_dim,
-            4,
-        ))
-        .saturating_add(bytes(n_linear * cfg.conv_dim() * 3, 4))
-        .saturating_add(bytes(cfg.vocab, 4))
-        .saturating_add(
-            bytes(cfg.max_batch.max(1), 4).saturating_mul(Scratch::floats_per_token(cfg) as u64),
-        );
-    let by_working_set = recommended_working_set.saturating_sub(fixed) / per_position.max(1);
+    let footprint = qwen35_footprint(cfg, n_full, n_linear);
+    let by_buffer = max_buffer_length / footprint.kv_buffer_bytes_per_position.max(1);
+    let fixed = weight_bytes.saturating_add(footprint.fixed_bytes);
+    let by_working_set =
+        recommended_working_set.saturating_sub(fixed) / footprint.per_position_bytes.max(1);
     usize::try_from(by_buffer.min(by_working_set)).unwrap_or(usize::MAX)
 }
 
@@ -1745,6 +1825,11 @@ fn encode_gemv(
 
 #[path = "qwen35_encode.rs"]
 mod encode;
+
+#[path = "qwen35_state.rs"]
+mod state;
+
+pub use state::{qwen35_footprint, Qwen35DeviceLimits, Qwen35Footprint, Qwen35RecurrentSnapshot};
 
 #[cfg(test)]
 #[path = "qwen35_tests.rs"]

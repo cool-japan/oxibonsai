@@ -372,10 +372,11 @@ impl KernelDispatcher {
     /// # Tier behaviour
     ///
     /// Every tier — including [`KernelTier::Gpu`] — currently executes
-    /// [`crate::gemv_f32::gemv_f32`], whose NEON-`fmla` / AVX2-`vfmadd` lane
-    /// structure already covers the CPU tiers without a per-tier body. `Gpu`
-    /// deliberately runs the same CPU kernel rather than degrading silently
-    /// to *something else*: neither
+    /// [`crate::gemv_f32::gemv_f32`], whose eight-lane accumulator structure
+    /// (two 128-bit vectors, written with NEON / SSE intrinsics where the
+    /// target has them) already covers the CPU tiers without a per-tier body.
+    /// `Gpu` deliberately runs the same CPU kernel rather than degrading
+    /// silently to *something else*: neither
     /// [`GpuBackendTrait`](crate::gpu_backend::GpuBackendTrait) nor the Metal
     /// / CUDA kernel-source sets carries a dense-FP32 GEMV entry point yet, and
     /// the parity gate requires this projection to stay byte-identical
@@ -400,6 +401,42 @@ impl KernelDispatcher {
         // GPU (or per-tier CPU) FP32 GEMV has to be wired into, and every
         // caller already arrives through it.
         crate::gemv_f32::gemv_f32(weights, input, out, out_features, in_features)
+    }
+
+    /// Dense FP32 GEMM: `out[m × n] = a[m × k] · w[n × k]ᵀ (+ bias[n])`, the
+    /// batched form of [`Self::gemv_f32`] in the same weight layout (one
+    /// weight row per output feature).
+    ///
+    /// Every element is bit-identical to running [`Self::gemv_f32`] once per
+    /// row of `a` (then adding the bias), so a batched caller and a
+    /// one-token-at-a-time caller agree exactly; the speed comes from
+    /// register and cache tiling and one Rayon pass over the tiles instead of
+    /// one fork/join per row. See the [`gemm_f32`](mod@crate::gemm_f32) module
+    /// for the numerics, the tiling and the length contract.
+    ///
+    /// # Tier behaviour
+    ///
+    /// Every tier — including [`KernelTier::Gpu`] — runs the same CPU kernel:
+    /// the dispatcher does not route a dense FP32 GEMM to any GPU backend (nor
+    /// does [`Self::gemv_f32`] route its GEMV), so the GPU tier does not
+    /// degrade to anything else here. When such a route lands, this method is
+    /// where it is selected.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`crate::gemm_f32::gemm_f32`]'s typed shape errors.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f32(
+        &self,
+        a: &[f32],
+        w: &[f32],
+        bias: Option<&[f32]>,
+        m: usize,
+        k: usize,
+        n: usize,
+        out: &mut [f32],
+    ) -> KernelResult<()> {
+        crate::gemm_f32::gemm_f32(a, w, bias, m, k, n, out)
     }
 
     /// Return the best CPU-only tier for use as GPU fallback.

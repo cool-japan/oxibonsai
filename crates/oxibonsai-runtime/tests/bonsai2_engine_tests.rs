@@ -34,6 +34,15 @@
 //! never a silent pass, never an `#[ignore]`. A set variable pointing at a
 //! missing file is a hard failure.
 //!
+//! # Executor
+//!
+//! `InferenceEngine::from_gguf` is `--backend auto`: on a Metal host it
+//! decodes the 27B on the Metal hybrid runner, elsewhere on the CPU model —
+//! this gate checks whichever the product path picks against the fork
+//! (`bonsai2_metal_engine_tests` pins each executor and compares them).
+//! `OXIBONSAI_KERNEL_TIER` is cleared for the run: the CPU model's `PQ2_0`
+//! GEMV honours it (K-14), which would move a CPU run off the fork's ids.
+//!
 //! # Memory
 //!
 //! The GGUF is memory-mapped (never materialised as f32), the KV window is
@@ -44,6 +53,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use oxibonsai_core::gguf::reader::{mmap_gguf_file, GgufFile};
+use oxibonsai_kernels::dispatch_int8::KERNEL_TIER_ENV;
 use oxibonsai_runtime::engine::{tokenizer_from_gguf, InferenceEngine};
 use oxibonsai_runtime::sampling::SamplingParams;
 use oxibonsai_testkit::capability::{record_executed_timed, record_skipped, Capability};
@@ -63,6 +73,42 @@ const MAX_SEQ_LEN: usize = 4096;
 
 /// One real 27B mapping at a time (peer-process RSS budget).
 static REAL_MODEL_LOCK: Mutex<()> = Mutex::new(());
+
+/// Holds [`REAL_MODEL_LOCK`] and keeps `OXIBONSAI_KERNEL_TIER` cleared for
+/// one gate, restoring its prior value on drop (also while unwinding).
+struct RealModelRun {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    prior_tier: Option<String>,
+}
+
+impl RealModelRun {
+    fn start() -> Self {
+        let lock = REAL_MODEL_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior_tier = std::env::var(KERNEL_TIER_ENV).ok();
+        // SAFETY: every test in this binary that touches the environment
+        // holds `REAL_MODEL_LOCK` first, so no other thread reads or writes
+        // it concurrently.
+        unsafe { std::env::remove_var(KERNEL_TIER_ENV) };
+        Self {
+            _lock: lock,
+            prior_tier,
+        }
+    }
+}
+
+impl Drop for RealModelRun {
+    fn drop(&mut self) {
+        // SAFETY: still under `REAL_MODEL_LOCK` (see `start`).
+        unsafe {
+            match &self.prior_tier {
+                Some(v) => std::env::set_var(KERNEL_TIER_ENV, v),
+                None => std::env::remove_var(KERNEL_TIER_ENV),
+            }
+        }
+    }
+}
 
 fn greedy_params() -> SamplingParams {
     SamplingParams {
@@ -163,7 +209,11 @@ fn check_engine_against_goldens(model_path: &Path, golden_dir: &Path, quant: &st
     assert!(engine.dense_model().is_none());
     assert!(
         !engine.uses_fused_gpu_decode(),
-        "no hybrid GPU encoder exists yet: the engine must run on the CPU"
+        "the dense fused Metal route never applies to a hybrid model"
+    );
+    eprintln!(
+        "[{quant}] executor under --backend auto: {:?}",
+        engine.hybrid_backend()
     );
     assert_eq!(engine.vocab_size(), 248_320);
     assert!(
@@ -232,9 +282,7 @@ fn bonsai2_pq2_engine_greedy_matches_the_fork_goldens() {
         return;
     };
     let gate_start = std::time::Instant::now();
-    let _serial = REAL_MODEL_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _run = RealModelRun::start();
     check_engine_against_goldens(&model, &golden_dir, "PQ2_0");
     record_executed_timed(Capability::Bonsai2Models, TEST, gate_start.elapsed());
 }
@@ -250,9 +298,7 @@ fn bonsai2_ptq1_engine_greedy_matches_the_fork_goldens() {
         return;
     };
     let gate_start = std::time::Instant::now();
-    let _serial = REAL_MODEL_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _run = RealModelRun::start();
     check_engine_against_goldens(&model, &golden_dir, "PTQ1_0");
     record_executed_timed(Capability::Bonsai2Models, TEST, gate_start.elapsed());
 }

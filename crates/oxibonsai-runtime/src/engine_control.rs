@@ -14,6 +14,7 @@
 //! | [`GPU_ARGMAX_TIEBREAK_IS_FIRST_INDEX`] | `perf-11` — GPU argmax kernels now tie-break to the first index (`FIX2-KERN`); gate flipped on |
 //! | [`SpeculativeConfig`] | `RT-27` / `perf-16` — speculation behind an undocumented env var |
 //! | [`FusedMetalRoute`] | `MET-M1` — duplicate GPU-resident weight copy |
+//! | [`Int8TierUse`] | `K-14` — which engines the `OXIBONSAI_KERNEL_TIER` INT8 selector reaches |
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -705,6 +706,203 @@ pub fn gguf_fused_metal_route(gguf: &GgufFile<'_>) -> FusedMetalRoute {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// How `OXIBONSAI_KERNEL_TIER` applies to one engine (K-14)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What executes an engine's decode, as far as the INT8 tier selector is
+/// concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TierExecutor {
+    /// A dense (`qwen3`) model on the engine's dispatcher.
+    Dense,
+    /// A hybrid (`qwen35`) model decoding on the CPU [`HybridModel`](oxibonsai_model::hybrid::HybridModel).
+    HybridCpu,
+    /// A hybrid model decoding on the Metal hybrid runner, with the CPU
+    /// model kept beside it for the embedding pass.
+    HybridMetal,
+}
+
+/// How the `OXIBONSAI_KERNEL_TIER` INT8 selector (K-14) applies to one
+/// engine — what its tier log line and
+/// [`InferenceEngine::effective_tier_reason`](crate::engine::InferenceEngine::effective_tier_reason)
+/// report.
+///
+/// Which case applies depends on the weight format, on the dispatcher's tier
+/// and on the executor:
+///
+/// * the native formats (`TQ2_0_g128`, `Q1_0_g128`) are diverted only by a
+///   CPU-tier dispatcher (`KernelDispatcher::native_int8_tier` is `None` on
+///   `KernelTier::Gpu`): honoured on a CPU tier, set-but-ignored on the GPU
+///   tier;
+/// * the PrismML formats with an INT8 kernel (`PQ2_0`, `Q2_0_g64`, and the
+///   gen-1 `Q2_0_g128` d-first reading a hybrid binds as `PQ2_0`) are
+///   diverted on **any** tier (they have no GPU kernel, so their CPU GEMV
+///   reads the selector whatever the dispatcher's tier);
+/// * a Metal-backed hybrid decodes through the runner's own `q35_gemv_*`
+///   kernels, which never read the selector — only the CPU model's own GEMV
+///   (the embedding pass) can be diverted;
+/// * `PTQ1_0` (five base-3 trits per byte) and every other format have no
+///   INT8 kernel at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Int8TierUse {
+    /// The variable is unset.
+    Unset,
+    /// The variable names no INT8 tier (or is empty): it selects nothing.
+    UnknownName {
+        /// The value as set.
+        raw: String,
+    },
+    /// A native format on a CPU tier, or a PrismML format on a CPU-only
+    /// engine: set and honoured.
+    Honoured {
+        /// The dominant weight format.
+        format: oxibonsai_core::GgufTensorType,
+        /// The INT8 tier the GEMV/GEMM run on (after clamping to this CPU).
+        tier: oxibonsai_kernels::dispatch_int8::Int8Tier,
+    },
+    /// A PrismML format on a GPU-tier dense engine: honoured anyway (no GPU
+    /// kernel exists for the format, so its CPU GEMV runs on the INT8 tier).
+    HonouredDespiteGpuTier {
+        /// The dominant weight format.
+        format: oxibonsai_core::GgufTensorType,
+        /// The INT8 tier its GEMV/GEMM run on.
+        tier: oxibonsai_kernels::dispatch_int8::Int8Tier,
+    },
+    /// A native format on the GPU tier: set but ignored by the decode (a
+    /// `KernelTier::Gpu` dispatcher is never diverted, so Metal output is
+    /// byte-identical with the variable set); the batched CPU prefill
+    /// fallback and the batched embedding pass still run on it.
+    IgnoredOnGpuTier {
+        /// The dominant weight format.
+        format: oxibonsai_core::GgufTensorType,
+        /// The tier the variable names.
+        tier: oxibonsai_kernels::dispatch_int8::Int8Tier,
+    },
+    /// A Metal-backed hybrid: the runner never reads the selector; the CPU
+    /// model's own GEMV (the embedding pass) honours it.
+    CpuModelOnly {
+        /// The dominant weight format.
+        format: oxibonsai_core::GgufTensorType,
+        /// The INT8 tier the CPU model's GEMV run on.
+        tier: oxibonsai_kernels::dispatch_int8::Int8Tier,
+    },
+    /// No INT8 kernel exists for the format: ignored on every tier.
+    NoInt8Kernel {
+        /// The dominant weight format.
+        format: oxibonsai_core::GgufTensorType,
+        /// The tier the variable names.
+        tier: oxibonsai_kernels::dispatch_int8::Int8Tier,
+    },
+}
+
+/// Whether `tier` is the GPU tier (`KernelTier::Gpu` exists only in a GPU
+/// build).
+fn kernel_tier_is_gpu(tier: oxibonsai_kernels::KernelTier) -> bool {
+    #[cfg(any(feature = "metal", feature = "native-cuda"))]
+    {
+        tier == oxibonsai_kernels::KernelTier::Gpu
+    }
+    #[cfg(not(any(feature = "metal", feature = "native-cuda")))]
+    {
+        let _ = tier;
+        false
+    }
+}
+
+/// Classify how `OXIBONSAI_KERNEL_TIER = raw` applies to an engine whose
+/// dominant weight format is `format`, whose dispatcher runs on
+/// `dispatcher_tier`, decoding on `executor` (see [`Int8TierUse`]).
+///
+/// Pure: the caller reads the environment (`raw = None` for an unset
+/// variable), so every case is testable without touching it.
+#[must_use]
+pub fn int8_tier_use(
+    raw: Option<&str>,
+    format: oxibonsai_core::GgufTensorType,
+    dispatcher_tier: oxibonsai_kernels::KernelTier,
+    executor: TierExecutor,
+) -> Int8TierUse {
+    use oxibonsai_core::GgufTensorType as T;
+    use oxibonsai_kernels::dispatch_int8::Int8Tier;
+
+    let Some(raw) = raw else {
+        return Int8TierUse::Unset;
+    };
+    let Some(tier) = Int8Tier::from_name(raw).map(Int8Tier::clamp_to_cpu) else {
+        return Int8TierUse::UnknownName {
+            raw: raw.to_string(),
+        };
+    };
+    let hybrid = !matches!(executor, TierExecutor::Dense);
+    let native = matches!(format, T::TQ2_0_g128 | T::Q1_0_g128);
+    // A hybrid binds the gen-1 d-first reading as `PQ2_0`; the dense loader
+    // dequantizes it, so only a hybrid reaches the INT8 GEMV for it.
+    let prism =
+        matches!(format, T::PQ2_0 | T::Q2_0G64) || (hybrid && matches!(format, T::Q2_0G128DFirst));
+    if !native && !prism {
+        return Int8TierUse::NoInt8Kernel { format, tier };
+    }
+    if executor == TierExecutor::HybridMetal {
+        return Int8TierUse::CpuModelOnly { format, tier };
+    }
+    match (native, kernel_tier_is_gpu(dispatcher_tier)) {
+        (true, true) => Int8TierUse::IgnoredOnGpuTier { format, tier },
+        (false, true) => Int8TierUse::HonouredDespiteGpuTier { format, tier },
+        (_, false) => Int8TierUse::Honoured { format, tier },
+    }
+}
+
+/// [`int8_tier_use`] with the variable read from this process's
+/// environment.
+#[must_use]
+pub fn int8_tier_use_from_env(
+    format: oxibonsai_core::GgufTensorType,
+    dispatcher_tier: oxibonsai_kernels::KernelTier,
+    executor: TierExecutor,
+) -> Int8TierUse {
+    let raw = std::env::var(oxibonsai_kernels::dispatch_int8::KERNEL_TIER_ENV).ok();
+    int8_tier_use(raw.as_deref(), format, dispatcher_tier, executor)
+}
+
+impl std::fmt::Display for Int8TierUse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const VAR: &str = oxibonsai_kernels::dispatch_int8::KERNEL_TIER_ENV;
+        match self {
+            Self::Unset => write!(f, "{VAR} unset: no INT8 tier"),
+            Self::UnknownName { raw } => {
+                write!(f, "{VAR}={raw:?} names no INT8 tier: it selects nothing")
+            }
+            Self::Honoured { format, tier } => write!(
+                f,
+                "{VAR}={tier} honoured: the {format} GEMV/GEMM run on the {tier} INT8 tier"
+            ),
+            Self::HonouredDespiteGpuTier { format, tier } => write!(
+                f,
+                "{VAR}={tier} honoured although the dispatcher is on the GPU tier: {format} has \
+                 no GPU kernel, so its CPU GEMV/GEMM run on the {tier} INT8 tier"
+            ),
+            Self::IgnoredOnGpuTier { format, tier } => write!(
+                f,
+                "{VAR}={tier} set but ignored by the {format} decode: a GPU-tier dispatcher is \
+                 never diverted (Metal output is byte-identical with the variable set); the \
+                 batched CPU prefill fallback and the embedding pass still run on it"
+            ),
+            Self::CpuModelOnly { format, tier } => write!(
+                f,
+                "{VAR}={tier} honoured only by the CPU model's own {format} GEMV (the \
+                 embedding pass); never by the Metal hybrid runner, whose own kernels decode \
+                 every token"
+            ),
+            Self::NoInt8Kernel { format, tier } => write!(
+                f,
+                "{VAR}={tier} ignored: no INT8 kernel exists for {format}, so every tier runs its \
+                 own kernels"
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1154,5 +1352,159 @@ mod tests {
     #[test]
     fn default_route_is_the_conservative_one() {
         assert_eq!(FusedMetalRoute::default(), FusedMetalRoute::None);
+    }
+
+    // ── Int8TierUse (K-14) ───────────────────────────────────────────────
+    //
+    // `int8_tier_use` is pure, so every case is pinned here without setting
+    // `OXIBONSAI_KERNEL_TIER`: this binary links the regular kernels build,
+    // where every Prism GEMV reads the variable, so setting it would reach
+    // concurrently running bit-identity tests.
+
+    fn cpu_tier() -> oxibonsai_kernels::KernelTier {
+        oxibonsai_kernels::cpu_kernel_tier()
+    }
+
+    /// The four cases the tier log distinguishes: unset; a native format on
+    /// a CPU tier (honoured); a native format on the GPU tier (ignored); a
+    /// PrismML format (honoured by the CPU model on any tier, never by the
+    /// Metal runner) — plus the two refinements the formats force: no INT8
+    /// kernel for `PTQ1_0`, and an unknown tier name.
+    #[test]
+    fn int8_tier_use_reports_every_case() {
+        use oxibonsai_core::GgufTensorType as T;
+        use oxibonsai_kernels::dispatch_int8::Int8Tier;
+        let scalar = Int8Tier::Scalar;
+
+        // Unset.
+        let unset = int8_tier_use(None, T::PQ2_0, cpu_tier(), TierExecutor::HybridMetal);
+        assert_eq!(unset, Int8TierUse::Unset);
+        assert!(unset.to_string().contains("unset"), "{unset}");
+
+        // (a) native format, CPU tier: honoured.
+        for format in [T::TQ2_0_g128, T::Q1_0_g128] {
+            let use_ = int8_tier_use(Some("int8-scalar"), format, cpu_tier(), TierExecutor::Dense);
+            assert_eq!(
+                use_,
+                Int8TierUse::Honoured {
+                    format,
+                    tier: scalar
+                }
+            );
+            assert!(use_.to_string().contains("honoured"), "{use_}");
+            // A CPU hybrid's layers are on a CPU tier too.
+            assert_eq!(
+                int8_tier_use(
+                    Some("int8-scalar"),
+                    format,
+                    cpu_tier(),
+                    TierExecutor::HybridCpu
+                ),
+                Int8TierUse::Honoured {
+                    format,
+                    tier: scalar
+                }
+            );
+        }
+
+        // (b) native format, GPU tier: set but ignored.
+        #[cfg(any(feature = "metal", feature = "native-cuda"))]
+        {
+            let gpu = oxibonsai_kernels::KernelTier::Gpu;
+            let use_ = int8_tier_use(Some("int8-scalar"), T::TQ2_0_g128, gpu, TierExecutor::Dense);
+            assert_eq!(
+                use_,
+                Int8TierUse::IgnoredOnGpuTier {
+                    format: T::TQ2_0_g128,
+                    tier: scalar
+                }
+            );
+            assert!(use_.to_string().contains("byte-identical"), "{use_}");
+            // A Prism format is honoured on the GPU tier anyway.
+            assert_eq!(
+                int8_tier_use(Some("int8-scalar"), T::PQ2_0, gpu, TierExecutor::Dense),
+                Int8TierUse::HonouredDespiteGpuTier {
+                    format: T::PQ2_0,
+                    tier: scalar
+                }
+            );
+        }
+
+        // (c) Prism formats: honoured by a CPU hybrid; only the CPU model's
+        // own GEMV on a Metal-backed one.
+        for format in [T::PQ2_0, T::Q2_0G64, T::Q2_0G128DFirst] {
+            assert_eq!(
+                int8_tier_use(
+                    Some("int8-scalar"),
+                    format,
+                    cpu_tier(),
+                    TierExecutor::HybridCpu
+                ),
+                Int8TierUse::Honoured {
+                    format,
+                    tier: scalar
+                }
+            );
+            let metal = int8_tier_use(
+                Some("int8-scalar"),
+                format,
+                cpu_tier(),
+                TierExecutor::HybridMetal,
+            );
+            assert_eq!(
+                metal,
+                Int8TierUse::CpuModelOnly {
+                    format,
+                    tier: scalar
+                }
+            );
+            assert!(metal.to_string().contains("never by the Metal"), "{metal}");
+        }
+        // The dense loader dequantizes the d-first reading: no INT8 kernel.
+        assert_eq!(
+            int8_tier_use(
+                Some("int8-scalar"),
+                T::Q2_0G128DFirst,
+                cpu_tier(),
+                TierExecutor::Dense
+            ),
+            Int8TierUse::NoInt8Kernel {
+                format: T::Q2_0G128DFirst,
+                tier: scalar
+            }
+        );
+
+        // PTQ1_0 (and any other format) has no INT8 kernel: ignored on every
+        // executor.
+        for executor in [
+            TierExecutor::Dense,
+            TierExecutor::HybridCpu,
+            TierExecutor::HybridMetal,
+        ] {
+            let use_ = int8_tier_use(Some("int8-scalar"), T::PTQ1_0, cpu_tier(), executor);
+            assert_eq!(
+                use_,
+                Int8TierUse::NoInt8Kernel {
+                    format: T::PTQ1_0,
+                    tier: scalar
+                }
+            );
+            assert!(use_.to_string().contains("no INT8 kernel"), "{use_}");
+        }
+
+        // A name that is no tier selects nothing.
+        let unknown = int8_tier_use(
+            Some("warp-9"),
+            T::PQ2_0,
+            cpu_tier(),
+            TierExecutor::HybridCpu,
+        );
+        assert_eq!(
+            unknown,
+            Int8TierUse::UnknownName {
+                raw: "warp-9".to_string()
+            }
+        );
+        assert!(unknown.to_string().contains("selects nothing"), "{unknown}");
     }
 }

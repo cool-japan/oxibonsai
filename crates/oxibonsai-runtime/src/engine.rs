@@ -316,6 +316,10 @@ pub struct InferenceEngine<'a> {
     /// whether to download top-k candidates instead of the full logit row
     /// (on by default — see [`SampledTopKConfig`]) and how many.
     pub(crate) sampled_topk: SampledTopKConfig,
+    /// The Metal hybrid runner a hybrid engine decodes on, when one serves
+    /// its model (see [`crate::engine_hybrid_gpu`]); `None` for a dense
+    /// engine and for a hybrid engine on the CPU tier.
+    pub(crate) hybrid_gpu: Option<crate::engine_hybrid_gpu::HybridGpu<'a>>,
     /// Test-only scripted generation (see [`ScriptedLogits`]); `None` — the
     /// only value outside `cfg(test)`, where the field does not exist — runs
     /// the model's real logits.
@@ -573,6 +577,7 @@ impl<'a> InferenceEngine<'a> {
             backend: Backend::Auto,
             sequence_id: 0,
             sampled_topk: SampledTopKConfig::default(),
+            hybrid_gpu: None,
             #[cfg(test)]
             scripted_logits: None,
         }
@@ -583,8 +588,9 @@ impl<'a> InferenceEngine<'a> {
     ///
     /// For a [`LoadedModel::Hybrid`] the dispatcher is used for everything
     /// the engine itself dispatches (the hybrid model carries its own inside
-    /// its layers); pass a CPU tier — no hybrid GPU encoder exists yet, and a
-    /// GPU tier would make the engine report a GPU it never uses.
+    /// its layers); pass a CPU tier — the engine decodes the hybrid on its
+    /// CPU layers (only the GGUF constructors build the Metal hybrid
+    /// runner), and a GPU tier would make it report a GPU it never uses.
     pub fn from_loaded_model(
         model: LoadedModel<'a>,
         kernel: KernelDispatcher,
@@ -601,7 +607,9 @@ impl<'a> InferenceEngine<'a> {
         )
     }
 
-    /// Wrap an already-constructed [`HybridModel`] (on the best CPU tier).
+    /// Wrap an already-constructed [`HybridModel`] (on the best CPU tier;
+    /// the Metal hybrid runner needs the GGUF image the model was bound
+    /// from, so only the GGUF constructors build one).
     ///
     /// The EOS set falls back to [`EOS_TOKEN_ID`] exactly as the dense
     /// `from_model*` constructors do; a GGUF-loaded hybrid engine resolves it
@@ -719,7 +727,8 @@ impl<'a> InferenceEngine<'a> {
     /// [`Backend::Auto`].
     ///
     /// Either kind of model: a `qwen35` (PrismML Bonsai 2) file loads as a
-    /// hybrid engine on the best CPU tier (no hybrid GPU encoder exists yet),
+    /// hybrid engine — on the Metal hybrid runner when one serves it on this
+    /// host, else on the best CPU tier (see [`crate::engine_hybrid_gpu`]) —
     /// anything else as a dense one exactly as before.
     pub fn from_gguf(
         gguf: &'a GgufFile<'a>,
@@ -735,9 +744,10 @@ impl<'a> InferenceEngine<'a> {
     /// # Errors
     ///
     /// Model-load errors; [`EngineError::HybridGpuBackendUnsupported`] for
-    /// [`Backend::Metal`] on a hybrid file; [`EngineError::BackendUnavailable`]
-    /// for [`Backend::Metal`] on a build or host without an accelerated Metal
-    /// device.
+    /// [`Backend::Metal`] on a hybrid file the Metal hybrid runner cannot
+    /// serve here (naming why); [`EngineError::BackendUnavailable`] for
+    /// [`Backend::Metal`] on a dense file on a build or host without an
+    /// accelerated Metal device.
     pub fn from_gguf_with_backend(
         gguf: &'a GgufFile<'a>,
         sampling_params: SamplingParams,
@@ -817,22 +827,26 @@ impl<'a> InferenceEngine<'a> {
                 }
                 .into());
             }
-            let (model, kernel) = crate::engine_seam::load_hybrid(gguf, max_seq_len, backend)?;
+            let loaded = crate::engine_seam::load_hybrid(gguf, max_seq_len, backend)?;
             let sampler = Sampler::new(sampling_params, seed);
-            tracing::info!(
-                kernel = %kernel.kernel_label(model.quant_type()),
-                eos = ?eos.as_slice(),
-                model = %model.describe(),
-                "inference engine loaded from GGUF (hybrid)"
-            );
             let mut engine = Self::assemble(
-                LoadedModel::Hybrid(Box::new(model)),
-                kernel,
+                LoadedModel::Hybrid(Box::new(loaded.model)),
+                loaded.kernel,
                 sampler,
                 eos,
                 false,
             );
             engine.backend = backend;
+            engine.hybrid_gpu = loaded.gpu;
+            // cli-16 + K-14: the effective executor, and how the INT8 tier
+            // selector applies to it.
+            tracing::info!(
+                kernel = %engine.kernel_label(),
+                tier_reason = %engine.effective_tier_reason(),
+                eos = ?engine.eos.as_slice(),
+                model = %engine.model_description(),
+                "inference engine loaded from GGUF (hybrid)"
+            );
             return Ok(engine);
         }
 
@@ -985,10 +999,17 @@ impl<'a> InferenceEngine<'a> {
 
         // cli-16: name the resolved dominant tensor type together with the
         // effective tier (e.g. "TQ2_0_g128 GPU (accelerated)"), never a
-        // hardcoded kernel family.
+        // hardcoded kernel family; K-14: say how the INT8 tier selector
+        // applies to this dispatcher and format.
+        let int8_tier = crate::engine_control::int8_tier_use_from_env(
+            model.dominant_quant_type(),
+            kernel.tier(),
+            crate::engine_control::TierExecutor::Dense,
+        );
         tracing::info!(
             kernel = %kernel.kernel_label(model.dominant_quant_type()),
             tier_reason = %kernel.effective_tier_reason(),
+            int8_tier = %int8_tier,
             eos = ?eos.as_slice(),
             fused_route = ?route,
             "inference engine loaded from GGUF"
@@ -1052,12 +1073,19 @@ impl<'a> InferenceEngine<'a> {
         &self.kernel
     }
 
-    /// Kernel tier this engine dispatches to.
+    /// Kernel tier this engine's decode runs on.
     ///
     /// Feature-agnostic convenience used by the engine pool to size itself:
-    /// a GPU tier gets one Metal session per replica, a CPU tier (every
-    /// hybrid engine) runs replicas fully in parallel.
+    /// a GPU tier is bounded by `MetalGraph::max_sessions()`, a CPU tier runs
+    /// replicas fully in parallel. A Metal-backed hybrid engine reports
+    /// `KernelTier::Gpu` — its decode runs on the Metal hybrid runner — even
+    /// though [`kernel`](Self::kernel) is the CPU dispatcher its CPU model
+    /// (the embedding pass) keeps.
     pub fn kernel_tier(&self) -> KernelTier {
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if self.hybrid_gpu.is_some() {
+            return KernelTier::Gpu;
+        }
         self.kernel.tier()
     }
 
@@ -1306,7 +1334,8 @@ impl<'a> InferenceEngine<'a> {
     }
 
     /// Bytes of recurrent state held by this engine: the hybrid model's own
-    /// Gated-DeltaNet state (~157 MB for the 27B) plus any attached
+    /// Gated-DeltaNet state (~157 MB for the 27B), the Metal runner's device
+    /// copy (~150 MiB) on a Metal-backed engine, plus any attached
     /// `RecurrentState`; `0` for a dense engine with nothing attached.
     pub fn recurrent_memory_bytes(&self) -> usize {
         let attached = self
@@ -1317,11 +1346,15 @@ impl<'a> InferenceEngine<'a> {
             .model
             .as_hybrid()
             .map_or(0, |model| model.recurrent().memory_bytes());
-        attached + own
+        let runner = self.hybrid_gpu.as_ref().map_or(0, |gpu| {
+            usize::try_from(gpu.recurrent_bytes()).unwrap_or(usize::MAX)
+        });
+        attached.saturating_add(own).saturating_add(runner)
     }
 
-    /// Clear the recurrent/conv state (`RT-28`): the hybrid model's own and
-    /// any attached `RecurrentState`.
+    /// Clear the recurrent/conv state (`RT-28`): the hybrid model's own, the
+    /// Metal runner's on a Metal-backed engine, and any attached
+    /// `RecurrentState`.
     ///
     /// A no-op for a dense engine with nothing attached. Called by
     /// [`reset`](Self::reset), so the server's per-request reset (`RT-03`)
@@ -1334,6 +1367,9 @@ impl<'a> InferenceEngine<'a> {
         }
         if let Some(model) = self.model.as_hybrid_mut() {
             model.recurrent_mut().reset();
+        }
+        if let Some(gpu) = self.hybrid_gpu.as_mut() {
+            gpu.reset();
         }
     }
 
@@ -1380,21 +1416,51 @@ impl<'a> InferenceEngine<'a> {
     /// surface (`cli-19`) and `/admin/status`, so that degradation is
     /// observable rather than inferred from throughput.
     ///
-    /// A hybrid (`qwen35`) engine always runs on a CPU tier (no hybrid GPU
-    /// encoder exists yet); its reason says so instead of the pinned CPU
-    /// dispatcher's own "explicitly requested", which would misdescribe a
-    /// [`Backend::Auto`] load.
+    /// A hybrid (`qwen35`) engine names its executor instead of the pinned
+    /// CPU dispatcher's own "explicitly requested", which would misdescribe
+    /// a [`Backend::Auto`] load: the Metal hybrid runner with its KV window
+    /// and device ceiling, or the CPU tier.
+    ///
+    /// Every reason ends with how the `OXIBONSAI_KERNEL_TIER` INT8 selector
+    /// applies to this engine (K-14, [`Int8TierUse`](crate::engine_control::Int8TierUse)):
+    /// honoured on a CPU tier for the native formats, ignored by a GPU-tier
+    /// decode of them, honoured on any tier for the PrismML formats' CPU
+    /// GEMV (only the CPU model's, never the Metal runner's), or unset.
     pub fn effective_tier_reason(&self) -> String {
-        if self.model.is_hybrid() {
-            return format!(
-                "{} tier (hybrid `{}` model, backend={}: no hybrid GPU encoder exists yet, so \
-                 it runs on the best CPU tier)",
-                self.kernel.tier(),
-                self.architecture(),
-                self.backend
-            );
-        }
-        self.kernel.effective_tier_reason()
+        use crate::engine_control::{int8_tier_use_from_env, TierExecutor};
+        let format = self.dominant_quant_type();
+        let (reason, executor) = match (self.model.is_hybrid(), &self.hybrid_gpu) {
+            (false, _) => (self.kernel.effective_tier_reason(), TierExecutor::Dense),
+            (true, Some(gpu)) => {
+                let window = gpu.window();
+                (
+                    format!(
+                        "{} (hybrid `{}` model, backend={}: decodes on the Metal hybrid runner; KV \
+                         window {} positions, device ceiling {}; the CPU model stays loaded on the \
+                         {} tier for the embedding pass)",
+                        crate::engine_hybrid_gpu::HYBRID_RUNNER_LABEL,
+                        self.architecture(),
+                        self.backend,
+                        window.window,
+                        window.device_ceiling,
+                        self.kernel.tier(),
+                    ),
+                    TierExecutor::HybridMetal,
+                )
+            }
+            (true, None) => (
+                format!(
+                    "{} tier (hybrid `{}` model, backend={}: runs on the CPU model, on the best \
+                     CPU tier)",
+                    self.kernel.tier(),
+                    self.architecture(),
+                    self.backend
+                ),
+                TierExecutor::HybridCpu,
+            ),
+        };
+        let int8 = int8_tier_use_from_env(format, self.kernel.tier(), executor);
+        format!("{reason}; {int8}")
     }
 
     /// Whether this engine's model decodes through the fused Metal graph
@@ -1502,9 +1568,13 @@ impl<'a> InferenceEngine<'a> {
     /// [`clear_cancellation_token`](Self::clear_cancellation_token).
     pub fn reset(&mut self) {
         // `LoadedModel::reset` clears the KV cursor on both arms and the
-        // hybrid model's own recurrent state; only an attached
-        // `RecurrentState` is left for this engine to clear.
+        // hybrid model's own recurrent state; the Metal runner's state (on a
+        // Metal-backed hybrid engine) and an attached `RecurrentState` are
+        // left for this engine to clear.
         self.model.reset();
+        if let Some(gpu) = self.hybrid_gpu.as_mut() {
+            gpu.reset();
+        }
         if let Some(state) = self.recurrent.as_deref_mut() {
             state.reset_recurrent();
         }

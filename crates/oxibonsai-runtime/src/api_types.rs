@@ -360,32 +360,29 @@ fn default_max_tokens() -> usize {
     256
 }
 
-// ── Multimodal content parts (SV-11 — prepare only) ──────────────────────────
+// ── Multimodal content parts (SV-11) ─────────────────────────────────────────
 //
 // `ChatMessage.content` (`crate::server::ChatMessage`) is `Option<String>`,
 // so a request whose message content is an array of content parts (the
-// OpenAI vision shape, `content: string | ContentPart[]`) is rejected at the
-// type level with a bare deserialization error before any handler code runs
-// — the type-level block Bonsai 2 vision needs removed (mmproj / Qwen3-VL
-// merger, `<|image_pad|>` token expansion; see `CONTEXT.md`'s Bonsai 2
-// section). The chat handlers flatten such an array before the typed
-// parse; what is implemented here, end to end, is the value-level
-// machinery a `ChatMessage.content: Option<MessageContent>` field plugs
-// straight into — deserialization, the
-// text-only extraction used by every prompt builder today, and an honest
-// rejection of `image_url` parts (never a silent drop, never a stub image
-// path: "do not accept `image_url` yet, and say so in the 400 message").
+// OpenAI vision shape, `content: string | ContentPart[]`) would fail the
+// typed parse. Both chat endpoints therefore read `content` arrays from the
+// raw request body first (`tokenizer_bridge::chat_render`): a text-only
+// array is flattened into the string it concatenates to (the prompt is
+// byte-identical to sending that string), and an array with `image_url`
+// parts keeps its parts for the renderer — the text still flattened into
+// the typed field — so the chat template renders the image placeholders
+// and the endpoint splices each image's encoded rows in (bonsai2-design.md
+// §6.2; `crate::vision_prefill`). A server started without a vision
+// projector answers such a request with `400 vision_unavailable`.
 
 /// One part of a multipart chat message `content` array (OpenAI vision
 /// shape: `{"type": "text", "text": "..."}` /
 /// `{"type": "image_url", "image_url": {"url": "...", ...}}`).
 ///
 /// `ImageUrl` is parsed structurally — never silently dropped or merged into
-/// an "unknown variant" deserialization error — precisely so that
-/// [`MessageContent::into_text_only`] can recognize it and produce a clear,
-/// specific rejection message instead of an opaque schema error. Parsing an
-/// `image_url` part is not the same as supporting it: nothing here decodes,
-/// fetches, or otherwise acts on the URL (vision input is not served).
+/// an "unknown variant" deserialization error — so every consumer sees the
+/// image: the chat endpoints honour it, and a text-only consumer
+/// ([`MessageContent::into_text_only`]) refuses it by name.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
@@ -394,8 +391,9 @@ pub enum ContentPart {
         /// The text content.
         text: String,
     },
-    /// An image reference. Structurally accepted, semantically rejected —
-    /// see [`MessageContent::into_text_only`].
+    /// An image reference (a base64 `data:` URI, or a `file://` reference
+    /// inside the server's media directory; remote `http(s)` URLs are
+    /// refused — see `oxibonsai_model::vision::image_decode`).
     ImageUrl {
         /// The image reference payload.
         image_url: ImageUrlPart,
@@ -405,23 +403,24 @@ pub enum ContentPart {
 /// The `image_url` object of an [`ContentPart::ImageUrl`] part.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ImageUrlPart {
-    /// The image URL (`http(s)://...` or a `data:` URI).
+    /// The image reference (`data:` URI, `file://`, or `http(s)://`).
     pub url: String,
     /// OpenAI's optional resolution hint (`"auto"` / `"low"` / `"high"`).
+    /// Accepted for compatibility; the per-image token budget
+    /// (`--image-max-tokens`) decides the resolution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
 
-/// A chat message's `content`: either a plain string (the common case, and
-/// the only shape `crate::server::ChatMessage` accepts today) or an array of
-/// [`ContentPart`]s (the OpenAI multimodal shape).
+/// A chat message's `content`: either a plain string (the common case) or
+/// an array of [`ContentPart`]s (the OpenAI multimodal shape).
 ///
 /// `#[serde(untagged)]` tries each variant in declaration order, so a bare
 /// JSON string deserializes as [`MessageContent::Text`] and a JSON array as
 /// [`MessageContent::Parts`] — matching the wire format exactly, including
 /// on the way back out: serializing `Text(s)` re-emits the bare string `s`,
-/// not `{"Text": s}`, so a future `ChatMessage.content: Option<MessageContent>`
-/// stays byte-identical on responses (which only ever construct `Text`).
+/// not `{"Text": s}`, so responses (which only ever construct `Text`) keep
+/// their wire shape.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(untagged)]
 pub enum MessageContent {
@@ -432,8 +431,48 @@ pub enum MessageContent {
 }
 
 impl MessageContent {
-    /// Flatten this content into a single string for the text-only prompt
-    /// builders every endpoint uses today.
+    /// Every text segment, concatenated in order with no separator (the
+    /// whole string for [`MessageContent::Text`]); image parts contribute
+    /// nothing.
+    #[must_use]
+    pub fn text(&self) -> String {
+        match self {
+            MessageContent::Text(s) => s.clone(),
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::Text { text } => Some(text.as_str()),
+                    ContentPart::ImageUrl { .. } => None,
+                })
+                .collect(),
+        }
+    }
+
+    /// Whether any part is an image.
+    #[must_use]
+    pub fn has_images(&self) -> bool {
+        matches!(self, MessageContent::Parts(parts)
+            if parts.iter().any(|p| matches!(p, ContentPart::ImageUrl { .. })))
+    }
+
+    /// The image references, in part order.
+    #[must_use]
+    pub fn image_urls(&self) -> Vec<&str> {
+        match self {
+            MessageContent::Text(_) => Vec::new(),
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::ImageUrl { image_url } => Some(image_url.url.as_str()),
+                    ContentPart::Text { .. } => None,
+                })
+                .collect(),
+        }
+    }
+
+    /// Flatten this content into a single string for a consumer that can
+    /// only take text (every prompt builder except the chat endpoints'
+    /// multimodal path).
     ///
     /// A bare string passes through unchanged. A parts array concatenates
     /// every [`ContentPart::Text`] segment (in order, with no separator —
@@ -443,27 +482,15 @@ impl MessageContent {
     /// send the model a prompt silently missing the image the client asked
     /// about.
     pub fn into_text_only(self) -> Result<String, String> {
-        match self {
-            MessageContent::Text(s) => Ok(s),
-            MessageContent::Parts(parts) => {
-                if parts
-                    .iter()
-                    .any(|p| matches!(p, ContentPart::ImageUrl { .. }))
-                {
-                    return Err("image_url content parts are not supported yet; only text \
-                         content parts are accepted (image input support is planned)"
-                        .to_string());
-                }
-                Ok(parts
-                    .into_iter()
-                    .filter_map(|p| match p {
-                        ContentPart::Text { text } => Some(text),
-                        ContentPart::ImageUrl { .. } => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join(""))
-            }
+        if self.has_images() {
+            return Err(
+                "image_url content parts cannot be flattened into a text-only \
+                        prompt; send them to a chat endpoint of a server started with a vision \
+                        projector (--mmproj)"
+                    .to_string(),
+            );
         }
+        Ok(self.text())
     }
 }
 
@@ -1013,5 +1040,26 @@ mod tests {
         let mc = MessageContent::Text("hi".to_string());
         let json = serde_json::to_string(&mc).expect("serialize");
         assert_eq!(json, r#""hi""#);
+    }
+
+    #[test]
+    fn message_content_exposes_its_images_in_part_order() {
+        let json = serde_json::json!([
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            {"type": "text", "text": "compare "},
+            {"type": "image_url", "image_url": {"url": "file://b.png", "detail": "low"}},
+            {"type": "text", "text": "these"},
+        ]);
+        let mc: MessageContent = serde_json::from_value(json).expect("parts form");
+        assert!(mc.has_images());
+        assert_eq!(
+            mc.image_urls(),
+            vec!["data:image/png;base64,AAAA", "file://b.png"]
+        );
+        assert_eq!(mc.text(), "compare these");
+        let text = MessageContent::Text("plain".to_string());
+        assert!(!text.has_images());
+        assert!(text.image_urls().is_empty());
+        assert_eq!(text.text(), "plain");
     }
 }

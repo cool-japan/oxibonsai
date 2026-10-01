@@ -41,6 +41,27 @@
 //! - On the CUDA tier the process-global `CudaGraph` singleton is unchanged,
 //!   so `N > 1` replicas would still corrupt each other's KV: the clamp to `1`
 //!   stays there (see [`resolve_pool_sizing`]).
+//! - A **hybrid** (`qwen35`) replica on the Metal hybrid runner is not the
+//!   `MET-05` singleton either: every runner owns a `MetalGraph::new_session()`
+//!   with its own command queue, sparse `f16` KV cache, recurrent state and
+//!   activation scratch, and binds the weights as one no-copy buffer over the
+//!   same file mapping (the pages are resident once, whichever runner reads
+//!   them). Two runners in one process are therefore independent by
+//!   construction — `two_metal_hybrid_replicas_interleave_bit_identically_to_solo_runs`
+//!   decodes interleaved requests on two replicas bit-identically to solo
+//!   runs — and the pool sizes a Metal-backed hybrid like any GPU tier:
+//!   `min(requested, MetalGraph::max_sessions())`, one replica when nothing
+//!   was requested. The bound is memory: each runner allocates its KV cache
+//!   for the whole window at load (64 KiB per position for the 27B — 512 MiB
+//!   at the default 8192), about 150 MiB of recurrent state, the widened
+//!   gates and its scratch, and each replica's CPU model keeps its own
+//!   recurrent state; the engine's per-replica window budget
+//!   ([`crate::engine_hybrid_gpu::plan_hybrid_metal_window`]) counts one CPU
+//!   model and one runner, so an operator asking for more replicas is asking
+//!   for that much more. The pool binds no session of its own for a hybrid
+//!   replica (the runner never dispatches through `MetalGraph::global()`), and
+//!   replicas `2..N` are built on the executor replica `#1` resolved to, so a
+//!   pool never mixes Metal and CPU hybrids.
 //!
 //! ## Back-compatibility
 //!
@@ -81,6 +102,13 @@ struct GpuSession(Option<Arc<oxibonsai_kernels::MetalGraph>>);
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 impl GpuSession {
+    /// No session: a replica that issues no work through
+    /// `MetalGraph::global()` (a CPU tier, or a hybrid replica whose Metal
+    /// runner owns a session of its own).
+    fn none() -> Self {
+        Self(None)
+    }
+
     /// Create a session for a replica running on `tier`.
     ///
     /// Only the GPU tier gets one, and that is sufficient rather than merely
@@ -144,6 +172,11 @@ struct GpuSession;
 #[cfg(not(all(feature = "metal", target_os = "macos")))]
 impl GpuSession {
     /// No GPU session exists off the Metal tier.
+    fn none() -> Self {
+        Self
+    }
+
+    /// No GPU session exists off the Metal tier.
     fn for_tier(_tier: oxibonsai_kernels::KernelTier) -> Self {
         Self
     }
@@ -170,8 +203,16 @@ struct Replica {
 
 impl Replica {
     /// Wrap an engine, giving it a session sized for its own kernel tier.
+    ///
+    /// A hybrid engine gets none: a Metal-backed one decodes on its runner,
+    /// which already owns a Metal session of its own (and never dispatches
+    /// through `MetalGraph::global()`), and a CPU one issues no GPU work.
     fn new(engine: InferenceEngine<'static>) -> Self {
-        let session = GpuSession::for_tier(engine.kernel_tier());
+        let session = if engine.is_hybrid() {
+            GpuSession::none()
+        } else {
+            GpuSession::for_tier(engine.kernel_tier())
+        };
         Self { engine, session }
     }
 }
@@ -697,11 +738,14 @@ impl std::fmt::Debug for PoolBuild {
 /// [`build_pool_from_gguf`] on an explicit [`crate::engine_seam::Backend`],
 /// returning every part of the build ([`PoolBuild`]).
 ///
-/// A **hybrid** (`qwen35`) model runs on a CPU tier, where the generic sizing
-/// would default to `min(4, cores)` replicas. Each 27B replica carries its own
-/// KV cache, a ~157 MB recurrent state and its chunk scratch, and a single
-/// CPU replica already saturates memory bandwidth, so an *unspecified* size
-/// is 1 for a hybrid model (logged); an explicit `requested_size` is honoured.
+/// A **hybrid** (`qwen35`) model decodes on the Metal hybrid runner or on a
+/// CPU tier. On a CPU tier the generic sizing would default to `min(4,
+/// cores)` replicas; each 27B replica carries its own KV cache, a ~157 MB
+/// recurrent state and its chunk scratch, and a single replica already
+/// saturates memory bandwidth, so an *unspecified* size is 1 for a hybrid
+/// model on either executor (logged). An explicit `requested_size` is
+/// honoured on the CPU and capped at `MetalGraph::max_sessions()` on the
+/// Metal runner (see the module docs).
 ///
 /// # Errors
 ///
@@ -758,9 +802,11 @@ fn finish_pool_from_first_replica(
     let sizing = if hybrid && requested_size.is_none() {
         tracing::info!(
             architecture = %first.architecture(),
+            executor = ?first.hybrid_backend(),
             "hybrid model: defaulting the engine pool to 1 replica (each replica holds its own \
-             KV cache and recurrent state, and one CPU replica already saturates memory \
-             bandwidth); pass an explicit pool size to run more"
+             KV cache and recurrent state — a Metal-backed one also its own Metal session and \
+             whole-window device KV — and one replica already saturates memory bandwidth); pass \
+             an explicit pool size to run more"
         );
         PoolSizing {
             requested: None,
@@ -792,19 +838,32 @@ fn finish_pool_from_first_replica(
     // holds one embedding allocation total.
     let shared_token_embd = first.model_token_embd();
 
+    // A hybrid pool is built on the executor replica #1 resolved to: under
+    // `auto` a later replica must not quietly land on the CPU (or on Metal)
+    // when #1 did not, or two requests could decode the same prompt on two
+    // different executors.
+    let replica_backend = match first.hybrid_backend() {
+        Some(crate::engine_hybrid_gpu::HybridBackend::Metal) => crate::engine_seam::Backend::Metal,
+        Some(crate::engine_hybrid_gpu::HybridBackend::Cpu) => crate::engine_seam::Backend::Cpu,
+        None => backend,
+    };
+
     let mut engines = Vec::with_capacity(size);
     engines.push(first);
     // Replicas 2..size reuse the already-`'static` GGUF (zero extra mmap/copy)
     // and the shared `Arc<[f32]>` token-embedding table (zero extra dequant/copy).
     for _ in 1..size {
-        let replica = InferenceEngine::from_gguf_static_with_embd_and_backend(
+        let mut replica = InferenceEngine::from_gguf_static_with_embd_and_backend(
             gguf,
             sampling_params.clone(),
             seed,
             max_seq_len,
             Arc::clone(&shared_token_embd),
-            backend,
+            replica_backend,
         )?;
+        // Every replica reports the knob the pool was asked for, whatever
+        // executor it was pinned to.
+        replica.backend = backend;
         engines.push(replica);
     }
 

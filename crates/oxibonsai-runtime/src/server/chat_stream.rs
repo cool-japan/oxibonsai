@@ -219,7 +219,8 @@ impl ContentStop for TextStop {
 
 /// Bundled inputs for one streaming chat completion.
 pub(super) struct StreamRequest {
-    pub(super) prompt_tokens: Vec<u32>,
+    /// The prompt: token ids, or text with images spliced in (SV-11).
+    pub(super) prompt: crate::vision_prefill::ChatPrompt,
     pub(super) max_tokens: usize,
     pub(super) overrides: SamplingOverrides,
     pub(super) penalties: PenaltyParams,
@@ -476,7 +477,7 @@ pub(super) async fn chat_completions_stream(
     req: StreamRequest,
 ) -> Result<Response, ApiError> {
     let StreamRequest {
-        prompt_tokens,
+        prompt,
         max_tokens,
         overrides,
         penalties,
@@ -490,7 +491,7 @@ pub(super) async fn chat_completions_stream(
         request_start,
         active_guard,
     } = req;
-    let prompt_len = prompt_tokens.len();
+    let prompt_len = prompt.len();
     let completion_id = format!("chatcmpl-{}", rand_id());
     let created = unix_now_secs();
 
@@ -534,7 +535,7 @@ pub(super) async fn chat_completions_stream(
         // The request's params, penalties, min_p and seed for this one
         // generation; the replica's own sampler comes back afterwards.
         let result = sampling.run(&mut lease, |engine| {
-            engine.generate_streaming(&prompt_tokens, max_tokens, &token_tx)
+            prompt.generate_streaming(engine, max_tokens, &token_tx)
         });
         // SV-08: streaming requests record `tokens_generated_total` /
         // `errors_total` from the real outcome the engine reported, like the

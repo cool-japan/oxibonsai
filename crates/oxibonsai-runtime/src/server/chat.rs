@@ -40,7 +40,10 @@ use super::response_pipeline::{
 };
 use super::sampling_scope::RequestSampling;
 use super::*;
-use crate::tokenizer_bridge::chat_render::{self, to_render_messages, ChatRequestExtras};
+use crate::tokenizer_bridge::chat_render::{self, ChatRequestExtras};
+// The text-only conversion, for this module's tests.
+#[cfg(test)]
+use crate::tokenizer_bridge::chat_render::to_render_messages;
 
 /// The SSE-streaming half of this pipeline, in its own file to keep both
 /// under the workspace's 2000-line ceiling.
@@ -159,9 +162,14 @@ fn find_first_stop_match<'a>(text: &str, stop_sequences: &'a [String]) -> Option
         .min_by_key(|&(pos, _)| pos)
 }
 
-#[tracing::instrument(skip(state, headers, raw), fields(request_id))]
+#[tracing::instrument(skip(state, vision, headers, raw), fields(request_id))]
 pub(super) async fn chat_completions(
     State(state): State<Arc<AppState>>,
+    // SV-11: the vision projector the process loaded at startup
+    // (`--mmproj`), attached to the router as an extension; `None` for a
+    // text-only server, which then answers an image request with
+    // `400 vision_unavailable`.
+    vision: Option<axum::Extension<Arc<crate::vision_prefill::VisionService>>>,
     headers: HeaderMap,
     // `Box<RawValue>` in place of `OpenAiJson<ChatCompletionRequest>`
     // directly — still goes through `OpenAiJson`, so a genuinely malformed
@@ -179,19 +187,21 @@ pub(super) async fn chat_completions(
     tracing::Span::current().record("request_id", tracing::field::display(&request_id));
 
     // SV-11: recover what `ChatMessage.content: Option<String>` cannot
-    // represent (a vision-shaped content array — flattened here or
-    // honestly rejected, never silently schema-error'd) and what it has no
-    // field for at all (`reasoning_content` on a replayed assistant turn)
-    // from the raw body, BEFORE the typed parse below. `extras` still
-    // parses from the ORIGINAL `raw.get()` text (not `rewritten`) — see
+    // represent (a content-parts array — its text flattened into the typed
+    // field, its image parts kept for the renderer, never silently
+    // schema-error'd or dropped) and what it has no field for at all
+    // (`reasoning_content` on a replayed assistant turn) from the raw body,
+    // BEFORE the typed parse below. `extras` still parses from the ORIGINAL
+    // `raw.get()` text (not the rewrite) — see
     // `preprocess_message_content_and_reasoning`'s own doc for why that
     // matters for `tools`' key order.
-    let (rewritten, reasoning_contents) =
+    let preprocessed =
         chat_render::preprocess_message_content_and_reasoning(raw.get()).map_err(|e| {
             state.metrics.errors_total.inc();
             e.with_request_id(request_id)
         })?;
-    let body: ChatCompletionRequest = match serde_json::from_str(&rewritten) {
+    let vision = vision.map(|axum::Extension(service)| service);
+    let body: ChatCompletionRequest = match serde_json::from_str(&preprocessed.rewritten) {
         Ok(b) => b,
         Err(e) => {
             state.metrics.errors_total.inc();
@@ -231,7 +241,8 @@ pub(super) async fn chat_completions(
                     Arc::clone(&state),
                     body,
                     extras,
-                    reasoning_contents,
+                    preprocessed,
+                    vision,
                     request_id,
                     cancel_slot.clone(),
                 ),
@@ -262,7 +273,8 @@ pub(super) async fn chat_completions(
                 Arc::clone(&state),
                 body,
                 extras,
-                reasoning_contents,
+                preprocessed,
+                vision,
                 request_id,
                 cancel_slot,
             )
@@ -279,7 +291,8 @@ async fn chat_completions_inner(
     state: Arc<AppState>,
     body: ChatCompletionRequest,
     extras: ChatRequestExtras,
-    reasoning_contents: Vec<Option<String>>,
+    preprocessed: chat_render::PreprocessedChat,
+    vision: Option<Arc<crate::vision_prefill::VisionService>>,
     request_id: RequestId,
     cancel_slot: CancelSlot,
 ) -> Result<Response, ApiError> {
@@ -395,18 +408,33 @@ async fn chat_completions_inner(
     // Build the prompt: the model's own resolved chat template, rendered
     // through the real Jinja engine and encoded in one whole-prompt call —
     // see `chat_render`'s module doc for why one call, and for how TOK-M2
-    // (finding `sec-01`'s id-level half) is preserved despite it. Without a
-    // tokenizer there is no vocabulary to render into: the configured
-    // prompt start token, or `400 tokenizer_required`.
+    // (finding `sec-01`'s id-level half) is preserved despite it. A message
+    // carrying images renders from its content parts, each image as the
+    // template's `<|vision_start|><|image_pad|><|vision_end|>` (SV-11).
+    // Without a tokenizer there is no vocabulary to render into: the
+    // configured prompt start token, or `400 tokenizer_required`.
+    let image_references = preprocessed.image_references();
+    if !image_references.is_empty() && vision.is_none() {
+        // Before rendering: a template without image support would only
+        // produce a less helpful error.
+        state.metrics.errors_total.inc();
+        return Err(chat_render::api_error_from_multimodal(
+            &crate::vision_prefill::MultimodalError::VisionUnavailable,
+        ));
+    }
     let (prompt_tokens, rendered) = match &state.tokenizer {
         Some(tok) => {
-            let render_messages = to_render_messages(&body.messages, &reasoning_contents);
+            let render_messages = chat_render::to_render_messages_with_parts(
+                &body.messages,
+                &preprocessed.reasoning_contents,
+                &preprocessed.content_parts,
+            );
             let opts = oxibonsai_tokenizer::chat_templates::RenderOptions {
                 add_generation_prompt: true,
                 enable_thinking: extras.effective_enable_thinking(),
                 reasoning_effort: extras.effective_reasoning_effort(),
                 preserve_thinking: extras.effective_preserve_thinking(),
-                add_vision_id: false,
+                add_vision_id: extras.effective_add_vision_id(),
                 tools: extras.tools_raw_json(),
             };
             let (rendered, tokens) = chat_render::render_chat_prompt(
@@ -422,6 +450,15 @@ async fn chat_completions_inner(
             (tokens, Some(rendered))
         }
         None => {
+            if !image_references.is_empty() {
+                state.metrics.errors_total.inc();
+                return Err(ApiError::bad_request(
+                    "image content needs the model's tokenizer to render its placeholders, and \
+                     this server has none",
+                    "messages",
+                )
+                .with_code("tokenizer_required"));
+            }
             let tokens = state.tokenizerless_prompt("messages").inspect_err(|_| {
                 state.metrics.errors_total.inc();
             })?;
@@ -429,6 +466,15 @@ async fn chat_completions_inner(
             (tokens, None)
         }
     };
+
+    // SV-11: every image resolved, decoded and preprocessed, and the splice
+    // checked against the rendered ids — but not yet encoded, so the budget
+    // below sees the expanded prompt before any vision-tower work is spent.
+    let pending = chat_render::prepare_chat_prompt(prompt_tokens, image_references, vision)
+        .await
+        .inspect_err(|_| {
+            state.metrics.errors_total.inc();
+        })?;
 
     // How this response's tokens split into reasoning, content and tool
     // calls — resolved once from the loaded vocabulary and the actual
@@ -438,17 +484,18 @@ async fn chat_completions_inner(
     // model-emitted `<think>` from opening another).
     let shape = ResponseShape::resolve(
         state.tokenizer.as_ref(),
-        &prompt_tokens,
+        pending.tokens(),
         rendered.as_deref(),
         tools_active,
     );
 
     // sec-05 (token half): reject an over-long prompt with a 400 naming the
     // real numbers instead of letting it become an opaque 500 in the engine.
+    // An image counts as the rows it expands to.
     let descriptor = state.model_info().descriptor().await;
     let ctx_len = descriptor.max_context_length;
     budget::validate_request_budget(
-        prompt_tokens.len(),
+        pending.len(),
         effective_max_tokens,
         ctx_len,
         state.limits.max_input_tokens,
@@ -460,7 +507,7 @@ async fn chat_completions_inner(
     state
         .metrics
         .prompt_tokens_total
-        .inc_by(prompt_tokens.len() as u64);
+        .inc_by(pending.len() as u64);
 
     // SV-19: feed a real per-request context-utilization pressure sample
     // into the KV cache policy so `/admin/cache-stats` reflects genuine
@@ -469,9 +516,15 @@ async fn chat_completions_inner(
     // observes and reports them — the demote-to-telemetry option that
     // finding's own fix explicitly allows.
     if ctx_len > 0 {
-        let pressure = prompt_tokens.len() as f64 / ctx_len as f64;
+        let pressure = pending.len() as f64 / ctx_len as f64;
         state.kv_cache_policy.observe(pressure);
     }
+
+    // SV-11: the images are encoded (on the blocking pool) only now that
+    // the request is accepted.
+    let prompt = pending.encode().await.inspect_err(|_| {
+        state.metrics.errors_total.inc();
+    })?;
 
     let created = unix_now_secs();
     let model_id = descriptor.id.clone();
@@ -486,7 +539,7 @@ async fn chat_completions_inner(
         chat_completions_stream(
             Arc::clone(&state),
             StreamRequest {
-                prompt_tokens,
+                prompt,
                 max_tokens: effective_max_tokens,
                 overrides,
                 penalties,
@@ -514,7 +567,7 @@ async fn chat_completions_inner(
         chat_completions_non_stream(
             Arc::clone(&state),
             NonStreamRequest {
-                prompt_tokens,
+                prompt,
                 max_tokens: effective_max_tokens,
                 overrides,
                 penalties,
@@ -557,7 +610,8 @@ async fn chat_completions_inner(
 /// Grouped into one struct so [`chat_completions_non_stream`] stays within
 /// clippy's argument-count budget.
 struct NonStreamRequest {
-    prompt_tokens: Vec<u32>,
+    /// The prompt: token ids, or text with images spliced in (SV-11).
+    prompt: crate::vision_prefill::ChatPrompt,
     max_tokens: usize,
     overrides: SamplingOverrides,
     penalties: PenaltyParams,
@@ -643,7 +697,7 @@ async fn chat_completions_non_stream(
     req: NonStreamRequest,
 ) -> Result<Response, ApiError> {
     let NonStreamRequest {
-        prompt_tokens,
+        prompt,
         max_tokens,
         overrides,
         penalties,
@@ -658,7 +712,7 @@ async fn chat_completions_non_stream(
         created,
         model_id,
     } = req;
-    let prompt_len = prompt_tokens.len();
+    let prompt_len = prompt.len();
 
     let mut lease = state.acquire_engine().await.map_err(|e| {
         tracing::error!(error = %e, "engine pool acquire failed");
@@ -697,12 +751,12 @@ async fn chat_completions_non_stream(
                 let id_to_token = |id: u32| -> String {
                     logprob_id_to_token(state_for_generation.tokenizer.as_ref(), id)
                 };
-                engine
-                    .generate_with_logprobs(&prompt_tokens, max_tokens, top_logprobs, &id_to_token)
+                prompt
+                    .generate_with_logprobs(engine, max_tokens, top_logprobs, &id_to_token)
                     .map(|(tokens, lp)| (tokens, Some(lp)))
             } else {
-                engine
-                    .generate(&prompt_tokens, max_tokens)
+                prompt
+                    .generate(engine, max_tokens)
                     .map(|tokens| (tokens, None))
             }
         })

@@ -20,8 +20,20 @@
 //! the recurrent state and the conv windows. It shares nothing mutable with
 //! the [`HybridModel`] it was built from — only the model's immutable weight
 //! slices, which the device reads in place when the runner is built with
-//! [`HybridMetalRunner::new_mapped`] — so the CPU model stays usable next to
-//! it, e.g. as a parity reference.
+//! [`HybridMetalRunner::new_mapped`] or [`HybridMetalRunner::new_in_place`] —
+//! so the CPU model stays usable next to it, e.g. as a parity reference or
+//! for the embedding pass.
+//!
+//! The runner counts the positions its state has consumed
+//! ([`HybridMetalRunner::token_count`]) the way the CPU model's recurrent
+//! cache does, so a caller can hold it to the same contiguous-position
+//! contract. The recurrent state can be copied out and back
+//! ([`HybridMetalRunner::snapshot_state`] /
+//! [`HybridMetalRunner::restore_state`], `metal_state.rs`): an exact
+//! rollback point, like the CPU model's `RecurrentCache::snapshot`. A GPU
+//! call that fails abandons the sequence — the state is cleared and the
+//! count returns to zero — since a command buffer that failed part-way may
+//! have advanced some layers and not others.
 //!
 //! # Context capacity
 //!
@@ -37,9 +49,12 @@
 //!
 //! The runner is an explicit object: nothing here, and nothing in
 //! [`HybridModel`], consults the environment. Choosing Metal or CPU is the
-//! caller's backend decision; [`HybridMetalRunner::check_supported`] tells a
-//! caller, without touching the device, whether a model's geometry and
-//! weight formats are ones the Metal kernels serve.
+//! caller's backend decision — the runtime engine builds a runner for
+//! `--backend metal` and, when a device exists and the model is served, for
+//! `--backend auto`; [`HybridMetalRunner::check_supported`] tells a caller,
+//! without touching the device, whether a model's geometry and weight
+//! formats are ones the Metal kernels serve, and
+//! [`HybridMetalRunner::footprint`] what a runner would keep resident.
 
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
@@ -77,6 +92,9 @@ pub struct HybridMetalRunner<'a> {
     vocab: usize,
     max_seq_len: usize,
     max_batch: usize,
+    /// Positions the recurrent state has consumed since the last reset
+    /// (see [`Self::token_count`]).
+    token_count: usize,
     /// Host staging for the embedded rows of one call, `[t][hidden]`.
     rows: Vec<f32>,
 }
@@ -90,6 +108,7 @@ impl std::fmt::Debug for HybridMetalRunner<'_> {
             .field("vocab", &self.vocab)
             .field("max_seq_len", &self.max_seq_len)
             .field("max_batch", &self.max_batch)
+            .field("token_count", &self.token_count)
             .finish()
     }
 }
@@ -135,6 +154,28 @@ impl<'a> HybridMetalRunner<'a> {
         // created: an unaligned start is refused, never wrapped.
         let region = unsafe { Qwen35MappedRegion::from_mapping(&mapping[..]) };
         Self::build(model, Qwen35Residency::Mapped(region))
+    }
+
+    /// Build a runner over `file_bytes`, the bytes of the GGUF `model` was
+    /// loaded from: the weights are read **in place** (as
+    /// [`Self::new_mapped`]) when `file_bytes` starts on a host page
+    /// boundary — which the whole-file memory mapping every GGUF loader
+    /// hands out always does — and copied (as [`Self::new`]) when it does
+    /// not, e.g. a GGUF image assembled in a heap buffer.
+    ///
+    /// This is the constructor for a caller that holds the parsed GGUF
+    /// (`GgufFile::data`) rather than its `memmap2::Mmap`.
+    /// [`Self::is_mapped`] tells which residency was chosen.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::new`].
+    pub fn new_in_place(model: &HybridModel<'a>, file_bytes: &'a [u8]) -> ModelResult<Self> {
+        let residency = match Qwen35MappedRegion::page_aligned(file_bytes) {
+            Some(region) => Qwen35Residency::Mapped(region),
+            None => Qwen35Residency::Copied,
+        };
+        Self::build(model, residency)
     }
 
     /// Whether `model` is one the Metal kernels can run, checked without
@@ -282,6 +323,7 @@ impl<'a> HybridMetalRunner<'a> {
             vocab: cfg.vocab,
             max_seq_len: cfg.max_seq_len,
             max_batch: cfg.max_batch,
+            token_count: 0,
             rows: Vec::new(),
         })
     }
@@ -334,12 +376,35 @@ impl<'a> HybridMetalRunner<'a> {
         self.gpu.last_gpu_seconds()
     }
 
-    /// Clear the recurrent state and the conv windows (a new sequence).
+    /// Clear the recurrent state and the conv windows (a new sequence), and
+    /// the position count with them.
     ///
     /// The KV cache needs no clearing: every position is written before any
     /// query at or after it reads it.
     pub fn reset(&mut self) {
         self.gpu.reset();
+        self.token_count = 0;
+    }
+
+    /// Positions the recurrent state has consumed since the last reset: the
+    /// end of the last successful [`Self::forward_into`] /
+    /// [`Self::forward_prefill`] / [`Self::forward_with_dump`] call (or the
+    /// position of a restored snapshot) — the next position of a contiguous
+    /// sequence, exactly as `RecurrentCache::token_count` is on the CPU.
+    ///
+    /// [`Self::trace_layer`] advances a single layer's state and leaves the
+    /// count alone: a traced runner must be reset before it decodes again.
+    #[must_use]
+    pub fn token_count(&self) -> usize {
+        self.token_count
+    }
+
+    /// Abandon the sequence after a failed GPU call: a command buffer that
+    /// failed part-way may have advanced some layers' state and not others,
+    /// so nothing short of a reset is a known state.
+    fn abandon(&mut self, error: MetalGraphError) -> ModelError {
+        self.reset();
+        from_gpu(error)
     }
 
     /// The embedding rows of `tokens` after the inverse rotation,
@@ -419,14 +484,18 @@ impl<'a> HybridMetalRunner<'a> {
     ///
     /// [`ModelError::PositionOutOfRange`] past the KV window or for a token
     /// past the vocabulary, [`ModelError::ShapeMismatch`] for a short
-    /// `logits`, and [`KernelError::GpuError`] for a failed command buffer.
+    /// `logits` — all refused before any GPU work, leaving the sequence as
+    /// it was — and [`KernelError::GpuError`] for a failed command buffer,
+    /// which abandons the sequence (see the module docs).
     pub fn forward_into(&mut self, token: u32, pos: usize, logits: &mut [f32]) -> ModelResult<()> {
         self.check_logits(logits)?;
         self.check_window(pos, 1)?;
         self.embed_rows(&[token])?;
-        self.gpu
-            .forward(&self.rows, pos, Some(logits))
-            .map_err(from_gpu)
+        if let Err(e) = self.gpu.forward(&self.rows, pos, Some(logits)) {
+            return Err(self.abandon(e));
+        }
+        self.token_count = pos + 1;
+        Ok(())
     }
 
     /// Prefill `tokens` from absolute position `start_pos`, writing the
@@ -451,6 +520,15 @@ impl<'a> HybridMetalRunner<'a> {
         }
         self.check_logits(last_logits)?;
         self.check_window(start_pos, tokens.len())?;
+        // Every id is checked before the first chunk runs, so a bad token
+        // late in a long prompt is refused without advancing the state.
+        let vocab = u32::try_from(self.vocab).unwrap_or(u32::MAX);
+        if let Some(&bad) = tokens.iter().find(|&&t| t >= vocab) {
+            return Err(ModelError::PositionOutOfRange {
+                pos: bad as usize,
+                max: self.vocab,
+            });
+        }
         let n_chunks = tokens.len().div_ceil(self.max_batch);
         for (i, chunk) in tokens.chunks(self.max_batch).enumerate() {
             self.embed_rows(chunk)?;
@@ -460,9 +538,10 @@ impl<'a> HybridMetalRunner<'a> {
             } else {
                 None
             };
-            self.gpu
-                .forward(&self.rows, pos, logits)
-                .map_err(from_gpu)?;
+            if let Err(e) = self.gpu.forward(&self.rows, pos, logits) {
+                return Err(self.abandon(e));
+            }
+            self.token_count = pos + chunk.len();
         }
         Ok(())
     }
@@ -484,9 +563,13 @@ impl<'a> HybridMetalRunner<'a> {
         self.check_batch(tokens.len())?;
         self.check_window(start_pos, tokens.len())?;
         self.embed_rows(tokens)?;
-        self.gpu
-            .forward_with_dump(&self.rows, start_pos)
-            .map_err(from_gpu)
+        match self.gpu.forward_with_dump(&self.rows, start_pos) {
+            Ok(dumped) => {
+                self.token_count = start_pos + tokens.len();
+                Ok(dumped)
+            }
+            Err(e) => Err(self.abandon(e)),
+        }
     }
 
     /// Run layer `layer` alone on `hidden_rows` (its input residual rows,
@@ -827,6 +910,11 @@ fn rebind_embedding<'a>(embedding: &HybridEmbedding<'a>) -> HybridEmbedding<'a> 
         HybridEmbedding::Dense(table) => HybridEmbedding::Dense(table.clone()),
     }
 }
+
+#[path = "metal_state.rs"]
+mod state;
+
+pub use state::{HybridGpuSnapshot, HybridMetalFootprint};
 
 #[cfg(test)]
 #[path = "metal_tests.rs"]

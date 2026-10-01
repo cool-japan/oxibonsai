@@ -49,8 +49,9 @@ use oxibonsai_model::model::BonsaiModel;
 use oxibonsai_runtime::engine::InferenceEngine;
 use oxibonsai_runtime::engine_seam::Backend;
 use oxibonsai_runtime::sampling::SamplingParams;
-use oxibonsai_testkit::capability::{record_executed, record_skipped, Capability};
+use oxibonsai_testkit::capability::{record_executed_timed, record_skipped, Capability};
 use oxibonsai_testkit::gguf_fixture::Lcg;
+use oxibonsai_testkit::workspace::find_model;
 
 /// Serializes every test in this binary: each one owns
 /// `OXIBONSAI_KERNEL_TIER` for its whole run through a [`TierEnvGuard`]
@@ -427,27 +428,37 @@ fn metal_greedy_output_ignores_the_int8_tier_selector() {
 
 /// FAITHFUL guard against a real staged ternary GGUF. Validates the README
 /// promise literally on the shipped 1.7B ternary model rather than a synthetic
-/// fixture. Ignored by default (needs a multi-hundred-MB model file + a dev Mac
-/// with Metal).
+/// fixture. Needs a dev Mac with Metal and resolves the model from `OXI_MODEL`
+/// when set, else the testkit `models/`/`$OXIBONSAI_MODELS_DIR` fallback;
+/// self-skips with a `Capability::LegacyModels` record when neither locates
+/// one.
 ///
 /// Run with:
 /// ```text
 /// OXI_MODEL=/path/to/Ternary-Bonsai-1.7B.gguf \
 ///   cargo test -p oxibonsai-runtime --features metal \
 ///   --test cross_backend_determinism_tests \
-///   real_model_cpu_metal_byte_identical -- --ignored --nocapture
+///   real_model_cpu_metal_byte_identical -- --nocapture
 /// ```
 #[test]
-#[ignore = "requires OXI_MODEL real ternary GGUF; run on dev Mac"]
 fn real_model_cpu_metal_byte_identical() {
     let _env = TierEnvGuard::cleared();
-    let Some(path) = std::env::var_os("OXI_MODEL") else {
+    let test_name =
+        "oxibonsai-runtime::cross_backend_determinism_tests::real_model_cpu_metal_byte_identical";
+    let Some(path) = std::env::var_os("OXI_MODEL")
+        .map(std::path::PathBuf::from)
+        .or_else(|| find_model("Ternary-Bonsai-1.7B.gguf"))
+    else {
         eprintln!(
-            "real_model_cpu_metal_byte_identical: OXI_MODEL not set — skipping. \
-             Set OXI_MODEL=/path/to/Ternary-Bonsai-1.7B.gguf to run."
+            "real_model_cpu_metal_byte_identical: OXI_MODEL not set and \
+             Ternary-Bonsai-1.7B.gguf not found under {:?} — skipping. Set OXI_MODEL or \
+             OXIBONSAI_MODELS_DIR to run.",
+            oxibonsai_testkit::workspace::models_dir()
         );
+        record_skipped(Capability::LegacyModels, test_name);
         return;
     };
+    let start = std::time::Instant::now();
 
     let gguf = std::fs::read(&path).expect("read OXI_MODEL gguf");
 
@@ -480,6 +491,7 @@ fn real_model_cpu_metal_byte_identical() {
         "real model: CPU(Reference) and Metal(Gpu) greedy outputs byte-identical ({} tokens)",
         cpu.len()
     );
+    record_executed_timed(Capability::LegacyModels, test_name, start.elapsed());
 }
 
 /// The 1/5/15-minute load average, for the throughput line.
@@ -543,15 +555,23 @@ fn timed_greedy_decode(
 /// best this CPU supports. Reports decode tok/s both ways, the machine's
 /// load, and how far the two greedy chains agree (int8 activation
 /// quantization may legitimately flip a near-tie, so agreement is evidence,
-/// not a gate). Self-skips with a capability record when `OXI_MODEL` is
-/// unset.
+/// not a gate). Resolves the model from `OXI_MODEL` when set, else the
+/// testkit `models/`/`$OXIBONSAI_MODELS_DIR` fallback; self-skips with a
+/// capability record when neither locates one.
 #[test]
 fn real_model_cpu_decode_tok_s_with_and_without_the_int8_tier() {
     let env = TierEnvGuard::cleared();
     let test_name = "oxibonsai-runtime::cross_backend_determinism_tests::\
                      real_model_cpu_decode_tok_s_with_and_without_the_int8_tier";
-    let Some(path) = std::env::var_os("OXI_MODEL") else {
-        eprintln!("skip: OXI_MODEL not set (a real ternary GGUF, e.g. Ternary-Bonsai-1.7B)");
+    let Some(path) = std::env::var_os("OXI_MODEL")
+        .map(std::path::PathBuf::from)
+        .or_else(|| find_model("Ternary-Bonsai-1.7B.gguf"))
+    else {
+        eprintln!(
+            "skip: OXI_MODEL not set and Ternary-Bonsai-1.7B.gguf not found under {:?} (set \
+             OXI_MODEL or OXIBONSAI_MODELS_DIR)",
+            oxibonsai_testkit::workspace::models_dir()
+        );
         record_skipped(Capability::LegacyModels, test_name);
         return;
     };
@@ -569,6 +589,7 @@ fn real_model_cpu_decode_tok_s_with_and_without_the_int8_tier() {
     // <|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n
     let prompt: Vec<u32> = vec![151644, 872, 198, 9707, 151645, 198, 151644, 77091, 198];
 
+    let start = std::time::Instant::now();
     // Warm both configurations once (page-in, Rayon pool), then measure.
     let _ = timed_greedy_decode(&mut engine, &prompt);
     let (f32_tokens, f32_time) = timed_greedy_decode(&mut engine, &prompt);
@@ -598,7 +619,7 @@ fn real_model_cpu_decode_tok_s_with_and_without_the_int8_tier() {
     );
     assert_eq!(f32_tokens.len(), DECODE_STEPS + 1);
     assert_eq!(int8_tokens.len(), DECODE_STEPS + 1);
-    record_executed(Capability::LegacyModels, test_name);
+    record_executed_timed(Capability::LegacyModels, test_name, start.elapsed());
 }
 
 // CUDA variant: same shape, gate on native-cuda + linux/windows, compares

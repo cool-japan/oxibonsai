@@ -1,11 +1,12 @@
 //! The `qwen35` forward / prefill driver (design §3.10) and the model seam
-//! the runtime dispatches through (B2-11).
+//! the runtime dispatches through.
 //!
 //! # One body, parameterised by batch
 //!
-//! [`run_chunk`] is the *only* forward body in this module tree. A decode
-//! step is `run_chunk` with `t_len == 1`; a chunked prefill is the same
-//! call with `t_len == chunk`. Nothing is duplicated between the two, so
+//! [`run_chunk_input`] is the *only* forward body in this module tree
+//! ([`run_chunk`] is its token-id form). A decode step is one call with
+//! `t_len == 1`; a chunked prefill is the same call with `t_len == chunk`.
+//! Nothing is duplicated between the two, so
 //! design §8.2's G5 ("prefill(T) == T sequential decode steps") is a
 //! property of the *shape* of the code rather than of two implementations
 //! agreeing by luck:
@@ -32,6 +33,27 @@
 //! `ssm_beta` — the two projections that are **not** in
 //! `prism.hadamard.weight_names` — keep reading the *un-rotated* activation.
 //!
+//! # Two kinds of chunk input (design §6.2)
+//!
+//! A chunk enters block 0 either as **token ids** ([`ChunkInput::Tokens`]:
+//! each row is the `token_embd` lookup, inverse-rotated for a folded
+//! checkpoint, design §3.5) or as **caller-supplied rows**
+//! ([`ChunkInput::Rows`]: e.g. a vision tower's merged image rows, which
+//! live in the unrotated embedding basis already and must reach block 0
+//! untouched). The two also differ in how rotary positions are named:
+//!
+//! * the **KV slot** of every row is always its absolute *sequence* index
+//!   (`start_pos + t`) — attention is causal in sequence order, exactly as
+//!   the reference's 2-D M-RoPE causal mask reduces to for an image laid out
+//!   row-major between text tokens;
+//! * the **rotary angle** of a token row is its text position (all three
+//!   M-RoPE axes equal, which degenerates bitwise to the precomputed
+//!   single-axis table, design §2.5), while an image row carries its own
+//!   3-axis [`MropePos`] (`t = p0`, `h = p0 + row`, `w = p0 + col`). After an
+//!   image, text positions resume at `p0 + max(h, w)`, so they run *behind*
+//!   the sequence index — the model keeps that offset
+//!   ([`crate::hybrid::HybridModel::rope_delta`]).
+//!
 //! # Layer dumps (design §8.2 G11)
 //!
 //! [`LayerDump`] records the residual stream after each block, so the CPU
@@ -39,7 +61,7 @@
 //! without re-running anything.
 
 use oxibonsai_core::config_hybrid::HybridConfig;
-use oxibonsai_kernels::rope_mrope::partial_rope_build_table;
+use oxibonsai_kernels::rope_mrope::{mrope_build_tables, partial_rope_build_table};
 
 use crate::error::{ModelError, ModelResult};
 use crate::hybrid::block::HybridBlock;
@@ -50,6 +72,7 @@ use crate::hybrid::weights::HybridEmbedding;
 use crate::kv_cache::KvCache;
 use crate::layers::linear::LinearLayer;
 use crate::layers::rms_norm::RmsNorm;
+use crate::layers::rope_mrope::MropePos;
 
 /// Tokens processed per prefill chunk unless the caller says otherwise
 /// (design §3.10: 512 × 17408 f32 ≈ 35 MB of activation peak).
@@ -60,14 +83,18 @@ pub const DEFAULT_PREFILL_CHUNK: usize = 512;
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Precomputed partial-NeoX RoPE angles for every position a sequence can
-/// reach (design §2.5).
+/// reach (design §2.5), plus the 3-axis M-RoPE angles of an image row.
 ///
 /// Text-only M-RoPE is provably identical to standard NeoX RoPE over the
 /// first `n_rot` of `head_dim` when all three position axes carry the token
 /// index, so one `(cos, sin)` pair per position is enough; the table is
 /// built through [`partial_rope_build_table`], i.e. through the very
-/// `mrope_build_tables` the vision path will use, rather than through a
-/// second angle formula that could drift from it.
+/// [`mrope_build_tables`] the vision rows use, rather than through a second
+/// angle formula that could drift from it.
+///
+/// A table built with [`RopeTables::with_sections`] also knows the model's
+/// `rope.dimension_sections`, which [`RopeTables::fill_angles`] needs for a
+/// position whose three axes differ (an image row, design §6.2).
 #[derive(Debug, Clone)]
 pub struct RopeTables {
     cos: Vec<f32>,
@@ -75,10 +102,16 @@ pub struct RopeTables {
     n_rot: usize,
     half: usize,
     max_pos: usize,
+    freq_base: f32,
+    /// `rope.dimension_sections`, when the table serves 3-axis positions.
+    sections: Option<[u32; 4]>,
 }
 
 impl RopeTables {
-    /// Build the table for positions `0..max_pos`.
+    /// Build the text table for positions `0..max_pos`.
+    ///
+    /// A table built this way serves text positions only;
+    /// [`RopeTables::fill_angles`] refuses a position whose axes differ.
     ///
     /// # Errors
     ///
@@ -86,6 +119,42 @@ impl RopeTables {
     /// `max_pos`, or a position that does not fit in the `i32` the kernel's
     /// angle builder takes; [`ModelError::Kernel`] from the builder itself.
     pub fn new(n_rot: usize, max_pos: usize, freq_base: f32) -> ModelResult<Self> {
+        Self::build(n_rot, max_pos, freq_base, None)
+    }
+
+    /// [`RopeTables::new`] for a model whose full-attention layers take
+    /// 3-axis M-RoPE positions: `sections` is `rope.dimension_sections`
+    /// (`[11, 11, 10, 0]` for Bonsai 2).
+    ///
+    /// # Errors
+    ///
+    /// As [`RopeTables::new`], plus [`ModelError::Kernel`] when `sections`
+    /// sum to zero or leave a rotation pair to the vision `e` axis (which a
+    /// `[t, h, w]` position cannot drive) — checked once here, so a vision
+    /// row can never discover it mid-forward.
+    pub fn with_sections(
+        n_rot: usize,
+        max_pos: usize,
+        freq_base: f32,
+        sections: [u32; 4],
+    ) -> ModelResult<Self> {
+        let table = Self::build(n_rot, max_pos, freq_base, Some(sections))?;
+        // Probe the section map with three distinct axes: the kernel
+        // refuses sections that need the `e` axis the first time such a
+        // sector is reached.
+        let mut cos = vec![0.0f32; table.half];
+        let mut sin = vec![0.0f32; table.half];
+        mrope_build_tables([0, 1, 2], sections, n_rot, freq_base, &mut cos, &mut sin)
+            .map_err(ModelError::Kernel)?;
+        Ok(table)
+    }
+
+    fn build(
+        n_rot: usize,
+        max_pos: usize,
+        freq_base: f32,
+        sections: Option<[u32; 4]>,
+    ) -> ModelResult<Self> {
         if !n_rot.is_multiple_of(2) {
             return Err(ModelError::ShapeInvariant {
                 tensor: "rope.dimension_count".to_string(),
@@ -125,6 +194,8 @@ impl RopeTables {
             n_rot,
             half,
             max_pos,
+            freq_base,
+            sections,
         })
     }
 
@@ -133,6 +204,84 @@ impl RopeTables {
     #[must_use]
     pub fn n_rot(&self) -> usize {
         self.n_rot
+    }
+
+    /// The `rope.dimension_sections` this table serves 3-axis positions
+    /// with, or `None` for a text-only table.
+    #[inline]
+    #[must_use]
+    pub fn sections(&self) -> Option<[u32; 4]> {
+        self.sections
+    }
+
+    /// Write the `(cos, sin)` angles of the 3-axis position `pos` into
+    /// `cos_out` / `sin_out` (each at least `n_rot / 2` long).
+    ///
+    /// A text position (`t == h == w`) copies the precomputed row for `t`:
+    /// the kernel builder degenerates to exactly that row bitwise (design
+    /// §2.5), so a text token spliced between image rows rotates exactly as
+    /// it would in a text-only prompt. Any other position is built through
+    /// [`mrope_build_tables`] with the model's sections — the reference's
+    /// interleaved M-RoPE (`sector % 3` picks `t` / `h` / `w`).
+    ///
+    /// # Errors
+    ///
+    /// [`ModelError::PositionOutOfRange`] for an axis at or past
+    /// [`RopeTables::max_pos`]; [`ModelError::ShapeInvariant`] for a text-only
+    /// table asked for a non-text position or short output buffers;
+    /// [`ModelError::Kernel`] from the angle builder.
+    pub fn fill_angles(
+        &self,
+        pos: MropePos,
+        cos_out: &mut [f32],
+        sin_out: &mut [f32],
+    ) -> ModelResult<()> {
+        let axis_max = pos.t.max(pos.h).max(pos.w) as usize;
+        if axis_max >= self.max_pos {
+            return Err(ModelError::PositionOutOfRange {
+                pos: axis_max,
+                max: self.max_pos,
+            });
+        }
+        let (Some(cos_dst), Some(sin_dst)) =
+            (cos_out.get_mut(..self.half), sin_out.get_mut(..self.half))
+        else {
+            return Err(ModelError::ShapeInvariant {
+                tensor: "rope angle buffers".to_string(),
+                expected: format!("at least {} entries each", self.half),
+                actual: format!("{} / {}", cos_out.len(), sin_out.len()),
+            });
+        };
+        if pos.t == pos.h && pos.t == pos.w {
+            let (cos, sin) = self.angles(pos.t as usize)?;
+            cos_dst.copy_from_slice(cos);
+            sin_dst.copy_from_slice(sin);
+            return Ok(());
+        }
+        let sections = self.sections.ok_or_else(|| ModelError::ShapeInvariant {
+            tensor: "rope table".to_string(),
+            expected: "rope.dimension_sections for a 3-axis (image) position".to_string(),
+            actual: format!(
+                "a text-only table asked for (t={}, h={}, w={})",
+                pos.t, pos.h, pos.w
+            ),
+        })?;
+        let axis = |v: u32| {
+            i32::try_from(v).map_err(|_| ModelError::ShapeInvariant {
+                tensor: "rope position".to_string(),
+                expected: "representable as i32".to_string(),
+                actual: v.to_string(),
+            })
+        };
+        mrope_build_tables(
+            [axis(pos.t)?, axis(pos.h)?, axis(pos.w)?],
+            sections,
+            self.n_rot,
+            self.freq_base,
+            cos_dst,
+            sin_dst,
+        )
+        .map_err(ModelError::Kernel)
     }
 
     /// Highest position + 1 this table covers.
@@ -172,22 +321,28 @@ impl RopeTables {
 //  Per-layer activation dump (design §8.2 G11)
 // ─────────────────────────────────────────────────────────────────────────
 
-/// The residual stream after each block, recorded for the later Metal
-/// parity gate (design §8.2 G11: "record a token list and a per-layer dump
-/// so B2-15 can diff against it").
+/// The residual stream after each block, recorded for the Metal parity
+/// gate (design §8.2 G11: a token list plus a per-layer dump to diff
+/// against).
 ///
 /// A dump holds one `[t_len][hidden]` row set per layer plus the final
-/// post-`output_norm` hidden state, for the tokens of the call it was
+/// post-`output_norm` hidden state, for the rows of the call it was
 /// attached to.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LayerDump {
-    /// The tokens this dump was produced from.
+    /// The tokens this dump was produced from (empty for a chunk of
+    /// caller-supplied rows, [`ChunkInput::Rows`]).
     pub tokens: Vec<u32>,
-    /// Absolute position of `tokens[0]`.
+    /// The rotary position of every recorded row (text rows carry equal
+    /// axes).
+    pub rotary_positions: Vec<MropePos>,
+    /// Absolute sequence position of the first row.
     pub start_pos: usize,
     /// Hidden width of every recorded row.
     pub hidden: usize,
-    /// The embedding output *after* the inverse rotation, `[t][hidden]`.
+    /// What entered block 0, `[t][hidden]`: the embedding *after* the
+    /// inverse rotation for token rows, the caller's rows verbatim for
+    /// [`ChunkInput::Rows`].
     pub embedding: Vec<f32>,
     /// `layers[i]` is the residual stream after block `i`, `[t][hidden]`.
     pub layers: Vec<Vec<f32>>,
@@ -203,10 +358,16 @@ impl LayerDump {
         rows.get(t * self.hidden..(t + 1) * self.hidden)
     }
 
-    /// Number of tokens recorded.
+    /// Row `t` of what entered block 0, or `None` when out of range.
+    #[must_use]
+    pub fn embedding_row(&self, t: usize) -> Option<&[f32]> {
+        self.embedding.get(t * self.hidden..(t + 1) * self.hidden)
+    }
+
+    /// Number of rows recorded.
     #[must_use]
     pub fn t_len(&self) -> usize {
-        self.tokens.len()
+        self.tokens.len().max(self.rotary_positions.len())
     }
 }
 
@@ -416,8 +577,8 @@ impl HybridScratch {
 //  Driver
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Everything one [`run_chunk`] call reads or writes, borrowed field by
-/// field so the caller can hand out disjoint borrows of one model.
+/// Everything one [`run_chunk_input`] call reads or writes, borrowed field
+/// by field so the caller can hand out disjoint borrows of one model.
 pub struct ForwardCtx<'m, 'a> {
     /// The parsed `qwen35` configuration.
     pub config: &'m HybridConfig,
@@ -443,9 +604,145 @@ pub struct ForwardCtx<'m, 'a> {
     pub scratch: &'m mut HybridScratch,
 }
 
-/// Run one chunk of `tokens` starting at absolute position `start_pos`.
+/// What one chunk feeds into block 0 (see the module docs, "Two kinds of
+/// chunk input").
+#[derive(Debug, Clone, Copy)]
+pub enum ChunkInput<'i> {
+    /// Token ids. Each row is the `token_embd` lookup, inverse-rotated for
+    /// a folded checkpoint (design §3.5); token `t` rotates at the text
+    /// position `rope_start + t` on all three M-RoPE axes.
+    Tokens {
+        /// The chunk's token ids.
+        tokens: &'i [u32],
+        /// Rotary position of `tokens[0]` — the sequence position minus the
+        /// model's M-RoPE offset ([`crate::hybrid::HybridModel::rope_delta`]).
+        rope_start: usize,
+    },
+    /// Caller-supplied rows, `[positions.len()][hidden]`, already in the
+    /// basis block 0 expects: written into the residual stream verbatim —
+    /// no `token_embd` lookup and **no inverse Hadamard transform** (a
+    /// vision tower's rows are in the unrotated basis, design §3.5/§6.2) —
+    /// each rotating at its own 3-axis position.
+    Rows {
+        /// `positions.len() * hidden` floats, row-major.
+        rows: &'i [f32],
+        /// One rotary position per row.
+        positions: &'i [MropePos],
+    },
+}
+
+impl ChunkInput<'_> {
+    /// Rows in this chunk.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Tokens { tokens, .. } => tokens.len(),
+            Self::Rows { positions, .. } => positions.len(),
+        }
+    }
+
+    /// Whether the chunk carries no rows.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// How the full-attention layers name this chunk's rotary positions.
+    fn rope(&self) -> ChunkRope<'_> {
+        match *self {
+            Self::Tokens { rope_start, .. } => ChunkRope::Text { start: rope_start },
+            Self::Rows { positions, .. } => ChunkRope::Explicit(positions),
+        }
+    }
+}
+
+/// The rotary positions of one chunk's rows, as the full-attention layers
+/// consume them.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ChunkRope<'p> {
+    /// Row `t` rotates at the text position `start + t` (all three axes).
+    Text {
+        /// Rotary position of row 0.
+        start: usize,
+    },
+    /// Row `t` rotates at `positions[t]`.
+    Explicit(&'p [MropePos]),
+}
+
+/// Write the rows `tokens` enter block 0 with into `out`
+/// (`[tokens.len()][hidden]`): the `token_embd` row of each id, then — for
+/// a folded checkpoint — the inverse Hadamard transform (design §3.5).
 ///
-/// When `logits` is `Some`, the LM head is evaluated for the **last** token
+/// The one implementation both [`run_chunk_input`]'s token path and a
+/// caller assembling a mixed prompt
+/// ([`crate::hybrid::HybridModel::embed_token_rows`]) use, so a text row of
+/// a multimodal prompt is bit-identical to the same token's row in a
+/// text-only one.
+///
+/// # Errors
+///
+/// [`ModelError::ShapeMismatch`] for an `out` that is not exactly
+/// `tokens.len() * hidden` long, plus the embedding lookup's and the
+/// transform's own errors (a token id past the vocabulary, a width the fold
+/// does not cover).
+pub(crate) fn embed_token_rows(
+    embedding: &HybridEmbedding<'_>,
+    hadamard: Option<&HadamardHook>,
+    tokens: &[u32],
+    hidden: usize,
+    out: &mut [f32],
+) -> ModelResult<()> {
+    let expected = tokens.len().saturating_mul(hidden);
+    if out.len() != expected {
+        return Err(ModelError::ShapeMismatch {
+            name: "embedded token rows".to_string(),
+            expected: vec![expected],
+            actual: vec![out.len()],
+        });
+    }
+    if hidden == 0 {
+        return Ok(());
+    }
+    for (&token, row) in tokens.iter().zip(out.chunks_exact_mut(hidden)) {
+        embedding.row(token, hidden, row)?;
+        if let Some(hook) = hadamard {
+            hook.inverse_embedding(row)?;
+        }
+    }
+    Ok(())
+}
+
+/// Run one chunk of `tokens` starting at absolute position `start_pos`,
+/// rotating token `t` at the text position `start_pos + t` — i.e.
+/// [`run_chunk_input`] with [`ChunkInput::Tokens`] and no M-RoPE offset.
+///
+/// # Errors
+///
+/// As [`run_chunk_input`].
+pub fn run_chunk(
+    ctx: &mut ForwardCtx<'_, '_>,
+    tokens: &[u32],
+    start_pos: usize,
+    logits: Option<&mut [f32]>,
+    dump: Option<&mut LayerDump>,
+) -> ModelResult<()> {
+    run_chunk_input(
+        ctx,
+        ChunkInput::Tokens {
+            tokens,
+            rope_start: start_pos,
+        },
+        start_pos,
+        logits,
+        dump,
+    )
+}
+
+/// Run one chunk whose first row sits at absolute sequence position
+/// `start_pos` (its KV slot and recurrent step; rotary positions come from
+/// `input`, see [`ChunkInput`]).
+///
+/// When `logits` is `Some`, the LM head is evaluated for the **last** row
 /// of the chunk only (the decode contract: a prefill does not need a logit
 /// row per prompt token, and materialising 512 × 248 320 f32 would be
 /// 508 MB). When `dump` is `Some`, every block's output is recorded
@@ -455,21 +752,32 @@ pub struct ForwardCtx<'m, 'a> {
 ///
 /// [`ModelError::PositionOutOfRange`] when the chunk would run past the KV
 /// window or the RoPE table, [`ModelError::ShapeMismatch`] for a
-/// wrong-sized `logits`, and anything the block bodies, the caches or the
-/// kernels return.
-pub fn run_chunk(
+/// wrong-sized `logits` or a [`ChunkInput::Rows`] whose `rows` are not
+/// `positions.len() * hidden` long, and anything the block bodies, the
+/// caches or the kernels return.
+pub fn run_chunk_input(
     ctx: &mut ForwardCtx<'_, '_>,
-    tokens: &[u32],
+    input: ChunkInput<'_>,
     start_pos: usize,
     logits: Option<&mut [f32]>,
     mut dump: Option<&mut LayerDump>,
 ) -> ModelResult<()> {
-    let t_len = tokens.len();
+    let t_len = input.len();
     if t_len == 0 {
         return Ok(());
     }
     let hidden = ctx.config.base.hidden_size;
     let vocab = ctx.config.base.vocab_size;
+    if let ChunkInput::Rows { rows, .. } = input {
+        let expected = t_len.saturating_mul(hidden);
+        if rows.len() != expected {
+            return Err(ModelError::ShapeMismatch {
+                name: "prefill rows".to_string(),
+                expected: vec![t_len, hidden],
+                actual: vec![rows.len()],
+            });
+        }
+    }
     let end_pos = start_pos
         .checked_add(t_len)
         .ok_or_else(|| ModelError::ShapeInvariant {
@@ -497,27 +805,42 @@ pub fn run_chunk(
 
     ctx.scratch.ensure(t_len);
 
-    // ── Embedding lookup + inverse rotation (design §3.5) ───────────────
-    for (t, &token) in tokens.iter().enumerate() {
-        let lo = t * hidden;
-        let row = ctx
-            .scratch
-            .resid
-            .get_mut(lo..lo + hidden)
-            .ok_or_else(|| scratch_short("resid", (t + 1) * hidden))?;
-        ctx.embedding.row(token, hidden, row)?;
-        if let Some(hook) = ctx.hadamard {
-            hook.inverse_embedding(row)?;
+    // ── What enters block 0 ──────────────────────────────────────────────
+    let rows_len = t_len * hidden;
+    let resid = ctx
+        .scratch
+        .resid
+        .get_mut(..rows_len)
+        .ok_or_else(|| scratch_short("resid", rows_len))?;
+    match input {
+        // Embedding lookup + inverse rotation (design §3.5).
+        ChunkInput::Tokens { tokens, .. } => {
+            embed_token_rows(ctx.embedding, ctx.hadamard, tokens, hidden, resid)?;
         }
+        // Verbatim: these rows are already in the basis block 0 reads, and
+        // rotating them again would silently corrupt every one of them.
+        ChunkInput::Rows { rows, .. } => resid.copy_from_slice(rows),
     }
     if let Some(dump) = dump.as_deref_mut() {
-        dump.tokens = tokens.to_vec();
+        match input {
+            ChunkInput::Tokens { tokens, rope_start } => {
+                dump.tokens = tokens.to_vec();
+                dump.rotary_positions = (rope_start..rope_start + t_len)
+                    .map(|p| MropePos::text(u32::try_from(p).unwrap_or(u32::MAX)))
+                    .collect();
+            }
+            ChunkInput::Rows { positions, .. } => {
+                dump.tokens.clear();
+                dump.rotary_positions = positions.to_vec();
+            }
+        }
         dump.start_pos = start_pos;
         dump.hidden = hidden;
-        dump.embedding = ctx.scratch.resid[..t_len * hidden].to_vec();
+        dump.embedding = ctx.scratch.resid[..rows_len].to_vec();
         dump.layers.clear();
         dump.layers.reserve(ctx.blocks.len());
     }
+    let rope = input.rope();
 
     // ── The stack ───────────────────────────────────────────────────────
     let n_blocks = ctx.blocks.len();
@@ -535,7 +858,7 @@ pub fn run_chunk(
                 actual: "out of range".to_string(),
             })?;
         if is_full {
-            crate::hybrid::block_full::forward_full_chunk(ctx, index, t_len, start_pos)?;
+            crate::hybrid::block_full::forward_full_chunk(ctx, index, t_len, start_pos, rope)?;
         } else {
             crate::hybrid::block_linear::forward_linear_chunk(ctx, index, t_len)?;
         }
@@ -1137,6 +1460,7 @@ mod tests {
     fn layer_dump_indexes_rows_by_layer_and_token_bonsai2() {
         let dump = LayerDump {
             tokens: vec![7, 8, 9],
+            rotary_positions: vec![MropePos::text(4), MropePos::text(5), MropePos::text(6)],
             start_pos: 4,
             hidden: 2,
             embedding: vec![0.0; 6],

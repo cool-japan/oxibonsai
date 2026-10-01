@@ -1,8 +1,16 @@
 //! Intermediate buffer set for the FFN pipeline, plus low-level allocation,
 //! upload/download, and dispatch helpers shared across the directory module.
+//!
+//! Allocation and every commit/wait helper here run inside an Objective-C
+//! [`autoreleasepool`]: whatever Metal autoreleases while a buffer is created
+//! or while a command buffer is committed, waited on and its error read is
+//! drained before the helper returns, instead of piling up on a calling
+//! thread that has no pool of its own.
 
+use metal::objc::rc::autoreleasepool;
 use metal::{Buffer, CommandBufferRef, Device, MTLCommandBufferStatus, MTLResourceOptions};
 use std::ffi::c_void;
+use std::time::{Duration, Instant};
 
 use super::error::MetalGraphError;
 
@@ -94,6 +102,11 @@ fn check_buffer_length(
 /// calling `Device::new_buffer` (see [`check_buffer_length`]); the
 /// post-hoc null/length checks below remain as belt-and-braces for any other
 /// allocation failure (e.g. transient GPU OOM under the limit).
+///
+/// `newBufferWithLength:options:` hands back an owned buffer; the allocation
+/// runs inside an [`autoreleasepool`] so nothing the driver autoreleases
+/// meanwhile outlives the call. The fused decode and prefill paths allocate
+/// their weight uploads, device KV caches and workspace buffers here.
 pub(crate) fn alloc_buf(
     device: &Device,
     byte_len: u64,
@@ -103,7 +116,7 @@ pub(crate) fn alloc_buf(
         return Err(MetalGraphError::BufferCreationFailed);
     }
     check_buffer_length(byte_len, device, "alloc_buf")?;
-    let buf = device.new_buffer(byte_len, opts);
+    let buf = autoreleasepool(|| device.new_buffer(byte_len, opts));
     // StorageModePrivate buffers have contents() == null by design
     if opts.contains(MTLResourceOptions::StorageModePrivate) {
         // For private buffers, just check length as a sanity proxy
@@ -188,23 +201,179 @@ pub(super) fn upload_bytes(device: &Device, data: &[u8]) -> Result<Buffer, Metal
 /// The caller must have already called `end_encoding()` on every encoder
 /// attached to `cmd`, and must not call `commit()` on `cmd` again after this
 /// returns (Metal command buffers are single-use).
+///
+/// # Autorelease pools
+///
+/// The commit, the wait and the `NSError` / `NSString` read of a failure run
+/// inside an [`autoreleasepool`] of their own. `cmd` itself and its encoders
+/// were autoreleased when the caller created them, so the caller must create,
+/// encode and hand `cmd` here inside one pool of its own as well.
 pub(crate) fn commit_and_wait(
     cmd: &CommandBufferRef,
     what: &'static str,
 ) -> Result<(), MetalGraphError> {
-    cmd.commit();
-    cmd.wait_until_completed();
-    let status = cmd.status();
-    let error = if status == MTLCommandBufferStatus::Completed {
-        None
-    } else {
-        // SAFETY: `wait_until_completed()` has already returned above, so
-        // the command buffer has reached a terminal state and reading its
-        // `error` property is safe (mirrors the GPUStartTime / GPUEndTime
-        // pattern at `metal_full_layer/functions.rs`).
-        unsafe { command_buffer_error_description(cmd) }
-    };
-    map_command_buffer_status(status, what, error)
+    autoreleasepool(|| {
+        cmd.commit();
+        cmd.wait_until_completed();
+        let status = cmd.status();
+        let error = if status == MTLCommandBufferStatus::Completed {
+            None
+        } else {
+            // SAFETY: `wait_until_completed()` has already returned above, so
+            // the command buffer has reached a terminal state and reading its
+            // `error` property is safe (mirrors the GPUStartTime / GPUEndTime
+            // pattern at `metal_full_layer/functions.rs`).
+            unsafe { command_buffer_error_description(cmd) }
+        };
+        map_command_buffer_status(status, what, error)
+    })
+}
+
+/// First poll interval of [`wait_bounded`]; doubled after every poll up to
+/// [`BOUNDED_WAIT_MAX_POLL`].
+const BOUNDED_WAIT_FIRST_POLL: Duration = Duration::from_micros(20);
+
+/// Longest sleep between two status polls of [`wait_bounded`]: the latency a
+/// bounded wait can add to a command buffer's completion. Every command
+/// buffer the batched prefill waits on is a micro-batch of whole-model work
+/// (tens of milliseconds at least on a real model), so 2 ms is noise.
+const BOUNDED_WAIT_MAX_POLL: Duration = Duration::from_millis(2);
+
+/// [`commit_and_wait`] with a deadline (M-18): commit `cmd`, then wait for it
+/// until `deadline`.
+///
+/// `-[MTLCommandBuffer waitUntilCompleted]` has no timeout, and Metal cannot
+/// cancel committed work, so a pathological batch prefill used to park the
+/// calling thread for as long as the GPU needed (a 4352-token Bonsai-8B
+/// prefill did not return within 900 s). This polls the command buffer's
+/// status instead and gives up at `deadline` with a **timeout**: a
+/// [`MetalGraphError::CommandBufferFailed`] whose `status` is still short of
+/// `Completed`/`Error` (see [`MetalGraphError::is_command_buffer_timeout`]).
+/// The command buffer keeps running after a timeout; the caller owns making
+/// sure nothing the CPU writes races it (the prefill runner parks it in the
+/// session and drains it before its buffers are reused).
+///
+/// A terminal status is mapped exactly as [`commit_and_wait`] maps it, and the
+/// same autorelease-pool contract applies.
+pub(crate) fn commit_and_wait_bounded(
+    cmd: &CommandBufferRef,
+    what: &'static str,
+    deadline: Instant,
+) -> Result<(), MetalGraphError> {
+    autoreleasepool(|| {
+        cmd.commit();
+        let forced = super::graph::take_forced_prefill_timeout();
+        wait_bounded(cmd, what, deadline, forced)
+    })
+}
+
+/// Wait for an already-committed `cmd` until `deadline` (see
+/// [`commit_and_wait_bounded`]).
+///
+/// `forced` reports a timeout right away, whatever the command buffer's
+/// progress — the deterministic fault-injection seam
+/// ([`super::MetalGraph::force_prefill_timeouts`]); the reported status is then
+/// `Committed` if the buffer happened to finish already, since a completed
+/// status would not read as the timeout being simulated.
+///
+/// The polls and the error read of a failure run inside an
+/// [`autoreleasepool`] of their own (see [`commit_and_wait`]).
+pub(crate) fn wait_bounded(
+    cmd: &CommandBufferRef,
+    what: &'static str,
+    deadline: Instant,
+    forced: bool,
+) -> Result<(), MetalGraphError> {
+    autoreleasepool(|| wait_bounded_unpooled(cmd, what, deadline, forced))
+}
+
+/// Body of [`wait_bounded`], run inside its pool.
+fn wait_bounded_unpooled(
+    cmd: &CommandBufferRef,
+    what: &'static str,
+    deadline: Instant,
+    forced: bool,
+) -> Result<(), MetalGraphError> {
+    let started = Instant::now();
+    let mut poll = BOUNDED_WAIT_FIRST_POLL;
+    loop {
+        let status = cmd.status();
+        if forced {
+            let status = match status {
+                MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error => {
+                    MTLCommandBufferStatus::Committed
+                }
+                pending => pending,
+            };
+            return Err(timeout_error(what, status, started.elapsed(), true));
+        }
+        if matches!(
+            status,
+            MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error
+        ) {
+            let error = if status == MTLCommandBufferStatus::Completed {
+                None
+            } else {
+                // SAFETY: the status is terminal, so the command buffer has
+                // finished and its `error` property is stable.
+                unsafe { command_buffer_error_description(cmd) }
+            };
+            return map_command_buffer_status(status, what, error);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(timeout_error(what, status, started.elapsed(), false));
+        }
+        std::thread::sleep(poll.min(deadline - now));
+        poll = (poll * 2).min(BOUNDED_WAIT_MAX_POLL);
+    }
+}
+
+/// The typed timeout a bounded wait reports: the command buffer's own,
+/// still-pending status, and how long the wait lasted.
+fn timeout_error(
+    what: &'static str,
+    status: MTLCommandBufferStatus,
+    waited: Duration,
+    forced: bool,
+) -> MetalGraphError {
+    MetalGraphError::CommandBufferFailed {
+        what,
+        status,
+        error: Some(format!(
+            "{} after {:.1} ms: the command buffer was still running at its deadline",
+            if forced {
+                "timed out (injected by force_prefill_timeouts)"
+            } else {
+                "timed out"
+            },
+            waited.as_secs_f64() * 1e3
+        )),
+    }
+}
+
+impl MetalGraphError {
+    /// Whether this is a bounded wait giving up on a command buffer that had
+    /// not finished (M-18): a [`MetalGraphError::CommandBufferFailed`] whose
+    /// status is still `NotEnqueued`/`Enqueued`/`Committed`/`Scheduled`.
+    ///
+    /// Only the bounded `commit_and_wait_bounded` produces such a status — an unbounded
+    /// wait always returns at a terminal one — so this is the typed signal a
+    /// caller falls back on (the sequential decode, for the batched prefill)
+    /// instead of treating the error as a GPU fault.
+    #[must_use]
+    pub fn is_command_buffer_timeout(&self) -> bool {
+        matches!(
+            self,
+            Self::CommandBufferFailed {
+                status: MTLCommandBufferStatus::NotEnqueued
+                    | MTLCommandBufferStatus::Enqueued
+                    | MTLCommandBufferStatus::Committed
+                    | MTLCommandBufferStatus::Scheduled,
+                ..
+            }
+        )
+    }
 }
 
 /// Map a terminal `MTLCommandBufferStatus` to `Ok(())` (only for

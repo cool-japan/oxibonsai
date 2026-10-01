@@ -96,6 +96,7 @@
 //! resolves to the process-default session again instead of dispatching into
 //! (or clearing the KV cache of) a replica that another thread is running.
 
+use metal::objc::rc::autoreleasepool;
 use metal::{CommandQueue, Device};
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -208,6 +209,11 @@ pub struct MetalDevice {
     /// workspace state, so making it per-session would make every new session
     /// pay its own `new_library_with_source` on first prefill.
     pub(crate) prefill_attn: Arc<OnceLock<Option<metal_prefill::attention::PrefillAttnPipelines>>>,
+    /// Lazily resolved tiled simdgroup Q1 prefill GEMM pipeline (M-18),
+    /// shared for the same reason as `prefill_attn`.
+    pub(crate) prefill_q1_tiled: Arc<OnceLock<Option<metal::ComputePipelineState>>>,
+    /// Its ternary twin (`gemm_tq2_g128_simdgroup`).
+    pub(crate) prefill_tq2_tiled: Arc<OnceLock<Option<metal::ComputePipelineState>>>,
     /// Lazy cache of GPU-resident weight buffers, keyed by
     /// [`WeightKey`] `{ model_epoch, kind, slot }` (`MET-02`).
     ///
@@ -241,10 +247,17 @@ unsafe impl Sync for MetalDevice {}
 
 impl MetalDevice {
     /// Open the system default device and compile every pipeline.
+    ///
+    /// Runs inside an [`autoreleasepool`]: opening the device and building
+    /// the pipelines autoreleases Objective-C strings and error objects,
+    /// which would otherwise stay on the opening thread for as long as it
+    /// lives.
     fn open() -> Result<Self, MetalGraphError> {
-        let device = Device::system_default().ok_or(MetalGraphError::DeviceNotFound)?;
-        let pipelines = Arc::new(MetalPipelines::compile(&device)?);
-        Ok(Self::with_pipelines(device, pipelines))
+        autoreleasepool(|| {
+            let device = Device::system_default().ok_or(MetalGraphError::DeviceNotFound)?;
+            let pipelines = Arc::new(MetalPipelines::compile(&device)?);
+            Ok(Self::with_pipelines(device, pipelines))
+        })
     }
 
     /// Assemble a device around an already-compiled pipeline set.
@@ -253,6 +266,8 @@ impl MetalDevice {
             device,
             pipelines,
             prefill_attn: Arc::new(OnceLock::new()),
+            prefill_q1_tiled: Arc::new(OnceLock::new()),
+            prefill_tq2_tiled: Arc::new(OnceLock::new()),
             weight_cache: Mutex::new(WeightCache::new()),
             gemm_io_pool: Mutex::new(None),
             joint_attn_pool: Mutex::new(None),
@@ -304,8 +319,12 @@ impl MetalDevice {
     }
 
     /// Create a fresh command queue on this device (one per session).
+    ///
+    /// The queue itself is owned; what the driver autoreleases while it sets
+    /// the queue up is drained here, since a request-scoped session (the
+    /// hidden-state prefill) creates one per request.
     fn new_command_queue(&self) -> CommandQueue {
-        self.device.new_command_queue()
+        autoreleasepool(|| self.device.new_command_queue())
     }
 
     /// Lock the weight cache, mapping a poisoned mutex to an error.
@@ -384,12 +403,16 @@ impl MetalGraph {
         let device = shared.device.clone();
         let pipelines = Arc::clone(&shared.pipelines);
         let prefill_attn = Arc::clone(&shared.prefill_attn);
+        let prefill_q1_tiled = Arc::clone(&shared.prefill_q1_tiled);
+        let prefill_tq2_tiled = Arc::clone(&shared.prefill_tq2_tiled);
         shared.live_sessions.fetch_add(1, Ordering::Relaxed);
         Self {
             device,
             command_queue,
             pipelines,
             prefill_attn,
+            prefill_q1_tiled,
+            prefill_tq2_tiled,
             session_id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
             owner_thread: AtomicU64::new(0),
             shared,
@@ -399,6 +422,8 @@ impl MetalGraph {
             logits_buf: Mutex::new(None),
             token_id_buf: Mutex::new(None),
             prefill_buffers: Mutex::new(None),
+            prefill_inflight: Mutex::new(None),
+            prefill_runs: AtomicU64::new(0),
         }
     }
 
@@ -453,6 +478,28 @@ impl MetalGraph {
     #[must_use]
     pub fn new_session_on(device: &Arc<MetalDevice>) -> Arc<Self> {
         Arc::new(Self::from_shared(Arc::clone(device)))
+    }
+
+    /// A new, unbound session on **this** session's device — the same
+    /// `MTLDevice`, compiled pipelines and weight cache (so every weight this
+    /// session has resident is resident for it too), but its own command
+    /// queue and its own, empty device KV cache and prefill workspace.
+    ///
+    /// This is the request-scoped workspace of a pass that must not touch the
+    /// KV cache of whatever is decoding in this session (MET-05): the batched
+    /// hidden-state prefill of an embedding request runs in one and drops it
+    /// on return, which frees its KV cache.
+    #[must_use]
+    pub fn new_sibling_session(&self) -> Arc<Self> {
+        Arc::new(Self::from_shared(Arc::clone(&self.shared)))
+    }
+
+    /// Sessions currently alive on **this** session's device (itself
+    /// included) — the per-device twin of [`Self::live_session_count`], which
+    /// counts only the process-shared device.
+    #[must_use]
+    pub fn sessions_on_this_device(&self) -> usize {
+        self.shared.live_sessions.load(Ordering::Relaxed)
     }
 
     /// The process-default session, created on first use.
@@ -681,7 +728,7 @@ impl MetalGraph {
     /// device KV cache is 604 MB for the 8B at `ctx = 4096`, and a Q1 replica
     /// additionally carries its own copy of the weights until the engine seam
     /// shares them (module docs, *Sizing reality*), so the default is
-    /// deliberately small ([`DEFAULT_MAX_SESSIONS`]). Override with the
+    /// deliberately small (`DEFAULT_MAX_SESSIONS`, 4). Override with the
     /// `OXIBONSAI_METAL_MAX_SESSIONS` environment variable.
     #[must_use]
     pub fn max_sessions() -> usize {
@@ -955,10 +1002,13 @@ impl MetalGraph {
     /// Returns [`MetalGraphError::ExecutionFailed`] if the KV-cache lock is
     /// poisoned.
     pub fn clear_kv_cache(&self) -> Result<(), MetalGraphError> {
-        *self
+        let mut guard = self
             .kv_cache
             .lock()
-            .map_err(|_| MetalGraphError::ExecutionFailed("kv_cache lock poisoned".into()))? = None;
+            .map_err(|_| MetalGraphError::ExecutionFailed("kv_cache lock poisoned".into()))?;
+        // The buffers are released inside a pool: nothing their release
+        // autoreleases outlives the reset that frees them.
+        autoreleasepool(|| *guard = None);
         Ok(())
     }
 

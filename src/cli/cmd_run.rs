@@ -21,6 +21,7 @@
 
 use oxibonsai_runtime::config::RenderMessage;
 use oxibonsai_runtime::sampling::{PenaltyParams, SamplingParams};
+use oxibonsai_runtime::vision_prefill::{ChatPrompt, RenderContentPart};
 
 use super::args;
 use super::bonsai2;
@@ -247,7 +248,8 @@ pub(crate) struct RunArgs {
     pub(crate) hide_reasoning: bool,
     pub(crate) ptq1_transcode: bool,
     pub(crate) prefill_chunk: Option<usize>,
-    /// §5.7 vision flags: validated, then a typed `NOT_YET_SUPPORTED`.
+    /// §5.7 vision flags: `--mmproj` loads the projector, every `--image`
+    /// is encoded into the (chat-rendered) prompt.
     pub(crate) vision: bonsai2::VisionRequest,
     pub(crate) allow_vocab_mismatch: bool,
     pub(crate) no_stream: bool,
@@ -325,7 +327,10 @@ pub(crate) fn run(args: RunArgs) -> anyhow::Result<()> {
             anyhow::anyhow!("no model: pass --model <gguf> or set OXI_MODEL (e.g. in .env)")
         })?;
 
-    vision.reject_until_supported()?;
+    vision.validate(true)?;
+    // An image is a part of a chat turn (the template places its
+    // placeholder), so `--image` implies the chat contract.
+    let chat = chat || !vision.images.is_empty();
     let contract = ChatContract::from_flags(enable_thinking, reasoning_effort, tools.as_deref())?;
     let (display, display_explicit) = ReasoningDisplay::from_flags(show_reasoning, hide_reasoning);
     require_chat_for_contract_flags(chat, &contract, display_explicit)?;
@@ -353,6 +358,14 @@ pub(crate) fn run(args: RunArgs) -> anyhow::Result<()> {
         max_seq_len,
         rope_scaling,
     )?;
+    // The vision projector (design §6.2), before any language-model weight
+    // is bound: a wrong architecture or a variant projector fails fast.
+    let vision_service = vision.load_service(&arch, bonsai2::cli_image_policy())?;
+    if vision_service.is_some() && vision.images.is_empty() {
+        tracing::warn!(
+            "--mmproj without --image: the projector is loaded but the prompt has no image"
+        );
+    }
     let sampling = resolve_sampling(temperature, top_k, top_p, min_p, &gguf.metadata)?;
     tracing::info!(
         temperature = sampling.temperature,
@@ -412,7 +425,7 @@ pub(crate) fn run(args: RunArgs) -> anyhow::Result<()> {
             }
             let rendered = generate::render_prompt(
                 &template,
-                &[RenderMessage::new("user", prompt_text.as_str())],
+                &[user_turn(prompt_text.as_str(), vision.images.len())],
                 &contract,
             )?;
             (
@@ -455,9 +468,21 @@ pub(crate) fn run(args: RunArgs) -> anyhow::Result<()> {
         presence_penalty,
     )?;
 
-    tracing::info!(prompt_tokens = prompt_tokens.len(), "prefilling");
+    // SV-11 / design §6.2: each `--image` encoded and spliced in place of
+    // its `<|image_pad|>`; a text-only prompt stays its token ids.
+    let prompt = multimodal_prompt(
+        prompt_tokens,
+        &vision,
+        vision_service.as_deref(),
+        engine.max_context(),
+    )?;
+    tracing::info!(
+        prompt_tokens = prompt.len(),
+        images = prompt.image_count(),
+        "prefilling"
+    );
     let start = std::time::Instant::now();
-    let prompt_len = prompt_tokens.len();
+    let prompt_len = prompt.len();
     // Clamp the budget to what the
     // context window has left, on every decode path alike, instead of
     // crashing once decode reaches `--ctx`. A prompt that alone overflows
@@ -468,7 +493,7 @@ pub(crate) fn run(args: RunArgs) -> anyhow::Result<()> {
         let mut printer = TokenPrinter::new(tok_bridge.as_ref(), started_in_think, display, false);
         let count = run_constrained_or_stopped(
             &mut engine,
-            &prompt_tokens,
+            &prompt,
             max_tokens,
             grammar.as_deref(),
             &stop,
@@ -491,13 +516,8 @@ pub(crate) fn run(args: RunArgs) -> anyhow::Result<()> {
         // token-for-token identical to the CLI's former sampler loop
         // (`min_p_engine_path_matches_the_cli_loop`), so every sampled
         // request routes through it uniformly now.
-        let count = run_engine_generation(
-            &mut engine,
-            &prompt_tokens,
-            max_tokens,
-            no_stream,
-            &mut printer,
-        )?;
+        let count =
+            run_engine_generation(&mut engine, &prompt, max_tokens, no_stream, &mut printer)?;
         printer.finish(None);
         count
     };
@@ -532,14 +552,68 @@ pub(crate) fn run(args: RunArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The user turn of a `run` prompt: the prompt text alone, or — with
+/// `images` images — the images as content parts ahead of the text (the
+/// order the reference's examples and the golden requests use).
+pub(crate) fn user_turn(prompt_text: &str, images: usize) -> RenderMessage {
+    if images == 0 {
+        return RenderMessage::new("user", prompt_text);
+    }
+    let mut parts: Vec<RenderContentPart> = (0..images).map(|_| RenderContentPart::Image).collect();
+    parts.push(RenderContentPart::Text(prompt_text.to_string()));
+    RenderMessage::with_parts("user", parts)
+}
+
+/// The prompt to generate from: `tokens` as they are when no image was
+/// given, else every `--image` encoded by `service` and spliced in place of
+/// its `<|image_pad|>` (design §6.2).
+///
+/// The images are prepared (resolved, decoded, resized) first and the
+/// expanded prompt checked against `max_context` BEFORE the tower encodes
+/// anything, so an image that cannot fit costs no encode.
+///
+/// # Errors
+///
+/// An image that cannot be prepared or encoded, a rendered prompt whose
+/// placeholders do not match the images (`[<code>] ...`), or an expanded
+/// prompt longer than `max_context`.
+pub(crate) fn multimodal_prompt(
+    tokens: Vec<u32>,
+    vision: &bonsai2::VisionRequest,
+    service: Option<&oxibonsai_runtime::vision_prefill::VisionService>,
+    max_context: usize,
+) -> anyhow::Result<ChatPrompt> {
+    let Some(service) = service.filter(|_| !vision.images.is_empty()) else {
+        return Ok(ChatPrompt::Text(tokens));
+    };
+    let prepared = vision.prepare_images(service)?;
+    let grids: Vec<oxibonsai_model::vision::GridSize> = prepared.iter().map(|p| p.grid).collect();
+    // Strict: every image needs its placeholder (a template that dropped
+    // the image parts is refused here, before any encode).
+    let rows = oxibonsai_model::vision::plan_splice(&tokens, &grids, service.token_ids())
+        .map_err(|e| anyhow::anyhow!("[{}] {e}", e.code()))?
+        .total_rows();
+    if rows > max_context {
+        anyhow::bail!(
+            "sequence length {rows} (the prompt with its image rows) exceeds max context \
+             {max_context}: the prompt alone does not fit; lower --image-max-tokens or raise --ctx"
+        );
+    }
+    let images = vision.encode_prepared(service, &prepared)?;
+    oxibonsai_runtime::vision_prefill::MultimodalPrompt::new(tokens, images, service.token_ids())
+        .map(ChatPrompt::Multimodal)
+        .map_err(|e| anyhow::anyhow!("[{}] {e}", e.code()))
+}
+
 /// The engine's own decode loop — `generate_streaming_sync` on a worker
-/// thread (tokens printed as they arrive), or `generate` with `--no-stream`.
-/// Either routes a greedy, penalty-free request through the GPU argmax only
-/// when the engine itself says it is eligible (a fused-Metal GPU-tier
-/// engine; never under `--backend cpu`, never for a hybrid model).
+/// thread (tokens printed as they arrive), or `generate` with `--no-stream`
+/// (the multimodal forms for a prompt with images). Either routes a greedy,
+/// penalty-free text request through the GPU argmax only when the engine
+/// itself says it is eligible (a fused-Metal GPU-tier engine; never under
+/// `--backend cpu`, never for a hybrid model).
 pub(crate) fn run_engine_generation(
     engine: &mut oxibonsai_runtime::InferenceEngine<'_>,
-    prompt_tokens: &[u32],
+    prompt: &ChatPrompt,
     max_tokens: usize,
     no_stream: bool,
     printer: &mut TokenPrinter<'_>,
@@ -548,7 +622,7 @@ pub(crate) fn run_engine_generation(
         tracing::info!("greedy request on a fused-Metal GPU-tier engine: GPU argmax decode");
     }
     if no_stream {
-        let tokens = engine.generate(prompt_tokens, max_tokens)?;
+        let tokens = prompt.generate(engine, max_tokens)?;
         for &token in &tokens {
             printer.push(token)?;
         }
@@ -558,7 +632,7 @@ pub(crate) fn run_engine_generation(
     std::thread::scope(|s| -> anyhow::Result<usize> {
         let thread_tx = tx.clone();
         let gen_handle =
-            s.spawn(move || engine.generate_streaming_sync(prompt_tokens, max_tokens, &thread_tx));
+            s.spawn(move || prompt.generate_streaming_sync(engine, max_tokens, &thread_tx));
         drop(tx);
         let mut count = 0usize;
         for token_id in rx {
@@ -789,7 +863,7 @@ pub(crate) struct ConstrainedSampling {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_constrained_or_stopped(
     engine: &mut oxibonsai_runtime::InferenceEngine<'_>,
-    prompt_tokens: &[u32],
+    prompt: &ChatPrompt,
     max_tokens: usize,
     grammar_path: Option<&str>,
     stop: &[String],
@@ -800,7 +874,7 @@ pub(crate) fn run_constrained_or_stopped(
     let grammar = grammar_path.map(load_grammar).transpose()?;
     run_constrained_or_stopped_with(
         engine,
-        prompt_tokens,
+        prompt,
         max_tokens,
         grammar.as_ref(),
         stop,
@@ -816,7 +890,7 @@ pub(crate) fn run_constrained_or_stopped(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_constrained_or_stopped_with(
     engine: &mut oxibonsai_runtime::InferenceEngine<'_>,
-    prompt_tokens: &[u32],
+    prompt: &ChatPrompt,
     max_tokens: usize,
     grammar: Option<&oxibonsai_runtime::Grammar>,
     stop: &[String],
@@ -826,8 +900,8 @@ pub(crate) fn run_constrained_or_stopped_with(
     interrupted: &dyn Fn() -> bool,
 ) -> anyhow::Result<usize> {
     engine.reset();
-    let prompt_len = prompt_tokens.len();
-    let mut logits = engine.prefill_from_pos(prompt_tokens, 0)?;
+    let prompt_len = prompt.len();
+    let mut logits = prompt.prefill(engine)?;
 
     let mut constrained = grammar.map(|grammar| {
         build_constrained_sampler_from_grammar(

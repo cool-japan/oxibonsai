@@ -227,66 +227,193 @@ fn explicit_no_think_closes_the_block_the_default_leaves_open() {
     assert!(!prompt_opens_think_block(&off));
 }
 
-// ── §5.7 vision flags: validate, then typed NOT_YET_SUPPORTED ───────────────
+// ── §5.7 vision flags: validation, projector loading, image preparation ────
 
 fn scratch(tag: &str) -> std::path::PathBuf {
     crate::cli::test_fixtures::scratch_dir(&format!("bonsai2_{tag}"))
 }
 
+/// A `clip` GGUF with metadata only: it passes the flag validation (which
+/// checks the architecture) but carries no tower.
+fn metadata_only_projector(dir: &std::path::Path) -> String {
+    let projector = dir.join("mmproj_metadata_only.gguf");
+    let mut w = GgufWriter::new();
+    w.add_metadata(
+        "general.architecture",
+        MetadataWriteValue::Str("clip".to_string()),
+    );
+    std::fs::write(&projector, w.to_bytes().expect("serialize")).expect("write");
+    projector.to_string_lossy().into_owned()
+}
+
+/// The test kit's tiny synthetic Qwen3-VL projector (projection width 80),
+/// written to `dir`.
+pub(crate) fn synthetic_projector(dir: &std::path::Path) -> String {
+    use oxibonsai_testkit::mmproj_fixture::{synthetic_mmproj_gguf, MmprojFixtureSpec};
+    let bytes = synthetic_mmproj_gguf(&MmprojFixtureSpec::tiny()).expect("synthetic projector");
+    let path = dir.join("mmproj_tiny.gguf");
+    std::fs::write(&path, bytes).expect("write");
+    path.to_string_lossy().into_owned()
+}
+
+/// A 256 x 192 RGB PNG (red = x, green = a vertical ramp, a blue
+/// checkerboard of 32-pixel squares): the Bonsai 2 vision golden's geometry,
+/// so a 6 x 8 merged grid at the default budget. Embedded because the
+/// repository ignores `*.png` files.
+pub(crate) const PATTERN_PNG_DATA_URI: &str =
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAQAAAADACAIAAABkjyoxAAAEY0lEQVR42u3TYasYAhiG4XOE\
+kK1ZsxDLNBqhEWIhxEKjTZtM6NAmhNAmZEIj1ohlQugQi4XQaIQQQrNMJtNoNGKxEEKT/Yh1Pt1XvZ/frp66BwcGhgYHBkbyThrh\
+/2/z82/HDQqAv+zfQQD8Zf+OAuAv+3cSAH/Zv7MA+Mv+XQTAX/bvKgD+sn83AfCX/bsLgL/sHyUA/rJ/tAD4y/4xAuAv+/cQAH/Z\
+P1YA/GX/OAHwl/17CoC/7B8vAP6yfy8B8Jf9ewuAv+zfRwD8Zf++AuAv+/cTAH/ZP0EA/GX//gLgL/snCoC/7D9AAPxl/yQB8Jf9\
+BwqAv+w/SAD8Zf9kAfCX/QcLgL/sP2TYQPxh/6EC4C/7DxMAf9l/uAD4y/4pAuAv+48QAH/Zf6QA+Mv+owTAX/YfLQD+sv8YAfCX\
+/ccKgL/sP04A/GX/VAHwl/3HC4C/7D9BAPxl/4kC4E/7BcBf9p8sAP6y/xQB8Jf9pwqAv+w/TQD8Zf80AfCX/acLgL/sP0MA/GX/\
+mQLgL/unC4C/7D9LAPxl/9kC4C/7ZwiAv+yfKQD+sv8cAfCX/bMEwF/2zx4yEH/Yf64A+Mv+8wTAX/bPEQB/2X++APjL/gsEwF/2\
+XygA/rL/IgHwl/1DAuAv+y8WAH/Zf4kA+Mv+uQLgL/vnCYC/7L9UAPxl/2UC4C/7LxcAf9l/hQD4y/4rBcBf9l8lAP6y/2oB8Jf9\
+1wiAv+y/VgD8Zf91AuAv++cLgL/sXyAA/rL/egHwl/03CIC/7L9RAPxl/00C4C/7bxYAf9m/UAD8Zf8tAuAv+28dNhB/2H+bAPjL\
+/tsFwF/2LxIAf9l/hwD4y/47BcBf9t8lAP6y/24B8Jf9iwXAX/YvEQB/2X+PAPjL/nsFwF/23ycA/rL/fgHwl/1LBcBf9j8gAP6y\
+f5kA+Mv+BwXAX/Y/JAD+sv9hAfCX/Y8IgL/sf1QA/GX/YwLgL/sfFwB/2T8sAP6y/wkB8Jf9TwqAv+x/SgD8Zf/TAuAv+5cLgL/s\
+f0YA/GX/swLgL/tXDBmIP+x/TgD8Zf/zAuAv+18QAH/Z/6IA+Mv+lwTAX/a/LAD+sn+lAPjL/lcEwF/2vyoA/rJ/lQD4y/7XBMBf\
+9r8uAP6y/w0B8Jf9bwqAv+x/SwD8ab8A+Mv+dwTAX/a/KwD+sv89AfCX/e8LgL/s/0AA/GX/hwLgL/s/EgB/2f+xAPjL/tUC4C/7\
+PxEAf9m/RgD8Zf+nAuAv+9cKgL/s/0wA/GX/5wLgL/vXDRuIP+z/QgD8Zf+XAuAv+9cLgL/s/0oA/GX/BgHwl/1fC4C/7P9GAPxl\
+/0YB8Jf93wqAv+z/TgD8Zf8mAfCX/d8LgL/s/0EA/GX/jwLgL/t/EgB/2b9ZAPxl/88C4C/7fxEAf9m/RQD8Zf+vAuAv+38TAH/Z\
+/7sA+Mv+PwTAX/b/KQD+sv8vAfCX/X8LgL/s/0cA/GX/vwLgL/u3CoC/7P9PAPxl//8C4O/6twGhXx9+85z8hQAAAABJRU5ErkJggg==";
+
+/// [`PATTERN_PNG_DATA_URI`] written to `dir` as a PNG file (the `--image
+/// <path>` form).
+pub(crate) fn pattern_png_file(dir: &std::path::Path) -> String {
+    let bytes = oxibonsai_model::vision::load_image_bytes(
+        PATTERN_PNG_DATA_URI,
+        &oxibonsai_model::vision::ImageSourcePolicy::local_user(),
+    )
+    .expect("the embedded PNG decodes from base64");
+    let path = dir.join("pattern_256x192.png");
+    std::fs::write(&path, bytes).expect("write the test image");
+    path.to_string_lossy().into_owned()
+}
+
+/// A 1 x 4000 8-bit grayscale PNG: too elongated for any small budget
+/// without distorting its aspect ratio.
+const STRIP_PNG_DATA_URI: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAA+gCAAAAAAedin3\
+                                  AAAAH0lEQVR42u3CAQkAAAACoKY3vSGJpgEAAAAAAACAewNGt9Bqp3bDOgAAAABJRU5ErkJggg==";
+
+fn with_projector(mmproj: &str, images: &[&str], budget: Option<usize>) -> VisionRequest {
+    VisionRequest {
+        mmproj: Some(mmproj.to_string()),
+        images: images.iter().map(|s| s.to_string()).collect(),
+        image_max_tokens: budget,
+    }
+}
+
 #[test]
 fn no_vision_flags_is_a_noop() {
-    VisionRequest::default()
-        .reject_until_supported()
-        .expect("nothing to refuse");
+    let request = VisionRequest::default();
+    assert!(request.is_empty());
+    request
+        .validate(true)
+        .expect("nothing to check for run/chat");
+    request.validate(false).expect("nothing to check for serve");
+    assert!(request
+        .load_service("qwen35", cli_image_policy())
+        .expect("no projector requested")
+        .is_none());
+    assert_eq!(request.effective_image_max_tokens(), 1024);
 }
 
 #[test]
-fn an_image_url_is_validated_then_refused_with_the_typed_code() {
+fn an_image_without_mmproj_is_refused_naming_the_missing_flag() {
     let request = VisionRequest {
-        images: vec!["https://example.com/cat.png".to_string()],
+        images: vec!["cat.png".to_string()],
         ..VisionRequest::default()
     };
     let msg = request
-        .reject_until_supported()
-        .expect_err("vision is not supported yet")
+        .validate(true)
+        .expect_err("no projector")
         .to_string();
-    assert!(msg.starts_with("[NOT_YET_SUPPORTED]"), "{msg}");
-    assert!(msg.contains("vision tower"), "{msg}");
-    assert!(
-        msg.contains("1024"),
-        "names the default image budget: {msg}"
-    );
+    assert!(msg.contains("--image needs the vision projector"), "{msg}");
+    assert!(msg.contains("--mmproj"), "{msg}");
 }
 
 #[test]
-fn a_missing_image_file_is_a_validation_error_not_the_typed_refusal() {
-    let dir = scratch("missing_image");
-    let missing = dir.join("nope.png");
-    let request = VisionRequest {
-        images: vec![missing.to_string_lossy().into_owned()],
-        ..VisionRequest::default()
-    };
-    let msg = request
-        .reject_until_supported()
-        .expect_err("missing file")
-        .to_string();
-    let _ = std::fs::remove_dir_all(&dir);
-    assert!(!msg.contains(NOT_YET_SUPPORTED), "{msg}");
-    assert!(msg.contains("--image"), "{msg}");
-}
-
-#[test]
-fn an_explicit_image_max_tokens_alone_is_refused_with_the_typed_code() {
+fn an_image_max_tokens_without_mmproj_is_refused_as_a_silent_no_op() {
     let request = VisionRequest {
         image_max_tokens: Some(512),
         ..VisionRequest::default()
     };
     let msg = request
-        .reject_until_supported()
-        .expect_err("refused")
+        .validate(true)
+        .expect_err("no projector")
         .to_string();
-    assert!(msg.starts_with("[NOT_YET_SUPPORTED]"), "{msg}");
-    assert!(msg.contains("512"), "{msg}");
+    assert!(msg.contains("--image-max-tokens has no effect"), "{msg}");
+    assert!(msg.contains("--mmproj"), "{msg}");
+}
+
+#[test]
+fn the_image_budget_must_be_in_range() {
+    let dir = scratch("budget");
+    let mmproj = metadata_only_projector(&dir);
+    for bad in [0usize, 16_385] {
+        let msg = with_projector(&mmproj, &[], Some(bad))
+            .validate(true)
+            .expect_err("out of range")
+            .to_string();
+        assert!(msg.contains("1..=16384"), "{bad}: {msg}");
+    }
+    for good in [1usize, 1024, 16_384] {
+        with_projector(&mmproj, &[], Some(good))
+            .validate(true)
+            .expect("in range");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_remote_image_url_is_refused_with_its_typed_code() {
+    let dir = scratch("remote");
+    let mmproj = metadata_only_projector(&dir);
+    let url = "https://example.com/cat.png";
+    let msg = with_projector(&mmproj, &[url], None)
+        .validate(true)
+        .expect_err("never fetched")
+        .to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(msg.starts_with("[image_url_fetch_disabled]"), "{msg}");
+    assert!(msg.contains("--image https://example.com/cat.png"), "{msg}");
+    assert!(msg.contains("server-side request forgery"), "{msg}");
+
+    // The operator opt-in changes the reason, never the outcome.
+    let mut opted_in = cli_image_policy();
+    opted_in.allow_remote_fetch = true;
+    let msg = validate_image_ref(url, &opted_in)
+        .expect_err("still never fetched")
+        .to_string();
+    assert!(msg.starts_with("[image_url_fetch_disabled]"), "{msg}");
+    assert!(msg.contains("no image fetcher"), "{msg}");
+}
+
+#[test]
+fn a_missing_image_file_is_refused_naming_the_flag() {
+    let dir = scratch("missing_image");
+    let mmproj = metadata_only_projector(&dir);
+    let missing = dir.join("nope.png").to_string_lossy().into_owned();
+    let msg = with_projector(&mmproj, &[missing.as_str()], None)
+        .validate(true)
+        .expect_err("missing file")
+        .to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(msg.contains("--image"), "{msg}");
+    assert!(msg.contains("cannot read"), "{msg}");
+}
+
+#[test]
+fn an_invalid_data_uri_is_refused_with_its_typed_code() {
+    let dir = scratch("data_uri");
+    let mmproj = metadata_only_projector(&dir);
+    let msg = with_projector(&mmproj, &["data:image/png;base64,@@@@"], None)
+        .validate(true)
+        .expect_err("not base64")
+        .to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(msg.starts_with("[image_data_uri_invalid]"), "{msg}");
 }
 
 #[test]
@@ -299,28 +426,139 @@ fn mmproj_must_be_a_clip_gguf() {
         ..VisionRequest::default()
     };
     let msg = request
-        .reject_until_supported()
+        .validate(true)
         .expect_err("not a projector")
         .to_string();
     assert!(msg.contains("expected 'clip'"), "{msg}");
 
-    let projector = dir.join("mmproj.gguf");
-    let mut w = GgufWriter::new();
-    w.add_metadata(
-        "general.architecture",
-        MetadataWriteValue::Str("clip".to_string()),
-    );
-    std::fs::write(&projector, w.to_bytes().expect("serialize")).expect("write");
-    let request = VisionRequest {
-        mmproj: Some(projector.to_string_lossy().into_owned()),
-        ..VisionRequest::default()
-    };
-    let msg = request
-        .reject_until_supported()
-        .expect_err("valid projector, still not supported")
+    let projector = metadata_only_projector(&dir);
+    with_projector(&projector, &[], None)
+        .validate(true)
+        .expect("a clip GGUF passes the flag validation");
+    // ...but a projector without the tower's tensors is refused at load,
+    // with the file named.
+    let msg = with_projector(&projector, &[], None)
+        .load_service("qwen35", cli_image_policy())
+        .expect_err("no tower in the file")
         .to_string();
     let _ = std::fs::remove_dir_all(&dir);
-    assert!(msg.starts_with("[NOT_YET_SUPPORTED]"), "{msg}");
+    assert!(msg.contains("--mmproj"), "{msg}");
+}
+
+#[test]
+fn serve_refuses_the_image_flag() {
+    let dir = scratch("serve_image");
+    let mmproj = metadata_only_projector(&dir);
+    let png = pattern_png_file(&dir);
+    let msg = with_projector(&mmproj, &[png.as_str()], None)
+        .validate(false)
+        .expect_err("a server takes images from requests")
+        .to_string();
+    with_projector(&mmproj, &[], None)
+        .validate(false)
+        .expect("--mmproj alone is how serve enables vision");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(msg.contains("image_url"), "{msg}");
+}
+
+#[test]
+fn the_projector_serves_only_a_qwen35_language_model() {
+    let dir = scratch("projector_arch");
+    let mmproj = synthetic_projector(&dir);
+    let msg = with_projector(&mmproj, &[], None)
+        .load_service("qwen3", cli_image_policy())
+        .expect_err("not a Bonsai 2 model")
+        .to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(msg.contains("`qwen35`"), "{msg}");
+    assert!(msg.contains("'qwen3'"), "{msg}");
+}
+
+#[test]
+fn a_synthetic_projector_prepares_and_encodes_a_png_file_and_a_data_uri() {
+    let dir = scratch("projector_encode");
+    let mmproj = synthetic_projector(&dir);
+    let png = pattern_png_file(&dir);
+    let request = with_projector(&mmproj, &[png.as_str()], None);
+    request.validate(true).expect("valid flags");
+    let service = request
+        .load_service("qwen35", cli_image_policy())
+        .expect("the tiny projector loads")
+        .expect("a projector was requested");
+    assert_eq!(service.preprocess().max_tokens, 1024);
+
+    let prepared = request.prepare_images(&service).expect("prepare");
+    assert_eq!(prepared.len(), 1);
+    assert_eq!(
+        (prepared[0].grid.h, prepared[0].grid.w),
+        (6, 8),
+        "256 x 192 is already on the 32-pixel grid"
+    );
+    assert_eq!(prepared[0].source, (256, 192));
+
+    let encoded = request
+        .encode_prepared(&service, &prepared)
+        .expect("encode");
+    assert_eq!(encoded.len(), 1);
+    assert_eq!(encoded[0].grid, prepared[0].grid);
+    let projection = service.tower().config().projection_dim;
+    assert_eq!(encoded[0].rows.len(), 48 * projection);
+    assert!(encoded[0].rows.iter().all(|v| v.is_finite()));
+
+    // The same pixels as a data URI encode to the same rows, bit for bit.
+    let as_uri = with_projector(&mmproj, &[PATTERN_PNG_DATA_URI], None);
+    as_uri
+        .validate(true)
+        .expect("a data URI is a valid --image");
+    let from_uri = as_uri
+        .encode_prepared(&service, &as_uri.prepare_images(&service).expect("prepare"))
+        .expect("encode");
+    let _ = std::fs::remove_dir_all(&dir);
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(from_uri[0].grid, encoded[0].grid);
+    assert_eq!(bits(&from_uri[0].rows), bits(&encoded[0].rows));
+}
+
+#[test]
+fn an_image_that_cannot_fit_the_budget_is_refused_with_its_typed_code() {
+    let dir = scratch("projector_budget");
+    let mmproj = synthetic_projector(&dir);
+    let request = with_projector(&mmproj, &[STRIP_PNG_DATA_URI], Some(8));
+    let service = request
+        .load_service("qwen35", cli_image_policy())
+        .expect("loads")
+        .expect("requested");
+    let msg = request
+        .prepare_images(&service)
+        .expect_err("a 1 x 4000 strip cannot keep its aspect in 8 tokens")
+        .to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(msg.starts_with("[image_too_many_tokens]"), "{msg}");
+    assert!(msg.contains("--image data:image/png;base64,"), "{msg}");
+    assert!(
+        msg.len() < 1024,
+        "a data URI is shortened in the message: {msg}"
+    );
+}
+
+#[test]
+fn prompt_rows_expands_each_placeholder_to_its_image_rows() {
+    let ids = oxibonsai_model::vision::VisionTokenIds::BONSAI2;
+    let grid = oxibonsai_model::vision::GridSize { h: 6, w: 8 };
+    let text = [1u32, 2, 3];
+    assert_eq!(prompt_rows(&text, &[grid], ids).expect("text only"), 3);
+    let with_image = [1u32, ids.vision_start, ids.image_pad, ids.vision_end, 2];
+    assert_eq!(
+        prompt_rows(&with_image, &[grid], ids).expect("one image"),
+        5 - 1 + 48
+    );
+    let msg = prompt_rows(&with_image, &[grid, grid], ids)
+        .expect_err("one placeholder, two images")
+        .to_string();
+    assert!(
+        msg.starts_with("[image_placeholder_count_mismatch]"),
+        "{msg}"
+    );
 }
 
 #[test]

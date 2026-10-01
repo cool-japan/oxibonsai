@@ -1364,8 +1364,11 @@ pub(in crate::model::types) fn load_average() -> String {
 /// measurement taken is 3.26x–4.74x or better), so keeping it preserves a
 /// guarantee rather than weakening one.
 ///
-/// Ignored by default (it needs a multi-hundred-MB model file and a real
-/// CPU); the absolute numbers it prints are the record.
+/// Needs a multi-hundred-MB model file and a real CPU; resolves it from
+/// `OXI_MODEL` when set, else the testkit `models/`/`$OXIBONSAI_MODELS_DIR`
+/// fallback (defaulting to `Ternary-Bonsai-1.7B.gguf`), and self-skips with
+/// a `Capability::LegacyModels` record when neither locates one. The
+/// absolute numbers it prints are the record.
 ///
 /// Calls [`BonsaiModel::forward_prefill_cpu`] **directly** rather than
 /// through [`BonsaiModel::forward_prefill`]: under `--all-features` the
@@ -1382,24 +1385,34 @@ pub(in crate::model::types) fn load_average() -> String {
 /// OXI_MODEL=/path/to/Ternary-Bonsai-1.7B.gguf \
 ///   cargo test -p oxibonsai-model --release --all-features --lib \
 ///   prefill_cpu::tests::real_model_cpu_prefill_outruns_the_sequential_prefill \
-///   -- --ignored --nocapture
+///   -- --nocapture
 /// ```
 #[test]
-#[ignore = "requires OXI_MODEL real ternary/1-bit GGUF; run on dev Mac"]
 fn real_model_cpu_prefill_outruns_the_sequential_prefill() {
     use oxibonsai_core::gguf::reader::GgufFile;
+    use oxibonsai_testkit::capability::{record_executed_timed, record_skipped, Capability};
     use std::time::{Duration, Instant};
 
+    const TEST: &str =
+        "oxibonsai-model::lib::real_model_cpu_prefill_outruns_the_sequential_prefill";
+
     let _env = TierEnvGuard::acquire();
-    let Some(path) = std::env::var_os("OXI_MODEL") else {
+    let Some(path) = std::env::var_os("OXI_MODEL")
+        .map(std::path::PathBuf::from)
+        .or_else(|| oxibonsai_testkit::workspace::find_model("Ternary-Bonsai-1.7B.gguf"))
+    else {
         eprintln!(
-            "real_model_cpu_prefill_outruns_the_sequential_prefill: OXI_MODEL not set — \
-             skipping. Set OXI_MODEL=/path/to/Ternary-Bonsai-1.7B.gguf to run."
+            "real_model_cpu_prefill_outruns_the_sequential_prefill: OXI_MODEL not set and \
+             Ternary-Bonsai-1.7B.gguf not found under {:?} — skipping. Set OXI_MODEL or \
+             OXIBONSAI_MODELS_DIR to run.",
+            oxibonsai_testkit::workspace::models_dir()
         );
+        record_skipped(Capability::LegacyModels, TEST);
         return;
     };
     let bytes = std::fs::read(&path).expect("read OXI_MODEL gguf");
     let gguf = GgufFile::parse(&bytes).expect("GgufFile::parse OXI_MODEL");
+    let start = Instant::now();
 
     const MAX_SEQ: usize = 4096;
     const PROMPT_LEN: usize = 280; // same order as the 277-token baseline run
@@ -1507,4 +1520,5 @@ fn real_model_cpu_prefill_outruns_the_sequential_prefill() {
         "batched CPU prefill should be substantially faster than the sequential \
          reference, got only {speedup:.2}x"
     );
+    record_executed_timed(Capability::LegacyModels, TEST, start.elapsed());
 }

@@ -81,8 +81,118 @@ use std::path::PathBuf;
 
 use oxibonsai_core::gguf::reader::GgufFile;
 use oxibonsai_kernels::dispatch::{cpu_kernel_tier, KernelDispatcher, KernelTier};
+use oxibonsai_kernels::dispatch_int8::KERNEL_TIER_ENV;
 use oxibonsai_model::model::BonsaiModel;
 use oxibonsai_testkit::capability::{record_executed_timed, record_skipped, Capability};
+
+// ── OXIBONSAI_KERNEL_TIER scrub ─────────────────────────────────────────────
+//
+// The opt-in INT8 tier (K-14) diverts the CPU tiers' native-format GEMV/GEMM
+// but never Metal, so an exported `OXIBONSAI_KERNEL_TIER` would make this
+// gate's CPU arms compute something its Metal arm does not, and the greedy
+// token chains could flip. Every test below that runs a model (or re-execs
+// this binary to run one) therefore owns the variable for its whole run
+// through a [`TierEnvGuard`]; re-exec'd children inherit the cleared value.
+
+/// Serializes every [`TierEnvGuard`] in this binary: `std::env::set_var` /
+/// `remove_var` are `unsafe` because a concurrent read of any key can observe
+/// a torn `environ`.
+static TIER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`TIER_ENV_LOCK`], recovering it if a failed test poisoned it.
+fn lock_tier_env() -> std::sync::MutexGuard<'static, ()> {
+    TIER_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// RAII owner of `OXIBONSAI_KERNEL_TIER` for one test: holds
+/// [`TIER_ENV_LOCK`], clears the variable, and restores its previous value on
+/// drop (also while unwinding from a failed assertion).
+struct TierEnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    prior: Option<String>,
+}
+
+impl TierEnvGuard {
+    fn cleared() -> Self {
+        Self::cleared_under(lock_tier_env())
+    }
+
+    /// [`Self::cleared`] for a caller that already holds the lock.
+    fn cleared_under(lock: std::sync::MutexGuard<'static, ()>) -> Self {
+        let prior = std::env::var(KERNEL_TIER_ENV).ok();
+        // SAFETY: `lock` is held for the lifetime of the guard and serializes
+        // every reader and writer of the variable in this binary.
+        unsafe {
+            std::env::remove_var(KERNEL_TIER_ENV);
+        }
+        Self { _lock: lock, prior }
+    }
+}
+
+impl Drop for TierEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: `self._lock` is still held (fields drop after this body).
+        unsafe {
+            match &self.prior {
+                Some(value) => std::env::set_var(KERNEL_TIER_ENV, value),
+                None => std::env::remove_var(KERNEL_TIER_ENV),
+            }
+        }
+    }
+}
+
+/// The guard clears a selector that is set, keeps every other guard out
+/// while it lives, and puts the previous value (or its absence) back on drop.
+#[test]
+fn the_tier_env_guard_clears_the_selector_and_restores_it() {
+    let ambient = {
+        let lock = lock_tier_env();
+        let ambient = std::env::var(KERNEL_TIER_ENV).ok();
+        // SAFETY: `lock` is held.
+        unsafe {
+            std::env::set_var(KERNEL_TIER_ENV, "neon-dot");
+        }
+        let guard = TierEnvGuard::cleared_under(lock);
+        assert!(
+            std::env::var(KERNEL_TIER_ENV).is_err(),
+            "the selector is cleared while the guard is alive"
+        );
+        assert!(
+            TIER_ENV_LOCK.try_lock().is_err(),
+            "the guard holds the process-wide lock"
+        );
+        drop(guard);
+        assert_eq!(
+            std::env::var(KERNEL_TIER_ENV).as_deref(),
+            Ok("neon-dot"),
+            "the previous value is restored on drop"
+        );
+        ambient
+    };
+    {
+        let lock = lock_tier_env();
+        // SAFETY: `lock` is held.
+        unsafe {
+            std::env::remove_var(KERNEL_TIER_ENV);
+        }
+        drop(TierEnvGuard::cleared_under(lock));
+        assert!(
+            std::env::var(KERNEL_TIER_ENV).is_err(),
+            "a selector that was unset stays unset"
+        );
+    }
+    // Leave the process as it was found.
+    let _lock = lock_tier_env();
+    // SAFETY: `_lock` is held.
+    unsafe {
+        match ambient {
+            Some(value) => std::env::set_var(KERNEL_TIER_ENV, value),
+            None => std::env::remove_var(KERNEL_TIER_ENV),
+        }
+    }
+}
 
 /// Generation budget: long enough to reach a repetition-inducing tail on
 /// every prompt below.
@@ -282,6 +392,7 @@ fn is_cpu_tier(tier: KernelTier) -> bool {
 /// tier under D-6 — token chain first (hard, unconditional), then bit-exact
 /// logits for the CPU pair / the relative bound for the GPU pair.
 fn run_legacy_model_gate(model: &LegacyModel, test_name: &str) {
+    let _tier_env = TierEnvGuard::cleared();
     let gate_start = std::time::Instant::now();
     // Serialized against this binary's other real-model gates — see
     // [`gpu_serial`]. Taken before the fixture probe so the whole gate,
@@ -529,6 +640,7 @@ fn m18_run_one_arm_in_child(chunk_tokens: usize) -> (Option<std::process::ExitSt
 fn prefill_chunk_size_is_a_dispatch_knob_not_a_numerics_knob_on_a_real_long_prompt() {
     const TEST: &str = "oxibonsai-model::legacy_parity_tests::\
                         prefill_chunk_size_is_a_dispatch_knob_not_a_numerics_knob_on_a_real_long_prompt";
+    let _tier_env = TierEnvGuard::cleared();
 
     // Child branch: this exact process was re-exec'd to run ONE arm (chunk
     // size from `M18_CHILD_ENV`), print machine-readable lines, and exit —
@@ -912,6 +1024,7 @@ fn run_m08_control_child(arm: &str) {
 fn m08_yarn_scaling_wiring_takes_effect_on_the_real_bonsai_8b_file() {
     const TEST: &str =
         "oxibonsai-model::legacy_parity_tests::m08_yarn_scaling_wiring_takes_effect_on_the_real_bonsai_8b_file";
+    let _tier_env = TierEnvGuard::cleared();
 
     if let Ok(arm) = std::env::var(M08_CHILD_ARM_ENV) {
         run_m08_control_child(&arm);
@@ -1096,6 +1209,7 @@ fn process_rss_kib() -> u64 {
 fn footprint_and_measured_rss_confirm_the_embedding_table_stays_unmaterialized_bonsai_8b() {
     const TEST: &str = "oxibonsai-model::legacy_parity_tests::\
                         footprint_and_measured_rss_confirm_the_embedding_table_stays_unmaterialized_bonsai_8b";
+    let _tier_env = TierEnvGuard::cleared();
 
     // Fresh-process branch: measure and print, make no assertions (the
     // PARENT invocation below does), keep no state past `return`.

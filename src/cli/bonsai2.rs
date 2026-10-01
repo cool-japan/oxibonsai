@@ -20,8 +20,13 @@
 //!    prompt inside a `<think>` block when `enable_thinking` is left
 //!    undefined.
 //! 5. [`VisionRequest`] — the §5.7 vision flags (`--mmproj`, `--image`,
-//!    `--image-max-tokens`): parsed and validated, then refused with the
-//!    typed [`NOT_YET_SUPPORTED`] error until the vision tower lands.
+//!    `--image-max-tokens`): validated before any model is loaded, then the
+//!    Qwen3-VL projector loaded once ([`VisionRequest::load_service`]) and
+//!    every `--image` prepared ([`VisionRequest::prepare_images`]), checked
+//!    against the context ([`prompt_rows`]) and encoded
+//!    ([`VisionRequest::encode_prepared`]) for the multimodal prefill
+//!    (design §6.2); image-reference policy from [`cli_image_policy`] /
+//!    [`server_image_policy`].
 //! 6. [`apply_prefill_chunk`] — `--prefill-chunk <N>`.
 //!
 //! Scope note: the context guard applies to the `qwen35` architecture. A
@@ -33,16 +38,6 @@ use oxibonsai_core::config_hybrid::HybridConfig;
 use oxibonsai_runtime::config::{
     RenderMessage, RenderOptions, ResolvedChatTemplate, BONSAI2_DEFAULT_CONTEXT,
 };
-
-/// The stable code of every "accepted, validated, but not implemented in
-/// this release" refusal.
-pub(crate) const NOT_YET_SUPPORTED: &str = "NOT_YET_SUPPORTED";
-
-/// Build the typed [`NOT_YET_SUPPORTED`] error: `[NOT_YET_SUPPORTED]
-/// <what>: <why>`.
-pub(crate) fn not_yet_supported(what: &str, why: &str) -> anyhow::Error {
-    anyhow::anyhow!("[{NOT_YET_SUPPORTED}] {what}: {why}")
-}
 
 /// Whether `arch` (a GGUF's `general.architecture` value) is the Bonsai 2 /
 /// Qwen3.5 hybrid family (64-layer, 16-full/48-linear-attention GDN hybrid).
@@ -319,14 +314,55 @@ pub(crate) fn default_enable_thinking(template: &ResolvedChatTemplate) -> anyhow
 pub(crate) struct VisionRequest {
     /// `--mmproj <path>`.
     pub(crate) mmproj: Option<String>,
-    /// `--image <path|url>` (repeatable).
+    /// `--image <path>` (repeatable; `run`/`chat`).
     pub(crate) images: Vec<String>,
     /// `--image-max-tokens <N>` when passed explicitly.
     pub(crate) image_max_tokens: Option<usize>,
 }
 
-/// The reference demo's per-image token budget (design §5.7).
-pub(crate) const DEFAULT_IMAGE_MAX_TOKENS: usize = 1024;
+/// The per-image merged-token budget unless `--image-max-tokens` says
+/// otherwise (the Bonsai demo's default, design §5.7).
+pub(crate) const DEFAULT_IMAGE_MAX_TOKENS: usize =
+    oxibonsai_model::vision::DEFAULT_IMAGE_MAX_TOKENS;
+
+/// Environment opt-in for remote (`http(s)`) image references. Remote
+/// references are refused either way — fetching arbitrary URLs is a
+/// server-side request forgery surface and this build has no fetcher with
+/// an address policy — the opt-in only changes the reason the refusal
+/// gives.
+pub(crate) const ALLOW_IMAGE_URL_FETCH_ENV: &str = "OXI_ALLOW_IMAGE_URL_FETCH";
+
+/// Environment setting for `serve`: the directory `file://` image
+/// references resolve inside (no `..`, nothing outside it). Unset, a server
+/// accepts base64 `data:` URIs only.
+#[cfg(feature = "server")]
+pub(crate) const MEDIA_PATH_ENV: &str = "OXI_MEDIA_PATH";
+
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+}
+
+/// Which image references `run` / `chat` resolve: the user's own local
+/// files and `data:` URIs.
+pub(crate) fn cli_image_policy() -> oxibonsai_model::vision::ImageSourcePolicy {
+    let mut policy = oxibonsai_model::vision::ImageSourcePolicy::local_user();
+    policy.allow_remote_fetch = env_truthy(ALLOW_IMAGE_URL_FETCH_ENV);
+    policy
+}
+
+/// Which image references `serve` resolves for a request: `data:` URIs,
+/// and `file://` references inside [`MEDIA_PATH_ENV`] when it is set.
+#[cfg(feature = "server")]
+pub(crate) fn server_image_policy() -> oxibonsai_model::vision::ImageSourcePolicy {
+    let media_root = std::env::var(MEDIA_PATH_ENV)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(std::path::PathBuf::from);
+    oxibonsai_model::vision::ImageSourcePolicy::server(
+        media_root,
+        env_truthy(ALLOW_IMAGE_URL_FETCH_ENV),
+    )
+}
 
 impl VisionRequest {
     /// `true` when no vision flag was passed at all.
@@ -339,43 +375,186 @@ impl VisionRequest {
         self.image_max_tokens.unwrap_or(DEFAULT_IMAGE_MAX_TOKENS)
     }
 
-    /// Validate every vision input, then refuse the request with the typed
-    /// [`NOT_YET_SUPPORTED`] error (a no-op success when nothing was
-    /// passed). A malformed input is reported as such first, so fixing the
-    /// command line never hides behind the "not yet supported" answer.
+    /// Check the vision flags before any model is loaded: an `--image` or
+    /// `--image-max-tokens` without `--mmproj` (flags that would silently do
+    /// nothing), a budget out of range, an `--mmproj` that is not a `clip`
+    /// projector GGUF, and every `--image` reference (a missing file, a
+    /// refused remote URL — with its stable reason code). `images_allowed`
+    /// is `false` for `serve`, which takes images from requests.
     ///
     /// # Errors
     ///
-    /// A validation failure (missing/unreadable mmproj, a projector GGUF
-    /// whose `general.architecture` is not `clip`, a missing image file, a
-    /// zero token budget), else the [`NOT_YET_SUPPORTED`] refusal.
-    pub(crate) fn reject_until_supported(&self) -> anyhow::Result<()> {
+    /// The first problem found, naming the flag.
+    pub(crate) fn validate(&self, images_allowed: bool) -> anyhow::Result<()> {
         if self.is_empty() {
             return Ok(());
+        }
+        if !images_allowed && !self.images.is_empty() {
+            anyhow::bail!(
+                "--image is for `run` and `chat`; a server receives images as `image_url` content \
+                 parts of each request"
+            );
+        }
+        if self.mmproj.is_none() {
+            if !self.images.is_empty() {
+                anyhow::bail!(
+                    "--image needs the vision projector: pass --mmproj <mmproj GGUF> (e.g. \
+                     Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf)"
+                );
+            }
+            anyhow::bail!("--image-max-tokens has no effect without --mmproj <mmproj GGUF>");
+        }
+        let budget = self.effective_image_max_tokens();
+        if !(1..=oxibonsai_model::vision::MAX_IMAGE_MAX_TOKENS).contains(&budget) {
+            anyhow::bail!(
+                "--image-max-tokens must be in 1..={}, got {budget}",
+                oxibonsai_model::vision::MAX_IMAGE_MAX_TOKENS
+            );
         }
         if let Some(path) = &self.mmproj {
             validate_mmproj(path)?;
         }
+        let policy = cli_image_policy();
         for image in &self.images {
-            validate_image_ref(image)?;
+            validate_image_ref(image, &policy)?;
         }
-        if self.effective_image_max_tokens() == 0 {
-            anyhow::bail!("--image-max-tokens must be >= 1");
+        Ok(())
+    }
+
+    /// Load the vision projector for a language model of architecture
+    /// `arch`, resolving request images under `policy`. `None` when no
+    /// `--mmproj` was given.
+    ///
+    /// # Errors
+    ///
+    /// A projector for anything but a `qwen35` (Bonsai 2) language model,
+    /// or the projector's own load error (verbatim: the tower refuses a
+    /// variant projector rather than guessing).
+    pub(crate) fn load_service(
+        &self,
+        arch: &str,
+        policy: oxibonsai_model::vision::ImageSourcePolicy,
+    ) -> anyhow::Result<Option<std::sync::Arc<oxibonsai_runtime::vision_prefill::VisionService>>>
+    {
+        let Some(path) = &self.mmproj else {
+            return Ok(None);
+        };
+        if !is_qwen35_hybrid(arch) {
+            anyhow::bail!(
+                "--mmproj {path}: the Bonsai 2 vision projector serves a `qwen35` (Bonsai 2) \
+                 language model, but this model's architecture is '{arch}'"
+            );
         }
-        Err(not_yet_supported(
-            "vision input (--mmproj / --image / --image-max-tokens)",
-            &format!(
-                "validated ({} image(s), budget {} tokens/image{}), but the Qwen3-VL vision \
-                 tower is not wired up yet; rerun without the vision flags for \
-                 text-only inference",
-                self.images.len(),
-                self.effective_image_max_tokens(),
-                self.mmproj
-                    .as_deref()
-                    .map(|p| format!(", projector {p}"))
-                    .unwrap_or_default(),
-            ),
-        ))
+        let started = std::time::Instant::now();
+        let service = oxibonsai_runtime::vision_prefill::VisionService::load(
+            std::path::Path::new(path),
+            self.effective_image_max_tokens(),
+            policy,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        tracing::info!(
+            mmproj = %path,
+            blocks = service.tower().block_count(),
+            resident_bytes = service.tower().resident_bytes(),
+            image_max_tokens = self.effective_image_max_tokens(),
+            seconds = started.elapsed().as_secs_f64(),
+            "vision projector loaded"
+        );
+        Ok(Some(std::sync::Arc::new(service)))
+    }
+
+    /// Resolve, decode and preprocess every `--image` with `service`, in
+    /// order: everything but the (expensive) tower encode, so the prompt's
+    /// expanded length can be checked against the context window before
+    /// any image is encoded.
+    ///
+    /// # Errors
+    ///
+    /// The first image's error, with its stable reason code:
+    /// `[<code>] --image <ref>: <reason>`.
+    pub(crate) fn prepare_images(
+        &self,
+        service: &oxibonsai_runtime::vision_prefill::VisionService,
+    ) -> anyhow::Result<Vec<oxibonsai_model::vision::PreparedImage>> {
+        self.images
+            .iter()
+            .enumerate()
+            .map(|(i, image)| {
+                service
+                    .prepare_reference(i, image)
+                    .map_err(|e| anyhow::anyhow!("[{}] --image {}: {e}", e.code(), shorten(image)))
+            })
+            .collect()
+    }
+
+    /// Encode the images [`VisionRequest::prepare_images`] prepared, in
+    /// order, reporting each one's geometry and encode time on stderr.
+    ///
+    /// # Errors
+    ///
+    /// The first tower failure, with its stable reason code.
+    pub(crate) fn encode_prepared(
+        &self,
+        service: &oxibonsai_runtime::vision_prefill::VisionService,
+        prepared: &[oxibonsai_model::vision::PreparedImage],
+    ) -> anyhow::Result<Vec<oxibonsai_runtime::vision_prefill::EncodedImage>> {
+        prepared
+            .iter()
+            .enumerate()
+            .map(|(i, image)| {
+                let started = std::time::Instant::now();
+                let reference = self.images.get(i).map_or("", String::as_str);
+                let encoded = service.encode_prepared(i, image).map_err(|e| {
+                    anyhow::anyhow!("[{}] --image {}: {e}", e.code(), shorten(reference))
+                })?;
+                eprintln!(
+                    "[image {}: {} x {} -> {} x {} merged grid ({} image tokens) in {:.2}s]",
+                    i + 1,
+                    encoded.source.0,
+                    encoded.source.1,
+                    encoded.grid.h,
+                    encoded.grid.w,
+                    encoded.grid.n_tokens(),
+                    started.elapsed().as_secs_f64()
+                );
+                Ok(encoded)
+            })
+            .collect()
+    }
+}
+
+/// Sequence positions `tokens` occupies once every `<|image_pad|>` is
+/// replaced by its image's rows (`grids`, in placeholder order): the splice
+/// plan's row count, or the plain token count for a prompt that holds no
+/// placeholder (a text-only turn, or a conversation whose image message was
+/// dropped to fit the context).
+///
+/// # Errors
+///
+/// A prompt whose placeholders do not match the images
+/// (`[<code>] <reason>`).
+pub(crate) fn prompt_rows(
+    tokens: &[u32],
+    grids: &[oxibonsai_model::vision::GridSize],
+    ids: oxibonsai_model::vision::VisionTokenIds,
+) -> anyhow::Result<usize> {
+    if !tokens.contains(&ids.image_pad) {
+        return Ok(tokens.len());
+    }
+    oxibonsai_model::vision::plan_splice(tokens, grids, ids)
+        .map(|plan| plan.total_rows())
+        .map_err(|e| anyhow::anyhow!("[{}] {e}", e.code()))
+}
+
+/// An image reference shortened for a message (a data URI can be
+/// megabytes).
+fn shorten(reference: &str) -> String {
+    const MAX: usize = 96;
+    if reference.chars().count() <= MAX {
+        reference.to_string()
+    } else {
+        let head: String = reference.chars().take(MAX).collect();
+        format!("{head}...")
     }
 }
 
@@ -399,17 +578,35 @@ fn validate_mmproj(path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `--image` must be an `http(s)://` URL or an existing file.
-fn validate_image_ref(image: &str) -> anyhow::Result<()> {
-    if image.starts_with("http://") || image.starts_with("https://") {
-        return Ok(());
+/// `--image` must be a `data:` URI or a readable local file; a remote URL
+/// is refused (see [`ALLOW_IMAGE_URL_FETCH_ENV`]).
+fn validate_image_ref(
+    image: &str,
+    policy: &oxibonsai_model::vision::ImageSourcePolicy,
+) -> anyhow::Result<()> {
+    use oxibonsai_model::vision::image_decode::{classify_image_source, ImageSource};
+    let refused = |e: oxibonsai_model::vision::ImageInputError| {
+        anyhow::anyhow!("[{}] --image {}: {e}", e.code(), shorten(image))
+    };
+    match classify_image_source(image).map_err(refused)? {
+        ImageSource::Remote => {
+            // Resolving it produces the typed refusal (with the reason the
+            // opt-in selects).
+            oxibonsai_model::vision::load_image_bytes(image, policy).map_err(refused)?;
+            Ok(())
+        }
+        ImageSource::DataUri => oxibonsai_model::vision::parse_data_uri(image)
+            .map(|_| ())
+            .map_err(refused),
+        ImageSource::LocalFile(path) => {
+            let meta = std::fs::metadata(&path)
+                .map_err(|e| anyhow::anyhow!("--image {path}: cannot read: {e}"))?;
+            if !meta.is_file() {
+                anyhow::bail!("--image {path}: not a regular file");
+            }
+            Ok(())
+        }
     }
-    let meta = std::fs::metadata(image)
-        .map_err(|e| anyhow::anyhow!("--image {image}: cannot read: {e}"))?;
-    if !meta.is_file() {
-        anyhow::bail!("--image {image}: not a regular file");
-    }
-    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -446,6 +643,8 @@ pub(crate) fn apply_prefill_chunk(
     Ok(())
 }
 
+/// Also shared with the `run` / `chat` tests: the synthetic projector and
+/// the golden fixture image.
 #[cfg(test)]
 #[path = "bonsai2_tests.rs"]
-mod tests;
+pub(crate) mod tests;

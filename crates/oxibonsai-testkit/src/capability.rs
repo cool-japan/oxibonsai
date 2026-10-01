@@ -121,6 +121,50 @@ pub enum Capability {
     /// through this variant rather than writing the `"bonsai2-models"` JSONL
     /// line by hand.
     Bonsai2Models,
+    /// The real Bonsai 2 27B decoded through the ordinary `InferenceEngine`
+    /// on the Metal hybrid runner — `oxibonsai-runtime`'s
+    /// `bonsai2_metal_engine_tests`: the product-path CPU-vs-Metal identity
+    /// and fork parity, decode throughput and memory, and the
+    /// `/v1/chat/completions` round trip. Distinct from
+    /// [`Self::Bonsai2Models`] (whose records lighter, header-only tests
+    /// also write) so `REQUIRED_CAPS` can require the engine-level Metal
+    /// evidence under its own name.
+    Bonsai2MetalEngine,
+    /// A host with an accessible CUDA device, for validation runs whose own
+    /// claim is stronger than [`Self::Cuda`]'s "the code path did not
+    /// panic": an end-to-end numeric parity result (e.g. CPU-vs-CUDA greedy
+    /// decode agreement) or a checklist item that has never yet been
+    /// exercised on real hardware at all. A distinct name is needed for the
+    /// same reason [`Self::LegacyModels`] is distinct from [`Self::Metal`]:
+    /// [`Self::Cuda`] is already satisfied elsewhere by lighter-weight
+    /// checks (e.g. "does not panic on an empty layer slice"), so a
+    /// `REQUIRED_CAPS` entry that wanted to gate on the stronger claim could
+    /// never do so under the shared name. Every producer of this record
+    /// must write `executed: true` only after a genuine device probe (e.g.
+    /// `CudaGraph::global().is_ok()`) *and* the comparison it names has
+    /// passed — never from fixture presence alone.
+    CudaHardware,
+    /// The real Bonsai 2 vision projector
+    /// (`Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf`, a `clip`-architecture GGUF
+    /// with the `qwen3vl_merger` projector) is present under `models/` (or
+    /// named by `$OXI_BONSAI2_MMPROJ_GGUF`). Same "model-file presence, not
+    /// hardware" shape as [`Self::Bonsai2Models`], and deliberately a
+    /// distinct name: the vision tower is optional (text-only inference never
+    /// needs the mmproj), so the language-model gates can pass on a host that
+    /// has never validated the vision tower, and a `REQUIRED_CAPS` entry that
+    /// wants the tower's real-weight evidence needs its own name to gate on.
+    /// `crates/oxibonsai-model/tests/vision_mmproj_tests.rs` records through
+    /// this variant.
+    Bonsai2Mmproj,
+    /// The head-free Metal hidden-state prefill that serves dense
+    /// embeddings, checked against the batched CPU path on the real legacy
+    /// models (`crates/oxibonsai-model/tests/metal_hidden_parity_tests.rs`:
+    /// pooled and per-row cosine, plus the 2000-token latency target).
+    /// Distinct from [`Self::Metal`] (which lighter kernel-parity tests
+    /// satisfy) and from [`Self::LegacyModels`] (the CPU cross-tier gates),
+    /// so the release gate can require the Metal embedding evidence under
+    /// its own name.
+    MetalHidden,
 }
 
 impl Capability {
@@ -135,6 +179,10 @@ impl Capability {
             Self::ImageParity => "image-parity",
             Self::LegacyModels => "legacy-models",
             Self::Bonsai2Models => "bonsai2-models",
+            Self::Bonsai2MetalEngine => "bonsai2-metal-engine",
+            Self::CudaHardware => "cuda-hardware",
+            Self::Bonsai2Mmproj => "bonsai2-mmproj",
+            Self::MetalHidden => "metal-hidden",
         }
     }
 }
@@ -652,12 +700,95 @@ mod tests {
         assert_eq!(Capability::ImageParity.as_str(), "image-parity");
         assert_eq!(Capability::LegacyModels.as_str(), "legacy-models");
         assert_eq!(Capability::Bonsai2Models.as_str(), "bonsai2-models");
+        assert_eq!(
+            Capability::Bonsai2MetalEngine.as_str(),
+            "bonsai2-metal-engine"
+        );
+        assert_eq!(Capability::CudaHardware.as_str(), "cuda-hardware");
+        assert_eq!(Capability::Bonsai2Mmproj.as_str(), "bonsai2-mmproj");
+        assert_eq!(Capability::MetalHidden.as_str(), "metal-hidden");
         // Display must agree with as_str (call sites use both).
         assert_eq!(Capability::Metal.to_string(), Capability::Metal.as_str());
         assert_eq!(
             Capability::Bonsai2Models.to_string(),
             Capability::Bonsai2Models.as_str()
         );
+        assert_eq!(
+            Capability::CudaHardware.to_string(),
+            Capability::CudaHardware.as_str()
+        );
+        assert_eq!(
+            Capability::Bonsai2Mmproj.to_string(),
+            Capability::Bonsai2Mmproj.as_str()
+        );
+        assert_eq!(
+            Capability::MetalHidden.to_string(),
+            Capability::MetalHidden.as_str()
+        );
+    }
+
+    /// [`Capability::Bonsai2Mmproj`] must write the same documented JSONL
+    /// schema every other capability does — the dedicated test for the
+    /// vision-projector variant.
+    #[test]
+    fn bonsai2_mmproj_record_executed_and_skipped_write_the_documented_schema() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let path = unique_temp_path("bonsai2-mmproj");
+        std::env::set_var("OXIBONSAI_CAPABILITY_REPORT", &path);
+        record_executed(Capability::Bonsai2Mmproj, "crate::file::mmproj_ran");
+        record_skipped(Capability::Bonsai2Mmproj, "crate::file::mmproj_skipped");
+        std::env::remove_var("OXIBONSAI_CAPABILITY_REPORT");
+
+        let contents = std::fs::read_to_string(&path).expect("read manifest");
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2, "expected two records, got: {contents:?}");
+
+        let ran: serde_json::Value = serde_json::from_str(lines[0]).expect("line 1 valid json");
+        assert_eq!(ran["capability"], "bonsai2-mmproj");
+        assert_eq!(ran["executed"], true);
+        assert_eq!(ran["test"], "crate::file::mmproj_ran");
+
+        let skipped: serde_json::Value = serde_json::from_str(lines[1]).expect("line 2 valid json");
+        assert_eq!(skipped["capability"], "bonsai2-mmproj");
+        assert_eq!(skipped["executed"], false);
+        assert_eq!(skipped["test"], "crate::file::mmproj_skipped");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// [`Capability::CudaHardware`] must write the same documented JSONL
+    /// schema every other capability does — the dedicated test for the new
+    /// variant, distinct from
+    /// [`bonsai2_models_record_executed_and_skipped_write_the_documented_schema`],
+    /// which pins the shared behaviour via [`Capability::Bonsai2Models`].
+    #[test]
+    fn cuda_hardware_record_executed_and_skipped_write_the_documented_schema() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let path = unique_temp_path("cuda-hardware");
+        std::env::set_var("OXIBONSAI_CAPABILITY_REPORT", &path);
+        record_executed(Capability::CudaHardware, "crate::file::cuda_ran");
+        record_skipped(Capability::CudaHardware, "crate::file::cuda_skipped");
+        std::env::remove_var("OXIBONSAI_CAPABILITY_REPORT");
+
+        let contents = std::fs::read_to_string(&path).expect("read manifest");
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2, "expected two records, got: {contents:?}");
+
+        let ran: serde_json::Value = serde_json::from_str(lines[0]).expect("line 1 valid json");
+        assert_eq!(ran["capability"], "cuda-hardware");
+        assert_eq!(ran["executed"], true);
+        assert_eq!(ran["test"], "crate::file::cuda_ran");
+
+        let skipped: serde_json::Value = serde_json::from_str(lines[1]).expect("line 2 valid json");
+        assert_eq!(skipped["capability"], "cuda-hardware");
+        assert_eq!(skipped["executed"], false);
+        assert_eq!(skipped["test"], "crate::file::cuda_skipped");
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// `Capability::Bonsai2Models` must write the

@@ -12,9 +12,12 @@
 //! the resolved weight type with its ggml id (PQ2_0 = 142, PTQ1_0 = 143),
 //! the `prism.hadamard.*` contract, vocabulary and context, the KV and
 //! recurrent bytes per sequence, a dry bind of the hybrid model (the
-//! constructor `run` actually uses), and the kernel tier the engine seam
-//! really runs it on (the CPU tier — never the GPU tier `auto_detect`
-//! would report for a dense model on this machine).
+//! constructor `run` actually uses), and the executor the engine seam
+//! really decodes it on under `--backend auto`: the Metal hybrid runner
+//! (with its KV window, every limit on it, the residents it shares memory
+//! with and the device bytes it allocates at load) when one serves the
+//! model on this host, else the CPU tier and why — never the dense model's
+//! `auto_detect` tier.
 
 use oxibonsai_core::gguf::reader::GgufFile;
 use oxibonsai_core::gguf::tensor_info::keys;
@@ -23,11 +26,7 @@ use super::bonsai2;
 use super::model_desc;
 
 pub(crate) fn run(model: Option<String>, json: bool) -> anyhow::Result<()> {
-    let model = model
-        .or_else(|| std::env::var("OXI_MODEL").ok().filter(|s| !s.is_empty()))
-        .ok_or_else(|| {
-            anyhow::anyhow!("no model: pass --model <gguf> or set OXI_MODEL (e.g. in .env)")
-        })?;
+    let model = resolve_model_path(model)?;
 
     let mmap = oxibonsai_core::gguf::reader::mmap_gguf_file(std::path::Path::new(&model))
         .map_err(|e| anyhow::anyhow!("failed to open model '{model}': {e}"))?;
@@ -164,15 +163,17 @@ pub(crate) fn run(model: Option<String>, json: bool) -> anyhow::Result<()> {
         None
     };
 
-    // The EFFECTIVE kernel tier `run` would dispatch to: the CPU tier for a
-    // hybrid (the engine seam pins it there — no hybrid GPU encoder exists
-    // yet), the auto-detected tier for a dense model.
+    // The EFFECTIVE kernel tier `run` would dispatch to under `--backend
+    // auto`: for a hybrid, the executor the engine seam resolves (the Metal
+    // hybrid runner when one serves the model here, else the CPU tier and
+    // why); the auto-detected tier for a dense model.
     let (kernel_tier, kernel_tier_reason) = match &hybrid {
-        Some(_) => (
+        Some(Ok(report)) => model_desc::hybrid_auto_tier(report),
+        Some(Err(e)) => (
             oxibonsai_kernels::cpu_kernel_tier().to_string(),
-            "hybrid qwen35 model: no hybrid GPU encoder exists yet, so it runs on the best CPU \
-             tier under --backend auto/cpu (--backend metal is refused)"
-                .to_string(),
+            format!(
+                "hybrid qwen35 model: the hybrid report failed ({e}), so no backend was resolved"
+            ),
         ),
         None => model_desc::dense_auto_tier(),
     };
@@ -282,6 +283,15 @@ pub(crate) fn run(model: Option<String>, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `--model`, else a non-empty `OXI_MODEL`, else the "no model" error.
+fn resolve_model_path(model: Option<String>) -> anyhow::Result<String> {
+    model
+        .or_else(|| std::env::var("OXI_MODEL").ok().filter(|s| !s.is_empty()))
+        .ok_or_else(|| {
+            anyhow::anyhow!("no model: pass --model <gguf> or set OXI_MODEL (e.g. in .env)")
+        })
+}
+
 /// Convert the honest `"-"` display sentinel into JSON `null` for
 /// `--json` output, so a machine consumer can test for absence with
 /// `!= null` instead of string-comparing against `"-"`.
@@ -351,3 +361,7 @@ fn report_probe_compat_fallback(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "cmd_info_tests.rs"]
+mod tests;

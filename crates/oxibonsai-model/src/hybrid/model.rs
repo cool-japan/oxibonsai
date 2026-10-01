@@ -7,9 +7,21 @@
 //!   allocated, the v-head map, the Hadamard hook and the layer split.
 //! * The **forward**: [`HybridModel::forward`],
 //!   [`HybridModel::forward_prefill`] and [`HybridModel::forward_with_dump`],
-//!   all three of which are one call into
-//!   [`crate::hybrid::forward::run_chunk`] parameterised by batch, plus the
-//!   RoPE table and the chunk-wide activation scratch they run in.
+//!   all of which are calls into
+//!   [`crate::hybrid::forward::run_chunk_input`] parameterised by batch, plus
+//!   the RoPE table and the chunk-wide activation scratch they run in. Both
+//!   chunked prefills — token ids ([`HybridModel::forward_prefill`]) and
+//!   caller-supplied rows (`HybridModel::forward_prefill_rows`, the vision
+//!   splice in `vision_prefill.rs`) — run through the one chunk loop,
+//!   `HybridModel::prefill_chunks`.
+//! * The **M-RoPE offset** a multimodal prompt leaves behind
+//!   ([`HybridModel::rope_delta`], design §6.2): after an image, text
+//!   rotary positions run behind the sequence index, and every later decode
+//!   step rotates at `pos - rope_delta`. Zero for any text-only sequence,
+//!   cleared by [`HybridModel::reset`] and by any forward that starts a new
+//!   sequence at position 0, and kept per sequence position, so a sequence
+//!   rolled back to an earlier position continues at the offset in force
+//!   there.
 //! * The **hidden-state seam** embeddings need:
 //!   [`HybridModel::forward_hidden`] and [`HybridModel::embed_mean_pooled`]
 //!   (`forward_hidden.rs`, a child module so it drives the same private
@@ -47,11 +59,13 @@ use crate::hybrid::block::{
     FullAttnBlock, FullScratch, HybridBlock, LinearAttnBlock, LinearScratch,
 };
 use crate::hybrid::forward::{
-    run_chunk, ForwardCtx, HybridScratch, LayerDump, RopeTables, DEFAULT_PREFILL_CHUNK,
+    run_chunk_input, ChunkInput, ForwardCtx, HybridScratch, LayerDump, RopeTables,
+    DEFAULT_PREFILL_CHUNK,
 };
 use crate::hybrid::hadamard::{HadamardHook, HadamardScratch};
 use crate::hybrid::recurrent_cache::RecurrentCache;
 use crate::hybrid::vhead_map::VHeadMap;
+use crate::hybrid::vision_prefill::RopeOffsets;
 use crate::hybrid::weights::{
     bind_conv1d, bind_embedding, bind_gate_projection, bind_gdn_gates, bind_linear, bind_lm_head,
     block_tensor, load_norm, names, resolve_id42, HybridEmbedding,
@@ -59,6 +73,7 @@ use crate::hybrid::weights::{
 use crate::kv_cache::{KvCache, KvCacheBacking, GROWTH_CHUNK_POSITIONS};
 use crate::layers::linear::LinearLayer;
 use crate::layers::rms_norm::RmsNorm;
+use crate::layers::rope_mrope::MropePos;
 use crate::model_registry::ModelVariant;
 
 /// [`HybridModel::forward_hidden`] / [`HybridModel::embed_mean_pooled`]: a
@@ -179,6 +194,60 @@ pub struct HybridModel<'a> {
     max_seq_len: usize,
     quant_type: GgufTensorType,
     variant: Option<ModelVariant>,
+    /// Sequence position minus text rotary position, per sequence position
+    /// (design §6.2): empty (`0` everywhere) for a text-only sequence; after
+    /// an image of merged grid `h x w` the offset grows by `h * w - max(h,
+    /// w)`. See [`RopeOffsets`] for how a rolled-back sequence recovers the
+    /// offset in force at its position.
+    rope_offsets: RopeOffsets,
+}
+
+/// The rows one chunked prefill feeds, before [`HybridModel::prefill_chunks`]
+/// cuts them into chunks.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PrefillSource<'s> {
+    /// Token ids; token `i` rotates at the text position `rope_start + i`.
+    Tokens {
+        tokens: &'s [u32],
+        rope_start: usize,
+    },
+    /// Caller-supplied rows (`positions.len() * hidden` floats) with one
+    /// rotary position each.
+    Rows {
+        rows: &'s [f32],
+        positions: &'s [MropePos],
+    },
+}
+
+impl<'s> PrefillSource<'s> {
+    /// Rows in the whole prefill.
+    fn len(&self) -> usize {
+        match self {
+            Self::Tokens { tokens, .. } => tokens.len(),
+            Self::Rows { positions, .. } => positions.len(),
+        }
+    }
+
+    /// Rows `start..end` as one chunk's input.
+    fn chunk(&self, start: usize, end: usize, hidden: usize) -> ModelResult<ChunkInput<'s>> {
+        let out_of_range = || ModelError::ShapeInvariant {
+            tensor: "prefill chunk".to_string(),
+            expected: format!("{start}..{end} within {} rows", self.len()),
+            actual: "out of range".to_string(),
+        };
+        match *self {
+            Self::Tokens { tokens, rope_start } => Ok(ChunkInput::Tokens {
+                tokens: tokens.get(start..end).ok_or_else(out_of_range)?,
+                rope_start: rope_start + start,
+            }),
+            Self::Rows { rows, positions } => Ok(ChunkInput::Rows {
+                rows: rows
+                    .get(start * hidden..end * hidden)
+                    .ok_or_else(out_of_range)?,
+                positions: positions.get(start..end).ok_or_else(out_of_range)?,
+            }),
+        }
+    }
 }
 
 /// Element type of a hybrid model's KV cache.
@@ -360,13 +429,17 @@ impl<'a> HybridModel<'a> {
             GROWTH_CHUNK_POSITIONS,
         )?;
         let recurrent = RecurrentCache::new(&config)?;
-        let rope = RopeTables::new(
+        // With the file's `rope.dimension_sections`, so an image row's 3-axis
+        // position can be rotated (design §6.2); text positions read the
+        // precomputed single-axis rows exactly as before.
+        let rope = RopeTables::with_sections(
             config.rope_dimension_count,
             max_seq_len,
             config.base.rope_freq_base,
+            config.rope_sections,
         )?;
-        // One token's worth to start with: `run_chunk` grows it in place the
-        // first time a prefill asks for more.
+        // One token's worth to start with: `run_chunk_input` grows it in
+        // place the first time a prefill asks for more.
         let scratch = HybridScratch::new(&config, 1);
 
         let quant_type = crate::hybrid::weights::apply_resolved_type(
@@ -400,6 +473,7 @@ impl<'a> HybridModel<'a> {
             max_seq_len,
             quant_type,
             variant,
+            rope_offsets: RopeOffsets::default(),
         })
     }
 
@@ -628,17 +702,144 @@ impl<'a> HybridModel<'a> {
     ///
     /// This is [`HybridModel::forward_prefill`] with a one-token chunk --
     /// literally the same body -- so a decode step and the last token of a
-    /// prefill chunk cannot diverge.
+    /// prefill chunk cannot diverge. The token rotates at `pos -
+    /// rope_delta` ([`HybridModel::rope_delta`]; `pos` itself for any
+    /// text-only sequence).
     ///
     /// # Errors
     ///
     /// [`ModelError::PositionOutOfRange`] past the KV window,
-    /// [`ModelError::ShapeMismatch`] for a short `logits`, and anything the
-    /// blocks or kernels return.
+    /// [`ModelError::ShapeMismatch`] for a short `logits`,
+    /// [`ModelError::ShapeInvariant`] for a `pos` before the M-RoPE offset,
+    /// and anything the blocks or kernels return.
     pub fn forward(&mut self, token: u32, pos: usize, logits: &mut [f32]) -> ModelResult<()> {
+        let rope_start = self.text_rope_start(pos)?;
         let mut ctx = self.ctx();
-        run_chunk(&mut ctx, &[token], pos, Some(logits), None)?;
+        run_chunk_input(
+            &mut ctx,
+            ChunkInput::Tokens {
+                tokens: &[token],
+                rope_start,
+            },
+            pos,
+            Some(logits),
+            None,
+        )?;
         self.kv_cache.set_seq_len(pos + 1);
+        Ok(())
+    }
+
+    /// The M-RoPE offset of the current sequence: its next token sits at
+    /// sequence position `p` (the KV cursor) but rotates at the text
+    /// position `p - rope_delta()` (design §6.2).
+    ///
+    /// `0` for a text-only sequence. An image with a merged grid of `h x w`
+    /// occupies `h * w` sequence positions but only `max(h, w)` rotary ones,
+    /// so each image grows the offset by the difference; it is set by
+    /// `HybridModel::forward_prefill_rows`, cleared by
+    /// [`HybridModel::reset`] and by any forward starting at position 0, and
+    /// follows the sequence back when its KV cursor and recurrent state are
+    /// restored to an earlier position (the offset in force there applies
+    /// again).
+    #[inline]
+    #[must_use]
+    pub fn rope_delta(&self) -> usize {
+        self.rope_offsets.at(self.kv_cache.seq_len())
+    }
+
+    /// The M-RoPE offset of the token at sequence position `pos` (see
+    /// [`HybridModel::rope_delta`]).
+    #[inline]
+    pub(crate) fn rope_delta_at(&self, pos: usize) -> usize {
+        self.rope_offsets.at(pos)
+    }
+
+    /// The rotary position of a text token at sequence position `pos`:
+    /// `pos - rope_delta`. A forward at `pos` continues the sequence there,
+    /// so it first forgets the offsets of every later position — those of a
+    /// rolled-back continuation, or at position 0 (a new sequence) all of
+    /// them.
+    ///
+    /// # Errors
+    ///
+    /// [`ModelError::ShapeInvariant`] for a `pos` before the offset — no
+    /// sequence consistent with this model's state has such a position.
+    pub(crate) fn text_rope_start(&mut self, pos: usize) -> ModelResult<usize> {
+        self.rope_offsets.continue_at(pos);
+        let delta = self.rope_offsets.at(pos);
+        pos.checked_sub(delta)
+            .ok_or_else(|| ModelError::ShapeInvariant {
+                tensor: "rotary position".to_string(),
+                expected: format!("a sequence position at or past the M-RoPE offset {delta}"),
+                actual: pos.to_string(),
+            })
+    }
+
+    /// Record the M-RoPE offset a prefill of caller-supplied rows that began
+    /// at sequence position `start_pos` leaves: the next token sits at
+    /// sequence position `seq_end` and rotates at `rope_next`.
+    ///
+    /// # Errors
+    ///
+    /// [`ModelError::ShapeInvariant`] when `rope_next` runs ahead of
+    /// `seq_end` (rotary positions never exceed sequence positions under
+    /// the design §6.2 layout).
+    pub(crate) fn set_rope_next(
+        &mut self,
+        start_pos: usize,
+        seq_end: usize,
+        rope_next: usize,
+    ) -> ModelResult<()> {
+        let delta = seq_end
+            .checked_sub(rope_next)
+            .ok_or_else(|| ModelError::ShapeInvariant {
+                tensor: "rotary positions".to_string(),
+                expected: format!(
+                    "no rotary position past the sequence position (next sequence position \
+                     {seq_end})"
+                ),
+                actual: format!("next rotary position {rope_next}"),
+            })?;
+        self.rope_offsets.record(start_pos, seq_end, delta);
+        Ok(())
+    }
+
+    /// The one chunk loop behind every chunked prefill — token ids
+    /// ([`HybridModel::forward_prefill`]) and caller-supplied rows
+    /// (`HybridModel::forward_prefill_rows`): `source` is cut into
+    /// [`HybridModel::prefill_chunk`]-row chunks, each run at its absolute
+    /// sequence position, the LM head evaluated for the last row only, and
+    /// the KV cursor left at `start_pos + source.len()`.
+    ///
+    /// # Errors
+    ///
+    /// Anything [`run_chunk_input`] returns.
+    pub(crate) fn prefill_chunks(
+        &mut self,
+        source: PrefillSource<'_>,
+        start_pos: usize,
+        mut last_logits: Option<&mut [f32]>,
+    ) -> ModelResult<()> {
+        let total = source.len();
+        if total == 0 {
+            return Ok(());
+        }
+        let chunk = self.prefill_chunk.max(1);
+        let hidden = self.config.base.hidden_size;
+        let mut offset = 0usize;
+        while offset < total {
+            let end = (offset + chunk).min(total);
+            let input = source.chunk(offset, end, hidden)?;
+            let logits = if end == total {
+                last_logits.as_deref_mut()
+            } else {
+                None
+            };
+            let mut ctx = self.ctx();
+            run_chunk_input(&mut ctx, input, start_pos + offset, logits, None)?;
+            offset = end;
+        }
+        self.kv_cache.set_seq_len(start_pos + total);
         Ok(())
     }
 
@@ -660,7 +861,8 @@ impl<'a> HybridModel<'a> {
     /// chunks; each chunk advances the recurrent state exactly once per
     /// token, in order, and stores every key/value at its absolute
     /// position, so the result is the same as feeding the tokens one at a
-    /// time (design SS8.2 G5).
+    /// time (design SS8.2 G5). Token `i` rotates at `start_pos + i -
+    /// rope_delta` ([`HybridModel::rope_delta`]).
     ///
     /// # Errors
     ///
@@ -674,29 +876,12 @@ impl<'a> HybridModel<'a> {
         if tokens.is_empty() {
             return Ok(());
         }
-        let chunk = self.prefill_chunk.max(1);
-        let total = tokens.len();
-        let mut offset = 0usize;
-        while offset < total {
-            let end = (offset + chunk).min(total);
-            let is_last = end == total;
-            let slice = tokens
-                .get(offset..end)
-                .ok_or_else(|| ModelError::ShapeInvariant {
-                    tensor: "prefill chunk".to_string(),
-                    expected: format!("{offset}..{end} within {total} tokens"),
-                    actual: "out of range".to_string(),
-                })?;
-            let mut ctx = self.ctx();
-            if is_last {
-                run_chunk(&mut ctx, slice, start_pos + offset, Some(last_logits), None)?;
-            } else {
-                run_chunk(&mut ctx, slice, start_pos + offset, None, None)?;
-            }
-            offset = end;
-        }
-        self.kv_cache.set_seq_len(start_pos + total);
-        Ok(())
+        let rope_start = self.text_rope_start(start_pos)?;
+        self.prefill_chunks(
+            PrefillSource::Tokens { tokens, rope_start },
+            start_pos,
+            Some(last_logits),
+        )
     }
 
     /// [`HybridModel::forward_prefill`] over a single chunk, recording every
@@ -718,12 +903,63 @@ impl<'a> HybridModel<'a> {
     ) -> ModelResult<LayerDump> {
         let mut dump = LayerDump::default();
         let end = start_pos + tokens.len();
+        let rope_start = self.text_rope_start(start_pos)?;
         {
             let mut ctx = self.ctx();
-            run_chunk(&mut ctx, tokens, start_pos, last_logits, Some(&mut dump))?;
+            run_chunk_input(
+                &mut ctx,
+                ChunkInput::Tokens { tokens, rope_start },
+                start_pos,
+                last_logits,
+                Some(&mut dump),
+            )?;
         }
         self.kv_cache.set_seq_len(end);
         Ok(dump)
+    }
+
+    /// Run `input` as one unchunked chunk at `start_pos`, recording every
+    /// block's output — the rows form of [`HybridModel::forward_with_dump`]
+    /// (`HybridModel::forward_prefill_rows_with_dump` wraps it).
+    ///
+    /// # Errors
+    ///
+    /// Anything [`run_chunk_input`] returns.
+    pub(crate) fn run_single_chunk_with_dump(
+        &mut self,
+        input: ChunkInput<'_>,
+        start_pos: usize,
+        last_logits: Option<&mut [f32]>,
+    ) -> ModelResult<LayerDump> {
+        let mut dump = LayerDump::default();
+        let end = start_pos + input.len();
+        {
+            let mut ctx = self.ctx();
+            run_chunk_input(&mut ctx, input, start_pos, last_logits, Some(&mut dump))?;
+        }
+        self.kv_cache.set_seq_len(end);
+        Ok(dump)
+    }
+
+    /// Write the rows `tokens` enter block 0 with into `out`
+    /// (`[tokens.len()][hidden]`): the `token_embd` lookup and, for a folded
+    /// checkpoint, the inverse Hadamard transform (design §3.5) — the same
+    /// code [`HybridModel::forward_prefill`] runs, so a text row spliced
+    /// into a multimodal prompt is bit-identical to the same token's row in
+    /// a text-only one.
+    ///
+    /// # Errors
+    ///
+    /// [`ModelError::ShapeMismatch`] for an `out` of the wrong length, and
+    /// the lookup's own errors (e.g. a token id past the vocabulary).
+    pub fn embed_token_rows(&self, tokens: &[u32], out: &mut [f32]) -> ModelResult<()> {
+        crate::hybrid::forward::embed_token_rows(
+            &self.embedding,
+            self.hadamard.as_ref(),
+            tokens,
+            self.config.base.hidden_size,
+            out,
+        )
     }
 
     /// Bytes held by the activation scratch at its current chunk capacity.
@@ -733,7 +969,9 @@ impl<'a> HybridModel<'a> {
         self.scratch.memory_bytes()
     }
 
-    /// Clear both caches: the KV cursor **and** the recurrent state (RT-28).
+    /// Clear both caches: the KV cursor **and** the recurrent state (RT-28),
+    /// together with the sequence's M-RoPE offset
+    /// ([`HybridModel::rope_delta`]).
     ///
     /// The recurrent half is the part with no positional masking — a stale
     /// `S` contaminates the next request's very first token rather than
@@ -742,6 +980,7 @@ impl<'a> HybridModel<'a> {
     pub fn reset(&mut self) {
         self.kv_cache.clear();
         self.recurrent.reset();
+        self.rope_offsets.clear();
     }
 
     /// One-line summary for `oxibonsai info` (integration gate G2).

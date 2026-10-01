@@ -20,13 +20,17 @@
 //! * the result goes to the router through
 //!   [`RouterOptions::with_embedder`](oxibonsai_runtime::server::RouterOptions::with_embedder).
 //!
-//! When there can be no embedder — no tokenizer to encode text with, or a
-//! model whose embedder construction genuinely fails — [`build_embedder`]
-//! logs why and returns `None` alongside the reason (`error.code` and a
-//! human-readable message), which the caller hands to the router via
-//! `RouterOptions::with_embedder_unavailable` so the `501` body names it
-//! too, not just the log: a missing embedder is never fatal to serving
-//! chat.
+//! Every supported model kind embeds — a dense (`qwen3`) model through
+//! `BonsaiModel::embed_mean_pooled`, a hybrid (`qwen35`, Bonsai 2) one through
+//! `HybridModel::embed_mean_pooled` — so the kind of model never makes the
+//! route answer `501` by itself. Two things still do: no tokenizer to encode
+//! text with, and a dedicated embedding engine that cannot be built for the
+//! model (a typed engine refusal carrying its own code, or a plain load
+//! failure). [`build_embedder`] then logs why and returns `None` alongside the
+//! reason (`error.code` when the failure carries one, and a human-readable
+//! message), which the caller hands to the router via
+//! `RouterOptions::with_embedder_unavailable` so the `501` body names it too,
+//! not just the log: a missing embedder is never fatal to serving chat.
 
 use std::sync::Arc;
 
@@ -36,9 +40,10 @@ use oxibonsai_runtime::engine_pool::PoolBuild;
 use oxibonsai_runtime::sampling::SamplingParams;
 use oxibonsai_runtime::tokenizer_bridge::TokenizerBridge;
 
-/// Why there is no model-backed embedder: an `error.code` (an engine
-/// refusal's own code, e.g. `NOT_A_DENSE_MODEL`), or `None` for a generic
-/// reason, and a human-readable message — for
+/// Why there is no model-backed embedder: an `error.code` (the failing
+/// engine construction's own typed code, when it carries one), or `None` when
+/// the reason carries none (no tokenizer, an untyped failure), and a
+/// human-readable message — for
 /// `RouterOptions::with_embedder_unavailable`.
 pub type EmbedderUnavailable = (Option<&'static str>, String);
 
@@ -53,8 +58,8 @@ pub fn embedding_window(max_seq_len: usize) -> usize {
 
 /// The model-backed embedder `/v1/embeddings` is served from, or `None` —
 /// the route's honest `501` — when there can be none (see the module docs),
-/// alongside why: an `error.code` (an engine refusal's own code, e.g.
-/// `NOT_A_DENSE_MODEL`) and a human-readable message.
+/// alongside why: an `error.code` (the failing engine construction's own
+/// typed code, when it carries one) and a human-readable message.
 ///
 /// Mirrors `oxibonsai serve`'s own construction exactly: `tokenizer` becomes
 /// the embedder's (a `TokenizerBridge` is not `Clone`, so the caller loads a
@@ -89,6 +94,12 @@ pub fn build_embedder(
             );
             (Some(embedder), None)
         }
+        // `NOT_A_DENSE_MODEL` is what a dense-only refinement of the engine seam
+        // would refuse with (`InferenceEngine::require_dense`). No embedder
+        // path produces it today — dense and hybrid models both embed — so
+        // this is a defensive branch kept in step with `oxibonsai serve`'s
+        // identical construction; a model limitation rather than a failure,
+        // hence `info` and not `warn`.
         Err(e) if engine_error_code(&e) == Some("NOT_A_DENSE_MODEL") => {
             tracing::info!(
                 error = %e,

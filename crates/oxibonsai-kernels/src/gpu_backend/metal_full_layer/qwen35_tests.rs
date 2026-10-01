@@ -1292,3 +1292,148 @@ fn trace_layer_reproduces_the_forward_stage_by_stage() {
         "full layer output",
     );
 }
+
+/// A recurrent-state snapshot taken mid-sequence and restored after the
+/// sequence wandered on replays the next steps bit for bit (the KV cache
+/// needs no copy: the replay rewrites every position it reads), and a
+/// snapshot of another geometry is refused without touching the state.
+#[test]
+fn recurrent_snapshot_restores_the_state_bit_for_bit() {
+    if session().is_none() {
+        return;
+    }
+    let tiny = TinyModel::new(33);
+    let weights = tiny.weights();
+    let c = tiny.cfg.clone();
+    let mut model = Qwen35GpuModel::new(&weights, Qwen35Residency::Copied).expect("model");
+    let mut rng = Rng::new(12);
+    let prompt = rng.vec(5 * c.hidden, 1.0);
+    let steps: Vec<Vec<f32>> = (0..8).map(|_| rng.vec(c.hidden, 1.0)).collect();
+    let mut logits = vec![0.0f32; c.vocab];
+    model
+        .forward(&prompt, 0, Some(&mut logits))
+        .expect("prefill");
+
+    let snapshot = model.snapshot_state();
+    assert_eq!(snapshot.bytes(), model.recurrent_state_bytes());
+    let decode = |model: &mut Qwen35GpuModel<'_>| -> Vec<Vec<f32>> {
+        steps
+            .iter()
+            .enumerate()
+            .map(|(i, row)| {
+                let mut out = vec![0.0f32; c.vocab];
+                model.forward(row, 5 + i, Some(&mut out)).expect("decode");
+                out
+            })
+            .collect()
+    };
+    let reference = decode(&mut model);
+    // Wander off: more tokens, then restore and replay.
+    let mut scratch = vec![0.0f32; c.vocab];
+    for pos in 13..16 {
+        model
+            .forward(&steps[pos % steps.len()], pos, Some(&mut scratch))
+            .expect("wander");
+    }
+    model.restore_state(&snapshot).expect("restore");
+    let replayed = decode(&mut model);
+    for (i, (a, b)) in replayed.iter().zip(&reference).enumerate() {
+        assert_bits(a, b, &format!("replayed step {i}"));
+    }
+
+    let mut foreign = snapshot.clone();
+    foreign.ssm.pop();
+    let before = model.snapshot_state();
+    let err = model
+        .restore_state(&foreign)
+        .expect_err("a snapshot of another geometry must be refused");
+    assert!(
+        matches!(err, MetalGraphError::InvalidDimensions(_)),
+        "{err}"
+    );
+    assert!(
+        model.snapshot_state() == before,
+        "a refused restore must leave the state untouched"
+    );
+}
+
+/// The footprint the context budget is computed from is exactly what the
+/// encoder allocates, and it reproduces the 27B's documented per-position
+/// (65 888 B) and recurrent (156 893 184 B) figures.
+#[test]
+fn footprint_matches_the_allocations_and_the_27b_figures() {
+    let cfg_27b = Qwen35GpuConfig {
+        hidden: 5120,
+        intermediate: 17408,
+        n_heads: 24,
+        n_kv_heads: 4,
+        head_dim: 256,
+        n_rot: 64,
+        n_k_heads: 16,
+        n_v_heads: 48,
+        head_k_dim: 128,
+        head_v_dim: 128,
+        conv_kernel: 4,
+        rms_eps: 1e-6,
+        hadamard_block: Some(1024),
+        vocab: 248_320,
+        max_seq_len: 8192,
+        max_batch: 512,
+    };
+    let fp = qwen35_footprint(&cfg_27b, 16, 48);
+    assert_eq!(fp.kv_bytes_per_position, 65_536);
+    assert_eq!(fp.kv_buffer_bytes_per_position, 32_768);
+    assert_eq!(fp.per_position_bytes, 65_888);
+    assert_eq!(fp.recurrent_bytes, 156_893_184);
+    // Recurrent state + logits + 140 384 scratch floats x 512 tokens.
+    assert_eq!(
+        fp.fixed_bytes,
+        156_893_184 + 248_320 * 4 + 140_384 * 4 * 512
+    );
+    // 8192 positions: 512 MiB of f16 KV plus the rope angles and score row.
+    assert_eq!(fp.window_bytes(8192), (512 << 20) + 8192 * (64 + 24) * 4);
+    assert_eq!(
+        fp.resident_bytes(8192),
+        fp.fixed_bytes + fp.window_bytes(8192)
+    );
+
+    if session().is_none() {
+        return;
+    }
+    let tiny = TinyModel::new(4);
+    let model = Qwen35GpuModel::new(&tiny.weights(), Qwen35Residency::Copied).expect("model");
+    let fp = model.footprint();
+    assert_eq!(fp.recurrent_bytes, model.recurrent_state_bytes());
+    assert_eq!(
+        fp.kv_bytes_per_position * tiny.cfg.max_seq_len as u64,
+        model.kv_cache_bytes()
+    );
+    assert!(model.device_allocated_bytes() >= model.kv_cache_bytes());
+    let limits = Qwen35DeviceLimits::of_shared_device().expect("device limits");
+    assert!(limits.max_buffer_length > 0 && limits.recommended_working_set > 0);
+    assert_eq!(
+        limits.context_capacity(&tiny.cfg, 1, 1, model.weight_bytes()),
+        Qwen35GpuModel::max_context(&tiny.cfg, 1, 1, model.weight_bytes(), &model.graph)
+    );
+}
+
+/// Only a non-empty slice that starts on a host page boundary is bound in
+/// place; anything else is left for the caller to copy.
+#[test]
+fn page_aligned_region_takes_only_page_aligned_slices() {
+    let page = host_page_size();
+    let layout = std::alloc::Layout::from_size_align(3 * page, page).expect("layout");
+    // SAFETY: non-zero size; freed at the end of the test.
+    let base = unsafe { std::alloc::alloc_zeroed(layout) };
+    assert!(!base.is_null());
+    // SAFETY: the allocation holds `3 * page` initialised bytes.
+    let all = unsafe { std::slice::from_raw_parts(base, 3 * page) };
+    let region = Qwen35MappedRegion::page_aligned(all).expect("page-aligned start");
+    assert_eq!(region.len(), 3 * page);
+    assert!(!region.is_empty());
+    assert!(Qwen35MappedRegion::page_aligned(&all[1..]).is_none());
+    assert!(Qwen35MappedRegion::page_aligned(&all[page..page + 1]).is_some());
+    assert!(Qwen35MappedRegion::page_aligned(&all[..0]).is_none());
+    // SAFETY: allocated above with this layout; nothing borrows it now.
+    unsafe { std::alloc::dealloc(base, layout) };
+}

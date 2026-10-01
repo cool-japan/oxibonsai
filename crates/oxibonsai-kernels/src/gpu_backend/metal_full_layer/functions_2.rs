@@ -8,6 +8,7 @@ use super::super::metal_graph::{
 };
 use super::functions::gpu_profile;
 use super::types::{FullLayerBuffers, GpuKvCache, WeightKey, WeightKind, LEGACY_MODEL_EPOCH};
+use metal::objc::rc::autoreleasepool;
 use metal::{MTLResourceOptions, MTLSize};
 use std::sync::Arc;
 
@@ -521,75 +522,77 @@ impl MetalGraph {
         max_seq_len: usize,
         n_layers: usize,
     ) -> Result<(), MetalGraphError> {
-        let half_dim = head_dim / 2;
-        if hidden.len() < hidden_size {
-            return Err(MetalGraphError::EncodingFailed(format!(
-                "hidden too short: need {hidden_size}, got {}",
-                hidden.len()
-            )));
-        }
-        if rope_cos.len() < half_dim {
-            return Err(MetalGraphError::EncodingFailed(format!(
-                "rope_cos too short: need {half_dim}, got {}",
-                rope_cos.len()
-            )));
-        }
-        if rope_sin.len() < half_dim {
-            return Err(MetalGraphError::EncodingFailed(format!(
-                "rope_sin too short: need {half_dim}, got {}",
-                rope_sin.len()
-            )));
-        }
-        let fl_guard = self.acquire_full_layer_buffers(
-            hidden_size,
-            intermediate_size,
-            nq,
-            nkv,
-            head_dim,
-            max_seq_len,
-        )?;
-        let bufs = fl_guard.as_ref().ok_or_else(|| {
-            MetalGraphError::ExecutionFailed("full_layer_buffers not allocated".into())
-        })?;
-        let kv_guard = self.acquire_kv_cache(n_layers, nkv, max_seq_len, head_dim)?;
-        let kv = kv_guard
-            .as_ref()
-            .ok_or_else(|| MetalGraphError::ExecutionFailed("kv_cache not allocated".into()))?;
-        unsafe {
-            upload_f32(&bufs.hidden_buf, &hidden[..hidden_size]);
-            upload_f32(&bufs.cos_buf, &rope_cos[..half_dim]);
-            upload_f32(&bufs.sin_buf, &rope_sin[..half_dim]);
-        }
-        let cmd_buf = self.command_queue.new_command_buffer();
-        let encoder = cmd_buf.new_compute_command_encoder();
-        self.encode_layer_into(
-            encoder,
-            bufs,
-            kv,
-            layer_idx,
-            pos,
-            attn_norm_w,
-            fused_qkv_w,
-            q_norm_w,
-            k_norm_w,
-            attn_proj_w,
-            ffn_norm_w,
-            gate_up_w,
-            down_w,
-            hidden_size,
-            intermediate_size,
-            nq,
-            nkv,
-            head_dim,
-            eps,
-            max_seq_len,
-        )?;
-        encoder.end_encoding();
-        commit_and_wait(cmd_buf, "encode_full_layer")?;
-        unsafe {
-            download_f32(&bufs.hidden_buf, &mut hidden[..hidden_size]);
-        }
-        Ok(())
+        autoreleasepool(|| {
+            let half_dim = head_dim / 2;
+            if hidden.len() < hidden_size {
+                return Err(MetalGraphError::EncodingFailed(format!(
+                    "hidden too short: need {hidden_size}, got {}",
+                    hidden.len()
+                )));
+            }
+            if rope_cos.len() < half_dim {
+                return Err(MetalGraphError::EncodingFailed(format!(
+                    "rope_cos too short: need {half_dim}, got {}",
+                    rope_cos.len()
+                )));
+            }
+            if rope_sin.len() < half_dim {
+                return Err(MetalGraphError::EncodingFailed(format!(
+                    "rope_sin too short: need {half_dim}, got {}",
+                    rope_sin.len()
+                )));
+            }
+            let fl_guard = self.acquire_full_layer_buffers(
+                hidden_size,
+                intermediate_size,
+                nq,
+                nkv,
+                head_dim,
+                max_seq_len,
+            )?;
+            let bufs = fl_guard.as_ref().ok_or_else(|| {
+                MetalGraphError::ExecutionFailed("full_layer_buffers not allocated".into())
+            })?;
+            let kv_guard = self.acquire_kv_cache(n_layers, nkv, max_seq_len, head_dim)?;
+            let kv = kv_guard
+                .as_ref()
+                .ok_or_else(|| MetalGraphError::ExecutionFailed("kv_cache not allocated".into()))?;
+            unsafe {
+                upload_f32(&bufs.hidden_buf, &hidden[..hidden_size]);
+                upload_f32(&bufs.cos_buf, &rope_cos[..half_dim]);
+                upload_f32(&bufs.sin_buf, &rope_sin[..half_dim]);
+            }
+            let cmd_buf = self.command_queue.new_command_buffer();
+            let encoder = cmd_buf.new_compute_command_encoder();
+            self.encode_layer_into(
+                encoder,
+                bufs,
+                kv,
+                layer_idx,
+                pos,
+                attn_norm_w,
+                fused_qkv_w,
+                q_norm_w,
+                k_norm_w,
+                attn_proj_w,
+                ffn_norm_w,
+                gate_up_w,
+                down_w,
+                hidden_size,
+                intermediate_size,
+                nq,
+                nkv,
+                head_dim,
+                eps,
+                max_seq_len,
+            )?;
+            encoder.end_encoding();
+            commit_and_wait(cmd_buf, "encode_full_layer")?;
+            unsafe {
+                download_f32(&bufs.hidden_buf, &mut hidden[..hidden_size]);
+            }
+            Ok(())
+        })
     }
     /// Ternary (TQ2_0_g128) twin of `Self::encode_full_layer`.
     ///
@@ -622,75 +625,77 @@ impl MetalGraph {
         max_seq_len: usize,
         n_layers: usize,
     ) -> Result<(), MetalGraphError> {
-        let half_dim = head_dim / 2;
-        if hidden.len() < hidden_size {
-            return Err(MetalGraphError::EncodingFailed(format!(
-                "hidden too short: need {hidden_size}, got {}",
-                hidden.len()
-            )));
-        }
-        if rope_cos.len() < half_dim {
-            return Err(MetalGraphError::EncodingFailed(format!(
-                "rope_cos too short: need {half_dim}, got {}",
-                rope_cos.len()
-            )));
-        }
-        if rope_sin.len() < half_dim {
-            return Err(MetalGraphError::EncodingFailed(format!(
-                "rope_sin too short: need {half_dim}, got {}",
-                rope_sin.len()
-            )));
-        }
-        let fl_guard = self.acquire_full_layer_buffers(
-            hidden_size,
-            intermediate_size,
-            nq,
-            nkv,
-            head_dim,
-            max_seq_len,
-        )?;
-        let bufs = fl_guard.as_ref().ok_or_else(|| {
-            MetalGraphError::ExecutionFailed("full_layer_buffers not allocated".into())
-        })?;
-        let kv_guard = self.acquire_kv_cache(n_layers, nkv, max_seq_len, head_dim)?;
-        let kv = kv_guard
-            .as_ref()
-            .ok_or_else(|| MetalGraphError::ExecutionFailed("kv_cache not allocated".into()))?;
-        unsafe {
-            upload_f32(&bufs.hidden_buf, &hidden[..hidden_size]);
-            upload_f32(&bufs.cos_buf, &rope_cos[..half_dim]);
-            upload_f32(&bufs.sin_buf, &rope_sin[..half_dim]);
-        }
-        let cmd_buf = self.command_queue.new_command_buffer();
-        let encoder = cmd_buf.new_compute_command_encoder();
-        self.encode_layer_into_ternary(
-            encoder,
-            bufs,
-            kv,
-            layer_idx,
-            pos,
-            attn_norm_w,
-            fused_qkv_w,
-            q_norm_w,
-            k_norm_w,
-            attn_proj_w,
-            ffn_norm_w,
-            gate_up_w,
-            down_w,
-            hidden_size,
-            intermediate_size,
-            nq,
-            nkv,
-            head_dim,
-            eps,
-            max_seq_len,
-        )?;
-        encoder.end_encoding();
-        commit_and_wait(cmd_buf, "encode_full_layer_ternary")?;
-        unsafe {
-            download_f32(&bufs.hidden_buf, &mut hidden[..hidden_size]);
-        }
-        Ok(())
+        autoreleasepool(|| {
+            let half_dim = head_dim / 2;
+            if hidden.len() < hidden_size {
+                return Err(MetalGraphError::EncodingFailed(format!(
+                    "hidden too short: need {hidden_size}, got {}",
+                    hidden.len()
+                )));
+            }
+            if rope_cos.len() < half_dim {
+                return Err(MetalGraphError::EncodingFailed(format!(
+                    "rope_cos too short: need {half_dim}, got {}",
+                    rope_cos.len()
+                )));
+            }
+            if rope_sin.len() < half_dim {
+                return Err(MetalGraphError::EncodingFailed(format!(
+                    "rope_sin too short: need {half_dim}, got {}",
+                    rope_sin.len()
+                )));
+            }
+            let fl_guard = self.acquire_full_layer_buffers(
+                hidden_size,
+                intermediate_size,
+                nq,
+                nkv,
+                head_dim,
+                max_seq_len,
+            )?;
+            let bufs = fl_guard.as_ref().ok_or_else(|| {
+                MetalGraphError::ExecutionFailed("full_layer_buffers not allocated".into())
+            })?;
+            let kv_guard = self.acquire_kv_cache(n_layers, nkv, max_seq_len, head_dim)?;
+            let kv = kv_guard
+                .as_ref()
+                .ok_or_else(|| MetalGraphError::ExecutionFailed("kv_cache not allocated".into()))?;
+            unsafe {
+                upload_f32(&bufs.hidden_buf, &hidden[..hidden_size]);
+                upload_f32(&bufs.cos_buf, &rope_cos[..half_dim]);
+                upload_f32(&bufs.sin_buf, &rope_sin[..half_dim]);
+            }
+            let cmd_buf = self.command_queue.new_command_buffer();
+            let encoder = cmd_buf.new_compute_command_encoder();
+            self.encode_layer_into_ternary(
+                encoder,
+                bufs,
+                kv,
+                layer_idx,
+                pos,
+                attn_norm_w,
+                fused_qkv_w,
+                q_norm_w,
+                k_norm_w,
+                attn_proj_w,
+                ffn_norm_w,
+                gate_up_w,
+                down_w,
+                hidden_size,
+                intermediate_size,
+                nq,
+                nkv,
+                head_dim,
+                eps,
+                max_seq_len,
+            )?;
+            encoder.end_encoding();
+            commit_and_wait(cmd_buf, "encode_full_layer_ternary")?;
+            unsafe {
+                download_f32(&bufs.hidden_buf, &mut hidden[..hidden_size]);
+            }
+            Ok(())
+        })
     }
     /// Encode ALL transformer layers into a SINGLE Metal command buffer.
     ///
@@ -733,166 +738,168 @@ impl MetalGraph {
         logits_out: Option<&mut Vec<f32>>,
         greedy_token_id_out: Option<&mut u32>,
     ) -> Result<(), MetalGraphError> {
-        let half_dim = head_dim / 2;
-        if hidden.len() < hidden_size {
-            return Err(MetalGraphError::EncodingFailed(format!(
-                "hidden too short: need {hidden_size}, got {}",
-                hidden.len()
-            )));
-        }
-        if rope_cos.len() < half_dim {
-            return Err(MetalGraphError::EncodingFailed(format!(
-                "rope_cos too short: need {half_dim}, got {}",
-                rope_cos.len()
-            )));
-        }
-        if rope_sin.len() < half_dim {
-            return Err(MetalGraphError::EncodingFailed(format!(
-                "rope_sin too short: need {half_dim}, got {}",
-                rope_sin.len()
-            )));
-        }
-        if layer_weights.len() != n_layers {
-            return Err(MetalGraphError::EncodingFailed(format!(
-                "layer_weights length mismatch: need {n_layers}, got {}",
-                layer_weights.len()
-            )));
-        }
-        let fl_guard = self.acquire_full_layer_buffers(
-            hidden_size,
-            intermediate_size,
-            nq,
-            nkv,
-            head_dim,
-            max_seq_len,
-        )?;
-        let bufs = fl_guard.as_ref().ok_or_else(|| {
-            MetalGraphError::ExecutionFailed("full_layer_buffers not allocated".into())
-        })?;
-        let kv_guard = self.acquire_kv_cache(n_layers, nkv, max_seq_len, head_dim)?;
-        let kv = kv_guard
-            .as_ref()
-            .ok_or_else(|| MetalGraphError::ExecutionFailed("kv_cache not allocated".into()))?;
-        unsafe {
-            upload_f32(&bufs.hidden_buf, &hidden[..hidden_size]);
-            upload_f32(&bufs.cos_buf, &rope_cos[..half_dim]);
-            upload_f32(&bufs.sin_buf, &rope_sin[..half_dim]);
-        }
-        let profiling = gpu_profile::full_profiling_enabled();
-        let gpu_profiling = gpu_profile::is_enabled();
-        if profiling {
-            let mut layer_times = Vec::with_capacity(n_layers);
-            for (layer_idx, weights) in layer_weights.iter().enumerate() {
-                let layer_cmd = self.command_queue.new_command_buffer();
-                let layer_enc = layer_cmd.new_compute_command_encoder();
-                self.encode_layer_into(
-                    layer_enc,
-                    bufs,
-                    kv,
-                    layer_idx,
-                    pos,
-                    weights.0,
-                    weights.1,
-                    weights.2,
-                    weights.3,
-                    weights.4,
-                    weights.5,
-                    weights.6,
-                    weights.7,
-                    hidden_size,
-                    intermediate_size,
-                    nq,
-                    nkv,
-                    head_dim,
-                    eps,
-                    max_seq_len,
-                )?;
-                layer_enc.end_encoding();
-                let t = std::time::Instant::now();
-                commit_and_wait(layer_cmd, "encode_full_forward layer")?;
-                let elapsed_ms = t.elapsed().as_secs_f64() * 1000.0;
-                layer_times.push(elapsed_ms);
-                eprintln!("[profile] layer {:2} = {:.3}ms", layer_idx, elapsed_ms);
+        autoreleasepool(|| {
+            let half_dim = head_dim / 2;
+            if hidden.len() < hidden_size {
+                return Err(MetalGraphError::EncodingFailed(format!(
+                    "hidden too short: need {hidden_size}, got {}",
+                    hidden.len()
+                )));
             }
-            let sum: f64 = layer_times.iter().sum();
-            let min = layer_times.iter().cloned().fold(f64::INFINITY, f64::min);
-            let max = layer_times
-                .iter()
-                .cloned()
-                .fold(f64::NEG_INFINITY, f64::max);
-            eprintln!(
-                "[profile] layers total={:.3}ms  avg={:.3}ms  min={:.3}ms  max={:.3}ms",
-                sum,
-                sum / n_layers as f64,
-                min,
-                max,
-            );
-            let tail_cmd = self.command_queue.new_command_buffer();
-            let tail_enc = tail_cmd.new_compute_command_encoder();
-            self.encode_tail_and_commit(
-                tail_enc,
-                tail_cmd,
-                bufs,
-                hidden,
+            if rope_cos.len() < half_dim {
+                return Err(MetalGraphError::EncodingFailed(format!(
+                    "rope_cos too short: need {half_dim}, got {}",
+                    rope_cos.len()
+                )));
+            }
+            if rope_sin.len() < half_dim {
+                return Err(MetalGraphError::EncodingFailed(format!(
+                    "rope_sin too short: need {half_dim}, got {}",
+                    rope_sin.len()
+                )));
+            }
+            if layer_weights.len() != n_layers {
+                return Err(MetalGraphError::EncodingFailed(format!(
+                    "layer_weights length mismatch: need {n_layers}, got {}",
+                    layer_weights.len()
+                )));
+            }
+            let fl_guard = self.acquire_full_layer_buffers(
                 hidden_size,
-                final_norm_w,
-                final_norm_eps,
-                lm_head_w,
-                lm_head_out_features,
-                logits_out,
-                greedy_token_id_out,
-                true,
-                None,
+                intermediate_size,
+                nq,
+                nkv,
+                head_dim,
+                max_seq_len,
             )?;
-        } else {
-            let wall_start = if gpu_profiling {
-                Some(std::time::Instant::now())
+            let bufs = fl_guard.as_ref().ok_or_else(|| {
+                MetalGraphError::ExecutionFailed("full_layer_buffers not allocated".into())
+            })?;
+            let kv_guard = self.acquire_kv_cache(n_layers, nkv, max_seq_len, head_dim)?;
+            let kv = kv_guard
+                .as_ref()
+                .ok_or_else(|| MetalGraphError::ExecutionFailed("kv_cache not allocated".into()))?;
+            unsafe {
+                upload_f32(&bufs.hidden_buf, &hidden[..hidden_size]);
+                upload_f32(&bufs.cos_buf, &rope_cos[..half_dim]);
+                upload_f32(&bufs.sin_buf, &rope_sin[..half_dim]);
+            }
+            let profiling = gpu_profile::full_profiling_enabled();
+            let gpu_profiling = gpu_profile::is_enabled();
+            if profiling {
+                let mut layer_times = Vec::with_capacity(n_layers);
+                for (layer_idx, weights) in layer_weights.iter().enumerate() {
+                    let layer_cmd = self.command_queue.new_command_buffer();
+                    let layer_enc = layer_cmd.new_compute_command_encoder();
+                    self.encode_layer_into(
+                        layer_enc,
+                        bufs,
+                        kv,
+                        layer_idx,
+                        pos,
+                        weights.0,
+                        weights.1,
+                        weights.2,
+                        weights.3,
+                        weights.4,
+                        weights.5,
+                        weights.6,
+                        weights.7,
+                        hidden_size,
+                        intermediate_size,
+                        nq,
+                        nkv,
+                        head_dim,
+                        eps,
+                        max_seq_len,
+                    )?;
+                    layer_enc.end_encoding();
+                    let t = std::time::Instant::now();
+                    commit_and_wait(layer_cmd, "encode_full_forward layer")?;
+                    let elapsed_ms = t.elapsed().as_secs_f64() * 1000.0;
+                    layer_times.push(elapsed_ms);
+                    eprintln!("[profile] layer {:2} = {:.3}ms", layer_idx, elapsed_ms);
+                }
+                let sum: f64 = layer_times.iter().sum();
+                let min = layer_times.iter().cloned().fold(f64::INFINITY, f64::min);
+                let max = layer_times
+                    .iter()
+                    .cloned()
+                    .fold(f64::NEG_INFINITY, f64::max);
+                eprintln!(
+                    "[profile] layers total={:.3}ms  avg={:.3}ms  min={:.3}ms  max={:.3}ms",
+                    sum,
+                    sum / n_layers as f64,
+                    min,
+                    max,
+                );
+                let tail_cmd = self.command_queue.new_command_buffer();
+                let tail_enc = tail_cmd.new_compute_command_encoder();
+                self.encode_tail_and_commit(
+                    tail_enc,
+                    tail_cmd,
+                    bufs,
+                    hidden,
+                    hidden_size,
+                    final_norm_w,
+                    final_norm_eps,
+                    lm_head_w,
+                    lm_head_out_features,
+                    logits_out,
+                    greedy_token_id_out,
+                    true,
+                    None,
+                )?;
             } else {
-                None
-            };
-            let cmd_buf = self.command_queue.new_command_buffer();
-            let encoder = cmd_buf.new_compute_command_encoder();
-            for (layer_idx, weights) in layer_weights.iter().enumerate() {
-                self.encode_layer_into(
+                let wall_start = if gpu_profiling {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                let cmd_buf = self.command_queue.new_command_buffer();
+                let encoder = cmd_buf.new_compute_command_encoder();
+                for (layer_idx, weights) in layer_weights.iter().enumerate() {
+                    self.encode_layer_into(
+                        encoder,
+                        bufs,
+                        kv,
+                        layer_idx,
+                        pos,
+                        weights.0,
+                        weights.1,
+                        weights.2,
+                        weights.3,
+                        weights.4,
+                        weights.5,
+                        weights.6,
+                        weights.7,
+                        hidden_size,
+                        intermediate_size,
+                        nq,
+                        nkv,
+                        head_dim,
+                        eps,
+                        max_seq_len,
+                    )?;
+                }
+                self.encode_tail_and_commit(
                     encoder,
+                    cmd_buf,
                     bufs,
-                    kv,
-                    layer_idx,
-                    pos,
-                    weights.0,
-                    weights.1,
-                    weights.2,
-                    weights.3,
-                    weights.4,
-                    weights.5,
-                    weights.6,
-                    weights.7,
+                    hidden,
                     hidden_size,
-                    intermediate_size,
-                    nq,
-                    nkv,
-                    head_dim,
-                    eps,
-                    max_seq_len,
+                    final_norm_w,
+                    final_norm_eps,
+                    lm_head_w,
+                    lm_head_out_features,
+                    logits_out,
+                    greedy_token_id_out,
+                    false,
+                    wall_start,
                 )?;
             }
-            self.encode_tail_and_commit(
-                encoder,
-                cmd_buf,
-                bufs,
-                hidden,
-                hidden_size,
-                final_norm_w,
-                final_norm_eps,
-                lm_head_w,
-                lm_head_out_features,
-                logits_out,
-                greedy_token_id_out,
-                false,
-                wall_start,
-            )?;
-        }
-        Ok(())
+            Ok(())
+        })
     }
     /// Ternary (TQ2_0_g128) twin of `Self::encode_full_forward`.
     ///
@@ -937,166 +944,168 @@ impl MetalGraph {
         logits_out: Option<&mut Vec<f32>>,
         greedy_token_id_out: Option<&mut u32>,
     ) -> Result<(), MetalGraphError> {
-        let half_dim = head_dim / 2;
-        if hidden.len() < hidden_size {
-            return Err(MetalGraphError::EncodingFailed(format!(
-                "hidden too short: need {hidden_size}, got {}",
-                hidden.len()
-            )));
-        }
-        if rope_cos.len() < half_dim {
-            return Err(MetalGraphError::EncodingFailed(format!(
-                "rope_cos too short: need {half_dim}, got {}",
-                rope_cos.len()
-            )));
-        }
-        if rope_sin.len() < half_dim {
-            return Err(MetalGraphError::EncodingFailed(format!(
-                "rope_sin too short: need {half_dim}, got {}",
-                rope_sin.len()
-            )));
-        }
-        if layer_weights.len() != n_layers {
-            return Err(MetalGraphError::EncodingFailed(format!(
-                "layer_weights length mismatch: need {n_layers}, got {}",
-                layer_weights.len()
-            )));
-        }
-        let fl_guard = self.acquire_full_layer_buffers(
-            hidden_size,
-            intermediate_size,
-            nq,
-            nkv,
-            head_dim,
-            max_seq_len,
-        )?;
-        let bufs = fl_guard.as_ref().ok_or_else(|| {
-            MetalGraphError::ExecutionFailed("full_layer_buffers not allocated".into())
-        })?;
-        let kv_guard = self.acquire_kv_cache(n_layers, nkv, max_seq_len, head_dim)?;
-        let kv = kv_guard
-            .as_ref()
-            .ok_or_else(|| MetalGraphError::ExecutionFailed("kv_cache not allocated".into()))?;
-        unsafe {
-            upload_f32(&bufs.hidden_buf, &hidden[..hidden_size]);
-            upload_f32(&bufs.cos_buf, &rope_cos[..half_dim]);
-            upload_f32(&bufs.sin_buf, &rope_sin[..half_dim]);
-        }
-        let profiling = gpu_profile::full_profiling_enabled();
-        let gpu_profiling = gpu_profile::is_enabled();
-        if profiling {
-            let mut layer_times = Vec::with_capacity(n_layers);
-            for (layer_idx, weights) in layer_weights.iter().enumerate() {
-                let layer_cmd = self.command_queue.new_command_buffer();
-                let layer_enc = layer_cmd.new_compute_command_encoder();
-                self.encode_layer_into_ternary(
-                    layer_enc,
-                    bufs,
-                    kv,
-                    layer_idx,
-                    pos,
-                    weights.0,
-                    weights.1,
-                    weights.2,
-                    weights.3,
-                    weights.4,
-                    weights.5,
-                    weights.6,
-                    weights.7,
-                    hidden_size,
-                    intermediate_size,
-                    nq,
-                    nkv,
-                    head_dim,
-                    eps,
-                    max_seq_len,
-                )?;
-                layer_enc.end_encoding();
-                let t = std::time::Instant::now();
-                commit_and_wait(layer_cmd, "encode_full_forward_ternary layer")?;
-                let elapsed_ms = t.elapsed().as_secs_f64() * 1000.0;
-                layer_times.push(elapsed_ms);
-                eprintln!("[profile] layer {:2} = {:.3}ms", layer_idx, elapsed_ms);
+        autoreleasepool(|| {
+            let half_dim = head_dim / 2;
+            if hidden.len() < hidden_size {
+                return Err(MetalGraphError::EncodingFailed(format!(
+                    "hidden too short: need {hidden_size}, got {}",
+                    hidden.len()
+                )));
             }
-            let sum: f64 = layer_times.iter().sum();
-            let min = layer_times.iter().cloned().fold(f64::INFINITY, f64::min);
-            let max = layer_times
-                .iter()
-                .cloned()
-                .fold(f64::NEG_INFINITY, f64::max);
-            eprintln!(
-                "[profile] layers total={:.3}ms  avg={:.3}ms  min={:.3}ms  max={:.3}ms",
-                sum,
-                sum / n_layers as f64,
-                min,
-                max,
-            );
-            let tail_cmd = self.command_queue.new_command_buffer();
-            let tail_enc = tail_cmd.new_compute_command_encoder();
-            self.encode_tail_and_commit_ternary(
-                tail_enc,
-                tail_cmd,
-                bufs,
-                hidden,
+            if rope_cos.len() < half_dim {
+                return Err(MetalGraphError::EncodingFailed(format!(
+                    "rope_cos too short: need {half_dim}, got {}",
+                    rope_cos.len()
+                )));
+            }
+            if rope_sin.len() < half_dim {
+                return Err(MetalGraphError::EncodingFailed(format!(
+                    "rope_sin too short: need {half_dim}, got {}",
+                    rope_sin.len()
+                )));
+            }
+            if layer_weights.len() != n_layers {
+                return Err(MetalGraphError::EncodingFailed(format!(
+                    "layer_weights length mismatch: need {n_layers}, got {}",
+                    layer_weights.len()
+                )));
+            }
+            let fl_guard = self.acquire_full_layer_buffers(
                 hidden_size,
-                final_norm_w,
-                final_norm_eps,
-                lm_head_w,
-                lm_head_out_features,
-                logits_out,
-                greedy_token_id_out,
-                true,
-                None,
+                intermediate_size,
+                nq,
+                nkv,
+                head_dim,
+                max_seq_len,
             )?;
-        } else {
-            let wall_start = if gpu_profiling {
-                Some(std::time::Instant::now())
+            let bufs = fl_guard.as_ref().ok_or_else(|| {
+                MetalGraphError::ExecutionFailed("full_layer_buffers not allocated".into())
+            })?;
+            let kv_guard = self.acquire_kv_cache(n_layers, nkv, max_seq_len, head_dim)?;
+            let kv = kv_guard
+                .as_ref()
+                .ok_or_else(|| MetalGraphError::ExecutionFailed("kv_cache not allocated".into()))?;
+            unsafe {
+                upload_f32(&bufs.hidden_buf, &hidden[..hidden_size]);
+                upload_f32(&bufs.cos_buf, &rope_cos[..half_dim]);
+                upload_f32(&bufs.sin_buf, &rope_sin[..half_dim]);
+            }
+            let profiling = gpu_profile::full_profiling_enabled();
+            let gpu_profiling = gpu_profile::is_enabled();
+            if profiling {
+                let mut layer_times = Vec::with_capacity(n_layers);
+                for (layer_idx, weights) in layer_weights.iter().enumerate() {
+                    let layer_cmd = self.command_queue.new_command_buffer();
+                    let layer_enc = layer_cmd.new_compute_command_encoder();
+                    self.encode_layer_into_ternary(
+                        layer_enc,
+                        bufs,
+                        kv,
+                        layer_idx,
+                        pos,
+                        weights.0,
+                        weights.1,
+                        weights.2,
+                        weights.3,
+                        weights.4,
+                        weights.5,
+                        weights.6,
+                        weights.7,
+                        hidden_size,
+                        intermediate_size,
+                        nq,
+                        nkv,
+                        head_dim,
+                        eps,
+                        max_seq_len,
+                    )?;
+                    layer_enc.end_encoding();
+                    let t = std::time::Instant::now();
+                    commit_and_wait(layer_cmd, "encode_full_forward_ternary layer")?;
+                    let elapsed_ms = t.elapsed().as_secs_f64() * 1000.0;
+                    layer_times.push(elapsed_ms);
+                    eprintln!("[profile] layer {:2} = {:.3}ms", layer_idx, elapsed_ms);
+                }
+                let sum: f64 = layer_times.iter().sum();
+                let min = layer_times.iter().cloned().fold(f64::INFINITY, f64::min);
+                let max = layer_times
+                    .iter()
+                    .cloned()
+                    .fold(f64::NEG_INFINITY, f64::max);
+                eprintln!(
+                    "[profile] layers total={:.3}ms  avg={:.3}ms  min={:.3}ms  max={:.3}ms",
+                    sum,
+                    sum / n_layers as f64,
+                    min,
+                    max,
+                );
+                let tail_cmd = self.command_queue.new_command_buffer();
+                let tail_enc = tail_cmd.new_compute_command_encoder();
+                self.encode_tail_and_commit_ternary(
+                    tail_enc,
+                    tail_cmd,
+                    bufs,
+                    hidden,
+                    hidden_size,
+                    final_norm_w,
+                    final_norm_eps,
+                    lm_head_w,
+                    lm_head_out_features,
+                    logits_out,
+                    greedy_token_id_out,
+                    true,
+                    None,
+                )?;
             } else {
-                None
-            };
-            let cmd_buf = self.command_queue.new_command_buffer();
-            let encoder = cmd_buf.new_compute_command_encoder();
-            for (layer_idx, weights) in layer_weights.iter().enumerate() {
-                self.encode_layer_into_ternary(
+                let wall_start = if gpu_profiling {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                let cmd_buf = self.command_queue.new_command_buffer();
+                let encoder = cmd_buf.new_compute_command_encoder();
+                for (layer_idx, weights) in layer_weights.iter().enumerate() {
+                    self.encode_layer_into_ternary(
+                        encoder,
+                        bufs,
+                        kv,
+                        layer_idx,
+                        pos,
+                        weights.0,
+                        weights.1,
+                        weights.2,
+                        weights.3,
+                        weights.4,
+                        weights.5,
+                        weights.6,
+                        weights.7,
+                        hidden_size,
+                        intermediate_size,
+                        nq,
+                        nkv,
+                        head_dim,
+                        eps,
+                        max_seq_len,
+                    )?;
+                }
+                self.encode_tail_and_commit_ternary(
                     encoder,
+                    cmd_buf,
                     bufs,
-                    kv,
-                    layer_idx,
-                    pos,
-                    weights.0,
-                    weights.1,
-                    weights.2,
-                    weights.3,
-                    weights.4,
-                    weights.5,
-                    weights.6,
-                    weights.7,
+                    hidden,
                     hidden_size,
-                    intermediate_size,
-                    nq,
-                    nkv,
-                    head_dim,
-                    eps,
-                    max_seq_len,
+                    final_norm_w,
+                    final_norm_eps,
+                    lm_head_w,
+                    lm_head_out_features,
+                    logits_out,
+                    greedy_token_id_out,
+                    false,
+                    wall_start,
                 )?;
             }
-            self.encode_tail_and_commit_ternary(
-                encoder,
-                cmd_buf,
-                bufs,
-                hidden,
-                hidden_size,
-                final_norm_w,
-                final_norm_eps,
-                lm_head_w,
-                lm_head_out_features,
-                logits_out,
-                greedy_token_id_out,
-                false,
-                wall_start,
-            )?;
-        }
-        Ok(())
+            Ok(())
+        })
     }
     /// Shared tail: final RMSNorm + LM head + argmax, then commit + wait + download.
     ///

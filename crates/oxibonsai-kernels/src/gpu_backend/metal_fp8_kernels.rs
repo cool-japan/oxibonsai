@@ -33,6 +33,7 @@
 
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
+use metal::objc::rc::autoreleasepool;
 use metal::MTLResourceOptions;
 
 use super::metal_graph::{commit_and_wait, MetalGraph, MetalGraphError};
@@ -115,102 +116,104 @@ fn dispatch_metal_fp8_gemv(
     k: usize,
     variant: Fp8Variant,
 ) -> Result<(), MetalGraphError> {
-    // ── Validate dimensions ─────────────────────────────────────────────────
-    if k == 0 || !k.is_multiple_of(FP8_BLOCK_K) {
-        return Err(MetalGraphError::EncodingFailed(format!(
-            "k = {k} must be a non-zero multiple of {FP8_BLOCK_K}"
-        )));
-    }
-    let blocks_per_row = k / FP8_BLOCK_K;
-    let expected_block_bytes = n_rows.saturating_mul(blocks_per_row) * FP8_BLOCK_BYTES;
-    if blocks.len() != expected_block_bytes {
-        return Err(MetalGraphError::EncodingFailed(format!(
-            "blocks.len() = {} expected {} (n_rows = {n_rows}, k = {k})",
-            blocks.len(),
-            expected_block_bytes
-        )));
-    }
-    if input.len() != k {
-        return Err(MetalGraphError::EncodingFailed(format!(
-            "input.len() = {} expected {k}",
-            input.len()
-        )));
-    }
-    if output.len() != n_rows {
-        return Err(MetalGraphError::EncodingFailed(format!(
-            "output.len() = {} expected {n_rows}",
-            output.len()
-        )));
-    }
+    autoreleasepool(|| {
+        // ── Validate dimensions ─────────────────────────────────────────────────
+        if k == 0 || !k.is_multiple_of(FP8_BLOCK_K) {
+            return Err(MetalGraphError::EncodingFailed(format!(
+                "k = {k} must be a non-zero multiple of {FP8_BLOCK_K}"
+            )));
+        }
+        let blocks_per_row = k / FP8_BLOCK_K;
+        let expected_block_bytes = n_rows.saturating_mul(blocks_per_row) * FP8_BLOCK_BYTES;
+        if blocks.len() != expected_block_bytes {
+            return Err(MetalGraphError::EncodingFailed(format!(
+                "blocks.len() = {} expected {} (n_rows = {n_rows}, k = {k})",
+                blocks.len(),
+                expected_block_bytes
+            )));
+        }
+        if input.len() != k {
+            return Err(MetalGraphError::EncodingFailed(format!(
+                "input.len() = {} expected {k}",
+                input.len()
+            )));
+        }
+        if output.len() != n_rows {
+            return Err(MetalGraphError::EncodingFailed(format!(
+                "output.len() = {} expected {n_rows}",
+                output.len()
+            )));
+        }
 
-    // `MET-10`: the shared device, the *current session's* command queue, and
-    // a pipeline resolved by name from the combined metallib — no private
-    // device, queue or library. `MetalGraph::global()` resolves to the session
-    // bound to this thread (an engine-pool replica's), else the process
-    // default; `pipeline_for` caches the pipeline state by name.
-    let graph = MetalGraph::global()?;
-    let pipeline = graph.pipeline_for(variant.entry())?;
+        // `MET-10`: the shared device, the *current session's* command queue, and
+        // a pipeline resolved by name from the combined metallib — no private
+        // device, queue or library. `MetalGraph::global()` resolves to the session
+        // bound to this thread (an engine-pool replica's), else the process
+        // default; `pipeline_for` caches the pipeline state by name.
+        let graph = MetalGraph::global()?;
+        let pipeline = graph.pipeline_for(variant.entry())?;
 
-    // ── Allocate buffers ────────────────────────────────────────────────────
-    let block_buf = graph.device().new_buffer_with_data(
-        blocks.as_ptr() as *const std::ffi::c_void,
-        blocks.len() as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let input_buf = graph.device().new_buffer_with_data(
-        input.as_ptr() as *const std::ffi::c_void,
-        std::mem::size_of_val(input) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let output_buf = graph.device().new_buffer(
-        (n_rows * std::mem::size_of::<f32>()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    // Zero-initialise output (some Metal drivers leave new buffers uninitialised).
-    unsafe {
-        std::ptr::write_bytes(output_buf.contents() as *mut f32, 0u8, n_rows);
-    }
+        // ── Allocate buffers ────────────────────────────────────────────────────
+        let block_buf = graph.device().new_buffer_with_data(
+            blocks.as_ptr() as *const std::ffi::c_void,
+            blocks.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let input_buf = graph.device().new_buffer_with_data(
+            input.as_ptr() as *const std::ffi::c_void,
+            std::mem::size_of_val(input) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let output_buf = graph.device().new_buffer(
+            (n_rows * std::mem::size_of::<f32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        // Zero-initialise output (some Metal drivers leave new buffers uninitialised).
+        unsafe {
+            std::ptr::write_bytes(output_buf.contents() as *mut f32, 0u8, n_rows);
+        }
 
-    let n_rows_u32 = u32::try_from(n_rows).map_err(|_| {
-        MetalGraphError::EncodingFailed(format!("n_rows = {n_rows} exceeds u32::MAX"))
-    })?;
-    let k_u32 = u32::try_from(k)
-        .map_err(|_| MetalGraphError::EncodingFailed(format!("k = {k} exceeds u32::MAX")))?;
+        let n_rows_u32 = u32::try_from(n_rows).map_err(|_| {
+            MetalGraphError::EncodingFailed(format!("n_rows = {n_rows} exceeds u32::MAX"))
+        })?;
+        let k_u32 = u32::try_from(k)
+            .map_err(|_| MetalGraphError::EncodingFailed(format!("k = {k} exceeds u32::MAX")))?;
 
-    // ── Encode + commit ─────────────────────────────────────────────────────
-    let cmd = graph.command_queue.new_command_buffer();
-    let encoder = cmd.new_compute_command_encoder();
+        // ── Encode + commit ─────────────────────────────────────────────────────
+        let cmd = graph.command_queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
 
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(&block_buf), 0);
-    encoder.set_buffer(1, Some(&input_buf), 0);
-    encoder.set_buffer(2, Some(&output_buf), 0);
-    encoder.set_bytes(
-        3,
-        std::mem::size_of::<u32>() as u64,
-        &n_rows_u32 as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        4,
-        std::mem::size_of::<u32>() as u64,
-        &k_u32 as *const u32 as *const std::ffi::c_void,
-    );
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(&block_buf), 0);
+        encoder.set_buffer(1, Some(&input_buf), 0);
+        encoder.set_buffer(2, Some(&output_buf), 0);
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<u32>() as u64,
+            &n_rows_u32 as *const u32 as *const std::ffi::c_void,
+        );
+        encoder.set_bytes(
+            4,
+            std::mem::size_of::<u32>() as u64,
+            &k_u32 as *const u32 as *const std::ffi::c_void,
+        );
 
-    let n_tgs = n_rows.div_ceil(SIMDS_PER_TG) as u64;
-    let grid = metal::MTLSize::new(n_tgs, 1, 1);
-    let tg_size = metal::MTLSize::new(THREADS_PER_TG, 1, 1);
-    encoder.dispatch_thread_groups(grid, tg_size);
-    encoder.end_encoding();
+        let n_tgs = n_rows.div_ceil(SIMDS_PER_TG) as u64;
+        let grid = metal::MTLSize::new(n_tgs, 1, 1);
+        let tg_size = metal::MTLSize::new(THREADS_PER_TG, 1, 1);
+        encoder.dispatch_thread_groups(grid, tg_size);
+        encoder.end_encoding();
 
-    commit_and_wait(cmd, "metal_gemv_fp8")?;
+        commit_and_wait(cmd, "metal_gemv_fp8")?;
 
-    // ── Read output back ────────────────────────────────────────────────────
-    unsafe {
-        let src = output_buf.contents() as *const f32;
-        std::ptr::copy_nonoverlapping(src, output.as_mut_ptr(), n_rows);
-    }
+        // ── Read output back ────────────────────────────────────────────────────
+        unsafe {
+            let src = output_buf.contents() as *const f32;
+            std::ptr::copy_nonoverlapping(src, output.as_mut_ptr(), n_rows);
+        }
 
-    Ok(())
+        Ok(())
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

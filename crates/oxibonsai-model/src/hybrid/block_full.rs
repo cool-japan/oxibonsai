@@ -8,6 +8,7 @@
 //! qg  = attn_q(a')            [2 * n_head * head_dim], [q|gate] per head
 //! q   = RMSNorm(q_h, attn_q_norm); k = RMSNorm(k_h, attn_k_norm)
 //! q,k = partial NeoX RoPE (n_rot of head_dim, split-half pairs (j, j+n_rot/2))
+//!       at the row's rotary position (text: one axis; image: 3-axis M-RoPE)
 //! o   = GQA(q, k, v, kv_cache[kv_slot], 1/sqrt(head_dim))
 //! o   = o * sigmoid(gate)                          gate is NOT normed, NOT RoPE'd
 //! o'  = hook.rotate(o, n_head * head_dim)
@@ -36,6 +37,18 @@
 //! is copied out of the cache, and the result is bit-identical to widening
 //! the history first and running `fused_attention_head_contiguous` per head
 //! (which is what this body used to do, through `keys_for_owned`).
+//!
+//! # KV slot versus rotary position (design §6.2)
+//!
+//! Every key/value is stored at the row's absolute *sequence* position
+//! (`start_pos + t`) and attention reads the first `start_pos + t + 1` of
+//! them — causal in sequence order. The rotary angle is separate: a text
+//! row rotates at its text position (the precomputed single-axis table),
+//! an image row at its 3-axis M-RoPE position
+//! ([`crate::hybrid::forward::RopeTables::fill_angles`], the same
+//! `mrope_build_tables` angles `MropeTable::apply_heads` uses). For a
+//! text-only prompt the two coincide and nothing here differs from a plain
+//! RoPE model.
 
 use oxibonsai_kernels::norms::sigmoid_mul_simd;
 use oxibonsai_kernels::rope_mrope::rope_partial_splithalf_simd;
@@ -43,11 +56,13 @@ use oxibonsai_kernels::rope_mrope::rope_partial_splithalf_simd;
 use crate::error::{ModelError, ModelResult};
 use crate::hybrid::block::{FullAttnBlock, HybridBlock};
 use crate::hybrid::forward::{
-    folded_input, forward_ffn_chunk, norm_and_rotate, residual_add, scratch_short, ForwardCtx,
+    folded_input, forward_ffn_chunk, norm_and_rotate, residual_add, scratch_short, ChunkRope,
+    ForwardCtx,
 };
 
-/// Run one full-attention layer over a chunk of `t_len` tokens whose first
-/// token sits at absolute position `start_pos`.
+/// Run one full-attention layer over a chunk of `t_len` rows whose first
+/// row sits at absolute sequence position `start_pos`, rotating row `t` at
+/// the position `rope` names for it.
 ///
 /// `ctx.scratch.resid` is both the input and the output: the two residual
 /// adds happen in place, exactly as they would token by token.
@@ -55,14 +70,15 @@ use crate::hybrid::forward::{
 /// # Errors
 ///
 /// [`ModelError::ShapeInvariant`] when `index` is not a full-attention
-/// layer or a geometry relationship does not hold, and anything the
-/// projections, the KV cache, the RoPE table or the attention kernel
-/// return.
+/// layer, a geometry relationship does not hold or `rope` names fewer than
+/// `t_len` positions, and anything the projections, the KV cache, the RoPE
+/// table or the attention kernel return.
 pub(crate) fn forward_full_chunk(
     ctx: &mut ForwardCtx<'_, '_>,
     index: usize,
     t_len: usize,
     start_pos: usize,
+    rope_positions: ChunkRope<'_>,
 ) -> ModelResult<()> {
     // Copy the shared references out of `ctx` first: `&T` is `Copy`, so
     // these are independent of the `&mut` borrows of `ctx.scratch` /
@@ -135,9 +151,36 @@ pub(crate) fn forward_full_chunk(
     }
 
     // ── De-interleave q|gate, per-head norms, RoPE, KV store ────────────
+    //
+    // An image row's angles are built per row into these two buffers; a
+    // text row borrows its precomputed table row directly.
+    let half = n_rot / 2;
+    let mut mrope_cos = Vec::new();
+    let mut mrope_sin = Vec::new();
+    if let ChunkRope::Explicit(positions) = rope_positions {
+        if positions.len() < t_len {
+            return Err(ModelError::ShapeInvariant {
+                tensor: format!("layer {index}: rotary positions"),
+                expected: format!("one position per row ({t_len})"),
+                actual: positions.len().to_string(),
+            });
+        }
+        mrope_cos.resize(half, 0.0f32);
+        mrope_sin.resize(half, 0.0f32);
+    }
     for t in 0..t_len {
         let pos = start_pos + t;
-        let (cos, sin) = rope.angles(pos)?;
+        let (cos, sin): (&[f32], &[f32]) = match rope_positions {
+            ChunkRope::Text { start } => rope.angles(start + t)?,
+            ChunkRope::Explicit(positions) => {
+                let row_pos = positions
+                    .get(t)
+                    .copied()
+                    .ok_or_else(|| scratch_short("rotary positions", t + 1))?;
+                rope.fill_angles(row_pos, &mut mrope_cos, &mut mrope_sin)?;
+                (&mrope_cos, &mrope_sin)
+            }
+        };
         let sc = &mut *ctx.scratch;
 
         for h in 0..n_heads {

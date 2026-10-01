@@ -20,6 +20,7 @@
 //! reuse the existing `dispatch_residual_add` (no new kernel); the mid-block
 //! attention stays on CPU for the first cut.
 
+use metal::objc::rc::autoreleasepool;
 use metal::MTLResourceOptions;
 
 use super::buffers::{alloc_buf, commit_and_wait, download_f32, upload_f32};
@@ -270,89 +271,91 @@ impl MetalGraph {
         patch_dim: usize,
         w_out: usize,
     ) -> Result<(), MetalGraphError> {
-        let shared = MTLResourceOptions::StorageModeShared;
-        let private = MTLResourceOptions::StorageModePrivate;
+        autoreleasepool(|| {
+            let shared = MTLResourceOptions::StorageModeShared;
+            let private = MTLResourceOptions::StorageModePrivate;
 
-        // Upload the NCHW input once (shared so im2col reads it directly).
-        let input_bytes = std::mem::size_of_val(input) as u64;
-        let input_buf = alloc_buf(&self.device, input_bytes, shared)?;
-        unsafe { upload_f32(&input_buf, input) };
+            // Upload the NCHW input once (shared so im2col reads it directly).
+            let input_bytes = std::mem::size_of_val(input) as u64;
+            let input_buf = alloc_buf(&self.device, input_bytes, shared)?;
+            unsafe { upload_f32(&input_buf, input) };
 
-        // Tile the output rows so the patch buffer stays ≤ the cap.
-        let patch_row_bytes = patch_dim
-            .checked_mul(std::mem::size_of::<f32>())
-            .ok_or_else(|| {
-                MetalGraphError::InvalidDimensions(
-                    "encode_conv2d_f32: patch row byte size overflow".into(),
-                )
-            })?;
-        let tile_rows = (IM2COL_TILE_CAP_BYTES / patch_row_bytes.max(1))
-            .max(1)
-            .min(spatial);
+            // Tile the output rows so the patch buffer stays ≤ the cap.
+            let patch_row_bytes = patch_dim
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or_else(|| {
+                    MetalGraphError::InvalidDimensions(
+                        "encode_conv2d_f32: patch row byte size overflow".into(),
+                    )
+                })?;
+            let tile_rows = (IM2COL_TILE_CAP_BYTES / patch_row_bytes.max(1))
+                .max(1)
+                .min(spatial);
 
-        // GPU-private patch scratch [tile_rows, patch_dim]; shared output tile
-        // [tile_rows, c_out] for download.
-        let patches_bytes = (tile_rows * patch_dim * std::mem::size_of::<f32>()) as u64;
-        let patches_buf = alloc_buf(&self.device, patches_bytes, private)?;
-        let out_tile_bytes = (tile_rows * c_out * std::mem::size_of::<f32>()) as u64;
-        let out_tile_buf = alloc_buf(&self.device, out_tile_bytes, shared)?;
+            // GPU-private patch scratch [tile_rows, patch_dim]; shared output tile
+            // [tile_rows, c_out] for download.
+            let patches_bytes = (tile_rows * patch_dim * std::mem::size_of::<f32>()) as u64;
+            let patches_buf = alloc_buf(&self.device, patches_bytes, private)?;
+            let out_tile_bytes = (tile_rows * c_out * std::mem::size_of::<f32>()) as u64;
+            let out_tile_buf = alloc_buf(&self.device, out_tile_bytes, shared)?;
 
-        let mut out_tile = vec![0f32; tile_rows * c_out];
+            let mut out_tile = vec![0f32; tile_rows * c_out];
 
-        let mut row_start = 0usize;
-        while row_start < spatial {
-            let rows = (spatial - row_start).min(tile_rows);
-            let n_elems = rows * patch_dim;
+            let mut row_start = 0usize;
+            while row_start < spatial {
+                let rows = (spatial - row_start).min(tile_rows);
+                let n_elems = rows * patch_dim;
 
-            let cmd_buf = self.command_queue.new_command_buffer();
-            let encoder = cmd_buf.new_compute_command_encoder();
+                let cmd_buf = self.command_queue.new_command_buffer();
+                let encoder = cmd_buf.new_compute_command_encoder();
 
-            // im2col → patches [rows, patch_dim] (GPU-private).
-            self.dispatch_im2col_f32(
-                encoder,
-                &input_buf,
-                &patches_buf,
-                c_in as u32,
-                h as u32,
-                w as u32,
-                k as u32,
-                pad as u32,
-                w_out as u32,
-                row_start as u32,
-                n_elems as u32,
-            );
-            // GEMM: out_tile[rows, c_out] = patches[rows, patch_dim] · weightᵀ.
-            // Same buffer-(0/1/2) contract as encode_gemm_f32's dispatch; the
-            // RAW dependency on `patches_buf` is enforced by Metal's automatic
-            // hazard tracking (single non-concurrent encoder).
-            self.dispatch_gemm_f32(
-                encoder,
-                &weight.buffer,
-                &patches_buf,
-                &out_tile_buf,
-                c_out as u32,
-                patch_dim as u32,
-                rows as u32,
-            );
+                // im2col → patches [rows, patch_dim] (GPU-private).
+                self.dispatch_im2col_f32(
+                    encoder,
+                    &input_buf,
+                    &patches_buf,
+                    c_in as u32,
+                    h as u32,
+                    w as u32,
+                    k as u32,
+                    pad as u32,
+                    w_out as u32,
+                    row_start as u32,
+                    n_elems as u32,
+                );
+                // GEMM: out_tile[rows, c_out] = patches[rows, patch_dim] · weightᵀ.
+                // Same buffer-(0/1/2) contract as encode_gemm_f32's dispatch; the
+                // RAW dependency on `patches_buf` is enforced by Metal's automatic
+                // hazard tracking (single non-concurrent encoder).
+                self.dispatch_gemm_f32(
+                    encoder,
+                    &weight.buffer,
+                    &patches_buf,
+                    &out_tile_buf,
+                    c_out as u32,
+                    patch_dim as u32,
+                    rows as u32,
+                );
 
-            encoder.end_encoding();
-            commit_and_wait(cmd_buf, "encode_conv2d_f32_im2col")?;
+                encoder.end_encoding();
+                commit_and_wait(cmd_buf, "encode_conv2d_f32_im2col")?;
 
-            // Download this tile and scatter into NCHW output with bias.
-            // out_tile is row-major [rows, c_out] (outputs[m*c_out + oc]).
-            unsafe { download_f32(&out_tile_buf, &mut out_tile[..rows * c_out]) };
-            for local_row in 0..rows {
-                let out_idx = row_start + local_row;
-                let base = local_row * c_out;
-                for oc in 0..c_out {
-                    output[oc * spatial + out_idx] = out_tile[base + oc] + bias[oc];
+                // Download this tile and scatter into NCHW output with bias.
+                // out_tile is row-major [rows, c_out] (outputs[m*c_out + oc]).
+                unsafe { download_f32(&out_tile_buf, &mut out_tile[..rows * c_out]) };
+                for local_row in 0..rows {
+                    let out_idx = row_start + local_row;
+                    let base = local_row * c_out;
+                    for oc in 0..c_out {
+                        output[oc * spatial + out_idx] = out_tile[base + oc] + bias[oc];
+                    }
                 }
+
+                row_start += rows;
             }
 
-            row_start += rows;
-        }
-
-        Ok(())
+            Ok(())
+        })
     }
 
     /// **im2col-free implicit-GEMM** conv2d (the high-res VAE convs): dispatches
@@ -393,62 +396,64 @@ impl MetalGraph {
         patch_dim: usize,
         w_out: usize,
     ) -> Result<(), MetalGraphError> {
-        let shared = MTLResourceOptions::StorageModeShared;
+        autoreleasepool(|| {
+            let shared = MTLResourceOptions::StorageModeShared;
 
-        // Upload the NCHW input once (shared so the gather reads it directly).
-        let input_bytes = std::mem::size_of_val(input) as u64;
-        let input_buf = alloc_buf(&self.device, input_bytes, shared)?;
-        unsafe { upload_f32(&input_buf, input) };
+            // Upload the NCHW input once (shared so the gather reads it directly).
+            let input_bytes = std::mem::size_of_val(input) as u64;
+            let input_buf = alloc_buf(&self.device, input_bytes, shared)?;
+            unsafe { upload_f32(&input_buf, input) };
 
-        // Shared output buffer [c_out, spatial] (row-major NCHW; NO bias yet).
-        let out_floats = c_out.checked_mul(spatial).ok_or_else(|| {
+            // Shared output buffer [c_out, spatial] (row-major NCHW; NO bias yet).
+            let out_floats = c_out.checked_mul(spatial).ok_or_else(|| {
             MetalGraphError::InvalidDimensions(format!(
                 "encode_conv2d_f32_implicit: c_out*spatial overflow (c_out={c_out}, spatial={spatial})"
             ))
         })?;
-        let out_bytes = out_floats
-            .checked_mul(std::mem::size_of::<f32>())
-            .ok_or_else(|| {
-                MetalGraphError::InvalidDimensions(
-                    "encode_conv2d_f32_implicit: output byte size overflow".into(),
-                )
-            })? as u64;
-        let out_buf = alloc_buf(&self.device, out_bytes, shared)?;
+            let out_bytes = out_floats
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or_else(|| {
+                    MetalGraphError::InvalidDimensions(
+                        "encode_conv2d_f32_implicit: output byte size overflow".into(),
+                    )
+                })? as u64;
+            let out_buf = alloc_buf(&self.device, out_bytes, shared)?;
 
-        // Single command buffer: one implicit-GEMM conv over the whole plane.
-        let cmd_buf = self.command_queue.new_command_buffer();
-        let encoder = cmd_buf.new_compute_command_encoder();
-        self.dispatch_conv2d_f32_implicit(
-            encoder,
-            &weight.buffer,
-            &input_buf,
-            &out_buf,
-            c_out as u32,
-            spatial as u32,
-            patch_dim as u32,
-            c_in as u32,
-            h as u32,
-            w as u32,
-            k as u32,
-            pad as u32,
-            w_out as u32,
-        );
-        encoder.end_encoding();
-        commit_and_wait(cmd_buf, "encode_conv2d_f32_implicit")?;
+            // Single command buffer: one implicit-GEMM conv over the whole plane.
+            let cmd_buf = self.command_queue.new_command_buffer();
+            let encoder = cmd_buf.new_compute_command_encoder();
+            self.dispatch_conv2d_f32_implicit(
+                encoder,
+                &weight.buffer,
+                &input_buf,
+                &out_buf,
+                c_out as u32,
+                spatial as u32,
+                patch_dim as u32,
+                c_in as u32,
+                h as u32,
+                w as u32,
+                k as u32,
+                pad as u32,
+                w_out as u32,
+            );
+            encoder.end_encoding();
+            commit_and_wait(cmd_buf, "encode_conv2d_f32_implicit")?;
 
-        // Download row-major [c_out, spatial] and add the per-channel bias in
-        // place (the kernel intentionally omits it, matching the im2col path's
-        // CPU-side bias add).
-        unsafe { download_f32(&out_buf, output) };
-        for oc in 0..c_out {
-            let b = bias[oc];
-            let dst = &mut output[oc * spatial..(oc + 1) * spatial];
-            for slot in dst.iter_mut() {
-                *slot += b;
+            // Download row-major [c_out, spatial] and add the per-channel bias in
+            // place (the kernel intentionally omits it, matching the im2col path's
+            // CPU-side bias add).
+            unsafe { download_f32(&out_buf, output) };
+            for oc in 0..c_out {
+                let b = bias[oc];
+                let dst = &mut output[oc * spatial..(oc + 1) * spatial];
+                for slot in dst.iter_mut() {
+                    *slot += b;
+                }
             }
-        }
 
-        Ok(())
+            Ok(())
+        })
     }
 
     /// PyTorch-compatible GroupNorm on an NCHW buffer `[C, H, W]` (batch 1), in
@@ -484,62 +489,64 @@ impl MetalGraph {
         num_groups: usize,
         eps: f32,
     ) -> Result<(), MetalGraphError> {
-        if num_groups == 0 || !channels.is_multiple_of(num_groups) {
-            return Err(MetalGraphError::InvalidDimensions(format!(
+        autoreleasepool(|| {
+            if num_groups == 0 || !channels.is_multiple_of(num_groups) {
+                return Err(MetalGraphError::InvalidDimensions(format!(
                 "encode_groupnorm_f32: channels {channels} not divisible by num_groups {num_groups}"
             )));
-        }
-        let expected = channels.checked_mul(hw).ok_or_else(|| {
-            MetalGraphError::InvalidDimensions(format!(
-                "encode_groupnorm_f32: channels*hw overflow (channels={channels}, hw={hw})"
-            ))
-        })?;
-        if x.len() != expected {
-            return Err(MetalGraphError::InvalidDimensions(format!(
-                "encode_groupnorm_f32: x len {} != channels*hw {expected}",
-                x.len()
-            )));
-        }
-        if weight.len() != channels || bias.len() != channels {
-            return Err(MetalGraphError::InvalidDimensions(format!(
-                "encode_groupnorm_f32: weight/bias len ({}/{}) != channels {channels}",
-                weight.len(),
-                bias.len()
-            )));
-        }
-        if expected == 0 {
-            return Ok(());
-        }
+            }
+            let expected = channels.checked_mul(hw).ok_or_else(|| {
+                MetalGraphError::InvalidDimensions(format!(
+                    "encode_groupnorm_f32: channels*hw overflow (channels={channels}, hw={hw})"
+                ))
+            })?;
+            if x.len() != expected {
+                return Err(MetalGraphError::InvalidDimensions(format!(
+                    "encode_groupnorm_f32: x len {} != channels*hw {expected}",
+                    x.len()
+                )));
+            }
+            if weight.len() != channels || bias.len() != channels {
+                return Err(MetalGraphError::InvalidDimensions(format!(
+                    "encode_groupnorm_f32: weight/bias len ({}/{}) != channels {channels}",
+                    weight.len(),
+                    bias.len()
+                )));
+            }
+            if expected == 0 {
+                return Ok(());
+            }
 
-        let shared = MTLResourceOptions::StorageModeShared;
-        let x_bytes = std::mem::size_of_val(&x[..]) as u64;
-        let aff_bytes = (channels * std::mem::size_of::<f32>()) as u64;
-        let x_buf = alloc_buf(&self.device, x_bytes, shared)?;
-        let w_buf = alloc_buf(&self.device, aff_bytes, shared)?;
-        let b_buf = alloc_buf(&self.device, aff_bytes, shared)?;
-        unsafe {
-            upload_f32(&x_buf, x);
-            upload_f32(&w_buf, weight);
-            upload_f32(&b_buf, bias);
-        }
+            let shared = MTLResourceOptions::StorageModeShared;
+            let x_bytes = std::mem::size_of_val(&x[..]) as u64;
+            let aff_bytes = (channels * std::mem::size_of::<f32>()) as u64;
+            let x_buf = alloc_buf(&self.device, x_bytes, shared)?;
+            let w_buf = alloc_buf(&self.device, aff_bytes, shared)?;
+            let b_buf = alloc_buf(&self.device, aff_bytes, shared)?;
+            unsafe {
+                upload_f32(&x_buf, x);
+                upload_f32(&w_buf, weight);
+                upload_f32(&b_buf, bias);
+            }
 
-        let cmd_buf = self.command_queue.new_command_buffer();
-        let encoder = cmd_buf.new_compute_command_encoder();
-        self.dispatch_groupnorm_f32(
-            encoder,
-            &x_buf,
-            &w_buf,
-            &b_buf,
-            channels as u32,
-            hw as u32,
-            num_groups as u32,
-            eps,
-        );
-        encoder.end_encoding();
-        commit_and_wait(cmd_buf, "encode_groupnorm_f32")?;
+            let cmd_buf = self.command_queue.new_command_buffer();
+            let encoder = cmd_buf.new_compute_command_encoder();
+            self.dispatch_groupnorm_f32(
+                encoder,
+                &x_buf,
+                &w_buf,
+                &b_buf,
+                channels as u32,
+                hw as u32,
+                num_groups as u32,
+                eps,
+            );
+            encoder.end_encoding();
+            commit_and_wait(cmd_buf, "encode_groupnorm_f32")?;
 
-        unsafe { download_f32(&x_buf, x) };
-        Ok(())
+            unsafe { download_f32(&x_buf, x) };
+            Ok(())
+        })
     }
 
     /// Element-wise SiLU (`x · sigmoid(x) = x / (1 + exp(-x))`), in place over a
@@ -548,22 +555,24 @@ impl MetalGraph {
     /// # Errors
     /// A buffer / execution error if the GPU work cannot be encoded.
     pub fn encode_silu_f32(&self, x: &mut [f32]) -> Result<(), MetalGraphError> {
-        if x.is_empty() {
-            return Ok(());
-        }
-        let shared = MTLResourceOptions::StorageModeShared;
-        let x_bytes = std::mem::size_of_val(&x[..]) as u64;
-        let x_buf = alloc_buf(&self.device, x_bytes, shared)?;
-        unsafe { upload_f32(&x_buf, x) };
+        autoreleasepool(|| {
+            if x.is_empty() {
+                return Ok(());
+            }
+            let shared = MTLResourceOptions::StorageModeShared;
+            let x_bytes = std::mem::size_of_val(&x[..]) as u64;
+            let x_buf = alloc_buf(&self.device, x_bytes, shared)?;
+            unsafe { upload_f32(&x_buf, x) };
 
-        let cmd_buf = self.command_queue.new_command_buffer();
-        let encoder = cmd_buf.new_compute_command_encoder();
-        self.dispatch_silu_f32(encoder, &x_buf, x.len() as u32);
-        encoder.end_encoding();
-        commit_and_wait(cmd_buf, "encode_silu_f32")?;
+            let cmd_buf = self.command_queue.new_command_buffer();
+            let encoder = cmd_buf.new_compute_command_encoder();
+            self.dispatch_silu_f32(encoder, &x_buf, x.len() as u32);
+            encoder.end_encoding();
+            commit_and_wait(cmd_buf, "encode_silu_f32")?;
 
-        unsafe { download_f32(&x_buf, x) };
-        Ok(())
+            unsafe { download_f32(&x_buf, x) };
+            Ok(())
+        })
     }
 
     /// Nearest-neighbour ×2 upsample of an NCHW buffer `[C, H, W]` → `[C, 2H,
@@ -586,57 +595,59 @@ impl MetalGraph {
         h: usize,
         w: usize,
     ) -> Result<(), MetalGraphError> {
-        let expected_in = c
-            .checked_mul(h)
-            .and_then(|x| x.checked_mul(w))
-            .ok_or_else(|| {
-                MetalGraphError::InvalidDimensions(format!(
-                    "encode_upsample_nearest_f32: c*h*w overflow (c={c}, h={h}, w={w})"
-                ))
+        autoreleasepool(|| {
+            let expected_in = c
+                .checked_mul(h)
+                .and_then(|x| x.checked_mul(w))
+                .ok_or_else(|| {
+                    MetalGraphError::InvalidDimensions(format!(
+                        "encode_upsample_nearest_f32: c*h*w overflow (c={c}, h={h}, w={w})"
+                    ))
+                })?;
+            if input.len() != expected_in {
+                return Err(MetalGraphError::InvalidDimensions(format!(
+                    "encode_upsample_nearest_f32: input len {} != c*h*w {expected_in}",
+                    input.len()
+                )));
+            }
+            let expected_out = expected_in.checked_mul(4).ok_or_else(|| {
+                MetalGraphError::InvalidDimensions(
+                    "encode_upsample_nearest_f32: output size overflow".into(),
+                )
             })?;
-        if input.len() != expected_in {
-            return Err(MetalGraphError::InvalidDimensions(format!(
-                "encode_upsample_nearest_f32: input len {} != c*h*w {expected_in}",
-                input.len()
-            )));
-        }
-        let expected_out = expected_in.checked_mul(4).ok_or_else(|| {
-            MetalGraphError::InvalidDimensions(
-                "encode_upsample_nearest_f32: output size overflow".into(),
-            )
-        })?;
-        if output.len() != expected_out {
-            return Err(MetalGraphError::InvalidDimensions(format!(
-                "encode_upsample_nearest_f32: output len {} != c*4*h*w {expected_out}",
-                output.len()
-            )));
-        }
-        if expected_in == 0 {
-            return Ok(());
-        }
+            if output.len() != expected_out {
+                return Err(MetalGraphError::InvalidDimensions(format!(
+                    "encode_upsample_nearest_f32: output len {} != c*4*h*w {expected_out}",
+                    output.len()
+                )));
+            }
+            if expected_in == 0 {
+                return Ok(());
+            }
 
-        let shared = MTLResourceOptions::StorageModeShared;
-        let in_bytes = std::mem::size_of_val(input) as u64;
-        let out_bytes = std::mem::size_of_val(&output[..]) as u64;
-        let in_buf = alloc_buf(&self.device, in_bytes, shared)?;
-        let out_buf = alloc_buf(&self.device, out_bytes, shared)?;
-        unsafe { upload_f32(&in_buf, input) };
+            let shared = MTLResourceOptions::StorageModeShared;
+            let in_bytes = std::mem::size_of_val(input) as u64;
+            let out_bytes = std::mem::size_of_val(&output[..]) as u64;
+            let in_buf = alloc_buf(&self.device, in_bytes, shared)?;
+            let out_buf = alloc_buf(&self.device, out_bytes, shared)?;
+            unsafe { upload_f32(&in_buf, input) };
 
-        let cmd_buf = self.command_queue.new_command_buffer();
-        let encoder = cmd_buf.new_compute_command_encoder();
-        self.dispatch_upsample_nearest_f32(
-            encoder,
-            &in_buf,
-            &out_buf,
-            c as u32,
-            h as u32,
-            w as u32,
-            expected_out as u32,
-        );
-        encoder.end_encoding();
-        commit_and_wait(cmd_buf, "encode_upsample_nearest_f32")?;
+            let cmd_buf = self.command_queue.new_command_buffer();
+            let encoder = cmd_buf.new_compute_command_encoder();
+            self.dispatch_upsample_nearest_f32(
+                encoder,
+                &in_buf,
+                &out_buf,
+                c as u32,
+                h as u32,
+                w as u32,
+                expected_out as u32,
+            );
+            encoder.end_encoding();
+            commit_and_wait(cmd_buf, "encode_upsample_nearest_f32")?;
 
-        unsafe { download_f32(&out_buf, output) };
-        Ok(())
+            unsafe { download_f32(&out_buf, output) };
+            Ok(())
+        })
     }
 }

@@ -46,6 +46,7 @@
 
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
+use metal::objc::rc::autoreleasepool;
 use metal::MTLResourceOptions;
 
 use super::metal_graph::{commit_and_wait, MetalGraph, MetalGraphError};
@@ -284,84 +285,86 @@ fn dispatch_gemm(
     residual: Option<&[f32]>,
     variant: Fp8Variant,
 ) -> Result<(), MetalGraphError> {
-    validate_batch_dims(blocks, inputs, outputs, n_rows, k, batch_size)?;
-    if let Some(r) = residual {
-        if r.len() != batch_size * n_rows {
-            return Err(MetalGraphError::EncodingFailed(format!(
-                "residual.len() = {} expected {} (batch_size {batch_size} × n_rows {n_rows})",
-                r.len(),
-                batch_size * n_rows
-            )));
+    autoreleasepool(|| {
+        validate_batch_dims(blocks, inputs, outputs, n_rows, k, batch_size)?;
+        if let Some(r) = residual {
+            if r.len() != batch_size * n_rows {
+                return Err(MetalGraphError::EncodingFailed(format!(
+                    "residual.len() = {} expected {} (batch_size {batch_size} × n_rows {n_rows})",
+                    r.len(),
+                    batch_size * n_rows
+                )));
+            }
         }
-    }
 
-    // `MET-10`: the shared device, the *current session's* command queue, and
-    // a pipeline resolved by name from the combined metallib — no private
-    // device, queue or library (`pipeline_for` caches the state by name).
-    let graph = MetalGraph::global()?;
-    let pipeline = graph.pipeline_for(variant.gemm_entry(residual.is_some()))?;
+        // `MET-10`: the shared device, the *current session's* command queue, and
+        // a pipeline resolved by name from the combined metallib — no private
+        // device, queue or library (`pipeline_for` caches the state by name).
+        let graph = MetalGraph::global()?;
+        let pipeline = graph.pipeline_for(variant.gemm_entry(residual.is_some()))?;
 
-    let block_buf = graph.device().new_buffer_with_data(
-        blocks.as_ptr() as *const std::ffi::c_void,
-        blocks.len() as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let input_buf = graph.device().new_buffer_with_data(
-        inputs.as_ptr() as *const std::ffi::c_void,
-        std::mem::size_of_val(inputs) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let output_buf = graph.device().new_buffer_with_data(
-        outputs.as_ptr() as *const std::ffi::c_void,
-        std::mem::size_of_val(outputs) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let residual_buf = residual.map(|r| {
-        graph.device().new_buffer_with_data(
-            r.as_ptr() as *const std::ffi::c_void,
-            std::mem::size_of_val(r) as u64,
+        let block_buf = graph.device().new_buffer_with_data(
+            blocks.as_ptr() as *const std::ffi::c_void,
+            blocks.len() as u64,
             MTLResourceOptions::StorageModeShared,
-        )
-    });
+        );
+        let input_buf = graph.device().new_buffer_with_data(
+            inputs.as_ptr() as *const std::ffi::c_void,
+            std::mem::size_of_val(inputs) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let output_buf = graph.device().new_buffer_with_data(
+            outputs.as_ptr() as *const std::ffi::c_void,
+            std::mem::size_of_val(outputs) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let residual_buf = residual.map(|r| {
+            graph.device().new_buffer_with_data(
+                r.as_ptr() as *const std::ffi::c_void,
+                std::mem::size_of_val(r) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        });
 
-    let n_rows_u32 = u32::try_from(n_rows).map_err(|_| {
-        MetalGraphError::EncodingFailed(format!("n_rows = {n_rows} exceeds u32::MAX"))
-    })?;
-    let k_u32 = u32::try_from(k)
-        .map_err(|_| MetalGraphError::EncodingFailed(format!("k = {k} exceeds u32::MAX")))?;
-    let batch_u32 = u32::try_from(batch_size).map_err(|_| {
-        MetalGraphError::EncodingFailed(format!("batch_size = {batch_size} exceeds u32::MAX"))
-    })?;
+        let n_rows_u32 = u32::try_from(n_rows).map_err(|_| {
+            MetalGraphError::EncodingFailed(format!("n_rows = {n_rows} exceeds u32::MAX"))
+        })?;
+        let k_u32 = u32::try_from(k)
+            .map_err(|_| MetalGraphError::EncodingFailed(format!("k = {k} exceeds u32::MAX")))?;
+        let batch_u32 = u32::try_from(batch_size).map_err(|_| {
+            MetalGraphError::EncodingFailed(format!("batch_size = {batch_size} exceeds u32::MAX"))
+        })?;
 
-    let cmd = graph.command_queue.new_command_buffer();
-    let encoder = cmd.new_compute_command_encoder();
+        let cmd = graph.command_queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
 
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(&block_buf), 0);
-    encoder.set_buffer(1, Some(&input_buf), 0);
-    encoder.set_buffer(2, Some(&output_buf), 0);
-    set_u32(encoder, 3, n_rows_u32);
-    set_u32(encoder, 4, batch_u32);
-    set_u32(encoder, 5, k_u32);
-    if let Some(rbuf) = residual_buf.as_ref() {
-        encoder.set_buffer(6, Some(rbuf), 0);
-    }
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(&block_buf), 0);
+        encoder.set_buffer(1, Some(&input_buf), 0);
+        encoder.set_buffer(2, Some(&output_buf), 0);
+        set_u32(encoder, 3, n_rows_u32);
+        set_u32(encoder, 4, batch_u32);
+        set_u32(encoder, 5, k_u32);
+        if let Some(rbuf) = residual_buf.as_ref() {
+            encoder.set_buffer(6, Some(rbuf), 0);
+        }
 
-    let n_tgs = n_rows.div_ceil(SIMDS_PER_TG) as u64;
-    let grid = metal::MTLSize::new(n_tgs, 1, 1);
-    let tg_size = metal::MTLSize::new(THREADS_PER_TG, 1, 1);
-    encoder.dispatch_thread_groups(grid, tg_size);
-    encoder.end_encoding();
+        let n_tgs = n_rows.div_ceil(SIMDS_PER_TG) as u64;
+        let grid = metal::MTLSize::new(n_tgs, 1, 1);
+        let tg_size = metal::MTLSize::new(THREADS_PER_TG, 1, 1);
+        encoder.dispatch_thread_groups(grid, tg_size);
+        encoder.end_encoding();
 
-    commit_and_wait(cmd, "metal_gemm_fp8_batch")?;
+        commit_and_wait(cmd, "metal_gemm_fp8_batch")?;
 
-    // ── Read output back ────────────────────────────────────────────────────
-    unsafe {
-        let src = output_buf.contents() as *const f32;
-        std::ptr::copy_nonoverlapping(src, outputs.as_mut_ptr(), outputs.len());
-    }
+        // ── Read output back ────────────────────────────────────────────────────
+        unsafe {
+            let src = output_buf.contents() as *const f32;
+            std::ptr::copy_nonoverlapping(src, outputs.as_mut_ptr(), outputs.len());
+        }
 
-    Ok(())
+        Ok(())
+    })
 }
 
 fn dispatch_fused_gate_up_swiglu(
@@ -373,94 +376,96 @@ fn dispatch_fused_gate_up_swiglu(
     batch_size: usize,
     variant: Fp8Variant,
 ) -> Result<(), MetalGraphError> {
-    // The fused kernel reads gate + up rows from the same buffer, so the buffer
-    // covers 2 * n_ffn_rows rows worth of FP8 blocks.
-    if k == 0 || !k.is_multiple_of(FP8_BLOCK_K) {
-        return Err(MetalGraphError::EncodingFailed(format!(
-            "k = {k} must be a non-zero multiple of {FP8_BLOCK_K}"
-        )));
-    }
-    let blocks_per_row = k / FP8_BLOCK_K;
-    let expected_block_bytes = 2usize
-        .saturating_mul(n_ffn_rows)
-        .saturating_mul(blocks_per_row)
-        .saturating_mul(FP8_BLOCK_BYTES);
-    if blocks.len() != expected_block_bytes {
-        return Err(MetalGraphError::EncodingFailed(format!(
+    autoreleasepool(|| {
+        // The fused kernel reads gate + up rows from the same buffer, so the buffer
+        // covers 2 * n_ffn_rows rows worth of FP8 blocks.
+        if k == 0 || !k.is_multiple_of(FP8_BLOCK_K) {
+            return Err(MetalGraphError::EncodingFailed(format!(
+                "k = {k} must be a non-zero multiple of {FP8_BLOCK_K}"
+            )));
+        }
+        let blocks_per_row = k / FP8_BLOCK_K;
+        let expected_block_bytes = 2usize
+            .saturating_mul(n_ffn_rows)
+            .saturating_mul(blocks_per_row)
+            .saturating_mul(FP8_BLOCK_BYTES);
+        if blocks.len() != expected_block_bytes {
+            return Err(MetalGraphError::EncodingFailed(format!(
             "blocks.len() = {} expected {} (2 × n_ffn_rows {n_ffn_rows} × blocks_per_row {blocks_per_row} × {FP8_BLOCK_BYTES})",
             blocks.len(),
             expected_block_bytes
         )));
-    }
-    if inputs.len() != batch_size * k {
-        return Err(MetalGraphError::EncodingFailed(format!(
-            "inputs.len() = {} expected {} (batch_size {batch_size} × k {k})",
-            inputs.len(),
-            batch_size * k
-        )));
-    }
-    if outputs.len() != batch_size * n_ffn_rows {
-        return Err(MetalGraphError::EncodingFailed(format!(
+        }
+        if inputs.len() != batch_size * k {
+            return Err(MetalGraphError::EncodingFailed(format!(
+                "inputs.len() = {} expected {} (batch_size {batch_size} × k {k})",
+                inputs.len(),
+                batch_size * k
+            )));
+        }
+        if outputs.len() != batch_size * n_ffn_rows {
+            return Err(MetalGraphError::EncodingFailed(format!(
             "outputs.len() = {} expected {} (batch_size {batch_size} × n_ffn_rows {n_ffn_rows})",
             outputs.len(),
             batch_size * n_ffn_rows
         )));
-    }
+        }
 
-    // `MET-10`: see `dispatch_gemm` — shared device, current session's queue,
-    // pipeline resolved by name from the combined metallib.
-    let graph = MetalGraph::global()?;
-    let pipeline = graph.pipeline_for(variant.fused_gate_up_entry())?;
+        // `MET-10`: see `dispatch_gemm` — shared device, current session's queue,
+        // pipeline resolved by name from the combined metallib.
+        let graph = MetalGraph::global()?;
+        let pipeline = graph.pipeline_for(variant.fused_gate_up_entry())?;
 
-    let block_buf = graph.device().new_buffer_with_data(
-        blocks.as_ptr() as *const std::ffi::c_void,
-        blocks.len() as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let input_buf = graph.device().new_buffer_with_data(
-        inputs.as_ptr() as *const std::ffi::c_void,
-        std::mem::size_of_val(inputs) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let output_buf = graph.device().new_buffer(
-        std::mem::size_of_val(outputs) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
+        let block_buf = graph.device().new_buffer_with_data(
+            blocks.as_ptr() as *const std::ffi::c_void,
+            blocks.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let input_buf = graph.device().new_buffer_with_data(
+            inputs.as_ptr() as *const std::ffi::c_void,
+            std::mem::size_of_val(inputs) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let output_buf = graph.device().new_buffer(
+            std::mem::size_of_val(outputs) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
 
-    let n_rows_u32 = u32::try_from(n_ffn_rows).map_err(|_| {
-        MetalGraphError::EncodingFailed(format!("n_ffn_rows = {n_ffn_rows} exceeds u32::MAX"))
-    })?;
-    let k_u32 = u32::try_from(k)
-        .map_err(|_| MetalGraphError::EncodingFailed(format!("k = {k} exceeds u32::MAX")))?;
-    let batch_u32 = u32::try_from(batch_size).map_err(|_| {
-        MetalGraphError::EncodingFailed(format!("batch_size = {batch_size} exceeds u32::MAX"))
-    })?;
+        let n_rows_u32 = u32::try_from(n_ffn_rows).map_err(|_| {
+            MetalGraphError::EncodingFailed(format!("n_ffn_rows = {n_ffn_rows} exceeds u32::MAX"))
+        })?;
+        let k_u32 = u32::try_from(k)
+            .map_err(|_| MetalGraphError::EncodingFailed(format!("k = {k} exceeds u32::MAX")))?;
+        let batch_u32 = u32::try_from(batch_size).map_err(|_| {
+            MetalGraphError::EncodingFailed(format!("batch_size = {batch_size} exceeds u32::MAX"))
+        })?;
 
-    let cmd = graph.command_queue.new_command_buffer();
-    let encoder = cmd.new_compute_command_encoder();
+        let cmd = graph.command_queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
 
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(&block_buf), 0);
-    encoder.set_buffer(1, Some(&input_buf), 0);
-    encoder.set_buffer(2, Some(&output_buf), 0);
-    set_u32(encoder, 3, n_rows_u32);
-    set_u32(encoder, 4, batch_u32);
-    set_u32(encoder, 5, k_u32);
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(&block_buf), 0);
+        encoder.set_buffer(1, Some(&input_buf), 0);
+        encoder.set_buffer(2, Some(&output_buf), 0);
+        set_u32(encoder, 3, n_rows_u32);
+        set_u32(encoder, 4, batch_u32);
+        set_u32(encoder, 5, k_u32);
 
-    let n_tgs = n_ffn_rows.div_ceil(SIMDS_PER_TG) as u64;
-    let grid = metal::MTLSize::new(n_tgs, 1, 1);
-    let tg_size = metal::MTLSize::new(THREADS_PER_TG, 1, 1);
-    encoder.dispatch_thread_groups(grid, tg_size);
-    encoder.end_encoding();
+        let n_tgs = n_ffn_rows.div_ceil(SIMDS_PER_TG) as u64;
+        let grid = metal::MTLSize::new(n_tgs, 1, 1);
+        let tg_size = metal::MTLSize::new(THREADS_PER_TG, 1, 1);
+        encoder.dispatch_thread_groups(grid, tg_size);
+        encoder.end_encoding();
 
-    commit_and_wait(cmd, "metal_fused_gate_up_swiglu_fp8")?;
+        commit_and_wait(cmd, "metal_fused_gate_up_swiglu_fp8")?;
 
-    unsafe {
-        let src = output_buf.contents() as *const f32;
-        std::ptr::copy_nonoverlapping(src, outputs.as_mut_ptr(), outputs.len());
-    }
+        unsafe {
+            let src = output_buf.contents() as *const f32;
+            std::ptr::copy_nonoverlapping(src, outputs.as_mut_ptr(), outputs.len());
+        }
 
-    Ok(())
+        Ok(())
+    })
 }
 
 fn validate_batch_dims(
