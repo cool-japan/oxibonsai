@@ -61,7 +61,7 @@ fn cuda_available() -> bool {
 
 // ── T-05 capability-report producer ─────────────────────────────────────────
 //
-// T-07 FIX (verifier wave 3): this used to be an inline copy of
+// T-07: this used to be an inline copy of
 // `oxibonsai_testkit::capability::record`; `oxibonsai-runtime` now takes
 // `oxibonsai-testkit` as a dev-dependency (imported above), so the copy is
 // deleted in favour of the shared implementation.
@@ -79,7 +79,7 @@ fn f32_pattern(n: usize, scale: f32) -> Vec<u8> {
 
 /// Build a `TQ2_0_g128` weight blob (34 bytes/block: 32B of 2-bit codes + FP16 scale).
 ///
-/// CQ-14 (wave-2.5 deviation routing #7): each packed byte holds four 2-bit
+/// CQ-14: each packed byte holds four 2-bit
 /// ternary lanes, and only `{0, 1, 2}` are valid codes — `3` (`0b11`) is
 /// reserved and rejected by `screen_ternary_codes` in
 /// `oxibonsai-model/src/weight_loaders.rs`. Pushing a raw
@@ -91,7 +91,7 @@ fn f32_pattern(n: usize, scale: f32) -> Vec<u8> {
 /// `crates/oxibonsai-model/src/model/types/gpu_cache.rs::tq2_pattern`
 /// already does.
 ///
-/// T-07 FIX (verifier wave 3): re-pointed at
+/// T-07: re-pointed at
 /// `oxibonsai_testkit::gguf_fixture::Lcg::next_valid_tq2_byte`. `Lcg::new(s)`
 /// stores `s` as its state directly, so pre-adding the same golden-ratio
 /// constant this file always added before its first `next_u64()` reproduces
@@ -102,15 +102,9 @@ fn f32_pattern(n: usize, scale: f32) -> Vec<u8> {
 /// and `generate_pipeline_tests.rs` (all re-pointed the same way, all their
 /// tests still pass unchanged). This file's own `#[cfg(all(feature =
 /// "native-cuda", any(target_os = "linux", target_os = "windows")))]` gate
-/// makes it unreachable on this session's macOS/no-CUDA host — confirmed
-/// empirically that the dependency graph does not even cross-compile today
-/// for an *unrelated*, pre-existing reason
-/// (`oxibonsai-model/src/block/types/forward.rs` calls `try_cuda_qkv`/
-/// `try_cuda_ffn` with one fewer argument than their current signatures
-/// require — not owned by this package, not touched by this session) — so
-/// this specific file's compilation is not directly re-verified here, only
-/// derived by the same byte-exact construction as its three verified
-/// siblings.
+/// makes it unreachable on a macOS host without CUDA, so its compilation is
+/// not directly verified there, only derived by the same byte-exact
+/// construction as its three verified siblings.
 fn tq2_0_g128_pattern(num_weights: usize, seed: u64) -> Vec<u8> {
     assert_eq!(
         num_weights % 128,
@@ -133,7 +127,7 @@ fn tq2_0_g128_pattern(num_weights: usize, seed: u64) -> Vec<u8> {
 
 /// Build a `Q1_0G128` weight blob (18 bytes/block: FP16 scale + 16B of 128 sign bits).
 ///
-/// T-07 FIX (verifier wave 3): re-pointed at
+/// T-07: re-pointed at
 /// `oxibonsai_testkit::gguf_fixture::Lcg` (`next_u64`/`next_u8`), byte-for-byte
 /// identical to the previous hand-rolled state machine — see
 /// `tq2_0_g128_pattern`'s doc comment above for the full rationale (the same

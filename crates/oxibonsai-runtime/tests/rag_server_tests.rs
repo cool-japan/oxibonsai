@@ -651,4 +651,104 @@ mod tests {
             "overlap exactly at half of chunk_size is the accepted boundary"
         );
     }
+
+    // ── Router options: the server's request limits reach /rag/query ─────────
+
+    /// Drive a router through index → query → stats and return the three
+    /// response bodies, as the client reads them.
+    async fn transcript(app: axum::Router) -> Vec<String> {
+        let requests = [
+            json_request(
+                Method::POST,
+                "/rag/index",
+                serde_json::json!({
+                    "documents": [
+                        "Rust is a systems programming language with memory safety.",
+                        "Tokyo is the capital of Japan and a major travel destination."
+                    ]
+                }),
+            ),
+            json_request(
+                Method::POST,
+                "/rag/query",
+                serde_json::json!({
+                    "query": "Rust memory safety",
+                    "max_tokens": 4,
+                    "include_context": true
+                }),
+            ),
+            Request::get("/rag/stats")
+                .body(Body::empty())
+                .expect("build request"),
+        ];
+        let mut bodies = Vec::new();
+        for request in requests {
+            let resp = app.clone().oneshot(request).await.expect("response");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("read body");
+            bodies.push(String::from_utf8_lossy(&bytes).into_owned());
+        }
+        bodies
+    }
+
+    /// A router built from `RagRouterOptions` answers byte for byte like the
+    /// router built without them — with the default options and under a
+    /// generous deadline alike — and a deadline nobody reaches counts nothing.
+    #[tokio::test]
+    async fn test_options_router_answers_like_the_pool_router() {
+        use oxibonsai_runtime::engine_pool::EnginePool;
+        use oxibonsai_runtime::metrics::InferenceMetrics;
+        use oxibonsai_runtime::rag_server::{
+            create_rag_router_with_options, create_rag_router_with_pool, RagRouterOptions,
+        };
+        use oxibonsai_runtime::server::RequestLimits;
+
+        let engine =
+            || InferenceEngine::new(Qwen3Config::tiny_test(), SamplingParams::default(), 42);
+        let plain = transcript(create_rag_router_with_pool(
+            EnginePool::new(vec![engine()]),
+            None,
+        ))
+        .await;
+        let defaults = transcript(create_rag_router_with_options(
+            EnginePool::new(vec![engine()]),
+            None,
+            RagRouterOptions::default(),
+        ))
+        .await;
+        let metrics = std::sync::Arc::new(InferenceMetrics::new());
+        let generous = transcript(create_rag_router_with_options(
+            EnginePool::new(vec![engine()]),
+            None,
+            RagRouterOptions::default()
+                .with_limits(RequestLimits::default().with_timeout_ms(600_000))
+                .with_metrics(std::sync::Arc::clone(&metrics)),
+        ))
+        .await;
+        assert_eq!(plain, defaults);
+        assert_eq!(plain, generous);
+        assert_eq!(metrics.errors_total.get(), 0);
+    }
+
+    #[test]
+    fn test_router_options_carry_what_they_were_given() {
+        use oxibonsai_runtime::metrics::InferenceMetrics;
+        use oxibonsai_runtime::rag_server::RagRouterOptions;
+        use oxibonsai_runtime::server::RequestLimits;
+
+        let options = RagRouterOptions::default();
+        assert_eq!(options.limits.per_request_timeout, None);
+        assert!(options.metrics.is_none());
+
+        let options = options
+            .with_limits(RequestLimits::default().with_timeout_ms(2_500))
+            .with_metrics(std::sync::Arc::new(InferenceMetrics::new()));
+        assert_eq!(
+            options.limits.per_request_timeout,
+            Some(std::time::Duration::from_millis(2_500))
+        );
+        assert!(options.metrics.is_some());
+    }
 }

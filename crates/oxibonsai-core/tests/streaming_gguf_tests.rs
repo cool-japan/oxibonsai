@@ -1,6 +1,6 @@
 //! Tests for the streaming GGUF parser.
 //!
-//! T-07 (verifier wave 3): `build_test_gguf` below is NOT re-pointed at
+//! T-07: `build_test_gguf` below is NOT re-pointed at
 //! `oxibonsai_testkit::gguf_fixture::GgufFixtureBuilder`, despite building a
 //! GGUF-shaped byte buffer. It tests a different layer of the system on
 //! purpose: the *incremental streaming parser's* byte-level state machine

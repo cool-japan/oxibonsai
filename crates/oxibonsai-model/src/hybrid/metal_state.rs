@@ -6,7 +6,10 @@
 //!
 //! A [`HybridGpuSnapshot`] is the device recurrent state — every
 //! Gated-DeltaNet slab (144 MiB for the 27B) and conv window (5.6 MiB) —
-//! plus the position the runner had consumed. The KV cache is not copied:
+//! plus the position the runner had consumed and the sequence's M-RoPE
+//! offsets up to it (an image prefilled before the snapshot keeps rotating
+//! later tokens behind their sequence position after a restore, and one
+//! prefilled after it is forgotten). The KV cache is not copied:
 //! the encoder writes every position before any query at or after it
 //! reads it, so after a restore to position `p` a contiguous sequence only
 //! writes at `p` or later and the stored keys and values below `p` are
@@ -31,6 +34,7 @@ use super::{from_gpu, full_matrices, gpu_config, gpu_matrix, linear_matrices, Hy
 use crate::error::{ModelError, ModelResult};
 use crate::hybrid::block::HybridBlock;
 use crate::hybrid::model::HybridModel;
+use crate::hybrid::vision_prefill::RopeOffsets;
 
 /// Bytes of one `f32`.
 const F32_BYTES: u64 = 4;
@@ -82,6 +86,21 @@ impl HybridMetalFootprint {
         limits.context_capacity(&self.config, self.n_full, self.n_linear, self.weight_bytes)
     }
 
+    /// The same footprint for a runner built to take calls of up to
+    /// `max_batch` tokens (the activation scratch scales with it; see
+    /// `HybridMetalRunner::new_in_place_with_batch`).
+    #[must_use]
+    pub fn with_max_batch(&self, max_batch: usize) -> Self {
+        let mut config = self.config.clone();
+        config.max_batch = max_batch.max(1);
+        let device = qwen35_footprint(&config, self.n_full, self.n_linear);
+        Self {
+            config,
+            device,
+            ..self.clone()
+        }
+    }
+
     /// Bytes a runner allocates on the device for a KV window of
     /// `positions` besides the weights it reads in place: the copied
     /// weights, the recurrent state, the logits and scratch, and the
@@ -98,12 +117,14 @@ impl HybridMetalFootprint {
     }
 }
 
-/// An exact rollback point of a [`HybridMetalRunner`]: its recurrent state
-/// and the position it had consumed (see the module docs).
+/// An exact rollback point of a [`HybridMetalRunner`]: its recurrent state,
+/// the position it had consumed and the sequence's M-RoPE offsets (see the
+/// module docs).
 #[derive(Debug, Clone, PartialEq)]
 pub struct HybridGpuSnapshot {
     recurrent: Qwen35RecurrentSnapshot,
     position: usize,
+    rope_offsets: RopeOffsets,
 }
 
 impl HybridGpuSnapshot {
@@ -111,6 +132,13 @@ impl HybridGpuSnapshot {
     #[must_use]
     pub fn position(&self) -> usize {
         self.position
+    }
+
+    /// The M-RoPE offset in force at the snapshot's position
+    /// ([`HybridMetalRunner::rope_delta`] when it was taken).
+    #[must_use]
+    pub fn rope_delta(&self) -> usize {
+        self.rope_offsets.at(self.position)
     }
 
     /// Bytes of recurrent state the snapshot holds.
@@ -191,10 +219,12 @@ impl HybridMetalRunner<'_> {
         Ok(HybridGpuSnapshot {
             recurrent: self.gpu.snapshot_state(),
             position: self.token_count,
+            rope_offsets: self.rope_offsets.clone(),
         })
     }
 
-    /// Return the recurrent state and the position count to `snapshot`.
+    /// Return the recurrent state, the position count and the M-RoPE
+    /// offsets to `snapshot`.
     ///
     /// The caller is responsible for `snapshot` belonging to this runner's
     /// current sequence (see the module docs); geometry is checked here.
@@ -216,6 +246,7 @@ impl HybridMetalRunner<'_> {
             .restore_state(&snapshot.recurrent)
             .map_err(from_gpu)?;
         self.token_count = snapshot.position;
+        self.rope_offsets = snapshot.rope_offsets.clone();
         Ok(())
     }
 
@@ -360,6 +391,7 @@ mod tests {
             let far = HybridGpuSnapshot {
                 recurrent: snapshot.recurrent.clone(),
                 position: MAX_SEQ + 1,
+                rope_offsets: RopeOffsets::default(),
             };
             let before = runner.snapshot_state().expect("snapshot");
             assert!(matches!(

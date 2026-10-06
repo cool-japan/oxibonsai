@@ -1,8 +1,8 @@
-//! CPU parity gates for the `qwen35` hybrid forward driver (B2-11,
-//! `bonsai2-design.md` §8.2 gates **G3 / G5 / G11** on the synthetic
+//! CPU parity gates for the `qwen35` hybrid forward driver
+//! (`bonsai2-design.md` §8.2 gates **G3 / G5 / G11** on the synthetic
 //! fixtures and **G1 / G4** on the real 27B when it is present).
 //!
-//! # Why this file consumes B2-16's fixture rather than its own reference
+//! # Why this file consumes the shared fixture rather than its own reference
 //!
 //! `tests/fixtures/hybrid_gguf.rs` carries an **independent** `f64` scalar
 //! model of the whole `qwen35` stack (`ReferenceForward`), written by a
@@ -589,7 +589,7 @@ fn hybrid_forward_matches_f64_reference_on_the_1024_wide_hadamard_variant_bonsai
 }
 
 // ═════════════════════════════════════════════════════════════════════════
-//  The dense arm: an F32 qwen35 file loads and runs (gatekeeper REQUIRED #5)
+//  The dense arm: an F32 qwen35 file loads and runs
 // ═════════════════════════════════════════════════════════════════════════
 
 /// The `F32` variants used to be refused outright (no dense `LinearLayer`
@@ -722,7 +722,7 @@ fn hybrid_dense_f32_variant_binds_the_dense_arm_and_matches_the_reference_bonsai
 //  The G1/G4 harness itself, verified without the 7.2 GB weight file
 // ═════════════════════════════════════════════════════════════════════════
 
-/// The real goldens are in the session scratchpad, not the repository, so
+/// The real goldens are not in the repository, so
 /// the ignored 27B gate could otherwise fail on a *parsing* mistake that
 /// looks like a forward-pass divergence. These fixtures reproduce the two
 /// formats exactly (an abridged `llama-server` `/completion` body and a
@@ -781,7 +781,7 @@ fn hybrid_golden_harness_parses_the_fork_formats_bonsai2() {
 
 /// The vendored oracle (`tests/fixtures/bonsai2_golden{,_cpu}/`) is
 /// complete and self-consistent, so the real-model gates never depend on a
-/// session scratchpad — checked on every run, model files or not. Reads the
+/// external golden directory — checked on every run, model files or not. Reads the
 /// vendored copies directly, whatever `OXI_BONSAI2_GOLDEN_DIR` says.
 #[test]
 fn hybrid_vendored_fork_goldens_are_complete_and_consistent_bonsai2() {

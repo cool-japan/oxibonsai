@@ -4,8 +4,7 @@
 //! so the tests keep full access to the module's private items while
 //! `pipeline.rs` itself stays comfortably under the workspace 2000-line
 //! ceiling (mirrors `api_extensions.rs` / `api_extensions_tests.rs`,
-//! `engine.rs` / `engine_tests.rs`). Mechanical split, no behavior change
-//! (gatekeeper OPTIONAL O1).
+//! `engine.rs` / `engine_tests.rs`). Mechanical split, no behavior change.
 
 use super::*;
 use crate::sampling::SamplingParams;

@@ -32,8 +32,8 @@ use crate::block::functions::{advance_kv_cache_to, validate_shapes};
 use super::block_def::TransformerBlock;
 use super::scratch::ScratchBuffers;
 
-// Weight-cache epoch of this block's CUDA uploads (finding F-M3): FIX2-CUDA
-// added `model_epoch: u64` as the last parameter of
+// Weight-cache epoch of this block's CUDA uploads (finding F-M3):
+// `model_epoch: u64` is the last parameter of
 // `oxibonsai_kernels::try_cuda_qkv` / `try_cuda_ffn` so a model's `Drop` can
 // free exactly its own GPU weights, but the block carried no epoch and
 // registered its uploads **unattributed** (never released). The block now
@@ -141,8 +141,7 @@ fn cuda_tq2_soa_len_bytes(total_rows: usize, k: usize) -> Option<usize> {
 }
 
 /// Fused ternary (TQ2_0_g128) QKV GEMV on CUDA — the twin of
-/// `block::functions::try_metal_gemv_ternary_fused` (**M-21**, wave-2.5
-/// addendum item 4).
+/// `block::functions::try_metal_gemv_ternary_fused` (**M-21**).
 ///
 /// Ternary models get no `fused_qkv_handle` (see `upload.rs`), so the 1-bit
 /// fused path above cannot serve them: `OneBitKernel::gemv_cached` always
@@ -367,7 +366,7 @@ impl<'a> TransformerBlock<'a> {
                     not(all(feature = "metal", target_os = "macos")),
                     any(target_os = "linux", target_os = "windows")
                 ))]
-                // F-M2 (wave-2.5 addendum item 2): a CPU-tier run must never
+                // F-M2: a CPU-tier run must never
                 // reach `try_cuda_qkv` at all. `CudaGraph::global()` opens the
                 // device and compiles six NVRTC modules on first call; without
                 // this gate a `KernelTier::Reference` run on a CUDA box paid
@@ -446,7 +445,7 @@ impl<'a> TransformerBlock<'a> {
                     self.try_fused_qkv_ternary_metal(normed, fused_qkv, q_all, k_all, v_all);
                 #[cfg(not(all(feature = "metal", target_os = "macos")))]
                 let ternary_metal_ok = false;
-                // M-21 (wave-2.5 addendum item 4): the CUDA twin of the Metal
+                // M-21: the CUDA twin of the Metal
                 // branch above. Same gating — real ternary blocks on all three
                 // projections, a GPU handle that seeds the upload slot, and a
                 // GPU kernel tier (F-M2) so a CPU-tier run never opens the
@@ -563,7 +562,7 @@ impl<'a> TransformerBlock<'a> {
         let cache_start = Instant::now();
         for head in 0..nkv {
             let start = head * hd;
-            // REQUIRED #4 (sparse-KV cross-note): the fallible stores, so an
+            // Sparse-KV: the fallible stores, so an
             // out-of-range layer/head/position or a wrong-width key surfaces
             // as an error here instead of being silently dropped and read
             // back as zeros by the attention below.
@@ -677,7 +676,7 @@ impl<'a> TransformerBlock<'a> {
                     any(target_os = "linux", target_os = "windows")
                 ))]
                 {
-                    // F-M2 (wave-2.5 addendum item 2): see the `try_cuda_qkv`
+                    // F-M2: see the `try_cuda_qkv`
                     // gate above — a CPU-tier run must not open the device.
                     if let (Some(attn_proj_blk), Some(gate_blk), Some(up_blk), Some(down_blk)) =
                         if kernel.is_gpu_accelerated() {
@@ -1463,7 +1462,7 @@ mod metal_fused_ternary_tests {
         hidden
     }
 
-    /// B2 (MC-FIX D4): **every** block forward kind — `forward`,
+    /// **Every** block forward kind — `forward`,
     /// `forward_with_sliding_window` and `forward_with_stats` — runs the
     /// ternary fused arms (Q‖K‖V and gate‖up) on its own, is not diverted into
     /// the 1-bit branch, matches the CPU reference, and binds the **same**

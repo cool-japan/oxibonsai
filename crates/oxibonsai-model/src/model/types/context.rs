@@ -1,5 +1,5 @@
-//! On-demand growth of the host caches (sec-11, M-07, REQUIRED #4 (4)),
-//! split out of `model/types/mod.rs` (B2-11-FIX).
+//! On-demand growth of the host caches (sec-11, M-07),
+//! split out of `model/types/mod.rs`.
 //!
 //! # What grows, and what never changes
 //!

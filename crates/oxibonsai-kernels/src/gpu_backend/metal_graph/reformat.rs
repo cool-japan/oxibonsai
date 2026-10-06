@@ -303,8 +303,8 @@ mod tests {
         // Scales taken from the real `Ternary-Bonsai-2-27B-PQ2_0.gguf`
         // (`output.weight`, first blocks — verified 2026-09-22 by reading the
         // raw bytes at the tensor's data offset, 11120992, in the actual
-        // model file): 0.016724, 0.016434, 0.017609. (REQUIRED #4,
-        // waves 1+1.5 gatekeeper review: the constants below previously read
+        // model file): 0.016724, 0.016434, 0.017609. (The constants below
+        // previously read
         // [0x2247, 0x2235, 0x2283], which decode to 0.01226/0.01212/0.01272
         // — not the values this comment claims and not what the real file
         // contains at that offset; 0x2448/0x2435/0x2482 are the bytes

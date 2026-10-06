@@ -143,9 +143,8 @@ pub enum ExportFormat {
     ///
     /// Maps to GGML type ID 10. Each super-block stores 16 bytes of packed
     /// 4-bit sub-block scale/min pairs, 64 bytes of packed 2-bit codes, and
-    /// FP16 `d`/`dmin` super-block scales. Wave-3.5 deviation routing
-    /// (FIX3-GGUF-WRITE landed `encode_quantized_tensor`'s `TensorType::Q2_K`
-    /// arm; this `ExportFormat` variant is B2-14's wiring on top of it).
+    /// FP16 `d`/`dmin` super-block scales. Backed by `encode_quantized_tensor`'s
+    /// `TensorType::Q2_K` arm.
     Q2K,
     /// Q3_K quantization: 3-bit K-quant, 256 per super-block, 6-bit packed
     /// sub-scales plus a high-bit mask (110 bytes/256 weights).
@@ -606,7 +605,7 @@ fn should_keep_fp32(name: &str, shape: &[usize], config: &ExportConfig) -> bool 
 /// 3. Otherwise `F32` again, with a `tracing::info!` — a tensor whose `ne0`
 ///    is not a block multiple has **no** valid encoding in that format, and
 ///    `llama.cpp`'s own quantizer keeps such a tensor in its source precision
-///    rather than failing the whole run (wave-1 addendum / core-gguf-N1).
+///    rather than failing the whole run (core-gguf-N1).
 ///    The previous behaviour — zero-padding the flattened tensor — made every
 ///    row after the first straddle a group boundary (CQ-14).
 ///
@@ -692,7 +691,7 @@ fn convert_metadata_value(value: &MetadataValue) -> Option<MetadataWriteValue> {
         MetadataValue::Float32(v) => MetadataWriteValue::F32(*v),
         MetadataValue::Float64(v) => MetadataWriteValue::F64(*v),
         MetadataValue::Uint64(v) => MetadataWriteValue::U64(*v),
-        // B2-16 handover 2 / FIX3-GGUF-WRITE item 3: this used to be
+        // This used to be
         // `MetadataWriteValue::U64(u64::try_from(*v).ok()?)`, which silently
         // dropped the whole key for any negative source value (`u64::try_from`
         // fails, `.ok()?` short-circuits to `None`) instead of writing it back
@@ -1164,7 +1163,7 @@ fn stash(state: &mut StreamState<'_>, err: ExportError) -> std::io::Error {
 ///
 /// This is an approximation — metadata and tensor-info headers are not
 /// included — but the *per-tensor* figure is exact: it applies the same
-/// [`effective_tensor_type`] resolution the writer does (including the FP32
+/// `effective_tensor_type` resolution the writer does (including the FP32
 /// carve-outs of CQ-02 and the block-alignment fallback), then asks the type
 /// for its real per-row byte count. Before this, the estimate reported the
 /// quantized size of tensors the writer kept in FP32, so `oxibonsai quantize`
@@ -1223,7 +1222,7 @@ pub struct ExportStats {
 
 /// Compute export statistics without performing the actual export.
 ///
-/// Uses the same [`effective_tensor_type`] resolution as the writer, so the
+/// Uses the same `effective_tensor_type` resolution as the writer, so the
 /// quantized / FP32 split it reports is the split the file will have.
 pub fn export_stats(tensors: &[WeightTensor], config: &ExportConfig) -> ExportStats {
     let mut quantized = 0usize;
@@ -1257,8 +1256,7 @@ pub fn export_stats(tensors: &[WeightTensor], config: &ExportConfig) -> ExportSt
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
-// Split out per the 2000-line file-length policy (gatekeeper OPTIONAL #O1,
-// waves 3+3.5 review) -- see `export_tests.rs`'s own module doc.
+// Split out per the 2000-line file-length policy -- see `export_tests.rs`'s own module doc.
 #[cfg(test)]
 #[path = "export_tests.rs"]
 mod tests;

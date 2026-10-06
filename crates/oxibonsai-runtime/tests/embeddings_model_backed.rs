@@ -62,8 +62,22 @@
 //! `InferenceEngine::embed` (the head-free Metal prefill on a GPU engine)
 //! against the batched CPU pass it superseded and the per-token loop both
 //! replaced, on a real model, and asserts parity, the short-input speed-up
-//! and the long-input wall-time target. It runs only when asked (`OXI_MODEL`
-//! or `OXIBONSAI_EMBED_BENCH=1`, release build).
+//! and the long-input wall-time target. It runs only when asked: both
+//! `OXIBONSAI_EMBED_BENCH=1` and `OXI_MODEL=<gguf>` must be set (release
+//! build). Neither variable starts it alone — `OXI_MODEL` is exported for the
+//! other real-model gates, and the benchmark maps a multi-GB model and runs
+//! for minutes — and `scripts/release-gate.sh`'s embedding leg sets both
+//! explicitly, so that leg never self-skips.
+//!
+//! The per-token reference loop costs about five to six minutes at 2000 tokens
+//! on an M3 at a load average of about 10 (309-353 s measured, longer under a
+//! heavier load), so on a long input it is a manual measurement
+//! behind a second opt-in, `OXIBONSAI_EMBED_BENCH_PER_TOKEN=1`, which the
+//! release gate never sets (it removes an inherited one). Without it the
+//! 2000-token input compares the production embedding with the batched CPU
+//! pass (pooled cosine of at least 0.9999) and asserts the 20 s Metal target;
+//! the 10- and 200-token inputs always compare every leg with the per-token
+//! reference, and the 10-token speed-up assertion stands.
 
 // `embeddings` is only compiled with the `server` feature; gate the whole file
 // the same way so `--no-default-features` stays green.
@@ -89,7 +103,7 @@ use oxibonsai_runtime::error::RuntimeError;
 use oxibonsai_runtime::metrics::InferenceMetrics;
 use oxibonsai_runtime::sampling::SamplingParams;
 use oxibonsai_runtime::tokenizer_bridge::TokenizerBridge;
-use oxibonsai_testkit::capability::{record_executed, record_skipped, Capability};
+use oxibonsai_testkit::capability::{record_executed_timed, record_skipped, Capability};
 use oxibonsai_testkit::workspace::{find_model, models_dir};
 use oxibonsai_tokenizer::OxiTokenizer;
 
@@ -1068,6 +1082,7 @@ fn real_model_places_queen_nearer_to_king_than_banana() {
         record_skipped(Capability::LegacyModels, TEST_NAME);
         return;
     };
+    let gate_start = std::time::Instant::now();
     let tokenizer_path_str = tokenizer_path
         .to_str()
         .expect("models/ path is valid UTF-8");
@@ -1138,7 +1153,7 @@ fn real_model_places_queen_nearer_to_king_than_banana() {
          than either is to a sentence about breakfast: {royal_sentences} vs {fruit_sentences}"
     );
 
-    record_executed(Capability::LegacyModels, TEST_NAME);
+    record_executed_timed(Capability::LegacyModels, TEST_NAME, gate_start.elapsed());
 }
 
 // ─── 6. Benchmark: the batched path against the per-token loop ───────────────
@@ -1154,6 +1169,12 @@ const BENCH_RUNS: usize = 3;
 /// Input lengths the benchmark measures: a short query, a paragraph, and the
 /// embedder's default token ceiling (`DEFAULT_MAX_EMBEDDING_TOKENS`).
 const BENCH_LENGTHS: [usize; 3] = [10, 200, 2000];
+
+/// From this input length the batched CPU pass and the per-token loop are
+/// slow enough (tens of seconds to minutes per run) to be timed once instead
+/// of [`BENCH_RUNS`] times, and the per-token loop needs its own opt-in (see
+/// [`per_token_reference_runs`]).
+const SLOW_LEG_FROM_TOKENS: usize = 1000;
 
 /// The acceptance ratio for the shortest input.
 const SHORT_INPUT_MIN_SPEEDUP: f64 = 10.0;
@@ -1240,61 +1261,176 @@ fn fmt_runs(times: &[f64]) -> String {
 /// it on a loaded host.
 const LONG_INPUT_TARGET_SECS: f64 = 20.0;
 
-/// The real model and tokenizer the benchmark runs on: `$OXI_MODEL`, else the
-/// testkit resolver's `Ternary-Bonsai-1.7B.gguf`; the tokenizer from the
-/// resolver, else next to the model file. `None` when either is missing.
-fn bench_model_and_tokenizer() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
-    let model = match std::env::var_os("OXI_MODEL").filter(|p| !p.is_empty()) {
-        Some(path) => std::path::PathBuf::from(path),
-        None => find_model("Ternary-Bonsai-1.7B.gguf")?,
-    };
-    let tokenizer = find_model("tokenizer.json").or_else(|| {
-        let beside = model.parent()?.join("tokenizer.json");
-        beside.is_file().then_some(beside)
-    })?;
-    Some((model, tokenizer))
+/// Environment variable that opts into the benchmark (together with
+/// `OXI_MODEL`, see [`embed_bench_requested`]).
+const EMBED_BENCH_ENV: &str = "OXIBONSAI_EMBED_BENCH";
+
+/// Environment variable that opts a long input into the per-token reference
+/// loop (see [`per_token_reference_requested`]); the release gate never sets
+/// it.
+const EMBED_BENCH_PER_TOKEN_ENV: &str = "OXIBONSAI_EMBED_BENCH_PER_TOKEN";
+
+/// Whether the benchmark was explicitly asked for: `OXIBONSAI_EMBED_BENCH`
+/// is exactly `1` **and** `OXI_MODEL` names a model.
+///
+/// Neither alone is enough. `OXI_MODEL` is exported for the other real-model
+/// gates (a workspace `cargo nextest run` with it set reaches this test), and
+/// the benchmark maps a multi-GB model and runs for minutes, so the model
+/// variable alone must not start it; the opt-in alone has no model to run on,
+/// and the benchmark never guesses one.
+fn embed_bench_requested(embed_bench: Option<&str>, oxi_model: Option<&std::ffi::OsStr>) -> bool {
+    embed_bench == Some("1") && oxi_model.is_some_and(|model| !model.is_empty())
 }
 
-/// 10-, 200- and 2000-token embeddings on a real model (the 1.7B by default):
+/// Whether the per-token reference loop was explicitly asked for on a long
+/// input: `OXIBONSAI_EMBED_BENCH_PER_TOKEN` is exactly `1`. A second opt-in on
+/// top of [`embed_bench_requested`]: the loop costs about five to six minutes
+/// at 2000 tokens on an M3 at a load average of about 10 (309-353 s measured,
+/// longer under a heavier load), which is a manual
+/// measurement, not something a gate leg or a casual benchmark run pays.
+fn per_token_reference_requested(per_token: Option<&str>) -> bool {
+    per_token == Some("1")
+}
+
+/// Whether the per-token reference loop runs on an `n`-token input: always
+/// below [`SLOW_LEG_FROM_TOKENS`] (the 10- and 200-token inputs, seconds
+/// each), and from there only when `per_token_opt_in` is set.
+fn per_token_reference_runs(n: usize, per_token_opt_in: bool) -> bool {
+    n < SLOW_LEG_FROM_TOKENS || per_token_opt_in
+}
+
+/// What the per-token reference loop measured on one input.
+struct PerTokenLeg {
+    /// Wall time of every run, seconds.
+    times: Vec<f64>,
+    /// The loop's rows, mean-pooled and normalised.
+    pooled: Vec<f32>,
+}
+
+/// The tokenizer the benchmark runs with: the testkit resolver's
+/// `tokenizer.json`, else the one next to the model file. `None` when neither
+/// exists.
+fn bench_tokenizer(model: &std::path::Path) -> Option<std::path::PathBuf> {
+    find_model("tokenizer.json").or_else(|| {
+        let beside = model.parent()?.join("tokenizer.json");
+        beside.is_file().then_some(beside)
+    })
+}
+
+/// The benchmark needs both variables, and neither alone starts it.
+#[test]
+fn the_embed_bench_needs_both_the_opt_in_and_a_model() {
+    use std::ffi::OsStr;
+    let model = Some(OsStr::new("model.gguf"));
+    assert!(embed_bench_requested(Some("1"), model));
+    assert!(
+        !embed_bench_requested(None, model),
+        "OXI_MODEL alone must not start the benchmark"
+    );
+    assert!(!embed_bench_requested(Some("0"), model));
+    assert!(
+        !embed_bench_requested(Some("true"), model),
+        "only the exact value 1 opts in"
+    );
+    assert!(
+        !embed_bench_requested(Some("1"), None),
+        "the opt-in without a model has nothing to run on"
+    );
+    assert!(!embed_bench_requested(Some("1"), Some(OsStr::new(""))));
+    assert!(!embed_bench_requested(None, None));
+}
+
+/// The per-token reference loop on a long input has its own opt-in: the
+/// benchmark's two variables never start it, and only the exact value `1`
+/// does.
+#[test]
+fn the_per_token_reference_at_a_long_input_needs_its_own_opt_in() {
+    assert!(per_token_reference_requested(Some("1")));
+    assert!(
+        !per_token_reference_requested(None),
+        "the benchmark's own opt-in must not start the per-token reference"
+    );
+    for not_exactly_one in ["0", "true", "yes", "", " 1", "1 ", "11"] {
+        assert!(
+            !per_token_reference_requested(Some(not_exactly_one)),
+            "{not_exactly_one:?} is not the explicit opt-in"
+        );
+    }
+
+    // The benchmark's own lengths: the short and medium inputs always measure
+    // the per-token reference, the 2000-token one only on the opt-in.
+    assert_eq!(BENCH_LENGTHS, [10, 200, 2000]);
+    for n in [BENCH_LENGTHS[0], BENCH_LENGTHS[1]] {
+        assert!(per_token_reference_runs(n, false), "{n} tokens, no opt-in");
+        assert!(per_token_reference_runs(n, true), "{n} tokens, opt-in");
+    }
+    assert!(
+        !per_token_reference_runs(BENCH_LENGTHS[2], false),
+        "2000 tokens must skip the per-token reference unless explicitly asked"
+    );
+    assert!(per_token_reference_runs(BENCH_LENGTHS[2], true));
+
+    // The boundary itself, and nothing above it that always runs.
+    assert!(per_token_reference_runs(SLOW_LEG_FROM_TOKENS - 1, false));
+    assert!(!per_token_reference_runs(SLOW_LEG_FROM_TOKENS, false));
+    assert!(!per_token_reference_runs(usize::MAX, false));
+    // The short-input speed-up assertion needs the shortest input to be
+    // measured without any opt-in.
+    assert!(BENCH_LENGTHS[0] < SLOW_LEG_FROM_TOKENS);
+}
+
+/// 10-, 200- and 2000-token embeddings on a real model (`OXI_MODEL`):
 /// the production `InferenceEngine::embed` — the head-free Metal prefill on a
 /// GPU engine — against the batched CPU pass the same engine ran before it
 /// (`forward_hidden` on a CPU-tier dispatcher) and the per-token host-KV loop
 /// both replaced (`BonsaiModel::forward_hidden_sequential` on a dispatcher
 /// built exactly as the engine's own), minimum of three runs per leg (one
-/// run for the two slow legs at 1000+ tokens), with the load average printed
-/// beside every figure.
+/// run for the batched CPU pass and the per-token loop at 1000+ tokens), with
+/// the load average printed beside every figure.
 ///
-/// Asserts that every leg agrees with the per-token reference (a pooled
-/// cosine of at least 0.9999), the acceptance ratio on the 10-token input,
-/// and — on a GPU
-/// engine — that the 2000-token embedding takes at most
-/// [`LONG_INPUT_TARGET_SECS`]. Runs when `OXI_MODEL` names a model or
-/// `OXIBONSAI_EMBED_BENCH=1` (release build), and self-skips — recording
-/// the skip — otherwise or when a file is missing.
+/// Asserts, on every input, that the production embedding agrees with the
+/// batched CPU pass (a pooled cosine of at least 0.9999); on every input that
+/// measures the per-token reference — the 10- and 200-token ones always, the
+/// 2000-token one only with `OXIBONSAI_EMBED_BENCH_PER_TOKEN=1` (see
+/// [`per_token_reference_runs`]; the release gate never sets it) — that both
+/// legs agree with it too; the acceptance ratio on the 10-token input; and,
+/// on a GPU engine, that the 2000-token embedding takes at most
+/// [`LONG_INPUT_TARGET_SECS`]. The verdict and every assertion message
+/// carry the load average the figures were measured under. Runs only when
+/// both `OXIBONSAI_EMBED_BENCH=1` and `OXI_MODEL` are set (release build; see
+/// [`embed_bench_requested`]), and self-skips — recording the skip —
+/// otherwise or when the tokenizer is missing.
 #[test]
 fn embed_bench_short_and_long() {
     use oxibonsai_kernels::{KernelDispatcher, OneBitKernel};
 
     const TEST_NAME: &str =
         "oxibonsai-runtime::embeddings_model_backed::embed_bench_short_and_long";
-    let requested = std::env::var("OXIBONSAI_EMBED_BENCH").is_ok_and(|v| v == "1")
-        || std::env::var_os("OXI_MODEL").is_some_and(|p| !p.is_empty());
-    if !requested {
+    let embed_bench = std::env::var(EMBED_BENCH_ENV).ok();
+    let oxi_model = std::env::var_os("OXI_MODEL");
+    let model_path = match oxi_model.as_deref() {
+        Some(model) if embed_bench_requested(embed_bench.as_deref(), Some(model)) => {
+            std::path::PathBuf::from(model)
+        }
+        _ => {
+            eprintln!(
+                "{TEST_NAME}: set {EMBED_BENCH_ENV}=1 and OXI_MODEL=<gguf> in a release build to \
+                 run (the benchmark maps a multi-GB model and runs for minutes, so neither \
+                 variable starts it alone) -- skipping"
+            );
+            record_skipped(Capability::LegacyModels, TEST_NAME);
+            return;
+        }
+    };
+    let Some(tokenizer_path) = bench_tokenizer(&model_path) else {
         eprintln!(
-            "{TEST_NAME}: set OXI_MODEL (or OXIBONSAI_EMBED_BENCH=1) in a release build to \
-             run -- skipping"
-        );
-        record_skipped(Capability::LegacyModels, TEST_NAME);
-        return;
-    }
-    let Some((model_path, tokenizer_path)) = bench_model_and_tokenizer() else {
-        eprintln!(
-            "{TEST_NAME}: the model or tokenizer.json is missing (OXI_MODEL / {:?}) -- skipping",
+            "{TEST_NAME}: tokenizer.json is missing ({:?} and next to {model_path:?}) -- skipping",
             models_dir()
         );
         record_skipped(Capability::LegacyModels, TEST_NAME);
         return;
     };
+    let gate_start = std::time::Instant::now();
     let tokenizer = TokenizerBridge::from_file(
         tokenizer_path
             .to_str()
@@ -1331,19 +1467,31 @@ fn embed_bench_short_and_long() {
     // dispatcher answers on every build.
     let gpu_engine = per_token_kernel.is_gpu_accelerated();
     let hidden = engine.hidden_size();
+    let per_token_opt_in =
+        per_token_reference_requested(std::env::var(EMBED_BENCH_PER_TOKEN_ENV).ok().as_deref());
     eprintln!(
         "embed_bench: model {model_path:?}, engine tier {:?}; per-token leg on {:?}; batched \
-         CPU leg on {:?}; load average before: {}",
+         CPU leg on {:?}; per-token reference at {SLOW_LEG_FROM_TOKENS}+ tokens: {}; load \
+         average before: {}",
         engine.kernel_tier(),
         per_token_kernel.tier(),
         cpu_kernel.tier(),
+        if per_token_opt_in {
+            format!("on ({EMBED_BENCH_PER_TOKEN_ENV}=1)")
+        } else {
+            format!("off (set {EMBED_BENCH_PER_TOKEN_ENV}=1 to measure it)")
+        },
         load_average()
     );
 
     let mut short_speedup = None;
     for n in BENCH_LENGTHS {
         let tokens = &ids[..n];
-        let slow_runs = if n >= 1000 { 1 } else { BENCH_RUNS };
+        let slow_runs = if n >= SLOW_LEG_FROM_TOKENS {
+            1
+        } else {
+            BENCH_RUNS
+        };
         let (production_times, production) = time_runs(BENCH_RUNS, || {
             engine.embed(tokens).expect("production embed")
         });
@@ -1354,26 +1502,50 @@ fn embed_bench_short_and_long() {
                 .forward_hidden(tokens, &cpu_kernel)
                 .expect("batched CPU forward_hidden")
         });
-        let (per_token_times, per_token_rows) = time_runs(slow_runs, || {
-            engine
-                .dense_model_mut()
-                .expect("a dense model")
-                .forward_hidden_sequential(tokens, &per_token_kernel)
-                .expect("per-token forward_hidden")
+        let per_token_leg = per_token_reference_runs(n, per_token_opt_in).then(|| {
+            let (times, rows) = time_runs(slow_runs, || {
+                engine
+                    .dense_model_mut()
+                    .expect("a dense model")
+                    .forward_hidden_sequential(tokens, &per_token_kernel)
+                    .expect("per-token forward_hidden")
+            });
+            PerTokenLeg {
+                times,
+                pooled: pool_rows(&rows, hidden),
+            }
         });
-        let per_token = pool_rows(&per_token_rows, hidden);
         let cpu = pool_rows(&cpu_rows, hidden);
-        let cos_production = cosine(&production, &per_token);
-        let cos_cpu = cosine(&cpu, &per_token);
+        let cos_production_cpu = cosine(&production, &cpu);
         let production_min = min_of(&production_times);
         let cpu_min = min_of(&cpu_times);
-        let per_token_min = min_of(&per_token_times);
-        let speedup = per_token_min / production_min.max(f64::MIN_POSITIVE);
+        // `(per-token min, production speed-up, cos(production), cos(batched
+        // CPU))` against the per-token reference, when it ran.
+        let per_token = per_token_leg.as_ref().map(|leg| {
+            let per_token_min = min_of(&leg.times);
+            (
+                per_token_min,
+                per_token_min / production_min.max(f64::MIN_POSITIVE),
+                cosine(&production, &leg.pooled),
+                cosine(&cpu, &leg.pooled),
+            )
+        });
+        let per_token_report = match per_token_leg.as_ref().zip(per_token) {
+            Some((leg, (per_token_min, speedup, cos_production, cos_cpu))) => format!(
+                "per-token loop min {per_token_min:.3} s [{}]: production {speedup:.1}x faster; \
+                 pooled cos vs per-token: production {cos_production:.6}, batched CPU \
+                 {cos_cpu:.6}",
+                fmt_runs(&leg.times)
+            ),
+            None => format!(
+                "per-token loop skipped at {n} tokens (set {EMBED_BENCH_PER_TOKEN_ENV}=1 to \
+                 measure it)"
+            ),
+        };
         eprintln!(
             "embed_bench: {n} tokens: production ({}) min {production_min:.3} s [{}]; batched \
-             CPU min {cpu_min:.3} s [{}] ({:.1}x slower than production); per-token loop min \
-             {per_token_min:.3} s [{}]: production {speedup:.1}x faster; pooled cos vs \
-             per-token: production {cos_production:.6}, batched CPU {cos_cpu:.6}; load {}",
+             CPU min {cpu_min:.3} s [{}] ({:.1}x slower than production); pooled cos production \
+             vs batched CPU {cos_production_cpu:.6}; {per_token_report}; load {}",
             if gpu_engine {
                 "Metal hidden prefill"
             } else {
@@ -1382,20 +1554,27 @@ fn embed_bench_short_and_long() {
             fmt_runs(&production_times),
             fmt_runs(&cpu_times),
             cpu_min / production_min.max(f64::MIN_POSITIVE),
-            fmt_runs(&per_token_times),
             load_average()
         );
         assert!(
-            f64::from(cos_production) >= 0.9999,
-            "{n} tokens: the production embedding diverged from the per-token loop: \
-             cos {cos_production}"
+            f64::from(cos_production_cpu) >= 0.9999,
+            "{n} tokens: the production embedding diverged from the batched CPU pass: \
+             cos {cos_production_cpu}"
         );
-        assert!(
-            f64::from(cos_cpu) >= 0.9999,
-            "{n} tokens: the batched CPU embedding diverged from the per-token loop: cos {cos_cpu}"
-        );
-        if n == BENCH_LENGTHS[0] {
-            short_speedup = Some(speedup);
+        if let Some((_, speedup, cos_production, cos_cpu)) = per_token {
+            assert!(
+                f64::from(cos_production) >= 0.9999,
+                "{n} tokens: the production embedding diverged from the per-token loop: \
+                 cos {cos_production}"
+            );
+            assert!(
+                f64::from(cos_cpu) >= 0.9999,
+                "{n} tokens: the batched CPU embedding diverged from the per-token loop: \
+                 cos {cos_cpu}"
+            );
+            if n == BENCH_LENGTHS[0] {
+                short_speedup = Some(speedup);
+            }
         }
         if n == longest {
             eprintln!(
@@ -1412,19 +1591,22 @@ fn embed_bench_short_and_long() {
             if gpu_engine {
                 assert!(
                     production_min <= LONG_INPUT_TARGET_SECS,
-                    "{n} tokens: the Metal embedding took {production_min:.3} s, over the \
-                     {LONG_INPUT_TARGET_SECS} s target"
+                    "{n} tokens: the Metal embedding took {production_min:.3} s (best of \
+                     {BENCH_RUNS}), over the {LONG_INPUT_TARGET_SECS} s target; load average {}",
+                    load_average()
                 );
             }
         }
     }
     eprintln!("embed_bench: load average after: {}", load_average());
-    let short_speedup = short_speedup.unwrap_or(0.0);
+    let short_speedup =
+        short_speedup.expect("the shortest input always measures the per-token reference");
     assert!(
         short_speedup >= SHORT_INPUT_MIN_SPEEDUP,
         "{} tokens: the production path must be at least {SHORT_INPUT_MIN_SPEEDUP}x faster than \
-         the per-token loop, measured {short_speedup:.2}x",
-        BENCH_LENGTHS[0]
+         the per-token loop, measured {short_speedup:.2}x; load average {}",
+        BENCH_LENGTHS[0],
+        load_average()
     );
-    record_executed(Capability::LegacyModels, TEST_NAME);
+    record_executed_timed(Capability::LegacyModels, TEST_NAME, gate_start.elapsed());
 }

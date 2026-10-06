@@ -29,7 +29,7 @@ const PROBE_MAX_STRING_LEN: u64 = 256 * 1024 * 1024;
 /// `GGML_MAX_DIMS` is 4 and llama.cpp rejects `n_dims > 4`; both strict
 /// parsers (`tensor_info.rs::MAX_TENSOR_DIMS`, `streaming.rs`) already cap
 /// at 4 (core-gguf-16). This tolerant probe path was left at a stale 1024
-/// until this fix (wave-1 addendum #3).
+/// until this fix.
 const PROBE_MAX_TENSOR_DIMS: u32 = 4;
 
 /// Translate a [`CompatError`] (raised by the shared forward-compat header
@@ -529,7 +529,7 @@ fn read_u64_field(data: &[u8], offset: usize) -> u64 {
 ///
 /// Reads the string body via the one shared, already-hardened
 /// [`crate::gguf::tensor_info::read_string_body_chunked`] (core-gguf-20 /
-/// sec-10 / wave-2.5 integration addendum, item 5) in bounded 64 KiB
+/// sec-10) in bounded 64 KiB
 /// pieces, instead of this file's own former independent copy
 /// (`read_gguf_string_chunked` / a private `STRING_READ_CHUNK`) that
 /// allocated `vec![0u8; len]` up front — bounded only by

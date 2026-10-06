@@ -225,14 +225,17 @@ fn greedy_load(backend: Backend, seed: u64, temperature: f32) -> EngineLoad {
         prefill_chunk: None,
         penalties: PenaltyParams::default(),
         min_p: 0.0,
+        wants_vision: false,
+        vision_resident_bytes: 0,
     }
 }
 
-/// The orchestrator's P0: the CLI's own temperature-0 shortcut decoded a
-/// CPU-tier engine through the GPU argmax path. The shortcut is gone; the
-/// engine alone decides, and a `--backend cpu` engine is never eligible —
-/// on every build, `metal` included. The streamed, the `--no-stream` and a
-/// fresh engine's own `generate` all agree token for token.
+/// P0 regression: the CLI once decoded a temperature-0 run of a CPU-tier
+/// engine through the GPU argmax path with a shortcut of its own. The
+/// shortcut is gone; the engine alone decides, and a `--backend cpu` engine
+/// is never eligible — on every build, `metal` included. The streamed, the
+/// `--no-stream` and a fresh engine's own `generate` all agree token for
+/// token.
 #[test]
 fn a_cpu_backend_greedy_run_never_takes_the_gpu_argmax_route() {
     let bytes = tiny_dense_gguf(Vec::new());
@@ -437,6 +440,9 @@ fn min_p_engine_path_matches_the_cli_loop() {
         return;
     };
     let _real = test_fixtures::real_model_lock();
+    // Timed from here — the model is located and the host lock held — to the
+    // record below: the cost of the real work this test names.
+    let started = std::time::Instant::now();
     let mmap = oxibonsai_core::gguf::reader::mmap_gguf_file(&model).expect("mmap");
     let gguf = GgufFile::parse(&mmap).expect("parse");
     let tok = oxibonsai_runtime::TokenizerBridge::from_file(&tokenizer.to_string_lossy())
@@ -470,9 +476,10 @@ fn min_p_engine_path_matches_the_cli_loop() {
         );
     }
 
-    oxibonsai_testkit::capability::record_executed(
+    oxibonsai_testkit::capability::record_executed_timed(
         oxibonsai_testkit::capability::Capability::LegacyModels,
         TEST,
+        started.elapsed(),
     );
 }
 
@@ -589,13 +596,12 @@ fn cli_greedy_text(
 
 /// The P0's own acceptance, through the CLI path: `--backend cpu
 /// --temperature 0` on the legacy 1.7B is pure greedy and reproduces the
-/// greedy truth — `golden_legacy/legacy_golden.json`'s backend "metal" row
-/// for prompt 1 (the orchestrator P0 addendum's chosen truth), i.e. CPU and
-/// Metal are byte-identical. That file's backend "cpu" row for this prompt
-/// (`"... Tokyo.\nThe answer to the question ..."`) is a capture of the
-/// pre-P0 CLI, whose CPU path applied a hidden `repetition_penalty` of 1.1
-/// before the argmax (`findings/legacy_cpu_metal_divergence.md`); reproducing
-/// it would mean the hidden penalty is back.
+/// greedy truth — the legacy golden's backend "metal" row for prompt 1,
+/// i.e. CPU and Metal are byte-identical. The golden's backend "cpu" row for
+/// this prompt (`"... Tokyo.\nThe answer to the question ..."`) is a capture
+/// of the pre-P0 CLI, whose CPU path applied a hidden `repetition_penalty`
+/// of 1.1 before the argmax; reproducing it would mean the hidden penalty is
+/// back.
 #[test]
 fn a_cpu_greedy_run_reproduces_the_legacy_1_7b_greedy_golden() {
     let Some(model) = test_fixtures::models_dir_file("Ternary-Bonsai-1.7B.gguf") else {
@@ -666,8 +672,14 @@ fn a_run_user_turn_carries_its_images_ahead_of_the_text() {
 #[test]
 fn a_prompt_without_images_stays_its_token_ids() {
     let tokens = vec![7u32, 8, 9];
-    let prompt = multimodal_prompt(tokens.clone(), &bonsai2::VisionRequest::default(), None, 16)
-        .expect("text prompt");
+    let prompt = multimodal_prompt(
+        tokens.clone(),
+        &bonsai2::VisionRequest::default(),
+        None,
+        16,
+        4,
+    )
+    .expect("text prompt");
     assert_eq!(prompt, ChatPrompt::Text(tokens));
 }
 
@@ -684,13 +696,17 @@ fn an_image_is_encoded_and_spliced_in_place_of_its_placeholder() {
     let dir = test_fixtures::scratch_dir("run_splice");
     let vision = vision_request_for_a_test_image(&dir);
     let service = vision
-        .load_service("qwen35", bonsai2::cli_image_policy())
+        .load_service(
+            "qwen35",
+            &bonsai2::tests::bonsai2_vocabulary(),
+            bonsai2::cli_image_policy(),
+        )
         .expect("load")
         .expect("requested");
     let ids = service.token_ids();
     let tokens = vec![1u32, ids.vision_start, ids.image_pad, ids.vision_end, 2];
-    let prompt =
-        multimodal_prompt(tokens.clone(), &vision, Some(&service), 4096).expect("spliced prompt");
+    let prompt = multimodal_prompt(tokens.clone(), &vision, Some(&service), 4096, 8)
+        .expect("spliced prompt");
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(prompt.image_count(), 1);
     assert_eq!(prompt.tokens(), tokens.as_slice());
@@ -706,17 +722,21 @@ fn an_image_prompt_is_checked_against_the_context_before_any_encode() {
     let dir = test_fixtures::scratch_dir("run_splice_ctx");
     let vision = vision_request_for_a_test_image(&dir);
     let service = vision
-        .load_service("qwen35", bonsai2::cli_image_policy())
+        .load_service(
+            "qwen35",
+            &bonsai2::tests::bonsai2_vocabulary(),
+            bonsai2::cli_image_policy(),
+        )
         .expect("load")
         .expect("requested");
     let ids = service.token_ids();
     let tokens = vec![1u32, ids.vision_start, ids.image_pad, ids.vision_end, 2];
-    let msg = multimodal_prompt(tokens, &vision, Some(&service), 40)
+    let msg = multimodal_prompt(tokens, &vision, Some(&service), 40, 8)
         .expect_err("52 rows cannot fit a 40-position context")
         .to_string();
 
     // A prompt with no placeholder for the image is refused, too.
-    let orphan = multimodal_prompt(vec![1u32, 2, 3], &vision, Some(&service), 4096)
+    let orphan = multimodal_prompt(vec![1u32, 2, 3], &vision, Some(&service), 4096, 8)
         .expect_err("the image has no placeholder")
         .to_string();
     let _ = std::fs::remove_dir_all(&dir);
@@ -726,5 +746,86 @@ fn an_image_prompt_is_checked_against_the_context_before_any_encode() {
     assert!(
         orphan.starts_with("[image_placeholder_count_mismatch]"),
         "{orphan}"
+    );
+}
+
+/// One helper (`vision::check_generation_room`) judges a prompt's room for
+/// the request's `max_tokens` before any encode or prefill, for an image
+/// prompt and for a text prompt alike: a prompt that fills the window
+/// exactly leaves no position to generate into and is refused; one that fits
+/// but leaves less room than `max_tokens` is not (the generation is clamped
+/// to the room left, as it is for every over-large `--max-tokens`).
+#[test]
+fn the_room_check_covers_image_and_text_prompts_alike() {
+    // Text: 16 tokens in a 16-position window.
+    let full = vec![7u32; 16];
+    let msg = multimodal_prompt(
+        full.clone(),
+        &bonsai2::VisionRequest::default(),
+        None,
+        16,
+        4,
+    )
+    .expect_err("no position is left to generate into")
+    .to_string();
+    assert!(
+        msg.contains("sequence length 16 fills max context 16 exactly"),
+        "{msg}"
+    );
+    assert!(msg.contains("shorten it or raise --ctx"), "{msg}");
+    // ...one position of room is enough, and `max_tokens` beyond it is clamped
+    // later, not refused here.
+    let mut almost = full.clone();
+    almost.pop();
+    let prompt = multimodal_prompt(
+        almost.clone(),
+        &bonsai2::VisionRequest::default(),
+        None,
+        16,
+        4,
+    )
+    .expect("15 of 16 leaves room for a token");
+    assert_eq!(prompt, ChatPrompt::Text(almost));
+    let too_long = vec![7u32; 17];
+    let msg = multimodal_prompt(too_long, &bonsai2::VisionRequest::default(), None, 16, 4)
+        .expect_err("the prompt alone does not fit")
+        .to_string();
+    assert!(
+        msg.contains("sequence length 17 exceeds max context 16"),
+        "{msg}"
+    );
+
+    // Image: 5 tokens with the placeholder expanded to 48 rows = 52 positions.
+    let dir = test_fixtures::scratch_dir("run_room");
+    let vision = vision_request_for_a_test_image(&dir);
+    let service = vision
+        .load_service(
+            "qwen35",
+            &bonsai2::tests::bonsai2_vocabulary(),
+            bonsai2::cli_image_policy(),
+        )
+        .expect("load")
+        .expect("requested");
+    let ids = service.token_ids();
+    let tokens = vec![1u32, ids.vision_start, ids.image_pad, ids.vision_end, 2];
+    let msg = multimodal_prompt(tokens.clone(), &vision, Some(&service), 52, 4)
+        .expect_err("52 rows fill a 52-position window exactly")
+        .to_string();
+    assert!(
+        msg.contains("sequence length 52 (the prompt with its image rows) fills max context 52"),
+        "{msg}"
+    );
+    assert!(msg.contains("--image-max-tokens"), "{msg}");
+    // 8 positions of room for 100 requested tokens: accepted (and clamped by
+    // the caller), the images encoded and spliced.
+    let prompt = multimodal_prompt(tokens, &vision, Some(&service), 60, 100)
+        .expect("a fitting prompt is never refused for a large --max-tokens");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(prompt.image_count(), 1);
+    assert_eq!(prompt.len(), 52);
+    assert_eq!(
+        clamp_generation_budget(prompt.len(), 100, 60).expect("fits"),
+        8,
+        "the room left is what the run then generates"
     );
 }

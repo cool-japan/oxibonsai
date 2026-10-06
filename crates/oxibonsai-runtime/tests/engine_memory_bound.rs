@@ -1,7 +1,7 @@
-//! HOTFIX-TESTMEM regression test: constructing an `InferenceEngine` + router
+//! Test-memory regression test: constructing an `InferenceEngine` + router
 //! from a config that carries no real weights must never approach the
-//! multi-GB blowup filed against `server::tests::create_router_builds_without_tokenizer`
-//! and `server::tests::create_router_with_shared_metrics`.
+//! multi-GB blowup that `server::tests::create_router_builds_without_tokenizer`
+//! and `server::tests::create_router_with_shared_metrics` once hit.
 //!
 //! Those two unit tests built their engine from `Qwen3Config::bonsai_8b()`,
 //! which sent `InferenceEngine::new` -> `BonsaiModel::new`
@@ -12,15 +12,15 @@
 //! hardcoded `max_seq_len = 4096` — roughly 5 GB total, measured (see below),
 //! just to build a router that never runs a forward pass. Both tests are now
 //! `Qwen3Config::tiny_test()`-based; this file is the standing regression
-//! test the package spec asked for so a future edit can't reintroduce a
+//! test so a future edit can't reintroduce a
 //! large config here unnoticed.
 //!
 //! Measured with `/usr/bin/time -l` against the compiled test binary
-//! (`--exact --test-threads=1`, one process per test, this worktree, before
-//! this package's fix): `create_router_builds_without_tokenizer` peaked at
+//! (`--exact --test-threads=1`, one process per test, before the fix):
+//! `create_router_builds_without_tokenizer` peaked at
 //! 5 006 376 960 bytes (~4.66 GiB) maximum resident set size;
 //! `create_router_with_shared_metrics` peaked at 5 007 622 144 bytes
-//! (~4.66 GiB). Both numbers are recorded in this package's `notes` field.
+//! (~4.66 GiB).
 //!
 //! ## Why this test asserts on config-derived sizes, not an allocation count
 //!
@@ -32,9 +32,9 @@
 //! not even exist in this binary, and it would not be visible outside
 //! `oxibonsai-model` if it did. Reusing it from here is not possible without
 //! making it a public, always-compiled API of `oxibonsai-model` — a product
-//! change outside this test-only package's `owned_files`. A libc/RSS
+//! change outside this test target. A libc/RSS
 //! before-after check from inside the test process (`std::process` /
-//! `/proc`) was considered and rejected per the package spec (it is noisy
+//! `/proc`) was considered and rejected (it is noisy
 //! across platforms and measures the whole process, not the allocation under
 //! test). Defining a second, independent `#[global_allocator]` scoped to
 //! just this integration-test binary was also considered — since each
@@ -58,9 +58,9 @@ use oxibonsai_runtime::server::create_router;
 /// `num_layers`/`num_kv_heads`/`head_dim`, is smaller than either of those
 /// tables alone. Bounding one table's size below 64 MiB keeps both tables
 /// combined (~128 MiB) plus the KV cache/rope/norm overhead safely inside
-/// the 256 MiB engine-construction ceiling this package's spec sets, with
+/// the 256 MiB engine-construction ceiling this test sets, with
 /// wide margin (`tiny_test()` actually measures at ~37 MiB per table, i.e.
-/// ~74 MiB + ~2 MiB KV cache — see `notes`).
+/// ~74 MiB + ~2 MiB KV cache).
 ///
 /// That margin is real but not huge (~1.7x): `tiny_test()`'s
 /// `hidden_size = 64` isn't a multiple of 128, which already makes it
@@ -98,8 +98,8 @@ fn engine_and_router_construction_stays_within_memory_bound() {
     assert!(
         embed_table_bytes < MAX_EMBED_TABLE_BYTES,
         "engine-construction embedding table is {embed_table_bytes} bytes \
-         (vocab_size={}, hidden_size={}); HOTFIX-TESTMEM requires test \
-         fixtures to stay under {MAX_EMBED_TABLE_BYTES} bytes per table \
+         (vocab_size={}, hidden_size={}); the test-memory bound requires \
+         test fixtures to stay under {MAX_EMBED_TABLE_BYTES} bytes per table \
          (server::tests::create_router_* used to allocate ~2.3 GB per table \
          from Qwen3Config::bonsai_8b(), ~5 GB total measured RSS)",
         carried.vocab_size,
@@ -113,8 +113,7 @@ fn engine_and_router_construction_stays_within_memory_bound() {
     let _router = create_router(engine, None);
 }
 
-/// Replica sharing on a **real** model (verify:METAL-CONCURRENCY blocking
-/// #1, ENGINE-SEAM item 6): three replicas of the dense model at
+/// Replica sharing on a **real** model: three replicas of the dense model at
 /// `$OXI_MODEL`, built exactly the way `build_pool_from_gguf_parts` builds a
 /// pool (replica 1 maps and leaks the file, replicas 2 and 3 borrow the same
 /// `&'static GgufFile` and the shared token-embedding table), must place the
@@ -138,7 +137,7 @@ fn real_model_replicas_place_their_weights_on_the_gpu_once() {
     use oxibonsai_kernels::gpu_backend::weight_bytes_uploaded_total;
     use oxibonsai_kernels::{KernelDispatcher, KernelTier, MetalGraph};
     use oxibonsai_runtime::engine::Backend;
-    use oxibonsai_testkit::capability::{record_executed, record_skipped, Capability};
+    use oxibonsai_testkit::capability::{record_executed_timed, record_skipped, Capability};
 
     const TEST: &str =
         "engine_memory_bound::real_model_replicas_place_their_weights_on_the_gpu_once";
@@ -161,6 +160,7 @@ fn real_model_replicas_place_their_weights_on_the_gpu_once() {
         path.display()
     );
 
+    let gate_start = std::time::Instant::now();
     let params = SamplingParams {
         temperature: 0.0,
         top_k: 0,
@@ -255,5 +255,5 @@ fn real_model_replicas_place_their_weights_on_the_gpu_once() {
         replicas.push(replica);
     }
     assert_eq!(replicas.len(), REPLICAS);
-    record_executed(Capability::LegacyModels, TEST);
+    record_executed_timed(Capability::LegacyModels, TEST, gate_start.elapsed());
 }

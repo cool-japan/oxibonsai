@@ -1,4 +1,4 @@
-//! Tests of the B2-11-FIX additions to [`crate::kv_cache`]: bounded lazy
+//! Tests of the additions to [`crate::kv_cache`]: bounded lazy
 //! allocation, the element-type / layout split, the read-back accessors and the
 //! storage-aware attention read.
 

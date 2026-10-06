@@ -184,7 +184,7 @@ impl InferenceEngine<'_> {
         }
         // Record engine-level stats. Kept symmetric with `generate` /
         // `generate_tracked`'s CPU tails and with the GPU-argmax path's
-        // `generate_greedy_gpu_unchecked` (a wave-2 verifier finding: this
+        // `generate_greedy_gpu_unchecked` (this
         // call was previously missing here, so `EngineStats::requests_completed`
         // / `tokens_generated` depended on which decode route a given
         // request happened to take).
@@ -304,8 +304,8 @@ impl InferenceEngine<'_> {
             m.tokens_generated_total.inc_by(generated as u64);
             m.update_memory_from_rss();
         }
-        // See the identical comment in `generate_streaming`'s CPU tail
-        // (wave-2 verifier finding): keeps `EngineStats` symmetric across
+        // See the identical comment in `generate_streaming`'s CPU tail:
+        // keeps `EngineStats` symmetric across
         // every decode route.
         self.stats.record_request(generated);
 

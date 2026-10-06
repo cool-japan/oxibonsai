@@ -159,7 +159,8 @@ mod gates {
     use crate::harness::{
         argmax, detokenize, gguf_vocab, golden_dir, gpt2_byte_decoder, log_softmax,
         parse_prompt_tokens, read_golden, read_golden_bytes, record_capability,
-        require_model_files, show_bytes, top_n, PQ2_ENV, PROMPTS, PTQ1_ENV, REQUIRE_ENV, TOP_N,
+        record_capability_timed, require_model_files, show_bytes, top_n, PQ2_ENV, PROMPTS,
+        PTQ1_ENV, REQUIRE_ENV, TOP_N,
     };
 
     /// KV window: the longest golden prompt (13 tokens) plus 32 generated
@@ -229,10 +230,11 @@ mod gates {
         found
     }
 
-    /// Record the outcome: `executed` only when every band ran.
-    fn record(test: &str, ran: usize) {
+    /// Record the outcome: `executed` (with the gate's wall time since
+    /// `gate_start`) only when every band ran.
+    fn record(test: &str, ran: usize, gate_start: Instant) {
         if ran == BANDS.len() {
-            record_capability(true, test);
+            record_capability_timed(true, test, Some(gate_start.elapsed()));
         } else {
             eprintln!("skip {test}: {ran} of {} bands located", BANDS.len());
             record_capability(false, test);
@@ -316,9 +318,11 @@ mod gates {
     pub(super) fn g11(test: &str) {
         let bands = locate_bands(test);
         if bands.is_empty() {
-            record(test, 0);
+            record(test, 0, Instant::now());
             return;
         }
+        // The timer starts once the files are located and covers every band.
+        let gate_start = Instant::now();
         let mut failures = Vec::new();
         for (band, path) in &bands {
             failures.extend(g11_band(band, path));
@@ -328,7 +332,7 @@ mod gates {
             "G11 on the real 27B:\n{}",
             failures.join("\n")
         );
-        record(test, bands.len());
+        record(test, bands.len(), gate_start);
     }
 
     fn g11_band(band: &Band, path: &Path) -> Vec<String> {
@@ -1106,9 +1110,11 @@ mod gates {
     pub(super) fn g10(test: &str) {
         let bands = locate_bands(test);
         if bands.is_empty() {
-            record(test, 0);
+            record(test, 0, Instant::now());
             return;
         }
+        // The timer starts once the files are located and covers every band.
+        let gate_start = Instant::now();
         let mut failures = Vec::new();
         for (band, path) in &bands {
             let best = g10_band(band, path);
@@ -1120,7 +1126,7 @@ mod gates {
             }
         }
         assert!(failures.is_empty(), "G10:\n{}", failures.join("\n"));
-        record(test, bands.len());
+        record(test, bands.len(), gate_start);
     }
 
     /// Best-of-three Metal decode rate of one band, in tokens per second.

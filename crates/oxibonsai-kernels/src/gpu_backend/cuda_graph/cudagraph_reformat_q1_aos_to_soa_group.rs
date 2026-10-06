@@ -103,7 +103,7 @@ impl CudaGraph {
     /// `model_epoch` (finding **F-M3**).
     ///
     /// Lives here rather than beside the unattributed lazy variant because that
-    /// file is outside this package's ownership; the byte producer is still only
+    /// file is left unchanged; the byte producer is still only
     /// invoked on a cache miss.
     pub fn get_or_upload_weight_soa_lazy_for_epoch<F>(
         &self,

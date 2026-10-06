@@ -1,7 +1,7 @@
-//! B2-06 acceptance gate: SSM conv1d + norms + partial/M-RoPE.
+//! Acceptance gate: SSM conv1d + norms + partial/M-RoPE.
 //!
 //! Restates, as public-API integration tests, the exact acceptance
-//! criteria from the package spec (design §8.2 B2-06):
+//! criteria (design §8.2):
 //!
 //! 1. `causal_conv1d_k4_prefill` == `T` sequential `causal_conv1d_k4_decode`
 //!    calls, **bitwise**.

@@ -59,21 +59,21 @@
 //! Within the cache-aware path, every candidate block is checksummed against
 //! its own live extracted content — not against an unrelated sample range —
 //! before it is allowed into the trie; see
-//! [`PrefixCachedEngine::store_new_blocks`].
+//! `PrefixCachedEngine::store_new_blocks`.
 //!
-//! ## The "ideal fix" ([`cpu_kv_is_authoritative`], M-35 addendum)
+//! ## The "ideal fix" (`cpu_kv_is_authoritative`, M-35)
 //!
-//! The checksum in [`block_has_real_content`] is a *fallback*: it infers
+//! The checksum in `block_has_real_content` is a *fallback*: it infers
 //! "was this really written by the CPU forward path" from the data itself
 //! (all-zero is suspicious), which is reliable but, by construction, cannot
 //! catch a forward path that writes *plausible-looking but stale* data.
-//! [`cpu_kv_is_authoritative`] is the honest alternative the M-35 finding's
-//! verifier correction asks for: it reads
+//! `cpu_kv_is_authoritative` is the honest alternative the M-35 finding's
+//! review asks for: it reads
 //! [`BonsaiModel::gpu_path_active`](oxibonsai_model::model::BonsaiModel::gpu_path_active)
 //! — already set truthfully by every forward path
 //! (`forward_prefill`/`forward_into`/`mark_host_kv_rebuilt`/
-//! `note_host_kv_written`, none of which this package owns, but all of
-//! which already exist and are already `pub`) — combined with the same
+//! `note_host_kv_written`, all of
+//! which are `pub`) — combined with the same
 //! hybrid-architecture check `generate()` uses. `store_new_blocks` consults
 //! **both** this flag and the checksum; neither replaces the other.
 

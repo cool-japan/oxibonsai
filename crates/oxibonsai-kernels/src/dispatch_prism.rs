@@ -1,7 +1,7 @@
-//! [`PrismKernel`] dispatch (B2-09; design doc §2.7): the three new PrismML
+//! [`PrismKernel`] dispatch (design doc §2.7): the three new PrismML
 //! Bonsai 2 quant-format GEMV/GEMM kernels (`PQ2_0`, `PTQ1_0`, mainline
 //! group-64 `Q2_0`) plus the Gated-DeltaNet/Hadamard/SSM hybrid-math
-//! primitives (B2-03/04/05/06).
+//! primitives.
 //!
 //! Split into its own sibling file for the same reason as
 //! `dispatch_std_quant.rs`: a single `impl Trait for Type` cannot itself be
@@ -12,18 +12,24 @@
 //! ## GEMV/GEMM tier dispatch
 //!
 //! `PQ2_0`/`PTQ1_0`/group-64 `Q2_0` each have a real per-tier kernel
-//! (scalar reference, NEON, AVX2 — B2-03's accept criteria only required
+//! (scalar reference, NEON, AVX2 — the acceptance criteria only required
 //! NEON parity, so there is no dedicated AVX-512 kernel; `KernelTier::Avx512`
 //! therefore falls through to the AVX2 kernel, which every real AVX-512F CPU
-//! also supports). None of the three has a Metal/CUDA kernel yet (B2-15/17
-//! future work), so a `KernelTier::Gpu` dispatcher routes straight to the
-//! best *CPU* tier — the same K-17 policy `dispatch_std_quant.rs` and
-//! `dispatch.rs`'s ternary/1-bit arms use, applied here so a future Metal
-//! kernel can slot in ahead of it without silently regressing to scalar in
-//! the meantime.
+//! also supports). The Metal and CUDA kernels for these three formats exist,
+//! but inside the hybrid (`qwen35`) runner rather than behind
+//! [`KernelDispatcher`]: the Metal sources are
+//! `gpu_backend/kernel_sources/qwen35.rs` and `qwen35_gemm.rs` (driven by
+//! `gpu_backend/metal_full_layer/qwen35*.rs`) and the CUDA ones
+//! `gpu_backend/kernel_sources/cuda_qwen35_kernels.rs`. The runner decodes whole
+//! layers on the device, so no per-call GEMV or GEMM entry point of this
+//! dispatcher reaches them, and a `KernelTier::Gpu` dispatcher therefore
+//! routes these formats straight to the best *CPU* tier — the same K-17 policy
+//! `dispatch_std_quant.rs` and `dispatch.rs`'s ternary/1-bit arms use, so a
+//! GPU-tier dispatcher never regresses to the scalar kernel for a format that
+//! has no per-call GPU kernel.
 //!
-//! That one mapping now lives in [`KernelDispatcher::prism_tier`] instead of
-//! six near-identical `cpu_*_fallback` methods (K-INT8): the six differed
+//! That one mapping now lives in `KernelDispatcher::prism_tier` instead of
+//! six near-identical `cpu_*_fallback` methods: the six differed
 //! only in which kernel they called, and only the three GEMV ones recorded
 //! the fallback tier for the K-17 regression tests. The three GEMM sites
 //! now record it too, which a single shared mapping gives for free and
@@ -31,18 +37,18 @@
 //!
 //! ## Tiling and row/batch parallelism
 //!
-//! Until K-INT8 every Prism GEMM was a literal loop of GEMVs and every entry
+//! Before the register-blocked path every Prism GEMM was a literal loop of GEMVs and every entry
 //! point was single-threaded: `rg rayon` over the four Prism kernel files
-//! returned nothing, so B2-11's chunked CPU prefill would re-stream the full
+//! returned nothing, so the chunked CPU prefill would re-stream the full
 //! 7.2 GB `PQ2_0` weight set once per prompt token on one core. Both halves
 //! are fixed here, behind the unchanged public entry points:
 //!
 //! - **Register blocking**: `gemm_*` routes to the `*_blocked` kernels
 //!   (`dequant_prism`, `gemv_ptq1`, `simd_prism_neon`, `simd_prism_avx2`),
 //!   which decode a weight block once per [`PRISM_GEMM_MR`] batch rows.
-//! - **Rayon**: [`prism_gemm_par`] splits the batch dimension into slabs of
+//! - **Rayon**: `prism_gemm_par` splits the batch dimension into slabs of
 //!   whole batch rows (so the register blocking survives the split) and
-//!   [`prism_gemv_par`] splits the weight-row dimension into chunks, both
+//!   `prism_gemv_par` splits the weight-row dimension into chunks, both
 //!   above the platform-tuned thresholds [`crate::tuning`] already computes
 //!   for the ternary/1-bit drivers.
 //!
@@ -89,8 +95,8 @@
 //!   LUT tables decode. No `Int8TwoBitBlock` impl exists for
 //!   [`BlockPTQ1_0`] (only [`oxibonsai_core::BlockTQ2_0_g128`],
 //!   [`BlockPQ2_0`] and [`BlockQ2_0G64`] at `simd_dot_int8.rs:524/537/550`
-//!   do), and the K-INT8 spec's own "TWO TABLES, not one" requirement
-//!   scoped exactly those three — never a fourth for PTQ1_0. Building a
+//!   do), and the INT8 dispatch is scoped to exactly those three formats
+//!   — never a fourth for PTQ1_0. Building a
 //!   base-3 int8 decode kernel is a real, separate undertaking, not a
 //!   small change; `gemv_ptq1_0_ignores_the_int8_tier_env_var`
 //!   pins this as the intended behaviour, not a gap.
@@ -402,7 +408,7 @@ fn prism_gemv_par<B: Sync>(
 /// host): [`prism_gemm_chunk_rows`]'s own floor still caps the slab width at
 /// `MR`, so parallelism there ramps up gradually with `m` (2 slabs at
 /// `m=9..15`, not the full thread count) rather than jumping straight to
-/// `m=64`'s full 8-way split. That is strictly better than the pre-K-INT8
+/// `m=64`'s full 8-way split. That is strictly better than the earlier
 /// single-slab behavior this function replaces for `m <= MR`, and matches
 /// the pre-existing, previously-accepted chunking this function defers to
 /// for `m > MR` — narrowing it further is a distinct, separate
@@ -850,7 +856,7 @@ mod tests {
         dispatcher
             .softplus(&input, &mut output)
             .expect("softplus should succeed");
-        // Above the 20.0 cutoff, softplus(x) == x exactly (B2-05's acceptance
+        // Above the 20.0 cutoff, softplus(x) == x exactly (the acceptance
         // criterion).
         assert!((output[0] - 25.0).abs() < 1e-6);
         // softplus(0) == ln(2).
@@ -872,7 +878,7 @@ mod tests {
 }
 
 /// Bit-exactness and routing guards for the register-blocked + Rayon Prism
-/// GEMM/GEMV path (K-INT8).
+/// GEMM/GEMV path.
 ///
 /// Every comparison here is `assert_eq!` on raw `f32` values, never a
 /// tolerance: register blocking and a Rayon split are both defined to leave
@@ -981,7 +987,7 @@ mod prism_blocked_tests {
 
     /// The GEMV sweep the blocked GEMM must reproduce bit for bit: one
     /// `gemv` call per batch row, exactly as every Prism GEMM did before
-    /// K-INT8.
+    /// the register-blocked path.
     fn gemv_sweep<B>(
         kernel: PrismGemvFn<B>,
         blocks: &[B],
@@ -1105,7 +1111,7 @@ mod prism_blocked_tests {
     }
 
     /// The dispatcher entry point (the signature `oxibonsai-model` and
-    /// B2-11's prefill driver call) must agree with the raw blocked kernel.
+    /// the prefill driver call) must agree with the raw blocked kernel.
     #[test]
     fn prism_dispatcher_gemm_matches_the_blocked_kernel_bit_for_bit() {
         let _guard = env_guard();
@@ -1273,7 +1279,7 @@ mod prism_blocked_tests {
     /// register-blocked kernel (`gemm_pq2_0_kernel(tier)` etc.) it defers to
     /// for `m > PRISM_GEMM_MR`. This is the missing direct comparison: for
     /// every tier this build can execute and every `m` in `1..=PRISM_GEMM_MR`
-    /// — the whole range the K-INT8 fast path covers — the dispatcher's
+    /// — the whole range the register-blocked fast path covers — the dispatcher's
     /// `gemm_{pq2_0,ptq1_0,q2_0_g64}` must still agree, bit for bit, with
     /// calling the *blocked* kernel function directly at that same `m` (the
     /// `*_blocked_gemm_is_bit_identical_to_the_gemv_sweep` tests already pin
@@ -1384,7 +1390,7 @@ mod prism_blocked_tests {
     /// `M = 64`, one plausible prefill chunk — a **synthetic** matrix of that
     /// shape, not the 7.2 GB file, so the measurement is reproducible without
     /// model weights. `before` is the exact loop-of-GEMVs every Prism GEMM
-    /// was until K-INT8; `after` is the dispatcher entry point B2-11 calls.
+    /// was before the register-blocked path; `after` is the dispatcher entry point the prefill driver calls.
     ///
     /// `#[ignore]` for the same reason as
     /// `gemv_ptq1::prism_gemv_tests::prism_ptq1_0_gemv_within_15pct_of_tq2`:

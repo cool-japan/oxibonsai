@@ -68,8 +68,8 @@ const SUFFIX_BIASES: &str = ".biases";
 /// Reinterpret a bfloat16 bit pattern as `f32`.
 ///
 /// Re-exports the single canonical implementation in
-/// [`oxibonsai_core::bf16::bf16_to_f32`] (K-12 bf16 hoist / FIX3-GGUF-WRITE
-/// item 4), replacing this module's former independent copy of the
+/// [`oxibonsai_core::bf16::bf16_to_f32`] (K-12 bf16 hoist),
+/// replacing this module's former independent copy of the
 /// identical bit-manipulation (`f32::from_bits((bits as u32) << 16)`). Kept
 /// `pub` (unchanged visibility) even though nothing outside this crate
 /// currently imports it by this path.
@@ -530,7 +530,7 @@ mod tests {
         }
     }
 
-    /// FIX3-GGUF-WRITE item 4: the now-shared `bf16_to_f32`
+    /// The now-shared `bf16_to_f32`
     /// (`oxibonsai_core::bf16::bf16_to_f32`) must agree with this module's
     /// former local expression over the entire `u16` domain — every
     /// subnormal, both zeros, every infinity and every NaN payload.

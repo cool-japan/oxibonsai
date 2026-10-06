@@ -2,12 +2,12 @@
 //! `bonsai-image` GGUF produced by the MLX→GGUF converter.
 //!
 //! This test is **gated** behind the `OXIBONSAI_DIT_GGUF` environment variable,
-//! which must point at the GGUF file (e.g. `/tmp/parity.gguf`). When the
+//! which must point at the GGUF file (e.g. `parity.gguf` in the temp dir). When the
 //! variable is unset (CI, or the 1.3 GB file absent) the test is skipped, so it
 //! never fails a clean checkout. Run with:
 //!
 //! ```text
-//! OXIBONSAI_DIT_GGUF=/tmp/parity.gguf cargo test -p oxibonsai-image --test parity_gguf -- --nocapture
+//! OXIBONSAI_DIT_GGUF=${TMPDIR:-/tmp}/parity.gguf cargo test -p oxibonsai-image --test parity_gguf -- --nocapture
 //! ```
 
 use std::path::PathBuf;
@@ -108,7 +108,7 @@ fn bf16_spot_checks() -> Vec<(&'static str, Vec<u64>)> {
 
 // ── T-05 capability-report producer ─────────────────────────────────────────
 //
-// T-07 FIX (verifier wave 3): this used to be an inline copy of
+// T-07: this used to be an inline copy of
 // `oxibonsai_testkit::capability::record`; `oxibonsai-image` now takes
 // `oxibonsai-testkit` as a dev-dependency (imported above), so the copy is
 // deleted in favour of the shared implementation.

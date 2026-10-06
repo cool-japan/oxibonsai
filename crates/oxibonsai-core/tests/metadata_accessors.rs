@@ -275,7 +275,7 @@ fn feed_returns_zero_when_chunk_completes_no_new_array_element() {
 /// On top of that, the whole measure-and-compare procedure is retried up
 /// to [`MAX_ATTEMPTS`] times, succeeding as soon as one attempt satisfies
 /// the bound — a deliberate, evidence-based departure from a single
-/// pass/fail measurement (recorded in this package's `deviations`), not a
+/// pass/fail measurement, not a
 /// weakening of the property being checked. Be honest about the margin
 /// this relies on: a quadratic implementation's ratio for doubling the
 /// element count is *exactly* `4x` by definition (`(2n)^2 / n^2 = 4`),
@@ -379,11 +379,10 @@ fn streaming_array_parse_time_is_linear_not_quadratic_in_element_count() {
 /// `[u64; 4]`.
 ///
 /// The batch (`TensorStore`/`GgufFile`) parser's matching half of this fix
-/// lives in `crates/oxibonsai-core/src/gguf/tensor_info.rs` (owned by
-/// `B2-01`). It originally used different wording than this package's own
-/// `streaming.rs`; the two were unified to the identical message ("tensor
-/// has {n} dimensions; GGML_MAX_DIMS is {max}") by the wave-2.5 addendum
-/// (`B2-16`, item 4), so this now pins the exact text both parsers agree on
+/// lives in `crates/oxibonsai-core/src/gguf/tensor_info.rs`. It originally
+/// used different wording than `streaming.rs`; the two were unified to the
+/// identical message ("tensor has {n} dimensions; GGML_MAX_DIMS is {max}"),
+/// so this now pins the exact text both parsers agree on
 /// instead of only a substring of the old, streaming-only wording.
 #[test]
 fn streaming_parser_rejects_tensor_with_five_dimensions() {

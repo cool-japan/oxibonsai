@@ -426,7 +426,7 @@ mod tests {
         }
     }
 
-    /// FIX3-GGUF-WRITE item 4: asserts the now-shared `bf16_to_f32`
+    /// Asserts the now-shared `bf16_to_f32`
     /// (`oxibonsai_core::bf16::bf16_to_f32`) agrees with this module's
     /// former local expression over the **entire** `u16` domain (all 65536
     /// bit patterns) — every subnormal, both zeros, every infinity and

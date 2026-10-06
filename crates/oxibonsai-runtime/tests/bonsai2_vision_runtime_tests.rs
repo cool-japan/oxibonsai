@@ -26,7 +26,22 @@
 //!    on both endpoints — a prompt whose image rows overflow the context;
 //! 4. streaming an image request, on either endpoint, delivers the
 //!    non-streaming answer: the same text, the same finish reason and the
-//!    same usage (the image's 48 rows included).
+//!    same usage (the image's 48 rows included);
+//! 5. the KV window bounds every request: a prompt past the engine's window
+//!    but inside the context the model declares is a typed `400
+//!    context_length_exceeded` naming both, never an engine failure — for a
+//!    text prompt as for an image one, for the prompt alone and for the prompt
+//!    plus `max_tokens`; and a request that hits the per-request deadline
+//!    gets a `504` naming the stage it was caught in (preparing, vision
+//!    encode, waiting for a replica, prefill or decode);
+//! 6. an engine that cannot prefill image rows (a dense model, or a hybrid
+//!    one decoding on an executor without an image prefill) refuses an image
+//!    request with its typed `400` — `NOT_A_HYBRID_MODEL` /
+//!    `BACKEND_UNAVAILABLE` — on both endpoints, streamed or not, with or
+//!    without a projector loaded, before any image is decoded or encoded;
+//! 7. a source image with more pixels than the decode budget derived from the
+//!    per-image token budget is `image_too_large` from its header, before it
+//!    is inflated.
 //!
 //! # Real-model case
 //!
@@ -54,7 +69,7 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 
 use oxibonsai_core::gguf::reader::{mmap_gguf_file, GgufFile};
-use oxibonsai_model::vision::{ImageSourcePolicy, VisionTokenIds, VisionTower};
+use oxibonsai_model::vision::{load_image_source, ImageSourcePolicy, VisionTokenIds, VisionTower};
 use oxibonsai_runtime::engine::InferenceEngine;
 use oxibonsai_runtime::engine_pool::EnginePool;
 use oxibonsai_runtime::engine_seam::Backend;
@@ -63,6 +78,7 @@ use oxibonsai_runtime::sampling::SamplingParams;
 use oxibonsai_runtime::server::{create_router, create_router_full, RequestLimits, RouterOptions};
 use oxibonsai_runtime::vision_prefill::{ChatPrompt, MultimodalPrompt, VisionService};
 use oxibonsai_runtime::TokenizerBridge;
+use oxibonsai_testkit::capability::{record_timed, Capability};
 use oxibonsai_testkit::mmproj_fixture::{synthetic_mmproj_gguf, MmprojFixtureSpec};
 use oxibonsai_testkit::qwen35_fixture::{synthetic_qwen35_gguf, CONTEXT_LENGTH, HIDDEN, VOCAB};
 use oxibonsai_tokenizer::chat_templates::{
@@ -666,8 +682,10 @@ async fn every_refusal_carries_its_named_code() {
             "{path}: the text alone fits: {json}"
         );
 
-        // ...and against the model's declared context: rows + max_tokens
-        // past it is refused although the text tokens alone would fit.
+        // ...and against the context the server can serve: rows +
+        // max_tokens past it is refused although the text tokens alone would
+        // fit. Here that is the engine's 256-position KV window, well inside
+        // the 4096 positions the model declares.
         let (status, json) = post(&app, path, &long).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {json}");
         assert_eq!(
@@ -680,7 +698,125 @@ async fn every_refusal_carries_its_named_code() {
             json!(rows),
             "{path}: {json}"
         );
+        assert_eq!(
+            json["error"]["context_length"],
+            json!(MAX_SEQ),
+            "{path}: {json}"
+        );
+        assert_eq!(
+            json["error"]["model_context_length"],
+            json!(CONTEXT_LENGTH),
+            "{path}: {json}"
+        );
     }
+}
+
+/// The KV-window bug on the product path: a prompt whose rows exceed the
+/// engine's window but fit the context the model declares used to pass the
+/// budget check (it compared the declared context) and fail inside the
+/// engine as an opaque `500` ("position N out of range"), after the images
+/// had been encoded. Every entry point now answers a typed `400
+/// context_length_exceeded` naming the prompt's rows, the window it was
+/// checked against and the larger context the model declares.
+///
+/// The router here is the library default (no `max_input_tokens`): the
+/// window alone must catch it.
+#[tokio::test]
+async fn a_prompt_past_the_kv_window_but_inside_the_declared_context_is_a_typed_400() {
+    const WINDOW: usize = 80;
+    let rows = rendered_image_prompt_tokens(&tokenizer()).len() - 1 + 48;
+    assert!(
+        rows > WINDOW && rows < CONTEXT_LENGTH,
+        "the image prompt is past the window and inside the declared context: {rows}"
+    );
+
+    // What the declared-context check alone would have let through, and what
+    // the engine then does with it: the failure mode this test guards.
+    assert!(
+        oxibonsai_runtime::server::validate_request_budget(rows, MAX_TOKENS, CONTEXT_LENGTH, None)
+            .is_ok(),
+        "the declared context admits the prompt"
+    );
+    let service = synthetic_service(BUDGET);
+    let images = service
+        .encode_all(std::slice::from_ref(&PATTERN_PNG_DATA_URI.to_string()))
+        .expect("the fixture encodes");
+    let prompt = ChatPrompt::Multimodal(
+        MultimodalPrompt::new(rendered_image_prompt_tokens(&tokenizer()), images, IDS)
+            .expect("the prompt splices"),
+    );
+    assert!(
+        prompt
+            .generate(&mut synthetic_engine(WINDOW), MAX_TOKENS)
+            .is_err(),
+        "the engine cannot run {rows} positions in a {WINDOW}-position window"
+    );
+
+    let app = router_with(WINDOW, Some(service));
+    let text_alone = chat_body(json!([text_part(PROMPT_TEXT)]));
+    // Text as long as the window, well inside the declared context.
+    let long_text = chat_body(json!("x".repeat(2 * WINDOW)));
+    for path in ["/v1/chat/completions", "/v1/chat/completions/extended"] {
+        for body in [image_body(PATTERN_PNG_DATA_URI), long_text.clone()] {
+            let (status, json) = post(&app, path, &body).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{path}: a typed refusal, never a 500: {json}"
+            );
+            assert_eq!(
+                error_code(&json),
+                "context_length_exceeded",
+                "{path}: {json}"
+            );
+            assert_eq!(
+                json["error"]["context_length"],
+                json!(WINDOW),
+                "{path}: {json}"
+            );
+            assert_eq!(
+                json["error"]["model_context_length"],
+                json!(CONTEXT_LENGTH),
+                "{path}: {json}"
+            );
+            assert!(
+                json["error"]["n_prompt_tokens"]
+                    .as_u64()
+                    .is_some_and(|n| n as usize >= WINDOW),
+                "names the prompt's own size: {path}: {json}"
+            );
+            let message = json["error"]["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains(&WINDOW.to_string()),
+                "names the window: {message}"
+            );
+            assert!(
+                message.contains(&CONTEXT_LENGTH.to_string()),
+                "names the declared context: {message}"
+            );
+        }
+        // The same window still serves what fits it.
+        let (status, json) = post(&app, path, &text_alone).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {json}");
+    }
+    // ...and `/v1/models` reports the window the server serves.
+    let request = Request::get("/v1/models")
+        .body(Body::empty())
+        .expect("build the request");
+    let response = app
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("the router answers");
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read the body");
+    let models: Value = serde_json::from_slice(&bytes).expect("models JSON");
+    assert_eq!(
+        models["data"][0]["max_context_length"],
+        json!(WINDOW),
+        "{models}"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -733,6 +869,7 @@ async fn streaming_an_image_request_reports_the_non_streaming_usage() {
 
     // Both chat endpoints stream an image request (SV-11), each delivering
     // exactly its own non-streaming answer (greedy, so seed-independent).
+    let mut streamed_by_endpoint: Vec<(String, String)> = Vec::new();
     for path in ["/v1/chat/completions", "/v1/chat/completions/extended"] {
         let (status, whole) = post(&app, path, &image_body(&uri)).await;
         assert_eq!(status, StatusCode::OK, "{path}: {whole}");
@@ -789,6 +926,549 @@ async fn streaming_an_image_request_reports_the_non_streaming_usage() {
             message_text(&whole, "reasoning_content"),
             "{path}: the same reasoning split"
         );
+        streamed_by_endpoint.push((
+            streamed_text(&payloads, "content"),
+            streamed_text(&payloads, "reasoning_content"),
+        ));
+    }
+    // ...and the two endpoints stream the same answer to the same request.
+    assert_eq!(
+        streamed_by_endpoint[0], streamed_by_endpoint[1],
+        "the extended stream delivers the base endpoint's tokens"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. Deadlines name the stage
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A router over the synthetic engine whose requests must finish within
+/// `timeout_ms` (the server's `--request-timeout-ms`).
+fn router_with_deadline(timeout_ms: u64, vision: Option<Arc<VisionService>>) -> axum::Router {
+    let router = create_router_full(
+        EnginePool::new(vec![synthetic_engine(MAX_SEQ)]),
+        Some(tokenizer()),
+        Arc::new(InferenceMetrics::new()),
+        RouterOptions::default().with_limits(RequestLimits::default().with_timeout_ms(timeout_ms)),
+    );
+    match vision {
+        Some(service) => router.layer(axum::Extension(service)),
+        None => router,
+    }
+}
+
+/// What the message of a `504` says about each stage (see `server::phase`).
+const STAGES: [(&str, &str); 5] = [
+    ("preparing", "while preparing the request"),
+    ("vision_encode", "during the vision encode of the request's"),
+    (
+        "waiting_for_engine",
+        "while waiting for a free engine replica",
+    ),
+    ("prefill", "during prefill of the"),
+    ("decode", "during decode"),
+];
+
+/// The timeout error a response carries: the JSON body of a `504`, or — for
+/// a streamed request whose deadline expired after its stream had opened, so
+/// that the `200` status line was already on the wire — the stream's `error`
+/// event, after which the stream must still close with `[DONE]`.
+fn timeout_error_of(label: &str, streaming: bool, status: StatusCode, bytes: &[u8]) -> Value {
+    let text = String::from_utf8_lossy(bytes);
+    if streaming && status == StatusCode::OK {
+        assert!(
+            text.contains("event: error\n"),
+            "{label}: a 200 stream that names no error event: {text}"
+        );
+        assert!(
+            text.trim_end().ends_with("data: [DONE]"),
+            "{label}: the stream does not close after its error event: {text}"
+        );
+        return sse_payloads(bytes)
+            .into_iter()
+            .find(|payload| payload.get("error").is_some())
+            .unwrap_or_else(|| panic!("{label}: no error payload in the stream: {text}"));
+    }
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{label}: {text}");
+    serde_json::from_slice(bytes).unwrap_or_else(|e| panic!("{label}: not JSON ({e}): {text}"))
+}
+
+/// An image request against a 1 ms deadline cannot finish (decoding, encoding
+/// and prefilling 48 image rows take far longer): the timeout names the stage
+/// it was caught in, and the words match the stage's stable name. Which stage
+/// that is depends on how fast the host is; that it is named, and that the
+/// message and `error.phase` agree, does not — streamed or not. A request
+/// that is not streamed always answers `504`. A streamed one answers `504`
+/// when the deadline expires before its stream opens, and reports the same
+/// error as the stream's `error` event when it expires after (an optimised
+/// build reaches the prefill of the synthetic model inside the millisecond).
+#[tokio::test]
+async fn an_image_request_past_a_tiny_deadline_names_the_stage_it_was_in() {
+    let app = router_with_deadline(1, Some(synthetic_service(BUDGET)));
+    let mut streamed = image_body(PATTERN_PNG_DATA_URI);
+    streamed["stream"] = json!(true);
+    for (label, streaming, body) in [
+        ("non-streaming", false, image_body(PATTERN_PNG_DATA_URI)),
+        ("streaming", true, streamed),
+    ] {
+        let (status, bytes) = send(&app, "/v1/chat/completions", &body).await;
+        let json = timeout_error_of(label, streaming, status, &bytes);
+        assert_eq!(error_code(&json), "request_timeout", "{label}: {json}");
+        let phase = json["error"]["phase"].as_str().unwrap_or("<no phase>");
+        let message = json["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with("request exceeded the server's per-request timeout of 1 ms "),
+            "{label}: {message}"
+        );
+        let words = STAGES
+            .iter()
+            .find(|(name, _)| *name == phase)
+            .map(|(_, words)| *words)
+            .unwrap_or_else(|| panic!("{label}: an unknown stage {phase:?}: {json}"));
+        assert!(
+            message.contains(words),
+            "{label}: the message says {words:?} for the stage {phase:?}: {message}"
+        );
+    }
+}
+
+/// A server whose deadline has room for the request is unaffected: the same
+/// answer as a router with no deadline at all (the stage record and the
+/// observed generation behind it change no token).
+#[tokio::test]
+async fn a_generous_deadline_changes_nothing_for_an_image_request() {
+    let app = router_with_deadline(600_000, Some(synthetic_service(BUDGET)));
+    let with_deadline = answer(&chat(&app, &image_body(PATTERN_PNG_DATA_URI)).await);
+    let without = answer(&chat(&vision_router(), &image_body(PATTERN_PNG_DATA_URI)).await);
+    assert_eq!(
+        with_deadline, without,
+        "the deadline never alters an answer"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. The KV window bounds text requests too
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Sequence positions the rendered chat prompt of one user turn with `text`
+/// occupies (the byte-level synthetic vocabulary has no merges, so every
+/// character is one position).
+fn rendered_text_prompt_len(text: &str) -> usize {
+    let rendered = template()
+        .render_with(
+            &[RenderMessage::new("user", text)],
+            &RenderOptions {
+                add_generation_prompt: true,
+                ..RenderOptions::default()
+            },
+        )
+        .expect("the text prompt renders");
+    tokenizer()
+        .encode(&rendered)
+        .expect("the text prompt encodes")
+        .len()
+}
+
+/// A user turn whose rendered prompt is exactly `positions` long.
+fn text_of_prompt_len(positions: usize) -> String {
+    let frame = rendered_text_prompt_len("");
+    assert!(positions >= frame, "{positions} < the frame's {frame}");
+    let text = "x".repeat(positions - frame);
+    assert_eq!(rendered_text_prompt_len(&text), positions);
+    text
+}
+
+/// The window — not the context the model declares — bounds every request,
+/// text included, with the comparison that matches what the engine runs: the
+/// prompt must be shorter than the window, and the prompt plus `max_tokens`
+/// must fit it. Everything past that is a typed `400 context_length_exceeded`
+/// naming the room left, on both endpoints, streamed or not; what fits is
+/// served. (The declared context is 4096 here; a window of 96 serves a
+/// prompt of 88 plus 16 tokens only as a refusal.)
+#[tokio::test]
+async fn a_text_request_is_bounded_by_the_kv_window_with_the_comparison_the_engine_needs() {
+    const WINDOW: usize = 96;
+    let app = router_with(WINDOW, None);
+    let request = |prompt_len: usize, max_tokens: usize, stream: bool| {
+        let mut body = chat_body(json!(text_of_prompt_len(prompt_len)));
+        body["max_tokens"] = json!(max_tokens);
+        body["stream"] = json!(stream);
+        body
+    };
+
+    for path in ["/v1/chat/completions", "/v1/chat/completions/extended"] {
+        // Prompt 88 + 16 tokens = 104 > 96: refused, with the room left.
+        for stream in [false, true] {
+            let (status, json) = post(&app, path, &request(WINDOW - 8, 16, stream)).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{path} stream={stream}: {json}"
+            );
+            assert_eq!(error_code(&json), "context_length_exceeded", "{json}");
+            assert_eq!(
+                json["error"]["n_prompt_tokens"],
+                json!(WINDOW - 8),
+                "{json}"
+            );
+            assert_eq!(json["error"]["max_tokens"], json!(16), "{json}");
+            assert_eq!(json["error"]["context_length"], json!(WINDOW), "{json}");
+            assert_eq!(
+                json["error"]["model_context_length"],
+                json!(CONTEXT_LENGTH),
+                "the larger context the model declares: {json}"
+            );
+            let message = json["error"]["message"].as_str().unwrap_or_default();
+            assert!(message.contains("at most 8"), "the room left: {message}");
+        }
+        // The same prompt with exactly the room that is left is served.
+        let (status, json) = post(&app, path, &request(WINDOW - 8, 8, false)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{path}: prompt + max_tokens == window: {json}"
+        );
+        // A prompt as long as the window leaves no position to generate into:
+        // refused (the first forward after it would be out of range), even
+        // for one token.
+        for stream in [false, true] {
+            let (status, json) = post(&app, path, &request(WINDOW, 1, stream)).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{path} stream={stream}: {json}"
+            );
+            assert_eq!(error_code(&json), "context_length_exceeded", "{json}");
+        }
+        // One position shorter, with one token to generate, is the largest
+        // request the window serves.
+        let (status, json) = post(&app, path, &request(WINDOW - 1, 1, false)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{path}: the largest request that fits: {json}"
+        );
+    }
+}
+
+/// `oxibonsai serve` sets the prompt ceiling to the window. A prompt exactly
+/// the window's size passes that ceiling (which only refuses MORE than it) and
+/// is still refused as `context_length_exceeded`, by the window check — never
+/// admitted to fail at the engine's first forward.
+#[tokio::test]
+async fn a_prompt_exactly_the_windows_size_passes_the_input_ceiling_but_not_the_window() {
+    const WINDOW: usize = 80;
+    let app = serve_like_router(WINDOW, None);
+    for path in ["/v1/chat/completions", "/v1/chat/completions/extended"] {
+        let mut body = chat_body(json!(text_of_prompt_len(WINDOW)));
+        body["max_tokens"] = json!(1);
+        let (status, json) = post(&app, path, &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {json}");
+        assert_eq!(
+            error_code(&json),
+            "context_length_exceeded",
+            "{path}: {json}"
+        );
+        // One position more is past the ceiling itself.
+        let mut longer = chat_body(json!(text_of_prompt_len(WINDOW + 1)));
+        longer["max_tokens"] = json!(1);
+        let (status, json) = post(&app, path, &longer).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {json}");
+        assert_eq!(
+            error_code(&json),
+            "max_input_tokens_exceeded",
+            "{path}: {json}"
+        );
+    }
+}
+
+/// The legacy completions endpoint is held to the same window: a prompt (or
+/// prompt plus `max_tokens`) past it is the typed `400` instead of a
+/// generation that dies inside the engine, streamed or not, and `param`
+/// names the field that is too long.
+#[tokio::test]
+async fn the_completions_endpoint_is_bounded_by_the_kv_window_too() {
+    const WINDOW: usize = 64;
+    let app = router_with(WINDOW, None);
+    let completion = |prompt_len: usize, max_tokens: usize, stream: bool| {
+        json!({
+            "prompt": "x".repeat(prompt_len),
+            "max_tokens": max_tokens,
+            "temperature": 0.0,
+            "stream": stream,
+        })
+    };
+    // A byte-level vocabulary: one position per character, no frame.
+    for stream in [false, true] {
+        let (status, json) =
+            post(&app, "/v1/completions", &completion(WINDOW - 4, 8, stream)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "stream={stream}: {json}");
+        assert_eq!(error_code(&json), "context_length_exceeded", "{json}");
+        assert_eq!(json["error"]["param"], "prompt", "{json}");
+        assert_eq!(json["error"]["context_length"], json!(WINDOW), "{json}");
+        assert_eq!(
+            json["error"]["model_context_length"],
+            json!(CONTEXT_LENGTH),
+            "{json}"
+        );
+        let (status, json) = post(&app, "/v1/completions", &completion(WINDOW, 1, stream)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "stream={stream}: {json}");
+        assert_eq!(error_code(&json), "context_length_exceeded", "{json}");
+    }
+    // A batch is checked prompt by prompt: one long prompt refuses it all.
+    let batch = json!({
+        "prompt": ["short", "x".repeat(WINDOW)],
+        "max_tokens": 1,
+        "temperature": 0.0,
+    });
+    let (status, json) = post(&app, "/v1/completions", &batch).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+    assert_eq!(error_code(&json), "context_length_exceeded", "{json}");
+    // What fits is served.
+    let (status, json) = post(&app, "/v1/completions", &completion(WINDOW - 8, 8, false)).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. Engines that cannot serve images refuse before any image work
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Both chat endpoints, streamed or not, with a malformed image and a valid
+/// one: were the image prepared before the engine's capability was checked,
+/// the malformed one would be `image_data_uri_invalid` and the valid one
+/// would pay for its decode and encode. The refusal is the engine's code, a
+/// plain JSON `400` (never an SSE `error` event after a `200`), and the
+/// message names why.
+async fn expect_every_image_request_refused(app: &axum::Router, code: &str, mentions: &[&str]) {
+    for path in ["/v1/chat/completions", "/v1/chat/completions/extended"] {
+        for (label, mut body) in [
+            ("malformed", image_body("data:image/png;base64,@@@@")),
+            ("valid", image_body(PATTERN_PNG_DATA_URI)),
+        ] {
+            for stream in [false, true] {
+                body["stream"] = json!(stream);
+                let (status, bytes) = send(app, path, &body).await;
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                assert_eq!(
+                    status,
+                    StatusCode::BAD_REQUEST,
+                    "{path} {label} stream={stream}: {text}"
+                );
+                let json: Value = serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                    panic!("{path} {label} stream={stream}: a JSON error body, not ({e}): {text}")
+                });
+                assert_eq!(
+                    error_code(&json),
+                    code,
+                    "{path} {label} stream={stream}: {json}"
+                );
+                assert_eq!(json["error"]["param"], "messages", "{json}");
+                let message = json["error"]["message"].as_str().unwrap_or_default();
+                for word in mentions {
+                    assert!(message.contains(word), "{path}: {word:?} not in {message}");
+                }
+            }
+        }
+    }
+}
+
+/// A dense engine behind a router that has a vision projector: every image
+/// request is `400 NOT_A_HYBRID_MODEL`, and the message names the
+/// architecture the engine holds.
+#[tokio::test]
+async fn a_dense_engine_refuses_image_parts_as_not_a_hybrid_model() {
+    let engine = InferenceEngine::new(
+        oxibonsai_core::config::Qwen3Config::tiny_test(),
+        greedy(),
+        SEED,
+    );
+    let architecture = engine.architecture().to_string();
+    let app =
+        create_router(engine, Some(tokenizer())).layer(axum::Extension(synthetic_service(BUDGET)));
+    expect_every_image_request_refused(&app, "NOT_A_HYBRID_MODEL", &["hybrid", &architecture])
+        .await;
+}
+
+/// The same dense engine behind a server started WITHOUT a vision projector:
+/// the engine's refusal still comes first — `NOT_A_HYBRID_MODEL`, not
+/// `vision_unavailable`, since loading a projector would not let a dense
+/// engine serve the image — and still before any image is decoded (the
+/// malformed image is never looked at). A hybrid engine without a projector
+/// keeps answering `vision_unavailable`
+/// (`every_refusal_carries_its_named_code`).
+#[tokio::test]
+async fn a_dense_engine_without_a_projector_refuses_image_parts_as_not_a_hybrid_model() {
+    let engine = InferenceEngine::new(
+        oxibonsai_core::config::Qwen3Config::tiny_test(),
+        greedy(),
+        SEED,
+    );
+    let architecture = engine.architecture().to_string();
+    let app = create_router(engine, Some(tokenizer()));
+    expect_every_image_request_refused(&app, "NOT_A_HYBRID_MODEL", &["hybrid", &architecture])
+        .await;
+}
+
+/// A hybrid engine built for the Metal runner, on a host that has one: the
+/// engine's own pre-encode check decides. Every executor this workspace
+/// builds runs the rows prefill, so the Metal runner serves the image turn;
+/// an executor that did not would answer every image request with its typed
+/// `400 BACKEND_UNAVAILABLE` naming the way out, and text requests would be
+/// unaffected. A host without a Metal device builds no such engine.
+#[tokio::test]
+async fn a_hybrid_engine_without_an_image_prefill_refuses_image_parts_as_backend_unavailable() {
+    let Ok(engine) = InferenceEngine::from_gguf_with_backend(
+        synthetic_gguf(),
+        greedy(),
+        SEED,
+        MAX_SEQ,
+        Backend::Metal,
+    ) else {
+        report("skip: this host builds no Metal hybrid engine");
+        return;
+    };
+    let prefills_images = engine.prefills_images();
+    let app =
+        create_router(engine, Some(tokenizer())).layer(axum::Extension(synthetic_service(BUDGET)));
+    if prefills_images {
+        // The runner prefills the image rows: the request is served.
+        let (status, json) = post(
+            &app,
+            "/v1/chat/completions",
+            &image_body(PATTERN_PNG_DATA_URI),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the Metal runner serves images: {json}"
+        );
+        report("the Metal runner prefills image rows; nothing to refuse");
+        return;
+    }
+    expect_every_image_request_refused(&app, "BACKEND_UNAVAILABLE", &["metal", "--backend cpu"])
+        .await;
+    // The refusal is about images only.
+    let (status, json) = post(
+        &app,
+        "/v1/chat/completions",
+        &chat_body(json!("Hello there, how are you?")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. The decode budget
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// CRC-32 (IEEE), for sealing the chunks of a hand-built PNG.
+fn crc32(parts: &[&[u8]]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for byte in parts.iter().flat_map(|part| part.iter()) {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                0xEDB8_8320 ^ (crc >> 1)
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    crc ^ 0xFFFF_FFFF
+}
+
+/// A PNG that is only a header and an end marker, declaring a `width` x
+/// `height` 8-bit RGB image: some sixty bytes that would cost gigabytes to
+/// decode if they carried the pixels they promise.
+fn header_only_png_data_uri(width: u32, height: u32) -> String {
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+    let mut png = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+    png.extend_from_slice(&13u32.to_be_bytes());
+    png.extend_from_slice(b"IHDR");
+    png.extend_from_slice(&ihdr);
+    png.extend_from_slice(&crc32(&[b"IHDR", &ihdr]).to_be_bytes());
+    png.extend_from_slice(&0u32.to_be_bytes());
+    png.extend_from_slice(b"IEND");
+    png.extend_from_slice(&crc32(&[b"IEND"]).to_be_bytes());
+    png_data_uri(&png)
+}
+
+/// A source image declaring far more pixels than the per-image token budget
+/// can use is `400 image_too_large` from its header, on both endpoints and
+/// streamed or not, naming the budget — also from a service whose policy
+/// carries no budget of its own (the service derives one), where the same
+/// bytes under a bare policy with no decode budget get as far as the
+/// (absent) pixel data.
+#[tokio::test]
+async fn a_source_image_past_the_decode_budget_is_refused_before_it_is_inflated() {
+    let huge = header_only_png_data_uri(8192, 8192);
+    let budgeted = || {
+        let spec = MmprojFixtureSpec {
+            projection_dim: HIDDEN,
+            ..MmprojFixtureSpec::tiny()
+        };
+        let bytes = synthetic_mmproj_gguf(&spec).expect("the synthetic projector builds");
+        let gguf = GgufFile::parse(&bytes).expect("the synthetic projector parses");
+        let tower = VisionTower::from_mmproj(&gguf).expect("the tiny tower loads");
+        Arc::new(
+            VisionService::new(
+                tower,
+                BUDGET,
+                ImageSourcePolicy::server(None, false).with_token_budget(BUDGET),
+            )
+            .expect("a valid budget")
+            .with_token_ids(IDS),
+        )
+    };
+    let app = router_with(MAX_SEQ, Some(budgeted()));
+    for path in ["/v1/chat/completions", "/v1/chat/completions/extended"] {
+        for stream in [false, true] {
+            let mut body = image_body(&huge);
+            body["stream"] = json!(stream);
+            let (status, json) = post(&app, path, &body).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{path} stream={stream}: {json}"
+            );
+            assert_eq!(error_code(&json), "image_too_large", "{path}: {json}");
+            let message = json["error"]["message"].as_str().unwrap_or_default();
+            assert!(message.contains("8192 x 8192"), "{message}");
+            assert!(message.contains("--image-max-tokens"), "{message}");
+        }
+    }
+    // The ordinary fixture (256 x 192) is far inside the budget.
+    let (status, json) = post(
+        &app,
+        "/v1/chat/completions",
+        &image_body(PATTERN_PNG_DATA_URI),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+
+    // A service whose policy carries no decode budget of its own (a library
+    // caller's `ImageSourcePolicy::server`) derives one from its token
+    // budget, so it refuses the same header.
+    let derived = vision_router();
+    let (status, json) = post(&derived, "/v1/chat/completions", &image_body(&huge)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+    assert_eq!(error_code(&json), "image_too_large", "{json}");
+    let message = json["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("8192 x 8192"), "{message}");
+    assert!(message.contains("--image-max-tokens"), "{message}");
+
+    // The refusal is the decode budget's: under a bare policy with no
+    // budget the same bytes pass the header gate and fail on their missing
+    // pixel data.
+    let bare = ImageSourcePolicy::server(None, false);
+    assert_eq!(bare.max_source_pixels, None, "a bare policy has no budget");
+    match load_image_source(&huge, &bare) {
+        Ok(_) => panic!("a header-only PNG has no pixel data to decode"),
+        Err(e) => assert_eq!(e.code(), "image_decode_failed", "{e:?}"),
     }
 }
 
@@ -802,7 +1482,7 @@ const MODELS_DIR_ENV: &str = "OXIBONSAI_MODELS_DIR";
 const REQUIRE_ENV: &str = "OXI_REQUIRE_MODEL_FILES";
 const PQ2_FILE: &str = "Ternary-Bonsai-2-27B-PQ2_0.gguf";
 const MMPROJ_FILE: &str = "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf";
-const CAPABILITY: &str = "bonsai2-vision";
+const CAPABILITY: Capability = Capability::Bonsai2Vision;
 const REAL_TEST: &str = "oxibonsai-runtime::bonsai2_vision_runtime_tests::\
                          real_27b_server_round_trip_reproduces_the_golden_prompt_one";
 /// The real engine's KV window: the 67-row prompt plus 32 tokens, with room.
@@ -829,29 +1509,13 @@ fn report(line: &str) {
     let _ = writeln!(stderr, "{line}");
 }
 
-/// Append one `{"capability", "executed", "test", "duration_ms"}` record to
-/// the capability manifest in one `write_all` (the test kit's schema).
+/// Append one record to the capability manifest through the test kit (one
+/// `write_all`, the documented schema); `duration_ms` is attached when the
+/// gate measured one.
 fn record(executed: bool, duration: Option<std::time::Duration>) {
-    let mut line = json!({
-        "capability": CAPABILITY,
-        "executed": executed,
-        "test": REAL_TEST,
-    });
-    if let Some(d) = duration {
-        line["duration_ms"] = json!(d.as_millis() as u64);
-    }
-    let path = oxibonsai_testkit::capability::report_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let mut text = line.to_string();
-    text.push('\n');
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = file.write_all(text.as_bytes());
+    match duration {
+        Some(d) => record_timed(CAPABILITY, executed, REAL_TEST, d),
+        None => oxibonsai_testkit::capability::record(CAPABILITY, executed, REAL_TEST),
     }
     report(&format!(
         "CAPABILITY-REPORT capability={CAPABILITY} executed={executed} test={REAL_TEST}{}",
@@ -914,7 +1578,10 @@ async fn real_27b_server_round_trip_reproduces_the_golden_prompt_one() {
     let service = VisionService::load(
         &mmproj_path,
         oxibonsai_model::vision::DEFAULT_IMAGE_MAX_TOKENS,
-        ImageSourcePolicy::server(None, false),
+        // As `oxibonsai serve --mmproj` builds it: the decode budget follows
+        // the per-image token budget.
+        ImageSourcePolicy::server(None, false)
+            .with_token_budget(oxibonsai_model::vision::DEFAULT_IMAGE_MAX_TOKENS),
     )
     .expect("the projector loads");
     report(&format!(

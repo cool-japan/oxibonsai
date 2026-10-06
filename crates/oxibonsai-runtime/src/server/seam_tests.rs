@@ -344,3 +344,253 @@ async fn tokenizer_required_never_applies_to_a_server_with_a_tokenizer() {
     assert_eq!(json["usage"]["prompt_tokens"], 3, "{json}");
     assert_eq!(json["choices"][0]["text"], "ok", "{json}");
 }
+
+// ── with_served_model_id / the served context window ─────────────────────
+
+/// `general.name` of the Bonsai 2 27B GGUFs, and the file they ship in.
+const PLACEHOLDER_NAME: &str = "Hf";
+const FILE_STEM: &str = "Ternary-Bonsai-2-27B-PQ2_0";
+
+/// A tiny dense engine whose model reports `name` as its `general.name`.
+fn engine_named(name: &str) -> InferenceEngine<'static> {
+    let mut config = oxibonsai_core::config::Qwen3Config::tiny_test();
+    config.model_name = name.to_string();
+    InferenceEngine::new(config, SamplingParams::default(), 42)
+}
+
+/// A router over one replica named `name`, prompt start token configured so
+/// text requests run without a tokenizer.
+fn router_named(name: &str, options: RouterOptions) -> Router {
+    create_router_full(
+        EnginePool::new(vec![engine_named(name)]),
+        None,
+        Arc::new(InferenceMetrics::new()),
+        options.with_prompt_start_token(fx::QWEN3_IM_START),
+    )
+}
+
+/// The hybrid `qwen35` fixture (declared context 4096) on the CPU model with
+/// a KV window of `window` positions.
+fn hybrid_engine(window: usize) -> InferenceEngine<'static> {
+    let bytes: &'static [u8] =
+        Box::leak(oxibonsai_testkit::qwen35_fixture::synthetic_qwen35_gguf().into_boxed_slice());
+    let gguf: &'static oxibonsai_core::gguf::reader::GgufFile<'static> = Box::leak(Box::new(
+        oxibonsai_core::gguf::reader::GgufFile::parse(bytes).expect("the fixture parses"),
+    ));
+    InferenceEngine::from_gguf_with_backend(
+        gguf,
+        SamplingParams::default(),
+        42,
+        window,
+        crate::engine_seam::Backend::Cpu,
+    )
+    .expect("a CPU hybrid engine")
+}
+
+/// A model whose `general.name` is a placeholder is listed under its file's
+/// stem, everywhere the id is shown: `GET /v1/models`, `GET
+/// /v1/models/{id}` (the placeholder no longer resolves), and the `model`
+/// member of a chat, a streamed chat and a completion answer.
+#[tokio::test]
+async fn a_placeholder_general_name_is_served_under_the_file_stem() {
+    let id = crate::multi_model::served_model_id(Some(PLACEHOLDER_NAME), Some(FILE_STEM))
+        .expect("the stem stands in for the placeholder");
+    assert_eq!(id, FILE_STEM);
+    let app = || {
+        router_named(
+            PLACEHOLDER_NAME,
+            RouterOptions::default().with_served_model_id(&id),
+        )
+    };
+
+    let (status, json) = get_json(app(), "/v1/models", None).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["data"][0]["id"], FILE_STEM, "{json}");
+    assert_eq!(json["data"].as_array().map(Vec::len), Some(1), "{json}");
+
+    let (status, json) = get_json(app(), &format!("/v1/models/{FILE_STEM}"), None).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["id"], FILE_STEM, "{json}");
+    let (status, json) = get_json(app(), &format!("/v1/models/{PLACEHOLDER_NAME}"), None).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the placeholder names no model: {json}"
+    );
+
+    let chat = serde_json::json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 2,
+    });
+    let (status, json) = post_json(app(), "/v1/chat/completions", chat.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["model"], FILE_STEM, "{json}");
+
+    let mut streamed = chat;
+    streamed["stream"] = serde_json::json!(true);
+    let (status, _, sse) = fx::post(app(), "/v1/chat/completions", streamed).await;
+    assert_eq!(status, StatusCode::OK, "{sse}");
+    let chunks = fx::sse_payloads(&sse);
+    assert!(!chunks.is_empty(), "{sse}");
+    assert!(
+        chunks.iter().all(|chunk| chunk["model"] == FILE_STEM),
+        "every chunk carries the served id: {sse}"
+    );
+
+    let (status, json) = post_json(
+        app(),
+        "/v1/completions",
+        serde_json::json!({"prompt": "hi", "max_tokens": 2}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["model"], FILE_STEM, "{json}");
+}
+
+/// A real `general.name` is the served id; the descriptor keeps both the
+/// model's own name (`id`, what `/admin/config` reports) and the served id.
+#[tokio::test]
+async fn a_real_general_name_is_served_as_it_is() {
+    let name = "Ternary-Bonsai-1.7B";
+    let id = crate::multi_model::served_model_id(Some(name), Some("some-renamed-file"))
+        .expect("a usable name");
+    assert_eq!(id, name);
+    let app = router_named(name, RouterOptions::default().with_served_model_id(id));
+    let (status, json) = get_json(app, "/v1/models", None).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["data"][0]["id"], name, "{json}");
+
+    let pool = EnginePool::new(vec![engine_named(PLACEHOLDER_NAME)]);
+    let info = ServedModelInfo::new(pool, Some(FILE_STEM.to_string()));
+    let descriptor = info.descriptor().await;
+    assert_eq!(descriptor.served_id, FILE_STEM);
+    assert_eq!(
+        descriptor.id, PLACEHOLDER_NAME,
+        "the model's own name is what the operator surface keeps reporting"
+    );
+}
+
+/// A router built without a launcher-chosen id lists the name the loaded
+/// model reports, as before; a blank id is no id.
+#[tokio::test]
+async fn without_a_served_id_the_models_reported_name_is_listed() {
+    for options in [
+        RouterOptions::default(),
+        RouterOptions::default().with_served_model_id("  "),
+    ] {
+        let (status, json) =
+            get_json(router_named(PLACEHOLDER_NAME, options), "/v1/models", None).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["data"][0]["id"], PLACEHOLDER_NAME, "{json}");
+    }
+}
+
+/// The context a server reports and enforces is the engine's KV window when
+/// that is smaller than the context the model declares.
+#[tokio::test]
+async fn the_served_context_is_the_kv_window_not_the_declared_context() {
+    const WINDOW: usize = 64;
+    let pool = EnginePool::new(vec![hybrid_engine(WINDOW)]);
+    let info = ServedModelInfo::new(Arc::clone(&pool), None);
+    let descriptor = info.descriptor().await;
+    assert_eq!(
+        descriptor.declared_context_length,
+        oxibonsai_testkit::qwen35_fixture::CONTEXT_LENGTH,
+        "the file declares its own context"
+    );
+    assert_eq!(
+        descriptor.max_context_length, WINDOW,
+        "the engine can run WINDOW positions"
+    );
+    assert_eq!(descriptor.architecture, "qwen35");
+
+    let app = create_router_full(
+        pool,
+        None,
+        Arc::new(InferenceMetrics::new()),
+        RouterOptions::default(),
+    );
+    let (status, json) = get_json(app, "/v1/models", None).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["data"][0]["max_context_length"], WINDOW, "{json}");
+}
+
+/// A dense engine's window is its declared context unless it was built with
+/// less: the served context never exceeds either.
+#[tokio::test]
+async fn a_dense_engine_serves_its_declared_context() {
+    let pool = EnginePool::new(vec![engine_named("Bonsai-Tiny-Test")]);
+    let descriptor = ServedModelInfo::new(pool, None).descriptor().await;
+    assert!(descriptor.max_context_length > 0);
+    assert_eq!(
+        descriptor.max_context_length,
+        descriptor.declared_context_length
+    );
+    assert_eq!(
+        descriptor.served_id, descriptor.id,
+        "no launcher-chosen id: served under the model's own name"
+    );
+}
+
+// ── The per-request deadline names the stage it caught the request in ────
+
+/// A request queued behind a busy replica waits for the whole deadline; the
+/// `504` says that it was waiting (not generating), streamed or not. The
+/// descriptor cache is warmed first, while the replica is free: its first
+/// resolution briefly acquires a replica of its own (`GET /v1/models` does it
+/// without a generation, so no host speed can make the warm-up outlast the
+/// deadline).
+#[tokio::test]
+async fn a_request_queued_behind_a_busy_replica_times_out_naming_the_wait() {
+    // Short enough to keep the test quick; nothing below depends on a
+    // generation finishing inside it.
+    const TIMEOUT_MS: u64 = 400;
+    let pool = EnginePool::new(vec![tiny_engine()]);
+    let app = create_router_full(
+        Arc::clone(&pool),
+        None,
+        Arc::new(InferenceMetrics::new()),
+        RouterOptions::default()
+            .with_prompt_start_token(fx::QWEN3_IM_START)
+            .with_limits(RequestLimits::default().with_timeout_ms(TIMEOUT_MS)),
+    );
+    let body = |stream: bool| {
+        serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 2,
+            "stream": stream,
+        })
+    };
+    let (status, json) = get_json(app.clone(), "/v1/models", None).await;
+    assert_eq!(status, StatusCode::OK, "the warm-up request: {json}");
+
+    let held = pool.acquire().await.expect("the only replica");
+    for stream in [false, true] {
+        let (status, json) = post_json(app.clone(), "/v1/chat/completions", body(stream)).await;
+        assert_eq!(
+            status,
+            StatusCode::GATEWAY_TIMEOUT,
+            "stream={stream}: {json}"
+        );
+        assert_eq!(json["error"]["code"], "request_timeout", "{json}");
+        assert_eq!(json["error"]["phase"], "waiting_for_engine", "{json}");
+        let message = json["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(&format!("{TIMEOUT_MS} ms")),
+            "names the limit: {message}"
+        );
+        assert!(
+            message.contains("waiting for a free engine replica"),
+            "names the stage: {message}"
+        );
+    }
+    drop(held);
+
+    // The timed-out requests left nothing holding the replica: it is free
+    // again.
+    let again = tokio::time::timeout(std::time::Duration::from_secs(30), pool.acquire())
+        .await
+        .expect("the replica is released, not leaked by the timeouts")
+        .expect("the pool hands it out");
+    drop(again);
+}

@@ -21,14 +21,14 @@
 //! # Full Pure-Rust text→image from a PROMPT: tokenize → Qwen3 TE → 7680 cond →
 //! # DiT sample → VAE → PNG. (~7-8 min for the DiT sample; the TE is seconds.)
 //! cargo run --release -p oxibonsai-image --example generate -- \
-//!     --prompt "a tiny bonsai tree in a ceramic pot" /tmp/bonsai_rust_out.png
+//!     --prompt "a tiny bonsai tree in a ceramic pot" ${TMPDIR:-/tmp}/bonsai_rust_out.png
 //!
 //! # Fast iteration: reuse the golden step-3 latent, skip the sampler.
 //! OXI_USE_GOLDEN_LATENT=1 cargo run --release -p oxibonsai-image \
-//!     --example generate -- /tmp/bonsai_rust_out.png
+//!     --example generate -- ${TMPDIR:-/tmp}/bonsai_rust_out.png
 //!
 //! # Golden-cond end-to-end (no prompt): run the DiT sampler then VAE + PNG.
-//! cargo run --release -p oxibonsai-image --example generate -- /tmp/bonsai_rust_out.png
+//! cargo run --release -p oxibonsai-image --example generate -- ${TMPDIR:-/tmp}/bonsai_rust_out.png
 //! ```
 //!
 //! When `--prompt` is given, the conditioning is produced natively by the Rust
@@ -37,11 +37,11 @@
 //! Env:
 //! - `OXI_USE_GOLDEN_LATENT=1` — use the golden `latent_after_step3` instead of
 //!   sampling (fast path).
-//! - `OXI_DIT_GGUF` — DiT GGUF path (default `/tmp/parity.gguf`).
-//! - `OXI_GOLDEN_DIR` — bf16 golden dir (default `/tmp/bonsai_golden/bf16`).
-//! - `OXI_VAE_WEIGHTS` — VAE weights dir (default `/tmp/bonsai_golden/vae/weights`).
-//! - `OXI_VAE_GOLDEN` — VAE golden dir (default `/tmp/bonsai_golden/vae`).
-//! - `OXI_TE_WEIGHTS` — TE f32 weights dir (default `/tmp/bonsai_golden/te/weights`).
+//! - `OXI_DIT_GGUF` — DiT GGUF path (default `<temp dir>/parity.gguf`).
+//! - `OXI_GOLDEN_DIR` — bf16 golden dir (default `<temp dir>/bonsai_golden/bf16`).
+//! - `OXI_VAE_WEIGHTS` — VAE weights dir (default `<temp dir>/bonsai_golden/vae/weights`).
+//! - `OXI_VAE_GOLDEN` — VAE golden dir (default `<temp dir>/bonsai_golden/vae`).
+//! - `OXI_TE_WEIGHTS` — TE f32 weights dir (default `<temp dir>/bonsai_golden/te/weights`).
 //! - `OXI_TE_4BIT` — path to the native 4-bit `model.safetensors`. When set, the
 //!   TE loads from this 2.1 GB file instead of the 15 GB f32 `.npy` dir.
 //! - `OXI_TE_TOKENIZER_DIR` — dir with `tokenizer.json` (default: the 4-bit model dir).
@@ -51,10 +51,15 @@ use std::process::ExitCode;
 
 use oxibonsai_image::pipeline::{text_to_image, GoldenOverride, TeSource, TextToImageCfg};
 
-fn env_path(key: &str, default: &str) -> PathBuf {
+fn env_path(key: &str, default: impl Into<PathBuf>) -> PathBuf {
     std::env::var(key)
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(default))
+        .unwrap_or_else(|_| default.into())
+}
+
+/// `<temp dir>/<relative>`: where the golden dumps default to.
+fn temp_default(relative: &str) -> PathBuf {
+    std::env::temp_dir().join(relative)
 }
 
 /// Parsed CLI arguments: an optional `--prompt`, `--seed`, and the output PNG
@@ -99,7 +104,7 @@ fn parse_args() -> Args {
     Args {
         prompt,
         seed,
-        out_path: out_path.unwrap_or_else(|| PathBuf::from("/tmp/bonsai_rust_out.png")),
+        out_path: out_path.unwrap_or_else(|| temp_default("bonsai_rust_out.png")),
     }
 }
 
@@ -107,11 +112,11 @@ fn run() -> Result<(), String> {
     let args = parse_args();
     let out_path = args.out_path;
 
-    let gguf = env_path("OXI_DIT_GGUF", "/tmp/parity.gguf");
-    let golden_dir = env_path("OXI_GOLDEN_DIR", "/tmp/bonsai_golden/bf16");
-    let vae_weights_dir = env_path("OXI_VAE_WEIGHTS", "/tmp/bonsai_golden/vae/weights");
-    let vae_golden_dir = env_path("OXI_VAE_GOLDEN", "/tmp/bonsai_golden/vae");
-    let te_weights_dir = env_path("OXI_TE_WEIGHTS", "/tmp/bonsai_golden/te/weights");
+    let gguf = env_path("OXI_DIT_GGUF", temp_default("parity.gguf"));
+    let golden_dir = env_path("OXI_GOLDEN_DIR", temp_default("bonsai_golden/bf16"));
+    let vae_weights_dir = env_path("OXI_VAE_WEIGHTS", temp_default("bonsai_golden/vae/weights"));
+    let vae_golden_dir = env_path("OXI_VAE_GOLDEN", temp_default("bonsai_golden/vae"));
+    let te_weights_dir = env_path("OXI_TE_WEIGHTS", temp_default("bonsai_golden/te/weights"));
     let te_tokenizer_dir = env_path("OXI_TE_TOKENIZER_DIR", "/path/to/text_encoder-mlx-4bit");
     let use_golden_latent = std::env::var("OXI_USE_GOLDEN_LATENT").is_ok();
 

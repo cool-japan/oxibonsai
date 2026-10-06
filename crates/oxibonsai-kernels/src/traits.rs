@@ -385,8 +385,8 @@ pub trait Fp8Kernel: Send + Sync {
 /// A kernel tier that supports **both** 1-bit and ternary fused GPU weight
 /// handles (M-21).
 ///
-/// `TransformerBlock::upload_to_gpu` (`block/types/upload.rs`, not owned by
-/// this package) currently takes `&dyn OneBitKernel`, so ternary QKV/
+/// `TransformerBlock::upload_to_gpu` (`block/types/upload.rs`)
+/// currently takes `&dyn OneBitKernel`, so ternary QKV/
 /// gate-up fusion cannot reach `TernaryKernel::upload_weights_ternary` — a
 /// `dyn` trait object cannot gain a second trait's methods after the fact.
 /// This marker trait plus its blanket impl below gives any concrete
@@ -509,7 +509,7 @@ pub trait StandardQuantKernel: Send + Sync {
 }
 
 /// PrismML Bonsai 2 quantization-format and hybrid-math kernel operations
-/// (B2-09; design doc §2.7).
+/// (design doc §2.7).
 ///
 /// Covers the three new quant formats (`PQ2_0` ggml id 142, `PTQ1_0` id 143,
 /// mainline group-64 `Q2_0` — disambiguated from the legacy group-128
@@ -524,11 +524,11 @@ pub trait StandardQuantKernel: Send + Sync {
 /// `rope_partial_splithalf`) wraps a free function in `oxibonsai-kernels`
 /// (`hadamard`, `gated_delta_net`, `gated_delta_net_chunk`, `ssm_ops`,
 /// `norms`, `rope_mrope`) that already self-dispatches AArch64 NEON /
-/// x86-64 AVX2 internally via `#[cfg(target_arch)]` (B2-04/05/06) — there is
+/// x86-64 AVX2 internally via `#[cfg(target_arch)]` — there is
 /// no separate per-tier sibling to route to yet, so [`crate::KernelDispatcher`]'s
 /// implementation calls the one function directly regardless of `self.tier()`
 /// today. The trait method still exists (rather than callers reaching for
-/// the free function themselves) so a future Metal/CUDA kernel (B2-15/17)
+/// the free function themselves) so a future Metal/CUDA kernel
 /// slots in without changing any caller's call site.
 pub trait PrismKernel: Send + Sync {
     /// Fused `PQ2_0` matrix × FP32 vector product (GEMV).
@@ -652,8 +652,7 @@ pub trait PrismKernel: Send + Sync {
     ///   via `VHeadMap` before calling, per design §3.3).
     /// - `alpha_raw`, `beta_raw`: `[n_v_heads]` pre-activation gate inputs.
     /// - `a_neg`, `dt_bias`: `[n_v_heads]` (`a_neg` = `-exp(A_log)`, already
-    ///   negative — rejected at load if positive, B2-05's acceptance
-    ///   criterion).
+    ///   negative — rejected at load if positive).
     /// - `state`: holds every linear layer's recurrent state; `layer`
     ///   selects which slab this call updates.
     /// - `out`: `[n_v_heads][head_v_dim]`, grouped v-head order.
@@ -674,7 +673,7 @@ pub trait PrismKernel: Send + Sync {
 
     /// Chunked prefill of the Gated DeltaNet recurrence over `t_len` tokens —
     /// equivalent to `t_len` sequential [`Self::gdn_step`] calls, bitwise
-    /// (B2-05's acceptance criterion), but processes linear layers
+    /// (the kernel's acceptance criterion), but processes linear layers
     /// sequentially in time within a chunk while batching everything else
     /// (design §3.10). Mirrors [`crate::gated_delta_net_chunk::gdn_chunk`]'s
     /// exact parameter order (same as [`Self::gdn_step`] plus a trailing
@@ -707,11 +706,11 @@ pub trait PrismKernel: Send + Sync {
     ) -> KernelResult<()>;
 
     /// Prefill (`n_t` tokens at once) of the causal depthwise conv1d — equal
-    /// to `n_t` sequential [`Self::conv1d_decode`] calls, bitwise (B2-06's
-    /// acceptance criterion). `conv_x` is the pre-assembled `[d_inner][(KC-1)
-    /// + n_t]` window (history taps followed by this chunk's raw
+    /// to `n_t` sequential [`Self::conv1d_decode`] calls, bitwise (the kernel's
+    /// acceptance criterion). `conv_x` is the pre-assembled `d_inner x ((KC-1)
+    /// + n_t)` window (history taps followed by this chunk's raw
     /// activations — no separate mutable `state`, unlike [`Self::conv1d_decode`]);
-    /// `out` is token-major (`[n_t][d_inner]`).
+    /// `out` is token-major (`n_t x d_inner`).
     fn conv1d_prefill(
         &self,
         conv_x: &[f32],
@@ -742,7 +741,7 @@ pub trait PrismKernel: Send + Sync {
     /// full-attention layer's sigmoid output gate).
     fn sigmoid_mul(&self, x: &[f32], gate: &[f32], output: &mut [f32]) -> KernelResult<()>;
 
-    /// `output[i] = softplus(input[i])`, cutoff exactly `20.0` (B2-05's
+    /// `output[i] = softplus(input[i])`, cutoff exactly `20.0` (the kernel's
     /// acceptance criterion: above the cutoff, `softplus(x) ≈ x` to avoid
     /// `exp` overflow) — the GDN decay-gate activation (design §2.3).
     fn softplus(&self, input: &[f32], output: &mut [f32]) -> KernelResult<()>;

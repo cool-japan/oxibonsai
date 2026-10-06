@@ -41,7 +41,7 @@ merging, and numerical stability tests all implemented and green.
 - [x] `Qwen3Config::ternary_bonsai_{8b,4b,1_7b}()` constructors in `config.rs`
 - [x] `ModelVariant::TernaryBonsai{8B,4B,1_7B}` + `from_config_and_sample_tensor_type()` in `model_registry.rs`
 - [x] `ternary_bonsai_*_spec()` + capability profiles in `model_variants.rs`
-- [x] `LinearTernary` layer + `load_ternary_blocks` + `load_ternary_embedding` + `OutputWeight::Ternary` in `model/weight_loaders.rs` and `layers/linear.rs`
+- [x] `LinearTernary` layer + `load_ternary_blocks` + `OutputWeight::Ternary` in `model/weight_loaders.rs` and `layers/linear.rs`
 - [x] `ExportFormat::TernaryG128` + `quantize_ternary.rs` exporter in `export.rs`
 - [x] Ternary integration tests (`tests/ternary_integration.rs`)
 

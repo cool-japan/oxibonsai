@@ -1,7 +1,7 @@
 //! End-to-end tests for the whole convert / export surface.
 //!
 //! Originally a regression suite for `convert --quant q1_0_g128`
-//! (cli-facade-01): wave 1 fixed the `--help` honesty gap, but
+//! (cli-facade-01): the `--help` honesty gap was fixed first, but
 //! `oxibonsai convert --quant q1_0_g128` still bailed with "unsupported
 //! quantisation format" because the format was only implemented in the
 //! separate `quantize` subcommand. Those tests remain, and the file now also
@@ -14,7 +14,7 @@
 //! * a source tensor with no mapping fails the run by name (CQ-04);
 //! * norms and 1-D tensors stay F32 in **every** export format (CQ-02);
 //! * a tensor whose `ne0` is not a block multiple lands in F32 rather than
-//!   being flat-padded across row boundaries (CQ-14 / wave-1 addendum);
+//!   being flat-padded across row boundaries (CQ-14);
 //! * the Bonsai 2 writers `PQ2_0` / `PTQ1_0` / `Q2_0`-g64 produce the right
 //!   ids and block extents, with `PQ2_0` verified scale-**first** (CQ-05);
 //! * the streaming entry point pulls one tensor at a time (CQ-17);
@@ -749,7 +749,7 @@ fn keep_fp32_predicate_is_exactly_the_two_documented_rules() {
     assert!(!keep_fp32_by_kind("token_embd.weight", &[5120, 248320]));
 }
 
-/// Wave-1 addendum (1): a tensor whose `ne0` is not a block multiple lands in
+/// A tensor whose `ne0` is not a block multiple lands in
 /// F32 while the rest of the model is quantized — llama.cpp's own behaviour —
 /// instead of failing the whole run or being flat-padded across rows.
 #[test]

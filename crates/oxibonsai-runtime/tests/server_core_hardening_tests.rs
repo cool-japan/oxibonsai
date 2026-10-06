@@ -417,6 +417,42 @@ async fn admin_config_is_mounted_and_reports_real_model() {
     assert_eq!(json["model"]["architecture"], "qwen3");
 }
 
+/// `/admin/config` keeps reporting the model's own name as `model.id` and shows
+/// the id the model is served under beside it (`model.served_id`).
+#[tokio::test]
+async fn admin_config_reports_the_served_id_beside_the_models_own_name() {
+    let router = create_router_full(
+        EnginePool::new(vec![engine()]),
+        None,
+        Arc::new(InferenceMetrics::new()),
+        RouterOptions::default()
+            .with_auth(AuthConfig::with_admin_token(ADMIN_TOKEN))
+            .with_served_model_id("Ternary-Bonsai-2-27B-PQ2_0"),
+    );
+    let resp = router
+        .oneshot(
+            Request::get("/admin/config")
+                .header("authorization", format!("Bearer {ADMIN_TOKEN}"))
+                .body(Body::empty())
+                .expect("req"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["model"]["id"], "Bonsai-Tiny-Test", "{json}");
+    assert_eq!(
+        json["model"]["served_id"], "Ternary-Bonsai-2-27B-PQ2_0",
+        "{json}"
+    );
+    assert!(
+        json["model"]["declared_context_length"]
+            .as_u64()
+            .is_some_and(|n| n > 0),
+        "{json}"
+    );
+}
+
 #[tokio::test]
 async fn admin_cache_stats_is_honest_about_unwired_caches() {
     let resp = admin_router()

@@ -8,7 +8,7 @@
 //! It also defines [`EmbedderState`], an optional extension trait that lets
 //! an embedder's fittable internal state (e.g. `TfIdfEmbedder`'s vocabulary
 //! and IDF table) be persisted and restored alongside a
-//! [`crate::retriever::Retriever`]'s index (RAG-EVAL-IMG-10).
+//! [`crate::retriever::Retriever`]'s index.
 
 use std::collections::HashMap;
 
@@ -53,7 +53,7 @@ pub trait Embedder: Send + Sync {
 /// internal state (a vocabulary, IDF weights, learned weights, …), which
 /// must be persisted alongside the vector store for
 /// [`crate::retriever::Retriever::save`]/[`crate::retriever::Retriever::load_with_embedder`]
-/// to round-trip an equivalent embedder (RAG-EVAL-IMG-10).
+/// to round-trip an equivalent embedder.
 ///
 /// An embedder with nothing to persist beyond what the caller already
 /// supplies to reconstruct it (like [`IdentityEmbedder`], whose only
@@ -193,7 +193,7 @@ pub struct TfIdfFitOptions {
     /// — this is the direct fix for the fact that plain `fit` used to keep
     /// the *highest*-document-frequency terms, i.e. it preferentially kept
     /// stop-words and discarded the rare, discriminative terms IDF
-    /// weighting exists to emphasise (RAG-EVAL-IMG-21). Default `1.0` (no
+    /// weighting exists to emphasise. Default `1.0` (no
     /// filtering — a document-frequency ratio can never exceed `1.0`).
     pub max_df_ratio: f32,
 }
@@ -252,8 +252,7 @@ impl TfIdfEmbedder {
         )
     }
 
-    /// Like [`TfIdfEmbedder::fit`], with `min_df`/`max_df_ratio` filtering
-    /// (RAG-EVAL-IMG-21).
+    /// Like [`TfIdfEmbedder::fit`], with `min_df`/`max_df_ratio` filtering.
     pub fn fit_with_options(documents: &[&str], options: TfIdfFitOptions) -> Self {
         let max_features = options.max_features.max(1);
         let n_docs = documents.len().max(1);
@@ -383,7 +382,7 @@ impl TfIdfEmbedder {
     ///
     /// When enabled, [`Embedder::embed`] returns
     /// [`RagError::EmptyQueryVector`] instead of an all-zero vector when
-    /// none of `text`'s tokens are in the vocabulary (RAG-EVAL-IMG-21).
+    /// none of `text`'s tokens are in the vocabulary.
     /// Defaults to `false` so existing callers who rely on always getting a
     /// vector back (e.g. to embed it anyway and accept a meaningless score)
     /// keep that behaviour; new callers, and every query routed through
@@ -414,7 +413,7 @@ impl Embedder for TfIdfEmbedder {
             if norm_sq <= 1e-20 {
                 // Typed as `EmptyQueryVector` (not `EmbeddingFailed`), matching
                 // `retriever.rs::reject_degenerate_query`'s independent guard for
-                // the same condition (RAG-21 / verifier REQUIRED #11): a
+                // the same condition (RAG-21): a
                 // zero-norm embedding is a distinct, structurally-detectable
                 // outcome from "the backend could not produce a vector at
                 // all", and callers should be able to `matches!` on it without
@@ -513,7 +512,7 @@ pub(crate) fn tokenize(text: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
-    // ── Embedder::embed_batch (EMBED-WIRE handover) ─────────────────────────
+    // ── Embedder::embed_batch ─────────────────────────
 
     /// An embedder that only implements the two required methods, counts
     /// `embed` calls and fails on one marker input.
@@ -588,7 +587,7 @@ mod tests {
         let docs = ["cat sat mat", "bat rat hat"];
         let emb = TfIdfEmbedder::fit(&docs, 20).with_strict_oov(true);
         let err = emb.embed("zzz");
-        // Typed-error consistency (verifier REQUIRED #11): the strict-OOV
+        // Typed-error consistency: the strict-OOV
         // branch must construct the same `EmptyQueryVector` variant
         // `retriever.rs::reject_degenerate_query` already uses for a
         // zero-norm query, not the catch-all `EmbeddingFailed` (which stays
@@ -603,7 +602,7 @@ mod tests {
 
     /// The empty-*vocabulary* case (`self.dim == 0`, a configuration error —
     /// nothing was ever fit) is a different condition from strict-OOV
-    /// rejection and must stay `EmbeddingFailed`; the wave-1.5 addendum is
+    /// rejection and must stay `EmbeddingFailed`; the contract is
     /// explicit that this call site (`embed`'s very first check) is untouched
     /// by the `EmptyQueryVector` migration above.
     #[test]

@@ -238,7 +238,7 @@ impl<'a> SpeculativeDecoder<'a> {
         // cached prefix no longer matches `context`. Rewind the draft cache and
         // re-prime from scratch instead of indexing past the end of `context`
         // (which previously panicked with an out-of-bounds slice access).
-        // ENGINE-SEAM: drafting K tokens and rewinding the rejected ones is
+        // Drafting K tokens and rewinding the rejected ones is
         // a KV-cursor rollback; a hybrid draft model's recurrent state
         // cannot follow it.
         refuse_recurrent_engine(&self.draft_engine, "speculative drafting (draft engine)")?;
@@ -581,7 +581,7 @@ impl<'a> SpeculativeDecoder<'a> {
         if prompt_tokens.is_empty() || max_tokens == 0 {
             return Ok(Vec::new());
         }
-        // ENGINE-SEAM: verification writes state for every draft position
+        // Verification writes state for every draft position
         // and rolls the rejected ones back; neither engine may carry a
         // recurrent state that cannot follow that rollback.
         refuse_recurrent_engine(target, "speculative decoding (target engine)")?;
@@ -775,7 +775,7 @@ impl<'a> SpeculativeDecoder<'a> {
 }
 
 // ──────────────────────────────────────────────────────────────────
-// ENGINE-SEAM helpers
+// Recurrent-rollback refusal helpers
 // ──────────────────────────────────────────────────────────────────
 
 /// Refuse an engine whose sequence state cannot be rolled back by moving the

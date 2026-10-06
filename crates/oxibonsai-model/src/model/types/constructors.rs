@@ -1,7 +1,7 @@
 //! `BonsaiModel` constructors: GGUF loading and the config-only (weight-less)
 //! test/mock seam, plus the context-sizing helpers they share.
 //!
-//! Split out of `model/types/mod.rs` (B2-11-FIX: that file had reached the
+//! Split out of `model/types/mod.rs` (that file had reached the
 //! 2000-line ceiling). Every item keeps its original body; only its home
 //! moved.
 
@@ -23,7 +23,7 @@ use oxibonsai_core::gguf::reader::GgufFile;
 use oxibonsai_core::gguf::tensor_info::tensor_names;
 
 /// The GPU slot namespaces a new model takes and hands to its blocks
-/// (`MET-02`; HANDOVER-GPU A1 / A3 / A4).
+/// (`MET-02`).
 ///
 /// - **Metal:** the model **joins** the namespace of the GGUF mapping its
 ///   weights are borrowed from (`super::q1_slots`) — one epoch shared by every
@@ -163,7 +163,7 @@ impl<'a> BonsaiModel<'a> {
         // `load_transformer_block` re-checks per layer against real tensor
         // widths; this catches a file with no layers at all.
         validate_config_shapes(&config)?;
-        // B2-09: resolve ggml wire id 42's on-disk layout ONCE for the whole
+        // Resolve ggml wire id 42's on-disk layout ONCE for the whole
         // file (`Ok(None)` when the file has no wire-id-42 tensor at all) and
         // thread it into every loader below, instead of each one re-deriving
         // it from the raw parse-time guess (which is always `TQ2_0_g128`
@@ -254,7 +254,7 @@ impl<'a> BonsaiModel<'a> {
         // M-08: honour `<arch>.rope.scaling.*` — `models/Bonsai-8B.gguf`
         // declares YaRN (factor 4.0, original context 16384).
         let rope = build_rope_table(&config, prealloc)?;
-        // REQUIRED #4 (3)+(4): the host KV cache is `f16` (half the bytes of
+        // The host KV cache is `f16` (half the bytes of
         // the old `f32` default, and the element type the fused GPU paths
         // and the reference implementations keep their KV in) and LAZY —
         // one growth chunk resident at load, grown by the decode loop
@@ -321,7 +321,7 @@ impl<'a> BonsaiModel<'a> {
     /// head are synthesized as all-zero on demand rather than materialized
     /// (2 × 2.5 GB for the 8B config, 2 × 4.74 GiB for Bonsai 2 27B), and the
     /// `f16` KV cache and the RoPE table start at
-    /// [`WEIGHTLESS_PREALLOC_CONTEXT`] positions and grow towards
+    /// `WEIGHTLESS_PREALLOC_CONTEXT` positions and grow towards
     /// `config.max_context_length` as the sequence does. A forward pass
     /// behaves exactly as before — all-zero weights produce all-zero logits.
     pub fn new(config: Qwen3Config) -> Self {

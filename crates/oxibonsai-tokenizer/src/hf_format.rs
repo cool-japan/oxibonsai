@@ -949,7 +949,7 @@ fn find_split_regex_pattern(value: &Value) -> TokenizerResult<Option<String>> {
 }
 
 /// Validate a `Split` pre-tokenizer node's `behavior`/`invert` fields
-/// (minor finding, wave-2 B2-08 review, filed alongside TOK-04's
+/// (a minor finding filed alongside TOK-04's
 /// pattern-extraction correction above).
 ///
 /// [`crate::bpe::pretokenize_regex`] always implements HF's `Isolated`

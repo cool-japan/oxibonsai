@@ -1,5 +1,5 @@
 //! Single-token decode (`forward` / `forward_into`) and the per-block
-//! host-KV loop, split out of `model/types/mod.rs` (B2-11-FIX).
+//! host-KV loop, split out of `model/types/mod.rs`.
 
 #[cfg(any(
     all(feature = "metal", target_os = "macos"),
@@ -45,13 +45,13 @@ impl BonsaiModel<'_> {
     /// `[vocab_size]` logits into `logits`.
     ///
     /// Allocation-free after the first call: every intermediate lives in
-    /// [`ModelScratch`] (M-22).
+    /// `ModelScratch` (M-22).
     ///
     /// # Errors
     ///
     /// * [`ModelError::SequenceTooLong`] — `pos` is beyond the effective
     ///   context (sec-11).
-    /// * [`gpu_fallback_requires_cache_rebuild`] — the GPU decode path has been
+    /// * `gpu_fallback_requires_cache_rebuild` — the GPU decode path has been
     ///   maintaining a device KV cache for this sequence and cannot fall back
     ///   to the CPU without the host cache being rebuilt first (MET-05).
     /// * [`ModelError::ShapeMismatch`] — `logits` is shorter than `vocab_size`.
@@ -111,13 +111,12 @@ impl BonsaiModel<'_> {
         // it) instead. `None` — every shipped model — leaves this expression
         // exactly as it was.
         //
-        // NOT covered here: `forward_greedy_gpu` (`forward_metal.rs`, a
-        // different package's file this wave) is a *second* fused-Metal decode
-        // entry point that `engine_greedy.rs` calls directly, never through
-        // `forward_into`, so this gate cannot reach it. It needs the same
-        // refusal at its own head — returning `Err` is enough, because its one
-        // production caller already falls back to the CPU path on `Err`. The
-        // exact change is recorded in this package's `deviations`.
+        // NOT covered here: `forward_greedy_gpu` (`forward_metal.rs`) is a
+        // *second* fused-Metal decode entry point that `engine_greedy.rs`
+        // calls directly, never through `forward_into`, so this gate cannot
+        // reach it. It carries the same refusal at its own head — returning
+        // `Err` is enough, because its one production caller already falls
+        // back to the CPU path on `Err`.
         let _gpu_kernel =
             kernel.is_gpu_accelerated() && !self.force_cpu_at(pos) && sliding_window.is_none();
         #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -344,15 +343,21 @@ impl BonsaiModel<'_> {
             // Host-KV path: every block reads the history out of `self.kv_cache`,
             // so it must actually contain that history (MET-05).
             self.require_host_kv_coherent(pos)?;
-            run_blocks(
-                &self.blocks,
-                sliding_window,
-                &mut scratch.hidden,
-                pos,
-                &mut self.kv_cache,
-                &self.rope,
-                kernel,
-            )?;
+            // A GPU-tier dispatcher reaches this loop through the scirs2-core
+            // GPU backend, whose Metal command buffers and encoders are
+            // autoreleased: pooled here so they are freed per token, not when
+            // the decode thread exits (see `in_autorelease_pool`).
+            in_autorelease_pool(|| {
+                run_blocks(
+                    &self.blocks,
+                    sliding_window,
+                    &mut scratch.hidden,
+                    pos,
+                    &mut self.kv_cache,
+                    &self.rope,
+                    kernel,
+                )
+            })?;
             self.note_host_kv_written(pos);
         }
         let t_blocks_elapsed = t_blocks_start.elapsed();
@@ -361,7 +366,9 @@ impl BonsaiModel<'_> {
             .forward(&scratch.hidden, &mut scratch.normed)?;
         let t_norm_elapsed = t_norm_start.elapsed();
         let t_lm_start = std::time::Instant::now();
-        self.apply_lm_head(&scratch.normed, &mut logits[..vocab])?;
+        // The LM head is a GPU GEMV through the same backend on the GPU tier:
+        // pooled like the blocks above.
+        in_autorelease_pool(|| self.apply_lm_head(&scratch.normed, &mut logits[..vocab]))?;
         let t_lm_elapsed = t_lm_start.elapsed();
         tracing::debug!(
             target : "fwd_profile",
@@ -370,6 +377,30 @@ impl BonsaiModel<'_> {
             1000.0, t_lm_elapsed.as_secs_f64() * 1000.0, did_full_forward,
         );
         Ok(())
+    }
+}
+
+/// Run `f` inside an Objective-C autorelease pool on a Metal build, and
+/// plainly on every other build.
+///
+/// `-[MTLCommandQueue commandBuffer]` and
+/// `-[MTLCommandBuffer computeCommandEncoder]` hand back autoreleased
+/// objects, and a thread without a pool keeps them until it exits (about
+/// 1.8 KiB per command buffer, i.e. per decoded token on a long-lived server
+/// thread). The fused Metal entry points drain a pool per call themselves;
+/// the per-block host-KV path does not go through them: with a GPU-tier
+/// dispatcher its projections and the LM head dispatch through the scirs2-core
+/// GPU backend, whose command buffers nothing else pools. This wraps exactly
+/// those calls (and `BonsaiModel::upload_weights_to_gpu`'s uploads).
+#[inline]
+pub(super) fn in_autorelease_pool<T>(f: impl FnOnce() -> T) -> T {
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    {
+        oxibonsai_kernels::gpu_backend::with_autorelease_pool(f)
+    }
+    #[cfg(not(all(feature = "metal", target_os = "macos")))]
+    {
+        f()
     }
 }
 

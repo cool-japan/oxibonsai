@@ -669,7 +669,7 @@ fn json_escape_into(out: &mut String, s: &str) {
 
 // ---------------------------------------------------------------------------
 // Tests (CQ-09: bounded reads must never abort on a crafted length; CQ-11's
-// "add in-file tests" note applies to every module in this package, and this
+// "add in-file tests" note applies to every module in this crate, and this
 // file previously had zero)
 // ---------------------------------------------------------------------------
 

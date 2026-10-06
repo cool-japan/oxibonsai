@@ -340,7 +340,7 @@ mod tests {
         assert_eq!(bridge.inner().vocab_size(), bridge.vocab_size());
     }
 
-    // ── Wave-1.5 mandatory regression test ───────────────────────────────
+    // ── Mandatory regression test ────────────────────────────────────────
     //
     // `TokenizerConfig::default()` sets `unk=0, bos=1, eos=2, pad=3`. A real
     // byte-level vocabulary that declares no explicit unk/bos/eos/pad token

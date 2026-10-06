@@ -56,6 +56,15 @@
 //!   `request_duration_seconds` (a stream at its true end), and renders
 //!   failures in the shared [`crate::server::api_error::ApiError`]
 //!   envelope.
+//! - **Deadline and abandonment** — the request runs under the server's
+//!   per-request deadline exactly as the chat endpoints do
+//!   (`crate::server::deadline`): `504 request_timeout` naming the stage in
+//!   `error.phase` (`preparing`, `waiting_for_engine`, `prefill`, `decode`
+//!   with `generated_tokens`), or the same error in an SSE `error` event
+//!   followed by `[DONE]` once a stream is open, and the generation cancelled
+//!   either way. A non-streamed request whose handler is dropped (the client
+//!   went away) cancels its generation too; a batch runs none of its
+//!   remaining prompts.
 
 use axum::{
     extract::State,
@@ -71,7 +80,9 @@ use crate::error::RuntimeResult;
 use crate::request_id::RequestId;
 use crate::sampling::{PenaltyParams, SamplingParams};
 use crate::server::api_error::{ApiError, OpenAiJson};
-use crate::server::blocking::run_blocking_generation;
+use crate::server::blocking::{run_blocking_generation, CancelOnAbandon};
+use crate::server::deadline::{run_with_deadline, CancelSlot};
+use crate::server::phase::{self, Phase};
 use crate::server::sampling_scope::RequestSampling;
 use crate::server::{
     request_id_header_map, resolve_request_id, ActiveRequestGuard, AppState, StreamOptions,
@@ -520,6 +531,13 @@ fn validate_completion_request(req: CompletionRequest) -> Result<ValidatedReques
 /// OpenAI-compatible completion response (or SSE stream), tagged with an
 /// `x-request-id` header (the client's own, when it sent a well-formed one —
 /// see [`crate::server::resolve_request_id`]) on success and on error alike.
+///
+/// The request runs under the server's per-request deadline, exactly as on
+/// the chat endpoints (`crate::server::deadline`): an expired deadline
+/// cancels the request's generation — and every prompt of a batch not yet
+/// started — and answers `504 request_timeout` naming the stage
+/// (`error.phase`), or, once a stream is open, ends it with that error in an
+/// SSE `error` event and `[DONE]`.
 #[tracing::instrument(skip(state, headers), fields(request_id))]
 pub async fn create_completion(
     State(state): State<Arc<AppState>>,
@@ -528,9 +546,17 @@ pub async fn create_completion(
 ) -> Result<Response, ApiError> {
     let request_id = resolve_request_id(&headers);
     tracing::Span::current().record("request_id", tracing::field::display(&request_id));
-    create_completion_inner(state, req, request_id)
-        .await
-        .map_err(|err| err.with_request_id(request_id))
+    // The request's handle on its generations and its stage record: the
+    // deadline cancels whatever the handler starts and names the stage it
+    // caught the request in.
+    let slot = CancelSlot::default();
+    run_with_deadline(
+        &state,
+        &slot,
+        create_completion_inner(Arc::clone(&state), req, request_id, slot.clone()),
+    )
+    .await
+    .map_err(|err| err.with_request_id(request_id))
 }
 
 /// Tokenize every prompt of a validated request, in the async context
@@ -559,12 +585,14 @@ fn tokenize_prompts(state: &AppState, prompts: &[String]) -> Result<Vec<Vec<u32>
     Ok(batches)
 }
 
-/// The handler proper, split out of [`create_completion`] so every error it
-/// returns is tagged with the request id in one place.
+/// The handler proper, split out of [`create_completion`] so it runs under
+/// the per-request deadline and every error it returns is tagged with the
+/// request id in one place.
 async fn create_completion_inner(
     state: Arc<AppState>,
     req: CompletionRequest,
     request_id: RequestId,
+    slot: CancelSlot,
 ) -> Result<Response, ApiError> {
     let request_start = std::time::Instant::now();
     state.metrics().requests_total.inc();
@@ -583,6 +611,32 @@ async fn create_completion_inner(
     let validated = validate_completion_request(req)?;
     let prompt_token_batches = tokenize_prompts(&state, &validated.prompts)?;
 
+    // sec-05 (token half), as on the chat endpoints: every prompt of the
+    // batch must fit the context window this server can serve — the engine's
+    // KV window, `min(declared context, window)` — together with its
+    // `max_tokens`, else a `400` naming the numbers instead of a generation
+    // that dies inside the engine (`position N out of range`). Streamed or
+    // not, ahead of any generation. Resolved before an engine is leased: a
+    // cache-cold descriptor acquires its own.
+    let descriptor = state.model_info().descriptor().await;
+    for prompt_tokens in &prompt_token_batches {
+        crate::server::validate_request_budget_in_window(
+            prompt_tokens.len(),
+            validated.max_tokens,
+            descriptor.max_context_length,
+            descriptor.declared_context_length,
+            state.limits().max_input_tokens,
+        )
+        .map_err(|err| {
+            state.metrics().errors_total.inc();
+            err.with_param("prompt")
+        })?;
+    }
+
+    // The stage record learns the batch's size (every prompt's positions).
+    let phase = slot.phase();
+    phase.set_workload(prompt_token_batches.iter().map(Vec::len).sum(), 0);
+
     if validated.stream {
         return stream::stream_completion(
             Arc::clone(&state),
@@ -592,6 +646,7 @@ async fn create_completion_inner(
                 request_id,
                 request_start,
                 active_guard,
+                slot,
             },
         )
         .await;
@@ -601,13 +656,16 @@ async fn create_completion_inner(
 
     // One engine lease serves every prompt in the batch (reset between runs),
     // so the replica is held for the whole request rather than re-acquired
-    // per prompt.
-    let lease = state.acquire_engine().await.map_err(|e| {
+    // per prompt. Queued until a replica is free; once one is held the engine
+    // is ingesting the first prompt until it produces its first token.
+    phase.enter(Phase::WaitingForEngine);
+    let mut lease = state.acquire_engine().await.map_err(|e| {
         tracing::error!(error = %e, "engine pool acquire failed");
         state.metrics().errors_total.inc();
         ApiError::service_unavailable(format!("no inference engine replica is available: {e}"))
             .with_code("engine_unavailable")
     })?;
+    phase.enter(Phase::Prefill);
 
     // Prompt `i`'s sampling configuration, resolved against the replica's
     // own ambient parameters (never `SamplingParams::default()`).
@@ -617,48 +675,78 @@ async fn create_completion_inner(
     let max_tokens = validated.max_tokens;
     let logprobs_top_k = validated.logprobs_top_k;
 
+    // Arm cancellation now that generation is about to start: the token is
+    // recorded in the slot the deadline cancels (with the prefill chunked, so
+    // a long prompt's ingest observes it), and the guard holds another handle
+    // across the blocking generation, so a handler future dropped before the
+    // answer is in hand — the client went away, or a layer outside the
+    // handler gave up on it — cancels the generation instead of leaving the
+    // replica decoding every prompt to `max_tokens` for nobody.
+    let cancel_token = slot.arm_lease(&mut lease);
+    let abandon = CancelOnAbandon::new(cancel_token);
+
     // sec-03: generation is synchronous, CPU-bound work and must not run on a
     // tokio worker thread. The *whole* batch runs inside ONE
     // `run_blocking_generation` call, not one call per prompt: the lease is
     // shared across every prompt in the batch. Each prompt installs its own
-    // sampling configuration and restores the replica's afterwards.
+    // sampling configuration and restores the replica's afterwards. The
+    // stage record counts the tokens of every prompt: the first one moves
+    // the request from prefill to decode.
     let state_for_generation = Arc::clone(&state);
-    let generated: RuntimeResult<Vec<PromptOutcome>> =
-        run_blocking_generation(lease, move |lease| {
-            let mut outcomes: Vec<PromptOutcome> = Vec::with_capacity(prompt_token_batches.len());
-            for (prompt_tokens, sampling) in prompt_token_batches.iter().zip(&samplings) {
-                lease.reset();
-                let outcome = sampling.run(lease, |engine| match logprobs_top_k {
-                    Some(top_k) => {
-                        let id_to_token = |id: u32| -> String {
-                            match state_for_generation.tokenizer() {
-                                Some(tok) => {
-                                    tok.decode(&[id]).unwrap_or_else(|_| format!("<{id}>"))
-                                }
-                                None => format!("<{id}>"),
-                            }
-                        };
-                        engine
-                            .generate_with_logprobs(prompt_tokens, max_tokens, top_k, &id_to_token)
-                            .map(|(tokens, logprobs)| PromptOutcome {
-                                tokens,
-                                logprobs: Some(logprobs),
-                            })
-                    }
-                    None => {
-                        engine
-                            .generate(prompt_tokens, max_tokens)
-                            .map(|tokens| PromptOutcome {
-                                tokens,
-                                logprobs: None,
-                            })
-                    }
-                });
-                outcomes.push(outcome?);
+    let generation_phase = phase.clone();
+    let generated = run_blocking_generation(lease, move |lease| {
+        let mut outcomes: Vec<PromptOutcome> = Vec::with_capacity(prompt_token_batches.len());
+        for (index, (prompt_tokens, sampling)) in
+            prompt_token_batches.iter().zip(&samplings).enumerate()
+        {
+            // An abandoned request (its client gone, its deadline expired)
+            // runs no further prompt: the token is cancelled, and nobody will
+            // read the answer.
+            if lease.is_cancelled() {
+                tracing::debug!(
+                    completed = index,
+                    requested = prompt_token_batches.len(),
+                    "completion batch abandoned; the remaining prompts are not run"
+                );
+                break;
             }
-            Ok(outcomes)
-        })
-        .await?;
+            lease.reset();
+            let outcome = sampling.run(lease, |engine| match logprobs_top_k {
+                Some(top_k) => {
+                    // The callback runs for the chosen token of every step
+                    // (and for its alternatives): the first call is the
+                    // first token.
+                    let id_to_token = |id: u32| -> String {
+                        generation_phase.decode_started();
+                        match state_for_generation.tokenizer() {
+                            Some(tok) => tok.decode(&[id]).unwrap_or_else(|_| format!("<{id}>")),
+                            None => format!("<{id}>"),
+                        }
+                    };
+                    engine
+                        .generate_with_logprobs(prompt_tokens, max_tokens, top_k, &id_to_token)
+                        .map(|(tokens, logprobs)| PromptOutcome {
+                            tokens,
+                            logprobs: Some(logprobs),
+                        })
+                }
+                None => phase::observe_generation(&generation_phase, |tx| {
+                    engine.generate_streaming_sync(prompt_tokens, max_tokens, tx)
+                })
+                .map(|tokens| PromptOutcome {
+                    tokens,
+                    logprobs: None,
+                }),
+            });
+            outcomes.push(outcome?);
+        }
+        Ok(outcomes)
+    })
+    .await;
+    // Every prompt's answer (or the task's failure) is in hand: nothing is
+    // abandoned.
+    abandon.disarm();
+    let generated: RuntimeResult<Vec<PromptOutcome>> = generated?;
 
     let outcomes = generated.map_err(|e| {
         tracing::error!(error = %e, "generation failed");
@@ -745,7 +833,7 @@ async fn create_completion_inner(
     // Report the real loaded-model id (resolved once from the engine via the
     // shared descriptor cache), not a hard-coded literal — the same
     // mechanism the base `/v1/chat/completions` and `/v1/models` handlers use.
-    let model_name = state.model_info().descriptor().await.id;
+    let model_name = state.model_info().descriptor().await.served_id;
 
     let response = build_completion_response(
         &completion_id,

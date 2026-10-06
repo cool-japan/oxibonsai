@@ -56,6 +56,7 @@
 //! | step | module |
 //! |---|---|
 //! | `data:` URI / file -> PNG or JPEG bytes -> RGB8 | [`image_decode`] |
+//! | `http(s)` reference -> the opt-in, the fetcher seam, the address policy | [`remote`] |
 //! | smart resize + Pillow bicubic into the box, token budget | [`preprocess`] |
 //! | ViT + merger -> merged rows (unrotated basis) | [`tower`] |
 //! | one `<|image_pad|>` -> `h * w` rows, bracket checks | [`merger`] |
@@ -65,9 +66,18 @@
 //! transform, image rows around it — is
 //! [`crate::hybrid::vision_prefill`].
 //!
+//! # Two executors
+//!
+//! [`VisionTower`] runs on the CPU; [`metal::VisionTowerMetal`] runs the
+//! same graph on the Metal GPU (with the matrices in the file's own `Q8_0`
+//! / `F16` storage, read exactly). A caller that
+//! serves both holds a [`VisionEncoder`], whose surface is the CPU tower's
+//! (`encode`, `encode_normalized`, `merged_grid`, `config`,
+//! `resident_bytes`), and builds exactly one of them.
+//!
 //! # Numerics
 //!
-//! Everything runs in `f32` on the CPU. Every matrix product — the patch
+//! On the CPU tower everything runs in `f32`. Every matrix product — the patch
 //! convolution, QKV, the attention's `QKᵀ` and `PV`, the output projection,
 //! the MLP and the merger — goes through
 //! [`oxibonsai_kernels::KernelDispatcher::gemm_f32`], so the result does not
@@ -80,9 +90,11 @@ pub mod clip_loader;
 mod f64_reference;
 pub mod image_decode;
 pub mod merger;
+pub mod metal;
 pub mod mrope;
 pub mod patch_embed;
 pub mod preprocess;
+pub mod remote;
 pub mod tower;
 #[cfg(test)]
 mod tower_tests;
@@ -98,6 +110,7 @@ pub use preprocess::{
     prepare_image, PreparedImage, PreprocessConfig, ResizeFilter, DEFAULT_IMAGE_MAX_TOKENS,
     MAX_IMAGE_MAX_TOKENS,
 };
+pub use remote::{RemoteImageAccess, RemoteImageFetcher, SharedRemoteImageFetcher};
 pub use tower::VisionTower;
 
 use crate::error::{ModelError, ModelResult};
@@ -168,6 +181,131 @@ impl ImageRgb8 {
         let base = y.checked_mul(self.width)?.checked_add(x)?.checked_mul(3)?;
         let px = self.data.get(base..base.checked_add(3)?)?;
         Some([px[0], px[1], px[2]])
+    }
+}
+
+/// A vision tower on one executor, with the CPU tower's surface: the
+/// runtime builds the one its engine's decode runs beside (the Metal tower
+/// for a Metal engine, never both).
+#[derive(Debug)]
+pub enum VisionEncoder {
+    /// The CPU tower (`f32`, every matrix product on the CPU).
+    Cpu(VisionTower),
+    /// The Metal tower (the file's `Q8_0` / `F16` matrices as stored, one
+    /// command buffer per image).
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    Metal(metal::VisionTowerMetal),
+}
+
+impl VisionEncoder {
+    /// `"cpu"` or `"metal"`.
+    #[must_use]
+    pub fn backend_name(&self) -> &'static str {
+        match self {
+            Self::Cpu(_) => "cpu",
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Self::Metal(_) => "metal",
+        }
+    }
+
+    /// Whether this is the Metal tower.
+    #[must_use]
+    pub fn is_metal(&self) -> bool {
+        self.backend_name() == "metal"
+    }
+
+    /// The projector's hyper-parameters.
+    #[must_use]
+    pub fn config(&self) -> &VisionConfig {
+        match self {
+            Self::Cpu(tower) => tower.config(),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Self::Metal(tower) => tower.config(),
+        }
+    }
+
+    /// The number of ViT blocks bound.
+    #[must_use]
+    pub fn block_count(&self) -> usize {
+        match self {
+            Self::Cpu(tower) => tower.block_count(),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Self::Metal(tower) => tower.block_count(),
+        }
+    }
+
+    /// The number of GGUF tensors bound.
+    #[must_use]
+    pub fn bound_tensor_count(&self) -> usize {
+        match self {
+            Self::Cpu(tower) => tower.bound_tensor_count(),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Self::Metal(tower) => tower.bound_tensor_count(),
+        }
+    }
+
+    /// Bytes the tower keeps resident (`f32` weights on the CPU; device
+    /// weights, scratch and the host position grid on Metal).
+    #[must_use]
+    pub fn resident_bytes(&self) -> usize {
+        match self {
+            Self::Cpu(tower) => tower.resident_bytes(),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Self::Metal(tower) => tower.resident_bytes(),
+        }
+    }
+
+    /// The merged grid an image of `width x height` pixels produces (see
+    /// [`VisionTower::merged_grid`]).
+    ///
+    /// # Errors
+    ///
+    /// The tower's geometry errors.
+    pub fn merged_grid(
+        &self,
+        width: usize,
+        height: usize,
+        max_tokens: usize,
+    ) -> ModelResult<GridSize> {
+        match self {
+            Self::Cpu(tower) => tower.merged_grid(width, height, max_tokens),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Self::Metal(tower) => tower.merged_grid(width, height, max_tokens),
+        }
+    }
+
+    /// Encode an RGB8 image sized for the tower (see
+    /// [`VisionTower::encode`]).
+    ///
+    /// # Errors
+    ///
+    /// The tower's errors.
+    pub fn encode(&self, img: &ImageRgb8, max_tokens: usize) -> ModelResult<(Vec<f32>, GridSize)> {
+        match self {
+            Self::Cpu(tower) => tower.encode(img, max_tokens),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Self::Metal(tower) => tower.encode(img, max_tokens),
+        }
+    }
+
+    /// Encode already-normalised planar pixels (see
+    /// [`VisionTower::encode_normalized`]).
+    ///
+    /// # Errors
+    ///
+    /// The tower's errors.
+    pub fn encode_normalized(
+        &self,
+        planar: &[f32],
+        width: usize,
+        height: usize,
+        max_tokens: usize,
+    ) -> ModelResult<(Vec<f32>, GridSize)> {
+        match self {
+            Self::Cpu(tower) => tower.encode_normalized(planar, width, height, max_tokens),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Self::Metal(tower) => tower.encode_normalized(planar, width, height, max_tokens),
+        }
     }
 }
 

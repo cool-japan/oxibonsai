@@ -8,7 +8,7 @@
 //!   entry-point name from the combined metallib `build.rs` embeds
 //!   (`ACTIVE_KERNELS` lists `MSL_GEMM_FP8_*` and
 //!   `MSL_FUSED_GATE_UP_SWIGLU_GEMM_FP8_*`) through
-//!   [`MetalGraph::pipeline_for`], which caches each pipeline state by name —
+//!   `MetalGraph::pipeline_for`, which caches each pipeline state by name —
 //!   so a process that never prefills FP8 still never builds these pipeline
 //!   states, and one that does pays a by-name lookup instead of compiling six
 //!   private `MTLLibrary`s from source (what this file used to do).

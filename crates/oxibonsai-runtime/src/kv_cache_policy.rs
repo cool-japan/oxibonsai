@@ -12,13 +12,13 @@
 //! an internal EWMA and picks a tier, and that is all — nothing in
 //! `oxibonsai-runtime` or `oxibonsai-model` reads the result and applies it
 //! to a real KV cache. `BonsaiModel` holds exactly one `KvCache` field
-//! (always FP32, or since B2-12/M-07 optionally sparse-`f16` via
+//! (always FP32, or since M-07 optionally sparse-`f16` via
 //! [`KvCache::new_sparse`](oxibonsai_model::kv_cache::KvCache::new_sparse)
 //! for a hybrid model, but still a *single* field chosen once at load time)
 //! threaded through every block-forward call; switching that backing per
 //! tier would mean changing the block-forward signature across every
 //! forward path (`block/types/forward.rs`, `forward_metal.rs`,
-//! `forward_cuda/*`, none of which this package owns). The related types
+//! `forward_cuda/*`). The related types
 //! [`KvCacheFp16`](https://docs.rs/oxibonsai-model) and the `kv_cache_quant`
 //! module (`QuantizedKvCache`/`Fp8KvCache`) exist as standalone,
 //! never-instantiated-by-the-model types for exactly the same reason, and
@@ -38,7 +38,7 @@
 //! payloads that surface them remain **advisory numbers only** — read them
 //! as "what the policy would recommend", not "what the cache is doing".
 //!
-//! ### What B2-12 adds, and what it still cannot (RT-14 addendum)
+//! ### What the sparse backing adds, and what it still cannot (RT-14)
 //!
 //! [`oxibonsai_model::kv_cache::KvCacheBacking`] is the data half of the
 //! still-missing seam: an enum naming the concrete backing a `BonsaiModel`
@@ -46,9 +46,8 @@
 //! is implemented for it right here, so that *if* a
 //! `BonsaiModel::set_kv_backing(&mut self, backing: KvCacheBacking)` seam is
 //! ever added (it requires editing `model/types/mod.rs` and the
-//! `block/types/forward*.rs` files above, none of which this package owns —
-//! confirmed independently by this finding's own verifier correction, which
-//! recommends *not* pretending a partial wire-up is the real fix), wiring
+//! `block/types/forward*.rs` files above — a partial wire-up would not be
+//! the real fix, so none is attempted), wiring
 //! this policy to it is exactly:
 //!
 //! ```ignore
@@ -192,7 +191,7 @@ impl KvCacheLevel {
 /// Map a telemetry-driven precision tier onto the concrete
 /// [`oxibonsai_model::kv_cache::KvCacheBacking`] a hypothetical
 /// `BonsaiModel::set_kv_backing` seam would need (RT-14 / M-13 — see the
-/// module docs' "What B2-12 adds" section for why that seam does not exist
+/// module docs' "What the sparse backing adds" section for why that seam does not exist
 /// yet). A 1:1 mirror of the four [`KvCacheLevel`] variants onto their
 /// `Dense*` `KvCacheBacking` counterparts; `KvCacheBacking::DenseF32` and
 /// `KvCacheBacking::SparseF16` are unreachable from this conversion because

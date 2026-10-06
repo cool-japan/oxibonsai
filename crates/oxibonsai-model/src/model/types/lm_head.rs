@@ -3,7 +3,11 @@
 //! The FP32 output projection used to be a naive scalar triple loop inside
 //! `BonsaiModel::forward`:
 //!
-//! ```text
+//! ```rust
+//! # let (out_features, in_features) = (2usize, 3usize);
+//! # let weights = vec![1.0f32; out_features * in_features];
+//! # let normed = vec![2.0f32; in_features];
+//! # let mut logits = vec![0.0f32; out_features];
 //! for i in 0..out_features {          // vocab
 //!     let mut sum = 0.0;
 //!     for j in 0..in_features {       // hidden
@@ -11,6 +15,7 @@
 //!     }
 //!     logits[i] = sum;
 //! }
+//! # assert_eq!(logits, vec![6.0, 6.0]);
 //! ```
 //!
 //! One scalar FMA chain per row, single-threaded, over `vocab × hidden`
@@ -30,7 +35,7 @@
 //! named shape errors into [`ModelError::ShapeMismatch`].
 //!
 //! The move was **verbatim** — same lane count, same accumulator layout, same
-//! fold order, same Rayon row threshold — because the wave's parity gate
+//! fold order, same Rayon row threshold — because the parity gate
 //! measures these logits: the dispatched kernel produces byte-identical
 //! logits to the pre-hoist body on a real model. See
 //! `oxibonsai_kernels::gemv_f32`'s module docs for why the lane structure is

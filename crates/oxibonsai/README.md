@@ -1,6 +1,6 @@
 # oxibonsai
 
-Pure Rust 1-bit LLM inference engine for PrismML Bonsai models — umbrella crate.
+Pure Rust sub-2-bit LLM inference engine for PrismML Bonsai models (1-bit, ternary, Bonsai 2 27B hybrid) — umbrella crate.
 
 **Status:** Stable (thin re-export facade) · **Version:** 0.2.4 · **Updated:** 2026-07-22
 

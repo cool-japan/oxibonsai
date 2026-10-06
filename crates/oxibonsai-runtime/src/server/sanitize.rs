@@ -704,7 +704,7 @@ mod tests {
     /// the variable is unset.
     #[test]
     fn special_token_class_real_27b_header() {
-        use oxibonsai_testkit::capability::{record_executed, record_skipped, Capability};
+        use oxibonsai_testkit::capability::{record_executed_timed, record_skipped, Capability};
         const TEST: &str = "oxibonsai-runtime::lib::special_token_class_real_27b_header";
         let Some(path) = std::env::var_os("OXI_BONSAI2_PQ2_GGUF").filter(|p| !p.is_empty()) else {
             eprintln!(
@@ -714,6 +714,7 @@ mod tests {
             record_skipped(Capability::Bonsai2Models, TEST);
             return;
         };
+        let gate_start = std::time::Instant::now();
         let mmap = oxibonsai_core::gguf::reader::mmap_gguf_file(std::path::Path::new(&path))
             .expect("OXI_BONSAI2_PQ2_GGUF maps");
         let file = oxibonsai_core::gguf::reader::GgufFile::parse(&mmap)
@@ -743,6 +744,6 @@ mod tests {
             "{TEST}: special block 248044..=248076 guarded ({control} control, {user_defined} \
              user-defined)"
         );
-        record_executed(Capability::Bonsai2Models, TEST);
+        record_executed_timed(Capability::Bonsai2Models, TEST, gate_start.elapsed());
     }
 }

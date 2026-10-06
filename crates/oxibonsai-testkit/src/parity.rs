@@ -515,10 +515,46 @@ impl ChildRun {
     }
 }
 
+/// A path under `std::env::temp_dir()` for one child's combined
+/// stdout/stderr log, unique across every call in this process and across
+/// processes.
+///
+/// The name carries the parent's process id, a process-wide atomic counter
+/// and a wall-clock timestamp (see [`crate::temp_path::unique_path`]). The
+/// counter is what makes it collision-free: two threads of one process that
+/// start children for the *same* `test_name` share the process id and the
+/// sanitised test-name tag, and a timestamp alone cannot tell them apart
+/// when the platform clock ticks in microseconds. Two children writing one
+/// log truncate each other's output, and whichever parent finishes first
+/// removes the file the other is still reading.
+fn child_log_path(test_name: &str) -> std::path::PathBuf {
+    let tag: String = test_name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    crate::temp_path::unique_path(&format!("child-{tag}"), ".log")
+}
+
+/// Removes the child's log file when dropped, so every early return of
+/// [`run_named_test_in_child`] (a failed clone, spawn or poll) cleans up too.
+struct RemoveOnDrop(std::path::PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        // Best effort: a leftover log in the temp dir is harmless.
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// Re-execute the CURRENT test binary so it runs exactly one test,
 /// `test_name` (`<test_name> --exact --nocapture`), in a fresh process with
 /// `envs` added to its environment, and wait at most `deadline` for it —
 /// killing it when the deadline passes.
+///
+/// `test_name` is the name libtest lists the test under, which is its path
+/// from the test crate's root (`module::test_fn`), because `--exact` matches
+/// the whole path: a bare function name selects nothing when the test lives
+/// in a module, and the child then exits 0 having run no test.
 ///
 /// The real-model gates compare two configurations of the Metal decode path
 /// this way, one fresh process per arm, because that path is a
@@ -528,8 +564,10 @@ impl ChildRun {
 /// The child's stdout and stderr go to one file under
 /// `std::env::temp_dir()` rather than a pipe: a pipe can deadlock once the
 /// child fills the OS buffer before the parent reads it, and a killed
-/// child's output must still be readable afterwards. The file is removed
-/// once read.
+/// child's output must still be readable afterwards. The file is created
+/// exclusively at a path no other call can hold (process id, a process-wide
+/// counter and a timestamp are all in its name) and is removed once read.
+/// The parent's environment is never modified: `envs` reach only the child.
 ///
 /// # Errors
 ///
@@ -542,19 +580,12 @@ pub fn run_named_test_in_child(
     deadline: std::time::Duration,
 ) -> std::io::Result<ChildRun> {
     let exe = std::env::current_exe()?;
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let tag: String = test_name
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
-    let log_path = std::env::temp_dir().join(format!(
-        "oxibonsai-child-{tag}-{}-{nanos}.log",
-        std::process::id()
-    ));
-    let log = std::fs::File::create(&log_path)?;
+    let log_path = child_log_path(test_name);
+    let log = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&log_path)?;
+    let _remove_log = RemoveOnDrop(log_path.clone());
     let log_for_stderr = log.try_clone()?;
 
     let mut command = std::process::Command::new(&exe);
@@ -592,8 +623,6 @@ pub fn run_named_test_in_child(
     let output = std::fs::read(&log_path)
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .unwrap_or_default();
-    // Best effort: a leftover log in the temp dir is harmless.
-    let _ = std::fs::remove_file(&log_path);
     Ok(ChildRun { status, output })
 }
 
@@ -737,10 +766,29 @@ mod tests {
         }
     }
 
+    /// The libtest name of [`child_runner_probe`], as `--exact` needs it.
+    const PROBE_TEST: &str = "parity::tests::child_runner_probe";
+
+    /// Serialises every test that starts a child through
+    /// [`run_named_test_in_child`], so two of them never overlap under
+    /// `cargo test`'s in-process thread pool. Each one re-executes this test
+    /// binary and waits on it, so overlapping them only multiplies the load
+    /// on a busy host and adds nothing a single child does not exercise; the
+    /// one test that needs two children at once ([`concurrent_children_keep_separate_logs`])
+    /// starts them itself, under this same lock.
+    static CHILD_RUNNER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn child_runner_serial() -> std::sync::MutexGuard<'static, ()> {
+        CHILD_RUNNER_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn run_named_test_in_child_captures_a_successful_child() {
+        let _serial = child_runner_serial();
         let run = run_named_test_in_child(
-            "parity::tests::child_runner_probe",
+            PROBE_TEST,
             &[(CHILD_PROBE_ENV, "print")],
             std::time::Duration::from_secs(120),
         )
@@ -753,10 +801,131 @@ mod tests {
         );
     }
 
+    /// The log path is unique per call even when many threads ask for the
+    /// same `test_name` in the same instant: it carries a process-wide
+    /// counter, not only the process id and a timestamp (the collision that
+    /// let two concurrent children share one log file). None of the paths
+    /// exists yet — the runner creates it exclusively — and all of them live
+    /// under the OS temp directory.
+    #[test]
+    fn child_log_paths_are_unique_across_threads_for_one_test_name() {
+        const THREADS: usize = 8;
+        const PATHS_PER_THREAD: usize = 512;
+        let all: Vec<std::path::PathBuf> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        (0..PATHS_PER_THREAD)
+                            .map(|_| child_log_path(PROBE_TEST))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap_or_default())
+                .collect()
+        });
+        assert_eq!(all.len(), THREADS * PATHS_PER_THREAD);
+        let distinct: std::collections::HashSet<&std::path::PathBuf> = all.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            all.len(),
+            "child_log_path handed the same path to two calls"
+        );
+        assert!(
+            all.iter()
+                .all(|p| p.starts_with(std::env::temp_dir()) && !p.exists()),
+            "every child log path must be a fresh path under the OS temp directory"
+        );
+    }
+
+    /// Two children started at the same moment for the same test name each
+    /// get their own log: both parents read back their own child's marker
+    /// (each child prints its own pid, so a shared or clobbered log shows up
+    /// as a missing or duplicated marker).
+    #[test]
+    fn concurrent_children_keep_separate_logs() {
+        let _serial = child_runner_serial();
+        let outputs: Vec<ChildRun> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        run_named_test_in_child(
+                            PROBE_TEST,
+                            &[(CHILD_PROBE_ENV, "print")],
+                            std::time::Duration::from_secs(120),
+                        )
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| panic!("a runner thread panicked"))
+                        .unwrap_or_else(|e| panic!("spawning a probe child: {e}"))
+                })
+                .collect()
+        });
+        let mut pids = Vec::new();
+        for run in &outputs {
+            assert!(run.succeeded(), "probe child failed: {run:?}");
+            let markers: Vec<&str> = run
+                .output
+                .lines()
+                .filter(|l| l.starts_with("CHILD_PROBE_MARKER pid="))
+                .collect();
+            assert_eq!(
+                markers.len(),
+                1,
+                "each child's log must hold exactly its own marker: {:?}",
+                run.output
+            );
+            pids.push(markers[0].to_string());
+        }
+        assert_ne!(
+            pids[0], pids[1],
+            "the two runs read the same child's marker: the logs were shared"
+        );
+    }
+
+    /// A finished run leaves no log behind in the temp directory.
+    #[test]
+    fn run_named_test_in_child_removes_its_log() {
+        let _serial = child_runner_serial();
+        let prefix = format!(
+            "oxibonsai-testkit-child-{}-{}-",
+            PROBE_TEST.replace([':', '_'], "_"),
+            std::process::id()
+        );
+        let leftovers = || -> Vec<String> {
+            std::fs::read_dir(std::env::temp_dir())
+                .map(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .filter(|name| name.starts_with(&prefix))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert!(leftovers().is_empty(), "stale logs before the run");
+        let run = run_named_test_in_child(
+            PROBE_TEST,
+            &[(CHILD_PROBE_ENV, "print")],
+            std::time::Duration::from_secs(120),
+        )
+        .unwrap_or_else(|e| panic!("spawning the probe child: {e}"));
+        assert!(run.succeeded(), "probe child failed: {run:?}");
+        assert_eq!(leftovers(), Vec::<String>::new(), "the log was not removed");
+    }
+
     #[test]
     fn run_named_test_in_child_reports_failure_and_timeout_distinctly() {
+        let _serial = child_runner_serial();
         let failed = run_named_test_in_child(
-            "parity::tests::child_runner_probe",
+            PROBE_TEST,
             &[(CHILD_PROBE_ENV, "fail")],
             std::time::Duration::from_secs(120),
         )
@@ -768,7 +937,7 @@ mod tests {
         assert!(failed.output.contains("CHILD_PROBE_FAILURE"));
 
         let timed_out = run_named_test_in_child(
-            "parity::tests::child_runner_probe",
+            PROBE_TEST,
             &[(CHILD_PROBE_ENV, "sleep")],
             std::time::Duration::from_secs(1),
         )

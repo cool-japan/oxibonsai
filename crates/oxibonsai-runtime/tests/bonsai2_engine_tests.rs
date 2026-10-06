@@ -1,8 +1,8 @@
-//! Real Bonsai 2 27B end to end through the ordinary [`InferenceEngine`]
-//! (ENGINE-SEAM acceptance (a)).
+//! Real Bonsai 2 27B end to end through the ordinary [`InferenceEngine`].
 //!
-//! `B2-11` proved the hybrid forward against the PrismML fork at the
-//! *model* level. This file proves the product path: the same
+//! The model-level hybrid gates (`oxibonsai-model`'s
+//! `hybrid_forward_parity_tests`) prove the hybrid forward against the
+//! PrismML fork. This file proves the product path: the same
 //! `InferenceEngine::from_gguf` the CLI and the server call loads a `qwen35`
 //! file as a hybrid engine, the GGUF-embedded tokenizer (`pre = qwen35`)
 //! produces exactly the fork's prompt tokens, and `InferenceEngine::generate`
@@ -11,7 +11,8 @@
 //!
 //! # Oracles
 //!
-//! `$OXI_BONSAI2_GOLDEN_DIR` is the fork's golden directory (`golden2`):
+//! `$OXI_BONSAI2_GOLDEN_DIR` is the fork's golden directory (the vendored
+//! copy is `crates/oxibonsai-model/tests/fixtures/bonsai2_golden`):
 //!
 //! * `Ternary-Bonsai-2-27B-<quant>.prompt{i}.prompt_tokens.txt` — the fork's
 //!   own tokenisation dump (`llama-completion --verbose-prompt`);
@@ -58,7 +59,8 @@ use oxibonsai_runtime::engine::{tokenizer_from_gguf, InferenceEngine};
 use oxibonsai_runtime::sampling::SamplingParams;
 use oxibonsai_testkit::capability::{record_executed_timed, record_skipped, Capability};
 
-/// The three raw (un-templated) golden prompts of `make_golden2.sh`.
+/// The three raw (un-templated) golden prompts the fork's goldens were
+/// captured from (`scripts/bonsai2_golden.sh`).
 const PROMPTS: [&str; 3] = [
     "The capital of Japan is",
     "def fibonacci(n):",

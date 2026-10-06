@@ -80,13 +80,11 @@ pub fn bonsai_8b_spec() -> ModelSpec {
     // Layer total ≈ 192 950 272  × 36 ≈ 6 946 209 792
     // Final norm: 4 096
     // Grand total ≈ 8 190 000 000
-    // NOTE (wave-2.5 deviation, M-31 class): this recomputation (real
+    // NOTE (M-31 class): this recomputation (real
     // intermediate=12288/vocab=151669 shape) supersedes the pre-M-34
     // comment, which used the stale intermediate=14336/vocab=151936 figures.
-    // Per the FIX2-BUILD precedent (see `bonsai_1_7b_spec` below), the
-    // returned literal is left unchanged — it already satisfies
-    // `param_count_is_reasonable`'s bound and changing it is outside this
-    // comment-only pass's scope.
+    // The returned literal is left unchanged (see `bonsai_1_7b_spec` below):
+    // it already satisfies `param_count_is_reasonable`'s bound.
     let param_count: u64 = 8_030_000_000;
 
     // ── weights at Q1_0_g128 ─────────────────────────────────────────────────
@@ -186,12 +184,12 @@ pub fn bonsai_1_7b_spec() -> ModelSpec {
     //   norms (×3 × 2048) ≈ 6 144
     // Layer total ≈ 50 337 792 × 28 ≈ 1 409 458 176
     // Total ≈ 2 030 694 400 (embedding tables are large relative to compute)
-    // NOTE (FIX2-BUILD item 3(g)): this recomputation (~2.03B, real 28-layer/
+    // NOTE: this recomputation (~2.03B, real 28-layer/
     // hidden=2048 shape) differs from the historical literal below (1.72B,
     // dating from the pre-M-34 16-layer/hidden=1536 shape). Both satisfy
-    // `param_count_is_reasonable`'s [1B, 10B] bound, so per the FIX2-BUILD
-    // spec the literal is left unchanged (only change a literal when the
-    // recomputation falls outside what the bound tests allow).
+    // `param_count_is_reasonable`'s [1B, 10B] bound, so the literal is left
+    // unchanged (only change a literal when the recomputation falls outside
+    // what the bound tests allow).
     let param_count: u64 = 1_720_000_000;
 
     // ── weights at Q1_0_g128 ─────────────────────────────────────────────────
@@ -199,7 +197,7 @@ pub fn bonsai_1_7b_spec() -> ModelSpec {
     // Embedding FP16:   310 618 112 × 2 = 621 236 224
     // Output FP16:      same
     // Total ≈ 1 440 677 504
-    // NOTE (FIX2-BUILD item 3(g)): recomputed total (~1.44 GB) differs from
+    // NOTE: recomputed total (~1.44 GB) differs from
     // the literal below (0.70 GB); both satisfy
     // `weights_size_matches_q1_0_g128_expectation`'s bound
     // (param_count/8 ..= param_count*2), so the literal is left unchanged.
@@ -291,7 +289,7 @@ pub fn ternary_bonsai_1_7b_spec() -> ModelSpec {
     // ~1.41B transformer params × 0.266 ≈ 0.37 GB
     // Embedding FP16: 151669 × 2048 × 2 ≈ 0.62 GB (output head same)
     // Total → ~0.39 GB
-    // NOTE (FIX2-BUILD item 3(g)): recomputed against the real GGUF shape
+    // NOTE: recomputed against the real GGUF shape
     // (28 layers, hidden=2048, vocab=151669; see bonsai_1_7b_spec() for the
     // full per-layer breakdown). The literal below is left unchanged (still
     // within weights_size_matches_q1_0_g128_expectation's bound).
@@ -372,7 +370,7 @@ pub fn fp8_bonsai_1_7b_spec() -> ModelSpec {
     let param_count: u64 = 1_720_000_000;
 
     // ~1.41B transformer params × 1.0625 ≈ 1.50 GB + embeddings 0.62 GB → ~2.12 GB
-    // NOTE (FIX2-BUILD item 3(g)): recomputed against the real GGUF shape
+    // NOTE: recomputed against the real GGUF shape
     // (28 layers, hidden=2048, vocab=151669). The literal below is left
     // unchanged (still within this variant's [param_count/8, param_count*2]
     // bound).
@@ -524,7 +522,7 @@ pub fn capability_profile(v: ModelVariant) -> CapabilityProfile {
         ModelVariant::Bonsai1_7B => CapabilityProfile {
             // Pinned to `Qwen3Config::bonsai_1_7b().max_context_length` by
             // `capability_profile_1_7b_family_context_len_matches_config`
-            // below (wave-2.5 deviation #0): the real model's max context is
+            // below (M-34): the real model's max context is
             // 32768, not 65536 — this used to over-claim 2x.
             max_context_len: 32768,
             supports_system_prompt: true,
@@ -647,7 +645,7 @@ pub fn capability_profile(v: ModelVariant) -> CapabilityProfile {
         | ModelVariant::TernaryBonsai227bQ2g64 => CapabilityProfile {
             // Model max context (design Appendix A.4); the RAM-derived
             // ceiling for a given machine is a separate, smaller number
-            // (§B2-12's context guard), not this capability declaration.
+            // (the context guard), not this capability declaration.
             max_context_len: 262_144,
             supports_system_prompt: true,
             supports_streaming: true,
@@ -1007,7 +1005,7 @@ mod tests {
 
     // ── CapabilityProfile ─────────────────────────────────────────────────────
 
-    /// Wave-2.5 deviation #0: the 1.7B family's `max_context_len` must track
+    /// The 1.7B family's `max_context_len` must track
     /// the real `Qwen3Config::bonsai_1_7b().max_context_length` (32768, from
     /// the on-disk `models/Ternary-Bonsai-1.7B.gguf` header) so it cannot
     /// silently drift back to the stale 65536 that used to over-claim 2x the

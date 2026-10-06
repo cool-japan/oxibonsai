@@ -1,11 +1,11 @@
 //! `BonsaiModel::new_for_testing_with_blocks`: a tiny, deterministic model
 //! with real Transformer blocks for the prefix-cache tests. Split out of
-//! `model/types/mod.rs` (B2-11-FIX).
+//! `model/types/mod.rs`.
 //!
 //! Also the test-only [`Q1ReplicaFixture`]: a tiny all-`Q1_0_g128` model —
 //! blocks **and** LM head — whose weights are leaked once and shared by every
 //! replica built from them, i.e. the in-process image of engine-pool replicas
-//! of one GGUF mapping (HANDOVER-GPU A5).
+//! of one GGUF mapping.
 
 use super::constructors::{
     effective_context, force_cpu_decode_after_from_env, prealloc_context, ModelGpuSlots,

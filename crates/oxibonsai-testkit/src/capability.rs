@@ -26,8 +26,13 @@
 //! optionally with a trailing `"duration_ms": <integer>` ([`record_timed`] /
 //! [`record_executed_timed`]) — the record's own measured wall-clock cost,
 //! omitted entirely (not `null`) by every call site that has not opted into
-//! measuring it, so an older or unmeasured record stays exactly the shape
-//! above. `executed: false` means the test body actually reached and took
+//! measuring it, so an unmeasured record stays exactly the shape above.
+//! Every real-model gate (a test that maps a multi-GB GGUF) records through
+//! [`record_executed_timed`], measuring its whole body from just after its
+//! fixtures were located; `scripts/release-gate.sh` prints a `WARN` for a
+//! required test whose executed record has no `duration_ms`, so a missing
+//! timer shows up in the report without failing the gate.
+//! `executed: false` means the test body actually reached and took
 //! the self-skip path (hardware/fixture absent) — it must still write a
 //! record, so an all-skipped run is visibly distinct in the manifest from a
 //! manifest that is simply missing (meaning no producer test uses this
@@ -163,8 +168,39 @@ pub enum Capability {
     /// Distinct from [`Self::Metal`] (which lighter kernel-parity tests
     /// satisfy) and from [`Self::LegacyModels`] (the CPU cross-tier gates),
     /// so the release gate can require the Metal embedding evidence under
-    /// its own name.
+    /// its own name. The release gate runs that test binary once per legacy
+    /// model file (`OXI_MODEL` names one GGUF per run), so this capability
+    /// accumulates one record per run, and the gate requires the test's name
+    /// to have at least one `executed: true` record.
     MetalHidden,
+    /// The real Bonsai 2 27B plus its vision projector, end to end on the CPU
+    /// path: `oxibonsai-model`'s `bonsai2_vision_tests` (the fixture image
+    /// encoded, two prompts prefilled and decoded against the fork's image
+    /// goldens) and `oxibonsai-runtime`'s `bonsai2_vision_runtime_tests`
+    /// `real_27b_` case (the same weights behind `/v1/chat/completions`).
+    /// Distinct from [`Self::Bonsai2Mmproj`] (the projector alone, bound and
+    /// checked against the f64 reference) and from [`Self::Bonsai2Models`]
+    /// (the text-only 27B gates, which a host without the projector still
+    /// passes): the vision tower is optional, so the release gate needs its
+    /// own name to require the language model's image path under. Both test
+    /// files record through this variant.
+    Bonsai2Vision,
+    /// The real Bonsai 2 27B plus its vision projector on Metal: the Metal
+    /// hybrid runner's rows prefill and the Metal vision tower against the
+    /// CPU path and the fork's image goldens, both bands
+    /// (`crates/oxibonsai-model/tests/bonsai2_vision_metal_tests.rs`), the
+    /// image chat round trip on a Metal engine
+    /// (`crates/oxibonsai-runtime/tests/bonsai2_vision_metal_runtime_tests.rs`),
+    /// and the shipped CLI end to end (`tests/bonsai2_vision_cli_tests.rs`:
+    /// `run --mmproj --backend auto` stays on the Metal runner and prints the
+    /// golden answer, `serve` answers the image request). Distinct from
+    /// [`Self::Bonsai2Vision`] (the same image path on the CPU),
+    /// [`Self::Bonsai2MetalEngine`] (text only) and [`Self::Bonsai2Mmproj`]
+    /// (the projector alone — under which the Metal tower's own
+    /// real-projector gate, `vision_metal_tests.rs`, records), so the release
+    /// gate can require the end-to-end Metal vision evidence under its own
+    /// name. Every file named here records through this variant.
+    Bonsai2VisionMetal,
 }
 
 impl Capability {
@@ -183,6 +219,8 @@ impl Capability {
             Self::CudaHardware => "cuda-hardware",
             Self::Bonsai2Mmproj => "bonsai2-mmproj",
             Self::MetalHidden => "metal-hidden",
+            Self::Bonsai2Vision => "bonsai2-vision",
+            Self::Bonsai2VisionMetal => "bonsai2-vision-metal",
         }
     }
 }
@@ -707,6 +745,11 @@ mod tests {
         assert_eq!(Capability::CudaHardware.as_str(), "cuda-hardware");
         assert_eq!(Capability::Bonsai2Mmproj.as_str(), "bonsai2-mmproj");
         assert_eq!(Capability::MetalHidden.as_str(), "metal-hidden");
+        assert_eq!(Capability::Bonsai2Vision.as_str(), "bonsai2-vision");
+        assert_eq!(
+            Capability::Bonsai2VisionMetal.as_str(),
+            "bonsai2-vision-metal"
+        );
         // Display must agree with as_str (call sites use both).
         assert_eq!(Capability::Metal.to_string(), Capability::Metal.as_str());
         assert_eq!(
@@ -725,6 +768,105 @@ mod tests {
             Capability::MetalHidden.to_string(),
             Capability::MetalHidden.as_str()
         );
+        assert_eq!(
+            Capability::Bonsai2Vision.to_string(),
+            Capability::Bonsai2Vision.as_str()
+        );
+        assert_eq!(
+            Capability::Bonsai2VisionMetal.to_string(),
+            Capability::Bonsai2VisionMetal.as_str()
+        );
+        // `as_str` is a `const fn`, so a test file can keep a `&'static str`
+        // constant for its log lines without a second spelling of the name.
+        const VISION_NAME: &str = Capability::Bonsai2Vision.as_str();
+        assert_eq!(VISION_NAME, "bonsai2-vision");
+        const VISION_METAL_NAME: &str = Capability::Bonsai2VisionMetal.as_str();
+        assert_eq!(VISION_METAL_NAME, "bonsai2-vision-metal");
+    }
+
+    /// [`Capability::Bonsai2VisionMetal`] writes the same documented JSONL
+    /// schema every other capability does, with and without `duration_ms` —
+    /// the Metal vision test files record through it (the skip path untimed,
+    /// the executed path timed).
+    #[test]
+    fn bonsai2_vision_metal_record_skipped_and_executed_timed_write_the_documented_schema() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let path = unique_temp_path("bonsai2-vision-metal");
+        std::env::set_var("OXIBONSAI_CAPABILITY_REPORT", &path);
+        record_skipped(
+            Capability::Bonsai2VisionMetal,
+            "crate::file::vision_metal_skipped",
+        );
+        record_executed_timed(
+            Capability::Bonsai2VisionMetal,
+            "crate::file::vision_metal_ran",
+            std::time::Duration::from_millis(4321),
+        );
+        std::env::remove_var("OXIBONSAI_CAPABILITY_REPORT");
+
+        let contents = std::fs::read_to_string(&path).expect("read manifest");
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2, "expected two records, got: {contents:?}");
+
+        let skipped: serde_json::Value = serde_json::from_str(lines[0]).expect("line 1 valid json");
+        assert_eq!(skipped["capability"], "bonsai2-vision-metal");
+        assert_eq!(skipped["executed"], false);
+        assert_eq!(skipped["test"], "crate::file::vision_metal_skipped");
+        assert!(
+            skipped.get("duration_ms").is_none(),
+            "an untimed record omits duration_ms entirely: {skipped}"
+        );
+
+        let ran: serde_json::Value = serde_json::from_str(lines[1]).expect("line 2 valid json");
+        assert_eq!(ran["capability"], "bonsai2-vision-metal");
+        assert_eq!(ran["executed"], true);
+        assert_eq!(ran["test"], "crate::file::vision_metal_ran");
+        assert_eq!(ran["duration_ms"], 4321);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// [`Capability::Bonsai2Vision`] must write the same documented JSONL
+    /// schema every other capability does, with and without `duration_ms` —
+    /// the two vision test files record through it (the skip path untimed,
+    /// the executed path timed).
+    #[test]
+    fn bonsai2_vision_record_skipped_and_executed_timed_write_the_documented_schema() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let path = unique_temp_path("bonsai2-vision");
+        std::env::set_var("OXIBONSAI_CAPABILITY_REPORT", &path);
+        record_skipped(Capability::Bonsai2Vision, "crate::file::vision_skipped");
+        record_executed_timed(
+            Capability::Bonsai2Vision,
+            "crate::file::vision_ran",
+            std::time::Duration::from_millis(1234),
+        );
+        std::env::remove_var("OXIBONSAI_CAPABILITY_REPORT");
+
+        let contents = std::fs::read_to_string(&path).expect("read manifest");
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2, "expected two records, got: {contents:?}");
+
+        let skipped: serde_json::Value = serde_json::from_str(lines[0]).expect("line 1 valid json");
+        assert_eq!(skipped["capability"], "bonsai2-vision");
+        assert_eq!(skipped["executed"], false);
+        assert_eq!(skipped["test"], "crate::file::vision_skipped");
+        assert!(
+            skipped.get("duration_ms").is_none(),
+            "an untimed record omits duration_ms entirely: {skipped}"
+        );
+
+        let ran: serde_json::Value = serde_json::from_str(lines[1]).expect("line 2 valid json");
+        assert_eq!(ran["capability"], "bonsai2-vision");
+        assert_eq!(ran["executed"], true);
+        assert_eq!(ran["test"], "crate::file::vision_ran");
+        assert_eq!(ran["duration_ms"], 1234);
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// [`Capability::Bonsai2Mmproj`] must write the same documented JSONL

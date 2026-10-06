@@ -17,9 +17,8 @@ fn default_config_has_expected_values() {
     assert!((cfg.sampling.temperature - 0.7).abs() < f32::EPSILON);
     assert_eq!(cfg.sampling.top_k, 40);
     assert!((cfg.sampling.top_p - 0.9).abs() < f32::EPSILON);
-    // Gatekeeper REQUIRED #18 (waves 3+3.5 review, B2-14): corrected from a
-    // stale `1.1` after `sampling::SamplingParams::default()` was fixed to
-    // `1.0` (RT-24 / gatekeeper REQUIRED #1(a), the P0 CPU-vs-Metal greedy
+    // Corrected from a stale `1.1` after `sampling::SamplingParams::default()`
+    // was fixed to `1.0` (RT-24, the P0 CPU-vs-Metal greedy
     // parity fix) — every default-constructed sampling config must agree.
     assert!((cfg.sampling.repetition_penalty - 1.0).abs() < f32::EPSILON);
     assert_eq!(cfg.sampling.max_tokens, 512);
@@ -241,25 +240,24 @@ fn config_roundtrip_serialize_deserialize() {
             model_path: Some("/path/to/model.gguf".to_string()),
             tokenizer_path: Some("/path/to/tokenizer.json".to_string()),
             max_seq_len: 16384,
-            // RT-ADMIN-CFG (spec item 9) added these two fields in
-            // config.rs to prepare B2-12's (wave 3) context-guard formula;
+            // `max_context` / `ctx_budget_bytes` feed the context-guard formula;
             // this exhaustive same-crate struct literal needs them listed
             // too. `#[non_exhaustive]` would not help here since this file
             // is in the same crate as the struct.
             max_context: None,
             ctx_budget_bytes: None,
-            // B2-14 (wave 4b) added `rope_scaling` to `ModelConfig` (the
-            // `--rope-scaling auto|on|off` CLI/TOML control) — same
-            // situation as `max_context`/`ctx_budget_bytes` above.
+            // `rope_scaling` (the `--rope-scaling auto|on|off` CLI/TOML control)
+            // is a `ModelConfig` field — same situation as
+            // `max_context`/`ctx_budget_bytes` above.
             rope_scaling: RopeScalingMode::Off,
         },
         observability: ObservabilityConfig {
             log_level: "trace".to_string(),
             json_logs: true,
         },
-        // B2-12 (wave 3) added the `imagen` field to `OxiBonsaiConfig` (the
-        // enabling half of an `[imagen]` config-file section; CLI wiring is
-        // B2-14's) — same situation as `max_context`/`ctx_budget_bytes`
+        // `imagen` is a field of `OxiBonsaiConfig` (the
+        // config-file `[imagen]` section) — same situation as
+        // `max_context`/`ctx_budget_bytes`
         // above: this exhaustive same-crate struct literal needs it listed.
         imagen: ImagenConfig {
             model_path: Some("/models/bonsai-image".to_string()),
@@ -268,7 +266,7 @@ fn config_roundtrip_serialize_deserialize() {
             steps: 12,
             guidance_scale: 5.0,
             seed: Some(7),
-            output_dir: Some("/tmp/imagen-out".to_string()),
+            output_dir: Some("out/imagen".to_string()),
         },
     };
 

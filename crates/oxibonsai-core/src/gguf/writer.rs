@@ -66,8 +66,7 @@ pub enum MetadataWriteValue {
     /// round-trip to: `ExportConfig::with_source_metadata` mapped it to
     /// [`MetadataWriteValue::U64`], which turns a negative source value into
     /// a huge positive one (`v as u64`) instead of writing it back as the
-    /// signed type the GGUF spec requires (wave-2.5 integration addendum,
-    /// item 2).
+    /// signed type the GGUF spec requires.
     I64(i64),
     Bool(bool),
     Str(String),
@@ -1136,7 +1135,7 @@ mod tests {
         assert_eq!(decoded, vec![1.0, -1.0, 0.0, 0.5, -0.0625, 2000.0]);
     }
 
-    // ── MetadataWriteValue::I64 (wave-2.5 integration addendum, item 2) ────
+    // ── MetadataWriteValue::I64 ─────────────────────────────────────────
 
     /// A negative `i64` is the case the missing variant actually broke:
     /// before this, `ExportConfig::with_source_metadata` had nowhere to
@@ -1177,8 +1176,8 @@ mod tests {
             (TensorType::TQ1_0, 34, 256, 54),
             (TensorType::MXFP4, 39, 32, 17),
             (TensorType::NVFP4, 40, 64, 36),
-            // FIX3-GGUF-WRITE item 1(a): the three K-quant formats this
-            // package adds writer support for. Byte sizes match
+            // The three K-quant formats this
+            // module has writer support for. Byte sizes match
             // `oxibonsai_core::quant_k::{BLOCK_Q2_K_BYTES, BLOCK_Q3K_BYTES,
             // BLOCK_Q8K_BYTES}` and the reader-side
             // `GgufTensorType::block_bytes`, which this must never drift

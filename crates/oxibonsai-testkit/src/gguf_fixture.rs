@@ -173,35 +173,30 @@ impl FixtureQuant {
     /// The `oxibonsai_core::TensorType` this format serialises as when
     /// writing a full GGUF file with [`GgufFixtureBuilder`].
     ///
-    /// `None` for `Q2K`/`Q3K`/`Q8K`: `oxibonsai_core::gguf::writer::TensorType`
-    /// (a file this package does not own) has no variant for ggml ids
-    /// 10/11/15 yet — only `Q4_K`/`Q5_K`/`Q6_K` are wired into the writer
-    /// today. [`quantize_bytes`] still produces correct raw block bytes for
-    /// these three (every K-quant kernel test in this workspace — e.g.
-    /// `metal_k_quant_gemv_parity.rs` — consumes raw blocks directly and
-    /// never goes through a full GGUF file), only [`GgufFixtureBuilder`]
-    /// cannot embed them in a whole file. Recorded as a deviation (writer.rs
-    /// needs three more `TensorType` variants; not in this package's
-    /// `owned_files`).
+    /// Every format has one, including the six K-quants (ggml ids 10-15): the
+    /// writer's `TensorType` carries `Q2_K`, `Q3_K` and `Q8_K` next to
+    /// `Q4_K`/`Q5_K`/`Q6_K`, so a fixture file can embed any of them.
     #[must_use]
-    pub const fn writer_type(self) -> Option<TensorType> {
+    pub const fn writer_type(self) -> TensorType {
         match self {
-            Self::F32 => Some(TensorType::F32),
-            Self::F16 => Some(TensorType::F16),
-            Self::Q1_0G128 => Some(TensorType::Q1_0G128),
-            Self::TQ2_0_g128 => Some(TensorType::TQ2_0_g128),
-            Self::TQ2_0 => Some(TensorType::TQ2_0),
-            Self::Q4_0 => Some(TensorType::Q4_0),
-            Self::Q8_0 => Some(TensorType::Q8_0),
-            Self::Q4K => Some(TensorType::Q4_K),
-            Self::Q5K => Some(TensorType::Q5_K),
-            Self::Q6K => Some(TensorType::Q6_K),
-            Self::F8E4M3 => Some(TensorType::F8_E4M3),
-            Self::F8E5M2 => Some(TensorType::F8_E5M2),
-            Self::PQ2_0 => Some(TensorType::PQ2_0),
-            Self::PTQ1_0 => Some(TensorType::PTQ1_0),
-            Self::Q2_0G64 => Some(TensorType::Q2_0G64),
-            Self::Q2K | Self::Q3K | Self::Q8K => None,
+            Self::F32 => TensorType::F32,
+            Self::F16 => TensorType::F16,
+            Self::Q1_0G128 => TensorType::Q1_0G128,
+            Self::TQ2_0_g128 => TensorType::TQ2_0_g128,
+            Self::TQ2_0 => TensorType::TQ2_0,
+            Self::Q4_0 => TensorType::Q4_0,
+            Self::Q8_0 => TensorType::Q8_0,
+            Self::Q2K => TensorType::Q2_K,
+            Self::Q3K => TensorType::Q3_K,
+            Self::Q4K => TensorType::Q4_K,
+            Self::Q5K => TensorType::Q5_K,
+            Self::Q6K => TensorType::Q6_K,
+            Self::Q8K => TensorType::Q8_K,
+            Self::F8E4M3 => TensorType::F8_E4M3,
+            Self::F8E5M2 => TensorType::F8_E5M2,
+            Self::PQ2_0 => TensorType::PQ2_0,
+            Self::PTQ1_0 => TensorType::PTQ1_0,
+            Self::Q2_0G64 => TensorType::Q2_0G64,
         }
     }
 }
@@ -226,12 +221,6 @@ pub enum FixtureError {
         len: usize,
         block_size: usize,
     },
-    /// [`FixtureQuant::writer_type`] returned `None`: see its doc comment.
-    #[error(
-        "{quant:?} has no oxibonsai_core::gguf::writer::TensorType mapping yet; \
-         use quantize_bytes() directly for this format instead of GgufFixtureBuilder"
-    )]
-    UnsupportedByWriter { quant: FixtureQuant },
     /// [`oxibonsai_core::GgufWriter::write`] itself failed.
     #[error(transparent)]
     Write(#[from] WriteError),
@@ -426,9 +415,6 @@ impl<'a> GgufFixtureBuilder<'a> {
     ///
     /// # Errors
     ///
-    /// - [`FixtureError::UnsupportedByWriter`] if `quant` has no
-    ///   `oxibonsai_core::TensorType` mapping (`Q2K`/`Q3K`/`Q8K` today; see
-    ///   [`FixtureQuant::writer_type`]).
     /// - Whatever [`quantize_bytes`] returns for a shape whose element count
     ///   is not a multiple of `quant.block_size()`.
     pub fn tensor(
@@ -438,9 +424,7 @@ impl<'a> GgufFixtureBuilder<'a> {
         quant: FixtureQuant,
         seed: u64,
     ) -> Result<&mut Self, FixtureError> {
-        let tensor_type = quant
-            .writer_type()
-            .ok_or(FixtureError::UnsupportedByWriter { quant })?;
+        let tensor_type = quant.writer_type();
         let element_count: u64 = shape.iter().product();
         let weights = deterministic_weights(element_count as usize, seed);
         let data = quantize_bytes(quant, &weights)?;
@@ -454,7 +438,7 @@ impl<'a> GgufFixtureBuilder<'a> {
     }
 
     /// Append a tensor from caller-supplied raw bytes (e.g. a hand-crafted
-    /// malformed block, or a format `quant.writer_type()` cannot reach).
+    /// malformed block).
     pub fn tensor_raw(
         &mut self,
         name: &str,
@@ -1005,16 +989,48 @@ mod tests {
         assert_eq!(norm.len(), 8 * 4, "F32: 8 elements * 4 bytes each");
     }
 
+    /// Every K-quant — `Q2K`, `Q3K` and `Q8K` included — goes through the
+    /// builder into a file the real reader parses: the tensor carries the
+    /// format's ggml type id and exactly `rows * block_bytes` of data, and
+    /// the data is the same bytes [`quantize_bytes`] produces for the seed.
     #[test]
-    fn builder_rejects_k_quant_formats_the_writer_cannot_serialise_yet() {
-        // Q2K/Q3K/Q8K: writer.rs (not owned by this package) has no
-        // TensorType variant for ggml ids 10/11/15 yet.
-        for quant in [FixtureQuant::Q2K, FixtureQuant::Q3K, FixtureQuant::Q8K] {
-            let mut b = GgufFixtureBuilder::new();
-            let err = b
-                .tensor("w", &[quant.block_size() as u64], quant, 1)
-                .expect_err("must report the writer gap, not silently drop the tensor");
-            assert!(matches!(err, FixtureError::UnsupportedByWriter { .. }));
+    fn builder_embeds_every_k_quant_format_in_a_file_the_real_reader_parses() {
+        use oxibonsai_core::GgufTensorType;
+
+        // (format, ggml id, bytes per 256-weight super-block)
+        let cases = [
+            (FixtureQuant::Q2K, 10_u32, std::mem::size_of::<BlockQ2K>()),
+            (FixtureQuant::Q3K, 11, std::mem::size_of::<BlockQ3K>()),
+            (FixtureQuant::Q4K, 12, std::mem::size_of::<BlockQ4K>()),
+            (FixtureQuant::Q5K, 13, std::mem::size_of::<BlockQ5K>()),
+            (FixtureQuant::Q6K, 14, std::mem::size_of::<BlockQ6K>()),
+            (FixtureQuant::Q8K, 15, std::mem::size_of::<BlockQ8K>()),
+        ];
+        for (quant, ggml_id, block_bytes) in cases {
+            // ne0 = one super-block, two rows.
+            let shape = [quant.block_size() as u64, 2];
+            let bytes = GgufFixtureBuilder::new()
+                .metadata_str("general.architecture", "qwen3")
+                .tensor("w", &shape, quant, 7)
+                .unwrap_or_else(|e| panic!("{quant:?}: add tensor: {e}"))
+                .build()
+                .unwrap_or_else(|e| panic!("{quant:?}: build: {e}"));
+            let file = GgufFile::parse(&bytes)
+                .unwrap_or_else(|e| panic!("{quant:?}: the real reader must parse: {e}"));
+            let info = file
+                .tensors
+                .get("w")
+                .unwrap_or_else(|| panic!("{quant:?}: tensor `w` is listed"));
+            assert_eq!(
+                info.tensor_type,
+                GgufTensorType::from_id(ggml_id).expect("a known ggml id"),
+                "{quant:?} is written under ggml id {ggml_id}"
+            );
+            let data = file.tensor_data("w").expect("tensor data");
+            assert_eq!(data.len(), 2 * block_bytes, "{quant:?}: two super-blocks");
+            let expected = quantize_bytes(quant, &deterministic_weights(2 * quant.block_size(), 7))
+                .expect("quantize");
+            assert_eq!(data, expected.as_slice(), "{quant:?}: the bytes written");
         }
     }
 

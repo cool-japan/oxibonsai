@@ -22,7 +22,7 @@ mod cuda_tq2 {
 
     // ── T-05 capability-report producer ──────────────────────────────────
     //
-    // T-07 FIX (verifier wave 3): this used to be an inline copy of
+    // T-07: this used to be an inline copy of
     // `oxibonsai_testkit::capability::record` (see `metal_k_quant_gemv_parity.rs`'s
     // former copy for the historical rationale); now imported directly above.
     use oxibonsai_kernels::CudaGraph;

@@ -6,16 +6,27 @@
 #
 # Precedence (highest wins):
 #     defaults < this TOML < env (OXIBONSAI_*) < CLI (--flag)
+#
+# Unknown keys are ignored without an error, so check spelling against this
+# file. See docs/CLI.md (flags and environment) and docs/DEPLOYMENT.md
+# (production guidance).
+
+# ─── Top-level (must come before the first [table]) ────────────────
+# RNG seed for deterministic sampling.
+seed = 42
 
 # ─── Bind address ──────────────────────────────────────────────────
 [bind]
-host = "0.0.0.0"
+# Loopback only. Binding a non-loopback address (for example "0.0.0.0")
+# is refused at start-up unless a bearer token is configured or
+# `auth.insecure_no_auth = true` acknowledges the risk.
+host = "127.0.0.1"
 port = 8080
 
 # ─── Model ─────────────────────────────────────────────────────────
 [model]
-# Path to a GGUF file on disk.  Leave unset to fall back to the
-# built-in tiny_test config (for smoke tests only).
+# Path to a GGUF file on disk.  Leave unset only for smoke tests: the server
+# then falls back to an untrained built-in tiny_test engine.
 # path = "/var/lib/oxibonsai/qwen3-1.7b.gguf"
 
 # Optional hint; the loader picks the real quantization from the file,
@@ -25,9 +36,11 @@ port = 8080
 # ─── Tokenizer ─────────────────────────────────────────────────────
 [tokenizer]
 # path = "/var/lib/oxibonsai/tokenizer.json"
-# kind = "huggingface"
+# kind = "huggingface"       # "huggingface" or "hf"; anything else is rejected
 
 # ─── Sampling defaults ─────────────────────────────────────────────
+# Defaults for a request that sets none (the GGUF's own sampling keys are
+# not consulted by this binary).
 [sampling]
 default_max_tokens = 256
 default_temperature = 0.7
@@ -35,21 +48,48 @@ default_top_p = 1.0
 
 # ─── Resource limits ───────────────────────────────────────────────
 [limits]
-max_input_tokens = 8192
+max_input_tokens = 8192            # also sizes each replica's KV window
+# The effective admission ceiling is min(max_concurrent_requests, 4 x pool size).
 max_concurrent_requests = 32
 per_request_timeout_ms = 60_000
+# engine_pool_size = 1             # unset: min(4, cores) on CPU, 1 on Metal and for hybrid models
+# max_body_bytes = 4_194_304       # 4 MiB, 413 above
+# max_output_tokens = 8192         # hard ceiling on a request's max_tokens
 
 # ─── Authentication ────────────────────────────────────────────────
 [auth]
-# Set to require `Authorization: Bearer <token>` on all endpoints
-# except `/health` and `/metrics`.  Must be at least 16 chars.
+# Set to require `Authorization: Bearer <token>` on all endpoints except
+# `/health`, `/metrics` and `/metrics/serve`.  Must be at least 16 bytes.
+# Prefer a file (kept out of `ps` and out of this config) to an inline value.
 # bearer_token = "change-me-to-a-real-16+char-token"
+# bearer_token_file = "/etc/oxibonsai/token"
+#
+# Credential for /admin/* (else the OXI_ADMIN_TOKEN environment variable);
+# every /admin/* request is 403 while neither is set. The bearer token does
+# not unlock it.
+# admin_token = "another-16+char-secret"
+#
+# Explicit acknowledgement that a non-loopback host runs with no bearer token.
+# insecure_no_auth = false
+
+# ─── CORS (off unless an origin is listed) ─────────────────────────
+# [cors]
+# allowed_origins = ["https://app.example.com"]
+# allow_credentials = false        # never combine `true` with a "*" origin
+
+# ─── Per-client rate limit (off unless rpm is set) ─────────────────
+# Keyed on the connecting peer's address; behind a reverse proxy every client
+# shares the proxy's bucket, so limit at the proxy instead.
+# [rate_limit]
+# rpm = 120
+# burst = 20
+
+# ─── Bundled chat UI (GET /ui, off by default) ─────────────────────
+# [ui]
+# enabled = false
 
 # ─── Observability ─────────────────────────────────────────────────
 [observability]
-log_level = "info"
+log_level = "info"                 # error, warn, info, debug, trace or off
 metrics_enabled = true
 metrics_path = "/metrics"
-
-# ─── Top-level ─────────────────────────────────────────────────────
-seed = 42

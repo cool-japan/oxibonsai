@@ -364,6 +364,51 @@ mod endpoint_existence {
         assert_eq!(json["engine_slot_available"], true);
     }
 
+    /// A busy server is ready: with the only replica leased (as a running
+    /// generation holds it) `/readyz` is still `200 ready`, and its body says
+    /// that no replica is idle. `503 not_ready` is for a server that cannot
+    /// serve at all, not for one that is saturated.
+    #[tokio::test]
+    async fn readyz_stays_ready_while_every_replica_is_leased() {
+        let engine = InferenceEngine::new(
+            oxibonsai_core::config::Qwen3Config::tiny_test(),
+            SamplingParams::default(),
+            42,
+        );
+        let pool = EnginePool::new(vec![engine]);
+        let app = create_router_full(
+            Arc::clone(&pool),
+            None,
+            Arc::new(InferenceMetrics::new()),
+            RouterOptions::default(),
+        );
+
+        // The first `/readyz` resolves the model descriptor by leasing a
+        // replica, so ask once while the replica is idle: the answer below is
+        // then served from the cache and never waits for a replica.
+        let (status, json) = get_json(app.clone(), "/readyz").await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["engine_slot_available"], true);
+
+        let lease = pool.acquire().await.expect("the replica is idle");
+        assert_eq!(pool.idle_count(), 0, "the only replica is leased");
+        let (status, json) = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            get_json(app.clone(), "/readyz"),
+        )
+        .await
+        .expect("a saturated server answers its readiness probe without waiting");
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["status"], "ready");
+        assert_eq!(json["model_loaded"], true);
+        assert_eq!(json["engine_slot_available"], false);
+
+        drop(lease);
+        let (status, json) = get_json(app, "/readyz").await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["engine_slot_available"], true);
+    }
+
     #[tokio::test]
     async fn get_model_by_id_returns_the_real_loaded_model() {
         let app = tiny_router();

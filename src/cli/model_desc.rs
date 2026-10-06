@@ -267,6 +267,11 @@ pub(crate) struct HybridReport {
     /// default `--ctx`: the Metal hybrid runner with its KV window, or the
     /// CPU tier and why (`None` when the model did not bind).
     pub(crate) backend_plan: Option<oxibonsai_runtime::engine_hybrid_gpu::HybridBackendPlan>,
+    /// `--prefill-chunk` as the report was asked for (`None`: the model's
+    /// own default).
+    pub(crate) prefill_chunk_requested: Option<usize>,
+    /// The model's own prefill chunk (`None` when the model did not bind).
+    pub(crate) default_prefill_chunk: Option<usize>,
 }
 
 /// What a successful dry bind resolved.
@@ -288,7 +293,9 @@ const DRY_BIND_CONTEXT: usize = 16;
 /// memory map; ~1-2 s for the 27B) — and the backend `--backend auto`
 /// resolves to for it at the default `--ctx` (the Metal hybrid runner's
 /// footprint and window, computed without building one; the Metal device is
-/// opened only to read its limits).
+/// opened only to read its limits), under the `HybridLoadOptions` in force
+/// on this thread — a vision tower's resident bytes and the prefill chunk
+/// the runner's calls are sized for.
 ///
 /// # Errors
 ///
@@ -321,7 +328,7 @@ pub(crate) fn hybrid_report(
             Err(e) => anyhow::bail!("prism.hadamard.* contract: {e}"),
         };
     let default_ctx = super::bonsai2::default_max_seq_len("qwen35");
-    let (bind, backend_plan) =
+    let (bind, backend_plan, default_prefill_chunk) =
         match oxibonsai_model::hybrid::HybridModel::from_gguf(gguf, DRY_BIND_CONTEXT) {
             Ok(model) => (
                 Ok(HybridBind {
@@ -335,8 +342,9 @@ pub(crate) fn hybrid_report(
                     &model,
                     default_ctx,
                 )),
+                Some(model.prefill_chunk()),
             ),
-            Err(e) => (Err(e.to_string()), None),
+            Err(e) => (Err(e.to_string()), None, None),
         };
     Ok(HybridReport {
         layers: cfg.base.num_layers,
@@ -349,7 +357,48 @@ pub(crate) fn hybrid_report(
         bind,
         kernel_tier: oxibonsai_kernels::cpu_kernel_tier(),
         backend_plan,
+        prefill_chunk_requested: oxibonsai_runtime::engine_hybrid_gpu::HybridLoadScope::active()
+            .prefill_chunk,
+        default_prefill_chunk,
     })
+}
+
+/// The prefill chunk a hybrid report's engine would run in: the tokens one
+/// prefill call takes (`in_effect`), the request it came from (`None`: the
+/// model's default), and whether the executor capped the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PrefillChunkPlan {
+    /// `--prefill-chunk`, when one was asked for.
+    pub(crate) requested: Option<usize>,
+    /// The model's chunk: the request, else the model's own default.
+    pub(crate) model_chunk: usize,
+    /// The most tokens one prefill call takes on the planned executor.
+    pub(crate) in_effect: usize,
+}
+
+impl PrefillChunkPlan {
+    /// Whether the planned executor takes fewer tokens per call than the
+    /// model's chunk (the Metal runner's KV-window budget capped it).
+    pub(crate) fn capped(&self) -> bool {
+        self.in_effect < self.model_chunk
+    }
+
+    /// The report line.
+    pub(crate) fn describe(&self) -> String {
+        let source = match self.requested {
+            Some(requested) => format!("--prefill-chunk {requested}"),
+            None => "the model's default; --prefill-chunk changes it".to_string(),
+        };
+        if self.capped() {
+            format!(
+                "{} tokens per prefill call ({source}): larger calls would not leave room for \
+                 the KV window in the memory budget",
+                self.in_effect
+            )
+        } else {
+            format!("{} tokens per prefill call ({source})", self.in_effect)
+        }
+    }
 }
 
 /// The effective decode tier of a hybrid under `--backend auto`, and the
@@ -383,6 +432,27 @@ pub(crate) fn hybrid_auto_tier(report: &HybridReport) -> (String, String) {
 }
 
 impl HybridReport {
+    /// The prefill chunk the planned executor would run in (`None` when the
+    /// model did not bind): on the Metal runner its call size, sized for the
+    /// request within the KV window's memory budget; on the CPU model the
+    /// model's chunk.
+    pub(crate) fn prefill_chunk_plan(&self) -> Option<PrefillChunkPlan> {
+        use oxibonsai_runtime::engine_hybrid_gpu::HybridBackendPlan;
+        let model_chunk = self
+            .prefill_chunk_requested
+            .or(self.default_prefill_chunk)?;
+        let in_effect = match &self.backend_plan {
+            Some(HybridBackendPlan::Metal { call_tokens, .. }) => *call_tokens,
+            Some(HybridBackendPlan::Cpu { .. }) => model_chunk,
+            None => return None,
+        };
+        Some(PrefillChunkPlan {
+            requested: self.prefill_chunk_requested,
+            model_chunk,
+            in_effect,
+        })
+    }
+
     /// Human-readable report lines (shared by `info` and `validate`).
     pub(crate) fn lines(&self, weight_bytes: u64) -> Vec<String> {
         use super::bonsai2::gib;
@@ -446,9 +516,13 @@ impl HybridReport {
         ));
         let (tier, reason) = hybrid_auto_tier(self);
         out.push(format!("Kernel tier: {tier} ({reason})"));
+        if let Some(plan) = self.prefill_chunk_plan() {
+            out.push(format!("Prefill chunk: {}", plan.describe()));
+        }
         if let Some(oxibonsai_runtime::engine_hybrid_gpu::HybridBackendPlan::Metal {
             window,
             mapped,
+            ..
         }) = &self.backend_plan
         {
             out.push(format!(
@@ -523,6 +597,12 @@ impl HybridReport {
             "kernel_tier": hybrid_auto_tier(self).0,
             "cpu_kernel_tier": self.kernel_tier.to_string(),
             "backend": self.backend_json(),
+            "prefill_chunk": self.prefill_chunk_plan().map(|plan| serde_json::json!({
+                "requested": plan.requested,
+                "model_chunk": plan.model_chunk,
+                "in_effect": plan.in_effect,
+                "capped": plan.capped(),
+            })),
         })
     }
 
@@ -530,10 +610,16 @@ impl HybridReport {
     fn backend_json(&self) -> serde_json::Value {
         use oxibonsai_runtime::engine_hybrid_gpu::HybridBackendPlan;
         match &self.backend_plan {
-            Some(HybridBackendPlan::Metal { window, mapped }) => serde_json::json!({
+            Some(HybridBackendPlan::Metal {
+                window,
+                mapped,
+                call_tokens,
+            }) => serde_json::json!({
                 "executor": "metal",
                 "label": oxibonsai_runtime::engine_hybrid_gpu::HYBRID_RUNNER_LABEL,
                 "weights_mapped": mapped,
+                "call_tokens": call_tokens,
+                "vision_resident_bytes": window.vision_resident_bytes,
                 "window": window.window,
                 "requested": window.requested,
                 "declared": window.declared,
@@ -814,8 +900,8 @@ mod tests {
         let summary = resolved_engine_summary(
             "Custom",
             oxibonsai_core::GgufTensorType::Q1_0_g128,
-            oxibonsai_kernels::KernelTier::Neon,
-            "aarch64 NEON detected",
+            oxibonsai_kernels::KernelTier::Reference,
+            "no SIMD feature compiled in",
         );
         assert!(
             summary.contains("Q1_0_g128"),

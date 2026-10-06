@@ -66,7 +66,7 @@ pub enum RagError {
     /// out-of-vocabulary query against a `TfIdfEmbedder` -- for a
     /// similarity metric whose score collapses to a constant at the
     /// origin. Returning this instead of an arbitrary insertion-order
-    /// ranking (RAG-21 / RAG-EVAL-IMG-21) lets a caller distinguish "no
+    /// ranking (RAG-21) lets a caller distinguish "no
     /// results were relevant" from "the query itself carried no
     /// information", which a silently-identical score for every entry
     /// cannot.

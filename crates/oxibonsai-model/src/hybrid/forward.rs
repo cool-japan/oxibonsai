@@ -798,7 +798,7 @@ pub fn run_chunk_input(
             max: ctx.rope.max_pos(),
         });
     }
-    // Lazy KV growth (REQUIRED #4 (4)): make every position of the chunk
+    // Lazy KV growth: make every position of the chunk
     // resident BEFORE any layer runs, so an allocation failure surfaces as
     // a typed error with no layer half-written, instead of mid-stack.
     ctx.kv.try_ensure_capacity(end_pos)?;
@@ -1083,13 +1083,13 @@ pub(crate) fn forward_ffn_chunk(
 // -------------------------------------------------------------------------
 
 /// Either kind of model a GGUF in this tree can hold, selected by
-/// `general.architecture` (gatekeeper REQUIRED #1(a)).
+/// `general.architecture`.
 ///
-/// A `qwen35` file cannot be loaded as a [`BonsaiModel`] -- it has no
+/// A `qwen35` file cannot be loaded as a `BonsaiModel` -- it has no
 /// `blk.N.attn_q.weight` on 48 of its 64 layers, a `q|gate` interleave on
 /// the other 16, a Hadamard fold on every matrix and a recurrent state
 /// beside the KV cache -- and a `qwen3` file cannot be loaded as a
-/// [`HybridModel`]. This enum is the one place that choice is made, so no
+/// `HybridModel`. This enum is the one place that choice is made, so no
 /// caller has to re-derive it from the metadata and no caller can get it
 /// wrong in only one of several places.
 ///
@@ -1336,7 +1336,7 @@ impl<'a> LoadedModel<'a> {
         }
     }
 
-    /// Clear the recurrent state only (REQUIRED #6 / RT-28): the hybrid
+    /// Clear the recurrent state only (RT-28): the hybrid
     /// arm zeroes every Gated-DeltaNet state and conv window; the dense arm
     /// has no recurrent layers, so there is nothing to clear.
     pub fn reset_recurrent(&mut self) {
@@ -1346,7 +1346,7 @@ impl<'a> LoadedModel<'a> {
         }
     }
 
-    /// Install a recurrent state after validating its geometry (REQUIRED #6).
+    /// Install a recurrent state after validating its geometry.
     ///
     /// # Errors
     ///
@@ -1483,7 +1483,7 @@ mod tests {
         assert!(folded_input(&normed, &rotated, None, 5).is_err());
     }
 
-    /// REQUIRED #6 at the seam the runtime dispatches through: the hybrid
+    /// At the seam the runtime dispatches through: the hybrid
     /// arm resets / takes / installs its recurrent state (validated), the
     /// dense arm has none and refuses a non-empty one with a typed error.
     #[test]

@@ -3,7 +3,7 @@
 //! Builds a tiny `bonsai-image` GGUF in memory (one fake quantized module + one
 //! BF16 tensor + the full `bonsai-image.*` metadata) with the OxiBonsai core
 //! `GgufWriter`, then loads it through [`DitWeights`]. Runs without the 1.3 GB
-//! `/tmp/parity.gguf` and validates every code path: config parsing, the
+//! `parity.gguf` and validates every code path: config parsing, the
 //! base-name quantized lookup (including `.weight`-suffix fallback), reversed
 //! shape recovery, ternary block count, and BF16 decode.
 
@@ -26,7 +26,7 @@ const BF16_NAME: &str = "x_embedder.weight";
 /// Build a tiny in-memory `bonsai-image` GGUF and the f32 weights we expect the
 /// quantized linear to dequantize to.
 ///
-/// T-07 (verifier wave 3): not re-pointed at
+/// T-07: not re-pointed at
 /// `oxibonsai_testkit::gguf_fixture` — this already calls the real
 /// `BlockTQ2_0_g128::quantize`/`dequant` directly (no reinvented
 /// quantization logic to deduplicate), and needs both the quantized bytes

@@ -30,21 +30,38 @@
 //! buffer exists), and a PNG's inflated data must be exactly the size its
 //! header declares.
 //!
+//! A caller that knows its per-image token budget (`--image-max-tokens`)
+//! bounds the decode tighter still: [`ImageSourcePolicy::max_source_pixels`]
+//! is the most pixels a source may have, checked at the same point (the PNG
+//! `IHDR`, the JPEG frame header) and refused with
+//! [`ImageInputError::OverDecodeBudget`] before a byte is inflated. The
+//! budget follows from the token budget
+//! ([`super::preprocess::source_pixel_budget`]): an image far larger than
+//! the grid it is resized to is not worth the memory of decoding it — a
+//! half-megabyte PNG can declare 8192 x 8192 pixels and cost over a gigabyte
+//! to inflate, unfilter and convert.
+//!
 //! # Sources
 //!
 //! [`load_image_source`] resolves an OpenAI `image_url` / CLI `--image`
 //! reference under an [`ImageSourcePolicy`]: base64 `data:` URIs always,
 //! local files only where the policy allows them (the CLI names its own
 //! files; a server resolves `file://` references inside an operator-chosen
-//! media directory only — `OXI_MEDIA_PATH` for `oxibonsai serve`, as the
-//! reference server's `--media-path` does), and
-//! `http(s)` never fetched — fetching arbitrary URLs from a server is a
-//! server-side request forgery surface, so it is refused with a typed error
-//! whether or not the operator opted in, until a fetcher with an address
-//! policy exists.
+//! media directory only — `--media-path <dir>` (or `OXI_MEDIA_PATH`) for
+//! `oxibonsai serve`, as the reference server's `--media-path` does), and
+//! `http(s)` only through the remote-image fetcher the policy carries
+//! ([`ImageSourcePolicy::remote`], see [`super::remote`]). Fetching
+//! arbitrary URLs is a server-side request forgery surface, so by default
+//! a remote reference is refused with a typed error before anything is
+//! opened or resolved; the operator opts in (`--allow-image-url-fetch` or
+//! `OXI_ALLOW_IMAGE_URL_FETCH=1`), and the front end installs a fetcher
+//! that applies the address policy of [`super::remote`] (the `oxibonsai`
+//! command does). The fetched bytes are decoded exactly like a data URI's:
+//! the format is sniffed from the bytes and the decode budget applies.
 
 use std::path::{Component, Path, PathBuf};
 
+use super::remote::{fetch_remote_reference, RemoteImageAccess, SharedRemoteImageFetcher};
 use super::ImageRgb8;
 
 /// The largest encoded image (file, data URI payload) accepted: 32 MiB.
@@ -109,6 +126,23 @@ pub enum ImageInputError {
         /// [`MAX_IMAGE_SIDE`].
         max_side: usize,
     },
+    /// The image is within the hard limits ([`MAX_DECODED_PIXELS`],
+    /// [`MAX_IMAGE_SIDE`]) but has more pixels than the decode budget its
+    /// caller derived from the per-image token budget
+    /// ([`ImageSourcePolicy::max_source_pixels`]).
+    #[error(
+        "the image is {width} x {height} pixels, over the decode budget of {max_pixels} pixels \
+         that the per-image token budget (--image-max-tokens) allows; downscale the image, or \
+         raise --image-max-tokens to admit larger sources"
+    )]
+    OverDecodeBudget {
+        /// Declared width.
+        width: usize,
+        /// Declared height.
+        height: usize,
+        /// The budget, in pixels.
+        max_pixels: usize,
+    },
     /// The image has a zero side.
     #[error("the image is empty ({width} x {height})")]
     Empty {
@@ -150,7 +184,9 @@ pub enum ImageInputError {
         /// What was given.
         reason: String,
     },
-    /// An `http(s)` reference (never fetched; see the module docs).
+    /// An `http(s)` reference the policy does not fetch at all: the
+    /// operator did not opt in, or no fetcher is installed (see
+    /// [`super::remote::RemoteImageAccess`]).
     #[error(
         "remote image URLs are not fetched ({url}): {reason}; send the image inline as a base64 \
          data URI (data:image/png;base64,...)"
@@ -158,7 +194,27 @@ pub enum ImageInputError {
     RemoteFetchRefused {
         /// The URL, truncated for the message.
         url: String,
-        /// Why (disabled, or enabled but unavailable).
+        /// Why (not opted in, or opted in without a fetcher).
+        reason: String,
+    },
+    /// An `http(s)` reference the remote-image address policy refuses: its
+    /// syntax, its scheme, credentials in it, or a host that is not a public
+    /// address and not allowlisted ([`super::remote::RemoteUrlRefusal`]).
+    #[error("remote image URL refused ({url}): {reason}")]
+    RemoteUrlRefused {
+        /// The URL, truncated for the message.
+        url: String,
+        /// Which rule refused it (never a resolved address).
+        reason: String,
+    },
+    /// A permitted `http(s)` reference whose fetch failed, naming the step
+    /// ([`super::remote::RemoteFetchFailure`]: resolve, connect, TLS, a
+    /// status other than 200, a redirect, the body, or the deadline).
+    #[error("remote image fetch failed ({url}): {reason}")]
+    RemoteFetchFailed {
+        /// The URL, truncated for the message.
+        url: String,
+        /// The step that failed.
         reason: String,
     },
     /// A local file reference the policy does not allow.
@@ -190,12 +246,16 @@ impl ImageInputError {
         match self {
             Self::UnsupportedFormat { .. } | Self::Unsupported { .. } => "image_format_unsupported",
             Self::Malformed { .. } => "image_decode_failed",
-            Self::EncodedTooLarge { .. } | Self::TooLarge { .. } => "image_too_large",
+            Self::EncodedTooLarge { .. }
+            | Self::TooLarge { .. }
+            | Self::OverDecodeBudget { .. } => "image_too_large",
             Self::Empty { .. } => "image_empty",
             Self::TooManyTokens { .. } => "image_too_many_tokens",
             Self::DataUri { .. } => "image_data_uri_invalid",
             Self::UnsupportedSource { .. } => "image_url_scheme_unsupported",
             Self::RemoteFetchRefused { .. } => "image_url_fetch_disabled",
+            Self::RemoteUrlRefused { .. } => "image_url_refused",
+            Self::RemoteFetchFailed { .. } => "image_url_fetch_failed",
             Self::LocalFileRefused { .. } => "image_file_refused",
             Self::FileUnreadable { .. } => "image_file_unreadable",
             Self::InvalidConfig { .. } => "image_config_invalid",
@@ -210,8 +270,15 @@ fn malformed_png(reason: impl Into<String>) -> ImageInputError {
     }
 }
 
-/// Refuse a declared size before any pixel buffer is allocated.
-fn check_dimensions(width: usize, height: usize) -> Result<(), ImageInputError> {
+/// Refuse a declared size before any pixel buffer is allocated: a zero side,
+/// anything past the hard limits ([`MAX_DECODED_PIXELS`], [`MAX_IMAGE_SIDE`]),
+/// and — when the caller gave one — more pixels than `budget`
+/// ([`ImageSourcePolicy::max_source_pixels`]).
+fn check_dimensions(
+    width: usize,
+    height: usize,
+    budget: Option<usize>,
+) -> Result<(), ImageInputError> {
     if width == 0 || height == 0 {
         return Err(ImageInputError::Empty { width, height });
     }
@@ -224,9 +291,17 @@ fn check_dimensions(width: usize, height: usize) -> Result<(), ImageInputError> 
     if width > MAX_IMAGE_SIDE || height > MAX_IMAGE_SIDE {
         return Err(too_large());
     }
-    match width.checked_mul(height) {
-        Some(pixels) if pixels <= MAX_DECODED_PIXELS => Ok(()),
-        _ => Err(too_large()),
+    let pixels = match width.checked_mul(height) {
+        Some(pixels) if pixels <= MAX_DECODED_PIXELS => pixels,
+        _ => return Err(too_large()),
+    };
+    match budget {
+        Some(max_pixels) if pixels > max_pixels => Err(ImageInputError::OverDecodeBudget {
+            width,
+            height,
+            max_pixels,
+        }),
+        _ => Ok(()),
     }
 }
 
@@ -271,10 +346,9 @@ fn describe_unknown(bytes: &[u8]) -> String {
     match named {
         Some(name) => name.to_string(),
         None if bytes.is_empty() => "empty input".to_string(),
-        None => {
-            let head: Vec<String> = bytes.iter().take(8).map(|b| format!("{b:02x}")).collect();
-            format!("unrecognised leading bytes {}", head.join(" "))
-        }
+        // Never the bytes themselves: the input may be a resource the server
+        // fetched on a client's behalf, and this text goes back to that client.
+        None => "not a recognised image format".to_string(),
     }
 }
 
@@ -285,6 +359,22 @@ fn describe_unknown(bytes: &[u8]) -> String {
 ///
 /// [`ImageInputError`] naming the format and the reason; never a panic.
 pub fn decode_image(bytes: &[u8]) -> Result<ImageRgb8, ImageInputError> {
+    decode_image_within(bytes, None)
+}
+
+/// [`decode_image`] under a pixel budget: an image with more than
+/// `max_pixels` pixels (`None`: only the hard limits) is refused with
+/// [`ImageInputError::OverDecodeBudget`] as soon as its header is read — for
+/// a PNG before any `IDAT` data is collected, for a JPEG before any pixel
+/// buffer exists.
+///
+/// # Errors
+///
+/// As [`decode_image`], plus [`ImageInputError::OverDecodeBudget`].
+pub fn decode_image_within(
+    bytes: &[u8],
+    max_pixels: Option<usize>,
+) -> Result<ImageRgb8, ImageInputError> {
     if bytes.len() > MAX_ENCODED_IMAGE_BYTES {
         return Err(ImageInputError::EncodedTooLarge {
             bytes: bytes.len(),
@@ -292,8 +382,8 @@ pub fn decode_image(bytes: &[u8]) -> Result<ImageRgb8, ImageInputError> {
         });
     }
     match sniff_format(bytes) {
-        Some(ImageFormat::Png) => decode_png(bytes),
-        Some(ImageFormat::Jpeg) => decode_jpeg(bytes),
+        Some(ImageFormat::Png) => decode_png_within(bytes, max_pixels),
+        Some(ImageFormat::Jpeg) => decode_jpeg_within(bytes, max_pixels),
         None => Err(ImageInputError::UnsupportedFormat {
             detected: describe_unknown(bytes),
         }),
@@ -348,7 +438,7 @@ struct PngHeader {
 }
 
 impl PngHeader {
-    fn parse(data: &[u8]) -> Result<Self, ImageInputError> {
+    fn parse(data: &[u8], budget: Option<usize>) -> Result<Self, ImageInputError> {
         let [w0, w1, w2, w3, h0, h1, h2, h3, bit_depth, color_type, compression, filter, interlace] =
             <[u8; 13]>::try_from(data)
                 .map_err(|_| malformed_png(format!("IHDR is {} bytes, not 13", data.len())))?;
@@ -375,7 +465,7 @@ impl PngHeader {
                 "unknown interlace method {interlace}"
             )));
         }
-        check_dimensions(width, height)?;
+        check_dimensions(width, height, budget)?;
         Ok(Self {
             width,
             height,
@@ -575,6 +665,19 @@ fn row_to_rgb(
 /// [`ImageInputError::TooLarge`] / [`ImageInputError::Empty`] from the
 /// header.
 pub fn decode_png(bytes: &[u8]) -> Result<ImageRgb8, ImageInputError> {
+    decode_png_within(bytes, None)
+}
+
+/// [`decode_png`] under a pixel budget, checked at the `IHDR` — before the
+/// `IDAT` data is collected, let alone inflated (see [`decode_image_within`]).
+///
+/// # Errors
+///
+/// As [`decode_png`], plus [`ImageInputError::OverDecodeBudget`].
+pub fn decode_png_within(
+    bytes: &[u8],
+    max_pixels: Option<usize>,
+) -> Result<ImageRgb8, ImageInputError> {
     let body = bytes
         .strip_prefix(&PNG_SIGNATURE[..])
         .ok_or_else(|| malformed_png("missing the PNG signature"))?;
@@ -615,7 +718,7 @@ pub fn decode_png(bytes: &[u8]) -> Result<ImageRgb8, ImageInputError> {
                 if header.is_some() {
                     return Err(malformed_png("more than one IHDR"));
                 }
-                header = Some(PngHeader::parse(data)?);
+                header = Some(PngHeader::parse(data, max_pixels)?);
             }
             b"PLTE" => {
                 if data.is_empty() || data.len() % 3 != 0 || data.len() > 3 * 256 {
@@ -803,9 +906,22 @@ fn jpeg_error(error: jpeg_decoder::Error) -> ImageInputError {
 /// the decoder, [`ImageInputError::TooLarge`] / [`ImageInputError::Empty`]
 /// from the frame header (checked before any pixel buffer exists).
 pub fn decode_jpeg(bytes: &[u8]) -> Result<ImageRgb8, ImageInputError> {
+    decode_jpeg_within(bytes, None)
+}
+
+/// [`decode_jpeg`] under a pixel budget, checked at the frame header (see
+/// [`decode_image_within`]).
+///
+/// # Errors
+///
+/// As [`decode_jpeg`], plus [`ImageInputError::OverDecodeBudget`].
+pub fn decode_jpeg_within(
+    bytes: &[u8],
+    max_pixels: Option<usize>,
+) -> Result<ImageRgb8, ImageInputError> {
     // A third-party decoder on caller bytes: a panic inside it must become
     // a typed error, never take the process down.
-    let result = std::panic::catch_unwind(|| decode_jpeg_inner(bytes));
+    let result = std::panic::catch_unwind(|| decode_jpeg_inner(bytes, max_pixels));
     result.unwrap_or_else(|_| {
         Err(ImageInputError::Malformed {
             format: "JPEG",
@@ -814,7 +930,10 @@ pub fn decode_jpeg(bytes: &[u8]) -> Result<ImageRgb8, ImageInputError> {
     })
 }
 
-fn decode_jpeg_inner(bytes: &[u8]) -> Result<ImageRgb8, ImageInputError> {
+fn decode_jpeg_inner(
+    bytes: &[u8],
+    max_pixels: Option<usize>,
+) -> Result<ImageRgb8, ImageInputError> {
     let mut decoder = jpeg_decoder::Decoder::new(bytes);
     decoder.read_info().map_err(jpeg_error)?;
     let info = decoder.info().ok_or_else(|| ImageInputError::Malformed {
@@ -822,7 +941,7 @@ fn decode_jpeg_inner(bytes: &[u8]) -> Result<ImageRgb8, ImageInputError> {
         reason: "no frame header".to_string(),
     })?;
     let (width, height) = (usize::from(info.width), usize::from(info.height));
-    check_dimensions(width, height)?;
+    check_dimensions(width, height, max_pixels)?;
     let pixel_bytes = info.pixel_format.pixel_bytes();
     decoder.set_max_decoding_buffer_size(width * height * pixel_bytes);
     let pixels = decoder.decode().map_err(jpeg_error)?;
@@ -1019,16 +1138,30 @@ pub struct ImageSourcePolicy {
     /// Plain local paths (and `file://` URLs) are read as given — for a
     /// command-line user naming their own files.
     pub allow_any_local_path: bool,
-    /// A directory `file://` references resolve inside (`OXI_MEDIA_PATH`
-    /// for `oxibonsai serve`, like the reference server's `--media-path`):
-    /// no absolute path, no `..`, and the resolved file must stay inside
-    /// it. `None` with `allow_any_local_path == false` refuses local files
-    /// — a network server's default.
+    /// A directory `file://` references resolve inside (`--media-path <dir>`
+    /// or `OXI_MEDIA_PATH` for `oxibonsai serve`, like the reference
+    /// server's `--media-path`): no absolute path, no `..`, and the
+    /// resolved file must stay inside it once symlinks are followed
+    /// (anything else is [`ImageInputError::LocalFileRefused`]). `None` with
+    /// `allow_any_local_path == false` refuses local files — a network
+    /// server's default.
     pub media_root: Option<PathBuf>,
-    /// The operator opted in to remote `http(s)` references. They are
-    /// still refused (no fetcher with an address policy exists yet), with a
-    /// reason that says so.
-    pub allow_remote_fetch: bool,
+    /// How remote `http(s)` references are treated (see
+    /// [`super::remote`], "Three states"): refused before anything is
+    /// opened ([`RemoteImageAccess::Disabled`], the default), refused saying
+    /// the operator's opt-in (`--allow-image-url-fetch` or
+    /// `OXI_ALLOW_IMAGE_URL_FETCH=1`) has no fetcher to act on
+    /// ([`RemoteImageAccess::OptedInWithoutFetcher`]), or fetched through the
+    /// installed fetcher ([`RemoteImageAccess::Fetcher`],
+    /// [`ImageSourcePolicy::with_remote_fetcher`]).
+    pub remote: RemoteImageAccess,
+    /// The most pixels a source image may have to be decoded at all: more is
+    /// [`ImageInputError::OverDecodeBudget`], decided from the header before
+    /// any pixel memory is spent. `None` (the default) leaves only the hard
+    /// limits ([`MAX_DECODED_PIXELS`], [`MAX_IMAGE_SIDE`]); a caller that
+    /// knows its per-image token budget sets the budget that follows from it
+    /// with [`ImageSourcePolicy::with_token_budget`].
+    pub max_source_pixels: Option<usize>,
 }
 
 impl ImageSourcePolicy {
@@ -1039,20 +1172,58 @@ impl ImageSourcePolicy {
         Self {
             allow_any_local_path: true,
             media_root: None,
-            allow_remote_fetch: false,
+            remote: RemoteImageAccess::Disabled,
+            max_source_pixels: None,
         }
     }
 
     /// The policy for a network server: `data:` URIs only, unless the
-    /// operator named a media directory (`file://` references inside it)
-    /// or opted in to remote references.
+    /// operator named a media directory (`file://` references inside it).
+    /// `remote_opt_in` records the operator's opt-in to remote references;
+    /// they are fetched only once a fetcher is installed
+    /// ([`ImageSourcePolicy::with_remote_fetcher`]).
     #[must_use]
-    pub fn server(media_root: Option<PathBuf>, allow_remote_fetch: bool) -> Self {
+    pub fn server(media_root: Option<PathBuf>, remote_opt_in: bool) -> Self {
         Self {
             allow_any_local_path: false,
             media_root,
-            allow_remote_fetch,
+            remote: if remote_opt_in {
+                RemoteImageAccess::OptedInWithoutFetcher
+            } else {
+                RemoteImageAccess::Disabled
+            },
+            max_source_pixels: None,
         }
+    }
+
+    /// This policy fetching remote references through `fetcher` — the
+    /// operator's opt-in made effective by a front end that applies an
+    /// address policy (see [`super::remote`]).
+    #[must_use]
+    pub fn with_remote_fetcher(mut self, fetcher: SharedRemoteImageFetcher) -> Self {
+        self.remote = RemoteImageAccess::Fetcher(fetcher);
+        self
+    }
+
+    /// This policy with its remote access set to `remote`.
+    #[must_use]
+    pub fn with_remote_access(mut self, remote: RemoteImageAccess) -> Self {
+        self.remote = remote;
+        self
+    }
+
+    /// This policy with its decode budget set to what a per-image token
+    /// budget of `max_tokens` (`--image-max-tokens`) justifies for a Qwen-VL
+    /// projector: [`super::preprocess::source_pixel_budget`] at the tower's
+    /// 32-pixel merge unit. A source image larger than that is refused from
+    /// its header, before it is inflated or converted.
+    #[must_use]
+    pub fn with_token_budget(mut self, max_tokens: usize) -> Self {
+        self.max_source_pixels = Some(super::preprocess::source_pixel_budget(
+            max_tokens,
+            super::preprocess::QWEN_VL_MERGE_UNIT,
+        ));
+        self
     }
 }
 
@@ -1112,23 +1283,75 @@ pub fn classify_image_source(reference: &str) -> Result<ImageSource, ImageInputE
 }
 
 /// Read a local file of at most [`MAX_ENCODED_IMAGE_BYTES`].
+///
+/// The size that is checked is the size of the file that is read: the path
+/// is opened once, its length is taken from the open handle, and the read
+/// goes through that handle capped at one byte past the limit — so a file
+/// replaced or grown after the check (or one whose length lies, like a
+/// pipe's) can never make this buffer more than the limit.
+///
+/// A path that is not a regular file (a FIFO would block the `open`, a
+/// device never ends) is refused by a plain `metadata` check before it is
+/// opened; the handle's own metadata repeats the check for the file that was
+/// actually opened.
 fn read_limited(path: &Path, shown: &str) -> Result<Vec<u8>, ImageInputError> {
     let unreadable = |reason: String| ImageInputError::FileUnreadable {
         path: shown.to_string(),
         reason,
     };
-    let meta = std::fs::metadata(path).map_err(|e| unreadable(e.to_string()))?;
-    if !meta.is_file() {
-        return Err(unreadable("not a regular file".to_string()));
+    let not_regular = || unreadable("not a regular file".to_string());
+    let on_path = std::fs::metadata(path).map_err(|e| unreadable(e.to_string()))?;
+    if !on_path.is_file() {
+        return Err(not_regular());
     }
-    let len = usize::try_from(meta.len()).unwrap_or(usize::MAX);
-    if len > MAX_ENCODED_IMAGE_BYTES {
-        return Err(ImageInputError::EncodedTooLarge {
-            bytes: len,
+    let mut file = std::fs::File::open(path).map_err(|e| unreadable(e.to_string()))?;
+    let on_handle = file.metadata().map_err(|e| unreadable(e.to_string()))?;
+    if !on_handle.is_file() {
+        return Err(not_regular());
+    }
+    read_bounded(&mut file, on_handle.len(), MAX_ENCODED_IMAGE_BYTES).map_err(|error| match error {
+        BoundedReadError::TooLarge(bytes) => ImageInputError::EncodedTooLarge {
+            bytes,
             limit: MAX_ENCODED_IMAGE_BYTES,
-        });
+        },
+        BoundedReadError::Io(reason) => unreadable(reason),
+    })
+}
+
+/// Why [`read_bounded`] gave up.
+#[derive(Debug, PartialEq, Eq)]
+enum BoundedReadError {
+    /// More than the limit: the byte count seen (the declared length, or one
+    /// past the limit when the reader outgrew it).
+    TooLarge(usize),
+    /// The reader failed.
+    Io(String),
+}
+
+/// Read all of `reader`, which declares `declared_len` bytes, refusing more
+/// than `limit`: a declared length past the limit is refused without reading,
+/// and a reader that yields more than the limit anyway (it grew, or its
+/// length was never true) is stopped one byte past it by `take`.
+fn read_bounded(
+    reader: impl std::io::Read,
+    declared_len: u64,
+    limit: usize,
+) -> Result<Vec<u8>, BoundedReadError> {
+    use std::io::Read as _;
+    let declared = usize::try_from(declared_len).unwrap_or(usize::MAX);
+    if declared > limit {
+        return Err(BoundedReadError::TooLarge(declared));
     }
-    std::fs::read(path).map_err(|e| unreadable(e.to_string()))
+    let mut bytes = Vec::with_capacity(declared);
+    let cap = u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1);
+    reader
+        .take(cap)
+        .read_to_end(&mut bytes)
+        .map_err(|e| BoundedReadError::Io(e.to_string()))?;
+    if bytes.len() > limit {
+        return Err(BoundedReadError::TooLarge(bytes.len()));
+    }
+    Ok(bytes)
 }
 
 /// Resolve a `file://` reference inside `root`: relative, no `..`, and
@@ -1165,12 +1388,16 @@ fn resolve_in_media_root(root: &Path, relative: &str) -> Result<PathBuf, ImageIn
 }
 
 /// Resolve an image reference to its encoded bytes under `policy` (see the
-/// module docs), without decoding it.
+/// module docs), without decoding it. A remote reference is fetched only
+/// through the policy's installed fetcher, held to
+/// [`MAX_ENCODED_IMAGE_BYTES`].
 ///
 /// # Errors
 ///
 /// [`ImageInputError`]: a malformed data URI, a refused or unreadable local
-/// file, a refused remote URL, an unsupported scheme or an oversized input.
+/// file, a remote URL that is not fetched (`image_url_fetch_disabled`), is
+/// refused by the address policy (`image_url_refused`) or failed to fetch
+/// (`image_url_fetch_failed`), an unsupported scheme or an oversized input.
 pub fn load_image_bytes(
     reference: &str,
     policy: &ImageSourcePolicy,
@@ -1179,20 +1406,7 @@ pub fn load_image_bytes(
     match classify_image_source(reference)? {
         ImageSource::DataUri => parse_data_uri(reference).map(|uri| uri.bytes),
         ImageSource::Remote => {
-            let shown: String = reference.chars().take(96).collect();
-            Err(ImageInputError::RemoteFetchRefused {
-                url: shown,
-                reason: if policy.allow_remote_fetch {
-                    "remote fetching was enabled, but this build has no image fetcher with an \
-                     address policy (loopback/private ranges, redirects, size and time limits)"
-                        .to_string()
-                } else {
-                    "fetching them would let a request make this process open arbitrary \
-                     network connections (server-side request forgery); remote image URLs are \
-                     disabled unless the operator opts in (OXI_ALLOW_IMAGE_URL_FETCH=1)"
-                        .to_string()
-                },
-            })
+            fetch_remote_reference(reference, &policy.remote, MAX_ENCODED_IMAGE_BYTES)
         }
         ImageSource::LocalFile(path) => {
             if policy.allow_any_local_path {
@@ -1206,7 +1420,8 @@ pub fn load_image_bytes(
                 None => Err(ImageInputError::LocalFileRefused {
                     reason: format!(
                         "{path:?}: local files are not served unless the operator names a media \
-                         directory (OXI_MEDIA_PATH); send the image as a base64 data URI"
+                         directory (--media-path <dir> or OXI_MEDIA_PATH); send the image as a \
+                         base64 data URI"
                     ),
                 }),
             }
@@ -1214,7 +1429,8 @@ pub fn load_image_bytes(
     }
 }
 
-/// [`load_image_bytes`] followed by [`decode_image`].
+/// [`load_image_bytes`] followed by [`decode_image_within`] under the
+/// policy's decode budget ([`ImageSourcePolicy::max_source_pixels`]).
 ///
 /// # Errors
 ///
@@ -1223,598 +1439,12 @@ pub fn load_image_source(
     reference: &str,
     policy: &ImageSourcePolicy,
 ) -> Result<ImageRgb8, ImageInputError> {
-    decode_image(&load_image_bytes(reference, policy)?)
+    decode_image_within(
+        &load_image_bytes(reference, policy)?,
+        policy.max_source_pixels,
+    )
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn hex(s: &str) -> Vec<u8> {
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("test vector hex"))
-            .collect()
-    }
-
-    fn decode_ok(png_hex: &str, rgb_hex: &str, dims: (usize, usize)) {
-        let img = decode_image(&hex(png_hex)).expect("decodes");
-        assert_eq!((img.width, img.height), dims);
-        assert_eq!(img.data, hex(rgb_hex));
-    }
-
-    /// Every colour type and legal bit depth, per-row filters 0..=4,
-    /// split `IDAT`, ancillary chunks — from an independent encoder, with
-    /// the expected RGB computed the way `stb_image` converts (alpha
-    /// dropped, grey replicated, sub-byte grey scaled, 16-bit high byte).
-    #[test]
-    fn png_every_colour_type_and_bit_depth_decodes_like_stb_image() {
-        decode_ok(PNG_RGB8, PNG_RGB8_RGB, PNG_RGB8_DIMS);
-        decode_ok(PNG_RGBA8, PNG_RGBA8_RGB, PNG_RGBA8_DIMS);
-        decode_ok(PNG_RGB16, PNG_RGB16_RGB, PNG_RGB16_DIMS);
-        decode_ok(PNG_RGBA16, PNG_RGBA16_RGB, PNG_RGBA16_DIMS);
-        decode_ok(PNG_GREY1, PNG_GREY1_RGB, PNG_GREY1_DIMS);
-        decode_ok(PNG_GREY2, PNG_GREY2_RGB, PNG_GREY2_DIMS);
-        decode_ok(PNG_GREY4, PNG_GREY4_RGB, PNG_GREY4_DIMS);
-        decode_ok(PNG_GREY8, PNG_GREY8_RGB, PNG_GREY8_DIMS);
-        decode_ok(PNG_GREY16, PNG_GREY16_RGB, PNG_GREY16_DIMS);
-        decode_ok(PNG_GREYA8, PNG_GREYA8_RGB, PNG_GREYA8_DIMS);
-        decode_ok(PNG_GREYA16, PNG_GREYA16_RGB, PNG_GREYA16_DIMS);
-        decode_ok(PNG_PAL1, PNG_PAL1_RGB, PNG_PAL1_DIMS);
-        decode_ok(PNG_PAL2, PNG_PAL2_RGB, PNG_PAL2_DIMS);
-        decode_ok(PNG_PAL4, PNG_PAL4_RGB, PNG_PAL4_DIMS);
-        decode_ok(PNG_PAL8, PNG_PAL8_RGB, PNG_PAL8_DIMS);
-    }
-
-    #[test]
-    fn png_adam7_interlacing_decodes() {
-        decode_ok(PNG_ADAM7_RGB8, PNG_ADAM7_RGB8_RGB, PNG_ADAM7_RGB8_DIMS);
-        decode_ok(PNG_ADAM7_GREY1, PNG_ADAM7_GREY1_RGB, PNG_ADAM7_GREY1_DIMS);
-        decode_ok(PNG_ADAM7_PAL4, PNG_ADAM7_PAL4_RGB, PNG_ADAM7_PAL4_DIMS);
-        decode_ok(PNG_ADAM7_TINY, PNG_ADAM7_TINY_RGB, PNG_ADAM7_TINY_DIMS);
-    }
-
-    /// Flip one byte at `at` and re-seal nothing: the decoder must refuse
-    /// the result with a typed error, never panic.
-    fn corrupted(bytes: &[u8], at: usize) -> Vec<u8> {
-        let mut out = bytes.to_vec();
-        out[at] ^= 0x5A;
-        out
-    }
-
-    #[test]
-    fn png_corruption_is_a_typed_error_never_a_panic() {
-        let good = hex(PNG_RGB8);
-        // Every single-byte corruption and every truncation.
-        for at in 0..good.len() {
-            let _ = decode_image(&corrupted(&good, at));
-        }
-        for len in 0..good.len() {
-            let result = decode_image(&good[..len]);
-            assert!(result.is_err(), "a PNG truncated to {len} bytes decoded");
-        }
-        // A header CRC flip is named.
-        let err = decode_image(&corrupted(&good, 20)).expect_err("IHDR corrupted");
-        assert_eq!(err.code(), "image_decode_failed");
-        assert!(err.to_string().contains("CRC"), "{err}");
-    }
-
-    #[test]
-    fn png_oversized_header_is_refused_before_allocation() {
-        // 40000 x 40000 RGB: refused from IHDR alone.
-        let mut ihdr = Vec::new();
-        ihdr.extend_from_slice(&40_000u32.to_be_bytes());
-        ihdr.extend_from_slice(&40_000u32.to_be_bytes());
-        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
-        let mut png = PNG_SIGNATURE.to_vec();
-        png.extend_from_slice(&13u32.to_be_bytes());
-        png.extend_from_slice(b"IHDR");
-        png.extend_from_slice(&ihdr);
-        png.extend_from_slice(&crc32(&[b"IHDR", &ihdr]).to_be_bytes());
-        let err = decode_image(&png).expect_err("too large");
-        assert_eq!(err.code(), "image_too_large");
-        // A zero side.
-        let mut ihdr = Vec::new();
-        ihdr.extend_from_slice(&0u32.to_be_bytes());
-        ihdr.extend_from_slice(&4u32.to_be_bytes());
-        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
-        let mut png = PNG_SIGNATURE.to_vec();
-        png.extend_from_slice(&13u32.to_be_bytes());
-        png.extend_from_slice(b"IHDR");
-        png.extend_from_slice(&ihdr);
-        png.extend_from_slice(&crc32(&[b"IHDR", &ihdr]).to_be_bytes());
-        assert_eq!(decode_image(&png).expect_err("empty").code(), "image_empty");
-    }
-
-    #[test]
-    fn crc32_matches_the_png_reference_value() {
-        // The CRC of the IEND chunk type, a constant every PNG ends with.
-        assert_eq!(crc32(&[b"IEND"]), 0xAE42_6082);
-        assert_eq!(crc32(&[b"123456789"]), 0xCBF4_3926);
-    }
-
-    fn max_abs_diff(a: &[u8], b: &[u8]) -> u8 {
-        a.iter()
-            .zip(b)
-            .map(|(x, y)| x.abs_diff(*y))
-            .max()
-            .unwrap_or(0)
-    }
-
-    /// Baseline (4:2:0 and 4:4:4), progressive, greyscale and Adobe CMYK
-    /// JPEGs against libjpeg's (Pillow's) decode of the same bytes: IDCT
-    /// and upsampling differ by at most a couple of units per channel.
-    #[test]
-    fn jpeg_baseline_progressive_grey_and_cmyk_decode() {
-        for (name, jpeg, want, tolerance) in [
-            ("baseline", JPEG_BASELINE, JPEG_BASELINE_PIL_RGB, 3u8),
-            ("progressive", JPEG_PROGRESSIVE, JPEG_PROGRESSIVE_PIL_RGB, 3),
-            ("4:4:4", JPEG_444, JPEG_444_PIL_RGB, 3),
-            ("grey", JPEG_GREY, JPEG_GREY_PIL_RGB, 2),
-            ("cmyk", JPEG_CMYK, JPEG_CMYK_PIL_RGB, 4),
-        ] {
-            let img = decode_image(&hex(jpeg)).unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert_eq!((img.width, img.height), (16, 16), "{name}");
-            let diff = max_abs_diff(&img.data, &hex(want));
-            assert!(diff <= tolerance, "{name}: max |diff| {diff} vs libjpeg");
-        }
-        // The progressive and baseline encodings of the same picture agree
-        // with each other just as closely.
-        let a = decode_image(&hex(JPEG_BASELINE)).expect("baseline");
-        let b = decode_image(&hex(JPEG_PROGRESSIVE)).expect("progressive");
-        assert!(max_abs_diff(&a.data, &b.data) <= 4);
-    }
-
-    #[test]
-    fn jpeg_corruption_is_a_typed_error_never_a_panic() {
-        let good = hex(JPEG_PROGRESSIVE);
-        for len in 3..good.len() {
-            let _ = decode_image(&good[..len]);
-        }
-        for at in (2..good.len()).step_by(7) {
-            let _ = decode_image(&corrupted(&good, at));
-        }
-        let err = decode_image(&good[..40]).expect_err("truncated");
-        assert!(
-            matches!(
-                err.code(),
-                "image_decode_failed" | "image_format_unsupported"
-            ),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn unknown_formats_are_named() {
-        let gif = decode_image(b"GIF89a\x01\x00\x01\x00").expect_err("gif");
-        assert_eq!(gif.code(), "image_format_unsupported");
-        assert!(gif.to_string().contains("GIF"), "{gif}");
-        let webp = decode_image(b"RIFF\0\0\0\0WEBPVP8 ").expect_err("webp");
-        assert!(webp.to_string().contains("WebP"), "{webp}");
-        let empty = decode_image(&[]).expect_err("empty");
-        assert!(empty.to_string().contains("empty"), "{empty}");
-    }
-
-    #[test]
-    fn base64_accepts_padding_whitespace_and_url_safe_symbols() {
-        assert_eq!(decode_base64("aGVsbG8=").expect("padded"), b"hello");
-        assert_eq!(decode_base64("aGVsbG8").expect("unpadded"), b"hello");
-        assert_eq!(decode_base64("aGVs\nbG8=").expect("wrapped"), b"hello");
-        assert_eq!(
-            decode_base64("-_-_").expect("url-safe"),
-            vec![0xFB, 0xFF, 0xBF]
-        );
-        assert_eq!(
-            decode_base64("+/+/").expect("standard"),
-            vec![0xFB, 0xFF, 0xBF]
-        );
-        for bad in ["aGVsbG8*", "aGVsb=G8", "a", "aGVsbG8===", "", "===="] {
-            let err = decode_base64(bad).expect_err(bad);
-            assert_eq!(err.code(), "image_data_uri_invalid", "{bad}: {err}");
-        }
-    }
-
-    #[test]
-    fn data_uris_are_parsed_strictly() {
-        let png = hex(PNG_RGB8);
-        let b64 = encode_base64_for_test(&png);
-        let uri = format!("data:image/png;base64,{b64}");
-        let parsed = parse_data_uri(&uri).expect("data uri");
-        assert_eq!(parsed.media_type, "image/png");
-        assert_eq!(parsed.bytes, png);
-        // Scheme case, extra parameters and an omitted media type are fine;
-        // a JPEG label on PNG bytes still decodes (the format is sniffed).
-        let loose = format!("DATA:;charset=x;base64,{b64}");
-        assert_eq!(parse_data_uri(&loose).expect("loose").bytes, png);
-        let mislabelled = format!("data:image/jpeg;base64,{b64}");
-        let img = load_image_source(&mislabelled, &ImageSourcePolicy::default()).expect("sniffed");
-        assert_eq!(img.data, hex(PNG_RGB8_RGB));
-        for (bad, why) in [
-            ("data:image/png,rawbytes", "not base64"),
-            ("data:text/plain;base64,aGVsbG8=", "not an image"),
-            ("data:image/png;base64", "no comma"),
-            ("image/png;base64,aGVsbG8=", "no scheme"),
-        ] {
-            let err = parse_data_uri(bad).expect_err(why);
-            assert_eq!(err.code(), "image_data_uri_invalid", "{why}: {err}");
-        }
-    }
-
-    /// A minimal standard base64 encoder for the tests (the crate itself
-    /// only decodes).
-    fn encode_base64_for_test(bytes: &[u8]) -> String {
-        const ALPHABET: &[u8; 64] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut out = String::new();
-        for chunk in bytes.chunks(3) {
-            let n = chunk.len();
-            let v = (u32::from(chunk[0]) << 16)
-                | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
-                | u32::from(*chunk.get(2).unwrap_or(&0));
-            for i in 0..4 {
-                if i <= n {
-                    out.push(char::from(ALPHABET[((v >> (18 - 6 * i)) & 63) as usize]));
-                } else {
-                    out.push('=');
-                }
-            }
-        }
-        out
-    }
-
-    #[test]
-    fn sources_follow_the_policy() {
-        let dir = std::env::temp_dir().join(format!(
-            "oxibonsai-image-source-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(dir.join("sub")).expect("temp dir");
-        let file = dir.join("sub").join("pic.png");
-        std::fs::write(&file, hex(PNG_RGB8)).expect("write fixture");
-        let path = file.to_string_lossy().into_owned();
-
-        // The CLI: any local path, as given or as a file:// URL.
-        let cli = ImageSourcePolicy::local_user();
-        assert_eq!(load_image_source(&path, &cli).expect("path").width, 5);
-        let file_url = format!("file://{path}");
-        assert_eq!(
-            load_image_source(&file_url, &cli).expect("file url").width,
-            5
-        );
-
-        // A server without a media directory: data URIs only.
-        let server = ImageSourcePolicy::server(None, false);
-        let err = load_image_source(&path, &server).expect_err("refused");
-        assert_eq!(err.code(), "image_file_refused");
-
-        // A server with one: relative file:// references inside it.
-        let rooted = ImageSourcePolicy::server(Some(dir.clone()), false);
-        let ok = load_image_source("file://sub/pic.png", &rooted).expect("inside the root");
-        assert_eq!(ok.height, 4);
-        for escape in ["file://../pic.png", "file://sub/../../x.png", &file_url] {
-            let err = load_image_source(escape, &rooted).expect_err(escape);
-            assert_eq!(err.code(), "image_file_refused", "{escape}: {err}");
-        }
-        let missing = load_image_source("file://sub/none.png", &rooted).expect_err("missing");
-        assert_eq!(missing.code(), "image_file_unreadable");
-
-        // Remote URLs: refused with or without the opt-in, naming why.
-        for policy in [&cli, &server, &ImageSourcePolicy::server(None, true)] {
-            let err = load_image_source("https://example.com/cat.png", policy).expect_err("remote");
-            assert_eq!(err.code(), "image_url_fetch_disabled");
-        }
-        let err = load_image_source("ftp://example.com/cat.png", &cli).expect_err("ftp");
-        assert_eq!(err.code(), "image_url_scheme_unsupported");
-        let err = load_image_source("   ", &cli).expect_err("blank");
-        assert_eq!(err.code(), "image_url_scheme_unsupported");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn classification_distinguishes_drives_from_schemes() {
-        assert_eq!(
-            classify_image_source("C:\\pics\\a.png").expect("drive"),
-            ImageSource::LocalFile("C:\\pics\\a.png".to_string())
-        );
-        assert_eq!(
-            classify_image_source("data:image/png;base64,AA").expect("data"),
-            ImageSource::DataUri
-        );
-        assert_eq!(
-            classify_image_source("HTTPS://x").expect("remote"),
-            ImageSource::Remote
-        );
-    }
-
-    // ── Test vectors (PNG from an independent encoder, JPEG + reference decode from Pillow) ──
-    const PNG_RGB8: &str = "89504e470d0a1a0a0000000d4948445200000005000000040802000000c95162170000000e74455874436f6d6d656e74\
-         00766563746f72236665970000000467414d410000b18f0bfc6105000000254944415478da014000bfff00c394ed4bdf\
-         79bbf622049fd8ebe3e501431c5fb5c2e167a4619dc863465b5dcf7a000000264944415499e5027b7a08e50320b73d69\
-         d9397868fb1103991bd474b01222a5164acdc28f002131a01e813c7f08250000000049454e44ae426082";
-    const PNG_RGB8_RGB: &str = "c394ed4bdf79bbf622049fd8ebe3e5431c5ff8de405f82a1fc4a0442e3e9be9667dde16016bf0ad5837caadefaf86607\
-         5e53455c2e3de2251e5581ad";
-    const PNG_RGB8_DIMS: (usize, usize) = (5, 4);
-    const PNG_RGBA8: &str = "89504e470d0a1a0a0000000d49484452000000030000000308060000005628b5bf0000000e74455874436f6d6d656e74\
-         00766563746f72236665970000000467414d410000b18f0bfc6105000000194944415478da012700d8ff00746452439a\
-         d19b4d0931da49019af9351e91272fdf0000001949444154b225535af3d7ff0c023d880e88f8dc9c5feb37978a473d11\
-         cdec9da0b40000000049454e44ae426082";
-    const PNG_RGBA8_RGB: &str = "7464529ad19b0931da9af9354c1e883ff587d7814344fa242a2c1e";
-    const PNG_RGBA8_DIMS: (usize, usize) = (3, 3);
-    const PNG_RGB16: &str = "89504e470d0a1a0a0000000d49484452000000040000000310020000006b06e5d20000000e74455874436f6d6d656e74\
-         00766563746f72236665970000000467414d410000b18f0bfc61050000002b4944415478da014b00b4ff007d09a7bc24\
-         6ad92a2190b1e69009f4d34a48d80e938edbf3017f7e69429946cfe83ddc53198ea50000002b49444154b908bb765a8d\
-         8132af2154a99cf002dbf62e96e3660cc113e3519347c523ad7bd3c510362bf1206c1624bfabe6f8940000000049454e\
-         44ae426082";
-    const PNG_RGB16_RGB: &str =
-        "7da724d921b190f44ad893db7f69994ea6520900d3b8546f5a977c5ab9a350234e7d8a60";
-    const PNG_RGB16_DIMS: (usize, usize) = (4, 3);
-    const PNG_RGBA16: &str = "89504e470d0a1a0a0000000d4948445200000002000000031006000000e97a02c20000000e74455874436f6d6d656e74\
-         00766563746f72236665970000000467414d410000b18f0bfc61050000001f4944415478da013300ccff00132b220f71\
-         3018cde900250a4c8ef4a90145d135fe39a712f671990000001f49444154f75328d41a48fbb9ff810256bc413367c9be\
-         3c4d31ab0dda611c46fbf9151005feba750000000049454e44ae426082";
-    const PNG_RGBA16_RGB: &str = "132271e9254c4535396d4f349b76a0bafa0e";
-    const PNG_RGBA16_DIMS: (usize, usize) = (2, 3);
-    const PNG_GREY1: &str = "89504e470d0a1a0a0000000d4948445200000009000000020100000000a22dcb7e0000000e74455874436f6d6d656e74\
-         00766563746f72236665970000000467414d410000b18f0bfc6105000000074944415478da63f0686064146635650000\
-         000749444154af040003f8014a45542efc0000000049454e44ae426082";
-    const PNG_GREY1_RGB: &str = "000000ffffff000000000000ffffff000000000000000000ffffff000000000000000000000000000000ffffffffffff\
-         ffffffffffff";
-    const PNG_GREY1_DIMS: (usize, usize) = (9, 2);
-    const PNG_GREY2: &str = "89504e470d0a1a0a0000000d494844520000000500000003020000000034ed82850000000e74455874436f6d6d656e74\
-         00766563746f72236665970000000467414d410000b18f0bfc6105000000084944415478da63887360bc96f1f91e9900\
-         00000949444154c564ec00000b4102554caf32790000000049454e44ae426082";
-    const PNG_GREY2_RGB: &str = "555555555555ffffffaaaaaa555555ffffff555555555555aaaaaa555555000000000000aaaaaa555555aaaaaa";
-    const PNG_GREY2_DIMS: (usize, usize) = (5, 3);
-    const PNG_GREY4: &str = "89504e470d0a1a0a0000000d49484452000000030000000204000000007defd4c70000000e74455874436f6d6d656e74\
-         00766563746f72236665970000000467414d410000b18f0bfc6105000000074944415478da6378b181f179d300680000\
-         000749444154c202000991030a153dd31d0000000049454e44ae426082";
-    const PNG_GREY4_RGB: &str = "eeeeee888888bbbbbbdddddd000000777777";
-    const PNG_GREY4_DIMS: (usize, usize) = (3, 2);
-    const PNG_GREY8: &str = "89504e470d0a1a0a0000000d49484452000000040000000208000000005ac322bf0000000e74455874436f6d6d656e74\
-         00766563746f72236665970000000467414d410000b18f0bfc6105000000094944415478da63b8c37ec690f13add9aec\
-         0000000949444154d47dee7b0015760474e94bc6010000000049454e44ae426082";
-    const PNG_GREY8_RGB: &str = "dcdcdc070707cccccc313131cacacaa9a9a9b4b4b4929292";
-    const PNG_GREY8_DIMS: (usize, usize) = (4, 2);
-    const PNG_GREY16: &str = "89504e470d0a1a0a0000000d4948445200000003000000021000000000e88fe5850000000e74455874436f6d6d656e74\
-         00766563746f72236665970000000467414d410000b18f0bfc61050000000b4944415478da63a85d726a575f2123b415\
-         a27a0000000b4944415457564bcb933b002f2406e29d7b28180000000049454e44ae426082";
-    const PNG_GREY16_RGB: &str = "7d7d7dcacaca8e8e8e0a0a0a8e8e8e727272";
-    const PNG_GREY16_DIMS: (usize, usize) = (3, 2);
-    const PNG_GREYA8: &str = "89504e470d0a1a0a0000000d4948445200000002000000020804000000d8bfc5af0000000e74455874436f6d6d656e74\
-         00766563746f72236665970000000467414d410000b18f0bfc6105000000094944415478da6310b8b06c37a367ce83c4\
-         0000000949444154dae55bda0014fb04417a033b0e0000000049454e44ae426082";
-    const PNG_GREYA8_RGB: &str = "101010a6a6a6262626000000";
-    const PNG_GREYA8_DIMS: (usize, usize) = (2, 2);
-    const PNG_GREYA16: &str = "89504e470d0a1a0a0000000d4948445200000003000000011004000000e179007c0000000e74455874436f6d6d656e74\
-         00766563746f72236665970000000467414d410000b18f0bfc61050000000a4944415478da6348fe37a774eab723bf8d\
-         790000000b49444154d742b62eac8d002d590602acc4c7fe0000000049454e44ae426082";
-    const PNG_GREYA16_RGB: &str = "6363639595953d3d3d";
-    const PNG_GREYA16_DIMS: (usize, usize) = (3, 1);
-    const PNG_PAL1: &str = "89504e470d0a1a0a0000000d494844520000000a0000000201030000005bafdf930000000e74455874436f6d6d656e74\
-         00766563746f72236665970000000467414d410000b18f0bfc610500000006504c544583f85c9e57f47c7b1c53000000\
-         074944415478da63787380d1c98d53cf0000000749444154e6080008e102aeabb9b4710000000049454e44ae426082";
-    const PNG_PAL1_RGB: &str = "9e57f49e57f49e57f483f85c9e57f49e57f483f85c83f85c9e57f49e57f483f85c83f85c9e57f49e57f49e57f49e57f4\
-         83f85c83f85c83f85c83f85c";
-    const PNG_PAL1_DIMS: (usize, usize) = (10, 2);
-    const PNG_PAL2: &str = "89504e470d0a1a0a0000000d494844520000000700000003020300000022adfd560000000e74455874436f6d6d656e74\
-         00766563746f72236665970000000467414d410000b18f0bfc61050000000c504c5445d56db748bd2142235baaa00f75\
-         45618a000000084944415478da63086561ac5f9cd5a43a0000000949444154ca14ff0600099202cc133c617400000000\
-         49454e44ae426082";
-    const PNG_PAL2_RGB: &str = "48bd2148bd2148bd2148bd21d56db7d56db748bd2148bd21aaa00faaa00faaa00fd56db742235b48bd21aaa00f48bd21\
-         aaa00f42235bd56db748bd21d56db7";
-    const PNG_PAL2_DIMS: (usize, usize) = (7, 3);
-    const PNG_PAL4: &str = "89504e470d0a1a0a0000000d494844520000000500000002040300000062440b6e0000000e74455874436f6d6d656e74\
-         00766563746f72236665970000000467414d410000b18f0bfc610500000027504c54456691e710fb07dfd8c4d048dc25\
-         c42e350b542a02985d9acb0675ad5a9074704c7558159eaa17e0b9cb1c0d000000084944415478da63602b0a60148c9f\
-         93230000000849444154dfd8010006a1021a508054c30000000049454e44ae426082";
-    const PNG_PAL4_RGB: &str = "6691e72a02985d9acbdfd8c4350b5410fb075d9acbaa17e00675ad350b54";
-    const PNG_PAL4_DIMS: (usize, usize) = (5, 2);
-    const PNG_PAL8: &str = "89504e470d0a1a0a0000000d49484452000000040000000408030000009e2f6e4c0000000e74455874436f6d6d656e74\
-         00766563746f72236665970000000467414d410000b18f0bfc610500000258504c544533a110dadbe7fdcb4738466e56\
-         3ec8e68d92e3b5b6f5d94e88c35c5f86bbbb9f54358798929d48ea6e10c6a0d1474302db6b54bc5dff5753fb99133118\
-         f6ed72ee6826731ba59b0ceec4287ca22afddf6dfc56fcac40bc0024ec7bc34bba569e663e8704e0372c092cabb5ec9b\
-         3c90ad7227c4da966e6b2c5c54ba08499233d15e84e74ef8f8c949e73a2bbfff44c540b623bc76f929500a39a56bbc29\
-         9072e1447fd0f33ea77a0232f21701a5e26d71d76abd7496fdf6d84b53ba9b7da77deae7267b39c73785aec0badc87c1\
-         21c67b21e39bed11704549211b7ed003e014850a3545406d1d9fc31329e6c3808b7ca0715a7a4ef545fafae4b085078d\
-         8018c707e8ac4874d64d698b30221555ea5932fe9cdc56408b7d8cc9b451991b36f7f7527979184ea9108a47e50eaf16\
-         6cc631a02f9669357944749a6f4645cc045904dfbcb5b143ec45cfb4ad7de397b4f8ec01667af87adeb3dd88821fb533\
-         d044b9452fce69f97198e3c4cc52972a0b2baa17db6ecdaaea18f09cc20ac25d53368e86e7aecb18001ded3bbfac445a\
-         5946b3c013cb44d4a70e0f60e9d1bfe9d6f573de64fa33d8728a764ab0ee3a8d12f9a22f204a59e556ef12274889c316\
-         3e5369374876cf9ca45ce9686843a06817c1f2cfd51f1590b696b13a703070582462bc545a471defb1249907d3303536\
-         5668cce2090c117f4f228acaedf3f97450022799e5e4de224cf5abc9f1fcb497586138440f8f04831d868cc875eac3ae\
-         ecec66103d2c46a3c9a48cce1039b38e6e57d38408b2c3a293506cafdc6716528faaeb947fe6c9fbc638d4e4019b1e7e\
-         ea49619257c67fe62ff5a460ec1db90000000e4944415478da63f059619dc0a83f6d473b53c158e2910000000e494441\
-         5466f1365966e64b7f4c0145e2074fd5ae40820000000049454e44ae426082";
-    const PNG_PAL8_RGB: &str = "6d1d9fcaedf36abd7452797944c540619257f09cc2563ec868684332f217a56bbc04e0378b7ca072ee68663e87c707e8";
-    const PNG_PAL8_DIMS: (usize, usize) = (4, 4);
-    const PNG_ADAM7_RGB8: &str = "89504e470d0a1a0a0000000d494844520000000b0000000908020000011c0171ec0000000e74455874436f6d6d656e74\
-         00766563746f72236665970000000467414d410000b18f0bfc6105000000a34944415478da013c01c3fe00af42bea2bf\
-         12013db0c3297c680044a62c0105573e00c869ce9ce3036f93b400cc6ce3ec2ef550c4be014fb90d56da33d896dd02e0\
-         71cd463839086b8300047cf1ec32e58a12b56045e5684d6ffc2614017cb9e66a6f86820f7a5e13b8e15c9bc4de1e0099\
-         c1172f06eeedd30136d8f2526d5301737fdacf3b49b0c890e93a5fd7d4a302210a01e23d2fd5c95cfffa31300d0403f0\
-         8145295b2d57a995ff38000000a449444154fae5e09b8a091b77042c5ca1523d3e6556de629d66f99376006aa9c8d653\
-         acb1627a7c519f7b9d5239b2acfc704354170e9b9bb9db32bef8c0250128e269182c0d8f994d07805645e27f8dad3ae6\
-         fdd82ebca285dd11be2ffc09477902e16ceedff3958cee2c3d101d55ddbf3eb2f78a2bed406eb85eee3311ed30452c2f\
-         037184061003d24c7b8a6aa6bbbbe84142de5511be8512151cd6d7e3d4350d07c1b2b62d92b6492365d5000000004945\
-         4e44ae426082";
-    const PNG_ADAM7_RGB8_RGB: &str = "af42be99c117cc6ce32f06ee44a62cedd301ec2ef536d8f2a2bf12526d5350c4be6aa9c8d653acb1627a7c519f7b9d52\
-         39b2acfc704354170e9b9bb9db32bef8c025047cf1737fdaec32e542ba238a12b5f282b36045e5dbbc12684d6fb290b5\
-         fc261428e269400e76cfa7c3d627191b0998a8b6d28eb3aabc6f4c414c5dff7b5908c2d2c869ce9489db4fb90d24f752\
-         9ce303c74b0fa59340dab6436f93b4e29db97d291d094e571f010b5b95ef13373670e657e668c918de97fcdd049f3a90\
-         1068894dee017cb9e63ac5b2e6286c5839af6837e6e63c44c64a9ec014cda7a639da733a6b845775ab315a59f0a6f279\
-         c63a12567875e04ef48d544ad6ad43904a4c248e773f7fee3db0c36621532f2adab85e9105573e4bb422ebcb79ad5133\
-         662c2bb906a98594a0";
-    const PNG_ADAM7_RGB8_DIMS: (usize, usize) = (11, 9);
-    const PNG_ADAM7_GREY1: &str = "89504e470d0a1a0a0000000d494844520000000d0000000a01000000013092d9ff0000000e74455874436f6d6d656e74\
-         00766563746f72236665970000000467414d410000b18f0bfc61050000001a4944415478da6370603cc0c0c0d8c07080\
-         e1006303d3020619c6028612c68388545b0000001b494441540ca61ce6381613866e0e46850ea6a417cc4ee62c061f00\
-         e6cf0abf20daa6ea0000000049454e44ae426082";
-    const PNG_ADAM7_GREY1_RGB: &str = "000000000000ffffffffffff000000ffffffffffffffffffffffff000000000000ffffff000000ffffff000000000000\
-         000000ffffff000000ffffffffffff000000000000000000000000ffffff000000000000000000ffffff000000ffffff\
-         ffffff000000ffffffffffffffffff000000000000000000000000ffffff000000000000000000000000000000ffffff\
-         000000ffffff000000ffffffffffffffffffffffffffffffffffff000000000000ffffff000000000000000000ffffff\
-         000000ffffff000000000000000000000000000000ffffff000000ffffff000000000000ffffff000000000000ffffff\
-         ffffffffffffffffff000000ffffff000000000000ffffff000000000000000000ffffff000000000000000000000000\
-         000000ffffffffffffffffffffffff000000000000000000ffffffffffff000000ffffffffffffffffff000000ffffff\
-         ffffffffffffffffffffffff000000ffffff000000ffffffffffff000000000000ffffffffffffffffff000000ffffff\
-         ffffff000000";
-    const PNG_ADAM7_GREY1_DIMS: (usize, usize) = (13, 10);
-    const PNG_ADAM7_PAL4: &str = "89504e470d0a1a0a0000000d494844520000000300000005040300000105587b070000000e74455874436f6d6d656e74\
-         00766563746f72236665970000000467414d410000b18f0bfc61050000001b504c54451b4dc7989ace856e23baba1121\
-         8eee367e5c02672861b1d06bdafb409b24330000000f4944415478da63086048607060646050622860089b75ab000000\
-         0f494441542c6012600870602ce901002121039894a65c5a0000000049454e44ae426082";
-    const PNG_ADAM7_PAL4_RGB: &str = "367e5c61b1d0218eee367e5c1b4dc7218eee856e2361b1d0856e2361b1d0218eee1b4dc70267286bdafb1b4dc7";
-    const PNG_ADAM7_PAL4_DIMS: (usize, usize) = (3, 5);
-    const PNG_ADAM7_TINY: &str = "89504e470d0a1a0a0000000d49484452000000010000000110060000013882285c0000000e74455874436f6d6d656e74\
-         00766563746f72236665970000000467414d410000b18f0bfc6105000000084944415478da637823527338282335f600\
-         00000949444154f0109b0500127a0391f92c72140000000049454e44ae426082";
-    const PNG_ADAM7_TINY_RGB: &str = "ec7c51";
-    const PNG_ADAM7_TINY_DIMS: (usize, usize) = (1, 1);
-    const JPEG_BASELINE: &str = "ffd8ffe000104a46494600010100000100010000ffdb0043000201010101010201010102020202020403020202020504\
-         040304060506060605060606070908060709070606080b08090a0a0a0a0a06080b0c0b0a0c090a0a0affdb0043010202\
-         02020202050303050a0706070a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a\
-         0a0a0a0a0a0a0a0a0a0a0a0a0a0affc00011080010001003012200021101031101ffc4001f0000010501010101010100\
-         000000000000000102030405060708090a0bffc400b5100002010303020403050504040000017d010203000411051221\
-         31410613516107227114328191a1082342b1c11552d1f02433627282090a161718191a25262728292a3435363738393a\
-         434445464748494a535455565758595a636465666768696a737475767778797a838485868788898a9293949596979899\
-         9aa2a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c4c5c6c7c8c9cad2d3d4d5d6d7d8d9dae1e2e3e4e5e6e7e8e9eaf1\
-         f2f3f4f5f6f7f8f9faffc4001f0100030101010101010101010000000000000102030405060708090a0bffc400b51100\
-         020102040403040705040400010277000102031104052131061241510761711322328108144291a1b1c109233352f015\
-         6272d10a162434e125f11718191a262728292a35363738393a434445464748494a535455565758595a63646566676869\
-         6a737475767778797a82838485868788898a92939495969798999aa2a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c4\
-         c5c6c7c8c9cad2d3d4d5d6d7d8d9dae2e3e4e5e6e7e8e9eaf2f3f4f5f6f7f8f9faffda000c03010002110311003f00f8\
-         b7e1c7eca9feaffe25be9fc15ef9f0e3f654ff0057ff0012df4fe0afac7e1cfeca9feaff00e25be9fc15ef7f0e3f654f\
-         f57ff12df4fe0afe96f1ebc61fe2fef3bf53c7fa30f8f5fc0fdef6ea7fffd9";
-    const JPEG_BASELINE_PIL_RGB: &str = "0101f50b04f21b03eb2b02e23c03db4c02d35b03cb6b04c37c02bc8c03b39b04aba903a3bc039cca0392dc028ce7068a\
-         060df91011f91f10ef2f10e7410fe05010d8600fd07010c9800fbf9210b8a010aeaf10a8c0109fd01099e00f8fea128d\
-         061efa1021f72021ef3020e54120df5020d66020cf7021c88020bf9120b6a021b0b020a6c1219fd11f97e0208feb238e\
-         052ef80f30f71f30ef2f2fe54130e0502fd65f2fd06f30c77f30bd9030b59f31aeaf2fa6c0309fd02f96df308fea318c\
-         053ffa1041f62041f02f40e64240df5040d76040d17040c88140be9041b69f41afaf40a6c141a0d04097e1408eea428d\
-         054df91051f72050f0304fe74150df514fd7604fd16f50c87f4fbd9150b6a050afae50a6c150a0cf5097e0508eeb518d\
-         065dfa1160f9215ff0315fe8425fe1515fd9615ed17160ca815fbe9161b7a05fafb060a9c25fa0d16098e15e90eb628e\
-         066dfa1070f82170ef316fe84270e0506fd9616fd07070c8806fbf9071b7a170b1b06fa7c270a0d06f98e16f90ea728e\
-         067ef81081f72080ee2f81e74081df5181d6607fcf7081c78080be8f81b6a081adae80a5c0819ecf8096e0808eeb838c\
-         068ff91091f62091ef2e91e64190dd5090d76090d07091c77f90bc8f92b59f90adae91a5bf919ecf9196df908cea938c\
-         059ff911a1f821a0ef30a1e742a0e051a0d860a0d071a1c981a0bd90a1b59fa1aeafa0a7c0a19fd0a096e19f8feba38d\
-         06aef90fb0f820b0ef31b0e741afe051aed760afd06fafc880b0be91b0b5a0b0afaeafa7c1b0a0d1af96e0af8febb18c\
-         06befa11c0f720c0f031c0e841c0e051bfd860bfd171bfc982c0bf91c0b6a0c1b0b0c0a6c1c0a1d1bf97e1bf8febc28e\
-         07cef810d0f71fd1ef2fcfe741d0e050cfd65fcfd070cfc780cebe90d0b6a1d0b0afcfa6c0d0a1d0cf97e1cf8fead28c\
-         07defa10e1f721e1ee31dfe641dfde50e0d760e1cf70e0c780dfbd90e1b6a0e0aeafe1a6c1df9fd2df97e0df8deae28d\
-         0aebfd14eefa26edf434ecea47ede355ecdb64edd374edca85ebc395edbba4eeb3b4ecabc5eda4d5ec9ae6ec94efee91";
-    const JPEG_PROGRESSIVE: &str = "ffd8ffe000104a46494600010100000100010000ffdb0043000201010101010201010102020202020403020202020504\
-         040304060506060605060606070908060709070606080b08090a0a0a0a0a06080b0c0b0a0c090a0a0affdb0043010202\
-         02020202050303050a0706070a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a\
-         0a0a0a0a0a0a0a0a0a0a0a0a0a0affc20011080010001003012200021101031101ffc400150001010000000000000000\
-         0000000000000607ffc4001501010100000000000000000000000000000407ffda000c030100021003100000018b3eac\
-         3ea58fffc400161000030000000000000000000000000000000506ffda00080101000105025d2a2e95174a8ba54fffc4\
-         001811000203000000000000000000000000000006072232ffda0008010301013f018c1f7163ffc40017110100030000\
-         000000000000000000000006002232ffda0008010201013f017ac3569fffc40016100003000000000000000000000000\
-         0000000123ffda0008010100063f025314c5314cffc40015100101000000000000000000000000000000f1ffda000801\
-         0100013f219a9a9a9affda000c0301000200030000001023ffc4001611000300000000000000000000000000000041a1\
-         ffda0008010301013f1086cfffc4001611000300000000000000000000000000000041a1ffda0008010201013f10accf\
-         ffc40015100101000000000000000000000000000000a1ffda0008010100013f1098cc62331fffd9";
-    const JPEG_PROGRESSIVE_PIL_RGB: &str = "0101f50b04f21b03eb2b02e23c03db4c02d35b03cb6b04c37c02bc8c03b39b04aba903a3bc039cca0392dc028ce7068a\
-         060df91011f91f10ef2f10e7410fe05010d8600fd07010c9800fbf9210b8a010aeaf10a8c0109fd01099e00f8fea128d\
-         061efa1021f72021ef3020e54120df5020d66020cf7021c88020bf9120b6a021b0b020a6c1219fd11f97e0208feb238e\
-         052ef80f30f71f30ef2f2fe54130e0502fd65f2fd06f30c77f30bd9030b59f31aeaf2fa6c0309fd02f96df308fea318c\
-         053ffa1041f62041f02f40e64240df5040d76040d17040c88140be9041b69f41afaf40a6c141a0d04097e1408eea428d\
-         054df91051f72050f0304fe74150df514fd7604fd16f50c87f4fbd9150b6a050afae50a6c150a0cf5097e0508eeb518d\
-         065dfa1160f9215ff0315fe8425fe1515fd9615ed17160ca815fbe9161b7a05fafb060a9c25fa0d16098e15e90eb628e\
-         066dfa1070f82170ef316fe84270e0506fd9616fd07070c8806fbf9071b7a170b1b06fa7c270a0d06f98e16f90ea728e\
-         067ef81081f72080ee2f81e74081df5181d6607fcf7081c78080be8f81b6a081adae80a5c0819ecf8096e0808eeb838c\
-         068ff91091f62091ef2e91e64190dd5090d76090d07091c77f90bc8f92b59f90adae91a5bf919ecf9196df908cea938c\
-         059ff911a1f821a0ef30a1e742a0e051a0d860a0d071a1c981a0bd90a1b59fa1aeafa0a7c0a19fd0a096e19f8feba38d\
-         06aef90fb0f820b0ef31b0e741afe051aed760afd06fafc880b0be91b0b5a0b0afaeafa7c1b0a0d1af96e0af8febb18c\
-         06befa11c0f720c0f031c0e841c0e051bfd860bfd171bfc982c0bf91c0b6a0c1b0b0c0a6c1c0a1d1bf97e1bf8febc28e\
-         07cef810d0f71fd1ef2fcfe741d0e050cfd65fcfd070cfc780cebe90d0b6a1d0b0afcfa6c0d0a1d0cf97e1cf8fead28c\
-         07defa10e1f721e1ee31dfe641dfde50e0d760e1cf70e0c780dfbd90e1b6a0e0aeafe1a6c1df9fd2df97e0df8deae28d\
-         0aebfd14eefa26edf434ecea47ede355ecdb64edd374edca85ebc395edbba4eeb3b4ecabc5eda4d5ec9ae6ec94efee91";
-    const JPEG_444: &str = "ffd8ffe000104a46494600010100000100010000ffdb0043000201010101010201010102020202020403020202020504\
-         040304060506060605060606070908060709070606080b08090a0a0a0a0a06080b0c0b0a0c090a0a0affdb0043010202\
-         02020202050303050a0706070a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a\
-         0a0a0a0a0a0a0a0a0a0a0a0a0a0affc00011080010001003011100021101031101ffc4001f0000010501010101010100\
-         000000000000000102030405060708090a0bffc400b5100002010303020403050504040000017d010203000411051221\
-         31410613516107227114328191a1082342b1c11552d1f02433627282090a161718191a25262728292a3435363738393a\
-         434445464748494a535455565758595a636465666768696a737475767778797a838485868788898a9293949596979899\
-         9aa2a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c4c5c6c7c8c9cad2d3d4d5d6d7d8d9dae1e2e3e4e5e6e7e8e9eaf1\
-         f2f3f4f5f6f7f8f9faffc4001f0100030101010101010101010000000000000102030405060708090a0bffc400b51100\
-         020102040403040705040400010277000102031104052131061241510761711322328108144291a1b1c109233352f015\
-         6272d10a162434e125f11718191a262728292a35363738393a434445464748494a535455565758595a63646566676869\
-         6a737475767778797a82838485868788898a92939495969798999aa2a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c4\
-         c5c6c7c8c9cad2d3d4d5d6d7d8d9dae2e3e4e5e6e7e8e9eaf2f3f4f5f6f7f8f9faffda000c03010002110311003f00f8\
-         b7e1c7eca9feaffe25be9fc15feab71ef187c7ef1f0fe1871efc1eff0063df3e1c7eca9feaff00e25be9fc15fc53c7bc\
-         61f1fbc7fa2be1871efc1ef9f58fc39fd953fd5ffc4b7d3f82beb38f78c3e3f78ff053c30e3df83df3defe1c7eca9fea\
-         ff00e25be9fc15fc53c7bc61f1fbc7fa2be1871efc1ef9ffd9";
-    const JPEG_444_PIL_RGB: &str = "0000fe1000f71f01ed2e01e44200e05000d75e01cc7101c78100bd8f01b8a100aeb000a5c0019fd00098e1008def0288\
-         000fff1210fa2010ef2f10e7430ee2520fd95f10ce7210c9810fbf9011baa10faeb20fa8c10fa1d20f99e10f8ef01188\
-         0021ff1020f91f21ef2d21e54120df5020d85d21ce7021c88020bf8e21b8a021aeb020a4c021a1cf2097e0208def2287\
-         0031fe1030f71e31ed2c31e54130e04f30d65e31cc6f30c57f30bf8d31b89f31aeaf30a5bf31a1cf3097e12f8dee3086\
-         0140ff123ffa2140f02f40e6443fe1523fd96040cf723fc8823fc09040b9a240afb23fa6c240a2d04098e23f8ef04088\
-         004ffe124ff82050ee2e50e7434fe1514fd76050cd714fc7804ebf8f50b9a150afb14fa6c150a2d14f99e34e8eef5088\
-         0061fd1161f81e61ed2d62e44160df5061d75e61cc7061c67f60be8e62b99f61aeb060a5bf619fd06098e15f8dee6287\
-         006fff126ffa1f71ef2e71e6426fe2506fd96070cf7070c8806fbf8f71b9a171afb06fa7c071a1d06f98e26f8ef07089\
-         0080fd0f82f92080ee3180e54081df5180d8627fcd6f82c78080be8e81b7a081adaf80a4c081a0cf8096e17f8cf08187\
-         0290ff1091f92290ef318fe7418fe1518fd8638fce7190c7828ec08f91baa08fafb18fa7c08fa2d18f99e28e8ef19089\
-         00a0fe0ea2f81fa1ed30a1e53fa1e050a1d861a0cc6ea2c781a0bf8da1b99fa1aeafa0a5bfa19fcfa098e1a08eefa288\
-         00affe0eb0f81fb1ed2fb1e53eb1e04eb0d760afcd6eb0c680b0be8eb1b7a0b0adaeb0a5beb1a0ceb096e0b08ceeb185\
-         02bfff10c0f922c0ef32c0e641c0e151bfd862bfce70c0c782bfc08fc0baa1c0b0b1bfa6c1c0a1d1bf99e3bf8ff1c088\
-         02ceff0fd0f921d0ef30cfe541d0e150cfd862cece70cfc781cebe90d0b8a1d0aeb0cfa6c0d0a1d0cf97e2cf8df0d087\
-         00e1ff0ee2f820e2ee2fe1e53ee1de4fe1d761e0cd6fe1c780dfbd8fe2b89ee1acafe1a4bee19fcfe197e0df8cefe286\
-         02efff0ef1f820f1ee30efe740f1e150f0d862efcd6ff0c980eebf8ff0baa0f1afb0f0a6c0f1a2cff099e1ef8eeff088";
-    const JPEG_GREY: &str = "ffd8ffe000104a46494600010100000100010000ffdb0043000201010101010201010102020202020403020202020504\
-         040304060506060605060606070908060709070606080b08090a0a0a0a0a06080b0c0b0a0c090a0a0affc0000b080010\
-         001001011100ffc4001f0000010501010101010100000000000000000102030405060708090a0bffc400b51000020103\
-         03020403050504040000017d01020300041105122131410613516107227114328191a1082342b1c11552d1f024336272\
-         82090a161718191a25262728292a3435363738393a434445464748494a535455565758595a636465666768696a737475\
-         767778797a838485868788898a92939495969798999aa2a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c4c5c6c7c8c9\
-         cad2d3d4d5d6d7d8d9dae1e2e3e4e5e6e7e8e9eaf1f2f3f4f5f6f7f8f9faffda0008010100003f00f8b7e1c7eca9feaf\
-         fe25be9fc15ef9f0e3f654ff0057ff0012df4fe0afac7e1cfeca9feaff00e25be9fc15ef7f0e3f654ff57ff12df4fe0a\
-         ffd9";
-    const JPEG_GREY_PIL_RGB: &str = "1d1d1d2121212525252828282d2d2d3030303434343939393c3c3c4040404444444747474c4c4c4f4f4f535353585858\
-         2626262b2b2b2e2e2e3232323636363a3a3a3d3d3d4242424545454a4a4a4d4d4d5151515555555959595c5c5c616161\
-         3030303434343838383b3b3b4040404343434747474c4c4c4f4f4f5353535757575a5a5a5f5f5f6262626666666b6b6b\
-         3939393d3d3d4141414444444949494c4c4c5050505454545858585c5c5c6060606363636868686b6b6b6f6f6f737373\
-         4343434747474b4b4b4e4e4e5353535656565a5a5a5e5e5e6262626666666a6a6a6d6d6d7272727575757979797d7d7d\
-         4b4b4b5050505454545757575c5c5c5f5f5f6363636767676a6a6a6f6f6f7373737676767b7b7b7e7e7e828282868686\
-         5555555a5a5a5d5d5d6161616565656969696c6c6c7171717474747979797c7c7c8080808484848888888b8b8b909090\
-         5e5e5e6363636767676a6a6a6f6f6f7272727676767a7a7a7d7d7d8282828686868989898e8e8e919191959595999999\
-         6868686d6d6d7070707474747878787c7c7c7f7f7f8484848787878b8b8b8f8f8f9292929797979a9a9a9e9e9ea3a3a3\
-         7272727676767a7a7a7d7d7d8181818585858989898d8d8d9090909595959898989c9c9ca0a0a0a4a4a4a7a7a7acacac\
-         7b7b7b8080808383838787878b8b8b8f8f8f9292929797979a9a9a9e9e9ea2a2a2a5a5a5aaaaaaadadadb1b1b1b6b6b6\
-         8484848888888c8c8c9090909494949797979b9b9b9f9f9fa3a3a3a7a7a7abababaeaeaeb3b3b3b6b6b6babababebebe\
-         8e8e8e9292929696969a9a9a9e9e9ea1a1a1a5a5a5a9a9a9adadadb1b1b1b5b5b5b8b8b8bdbdbdc0c0c0c4c4c4c8c8c8\
-         9797979b9b9b9f9f9fa2a2a2a7a7a7aaaaaaaeaeaeb2b2b2b5b5b5babababebebec1c1c1c6c6c6c9c9c9cdcdcdd1d1d1\
-         a1a1a1a5a5a5a9a9a9acacacb0b0b0b4b4b4b8b8b8bcbcbcbfbfbfc4c4c4c7c7c7cbcbcbcfcfcfd3d3d3d6d6d6dbdbdb\
-         aaaaaaaeaeaeb2b2b2b5b5b5babababdbdbdc1c1c1c5c5c5c8c8c8cdcdcdd1d1d1d4d4d4d9d9d9dcdcdce0e0e0e4e4e4";
-    const JPEG_CMYK: &str = "ffd8ffee000e41646f626500640000000000ffdb00430002010101010102010101020202020204030202020205040403\
-         04060506060605060606070908060709070606080b08090a0a0a0a0a06080b0c0b0a0c090a0a0affc000140800100010\
-         044311004d11005911004b1100ffc4001f0000010501010101010100000000000000000102030405060708090a0bffc4\
-         00b5100002010303020403050504040000017d01020300041105122131410613516107227114328191a1082342b1c115\
-         52d1f02433627282090a161718191a25262728292a3435363738393a434445464748494a535455565758595a63646566\
-         6768696a737475767778797a838485868788898a92939495969798999aa2a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2\
-         c3c4c5c6c7c8c9cad2d3d4d5d6d7d8d9dae1e2e3e4e5e6e7e8e9eaf1f2f3f4f5f6f7f8f9faffda000e0443004d005900\
-         4b00003f00fcdfff00826dff00cb87fc06bf37ff00e1db7ff500ff00c855fb19fb497fcbc7e35fbf95fd007fc136ff00\
-         e5c3fe0347fc3b6ffea01ff90abf3fff00692ff978fc68afe7ff00fe09b7ff002e1ff01afe803fe1db7ff500ff00c855\
-         fa01fb497fcbc7e3457f401ff04dbff970ff0080d1ff000edbff00a807fe42afcfff00da4bfe5e3f1a2bffd9";
-    const JPEG_CMYK_PIL_RGB: &str = "0000ff1000f72000ef3000e74000df5000d76000cf7000c78000bf9000b7a000afb000a7c0009fd00097e0008ff00087\
-         0010ff1010f72010ef3010e74010df5010d76010cf7010c78010bf9010b7a010afb010a7c0109fd01097e0108ff01087\
-         0020ff1020f72020ef3020e74020df5020d76020cf7020c78020bf9020b7a020afb020a7c0209fd02097e0208ff02087\
-         0030ff1030f72030ef3030e74030df5030d76030cf7030c78030bf9030b7a030afb030a7c0309fd03097e0308ff03087\
-         0041ff1041f72041ef3041e74041df5041d76041cf7041c78041bf9041b7a041afb041a7c0419fd04197e0418ff04187\
-         0050ff1050f72050ef3050e74050df5050d76050cf7050c78050bf9050b7a050afb050a7c0509fd05097e0508ff05087\
-         0060ff1060f72060ef3060e74060df5060d76060cf7060c78060bf9060b7a060afb060a7c0609fd06097e0608ff06087\
-         0070ff1070f72070ef3070e74070df5070d76070cf7070c78070bf9070b7a070afb070a7c0709fd07097e0708ff07087\
-         0080ff1080f72080ef3080e74080df5080d76080cf7080c78080bf9080b7a080afb080a7c0809fd08097e0808ff08087\
-         0090ff1090f72090ef3090e74090df5090d76090cf7090c78090bf9090b7a090afb090a7c0909fd09097e0908ff09087\
-         00a0ff10a0f720a0ef30a0e740a0df50a0d760a0cf70a0c780a0bf90a0b7a0a0afb0a0a7c0a09fd0a097e0a08ff0a087\
-         00b0ff10b0f720b0ef30b0e740b0df50b0d760b0cf70b0c780b0bf90b0b7a0b0afb0b0a7c0b09fd0b097e0b08ff0b087\
-         00c1ff10c1f720c1ef30c1e740c1df50c1d760c1cf70c1c780c1bf90c1b7a0c1afb0c1a7c0c19fd0c197e0c18ff0c187\
-         00d0ff10d0f720d0ef30d0e740d0df50d0d760d0cf70d0c780d0bf90d0b7a0d0afb0d0a7c0d09fd0d097e0d08ff0d087\
-         00e0ff10e0f720e0ef30e0e740e0df50e0d760e0cf70e0c780e0bf90e0b7a0e0afb0e0a7c0e09fd0e097e0e08ff0e087\
-         00f0ff10f0f720f0ef30f0e740f0df50f0d760f0cf70f0c780f0bf90f0b7a0f0afb0f0a7c0f09fd0f097e0f08ff0f087";
-}
+#[path = "image_decode_tests.rs"]
+mod tests;

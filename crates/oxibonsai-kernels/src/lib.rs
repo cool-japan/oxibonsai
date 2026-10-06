@@ -5,12 +5,14 @@
 
 //! # oxibonsai-kernels
 //!
-//! 1-bit Q1\_0\_g128 compute kernels for OxiBonsai.
+//! Sub-2-bit compute kernels for OxiBonsai.
 //!
 //! Provides dequantization and fused matrix-multiply operations optimized
-//! for the PrismML 1-bit weight format. The kernels are organised in a
-//! tiered dispatch architecture that auto-selects the fastest implementation
-//! available on the current CPU:
+//! for PrismML's weight formats: 1-bit `Q1_0_g128`, ternary `TQ2_0_g128`, and
+//! the Bonsai 2 `PQ2_0` / `PTQ1_0` / group-64 `Q2_0`, next to the standard ggml
+//! formats, with Metal and CUDA backends beside the CPU tiers. The CPU kernels
+//! are organised in a tiered dispatch architecture that auto-selects the
+//! fastest implementation available on the current CPU:
 //!
 //! | Tier | Cargo feature (informational) | Instruction set |
 //! |------|-------------------------------|-----------------|
@@ -35,12 +37,16 @@
 //! | [`dequant::dequant_1bit_g128`] | Unpack 128 sign bits + FP16 scale → FP32 |
 //! | [`gemv::gemv_1bit_g128`] | 1-bit weight matrix × FP32 vector (single-token decode) |
 //! | [`gemm::gemm_1bit_g128`] | 1-bit weight matrix × FP32 matrix (multi-token prefill) |
+//! | [`gemv_ternary::gemv_tq2_0_g128`] | Ternary `TQ2_0_g128` weight matrix × FP32 vector |
+//! | [`gemv_ptq1::gemv_ptq1_0`] | Bonsai 2 `PTQ1_0` weight matrix × FP32 vector |
+//! | [`hadamard`], [`gated_delta_net`] | The blockwise Hadamard transform and the Gated-DeltaNet recurrence of the Bonsai 2 hybrid |
 //! | [`gemm_f32::gemm_f32`] | Dense FP32 weight matrix × FP32 matrix, bit-identical to [`gemv_f32::gemv_f32`] per row |
 //!
-//! ## Trait
+//! ## Traits
 //!
-//! All tiers implement [`OneBitKernel`] so callers are agnostic to the
-//! underlying SIMD level.
+//! One kernel trait per weight format ([`OneBitKernel`], [`TernaryKernel`],
+//! [`PrismKernel`], [`StandardQuantKernel`], [`Fp8Kernel`]) gives callers a
+//! single interface that is agnostic to the underlying SIMD level.
 
 /// Emit an AArch64 software-prefetch hint, degrading to a no-op off-nightly.
 ///
@@ -161,6 +167,7 @@ pub mod dequant_prism;
 pub mod dequant_ternary;
 pub mod dispatch;
 pub mod dispatch_int8;
+pub mod dispatch_log;
 pub mod dispatch_prism;
 pub mod dispatch_std_quant;
 pub mod error;

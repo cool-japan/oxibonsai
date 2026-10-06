@@ -5,7 +5,7 @@
 //! - **No private Metal state** (`MET-10`). Both pipelines, `gemv_q4_0` and
 //!   `gemv_q8_0`, are resolved by name from the combined metallib that
 //!   `build.rs` embeds (`ACTIVE_KERNELS` lists `MSL_GEMV_Q4_0_V1` /
-//!   `MSL_GEMV_Q8_0_V1`), through [`MetalGraph::pipeline_for`] — the same
+//!   `MSL_GEMV_Q8_0_V1`), through `MetalGraph::pipeline_for` — the same
 //!   embedded → disk-cached → `xcrun` → runtime-source cascade every other
 //!   kernel family uses. This file used to open its own device and compile its
 //!   own `MTLLibrary` from source on first use, uncached, every process start.

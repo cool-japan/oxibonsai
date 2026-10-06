@@ -281,7 +281,7 @@ mod tests {
         assert_eq!(bf16_to_f32(0x3FC0), 1.5);
     }
 
-    /// FIX3-GGUF-WRITE item 4: the now-imported `bf16_to_f32`
+    /// The now-imported `bf16_to_f32`
     /// (`oxibonsai_core::bf16::bf16_to_f32`) must agree with this module's
     /// former local expression over the entire `u16` domain — every
     /// subnormal, both zeros, every infinity and every NaN payload.

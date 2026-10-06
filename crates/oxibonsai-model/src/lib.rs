@@ -1,22 +1,36 @@
 //! # oxibonsai-model
 //!
-//! Qwen3 Transformer implementation for 1-bit Bonsai inference.
+//! Dense Qwen3 and hybrid Qwen3.5 transformer forward passes for sub-2-bit
+//! Bonsai inference (1-bit, ternary, and the Bonsai 2 27B hybrid).
 //!
-//! This crate implements the full autoregressive forward pass for the
-//! Qwen3 architecture family (8B, 4B, 1.7B) using 1-bit quantised
-//! weights. The forward pass pipeline is:
+//! This crate implements the full autoregressive forward pass for two
+//! architecture families:
 //!
-//! 1. **Token embedding** — FP32 lookup from a `[vocab_size x hidden_size]` table
-//! 2. **N Transformer blocks**, each containing:
-//!    - Pre-attention **RMSNorm**
-//!    - **Grouped Query Attention** (GQA) with rotary position embeddings
-//!    - Pre-FFN **RMSNorm**
-//!    - **SwiGLU MLP** (gate + up + down projections)
-//! 3. **Final RMSNorm**
-//! 4. **LM head** projection to vocabulary logits
+//! - **Dense Qwen3** (`general.architecture = "qwen3"`: Bonsai-8B,
+//!   Ternary-Bonsai-8B / 4B / 1.7B, and generic llama.cpp-style GGUFs). The
+//!   forward pass pipeline is:
 //!
-//! All linear projections in the Transformer blocks use Q1\_0\_g128 1-bit
-//! weights dispatched through [`oxibonsai_kernels::OneBitKernel`].
+//!   1. **Token embedding** — FP32 lookup from a `[vocab_size x hidden_size]` table
+//!   2. **N Transformer blocks**, each containing:
+//!      - Pre-attention **RMSNorm**
+//!      - **Grouped Query Attention** (GQA) with rotary position embeddings
+//!      - Pre-FFN **RMSNorm**
+//!      - **SwiGLU MLP** (gate + up + down projections)
+//!   3. **Final RMSNorm**
+//!   4. **LM head** projection to vocabulary logits
+//! - **Hybrid Qwen3.5** (`general.architecture = "qwen35"`: Bonsai 2 27B),
+//!   which interleaves Gated-DeltaNet linear-attention layers with gated
+//!   full-attention layers over Hadamard-rotated weights, with an optional
+//!   vision tower (see [`hybrid`] and [`vision`]).
+//!
+//! Every linear projection is dispatched through the kernel trait of the
+//! tensor's on-disk format in [`oxibonsai_kernels`]:
+//! [`OneBitKernel`](oxibonsai_kernels::OneBitKernel) for `Q1_0_g128`,
+//! [`TernaryKernel`](oxibonsai_kernels::TernaryKernel) for `TQ2_0_g128`,
+//! [`PrismKernel`](oxibonsai_kernels::PrismKernel) for `PQ2_0` / `PTQ1_0` /
+//! group-64 `Q2_0`, and
+//! [`StandardQuantKernel`](oxibonsai_kernels::StandardQuantKernel) for the
+//! standard ggml formats.
 //!
 //! ## Model Registry
 //!

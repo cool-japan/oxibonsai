@@ -833,7 +833,7 @@ mod tests {
     /// ggml's real `block_q8_1` is `ggml_half2 ds` (2×f16 = 4 bytes) plus
     /// `qs[32]`, i.e. 36 bytes (`ggml-common.h:297`) — not 40. A wrong
     /// `block_bytes()` here would mis-size every Q8_1 tensor's offset
-    /// replay (REQUIRED #3, gatekeeper wave-1+1.5 review).
+    /// replay.
     #[test]
     fn q8_1_block_bytes_matches_ggml_common_h() {
         assert_eq!(GgufTensorType::Q8_1.block_bytes(), 36);

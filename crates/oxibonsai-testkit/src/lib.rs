@@ -10,8 +10,7 @@
 //!   written, subtly-divergent builders (T-07).
 //! - [`qwen35_fixture`] — a complete, public synthetic Bonsai 2 hybrid
 //!   (`qwen35`) GGUF built on [`gguf_fixture`], for any crate that needs a
-//!   loadable hybrid model without a multi-GB real one (EMBED-WIRE handover
-//!   (3)).
+//!   loadable hybrid model without a multi-GB real one.
 //! - [`mmproj_fixture`] — a small synthetic Qwen3-VL vision projector
 //!   (`clip` architecture, `qwen3vl_merger` projector) GGUF with the same
 //!   tensor inventory and type mix as the real Bonsai 2 mmproj, for
@@ -30,12 +29,18 @@
 //!   bit-exact or relative-bound numeric check), generic over the caller's
 //!   own kernel-tier type so this crate never depends on
 //!   `oxibonsai-kernels`.
+//! - [`cli_bin`] — resolving the `oxibonsai` command-line binary for a test
+//!   that runs it as a subprocess: a pre-built `OXIBONSAI_CLI_BIN` first,
+//!   otherwise one `--all-features` release build whose executable path is
+//!   the one cargo reports, so no test compiles inside a real-model
+//!   critical section or overwrites a wider binary with a narrower one.
 //!
 //! This crate is a real member of the main Cargo workspace (root
 //! `Cargo.toml`'s `[workspace] members`), taken as a `[dev-dependencies]`
 //! entry by every producer crate above.
 
 pub mod capability;
+pub mod cli_bin;
 pub mod dense_fixture;
 pub mod gguf_fixture;
 pub mod parity;
@@ -384,9 +389,7 @@ pub mod mmproj_fixture {
     /// # Errors
     ///
     /// Propagates [`quantize_bytes`] (a value count that is not a multiple
-    /// of the format's block size) and the writer's own errors, and reports
-    /// [`FixtureError::UnsupportedByWriter`] for a format with no GGUF
-    /// writer mapping.
+    /// of the format's block size) and the writer's own errors.
     pub fn assemble(
         metadata: &[(String, MetadataWriteValue)],
         tensors: &[FixtureTensor],
@@ -396,10 +399,7 @@ pub mod mmproj_fixture {
             builder.metadata(key, value.clone());
         }
         for t in tensors {
-            let tensor_type = t
-                .quant
-                .writer_type()
-                .ok_or(FixtureError::UnsupportedByWriter { quant: t.quant })?;
+            let tensor_type = t.quant.writer_type();
             let data = quantize_bytes(t.quant, &t.values)?;
             builder.tensor_raw(&t.name, &t.shape, tensor_type, data);
         }
@@ -791,21 +791,17 @@ pub mod golden {
 
 /// Locating this workspace's root and its `models/` directory.
 ///
-/// (Wave-1 gatekeeper OPTIONAL #O7): several real-model acceptance tests
+/// Several real-model acceptance tests
 /// (`crates/oxibonsai-core/tests/quant_prism_golden.rs`,
-/// `crates/oxibonsai-model/src/gguf_loader.rs`'s own test module — neither
-/// owned by this package) silently no-op when `models/` is empty, which is
-/// the normal state inside an isolated wave worktree (confirmed empirically
-/// this wave: this worktree's own `models/` holds only a `.gitkeep`). This
-/// module is the fix's building block: it resolves the real `models/`
-/// directory the same, robust way regardless of which crate's test binary
-/// calls in, with an env-var override for CI or a custom layout, and it is
-/// what those two files should call once they can take this crate as a
-/// dev-dependency (see the `Cargo.toml` doc comment — that wiring is a
-/// deviation, this helper is not). It deliberately does not hardcode, guess
-/// at, or symlink to any *other* checkout's path (e.g. the main tree this
-/// worktree was created from): only `$OXIBONSAI_MODELS_DIR`, set by
-/// whatever created the environment, can point here at anything outside
+/// `crates/oxibonsai-model/src/gguf_loader.rs`'s own test module) silently
+/// no-op when `models/` is empty, which is the normal state inside an
+/// isolated git worktree (`models/` is gitignored, so a fresh worktree holds
+/// only a `.gitkeep`). This module resolves the real `models/` directory the
+/// same, robust way regardless of which crate's test binary calls in, with
+/// an env-var override for CI or a custom layout. It deliberately does not
+/// hardcode, guess at, or symlink to any *other* checkout's path (e.g. the
+/// main tree a worktree was created from): only `$OXIBONSAI_MODELS_DIR`, set
+/// by whatever created the environment, can point here at anything outside
 /// this workspace's own `models/` directory.
 pub mod workspace {
     use std::path::PathBuf;
@@ -873,11 +869,11 @@ pub mod workspace {
             let _guard = ENV_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // MINOR (verifier wave 3): this path is never opened (only
-            // compared against `models_dir()`'s return value), but a fixed
-            // absolute literal would still trip a naive "never hardcode
-            // absolute paths" policy grep. `std::env::temp_dir()` satisfies
-            // the policy and the override-priority assertion equally well.
+            // This path is never opened (only compared against
+            // `models_dir()`'s return value), but a fixed absolute literal
+            // would still trip a "never hardcode absolute paths" policy
+            // grep. `std::env::temp_dir()` satisfies the policy and the
+            // override-priority assertion equally well.
             let override_path = std::env::temp_dir().join("oxibonsai-testkit-override-check");
             std::env::set_var("OXIBONSAI_MODELS_DIR", &override_path);
             assert_eq!(models_dir(), override_path);

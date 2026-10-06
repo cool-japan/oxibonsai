@@ -40,7 +40,7 @@ use std::sync::Arc;
 /// Build a byte buffer for a Q1_0_g128 weight matrix: every block uniform
 /// (all weights `+1.0`), so every sign bit is set and the scale is `1.0`.
 ///
-/// T-07 FIX (verifier wave 3): re-pointed at
+/// T-07: re-pointed at
 /// `oxibonsai_testkit::gguf_fixture::quantize_bytes`, the real
 /// `BlockQ1_0G128` packer, instead of hand-rolling the "all sign bits set,
 /// scale = f16::ONE" byte pattern directly — every test using this builder
@@ -58,7 +58,7 @@ fn q1_0_g128_data(num_weights: usize) -> Vec<u8> {
 /// Build a byte buffer for a TQ2_0_g128 weight matrix: every block uniform
 /// (all weights `+1.0`), so every 2-bit lane packs the `+1` code.
 ///
-/// T-07 FIX (verifier wave 3): re-pointed at
+/// T-07: re-pointed at
 /// `oxibonsai_testkit::gguf_fixture::quantize_bytes` (the real
 /// `BlockTQ2_0_g128` packer) — see [`q1_0_g128_data`]'s doc comment for the
 /// full rationale.

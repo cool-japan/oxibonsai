@@ -17,13 +17,13 @@
 //! into a code**:
 //!
 //! - `PQ2_0` / `Q2_0_g64`: 4 codes per byte, LSB-first — see
-//!   [`dequant_two_bit_block`] / [`dot_two_bit_block`], shared verbatim
+//!   `dequant_two_bit_block` / `dot_two_bit_block`, shared verbatim
 //!   between the two formats (they differ only in `qs` length: 32 bytes / 128
 //!   weights vs. 16 bytes / 64 weights, and both structs already place `d`
 //!   before `qs`, so no extra "byte offset" parameter is needed — the qs
 //!   slice IS the offset).
 //! - `PTQ1_0`: five interleaved base-3 trits per byte plus four per `qh`
-//!   byte, unpacked by [`decode_ptq1_0_codes`] (see its doc for the exact,
+//!   byte, unpacked by `decode_ptq1_0_codes` (see its doc for the exact,
 //!   trap-laden element order).
 //!
 //! **`PQ2_0` must never be confused with the legacy [`crate::dequant_ternary`]
@@ -440,7 +440,7 @@ pub fn dequant_ptq1_0(blocks: &[BlockPTQ1_0], output: &mut [f32]) -> KernelResul
 /// identical `code - 1` arithmetic — so the trit code becomes the 2-bit code
 /// unchanged (never `0b11`) and `d` is copied bit-for-bit.
 ///
-/// Built directly on [`decode_ptq1_0_codes`] (this crate's own trit decode),
+/// Built directly on `decode_ptq1_0_codes` (this crate's own trit decode),
 /// not on [`oxibonsai_core::BlockPTQ1_0::transcode_to_pq2`], so that
 /// `dequant_ptq1_0(blocks) == dequant_pq2_0(transcode_ptq1_0_to_pq2_0(blocks))`
 /// is a real test of this crate's own repacking logic, not a tautology.
@@ -472,7 +472,7 @@ pub fn transcode_ptq1_0_to_pq2_0(
 }
 
 // ---------------------------------------------------------------------------
-// Register-blocked (MR-tiled) GEMM — K-INT8 / gatekeeper REQUIRED #9
+// Register-blocked (MR-tiled) GEMM
 //
 // Before this section the three Prism GEMMs were literal loops of GEMVs
 // (`gemm_pq2_0` below, `gemm_ptq1_0`, and every SIMD twin): the full
@@ -485,7 +485,7 @@ pub fn transcode_ptq1_0_to_pq2_0(
 // live in registers, then advance. Because each `(batch row, weight row)`
 // pair keeps the *same* sequence of multiply-adds and the same per-block
 // `sum += d * acc` order it had in the GEMV sweep, the blocked result is
-// **bit-identical** to the unblocked one — the invariant FIX3-PERF
+// **bit-identical** to the unblocked one — the invariant
 // established for the ternary family and which
 // `prism_blocked_tests::*_blocked_is_bit_identical_to_the_gemv_sweep`
 // re-checks here on every run.

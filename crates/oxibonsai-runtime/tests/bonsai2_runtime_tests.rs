@@ -32,10 +32,13 @@
 //! the model's 248044..248076 range, not a byte-fallback sequence).
 //!
 
+use std::time::Instant;
+
 use oxibonsai_core::gguf::reader::{mmap_gguf_file, GgufFile};
 use oxibonsai_runtime::engine::tokenizer_from_gguf;
 use oxibonsai_runtime::reasoning::{split_reasoning, ReasoningChunk, ReasoningSplitter};
-use oxibonsai_testkit::capability::{record_executed, record_skipped, Capability};
+use oxibonsai_testkit::capability::{record_executed_timed, record_skipped, Capability};
+use oxibonsai_testkit::cli_bin::resolve_cli_binary;
 use oxibonsai_tokenizer::chat_templates::{RenderMessage, RenderOptions, ResolvedChatTemplate};
 
 /// `OXI_BONSAI2_PQ2_GGUF`, else `$OXIBONSAI_MODELS_DIR/Ternary-Bonsai-2-27B-PQ2_0.gguf`,
@@ -76,18 +79,12 @@ fn locate_27b_gguf(test_name: &str) -> Option<std::path::PathBuf> {
             }
         }
     }
-    // `CARGO_MANIFEST_DIR` is fixed at this crate's own compile time
-    // (`<workspace-root>/crates/oxibonsai-runtime`); every workspace member
-    // lives exactly two directories below the root, so this always resolves
-    // to the workspace's own (gitignored, often-absent-in-a-worktree)
-    // `models/` directory regardless of which directory the test binary was
-    // invoked from — the same technique `oxibonsai_testkit::workspace::root`
-    // uses.
-    let workspace_models = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../models")
-        .join("Ternary-Bonsai-2-27B-PQ2_0.gguf");
-    if workspace_models.is_file() {
-        return Some(workspace_models);
+    // The test kit's lookup: `OXIBONSAI_MODELS_DIR` when it is set (already
+    // tried above, so a miss there is a miss here), else the workspace's own
+    // (gitignored, often-absent-in-a-worktree) `models/` directory.
+    if let Some(path) = oxibonsai_testkit::workspace::find_model("Ternary-Bonsai-2-27B-PQ2_0.gguf")
+    {
+        return Some(path);
     }
     assert!(
         !require_real_files,
@@ -160,6 +157,7 @@ fn real_27b_tokenize_matches_the_fork_for_all_five_golden_texts_bonsai2() {
     let Some(path) = locate_27b_gguf(TEST) else {
         return;
     };
+    let gate_start = Instant::now();
 
     let mmap = mmap_gguf_file(&path).unwrap_or_else(|e| panic!("mmap {}: {e}", path.display()));
     let gguf = GgufFile::parse(&mmap).expect("real 27B GGUF header parses");
@@ -197,7 +195,7 @@ fn real_27b_tokenize_matches_the_fork_for_all_five_golden_texts_bonsai2() {
          the literal <think> tag"
     );
 
-    record_executed(Capability::Bonsai2Models, TEST);
+    record_executed_timed(Capability::Bonsai2Models, TEST, gate_start.elapsed());
 }
 
 /// The golden fixture itself: every case must be non-empty and the
@@ -324,6 +322,7 @@ fn real_27b_chat_template_matches_the_fork_for_all_five_golden_cases_bonsai2() {
     let Some(path) = locate_27b_gguf(TEST) else {
         return;
     };
+    let gate_start = Instant::now();
 
     let mmap = mmap_gguf_file(&path).unwrap_or_else(|e| panic!("mmap {}: {e}", path.display()));
     let gguf = GgufFile::parse(&mmap).expect("real 27B GGUF header parses");
@@ -377,7 +376,7 @@ fn real_27b_chat_template_matches_the_fork_for_all_five_golden_cases_bonsai2() {
         failures.join("\n---\n")
     );
 
-    record_executed(Capability::Bonsai2Models, TEST);
+    record_executed_timed(Capability::Bonsai2Models, TEST, gate_start.elapsed());
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -500,42 +499,31 @@ fn reasoning_split_matches_the_fork_capture_for_prompt_one_bonsai2() {
 /// `src/cli/model_desc.rs`) — a bin-only crate with no `[lib]` target, so no
 /// other crate's test can import its modules directly. This exercises the
 /// real, shipped `oxibonsai info --json` command as a subprocess instead:
-/// build the binary (a no-op once it is up to date for this exact feature
-/// set — but a rebuild, not a no-op, if another test most recently built it
-/// with a different one; `crates/oxibonsai-runtime/tests/legacy_parity_tests.rs`'s
-/// CLI-CORE case builds the same binary with `--features eval`, which this
-/// call does not pass), run it against the real GGUF, and parse its own
-/// `--json` output, exactly as an operator running `oxibonsai info --model
-/// <file> --json` would see it.
-fn target_dir() -> std::path::PathBuf {
-    if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
-        if !dir.is_empty() {
-            return std::path::PathBuf::from(dir);
-        }
-    }
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target")
+/// run the CLI binary against the real GGUF and parse its own `--json`
+/// output, exactly as an operator running `oxibonsai info --model <file>
+/// --json` would see it.
+///
+/// The binary comes from [`oxibonsai_testkit::cli_bin::resolve_cli_binary`]
+/// (a pre-built `OXIBONSAI_CLI_BIN`, else one `--all-features` release
+/// build), and each case resolves it *before* it starts its timer, so the
+/// compile is never billed to the gate and never happens while a model file
+/// is being read.
+fn resolve_cli_for(test: &str) -> std::path::PathBuf {
+    resolve_cli_binary()
+        .unwrap_or_else(|e| panic!("{test}: cannot resolve the oxibonsai CLI binary: {e}"))
 }
 
-/// Run `oxibonsai info --json --model <path>` and parse its stdout.
+/// Run `<bin> info --json --model <path>` and parse its stdout.
 ///
 /// # Panics
-/// If the binary fails to build, exits non-zero, or its stdout is not valid
-/// JSON — every one of those is a genuine gate failure, not a skip (the
-/// caller has already confirmed the model file exists before calling this).
-fn run_oxibonsai_info_json(model_path: &std::path::Path) -> serde_json::Value {
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let build_status = std::process::Command::new(&cargo)
-        .args(["build", "--release", "-p", "oxibonsai-cli", "--bin", "oxibonsai"])
-        .status()
-        .expect("spawning `cargo build -p oxibonsai-cli --bin oxibonsai` should not itself fail to launch");
-    assert!(
-        build_status.success(),
-        "cargo build -p oxibonsai-cli --bin oxibonsai failed (exit {:?})",
-        build_status.code()
-    );
-
-    let bin = target_dir().join("release").join("oxibonsai");
-    let output = std::process::Command::new(&bin)
+/// If the binary exits non-zero or its stdout is not valid JSON — every one
+/// of those is a genuine gate failure, not a skip (the caller has already
+/// confirmed the model file exists before calling this).
+fn run_oxibonsai_info_json(
+    bin: &std::path::Path,
+    model_path: &std::path::Path,
+) -> serde_json::Value {
+    let output = std::process::Command::new(bin)
         .args(["info", "--json", "--model"])
         .arg(model_path)
         .output()
@@ -563,11 +551,12 @@ fn run_oxibonsai_info_json(model_path: &std::path::Path) -> serde_json::Value {
 /// 142, PTQ1_0 = 143) with a variant name that names both the model family
 /// and the quant band.
 fn assert_info_reports_hybrid_facts(
+    bin: &std::path::Path,
     path: &std::path::Path,
     expected_ggml_type_id: u64,
     expected_variant_substring: &str,
 ) {
-    let info = run_oxibonsai_info_json(path);
+    let info = run_oxibonsai_info_json(bin, path);
     let hybrid = &info["hybrid"];
     assert!(
         !hybrid.is_null(),
@@ -613,8 +602,12 @@ fn real_27b_info_reports_pq2_0_variant_and_layer_split_bonsai2() {
     let Some(path) = locate_named_27b_gguf("OXI_BONSAI2_PQ2_GGUF", TEST) else {
         return;
     };
-    assert_info_reports_hybrid_facts(&path, 142, "PQ2_0");
-    record_executed(Capability::Bonsai2Models, TEST);
+    // Resolve (and, without OXIBONSAI_CLI_BIN, build) the binary first: no
+    // model file is read yet and the gate's timer has not started.
+    let bin = resolve_cli_for(TEST);
+    let gate_start = Instant::now();
+    assert_info_reports_hybrid_facts(&bin, &path, 142, "PQ2_0");
+    record_executed_timed(Capability::Bonsai2Models, TEST, gate_start.elapsed());
 }
 
 /// G9 over the PTQ1_0 band (ggml type id 143).
@@ -625,15 +618,17 @@ fn real_27b_info_reports_ptq1_0_variant_and_layer_split_bonsai2() {
     let Some(path) = locate_named_27b_gguf("OXI_BONSAI2_PTQ1_GGUF", TEST) else {
         return;
     };
-    assert_info_reports_hybrid_facts(&path, 143, "PTQ1_0");
-    record_executed(Capability::Bonsai2Models, TEST);
+    let bin = resolve_cli_for(TEST);
+    let gate_start = Instant::now();
+    assert_info_reports_hybrid_facts(&bin, &path, 143, "PTQ1_0");
+    record_executed_timed(Capability::Bonsai2Models, TEST, gate_start.elapsed());
 }
 
 /// Locates one Bonsai 2 27B file by its own env var only (no `models/`
-/// fallback: unlike G6/G7 above, this gate spawns a `cargo build` and a
-/// fresh process per case rather than only `mmap`ping a header, so it must
-/// never run by accident just because a `models/` directory happens to be
-/// populated — the same env-only convention `hybrid_metal_gates.rs` uses).
+/// fallback: unlike G6/G7 above, this gate runs the CLI as a fresh process
+/// that maps the whole file rather than only `mmap`ping a header here, so it
+/// must never run by accident just because a `models/` directory happens to
+/// be populated — the same env-only convention `hybrid_metal_gates.rs` uses).
 /// Records a capability skip (naming `test_name`) when the file is absent.
 fn locate_named_27b_gguf(env_var: &str, test_name: &str) -> Option<std::path::PathBuf> {
     let require_real_files = std::env::var("OXI_REQUIRE_MODEL_FILES")

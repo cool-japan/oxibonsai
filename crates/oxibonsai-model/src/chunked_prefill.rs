@@ -835,9 +835,57 @@ mod tests {
     const SWEEP_MIN_SHORT_SPEEDUP: f64 = 3.0;
 
     /// M-18 acceptance: fused per-token cost on the full prompt over the
-    /// short prompt's (the attention term is the only super-linear part).
+    /// short prompt's (the attention term is the only super-linear part), for
+    /// a model of [`SWEEP_SMALL_MODEL_HIDDEN`] hidden units or more (see
+    /// [`sweep_max_growth`]). Both sides of the ratio are best-of-
+    /// [`SWEEP_RUNS`] minima. The Bonsai-8B measured 1.19-1.27x.
     #[cfg(all(feature = "metal", target_os = "macos"))]
     const SWEEP_MAX_GROWTH: f64 = 1.5;
+
+    /// The growth bound for a model below [`SWEEP_SMALL_MODEL_HIDDEN`] hidden
+    /// units. The attention term weighs more against the projections of a
+    /// small model, so its growth is higher: the Ternary-Bonsai-1.7B measured
+    /// 1.35x-1.43x over four sweeps at load averages from 6 to 163 (1.41x and
+    /// 1.43x as single runs, 1.42x and 1.35x as best of 3). Best-of-N narrows
+    /// the spread of one arm to ~2% (the prefill is GPU-bound) but not the
+    /// spread between sweeps, which moves with whatever else the GPU is doing,
+    /// so the bound is wider as well: 1.65x leaves ~15% over the worst figure
+    /// measured and stays far under the 3.2x (84 to 271 ms/token from 256 to
+    /// 4096 rows) of the row-wise kernel it guards against.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    const SWEEP_MAX_GROWTH_SMALL_MODEL: f64 = 1.65;
+
+    /// Hidden size below which a model counts as small for
+    /// [`SWEEP_MAX_GROWTH_SMALL_MODEL`] (the 1.7B has 2048, the 8B 4096).
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    const SWEEP_SMALL_MODEL_HIDDEN: usize = 4096;
+
+    /// The per-token growth bound for a model of `hidden_size`.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    fn sweep_max_growth(hidden_size: usize) -> f64 {
+        if hidden_size < SWEEP_SMALL_MODEL_HIDDEN {
+            SWEEP_MAX_GROWTH_SMALL_MODEL
+        } else {
+            SWEEP_MAX_GROWTH
+        }
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn sweep_growth_bound_follows_the_model_size() {
+        assert_eq!(sweep_max_growth(2048), SWEEP_MAX_GROWTH_SMALL_MODEL);
+        assert_eq!(sweep_max_growth(4095), SWEEP_MAX_GROWTH_SMALL_MODEL);
+        assert_eq!(sweep_max_growth(4096), SWEEP_MAX_GROWTH);
+        assert_eq!(sweep_max_growth(5120), SWEEP_MAX_GROWTH);
+        const { assert!(SWEEP_MAX_GROWTH_SMALL_MODEL > SWEEP_MAX_GROWTH) };
+    }
+
+    /// Timed runs of every distinct prefill arm (each on a fresh, warmed-up
+    /// model); every figure the sweep asserts on is the minimum of them — the
+    /// sample closest to the machine's own floor on a host whose load average
+    /// moved between 6 and 23 within one measured sweep.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    const SWEEP_RUNS: usize = 3;
 
     /// Whether `InferenceEngine::from_gguf` would skip the scirs2 weight
     /// upload for this file: an all-ternary file binds every fused Metal path
@@ -920,6 +968,44 @@ mod tests {
         (elapsed, fused_calls)
     }
 
+    /// [`sweep_timed_prefill`] [`SWEEP_RUNS`] times: the fastest run, every
+    /// run's wall time (in run order) and the number of fused batch-prefill
+    /// calls each run completed — which must be the same every run.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    fn sweep_best_prefill(
+        gguf: &oxibonsai_core::gguf::reader::GgufFile<'_>,
+        kernel: &oxibonsai_kernels::KernelDispatcher,
+        max_seq: usize,
+        prompt: &[u32],
+        chunk_tokens: usize,
+    ) -> (std::time::Duration, Vec<std::time::Duration>, u64) {
+        let mut runs = Vec::with_capacity(SWEEP_RUNS);
+        let mut fused_calls = None;
+        for run in 0..SWEEP_RUNS {
+            let (elapsed, calls) = sweep_timed_prefill(gguf, kernel, max_seq, prompt, chunk_tokens);
+            if let Some(first) = fused_calls {
+                assert_eq!(
+                    calls, first,
+                    "chunk_tokens={chunk_tokens}: run {run} completed {calls} fused calls, run 0 \
+                     completed {first}"
+                );
+            }
+            fused_calls = Some(calls);
+            runs.push(elapsed);
+        }
+        let best = runs.iter().copied().min().unwrap_or_default();
+        (best, runs, fused_calls.unwrap_or(0))
+    }
+
+    /// Wall times in milliseconds, comma-separated, for the sweep's log lines.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    fn sweep_runs_ms(runs: &[std::time::Duration]) -> String {
+        runs.iter()
+            .map(|d| format!("{:.1}", d.as_secs_f64() * 1e3))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// The same prompt decoded one token at a time through `forward` on a
     /// fresh GPU model — the sequential path the fused prefill replaces.
     /// Returns the wall time after `short` positions and after all of them.
@@ -991,8 +1077,17 @@ mod tests {
     /// asserted: on the 256-token prompt the fused prefill is at least
     /// [`SWEEP_MIN_SHORT_SPEEDUP`]x faster per token than sequential decode,
     /// the whole prompt prefills faster fused than decoded, and the fused
-    /// per-token cost grows at most [`SWEEP_MAX_GROWTH`]x from the short
+    /// per-token cost grows at most [`sweep_max_growth`]x (1.5x, 1.65x for a
+    /// model under [`SWEEP_SMALL_MODEL_HIDDEN`] hidden units) from the short
     /// prompt to the full one.
+    ///
+    /// Every fused arm (each distinct chunk size and the short prompt) runs
+    /// [`SWEEP_RUNS`] times and the figures are the minima, so a load spike
+    /// during one run does not decide the verdict; the one sequential decode
+    /// runs once (its margin over the fused arms is an order of magnitude).
+    /// The load average is printed beside every arm and with the verdict, and
+    /// repeated in every assertion message, so a failure reads against the
+    /// load it was measured under.
     ///
     /// Self-skips — recording the skip — when `OXI_MODEL` is unset.
     #[test]
@@ -1021,6 +1116,7 @@ mod tests {
         let gguf = GgufFile::parse(&mmap).expect("GgufFile::parse OXI_MODEL");
         let cfg = oxibonsai_core::config::Qwen3Config::from_metadata(&gguf.metadata)
             .expect("Qwen3Config::from_metadata OXI_MODEL");
+        let max_growth = sweep_max_growth(cfg.hidden_size);
         let vocab = u32::try_from(cfg.vocab_size).expect("vocabulary fits u32");
         assert!(vocab > 1, "a real model has a non-trivial vocabulary");
         let n_layers = cfg.num_layers as u64;
@@ -1050,29 +1146,39 @@ mod tests {
             let elapsed = match measured.iter().find(|(c, _)| *c == effective) {
                 Some(&(_, elapsed)) => elapsed,
                 None => {
-                    let (elapsed, fused_calls) =
-                        sweep_timed_prefill(&gguf, &kernel, max_seq, &prompt, effective);
+                    let (elapsed, runs, fused_calls) =
+                        sweep_best_prefill(&gguf, &kernel, max_seq, &prompt, effective);
                     assert_eq!(
                         fused_calls, calls as u64,
                         "chunk_tokens={chunk}: the fused Metal batch path did not run for every \
                          call ({fused_calls} fused calls, expected {calls})"
+                    );
+                    eprintln!(
+                        "M18_SWEEP chunk_tokens={chunk} runs_ms=[{}] load={}",
+                        sweep_runs_ms(&runs),
+                        sweep_load_average()
                     );
                     measured.push((effective, elapsed));
                     elapsed
                 }
             };
             eprintln!(
-                "M18_SWEEP chunk_tokens={chunk} calls={calls} prefill_ms={:.1} \
-                 prefill_us/token={:.1}",
+                "M18_SWEEP chunk_tokens={chunk} calls={calls} best_prefill_ms={:.1} \
+                 best_prefill_us/token={:.1}",
                 elapsed.as_secs_f64() * 1e3,
                 us_per_token(elapsed, prompt_len)
             );
         }
 
         let short = SWEEP_SHORT_PROMPT_TOKENS.min(prompt_len);
-        let (short_fused, short_calls) =
-            sweep_timed_prefill(&gguf, &kernel, max_seq, &prompt[..short], 0);
+        let (short_fused, short_runs, short_calls) =
+            sweep_best_prefill(&gguf, &kernel, max_seq, &prompt[..short], 0);
         assert_eq!(short_calls, 1, "the {short}-token fused prefill ran");
+        eprintln!(
+            "M18_SWEEP short prompt={short} runs_ms=[{}] load={}",
+            sweep_runs_ms(&short_runs),
+            sweep_load_average()
+        );
         let (seq_short, seq_total) = sweep_sequential(&gguf, &kernel, max_seq, &prompt, short);
         let fused_short_us = us_per_token(short_fused, short);
         let seq_short_us = us_per_token(seq_short, short);
@@ -1089,13 +1195,15 @@ mod tests {
             seq_short_us / fused_short_us.max(f64::MIN_POSITIVE)
         );
         let growth = fused_full_us / fused_short_us.max(f64::MIN_POSITIVE);
+        let load = sweep_load_average();
         eprintln!(
             "M18_SWEEP full prompt={prompt_len} fused_ms={:.1} fused_us/token={fused_full_us:.1} \
              sequential_ms={:.1} sequential_us/token={seq_total_us:.1} \
-             fused_growth_vs_short={growth:.2}x load={}",
+             fused_growth_vs_short={growth:.2}x (best of {SWEEP_RUNS}, bound {max_growth}x for \
+             hidden size {}) load={load}",
             fused_full.as_secs_f64() * 1e3,
             seq_total.as_secs_f64() * 1e3,
-            sweep_load_average()
+            cfg.hidden_size,
         );
         // M-18 acceptance: the fused prefill beats sequential decode by 3x per
         // token on a short prompt, beats it outright on the whole prompt, and
@@ -1103,17 +1211,19 @@ mod tests {
         assert!(
             seq_short_us >= SWEEP_MIN_SHORT_SPEEDUP * fused_short_us,
             "{short} tokens: the fused prefill ({fused_short_us:.1} us/token) must be at least \
-             {SWEEP_MIN_SHORT_SPEEDUP}x faster than sequential decode ({seq_short_us:.1} us/token)"
+             {SWEEP_MIN_SHORT_SPEEDUP}x faster than sequential decode ({seq_short_us:.1} \
+             us/token); load average {load}"
         );
         assert!(
             fused_full < seq_total,
             "{prompt_len} tokens: the fused prefill ({fused_full:?}) must beat sequential decode \
-             ({seq_total:?})"
+             ({seq_total:?}); load average {load}"
         );
         assert!(
-            growth <= SWEEP_MAX_GROWTH,
-            "the fused per-token cost grew {growth:.2}x from {short} to {prompt_len} tokens, above \
-             {SWEEP_MAX_GROWTH}x"
+            growth <= max_growth,
+            "the fused per-token cost grew {growth:.2}x (best of {SWEEP_RUNS}) from {short} to \
+             {prompt_len} tokens, above {max_growth}x (hidden size {}); load average {load}",
+            cfg.hidden_size
         );
         record_executed_timed(Capability::LegacyModels, TEST_NAME, started.elapsed());
     }

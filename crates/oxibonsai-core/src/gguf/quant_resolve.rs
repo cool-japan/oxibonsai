@@ -735,7 +735,7 @@ mod tests {
 
     /// A file that claims the legacy string but whose bytes are d-first is a
     /// hard error — silently trusting either side is exactly the silent
-    /// mis-decode this package exists to remove.
+    /// mis-decode this module exists to remove.
     #[test]
     fn sniff_contradicting_the_legacy_tag_is_a_hard_error() {
         let (tensors, data_len) = lay_out(&specs(), 32, (128, 34), true);

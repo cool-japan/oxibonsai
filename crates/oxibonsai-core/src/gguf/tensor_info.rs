@@ -292,7 +292,7 @@ pub const MAX_TENSOR_DIMS: u32 = 4;
 /// reservation) while reading a declared-length GGUF string.
 ///
 /// Shared with `metadata.rs` via [`read_string_body_chunked`] (core-gguf-20
-/// / sec-10 / wave-2.5 integration addendum, item 5): the declared `len`
+/// / sec-10): the declared `len`
 /// prefix is attacker-controlled and only bounded against
 /// [`MAX_STRING_LEN`] (256 MiB), so allocating `len` bytes up front —
 /// before confirming the reader actually has that much data left — lets a
@@ -308,8 +308,7 @@ pub(crate) const STRING_READ_CHUNK: usize = 64 * 1024;
 /// hardened copies of the identical bounded-chunk read loop — this
 /// function (formerly inlined here), `metadata.rs`'s former copy (now a
 /// thin wrapper calling this), and `reader.rs`'s `read_gguf_string_chunked`
-/// (not owned by this package; see the deviations note for the remaining
-/// call site). `pub(crate)` rather than `pub`: this is an internal
+/// (which keeps its own call site). `pub(crate)` rather than `pub`: this is an internal
 /// implementation detail, not part of this crate's public API.
 pub(crate) fn read_string_body_chunked<R: std::io::Read>(
     reader: &mut R,

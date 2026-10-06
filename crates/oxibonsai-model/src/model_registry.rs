@@ -226,7 +226,7 @@ impl ModelVariant {
     /// For `Custom`, returns the 8B configuration as a fallback.
     ///
     /// **The four `qwen35` (Bonsai 2 family) variants and the mmproj
-    /// variant are `Qwen3Config`-incompatible** (B2-09): `qwen35` is a
+    /// variant are `Qwen3Config`-incompatible**: `qwen35` is a
     /// hybrid architecture with M-RoPE sections, SSM/Gated-DeltaNet
     /// parameters and a Hadamard fold that `Qwen3Config` has no fields for,
     /// and `Bonsai227bMmproj` is a `clip` vision tower, not a causal LM at
@@ -235,9 +235,9 @@ impl ModelVariant {
     /// represent, set to the real GGUF header value — Appendix A.4) so
     /// generic scalar-config consumers (capability reporting, parameter/size
     /// estimators) get real numbers instead of a zeroed `Custom` guess (the
-    /// M-14 defect this package closes) — **it is not sufficient to
+    /// M-14 defect) — **it is not sufficient to
     /// construct a working hybrid forward pass**; that needs the real
-    /// `qwen35`-specific config B2-10 introduces. `Bonsai227bMmproj` returns
+    /// `qwen35`-specific hybrid config. `Bonsai227bMmproj` returns
     /// the 8B placeholder like `Custom`, since none of `Qwen3Config`'s
     /// fields have a sensible mapping for a ViT.
     pub fn default_config(&self) -> Qwen3Config {
@@ -819,8 +819,8 @@ mod tests {
         );
     }
 
-    /// Resolve `sample`'s tensor type exactly as a real loader must
-    /// (B2-09): ggml wire id 42 is ambiguous (see
+    /// Resolve `sample`'s tensor type exactly as a real loader must:
+    /// ggml wire id 42 is ambiguous (see
     /// `oxibonsai_core::gguf::quant_resolve`'s module doc), and
     /// `sample.tensor_type` alone is only ever the parse-time guess for it
     /// (always `TQ2_0_g128`) -- never the "never from the raw id 42" input
@@ -886,7 +886,7 @@ mod tests {
     /// even when the file *is* present.
     ///
     /// Set `OXI_REQUIRE_MODEL_FILES=1` to turn a missing file into a hard
-    /// failure instead of a skip (gatekeeper minor finding): a green run
+    /// failure instead of a skip: a green run
     /// with `models/` containing only `.gitkeep` executes zero assertions,
     /// so CI that actually mounts the real weights should be able to demand
     /// that every case really ran.
@@ -960,7 +960,7 @@ mod tests {
                 .tensors
                 .require("output.weight")
                 .unwrap_or_else(|e| panic!("{filename}: missing output.weight: {e}"));
-            // B2-09 fix: never feed `detect_qwen35_27b` the raw ambiguous
+            // Never feed `detect_qwen35_27b` the raw ambiguous
             // ggml id 42 -- resolve it first, exactly as a real loader must.
             let resolved_type = resolve_sample_type_for_detection(&gguf, filename, sample);
             let detected =
@@ -1005,7 +1005,7 @@ mod tests {
     }
 
     /// Regression (design §7.4): the three legacy (non-27B) local models
-    /// must keep resolving exactly as before this package's changes. Model
+    /// must keep resolving exactly as before. Model
     /// weights are not in the repo, so this skips per file when absent.
     ///
     /// Set `OXI_REQUIRE_MODEL_FILES=1` to turn a missing file into a hard

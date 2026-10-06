@@ -26,14 +26,14 @@
 //! sigmoid attention gate (`sigmoid_gate`), and partial RoPE with an
 //! explicit rotary width (`partial_rope`) — the existing
 //! `fused_qk_rope`/`fused_qk_norm_rope` kernels
-//! ([`crate::gpu_backend::cuda_attn_kernels`]) hardcode
+//! (`crate::gpu_backend::cuda_attn_kernels`) hardcode
 //! `half_dim = head_dim >> 1`, which is wrong for Bonsai 2's `n_rot = 64` on
 //! a 256-wide head.
 //! `PTQ1_0` (ggml 143) is **not** a device kernel here: like `PQ2_0`, its
 //! ternary codes are losslessly representable in the existing 2-bit SoA
 //! layout, so [`super::super::cuda_qwen35`] transcodes it once at weight-load
 //! time and the proven `gemv_tq2_g128_v1` kernel
-//! ([`crate::gpu_backend::cuda_kernels`]) serves it — no new GEMV kernel, no
+//! (`crate::gpu_backend::cuda_kernels`) serves it — no new GEMV kernel, no
 //! new decode table to get wrong on-device.
 //!
 //! Dispatch shapes follow the rest of this crate's CUDA kernels: one CTA per
@@ -661,7 +661,7 @@ extern "C" __global__ void gemv_pq2_g128_v1(
 // arithmetic above.
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// The scalar twin of `decode_pq2` in [`CUDA_QWEN35_GEMV_PQ2_KERNEL_SRC`]:
+/// The scalar twin of `decode_pq2` in `CUDA_QWEN35_GEMV_PQ2_KERNEL_SRC`:
 /// `00 -> -1, 01 -> 0, 10 -> +1, 11 -> +2`. Only the low two bits of `code`
 /// are used.
 #[cfg(feature = "native-cuda")]
@@ -741,7 +741,7 @@ pub fn gemv_2bit_check_weight_len(
 }
 
 /// Whether `(width, block)` are valid dispatch dimensions for
-/// [`CUDA_QWEN35_FWHT_KERNELS_SRC`]'s `fwht_signed`: `block` a power of two
+/// `CUDA_QWEN35_FWHT_KERNELS_SRC`'s `fwht_signed`: `block` a power of two
 /// no larger than `Q35_MAX_SPAN` (1024, the kernel's shared-memory budget),
 /// `width` a positive multiple of `block` (an independent transform per
 /// `block`-wide chunk, no partial chunk), and both nonzero.
@@ -758,7 +758,7 @@ pub const fn qwen35_fwht_dims_ok(width: usize, block: usize) -> bool {
     width.is_multiple_of(block)
 }
 
-/// Whether `head_k_dim` fits [`CUDA_QWEN35_GDN_KERNELS_SRC`]'s fixed-size
+/// Whether `head_k_dim` fits `CUDA_QWEN35_GDN_KERNELS_SRC`'s fixed-size
 /// per-thread `col[Q35_GDN_MAX_HK]` local array (`Q35_GDN_MAX_HK == 256`,
 /// double this checkpoint's `head_k_dim == 128` so a slightly wider future
 /// `ssm.state_size` still fits without a kernel recompile).
@@ -770,7 +770,7 @@ pub const fn qwen35_gdn_head_k_dim_ok(head_k_dim: usize) -> bool {
 }
 
 /// Whether `n_rot` is a valid rotary width for
-/// [`CUDA_QWEN35_PARTIAL_ROPE_KERNELS_SRC`]'s `partial_rope` against a head
+/// `CUDA_QWEN35_PARTIAL_ROPE_KERNELS_SRC`'s `partial_rope` against a head
 /// of `head_dim`: positive, even (the kernel pairs `i` with `i + n_rot/2`),
 /// and no wider than the head itself.
 #[cfg(feature = "native-cuda")]
@@ -779,7 +779,7 @@ pub const fn qwen35_partial_rope_dims_ok(head_dim: usize, n_rot: usize) -> bool 
     n_rot > 0 && n_rot.is_multiple_of(2) && n_rot <= head_dim
 }
 
-/// The scalar twin of [`CUDA_QWEN35_GDN_KERNELS_SRC`]'s `gdn_step` output
+/// The scalar twin of `CUDA_QWEN35_GDN_KERNELS_SRC`'s `gdn_step` output
 /// scale: `1/sqrt(head_v_dim)`. Kept as its own function (rather than
 /// inlined at the one call site in [`super::super::cuda_qwen35`]'s
 /// `launch_gdn_step`) so it has exactly one host-testable definition to pin
@@ -791,7 +791,7 @@ pub fn qwen35_gdn_out_scale(head_v_dim: usize) -> f32 {
 }
 
 /// The scalar twin of one channel's `t_len`-token loop in
-/// [`CUDA_QWEN35_CONV1D_KERNELS_SRC`]'s `conv1d_silu`: `state` is
+/// `CUDA_QWEN35_CONV1D_KERNELS_SRC`'s `conv1d_silu`: `state` is
 /// channel-major, 3 taps, oldest first (`[tap]` for one channel — the kernel
 /// indexes `state[c*3 + tap]` across channels); `x`/`out` are `[t_len]` for
 /// this one channel (the kernel indexes `x[t*channels + c]` /

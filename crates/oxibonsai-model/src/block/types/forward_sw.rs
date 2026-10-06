@@ -27,8 +27,7 @@ impl<'a> TransformerBlock<'a> {
     ///
     /// This entry point is not yet called from `BonsaiModel`'s per-token
     /// loop: `Qwen3Config` has no `sliding_window` field to route on, and
-    /// wiring that requires a change to `model/types/mod.rs` (owned by a
-    /// different package this wave — see this package's `deviations`). It
+    /// wiring that requires a change to `model/types/mod.rs`. It
     /// is kept rather than deleted because `OneBitKernel::batch_attn_phase`
     /// (`traits.rs`) names this file as its documented revival point; the
     /// parity test below (`sliding_window_with_window_ge_seq_len_matches_full_attention`

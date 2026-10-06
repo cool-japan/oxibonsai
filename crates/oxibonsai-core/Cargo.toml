@@ -1,6 +1,6 @@
 [package]
 name = "oxibonsai-core"
-description = "GGUF Q1_0_g128 loader, tensor types, and configuration for OxiBonsai"
+description = "GGUF reader/writer, sub-2-bit quantization block types (Q1_0_g128, TQ2_0_g128, PQ2_0, PTQ1_0) and model configuration for OxiBonsai"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

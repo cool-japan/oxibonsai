@@ -512,6 +512,27 @@ fn test_weight_upload_count_increments_on_new_key() {
     graph.evict_f32_weight(key).expect("cleanup evict failed");
 }
 
+/// The lines of `src` above its test module: a file's own `#[cfg(test)]`
+/// module (always last) builds throwaway command buffers of its own, so
+/// only the dispatch code above it is pinned.
+fn dispatch_lines(src: &str) -> Vec<&str> {
+    let lines: Vec<&str> = src.lines().collect();
+    let end = lines
+        .iter()
+        .position(|line| {
+            let code = line.trim_start();
+            code.starts_with("#[cfg(test)]") || code.starts_with("#[cfg(all(test")
+        })
+        .unwrap_or(lines.len());
+    lines[..end].to_vec()
+}
+
+/// Whether `line` (code, not a comment) creates a command buffer.
+fn creates_command_buffer(line: &str) -> bool {
+    let code = line.trim_start();
+    !code.starts_with("//") && code.contains(".new_command_buffer()")
+}
+
 /// Every command buffer these dispatch sources create lives inside an
 /// Objective-C autorelease pool.
 ///
@@ -522,55 +543,102 @@ fn test_weight_upload_count_increments_on_new_key() {
 /// `metal_dense_forwards_do_not_grow_the_process_footprint` measures the
 /// routes a model drives; this pins the structural half for every dispatch
 /// site here, including the ones no model route reaches (the DiT GEMM and
-/// joint-attention entry points): in the function that creates a command
-/// buffer, an `autoreleasepool(` scope opens before the buffer is created.
+/// joint-attention entry points, the VAE kernels, the FP8 / K-quant /
+/// standard-quant GEMVs and the resident-logits top-k): in the function
+/// that creates a command buffer, an `autoreleasepool(` scope opens before
+/// the buffer is created.
+///
+/// Each file must still show the sites it is known to have (a scan cut
+/// short — say by a `#[cfg(test)]` item moved above a dispatch function —
+/// fails here rather than passing on fewer sites), and every non-test
+/// source under `gpu_backend/` that creates a command buffer must be
+/// scanned, here or by `metal_vision::tests::
+/// qwen35_and_vision_command_buffers_are_created_inside_autorelease_pools`
+/// (the hybrid runner's `metal_full_layer/qwen35*.rs` and the vision
+/// tower's `metal_vision/`).
 #[test]
 fn metal_command_buffers_are_created_inside_autorelease_pools() {
-    let sources = [
-        ("metal_graph/graph.rs", include_str!("graph.rs")),
-        ("metal_graph/buffers.rs", include_str!("buffers.rs")),
-        ("metal_graph/session.rs", include_str!("session.rs")),
+    // (file, source, command-buffer sites it is known to have)
+    let sources: [(&str, &str, usize); 14] = [
+        ("metal_graph/graph.rs", include_str!("graph.rs"), 8),
+        ("metal_graph/buffers.rs", include_str!("buffers.rs"), 0),
+        ("metal_graph/session.rs", include_str!("session.rs"), 0),
+        ("metal_graph/vae.rs", include_str!("vae.rs"), 5),
         (
             "metal_prefill/functions.rs",
             include_str!("../metal_prefill/functions.rs"),
+            1,
         ),
         (
             "metal_prefill/functions_2.rs",
             include_str!("../metal_prefill/functions_2.rs"),
+            0,
         ),
         (
             "metal_prefill/hidden.rs",
             include_str!("../metal_prefill/hidden.rs"),
+            0,
         ),
         (
             "metal_prefill/attention.rs",
             include_str!("../metal_prefill/attention.rs"),
+            0,
+        ),
+        (
+            "metal_full_layer/functions_2.rs",
+            include_str!("../metal_full_layer/functions_2.rs"),
+            8,
+        ),
+        (
+            "metal_fp8_kernels.rs",
+            include_str!("../metal_fp8_kernels.rs"),
+            1,
+        ),
+        (
+            "metal_fp8_prefill.rs",
+            include_str!("../metal_fp8_prefill.rs"),
+            2,
+        ),
+        (
+            "metal_k_quant_kernels.rs",
+            include_str!("../metal_k_quant_kernels.rs"),
+            1,
+        ),
+        (
+            "metal_q_std_kernels.rs",
+            include_str!("../metal_q_std_kernels.rs"),
+            1,
+        ),
+        (
+            "resident_logits.rs",
+            include_str!("../resident_logits.rs"),
+            1,
         ),
     ];
     let is_fn_start = |line: &str| {
         let code = line.trim_start();
-        ["fn ", "pub fn ", "pub(crate) fn ", "pub(super) fn "]
-            .iter()
-            .any(|prefix| code.starts_with(prefix))
+        [
+            "fn ",
+            "pub fn ",
+            "pub(crate) fn ",
+            "pub(super) fn ",
+            "unsafe fn ",
+            "pub unsafe fn ",
+            "pub(crate) unsafe fn ",
+            "pub(super) unsafe fn ",
+        ]
+        .iter()
+        .any(|prefix| code.starts_with(prefix))
     };
     let mut sites = 0usize;
-    for (file, src) in sources {
-        let lines: Vec<&str> = src.lines().collect();
-        // A file's own test module (always last) builds throwaway command
-        // buffers of its own; only the dispatch code above it is pinned.
-        let end = lines
-            .iter()
-            .position(|line| {
-                let code = line.trim_start();
-                code.starts_with("#[cfg(test)]") || code.starts_with("#[cfg(all(test")
-            })
-            .unwrap_or(lines.len());
-        for (i, line) in lines[..end].iter().enumerate() {
-            let code = line.trim_start();
-            if code.starts_with("//") || !code.contains(".new_command_buffer()") {
+    for (file, src, known) in sources {
+        let lines = dispatch_lines(src);
+        let mut found = 0usize;
+        for (i, line) in lines.iter().enumerate() {
+            if !creates_command_buffer(line) {
                 continue;
             }
-            sites += 1;
+            found += 1;
             let fn_start = lines[..i].iter().rposition(|l| is_fn_start(l)).unwrap_or(0);
             assert!(
                 lines[fn_start..i]
@@ -580,11 +648,66 @@ fn metal_command_buffers_are_created_inside_autorelease_pools() {
                 i + 1
             );
         }
+        // `>=`: a dispatch site added later is pinned too.
+        assert!(
+            found >= known,
+            "{file}: expected at least its {known} known command-buffer sites, found {found}"
+        );
+        sites += found;
     }
-    // `>=`: the eight graph.rs dispatches and the prefill runner's
-    // micro-batch must be found (a dispatch site added later is pinned too).
     assert!(
-        sites >= 9,
-        "expected at least the 9 known command-buffer sites, found {sites}"
+        sites >= 28,
+        "expected at least the 28 known command-buffer sites, found {sites}"
+    );
+
+    // Every non-test source under `gpu_backend/` that creates a command
+    // buffer is scanned here or by the runner / tower test.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/gpu_backend");
+    let scanned_here: Vec<&str> = sources.iter().map(|(file, _, _)| *file).collect();
+    let mut pending = vec![root.clone()];
+    let mut dispatch_files = 0usize;
+    while let Some(dir) = pending.pop() {
+        let entries = std::fs::read_dir(&dir).expect("the source directory lists");
+        for entry in entries {
+            let path = entry.expect("a directory entry").path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let is_test =
+                name == "tests.rs" || name.ends_with("_tests.rs") || name.starts_with("tests_");
+            if !name.ends_with(".rs") || is_test {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("a source file reads");
+            if !dispatch_lines(&src)
+                .iter()
+                .any(|l| creates_command_buffer(l))
+            {
+                continue;
+            }
+            dispatch_files += 1;
+            let relative = path
+                .strip_prefix(&root)
+                .expect("under gpu_backend/")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let runner_or_tower = relative.starts_with("metal_full_layer/qwen35")
+                || relative.starts_with("metal_vision/");
+            assert!(
+                scanned_here.contains(&relative.as_str()) || runner_or_tower,
+                "{relative} creates command buffers but no structural pool test scans it"
+            );
+        }
+    }
+    // The nine files above with sites, `qwen35.rs`, `qwen35_rows.rs` and
+    // the tower's `encode.rs`.
+    assert!(
+        dispatch_files >= 12,
+        "expected at least the 12 known dispatch sources, found {dispatch_files}"
     );
 }

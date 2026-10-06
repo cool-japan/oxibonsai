@@ -1,7 +1,7 @@
 //! Tests for `weight_loaders.rs`.
 //!
 //! Split into its own sibling file purely for size (`weight_loaders.rs`
-//! was 2050/2000 lines with the B2-09 additions) -- mirrors the
+//! was 2050/2000 lines with the PrismML additions) -- mirrors the
 //! `weight_loaders/wiring.rs` split already in this directory and the
 //! `model/types/mod.rs` + `model/types/tests.rs` pattern elsewhere in this
 //! crate. A child module of `weight_loaders` (declared `#[cfg(test)] mod
@@ -106,7 +106,7 @@ fn load_f32_tensor_unsupported_type_still_errors_clearly() {
     // trip), so this test's job is narrower: confirm the happy path for
     // the PrismML `TQ2_0_g128` extension (id 42, qs-first/34B) — which
     // `dequant_any` DOES support, alongside mainline `TQ2_0` (id 35),
-    // which `load_f32_tensor` did not handle before this package but now
+    // which `load_f32_tensor` did not handle before but now
     // does too — still round-trips correctly alongside the new arms.
     let tensors = vec![WeightTensor::new(
         "blk.0.attn_q.weight",
@@ -123,7 +123,7 @@ fn load_f32_tensor_unsupported_type_still_errors_clearly() {
     assert_eq!(loaded.len(), 256);
 }
 
-// ── B2-05 acceptance criterion: ssm_a must be rejected at load if any
+// ── ssm_a must be rejected at load if any
 // element is positive (or NaN), not silently logged ────────────────────
 
 #[test]
@@ -475,8 +475,8 @@ fn tiny_qwen3_config() -> Qwen3Config {
     }
 }
 
-/// Regression for M-10: before this package, `load_transformer_block`'s
-/// dispatch was a boolean ladder ending in a bare `else` that decoded
+/// Regression for M-10: `load_transformer_block`'s
+/// dispatch used to be a boolean ladder ending in a bare `else` that decoded
 /// ANY unmatched quantization type as `Q1_0_g128` with no error. Feeding
 /// it an `attn_q.weight` of a type with no `Linear*` wrapper — BF16,
 /// executable for `dequant_any` but not wired into any transformer block
@@ -515,7 +515,7 @@ fn load_transformer_block_rejects_decodable_but_unwired_type() {
 /// Build a full 1-layer GGUF fixture (all 7 weight tensors + 4 norms) of
 /// a single quant type at a 128×128 shape (one PQ2_0/PTQ1_0 block-width,
 /// or two Q2_0G64 block-widths, per row) — big enough to actually
-/// exercise `load_transformer_block`'s new B2-09 arms end to end,
+/// exercise `load_transformer_block`'s PrismML arms end to end,
 /// unlike `one_layer_fixture` (which only ever writes `attn_q`, enough
 /// for the type-dispatch tests above but not a full block).
 fn full_layer_fixture_uniform(
@@ -593,7 +593,7 @@ fn square_128_qwen3_config() -> Qwen3Config {
     }
 }
 
-/// B2-09 acceptance: a `PQ2_0`-quantized transformer block now loads
+/// A `PQ2_0`-quantized transformer block loads
 /// end to end through `load_transformer_block` (it used to hit the "no
 /// Linear* wrapper" `Internal` error moved off this arm by this
 /// package).
@@ -726,7 +726,7 @@ fn one_ternary_block(plant_plus_two: bool) -> Vec<u8> {
 }
 
 /// [`one_layer_fixture`], specialised for a single-block `TQ2_0_g128`
-/// `attn_q.weight` (the CQ-14 tests below; B2-09).
+/// `attn_q.weight` (the CQ-14 tests below).
 ///
 /// Two differences from `one_layer_fixture`, both needed only because a
 /// single 34-byte block is small enough that the id-42 resolver's own
@@ -846,7 +846,7 @@ fn prism_two_bit_layouts_are_exempt_from_the_screen() {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// B2-09 verifier fix: a genuinely inconclusive id-42 resolution falls
+// A genuinely inconclusive id-42 resolution falls
 // back to the legacy reading instead of erroring the whole load
 // ══════════════════════════════════════════════════════════════════════
 

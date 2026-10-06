@@ -1463,7 +1463,7 @@ mod tests {
 
     #[test]
     fn q3k_slice_from_bytes() {
-        // wave-2.5 addendum (6) (Miri, pre-existing): borrow directly from a
+        // (Miri, pre-existing): borrow directly from a
         // real `BlockQ3K`'s own (compiler-guaranteed-aligned) stack address,
         // rather than reinterpreting a `Vec<u8>`'s buffer — `align_of::<u8>()
         // == 1`, so nothing guarantees a `Vec<u8>` allocation is aligned to
@@ -1473,7 +1473,7 @@ mod tests {
         // alignment guard on a perfectly legitimate all-zero block). Same
         // technique as `tensor.rs::one_bit_tensor_dequantize`.
         //
-        // `f16::from_bits(0)`, not `f16::from_f32(0.0)` (verifier, wave 3):
+        // `f16::from_bits(0)`, not `f16::from_f32(0.0)`:
         // re-running this fix under Miri surfaced a second, unrelated wall
         // — `half`'s aarch64 `f32_to_f16` path is `asm!`-based (hardware
         // `fcvt`), which Miri's interpreter cannot execute at all
@@ -1577,7 +1577,7 @@ mod tests {
 
     #[test]
     fn q8k_slice_from_bytes() {
-        // wave-2.5 addendum (6) (Miri, pre-existing): see
+        // (Miri, pre-existing): see
         // `q3k_slice_from_bytes`'s doc comment — same borrow-from-a-real-
         // aligned-value fix, not a `Vec<u8>` reinterpreted as bytes.
         let block = BlockQ8K {

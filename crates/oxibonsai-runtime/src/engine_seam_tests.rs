@@ -139,6 +139,10 @@ fn every_engine_error_round_trips_its_code_through_runtime_error() {
         },
         EngineError::RecurrentStateNotSnapshotable { name: "x".into() },
         EngineError::SnapshotMismatch { detail: "d".into() },
+        EngineError::NotAHybridModel {
+            operation: "op",
+            architecture: "qwen3".into(),
+        },
     ];
     assert_eq!(errors.len(), EngineError::ALL_CODES.len());
     for error in errors {
@@ -1413,6 +1417,139 @@ fn snapshot_misuse_answers_the_same_codes_on_both_executors() {
     }
 }
 
+/// A rollback to an earlier snapshot followed by other text rewrites the
+/// positions under every later snapshot, even though no image changes an
+/// M-RoPE offset: restoring one of those would put a recurrent state back
+/// over a KV cache that holds other tokens, so both executors refuse it and
+/// change nothing. Snapshots the rollbacks never went below — one taken
+/// after the rewrite, restored across a later rollback above it, and the
+/// one rolled back to — keep restoring exactly.
+#[test]
+fn a_restore_below_a_later_rollback_is_refused_on_both_executors() {
+    let bytes = synthetic_qwen35_gguf();
+    let gguf = GgufFile::parse(&bytes).expect("fixture parses");
+    for backend in hybrid_backends() {
+        let mut engine = hybrid_engine(&gguf, backend);
+        let k = PROMPT.len();
+        engine.prefill_from_pos(&PROMPT, 0).expect("prefill");
+        let early = engine.snapshot_sequence().expect("early snapshot");
+        let original: Vec<u32> = (20..28).collect();
+        engine.prefill_from_pos(&original, k).expect("text");
+        let late = engine.snapshot_sequence().expect("late snapshot");
+        assert_eq!(late.rope_delta(), 0, "{backend}: text only");
+
+        // Roll back to `early` and write other text past `late`'s position.
+        engine.restore_sequence(&early).expect("restore early");
+        let other: Vec<u32> = (30..40).collect();
+        engine.prefill_from_pos(&other, k).expect("other text");
+        let position = engine.sequence_position();
+        assert!(position > late.position(), "{backend}");
+        let err = engine
+            .restore_sequence(&late)
+            .expect_err("positions below the late snapshot were rewritten");
+        assert_eq!(
+            engine_error_code(&err),
+            Some("SNAPSHOT_MISMATCH"),
+            "{backend}: {err}"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains(&format!("back to position {k}")),
+            "{backend}: {text}"
+        );
+        assert!(text.contains("were rewritten"), "{backend}: {text}");
+        assert_eq!(
+            engine.sequence_position(),
+            position,
+            "{backend}: a refused restore changes nothing"
+        );
+
+        // A snapshot taken after the rewrite restores exactly, also across
+        // a later rollback that stays above it.
+        let fresh = engine.snapshot_sequence().expect("fresh snapshot");
+        let fresh_next = engine.decode_step(3, position).expect("decode");
+        engine.decode_step(4, position + 1).expect("decode");
+        let later = engine.snapshot_sequence().expect("later snapshot");
+        engine.decode_step(5, position + 2).expect("decode");
+        engine.restore_sequence(&later).expect("restore later");
+        engine.decode_step(6, position + 2).expect("decode");
+        engine
+            .restore_sequence(&fresh)
+            .expect("no rollback went below the fresh snapshot");
+        assert_eq!(engine.sequence_position(), position, "{backend}");
+        let replayed = engine.decode_step(3, position).expect("decode");
+        assert_eq!(bits(&replayed), bits(&fresh_next), "{backend}");
+
+        // The snapshot the first rollback went to was never rewritten
+        // below its position: it restores as often as a caller likes.
+        engine.restore_sequence(&early).expect("early again");
+        engine
+            .prefill_from_pos(&original, k)
+            .expect("the original text");
+        engine.restore_sequence(&early).expect("early once more");
+        assert_eq!(engine.sequence_position(), k, "{backend}");
+        let still = engine
+            .restore_sequence(&late)
+            .expect_err("still rewritten below the late snapshot");
+        assert_eq!(engine_error_code(&still), Some("SNAPSHOT_MISMATCH"));
+    }
+}
+
+/// The rollback log answers "the lowest position rolled back to since this
+/// mark" exactly as the full history does, for every mark, keeping at most
+/// one entry per distinct position; another sequence's rollbacks are never
+/// seen and a rollback of a new sequence starts a fresh log.
+#[test]
+fn the_rewind_log_answers_like_the_full_history() {
+    const SEQUENCE: u64 = 5;
+    const POSITIONS: usize = 48;
+    let mut log = RewindLog::default();
+    let mut history: Vec<usize> = Vec::new();
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    for step in 0..300 {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let position = (state >> 33) as usize % POSITIONS;
+        assert_eq!(log.mark(SEQUENCE), history.len() as u64, "step {step}");
+        log.record(SEQUENCE, position);
+        history.push(position);
+        for mark in 0..=history.len() {
+            assert_eq!(
+                log.lowest_since(SEQUENCE, mark as u64),
+                history[mark..].iter().copied().min(),
+                "step {step}, mark {mark}"
+            );
+        }
+        assert!(log.floors.len() <= POSITIONS, "step {step}");
+        assert!(
+            log.floors
+                .windows(2)
+                .all(|w| w[0].0 < w[1].0 && w[0].1 < w[1].1),
+            "step {step}: strictly increasing indices and positions"
+        );
+    }
+    // Rollbacks to ever higher positions keep one entry each.
+    let mut rising = RewindLog::default();
+    for position in 0..100 {
+        rising.record(SEQUENCE, position);
+    }
+    assert_eq!(rising.floors.len(), 100);
+    assert_eq!(rising.lowest_since(SEQUENCE, 40), Some(40));
+    rising.record(SEQUENCE, 10);
+    assert_eq!(rising.floors.len(), 11, "every entry at or above 10 popped");
+    assert_eq!(rising.lowest_since(SEQUENCE, 40), Some(10));
+    assert_eq!(rising.lowest_since(SEQUENCE, 101), None);
+
+    // Another sequence sees nothing, and its first rollback starts afresh.
+    assert_eq!(log.lowest_since(SEQUENCE + 1, 0), None);
+    assert_eq!(log.mark(SEQUENCE + 1), 0);
+    log.record(SEQUENCE + 1, 9);
+    assert_eq!(log.lowest_since(SEQUENCE + 1, 0), Some(9));
+    assert_eq!(log.mark(SEQUENCE + 1), 1);
+    assert_eq!(log.lowest_since(SEQUENCE, 0), None);
+}
+
 #[test]
 fn dense_snapshot_restore_moves_the_cursor_and_rejects_the_other_kind() {
     let bytes = synthetic_qwen35_gguf();
@@ -1450,6 +1587,50 @@ fn dense_snapshot_restore_moves_the_cursor_and_rejects_the_other_kind() {
         .restore_sequence(&hybrid_snapshot)
         .expect_err("a foreign snapshot must be refused");
     assert_eq!(engine_error_code(&wrong), Some("SNAPSHOT_MISMATCH"));
+}
+
+/// A dense engine's restore logs its rollbacks too: a snapshot whose
+/// positions a later restore rolled back below (and the sequence then
+/// rewrote) is refused, changing nothing, while the snapshot rolled back to
+/// keeps restoring.
+#[test]
+fn a_dense_restore_below_a_later_rollback_is_refused() {
+    let config = oxibonsai_core::config::Qwen3Config {
+        hidden_size: 128,
+        intermediate_size: 256,
+        num_layers: 2,
+        num_attention_heads: 4,
+        num_kv_heads: 2,
+        head_dim: 32,
+        vocab_size: 64,
+        max_context_length: 64,
+        ..oxibonsai_core::config::Qwen3Config::tiny_test()
+    };
+    let model = BonsaiModel::new_for_testing_with_blocks(config);
+    let mut dense =
+        InferenceEngine::from_model_with_tier(model, KernelTier::Reference, greedy_params(), 42);
+    dense.prefill_from_pos(&[1, 2, 3], 0).expect("prefill");
+    let early = dense.snapshot_sequence().expect("early snapshot");
+    dense.decode_step(4, 3).expect("decode");
+    dense.decode_step(5, 4).expect("decode");
+    let late = dense.snapshot_sequence().expect("late snapshot");
+    assert_eq!(late.position(), 5);
+    dense.restore_sequence(&early).expect("restore early");
+    for (pos, token) in (3..6).zip([7u32, 8, 9]) {
+        dense.decode_step(token, pos).expect("rewrite");
+    }
+    let position = dense.sequence_position();
+    assert!(position > late.position());
+    let err = dense
+        .restore_sequence(&late)
+        .expect_err("positions below the late snapshot were rewritten");
+    assert_eq!(engine_error_code(&err), Some("SNAPSHOT_MISMATCH"), "{err}");
+    assert!(err.to_string().contains("back to position 3"), "{err}");
+    assert_eq!(dense.sequence_position(), position, "nothing changed");
+    dense
+        .restore_sequence(&early)
+        .expect("early still restores");
+    assert_eq!(dense.sequence_position(), 3);
 }
 
 #[test]

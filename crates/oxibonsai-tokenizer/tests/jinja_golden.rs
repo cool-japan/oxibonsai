@@ -1,4 +1,4 @@
-//! Golden and differential tests for the Jinja subset engine (B2-07).
+//! Golden and differential tests for the Jinja subset engine.
 //!
 //! Three independent sources of truth:
 //!
@@ -16,7 +16,7 @@
 //!    `raise_exception` path.
 //! 3. The negative tests below assert that anything outside the supported
 //!    subset is a hard error with a source position — the actual finding
-//!    behind this package (TOK-07: the old engine rendered garbage instead).
+//!    behind this engine (TOK-07: the old engine rendered garbage instead).
 
 use oxibonsai_tokenizer::jinja::{JinjaError, JinjaOptions, JinjaTemplate, Value, ValueMap};
 use proptest::prelude::*;
@@ -451,7 +451,7 @@ fn jinja_raise_exception_surfaces_as_template_raise() {
         "every raise_exception path in the template must be covered"
     );
 
-    // And the standalone global, including the error accessor B2-13 will use.
+    // And the standalone global, including the error accessor the chat template uses.
     let err = JinjaTemplate::compile("{{ raise_exception('boom') }}")
         .expect("compile")
         .render(&Value::Undefined)
@@ -467,7 +467,7 @@ fn jinja_raise_exception_surfaces_as_template_raise() {
 /// reference runtime emits `{"name": …, "description": …}`.  Golden case 5
 /// would change byte for byte.  The order is destroyed at parse time, so it
 /// cannot be recovered afterwards — this test pins the working path and makes
-/// the trap executable for B2-13.
+/// the trap executable.
 #[test]
 fn jinja_tool_key_order_requires_from_json_str() {
     const TOOL: &str = r#"{"name": "get_weather", "description": "Get weather"}"#;
@@ -495,7 +495,7 @@ fn jinja_tool_key_order_requires_from_json_str() {
 /// The template does `tool_call.arguments|items`, so `arguments` must already
 /// be a mapping.  OpenAI's wire format delivers it as a JSON *string*; that
 /// path errors (exactly as Python Jinja does) instead of rendering nonsense,
-/// so B2-13 has to parse it into an object first.
+/// so a caller has to parse it into an object first.
 #[test]
 fn jinja_tool_arguments_must_be_a_mapping() {
     let template =

@@ -111,7 +111,7 @@ fn try_add_accepts_well_formed_question() {
 fn add_keeps_its_original_infallible_signature() {
     // `add` must remain `fn(&mut self, MultipleChoiceQuestion)` with no
     // `Result` — changing that would break every other call site in this
-    // crate that is not owned by this package (tests, hellaswag.rs,
+    // crate (tests, hellaswag.rs,
     // winogrande.rs, ...), since an ignored `Result` trips
     // `unused_must_use` under `-D warnings`. This test is a compile-time
     // guarantee: it only builds if `add` still returns `()`.

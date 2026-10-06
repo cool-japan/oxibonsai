@@ -319,7 +319,7 @@ impl<'a> BonsaiModel<'a> {
             )
             .into());
         }
-        // Lazy host KV (REQUIRED #4 (4)): make every prompt position resident
+        // Lazy host KV: make every prompt position resident
         // before the first GEMM, so a refused allocation fails the prefill
         // cleanly instead of part-way through a layer.
         self.kv_cache.try_ensure_capacity(pos_start + batch_size)?;

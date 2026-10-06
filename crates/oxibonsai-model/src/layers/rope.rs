@@ -148,8 +148,8 @@ impl RopeTable {
                 return Err(RopeScalingError::InvalidScaleFactor(*factor));
             }
             // Ditto for the `InvalidHeadDim` check every other strategy
-            // gets via `compute_rope_frequencies` (verifier finding,
-            // minor): this branch bypasses that function entirely, so
+            // gets via `compute_rope_frequencies`): this branch bypasses that
+            // function entirely, so
             // without this it would hand `head_dim == 0` or an odd
             // `head_dim` straight to `yarn_inv_freq_f64`, which does not
             // itself panic but silently produces a degenerate table
@@ -267,7 +267,7 @@ impl RopeTable {
     ///   (M-27) — a real bounds check instead of a `debug_assert!` that would
     ///   otherwise let a safe-but-uncontrolled slice-index panic through in
     ///   release. It is deliberately not
-    ///   [`ModelError::SequenceTooLong`](crate::error::ModelError::SequenceTooLong):
+    ///   [`ModelError::SequenceTooLong`]:
     ///   that is the recoverable "shorten the prompt" condition, whereas a
     ///   RoPE-table bound violation means the table and the KV cache were
     ///   built with inconsistent `max_seq_len` values.
@@ -304,16 +304,14 @@ impl RopeTable {
     }
 
     /// Checked version of [`Self::cos_at`], returning
-    /// [`ModelError::PositionOutOfRange`] instead of panicking (M-27
-    /// residue, wave-1.5 addendum).
+    /// [`ModelError::PositionOutOfRange`] instead of panicking (M-27).
     ///
     /// [`Self::cos_at`] itself is left panicking on purpose: switching its
     /// return type would require updating every one of its ~40 call sites
     /// (`model/types/forward_metal.rs`, `model/types/forward_cuda/*.rs`,
     /// `forward_cuda_fp8.rs`, `forward_metal_fp8.rs`,
-    /// `block/types/helpers.rs`), none of which are in this package's
-    /// `owned_files` — see the package's recorded deviations for the exact
-    /// list. This checked variant exists so a future migration is possible
+    /// `block/types/helpers.rs`). This checked variant exists so a future
+    /// migration is possible
     /// without ever needing a breaking signature change to the unchecked
     /// pair.
     pub fn cos_at_checked(&self, pos: usize) -> ModelResult<&[f32]> {
@@ -344,14 +342,13 @@ impl RopeTable {
     /// Panics via out-of-bounds slice indexing if `pos >= max_seq_len()`,
     /// unlike [`Self::apply`] (M-27), which returns
     /// `Err(ModelError::PositionOutOfRange)`-equivalent instead of panicking.
-    /// Guarding this the same way by changing this method's signature is out
-    /// of scope for this package: its ~40 call sites
+    /// Guarding this the same way would change this method's signature across
+    /// its ~40 call sites
     /// (`model/types/forward_metal.rs`, `forward_cuda*.rs`,
-    /// `block/types/helpers.rs`) are all outside its `owned_files`. A
+    /// `block/types/helpers.rs`). A
     /// non-breaking, fully-guarded alternative, [`Self::cos_at_checked`], is
-    /// available now for any caller (existing or new) able to handle a
-    /// `Result` — see the package's recorded deviations for the migration
-    /// this method's own call sites still need.
+    /// available for any caller (existing or new) able to handle a
+    /// `Result`; those call sites still use this panicking form.
     pub fn cos_at(&self, pos: usize) -> &[f32] {
         &self.cos[pos * self.half_dim..(pos + 1) * self.half_dim]
     }
@@ -461,7 +458,7 @@ mod tests {
             .expect("the last valid position must still succeed");
     }
 
-    // ── cos_at_checked / sin_at_checked (wave-1.5 addendum, M-27 residue) ────
+    // ── cos_at_checked / sin_at_checked (M-27) ─────────────────────
 
     #[test]
     fn cos_at_checked_accepts_in_range_position() {
@@ -621,7 +618,7 @@ mod tests {
     }
 
     /// Pins the `InvalidHeadDim` check the `Yarn` branch of
-    /// `new_with_scaling` now performs directly (verifier finding, minor):
+    /// `new_with_scaling` now performs directly (a minor finding):
     /// every other strategy gets this check via `compute_rope_frequencies`,
     /// but `Yarn` bypasses that function (see `new_with_scaling`'s doc
     /// comment), so without a duplicate check here it would silently hand
@@ -734,7 +731,7 @@ mod tests {
     /// `rope_yarn` / HF `transformers`' `_compute_yarn_parameters`) written
     /// directly against the position/cos/sin definitions rather than by
     /// calling any function under test — there is no external golden file
-    /// for this model in the scratchpad, so this is the strongest
+    /// for this model, so this is the strongest
     /// correctness check available without one.  The ramp-direction
     /// boundary check ([`yarn_ramp_direction_boundary_frequencies`] in
     /// `rope_scaling.rs`) is the fully-independent complement: it validates
@@ -792,15 +789,9 @@ mod tests {
     /// assert it differs from the unscaled table."
     ///
     /// The *model-level* half — an actual greedy decode of
-    /// `models/Bonsai-8B.gguf` — needs `RopeTable::new_with_scaling` wired
-    /// into `BonsaiModel::from_gguf_with_embd`
-    /// (`crate::model::types::mod::from_gguf_with_embd`, currently still
-    /// calling plain `RopeTable::new` at that call site) plus a real GGUF
-    /// file, neither of which this package can supply from within its own
-    /// `owned_files` (`model/types/mod.rs` is MODEL-CORE-FWD's, and this
-    /// worktree's `models/` is empty) — see the package's recorded
-    /// deviations for the exact required call-site change. This test
-    /// proves the part this package *does* own — the table itself — is not
+    /// `models/Bonsai-8B.gguf` — needs a real GGUF file and is exercised by
+    /// the real-model parity tests, not here. This test
+    /// proves the table itself is not
     /// a no-op: built at the real Bonsai-8B shape
     /// (`head_dim=128, rope_freq_base=1e6, original_context_length=16384,
     /// factor=4.0, context_length=65536`), it diverges materially from the
@@ -873,8 +864,8 @@ mod tests {
             (head_dim as f64 * (original_max_position as f64 / (num_rotations * two_pi)).ln())
                 / (2.0 * base.ln())
         };
-        // Matches the fix in `rope_scaling.rs::yarn_inv_freq_f64` (verifier
-        // finding B3): `high` clamps to `head_dim - 1` (ggml/HF both clamp
+        // Matches the fix in `rope_scaling.rs::yarn_inv_freq_f64` (finding
+        // B3): `high` clamps to `head_dim - 1` (ggml/HF both clamp
         // against `head_dim`, not `half_dim`), and `low` has no upper
         // clamp at all. See that function's doc comment for the exact
         // ggml/HF citations. Keeping this test-only reference in sync with

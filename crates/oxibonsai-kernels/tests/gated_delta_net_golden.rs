@@ -1,4 +1,4 @@
-//! Gated DeltaNet (B2-05) — golden, parity and contract tests.
+//! Gated DeltaNet — golden, parity and contract tests.
 //!
 //! What is checked here, in the order the package's acceptance list names it:
 //!
@@ -19,7 +19,7 @@
 //!
 //! # How the golden was produced (regeneration recipe)
 //!
-//! `GOLDEN_OUT` / `GOLDEN_STATE` come from `scratchpad/gdn_golden_gen.cpp`, a
+//! `GOLDEN_OUT` / `GOLDEN_STATE` come from a `gdn_golden_gen.cpp` harness, a
 //! literal transliteration of the PrismML llama.cpp fork's CPU kernel
 //! `fork/models/gated_delta_net_cpu.cpp.txt:108-160` (the per-token body of
 //! `ggml_compute_forward_gated_delta_net_one_chunk`) with ggml's three scalar
@@ -286,7 +286,7 @@ impl Inputs {
     }
 }
 
-/// The exact input construction of `scratchpad/gdn_golden_gen.cpp`.
+/// The exact input construction of the `gdn_golden_gen.cpp` harness.
 fn golden_inputs() -> Inputs {
     let mut rng = SplitMix64::new(GOLDEN_SEED);
     let mut state = vec![0.0f32; G_NV * G_HV * G_HK];

@@ -17,16 +17,159 @@
 //! (with its KV window, every limit on it, the residents it shares memory
 //! with and the device bytes it allocates at load) when one serves the
 //! model on this host, else the CPU tier and why — never the dense model's
-//! `auto_detect` tier.
+//! `auto_detect` tier — and the prefill chunk that executor would run in.
+//!
+//! With `--mmproj` (a Bonsai 2 vision projector) the report is the one `run`
+//! / `chat` / `serve --mmproj` act on: the KV window leaves room for the
+//! Metal tower, the tower an engine would build is the one of the executor
+//! `--backend auto` resolves to, both towers' resident bytes are printed,
+//! and so are the process's Metal sessions against their ceiling. A
+//! projector file given as the model itself (`clip`) gets its towers'
+//! footprints too.
 
 use oxibonsai_core::gguf::reader::GgufFile;
 use oxibonsai_core::gguf::tensor_info::keys;
 
 use super::bonsai2;
+use super::image_fetch;
 use super::model_desc;
 
-pub(crate) fn run(model: Option<String>, json: bool) -> anyhow::Result<()> {
+/// What `oxibonsai info` was asked to describe.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct InfoRequest {
+    /// `--model`, else `OXI_MODEL`.
+    pub(crate) model: Option<String>,
+    /// `--json`.
+    pub(crate) json: bool,
+    /// `--mmproj` / `--image-max-tokens` (never an image).
+    pub(crate) vision: bonsai2::VisionRequest,
+    /// `--prefill-chunk`.
+    pub(crate) prefill_chunk: Option<usize>,
+}
+
+/// The towers a vision projector would put beside an engine, as `info`
+/// reports them.
+#[derive(Debug, Clone)]
+struct VisionInfo {
+    /// The projector file.
+    path: String,
+    /// What each tower keeps resident, read from the header.
+    footprints: oxibonsai_runtime::vision_prefill::VisionFootprints,
+    /// The tower an engine would build: the one of the executor `--backend
+    /// auto` resolves to (`"metal"` or `"cpu"`).
+    tower: &'static str,
+    /// The model's image tokens against the ids the splice uses: `None`
+    /// when they match, else the refusal `run` would print.
+    image_tokens_refusal: Option<String>,
+    /// What `run` / `chat` / `serve` do with a remote image reference under
+    /// the environment alone (`info` takes no image-source flag), or the
+    /// error those commands would refuse to start with.
+    remote_images: Result<image_fetch::RemoteFetchReport, String>,
+}
+
+/// [`VisionInfo::remote_images`]: the environment's opt-in, deadline and
+/// allowlist (`OXI_ALLOW_IMAGE_URL_FETCH`, `OXI_IMAGE_URL_TIMEOUT_MS`,
+/// `OXI_IMAGE_URL_ALLOW_HOSTS`), as a command without image-source flags
+/// would resolve them.
+fn remote_images_report() -> Result<image_fetch::RemoteFetchReport, String> {
+    bonsai2::ImageSourceFlags::default()
+        .remote_fetch_report()
+        .map_err(|e| e.to_string())
+}
+
+/// The JSON form of [`VisionInfo::remote_images`].
+fn remote_images_json(
+    report: &Result<image_fetch::RemoteFetchReport, String>,
+) -> serde_json::Value {
+    match report {
+        Ok(image_fetch::RemoteFetchReport::Disabled) => serde_json::json!({ "enabled": false }),
+        Ok(image_fetch::RemoteFetchReport::Enabled { from, settings }) => serde_json::json!({
+            "enabled": true,
+            "opted_in_by": from.label(),
+            "timeout_ms": settings.timeout_ms(),
+            "allowlist": settings
+                .allowlist
+                .entries()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+        }),
+        Err(error) => serde_json::json!({ "error": error }),
+    }
+}
+
+/// What `path` (a projector GGUF) keeps resident on each executor for
+/// `image_max_tokens`-token images.
+fn projector_footprints(
+    path: &str,
+    image_max_tokens: usize,
+) -> anyhow::Result<oxibonsai_runtime::vision_prefill::VisionFootprints> {
+    let mmap = oxibonsai_core::gguf::reader::mmap_gguf_file(std::path::Path::new(path))
+        .map_err(|e| anyhow::anyhow!("--mmproj {path}: cannot open: {e}"))?;
+    let gguf = GgufFile::parse(&mmap)
+        .map_err(|e| anyhow::anyhow!("--mmproj {path}: not a valid GGUF: {e}"))?;
+    oxibonsai_runtime::vision_prefill::VisionService::footprints(&gguf, image_max_tokens)
+        .map_err(|e| anyhow::anyhow!("--mmproj {path}: {e}"))
+}
+
+/// The tower lines of the text report.
+fn vision_lines(footprints: &oxibonsai_runtime::vision_prefill::VisionFootprints) -> Vec<String> {
+    let mut lines = vec![format!(
+        "Vision tower: {} blocks; CPU tower {} resident (f32 weights)",
+        footprints.blocks,
+        bonsai2::gib(footprints.cpu_bytes)
+    )];
+    lines.push(match footprints.metal_bytes {
+        Some(bytes) => format!(
+            "Vision tower: Metal tower {} resident (weights as stored, {}-token images)",
+            bonsai2::gib(bytes),
+            footprints.image_max_tokens
+        ),
+        None => "Vision tower: no Metal tower in this build (the CPU tower serves every engine)"
+            .to_string(),
+    });
+    lines
+}
+
+/// The JSON form of a projector's towers.
+fn vision_json(
+    footprints: &oxibonsai_runtime::vision_prefill::VisionFootprints,
+) -> serde_json::Value {
+    serde_json::json!({
+        "blocks": footprints.blocks,
+        "cpu_resident_bytes": footprints.cpu_bytes,
+        "metal_resident_bytes": footprints.metal_bytes,
+        "image_max_tokens": footprints.image_max_tokens,
+    })
+}
+
+/// The Metal session line: what an engine (and a vision tower) opens against
+/// the process's ceiling; `None` on a build without the Metal backend.
+fn sessions_json(with_tower: bool) -> serde_json::Value {
+    match oxibonsai_runtime::engine_hybrid_gpu::MetalSessionReport::current() {
+        Some(report) => serde_json::json!({
+            "live": report.live,
+            "max": report.max,
+            "per_engine": oxibonsai_runtime::engine_hybrid_gpu::MetalSessionReport::sessions_for(
+                with_tower
+            ),
+            "enforced": false,
+        }),
+        None => serde_json::Value::Null,
+    }
+}
+
+pub(crate) fn run(request: InfoRequest) -> anyhow::Result<()> {
+    let InfoRequest {
+        model,
+        json,
+        vision,
+        prefill_chunk,
+    } = request;
     let model = resolve_model_path(model)?;
+    // The projector flags are checked before the model is read: a file that
+    // is not a `clip` projector, or a budget out of range, fails fast.
+    vision.validate(true, &bonsai2::ImageSourceFlags::default())?;
 
     let mmap = oxibonsai_core::gguf::reader::mmap_gguf_file(std::path::Path::new(&model))
         .map_err(|e| anyhow::anyhow!("failed to open model '{model}': {e}"))?;
@@ -135,7 +278,47 @@ pub(crate) fn run(model: Option<String>, json: bool) -> anyhow::Result<()> {
     // ternary/2-bit tensor layout the older classifier does not
     // special-case would otherwise fall through to.
     let has_hadamard = gguf.metadata.get("prism.hadamard.version").is_some();
-    let hybrid = bonsai2::is_qwen35_hybrid(&arch).then(|| model_desc::hybrid_report(&gguf));
+    // The options `run` would build the engine with: the Metal tower's
+    // resident bytes (a projector for anything but a `qwen35` model is
+    // refused here, typed, exactly as `run` refuses it) and the prefill
+    // chunk the runner's calls are sized for.
+    let hybrid_options = vision.hybrid_load_options(&arch, prefill_chunk)?;
+    let hybrid = bonsai2::is_qwen35_hybrid(&arch).then(|| {
+        let _scope = oxibonsai_runtime::engine_hybrid_gpu::HybridLoadScope::enter(hybrid_options);
+        model_desc::hybrid_report(&gguf)
+    });
+    let budget = vision.effective_image_max_tokens();
+    // A projector beside the model: the tower of the executor the plan
+    // resolves to (the Metal tower beside the Metal hybrid runner).
+    let vision_info = match &vision.mmproj {
+        Some(path) => {
+            let tower = match &hybrid {
+                Some(Ok(report)) => match &report.backend_plan {
+                    Some(plan) => plan.backend().as_str(),
+                    None => oxibonsai_runtime::engine_hybrid_gpu::HybridBackend::Cpu.as_str(),
+                },
+                _ => oxibonsai_runtime::engine_hybrid_gpu::HybridBackend::Cpu.as_str(),
+            };
+            Some(VisionInfo {
+                path: path.clone(),
+                footprints: projector_footprints(path, budget)?,
+                tower,
+                image_tokens_refusal: vision
+                    .check_image_tokens(&bonsai2::ModelVocabulary::of_gguf(&gguf))
+                    .err()
+                    .map(|e| e.to_string()),
+                remote_images: remote_images_report(),
+            })
+        }
+        None => None,
+    };
+    // A projector given as the model itself: its towers' footprints.
+    let projector = (arch == "clip")
+        .then(|| oxibonsai_runtime::vision_prefill::VisionService::footprints(&gguf, budget));
+    // The Metal sessions an engine of this model (and a vision tower) open:
+    // reported for a hybrid model and for a projector.
+    let with_tower = vision_info.is_some() || projector.is_some();
+    let report_sessions = hybrid.is_some() || with_tower;
     let bound_variant = match &hybrid {
         Some(Ok(report)) => report.bind.as_ref().ok().and_then(|b| b.variant.clone()),
         _ => None,
@@ -212,6 +395,29 @@ pub(crate) fn run(model: Option<String>, json: bool) -> anyhow::Result<()> {
                 Some(Err(e)) => serde_json::json!({ "error": e.to_string() }),
                 None => serde_json::Value::Null,
             },
+            "vision": match &vision_info {
+                Some(info) => {
+                    let mut towers = vision_json(&info.footprints);
+                    towers["mmproj"] = serde_json::json!(info.path);
+                    towers["tower"] = serde_json::json!(info.tower);
+                    towers["image_tokens_match"] =
+                        serde_json::json!(info.image_tokens_refusal.is_none());
+                    towers["image_tokens_refusal"] = serde_json::json!(info.image_tokens_refusal);
+                    towers["remote_images"] = remote_images_json(&info.remote_images);
+                    towers
+                }
+                None => serde_json::Value::Null,
+            },
+            "vision_tower": match &projector {
+                Some(Ok(footprints)) => vision_json(footprints),
+                Some(Err(e)) => serde_json::json!({ "error": e.to_string() }),
+                None => serde_json::Value::Null,
+            },
+            "metal_sessions": if report_sessions {
+                sessions_json(with_tower)
+            } else {
+                serde_json::Value::Null
+            },
         });
         println!("{}", serde_json::to_string_pretty(&info)?);
     } else {
@@ -259,6 +465,45 @@ pub(crate) fn run(model: Option<String>, json: bool) -> anyhow::Result<()> {
             }
             Some(Err(e)) => println!("  Hybrid report: FAILED ({e})"),
             None => {}
+        }
+        if let Some(info) = &vision_info {
+            println!(
+                "  Vision projector: {} — an engine on the {} executor builds the {} tower",
+                info.path, info.tower, info.tower
+            );
+            for line in vision_lines(&info.footprints) {
+                println!("  {line}");
+            }
+            match &info.image_tokens_refusal {
+                None => println!(
+                    "  Vision projector: the model's image tokens sit at the ids the splice uses"
+                ),
+                Some(refusal) => {
+                    println!("  Vision projector: REFUSED by run/chat/serve ({refusal})")
+                }
+            }
+            match &info.remote_images {
+                Ok(report) => println!("  Remote image URLs: {report}"),
+                Err(error) => {
+                    println!("  Remote image URLs: run/chat/serve would refuse to start ({error})")
+                }
+            }
+        }
+        match &projector {
+            Some(Ok(footprints)) => {
+                for line in vision_lines(footprints) {
+                    println!("  {line}");
+                }
+            }
+            Some(Err(e)) => println!("  Vision tower: FAILED ({e})"),
+            None => {}
+        }
+        if report_sessions {
+            if let Some(report) =
+                oxibonsai_runtime::engine_hybrid_gpu::MetalSessionReport::current()
+            {
+                println!("  Metal sessions: {}", report.describe(with_tower));
+            }
         }
         println!();
 

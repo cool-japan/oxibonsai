@@ -111,7 +111,7 @@ impl EvalReport {
     /// `#[from]` conversion) rather than [`EvalError::InvalidFormat`], so a
     /// caller that needs to distinguish "the input was malformed" from "the
     /// serialisation layer itself failed" can match on the real variant
-    /// instead of parsing a formatted string (gatekeeper REQUIRED #12).
+    /// instead of parsing a formatted string.
     pub fn try_to_json(&self) -> Result<String, EvalError> {
         Ok(serde_json::to_string_pretty(self)?)
     }

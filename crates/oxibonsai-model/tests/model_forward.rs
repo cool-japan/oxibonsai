@@ -83,10 +83,11 @@ fn build_test_block<'a>(
 // Model creation tests
 // ══════════════════════════════════════════════════════════════
 
-// HOTFIX-TESTMEM: `BonsaiModel::new(Qwen3Config::bonsai_8b())` allocates ~5 GB
-// of token_embd + output_weight tables (plus a ~1.2 GB KV cache) — for tests
-// that only check the config was carried through unchanged. `tiny_test()`
-// exercises the identical constructor for a few tens of MB.
+// Test memory bound: `BonsaiModel::new(Qwen3Config::bonsai_8b())` allocates
+// ~5 GB of token_embd + output_weight tables (plus a ~1.2 GB KV cache) — far
+// more than tests that only check the config was carried through unchanged
+// need. They use `tiny_test()`, which exercises the identical constructor for
+// a few tens of MB.
 
 #[test]
 fn model_new_creates_valid_model() {
@@ -734,8 +735,8 @@ fn sliding_window_wider_than_the_prompt_matches_full_attention() {
     let unwindowed = sw_sequential_logits(&build_sliding_window_gguf(None), &prompt);
     let windowed = sw_sequential_logits(&build_sliding_window_gguf(Some(64)), &prompt);
     let diff = sw_max_abs_diff(&unwindowed, &windowed);
-    // Relative bound (tightened from an absolute `1e-3` during wave-3.5
-    // verifier review): an off-by-one in the gather-and-attend window path
+    // Relative bound (tightened from an absolute `1e-3` in review): an
+    // off-by-one in the gather-and-attend window path
     // must not be able to hide under a loose absolute tolerance. The review
     // independently re-verified `<= 1e-5 * max|logit|` against this exact
     // fixture family (plus a 1-token/window=1 bit-exact check and a

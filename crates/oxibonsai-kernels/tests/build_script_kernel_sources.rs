@@ -32,7 +32,7 @@
 //!      instead of trusting an embedded metallib that turns out to be
 //!      incomplete); this test closes it at *build/CI* time by catching the
 //!      whitelist desync itself, before it ever reaches a shipped binary.
-//!   4. (wave-3 re-review) #3 above only compared this file's own
+//!   4. #3 above only compared this file's own
 //!      `ACTIVE_KERNELS` *mirror* against `pipelines.rs`'s real pushes —
 //!      nothing compared `build.rs`'s own real `ACTIVE_KERNELS` (the one
 //!      list that actually drives `extract_and_combine_msl` and therefore
@@ -74,10 +74,12 @@ const ACTIVE_KERNELS: &[&str] = &[
     "MSL_BATCHED_RMSNORM_V2",
     "MSL_BATCHED_SWIGLU",
     "MSL_GEMM_Q1_G128_V7",
+    "MSL_GEMM_Q1_G128_SIMDGROUP",
     "MSL_GEMM_Q1_G128_V7_RESIDUAL",
     "MSL_FUSED_GATE_UP_SWIGLU_GEMM_Q1",
     "MSL_GEMV_TQ2_G128_V1",
     "MSL_GEMM_TQ2_G128_V7",
+    "MSL_GEMM_TQ2_G128_SIMDGROUP",
     "MSL_GEMM_TQ2_G128_V8_TILED",
     "MSL_GEMM_TQ2_G128_V9_SIMDGROUP",
     "MSL_GEMM_TQ2_G128_V10_SIMDGROUP",
@@ -119,7 +121,10 @@ const ACTIVE_KERNELS: &[&str] = &[
     "MSL_QWEN35_COMMON",
     "MSL_QWEN35_ROTATE",
     "MSL_QWEN35_GEMV",
+    "MSL_QWEN35_GEMM",
     "MSL_QWEN35_SSM",
+    // Qwen3-VL vision tower (the Bonsai 2 mmproj on Metal)
+    "MSL_VISION",
 ];
 
 fn kernel_sources_dir() -> PathBuf {
@@ -303,7 +308,7 @@ fn parse_build_rs_active_kernels(build_rs_src: &str) -> BTreeSet<String> {
 /// (so the whitelist carries no dead entries). See the module doc for why
 /// only checking one direction left this gap.
 ///
-/// (wave-3 re-review, module doc point 4) Also parses `build.rs`'s own real
+/// (module doc point 4) Also parses `build.rs`'s own real
 /// `ACTIVE_KERNELS` array and cross-checks it against this file's mirror,
 /// so the three lists that must all agree — this file's `ACTIVE_KERNELS`
 /// mirror, `build_combined_msl()`'s real pushes, and `build.rs`'s real
@@ -346,7 +351,7 @@ fn combined_msl_pushes_exactly_match_active_kernels() {
         path.display()
     );
 
-    // Third leg (wave-3 re-review): cross-check this file's `ACTIVE_KERNELS`
+    // Third leg: cross-check this file's `ACTIVE_KERNELS`
     // mirror against build.rs's REAL `ACTIVE_KERNELS` array — the list that
     // actually drives `extract_and_combine_msl` and therefore the embedded
     // metallib. The two asserts above only prove this file's mirror agrees

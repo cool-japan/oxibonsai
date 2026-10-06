@@ -7,7 +7,7 @@
 //! ## Text prompts (TOK-11)
 //!
 //! The crate advertises a "WASM-safe, zero-FFI" Pure-Rust tokenizer
-//! ([`crate::tokenizer_bridge::TokenizerBridge::Native`], backed by
+//! (the native backend of [`crate::tokenizer_bridge::TokenizerBridge`], backed by
 //! [`oxibonsai_tokenizer`]) that compiles for `wasm32-unknown-unknown` with
 //! no C dependency, but this module used to accept only raw token ids —
 //! nothing here ever wired the advertised tokenizer up. `prompt_text` /
@@ -295,13 +295,10 @@ fn run_inference(request_json: &str) -> Result<(Vec<u32>, Option<String>), Strin
         temperature: req.temperature,
         top_k: req.top_k,
         top_p: req.top_p,
-        // Gatekeeper REQUIRED #18 (waves 3+3.5 review): residual `1.1`
-        // seed, corrected to the `1.0` no-op default now standardised
-        // workspace-wide (RT-24 / gatekeeper REQUIRED #1(a)).
+        // The `1.0` no-op default, standardised workspace-wide (RT-24).
         // `WasmInferenceRequest` has no `repetition_penalty` field of its
         // own yet (a caller cannot opt into a non-default penalty through
-        // this API at all today) — recorded as a deviation; out of this
-        // fix's scope to add a new request field.
+        // this API at all today).
         repetition_penalty: 1.0,
         ..SamplingParams::default()
     };

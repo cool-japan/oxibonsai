@@ -34,6 +34,15 @@
 //! [`rope_partial_splithalf_simd`] and [`mrope_build_tables`] are the two
 //! primitives; `crates/oxibonsai-model/src/layers/rope_mrope.rs` wraps them
 //! into `PartialRopeTable` / `MropeTable`.
+//!
+//! # The vision tower's 2-D RoPE
+//!
+//! [`mrope_vision_build_tables`] builds the angle row of the Qwen3-VL vision
+//! tower's `GGML_ROPE_TYPE_VISION` rotation (independent sections, pairs
+//! `(j, j + head_dim / 2)` across the whole head) — a different cache from
+//! the text model's interleaved one, which [`mrope_build_tables`] refuses on
+//! purpose. The CPU tower and the Metal tower both build their per-patch
+//! rows through it, so the two agree on every angle bit for bit.
 
 use crate::error::{KernelError, KernelResult};
 
@@ -277,7 +286,7 @@ fn single_axis_sections(n_rot: usize) -> [u32; 4] {
 /// selected for a given sector (`ops.cpp:5935-5938`) — so the value written
 /// to `cos_out[k]`/`sin_out[k]` at each `k` cannot depend on the sections
 /// array's specific shape, only on whether it is valid (covers every
-/// sector without needing the `e` axis). [`single_axis_sections`] is one
+/// sector without needing the `e` axis). `single_axis_sections` is one
 /// such valid choice.
 ///
 /// # Errors
@@ -302,6 +311,101 @@ pub fn partial_rope_build_table(
         cos_out,
         sin_out,
     )
+}
+
+/// Build one token's `cos`/`sin` row for ggml's `GGML_ROPE_TYPE_VISION`
+/// multi-section RoPE (the Qwen3-VL vision tower): `head_dim / 2` rotation
+/// pairs, pair `j` coupling channels `j` and `j + head_dim / 2`, applied with
+/// [`rope_partial_splithalf_simd`] at `n_rot = head_dim`.
+///
+/// Reproduces `ggml_mrope_cache_init` with `indep_sects = true`,
+/// `is_imrope = false`, `freq_scale = 1`, `ext_factor = 0`,
+/// `attn_factor = 1` and no frequency factors, in the same `f32`
+/// arithmetic: `theta_scale = freq_base^(-2 / n_dims)` with `n_dims =
+/// head_dim / 2`, four running angles started at `pos[0..4]` and multiplied
+/// by `theta_scale` after every pair, the angle of section `s` restarted at
+/// `pos[s]` when pair index `j % sum(sections)` enters it, and pair `j` using
+/// the angle of the section it falls in. With the tower's sections
+/// (`head_dim / 4` each) and `pos = (y, x, y, x)` the first `head_dim / 4`
+/// pairs rotate by the patch row and the rest by the patch column.
+///
+/// # Errors
+///
+/// - [`KernelError::UnsupportedOperation`] for a `head_dim` that is not a
+///   positive multiple of 4, or `sections` summing to zero or to more than
+///   `head_dim`;
+/// - [`KernelError::NamedBufferTooSmall`] if `cos_out` or `sin_out` holds
+///   fewer than `head_dim / 2` entries.
+pub fn mrope_vision_build_tables(
+    pos: [i32; 4],
+    sections: [u32; 4],
+    head_dim: usize,
+    freq_base: f32,
+    cos_out: &mut [f32],
+    sin_out: &mut [f32],
+) -> KernelResult<()> {
+    if head_dim == 0 || !head_dim.is_multiple_of(4) {
+        return Err(KernelError::UnsupportedOperation(format!(
+            "mrope_vision_build_tables: head_dim {head_dim} is not a positive multiple of 4"
+        )));
+    }
+    let n_pairs = head_dim / 2;
+    if cos_out.len() < n_pairs {
+        return Err(KernelError::buffer_too_small(
+            "cos_out",
+            n_pairs,
+            cos_out.len(),
+        ));
+    }
+    if sin_out.len() < n_pairs {
+        return Err(KernelError::buffer_too_small(
+            "sin_out",
+            n_pairs,
+            sin_out.len(),
+        ));
+    }
+    let sections = sections.map(|s| s as usize);
+    let sect_dims: usize = sections.iter().sum();
+    if sect_dims == 0 || sect_dims > head_dim {
+        return Err(KernelError::UnsupportedOperation(format!(
+            "mrope_vision_build_tables: sections {sections:?} must sum to 1..=head_dim \
+             ({head_dim})"
+        )));
+    }
+    let sec_w = sections[0] + sections[1];
+    let sec_e = sec_w + sections[2];
+    let n_dims = n_pairs as f32;
+    let theta_scale = freq_base.powf(-2.0 / n_dims);
+    let base = pos.map(|p| p as f32);
+    let (mut theta_t, mut theta_h, mut theta_w, mut theta_e) = (base[0], base[1], base[2], base[3]);
+    for j in 0..n_pairs {
+        let sector = j % sect_dims;
+        if sector == 0 {
+            theta_t = base[0];
+        } else if sector == sections[0] {
+            theta_h = base[1];
+        } else if sector == sec_w {
+            theta_w = base[2];
+        } else if sector == sec_e {
+            theta_e = base[3];
+        }
+        let theta = if sector >= sections[0] && sector < sec_w {
+            theta_h
+        } else if sector >= sec_w && sector < sec_w + sections[2] {
+            theta_w
+        } else if sector >= sec_w + sections[2] {
+            theta_e
+        } else {
+            theta_t
+        };
+        cos_out[j] = theta.cos();
+        sin_out[j] = theta.sin();
+        theta_t *= theta_scale;
+        theta_h *= theta_scale;
+        theta_w *= theta_scale;
+        theta_e *= theta_scale;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -583,5 +687,51 @@ mod tests {
         let err = mrope_build_tables([1, 2, 3], [0, 1, 1, 0], 8, 1e4, &mut cos_out, &mut sin_out)
             .expect_err("sector 0 must require the unsupported e axis");
         assert!(matches!(err, KernelError::UnsupportedOperation(_)));
+    }
+    // ── mrope_vision_build_tables ───────────────────────────────
+
+    /// The tower's layout (head 72, four sections of 18, `pos = (y, x, y,
+    /// x)`): pairs `0..18` turn by the row and pairs `18..36` by the column,
+    /// each section's angle starting at its own position and falling by
+    /// `theta_scale` per pair.
+    #[test]
+    fn vision_rope_rows_rotate_by_row_then_column() {
+        let (head_dim, sections) = (72usize, [18u32; 4]);
+        let n_pairs = head_dim / 2;
+        let mut cos = vec![0.0f32; n_pairs];
+        let mut sin = vec![0.0f32; n_pairs];
+        let (y, x) = (5i32, 11i32);
+        mrope_vision_build_tables([y, x, y, x], sections, head_dim, 1e4, &mut cos, &mut sin)
+            .expect("valid");
+        // Runtime inputs (`black_box`), so the reference's `powf` is the same
+        // libm call the builder makes, never a compile-time evaluation.
+        let scale = std::hint::black_box(1e4f32).powf(-2.0 / std::hint::black_box(n_pairs as f32));
+        // The row section runs pairs 0..18; the column section restarts its
+        // angle at the column position at pair 18.
+        let mut theta = y as f32;
+        for j in 0..n_pairs {
+            if j == 18 {
+                theta = x as f32;
+            }
+            assert_eq!(cos[j].to_bits(), theta.cos().to_bits(), "cos[{j}]");
+            assert_eq!(sin[j].to_bits(), theta.sin().to_bits(), "sin[{j}]");
+            theta *= scale;
+        }
+        // Position 0 is the identity rotation on every pair.
+        mrope_vision_build_tables([0; 4], sections, head_dim, 1e4, &mut cos, &mut sin)
+            .expect("valid");
+        assert!(cos.iter().all(|&c| c == 1.0) && sin.iter().all(|&s| s == 0.0));
+    }
+
+    #[test]
+    fn vision_rope_rejects_malformed_requests() {
+        let mut cos = vec![0.0f32; 8];
+        let mut sin = vec![0.0f32; 8];
+        let head_18 = mrope_vision_build_tables([0; 4], [4; 4], 18, 1e4, &mut cos, &mut sin);
+        assert!(matches!(head_18, Err(KernelError::UnsupportedOperation(_))));
+        assert!(mrope_vision_build_tables([0; 4], [0; 4], 16, 1e4, &mut cos, &mut sin).is_err());
+        assert!(mrope_vision_build_tables([0; 4], [5; 4], 16, 1e4, &mut cos, &mut sin).is_err());
+        assert!(mrope_vision_build_tables([0; 4], [4; 4], 32, 1e4, &mut cos, &mut sin).is_err());
+        assert!(mrope_vision_build_tables([0; 4], [4; 4], 16, 1e4, &mut cos, &mut sin).is_ok());
     }
 }

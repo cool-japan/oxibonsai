@@ -30,9 +30,10 @@
 //! pair `j >= head_dim / 4` by `x * base^(-2(j - head_dim/4) / n_dims)`.
 //! That is not the text model's interleaved M-RoPE
 //! ([`oxibonsai_kernels::rope_mrope::mrope_build_tables`] refuses the
-//! vision axis by design), so `vision_rope_table` builds the table here,
-//! reproducing `ggml_mrope_cache_init`'s `f32` arithmetic step for step;
-//! the rotation itself is the kernels crate's
+//! vision axis by design); the table comes from the kernels crate's
+//! [`mrope_vision_build_tables`], which reproduces `ggml_mrope_cache_init`'s
+//! `f32` arithmetic step for step and is the builder the Metal tower uses
+//! too; the rotation itself is the kernels crate's
 //! [`rope_partial_splithalf_simd`] with `n_rot = head_dim`.
 //!
 //! # GELU
@@ -54,7 +55,7 @@
 //! bit-identical for any Rayon thread count.
 
 use oxibonsai_core::gguf::reader::GgufFile;
-use oxibonsai_kernels::rope_mrope::rope_partial_splithalf_simd;
+use oxibonsai_kernels::rope_mrope::{mrope_vision_build_tables, rope_partial_splithalf_simd};
 use oxibonsai_kernels::{cpu_kernel_tier, softmax_simd, KernelDispatcher};
 use rayon::prelude::*;
 
@@ -86,26 +87,15 @@ pub fn gelu_tanh(x: f32) -> f32 {
 
 /// Build one token's `cos`/`sin` table for ggml's `GGML_ROPE_TYPE_VISION`
 /// multi-section RoPE: `head_dim / 2` rotation pairs, pair `j` coupling
-/// channels `j` and `j + head_dim / 2`.
-///
-/// Reproduces `ggml_mrope_cache_init` with `indep_sects = true`,
-/// `is_imrope = false`, `freq_scale = 1`, `ext_factor = 0`, `attn_factor = 1`
-/// and no frequency factors, in the same `f32` arithmetic:
-/// `theta_scale = freq_base^(-2 / n_dims)` with `n_dims = head_dim / 2`,
-/// four running angles started at `pos[0..4]` and multiplied by
-/// `theta_scale` after every pair, the angle of section `s` restarted at
-/// `pos[s]` when pair index `j % sum(sections)` enters it, and pair `j`
-/// using the angle of the section it falls in.
-///
-/// With the tower's sections (`head_dim / 4` each) and `pos = (y, x, y, x)`
-/// the first `head_dim / 4` pairs rotate by the row position and the rest
-/// by the column position.
+/// channels `j` and `j + head_dim / 2` — the kernels crate's
+/// [`mrope_vision_build_tables`] (the builder the Metal tower uses too), with
+/// the tower's `usize` sections and model errors.
 ///
 /// # Errors
 ///
 /// [`ModelError::ShapeInvariant`] for a `head_dim` that is not a positive
-/// multiple of 4, sections summing to zero or to more than `head_dim`, or a
-/// `cos_out`/`sin_out` shorter than `head_dim / 2`.
+/// multiple of 4, sections summing to zero or to more than `head_dim` (or
+/// past `u32`), or a `cos_out`/`sin_out` shorter than `head_dim / 2`.
 pub(crate) fn vision_rope_table(
     pos: [i32; 4],
     sections: [usize; 4],
@@ -114,69 +104,19 @@ pub(crate) fn vision_rope_table(
     cos_out: &mut [f32],
     sin_out: &mut [f32],
 ) -> ModelResult<()> {
-    let bad = |expected: &str, actual: String| ModelError::ShapeInvariant {
+    let bad = |actual: String| ModelError::ShapeInvariant {
         tensor: "vision rope table".to_string(),
-        expected: expected.to_string(),
+        expected: "a positive head_dim divisible by 4, sections summing to 1..=head_dim and \
+                   cos/sin buffers of at least head_dim / 2 entries"
+            .to_string(),
         actual,
     };
-    if head_dim == 0 || !head_dim.is_multiple_of(4) {
-        return Err(bad(
-            "a positive head_dim divisible by 4",
-            format!("{head_dim}"),
-        ));
+    let mut narrow = [0u32; 4];
+    for (dst, &src) in narrow.iter_mut().zip(&sections) {
+        *dst = u32::try_from(src).map_err(|_| bad(format!("section {src} past u32")))?;
     }
-    let n_pairs = head_dim / 2;
-    if cos_out.len() < n_pairs || sin_out.len() < n_pairs {
-        return Err(bad(
-            "cos/sin buffers of at least head_dim / 2 entries",
-            format!(
-                "{} / {} for head_dim {head_dim}",
-                cos_out.len(),
-                sin_out.len()
-            ),
-        ));
-    }
-    let sect_dims: usize = sections.iter().sum();
-    if sect_dims == 0 || sect_dims > head_dim {
-        return Err(bad(
-            "sections summing to 1..=head_dim",
-            format!("{sections:?} for head_dim {head_dim}"),
-        ));
-    }
-    let sec_w = sections[0] + sections[1];
-    let sec_e = sec_w + sections[2];
-    let n_dims = n_pairs as f32;
-    let theta_scale = freq_base.powf(-2.0 / n_dims);
-    let base = pos.map(|p| p as f32);
-    let (mut theta_t, mut theta_h, mut theta_w, mut theta_e) = (base[0], base[1], base[2], base[3]);
-    for j in 0..n_pairs {
-        let sector = j % sect_dims;
-        if sector == 0 {
-            theta_t = base[0];
-        } else if sector == sections[0] {
-            theta_h = base[1];
-        } else if sector == sec_w {
-            theta_w = base[2];
-        } else if sector == sec_e {
-            theta_e = base[3];
-        }
-        let theta = if sector >= sections[0] && sector < sec_w {
-            theta_h
-        } else if sector >= sec_w && sector < sec_w + sections[2] {
-            theta_w
-        } else if sector >= sec_w + sections[2] {
-            theta_e
-        } else {
-            theta_t
-        };
-        cos_out[j] = theta.cos();
-        sin_out[j] = theta.sin();
-        theta_t *= theta_scale;
-        theta_h *= theta_scale;
-        theta_w *= theta_scale;
-        theta_e *= theta_scale;
-    }
-    Ok(())
+    mrope_vision_build_tables(pos, narrow, head_dim, freq_base, cos_out, sin_out)
+        .map_err(|e| bad(e.to_string()))
 }
 
 /// Per-token RoPE tables for one image, in merge-window order:
@@ -351,8 +291,28 @@ impl VisionTower {
         self.bound_tensors
     }
 
+    /// Bytes a CPU tower for a projector with `config` keeps resident — its
+    /// `f32` weights, [`VisionTower::resident_bytes`] of the built tower —
+    /// computed from the configuration alone (what a caller reports or
+    /// budgets before building one).
+    #[must_use]
+    pub fn footprint(config: &VisionConfig) -> u64 {
+        let (h, ffn) = (config.hidden as u64, config.ffn as u64);
+        // Patch embedding: the two temporal kernel slices summed into one,
+        // its bias, and the stored position grid.
+        let patch =
+            h * config.patch_len() as u64 + h + (config.pos_grid * config.pos_grid) as u64 * h;
+        // One block: two layer norms, the fused QKV, the output projection
+        // and the two FFN matrices, each with its bias.
+        let block = 4 * h + (3 * h * h + 3 * h) + (h * h + h) + (ffn * h + ffn) + (h * ffn + h);
+        let merged = config.merged_width() as u64;
+        let (mid, proj) = (config.merger_hidden as u64, config.projection_dim as u64);
+        let head = 2 * h + (mid * merged + mid) + (proj * mid + proj);
+        (patch + config.blocks as u64 * block + head) * std::mem::size_of::<f32>() as u64
+    }
+
     /// Bytes held by the resident `f32` weights (about 1.84 GB for the
-    /// Bonsai 2 projector).
+    /// Bonsai 2 projector; [`VisionTower::footprint`] of its config).
     #[must_use]
     pub fn resident_bytes(&self) -> usize {
         let f32_bytes = |v: &Vec<f32>| std::mem::size_of_val(v.as_slice());
@@ -384,35 +344,7 @@ impl VisionTower {
         height: usize,
         max_tokens: usize,
     ) -> ModelResult<GridSize> {
-        let unit = self.config.merge_unit();
-        if width == 0 || height == 0 || !width.is_multiple_of(unit) || !height.is_multiple_of(unit)
-        {
-            return Err(ModelError::ShapeInvariant {
-                tensor: "image".to_string(),
-                expected: format!(
-                    "a non-empty image whose sides are multiples of {unit} \
-                     (patch {} x spatial merge {}); resize before encoding",
-                    self.config.patch_size, self.config.spatial_merge
-                ),
-                actual: format!("{width} x {height}"),
-            });
-        }
-        let grid = GridSize {
-            h: height / unit,
-            w: width / unit,
-        };
-        let tokens = grid.h.saturating_mul(grid.w);
-        if tokens > max_tokens {
-            return Err(ModelError::ShapeInvariant {
-                tensor: "image tokens".to_string(),
-                expected: format!("at most {max_tokens} merged tokens"),
-                actual: format!(
-                    "{tokens} ({} x {} merged grid of a {width} x {height} image)",
-                    grid.h, grid.w
-                ),
-            });
-        }
-        Ok(grid)
+        merged_grid_of(&self.config, width, height, max_tokens)
     }
 
     /// Encode an RGB8 image into `[n_merged x projection_dim]` embedding
@@ -618,6 +550,51 @@ impl VisionTower {
     }
 }
 
+/// The merged grid an image of `width x height` pixels produces under
+/// `config`, after checking that it can be encoded as-is — the rule every
+/// tower (CPU and Metal) applies.
+///
+/// # Errors
+///
+/// [`ModelError::ShapeInvariant`] when a side is zero or not a multiple of
+/// [`VisionConfig::merge_unit`] (32), or when `(height / 32) * (width /
+/// 32)` exceeds `max_tokens`.
+pub(crate) fn merged_grid_of(
+    config: &VisionConfig,
+    width: usize,
+    height: usize,
+    max_tokens: usize,
+) -> ModelResult<GridSize> {
+    let unit = config.merge_unit();
+    if width == 0 || height == 0 || !width.is_multiple_of(unit) || !height.is_multiple_of(unit) {
+        return Err(ModelError::ShapeInvariant {
+            tensor: "image".to_string(),
+            expected: format!(
+                "a non-empty image whose sides are multiples of {unit} \
+                 (patch {} x spatial merge {}); resize before encoding",
+                config.patch_size, config.spatial_merge
+            ),
+            actual: format!("{width} x {height}"),
+        });
+    }
+    let grid = GridSize {
+        h: height / unit,
+        w: width / unit,
+    };
+    let tokens = grid.h.saturating_mul(grid.w);
+    if tokens > max_tokens {
+        return Err(ModelError::ShapeInvariant {
+            tensor: "image tokens".to_string(),
+            expected: format!("at most {max_tokens} merged tokens"),
+            actual: format!(
+                "{tokens} ({} x {} merged grid of a {width} x {height} image)",
+                grid.h, grid.w
+            ),
+        });
+    }
+    Ok(grid)
+}
+
 /// Rotate the Q and K parts of every `[Q | K | V]` row with the token's
 /// vision RoPE table.
 fn apply_rope_qk(qkv: &mut [f32], cfg: &VisionConfig, rope: &VisionRope) -> ModelResult<()> {
@@ -688,4 +665,37 @@ fn add_inplace(x: &mut [f32], y: &[f32]) {
                 *a += *b;
             }
         });
+}
+
+#[cfg(test)]
+mod footprint_tests {
+    use super::*;
+    use oxibonsai_testkit::mmproj_fixture::{synthetic_mmproj_gguf, MmprojFixtureSpec};
+
+    /// The configuration-only footprint is the built tower's resident bytes
+    /// exactly, for the tiny projector and one with an uneven FFN and a
+    /// merger narrower than four ViT rows.
+    #[test]
+    fn the_footprint_is_the_built_towers_resident_bytes() {
+        let uneven = MmprojFixtureSpec {
+            hidden: 96,
+            heads: 4,
+            ffn: 136,
+            blocks: 3,
+            pos_side: 6,
+            merger_hidden: 224,
+            projection_dim: 48,
+            ..MmprojFixtureSpec::tiny()
+        };
+        for spec in [MmprojFixtureSpec::tiny(), uneven] {
+            let bytes = synthetic_mmproj_gguf(&spec).expect("synthetic projector");
+            let gguf = GgufFile::parse(&bytes).expect("parses");
+            let tower = VisionTower::from_mmproj(&gguf).expect("tower");
+            assert_eq!(
+                VisionTower::footprint(tower.config()),
+                tower.resident_bytes() as u64,
+                "{spec:?}"
+            );
+        }
+    }
 }

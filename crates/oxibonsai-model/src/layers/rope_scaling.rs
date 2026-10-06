@@ -150,7 +150,7 @@ pub enum RopeScalingError {
 /// Returns `head_dim / 2` angular frequency values (θ_i for i = 0..head_dim/2).
 /// The rotation angle at absolute position `p` is `θ_i * p`.
 ///
-/// # `RopeScalingStrategy::Yarn` drops `attn_factor` (verifier finding, minor)
+/// # `RopeScalingStrategy::Yarn` drops `attn_factor` (minor finding)
 ///
 /// This function's `Vec<f32>` return type carries *frequencies only* — there
 /// is nowhere in that shape to also return YaRN's attention-temperature
@@ -515,7 +515,7 @@ pub(crate) fn yarn_inv_freq_f64(
         return (0..half_dim).map(standard_freq_f64).collect();
     }
 
-    // Bounds fix (verifier finding B3): `low` and `high` are correction-
+    // Bounds fix (finding B3): `low` and `high` are correction-
     // dimension *indices into the standard RoPE frequency schedule*, whose
     // valid range is `0..head_dim` conceptually (ggml computes them against
     // `n_dims = head_dim`), even though only the first `half_dim` of them
@@ -595,7 +595,7 @@ fn yarn_inv_freq(
 /// `<arch>.rope.scaling.attn_factor`; when `None`, it seeds the multiplier
 /// at the neutral default of `1.0`.
 ///
-/// **Convention: multiply, not replace (verifier finding, minor).** GGUF's
+/// **Convention: multiply, not replace (minor finding).** GGUF's
 /// `attn_factor` key is defined by llama.cpp, which *seeds* `mscale` with
 /// `hparams.rope_attn_factor` (default `1.0`) and then multiplies in the
 /// standard correction: `mscale *= 1.0 + 0.1 * ln(1.0 / freq_scale)`, i.e.
@@ -1046,7 +1046,7 @@ mod tests {
     fn bonsai_8b_yarn() -> RopeScalingStrategy {
         // The exact values `models/Bonsai-8B.gguf` ships (M-08): a real,
         // shipped model whose long-context output was silently wrong before
-        // this package because YaRN scaling was parsed nowhere.
+        // YaRN scaling was wired in, because it was parsed nowhere.
         RopeScalingStrategy::Yarn {
             original_max_position: 16384,
             factor: 4.0,
@@ -1165,7 +1165,7 @@ mod tests {
 
     #[test]
     fn yarn_high_correction_dim_clamps_to_head_dim_not_half_dim() {
-        // Materiality point identified by the verifier review: at these
+        // Materiality point: at these
         // parameters the RAW high correction dimension is ~37 (see the
         // assertion below), which is *larger* than `half_dim - 1` (= 31 for
         // head_dim=64) but still within `head_dim - 1` (= 63). Both ggml
@@ -1262,7 +1262,7 @@ mod tests {
 
     #[test]
     fn yarn_mscale_override_is_respected() {
-        // Multiply convention (verifier finding, minor — see `yarn_mscale`'s
+        // Multiply convention (minor finding — see `yarn_mscale`'s
         // doc comment): the override *seeds* mscale, it does not replace the
         // computed correction outright. `2.5` is not the expected result on
         // its own; `2.5 * (0.1 * ln(4.0) + 1.0)` is.

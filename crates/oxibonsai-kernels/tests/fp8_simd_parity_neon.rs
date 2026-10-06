@@ -122,13 +122,13 @@ fn e4m3_dequant_neon_matches_scalar() {
         oxibonsai_kernels::simd_fp8_neon::dequant_fp8_e4m3_neon(&blocks, &mut neon_out)
             .expect("neon dequant should succeed");
     }
-    // Measured bit-exact (max abs diff 0e0) per the tests domain verifier;
+    // Measured bit-exact (max abs diff 0e0);
     // the tolerance stays the shared 1e-4 formula for consistency with the
     // x86 siblings rather than hard-coding "0.0" and drifting apart later.
     assert_close(&scalar_out, &neon_out, 1e-4, "e4m3 dequant neon");
 }
 
-/// MINOR (verifier wave 3): `e4m3_dequant_neon_matches_scalar` uses the
+/// MINOR: `e4m3_dequant_neon_matches_scalar` uses the
 /// shared 1e-4 tolerance formula "for consistency with the x86 siblings"
 /// although the comment there claims the result is measured bit-exact.
 /// Rather than blind-tighten that shared helper (a claim from an earlier
@@ -232,7 +232,7 @@ fn e4m3_gemv_neon_matches_scalar() {
         )
         .expect("neon gemv e4m3 should succeed");
     }
-    // Verifier-measured bound for this kernel: <= 3.0e-7.
+    // Measured bound for this kernel: <= 3.0e-7.
     assert_close(&scalar_out, &neon_out, 3.0e-7, "e4m3 gemv neon");
 }
 

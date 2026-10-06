@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! cargo run -p oxibonsai-image --example vae_tiled_parity -- \
-//!     /tmp/bonsai_golden/vae/weights /tmp/bonsai_golden/vae
+//!     ${TMPDIR:-/tmp}/bonsai_golden/vae/weights ${TMPDIR:-/tmp}/bonsai_golden/vae
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -191,11 +191,11 @@ fn run() -> Result<bool, String> {
     let weights_dir = args
         .next()
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp/bonsai_golden/vae/weights"));
+        .unwrap_or_else(|| std::env::temp_dir().join("bonsai_golden/vae/weights"));
     let golden_dir = args
         .next()
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp/bonsai_golden/vae"));
+        .unwrap_or_else(|| std::env::temp_dir().join("bonsai_golden/vae"));
 
     if !weights_dir.exists() {
         return Err(format!("weights dir not found: {}", weights_dir.display()));

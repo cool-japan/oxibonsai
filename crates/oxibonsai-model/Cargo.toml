@@ -1,6 +1,6 @@
 [package]
 name = "oxibonsai-model"
-description = "Qwen3-8B Transformer implementation for OxiBonsai 1-bit inference"
+description = "Dense Qwen3 and hybrid Qwen3.5 transformer forward passes, weight loaders and vision tower for OxiBonsai sub-2-bit inference"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

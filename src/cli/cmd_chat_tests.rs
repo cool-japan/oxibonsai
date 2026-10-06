@@ -190,7 +190,7 @@ fn a_fitting_prompt_with_no_room_to_drop_clamps_the_budget_instead_of_erroring()
     assert_eq!(history.len(), 1, "the sole message is kept, never dropped");
 }
 
-// ── golden2/apply_template.json: all 5 cases byte-identical (B2-13 G7) ──────
+// ── vendored apply_template.json: all 5 cases byte-identical (G7) ──────
 
 /// The raw text of the JSON value at `key` inside `object_text` (the first
 /// occurrence), found by bracket matching — the tool definitions must reach
@@ -271,7 +271,7 @@ fn split_top_level_array(text: &str) -> Vec<&str> {
     out
 }
 
-/// B2-13's G7 contract, through `oxibonsai chat`'s own path: the REAL
+/// The G7 contract, through `oxibonsai chat`'s own path: the REAL
 /// 27B's embedded tokenizer + `tokenizer.chat_template` (resolved exactly as
 /// `chat` resolves it), the contract built from flags (`--no-think`,
 /// `--reasoning-effort`, `--tools <file>` written from the golden's raw
@@ -288,7 +288,7 @@ fn chat_renders_all_five_apply_template_cases_byte_identically() {
     };
     let Some(golden_dir) = test_fixtures::env_path(
         "OXI_BONSAI2_GOLDEN_DIR",
-        "the golden2 directory holding apply_template.json",
+        "the golden directory holding apply_template.json",
     ) else {
         return;
     };
@@ -510,7 +510,11 @@ fn session_images_are_encoded_once_and_checked_against_the_context() {
         image_max_tokens: None,
     };
     let service = vision
-        .load_service("qwen35", crate::cli::bonsai2::cli_image_policy())
+        .load_service(
+            "qwen35",
+            &crate::cli::bonsai2::tests::bonsai2_vocabulary(),
+            crate::cli::bonsai2::cli_image_policy(),
+        )
         .expect("load")
         .expect("requested");
     assert!(

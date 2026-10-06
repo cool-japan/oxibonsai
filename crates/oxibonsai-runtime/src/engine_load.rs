@@ -16,7 +16,7 @@ use crate::sampling::SamplingParams;
 
 impl<'a> InferenceEngine<'a> {
     /// [`from_gguf_with_backend`](Self::from_gguf_with_backend) with a
-    /// `--rope-scaling auto|on|off` override (wave-4b ruling R2; additive —
+    /// `--rope-scaling auto|on|off` override (additive —
     /// every existing constructor is unchanged).
     ///
     /// The override is applied through

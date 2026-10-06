@@ -506,8 +506,15 @@ fn parts_have_images(parts: &[crate::api_types::ContentPart]) -> bool {
 /// A [`crate::vision_prefill::MultimodalError`] as the API error both chat
 /// endpoints answer with: a `400` naming the reason (its stable code) for
 /// anything the request is at fault for, a `500` for a tower failure on an
-/// accepted image.
+/// accepted image, and the retryable `503` load shed
+/// ([`crate::server::image_fetch::overload_error`]) for a remote image the
+/// fetcher refused because it was at capacity.
 pub(crate) fn api_error_from_multimodal(err: &crate::vision_prefill::MultimodalError) -> ApiError {
+    // A remote-image fetcher at capacity is a load shed (503 + Retry-After),
+    // neither the request's fault nor a server fault.
+    if err.is_overload() {
+        return crate::server::image_fetch::overload_error(&err.to_string());
+    }
     let base = if err.is_client_error() {
         ApiError::bad_request(err.to_string(), "messages")
     } else {
@@ -1608,6 +1615,27 @@ mod tests {
             );
             assert!(!started_in_think(&ids, Some(THINK_OPEN), Some(THINK_CLOSE)));
         }
+    }
+
+    /// A remote-image fetcher at capacity is a load shed wherever its error
+    /// is mapped, not only where a chat handler re-classifies it: `503`,
+    /// `Retry-After`, `type: overloaded_error`, the typed code.
+    #[test]
+    fn a_fetch_overload_maps_to_the_retryable_503() {
+        let error = crate::vision_prefill::MultimodalError::FetchOverloaded {
+            index: 0,
+            source: oxibonsai_model::vision::ImageInputError::RemoteFetchFailed {
+                url: "http://127.0.0.1/a.png".to_string(),
+                reason: "the fetcher is at capacity".to_string(),
+            },
+        };
+        let api = api_error_from_multimodal(&error);
+        assert_eq!(api.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(api.retry_after(), Some(1));
+        let json = api.to_json();
+        assert_eq!(json["error"]["type"], "overloaded_error", "{json}");
+        assert_eq!(json["error"]["code"], "image_fetch_overloaded", "{json}");
+        assert!(json["error"]["param"].is_null(), "{json}");
     }
 }
 

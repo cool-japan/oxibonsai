@@ -100,8 +100,7 @@ pub enum ModelError {
     InvalidTensor(String),
 
     /// A Hadamard-folded `ssm_out` whose fold was computed in **tiled**
-    /// v-head order on a model with more v-heads than k-heads (B2-10,
-    /// design §3.3).
+    /// v-head order on a model with more v-heads than k-heads (design §3.3).
     ///
     /// `prism.hadamard.gdn_v_grouped = false` says the fold of
     /// `blk.N.ssm_out.weight` was computed with its columns in the GGUF's
@@ -156,7 +155,7 @@ pub enum ModelError {
     },
 
     /// A recurrent (Gated-DeltaNet) state handed to a model does not match
-    /// that model's recurrent geometry (REQUIRED #6).
+    /// that model's recurrent geometry.
     ///
     /// Installing a state from another model — or into a dense stack, which
     /// has no recurrent layers at all — would either index out of bounds or,
@@ -189,7 +188,7 @@ pub enum ModelError {
         embedding: String,
     },
 
-    /// A KV-cache buffer could not be allocated (B2-12 item (5)).
+    /// A KV-cache buffer could not be allocated.
     ///
     /// Distinct from [`ModelError::Internal`], which is the crate's
     /// catch-all for "an invariant this code owns was broken": running out

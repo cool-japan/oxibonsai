@@ -469,12 +469,31 @@ impl CacheSession {
 
 /// Wraps a [`PrefixCache`] and exposes a higher-level prefill API.
 ///
-/// The typical call pattern for one request is:
+/// The typical call pattern for one request is `prepare`, run the model's
+/// prefill on `token_ids[uncached_start..]`, `store_blocks`, `release_session`:
 ///
-/// ```text
+/// ```
+/// use oxibonsai_model::prefix_cache::{PrefixAwarePrefill, PrefixCache};
+///
+/// // Room for 8 blocks of 4 tokens; 1 layer, 1 KV head of dimension 2, so
+/// // each block holds 1 * 2 * 4 = 8 floats of keys and of values per layer.
+/// let mut prefill = PrefixAwarePrefill::new(PrefixCache::new(8, 4, 1, 1, 2));
+/// let token_ids: Vec<u32> = (0..8).collect();
+///
+/// // First request: nothing is cached, so the whole prompt is prefilled.
 /// let (session, uncached_start) = prefill.prepare(&token_ids);
-/// // run your model prefill on token_ids[uncached_start..]
+/// assert_eq!(uncached_start, 0);
+/// // ... run the model prefill on token_ids[uncached_start..] and keep the
+/// // per-layer keys and values of each new block (zeros stand in here):
+/// let new_kv_blocks = (0..2)
+///     .map(|_| (vec![vec![0.0f32; 8]], vec![vec![0.0f32; 8]]))
+///     .collect();
 /// prefill.store_blocks(&token_ids, uncached_start, new_kv_blocks);
+/// prefill.release_session(session);
+///
+/// // A later request with the same prefix is served from the cache.
+/// let (session, uncached_start) = prefill.prepare(&token_ids);
+/// assert_eq!(uncached_start, 8);
 /// prefill.release_session(session);
 /// ```
 pub struct PrefixAwarePrefill {

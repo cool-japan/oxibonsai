@@ -151,7 +151,7 @@ pub fn cuda_init_attempts() -> usize {
 }
 
 /// Whether a CUDA context is already live in this process — **without
-/// constructing one** (wave-2.5 deviation #14, finding **F-M3**).
+/// constructing one** (finding **F-M3**).
 ///
 /// `CudaGraph::global()` builds the singleton on first call: it opens the
 /// device, creates the context and loads every PTX module. A caller that only

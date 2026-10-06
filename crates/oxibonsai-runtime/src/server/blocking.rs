@@ -9,17 +9,62 @@
 //! `spawn_blocking`; the non-streaming ones did not.
 //!
 //! [`run_blocking_generation`] is the single seam every non-streaming
-//! generation goes through. It also closes finding `RT-03`: the engine is
+//! generation goes through — `/v1/chat/completions`, the `n`-loop of
+//! `/v1/chat/completions/extended`, the prompt loop of `/v1/completions` and
+//! `/rag/query` (the `rag` feature, whose generation used to run inline on a
+//! worker too). It also closes finding `RT-03`: the engine is
 //! [`InferenceEngine::reset`](crate::engine::InferenceEngine::reset)-ed on
 //! acquisition, so KV state from the previous request served by that pool
 //! replica cannot leak into this one.
 //!
-//! `completions.rs` and the extended non-streaming `n`-loop in
-//! `api_extensions.rs` had the same defect and are meant to adopt
-//! this helper; it is `pub(crate)` for exactly that reason.
+//! # Abandoned requests
+//!
+//! Moving the lease onto the blocking pool also moves it out of the handler's
+//! reach: when the handler future is dropped — the client disconnected, or a
+//! layer outside the handler gave up on it — the blocking task runs on. Every
+//! non-streamed path (the three generation routes and `/rag/query`)
+//! therefore holds a [`CancelOnAbandon`] built from the generation's
+//! cancellation token across the `.await` and disarms it once the result is
+//! in hand: a handler future dropped mid-generation cancels the token, the
+//! generation stops at its next step, and the replica returns to the pool
+//! instead of decoding to `max_tokens` for nobody.
+//!
+//! A late cancel cannot reach the next request: the token is scoped to the
+//! lease that armed it (`EngineLease` detaches it on its way back into the
+//! pool) and every request arms a fresh one, so cancelling a finished
+//! request's token touches no engine.
 
+use crate::engine_control::CancellationToken;
 use crate::engine_pool::EngineLease;
 use crate::server::api_error::ApiError;
+
+/// Cancels a generation when dropped before [`CancelOnAbandon::disarm`]: the
+/// handler future that started it was dropped (a client disconnect, an outer
+/// timeout), so nobody will read the answer. See the module docs.
+#[must_use = "a guard dropped at once cancels the generation it guards"]
+#[derive(Debug)]
+pub(crate) struct CancelOnAbandon(Option<CancellationToken>);
+
+impl CancelOnAbandon {
+    /// Guard the generation `token` was armed for.
+    pub(crate) fn new(token: CancellationToken) -> Self {
+        Self(Some(token))
+    }
+
+    /// The generation's result is in hand: dropping the guard now cancels
+    /// nothing.
+    pub(crate) fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for CancelOnAbandon {
+    fn drop(&mut self) {
+        if let Some(token) = self.0.take() {
+            token.cancel();
+        }
+    }
+}
 
 /// Run a blocking generation closure on tokio's blocking pool.
 ///
@@ -128,4 +173,50 @@ mod tests {
         let value = generation.await.expect("join").expect("blocking task");
         assert_eq!(value, 7);
     }
+
+    #[test]
+    fn a_guard_dropped_while_armed_cancels_its_token() {
+        let token = CancellationToken::new();
+        drop(CancelOnAbandon::new(token.clone()));
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn a_disarmed_guard_cancels_nothing() {
+        let token = CancellationToken::new();
+        CancelOnAbandon::new(token.clone()).disarm();
+        assert!(!token.is_cancelled());
+    }
+
+    /// A guard that fires late — after its generation finished, its lease
+    /// went back to the pool and the next request armed the same replica —
+    /// cancels only its own (finished) request's token: the next request's
+    /// generation runs to its end.
+    #[tokio::test]
+    async fn a_late_guard_does_not_reach_the_next_request_on_the_replica() {
+        let pool = pool();
+        let mut first = pool.acquire().await.expect("acquire");
+        let first_token = first.arm_cancellation();
+        let late = CancelOnAbandon::new(first_token.clone());
+        let _ = run_blocking_generation(first, |lease| lease.generate(&[1, 2, 3], 2))
+            .await
+            .expect("blocking task");
+
+        // The same (only) replica, armed for the next request.
+        let mut next = pool.acquire().await.expect("re-acquire");
+        let next_token = next.arm_cancellation();
+        drop(late);
+        assert!(first_token.is_cancelled(), "the late guard did fire");
+        assert!(!next_token.is_cancelled());
+        assert!(!next.is_cancelled(), "the replica carries the next token");
+        let tokens = run_blocking_generation(next, |lease| lease.generate(&[1, 2, 3], 4))
+            .await
+            .expect("blocking task")
+            .expect("generation");
+        assert_eq!(tokens.len(), 4, "the next request runs to its budget");
+    }
 }
+
+#[cfg(test)]
+#[path = "abandon_tests.rs"]
+mod abandon_tests;

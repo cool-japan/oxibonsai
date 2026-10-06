@@ -1,13 +1,18 @@
 # oxibonsai-model
 
-Qwen3 Transformer implementation for 1-bit and ternary Bonsai inference.
+Dense Qwen3 and hybrid Qwen3.5 transformer forward passes for sub-2-bit Bonsai inference
+(1-bit, ternary, and the Bonsai 2 27B hybrid).
 
-Implements the full autoregressive forward pass for the Qwen3 architecture family
+Implements the full autoregressive forward pass for the dense Qwen3 architecture family
 (Bonsai-8B/4B/1.7B in Q1_0_g128 and TernaryBonsai-8B/4B/1.7B in TQ2) — token
 embedding, Grouped Query Attention with RoPE, SwiGLU MLP, RMSNorm, paged
-KV-cache, and Metal/CUDA full-forward integration via `oxibonsai-kernels`.
+KV-cache, and Metal/CUDA full-forward integration via `oxibonsai-kernels` — and for
+the Qwen3.5 hybrid of Bonsai 2 27B (`hybrid/`: Gated-DeltaNet linear attention
+interleaved with gated full attention, Hadamard-rotated PTQ1_0 / PQ2_0 / group-64 Q2_0
+weights, M-RoPE and a recurrent-state cache) together with its optional vision tower
+(`vision/`).
 
-**Status:** Stable — 1,209 tests passing (`cargo nextest run -p oxibonsai-model`)
+**Status:** Stable — 1,972 tests (`cargo nextest list -p oxibonsai-model --all-features`; the real-model ones self-skip without the weights)
 **Version:** 0.2.4
 
 Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
@@ -24,6 +29,7 @@ Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 ### Model Variants & Registry
 - `ModelVariant::Bonsai{8B, 4B, 1_7B}` — Q1_0_g128 1-bit weights
 - `ModelVariant::TernaryBonsai{8B, 4B, 1_7B}` — TQ2 ternary weights
+- `ModelVariant::Bonsai27B` (previous-generation 27B) and `ModelVariant::TernaryBonsai227b{Pq2, Ptq1, Q2g64}` (Bonsai 2 27B) — `qwen35` hybrids; `ModelVariant::Bonsai227bMmproj` is the vision projector
 - `ModelSpec`, `CapabilityProfile`, `all_specs()` in `model_variants.rs`
 - Architecture auto-detection from GGUF metadata in `model_registry.rs`
 - `Qwen3Config` + `ModelConfigBuilder` for custom configs
@@ -31,7 +37,7 @@ Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 ### Weight Loading
 - GGUF loader with tensor-name mapping (`gguf_loader.rs`, `convert/name_map.rs`)
 - Q1 loader path via `oxibonsai-kernels` blocks
-- `LinearTernary` layer + `load_ternary_blocks` + `load_ternary_embedding` + `OutputWeight::Ternary` (TQ2)
+- `LinearTernary` layer + `load_ternary_blocks` + `OutputWeight::Ternary` (TQ2)
 - Q4_0/Q8_0 (standard GGUF) + K-quant (Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K) weight loading — `LinearQ4_0`/`LinearQ8_0` (`layers/linear_standard.rs`), `LinearQ2K`/`LinearQ3K`/`LinearQ4K`/`LinearQ5K`/`LinearQ6K`/`LinearQ8K` (`layers/linear_kquant_full.rs`, `layers/linear_kquant_ext.rs`); `forward()` tries the native-CUDA / Metal GEMV kernel first (via `oxibonsai-kernels`), then falls back to CPU
 - Safetensors loading support
 

@@ -923,6 +923,30 @@ mod tests {
         }
         // Helpers only: the common prelude declares no entry point.
         assert!(!MSL_QWEN35_COMMON.contains("kernel void"));
+        // The batched-prefill GEMMs: one per GEMV format, plus the
+        // half-activation twins of the five quantized formats, each at the
+        // start of a line (the runtime verifier's line-anchored scan).
+        let gemm = crate::gpu_backend::kernel_sources::MSL_QWEN35_GEMM;
+        for fmt in ["pq2", "tq2", "q2g64", "q1", "ptq1", "f32"] {
+            let entry = format!("kernel void q35_gemm_{fmt}(");
+            assert!(
+                gemm.lines().any(|l| l.starts_with(&entry)),
+                "{entry} missing"
+            );
+        }
+        for fmt in ["pq2", "tq2", "q2g64", "q1", "ptq1"] {
+            let entry = format!("kernel void q35_gemm_{fmt}_ha(");
+            assert!(
+                gemm.lines().any(|l| l.starts_with(&entry)),
+                "{entry} missing"
+            );
+        }
+        assert!(
+            !gemm.contains("q35_gemm_f32_ha"),
+            "f32 weights are never staged as half"
+        );
+        // Every `kernel void` of the GEMM source is one of those eleven.
+        assert_eq!(gemm.matches("kernel void ").count(), 11);
     }
 
     /// The raw-string terminator must not appear inside any source (the
@@ -933,6 +957,7 @@ mod tests {
             MSL_QWEN35_COMMON,
             MSL_QWEN35_ROTATE,
             MSL_QWEN35_GEMV,
+            crate::gpu_backend::kernel_sources::MSL_QWEN35_GEMM,
             MSL_QWEN35_SSM,
         ] {
             assert!(!src.contains("\"#"));

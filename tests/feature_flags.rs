@@ -5,21 +5,27 @@
 
 // ── Default features ────────────────────────────────────────────────────────
 
+/// The package's `default` feature list names `server`. Read from the manifest
+/// rather than from this build's own `cfg`, so the check says the same thing
+/// whichever feature set the tests were compiled with (a `cfg`-based check
+/// either fails by construction under `--no-default-features` or vanishes).
 #[test]
-#[allow(clippy::assertions_on_constants)]
 fn default_features_include_server() {
-    // The "server" feature is enabled by default in oxibonsai.
-    #[cfg(feature = "server")]
-    {
-        assert!(
-            true,
-            "server feature should be enabled with default features"
-        );
-    }
-    #[cfg(not(feature = "server"))]
-    {
-        panic!("server feature should be enabled by default");
-    }
+    let manifest_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let manifest = std::fs::read_to_string(&manifest_path).expect("read the package manifest");
+    let features = manifest
+        .split("\n[features]")
+        .nth(1)
+        .expect("the manifest has a [features] table");
+    let default_line = features
+        .lines()
+        .take_while(|line| !line.starts_with('['))
+        .find(|line| line.trim_start().starts_with("default"))
+        .expect("the [features] table has a default list");
+    assert!(
+        default_line.contains("\"server\""),
+        "the `server` feature must be enabled by default; got: {default_line}"
+    );
 }
 
 // ── Core crate availability ─────────────────────────────────────────────────
@@ -143,7 +149,7 @@ fn runtime_metrics_available() {
 // (`is_x86_feature_detected!`), never by these Cargo features, so there is
 // still no dispatch-level behaviour for this test to assert against.
 // `model_desc.rs`'s new reporting fields are the only consumer, live in
-// `src/cli/` (not owned by this package, and not reachable from this
+// `src/cli/` (not reachable from this
 // integration-test binary — the root `oxibonsai-cli` package has no `[lib]`
 // target `tests/*.rs` files could import from). Deleted per the spec's
 // explicit "give it a real assertion or delete it" rather than leaving a
@@ -167,7 +173,7 @@ fn model_kv_cache_available() {
 
 // ── Server feature gating ───────────────────────────────────────────────────
 
-// MINOR fix (verifier wave 3): this used to bind `create_router_with_metrics`
+// MINOR fix: this used to bind `create_router_with_metrics`
 // as compile-time evidence and then `assert!(true, ...)` — no runtime check
 // at all beyond "this compiled" (which the `#[cfg(feature = "server")]` gate
 // already guarantees). Now it actually calls the function and drives one

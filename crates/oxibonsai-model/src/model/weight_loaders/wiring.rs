@@ -147,8 +147,8 @@ pub(crate) fn build_rope_table(config: &Qwen3Config, max_seq_len: usize) -> Mode
 ///
 /// [`crate::model::BonsaiModel::new`] and
 /// [`crate::model::BonsaiModel::new_for_testing_with_blocks`] return `Self`,
-/// not `ModelResult<Self>`, and are called from code this package does not
-/// own, so they cannot become fallible. They get the scaled table whenever one
+/// not `ModelResult<Self>`, and are called from external code, so they cannot become
+/// fallible. They get the scaled table whenever one
 /// can be built and an unscaled one — with a `tracing::error!` naming the
 /// reason — when it cannot. Every path that *can* report the failure
 /// (`from_gguf*`, `grow_context`) uses [`build_rope_table`] and propagates it.

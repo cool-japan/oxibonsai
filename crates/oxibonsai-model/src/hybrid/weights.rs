@@ -44,7 +44,7 @@
 //!   makes the decay `exp(g) > 1` and the recurrence diverge — hundreds of
 //!   tokens later, far from the cause. [`oxibonsai_kernels::gated_delta_net::validate_a_neg`]
 //!   is called here, at **load**, so a bad checkpoint names the offending
-//!   index and value immediately (B2-05's loader-side requirement).
+//!   index and value immediately.
 //! * **The `a_neg` / `dt_bias` argument order.** `gdn_step_f32` takes
 //!   `(…, dt_bias, a_neg, …)` while `gdn_step` takes `(…, a_neg, dt_bias,
 //!   …)`; both are `[n_v_heads]` `f32`, so a swap compiles and only shows up
@@ -66,7 +66,7 @@
 //!   closes it the same way: both vectors are re-indexed through
 //!   [`crate::hybrid::vhead_map::VHeadMap::gather_grouped_scalar`] before
 //!   [`GdnGateWeights::new`] ever sees them, so `a_neg()[m]`/`dt_bias()[m]`
-//!   are grouped like every other v-indexed quantity this package produces.
+//!   are grouped like every other v-indexed quantity this module produces.
 
 use std::sync::Arc;
 
@@ -207,7 +207,7 @@ pub struct Bf16Matrix<'a> {
     in_features: usize,
 }
 
-/// How one gate projection's weights are held (gatekeeper REQUIRED #16).
+/// How one gate projection's weights are held.
 ///
 /// Every Bonsai **2** file stores `ssm_alpha`/`ssm_beta` as BF16, which is
 /// read zero-copy straight out of the mmap. The gen-1 27B builds
@@ -700,7 +700,7 @@ pub fn parse_forced_q2_layout(raw: &str) -> ModelResult<Option<GgufTensorType>> 
 /// per file and threaded through the per-layer loop.
 ///
 /// This **is** the dense loader's resolver
-/// (`model::weight_loaders::resolve_id42_once`, B2-10), not a copy of it:
+/// (`model::weight_loaders::resolve_id42_once`), not a copy of it:
 /// the two load paths can never disagree about a file's layout, and design
 /// SS1.3's [`FORCE_Q2_LAYOUT_ENV`] override applies to both identically.
 ///
@@ -718,7 +718,7 @@ pub fn resolve_id42(gguf: &GgufFile<'_>) -> ModelResult<Option<GgufTensorType>> 
 
 /// Apply [`resolve_id42`]'s answer to one tensor's parse-time type: every
 /// type but wire id 42 passes through unchanged. The dense loader's own
-/// function (B2-10), shared rather than copied.
+/// function, shared rather than copied.
 #[inline]
 #[must_use]
 pub fn apply_resolved_type(
@@ -896,7 +896,7 @@ pub fn bind_linear<'a>(
         // Unquantized matrices (the synthetic fixture's reference variants,
         // any dequantised or converted `qwen35` file): widened once to a
         // dense `f32` layer that projects through the dispatcher's `f32`
-        // GEMV (gatekeeper REQUIRED #5). Every `F16`/`BF16` value is exactly
+        // GEMV. Every `F16`/`BF16` value is exactly
         // representable in `f32`, so the widening is lossless.
         GgufTensorType::F32 | GgufTensorType::F16 | GgufTensorType::BF16 => LinearLayer::Dense(
             LinearDense::from_le_bytes(data, resolved, out_features, in_features, kernel.clone())?,
@@ -1095,7 +1095,7 @@ pub fn bind_gdn_gates(
     // Validate the RAW (tiled) vector, before the gather below, so a bad
     // checkpoint's error names the GGUF row a person can go look up in the
     // file (`ssm_a[17]`) rather than a grouped index that only means
-    // something after mentally reversing `vhead_map` (B2-05's load-time
+    // something after mentally reversing `vhead_map` (the load-time
     // check must name "the offending index and value immediately" — an
     // index in the wrong space is not that). `GdnGateWeights::new` still
     // runs the same check on the grouped vector as its own invariant, but
@@ -1181,8 +1181,7 @@ pub fn bind_gate_projection<'a>(
     // Gen-1 27B files (`Bonsai-27B-Q1_0`, `Ternary-Bonsai-27B-{PQ2_0,Q2_0}`)
     // store these two tensors quantized (ids 41/142/42). Dequantize the
     // whole 48 x hidden matrix once at load rather than refusing a variant
-    // `ModelVariant::Bonsai27B` advertises as supported (gatekeeper
-    // REQUIRED #16); the id-42 ambiguity is resolved the same way every
+    // `ModelVariant::Bonsai27B` advertises as supported; the id-42 ambiguity is resolved the same way every
     // other tensor's is.
     let resolved = apply_resolved_type(info.tensor_type, resolved_42);
     let n = out_features
@@ -1409,7 +1408,7 @@ mod tests {
         assert!(err.to_string().contains("ssm_a[1]"), "{err}");
     }
 
-    /// The gatekeeper's blocking finding: `ssm_a` and `ssm_dt.bias` are GGUF
+    /// `ssm_a` and `ssm_dt.bias` are GGUF
     /// rows in **tiled** v-head order (design §3.3's table) and
     /// [`bind_gdn_gates`] must re-index them into **grouped** order before
     /// [`GdnGateWeights`] hands them to the kernel — exactly the property
@@ -1519,7 +1518,7 @@ mod tests {
         );
     }
 
-    /// The gatekeeper's second requested pin: [`LinearAttnBlock::gates`]
+    /// [`LinearAttnBlock::gates`]
     /// must stay order-consistent with `LinearScratch::alpha_grouped` /
     /// `beta_grouped` — the two are built by different code paths
     /// (load-time binding vs. per-token gather) but must agree on which
@@ -1545,8 +1544,8 @@ mod tests {
             .expect("layer 0 is linear");
 
         // One token's raw (tiled) alpha/beta projection output, gathered
-        // into `LinearScratch`'s grouped buffers exactly as a B2-11 forward
-        // will.
+        // into `LinearScratch`'s grouped buffers exactly as the forward
+        // pass does.
         let x = vec![0.37f32; shape.hidden];
         let mut alpha_tiled = vec![0.0f32; shape.n_v_heads];
         let mut beta_tiled = vec![0.0f32; shape.n_v_heads];
@@ -1586,7 +1585,7 @@ mod tests {
         assert!(!vhead_map.is_identity());
     }
 
-    /// The gatekeeper's REQUIRED #8: a transposed `(a_neg, dt_bias)` pair
+    /// A transposed `(a_neg, dt_bias)` pair
     /// must be caught by the arithmetic, not by luck.
     ///
     /// Both vectors are negative here (so `validate_a_neg` accepts either

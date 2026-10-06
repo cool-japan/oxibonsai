@@ -197,8 +197,8 @@ fn dequant_ternary(raw: &[u8]) -> Result<Vec<f32>, Box<dyn Error>> {
 /// Decode a raw BF16 byte stream (little-endian `u16` bit patterns) to `f32`.
 ///
 /// BF16 → f32 is an exact upper-half placement, via the single canonical
-/// [`oxibonsai_core::bf16::bf16_to_f32`] (K-12 bf16 hoist / FIX3-GGUF-WRITE
-/// item 4) rather than this example's former inline copy of the identical
+/// [`oxibonsai_core::bf16::bf16_to_f32`] (K-12 bf16 hoist)
+/// rather than this example's former inline copy of the identical
 /// bit-manipulation.
 fn decode_bf16(raw: &[u8]) -> Vec<f32> {
     raw.chunks_exact(2)
@@ -442,7 +442,7 @@ mod tests {
         assert_eq!(got, vec![1.0f32]);
     }
 
-    /// FIX3-GGUF-WRITE item 4: `decode_bf16`'s now-shared widening
+    /// `decode_bf16`'s now-shared widening
     /// (`oxibonsai_core::bf16::bf16_to_f32`) must agree with this example's
     /// former inline expression over the entire `u16` domain — every
     /// subnormal, both zeros, every infinity and every NaN payload.

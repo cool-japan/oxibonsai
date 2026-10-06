@@ -11,7 +11,7 @@
 //! plug in *any* of the crate's chunking strategies — the three functions
 //! above, or the `RichChunk`-based family in [`crate::advanced_chunker`], or
 //! [`crate::code_chunker::CodeChunker`] — rather than being hard-wired to
-//! [`chunk_document`] (RAG-EVAL-IMG-11 / RAG-EVAL-IMG-12).
+//! [`chunk_document`].
 
 use std::collections::HashMap;
 
@@ -154,9 +154,9 @@ impl Chunk {
     /// Build a [`Chunk`] from a [`RichChunk`] (as produced by any
     /// [`crate::advanced_chunker::ChunkStrategy`]: `MarkdownChunker`,
     /// `RecursiveCharSplitter`, `SentenceChunker`, `SlidingWindowChunker`),
-    /// attaching it to `doc_id` (RAG-EVAL-IMG-12).
+    /// attaching it to `doc_id`.
     ///
-    /// # Offset semantics (RAG-EVAL-IMG-12 verifier follow-up)
+    /// # Offset semantics
     ///
     /// `RichChunk::char_start`/`char_end` are *character* offsets (see
     /// `advanced_chunker.rs`'s own `RichChunk::len`, which counts
@@ -174,7 +174,7 @@ impl Chunk {
     /// `char_start` to the true byte offset in O(1), so the O(n) table build
     /// happens once per document rather than once per chunk (an O(n·k)
     /// re-scan would reintroduce the exact class of blow-up
-    /// `chunk_document` was already fixed for; see RAG-EVAL-IMG-14).
+    /// `chunk_document` was already fixed for).
     pub fn from_rich(rich: RichChunk, doc_id: usize, index: &CharByteIndex) -> Self {
         let RichChunk {
             text,
@@ -217,8 +217,8 @@ fn convert_rich_metadata(metadata: HashMap<String, String>) -> HashMap<String, M
 /// while [`Chunk::char_offset`] is a *byte* offset. Recomputing it with a
 /// fresh `source.char_indices().nth(char_idx)` scan inside `from_rich` for
 /// every chunk would cost O(n) per chunk — O(n·k) for a k-chunk document,
-/// the same quadratic-in-spirit trap `chunk_document` was fixed for
-/// (RAG-EVAL-IMG-14). Building this table once per document and indexing it
+/// the same quadratic-in-spirit trap `chunk_document` was fixed for.
+/// Building this table once per document and indexing it
 /// per chunk is O(n + k).
 #[derive(Debug, Clone)]
 pub struct CharByteIndex {
@@ -298,8 +298,8 @@ impl From<RichChunk> for Chunk {
 ///
 /// This is the trait-object-safe seam that lets [`crate::retriever::Retriever`]
 /// and [`crate::pipeline::RagPipeline`] accept *any* of the crate's chunking
-/// strategies instead of being hard-wired to [`chunk_document`]
-/// (RAG-EVAL-IMG-11 / RAG-EVAL-IMG-12). Implementations must be `Send + Sync`
+/// strategies instead of being hard-wired to [`chunk_document`].
+/// Implementations must be `Send + Sync`
 /// so a boxed chunker can be stored on a `Retriever` shared across threads.
 pub trait Chunker: Send + Sync {
     /// Split `text` (the `doc_id`-th document) into chunks.
@@ -343,7 +343,7 @@ impl Chunker for ParagraphChunker {
 /// [`Chunker`] adapter for any [`ChunkStrategy`] (`MarkdownChunker`,
 /// `RecursiveCharSplitter`, `advanced_chunker::SentenceChunker`,
 /// `SlidingWindowChunker`) — this whole family previously had no path into
-/// `Retriever`/`RagPipeline` at all (RAG-EVAL-IMG-12). Builds one
+/// `Retriever`/`RagPipeline` at all. Builds one
 /// [`CharByteIndex`] for `text` and reuses it across every produced chunk, so
 /// [`Chunk::from_rich`] reports a real byte offset (correct for non-ASCII
 /// documents too) in O(n + k) rather than the O(n·k) an index-per-chunk scan
@@ -392,7 +392,7 @@ impl Chunker for CodeChunker {
 /// Runs in O(n) time and O(n) extra space (one `usize` byte-offset per
 /// character, no repeated re-scans): a prior version recomputed the byte
 /// offset of every window's start from byte 0 on every iteration, which made
-/// the whole function O(n²) (RAG-EVAL-IMG-14: 1 MiB took 1.39 s, 2 MiB took
+/// the whole function O(n²) (1 MiB took 1.39 s, 2 MiB took
 /// 5.66 s — a 4.06× blow-up for a 2× input).
 ///
 /// Returns an empty `Vec` if `text` is empty.
@@ -458,7 +458,7 @@ pub fn chunk_document(text: &str, doc_id: usize, config: &ChunkConfig) -> Vec<Ch
 /// sentence to the end of its last sentence (including whatever original
 /// separators appeared between them), and `Chunk::char_offset` is that
 /// span's real byte offset — so `doc[chunk.char_offset..]` always starts
-/// with `chunk.text` by construction (RAG-EVAL-IMG-19: a prior version
+/// with `chunk.text` by construction (a prior version
 /// rebuilt each chunk by `join(" ")`-ing trimmed sentences and tracked the
 /// offset with a `+1`-per-sentence approximation, which desynchronised the
 /// two the moment a real separator was not exactly one space).
@@ -848,7 +848,7 @@ mod tests {
 
     #[test]
     fn chunk_by_paragraphs_offsets_correct_with_single_trailing_newline() {
-        // RAG-CORE-blocking-1 (verifier follow-up): a document whose last
+        // RAG-CORE-blocking-1: a document whose last
         // line is non-blank and ends with exactly one `\n` used to panic
         // inside `trimmed_span` at end-of-text. At the EOT iteration the
         // trailing empty "line" is classified blank, the blank-line branch
@@ -955,8 +955,8 @@ mod tests {
         assert_eq!(chunk.chunk_idx, 2);
     }
 
-    // ── CharByteIndex / Chunk::from_rich byte-vs-char offset (wave-1.5
-    //    addendum: `RichChunk::char_start` is a character count, but
+    // ── CharByteIndex / Chunk::from_rich byte-vs-char offset
+    //    (`RichChunk::char_start` is a character count, but
     //    `Chunk::char_offset` must be a byte offset) ───────────────────────
 
     #[test]
@@ -1023,7 +1023,7 @@ mod tests {
         );
     }
 
-    /// Same property FIX-03's chunk-offset sweep asserts for the byte-offset
+    /// Same property the chunk-offset sweep asserts for the byte-offset
     /// chunkers (`chunk_by_sentences_offsets_point_at_the_real_text`,
     /// `chunk_by_paragraphs_offsets_correct_for_cjk_document`, above),
     /// exercised here for the `RichChunk`-derived family through
@@ -1081,7 +1081,7 @@ mod tests {
 
     /// Same property, exercised through the public
     /// `RetrieverBuilder::with_chunker(StrategyChunker(..))` path — the real
-    /// integration surface RAG-EVAL-IMG-12 added — rather than calling the
+    /// integration surface added — rather than calling the
     /// `Chunker` trait directly, mirroring
     /// `paragraph_chunker_through_retriever_end_to_end_offsets_are_correct`
     /// above for the `RichChunk` family.

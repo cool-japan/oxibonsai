@@ -406,7 +406,7 @@ fn concurrent_gemv_and_gemm_q1_callers_do_not_corrupt_each_other() {
     join_workers(handles);
 }
 
-// ── Q1 replica sharing + per-epoch release (MET-M1 / verify:METAL-CONCURRENCY) ──
+// ── Q1 replica sharing + per-epoch release (MET-M1) ──
 
 /// Two distinct 18-byte Q1 blocks, so "same bytes" and "different bytes"
 /// cases are unambiguous.
@@ -439,7 +439,7 @@ fn content_fingerprint_separates_content_and_length() {
     assert_ne!(content_fingerprint(&[]), content_fingerprint(&[0u8]));
 }
 
-/// The verify:METAL-CONCURRENCY blocking finding, at the backend: a second
+/// The replica-sharing finding, at the backend: a second
 /// upload of byte-identical weights from another replica (another epoch)
 /// must return the SAME handle — which is also what makes the Q1 fused
 /// path's `MetalGraph` slots coincide — and place nothing new on the device.

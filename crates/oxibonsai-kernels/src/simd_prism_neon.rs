@@ -5,12 +5,12 @@
 //! the shared `code -> value` map. This file adds two things beyond that
 //! scalar reference:
 //!
-//! - [`decode_byte_arith_to_f32x4`]: one byte -> 4 lanes, the arithmetic
+//! - `decode_byte_arith_to_f32x4`: one byte -> 4 lanes, the arithmetic
 //!   `code - 1` map (no reserved-code masking — every 2-bit code is valid for
 //!   this family, unlike the legacy ternary LUT), used by the `PQ2_0` /
 //!   `Q2_0_g64` tiers.
-//! - [`decode_ptq1_0_codes_neon`]: a genuinely vectorized re-implementation
-//!   of [`crate::dequant_prism::decode_ptq1_0_codes`]'s base-3 trit unpack
+//! - `decode_ptq1_0_codes_neon`: a genuinely vectorized re-implementation
+//!   of `crate::dequant_prism::decode_ptq1_0_codes`'s base-3 trit unpack
 //!   (widen -> multiply -> mask -> multiply -> shift -> narrow, entirely in
 //!   16-bit lanes so the `u8` wrap trap is reproduced exactly: the low byte
 //!   of an exact, non-overflowing 16-bit product is bit-identical to a
@@ -563,7 +563,7 @@ pub unsafe fn gemm_ptq1_0_neon(
 }
 
 // ---------------------------------------------------------------------------
-// Register-blocked (MR-tiled) NEON GEMM — K-INT8 / gatekeeper REQUIRED #9
+// Register-blocked (MR-tiled) NEON GEMM
 //
 // Same contract as `crate::dequant_prism`'s scalar blocked kernels: one
 // decoded block is consumed by `PRISM_GEMM_MR` batch rows before the next is

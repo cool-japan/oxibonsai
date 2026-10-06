@@ -16,7 +16,13 @@ categories = ["science", "algorithms"]
 [features]
 default = ["server"]
 server = ["dep:axum", "dep:tower"]
-rag = ["dep:axum", "dep:tower"]
+# The RAG endpoints (`rag_server`) generate through the chat routes' blocking-pool
+# seam (`server::blocking`) and answer to the server's per-request deadline
+# (`server::deadline`), and both live in the `server` module tree, so `rag`
+# brings `server` with it. Nothing enables `rag` without `server`: the CLI's
+# `rag` feature forwards here with `server` on by default, and neither the
+# facade crate nor `oxibonsai-serve` forwards it.
+rag = ["server"]
 wasm = []
 metal = ["oxibonsai-kernels/metal", "oxibonsai-model/metal"]
 native-cuda = ["oxibonsai-kernels/native-cuda", "oxibonsai-model/native-cuda"]

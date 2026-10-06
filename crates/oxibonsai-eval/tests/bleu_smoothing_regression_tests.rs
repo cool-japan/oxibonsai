@@ -1,5 +1,5 @@
 //! RAG-EVAL-IMG-33: BLEU smoothing's relationship to "Chen & Cherry 2014
-//! m2/m3" was re-verified against the source in this package (see the
+//! m2/m3" was re-verified against the source (see the
 //! doc comments on `bleu::SmoothingMethod`), not against a live
 //! NLTK/sacreBLEU install (unavailable offline in this environment). These
 //! tests lock in the exact — hand-derived — arithmetic each variant

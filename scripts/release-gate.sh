@@ -51,9 +51,28 @@
 #   {"capability": "metal", "executed": true, "test": "oxibonsai-kernels::metal_k_quant_gemv_parity::metal_gemv_q2k_matches_scalar"}
 #   - "capability" (string, required): one of "metal", "cuda", "rag-real-generation",
 #     "image-parity", "legacy-models", "bonsai2-models", "bonsai2-metal-engine",
-#     "cuda-hardware"
+#     "cuda-hardware", "bonsai2-mmproj", "bonsai2-vision", "metal-hidden",
+#     "bonsai2-vision-metal"
 #     (extend this list here, in the same edit that adds a new gated
 #     capability, so this file stays the single source of truth).
+#     "metal-hidden" is the head-free Metal hidden-state prefill behind dense
+#     embeddings, checked against the per-token reference on the real legacy
+#     models — see `Capability::MetalHidden`'s doc comment in
+#     `crates/oxibonsai-testkit/src/capability.rs`.
+#     "bonsai2-mmproj" is the real Bonsai 2 vision projector
+#     (`Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf`) bound and checked against the
+#     f64 reference (`Capability::Bonsai2Mmproj`); "bonsai2-vision" is the
+#     27B plus that projector end to end on the CPU path — the model-level
+#     golden gate and the chat-endpoint round trip (`Capability::Bonsai2Vision`).
+#     "bonsai2-vision-metal" is the same image path on Metal
+#     (`Capability::Bonsai2VisionMetal`): the 27B image prompts on the Metal
+#     hybrid runner and the Metal vision tower against the CPU path and the
+#     fork's image goldens (both bands), the image chat round trip on a Metal
+#     engine, and the shipped CLI end to end (`oxibonsai run --mmproj
+#     --backend auto` stays on the Metal runner and prints the golden answer,
+#     the same with `--backend cpu`, and `oxibonsai serve` answers the image
+#     request). The Metal tower on the real projector records
+#     "bonsai2-mmproj".
 #     "cuda-hardware" is distinct from "cuda": it names validation whose own
 #     claim is stronger than "the CUDA code path did not panic" (an
 #     end-to-end numeric parity result, or a checklist item never yet
@@ -64,6 +83,7 @@
 #     project's capability manifest has had a CUDA device, but a future
 #     host that does have one can require it the same way `--require-cuda`
 #     requires "cuda".
+#     "cuda-syntax" appears only in waiver records ("waived", below); nothing requires it.
 #   - "executed" (bool, required): true iff the test body actually reached
 #     and ran the hardware/fixture-dependent code path this run — NOT
 #     merely "the process exited 0". A test that detects the capability is
@@ -80,29 +100,73 @@
 #     below prints it on each capability's own "OK" line when at least one
 #     matching record carries it, so the real-model gates' relative cost is
 #     visible in this script's own output without re-running under a
-#     stopwatch.
-# This script DELETES the manifest before invoking scripts/ci.sh and only
-# trusts entries written *during this run* (mtime check) — a leftover file
-# from a previous invocation, or one for a different feature set, must
-# never be read as this run's evidence. Producers therefore do not need to
-# truncate the file themselves; appending is always correct.
+#     stopwatch. Every real-model gate records it; a required test
+#     (`--require-tests`) whose executed record has no `duration_ms` earns a
+#     `WARN` line naming it — the report is then incomplete, but a missing
+#     timer never turns the gate red.
+#   - "waived" (string, OPTIONAL): marks a record of an explicit, flag-granted
+#     WAIVER instead of hardware evidence; only THIS script writes one, never a
+#     test. The one value is "approximate-accepted", with "capability":
+#     "cuda-syntax", "executed": false, "test": "scripts/check_cuda.sh", appended
+#     once ci.sh passed under `--accept-approximate-cuda-syntax` and its
+#     cuda-syntax stage reported `CUDA_SYNTAX_RESULT=approximate-accepted` (a real
+#     nvcc pass waives nothing and writes none). `check_capability_manifest`
+#     ignores it (it is no "cuda" evidence): it is there for the reader.
+# This script MOVES ASIDE any manifest a previous run left (to
+# `capability-report.json.<UTC timestamp>.<pid>` beside it, so that earlier
+# evidence is kept) before invoking scripts/ci.sh, and only trusts entries
+# written *during this run* (mtime check) — a leftover file from a previous
+# invocation, or one for a different feature set, must never be read as this
+# run's evidence. The run therefore starts from no manifest and the final
+# check reads this run's records alone. Producers do not need to truncate the
+# file themselves; appending is always correct.
 #
 # Required-on-this-host capabilities (matches this script's own spec):
 #   - "metal" is required whenever `uname -s` is Darwin (this project
 #     targets Apple Silicon as a first-class backend).
-#   - "cuda" is required only when --require-cuda is passed (this session's
-#     dev machine has no CUDA hardware at all; do not require it by
+#   - "cuda" is required only when --require-cuda is passed (the development
+#     machine has no CUDA hardware at all; do not require it by
 #     default — see CONTEXT: "CUDA code is compile-blind").
+#   - ci.sh's `cuda-syntax` stage needs a real nvcc, which a host without the CUDA
+#     toolkit (every macOS host) cannot supply: --accept-approximate-cuda-syntax is
+#     the explicit, never-implied opt-out (a clean APPROXIMATE check, no nvcc
+#     compile; recorded as a waiver and named in the verdict; see "waived"). It
+#     never waives a syntax error and is refused with --require-cuda.
 #   - "legacy-models" is required on Darwin unless --skip-legacy-models is
 #     passed. It is the evidence that the real-model CPU/NEON/Metal greedy
 #     parity gate — the strongest correctness signal this project can
 #     produce, and the one that guards README's "byte-identical output at
 #     --temperature 0" claim — actually RAN against the shipped GGUFs. The
-#     producer tests are no longer `#[ignore]`d (orchestrator ruling D-6(4)),
-#     so on a host that has models/ they run and record; on a host that does
-#     not they record executed=false, and a release must not be cut from such
-#     a run without the operator saying so out loud. --skip-legacy-models is
+#     producer tests are not `#[ignore]`d (design decision D-6(4)), so on a
+#     host that has models/ they run and record; on a host that does not
+#     they record executed=false, and a release must not be cut from such a
+#     run without the operator saying so out loud. --skip-legacy-models is
 #     that explicit statement; it is visible in this script's own output.
+#   - "metal-hidden" is required on Darwin under the same condition as
+#     "legacy-models" (it is evidence about the same three legacy GGUFs, and
+#     --skip-legacy-models drops it too): stage 1b runs
+#     `oxibonsai-model::metal_hidden_parity_tests` once per legacy model file
+#     (`OXI_MODEL` names one GGUF per run) and the check requires that test's
+#     own name to have an `executed: true` record, so a run that self-skipped
+#     — no model resolved, or a build without the Metal feature — fails the
+#     gate instead of passing on the strength of some lighter Metal test.
+#   - "legacy-models" ALSO covers the real-model gates stage 1b adds beyond
+#     the cross-tier matrix, each required by name: the speculative gate
+#     (`oxibonsai-model::speculative_ternary_metal_gates`, one test per
+#     ternary model: speculative greedy against plain greedy on the Metal
+#     route, at draft lengths below and above the 8-row tiled-GEMM boundary
+#     and across the adaptive lookahead's range), the embedding leg
+#     (`oxibonsai-runtime::embeddings_model_backed`'s `embed_bench_short_and_long`
+#     and `real_model_places_queen_nearer_to_king_than_banana`) and the M-18
+#     fused-prefill chunk-size sweep (`oxibonsai-model`'s
+#     `real_model_metal_prefill_chunk_size_sweep`, run once on Bonsai-8B and
+#     once on the Ternary-Bonsai-1.7B). The benchmark opts in explicitly —
+#     `OXIBONSAI_EMBED_BENCH=1` and `OXI_MODEL` are both set by this script —
+#     so the leg never self-skips; it never sets
+#     `OXIBONSAI_EMBED_BENCH_PER_TOKEN` (and removes an inherited one), so at
+#     2000 tokens the benchmark compares the production Metal embedding with
+#     the batched CPU pass and asserts the 20 s target instead of paying the
+#     per-token reference loop, which stays a manual measurement.
 #   - "bonsai2-models" is required on Darwin unless --skip-bonsai2-models is
 #     passed, same shape as "legacy-models" above, for the Bonsai 2 27B
 #     target instead of the 1.7B/8B/1-bit legacy models: the evidence that
@@ -129,24 +193,78 @@
 #     memory, and a `/v1/chat/completions` round trip), also by name.
 #     --skip-bonsai2-metal is the narrower opt out: it drops only the
 #     Metal-specific evidence requirements, not the whole "bonsai2-models"
-#     capability.
+#     capability. Under the same condition "bonsai2-models" also requires
+#     `oxibonsai-model::hybrid_metal_prefill_gates`'s two gates by name (the
+#     runner's batched prefill against its decode rate on both bands, and the
+#     token and logprob gates with every prefill on the GEMM).
+#   - "bonsai2-vision" and "bonsai2-mmproj" are required on Darwin, by name,
+#     whenever the real vision projector is present next to the 27B and
+#     neither --skip-bonsai2-models nor --skip-bonsai2-vision was passed:
+#     `oxibonsai-model::bonsai2_vision_tests` (the 27B and its projector
+#     against the fork's image goldens, CPU path),
+#     `oxibonsai-runtime::bonsai2_vision_runtime_tests`'s real-27B chat round
+#     trip and `oxibonsai-model::vision_mmproj_tests`'s real-projector gate
+#     all ran for real. A host that has the 27B but NOT the projector fails
+#     closed — a release must not ship `--mmproj` without that evidence —
+#     unless --skip-bonsai2-vision says so out loud.
+#   - Wherever the vision leg runs, its Metal half runs and is required too,
+#     unless --skip-bonsai2-metal is passed: "bonsai2-vision-metal" by the
+#     names of `oxibonsai-model::bonsai2_vision_metal_tests`'s gate (both
+#     bands), `oxibonsai-runtime::bonsai2_vision_metal_runtime_tests`'s round
+#     trip and `oxibonsai-cli::bonsai2_vision_cli_tests`'s CLI gate, and
+#     "bonsai2-mmproj" additionally by the name of
+#     `oxibonsai-model::vision_metal_tests`'s Metal-tower gate. It needs both
+#     27B bands beside the projector and fails closed, before invoking
+#     cargo, when the second band is missing.
+#
+# ── STAGE 0: THE RELEASE CLI BINARY IS BUILT ONCE, BEFORE ANYTHING ELSE ─────
+# Two real-model gates (`bonsai2_runtime_tests`'s `oxibonsai info --json` cases
+# and `legacy_parity_tests`'s `oxibonsai eval --task mmlu` case) run the
+# shipped `oxibonsai` binary as a subprocess. A test must not build that
+# binary itself: an in-test `cargo build` (a) compiles for minutes inside the
+# real-model critical section, (b) with a narrower feature set than the
+# release ships, overwrites a wider binary in a shared target directory and
+# silently voids every later leg that expected e.g. the Metal backend, and
+# (c) leaves the test executing `<manifest>/../../target/release/oxibonsai`
+# even when `CARGO_TARGET_DIR` put the build elsewhere. Stage 0 therefore
+# builds the binary ONCE — `cargo build --release -p oxibonsai-cli --bin
+# oxibonsai --all-features --message-format=json`, in the caller's
+# `CARGO_TARGET_DIR` —
+# takes the executable path from cargo's own `compiler-artifact` record for
+# the `oxibonsai` binary (never a computed path), checks it starts, and
+# exports it as `OXIBONSAI_CLI_BIN`, which every later stage (ci.sh's nextest
+# run, stages 1b-1d) inherits and `oxibonsai_testkit::cli_bin::
+# resolve_cli_binary` honours. The build FAILS CLOSED: if it fails, reports
+# no executable, or the executable is missing or will not run `--version`,
+# the gate stops here. An `OXIBONSAI_CLI_BIN` already in the environment is
+# deliberately overridden: the gate must test the binary of THIS tree.
 #
 # ── THE REAL-MODEL PARITY STAGE MUST BE SERIALIZED ──────────────────────────
 # Stage 1b's real legacy-model gates (the six cross-tier parity tests, three
 # in oxibonsai-model and three in oxibonsai-runtime, plus the M-18 / M-02 /
-# M-08 / CLI-CORE / CONVERT-EXPORT measurement gates, all in the two
-# `legacy_parity_tests` binaries), stage 1c's nine real
-# Bonsai 2 27B gates (`hybrid_forward_parity_tests`'s three
-# `hybrid_real_27b_*_bonsai2` cases, `bonsai2_engine_tests`'s two
+# M-08 measurement gates, the `oxibonsai eval` CLI gate, the ONNX-export round
+# trip and the engine-level speculative gates, all in the two
+# `legacy_parity_tests` binaries; the Metal hidden-state parity gate
+# `metal_hidden_parity_tests`, run once per legacy model file; the speculative
+# gate `speculative_ternary_metal_gates` on the two ternary models; the
+# embedding leg `embeddings_model_backed`; and the M-18 fused-prefill
+# chunk-size sweep, a unit test of `oxibonsai-model` run on Bonsai-8B and on
+# the Ternary-Bonsai-1.7B), stage 1c's nine real Bonsai 2 27B
+# gates (`hybrid_forward_parity_tests`'s three `hybrid_real_27b_*_bonsai2`
+# cases, `bonsai2_engine_tests`'s two
 # `bonsai2_*_engine_greedy_matches_the_fork_goldens` cases, and
 # `bonsai2_runtime_tests`'s four `real_27b_*_bonsai2` G6/G7/G9 cases) plus, on
-# Darwin, `hybrid_metal_gates`'s two Metal 27B cases and
-# `bonsai2_metal_engine_tests`'s four `real_27b_metal_engine_*` cases, and stage
-# 1d's real-model lib/bin cases each load a multi-GB GGUF and decode through it. Run
-# concurrently on an 8-core/24 GB M3 they have driven the machine's load
-# average past 90. Stages 1b-1d therefore invoke every real-model test
-# binary directly with `--test-threads=1`, one binary at a time, and the
-# heavier tests additionally carry an in-binary mutex
+# Darwin, `hybrid_metal_gates`'s two Metal 27B cases,
+# `bonsai2_metal_engine_tests`'s four `real_27b_metal_engine_*` cases and
+# `hybrid_metal_prefill_gates`'s two batched-prefill cases, then its vision
+# leg (`bonsai2_vision_tests`, `bonsai2_vision_runtime_tests` and
+# `vision_mmproj_tests`) and that leg's Metal half (`vision_metal_tests`,
+# `bonsai2_vision_metal_tests`, `bonsai2_vision_metal_runtime_tests` and the
+# CLI's `bonsai2_vision_cli_tests`), and stage 1d's real-model lib/bin cases each load a
+# multi-GB GGUF and decode through it. Run concurrently on an 8-core/24 GB M3
+# they have driven the machine's load average past 90. Stages 1b-1d therefore
+# invoke every real-model test binary directly with `--test-threads=1`, one
+# binary at a time, and the heavier tests additionally carry an in-binary mutex
 # (`real_model_serial`/`gpu_serial`/`REAL_MODEL_LOCK`) because the Metal
 # decode path is a process-global singleton. `.config/nextest.toml`
 # separately excludes the real-27B and legacy real-model cases from a plain
@@ -159,8 +277,7 @@
 # because the manifest has zero records for it at all, e.g. because no
 # producer test has adopted this contract yet — is INCOMPLETE, and this
 # script fails the release gate. It is not this script's job to weaken
-# that; it is the producer tests' job to start writing to the manifest
-# (tracked as CI-GATE's T-05 deviation until TESTS-INFRA lands it).
+# that; it is the producer tests' job to write to the manifest.
 #
 # Usage:
 #   ./scripts/release-gate.sh                        # metal + legacy-models +
@@ -173,10 +290,19 @@
 #   ./scripts/release-gate.sh --skip-bonsai2-models  # release WITHOUT real Bonsai 2
 #                                                     # 27B evidence (state it in the
 #                                                     # release notes)
+#   ./scripts/release-gate.sh --skip-bonsai2-vision  # release WITHOUT real Bonsai 2
+#                                                     # vision-projector evidence
+#                                                     # (state it in the release notes)
+#   ./scripts/release-gate.sh --accept-approximate-cuda-syntax
+#                                                     # no CUDA toolkit on this host: accept an approximate
+#                                                     # CUDA syntax check, loudly (state it in the release notes)
 #   OXIBONSAI_M08_RUN_LONG=1 ./scripts/release-gate.sh
 #                                                     # MANDATORY SEPARATE RELEASE STEP:
 #                                                     # also run and require M-08's
 #                                                     # 20000-token YaRN gate (below)
+#   ./scripts/release-gate.sh --self-test            # run this script's own offline
+#                                                     # scenarios (stub cargo, no
+#                                                     # build, no hardware) and exit
 #
 # ── M-08: the 20000-token YaRN gate is a separate, mandatory release step ──
 # `oxibonsai-runtime::legacy_parity_tests::
@@ -202,10 +328,108 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT" || exit 2
 
+# shellcheck disable=SC2034  # several constants below are read only by release-gate-selftest.sh (sourced for --self-test), which shellcheck does not follow
+{
 # Release file names of the two Bonsai 2 27B bands, shared by the real
 # Bonsai 2 27B stage below and its `--self-test` stub scenarios.
 BONSAI2_PQ2_FILE="Ternary-Bonsai-2-27B-PQ2_0.gguf"
 BONSAI2_PTQ1_FILE="Ternary-Bonsai-2-27B-PTQ1_0.gguf"
+
+# The three legacy dense models the CPU cross-tier gates and the Metal
+# hidden-state gate all run on, in the order the metal-hidden stage runs them.
+LEGACY_MODEL_FILES=(
+    "Ternary-Bonsai-1.7B.gguf"
+    "Ternary-Bonsai-8B.gguf"
+    "Bonsai-8B.gguf"
+)
+
+# The capability-record name of the Metal hidden-state parity gate
+# (`TEST_NAME` in `crates/oxibonsai-model/tests/metal_hidden_parity_tests.rs`),
+# shared by the required-tests list and the `--self-test` scenarios.
+METAL_HIDDEN_TEST_NAME="oxibonsai-model::metal_hidden_parity_tests::metal_hidden_prefill_matches_the_sequential_reference_on_real_models"
+
+# The capability-record names of the stage-1b real-model gates that are not
+# part of the cross-tier matrix. Each is the exact `TEST_NAME` the producing
+# test writes (the `--self-test` scenarios check that, so a rename cannot
+# silently turn a requirement into one nothing can satisfy).
+#   - the speculative gate: one test per ternary legacy model;
+#   - the embedding leg: the opt-in benchmark and the semantic smoke test;
+#   - the Metal-vs-CPU greedy fallback gate of stage 1d.
+SPECULATIVE_TEST_FILE="crates/oxibonsai-model/tests/speculative_ternary_metal_gates.rs"
+SPECULATIVE_TEST_NAMES=(
+    "oxibonsai-model::speculative_ternary_metal_gates::ternary_1_7b_speculative_greedy_equals_plain_greedy_on_metal"
+    "oxibonsai-model::speculative_ternary_metal_gates::ternary_8b_speculative_greedy_equals_plain_greedy_on_metal"
+)
+SPECULATIVE_ENGINE_TEST_FILE="crates/oxibonsai-runtime/tests/legacy_parity_tests/speculative.rs"
+SPECULATIVE_ENGINE_TEST_NAMES=(
+    "oxibonsai-runtime::legacy_parity_tests::ternary_1_7b_ngram_speculation_equals_plain_greedy_on_metal"
+    "oxibonsai-runtime::legacy_parity_tests::ternary_1_7b_adaptive_two_engine_speculation_equals_plain_greedy_on_metal"
+)
+EMBED_TEST_FILE="crates/oxibonsai-runtime/tests/embeddings_model_backed.rs"
+EMBED_BENCH_TEST_NAME="oxibonsai-runtime::embeddings_model_backed::embed_bench_short_and_long"
+EMBED_SMOKE_TEST_NAME="oxibonsai-runtime::embeddings_model_backed::real_model_places_queen_nearer_to_king_than_banana"
+FALLBACK_TEST_FILE="crates/oxibonsai-runtime/tests/metal_greedy_cpu_fallback_tests.rs"
+FALLBACK_TEST_NAME="oxibonsai-runtime::metal_greedy_cpu_fallback_tests::real_model_greedy_gpu_fallback_byte_identical"
+
+# The M-18 fused-prefill chunk-size sweep: a unit test of `oxibonsai-model`'s
+# `chunked_prefill` module (reached with `--lib`), run once per model in
+# `SWEEP_MODEL_FILES` order — the 1-bit Bonsai-8B first (the model whose
+# per-token prefill cost grew super-linearly before the tiled Q1 GEMM), then
+# the Ternary-Bonsai-1.7B. `SWEEP_TEST_FILTER` is the libtest name filter that
+# selects it; `SWEEP_TEST_NAME` is the capability-record name it writes.
+SWEEP_TEST_FILE="crates/oxibonsai-model/src/chunked_prefill.rs"
+SWEEP_TEST_FILTER="real_model_metal_prefill_chunk_size_sweep"
+SWEEP_TEST_NAME="oxibonsai-model::lib::real_model_metal_prefill_chunk_size_sweep"
+SWEEP_MODEL_FILES=(
+    "Bonsai-8B.gguf"
+    "Ternary-Bonsai-1.7B.gguf"
+)
+
+# The Bonsai 2 vision projector and the three real-weight vision gates (stage
+# 1c's vision leg): the two record "bonsai2-vision", the projector gate
+# "bonsai2-mmproj".
+BONSAI2_MMPROJ_FILE="Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf"
+BONSAI2_VISION_TEST_FILES=(
+    "crates/oxibonsai-model/tests/bonsai2_vision_tests.rs"
+    "crates/oxibonsai-runtime/tests/bonsai2_vision_runtime_tests.rs"
+)
+BONSAI2_VISION_TEST_NAMES=(
+    "oxibonsai-model::bonsai2_vision_tests::bonsai2_vision_real_27b_matches_the_fork_goldens_on_the_cpu_path"
+    "oxibonsai-runtime::bonsai2_vision_runtime_tests::real_27b_server_round_trip_reproduces_the_golden_prompt_one"
+)
+BONSAI2_MMPROJ_TEST_FILE="crates/oxibonsai-model/tests/vision_mmproj_tests.rs"
+BONSAI2_MMPROJ_TEST_NAME="oxibonsai-model::vision_mmproj_tests::real_mmproj_binds_every_block_and_matches_the_f64_reference"
+
+# The Metal half of the vision leg (on Darwin unless --skip-bonsai2-metal):
+# the projector's Metal tower records "bonsai2-mmproj"; the 27B image prompts
+# on the Metal runner, the image chat round trip on a Metal engine and the
+# shipped CLI end to end record "bonsai2-vision-metal". Each array entry pairs
+# with the file at the same index.
+BONSAI2_MMPROJ_METAL_TEST_FILE="crates/oxibonsai-model/tests/vision_metal_tests.rs"
+BONSAI2_MMPROJ_METAL_TEST_NAME="oxibonsai-model::vision_metal_tests::real_mmproj_metal_tower_tracks_the_cpu_tower_and_the_f64_reference"
+BONSAI2_VISION_METAL_TEST_FILES=(
+    "crates/oxibonsai-model/tests/bonsai2_vision_metal_tests.rs"
+    "crates/oxibonsai-runtime/tests/bonsai2_vision_metal_runtime_tests.rs"
+    "tests/bonsai2_vision_cli_tests.rs"
+)
+BONSAI2_VISION_METAL_TEST_NAMES=(
+    "oxibonsai-model::bonsai2_vision_metal_tests::hybrid_real_27b_metal_vision_matches_the_cpu_path_and_the_fork_goldens_bonsai2"
+    "oxibonsai-runtime::bonsai2_vision_metal_runtime_tests::real_27b_metal_engine_serves_the_golden_image_prompt_over_http_bonsai2"
+    "oxibonsai-cli::bonsai2_vision_cli_tests::real_27b_cli_image_turns_stay_on_metal_and_answer_the_golden_bonsai2"
+)
+
+# The Metal runner's batched (GEMM) prefill gates (stage 1c's last leg, on
+# Darwin unless --skip-bonsai2-metal), both of which record "bonsai2-models".
+BONSAI2_PREFILL_TEST_FILE="crates/oxibonsai-model/tests/hybrid_metal_prefill_gates.rs"
+BONSAI2_PREFILL_TEST_NAMES=(
+    "oxibonsai-model::hybrid_metal_prefill_gates::hybrid_real_27b_metal_prefill_throughput_bonsai2"
+    "oxibonsai-model::hybrid_metal_prefill_gates::hybrid_real_27b_metal_batched_prefill_matches_cpu_tokens_bonsai2"
+)
+
+# The exact arguments of the stage-0 CLI build; the `--self-test` stand-in
+# `cargo` checks that it receives exactly these.
+RELEASE_CLI_BUILD_ARGS=(build --release -p oxibonsai-cli --bin oxibonsai --all-features --message-format=json)
+}
 
 # Parses the JSONL capability manifest at `report_path` and verifies that
 # every capability named in the remaining arguments has at least one
@@ -213,7 +437,7 @@ BONSAI2_PTQ1_FILE="Ternary-Bonsai-2-27B-PTQ1_0.gguf"
 # Exit 0 = every required capability has real, fresh evidence; exit 1 = at
 # least one does not, OR the manifest itself is unusable (missing, stale,
 # or contains a malformed line). Factored into its own function (rather
-# than an inline heredoc at the call site) so `--self-test` below can
+# than an inline heredoc at the call site) so `--self-test` can
 # exercise this exact parsing logic against synthetic manifests, with no
 # cargo run and no hardware involved.
 #
@@ -226,7 +450,9 @@ BONSAI2_PTQ1_FILE="Ternary-Bonsai-2-27B-PTQ1_0.gguf"
 # `legacy_parity_tests`'s cases) is not the same guarantee as "these five
 # SPECIFIC gates all ran"; `--require-tests` is how this script asks for
 # the stronger one without weakening the plain check for capabilities that
-# do not need it.
+# do not need it. A required test whose executed record carries no
+# `duration_ms` is reported with a `WARN` line and does not change the
+# verdict.
 check_capability_manifest() {
     local report_path="$1" run_start_epoch="$2"
     shift 2
@@ -329,6 +555,16 @@ for cap in required:
                 print(f"  - {name}")
         else:
             print(f"OK: '{cap}' has executed=true for all {len(names_needed)} required test(s).")
+        # An executed record without `duration_ms` is reported, never failed:
+        # the evidence is real, only the report of what it cost is incomplete.
+        untimed_names = [n for n in dict.fromkeys(names_needed)
+                         if any(t == n and d is None for (t, d) in ran)]
+        if untimed_names:
+            print(f"WARN: '{cap}': {len(untimed_names)} required test(s) have an executed "
+                  f"record without duration_ms (not a failure; the gate's cost report is "
+                  f"incomplete):")
+            for name in untimed_names:
+                print(f"  - {name}")
 
 if malformed:
     print(f"FAIL: {malformed} malformed manifest line(s) found — a partially-corrupted "
@@ -351,9 +587,17 @@ PYEOF
 # `executed: true`) while every other gate silently self-skips. The list:
 # the six core cross-tier greedy gates (three models x {numeric parity in
 # oxibonsai-model, golden text in oxibonsai-runtime}), the three stage-1d
-# cases, the M-18 / M-02 / M-08-control / CLI-CORE real-model measurement
-# gates and the CONVERT-EXPORT round trip (ONNX export -> GGUF -> real
-# tokenizer). With `m08_long` = 1 (`OXIBONSAI_M08_RUN_LONG=1` in this
+# cases, the M-18 / M-02 / M-08-control real-model measurement gates, the
+# `oxibonsai eval --task mmlu` CLI gate and the ONNX-export round trip (ONNX
+# export -> GGUF -> real tokenizer), the speculative gates (one model-level test
+# per ternary model, plus the engine-level n-gram and two-engine adaptive tests
+# in oxibonsai-runtime's `legacy_parity_tests`), the embedding leg's two tests
+# and the M-18 fused-prefill chunk-size sweep (`oxibonsai-model`'s
+# `chunked_prefill` unit test, run once on Bonsai-8B and once on the
+# Ternary-Bonsai-1.7B by stage 1b; the numerics gate named
+# `prefill_chunk_size_is_a_dispatch_knob_not_a_numerics_knob_on_a_real_long_prompt`
+# is a different test). With `m08_long` = 1
+# (`OXIBONSAI_M08_RUN_LONG=1` in this
 # script's environment) it also names M-08's 20000-token YaRN gate, which
 # only runs when that variable is set — see the usage notes at the top of
 # this file for why that run is a separate, mandatory release step.
@@ -370,6 +614,13 @@ oxibonsai-runtime::legacy_parity_tests::bonsai_8b_greedy_text_matches_golden_acr
 oxibonsai-runtime::lib::temperature_zero_completion_takes_the_metal_greedy_gpu_path,\
 oxibonsai-runtime::lib::real_model_stream_stop_sequence_matches_the_non_stream_text_and_reports_stop,\
 oxibonsai-runtime::metal_greedy_cpu_fallback_tests::real_model_greedy_gpu_fallback_byte_identical,\
+oxibonsai-model::speculative_ternary_metal_gates::ternary_1_7b_speculative_greedy_equals_plain_greedy_on_metal,\
+oxibonsai-model::speculative_ternary_metal_gates::ternary_8b_speculative_greedy_equals_plain_greedy_on_metal,\
+oxibonsai-runtime::legacy_parity_tests::ternary_1_7b_ngram_speculation_equals_plain_greedy_on_metal,\
+oxibonsai-runtime::legacy_parity_tests::ternary_1_7b_adaptive_two_engine_speculation_equals_plain_greedy_on_metal,\
+oxibonsai-runtime::embeddings_model_backed::embed_bench_short_and_long,\
+oxibonsai-runtime::embeddings_model_backed::real_model_places_queen_nearer_to_king_than_banana,\
+oxibonsai-model::lib::real_model_metal_prefill_chunk_size_sweep,\
 oxibonsai-model::legacy_parity_tests::prefill_chunk_size_is_a_dispatch_knob_not_a_numerics_knob_on_a_real_long_prompt,\
 oxibonsai-model::legacy_parity_tests::footprint_and_measured_rss_confirm_the_embedding_table_stays_unmaterialized_bonsai_8b,\
 oxibonsai-model::legacy_parity_tests::m08_yarn_scaling_wiring_takes_effect_on_the_real_bonsai_8b_file,\
@@ -387,10 +638,13 @@ oxibonsai-runtime::legacy_parity_tests::onnx_converted_gguf_loads_through_the_re
 # PTQ1_0, the f64-layer reference), oxibonsai-runtime's `bonsai2_engine_tests`
 # (two gates), then — on Darwin, unless `skip_metal`, and only once the test
 # file exists in this checkout — oxibonsai-model's `hybrid_metal_gates`
-# (CPU-vs-Metal token parity + decode throughput) and oxibonsai-runtime's
+# (CPU-vs-Metal token parity + decode throughput), oxibonsai-runtime's
 # `bonsai2_metal_engine_tests` (the same on the product path: the Metal
 # engine vs the CPU engine and the fork, engine decode throughput and
-# memory, and a `/v1/chat/completions` round trip).
+# memory, and a `/v1/chat/completions` round trip) and oxibonsai-model's
+# `hybrid_metal_prefill_gates` (the runner's batched prefill against its
+# decode rate, and the token and logprob gates with every prefill on the
+# GEMM — both bands).
 #
 # Fails CLOSED, before invoking cargo at all, when either release GGUF is
 # missing from `models_dir` and `skip` is not set: a partial 27B evidence
@@ -406,7 +660,7 @@ oxibonsai-runtime::legacy_parity_tests::onnx_converted_gguf_loads_through_the_re
 # default configuration's.
 #
 # All inputs are explicit arguments — never a global — so `--self-test`
-# below can drive this exact function against a scratch directory and a
+# can drive this exact function against a scratch directory and a
 # PATH-shimmed `cargo` that only logs its own invocations, with no real
 # build, hardware or GGUF involved.
 #   run_bonsai2_models_stage <skip:0|1> <skip_metal:0|1> <models_dir> \
@@ -454,8 +708,9 @@ run_bonsai2_models_stage() {
     # template) are header-only (`mmap` + metadata parse, never a tensor
     # byte) and self-locate under `models_dir` on their own; G9 (`oxibonsai
     # info --json`, one case per band) needs its own per-band env var (see
-    # `locate_named_27b_gguf`'s doc comment: it spawns a `cargo build` and a
-    # fresh process per case, so it deliberately has no `models/` fallback).
+    # `locate_named_27b_gguf`'s doc comment: it runs the CLI as a fresh
+    # process per case, the binary stage 0 exported as OXIBONSAI_CLI_BIN, so
+    # it deliberately has no `models/` fallback).
     # One invocation with every var set covers all of it — this also avoids
     # a G9 case ever reaching its `OXI_REQUIRE_MODEL_FILES=1` hard-failure
     # branch just because a *different* leg forgot to export its env var.
@@ -491,306 +746,460 @@ run_bonsai2_models_stage() {
         "OXI_BONSAI2_PTQ1_GGUF=$ptq1_path" "OXI_BONSAI2_GOLDEN_DIR=$golden_dir" \
         cargo test --release -p oxibonsai-runtime --all-features \
         --test bonsai2_metal_engine_tests -- --test-threads=1 --nocapture || return $?
+    # The runner's batched (GEMM) prefill: a 512-token prefill against the
+    # same process's decode rate, and the token and logprob gates with every
+    # prefill on the GEMM — both bands. The gates find the files through
+    # their two variables only (no models-directory fallback), and
+    # `OXI_REQUIRE_MODEL_FILES=1` turns a band that is not found into a
+    # failure rather than a self-skip.
+    echo "── oxibonsai-model::hybrid_metal_prefill_gates (real 27B batched prefill gates) ─"
+    env -u OXIBONSAI_KERNEL_TIER "OXI_BONSAI2_PQ2_GGUF=$pq2_path" \
+        "OXI_BONSAI2_PTQ1_GGUF=$ptq1_path" "OXI_BONSAI2_GOLDEN_DIR=$golden_dir" \
+        OXI_REQUIRE_MODEL_FILES=1 \
+        cargo test --release -p oxibonsai-model --all-features \
+        --test hybrid_metal_prefill_gates -- --test-threads=1 --nocapture || return $?
     return 0
 }
 
-# ── --self-test: exercise check_capability_manifest() offline ───────────
-# No cargo, no hardware, no network: builds synthetic JSONL manifests under
-# a throwaway `mktemp -d` (honours $TMPDIR; never a hardcoded /tmp path)
-# and asserts check_capability_manifest()'s verdict on each scenario. This
-# is what "pins" the malformed-line-fails-closed behaviour documented
-# above with a test, per item (d): it cannot silently regress back to the
-# old "reported, not silently ignored, but still exits 0" shape without
-# this failing.
-release_gate_self_test() {
-    local failures=0
-    local total=0
-    local work_dir
-    work_dir="$(mktemp -d "${TMPDIR:-/tmp}/oxibonsai_release_gate_selftest.XXXXXX")" || {
-        echo "FAIL: self-test: could not create a scratch directory" >&2
+# Builds the `oxibonsai` CLI once with the full feature set the release ships
+# and prints the path of the executable cargo reports for it (stage 0; see the
+# header). Everything else goes to stderr, so a caller can capture the path
+# with `$(...)` and still see cargo's own diagnostics.
+#
+# Fails CLOSED (non-zero, nothing on stdout) when cargo cannot be started or
+# exits non-zero, when its JSON stream carries no `compiler-artifact` with an
+# executable for the `oxibonsai` binary target (the `oxibonsai` library crate
+# has a record of the same name with `executable: null`, which is skipped),
+# when that file does not exist, or when it does not answer `--version` with
+# exit 0. The environment's `OXIBONSAI_CLI_BIN` is never read here: the gate
+# tests the binary of this tree. The path is cargo's own record, never a
+# computed `<target dir>/release/oxibonsai`, so a custom `CARGO_TARGET_DIR`
+# is honoured by construction.
+#
+# The `cargo` it runs is whatever `cargo` resolves to on `PATH`, so
+# `--self-test` can put a stand-in in front and exercise this exact function.
+build_release_cli_binary() {
+    command -v python3 >/dev/null 2>&1 || {
+        echo "FATAL: python3 not found — cannot read cargo's JSON build stream." >&2
+        return 2
+    }
+    local stream cargo_rc=0 cli_path
+    stream="$(mktemp "${TMPDIR:-/tmp}/oxibonsai_release_gate_cli_stream.XXXXXX")" || {
+        echo "FAIL: could not create a scratch file for cargo's JSON stream" >&2
         return 1
     }
-
-    local now future_epoch
-    now="$(date +%s)"
-    # A run_start_epoch far in the future makes every real-filesystem mtime
-    # "predate" it, exercising the staleness branch without needing a
-    # platform-specific `touch -t` (BSD and GNU disagree on that flag's
-    # syntax) to backdate a file instead.
-    future_epoch=$((now + 1000000))
-
-    check() {
-        local label="$1" expect_rc="$2"
-        shift 2
-        echo ""
-        echo "-- self-test: $label --"
-        total=$((total + 1))
-        local rc=0
-        check_capability_manifest "$@" || rc=$?
-        if [[ "$rc" -ne "$expect_rc" ]]; then
-            echo "FAIL: self-test '$label': expected exit $expect_rc, got $rc"
-            failures=$((failures + 1))
-        else
-            echo "OK: self-test '$label' (exit $rc, as expected)"
-        fi
-    }
-
-    # 1. Manifest file does not exist at all -> FAIL.
-    check "missing manifest" 1 "$work_dir/does-not-exist.jsonl" "$now" metal
-
-    # 2. Manifest exists but is empty -> FAIL (no records for the required cap).
-    : >"$work_dir/empty.jsonl"
-    check "empty manifest" 1 "$work_dir/empty.jsonl" "$now" metal
-
-    # 3. Only executed:false records -> FAIL (self-skipped is not proof).
-    printf '%s\n' '{"capability":"metal","executed":false,"test":"t::skip"}' \
-        >"$work_dir/all_false.jsonl"
-    check "all executed:false" 1 "$work_dir/all_false.jsonl" "$now" metal
-
-    # 4. One executed:true record -> PASS.
-    printf '%s\n' '{"capability":"metal","executed":true,"test":"t::ran"}' \
-        >"$work_dir/one_true.jsonl"
-    check "one executed:true" 0 "$work_dir/one_true.jsonl" "$now" metal
-
-    # 5. Manifest predates this "run" -> FAIL (stale evidence), proven via
-    #    a run_start_epoch set in the future rather than a backdated mtime.
-    check "stale manifest (future run_start)" 1 "$work_dir/one_true.jsonl" "$future_epoch" metal
-
-    # 6. A malformed line alongside an otherwise-good executed:true record
-    #    -> FAIL. This is the exact behaviour item (d) pins.
-    printf '%s\n%s\n' \
-        '{"capability":"metal","executed":true,"test":"t::ran"}' \
-        'not valid json at all' \
-        >"$work_dir/malformed_plus_good.jsonl"
-    check "malformed line + good record" 1 "$work_dir/malformed_plus_good.jsonl" "$now" metal
-
-    # 7. A required capability with zero records, even though the manifest
-    #    is otherwise well-formed and fresh -> FAIL (checked per-capability,
-    #    not "the manifest has at least one good line anywhere").
-    check "required cap absent from otherwise-good manifest" 1 \
-        "$work_dir/one_true.jsonl" "$now" cuda
-
-    # 8. Two required capabilities, both satisfied -> PASS.
-    printf '%s\n%s\n' \
-        '{"capability":"metal","executed":true,"test":"t::ran"}' \
-        '{"capability":"cuda","executed":true,"test":"t::ran_cuda"}' \
-        >"$work_dir/both_true.jsonl"
-    check "two required capabilities, both satisfied" 0 \
-        "$work_dir/both_true.jsonl" "$now" metal cuda
-
-    # 9. HANDOVER-INFRA: the "bonsai2-models" capability is checked by the
-    #    exact same generic logic as every other capability name above — this
-    #    scenario exercises it by name so a future rename/typo of the string
-    #    this script and `Capability::Bonsai2Models::as_str()` must agree on
-    #    fails a test here, not only in production.
-    printf '%s\n' '{"capability":"bonsai2-models","executed":true,"test":"t::bonsai2_ran"}' \
-        >"$work_dir/bonsai2_models_true.jsonl"
-    check "bonsai2-models executed:true" 0 "$work_dir/bonsai2_models_true.jsonl" "$now" bonsai2-models
-
-    # 10/11. `--require-tests`: a capability can have `executed: true`
-    # records yet still be missing one of the SPECIFIC gates this script
-    # requires by name (item 1(b)'s per-capability required-test-name list).
-    printf '%s\n%s\n' \
-        '{"capability":"bonsai2-models","executed":true,"test":"gate::a"}' \
-        '{"capability":"bonsai2-models","executed":true,"test":"gate::b"}' \
-        >"$work_dir/require_tests_two.jsonl"
-    check "require-tests: every named test present" 0 \
-        "$work_dir/require_tests_two.jsonl" "$now" \
-        "--require-tests=bonsai2-models:gate::a,gate::b"
-    check "require-tests: one named test missing" 1 \
-        "$work_dir/require_tests_two.jsonl" "$now" \
-        "--require-tests=bonsai2-models:gate::a,gate::c"
-
-    # `duration_ms`: an optional field (`oxibonsai_testkit::capability::
-    # record_executed_timed`). A record that carries it must still pass the
-    # ordinary check (and print a total on the "OK" line, verified by eye
-    # above, not asserted here); a non-numeric value must not crash the
-    # parser, just be treated as if the field were absent.
-    printf '%s\n%s\n' \
-        '{"capability":"metal","executed":true,"test":"t::timed","duration_ms":1500}' \
-        '{"capability":"metal","executed":true,"test":"t::bad_duration","duration_ms":"not-a-number"}' \
-        >"$work_dir/duration_ms.jsonl"
-    check "duration_ms: numeric and non-numeric values both still pass" 0 \
-        "$work_dir/duration_ms.jsonl" "$now" metal
-
-    # 12-... : `run_bonsai2_models_stage`'s fail-closed and leg-ordering
-    # behaviour, via a PATH-shimmed `cargo` that only logs its own
-    # invocations (one line per call) instead of building or running
-    # anything — no real 27B GGUF, build or hardware involved.
-    local fake_bin fake_log stub_output
-    fake_bin="$(mktemp -d "${TMPDIR:-/tmp}/oxibonsai_release_gate_selftest_bin.XXXXXX")" || {
-        echo "FAIL: self-test: could not create a scratch bin directory" >&2
-        failures=$((failures + 1))
-        fake_bin=""
-    }
-    if [[ -n "$fake_bin" ]]; then
-        fake_log="$work_dir/fake_cargo_invocations.log"
-        stub_output="$work_dir/stage_stub_output.log"
-        cat >"$fake_bin/cargo" <<'CARGO_STUB_EOF'
-#!/usr/bin/env bash
-echo "$* [OXIBONSAI_KERNEL_TIER=${OXIBONSAI_KERNEL_TIER-unset}]" >>"$OXIBONSAI_SELFTEST_CARGO_LOG"
-exit 0
-CARGO_STUB_EOF
-        chmod +x "$fake_bin/cargo"
-
-        run_stage_stub() {
-            local label="$1" expect_rc="$2" expect_calls="$3"
-            shift 3
-            echo ""
-            echo "-- self-test: $label --"
-            total=$((total + 1))
-            : >"$fake_log"
-            local rc=0
-            OXIBONSAI_SELFTEST_CARGO_LOG="$fake_log" PATH="$fake_bin:$PATH" \
-                run_bonsai2_models_stage "$@" >"$stub_output" 2>&1 || rc=$?
-            local calls
-            calls="$(wc -l <"$fake_log" | tr -d ' ')"
-            if [[ "$rc" -ne "$expect_rc" ]]; then
-                echo "FAIL: self-test '$label': expected exit $expect_rc, got $rc"
-                echo "  stage output: $(cat "$stub_output")"
-                failures=$((failures + 1))
-            elif [[ "$calls" -ne "$expect_calls" ]]; then
-                echo "FAIL: self-test '$label': expected $expect_calls cargo invocation(s), got $calls"
-                echo "  invocation log: $(cat "$fake_log")"
-                failures=$((failures + 1))
-            else
-                echo "OK: self-test '$label' (exit $rc, $calls cargo invocation(s), as expected)"
-            fi
-        }
-
-        local models_half models_full golden_stub metal_present metal_absent
-        models_half="$work_dir/models_half"
-        mkdir -p "$models_half"
-        printf 'x' >"$models_half/$BONSAI2_PQ2_FILE"   # PTQ1_0 deliberately absent
-        models_full="$work_dir/models_full"
-        mkdir -p "$models_full"
-        printf 'x' >"$models_full/$BONSAI2_PQ2_FILE"
-        printf 'x' >"$models_full/$BONSAI2_PTQ1_FILE"
-        golden_stub="$work_dir/golden_stub"
-        mkdir -p "$golden_stub"
-        metal_present="$work_dir/hybrid_metal_gates.rs"
-        printf '// self-test stub\n' >"$metal_present"
-        metal_absent="$work_dir/does-not-exist/hybrid_metal_gates.rs"
-
-        run_stage_stub "stage1c stub: half-populated models dir refuses before any cargo call" \
-            1 0 0 0 "$models_half" "$golden_stub" "$metal_present" 1
-        run_stage_stub "stage1c stub: --skip-bonsai2-models never invokes cargo" \
-            0 0 1 0 "$models_half" "$golden_stub" "$metal_present" 1
-        run_stage_stub "stage1c stub: non-Darwin host runs nothing" \
-            0 0 0 0 "$models_full" "$golden_stub" "$metal_present" 0
-        run_stage_stub "stage1c stub: fully populated + metal file present runs all five legs" \
-            0 5 0 0 "$models_full" "$golden_stub" "$metal_present" 1
-        total=$((total + 1))
-        if [[ -f "$fake_log" ]] && [[ "$(grep -o 'hybrid_forward_parity_tests\|bonsai2_engine_tests\|bonsai2_runtime_tests\|hybrid_metal_gates\|bonsai2_metal_engine_tests' "$fake_log" | tr '\n' ',')" \
-            == "hybrid_forward_parity_tests,bonsai2_engine_tests,bonsai2_runtime_tests,hybrid_metal_gates,bonsai2_metal_engine_tests," ]]; then
-            echo "OK: self-test 'stage1c stub: the five legs run in the documented order (bonsai2_runtime_tests covers G6/G7/G9 in one invocation; the Metal engine leg runs last)'"
-        else
-            echo "FAIL: self-test 'stage1c stub: the five legs run in the documented order'"
-            failures=$((failures + 1))
-        fi
-        # An exported INT8 tier selector must never reach a leg (see
-        # `run_bonsai2_models_stage`): the stub logs what each call saw.
-        local had_tier=0 prior_tier="${OXIBONSAI_KERNEL_TIER-}"
-        [[ -n "${OXIBONSAI_KERNEL_TIER+set}" ]] && had_tier=1
-        export OXIBONSAI_KERNEL_TIER=int8-scalar
-        run_stage_stub "stage1c stub: an exported OXIBONSAI_KERNEL_TIER still runs all five legs" \
-            0 5 0 0 "$models_full" "$golden_stub" "$metal_present" 1
-        total=$((total + 1))
-        if [[ -f "$fake_log" ]] \
-            && [[ "$(grep -c -F 'OXIBONSAI_KERNEL_TIER=unset]' "$fake_log")" -eq 5 ]]; then
-            echo "OK: self-test 'stage1c stub: every leg runs with OXIBONSAI_KERNEL_TIER removed from its environment'"
-        else
-            echo "FAIL: self-test 'stage1c stub: every leg runs with OXIBONSAI_KERNEL_TIER removed from its environment'"
-            echo "  invocation log: $(cat "$fake_log")"
-            failures=$((failures + 1))
-        fi
-        if [[ "$had_tier" -eq 1 ]]; then
-            export OXIBONSAI_KERNEL_TIER="$prior_tier"
-        else
-            unset OXIBONSAI_KERNEL_TIER
-        fi
-        run_stage_stub "stage1c stub: fully populated, metal test file absent, only three legs run" \
-            0 3 0 0 "$models_full" "$golden_stub" "$metal_absent" 1
-        run_stage_stub "stage1c stub: --skip-bonsai2-metal runs only the first three legs" \
-            0 3 0 1 "$models_full" "$golden_stub" "$metal_present" 1
+    cargo "${RELEASE_CLI_BUILD_ARGS[@]}" >"$stream" || cargo_rc=$?
+    if [[ "$cargo_rc" -ne 0 ]]; then
+        echo "FAIL: 'cargo ${RELEASE_CLI_BUILD_ARGS[*]}' exited $cargo_rc" >&2
+        rm -f "$stream"
+        return "$cargo_rc"
     fi
+    cli_path="$(python3 - "$stream" <<'PYEOF'
+import json, sys
 
-    # "legacy-models" through `--require-tests`, exercised by name (same
-    # reasoning as scenario 9's bonsai2-models check): a host with only
-    # Ternary-Bonsai-1.7B.gguf present writes executed=true for that model's
-    # two gates but executed=false for Ternary-Bonsai-8B.gguf's and
-    # Bonsai-8B.gguf's four — the exact partial-fixture shape this script's
-    # REQUIRED_CAPS entry for "legacy-models" must fail on.
-    printf '%s\n%s\n%s\n%s\n%s\n%s\n' \
-        '{"capability":"legacy-models","executed":true,"test":"oxibonsai-model::legacy_parity_tests::ternary_1_7b_greedy_parity_across_tiers"}' \
-        '{"capability":"legacy-models","executed":true,"test":"oxibonsai-runtime::legacy_parity_tests::ternary_1_7b_greedy_text_matches_golden_across_tiers"}' \
-        '{"capability":"legacy-models","executed":false,"test":"oxibonsai-model::legacy_parity_tests::ternary_8b_greedy_parity_across_tiers"}' \
-        '{"capability":"legacy-models","executed":false,"test":"oxibonsai-runtime::legacy_parity_tests::ternary_8b_greedy_text_matches_golden_across_tiers"}' \
-        '{"capability":"legacy-models","executed":false,"test":"oxibonsai-model::legacy_parity_tests::bonsai_8b_greedy_parity_across_tiers"}' \
-        '{"capability":"legacy-models","executed":false,"test":"oxibonsai-runtime::legacy_parity_tests::bonsai_8b_greedy_text_matches_golden_across_tiers"}' \
-        >"$work_dir/legacy_models_partial.jsonl"
-    check "legacy-models require-tests: only the 1.7B pair ran -> FAIL" 1 \
-        "$work_dir/legacy_models_partial.jsonl" "$now" \
-        "--require-tests=legacy-models:\
-oxibonsai-model::legacy_parity_tests::ternary_1_7b_greedy_parity_across_tiers,\
-oxibonsai-model::legacy_parity_tests::ternary_8b_greedy_parity_across_tiers,\
-oxibonsai-model::legacy_parity_tests::bonsai_8b_greedy_parity_across_tiers,\
-oxibonsai-runtime::legacy_parity_tests::ternary_1_7b_greedy_text_matches_golden_across_tiers,\
-oxibonsai-runtime::legacy_parity_tests::ternary_8b_greedy_text_matches_golden_across_tiers,\
-oxibonsai-runtime::legacy_parity_tests::bonsai_8b_greedy_text_matches_golden_across_tiers"
+path = None
+with open(sys.argv[1], "r", encoding="utf-8", errors="replace") as f:
+    for raw in f:
+        line = raw.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        reason = rec.get("reason")
+        if reason == "build-finished" and rec.get("success") is False:
+            sys.exit(1)
+        if reason != "compiler-artifact":
+            continue
+        target = rec.get("target") or {}
+        if target.get("name") != "oxibonsai":
+            continue
+        kinds = target.get("kind")
+        if isinstance(kinds, list) and "bin" not in kinds:
+            continue
+        exe = rec.get("executable")
+        if isinstance(exe, str) and exe:
+            path = exe
+if path is None:
+    sys.exit(1)
+print(path)
+PYEOF
+    )" || {
+        echo "FAIL: cargo's JSON stream names no executable for the 'oxibonsai' binary of oxibonsai-cli" >&2
+        rm -f "$stream"
+        return 1
+    }
+    rm -f "$stream"
+    if [[ ! -f "$cli_path" ]]; then
+        echo "FAIL: cargo reported the CLI executable at $cli_path, but no file exists there" >&2
+        return 1
+    fi
+    if ! "$cli_path" --version >/dev/null 2>&1; then
+        echo "FAIL: the built CLI $cli_path does not answer --version with exit 0" >&2
+        return 1
+    fi
+    printf '%s\n' "$cli_path"
+}
 
-    # `legacy_models_require_tests_arg`'s own list, both ways: every legacy
-    # gate has an executed=true record except M-08's 20000-token YaRN gate,
-    # which self-skipped. Without OXIBONSAI_M08_RUN_LONG=1 that gate is not
-    # required (PASS); with it, its self-skip fails the gate; once it has
-    # really run, the gate passes. A self-skipped CONVERT-EXPORT round trip
-    # (no ONNX export on the host) fails either way.
-    local m08_long_name="oxibonsai-runtime::legacy_parity_tests::m08_yarn_scaling_moves_real_bonsai_8b_logits_at_20000_tokens"
-    local onnx_name="oxibonsai-runtime::legacy_parity_tests::onnx_converted_gguf_loads_through_the_real_tokenizer_round_trip"
-    local legacy_arg legacy_names legacy_name
-    legacy_arg="$(legacy_models_require_tests_arg 0)"
-    IFS=',' read -r -a legacy_names <<<"${legacy_arg#--require-tests=legacy-models:}"
-    : >"$work_dir/legacy_m08_skipped.jsonl"
-    : >"$work_dir/legacy_onnx_skipped.jsonl"
-    for legacy_name in "${legacy_names[@]}"; do
-        printf '{"capability":"legacy-models","executed":true,"test":"%s"}\n' "$legacy_name" \
-            >>"$work_dir/legacy_m08_skipped.jsonl"
-        if [[ "$legacy_name" != "$onnx_name" ]]; then
-            printf '{"capability":"legacy-models","executed":true,"test":"%s"}\n' "$legacy_name" \
-                >>"$work_dir/legacy_onnx_skipped.jsonl"
-        fi
+# Runs `oxibonsai-model`'s `metal_hidden_parity_tests` — the head-free Metal
+# hidden-state prefill behind dense embeddings, checked against the per-token
+# reference on a real model at 10, 300 and 2000 tokens — once per legacy model
+# file, in `LEGACY_MODEL_FILES` order, one real-model process at a time, in
+# `--release` with `--nocapture`. `OXI_MODEL` names exactly one GGUF per run,
+# so a run can never quietly cover fewer models than the release names. The
+# test is not `#[ignore]`d and records `metal-hidden`; the capability check
+# requires `METAL_HIDDEN_TEST_NAME` to have an `executed: true` record.
+#
+# Fails CLOSED before invoking cargo at all when any of the model files is
+# missing from `models_dir` — a partial run would otherwise pass on the
+# strength of the models that WERE present — and stops at the first leg whose
+# cargo invocation fails.
+#   run_metal_hidden_stage <models_dir>
+run_metal_hidden_stage() {
+    local models_dir="$1" file
+    local missing=()
+    for file in "${LEGACY_MODEL_FILES[@]}"; do
+        [[ -s "$models_dir/$file" ]] || missing+=("$file")
     done
-    printf '{"capability":"legacy-models","executed":false,"test":"%s"}\n' "$m08_long_name" \
-        >>"$work_dir/legacy_m08_skipped.jsonl"
-    printf '{"capability":"legacy-models","executed":false,"test":"%s"}\n' "$onnx_name" \
-        >>"$work_dir/legacy_onnx_skipped.jsonl"
-    cp "$work_dir/legacy_m08_skipped.jsonl" "$work_dir/legacy_m08_ran.jsonl"
-    printf '{"capability":"legacy-models","executed":true,"test":"%s"}\n' "$m08_long_name" \
-        >>"$work_dir/legacy_m08_ran.jsonl"
-    check "legacy-models: M-08 long gate self-skipped, OXIBONSAI_M08_RUN_LONG unset -> PASS" 0 \
-        "$work_dir/legacy_m08_skipped.jsonl" "$now" "$(legacy_models_require_tests_arg 0)"
-    check "legacy-models: M-08 long gate self-skipped under OXIBONSAI_M08_RUN_LONG=1 -> FAIL" 1 \
-        "$work_dir/legacy_m08_skipped.jsonl" "$now" "$(legacy_models_require_tests_arg 1)"
-    check "legacy-models: M-08 long gate ran under OXIBONSAI_M08_RUN_LONG=1 -> PASS" 0 \
-        "$work_dir/legacy_m08_ran.jsonl" "$now" "$(legacy_models_require_tests_arg 1)"
-    check "legacy-models: CONVERT-EXPORT round trip self-skipped -> FAIL" 1 \
-        "$work_dir/legacy_onnx_skipped.jsonl" "$now" "$(legacy_models_require_tests_arg 0)"
+    if [[ "${#missing[@]}" -gt 0 ]]; then
+        echo "MISSING fixtures: ${missing[*]}"
+        echo "Refusing to run a partial metal-hidden gate: put the missing file(s) under"
+        echo "$models_dir (or point OXIBONSAI_MODELS_DIR at them), or pass"
+        echo "--skip-legacy-models to release deliberately without this evidence."
+        return 1
+    fi
+    for file in "${LEGACY_MODEL_FILES[@]}"; do
+        echo "── oxibonsai-model::metal_hidden_parity_tests ($file) ──"
+        env -u OXIBONSAI_KERNEL_TIER "OXIBONSAI_MODELS_DIR=$models_dir" \
+            "OXI_MODEL=$models_dir/$file" \
+            cargo test --release -p oxibonsai-model --features metal \
+            --test metal_hidden_parity_tests -- --test-threads=1 --nocapture || return $?
+    done
+    return 0
+}
 
-    rm -rf "$work_dir" "$fake_bin"
-    if [[ "$failures" -eq 0 ]]; then
-        echo ""
-        echo "OK: release-gate.sh self-test — all $total scenarios matched their expected verdict."
+# Fails (returns 1, printing what is missing and both ways out) unless every
+# named file exists under `models_dir`. The shared head of the real-model stage
+# functions below: a partial run would otherwise start cargo, spend minutes
+# and self-skip, which the capability check at the end would only catch after
+# paying for everything that DID have its file.
+#   require_model_files <stage label> <skip flag name> <models_dir> <file>...
+require_model_files() {
+    local label="$1" skip_flag="$2" models_dir="$3"
+    shift 3
+    local file missing=()
+    for file in "$@"; do
+        [[ -s "$models_dir/$file" ]] || missing+=("$file")
+    done
+    if [[ "${#missing[@]}" -gt 0 ]]; then
+        echo "MISSING fixtures: ${missing[*]}"
+        echo "Refusing to run a partial $label gate: put the missing file(s) under"
+        echo "$models_dir (or point OXIBONSAI_MODELS_DIR at them), or pass"
+        echo "$skip_flag to release deliberately without this evidence."
+        return 1
+    fi
+    return 0
+}
+
+# Runs `oxibonsai-model`'s `speculative_ternary_metal_gates` — speculative
+# greedy decoding against plain greedy decoding, token for token, on the real
+# Ternary-Bonsai-1.7B and Ternary-Bonsai-8B on the Metal route (draft lengths
+# below and above the 8-row tiled-GEMM boundary and the adaptive lookahead's
+# whole range) — in `--release`, `--nocapture`, one real-model process. The
+# test finds its two files through `OXIBONSAI_MODELS_DIR`, is not `#[ignore]`d
+# and records `legacy-models` per model; the capability check requires both
+# names. Fails CLOSED before invoking cargo when either ternary file is
+# missing.
+#   run_speculative_stage <models_dir>
+run_speculative_stage() {
+    local models_dir="$1"
+    require_model_files "speculative-decoding" "--skip-legacy-models" "$models_dir" \
+        "${LEGACY_MODEL_FILES[0]}" "${LEGACY_MODEL_FILES[1]}" || return 1
+    env -u OXIBONSAI_KERNEL_TIER "OXIBONSAI_MODELS_DIR=$models_dir" \
+        cargo test --release -p oxibonsai-model --features metal \
+        --test speculative_ternary_metal_gates -- --test-threads=1 --nocapture
+}
+
+# Runs `oxibonsai-runtime`'s `embeddings_model_backed` against the real
+# Ternary-Bonsai-1.7B: the semantic smoke test and the embedding benchmark
+# (`embed_bench_short_and_long`: the production Metal hidden prefill against the
+# batched CPU pass at 10 / 200 / 2000 tokens and against the per-token loop at
+# 10 / 200 tokens, 20 s target at 2000). The benchmark runs only on an explicit
+# opt-in, so this passes `OXIBONSAI_EMBED_BENCH=1` AND `OXI_MODEL` itself — the
+# leg can never self-skip into a green — and the capability check requires both
+# tests by name.
+#
+# The per-token reference loop at 2000 tokens (about five to six minutes on an
+# M3 at a load average of about 10, longer under a heavier load) has its own
+# opt-in, `OXIBONSAI_EMBED_BENCH_PER_TOKEN=1`,
+# for manual runs. This leg never sets it and removes an inherited one
+# (`env -u`): at 2000 tokens the gate compares the production Metal embedding
+# with the batched CPU pass (pooled cosine >= 0.9999) and asserts the 20 s
+# Metal target, so the leg's cost and verdict do not depend on a developer's
+# exported variable. Fails CLOSED before invoking cargo when the model or the
+# tokenizer is missing.
+#   run_embedding_stage <models_dir>
+run_embedding_stage() {
+    local models_dir="$1"
+    require_model_files "embedding" "--skip-legacy-models" "$models_dir" \
+        "${LEGACY_MODEL_FILES[0]}" "tokenizer.json" || return 1
+    env -u OXIBONSAI_KERNEL_TIER -u OXIBONSAI_EMBED_BENCH_PER_TOKEN \
+        "OXIBONSAI_MODELS_DIR=$models_dir" \
+        "OXI_MODEL=$models_dir/${LEGACY_MODEL_FILES[0]}" OXIBONSAI_EMBED_BENCH=1 \
+        cargo test --release -p oxibonsai-runtime --all-features \
+        --test embeddings_model_backed -- --test-threads=1 --nocapture
+}
+
+# Runs the M-18 acceptance gate: `oxibonsai-model`'s fused Metal prefill
+# chunk-size sweep (`real_model_metal_prefill_chunk_size_sweep`, a unit test of
+# the `chunked_prefill` module, hence `--lib`) on each model in
+# `SWEEP_MODEL_FILES` — Bonsai-8B, then the Ternary-Bonsai-1.7B — one real-model
+# process at a time, in `--release` with `--nocapture`. `OXI_MODEL` names
+# exactly one GGUF per run (without it the test self-skips), so a run can never
+# quietly cover fewer models than the release names. For each model the test
+# prefills a 4096-token prompt at six chunk sizes with the fused route pinned,
+# decodes it once token by token, and asserts the fused path actually ran, the
+# 256-token speed-up over sequential decode, that the whole prompt prefills
+# faster fused than decoded, and the bound on the fused per-token cost's growth
+# from the short prompt to the full one. It records `legacy-models` under
+# `SWEEP_TEST_NAME`, which the capability check requires by name.
+#
+# `OXIBONSAI_KERNEL_TIER` and `OXIBONSAI_PREFILL_SWEEP_TOKENS` are removed from
+# each leg's environment (`env -u`): the sweep measures the default Metal
+# route at its default prompt length, and a value a developer exported would
+# silently move the release evidence off it.
+#
+# Fails CLOSED before invoking cargo at all when either model file is missing
+# from `models_dir`, and stops at the first leg whose cargo invocation fails.
+#   run_prefill_sweep_stage <models_dir>
+run_prefill_sweep_stage() {
+    local models_dir="$1" file
+    require_model_files "M-18 prefill sweep" "--skip-legacy-models" "$models_dir" \
+        "${SWEEP_MODEL_FILES[@]}" || return 1
+    for file in "${SWEEP_MODEL_FILES[@]}"; do
+        echo "── oxibonsai-model::lib::$SWEEP_TEST_FILTER ($file) ──"
+        env -u OXIBONSAI_KERNEL_TIER -u OXIBONSAI_PREFILL_SWEEP_TOKENS \
+            "OXI_MODEL=$models_dir/$file" \
+            cargo test --release -p oxibonsai-model --features metal --lib \
+            -- --test-threads=1 --nocapture "$SWEEP_TEST_FILTER" || return $?
+    done
+    return 0
+}
+
+# Runs the three real-model lib/bin cases of stage 1d that decode the legacy
+# Ternary-Bonsai-1.7B through the Metal engine, one after another:
+# `temperature_zero_completion_takes_the_metal_greedy_gpu_path` and
+# `real_model_stream_stop_sequence_matches_the_non_stream_text_and_reports_stop`
+# (both `oxibonsai-runtime --lib`, env-gated on `OXI_MODEL` + `OXI_TOKENIZER`)
+# and `metal_greedy_cpu_fallback_tests`'s
+# `real_model_greedy_gpu_fallback_byte_identical` (Metal against pure-CPU greedy
+# plus the forced mid-stream CPU fallback). Every one self-skips with a record
+# when `OXI_MODEL` is unset, so each leg is handed it explicitly: a leg that
+# ran without it would exit 0 having validated nothing. Fails CLOSED before
+# invoking cargo when the model or the tokenizer is missing.
+#   run_legacy_lib_bin_stage <models_dir>
+run_legacy_lib_bin_stage() {
+    local models_dir="$1"
+    require_model_files "legacy lib/bin" "--skip-legacy-models" "$models_dir" \
+        "${LEGACY_MODEL_FILES[0]}" "tokenizer.json" || return 1
+    local model="$models_dir/${LEGACY_MODEL_FILES[0]}" tokenizer="$models_dir/tokenizer.json"
+    echo "── oxibonsai-runtime::lib (legacy-models: temperature-0 GPU path, stream stop) ──"
+    env -u OXIBONSAI_KERNEL_TIER "OXI_MODEL=$model" "OXI_TOKENIZER=$tokenizer" \
+        cargo test --release -p oxibonsai-runtime --all-features --lib \
+        -- --test-threads=1 \
+        temperature_zero_completion_takes_the_metal_greedy_gpu_path \
+        real_model_stream_stop_sequence_matches_the_non_stream_text_and_reports_stop \
+        || return $?
+    echo ""
+    echo "── oxibonsai-runtime::metal_greedy_cpu_fallback_tests (legacy-models: Metal↔CPU byte parity + mid-stream fallback) ──"
+    env -u OXIBONSAI_KERNEL_TIER "OXI_MODEL=$model" \
+        cargo test --release -p oxibonsai-runtime --features metal \
+        --test metal_greedy_cpu_fallback_tests -- --test-threads=1 \
+        real_model_greedy_gpu_fallback_byte_identical
+}
+
+# Whether this run requires — and therefore runs — the Bonsai 2 vision
+# evidence: prints 1 on a Darwin host that has the real projector next to the
+# 27B when neither --skip-bonsai2-models (no 27B evidence at all, so none of
+# the vision legs that load it) nor --skip-bonsai2-vision was passed, else 0.
+# The one predicate the stage and the capability requirement both read, so
+# they can never disagree.
+#   bonsai2_vision_required <skip_vision:0|1> <skip_models:0|1> <models_dir> <is_darwin:0|1>
+bonsai2_vision_required() {
+    local skip_vision="$1" skip_models="$2" models_dir="$3" is_darwin="$4"
+    if [[ "$skip_vision" -eq 1 || "$skip_models" -eq 1 || "$is_darwin" -ne 1 ]]; then
+        echo 0
+    elif [[ -s "$models_dir/$BONSAI2_MMPROJ_FILE" ]]; then
+        echo 1
+    else
+        echo 0
+    fi
+}
+
+# Runs the real Bonsai 2 vision gates on the CPU path, in `--release`, one real
+# 27B process at a time: oxibonsai-model's `bonsai2_vision_tests` (the 27B
+# `PQ2_0` and its projector against the fork's image goldens), oxibonsai-runtime's
+# `bonsai2_vision_runtime_tests` (its `real_27b_` leg: the same weights behind
+# the chat endpoint) and oxibonsai-model's `vision_mmproj_tests` (the real
+# projector bound block by block and checked against the f64 reference).
+# `OXI_REQUIRE_MODEL_FILES=1` turns a missing file into a failure instead of a
+# self-skip, and `env -u OXIBONSAI_KERNEL_TIER` keeps the CPU legs on the
+# default configuration the release ships.
+#
+# Skipped (return 0, saying so) with --skip-bonsai2-vision, with
+# --skip-bonsai2-models (the 27B evidence is not collected at all) and on a
+# non-Darwin host. Fails CLOSED, before invoking cargo, when the 27B is
+# present but the projector is not: a release that ships `--mmproj` must carry
+# this evidence, and the refusal names both ways out. Also fails closed when
+# the 27B itself is missing.
+#   run_bonsai2_vision_stage <skip_vision:0|1> <skip_models:0|1> <models_dir> <is_darwin:0|1>
+run_bonsai2_vision_stage() {
+    local skip_vision="$1" skip_models="$2" models_dir="$3" is_darwin="$4"
+
+    if [[ "$skip_vision" -eq 1 ]]; then
+        echo "--skip-bonsai2-vision was passed: this release carries NO real Bonsai 2"
+        echo "vision-projector evidence (no image answer, projector or round-trip"
+        echo "gate ran). Say so in the release notes."
         return 0
     fi
-    echo ""
-    echo "FAILED: release-gate.sh self-test — $failures/$total scenario(s) did not match."
-    return 1
+    if [[ "$skip_models" -eq 1 ]]; then
+        echo "--skip-bonsai2-models was passed: the Bonsai 2 vision gates load the 27B,"
+        echo "so they are not run either; this release carries NO vision evidence."
+        return 0
+    fi
+    if [[ "$is_darwin" -ne 1 ]]; then
+        echo "The vision gates are gated to the Apple Silicon host this release is cut on;"
+        echo "there is no non-macOS run of them on this machine. Nothing to run."
+        return 0
+    fi
+
+    local pq2_path="$models_dir/$BONSAI2_PQ2_FILE" mmproj_path="$models_dir/$BONSAI2_MMPROJ_FILE"
+    if [[ ! -s "$pq2_path" ]]; then
+        echo "MISSING fixtures: $BONSAI2_PQ2_FILE"
+        echo "Refusing to run a partial Bonsai 2 vision gate: it needs the 27B beside its"
+        echo "projector. Put the file under $models_dir (or point OXIBONSAI_MODELS_DIR at"
+        echo "it), or pass --skip-bonsai2-vision / --skip-bonsai2-models."
+        return 1
+    fi
+    if [[ ! -s "$mmproj_path" ]]; then
+        echo "MISSING fixtures: $BONSAI2_MMPROJ_FILE"
+        echo "The 27B is present but its vision projector is not: refusing to release"
+        echo "without the real image-path evidence. Put the file under $models_dir (or"
+        echo "point OXIBONSAI_MODELS_DIR at it), or pass --skip-bonsai2-vision to release"
+        echo "deliberately without it."
+        return 1
+    fi
+
+    echo "── oxibonsai-model::bonsai2_vision_tests (real 27B + projector, CPU path) ──"
+    env -u OXIBONSAI_KERNEL_TIER "OXIBONSAI_MODELS_DIR=$models_dir" \
+        "OXI_BONSAI2_PQ2_GGUF=$pq2_path" "OXI_BONSAI2_MMPROJ_GGUF=$mmproj_path" \
+        OXI_REQUIRE_MODEL_FILES=1 \
+        cargo test --release -p oxibonsai-model --all-features \
+        --test bonsai2_vision_tests -- --test-threads=1 --nocapture || return $?
+
+    echo "── oxibonsai-runtime::bonsai2_vision_runtime_tests (real 27B chat round trip) ──"
+    env -u OXIBONSAI_KERNEL_TIER "OXIBONSAI_MODELS_DIR=$models_dir" \
+        "OXI_BONSAI2_PQ2_GGUF=$pq2_path" "OXI_BONSAI2_MMPROJ_GGUF=$mmproj_path" \
+        OXI_REQUIRE_MODEL_FILES=1 \
+        cargo test --release -p oxibonsai-runtime --all-features \
+        --test bonsai2_vision_runtime_tests -- --test-threads=1 --nocapture || return $?
+
+    echo "── oxibonsai-model::vision_mmproj_tests (real projector) ──"
+    env -u OXIBONSAI_KERNEL_TIER "OXIBONSAI_MODELS_DIR=$models_dir" \
+        "OXI_BONSAI2_MMPROJ_GGUF=$mmproj_path" OXI_REQUIRE_MODEL_FILES=1 \
+        cargo test --release -p oxibonsai-model --all-features \
+        --test vision_mmproj_tests -- --test-threads=1 --nocapture
 }
+
+# Prints 1 when this run requires (and so runs) the Metal half of the vision
+# evidence — wherever `bonsai2_vision_required` holds and --skip-bonsai2-metal
+# was not passed — else 0; the stage and the capability check both read it.
+#   bonsai2_vision_metal_required <skip_vision> <skip_models> <skip_metal> <models_dir> <is_darwin>
+bonsai2_vision_metal_required() {
+    local skip_vision="$1" skip_models="$2" skip_metal="$3" models_dir="$4" is_darwin="$5"
+    if [[ "$skip_metal" -eq 1 ]]; then
+        echo 0
+    else
+        bonsai2_vision_required "$skip_vision" "$skip_models" "$models_dir" "$is_darwin"
+    fi
+}
+
+# Runs the Metal half of the real Bonsai 2 vision gates, in `--release`, one
+# real-model process at a time: oxibonsai-model's `vision_metal_tests` (the
+# Metal tower on the real projector against the CPU tower and the f64
+# reference) and `bonsai2_vision_metal_tests` (the 27B image prompts on the
+# Metal runner and tower against the CPU path and the vendored image goldens,
+# both bands), oxibonsai-runtime's `bonsai2_vision_metal_runtime_tests` (the
+# image chat round trip on a Metal engine) and the CLI's
+# `bonsai2_vision_cli_tests` (stage 0's `OXIBONSAI_CLI_BIN`: `run --mmproj
+# --backend auto` stays on the Metal runner and prints the golden answer, as
+# `--backend cpu` does, `serve` answers the image request, and a dense model
+# is refused before any image is decoded), each with OXI_REQUIRE_MODEL_FILES=1.
+# Skipped (saying so) under --skip-bonsai2-vision, --skip-bonsai2-models,
+# --skip-bonsai2-metal and on a non-Darwin host; otherwise it fails CLOSED
+# before invoking cargo when the projector or either 27B band is missing.
+#   run_bonsai2_vision_metal_stage <skip_vision> <skip_models> <skip_metal> <models_dir> <is_darwin>
+run_bonsai2_vision_metal_stage() {
+    local skip_vision="$1" skip_models="$2" skip_metal="$3" models_dir="$4" is_darwin="$5"
+
+    if [[ "$skip_vision" -eq 1 || "$skip_models" -eq 1 || "$is_darwin" -ne 1 ]]; then
+        echo "The vision leg does not run here (see above), so neither does its Metal half."
+        return 0
+    fi
+    if [[ "$skip_metal" -eq 1 ]]; then
+        echo "--skip-bonsai2-metal was passed: this release carries NO Metal vision"
+        echo "evidence (tower, runner rows prefill, Metal chat round trip, CLI on the"
+        echo "Metal runner). Say so in the release notes."
+        return 0
+    fi
+
+    local pq2_path="$models_dir/$BONSAI2_PQ2_FILE" ptq1_path="$models_dir/$BONSAI2_PTQ1_FILE" \
+        mmproj_path="$models_dir/$BONSAI2_MMPROJ_FILE"
+    require_model_files "Bonsai 2 Metal vision" "--skip-bonsai2-metal (or --skip-bonsai2-vision)" \
+        "$models_dir" "$BONSAI2_PQ2_FILE" "$BONSAI2_PTQ1_FILE" "$BONSAI2_MMPROJ_FILE" || return 1
+
+    echo "── oxibonsai-model::vision_metal_tests (real projector on the Metal tower) ──"
+    env -u OXIBONSAI_KERNEL_TIER "OXI_BONSAI2_MMPROJ_GGUF=$mmproj_path" \
+        OXI_REQUIRE_MODEL_FILES=1 \
+        cargo test --release -p oxibonsai-model --all-features \
+        --test vision_metal_tests -- --test-threads=1 --nocapture || return $?
+
+    echo "── oxibonsai-model::bonsai2_vision_metal_tests (real 27B vision on Metal, both bands) ──"
+    env -u OXIBONSAI_KERNEL_TIER "OXI_BONSAI2_PQ2_GGUF=$pq2_path" \
+        "OXI_BONSAI2_PTQ1_GGUF=$ptq1_path" "OXI_BONSAI2_MMPROJ_GGUF=$mmproj_path" \
+        OXI_REQUIRE_MODEL_FILES=1 \
+        cargo test --release -p oxibonsai-model --all-features \
+        --test bonsai2_vision_metal_tests -- --test-threads=1 --nocapture || return $?
+
+    echo "── oxibonsai-runtime::bonsai2_vision_metal_runtime_tests (image chat on Metal) ──"
+    env -u OXIBONSAI_KERNEL_TIER "OXI_BONSAI2_PQ2_GGUF=$pq2_path" \
+        "OXI_BONSAI2_MMPROJ_GGUF=$mmproj_path" OXI_REQUIRE_MODEL_FILES=1 \
+        cargo test --release -p oxibonsai-runtime --all-features \
+        --test bonsai2_vision_metal_runtime_tests -- --test-threads=1 --nocapture || return $?
+
+    echo "── oxibonsai-cli::bonsai2_vision_cli_tests (the shipped CLI: run and serve with --mmproj) ──"
+    env -u OXIBONSAI_KERNEL_TIER "OXI_BONSAI2_PQ2_GGUF=$pq2_path" \
+        "OXI_BONSAI2_MMPROJ_GGUF=$mmproj_path" OXI_REQUIRE_MODEL_FILES=1 \
+        cargo test --release -p oxibonsai-cli --all-features \
+        --test bonsai2_vision_cli_tests -- --test-threads=1 --nocapture
+}
+
+# ── --self-test ──────────────────────────────────────────────────────────
+# The offline scenarios live in scripts/release-gate-selftest.sh, which defines
+# `release_gate_self_test` (and the helpers only it uses). It is sourced only
+# when `--self-test` is asked for (see the argument loop below), so a gate run
+# never reads it.
 
 REQUIRE_CUDA=0
 SKIP_LEGACY_MODELS=0
 SKIP_BONSAI2_MODELS=0
 SKIP_BONSAI2_METAL=0
+SKIP_BONSAI2_VISION=0
+# CUDA_WAIVER_USED is 1 only when ci.sh reports having used the waiver (never
+# from the flag alone); the verdict and the manifest record are driven by it.
+ACCEPT_APPROX_CUDA=0
+CUDA_WAIVER_USED=0
 # M-08's 20000-token YaRN gate runs (and is then required by name) only when
 # this is exactly "1" — see the usage notes at the top of this file.
 M08_RUN_LONG=0
@@ -798,18 +1207,23 @@ M08_RUN_LONG=0
 for arg in "$@"; do
     case "$arg" in
         --require-cuda) REQUIRE_CUDA=1 ;;
+        --accept-approximate-cuda-syntax) ACCEPT_APPROX_CUDA=1 ;;
         --skip-legacy-models) SKIP_LEGACY_MODELS=1 ;;
         --skip-bonsai2-models) SKIP_BONSAI2_MODELS=1 ;;
         --skip-bonsai2-metal) SKIP_BONSAI2_METAL=1 ;;
+        --skip-bonsai2-vision) SKIP_BONSAI2_VISION=1 ;;
         --self-test)
+            # A missing sibling file fails closed: no verdict is a failure, never a pass.
+            # shellcheck source=release-gate-selftest.sh
+            source "$SCRIPT_DIR/release-gate-selftest.sh" || exit 2
             release_gate_self_test
             exit $?
             ;;
         --help|-h)
             cat <<'HELP_EOF'
-Usage: release-gate.sh [--require-cuda] [--skip-legacy-models]
-                        [--skip-bonsai2-models] [--skip-bonsai2-metal]
-                        [--self-test]
+Usage: release-gate.sh [--require-cuda] [--accept-approximate-cuda-syntax]
+                        [--skip-legacy-models] [--skip-bonsai2-models] [--skip-bonsai2-metal]
+                        [--skip-bonsai2-vision] [--self-test]
 
   --require-cuda        Also require fresh "cuda" capability-manifest
                          evidence (see the capability-manifest contract at
@@ -818,9 +1232,19 @@ Usage: release-gate.sh [--require-cuda] [--skip-legacy-models]
                          no CUDA hardware, so a default run never demands
                          CUDA evidence.
 
+  --accept-approximate-cuda-syntax
+                         On a release host WITHOUT the CUDA toolkit (every macOS
+                         host), accept an APPROXIMATE CUDA kernel-syntax check
+                         (parsed as C++ with CUDA builtins stubbed; NOT an nvcc
+                         compile) instead of failing the gate. Off by default.
+                         Loud: the header, a waiver record in the manifest and
+                         the verdict "PASSED with a waiver"; state it in the
+                         release notes. Never waives a syntax error; REFUSED
+                         with --require-cuda (exit 2).
+
   --skip-legacy-models   Opt out of the "legacy-models" capability, which
-                         is otherwise REQUIRED on Darwin (FIX3-PARITY /
-                         orchestrator ruling D-6(4)). "legacy-models" is
+                         is otherwise REQUIRED on Darwin (design decision
+                         D-6(4)). "legacy-models" is
                          the evidence that the real-model CPU/NEON/Metal
                          greedy parity gate (oxibonsai-model and
                          oxibonsai-runtime's legacy_parity_tests, driven
@@ -828,14 +1252,22 @@ Usage: release-gate.sh [--require-cuda] [--skip-legacy-models]
                          ran on this host, guarding README's "byte-identical
                          output at --temperature 0" claim. Passing this flag
                          releases WITHOUT that real-model evidence — the
-                         gate skips stage 1b entirely and does not add
-                         "legacy-models" to the required-capability list —
+                         gate skips stage 1b entirely (including the Metal
+                         hidden-state gate, oxibonsai-model's
+                         metal_hidden_parity_tests, the speculative gate,
+                         oxibonsai-model's speculative_ternary_metal_gates,
+                         the embedding leg, oxibonsai-runtime's
+                         embeddings_model_backed, and the M-18 fused-prefill
+                         chunk-size sweep, oxibonsai-model's
+                         real_model_metal_prefill_chunk_size_sweep, which
+                         run on the same GGUFs) and does not add "legacy-models" or
+                         "metal-hidden" to the required-capability list —
                          and must be stated explicitly in the release notes
                          when used; it is never applied implicitly.
 
   --skip-bonsai2-models  Opt out of the "bonsai2-models" capability, which
-                         is otherwise REQUIRED on Darwin (HANDOVER-INFRA,
-                         same shape as --skip-legacy-models above, for the
+                         is otherwise REQUIRED on Darwin (same shape as
+                         --skip-legacy-models above, for the
                          Bonsai 2 27B target). "bonsai2-models" is the
                          evidence that the real Bonsai 2 27B gates
                          (oxibonsai-model's hybrid_forward_parity_tests and
@@ -849,19 +1281,53 @@ Usage: release-gate.sh [--require-cuda] [--skip-legacy-models]
                          explicitly in the release notes when used; it is
                          never applied implicitly.
 
-  --skip-bonsai2-metal   Opt out only of the Metal-specific half of
-                         "bonsai2-models" evidence: oxibonsai-model's
-                         hybrid_metal_gates (CPU-vs-Metal token parity and
-                         decode throughput on the real Bonsai 2 27B). The
-                         non-Metal Bonsai 2 27B gates (stage 1c's first two
-                         legs) are still required. Passing this flag
+  --skip-bonsai2-metal   Opt out only of the Metal-specific Bonsai 2 27B
+                         evidence: oxibonsai-model's hybrid_metal_gates
+                         (CPU-vs-Metal token parity and decode throughput)
+                         and hybrid_metal_prefill_gates (the runner's
+                         batched prefill), oxibonsai-runtime's
+                         bonsai2_metal_engine_tests ("bonsai2-metal-engine"),
+                         and the Metal half of the vision leg
+                         ("bonsai2-vision-metal": vision_metal_tests,
+                         bonsai2_vision_metal_tests,
+                         bonsai2_vision_metal_runtime_tests and the CLI's
+                         bonsai2_vision_cli_tests). The non-Metal Bonsai 2
+                         27B gates (stage 1c's first three legs) and the CPU
+                         vision leg are still required. Passing this flag
                          releases WITHOUT Metal 27B evidence and must be
                          stated explicitly in the release notes when used.
 
-  --self-test            Run this script's own capability-manifest-parsing
-                         self-test scenarios and exit (no release gate).
+  --skip-bonsai2-vision  Opt out of the real Bonsai 2 vision evidence
+                         ("bonsai2-vision" and "bonsai2-mmproj"): oxibonsai-model's
+                         bonsai2_vision_tests and vision_mmproj_tests and
+                         oxibonsai-runtime's bonsai2_vision_runtime_tests, driven
+                         against the 27B PQ2_0 GGUF and its Qwen3-VL projector
+                         (Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf), CPU path. The
+                         evidence is REQUIRED on Darwin whenever the projector is
+                         present beside the 27B; a host with the 27B but WITHOUT
+                         the projector fails closed instead of silently releasing
+                         without it. Passing this flag releases WITHOUT real
+                         image-path evidence and must be stated explicitly in the
+                         release notes when used. --skip-bonsai2-models implies
+                         it (the vision legs load the 27B). It also drops the
+                         Metal half of the vision leg ("bonsai2-vision-metal",
+                         see --skip-bonsai2-metal).
+
+  --self-test            Run this script's own offline self-test scenarios
+                         (capability-manifest parsing, the stage functions,
+                         the stage-0 CLI build, the main flow and the CUDA
+                         waiver across ci.sh/check_cuda.sh in a scratch copy,
+                         all against stand-in tools; defined in
+                         scripts/release-gate-selftest.sh) and exit (no
+                         release gate).
 
   --help, -h             Show this message and exit.
+
+Stage 0 (always, before anything else): builds the oxibonsai CLI once
+(`cargo build --release -p oxibonsai-cli --bin oxibonsai --all-features`),
+exports the executable cargo reports as OXIBONSAI_CLI_BIN for every later
+stage, and fails closed if the build fails or reports no runnable binary.
+An OXIBONSAI_CLI_BIN already in the environment is overridden.
 
 Environment:
   OXIBONSAI_M08_RUN_LONG=1
@@ -885,6 +1351,16 @@ HELP_EOF
     esac
 done
 
+# --require-cuda asks for real CUDA evidence, --accept-approximate-cuda-syntax says
+# there is no real CUDA check: a contradiction, in either argument order. Refused
+# here, after the whole loop and before the manifest is rotated or stage 0 builds
+# anything, so a mistaken combination can never start a long release run.
+if [[ "$ACCEPT_APPROX_CUDA" -eq 1 && "$REQUIRE_CUDA" -eq 1 ]]; then
+    echo "ERROR: --accept-approximate-cuda-syntax cannot be combined with --require-cuda:" >&2
+    echo "a release that requires CUDA evidence must run on a host with the CUDA toolkit." >&2
+    exit 2
+fi
+
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 # Absolute, exported for producer tests to read directly — see the
 # capability-manifest contract note above. Resolved by string prefix
@@ -904,6 +1380,11 @@ echo "════════════════════════�
 echo "project root: $PROJECT_ROOT"
 echo "capability manifest: $CAPABILITY_REPORT"
 echo "require-cuda: $([[ "$REQUIRE_CUDA" -eq 1 ]] && echo yes || echo no)"
+echo "cuda-syntax: $([[ "$ACCEPT_APPROX_CUDA" -eq 1 ]] && echo 'approximate accepted by flag' || echo 'nvcc required')"
+if [[ "$ACCEPT_APPROX_CUDA" -eq 1 ]]; then
+    echo "  -> without nvcc the CUDA kernel sources are only parsed as C++ with CUDA builtins stubbed (NOT an"
+    echo "     nvcc compile): the verdict will say \"PASSED with a waiver\"; state this in the release notes."
+fi
 echo "skip-legacy-models: $([[ "$SKIP_LEGACY_MODELS" -eq 1 ]] && echo yes || echo no)"
 if [[ "$SKIP_LEGACY_MODELS" -eq 1 ]]; then
     echo "  -> real-model CPU/NEON/Metal greedy parity evidence (\"legacy-models\")"
@@ -929,27 +1410,80 @@ if [[ "$M08_RUN_LONG" -eq 0 ]]; then
 fi
 echo "skip-bonsai2-metal: $([[ "$SKIP_BONSAI2_METAL" -eq 1 ]] && echo yes || echo no)"
 if [[ "$SKIP_BONSAI2_METAL" -eq 1 ]]; then
-    echo "  -> the Metal-specific half of \"bonsai2-models\" evidence (CPU-vs-Metal"
-    echo "     token parity, decode throughput) will NOT be required or collected"
-    echo "     this run; state this explicitly in the release notes."
+    echo "  -> the Metal-specific Bonsai 2 evidence (CPU-vs-Metal token parity,"
+    echo "     decode throughput, batched prefill, the Metal engine and the Metal"
+    echo "     half of the vision leg, \"bonsai2-vision-metal\") will NOT be"
+    echo "     required or collected this run; state this explicitly in the"
+    echo "     release notes."
 elif [[ "$(uname -s)" == "Darwin" ]]; then
-    echo "  -> the Metal-specific half of \"bonsai2-models\" evidence is REQUIRED on"
-    echo "     this host; pass --skip-bonsai2-metal to opt out."
+    echo "  -> the Metal-specific Bonsai 2 evidence (including the Metal half of the"
+    echo "     vision leg) is REQUIRED on this host; pass --skip-bonsai2-metal to"
+    echo "     opt out."
+fi
+echo "skip-bonsai2-vision: $([[ "$SKIP_BONSAI2_VISION" -eq 1 ]] && echo yes || echo no)"
+if [[ "$SKIP_BONSAI2_VISION" -eq 1 ]]; then
+    echo "  -> real Bonsai 2 vision-projector evidence (\"bonsai2-vision\", \"bonsai2-mmproj\")"
+    echo "     will NOT be required or collected this run; state this explicitly in"
+    echo "     the release notes."
+elif [[ "$(uname -s)" == "Darwin" ]]; then
+    echo "  -> real Bonsai 2 vision-projector evidence is REQUIRED on this host whenever"
+    echo "     the projector is present beside the 27B (and fails closed when it is"
+    echo "     not); pass --skip-bonsai2-vision to opt out."
 fi
 echo ""
 
-# Fresh-evidence guarantee: delete any leftover manifest and record the
-# moment this run started, so a stale file from a previous invocation (or
-# a differently-configured one) can never be mistaken for this run's proof.
+# Fresh-evidence guarantee: move any leftover manifest aside (to a name with
+# a UTC timestamp and this process's pid, so no earlier run's evidence is
+# lost and two runs never share a name) and record the moment this run
+# started, so a stale file from a previous invocation (or a differently-
+# configured one) can never be mistaken for this run's proof: the run starts
+# from no manifest at all, and the capability check below reads only the file
+# this run's producers wrote. A manifest that cannot be moved aside fails the
+# gate rather than being left in place to be read as this run's.
 mkdir -p "$TARGET_DIR"
-rm -f "$CAPABILITY_REPORT"
+if [[ -e "$CAPABILITY_REPORT" ]]; then
+    ROTATED_REPORT="$CAPABILITY_REPORT.$(date -u +%Y%m%dT%H%M%SZ).$$"
+    mv -f "$CAPABILITY_REPORT" "$ROTATED_REPORT" || {
+        echo "FATAL: could not move the previous capability manifest $CAPABILITY_REPORT aside" >&2
+        exit 2
+    }
+    echo "previous capability manifest kept as: $ROTATED_REPORT"
+fi
 RUN_START_EPOCH="$(date +%s)"
 
+# ── 0. The release CLI binary, built once ────────────────────────────────
+# The binary every later stage runs (see STAGE 0 in the header) is built here,
+# once, with the full release feature set, and exported as OXIBONSAI_CLI_BIN,
+# which ci.sh's nextest run and stages 1b-1d inherit. This stage FAILS CLOSED:
+# no later stage runs without it. The capture is `VAR="$(cmd)" || { rc=$?; }`
+# for the reason given at stage 1 below.
+echo "═══════════════════════════════════════════════════════════════"
+echo "  Stage 0: release CLI binary (cargo build --release --all-features)"
+echo "═══════════════════════════════════════════════════════════════"
+if [[ -n "${OXIBONSAI_CLI_BIN:-}" ]]; then
+    echo "NOTE: OXIBONSAI_CLI_BIN=$OXIBONSAI_CLI_BIN is set in the environment; the gate"
+    echo "builds its own binary from this tree and overrides it."
+fi
+RELEASE_CLI_BIN="$(build_release_cli_binary)" || {
+    rc=$?
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo "RELEASE GATE FAILED: the release CLI binary could not be built (exit $rc)."
+    echo "See cargo's output above; no later stage runs without it."
+    echo "═══════════════════════════════════════════════════════════════"
+    exit "$rc"
+}
+export OXIBONSAI_CLI_BIN="$RELEASE_CLI_BIN"
+echo "OXIBONSAI_CLI_BIN=$OXIBONSAI_CLI_BIN (exported to every later stage)"
+echo ""
+
 # ── 1. The full gate, in strict mode ─────────────────────────────────────
-# ci.sh itself also truncates the manifest right before its nextest stages
-# (belt-and-braces: it must produce a clean slate whether invoked directly
-# by a developer or, as here, via release-gate.sh) — both truncations
-# target the same path, so this is idempotent, not a double-reset race.
+# This script has already moved any earlier manifest aside (above); ci.sh
+# then truncates the same path right before its nextest stages
+# (belt-and-braces: it must produce a clean slate whether invoked directly by
+# a developer or, as here, via release-gate.sh), so the run still starts from
+# an empty manifest at the same path — no earlier evidence is lost, and the
+# two steps never race.
 #
 # NOTE: `rc=$?` is captured via `cmd || { rc=$?; ... }`, not
 # `if ! cmd; then rc=$?; ...`. Inside `if ! cmd; then`, `$?` reports the
@@ -960,15 +1494,64 @@ RUN_START_EPOCH="$(date +%s)"
 # would have gone on to `exit 0`, so a caller under `set -e`
 # (scripts/publish.sh) would NOT have stopped and would have published
 # despite the gate failing. Do not "simplify" this back to `if ! cmd`.
-"$SCRIPT_DIR/ci.sh" --release || {
-    rc=$?
+#
+# --accept-approximate-cuda-syntax is forwarded only when it was passed here, and
+# counts as USED only when ci.sh's cuda-syntax stage really took it (a host with
+# nvcc passes the real check and waives nothing). So with the flag, ci.sh's stdout
+# is also copied to a scratch log whose `CUDA_SYNTAX_RESULT=` line is read
+# afterwards (stderr stays attached); without it ci.sh runs exactly as before.
+# `pipefail` makes the pipeline's status ci.sh's own, so the idiom above holds.
+CI_ARGS=(--release)
+CI_STDOUT_LOG=""
+if [[ "$ACCEPT_APPROX_CUDA" -eq 1 ]]; then
+    CI_ARGS+=(--accept-approximate-cuda-syntax)
+    CI_STDOUT_LOG="$(mktemp "${TMPDIR:-/tmp}/oxibonsai_release_gate_ci_stdout.XXXXXX")" ||
+        { echo "FATAL: could not create a scratch file for scripts/ci.sh's output." >&2; exit 2; }
+fi
+CI_RC=0
+if [[ -n "$CI_STDOUT_LOG" ]]; then
+    "$SCRIPT_DIR/ci.sh" "${CI_ARGS[@]}" | tee "$CI_STDOUT_LOG" || CI_RC=$?
+else
+    "$SCRIPT_DIR/ci.sh" "${CI_ARGS[@]}" || CI_RC=$?
+fi
+if [[ "$CI_RC" -ne 0 ]]; then
+    [[ -n "$CI_STDOUT_LOG" ]] && rm -f "$CI_STDOUT_LOG"
     echo ""
     echo "═══════════════════════════════════════════════════════════════"
-    echo "RELEASE GATE FAILED: scripts/ci.sh --release did not pass (exit $rc)."
+    echo "RELEASE GATE FAILED: scripts/ci.sh --release did not pass (exit $CI_RC)."
     echo "See its output above for the failing stage."
     echo "═══════════════════════════════════════════════════════════════"
-    exit "$rc"
-}
+    exit "$CI_RC"
+fi
+
+# With the flag: ci.sh passed, so its cuda-syntax stage passed with a real nvcc
+# check or the accepted approximate one, and its CUDA_SYNTAX_RESULT line says
+# which; anything else is a broken contract and fails closed.
+if [[ -n "$CI_STDOUT_LOG" ]]; then
+    CUDA_VERDICT="none"
+    grep -q -F -x 'CUDA_SYNTAX_RESULT=nvcc-ok' "$CI_STDOUT_LOG" && CUDA_VERDICT="nvcc-ok"
+    grep -q -F -x 'CUDA_SYNTAX_RESULT=approximate-accepted' "$CI_STDOUT_LOG" && CUDA_VERDICT="approximate-accepted"
+    rm -f "$CI_STDOUT_LOG"
+    case "$CUDA_VERDICT" in
+        nvcc-ok) echo "cuda-syntax: a real nvcc check passed; the waiver was not needed and is not used." ;;
+        approximate-accepted)
+            CUDA_WAIVER_USED=1
+            # Appended AFTER ci.sh, which truncates the manifest before its nextest stages.
+            printf '%s\n' '{"capability":"cuda-syntax","executed":false,"waived":"approximate-accepted","test":"scripts/check_cuda.sh"}' \
+                >>"$CAPABILITY_REPORT" ||
+                { echo "FATAL: could not record the CUDA waiver in $CAPABILITY_REPORT." >&2; exit 2; }
+            echo ""
+            echo "WAIVER IN EFFECT: --accept-approximate-cuda-syntax was given and used. The CUDA kernel sources were"
+            echo "only parsed as C++ with CUDA builtins stubbed, NOT compiled by nvcc: the CUDA backend is not certified"
+            echo "by this run. Recorded in the capability manifest (capability \"cuda-syntax\", waived \"approximate-accepted\")."
+            ;;
+        *)
+            echo "RELEASE GATE FAILED: ci.sh passed under --accept-approximate-cuda-syntax but printed no" >&2
+            echo "recognised CUDA_SYNTAX_RESULT line, so the gate cannot say whether the waiver was used." >&2
+            exit 2
+            ;;
+    esac
+fi
 
 # ── 1b. Real-model legacy parity gate, SERIALIZED (D-6(4)) ───────────────
 # Invoked directly, and with `--test-threads=1`, for the reason documented in
@@ -995,9 +1578,7 @@ elif [[ "$(uname -s)" != "Darwin" ]]; then
 else
     LEGACY_MODELS_DIR="${OXIBONSAI_MODELS_DIR:-$PROJECT_ROOT/models}"
     LEGACY_FIXTURES=(
-        "Ternary-Bonsai-1.7B.gguf"
-        "Ternary-Bonsai-8B.gguf"
-        "Bonsai-8B.gguf"
+        "${LEGACY_MODEL_FILES[@]}"
         "tokenizer.json"
         "Ternary-Bonsai-1.7B-ONNX/onnx/model_q2.onnx"
     )
@@ -1048,6 +1629,76 @@ else
             exit "$rc"
         }
     done
+
+    # The head-free Metal hidden-state prefill behind dense embeddings, on the
+    # same three legacy GGUFs, once per file (`run_metal_hidden_stage`). It
+    # fails closed on a missing model file and on the first failing leg, and
+    # the capability check below requires its `metal-hidden` record by name.
+    echo ""
+    echo "── oxibonsai-model::metal_hidden_parity_tests (once per legacy model) ──"
+    run_metal_hidden_stage "$LEGACY_MODELS_DIR" || {
+        rc=$?
+        echo ""
+        echo "═══════════════════════════════════════════════════════════════"
+        echo "RELEASE GATE FAILED: the Metal hidden-state parity gate did not"
+        echo "pass (exit $rc). The output above names the model whose leg failed,"
+        echo "or the legacy GGUF that is missing."
+        echo "═══════════════════════════════════════════════════════════════"
+        exit "$rc"
+    }
+
+    # Speculative greedy against plain greedy on the two ternary models, on
+    # the Metal route: a verify of 8 rows or more (draft length 7 and up, and
+    # the adaptive lookahead's upper range) runs the tiled GEMM family while
+    # the decode it must equal runs the single-token one. Required by name.
+    echo ""
+    echo "── oxibonsai-model::speculative_ternary_metal_gates (speculative == plain greedy, ternary Metal) ──"
+    run_speculative_stage "$LEGACY_MODELS_DIR" || {
+        rc=$?
+        echo ""
+        echo "═══════════════════════════════════════════════════════════════"
+        echo "RELEASE GATE FAILED: the speculative-decoding gate did not pass"
+        echo "(exit $rc). A divergence names the model, prompt, draft length, token"
+        echo "index and the verify batch size that produced it: that is a finding"
+        echo "about the tiled-GEMM kernel-family switch, not a bound to loosen."
+        echo "═══════════════════════════════════════════════════════════════"
+        exit "$rc"
+    }
+
+    # The embedding leg: the semantic smoke test and the benchmark, which
+    # opts in explicitly (this stage sets OXIBONSAI_EMBED_BENCH=1 and OXI_MODEL
+    # itself, so the leg never self-skips) and never asks for the per-token
+    # reference at 2000 tokens (OXIBONSAI_EMBED_BENCH_PER_TOKEN stays unset).
+    echo ""
+    echo "── oxibonsai-runtime::embeddings_model_backed (embedding smoke + benchmark, explicit opt-in) ──"
+    run_embedding_stage "$LEGACY_MODELS_DIR" || {
+        rc=$?
+        echo ""
+        echo "═══════════════════════════════════════════════════════════════"
+        echo "RELEASE GATE FAILED: the real-model embedding leg did not pass"
+        echo "(exit $rc)."
+        echo "═══════════════════════════════════════════════════════════════"
+        exit "$rc"
+    }
+
+    # M-18: the fused Metal prefill's chunk-size sweep against sequential
+    # decode, once on Bonsai-8B and once on the Ternary-Bonsai-1.7B
+    # (`run_prefill_sweep_stage`). It fails closed on a missing model file and
+    # on the first failing leg, and the capability check below requires the
+    # sweep's own record by name.
+    echo ""
+    echo "── oxibonsai-model::lib::$SWEEP_TEST_FILTER (M-18 fused-prefill chunk-size sweep, once per model) ──"
+    run_prefill_sweep_stage "$LEGACY_MODELS_DIR" || {
+        rc=$?
+        echo ""
+        echo "═══════════════════════════════════════════════════════════════"
+        echo "RELEASE GATE FAILED: the M-18 fused-prefill chunk-size sweep did not"
+        echo "pass (exit $rc). The output above names the model whose leg failed, or"
+        echo "the GGUF that is missing; the per-chunk-size timings and the load"
+        echo "average they were measured under are printed beside the verdict."
+        echo "═══════════════════════════════════════════════════════════════"
+        exit "$rc"
+    }
 fi
 
 # ── 1c. Real Bonsai 2 27B gates, SERIALIZED, RELEASE ─────────────────────
@@ -1077,6 +1728,42 @@ run_bonsai2_models_stage "$SKIP_BONSAI2_MODELS" "$SKIP_BONSAI2_METAL" \
     echo ""
     echo "═══════════════════════════════════════════════════════════════"
     echo "RELEASE GATE FAILED: the real Bonsai 2 27B gate did not pass (exit $rc)."
+    echo "See its output above for which leg failed, or which file is missing."
+    echo "═══════════════════════════════════════════════════════════════"
+    exit "$rc"
+}
+
+# The vision leg of stage 1c: the 27B with its Qwen3-VL projector on the CPU
+# path (`run_bonsai2_vision_stage`), required by name below wherever the
+# projector exists. It fails CLOSED when the 27B is present without the
+# projector, unless --skip-bonsai2-vision says so.
+echo ""
+echo "═══════════════════════════════════════════════════════════════"
+echo "  Real Bonsai 2 vision gate (CPU path, --test-threads=1)"
+echo "═══════════════════════════════════════════════════════════════"
+run_bonsai2_vision_stage "$SKIP_BONSAI2_VISION" "$SKIP_BONSAI2_MODELS" \
+    "$BONSAI2_MODELS_DIR" "$BONSAI2_IS_DARWIN" || {
+    rc=$?
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo "RELEASE GATE FAILED: the real Bonsai 2 vision gate did not pass (exit $rc)."
+    echo "See its output above for which leg failed, or which file is missing."
+    echo "═══════════════════════════════════════════════════════════════"
+    exit "$rc"
+}
+
+# Its Metal half (`run_bonsai2_vision_metal_stage`), required by name below
+# wherever the CPU vision leg ran, unless --skip-bonsai2-metal.
+echo ""
+echo "═══════════════════════════════════════════════════════════════"
+echo "  Real Bonsai 2 vision gate (Metal tower, runner and CLI, --test-threads=1)"
+echo "═══════════════════════════════════════════════════════════════"
+run_bonsai2_vision_metal_stage "$SKIP_BONSAI2_VISION" "$SKIP_BONSAI2_MODELS" \
+    "$SKIP_BONSAI2_METAL" "$BONSAI2_MODELS_DIR" "$BONSAI2_IS_DARWIN" || {
+    rc=$?
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo "RELEASE GATE FAILED: the real Bonsai 2 Metal vision gate did not pass (exit $rc)."
     echo "See its output above for which leg failed, or which file is missing."
     echo "═══════════════════════════════════════════════════════════════"
     exit "$rc"
@@ -1113,32 +1800,12 @@ elif [[ "$(uname -s)" != "Darwin" ]]; then
     echo "── oxibonsai-runtime::lib (legacy-models): NOT AVAILABLE ON THIS HOST ──"
     echo "Both cases need the fused Metal greedy-decode path; nothing to run here."
 else
-    echo "── oxibonsai-runtime::lib (legacy-models: temperature-0 GPU path, stream stop) ──"
-    OXI_MODEL="$LEGACY_MODELS_DIR_1D/Ternary-Bonsai-1.7B.gguf" \
-        OXI_TOKENIZER="$LEGACY_MODELS_DIR_1D/tokenizer.json" \
-        cargo test --release -p oxibonsai-runtime --all-features --lib \
-        -- --test-threads=1 \
-        temperature_zero_completion_takes_the_metal_greedy_gpu_path \
-        real_model_stream_stop_sequence_matches_the_non_stream_text_and_reports_stop || {
+    run_legacy_lib_bin_stage "$LEGACY_MODELS_DIR_1D" || {
         rc=$?
         echo ""
         echo "═══════════════════════════════════════════════════════════════"
-        echo "RELEASE GATE FAILED: oxibonsai-runtime's real-model lib cases did not"
-        echo "pass (exit $rc)."
-        echo "═══════════════════════════════════════════════════════════════"
-        exit "$rc"
-    }
-    echo ""
-    echo "── oxibonsai-runtime::metal_greedy_cpu_fallback_tests (legacy-models: Metal↔CPU byte parity + mid-stream fallback) ──"
-    OXI_MODEL="$LEGACY_MODELS_DIR_1D/Ternary-Bonsai-1.7B.gguf" \
-        cargo test --release -p oxibonsai-runtime --features metal \
-        --test metal_greedy_cpu_fallback_tests -- --test-threads=1 \
-        real_model_greedy_gpu_fallback_byte_identical || {
-        rc=$?
-        echo ""
-        echo "═══════════════════════════════════════════════════════════════"
-        echo "RELEASE GATE FAILED: real_model_greedy_gpu_fallback_byte_identical did"
-        echo "not pass (exit $rc)."
+        echo "RELEASE GATE FAILED: oxibonsai-runtime's real-model lib / Metal-fallback"
+        echo "cases did not pass (exit $rc)."
         echo "═══════════════════════════════════════════════════════════════"
         exit "$rc"
     }
@@ -1179,6 +1846,23 @@ else
     }
 fi
 
+# The closing block of a PASSED run; both PASS exits below use it, so a waived
+# run (CUDA_WAIVER_USED=1) can never read as a full one.
+#   print_gate_passed <the verdict line of a run that waived nothing>
+print_gate_passed() {
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    if [[ "$CUDA_WAIVER_USED" -eq 1 ]]; then
+        echo "RELEASE GATE PASSED with a waiver: CUDA kernel syntax was checked approximately (no nvcc)."
+        echo "The kernels were parsed as C++ with CUDA builtins stubbed, not compiled by nvcc, and nothing ran"
+        echo "on CUDA hardware: the CUDA backend is not certified by this run. State this in the release notes."
+        echo "scripts/publish.sh runs this gate again and needs --accept-approximate-cuda-syntax as well."
+    else
+        echo "$1"
+    fi
+    echo "═══════════════════════════════════════════════════════════════"
+}
+
 # ── 2. Hardware-capability enforcement (T-05) ────────────────────────────
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
@@ -1203,6 +1887,13 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
         # OXIBONSAI_M08_RUN_LONG=1 (the separate release step described at
         # the top of this file).
         REQUIRED_CAPS+=("$(legacy_models_require_tests_arg "$M08_RUN_LONG")")
+        # The Metal hidden-state gate runs on the same legacy models (stage
+        # 1b, once per file), so it is required under the same condition. A
+        # bare "metal-hidden" would be satisfied by any one record, so the
+        # gate is named as well: a run that self-skipped writes
+        # executed=false for it and fails here.
+        REQUIRED_CAPS+=("metal-hidden")
+        REQUIRED_CAPS+=("--require-tests=metal-hidden:$METAL_HIDDEN_TEST_NAME")
     fi
     # Same reasoning, for the Bonsai 2 27B target: see the
     # --skip-bonsai2-models note in this file's header.
@@ -1232,6 +1923,8 @@ oxibonsai-cli::bin::real_27b_hybrid_model_serves_embeddings"
             BONSAI2_REQUIRED_NAMES="$BONSAI2_REQUIRED_NAMES,\
 oxibonsai-model::hybrid_metal_gates::hybrid_real_27b_metal_matches_cpu_tokens_bonsai2,\
 oxibonsai-model::hybrid_metal_gates::hybrid_real_27b_metal_decode_throughput_bonsai2"
+            # The runner's two batched-prefill gates, under the same opt out.
+            BONSAI2_REQUIRED_NAMES="$BONSAI2_REQUIRED_NAMES,$(IFS=,; echo "${BONSAI2_PREFILL_TEST_NAMES[*]}")"
         fi
         REQUIRED_CAPS+=("--require-tests=bonsai2-models:$BONSAI2_REQUIRED_NAMES")
         if [[ "$SKIP_BONSAI2_METAL" -eq 0 ]]; then
@@ -1245,6 +1938,27 @@ oxibonsai-runtime::bonsai2_metal_engine_tests::real_27b_metal_engine_decode_thro
 oxibonsai-runtime::bonsai2_metal_engine_tests::real_27b_metal_engine_serves_chat_like_the_cpu_engine_bonsai2")
         fi
     fi
+    # The vision evidence, wherever the vision leg ran: the same predicate
+    # that decides whether `run_bonsai2_vision_stage` runs the legs. Both
+    # capabilities are required by name — the lighter synthetic cases of the
+    # same files also write records, and a bare capability name would accept
+    # any one of them.
+    if [[ "$(bonsai2_vision_required "$SKIP_BONSAI2_VISION" "$SKIP_BONSAI2_MODELS" \
+        "$BONSAI2_MODELS_DIR" "$BONSAI2_IS_DARWIN")" -eq 1 ]]; then
+        REQUIRED_CAPS+=("bonsai2-vision")
+        REQUIRED_CAPS+=("--require-tests=bonsai2-vision:$(IFS=,; echo "${BONSAI2_VISION_TEST_NAMES[*]}")")
+        REQUIRED_CAPS+=("bonsai2-mmproj")
+        REQUIRED_CAPS+=("--require-tests=bonsai2-mmproj:$BONSAI2_MMPROJ_TEST_NAME")
+    fi
+    # The Metal half of the vision evidence, wherever it ran: the Metal
+    # tower's gate is a second "bonsai2-mmproj" name, the rest are
+    # "bonsai2-vision-metal", each by name.
+    if [[ "$(bonsai2_vision_metal_required "$SKIP_BONSAI2_VISION" "$SKIP_BONSAI2_MODELS" \
+        "$SKIP_BONSAI2_METAL" "$BONSAI2_MODELS_DIR" "$BONSAI2_IS_DARWIN")" -eq 1 ]]; then
+        REQUIRED_CAPS+=("--require-tests=bonsai2-mmproj:$BONSAI2_MMPROJ_METAL_TEST_NAME")
+        REQUIRED_CAPS+=("bonsai2-vision-metal")
+        REQUIRED_CAPS+=("--require-tests=bonsai2-vision-metal:$(IFS=,; echo "${BONSAI2_VISION_METAL_TEST_NAMES[*]}")")
+    fi
 fi
 if [[ "$REQUIRE_CUDA" -eq 1 ]]; then
     REQUIRED_CAPS+=("cuda")
@@ -1252,10 +1966,7 @@ fi
 
 if [[ "${#REQUIRED_CAPS[@]}" -eq 0 ]]; then
     echo "No hardware capability is required on this host/configuration. Skipping."
-    echo ""
-    echo "═══════════════════════════════════════════════════════════════"
-    echo "RELEASE GATE PASSED."
-    echo "═══════════════════════════════════════════════════════════════"
+    print_gate_passed "RELEASE GATE PASSED."
     exit 0
 fi
 echo "Required on this host: ${REQUIRED_CAPS[*]}"
@@ -1272,16 +1983,12 @@ if ! check_capability_manifest "$CAPABILITY_REPORT" "$RUN_START_EPOCH" "${REQUIR
     echo ""
     echo "═══════════════════════════════════════════════════════════════"
     echo "RELEASE GATE FAILED: a required hardware capability did not"
-    echo "actually execute this run (see above). This is expected today for"
-    echo "any capability whose producer test has not yet adopted the"
-    echo "manifest contract documented at the top of this script — see"
-    echo "CI-GATE's recorded deviations for the exact per-file change."
+    echo "actually execute this run (see above): its producer test either"
+    echo "self-skipped (executed=false), never ran, or has not adopted the"
+    echo "manifest contract documented at the top of this script."
     echo "═══════════════════════════════════════════════════════════════"
     exit 1
 fi
 
-echo ""
-echo "═══════════════════════════════════════════════════════════════"
-echo "RELEASE GATE PASSED. scripts/publish.sh is safe to run next."
-echo "═══════════════════════════════════════════════════════════════"
+print_gate_passed "RELEASE GATE PASSED. scripts/publish.sh is safe to run next."
 exit 0

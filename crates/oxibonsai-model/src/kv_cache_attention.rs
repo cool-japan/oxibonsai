@@ -1,5 +1,5 @@
 //! Storage-aware GQA attention read straight out of a [`KvCache`]
-//! (B2-11-FIX, gatekeeper REQUIRED #4: "an f16-aware GQA read").
+//! (an f16-aware GQA read).
 //!
 //! # Why this lives beside the cache
 //!

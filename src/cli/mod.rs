@@ -23,11 +23,13 @@ use oxibonsai_runtime::OxiBonsaiConfig;
 mod admission;
 mod bonsai2;
 mod generate;
+mod image_fetch;
 mod model_desc;
 mod model_source;
 mod repl;
 mod term;
 mod tokenizer_backend;
+mod vision;
 
 mod args;
 mod util;
@@ -345,6 +347,9 @@ pub async fn run_with(cli: Cli) -> anyhow::Result<()> {
             mmproj,
             image,
             image_max_tokens,
+            allow_image_url_fetch,
+            image_url_timeout_ms,
+            image_url_allow_host,
             allow_vocab_mismatch,
             no_stream,
         } => {
@@ -412,6 +417,12 @@ pub async fn run_with(cli: Cli) -> anyhow::Result<()> {
                     mmproj,
                     images: image,
                     image_max_tokens,
+                },
+                image_sources: bonsai2::ImageSourceFlags {
+                    allow_image_url_fetch,
+                    media_path: None,
+                    image_url_timeout_ms,
+                    image_url_allow_hosts: image_url_allow_host,
                 },
                 allow_vocab_mismatch,
                 no_stream,
@@ -506,6 +517,9 @@ pub async fn run_with(cli: Cli) -> anyhow::Result<()> {
             mmproj,
             image,
             image_max_tokens,
+            allow_image_url_fetch,
+            image_url_timeout_ms,
+            image_url_allow_host,
             allow_vocab_mismatch,
         } => {
             let sampling = resolve_sampling_overrides(temperature, top_k, top_p, min_p, &sections)?;
@@ -571,6 +585,12 @@ pub async fn run_with(cli: Cli) -> anyhow::Result<()> {
                     images: image,
                     image_max_tokens,
                 },
+                image_sources: bonsai2::ImageSourceFlags {
+                    allow_image_url_fetch,
+                    media_path: None,
+                    image_url_timeout_ms,
+                    image_url_allow_hosts: image_url_allow_host,
+                },
                 allow_vocab_mismatch,
             };
             cmd_chat::run(chat_args)?
@@ -609,6 +629,10 @@ pub async fn run_with(cli: Cli) -> anyhow::Result<()> {
             mmproj,
             image,
             image_max_tokens,
+            allow_image_url_fetch,
+            image_url_timeout_ms,
+            image_url_allow_host,
+            media_path,
             embedding_backend,
             embedding_corpus,
         } => {
@@ -682,13 +706,34 @@ pub async fn run_with(cli: Cli) -> anyhow::Result<()> {
                     images: image,
                     image_max_tokens,
                 },
+                image_sources: bonsai2::ImageSourceFlags {
+                    allow_image_url_fetch,
+                    media_path,
+                    image_url_timeout_ms,
+                    image_url_allow_hosts: image_url_allow_host,
+                },
                 embedding_backend,
                 embedding_corpus,
             };
             cmd_serve::run(serve_args).await?;
         }
 
-        Commands::Info { model, json } => cmd_info::run(model, json)?,
+        Commands::Info {
+            model,
+            json,
+            mmproj,
+            image_max_tokens,
+            prefill_chunk,
+        } => cmd_info::run(cmd_info::InfoRequest {
+            model,
+            json,
+            vision: bonsai2::VisionRequest {
+                mmproj,
+                images: Vec::new(),
+                image_max_tokens,
+            },
+            prefill_chunk,
+        })?,
 
         Commands::BuildInfo => model_desc::print_build_info(),
 

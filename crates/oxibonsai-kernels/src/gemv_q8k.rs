@@ -3,7 +3,7 @@
 //! Implements `y = W × x` where W is stored as Q8_K blocks.
 //! Each super-block covers 256 weights (QK_K = 256).
 //!
-//! On AArch64 this routes through [`neon_fused::row_dot`] (K-15 item (c));
+//! On AArch64 this routes through `neon_fused::row_dot` (K-15 item (c));
 //! everywhere else it falls back to the generic dequantize-then-dot driver.
 //! Q8_K's dequant is a single affine `w[i] = d * qs[i]` per block (one
 //! scale, no sub-block scales/mins and no nibble/bit-field packing), so this

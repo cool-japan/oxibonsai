@@ -34,12 +34,12 @@ pub struct RagConfig {
     /// chunks are dropped. Counting bytes here would silently cut non-ASCII
     /// (e.g. CJK) context to roughly a third of the configured budget, since
     /// those characters are multiple bytes wide but still one character
-    /// each (RAG-EVAL-IMG-20).
+    /// each.
     pub max_context_chars: usize,
     /// String placed between adjacent retrieved chunks in the context block.
     pub context_separator: String,
     /// Prompt template.  Two placeholders are expanded, in a single
-    /// left-to-right pass over the template (see [`render_template`]):
+    /// left-to-right pass over the template (see `render_template`):
     ///
     /// - `{context}` — the retrieved context string.
     /// - `{query}` — the raw query string.
@@ -47,8 +47,7 @@ pub struct RagConfig {
     /// Neither substituted value is itself re-scanned for placeholder
     /// syntax, so retrieved (untrusted, corpus-controlled) text that
     /// happens to contain the literal text `{query}` cannot pull the live
-    /// query into an attacker-chosen position in the rendered prompt
-    /// (RAG-EVAL-IMG-31).
+    /// query into an attacker-chosen position in the rendered prompt.
     pub prompt_template: String,
 }
 
@@ -125,9 +124,9 @@ pub struct PipelineStats {
 /// The two logically-distinct pieces of a RAG prompt, kept apart instead of
 /// being spliced into one string.
 ///
-/// [`RagPipeline::build_prompt`]'s [`render_template`] already stops
-/// *corpus* content from re-expanding `{context}`/`{query}` placeholders
-/// (RAG-EVAL-IMG-31), but the result is still a single flat string in which
+/// [`RagPipeline::build_prompt`]'s `render_template` already stops
+/// *corpus* content from re-expanding `{context}`/`{query}` placeholders,
+/// but the result is still a single flat string in which
 /// retrieved (untrusted, indexed-document) text sits directly alongside
 /// instruction/query text with nothing structurally marking the boundary
 /// for whatever consumes that string next. [`RagPipeline::build_prompt_parts`]
@@ -183,7 +182,7 @@ impl<E: Embedder> RagPipeline<E> {
     /// Configure a custom [`Chunker`] (builder-style; consumes and returns
     /// `self`), mirroring [`crate::retriever::RetrieverBuilder::with_chunker`]
     /// for callers who start from [`RagPipeline::new`] rather than building
-    /// the underlying [`Retriever`] by hand (RAG-EVAL-IMG-11/12).
+    /// the underlying [`Retriever`] by hand.
     #[must_use]
     pub fn with_chunker(mut self, chunker: Box<dyn Chunker>) -> Self {
         self.retriever = self.retriever.with_chunker(chunker);
@@ -200,8 +199,7 @@ impl<E: Embedder> RagPipeline<E> {
 
     /// Index a single document, attaching `metadata` to every chunk produced
     /// from it — the pipeline-level mirror of
-    /// [`crate::retriever::Retriever::add_document_with_metadata`]
-    /// (RAG-EVAL-IMG-11).
+    /// [`crate::retriever::Retriever::add_document_with_metadata`].
     pub fn index_document_with_metadata(
         &mut self,
         text: &str,
@@ -260,9 +258,9 @@ impl<E: Embedder> RagPipeline<E> {
     /// is empty, the context placeholder is replaced with an empty string
     /// (allowing the model to answer from prior knowledge).
     ///
-    /// See [`render_template`] / [`RagConfig::prompt_template`] for why this
+    /// See `render_template` / [`RagConfig::prompt_template`] for why this
     /// is safe against corpus content that happens to contain `{context}` or
-    /// `{query}` literally (RAG-EVAL-IMG-31). Prefer
+    /// `{query}` literally. Prefer
     /// [`RagPipeline::build_prompt_parts`] instead when talking to a chat
     /// completion API that supports multiple messages: it keeps the
     /// untrusted retrieved context out of the single flattened string this
@@ -279,7 +277,7 @@ impl<E: Embedder> RagPipeline<E> {
     /// Like [`RagPipeline::build_prompt`], but returns the retrieved
     /// context and the query as separate [`PromptParts`] instead of
     /// splicing them into [`RagConfig::prompt_template`] — see that type's
-    /// documentation for why (RAG-EVAL-IMG-31: the corpus-controlled
+    /// documentation for why (the corpus-controlled
     /// `context` half is untrusted).
     ///
     /// Returns [`RagError::EmptyQuery`] for blank queries.  If the vector
@@ -340,7 +338,7 @@ impl<E: Embedder> RagPipeline<E> {
 /// retrieved chunk was then rewritten by the second `.replace()` call,
 /// letting corpus content splice the live user query into an
 /// attacker-chosen position of the rendered prompt: prompt injection
-/// through the corpus (RAG-EVAL-IMG-31, reproduced). This function instead
+/// through the corpus (reproduced). This function instead
 /// only ever advances through `template`'s own bytes; `context` and `query`
 /// are appended to the output verbatim and their contents are never
 /// examined by the scanning loop, so this holds regardless of what either
@@ -434,7 +432,7 @@ mod tests {
         );
     }
 
-    // ── verifier MINOR: parts-returning API keeps context out of one string ──
+    // ── parts-returning API keeps context out of one string ──
 
     #[test]
     fn build_prompt_parts_keeps_context_and_query_separate() {

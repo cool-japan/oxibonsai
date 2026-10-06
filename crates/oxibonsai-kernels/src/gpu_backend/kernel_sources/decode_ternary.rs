@@ -173,7 +173,7 @@ inline float4 decode_byte_pq2(uint b) {
 /// `decode_pq2` / `decode_byte_pq2`). The per-byte inner loop has a constant trip
 /// count and is fully unrolled by the MSL compiler; it is deliberately kept in
 /// loop form (rather than the hand-unrolled `uint` packing of the TQ2 V1 kernel)
-/// until B2-15 profiles it on the 27B.
+/// until it is profiled on the 27B.
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub const MSL_GEMV_PQ2_G128_V1: &str = r#"
 kernel void gemv_pq2_g128_v1(

@@ -81,6 +81,11 @@ pub(super) fn is_prefill_timeout(e: &(dyn std::error::Error + 'static)) -> bool 
 /// **iff** the shared device already has live sessions. When neither holds,
 /// no Metal state exists in this process on the shared device, so nothing can
 /// be resident under the epoch there.
+///
+/// A model used only inside an isolated `MetalDevice` graph whose last replica
+/// drops on a thread that is not bound to that graph keeps its epoch's buffers
+/// until that graph drops. They are never bound stale: a reused address mints
+/// a new epoch.
 pub(crate) fn release_metal_mapping(epoch: u64) {
     // The mapping's M-18 prefill cost model leaves with it.
     MetalPrefillPolicy::forget(epoch);
@@ -1185,7 +1190,7 @@ impl<'a> BonsaiModel<'a> {
             )
             .into());
         }
-        // M-17 gate (out-of-owned-files fix; see FIX3-MODEL wave-3.5 notes):
+        // M-17 gate:
         // this fused-Metal entry point attends over the *full* KV cache with
         // no windowing, and is reached directly from
         // `engine_greedy::greedy_decode_token_with_fallback` rather than

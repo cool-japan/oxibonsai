@@ -34,7 +34,7 @@ fn small_config(num_layers: usize, vocab: usize, max_ctx: usize) -> Qwen3Config 
         rms_norm_eps: 1e-6,
         rope_freq_base: 10_000.0,
         rope_scaling: RopeScaling::None,
-        // FIX3-MODEL added this field (M-17). Every test in this file wants
+        // Field added for M-17. Every test in this file wants
         // the full-causal path, which is what `None` selects.
         sliding_window: None,
         architecture: "test".to_string(),
@@ -172,7 +172,7 @@ fn dense_embedding_shares_one_allocation_and_reports_it() {
     assert!(std::sync::Arc::ptr_eq(&handle, &arc));
     assert_eq!(table.resident_bytes(), vocab * hidden * 4);
     // The batched gather the GPU prefill paths use sees the same numbers as
-    // `copy_row` (M-02, wave 2.5 — this replaces the `&table[8..12]` dense
+    // `copy_row` (M-02 — this replaces the `&table[8..12]` dense
     // `Index` assertion, which no longer exists).
     let mut batch = vec![0.0f32; 2 * hidden];
     table.copy_rows(&[1, 2], &mut batch).expect("batch");
@@ -180,7 +180,7 @@ fn dense_embedding_shares_one_allocation_and_reports_it() {
 }
 
 /// A non-dense table never materializes anything — not on a row lookup and
-/// not on the batched gather the GPU prefill paths use (M-02, wave 2.5).
+/// not on the batched gather the GPU prefill paths use (M-02).
 ///
 /// This is the strengthened successor of
 /// `quantized_embedding_materializes_only_on_dense_index`, which asserted the
@@ -295,7 +295,7 @@ fn forward_rejects_an_out_of_range_token_instead_of_panicking() {
 fn gpu_fallback_error_round_trips_through_its_accessor() {
     let err = gpu_fallback_requires_cache_rebuild(4096);
     assert_eq!(gpu_fallback_cache_rebuild_pos(&err), Some(4096));
-    // MET-05 (wave 2.5): the marker is now the typed variant's `error_code()`,
+    // MET-05: the marker is now the typed variant's `error_code()`,
     // not a prefix inside the message, so assert on the code itself — a
     // stricter check than the substring test it replaces (the code is the
     // whole string, not a fragment of a longer sentence).
@@ -464,7 +464,7 @@ fn kv_cache_grows_on_demand_and_keeps_its_contents() {
     );
     assert!(
         model.kv_cache().is_f16() && model.kv_cache().is_lazy(),
-        "REQUIRED #4 (3)+(4): the host default is a lazy f16 cache"
+        "the host default is a lazy f16 cache"
     );
     let head_dim = model.config().head_dim;
     // Exactly representable in f16, so the round trip is exact.
@@ -495,7 +495,7 @@ fn kv_cache_grows_on_demand_and_keeps_its_contents() {
 }
 
 /// Replaces "a loaded model's caches do not grow behind the GPU's back"
-/// (REQUIRED #4 (4) makes every model's host KV grow lazily): the invariant
+/// (every model's host KV grows lazily): the invariant
 /// that rule protected — a device-side KV cache must never be re-geometried
 /// mid-sequence — now holds by construction, because every device cache is
 /// sized from the host cache's fixed LOGICAL limit (`max_seq_len()`), which
@@ -533,7 +533,7 @@ fn host_kv_growth_never_changes_the_device_kv_geometry() {
 
 /// Lazy growth across a chunk boundary on the real decode loop, with a
 /// populated model: every position written before the growth is still
-/// there after it (REQUIRED #4 (4)'s "growth across a chunk boundary").
+/// there after it ("growth across a chunk boundary").
 #[test]
 fn decode_loop_grows_the_host_kv_across_a_chunk_boundary() {
     let config = small_config(1, 32, 1024);
@@ -780,7 +780,7 @@ fn forward_into_is_allocation_free_per_token_serial_lm_head() {
 
 #[test]
 fn forward_into_is_allocation_free_without_blocks() {
-    // Narrower guard on the code this package owns end to end: embedding row
+    // Narrower guard on the code this crate owns end to end: embedding row
     // lookup -> output norm -> LM head, with no `TransformerBlock` involved.
     with_isolated_rayon_pool(|| {
         let config = small_config(0, 512, 64);
@@ -1159,7 +1159,7 @@ fn fixture_ternary_gguf(scaling: Option<(f32, u32)>) -> Vec<u8> {
 
 /// The acceptance measurement: a real load + prefill + decode cycle on a model
 /// whose `token_embd.weight` is quantized must leave `resident_bytes()` at
-/// **0** throughout. Before the wave-2.5 fix, the first multi-token prompt
+/// **0** throughout. Before the fix, the first multi-token prompt
 /// tripped the dense `Index` hatch and materialized the whole FP32 table.
 #[test]
 fn a_quantized_embedding_costs_no_resident_bytes_across_prefill_and_decode() {
@@ -1263,7 +1263,7 @@ fn a_gguf_declared_yarn_reaches_the_rope_table() {
 /// exactly that — so this test covers the one case where they legitimately
 /// differ: 13 tokens at chunk size 4, i.e. 4, 4, 4, **1**.
 ///
-/// **Why a tolerance here (FIX3-PERF item 1, orchestrator decision D-4).**
+/// **Why a tolerance here.**
 /// The paragraph this one replaces blamed `for_each_register_block!`'s
 /// tile-width selection — the claim being that one `m = 13` call and four
 /// calls of `m = 4, 4, 4, 1` can land the same row in different-width
@@ -1473,7 +1473,7 @@ fn prefill_on_tier(gguf_bytes: &[u8], tier: KernelTier, prompt: &[u32]) -> (Vec<
 /// **K-18 / PARITY-RED-1: the `Reference` tier and the host's native CPU
 /// tier must produce bit-identical `forward_prefill` results.**
 ///
-/// Wave 3.5 measured this end to end on the real `Ternary-Bonsai-1.7B.gguf`
+/// This was measured end to end on the real `Ternary-Bonsai-1.7B.gguf`
 /// — Reference vs the auto-detected CPU tier (NEON on this M3), 64
 /// self-generated greedy steps, all three prompt slots, batched prefill:
 /// **exactly 0.0 at every step, identical token chains** (and the same for a
@@ -1557,7 +1557,7 @@ fn forward_prefill_is_bit_exact_across_the_reference_and_native_cpu_tiers() {
 /// float32 ULPs — they are *not* bit-identical, and this is the assertion
 /// that says by how much.
 ///
-/// Wave 3.5's measurement on the real `Ternary-Bonsai-1.7B.gguf`, 64
+/// The measurement on the real `Ternary-Bonsai-1.7B.gguf`, 64
 /// self-generated greedy steps, both CPU tiers, all three prompt slots:
 /// worst |delta| **9.06e-6** (slot 0, step 45) and **8.58e-6** (slot 1, step
 /// 0), with **identical token chains** throughout and the same series to

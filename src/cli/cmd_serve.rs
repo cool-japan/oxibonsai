@@ -5,7 +5,10 @@
 //! routes → admission (concurrency + timeout) → `DefaultBodyLimit` →
 //! `Content-Length` precheck → rate limit → bearer auth → CORS — and exposes
 //! every hardening knob as a flag (each wins over its `OXIBONSAI_*`
-//! environment variable; see `oxibonsai serve --help`).
+//! environment variable; see `oxibonsai serve --help`). Admission answers the
+//! liveness, readiness and metrics routes
+//! ([`admission::ADMISSION_EXEMPT_PATHS`]) outside its concurrency budget, so
+//! they keep answering while the server is at its limit.
 //!
 //! Model-dependent behaviour is resolved once the GGUF is parsed:
 //!
@@ -52,6 +55,7 @@ use super::generate::ChatContract;
 use super::model_desc;
 use super::model_source::ModelSource;
 use super::util::{build_sampling_params, missing_tokenizer_warning};
+use super::vision;
 
 // ─── RT-17: the pool's baseline sampling parameters ────────────────────────
 //
@@ -134,6 +138,11 @@ pub(crate) struct ServeArgs {
     /// chat endpoint accepts `image_url` content parts (`--image` is
     /// refused: a server takes images from requests).
     pub(crate) vision: bonsai2::VisionRequest,
+    /// `--allow-image-url-fetch`, `--image-url-timeout-ms`,
+    /// `--image-url-allow-host` and `--media-path` (and their `OXI_*`
+    /// fallbacks): which `image_url` references resolve, and how a remote
+    /// one is fetched.
+    pub(crate) image_sources: bonsai2::ImageSourceFlags,
     pub(crate) embedding_backend: EmbeddingBackendChoice,
     /// `--embedding-corpus`: the documents `--embedding-backend tfidf`
     /// fits its vocabulary on.
@@ -171,11 +180,12 @@ pub(crate) async fn run(args: ServeArgs) -> anyhow::Result<()> {
         ptq1_transcode,
         prefill_chunk,
         vision,
+        image_sources,
         embedding_backend,
         embedding_corpus,
     } = args;
 
-    vision.validate(false)?;
+    vision.validate(false, &image_sources)?;
     // `--embedding-backend tfidf`: the corpus is read and validated before
     // any model is resolved or loaded.
     let tfidf_corpus = resolve_tfidf_corpus(embedding_backend, embedding_corpus.as_deref())?;
@@ -275,24 +285,34 @@ pub(crate) async fn run(args: ServeArgs) -> anyhow::Result<()> {
         max_seq_len,
         rope_scaling,
     )?;
-    // The vision projector (design §6.2), loaded once and shared read-only
-    // by every request: `image_url` content parts resolve under the server
-    // policy (`data:` URIs; `file://` only inside `OXI_MEDIA_PATH`).
-    let vision_service = vision.load_service(&arch, bonsai2::server_image_policy())?;
-    if vision_service.is_some() {
+    // The vision projector (design §6.2) is checked before any
+    // language-model weight is bound — a wrong architecture or a projector
+    // the towers refuse fails fast — and its header sizes every replica: a
+    // Metal-backed engine's KV window leaves room for the Metal tower, and
+    // the runners' calls are sized for `--prefill-chunk`. `image_url` content
+    // parts resolve under the server policy (`data:` URIs; `file://` only
+    // inside `--media-path`, else `OXI_MEDIA_PATH`, once canonicalised),
+    // resolved here too. The tower itself is loaded once the pool exists, for
+    // the executor its replicas decode on, and shared read-only by every
+    // request.
+    let hybrid_options = vision.hybrid_load_options(&arch, prefill_chunk)?;
+    vision.check_image_tokens(&bonsai2::ModelVocabulary::of_gguf(gguf))?;
+    let image_policy = vision::serve_image_policy(&vision, &image_sources)?;
+    if let Some(policy) = &image_policy {
+        let media_root = image_sources.media_root();
         tracing::info!(
-            media_root = ?std::env::var(bonsai2::MEDIA_PATH_ENV).ok(),
+            media_root = ?media_root.as_ref().map(|root| root.path.display().to_string()),
+            media_root_from = ?media_root.as_ref().map(|root| root.source.label()),
+            remote_image_fetch = policy.remote.is_opted_in(),
             "serving image_url content parts on /v1/chat/completions and \
              /v1/chat/completions/extended"
         );
-        if request_timeout_ms < VISION_REQUEST_TIMEOUT_HINT_MS {
-            tracing::warn!(
-                request_timeout_ms,
-                "an image turn runs its vision encode and the prefill of every image row on the \
-                 CPU model (on the 27B a 48-row image prompt takes about 40 s to prefill, and \
-                 the prefill grows with the image's rows): raise --request-timeout-ms if image \
-                 requests time out"
-            );
+        // Whether remote `image_url`s are fetched, with the per-image deadline
+        // and the allowlist — once, at start-up, where the operator looks.
+        let remote = image_sources.remote_fetch_report()?;
+        tracing::info!("{remote}");
+        if let Some(warning) = vision_timeout_warning(request_timeout_ms) {
+            tracing::warn!(request_timeout_ms, "{warning}");
         }
     }
 
@@ -326,16 +346,43 @@ pub(crate) async fn run(args: ServeArgs) -> anyhow::Result<()> {
     let seed = resolve_seed(toml_seed);
     tracing::info!(seed, "resolved RNG seed");
 
-    let built = oxibonsai_runtime::engine_pool::build_pool_from_static_gguf_with_rope(
+    // The pool, on the backend `--backend` names — or, with a projector
+    // loaded under `--backend auto`, on the CPU model when the engine `auto`
+    // resolved to cannot prefill image rows (`backend` is then the one the
+    // replicas actually run on, which the embedding engine below follows).
+    let (built, backend) = build_serving_pool(
         gguf,
-        params.clone(),
-        seed,
-        max_seq_len,
-        requested_pool_size,
+        &ServingPoolLoad {
+            params: &params,
+            seed,
+            max_seq_len,
+            requested_pool_size,
+            rope_scaling,
+            wants_vision: image_policy.is_some(),
+            hybrid: hybrid_options,
+        },
         backend,
-        rope_scaling.into(),
-    )?;
+    )
+    .await?;
     let pool = Arc::clone(&built.pool);
+    // The projector, for the executor the replicas decode on (every replica
+    // of one pool decodes on the same one), checked against one of them
+    // before any request is served.
+    let vision_service = match image_policy {
+        Some(policy) => {
+            let lease = pool
+                .acquire()
+                .await
+                .map_err(|e| anyhow::anyhow!("engine pool: {e}"))?;
+            vision.load_service_for(
+                &arch,
+                &bonsai2::ModelVocabulary::of_gguf(gguf),
+                move || Ok(policy),
+                &lease,
+            )?
+        }
+        None => None,
+    };
     pool.set_metrics_all(&metrics)?;
     // The GGUF-declared min_p (or 0.0, disabling the filter) is every
     // replica's baseline BEFORE the first lease is ever handed out.
@@ -347,6 +394,10 @@ pub(crate) async fn run(args: ServeArgs) -> anyhow::Result<()> {
     // through a lease) and threaded through `RouterOptions` below, rather
     // than a process-wide registration.
     let mut engine_report = None;
+    // The KV window the replicas were actually built with: it bounds the
+    // prompt ceiling below (a Metal-backed hybrid engine can be bound at
+    // fewer positions than `--max-seq-len` asked for).
+    let mut engine_window = max_seq_len;
     {
         let mut leases = Vec::with_capacity(pool_size_actual);
         for _ in 0..pool_size_actual {
@@ -370,6 +421,11 @@ pub(crate) async fn run(args: ServeArgs) -> anyhow::Result<()> {
             // `/admin/status` and `/admin/config`
             // report the resolved variant and the effective kernel tier.
             engine_report = Some(oxibonsai_runtime::admin::EngineReport::from_engine(first));
+        }
+        // Every replica of one pool is built at the same window; the
+        // smallest is the one a request must fit.
+        if let Some(window) = leases.iter().map(|lease| lease.max_context()).min() {
+            engine_window = served_input_ceiling(max_seq_len, window);
         }
     }
 
@@ -442,12 +498,21 @@ pub(crate) async fn run(args: ServeArgs) -> anyhow::Result<()> {
     let mut router_options = RouterOptions::default()
         .with_limits(
             RequestLimits::default()
-                .with_max_input_tokens(Some(max_seq_len))
+                // The prompt ceiling is the KV window the replicas were built
+                // with (never above `--max-seq-len`): the budget check also
+                // bounds every request by that window, and the two agree.
+                .with_max_input_tokens(Some(engine_window))
                 .with_timeout_ms(request_timeout_ms),
         )
         .with_auth(admin_auth)
         .with_embedder(embedder)
         .with_enable_ui(enable_ui);
+    // The id the model is listed under: the GGUF's `general.name` when it is
+    // a real name, else the model file's stem.
+    if let Some(id) = served_model_id_for(gguf, &model) {
+        tracing::info!(served_model_id = %id, "the model is listed under this id (GET /v1/models)");
+        router_options = router_options.with_served_model_id(id);
+    }
     if let Some(ceiling) = max_output_tokens {
         router_options = router_options.with_max_output_tokens_ceiling(ceiling);
     }
@@ -475,10 +540,17 @@ pub(crate) async fn run(args: ServeArgs) -> anyhow::Result<()> {
     #[cfg(feature = "rag")]
     if rag {
         tracing::info!("mounting RAG HTTP API (/rag/index, /rag/query, /rag/stats)");
-        router = router.merge(oxibonsai_runtime::rag_server::create_rag_router_with_pool(
-            Arc::clone(&pool),
-            tokenizers.rag,
-        ));
+        // `/rag/query` enforces the same `--request-timeout-ms` deadline as the
+        // generation routes, and counts a timeout in the same metrics.
+        router = router.merge(
+            oxibonsai_runtime::rag_server::create_rag_router_with_options(
+                Arc::clone(&pool),
+                tokenizers.rag,
+                oxibonsai_runtime::rag_server::RagRouterOptions::default()
+                    .with_limits(RequestLimits::default().with_timeout_ms(request_timeout_ms))
+                    .with_metrics(Arc::clone(&metrics)),
+            ),
+        );
     }
 
     // The chat endpoints pick the projector up from this extension; without
@@ -520,7 +592,7 @@ pub(crate) async fn run(args: ServeArgs) -> anyhow::Result<()> {
             "server-wide chat defaults (applied to a request that carries none of its own)"
         );
     }
-    let router = harden_router(router, pool_size_actual, &opts, &host);
+    let router = serve_router(router, pool_size_actual, &opts, &host).await;
 
     let addr_str = format!("{host}:{port}");
     let addr: std::net::SocketAddr = addr_str
@@ -545,9 +617,178 @@ pub(crate) async fn run(args: ServeArgs) -> anyhow::Result<()> {
 const TFIDF_MAX_FEATURES: usize = 512;
 
 /// Below this `--request-timeout-ms`, a server that loaded `--mmproj` warns
-/// at startup: an image turn's CPU prefill alone can take minutes on the
-/// 27B.
-const VISION_REQUEST_TIMEOUT_HINT_MS: u64 = 300_000;
+/// at startup: an image turn's prefill on the CPU model alone can take
+/// minutes on the 27B.
+pub(crate) const VISION_REQUEST_TIMEOUT_HINT_MS: u64 = 300_000;
+
+/// How much later than the handler's own deadline the admission layer's
+/// timeout fires. Both are `--request-timeout-ms`; the admission layer's
+/// timer starts first (before the body is read), so at the same value it
+/// would always win the race and answer with a bare `408`, dropping the
+/// handler before it can cancel the in-flight generation or name the stage
+/// the request was caught in. The handler's deadline is the real one; this
+/// margin keeps the admission timeout as a backstop for routes that have no
+/// deadline of their own.
+const ADMISSION_TIMEOUT_GRACE_MS: u64 = 2_000;
+
+/// The start-up warning of a server that loaded a projector
+/// (`--mmproj`) with a `--request-timeout-ms` too short for an image
+/// request; `None` when the timeout is at least
+/// [`VISION_REQUEST_TIMEOUT_HINT_MS`].
+///
+/// It names what an image request costs on each executor — measured on the
+/// Bonsai 2 27B: on the CPU model 67 image-prompt rows took 54.9 s and 75
+/// rows 32.6 s to prefill (two separate runs at different host load, so an
+/// order of magnitude only — the larger prompt was the faster run), after a
+/// vision encode of about 5 s on the CPU tower; on the Metal hybrid runner
+/// with the Metal tower a 67-row prompt takes 2.7-3.6 s end to end — and the
+/// flag to raise. The image rows prefill on the executor the replicas
+/// decode on, so the cost is seconds on one and minutes on the other, and it
+/// grows with the image's rows.
+#[must_use]
+pub(crate) fn vision_timeout_warning(request_timeout_ms: u64) -> Option<String> {
+    (request_timeout_ms < VISION_REQUEST_TIMEOUT_HINT_MS).then(|| {
+        format!(
+            "--mmproj is loaded and --request-timeout-ms is {request_timeout_ms} ms ({} s): an \
+             image request runs its vision encode and the prefill of every image row inside \
+             that budget, on the executor the server decodes on — on the 27B seconds on the \
+             Metal hybrid runner (a 67-row prompt 2.7-3.6 s end to end) but tens of seconds to \
+             minutes on the CPU model (67 rows 54.9 s, 75 rows 32.6 s — measured on separate \
+             runs at different host load; order of magnitude only — after a vision encode of \
+             about 5 s), growing with the image; a request that runs out of time is answered \
+             with a timeout error naming the stage it was in. Raise it with \
+             --request-timeout-ms {VISION_REQUEST_TIMEOUT_HINT_MS} (or more) if image requests \
+             time out",
+            request_timeout_ms / 1000
+        )
+    })
+}
+
+/// Everything the serving pool is built from besides the GGUF and the
+/// backend.
+pub(crate) struct ServingPoolLoad<'a> {
+    pub(crate) params: &'a oxibonsai_runtime::sampling::SamplingParams,
+    pub(crate) seed: u64,
+    pub(crate) max_seq_len: usize,
+    pub(crate) requested_pool_size: Option<usize>,
+    pub(crate) rope_scaling: oxibonsai_runtime::config::RopeScalingMode,
+    /// A projector (`--mmproj`) was loaded.
+    pub(crate) wants_vision: bool,
+    /// The options every hybrid replica is built with
+    /// ([`super::bonsai2::VisionRequest::hybrid_load_options`]): the Metal
+    /// tower's resident bytes and `--prefill-chunk`. A dense pool ignores
+    /// them.
+    pub(crate) hybrid: oxibonsai_runtime::engine_hybrid_gpu::HybridLoadOptions,
+}
+
+/// Build the engine pool on `backend`; returns it with the backend its
+/// replicas actually run on.
+///
+/// Every replica is constructed on this thread inside one `HybridLoadScope`
+/// carrying [`ServingPoolLoad::hybrid`], so a Metal-backed replica's KV
+/// window leaves room for the vision tower and its runner takes calls sized
+/// for `--prefill-chunk` — the scope covers the synchronous build only,
+/// never an `.await`.
+///
+/// With a projector loaded and `--backend auto`, a hybrid pool whose replicas
+/// cannot prefill image rows (`InferenceEngine::prefills_images` is `false`)
+/// is dropped and rebuilt on the CPU model, with one `INFO` line saying why
+/// ([`vision::plan_vision_backend`]); the first pool goes before the second is
+/// built, so a 27B is never resident twice. Both hybrid executors prefill
+/// image rows, so `auto` keeps the pool it built. An explicit `--backend` is
+/// never overridden: an engine that cannot serve images then keeps its typed
+/// refusal, and a start-up warning says so
+/// ([`vision::startup_backend_warning`]).
+///
+/// # Errors
+///
+/// Anything pool construction returns, or a failure to lease a replica to
+/// inspect it.
+pub(crate) async fn build_serving_pool(
+    gguf: &'static oxibonsai_core::gguf::reader::GgufFile<'static>,
+    load: &ServingPoolLoad<'_>,
+    backend: oxibonsai_runtime::engine_seam::Backend,
+) -> anyhow::Result<(
+    oxibonsai_runtime::engine_pool::PoolBuild,
+    oxibonsai_runtime::engine_seam::Backend,
+)> {
+    let build = |backend: oxibonsai_runtime::engine_seam::Backend| {
+        let _hybrid = oxibonsai_runtime::engine_hybrid_gpu::HybridLoadScope::enter(load.hybrid);
+        oxibonsai_runtime::engine_pool::build_pool_from_static_gguf_with_rope(
+            gguf,
+            load.params.clone(),
+            load.seed,
+            load.max_seq_len,
+            load.requested_pool_size,
+            backend,
+            load.rope_scaling.into(),
+        )
+    };
+    let built = build(backend)?;
+    if !load.wants_vision {
+        return Ok((built, backend));
+    }
+    let (is_hybrid, prefills_images, executor) = {
+        let lease = built
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| anyhow::anyhow!("engine pool: {e}"))?;
+        (
+            lease.is_hybrid(),
+            lease.prefills_images(),
+            vision::executor_name(&lease),
+        )
+    };
+    if !is_hybrid {
+        // A dense pool refuses image turns for its model kind on any
+        // backend; there is no executor to change.
+        return Ok((built, backend));
+    }
+    if let Some(warning) = vision::startup_backend_warning(backend, prefills_images) {
+        tracing::warn!("{warning}");
+    }
+    match vision::plan_vision_backend(backend, true, prefills_images) {
+        vision::VisionBackendPlan::Keep => Ok((built, backend)),
+        vision::VisionBackendPlan::RebuildOnCpu => {
+            tracing::info!(executor = %executor, "{}", vision::rebuild_reason(&executor));
+            drop(built);
+            let cpu = oxibonsai_runtime::engine_seam::Backend::Cpu;
+            Ok((build(cpu)?, cpu))
+        }
+    }
+}
+
+/// The prompt-token ceiling `serve` hands the request limits: the KV window
+/// the engine was actually built with, never more than the window that was
+/// requested. A hybrid engine on the Metal runner can be bound at a smaller
+/// window than `--max-seq-len` asked for (its memory budget), and a ceiling
+/// above the real window would let a prompt pass the input check only to fail
+/// inside the engine.
+#[must_use]
+pub(crate) fn served_input_ceiling(requested_window: usize, engine_window: usize) -> usize {
+    requested_window.min(engine_window)
+}
+
+/// The id `serve` lists its model under: the GGUF's own `general.name` when
+/// it is a real name, else the model file's stem
+/// ([`oxibonsai_runtime::multi_model::served_model_id`]) — the Bonsai 2 27B
+/// files carry `general.name = "Hf"`. `None` leaves the router listing the
+/// name the loaded model reports.
+#[must_use]
+pub(crate) fn served_model_id_for(
+    gguf: &oxibonsai_core::gguf::reader::GgufFile<'_>,
+    model_path: &str,
+) -> Option<String> {
+    let general_name = gguf
+        .metadata
+        .get_string(oxibonsai_core::gguf::tensor_info::keys::GENERAL_NAME)
+        .ok();
+    let stem = Path::new(model_path)
+        .file_stem()
+        .and_then(std::ffi::OsStr::to_str);
+    oxibonsai_runtime::multi_model::served_model_id(general_name, stem)
+}
 
 /// Validate the `--embedding-backend` / `--embedding-corpus` pair and read
 /// the corpus (one document per non-blank line). `Ok(None)` for every
@@ -706,6 +947,21 @@ fn build_embedding_engine(
     )
 }
 
+/// The backend the embedding engine actually runs on: a hybrid (`qwen35`)
+/// model's embedder is always built on the CPU model
+/// ([`oxibonsai_runtime::embed_engine::ModelEmbedder::from_static_gguf`]
+/// ignores the pool's backend), a dense one follows `--backend`.
+pub(crate) fn embedding_backend(
+    hybrid: bool,
+    requested: oxibonsai_runtime::engine_seam::Backend,
+) -> oxibonsai_runtime::engine_seam::Backend {
+    if hybrid {
+        oxibonsai_runtime::engine_seam::Backend::Cpu
+    } else {
+        requested
+    }
+}
+
 /// Why there is no model-backed embedder: an `error.code` (an engine
 /// refusal's own code, e.g. `NOT_A_DENSE_MODEL`), or `None` for a generic
 /// reason, and a human-readable message — for
@@ -743,7 +999,8 @@ fn build_embedder(
         oxibonsai_runtime::embed_engine::DEFAULT_MAX_EMBEDDING_TOKENS,
     );
     let tokenizer = Arc::new(tokenizer);
-    let result = if oxibonsai_model::hybrid::LoadedModel::is_hybrid_gguf(built.gguf) {
+    let hybrid = oxibonsai_model::hybrid::LoadedModel::is_hybrid_gguf(built.gguf);
+    let result = if hybrid {
         oxibonsai_runtime::embed_engine::ModelEmbedder::from_static_gguf(
             built.gguf,
             Arc::clone(&built.shared_token_embd),
@@ -761,7 +1018,7 @@ fn build_embedder(
         Ok(embedder) => {
             tracing::info!(
                 window,
-                backend = %load.backend,
+                backend = %embedding_backend(hybrid, load.backend),
                 "serving /v1/embeddings from a dedicated embedding engine"
             );
             (Some(embedder), None)
@@ -997,6 +1254,12 @@ struct HardeningOptions {
 ///        -> bearer-auth -> CORS (outermost)
 /// ```
 ///
+/// Admission wraps every route, and only the paths in
+/// [`admission::ADMISSION_EXEMPT_PATHS`] (`/health`, `/readyz`, `/metrics`,
+/// `/ui/health`) skip its concurrency budget; they are still bound by every
+/// layer above it, and by the timeout. A route added to the router before
+/// this function runs is inside admission unless it is named there.
+///
 /// `--embedding-backend tfidf` is no longer a separate layer here: `run`
 /// passes its fitted `EmbedderRegistry` into `RouterOptions::with_embeddings_registry`
 /// before the base router is even built, so `POST /v1/embeddings` is one
@@ -1039,10 +1302,18 @@ fn harden_router(
 
     let effective_max_concurrent_requests =
         admission::resolve_admission_limit(opts.max_concurrent_requests, pool_size);
+    // The handler's own deadline (`RequestLimits::with_timeout_ms`, the same
+    // `--request-timeout-ms`) is the real one: it cancels the in-flight
+    // generation and names the stage the request was caught in. This layer's
+    // timer starts earlier, so at the same value it would always fire first
+    // and drop the handler with a bare `408`; the grace keeps it a backstop.
+    // The probe routes (`admission::ADMISSION_EXEMPT_PATHS`) are answered
+    // outside the concurrency budget.
     router = admission::apply_admission(
         router,
         effective_max_concurrent_requests,
-        opts.request_timeout_ms,
+        opts.request_timeout_ms
+            .saturating_add(ADMISSION_TIMEOUT_GRACE_MS),
     );
 
     // SV-27/sec-16: explicit, configurable request body ceiling instead of
@@ -1104,7 +1375,7 @@ fn harden_router(
                 host = %host_for_log,
                 "no --bearer-token / OXIBONSAI_BEARER_TOKEN configured: the inference \
                  endpoints are unauthenticated on this listener; /admin/* is separately \
-                 gated (403 unless OXI_ADMIN_TOKEN is set) -- set --bearer-token or keep \
+                 gated (403 unless OXIBONSAI_ADMIN_TOKEN or OXI_ADMIN_TOKEN is set) -- set --bearer-token or keep \
                  --host at 127.0.0.1"
             );
             router
@@ -1123,6 +1394,23 @@ fn harden_router(
         };
         apply_middleware(router, MiddlewareConfig::none().with_cors(cors))
     }
+}
+
+/// The router `run` serves: `router` hardened by [`harden_router`], after the
+/// served model's descriptor has been resolved on it while every replica is
+/// idle ([`admission::warm_model_descriptor`]). `/readyz` reads the
+/// descriptor, and admission answers it outside the concurrency budget, so
+/// without the warm-up a probe that arrived while every replica was busy
+/// would have to wait for one. The warm-up request goes to the router before
+/// bearer auth is mounted in front of it, so it needs no token.
+async fn serve_router(
+    router: Router,
+    pool_size: usize,
+    opts: &HardeningOptions,
+    host_for_log: &str,
+) -> Router {
+    admission::warm_model_descriptor(&router).await;
+    harden_router(router, pool_size, opts, host_for_log)
 }
 
 // ─── sec-15 / SV-07 / sec-M2: bind-safety guard ─────────────────────────────

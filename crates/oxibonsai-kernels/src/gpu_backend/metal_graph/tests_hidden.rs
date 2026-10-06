@@ -885,8 +885,9 @@ fn metal_prefill_gemm_family_is_chosen_once_per_request() {
             assert_eq!(
                 graph.choose_prefill_gemm(format, batch),
                 PrefillGemm::Rowwise,
-                "{format:?}: a {batch}-row batch (speculative verify's size) stays on the \
-                 row-wise kernel"
+                "{format:?}: a {batch}-row batch (below the 8-row tiled threshold, like a \
+                 speculative verify at the default draft length of 4, which is 5 rows) stays on \
+                 the row-wise kernel"
             );
         }
         for batch in [8, 63, 64, 300, 4096] {

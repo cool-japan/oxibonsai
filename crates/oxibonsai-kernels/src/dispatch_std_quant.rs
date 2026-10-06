@@ -1,10 +1,10 @@
 //! [`StandardQuantKernel`] dispatch: Q4_0, Q8_0 (KERN-SOUND) and the six
-//! K-quant formats Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K (B2-09, wave-1/1.5 addenda).
+//! K-quant formats Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K.
 //!
 //! Split out of `dispatch.rs` purely for file size, and because a single
 //! `impl Trait for Type` must live in one place — this crate can define it
 //! in any file, so this one holds every `StandardQuantKernel` method rather
-//! than only the two that predate this package.
+//! than only the Q4_0/Q8_0 ones.
 //!
 //! ## Why the K-quant arms look different from Q4_0/Q8_0's
 //!
@@ -16,7 +16,7 @@
 //! `gemv_q4k.rs`/`gemv_q6k.rs`/`gemv_q8k.rs`) and has no distinct AVX2/
 //! AVX-512 sibling to route to — every CPU tier therefore converges on the
 //! same call, which is the honest reflection of what exists today, not a
-//! shortcut (see the wave-1.5 addendum: the fix this package owes is a
+//! shortcut (the fix owed is a
 //! **dispatch policy** — GPU-arm-with-CPU-fallback wired through
 //! `KernelDispatcher`, replacing the direct call the model layer used to
 //! make — not new SIMD kernels).
@@ -30,8 +30,8 @@ use crate::dispatch::KernelDispatcher;
 // "aarch64")]`, `#[cfg(target_arch = "x86_64")]` or `#[cfg(feature =
 // "gpu")]` (directly on a match arm, or via an enclosing `cpu_*_fallback`
 // fn); on wasm32 with just the `wasm` feature none of those hold, so the
-// name would otherwise be an unused import (wasm32 clippy leg, FIX3-BUILD
-// wave 3.5). Gate the import to match rather than `#[allow(unused_imports)]`,
+// name would otherwise be an unused import (wasm32 clippy leg). Gate the
+// import to match rather than `#[allow(unused_imports)]`,
 // which would hide the next variant that stops being used.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "gpu"))]
 use crate::dispatch::KernelTier;
@@ -510,7 +510,7 @@ impl KernelDispatcher {
         }
     }
 
-    /// Route a K-quant GEMV onto the CPU (K-17/wave-1.5): every tier
+    /// Route a K-quant GEMV onto the CPU (K-17): every tier
     /// converges on the one free function (see this module's doc comment),
     /// so — unlike the Q4_0/Q8_0 fallbacks above — there is no per-tier
     /// match to be exhaustive over; `Self::cpu_tier()` is still consulted

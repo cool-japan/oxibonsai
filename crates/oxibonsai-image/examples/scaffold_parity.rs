@@ -17,7 +17,7 @@
 //! Usage (the golden dir defaults to the standard location):
 //! ```text
 //! cargo run -p oxibonsai-image --release --example scaffold_parity
-//! cargo run -p oxibonsai-image --release --example scaffold_parity -- /tmp/bonsai_golden/f32
+//! cargo run -p oxibonsai-image --release --example scaffold_parity -- ${TMPDIR:-/tmp}/bonsai_golden/f32
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -161,7 +161,7 @@ fn main() -> ExitCode {
     let dir = std::env::args()
         .nth(1)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp/bonsai_golden/f32"));
+        .unwrap_or_else(|| std::env::temp_dir().join("bonsai_golden/f32"));
 
     println!("== FLUX.2 scaffold parity vs golden (seed 42, 512^2, 4 steps) ==");
     println!("   golden dir: {}", dir.display());

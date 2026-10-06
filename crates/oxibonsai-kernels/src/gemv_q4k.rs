@@ -3,14 +3,14 @@
 //! Implements `y = W × x` where W is stored as Q4_K blocks.
 //! Each super-block covers 256 weights (QK_K = 256).
 //!
-//! On AArch64 this routes through [`neon_fused::row_dot`], which computes
+//! On AArch64 this routes through `neon_fused::row_dot`, which computes
 //! each output row's dot product directly from the quantized bytes without
 //! ever materializing a dequantized f32 row (K-15 item (c)) — decoding the
 //! super-block's scales/mins once per 64-element group and
 //! multiply-accumulating the packed nibbles against the input slice in
 //! NEON registers, mirroring `simd_q_std_neon.rs`'s Q4_0 kernel structure.
 //! Everywhere else, it falls back to the generic dequantize-then-dot driver
-//! ([`crate::parallel::gemv_kquant_row_parallel`]), which K-15 items (a)/(b)
+//! (`crate::parallel::gemv_kquant_row_parallel`), which K-15 items (a)/(b)
 //! already made SIMD-reduced and allocation-free in steady state.
 
 use oxibonsai_core::BlockQ4K;
@@ -373,7 +373,7 @@ mod tests {
         buf.iter().zip(input.iter()).map(|(w, x)| w * x).sum()
     }
 
-    /// K-15 item (c) / wave-1 addendum: pin the (possibly fused) production
+    /// K-15 item (c): pin the (possibly fused) production
     /// path against the ggml-exact reference decoder on **non-uniform**
     /// data — every sub-block scale/min and every nibble distinct — across
     /// several shapes (multiple blocks per row, multiple rows), since a
@@ -420,7 +420,7 @@ mod tests {
         }
     }
 
-    /// Hand-derived golden (wave-1/wave-1.5 addenda): a byte layout built
+    /// Hand-derived golden: a byte layout built
     /// directly (not round-tripped through `BlockQ4K::quantize`), with the
     /// expected value traced by hand from the ggml formula rather than
     /// compared only against this crate's own dequantizer — one
@@ -450,7 +450,7 @@ mod tests {
     /// construction: `input` is all `1.0` and every sub-block scale is `1`
     /// with min `0`, so the expected `1920.0` is invariant under (a) a lo/hi
     /// nibble swap and (b) any permutation of the 8 sub-block scales — the
-    /// two bug classes the wave-1/1.5 addenda single out. What it does pin is
+    /// two bug classes the audit singled out. What it does pin is
     /// the `get_scale_min_k4` derivation and the total magnitude; nothing
     /// positional. Positional coverage lives in
     /// `tests/verifier_kquant_fused_random.rs`

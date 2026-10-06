@@ -54,7 +54,7 @@ pub enum RuntimeError {
     #[error("batch error: {} sub-errors", .0.len())]
     BatchError(Vec<RuntimeError>),
 
-    /// A typed engine refusal (`ENGINE-SEAM`): an operation the loaded
+    /// A typed engine refusal: an operation the loaded
     /// model or the requested backend cannot perform — a dense-only
     /// operation on a hybrid (`qwen35`) engine, a rollback a recurrent state
     /// cannot do, an unavailable backend, a non-contiguous position, a stale

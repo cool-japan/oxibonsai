@@ -26,9 +26,10 @@
 //! on the logits alone. A seeded draw is therefore a function of the survivor
 //! set only, not of how a partial selection over the whole row happened to
 //! arrange it; sampling any candidate sub-row that contains the survivors
-//! (the fused GPU route's top-k download,
+//! (the fused GPU route's top-k download, the opt-in
 //! `crate::engine_greedy::SampledTopKMode::GpuCandidates`) is byte-identical
-//! to sampling the full row. With top-k disabled (`top_k == 0`) the full row is
+//! to sampling the full row, which is what a sampled request decodes by
+//! default. With top-k disabled (`top_k == 0`) the full row is
 //! walked in index order, exactly as before, so seeded output of a `top_k == 0`
 //! request is unchanged.
 //!

@@ -2,7 +2,7 @@
 //! T-10: property-based coverage for the stop-sequence matcher
 //! (`api_extensions::StopChecker`).
 //!
-//! ## Split out of `sampler_stop_sequence_proptests.rs` (verifier fix, wave 3)
+//! ## Split out of `sampler_stop_sequence_proptests.rs`
 //!
 //! This file used to be part of `sampler_stop_sequence_proptests.rs`, which
 //! imported `oxibonsai_runtime::api_extensions::StopChecker` unconditionally
@@ -11,8 +11,7 @@
 //! `cargo check -p oxibonsai-runtime --no-default-features --tests` fail
 //! with an unresolved-import error (`server` is a default feature, but not
 //! every consumer enables defaults) — a build regression against the
-//! wave-2.5 addendum's explicit "do not revert, do re-verify" instruction on
-//! keeping `--no-default-features` buildable.
+//! requirement to keep `--no-default-features` buildable.
 //!
 //! `StopChecker` genuinely only exists behind the `server` feature, so
 //! *this* file (and only this file) needs the guard; the sampler-only

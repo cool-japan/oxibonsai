@@ -1178,11 +1178,11 @@ async fn base_endpoint_rejects_an_image_url_content_part_honestly() {
 // it. This confirms the pool-level guarantee still holds when the token
 // really was cancelled mid-stream (a live stop-sequence match,
 // `chat_completions_stream`'s `SV-09` wiring) and the *next* request comes
-// through a sibling endpoint that never calls `arm_cancellation()` itself —
-// `/v1/completions` (`completions.rs::create_completion`'s non-streaming
-// path) — rather than back through chat, whose own handler always re-arms
-// a fresh token before it checks cancellation and so would not exercise
-// this at all.
+// through a sibling endpoint — `/v1/completions`
+// (`completions.rs::create_completion`'s non-streaming path), which arms a
+// fresh token of its own for its generation, as every generation path does.
+// The pool clears the cancelled token on release and nothing hands it to
+// the next request, so the replica generates normally.
 
 async fn post_chat(app: axum::Router, body: serde_json::Value) -> (StatusCode, String) {
     let req = axum::http::Request::post("/v1/chat/completions")
@@ -1253,10 +1253,8 @@ async fn a_stream_stopped_by_a_real_cancel_does_not_affect_the_next_request_on_a
         "sanity: the stop sequence must actually have matched: {body}"
     );
 
-    // The victim: `/v1/completions`, non-streaming, on the SAME replica.
-    // `create_completion` never calls `arm_cancellation()` itself, so it
-    // has no way to overwrite a poisoned `cancel` left behind by the
-    // request above.
+    // The victim: `/v1/completions`, non-streaming, on the SAME replica,
+    // right after a real cancellation through another endpoint.
     let (status, body) =
         post_legacy_completion(app, serde_json::json!({ "prompt": "hi", "max_tokens": 3 })).await;
     assert_eq!(status, StatusCode::OK, "{body}");

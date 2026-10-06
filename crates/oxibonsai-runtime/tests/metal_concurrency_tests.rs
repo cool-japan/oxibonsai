@@ -209,7 +209,7 @@ fn metal_concurrency_binding_is_scoped_and_reentrant() {
 /// dropped on a `spawn_blocking` thread): once the using thread binds the
 /// session, the worker's earlier binding is stale — an unleased dispatch left
 /// on the worker resolves to the process-default session, never into the
-/// replica the other thread is running (`METAL-CONCURRENCY` minor 4).
+/// replica the other thread is running (a Metal concurrency finding).
 #[test]
 fn metal_concurrency_a_moved_binding_goes_stale_on_the_old_thread() {
     if no_gpu() {
@@ -684,7 +684,7 @@ fn metal_concurrency_two_sessions_keep_separate_kv_caches_under_lockstep_and_con
 // 4. GEMM dispatch from concurrently bound sessions
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// Scope note (the `METAL-CONCURRENCY` review): `encode_gemm_f32` stages its
+// Scope note: `encode_gemm_f32` stages its
 // input and output in the **process-wide** DiT I/O pool, whose mutex is held
 // across the whole upload → dispatch → wait → download. The two tests below
 // therefore do not overlap their GEMMs, touch none of the per-session state

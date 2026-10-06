@@ -2,6 +2,8 @@
 //! that file under the workspace's 2000-line-per-file policy (declared
 //! there via `#[path]`, so `super` still names that module).
 
+use std::time::Duration;
+
 use super::*;
 use axum::http::Request;
 use oxibonsai_core::config::Qwen3Config;
@@ -464,7 +466,7 @@ async fn oversized_body_is_rejected_with_413() {
 /// different layer pair): `axum::extract::DefaultBodyLimit`'s `Layer`
 /// implementation only inserts a request extension consulted later by
 /// the `Bytes`/`Json` extractors deep inside the handler -- it never
-/// rejects anything itself, at either position, and `tower::load_shed`
+/// rejects anything itself, at either position, and the admission layer
 /// decides a genuine "is a permit available" race before either
 /// position is reached.
 /// This test only proves the ceiling still applies once
@@ -727,4 +729,60 @@ async fn per_request_timeout_returns_408_for_a_slow_request() {
         "expected a timeout status (408 or 504), got {}",
         resp.status()
     );
+}
+
+/// The id a launcher hands `RouterBuildOptions::with_served_model_id` is what
+/// `GET /v1/models` lists, in place of the name the loaded model reports.
+#[tokio::test]
+async fn a_launcher_chosen_served_model_id_is_what_v1_models_lists() {
+    let cfg = ServerConfig::default();
+    let pool = tiny_pool();
+    let pool_size = pool.size();
+    let router = build_router(
+        pool,
+        None,
+        Arc::new(InferenceMetrics::new()),
+        Arc::new(MetricsRegistry::new()),
+        &cfg,
+        RouterBuildOptions::new(AdminAuthConfig::locked(), pool_size, false, None)
+            .with_served_model_id("Ternary-Bonsai-2-27B-PQ2_0"),
+    );
+    let resp = router
+        .oneshot(
+            Request::get("/v1/models")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("body bytes");
+    let json: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
+    assert_eq!(
+        json["data"][0]["id"], "Ternary-Bonsai-2-27B-PQ2_0",
+        "{json}"
+    );
+}
+
+/// Without a launcher-chosen id the model is listed under the name it reports.
+#[tokio::test]
+async fn without_a_served_model_id_v1_models_lists_the_loaded_models_name() {
+    let cfg = ServerConfig::default();
+    let router = router_for(&cfg);
+    let resp = router
+        .oneshot(
+            Request::get("/v1/models")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("body bytes");
+    let json: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
+    assert_eq!(json["data"][0]["id"], "Bonsai-Tiny-Test", "{json}");
 }

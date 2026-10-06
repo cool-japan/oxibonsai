@@ -7,7 +7,7 @@
 //! Split out of `main.rs` to keep that file under the 2000-line policy
 //! limit; `main.rs::run()` is the only caller.
 //!
-//! [`build_router`] composes the served router in the order mandated by
+//! [`build_served_router`] composes the served router in the order mandated by
 //! `oxibonsai_runtime::middleware`'s and `oxibonsai_runtime::rate_limiter`'s
 //! module docs, innermost first:
 //!
@@ -18,20 +18,32 @@
 //!
 //! (`DefaultBodyLimit` moved from inside `admission` to
 //! outside it, still inside rate-limit -- see the note at its call site in
-//! [`build_router`] for what this does and does not achieve.)
+//! [`harden_router`] for what this does and does not achieve.)
+//!
+//! Admission (see [`admission`]) wraps every route; only the liveness,
+//! readiness and metrics routes ([`admission::ADMISSION_EXEMPT_PATHS`], plus
+//! the configured metrics alias) skip its concurrency budget, so they keep
+//! answering while the server is at its limit. They are still bound by every
+//! layer outside admission and by its timeout.
+//!
+//! [`build_served_router`] is [`build_base_router`] (the routes, up to and
+//! including the metrics gate), the model-descriptor warm-up (sent to the base
+//! router, before any token is needed) and [`harden_router`] (admission and
+//! everything outside it).
+
+pub mod admission;
 
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use axum::body::Body;
-use axum::error_handling::HandleErrorLayer;
 use axum::extract::{DefaultBodyLimit, Request, State};
-use axum::http::{HeaderName, HeaderValue, StatusCode};
+use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::{BoxError, Json, Router};
+use axum::{Json, Router};
 use oxibonsai_runtime::engine_pool::EnginePool;
 use oxibonsai_runtime::metrics::InferenceMetrics;
 use oxibonsai_runtime::middleware::{apply_middleware, CorsConfig, MiddlewareConfig};
@@ -42,7 +54,6 @@ use oxibonsai_runtime::server::{
 use oxibonsai_runtime::tokenizer_bridge::TokenizerBridge;
 use oxibonsai_serve::config::{PartialServerConfig, SamplingConfig, ServerConfig};
 use oxibonsai_serve::metrics::MetricsRegistry;
-use tower::ServiceBuilder;
 
 use crate::middleware as bearer_middleware;
 
@@ -142,7 +153,7 @@ pub fn bind_safety_check(config: &ServerConfig, admin_enabled: bool) -> Result<(
 /// Historical name kept for API stability (`main.rs` still calls it) — the
 /// mismatch this used to warn about is now fixed, not merely explained.
 ///
-/// SV-15(c) is resolved for real: [`build_router`] threads
+/// SV-15(c) is resolved for real: [`build_served_router`] threads
 /// `sampling.default_max_tokens` through
 /// `RouterOptions::with_default_max_tokens`, so
 /// `oxibonsai_runtime::server::resolve_effective_max_tokens` (via
@@ -253,7 +264,7 @@ fn parse_bool_env(value: &str) -> Option<bool> {
 /// `RouterOptions::default()`, whose `RequestLimits::default()` leaves both
 /// `max_input_tokens` and `per_request_timeout` at `None`).
 ///
-/// Split out from [`build_router`] so this specific conversion is directly
+/// Split out from [`build_served_router`] so this specific conversion is directly
 /// unit-testable without standing up a router or making an HTTP request.
 pub fn resolve_request_limits(config: &ServerConfig) -> RequestLimits {
     RequestLimits::default()
@@ -272,10 +283,10 @@ pub fn resolve_request_limits(config: &ServerConfig) -> RequestLimits {
 /// `oxibonsai_runtime::serve_shared` (findings `SV-30` / `sec-M3`);
 /// `src/cli/admission.rs::resolve_admission_limit` re-exports the same
 /// function rather than keeping its own byte-for-byte copy. `pub` here
-/// since [`build_router`] below calls it unqualified via this re-export.
+/// since [`harden_router`] below calls it unqualified via this re-export.
 pub use oxibonsai_runtime::serve_shared::resolve_admission_limit;
 
-/// Bundles [`build_router`]'s knobs that aren't the pool/tokenizer/metrics
+/// Bundles [`build_served_router`]'s knobs that aren't the pool/tokenizer/metrics
 /// triple or `config` itself.
 ///
 /// `enable_ui` and `max_output_tokens_ceiling` join `admin_auth` and
@@ -315,6 +326,10 @@ pub struct RouterBuildOptions {
     /// use only: a served model always resolves a real tokenizer or a real
     /// GGUF-embedded one.
     pub prompt_start_token: Option<u32>,
+    /// The id the served model is listed under (`GET /v1/models`, the `model` of
+    /// every response) — see [`Self::with_served_model_id`]. `None` lists it
+    /// under the name the loaded model reports.
+    pub served_model_id: Option<String>,
 }
 
 impl RouterBuildOptions {
@@ -337,6 +352,7 @@ impl RouterBuildOptions {
             embedder_unavailable: None,
             engine_report: None,
             prompt_start_token: None,
+            served_model_id: None,
         }
     }
 
@@ -370,6 +386,16 @@ impl RouterBuildOptions {
         self
     }
 
+    /// List the served model under `id` instead of the name the loaded model
+    /// reports (builder). A launcher that knows the model file derives it with
+    /// [`oxibonsai_runtime::multi_model::served_model_id`]: the GGUF's
+    /// `general.name` when it is a real name, else the file's stem.
+    #[must_use]
+    pub fn with_served_model_id(mut self, id: impl Into<String>) -> Self {
+        self.served_model_id = Some(id.into());
+        self
+    }
+
     /// Let a tokenizer-less server answer text prompts by feeding the single
     /// token `id` as the prompt (builder). Test-only: the standalone binary
     /// always resolves a real tokenizer or refuses to start; a production
@@ -381,6 +407,16 @@ impl RouterBuildOptions {
         self
     }
 }
+
+/// How much later than the handler's own deadline the admission layer's
+/// timeout fires. Both are `limits.per_request_timeout_ms`; the admission
+/// layer's timer starts first (before the body is read), so at the same value
+/// it would always win the race and answer with a bare `408`, dropping the
+/// handler before it can cancel the in-flight generation or name the stage the
+/// request was caught in. The handler's deadline is the real one; this margin
+/// keeps the admission timeout as a backstop for routes with no deadline of
+/// their own.
+const ADMISSION_TIMEOUT_GRACE_MS: u64 = 2_000;
 
 /// Compose the fully-hardened router.
 ///
@@ -408,8 +444,67 @@ impl RouterBuildOptions {
 /// (`oxibonsai-serve/src/config.rs`, CLI flag > env > TOML > default) —
 /// `main.rs` reads them off `config` (not off `ServerArgs` directly) and
 /// passes them here via [`RouterBuildOptions`], the same way every other
-/// `build_router` knob arrives.
+/// `build_served_router` knob arrives.
+///
+/// This is [`build_base_router`], then the model-descriptor warm-up
+/// ([`admission::warm_model_descriptor`], which needs the router before bearer
+/// auth is mounted in front of it), then [`harden_router`]: the router
+/// `main.rs` serves.
+pub async fn build_served_router(
+    pool: Arc<EnginePool>,
+    tokenizer: Option<TokenizerBridge>,
+    metrics: Arc<InferenceMetrics>,
+    serve_metrics: Arc<MetricsRegistry>,
+    config: &ServerConfig,
+    build_options: RouterBuildOptions,
+) -> Router {
+    let pool_size = build_options.pool_size;
+    let base_router = build_base_router(
+        pool,
+        tokenizer,
+        metrics,
+        serve_metrics,
+        config,
+        build_options,
+    );
+    admission::warm_model_descriptor(&base_router).await;
+    harden_router(base_router, config, pool_size)
+}
+
+/// [`build_served_router`] without the descriptor warm-up, so a test needs no
+/// `.await` to get a router: [`build_base_router`] followed by
+/// [`harden_router`].
+#[cfg(test)]
 pub fn build_router(
+    pool: Arc<EnginePool>,
+    tokenizer: Option<TokenizerBridge>,
+    metrics: Arc<InferenceMetrics>,
+    serve_metrics: Arc<MetricsRegistry>,
+    config: &ServerConfig,
+    build_options: RouterBuildOptions,
+) -> Router {
+    let pool_size = build_options.pool_size;
+    let base_router = build_base_router(
+        pool,
+        tokenizer,
+        metrics,
+        serve_metrics,
+        config,
+        build_options,
+    );
+    harden_router(base_router, config, pool_size)
+}
+
+/// The routes of the served router, before any hardening: everything
+/// `create_router_full` mounts, this crate's own `/metrics/serve` and the
+/// `observability.metrics_path` alias, and the `observability.metrics_enabled`
+/// gate — the innermost layers of the stack described on
+/// [`build_served_router`].
+///
+/// Split out so the warm-up can send the router a request before bearer auth
+/// is mounted in front of it, and so a test can add a route of its own before
+/// [`harden_router`] wraps the whole thing.
+pub fn build_base_router(
     pool: Arc<EnginePool>,
     tokenizer: Option<TokenizerBridge>,
     metrics: Arc<InferenceMetrics>,
@@ -419,13 +514,16 @@ pub fn build_router(
 ) -> Router {
     let RouterBuildOptions {
         admin_auth,
-        pool_size,
+        // Only [`harden_router`] needs the pool size, to derive the
+        // admission ceiling.
+        pool_size: _,
         enable_ui,
         max_output_tokens_ceiling,
         embedder,
         embedder_unavailable,
         engine_report,
         prompt_start_token,
+        served_model_id,
     } = build_options;
 
     let mut router_options = RouterOptions::default()
@@ -445,6 +543,9 @@ pub fn build_router(
     }
     if let Some(id) = prompt_start_token {
         router_options = router_options.with_prompt_start_token(id);
+    }
+    if let Some(id) = served_model_id {
+        router_options = router_options.with_served_model_id(id);
     }
 
     let mut base_router = create_router_full(pool, tokenizer, Arc::clone(&metrics), router_options);
@@ -500,21 +601,28 @@ pub fn build_router(
         enabled: config.observability.metrics_enabled,
         custom_path: config.observability.metrics_path.clone(),
     });
-    base_router = base_router.layer(axum::middleware::from_fn_with_state(
+    base_router.layer(axum::middleware::from_fn_with_state(
         metrics_gate_cfg,
         metrics_gate_mw,
-    ));
+    ))
+}
 
-    // Innermost of the "admission" group: bounded concurrency + per-request
-    // timeout, both bridged back into JSON HTTP responses via
-    // `HandleErrorLayer` (axum requires an `Infallible` error type on the
-    // outermost service). `GlobalConcurrencyLimitLayer` (not
-    // `tower::limit::ConcurrencyLimitLayer` via `ServiceBuilder`) is
-    // required: `Router::layer` applies a given `Layer` independently to
-    // *every registered route*, so a bare `ConcurrencyLimitLayer` -- which
-    // allocates its own `Arc<Semaphore>` inside `Layer::layer()` -- would
-    // silently create one independent semaphore *per route* instead of one
-    // shared budget across the whole HTTP surface.
+/// Wrap `base_router` in admission and every layer outside it, in the order
+/// documented on [`build_served_router`]: admission (a shared concurrency budget of
+/// `resolve_admission_limit(limits.max_concurrent_requests, pool_size)`
+/// requests and a timeout), the body limit, the `Content-Length` precheck,
+/// the rate limiter, bearer auth and CORS.
+///
+/// Admission wraps every route `base_router` has: only the paths in
+/// [`admission::exempt_paths`] (the liveness, readiness and metrics routes,
+/// and the configured metrics alias) skip its concurrency budget. Mount any
+/// further route on `base_router`, before this call, to put it inside
+/// admission; a route added to the returned router is outside it.
+pub fn harden_router(base_router: Router, config: &ServerConfig, pool_size: usize) -> Router {
+    // Bounded concurrency + per-request timeout, one shared budget across the
+    // whole HTTP surface (see `admission::Admission` for why the budget is
+    // shared state rather than a per-route layer), with the probe and metrics
+    // routes answered outside the budget.
     //
     // Applied here, BEFORE `DefaultBodyLimit` below, so
     // `DefaultBodyLimit` ends up mounted OUTSIDE (more outer than) this
@@ -522,14 +630,15 @@ pub fn build_router(
     // does and does not achieve.
     let effective_max_concurrent_requests =
         resolve_admission_limit(config.limits.max_concurrent_requests, pool_size);
-    let concurrency_semaphore =
-        tower::limit::GlobalConcurrencyLimitLayer::new(effective_max_concurrent_requests);
-    let admission = ServiceBuilder::new()
-        .layer(HandleErrorLayer::new(handle_admission_error))
-        .load_shed()
-        .layer(concurrency_semaphore)
-        .timeout(Duration::from_millis(config.limits.per_request_timeout_ms));
-    let mut router = base_router.layer(admission);
+    let mut router = admission::apply_admission(
+        base_router,
+        effective_max_concurrent_requests,
+        config
+            .limits
+            .per_request_timeout_ms
+            .saturating_add(ADMISSION_TIMEOUT_GRACE_MS),
+        admission::exempt_paths(&config.observability.metrics_path),
+    );
 
     // SV-27/sec-16: explicit, configurable request body ceiling instead of
     // axum's implicit 2 MiB default.
@@ -546,7 +655,7 @@ pub fn build_router(
     // either position. So a request whose declared size already exceeds
     // the limit still has to reach the handler's body-collecting extractor
     // (past `admission`, wherever `DefaultBodyLimit` sits) before anything
-    // rejects it, and `tower::load_shed` decides the "is a concurrency
+    // rejects it, and the admission layer decides the "is a concurrency
     // permit available" question before either layer is reached. Sitting
     // here is still the right relative position for when a real
     // synchronous body-size guard (e.g. a `Content-Length` precheck, or
@@ -601,65 +710,6 @@ pub fn build_router(
     router
 }
 
-/// Convert an admission-layer error (an overloaded `load_shed` or an elapsed
-/// `timeout`) into an OpenAI-style JSON error response.
-///
-/// Required because axum's `Router` demands an `Infallible` error type on the
-/// outermost service; `HandleErrorLayer` is the documented bridge from the
-/// `tower::BoxError` the admission stack produces back into a `Response`. See
-/// <https://docs.rs/axum/latest/axum/error_handling/index.html>.
-///
-/// sec-20/perf-M1: the `Overloaded` (`503`) branch carries a `Retry-After`
-/// header -- this module's own doc comment on [`resolve_admission_limit`]
-/// promises "a fast `503` + `Retry-After`", which only the `429` rate-limit
-/// path (`oxibonsai_runtime::rate_limiter`) actually delivered until now.
-async fn handle_admission_error(err: BoxError) -> Response {
-    if err.is::<tower::load_shed::error::Overloaded>() {
-        let body = Json(serde_json::json!({
-            "error": {
-                "message": "server is at its configured limits.max_concurrent_requests \
-                             capacity; retry after a short backoff",
-                "type": "overloaded_error",
-                "param": null,
-                "code": null,
-            }
-        }));
-        let mut response = (StatusCode::SERVICE_UNAVAILABLE, body).into_response();
-        response.headers_mut().insert(
-            HeaderName::from_static("retry-after"),
-            HeaderValue::from_static("1"),
-        );
-        return response;
-    }
-    if err.is::<tower::timeout::error::Elapsed>() {
-        return (
-            StatusCode::REQUEST_TIMEOUT,
-            Json(serde_json::json!({
-                "error": {
-                    "message": "request exceeded the configured limits.per_request_timeout_ms \
-                                 budget",
-                    "type": "timeout_error",
-                    "param": null,
-                    "code": null,
-                }
-            })),
-        )
-            .into_response();
-    }
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({
-            "error": {
-                "message": format!("unhandled admission-layer error: {err}"),
-                "type": "internal_error",
-                "param": null,
-                "code": null,
-            }
-        })),
-    )
-        .into_response()
-}
-
 // ─── SV-24: this crate's own Prometheus registry, actually mounted ─────────
 
 /// Serve this crate's [`MetricsRegistry`] as Prometheus text exposition.
@@ -667,7 +717,7 @@ async fn handle_admission_error(err: BoxError) -> Response {
 ///
 /// Takes the registry directly (not via an axum `State<S>` extractor) so it
 /// can be mounted on an already state-erased `Router<()>` via a capturing
-/// closure — see the call site in `build_router`.
+/// closure — see the call site in `build_base_router`.
 async fn serve_metrics_handler(registry: Arc<MetricsRegistry>) -> impl IntoResponse {
     (
         StatusCode::OK,
@@ -746,7 +796,7 @@ fn route_label(path: &str) -> &'static str {
 /// Render an `InferenceMetrics` snapshot as Prometheus text exposition —
 /// byte-identical to `oxibonsai_runtime::server`'s own (private)
 /// `prometheus_metrics` handler, used here to back a non-default
-/// `observability.metrics_path` alias (see `build_router`).
+/// `observability.metrics_path` alias (see `build_base_router`).
 fn render_metrics_text(metrics: &InferenceMetrics) -> impl IntoResponse {
     (
         StatusCode::OK,
@@ -762,7 +812,7 @@ struct MetricsGateConfig {
 }
 
 /// Gate `/metrics`, this crate's own `/metrics/serve` (finding `SV-24`), and
-/// the `observability.metrics_path` alias route `build_router` mounts when
+/// the `observability.metrics_path` alias route `build_base_router` mounts when
 /// it differs from `/metrics` — all three behind `observability.metrics_enabled`
 /// (finding `SV-15`(b)). A no-op for every other path.
 ///
@@ -795,7 +845,7 @@ async fn metrics_gate_mw(
 
 /// Active `Content-Length` precheck.
 ///
-/// `DefaultBodyLimit` (see the note where [`build_router`] applies it)
+/// `DefaultBodyLimit` (see the note where [`harden_router`] applies it)
 /// enforces nothing by itself at either layer position: it only stamps a
 /// request extension that the *handler's* `Bytes`/`Json` extractor consults
 /// once it actually buffers the body, which happens *inside* `admission` --
@@ -1264,3 +1314,7 @@ mod env_override_tests {
 #[cfg(test)]
 #[path = "hardening/build_router_tests.rs"]
 mod build_router_tests;
+
+#[cfg(test)]
+#[path = "hardening/probe_admission_tests.rs"]
+mod probe_admission_tests;

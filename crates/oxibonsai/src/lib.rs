@@ -1,11 +1,13 @@
 //! # OxiBonsai
 //!
-//! **Pure Rust 1-bit LLM inference engine for PrismML Bonsai models.**
+//! **Pure Rust sub-2-bit LLM inference engine for PrismML Bonsai models.**
 //!
-//! OxiBonsai is a high-performance inference engine designed for 1-bit quantized
-//! large language models in GGUF format. It provides a complete pipeline from model
-//! loading through token generation, with optional RAG, tokenization, evaluation,
-//! and HTTP serving capabilities.
+//! OxiBonsai is a high-performance inference engine for PrismML's sub-2-bit
+//! Bonsai family in GGUF format: the 1-bit line, the ternary line, and the
+//! Bonsai 2 27B hybrid model, plus the Bonsai-Image text-to-image model. It
+//! provides a complete pipeline from model loading through token generation,
+//! with optional RAG, tokenization, evaluation, image generation, and HTTP
+//! serving capabilities.
 //!
 //! ## Quick Start
 //!

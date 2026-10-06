@@ -13,7 +13,7 @@
 //! No binary fixtures: every golden block is generated in-code from a fixed
 //! seed, so the suite is reproducible and the repo stays clean.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use half::f16;
 use oxibonsai_core::error::BonsaiError;
@@ -372,7 +372,7 @@ fn claimed_block_count_guards_reject_a_mis_typed_tensor() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn models_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models")
+    oxibonsai_testkit::workspace::models_dir()
 }
 
 /// What each real file must resolve to, from the block-layout probe (§0.2).

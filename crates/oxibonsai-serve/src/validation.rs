@@ -39,7 +39,7 @@ pub const MAX_DEFAULT_MAX_TOKENS: usize = 8192;
 /// unconditionally, sourced from `oxibonsai_runtime::server::create_router_full`
 /// (chat/completions/models/health/metrics), `embeddings::create_embeddings_router`,
 /// `web_ui::create_ui_router`, `admin::create_admin_router`, and this
-/// package's own `/metrics/serve` (finding `SV-24`). A non-default
+/// crate's own `/metrics/serve` (finding `SV-24`). A non-default
 /// `observability.metrics_path` that collides with one of these would make
 /// `axum::Router::route` panic at startup (`Router::route` refuses a
 /// duplicate path+method registration) — see [`ServerConfig::validate`]'s
@@ -73,9 +73,9 @@ pub const RESERVED_ROUTE_PATHS: &[&str] = &[
 /// must reject identically (findings `SV-30` / `sec-M3`): an unset-or-short
 /// bearer token is fine (auth is optional), but a *configured* token must
 /// meet the minimum length, and the two admission knobs must be positive —
-/// `max_concurrent_requests == 0` builds a zero-permit semaphore that
-/// `load_shed`s every request forever, and `request_timeout_ms == 0` fires
-/// the timeout before any handler can complete.
+/// `max_concurrent_requests == 0` builds a zero-slot budget that sheds
+/// every request forever, and `request_timeout_ms == 0` fires the timeout
+/// before any handler can complete.
 ///
 /// The single canonical implementation now lives in
 /// `oxibonsai_runtime::serve_shared` (both crates already depend on
@@ -216,7 +216,7 @@ impl ServerConfig {
             }
         }
 
-        // ─── CORS (finding sec-09 / SV-20 / wave-1 addendum item 5) ───────
+        // ─── CORS (finding sec-09 / SV-20) ───────
         //
         // `oxibonsai_runtime::middleware::CorsConfig::is_unrestricted_wildcard`
         // already makes this combination impossible to *emit* at the HTTP

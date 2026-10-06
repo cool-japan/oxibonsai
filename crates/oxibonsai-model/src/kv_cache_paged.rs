@@ -1,5 +1,5 @@
 //! The experimental page-based KV cache ([`PagedKvCache`]), split out of
-//! `kv_cache.rs` (B2-11-FIX). Re-exported from [`crate::kv_cache`], so the
+//! `kv_cache.rs`. Re-exported from [`crate::kv_cache`], so the
 //! `crate::kv_cache::PagedKvCache` path is unchanged.
 
 /// Default number of positions per page.

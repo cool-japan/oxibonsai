@@ -22,14 +22,14 @@
 //! `acc1` in two-block pairs (AVX2); a strictly sequential 128-element
 //! scalar sweep (reference). Batch rows never interact, so blocking over
 //! `m` cannot perturb a row's reduction, and
-//! [`blocked_tests::onebit_blocked_is_bit_identical_to_the_tier_gemm`]
+//! `blocked_tests::onebit_blocked_is_bit_identical_to_the_tier_gemm`
 //! asserts byte equality rather than a tolerance. That is what lets
 //! [`crate::tiled::gemm_tiled`] and [`crate::parallel::gemm_1bit_g128_par`]
 //! adopt this kernel without relaxing a single existing assertion.
 //!
 //! The sign decode itself is perf-08's other half: `bits_to_signs_neon` /
 //! `bits_to_signs_avx2` rebuild a `±1` vector per 4 (resp. 8) weights out
-//! of lane inserts, compares and selects. [`ONEBIT_SIGN_LUT`] replaces that
+//! of lane inserts, compares and selects. `ONEBIT_SIGN_LUT` replaces that
 //! with one 8 KiB, L1-resident table load per `qs` byte, producing exactly
 //! the same `±1.0` values.
 
@@ -46,7 +46,7 @@ use crate::gemm_ternary::BlockedTier;
 /// rows means 16 live vector accumulators plus two sign vectors and a scale
 /// — still inside AArch64's 32 vector registers.
 ///
-/// **Measured, not assumed (PERF-CPU-PREFILL verifier pass).** An earlier
+/// **Measured, not assumed.** An earlier
 /// revision of this doc quoted a specific MR=4-vs-8 speedup and specific
 /// ternary sequential/parallel multipliers; neither number is reproducible
 /// from the harness it cited, and no run recording them shipped with this
@@ -169,8 +169,8 @@ fn validate_onebit_gemm(
 /// weight block is decoded once per [`ONEBIT_GEMM_MR`] batch rows instead
 /// of once per batch row.
 ///
-/// Tiers this package cannot mirror without editing a kernel module it does
-/// not own (AVX-512) call straight into that module's own
+/// Tiers that cannot be mirrored here without editing a separate kernel module
+/// (AVX-512) call straight into that module's own
 /// (non-register-blocked) GEMM instead, so this entry point is always safe
 /// to call, never escapes to the GPU, and never changes results.
 ///

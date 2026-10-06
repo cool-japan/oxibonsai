@@ -644,7 +644,7 @@ fn real_model_tokens(vocab: usize, n: usize) -> Vec<u32> {
 /// of each shape. The model's own ternary routes — `forward_greedy_gpu`,
 /// `try_metal_prefill_with_lm_head_ternary` and
 /// `try_metal_prefill_verify_ternary_path` — dispatch through the cached
-/// entries (HANDOVER-GPU B4), so each is also checked against the cached
+/// entries, so each is also checked against the cached
 /// result: the routing change is bit-exact on the real model.
 ///
 /// Every run gets its own Metal session (`MET-08`), so the device KV caches of
@@ -908,7 +908,7 @@ const BLOCK_PROJECTIONS: [&str; 7] = [
     "ffn_down",
 ];
 
-/// HANDOVER-GPU C2 on the real **Ternary-Bonsai-1.7B**
+/// On the real **Ternary-Bonsai-1.7B**
 /// (`OXI_MODEL=<path to Ternary-Bonsai-1.7B.gguf>`): on Metal,
 /// `BonsaiModel::upload_weights_to_gpu` keeps exactly the model's own tensors
 /// resident in the kernel's weight cache — the seven projections of every
@@ -933,7 +933,7 @@ fn real_model_upload_weights_to_gpu_keeps_no_ternary_concatenation_on_metal() {
         next_gpu_model_epoch, release_model_weights, resident_weight_bytes, GpuUploadScope,
     };
     use oxibonsai_kernels::TernaryKernel;
-    use oxibonsai_testkit::capability::{record_executed, record_skipped, Capability};
+    use oxibonsai_testkit::capability::{record_executed_timed, record_skipped, Capability};
 
     const TEST: &str = "metal_prefill_ternary_parity_tests::\
                         real_model_upload_weights_to_gpu_keeps_no_ternary_concatenation_on_metal";
@@ -955,6 +955,7 @@ fn real_model_upload_weights_to_gpu_keeps_no_ternary_concatenation_on_metal() {
         record_skipped(Capability::Metal, TEST);
         return;
     };
+    let gate_start = std::time::Instant::now();
     let mmap = oxibonsai_core::gguf::reader::mmap_gguf_file(std::path::Path::new(&path))
         .expect("mmap OXI_MODEL");
     let gguf = GgufFile::parse(&mmap).expect("parse OXI_MODEL");
@@ -1050,6 +1051,7 @@ fn real_model_upload_weights_to_gpu_keeps_no_ternary_concatenation_on_metal() {
         resident_start,
         "releasing the scope's epoch frees everything this test uploaded"
     );
-    record_executed(Capability::Metal, TEST);
-    record_executed(Capability::LegacyModels, TEST);
+    let elapsed = gate_start.elapsed();
+    record_executed_timed(Capability::Metal, TEST, elapsed);
+    record_executed_timed(Capability::LegacyModels, TEST, elapsed);
 }

@@ -14,7 +14,7 @@
 //! ```text
 //! cargo run --release -p oxibonsai-image --example te_4bit_check -- \
 //!     /path/to/text_encoder-mlx-4bit/model.safetensors \
-//!     /tmp/bonsai_golden/te/weights
+//!     ${TMPDIR:-/tmp}/bonsai_golden/te/weights
 //! ```
 
 use std::path::PathBuf;

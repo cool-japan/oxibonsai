@@ -52,20 +52,30 @@
 //! first-index rule the GPU kernel implements, so the two tiers agree on
 //! ties either way.
 //!
-//! ## The sampled top-k route (`perf-11`, sampled half)
+//! ## The sampled top-k route (`perf-11`, sampled half) — opt-in
 //!
-//! A sampled request on the fused route downloads only the top-`k`
+//! A sampled request on the fused route can download only the top-`k`
 //! `(id, logit)` candidates of each decode step's resident logit row
-//! instead of the whole row — on by default ([`SampledTopKConfig`]). The
-//! engine's own sampler draws over the candidate sub-row; because the
-//! sampler ranks and walks its top-k survivors in a canonical order that
-//! depends only on the survivor set (`crate::sampling`'s module docs), and
-//! the candidates contain every survivor in that order, a seeded draw picks
-//! exactly the token the full-row draw would. Requests the candidates
-//! cannot serve exactly (a penalty, `top_k` of `0` or above the candidate
-//! count, log-probabilities) decode the full row, and every such request
-//! or step is counted ([`crate::engine::EngineStats`] and, when attached,
-//! the Prometheus counters).
+//! instead of the whole row ([`SampledTopKConfig`]). The route is **off by
+//! default**: its GPU selection kernel (`topk_f32`, one threadgroup making 64
+//! selection passes over the row) costs about 25 ms per token at a
+//! 151 669-token vocabulary, while the full-row "download" it avoids is a read
+//! of a shared-memory buffer on Apple silicon — on an M3,
+//! Ternary-Bonsai-1.7B decoded at 21-23 tok/s with the route and at 57-59
+//! tok/s with the full-row draw. Turn it on per engine with
+//! `InferenceEngine::set_sampled_topk(SampledTopKConfig::gpu_candidates())`
+//! (an engine pool's replicas each need it before the pool is built).
+//!
+//! When it is on, the engine's own sampler draws over the candidate sub-row;
+//! because the sampler ranks and walks its top-k survivors in a canonical
+//! order that depends only on the survivor set (`crate::sampling`'s module
+//! docs), and the candidates contain every survivor in that order, a seeded
+//! draw picks exactly the token the full-row draw would — the output never
+//! depends on the route. Requests the candidates cannot serve exactly (a
+//! penalty, `top_k` of `0` or above the candidate count, log-probabilities)
+//! decode the full row, and every such request or step is counted
+//! ([`crate::engine::EngineStats`] and, when attached, the Prometheus
+//! counters).
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use oxibonsai_kernels::{KernelDispatcher, KernelTier};
@@ -87,16 +97,22 @@ pub const DEFAULT_SAMPLED_TOPK_CANDIDATES: usize = 64;
 /// (`perf-11`, sampled half).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SampledTopKMode {
-    /// Route disabled: a sampled request decodes every step's full logit row
-    /// through the classic sampler (`Sampler::sample_with_history`). Its
-    /// output is byte-identical to [`Self::GpuCandidates`]'s; it only costs
-    /// the full download.
-    Off,
-    /// **The default**: download only the top-`k` `(id, logit)` pairs of each
-    /// decode step's logit row (the GPU `topk_f32` kernel over the resident
-    /// logits) and draw the step's token from them — byte-identical to the
-    /// classic full-row draw (see [`SampledTopKConfig`]).
+    /// **The default**: route disabled. A sampled request decodes every
+    /// step's full logit row through the classic sampler
+    /// (`Sampler::sample_with_history`). Its output is byte-identical to
+    /// [`Self::GpuCandidates`]'s; it pays the full download, which on Apple
+    /// silicon is a read of a shared-memory buffer and costs less than the
+    /// selection kernel [`Self::GpuCandidates`] runs instead (see
+    /// [`SampledTopKConfig`]).
     #[default]
+    Off,
+    /// Opt-in: download only the top-`k` `(id, logit)` pairs of each decode
+    /// step's logit row (the GPU `topk_f32` kernel over the resident logits)
+    /// and draw the step's token from them — byte-identical to the classic
+    /// full-row draw (see [`SampledTopKConfig`]), but slower than it at the
+    /// 151 669-token vocabulary of the shipped dense models because of the
+    /// kernel's selection cost. Select it with
+    /// [`SampledTopKConfig::gpu_candidates`].
     GpuCandidates,
     /// Download the full row and extract the very same top-`k` on the CPU,
     /// then draw from them exactly as [`Self::GpuCandidates`] does: the
@@ -125,7 +141,37 @@ pub enum SampledTopKMode {
 /// above the candidate count or at/above the vocabulary, a penalty, or the
 /// route disabled.
 ///
-/// # Default: [`SampledTopKMode::GpuCandidates`] — byte-identical to the classic sampler
+/// # Default: [`SampledTopKMode::Off`] — the route is opt-in
+///
+/// By default every sampled step decodes the full logit row through the
+/// classic sampler. [`SampledTopKMode::GpuCandidates`] avoids that download
+/// but replaces it with the GPU `topk_f32` selection kernel (one threadgroup
+/// making 64 selection passes over the row), which costs about 25 ms per
+/// token at a 151 669-token vocabulary — more than the read of a shared-memory
+/// buffer it saves on Apple silicon. Measured on an M3 (release build, same
+/// seed; `top_k` 64 takes the route, `top_k` 65 the full row):
+/// Ternary-Bonsai-1.7B decodes at 21-23 tok/s with the route and 57-59 tok/s
+/// without it, Bonsai-8B at 14.3 against 22.2.
+/// The route is therefore left to the embedder, per engine:
+///
+/// ```
+/// use oxibonsai_core::config::Qwen3Config;
+/// use oxibonsai_runtime::engine::InferenceEngine;
+/// use oxibonsai_runtime::engine_greedy::{SampledTopKConfig, SampledTopKMode};
+/// use oxibonsai_runtime::sampling::SamplingParams;
+///
+/// let mut engine =
+///     InferenceEngine::new(Qwen3Config::tiny_test(), SamplingParams::default(), 42);
+/// assert_eq!(engine.sampled_topk().mode, SampledTopKMode::Off);
+///
+/// engine.set_sampled_topk(SampledTopKConfig::gpu_candidates());
+/// assert_eq!(engine.sampled_topk().mode, SampledTopKMode::GpuCandidates);
+/// ```
+///
+/// A pool's replicas are engines like any other: configure each one before
+/// building the pool. The shipped CLI and servers do not enable it.
+///
+/// # Byte-identical to the classic sampler
 ///
 /// `Sampler::sample_core` selects its `top_k` survivors and walks them — the
 /// softmax sum, min-p/top-p, the weighted draw — in a canonical order: raw
@@ -140,9 +186,10 @@ pub enum SampledTopKMode {
 /// produces the same tokens with the route on or off (tested on the ternary
 /// and the 1-bit fused fixtures across `top_k`, `top_p`, min-p, temperature
 /// and seed, and on the real 1.7B, against the route switched off and an
-/// independently spelled-out classic loop), so switching it off
-/// ([`SampledTopKMode::Off`] through [`InferenceEngine::set_sampled_topk`])
-/// only changes what each decode step downloads, never the output.
+/// independently spelled-out classic loop), so switching the route on
+/// ([`SampledTopKMode::GpuCandidates`] through
+/// [`InferenceEngine::set_sampled_topk`]) only changes what each decode step
+/// downloads and computes, never the output.
 ///
 /// # What the route guarantees
 ///
@@ -171,20 +218,21 @@ pub struct SampledTopKConfig {
 }
 
 impl Default for SampledTopKConfig {
-    /// The route on ([`SampledTopKMode::GpuCandidates`]) with
-    /// [`DEFAULT_SAMPLED_TOPK_CANDIDATES`] candidates per decode step.
+    /// The route off ([`SampledTopKMode::Off`]): every sampled step decodes
+    /// the full logit row. [`DEFAULT_SAMPLED_TOPK_CANDIDATES`] is the
+    /// candidate count the route uses once a mode turns it on.
     fn default() -> Self {
         Self {
-            mode: SampledTopKMode::GpuCandidates,
+            mode: SampledTopKMode::Off,
             candidates: DEFAULT_SAMPLED_TOPK_CANDIDATES,
         }
     }
 }
 
 impl SampledTopKConfig {
-    /// [`SampledTopKMode::GpuCandidates`] with
-    /// [`DEFAULT_SAMPLED_TOPK_CANDIDATES`] candidates per decode step (the
-    /// default configuration, spelled out).
+    /// The opt-in configuration: [`SampledTopKMode::GpuCandidates`] with
+    /// [`DEFAULT_SAMPLED_TOPK_CANDIDATES`] candidates per decode step. Pass it
+    /// to [`InferenceEngine::set_sampled_topk`] to turn the route on.
     #[must_use]
     pub fn gpu_candidates() -> Self {
         Self {
@@ -709,9 +757,13 @@ impl<'a> InferenceEngine<'a> {
                         }
                         spec_accepted_total += accepted as u64;
 
-                        // Collect accepted draft tokens + bonus
+                        // Collect accepted draft tokens + bonus, never past the
+                        // request's budget: a verify can accept up to `draft_len`
+                        // tokens and the bonus is one more, so without the cap
+                        // a generation overshoots `max_tokens` by up to `draft_len`.
                         let mut eos_seen = false;
-                        for &token in draft.iter().take(accepted) {
+                        let budget = max_tokens.saturating_sub(output_tokens.len());
+                        for &token in draft.iter().take(accepted.min(budget)) {
                             if self.is_eos(token) {
                                 eos_seen = true;
                                 break;
@@ -724,7 +776,7 @@ impl<'a> InferenceEngine<'a> {
                             context.push(token);
                         }
 
-                        if stopped {
+                        if stopped || output_tokens.len() >= max_tokens {
                             break;
                         }
 
@@ -852,13 +904,17 @@ impl<'a> InferenceEngine<'a> {
 // ═════════════════════════════════════════════════════════════════════════
 
 impl InferenceEngine<'_> {
-    /// The sampled top-k route's configuration (`perf-11`).
+    /// The sampled top-k route's configuration (`perf-11`): the route is off
+    /// ([`SampledTopKMode::Off`]) unless [`Self::set_sampled_topk`] turned it
+    /// on.
     pub fn sampled_topk(&self) -> SampledTopKConfig {
         self.sampled_topk
     }
 
-    /// Configure the sampled top-k route: the candidate count, or the
-    /// full-row reference / disabled modes.
+    /// Configure the sampled top-k route, which is off by default: pass
+    /// [`SampledTopKConfig::gpu_candidates`] to turn it on, change the
+    /// candidate count, or select the full-row reference mode (see
+    /// [`SampledTopKConfig`] for why the route is off by default).
     pub fn set_sampled_topk(&mut self, config: SampledTopKConfig) {
         self.sampled_topk = config;
     }
@@ -896,7 +952,8 @@ impl InferenceEngine<'_> {
     }
 
     /// Count a sampled request on the fused GPU route that is about to decode
-    /// the full logit row because it is not eligible for the top-k route —
+    /// the full logit row because it is not eligible for the top-k route
+    /// (every such request while the route is off, which is the default) —
     /// in [`EngineStats`](crate::engine::EngineStats) and, when attached, in
     /// the Prometheus `oxibonsai_sampled_full_row_requests_total` counter.
     #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -1412,5 +1469,80 @@ mod tests {
             "a configured penalty must route generate_greedy_gpu through the \
              penalised CPU path regardless of the tie-break gate's value"
         );
+    }
+
+    /// The n-gram speculation of `generate_greedy_gpu` never commits past
+    /// `max_tokens`: a verify can accept up to `draft_len` drafts and the
+    /// bonus token is one more, so the commit is capped at the remaining
+    /// budget. On the weightless tiny model every logit is `0.0`, so the
+    /// greedy chain is all `0` and a prompt of `0`s makes the n-gram cache
+    /// draft `0`s that every verify accepts in full — the worst case for the
+    /// cap, at every budget from below one verify's worth to many verifies'.
+    /// Each speculative run must equal the non-speculative chain of the same
+    /// budget exactly, length included.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn ngram_speculation_never_commits_past_max_tokens() {
+        use crate::engine_control::{SpeculativeConfig, SpeculativeMode};
+        use crate::ngram_cache::NgramCache;
+        use oxibonsai_kernels::KernelTier;
+        use oxibonsai_model::model::BonsaiModel;
+
+        let prompt = [0u32; 6];
+        let engine = |speculative: Option<usize>| {
+            let mut engine = InferenceEngine::from_model_with_tier(
+                BonsaiModel::new(Qwen3Config::tiny_test()),
+                KernelTier::Reference,
+                greedy_params(),
+                42,
+            );
+            if let Some(draft_len) = speculative {
+                engine.set_speculative(SpeculativeConfig {
+                    mode: SpeculativeMode::Ngram,
+                    draft_len,
+                    warmup_tokens: 0,
+                    min_accept_rate: 0.0,
+                    min_attempts_before_gating: u64::MAX,
+                    retry_interval: 1,
+                    force_cpu_decode_after: None,
+                });
+            }
+            engine
+        };
+
+        // The premises that make the speculative branch the one under test:
+        // the cache drafts from this prompt, and a verify succeeds on this
+        // model (a failing verify would fall back to single-token decode and
+        // pass the length check without exercising the cap).
+        let mut cache = NgramCache::new();
+        cache.record(&prompt);
+        let mut context = prompt.to_vec();
+        context.push(0);
+        assert_eq!(cache.draft(&context, 4), vec![0u32; 4], "the cache drafts");
+        let mut probe = engine(None);
+        probe.prefill_from_pos(&prompt, 0).expect("prefill");
+        let preds = probe
+            .verify_batch(&[0u32; 5], prompt.len())
+            .expect("a verify runs on this model");
+        assert_eq!(preds, vec![0u32; 5], "every draft is accepted");
+
+        for draft_len in [1usize, 4, 7, 12] {
+            for max_tokens in [1usize, 2, 3, 4, 5, 6, 8, 13, 14, 40] {
+                let plain = engine(None)
+                    .generate_greedy_gpu(&prompt, max_tokens)
+                    .expect("plain greedy");
+                assert_eq!(plain.len(), max_tokens, "the plain chain fills its budget");
+                let speculative = engine(Some(draft_len))
+                    .generate_greedy_gpu(&prompt, max_tokens)
+                    .expect("speculative greedy");
+                assert_eq!(
+                    speculative,
+                    plain,
+                    "draft_len {draft_len}, max_tokens {max_tokens}: the speculative run must \
+                     be the plain chain exactly ({} tokens past the budget)",
+                    speculative.len().saturating_sub(max_tokens)
+                );
+            }
+        }
     }
 }

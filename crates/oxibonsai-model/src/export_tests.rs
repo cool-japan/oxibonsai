@@ -1,6 +1,6 @@
 //! Unit tests for `export.rs` (split out per the 2000-line file-length
-//! policy — gatekeeper OPTIONAL #O1, waves 3+3.5 review: this file was at
-//! 1983/1990 lines before the wave-3.5 `Q2K`/`Q3K`/`Q8K` addition, with no
+//! policy: this file was at
+//! 1983/1990 lines before the `Q2K`/`Q3K`/`Q8K` addition, with no
 //! headroom left). `#[path = "export_tests.rs"] mod tests;` in `export.rs`
 //! keeps this as that module's content verbatim (`use super::*;` reaches
 //! everything `export.rs` defines, exactly as it did as an inline module).
@@ -772,7 +772,7 @@ fn test_new_formats_fp32_exception_respected() {
     }
 }
 
-// ── Q2K export tests (wave-3.5 deviation routing: ExportFormat wiring) ─────
+// ── Q2K export tests (ExportFormat wiring) ──────────────────────────────
 
 #[test]
 fn test_export_q2k_roundtrip() {

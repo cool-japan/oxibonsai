@@ -1006,7 +1006,7 @@ mod tests {
     /// repo names a dense model. Unset, it self-skips and records the skip.
     #[test]
     fn real_27b_hybrid_embed_returns_a_unit_vector() {
-        use oxibonsai_testkit::capability::{record_executed, record_skipped, Capability};
+        use oxibonsai_testkit::capability::{record_executed_timed, record_skipped, Capability};
 
         const TEST_NAME: &str =
             "oxibonsai-runtime::lib::real_27b_hybrid_embed_returns_a_unit_vector";
@@ -1023,6 +1023,7 @@ mod tests {
             record_skipped(Capability::Bonsai2Models, TEST_NAME);
             return;
         };
+        let gate_start = std::time::Instant::now();
         let (mut engine, _gguf) =
             InferenceEngine::from_gguf_path_leaked(&path, greedy_params(), 42, MAX_SEQ)
                 .unwrap_or_else(|e| {
@@ -1062,6 +1063,6 @@ mod tests {
         assert_eq!(embedder.dimension(), dim);
         let served = embedder.embed_tokens(&tokens).expect("served embedding");
         assert_eq!(served, first);
-        record_executed(Capability::Bonsai2Models, TEST_NAME);
+        record_executed_timed(Capability::Bonsai2Models, TEST_NAME, gate_start.elapsed());
     }
 }

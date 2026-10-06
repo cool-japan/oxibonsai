@@ -30,9 +30,12 @@ use oxibonsai_core::gguf::writer::{GgufWriter, MetadataWriteValue, TensorEntry, 
 // ── Shared helpers ──────────────────────────────────────────────────────────
 
 fn scratch_dir(tag: &str) -> PathBuf {
+    // Unique per call for the same reason as `sha256_hex`'s scratch file.
+    static DIR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
-        "oxibonsai_pull_cli_test_{tag}_{}_{}",
+        "oxibonsai_pull_cli_test_{tag}_{}_{}_{}",
         std::process::id(),
+        DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -160,9 +163,14 @@ fn write_checksums_file(dir: &std::path::Path, filename: &str, hex: &str) -> Pat
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
+    // A per-process sequence number, not the clock alone: the tests of this
+    // binary run as threads of one process, and two of them hashing in the
+    // same clock tick would otherwise share (and delete) one scratch file.
+    static SCRATCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let tmp = std::env::temp_dir().join(format!(
-        "oxibonsai_pull_test_hash_scratch_{}_{}.bin",
+        "oxibonsai_pull_test_hash_scratch_{}_{}_{}.bin",
         std::process::id(),
+        SCRATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())

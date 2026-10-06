@@ -3,8 +3,8 @@
 //! (`encode_quantized_tensor` in `quantize.rs`).
 //!
 //! Split into its own sibling file purely for size (`quantize.rs` crossed
-//! the 2000-line policy limit once these tests plus the FIX3-GGUF-WRITE
-//! item 1(c) encoder arms were added) -- mirrors the
+//! the 2000-line policy limit once these tests plus the K-quant
+//! encoder arms were added) -- mirrors the
 //! `model/weight_loaders.rs` + `model/weight_loaders/tests.rs` split
 //! already in this crate. A child module of `quantize` (declared
 //! `#[cfg(test)] mod kquant_roundtrip_tests;` there), so `use super::*;`
@@ -13,10 +13,10 @@
 //! `quantize::scale_rule_tests` -- no caller-visible change, no test
 //! renamed or altered.
 //!
-//! FIX3-GGUF-WRITE item 1(d), "the point of the exercise": before this
-//! package, nothing in the workspace could WRITE a `Q2_K`/`Q3_K`/`Q8_K`
+//! "The point of the exercise": before these arms existed,
+//! nothing in the workspace could WRITE a `Q2_K`/`Q3_K`/`Q8_K`
 //! tensor at all (`encode_quantized_tensor` had no arm for them), so the
-//! wave-2 K-quant dequant rewrite (core-gguf-K0) had no real-GGUF
+//! K-quant dequant rewrite (core-gguf-K0) had no real-GGUF
 //! round-trip test for any of the six K-quant formats -- only an in-memory
 //! `BlockQxK::quantize`/`dequant` check
 //! (`oxibonsai-core/tests/quant_k_tests.rs`) and a writer geometry table
@@ -342,7 +342,7 @@ fn all_k_quant_formats_roundtrip_a_zero_tensor_through_a_real_gguf() {
     }
 }
 
-/// FIX3-GGUF-WRITE item 1: `known_quant_types()` is generated from
+/// `known_quant_types()` is generated from
 /// `GgufTensorType::ALL.iter().filter(is_executable)`, not a hand
 /// maintained list, so it must already report the three new K-quant
 /// wire ids without any further edit — this pins that down rather

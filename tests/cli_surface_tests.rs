@@ -346,7 +346,7 @@ mod embeddings_base64 {
     }
 }
 
-// ── cli-02 / gatekeeper REQUIRED #1: honest info/validate ────────────────────
+// ── cli-02: honest info/validate ────────────────────
 
 #[test]
 fn validate_rejects_a_non_language_model_architecture() {
@@ -659,6 +659,8 @@ fn config_model_path_section_is_actually_applied() {
 // is proven the same way: it controls whether that very log line renders
 // as JSON.
 
+// Drives the `serve` subcommand, which exists only with the `server` feature.
+#[cfg(feature = "server")]
 #[test]
 fn config_server_section_is_actually_applied() {
     let dir = scratch_dir("config_server_section");
@@ -686,6 +688,8 @@ fn config_server_section_is_actually_applied() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// Drives the `serve` subcommand, which exists only with the `server` feature.
+#[cfg(feature = "server")]
 #[test]
 fn config_observability_section_is_actually_applied() {
     let dir = scratch_dir("config_observability_section");
@@ -711,6 +715,8 @@ fn config_observability_section_is_actually_applied() {
 /// rejected by name, and the rejection happens before `cmd_serve::run`'s
 /// "no model" check even runs — `mod.rs` validates `[sampling].seed` while
 /// building `ServeArgs`, ahead of calling into `serve` at all.
+// Drives the `serve` subcommand, which exists only with the `server` feature.
+#[cfg(feature = "server")]
 #[test]
 fn config_bad_sampling_seed_is_rejected_before_serve_resolves_a_model() {
     let dir = scratch_dir("config_bad_seed_serve");

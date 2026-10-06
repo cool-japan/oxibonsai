@@ -20,15 +20,13 @@
 //! ## NEON transcendental helpers
 //!
 //! `exp_neon_f32x4` and `silu_core_neon_f32x4` are `simd_float_ops.rs`'s
-//! (KERN-SOUND's K-M3 fix), imported below rather than duplicated (K-INT8
-//! wave-4b: both files are owned by the same package, so the prior verbatim
-//! copy here — kept only because `simd_float_ops.rs` was out of reach at
-//! the time — is gone). `norms::dedup_parity` pins that every entry point
+//! (KERN-SOUND's K-M3 fix), imported below rather than duplicated (the earlier
+//! verbatim copy here is gone). `norms::dedup_parity` pins that every entry point
 //! built on them (`sigmoid_simd`, `sigmoid_mul_simd`, `softplus_simd`,
 //! `rms_norm_gated_simd`) produces bit-identical output to the old
 //! duplicated implementation.
 //!
-//! [`ln_neon_f32x4`] is new: `softplus_simd` needs `ln(1+exp(x))` and no
+//! `ln_neon_f32x4` is new: `softplus_simd` needs `ln(1+exp(x))` and no
 //! vectorized `ln` exists anywhere in this workspace (checked). Rather than
 //! transcribing a second multi-constant polynomial from memory (real risk
 //! of a silent transcription error in an untested constant), it computes
@@ -251,9 +249,8 @@ pub fn sigmoid_mul_simd(x: &[f32], gate: &[f32], out: &mut [f32]) -> KernelResul
 ///
 /// The `20.0` cutoff (not a smaller "safe" threshold) matches ggml's own
 /// `ggml_vec_soft_plus_f32` and the Gated DeltaNet decay-gate computation
-/// (`x = alpha_raw + dt_bias; softplus(x)`), which B2-05's `gdn_step_f32`
-/// also reproduces — kept self-contained here rather than imported since
-/// B2-05 is a parallel, independently-landing package.
+/// (`x = alpha_raw + dt_bias; softplus(x)`), which `gdn_step_f32`
+/// also reproduces — kept self-contained here rather than imported.
 ///
 /// # Errors
 ///
@@ -1190,7 +1187,7 @@ mod tests {
 }
 
 // ═════════════════════════════════════════════════════════════════
-//  K-INT8 wave-4b: exp_neon_f32x4 / silu_core_neon_f32x4 de-dup proof
+//  exp_neon_f32x4 / silu_core_neon_f32x4 de-dup proof
 // ═════════════════════════════════════════════════════════════════
 //
 // `norms.rs` used to carry its own verbatim copy of
@@ -1297,7 +1294,7 @@ mod dedup_parity {
     }
 
     /// Pinned against the verbatim-copy implementation, captured BEFORE the
-    /// K-INT8 wave-4b `exp_neon_f32x4`/`silu_core_neon_f32x4` de-dup
+    /// the `exp_neon_f32x4`/`silu_core_neon_f32x4` de-dup
     /// landed. If this ever needs to change, the de-dup broke bit
     /// exactness -- fix the code, never this constant.
     const PINNED_FINGERPRINT_BEFORE_DEDUP: u64 = 0xe189_a559_1b7d_149f;

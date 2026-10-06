@@ -1,13 +1,13 @@
-//! HF-parity tests for `oxibonsai-tokenizer` (B2-08 acceptance criteria).
+//! HF-parity tests for `oxibonsai-tokenizer` (acceptance criteria).
 //!
-//! Covers the parts of the design-doc §8.2 B2-08 acceptance criterion that
+//! Covers the parts of the design-doc §8.2 tokenizer acceptance criterion that
 //! are reachable **without** the real Bonsai 2 27B GGUF vocabulary (248 320
 //! tokens / 247 587 merges), which is not available in this sandboxed
 //! worktree:
 //!
 //! - **Decode-side exactness against the real golden**
-//!   (`scratchpad/golden2/tokenize.json`, transcribed inline below — never
-//!   read from a scratchpad path at runtime, per the "no absolute paths in
+//!   (the upstream `tokenize.json` golden, transcribed inline below — never
+//!   read from an external path at runtime, per the "no absolute paths in
 //!   tests" rule): for all 5 golden texts, build a byte-level vocabulary
 //!   from the golden's own `(id, piece)` pairs and assert `decode(ids) ==
 //!   text` exactly. This exercises the exact real `(id, piece, byte)`

@@ -235,11 +235,13 @@ const ACTIVE_KERNELS: &[&str] = &[
     "MSL_BATCHED_RMSNORM_V2",
     "MSL_BATCHED_SWIGLU",
     "MSL_GEMM_Q1_G128_V7",
+    "MSL_GEMM_Q1_G128_SIMDGROUP",
     "MSL_GEMM_Q1_G128_V7_RESIDUAL",
     "MSL_FUSED_GATE_UP_SWIGLU_GEMM_Q1",
     // Ternary (TQ2_0_g128)
     "MSL_GEMV_TQ2_G128_V1",
     "MSL_GEMM_TQ2_G128_V7",
+    "MSL_GEMM_TQ2_G128_SIMDGROUP",
     "MSL_GEMM_TQ2_G128_V8_TILED",
     "MSL_GEMM_TQ2_G128_V9_SIMDGROUP",
     "MSL_GEMM_TQ2_G128_V10_SIMDGROUP",
@@ -287,7 +289,10 @@ const ACTIVE_KERNELS: &[&str] = &[
     "MSL_QWEN35_COMMON",
     "MSL_QWEN35_ROTATE",
     "MSL_QWEN35_GEMV",
+    "MSL_QWEN35_GEMM",
     "MSL_QWEN35_SSM",
+    // Qwen3-VL vision tower (the Bonsai 2 mmproj on Metal)
+    "MSL_VISION",
 ];
 
 /// Extract actively-used MSL raw string literals from the concatenated

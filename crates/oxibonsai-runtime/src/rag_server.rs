@@ -1,6 +1,9 @@
 //! OpenAI-compatible RAG endpoints for OxiBonsai.
 //!
-//! Feature-gated with `#[cfg(feature = "rag")]`.
+//! Feature-gated with `#[cfg(feature = "rag")]`. The feature brings the
+//! `server` feature with it: the RAG routes run their generation through the
+//! chat routes' blocking-pool seam and answer to the server's per-request
+//! deadline.
 //!
 //! # Endpoints
 //!
@@ -23,34 +26,76 @@
 //! let engine = InferenceEngine::new(config, SamplingParams::default(), 42);
 //! let router = create_rag_router(engine);
 //! ```
+//!
+//! # Where the work runs
+//!
+//! No handler runs a long synchronous computation on an async worker thread,
+//! where it would starve every other request served by that worker (the
+//! probe routes included):
+//!
+//! | Route | Work | Where it runs |
+//! |-------|------|---------------|
+//! | `POST /rag/query` | embedding the query, searching the vector store, assembling the prompt, tokenising it | the blocking pool, as one stage |
+//! | `POST /rag/query` | the generation | the blocking pool, through the chat routes' `run_blocking_generation` |
+//! | `POST /rag/index` | fitting the TF-IDF vocabulary, chunking and embedding every document | the blocking pool |
+//! | `GET /rag/stats` | a pointer read and one pass over the stored chunks' sizes (a few nanoseconds per chunk) | the handler, off a snapshot: no lock is held across the pass |
+//! | `DELETE /rag/index` | a fit over the fixed bootstrap corpus | the handler (microseconds) |
+//!
+//! The pipeline is shared as an immutable snapshot: a query clones the
+//! pointer under the state's lock and searches without holding it, and an
+//! index or clear swaps in a whole new pipeline. No lock is ever held across
+//! work, so a long search never delays `/rag/stats` or an index swap, and an
+//! index that is replaced mid-query leaves that query on a consistent view.
+//!
+//! # Deadline and cancellation
+//!
+//! `/rag/query` behaves like the chat routes' non-streamed path:
+//!
+//! * a handler future that is dropped before the answer is in hand — the
+//!   client disconnected, or a layer outside the handler (the admission
+//!   layer's timeout) gave up on it — cancels the generation at its next
+//!   step, so the replica serves the next request instead of decoding to
+//!   `max_tokens` for nobody;
+//! * a router built with a request timeout ([`RagRouterOptions::with_limits`])
+//!   enforces it inside the handler: an expired deadline cancels the
+//!   generation and answers `504` with `error.code: request_timeout`,
+//!   `error.phase` naming the stage the request was in (`preparing` while it
+//!   retrieves and tokenises, `waiting_for_engine`, `prefill`, `decode`) and,
+//!   in decode, `error.generated_tokens` — the error object of the chat
+//!   routes, not a new one.
+//!
+//! `/rag/index` has no deadline of its own (the admission layer's timeout is
+//! its backstop), but a request that is dropped stops its indexing loop
+//! between documents and never replaces the index: an abandoned `/rag/index`
+//! leaves the index it found. A single document is indexed in one library
+//! call, so the loop cannot stop inside it.
 
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use axum::Router;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
+use oxibonsai_rag::chunker::ChunkConfig;
 use oxibonsai_rag::embedding::TfIdfEmbedder;
 use oxibonsai_rag::pipeline::{RagConfig, RagPipeline};
 
 use crate::engine::InferenceEngine;
+use crate::engine_control::CancellationToken;
 use crate::engine_pool::EnginePool;
-use crate::sampling::SamplingParams;
+use crate::metrics::InferenceMetrics;
+use crate::server::api_error::ApiError;
+use crate::server::blocking::CancelOnAbandon;
+use crate::server::deadline::{enforce_deadline, CancelSlot};
+use crate::server::RequestLimits;
 use crate::tokenizer_bridge::TokenizerBridge;
 
-/// Hard upper bound on the number of tokens a single `/rag/query` request may
-/// ask the engine to generate, mirroring the chat server's output ceiling so an
-/// oversized `max_tokens` cannot drive an unbounded allocation.
-const MAX_RAG_OUTPUT_TOKENS: usize = 8192;
+mod index;
+mod query;
 
-/// Inclusive bounds on the client-supplied `top_k` for `/rag/query`. Values
-/// outside this range are rejected with `400 Bad Request` rather than
-/// silently clamped, so callers get honest feedback instead of a
-/// mismatch between the requested and actual retrieval depth (finding
-/// `serve-api-06`/`rag-eval-01`).
-const MIN_RAG_TOP_K: usize = 1;
-const MAX_RAG_TOP_K: usize = 50;
+use index::{build_index, BuiltIndex, IndexError};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Default corpus used to bootstrap the TF-IDF vocabulary.
@@ -173,6 +218,13 @@ fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
     crate::http_error::error_response(status, message, None)
 }
 
+/// The same envelope as [`error_response`], as the error type the deadline
+/// and the blocking-pool seams share with the chat routes (it renders the
+/// identical body).
+fn api_error(status: StatusCode, message: impl Into<String>) -> ApiError {
+    ApiError::new(status, message)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Human-readable byte formatting
 // ─────────────────────────────────────────────────────────────────────────────
@@ -202,27 +254,78 @@ fn rough_token_count(text: &str) -> usize {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Router options
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Everything [`create_rag_router_with_options`] takes besides the engine
+/// pool and the tokenizer.
+///
+/// The default builds the router the other constructors build: no deadline,
+/// and a router-local metrics instance nobody scrapes.
+#[derive(Clone, Default)]
+#[non_exhaustive]
+pub struct RagRouterOptions {
+    /// The server's per-request limits. Only
+    /// [`RequestLimits::per_request_timeout`] applies to the RAG routes: it
+    /// is the deadline `/rag/query` enforces inside its handler, the same
+    /// value the chat routes enforce (`--request-timeout-ms`).
+    pub limits: RequestLimits,
+    /// The metrics a request that outlasts its deadline is counted in
+    /// (`errors_total`). Pass the instance the chat router records into so
+    /// `/metrics` shows RAG timeouts alongside theirs; `None` keeps a
+    /// router-local instance.
+    pub metrics: Option<Arc<InferenceMetrics>>,
+}
+
+impl RagRouterOptions {
+    /// Set the per-request limits (see [`Self::limits`]).
+    #[must_use]
+    pub fn with_limits(mut self, limits: RequestLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// Record timed-out requests into `metrics` (see [`Self::metrics`]).
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<InferenceMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // RagState
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Shared state for the RAG server.
 ///
-/// Holds the RAG pipeline (protected by a `std::sync::Mutex` for blocking
-/// operations) and an [`EnginePool`] of inference-engine replicas — the same
-/// pooling pattern the base `/v1/chat/completions` server uses, so RAG requests
-/// can generate concurrently up to `pool.size()` instead of serializing on a
-/// single mutex. An optional [`TokenizerBridge`] enables real text generation
-/// from the retrieved-context prompt.
+/// Holds the RAG pipeline — an immutable snapshot behind a lock that is held
+/// only to read or replace the pointer — and an [`EnginePool`] of
+/// inference-engine replicas — the same pooling pattern the base
+/// `/v1/chat/completions` server uses, so RAG requests can generate
+/// concurrently up to `pool.size()` instead of serializing on a single mutex.
+/// An optional [`TokenizerBridge`] enables real text generation from the
+/// retrieved-context prompt.
 pub struct RagState {
-    /// The RAG pipeline.  Uses a `std::sync::Mutex` because all RAG operations
-    /// are synchronous (no `.await` points inside the lock).
-    pipeline: Mutex<RagPipeline<TfIdfEmbedder>>,
+    /// The RAG pipeline, as an immutable snapshot. The `std::sync::Mutex`
+    /// guards the pointer only: a reader clones it and works on its own
+    /// snapshot, so the lock is never held across the (long) retrieval or
+    /// indexing work and a poisoned lock cannot leave a half-written index.
+    pipeline: Mutex<Arc<RagPipeline<TfIdfEmbedder>>>,
     /// Pool of inference-engine replicas shared across all RAG requests.
     engines: Arc<EnginePool>,
     /// Optional tokenizer. When present, the RAG prompt is encoded, generated,
     /// and decoded to real text; when absent, generation is skipped honestly
     /// (see [`rag_query`]).
     tokenizer: Option<TokenizerBridge>,
+    /// The deadline `/rag/query` enforces inside its handler; `None` is no
+    /// deadline of its own (only the layers outside the handler time it).
+    request_timeout: Option<Duration>,
+    /// Where a request that outlasts `request_timeout` is counted.
+    metrics: Arc<InferenceMetrics>,
+    /// Test seam: which thread each long-running stage ran on.
+    #[cfg(test)]
+    stage_log: Mutex<Vec<(&'static str, std::thread::ThreadId)>>,
 }
 
 impl RagState {
@@ -230,16 +333,118 @@ impl RagState {
     /// optional tokenizer.
     ///
     /// The RAG pipeline is initialised with a bootstrap corpus so the
-    /// `TfIdfEmbedder` vocabulary is non-empty from the start.
+    /// `TfIdfEmbedder` vocabulary is non-empty from the start. The state has
+    /// no deadline of its own until [`Self::with_options`] gives it one.
     pub fn new(engines: Arc<EnginePool>, tokenizer: Option<TokenizerBridge>) -> Self {
-        let embedder = TfIdfEmbedder::fit(BOOTSTRAP_CORPUS, DEFAULT_MAX_FEATURES);
-        let pipeline = RagPipeline::new(embedder, RagConfig::default());
         Self {
-            pipeline: Mutex::new(pipeline),
+            pipeline: Mutex::new(Arc::new(bootstrap_pipeline())),
             engines,
             tokenizer,
+            request_timeout: None,
+            metrics: Arc::new(InferenceMetrics::new()),
+            #[cfg(test)]
+            stage_log: Mutex::new(Vec::new()),
         }
     }
+
+    /// Apply `options`: the deadline `/rag/query` enforces, and the metrics a
+    /// request that outlasts it is counted in.
+    #[must_use]
+    pub fn with_options(mut self, options: RagRouterOptions) -> Self {
+        self.request_timeout = options.limits.per_request_timeout;
+        if let Some(metrics) = options.metrics {
+            self.metrics = metrics;
+        }
+        self
+    }
+
+    /// The current pipeline. The lock is held for the pointer clone only.
+    fn snapshot(&self) -> Arc<RagPipeline<TfIdfEmbedder>> {
+        // The guarded value is a plain `Arc` that is valid whatever panicked
+        // while the lock was held, so a poisoned lock is recovered.
+        let guard = self.pipeline.lock().unwrap_or_else(PoisonError::into_inner);
+        Arc::clone(&guard)
+    }
+
+    /// Replace the pipeline with `pipeline`. The previous one is released
+    /// after the lock is, and goes away with its last in-flight reader.
+    fn replace_pipeline(&self, pipeline: RagPipeline<TfIdfEmbedder>) {
+        let previous = {
+            let mut guard = self.pipeline.lock().unwrap_or_else(PoisonError::into_inner);
+            std::mem::replace(&mut *guard, Arc::new(pipeline))
+        };
+        drop(previous);
+    }
+
+    /// Run `work` — one long synchronous stage of a request — on the blocking
+    /// pool, so it never occupies an async worker thread.
+    ///
+    /// `cancel` is cancelled if the handler future is dropped before the
+    /// result is in hand (the client went away, or a layer outside the
+    /// handler gave up on it), so a stage that checks it can stop; `work`
+    /// receives the same token. The blocking task itself cannot be
+    /// interrupted from outside: it runs until it returns.
+    ///
+    /// # Errors
+    ///
+    /// `500` when the blocking task itself fails (panicked or was cancelled);
+    /// `work`'s own result is passed through untouched as `T`.
+    async fn run_stage<T, F>(
+        self: &Arc<Self>,
+        stage: &'static str,
+        cancel: &CancellationToken,
+        work: F,
+    ) -> Result<T, ApiError>
+    where
+        F: FnOnce(&CancellationToken) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        #[cfg(test)]
+        let probe = Arc::clone(self);
+        let token = cancel.clone();
+        let abandon = CancelOnAbandon::new(cancel.clone());
+        let joined = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            probe.note_stage(stage);
+            work(&token)
+        })
+        .await;
+        // The stage's result (or its failure) is in hand: nothing is abandoned.
+        abandon.disarm();
+        joined.map_err(|error| {
+            tracing::error!(%error, stage, "RAG stage task failed");
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("RAG {stage} task failed"),
+            )
+        })
+    }
+
+    /// Record that the calling thread is running `stage` (tests read it back
+    /// to show which stages ran off the async worker).
+    #[cfg(test)]
+    fn note_stage(&self, stage: &'static str) {
+        self.stage_log
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((stage, std::thread::current().id()));
+    }
+}
+
+/// A fresh pipeline over the bootstrap corpus, so the TF-IDF vocabulary is
+/// non-empty before any document is indexed.
+fn bootstrap_pipeline() -> RagPipeline<TfIdfEmbedder> {
+    let embedder = TfIdfEmbedder::fit(BOOTSTRAP_CORPUS, DEFAULT_MAX_FEATURES);
+    RagPipeline::new(embedder, RagConfig::default())
+}
+
+/// The `error` of a stage that was told its request is over. Nobody reads
+/// it: the handler future that would is already gone.
+fn abandoned(stage: &str) -> ApiError {
+    api_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!("the request was abandoned before {stage} began"),
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -252,6 +457,10 @@ impl RagState {
 /// is overridden.  After indexing the TF-IDF vocabulary is re-fitted against
 /// the newly provided corpus so that future queries benefit from in-domain
 /// term frequencies.
+///
+/// The fit and the per-document indexing loop run on the blocking pool; the
+/// new index replaces the old one only once every document is indexed, and
+/// never for a request whose client has gone away.
 pub async fn index_documents(
     State(state): State<Arc<RagState>>,
     Json(req): Json<IndexDocumentRequest>,
@@ -261,7 +470,7 @@ pub async fn index_documents(
     }
 
     // Build chunk config, honouring optional overrides.
-    let mut chunk_config = oxibonsai_rag::chunker::ChunkConfig::default();
+    let mut chunk_config = ChunkConfig::default();
     if let Some(size) = req.chunk_size {
         chunk_config.chunk_size = size;
     }
@@ -301,48 +510,37 @@ pub async fn index_documents(
         );
     }
 
-    // Build a fresh TF-IDF embedder fitted on the new corpus so that
-    // vocabulary is always in-domain.
-    let doc_refs: Vec<&str> = req.documents.iter().map(String::as_str).collect();
-    let embedder = TfIdfEmbedder::fit(&doc_refs, DEFAULT_MAX_FEATURES);
-
-    let rag_config = RagConfig::default().with_chunk_config(chunk_config);
-
-    // Replace the pipeline with a freshly fitted one.
-    let mut new_pipeline = RagPipeline::new(embedder, rag_config);
-
-    let mut document_ids: Vec<usize> = Vec::with_capacity(req.documents.len());
-    let mut total_chunks = 0usize;
-
-    for (doc_idx, doc) in req.documents.iter().enumerate() {
-        match new_pipeline.index_document(doc) {
-            Ok(chunk_count) => {
-                document_ids.push(doc_idx);
-                total_chunks += chunk_count;
-            }
-            Err(e) => {
-                return error_response(
-                    StatusCode::BAD_REQUEST,
-                    format!("failed to index document {doc_idx}: {e}"),
-                );
-            }
-        }
-    }
-
-    let indexed = document_ids.len();
-
-    // Swap the pipeline in under the mutex.
-    match state.pipeline.lock() {
-        Ok(mut guard) => {
-            *guard = new_pipeline;
-        }
-        Err(e) => {
+    // The heavy half runs off the async worker. The guard inside `run_stage`
+    // cancels the token if this future is dropped while it runs, and the
+    // swap below only happens once the result is in hand.
+    let documents = req.documents;
+    let cancel = CancellationToken::new();
+    let built = match state
+        .run_stage("indexing", &cancel, move |cancel| {
+            build_index(&documents, chunk_config, cancel)
+        })
+        .await
+    {
+        Ok(Ok(built)) => built,
+        Ok(Err(IndexError::Document { index, source })) => {
             return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("pipeline lock poisoned: {e}"),
+                StatusCode::BAD_REQUEST,
+                format!("failed to index document {index}: {source}"),
             );
         }
-    }
+        Ok(Err(IndexError::Cancelled)) => return abandoned("indexing").into_response(),
+        Err(error) => return error.into_response(),
+    };
+
+    let BuiltIndex {
+        pipeline,
+        document_ids,
+        total_chunks,
+    } = built;
+    let indexed = document_ids.len();
+
+    // Swap the pipeline in.
+    state.replace_pipeline(pipeline);
 
     let resp = IndexDocumentResponse {
         indexed,
@@ -360,224 +558,31 @@ pub async fn index_documents(
 ///
 /// 1. Retrieves the top-k most relevant context chunks for `query`.
 /// 2. Builds a prompt from the context and query.
-/// 3. Runs inference via the shared `InferenceEngine`.
+/// 3. Runs inference on a replica of the engine pool.
 /// 4. Returns the answer along with optional context and usage metadata.
+///
+/// Retrieval, prompt assembly and tokenisation run on the blocking pool, and
+/// so does the generation (through the same seam as the chat routes'
+/// non-streamed path), so no request ever occupies an async worker for its
+/// duration. The request runs under the router's per-request deadline
+/// ([`RagRouterOptions::with_limits`]) and its generation is cancelled when
+/// the client goes away; see the module docs.
 pub async fn rag_query(
     State(state): State<Arc<RagState>>,
     Json(req): Json<RagQueryRequest>,
 ) -> impl IntoResponse {
-    if req.query.trim().is_empty() {
-        return error_response(StatusCode::BAD_REQUEST, "query must not be empty");
-    }
-
-    let max_tokens = req
-        .max_tokens
-        .unwrap_or(256)
-        .clamp(1, MAX_RAG_OUTPUT_TOKENS);
-    let top_k = match req.top_k {
-        None => 3,
-        Some(k) if (MIN_RAG_TOP_K..=MAX_RAG_TOP_K).contains(&k) => k,
-        Some(k) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "top_k ({k}) must be between {MIN_RAG_TOP_K} and {MAX_RAG_TOP_K} inclusive"
-                ),
-            );
-        }
-    };
-    let include_context = req.include_context.unwrap_or(false);
-
-    // ── 1. Build prompt via RAG pipeline ────────────────────────────────────
-    //
-    // The pipeline's own `Retriever` is always constructed with a *fixed*
-    // `RetrieverConfig` (top_k baked in at pipeline-construction time), so
-    // `RagPipeline::build_prompt` cannot be asked to use a different top_k
-    // per request. To make the client-supplied `top_k` genuinely drive both
-    // the reported chunk count *and* the generation prompt (finding
-    // `serve-api-06`/`rag-eval-01`), we perform retrieval ourselves against
-    // the pipeline's embedder + vector store directly, then assemble the
-    // context/prompt using the exact same defaults `RagState` constructs its
-    // pipelines with (`RagConfig::default()`), and finally feed that same
-    // context into the generation step below.
-    let (prompt, retrieved_chunks, docs_searched, chunks_retrieved) = {
-        let pipeline_guard = match state.pipeline.lock() {
-            Ok(g) => g,
-            Err(e) => {
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("pipeline lock poisoned: {e}"),
-                );
-            }
-        };
-
-        let stats = pipeline_guard.stats();
-        let docs_searched = stats.documents_indexed;
-
-        let retriever = pipeline_guard.retriever();
-
-        // Route through the retriever's own public retrieval API (RAG,
-        // unowned sibling) instead of reconstructing the search call by
-        // hand against `retriever.store()` directly, which used to bypass
-        // both the zero-norm query guard (RAG-21 /
-        // `Retriever::reject_degenerate_query`) and the retriever's own
-        // *configured* `min_score` (a freshly-built
-        // `RetrieverConfig::default()` was used instead of the pipeline's
-        // real config). `retrieve_with_top_k` exists specifically so this
-        // per-request client-supplied `top_k` can still override
-        // `RetrieverConfig::top_k` while every other guard/config applies
-        // exactly like `Retriever::retrieve`.
-        let results = match retriever.retrieve_with_top_k(&req.query, top_k) {
-            Ok(results) => results,
-            // An empty index is not a client error for this endpoint --
-            // the pipeline still answers, just with no retrieved context
-            // (matches `/rag/query`'s long-standing documented/tested
-            // behaviour against a fresh server before any `/rag/index`
-            // call).
-            Err(oxibonsai_rag::error::RagError::NoDocumentsIndexed) => Vec::new(),
-            Err(oxibonsai_rag::error::RagError::EmptyQueryVector) => {
-                return error_response(
-                    StatusCode::BAD_REQUEST,
-                    "query embedding has zero norm; refusing to return an arbitrary ranking",
-                );
-            }
-            Err(e) => {
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("query embedding failed: {e}"),
-                );
-            }
-        };
-
-        let retrieved_texts: Vec<String> = results.iter().map(|r| r.chunk.text.clone()).collect();
-        let chunks_retrieved = retrieved_texts.len();
-
-        // Assemble the context block the same way
-        // `RagPipeline::retrieve_context` does: concatenate chunk texts with
-        // the configured separator, dropping chunks that would exceed
-        // `max_context_chars`.
-        let rag_defaults = RagConfig::default();
-        let sep = &rag_defaults.context_separator;
-        let mut parts: Vec<&str> = Vec::with_capacity(results.len());
-        let mut total_chars = 0usize;
-        for result in &results {
-            let text_len = result.chunk.text.len();
-            let sep_len = if parts.is_empty() { 0 } else { sep.len() };
-            if total_chars + sep_len + text_len > rag_defaults.max_context_chars
-                && !parts.is_empty()
-            {
-                break;
-            }
-            total_chars += sep_len + text_len;
-            parts.push(&result.chunk.text);
-        }
-        let context = parts.join(sep.as_str());
-
-        let prompt = rag_defaults
-            .prompt_template
-            .replace("{context}", &context)
-            .replace("{query}", &req.query);
-
-        (prompt, retrieved_texts, docs_searched, chunks_retrieved)
-    };
-
-    // ── 2. Generate an answer from the real RAG prompt ───────────────────────
-    // When a tokenizer is configured we encode the *actual* context+query
-    // prompt, run the engine on those tokens, and decode the output back to
-    // text — so the answer genuinely depends on the retrieved context and the
-    // query. Without a tokenizer we cannot map the prompt text onto the model's
-    // vocabulary, so we skip generation and say so honestly rather than
-    // fabricating an answer from a fixed start token.
-    let (answer, completion_tokens, prompt_tokens_count) = match &state.tokenizer {
-        Some(tokenizer) => {
-            let input_tokens = match tokenizer.encode(&prompt) {
-                Ok(tokens) if !tokens.is_empty() => tokens,
-                Ok(_) => {
-                    return error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "prompt encoded to an empty token sequence",
-                    );
-                }
-                Err(e) => {
-                    return error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("prompt tokenisation failed: {e}"),
-                    );
-                }
-            };
-            let prompt_tokens_count = input_tokens.len();
-
-            // Honor the request temperature when it is a valid value.
-            let mut params = SamplingParams::default();
-            if let Some(temperature) = req.temperature {
-                if temperature.is_finite() && (0.0..=2.0).contains(&temperature) {
-                    params.temperature = temperature;
-                }
-            }
-
-            let output_tokens = {
-                let mut lease = match state.engines.acquire().await {
-                    Ok(lease) => lease,
-                    Err(e) => {
-                        return error_response(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            format!("engine pool acquire failed: {e}"),
-                        );
-                    }
-                };
-                match lease.generate_with_params(&input_tokens, max_tokens, &params) {
-                    Ok(tokens) => tokens,
-                    Err(e) => {
-                        return error_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("generation failed: {e}"),
-                        );
-                    }
-                }
-            };
-
-            let completion_tokens = output_tokens.len();
-            let answer = match tokenizer.decode(&output_tokens) {
-                Ok(text) => text,
-                Err(e) => {
-                    return error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("decoding generated tokens failed: {e}"),
-                    );
-                }
-            };
-            (answer, completion_tokens, prompt_tokens_count)
-        }
-        None => {
-            // No tokenizer: retrieval succeeded and the prompt was built, but we
-            // cannot run the model on raw text. Be transparent instead of
-            // returning numeric token IDs dressed up as an answer.
-            let answer = "[no tokenizer configured: retrieval succeeded and the \
-                          prompt was built, but text generation is unavailable on \
-                          this server]"
-                .to_string();
-            (answer, 0usize, rough_token_count(&prompt))
-        }
-    };
-
-    // ── 4. Build response ────────────────────────────────────────────────────
-    let resp = RagQueryResponse {
-        answer,
-        retrieved_chunks: if include_context {
-            Some(retrieved_chunks)
-        } else {
-            None
-        },
-        prompt_used: prompt,
-        usage: RagUsage {
-            documents_searched: docs_searched,
-            chunks_retrieved,
-            prompt_tokens: prompt_tokens_count,
-            completion_tokens,
-        },
-    };
-
-    (StatusCode::OK, Json(resp)).into_response()
+    // The request's handle on its generation and its stage record: the
+    // deadline cancels whatever the handler starts and names the stage it
+    // caught the request in.
+    let slot = CancelSlot::default();
+    let outcome = enforce_deadline(
+        state.request_timeout,
+        &state.metrics,
+        &slot,
+        query::rag_query_inner(Arc::clone(&state), req, slot.clone()),
+    )
+    .await;
+    outcome.unwrap_or_else(IntoResponse::into_response)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -585,17 +590,11 @@ pub async fn rag_query(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Return pipeline statistics as JSON.
+///
+/// Reads the current pipeline's snapshot, so it never waits for a query or
+/// an index in flight.
 pub async fn rag_stats(State(state): State<Arc<RagState>>) -> impl IntoResponse {
-    let stats = match state.pipeline.lock() {
-        Ok(guard) => guard.stats(),
-        Err(e) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("pipeline lock poisoned: {e}"),
-            )
-            .into_response();
-        }
-    };
+    let stats = state.snapshot().stats();
 
     let resp = RagStatsResponse {
         documents_indexed: stats.documents_indexed,
@@ -617,20 +616,7 @@ pub async fn rag_stats(State(state): State<Arc<RagState>>) -> impl IntoResponse 
 /// The TF-IDF embedder is re-fitted on the bootstrap corpus so the pipeline
 /// remains usable after the clear.
 pub async fn clear_index(State(state): State<Arc<RagState>>) -> impl IntoResponse {
-    let embedder = TfIdfEmbedder::fit(BOOTSTRAP_CORPUS, DEFAULT_MAX_FEATURES);
-    let fresh_pipeline = RagPipeline::new(embedder, RagConfig::default());
-
-    match state.pipeline.lock() {
-        Ok(mut guard) => {
-            *guard = fresh_pipeline;
-        }
-        Err(e) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("pipeline lock poisoned: {e}"),
-            );
-        }
-    }
+    state.replace_pipeline(bootstrap_pipeline());
 
     let body = serde_json::json!({ "status": "cleared" });
     (StatusCode::OK, Json(body)).into_response()
@@ -655,11 +641,28 @@ pub fn create_rag_router(engine: InferenceEngine<'static>) -> Router {
 /// concurrently up to `pool.size()`. When a tokenizer is supplied, `/rag/query`
 /// encodes the retrieved-context prompt, runs the engine, and decodes the
 /// output to real text.
+///
+/// The router has no deadline of its own: only the layers outside it time a
+/// request. Use [`create_rag_router_with_options`] to give `/rag/query` the
+/// server's per-request deadline.
 pub fn create_rag_router_with_pool(
     engines: Arc<EnginePool>,
     tokenizer: Option<TokenizerBridge>,
 ) -> Router {
-    let state = Arc::new(RagState::new(engines, tokenizer));
+    create_rag_router_with_options(engines, tokenizer, RagRouterOptions::default())
+}
+
+/// [`create_rag_router_with_pool`] with the server's per-request limits: when
+/// `options` carries a request timeout ([`RagRouterOptions::with_limits`]),
+/// `/rag/query` enforces it inside its handler exactly as the chat routes
+/// do — an expired deadline cancels the generation and answers `504
+/// request_timeout` with the stage it caught the request in.
+pub fn create_rag_router_with_options(
+    engines: Arc<EnginePool>,
+    tokenizer: Option<TokenizerBridge>,
+    options: RagRouterOptions,
+) -> Router {
+    let state = Arc::new(RagState::new(engines, tokenizer).with_options(options));
 
     Router::new()
         .route("/rag/index", axum::routing::post(index_documents))
@@ -669,131 +672,6 @@ pub fn create_rag_router_with_pool(
         .with_state(state)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Unit tests
-// ─────────────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn human_bytes_formatting() {
-        assert_eq!(human_bytes(0), "0 B");
-        assert_eq!(human_bytes(512), "512 B");
-        assert_eq!(human_bytes(1024), "1.00 KiB");
-        assert_eq!(human_bytes(1024 * 1024), "1.00 MiB");
-        assert_eq!(human_bytes(1024 * 1024 * 1024), "1.00 GiB");
-    }
-
-    #[test]
-    fn rough_token_count_basic() {
-        assert_eq!(rough_token_count(""), 0);
-        assert_eq!(rough_token_count("one two three"), 3);
-        assert_eq!(rough_token_count("  spaces  everywhere  "), 2);
-    }
-
-    #[test]
-    fn rag_state_creates_without_panic() {
-        use oxibonsai_core::config::Qwen3Config;
-
-        let config = Qwen3Config::tiny_test();
-        let engine = InferenceEngine::new(config, SamplingParams::default(), 42);
-        let pool = EnginePool::new(vec![engine]);
-        let _state = RagState::new(pool, None);
-    }
-
-    // ── RAG, unowned sibling: /rag/query must route through the
-    // retriever's own guarded retrieval API ────────────────────────────────
-
-    #[tokio::test]
-    async fn rag_query_rejects_a_fully_out_of_vocabulary_query_against_a_nonempty_index() {
-        use axum::body::Body;
-        use axum::http::{Method, Request, StatusCode};
-        use oxibonsai_core::config::Qwen3Config;
-        use tower::ServiceExt;
-
-        let config = Qwen3Config::tiny_test();
-        let engine = InferenceEngine::new(config, SamplingParams::default(), 42);
-        let app = create_rag_router(engine);
-
-        // `/rag/index` refits the TF-IDF vocabulary from exactly the
-        // submitted documents (BOOTSTRAP_CORPUS is not merged in), so the
-        // vocabulary here is precisely the union of these three documents'
-        // tokens -- several unrelated documents, so a positive-control
-        // query sharing vocabulary with only one of them still has to
-        // survive ranking against the others.
-        let index_req = Request::builder()
-            .method(Method::POST)
-            .uri("/rag/index")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::json!({
-                    "documents": [
-                        "Rust is a systems programming language with memory safety.",
-                        "Python is popular for data science and machine learning.",
-                        "Tokyo is the capital of Japan and a major travel destination."
-                    ]
-                })
-                .to_string(),
-            ))
-            .expect("build index request");
-        let index_resp = app
-            .clone()
-            .oneshot(index_req)
-            .await
-            .expect("index response");
-        assert_eq!(
-            index_resp.status(),
-            StatusCode::OK,
-            "sanity: indexing three documents must succeed"
-        );
-
-        // Positive control: an in-vocabulary query must still succeed with
-        // 200, so a 400 on the OOV query below is known to come from the
-        // zero-norm guard specifically, not from every query being
-        // rejected (e.g. a broken embedder or an over-eager guard).
-        let control_req = Request::builder()
-            .method(Method::POST)
-            .uri("/rag/query")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::json!({ "query": "Rust memory safety", "max_tokens": 1 }).to_string(),
-            ))
-            .expect("build control request");
-        let control_resp = app
-            .clone()
-            .oneshot(control_req)
-            .await
-            .expect("control response");
-        assert_eq!(
-            control_resp.status(),
-            StatusCode::OK,
-            "sanity: an in-vocabulary query must still return 200"
-        );
-
-        // Every token here is out-of-vocabulary against the just-indexed
-        // documents' TF-IDF vocabulary, so the query embeds to an all-zero
-        // vector -- degenerate for the store's default Cosine metric
-        // (RAG-21 / RAG-EVAL-IMG-21). Before this fix, `/rag/query`
-        // bypassed `Retriever::retrieve`'s guard entirely (calling
-        // `retriever.store().search_with_threshold` directly) and silently
-        // returned 200 OK with an arbitrary insertion-order ranking
-        // instead.
-        let query_req = Request::builder()
-            .method(Method::POST)
-            .uri("/rag/query")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::json!({ "query": "zzqvx wwpqr fjklm bbxyzq" }).to_string(),
-            ))
-            .expect("build query request");
-        let query_resp = app.oneshot(query_req).await.expect("query response");
-        assert_eq!(
-            query_resp.status(),
-            StatusCode::BAD_REQUEST,
-            "a fully out-of-vocabulary query against a non-empty Cosine-metric index must be \
-             rejected (RAG-21), not silently ranked"
-        );
-    }
-}
+#[path = "rag_server_tests.rs"]
+mod tests;

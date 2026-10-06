@@ -50,6 +50,57 @@ impl std::fmt::Display for ModelId {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// The id a served model is listed under
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `general.name` values that name no model at all. Some converters leave the
+/// hub's placeholder (`Hf`) or a generic word in the field — the Bonsai 2 27B
+/// GGUFs carry `general.name = "Hf"` — and listing the model under one of
+/// them would make `/v1/models` useless.
+pub const PLACEHOLDER_MODEL_NAMES: [&str; 4] = ["hf", "model", "gguf", "llama"];
+
+/// The fewest characters a `general.name` needs to serve as a model id.
+pub const MIN_MODEL_NAME_CHARS: usize = 4;
+
+/// Whether `name` (a GGUF's `general.name`) is fit to be the id a model is
+/// served under: at least [`MIN_MODEL_NAME_CHARS`] characters once trimmed
+/// and not, case-insensitively, one of [`PLACEHOLDER_MODEL_NAMES`].
+#[must_use]
+pub fn is_usable_model_name(name: &str) -> bool {
+    let name = name.trim();
+    name.chars().count() >= MIN_MODEL_NAME_CHARS
+        && !PLACEHOLDER_MODEL_NAMES
+            .iter()
+            .any(|placeholder| name.eq_ignore_ascii_case(placeholder))
+}
+
+/// The id a server lists its model under (`GET /v1/models`, and the `model`
+/// member of every completion it returns).
+///
+/// The rule is deterministic:
+///
+/// 1. `general_name` — the GGUF's own `general.name`, exactly as the file
+///    spells it — when [`is_usable_model_name`] accepts it;
+/// 2. otherwise `file_stem` — the model file's name without its extension,
+///    e.g. `Ternary-Bonsai-2-27B-PQ2_0` for
+///    `models/Ternary-Bonsai-2-27B-PQ2_0.gguf` — when it is not blank;
+/// 3. otherwise `None`: the file names nothing usable and the caller keeps
+///    whatever name it already has.
+///
+/// `general_name` must be the raw metadata value (`None` when the key is
+/// absent), not a name a loader already substituted for a missing one — the
+/// dense loader reports the architecture tag when `general.name` is absent,
+/// and that tag would pass rule 1.
+#[must_use]
+pub fn served_model_id(general_name: Option<&str>, file_stem: Option<&str>) -> Option<String> {
+    general_name
+        .filter(|name| is_usable_model_name(name))
+        .map(str::trim)
+        .or_else(|| file_stem.map(str::trim).filter(|stem| !stem.is_empty()))
+        .map(str::to_string)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // EndpointStatus
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -129,6 +180,23 @@ impl ModelEndpoint {
             is_default: false,
             status: EndpointStatus::Ready,
         }
+    }
+
+    /// The endpoint of a model file: listed under the id [`served_model_id`]
+    /// derives from the file's `general.name` and its stem, or under
+    /// `fallback_id` when the file names nothing usable. The base model is
+    /// the file's own `general.name` (the served id when the file has none).
+    pub fn from_model_file(
+        general_name: Option<&str>,
+        file_stem: Option<&str>,
+        fallback_id: impl Into<String>,
+    ) -> Self {
+        let id = served_model_id(general_name, file_stem).unwrap_or_else(|| fallback_id.into());
+        let base = general_name
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map_or_else(|| id.clone(), str::to_string);
+        Self::new(id, base)
     }
 
     /// Attach a LoRA adapter to this endpoint.
@@ -544,5 +612,84 @@ mod tests {
     fn endpoint_display_name_defaults_to_id() {
         let ep = ModelEndpoint::new("bonsai-8b", "qwen3-8b");
         assert_eq!(ep.display_name, "bonsai-8b");
+    }
+
+    // ── The id a served model is listed under ───────────────────────────────
+
+    const STEM: &str = "Ternary-Bonsai-2-27B-PQ2_0";
+
+    #[test]
+    fn a_real_general_name_is_the_served_id() {
+        assert_eq!(
+            served_model_id(Some("Ternary-Bonsai-2-27B"), Some(STEM)).as_deref(),
+            Some("Ternary-Bonsai-2-27B"),
+            "a usable name wins over the file stem"
+        );
+        // Exactly the minimum length is enough, and surrounding whitespace
+        // is not part of the name.
+        assert_eq!(
+            served_model_id(Some("  Qwen "), Some(STEM)).as_deref(),
+            Some("Qwen")
+        );
+    }
+
+    #[test]
+    fn the_27b_placeholder_name_falls_back_to_the_file_stem() {
+        assert_eq!(
+            served_model_id(Some("Hf"), Some(STEM)).as_deref(),
+            Some(STEM),
+            "the Bonsai 2 27B files carry general.name = \"Hf\""
+        );
+    }
+
+    #[test]
+    fn every_placeholder_and_short_name_is_refused_case_insensitively() {
+        for name in [
+            "hf", "HF", "Hf", "model", "MODEL", "Model", "gguf", "GGUF", "GgUf", "llama", "LLaMA",
+            "LLAMA",
+        ] {
+            assert!(!is_usable_model_name(name), "{name:?} names no model");
+            assert_eq!(
+                served_model_id(Some(name), Some(STEM)).as_deref(),
+                Some(STEM),
+                "{name:?}"
+            );
+        }
+        for short in ["", " ", "a", "ab", "abc", " abc ", "日本語"] {
+            assert!(!is_usable_model_name(short), "{short:?} is too short");
+        }
+        // Length counts characters, not bytes: four CJK characters are a name.
+        assert!(is_usable_model_name("日本語処"));
+        // A placeholder is only a placeholder as a whole name.
+        for name in ["llama-3", "hf-model", "my-model", "gguf.v2", "Llama2"] {
+            assert!(is_usable_model_name(name), "{name:?} is a real name");
+        }
+    }
+
+    #[test]
+    fn a_missing_name_and_a_missing_stem_leave_the_caller_its_own_fallback() {
+        assert_eq!(served_model_id(None, Some(STEM)).as_deref(), Some(STEM));
+        assert_eq!(served_model_id(Some("Hf"), None), None);
+        assert_eq!(served_model_id(Some("Hf"), Some("  ")), None);
+        assert_eq!(served_model_id(None, None), None);
+        assert_eq!(
+            served_model_id(Some("Hf"), Some(" spaced-stem ")).as_deref(),
+            Some("spaced-stem")
+        );
+    }
+
+    #[test]
+    fn an_endpoint_built_from_a_model_file_uses_the_rule() {
+        let placeholder = ModelEndpoint::from_model_file(Some("Hf"), Some(STEM), "fallback");
+        assert_eq!(placeholder.id.as_str(), STEM);
+        assert_eq!(placeholder.display_name, STEM);
+        assert_eq!(placeholder.base_model, "Hf", "the file's own name is kept");
+
+        let named = ModelEndpoint::from_model_file(Some("Bonsai-8B"), Some("other"), "fallback");
+        assert_eq!(named.id.as_str(), "Bonsai-8B");
+
+        let nameless = ModelEndpoint::from_model_file(None, None, "fallback");
+        assert_eq!(nameless.id.as_str(), "fallback");
+        assert_eq!(nameless.base_model, "fallback");
     }
 }

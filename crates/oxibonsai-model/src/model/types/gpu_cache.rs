@@ -72,7 +72,7 @@
 //! **non-ternary** LM head keeps the per-call binding, because the cache it
 //! would bind is built only alongside a ternary tail.
 //!
-//! # Weight-cache epoch: one per GGUF mapping (MET-02, HANDOVER-GPU C1)
+//! # Weight-cache epoch: one per GGUF mapping (MET-02)
 //!
 //! Every ternary buffer — eight per layer plus the tail — is keyed under the
 //! model's **mapping epoch** ([`BonsaiModel::gpu_mapping_epoch`]): the epoch
@@ -599,7 +599,7 @@ impl<'a> BonsaiModel<'a> {
     /// For Q1 models the cache contains pre-uploaded `CachedLayerWeights`
     /// handles plus a pre-uploaded LM-head handle — used by
     /// `try_metal_full_forward_cached`. They are keyed exactly like the
-    /// uncached fused paths ([`Self::q1_layer_params`]; the norms and the LM
+    /// uncached fused paths (`Self::q1_layer_params`; the norms and the LM
     /// head under the mapping epoch), so a model that already prefilled
     /// uploads nothing here, and every replica of one mapping hits the first
     /// replica's buffers (`MET-02`, Q1 half).

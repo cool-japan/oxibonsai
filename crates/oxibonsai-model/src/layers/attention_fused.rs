@@ -58,7 +58,7 @@ const MAX_HEAD_DIM: usize = 256;
 /// release — and the guard here was a `debug_assert_eq!`, compiled out
 /// exactly where it mattered. That was reachable: the public entry points of
 /// this module deliberately accept `query.len() > head_dim` (they validate
-/// with `<`, and [`OnlineSoftmaxState::accumulate`] asserts `>=`), and they
+/// with `<`, and `OnlineSoftmaxState::accumulate` asserts `>=`), and they
 /// passed the whole `query` here against a `head_dim`-length key slice.
 /// Those entry points now also narrow `query` to `head_dim` before scoring,
 /// so the equal-length case is what the hot path actually takes; this clamp

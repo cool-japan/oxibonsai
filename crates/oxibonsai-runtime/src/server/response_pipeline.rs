@@ -438,6 +438,10 @@ pub(crate) struct StreamDriver<S, C> {
     /// The per-request rate tracker fed one sample per generated token.
     pub(crate) rate_tracker:
         Option<Arc<std::sync::Mutex<crate::request_metrics::RequestRateTracker>>>,
+    /// The request's stage record, told about every generated token: the
+    /// first one is the edge from prefill to decode (`server::phase`).
+    /// `None` for a stream that keeps no such record.
+    pub(crate) phase: Option<crate::server::phase::RequestPhase>,
 }
 
 impl<S: ContentStop, C: StreamChunks> StreamDriver<S, C> {
@@ -494,8 +498,11 @@ impl<S: ContentStop, C: StreamChunks> StreamDriver<S, C> {
         }
     }
 
-    /// Record one generated token on the rate tracker.
+    /// Record one generated token on the rate tracker and the stage record.
     fn record_token(&self) {
+        if let Some(phase) = self.phase.as_ref() {
+            phase.token_generated();
+        }
         let Some(tracker) = self.rate_tracker.as_ref() else {
             return;
         };

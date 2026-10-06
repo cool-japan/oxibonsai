@@ -17,14 +17,14 @@
 //! history). A generic invariant list would not necessarily have caught
 //! either.
 //!
-//! ## Stop-sequence matcher properties moved out (verifier fix, wave 3)
+//! ## Stop-sequence matcher properties moved out
 //!
 //! This file originally also covered `api_extensions::StopChecker`, but that
 //! type — and the module it lives in — is `#[cfg(feature = "server")]`
 //! (`crates/oxibonsai-runtime/src/lib.rs`), while this file carried no such
 //! guard. That broke `cargo check -p oxibonsai-runtime --no-default-features
-//! --tests` (unresolved import) — a regression against the wave-2.5
-//! addendum's explicit instruction to keep that build green. The
+//! --tests` (unresolved import) — a regression against the requirement
+//! to keep that build green. The
 //! `StopChecker` properties now live in the sibling
 //! `stop_sequence_proptests.rs`, gated `#![cfg(feature = "server")]`; the
 //! sampler properties below have no such dependency and stay ungated here,

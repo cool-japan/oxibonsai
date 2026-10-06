@@ -16,8 +16,9 @@
 //! cache sized to the input and freed on return; the KV cache of the session
 //! this thread decodes in — the process-default one, for most callers — is
 //! neither read nor written. Correspondingly this path never calls
-//! `note_device_kv_used`: the model's MET-05 latch still describes whatever
-//! generation state the model had before the embedding.
+//! `note_device_kv_used`: it leaves the model's MET-05 latch as it found it
+//! (`forward_hidden`, which calls this path, clears the latch together with
+//! the rest of the per-sequence state around the pass; see its module docs).
 //!
 //! Like the model's fused decode and prefill forwards (`forward_metal.rs`),
 //! the pass runs inside an autorelease pool of its own, so an embedding

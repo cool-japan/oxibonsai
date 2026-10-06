@@ -20,11 +20,10 @@ fn make_tiny_engine() -> InferenceEngine<'static> {
     InferenceEngine::new(Qwen3Config::tiny_test(), SamplingParams::default(), 42)
 }
 
-// HOTFIX-TESTMEM: kept only for `model_info_from_engine` below, which is
-// `#[ignore]`d specifically because it needs this full-size engine (see that
-// test for why). `model_variant_detection_8b/4b/1_7b` used to have their own
-// `make_8b_engine()`/`make_engine_with_config()`-built engines too, but no
-// longer construct a model at all — see the comment on
+// Test memory bound: this full-size engine exists only for
+// `model_info_from_engine` below, which is `#[ignore]`d specifically because
+// it needs it (see that test for why). The `model_variant_detection_8b/4b/1_7b`
+// tests construct no model at all — see the comment on
 // `model_variant_detection_8b`.
 fn make_8b_engine() -> InferenceEngine<'static> {
     InferenceEngine::new(Qwen3Config::bonsai_8b(), SamplingParams::default(), 42)
@@ -244,11 +243,11 @@ fn generate_max_tokens_zero_returns_empty_or_minimal() {
 
 // ── 10. Model variant detection ──────────────────────────────────────────
 //
-// HOTFIX-TESTMEM: these three used to build a real engine via
-// `make_8b_engine()`/`make_engine_with_config(bonsai_4b()/bonsai_1_7b())`,
-// i.e. `BonsaiModel::new(config)`, which allocates ~5 GB / ~2.7 GB / ~1.3 GB
-// of token_embd + output_weight tables (plus a KV cache) just to read back
-// `model.variant().name()`. `BonsaiModel::variant()` (model/types/mod.rs) is
+// Test memory bound: these three tests do not build a real engine. Doing so
+// (`BonsaiModel::new(config)` for bonsai_8b / bonsai_4b / bonsai_1_7b) would
+// allocate ~5 GB / ~2.7 GB / ~1.3 GB of token_embd + output_weight tables
+// (plus a KV cache) just to read back `model.variant().name()`.
+// `BonsaiModel::variant()` (model/types/mod.rs) is
 // `ModelVariant::from_config_and_sample_tensor_type(&self.config,
 // self.dominant_quant_type)`, and `ModelVariant::from_config` is a pure
 // function of `(num_layers, hidden_size)` alone (model_registry.rs) — it

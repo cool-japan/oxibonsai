@@ -1,8 +1,8 @@
 //! Golden acceptance tests for the blockwise FWHT-1024 kernel (finding
-//! K-07, `bonsai2-design.md` §2.2 / §8.2 B2-04). Black-box: every check goes
+//! K-07, `bonsai2-design.md` §2.2 / §8.2). Black-box: every check goes
 //! through `oxibonsai_kernels::hadamard`'s public API only.
 //!
-//! Covers, per the design's own acceptance list for this package:
+//! Covers, per the design's own acceptance list:
 //! - involution: `fwht(fwht(x)) == x`;
 //! - orthogonality: `‖fwht(x)‖₂ == ‖x‖₂`;
 //! - equality with a naive `O(n²)` `H·x/√n` for `n == 1024`, doubling as the

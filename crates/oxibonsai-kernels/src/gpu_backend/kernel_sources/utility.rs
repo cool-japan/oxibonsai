@@ -431,8 +431,7 @@ kernel void argmax(
 /// reuses the same 1024-thread / power-of-two-stride tree and pays no extra
 /// GPU→CPU round trips — one dispatch produces all `k` pairs.
 ///
-/// `k` is capped at [`MAX_TOPK_F32`](
-/// crate::gpu_backend::metal_dispatch::MAX_TOPK_F32) (256, comfortably above
+/// `k` is capped at `MAX_TOPK_F32` (256, comfortably above
 /// any realistic `top_k` sampling value — the recommended Bonsai 2 sampling
 /// config uses `top_k = 20`) by both sides: the Rust dispatcher
 /// (`metal_dispatch.rs::dispatch_topk_f32`) rejects a larger `k` with a typed
@@ -463,9 +462,8 @@ kernel void argmax(
 /// real, grammar-masked `-INFINITY` logit was present but could never be
 /// chosen". Both cases are harmless to a caller that follows this rule:
 /// **treat `out_vals[i] == -INFINITY` as "no candidate" and ignore the
-/// paired `out_ids[i]`**, never sample or rank on it. (This kernel is
-/// unwired as of this package; the consumer that must honour this contract
-/// is METAL-CONCURRENCY's wave-4 `sampled_gpu_topk` engine arm.)
+/// paired `out_ids[i]`**, never sample or rank on it. (The consumer that must
+/// honour this contract is the sampled top-k route in `resident_logits.rs`.)
 ///
 /// Buffers:
 /// - buffer(0) = data     (f32, input values)

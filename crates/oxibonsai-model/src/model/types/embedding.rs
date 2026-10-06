@@ -34,7 +34,7 @@
 //! None of the shipped or 27B-target GGUFs embed their token table that way
 //! today; add a decoder here if one ever does.
 //!
-//! ## No dense escape hatch (M-02, wave 2.5)
+//! ## No dense escape hatch (M-02)
 //!
 //! This type used to implement `Index<Range<usize>>`, which materialized the
 //! whole FP32 table into a `OnceLock` on first use. Every batched GPU gather
@@ -421,7 +421,7 @@ impl<'a> EmbeddingTable<'a> {
     }
 
     /// Copy the embedding rows of `token_ids` into `out`, one contiguous
-    /// `hidden`-element row each (M-02, wave 2.5).
+    /// `hidden`-element row each (M-02).
     ///
     /// This is what the batched GPU gather paths call instead of the deleted
     /// dense `Index` hatch: it allocates nothing and touches only the
@@ -512,7 +512,7 @@ mod tests {
                         );
                     }
                     // The batched gather must produce exactly the same numbers
-                    // as the whole-table `dequant` it replaced (M-02, wave 2.5
+                    // as the whole-table `dequant` it replaced (M-02
                     // — this is the assertion the deleted dense `Index` hatch
                     // used to carry), and cost no resident bytes doing it.
                     let ids: Vec<u32> = (0..vocab as u32).collect();

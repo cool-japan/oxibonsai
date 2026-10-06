@@ -1,7 +1,7 @@
 //! Integration tests for the sampler/engine penalty seam and logprobs variant.
 //!
 //! These exercise the *public* API surface that the OpenAI-compatible server
-//! layer (wave 2) consumes: the exported [`PenaltyParams`] type, the
+//! layer consumes: the exported [`PenaltyParams`] type, the
 //! [`apply_frequency_presence_penalty`] primitive, the engine-level
 //! `set_penalties` / `penalties` / `eos_token_id` accessors, the
 //! `generate_with_params_and_penalties` convenience, and (under the `server`

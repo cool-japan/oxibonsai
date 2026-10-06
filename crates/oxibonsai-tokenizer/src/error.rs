@@ -38,7 +38,7 @@ pub enum TokenizerError {
     HfFormat(String),
 
     /// A GGUF-embedded tokenizer definition (`tokenizer.ggml.*`) could not be
-    /// parsed or interpreted (B2-08/TOK-05's format, distinct from
+    /// parsed or interpreted (TOK-05's format, distinct from
     /// [`Self::HfFormat`]'s `tokenizer.json`: both describe "the serialized
     /// tokenizer definition could not be parsed", just from a different
     /// container).

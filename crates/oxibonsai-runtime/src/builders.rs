@@ -42,10 +42,10 @@ pub struct SamplerBuilder {
 impl SamplerBuilder {
     /// Create a new sampler builder with default values.
     ///
-    /// `repetition_penalty` defaults to `1.0` (no-op). Gatekeeper REQUIRED
-    /// #18 (waves 3+3.5 review): this used to be `1.1`, one of the residual
-    /// seeds left over after `sampling::SamplingParams::default()` was
-    /// corrected to `1.0` (RT-24 / gatekeeper REQUIRED #1(a)) — the P0
+    /// `repetition_penalty` defaults to `1.0` (no-op); it used to be `1.1`,
+    /// one of the residual seeds left over after
+    /// `sampling::SamplingParams::default()` was corrected to `1.0` (RT-24) —
+    /// the P0
     /// CPU-vs-Metal greedy-parity fix depends on every default-constructed
     /// sampler applying no penalty unless a caller opts in explicitly.
     pub fn new() -> Self {
@@ -225,7 +225,7 @@ impl Default for ConfigBuilder {
     }
 }
 
-/// Builder for the inference engine (high-level orchestrator).
+/// Builder for the inference engine (the high-level entry point).
 ///
 /// Validates configuration and sampling parameters together.
 /// [`build`](Self::build) returns the validated config and sampler;
@@ -282,7 +282,7 @@ impl EngineBuilder {
         self.kernel_tier.as_deref()
     }
 
-    /// Set the `--rope-scaling` override (wave-4b orchestrator addendum;
+    /// Set the `--rope-scaling` override (M-08;
     /// see [`RopeScalingMode`]). It wins over the configuration's own
     /// `[model].rope_scaling`, is written into the configuration
     /// [`build`](Self::build) returns, and is applied to the model by
@@ -377,7 +377,7 @@ mod tests {
         assert!((params.temperature - 0.7).abs() < f32::EPSILON);
         assert_eq!(params.top_k, 40);
         assert!((params.top_p - 0.9).abs() < f32::EPSILON);
-        // Gatekeeper REQUIRED #18: the raw builder default is now `1.0`
+        // The raw builder default is `1.0`
         // (no-op), matching `sampling::SamplingParams::default()`.
         assert!((params.repetition_penalty - 1.0).abs() < f32::EPSILON);
     }

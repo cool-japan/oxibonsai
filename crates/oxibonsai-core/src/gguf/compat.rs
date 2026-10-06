@@ -251,7 +251,7 @@ impl ExtendedQuantType {
             // bytes = 2 + 32 = 34; bits_per_w = 34*8/32 = 8.5
             Self::Q8_0 => 8.5,
             // Q8_1: 32 weights at 8 bits + `ggml_half2 ds` (2×f16 scale/min)
-            // bytes = 2*2 + 32 = 36 (REQUIRED #3: ggml-common.h:297, not the
+            // bytes = 2*2 + 32 = 36 (ggml-common.h:297, not the
             // 40-byte figure an earlier version of this file used);
             // bits_per_w = 36*8/32 = 9.0
             Self::Q8_1 => 9.0,
@@ -357,7 +357,7 @@ pub struct GgufCompatReport {
     /// the "sorted unique ids" accessor shape the finding asked for, kept
     /// as a **field** rather than a same-named method: this exact
     /// `is_empty()`/`len()`/`contains(&id)` field-access shape is what
-    /// `tests/gguf_compat_tests.rs` (outside this package's owned files)
+    /// `tests/gguf_compat_tests.rs`
     /// already exercises, and a field and a method cannot share one name.
     /// See [`Self::unknown_quant_type_counts`] for how many tensors use
     /// each id.
@@ -626,7 +626,7 @@ mod tests {
 
     /// `Other`'s `bits_per_weight` must be computed from the real
     /// `GgufTensorType` geometry, not a stale hand-copied constant — this is
-    /// what the Q8_1 40-vs-36-byte drift (REQUIRED #3) would have shown up
+    /// what the Q8_1 40-vs-36-byte drift would have shown up
     /// as if `Other` had instead hard-coded a value.
     #[test]
     fn other_variant_bits_per_weight_matches_block_geometry() {

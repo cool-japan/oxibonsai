@@ -424,7 +424,11 @@ pub async fn get_status(State(state): State<Arc<AdminState>>) -> impl IntoRespon
 /// The sampling defaults are read from the runtime chat handler's single source
 /// of truth (the same functions that supply the request `serde` defaults), not
 /// duplicated literals. When a served-model descriptor is attached, the loaded
-/// model's real identity/context length is included under `model`.
+/// model's real identity/context length is included under `model`: `id` is the
+/// model's own name (its `general.name`, a placeholder such as `Hf` included),
+/// `served_id` the id it is served under (what `/v1/models` lists),
+/// `max_context_length` the context window the server can serve and
+/// `declared_context_length` the context the model declares.
 pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
     let snapshot = ConfigSnapshot {
         max_tokens_default: crate::server::default_max_tokens_value(),
@@ -446,8 +450,10 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
             "model".to_string(),
             serde_json::json!({
                 "id": descriptor.id,
+                "served_id": descriptor.served_id,
                 "architecture": descriptor.architecture,
                 "max_context_length": descriptor.max_context_length,
+                "declared_context_length": descriptor.declared_context_length,
                 "vocab_size": descriptor.vocab_size,
                 "created": descriptor.created,
             }),

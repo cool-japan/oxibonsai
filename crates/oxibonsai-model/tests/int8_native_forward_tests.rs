@@ -45,7 +45,7 @@ use oxibonsai_kernels::dispatch::{cpu_kernel_tier, KernelDispatcher};
 use oxibonsai_kernels::dispatch_int8::{Int8Tier, KERNEL_TIER_ENV};
 use oxibonsai_kernels::gpu_backend::CpuOnlyBackendScope;
 use oxibonsai_model::model::BonsaiModel;
-use oxibonsai_testkit::capability::{record_executed, record_skipped, Capability};
+use oxibonsai_testkit::capability::{record_executed_timed, record_skipped, Capability};
 
 /// Teacher-forced decode steps per prompt, after the prefill.
 const STEPS: usize = 8;
@@ -230,6 +230,7 @@ fn check_model(file_name: &str, test_name: &str) {
         record_skipped(Capability::LegacyModels, test_name);
         return;
     };
+    let gate_start = std::time::Instant::now();
     let tier = Int8Tier::from_name(REQUESTED_TIER)
         .map(Int8Tier::clamp_to_cpu)
         .unwrap_or(Int8Tier::Scalar);
@@ -321,7 +322,7 @@ fn check_model(file_name: &str, test_name: &str) {
         load_average()
     );
     // Written only here, after every assertion above has passed.
-    record_executed(Capability::LegacyModels, test_name);
+    record_executed_timed(Capability::LegacyModels, test_name, gate_start.elapsed());
 }
 
 #[test]

@@ -8,7 +8,7 @@
 //!   `gemv_fp8_e4m3` and `gemv_fp8_e5m2`, are resolved by entry-point name
 //!   from the combined metallib `build.rs` embeds (`ACTIVE_KERNELS` lists
 //!   `MSL_GEMV_FP8_E4M3_V1` / `MSL_GEMV_FP8_E5M2_V1`) through
-//!   [`MetalGraph::pipeline_for`] — the embedded → disk-cached → `xcrun` →
+//!   `MetalGraph::pipeline_for` — the embedded → disk-cached → `xcrun` →
 //!   runtime-source cascade every kernel family shares. This file used to
 //!   compile two private `MTLLibrary`s from source on first use.
 //! - Dispatch runs on the *current session's* command queue

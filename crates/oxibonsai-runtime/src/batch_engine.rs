@@ -242,11 +242,12 @@ mod tests {
     use crate::sampling::SamplingParams;
     use oxibonsai_core::config::Qwen3Config;
 
-    // HOTFIX-TESTMEM: `bonsai_8b()` made `BonsaiModel::new` allocate ~5 GB of
-    // token_embd + output_weight tables (plus a ~1.2 GB KV cache) for every
-    // test using this helper; all callers here submit empty prompts and
-    // never touch a dimension-dependent assertion. `tiny_test()` exercises
-    // the identical batch-generation wiring for a few tens of MB.
+    // Test memory bound: `bonsai_8b()` would make `BonsaiModel::new` allocate
+    // ~5 GB of token_embd + output_weight tables (plus a ~1.2 GB KV cache) for
+    // every test using this helper; all callers here submit empty prompts and
+    // never touch a dimension-dependent assertion, so the helper uses
+    // `tiny_test()`, which exercises the identical batch-generation wiring
+    // for a few tens of MB.
     fn make_engine() -> InferenceEngine<'static> {
         let config = Qwen3Config::tiny_test();
         InferenceEngine::new(config, SamplingParams::default(), 42)

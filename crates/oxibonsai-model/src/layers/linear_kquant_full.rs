@@ -17,7 +17,7 @@ use oxibonsai_kernels::KernelDispatcher;
 use crate::error::{ModelError, ModelResult};
 
 /// Process-wide [`KernelDispatcher`], detected once instead of once per
-/// `forward` call (a MINOR gatekeeper finding on this package): every
+/// `forward` call: every
 /// `forward` below used to call `KernelDispatcher::auto_detect()` per weight
 /// matrix per token, and `auto_detect` both allocates a fresh
 /// `Box<dyn GpuBackendTrait>`/`Arc` and emits an un-once-gated
@@ -147,8 +147,8 @@ impl<'a> LinearQ2K<'a> {
     /// When the `native-cuda` feature is enabled and a CUDA device is present
     /// the NVRTC Q2_K GEMV kernel is tried first; any failure other than
     /// "no CUDA device" is logged as a warning. Otherwise (or on that
-    /// fallback), the call routes through [`KernelDispatcher::gemv_q2k`]
-    /// (wave-1/1.5 addenda), which is the Metal-vs-CPU tier policy this type
+    /// fallback), the call routes through [`KernelDispatcher::gemv_q2k`],
+    /// which is the Metal-vs-CPU tier policy this type
     /// used to bypass entirely by calling `metal_gemv_q2k` inline — the
     /// exact gap that let a broken Metal kernel silently produce wrong
     /// logits with no diagnostic (see `LinearQ5K::forward` in

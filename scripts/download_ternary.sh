@@ -16,32 +16,31 @@
 # variants (PTQ1_0 1-bit, PQ2_0 2-bit, and a legacy-layout Q2_0 that NEEDS
 # PrismML's `prism` llama.cpp fork to read correctly: it reuses ggml type
 # id 42 with a group-128 block layout, which mainline llama.cpp treats as
-# the official group-64 Q2_0 and would silently misdecode — see CONTEXT.md
-# "id 42 is AMBIGUOUS") plus a shared Q8_0 mmproj vision projector — this
-# downloads the GGUF(s) verbatim, no local conversion.
+# the official group-64 Q2_0 and would silently misdecode — see
+# docs/models.md, "ggml type id 42: three layouts under one id") plus a shared
+# Q8_0 mmproj vision projector — this downloads the GGUF(s) verbatim, no local
+# conversion.
 #
-# REPO PROVENANCE (sec-12 / CI-GATE-blocking-2) — two separate sources,
-# kept separate below because they carry different authority; do not merge
-# them into one unsourced claim:
+# REPO PROVENANCE (sec-12) — two separate sources, kept separate below because
+# they carry different authority; do not merge them into one unsourced claim:
 #   - CONFIRMED BY THE PROJECT OWNER: the repo is
 #     `prism-ml/Ternary-Bonsai-2-27B-gguf`, holding
 #     Ternary-Bonsai-2-27B-PTQ1_0.gguf (5946648928 B),
 #     Ternary-Bonsai-2-27B-PQ2_0.gguf (7206168928 B) and
 #     Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf (629246976 B) — independently
-#     corroborated by scratchpad/demo/README.md:124. This is
-#     OXI_BONSAI2_REPO's default below.
-#   - FROM scratchpad/demo/MODEL-FORMATS.md (:40, :51-55): the third
-#     language GGUF, Ternary-Bonsai-2-27B-Q2_0-prism-fork-required.gguf, is
-#     deliberately kept OUT of that repo — mainline llama.cpp already knows
-#     ggml type id 42 and would silently misdecode this file's group-128
-#     layout as the official group-64 Q2_0 rather than refusing it outright
-#     — and is published separately, for testing only, in
-#     `prism-ml/Ternary-Bonsai-2-27B-gguf-dev` (~7.6 GB). This is
-#     OXI_BONSAI2_DEV_REPO's default below.
+#     corroborated by the file list in the README of PrismML's Bonsai-demo
+#     repository. This is OXI_BONSAI2_REPO's default below.
+#   - FROM `MODEL-FORMATS.md` in PrismML's Bonsai-demo repository (its table
+#     of model files): the third language GGUF,
+#     Ternary-Bonsai-2-27B-Q2_0-prism-fork-required.gguf, is deliberately kept
+#     OUT of that repo — mainline llama.cpp already knows ggml type id 42 and
+#     would silently misdecode this file's group-128 layout as the official
+#     group-64 Q2_0 rather than refusing it outright — and is published
+#     separately, for testing only, in `prism-ml/Ternary-Bonsai-2-27B-gguf-dev`
+#     (~7.6 GB). This is OXI_BONSAI2_DEV_REPO's default below.
 # Override either env var if you need a different revision or mirror.
-# (cli-05 / B2-14, wave 4, adds a native `oxibonsai pull` subcommand with
-# the same validation baked in — this script remains the scripted fallback
-# until that lands.)
+# `oxibonsai pull` (cli-05) is the native equivalent with the same validation
+# baked in; this script remains the scripted fallback.
 #
 # Every downloaded/converted GGUF is verified against
 # `scripts/checksums.sha256` afterwards (sec-12): a mismatch on a directly
@@ -75,8 +74,8 @@ PQ2_0_FILE="Ternary-Bonsai-2-27B-PQ2_0.gguf"
 # Legacy group-128 layout (ggml type id 42, general.file_type 41) — needs
 # PrismML's `prism` fork to read; see the header comment above. Lives in
 # OXI_BONSAI2_DEV_REPO, NOT OXI_BONSAI2_REPO — that split is the whole
-# point of the structural fix below (deps-08/CI-GATE-blocking-2's
-# "DIRECT_FILES resolved against a single $REPO" bug).
+# point of the structural fix below (deps-08: resolving every direct file
+# against a single $REPO would fetch this one from the wrong repository).
 PRISM_Q2_0_FILE="Ternary-Bonsai-2-27B-Q2_0-prism-fork-required.gguf"
 
 MODE=""                 # convert (unpack+build+convert) | direct (fetch GGUF verbatim)
@@ -159,7 +158,7 @@ assert_direct_files() {
 }
 
 # ── --self-test: isolated, offline dispatch test (no network, no `hf`) ──
-# deps-08/CI-GATE-blocking-2: every `27b-*` variant must resolve to the
+# deps-08: every `27b-*` variant must resolve to the
 # correct repo:file pairs (in particular, that only 27b-q2_0/27b-all pull
 # from OXI_BONSAI2_DEV_REPO), and an unknown variant must be rejected. Only
 # calls resolve_variant() — the download loop that actually shells out to
@@ -219,7 +218,7 @@ run_dispatch_self_test() {
     # Inside the `else` of a plain (non-negated) `if CMD; then ... else`,
     # `$?` correctly holds CMD's own exit status (unlike `if ! CMD; then`,
     # where the `!` negation loses it — see release-gate.sh's header for
-    # the concrete bug that idiom caused elsewhere in this package).
+    # the concrete bug that idiom causes).
     if (resolve_variant "not-a-real-variant") >/dev/null 2>&1; then
         echo "FAIL: unknown variant 'not-a-real-variant' did not reject (expected exit 1)"
         DISPATCH_TEST_FAILURES=$((DISPATCH_TEST_FAILURES + 1))

@@ -73,7 +73,7 @@ pub mod grammar;
 pub mod health;
 pub mod hot_reload;
 /// Shared OpenAI-style HTTP error envelope, used by every served route.
-#[cfg(any(feature = "server", feature = "rag"))]
+#[cfg(feature = "server")]
 pub mod http_error;
 pub mod json_schema;
 pub mod kv_cache_policy;

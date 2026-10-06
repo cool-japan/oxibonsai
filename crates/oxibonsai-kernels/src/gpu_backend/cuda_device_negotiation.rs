@@ -327,7 +327,7 @@ pub const fn soa_qs_offset_bytes(total_blocks: u64) -> u64 {
 /// No non-test, non-doc caller wires this predicate (or [`soa_total_blocks`])
 /// against the SoA reformat path
 /// (`cuda_graph::cudagraph_reformat_tq2_blocks_to_soa_group` /
-/// `cudagraph_reformat_q1_aos_to_soa_group`, both in this package). That is
+/// `cudagraph_reformat_q1_aos_to_soa_group`, both in this crate). That is
 /// intentional, not an oversight: the F10 fix (spec item 5) took the in-kernel
 /// grid-uniform branch — `soa_quant_aligned16` / `soa_load4_u32` in
 /// `cuda_kernels.rs` — as the single source of truth, so every launch is

@@ -10,7 +10,7 @@
 //! could only be a wall-clock proxy — and is `#[ignore]`d, so it never ran in
 //! a gate. This test is **not** `#[ignore]`d.
 //!
-//! # Why the first version of this file was ~50% flaky (verifier finding)
+//! # Why the first version of this file was ~50% flaky
 //!
 //! `System`, wrapped in one **process-wide** `AtomicUsize`, cannot tell "the
 //! call under test allocated" from "some other thread allocated while the
@@ -61,7 +61,7 @@
 //!    size, on any thread" trigger. Measured on this host (below) that
 //!    rarer event has a rate of zero across 40 runs even with the threshold
 //!    lowered to `1` (i.e. with the narrowing removed entirely) — evidence
-//!    that the specific noise the verifier caught does not reach the sizes
+//!    that the specific noise observed does not reach the sizes
 //!    axis 2 would need to see to misfire, not a proof that no environment
 //!    ever could produce it.
 //!

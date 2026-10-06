@@ -175,7 +175,7 @@ pub fn tokenizer_from_gguf_metadata(md: &MetadataStore) -> TokenizerResult<OxiTo
 
     // ── Vocabulary ──────────────────────────────────────────────────────
     //
-    // Defensive fallback (minor finding, wave-2 B2-08 review): when
+    // Defensive fallback (a minor finding): when
     // `tokenizer.ggml.token_type` is absent entirely (the real Bonsai 2 27B
     // GGUF always ships it — verified CONTROL=27/USER_DEFINED=6 — but a
     // hand-rolled or otherwise atypical GGUF might not), a declared
@@ -448,7 +448,7 @@ mod tests {
         assert_eq!(ids.first().copied(), Some(5), "BOS must be prepended");
     }
 
-    // ── `token_type`-absent defensive fallback (minor finding, wave-2 review) ──
+    // ── `token_type`-absent defensive fallback (minor finding) ───────────────
 
     /// Build a metadata block with NO `tokenizer.ggml.token_type` array at
     /// all — the scenario the fallback exists for. `bos_token_id` and

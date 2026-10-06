@@ -3,7 +3,7 @@
 //! Implements `y = W × x` where W is stored as Q6_K blocks.
 //! Each super-block covers 256 weights (QK_K = 256).
 //!
-//! On AArch64 this routes through [`neon_fused::row_dot`] (K-15 item (c)),
+//! On AArch64 this routes through `neon_fused::row_dot` (K-15 item (c)),
 //! never materializing a dequantized f32 row; everywhere else it falls back
 //! to the generic dequantize-then-dot driver.
 
@@ -17,7 +17,7 @@ use crate::error::{KernelError, KernelResult};
 /// from `ql`, a 2-bit field from `qh`, and one of 16 per-16-element `i8`
 /// sub-scales selected by `l / 16` — across four interleaved "arms" per
 /// 32-element group (`ggml-quants.c`'s `dequantize_row_q6_K`, mirrored by
-/// `BlockQ6K::dequant`). The wave-1/1.5 addenda single this format out by
+/// `BlockQ6K::dequant`). The audit singled this format out by
 /// name (its stale-layout bug hid at rel=0.0119 under a cos tolerance), so
 /// this kernel is restructured — not re-derived — directly from
 /// `BlockQ6K::dequant`'s loop: same `is = l/16` split, same four bit
@@ -393,7 +393,7 @@ mod tests {
         buf.iter().zip(input.iter()).map(|(w, x)| w * x).sum()
     }
 
-    /// K-15 item (c) / wave-1 addendum: pin the (possibly fused) production
+    /// K-15 item (c): pin the (possibly fused) production
     /// path against the ggml-exact reference decoder on non-uniform data —
     /// distinct `ql`/`qh`/per-sub-block `scales` — across several shapes.
     /// Q6_K is the format the addenda name explicitly: its stale-layout bug
@@ -437,7 +437,7 @@ mod tests {
         }
     }
 
-    /// Hand-derived golden (wave-1/1.5 addenda's explicit ask for Q6_K):
+    /// Hand-derived golden:
     /// a byte layout built directly, with the expected value traced by hand
     /// from ggml's four-arm bit extraction rather than compared only
     /// against this crate's own dequantizer.

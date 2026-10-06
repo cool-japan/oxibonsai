@@ -1,6 +1,6 @@
 //! Shared `bf16` <-> `f32` conversion helpers.
 //!
-//! Wave-2.5 integration addendum, item 7 (`K-12` bf16 hoist): before this
+//! `K-12` bf16 hoist: before this
 //! module existed, four independent copies of `bf16_to_f32` had drifted into
 //! the tree (`oxibonsai-model/src/convert/mlx_image/pack.rs`,
 //! `oxibonsai-image/src/vae/safetensors.rs`, `oxibonsai-image/src/te/mlx4bit.rs`,

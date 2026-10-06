@@ -85,7 +85,7 @@ fn assemble_gguf(
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// core-gguf-16 (wave-1 addendum #4): 5-D tensor parity between the batch
+// core-gguf-16: 5-D tensor parity between the batch
 // and streaming parsers over the identical bytes.
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -93,13 +93,11 @@ fn assemble_gguf(
 /// both parsers must reject it with the same error *and the exact same
 /// message text* over the exact same bytes. This drives `GgufFile::parse`
 /// (which owns `TensorStore` via `tensor_info.rs`) and `GgufStreamParser`
-/// (`streaming.rs`) side by side — neither of those two files is owned by
-/// this package, but the parity test itself belongs here per the wave-1
-/// addendum.
+/// (`streaming.rs`) side by side.
 ///
 /// The two parsers' reason strings were unified to the identical wording
-/// ("tensor has {n} dimensions; GGML_MAX_DIMS is {max}") by the wave-2.5
-/// addendum (item 4); this test now asserts that stronger message-text
+/// ("tensor has {n} dimensions; GGML_MAX_DIMS is {max}") by core-gguf-16;
+/// this test now asserts that stronger message-text
 /// parity directly, rather than only the weaker error *kind* it used to
 /// check.
 #[test]
@@ -179,7 +177,7 @@ fn data_offset_agrees_between_batch_and_streaming_parsers_for_the_uint32_spellin
 
 /// A `general.alignment` stored as `Uint64` is spec-invalid (llama.cpp
 /// rejects any non-`UINT32` spelling outright — `ggml/src/gguf.cpp:613-618`).
-/// The batch parser (this package's `reader.rs`) now rejects it explicitly
+/// The batch parser (`reader.rs`) now rejects it explicitly
 /// instead of silently widening through `MetadataValue::as_u32()`.
 #[test]
 fn batch_parser_rejects_a_non_uint32_alignment_spelling() {
@@ -199,9 +197,9 @@ fn batch_parser_rejects_a_non_uint32_alignment_spelling() {
     }
 }
 
-/// The wave-1 asymmetry this test used to pin (`GgufStreamParser::finalize()`
+/// The asymmetry this test used to pin (`GgufStreamParser::finalize()`
 /// silently defaulting a non-`Uint32` `general.alignment` instead of
-/// erroring, unlike the batch parser) is fixed (wave-2.5 addendum item 3):
+/// erroring, unlike the batch parser) is fixed (core-gguf-15):
 /// `finalize()` now matches `GgufFile::parse`'s shape exactly — an absent
 /// key defaults, `Some(Uint32(v))` uses `v`, and any other type is a hard
 /// `InvalidMetadata` error. This test now asserts that parity directly

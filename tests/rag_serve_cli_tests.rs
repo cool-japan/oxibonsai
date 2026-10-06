@@ -50,12 +50,13 @@ fn serve_rejects_unknown_rag_flag_when_rag_feature_is_disabled() {
     );
 }
 
-/// End-to-end proof that the exact router-merge pattern `Commands::Serve`
-/// uses when `--rag` is passed (`create_router_with_pool(..).merge(
-/// rag_server::create_rag_router_with_pool(..))`) actually mounts a
-/// reachable `/rag/stats` endpoint alongside the base OpenAI-compatible
-/// routes, in-process (no real socket / model file needed — mirrors the
-/// `tower::ServiceExt::oneshot` pattern already used by
+/// End-to-end proof that the router-merge pattern `Commands::Serve` uses
+/// when `--rag` is passed (the chat router merged with
+/// `rag_server::create_rag_router_with_options(..)`, which carries the
+/// server's `--request-timeout-ms` and its metrics into `/rag/query`)
+/// actually mounts a reachable `/rag/stats` endpoint alongside the base
+/// OpenAI-compatible routes, in-process (no real socket / model file needed
+/// — mirrors the `tower::ServiceExt::oneshot` pattern already used by
 /// `server_integration_tests.rs`).
 #[cfg(feature = "rag")]
 mod rag_router_merge {
@@ -67,9 +68,12 @@ mod rag_router_merge {
     };
     use oxibonsai_core::config::Qwen3Config;
     use oxibonsai_runtime::{
-        engine::InferenceEngine, engine_pool::EnginePool, metrics::InferenceMetrics,
-        rag_server::create_rag_router_with_pool, sampling::SamplingParams,
-        server::create_router_with_pool,
+        engine::InferenceEngine,
+        engine_pool::EnginePool,
+        metrics::InferenceMetrics,
+        rag_server::{create_rag_router_with_options, RagRouterOptions},
+        sampling::SamplingParams,
+        server::{create_router_with_pool, RequestLimits},
     };
     use tower::ServiceExt;
 
@@ -77,8 +81,14 @@ mod rag_router_merge {
         let engine = InferenceEngine::new(Qwen3Config::tiny_test(), SamplingParams::default(), 42);
         let pool = EnginePool::new(vec![engine]);
         let metrics = Arc::new(InferenceMetrics::new());
-        let base = create_router_with_pool(Arc::clone(&pool), None, metrics);
-        base.merge(create_rag_router_with_pool(pool, None))
+        let base = create_router_with_pool(Arc::clone(&pool), None, Arc::clone(&metrics));
+        base.merge(create_rag_router_with_options(
+            pool,
+            None,
+            RagRouterOptions::default()
+                .with_limits(RequestLimits::default().with_timeout_ms(60_000))
+                .with_metrics(metrics),
+        ))
     }
 
     #[tokio::test]

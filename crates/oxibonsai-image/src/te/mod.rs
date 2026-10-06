@@ -6,7 +6,8 @@
 //! `hidden_states_list[9/18/27]`).
 //!
 //! The 4-bit (mlx packed-affine, bits=4, group_size=64) weights are dequantised
-//! to f32 offline (`/tmp/bonsai_te_export_weights.py`) and loaded via
+//! to f32 offline (exported by the project's `bonsai_te_export_weights.py`
+//! export script) and loaded via
 //! [`TeWeights`]; the forward runs entirely in f32, validated against golden
 //! MLX tensors (cosine ≥ 0.999 per layer and on the stacked cond) by the
 //! `te_parity` example.
@@ -26,7 +27,7 @@
 //! use std::path::Path;
 //! use oxibonsai_image::te::{TeWeights, TextEncoder};
 //!
-//! let weights = TeWeights::open(Path::new("/tmp/bonsai_golden/te/weights"))
+//! let weights = TeWeights::open(Path::new("/path/to/exported/te/weights"))
 //!     .expect("open TE weights");
 //! let encoder = TextEncoder::new(&weights);
 //! let ids: Vec<u32> = vec![151644, 872, 198 /* … */];

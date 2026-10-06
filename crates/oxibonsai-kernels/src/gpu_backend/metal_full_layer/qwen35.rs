@@ -10,7 +10,7 @@
 //! `i` iff `(i + 1) % full_attention_interval == 0`, a recurrent Gated
 //! DeltaNet on the others — so here:
 //!
-//! * every layer is a [`LayerKind`] (`FullAttention` / `LinearAttention`)
+//! * every layer is a `LayerKind` (`FullAttention` / `LinearAttention`)
 //!   and the encoder matches on it;
 //! * the KV cache has one **slot** per full-attention layer, found through
 //!   the dense index `layer_kv_slot: Vec<Option<u32>>` (27B: layer 3 → slot
@@ -44,10 +44,10 @@
 //!   (6 893 936 640 B for `PQ2_0`, 5 694 013 440 B for `PTQ1_0`: every
 //!   matrix, the LM head and the widened `ssm_alpha`/`ssm_beta`; the token
 //!   embedding stays a host-side lookup), the 149.6 MiB recurrent state, the
-//!   logits and the activation scratch at `max_batch` tokens (274.2 MiB at
+//!   logits and the activation scratch at `max_batch` tokens (274.3 MiB at
 //!   the default 512-token prefill chunk) — over 65 888 B per position (the
-//!   K + V cache, the rope angles and one score row): **178 034** positions
-//!   for `PQ2_0` and **196 246** for `PTQ1_0`.
+//!   K + V cache, the rope angles and one score row): **178 032** positions
+//!   for `PQ2_0` and **196 244** for `PTQ1_0`.
 //!
 //! That is the ceiling for a process in which the runner is the only large
 //! resident. The GPU shares the machine's 24 GiB with the host, so the
@@ -578,7 +578,8 @@ pub enum Qwen35Residency<'m> {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// One matrix bound on the device: its buffer (the shared mapping or its own
-/// copy), the byte offset of its first block, its shape and its kernel.
+/// copy), the byte offset of its first block, its shape, its decode GEMV and
+/// its batched-prefill GEMM (`qwen35_prefill`).
 #[derive(Clone)]
 struct DeviceMatrix {
     buffer: Buffer,
@@ -586,6 +587,7 @@ struct DeviceMatrix {
     rows: usize,
     cols: usize,
     pso: ComputePipelineState,
+    gemm_pso: ComputePipelineState,
 }
 
 struct DeviceFullLayer {
@@ -664,6 +666,10 @@ struct Scratch {
     ffn_gate: Buffer,
     ffn_up: Buffer,
     ffn_act: Buffer,
+    /// Per-row partial-RoPE angles of a `Qwen35Rope::PerRow` call,
+    /// `[capacity][n_rot / 2]` each.
+    rope_cos: Buffer,
+    rope_sin: Buffer,
 }
 
 impl Scratch {
@@ -680,6 +686,7 @@ impl Scratch {
             + 3 * kv // k, v, k_rope
             + 3 * cfg.heads_width() // q_rope, attn, attn_rot
             + 3 * cfg.intermediate // ffn_gate, ffn_up, ffn_act
+            + cfg.n_rot // rope_cos, rope_sin (n_rot / 2 each)
     }
 
     fn allocate(
@@ -716,6 +723,8 @@ impl Scratch {
             ffn_gate: f(t * cfg.intermediate)?,
             ffn_up: f(t * cfg.intermediate)?,
             ffn_act: f(t * cfg.intermediate)?,
+            rope_cos: f(t * cfg.n_rot / 2)?,
+            rope_sin: f(t * cfg.n_rot / 2)?,
         })
     }
 }
@@ -767,6 +776,8 @@ pub struct Qwen35GpuModel<'m> {
     weight_bytes: u64,
     mapped: bool,
     last_gpu_seconds: f64,
+    prefill_mode: Qwen35PrefillMode,
+    gemm_min_cols: usize,
     _mapping: PhantomData<&'m [u8]>,
 }
 
@@ -918,6 +929,7 @@ impl Binder<'_, '_> {
             )));
         }
         let pso = self.graph.pipeline_for(m.data.kernel())?;
+        let gemm_pso = self.graph.pipeline_for(m.data.gemm_kernel())?;
         let mapped = match (&self.region, &m.data) {
             (Some((region, buffer)), data) if !data.always_copied() => region
                 .contains(bytes)
@@ -941,6 +953,7 @@ impl Binder<'_, '_> {
             rows,
             cols,
             pso,
+            gemm_pso,
         })
     }
 
@@ -1182,6 +1195,8 @@ impl<'m> Qwen35GpuModel<'m> {
             weight_bytes,
             mapped,
             last_gpu_seconds: 0.0,
+            prefill_mode: Qwen35PrefillMode::default(),
+            gemm_min_cols: Q35_GEMM_MIN_COLS,
             _mapping: PhantomData,
         })
     }
@@ -1381,199 +1396,6 @@ impl<'m> Qwen35GpuModel<'m> {
             )));
         }
         Ok(())
-    }
-
-    fn load_rows(&mut self, rows: &[f32]) -> Result<usize, MetalGraphError> {
-        let h = self.cfg.hidden;
-        if rows.is_empty() || !rows.len().is_multiple_of(h) {
-            return Err(MetalGraphError::InvalidDimensions(format!(
-                "qwen35 GPU: {} input floats is not a whole number of {h}-wide rows",
-                rows.len()
-            )));
-        }
-        let t_len = rows.len() / h;
-        self.ensure_capacity(t_len)?;
-        // SAFETY: `resid` holds `capacity * hidden >= rows.len()` floats and
-        // no GPU work is in flight.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                rows.as_ptr(),
-                self.scratch.resid.contents().cast::<f32>(),
-                rows.len(),
-            );
-        }
-        Ok(t_len)
-    }
-
-    /// Run the whole stack over `t_len = hidden_rows.len() / hidden` tokens
-    /// at positions `start_pos..start_pos + t_len` (their embeddings, after
-    /// any inverse rotation, in `hidden_rows`), advancing the recurrent
-    /// state once per token and storing every key/value; when `logits` is
-    /// `Some`, write the last token's `[vocab]` logits into it.
-    ///
-    /// One command buffer, one encoder, one wait, inside one autorelease
-    /// pool: `commandBuffer` and `computeCommandEncoder` hand back
-    /// autoreleased objects, and without a pool they would pile up on the
-    /// calling thread — about 1.8 KiB per call, i.e. per decoded token of a
-    /// long-lived server thread — until that thread exits.
-    ///
-    /// # Errors
-    ///
-    /// [`MetalGraphError::InvalidDimensions`] for a bad row count, a window
-    /// past `max_seq_len` or a short `logits`;
-    /// [`MetalGraphError::EncodingFailed`] if a layer lacks the cache slot or
-    /// sign vector it needs (nothing is committed then); a failed command
-    /// buffer.
-    pub fn forward(
-        &mut self,
-        hidden_rows: &[f32],
-        start_pos: usize,
-        logits: Option<&mut [f32]>,
-    ) -> Result<(), MetalGraphError> {
-        autoreleasepool(|| self.forward_unpooled(hidden_rows, start_pos, logits))
-    }
-
-    fn forward_unpooled(
-        &mut self,
-        hidden_rows: &[f32],
-        start_pos: usize,
-        logits: Option<&mut [f32]>,
-    ) -> Result<(), MetalGraphError> {
-        let t_len = self.load_rows(hidden_rows)?;
-        self.check_window(t_len, start_pos)?;
-        if let Some(out) = logits.as_ref() {
-            if out.len() < self.cfg.vocab {
-                return Err(MetalGraphError::InvalidDimensions(format!(
-                    "qwen35 GPU: logits buffer holds {} < vocab {}",
-                    out.len(),
-                    self.cfg.vocab
-                )));
-            }
-        }
-        let want_logits = logits.is_some();
-        let cmd = self.graph.command_queue.new_command_buffer();
-        let enc = cmd.new_compute_command_encoder();
-        let encoded = (0..self.layers.len())
-            .try_for_each(|layer| self.encode_layer(enc, layer, t_len, start_pos))
-            .and_then(|()| {
-                if want_logits {
-                    self.encode_head(enc, t_len)
-                } else {
-                    Ok(())
-                }
-            });
-        // The encoder is closed on every path; an encoding error drops the
-        // command buffer uncommitted.
-        enc.end_encoding();
-        encoded?;
-        commit_and_wait(cmd, "qwen35_forward")?;
-        // SAFETY: `commit_and_wait` returned after `wait_until_completed`,
-        // so the command buffer is in a terminal state and both timestamp
-        // properties are readable.
-        let (gpu_start, gpu_end): (f64, f64) =
-            unsafe { (msg_send![cmd, GPUStartTime], msg_send![cmd, GPUEndTime]) };
-        self.last_gpu_seconds = (gpu_end - gpu_start).max(0.0);
-        if let Some(out) = logits {
-            let vocab = self.cfg.vocab;
-            // SAFETY: `logits` holds `vocab` floats written by the command
-            // buffer that has just completed.
-            let src =
-                unsafe { std::slice::from_raw_parts(self.logits.contents().cast::<f32>(), vocab) };
-            out[..vocab].copy_from_slice(src);
-        }
-        Ok(())
-    }
-
-    /// [`Self::forward`] one layer at a time, returning the residual stream
-    /// after every layer (`[layer][t_len * hidden]`) and the last token's
-    /// logits — the GPU counterpart of the CPU forward's per-layer dump.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::forward`]; a layer that fails to encode is not committed,
-    /// though the layers before it already ran.
-    pub fn forward_with_dump(
-        &mut self,
-        hidden_rows: &[f32],
-        start_pos: usize,
-    ) -> Result<(Vec<Vec<f32>>, Vec<f32>), MetalGraphError> {
-        autoreleasepool(|| self.forward_with_dump_unpooled(hidden_rows, start_pos))
-    }
-
-    fn forward_with_dump_unpooled(
-        &mut self,
-        hidden_rows: &[f32],
-        start_pos: usize,
-    ) -> Result<(Vec<Vec<f32>>, Vec<f32>), MetalGraphError> {
-        let t_len = self.load_rows(hidden_rows)?;
-        self.check_window(t_len, start_pos)?;
-        let n = t_len * self.cfg.hidden;
-        let mut dump = Vec::with_capacity(self.layers.len());
-        for layer in 0..self.layers.len() {
-            let cmd = self.graph.command_queue.new_command_buffer();
-            let enc = cmd.new_compute_command_encoder();
-            let encoded = self.encode_layer(enc, layer, t_len, start_pos);
-            enc.end_encoding();
-            encoded?;
-            commit_and_wait(cmd, "qwen35_forward_layer")?;
-            dump.push(read_buffer(&self.scratch.resid, 0, n));
-        }
-        let cmd = self.graph.command_queue.new_command_buffer();
-        let enc = cmd.new_compute_command_encoder();
-        let encoded = self.encode_head(enc, t_len);
-        enc.end_encoding();
-        encoded?;
-        commit_and_wait(cmd, "qwen35_forward_head")?;
-        Ok((dump, read_buffer(&self.logits, 0, self.cfg.vocab)))
-    }
-
-    /// Run layer `layer` alone on `hidden_rows` (its input residual rows),
-    /// one kernel per command buffer, capturing every intermediate
-    /// activation — the per-kernel parity harness. The layer's KV slot or
-    /// recurrent state advances exactly as in [`Self::forward`].
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::forward`], plus an out-of-range `layer`.
-    pub fn trace_layer(
-        &mut self,
-        layer: usize,
-        hidden_rows: &[f32],
-        start_pos: usize,
-    ) -> Result<Qwen35LayerTrace, MetalGraphError> {
-        autoreleasepool(|| self.trace_layer_unpooled(layer, hidden_rows, start_pos))
-    }
-
-    fn trace_layer_unpooled(
-        &mut self,
-        layer: usize,
-        hidden_rows: &[f32],
-        start_pos: usize,
-    ) -> Result<Qwen35LayerTrace, MetalGraphError> {
-        if layer >= self.layers.len() {
-            return Err(MetalGraphError::InvalidDimensions(format!(
-                "qwen35 GPU: layer {layer} of {}",
-                self.layers.len()
-            )));
-        }
-        let t_len = self.load_rows(hidden_rows)?;
-        self.check_window(t_len, start_pos)?;
-        let mut trace = Qwen35LayerTrace::default();
-        let stages = self.layer_stages(layer);
-        for &stage in stages {
-            let cmd = self.graph.command_queue.new_command_buffer();
-            let enc = cmd.new_compute_command_encoder();
-            let encoded = self.encode_stage(enc, layer, stage, t_len, start_pos);
-            enc.end_encoding();
-            encoded?;
-            commit_and_wait(cmd, "qwen35_trace_stage")?;
-            for (name, buffer, width) in self.stage_outputs(stage) {
-                trace
-                    .stages
-                    .push((name, read_buffer(buffer, 0, t_len * width)));
-            }
-        }
-        Ok(trace)
     }
 
     /// `y = W x` for one matrix of layer `layer` (or the LM head, `layer ==
@@ -1829,8 +1651,24 @@ mod encode;
 #[path = "qwen35_state.rs"]
 mod state;
 
+#[path = "qwen35_prefill.rs"]
+mod prefill;
+
+#[path = "qwen35_rows.rs"]
+mod rows;
+
+pub use prefill::{Qwen35PrefillMode, Q35_GEMM_MIN_COLS};
+pub use rows::{Qwen35ForwardDump, Qwen35Rope};
 pub use state::{qwen35_footprint, Qwen35DeviceLimits, Qwen35Footprint, Qwen35RecurrentSnapshot};
 
 #[cfg(test)]
 #[path = "qwen35_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "qwen35_gemm_tests.rs"]
+mod gemm_tests;
+
+#[cfg(test)]
+#[path = "qwen35_prefill_tests.rs"]
+mod prefill_tests;

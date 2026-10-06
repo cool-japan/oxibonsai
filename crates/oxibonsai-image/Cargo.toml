@@ -1,6 +1,6 @@
 [package]
 name = "oxibonsai-image"
-description = "FLUX.2 DiT (bonsai-image) GGUF weight loader and configuration for OxiBonsai"
+description = "Bonsai-Image (FLUX.2 Klein) text-to-image for OxiBonsai: GGUF weight loading, text encoder, DiT, VAE and PNG"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -13,7 +13,7 @@
 //! GEMV/GEMM/Metal/CUDA stack at the cost of materializing a second,
 //! `TQ2_0_g128`-shaped copy of the weights (34 B/128 weights vs. `PTQ1_0`'s 28
 //! B/128, i.e. ~18% more bytes to move for the transcoded copy, plus the
-//! one-time transcode pass itself). [`tests`] benchmarks both.
+//! one-time transcode pass itself). `tests` benchmarks both.
 
 use oxibonsai_core::{q2_0_code_to_i32, BlockPTQ1_0, QK_PTQ1_0};
 
@@ -122,7 +122,7 @@ pub fn gemm_ptq1_0(
 }
 
 // ---------------------------------------------------------------------------
-// Register-blocked (MR-tiled) GEMM — K-INT8 / gatekeeper REQUIRED #9
+// Register-blocked (MR-tiled) GEMM
 //
 // `gemm_ptq1_0` above re-runs `decode_ptq1_0_codes` (a five-stage base-3
 // trit unpack) once per (batch row, block) pair. The blocked form below
@@ -297,7 +297,7 @@ mod prism_gemv_tests {
     }
 
     /// `gemv_ptq1_0` must agree with `dequant` + naive dot product within
-    /// 1e-4 (design §7.2 / B2-03 acceptance).
+    /// 1e-4 (design §7.2 acceptance).
     #[test]
     fn gemv_ptq1_0_matches_dequant_plus_naive_dot() {
         let mut input = vec![0.0f32; 2 * QK_PTQ1_0];
@@ -401,7 +401,7 @@ mod prism_gemv_tests {
     /// pipelines better than the existing ternary NEON kernel's per-byte
     /// decode. The scalar-tier shortfall is real but is not the tier that
     /// ships on any target with NEON (every AArch64 target, including this
-    /// one) or AVX2 — see this package's `deviations` for the full note.
+    /// one) or AVX2.
     #[test]
     #[ignore = "wall-clock perf comparison; run manually, not under concurrent-build CI"]
     fn prism_ptq1_0_gemv_within_15pct_of_tq2() {
@@ -507,8 +507,8 @@ mod prism_gemv_tests {
                 "[neon]    PTQ1_0 native gemv: {native_neon_secs:.6}s vs TQ2_0_g128 gemv: \
                  {tq2_neon_secs:.6}s (ratio {neon_ratio:.3}; design target <= 1.15)"
             );
-            // This is the design's actual acceptance target (design §8.2 /
-            // B2-03: "within 15% of gemv_tq2_0_g128") and the tier that
+            // This is the design's actual acceptance target (design §8.2:
+            // "within 15% of gemv_tq2_0_g128") and the tier that
             // ships on every NEON-capable target, so — unlike the scalar
             // print above, which documents a real but not-shipped-tier
             // property — it is worth a real regression guard here. Measured

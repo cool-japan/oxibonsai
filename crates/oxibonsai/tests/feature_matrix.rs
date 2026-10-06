@@ -12,7 +12,7 @@
 //!
 //! ## Scope, and why this is not a pile of `assert_type_exists::<T>()` calls
 //!
-//! The T-12 verifier's correction is explicit: seven hand-written
+//! The T-12 correction is explicit: seven hand-written
 //! type-existence tests are strictly worse than `cargo hack check -p
 //! oxibonsai --each-feature` (mechanical, zero maintenance) at proving a
 //! feature *compiles*, and the one thing worth writing by hand is a real,
@@ -203,7 +203,7 @@ fn full_feature_set_composes_every_optional_crate_together() {
     let tok = oxibonsai::tokenizer::OxiTokenizer::char_level_stub(128);
     assert!(tok.encode("full").is_ok());
 
-    // `oxibonsai::image` (added to `full` by RAG-EVAL-IMG-17/FIX3-FACADE):
+    // `oxibonsai::image` (added to `full` by RAG-EVAL-IMG-17):
     // `mlx_rng::key` is a pure, file-free, deterministic bit operation
     // (`key(seed) = [(seed >> 32) as u32, seed as u32]`), so this is a real
     // call with a hand-verifiable expected value rather than a bare type

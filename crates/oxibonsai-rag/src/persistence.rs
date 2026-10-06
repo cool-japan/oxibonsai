@@ -1,5 +1,5 @@
 //! Persistence for the vector store and retriever: JSON (human-readable,
-//! the default) and a compact hand-rolled binary format (RAG-EVAL-IMG-34).
+//! the default) and a compact hand-rolled binary format.
 //!
 //! Two snapshot types are exposed:
 //!
@@ -9,8 +9,7 @@
 //!   [`Retriever`]'s document counter, its [`crate::retriever::RetrieverConfig`],
 //!   and its embedder's persisted state (see "Embedder state" below), so a
 //!   round trip through [`Retriever::save`]/[`Retriever::load`] restores the
-//!   retriever exactly as it was configured, not just its index
-//!   (RAG-EVAL-IMG-09).
+//!   retriever exactly as it was configured, not just its index.
 //!
 //! A monotonically-increasing [`SCHEMA_VERSION`] is stored in every
 //! snapshot.  Loaders refuse to deserialise an unknown `schema_version` with
@@ -28,7 +27,7 @@
 //! destination. A crash or a concurrent reader can therefore never observe
 //! a partially-written snapshot — the destination file is either the
 //! previous complete snapshot or the new complete one, never a truncated
-//! mix of both (part of RAG-EVAL-IMG-34; needs no new dependency).
+//! mix of both (needs no new dependency).
 //!
 //! # Embedder state
 //!
@@ -41,8 +40,7 @@
 //! [`RetrieverSnapshot::embedder_state`]. [`Retriever::load_with_embedder`]
 //! goes one step further and reconstructs the embedder *itself* from that
 //! persisted state, so a caller no longer needs to keep the original corpus
-//! around just to refit a [`crate::embedding::TfIdfEmbedder`]
-//! (RAG-EVAL-IMG-10).
+//! around just to refit a [`crate::embedding::TfIdfEmbedder`].
 //!
 //! # Example
 //!
@@ -110,7 +108,7 @@ pub struct IndexSnapshot {
     pub entries: Vec<VectorEntry>,
     /// Optional serialised TF-IDF state.  Superseded by
     /// [`RetrieverSnapshot::embedder_state`] for the `Retriever::save`/`load`
-    /// path (RAG-EVAL-IMG-10); kept here, and still populatable by hand, for
+    /// path; kept here, and still populatable by hand, for
     /// callers who persist a bare [`VectorStore`] without a `Retriever`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tfidf_state: Option<serde_json::Value>,
@@ -146,7 +144,7 @@ pub struct RetrieverSnapshot {
     /// The retriever's configuration at save time. `#[serde(default)]` so a
     /// snapshot written before this field existed still loads (falling back
     /// to [`RetrieverConfig::default`], exactly the pre-fix behaviour)
-    /// instead of failing to parse (RAG-EVAL-IMG-09).
+    /// instead of failing to parse.
     #[serde(default)]
     pub config: RetrieverConfig,
     /// The embedder's persisted state, if any (see
@@ -190,7 +188,7 @@ fn temp_sibling_path(path: &Path) -> PathBuf {
 /// Write `bytes` to `path` atomically: write to a same-directory temporary
 /// file, `fsync` it, then `rename` it into place. A reader can therefore
 /// only ever observe the previous complete file or the new complete file —
-/// never a truncated write from a crash mid-save (RAG-EVAL-IMG-34).
+/// never a truncated write from a crash mid-save.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), RagError> {
     let tmp = temp_sibling_path(path);
     let write_result = (|| -> std::io::Result<()> {
@@ -266,8 +264,7 @@ impl VectorStore {
 
     /// Serialise this store to `path` in the compact binary format (see the
     /// `binary` submodule), atomically. Typically much smaller and faster
-    /// to load than [`VectorStore::save_json`] for a large index
-    /// (RAG-EVAL-IMG-34).
+    /// to load than [`VectorStore::save_json`] for a large index.
     pub fn save_binary(&self, path: impl AsRef<Path>) -> Result<(), RagError> {
         let bytes = binary::encode_index_snapshot(&self.to_snapshot())?;
         write_atomic(path.as_ref(), &bytes)
@@ -298,7 +295,7 @@ impl<E: EmbedderState> Retriever<E> {
     }
 
     /// Serialise this retriever to `path` in the compact binary format,
-    /// atomically (RAG-EVAL-IMG-34).
+    /// atomically.
     pub fn save_binary(&self, path: impl AsRef<Path>) -> Result<(), RagError> {
         let snapshot = self.to_retriever_snapshot();
         let bytes = binary::encode_retriever_snapshot(&snapshot)?;
@@ -351,7 +348,7 @@ impl<E: Embedder> Retriever<E> {
     /// snapshot, otherwise [`RagError::DimensionMismatch`] is returned. The
     /// retriever's [`crate::retriever::RetrieverConfig`] is restored from the
     /// snapshot (falling back to [`RetrieverConfig::default`] for a
-    /// snapshot saved before that was persisted — RAG-EVAL-IMG-09).
+    /// snapshot saved before that was persisted).
     ///
     /// This does not require `E: EmbedderState` — unlike
     /// [`Retriever::save`], `load` never needs to *extract* state from an
@@ -386,8 +383,8 @@ impl<E: EmbedderState> Retriever<E> {
     /// state — unlike [`Retriever::load`], the caller does not need to
     /// supply (or know how to rebuild) an equivalent embedder out of band.
     ///
-    /// This is the direct fix for "`TfIdfEmbedder` cannot be reconstructed"
-    /// (RAG-EVAL-IMG-10): a saved [`crate::embedding::TfIdfEmbedder`] index
+    /// This is the direct fix for "`TfIdfEmbedder` cannot be reconstructed":
+    /// a saved [`crate::embedding::TfIdfEmbedder`] index
     /// now round-trips its vocabulary and IDF table without the caller
     /// needing to keep the original corpus around to refit it.
     pub fn load_with_embedder(path: impl AsRef<Path>) -> Result<Self, RagError> {
@@ -415,7 +412,7 @@ impl<E: EmbedderState> Retriever<E> {
 
 /// A compact, hand-rolled binary encoding for [`IndexSnapshot`] and
 /// [`RetrieverSnapshot`], used behind [`VectorStore::save_binary`]/
-/// [`Retriever::save_binary`] (RAG-EVAL-IMG-34).
+/// [`Retriever::save_binary`].
 ///
 /// The bulk data — every entry's id, raw `f32` vector, and chunk (text,
 /// `doc_id`/`chunk_idx`/`char_offset`, metadata) — is encoded field-by-field
@@ -430,8 +427,8 @@ impl<E: EmbedderState> Retriever<E> {
 /// documented trade-off, not an oversight.
 ///
 /// COOLJAPAN policy bans `bincode`; the intended dependency for this format
-/// is `oxicode`, but adding it requires a `Cargo.toml` change this package
-/// does not own (see the RAG-CORE deviations). This hand-rolled codec has no
+/// is `oxicode`, but it is not a dependency of this crate yet. This hand-rolled
+/// codec has no
 /// dependency on either and fully implements the "add a binary format"
 /// requirement in the meantime; swapping the low-level encode/decode calls
 /// below for `oxicode::serialize`/`deserialize` once that dependency lands
@@ -560,7 +557,7 @@ mod binary {
     /// length-prefixed compact-JSON payload.
     ///
     /// Propagates a `serde_json` failure instead of swallowing it into a
-    /// zero-length blob (verifier-flagged): in every call site in this
+    /// zero-length blob: in every call site in this
     /// module `value` is a `serde_json::Value`, whose own serialisation is
     /// not expected to fail, but silently writing an empty payload on the
     /// (currently unreachable) error path would otherwise turn a real bug
@@ -753,7 +750,7 @@ mod binary {
 
     /// Cap a length read from an untrusted file to a `with_capacity` hint
     /// that cannot request more memory than the remaining bytes could
-    /// possibly encode (verifier-flagged: `read_index_body`/`read_entry`/
+    /// possibly encode (`read_index_body`/`read_entry`/
     /// `read_chunk` used to pass a file-controlled length straight to
     /// `with_capacity`). FNV-1a-64 (see [`fnv1a64`]) is trivially forgeable,
     /// so a crafted-but-checksummed snapshot with e.g. `entry_count =
@@ -969,14 +966,14 @@ mod binary {
             }
         }
 
-        // ── verifier MINOR: a forged length must not drive a huge pre-allocation ──
+        // ── a forged length must not drive a huge pre-allocation ──
 
         #[test]
         fn forged_huge_entry_count_with_valid_checksum_errors_cleanly() {
             // Simulates a crafted file: a legitimate empty `IndexSnapshot`'s
             // bytes, with `entry_count` overwritten to an enormous value and
             // the trailing checksum recomputed so it still verifies --
-            // exactly the scenario the verifier flagged. FNV-1a-64 is
+            // exactly the scenario to guard against. FNV-1a-64 is
             // trivially forgeable, so a "valid checksum" proves nothing
             // about a length field being honest. Without `capped_capacity`
             // capping the `Vec::with_capacity` hint in `read_index_body`,
@@ -1130,7 +1127,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    // ── verifier BLOCKING: non-finite `min_score` must still round-trip ────
+    // ── non-finite `min_score` must still round-trip ────
     //
     // `RetrieverConfig::min_score` is a `pub` field on a `#[non_exhaustive]`
     // struct: `cfg.min_score = f32::NEG_INFINITY` reaches it directly from

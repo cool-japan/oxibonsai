@@ -52,7 +52,7 @@ use crate::token_healing::{TokenHealer, TokenHealingConfig};
 /// Signature shared by every detokenizer callback the pipeline accepts:
 /// decode an arbitrary slice of token ids to text.
 ///
-/// Kept as a type alias so [`PipelineConfig`], [`PipelineBuilder`] and the
+/// Kept as a type alias so `PipelineConfig`, [`PipelineBuilder`] and the
 /// convenience constructors all name the exact same (rather lengthy) trait
 /// object type.
 pub type Detokenizer = dyn Fn(&[u32]) -> RuntimeResult<String> + Send + Sync;
@@ -629,7 +629,7 @@ impl InferencePipeline {
                         // `(-inf) - (-inf) == NaN`) -- switching from the
                         // old finite `-1e9` sentinel to an exact `-inf`
                         // makes that reachable where it silently wasn't
-                        // before (both files are outside this package).
+                        // before.
                         // Stop here, deterministically and honestly,
                         // instead of ever constructing that input --
                         // reported as the distinct `ConstraintUnsatisfiable`
@@ -825,7 +825,7 @@ impl InferencePipeline {
                     if engine.recurrent_rollback_supported() {
                         engine.rewind_cache(common);
                     } else if common != cached_tokens.len() {
-                        // ENGINE-SEAM: a hybrid (recurrent) engine cannot move
+                        // A hybrid (recurrent) engine cannot move
                         // a cursor back -- its Gated-DeltaNet state after the
                         // cached tokens does not determine the state after the
                         // shorter common prefix. Unless the beam purely

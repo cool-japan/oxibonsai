@@ -134,6 +134,15 @@ impl RopeOffsets {
 }
 
 impl<'a> HybridModel<'a> {
+    /// The M-RoPE offset in force at sequence position `pos` of the current
+    /// sequence (the offset the token there rotates behind; `0` before any
+    /// image) — [`HybridModel::rope_delta`] at an arbitrary position, what a
+    /// caller checks a rollback point against.
+    #[must_use]
+    pub fn rope_offset_at(&self, pos: usize) -> usize {
+        self.rope_delta_at(pos)
+    }
+
     /// The rotary position a prompt starting at sequence position
     /// `start_pos` begins at, without changing any state: `0` for a new
     /// sequence, `start_pos` minus the offset in force there for a
@@ -172,6 +181,24 @@ impl<'a> HybridModel<'a> {
         pieces: &[PromptPiece<'_>],
         start_pos: usize,
     ) -> ModelResult<AssembledPrompt> {
+        self.assemble_prompt_at(pieces, self.rope_start_for(start_pos)?)
+    }
+
+    /// [`HybridModel::assemble_prompt`] with the first text rotary position
+    /// given explicitly — for a prompt whose sequence runs on another
+    /// executor (the Metal runner keeps its own M-RoPE offsets and hands
+    /// out its own rope start, `HybridMetalRunner::rope_start_for`), so
+    /// nothing here reads this model's offsets. Text rows are embedded
+    /// exactly as [`HybridModel::assemble_prompt`] embeds them.
+    ///
+    /// # Errors
+    ///
+    /// As [`HybridModel::assemble_prompt`].
+    pub fn assemble_prompt_at(
+        &self,
+        pieces: &[PromptPiece<'_>],
+        rope_start: usize,
+    ) -> ModelResult<AssembledPrompt> {
         let hidden = self.config().base.hidden_size;
         let total: usize = pieces
             .iter()
@@ -181,7 +208,7 @@ impl<'a> HybridModel<'a> {
             })
             .sum();
         let mut rows = vec![0.0f32; total.saturating_mul(hidden)];
-        let mut cursor = MropeCursor::new(self.rope_start_for(start_pos)?);
+        let mut cursor = MropeCursor::new(rope_start);
         let mut row = 0usize;
         for (index, piece) in pieces.iter().enumerate() {
             match *piece {

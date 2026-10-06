@@ -55,6 +55,7 @@ use oxibonsai_model::vision::{
     decode_image, plan_splice, prepare_image, GridSize, PreprocessConfig, SpliceSegment,
     VisionTokenIds, VisionTower, DEFAULT_IMAGE_MAX_TOKENS,
 };
+use oxibonsai_testkit::capability::{record_timed, Capability};
 
 const PQ2_ENV: &str = "OXI_BONSAI2_PQ2_GGUF";
 const MMPROJ_ENV: &str = "OXI_BONSAI2_MMPROJ_GGUF";
@@ -63,7 +64,7 @@ const REQUIRE_ENV: &str = "OXI_REQUIRE_MODEL_FILES";
 const PQ2_FILE: &str = "Ternary-Bonsai-2-27B-PQ2_0.gguf";
 const MMPROJ_FILE: &str = "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf";
 /// The capability these records are written under.
-const CAPABILITY: &str = "bonsai2-vision";
+const CAPABILITY: Capability = Capability::Bonsai2Vision;
 const TEST: &str =
     "oxibonsai-model::bonsai2_vision_tests::bonsai2_vision_real_27b_matches_the_fork_goldens_on_the_cpu_path";
 /// The fork's media marker in its `apply_template` output.
@@ -107,29 +108,13 @@ fn report(line: &str) {
     let _ = writeln!(stderr, "{line}");
 }
 
-/// Append one `{"capability", "executed", "test", "duration_ms"}` record to
-/// the capability manifest in one `write_all` (the testkit's schema).
+/// Append one record to the capability manifest through the testkit (one
+/// `write_all`, the documented schema); `duration_ms` is attached when the
+/// gate measured one.
 fn record(executed: bool, duration: Option<std::time::Duration>) {
-    let mut line = serde_json::json!({
-        "capability": CAPABILITY,
-        "executed": executed,
-        "test": TEST,
-    });
-    if let Some(d) = duration {
-        line["duration_ms"] = serde_json::json!(d.as_millis() as u64);
-    }
-    let path = oxibonsai_testkit::capability::report_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let mut text = line.to_string();
-    text.push('\n');
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = file.write_all(text.as_bytes());
+    match duration {
+        Some(d) => record_timed(CAPABILITY, executed, TEST, d),
+        None => oxibonsai_testkit::capability::record(CAPABILITY, executed, TEST),
     }
     report(&format!(
         "CAPABILITY-REPORT capability={CAPABILITY} executed={executed} test={TEST}{}",

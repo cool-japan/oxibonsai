@@ -706,7 +706,7 @@ fn batch_inputs(batch: usize, salt: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     (hidden_batch, cos_table, sin_table)
 }
 
-/// HANDOVER-GPU B3: the **uncached** batched ternary prefill and its verify
+/// The **uncached** batched ternary prefill and its verify
 /// twin (`metal_prefill`) resolve every buffer through the shared helpers,
 /// so they honour `lp.model_epoch` like every other ternary entry point:
 ///
@@ -1173,7 +1173,7 @@ fn q1_logits(fx: &Fixture, params: &[FullForwardLayerParams<'_>], salt: usize) -
     logits
 }
 
-/// HANDOVER-GPU E: the Q1 entry points carry the model epoch.
+/// The Q1 entry points carry the model epoch.
 ///
 /// - Every Q1 entry — the full forward, the cached builder, the batched
 ///   prefill and its verify twin — refuses a slice mixing two epochs before

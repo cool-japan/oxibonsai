@@ -1,5 +1,5 @@
 //! Golden-reference tests for the PrismML Bonsai 2 kernels (`PQ2_0`,
-//! `Q2_0_g64`, `PTQ1_0`): B2-03 acceptance (design §7.2 rows 1-6).
+//! `Q2_0_g64`, `PTQ1_0`): acceptance (design §7.2 rows 1-6).
 //!
 //! Every dequant golden function below is an INDEPENDENT transliteration of
 //! the relevant `ggml-quants.c` function, written directly from the C
@@ -290,7 +290,7 @@ fn test_prism_transcode_ptq1_0_to_pq2_0_is_bitwise_lossless() {
 }
 
 // ---------------------------------------------------------------------------
-// gemv_ptq1_0 vs dequant + naive dot (design §7.2 / B2-03 acceptance: <= 1e-4)
+// gemv_ptq1_0 vs dequant + naive dot (design §7.2 acceptance: <= 1e-4)
 // ---------------------------------------------------------------------------
 
 #[test]

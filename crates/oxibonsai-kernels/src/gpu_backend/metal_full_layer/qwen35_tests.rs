@@ -14,10 +14,10 @@ use crate::norms::{l2_norm_simd, rms_norm_gated_simd, sigmoid_mul_simd};
 use crate::ssm_ops::causal_conv1d_k4_decode;
 
 /// Deterministic xorshift64* stream.
-struct Rng(u64);
+pub(super) struct Rng(u64);
 
 impl Rng {
-    fn new(seed: u64) -> Self {
+    pub(super) fn new(seed: u64) -> Self {
         Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
     }
 
@@ -31,11 +31,11 @@ impl Rng {
     }
 
     /// Uniform in `[-1, 1)`.
-    fn f32(&mut self) -> f32 {
+    pub(super) fn f32(&mut self) -> f32 {
         ((self.next_u64() >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
     }
 
-    fn vec(&mut self, n: usize, scale: f32) -> Vec<f32> {
+    pub(super) fn vec(&mut self, n: usize, scale: f32) -> Vec<f32> {
         (0..n).map(|_| self.f32() * scale).collect()
     }
 
@@ -57,7 +57,7 @@ impl Rng {
 /// A fresh session, or `None` on a host without a Metal device. On a host
 /// *with* one, a library that fails to build is a test failure, never a
 /// silent skip.
-fn session() -> Option<Arc<MetalGraph>> {
+pub(super) fn session() -> Option<Arc<MetalGraph>> {
     metal::Device::system_default()?;
     match MetalGraph::new_session() {
         Ok(graph) => Some(graph),
@@ -77,7 +77,7 @@ fn buf(graph: &MetalGraph, data: &[f32]) -> Buffer {
     upload_f32(graph, data).expect("upload")
 }
 
-fn worst_rel(got: &[f32], want: &[f32]) -> f32 {
+pub(super) fn worst_rel(got: &[f32], want: &[f32]) -> f32 {
     assert_eq!(got.len(), want.len());
     let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-6);
     got.iter()
@@ -86,7 +86,7 @@ fn worst_rel(got: &[f32], want: &[f32]) -> f32 {
         .fold(0.0f32, f32::max)
 }
 
-fn assert_bits(got: &[f32], want: &[f32], what: &str) {
+pub(super) fn assert_bits(got: &[f32], want: &[f32], what: &str) {
     assert_eq!(got.len(), want.len(), "{what}: length");
     for (i, (a, b)) in got.iter().zip(want).enumerate() {
         assert_eq!(a.to_bits(), b.to_bits(), "{what}[{i}]: gpu {a} vs cpu {b}");
@@ -741,8 +741,8 @@ fn gdn_matches_the_cpu_recurrence() {
 /// A tiny random `qwen35` model: layer 0 linear, layer 1 full, the fixture
 /// geometry of the model crate's synthetic GGUF (hidden 256, Hadamard block
 /// 128, head_dim 64 with `n_rot` 16, 2 k-heads / 6 v-heads of 64).
-struct TinyModel {
-    cfg: Qwen35GpuConfig,
+pub(super) struct TinyModel {
+    pub(super) cfg: Qwen35GpuConfig,
     mats: Vec<Vec<BlockPQ2_0>>,
     norms: Vec<Vec<f32>>,
     ab: Vec<f32>,
@@ -755,7 +755,13 @@ struct TinyModel {
 }
 
 impl TinyModel {
-    fn new(seed: u64) -> Self {
+    pub(super) fn new(seed: u64) -> Self {
+        Self::with_window(seed, 32, 16)
+    }
+
+    /// [`Self::new`] with a KV window of `max_seq_len` positions and calls of
+    /// up to `max_batch` tokens.
+    pub(super) fn with_window(seed: u64, max_seq_len: usize, max_batch: usize) -> Self {
         let cfg = Qwen35GpuConfig {
             hidden: 256,
             intermediate: 512,
@@ -771,8 +777,8 @@ impl TinyModel {
             rms_eps: 1e-6,
             hadamard_block: Some(128),
             vocab: 512,
-            max_seq_len: 32,
-            max_batch: 16,
+            max_seq_len,
+            max_batch,
         };
         let mut rng = Rng::new(seed);
         let shapes = Self::matrix_shapes(&cfg);
@@ -872,7 +878,17 @@ impl TinyModel {
         }
     }
 
-    fn weights(&self) -> Qwen35ModelWeights<'_> {
+    /// The resident angle table's cosines, `[max_seq_len][n_rot / 2]`.
+    pub(super) fn cos_table(&self) -> &[f32] {
+        &self.cos
+    }
+
+    /// The resident angle table's sines, `[max_seq_len][n_rot / 2]`.
+    pub(super) fn sin_table(&self) -> &[f32] {
+        &self.sin
+    }
+
+    pub(super) fn weights(&self) -> Qwen35ModelWeights<'_> {
         let linear = Qwen35LinearAttentionWeights {
             attn_norm: &self.norms[0],
             post_attention_norm: &self.norms[1],
@@ -916,10 +932,12 @@ impl TinyModel {
     }
 }
 
-/// Prefill of `T` tokens is bitwise the same as `T` single-token forwards
-/// (every batched kernel runs the single-token arithmetic per column), a
-/// reset really clears the recurrent state, and the sparse KV cache holds
-/// one slot per full-attention layer.
+/// In [`Qwen35PrefillMode::Sequential`], a prefill of `T` tokens is bitwise
+/// the same as `T` single-token forwards (every batched kernel runs the
+/// single-token arithmetic per column), a reset really clears the recurrent
+/// state, and the sparse KV cache holds one slot per full-attention layer.
+/// (The batched mode's GEMM sums in another order; `qwen35_prefill_tests`
+/// bands it.)
 #[test]
 fn prefill_is_bitwise_sequential_decode_and_reset_clears_the_state() {
     if session().is_none() {
@@ -928,6 +946,8 @@ fn prefill_is_bitwise_sequential_decode_and_reset_clears_the_state() {
     let tiny = TinyModel::new(5);
     let weights = tiny.weights();
     let mut model = Qwen35GpuModel::new(&weights, Qwen35Residency::Copied).expect("model builds");
+    assert_eq!(model.prefill_mode(), Qwen35PrefillMode::Batched);
+    model.set_prefill_mode(Qwen35PrefillMode::Sequential);
     assert_eq!(model.layer_kv_slots(), &[None, Some(0)]);
     assert_eq!(model.layer_rec_slots(), &[Some(0), None]);
     let c = tiny.cfg.clone();
@@ -1174,6 +1194,8 @@ fn scratch_accounting_matches_the_allocated_buffers() {
         &scratch.ffn_gate,
         &scratch.ffn_up,
         &scratch.ffn_act,
+        &scratch.rope_cos,
+        &scratch.rope_sin,
     ];
     let allocated: u64 = buffers.iter().map(|b| b.length()).sum();
     assert_eq!(
@@ -1209,8 +1231,8 @@ fn context_capacity_of_the_27b_on_the_m3_matches_the_documented_figures() {
         max_batch: 512,
     };
     cfg.validate().expect("the 27B geometry is served");
-    // 140 384 floats per token: 274.2 MiB of scratch at a 512-token chunk.
-    assert_eq!(Scratch::floats_per_token(&cfg), 140_384);
+    // 140 448 floats per token: 274.3 MiB of scratch at a 512-token chunk.
+    assert_eq!(Scratch::floats_per_token(&cfg), 140_448);
     let capacity = |weight_bytes: u64, max_batch: usize| {
         let cfg = Qwen35GpuConfig {
             max_batch,
@@ -1228,8 +1250,8 @@ fn context_capacity_of_the_27b_on_the_m3_matches_the_documented_figures() {
     // Every matrix, the LM head and the widened ssm gates, per band.
     const PQ2_0_WEIGHTS: u64 = 6_893_936_640;
     const PTQ1_0_WEIGHTS: u64 = 5_694_013_440;
-    assert_eq!(capacity(PQ2_0_WEIGHTS, 512), 178_034);
-    assert_eq!(capacity(PTQ1_0_WEIGHTS, 512), 196_246);
+    assert_eq!(capacity(PQ2_0_WEIGHTS, 512), 178_032);
+    assert_eq!(capacity(PTQ1_0_WEIGHTS, 512), 196_244);
     // The scratch is charged at `max_batch` tokens, not one.
     assert!(capacity(PQ2_0_WEIGHTS, 1) > capacity(PQ2_0_WEIGHTS, 512));
     // With an unbounded working set, one K (or V) buffer binds: 14.30 GB /
@@ -1385,10 +1407,10 @@ fn footprint_matches_the_allocations_and_the_27b_figures() {
     assert_eq!(fp.kv_buffer_bytes_per_position, 32_768);
     assert_eq!(fp.per_position_bytes, 65_888);
     assert_eq!(fp.recurrent_bytes, 156_893_184);
-    // Recurrent state + logits + 140 384 scratch floats x 512 tokens.
+    // Recurrent state + logits + 140 448 scratch floats x 512 tokens.
     assert_eq!(
         fp.fixed_bytes,
-        156_893_184 + 248_320 * 4 + 140_384 * 4 * 512
+        156_893_184 + 248_320 * 4 + 140_448 * 4 * 512
     );
     // 8192 positions: 512 MiB of f16 KV plus the rope angles and score row.
     assert_eq!(fp.window_bytes(8192), (512 << 20) + 8192 * (64 + 24) * 4);

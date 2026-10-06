@@ -35,6 +35,7 @@ use super::util::{
     reject_penalties_with_constrained_decode, resolve_tokenizer_vocab_aware, validated,
     StopChecker, TokenizerLookup,
 };
+use super::vision;
 
 /// Attach the GGUF's own chat template to `tok`:
 /// every production deployment must render prompts through the SHIPPED
@@ -172,11 +173,65 @@ pub(crate) struct EngineLoad {
     /// separate CLI-owned sampler loop for a sampled request with
     /// `min_p > 0`.
     pub(crate) min_p: f32,
+    /// A projector (`--mmproj`) was loaded: under `--backend auto` the engine
+    /// must be one that can prefill image rows ([`vision::plan_vision_backend`]).
+    pub(crate) wants_vision: bool,
+    /// Bytes the projector's Metal tower keeps resident
+    /// ([`bonsai2::VisionRequest::hybrid_load_options`]; `0` without
+    /// `--mmproj`): a Metal-backed hybrid engine's KV window leaves room for
+    /// them.
+    pub(crate) vision_resident_bytes: u64,
+}
+
+impl EngineLoad {
+    /// The options a hybrid engine is built with: the vision tower's
+    /// resident bytes and `--prefill-chunk`, so a Metal runner's window and
+    /// call size are planned for both before it allocates anything. A dense
+    /// engine ignores them.
+    pub(crate) fn hybrid_options(&self) -> oxibonsai_runtime::engine_hybrid_gpu::HybridLoadOptions {
+        oxibonsai_runtime::engine_hybrid_gpu::HybridLoadOptions {
+            vision_resident_bytes: self.vision_resident_bytes,
+            prefill_chunk: self.prefill_chunk,
+        }
+    }
+}
+
+/// Construct the engine for `backend` — honouring `--rope-scaling`, building
+/// a hybrid engine under [`EngineLoad::hybrid_options`], applying
+/// `--prefill-chunk`, the penalties and `--min-p` — without reporting on it.
+fn construct_engine<'a>(
+    gguf: &'a oxibonsai_core::gguf::reader::GgufFile<'a>,
+    load: &EngineLoad,
+    backend: oxibonsai_runtime::engine_seam::Backend,
+) -> anyhow::Result<oxibonsai_runtime::InferenceEngine<'a>> {
+    let mut engine = {
+        let _hybrid =
+            oxibonsai_runtime::engine_hybrid_gpu::HybridLoadScope::enter(load.hybrid_options());
+        oxibonsai_runtime::InferenceEngine::from_gguf_with_backend_and_rope(
+            gguf,
+            load.params.clone(),
+            load.seed,
+            load.max_seq_len,
+            backend,
+            load.rope_scaling.into(),
+        )?
+    };
+    bonsai2::apply_prefill_chunk(&mut engine, load.prefill_chunk)?;
+    engine.set_penalties(load.penalties);
+    engine.set_min_p(load.min_p);
+    Ok(engine)
 }
 
 /// Build the engine (honouring `--backend` and `--rope-scaling`), apply
 /// `--prefill-chunk`, the penalties and `--min-p`, and print the
 /// resolved-engine summary line (cli-16: from the engine's own accessors).
+///
+/// With a projector loaded ([`EngineLoad::wants_vision`]) and `--backend
+/// auto`, an engine whose executor cannot prefill image rows
+/// (`InferenceEngine::prefills_images` is `false`) is dropped and rebuilt on
+/// the CPU model ([`vision::plan_vision_backend`]), with one `INFO` line
+/// saying why; an explicit backend is never overridden. Both hybrid
+/// executors prefill image rows, so `auto` keeps the engine it resolved to.
 ///
 /// # Errors
 ///
@@ -186,17 +241,20 @@ pub(crate) fn load_engine<'a>(
     load: &EngineLoad,
     transcoded_tensors: usize,
 ) -> anyhow::Result<oxibonsai_runtime::InferenceEngine<'a>> {
-    let mut engine = oxibonsai_runtime::InferenceEngine::from_gguf_with_backend_and_rope(
-        gguf,
-        load.params.clone(),
-        load.seed,
-        load.max_seq_len,
-        load.backend,
-        load.rope_scaling.into(),
-    )?;
-    bonsai2::apply_prefill_chunk(&mut engine, load.prefill_chunk)?;
-    engine.set_penalties(load.penalties);
-    engine.set_min_p(load.min_p);
+    let mut engine = construct_engine(gguf, load, load.backend)?;
+    // Only a hybrid engine's executor is a question here: a dense engine
+    // refuses image turns for its model kind on any backend.
+    let wants_vision = load.wants_vision && engine.is_hybrid();
+    if vision::plan_vision_backend(load.backend, wants_vision, engine.prefills_images())
+        == vision::VisionBackendPlan::RebuildOnCpu
+    {
+        let executor = vision::executor_name(&engine);
+        tracing::info!(executor = %executor, "{}", vision::rebuild_reason(&executor));
+        // The first engine (and a Metal runner's device buffers) goes before
+        // the second is built: a 27B is never resident twice.
+        drop(engine);
+        engine = construct_engine(gguf, load, oxibonsai_runtime::engine_seam::Backend::Cpu)?;
+    }
     let mut summary = model_desc::engine_summary(&engine);
     if transcoded_tensors > 0 {
         summary.push_str(&format!(
@@ -251,6 +309,10 @@ pub(crate) struct RunArgs {
     /// §5.7 vision flags: `--mmproj` loads the projector, every `--image`
     /// is encoded into the (chat-rendered) prompt.
     pub(crate) vision: bonsai2::VisionRequest,
+    /// `--allow-image-url-fetch`, `--image-url-timeout-ms` and
+    /// `--image-url-allow-host` (and their `OXI_*` fallbacks): which image
+    /// references resolve, and how a remote one is fetched.
+    pub(crate) image_sources: bonsai2::ImageSourceFlags,
     pub(crate) allow_vocab_mismatch: bool,
     pub(crate) no_stream: bool,
 }
@@ -317,6 +379,7 @@ pub(crate) fn run(args: RunArgs) -> anyhow::Result<()> {
         ptq1_transcode,
         prefill_chunk,
         vision,
+        image_sources,
         allow_vocab_mismatch,
         no_stream,
     } = args;
@@ -327,7 +390,7 @@ pub(crate) fn run(args: RunArgs) -> anyhow::Result<()> {
             anyhow::anyhow!("no model: pass --model <gguf> or set OXI_MODEL (e.g. in .env)")
         })?;
 
-    vision.validate(true)?;
+    vision.validate(true, &image_sources)?;
     // An image is a part of a chat turn (the template places its
     // placeholder), so `--image` implies the chat contract.
     let chat = chat || !vision.images.is_empty();
@@ -358,14 +421,14 @@ pub(crate) fn run(args: RunArgs) -> anyhow::Result<()> {
         max_seq_len,
         rope_scaling,
     )?;
-    // The vision projector (design §6.2), before any language-model weight
-    // is bound: a wrong architecture or a variant projector fails fast.
-    let vision_service = vision.load_service(&arch, bonsai2::cli_image_policy())?;
-    if vision_service.is_some() && vision.images.is_empty() {
-        tracing::warn!(
-            "--mmproj without --image: the projector is loaded but the prompt has no image"
-        );
-    }
+    // The vision projector (design §6.2) is checked before any
+    // language-model weight is bound — a wrong architecture or a projector
+    // the towers refuse fails fast — and its header sizes the engine: a
+    // Metal-backed engine's KV window leaves room for the Metal tower. The
+    // tower itself is built once the engine exists, for the executor the
+    // engine decodes on.
+    let hybrid_options = vision.hybrid_load_options(&arch, prefill_chunk)?;
+    vision.check_image_tokens(&bonsai2::ModelVocabulary::of_gguf(&gguf))?;
     let sampling = resolve_sampling(temperature, top_k, top_p, min_p, &gguf.metadata)?;
     tracing::info!(
         temperature = sampling.temperature,
@@ -395,9 +458,33 @@ pub(crate) fn run(args: RunArgs) -> anyhow::Result<()> {
             prefill_chunk,
             penalties,
             min_p: sampling.min_p,
+            wants_vision: vision.mmproj.is_some(),
+            vision_resident_bytes: hybrid_options.vision_resident_bytes,
         },
         source.transcoded_tensors(),
     )?;
+    // An engine that cannot serve image turns refuses the image turn with
+    // its typed error — raised here, before any image is encoded, instead of
+    // after the tower has run.
+    if !vision.images.is_empty() {
+        vision::require_image_capable_engine(&engine)?;
+    }
+    // The projector, for the executor the engine decodes on: the Metal
+    // tower beside the Metal hybrid runner, the CPU tower beside the CPU
+    // model. The image policy is built only when a projector is loaded, so a
+    // text-only run never reads the remote-image settings (a stale value in
+    // the shell or `.env` cannot stop it).
+    let vision_service = vision.load_service_for(
+        &arch,
+        &bonsai2::ModelVocabulary::of_gguf(&gguf),
+        || image_sources.cli_policy(),
+        &engine,
+    )?;
+    if vision_service.is_some() && vision.images.is_empty() {
+        tracing::warn!(
+            "--mmproj without --image: the projector is loaded but the prompt has no image"
+        );
+    }
 
     // Tokenizer (TOK-08): vocab-aware resolution, a hard
     // compatibility check, the GGUF's own template attached, and the
@@ -475,6 +562,7 @@ pub(crate) fn run(args: RunArgs) -> anyhow::Result<()> {
         &vision,
         vision_service.as_deref(),
         engine.max_context(),
+        max_tokens,
     )?;
     tracing::info!(
         prompt_tokens = prompt.len(),
@@ -569,21 +657,25 @@ pub(crate) fn user_turn(prompt_text: &str, images: usize) -> RenderMessage {
 /// its `<|image_pad|>` (design §6.2).
 ///
 /// The images are prepared (resolved, decoded, resized) first and the
-/// expanded prompt checked against `max_context` BEFORE the tower encodes
-/// anything, so an image that cannot fit costs no encode.
+/// expanded prompt checked against `max_context` — with the room it leaves
+/// for `max_tokens` new tokens, [`vision::check_generation_room`], the same
+/// check a text prompt gets — BEFORE the tower encodes anything, so an image
+/// prompt that cannot be answered costs no encode.
 ///
 /// # Errors
 ///
 /// An image that cannot be prepared or encoded, a rendered prompt whose
 /// placeholders do not match the images (`[<code>] ...`), or an expanded
-/// prompt longer than `max_context`.
+/// prompt that leaves nothing to generate into.
 pub(crate) fn multimodal_prompt(
     tokens: Vec<u32>,
     vision: &bonsai2::VisionRequest,
     service: Option<&oxibonsai_runtime::vision_prefill::VisionService>,
     max_context: usize,
+    max_tokens: usize,
 ) -> anyhow::Result<ChatPrompt> {
     let Some(service) = service.filter(|_| !vision.images.is_empty()) else {
+        vision::check_generation_room(tokens.len(), max_tokens, max_context, 0)?;
         return Ok(ChatPrompt::Text(tokens));
     };
     let prepared = vision.prepare_images(service)?;
@@ -593,12 +685,7 @@ pub(crate) fn multimodal_prompt(
     let rows = oxibonsai_model::vision::plan_splice(&tokens, &grids, service.token_ids())
         .map_err(|e| anyhow::anyhow!("[{}] {e}", e.code()))?
         .total_rows();
-    if rows > max_context {
-        anyhow::bail!(
-            "sequence length {rows} (the prompt with its image rows) exceeds max context \
-             {max_context}: the prompt alone does not fit; lower --image-max-tokens or raise --ctx"
-        );
-    }
+    vision::check_generation_room(rows, max_tokens, max_context, prepared.len())?;
     let images = vision.encode_prepared(service, &prepared)?;
     oxibonsai_runtime::vision_prefill::MultimodalPrompt::new(tokens, images, service.token_ids())
         .map(ChatPrompt::Multimodal)

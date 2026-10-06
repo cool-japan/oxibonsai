@@ -12,7 +12,7 @@
 //! transactional: every chunk is embedded and validated into a scratch
 //! vector store first, and only merged into the live index if every chunk
 //! succeeded, so a mid-document failure can never leave a partially-indexed
-//! document behind (RAG-EVAL-IMG-30).
+//! document behind.
 
 use std::collections::HashMap;
 
@@ -42,7 +42,7 @@ pub struct RetrieverConfig {
     /// Minimum acceptable score for a result to be returned; results below
     /// this threshold are discarded even if they fall within the top-k.
     ///
-    /// **Sign convention** (RAG-EVAL-IMG-07 / missed-M2): this is compared
+    /// **Sign convention**: this is compared
     /// against [`crate::vector_store::SearchResult::score`], i.e. the
     /// store's configured [`Distance`] *after* [`Distance::to_score`] —
     /// always "higher is better", but the achievable range depends on the
@@ -72,8 +72,8 @@ pub struct RetrieverConfig {
     /// JSON `null`, which does not deserialise back into an `f32` — a
     /// `save`/`save_binary` call would return `Ok`, but the resulting file
     /// could then never be loaded again. To close that hole, this field is
-    /// (de)serialised through [`serialize_min_score`]/
-    /// [`deserialize_min_score`] below instead of the plain derive, which
+    /// (de)serialised through `serialize_min_score`/
+    /// `deserialize_min_score` below instead of the plain derive, which
     /// encode a non-finite value as the string `"-inf"`/`"inf"`/`"nan"` —
     /// so **every** `f32` value of this field, finite or not, round-trips
     /// through [`crate::retriever::Retriever::save`]/
@@ -240,7 +240,7 @@ pub struct Retriever<E: Embedder> {
     doc_count: usize,
     /// Optional pluggable chunking strategy; `None` uses [`chunk_document`]
     /// with the caller-supplied [`ChunkConfig`] (the historical default).
-    /// See [`RetrieverBuilder::with_chunker`] (RAG-EVAL-IMG-11/12).
+    /// See [`RetrieverBuilder::with_chunker`].
     chunker: Option<Box<dyn Chunker>>,
 }
 
@@ -256,7 +256,7 @@ pub struct Retriever<E: Embedder> {
 /// untagged-enum `Deserialize` then fails to match *any* variant against
 /// `null`, so `save`/`save_binary` return `Ok` for a snapshot that
 /// `load`/`load_binary` can never read back. `MetadataValue` itself lives
-/// in `metadata_filter.rs`, a file this package does not own, so unlike
+/// in `metadata_filter.rs`, so unlike
 /// `min_score` this cannot be closed with a `serde_with` attribute here;
 /// rejecting it at the indexing boundary, mirroring
 /// [`VectorStore::insert`]'s existing non-finite-vector guard
@@ -309,8 +309,7 @@ impl<E: Embedder> Retriever<E> {
     /// this replaces the store/config/doc_count *wholesale* and exists for
     /// the persistence layer's reconstruction path, not incremental
     /// indexing — [`Retriever::add_chunks`] and [`Retriever::store_mut`] are
-    /// the supported public escape hatches for building an index by hand
-    /// (RAG-EVAL-IMG-11).
+    /// the supported public escape hatches for building an index by hand.
     #[doc(hidden)]
     pub fn from_parts(
         embedder: E,
@@ -335,7 +334,7 @@ impl<E: Embedder> Retriever<E> {
     /// shorter than `chunk_config.min_chunk_size` — the default chunker's
     /// documented per-window behaviour), the whole (trimmed) document is
     /// indexed as a single chunk instead of being silently dropped from the
-    /// corpus while `add_document` still reports success (RAG-EVAL-IMG-13).
+    /// corpus while `add_document` still reports success.
     fn produce_chunks(
         &self,
         text: &str,
@@ -372,20 +371,20 @@ impl<E: Embedder> Retriever<E> {
     /// failure partway through (an embedder error, or a
     /// [`RagError::DimensionMismatch`]/[`RagError::NonFinite`] from
     /// [`VectorStore::insert`]) leaves the live store completely unchanged
-    /// instead of half-updated (RAG-EVAL-IMG-30).
+    /// instead of half-updated.
     ///
     /// Also fills in each chunk's `doc_id`/`chunk_idx` metadata keys (in
     /// addition to the dedicated struct fields) *if not already present*,
     /// so `Exists`/`Equals` filters over them work out of the box even for
     /// chunks produced by the default chunker, which previously never
-    /// attached any metadata at all (RAG-EVAL-IMG-11).
+    /// attached any metadata at all.
     ///
     /// "If not already present" matters for
     /// [`Retriever::add_document_with_metadata`]: caller-supplied metadata
     /// is merged into each chunk *before* `stage_and_commit` runs, so a
     /// caller who deliberately sets their own `"doc_id"`/`"chunk_idx"`
     /// metadata value keeps it instead of having it silently overwritten by
-    /// the automatic stamp (verifier-flagged: an unconditional `insert`
+    /// the automatic stamp (an unconditional `insert`
     /// here previously won regardless of merge order).
     fn stage_and_commit(&mut self, mut chunks: Vec<Chunk>) -> Result<usize, RagError> {
         for chunk in &mut chunks {
@@ -427,22 +426,22 @@ impl<E: Embedder> Retriever<E> {
     /// The document is split with the configured [`Chunker`] (or
     /// `chunk_config` by default), each chunk is embedded, and the
     /// resulting vectors are inserted atomically (see
-    /// [`Retriever::stage_and_commit`]). Returns the number of chunks that
-    /// were indexed. This is the metadata-carrying entry point
-    /// RAG-EVAL-IMG-11 asked for; [`Retriever::add_document`] is this
+    /// `Retriever::stage_and_commit`). Returns the number of chunks that
+    /// were indexed. This is the metadata-carrying entry point;
+    /// [`Retriever::add_document`] is this
     /// method with an empty metadata map.
     ///
     /// `"doc_id"` and `"chunk_idx"` are reserved metadata keys: every
     /// indexed chunk gets them auto-stamped from its
     /// [`crate::chunker::Chunk::doc_id`]/[`crate::chunker::Chunk::chunk_idx`]
-    /// fields (see [`Retriever::stage_and_commit`]), but only as a
+    /// fields (see `Retriever::stage_and_commit`), but only as a
     /// fallback — if `metadata` already sets either key, that caller value
     /// is kept instead of being overwritten by the automatic stamp.
     ///
     /// Returns [`RagError::NonFinite`] if `metadata` contains a
     /// [`MetadataValue::Float`] that is `NaN` or `±∞`, before touching any
     /// state — such a value would otherwise save without error but could
-    /// never be loaded back (see [`reject_non_finite_metadata`]).
+    /// never be loaded back (see `reject_non_finite_metadata`).
     pub fn add_document_with_metadata(
         &mut self,
         text: &str,
@@ -500,13 +499,13 @@ impl<E: Embedder> Retriever<E> {
     /// many distinct documents `chunks` spans — it may be zero, one, or
     /// several), so callers doing document-level accounting should track it
     /// themselves. Embedding and insertion are still atomic, exactly like
-    /// [`Retriever::add_document`] (RAG-EVAL-IMG-11/RAG-EVAL-IMG-30).
+    /// [`Retriever::add_document`].
     ///
     /// Returns [`RagError::NonFinite`] if any chunk's metadata contains a
     /// [`MetadataValue::Float`] that is `NaN` or `±∞`, checked before any
     /// chunk is embedded or inserted — see
     /// [`Retriever::add_document_with_metadata`]'s documentation and
-    /// [`reject_non_finite_metadata`] for why.
+    /// `reject_non_finite_metadata` for why.
     pub fn add_chunks(&mut self, chunks: Vec<Chunk>) -> Result<usize, RagError> {
         if chunks.is_empty() {
             return Ok(0);
@@ -520,8 +519,8 @@ impl<E: Embedder> Retriever<E> {
     /// Index multiple documents, returning per-document chunk counts.
     ///
     /// Processing stops and the error is returned on the first failure.
-    /// Because [`Retriever::add_document`] is itself atomic per document
-    /// (RAG-EVAL-IMG-30), any documents *before* the failing one remain
+    /// Because [`Retriever::add_document`] is itself atomic per document,
+    /// any documents *before* the failing one remain
     /// indexed — only this call's own `Vec<usize>` of per-document counts is
     /// discarded on error; [`Retriever::document_count`] and
     /// [`Retriever::chunk_count`] still reflect what was actually indexed.
@@ -557,7 +556,7 @@ impl<E: Embedder> Retriever<E> {
 
     /// Reject a query embedding that is degenerate for the store's metric,
     /// rather than silently scoring every entry identically and returning
-    /// an insertion-order "ranking" with no error (RAG-EVAL-IMG-21).
+    /// an insertion-order "ranking" with no error.
     ///
     /// A zero vector is only degenerate for similarity metrics whose score
     /// collapses to a constant at the origin — Cosine and Angular are
@@ -591,7 +590,7 @@ impl<E: Embedder> Retriever<E> {
     /// Returns [`RagError::EmptyQuery`] if `query` is blank,
     /// [`RagError::NoDocumentsIndexed`] if the store is empty, and
     /// [`RagError::EmptyQueryVector`] if the embedded query is degenerate
-    /// for the store's metric (see [`Retriever::reject_degenerate_query`]).
+    /// for the store's metric (see `Retriever::reject_degenerate_query`).
     pub fn retrieve(&self, query: &str) -> Result<Vec<SearchResult>, RagError> {
         self.retrieve_with_top_k(query, self.config.top_k)
     }
@@ -640,7 +639,7 @@ impl<E: Embedder> Retriever<E> {
 
     /// Retrieve the top-k chunks that pass a [`MetadataFilter`], honouring
     /// [`RetrieverConfig::min_score`] exactly like [`Retriever::retrieve`]
-    /// (RAG-EVAL-IMG-07: a prior version routed through
+    /// (a prior version routed through
     /// [`VectorStore::search_filtered`] with the threshold hard-coded away,
     /// so adding a filter silently *widened* the result set).
     ///
@@ -707,8 +706,7 @@ impl<E: Embedder> Retriever<E> {
 
     /// Mutably borrow the underlying vector store — the supported way to
     /// reach [`VectorStore::delete`]/[`VectorStore::update`]/
-    /// [`VectorStore::delete_by_doc_id`] through a `Retriever`
-    /// (RAG-EVAL-IMG-11/RAG-EVAL-IMG-22).
+    /// [`VectorStore::delete_by_doc_id`] through a `Retriever`.
     pub fn store_mut(&mut self) -> &mut VectorStore {
         &mut self.store
     }
@@ -730,7 +728,7 @@ impl<E: Embedder> Retriever<E> {
 
 /// Fluent builder for [`Retriever`], for construction paths that need more
 /// than [`Retriever::new`]'s `(embedder, config)` pair — currently, a
-/// pluggable [`Chunker`] (RAG-EVAL-IMG-11/12): previously, four of the
+/// pluggable [`Chunker`]: previously, four of the
 /// crate's five chunking strategies ([`crate::advanced_chunker::MarkdownChunker`],
 /// [`crate::advanced_chunker::RecursiveCharSplitter`],
 /// [`crate::advanced_chunker::SentenceChunker`],
@@ -821,7 +819,7 @@ fn rerank(mut results: Vec<SearchResult>, query: &str) -> Vec<SearchResult> {
             // Small additive boost. Not clamped to <= 1.0 (RAG-08
             // interaction): that clamp was only ever harmless because
             // RAG-08 used to silently L2-normalise `DotProduct` scores
-            // into [-1, 1] like Cosine; wave 1 removed that normalisation
+            // into [-1, 1] like Cosine; that normalisation was removed
             // (`vector_store.rs`'s `requires_normalized_inputs` excludes
             // `DotProduct`), so a `DotProduct` store's scores are now
             // unbounded, and clamping every *boosted* result to exactly
@@ -976,7 +974,7 @@ mod tests {
         );
     }
 
-    // ── verifier MINOR: caller metadata must win over the auto-stamp ────────
+    // ── caller metadata must win over the auto-stamp ────────
 
     #[test]
     fn caller_supplied_doc_id_metadata_survives_the_automatic_stamp() {
@@ -1003,7 +1001,7 @@ mod tests {
         );
     }
 
-    // ── verifier BLOCKING-class: non-finite metadata must be rejected up front ──
+    // ── non-finite metadata must be rejected up front ──
     //
     // `add_document_with_metadata`/`add_chunks` are themselves new in this
     // diff (RAG-EVAL-IMG-11): before it, a `Retriever` caller had no way to
@@ -1181,8 +1179,8 @@ mod tests {
 
     #[test]
     fn rerank_boost_does_not_collapse_unbounded_dot_product_scores() {
-        // DotProduct has been unbounded since wave 1 removed RAG-08's
-        // silent L2 normalisation (`vector_store.rs`'s
+        // DotProduct has been unbounded since RAG-08's
+        // silent L2 normalisation was removed (`vector_store.rs`'s
         // `requires_normalized_inputs` excludes DotProduct), so two real
         // entries can legitimately score > 1.0 *before* any rerank boost.
         // The old `rerank` clamped every *boosted* result to exactly 1.0,

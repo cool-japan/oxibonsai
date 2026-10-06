@@ -46,7 +46,7 @@ impl<'a> TransformerBlock<'a> {
     ///   TernaryKernel`). On CUDA the concatenation stored is the very buffer
     ///   the fused ternary GEMVs bind.
     /// - **ternary** blocks on **Metal**: nothing beyond the seven per-matrix
-    ///   uploads (see [`UPLOAD_TERNARY_CONCATENATIONS`]). The fused arms build
+    ///   uploads (see `UPLOAD_TERNARY_CONCATENATIONS`). The fused arms build
     ///   each concatenation once in `MetalGraph`'s own cache, keyed on the
     ///   block's mapping namespace (`TransformerBlock::ternary_fused_qkv_slot`
     ///   / `ternary_fused_gate_up_slot`), which is the same buffer the model's

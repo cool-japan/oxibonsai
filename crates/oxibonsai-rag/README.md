@@ -15,7 +15,7 @@ Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 
 ## Status
 
-**Stable** — version 0.2.4, 212 tests passing (`cargo nextest run -p oxibonsai-rag`). Uplifted from Alpha in 0.1.2.
+**Stable** — version 0.2.4, 324 tests (`cargo nextest list -p oxibonsai-rag --all-features`). Uplifted from Alpha in 0.1.2.
 
 ## Features
 

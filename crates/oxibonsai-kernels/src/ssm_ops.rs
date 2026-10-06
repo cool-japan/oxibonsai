@@ -7,7 +7,7 @@
 //! c[i0 + i1*nc]`, applied over the concatenated qkv stream. SiLU and the
 //! joint q‖k L2-norm that follow in the real forward graph are **not**
 //! applied here — `qwen35.cpp:494-498` runs `ggml_ssm_conv` then a
-//! *separate* `ggml_silu`, and B2-06's `norms::l2_norm_simd` is the
+//! *separate* `ggml_silu`, and `norms::l2_norm_simd` is the
 //! separate L2-norm step (K-10). This module is the conv only.
 //!
 //! # Memory layouts
@@ -135,7 +135,7 @@ pub fn causal_conv1d_k4_decode(
 /// the same causal window. This mirrors `gdn_prefill_f32`'s state handling
 /// and is deliberate: it keeps this kernel a pure function of its inputs,
 /// with no hidden dependency on how the cache is owned (the recurrent-state
-/// cache is B2-10's territory).
+/// cache lives in the model crate).
 ///
 /// Internally parallelised over **tokens** (`rayon`, `d_inner`-wide chunks
 /// of the token-major `out`) rather than literally over the `d_inner`
@@ -635,8 +635,7 @@ mod tests {
     use super::*;
 
     /// Deterministic xorshift64* generator so tests need no external RNG
-    /// dependency (this crate's `owned_files` for this package do not
-    /// include `Cargo.toml`).
+    /// dependency.
     struct XorShift64(u64);
     impl XorShift64 {
         fn next_f32(&mut self) -> f32 {

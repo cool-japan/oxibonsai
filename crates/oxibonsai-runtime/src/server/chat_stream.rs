@@ -498,16 +498,21 @@ pub(super) async fn chat_completions_stream(
     // Report the real loaded model id in the streaming chunks (resolved once
     // and cached) instead of a hard-coded literal. Resolved before the lease
     // below: a cache-cold descriptor lookup acquires its own lease.
-    let model_id = state.model_info().descriptor().await.id;
+    let model_id = state.model_info().descriptor().await.served_id;
 
     // Acquire an engine lease in async context, then move it into the blocking
     // generation task. The lease's Drop (a synchronous std-mutex push) runs at
     // the closure's end — no async in Drop, so this is safe off the runtime.
+    // The stage record follows: queued until a replica is free, then in
+    // prefill until the stream driver receives the first token.
+    let phase = cancel_slot.phase();
+    phase.enter(phase::Phase::WaitingForEngine);
     let mut lease = state.acquire_engine().await.map_err(|e| {
         tracing::error!(error = %e, "engine pool acquire failed");
         ApiError::service_unavailable(format!("no inference engine replica is available: {e}"))
             .with_code("engine_unavailable")
     })?;
+    phase.enter(phase::Phase::Prefill);
 
     // Seed from the engine's actual running
     // configuration, never `SamplingParams::default()`.
@@ -518,12 +523,11 @@ pub(super) async fn chat_completions_stream(
         seed,
     };
 
-    // SV-09 server wiring: arm cancellation, and keep a clone for the
-    // stream driver so a stop-sequence match (or a vanished client) can cut
-    // generation short, not just the outer per-request timeout.
-    let cancel_token = lease.arm_cancellation();
-    cancel_slot.arm(cancel_token.clone());
-    lease.set_prefill_chunk_tokens(Some(CANCELLATION_PREFILL_CHUNK_TOKENS));
+    // SV-09 server wiring: arm cancellation (recorded in the slot the SSE
+    // body cancels when the deadline expires or the client stops reading),
+    // and keep a handle for the stream driver so a stop-sequence match can
+    // cut generation short too.
+    let cancel_token = cancel_slot.arm_lease(&mut lease);
 
     let (token_tx, token_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
     let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel::<GenerationOutcome>();
@@ -577,6 +581,7 @@ pub(super) async fn chat_completions_stream(
         cancel: cancel_token,
         max_tokens,
         rate_tracker: Some(Arc::clone(&tracker)),
+        phase: Some(phase.clone()),
     };
     tokio::spawn(driver.run(token_rx, outcome_rx, payload_tx));
 
@@ -594,13 +599,16 @@ pub(super) async fn chat_completions_stream(
         _active_guard: active_guard,
     };
 
-    // `sse::sse_response` appends `[DONE]`, applies the keep-alive interval
-    // and enforces the per-request deadline over the whole body (finding
-    // `sec-08`).
-    Ok(sse::sse_response(
+    // `sse::sse_response_tracked` appends `[DONE]`, applies the keep-alive
+    // interval and enforces the per-request deadline over the whole body
+    // (finding `sec-08`); a deadline that expires names the stage the request
+    // was in and cancels the generation, as does a client that stops
+    // reading.
+    Ok(sse::sse_response_tracked(
         guarded_stream,
         &state.limits,
         request_id_header_map(request_id),
+        Some(&cancel_slot),
     ))
 }
 

@@ -304,7 +304,7 @@ pub(super) fn dequant_any(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ggml wire id 42 resolution (B2-09 fix)
+// ggml wire id 42 resolution
 //
 // `TensorInfo::tensor_type` is only ever the PARSE-TIME guess for wire id 42
 // -- always `GgufTensorType::TQ2_0_g128` (see
@@ -388,9 +388,9 @@ pub(crate) fn resolve_id42_once(gguf: &GgufFile<'_>) -> ModelResult<Option<GgufT
         // `TQ2_0_g128` test fixtures across the workspace (built in-process
         // via `GgufWriter`, never carrying `general.quantization_version`,
         // sized for a fast unit test rather than a real checkpoint) --
-        // files this package does not own and cannot add the tag to.
+        // files that cannot carry the tag.
         // Falling back to the legacy qs-first reading here reproduces
-        // exactly what every caller did before this package's fix existed,
+        // exactly what every caller did before the sniff existed,
         // for the one case (genuinely inconclusive evidence) where nothing
         // -- old code or new -- ever had grounds to prefer one reading over
         // another. `TensorLayout` (the offsets are internally
@@ -524,7 +524,7 @@ fn resolve_sample_tensor_type(
 /// RAW: this buckets every wire-id-42 tensor under `TQ2_0_g128` (the
 /// parse-time guess) regardless of its actual on-disk layout. Use
 /// [`resolved_dominant_weight_quant_type`] for anything that reports a
-/// variant/size to a human or feeds `ModelVariant` detection (B2-09) — this
+/// variant/size to a human or feeds `ModelVariant` detection — this
 /// raw form only remains `pub(super)` for [`dominant_from_counts`]'s own
 /// unit tests, which exercise the pure selection logic over hand-written
 /// `(type, count)` pairs.
@@ -533,7 +533,7 @@ pub(super) fn dominant_weight_quant_type(gguf: &GgufFile<'_>) -> GgufTensorType 
 }
 
 /// [`resolve_id42_once`] + [`apply_resolved_type`] applied to
-/// [`dominant_weight_quant_type`]'s answer (B2-09).
+/// [`dominant_weight_quant_type`]'s answer.
 ///
 /// The raw tally can only ever land on `TQ2_0_g128` by counting wire-id-42
 /// tensors (that is the ONLY way `GgufTensorType::from_id` produces that
@@ -596,7 +596,7 @@ pub(super) fn load_f32_tensor(gguf: &GgufFile<'_>, name: &str) -> ModelResult<Ve
             format!("element count {element_count} overflows usize on this platform"),
         ))
     })?;
-    // B2-09 fix: resolve the real on-disk layout before screening/decoding
+    // Resolve the real on-disk layout before screening/decoding
     // (see the "ggml wire id 42 resolution" section above) -- `info.tensor_type`
     // alone is only ever the parse-time guess for wire id 42.
     let resolved_type = resolve_sample_tensor_type(gguf, info)?;
@@ -605,7 +605,7 @@ pub(super) fn load_f32_tensor(gguf: &GgufFile<'_>, name: &str) -> ModelResult<Ve
     // decoding every `+2` weight as `0`.
     screen_ternary_codes(name, data, resolved_type)?;
     let values = dequant_any(resolved_type, data, n)?;
-    // B2-05's acceptance criterion: a Gated DeltaNet `ssm_a` (`A = -exp(A_log)`,
+    // A Gated DeltaNet `ssm_a` (`A = -exp(A_log)`,
     // GGUF `blk.N.ssm_a`, always F32) must be strictly non-positive, or the
     // decay gate `exp(g)` in `gdn_step`/`gdn_chunk` exceeds 1 and the
     // recurrence diverges. Reject at load with a named error, not a log
@@ -642,7 +642,7 @@ pub(super) fn load_1bit_blocks<'a>(
 /// `PQ2_0` and `Q2_0_g64` are deliberately **exempt**: `0b11` is a legal `+2`
 /// there, so screening them would reject valid files. This is the load-side
 /// twin of the converter-side screen `crate::quantize` already applies when
-/// writing (CONVERT-EXPORT wave 1).
+/// writing.
 ///
 /// # Errors
 ///
@@ -733,7 +733,7 @@ pub(super) fn load_q8_0_blocks<'a>(
     BlockQ8_0::slice_from_bytes(data).map_err(ModelError::Core)
 }
 
-/// Load `PQ2_0` weight blocks from GGUF (zero-copy; B2-09).
+/// Load `PQ2_0` weight blocks from GGUF (zero-copy).
 ///
 /// Also the loader for `Q2_0G128DFirst` (the PrismML gen-1 reading of ggml
 /// id 42), which is wire-identical to `PQ2_0` — see `dequant_any`'s comment.
@@ -745,7 +745,7 @@ pub(super) fn load_pq2_0_blocks<'a>(
     BlockPQ2_0::slice_from_bytes(data).map_err(ModelError::Core)
 }
 
-/// Load `PTQ1_0` weight blocks from GGUF (zero-copy; B2-09).
+/// Load `PTQ1_0` weight blocks from GGUF (zero-copy).
 pub(super) fn load_ptq1_0_blocks<'a>(
     gguf: &'a GgufFile<'a>,
     name: &str,
@@ -754,7 +754,7 @@ pub(super) fn load_ptq1_0_blocks<'a>(
     BlockPTQ1_0::slice_from_bytes(data).map_err(ModelError::Core)
 }
 
-/// Load mainline group-64 `Q2_0` weight blocks from GGUF (zero-copy; B2-09).
+/// Load mainline group-64 `Q2_0` weight blocks from GGUF (zero-copy).
 ///
 /// The tensor sample that routes a real file here always arrives with wire
 /// id 42, whose `TensorInfo::tensor_type` is only ever the group-128
@@ -831,7 +831,7 @@ pub(super) fn load_q8k_blocks<'a>(
 /// `resolved_42` is [`resolve_id42_once`]'s per-file resolution of ggml wire
 /// id 42, computed ONCE by the caller (`model/types/mod.rs`, before the
 /// per-layer loop) and threaded through here rather than re-resolved per
-/// layer (B2-09): the replay walks every tensor's offset and the sniff
+/// layer: the replay walks every tensor's offset and the sniff
 /// samples real block bytes, so redoing it once per layer would repeat that
 /// work 64 times for the 27B for an answer that cannot change within one
 /// file. Pass `None` when the caller already knows the file has no
@@ -860,7 +860,7 @@ pub(super) fn load_transformer_block<'a>(
 
     let blk = |suffix: &str| -> String { tensor_names::block_tensor(layer_idx, suffix) };
 
-    // Detect quantization type from the Q projection tensor. B2-09: the RAW
+    // Detect quantization type from the Q projection tensor. The RAW
     // `sample_info.tensor_type` is only ever the parse-time guess for wire
     // id 42 -- `resolved_type` is what every arm below actually matches on.
     let sample_name = blk(tensor_names::ATTN_Q);
@@ -1251,13 +1251,13 @@ pub(super) fn load_transformer_block<'a>(
         }
         // `PQ2_0` (142) and `Q2_0G128DFirst` (the PrismML gen-1 RESOLVED
         // reading of ambiguous ggml id 42, never the raw wire id -- see
-        // `resolved_type` above) share one wire layout (B2-09; see
+        // `resolved_type` above) share one wire layout (see
         // `dequant_any`'s own comment above), so both build a `LinearPQ2_0`.
         // This is a generic uniform-Qwen3 wrapper: the real Bonsai 2 27B
         // hybrid layout does not fit `TransformerBlock` (different tensor
         // names/widths for the linear-attention layers, `q|gate` interleave
         // for full-attention ones) — that model is loaded through
-        // `hybrid/weights.rs` (B2-10), not this function. This arm exists so
+        // `hybrid/weights.rs`, not this function. This arm exists so
         // ANY GGUF that legitimately uses these quant types in a uniform
         // Qwen3 shape loads correctly instead of hitting the "no wrapper"
         // error below; a hybrid file fails this arm's own shape checks
@@ -1421,7 +1421,7 @@ pub(super) fn load_transformer_block<'a>(
 /// data transpose, only reuse of the one tensor for both roles.
 ///
 /// `resolved_42` is [`resolve_id42_once`]'s per-file resolution of ggml wire
-/// id 42, exactly as [`load_transformer_block`] takes it (B2-09) — the raw
+/// id 42, exactly as [`load_transformer_block`] takes it — the raw
 /// `output.weight`/`token_embd.weight` tensor type is only ever the
 /// parse-time guess for wire id 42, so matching on it directly would send a
 /// PrismML gen-1 or mainline group-64 output tensor down the wrong decode

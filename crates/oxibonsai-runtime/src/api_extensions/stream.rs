@@ -344,6 +344,10 @@ pub(super) struct ExtendedStream {
     pub(super) include_usage: bool,
     pub(super) metrics_guard: ActiveRequestGuard,
     pub(super) request_start: Instant,
+    /// The request's handle on its generation and its stage record: armed
+    /// here, cancelled by the SSE body when the deadline expires or the
+    /// client stops reading, and read for the stage the deadline names.
+    pub(super) slot: CancelSlot,
 }
 
 /// Real SSE streaming for `POST /v1/chat/completions/extended`.
@@ -364,6 +368,13 @@ pub(super) struct ExtendedStream {
 /// reasoning deltas, content deltas and one `tool_calls` delta per
 /// completed call, then the final chunk (and, with
 /// `stream_options.include_usage`, the usage chunk).
+///
+/// The body goes through the base endpoint's SSE machinery
+/// ([`crate::server::sse::sse_response_tracked`]): keep-alive comments, the
+/// per-request deadline over the whole body (an expired one ends the stream
+/// with the stage-naming `request_timeout` in an SSE `error` event, then
+/// `[DONE]`), and the generation cancelled when the deadline expires or the
+/// client stops reading.
 pub(super) async fn extended_chat_completions_stream(
     state: Arc<AppState>,
     request: ExtendedStream,
@@ -379,6 +390,7 @@ pub(super) async fn extended_chat_completions_stream(
         include_usage,
         metrics_guard,
         request_start,
+        slot,
     } = request;
     let completion_id = format!("chatcmpl-ext-{}", rand_ext_id());
     let created = std::time::SystemTime::now()
@@ -389,8 +401,10 @@ pub(super) async fn extended_chat_completions_stream(
     // path.
     let prompt_len = prompt.len();
 
-    // A stop-sequence match (or a vanished client) cancels the generation.
-    let cancel_token = lease.arm_cancellation();
+    // Armed through the request's slot (the SSE body cancels it when the
+    // deadline expires or the client goes away); the driver keeps a handle
+    // so a stop-sequence match cancels the generation too.
+    let cancel_token = slot.arm_lease(&mut lease);
 
     let (token_tx, token_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
     let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel::<GenerationOutcome>();
@@ -432,6 +446,9 @@ pub(super) async fn extended_chat_completions_stream(
         cancel: cancel_token,
         max_tokens,
         rate_tracker: None,
+        // Every generated token reaches the stage record: the first one is
+        // the edge from prefill to decode the deadline reports.
+        phase: Some(slot.phase()),
     };
     let state_for_driver = Arc::clone(&state);
     tokio::spawn(async move {
@@ -446,11 +463,13 @@ pub(super) async fn extended_chat_completions_stream(
             .observe(request_start.elapsed().as_secs_f64());
     });
 
-    let full_stream = UnboundedReceiverStream::new(payload_rx)
-        .map(|json_str| -> Result<Event, Infallible> { Ok(Event::default().data(json_str)) })
-        .chain(tokio_stream::once(Ok(Event::default().data("[DONE]"))));
-
-    Sse::new(full_stream).into_response()
+    // `sse_response_tracked` appends `[DONE]` itself.
+    crate::server::sse::sse_response_tracked(
+        UnboundedReceiverStream::new(payload_rx),
+        state.limits(),
+        HeaderMap::new(),
+        Some(&slot),
+    )
 }
 
 #[cfg(test)]

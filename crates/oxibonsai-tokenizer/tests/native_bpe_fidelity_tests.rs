@@ -437,7 +437,7 @@ fn large_merge_table_encode_is_fast() {
     let elapsed = start.elapsed();
 
     assert!(!ids.is_empty());
-    // Gatekeeper (waves 2+2.5 review) REQUIRED #2: the bound is lifted (not
+    // The bound is lifted (not
     // dropped) in a debug build, which is measurably slower than release —
     // see `crates/oxibonsai-tokenizer/src/bpe.rs`'s
     // `bpe_merge_symbols_is_not_quadratic_wall_clock` doc comment for the

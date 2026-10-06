@@ -446,7 +446,7 @@ fn token_embd_is_row_wise_decodable(ty: GgufTensorType) -> bool {
 /// memory-efficient case), or its full `element_count * 4`-byte
 /// f32-dequantized size when it does not (the eager-dequant fallback M-02's
 /// `EmbeddingTable::from_gguf` takes — this is the "eager-embedding" term
-/// the M-07 verifier correction says [`estimate_memory_bytes`] was missing).
+/// the M-07 review says [`estimate_memory_bytes`] was missing).
 ///
 /// `None` when `token_embd.weight` is absent from `entries`, its type id is
 /// not a recognised [`GgufTensorType`], or its f32-equivalent size would
@@ -469,12 +469,12 @@ fn token_embd_resident_bytes(entries: &[TensorEntry]) -> Option<u64> {
 ///
 /// This reads only the file header and tensor metadata — no weight bytes.
 ///
-/// # Honesty (M-07 verifier correction / sec-17 addendum)
+/// # Honesty (M-07 / sec-17)
 ///
 /// The naive sum of every [`TensorEntry::size_bytes`] understates the real
 /// figure by exactly one term this build's own loader already knows about:
 /// `token_embd.weight`'s **resident** cost (see
-/// [`token_embd_resident_bytes`]) whenever no row-wise decoder exists for
+/// `token_embd_resident_bytes`) whenever no row-wise decoder exists for
 /// its layout and it is dequantized eagerly to `f32` instead of staying
 /// quantized-resident. This function adds that difference on top of the
 /// naive sum so a caller building the RAM-derived context guard
@@ -923,12 +923,14 @@ mod tests {
     /// clone; it ran live this session against `Ternary-Bonsai-1.7B.gguf`.
     #[test]
     fn real_legacy_model_resolves_to_the_qs_first_reading() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../models/Ternary-Bonsai-1.7B.gguf");
-        if !path.exists() {
-            eprintln!("skipping: {} not present", path.display());
+        let Some(path) = oxibonsai_testkit::workspace::find_model("Ternary-Bonsai-1.7B.gguf")
+        else {
+            eprintln!(
+                "skipping: Ternary-Bonsai-1.7B.gguf not present under {}",
+                oxibonsai_testkit::workspace::models_dir().display()
+            );
             return;
-        }
+        };
         let resolved = load_tensor_metadata_resolved(&path).expect("resolve real model");
         assert!(!resolved.is_empty());
         let quantized: Vec<_> = resolved
@@ -954,7 +956,7 @@ mod tests {
         }
     }
 
-    // ── estimate_memory_bytes honesty (M-07 verifier correction / sec-17) ──
+    // ── estimate_memory_bytes honesty (M-07 / sec-17) ──
 
     /// Write a minimal synthetic GGUF whose `token_embd.weight` uses
     /// `tensor_type`, plus one small unrelated F32 tensor so the estimate

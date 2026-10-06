@@ -17,7 +17,7 @@ use crate::error::{ModelError, ModelResult};
 
 /// Process-wide [`KernelDispatcher`], detected once instead of once per
 /// `forward` call. See `linear_kquant_full.rs`'s sibling function of the
-/// same name for the full rationale (MINOR gatekeeper finding).
+/// same name for the full rationale.
 fn kquant_kernel_dispatcher() -> &'static KernelDispatcher {
     static DISPATCHER: std::sync::OnceLock<KernelDispatcher> = std::sync::OnceLock::new();
     DISPATCHER.get_or_init(KernelDispatcher::auto_detect)
@@ -120,8 +120,8 @@ impl<'a> LinearQ5K<'a> {
     /// When the `native-cuda` feature is enabled and a CUDA device is present
     /// the NVRTC Q5_K GEMV kernel is tried first; any failure other than
     /// "no CUDA device" is logged as a warning. Otherwise (or on that
-    /// fallback), the call routes through [`KernelDispatcher::gemv_q5k`]
-    /// (wave-1/1.5 addenda), which is the Metal-vs-CPU tier policy this type
+    /// fallback), the call routes through [`KernelDispatcher::gemv_q5k`],
+    /// which is the Metal-vs-CPU tier policy this type
     /// used to bypass entirely by calling `metal_gemv_q5k` inline — the
     /// exact gap that let a broken Metal kernel silently produce
     /// 0.62×-wrong logits with no diagnostic.

@@ -8,7 +8,7 @@
 //! 1. No graceful shutdown — no `with_graceful_shutdown` / SIGTERM+Ctrl-C
 //!    handling, unlike `oxibonsai-serve`'s `serve_with_shutdown` helper.
 //! 2. No `into_make_service_with_connect_info::<SocketAddr>()` — so the
-//!    wave-2 trusted-proxy rate limiter's `MaybePeerAddr` extractor
+//!    trusted-proxy rate limiter's `MaybePeerAddr` extractor
 //!    (`oxibonsai_runtime::middleware`) never saw a real peer address on
 //!    this binary and every direct client fell back to a single shared
 //!    `"unknown"` rate-limit bucket.

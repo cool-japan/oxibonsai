@@ -34,6 +34,7 @@
 //!   ordinary tokens is never a call. A token the decoder cannot render
 //!   never becomes id syntax, and without a tokenizer the content is empty.
 
+use super::blocking::CancelOnAbandon;
 use super::response_pipeline::{
     CollectedResponse, ContentStop, GenerationOutcome, ResponsePipeline, ResponseShape,
     StreamChunks, StreamDriver, StreamToolCallDelta,
@@ -105,46 +106,14 @@ impl SamplingOverrides {
     }
 }
 
-/// A slot the outer per-request-timeout branch in [`chat_completions`] uses
-/// to cancel whichever generation is in flight for this request, once one
-/// has actually started (`SV-09` server wiring).
-///
-/// The token itself is created deep inside [`chat_completions_non_stream`]
-/// / [`chat_completions_stream`] (where the lease is acquired), so this slot
-/// is how it becomes visible to the outer timeout branch, which runs
-/// concurrently via `tokio::time::timeout`. `None` until a lease is
-/// acquired and armed — the timeout branch is a no-op if it fires before
-/// that (the request is still queued on the pool, not yet running, so there
-/// is nothing to cancel; the pool acquire future is what gets dropped, which
-/// is enough on its own).
-#[derive(Clone, Default)]
-struct CancelSlot(Arc<std::sync::Mutex<Option<crate::engine_control::CancellationToken>>>);
-
-impl CancelSlot {
-    /// Record the token this request's generation was armed with.
-    fn arm(&self, token: crate::engine_control::CancellationToken) {
-        if let Ok(mut slot) = self.0.lock() {
-            *slot = Some(token);
-        }
-    }
-
-    /// Cancel whichever generation this slot currently holds a token for, if
-    /// any. Idempotent and safe to call even when nothing has armed yet.
-    fn request_cancel(&self) {
-        if let Ok(slot) = self.0.lock() {
-            if let Some(token) = slot.as_ref() {
-                token.cancel();
-            }
-        }
-    }
-}
-
-/// Prefill chunk size armed alongside a [`CancelSlot`] cancellation token
-/// (`SV-09`), so a long prompt's ingest observes the deadline instead of
-/// running the whole prefill as one uninterruptible call. Small enough to
-/// keep cancellation latency low, large enough not to meaningfully slow
-/// down prefill throughput.
-const CANCELLATION_PREFILL_CHUNK_TOKENS: usize = 512;
+// The request's handle on its generation and its stage record, shared with
+// the deadline (`deadline::run_with_deadline`) and the SSE body: the token is
+// created deep inside `chat_completions_non_stream` / `chat_completions_stream`
+// (where the lease is acquired), so the slot is how it becomes visible to the
+// deadline branch, which runs concurrently. A deadline that fires before
+// anything was armed (the request still queued on the pool) has nothing to
+// cancel; dropping the acquire future is enough.
+use super::deadline::CancelSlot;
 
 /// Find the earliest occurrence of any of `stop_sequences` in `text`.
 ///
@@ -224,63 +193,30 @@ pub(super) async fn chat_completions(
     // JSON matching its own shape.
     let extras: ChatRequestExtras = serde_json::from_str(raw.get()).unwrap_or_default();
 
-    // SV-09 server wiring: this slot lets the timeout branch below cancel
+    // SV-09 server wiring: this slot lets the deadline below cancel
     // whichever generation `chat_completions_inner` starts, once it starts
     // one — see [`CancelSlot`].
     let cancel_slot = CancelSlot::default();
 
     // sec-08: bound the WHOLE handler, not just the generation call. For the
     // streaming branch this covers the response head; the SSE body carries the
-    // same deadline into `sse::sse_response`, so a stalled client cannot hold
-    // the connection (and the engine replica's turn) open indefinitely.
-    let result = match state.limits.per_request_timeout {
-        Some(limit) => {
-            match tokio::time::timeout(
-                limit,
-                chat_completions_inner(
-                    Arc::clone(&state),
-                    body,
-                    extras,
-                    preprocessed,
-                    vision,
-                    request_id,
-                    cancel_slot.clone(),
-                ),
-            )
-            .await
-            {
-                Ok(inner) => inner,
-                Err(_) => {
-                    // SV-09: stop the in-flight generation (if one had
-                    // started) rather than letting it run to completion on a
-                    // pool replica the client will never see the answer
-                    // from.
-                    cancel_slot.request_cancel();
-                    state.metrics.errors_total.inc();
-                    tracing::warn!(
-                        timeout_ms = limit.as_millis() as u64,
-                        "request exceeded the per-request timeout"
-                    );
-                    Err(ApiError::timeout(format!(
-                        "request exceeded the server's per-request timeout of {} ms",
-                        limit.as_millis()
-                    )))
-                }
-            }
-        }
-        None => {
-            chat_completions_inner(
-                Arc::clone(&state),
-                body,
-                extras,
-                preprocessed,
-                vision,
-                request_id,
-                cancel_slot,
-            )
-            .await
-        }
-    };
+    // same deadline into `sse::sse_response_tracked`, so a stalled client
+    // cannot hold the connection (and the engine replica's turn) open
+    // indefinitely.
+    let result = deadline::run_with_deadline(
+        &state,
+        &cancel_slot,
+        chat_completions_inner(
+            Arc::clone(&state),
+            body,
+            extras,
+            preprocessed,
+            vision,
+            request_id,
+            cancel_slot.clone(),
+        ),
+    )
+    .await;
 
     result.map_err(|err| err.with_request_id(request_id))
 }
@@ -414,13 +350,28 @@ async fn chat_completions_inner(
     // Without a tokenizer there is no vocabulary to render into: the
     // configured prompt start token, or `400 tokenizer_required`.
     let image_references = preprocessed.image_references();
-    if !image_references.is_empty() && vision.is_none() {
-        // Before rendering: a template without image support would only
-        // produce a less helpful error.
-        state.metrics.errors_total.inc();
-        return Err(chat_render::api_error_from_multimodal(
-            &crate::vision_prefill::MultimodalError::VisionUnavailable,
-        ));
+    // The served model's description (resolved once and cached; resolved here,
+    // before any lease is held — on a cache-cold call it acquires its own).
+    // An engine that cannot prefill image rows (a dense model, or a hybrid
+    // one decoding on an executor without an image prefill) refuses the
+    // request now, typed and ahead of the template render, the image decode
+    // and the vision tower — streamed or not, so a stream is never opened
+    // only to fail inside the engine. That refusal comes before the
+    // projector's: loading one would not let such an engine serve the image.
+    let descriptor = state.model_info().descriptor().await;
+    if !image_references.is_empty() {
+        if let Some(refusal) = descriptor.image_support.refusal() {
+            state.metrics.errors_total.inc();
+            return Err(refusal);
+        }
+        if vision.is_none() {
+            // Before rendering: a template without image support would only
+            // produce a less helpful error.
+            state.metrics.errors_total.inc();
+            return Err(chat_render::api_error_from_multimodal(
+                &crate::vision_prefill::MultimodalError::VisionUnavailable,
+            ));
+        }
     }
     let (prompt_tokens, rendered) = match &state.tokenizer {
         Some(tok) => {
@@ -470,11 +421,24 @@ async fn chat_completions_inner(
     // SV-11: every image resolved, decoded and preprocessed, and the splice
     // checked against the rendered ids — but not yet encoded, so the budget
     // below sees the expanded prompt before any vision-tower work is spent.
-    let pending = chat_render::prepare_chat_prompt(prompt_tokens, image_references, vision)
-        .await
-        .inspect_err(|_| {
-            state.metrics.errors_total.inc();
-        })?;
+    // A remote image (when the operator enabled them) is fetched here, on the
+    // blocking pool: the request's own view of the vision service reports
+    // each fetch to the stage record (`image_fetch`), and dropping this
+    // handler (its deadline, or a client that went away) stops the fetch in
+    // flight and starts no further one. A fetch refused because the fetcher
+    // is at capacity is the typed, retryable `503`.
+    let image_fetches = image_fetch::RequestImageFetches::new(Some(cancel_slot.phase()));
+    let pending = chat_render::prepare_chat_prompt(
+        prompt_tokens,
+        image_references,
+        image_fetches.watch(vision),
+    )
+    .await
+    .map_err(|err| image_fetches.classify_failure(err))
+    .inspect_err(|_| {
+        state.metrics.errors_total.inc();
+    })?;
+    drop(image_fetches);
 
     // How this response's tokens split into reasoning, content and tool
     // calls — resolved once from the loaded vocabulary and the actual
@@ -491,13 +455,16 @@ async fn chat_completions_inner(
 
     // sec-05 (token half): reject an over-long prompt with a 400 naming the
     // real numbers instead of letting it become an opaque 500 in the engine.
-    // An image counts as the rows it expands to.
-    let descriptor = state.model_info().descriptor().await;
+    // An image counts as the rows it expands to. The bound is the engine's KV
+    // window (`min(declared context, window)`), not the context the model
+    // merely declares: a prompt between the two would pass a declared-context
+    // check and fail inside the engine, after its images were encoded.
     let ctx_len = descriptor.max_context_length;
-    budget::validate_request_budget(
+    budget::validate_request_budget_in_window(
         pending.len(),
         effective_max_tokens,
         ctx_len,
+        descriptor.declared_context_length,
         state.limits.max_input_tokens,
     )
     .inspect_err(|_| {
@@ -521,13 +488,24 @@ async fn chat_completions_inner(
     }
 
     // SV-11: the images are encoded (on the blocking pool) only now that
-    // the request is accepted.
+    // the request is accepted. The stage record learns the prompt's size
+    // (image rows included) and, for an image request, that the deadline may
+    // now catch the vision encode.
+    let phase = cancel_slot.phase();
+    let image_count = match &pending {
+        chat_render::PendingChatPrompt::Multimodal { prepared, .. } => prepared.len(),
+        chat_render::PendingChatPrompt::Text(_) => 0,
+    };
+    phase.set_workload(pending.len(), image_count);
+    if image_count > 0 {
+        phase.enter(phase::Phase::VisionEncode);
+    }
     let prompt = pending.encode().await.inspect_err(|_| {
         state.metrics.errors_total.inc();
     })?;
 
     let created = unix_now_secs();
-    let model_id = descriptor.id.clone();
+    let model_id = descriptor.served_id.clone();
 
     // SV-08: captured before branching so the post-`.await` skip-logic
     // below can tell whether a `StreamLifecycleGuard` was actually
@@ -714,11 +692,16 @@ async fn chat_completions_non_stream(
     } = req;
     let prompt_len = prompt.len();
 
+    // Queued until a replica is free; once one is held the engine is ingesting
+    // the prompt until it produces its first token (see `phase`).
+    let phase = cancel_slot.phase();
+    phase.enter(phase::Phase::WaitingForEngine);
     let mut lease = state.acquire_engine().await.map_err(|e| {
         tracing::error!(error = %e, "engine pool acquire failed");
         ApiError::service_unavailable(format!("no inference engine replica is available: {e}"))
             .with_code("engine_unavailable")
     })?;
+    phase.enter(phase::Phase::Prefill);
 
     // Seed from the engine's actual running
     // configuration, never `SamplingParams::default()`.
@@ -730,12 +713,15 @@ async fn chat_completions_non_stream(
     };
 
     // SV-09 server wiring: arm cancellation now that generation is actually
-    // about to start, and expose the token to the outer per-request timeout
-    // via `cancel_slot`. Chunking prefill lets a long prompt's ingest also
-    // observe the deadline instead of running as one uninterruptible call.
-    let cancel_token = lease.arm_cancellation();
-    cancel_slot.arm(cancel_token);
-    lease.set_prefill_chunk_tokens(Some(CANCELLATION_PREFILL_CHUNK_TOKENS));
+    // about to start, and expose the token to the per-request deadline via
+    // `cancel_slot` (the prefill is chunked, so a long prompt's ingest also
+    // observes it). The guard holds another handle to the same token across
+    // the blocking generation: a handler future dropped before the answer is
+    // in hand — the client went away, or a layer outside the handler gave up
+    // on it — cancels the generation instead of leaving the replica decoding
+    // to `max_tokens` for nobody.
+    let cancel_token = cancel_slot.arm_lease(&mut lease);
+    let abandon = CancelOnAbandon::new(cancel_token);
 
     // sec-03: generation is synchronous, CPU-bound work and must not run on a
     // tokio worker thread. `run_blocking_generation` moves the lease onto the
@@ -745,23 +731,29 @@ async fn chat_completions_non_stream(
     // generation and the replica's own restored afterwards, whichever
     // generate variant runs (`RT-26`; seeded `logprobs` included).
     let state_for_generation = Arc::clone(&state);
+    let generation_phase = phase.clone();
     let generated = run_blocking_generation(lease, move |lease| {
         sampling.run(lease, |engine| {
             if want_logprobs {
+                // The callback runs for the chosen token of every step (and
+                // for its alternatives): the first call is the first token.
                 let id_to_token = |id: u32| -> String {
+                    generation_phase.decode_started();
                     logprob_id_to_token(state_for_generation.tokenizer.as_ref(), id)
                 };
                 prompt
                     .generate_with_logprobs(engine, max_tokens, top_logprobs, &id_to_token)
                     .map(|(tokens, lp)| (tokens, Some(lp)))
             } else {
-                prompt
-                    .generate(engine, max_tokens)
+                phase::generate_observed(&prompt, engine, max_tokens, &generation_phase)
                     .map(|tokens| (tokens, None))
             }
         })
     })
-    .await?;
+    .await;
+    // The answer (or the task's failure) is in hand: nothing is abandoned.
+    abandon.disarm();
+    let generated = generated?;
 
     let (output_tokens, logprobs_content) = generated.map_err(|e| {
         tracing::error!(error = %e, "generation failed");

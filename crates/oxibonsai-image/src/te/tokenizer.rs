@@ -64,8 +64,7 @@
 //! decode path. Calling the BPE primitives directly also means
 //! `OxiTokenizer`'s protected-token carve-out (`build_special_pieces`,
 //! `oxibonsai-tokenizer`'s `tokenizer.rs:607-616`) is never in this code
-//! path at all, so it cannot re-tokenize `PREFIX`/`SUFFIX` differently (the
-//! wave-1 addendum's mandatory pre-check for this rewrite).
+//! path at all, so it cannot re-tokenize `PREFIX`/`SUFFIX` differently.
 
 use std::path::Path;
 

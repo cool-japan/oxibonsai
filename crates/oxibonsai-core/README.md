@@ -24,7 +24,7 @@ Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 - K-quant formats: `BlockQ2K`, `BlockQ4K`
 - `ModelCard` — structured model card (author, license, tags) embedded in GGUF
 - `mmap` feature for zero-copy model file access
-- 465 tests passing (unit, integration, fuzz, property)
+- 743 tests (unit, integration, fuzz, property; `cargo nextest list -p oxibonsai-core --all-features`)
 
 ## Feature Flags
 

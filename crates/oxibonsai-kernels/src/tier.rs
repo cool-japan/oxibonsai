@@ -2,8 +2,8 @@
 //! ended up on its current tier (`TierReason`), and the pure CPU-feature
 //! detection logic (no [`KernelDispatcher`] field access) that picks one.
 //!
-//! Split out of `dispatch.rs` purely for file size (wave-1 / wave-1.5
-//! addenda: `dispatch.rs` was 1997/2000 lines with `LinearLayer` and
+//! Split out of `dispatch.rs` purely for file size (`dispatch.rs` was
+//! 1997/2000 lines with `LinearLayer` and
 //! `ModelVariant` dispatch still to add). Every item here is re-exported or
 //! used from `dispatch.rs`, so callers keep addressing them as
 //! `oxibonsai_kernels::{KernelTier, cpu_kernel_tier}` / `crate::dispatch::*`

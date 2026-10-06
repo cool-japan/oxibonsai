@@ -1,5 +1,5 @@
 //! Unit tests of [`crate::kv_cache`], split out of `kv_cache.rs`
-//! (B2-11-FIX). With the legacy `KvCache::store_key` / `store_value`
+//! to keep that file small. With the legacy `KvCache::store_key` / `store_value`
 //! forwarders gone (M-26), the two tests that pin the error-swallowing
 //! contract call `store_key_lossy` / `store_value_lossy` by name and every
 //! other store goes through `try_store_*` — an in-range store that fails is a
@@ -409,9 +409,9 @@ fn try_new_accepts_the_same_geometry_new_would_build() {
     );
 }
 
-/// Supersedes the pre-B2-11-FIX contract ("`keys_for` on an `f16` cache
+/// Supersedes the earlier contract ("`keys_for` on an `f16` cache
 /// returns an EMPTY slice, not wrong data"): that empty slice was the
-/// release-build-silent footgun the wave-3.5 triage flagged, and with `f16`
+/// release-build-silent footgun the review flagged, and with `f16`
 /// now the host default it would have handed every legacy reader an empty
 /// history. `keys_for`/`values_for` now return the real rows (from the
 /// `f32` read-back mirror — never garbage, never empty) for every storage
@@ -587,7 +587,7 @@ fn ensure_capacity_never_shrinks() {
 
 #[test]
 fn ensure_capacity_doubles_instead_of_creeping_by_one_chunk_once_the_cache_is_large() {
-    // Perf minor (wave-3 review): once a cache is already much larger
+    // Perf minor: once a cache is already much larger
     // than one growth chunk, growing by exactly one
     // `GROWTH_CHUNK_POSITIONS` chunk at a time makes every
     // `try_grow_to` re-copy roughly the cache's whole existing content

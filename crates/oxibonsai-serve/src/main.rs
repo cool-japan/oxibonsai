@@ -10,7 +10,7 @@
 //!
 //! The bind-safety guard, bearer/admin token resolution, checksum
 //! verification, the extra `OXIBONSAI_*` env overrides, and the fully
-//! composed router (see [`hardening::build_router`]) live in the sibling
+//! composed router (see [`hardening::build_served_router`]) live in the sibling
 //! [`hardening`] module — split out to keep this file under the workspace's
 //! 2000-line-per-file policy.
 //!
@@ -114,7 +114,7 @@ async fn run() -> Result<(), StartupError> {
 
     // sec-06/SV-15(b): `observability.metrics_enabled`/`metrics_path` are
     // read here (see `hardening::metrics_gate_mw` / the metrics-path alias
-    // route, mounted in `hardening::build_router`) instead of being
+    // route, mounted in `hardening::build_base_router`) instead of being
     // validated and discarded.
     if !config.observability.metrics_enabled {
         info!("Prometheus metrics are disabled (observability.metrics_enabled = false)");
@@ -126,7 +126,7 @@ async fn run() -> Result<(), StartupError> {
     }
 
     // SV-15(c): `sampling.default_max_tokens` is threaded through
-    // `hardening::build_router` -> `RouterOptions::with_default_max_tokens`
+    // `hardening::build_served_router` -> `RouterOptions::with_default_max_tokens`
     // below, so the per-request fallback a client omitting `max_tokens`
     // gets is this configured value, not a hardcoded literal. This call is
     // now a defense-in-depth trip-wire rather than a "this is broken"
@@ -259,7 +259,7 @@ async fn run() -> Result<(), StartupError> {
     let metrics = Arc::new(InferenceMetrics::new());
     let serve_metrics = Arc::new(MetricsRegistry::new());
     // sec-20/perf-M1: capture the REAL pool size before `pool` is consumed
-    // by `hardening::build_router` -> `create_router_full`.
+    // by `hardening::build_served_router` -> `create_router_full`.
     let pool_size = pool.size();
     let mut router_build_options = hardening::RouterBuildOptions::new(
         admin_auth,
@@ -276,14 +276,34 @@ async fn run() -> Result<(), StartupError> {
     if let Some((code, message)) = embedder_unavailable {
         router_build_options = router_build_options.with_embedder_unavailable(code, message);
     }
-    let router = hardening::build_router(
+    // The id the model is listed under (`GET /v1/models`, every response's
+    // `model`): the GGUF's `general.name` when it is a real name, else the model
+    // file's stem — the Bonsai 2 27B files carry `general.name = "Hf"`.
+    if let Some(id) = built.as_ref().and_then(|b| {
+        oxibonsai_runtime::multi_model::served_model_id(
+            b.gguf
+                .metadata
+                .get_string(oxibonsai_core::gguf::tensor_info::keys::GENERAL_NAME)
+                .ok(),
+            config
+                .model
+                .path
+                .as_deref()
+                .and_then(std::path::Path::file_stem)
+                .and_then(std::ffi::OsStr::to_str),
+        )
+    }) {
+        router_build_options = router_build_options.with_served_model_id(id);
+    }
+    let router = hardening::build_served_router(
         Arc::clone(&pool),
         tokenizer,
         Arc::clone(&metrics),
         Arc::clone(&serve_metrics),
         &config,
         router_build_options,
-    );
+    )
+    .await;
 
     // ── 10. Resolve bind address ───────────────────────────────────────────
     let addr_str = format!("{}:{}", config.bind.host, config.bind.port);
@@ -520,7 +540,7 @@ fn quantization_hint_recognized(hint: &str) -> bool {
 ///
 /// Kept inline here (rather than in `oxibonsai-runtime`) because auth is a
 /// deployment concern of the server binary, not the inference core. Used by
-/// [`hardening::build_router`] via `crate::middleware`.
+/// [`hardening::harden_router`] via `crate::middleware`.
 mod middleware {
     use axum::body::Body;
     use axum::extract::State;
@@ -548,7 +568,7 @@ mod middleware {
         // checked *before* the `Authorization` lookup. When CORS is also
         // configured this is already unreachable (the outer `cors_mw`
         // short-circuits preflight before this layer ever runs — see
-        // `hardening::build_router`), but this keeps the same guarantee
+        // `hardening::harden_router`), but this keeps the same guarantee
         // even when CORS is disabled entirely.
         if req.method() == Method::OPTIONS {
             return next.run(req).await;

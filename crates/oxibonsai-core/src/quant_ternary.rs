@@ -490,7 +490,7 @@ pub const SNIFF_DEFAULT_BLOCKS: usize = 2000;
 const SNIFF_SAMPLE_COMMON_MULTIPLE_BYTES: usize = 612;
 
 /// Round `n_blocks` worth of the widest candidate's block size (34 bytes) up
-/// to a multiple of [`SNIFF_SAMPLE_COMMON_MULTIPLE_BYTES`], for use as a
+/// to a multiple of `SNIFF_SAMPLE_COMMON_MULTIPLE_BYTES`, for use as a
 /// byte cap before calling [`sniff_two_bit_layout`] (or
 /// [`sniff_two_bit_layout_scores`]) on a tensor that may be far larger than
 /// the sample the sniff actually needs.

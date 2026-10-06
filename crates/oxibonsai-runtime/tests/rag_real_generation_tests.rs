@@ -24,7 +24,7 @@ use oxibonsai_runtime::engine_pool::EnginePool;
 use oxibonsai_runtime::rag_server::{create_rag_router, create_rag_router_with_pool};
 use oxibonsai_runtime::sampling::SamplingParams;
 use oxibonsai_runtime::tokenizer_bridge::TokenizerBridge;
-use oxibonsai_testkit::capability::{record_executed, record_skipped, Capability};
+use oxibonsai_testkit::capability::{record_executed_timed, record_skipped, Capability};
 
 /// Bundled Qwen3 tokenizer fixture (relative to the crate root). Tests needing
 /// a real tokenizer skip themselves when it is absent.
@@ -52,18 +52,18 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
 
 // ── T-05 capability-report producer ─────────────────────────────────────────
 //
-// T-07 FIX (verifier wave 3): this used to be an inline copy of
+// T-07: this used to be an inline copy of
 // `oxibonsai_testkit::capability::record`; `oxibonsai-runtime` now takes
 // `oxibonsai-testkit` as a dev-dependency (imported above), so the copy is
 // deleted in favour of the shared implementation.
 //
-// Wave-1 addendum (1)(b): "`maybe_tokenizer()`'s missing-fixture early return
+// "`maybe_tokenizer()`'s missing-fixture early return
 // writes `executed:false`, the caller writes `executed:true` after a real
 // run" — `maybe_tokenizer` takes the caller's test name explicitly (rather
 // than inferring it, e.g. from the test-harness thread name) since it is
 // shared by more than one `#[tokio::test]`.
 //
-// FIX3-PARITY item 2(c): this function used to write `executed: true` HERE,
+// This function used to write `executed: true` HERE,
 // *before* `TokenizerBridge::from_file(..)` — so a fixture that existed but
 // failed to load recorded a validated capability while the caller silently
 // skipped on the `None`, and a fixture that loaded fine recorded one before
@@ -100,6 +100,7 @@ async fn rag_query_with_tokenizer_generates_from_context_and_query() {
     let Some(tokenizer) = maybe_tokenizer(REAL_GENERATION_TEST) else {
         return;
     };
+    let gate_start = std::time::Instant::now();
 
     let router = create_rag_router_with_pool(EnginePool::new(vec![engine()]), Some(tokenizer));
 
@@ -159,12 +160,16 @@ async fn rag_query_with_tokenizer_generates_from_context_and_query() {
         "retrieved_chunks should contain the indexed document; got {json}"
     );
 
-    // FIX3-PARITY item 2(c): the capability is recorded as EXECUTED only
+    // The capability is recorded as EXECUTED only
     // here, after the real tokenizer loaded, the real generation ran and
     // every assertion above passed. Any panic above leaves the manifest
     // without an `executed: true` line for this capability, which is exactly
     // what the release gate's freshness check is meant to see.
-    record_executed(Capability::RagRealGeneration, REAL_GENERATION_TEST);
+    record_executed_timed(
+        Capability::RagRealGeneration,
+        REAL_GENERATION_TEST,
+        gate_start.elapsed(),
+    );
 }
 
 // ── Without a tokenizer: honest, non-fabricated response ───────────────────────

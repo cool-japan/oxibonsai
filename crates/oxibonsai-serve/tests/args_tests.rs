@@ -180,7 +180,7 @@ fn parse_all_flags_together() {
 #[test]
 fn default_server_args_matches_struct_default() {
     // Ensure the Default impl matches what the spec says. `host` is
-    // "127.0.0.1" (FIX2-SERVE item 5): the struct default now agrees with
+    // "127.0.0.1" : the struct default now agrees with
     // the real, effective bind default (`BindConfig::default()`) instead of
     // the stale, never-reachable historical "0.0.0.0" literal.
     let d = ServerArgs::default();

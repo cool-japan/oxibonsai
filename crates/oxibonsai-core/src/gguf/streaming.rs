@@ -579,7 +579,7 @@ impl GgufStreamParser {
             return Err(BonsaiError::InvalidMetadata {
                 key: name,
                 // Wording aligned with `tensor_info.rs`'s identical check
-                // (core-gguf-16 / wave-2.5 addendum item 4): the two parsers
+                // (core-gguf-16): the two parsers
                 // used to disagree on the reason string for the exact same
                 // invalid input, which meant a cross-parser parity test
                 // could only assert the error *kind*, not its message.
@@ -657,8 +657,8 @@ impl GgufStreamParser {
     ///
     /// A `general.alignment` present with a type *other than* `Uint32` is a
     /// hard [`BonsaiError::InvalidMetadata`], matching `GgufFile::parse`
-    /// (`reader.rs`) exactly (core-gguf-15 / wave-2.5 integration addendum,
-    /// item 3): this used to silently substitute the 32-byte default for a
+    /// (`reader.rs`) exactly (core-gguf-15): this used to silently substitute
+    /// the 32-byte default for a
     /// spec-invalid (e.g. `Uint64`-spelled) alignment instead of rejecting
     /// the file, which meant the batch and streaming parsers could disagree
     /// on `data_offset` for the identical bytes.
@@ -1007,7 +1007,7 @@ mod tests {
         bytes
     }
 
-    /// core-gguf-15 / wave-2.5 integration addendum, item 3: a
+    /// core-gguf-15: a
     /// `general.alignment` present but spelled as anything other than
     /// `Uint32` must be a hard `InvalidMetadata`, matching `GgufFile::parse`
     /// (`reader.rs::batch_parser_rejects_a_non_uint32_alignment_spelling`)
@@ -1315,8 +1315,7 @@ mod tests {
     /// `GGML_MAX_DIMS` is 4; a tensor declaring 5 dimensions is invalid
     /// input and must be rejected outright as `InvalidMetadata`, not
     /// silently accepted with dimensions `4..n_dims` dropped from a
-    /// `[u64; 4]` (see also the batch-parser half of this same fix, owned
-    /// by a different package — noted in this package's deviations).
+    /// `[u64; 4]` (see also the batch-parser half of this same fix).
     #[test]
     fn tensor_with_more_than_four_dims_is_rejected() {
         let mut bytes = Vec::new();

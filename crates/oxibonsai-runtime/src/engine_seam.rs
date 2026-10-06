@@ -49,10 +49,13 @@
 //! | `verify_batch` / speculative decoding | yes | [`EngineError::RecurrentRollbackRequired`] |
 //! | prefix-cache KV block restore | yes | [`EngineError::RecurrentRollbackRequired`] (`PrefixCachedEngine::try_new`) |
 //! | embeddings (`embed`, `ModelEmbedder`) | yes (batched CPU prefill) | yes (CPU, `HybridModel::forward_hidden`, on either executor) |
+//! | multimodal (image) prefill (`prefill_multimodal`) | [`EngineError::NotAHybridModel`] | yes (Metal runner or CPU) |
 //!
 //! [`EngineError::NotADenseModel`] remains the refusal for what genuinely is
 //! dense-only: [`InferenceEngine::require_dense`] hands it to any caller that
-//! needs the dense block stack itself.
+//! needs the dense block stack itself; [`EngineError::NotAHybridModel`] is
+//! its mirror for what only the hybrid model does (image rows need its
+//! rows prefill).
 //!
 //! # Snapshot semantics
 //!
@@ -64,6 +67,37 @@
 //! ~150 MiB; the device KV needs no copy, as the runner writes every
 //! position before any query reads it). Restoring it is exact, and both
 //! executors refuse the same misuse with the same error codes.
+//! After an image the sequence rotates behind its positions (the M-RoPE
+//! offset, design §6.2); the offset is part of the sequence either way — the
+//! runner's snapshot carries its offsets, the CPU model forgets every
+//! offset past the position it continues from — and a snapshot records the
+//! offset in force at its position ([`SequenceSnapshot::rope_delta`]).
+//!
+//! A restore refuses a snapshot whose positions below it were rewritten
+//! after it was taken, which two checks establish:
+//!
+//! 1. **The M-RoPE offset** in force at the snapshot's position must equal
+//!    the one it recorded (a consistency check on the executor's offsets).
+//! 2. **The rollback log** (the engine's `RewindLog`): every restore that moves the
+//!    sequence back logs the position it moved to, and a snapshot records
+//!    how far the log reached when it was taken. A later rollback to a
+//!    position *below* the snapshot's means the sequence was written again
+//!    from there — the only way back to (or past) the snapshot's position —
+//!    so the snapshot no longer describes the positions under it.
+//!
+//! A hybrid sequence rolls back only through a restore (a forward at an
+//! earlier position is refused, one at position 0 starts a new sequence),
+//! so for a hybrid engine the second check is exact: text rewritten by
+//! text is refused just like text rewritten by an image, rather than
+//! restoring a recurrent state over a KV cache that holds other tokens. A
+//! dense engine's snapshot is its KV cursor and its restore truncates the
+//! cache there; only the rollbacks its restores perform are logged — a
+//! forward, prefill or verification at an earlier position,
+//! `try_rewind_cache`, and a cursor moved directly on the model (the
+//! speculative and prefix-cache drivers) are not — so a dense sequence
+//! rewritten those ways below a snapshot restores to the rewritten
+//! contents.
+//!
 //! What is **not** snapshot-able: an arbitrary *past* position of a hybrid
 //! model (a recurrence has no positional masking — that needs a checkpoint
 //! ring, design §8.4 item 2), a KV-only block of a hybrid sequence (the
@@ -85,8 +119,8 @@ use oxibonsai_model::model::BonsaiModel;
 
 use crate::engine::InferenceEngine;
 use crate::engine_hybrid_gpu::{
-    hybrid_backend_plan, HybridBackend, HybridBackendPlan, HybridGpu, HybridGpuState,
-    HYBRID_RUNNER_LABEL,
+    hybrid_backend_plan_with, HybridBackend, HybridBackendPlan, HybridGpu, HybridGpuState,
+    HybridLoadScope, HYBRID_RUNNER_LABEL,
 };
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::tokenizer_bridge::TokenizerBridge;
@@ -323,6 +357,18 @@ pub enum EngineError {
         /// What does not match.
         detail: String,
     },
+    /// A hybrid-only operation (image rows need the hybrid model's rows
+    /// prefill) was asked of an engine holding a dense model.
+    #[error(
+        "{operation} requires a hybrid `qwen35` (Bonsai 2) model, but this engine holds a dense \
+         `{architecture}` model"
+    )]
+    NotAHybridModel {
+        /// The refused operation.
+        operation: &'static str,
+        /// `general.architecture` of the loaded model.
+        architecture: String,
+    },
 }
 
 impl EngineError {
@@ -338,11 +384,12 @@ impl EngineError {
             Self::SharedEmbeddingUnsupported { .. } => "SHARED_EMBEDDING_UNSUPPORTED",
             Self::RecurrentStateNotSnapshotable { .. } => "RECURRENT_STATE_NOT_SNAPSHOTABLE",
             Self::SnapshotMismatch { .. } => "SNAPSHOT_MISMATCH",
+            Self::NotAHybridModel { .. } => "NOT_A_HYBRID_MODEL",
         }
     }
 
     /// Every code [`Self::error_code`] can return.
-    pub const ALL_CODES: [&'static str; 8] = [
+    pub const ALL_CODES: [&'static str; 9] = [
         "NOT_A_DENSE_MODEL",
         "RECURRENT_ROLLBACK_REQUIRED",
         "HYBRID_GPU_BACKEND_UNSUPPORTED",
@@ -351,6 +398,7 @@ impl EngineError {
         "SHARED_EMBEDDING_UNSUPPORTED",
         "RECURRENT_STATE_NOT_SNAPSHOTABLE",
         "SNAPSHOT_MISMATCH",
+        "NOT_A_HYBRID_MODEL",
     ];
 }
 
@@ -389,6 +437,10 @@ impl EngineError {
             },
             Self::RecurrentStateNotSnapshotable { name: "x".into() },
             Self::SnapshotMismatch { detail: "d".into() },
+            Self::NotAHybridModel {
+                operation: "op",
+                architecture: "qwen3".into(),
+            },
         ]
     }
 }
@@ -418,8 +470,81 @@ pub struct SequenceSnapshot {
     position: usize,
     /// The engine sequence the snapshot belongs to.
     sequence_id: u64,
+    /// The M-RoPE offset in force at [`Self::position`] (`0` for a dense
+    /// engine and for any text-only hybrid sequence).
+    rope_delta: usize,
+    /// How many rollbacks of its sequence the engine's [`RewindLog`] held
+    /// when the snapshot was taken: a restore looks only at the later ones.
+    rewind_mark: u64,
     /// What besides the KV cursor the snapshot restores.
     state: SnapshotState,
+}
+
+/// The rollbacks of an engine's current sequence: every restore that moves
+/// the sequence back to an earlier position logs that position, so a later
+/// restore can tell whether a position below its own snapshot was rewritten
+/// after the snapshot was taken (see the module docs, "Snapshot
+/// semantics").
+///
+/// The log belongs to one sequence: a rollback of another sequence (any
+/// reset since) starts a fresh log, so the reset paths need not touch it.
+/// `floors` keeps, for every suffix of the log, its lowest position:
+/// `(index, position)` pairs with strictly increasing indices and
+/// strictly increasing positions, where the first pair at or after log
+/// index `i` holds the lowest position any rollback from the `i`-th on went
+/// to. A rollback pops every pair at or above its own position, so the
+/// pairs never outnumber the distinct positions of the context window.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RewindLog {
+    /// The sequence the log belongs to.
+    sequence_id: u64,
+    /// Rollbacks of that sequence so far (the index the next one gets).
+    count: u64,
+    /// Suffix minima of the rolled-back-to positions (see above).
+    floors: Vec<(u64, usize)>,
+}
+
+impl RewindLog {
+    /// What a snapshot of `sequence_id` taken now records: the number of
+    /// rollbacks of that sequence so far (`0` when the log holds another
+    /// sequence's, which a first rollback of this one replaces).
+    pub(crate) fn mark(&self, sequence_id: u64) -> u64 {
+        if self.sequence_id == sequence_id {
+            self.count
+        } else {
+            0
+        }
+    }
+
+    /// Log a rollback of `sequence_id` to `position`.
+    pub(crate) fn record(&mut self, sequence_id: u64, position: usize) {
+        if self.sequence_id != sequence_id {
+            *self = Self {
+                sequence_id,
+                count: 0,
+                floors: Vec::new(),
+            };
+        }
+        while self
+            .floors
+            .last()
+            .is_some_and(|&(_, floor)| floor >= position)
+        {
+            self.floors.pop();
+        }
+        self.floors.push((self.count, position));
+        self.count += 1;
+    }
+
+    /// The lowest position a rollback of `sequence_id` went to at or after
+    /// log index `mark`; `None` when there was none.
+    pub(crate) fn lowest_since(&self, sequence_id: u64, mark: u64) -> Option<usize> {
+        if self.sequence_id != sequence_id {
+            return None;
+        }
+        let first = self.floors.partition_point(|&(index, _)| index < mark);
+        self.floors.get(first).map(|&(_, position)| position)
+    }
 }
 
 /// The per-sequence state a [`SequenceSnapshot`] carries besides the KV
@@ -452,6 +577,14 @@ impl SequenceSnapshot {
     #[must_use]
     pub fn position(&self) -> usize {
         self.position
+    }
+
+    /// The M-RoPE offset in force at the snapshot's position: the next
+    /// token of the restored sequence rotates at `position() - rope_delta()`
+    /// (design §6.2). `0` for a dense engine and any text-only sequence.
+    #[must_use]
+    pub fn rope_delta(&self) -> usize {
+        self.rope_delta
     }
 
     /// Whether this snapshot carries a recurrent state (i.e. was taken from a
@@ -503,6 +636,12 @@ pub(crate) struct HybridLoad<'a> {
 /// budgeted for the CPU model and the runner together (the CPU model is
 /// rebound at that window when the budget is the tighter limit).
 ///
+/// The [`HybridLoadOptions`](crate::engine_hybrid_gpu::HybridLoadOptions) in
+/// force on this thread ([`HybridLoadScope`]) apply: the window also
+/// leaves room for a vision tower's resident bytes, the runner's calls are
+/// sized for the requested prefill chunk (within that window's budget) and
+/// the CPU model takes the chunk.
+///
 /// # Errors
 ///
 /// Model-load errors, and for [`Backend::Metal`] the typed
@@ -515,6 +654,7 @@ pub(crate) fn load_hybrid<'a>(
     backend: Backend,
 ) -> RuntimeResult<HybridLoad<'a>> {
     let architecture = gguf_architecture(gguf);
+    let options = HybridLoadScope::active();
     let kernel = cpu_dispatcher();
     let config = HybridModel::config_from_gguf(gguf)?;
     let declared = config.base.max_context_length.max(1);
@@ -548,56 +688,62 @@ pub(crate) fn load_hybrid<'a>(
     let model = bind(cpu_window)?;
     let (model, gpu) = match backend {
         Backend::Cpu => (model, None),
-        Backend::Auto | Backend::Metal => match hybrid_backend_plan(gguf, &model, max_seq_len) {
-            HybridBackendPlan::Cpu { reason } => {
-                if backend == Backend::Metal {
-                    return Err(refuse(reason));
+        Backend::Auto | Backend::Metal => {
+            match hybrid_backend_plan_with(gguf, &model, max_seq_len, &options) {
+                HybridBackendPlan::Cpu { reason } => {
+                    if backend == Backend::Metal {
+                        return Err(refuse(reason));
+                    }
+                    fall_back(&reason);
+                    (model, None)
                 }
-                fall_back(&reason);
-                (model, None)
-            }
-            HybridBackendPlan::Metal { window, mapped } => {
-                if window.clamped() {
-                    tracing::warn!(
-                        requested = window.requested,
-                        window = window.window,
-                        limits = ?window.limits_applied,
-                        "hybrid model on the Metal runner: the requested KV window is clamped to \
-                         {} positions ({})",
-                        window.window,
-                        window.describe_limits()
-                    );
-                }
-                let model = if window.window == model.max_seq_len() {
-                    model
-                } else {
-                    bind(window.window)?
-                };
-                let summary = window.summary();
-                match HybridGpu::build(gguf, &model, window) {
-                    Ok(gpu) => {
-                        tracing::info!(
-                            architecture = %architecture,
-                            mapped,
-                            "hybrid model: decoding on the Metal hybrid runner; {summary}"
+                HybridBackendPlan::Metal {
+                    window,
+                    mapped,
+                    call_tokens: _,
+                } => {
+                    if window.clamped() {
+                        tracing::warn!(
+                            requested = window.requested,
+                            window = window.window,
+                            limits = ?window.limits_applied,
+                            "hybrid model on the Metal runner: the requested KV window is clamped to \
+                             {} positions ({})",
+                            window.window,
+                            window.describe_limits()
                         );
-                        (model, Some(gpu))
                     }
-                    Err(reason) => {
-                        if backend == Backend::Metal {
-                            return Err(refuse(reason));
+                    let model = if window.window == model.max_seq_len() {
+                        model
+                    } else {
+                        bind(window.window)?
+                    };
+                    let summary = window.summary();
+                    match HybridGpu::build(gguf, &model, window, &options) {
+                        Ok(gpu) => {
+                            tracing::info!(
+                                architecture = %architecture,
+                                mapped,
+                                "hybrid model: decoding on the Metal hybrid runner; {summary}"
+                            );
+                            (model, Some(gpu))
                         }
-                        fall_back(&reason);
-                        let model = if model.max_seq_len() == cpu_window {
-                            model
-                        } else {
-                            bind(cpu_window)?
-                        };
-                        (model, None)
+                        Err(reason) => {
+                            if backend == Backend::Metal {
+                                return Err(refuse(reason));
+                            }
+                            fall_back(&reason);
+                            let model = if model.max_seq_len() == cpu_window {
+                                model
+                            } else {
+                                bind(cpu_window)?
+                            };
+                            (model, None)
+                        }
                     }
                 }
             }
-        },
+        }
     };
     if gpu.is_none() && cpu_window < max_seq_len {
         tracing::warn!(
@@ -605,6 +751,10 @@ pub(crate) fn load_hybrid<'a>(
             declared,
             "requested max_seq_len exceeds the hybrid model's declared context; clamped"
         );
+    }
+    let mut model = model;
+    if let Some(chunk) = options.prefill_chunk {
+        model.set_prefill_chunk(chunk)?;
     }
     Ok(HybridLoad { model, kernel, gpu })
 }
@@ -750,6 +900,40 @@ impl<'a> InferenceEngine<'a> {
         self.hybrid_gpu.as_ref().map(HybridGpu::window)
     }
 
+    /// The most tokens one prefill call of this engine takes — the prefill
+    /// chunk in effect (`--prefill-chunk`): the model's own chunk
+    /// (`HybridModel::prefill_chunk` for a hybrid engine on the CPU model,
+    /// `BonsaiModel::prefill_chunk_tokens` for a dense one), or — on a
+    /// Metal-backed hybrid engine — the call size the runner's next prefill
+    /// takes for the model's chunk, which the KV window's memory budget can
+    /// hold below the chunk (see [`crate::engine_hybrid_gpu`]). Compare it
+    /// with the model's chunk to tell whether the executor capped it, and
+    /// with [`hybrid_metal_call_tokens`](Self::hybrid_metal_call_tokens) to
+    /// tell whether the runner already holds that call size.
+    pub fn prefill_chunk_in_effect(&self) -> usize {
+        match (&self.model, &self.hybrid_gpu) {
+            (LoadedModel::Hybrid(model), Some(gpu)) => gpu.planned_batch(model.prefill_chunk()),
+            (LoadedModel::Hybrid(model), None) => model.prefill_chunk(),
+            (LoadedModel::Dense(model), _) => model.prefill_chunk_tokens(),
+        }
+    }
+
+    /// The most tokens one prefill call of a Metal-backed hybrid engine's
+    /// runner takes right now; `None` for any other engine.
+    ///
+    /// Unlike [`prefill_chunk_in_effect`](Self::prefill_chunk_in_effect),
+    /// which is the call size the runner's next prefill takes for the
+    /// model's chunk, this is the call size the runner holds: the one it was
+    /// built with (the prefill chunk of the
+    /// [`HybridLoadOptions`](crate::engine_hybrid_gpu::HybridLoadOptions) in
+    /// force at construction, as far as the KV window's memory budget
+    /// allows), which stays until a prefill fits the runner's calls to the
+    /// model's chunk. A runner built for the chunk the model holds already
+    /// holds the call size `prefill_chunk_in_effect` reports.
+    pub fn hybrid_metal_call_tokens(&self) -> Option<usize> {
+        self.hybrid_gpu.as_ref().map(HybridGpu::max_batch)
+    }
+
     /// Whether a Metal-backed hybrid engine's runner reads the weights in
     /// place from the file mapping (`Some(false)`: it copied them); `None`
     /// for any other engine.
@@ -830,6 +1014,27 @@ impl<'a> InferenceEngine<'a> {
         match &self.model {
             LoadedModel::Dense(model) => model.kv_cache().seq_len(),
             LoadedModel::Hybrid(model) => model.recurrent().token_count(),
+        }
+    }
+
+    /// The M-RoPE offset of the current sequence (design §6.2): its next
+    /// token sits at [`sequence_position`](Self::sequence_position) but
+    /// rotates that many positions earlier — `h * w - max(h, w)` more after
+    /// each image of a merged `h x w` grid, `0` for a text-only sequence and
+    /// for a dense engine. The Metal runner's when the engine decodes on it.
+    pub fn rope_delta(&self) -> usize {
+        self.rope_offset_at(self.sequence_position())
+    }
+
+    /// The M-RoPE offset in force at sequence position `pos` of the current
+    /// sequence, on the executor this engine decodes on.
+    fn rope_offset_at(&self, pos: usize) -> usize {
+        if let Some(gpu) = &self.hybrid_gpu {
+            return gpu.rope_offset_at(pos);
+        }
+        match &self.model {
+            LoadedModel::Dense(_) => 0,
+            LoadedModel::Hybrid(model) => model.rope_offset_at(pos),
         }
     }
 
@@ -942,8 +1147,10 @@ impl<'a> InferenceEngine<'a> {
     /// masked by position, so keeping it would contaminate the new sequence.
     ///
     /// On a Metal-backed engine the count is the runner's: its device state
-    /// is the one every forward advances.
-    fn prepare_hybrid_position(&mut self, pos: usize) -> RuntimeResult<()> {
+    /// is the one every forward advances. Every hybrid prefill — text or
+    /// multimodal (`InferenceEngine::prefill_multimodal`) — goes through
+    /// this one contract.
+    pub(crate) fn prepare_hybrid_position(&mut self, pos: usize) -> RuntimeResult<()> {
         let LoadedModel::Hybrid(model) = &mut self.model else {
             return Ok(());
         };
@@ -1030,11 +1237,16 @@ impl<'a> InferenceEngine<'a> {
     /// Dense: exactly `BonsaiModel::forward_prefill(tokens, pos_start,
     /// &self.kernel)`. Hybrid: the prompt in `prefill_chunk`-token chunks
     /// (design §3.10) after the position contract — through the Metal
-    /// runner's `forward_prefill` on a Metal-backed engine (each chunk also
-    /// capped at the runner's own batch size, fixed when it was built), else
-    /// `HybridModel::forward_prefill`. Either way the recurrent state
-    /// advances once per token, in order, so the chunking never changes the
-    /// result.
+    /// runner's `forward_prefill` on a Metal-backed engine (its calls sized
+    /// for the chunk as far as the KV window's memory budget allows, see
+    /// [`crate::engine_hybrid_gpu`]), else `HybridModel::forward_prefill`.
+    /// The recurrent state advances once per token, in order, either way. On
+    /// the CPU model the chunking never changes the result. On the runner a
+    /// chunk of at least `Q35_GEMM_MIN_COLS` (16) tokens runs its
+    /// projections as a tiled GEMM whose rows do not depend on the chunk
+    /// they are in, so such chunkings agree bit for bit; a shorter chunk (a
+    /// prompt's tail) runs the decode GEMV, which agrees with the GEMM to
+    /// float rounding, not bit for bit.
     pub(crate) fn prefill_logits(
         &mut self,
         tokens: &[u32],
@@ -1093,6 +1305,8 @@ impl<'a> InferenceEngine<'a> {
         Ok(SequenceSnapshot {
             position: self.sequence_position(),
             sequence_id: self.sequence_id,
+            rope_delta: self.rope_delta(),
+            rewind_mark: self.rewinds.mark(self.sequence_id),
             state,
         })
     }
@@ -1103,11 +1317,21 @@ impl<'a> InferenceEngine<'a> {
     /// recurrent state is restored from the snapshot's deep copy — the CPU
     /// model's, or the Metal runner's device state.
     ///
+    /// A restore that moves the sequence back logs the position it moved
+    /// to: a later restore of a snapshot taken before that rollback, at a
+    /// position above it, is refused (see the module docs, "Snapshot
+    /// semantics").
+    ///
     /// # Errors
     ///
     /// [`EngineError::SnapshotMismatch`] when the snapshot belongs to another
     /// sequence (any reset since it was taken), to the other model kind or
-    /// the other hybrid executor, or lies beyond the current position.
+    /// the other hybrid executor, or lies beyond the current position; or
+    /// when the positions below it were rewritten after it was taken — a
+    /// different M-RoPE offset is in force at its position than it recorded,
+    /// or a restore since rolled the sequence back below its position (for
+    /// a dense engine, only rollbacks made by a restore are seen — see the
+    /// module docs). Nothing changes on any refusal.
     pub fn restore_sequence(&mut self, snapshot: &SequenceSnapshot) -> RuntimeResult<()> {
         if snapshot.sequence_id != self.sequence_id {
             return Err(EngineError::SnapshotMismatch {
@@ -1129,18 +1353,42 @@ impl<'a> InferenceEngine<'a> {
             }
             .into());
         }
+        let offset = self.rope_offset_at(snapshot.position);
+        if offset != snapshot.rope_delta {
+            return Err(EngineError::SnapshotMismatch {
+                detail: format!(
+                    "the sequence's M-RoPE offset at position {} is {offset}, not the {} recorded \
+                     with the snapshot: the positions below it were rewritten since it was taken",
+                    snapshot.position, snapshot.rope_delta
+                ),
+            }
+            .into());
+        }
+        if let Some(floor) = self
+            .rewinds
+            .lowest_since(self.sequence_id, snapshot.rewind_mark)
+            .filter(|&floor| floor < snapshot.position)
+        {
+            return Err(EngineError::SnapshotMismatch {
+                detail: format!(
+                    "a restore after it was taken rolled the sequence back to position {floor} \
+                     and the sequence was written again from there, so positions {floor}..{} \
+                     below the snapshot were rewritten since it was taken",
+                    snapshot.position
+                ),
+            }
+            .into());
+        }
         match (&mut self.model, self.hybrid_gpu.as_mut(), &snapshot.state) {
             (LoadedModel::Dense(model), _, SnapshotState::Dense) => {
                 model.kv_cache_mut().truncate(snapshot.position);
-                Ok(())
             }
             (LoadedModel::Hybrid(model), None, SnapshotState::HybridCpu(recurrent)) => {
                 model.recurrent_mut().restore(recurrent)?;
                 model.kv_cache_mut().set_seq_len(snapshot.position);
-                Ok(())
             }
             (LoadedModel::Hybrid(_), Some(gpu), SnapshotState::HybridMetal(state)) => {
-                gpu.restore(state)
+                gpu.restore(state)?;
             }
             (model, gpu, state) => {
                 let engine = match (model.is_hybrid(), gpu.is_some()) {
@@ -1148,15 +1396,19 @@ impl<'a> InferenceEngine<'a> {
                     (true, false) => "a hybrid model on the CPU",
                     (true, true) => "a hybrid model on the Metal runner",
                 };
-                Err(EngineError::SnapshotMismatch {
+                return Err(EngineError::SnapshotMismatch {
                     detail: format!(
                         "it was taken from {} but this engine holds {engine}",
                         state.kind()
                     ),
                 }
-                .into())
+                .into());
             }
         }
+        if snapshot.position < current {
+            self.rewinds.record(self.sequence_id, snapshot.position);
+        }
+        Ok(())
     }
 }
 

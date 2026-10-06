@@ -149,6 +149,8 @@ mod metal_prefill;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal_q_std_kernels;
 #[cfg(all(feature = "metal", target_os = "macos"))]
+pub mod metal_vision;
+#[cfg(all(feature = "metal", target_os = "macos"))]
 mod resident_logits;
 pub mod scirs2_backend;
 mod upload_scope;
@@ -198,8 +200,8 @@ pub use metal_fp8_prefill::{
 /// `MetalGraph`, `MetalGraphError` and `MetalWeightHandle`, plus the
 /// process-shared `MetalDevice` and the RAII session binding `SessionScope`
 /// from the moment `metal_graph` exports them (its `pub use
-/// graph::{MetalDevice, MetalGraph, SessionScope}`, landed by the
-/// METAL-CONCURRENCY package). The glob is deliberate: it re-exports exactly
+/// graph::{MetalDevice, MetalGraph, SessionScope}`).
+/// The glob is deliberate: it re-exports exactly
 /// what `metal_graph` makes public, so this module can never lag behind — or
 /// name a type ahead of — that module.
 #[cfg(all(feature = "metal", target_os = "macos"))]

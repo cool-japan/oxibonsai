@@ -32,7 +32,7 @@ mod cuda_tests {
 
     // ── T-05 capability-report producer ──────────────────────────────────
     //
-    // T-07 FIX (verifier wave 3): this used to be an inline copy of
+    // T-07: this used to be an inline copy of
     // `oxibonsai_testkit::capability::record`; `oxibonsai-model` now takes
     // `oxibonsai-testkit` as a dev-dependency (imported above), so the copy
     // is deleted in favour of the shared implementation.

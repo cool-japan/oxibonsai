@@ -244,7 +244,7 @@ mod tests {
 
     #[test]
     fn template_is_reusable_and_shareable() {
-        // A compiled template must be `Send + Sync`: B2-13 keeps it in a
+        // A compiled template must be `Send + Sync`: the chat template keeps it in a
         // `ChatTemplateKind::Jinja(Arc<JinjaTemplate>)` shared by every server
         // thread.  Runtime `Value`s deliberately are not — they never outlive
         // a single `render` call.

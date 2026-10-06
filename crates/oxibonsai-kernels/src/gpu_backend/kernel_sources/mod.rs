@@ -51,9 +51,11 @@ mod prefill_simdgroup_v10;
 mod prefill_tiled;
 mod q_std;
 pub mod qwen35;
+mod qwen35_gemm;
 mod utility;
 mod vae;
 mod vae_conv_implicit;
+mod vision;
 
 #[cfg(any(all(feature = "metal", target_os = "macos"), feature = "cuda"))]
 pub use archive::*;
@@ -84,11 +86,15 @@ pub use prefill_tiled::*;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub use q_std::*;
 #[cfg(all(feature = "metal", target_os = "macos"))]
+pub use qwen35_gemm::*;
+#[cfg(all(feature = "metal", target_os = "macos"))]
 pub use utility::*;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub use vae::*;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub use vae_conv_implicit::*;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub use vision::*;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Tests
@@ -144,6 +150,11 @@ mod tests {
 
         // V7-based GEMM batch prefill kernels
         assert!(MSL_GEMM_Q1_G128_V7.contains("kernel void gemm_q1_g128_v7"));
+        // The tiled prefill GEMMs, each in its own constant.
+        assert!(MSL_GEMM_Q1_G128_SIMDGROUP.contains("kernel void gemm_q1_g128_simdgroup"));
+        assert!(!MSL_GEMM_Q1_G128_V7.contains("gemm_q1_g128_simdgroup("));
+        assert!(MSL_GEMM_TQ2_G128_SIMDGROUP.contains("kernel void gemm_tq2_g128_simdgroup"));
+        assert!(!MSL_GEMM_TQ2_G128_V7.contains("gemm_tq2_g128_simdgroup("));
         assert!(MSL_GEMM_Q1_G128_V7_RESIDUAL.contains("kernel void gemm_q1_g128_v7_residual"));
         assert!(
             MSL_FUSED_GATE_UP_SWIGLU_GEMM_Q1.contains("kernel void fused_gate_up_swiglu_gemm_q1")
@@ -183,6 +194,10 @@ mod tests {
 
         // FLUX.2 DiT flash-attention simdgroup_matrix kernel (the shipping path)
         assert!(MSL_DIT_JOINT_ATTENTION_FLASH.contains("kernel void joint_attention_flash_f32"));
+
+        // Qwen3-VL vision tower (the Bonsai 2 mmproj on Metal)
+        assert!(MSL_VISION.contains("kernel void vit_gemm_f16w"));
+        assert!(MSL_VISION.contains("kernel void vit_qkv_rope_pack"));
     }
 
     #[test]

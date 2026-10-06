@@ -17,31 +17,23 @@
 //! real type table again, plus a new exhaustive (non-random) scan over the
 //! small, dense id space where every interesting boundary actually lives.
 //!
-//! # cargo-fuzz follow-up
+//! # cargo-fuzz target
 //!
-//! The spec asks for a `cargo-fuzz` target for `GgufFile::parse` seeded from
-//! crafted adversarial files. This package's `owned_files` list a specific
-//! set of paths under `crates/oxibonsai-core/tests/`, not a sibling
-//! `crates/oxibonsai-core/fuzz/` directory, but that directory is a brand
-//! new path no other package's `owned_files` could possibly name (nothing
-//! about it existed before T-03), it carries its own one-crate
-//! `[workspace]` (the same technique `oxibonsai-testkit`'s `Cargo.toml`
-//! uses, so `cargo build/test/clippy --workspace` from the repository root
-//! never sees it and cannot regress), and the spec explicitly asks for it —
-//! so it *was* created: `crates/oxibonsai-core/fuzz/Cargo.toml`, a
+//! `crates/oxibonsai-core/fuzz/` is a standalone `cargo-fuzz` crate for
+//! `GgufFile::parse`. It carries its own one-crate `[workspace]` (the same
+//! technique `oxibonsai-testkit`'s `Cargo.toml` uses, so `cargo
+//! build/test/clippy --workspace` from the repository root never sees it and
+//! cannot regress): `crates/oxibonsai-core/fuzz/Cargo.toml`, a
 //! `libfuzzer-sys` dependency, `crates/oxibonsai-core/fuzz/fuzz_targets/
 //! gguf_parse.rs` (`fuzz_target!(|data: &[u8]| { let _ =
 //! oxibonsai_core::gguf::reader::GgufFile::parse(data); });`), and a seed
 //! corpus at `crates/oxibonsai-core/fuzz/corpus/gguf_parse/`. It needs the
-//! nightly toolchain and `cargo install cargo-fuzz` to actually run
-//! (`cargo +nightly fuzz run gguf_parse` from `crates/oxibonsai-core/`),
-//! which this gate does not have/do, so it is not part of `cargo test
-//! --workspace` — `cargo check --manifest-path
-//! crates/oxibonsai-core/fuzz/Cargo.toml` is the compile-only check this
-//! package's own verification used instead.
+//! nightly toolchain and `cargo install cargo-fuzz` to run
+//! (`cargo +nightly fuzz run gguf_parse` from `crates/oxibonsai-core/`), so it
+//! is not part of `cargo test --workspace`; `cargo check --manifest-path
+//! crates/oxibonsai-core/fuzz/Cargo.toml` is the compile-only check.
 //!
-//! Separately, the crafted byte patterns a prior exploratory probe
-//! (`scratchpad/ggufuzz` — session-local, not part of this repo) found
+//! Separately, the crafted byte patterns an exploratory probe found
 //! interesting are *also* ported below as permanent, deterministic
 //! regression tests (the "── Crafted adversarial files" section):
 //! odd/misaligned data offsets, overlapping tensors, a `u64::MAX`-dimension
@@ -49,20 +41,16 @@
 //! claiming a 200 MB tensor name it does not contain. These run on every
 //! `cargo test` (no nightly toolchain needed).
 //!
-//! CORRECTION (verifier wave 3): the previous paragraph here claimed these
-//! crafted cases "are also the fuzz target's seed corpus, so the two forms
-//! of coverage reinforce each other" — verified false.
-//! `crates/oxibonsai-core/fuzz/corpus/gguf_parse/` (not owned by this
-//! package; see the `cargo-fuzz follow-up` section above for why) holds 8
-//! plain header-shaped seeds (`empty`, `single_byte`, `magic_only`,
+//! These crafted cases are NOT the fuzz target's seed corpus.
+//! `crates/oxibonsai-core/fuzz/corpus/gguf_parse/` holds 8 plain
+//! header-shaped seeds (`empty`, `single_byte`, `magic_only`,
 //! `bad_magic`, `unsupported_version`, `huge_tensor_count`,
 //! `huge_metadata_kv_count`, `valid_empty_header`) and none of the five
-//! crafted cases above. The two forms of coverage are complementary today
+//! crafted cases above. The two forms of coverage are complementary
 //! (this file's crafted cases run deterministically on every `cargo test`;
 //! the fuzz target explores its own, disjoint corpus under `cargo +nightly
-//! fuzz run`), not reinforcing — landing the five crafted files' exact byte
-//! patterns into the corpus directory (outside this package's `owned_files`)
-//! is the follow-up that would make the claim true.
+//! fuzz run`); copying the five crafted files' exact byte patterns into the
+//! corpus directory would let the fuzzer start from them.
 
 use proptest::prelude::*;
 
@@ -347,8 +335,8 @@ proptest! {
 /// project adds) and the 140-150 window around the PrismML extension ids
 /// 142/143. Unlike the proptest above (`P(hit)` for any *specific* id is
 /// astronomically small over `any::<u32>()`), this is the test that
-/// actually would have caught 142/143 being forgotten — T-03's verifier
-/// correction singled this out as the fix the finder's own two "already
+/// actually would have caught 142/143 being forgotten — T-03's review
+/// singled this out as the fix the finder's own two "already
 /// correct" sibling tests both still missed (both omitted 43/44 too).
 #[test]
 fn exhaustive_type_id_scan_matches_known_wire_ids() {

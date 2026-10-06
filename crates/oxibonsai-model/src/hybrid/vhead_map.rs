@@ -30,14 +30,14 @@
 //! box, to save an index computation that is a single `usize` lookup. So:
 //! **permute nothing; re-index at slice time** — the design's own wording.
 //!
-//! # Integration contract (B2-05's silent-failure class)
+//! # Integration contract (the silent-failure class)
 //!
 //! `oxibonsai_kernels::gated_delta_net`'s default entry points
 //! (`gdn_step_f32`, `gdn_step`, `gdn_prefill_f32`, `gdn_chunk`) assume
 //! [`GdnHeadOrder::Grouped`]. Handing them raw GGUF (tiled) `v`/gate buffers
 //! is **not detectable by the kernel** — it silently pairs each v-head with
-//! the wrong k-head (the B2-05 mutation check measured golden cosine
-//! dropping to 0.47). This package pins the **grouped** convention:
+//! the wrong k-head (a mutation check measured golden cosine
+//! dropping to 0.47). This module pins the **grouped** convention:
 //!
 //! * v-indexed activations are gathered tiled → grouped through
 //!   [`VHeadMap::gather_grouped`] / [`VHeadMap::gather_grouped_scalar`]
@@ -45,9 +45,9 @@
 //! * the recurrent state and the kernel output stay grouped, so the write
 //!   into `ssm_out`'s input is contiguous and needs no scatter.
 //!
-//! [`vhead_map_matches_grouped_kernel_order`](self::tests) pins that choice
+//! `vhead_map_matches_grouped_kernel_order` pins that choice
 //! against [`GdnHeadOrder`] itself, and
-//! [`tiled_buffers_pair_the_wrong_k_head_under_grouped_order`](self::tests)
+//! `tiled_buffers_pair_the_wrong_k_head_under_grouped_order`
 //! pins the failure mode the contract exists to prevent.
 
 use oxibonsai_kernels::gated_delta_net::{GdnDims, GdnHeadOrder};
@@ -364,9 +364,9 @@ impl VHeadMap {
     }
 }
 
-/// The head order this package hands the Gated-DeltaNet kernels, pinned as a
+/// The head order this module hands the Gated-DeltaNet kernels, pinned as a
 /// constant so a future edit has to change a named value rather than a call
-/// argument (B2-05 integration contract; see the module docs).
+/// argument (see the module docs' integration contract).
 pub const GDN_HEAD_ORDER: GdnHeadOrder = GdnHeadOrder::Grouped;
 
 #[cfg(test)]
@@ -422,7 +422,7 @@ mod tests {
         assert_eq!(map.k_head(47), 15);
     }
 
-    /// B2-05 integration contract, half 1: re-indexing a tiled buffer through
+    /// Integration contract, half 1: re-indexing a tiled buffer through
     /// this map and then calling a **grouped** kernel entry point pairs every
     /// v-head with the same physical k-head the fork's tiled convention does.
     #[test]
@@ -441,7 +441,7 @@ mod tests {
         assert_eq!(GDN_HEAD_ORDER, GdnHeadOrder::Grouped);
     }
 
-    /// B2-05 integration contract, half 2: the silent failure the gather
+    /// Integration contract, half 2: the silent failure the gather
     /// exists to prevent. Handing raw (tiled) buffers to a grouped entry
     /// point is not an error the kernel can detect — it just reads the wrong
     /// k-head for most v-heads.

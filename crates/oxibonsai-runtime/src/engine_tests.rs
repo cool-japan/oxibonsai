@@ -1234,18 +1234,18 @@ fn engine_set_min_p_is_carried_into_generate_with_seed() {
 /// The fused GPU route honours the sampler's min-p: on the 1-bit fused
 /// fixture, a seeded sampled request with min-p 0.1 set through
 /// [`InferenceEngine::set_min_p`] is token-for-token the same with the
-/// sampled top-k route on (the default) and off, over 8 seeds, and equal to
-/// an independently spelled-out classic loop with a min-p 0.1 sampler. Not
-/// vacuous: the route serves every decode step from GPU candidates, and
-/// min-p 0.1 changes the route-off realisation of at least one seed. (This
-/// fixture's logits span only ~1.2, so the request samples at temperature
-/// 0.2: at 1.0 every top-20 candidate would sit above a tenth of the most
-/// likely one's probability and min-p 0.1 would filter nothing.)
+/// sampled top-k route opted in and off (the default), over 8 seeds, and
+/// equal to an independently spelled-out classic loop with a min-p 0.1
+/// sampler. Not vacuous: the route serves every decode step from GPU
+/// candidates, and min-p 0.1 changes the route-off realisation of at least
+/// one seed. (This fixture's logits span only ~1.2, so the request samples
+/// at temperature 0.2: at 1.0 every top-20 candidate would sit above a tenth
+/// of the most likely one's probability and min-p 0.1 would filter nothing.)
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn engine_set_min_p_route_on_equals_route_off() {
     use crate::engine_greedy::{SampledTopKConfig, SampledTopKMode};
-    use oxibonsai_testkit::capability::{record_executed, record_skipped, Capability};
+    use oxibonsai_testkit::capability::{record_executed_timed, record_skipped, Capability};
 
     const TEST: &str = "oxibonsai-runtime::lib::engine_set_min_p_route_on_equals_route_off";
     const TOKENS: usize = 16;
@@ -1263,6 +1263,7 @@ fn engine_set_min_p_route_on_equals_route_off() {
     let prompt = [1u32, 5, 9];
 
     let mut on = InferenceEngine::from_gguf(&gguf, params.clone(), 0, 64).expect("route on");
+    on.set_sampled_topk(SampledTopKConfig::gpu_candidates());
     if !on.uses_fused_gpu_decode() {
         eprintln!(
             "capability report: {TEST} SKIPPED -- no accelerated Metal device, so the fused \
@@ -1271,6 +1272,7 @@ fn engine_set_min_p_route_on_equals_route_off() {
         record_skipped(Capability::Metal, TEST);
         return;
     }
+    let gate_start = std::time::Instant::now();
     assert_eq!(on.sampled_topk().mode, SampledTopKMode::GpuCandidates);
     assert!(on.sampled_topk_eligible(false));
     let mut off = InferenceEngine::from_gguf(&gguf, params.clone(), 0, 64).expect("route off");
@@ -1341,5 +1343,5 @@ fn engine_set_min_p_route_on_equals_route_off() {
         min_p_changed > 0,
         "min-p {MIN_P} never changed a realisation: the comparison proves nothing"
     );
-    record_executed(Capability::Metal, TEST);
+    record_executed_timed(Capability::Metal, TEST, gate_start.elapsed());
 }

@@ -8,7 +8,7 @@
 //! consumes an activation, the activation must first be rotated through a
 //! **blockwise, normalized Hadamard transform** with a fused `±1` sign flip.
 //! This module implements that transform (reference scalar + NEON + AVX2);
-//! see `bonsai2-design.md` §2.2 (design source for this package, finding
+//! see `bonsai2-design.md` §2.2 (design source, finding
 //! K-07) for the surrounding architecture.
 //!
 //! # The transform

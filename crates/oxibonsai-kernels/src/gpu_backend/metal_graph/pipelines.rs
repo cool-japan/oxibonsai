@@ -60,11 +60,9 @@ pub(crate) struct MetalPipelines {
     /// `(id, value)` pairs from a logits row, so a sampled request no longer
     /// downloads the full row (993 KB/token at Bonsai 2's 248 320 vocab) just
     /// to run `top_k`/`top_p` on the CPU. Dispatched by
-    /// `metal_dispatch.rs::dispatch_topk_f32`; the engine's sampled decode
-    /// arm (`engine_greedy.rs`) does not dispatch it yet, so nothing in the
-    /// non-test build calls `dispatch_topk_f32` — same
-    /// situation as `gemm_tq2_g128_v8_tiled` above, hence
-    /// `#[allow(dead_code)]`. `metal_dispatch.rs`'s own tests dispatch this
+    /// `metal_dispatch.rs::dispatch_topk_f32`, which the engine's sampled
+    /// decode route reaches through `resident_logits.rs`.
+    /// `metal_dispatch.rs`'s own tests dispatch this
     /// kernel for real and check its output against a CPU oracle.
     #[allow(dead_code)]
     pub(crate) topk_f32: ComputePipelineState,
@@ -387,6 +385,8 @@ fn build_combined_msl() -> String {
     src.push('\n');
     src.push_str(kernel_sources::MSL_GEMM_Q1_G128_V7);
     src.push('\n');
+    src.push_str(kernel_sources::MSL_GEMM_Q1_G128_SIMDGROUP);
+    src.push('\n');
     src.push_str(kernel_sources::MSL_GEMM_Q1_G128_V7_RESIDUAL);
     src.push('\n');
     src.push_str(kernel_sources::MSL_FUSED_GATE_UP_SWIGLU_GEMM_Q1);
@@ -395,6 +395,8 @@ fn build_combined_msl() -> String {
     src.push_str(kernel_sources::MSL_GEMV_TQ2_G128_V1);
     src.push('\n');
     src.push_str(kernel_sources::MSL_GEMM_TQ2_G128_V7);
+    src.push('\n');
+    src.push_str(kernel_sources::MSL_GEMM_TQ2_G128_SIMDGROUP);
     src.push('\n');
     src.push_str(kernel_sources::MSL_GEMM_TQ2_G128_V8_TILED);
     src.push('\n');
@@ -469,15 +471,22 @@ fn build_combined_msl() -> String {
     src.push_str(kernel_sources::MSL_PREFILL_FLASH_ATTENTION);
     src.push('\n');
     // ── Qwen3.5 / Bonsai 2 hybrid stack (MET-09) ─────────────────────────────
-    // The common prelude (helpers, no entry points) must precede the other
-    // three; resolved on demand by `metal_full_layer::qwen35`.
+    // The common prelude (helpers, no entry points) must precede the GEMVs,
+    // the rotations and the recurrence kernels; the batched-prefill GEMMs are
+    // self-contained. Resolved on demand by `metal_full_layer::qwen35`.
     src.push_str(kernel_sources::MSL_QWEN35_COMMON);
     src.push('\n');
     src.push_str(kernel_sources::MSL_QWEN35_ROTATE);
     src.push('\n');
     src.push_str(kernel_sources::MSL_QWEN35_GEMV);
     src.push('\n');
+    src.push_str(kernel_sources::MSL_QWEN35_GEMM);
+    src.push('\n');
     src.push_str(kernel_sources::MSL_QWEN35_SSM);
+    src.push('\n');
+    // ── Qwen3-VL vision tower (the Bonsai 2 mmproj) ──────────────────────────
+    // Self-contained; resolved on demand by `metal_vision`.
+    src.push_str(kernel_sources::MSL_VISION);
     src.push('\n');
     src
 }

@@ -3,7 +3,7 @@
 //! Stores key and value tensors for each layer to avoid recomputation
 //! during token-by-token generation.
 //!
-//! # Element type, layout and lazy growth (M-07, B2-11-FIX)
+//! # Element type, layout and lazy growth (M-07)
 //!
 //! A [`KvCache`] is described by three independent facts:
 //!
@@ -36,7 +36,7 @@
 //! [`KvCache::keys_for`]/[`KvCache::values_for`] keep their `&[f32]`
 //! signature and are correct for every storage mode (they used to return an
 //! **empty** slice for `f16` storage — the release-build-silent footgun the
-//! wave-3.5 triage flagged, guarded only by a `debug_assert!`). An `f32`
+//! review flagged, guarded only by a `debug_assert!`). An `f32`
 //! cache is borrowed zero-copy; an `f16` cache is served from an `f32`
 //! read-back mirror built on the first such read after a write and dropped
 //! by the next write. They are diagnostic / inspection accessors: no hot
@@ -191,7 +191,7 @@ fn checked_element_count(
 
 /// Allocate a `len`-element `Vec<T>` filled with `zero`, surfacing a real
 /// allocator failure as a [`ModelError::KvAllocation`] instead of aborting the
-/// process (M-07 verifier correction: `try_new`/`try_new_sparse` were
+/// process (M-07: `try_new`/`try_new_sparse` were
 /// "fallible" only in the overflow-detecting sense — both used to finish
 /// with `Self::new(...)`/`Self::new_sparse(...)`, whose plain `vec![zero;
 /// len]` still calls `handle_alloc_error` and aborts on an allocator `Err`).
@@ -409,7 +409,7 @@ impl KvCache {
         })
     }
 
-    /// Build a **bounded, lazily allocated** cache (M-07 / REQUIRED #4 (4)).
+    /// Build a **bounded, lazily allocated** cache (M-07).
     ///
     /// `backing` selects element type and layout:
     ///

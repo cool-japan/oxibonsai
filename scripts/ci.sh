@@ -31,6 +31,18 @@
 #               pass silently" applies only to release mode; dev mode is
 #               meant to be usable on a laptop that does not have every
 #               optional toolchain installed.
+#   --accept-approximate-cuda-syntax
+#               the one explicit opt-out of that rule, for a release host
+#               without the CUDA toolkit (every macOS host): in --release
+#               mode the `cuda-syntax` stage then accepts a CLEAN approximate
+#               check (clang++/g++ parse with CUDA builtins stubbed; see
+#               scripts/check_cuda.sh) instead of requiring nvcc. The stage's
+#               Summary line reads `OK (approximate, accepted by flag)` and a
+#               waiver line follows the table, so the run can never be read
+#               as a full CUDA check. A syntax error still fails, and a host
+#               with no C++ compiler at all is still INCOMPLETE. Without the
+#               flag the stage is exactly the strict one described above; in
+#               dev mode the flag is accepted and changes nothing.
 #
 # --with-models: two more stages (`real-model-legacy`, `real-model-bonsai2`,
 #   SKIPPED by default without it) additionally run the real-model gates
@@ -48,9 +60,19 @@
 # Usage:
 #   ./scripts/ci.sh                 # dev mode, all stages
 #   ./scripts/ci.sh --release       # release mode (see above)
+#   ./scripts/ci.sh --release --accept-approximate-cuda-syntax
+#                                   # release mode on a host without the CUDA toolkit (see above)
 #   ./scripts/ci.sh --with-models   # also run the real-model gates (see above)
 #   ./scripts/ci.sh --only build    # run a single stage by short name (see STAGE names below), for iterating
 #   ./scripts/ci.sh --list          # list stage short names and exit
+#
+# `--only` is refused together with `--release` (a partial run must never be
+# reported through the release pass/fail signal), with ONE exception:
+# `--release --only cuda-syntax` runs just that stage, whose release verdict is
+# decided entirely by scripts/check_cuda.sh and depends on no other stage, so it
+# is the one single-stage release run that is a faithful probe (it is how the
+# `cuda-syntax` waiver is checked on its own). Such a run ends with a PARTIAL RUN
+# line instead of ALL STAGES COMPLETE. and is never a release verdict.
 #
 # Every `cargo` invocation below picks up `CARGO_TARGET_DIR` /
 # `CARGO_BUILD_JOBS` from the environment as usual; this script never sets
@@ -70,15 +92,27 @@ RELEASE_MODE=0
 ONLY_STAGE=""
 LIST_ONLY=0
 WITH_MODELS=0
+ACCEPT_APPROX_CUDA=0
+# Set once the cuda-syntax stage passed ONLY approximately and the flag accepted it.
+CUDA_WAIVER_USED=0
 for arg in "$@"; do
     case "$arg" in
         --release) RELEASE_MODE=1 ;;
         --with-models) WITH_MODELS=1 ;;
+        --accept-approximate-cuda-syntax) ACCEPT_APPROX_CUDA=1 ;;
         --only)    : ;; # value consumed below
         --only=*)  ONLY_STAGE="${arg#--only=}" ;;
         --list)    LIST_ONLY=1 ;;
         --help|-h)
-            echo "Usage: $0 [--release] [--with-models] [--only=<stage>] [--list]"
+            echo "Usage: $0 [--release] [--accept-approximate-cuda-syntax] [--with-models] [--only=<stage>] [--list]"
+            echo ""
+            echo "  --release                        strict mode: a missing tool is INCOMPLETE and fails the run"
+            echo "  --accept-approximate-cuda-syntax with --release and no nvcc: accept a clean approximate"
+            echo "                                   CUDA kernel-syntax check (labelled in the Summary and after"
+            echo "                                   it; never the default; no effect without --release)"
+            echo "  --with-models                    also run the real-model stages"
+            echo "  --only <stage>                   run one stage (refused with --release, except cuda-syntax)"
+            echo "  --list                           list the stage names and exit"
             exit 0
             ;;
         *)
@@ -140,15 +174,15 @@ if [[ -n "$ONLY_STAGE" ]]; then
     if [[ "$KNOWN" -eq 0 ]]; then
         # A typo'd --only value must not silently skip every stage and
         # report a green summary having run nothing — that is the exact
-        # "reports pass while doing nothing" failure shape this whole
-        # package exists to eliminate (see release-gate.sh's header for
-        # the sibling bug that shape caused elsewhere in this package).
+        # "reports pass while doing nothing" failure shape this gate
+        # exists to eliminate (see release-gate.sh's header for the
+        # sibling bug that shape caused there).
         echo "ERROR: --only '$ONLY_STAGE' is not a known stage name." >&2
         echo "Known stages:" >&2
         printf '  %s\n' "${STAGE_NAMES[@]}" >&2
         exit 2
     fi
-    if [[ "$RELEASE_MODE" -eq 1 ]]; then
+    if [[ "$RELEASE_MODE" -eq 1 && "$ONLY_STAGE" != "cuda-syntax" ]]; then
         # Same failure shape as the unknown-stage check above, but for a
         # *valid* --only in --release mode: `--release --only=fmt` would
         # otherwise run 1 of N stages, record the rest "SKIPPED(--only)",
@@ -157,6 +191,14 @@ if [[ -n "$ONLY_STAGE" ]]; then
         # release-gate.sh nor publish.sh ever passes --only alongside
         # --release (both invoke a full `ci.sh --release`), so refusing
         # the combination here cannot break either caller.
+        #
+        # The one exception is `cuda-syntax`, which stays allowed: its
+        # release verdict (an nvcc pass, a waived approximate pass, or
+        # INCOMPLETE) is decided entirely by scripts/check_cuda.sh and
+        # depends on no other stage, so running it alone is a faithful
+        # probe of exactly that verdict — the check of the
+        # --accept-approximate-cuda-syntax waiver relies on it. Such a run
+        # is labelled PARTIAL at its end (never "ALL STAGES COMPLETE.").
         echo "ERROR: --only is incompatible with --release: a partial run must never" >&2
         echo "be reported through the release gate's pass/fail signal. Run the single" >&2
         echo "stage in dev mode instead, or omit --only for a full --release run." >&2
@@ -306,7 +348,11 @@ print_summary() {
     for entry in "${STAGE_RESULTS[@]+"${STAGE_RESULTS[@]}"}"; do
         printf '  %-45s %s\n' "${entry%%:*}" "${entry#*:}"
     done
-    echo "  mode: $([[ "$RELEASE_MODE" -eq 1 ]] && echo release || echo dev)"
+    echo "  mode: $([[ "$RELEASE_MODE" -eq 1 ]] && echo release || echo dev)$([[ -n "$ONLY_STAGE" && "$RELEASE_MODE" -eq 1 ]] && echo " (PARTIAL run, --only)")"
+    if [[ "$CUDA_WAIVER_USED" -eq 1 ]]; then
+        echo "  WAIVER: cuda-syntax was checked APPROXIMATELY (no nvcc), accepted by --accept-approximate-cuda-syntax."
+        echo "          The CUDA backend is not certified by this run."
+    fi
 }
 
 tool_ok() { command -v "$1" >/dev/null 2>&1; echo $?; }
@@ -355,8 +401,8 @@ run_required_stage "build-all-features" cargo build --workspace --all-features
 # than a `cargo hack --each-feature` dependency, since `cargo-hack` is not
 # already an installed/documented tool for this repo (`rg 'cargo-hack|cargo
 # hack'` finds no such usage anywhere outside this comment and
-# `tests/feature_matrix.rs`'s own doc comment), and this package's spec
-# says explicitly: "do not add a new tool requirement silently").
+# `tests/feature_matrix.rs`'s own doc comment), and a gate must not add a
+# new tool requirement silently).
 run_required_stage "facade-image" cargo check -p oxibonsai --features image
 run_required_stage "facade-metal" cargo check -p oxibonsai --features metal
 run_required_stage "facade-server-metal-image" \
@@ -447,15 +493,54 @@ if only_filter_skips "cuda-syntax"; then
 else
     banner "cuda-syntax"
     CUDA_ARGS=()
-    [[ "$RELEASE_MODE" -eq 1 ]] && CUDA_ARGS+=(--release)
+    if [[ "$RELEASE_MODE" -eq 1 ]]; then
+        CUDA_ARGS+=(--release)
+        [[ "$ACCEPT_APPROX_CUDA" -eq 1 ]] && CUDA_ARGS+=(--accept-approximate)
+    elif [[ "$ACCEPT_APPROX_CUDA" -eq 1 ]]; then
+        echo "NOTE: --accept-approximate-cuda-syntax has no effect without --release"
+        echo "(dev mode never fails this stage for a missing nvcc)."
+    fi
+    # The stage's label comes from check_cuda.sh's own machine-readable verdict
+    # line (CUDA_SYNTAX_RESULT=...), never from its exit code alone: exit 0 in
+    # --release mode means "a real nvcc pass" OR "a waived approximate pass", and
+    # the Summary must say which. The output is teed so it still streams live.
+    CUDA_OUT_LOG="$(mktemp "${TMPDIR:-/tmp}/oxibonsai_ci_cuda_syntax.XXXXXX")" || {
+        echo "FATAL: could not create a scratch file for the cuda-syntax verdict." >&2
+        exit 2
+    }
     # ${arr[@]+"${arr[@]}"}, not a bare "${arr[@]}": macOS's default
     # /bin/bash (3.2) treats an empty array's "${arr[@]}" as unbound under
     # `set -u`. CUDA_ARGS is empty in dev mode (the common case), so this
-    # is not a hypothetical.
-    if "$SCRIPT_DIR/check_cuda.sh" "${CUDA_ARGS[@]+"${CUDA_ARGS[@]}"}"; then
-        STAGE_RESULTS+=("cuda-syntax:OK")
+    # is not a hypothetical. `pipefail` is set, so PIPESTATUS[0] — the
+    # checker's own exit status, read before anything else runs — is what counts.
+    "$SCRIPT_DIR/check_cuda.sh" "${CUDA_ARGS[@]+"${CUDA_ARGS[@]}"}" | tee "$CUDA_OUT_LOG"
+    rc=${PIPESTATUS[0]}
+    CUDA_RESULT=""
+    while IFS= read -r cuda_line; do
+        case "$cuda_line" in
+            CUDA_SYNTAX_RESULT=*) CUDA_RESULT="${cuda_line#CUDA_SYNTAX_RESULT=}" ;;
+        esac
+    done <"$CUDA_OUT_LOG"
+    rm -f "$CUDA_OUT_LOG"
+    if [[ "$rc" -eq 0 ]]; then
+        if [[ "$RELEASE_MODE" -ne 1 || "$CUDA_RESULT" == "nvcc-ok" ]]; then
+            STAGE_RESULTS+=("cuda-syntax:OK")
+        elif [[ "$CUDA_RESULT" == "approximate-accepted" ]]; then
+            CUDA_WAIVER_USED=1
+            echo "WAIVER IN EFFECT: cuda-syntax passed only APPROXIMATELY (no nvcc), because"
+            echo "--accept-approximate-cuda-syntax was given. The CUDA backend is not certified by this run."
+            STAGE_RESULTS+=("cuda-syntax:OK (approximate, accepted by flag)")
+        else
+            # check_cuda.sh exited 0 in --release mode without saying which tier
+            # passed: its contract is broken, and a pass that cannot be labelled
+            # must not be recorded as OK.
+            echo "FAILED (incomplete): cuda-syntax exited 0 in --release mode without a recognised"
+            echo "CUDA_SYNTAX_RESULT line (got '${CUDA_RESULT:-<none>}'); refusing to record an unlabelled pass."
+            STAGE_RESULTS+=("cuda-syntax:INCOMPLETE")
+            print_summary
+            exit 2
+        fi
     else
-        rc=$?
         if [[ "$rc" -eq 2 ]]; then
             # INCOMPLETE — check_cuda.sh only returns this in --release mode
             # (dev mode always exits 0 even when skipped/approximate).
@@ -471,7 +556,29 @@ else
     fi
 fi
 
-# ── Stage 11: wasm32 build for oxibonsai-tokenizer (TOK-11) ─────────────
+# ── Stage 11: wasm32 checks (TOK-11) ─────────────────────────────────────
+# The stage keeps its name and is two commands, both for
+# `wasm32-unknown-unknown`, run in this order, the stage failing on the first
+# that fails:
+#   1. `cargo build -p oxibonsai-tokenizer`: the tokenizer builds for the
+#      target with its default features.
+#   2. `cargo check -p oxibonsai-runtime -p oxibonsai-tokenizer
+#      --no-default-features` with every warning denied: the runtime (its
+#      `server` feature off) and the tokenizer check clean for the target.
+#      Nothing else compiles the runtime for wasm32, and its
+#      `cfg(target_arch = "wasm32")` code is invisible to the host builds,
+#      clippy and the tests — where a stray unused import or a function that
+#      lost its last caller on that target hides until someone checks by hand.
+# The warnings are denied through `RUSTFLAGS=-D warnings` on that one command,
+# the way the docs-strict stage denies rustdoc's through RUSTDOCFLAGS: the
+# value is the caller's `RUSTFLAGS` (if any) plus the flag, set for that
+# command only. With an explicit `--target` the flag reaches the wasm32
+# artifacts and not the host's build scripts and proc macros, and, being part
+# of cargo's fingerprint, it only ever rebuilds wasm32 artifacts.
+# `CARGO_ENCODED_RUSTFLAGS`, which cargo prefers to RUSTFLAGS and which would
+# so drop the denial without a word, is unset for it. A warning in any
+# workspace crate the two packages pull in fails the stage; cargo caps the
+# lints of registry dependencies, so theirs never do.
 WASM_PRESENT=1
 if rustup target list --installed 2>/dev/null | grep -q '^wasm32-unknown-unknown$'; then
     WASM_PRESENT=0
@@ -481,61 +588,154 @@ elif rustc --print target-list 2>/dev/null | grep -q '^wasm32-unknown-unknown$' 
     # have the target installed; probe rustc directly as a fallback.
     WASM_PRESENT=0
 fi
+# shellcheck disable=SC2329  # invoked indirectly via run_optional_stage "$@"
+wasm_stage() {
+    echo "+ cargo build --target wasm32-unknown-unknown -p oxibonsai-tokenizer"
+    cargo build --target wasm32-unknown-unknown -p oxibonsai-tokenizer || return $?
+    echo "+ RUSTFLAGS='${RUSTFLAGS:+$RUSTFLAGS }-D warnings' cargo check -p oxibonsai-runtime -p oxibonsai-tokenizer --target wasm32-unknown-unknown --no-default-features"
+    env -u CARGO_ENCODED_RUSTFLAGS RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-D warnings" \
+        cargo check -p oxibonsai-runtime -p oxibonsai-tokenizer \
+        --target wasm32-unknown-unknown --no-default-features
+}
 run_optional_stage "wasm-tokenizer" "$WASM_PRESENT" \
-    "install the target: rustup target add wasm32-unknown-unknown" \
-    cargo build --target wasm32-unknown-unknown -p oxibonsai-tokenizer
+    "install the target (the tokenizer build and the runtime check both need it): rustup target add wasm32-unknown-unknown" \
+    wasm_stage
 
 # ── Stage 12: coverage baseline (T-18 — record it, don't just print it) ──
 # T-18's fix asks for a *recorded* baseline, not merely a number that
-# scrolls off the terminal: tee the exact same `--summary-only` output that
-# used to be the whole stage into $TARGET_DIR/coverage-baseline.txt so a
-# later run (or a human) can diff today's numbers against it. `run_optional_stage`
-# invokes its trailing argv directly (`"$@"`, no shell), so a `|` cannot be
-# embedded there — wrap the pipeline in a function instead.
+# scrolls off the terminal: tee the `--summary-only` output into
+# $TARGET_DIR/coverage-baseline.txt so a later run (or a human) can diff
+# today's numbers against it. There is no coverage *threshold* yet (a floor
+# set against today's numbers would institutionalise today's blind spots),
+# so the stage fails only when a test fails, never on a percentage.
+#
+# What the stage measures: the coverage of the tests that need no real model
+# file, run instrumented. It is HERMETIC with respect to real models — by
+# construction, and it says so before it runs — so its figures do not depend on
+# whether `models/` holds real models on the host. How the real models behave
+# is evidenced by the nextest stages (5 and 6, uninstrumented) and by the
+# release gate's serialised real-model legs, never by this stage: under
+# coverage counters a real-model test takes many times the minutes it needs
+# without them, and its timing assertions (the batched prefill must outrun the
+# sequential one, ...) measure the instrumentation, not the code.
+#
+# Every way a test finds a real model file is closed for the run:
+#   - the variables that point a test, or the code it drives, at a model,
+#     tokenizer, projector or weight file are unset (COVERAGE_MODEL_VARS),
+#     OXI_REQUIRE_MODEL_FILES among them: it turns a missing model into a
+#     failure, and none can be found;
+#   - OXIBONSAI_MODELS_DIR names a directory that does not exist (the stage
+#     removes anything at that path first), so the `<workspace>/models` default
+#     of `oxibonsai_testkit::workspace` is never consulted and every
+#     `find_model` comes back empty. It is a path that does not exist, not an
+#     empty directory, because the tests that read the variable through
+#     `test_fixtures::env_path` skip on a missing path but treat an existing
+#     directory as the real-model directory and fail when it holds no `.gguf`
+#     (`validate_and_run_agree_on_every_real_model`);
+#   - no test reaches a model past that variable: every lookup goes through
+#     `oxibonsai_testkit::workspace::{models_dir, find_model}` or reads
+#     OXIBONSAI_MODELS_DIR itself before it falls back to the workspace's
+#     `models/`. A test that built a model path from its crate's compile-time
+#     `CARGO_MANIFEST_DIR` alone would be out of reach of every variable and
+#     would still open a populated `models/` here — do not write one. (The
+#     tests that read `models/tokenizer.json` that way load a tokenizer, not
+#     a model.)
+# With every route closed, every real-model test self-skips in well under a
+# second.
+#
+# What the stage records is kept apart from the release evidence:
+# OXIBONSAI_CAPABILITY_REPORT names a file of its own under the target dir,
+# truncated when the stage starts. The skip records of the self-skipping
+# real-model tests, and any record a test writes under instrumentation,
+# therefore never enter the manifest that release-gate.sh checks, and no
+# coverage run can satisfy a required capability. The variable is set for the
+# one command (`env`), so no other stage sees it and nothing here truncates or
+# redirects the manifest of the others; the stage also fails if that manifest
+# changes while it runs.
+#
+# The tests run under `cargo llvm-cov nextest` with the same `ci` profile as
+# stages 5 and 6, not under plain `cargo llvm-cov` (which drives `cargo test`):
+#   - nextest runs every test in its own process, as every other test stage
+#     does. Under `cargo test` all tests of a binary share one instrumented
+#     process, whose coverage counters are contended by every concurrent test
+#     thread, so a test sees a much slower machine under coverage than outside
+#     it; that distorted timing-sensitive tests (the deadline tests of
+#     `crates/oxibonsai-runtime/tests/server_hardening_round4.rs` failed about
+#     half the runs that way before they were made deterministic).
+#   - the `ci` profile's `default-filter` excludes the full-weight 27B tests
+#     and its `real-model-gate` group keeps the other real-model tests to one
+#     at a time, as in stages 5 and 6; `cargo test` has neither.
+# `run_optional_stage` invokes its trailing argv directly (`"$@"`, no shell), so
+# the pipeline lives in a function; `pipefail` (set at the top of this script)
+# makes the pipeline's exit status `cargo llvm-cov`'s real one instead of
+# `tee`'s.
+#
+# The variables that make a test find, or insist on finding, a real model.
+# `OXIBONSAI_M08_RUN_LONG` (the 20 000-token real-model gate) is unset for the
+# reason stage 5 gives. Add a variable here in the edit that introduces one.
+COVERAGE_MODEL_VARS=(
+    OXI_MODEL OXI_TOKENIZER
+    OXI_BONSAI2_PQ2_GGUF OXI_BONSAI2_PTQ1_GGUF OXI_BONSAI2_MMPROJ_GGUF
+    OXIBONSAI_MODEL_PATH OXIBONSAI_TOKENIZER_PATH OXIBONSAI_BONSAI2_HEADERS_DIR
+    OXI_DIT_GGUF OXIBONSAI_DIT_GGUF OXI_VAE_WEIGHTS OXI_VAE_SAFETENSORS
+    OXI_TE_WEIGHTS OXI_TE_4BIT OXI_TE_TOKENIZER_DIR
+    OXI_REQUIRE_MODEL_FILES OXIBONSAI_M08_RUN_LONG
+)
 # shellcheck disable=SC2329  # invoked indirectly via run_optional_stage "$@"
 llvm_cov_stage() {
-    mkdir -p "$TARGET_DIR"
-    echo "+ cargo llvm-cov --workspace --summary-only | tee $TARGET_DIR/coverage-baseline.txt"
-    # This script runs under `set -uo pipefail` (no `-e`): pipefail is what
-    # makes the pipeline's exit status `cargo llvm-cov`'s real one instead
-    # of `tee`'s, so a genuine coverage-run failure still fails this stage.
-    cargo llvm-cov --workspace --summary-only | tee "$TARGET_DIR/coverage-baseline.txt"
+    local no_models="$ABS_TARGET_DIR/coverage-no-models"
+    local capability_report="$ABS_TARGET_DIR/coverage-capability-report.json"
+    local started_marker="$ABS_TARGET_DIR/coverage-stage-started"
+    local unset_args=() var rc records executed
+    for var in "${COVERAGE_MODEL_VARS[@]}"; do
+        unset_args+=(-u "$var")
+    done
+    mkdir -p "$TARGET_DIR" || return $?
+    rm -rf -- "${no_models:?}" || return $?
+    : >"$capability_report" || return $?
+    : >"$started_marker" || return $?
+    echo "HERMETIC: no real model can be found by this stage's tests — the model, tokenizer and weight variables are unset, OXIBONSAI_MODELS_DIR names a directory that does not exist ($no_models), and capability records go to $capability_report, not to the release manifest; real-model behaviour is evidenced by the nextest stages and the release gate's serialised legs, not by coverage."
+    echo "+ cargo llvm-cov nextest --workspace --profile ci --summary-only | tee $TARGET_DIR/coverage-baseline.txt"
+    env "${unset_args[@]}" \
+        OXIBONSAI_MODELS_DIR="$no_models" \
+        OXIBONSAI_CAPABILITY_REPORT="$capability_report" \
+        cargo llvm-cov nextest --workspace --profile ci --summary-only \
+        | tee "$TARGET_DIR/coverage-baseline.txt"
+    rc=$?
+    records=$(grep -c '"capability"' "$capability_report" 2>/dev/null) || records=0
+    executed=$(grep -c '"executed":true' "$capability_report" 2>/dev/null) || executed=0
+    echo "coverage capability records: $records ($executed executed), all in $capability_report"
+    # The redirect above keeps this stage's records out of the release
+    # manifest by construction; this checks it. Nothing else runs while a stage
+    # does, so a manifest written since the stage started was written by it.
+    if [[ "$CAPABILITY_REPORT" -nt "$started_marker" ]]; then
+        echo "FAILED: the release manifest $CAPABILITY_REPORT was modified while the coverage stage ran; coverage must never write release evidence." >&2
+        return 1
+    fi
+    echo "the release manifest $CAPABILITY_REPORT was not modified by this stage"
+    return "$rc"
 }
-LLVM_COV_PRESENT="$(tool_ok cargo-llvm-cov)"
+LLVM_COV_PRESENT=$(( $(tool_ok cargo-llvm-cov) | $(tool_ok cargo-nextest) ))
 run_optional_stage "llvm-cov" "$LLVM_COV_PRESENT" \
-    "install cargo-llvm-cov: cargo install cargo-llvm-cov --locked" \
+    "install cargo-llvm-cov and cargo-nextest: cargo install cargo-llvm-cov cargo-nextest --locked" \
     llvm_cov_stage
 
-# ── Stage 13: repo-wide hardcoded /tmp advisory (deps-08 follow-up) ─────
-# NON-FATAL, for now. deps-08's CLI-side fix (src/cli/cmd_image.rs,
-# args.rs, examples/mlx_image_parity.rs — owned by other packages, not this
-# one) has not necessarily landed yet, so this stays advisory rather than
-# gating; it exists to keep the remaining hardcoded-/tmp sites visible
-# until it does.
+# ── Stage 13: repo-wide hardcoded temp-directory advisory (deps-08) ─────
+# NON-FATAL by design: a hit is reported as a WARN so a developer sees it, but
+# it does not fail the gate. The shipped tree is clean (every default scratch
+# path comes from `std::env::temp_dir()` in Rust and `${TMPDIR:-/tmp}` in
+# shell), so promoting the stage to a hard failure is a one-word change —
+# `run_advisory_stage` to `run_required_stage` below — for a release owner who
+# wants a regression to stop the gate rather than only be displayed.
 #
-# FLIP-TO-FATAL TRIGGER: once src/cli/cmd_image.rs and src/cli/args.rs no
-# longer default any path to `/tmp` (deps-08's CLI half, routed to
-# CLI-CORE, wave 2) and a repo-wide `hits` run comes back empty, change the
-# call below from `run_advisory_stage` to `run_required_stage` (or make
-# this function's `return 1` fail the gate some other way) so a future
-# regression is caught, not just displayed. Do not flip it before that —
-# the CLI half's hits are real, expected, and not this package's to fix.
-#
-# There used to be a second `grep -v` here excluding
-# scripts/{benchmark,cli_ternary,download_ternary,bench_ternary}.sh on the
-# theory that CI-GATE had already fixed those four scripts' `/tmp` usage.
-# That filter is now dead weight, not a real exclusion: `rg -c '/tmp/'
-# scripts/benchmark.sh scripts/cli_ternary.sh scripts/download_ternary.sh
-# scripts/bench_ternary.sh` returns zero for all four, so the filter never
-# matches anything — it can only ever hide a *regression* reintroduced into
-# exactly the files wave 1 already cleaned up, which is the opposite of
-# what an advisory grep gate is for. Removed; if one of those four scripts
-# ever needs `/tmp` again, honouring `${TMPDIR:-/tmp}` (already excluded
-# below) is the correct fix, not a per-file carve-out.
+# There is deliberately no per-file carve-out: a script or example that needs
+# a scratch directory honours `${TMPDIR:-/tmp}` (excluded below), which is the
+# fix for a hit. The search pattern is written `/tm[p]/` so that this script's
+# own text does not match itself.
 # shellcheck disable=SC2329  # invoked indirectly via run_advisory_stage "$@"
 tmp_hardcode_advisory() {
     local hits
-    hits="$(grep -rn '/tmp/' --include='*.rs' --include='*.sh' \
+    hits="$(grep -rn '/tm[p]/' --include='*.rs' --include='*.sh' \
         --exclude-dir=target --exclude-dir=.git \
         -- src crates scripts 2>/dev/null \
         | grep -v -E '\$\{TMPDIR:-/tmp\}' \
@@ -606,5 +806,12 @@ run_with_models_stage "real-model-bonsai2" real_model_bonsai2_stage
 # ── Done ─────────────────────────────────────────────────────────────────
 print_summary
 echo ""
-echo "ALL STAGES COMPLETE."
+if [[ -n "$ONLY_STAGE" && "$RELEASE_MODE" -eq 1 ]]; then
+    # Only reachable for `--release --only cuda-syntax` (see the --only check
+    # above): never worded like the verdict of a full release run.
+    echo "PARTIAL RUN COMPLETE: only '$ONLY_STAGE' ran (--only). This is NOT a release-gate pass:"
+    echo "every other stage was skipped. scripts/release-gate.sh is the release gate."
+else
+    echo "ALL STAGES COMPLETE."
+fi
 exit 0

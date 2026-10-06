@@ -1320,7 +1320,7 @@ mod tests {
         );
     }
 
-    // ── Wave-1.5 addendum (a): an extension the constraint REJECTS must
+    // ── An extension the constraint REJECTS must
     // ── never become a live beam ────────────────────────────────────────
 
     /// A constraint that masks nothing (`allowed_tokens` → `None`, i.e. "no
@@ -1435,7 +1435,7 @@ mod tests {
         );
     }
 
-    // ── Wave-1.5 addendum (b): when every live beam finishes in one round
+    // ── When every live beam finishes in one round
     // ── under `early_stopping`, the stale parents must not be re-gathered ─
 
     #[test]

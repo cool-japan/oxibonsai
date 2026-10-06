@@ -410,8 +410,7 @@ const ARRAY_EAGER_RESERVE_CAP: usize = 4096;
 ///
 /// The declared `len` prefix is attacker-controlled and only capped against
 /// [`MAX_STRING_LEN`] (256 MiB); the actual bounded-chunk read loop lives in
-/// [`read_string_body_chunked`] (core-gguf-20 / sec-10 / wave-2.5
-/// integration addendum, item 5) — this used to be an independent copy of
+/// [`read_string_body_chunked`] (core-gguf-20 / sec-10) — this used to be an independent copy of
 /// that exact loop, one of three in the crate.
 fn read_gguf_string<R: Read>(reader: &mut R) -> BonsaiResult<String> {
     let len = reader

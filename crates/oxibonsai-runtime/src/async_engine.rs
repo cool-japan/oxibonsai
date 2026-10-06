@@ -18,9 +18,9 @@
 //! in-flight request, the lease is moved into the blocking task and dropped
 //! there (returning the replica to the pool), and on the Metal tier each
 //! replica carries its own GPU session (`MET-08`), so requests overlap on the
-//! GPU instead of serialising on a shared graph. [`Self::new`] still accepts a
+//! GPU instead of serialising on a shared graph. `Self::new` still accepts a
 //! lone engine — it becomes a one-replica pool, which is honestly reported by
-//! [`Self::replicas`] — and [`Self::from_pool`] is the multi-replica path.
+//! `Self::replicas` — and `Self::from_pool` is the multi-replica path.
 //!
 //! This module is not available on WASM targets (`wasm32`) because tokio's
 //! full feature set (including threads and network I/O) is not supported there.
@@ -256,11 +256,12 @@ mod tests {
     use crate::sampling::SamplingParams;
     use oxibonsai_core::config::Qwen3Config;
 
-    // HOTFIX-TESTMEM: `bonsai_8b()` made `BonsaiModel::new` allocate ~5 GB of
-    // token_embd + output_weight tables (plus a ~1.2 GB KV cache) for every
-    // test using this helper (7 call sites below); none exercise anything
-    // dimension-dependent. `tiny_test()` exercises the identical
-    // async-wrapper/concurrency-limiting wiring for a few tens of MB.
+    // Test memory bound: `bonsai_8b()` would make `BonsaiModel::new` allocate
+    // ~5 GB of token_embd + output_weight tables (plus a ~1.2 GB KV cache) for
+    // every test using this helper (7 call sites below); none exercise
+    // anything dimension-dependent, so the helper uses `tiny_test()`, which
+    // exercises the identical async-wrapper/concurrency-limiting wiring for a
+    // few tens of MB.
     fn make_engine() -> InferenceEngine<'static> {
         let config = Qwen3Config::tiny_test();
         InferenceEngine::new(config, SamplingParams::default(), 42)

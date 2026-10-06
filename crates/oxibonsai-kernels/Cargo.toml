@@ -1,6 +1,6 @@
 [package]
 name = "oxibonsai-kernels"
-description = "1-bit Q1_0_g128 compute kernels (dequant, GEMV, GEMM) for OxiBonsai"
+description = "Sub-2-bit compute kernels (dequant, GEMV, GEMM; CPU SIMD, Metal, CUDA) for OxiBonsai"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

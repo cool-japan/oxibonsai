@@ -54,6 +54,15 @@
 //!   JSON-rewritten) final text.
 //! - `sec-03` — the non-streaming `n`-loop runs as one unit on the blocking
 //!   pool (`crate::server::blocking::run_blocking_generation`).
+//! - **Deadline and abandonment** — the request runs under the server's
+//!   per-request deadline exactly as on the base endpoint
+//!   (`crate::server::deadline`): `504 request_timeout` naming the stage in
+//!   `error.phase` (`preparing`, `image_fetch`, `vision_encode`,
+//!   `waiting_for_engine`, `prefill`, `decode` with `generated_tokens`), or
+//!   the same error in an SSE `error` event followed by `[DONE]` once a
+//!   stream is open, and the generation cancelled either way. A non-streamed
+//!   request whose handler is dropped (the client went away) cancels its
+//!   generation too, and runs none of its remaining choices.
 //! - `SV-25` — both routes record the same [`crate::metrics::InferenceMetrics`]
 //!   counters/gauges/histogram the base endpoint does.
 //! - `SV-32` — the non-streaming path honours an `Idempotency-Key` request
@@ -70,18 +79,14 @@
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
-    response::{
-        sse::{Event, Sse},
-        IntoResponse, Json,
-    },
+    response::{IntoResponse, Json},
 };
 use std::collections::{HashMap, HashSet};
-use std::convert::Infallible;
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::api_types::{
     ChoiceLogprobs, ExtendedChatRequest, ExtendedChatResponse, ExtendedChoice, UsageInfo,
@@ -94,6 +99,9 @@ use crate::metrics::InferenceMetrics;
 use crate::middleware::IdempotencyCache;
 use crate::pipeline::{StopMatch, StopSequenceMatcher};
 use crate::sampling::{PenaltyParams, SamplingParams};
+use crate::server::blocking::{run_blocking_generation, CancelOnAbandon};
+use crate::server::deadline::{run_with_deadline, CancelSlot};
+use crate::server::phase::{self, Phase};
 use crate::server::response_pipeline::{
     CollectedResponse, ContentStop, GenerationOutcome, ResponseEnd, ResponsePipeline,
     ResponseShape, StreamChunks, StreamDriver, StreamToolCallDelta,
@@ -273,6 +281,12 @@ fn idempotency_cache_key_with_images(
 /// `stream_options` (see the module docs); `n` is capped at
 /// [`MAX_EXTENDED_N_CHOICES`] and any larger value is rejected with `400`
 /// rather than silently clamped.
+///
+/// The request runs under the server's per-request deadline, exactly as on
+/// the base endpoint (`crate::server::deadline`): an expired deadline
+/// cancels the request's generation and answers `504 request_timeout` naming
+/// the stage (`error.phase`) — or, once a stream is open, ends it with that
+/// error in an SSE `error` event and `[DONE]`.
 pub async fn extended_chat_completions(
     State(state): State<Arc<AppState>>,
     // SV-11: the vision projector loaded at startup (`--mmproj`), attached
@@ -292,6 +306,29 @@ pub async fn extended_chat_completions(
     // built from the typed path).
     Json(raw): Json<Box<serde_json::value::RawValue>>,
 ) -> impl IntoResponse {
+    let vision = vision.map(|axum::Extension(service)| service);
+    // The request's handle on its generation and its stage record: the
+    // deadline cancels whatever generation the handler starts and names the
+    // stage it caught the request in.
+    let slot = CancelSlot::default();
+    let handler =
+        extended_chat_completions_inner(Arc::clone(&state), vision, headers, raw, slot.clone());
+    match run_with_deadline(&state, &slot, async { Ok(handler.await) }).await {
+        Ok(response) => response,
+        Err(timeout) => timeout.into_response(),
+    }
+}
+
+/// The `/extended` handler proper, split out so
+/// [`extended_chat_completions`] can run it under the per-request deadline.
+async fn extended_chat_completions_inner(
+    state: Arc<AppState>,
+    vision: Option<Arc<crate::vision_prefill::VisionService>>,
+    headers: HeaderMap,
+    raw: Box<serde_json::value::RawValue>,
+    slot: CancelSlot,
+) -> axum::response::Response {
+    let phase = slot.phase();
     // SV-11: recover what `ChatMessage.content: Option<String>` cannot
     // represent (a content-parts array — its text flattened into the typed
     // field, its image parts kept for the renderer, never silently
@@ -309,15 +346,7 @@ pub async fn extended_chat_completions(
             return crate::http_error::error_response(e.status(), e.message(), None);
         }
     };
-    let vision = vision.map(|axum::Extension(service)| service);
     let image_references = preprocessed.image_references();
-    if !image_references.is_empty() && vision.is_none() {
-        state.metrics().errors_total.inc();
-        return chat_render::api_error_from_multimodal(
-            &crate::vision_prefill::MultimodalError::VisionUnavailable,
-        )
-        .into_response();
-    }
     let req: ExtendedChatRequest = match serde_json::from_str(&preprocessed.rewritten) {
         Ok(r) => r,
         Err(e) => {
@@ -509,6 +538,34 @@ pub async fn extended_chat_completions(
         .filter(|s| !s.is_empty())
         .collect();
 
+    // The real loaded-model descriptor, resolved once: an image request is
+    // refused here when the engine cannot prefill image rows (a typed `400`,
+    // streamed or not — ahead of the template render, the image decode and
+    // the vision tower), its context window bounds the request below, and its
+    // id is the response `model` field. MUST run before the engine is
+    // acquired further down: on an uncached first call,
+    // `ServedModelInfo::descriptor` acquires its own (briefly held) lease from
+    // this same pool, so calling it while `lease` below is already held would
+    // self-deadlock a single-replica pool waiting on a permit only this
+    // request holds.
+    let descriptor = state.model_info().descriptor().await;
+    if !image_references.is_empty() {
+        if let Some(refusal) = descriptor.image_support.refusal() {
+            state.metrics().errors_total.inc();
+            return refusal.into_response();
+        }
+        // The engine could serve the image; a server started without a
+        // vision projector cannot encode it. Checked after the engine's own
+        // refusal, which a projector would not lift.
+        if vision.is_none() {
+            state.metrics().errors_total.inc();
+            return chat_render::api_error_from_multimodal(
+                &crate::vision_prefill::MultimodalError::VisionUnavailable,
+            )
+            .into_response();
+        }
+    }
+
     // Build the prompt: the model's own resolved chat template, rendered
     // through the real Jinja engine and encoded in one whole-prompt call —
     // see `chat_render`'s module doc for the rendering contract and for how
@@ -572,15 +629,28 @@ pub async fn extended_chat_completions(
     };
 
     // SV-11: images resolved, decoded, preprocessed and spliced against the
-    // rendered ids, then encoded; a text-only request is its token ids.
-    let pending =
-        match chat_render::prepare_chat_prompt(prompt_tokens, image_references, vision).await {
-            Ok(pending) => pending,
-            Err(err) => {
-                state.metrics().errors_total.inc();
-                return err.into_response();
-            }
-        };
+    // rendered ids, then encoded; a text-only request is its token ids. A
+    // remote image (when the operator enabled them) is fetched while they
+    // are resolved, on the blocking pool: the request's own view of the
+    // vision service reports each fetch to the stage record (`image_fetch`),
+    // and dropping this handler (its deadline, or a client that went away)
+    // stops the fetch in flight and starts no further one. A fetch refused
+    // because the fetcher is at capacity is the typed, retryable `503`.
+    let image_fetches = crate::server::image_fetch::RequestImageFetches::new(Some(slot.phase()));
+    let pending = match chat_render::prepare_chat_prompt(
+        prompt_tokens,
+        image_references,
+        image_fetches.watch(vision),
+    )
+    .await
+    {
+        Ok(pending) => pending,
+        Err(err) => {
+            state.metrics().errors_total.inc();
+            return image_fetches.classify_failure(err).into_response();
+        }
+    };
+    drop(image_fetches);
 
     // How each choice's tokens split into reasoning, content and tool
     // calls, from the loaded vocabulary and the actual rendered prompt.
@@ -591,33 +661,36 @@ pub async fn extended_chat_completions(
         tools.is_some(),
     );
 
-    // The real loaded-model descriptor, resolved once: its context length
-    // bounds the request just below, its id is the response `model` field.
-    // MUST run before the engine is acquired below: on an uncached first
-    // call, `ServedModelInfo::descriptor` acquires its own (briefly held)
-    // lease from this same pool, so calling it while `lease` below is already
-    // held would self-deadlock a single-replica pool waiting on a permit only
-    // this request holds.
-    let descriptor = state.model_info().descriptor().await;
-
     // sec-05 (token half), as on the base endpoint: an over-long prompt is a
     // `400` naming the real numbers rather than an engine failure midway
     // through generation, and — an image counting as the rows it expands
     // to — it is refused before any vision-tower work is spent on it. Each
     // of the `n` choices generates from the same prompt independently, so
-    // the per-choice budget is the whole budget.
-    if let Err(err) = crate::server::validate_request_budget(
+    // the per-choice budget is the whole budget. The bound is the engine's KV
+    // window (`min(declared context, window)`), as on the base endpoint.
+    if let Err(err) = crate::server::validate_request_budget_in_window(
         pending.len(),
         max_tokens,
         descriptor.max_context_length,
+        descriptor.declared_context_length,
         state.limits().max_input_tokens,
     ) {
         state.metrics().errors_total.inc();
         return err.into_response();
     }
 
-    // An image counts as the rows it expands to.
+    // An image counts as the rows it expands to. The stage record learns the
+    // prompt's size (image rows included) and, for an image request, that
+    // the deadline may now catch the vision encode.
     let prompt_len = pending.len();
+    let image_count = match &pending {
+        chat_render::PendingChatPrompt::Multimodal { prepared, .. } => prepared.len(),
+        chat_render::PendingChatPrompt::Text(_) => 0,
+    };
+    phase.set_workload(prompt_len, image_count);
+    if image_count > 0 {
+        phase.enter(Phase::VisionEncode);
+    }
     let prompt = match pending.encode().await {
         Ok(prompt) => prompt,
         Err(err) => {
@@ -631,12 +704,15 @@ pub async fn extended_chat_completions(
         .inc_by(prompt_len as u64);
 
     // The response `model` field and the fingerprint input.
-    let model_id = descriptor.id;
+    let model_id = descriptor.served_id;
 
     // Acquire the engine once, both to serve the request and to seed the
     // per-request `SamplingParams` from the engine's own ambient/startup
-    // configuration (see `resolve_sampling_params`).
-    let lease = match state.acquire_engine().await {
+    // configuration (see `resolve_sampling_params`). Queued until a replica
+    // is free; once one is held the engine is ingesting the prompt until it
+    // produces its first token.
+    phase.enter(Phase::WaitingForEngine);
+    let mut lease = match state.acquire_engine().await {
         Ok(lease) => lease,
         Err(e) => {
             state.metrics().errors_total.inc();
@@ -648,6 +724,7 @@ pub async fn extended_chat_completions(
             );
         }
     };
+    phase.enter(Phase::Prefill);
     state.metrics().active_requests.inc();
     let active_guard = ActiveRequestGuard(Arc::clone(state.metrics()));
     let request_start = Instant::now();
@@ -680,10 +757,21 @@ pub async fn extended_chat_completions(
                 include_usage,
                 metrics_guard: active_guard,
                 request_start,
+                slot,
             },
         )
         .await;
     }
+
+    // Arm cancellation now that generation is about to start: the token is
+    // recorded in the slot the deadline cancels (with the prefill chunked, so
+    // a long prompt's ingest observes it), and the guard holds another handle
+    // across the blocking generation, so a handler future dropped before the
+    // answer is in hand — the client went away, or a layer outside the
+    // handler gave up on it — cancels the generation instead of leaving the
+    // replica decoding every choice to `max_tokens` for nobody.
+    let cancel_token = slot.arm_lease(&mut lease);
+    let abandon = CancelOnAbandon::new(cancel_token);
 
     // `sec-03`: the whole `n`-loop — up to `MAX_EXTENDED_N_CHOICES` full
     // generations of up to `max_tokens` tokens each — runs as ONE unit on
@@ -692,11 +780,25 @@ pub async fn extended_chat_completions(
     // independent runs additionally resets *inside* the loop so run `i > 0`
     // never inherits run `i - 1`'s generated tokens. Each run installs the
     // request's sampling configuration (choice `i` seeded per
-    // [`choice_seed`]) and restores the replica's own afterwards.
+    // [`choice_seed`]) and restores the replica's own afterwards. The stage
+    // record counts the tokens of every choice: the first one moves the
+    // request from prefill to decode.
     let state_for_generation = Arc::clone(&state);
-    let generation = crate::server::blocking::run_blocking_generation(lease, move |lease| {
+    let generation_phase = phase.clone();
+    let generation = run_blocking_generation(lease, move |lease| {
         let mut results: Vec<RawCompletion> = Vec::with_capacity(n);
         for i in 0..n {
+            // An abandoned request (its client gone, its deadline expired)
+            // runs no further choice: the token is cancelled, and nobody
+            // will read the answer.
+            if lease.is_cancelled() {
+                tracing::debug!(
+                    completed = i,
+                    requested = n,
+                    "extended completion abandoned; the remaining choices are not run"
+                );
+                break;
+            }
             lease.reset();
             let sampling = RequestSampling {
                 params: sampling_params.clone(),
@@ -706,7 +808,11 @@ pub async fn extended_chat_completions(
             };
             let outcome = sampling.run(lease, |engine| {
                 if want_logprobs {
+                    // The callback runs for the chosen token of every step
+                    // (and for its alternatives): the first call is the
+                    // first token.
                     let id_to_token = |id: u32| -> String {
+                        generation_phase.decode_started();
                         match state_for_generation.tokenizer() {
                             Some(tok) => tok.decode(&[id]).unwrap_or_else(|_| format!("<{id}>")),
                             None => format!("<{id}>"),
@@ -716,7 +822,8 @@ pub async fn extended_chat_completions(
                         .generate_with_logprobs(engine, max_tokens, top_logprobs_k, &id_to_token)
                         .map(|(toks, lp)| (toks, Some(lp)))
                 } else {
-                    prompt.generate(engine, max_tokens).map(|toks| (toks, None))
+                    phase::generate_observed(&prompt, engine, max_tokens, &generation_phase)
+                        .map(|toks| (toks, None))
                 }
             });
             match outcome {
@@ -745,6 +852,8 @@ pub async fn extended_chat_completions(
         Ok(results)
     })
     .await;
+    // Every choice (or the task's failure) is in hand: nothing is abandoned.
+    abandon.disarm();
 
     let raw_completions: Vec<RawCompletion> = match generation {
         Ok(Ok(results)) => results,

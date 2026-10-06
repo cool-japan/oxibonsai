@@ -1,7 +1,7 @@
 //! Parity check of the Pure-Rust Qwen3-4B text-encoder forward against golden
 //! MLX tensors.
 //!
-//! Loads the dequantised f32 weights (exported by `/tmp/bonsai_te_export_weights.py`)
+//! Loads the dequantised f32 weights (exported from the MLX 4-bit checkpoint)
 //! and the golden `input_ids`/`attention_mask`, runs the Rust encoder, and prints
 //! per-layer cosine + relative-L2 for `te_hidden_{0,1,9,18,27,35,36}`, the stacked
 //! `te_cond_7680`, and finally the end-to-end `cond.npy` target.
@@ -18,7 +18,7 @@
 //!
 //! ```text
 //! cargo run --release -p oxibonsai-image --example te_parity -- \
-//!     /tmp/bonsai_golden/te/weights /tmp/bonsai_golden/te
+//!     ${TMPDIR:-/tmp}/bonsai_golden/te/weights ${TMPDIR:-/tmp}/bonsai_golden/te
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -212,11 +212,11 @@ fn run() -> Result<bool, String> {
     let weights_dir = args
         .next()
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp/bonsai_golden/te/weights"));
+        .unwrap_or_else(|| std::env::temp_dir().join("bonsai_golden/te/weights"));
     let golden_dir = args
         .next()
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp/bonsai_golden/te"));
+        .unwrap_or_else(|| std::env::temp_dir().join("bonsai_golden/te"));
 
     if !weights_dir.is_dir() {
         return Err(format!("weights dir not found: {}", weights_dir.display()));

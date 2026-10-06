@@ -1,4 +1,4 @@
-//! VERIFIER-ADDED (KERN-PARALLEL review): adversarial cross-check of the
+//! Adversarial cross-check of the
 //! fused NEON K-quant GEMV kernels against an INDEPENDENT, from-scratch
 //! transliteration of ggml's dequant formulas (written from ggml-quants.c,
 //! not from `BlockQ*K::dequant` nor from the kernels under test).

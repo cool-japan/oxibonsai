@@ -308,7 +308,7 @@ kernel void gemv_q1_g128_v7_residual(
 /// - buffer(0) = blocks_raw (u8, gate+up weights in SoA layout)
 /// - buffer(1) = input4     (f32, read as float4*, normed hidden state)
 /// - buffer(2) = output     (f32, swiglu output `[inter_size]`)
-/// - buffer(3) = inter_size (u32, scalar — 14336 for Bonsai-8B)
+/// - buffer(3) = inter_size (u32, scalar — 12288 for Bonsai-8B)
 /// - buffer(4) = k          (u32, scalar — hidden_size = 4096)
 ///
 /// Dispatch: `[ceil(inter_size/8), 1, 1]` threadgroups, `[256, 1, 1]` threads

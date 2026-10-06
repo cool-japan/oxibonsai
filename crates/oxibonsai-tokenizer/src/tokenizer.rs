@@ -414,7 +414,7 @@ impl OxiTokenizer {
     /// skipped, matching HF's `tokenizer.decode(ids, skip_special_tokens=)`
     /// signature.
     ///
-    /// Added additively (wave-1.5 addendum) rather than as a parameter on
+    /// Added additively rather than as a parameter on
     /// [`Self::decode`] itself, since that method's signature is depended on
     /// by callers in other packages within the same wave.
     /// `skip_special_tokens = true` reproduces [`Self::decode`] exactly.

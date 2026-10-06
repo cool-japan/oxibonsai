@@ -78,8 +78,8 @@ pub(crate) fn cjk_aware_tokens(s: &str) -> TokenSeq {
 /// Unified Ideographs block and its extensions, plus CJK compatibility
 /// ideographs), extended to the Japanese kana blocks and Hangul so
 /// Japanese/Korean text is handled the same way. This crate cannot depend
-/// on `unicode-segmentation` (would require a `Cargo.toml` change outside
-/// this package's owned files), so the ranges are hand-coded against
+/// on `unicode-segmentation` (an extra dependency), so the ranges are
+/// hand-coded against
 /// `char`'s already-Unicode-aware `is_alphanumeric`/`is_whitespace` rather
 /// than a full UAX #29 segmenter.
 pub(crate) fn is_cjk_char(c: char) -> bool {

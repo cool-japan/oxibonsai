@@ -14,7 +14,7 @@ Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 
 ## Status
 
-**Stable** (v0.2.4) — 274 tests passing.
+**Stable** (v0.2.4) — 351 tests (`cargo nextest list -p oxibonsai-eval --all-features`).
 
 ## Features
 

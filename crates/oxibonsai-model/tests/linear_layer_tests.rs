@@ -1,4 +1,4 @@
-//! The dense `LinearLayer` arm (B2-11-FIX, gatekeeper REQUIRED #5):
+//! The dense `LinearLayer` arm:
 //! `LinearDense` holds a row-major `f32` matrix (widened losslessly from an
 //! `F32` / `F16` / `BF16` tensor) and projects through the kernel
 //! dispatcher's `f32` GEMV, so a dense projection shares the perf path of

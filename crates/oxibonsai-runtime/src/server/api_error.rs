@@ -41,6 +41,10 @@ pub const ERROR_TYPE_INVALID_REQUEST: &str = "invalid_request_error";
 pub const ERROR_TYPE_SERVER: &str = "server_error";
 /// OpenAI `type` value for an authentication failure.
 pub const ERROR_TYPE_AUTHENTICATION: &str = "authentication_error";
+/// `type` value of a load shed: the server is at a capacity limit and the
+/// request may be retried after the `Retry-After` delay (the admission
+/// layer's `503`, and a remote-image fetcher at capacity).
+pub const ERROR_TYPE_OVERLOADED: &str = "overloaded_error";
 
 /// The error payload. Boxed inside [`ApiError`] so that a
 /// `Result<T, ApiError>` stays cheap to move (clippy's `result_large_err`).
@@ -55,6 +59,8 @@ struct ApiErrorInner {
     /// numbers). Always rendered after the four canonical members.
     fields: Vec<(String, serde_json::Value)>,
     request_id: Option<RequestId>,
+    /// Seconds for the `Retry-After` header of a retryable error.
+    retry_after_secs: Option<u64>,
 }
 
 /// An HTTP error rendered as the canonical OpenAI error envelope.
@@ -83,6 +89,7 @@ impl ApiError {
             code: None,
             fields: Vec::new(),
             request_id: None,
+            retry_after_secs: None,
         }))
     }
 
@@ -141,6 +148,13 @@ impl ApiError {
         self
     }
 
+    /// Tell the client when to retry: a `Retry-After` header of `seconds`
+    /// (a load shed, [`ERROR_TYPE_OVERLOADED`]).
+    pub fn with_retry_after(mut self, seconds: u64) -> Self {
+        self.0.retry_after_secs = Some(seconds);
+        self
+    }
+
     /// The HTTP status this error renders with.
     pub fn status(&self) -> StatusCode {
         self.0.status
@@ -154,6 +168,16 @@ impl ApiError {
     /// The `type` member.
     pub fn error_type(&self) -> &str {
         &self.0.error_type
+    }
+
+    /// The `code` member, when one was attached.
+    pub fn code(&self) -> Option<&str> {
+        self.0.code.as_deref()
+    }
+
+    /// The `Retry-After` seconds, when the error is retryable.
+    pub fn retry_after(&self) -> Option<u64> {
+        self.0.retry_after_secs
     }
 
     /// Render the JSON body (without the status or headers).
@@ -251,10 +275,17 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let body = self.to_json();
         let status = self.0.status;
-        match self.0.request_id {
-            Some(id) => (status, request_id_header_map(id), axum::Json(body)).into_response(),
-            None => (status, axum::Json(body)).into_response(),
+        let mut headers = match self.0.request_id {
+            Some(id) => request_id_header_map(id),
+            None => axum::http::HeaderMap::new(),
+        };
+        if let Some(seconds) = self.0.retry_after_secs {
+            headers.insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from(seconds),
+            );
         }
+        (status, headers, axum::Json(body)).into_response()
     }
 }
 

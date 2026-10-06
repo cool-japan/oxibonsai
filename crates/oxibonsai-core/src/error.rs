@@ -140,7 +140,7 @@ pub enum BonsaiError {
 
     /// Block size validation failed for a named quantization format.
     ///
-    /// The parameterised replacement for [`BonsaiError::InvalidBlockSize`]
+    /// The parameterised replacement for `BonsaiError::InvalidBlockSize`
     /// (core-gguf-19): a mis-typed 34-byte/28-byte tensor now reports which
     /// format it was read as and how many bytes that format needs.
     #[error("invalid {format} block data: expected {expected} bytes, got {actual}")]

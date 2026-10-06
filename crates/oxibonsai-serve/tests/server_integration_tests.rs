@@ -403,11 +403,15 @@ async fn bearer_auth_rejects_malformed_header() {
 
 // ─── Admission control (concurrency limit + timeout) ──────────────────────
 //
-// Mirrors the `ServiceBuilder` admission stack assembled in `src/main.rs`
-// ("── 7b. Admission control") so these can be exercised without booting the
-// binary — the same pattern already used for `bearer_auth` above. Verifies
-// that `limits.max_concurrent_requests` / `limits.per_request_timeout_ms` are
-// enforced HTTP-level controls, not just validated-but-inert config fields.
+// A self-contained tower stack (load shed, a shared concurrency limit and a
+// timeout) built here, not the server's own admission layer: the binary's
+// router composition is private to the binary, so these tests exercise the
+// HTTP-level behaviour of a bounded-concurrency stack over real sockets (a
+// request over the limit is shed with `503`, a slow one is cut off with
+// `408`, and the limit is one budget shared across routes). The server's own
+// layer — which additionally answers the probe routes outside the budget — is
+// tested against the real router in `src/hardening/admission_tests.rs` and
+// `src/hardening/probe_admission_tests.rs`.
 
 /// Sleeps for `ms` (query param, default 200) then returns `200 OK`. Lets
 /// tests control exactly how long a request stays in flight.
@@ -417,7 +421,9 @@ async fn slow_handler(Query(params): Query<HashMap<String, String>>) -> StatusCo
     StatusCode::OK
 }
 
-/// Mirror of `main.rs`'s `handle_admission_error`.
+/// Turns this test stack's tower errors into the same two JSON responses the
+/// server's admission layer produces: `503` `overloaded_error` and `408`
+/// `timeout_error`.
 async fn handle_admission_error(err: BoxError) -> (StatusCode, Json<serde_json::Value>) {
     let (status, kind) = if err.is::<tower::load_shed::error::Overloaded>() {
         (StatusCode::SERVICE_UNAVAILABLE, "overloaded_error")
@@ -434,7 +440,7 @@ async fn handle_admission_error(err: BoxError) -> (StatusCode, Json<serde_json::
     )
 }
 
-/// Mirror of `main.rs`'s "── 7b. Admission control" `ServiceBuilder` stack.
+/// The bounded-concurrency `ServiceBuilder` stack these tests run against.
 ///
 /// Must use `GlobalConcurrencyLimitLayer` (pre-built `Arc<Semaphore>`), not
 /// `ServiceBuilder::concurrency_limit`/`tower::limit::ConcurrencyLimitLayer` —
@@ -646,7 +652,7 @@ async fn server_config_load_composes_across_layers() {
     assert_eq!(cfg.bind.port, 12345);
 }
 
-// ─── Model-backed /v1/embeddings on the serve path (HANDOVER-RT item 13) ──
+// ─── Model-backed /v1/embeddings on the serve path ──
 //
 // The binary's own router composition (`hardening::build_router`) is private
 // to the binary target, so these build the router exactly as `main.rs` hands

@@ -145,6 +145,17 @@ kernel void gemm_q1_g128_v7(
     }
 }
 
+"#;
+
+/// The prefill's tiled `simdgroup_matrix` Q1_0_g128 GEMM
+/// (`gemm_q1_g128_simdgroup`, M-18) in its own constant, so the build
+/// script's whitelist and the combined library name it on its own; resolved
+/// on demand through `MetalPipelines::pipeline_for`.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub const MSL_GEMM_Q1_G128_SIMDGROUP: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
 // ─────────────────────────────────────────────────────────────────────────
 // gemm_q1_g128_simdgroup — tiled simdgroup_matrix Q1_0_g128 GEMM (M-18)
 // ─────────────────────────────────────────────────────────────────────────
@@ -919,6 +930,17 @@ kernel void gemm_tq2_g128_v7(
     }
 }
 
+"#;
+
+/// The prefill's tiled `simdgroup_matrix` TQ2_0_g128 GEMM
+/// (`gemm_tq2_g128_simdgroup`) in its own constant (see
+/// [`MSL_GEMM_Q1_G128_SIMDGROUP`]); resolved on demand through
+/// `MetalPipelines::pipeline_for`.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub const MSL_GEMM_TQ2_G128_SIMDGROUP: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
 // ─────────────────────────────────────────────────────────────────────────
 // gemm_tq2_g128_simdgroup — the prefill's tiled TQ2_0_g128 GEMM
 // ─────────────────────────────────────────────────────────────────────────
@@ -1074,8 +1096,8 @@ kernel void gemm_tq2_g128_simdgroup(
 //
 // Both kernels live in their own Metal library, compiled lazily by
 // `metal_prefill::attention` — `metal_graph/pipelines.rs`'s combined library
-// and `build.rs`'s `ACTIVE_KERNELS` whitelist are outside this package's
-// ownership, and the separate-library form is the same one the optional bf16
+// and `build.rs`'s `ACTIVE_KERNELS` whitelist are deliberately left untouched:
+// the separate-library form is the same one the optional bf16
 // TE GEMM already uses (`try_compile_bf16_pipeline`).
 // ═══════════════════════════════════════════════════════════════════════════
 

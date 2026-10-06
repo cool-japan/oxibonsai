@@ -50,7 +50,11 @@ pub mod api_error;
 pub mod auth;
 pub(crate) mod blocking;
 pub mod budget;
+pub(crate) mod deadline;
+pub(crate) mod image_fetch;
+pub mod image_support;
 pub mod lifecycle;
+pub(crate) mod phase;
 pub(crate) mod response_pipeline;
 pub(crate) mod sampling_scope;
 pub mod sanitize;
@@ -58,7 +62,11 @@ pub(crate) mod sse;
 
 pub use api_error::{ApiError, OpenAiJson};
 pub use auth::{AdminAuth, AuthConfig};
-pub use budget::{validate_prompt_bytes, validate_request_budget, RequestLimits};
+pub use budget::{
+    validate_prompt_bytes, validate_request_budget, validate_request_budget_in_window,
+    RequestLimits,
+};
+pub use image_support::ImageSupport;
 pub use lifecycle::{
     create_server, install_shutdown_signals, serve_with_shutdown, serve_with_shutdown_deadline,
     shutdown_signal, QueueDepthTracker, ServerConfig, DEFAULT_DRAIN_DEADLINE,
@@ -149,14 +157,35 @@ fn unix_now_secs() -> u64 {
 /// Unix timestamp captured once when the router is built.
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelDescriptor {
-    /// Model identifier — the loaded model's name (from GGUF metadata / config).
+    /// The loaded model's own name as the engine reports it — the GGUF's
+    /// `general.name` (the architecture tag when the file has none). The
+    /// operator surface (`/admin/config`) reports it as it always has, so a
+    /// placeholder name such as `Hf` stays visible there.
     pub id: String,
+    /// The id the model is served under: what `GET /v1/models` lists and
+    /// every response's `model` member carries. The launcher's own choice
+    /// when it made one ([`RouterOptions::with_served_model_id`], derived by
+    /// [`crate::multi_model::served_model_id`]), else [`Self::id`].
+    pub served_id: String,
     /// Architecture tag (e.g. `"qwen3"`).
     pub architecture: String,
-    /// Maximum context length in tokens.
+    /// The context window this server can serve, in tokens:
+    /// `min(declared context, KV window)`. A prompt (plus its completion) past
+    /// it cannot be run by the engine, so it is what every budget check
+    /// compares against — never the model's declared context alone.
     pub max_context_length: usize,
+    /// The context length the model declares (`<arch>.context_length`).
+    /// Equal to [`Self::max_context_length`] unless the engine was built with
+    /// a smaller KV window.
+    pub declared_context_length: usize,
     /// Vocabulary size.
     pub vocab_size: usize,
+    /// Whether the engine can prefill image rows. Both chat endpoints read it
+    /// before they decode an image or run the vision tower, and refuse an
+    /// image request the engine cannot run with a typed error
+    /// ([`ImageSupport::refusal`]). Not part of the serialised descriptor.
+    #[serde(skip)]
+    pub image_support: ImageSupport,
     /// Unix timestamp (seconds) captured when the server router was built.
     pub created: u64,
 }
@@ -168,14 +197,17 @@ pub struct ModelDescriptor {
 pub struct ServedModelInfo {
     engines: Arc<EnginePool>,
     created: u64,
+    /// The launcher's chosen served id ([`RouterOptions::with_served_model_id`]).
+    served_id: Option<String>,
     cache: OnceLock<ModelDescriptor>,
 }
 
 impl ServedModelInfo {
-    fn new(engines: Arc<EnginePool>) -> Self {
+    fn new(engines: Arc<EnginePool>, served_id: Option<String>) -> Self {
         Self {
             engines,
             created: unix_now_secs(),
+            served_id,
             cache: OnceLock::new(),
         }
     }
@@ -194,11 +226,23 @@ impl ServedModelInfo {
             Ok(lease) => {
                 // Read through the engine, which answers for a
                 // dense and a hybrid (`qwen35`) model alike.
+                let declared = lease.context_length();
                 let descriptor = ModelDescriptor {
                     id: lease.model_name().to_string(),
+                    served_id: self
+                        .served_id
+                        .clone()
+                        .unwrap_or_else(|| lease.model_name().to_string()),
                     architecture: lease.architecture().to_string(),
-                    max_context_length: lease.context_length(),
+                    // The engine's KV window bounds every sequence it can run
+                    // (`PositionOutOfRange` past it), whatever context the
+                    // file declares: a hybrid engine is bound at the window
+                    // it was asked for, a Metal runner at the window its
+                    // memory budget left.
+                    max_context_length: declared.min(lease.max_context()),
+                    declared_context_length: declared,
                     vocab_size: lease.vocab_size(),
+                    image_support: ImageSupport::of_engine(&lease),
                     created: self.created,
                 };
                 drop(lease);
@@ -208,9 +252,15 @@ impl ServedModelInfo {
             }
             Err(_) => ModelDescriptor {
                 id: "unknown".to_string(),
+                served_id: "unknown".to_string(),
                 architecture: "unknown".to_string(),
                 max_context_length: 0,
+                declared_context_length: 0,
                 vocab_size: 0,
+                // Nothing to read it from: an image request is not refused
+                // on a guess (the pool failing to hand out an engine is
+                // answered where the engine is acquired).
+                image_support: ImageSupport::Supported,
                 created: self.created,
             },
         }
@@ -930,6 +980,10 @@ pub struct RouterOptions {
     /// default) makes a tokenizer-less server answer a text prompt with
     /// `400 tokenizer_required`.
     pub prompt_start_token: Option<u32>,
+    /// The id the served model is listed under — see
+    /// [`Self::with_served_model_id`]. `None` (the default) lists it under
+    /// the name the loaded model reports.
+    pub served_model_id: Option<String>,
 }
 
 impl Default for RouterOptions {
@@ -949,11 +1003,28 @@ impl Default for RouterOptions {
             embedder_unavailable: None,
             engine_report: None,
             prompt_start_token: None,
+            served_model_id: None,
         }
     }
 }
 
 impl RouterOptions {
+    /// List the served model under `id` instead of the name the loaded model
+    /// reports: `GET /v1/models` (and `/v1/models/{id}`) and the `model`
+    /// member of every chat and completion response carry it
+    /// ([`ModelDescriptor::served_id`]), while the model's own name stays
+    /// [`ModelDescriptor::id`], which is what `/admin/config` reports.
+    ///
+    /// A launcher that knows the model file derives `id` with
+    /// [`crate::multi_model::served_model_id`] — the GGUF's `general.name`
+    /// when it is a real name, else the file's stem — because the engine
+    /// itself never sees the file's path. A blank `id` is ignored.
+    pub fn with_served_model_id(mut self, id: impl Into<String>) -> Self {
+        let id = id.into();
+        self.served_model_id = (!id.trim().is_empty()).then_some(id);
+        self
+    }
+
     /// Attach the model-backed embedder that serves `/v1/embeddings`
     /// (`RT-08`). `None` keeps whatever [`Self::with_embeddings_registry`]
     /// configured, or the honest `501`.
@@ -1181,9 +1252,10 @@ pub fn create_router_full(
         embedder_unavailable,
         engine_report,
         prompt_start_token,
+        served_model_id,
     } = options;
 
-    let model_info = Arc::new(ServedModelInfo::new(Arc::clone(&engines)));
+    let model_info = Arc::new(ServedModelInfo::new(Arc::clone(&engines), served_model_id));
     let special_tokens = match &tokenizer {
         Some(tok) => SpecialTokenGuard::from_tokenizer(tok),
         None => SpecialTokenGuard::default(),
@@ -1358,8 +1430,23 @@ async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResp
 ///
 /// When a multi-model [`ModelRouter`] is attached, every registered endpoint is
 /// listed (OpenAI-compatible shape). Otherwise the single loaded model is
-/// reported, with its `id` read from the engine's real configuration and a real
-/// `created` timestamp — never a hard-coded literal.
+/// reported, with a real `created` timestamp — never a hard-coded literal —
+/// and its `max_context_length` the context window the server can actually
+/// serve (`min(declared context, KV window)`, see
+/// [`ModelDescriptor::max_context_length`]).
+///
+/// # The listed `id`
+///
+/// The rule is deterministic ([`crate::multi_model::served_model_id`]): the
+/// model file's `general.name` when it is at least 4 characters long and is
+/// not, case-insensitively, one of `hf`, `model`, `gguf` or `llama`;
+/// otherwise the model file's stem (`Ternary-Bonsai-2-27B-PQ2_0` for
+/// `Ternary-Bonsai-2-27B-PQ2_0.gguf` — the 27B GGUF's own name is `Hf`). The
+/// engine never sees the file's path, so the launcher derives the id and
+/// hands it over with [`RouterOptions::with_served_model_id`]; a router built
+/// without one lists the name the loaded model reports
+/// ([`ModelDescriptor::served_id`]). `/admin/config` keeps reporting the
+/// model's own name ([`ModelDescriptor::id`]), placeholder or not.
 async fn list_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     if let Some(router) = state.model_router() {
         let data: Vec<serde_json::Value> = router
@@ -1381,7 +1468,7 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
     Json(serde_json::json!({
         "object": "list",
         "data": [{
-            "id": descriptor.id,
+            "id": descriptor.served_id,
             "object": "model",
             "owned_by": "oxibonsai",
             "created": descriptor.created,
@@ -1424,9 +1511,9 @@ async fn get_model(
     }
 
     let descriptor = state.model_info().descriptor().await;
-    if descriptor.id == model_id {
+    if descriptor.served_id == model_id {
         Ok(Json(serde_json::json!({
-            "id": descriptor.id,
+            "id": descriptor.served_id,
             "object": "model",
             "owned_by": "oxibonsai",
             "created": descriptor.created,
@@ -1438,17 +1525,32 @@ async fn get_model(
 }
 
 /// `GET /readyz` (`SV-14`) — readiness probe, distinct from `/health`'s pure
-/// liveness check: reports whether this server can actually serve a
-/// request *right now* (a model is loaded **and** at least one engine-pool
-/// replica is currently idle), not merely that the process is up.
-/// `docs/DEPLOYMENT.md` already tells operators to point a Kubernetes
-/// readiness probe here; this is what makes that claim true rather than
-/// silently falling back to `/health`, which cannot express "overloaded."
+/// liveness check: reports whether this server can serve requests at all (a
+/// model is loaded and the engine pool can hand out replicas), not merely
+/// that the process is up.
+///
+/// A busy server is ready. With every replica leased, however many requests
+/// are queued behind them, the answer is still `200`: the server is working,
+/// and what it cannot take it sheds on the API routes with its own `503` +
+/// `Retry-After`. Answering `503` here instead would pull a merely saturated
+/// instance out of rotation, and would fail a single-instance readiness
+/// probe for the length of every generation. `engine_slot_available` reports
+/// whether a replica is idle at this instant, for a balancer that wants
+/// least-loaded routing; it is information and takes no part in the verdict.
+/// `503 not_ready` is for a server that cannot serve at all: no model, so no
+/// engine to hand out.
+///
+/// `docs/DEPLOYMENT.md` tells operators to point a Kubernetes readiness probe
+/// here. The first call resolves the model descriptor by leasing a replica
+/// ([`ServedModelInfo::descriptor`]), so a server binary resolves it at
+/// start-up, while every replica is idle, to keep the probe from waiting for
+/// one.
 async fn readyz(State(state): State<Arc<AppState>>) -> Response {
     let descriptor = state.model_info().descriptor().await;
     let model_loaded = descriptor.id != "unknown";
     let engine_slot_available = state.engines().idle_count() > 0;
-    let ready = model_loaded && engine_slot_available;
+    // Only the model decides: a busy pool is still a server that can serve.
+    let ready = model_loaded;
     let body = serde_json::json!({
         "status": if ready { "ready" } else { "not_ready" },
         "model_loaded": model_loaded,

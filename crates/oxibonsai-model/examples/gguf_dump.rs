@@ -49,7 +49,7 @@ fn run() -> Result<(), String> {
         // carries sentinel variants (`Q2_0G64`, `Q2_0G128DFirst`) whose raw
         // discriminants are NOT the on-disk ggml id, so casting would print
         // `1073741866` instead of `42` for a legacy PrismML file
-        // (core-gguf-12 / B2-01).
+        // (core-gguf-12).
         let tid = info.tensor_type.wire_id();
         println!(
             "{:<40} type={} ({:<12}) shape={:?} bytes={}",

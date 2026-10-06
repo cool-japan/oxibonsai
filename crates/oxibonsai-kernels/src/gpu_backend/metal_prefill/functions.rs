@@ -53,8 +53,8 @@ use super::types::{LayerConfig, LayerWeightRefs, PrefillBuffers};
 /// down, GPU time) the tiled kernel already wins at 8 rows — 8.67 ms against
 /// 13.80 ms for `v7` on the Ternary-Bonsai-8B geometry, 2.90 ms against
 /// 5.90 ms on the 1.7B one — and the gap widens with the batch (at 64 rows:
-/// 9.36 against 161.2 ms, 2.66 against 38.96 ms). Batches below 8 rows —
-/// speculative verify's 4-token batch — stay on `v7`.
+/// 9.36 against 161.2 ms, 2.66 against 38.96 ms). Batches below 8 rows (a
+/// verify at the default draft length 4 is `1 + 4` = 5 rows) stay on `v7`.
 const PREFILL_TQ2_TILED_MIN_BATCH: usize = 8;
 
 /// Smallest prefill batch routed through the tiled simdgroup Q1 GEMM
@@ -67,8 +67,8 @@ const PREFILL_TQ2_TILED_MIN_BATCH: usize = 8;
 /// batch (84 ms/token at 256 rows, 271 at 4096) — the super-linear prefill
 /// M-18 measured. The tiled kernel's cost is flat below one 64-column tile and
 /// already wins at 8 rows (9.5 against 18.3 ms per layer on the same
-/// geometry); batches below 8 rows — speculative verify's 4-token batch —
-/// stay on the row-wise kernel.
+/// geometry); batches below 8 rows (a verify at the default draft length 4
+/// is `1 + 4` = 5 rows) stay on the row-wise kernel.
 pub(crate) const PREFILL_Q1_TILED_MIN_BATCH: usize = 8;
 
 /// Rows per command buffer of a logits / verify prefill.
@@ -1540,8 +1540,8 @@ impl MetalGraph {
     /// the swap is argument-for-argument. Below
     /// [`PREFILL_TQ2_TILED_MIN_BATCH`] columns `v7` runs instead, which keeps
     /// the two small-batch callers on `v7` by construction: single-token
-    /// decode (a GEMV, not this path at all) and speculative verify
-    /// (batch = 4). The choice is made once per request
+    /// decode (a GEMV, not this path at all) and a speculative verify at the
+    /// default draft length (batch `1 + 4` = 5). The choice is made once per request
     /// ([`Self::choose_prefill_gemm`]), so every micro-batch of a request runs
     /// the same kernel.
     ///

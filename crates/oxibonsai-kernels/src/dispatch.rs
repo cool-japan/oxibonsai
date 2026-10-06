@@ -84,6 +84,12 @@ impl KernelDispatcher {
     /// [`Self::try_with_tier`]`(KernelTier::Gpu)` instead of this method
     /// when a missing GPU should be a hard error.
     ///
+    /// Every call logs the selection as a `selected kernel tier` event with
+    /// `tier` and `reason` fields: at `INFO` the first time the process
+    /// selects that `(tier, reason)` pair, at `DEBUG` on every repeat (see
+    /// [`crate::dispatch_log`]), so a pool of engines does not print the same
+    /// line once per replica.
+    ///
     /// Under an active
     /// [`CpuOnlyBackendScope`](crate::gpu_backend::CpuOnlyBackendScope) (the
     /// engine's explicit `Backend::Cpu`) the GPU is neither probed nor
@@ -95,13 +101,14 @@ impl KernelDispatcher {
         if crate::gpu_backend::cpu_only_backend_active() {
             let caps = scirs2_core::simd::detect::get_cpu_features();
             let tier = Self::select_tier(caps);
-            tracing::info!(tier = %tier, "selected kernel tier (CPU requested explicitly)");
-            return Self {
+            let dispatcher = Self {
                 tier,
                 #[cfg(feature = "gpu")]
                 gpu_backend: None,
                 tier_reason: TierReason::CpuRequestedByScope,
             };
+            dispatcher.log_selection();
+            return dispatcher;
         }
 
         // Try GPU first when the feature is compiled in.
@@ -112,31 +119,33 @@ impl KernelDispatcher {
             let backend = crate::gpu_backend::select_backend();
             if backend.is_accelerated() {
                 let name = backend.name();
-                tracing::info!(backend = name, "GPU backend available");
-                return Self {
+                let dispatcher = Self {
                     tier: KernelTier::Gpu,
                     tier_reason: TierReason::GpuBackend(name),
                     gpu_backend: Some(Arc::from(backend)),
                 };
+                dispatcher.log_selection();
+                return dispatcher;
             }
             Self::warn_gpu_unavailable_once(backend.name());
         }
 
         let caps = scirs2_core::simd::detect::get_cpu_features();
         let tier = Self::select_tier(caps);
-        tracing::info!(tier = %tier, "selected kernel tier");
 
         #[cfg(feature = "gpu")]
         let tier_reason = TierReason::CpuAutoDetectGpuUnavailable;
         #[cfg(not(feature = "gpu"))]
         let tier_reason = TierReason::CpuAutoDetectNoGpuFeature;
 
-        Self {
+        let dispatcher = Self {
             tier,
             #[cfg(feature = "gpu")]
             gpu_backend: None,
             tier_reason,
-        }
+        };
+        dispatcher.log_selection();
+        dispatcher
     }
 
     /// Create a dispatcher with a specific tier (for testing/benchmarks).

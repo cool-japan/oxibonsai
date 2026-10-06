@@ -10,6 +10,7 @@
 
 use metal::{Buffer, ComputeCommandEncoderRef, MTLSize};
 
+use super::rows::RopeBinding;
 use super::{
     encode_gemv, rotation_scale, set_f32, set_u32, set_u64, LayerKind, Qwen35GpuModel, GDN_THREADS,
     NORM_THREADS, SCORES_BATCH_STRIDE,
@@ -132,12 +133,15 @@ impl Qwen35GpuModel<'_> {
         }
     }
 
+    /// Encode every stage of `layer` for `t_len` rows stored at KV
+    /// positions `start_pos..`, rotating them from `rope`.
     pub(super) fn encode_layer(
         &self,
         enc: &ComputeCommandEncoderRef,
         layer: usize,
         t_len: usize,
         start_pos: usize,
+        rope: RopeBinding,
     ) -> Result<(), MetalGraphError> {
         if layer >= self.layers.len() {
             return Err(encoding_failed(format!(
@@ -146,7 +150,7 @@ impl Qwen35GpuModel<'_> {
             )));
         }
         for &stage in self.layer_stages(layer) {
-            self.encode_stage(enc, layer, stage, t_len, start_pos)?;
+            self.encode_stage(enc, layer, stage, t_len, start_pos, rope)?;
         }
         Ok(())
     }
@@ -230,6 +234,9 @@ impl Qwen35GpuModel<'_> {
         Ok(())
     }
 
+    /// Encode one stage of `layer`: `start_pos` is the KV position of the
+    /// first row (the KV store and the causal window), `rope` the angle rows
+    /// the partial RoPE reads (see `qwen35_rows`).
     pub(super) fn encode_stage(
         &self,
         enc: &ComputeCommandEncoderRef,
@@ -237,6 +244,7 @@ impl Qwen35GpuModel<'_> {
         stage: Stage,
         t_len: usize,
         start_pos: usize,
+        rope: RopeBinding,
     ) -> Result<(), MetalGraphError> {
         let kind = self
             .layers
@@ -263,10 +271,10 @@ impl Qwen35GpuModel<'_> {
             }
             (LayerKind::LinearAttention(l), Stage::LinearProj) => {
                 let x = self.folded_input();
-                encode_gemv(enc, &l.attn_qkv, (x, 0), (&s.qkv, 0), t_len, false);
-                encode_gemv(enc, &l.attn_gate, (x, 0), (&s.z, 0), t_len, false);
+                self.encode_matmul(enc, &l.attn_qkv, (x, 0), (&s.qkv, 0), t_len, false);
+                self.encode_matmul(enc, &l.attn_gate, (x, 0), (&s.z, 0), t_len, false);
                 // `ssm_alpha` / `ssm_beta` are not folded: the un-rotated input.
-                encode_gemv(
+                self.encode_matmul(
                     enc,
                     &l.ssm_alpha_beta,
                     (&s.normed, 0),
@@ -340,17 +348,21 @@ impl Qwen35GpuModel<'_> {
                 );
             }
             (LayerKind::LinearAttention(l), Stage::SsmOut) => {
-                encode_gemv(enc, &l.ssm_out, (&s.gdn_rot, 0), (&s.resid, 0), t_len, true);
+                self.encode_matmul(enc, &l.ssm_out, (&s.gdn_rot, 0), (&s.resid, 0), t_len, true);
             }
             (LayerKind::FullAttention(l), Stage::FullProj) => {
                 let x = self.folded_input();
-                encode_gemv(enc, &l.attn_q, (x, 0), (&s.q_all, 0), t_len, false);
-                encode_gemv(enc, &l.attn_k, (x, 0), (&s.k, 0), t_len, false);
-                encode_gemv(enc, &l.attn_v, (x, 0), (&s.v, 0), t_len, false);
+                self.encode_matmul(enc, &l.attn_q, (x, 0), (&s.q_all, 0), t_len, false);
+                self.encode_matmul(enc, &l.attn_k, (x, 0), (&s.k, 0), t_len, false);
+                self.encode_matmul(enc, &l.attn_v, (x, 0), (&s.v, 0), t_len, false);
             }
             (LayerKind::FullAttention(l), Stage::QkNormRope) => {
-                let half = (c.n_rot / 2) as u64;
-                let rope_off = start_pos as u64 * half * 4;
+                let (rope_cos, rope_sin, rope_off) = match rope {
+                    RopeBinding::Table { byte_offset } => {
+                        (&self.rope_cos, &self.rope_sin, byte_offset)
+                    }
+                    RopeBinding::Scratch => (&s.rope_cos, &s.rope_sin, 0),
+                };
                 enc.set_compute_pipeline_state(&self.pipes.qk_norm_rope);
                 enc.set_buffer(0, Some(&s.q_all), 0);
                 enc.set_buffer(1, Some(&s.k), 0);
@@ -358,8 +370,8 @@ impl Qwen35GpuModel<'_> {
                 enc.set_buffer(3, Some(&s.k_rope), 0);
                 enc.set_buffer(4, Some(&l.attn_q_norm), 0);
                 enc.set_buffer(5, Some(&l.attn_k_norm), 0);
-                enc.set_buffer(6, Some(&self.rope_cos), rope_off);
-                enc.set_buffer(7, Some(&self.rope_sin), rope_off);
+                enc.set_buffer(6, Some(rope_cos), rope_off);
+                enc.set_buffer(7, Some(rope_sin), rope_off);
                 set_u32(enc, 8, c.n_heads as u32);
                 set_u32(enc, 9, c.n_kv_heads as u32);
                 set_u32(enc, 10, c.head_dim as u32);
@@ -395,7 +407,7 @@ impl Qwen35GpuModel<'_> {
                 );
             }
             (LayerKind::FullAttention(l), Stage::AttnOut) => {
-                encode_gemv(
+                self.encode_matmul(
                     enc,
                     &l.attn_output,
                     (&s.attn_rot, 0),
@@ -406,8 +418,8 @@ impl Qwen35GpuModel<'_> {
             }
             (_, Stage::FfnGateUp) => {
                 let x = self.folded_input();
-                encode_gemv(enc, &ffn.gate, (x, 0), (&s.ffn_gate, 0), t_len, false);
-                encode_gemv(enc, &ffn.up, (x, 0), (&s.ffn_up, 0), t_len, false);
+                self.encode_matmul(enc, &ffn.gate, (x, 0), (&s.ffn_gate, 0), t_len, false);
+                self.encode_matmul(enc, &ffn.up, (x, 0), (&s.ffn_up, 0), t_len, false);
             }
             (_, Stage::FfnAct) => {
                 let span = c.span();
@@ -427,7 +439,7 @@ impl Qwen35GpuModel<'_> {
                 );
             }
             (_, Stage::FfnDown) => {
-                encode_gemv(enc, &ffn.down, (&s.ffn_act, 0), (&s.resid, 0), t_len, true);
+                self.encode_matmul(enc, &ffn.down, (&s.ffn_act, 0), (&s.resid, 0), t_len, true);
             }
             // [`Self::layer_stages`] never pairs a stage with the other
             // layer kind; a caller that does is refused, not skipped.

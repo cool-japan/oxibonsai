@@ -595,12 +595,12 @@ mod tokenizer_tests {
     }
 }
 
-// MINOR fix (verifier wave 3, T-09): `test_rag_pipeline_skipped_no_feature`
+// MINOR fix (T-09): `test_rag_pipeline_skipped_no_feature`
 // and `test_tokenizer_skipped_no_feature` used to live here as `#[cfg(not(
 // feature = "..."))]`-gated placeholders that asserted nothing (just an
 // `eprintln!`) — a placebo pass under a non-default build, not evidence of
 // anything. Deleted rather than given a fabricated assertion: this file has
 // no unconditional code that depends on the `rag`/`native-tokenizer`
 // features being off, so the test binary compiles and runs cleanly without
-// them regardless of which features are enabled (this package's own
+// them regardless of which features are enabled (both the
 // `--all-features` and default-feature gate runs both confirm it).

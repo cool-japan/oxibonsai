@@ -37,15 +37,44 @@
 # validation"). Without `--release`, a clean tier-2 or tier-3 result exits 0
 # so local iteration on a GPU-less dev machine is not blocked.
 #
+# `--accept-approximate` is the one explicit, named opt-out of that rule, for a
+# release host that has no CUDA toolkit (every macOS host; the CUDA backend is
+# feature-gated off by default and is documented as not validated on hardware).
+# It only matters together with `--release`, and it only ever accepts ONE
+# situation: tier 1 is unavailable, tier 2 ran on EVERY extracted kernel source
+# and ALL of them parsed clean. Then the run prints a loud banner naming what
+# was and was not checked and exits 0 (CUDA_SYNTAX_RESULT=approximate-accepted).
+# It never accepts a syntax error (exit 1, with or without the flag), never
+# accepts a run in which no checker ran (exit 2: nothing was checked), and never
+# lets a failing nvcc fall back to the approximate tier. Without `--release` it
+# is accepted and changes nothing.
+#
 # Usage:
-#   ./scripts/check_cuda.sh              # dev mode: approximate/skip is OK
-#   ./scripts/check_cuda.sh --release    # release mode: only a real nvcc pass is a PASS
+#   ./scripts/check_cuda.sh                                # dev mode: approximate/skip is OK
+#   ./scripts/check_cuda.sh --release                      # release mode: only a real nvcc pass is a PASS
+#   ./scripts/check_cuda.sh --release --accept-approximate # release mode, no nvcc: a clean approximate
+#                                                          # run is accepted, loudly (see above)
 #
 # Exit codes:
 #   0  PASS       — a real (tier 1) check ran clean, OR (non-release mode
-#                   only) tier 2 ran clean / tier 3 skipped
+#                   only) tier 2 ran clean / tier 3 skipped, OR (--release
+#                   --accept-approximate only) tier 2 ran clean on every kernel
+#                   source
 #   1  FAIL       — a syntax error was found (by whichever tier ran)
-#   2  INCOMPLETE — no authoritative tier ran and --release was given
+#   2  INCOMPLETE — no authoritative tier ran and --release was given (and,
+#                   for tier 2, --accept-approximate was not)
+#
+# Machine-readable verdict: every run that reaches a verdict ends its stdout
+# with exactly one line `CUDA_SYNTAX_RESULT=<value>` (scripts/ci.sh reads it to
+# label the stage; never infer the tier from the exit code alone):
+#   nvcc-ok               a real nvcc pass (tier 1)
+#   approximate-accepted  --release --accept-approximate, tier 2 clean (the waiver)
+#   approximate-ok        dev mode, tier 2 clean
+#   skipped               dev mode, no tool ran
+#   incomplete            --release, nothing authoritative ran (exit 2)
+#   failed                a syntax error (exit 1)
+#
+# Tool selection is by PATH: nvcc for tier 1, then clang++, then g++ for tier 2.
 #
 # Copyright 2026 COOLJAPAN OU (Team KitaSan)
 # SPDX-License-Identifier: Apache-2.0
@@ -57,12 +86,18 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT" || exit 2
 
 RELEASE_MODE=0
+ACCEPT_APPROXIMATE=0
 for arg in "$@"; do
     case "$arg" in
         --release) RELEASE_MODE=1 ;;
+        --accept-approximate) ACCEPT_APPROXIMATE=1 ;;
         --help|-h)
-            echo "Usage: $0 [--release]"
-            echo "  --release   only a real nvcc pass counts as complete (approx/skip -> exit 2)"
+            echo "Usage: $0 [--release] [--accept-approximate]"
+            echo "  --release             only a real nvcc pass counts as complete (approx/skip -> exit 2)"
+            echo "  --accept-approximate  with --release and no nvcc: accept a CLEAN approximate (clang++/g++)"
+            echo "                        run as the verdict, loudly (CUDA_SYNTAX_RESULT=approximate-accepted)."
+            echo "                        Never accepts an error or a run in which no checker ran;"
+            echo "                        accepted and ignored without --release."
             exit 0
             ;;
         *)
@@ -75,6 +110,7 @@ done
 SRC_DIR="crates/oxibonsai-kernels/src/gpu_backend"
 if [[ ! -d "$SRC_DIR" ]]; then
     echo "ERROR: $SRC_DIR not found (run from the repo root)." >&2
+    echo "CUDA_SYNTAX_RESULT=incomplete"
     exit 2
 fi
 
@@ -245,6 +281,7 @@ PYEOF
 then
     cat "$EXTRACT_LOG" >&2
     echo "ERROR: CUDA kernel-source extraction failed (see above)." >&2
+    echo "CUDA_SYNTAX_RESULT=incomplete"
     exit 2
 fi
 cat "$EXTRACT_LOG"
@@ -253,6 +290,7 @@ CU_FILES=("$WORK_DIR"/*.cu)
 if [[ ! -e "${CU_FILES[0]}" ]]; then
     echo "ERROR: no CUDA_* constants extracted from $SRC_DIR — check the extraction regex" \
          "against the current source layout." >&2
+    echo "CUDA_SYNTAX_RESULT=incomplete"
     exit 2
 fi
 echo "  ${#CU_FILES[@]} kernel-source file(s) extracted to a scratch dir."
@@ -260,6 +298,7 @@ echo ""
 
 # ── 2. Pick a checker tier ───────────────────────────────────────────────
 FAIL=0
+APPROX_OK=0   # kernel sources the approximate tier parsed clean (the waiver counts these)
 declare -a FAILED_FILES=()
 
 if command -v nvcc >/dev/null 2>&1; then
@@ -290,6 +329,7 @@ elif command -v clang++ >/dev/null 2>&1 || command -v g++ >/dev/null 2>&1; then
         base="$(basename "$f")"
         if "$CXX" -x c++ -std=c++14 -fsyntax-only -Wall -I "$WORK_DIR" "$f" >"$WORK_DIR/${base}.log" 2>&1; then
             echo "  approx-OK    $base"
+            APPROX_OK=$((APPROX_OK + 1))
         else
             FAIL=1
             FAILED_FILES+=("$base")
@@ -310,34 +350,64 @@ echo "════════════════════════�
 if [[ "$FAIL" -ne 0 ]]; then
     echo "FAIL: ${#FAILED_FILES[@]} kernel-source file(s) failed the $TIER syntax check:"
     printf '  - %s\n' "${FAILED_FILES[@]}"
+    echo "CUDA_SYNTAX_RESULT=failed"
     exit 1
 fi
 
 case "$TIER" in
     real)
         echo "PASS: all ${#CU_FILES[@]} kernel-source file(s) passed a real nvcc --cuda syntax check."
+        if [[ "$RELEASE_MODE" -eq 1 && "$ACCEPT_APPROXIMATE" -eq 1 ]]; then
+            echo "NOTE: --accept-approximate was given, but a real nvcc check ran: the waiver was"
+            echo "not needed and is not used."
+        fi
+        echo "CUDA_SYNTAX_RESULT=nvcc-ok"
         exit 0
         ;;
     approx)
         if [[ "$RELEASE_MODE" -eq 1 ]]; then
+            # The waiver accepts exactly one situation: the approximate tier parsed
+            # EVERY extracted kernel source clean (a failure was already exit 1 above;
+            # the count below is the same guarantee, stated as a number).
+            if [[ "$ACCEPT_APPROXIMATE" -eq 1 && "$APPROX_OK" -eq "${#CU_FILES[@]}" ]]; then
+                echo "APPROXIMATE, ACCEPTED BY FLAG: $APPROX_OK kernel sources parsed as C++ with CUDA builtins stubbed; this is NOT an nvcc validation; the CUDA backend is not certified by this run"
+                echo "  --release --accept-approximate was given and no nvcc was available, so a clean"
+                echo "  approximate ($CXX -fsyntax-only) run stands in for the authoritative check."
+                echo "  CHECKED:     each of the $APPROX_OK CUDA_* kernel sources is valid C++ once the CUDA-only"
+                echo "               builtins are stubbed out."
+                echo "  NOT CHECKED: CUDA semantics (address spaces, launch bounds, the real signatures of"
+                echo "               warp/atomic intrinsics), inline PTX asm (stripped, not parsed), the"
+                echo "               host-side launch code, and any execution on a CUDA device."
+                echo "  State in the release notes that the CUDA backend's kernels were syntax-checked"
+                echo "  approximately and are not hardware-validated."
+                echo "CUDA_SYNTAX_RESULT=approximate-accepted"
+                exit 0
+            fi
             echo "INCOMPLETE (--release): only the approximate clang++/g++ check ran clean;"
             echo "no real CUDA toolchain (nvcc) was available. A release gate requires the"
             echo "authoritative check. Run this on a host with the CUDA toolkit installed."
+            echo "CUDA_SYNTAX_RESULT=incomplete"
             exit 2
         fi
         echo "PASS (approximate): all ${#CU_FILES[@]} kernel-source file(s) parsed as valid C++"
         echo "once CUDA builtins were stubbed. This is NOT a substitute for a real nvcc pass."
+        echo "CUDA_SYNTAX_RESULT=approximate-ok"
         exit 0
         ;;
     skipped)
         if [[ "$RELEASE_MODE" -eq 1 ]]; then
             echo "INCOMPLETE (--release): no CUDA toolchain and no C++ compiler were found;"
             echo "${#CU_FILES[@]} kernel-source constant(s) were not checked at all."
+            if [[ "$ACCEPT_APPROXIMATE" -eq 1 ]]; then
+                echo "(--accept-approximate cannot waive this: nothing ran.)"
+            fi
+            echo "CUDA_SYNTAX_RESULT=incomplete"
             exit 2
         fi
         echo "SKIPPED: no CUDA toolchain and no C++ compiler were found;"
         echo "${#CU_FILES[@]} kernel-source constant(s) were not checked at all."
         echo "(non-release mode: not treated as a failure, but genuinely incomplete)"
+        echo "CUDA_SYNTAX_RESULT=skipped"
         exit 0
         ;;
 esac

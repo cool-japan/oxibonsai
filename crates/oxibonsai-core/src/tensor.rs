@@ -497,8 +497,8 @@ mod tests {
     #[test]
     fn legacy_and_new_block_size_errors_agree_on_the_expected_count() {
         // Both the zero-copy and copied paths must report the same
-        // `expected`/`format` for the same malformed input (wave-1
-        // addendum #1: migrated off the legacy `BonsaiError::InvalidBlockSize`).
+        // `expected`/`format` for the same malformed input (migrated off the
+        // legacy `BonsaiError::InvalidBlockSize`).
         let short = [0u8; 5];
         for result in [
             BlockQ1_0G128::from_bytes(&short).map(|_| ()),

@@ -31,31 +31,101 @@ fn fixture_report() -> HybridReport {
     hybrid_report(&gguf).expect("hybrid report")
 }
 
+/// Recurrent state of one 27B sequence (either executor).
+const RECURRENT_27B: u64 = 156_893_184;
+/// The runner's activation scratch per token of a call for the 27B geometry
+/// (`Qwen35GpuModel`'s rows prefill included).
+const SCRATCH_FLOATS_27B: u64 = 140_448;
+/// The runner's tokens per call at the model's default prefill chunk.
+const CALL_TOKENS_27B: u64 = 512;
+/// The runner's bytes per KV position for the 27B: the `f16` K and V of the
+/// 16 full-attention slots, the 64 rope angles and one 24-head score row.
+const PER_POSITION_27B: u64 = 65_888;
+/// The runner's device ceiling for the 27B `PQ2_0` band on the documented
+/// M3 (`Qwen35GpuModel::max_context`).
+const DEVICE_CEILING_27B: usize = 178_032;
+
 /// A Metal plan for the 27B on the documented 24 GiB M3 at `requested`.
 fn metal_plan_27b(requested: usize) -> HybridBackendPlan {
-    let recurrent = 156_893_184u64;
     let window = plan_hybrid_metal_window(&HybridWindowInputs {
         requested,
         declared: 262_144,
         total_ram_bytes: Some(25_769_803_776),
         file_bytes: 7_206_168_928,
-        cpu_recurrent_bytes: recurrent,
+        cpu_recurrent_bytes: RECURRENT_27B,
         cpu_kv_bytes_per_position: 65_536,
         cpu_other_bytes_per_position: 256,
         runner_fixed_bytes: 48 * 2 * 48 * 5120 * 4
-            + recurrent
+            + RECURRENT_27B
             + 248_320 * 4
-            + 140_384 * 4 * 512
-            + 512 * 5120 * 4,
-        runner_bytes_per_position: 65_888,
+            + SCRATCH_FLOATS_27B * 4 * CALL_TOKENS_27B
+            + CALL_TOKENS_27B * 5120 * 4,
+        runner_bytes_per_position: PER_POSITION_27B,
         runner_kv_bytes_per_position: 65_536,
-        device_ceiling: 178_034,
+        device_ceiling: DEVICE_CEILING_27B,
         residents: HybridResidents::CpuModelAndRunner,
     });
     HybridBackendPlan::Metal {
         window,
         mapped: true,
+        call_tokens: CALL_TOKENS_27B as usize,
     }
+}
+
+/// The 27B constants above are the runner's own figures: on a Metal build
+/// the kernels' footprint function (`qwen35_footprint`, the one place the
+/// runner's resident arithmetic lives) and its capacity bound
+/// (`qwen35_context_capacity`, under the documented M3's device limits)
+/// reproduce them, so the report test cannot drift from the runner it
+/// describes.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+fn the_27b_constants_are_the_runners_own_footprint() {
+    use oxibonsai_kernels::gpu_backend::metal_full_layer::qwen35::{
+        qwen35_context_capacity, qwen35_footprint, Qwen35GpuConfig,
+    };
+    const M3_MAX_BUFFER_LENGTH: u64 = 14_302_248_960;
+    const M3_RECOMMENDED_WORKING_SET: u64 = 19_069_665_280;
+    /// Every matrix, the LM head and the widened ssm gates of the `PQ2_0` band.
+    const PQ2_0_WEIGHTS: u64 = 6_893_936_640;
+    let cfg = Qwen35GpuConfig {
+        hidden: 5120,
+        intermediate: 17408,
+        n_heads: 24,
+        n_kv_heads: 4,
+        head_dim: 256,
+        n_rot: 64,
+        n_k_heads: 16,
+        n_v_heads: 48,
+        head_k_dim: 128,
+        head_v_dim: 128,
+        conv_kernel: 4,
+        rms_eps: 1e-6,
+        hadamard_block: Some(1024),
+        vocab: 248_320,
+        max_seq_len: 8192,
+        max_batch: CALL_TOKENS_27B as usize,
+    };
+    let footprint = qwen35_footprint(&cfg, 16, 48);
+    assert_eq!(footprint.recurrent_bytes, RECURRENT_27B);
+    assert_eq!(
+        footprint.fixed_bytes,
+        RECURRENT_27B + 248_320 * 4 + SCRATCH_FLOATS_27B * 4 * CALL_TOKENS_27B,
+        "the recurrent state, the logits row and the scratch at {CALL_TOKENS_27B} tokens"
+    );
+    assert_eq!(footprint.per_position_bytes, PER_POSITION_27B);
+    assert_eq!(footprint.kv_bytes_per_position, 65_536);
+    assert_eq!(
+        qwen35_context_capacity(
+            &cfg,
+            16,
+            48,
+            PQ2_0_WEIGHTS,
+            M3_MAX_BUFFER_LENGTH,
+            M3_RECOMMENDED_WORKING_SET,
+        ),
+        DEVICE_CEILING_27B
+    );
 }
 
 fn kernel_tier_lines(lines: &[String]) -> Vec<&String> {
@@ -120,13 +190,13 @@ fn the_27b_metal_report_prints_every_limit_and_the_up_front_bytes() {
     let (tier, reason) = hybrid_auto_tier(&report);
     assert_eq!(tier, "gpu");
     assert!(reason.contains("KV window 8192 positions"), "{reason}");
-    assert!(reason.contains("device ceiling 178034"), "{reason}");
+    assert!(reason.contains("device ceiling 178032"), "{reason}");
     let text = report.lines(7_206_168_928).join("\n");
     for needle in [
         "KV window 8192 positions",
         "RAM budget for the residents kept 83968",
         "a runner alone would fit 171008",
-        "Metal device ceiling 178034",
+        "Metal device ceiling 178032",
         "RAM guard (CPU model alone) 178176",
         "65536 bytes/position: 0.50 GiB for the 8192-position window",
     ] {

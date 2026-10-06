@@ -533,7 +533,7 @@ impl<'a> LinearFP8E5M2<'a> {
 }
 
 /// A linear layer with `PQ2_0` (PrismML Bonsai 2 ternary, ggml id 142)
-/// weights (B2-09; design §3.4).
+/// weights (design §3.4).
 ///
 /// Computes `output = weights @ input` using the `PQ2_0` GEMV/GEMM kernels.
 /// **Not** the Hadamard rotation hook: per design §3.4, that lives in the
@@ -654,7 +654,7 @@ impl<'a> LinearPQ2_0<'a> {
 }
 
 /// A linear layer with `PTQ1_0` (PrismML Bonsai 2 1.75-bit, ggml id 143)
-/// weights (B2-09; design §3.4). See [`LinearPQ2_0`] for the Hadamard-hook
+/// weights (design §3.4). See [`LinearPQ2_0`] for the Hadamard-hook
 /// placement note (unchanged here).
 #[derive(Debug)]
 pub struct LinearPTQ1_0<'a> {
@@ -760,7 +760,7 @@ impl<'a> LinearPTQ1_0<'a> {
 /// A linear layer with mainline group-64 `Q2_0` (ggml id 42, disambiguated
 /// from the legacy group-128 `TQ2_0_g128`/`PQ2_0` readings by
 /// [`oxibonsai_core::gguf::quant_resolve::resolve_type_42`]) weights
-/// (B2-09; design §3.4). See [`LinearPQ2_0`] for the Hadamard-hook placement
+/// (design §3.4). See [`LinearPQ2_0`] for the Hadamard-hook placement
 /// note (unchanged here — the `Ternary-Bonsai-2-27B-Q2_0-prism-fork-required`
 /// file folds this format under `prism.hadamard.*` too).
 #[derive(Debug)]
@@ -893,14 +893,13 @@ pub enum LinearLayer<'a> {
     Q4K(LinearQ4K<'a>),
     /// 8-bit K-quant (Q8_K) linear layer.
     Q8K(LinearQ8K<'a>),
-    /// PrismML Bonsai 2 `PQ2_0` (ggml id 142) linear layer (B2-09).
+    /// PrismML Bonsai 2 `PQ2_0` (ggml id 142) linear layer.
     PQ2_0(LinearPQ2_0<'a>),
-    /// PrismML Bonsai 2 `PTQ1_0` (ggml id 143) linear layer (B2-09).
+    /// PrismML Bonsai 2 `PTQ1_0` (ggml id 143) linear layer.
     PTQ1_0(LinearPTQ1_0<'a>),
-    /// Mainline group-64 `Q2_0` linear layer (B2-09).
+    /// Mainline group-64 `Q2_0` linear layer.
     Q2_0G64(LinearQ2_0G64<'a>),
-    /// Dense (unquantized) `f32` linear layer (B2-11-FIX, gatekeeper
-    /// REQUIRED #5): an `F32` / `F16` / `BF16` matrix, widened to `f32`.
+    /// Dense (unquantized) `f32` linear layer: an `F32` / `F16` / `BF16` matrix, widened to `f32`.
     Dense(LinearDense<'a>),
 }
 
@@ -1411,7 +1410,7 @@ mod tests {
         );
     }
 
-    // ── B2-09 acceptance: LinearLayer::{PQ2_0,PTQ1_0,Q2_0G64} round-trip a
+    // ── LinearLayer::{PQ2_0,PTQ1_0,Q2_0G64} round-trip a
     // fixture tensor ──────────────────────────────────────────────────────
 
     /// `PQ2_0` fixture: `qs = 0xFF` (every 2-bit lane LSB-first is `0b11` =

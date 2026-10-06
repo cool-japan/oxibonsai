@@ -250,7 +250,7 @@ pub struct ArtifactCache {
 impl ArtifactCache {
     /// Open (creating when needed) `<root>/<sub_path>` as a private cache
     /// directory storing artifacts with file extension `extension`. Every
-    /// `/`-separated component and the extension must pass [`is_valid_tag`],
+    /// `/`-separated component and the extension must pass `is_valid_tag`,
     /// which is what makes traversal out of `root` impossible.
     pub fn open_in(root: &Path, sub_path: &str, extension: &str) -> Result<Self, CacheError> {
         if !is_valid_tag(extension) {

@@ -286,7 +286,7 @@ mod tests {
 // [`oxibonsai_core::ternary_code_to_i8`] table at compile time, and
 // `blocked_tests::ternary_byte_lut_matches_the_shared_table_exhaustively`
 // proves all 256 x 4 entries agree). The remaining factor — int8
-// dot-product (`vdotq_s32` / VNNI) — is K-14/K-INT8 in wave 4 and is
+// dot-product (`vdotq_s32` / VNNI) — is K-14 and is
 // deliberately NOT attempted here: it would change results bit-for-bit and
 // must land as its own selectable tier.
 
@@ -384,7 +384,7 @@ fn validate_ternary_gemm(
 /// Register-blocked ternary GEMM (K-18): `output[m, n] = weight[n, :] . input[m, :]`.
 ///
 /// Numerically identical, bit for bit, to
-/// [`TernaryKernel::gemm_ternary_g128`] on the same dispatcher — see the
+/// `TernaryKernel::gemm_ternary_g128` on the same dispatcher — see the
 /// module-level note above — but it decodes each weight block once per
 /// [`TERNARY_GEMM_MR`] batch rows instead of once per batch row.
 ///
@@ -479,7 +479,7 @@ pub(crate) enum BlockedTier {
     /// dispatcher.
     ///
     /// Only AVX-512 needs this today (its tier kernels live in
-    /// `simd_avx512.rs`, which this package does not own), so the variant
+    /// `simd_avx512.rs`), so the variant
     /// exists only where it can be constructed.
     #[cfg(target_arch = "x86_64")]
     Delegate,
@@ -638,7 +638,7 @@ fn micro_scalar<const MR: usize>(
 /// Horizontal sum matching `simd_neon::hsum_neon` exactly.
 ///
 /// Replicated here rather than imported because `hsum_neon` is private to
-/// `simd_neon`, which this package does not own; the two must stay
+/// `simd_neon`; the two must stay
 /// identical, which
 /// `blocked_tests::ternary_blocked_is_bit_identical_to_the_tier_gemm`
 /// enforces on every run.
@@ -993,8 +993,8 @@ mod blocked_tests {
     /// batched CPU prefill actually produces, including the
     /// [`TERNARY_GEMM_MR`] tail shapes (`m = 13` is 8 + 4 + 1).
     ///
-    /// This is the invariant K-18 could silently have broken. Wave 3.5
-    /// measured it holding end to end on the real `Ternary-Bonsai-1.7B.gguf`
+    /// This is the invariant K-18 could silently have broken. It was
+    /// measured holding end to end on the real `Ternary-Bonsai-1.7B.gguf`
     /// — `Reference` vs the auto CPU tier, batched prefill, 64 self-generated
     /// greedy steps on three prompt slots: **exactly 0.0 at every step**,
     /// identical token chains — and asserted it nowhere.

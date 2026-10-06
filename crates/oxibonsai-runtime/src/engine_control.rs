@@ -11,7 +11,7 @@
 //! | [`CancellationToken`] | `SV-09` — cancellation covered only the SSE path |
 //! | [`EosTokenSet`] | `RT-18` — `EOS_TOKEN_ID` was Qwen3-only and single-valued |
 //! | [`RecurrentState`] | `RT-28` — no recurrent-state reset seam (hybrid `M-05`) |
-//! | [`GPU_ARGMAX_TIEBREAK_IS_FIRST_INDEX`] | `perf-11` — GPU argmax kernels now tie-break to the first index (`FIX2-KERN`); gate flipped on |
+//! | [`GPU_ARGMAX_TIEBREAK_IS_FIRST_INDEX`] | `perf-11` — GPU argmax kernels now tie-break to the first index; gate flipped on |
 //! | [`SpeculativeConfig`] | `RT-27` / `perf-16` — speculation behind an undocumented env var |
 //! | [`FusedMetalRoute`] | `MET-M1` — duplicate GPU-resident weight copy |
 //! | [`Int8TierUse`] | `K-14` — which engines the `OXIBONSAI_KERNEL_TIER` INT8 selector reaches |
@@ -24,7 +24,7 @@ use oxibonsai_core::gguf::reader::GgufFile;
 use oxibonsai_core::gguf::tensor_info::{keys, tensor_names};
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Cancellation (SV-09 + the wave-1 SRV-HARDEN addendum)
+// Cancellation (SV-09)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A cooperative cancellation flag shared between the caller and a running
@@ -44,8 +44,8 @@ use oxibonsai_core::gguf::tensor_info::{keys, tensor_names};
 ///
 /// Before `SV-09`, only the SSE path could be cancelled, and then only
 /// implicitly: `generate_streaming` breaks when `tx.send` fails because the
-/// receiver was dropped. The non-streaming path had no seam at all — the
-/// wave-1 review recorded that dropping the handler future on a per-request
+/// receiver was dropped. The non-streaming path had no seam at all:
+/// dropping the handler future on a per-request
 /// timeout leaves the `spawn_blocking` generation running to completion,
 /// holding the engine replica (and, on the GPU tier, the *only* replica)
 /// long past the deadline. Arming a token makes that deadline real.
@@ -103,13 +103,12 @@ impl CancellationToken {
 /// `RT-28` therefore requires a reset seam in the runtime *before* the state
 /// itself exists.
 ///
-/// `B2-10` supplies the concrete
+/// The model crate supplies the concrete
 /// [`RecurrentCache`](oxibonsai_model::hybrid::RecurrentCache); the impl for it
 /// lives **here**, just below this trait, and not in `oxibonsai-model`:
 /// `RecurrentState` is defined in this crate and `RecurrentCache` in the crate
 /// this one depends on, so the orphan rule leaves the runtime as the only
-/// legal home for it (wave-3.5 triage item 3 — the earlier "zero runtime
-/// edits" note on this trait was mistaken). A caller hands the engine one via
+/// legal home for it. A caller hands the engine one via
 /// [`InferenceEngine::set_recurrent_state`](crate::engine::InferenceEngine::set_recurrent_state);
 /// everything else — [`InferenceEngine::reset`](crate::engine::InferenceEngine::reset)
 /// calling [`InferenceEngine::reset_recurrent`](crate::engine::InferenceEngine::reset_recurrent),
@@ -140,7 +139,7 @@ pub trait RecurrentState: Send {
 
 /// The hybrid model's own recurrent state is a [`RecurrentState`].
 ///
-/// `B2-10`/`RT-28`: `RecurrentCache` holds the Gated-DeltaNet conv windows and
+/// `RT-28`: `RecurrentCache` holds the Gated-DeltaNet conv windows and
 /// `S` matrices — ~157 MB for Bonsai 2's 48 linear-attention layers — and,
 /// unlike a KV cache, none of it is masked by position: a stale `S` silently
 /// contaminates the next request instead of being overwritten. Wiring it to
@@ -272,7 +271,7 @@ impl From<u32> for EosTokenSet {
 ///    absent.
 /// 2. [`keys::TOKENIZER_EOT_TOKEN_ID`] → added when present (models that
 ///    distinguish "end of turn" from "end of text").
-/// 3. Every [`TERMINATOR_TOKEN_STRINGS`] entry found in the GGUF's own
+/// 3. Every `TERMINATOR_TOKEN_STRINGS` entry found in the GGUF's own
 ///    `tokenizer.ggml.tokens` array, looked up **by name**, so the ids come
 ///    from the file rather than from a per-model table.
 ///
@@ -323,7 +322,7 @@ fn terminator_ids_from_vocab(gguf: &GgufFile<'_>) -> Vec<u32> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GPU-argmax tie-break dependency gate (wave-2 verifier finding, RT-24/perf-11)
+// GPU-argmax tie-break dependency gate (RT-24/perf-11)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Whether the GPU argmax kernels reachable from the fused decode route break
@@ -341,13 +340,12 @@ fn terminator_ids_from_vocab(gguf: &GgufFile<'_>) -> Vec<u32> {
 /// the GPU-argmax fast path (4-byte readback instead of the full logits row)
 /// is reachable again.
 ///
-/// ## Why this was `false` (fixed by `perf-11` / `FIX2-KERN`)
+/// ## Why this was `false` (fixed by `perf-11`)
 ///
-/// A wave-2 verifier review read the MSL kernel
+/// Tracing the reduction of the MSL kernel
 /// (`crates/oxibonsai-kernels/src/gpu_backend/kernel_sources/utility.rs`,
-/// `argmax`) and its CUDA twin (`cuda_kernels.rs`, `argmax_f32`) and
-/// confirmed — by tracing the reduction directly, not just reading the
-/// finding — that neither tied toward the global first index. Each thread
+/// `argmax`) and of its CUDA twin (`cuda_kernels.rs`, `argmax_f32`) showed
+/// that neither tied toward the global first index. Each thread
 /// first scanned a strided subset of the input (`i = tid, tid +
 /// threads_per_group, ...`) and kept the first index *within that subset* on
 /// a tie (a strict `>` comparison). A pairwise tree reduction then combined
@@ -406,7 +404,7 @@ fn terminator_ids_from_vocab(gguf: &GgufFile<'_>) -> Vec<u32> {
 ///
 /// If a future regression is found in either kernel, set this back to
 /// `false` and update
-/// [`gpu_argmax_tiebreak_gate_is_on_after_the_kernel_fix`](tests::gpu_argmax_tiebreak_gate_is_on_after_the_kernel_fix)'s
+/// `gpu_argmax_tiebreak_gate_is_on_after_the_kernel_fix`'s
 /// const-assert back to its original (negated) form — the tripwire is
 /// deliberately kept in that test (currently checking `true`) so the crate
 /// fails to *compile*, not merely fails a test, the moment the two drift out
@@ -427,7 +425,7 @@ pub const SPECULATIVE_ENV_VAR: &str = "OXIBONSAI_SPEC";
 /// Legacy environment switch for
 /// [`SpeculativeConfig::force_cpu_decode_after`].
 ///
-/// A wave-2 verifier review found this was the one decode-loop environment
+/// This was the one decode-loop environment
 /// switch `RT-27` left behind: it used to be read with
 /// `std::env::var("OXIBONSAI_FORCE_CPU_DECODE_AFTER")` directly inside
 /// `generate_greedy_gpu_unchecked`, alongside (but not part of) the
@@ -492,7 +490,7 @@ pub struct SpeculativeConfig {
     /// Metal dispatch failure. `None` (the default) never forces it.
     ///
     /// Folded in from the legacy [`FORCE_CPU_DECODE_AFTER_ENV_VAR`]
-    /// environment switch (a wave-2 verifier finding): this was the last
+    /// environment switch: this was the last
     /// undocumented decode-loop environment variable `RT-27` left behind.
     pub force_cpu_decode_after: Option<usize>,
 }
@@ -673,7 +671,7 @@ pub fn gguf_fused_metal_route(gguf: &GgufFile<'_>) -> FusedMetalRoute {
     // Every quantized *block* matrix must belong to the same family; a mixed
     // file takes the block-dispatch path for at least one layer. `blk.*
     // .weight` covers every transformer-layer matrix; `token_embd.weight`
-    // is checked explicitly alongside them (a wave-2 verifier finding: a
+    // is checked explicitly alongside them (a
     // quantized-but-non-uniform embedding table was previously invisible to
     // this scan, since embedding lookup is CPU-side and the scan only
     // walked `blk.*`/`output.weight`, so a GGUF with all-ternary blocks but
@@ -959,7 +957,7 @@ mod tests {
         dirty: bool,
     }
 
-    /// `B2-10`/`RT-28`: the concrete `RecurrentCache` implements this crate's
+    /// `RT-28`: the concrete `RecurrentCache` implements this crate's
     /// `RecurrentState`, and the impl lives *here* rather than in
     /// `oxibonsai-model` because the orphan rule leaves no other home for it.
     ///
@@ -1094,8 +1092,8 @@ mod tests {
     // ── GPU-argmax tie-break gate ────────────────────────────────────────
 
     /// A tripwire, not a behavioural test: this constant must not flip back
-    /// to `false` as a side effect of an unrelated edit. `perf-11` /
-    /// `FIX2-KERN` landed the `utility.rs` / `cuda_kernels.rs` fix this gate
+    /// to `false` as a side effect of an unrelated edit. `perf-11`
+    /// landed the `utility.rs` / `cuda_kernels.rs` fix this gate
     /// was waiting on, plus the kernel-level randomized tie test
     /// (`crates/oxibonsai-kernels/tests/gpu_argmax_tiebreak.rs`, 320/320
     /// passing, 258/320 cases crossing a threadgroup slot so the coverage is
@@ -1118,7 +1116,7 @@ mod tests {
                 GPU_ARGMAX_TIEBREAK_IS_FIRST_INDEX,
                 "the MSL/CUDA argmax kernels were fixed to tie-break toward \
                  the global first index and crates/oxibonsai-kernels/tests/\
-                 gpu_argmax_tiebreak.rs verifies it (perf-11 / FIX2-KERN); \
+                 gpu_argmax_tiebreak.rs verifies it (perf-11); \
                  if this constant is being reverted to false, a kernel \
                  regression must have been found -- update this assertion \
                  back to `!GPU_ARGMAX_TIEBREAK_IS_FIRST_INDEX` and its \
@@ -1309,7 +1307,7 @@ mod tests {
         );
     }
 
-    /// Wave-2 verifier finding: a quantized `token_embd.weight` that does
+    /// A quantized `token_embd.weight` that does
     /// not match the block family must break fused classification exactly
     /// like a mismatched `blk.*` matrix would, even though nothing on the
     /// fused route reads the embedding table today.

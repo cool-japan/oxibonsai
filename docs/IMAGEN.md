@@ -164,9 +164,8 @@ Point `--vae` / `OXI_VAE_WEIGHTS` at
 > canonical upstream source if you already have FLUX.2-dev access.
 >
 > **No more Python export.** The previous workflow required a dev-time Python
-> `.npy` export of the VAE weights (`/tmp/bonsai_vae_export_weights.py`); that
-> step is now eliminated — the engine reads the `.safetensors` checkpoint
-> directly.
+> script to export the VAE weights as per-tensor `.npy` files; that step is now
+> eliminated — the engine reads the `.safetensors` checkpoint directly.
 >
 > `--vae` also still accepts a **directory of per-tensor `.npy` tensors** for the
 > legacy path. The loader auto-detects: a `.safetensors` *file* selects the
@@ -226,23 +225,36 @@ opt-out of `"0"`; the CPU fallback is always available. See
 
 ## `oxibonsai image` flag reference
 
-All flags and defaults are taken directly from `src/main.rs`. For the canonical,
-exhaustive table (and every other subcommand) see
-[`docs/CLI.md`](CLI.md#image).
+All flags and defaults follow `oxibonsai image --help` (the `clap` definitions
+live in `src/cli/args.rs`). For the canonical, exhaustive table (and every other
+subcommand) see [`docs/CLI.md`](CLI.md#image).
+
+The three asset paths have **no hard-wired default**: each comes from its flag, its
+environment variable (or, for the DiT, `[imagen].model_path` in a `--config`
+file) or, as a last resort, a file that already exists at `models/dit.gguf`,
+`models/vae` or `models/te` under the per-user data directory
+(`$XDG_DATA_HOME/oxibonsai`, else `~/Library/Application Support/oxibonsai` on
+macOS, `~/.local/share/oxibonsai` on other Unix). A missing one stops the command
+with an error naming the flag, the variable and that location; nothing is read
+from `/tmp` or another world-writable directory by default. A
+`--config` file's `[imagen]` section can also set `width`, `height`, `steps`,
+`seed` and `output_dir`; `guidance_scale` is refused, because the FLUX.2 Klein
+DiT is guidance-distilled and this pipeline has no classifier-free-guidance
+stage (there is no `--guidance` flag either).
 
 | Flag | Short | Default | Env fallback (when flag omitted) | Description |
 | --- | --- | --- | --- | --- |
 | `--prompt` | `-p` | *(required)* | — | Text prompt. Use `-` to read from stdin. |
-| `--out` | `-o` | *(required)* | — | Output PNG path. |
-| `--seed` | | `42` | — | RNG seed for the initial noise. |
-| `--steps` | | `4` | — | Number of Euler (flow-matching) sampler steps. |
-| `--width` | | `512` | — | Image width in pixels. |
-| `--height` | | `512` | — | Image height in pixels. |
-| `--guidance` | | `1.0` | — | Guidance scale. |
-| `--dit` | | — | `OXI_DIT_GGUF`, else `/tmp/parity.gguf` | DiT GGUF path. |
-| `--vae` | | — | `OXI_VAE_WEIGHTS`, else `/tmp/bonsai_golden/vae/weights` | VAE weights: a `.safetensors` file or a legacy `.npy` directory. |
-| `--te` | | — | `OXI_TE_4BIT`, else `OXI_TE_WEIGHTS`, else `/tmp/bonsai_golden/te/weights` | Text-encoder weights: a 4-bit MLX `model.safetensors` file, or an f32 `.npy` directory. |
-| `--tokenizer` | | — | `OXI_TE_TOKENIZER_DIR`, else the TE dir | Tokenizer directory containing `tokenizer.json` (defaults to the TE `.safetensors`' parent). |
+| `--out` | `-o` | *(required)* | — | Output PNG path (a relative path lands under `[imagen].output_dir` when a `--config` sets one). |
+| `--seed` | | `42` | `[imagen].seed` | RNG seed for the initial noise. |
+| `--steps` | | `4` | `[imagen].steps` | Number of Euler (flow-matching) sampler steps. |
+| `--width` | | `512` | `[imagen].width` | Image width in pixels. |
+| `--height` | | `512` | `[imagen].height` | Image height in pixels. |
+| `--dit` | | *(required)* | `[imagen].model_path`, else `OXI_DIT_GGUF` | DiT GGUF path. |
+| `--vae` | | *(required)* | `OXI_VAE_WEIGHTS` | VAE weights: a `.safetensors` file or a legacy `.npy` directory. |
+| `--te` | | *(required)* | `OXI_TE_4BIT`, else `OXI_TE_WEIGHTS` | Text-encoder weights: a 4-bit MLX `model.safetensors` file, or an f32 `.npy` directory. |
+| `--tokenizer` | | the TE dir | `OXI_TE_TOKENIZER_DIR` | Tokenizer directory containing `tokenizer.json` (for a `.safetensors` `--te`, that file's parent directory). |
+| `--config` | | — | — | Global flag: an OxiBonsai TOML file; its `[imagen]` section supplies the defaults above (see [`docs/CLI.md`](CLI.md#configuration-file---config)). |
 
 ---
 
@@ -305,13 +317,14 @@ every stage stays at cosine ≥ 0.999 parity with the MLX reference.
 
 | Platform | Backend | Steps | Time / image |
 | --- | --- | --- | --- |
-| NVIDIA A4000-class | CUDA | 4 | ≈ 31.7 s |
+| NVIDIA A4000-class | CUDA | 4 | ≈ 31.7 s (measured in an earlier release; **not re-measured** — this release's CUDA code is unvalidated) |
 | Apple Silicon (M3-class) | Metal (default-on GPU) | 4 | ≈ 52–62 s |
 
-The CUDA path reached ≈ 31.7 s (≈ **3.2×** faster than the initial ≈ 101 s) after
-the GPU-offload work this cycle: a ~6× DiT GEMM speedup, a ~6.3× warp-cooperative
-flash-attention, and a ~59× stage-0 context-embedder (ported CPU→GPU), all at
-cosine ≥ 0.999. The Metal figure is the full image with the default-on GPU path.
+The CUDA path reached ≈ 31.7 s (≈ **3.2×** faster than the initial ≈ 101 s) in
+that earlier release after the GPU-offload work: a ~6× DiT GEMM speedup, a ~6.3×
+warp-cooperative flash-attention, and a ~59× stage-0 context-embedder (ported
+CPU→GPU), all at cosine ≥ 0.999. The Metal figure is the full image with the
+default-on GPU path.
 
 ---
 

@@ -314,7 +314,7 @@ fn parse_flat_toml_sections_absent_key_returns_none_not_a_default() {
     assert_eq!(toml_f32(&sections, "sampling", "repetition_penalty"), None);
 }
 
-// ── resolve_* precedence (cli-04 / orchestrator P0 addendum) ────────
+// ── resolve_* precedence (cli-04) ────────
 
 #[test]
 fn resolve_f32_prefers_explicit_cli_value_over_config() {

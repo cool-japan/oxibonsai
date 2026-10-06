@@ -121,7 +121,7 @@ pub(super) struct CachedWeight {
 /// The whole weight cache, behind one mutex so the entry table, the
 /// content index and the per-epoch registrations can never disagree.
 ///
-/// **Sharing (verify:METAL-CONCURRENCY blocking #1).** Every replica of a
+/// **Sharing.** Every replica of a
 /// Q1 model used to run `upload_weights_to_gpu`, and every upload minted a
 /// fresh handle from `NEXT_HANDLE_ID` — N replicas, N resident copies, in
 /// this cache *and* in the `MetalGraph` weight cache the Q1 fused path keys

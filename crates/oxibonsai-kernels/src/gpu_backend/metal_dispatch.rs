@@ -39,10 +39,9 @@ pub(crate) const ATTENTION_SCORES_V2_MAX_HEAD_DIM: u32 =
 /// `top_k` sampling value (Bonsai 2's recommended sampling config uses
 /// `top_k = 20`).
 ///
-/// Wiring a sampled decode request through `dispatch_topk_f32` is
-/// METAL-CONCURRENCY's (wave 4; see the `topk_f32` field doc on
-/// `MetalPipelines`), so nothing in the non-test build reads this constant
-/// yet — this crate's own tests do, hence `#[allow(dead_code)]`.
+/// The sampled-decode route reaches this bound through `resident_logits.rs`'s
+/// `metal_resident_logits_topk`, and this crate's own tests exercise it
+/// directly.
 #[allow(dead_code)]
 pub(crate) const MAX_TOPK_F32: u32 = 256;
 
@@ -985,12 +984,12 @@ impl MetalGraph {
     ///
     /// This dispatcher only encodes the kernel invocation — it does not
     /// download or interpret `out_ids`/`out_vals`, matching every other
-    /// `dispatch_*` method in this file. Wiring a sampled decode request
-    /// through this (upload logits → dispatch → download `k` pairs instead
-    /// of the full row) is METAL-CONCURRENCY's (wave 4), per the
-    /// `topk_f32` field doc on `MetalPipelines`.
+    /// `dispatch_*` method in this file. A sampled decode request goes
+    /// through this via `resident_logits.rs`'s `metal_resident_logits_topk`
+    /// (dispatch over the resident logits → download `k` pairs instead of
+    /// the full row).
     ///
-    /// **Before wiring that consumer, read the `-INFINITY` contract** on the
+    /// **Before consuming the results, read the `-INFINITY` contract** on the
     /// `MSL_TOPK_F32` doc comment (`kernel_sources/utility.rs`): a real,
     /// grammar-masked `-INFINITY` logit and an exhausted pad slot are
     /// indistinguishable in `out_vals`/`out_ids` BY DESIGN — the consumer
@@ -1015,13 +1014,10 @@ impl MetalGraph {
     /// be sized for at least `k` elements — same convention as every other
     /// `dispatch_*` buffer-sizing precondition in this file.
     ///
-    /// The engine-side caller is METAL-CONCURRENCY's (wave 4), so nothing in
-    /// the non-test build calls this yet — this file's own
-    /// `topk_f32_*`/`dispatch_topk_f32_*` tests do, dispatching the real
-    /// kernel and checking its output against a CPU oracle, hence
-    /// `#[allow(dead_code)]` (matching `MetalPipelines::
-    /// gemm_tq2_g128_v8_tiled`'s precedent for "compiled and tested, not yet
-    /// wired into the shipping call path").
+    /// The non-test caller is `resident_logits.rs`'s
+    /// `metal_resident_logits_topk`; this file's own
+    /// `topk_f32_*`/`dispatch_topk_f32_*` tests dispatch the real
+    /// kernel and check its output against a CPU oracle.
     #[allow(dead_code)]
     pub(crate) fn dispatch_topk_f32(
         &self,
@@ -1336,7 +1332,7 @@ mod tests {
         }
         let k_cache = graph.device.new_buffer((total * 2) as u64, shared);
         let v_cache = graph.device.new_buffer((total * 2) as u64, shared);
-        // REQUIRED #5 (wave-1+1.5 gatekeeper review): Metal does NOT
+        // Metal does NOT
         // zero-initialise newly allocated buffers — `newBufferWithLength:
         // options:` makes no such guarantee, so the "untouched" assertions
         // below need an explicit known-zero baseline instead of relying on
@@ -1671,7 +1667,7 @@ mod tests {
     /// crate's own scalar `gemv_q4k` CPU reference.
     ///
     /// This doubles as a regression guard for the `kq_scale_min_k4` ->
-    /// `kq_scale_min_k4_q4k`/`_q5k` rename this package made in
+    /// `kq_scale_min_k4_q4k`/`_q5k` rename made in
     /// `kernel_sources/k_quant.rs`: both kernels used to define
     /// `kq_scale_min_k4` identically, which was legal only because each
     /// compiled into its own separate `MTLLibrary`; concatenated into one
@@ -1812,8 +1808,8 @@ mod tests {
     /// call shapes on whatever cache state the host happens to be in", not
     /// as an absolute or cold-start measurement.
     ///
-    /// **Deliberately prints, never asserts, on the two durations** (wave-3
-    /// re-review): an earlier version of this test ended in
+    /// **Deliberately prints, never asserts, on the two durations**:
+    /// an earlier version of this test ended in
     /// `assert!(after < before)`, a wall-clock comparison between two
     /// `Instant::elapsed()` values on a shared, load-dependent host. Because
     /// this test is `#[ignore]`d it never runs in the gate, but a wall-clock
@@ -1824,11 +1820,10 @@ mod tests {
     /// the numbers instead, exactly as below.
     ///
     /// `#[ignore]`d: a wall-clock measurement, not a correctness assertion —
-    /// same convention this package's wave-2.5 addendum cites for the
-    /// KERN-PARALLEL / B2-03 in-crate timing tests. Run explicitly with
+    /// same convention the other in-crate timing tests follow. Run explicitly with
     /// `cargo test -p oxibonsai-kernels --features metal \
     /// met_10_first_use_latency_before_vs_after -- --ignored --nocapture`
-    /// to reproduce the numbers recorded in this package's notes.
+    /// to reproduce the recorded numbers.
     #[test]
     #[ignore = "wall-clock measurement, not a correctness gate — see doc comment"]
     fn met_10_first_use_latency_before_vs_after() {

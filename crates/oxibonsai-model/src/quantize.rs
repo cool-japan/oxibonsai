@@ -581,7 +581,7 @@ pub fn encode_quantized_tensor(
             // SAFETY: `BlockQ8_0` is repr(C), 34 bytes (asserted).
             unsafe { blocks_as_bytes(&blocks) }
         }
-        // FIX3-GGUF-WRITE item 1(c): before this, `oxibonsai quantize`'s
+        // Before these arms existed, `oxibonsai quantize`'s
         // writer path (this function) had no arm for these three K-quant
         // wire types at all — they fell through to the "no encoder" refusal
         // below — even though the block encoders themselves
@@ -1617,7 +1617,7 @@ mod scale_rule_tests {
         assert!(anonymous.to_string().contains("<unnamed>"));
     }
 
-    // ── 0b11 screen (wave-1 addendum 3) ───────────────────────────────────
+    // ── 0b11 screen ───────────────────────────────────
 
     #[test]
     fn reserved_code_in_a_ternary_tensor_is_rejected() {
@@ -1702,7 +1702,7 @@ mod scale_rule_tests {
 //
 // Split into a sibling file (`quantize/kquant_roundtrip_tests.rs`) to keep
 // this file under the 2000-line policy limit; see that file's module doc
-// for the full FIX3-GGUF-WRITE item 1(d) rationale. `use super::*;` there
+// for the full rationale. `use super::*;` there
 // resolves against this module (`quantize`) exactly as it did when this was
 // an inline `mod kquant_writer_roundtrip { .. }` block.
 #[cfg(test)]

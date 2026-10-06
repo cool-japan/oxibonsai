@@ -210,6 +210,27 @@ pub(crate) fn parse_image_max_tokens(s: &str) -> Result<usize, String> {
     validate_image_max_tokens(v)
 }
 
+/// `--image-url-timeout-ms <MS>`: the per-image deadline of a remote image
+/// fetch. A whole number of milliseconds, at least 1.
+pub(crate) fn parse_image_url_timeout_ms(s: &str) -> Result<u64, String> {
+    let v: u64 = s
+        .parse()
+        .map_err(|_| format!("'{s}' is not a whole number of milliseconds"))?;
+    if v == 0 {
+        return Err("the per-image deadline must be at least 1 ms".to_string());
+    }
+    Ok(v)
+}
+
+/// `--image-url-allow-host <HOST[:PORT]>`: one allowlist entry, checked the
+/// way the fetcher reads it (`oxibonsai_model::vision::remote::parse_allowed_host`)
+/// and kept as given.
+pub(crate) fn parse_image_url_allow_host(s: &str) -> Result<String, String> {
+    oxibonsai_model::vision::remote::parse_allowed_host(s)
+        .map(|_| s.trim().to_string())
+        .map_err(|why| format!("not a host or host:port: {why}"))
+}
+
 /// `serve --max-output-tokens <N>`: a hard ceiling on a request's effective
 /// `max_tokens`. `0` is rejected (it would 400 every request instead of
 /// capping it), matching `oxibonsai-serve`'s own parser.
@@ -237,8 +258,9 @@ pub(crate) fn parse_max_output_tokens(s: &str) -> Result<usize, String> {
 /// (`--embedding-backend`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub(crate) enum EmbeddingBackendChoice {
-    /// Mean-pooled hidden states of the loaded model (dense models; a
-    /// hybrid `qwen35` model has no embedder yet and answers the honest 501).
+    /// Mean-pooled hidden states of the loaded model — a dense model and a
+    /// hybrid `qwen35` model alike (a hybrid model's embedder runs on the CPU
+    /// model whatever `--backend` says).
     #[default]
     Model,
     /// Serve no embeddings at all: `/v1/embeddings` always answers 501.
@@ -457,39 +479,85 @@ pub(crate) enum Commands {
         /// Prompt-ingestion chunk size in tokens (design §5.7): the
         /// Gated-DeltaNet prefill chunk for a `qwen35` hybrid (default
         /// 512), the chunked-prefill plan for a dense model (default: that
-        /// model's own plan). Must be >= 1.
+        /// model's own plan). Must be >= 1. On the Metal hybrid runner the
+        /// runner is built to take calls of this many tokens, as far as its
+        /// KV window's memory budget allows; the log reports the size in
+        /// effect (a warning names both when it is smaller than asked).
         #[arg(long, value_parser = parse_prefill_chunk)]
         prefill_chunk: Option<usize>,
 
         /// Vision projector GGUF (`clip` architecture, e.g.
         /// `Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf`) for a Bonsai 2 (`qwen35`)
-        /// model: the Qwen3-VL tower is loaded once (about 1.7 GiB of `f32`
-        /// weights) and every `--image` is encoded into the prompt. Refused
-        /// for any other architecture, and for a projector the tower does
-        /// not recognise.
+        /// model: the Qwen3-VL tower is loaded once, for the executor the
+        /// engine decodes on — the Metal tower (the file's weights as
+        /// stored, about 0.87 GiB) beside the Metal hybrid runner, the CPU
+        /// tower (about 1.7 GiB of `f32` weights) beside the CPU model — and
+        /// every `--image` is encoded into the prompt. Refused for any other
+        /// architecture (`NOT_A_HYBRID_MODEL`, before the model is loaded),
+        /// and for a projector the tower does not recognise.
         #[arg(long)]
         mmproj: Option<String>,
 
-        /// Image input (repeatable; needs --mmproj): a PNG or JPEG file, or
-        /// a base64 `data:image/...;base64,` URI. Implies --chat: each image
-        /// becomes a `<|vision_start|><|image_pad|><|vision_end|>` part of
-        /// the user turn, ahead of the prompt text, and its placeholder is
-        /// replaced by the image's merged rows. Remote `http(s)` URLs are
-        /// never fetched (a typed `image_url_fetch_disabled` error), even
-        /// with `OXI_ALLOW_IMAGE_URL_FETCH=1`, which only changes the
-        /// reason.
+        /// Image input (repeatable; needs --mmproj): a PNG or JPEG file, a
+        /// base64 `data:image/...;base64,` URI, or — only with
+        /// --allow-image-url-fetch — an `http(s)` URL. Implies --chat: each
+        /// image becomes a `<|vision_start|><|image_pad|><|vision_end|>`
+        /// part of the user turn, ahead of the prompt text, and its
+        /// placeholder is replaced by the image's merged rows. Without the
+        /// opt-in a remote URL is refused (`image_url_fetch_disabled`) and
+        /// nothing is opened.
         #[arg(long)]
         image: Vec<String>,
 
-        /// Per-image token budget (default 1024, the Bonsai demo's): an
-        /// image is smart-resized to multiples of 32 pixels exactly like
-        /// the reference (Pillow bicubic, aspect preserved) and downscaled
-        /// until its `(H / 32) * (W / 32)` merged grid fits; one that cannot
-        /// fit even at its smallest aspect-preserving size is refused
-        /// (`image_too_many_tokens`). Never upscales to reach it. Range
-        /// 1..=16384; needs --mmproj.
+        /// Per-image token budget (default 1024, the Bonsai demo's; the
+        /// reference server's own default limit is 4096): an image is
+        /// smart-resized to multiples of 32 pixels exactly like the
+        /// reference (Pillow bicubic, aspect preserved) and downscaled until
+        /// its `(H / 32) * (W / 32)` merged grid fits; one that cannot fit
+        /// even at its smallest aspect-preserving size is refused
+        /// (`image_too_many_tokens`). Never upscales to reach it. The budget
+        /// also bounds how large a source image is decoded at all: more than
+        /// 16 times the pixels it can use (at least 16 megapixels) is
+        /// refused as `image_too_large` from its header. Range 1..=16384;
+        /// needs --mmproj.
         #[arg(long, value_parser = parse_image_max_tokens)]
         image_max_tokens: Option<usize>,
+
+        /// Fetch remote `http(s)` image references (needs --mmproj): an
+        /// `--image https://...` is downloaded with one GET — no request
+        /// body, cookies, credentials or retries, the `User-Agent:
+        /// oxibonsai/<version>` header, at most 3 redirects, a 200 answer
+        /// of at most 32 MiB, one deadline per image (--image-url-timeout-ms)
+        /// — and then decoded exactly like a file. Only public addresses are
+        /// fetched: a host that is, or resolves to, a loopback, private,
+        /// link-local, multicast or other special-purpose address, or that is
+        /// named `localhost`, is refused (`image_url_refused`) unless
+        /// --image-url-allow-host names it. Without this flag a remote
+        /// reference is refused with `image_url_fetch_disabled` and nothing
+        /// is opened or resolved. Also `OXI_ALLOW_IMAGE_URL_FETCH=1`; the
+        /// flag wins over the environment.
+        #[arg(long, default_value_t = false)]
+        allow_image_url_fetch: bool,
+
+        /// Per-image deadline of a remote image fetch, in milliseconds,
+        /// covering name resolution, connect, TLS, the response head and
+        /// the whole body (default 10000; at least 1). A fetch that runs out
+        /// of time fails as `image_url_fetch_failed`. Also
+        /// `OXI_IMAGE_URL_TIMEOUT_MS`; the flag wins. Needs
+        /// --allow-image-url-fetch.
+        #[arg(long, value_name = "MS", value_parser = parse_image_url_timeout_ms)]
+        image_url_timeout_ms: Option<u64>,
+
+        /// Exempt one host from the public-address rule (repeatable): an
+        /// exact, case-insensitive match of the URL's host — and of its port
+        /// when `:PORT` is given — such as an intranet image store or
+        /// `127.0.0.1:8080`. Nothing else is relaxed: http/https only, no
+        /// credentials, every redirect hop allowlisted or public, the size
+        /// cap and the deadline. Also `OXI_IMAGE_URL_ALLOW_HOSTS`
+        /// (comma-separated); the flag's entries are added to the
+        /// variable's. Needs --allow-image-url-fetch.
+        #[arg(long = "image-url-allow-host", value_name = "HOST[:PORT]", value_parser = parse_image_url_allow_host)]
+        image_url_allow_host: Vec<String>,
 
         /// Proceed even when the resolved tokenizer's vocabulary is
         /// SMALLER than the model's (TOK-08). A smaller vocabulary means a
@@ -767,6 +835,29 @@ pub(crate) enum Commands {
         #[arg(long, value_parser = parse_image_max_tokens)]
         image_max_tokens: Option<usize>,
 
+        /// Fetch remote `http(s)` image references (needs --mmproj): one
+        /// GET per image, public addresses only unless
+        /// --image-url-allow-host names the host, at most 3 redirects,
+        /// 32 MiB and one deadline per image. Without it a remote reference
+        /// is refused (`image_url_fetch_disabled`) and nothing is opened.
+        /// Also `OXI_ALLOW_IMAGE_URL_FETCH=1`; the flag wins. See `run
+        /// --help`.
+        #[arg(long, default_value_t = false)]
+        allow_image_url_fetch: bool,
+
+        /// Per-image deadline of a remote image fetch in milliseconds
+        /// (default 10000; at least 1). Also `OXI_IMAGE_URL_TIMEOUT_MS`;
+        /// the flag wins. Needs --allow-image-url-fetch. See `run --help`.
+        #[arg(long, value_name = "MS", value_parser = parse_image_url_timeout_ms)]
+        image_url_timeout_ms: Option<u64>,
+
+        /// Exempt one host (and its port, when given) from the
+        /// public-address rule (repeatable). Also
+        /// `OXI_IMAGE_URL_ALLOW_HOSTS` (comma-separated; the flag's entries
+        /// are added). Needs --allow-image-url-fetch. See `run --help`.
+        #[arg(long = "image-url-allow-host", value_name = "HOST[:PORT]", value_parser = parse_image_url_allow_host)]
+        image_url_allow_host: Vec<String>,
+
         /// Proceed even when the resolved tokenizer's vocabulary is
         /// SMALLER than the model's (TOK-08); see `run --help` for the
         /// full explanation. A larger tokenizer vocabulary is always a
@@ -825,9 +916,13 @@ pub(crate) enum Commands {
         #[arg(long)]
         tokenizer: Option<String>,
 
-        /// Number of engine replicas (default: min(4, CPU cores);
-        /// auto-clamped to 1 on GPU/Metal). Replicas share one token-embedding
-        /// table, so each adds only a KV cache.
+        /// Number of engine replicas (default: env
+        /// `OXIBONSAI_ENGINE_POOL_SIZE`, else `min(4, CPU cores)` for a
+        /// dense model on a CPU tier and 1 on a Metal tier or for a Bonsai 2
+        /// `qwen35` model on any executor). An explicit value is honoured on
+        /// the CPU and capped at `OXIBONSAI_METAL_MAX_SESSIONS` (default 4)
+        /// on Metal; a CUDA-only build clamps to 1. Replicas share one
+        /// token-embedding table, so each adds only a KV cache.
         #[arg(long)]
         pool_size: Option<usize>,
 
@@ -837,7 +932,7 @@ pub(crate) enum Commands {
         /// unauthenticated — only safe behind `--host 127.0.0.1` or
         /// another trusted network boundary. This flag does NOT gate the
         /// separate `/admin/*` surface: that is always authenticated by
-        /// its own `OXI_ADMIN_TOKEN` environment variable, and every
+        /// its own `OXIBONSAI_ADMIN_TOKEN` (else `OXI_ADMIN_TOKEN`) environment variable, and every
         /// `/admin/*` request is refused with 403 while that variable is
         /// unset, independent of `--bearer-token`.
         #[arg(long)]
@@ -913,8 +1008,7 @@ pub(crate) enum Commands {
         rate_limit_rpm: Option<u32>,
 
         /// Burst allowance on top of `--rate-limit-rpm` (default: env
-        /// `OXIBONSAI_RATE_LIMIT_BURST`, or a small multiple of the RPM
-        /// when unset).
+        /// `OXIBONSAI_RATE_LIMIT_BURST`, or a flat 20 when unset).
         #[arg(long)]
         rate_limit_burst: Option<u32>,
 
@@ -962,14 +1056,18 @@ pub(crate) enum Commands {
 
         /// Vision projector GGUF for a Bonsai 2 model, loaded once at
         /// startup: both chat endpoints then accept OpenAI `image_url`
-        /// content parts — base64 `data:` URIs, and `file://` references
-        /// inside the directory named by `OXI_MEDIA_PATH` when it is set.
-        /// Remote `http(s)` image URLs are never fetched (server-side
-        /// request forgery): a `400 image_url_fetch_disabled`, whatever
-        /// `OXI_ALLOW_IMAGE_URL_FETCH` says. Without this flag an image
-        /// request is a `400 vision_unavailable`. Image rows prefill on the
-        /// CPU model, so an image turn can outlast the default
-        /// --request-timeout-ms (a startup warning says so).
+        /// content parts — base64 `data:` URIs, `file://` references inside
+        /// the directory named by --media-path when there is one, and
+        /// remote `http(s)` URLs only with --allow-image-url-fetch (else a
+        /// `400 image_url_fetch_disabled`, before anything is opened).
+        /// Without this flag an image
+        /// request is a `400 vision_unavailable` (a dense model answers
+        /// `400 NOT_A_HYBRID_MODEL` either way). The tower is loaded for the
+        /// executor the replicas decode on — the Metal tower beside the
+        /// Metal hybrid runner, the CPU tower beside the CPU model — and
+        /// image rows prefill there too; on the CPU model an image turn can
+        /// outlast the default --request-timeout-ms (a startup warning says
+        /// so).
         #[arg(long)]
         mmproj: Option<String>,
 
@@ -984,9 +1082,57 @@ pub(crate) enum Commands {
         #[arg(long, value_parser = parse_image_max_tokens)]
         image_max_tokens: Option<usize>,
 
+        /// Fetch remote `http(s)` `image_url` references of requests
+        /// (needs --mmproj): one GET per image — no body, cookies,
+        /// credentials or retries, at most 3 redirects, a 200 answer of at
+        /// most 32 MiB, one deadline per image (--image-url-timeout-ms),
+        /// the images of a request fetched one after another within its
+        /// --request-timeout-ms — decoded exactly like a data URI. Only
+        /// public addresses are fetched: a host that is, or resolves to, a
+        /// loopback, private, link-local, multicast or other special-purpose
+        /// address (cloud metadata at 169.254.169.254 included), or that is
+        /// named `localhost`, is a `400 image_url_refused` unless
+        /// --image-url-allow-host names it; a failed fetch is a `400
+        /// image_url_fetch_failed` naming the step. Without this flag a
+        /// remote reference is a `400 image_url_fetch_disabled` and nothing
+        /// is opened or resolved. Keep it off on a public endpoint unless
+        /// clients need it. Also `OXI_ALLOW_IMAGE_URL_FETCH=1`; the flag
+        /// wins.
+        #[arg(long, default_value_t = false)]
+        allow_image_url_fetch: bool,
+
+        /// Per-image deadline of a remote image fetch, in milliseconds,
+        /// covering name resolution, connect, TLS, the response head and
+        /// the whole body (default 10000; at least 1); the fetches also
+        /// count toward --request-timeout-ms. Also
+        /// `OXI_IMAGE_URL_TIMEOUT_MS`; the flag wins. Needs
+        /// --allow-image-url-fetch.
+        #[arg(long, value_name = "MS", value_parser = parse_image_url_timeout_ms)]
+        image_url_timeout_ms: Option<u64>,
+
+        /// Exempt one host from the public-address rule (repeatable): an
+        /// exact, case-insensitive match of the URL's host — and of its port
+        /// when `:PORT` is given — such as an intranet image store. Nothing
+        /// else is relaxed: http/https only, no credentials, every redirect
+        /// hop allowlisted or public, the size cap and the deadline. Also
+        /// `OXI_IMAGE_URL_ALLOW_HOSTS` (comma-separated); the flag's entries
+        /// are added to the variable's. Needs --allow-image-url-fetch.
+        #[arg(long = "image-url-allow-host", value_name = "HOST[:PORT]", value_parser = parse_image_url_allow_host)]
+        image_url_allow_host: Vec<String>,
+
+        /// The directory `file://` image references resolve inside (needs
+        /// --mmproj): relative paths only, no `..`, and the resolved file
+        /// must stay inside it once symlinks are followed (anything else
+        /// is a `400 image_file_refused`). Must exist. Also
+        /// `OXI_MEDIA_PATH`; the flag wins. Without either, a server
+        /// accepts base64 `data:` URIs only.
+        #[arg(long, value_name = "DIR")]
+        media_path: Option<String>,
+
         /// Which backend answers `/v1/embeddings`: `model` (default: the
-        /// loaded model's mean-pooled hidden states; a hybrid `qwen35`
-        /// model has none yet and answers 501), `none` (always 501), or
+        /// loaded model's mean-pooled hidden states, for a dense and a
+        /// hybrid `qwen35` model alike; a hybrid model embeds on the CPU
+        /// model whatever `--backend` says), `none` (always 501), or
         /// `tfidf` (lexical TF-IDF vectors over the vocabulary fitted, once
         /// at startup, on `--embedding-corpus`).
         #[arg(long, value_enum, default_value_t = EmbeddingBackendChoice::Model)]
@@ -1008,6 +1154,27 @@ pub(crate) enum Commands {
         /// Emit info as JSON instead of human-readable text.
         #[arg(long, default_value_t = false)]
         json: bool,
+
+        /// A Bonsai 2 vision projector to report beside the model: which
+        /// tower `run`/`chat`/`serve --mmproj` would build for the executor
+        /// `--backend auto` resolves to, what each tower keeps resident, the
+        /// KV window with room left for the Metal tower, and the process's
+        /// Metal sessions against their ceiling. Refused for a model that is
+        /// not `qwen35` (`NOT_A_HYBRID_MODEL`), as `run` refuses it.
+        #[arg(long)]
+        mmproj: Option<String>,
+
+        /// Per-image token budget the projector's towers are sized for
+        /// (default 1024; needs --mmproj). See `run --help`.
+        #[arg(long, value_parser = parse_image_max_tokens)]
+        image_max_tokens: Option<usize>,
+
+        /// Report the prefill chunk a `qwen35` engine would run in for this
+        /// `--prefill-chunk`: on the Metal hybrid runner the call size it
+        /// would be built with (smaller than asked when its KV window's
+        /// memory budget cannot hold larger calls). See `run --help`.
+        #[arg(long, value_parser = parse_prefill_chunk)]
+        prefill_chunk: Option<usize>,
     },
 
     /// Print what this `oxibonsai` binary was built with: enabled Cargo

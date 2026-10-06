@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! cargo run -p oxibonsai-image --example dit_parity -- \
-//!     /tmp/parity.gguf /tmp/bonsai_golden/bf16
+//!     ${TMPDIR:-/tmp}/parity.gguf ${TMPDIR:-/tmp}/bonsai_golden/bf16
 //! ```
 //!
 //! It loads the GGUF weights and the goldens, feeds the golden inputs into the
@@ -357,11 +357,11 @@ fn run() -> Result<bool, String> {
     let gguf = args
         .next()
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp/parity.gguf"));
+        .unwrap_or_else(|| std::env::temp_dir().join("parity.gguf"));
     let golden_dir = args
         .next()
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp/bonsai_golden/bf16"));
+        .unwrap_or_else(|| std::env::temp_dir().join("bonsai_golden/bf16"));
 
     if !gguf.exists() {
         return Err(format!("GGUF not found: {}", gguf.display()));

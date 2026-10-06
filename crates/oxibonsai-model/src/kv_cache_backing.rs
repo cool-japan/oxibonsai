@@ -1,5 +1,5 @@
 //! [`KvCachePolicy`] and [`KvCacheBacking`]: the storage-format vocabulary of
-//! the KV cache, split out of `kv_cache.rs` (B2-11-FIX: that file had
+//! the KV cache, split out of `kv_cache.rs` (that file had
 //! reached the 2000-line ceiling). Re-exported from [`crate::kv_cache`], so
 //! every existing `crate::kv_cache::KvCacheBacking` path is unchanged.
 
@@ -20,8 +20,8 @@ pub enum KvCachePolicy {
 /// Selects which concrete backing a [`crate::model::BonsaiModel`] should
 /// build/use for its KV cache (RT-14 / M-13).
 ///
-/// This is the data half of the "ideal fix" the M-13/RT-14 verifier
-/// correction describes: the sibling `oxibonsai-runtime` crate's
+/// This is the data half of the "ideal fix" the M-13/RT-14 review
+/// describes: the sibling `oxibonsai-runtime` crate's
 /// `kv_cache_policy` module (not a dependency of this crate, so named here
 /// only in prose, not as a doc link) has a `KvCachePolicy` whose
 /// `observe`/`with_action`/`set_action` already fire a real callback on
@@ -29,10 +29,9 @@ pub enum KvCachePolicy {
 /// missing is a `BonsaiModel::set_kv_backing(&mut self, backing:
 /// KvCacheBacking)` seam for that callback to call, which would require
 /// changing the block-forward signature across `block/types/forward.rs`,
-/// `forward_metal.rs` and `forward_cuda/*` (none of which this package
-/// owns) — precisely the cost the verifier's correction identifies as the
-/// blocker, agreeing with the option-2 ("this is real work, not a one-line
-/// wire-up") framing over pretending a partial wire-up is the real fix.
+/// `forward_metal.rs` and `forward_cuda/*` — a partial wire-up would not be
+/// the real fix, so none is attempted ("this is real work, not a one-line
+/// wire-up").
 /// `oxibonsai_runtime::kv_cache_policy` implements `From<KvCacheLevel> for
 /// KvCacheBacking` so that, once such a seam exists, wiring it is exactly
 /// `policy.set_action(move |level| model.set_kv_backing(level.into()))`.

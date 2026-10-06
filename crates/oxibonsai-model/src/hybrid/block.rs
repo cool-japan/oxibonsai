@@ -17,7 +17,7 @@
 //! Each block owns its activation buffers behind a `Mutex`, allocated once
 //! from the config rather than per token (`forward` used to allocate three
 //! `Vec`s per token on the dense path; the 27B would allocate fourteen).
-//! They live here, with the block, because B2-11's `block_full.rs` /
+//! They live here, with the block, because `block_full.rs` /
 //! `block_linear.rs` own the *forward bodies* but not this file — a forward
 //! must not have to widen the type it runs on.
 //!

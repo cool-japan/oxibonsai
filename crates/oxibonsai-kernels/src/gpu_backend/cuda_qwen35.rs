@@ -77,7 +77,7 @@ const TQ2_SOA_QS_BYTES: usize = 32;
 /// return).
 ///
 /// The caller must upload this output with
-/// [`crate::gpu_backend::cuda_graph::CudaGraph::upload_weight_soa_direct`]
+/// `crate::gpu_backend::cuda_graph::CudaGraph::upload_weight_soa_direct`
 /// (or its `_for_epoch` twin) — **not**
 /// `get_or_upload_weight_tq2_soa`/`_for_epoch`, which reformats its input
 /// as AoS and would corrupt already-SoA bytes.

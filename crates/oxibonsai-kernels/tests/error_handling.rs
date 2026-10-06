@@ -231,7 +231,7 @@ fn gemm_blocks_too_few() {
 }
 
 // ──────────────────────────────────────────────────────────────
-// Named length-contract errors (wave-1.5 addendum (7)): once a real kernel
+// Named length-contract errors: once a real kernel
 // call site migrates from the unnamed `KernelError::BufferTooSmall` /
 // `DimensionMismatch` to the named `buffer_too_small`/`dimension_mismatch`
 // constructors, this integration test should cover it end to end (not just

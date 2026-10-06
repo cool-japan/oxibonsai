@@ -212,8 +212,9 @@ fn metal_runner_layer_dump_tracks_the_cpu_dump_bonsai2() {
     check_step("dump", 0, &gl, &cl);
 }
 
-/// A prefill split into several GPU calls is bit-identical to feeding the
-/// tokens one at a time, and a reset replays the same logits.
+/// In [`Qwen35PrefillMode::Sequential`], a prefill split into several GPU
+/// calls is bit-identical to feeding the tokens one at a time, and a reset
+/// replays the same logits.
 #[test]
 fn metal_runner_chunked_prefill_is_bitwise_sequential_decode_bonsai2() {
     if !metal_available() {
@@ -224,6 +225,8 @@ fn metal_runner_chunked_prefill_is_bitwise_sequential_decode_bonsai2() {
     let mut cpu = cpu_model(&gguf);
     cpu.set_prefill_chunk(3).expect("chunk");
     let mut gpu = HybridMetalRunner::new(&cpu).expect("runner builds");
+    assert_eq!(gpu.prefill_mode(), Qwen35PrefillMode::Batched);
+    gpu.set_prefill_mode(Qwen35PrefillMode::Sequential);
     assert_eq!(gpu.max_batch(), 3);
     let tokens: Vec<u32> = (0..8u32).map(|i| (i * 37 + 11) % 512).collect();
     let vocab = gpu.vocab_size();
@@ -345,4 +348,127 @@ fn metal_runner_refuses_what_it_cannot_serve_bonsai2() {
     // An empty prefill is a no-op, as on the CPU.
     gpu.forward_prefill(&[], 0, &mut logits)
         .expect("empty prefill");
+}
+
+/// KV window of the batched-prefill fixtures: room for prompts long enough
+/// to run every projection on the GEMM.
+const LONG_WINDOW: usize = 256;
+
+fn long_cpu_model<'a>(gguf: &'a GgufFile<'a>) -> HybridModel<'a> {
+    let config = HybridModel::config_from_gguf(gguf).expect("fixture config");
+    let kernel = Arc::new(KernelDispatcher::with_tier(cpu_kernel_tier()));
+    HybridModel::from_gguf_with(gguf, config, LONG_WINDOW, &kernel).expect("fixture loads")
+}
+
+/// A 40-token prompt (every chunk on the tiled GEMM): the batched prefill
+/// tracks the CPU model within the CPU-tracking tolerance, and so do eight
+/// greedy decode steps after it — for every weight format the GEMMs decode.
+#[test]
+fn metal_runner_batched_prefill_tracks_the_cpu_model_bonsai2() {
+    if !metal_available() {
+        return;
+    }
+    let prompt: Vec<u32> = (0..40u32).map(|i| (i * 53 + 5) % 512).collect();
+    for quant in [
+        TensorType::PQ2_0,
+        TensorType::PTQ1_0,
+        TensorType::Q2_0G64,
+        TensorType::TQ2_0_g128,
+        TensorType::Q1_0G128,
+        TensorType::F32,
+    ] {
+        let bytes = fixture(FixtureShape::default(), quant);
+        let gguf = GgufFile::parse(&bytes).expect("fixture parses");
+        let mut cpu = long_cpu_model(&gguf);
+        let mut gpu = HybridMetalRunner::new(&cpu).expect("runner builds");
+        assert_eq!(gpu.prefill_mode(), Qwen35PrefillMode::Batched);
+        let vocab = cpu.config().base.vocab_size;
+        let (mut cl, mut gl) = (vec![0.0f32; vocab], vec![0.0f32; vocab]);
+        cpu.forward_prefill(&prompt, 0, &mut cl)
+            .expect("cpu prefill");
+        gpu.forward_prefill(&prompt, 0, &mut gl)
+            .expect("metal prefill");
+        let label = format!("{quant:?} batched");
+        check_step(&label, 0, &gl, &cl);
+        for step in 0..8 {
+            let token = u32::try_from(argmax(&cl)).expect("token id");
+            let pos = prompt.len() + step;
+            cpu.forward(token, pos, &mut cl).expect("cpu decode");
+            gpu.forward_into(token, pos, &mut gl).expect("metal decode");
+            check_step(&label, step + 1, &gl, &cl);
+        }
+    }
+}
+
+/// The batched prefill against the sequential one on the same runner kind:
+/// cosine ≥ 0.99999 and worst relative error ≤ 1e-4 on the logits (the
+/// GEMM only reorders each projection's sums), and the batched result does
+/// not depend on the chunking when every chunk takes the GEMM (40 tokens in
+/// one call, in 24 + 16 and in 20 + 20 — bitwise, recurrent state
+/// included).
+#[test]
+fn metal_runner_batched_prefill_matches_sequential_and_is_chunk_invariant_bonsai2() {
+    if !metal_available() {
+        return;
+    }
+    let prompt: Vec<u32> = (0..40u32).map(|i| (i * 29 + 1) % 512).collect();
+    let bytes = fixture(FixtureShape::default(), TensorType::PQ2_0);
+    let gguf = GgufFile::parse(&bytes).expect("fixture parses");
+    let cpu = long_cpu_model(&gguf);
+    let vocab = cpu.config().base.vocab_size;
+    let run = |mode: Qwen35PrefillMode, batch: usize| {
+        let mut gpu = HybridMetalRunner::new(&cpu).expect("runner builds");
+        gpu.set_prefill_mode(mode);
+        gpu.set_max_batch(batch).expect("batch");
+        let mut logits = vec![0.0f32; vocab];
+        gpu.forward_prefill(&prompt, 0, &mut logits)
+            .expect("prefill");
+        (logits, gpu.snapshot_state().expect("snapshot"))
+    };
+    let (seq, _) = run(Qwen35PrefillMode::Sequential, 64);
+    let (whole, whole_state) = run(Qwen35PrefillMode::Batched, 64);
+    let (cos, rel) = (cosine(&whole, &seq), worst_rel(&whole, &seq));
+    eprintln!("batched vs sequential 40-token prefill: cosine {cos:.9}, worst rel {rel:.3e}");
+    assert!(cos >= 0.999_99, "cosine {cos}");
+    assert!(rel <= 1e-4, "worst relative error {rel:e}");
+    for batch in [24usize, 20] {
+        let (chunked, state) = run(Qwen35PrefillMode::Batched, batch);
+        assert_bits(&chunked, &whole, &format!("batch {batch} vs one call"));
+        assert!(
+            state == whole_state,
+            "batch {batch}: recurrent state differs"
+        );
+    }
+}
+
+/// The runner's batch follows the request: `new_in_place_with_batch` builds
+/// it with the requested batch (and the footprint of that batch matches the
+/// built runner), `set_max_batch` moves it, a zero batch is refused, and a
+/// call past the batch is refused before any GPU work.
+#[test]
+fn metal_runner_batch_capacity_follows_the_request_bonsai2() {
+    if !metal_available() {
+        return;
+    }
+    let bytes = fixture(FixtureShape::default(), TensorType::PTQ1_0);
+    let gguf = GgufFile::parse(&bytes).expect("fixture parses");
+    let cpu = long_cpu_model(&gguf);
+    let mut gpu =
+        HybridMetalRunner::new_in_place_with_batch(&cpu, gguf.data, 96).expect("runner builds");
+    assert_eq!(gpu.max_batch(), 96);
+    let footprint = HybridMetalRunner::footprint(&cpu)
+        .expect("footprint")
+        .with_max_batch(96);
+    assert_eq!(footprint.config().max_batch, 96);
+    assert_eq!(footprint.device, gpu.device_footprint());
+    assert!(HybridMetalRunner::new_in_place_with_batch(&cpu, gguf.data, 0).is_err());
+    let prompt: Vec<u32> = (0..120u32).map(|i| i % 512).collect();
+    let mut logits = vec![0.0f32; gpu.vocab_size()];
+    assert!(gpu.forward_with_dump(&prompt, 0).is_err(), "120 > 96");
+    gpu.set_max_batch(128).expect("grow");
+    assert_eq!(gpu.max_batch(), 128);
+    gpu.forward_prefill(&prompt, 0, &mut logits)
+        .expect("prefill in one call");
+    assert!(gpu.set_max_batch(0).is_err());
+    assert_eq!(gpu.max_batch(), 128);
 }

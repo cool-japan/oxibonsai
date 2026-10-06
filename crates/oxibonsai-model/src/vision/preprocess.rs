@@ -39,7 +39,7 @@
 
 use rayon::prelude::*;
 
-use super::image_decode::ImageInputError;
+use super::image_decode::{ImageInputError, MAX_DECODED_PIXELS};
 use super::{GridSize, ImageRgb8, VisionTower};
 
 /// The per-image merged-token budget unless the caller says otherwise
@@ -53,6 +53,45 @@ pub const QWEN_VL_MIN_IMAGE_TOKENS: usize = 8;
 /// The largest budget accepted (`--image-max-tokens`): 16 384 merged tokens
 /// is a 4096 x 4096 image, 4x the reference's own default maximum.
 pub const MAX_IMAGE_MAX_TOKENS: usize = 16_384;
+
+/// The side of one merged-grid cell, in pixels, of the Qwen3-VL projector the
+/// Bonsai 2 models ship: 16-pixel patches merged 2 x 2 (the projector loader
+/// only accepts a spatial merge of 2). [`PreprocessConfig::merge_unit`] is the
+/// same number read from a loaded tower; this constant is for a caller that
+/// must size a limit before the tower is loaded.
+pub const QWEN_VL_MERGE_UNIT: usize = 32;
+
+/// How many times the pixels a token budget can use ([`PreprocessConfig::max_pixels`])
+/// a *source* image may have and still be decoded: 16, i.e. one downscale of
+/// 4x per side. The resize brings every image to the budget anyway, so a
+/// source far beyond it only costs memory — a PNG declaring 8192 x 8192 pixels
+/// needs over a gigabyte to inflate, unfilter and convert, and its compressed
+/// size can be half a megabyte.
+pub const SOURCE_PIXEL_HEADROOM: usize = 16;
+
+/// The decode budget never falls below this many pixels (16 Mpx, a typical
+/// camera photo), whatever the token budget: a small `--image-max-tokens`
+/// asks for a smaller *grid*, not for photographs to be refused.
+pub const MIN_SOURCE_PIXELS: usize = 16 * 1024 * 1024;
+
+/// The most pixels a source image may have to be decoded, for a per-image
+/// token budget of `max_tokens` on a tower whose merged-grid cell is
+/// `merge_unit` pixels on a side:
+///
+/// `max_tokens * merge_unit^2 * SOURCE_PIXEL_HEADROOM`, at least
+/// [`MIN_SOURCE_PIXELS`] and at most [`MAX_DECODED_PIXELS`] (the hard limit
+/// no budget lifts).
+///
+/// At the default budget ([`DEFAULT_IMAGE_MAX_TOKENS`], 1024 tokens, 32-pixel
+/// cells) that is 16 777 216 pixels: a 4032 x 3024 phone photo passes, a
+/// 48-megapixel one needs `--image-max-tokens 3072` or a smaller picture.
+#[must_use]
+pub fn source_pixel_budget(max_tokens: usize, merge_unit: usize) -> usize {
+    max_tokens
+        .saturating_mul(merge_unit.saturating_mul(merge_unit))
+        .saturating_mul(SOURCE_PIXEL_HEADROOM)
+        .clamp(MIN_SOURCE_PIXELS, MAX_DECODED_PIXELS)
+}
 
 /// Pillow-compatible resampling filters (`resize_algo`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -196,6 +235,13 @@ impl PreprocessConfig {
     #[must_use]
     pub fn max_pixels(&self) -> usize {
         self.max_tokens.saturating_mul(self.merge_unit().pow(2))
+    }
+
+    /// The most pixels a source image may have to be decoded under this
+    /// configuration ([`source_pixel_budget`]).
+    #[must_use]
+    pub fn max_source_pixels(&self) -> usize {
+        source_pixel_budget(self.max_tokens, self.merge_unit())
     }
 }
 
@@ -506,6 +552,61 @@ mod tests {
 
     fn cfg(max_tokens: usize) -> PreprocessConfig {
         PreprocessConfig::qwen_vl(16, 2, max_tokens).expect("config")
+    }
+
+    /// The decode budget a token budget justifies: sixteen times the pixels
+    /// of the grid it allows, held between a camera-photo floor and the hard
+    /// decode limit.
+    #[test]
+    fn the_source_pixel_budget_follows_the_token_budget_between_its_floor_and_cap() {
+        let default = source_pixel_budget(DEFAULT_IMAGE_MAX_TOKENS, QWEN_VL_MERGE_UNIT);
+        assert_eq!(default, 16 * 1024 * 1024);
+        // A 12-megapixel phone photo passes the default budget; 48 Mpx does
+        // not, and passes once the token budget is three times as large.
+        assert!(4032 * 3024 <= default);
+        assert!(8000 * 6000 > default);
+        assert!(
+            8000 * 6000 <= source_pixel_budget(3 * DEFAULT_IMAGE_MAX_TOKENS, QWEN_VL_MERGE_UNIT)
+        );
+
+        // Below the floor a small token budget still admits ordinary photos.
+        for tokens in [1, 8, 64, 512] {
+            assert_eq!(
+                source_pixel_budget(tokens, QWEN_VL_MERGE_UNIT),
+                MIN_SOURCE_PIXELS,
+                "{tokens} tokens"
+            );
+        }
+        // Above the cap no token budget lifts the hard limit, and nothing
+        // overflows on the way there.
+        assert_eq!(
+            source_pixel_budget(MAX_IMAGE_MAX_TOKENS, QWEN_VL_MERGE_UNIT),
+            MAX_DECODED_PIXELS
+        );
+        assert_eq!(
+            source_pixel_budget(usize::MAX, usize::MAX),
+            MAX_DECODED_PIXELS
+        );
+        // Between the two it grows with the token budget.
+        let mut last = 0;
+        for tokens in (0..=MAX_IMAGE_MAX_TOKENS).step_by(512) {
+            let now = source_pixel_budget(tokens, QWEN_VL_MERGE_UNIT);
+            assert!(now >= last, "{tokens} tokens: {now} < {last}");
+            assert!((MIN_SOURCE_PIXELS..=MAX_DECODED_PIXELS).contains(&now));
+            last = now;
+        }
+        // The configuration of a tower answers the same question, from its
+        // own geometry; the loader-free constant is that geometry's value.
+        assert_eq!(cfg(1).merge_unit(), QWEN_VL_MERGE_UNIT);
+        for tokens in [1, 1024, 4096, MAX_IMAGE_MAX_TOKENS] {
+            assert_eq!(
+                cfg(tokens).max_source_pixels(),
+                source_pixel_budget(tokens, QWEN_VL_MERGE_UNIT),
+                "{tokens} tokens"
+            );
+        }
+        // A source at the budget is never smaller than what the resize keeps.
+        assert!(cfg(1024).max_source_pixels() >= cfg(1024).max_pixels());
     }
 
     /// The reference's box for the golden fixture and its neighbours.

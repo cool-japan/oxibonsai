@@ -419,7 +419,13 @@ fn image_max_tokens_accepts_exactly_its_range() {
     let zero = parse_image_max_tokens("0").expect_err("zero");
     assert!(zero.contains(">= 1"), "{zero}");
     assert!(parse_image_max_tokens("many").is_err());
-    for command in ["run", "chat", "serve"] {
+    // `serve` exists only in a build with the `server` feature.
+    let commands: &[&str] = if cfg!(feature = "server") {
+        &["run", "chat", "serve"]
+    } else {
+        &["run", "chat"]
+    };
+    for &command in commands {
         let mut argv = vec!["oxibonsai", command];
         if command == "run" {
             argv.extend(["--prompt", "hi"]);
@@ -823,5 +829,167 @@ fn eval_parses_tokenizer_backend_and_defaults_to_auto() {
             tokenizer_backend, ..
         } => assert_eq!(tokenizer_backend, TokenizerBackendChoice::Auto),
         _ => panic!("expected Eval"),
+    }
+}
+
+/// The `--help` text of three flags whose help once contradicted their
+/// behaviour states the real rule: the engine-pool sizing (a Metal pool is
+/// capped at the session ceiling, not clamped to 1), the flat built-in
+/// rate-limit burst, and the HuggingFace tokenizer backend being an opt-in
+/// build feature rather than on by default.
+#[test]
+fn help_text_states_the_real_pool_burst_and_tokenizer_rules() {
+    use clap::CommandFactory;
+
+    fn long_help(subcommand: &str) -> String {
+        let mut command = Cli::command();
+        command.build();
+        command
+            .find_subcommand_mut(subcommand)
+            .unwrap_or_else(|| panic!("`{subcommand}` is a subcommand"))
+            .render_long_help()
+            .to_string()
+    }
+
+    #[cfg(feature = "server")]
+    {
+        let serve = long_help("serve");
+        assert!(
+            serve.contains("OXIBONSAI_METAL_MAX_SESSIONS"),
+            "--pool-size names the Metal session ceiling:\n{serve}"
+        );
+        assert!(
+            !serve.contains("auto-clamped to 1"),
+            "--pool-size no longer claims an unconditional clamp to 1:\n{serve}"
+        );
+        assert!(
+            serve.contains("a flat 20"),
+            "--rate-limit-burst names its built-in default:\n{serve}"
+        );
+        assert!(
+            !serve.contains("small multiple of the RPM"),
+            "--rate-limit-burst no longer claims a multiple of the RPM:\n{serve}"
+        );
+    }
+
+    let run = long_help("run");
+    assert!(
+        run.contains("opt-in"),
+        "`--tokenizer-backend hf` is described as an opt-in build feature:\n{run}"
+    );
+    assert!(
+        !run.contains("on by default"),
+        "`--tokenizer-backend hf` is not on by default:\n{run}"
+    );
+}
+
+#[test]
+fn parse_image_url_timeout_ms_takes_whole_milliseconds_of_at_least_one() {
+    assert_eq!(parse_image_url_timeout_ms("1").expect("one"), 1);
+    assert_eq!(
+        parse_image_url_timeout_ms("10000").expect("the default"),
+        10_000
+    );
+    for bad in ["0", "-1", "1.5", "soon", ""] {
+        assert!(parse_image_url_timeout_ms(bad).is_err(), "{bad:?}");
+    }
+}
+
+#[test]
+fn parse_image_url_allow_host_checks_each_entry_and_keeps_it_as_given() {
+    for good in [
+        "images.intranet",
+        "images.intranet:8080",
+        "127.0.0.1:9000",
+        "[::1]:9000",
+        "::1",
+    ] {
+        assert_eq!(parse_image_url_allow_host(good).expect(good), good);
+    }
+    assert_eq!(
+        parse_image_url_allow_host(" images.intranet ").expect("trimmed"),
+        "images.intranet"
+    );
+    for bad in [
+        "",
+        "http://images.intranet",
+        "images.intranet/path",
+        "user@images.intranet",
+        "images.intranet:0",
+        "bad host",
+        "[fe80::1%en0]",
+    ] {
+        let why = parse_image_url_allow_host(bad).expect_err(bad);
+        assert!(why.contains("not a host or host:port"), "{bad:?}: {why}");
+    }
+}
+
+/// The remote-image settings parse on every command that resolves image
+/// references (repeatable allowlist, optional deadline, both absent by
+/// default), and a malformed value is refused by the parser, naming the flag.
+#[test]
+fn the_remote_image_flags_parse_on_run_chat_and_serve() {
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("oxibonsai").chain(args.iter().copied()))
+    }
+    fn settings_of(command: Commands) -> (Option<u64>, Vec<String>) {
+        match command {
+            Commands::Run {
+                image_url_timeout_ms,
+                image_url_allow_host,
+                ..
+            }
+            | Commands::Chat {
+                image_url_timeout_ms,
+                image_url_allow_host,
+                ..
+            } => (image_url_timeout_ms, image_url_allow_host),
+            #[cfg(feature = "server")]
+            Commands::Serve {
+                image_url_timeout_ms,
+                image_url_allow_host,
+                ..
+            } => (image_url_timeout_ms, image_url_allow_host),
+            _ => panic!("not a command that resolves image references"),
+        }
+    }
+
+    #[cfg_attr(not(feature = "server"), allow(unused_mut))]
+    let mut commands: Vec<Vec<&str>> = vec![vec!["run", "-p", "hi"], vec!["chat"]];
+    #[cfg(feature = "server")]
+    commands.push(vec!["serve"]);
+    for command in &commands {
+        let mut args = command.clone();
+        args.extend([
+            "--image-url-timeout-ms",
+            "2500",
+            "--image-url-allow-host",
+            "a.example",
+            "--image-url-allow-host",
+            "127.0.0.1:8080",
+        ]);
+        let (timeout, hosts) = settings_of(parse(&args).expect("the flags parse").command);
+        assert_eq!(timeout, Some(2_500), "{command:?}");
+        assert_eq!(hosts, ["a.example", "127.0.0.1:8080"], "{command:?}");
+
+        let (timeout, hosts) = settings_of(parse(command).expect("no flags parse").command);
+        assert_eq!(
+            (timeout, hosts.len()),
+            (None, 0),
+            "{command:?}: the defaults"
+        );
+
+        for (flag, value) in [
+            ("--image-url-timeout-ms", "0"),
+            ("--image-url-allow-host", "user@images.intranet"),
+        ] {
+            let mut args = command.clone();
+            args.extend([flag, value]);
+            let error = match parse(&args) {
+                Ok(_) => panic!("{args:?} must not parse"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains(flag), "{args:?}: {error}");
+        }
     }
 }

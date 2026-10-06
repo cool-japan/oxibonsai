@@ -22,7 +22,7 @@ fn test_dispatch_auto_detect() {
     let tier = dispatcher.tier();
     let name = dispatcher.name();
 
-    // FIX3-BUILD (wave 3.5): this whole test was unreachable under default
+    // This whole test was unreachable under default
     // features until the E0004 fix just below (the file failed to compile
     // at all), so the literal expectations here were never actually run and
     // had gone stale against cli-16 (already landed in `oxibonsai-kernels`,
@@ -52,7 +52,7 @@ fn test_dispatch_auto_detect() {
         KernelTier::Gpu => {
             assert!(name.contains("GPU") || name.contains("scirs2"));
         }
-        // cli-09 / FIX3-BUILD (wave 3.5): this crate's `#[cfg(feature =
+        // cli-09: this crate's `#[cfg(feature =
         // "gpu")]` arm above tracks THIS crate's OWN `gpu` feature, but
         // `KernelTier::Gpu` (`oxibonsai_kernels::tier::KernelTier`) is
         // gated on `oxibonsai-kernels`' OWN `gpu` feature — a dependency's

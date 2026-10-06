@@ -1,15 +1,14 @@
-//! Decode-attention criterion benchmark (K-M1, re-homed from MODEL-ATTN's
-//! acceptance clause 3, wave-1/1.5 addenda).
+//! Decode-attention criterion benchmark (K-M1).
 //!
 //! Benchmarks [`fused_attention_head_contiguous`] against a **local copy**
 //! of the frozen pre-change algorithm ([`old_algorithm`], below), sweeping
 //! `seq_len` in `{128, 256, 512, 1024, 4096, 8192}` x `head_dim` in
-//! `{64, 128, 256}` — not just `seq_len=8192`, which the wave-1.5 D-2
-//! decision noted maximally *dilutes* the allocation-churn win the change
+//! `{64, 128, 256}` — not just `seq_len=8192`, which maximally *dilutes* the
+//! allocation-churn win the change
 //! targets (one accumulator amortised over `8192*256` FLOPs) and is what
 //! produced the sub-1.0x readings that withdrew the original `>= 1.5x`
 //! target. This benchmark asserts **no ratio threshold** — it only records
-//! numbers, per that withdrawal (orchestrator decision D-2; the four
+//! numbers, per that withdrawal (the four
 //! release-run readings were 0.87x / 0.94x / 1.05x / 1.23x, two of them
 //! below 1.0x, and `attention_fused.rs`'s own doc comment now reads "a wash
 //! to modestly faster at this configuration").
@@ -21,9 +20,7 @@
 //! `mod old_algorithm`, included into `attention_fused.rs` only under
 //! `#[cfg(test)] #[path = "attention_fused_tests.rs"] mod tests;`. Two
 //! independent things make it unreachable from an external `benches/`
-//! crate, and both live in that file, which is **not** in this package's
-//! `owned_files` (only `attention_fused.rs` itself, plus this new bench,
-//! were granted):
+//! crate, and both live in that file:
 //!
 //! 1. `mod tests` is gated `#[cfg(test)]`, so it is compiled only for this
 //!    crate's own `cargo test`/`cargo nextest` run, never for a dependent

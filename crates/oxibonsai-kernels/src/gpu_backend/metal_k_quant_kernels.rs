@@ -6,7 +6,7 @@
 //! - **No private Metal state** (`MET-10`). All six pipelines are resolved by
 //!   entry-point name from the combined metallib `build.rs` embeds
 //!   (`ACTIVE_KERNELS` lists `MSL_GEMV_Q2K_V1` … `MSL_GEMV_Q8K_V1`) through
-//!   [`MetalGraph::pipeline_for`] — the embedded → disk-cached → `xcrun` →
+//!   `MetalGraph::pipeline_for` — the embedded → disk-cached → `xcrun` →
 //!   runtime-source cascade shared by every kernel family. This file used to
 //!   open its own device and compile six separate `MTLLibrary`s from source on
 //!   first use, uncached, every process start.
@@ -441,7 +441,7 @@ mod tests {
     }
 
     /// GPU decode of `golden` vs. the byte-exact CPU reference decode of the
-    /// same bytes — `BlockQ*K::dequant` is this package's normative oracle.
+    /// same bytes — `BlockQ*K::dequant` is this crate's normative oracle.
     macro_rules! assert_gpu_matches_cpu_reference {
         ($label:literal, $blk:ty, $metal:path, $bytes:expr) => {{
             let buf = $bytes;

@@ -53,7 +53,7 @@ pub(crate) use crate::model::weight_loaders::{
 };
 #[cfg(test)]
 use constructors::{effective_context, parse_force_cpu_after, prealloc_context};
-use decode::run_blocks;
+use decode::{in_autorelease_pool, run_blocks};
 use embedding::EmbeddingTable;
 
 #[cfg(all(
@@ -498,24 +498,29 @@ impl<'a> BonsaiModel<'a> {
             return;
         }
         tracing::info!(blocks = n_blocks, "uploading model weights to GPU");
-        for block in &mut self.blocks {
-            block.upload_to_gpu(kernel);
-        }
-        match self.output_weight {
-            OutputWeight::OneBit(ref mut linear) => linear.upload_to_gpu(),
-            OutputWeight::Ternary(ref mut linear) => linear.upload_to_gpu(),
-            OutputWeight::FP8E4M3(_)
-            | OutputWeight::FP8E5M2(_)
-            | OutputWeight::Q4_0(_)
-            | OutputWeight::Q8_0(_)
-            | OutputWeight::Q5K(_)
-            | OutputWeight::Q6K(_)
-            | OutputWeight::Q2K(_)
-            | OutputWeight::Q3K(_)
-            | OutputWeight::Q4K(_)
-            | OutputWeight::Q8K(_) => {}
-            OutputWeight::Fp32 { .. } => {}
-        }
+        // On a Metal build the uploads go through the scirs2-core GPU backend,
+        // whose Metal objects are autoreleased: pooled here so they are freed
+        // when the upload returns, not when the calling thread exits.
+        in_autorelease_pool(|| {
+            for block in &mut self.blocks {
+                block.upload_to_gpu(kernel);
+            }
+            match self.output_weight {
+                OutputWeight::OneBit(ref mut linear) => linear.upload_to_gpu(),
+                OutputWeight::Ternary(ref mut linear) => linear.upload_to_gpu(),
+                OutputWeight::FP8E4M3(_)
+                | OutputWeight::FP8E5M2(_)
+                | OutputWeight::Q4_0(_)
+                | OutputWeight::Q8_0(_)
+                | OutputWeight::Q5K(_)
+                | OutputWeight::Q6K(_)
+                | OutputWeight::Q2K(_)
+                | OutputWeight::Q3K(_)
+                | OutputWeight::Q4K(_)
+                | OutputWeight::Q8K(_) => {}
+                OutputWeight::Fp32 { .. } => {}
+            }
+        });
         tracing::info!("GPU weight upload complete");
     }
 

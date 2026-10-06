@@ -23,7 +23,7 @@
 //! threads), then requires the kernel to return the **minimal** tied index —
 //! the `argmax_first` rule the CPU sampler and llama.cpp use.
 //!
-//! Coverage (the verifier is explicit that the 1000/2000 example alone is not
+//! Coverage (the 1000/2000 example alone is not
 //! sufficient):
 //! * ≥ 300 randomized seeds, tie multiplicity 2..=16;
 //! * tie positions placed *across* threadgroup slots (the discriminating

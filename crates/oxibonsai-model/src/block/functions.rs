@@ -105,7 +105,7 @@ pub(super) fn compute_gqa_attention(
 /// cached history `0..seq_len`, one [`KvCache::attend_group`] call per KV
 /// head (optionally in parallel across KV heads).
 ///
-/// The cache is read in place whatever its element type (B2-11-FIX): an
+/// The cache is read in place whatever its element type: an
 /// `f32` cache runs each query head through `fused_attention_head_contiguous`
 /// over zero-copy slices — the exact bits this function has always
 /// produced — and an `f16` cache (the host default) widens each history row
@@ -186,7 +186,7 @@ pub(crate) fn gqa_attention(
 /// 2. `num_heads % num_kv_heads == 0` — GQA grouping must be exact.
 /// 3. `attn_q`'s output width is `head_dim * num_heads` (a plain Q
 ///    projection) or exactly double that (the Bonsai-2 q|gate interleave,
-///    B2-11 — not yet implemented on this `TransformerBlock`, but the check
+///    not yet implemented on this `TransformerBlock`, but the check
 ///    is written to already accept that layout).
 /// 4. This layer's `(head_dim, num_kv_heads)` matches the cache's fixed
 ///    stride — the direct fix for the "silent cross-layer KV read" defect.
@@ -1291,7 +1291,7 @@ mod tests {
         }
     }
 
-    /// B1 (MC-FIX D5): the block-level fused helper **refuses** a resident
+    /// The block-level fused helper **refuses** a resident
     /// buffer of the wrong size instead of running the GEMV past its end.
     ///
     /// The slot is filled first with the Q projection alone — what a

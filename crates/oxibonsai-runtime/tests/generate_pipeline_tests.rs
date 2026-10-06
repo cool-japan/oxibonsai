@@ -346,7 +346,7 @@ fn repetition_penalty_above_one_produces_valid_output() {
     }
 }
 
-// ── T-09 / FIX3-PARITY item 4: `repetition_penalty_vs_no_penalty_can_differ`
+// ── T-09: `repetition_penalty_vs_no_penalty_can_differ`
 //
 // That test asserted nothing. It ended in `let _ = (out_no, out_with);` under
 // the comment "We just verify both succeed", while its NAME claimed a
@@ -1151,7 +1151,7 @@ mod rt33_beam_search_kv_reuse_correctness {
     /// LSB-first) followed by a 2-byte FP16 scale
     /// (`00→-1, 01→0, 10→+1`).
     ///
-    /// CQ-14 (wave-2.5 deviation routing #7): `11` (`0b11`) is a *reserved*
+    /// CQ-14: `11` (`0b11`) is a *reserved*
     /// code, not a fourth value — `screen_ternary_codes` in
     /// `oxibonsai-model/src/weight_loaders.rs` now rejects it outright, so
     /// this fixture must never emit it. A raw `(state >> 33) as u8` byte
@@ -1160,7 +1160,7 @@ mod rt33_beam_search_kv_reuse_correctness {
     /// as `crates/oxibonsai-model/src/model/types/gpu_cache.rs::tq2_pattern`
     /// already does.
     ///
-    /// T-07 FIX (verifier wave 3): re-pointed at
+    /// T-07: re-pointed at
     /// `oxibonsai_testkit::gguf_fixture::Lcg::next_valid_tq2_byte`,
     /// byte-for-byte identical to the previous hand-rolled state machine
     /// (`Lcg::new(s)` stores `s` as its state directly, so pre-adding the

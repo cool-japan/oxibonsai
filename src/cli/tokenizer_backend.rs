@@ -1,20 +1,18 @@
 //! Tokenizer backend selection (cli-08).
 //!
-//! `--features native-tokenizer` used to be completely inert: it linked
-//! `oxibonsai-tokenizer` into the binary without ever routing a single call
-//! through it, since [`oxibonsai_runtime::TokenizerBridge::from_file`]
-//! always preferred the HuggingFace backend whenever `hf-tokenizer` (a
-//! *default* runtime feature) was compiled in — which it always is unless
-//! the whole binary is built with `--no-default-features`.
+//! The CLI has two tokenizer backends: the Pure-Rust native BPE backend
+//! (`oxibonsai-tokenizer`, available on every target) and the HuggingFace
+//! `tokenizers` backend, which exists only in a build with the opt-in
+//! `hf-tokenizer` Cargo feature (off by default: a default build does not link
+//! the `tokenizers` crate at all).
 //!
-//! This module gives the CLI's own `native-tokenizer` feature and the new
-//! `--tokenizer-backend {auto,native,hf}` flag a real, observable effect:
-//! `Auto` (the default) resolves to the native Pure-Rust backend when this
-//! binary was compiled with `native-tokenizer`, and to the HF backend
-//! otherwise (matching today's behaviour when the feature is off); `Native`
-//! / `Hf` force a specific backend, erroring instead of silently
-//! substituting the other one when the requested backend was not compiled
-//! in.
+//! `--tokenizer-backend {auto,native,hf}` selects between them. `Auto` (the
+//! default) resolves to the native backend in a default build and whenever the
+//! binary was compiled with `native-tokenizer`, and to the HuggingFace backend
+//! only in a build that has `hf-tokenizer` but not `native-tokenizer`.
+//! `Native` forces the Pure-Rust backend; `Hf` forces the HuggingFace one and
+//! errors, rather than silently substituting the native backend, when the
+//! binary was built without `hf-tokenizer`.
 
 use clap::ValueEnum;
 
@@ -29,8 +27,8 @@ pub(crate) enum TokenizerBackendChoice {
     /// target including `wasm32` and `--no-default-features` builds.
     Native,
     /// Force the HuggingFace `tokenizers` backend. Only available when
-    /// this binary was compiled with the runtime's `hf-tokenizer` feature
-    /// (on by default; absent from `--no-default-features` builds).
+    /// this binary was built with the opt-in `hf-tokenizer` Cargo feature
+    /// (off by default); otherwise selecting it is an error.
     Hf,
 }
 

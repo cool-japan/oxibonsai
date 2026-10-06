@@ -29,13 +29,14 @@
 //!   penalties are configured, or the tie-break gate is closed, the call
 //!   decodes the full logit row and applies penalties before the argmax
 //!   instead.
-//! * A sampled request on the fused Metal route with no penalty draws its
-//!   decode steps from the GPU's top-k candidates instead of the full logit
-//!   row (the sampled top-k route, on by default — see
-//!   [`SampledTopKConfig`]). The engine's own sampler makes the draw over a
-//!   candidate sub-row that contains every top-k survivor, in the sampler's
-//!   canonical survivor order, so the tokens are exactly the ones the full
-//!   row gives.
+//! * A sampled request on the fused Metal route decodes the full logit row
+//!   through the engine's sampler by default. With the opt-in sampled top-k
+//!   route ([`InferenceEngine::set_sampled_topk`]; off by default — see
+//!   [`SampledTopKConfig`]) and no penalty it instead draws its decode steps
+//!   from the GPU's top-k candidates. The engine's own sampler makes the
+//!   draw over a candidate sub-row that contains every top-k survivor, in the
+//!   sampler's canonical survivor order, so the tokens are exactly the ones
+//!   the full row gives.
 //!
 //! This closes `RT-24` and the CPU-vs-Metal greedy divergence: before it,
 //! `generate_greedy_gpu` was pure argmax and consulted neither the sampler
@@ -236,7 +237,9 @@ pub struct InferenceEngine<'a> {
     pub(crate) metrics: Option<Arc<InferenceMetrics>>,
     pub(crate) stats: Arc<EngineStats>,
     /// Cumulative number of tokens that have been processed by
-    /// [`InferenceEngine::prefill_from_pos`] across the engine's lifetime.
+    /// [`InferenceEngine::prefill_from_pos`] and
+    /// [`InferenceEngine::prefill_multimodal`] (every row of a multimodal
+    /// prompt, images expanded) across the engine's lifetime.
     ///
     /// Used by the prefix-cache integration to verify that cached prefixes
     /// actually reduce prefill work — the cached portion of a prompt is not
@@ -312,9 +315,13 @@ pub struct InferenceEngine<'a> {
     /// [`SequenceSnapshot`] is only restorable onto the sequence it was
     /// taken from.
     pub(crate) sequence_id: u64,
+    /// The restores that rolled the current sequence back, so a restore can
+    /// refuse a snapshot whose positions were rewritten since it was taken
+    /// (see [`crate::engine_seam::RewindLog`]).
+    pub(crate) rewinds: crate::engine_seam::RewindLog,
     /// Sampled decode on the fused GPU route (`perf-11`, sampled half):
     /// whether to download top-k candidates instead of the full logit row
-    /// (on by default — see [`SampledTopKConfig`]) and how many.
+    /// (off by default — see [`SampledTopKConfig`]) and how many.
     pub(crate) sampled_topk: SampledTopKConfig,
     /// The Metal hybrid runner a hybrid engine decodes on, when one serves
     /// its model (see [`crate::engine_hybrid_gpu`]); `None` for a dense
@@ -576,6 +583,7 @@ impl<'a> InferenceEngine<'a> {
             gpu_uploads: UploadStats::default(),
             backend: Backend::Auto,
             sequence_id: 0,
+            rewinds: crate::engine_seam::RewindLog::default(),
             sampled_topk: SampledTopKConfig::default(),
             hybrid_gpu: None,
             #[cfg(test)]
@@ -1106,9 +1114,7 @@ impl<'a> InferenceEngine<'a> {
         pos_start: usize,
     ) -> RuntimeResult<Vec<f32>> {
         let logits = self.prefill_logits(prompt_tokens, pos_start)?;
-        self.prefill_token_count = self
-            .prefill_token_count
-            .saturating_add(prompt_tokens.len() as u64);
+        self.record_prefill_tokens(prompt_tokens.len());
         Ok(logits)
     }
 
@@ -1544,9 +1550,17 @@ impl<'a> InferenceEngine<'a> {
     }
 
     /// Cumulative number of tokens that have been processed by
-    /// [`InferenceEngine::prefill_from_pos`] over this engine's lifetime.
+    /// [`InferenceEngine::prefill_from_pos`] and
+    /// [`InferenceEngine::prefill_multimodal`] over this engine's lifetime.
     pub fn prefill_token_count(&self) -> u64 {
         self.prefill_token_count
+    }
+
+    /// Count `tokens` prefilled positions into
+    /// [`prefill_token_count`](Self::prefill_token_count) — the one place
+    /// every successful prefill (text or multimodal) records its length.
+    pub(crate) fn record_prefill_tokens(&mut self, tokens: usize) {
+        self.prefill_token_count = self.prefill_token_count.saturating_add(tokens as u64);
     }
 
     /// Reset the model state for a new conversation.

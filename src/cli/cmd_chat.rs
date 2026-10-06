@@ -39,6 +39,7 @@ use super::util::{
     build_sampling_params, missing_tokenizer_warning, model_vocab_size,
     reject_penalties_with_constrained_decode, resolve_tokenizer_vocab_aware, StopChecker,
 };
+use super::vision;
 
 /// Resolved arguments for `oxibonsai chat`, merged from CLI flags and
 /// `--config` in `mod.rs` (cli-04). See [`cmd_run::RunArgs`] for the field
@@ -69,6 +70,10 @@ pub(crate) struct ChatArgs {
     pub(crate) ptq1_transcode: bool,
     pub(crate) prefill_chunk: Option<usize>,
     pub(crate) vision: bonsai2::VisionRequest,
+    /// `--allow-image-url-fetch`, `--image-url-timeout-ms` and
+    /// `--image-url-allow-host` (and their `OXI_*` fallbacks): which image
+    /// references resolve, and how a remote one is fetched.
+    pub(crate) image_sources: bonsai2::ImageSourceFlags,
     pub(crate) allow_vocab_mismatch: bool,
 }
 
@@ -304,6 +309,7 @@ pub(crate) fn run(args: ChatArgs) -> anyhow::Result<()> {
         ptq1_transcode,
         prefill_chunk,
         vision,
+        image_sources,
         allow_vocab_mismatch,
     } = args;
 
@@ -313,7 +319,7 @@ pub(crate) fn run(args: ChatArgs) -> anyhow::Result<()> {
             anyhow::anyhow!("no model: pass --model <gguf> or set OXI_MODEL (e.g. in .env)")
         })?;
 
-    vision.validate(true)?;
+    vision.validate(true, &image_sources)?;
     let contract = ChatContract::from_flags(enable_thinking, reasoning_effort, tools.as_deref())?;
     let (display, _) = ReasoningDisplay::from_flags(show_reasoning, hide_reasoning);
 
@@ -332,14 +338,14 @@ pub(crate) fn run(args: ChatArgs) -> anyhow::Result<()> {
         max_seq_len,
         rope_scaling,
     )?;
-    // The vision projector (design §6.2), before any language-model weight
-    // is bound: a wrong architecture or a variant projector fails fast.
-    let vision_service = vision.load_service(&arch, bonsai2::cli_image_policy())?;
-    if vision_service.is_some() && vision.images.is_empty() {
-        tracing::warn!(
-            "--mmproj without --image: the projector is loaded but no image is attached"
-        );
-    }
+    // The vision projector (design §6.2) is checked before any
+    // language-model weight is bound — a wrong architecture or a projector
+    // the towers refuse fails fast — and its header sizes the engine: a
+    // Metal-backed engine's KV window leaves room for the Metal tower. The
+    // tower itself is built once the engine exists, for the executor the
+    // engine decodes on.
+    let hybrid_options = vision.hybrid_load_options(&arch, prefill_chunk)?;
+    vision.check_image_tokens(&bonsai2::ModelVocabulary::of_gguf(&gguf))?;
     let sampling = cmd_run::resolve_sampling(temperature, top_k, top_p, min_p, &gguf.metadata)?;
 
     // cli-12: same shared constructor as `run`,
@@ -359,8 +365,30 @@ pub(crate) fn run(args: ChatArgs) -> anyhow::Result<()> {
         prefill_chunk,
         penalties: PenaltyParams::new(frequency_penalty, presence_penalty),
         min_p: sampling.min_p,
+        wants_vision: vision.mmproj.is_some(),
+        vision_resident_bytes: hybrid_options.vision_resident_bytes,
     };
     let mut engine = cmd_run::load_engine(&gguf, &load, source.transcoded_tensors())?;
+    // An engine that cannot serve image turns is refused here with its typed
+    // error, before the session's images are encoded.
+    if !vision.images.is_empty() {
+        vision::require_image_capable_engine(&engine)?;
+    }
+    // The projector, for the executor the engine decodes on. The image
+    // policy is built only when a projector is loaded, so a text-only
+    // session never reads the remote-image settings (a stale value in the
+    // shell or `.env` cannot stop it).
+    let vision_service = vision.load_service_for(
+        &arch,
+        &bonsai2::ModelVocabulary::of_gguf(&gguf),
+        || image_sources.cli_policy(),
+        &engine,
+    )?;
+    if vision_service.is_some() && vision.images.is_empty() {
+        tracing::warn!(
+            "--mmproj without --image: the projector is loaded but no image is attached"
+        );
+    }
 
     // TOK-08: vocab-aware resolution + a hard compatibility check, the
     // GGUF's own template attached, the GGUF-embedded tokenizer as the

@@ -135,13 +135,16 @@ pub struct LimitsConfig {
     pub max_concurrent_requests: usize,
     /// Per-request timeout, in milliseconds.
     pub per_request_timeout_ms: u64,
-    /// Number of inference-engine replicas for concurrent CPU serving.
+    /// Number of inference-engine replicas for concurrent serving.
     ///
-    /// `None` (the default) resolves to `min(4, CPU cores)` on CPU tiers, so a
-    /// few requests can generate in parallel out of the box. Replicas share one
-    /// `Arc<[f32]>` token-embedding table, so each extra replica only costs a KV
-    /// cache. An explicit value overrides this; the value is auto-clamped to `1`
-    /// on the GPU/Metal tier (a process-global singleton). Distinct from
+    /// `None` (the default) resolves to `min(4, CPU cores)` for a dense model
+    /// on a CPU tier, so a few requests can generate in parallel out of the
+    /// box, and to `1` on a Metal tier or for a Bonsai 2 `qwen35` model on any
+    /// executor. Replicas share one `Arc<[f32]>` token-embedding table, so each
+    /// extra replica only costs a KV cache. An explicit value is honoured on
+    /// the CPU and capped at `OXIBONSAI_METAL_MAX_SESSIONS` (default 4, one
+    /// Metal session per replica) on Metal; a CUDA-only build clamps it to `1`
+    /// (the CUDA graph is still a process-global singleton). Distinct from
     /// [`Self::max_concurrent_requests`], which bounds HTTP-level admission
     /// rather than the number of generation engines.
     #[serde(default)]

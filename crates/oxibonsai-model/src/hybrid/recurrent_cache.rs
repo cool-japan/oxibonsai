@@ -35,9 +35,8 @@
 //! crate, so the `impl` itself cannot live here (orphan rule); the three
 //! methods it needs are [`RecurrentCache::reset`],
 //! [`RecurrentCache::memory_bytes`] and [`RECURRENT_NAME`], and the
-//! forwarding impl is a five-line addition to
-//! `oxibonsai-runtime/src/engine_control.rs` (recorded as this package's
-//! deviation).
+//! forwarding impl lives in
+//! `oxibonsai-runtime/src/engine_control.rs`.
 
 use oxibonsai_core::config_hybrid::HybridConfig;
 use oxibonsai_kernels::gated_delta_net::GdnDims;
@@ -425,7 +424,7 @@ impl RecurrentCache {
 /// pool moves replicas across threads with `spawn_blocking`), and the
 /// forwarding impl has to live in that crate because of the orphan rule.
 /// Assert the bound here so a field added to [`RecurrentCache`] that breaks
-/// it fails in this package rather than in someone else's.
+/// it fails in this crate rather than in someone else's.
 const _: fn() = || {
     fn assert_send<T: Send>() {}
     assert_send::<RecurrentCache>();

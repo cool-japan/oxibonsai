@@ -409,8 +409,8 @@ impl<'a> HybridModel<'a> {
 
         // ── Caches ──────────────────────────────────────────────────────
         // Indexed by `kv_slot` (0..16 for the 27B), never by `layer_idx`,
-        // and allocated through the *fallible*, **lazy** constructor
-        // (REQUIRED #4 (4)): `max_seq_len` is the cache's fixed logical
+        // and allocated through the *fallible*, **lazy** constructor:
+        // `max_seq_len` is the cache's fixed logical
         // limit, but only one growth chunk is resident up front and the
         // decode loop grows it (`run_chunk` -> `try_ensure_capacity`) as
         // positions are reached. A 27B at the model's declared 262 144-token
@@ -584,7 +584,7 @@ impl<'a> HybridModel<'a> {
         Ok(std::mem::replace(&mut self.recurrent, replacement))
     }
 
-    /// Install `state` as this model's recurrent state (REQUIRED #6 / RT-28:
+    /// Install `state` as this model's recurrent state (RT-28:
     /// hand back a state taken with [`HybridModel::take_recurrent`], or one
     /// built for this geometry), after validating its geometry.
     ///
@@ -1377,7 +1377,7 @@ mod tests {
         assert_eq!(model.kv_cache().seq_len(), 0);
     }
 
-    /// REQUIRED #6: `reset` clears the KV cursor AND the recurrent state for
+    /// `reset` clears the KV cursor AND the recurrent state for
     /// real — proven by replaying the same tokens after a reset and getting
     /// bit-identical logits (a stale `S` or conv window would change them).
     #[test]
@@ -1433,7 +1433,7 @@ mod tests {
         );
     }
 
-    /// REQUIRED #6: `set_recurrent_state` validates the geometry and returns
+    /// `set_recurrent_state` validates the geometry and returns
     /// a typed error on mismatch, leaving the model's own state untouched.
     #[test]
     fn set_recurrent_state_installs_a_matching_state_and_refuses_a_foreign_one() {
@@ -1591,7 +1591,7 @@ mod real_model_tests {
     }
 
     fn models_dir() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models")
+        oxibonsai_testkit::workspace::models_dir()
     }
 
     /// Load one real file and assert the whole skeleton.

@@ -9,7 +9,7 @@ use crate::model_registry::ModelVariant;
 #[cfg(test)]
 use oxibonsai_core::Qwen3Config;
 
-// HOTFIX-TESTMEM: this module's tests used to build every fixture from
+// Test memory bound: this module's tests do not build their fixtures from
 // `Qwen3Config::bonsai_8b()/bonsai_4b()/bonsai_1_7b()`. Constructing a
 // `BonsaiModel` from one of those configs allocates ~5 GB of token_embd +
 // output_weight tables (plus a ~1.2 GB KV cache for the 8B case) via
@@ -19,7 +19,7 @@ use oxibonsai_core::Qwen3Config;
 //   - `model_creation` / `model_new_has_empty_blocks` / `model_reset_cache` /
 //     `model_kv_cache_memory` only check that the passed-in config and the
 //     empty-blocks/kv-cache bookkeeping are wired through correctly, which
-//     holds for any config, so they now use `Qwen3Config::tiny_test()`.
+//     holds for any config, so they use `Qwen3Config::tiny_test()`.
 //   - `model_variant_detection` and `model_info_methods` assert results that
 //     depend on the *specific* real dimensions ((36, 4096), (24, 2560),
 //     (28, 2048)) mapping to a known, non-`Custom` `ModelVariant` — see

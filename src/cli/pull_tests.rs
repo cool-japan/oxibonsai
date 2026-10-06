@@ -120,7 +120,7 @@ fn repo_overrides_apply_to_the_two_bonsai2_repositories_only() {
 
 /// The env-reading wrapper (`OXI_BONSAI2_REPO` / `OXI_BONSAI2_DEV_REPO` /
 /// `OXIBONSAI_HF_BASE_URL`), under the crate-wide env lock with RAII
-/// restore (ENGINE-SEAM addendum (3)).
+/// restore.
 #[test]
 fn environment_overrides_reach_the_resolved_url() {
     let _env = test_env::lock();

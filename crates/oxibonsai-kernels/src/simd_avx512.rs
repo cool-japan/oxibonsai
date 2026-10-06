@@ -323,11 +323,11 @@ pub unsafe fn gemv_1bit_g128_avx512(
 // ─── Register-blocked micro-kernels (K-18's AVX-512 tier) ───────────────
 //
 // `BlockedTier::Delegate` (gemm_ternary.rs) routes AVX-512 hosts straight
-// into this file's `gemm_*_avx512`, which until K-INT8 were loops of GEMVs:
+// into this file's `gemm_*_avx512`, which were once loops of GEMVs:
 // correct, and never a GPU escape, but with none of K-18's register
 // blocking, so an AVX-512 host re-streamed and re-decoded the whole weight
 // matrix once per batch row. Rather than add a second entry point that
-// `gemm_ternary.rs` (not this package's file) would have to be edited to
+// `gemm_ternary.rs` would have to be edited to
 // call, the blocking is applied **inside** the existing functions: same
 // names, same signatures, same numbers.
 //

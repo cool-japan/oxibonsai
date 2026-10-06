@@ -32,7 +32,7 @@ use oxibonsai_kernels::dispatch_int8::KERNEL_TIER_ENV;
 use oxibonsai_model::model::BonsaiModel;
 use oxibonsai_runtime::engine::InferenceEngine;
 use oxibonsai_runtime::sampling::SamplingParams;
-use oxibonsai_testkit::capability::{record_executed, record_skipped, Capability};
+use oxibonsai_testkit::capability::{record_executed_timed, record_skipped, Capability};
 use oxibonsai_testkit::gguf_fixture::Lcg;
 
 /// KV-cache / context budget for the synthetic model.
@@ -42,7 +42,7 @@ const MAX_SEQ: usize = 512;
 // Synthetic ternary fixture (verbatim copy of the shared known-good fixture).
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// CQ-14 (wave-2.5 deviation routing #7): each packed byte holds four 2-bit
+/// CQ-14: each packed byte holds four 2-bit
 /// ternary lanes, and only `{0, 1, 2}` are valid codes — `3` (`0b11`) is
 /// reserved and rejected by `screen_ternary_codes` in
 /// `oxibonsai-model/src/weight_loaders.rs`. Pushing a raw
@@ -54,7 +54,7 @@ const MAX_SEQ: usize = 512;
 /// `crates/oxibonsai-model/src/model/types/gpu_cache.rs::tq2_pattern`
 /// already does.
 ///
-/// T-07 FIX (verifier wave 3): re-pointed at
+/// T-07: re-pointed at
 /// `oxibonsai_testkit::gguf_fixture::Lcg::next_valid_tq2_byte`. This
 /// produces byte-for-byte identical output to the previous hand-rolled
 /// state machine: `Lcg::new(s)` stores `s` as its state directly (no extra
@@ -149,8 +149,8 @@ fn build_synthetic_ternary_gguf() -> Vec<u8> {
         tensor_type: TensorType::F32,
         data: f32_pattern(h, 1.0),
     });
-    // Seeds restored to `0xCAFE_BABE` (verifier wave 3, round 2 empirical
-    // finding): a prior fix round reseeded these to `0xC0FF_EE01` /
+    // Seeds restored to `0xCAFE_BABE` (an empirical finding): a prior fix round
+    // reseeded these to `0xC0FF_EE01` /
     // `0x2000_0000`, theorizing a fixture-coincidence near-exact-tie logit
     // masked by the CQ-14 lane-fold. That theory was proven FALSE by direct
     // measurement: with the *original* seeds and the (already-correct,
@@ -163,7 +163,7 @@ fn build_synthetic_ternary_gguf() -> Vec<u8> {
     // still falls through to the single process-default session — see
     // `gpu_serial`'s own doc comment below) run concurrently under `cargo
     // test`'s default in-binary thread parallelism — the same
-    // METAL-CONCURRENCY class of bug `gpu_backend_tests.rs::gpu_serial` (and
+    // Metal concurrency class of bug `gpu_backend_tests.rs::gpu_serial` (and
     // `metal_prefill_ternary_parity_tests.rs::gpu_serial`, its precedent)
     // already serializes around. Reseeding never fixed anything; it just
     // relocated the race to a token boundary where it happened not to flip
@@ -463,6 +463,7 @@ fn real_model_greedy_gpu_fallback_byte_identical() {
         record_skipped(Capability::LegacyModels, TEST);
         return;
     };
+    let gate_start = std::time::Instant::now();
     let gguf = std::fs::read(&path).expect("read OXI_MODEL gguf");
 
     // Realistic Qwen3 chat-template prefix.
@@ -490,7 +491,7 @@ fn real_model_greedy_gpu_fallback_byte_identical() {
          all-GPU / forced-CPU-fallback / pure-CPU",
         all_gpu.len()
     );
-    record_executed(Capability::LegacyModels, TEST);
+    record_executed_timed(Capability::LegacyModels, TEST, gate_start.elapsed());
 }
 
 /// A hybrid (`qwen35`) engine on the Metal hybrid runner has no mid-stream

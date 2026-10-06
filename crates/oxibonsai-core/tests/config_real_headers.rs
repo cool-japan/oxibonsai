@@ -1,7 +1,7 @@
 //! Integration tests that parse REAL PrismML Bonsai 2 27B GGUF headers, and
 //! (when available) the real dense Bonsai/Ternary-Bonsai GGUFs, proving
 //! `Qwen3Config`, `HybridConfig` and `HadamardConfig` work against actual
-//! file bytes rather than only synthetic fixtures (B2-02 acceptance:
+//! file bytes rather than only synthetic fixtures (acceptance:
 //! "parses all six real 27B headers"; M-34: "each named constructor equals
 //! `from_metadata` on the corresponding real file when present").
 //!
@@ -25,7 +25,7 @@
 //!   checked out locally. The M-34 named-constructor-vs-real-file
 //!   assertions run by default whenever the specific file is present (e.g.
 //!   the primary repo, post-merge) — this is exactly the gate that caught
-//!   B2-02's `ternary_bonsai_8b()` YaRN defect — and self-skip (recording
+//!   the `ternary_bonsai_8b()` YaRN defect — and self-skip (recording
 //!   the miss under `Capability::LegacyModels`) only when it is absent.
 
 use std::path::{Path, PathBuf};

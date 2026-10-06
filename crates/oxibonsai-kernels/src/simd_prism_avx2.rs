@@ -561,7 +561,7 @@ pub unsafe fn gemm_ptq1_0_avx2(
 }
 
 // ---------------------------------------------------------------------------
-// Register-blocked (MR-tiled) AVX2 GEMM — K-INT8 / gatekeeper REQUIRED #9
+// Register-blocked (MR-tiled) AVX2 GEMM
 //
 // The x86-64 twin of `simd_prism_neon.rs`'s blocked kernels, with the same
 // bit-identity contract: one decoded block is consumed by `PRISM_GEMM_MR`

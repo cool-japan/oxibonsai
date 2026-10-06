@@ -3,8 +3,8 @@
 //! runtime — `crates/oxibonsai-model/src/convert/{mod,onnx/mod}.rs` only
 //! implemented `tq2_0_g128`.
 //!
-//! Wave 1 closed the honesty gap by removing `q1_0_g128` from `--help`.
-//! Wave 2 implements Q1\_0\_g128 for real in the converter (reusing the
+//! `q1_0_g128` was first removed from `--help` to close an honesty gap and
+//! is now implemented for real in the converter (reusing the
 //! shipping `crate::quantize::quantize_q1_0_g128` encoder and its canonical
 //! sign convention), so this test now pins the *positive* contract restored
 //! alongside it:

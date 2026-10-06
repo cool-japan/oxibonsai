@@ -4,10 +4,14 @@
 //! is performed with a brute-force linear scan over all entries, evaluating
 //! the configured [`Distance`] metric against the query vector, and keeping
 //! only the top-`k` results in a bounded min-heap (no full sort of every
-//! candidate — see [`VectorStore::scored`]).  This is appropriate for
-//! corpora up to tens of thousands of chunks; larger corpora benefit from an
-//! approximate-nearest-neighbour index, which is out of scope for this
-//! crate (see RAG-EVAL-IMG-23 for the sizing rationale).
+//! candidate — see `VectorStore::scored`).  Memory is `entries x dim x 4`
+//! bytes of `f32` vectors (50 000 entries of 384 dimensions is 76.8 MB, about
+//! 73 MiB) plus the chunk text, and every query costs `entries x dim`
+//! multiply-adds (about 19 million for that corpus) plus an `O(n log k)`
+//! top-`k` heap; there is no index structure, so latency grows linearly with
+//! the corpus. A hierarchical-navigable-small-world (HNSW) index behind an
+//! `ann` feature is a deliberately deferred, project-sized item (see
+//! `TODO.md`); until then, larger corpora are out of scope for this crate.
 //!
 //! # Scoring and the `min_score` sign convention
 //!
@@ -16,8 +20,8 @@
 //! true distances (Euclidean, Angular, Hamming) are *negated* so that
 //! "higher is better" sorting always yields the closest match first.
 //!
-//! This has a consequence callers must know before setting `min_score`
-//! (RAG-EVAL-IMG-07 / missed-M2): for a similarity metric, scores are
+//! This has a consequence callers must know before setting `min_score`:
+//! for a similarity metric, scores are
 //! naturally in a "the bigger the more alike" range you would expect
 //! (`[-1, 1]` for Cosine, unbounded for DotProduct). For a true-distance
 //! metric, every achievable score is **`<= 0`** (it is `-distance`, and a
@@ -35,7 +39,7 @@
 //! the metric's defining transform. Every other metric, **including
 //! [`Distance::DotProduct`]**, sees vectors exactly as supplied: magnitude
 //! is the whole point of choosing DotProduct over Cosine, so silently
-//! normalising it would make the two indistinguishable (RAG-EVAL-IMG-08).
+//! normalising it would make the two indistinguishable.
 //!
 //! # NaN / Inf guards
 //!
@@ -102,9 +106,9 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// Only [`Distance::Cosine`] does: it is mathematically *defined* as the dot
 /// product of unit vectors. Every other metric — most importantly
 /// [`Distance::DotProduct`], whose entire purpose is to be sensitive to
-/// vector magnitude — must see vectors exactly as supplied (RAG-EVAL-IMG-08).
+/// vector magnitude — must see vectors exactly as supplied.
 ///
-/// [`Distance`] lives in a sibling module this package does not own, so this
+/// [`Distance`] lives in a sibling module, so this
 /// predicate is `VectorStore`-local (a free function, not a method on
 /// `Distance`) rather than the `Distance::normalizes_inputs()` the finder
 /// proposed; it is used consistently at both call sites below ([`VectorStore::insert`]
@@ -129,7 +133,7 @@ pub struct VectorEntry {
     /// Stored embedding vector. Only [`Distance::Cosine`] L2-normalises it
     /// on insert; every other metric (`DotProduct`, `Euclidean`,
     /// `Angular`, `Hamming`) stores it exactly as supplied — see
-    /// `requires_normalized_inputs` in this module (RAG-EVAL-IMG-08).
+    /// `requires_normalized_inputs` in this module.
     pub vector: Vec<f32>,
     /// The chunk this entry was derived from.
     pub chunk: Chunk,
@@ -194,7 +198,7 @@ pub struct VectorStore {
     distance: Distance,
     /// Monotonically increasing counter for the next assigned id. Kept
     /// separate from `entries.len()` so that ids stay unique even after
-    /// [`VectorStore::delete`] shrinks `entries` (RAG-EVAL-IMG-22): reusing
+    /// [`VectorStore::delete`] shrinks `entries`: reusing
     /// `entries.len()` as the next id would let a post-delete `insert`
     /// collide with a surviving entry's id.
     #[serde(default)]
@@ -220,7 +224,7 @@ impl VectorStore {
     /// Insert a vector+chunk pair into the store.
     ///
     /// Behaviour depends on the store's [`Distance`] — see
-    /// [`requires_normalized_inputs`] and this module's documentation.
+    /// `requires_normalized_inputs` and this module's documentation.
     ///
     /// Returns the assigned entry id (unique for the lifetime of the store,
     /// never reused even after a [`VectorStore::delete`]). Errors:
@@ -261,7 +265,7 @@ impl VectorStore {
     /// Returns the number of entries removed. Intended for GDPR/APPI-style
     /// deletion requests and re-crawling a changed source document, which
     /// previously required a full `clear()` and re-embed of the whole
-    /// corpus (RAG-EVAL-IMG-22).
+    /// corpus.
     pub fn delete_by_doc_id(&mut self, doc_id: usize) -> usize {
         let before = self.entries.len();
         self.entries.retain(|e| e.chunk.doc_id != doc_id);
@@ -325,7 +329,7 @@ impl VectorStore {
     }
 
     /// Search filtered by a [`MetadataFilter`], honouring `min_score`
-    /// exactly like [`Self::search_with_threshold`] (RAG-EVAL-IMG-07: a
+    /// exactly like [`Self::search_with_threshold`] (a
     /// prior version hard-coded `f32::NEG_INFINITY` here, so adding a
     /// metadata filter silently *widened* the result set past what
     /// `min_score` alone would ever allow).
@@ -348,9 +352,9 @@ impl VectorStore {
     /// Builds each [`SearchResult`] directly from the borrowed [`VectorEntry`]
     /// while scanning, using a bounded min-heap of size `top_k`
     /// (`O(n log k)`) instead of collecting every passing candidate and
-    /// fully sorting it (`O(n log n)`) — this is both the RAG-EVAL-IMG-23
+    /// fully sorting it (`O(n log n)`) — this is both a
     /// performance fix and, because it never re-indexes `self.entries` by
-    /// id afterwards, the RAG-EVAL-IMG-22 correctness fix: the previous
+    /// id afterwards, a correctness fix: the previous
     /// implementation collected `(score, id)` pairs and looked the chunk
     /// back up via `self.entries[id]` *after* sorting, which assumed
     /// `id == position` and both panicked (id out of bounds) and — the
@@ -478,7 +482,7 @@ impl VectorStore {
     /// `self`'s own id counter so they cannot collide with `self`'s
     /// existing entries. Used by [`crate::retriever::Retriever`] to commit a
     /// staged (temporary) store only after every chunk of a document
-    /// embedded and inserted successfully (RAG-EVAL-IMG-30).
+    /// embedded and inserted successfully.
     pub(crate) fn merge_from(&mut self, other: VectorStore) {
         for mut entry in other.entries {
             entry.id = self.next_id;

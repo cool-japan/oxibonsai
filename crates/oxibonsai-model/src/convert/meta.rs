@@ -449,7 +449,7 @@ mod tests {
 
     #[test]
     fn file_type_matches_shipped_27b_headers() {
-        // Observed in scratchpad/gguf_headers_summary.txt.
+        // Observed in the shipped 27B GGUF headers.
         assert_eq!(ggml_file_type(TensorType::PTQ1_0), 143);
         assert_eq!(ggml_file_type(TensorType::PQ2_0), 141);
         assert_eq!(ggml_file_type(TensorType::TQ2_0_g128), 41);
@@ -458,9 +458,9 @@ mod tests {
         assert_eq!(ggml_file_type(TensorType::F32), 0);
     }
 
-    /// FIX3-GGUF-WRITE item 1(b): `ggml_file_type` is an exhaustive match
-    /// with no `_` arm, so adding `TensorType::Q2_K`/`Q3_K`/`Q8_K` (item
-    /// 1(a)) must give every one of them a real value rather than leave the
+    /// `ggml_file_type` is an exhaustive match
+    /// with no `_` arm, so adding `TensorType::Q2_K`/`Q3_K`/`Q8_K` must give
+    /// every one of them a real value rather than leave the
     /// match non-exhaustive.
     #[test]
     fn file_type_covers_the_three_new_k_quants() {
@@ -470,7 +470,7 @@ mod tests {
         assert_eq!(ggml_file_type(TensorType::Q8_K), TensorType::Q8_K.wire_id());
     }
 
-    /// FIX3-GGUF-WRITE item 3 / B2-16 handover 2: a negative `i64` metadata
+    /// A negative `i64` metadata
     /// value must survive a **full export round trip**, not just the
     /// writer-level encode/decode `i64_metadata_value_roundtrips_a_negative_number`
     /// already covers in `gguf/writer.rs`.

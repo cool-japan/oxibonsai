@@ -13,11 +13,11 @@
 //! `\u{FFFD}` and dropped, rather than being held in `pending` forever
 //! waiting for a completion that can never come (the previous behaviour,
 //! which let an adversarial or corrupt byte stream grow `pending` without
-//! bound and poison the rest of the generation). [`Self::finish`] always
+//! bound and poison the rest of the generation). `Self::finish` always
 //! returns a best-effort `String` — it can no longer fail; any genuinely
 //! incomplete trailing sequence (the stream legitimately ended mid-character,
 //! e.g. truncated at `max_tokens`) is replaced with `\u{FFFD}` the same way
-//! [`Self::finish_lossy`] already did.
+//! `Self::finish_lossy` already did.
 //!
 //! ## Usage
 //!
@@ -143,7 +143,7 @@ impl<'a> StreamingDecoder<'a> {
     /// "the stream ended mid-character" as an error — e.g. a test harness
     /// or a protocol that guarantees complete characters and wants to
     /// surface a violation of that guarantee rather than silently
-    /// substituting `\u{FFFD}`. By construction (see [`Self::flush_complete`],
+    /// substituting `\u{FFFD}`. By construction (see `Self::flush_complete`,
     /// which drains any *definitely* invalid byte immediately on push,
     /// every push), any bytes still in `pending` when this is called are
     /// always a genuinely incomplete-but-valid-so-far sequence, never a

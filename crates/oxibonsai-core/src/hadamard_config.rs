@@ -78,7 +78,7 @@ pub type HadamardSpec = HadamardConfig;
 impl HadamardConfig {
     /// Parse and validate `prism.hadamard.*` from `metadata`.
     ///
-    /// Returns `Ok(None)` when [`KEY_VERSION`] is absent — a non-folded
+    /// Returns `Ok(None)` when `KEY_VERSION` is absent — a non-folded
     /// model (e.g. the pre-Hadamard `Bonsai-27B-Q1_0.gguf` /
     /// `Ternary-Bonsai-27B-{PQ2_0,Q2_0}.gguf` generation). Once that key is
     /// present, every one of the eight rules below is a hard
@@ -893,7 +893,7 @@ mod tests {
 
     // ── gdn_v_grouped ───────────────────────────────────────────────────────
 
-    /// Corrected by this package's own verifier review: `gdn_v_grouped` is
+    /// `gdn_v_grouped` is
     /// not one of design §1.7's eight numbered validation rules, and the
     /// fork reads it optionally (`ml.get_key("prism.hadamard.gdn_v_grouped",
     /// hadamard_gdn_v_grouped, false)` at src_llama-model.cpp:1259, with the

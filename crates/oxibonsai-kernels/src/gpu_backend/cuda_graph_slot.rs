@@ -157,7 +157,7 @@ pub fn cuda_graph_slot_action(
 /// unknown must **leak** rather than be released by an unrelated model's `Drop`,
 /// because the device pointer may still be live. Every CUDA upload path that
 /// does not thread a model epoch (the prefill and image entry points, whose call
-/// sites this package does not own) therefore stays unattributed and uncollected
+/// sites are outside this module) therefore stays unattributed and uncollected
 /// — see this crate's `cuda_graph::cudagraph_global_group::CudaGraph::
 /// release_model_epoch`.
 pub const UNATTRIBUTED_CUDA_MODEL_EPOCH: u64 = 0;

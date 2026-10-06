@@ -10,9 +10,9 @@
 # a manifest of everything the project can produce/fetch, not a checklist
 # every checkout must have on disk.
 #
-# `scripts/download_ternary.sh` and `scripts/download_tokenizer.sh` (this
-# package) run this verification automatically after every download and
-# fail loudly on a mismatch; this file is what they check against.
+# `scripts/download_ternary.sh` and `scripts/download_tokenizer.sh` run this
+# verification automatically after every download and fail loudly on a
+# mismatch; this file is what they check against.
 #
 # ── AUTHORITATIVE vs ADVISORY ────────────────────────────────────────────
 # Two different kinds of entry live in this file, and they carry different
@@ -24,31 +24,32 @@
 #   upstream revision bump, and downloader scripts treat it as a hard
 #   failure.
 #
-#   PROVENANCE for the Bonsai 2 27B entries specifically (sec-12 /
-#   CI-GATE-blocking-2) — two separate sources, cited separately because
-#   they carry different authority; do not merge them into one unsourced
-#   claim:
+#   PROVENANCE for the Bonsai 2 27B entries specifically (sec-12) — two
+#   separate sources, cited separately because they carry different
+#   authority; do not merge them into one unsourced claim:
 #     - CONFIRMED BY THE PROJECT OWNER: the repo is
 #       `prism-ml/Ternary-Bonsai-2-27B-gguf`, holding
 #       Ternary-Bonsai-2-27B-PTQ1_0.gguf (5946648928 B),
 #       Ternary-Bonsai-2-27B-PQ2_0.gguf (7206168928 B) and
 #       Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf (629246976 B) —
-#       independently corroborated by scratchpad/demo/README.md:124. This
-#       is `OXI_BONSAI2_REPO`'s default in scripts/download_ternary.sh.
-#     - FROM scratchpad/demo/MODEL-FORMATS.md (:40, :51-55): the third
-#       language GGUF, Ternary-Bonsai-2-27B-Q2_0-prism-fork-required.gguf,
-#       is deliberately kept OUT of that repo (mainline llama.cpp already
+#       independently corroborated by the file list in the README of
+#       PrismML's Bonsai-demo repository. This is `OXI_BONSAI2_REPO`'s
+#       default in scripts/download_ternary.sh.
+#     - FROM `MODEL-FORMATS.md` in PrismML's Bonsai-demo repository (its
+#       table of model files): the third language GGUF,
+#       Ternary-Bonsai-2-27B-Q2_0-prism-fork-required.gguf, is deliberately
+#       kept OUT of that repo (mainline llama.cpp already
 #       knows ggml type id 42 and would silently misdecode this file's
 #       group-128 layout as the official group-64 Q2_0) and is published
 #       separately, for testing only, in
 #       `prism-ml/Ternary-Bonsai-2-27B-gguf-dev` — this is
 #       `OXI_BONSAI2_DEV_REPO`'s default.
-#   The three recorded hashes below for the files that ARE on disk were
-#   independently re-verified with `shasum -a 256` against the real files
-#   in this project's own development checkout (`models/`) on 2026-09-21
-#   and are byte-exact matches (53107f53...3ee3 PTQ1_0, 3907dc16...2ec1
+#   The three recorded hashes below were computed with `shasum -a 256`
+#   against the real files in the maintainers' own development checkout
+#   (`models/`) on 2026-09-21 (53107f53...3ee3 PTQ1_0, 3907dc16...2ec1
 #   PQ2_0, 6807ede6...1903 mmproj) — treat them as authoritative for the
-#   two confirmed repos above.
+#   two confirmed repos above. docs/models.md lists which model files have a
+#   verified hash and which do not.
 #
 #   ADVISORY — the file is produced by *local* conversion
 #   (`oxibonsai convert`, run by `download_ternary.sh` against upstream
@@ -69,24 +70,22 @@
 #
 # The Bonsai 2 27B family is exactly THREE language GGUFs (PTQ1_0, PQ2_0,
 # and the legacy-layout Q2_0 requiring PrismML's `prism` llama.cpp fork —
-# see CONTEXT.md's Hadamard/quant-format notes on why ggml type id 42 is
-# ambiguous between mainline group-64 and this group-128 PrismML layout)
-# plus the mmproj vision projector — four artifacts total. Only the first
-# two language GGUFs' full bytes were obtained in this session; the third
+# see docs/models.md, "ggml type id 42: three layouts under one id", on why
+# ggml type id 42 is ambiguous between mainline group-64 and this group-128
+# PrismML layout) plus the mmproj vision projector — four artifacts total.
+# Only the first two language GGUFs' full bytes have been hashed; the third
 # (Q2_0-prism-fork-required) has a MISSING placeholder below instead of a
 # hash — see that entry's comment for why and how to fill it in.
 #
 # Coverage note (deps-08): this file also lists the three
 # previous-generation (non-Bonsai-2) 27B GGUFs as MISSING placeholders
 # (Bonsai-27B-Q1_0, Ternary-Bonsai-27B-PQ2_0, Ternary-Bonsai-27B-Q2_0) —
-# see the dedicated section below. Every artifact named in this package's
-# spec, plus these three previous-generation 27B GGUFs whose headers are
-# staged in scratchpad/hf/, therefore has either a verified hash or an
-# explicit MISSING placeholder here. This is NOT a claim that every
-# model file scratchpad/demo/MODEL-FORMATS.md's tables name is covered —
-# e.g. the official group-64 `*_g64`/`*-PQ2_0` files for the 1.7B/4B/8B/27B
-# sizes are outside this pass's scope and have no header staged to source
-# a placeholder comment from; do not infer their absence means anything.
+# see the dedicated section below. Every Bonsai 27B GGUF the project loads
+# therefore has either a verified hash or an explicit MISSING placeholder
+# here. This is NOT a claim that every model file the tables of PrismML's
+# Bonsai-demo `MODEL-FORMATS.md` name is covered — e.g. the official group-64
+# `*_g64`/`*-PQ2_0` files for the 1.7B/4B/8B/27B sizes are outside this
+# manifest's scope; do not infer their absence means anything.
 #
 # (Note: separator lines below are a lone "#", not blank — a truly blank
 # line makes both `shasum -c` and `sha256sum -c` print a spurious "N lines
@@ -95,7 +94,7 @@
 #
 # ── AUTHORITATIVE: published GGUF, downloaded verbatim ───────────────────
 # fetched by: curl (see scripts/cli.sh / README "Quick Start") — no
-# dedicated download script owns this one yet (see CI-GATE deviations).
+# dedicated download script owns this one.
 ead25897bc034fa52569d0c6d054ce38216f95db09900c8add8f6bbfb370cff1  models/Bonsai-8B.gguf
 #
 # fetched by: scripts/download_tokenizer.sh (Qwen/Qwen3-8B, "main" revision
@@ -105,8 +104,8 @@ aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4  models/tokeniz
 #
 # fetched by: scripts/download_ternary.sh 27b / 27b-pq2_0 (repo:
 # prism-ml/Ternary-Bonsai-2-27B-gguf — confirmed by the project owner, see
-# the PROVENANCE note above; independently corroborated by
-# scratchpad/demo/README.md:124).
+# the PROVENANCE note above; independently corroborated by the README of
+# PrismML's Bonsai-demo repository).
 6807ede61d570bb86ba34b756a0fa109edc33668604de867c6ea6d8f1d631903  models/Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf
 3907dc1658db1f78a9826bf8d5bcb8dc65db0d466388937af57f2294fae62ec1  models/Ternary-Bonsai-2-27B-PQ2_0.gguf
 53107f530aa52eb00912263ab1ee29bd199261c87cd7b4ad4ca1318c1fe33ee3  models/Ternary-Bonsai-2-27B-PTQ1_0.gguf
@@ -117,14 +116,12 @@ aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4  models/tokeniz
 # PrismML's legacy group-128 layout, NOT mainline llama.cpp's official
 # group-64 Q2_0 -- reading it with a stock llama.cpp would silently
 # misdecode the blocks, hence the filename warning; it needs PrismML's
-# `prism` fork, see CONTEXT.md's quant-format notes). Per
-# scratchpad/demo/MODEL-FORMATS.md (:40, :51-55), it is fetched from
+# `prism` fork, see docs/models.md). Per `MODEL-FORMATS.md` in PrismML's
+# Bonsai-demo repository, it is fetched from
 # `prism-ml/Ternary-Bonsai-2-27B-gguf-dev` (testing only), NOT the main
-# repo above. Only this file's first 64 MB header was staged in this
-# session, for GGUF-metadata parsing
-# (scratchpad hf/Ternary-Bonsai-2-27B-Q2_0-prism-fork-required.gguf.head) --
-# the full multi-gigabyte payload was never fetched, so no byte-exact
-# sha256 could be computed. `scripts/download_ternary.sh 27b-q2_0` (and
+# repo above. Only this file's first 64 MB (its GGUF header) has been
+# inspected -- the full multi-gigabyte payload has not been fetched, so no
+# byte-exact sha256 could be computed. `scripts/download_ternary.sh 27b-q2_0` (and
 # `27b-all`) will fetch it; `verify_checksum`'s "no checksum recorded yet"
 # branch fires harmlessly until this placeholder is replaced with a real
 # hash line via:
@@ -132,36 +129,33 @@ aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4  models/tokeniz
 #
 # ── AUTHORITATIVE, MISSING: previous-generation (non-Bonsai-2) 27B family ─
 # deps-08 (checksums.sha256 half): this file's own header (above) calls
-# itself a manifest of everything the project can produce/fetch, but three
+# itself a manifest of everything the project can produce/fetch, so the three
 # previous-generation 27B GGUFs -- distinct from the Bonsai 2 27B family
-# above (no "-2-" in the name) -- had no entry or placeholder at all. Only
-# their first 64 MB headers were staged in this session (scratchpad/hf/),
-# for GGUF-metadata parsing; none of the three full payloads were ever
-# fetched, so no byte-exact sha256 can be computed for any of them yet. No
-# hash is invented here -- each is a MISSING placeholder, same convention
+# above (no "-2-" in the name) -- are listed too. Only their first 64 MB
+# (the GGUF header) has been inspected; none of the three full payloads has
+# been fetched, so no byte-exact sha256 can be computed for any of them yet.
+# No hash is invented here -- each is a MISSING placeholder, same convention
 # as the Q2_0-prism-fork-required entry above.
 #
 # MISSING: models/Bonsai-27B-Q1_0.gguf -- previous-generation 1-bit 27B
 # GGUF (qwen35 hybrid, no Hadamard, ggml type id 41), per
-# prism-ml/Bonsai-27B-gguf (scratchpad/demo/README.md:136). Header staged
-# at scratchpad/hf/Bonsai-27B-Q1_0.gguf.head. Fill in after downloading:
+# prism-ml/Bonsai-27B-gguf (see the Bonsai-demo README). Fill in after
+# downloading:
 #   shasum -a 256 models/Bonsai-27B-Q1_0.gguf | awk '{print $1 "  " $2}'
 #
 # MISSING: models/Ternary-Bonsai-27B-PQ2_0.gguf -- previous-generation fork
 # PQ2_0 27B GGUF (ggml type id 142, group 128), per
-# prism-ml/Ternary-Bonsai-27B-gguf (scratchpad/demo/README.md:154). Header
-# staged at scratchpad/hf/Ternary-Bonsai-27B-PQ2_0.gguf.head. Fill in
+# prism-ml/Ternary-Bonsai-27B-gguf (see the Bonsai-demo README). Fill in
 # after downloading:
 #   shasum -a 256 models/Ternary-Bonsai-27B-PQ2_0.gguf | awk '{print $1 "  " $2}'
 #
 # MISSING: models/Ternary-Bonsai-27B-Q2_0.gguf -- previous-generation
 # DEPRECATED legacy-layout ternary 27B GGUF (ggml type id 42, group-128 --
 # NOT the official group-64 layout mainline expects for this same type id;
-# see scripts/download_ternary.sh's header and CONTEXT.md's "id 42 is
-# AMBIGUOUS" note, and scratchpad/demo/MODEL-FORMATS.md's format table),
-# per prism-ml/Ternary-Bonsai-27B-gguf (scratchpad/demo/README.md:154).
-# Header staged at scratchpad/hf/Ternary-Bonsai-27B-Q2_0.gguf.head. Fill in
-# after downloading:
+# see scripts/download_ternary.sh's header, docs/models.md ("ggml type id 42:
+# three layouts under one id") and the format table of the Bonsai-demo
+# `MODEL-FORMATS.md`), per prism-ml/Ternary-Bonsai-27B-gguf (see the
+# Bonsai-demo README). Fill in after downloading:
 #   shasum -a 256 models/Ternary-Bonsai-27B-Q2_0.gguf | awk '{print $1 "  " $2}'
 #
 # ── ADVISORY: locally converted from upstream unpacked safetensors ───────

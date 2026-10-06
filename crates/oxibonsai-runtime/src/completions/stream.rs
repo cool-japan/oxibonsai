@@ -38,72 +38,36 @@
 //!
 //! Every stream answers with an `x-request-id` header and observes
 //! `request_duration_seconds` when it ends (completion, a client
-//! disconnect, or the SSE deadline). [`StreamCancelGuard`] cancels the
-//! running generation — and every prompt not yet started — however the
-//! stream ends; cancellation is a no-op once generation already finished.
+//! disconnect, or the SSE deadline). The request's [`CancelSlot`] holds the
+//! running prompt's token: the SSE body cancels it — and every prompt not
+//! yet started — when the deadline expires or the client stops reading, and
+//! [`StreamCancelGuard`] does the same however else the stream ends;
+//! cancellation is a no-op once generation already finished. Every
+//! generated token reaches the request's stage record, so an expired
+//! deadline names the stage (`prefill` / `decode`, with the tokens generated
+//! so far) in its terminal `error` event.
 
 use super::*;
 
 use crate::engine::InferenceEngine;
 use crate::engine_control::CancellationToken;
 use crate::pipeline::{StopMatch, StopSequenceMatcher};
-use crate::server::sse::sse_response;
+use crate::server::sse::sse_response_tracked;
 use crate::tokenizer_bridge::chat_render::{DecodedPiece, PieceDecoder};
 use crate::tokenizer_bridge::TokenizerBridge;
 
 // ── Cancellation and lifetime guards ────────────────────────────────────────
 
-/// The cancellation handle of whichever prompt's generation is running,
-/// shared between the blocking generation loop (which arms one per prompt)
-/// and the SSE stream (which cancels it when the stream goes away).
-#[derive(Clone, Default)]
-struct GenerationSlot(Arc<std::sync::Mutex<SlotState>>);
-
-#[derive(Default)]
-struct SlotState {
-    /// The running prompt's token.
-    current: Option<CancellationToken>,
-    /// The stream is gone: no further prompt may start.
-    abandoned: bool,
-}
-
-impl GenerationSlot {
-    /// Install the next prompt's token. `false` (with the token cancelled)
-    /// once the stream has been abandoned.
-    fn start(&self, token: &CancellationToken) -> bool {
-        let Ok(mut state) = self.0.lock() else {
-            token.cancel();
-            return false;
-        };
-        if state.abandoned {
-            token.cancel();
-            return false;
-        }
-        state.current = Some(token.clone());
-        true
-    }
-
-    /// The stream is gone: cancel the running prompt and start no other.
-    fn abandon(&self) {
-        if let Ok(mut state) = self.0.lock() {
-            state.abandoned = true;
-            if let Some(token) = state.current.as_ref() {
-                token.cancel();
-            }
-        }
-    }
-}
-
-/// Abandons the [`GenerationSlot`] on drop: an early client disconnect, or
-/// `sse::sse_response`'s own per-request deadline, drops the stream without
-/// the generation having finished — this stops it (and every prompt after
-/// it) instead of letting it decode to `max_tokens` on a lease the client
-/// can no longer see. Harmless after a normal finish.
-struct AbandonOnDrop(GenerationSlot);
+/// Abandons the request's [`CancelSlot`] on drop: an early client
+/// disconnect, or the SSE body's own per-request deadline, drops the stream
+/// without the generation having finished — this stops it (and every prompt
+/// after it) instead of letting it decode to `max_tokens` on a lease the
+/// client can no longer see. Harmless after a normal finish.
+struct AbandonOnDrop(CancelSlot);
 
 impl Drop for AbandonOnDrop {
     fn drop(&mut self) {
-        self.0.abandon();
+        self.0.request_cancel();
     }
 }
 
@@ -336,6 +300,21 @@ impl LogprobsStopTracker {
 /// One `(text, logprobs entries)` pair of the `logprobs` streaming loop.
 type LogprobsChunk = (String, Vec<crate::api_types::LogprobsContent>);
 
+/// One prompt's run of [`generate_streaming_logprobs_chunks`].
+struct LogprobsRun<'a> {
+    /// Decodes each token's piece; `None` shows nothing.
+    tokenizer: Option<&'a TokenizerBridge>,
+    prompt_tokens: &'a [u32],
+    max_tokens: usize,
+    /// Alternatives per token (capped at 20).
+    top_k: usize,
+    stop_matcher: &'a StopSequenceMatcher,
+    /// Takes each safe-to-release `(text, entries)` pair.
+    tx: &'a tokio::sync::mpsc::UnboundedSender<LogprobsChunk>,
+    /// The request's stage record.
+    phase: &'a crate::server::phase::RequestPhase,
+}
+
 /// Runs entirely on the blocking pool: prefill, then per step — cancel
 /// check, sample, EOS check, capture logprobs, UTF-8-safe piece decode,
 /// stop-sequence hold-back — sending each safe-to-release `(text, entries)`
@@ -348,17 +327,25 @@ type LogprobsChunk = (String, Vec<crate::api_types::LogprobsContent>);
 /// stop-sequence pairing the collect-everything method has no equivalent
 /// for.
 ///
+/// Every sampled token is counted into the request's stage record as it is
+/// drawn (a token can wait in the hold-back before it is sent, so the
+/// receiving side would count late).
+///
 /// Returns the number of tokens actually generated and whether a stop
 /// sequence matched.
 fn generate_streaming_logprobs_chunks(
     engine: &mut InferenceEngine<'_>,
-    tokenizer: Option<&TokenizerBridge>,
-    prompt_tokens: &[u32],
-    max_tokens: usize,
-    top_k: usize,
-    stop_matcher: &StopSequenceMatcher,
-    tx: &tokio::sync::mpsc::UnboundedSender<LogprobsChunk>,
+    run: LogprobsRun<'_>,
 ) -> RuntimeResult<(usize, bool)> {
+    let LogprobsRun {
+        tokenizer,
+        prompt_tokens,
+        max_tokens,
+        top_k,
+        stop_matcher,
+        tx,
+        phase,
+    } = run;
     if prompt_tokens.is_empty() {
         return Ok((0, false));
     }
@@ -391,6 +378,7 @@ fn generate_streaming_logprobs_chunks(
         let entry =
             crate::api_types::compute_logprobs(&last_logits, next_token, top_k, &id_to_token);
         output_tokens.push(next_token);
+        phase.token_generated();
 
         // A token with no text of its own yet (a partial UTF-8 sequence)
         // hands its logprobs entry to the next completed piece; a token with
@@ -554,6 +542,9 @@ pub(super) struct StreamRequest {
     /// decrements when the generation actually finishes, not the moment
     /// this module returns the initial SSE response object.
     pub(super) active_guard: ActiveRequestGuard,
+    /// The request's handle on its generations and its stage record (see
+    /// the module docs).
+    pub(super) slot: CancelSlot,
 }
 
 /// What one prompt's generation streams.
@@ -590,6 +581,7 @@ pub(super) async fn stream_completion(
         request_id,
         request_start,
         active_guard,
+        slot,
     } = req;
     let duration = ObserveDurationOnDrop {
         metrics: Arc::clone(state.metrics()),
@@ -602,14 +594,21 @@ pub(super) async fn stream_completion(
     // the same pool on its first (cache-filling) call — calling it while
     // already holding this request's lease would self-deadlock a
     // single-replica pool.
-    let model_id = state.model_info().descriptor().await.id;
+    let model_id = state.model_info().descriptor().await.served_id;
 
+    // Queued until a replica is free (the per-request deadline answers a
+    // plain `504 waiting_for_engine` until the stream opens); once one is
+    // held the engine is ingesting the first prompt until it produces its
+    // first token.
+    let phase = slot.phase();
+    phase.enter(Phase::WaitingForEngine);
     let lease = state.acquire_engine().await.map_err(|e| {
         tracing::error!(error = %e, "engine pool acquire failed");
         state.metrics().errors_total.inc();
         ApiError::service_unavailable(format!("no inference engine replica is available: {e}"))
             .with_code("engine_unavailable")
     })?;
+    phase.enter(Phase::Prefill);
 
     // Prompt `i`'s sampling configuration, resolved against the replica's
     // own ambient parameters.
@@ -620,7 +619,6 @@ pub(super) async fn stream_completion(
     let logprobs_top_k = validated.logprobs_top_k;
     let stop_matcher = Arc::new(StopSequenceMatcher::new(validated.stop_checker.sequences()));
 
-    let slot = GenerationSlot::default();
     let (prompt_tx, prompt_rx) = tokio::sync::mpsc::unbounded_channel::<PromptStream>();
     let slot_for_task = slot.clone();
     let matcher_for_task = Arc::clone(&stop_matcher);
@@ -631,9 +629,20 @@ pub(super) async fn stream_completion(
         for (index, (prompt_tokens, sampling)) in
             prompt_token_batches.iter().zip(&samplings).enumerate()
         {
+            // An abandoned stream (its client gone, its deadline expired)
+            // starts no further prompt.
+            if slot_for_task.is_abandoned() {
+                break;
+            }
             lease.reset();
+            // Each prompt runs under its own token, recorded in the slot the
+            // SSE body cancels; once the stream is abandoned it comes back
+            // cancelled and no further prompt starts.
             let cancel = lease.arm_cancellation();
-            if !slot_for_task.start(&cancel) {
+            lease.set_prefill_chunk_tokens(Some(
+                crate::server::deadline::CANCELLATION_PREFILL_CHUNK_TOKENS,
+            ));
+            if !slot_for_task.arm(&cancel) {
                 break;
             }
             let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
@@ -670,15 +679,19 @@ pub(super) async fn stream_completion(
                         break;
                     }
                     let tokenizer = state_for_task.tokenizer();
+                    let phase = slot_for_task.phase();
                     sampling.run(&mut lease, |engine| {
                         generate_streaming_logprobs_chunks(
                             engine,
-                            tokenizer,
-                            prompt_tokens,
-                            max_tokens,
-                            top_k,
-                            &matcher_for_task,
-                            &chunk_tx,
+                            LogprobsRun {
+                                tokenizer,
+                                prompt_tokens,
+                                max_tokens,
+                                top_k,
+                                stop_matcher: &matcher_for_task,
+                                tx: &chunk_tx,
+                                phase: &phase,
+                            },
                         )
                     })
                 }
@@ -718,18 +731,20 @@ pub(super) async fn stream_completion(
         stop_matcher,
         prompt_rx,
         payload_tx,
+        phase: phase.clone(),
     }));
 
     let guarded_stream = StreamCancelGuard {
         inner: tokio_stream::wrappers::UnboundedReceiverStream::new(payload_rx),
-        _abandon: AbandonOnDrop(slot),
+        _abandon: AbandonOnDrop(slot.clone()),
         _duration: duration,
     };
 
-    Ok(sse_response(
+    Ok(sse_response_tracked(
         guarded_stream,
         state.limits(),
         request_id_header_map(request_id),
+        Some(&slot),
     ))
 }
 
@@ -744,6 +759,8 @@ struct PromptDriver {
     stop_matcher: Arc<StopSequenceMatcher>,
     prompt_rx: tokio::sync::mpsc::UnboundedReceiver<PromptStream>,
     payload_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    /// The request's stage record, told about every generated token.
+    phase: crate::server::phase::RequestPhase,
 }
 
 /// Turn each prompt's generation into its SSE chunks, in prompt order, then
@@ -760,6 +777,7 @@ async fn drive_prompts(driver: PromptDriver) {
         stop_matcher,
         mut prompt_rx,
         payload_tx,
+        phase,
     } = driver;
     let mut total_prompt_tokens = 0usize;
     let mut total_completion_tokens = 0usize;
@@ -779,6 +797,7 @@ async fn drive_prompts(driver: PromptDriver) {
                 let mut decoder = PieceDecoder::new(state.tokenizer());
                 let mut stop = CompletionStopTracker::default();
                 while let Some(id) = token_rx.recv().await {
+                    phase.token_generated();
                     if payload_tx.is_closed() {
                         prompt.cancel.cancel();
                         return;

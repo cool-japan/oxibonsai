@@ -544,8 +544,8 @@ fn dot_f32_matches_naive_scalar_sum_across_lengths() {
 /// same thread with varying `in_features` and confirm the thread-local
 /// scratch buffer converges to being reused rather than reallocated.
 /// This is a coarse, allocator-free proxy (no `#[global_allocator]` is
-/// available inside this package's owned files — see the package's
-/// recorded deviation) but it does exercise the exact code path that
+/// available inside a library test binary) but it does exercise the exact
+/// code path that
 /// used to allocate on every single call, at a scale (10k calls) that
 /// would be dominated by allocation overhead if the fix had not landed.
 #[test]
@@ -975,7 +975,7 @@ fn migrated_errors_name_the_offending_buffer() {
 fn rows_per_task_stays_below_gpu_min_rows() {
     // Load-bearing for the byte-identity tests above: as long as
     // `rows_per_task` never reaches 1024 (`GPU_MIN_ROWS` in
-    // `dispatch.rs`), every chunk this package hands to a Gpu-tier
+    // `dispatch.rs`), every chunk this crate hands to a Gpu-tier
     // dispatcher takes the same CPU-fallback branch a lone row always
     // did, regardless of core count or matrix size.
     for n_rows in [8, 64, 512, 4096, 248_320, 10_000_000] {
@@ -990,8 +990,7 @@ fn rows_per_task_stays_below_gpu_min_rows() {
 
 /// Measures the actual parallel speed-up of the K-16 chunking fix on
 /// this host (not part of the default gate — an in-crate substitute for
-/// the criterion bench recorded as a deviation, since `benches/` is not
-/// in this package's owned files). Run explicitly with `--ignored`.
+/// the criterion bench). Run explicitly with `--ignored`.
 /// Measures the K-16/K-M2 parallel speed-up on the **production** path.
 ///
 /// Uses `KernelDispatcher::auto_detect()` (whatever tier this host actually

@@ -98,7 +98,7 @@ mod tests {
         );
     }
 
-    // Note: an earlier revision of this package kept an infallible `swiglu()`
+    // Note: an earlier revision kept an infallible `swiglu()`
     // wrapper around `try_swiglu` for source compatibility with call sites
     // that predated the fallible kernel contract, plus a test
     // (`swiglu_leaves_output_untouched_on_length_mismatch`) asserting that it

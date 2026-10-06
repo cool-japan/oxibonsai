@@ -1,6 +1,6 @@
 [package]
 name = "oxibonsai"
-description = "Pure Rust 1-bit LLM inference engine for PrismML Bonsai models — umbrella crate"
+description = "Pure Rust sub-2-bit LLM inference engine for PrismML Bonsai models (1-bit, ternary, Bonsai 2 27B hybrid) — umbrella crate"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

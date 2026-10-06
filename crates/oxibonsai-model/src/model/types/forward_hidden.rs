@@ -60,14 +60,17 @@
 //!
 //! # Measured (real `Ternary-Bonsai-1.7B.gguf`, Apple M3, release)
 //!
-//! The runtime's `embed_bench_short_and_long` (`OXI_MODEL` or
-//! `OXIBONSAI_EMBED_BENCH=1`) times the production `InferenceEngine::embed`
+//! The runtime's `embed_bench_short_and_long` (`OXIBONSAI_EMBED_BENCH=1` with
+//! `OXI_MODEL` naming the GGUF) times the production `InferenceEngine::embed`
 //! on a Metal engine — the head-free Metal prefill — against the batched CPU
 //! pass (`forward_hidden` on a CPU-tier dispatcher, the production path
 //! before the Metal route existed) and the per-token loop both replaced
 //! (`forward_hidden_sequential` on a dispatcher built exactly as the
 //! engine's own), minimum of three runs per leg (a single run for the two
-//! slow legs at 2000 tokens), load average 10-12:
+//! slow legs at 2000 tokens), load average 10-12. The per-token loop at 2000
+//! tokens runs only with `OXIBONSAI_EMBED_BENCH_PER_TOKEN=1` (the release
+//! gate never sets it; there the 2000-token input is compared with the
+//! batched CPU pass instead):
 //!
 //! | tokens | per-token loop | batched CPU | Metal | Metal vs per-token |
 //! |---|---|---|---|---|
@@ -962,7 +965,7 @@ mod tests {
     fn real_model_batched_hidden_matches_sequential() {
         use oxibonsai_core::gguf::reader::{mmap_gguf_file, GgufFile};
         use oxibonsai_core::GgufTensorType;
-        use oxibonsai_testkit::capability::{record_executed, record_skipped, Capability};
+        use oxibonsai_testkit::capability::{record_executed_timed, record_skipped, Capability};
 
         const TEST_NAME: &str =
             "oxibonsai-model::lib::real_model_batched_hidden_matches_sequential";
@@ -979,6 +982,7 @@ mod tests {
             return;
         }
 
+        let gate_start = std::time::Instant::now();
         let kernel = KernelDispatcher::with_tier(oxibonsai_kernels::cpu_kernel_tier());
         let mut executed = 0usize;
         let models = [
@@ -1046,7 +1050,7 @@ mod tests {
             executed += 1;
         }
         if executed == models.len() {
-            record_executed(Capability::LegacyModels, TEST_NAME);
+            record_executed_timed(Capability::LegacyModels, TEST_NAME, gate_start.elapsed());
         } else {
             record_skipped(Capability::LegacyModels, TEST_NAME);
         }

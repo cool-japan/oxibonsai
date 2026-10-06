@@ -8,7 +8,7 @@
 //! | `sec-01` / `TOK-M2` | the prompt sanitizer is linear, and no `<|` survives it |
 //! | `sec-03` | a second request is served while a long generation is in flight |
 //! | `sec-05` | an over-budget prompt is a `400` naming the real numbers, not a `500` |
-//! | `sec-08` | SSE carries the usage chunk and always terminates with `[DONE]` |
+//! | `sec-08` | SSE carries the usage chunk and always terminates with `[DONE]`; the router's deadline fires for a held engine, plain (`504`) and streamed (`event: error`), on all three generation routes, cancelling the generation; a stream queued for a replica times out before it opens; the admission layer's backstop is never reached on those routes |
 //! | `sec-15` | `/admin/*` is refused without the admin credential |
 //! | `SV-04` | every error path carries the JSON envelope and `X-Request-ID` |
 //! | `SV-05` | a malformed body is a JSON envelope, not axum's plain text |
@@ -17,7 +17,7 @@
 
 #![cfg(feature = "server")]
 
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
@@ -26,6 +26,7 @@ use tower::ServiceExt;
 
 use oxibonsai_core::config::Qwen3Config;
 use oxibonsai_runtime::engine::InferenceEngine;
+use oxibonsai_runtime::engine_control::RecurrentState;
 use oxibonsai_runtime::engine_pool::EnginePool;
 use oxibonsai_runtime::metrics::InferenceMetrics;
 use oxibonsai_runtime::sampling::SamplingParams;
@@ -64,8 +65,13 @@ fn router() -> axum::Router {
 }
 
 fn router_with_limits(limits: RequestLimits) -> axum::Router {
+    router_over(engine(), limits)
+}
+
+/// [`router_with_limits`] over a caller-built single-replica `engine`.
+fn router_over(engine: InferenceEngine<'static>, limits: RequestLimits) -> axum::Router {
     create_router_full(
-        EnginePool::new(vec![engine()]),
+        EnginePool::new(vec![engine]),
         None,
         Arc::new(InferenceMetrics::new()),
         RouterOptions::default()
@@ -367,59 +373,172 @@ async fn streaming_without_stream_options_carries_no_usage() {
 // deadline it is handed directly; these two prove the deadline configured on
 // the *router* (`RequestLimits::per_request_timeout`) really reaches it, for
 // both response shapes, when driven through the real HTTP surface.
+//
+// Neither test estimates how long a generation takes. Whether a timed
+// generation outlasts a deadline depends on the host's speed *at that moment*,
+// and that is not stable inside one test binary: the same request takes
+// several times longer while the other tests of the binary (or an instrumented
+// `cargo llvm-cov` build) compete for the CPU than after they finish, so any
+// deadline derived from a timing probe can come out longer than the whole
+// generation. Instead the engine is *held*: an [`EngineGate`] parks the engine
+// thread inside the per-request reset, so no token can be produced until the
+// test lets go, however fast or slow the host is. The deadline fires because
+// the test holds the engine, never because a timing guess came out short.
 
-/// Calibrate a completion long enough that a deadline set to a small fraction
-/// of its duration is comfortably shorter than the full generation while
-/// staying comfortably longer than plain per-request setup overhead
-/// (validating / tokenizing a two-word prompt), so the two tests below are not
-/// tied to any one machine's absolute speed. Mirrors the calibration in
-/// `a_second_request_is_served_while_a_long_generation_runs`.
-async fn time_completion(app: &axum::Router, max_tokens: usize) -> Duration {
-    let start = Instant::now();
-    let resp = app
-        .clone()
-        .oneshot(chat_request(serde_json::json!({
-            "messages": [{"role": "user", "content": "hi"}],
-            "max_tokens": max_tokens,
-            "temperature": 0.0,
-        })))
-        .await
-        .expect("probe response");
-    assert_eq!(resp.status(), StatusCode::OK);
-    let _ = body_json(resp).await;
-    start.elapsed()
+/// The whole-request deadline of the two tests below, in milliseconds.
+///
+/// Determinism comes from the gate, not from this number: it only has to
+/// outlast the request's own setup (rendering, validating, taking the
+/// replica — milliseconds), so that the stage the timeout reports is the
+/// engine's (`prefill`) rather than an earlier one, and the streamed head is
+/// out before the handler-level deadline.
+const HELD_ENGINE_DEADLINE_MS: u64 = 1_000;
+
+/// How long a parked engine thread waits for the gate to open before it gives
+/// up on its own. A test that fails before it opens the gate releases it when
+/// its guard drops; this bound is the second line of defence, because dropping
+/// a tokio runtime waits for every `spawn_blocking` task, so a thread parked
+/// forever would turn a failed assertion into a hung test binary.
+const GATE_PARK_LIMIT: Duration = Duration::from_secs(30);
+
+#[derive(Default)]
+struct GateState {
+    /// The next per-request reset parks (set once the warm-up is done).
+    armed: bool,
+    /// An engine thread is parked in the gate.
+    parked: bool,
+    /// Released: the parked thread continues, and no later reset parks.
+    open: bool,
 }
 
-/// Two-probe slope calibration.
+/// Holds the engine's next step until the test releases it.
 ///
-/// A single short probe is setup-dominated (tokenizing/validating a two-word
-/// prompt costs about as much as generating a handful of tokens), so a
-/// per-token estimate built from it alone under-estimates the real marginal
-/// cost per token and the resulting "long" generation can finish inside the
-/// derived deadline instead of exceeding it. Timing two probes at different
-/// lengths and dividing the difference by the difference in token counts
-/// isolates the marginal per-token cost from the shared setup cost.
-async fn calibrate_long_tokens_and_short_timeout(app: &axum::Router) -> (usize, Duration) {
-    const SHORT_PROBE: usize = 4;
-    const LONG_PROBE: usize = 68;
-    const LONG_TOKENS: usize = 400;
-    let short = time_completion(app, SHORT_PROBE).await;
-    let long = time_completion(app, LONG_PROBE).await;
-    let marginal = long.saturating_sub(short) / (LONG_PROBE - SHORT_PROBE) as u32;
-    let full = marginal * LONG_TOKENS as u32;
-    (LONG_TOKENS, (full / 4).max(Duration::from_micros(200)))
+/// Both generation paths — `run_blocking_generation` for a plain request and
+/// the blocking task of the streaming handler — call `InferenceEngine::reset`
+/// as the first thing they do on the blocking thread, after the request has
+/// taken its replica (stage `prefill`) and before any token exists. `reset`
+/// clears an attached [`RecurrentState`], which is a public extension point, so
+/// a test can park exactly there without any hook in the product code.
+#[derive(Default)]
+struct EngineGate {
+    state: Mutex<GateState>,
+    changed: Condvar,
+}
+
+impl EngineGate {
+    fn lock(&self) -> std::sync::MutexGuard<'_, GateState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// From now on the next per-request reset parks until [`Self::open`].
+    fn arm(&self) {
+        self.lock().armed = true;
+    }
+
+    /// Release the held engine thread; also what dropping an [`OpenOnDrop`]
+    /// does. Idempotent.
+    fn open(&self) {
+        self.lock().open = true;
+        self.changed.notify_all();
+    }
+
+    /// Wait (without blocking the async runtime) until an engine thread is
+    /// parked in the gate; `false` if none arrived within `limit`.
+    async fn wait_until_parked(&self, limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            if self.lock().parked {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        self.lock().parked
+    }
+}
+
+/// The attached [`RecurrentState`]: parks the engine thread in its reset.
+struct ParkInReset(Arc<EngineGate>);
+
+impl RecurrentState for ParkInReset {
+    fn reset_recurrent(&mut self) {
+        let gate = &self.0;
+        let mut state = gate.lock();
+        if !state.armed || state.open {
+            return;
+        }
+        state.parked = true;
+        gate.changed.notify_all();
+        // Parked until the test opens the gate (bounded, see GATE_PARK_LIMIT).
+        let _released = gate
+            .changed
+            .wait_timeout_while(state, GATE_PARK_LIMIT, |held| !held.open)
+            .unwrap_or_else(PoisonError::into_inner);
+    }
+}
+
+/// Opens its gate when dropped, so a panicking test cannot leave the engine
+/// thread parked.
+struct OpenOnDrop(Arc<EngineGate>);
+
+impl Drop for OpenOnDrop {
+    fn drop(&mut self) {
+        self.0.open();
+    }
+}
+
+/// A single-replica router whose engine is held by the returned gate once
+/// that is armed, with the request deadline set to [`HELD_ENGINE_DEADLINE_MS`].
+fn held_engine_router() -> (axum::Router, Arc<EngineGate>, OpenOnDrop) {
+    let gate = Arc::new(EngineGate::default());
+    let mut held = engine();
+    held.set_recurrent_state(Box::new(ParkInReset(Arc::clone(&gate))));
+    let app = router_over(
+        held,
+        RequestLimits::default().with_timeout_ms(HELD_ENGINE_DEADLINE_MS),
+    );
+    let release = OpenOnDrop(Arc::clone(&gate));
+    (app, gate, release)
+}
+
+/// Resolve the served model id once, with the gate still unarmed (the first
+/// resolution takes a replica of its own, which is no part of what these tests
+/// hold), then arm the gate.
+async fn warm_up_then_arm(app: &axum::Router, gate: &EngineGate) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get("/v1/models")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("warm-up response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    gate.arm();
+}
+
+/// The JSON payload of the `event: error` frame of an SSE `body`, if it has one.
+fn sse_error_event(body: &str) -> Option<serde_json::Value> {
+    body.split("\n\n").find_map(|frame| {
+        let is_error = frame.lines().any(|line| line == "event: error");
+        let data = frame.lines().find_map(|line| line.strip_prefix("data: "))?;
+        if is_error {
+            serde_json::from_str(data).ok()
+        } else {
+            None
+        }
+    })
 }
 
 #[tokio::test]
 async fn non_streaming_request_times_out_with_504() {
-    let probe_app = router_with_limits(RequestLimits::default());
-    let (long_tokens, timeout) = calibrate_long_tokens_and_short_timeout(&probe_app).await;
+    let (app, gate, _release) = held_engine_router();
+    warm_up_then_arm(&app, &gate).await;
 
-    let app = router_with_limits(RequestLimits::default().with_timeout(Some(timeout)));
     let resp = app
         .oneshot(chat_request(serde_json::json!({
             "messages": [{"role": "user", "content": "hi"}],
-            "max_tokens": long_tokens,
+            "max_tokens": 4,
             "temperature": 0.0,
         })))
         .await
@@ -428,18 +547,30 @@ async fn non_streaming_request_times_out_with_504() {
     let json = body_json(resp).await;
     assert_eq!(json["error"]["code"], "request_timeout");
     assert_eq!(json["error"]["type"], "server_error");
+    // The deadline names the stage it caught the request in: it holds a
+    // replica and has produced no token, because its engine thread is parked.
+    assert_eq!(json["error"]["phase"], "prefill", "{json}");
+    let message = json["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(&format!("{HELD_ENGINE_DEADLINE_MS} ms")),
+        "the message names the configured limit: {message}"
+    );
+    assert!(
+        gate.wait_until_parked(GATE_PARK_LIMIT).await,
+        "the generation never reached the held engine step"
+    );
+    gate.open();
 }
 
 #[tokio::test]
 async fn streaming_request_times_out_with_an_sse_error_event() {
-    let probe_app = router_with_limits(RequestLimits::default());
-    let (long_tokens, timeout) = calibrate_long_tokens_and_short_timeout(&probe_app).await;
+    let (app, gate, _release) = held_engine_router();
+    warm_up_then_arm(&app, &gate).await;
 
-    let app = router_with_limits(RequestLimits::default().with_timeout(Some(timeout)));
     let resp = app
         .oneshot(chat_request(serde_json::json!({
             "messages": [{"role": "user", "content": "hi"}],
-            "max_tokens": long_tokens,
+            "max_tokens": 4,
             "temperature": 0.0,
             "stream": true,
         })))
@@ -447,15 +578,29 @@ async fn streaming_request_times_out_with_an_sse_error_event() {
         .expect("response");
     // The deadline fires INSIDE the SSE body, not on the response head: the
     // head (and the body's role chunk) is sent as soon as the stream is set
-    // up, well before generation — and thus the deadline — completes.
+    // up — the engine thread is parked by then, so no token can follow — and
+    // the body's own deadline, which starts once the head is out, is what
+    // ends the stream.
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_text(resp).await;
-    assert!(body.contains("event: error"), "body: {body}");
-    assert!(body.contains("request_timeout"), "body: {body}");
+    assert!(
+        body.contains("\"role\":\"assistant\""),
+        "the role chunk precedes the timeout: {body}"
+    );
+    let error = sse_error_event(&body)
+        .unwrap_or_else(|| panic!("the stream must carry an `event: error` frame: {body}"));
+    assert_eq!(error["error"]["code"], "request_timeout", "{body}");
+    assert_eq!(error["error"]["type"], "server_error", "{body}");
+    assert_eq!(error["error"]["phase"], "prefill", "{body}");
     assert!(
         body.trim_end().ends_with("data: [DONE]"),
         "an SSE stream must still end with [DONE] after a timeout: {body}"
     );
+    assert!(
+        gate.wait_until_parked(GATE_PARK_LIMIT).await,
+        "the generation never reached the held engine step"
+    );
+    gate.open();
 }
 
 // ── sec-15 / SV-07: the admin surface is authenticated ────────────────────────
@@ -748,4 +893,261 @@ async fn identical_greedy_requests_produce_identical_output() {
         first_json["usage"]["completion_tokens"],
         second_json["usage"]["completion_tokens"]
     );
+}
+
+// ── The deadline of every generation endpoint ─────────────────────────────────
+//
+// `/v1/chat/completions/extended` and `/v1/completions` carry the base
+// endpoint's own deadline: the same `504 request_timeout` naming the stage in
+// `error.phase` while no response has started, the same SSE `error` event
+// then `[DONE]` once a stream is open, and the same cancellation. The engine
+// is held exactly as above ([`EngineGate`]), or its only replica is taken by
+// the test (the request queues: `waiting_for_engine`). Every case also checks
+// that the generation was cancelled: once the engine is released the replica
+// comes back without having produced a single token (the engine's own
+// `tokens_generated_total` stays at zero), which an uncancelled four-token
+// generation could not do.
+
+/// The three generation routes.
+const GENERATION_ROUTES: [&str; 3] = [
+    "/v1/chat/completions",
+    "/v1/chat/completions/extended",
+    "/v1/completions",
+];
+
+/// A request every generation route accepts on a tokenizer-less router.
+fn generation_body(path: &str, stream: bool) -> serde_json::Value {
+    if path == "/v1/completions" {
+        serde_json::json!({
+            "prompt": "hi",
+            "max_tokens": 4,
+            "temperature": 0.0,
+            "stream": stream,
+        })
+    } else {
+        serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 4,
+            "temperature": 0.0,
+            "stream": stream,
+        })
+    }
+}
+
+fn post_to(path: &str, body: &serde_json::Value) -> Request<Body> {
+    Request::post(path)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(body).expect("serialize")))
+        .expect("request")
+}
+
+/// A held-engine router whose pool and engine metrics the test also holds.
+struct HeldServer {
+    app: axum::Router,
+    gate: Arc<EngineGate>,
+    _release: OpenOnDrop,
+    pool: Arc<EnginePool>,
+    /// The engine's own counters: what it generated, whoever asked.
+    engine_metrics: Arc<InferenceMetrics>,
+}
+
+impl HeldServer {
+    /// A single-replica router with the deadline [`HELD_ENGINE_DEADLINE_MS`],
+    /// its served model already resolved (the first resolution takes a
+    /// replica of its own).
+    async fn start() -> Self {
+        let gate = Arc::new(EngineGate::default());
+        let mut held = engine();
+        held.set_recurrent_state(Box::new(ParkInReset(Arc::clone(&gate))));
+        let engine_metrics = Arc::new(InferenceMetrics::new());
+        held.set_metrics(Arc::clone(&engine_metrics));
+        let pool = EnginePool::new(vec![held]);
+        let app = create_router_full(
+            Arc::clone(&pool),
+            None,
+            Arc::new(InferenceMetrics::new()),
+            RouterOptions::default()
+                .with_limits(RequestLimits::default().with_timeout_ms(HELD_ENGINE_DEADLINE_MS))
+                .with_auth(AuthConfig::with_admin_token(ADMIN_TOKEN))
+                .with_prompt_start_token(QWEN3_IM_START),
+        );
+        let server = Self {
+            app,
+            _release: OpenOnDrop(Arc::clone(&gate)),
+            gate,
+            pool,
+            engine_metrics,
+        };
+        let resp = server
+            .app
+            .clone()
+            .oneshot(
+                Request::get("/v1/models")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("warm-up response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        server
+    }
+
+    /// Release the held engine thread and wait (bounded) for the replica:
+    /// the request's generation was cancelled before it produced a token.
+    async fn release_and_expect_no_token(&self, what: &str) {
+        assert!(
+            self.gate.wait_until_parked(GATE_PARK_LIMIT).await,
+            "{what}: the generation never reached the held engine step"
+        );
+        self.gate.open();
+        let back = tokio::time::timeout(GATE_PARK_LIMIT, self.pool.acquire()).await;
+        assert!(
+            matches!(back, Ok(Ok(_))),
+            "{what}: the replica never came back"
+        );
+        assert_eq!(
+            self.engine_metrics.tokens_generated_total.get(),
+            0,
+            "{what}: the deadline must cancel the generation, which then produces nothing"
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_generation_route_times_out_with_a_504_naming_the_stage() {
+    for path in GENERATION_ROUTES {
+        let server = HeldServer::start().await;
+        server.gate.arm();
+        let resp = server
+            .app
+            .clone()
+            .oneshot(post_to(path, &generation_body(path, false)))
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT, "{path}");
+        let json = body_json(resp).await;
+        assert_eq!(json["error"]["code"], "request_timeout", "{path}: {json}");
+        assert_eq!(json["error"]["type"], "server_error", "{path}: {json}");
+        assert_eq!(json["error"]["phase"], "prefill", "{path}: {json}");
+        let message = json["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(&format!("{HELD_ENGINE_DEADLINE_MS} ms")),
+            "{path}: the message names the configured limit: {message}"
+        );
+        server.release_and_expect_no_token(path).await;
+    }
+}
+
+#[tokio::test]
+async fn every_generation_route_ends_an_open_stream_with_an_sse_error_event() {
+    for path in GENERATION_ROUTES {
+        let server = HeldServer::start().await;
+        server.gate.arm();
+        let resp = server
+            .app
+            .clone()
+            .oneshot(post_to(path, &generation_body(path, true)))
+            .await
+            .expect("response");
+        // The stream is open (the engine thread is parked by then, so no
+        // token can follow); the body's own deadline ends it.
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        let body = body_text(resp).await;
+        let error = sse_error_event(&body)
+            .unwrap_or_else(|| panic!("{path}: no `event: error` frame: {body}"));
+        assert_eq!(error["error"]["code"], "request_timeout", "{path}: {body}");
+        assert_eq!(error["error"]["type"], "server_error", "{path}: {body}");
+        assert_eq!(error["error"]["phase"], "prefill", "{path}: {body}");
+        assert!(
+            body.trim_end().ends_with("data: [DONE]"),
+            "{path}: an SSE stream must still end with [DONE] after a timeout: {body}"
+        );
+        server.release_and_expect_no_token(path).await;
+    }
+}
+
+#[tokio::test]
+async fn a_stream_queued_for_a_replica_times_out_before_it_opens() {
+    for path in GENERATION_ROUTES {
+        let server = HeldServer::start().await;
+        // The test takes the only replica: the request queues for it.
+        let taken = server.pool.acquire().await.expect("take the replica");
+        let resp = server
+            .app
+            .clone()
+            .oneshot(post_to(path, &generation_body(path, true)))
+            .await
+            .expect("response");
+        // No stream was opened: a plain JSON `504`, not an SSE body.
+        assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT, "{path}");
+        let json = body_json(resp).await;
+        assert_eq!(json["error"]["code"], "request_timeout", "{path}: {json}");
+        assert_eq!(
+            json["error"]["phase"], "waiting_for_engine",
+            "{path}: {json}"
+        );
+        drop(taken);
+        let back = tokio::time::timeout(GATE_PARK_LIMIT, server.pool.acquire()).await;
+        assert!(matches!(back, Ok(Ok(_))), "{path}: the replica is free");
+        assert_eq!(server.engine_metrics.tokens_generated_total.get(), 0);
+    }
+}
+
+/// `oxibonsai serve` and `oxibonsai-serve` put an admission timeout of the
+/// same `--request-timeout-ms` plus a two-second grace in front of this
+/// router; it answers a bare `408` when the router has not produced a
+/// response head by then. On every generation route the handler's own
+/// deadline answers first — streamed or not, caught in prefill or queued for
+/// a replica — so that backstop is never what a client of these routes gets:
+/// the response head always arrives well inside the grace, typed.
+#[tokio::test]
+async fn the_admission_backstop_is_unreachable_on_every_generation_route() {
+    const ADMISSION_TIMEOUT_GRACE_MS: u64 = 2_000;
+    let backstop = Duration::from_millis(HELD_ENGINE_DEADLINE_MS + ADMISSION_TIMEOUT_GRACE_MS);
+    for path in GENERATION_ROUTES {
+        for stream in [false, true] {
+            for queued in [false, true] {
+                let server = HeldServer::start().await;
+                let taken = if queued {
+                    Some(server.pool.acquire().await.expect("take the replica"))
+                } else {
+                    server.gate.arm();
+                    None
+                };
+                let started = Instant::now();
+                let head = tokio::time::timeout(
+                    backstop,
+                    server
+                        .app
+                        .clone()
+                        .oneshot(post_to(path, &generation_body(path, stream))),
+                )
+                .await;
+                let what = format!("{path}, stream {stream}, queued {queued}");
+                let resp = match head {
+                    Ok(Ok(resp)) => resp,
+                    Ok(Err(e)) => panic!("{what}: {e}"),
+                    Err(_) => panic!("{what}: no response head within the admission backstop"),
+                };
+                assert!(started.elapsed() < backstop, "{what}");
+                let open_stream = stream && !queued;
+                if open_stream {
+                    assert_eq!(resp.status(), StatusCode::OK, "{what}");
+                    let body = body_text(resp).await;
+                    let error = sse_error_event(&body)
+                        .unwrap_or_else(|| panic!("{what}: no `event: error` frame: {body}"));
+                    assert_eq!(error["error"]["code"], "request_timeout", "{what}");
+                } else {
+                    assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT, "{what}");
+                    let json = body_json(resp).await;
+                    assert_eq!(json["error"]["code"], "request_timeout", "{what}: {json}");
+                    assert!(json["error"]["phase"].is_string(), "{what}: {json}");
+                }
+                drop(taken);
+                if !queued {
+                    server.gate.open();
+                }
+            }
+        }
+    }
 }

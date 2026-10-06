@@ -73,7 +73,7 @@ const LEGACY_ARCH: &str = "llm";
 ///
 /// Every structural hyperparameter is looked up first under this key, then
 /// (only on a miss) under `arch_key(LEGACY_ARCH, suffix)` — the read-only
-/// legacy fallback described on [`LEGACY_ARCH`]. Public because
+/// legacy fallback described on `LEGACY_ARCH`. Public because
 /// [`crate::config_hybrid`] and [`crate::hadamard_config`] need the same
 /// convention for their own `<arch>.*` keys.
 pub fn arch_key(arch: &str, suffix: &str) -> String {
@@ -247,7 +247,7 @@ impl RopeScaling {
     }
 }
 
-// ─── `--rope-scaling auto|on|off` (wave-4b ruling R2, `RULING_bonsai8b_yarn.md`) ──
+// ─── `--rope-scaling auto|on|off` ──────────────────────────────
 
 /// A caller's override of the RoPE scaling a GGUF declares
 /// (`--rope-scaling auto|on|off`).
@@ -426,7 +426,7 @@ fn resolve_vocab_size(
 pub struct Qwen3Config {
     /// Hidden size (embedding dimension). Default: 4096.
     pub hidden_size: usize,
-    /// Intermediate size for SwiGLU MLP. Default: 14336.
+    /// Intermediate size for SwiGLU MLP. Default: 12288 (Bonsai-8B).
     pub intermediate_size: usize,
     /// Number of Transformer layers. Default: 36.
     pub num_layers: usize,
@@ -512,7 +512,7 @@ impl Qwen3Config {
     ///
     /// Identical to [`Qwen3Config::from_metadata`] except that `vocab_size`
     /// additionally consults `tensors`'s `token_embd.weight` shape (see
-    /// [`resolve_vocab_size`]) and hard-errors if it disagrees with
+    /// `resolve_vocab_size`) and hard-errors if it disagrees with
     /// `tokenizer.ggml.tokens`'s length instead of silently picking one.
     pub fn from_metadata_and_tensors(
         metadata: &MetadataStore,
@@ -589,7 +589,7 @@ impl Qwen3Config {
             .map(|v| v as usize)
             .unwrap_or(head_dim);
 
-        // `--rope-scaling` (wave-4b ruling R2): `Auto` returns the declared
+        // `--rope-scaling`: `Auto` returns the declared
         // value unchanged, so the default path is byte-identical.
         let rope_scaling =
             rope_override.apply(RopeScaling::from_metadata(metadata, arch)?, arch)?;
@@ -1036,7 +1036,7 @@ mod tests {
     // ── from_metadata: required-key behaviour (core-gguf-06 / M-03) ───────
 
     /// Replaces `from_empty_metadata_uses_defaults`, which enshrined the
-    /// defect this package fixes: empty metadata must be a hard error, not
+    /// defect fixed here: empty metadata must be a hard error, not
     /// a silently-defaulted Bonsai-8B config.
     #[test]
     fn from_empty_metadata_is_a_hard_error() {
@@ -1249,7 +1249,7 @@ mod tests {
         assert_ne!(config.head_dim, config.value_length);
     }
 
-    // ── RopeScalingOverride (`--rope-scaling`, wave-4b ruling R2) ──────────
+    // ── RopeScalingOverride (`--rope-scaling`) ────────────────────────────────
 
     /// `full_qwen3_pairs()` plus the exact YaRN declaration
     /// `models/Bonsai-8B.gguf` carries.

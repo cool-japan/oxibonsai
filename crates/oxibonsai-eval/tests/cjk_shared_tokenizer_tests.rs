@@ -1,6 +1,6 @@
 //! RAG-EVAL-IMG-06: `rouge::tokenize` collapsed any unspaced CJK sentence
 //! into a single token (whitespace-only splitting), so BLEU/ROUGE/METEOR of
-//! an *identical* Japanese sentence scored 0.0 instead of 1.0. The verifier
+//! an *identical* Japanese sentence scored 0.0 instead of 1.0. A review
 //! also found the identical defect in `qa.rs`'s SQuAD F1 (never opened by
 //! the original finder) — both are fixed from the one shared tokenizer in
 //! `rouge::cjk_aware_tokens`, exercised here from all three call sites.

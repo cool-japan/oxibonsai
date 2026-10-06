@@ -391,8 +391,8 @@ fn two_different_q1_models_never_share_fused_metal_weights() {
     );
 }
 
-/// HANDOVER-GPU A5 (ii), on the in-crate Q1 replica fixture (a Q1 LM head,
-/// GPU-tier layer dispatchers, replicas over one leaked weight set):
+/// Device weight-upload accounting, on the in-crate Q1 replica fixture (a Q1
+/// LM head, GPU-tier layer dispatchers, replicas over one leaked weight set):
 ///
 /// 1. a batched prefill (`try_metal_prefill_with_lm_head`) followed by greedy
 ///    decode (`forward_greedy_gpu`, which builds the cached Q1 weight set)
@@ -404,11 +404,11 @@ fn two_different_q1_models_never_share_fused_metal_weights() {
 /// 3. dropping one replica keeps the buffers for the other, and dropping the
 ///    last frees exactly the namespace's norm / LM-head entries.
 ///
-/// Measured before the fix on the real Bonsai-8B: the prefill keyed the LM
-/// head on the epoch slots and the cached greedy builder on the old literals
-/// — +84.5 MiB within one replica — and every replica minted its own epoch
-/// (+88.6 MB per extra replica). Runs in a private Metal graph so every
-/// count here is exact.
+/// The regression this guards, measured on the real Bonsai-8B before the
+/// shared-slot fix: the prefill keyed the LM head on the epoch slots and the
+/// cached greedy builder on the old literals — +84.5 MiB within one replica —
+/// and every replica minted its own epoch (+88.6 MB per extra replica). Runs
+/// in a private Metal graph so every count here is exact.
 #[test]
 fn q1_prefill_then_greedy_decode_uploads_the_lm_head_once_and_replicas_share_it() {
     use super::testing_fixture::Q1ReplicaFixture;
@@ -964,7 +964,9 @@ fn forward_hidden_metal_route_declines_what_it_does_not_serve() {
 // the size of a command buffer and its encoder on every token. The test
 // below measures the process footprint across many forwards of every dense
 // Metal route (decode, greedy decode, fused batch prefill, speculative
-// verify, head-free hidden prefill) on both weight formats, in a child
+// verify, head-free hidden prefill) and of the per-block host-KV decode a
+// model takes when no fused route applies (its projections and LM head go
+// through the scirs2-core GPU backend), on both weight formats, in a child
 // process of its own so that no other test of this binary allocates while
 // it measures.
 
@@ -986,8 +988,8 @@ const FOOTPRINT_FORWARDS: usize = 1550;
 /// Decode steps per decode round of the footprint test.
 const FOOTPRINT_DECODE_STEPS: usize = 31;
 
-/// Measured phases: five routes on two weight formats.
-const FOOTPRINT_PHASES: usize = 10;
+/// Measured phases: six routes on two weight formats.
+const FOOTPRINT_PHASES: usize = 12;
 
 /// `TASK_VM_INFO`, the `task_info` flavor carrying `phys_footprint`.
 const TASK_VM_INFO: u32 = 22;
@@ -1167,6 +1169,31 @@ fn footprint_probe() {
             assert_eq!(rows.len(), hidden_tokens.len() * H);
         });
         note_footprint(&mut failures, &label, growth);
+
+        // Per-block host-KV decode on the GPU tier (`forward`'s fallback when
+        // no fused Metal route applies). A declared sliding window turns the
+        // fused routes off (they attend over the full cache), so every
+        // block's projections and the LM head dispatch through the scirs2-core
+        // GPU backend, whose command buffers only `forward` pools. The window
+        // is wider than the 31 positions decoded, so it changes no result.
+        model.config.sliding_window = Some(CONTEXT);
+        let label = format!("{format} block-dispatch decode");
+        let growth = measure_footprint(&label, FOOTPRINT_FORWARDS, 10, rounds, || {
+            model.reset();
+            let mut token = 3u32;
+            for pos in 0..FOOTPRINT_DECODE_STEPS {
+                let logits = model
+                    .forward(token, pos, &gpu)
+                    .expect("per-block GPU-tier decode");
+                token = argmax(&logits);
+            }
+            assert!(
+                !model.gpu_path_active(),
+                "{format}: the block-dispatch decode ran on the host KV cache, not a fused route"
+            );
+        });
+        model.config.sliding_window = None;
+        note_footprint(&mut failures, &label, growth);
     }
     assert!(
         failures.is_empty(),
@@ -1178,9 +1205,10 @@ fn footprint_probe() {
 
 /// The dense Metal path does not grow the process: 1550 forwards of each
 /// route — fused single-token decode, fused greedy decode, fused batch
-/// prefill, batched speculative verify, head-free hidden prefill — on the Q1
-/// and the TQ2 fixture, weights uploaded, grow the process footprint by at
-/// most 1 MiB per route. Every forward's command buffers and encoders are
+/// prefill, batched speculative verify, head-free hidden prefill, and the
+/// per-block host-KV decode of the scirs2-core fallback — on the Q1 and the
+/// TQ2 fixture, weights uploaded, grow the process footprint by at most
+/// 1 MiB per route. Every forward's command buffers and encoders are
 /// autoreleased objects the Metal path drains per call; left to the thread
 /// they cost well over 1 KiB per forward until it exits.
 ///

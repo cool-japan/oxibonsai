@@ -18,10 +18,8 @@ fn sampler_builder_all_defaults_valid() {
     assert!((p.temperature - 0.7).abs() < f32::EPSILON);
     assert_eq!(p.top_k, 40);
     assert!((p.top_p - 0.9).abs() < f32::EPSILON);
-    // Gatekeeper REQUIRED #18 (waves 3+3.5 review, B2-14): corrected from a
-    // stale `1.1` after `SamplerBuilder::new()`'s default was fixed to
-    // `1.0`, matching `sampling::SamplingParams::default()` (RT-24 /
-    // gatekeeper REQUIRED #1(a)).
+    // Corrected from a stale `1.1` after `SamplerBuilder::new()`'s default was
+    // fixed to `1.0`, matching `sampling::SamplingParams::default()` (RT-24).
     assert!((p.repetition_penalty - 1.0).abs() < f32::EPSILON);
 }
 

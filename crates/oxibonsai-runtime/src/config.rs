@@ -7,7 +7,7 @@ use std::path::Path;
 
 use crate::error::{RuntimeError, RuntimeResult};
 
-/// Chat-template rendering types (B2-13's real Jinja subset), re-exported
+/// Chat-template rendering types (the real Jinja subset), re-exported
 /// here as part of the chat-contract configuration surface
 /// (`--think`/`--no-think`, `--reasoning-effort`, `--tools`,
 /// `[model].reasoning_effort`): a caller that depends only on
@@ -35,7 +35,7 @@ pub struct OxiBonsaiConfig {
     /// `--width`/`--height`/`--steps`/`--seed` flags against it (flag wins,
     /// then this section, then the CLI's own literal default), and
     /// `output_dir`/`model_path` fill in a relative `--out` and a missing
-    /// `--dit` (B2-14).
+    /// `--dit`.
     pub imagen: ImagenConfig,
 }
 
@@ -81,17 +81,14 @@ pub struct ModelConfig {
     /// it is populated from the model's GGUF metadata
     /// (`<arch>.context_length`).
     ///
-    /// This field only *carries* the value today; no forward/serving path
-    /// reads it yet. **B2-12 implements the guard formula** —
+    /// This field only *carries* the value; the pure guard functions
     /// [`max_context_for_budget`] (Appendix A.3 exactly) and
     /// [`validate_requested_context`]/[`OxiBonsaiConfig::validate_context_budget`]
     /// (refuse a request naming both the model limit and the RAM-derived
-    /// limit) — as pure, fully-tested functions; wiring a caller to fill
-    /// this field from real GGUF metadata and to call them before serving a
-    /// request is the CLI/model-load integration (B2-14 and B2-09/B2-11's
-    /// territory, not owned by this package). Only the trivial non-zero
-    /// sanity check below is enforced by [`OxiBonsaiConfig::validate`]
-    /// itself.
+    /// limit) are what a caller uses to enforce it — the CLI's Bonsai 2
+    /// context guard (`src/cli/bonsai2.rs`) calls them with numbers derived
+    /// from the loaded GGUF. Only the trivial non-zero sanity check below is
+    /// enforced by [`OxiBonsaiConfig::validate`] itself.
     #[serde(default)]
     pub max_context: Option<usize>,
     /// A hard ceiling, in bytes, on the memory a single session's context
@@ -106,8 +103,8 @@ pub struct ModelConfig {
     /// forward/serving path yet (same integration gap as `max_context`).
     #[serde(default)]
     pub ctx_budget_bytes: Option<u64>,
-    /// RoPE long-context scaling override (wave-4b orchestrator addendum,
-    /// `RULING_bonsai8b_yarn.md`): `auto` (default) honours the GGUF's own
+    /// RoPE long-context scaling override (M-08):
+    /// `auto` (default) honours the GGUF's own
     /// `<arch>.rope.scaling.*` metadata exactly; `off` forces plain RoPE;
     /// `on` requires the file to declare scaling. Applied at model load by
     /// [`crate::InferenceEngine::from_gguf_with_backend_and_rope`] (and the
@@ -118,12 +115,11 @@ pub struct ModelConfig {
     pub rope_scaling: RopeScalingMode,
 }
 
-/// `--rope-scaling`/`[model].rope_scaling` control (wave-4b orchestrator
-/// addendum, 2026-09-23; see `RULING_bonsai8b_yarn.md`).
+/// `--rope-scaling`/`[model].rope_scaling` control (M-08).
 ///
 /// Bonsai-8B's GGUF declares `qwen3.rope.scaling.{type=yarn,factor=4.0,
 /// original_context_length=16384}`; OxiBonsai <= 0.2.4 ignored it (plain
-/// RoPE at every position), while the wiring this session landed
+/// RoPE at every position), while the current build wires up
 /// (`oxibonsai_core::config::RopeScaling::from_metadata`, M-08) honours it
 /// exactly like llama.cpp — which changes that model's decoded text at
 /// every context length, not just past 16 384 tokens. This type exists so a
@@ -185,13 +181,13 @@ impl From<RopeScalingMode> for oxibonsai_core::config::RopeScalingOverride {
 
 /// Text-to-image (Bonsai-Image / FLUX.2 Klein DiT) generation defaults.
 ///
-/// CLI-CORE deviation (B2-12 addendum item 6): the config-file section is
-/// the enabling half; reading it from `oxibonsai image` CLI flags is
-/// B2-14's. `width`/`height` mirror `oxibonsai_image::pipeline`'s own
+/// The config-file section feeds `oxibonsai image` (flag, then this
+/// section, then the CLI's own literal default). `width`/`height` mirror
+/// `oxibonsai_image::pipeline`'s own
 /// enforced bounds (multiples of 16, [`MIN_DIMENSION`, `MAX_DIMENSION`] —
-/// not owned by this package, so checked here only informally by this doc,
+/// checked here only informally by this doc,
 /// not shared code). `steps`/`guidance_scale`'s defaults (4 / 3.5) are this
-/// package's own choice, not a mirrored pipeline default — the pipeline
+/// crate's own choice, not a mirrored pipeline default — the pipeline
 /// itself declares no default for either, only `validate_render_params`/
 /// `validate_guidance` acceptance ranges (see [`OxiBonsaiConfig::validate`]'s
 /// `guidance_scale` check, which matches `validate_guidance` exactly:
@@ -264,10 +260,9 @@ impl Default for SamplingConfig {
             temperature: 0.7,
             top_k: 40,
             top_p: 0.9,
-            // Gatekeeper REQUIRED #18 (waves 3+3.5 review): this used to be
-            // `1.1`, one of the residual `repetition_penalty: 1.1` seeds
-            // left over after `sampling.rs`'s own `SamplingParams::default()`
-            // was corrected to `1.0` (RT-24 / gatekeeper REQUIRED #1(a)).
+            // `1.0` (no-op), matching `sampling.rs`'s own
+            // `SamplingParams::default()` (RT-24); the default used to be
+            // `1.1`, which silently applied a penalty nobody asked for.
             // `1.0` (no-op) matches every other penalty default in this
             // struct and keeps `OxiBonsaiConfig::load`'s `#[serde(default)]`
             // path and `EngineBuilder::build` from silently reintroducing a
@@ -389,16 +384,14 @@ pub const OS_RESERVE_MIN_BYTES: u64 = 3 * 1024 * 1024 * 1024; // 3 GiB
 
 /// Bonsai 2 27B's recurrent (Gated-DeltaNet) state size per sequence, in
 /// bytes, derived from `RecurrentCache::memory_bytes()`
-/// (`crates/oxibonsai-model/src/hybrid/model.rs`, not owned by this
-/// package): 48 linear-attention layers, each holding a conv1d state
+/// (`crates/oxibonsai-model/src/hybrid/model.rs`): 48 linear-attention
+/// layers, each holding a conv1d state
 /// (`[3][10240]` f32 = `122_880` B — 3 = `ssm.conv_kernel - 1` causal taps
 /// over the concatenated qkv width) plus a per-v-head recurrent state `S`
 /// (`[48][128][128]` f32 = `3_145_728` B — `ssm.time_step_rank=48` v-heads x
 /// `ssm.state_size=128` x `head_v_dim=128`): `48 * (122_880 + 3_145_728) =
-/// 156_893_184`. Gatekeeper REQUIRED #8 (waves 3+3.5 review) corrected this
-/// from a stale `163_184_640` that did not match the real cache formula;
-/// this is the CODE-side half of that fix (REQUIRED #19 covers the design
-/// doc's own "~166 K" napkin-math text separately).
+/// 156_893_184`. An earlier value of `163_184_640` did not match the real
+/// cache formula and was corrected.
 pub const BONSAI2_RECURRENT_BYTES: u64 = 156_893_184;
 
 /// Bonsai 2 27B's KV cost per token at f16, from its Appendix A.3 geometry
@@ -409,16 +402,16 @@ pub const BONSAI2_KV_BYTES_PER_TOKEN: u64 = 65_536;
 /// Shipped operational default context length for Bonsai 2 (design doc
 /// §3.7/Appendix A.3: "the default stays 8192 by policy"). Deliberately far
 /// below the RAM-derived ceiling (178 176 tokens on a 24 GiB host with the
-/// PQ2_0 weights, Appendix A.3 as corrected by gatekeeper fix #19): a
+/// PQ2_0 weights, Appendix A.3): a
 /// conservative out-of-the-box default that a caller can raise explicitly,
 /// checked against [`max_context_for_budget`] via
 /// [`validate_requested_context`].
 ///
 /// This is **not** [`ModelConfig::max_seq_len`]'s `Default::default()`
 /// value (which stays `4096` — a long-standing, model-agnostic default with
-/// existing non-owned test coverage pinned to it; see this package's
-/// recorded deviation). It is the value a Bonsai-2-aware caller (the CLI's
-/// `--ctx`/model-registry defaults, B2-14's territory) should use.
+/// existing test coverage pinned to it). It is the value a
+/// Bonsai-2-aware caller (the CLI's `--ctx`/model-registry defaults)
+/// should use.
 pub const BONSAI2_DEFAULT_CONTEXT: usize = 8192;
 
 /// `bytes_per_token = n_full_layers * n_kv_heads * head_dim * 2 (K+V) *
@@ -488,7 +481,7 @@ pub fn max_context_for_budget(
     // declared limit is the binding constraint and is not already a
     // multiple of 1024 (every real `<arch>.context_length` this build has
     // seen — 262144/131072/32768/8192/4096 — is, so the divergence was
-    // previously unobservable; wave-3 review). `bytes_per_token == 0` (a
+    // previously unobservable). `bytes_per_token == 0` (a
     // model with no full-attention layers at all) has no KV-driven ceiling
     // at all, so the pre-rounding bound is `model_context_length` itself
     // rather than a division — the final rounding step below still applies
@@ -668,7 +661,7 @@ impl OxiBonsaiConfig {
                 "model.max_seq_len must be > 0".to_string(),
             ));
         }
-        // `max_context` / `ctx_budget_bytes` feed B2-12's context-guard
+        // `max_context` / `ctx_budget_bytes` feed the context-guard
         // formula (`max_context_for_budget` / `validate_context_budget`,
         // below), which needs the model's real weight/geometry numbers from
         // a loaded GGUF that `OxiBonsaiConfig` alone does not have — so only
@@ -710,7 +703,7 @@ impl OxiBonsaiConfig {
 
     /// Validate the operator-requested [`ModelConfig::max_seq_len`] against
     /// both the model's own declared context limit and a RAM-derived
-    /// ceiling (RT-29 / sec-11 / B2-12, Appendix A.3).
+    /// ceiling (RT-29 / sec-11, Appendix A.3).
     ///
     /// Unlike [`OxiBonsaiConfig::validate`], this needs numbers
     /// `OxiBonsaiConfig` does not carry on its own — the model's on-disk
@@ -882,8 +875,7 @@ mod tests {
         assert!((cfg.sampling.temperature - 0.7).abs() < f32::EPSILON);
         assert_eq!(cfg.sampling.top_k, 40);
         assert!((cfg.sampling.top_p - 0.9).abs() < f32::EPSILON);
-        // Gatekeeper REQUIRED #18: corrected from a stale `1.1` (see the
-        // identical note on `SamplingConfig`'s `Default` impl above).
+        // `1.0` (no-op), matching the `SamplingConfig` `Default` impl above.
         assert!((cfg.sampling.repetition_penalty - 1.0).abs() < f32::EPSILON);
         assert_eq!(cfg.sampling.max_tokens, 512);
         assert_eq!(cfg.model.max_seq_len, 4096);
@@ -891,11 +883,11 @@ mod tests {
         assert!(cfg.model.tokenizer_path.is_none());
         assert!(
             cfg.model.max_context.is_none(),
-            "max_context is unpopulated until B2-12 (wave 3) reads it from the GGUF"
+            "max_context is unpopulated by default"
         );
         assert!(
             cfg.model.ctx_budget_bytes.is_none(),
-            "ctx_budget_bytes is unpopulated until B2-12 (wave 3) sets a default"
+            "ctx_budget_bytes is unpopulated by default"
         );
         assert_eq!(cfg.observability.log_level, "info");
         assert!(!cfg.observability.json_logs);
@@ -1154,13 +1146,13 @@ port = 4444
         let _ = std::fs::remove_file(&path);
     }
 
-    // ── [imagen] section (CLI-CORE deviation, addendum item 6) ─────────────
+    // ── [imagen] section ────────────────────────────────────────────────────
 
     #[test]
     fn imagen_toml_round_trip() {
         // CLAUDE.md: never hardcode absolute paths in tests, even as inert
         // config-value strings that touch no filesystem -- built from
-        // `std::env::temp_dir()` instead (wave-3 review). TOML *literal*
+        // `std::env::temp_dir()` instead. TOML *literal*
         // strings (single-quoted) are used so a `\`-containing path (e.g. on
         // a platform whose temp dir uses backslashes) is never
         // escape-processed.
@@ -1232,7 +1224,7 @@ port = 4444
         // guidance scale (its own doctest pins `validate_guidance(-3.5)` as
         // `Ok`) -- this config's `validate()` must match that contract
         // exactly rather than being stricter than the consumer it exists to
-        // feed. Wave-3 review: a prior version of this test asserted the
+        // feed. An earlier version of this test asserted the
         // opposite (that `-1.0` must be rejected), which was simply wrong
         // relative to the real pipeline it claimed to mirror.
         let mut cfg = OxiBonsaiConfig::default();
@@ -1369,7 +1361,7 @@ port = 4444
         // `max_context_for_budget_result_is_always_a_multiple_of_1024`)
         // still applies uniformly, so a non-1024-multiple `context_length`
         // of 5000 still rounds down to 4096 here, same as it would on the
-        // RAM-derived path (wave-3 review: this branch previously bypassed
+        // RAM-derived path (this branch once bypassed
         // the rounding entirely and returned 5000 verbatim).
         let result = max_context_for_budget(1, 100, 100, 0, 5000);
         assert_eq!(result, 4096);
@@ -1546,7 +1538,7 @@ port = 4444
         assert!(matches!(err, RuntimeError::Config(_)));
     }
 
-    // ── RopeScalingMode (wave-4b orchestrator addendum) ──
+    // ── RopeScalingMode ──
 
     #[test]
     fn rope_scaling_mode_defaults_to_auto() {
@@ -1640,7 +1632,7 @@ rope_scaling = "off"
         }
     }
 
-    /// Gatekeeper REQUIRED #8: `BONSAI2_RECURRENT_BYTES` must BE what the
+    /// `BONSAI2_RECURRENT_BYTES` must BE what the
     /// model's own recurrent cache allocates, not a hand-copied number —
     /// asserted against a real `RecurrentCache` built for the 27B geometry
     /// (zero-initialised, so the ~157 MB are lazily committed pages).

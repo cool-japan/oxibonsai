@@ -52,15 +52,15 @@ use crate::error::{KernelError, KernelResult};
 ///   construction, for any length including zero.
 /// - Its three external call sites
 ///   (`oxibonsai-model/src/layers/attention.rs`, `oxibonsai-image/src/math.rs`,
-///   `oxibonsai-image/src/te/forward.rs`) are all outside this package's
-///   `owned_files`, and none of them use the return value today. Converting
+///   `oxibonsai-image/src/te/forward.rs`) are all outside this crate,
+///   and none of them use the return value today. Converting
 ///   this signature would force each of those three call sites to either
 ///   propagate a `Result` that can never be `Err` through their own
 ///   (infallible) callers, or discard it with `let _ = softmax_simd(...)`.
 ///   The latter is the error-swallowing idiom K-02/M-01 exists to eliminate
 ///   — manufacturing one to satisfy the letter of the spec at a real
 ///   invariant's expense would make the codebase worse in exactly the
-///   dimension this package improves.
+///   dimension this crate improves.
 #[inline]
 pub fn softmax_simd(values: &mut [f32]) {
     if values.is_empty() {
@@ -497,7 +497,7 @@ fn softmax_neon(values: &mut [f32]) {
 /// tail through this exact function rather than falling back to `f32::exp()`,
 /// so a value is bit-identical no matter where in the buffer it lands.
 ///
-/// `pub(crate)` (K-INT8 wave-4b): `norms.rs` imports this instead of holding
+/// `pub(crate)`: `norms.rs` imports this instead of holding
 /// its own verbatim copy — see its module doc comment and
 /// `norms::dedup_parity` for the bit-identity proof.
 #[cfg(target_arch = "aarch64")]

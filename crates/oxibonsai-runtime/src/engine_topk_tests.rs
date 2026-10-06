@@ -1,15 +1,15 @@
 //! Tests for the sampled top-k route (`perf-11`, sampled half) of
 //! [`crate::engine_greedy`].
 //!
-//! Three layers:
+//! Four layers:
 //!
 //! * the **byte identity** the route ships on: a sampled request decodes
 //!   exactly like an independently spelled-out classic loop (prefill, then a
 //!   standalone `Sampler::new(params, seed)` draw over every full logit row)
-//!   with the route on (the default) and off — on a synthetic CPU engine
-//!   here, on a fused Metal fixture and on the real 1.7B (`OXI_MODEL`)
-//!   below — and a candidate draw equals the classic draw draw-for-draw on
-//!   tie-heavy rows;
+//!   with the route opted in and with it off (the default) — on a synthetic
+//!   CPU engine here, on a fused Metal fixture and on the real 1.7B
+//!   (`OXI_MODEL`) below — and a candidate draw equals the classic draw
+//!   draw-for-draw on tie-heavy rows;
 //! * host-only tests of the CPU candidate extraction ([`top_k_candidates`]),
 //!   the configuration, and the route's distribution;
 //! * Metal tests of the route (on the fused synthetic ternary model,
@@ -17,14 +17,22 @@
 //!   `topk_f32` download over the resident logits equals the CPU extraction
 //!   of the same row bit for bit, and (b) a sampled generation through the
 //!   GPU candidates is token-for-token identical to the full-row candidate
-//!   reference mode, with every step counted where it was served.
+//!   reference mode, with every step counted where it was served. Every
+//!   engine in them that exercises the route opts in explicitly
+//!   (`set_sampled_topk(SampledTopKConfig::gpu_candidates())`): the route is
+//!   off by default;
+//! * the **default** (`default_route`) and the throughput guard that keeps
+//!   it from silently regressing (`throughput`): a default-constructed
+//!   engine and a default server request take the full-row path and never
+//!   move the route's counters, and on the real 1.7B default-sampled decode
+//!   keeps at least 0.6x the greedy rate in the same process.
 //!
 //! The `perf11_*` tests pin what landing the canonical survivor order and
-//! the route's default left unchanged: route on == route off across a
-//! 576-case sweep of `top_k` × `top_p` × min-p × temperature × seed,
-//! `top_k == 0` realisations (pinned ids captured on the sampler before the
-//! canonical order existed), greedy output, and the route's counters under
-//! the default configuration.
+//! the route left unchanged: route on == route off across a 576-case sweep
+//! of `top_k` × `top_p` × min-p × temperature × seed, `top_k == 0`
+//! realisations (pinned ids captured on the sampler before the canonical
+//! order existed), greedy output, and the route's counters once it is
+//! opted in.
 
 use std::collections::HashMap;
 
@@ -145,19 +153,25 @@ fn top_k_candidates_equals_a_full_sort_on_random_rows_with_ties() {
     }
 }
 
-/// The route ships **on** (it is byte-identical to the classic sampler), with
-/// the default candidate count, which clamps to the kernel cap and the
-/// vocabulary.
+/// The route ships **off**: it is byte-identical to the classic sampler, but
+/// its selection kernel costs more per token than the full-row read it
+/// replaces. [`SampledTopKConfig::gpu_candidates`] names the mode explicitly,
+/// so it is the opt-in; it carries the same candidate count, which clamps to
+/// the kernel cap and the vocabulary.
 #[test]
-fn the_route_is_on_by_default_and_candidates_clamp() {
+fn the_route_is_off_by_default_and_candidates_clamp() {
     let default = SampledTopKConfig::default();
-    assert_eq!(default.mode, SampledTopKMode::GpuCandidates);
-    assert_eq!(SampledTopKMode::default(), SampledTopKMode::GpuCandidates);
-    assert_eq!(default, SampledTopKConfig::gpu_candidates());
+    assert_eq!(default.mode, SampledTopKMode::Off);
+    assert_eq!(SampledTopKMode::default(), SampledTopKMode::Off);
     assert_eq!(default.candidates, DEFAULT_SAMPLED_TOPK_CANDIDATES);
     let opt_in = SampledTopKConfig::gpu_candidates();
+    assert_ne!(
+        default, opt_in,
+        "gpu_candidates() is the opt-in, not the default"
+    );
     assert_eq!(opt_in.mode, SampledTopKMode::GpuCandidates);
     assert_eq!(opt_in.candidates, DEFAULT_SAMPLED_TOPK_CANDIDATES);
+    assert_eq!(opt_in.candidates, default.candidates);
     assert_eq!(opt_in.effective_candidates(248_320), 64);
     assert_eq!(opt_in.effective_candidates(32), 32);
     let huge = SampledTopKConfig {
@@ -174,12 +188,16 @@ fn the_route_is_on_by_default_and_candidates_clamp() {
     };
     assert_eq!(zero.effective_candidates(248_320), 1);
 
-    let engine = InferenceEngine::new(
+    let mut engine = InferenceEngine::new(
         oxibonsai_core::config::Qwen3Config::tiny_test(),
         SamplingParams::default(),
         1,
     );
     assert_eq!(engine.sampled_topk(), SampledTopKConfig::default());
+    assert_eq!(engine.sampled_topk().mode, SampledTopKMode::Off);
+    assert!(!engine.sampled_topk_eligible(false));
+    engine.set_sampled_topk(opt_in);
+    assert_eq!(engine.sampled_topk(), opt_in);
 }
 
 #[test]
@@ -578,8 +596,8 @@ fn perf11_top_k_zero_realisations_are_unchanged() {
 /// Greedy decoding is untouched by the canonical order and by the route: a
 /// temperature-0 draw is the first-index argmax of the raw row whatever
 /// `top_k` / `top_p` / min-p say (the greedy branch runs before any
-/// ranking), and a temperature-0 generation is the same with the route on
-/// (the default) and off, and equals an independently spelled-out argmax
+/// ranking), and a temperature-0 generation is the same with the route opted
+/// in and off (the default), and equals an independently spelled-out argmax
 /// loop. The Metal twin runs the fused route's GPU argmax
 /// (`metal::perf11_greedy_is_unchanged_on_the_fused_route`).
 #[test]
@@ -621,6 +639,7 @@ fn perf11_greedy_is_unchanged() {
     };
     let prompt = [3u32, 1, 4];
     let mut on = InferenceEngine::new(config(), greedy.clone(), 5);
+    on.set_sampled_topk(SampledTopKConfig::gpu_candidates());
     assert_eq!(on.sampled_topk().mode, SampledTopKMode::GpuCandidates);
     let mut off = InferenceEngine::new(config(), greedy.clone(), 6);
     off.set_sampled_topk(SampledTopKConfig {
@@ -646,6 +665,18 @@ fn perf11_greedy_is_unchanged() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// The default (route off) and the sampled-throughput guard that protects it
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[path = "engine_topk_tests/default_route.rs"]
+mod default_route;
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[path = "engine_topk_tests/throughput.rs"]
+mod throughput;
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Metal: the GPU half
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -661,7 +692,7 @@ mod metal {
     use oxibonsai_kernels::MetalGraph;
     use oxibonsai_testkit::gguf_fixture::Lcg;
 
-    const MAX_SEQ: usize = 128;
+    pub(super) const MAX_SEQ: usize = 128;
     const VOCAB: usize = 32;
 
     fn tq2_pattern(num_weights: usize, seed: u64) -> Vec<u8> {
@@ -692,6 +723,15 @@ mod metal {
     /// every projection and the LM head `TQ2_0_g128`) — the same one the
     /// Metal greedy / cross-backend suites use.
     fn fused_ternary_gguf() -> Vec<u8> {
+        fused_ternary_gguf_with_vocab(VOCAB)
+    }
+
+    /// [`fused_ternary_gguf`] with a `vocab`-token vocabulary (`vocab * 128`
+    /// is a whole number of `TQ2_0_g128` blocks for any `vocab`): the
+    /// 32-token default is below the shipped sampling default `top_k` of 40,
+    /// so a test of the default configuration needs a wider one for the
+    /// route to be eligible at all.
+    pub(super) fn fused_ternary_gguf_with_vocab(vocab: usize) -> Vec<u8> {
         let (h, inter, layers, nq, nkv, hd) = (128usize, 256usize, 2usize, 4usize, 2usize, 32);
         let mut w = GgufWriter::new();
         w.add_metadata(
@@ -716,7 +756,7 @@ mod metal {
             "qwen3.feed_forward_length",
             MetadataWriteValue::U32(inter as u32),
         );
-        w.add_metadata("qwen3.vocab_size", MetadataWriteValue::U32(VOCAB as u32));
+        w.add_metadata("qwen3.vocab_size", MetadataWriteValue::U32(vocab as u32));
         w.add_metadata("qwen3.context_length", MetadataWriteValue::U32(512));
         w.add_metadata(
             "qwen3.attention.layer_norm_rms_epsilon",
@@ -725,9 +765,9 @@ mod metal {
         w.add_metadata("qwen3.rope.freq_base", MetadataWriteValue::F32(10_000.0));
         w.add_tensor(TensorEntry {
             name: "token_embd.weight".into(),
-            shape: vec![h as u64, VOCAB as u64],
+            shape: vec![h as u64, vocab as u64],
             tensor_type: TensorType::F32,
-            data: f32_pattern(VOCAB * h, 0.5),
+            data: f32_pattern(vocab * h, 0.5),
         });
         w.add_tensor(TensorEntry {
             name: "output_norm.weight".into(),
@@ -737,9 +777,9 @@ mod metal {
         });
         w.add_tensor(TensorEntry {
             name: "output.weight".into(),
-            shape: vec![h as u64, VOCAB as u64],
+            shape: vec![h as u64, vocab as u64],
             tensor_type: TensorType::TQ2_0_g128,
-            data: tq2_pattern(VOCAB * h, 0xCAFE_BABE),
+            data: tq2_pattern(vocab * h, 0xCAFE_BABE),
         });
         for layer in 0..layers {
             let p = format!("blk.{layer}");
@@ -846,20 +886,20 @@ mod metal {
         assert_gpu_candidates_match_cpu(&mut engine, &[1, 2, 3, 4], VOCAB);
     }
 
-    /// The shipped default on the fused route: the route is on and serves
-    /// every decode step from GPU candidates, and `generate`, the streaming
-    /// entry point and `generate_with_seed` are token-for-token the classic
-    /// full-row sampler — and the route switched off.
+    /// An opted-in fused engine: the route is on and serves every decode
+    /// step from GPU candidates, and `generate`, the streaming entry point
+    /// and `generate_with_seed` are token-for-token the classic full-row
+    /// sampler — and the route switched off.
     #[test]
-    fn default_fused_engine_samples_exactly_like_the_classic_sampler() {
+    fn opt_in_fused_engine_samples_exactly_like_the_classic_sampler() {
         let _session = MetalGraph::bind_new_session().expect("metal session");
         let bytes = fused_ternary_gguf();
         let gguf = GgufFile::parse(&bytes).expect("parse");
         let prompt = [1u32, 5, 9, 2];
         let params = sampled_params();
+        let opt_in = SampledTopKConfig::gpu_candidates();
 
-        let mut engine =
-            InferenceEngine::from_gguf(&gguf, params.clone(), 11, MAX_SEQ).expect("engine");
+        let mut engine = engine_with(&gguf, params.clone(), 11, MAX_SEQ, opt_in);
         assert!(engine.uses_fused_gpu_decode(), "fixture must be fused");
         assert_eq!(engine.sampled_topk().mode, SampledTopKMode::GpuCandidates);
         assert!(engine.sampled_topk_eligible(false));
@@ -874,7 +914,7 @@ mod metal {
         assert_eq!(classic.len(), 16, "no EOS inside the fixture's vocabulary");
         assert_eq!(
             via_engine, classic,
-            "the default fused engine must sample exactly like the classic sampler"
+            "the opted-in fused engine must sample exactly like the classic sampler"
         );
 
         let mut off = engine_with(
@@ -890,17 +930,16 @@ mod metal {
         assert_eq!(off.generate(&prompt, 16).expect("route off"), classic);
         assert_eq!(off.stats().sampled_full_row_requests(), 1);
 
-        let mut streaming =
-            InferenceEngine::from_gguf(&gguf, params.clone(), 11, MAX_SEQ).expect("engine");
+        let mut streaming = engine_with(&gguf, params.clone(), 11, MAX_SEQ, opt_in);
         let (tx, rx) = std::sync::mpsc::channel();
         streaming
             .generate_streaming_sync(&prompt, 16, &tx)
             .expect("streaming");
         drop(tx);
         assert_eq!(rx.into_iter().collect::<Vec<u32>>(), classic);
+        assert_eq!(streaming.stats().sampled_topk_steps(), 15);
 
-        let mut seeded =
-            InferenceEngine::from_gguf(&gguf, params.clone(), 999, MAX_SEQ).expect("engine");
+        let mut seeded = engine_with(&gguf, params.clone(), 999, MAX_SEQ, opt_in);
         let via_seed = seeded
             .generate_with_seed(&prompt, 16, 23, &params)
             .expect("seeded");
@@ -955,8 +994,8 @@ mod metal {
 
         // Step 0 is the classic draw over the prefill row on both paths, and
         // with the canonical survivor order every later step agrees too. (The
-        // default engine is the route itself now, so the route-off reference
-        // is spelled out.)
+        // route-off reference is spelled out; it is also what an engine does
+        // without any configuration.)
         let mut route_off = engine_with(
             &gguf,
             sampled_params(),
@@ -1119,7 +1158,7 @@ mod metal {
         }
     }
 
-    /// The route switched off, everything else default.
+    /// The route switched off, spelled out (it is also the default).
     fn route_off() -> SampledTopKConfig {
         SampledTopKConfig {
             mode: SampledTopKMode::Off,
@@ -1128,9 +1167,9 @@ mod metal {
     }
 
     /// The `perf-11` acceptance sweep on the fused fixture: with the canonical
-    /// survivor order, a seeded sampled request with the route on (the
-    /// default, no configuration) is token-for-token the same request with
-    /// the route switched off, for every `top_k` in {1, 5, 20, 64} × `top_p`
+    /// survivor order, a seeded sampled request with the route opted in is
+    /// token-for-token the same request with the route switched off (the
+    /// default), for every `top_k` in {1, 5, 20, 64} × `top_p`
     /// in {1.0, 0.9, 0.95} × min-p in {0.0, 0.05} × temperature in
     /// {0.3, 0.8, 1.2} × seeds 0..8 (576 cases).
     ///
@@ -1149,10 +1188,15 @@ mod metal {
         let gguf = GgufFile::parse(&bytes).expect("parse");
         let prompt = [1u32, 5, 9, 2];
 
-        let mut on =
-            InferenceEngine::from_gguf(&gguf, sampled_params(), 0, MAX_SEQ).expect("route on");
+        let mut on = engine_with(
+            &gguf,
+            sampled_params(),
+            0,
+            MAX_SEQ,
+            SampledTopKConfig::gpu_candidates(),
+        );
         assert!(on.uses_fused_gpu_decode(), "fixture must be fused");
-        assert_eq!(on.sampled_topk(), SampledTopKConfig::default());
+        assert_eq!(on.sampled_topk(), SampledTopKConfig::gpu_candidates());
         assert_eq!(on.sampled_topk().mode, SampledTopKMode::GpuCandidates);
         let mut off = engine_with(&gguf, sampled_params(), 0, MAX_SEQ, route_off());
 
@@ -1239,11 +1283,10 @@ mod metal {
     /// `perf11_top_k_zero_realisations_are_unchanged`: a seeded `top_k == 0`
     /// sampled request (temperature 0.8, seeds 1–4, 24 tokens, `top_p` 1.0
     /// and 0.9) produces exactly the ids the fused engine produced before the
-    /// canonical survivor order and the route's default flip — captured on
-    /// that unmodified engine, whose default was the route switched off — now
-    /// with the route on (the default: `top_k == 0` is never eligible, so it
-    /// decodes the full row and is counted as such) and with it off, and
-    /// equal to an independently spelled-out classic loop.
+    /// canonical survivor order existed (captured on that unmodified
+    /// engine) — with the route opted in (`top_k == 0` is never eligible, so
+    /// it decodes the full row and is counted as such) and with it off (the
+    /// default), and equal to an independently spelled-out classic loop.
     ///
     /// The pin is of this fixture's Metal logits: a change to the fused
     /// kernels' arithmetic that moves a draw across a probability boundary
@@ -1300,8 +1343,13 @@ mod metal {
                 repetition_penalty: 1.0,
                 max_tokens: 24,
             };
-            let mut on =
-                InferenceEngine::from_gguf(&gguf, params.clone(), 0, MAX_SEQ).expect("route on");
+            let mut on = engine_with(
+                &gguf,
+                params.clone(),
+                0,
+                MAX_SEQ,
+                SampledTopKConfig::gpu_candidates(),
+            );
             assert_eq!(on.sampled_topk().mode, SampledTopKMode::GpuCandidates);
             assert!(
                 !on.sampled_topk_eligible(false),
@@ -1342,8 +1390,8 @@ mod metal {
     }
 
     /// Greedy output on the fused route is unchanged by the canonical order
-    /// and by the route's default: a temperature-0 request takes the GPU
-    /// argmax with the route on and off alike — through `generate`, the
+    /// and by the route: a temperature-0 request takes the GPU
+    /// argmax with the route opted in and off alike — through `generate`, the
     /// streaming entry point, `generate_with_seed` and the explicit
     /// `generate_greedy_gpu` — and equals an independently spelled-out loop
     /// taking the first-index argmax of every full logit row; a penalised
@@ -1382,7 +1430,13 @@ mod metal {
             "no EOS inside the fixture's vocabulary"
         );
 
-        let mut on = InferenceEngine::from_gguf(&gguf, greedy.clone(), 3, MAX_SEQ).expect("on");
+        let mut on = engine_with(
+            &gguf,
+            greedy.clone(),
+            3,
+            MAX_SEQ,
+            SampledTopKConfig::gpu_candidates(),
+        );
         assert_eq!(on.sampled_topk().mode, SampledTopKMode::GpuCandidates);
         let mut off = engine_with(&gguf, greedy.clone(), 3, MAX_SEQ, route_off());
         for (name, engine) in [("route on", &mut on), ("route off", &mut off)] {
@@ -1439,24 +1493,28 @@ mod metal {
         assert_eq!(on.stats().sampled_full_row_requests(), 0);
     }
 
-    /// Under the new default (no route configuration at all) the three
-    /// sampled-route Prometheus counters move exactly with their
-    /// `EngineStats` twins on the fused fixture: an eligible sampled request
-    /// is served from GPU candidates at every decode step, a `top_k == 0`
-    /// request is one full-row request, and decode steps forced off the GPU
-    /// mid-request (the MET-05 CPU replay, through the
+    /// With the route opted in, the three sampled-route Prometheus counters
+    /// move exactly with their `EngineStats` twins on the fused fixture: an
+    /// eligible sampled request is served from GPU candidates at every decode
+    /// step, a `top_k == 0` request is one full-row request, and decode steps
+    /// forced off the GPU mid-request (the MET-05 CPU replay, through the
     /// `force_cpu_decode_after` seam) are full-row steps.
     #[test]
-    fn perf11_route_counters_move_under_the_new_default() {
+    fn perf11_route_counters_move_when_the_route_is_opted_in() {
         let _session = MetalGraph::bind_new_session().expect("metal session");
         let bytes = fused_ternary_gguf();
         let gguf = GgufFile::parse(&bytes).expect("parse");
         let prompt = [1u32, 5, 9, 2];
         let metrics = std::sync::Arc::new(crate::metrics::InferenceMetrics::new());
 
-        let mut engine =
-            InferenceEngine::from_gguf(&gguf, sampled_params(), 11, MAX_SEQ).expect("engine");
-        assert_eq!(engine.sampled_topk(), SampledTopKConfig::default());
+        let mut engine = engine_with(
+            &gguf,
+            sampled_params(),
+            11,
+            MAX_SEQ,
+            SampledTopKConfig::gpu_candidates(),
+        );
+        assert_eq!(engine.sampled_topk(), SampledTopKConfig::gpu_candidates());
         engine.set_metrics(std::sync::Arc::clone(&metrics));
 
         let tokens = engine.generate(&prompt, 8).expect("eligible request");
@@ -1539,12 +1597,13 @@ mod metal {
     /// reference.
     #[test]
     fn real_model_gpu_topk_route_matches_the_full_row_candidate_reference() {
-        use oxibonsai_testkit::capability::{record_executed, record_skipped, Capability};
+        use oxibonsai_testkit::capability::{record_executed_timed, record_skipped, Capability};
         const TEST: &str = "oxibonsai-runtime::lib::\
              real_model_gpu_topk_route_matches_the_full_row_candidate_reference";
         let Some(mmap) = real_model(TEST) else {
             return;
         };
+        let gate_start = std::time::Instant::now();
         let _session = MetalGraph::bind_new_session().expect("metal session");
         let gguf = GgufFile::parse(&mmap).expect("OXI_MODEL parses");
         let opt_in = SampledTopKConfig::gpu_candidates();
@@ -1589,31 +1648,32 @@ mod metal {
             reference.stats().sampled_topk_full_row_steps(),
             via_gpu.len()
         );
-        record_executed(Capability::LegacyModels, TEST);
+        record_executed_timed(Capability::LegacyModels, TEST, gate_start.elapsed());
     }
 
-    /// The shipped default on the real ternary 1.7B (`OXI_MODEL`): a seeded
+    /// The opted-in route on the real ternary 1.7B (`OXI_MODEL`): a seeded
     /// sampled request on the fused route — served from GPU top-k candidates
     /// — is token-for-token the classic full-row sampler, through `generate`
     /// and through the streaming entry point, and so is the same request
-    /// with the route switched off; with min-p 0.05 set through
+    /// with the route switched off (the default); with min-p 0.05 set through
     /// [`InferenceEngine::set_min_p`], the route's seeded draw equals the
     /// classic sampler's with the same min-p.
     #[test]
-    fn real_model_default_sampled_decode_matches_the_classic_sampler() {
-        use oxibonsai_testkit::capability::{record_executed, record_skipped, Capability};
+    fn real_model_opt_in_sampled_decode_matches_the_classic_sampler() {
+        use oxibonsai_testkit::capability::{record_executed_timed, record_skipped, Capability};
         const TEST: &str = "oxibonsai-runtime::lib::\
-             real_model_default_sampled_decode_matches_the_classic_sampler";
+             real_model_opt_in_sampled_decode_matches_the_classic_sampler";
         const MIN_P: f32 = 0.05;
+        let opt_in = SampledTopKConfig::gpu_candidates();
         let Some(mmap) = real_model(TEST) else {
             return;
         };
+        let gate_start = std::time::Instant::now();
         let _session = MetalGraph::bind_new_session().expect("metal session");
         let gguf = GgufFile::parse(&mmap).expect("OXI_MODEL parses");
         let params = sampled_params();
 
-        let mut engine =
-            InferenceEngine::from_gguf(&gguf, params.clone(), 5, 512).expect("real engine");
+        let mut engine = engine_with(&gguf, params.clone(), 5, 512, opt_in);
         if !engine.uses_fused_gpu_decode() {
             eprintln!(
                 "capability report: {TEST} SKIPPED — OXI_MODEL is not on the fused GPU route"
@@ -1647,7 +1707,7 @@ mod metal {
             classic_sampler_loop_with_min_p(&mut reference, &params, 5, MIN_P, &REAL_PROMPT, 24);
         drop(reference);
         eprintln!(
-            "real-model default sampled decode: engine {via_engine:?} | route off \
+            "real-model opt-in sampled decode: engine {via_engine:?} | route off \
              {via_route_off:?} | classic {classic:?} | min-p {MIN_P}: engine \
              {via_engine_min_p:?} | classic {classic_min_p:?}"
         );
@@ -1656,21 +1716,21 @@ mod metal {
         assert_eq!(via_route_off, classic);
         assert_eq!(via_engine_min_p, classic_min_p);
 
-        let mut streaming =
-            InferenceEngine::from_gguf(&gguf, params.clone(), 5, 512).expect("real engine");
+        let mut streaming = engine_with(&gguf, params.clone(), 5, 512, opt_in);
         let (tx, rx) = std::sync::mpsc::channel();
         streaming
             .generate_streaming_sync(&REAL_PROMPT, 24, &tx)
             .expect("streaming");
         drop(tx);
         assert_eq!(rx.into_iter().collect::<Vec<u32>>(), classic);
+        assert!(streaming.stats().sampled_topk_steps() > 0);
         eprintln!(
-            "real-model default sampled decode: engine == classic == route off, {} tokens {:?}; \
+            "real-model opt-in sampled decode: engine == classic == route off, {} tokens {:?}; \
              min-p {MIN_P}: engine == classic, {} tokens",
             classic.len(),
             classic,
             classic_min_p.len()
         );
-        record_executed(Capability::LegacyModels, TEST);
+        record_executed_timed(Capability::LegacyModels, TEST, gate_start.elapsed());
     }
 }

@@ -1,24 +1,42 @@
 //! # oxibonsai-core
 //!
-//! GGUF Q1\_0\_g128 format parser, tensor types, and model configuration
-//! for OxiBonsai — the Pure Rust 1-bit LLM inference engine.
+//! GGUF reader and writer, quantization block types, and model configuration
+//! for OxiBonsai — the Pure Rust sub-2-bit LLM inference engine for PrismML
+//! Bonsai models (1-bit, ternary, and the Bonsai 2 27B hybrid).
 //!
 //! This crate provides the foundational data types and parsing logic used
 //! by the rest of the OxiBonsai stack:
 //!
-//! - **GGUF v3 binary format parsing** — header, metadata key-value store,
-//!   and tensor info directory (see [`gguf`]).
-//! - **Q1\_0\_g128 block type** — the 18-byte packed representation used for
-//!   1-bit weights (see [`tensor::BlockQ1_0G128`]).
+//! - **GGUF v3 binary format parsing and writing** — header, metadata
+//!   key-value store, and tensor info directory (see [`gguf`]); written files
+//!   are alignment-padded and carry the `<arch>.*` metadata keys llama.cpp
+//!   reads.
+//! - **Sub-2-bit block types** — 1-bit `Q1_0_g128` (see
+//!   [`tensor::BlockQ1_0G128`]), ternary `TQ2_0_g128` (see [`quant_ternary`])
+//!   and PrismML Bonsai 2's `PQ2_0`, `PTQ1_0` and group-64 `Q2_0` (see
+//!   [`quant_prism`]), next to the standard ggml formats ([`quant_std`],
+//!   [`quant_k`]).
 //! - **Memory-mapped tensor loading** — zero-copy access to weight data
 //!   from disk via `memmap2`.
-//! - **Model configuration** — [`config::Qwen3Config`] extracted from GGUF
-//!   metadata or constructed for known Bonsai variants (8B, 4B, 1.7B).
+//! - **Model configuration** — [`config::Qwen3Config`] for the dense Qwen3
+//!   family (8B, 4B, 1.7B) and [`config_hybrid::HybridConfig`] for the
+//!   Bonsai 2 27B `qwen35` hybrid, both extracted from GGUF metadata.
 //!
-//! ## GGUF Q1\_0\_g128 Format
+//! ## Block formats
 //!
-//! Each block is 18 bytes: 2-byte FP16 scale + 16 bytes (128 sign bits).
-//! Weight = bit ? +scale : -scale. Effective 1.125 bits per weight.
+//! Every sub-2-bit format is a fixed-size block of 2-bit, 1-bit or base-3
+//! codes plus an FP16 scale `d`. The byte order differs between formats, and
+//! ggml type id 42 is shared by three incompatible layouts; the repository's
+//! `docs/models.md` tabulates every layout and how the loader tells the three
+//! id-42 layouts apart.
+//!
+//! | Format | ggml id | Block | Effective bits |
+//! |--------|--------:|-------|---------------:|
+//! | `Q1_0_g128` | 41 | 18 B / 128 weights: `d`, then 128 sign bits (bit 1 = +scale) | 1.125 |
+//! | `TQ2_0_g128` | 42 | 34 B / 128 weights: 32 B of 2-bit codes, then `d` | 2.125 |
+//! | `PQ2_0` | 142 | 34 B / 128 weights: `d`, then 32 B of 2-bit codes | 2.125 |
+//! | `PTQ1_0` | 143 | 28 B / 128 weights: 24 B + 2 B of base-3 trits, then `d` | 1.75 |
+//! | `Q2_0` (group 64) | 42 | 18 B / 64 weights: `d`, then 16 B of 2-bit codes | 2.25 |
 //!
 //! ## Crate Organisation
 //!

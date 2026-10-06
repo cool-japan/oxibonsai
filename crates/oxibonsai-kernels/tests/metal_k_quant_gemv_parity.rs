@@ -37,13 +37,13 @@ fn input(in_features: usize) -> Vec<f32> {
 
 /// Per-row parity check.
 ///
-/// Wave-1.5 addendum (1) / gatekeeper OPTIONAL #O5: this used to be
+/// This used to be
 /// `diff < 5e-3 || rel < 1e-4` — an OR against an absolute floor that let
 /// *any* row whose absolute diff happened to be under 5e-3 pass regardless
 /// of its relative error, which is exactly what hid a real stale-layout bug
 /// (Q6_K at rel=0.0119, Q2_K at rel=0.0013) while Q3_K/Q4_K/Q5_K were
 /// visibly failing at rel 0.93/0.65/0.64. Now that the K-quant GPU kernels
-/// are ggml-exact (FIX-05-KQUANT-GPU) and bit-exact dequant means only
+/// are ggml-exact and bit-exact dequant means only
 /// reduction order differs, every row is held to a real relative bound; a
 /// row whose CPU reference is genuinely near zero (where "relative" is
 /// ill-defined) instead uses a much smaller absolute floor — never an OR
@@ -83,7 +83,7 @@ fn metal_skips(err: &MetalGraphError) -> bool {
 // header for the full contract), so a skip is now visibly distinct from a
 // real, executed parity check.
 //
-// T-07 FIX (verifier wave 3): this used to be a byte-for-byte inline copy of
+// T-07: this used to be a byte-for-byte inline copy of
 // `oxibonsai_testkit::capability::record`; `oxibonsai-kernels` now takes
 // `oxibonsai-testkit` as a dev-dependency, so the copy is deleted in favour
 // of the shared implementation (aliased to the old local name above so every

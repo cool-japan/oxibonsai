@@ -82,12 +82,9 @@ ignore = [
     { id = "RUSTSEC-2023-0071", reason = "rsa (Marvin Attack timing side-channel, RUSTSEC-2023-0071) is a mandatory dependency of oxitls-rustcrypto-provider (oxitls's `pure` feature, no avoidance knob). This workspace only uses the stack as a TLS client verifying server certificates (a public-key operation) with no client certificate configured, so the vulnerable private-key decrypt/sign path is never exercised. Invalidated if mTLS with an RSA client cert is ever added. No safe upgrade exists upstream. Ignored 2026-09-21, revisit by 2027-03-31." },
 ]
 
-# deps-03/FIX-01-BUILD (wave-2.5 addendum: this comment was previously
-# mis-tagged "deps-16", which is the unrelated criterion/alloca/cc dev-dep
-# finding a few sections above — this list follows from the `[graph]
-# all-features = true` policy at the top of this file instead): this list
-# is the set of licenses actually ENCOUNTERED in the `all-features = true`
-# graph. `MPL-2.0` and `0BSD` were removed on
+# deps-03: this list follows from the `[graph] all-features = true` policy at
+# the top of this file: it is the set of licenses actually ENCOUNTERED in the
+# `all-features = true` graph. `MPL-2.0` and `0BSD` were removed on
 # 2026-09-21 because nothing in the graph carries them any more and cargo-deny
 # reports every unused allowance as a `license-not-encountered` warning — a
 # dead allowance is also a silent widening of what may enter later. Re-add an
@@ -172,27 +169,23 @@ deny = [
     # allow it too — re-check this exemption before adding one.
     { name = "aws-lc-sys", wrappers = ["aws-lc-rs"], reason = "BoringSSL C + aarch64 asm; dev-only via reqwest's default TLS backend, wrappers-exempted. Use oxihttp/oxitls instead of a production dependency on this." },
     { name = "aws-lc-rs", wrappers = ["rustls", "rustls-webpki"], reason = "BoringSSL C + aarch64 asm; dev-only via reqwest's default TLS backend, wrappers-exempted. Use oxihttp/oxitls instead of a production dependency on this." },
-    # deps-16 (BENCHES, wave 3; corrected FIX3-BUILD, wave 3.5): `criterion`
-    # (dev/bench-only) unconditionally depends on `alloca` (which builds one
-    # C source via a `cc` build-dependency) on unix/windows — verified in
-    # criterion 0.8.2's own manifest, not gated by any of criterion's
-    # features, so `default-features = false` cannot remove it (confirmed
-    # impossible; the wave-1 addendum's alternative was tried instead — see
-    # below). `alloca`/`cc` are intentionally NOT added to this `deny` list:
-    # they never reach a shipped artifact (same dev-only exception class as
-    # the aws-lc-* wrappers above), and criterion has no feature toggle to
-    # drop them. This exception is LOAD-BEARING, not cosmetic.
+    # deps-16: `criterion` (dev/bench-only) unconditionally depends on
+    # `alloca` (which builds one C source via a `cc` build-dependency) on
+    # unix/windows — verified in criterion 0.8.2's own manifest, not gated by
+    # any of criterion's features, so `default-features = false` cannot
+    # remove it. `alloca`/`cc` are intentionally NOT added to this `deny`
+    # list: they never reach a shipped artifact (same dev-only exception
+    # class as the aws-lc-* wrappers above), and criterion has no feature
+    # toggle to drop them. This exception is LOAD-BEARING, not cosmetic.
     #
-    # CORRECTION (FIX3-BUILD, wave 3.5): every `[[bench]]` TARGET across the
-    # workspace is behind a no-op `bench` Cargo feature +
-    # `required-features = ["bench"]`, which does stop cargo from building
-    # or running the bench SOURCES without `--features bench`. It does
-    # **not** keep `criterion`/`alloca`/`cc` out of a default `cargo test`/
-    # `cargo check --all-targets` invocation, contradicting an earlier
-    # version of this comment's "no longer *compiled* by a default
-    # invocation": `required-features` gates a target, not the
-    # `[dev-dependencies]` entry its harness needs, and Cargo builds every
-    # `[dev-dependencies]` entry whenever ANY test target is selected.
+    # Every `[[bench]]` TARGET across the workspace is behind a no-op `bench`
+    # Cargo feature + `required-features = ["bench"]`, which stops cargo from
+    # building or running the bench SOURCES without `--features bench`. It
+    # does **not** keep `criterion`/`alloca`/`cc` out of a default `cargo
+    # test`/`cargo check --all-targets` invocation: `required-features` gates
+    # a target, not the `[dev-dependencies]` entry its harness needs, and
+    # Cargo builds every `[dev-dependencies]` entry whenever ANY test target
+    # is selected.
     # Durable proof (reproduces regardless of build-cache state):
     # `cargo tree -p oxibonsai-rag -e normal,build,dev -i alloca` always
     # shows `alloca -> criterion -> [dev-dependencies] oxibonsai-rag`,
@@ -200,28 +193,17 @@ deny = [
     # `CARGO_TARGET_DIR`, 2026-09-22): `cargo test -p oxibonsai-rag --no-run`
     # (default features) compiles `cc` v1.4.7, `alloca` v0.4.0 and
     # `criterion` v0.8.2; `cargo check -p oxibonsai-rag --all-targets`
-    # compiles `cc` and `alloca`. The cross-target lint failure this was
-    # meant to fix is therefore UNFIXED: `cargo check -p oxibonsai-rag
-    # --all-targets --target aarch64-unknown-linux-gnu` still exits 101
-    # (`error occurred in cc-rs: failed to find tool
-    # "aarch64-linux-gnu-gcc"`; re-verified this session with that target
-    # installed). Do not re-assert the stronger claim anywhere in this
-    # workspace. This wording was also corrected in this workspace's root
-    # `Cargo.toml`'s own `bench` feature comment and in
-    # `crates/oxibonsai-kernels/Cargo.toml`'s — but NOT everywhere: the
-    # same uncorrected claim is still live, verbatim in shape, at
-    # `crates/oxibonsai-rag/Cargo.toml:23-27`,
-    # `crates/oxibonsai-model/Cargo.toml:34-38`,
-    # `crates/oxibonsai-eval/Cargo.toml:23-27` and
-    # `crates/oxibonsai-tokenizer/Cargo.toml:55-59` (re-measured, FIX3-BUILD
-    # wave 3.5). None of those four are in this package's owned_files;
-    # carried forward for a wave-4 grant, using this entry's wording as
-    # the template. Relocating the bench targets into a workspace
-    # member excluded from `default-members` (the only real fix) is
-    # orchestrator decision D-2 (wave 3.5), not attempted here — this
-    # dev-only exception stays. Revisit if/when a benchmark harness
-    # migration (e.g. to a Pure-Rust `divan`) removes the `criterion`
-    # dependency entirely, or D-2's relocation lands.
+    # compiles `cc` and `alloca`. A cross-target lint therefore still needs a
+    # C cross-compiler: `cargo check -p oxibonsai-rag --all-targets --target
+    # aarch64-unknown-linux-gnu` exits 101 (`error occurred in cc-rs: failed
+    # to find tool "aarch64-linux-gnu-gcc"`) with that target installed. Do
+    # not assert anywhere in this workspace that the `bench` feature keeps a C
+    # compiler out of a default build; the `bench` feature comments of the
+    # root and per-crate manifests carry the same wording. Relocating the
+    # bench targets into a workspace member excluded from `default-members`
+    # (the only real fix) is not done, so this dev-only exception stays.
+    # Revisit if a benchmark harness migration (e.g. to a Pure-Rust `divan`)
+    # removes the `criterion` dependency entirely, or that relocation lands.
     # `ring` is not currently reachable at all (oxitls uses the pure
     # `oxitls-rustcrypto-provider`); banned outright rather than exempted so
     # a future edge that pulls it in is caught immediately.
@@ -488,17 +470,16 @@ name = "syn"
 version = "<3.0.0"
 reason = "synstructure's early syn-3 migration vs the rest of the proc-macro ecosystem on syn 2; see comment above. Ignored 2026-09-21, revisit 2027-03-31."
 
-# RESTORED (B2-08, 2026-09-21): `oxibonsai-tokenizer` now depends directly on
-# `fancy-regex = { workspace = true }` (0.19.2) for the qwen2/qwen35 `Split`
-# pre-tokenizer (TOK-03/TOK-04), re-introducing exactly the duplication
-# FIX-01-BUILD's note above predicted: `tokenizers` v0.23.2 still pins its own
-# internal `fancy-regex` at 0.17.0 (verified via `cargo tree --duplicates`).
+# `oxibonsai-tokenizer` depends directly on `fancy-regex = { workspace =
+# true }` (0.19.2) for the qwen2/qwen35 `Split` pre-tokenizer
+# (TOK-03/TOK-04), which duplicates what `tokenizers` v0.23.2 pins internally:
+# its own `fancy-regex` at 0.17.0 (verified via `cargo tree --duplicates`).
 # Both are Pure Rust with no security advisories; skip rather than pin, since
 # `tokenizers` does not expose a way to override its internal dependency.
 [[bans.skip]]
 name = "fancy-regex"
 version = "<0.19"
-reason = "tokenizers v0.23.2 pins its own internal fancy-regex 0.17.0, independent of oxibonsai-tokenizer's direct 0.19.2 edge (TOK-03/TOK-04, B2-08 wave 2). Restored 2026-09-21, revisit 2027-03-31."
+reason = "tokenizers v0.23.2 pins its own internal fancy-regex 0.17.0, independent of oxibonsai-tokenizer's direct 0.19.2 edge (TOK-03/TOK-04). Ignored 2026-09-21, revisit 2027-03-31."
 
 [sources]
 unknown-registry = "deny"
