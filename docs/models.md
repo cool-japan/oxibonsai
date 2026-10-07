@@ -20,16 +20,31 @@ the image model see [`docs/IMAGEN.md`](IMAGEN.md); for the project overview see
 
 | Family | `general.architecture` | Weight formats | Backends |
 |--------|------------------------|----------------|----------|
-| Bonsai 2 27B, previous-generation 27B | `qwen35` (hybrid: 48 Gated-DeltaNet + 16 full-attention layers) | `PTQ1_0`, `PQ2_0`, `Q2_0` (id 42), `Q1_0` (id 41) | CPU, Metal (hybrid runner), CUDA\* |
+| Bonsai 2 27B, previous-generation 27B | `qwen35` (hybrid: 48 Gated-DeltaNet + 16 full-attention layers) | `PTQ1_0`, `PQ2_0`, `Q2_0` (id 42), `Q1_0` (id 41) | CPU, Metal (hybrid runner); CUDA: kernels only, no forward pass |
 | Bonsai-8B | `qwen3` | `Q1_0_g128` (id 41) | CPU, Metal, CUDA\* |
 | Ternary-Bonsai-8B / 4B / 1.7B | `qwen3` | `TQ2_0_g128` (id 42, our own layout) | CPU, Metal, CUDA\* |
 | Bonsai-Image (FLUX.2 Klein DiT) | `bonsai-image` | `TQ2_0_g128` + BF16 | CPU, Metal, CUDA\* |
-| Generic llama.cpp-style GGUFs | `qwen3` (dense) | `Q4_0`, `Q8_0`, `Q2_K`..`Q8_K`, FP8, `F16`/`BF16`/`F32` | CPU; Metal GEMV for `Q4_0`/`Q8_0`/K-quants |
+| Generic llama.cpp-style GGUFs | `qwen3` (dense) | `Q4_0`, `Q8_0`, `Q2_K`..`Q8_K`, FP8, `F16`/`BF16`/`F32` | CPU; Metal GEMV for `Q4_0`/`Q8_0`/K-quants; CUDA\* GEMV for `Q4_0`/`Q8_0`/K-quants/FP8 |
 
-\* The CUDA backend is **unvalidated in this release**: it was written and reviewed on a
-host with no NVIDIA hardware, so it compiles but has never been run. The `cuda`
-(scirs2) feature is a CPU fallback, not a GPU build; use `native-cuda` for the NVIDIA
-path and expect to validate it yourself.
+\* The CUDA backend (`native-cuda`) has been run on one GPU only: an NVIDIA RTX A4000
+(Ampere, compute capability 8.6, 16 GB), CUDA 12.0 toolkit, driver 550.144, x86_64
+Ubuntu 22.04, on 2026-10-07. There, 48 greedy tokens were byte-identical to the CPU
+for Bonsai-8B, Ternary-Bonsai-1.7B and -8B (id-42 `TQ2_0_g128` files) and for `Q4_0`,
+`Q8_0`, six K-quant and two FP8 test fixtures with a quantized LM head. Ternary-Bonsai-4B
+was not run. For Bonsai-Image, a CUDA smoke render on that GPU reproduced a prior render
+at PSNR 76-78 dB (max abs diff 1/255); that is not a golden-parity run. Not run at all:
+the Bonsai 2 / 27B files (the hybrid kernels have no CUDA forward pass), other GPU
+generations, aarch64 Linux, Windows and multi-GPU hosts. The CUDA `Q4_0`/`Q8_0`/K-quant/FP8
+decode uploads each weight matrix on every GEMV, so it can be slower than an AVX-512 CPU.
+That Linux run covered the dev-profile all-features nextest stage, not the full
+`scripts/ci.sh --release` / `scripts/release-gate.sh --require-cuda` gate, which is still
+pending; the macOS release gate checks the CUDA kernel syntax approximately (no `nvcc`,
+an explicit waiver). The `cuda` (scirs2) feature is a CPU fallback, not a GPU build;
+use `native-cuda` for the NVIDIA path.
+
+`oxibonsai convert --quant pq2_0` writes PrismML `PQ2_0` (id 142) for the PrismML
+llama.cpp fork; a `qwen3` model in that layout does not load in this release. The
+default `--quant tq2_0_g128` writes the native id-42 layout the runtime executes.
 
 ## Bonsai 2 and the 27B family (`qwen35` hybrid)
 
@@ -138,7 +153,7 @@ Three incompatible layouts ship under tensor type id 42:
 
 | File family | Group | Bytes | Byte order | `general.quantization_version` |
 |-------------|------:|------:|------------|-------------------------------|
-| `Ternary-Bonsai-{1.7B,8B}` (OxiBonsai's own writer) | 128 | 34 | `qs` first | the **string** `"TQ2_0_G128"` |
+| `Ternary-Bonsai-{1.7B,8B}` (OxiBonsai's own writer) | 128 | 34 | `qs` first | the **string** `"TQ2_0_G128"` (0.2.3 and earlier); `u32 2` with `oxibonsai.quant_format = "TQ2_0_G128"` (0.2.4 `convert --quant tq2_0_g128`) |
 | `Ternary-Bonsai-27B-Q2_0` (PrismML previous generation) | 128 | 34 | `d` first | `u32 2` |
 | `Ternary-Bonsai-2-27B-Q2_0` (mainline `block_q2_0`) | 64 | 18 | `d` first | `u32 2` |
 
@@ -152,8 +167,10 @@ offsets). The loader settles the reading in two steps and never guesses:
    offset. On the real files the two candidates differ by hundreds of megabytes, so
    exactly one survives.
 2. **Byte order** (`d` first or `qs` first) cannot be read from offsets, since both give
-   identical sizes. The legacy string tag settles it for OxiBonsai's own files; for
-   every other file a structural check of real block bytes does (a ternary checkpoint
+   identical sizes. The legacy string tag settles it for files written by OxiBonsai
+   0.2.3 and earlier; for every other file, including 0.2.4's own `tq2_0_g128` output
+   (the resolver does not read `oxibonsai.quant_format`), a structural check of real
+   block bytes does (a ternary checkpoint
    never contains the reserved `0b11` code, and its scale is a finite non-negative
    half). Without block bytes to look at, the resolver in `oxibonsai-core` reports an
    ambiguous quantization type instead of picking one. When the model loader's sample
@@ -206,9 +223,10 @@ pq2|ptq1` and `--vision`, `bonsai2-27b-ptq1_0`, `bonsai2-27b-pq2_0`,
 `ternary-bonsai-27b-q2_0`, `bonsai-8b`). A named download is verified fail-closed:
 GGUF structure (magic, expected `general.architecture`, and `prism.hadamard.version ==
 1` for Bonsai 2 language files), then the exact byte size, then the SHA-256 compiled
-into the binary, then a cross-check against `scripts/checksums.sha256`; a conflict
-between the authorities aborts. `bonsai-8b` verifies against the current upstream
-digest `284a335aa3fb2ced3b1b01fcb40b08aa783e3b70832767f0dd2e3fdfa134bd54` (an upstream
+into the binary, then a cross-check against `scripts/checksums.sha256` (a digest there
+that this binary does not know aborts; the other known-good digest prints a note).
+`bonsai-8b` verifies against the current upstream digest
+`284a335aa3fb2ced3b1b01fcb40b08aa783e3b70832767f0dd2e3fdfa134bd54` (an upstream
 re-upload of the same 1 158 654 496 bytes) and accepts the earlier known-good
 `ead25897bc034fa52569d0c6d054ce38216f95db09900c8add8f6bbfb370cff1` with a warning.
 
@@ -220,9 +238,10 @@ and it is less complete:
 
 | Entry | State in `scripts/checksums.sha256` |
 |-------|-------------------------------------|
-| `Bonsai-8B.gguf`, `tokenizer.json` | hash recorded; a mismatch aborts the download |
+| `Bonsai-8B.gguf` | hash recorded, but it is the earlier known-good `ead25897…` (the goldens' file). No download script fetches Bonsai-8B (`scripts/cli.sh` only prints a `curl` command): a fresh download of the current upstream object (`284a335a…`) fails the manual `shasum -c` by design, since a `-c` manifest holds one digest per path. Use `oxibonsai pull bonsai-8b`, which accepts both. `oxibonsai serve` and `oxibonsai-serve` also check the model against this file at startup and refuse a `284a335a…` `Bonsai-8B.gguf` while it resolves (CWD-relative `scripts/checksums.sha256`, e.g. run from the repository root); point `OXIBONSAI_CHECKSUMS_FILE` at another manifest there |
+| `tokenizer.json` | hash recorded; a mismatch aborts the download |
 | `Ternary-Bonsai-2-27B-PTQ1_0.gguf`, `-PQ2_0.gguf`, `-mmproj-Q8_0.gguf` | hash computed from the real files; a mismatch aborts the download |
-| `Ternary-Bonsai-1.7B.gguf`, `Ternary-Bonsai-8B.gguf` | hash recorded, but advisory: the files are converted locally, so a converter change can move the bytes and a mismatch is a warning |
+| `Ternary-Bonsai-1.7B.gguf`, `Ternary-Bonsai-8B.gguf` | hash recorded, but advisory: the files are converted locally, so a converter change can move the bytes and a mismatch is a warning. The recorded digests are of files written by OxiBonsai 0.2.3 and earlier; a 0.2.4 conversion writes a different header and embeds the source's tokenizer when one is present; it differs in size and bytes, so `download_ternary.sh`'s drift warning is expected; `oxibonsai serve` / `oxibonsai-serve` match by file name and refuse such a `Ternary-Bonsai-{1.7B,8B}.gguf` at startup while this manifest resolves (see the `Bonsai-8B.gguf` row) |
 | `Ternary-Bonsai-2-27B-Q2_0-prism-fork-required.gguf`, `Bonsai-27B-Q1_0.gguf`, `Ternary-Bonsai-27B-PQ2_0.gguf`, `Ternary-Bonsai-27B-Q2_0.gguf` | explicit `MISSING` placeholder, no hash invented: the payloads have not been hashed locally, so only `oxibonsai pull` (embedded digest) verifies them |
 | `Ternary-Bonsai-4B.gguf` | no entry |
 
@@ -241,5 +260,11 @@ and it is less complete:
   background load: Bonsai 2 27B decodes at 6.9-8.4 tok/s on Metal and 1.0-1.3 tok/s on
   the CPU path; see the [README](../README.md#measured-throughput) for the table and
   its caveats.
-- **Not validated:** CUDA (see above), the eval logit tasks against a real model, and
-  the AVX-512 VNNI INT8 tier on VNNI hardware.
+- **CUDA, on one GPU.** On an RTX A4000 (CUDA 12.0, x86_64 Linux, 2026-10-07) the
+  dense models above match the CPU at token level (see the footnote under
+  [At a glance](#at-a-glance)); greedy decode of 256 tokens after warm-up ran at
+  44.4 tok/s (Ternary-Bonsai-1.7B), 10.8 tok/s (Ternary-Bonsai-8B) and 20.6 tok/s
+  (Bonsai-8B).
+- **Not validated:** the CUDA hybrid (`qwen35`) kernels (no CUDA forward), CUDA on
+  anything but that one Ampere GPU, the eval logit tasks against a real model, and the
+  AVX-512 VNNI INT8 tier on VNNI hardware.

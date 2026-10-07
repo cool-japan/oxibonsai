@@ -259,7 +259,9 @@ pub fn init_q_std_modules(graph: &CudaGraph) -> Result<Arc<CudaQStdModules>, Cud
 /// `blocks_bytes` is the raw AoS byte representation of the weight matrix:
 /// - 18 bytes per block: `[d_lo, d_hi, qs[0]..qs[15]]`
 ///   - `d` is FP16 little-endian scale
-///   - `qs` are 16 bytes encoding 32 int4 nibbles (even nibble = low bits, odd = high bits)
+///   - `qs` are 16 bytes encoding 32 int4 nibbles in the ggml lo-hi split:
+///     byte `j` holds element `j` in its low nibble and element `j + 16` in its
+///     high nibble (not an even/odd interleave)
 /// - Total length: `n_rows * (k / 32) * 18`
 ///
 /// `input` must have length `>= k`.

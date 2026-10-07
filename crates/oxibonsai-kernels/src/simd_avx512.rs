@@ -338,8 +338,8 @@ pub unsafe fn gemv_1bit_g128_avx512(
 // against the same accumulator and ends with the same `hsum_avx512`, so
 // every output element is the identical `f32`.
 //
-// Compile-blind: this file cannot be executed on the AArch64 machine the
-// package was developed on. It is cross-checked against two real x86-64
+// This file cannot be executed on the AArch64 machine the package was
+// developed on. It is cross-checked against two real x86-64
 // targets, not just one: `cargo check -p oxibonsai-kernels --target
 // x86_64-apple-darwin --all-features --lib --profile test` (which also
 // compiles the `#[cfg(all(test, target_arch = "x86_64"))]` modules) *and*
@@ -350,7 +350,10 @@ pub unsafe fn gemv_1bit_g128_avx512(
 // could be silently *wrong* rather than non-compiling — the decode table —
 // is proven exhaustively on any host by
 // `simd_dot_int8::int8_dot_tests::ternary_f32_lut_matches_the_shared_decode_exhaustively`.
-// No runtime validation is claimed on either target.
+// Runtime: the 13 `simd_avx512::tests` ran natively, with their AVX-512
+// runtime guards true, on a Xeon Gold 5315Y (Linux x86_64, 2026-10-07, the
+// CUDA validation host's `nextest-all-features` stage); no other x86-64 run
+// is recorded.
 
 /// Batch rows a decoded weight block is consumed by before the next block
 /// is touched — the AVX-512 twin of `gemm_ternary::TERNARY_GEMM_MR`.

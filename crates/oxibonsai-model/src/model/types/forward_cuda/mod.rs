@@ -177,8 +177,10 @@ impl BonsaiModel<'_> {
     /// under the block's own `layer_index()` — see
     /// `prefill_dispatch::store_kv_readback` for the checks.
     ///
-    /// **Compile-blind**: the device read-back feeding this has never run
-    /// on CUDA hardware; the host-side store is unit-tested.
+    /// Run on hardware (RTX A4000, CUDA 12.0, 2026-10-07): CUDA-P11 passed on
+    /// real Q4_0 / Q8_0 weights through this store (read-back against the
+    /// sequential host KV, min cos 1.000000); the host-side store is also
+    /// unit-tested.
     ///
     /// # Errors
     /// A layer-count / shape mismatch, a window past the cache's limit, or
@@ -234,9 +236,10 @@ impl BonsaiModel<'_> {
 /// a poisoned lock), and a `Drop` that unwraps would abort the process during
 /// unwinding. Both fallible calls are logged and swallowed.
 ///
-/// **Compile-blind.** No CUDA hardware ran this branch: it is written
-/// against the driver API and mirrored from the Metal path, type-checked
-/// only by cross-compiling to `x86_64-unknown-linux-gnu`.
+/// Hardware status (RTX A4000, CUDA 12.0, 2026-10-07): F-M3 was observed
+/// only partially — nothing was evicted while in use, and VRAM was back to
+/// idle at process exit, but the release on drop itself was not observable
+/// in-process.
 impl Drop for BonsaiModel<'_> {
     fn drop(&mut self) {
         // Gate on "did this process ever open a CUDA context".
@@ -248,10 +251,12 @@ impl Drop for BonsaiModel<'_> {
         //
         // It also must not be `cuda_qkv_cache.is_some()`, which is what it used
         // to be: only `q1::get_or_build_cuda_qkv_cache`
-        // populates that field, while the ternary, Q4_0/Q8_0, K-quant and FP8
-        // CUDA paths build their QKV concatenation locally. A model that used
-        // one of those skipped its release entirely and leaked its GPU weights
-        // for the life of the process — the exact leak F-M3 is about.
+        // populates that field, while the ternary path caches its
+        // concatenation in its own field (`cuda_ternary_qkv_cache`) and the
+        // Q4_0/Q8_0, K-quant and FP8 CUDA paths build theirs locally. A model
+        // that used one of those skipped its release entirely and leaked its
+        // GPU weights for the life of the process — the exact leak F-M3 is
+        // about.
         //
         // `cuda_context_is_live` reads the lock-free mirror of the singleton's
         // state: exact for every path, and it constructs nothing.

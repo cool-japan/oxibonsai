@@ -10,7 +10,11 @@
 //! caller-supplied prefill/decode callbacks so this module actually gets
 //! used end to end, and it always uses a non-overlapping chunk split for
 //! that execution regardless of `ChunkedPrefillConfig::overlap` (see
-//! [`run_chunked_prefill`]'s doc comment for why).
+//! [`run_chunked_prefill`]'s doc comment for why), cut by
+//! [`prefill_chunk_windows`], which never leaves a short final chunk after
+//! a batched one (F-3, [`PREFILL_PER_TOKEN_MAX_TOKENS`]).
+
+use std::ops::Range;
 
 use crate::error::ModelResult;
 
@@ -189,6 +193,12 @@ impl PrefillScheduler {
     /// Create a new scheduler for the given prompt.
     pub fn new(prompt_tokens: &[u32], config: ChunkedPrefillConfig) -> Self {
         let chunks = create_prefill_chunks(prompt_tokens, &config);
+        Self::from_chunks(config, chunks)
+    }
+
+    /// A scheduler over chunks the caller already cut (the
+    /// [`run_chunked_prefill`] executor's [`prefill_chunk_windows`] split).
+    fn from_chunks(config: ChunkedPrefillConfig, chunks: Vec<PrefillChunk>) -> Self {
         Self {
             config,
             chunks,
@@ -404,7 +414,9 @@ impl PrefillMemoryEstimate {
 /// overhead, repeated 32 times. So the default is the largest chunk that
 /// still bounds a call's host-side staging (the `[chunk x hidden]` embedding
 /// batch, 64 MiB on the 8B at 4096): **4096** — one call for every prompt of
-/// the historical 4096-token context, 4096-token chunks beyond it. It is
+/// the historical 4096-token context, 4096-token chunks beyond it (the last
+/// call up to 4096 + [`PREFILL_PER_TOKEN_MAX_TOKENS`] tokens, see
+/// [`prefill_chunk_windows`]; a 4097..=4112-token prompt is one call). It is
 /// ratified together with the prefill router in `forward_metal.rs`, which
 /// keeps a model whose fused path measures slower than decode on the
 /// sequential route and bounds every fused call by a deadline.
@@ -414,16 +426,91 @@ impl PrefillMemoryEstimate {
 /// `InferenceEngine::set_prefill_chunk_tokens` is the same knob one level up.
 pub const DEFAULT_PREFILL_CHUNK_TOKENS: usize = 4096;
 
+/// Longest prefill window [`crate::model::BonsaiModel::forward_prefill`] runs
+/// on a GPU tier's per-token path rather than its batch kernels.
+///
+/// On a `native-cuda` build `forward_prefill_unchunked`
+/// (`model/types/prefill_dispatch.rs`) hands a GPU window of at most this
+/// many tokens to `forward_sequential`, a loop of per-token `forward` calls;
+/// only a longer window reaches the CUDA batch prefill (which is also why
+/// the runtime's CUDA warm-up prefills one token more than this). Before its
+/// loop, `forward_sequential` requires the host KV cache to be coherent up
+/// to the window's start (the MET-05 guard). The CUDA batch prefill of a Q1
+/// or ternary model keeps the prompt's K/V in the device KV cache only, so a
+/// 2..=16-token window that follows such a batch window is refused with
+/// [`crate::error::ModelError::GpuFallbackRequiresCacheRebuild`] (F-3, found
+/// for Q1 and ternary models in the 2026-10-07 RTX A4000 validation run).
+/// [`prefill_chunk_windows`] therefore never ends a multi-window plan with a
+/// window this short when the chunk is longer than this; the runtime's
+/// `InferenceEngine` plans its own prefill windows the same way.
+pub const PREFILL_PER_TOKEN_MAX_TOKENS: usize = 16;
+
+/// Cut a `prompt_len`-token prompt into the contiguous, non-overlapping
+/// windows a chunked prefill at `chunk_tokens` runs, one prefill call each.
+///
+/// The windows are those of `prompt.chunks(chunk_tokens)`, except that when
+/// `chunk_tokens` exceeds [`PREFILL_PER_TOKEN_MAX_TOKENS`] a final window of
+/// `1..=PREFILL_PER_TOKEN_MAX_TOKENS` tokens is merged into the window
+/// before it, which then holds at most `chunk_tokens + 16` tokens. Every
+/// earlier window took the batched path, so on a `native-cuda` build a
+/// 2..=16-token tail would run on the per-token path, which reads the host
+/// KV cache that a device-resident CUDA batch window of a Q1 or ternary
+/// model never populated, and be refused (F-3; see
+/// [`PREFILL_PER_TOKEN_MAX_TOKENS`]). A 1-token tail runs the decode-style
+/// `forward` and would work, but merging it too keeps one invariant: with
+/// more than one window, every window but the last holds exactly
+/// `chunk_tokens` tokens and the last more than
+/// [`PREFILL_PER_TOKEN_MAX_TOKENS`].
+///
+/// With `chunk_tokens <= PREFILL_PER_TOKEN_MAX_TOKENS` no window takes the
+/// batched path, so no batched window precedes the tail and the plan is
+/// exactly `chunks(chunk_tokens)`: merging there would instead create a
+/// per-token to batched transition at a non-zero position.
+///
+/// `chunk_tokens == 0` (chunking disabled) or `chunk_tokens >= prompt_len`
+/// gives the single window `0..prompt_len`, for an empty prompt too.
+pub fn prefill_chunk_windows(prompt_len: usize, chunk_tokens: usize) -> Vec<Range<usize>> {
+    if chunk_tokens == 0 || chunk_tokens >= prompt_len {
+        return std::iter::once(0..prompt_len).collect();
+    }
+    let mut windows: Vec<Range<usize>> = (0..prompt_len)
+        .step_by(chunk_tokens)
+        .map(|start| start..(start + chunk_tokens).min(prompt_len))
+        .collect();
+    let short_tail = windows
+        .last()
+        .is_some_and(|tail| tail.len() <= PREFILL_PER_TOKEN_MAX_TOKENS);
+    if chunk_tokens > PREFILL_PER_TOKEN_MAX_TOKENS && short_tail {
+        if let Some(tail) = windows.pop() {
+            if let Some(previous) = windows.last_mut() {
+                previous.end = tail.end;
+            }
+        }
+    }
+    windows
+}
+
 /// Decide whether a prompt of `prompt_len` tokens should be chunked at
 /// `chunk_tokens`, and with what configuration (M-18).
 ///
 /// Returns `None` — "run it in one shot, exactly as before" — when chunking
 /// would not actually split the prompt: an empty or single-token prompt, a
-/// disabled (`0`) chunk size, or a prompt that already fits in one chunk.
-/// That is what keeps the Metal fused batch path's dispatch granularity
-/// unchanged for every short prompt.
+/// disabled (`0`) chunk size, or a prompt that [`prefill_chunk_windows`]
+/// keeps in one window (at most `chunk_tokens` tokens, or at most
+/// `chunk_tokens + PREFILL_PER_TOKEN_MAX_TOKENS` once the chunk exceeds
+/// [`PREFILL_PER_TOKEN_MAX_TOKENS`], F-3). That is what keeps the Metal
+/// fused batch path's dispatch granularity unchanged for every short prompt.
+///
+/// The returned config carries the plain chunk size; it does not encode the
+/// short-tail merge. [`run_chunked_prefill`] applies the merge itself (it
+/// cuts its chunks with [`prefill_chunk_windows`]), whereas
+/// [`create_prefill_chunks`] / [`PrefillScheduler`] fed this config split
+/// plainly.
 pub fn prefill_chunk_plan(prompt_len: usize, chunk_tokens: usize) -> Option<ChunkedPrefillConfig> {
-    if chunk_tokens == 0 || prompt_len <= chunk_tokens || prompt_len <= 1 {
+    if chunk_tokens == 0
+        || prompt_len <= 1
+        || prefill_chunk_windows(prompt_len, chunk_tokens).len() <= 1
+    {
         return None;
     }
     // `overlap` is forced to 0 by `run_chunked_prefill` anyway; set it here so
@@ -464,6 +551,16 @@ pub fn prefill_chunk_plan(prompt_len: usize, chunk_tokens: usize) -> Option<Chun
 /// call with any `ChunkedPrefillConfig` — including one reused from
 /// elsewhere with `overlap > 0` set.
 ///
+/// **F-3: no short final chunk after a batched one.** The chunks are the
+/// windows of [`prefill_chunk_windows`] at `config.chunk_size` (at least
+/// 1): when the chunk size exceeds [`PREFILL_PER_TOKEN_MAX_TOKENS`], a
+/// final chunk of at most that many tokens is merged into the chunk before
+/// it, so the last chunk can hold up to `chunk_size + 16` tokens. A
+/// `native-cuda` Q1 or ternary model would otherwise run that tail on its
+/// per-token path, which reads the host KV cache the device-resident batch
+/// chunks never populated, and refuse it. Every other chunk is exactly
+/// what [`create_prefill_chunks`] would cut with `overlap: 0`.
+///
 /// Returns the last chunk's `prefill_fn` output (mirroring
 /// `BonsaiModel::forward_prefill`'s "return the last position's output"
 /// contract), or `Ok(None)` for an empty prompt.
@@ -491,7 +588,21 @@ pub fn run_chunked_prefill<T>(
         overlap: 0,
         ..config
     };
-    let mut scheduler = PrefillScheduler::new(prompt_tokens, config);
+    // F-3: cut with the short-tail merge (see the doc comment above).
+    let windows = prefill_chunk_windows(prompt_tokens.len(), config.chunk_size.max(1));
+    let last_index = windows.len().saturating_sub(1);
+    let chunks = windows
+        .into_iter()
+        .enumerate()
+        .map(|(chunk_index, window)| PrefillChunk {
+            tokens: prompt_tokens[window.clone()].to_vec(),
+            start_pos: window.start,
+            end_pos: window.end,
+            chunk_index,
+            is_last: chunk_index == last_index,
+        })
+        .collect();
+    let mut scheduler = PrefillScheduler::from_chunks(config, chunks);
     let mut last = None;
 
     loop {
@@ -561,19 +672,179 @@ mod tests {
             prefill_chunk_plan(100_000, 0).is_none(),
             "chunk size 0 means chunking is disabled"
         );
+        for prompt_len in 4097..=4096 + PREFILL_PER_TOKEN_MAX_TOKENS {
+            assert!(
+                prefill_chunk_plan(prompt_len, 4096).is_none(),
+                "F-3: a {prompt_len}-token prompt's short tail is merged into one window"
+            );
+        }
+        assert!(
+            prefill_chunk_plan(40, PREFILL_PER_TOKEN_MAX_TOKENS).is_some(),
+            "a chunk of at most the per-token threshold merges nothing"
+        );
     }
 
     #[test]
     fn chunk_plan_splits_a_prompt_that_does_not_fit() {
-        let cfg = prefill_chunk_plan(4097, 4096).expect("should chunk");
+        let prompt_len = 4096 + PREFILL_PER_TOKEN_MAX_TOKENS + 1;
+        let cfg = prefill_chunk_plan(prompt_len, 4096).expect("should chunk");
         assert_eq!(cfg.chunk_size, 4096);
         assert_eq!(
             cfg.overlap, 0,
             "overlap is never safe for KV-cache execution"
         );
         assert_eq!(cfg.priority, PrefillPriority::PrefillFirst);
-        let chunks = create_prefill_chunks(&vec![0u32; 4097], &cfg);
+        let chunks = create_prefill_chunks(&vec![0u32; prompt_len], &cfg);
         assert_eq!(chunks.len(), 2);
+    }
+
+    // ── F-3: no short final prefill window after a batched one ──────────────
+
+    /// [`prefill_chunk_windows`] as `(start, end)` pairs.
+    fn window_bounds(prompt_len: usize, chunk: usize) -> Vec<(usize, usize)> {
+        prefill_chunk_windows(prompt_len, chunk)
+            .into_iter()
+            .map(|window| (window.start, window.end))
+            .collect()
+    }
+
+    #[test]
+    fn chunk_windows_fold_a_short_tail_into_the_previous_window() {
+        let cases = [
+            (512, 512, vec![(0, 512)]),
+            (513, 512, vec![(0, 513)]),
+            (528, 512, vec![(0, 528)]),
+            (529, 512, vec![(0, 512), (512, 529)]),
+            (1040, 512, vec![(0, 512), (512, 1040)]),
+            (1041, 512, vec![(0, 512), (512, 1024), (1024, 1041)]),
+            (4097, 4096, vec![(0, 4097)]),
+            (4113, 4096, vec![(0, 4096), (4096, 4113)]),
+            (100, 512, vec![(0, 100)]),
+            (100, 0, vec![(0, 100)]),
+            (100, 100, vec![(0, 100)]),
+            (0, 512, vec![(0, 0)]),
+            (1, 512, vec![(0, 1)]),
+        ];
+        for (prompt_len, chunk, want) in cases {
+            assert_eq!(
+                window_bounds(prompt_len, chunk),
+                want,
+                "prompt_len {prompt_len}, chunk {chunk}"
+            );
+        }
+        for prompt_len in 4097..=4112 {
+            assert_eq!(
+                window_bounds(prompt_len, DEFAULT_PREFILL_CHUNK_TOKENS),
+                vec![(0, prompt_len)],
+                "the default chunk keeps a {prompt_len}-token prompt in one window"
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_windows_at_or_below_the_per_token_threshold_split_plainly() {
+        assert_eq!(
+            window_bounds(40, 2),
+            (0..40).step_by(2).map(|s| (s, s + 2)).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            window_bounds(40, PREFILL_PER_TOKEN_MAX_TOKENS),
+            vec![(0, 16), (16, 32), (32, 40)]
+        );
+    }
+
+    #[test]
+    fn chunk_windows_cover_the_prompt_and_keep_their_invariants() {
+        for chunk in 1..=40usize {
+            for prompt_len in 0..=200usize {
+                let plan = prefill_chunk_windows(prompt_len, chunk);
+                let context = format!("prompt_len {prompt_len}, chunk {chunk}: {plan:?}");
+                // Contiguous, starting at 0 and ending at the prompt's end.
+                assert_eq!(plan.first().map(|w| w.start), Some(0), "{context}");
+                assert_eq!(plan.last().map(|w| w.end), Some(prompt_len), "{context}");
+                assert!(
+                    plan.windows(2).all(|pair| pair[0].end == pair[1].start),
+                    "{context}"
+                );
+                let (last, rest) = match plan.split_last() {
+                    Some(split) => split,
+                    None => panic!("{context}: a plan always has a window"),
+                };
+                // No window but the last is shorter than the chunk.
+                assert!(rest.iter().all(|w| w.len() == chunk), "{context}");
+                assert_eq!(
+                    plan.len() == 1,
+                    prefill_chunk_plan(prompt_len, chunk).is_none(),
+                    "{context}: prefill_chunk_plan must agree on single-window prompts"
+                );
+                if chunk > PREFILL_PER_TOKEN_MAX_TOKENS {
+                    assert!(
+                        last.len() <= chunk + PREFILL_PER_TOKEN_MAX_TOKENS,
+                        "{context}"
+                    );
+                    if !rest.is_empty() {
+                        assert!(last.len() > PREFILL_PER_TOKEN_MAX_TOKENS, "{context}");
+                    }
+                } else if prompt_len > chunk {
+                    // No window takes the batched path: `chunks(chunk)`
+                    // verbatim.
+                    let plain: Vec<Range<usize>> = (0..prompt_len)
+                        .step_by(chunk)
+                        .map(|start| start..(start + chunk).min(prompt_len))
+                        .collect();
+                    assert_eq!(plan, plain, "{context}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn run_chunked_prefill_folds_a_short_tail_chunk() {
+        for (prompt_len, want) in [
+            (513usize, vec![(0usize, 513usize)]),
+            (529, vec![(0, 512), (512, 529)]),
+            (1040, vec![(0, 512), (512, 1040)]),
+        ] {
+            let tokens: Vec<u32> = (0..prompt_len as u32).collect();
+            let mut seen: Vec<(usize, usize, bool)> = Vec::new();
+            let result = run_chunked_prefill(
+                &tokens,
+                ChunkedPrefillConfig::new(512),
+                |chunk| {
+                    assert_eq!(
+                        chunk.tokens.as_slice(),
+                        &tokens[chunk.start_pos..chunk.end_pos]
+                    );
+                    seen.push((chunk.start_pos, chunk.end_pos, chunk.is_last));
+                    Ok(chunk.chunk_index)
+                },
+                || Ok(()),
+            )
+            .expect("should succeed");
+            let bounds: Vec<(usize, usize)> = seen.iter().map(|&(s, e, _)| (s, e)).collect();
+            assert_eq!(bounds, want, "prompt_len {prompt_len}");
+            let last_flags: Vec<bool> = seen.iter().map(|&(_, _, last)| last).collect();
+            let mut want_flags = vec![false; want.len()];
+            if let Some(flag) = want_flags.last_mut() {
+                *flag = true;
+            }
+            assert_eq!(last_flags, want_flags, "prompt_len {prompt_len}");
+            assert_eq!(result, Some(want.len() - 1), "prompt_len {prompt_len}");
+        }
+        // A chunk at or below the threshold keeps its plain split.
+        let tokens: Vec<u32> = (0..40).collect();
+        let mut seen: Vec<(usize, usize)> = Vec::new();
+        let _ = run_chunked_prefill(
+            &tokens,
+            ChunkedPrefillConfig::new(PREFILL_PER_TOKEN_MAX_TOKENS),
+            |chunk| {
+                seen.push((chunk.start_pos, chunk.end_pos));
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .expect("should succeed");
+        assert_eq!(seen, vec![(0, 16), (16, 32), (32, 40)]);
     }
 
     #[test]
@@ -1138,11 +1409,9 @@ mod tests {
         let mut measured: Vec<(usize, std::time::Duration)> = Vec::new();
         for &chunk in &SWEEP_CHUNK_SIZES {
             let effective = if chunk >= prompt_len { 0 } else { chunk };
-            let calls = if effective == 0 {
-                1
-            } else {
-                prompt_len.div_ceil(effective)
-            };
+            // One fused call per planned window (F-3: a short final window
+            // is merged into the one before it).
+            let calls = prefill_chunk_windows(prompt_len, effective).len();
             let elapsed = match measured.iter().find(|(c, _)| *c == effective) {
                 Some(&(_, elapsed)) => elapsed,
                 None => {

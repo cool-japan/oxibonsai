@@ -2,7 +2,10 @@
 //!
 //! This module contains method implementations for `CudaGraph`.
 //!
-//! **UNVALIDATED on hardware** — compile-checked only (no CUDA device here).
+//! Hardware status (RTX A4000, CUDA 12.0, 2026-10-07): `dtoh_exact` ran under
+//! `encode_lm_head_gemv_tq2` (Step 3d, CUDA-P18). `encode_qkv_phase` serves
+//! the per-block Q1 path (`try_cuda_qkv`), which no hardware test targeted —
+//! not yet run on CUDA hardware by a dedicated test.
 //!
 //! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
 

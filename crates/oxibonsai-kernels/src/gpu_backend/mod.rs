@@ -4,8 +4,10 @@
 //! - [`CpuBackend`]: Always-available CPU implementation (baseline)
 //! - `Scirs2Backend`: **Real** GPU backend via scirs2-core (feature = "gpu")
 //! - `NativeCudaBackend`: **Real** CUDA backend via cudarc (feature =
-//!   "native-cuda", Linux/Windows) — **UNVALIDATED on hardware**, this project
-//!   has no CUDA device, so every CUDA path is compile-checked only
+//!   "native-cuda", Linux/Windows) — run on one GPU so far (RTX A4000,
+//!   compute capability 8.6, CUDA 12.0, Linux x86_64, 2026-10-07: kernel
+//!   tests plus synthetic and real-model CPU parity); other GPU generations,
+//!   Windows, aarch64 Linux and multi-GPU have not been run
 //! - [`kernel_artifact_cache`]: user-private, verified on-disk cache for
 //!   compiled kernel artifacts (PTX today)
 //! - [`cuda_graph_slot`]: identity key for the captured-CUDA-graph slot
@@ -128,6 +130,11 @@ pub mod cuda_q_std_prefill;
     any(target_os = "linux", target_os = "windows")
 ))]
 pub mod cuda_q_std_prefill_kernels;
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub mod cuda_q_std_prefill_probe;
 #[cfg(feature = "native-cuda")]
 pub mod cuda_qwen35;
 pub mod kernel_artifact_cache;
@@ -272,6 +279,13 @@ pub use cuda_q_std_kernels::{cuda_gemv_q4_0, cuda_gemv_q8_0};
     any(target_os = "linux", target_os = "windows")
 ))]
 pub use cuda_q_std_prefill::{try_cuda_prefill_q_std, CudaQStdPrefillLayerParams};
+#[cfg(all(
+    feature = "native-cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub use cuda_q_std_prefill_probe::{
+    cuda_prefill_gate_up_swiglu_q_std, cuda_prefill_gemm_q_std, cuda_prefill_gemv_q_std,
+};
 
 #[cfg(all(
     feature = "native-cuda",
@@ -1095,7 +1109,8 @@ pub fn model_registration_count(dispatcher: &crate::KernelDispatcher, model_epoc
 /// Priority order (highest to lowest):
 /// 1. `Scirs2Backend` (feature = "gpu") — Metal-accelerated via scirs2-core
 /// 2. `NativeCudaBackend` (feature = "native-cuda", Linux/Windows) — direct
-///    cudarc CUDA; **UNVALIDATED on hardware** (compile-checked only)
+///    cudarc CUDA; run on hardware on one GPU so far (RTX A4000, CUDA 12.0,
+///    2026-10-07)
 /// 3. [`CpuBackend`] (always available)
 ///
 /// If initialisation fails at any level the function falls through to the

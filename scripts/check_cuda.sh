@@ -16,8 +16,13 @@
 #
 #   1. REAL   — `nvcc --cuda` (NVIDIA CUDA Compiler), if a CUDA toolkit is
 #               installed. This is an authoritative CUDA syntax+semantics
-#               pass; it needs no physical GPU (nvcc's front end runs on any
-#               host), only the toolkit itself.
+#               pass; it needs no physical GPU, only the toolkit itself.
+#               It is NOT front-end only: `nvcc --cuda --dryrun` (CUDA 12.0)
+#               shows cudafe++ for the host side plus a full device compile
+#               for nvcc's default arch (cicc -arch compute_52, ptxas
+#               -arch=sm_52, fatbinary). The stub header below expands to
+#               nothing under nvcc, and inline PTX `asm(...)` is stripped at
+#               extraction for BOTH tiers, so ptxas never sees inline PTX.
 #   2. APPROX — `clang++ -x c++ -fsyntax-only`, if tier 1 is unavailable.
 #               Inline PTX `asm(...)` statements are stripped (they are not
 #               valid host C++) and a small stub header defines away
@@ -122,12 +127,42 @@ echo "  CUDA kernel-source syntax gate"
 echo "═══════════════════════════════════════════════════════════════"
 
 # ── Stub header: defines CUDA-only builtins as inert host stand-ins so the
-# kernel bodies can be parsed as plain C++ by tier 2. Also read by nvcc in
-# tier 1 for the small number of `min`/`max` overloads it does not carry
-# for host-side scalars in a `--cuda` frontend-only pass (harmless there:
-# real device builtins from <cuda_runtime.h> still win in a real compile).
+# kernel bodies can be parsed as plain C++ by tier 2. Every extracted file
+# includes it in BOTH tiers, but its whole body sits inside
+# `#if !defined(__CUDACC__)`, so under nvcc (tier 1) it expands to nothing.
+# nvcc defines `__CUDACC__` and force-includes the real <cuda_runtime.h>
+# (`-include cuda_runtime.h` in `nvcc --cuda --dryrun`), which already
+# declares every name this stub provides. A second, host-side definition of
+# any of them is NOT harmless under nvcc: before this gating, every one of
+# the 31 kernel sources failed tier 1 inside this header (blocker B2, first
+# real-nvcc run, CUDA 12.0) with redefinition errors for `uint3` and
+# threadIdx/blockIdx/blockDim/gridDim, "function rsqrt(float) has already
+# been defined", "cannot overload functions distinguished by return type
+# alone" (`__popc`) and the int/unsigned `min`/`max` overloads, and the empty
+# `__global__`/`__device__` macros turned every kernel into a host function
+# ("calling a __device__ function from a __host__ function is not allowed").
+# Any new shim must go inside the guard too.
 cat >"$WORK_DIR/cuda_stub.h" <<'STUBEOF'
 #pragma once
+// Tier-2-only host shims: the ENTIRE body is gated on `!defined(__CUDACC__)`.
+// nvcc defines `__CUDACC__` for every .cu translation unit it compiles
+// (including tier 1's `--cuda` pass) and force-includes <cuda_runtime.h>,
+// which already provides every name below: the execution-space and
+// `__restrict__`/`__forceinline__` macros (crt/host_defines.h), `uint3`,
+// `dim3` and the `float4`/`uint4`/`int4` vector types (vector_types.h),
+// threadIdx/blockIdx/blockDim/gridDim (device_launch_parameters.h), the
+// warp, atomic, conversion and fast-math intrinsics, and the `rsqrt` and
+// int/unsigned `min`/`max` overloads (crt/math_functions.h{,pp}). A second,
+// stub definition of any of them is a redefinition / overload error under
+// nvcc, never a harmless shadow, so tier 1 (the authoritative check) sees
+// only nvcc's real headers. `__half` is gated for a different reason:
+// <cuda_runtime.h> does NOT declare it (only <cuda_fp16.h> does), so a kernel
+// that uses `__half` without including <cuda_fp16.h> must stay a real,
+// visible nvcc failure instead of one this stub quietly papers over.
+// These definitions only ever materialize for tier 2's host C++ compiler,
+// which has no CUDA headers at all and needs *some* definition to parse
+// kernel bodies that use them.
+#if !defined(__CUDACC__)
 #include <cmath>
 #include <algorithm>
 #define __global__
@@ -147,7 +182,15 @@ static inline float __uint_as_float(unsigned i){ float f; __builtin_memcpy(&f,&i
 static inline int __float_as_int(float f){ int i; __builtin_memcpy(&i,&f,4); return i; }
 template<typename T> static inline T __ldg(const T* p){ return *p; }
 static inline float __fmaf_rn(float a,float b,float c){return a*b+c;}
+// glibc's <math.h> already declares `extern float __expf(float)` (its
+// __MATHCALL macro declares every libm function a second time under a `__`
+// prefix), so on a glibc host this static shim was a hard error in every
+// file ("static declaration of '__expf' follows non-static declaration")
+// and tier 2 never passed on Linux. Kernel calls then parse against glibc's
+// own prototype; macOS and other non-glibc hosts keep the shim unchanged.
+#if !defined(__GLIBC__)
 static inline float __expf(float x){return expf(x);}
+#endif
 static inline float rsqrtf(float x){return 1.0f/sqrtf(x);}
 static inline double rsqrt(double x){return 1.0/sqrt(x);}
 static inline float rsqrt(float x){return 1.0f/sqrtf(x);}
@@ -158,21 +201,6 @@ static inline unsigned int min(unsigned int a,unsigned int b){return a<b?a:b;}
 static inline unsigned int max(unsigned int a,unsigned int b){return a>b?a:b;}
 static inline int min(int a,int b){return a<b?a:b;}
 static inline int max(int a,int b){return a>b?a:b;}
-// `__CUDACC__` is defined by nvcc for every .cu translation unit it compiles
-// (including tier 1's `--cuda` frontend-only pass), and nvcc's own implicit
-// prelude already defines the real `float4`/`uint4`/`int4` vector types (via
-// its auto-included `vector_types.h`) plus `__half` once a kernel includes
-// `<cuda_fp16.h>`. Unlike the macro/overload shims above — which the header
-// comment already documents as harmless no-ops under a real nvcc compile —
-// these are `struct` type definitions: a *second*, stub definition of a name
-// nvcc's own headers already declare is an ODR/redefinition error, not a
-// harmless shadow. Gating them out under `__CUDACC__` keeps tier 1 (the
-// authoritative check) exercising nvcc's real types/headers unchanged, and
-// keeps a genuinely missing `#include <cuda_fp16.h>` in a kernel a real,
-// visible nvcc failure instead of one this stub quietly papers over; they
-// only materialize for tier 2's host C++ compiler, which has no CUDA headers
-// at all and needs *some* definition to parse kernel bodies that use them.
-#if !defined(__CUDACC__)
 struct float4 { float x, y, z, w; };
 static inline float4 make_float4(float x, float y, float z, float w){ float4 r{x,y,z,w}; return r; }
 struct uint4 { unsigned int x, y, z, w; };
@@ -325,6 +353,13 @@ elif command -v clang++ >/dev/null 2>&1 || command -v g++ >/dev/null 2>&1; then
     echo "  cannot catch CUDA-specific semantic errors or verify PTX asm blocks"
     echo "  (which are stripped, not checked). Do not read a clean run here as"
     echo "  'the CUDA compiles'."
+    # A kernel that uses `__half` must `#include <cuda_fp16.h>` (tier 1 keeps a
+    # missing include a real nvcc failure). The host compiler has no CUDA
+    # headers, so give that include an empty stand-in here; `__half` itself
+    # comes from cuda_stub.h, which every extracted file includes first. It is
+    # written ONLY in this tier-2 branch: in tier 1 the same `-I "$WORK_DIR"`
+    # would otherwise shadow nvcc's real <cuda_fp16.h>.
+    printf '#pragma once\n// tier-2 stand-in: __half is shimmed in cuda_stub.h\n' >"$WORK_DIR/cuda_fp16.h"
     for f in "${CU_FILES[@]}"; do
         base="$(basename "$f")"
         if "$CXX" -x c++ -std=c++14 -fsyntax-only -Wall -I "$WORK_DIR" "$f" >"$WORK_DIR/${base}.log" 2>&1; then

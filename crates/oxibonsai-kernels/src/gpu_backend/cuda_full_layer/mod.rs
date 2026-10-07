@@ -195,7 +195,9 @@ impl CudaKvCache {
 /// more than one prefill chunk's worth of positions, so a whole-cache copy
 /// would allocate gigabytes of host memory per call at long contexts.
 ///
-/// **CUDA is unvalidated**: no CUDA hardware has run this read-back.
+/// Run on hardware (RTX A4000, CUDA 12.0, 2026-10-07): CUDA-P11 passed on real
+/// Q4_0 / Q8_0 weights — this read-back against the sequential host KV, min
+/// cos 1.000000 over all 224 (layer, head) pairs.
 ///
 /// # Errors
 /// [`CudaGraphError::InvalidDimensions`] when `pos_start + batch_size`
@@ -596,15 +598,16 @@ fn full_layer_state() -> &'static CudaFullLayerState {
 /// different model's weights are uploaded into the same slot (finding **F-M3**).
 ///
 /// This is what gives `release_model_epoch` a consumer on the full-forward path,
-/// and it is also a **correctness** fix, not only a VRAM one. The CUDA decode
-/// paths derive their handle ids from the layer index alone
-/// (`oxibonsai-model`'s `forward_cuda/ternary.rs`: `6_000_000 + layer * 10`), so
-/// two ternary models of equal depth produce **identical** handle ids: after a
-/// swap, `get_or_upload_weight_tq2_soa` hit the previous model's cache entry and
-/// handed back its device buffer, and the rebuilt `CudaCachedLayerWeights` was
-/// a fresh struct pointing at stale weights. Evicting the previous epoch first
-/// makes the miss real, so the new model's bytes are actually uploaded. It also
-/// keeps peak VRAM at one model rather than two.
+/// and it was also a **correctness** fix, not only a VRAM one. The CUDA decode
+/// paths used to derive their handle ids from the layer index alone
+/// (`6_000_000 + layer * 10`), so two ternary models of equal depth produced
+/// **identical** handle ids: after a swap, `get_or_upload_weight_tq2_soa` hit
+/// the previous model's cache entry and handed back its device buffer, and the
+/// rebuilt `CudaCachedLayerWeights` was a fresh struct pointing at stale
+/// weights. `oxibonsai-model` now composes those ids over the model's
+/// `cuda_model_epoch` (`SlotNamespace`), so two loads never share a handle id;
+/// evicting the previous epoch first stays as defence in depth for a caller
+/// that passes fixed ids, and keeps peak VRAM at one model rather than two.
 ///
 /// Best-effort: a failure here is logged, never propagated, because the caller's
 /// job (building this model's weights) can still succeed.
@@ -1182,9 +1185,9 @@ pub(super) fn acquire_kv_cache(
         // before `alloc_zeros` ever saw it and silently allocate a cache far
         // smaller than every later index assumes. A geometry that is zero or
         // overflows is refused as `InvalidDimensions` before any allocation.
-        // CUDA is unvalidated: no CUDA hardware has run this allocation; the
-        // check itself is plain host arithmetic, unit-tested in
-        // `cuda_device_negotiation`.
+        // This allocation ran on hardware (RTX A4000, CUDA 12.0, 2026-10-07)
+        // only for the dense models' geometries; the check itself is plain
+        // host arithmetic, unit-tested in `cuda_device_negotiation`.
         let total_elements = check_cuda_kv_cache_geometry(n_layers, n_kv, max_seq, head_dim)
             .map_err(|e| CudaGraphError::InvalidDimensions(format!("KV cache geometry: {e}")))?
             as usize;
@@ -1470,7 +1473,9 @@ enum AttnQkvGemv {
 /// `bufs.d_attn_out`. `None` for both keeps the decode path's shape: read
 /// `bufs.d_hidden`, write `bufs.d_attn_out`.
 ///
-/// **CUDA is unvalidated**: no CUDA hardware has run this encoder.
+/// Run on hardware (RTX A4000, CUDA 12.0, 2026-10-07): CUDA-P14 passed on
+/// Bonsai-8B — the Q1 batch prefill through these views against the
+/// sequential per-token CUDA path, last-token and decode-step cos 1.000000.
 ///
 /// # Safety
 /// The function launches CUDA kernels.  The caller must ensure all GPU state
@@ -1526,7 +1531,9 @@ pub unsafe fn encode_attn_phase(
 /// through this. `token`, `hidden_in` and `attn_out` mean exactly what they
 /// mean there.
 ///
-/// **CUDA is unvalidated**: no CUDA hardware has run this encoder.
+/// Run on hardware (RTX A4000, CUDA 12.0, 2026-10-07): CUDA-P15 passed on
+/// Ternary-Bonsai-8B — the TQ2 batch prefill against the sequential per-token
+/// CUDA path, last-token and decode-step cos 1.000000.
 ///
 /// # Safety
 /// The function launches CUDA kernels.  The caller must ensure all GPU state

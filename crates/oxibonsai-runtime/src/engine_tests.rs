@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::request_metrics::RequestRateTracker;
+use oxibonsai_model::chunked_prefill::PREFILL_PER_TOKEN_MAX_TOKENS;
 
 // The tests below only need *some* config to prove
 // `InferenceEngine::new`/`batch_generate`/session-tracking behavior —
@@ -414,6 +415,116 @@ fn chunked_prefill_observes_a_cancel_during_the_prompt() {
         engine.generate(&prompt, 8).expect("generate").is_empty(),
         "a cancel must abandon the prompt ingest, not only the decode loop"
     );
+}
+
+// ── F-3: no short final prefill window after a batched one ───────────
+
+/// [`plan_prefill_chunks`] as `(start, end)` pairs.
+fn prefill_plan_bounds(prompt_len: usize, chunk: usize) -> Vec<(usize, usize)> {
+    plan_prefill_chunks(prompt_len, chunk)
+        .into_iter()
+        .map(|window| (window.start, window.end))
+        .collect()
+}
+
+#[test]
+fn prefill_plan_folds_a_short_tail_into_the_previous_window() {
+    let cases = [
+        (512, 512, vec![(0, 512)]),
+        (513, 512, vec![(0, 513)]),
+        (528, 512, vec![(0, 528)]),
+        (529, 512, vec![(0, 512), (512, 529)]),
+        (1040, 512, vec![(0, 512), (512, 1040)]),
+        (1041, 512, vec![(0, 512), (512, 1024), (1024, 1041)]),
+        (4097, 4096, vec![(0, 4097)]),
+        (100, 512, vec![(0, 100)]),
+        (100, 0, vec![(0, 100)]),
+        (100, 100, vec![(0, 100)]),
+        (0, 512, vec![(0, 0)]),
+        (1, 512, vec![(0, 1)]),
+    ];
+    for (prompt_len, chunk, want) in cases {
+        assert_eq!(
+            prefill_plan_bounds(prompt_len, chunk),
+            want,
+            "prompt_len {prompt_len}, chunk {chunk}"
+        );
+    }
+}
+
+#[test]
+fn prefill_plan_covers_the_prompt_and_keeps_its_invariants() {
+    for chunk in 1..=40usize {
+        for prompt_len in 0..=200usize {
+            let plan = plan_prefill_chunks(prompt_len, chunk);
+            let context = format!("prompt_len {prompt_len}, chunk {chunk}: {plan:?}");
+            // Contiguous, starting at 0 and ending at the prompt's end.
+            assert_eq!(plan.first().map(|w| w.start), Some(0), "{context}");
+            assert_eq!(plan.last().map(|w| w.end), Some(prompt_len), "{context}");
+            assert!(
+                plan.windows(2).all(|pair| pair[0].end == pair[1].start),
+                "{context}"
+            );
+            if chunk > PREFILL_PER_TOKEN_MAX_TOKENS {
+                if let Some((last, rest)) = plan.split_last() {
+                    assert!(rest.iter().all(|w| w.len() == chunk), "{context}");
+                    assert!(
+                        last.len() <= chunk + PREFILL_PER_TOKEN_MAX_TOKENS,
+                        "{context}"
+                    );
+                    if !rest.is_empty() {
+                        assert!(last.len() > PREFILL_PER_TOKEN_MAX_TOKENS, "{context}");
+                    }
+                }
+            } else if prompt_len > chunk {
+                // Every window already takes the per-token path: the plan is
+                // `chunks(chunk)` verbatim.
+                let plain: Vec<std::ops::Range<usize>> = (0..prompt_len)
+                    .step_by(chunk)
+                    .map(|start| start..(start + chunk).min(prompt_len))
+                    .collect();
+                assert_eq!(plan, plain, "{context}");
+            }
+        }
+    }
+}
+
+/// A prompt one token past the servers' 512-token chunk is prefilled as one
+/// 513-token window, and 529 tokens as 512 + 17 — each giving the logits of
+/// the unchunked prefill. (The CUDA refusal itself needs a CUDA device; on
+/// the CPU tier the windows are what this pins.)
+#[test]
+fn chunked_prefill_folds_a_short_tail_and_matches_one_shot() {
+    let config = Qwen3Config {
+        max_context_length: 1024,
+        ..Qwen3Config::tiny_test()
+    };
+    for (prompt_len, want) in [
+        (513usize, vec![(0, 513)]),
+        (529, vec![(0, 512), (512, 529)]),
+    ] {
+        assert_eq!(prefill_plan_bounds(prompt_len, 512), want);
+        let prompt: Vec<u32> = (0..prompt_len as u32).map(|i| 1 + i % 997).collect();
+        let mut one_shot = InferenceEngine::new(config.clone(), greedy_params(), 42);
+        let mut chunked = InferenceEngine::new(config.clone(), greedy_params(), 42);
+        chunked.set_prefill_chunk_tokens(Some(512));
+        let reference = one_shot
+            .prefill_for_generate(&prompt)
+            .expect("one-shot prefill")
+            .expect("not cancelled");
+        let split = chunked
+            .prefill_for_generate(&prompt)
+            .expect("chunked prefill")
+            .expect("not cancelled");
+        assert_eq!(split.len(), reference.len(), "prompt_len {prompt_len}");
+        assert!(
+            split
+                .iter()
+                .zip(&reference)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "prompt_len {prompt_len}: chunked logits differ from one-shot"
+        );
+    }
 }
 
 // ── RT-27: speculative decoding is configuration, not an env var ─────

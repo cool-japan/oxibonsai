@@ -293,6 +293,16 @@ pub struct BonsaiModel<'a> {
         any(target_os = "linux", target_os = "windows")
     ))]
     cuda_qkv_cache: std::sync::Mutex<Option<std::sync::Arc<Vec<Vec<u8>>>>>,
+    /// Cached per-layer ternary (TQ2) Q‖K‖V concatenated bytes for the CUDA
+    /// ternary path (built once, reused). Besides saving the per-token copy,
+    /// this keeps the buffers' addresses stable for the life of the model, so
+    /// the ternary decode never sees a different weight-set identity for the
+    /// same model — see `forward_cuda::ternary`.
+    #[cfg(all(
+        feature = "native-cuda",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    cuda_ternary_qkv_cache: std::sync::Mutex<Option<std::sync::Arc<Vec<Vec<u8>>>>>,
     /// This load's CUDA weight-cache epoch (CUDA-SAFETY F-M3, model half):
     /// allocated once here, released by `Drop` in `forward_cuda`.
     #[cfg(all(
@@ -441,12 +451,22 @@ impl<'a> BonsaiModel<'a> {
         self.max_context
     }
 
-    /// Prompt length above which [`Self::forward_prefill`] chunks (M-18).
+    /// Chunk size [`Self::forward_prefill`] splits a longer prompt into
+    /// (M-18); `0` means chunking is disabled.
     pub fn prefill_chunk_tokens(&self) -> usize {
         self.prefill_chunk_tokens
     }
 
-    /// Set the chunking threshold; `0` disables chunking entirely (M-18).
+    /// Set the prefill chunk size; `0` disables chunking entirely (M-18).
+    ///
+    /// When `tokens` exceeds
+    /// [`crate::chunked_prefill::PREFILL_PER_TOKEN_MAX_TOKENS`] (16), a
+    /// final chunk of at most 16 tokens is folded into the one before it, so
+    /// the last call can hold up to `tokens + 16` tokens and a prompt of at
+    /// most `tokens + 16` tokens runs in one call: a GPU-tier model would
+    /// otherwise run that short tail on its per-token path, which native
+    /// CUDA refuses for a Q1 or ternary model after a batched chunk (F-3,
+    /// [`crate::chunked_prefill::prefill_chunk_windows`]).
     ///
     /// See [`crate::chunked_prefill::DEFAULT_PREFILL_CHUNK_TOKENS`] for why
     /// the default is deliberately large enough to be a no-op.

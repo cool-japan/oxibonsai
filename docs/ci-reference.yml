@@ -196,7 +196,7 @@ jobs:
   #   ./scripts/download_ternary.sh   # once, to fetch the multi-GB ternary GGUF
   #   OXI_MODEL=/abs/path/Ternary-Bonsai-8B.gguf \
   #     cargo test -p oxibonsai-runtime --features native-cuda \
-  #     --test cuda_ternary_forward_parity -- --ignored --nocapture
+  #     --test cuda_ternary_forward_parity -- --nocapture
   gpu-self-hosted:
     name: GPU execution tests (self-hosted A4000, manual)
     if: github.event_name == 'workflow_dispatch' && inputs.run_gpu_tests == true
@@ -218,7 +218,8 @@ jobs:
       # KV-cache handoff bug in oxibonsai-model's ternary CUDA batch-prefill
       # path (see crates/oxibonsai-model/src/model/types/forward_cuda/q1.rs).
       # It needs the real multi-GB ternary GGUF, which is not committed to
-      # the repo, so it is #[ignore]'d by default and only run here.
+      # the repo; the test is not #[ignore]'d, it self-skips (recording the
+      # miss) when OXI_MODEL or a CUDA device is absent.
       - name: Download ternary GGUF (if not already cached on this runner)
         run: |
           if [ ! -f "${OXI_MODEL_PATH}" ]; then
@@ -227,7 +228,7 @@ jobs:
         env:
           OXI_MODEL_PATH: ${{ vars.OXI_TERNARY_MODEL_PATH || 'models/Ternary-Bonsai-8B.gguf' }}
 
-      - name: Real ternary CPU<->CUDA forward parity (ignored by default)
-        run: cargo test -p oxibonsai-runtime --features native-cuda --test cuda_ternary_forward_parity -- --ignored --nocapture
+      - name: Real ternary CPU<->CUDA forward parity (self-skips without the model)
+        run: cargo test -p oxibonsai-runtime --features native-cuda --test cuda_ternary_forward_parity -- --nocapture
         env:
           OXI_MODEL: ${{ vars.OXI_TERNARY_MODEL_PATH || 'models/Ternary-Bonsai-8B.gguf' }}

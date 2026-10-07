@@ -914,7 +914,9 @@ unsafe fn encode_fp8_prefill_layer(
 /// refused (`forward_cuda::cuda_split_prefill_allowed`). A caller that does
 /// store the read-back uses [`try_cuda_prefill_fp8_with_kv_readback`].
 ///
-/// **CUDA is unvalidated**: no CUDA hardware has run this entry point.
+/// Not yet run on CUDA hardware: on the RTX A4000 run (CUDA 12.0, 2026-10-07)
+/// the model refused the FP8 batch prefill by construction and decoded on the
+/// CUDA FP8 GEMV (CUDA-P13 at CLI token level only).
 #[allow(clippy::too_many_arguments)]
 pub fn try_cuda_prefill_fp8(
     hidden_batch: &[f32],
@@ -991,7 +993,9 @@ pub fn try_cuda_prefill_fp8(
 ///   host `KvCache` so decode does not attend over stale, all-zero prompt
 ///   positions. Left untouched when the call fails.
 ///
-/// **CUDA is unvalidated**: no CUDA hardware has run this entry point.
+/// Not yet run on CUDA hardware: the kernel-side K/V read-back of CUDA-P13 is
+/// not reachable from the model, and the RTX A4000 run (CUDA 12.0,
+/// 2026-10-07) covered FP8 at CLI token level only.
 #[allow(clippy::too_many_arguments)]
 pub fn try_cuda_prefill_fp8_with_kv_readback(
     hidden_batch: &[f32],

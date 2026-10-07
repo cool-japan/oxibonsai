@@ -35,8 +35,9 @@
 //! Now the per-layer and full-forward paths share each norm, decode and
 //! prefill share the LM head, no two kinds can collide, and two models never
 //! share a slot. The model's `Drop` (`forward_cuda/mod.rs`) releases every
-//! one of these slots. **Compile-blind** (no CUDA device on the development
-//! host): type-checked by cross-compiling to `x86_64-unknown-linux-gnu`.
+//! one of these slots. Run on hardware (RTX A4000, CUDA 12.0, 2026-10-07):
+//! CUDA-P14 passed on Bonsai-8B, and F-M1 swapped Bonsai-8B and
+//! Ternary-Bonsai-8B in one process, each GPU run equal to its CPU reference.
 //!
 //! The ternary branch of [`BonsaiModel::try_cuda_full_forward_with_lm_head`]
 //! keys its final norm / LM head on
@@ -240,7 +241,7 @@ impl<'a> BonsaiModel<'a> {
             let lm_head_handle = self.cuda_q1_slots().ternary_lm_head();
             let lm_head_bytes = blocks_as_bytes_ternary(lm_head_ternary.blocks());
             let vocab_size = lm_head_ternary.out_features();
-            let qkv_concats = self.build_cuda_ternary_qkv_concats()?;
+            let qkv_concats = self.get_or_build_cuda_ternary_qkv_cache()?;
             let layer_params = self.build_cuda_ternary_layer_params(&qkv_concats)?;
             let rope_cos = self.rope.cos_at_checked(pos)?;
             let rope_sin = self.rope.sin_at_checked(pos)?;

@@ -30,6 +30,11 @@ impl BonsaiModel<'_> {
     /// [`crate::chunked_prefill::run_chunked_prefill`] (M-18); anything that
     /// fits in one chunk takes the single-shot path unchanged, so the fused
     /// Metal batch path's dispatch granularity is unaffected for short prompts.
+    /// When the chunk size exceeds
+    /// [`crate::chunked_prefill::PREFILL_PER_TOKEN_MAX_TOKENS`], a final chunk
+    /// of at most that many tokens is merged into the one before it (F-3, see
+    /// [`crate::chunked_prefill::prefill_chunk_windows`]), so a prompt of up to
+    /// `prefill_chunk_tokens + 16` tokens is one call.
     pub fn forward_prefill(
         &mut self,
         token_ids: &[u32],
@@ -91,7 +96,7 @@ impl BonsaiModel<'_> {
             not(all(feature = "metal", target_os = "macos")),
             any(target_os = "linux", target_os = "windows")
         ))]
-        if _gpu_kernel && token_ids.len() <= 16 {
+        if _gpu_kernel && token_ids.len() <= crate::chunked_prefill::PREFILL_PER_TOKEN_MAX_TOKENS {
             return self.forward_sequential(token_ids, pos_start, kernel);
         }
         #[cfg(all(feature = "metal", target_os = "macos"))]

@@ -95,6 +95,16 @@
 # ── AUTHORITATIVE: published GGUF, downloaded verbatim ───────────────────
 # fetched by: curl (see scripts/cli.sh / README "Quick Start") — no
 # dedicated download script owns this one.
+# This is the earlier known-good object the goldens were captured on. The
+# current upstream object is a re-upload of the same 1158654496 bytes,
+# 284a335aa3fb2ced3b1b01fcb40b08aa783e3b70832767f0dd2e3fdfa134bd54, which
+# `oxibonsai pull bonsai-8b` verifies as its primary digest (accepting this
+# one with a warning). A `-c` manifest holds one digest per path, so a fresh
+# `curl` download fails `shasum -c` / `sha256sum -c` on this line by design;
+# use `oxibonsai pull bonsai-8b` to verify it. Note that `oxibonsai serve` /
+# `oxibonsai-serve` read this file at startup (CWD-relative, or
+# OXIBONSAI_CHECKSUMS_FILE) and refuse a 284a335a... Bonsai-8B.gguf against
+# this line.
 ead25897bc034fa52569d0c6d054ce38216f95db09900c8add8f6bbfb370cff1  models/Bonsai-8B.gguf
 #
 # fetched by: scripts/download_tokenizer.sh (Qwen/Qwen3-8B, "main" revision
@@ -161,5 +171,14 @@ aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4  models/tokeniz
 # ── ADVISORY: locally converted from upstream unpacked safetensors ───────
 # fetched+converted by: scripts/download_ternary.sh 1.7b / 8b
 # (prism-ml/Ternary-Bonsai-{1.7B,8B}-unpacked -> `oxibonsai convert --quant tq2_0_g128`)
+# These two digests are of files written by OxiBonsai 0.2.3 and earlier
+# (string `general.quantization_version` tag, no embedded tokenizer). A 0.2.4
+# conversion writes a different header (u32 version 2 plus
+# `oxibonsai.quant_format`) and embeds the source's tokenizer.json when one is
+# present, so it differs in size and bytes, and download_ternary.sh's advisory
+# drift warning is expected until these lines are regenerated from a 0.2.4
+# conversion. `oxibonsai serve` / `oxibonsai-serve` are not advisory: they
+# match these lines by file name at startup and refuse a 0.2.4 conversion
+# saved under these names (CWD-relative, or OXIBONSAI_CHECKSUMS_FILE).
 ce5d254082b1dfb33a8532d203341f490a897faf1fa7f9044d3648b7851cb24a  models/Ternary-Bonsai-1.7B.gguf
 8b75b4fb478179859ac0a05bd2219c5cd9a5827c187bab6a65bb1547bb006409  models/Ternary-Bonsai-8B.gguf

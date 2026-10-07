@@ -2,9 +2,13 @@
 //!
 //! Converts a HuggingFace model directory (containing `model.safetensors` or
 //! sharded safetensors files and `config.json`) into an OxiBonsai GGUF file:
-//! `PQ2_0` (ggml id 142, the default group-128 ternary format), `PTQ1_0`
-//! (143), mainline `Q2_0` (group 64) or `Q1_0_g128` for weight tensors, with
-//! norm and 1-D tensors kept in a float type.
+//! `TQ2_0_g128` (ggml id 42, `qs` first — the default group-128 ternary
+//! format, the layout the runtime executes), PrismML `PQ2_0` (142, the same
+//! ternary data `d` first, for llama.cpp interoperability), `PTQ1_0` (143),
+//! mainline `Q2_0` (group 64) or `Q1_0_g128` for weight tensors, with norm
+//! and 1-D tensors kept in a float type. See
+//! [`common::quant_format_tensor_type`] for why the two group-128 ternary
+//! spellings map to different ids.
 //!
 //! A sibling [`onnx`] module provides the same output format from HuggingFace
 //! MatMulNBits-quantized ONNX models (e.g. `onnx-community/Ternary-Bonsai-1.7B-ONNX`).
@@ -85,7 +89,12 @@ fn source_dtype_of(dtype: Dtype) -> Option<SourceDtype> {
 ///   plus `model.safetensors.index.json`) and `config.json`.
 /// * `to_path` — Destination path for the GGUF file.
 /// * `quant` — Quantisation format; see [`common::SUPPORTED_QUANT_FORMATS`].
-///   `"tq2_0_g128"` and `"pq2_0"` both emit PrismML `PQ2_0` (ggml id 142).
+///   `"tq2_0_g128"` emits the runtime-native `TQ2_0_g128` (ggml id 42,
+///   `qs` first, `general.file_type` 41), which `oxibonsai run` / `chat` /
+///   `serve` load and execute on every tier; `"pq2_0"` emits the same
+///   ternary data as PrismML `PQ2_0` (ggml id 142, `d` first, file type
+///   141), the layout llama.cpp can read but whose `qwen3` LM head the 0.2.4
+///   runtime cannot execute (see [`common::quant_format_tensor_type`]).
 ///   Norm and 1-D tensors are kept unquantized regardless of format.
 ///
 /// Equivalent to [`convert_hf_to_gguf_with_options`] with

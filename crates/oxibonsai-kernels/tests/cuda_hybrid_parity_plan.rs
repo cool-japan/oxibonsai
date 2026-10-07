@@ -1,14 +1,21 @@
-//! The CUDA-hardware parity checklist (test plan) for the compile-blind CUDA
-//! paths: the `qwen35` hybrid-layer kernels (finding **F13**), the `PQ2_0` /
-//! `PTQ1_0` 2-bit GEMV paths (finding **F16**), the batch-prefill KV
-//! read-back (finding **F6**), the view-based batch-prefill attention
-//! (finding **F9**) and the fused ternary gate‖up GEMV the sliding-window
-//! and stats forwards reach.
+//! The CUDA-hardware parity checklist (test plan) for the CUDA paths that
+//! need a real-device parity run: the `qwen35` hybrid-layer kernels (finding
+//! **F13**), the `PQ2_0` / `PTQ1_0` 2-bit GEMV paths (finding **F16**), the
+//! batch-prefill KV read-back (finding **F6**), the view-based batch-prefill
+//! attention (finding **F9**) and the fused ternary gate‖up GEMV the
+//! sliding-window and stats forwards reach.
 //!
-//! **None of these runs has been executed.** Every CUDA path listed below is
-//! compile-checked only (cross-target `cargo check` / `clippy` plus
-//! `scripts/check_cuda.sh`'s kernel-source syntax pass); none has run on CUDA
-//! hardware. [`CUDA_HARDWARE_PARITY_PLAN`] is the list of runs that must pass
+//! **Status (0.2.4, RTX A4000, CUDA 12.0, 2026-10-07):** CUDA-P11, P14, P15
+//! and P18 pass on real models through the dedicated harnesses
+//! (`crates/oxibonsai-model/tests/cuda_p11_q_std_kv_readback.rs`,
+//! `crates/oxibonsai-runtime/tests/cuda_p14_p15_batch_prefill_vs_sequential.rs`,
+//! `crates/oxibonsai-kernels/tests/cuda_p18_tq2_gemv_real_shapes.rs`); P09
+//! partial (no `+2` codes in the available files); P12/P13 at CLI token level
+//! only; P01-P08 and P10 not run (no 27B files on the CUDA host); P16/P17 not
+//! run (no sliding-window / stats forward harness). The boxes below stay
+//! manual: this file is the plan, not a record of results.
+//!
+//! [`CUDA_HARDWARE_PARITY_PLAN`] is the list of runs that must pass
 //! on a real CUDA device — each at cosine similarity `>= 0.999` against the
 //! named CPU reference, per row / per head, on real activations — before any
 //! of these paths is advertised as working.
@@ -20,7 +27,8 @@
 //! - [`cuda_hardware_parity_plan_self_skips`] self-skips on every host and
 //!   files a [`Capability::CudaHardware`] record with `"executed": false`
 //!   in the release-gate capability manifest, so the manifest shows the plan
-//!   exists and has not been executed. It never writes `"executed": true`.
+//!   exists and that this test did not execute it. It never writes
+//!   `"executed": true`.
 
 use oxibonsai_testkit::capability::{record_skipped, Capability};
 
@@ -162,7 +170,7 @@ fn cuda_hardware_parity_plan_names_every_required_run() {
         );
         assert!(
             line.starts_with("[ ] "),
-            "{id} must be an unchecked item — none of these runs has been executed"
+            "{id} must stay an unchecked plan item — this file is the plan, not a record of results"
         );
     }
 }
@@ -176,8 +184,8 @@ fn cuda_hardware_parity_plan_self_skips() {
     // device — and records exactly that. It must never record
     // `"executed": true`.
     eprintln!(
-        "SKIP: {} CUDA-hardware parity runs are manual and have not been executed \
-         (no CUDA hardware ran them); checklist:\n{CUDA_HARDWARE_PARITY_PLAN}",
+        "SKIP: {} CUDA-hardware parity runs are manual and this test never executes them \
+         (see the file header for the 0.2.4 status); checklist:\n{CUDA_HARDWARE_PARITY_PLAN}",
         plan_runs().len()
     );
     record_skipped(Capability::CudaHardware, TEST_NAME);

@@ -2,9 +2,13 @@
 //!
 //! This module contains method implementations for `CudaGraph`.
 //!
-//! **UNVALIDATED on hardware.** This project has no CUDA device, so the device
-//! selection, shared-memory negotiation and weight-release paths below are
-//! compile-checked only (`scripts/check_cuda.sh`).
+//! Run on hardware (RTX A4000, CUDA 12.0, 2026-10-07), single GPU only: the
+//! shared-memory negotiation at device init (Step 3a: compute capability 8.6,
+//! opt-in maximum 101376 B, 32-key flash tiles) and the device selection
+//! (F-M4: a nonexistent ordinal fell back to the CPU, a malformed one to
+//! ordinal 0). Ordinals above 0 were not run; the weight-release path
+//! (F-M3) was observed only partially — nothing was evicted while in use,
+//! and release on drop was not observable in-process.
 //!
 //! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
 
@@ -495,7 +499,7 @@ impl CudaGraph {
             flash_tile_keys = tile_keys,
             flash_shared_bytes = granted_shared,
             flash_max_head_dim = config.max_head_dim,
-            "CUDA device initialised (UNVALIDATED: compile-checked only, no CUDA hardware)"
+            "CUDA device initialised"
         );
         Ok(Self {
             context,

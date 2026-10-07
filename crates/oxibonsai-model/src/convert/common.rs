@@ -287,15 +287,39 @@ pub fn write_metadata(
 
 /// Map a converter `quant` string to its GGUF tensor type.
 ///
-/// `"tq2_0_g128"` resolves to [`TensorType::PQ2_0`] — ggml id **142**, `d`
-/// first — not to the legacy qs-first id 42. The two carry identical ternary
-/// data, but only 142 is a layout any other ggml consumer can read
-/// (core-gguf-02): `llama.cpp` validates each tensor offset against the
-/// running padded sum and hard-errors on the 34-byte-at-id-42 files, and the
-/// Prism fork prints a dedicated hint naming exactly them.
+/// The two group-128 ternary spellings deliberately resolve to **different**
+/// wire types. Their payload is bit-identical — the same `AbsMean` scale,
+/// the same `0b00 / 0b01 / 0b10 → -1 / 0 / +1` codes, 34 bytes per 128
+/// weights — and only the block byte order and the ggml id differ, so a
+/// `tq2_0_g128` file is exactly a `pq2_0` file with every block rotated left
+/// by two bytes, tensor type 142 → 42 and `general.file_type` 141 → 41:
+///
+/// * `"tq2_0_g128"` → [`TensorType::TQ2_0_g128`] — ggml id **42**, `qs`
+///   first and `d` last, `general.file_type` 41. This is the **native**
+///   layout the 0.2.4 runtime executes for a uniform `qwen3` model: the
+///   per-layer and LM-head `LinearTernary` wrappers, their SIMD CPU kernels
+///   and the fused Metal / CUDA full-layer ternary paths all consume
+///   `BlockTQ2_0_g128`. It is what `scripts/download_ternary.sh` converts
+///   the gen-1 Ternary-Bonsai 1.7B / 4B / 8B checkpoints to.
+/// * `"pq2_0"` → [`TensorType::PQ2_0`] — ggml id **142**, `d` first,
+///   `general.file_type` 141. This is the **llama.cpp-readable** choice
+///   (core-gguf-02): `llama.cpp` validates each tensor offset against the
+///   running padded sum and hard-errors on the 34-byte-at-id-42 files, and
+///   the Prism fork prints a dedicated hint naming exactly them. The 0.2.4
+///   runtime decodes `PQ2_0` and runs it per layer, but has no `PQ2_0`
+///   output-projection (LM-head) wrapper and no fused GPU path for it, so a
+///   `qwen3` model converted this way does not load in `run` / `chat` /
+///   `serve`.
+///
+/// `"tq2_0_g128"` briefly resolved to `PQ2_0` as well (introduced after
+/// v0.2.3), which made every freshly converted Ternary-Bonsai GGUF fail at
+/// load time with "no output-projection Linear* kernel wrapper"; the
+/// `tq2_0_g128_converts_to_native_id_42_and_loads` integration test pins
+/// the native mapping.
 pub fn quant_format_tensor_type(quant: &str) -> Option<TensorType> {
     match quant {
-        "tq2_0_g128" | "pq2_0" => Some(TensorType::PQ2_0),
+        "tq2_0_g128" => Some(TensorType::TQ2_0_g128),
+        "pq2_0" => Some(TensorType::PQ2_0),
         "q1_0_g128" => Some(TensorType::Q1_0G128),
         "ptq1_0" => Some(TensorType::PTQ1_0),
         "q2_0_g64" => Some(TensorType::Q2_0G64),
@@ -391,8 +415,8 @@ pub fn record_tensor(stats: &mut ConvertStats, tensor_type: TensorType) {
 ///
 /// Each block is 34 bytes: 32 bytes of packed `qs` + 2 bytes of FP16 `d`.
 ///
-/// **This is the legacy qs-first layout and must never be used for
-/// `PQ2_0`** — that type is `d`-first, so reusing this cast would emit
+/// **This is the native qs-first (ggml id 42) layout and must never be used
+/// for `PQ2_0`** — that type is `d`-first, so reusing this cast would emit
 /// byte-swapped blocks which still pass every length check. Go through
 /// [`crate::quantize::encode_quantized_tensor`] instead, which picks the
 /// right block struct per tensor type.
@@ -434,12 +458,18 @@ mod tests {
         })
     }
 
+    /// `tq2_0_g128` is the runtime-native qs-first id 42; only `pq2_0` is
+    /// the llama.cpp-readable d-first id 142. Mapping both spellings to 142
+    /// produced Ternary-Bonsai GGUFs the 0.2.4 runtime refused to load.
     #[test]
-    fn group_128_ternary_resolves_to_pq2_0_not_id_42() {
+    fn tq2_0_g128_resolves_to_native_id_42_and_pq2_0_to_142() {
         assert_eq!(
             quant_format_tensor_type("tq2_0_g128"),
-            Some(TensorType::PQ2_0)
+            Some(TensorType::TQ2_0_g128)
         );
+        assert_eq!(TensorType::TQ2_0_g128.wire_id(), 42);
+        assert_eq!(TensorType::TQ2_0_g128.block_size(), 128);
+        assert_eq!(TensorType::TQ2_0_g128.block_bytes(), 34);
         assert_eq!(quant_format_tensor_type("pq2_0"), Some(TensorType::PQ2_0));
         assert_eq!(TensorType::PQ2_0.wire_id(), 142);
         assert_eq!(quant_format_tensor_type("ptq1_0"), Some(TensorType::PTQ1_0));
@@ -448,7 +478,74 @@ mod tests {
             Some(TensorType::Q2_0G64)
         );
         assert_eq!(TensorType::Q2_0G64.wire_id(), 42);
+        assert_eq!(
+            quant_format_tensor_type("q1_0_g128"),
+            Some(TensorType::Q1_0G128)
+        );
+        assert_eq!(quant_format_tensor_type("f32"), Some(TensorType::F32));
         assert!(quant_format_tensor_type("nope").is_none());
+        // Every advertised spelling must resolve, or the CLI help lies.
+        for quant in SUPPORTED_QUANT_FORMATS {
+            assert!(
+                quant_format_tensor_type(quant).is_some(),
+                "advertised quant format {quant:?} does not resolve"
+            );
+        }
+    }
+
+    /// The two group-128 ternary writers must agree on everything except the
+    /// block byte order: same `AbsMean` scale, same codes. A `tq2_0_g128`
+    /// tensor is therefore exactly the `pq2_0` tensor with each 34-byte block
+    /// rotated left by two bytes (`[d][qs]` → `[qs][d]`).
+    #[test]
+    fn tq2_0_g128_and_pq2_0_payloads_are_a_two_byte_block_rotation() {
+        use crate::quantize::{encode_quantized_tensor, ScaleRule};
+
+        const GROUP: usize = 128;
+        let ne0 = 4 * GROUP;
+        let rows = 6;
+        let mut data: Vec<f32> = (0..ne0 * rows)
+            .map(|i| {
+                let x = i as f32 * 0.137 + 0.25;
+                x.sin() * (0.2 + (i % 11) as f32 * 0.05)
+            })
+            .collect();
+        // An all-zero group (encoded as `d = 0`, codes all `0b01`).
+        data[GROUP..2 * GROUP].fill(0.0);
+        // An already-ternary group, which the AbsMean canonicaliser keeps
+        // byte-for-byte (`{-0.5, 0, +0.5}`).
+        for (j, w) in data[2 * GROUP..3 * GROUP].iter_mut().enumerate() {
+            *w = [-0.5f32, 0.0, 0.5][j % 3];
+        }
+        // A group whose values sit exactly on the absmax/2 boundary.
+        for (j, w) in data[5 * GROUP..6 * GROUP].iter_mut().enumerate() {
+            *w = if j == 0 {
+                1.0
+            } else {
+                0.5 * if j % 2 == 0 { 1.0 } else { -1.0 }
+            };
+        }
+
+        let tq2 = encode_quantized_tensor(&data, ne0, TensorType::TQ2_0_g128, ScaleRule::AbsMean)
+            .expect("encode TQ2_0_g128");
+        let pq2 = encode_quantized_tensor(&data, ne0, TensorType::PQ2_0, ScaleRule::AbsMean)
+            .expect("encode PQ2_0");
+        assert_eq!(tq2.len(), pq2.len());
+        assert_eq!(tq2.len(), data.len() / GROUP * 34);
+
+        let (tq2_blocks, tq2_tail) = tq2.as_chunks::<34>();
+        let (pq2_blocks, pq2_tail) = pq2.as_chunks::<34>();
+        assert!(tq2_tail.is_empty() && pq2_tail.is_empty());
+        for (block, (t, p)) in tq2_blocks.iter().zip(pq2_blocks).enumerate() {
+            assert_eq!(&t[..32], &p[2..], "block {block}: codes differ");
+            assert_eq!(&t[32..], &p[..2], "block {block}: scale differs");
+            assert!(
+                t[..32]
+                    .iter()
+                    .all(|b| (0..4u32).all(|lane| (b >> (2 * lane)) & 0x03 != 0x03)),
+                "block {block}: the reserved 0b11 code must never be emitted"
+            );
+        }
     }
 
     #[test]
@@ -463,9 +560,26 @@ mod tests {
             gguf.metadata.get_u32("general.quantization_version").ok(),
             Some(2)
         );
-        assert_eq!(gguf.metadata.get_u32("general.file_type").ok(), Some(141));
+        // PrismML MOSTLY_Q2_0 — the dominant type is the native id-42 layout.
+        assert_eq!(gguf.metadata.get_u32("general.file_type").ok(), Some(41));
+        assert_eq!(
+            gguf.metadata.get_string("oxibonsai.quant_format").ok(),
+            Some("TQ2_0_G128")
+        );
+        assert_eq!(
+            gguf.metadata.get_string("oxibonsai.quant_scale_rule").ok(),
+            Some("AbsMean")
+        );
         assert_eq!(gguf.metadata.get_u32("qwen3.block_count").ok(), Some(2));
         assert!(gguf.metadata.get_u32("llm.block_count").is_err());
+
+        // `pq2_0` keeps the PrismML MOSTLY_PQ2_0 file type.
+        let mut w = GgufWriter::new();
+        write_metadata(&mut w, &minimal_config(), "unit", "pq2_0", None)
+            .expect("write pq2_0 metadata");
+        let bytes = w.to_bytes().expect("serialise pq2_0");
+        let gguf = GgufFile::parse(&bytes).expect("parse pq2_0");
+        assert_eq!(gguf.metadata.get_u32("general.file_type").ok(), Some(141));
     }
 
     #[test]

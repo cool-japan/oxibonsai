@@ -57,7 +57,9 @@ use super::state::{
 ///   that keeps the prompt's K/V must write this into that host cache.
 ///   Left untouched when the call fails.
 ///
-/// **CUDA is unvalidated**: no CUDA hardware has run this entry point.
+/// Not yet run on CUDA hardware: on the RTX A4000 run (CUDA 12.0, 2026-10-07)
+/// the model refused the K-quant batch prefill by construction and decoded on
+/// the CUDA K-quant GEMV (CUDA-P12 at CLI token level only).
 #[allow(clippy::too_many_arguments)]
 pub fn try_cuda_prefill_k_quant(
     hidden_batch: &[f32],

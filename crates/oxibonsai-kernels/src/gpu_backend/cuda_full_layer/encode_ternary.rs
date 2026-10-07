@@ -28,11 +28,11 @@
 //!
 //! ## Handle namespaces
 //!
-//! These ranges are chosen to avoid collisions with the Q1 CUDA ranges (1M–4M):
-//! - Ternary norm handles:   `5_000_000 + layer * 10 + offset`
-//! - Ternary weight handles: `6_000_000 + layer * 10 + offset`
-//! - Final norm handle:      `5_900_000`
-//! - LM-head handle:         `7_000_000`
+//! The caller supplies every handle id. `oxibonsai-model` composes them over
+//! the model's `cuda_model_epoch` (`SlotNamespace`: `TAG | epoch << 24 |
+//! local`), with per-layer ternary norm and weight ranges, a final norm and an
+//! LM head disjoint from the Q1 locals — so two loads (even of one file) never
+//! share a handle id.
 
 use std::sync::Arc;
 
@@ -304,19 +304,43 @@ pub unsafe fn encode_layer_into_ternary(
 // get_or_build_ternary_model_weights
 // =============================================================================
 
-/// Cheap content-and-identity fingerprint of a ternary (TQ2) model's whole
-/// weight set.
+/// Identity fingerprint of a ternary (TQ2) model's whole weight set: the value
+/// the cached GPU weight set (`cached_model_weights`) is validated against on
+/// every decode token. A mismatch evicts the cached set, uploads the whole
+/// model again under a fresh epoch and forces a CUDA-graph re-capture, so the
+/// fingerprint must be **stable for one model** and **different across
+/// models**. Per layer it mixes:
 ///
-/// Mirrors [`super::model_weights_fingerprint`] (the Q1 slot's fingerprint):
-/// combines each layer's weight/norm source-slice base pointer + length into an
-/// FNV-1a hash.  The pointers are stable for the lifetime of a loaded model
-/// (they reference the model's owned / mmap'd bytes or its cached QKV concats)
-/// and differ across concurrently-loaded models, so a same-`n_layers` model swap
-/// (e.g. two same-depth finetunes) produces a different fingerprint.  Cost is
-/// O(n_layers) with a tiny constant, cheap enough to run on every decode token.
-fn ternary_model_weights_fingerprint(
+/// - every **handle id** (fused QKV, attention output, gate‖up, down and the
+///   four norms). `oxibonsai-model` composes these over the model's
+///   `cuda_model_epoch` (`SlotNamespace`), so two loaded models — even two
+///   loads of one file, even when the second model's host slices land on the
+///   first one's freed addresses — never share a fingerprint;
+/// - base address + length of every **model-owned** source slice (the attention
+///   and FFN norms, attention output, gate, up and down): they borrow the
+///   model's owned or mmap'd bytes, so they are stable for the life of the
+///   model and still separate two weight sets whose caller passes fixed rather
+///   than epoch-composed handle ids;
+/// - the **length only** of the fused Q‖K‖V buffer. That buffer is not a model
+///   tensor but a caller-side concatenation of three of them, so its address
+///   is an allocator artefact, not an identity. Hashing it made the cache
+///   identity depend on where `malloc` put a scratch buffer: the ternary decode
+///   used to rebuild the concatenation on every token, and on a streaming
+///   worker thread (its own malloc arena, ~6.7 MB per layer for the 8B) it
+///   landed at a different address on every call, so every token missed,
+///   evicted and re-uploaded the 1.85 GB weight set and re-captured the graph
+///   (`oxibonsai run` at 1.0 tok/s vs 5 tok/s for `benchmark` on the main
+///   thread). Address reuse could equally make two different buffers compare
+///   equal, so the address never was a usable identity in either direction.
+///
+/// Cost is O(n_layers) with a tiny constant, cheap enough to run on every
+/// decode token.
+pub(super) fn ternary_model_weights_fingerprint(
     layer_params: &[CudaFullForwardLayerParamsTernary<'_>],
 ) -> u64 {
+    fn slice_identity<T>(s: &[T]) -> (u64, u64) {
+        (s.as_ptr() as usize as u64, s.len() as u64)
+    }
     let mut h = 0xcbf29ce484222325u64; // FNV-1a offset basis
     let mut mix = |v: u64| {
         h ^= v;
@@ -324,53 +348,48 @@ fn ternary_model_weights_fingerprint(
     };
     mix(layer_params.len() as u64);
     for lp in layer_params {
-        let parts: [(u64, u64); 7] = [
-            (
-                lp.attn_norm_bytes.as_ptr() as usize as u64,
-                lp.attn_norm_bytes.len() as u64,
-            ),
-            (
-                lp.fused_qkv_bytes.as_ptr() as usize as u64,
-                lp.fused_qkv_bytes.len() as u64,
-            ),
-            (
-                lp.attn_proj_bytes.as_ptr() as usize as u64,
-                lp.attn_proj_bytes.len() as u64,
-            ),
-            (
-                lp.gate_bytes.as_ptr() as usize as u64,
-                lp.gate_bytes.len() as u64,
-            ),
-            (
-                lp.up_bytes.as_ptr() as usize as u64,
-                lp.up_bytes.len() as u64,
-            ),
-            (
-                lp.down_bytes.as_ptr() as usize as u64,
-                lp.down_bytes.len() as u64,
-            ),
-            (
-                lp.ffn_norm_bytes.as_ptr() as usize as u64,
-                lp.ffn_norm_bytes.len() as u64,
-            ),
+        let handles: [u64; 8] = [
+            lp.attn_norm_handle,
+            lp.fused_qkv_handle,
+            lp.q_norm_handle,
+            lp.k_norm_handle,
+            lp.attn_proj_handle,
+            lp.ffn_norm_handle,
+            lp.gate_up_handle,
+            lp.down_handle,
         ];
-        for (ptr, len) in parts {
+        for handle in handles {
+            mix(handle);
+        }
+        let owned: [(u64, u64); 6] = [
+            slice_identity(lp.attn_norm_bytes),
+            slice_identity(lp.attn_proj_bytes),
+            slice_identity(lp.gate_bytes),
+            slice_identity(lp.up_bytes),
+            slice_identity(lp.down_bytes),
+            slice_identity(lp.ffn_norm_bytes),
+        ];
+        for (ptr, len) in owned {
             mix(ptr);
             mix(len);
         }
+        // Deliberately the length only — see the doc comment.
+        mix(lp.fused_qkv_bytes.len() as u64);
     }
     h
 }
 
 /// Build (or return cached) GPU weight handles for all ternary transformer layers.
 ///
-/// Uses `6_000_000 + layer * 10 + offset` for weight handles and
-/// `5_000_000 + layer * 10 + offset` for norm handles, keeping them separate
-/// from Q1 CUDA handles (1M–4M) and the Metal ternary handles.
+/// The weight and norm handle ids come from the caller; `oxibonsai-model`
+/// composes them over the model's `cuda_model_epoch` (`SlotNamespace`), so
+/// they are disjoint from the Q1 CUDA handles and never shared by two loads.
 ///
-/// The cache is validated by BOTH the layer count and a content fingerprint
+/// The cache is validated by BOTH the layer count and an identity fingerprint
 /// ([`ternary_model_weights_fingerprint`]) so a same-depth ternary model swap
-/// rebuilds rather than silently reusing another model's uploaded GPU buffers.
+/// rebuilds rather than silently reusing another model's uploaded GPU buffers,
+/// while repeated calls for one model — whatever scratch address the caller's
+/// fused-QKV concatenation has — hit the cache.
 /// The ternary slot (`cached_model_weights`) is disjoint from the Q1 slot
 /// (`cached_q1_model_weights`), so Q1 and TQ2 weight sets can never alias.
 fn get_or_build_ternary_model_weights(
@@ -398,11 +417,11 @@ fn get_or_build_ternary_model_weights(
     }
 
     // F-M3: free the previous model's GPU weights *before* uploading this one.
-    // Critical here: the ternary handle ids are `6_000_000 + layer * 10`, i.e.
-    // identical for two same-depth ternary models, so without this eviction the
-    // uploads below hit the previous model's cache entries and this "rebuilt"
-    // weight set would point at the previous model's device buffers. See
-    // `super::evict_cached_model_weights`.
+    // `oxibonsai-model` composes the ternary handle ids over the model's
+    // `cuda_model_epoch`, so two loads never share them; the eviction stays as
+    // defence in depth (a caller passing fixed per-layer ids would otherwise
+    // hit the previous model's cache entries) and keeps peak VRAM at one
+    // model. See `super::evict_cached_model_weights`.
     let previous = state
         .cached_model_weights
         .lock()

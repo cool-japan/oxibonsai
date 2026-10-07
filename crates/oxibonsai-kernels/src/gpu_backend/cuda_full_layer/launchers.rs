@@ -161,9 +161,9 @@ pub(super) unsafe fn launch_fused_qk_norm_rope(
 /// [`CudaKvCache::layer_offset_elements`](super::CudaKvCache::layer_offset_elements);
 /// the kernel parameter is `unsigned long long` (finding **F4**).
 ///
-/// **CUDA is unvalidated.** No CUDA hardware has run this launch; the
-/// widened argument type has never been exercised by an actual `unsigned
-/// long long` kernel launch.
+/// Run on hardware (RTX A4000, CUDA 12.0, 2026-10-07) in the Q1 / TQ2
+/// real-model decode (Step 4e/4f, CUDA-P14/P15), with the `unsigned long
+/// long` offset; only offsets below 2^32 elements were exercised.
 ///
 /// # Safety
 /// All slices/views must be valid device pointers allocated on the graph's stream.
@@ -228,10 +228,10 @@ pub(super) unsafe fn launch_fused_kv_store(
 /// than the shared-memory budget allows (refused before any launch);
 /// [`CudaGraphError::DriverError`] when the launch itself fails.
 ///
-/// **CUDA is unvalidated.** No CUDA hardware has run this launch; the
-/// shared-memory sizing and the precondition below are exercised only by
-/// [`attn_scores_shared_bytes`]'s host-side unit tests, never by a real
-/// launch.
+/// Run on hardware (RTX A4000, CUDA 12.0, 2026-10-07) in the Q1 / TQ2
+/// real-model decode at `head_dim` 128 (Step 4e/4f, CUDA-P14/P15). `head_dim > 128` and the
+/// precondition below are exercised only by [`attn_scores_shared_bytes`]'s
+/// host-side unit tests — not yet run on CUDA hardware.
 ///
 /// # Safety
 /// All slices must be valid device pointers allocated on the graph's stream.

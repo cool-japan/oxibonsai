@@ -2,12 +2,17 @@
 //! **F13**) and the `PQ2_0` 2-bit decode table (finding **F16**, CUDA twin of
 //! MET-11).
 //!
-//! **CUDA is UNVALIDATED.** No CUDA hardware ran any of the kernels below:
-//! every one is transcribed from the CPU/Metal reference math (the `qwen35`
+//! **Not yet run on CUDA hardware, except the `PQ2_0` GEMV.** The one CUDA
+//! validation run so far (RTX A4000, CUDA 12.0, 2026-10-07) had no Bonsai 2
+//! 27B files, so none of the hybrid-layer kernels below ran (CUDA-P01..P08,
+//! P10). The `PQ2_0` GEMV is CUDA-P09 **partial**: 450 GEMVs on real `PQ2_0`
+//! weights matched the CPU, but those files hold no `+2` codes. Every kernel
+//! is transcribed from the CPU/Metal reference math (the `qwen35`
 //! GGUF metadata's hybrid-layer formulas, `oxibonsai_core::quant_prism`, and
 //! `kernel_sources::qwen35`'s MSL — see each kernel's doc comment for its
-//! exact source) and checked only by `scripts/check_cuda.sh`'s syntax pass
-//! and (for the pure host helpers) `cargo test`. A cosine-similarity parity
+//! exact source); apart from that partial GEMV run, each is checked only by
+//! `scripts/check_cuda.sh`'s syntax pass and (for the pure host helpers)
+//! `cargo test`. A cosine-similarity parity
 //! run against the CPU reference, per kernel, on real layer-0 activations
 //! (cos >= 0.999) is required before this path is advertised as working;
 //! the checklist of those runs is `tests/cuda_hybrid_parity_plan.rs`.
@@ -40,8 +45,8 @@
 //! independent row/head/span, launch configuration chosen by the host
 //! wiring. Kernels are written in plain loop form (no hand-unrolled 128-bit
 //! vector loads, no warp-shuffle micro-optimisation) — correctness first,
-//! consistent with every other compile-checked-only CUDA kernel in this
-//! crate; `metal_full_layer::qwen35_encode`'s Metal counterpart documents
+//! as for every CUDA kernel in this crate not yet profiled on hardware;
+//! `metal_full_layer::qwen35_encode`'s Metal counterpart documents
 //! the same choice for its PQ2 GEMV until real hardware can profile it.
 
 /// Blockwise Hadamard transform with fused sign-flip (finding **F13**;

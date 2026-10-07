@@ -598,3 +598,39 @@ slow-timeout = { period = "600s", terminate-after = 10 }
 filter = 'package(oxibonsai-runtime) & kind(lib) & test(/real_model_default_sampled_decode_keeps_pace_with_greedy$/)'
 test-group = 'real-model-gate'
 slow-timeout = { period = "600s", terminate-after = 10 }
+
+# The real-model CUDA harnesses: the Q4_0/Q8_0 batch-prefill K/V read-back
+# (`cuda_p11_q_std_kv_readback`, CUDA-P11, oxibonsai-model), the Q1 / TQ2
+# batch prefill against the sequential CUDA path on Bonsai-8B and
+# Ternary-Bonsai-8B (`cuda_p14_p15_batch_prefill_vs_sequential`, CUDA-P14/P15,
+# which may also re-encode a `PQ2_0` 8B to a ~2.2 GB temp file), the keyed
+# graph slot with both 8B models in one process (`cuda_graph_slot_two_models`,
+# F-M1), the TQ2 GEMV over every real projection of the 1.7B and 8B
+# (`cuda_p18_tq2_gemv_real_shapes`, CUDA-P18, which reads a whole file into
+# RAM), the Q-std GEMV on real weights (`cuda_q_std_gemv_real_weights`) and
+# the ternary full-forward parity (`cuda_ternary_forward_parity`,
+# oxibonsai-runtime). Each loads one or more multi-GB real GGUFs, found through
+# `OXI_MODEL` / `OXIBONSAI_MODELS_DIR` or the testkit `models/` fallback, onto
+# the one GPU, and their in-binary mutexes / `gpu_serial()` do not span
+# nextest's one process per test — so without these pins a workspace
+# `cargo nextest run --all-features` on a CUDA host with `./models` present
+# runs them concurrently with each other and with the CPU/Metal real-model
+# legs above. Each self-skips in well under a second without its model or
+# without a CUDA device, so they stay in `default-filter` (the five new
+# harnesses compile empty off Linux/Windows `native-cuda`; the two
+# `cuda_ternary_forward_parity` cases list everywhere and self-skip). The
+# 600s x 10 ceiling matches `legacy_parity_tests`: with real models they were
+# only ever run in `--release` on the RTX A4000 (2026-10-07; P14/P15 alone
+# took 103 s there), and a nextest stage builds them in the much slower dev
+# profile.
+[[profile.default.overrides]]
+filter = 'binary(cuda_p11_q_std_kv_readback) | binary(cuda_p14_p15_batch_prefill_vs_sequential) | binary(cuda_graph_slot_two_models) | binary(cuda_p18_tq2_gemv_real_shapes) | binary(cuda_q_std_gemv_real_weights) | binary(cuda_ternary_forward_parity)'
+test-group = 'real-model-gate'
+slow-timeout = { period = "600s", terminate-after = 10 }
+
+# Same pin as `[profile.default]` just above (kept in sync by hand, like every
+# other stanza in this file).
+[[profile.ci.overrides]]
+filter = 'binary(cuda_p11_q_std_kv_readback) | binary(cuda_p14_p15_batch_prefill_vs_sequential) | binary(cuda_graph_slot_two_models) | binary(cuda_p18_tq2_gemv_real_shapes) | binary(cuda_q_std_gemv_real_weights) | binary(cuda_ternary_forward_parity)'
+test-group = 'real-model-gate'
+slow-timeout = { period = "600s", terminate-after = 10 }

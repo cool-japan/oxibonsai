@@ -140,9 +140,9 @@ pub fn parse_device_ordinal(raw: &str) -> usize {
 
 // ═════════════════════════════════════════════════════════════════════════════
 // F3 — attention-score shared-memory sizing (head_dim > 128)
-// CUDA is unvalidated: this session has no CUDA hardware, so everything below
-// is host-side arithmetic checked by unit tests, never run through nvcc/NVRTC
-// or a real launch.
+// Everything below is host-side arithmetic checked by unit tests. On hardware
+// (RTX A4000, CUDA 12.0, 2026-10-07) the kernel it sizes ran only at the dense
+// models' head_dim 128; head_dim > 128 is not yet run on CUDA hardware.
 // ═════════════════════════════════════════════════════════════════════════════
 
 /// Threads per `batched_attn_scores_v2` CTA. Fixed by
@@ -202,9 +202,10 @@ pub fn attn_scores_shared_bytes(head_dim: u32, block_dim: u32) -> Result<u32, St
 
 // ═════════════════════════════════════════════════════════════════════════════
 // F4 — 64-bit KV-cache addressing
-// CUDA is unvalidated: this session has no CUDA hardware, so everything below
-// is host-side arithmetic checked by unit tests, never run through nvcc/NVRTC
-// or a real launch.
+// Everything below is host-side arithmetic checked by unit tests. On hardware
+// (RTX A4000, CUDA 12.0, 2026-10-07) the 64-bit offsets ran only at the dense
+// models' cache sizes, all below 2^32 elements; a cache past 2^32 elements is
+// not yet run on CUDA hardware.
 // ═════════════════════════════════════════════════════════════════════════════
 
 /// Bytes per KV-cache element (`half`), mirroring

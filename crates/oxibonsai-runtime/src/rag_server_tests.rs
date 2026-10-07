@@ -618,9 +618,14 @@ async fn a_long_prompt_is_prefilled_in_chunks_and_answers_in_full() {
     assert_eq!(status, StatusCode::OK, "{text}");
     let answer: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
     let prompt_tokens = answer["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
+    // A tail of at most `PREFILL_PER_TOKEN_MAX_TOKENS` is folded into the
+    // previous window (F-3), so one chunk plus that many tokens is one call.
+    let one_call_max = CANCELLATION_PREFILL_CHUNK_TOKENS
+        + oxibonsai_model::chunked_prefill::PREFILL_PER_TOKEN_MAX_TOKENS;
     assert!(
-        prompt_tokens > CANCELLATION_PREFILL_CHUNK_TOKENS as u64,
-        "the prompt must be longer than one chunk to be chunked: {prompt_tokens}"
+        prompt_tokens > one_call_max as u64,
+        "the prompt must be longer than one chunk (plus a foldable tail) to be chunked: \
+         {prompt_tokens}"
     );
     assert_eq!(answer["answer"], SCRIPT, "{answer}");
 

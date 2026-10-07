@@ -2,7 +2,10 @@
 //!
 //! This module contains method implementations for `CudaGraph`.
 //!
-//! **UNVALIDATED on hardware** — compile-checked only (no CUDA device here).
+//! Run on hardware (RTX A4000, CUDA 12.0, 2026-10-07): `encode_lm_head_gemv_tq2`
+//! passed Step 3d (`cuda_tq2_gemv_parity`) and CUDA-P18 (the real
+//! Ternary-Bonsai-1.7B / 8B LM heads); the Q1 `encode_lm_head_gemv` serves the
+//! Bonsai-8B decode, which matched the CPU over 48 greedy tokens (Step 4f).
 //!
 //! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
 

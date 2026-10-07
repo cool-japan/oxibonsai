@@ -1463,6 +1463,7 @@ extern "C" __global__ void swiglu_fused(
 /// Q1_0_g128 GEMV — one thread per output row.
 #[cfg(feature = "cuda")]
 pub const CUDA_GEMV_Q1_G128: &str = r#"
+#include <cuda_fp16.h>
 extern "C" __global__ void gemv_q1_g128(
     const unsigned char* __restrict__ blocks_raw,
     const float* __restrict__ input,
@@ -1516,6 +1517,7 @@ extern "C" __global__ void gemv_q1_g128(
 /// Q1_0_g128 GEMM — 2-D grid: (weight_row, batch_col).
 #[cfg(feature = "cuda")]
 pub const CUDA_GEMM_Q1_G128: &str = r#"
+#include <cuda_fp16.h>
 extern "C" __global__ void gemm_q1_g128(
     const unsigned char* __restrict__ blocks_raw,
     const float* __restrict__ input,

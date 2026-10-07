@@ -311,6 +311,11 @@ impl<'a> BonsaiModel<'a> {
                 feature = "native-cuda",
                 any(target_os = "linux", target_os = "windows")
             ))]
+            cuda_ternary_qkv_cache: std::sync::Mutex::new(None),
+            #[cfg(all(
+                feature = "native-cuda",
+                any(target_os = "linux", target_os = "windows")
+            ))]
             cuda_model_epoch: gpu_slots.cuda_model_epoch,
         })
     }
@@ -390,6 +395,11 @@ impl<'a> BonsaiModel<'a> {
                 any(target_os = "linux", target_os = "windows")
             ))]
             cuda_qkv_cache: std::sync::Mutex::new(None),
+            #[cfg(all(
+                feature = "native-cuda",
+                any(target_os = "linux", target_os = "windows")
+            ))]
+            cuda_ternary_qkv_cache: std::sync::Mutex::new(None),
             #[cfg(all(
                 feature = "native-cuda",
                 any(target_os = "linux", target_os = "windows")

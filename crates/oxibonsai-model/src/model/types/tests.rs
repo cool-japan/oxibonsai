@@ -1422,6 +1422,49 @@ fn chunked_prefill_matches_the_single_shot_prefill_bit_for_bit() {
     );
 }
 
+/// F-3 at the model level: a chunk size above
+/// [`crate::chunked_prefill::PREFILL_PER_TOKEN_MAX_TOKENS`] folds a short
+/// final chunk into the one before it, and the folded split is still bit for
+/// bit the single-shot prefill. 50 tokens at chunk 17 would split plainly into
+/// 17 + 17 + 16; the fold makes it 17 + 33.
+#[test]
+fn chunked_prefill_folds_a_short_tail_and_matches_the_single_shot_prefill() {
+    use oxibonsai_core::gguf::reader::GgufFile;
+
+    const CHUNK: usize = crate::chunked_prefill::PREFILL_PER_TOKEN_MAX_TOKENS + 1;
+    let bytes = fixture_ternary_gguf(None);
+    let gguf = GgufFile::parse(&bytes).expect("parse fixture GGUF");
+    let kernel = cpu_kernel();
+    let prompt: Vec<u32> = (0..50u32).map(|i| (i * 5 + 1) % FIX_VOCAB as u32).collect();
+    assert_eq!(
+        crate::chunked_prefill::prefill_chunk_windows(prompt.len(), CHUNK),
+        vec![0..CHUNK, CHUNK..prompt.len()],
+        "the 16-token tail must be folded into the previous window"
+    );
+
+    let mut one_shot = BonsaiModel::from_gguf(&gguf, FIX_CTX).expect("load");
+    one_shot.set_prefill_chunk_tokens(0);
+    let single = one_shot
+        .forward_prefill(&prompt, 0, &kernel)
+        .expect("single-shot prefill");
+
+    let mut chunked = BonsaiModel::from_gguf(&gguf, FIX_CTX).expect("load");
+    chunked.set_prefill_chunk_tokens(CHUNK);
+    let multi = chunked
+        .forward_prefill(&prompt, 0, &kernel)
+        .expect("chunked prefill");
+
+    assert_eq!(
+        single, multi,
+        "the folded chunk split must be bit-for-bit invisible"
+    );
+    assert_eq!(
+        one_shot.host_kv_valid_until(),
+        chunked.host_kv_valid_until(),
+        "both must leave the host KV cache covering the same prefix"
+    );
+}
+
 /// Largest absolute element-wise difference between two equal-length vectors.
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
     a.iter()

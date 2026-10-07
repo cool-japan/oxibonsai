@@ -192,3 +192,177 @@ fn stale_slot_is_dropped_and_matching_slot_is_kept() {
     );
     assert!(slot.is_some(), "a tried-and-failed slot must be preserved");
 }
+
+/// Model-owned source tensors of one fake ternary layer — what
+/// `oxibonsai-model` borrows from its owned / mmap'd weights, and whose
+/// addresses are therefore stable for the life of a model.
+struct FakeTernaryLayer {
+    attn_norm: Vec<f32>,
+    q_norm: Vec<f32>,
+    k_norm: Vec<f32>,
+    ffn_norm: Vec<f32>,
+    attn_proj: Vec<u8>,
+    gate: Vec<u8>,
+    up: Vec<u8>,
+    down: Vec<u8>,
+}
+
+impl FakeTernaryLayer {
+    fn new(seed: u8) -> Self {
+        Self {
+            attn_norm: vec![f32::from(seed) + 1.0; 64],
+            q_norm: vec![f32::from(seed) + 2.0; 16],
+            k_norm: vec![f32::from(seed) + 3.0; 16],
+            ffn_norm: vec![f32::from(seed) + 4.0; 64],
+            attn_proj: vec![seed; 34 * 4],
+            gate: vec![seed.wrapping_add(1); 34 * 8],
+            up: vec![seed.wrapping_add(2); 34 * 8],
+            down: vec![seed.wrapping_add(3); 34 * 4],
+        }
+    }
+
+    /// One layer's parameters, laid out like `oxibonsai-model`'s
+    /// `build_cuda_ternary_layer_params`: norm handles `+0..3` and weight
+    /// handles `+0..3` composed over `handle_epoch` (the model's
+    /// `cuda_model_epoch` in the real caller), Q‖K‖V from the caller's
+    /// `qkv` concatenation.
+    fn params<'a>(
+        &'a self,
+        qkv: &'a [u8],
+        handle_epoch: u64,
+        layer: u64,
+    ) -> CudaFullForwardLayerParamsTernary<'a> {
+        let norm_base = (handle_epoch << 24) | (5_000_000 + layer * 10);
+        let weight_base = (handle_epoch << 24) | (6_000_000 + layer * 10);
+        CudaFullForwardLayerParamsTernary {
+            attn_norm_handle: norm_base,
+            attn_norm_bytes: &self.attn_norm,
+            fused_qkv_handle: weight_base,
+            fused_qkv_bytes: qkv,
+            q_norm_handle: norm_base + 1,
+            q_norm_bytes: &self.q_norm,
+            k_norm_handle: norm_base + 2,
+            k_norm_bytes: &self.k_norm,
+            attn_proj_handle: weight_base + 1,
+            attn_proj_bytes: &self.attn_proj,
+            ffn_norm_handle: norm_base + 3,
+            ffn_norm_bytes: &self.ffn_norm,
+            gate_up_handle: weight_base + 2,
+            gate_bytes: &self.gate,
+            up_bytes: &self.up,
+            down_handle: weight_base + 3,
+            down_bytes: &self.down,
+        }
+    }
+}
+
+/// The caller-side Q‖K‖V concatenation of a fake layer, freshly allocated —
+/// exactly what the ternary decode used to rebuild on every token.
+fn fake_qkv_concat(seed: u8, len: usize) -> Vec<u8> {
+    (0..len).map(|i| seed.wrapping_add(i as u8)).collect()
+}
+
+/// Ternary decode thrash regression (`oxibonsai run` on `Ternary-Bonsai-8B`:
+/// every decode token evicted 289 weights / 1.85 GB, re-uploaded them under a
+/// new epoch and re-captured the CUDA graph, 1.0 tok/s).
+///
+/// The cached-weight-set fingerprint used to hash the heap address of the
+/// fused Q‖K‖V concatenation the caller rebuilt per call, so a malloc arena
+/// that hands out a different address per call (a streaming worker thread)
+/// made every call a miss. It must now be identical for one model whatever the
+/// scratch buffer's address is — while a different model must still miss
+/// (F-M1 / F-M3: a swap must evict and re-capture).
+///
+/// Pure host logic: no CUDA device is touched.
+#[test]
+fn ternary_weight_fingerprint_ignores_qkv_scratch_address() {
+    use super::encode_ternary::ternary_model_weights_fingerprint as fingerprint;
+
+    const N_LAYERS: usize = 3;
+    const QKV_LEN: usize = 34 * 12;
+    const EPOCH: u64 = 7;
+    let model: Vec<FakeTernaryLayer> = (0..N_LAYERS as u8).map(FakeTernaryLayer::new).collect();
+    let fingerprint_of = |qkv: &[Vec<u8>], epoch: u64| -> u64 {
+        let params: Vec<CudaFullForwardLayerParamsTernary<'_>> = model
+            .iter()
+            .zip(qkv)
+            .enumerate()
+            .map(|(layer, (l, q))| l.params(q, epoch, layer as u64))
+            .collect();
+        fingerprint(&params)
+    };
+
+    // Two "decode tokens" whose per-call concatenations are alive at the same
+    // time, so they are guaranteed to sit at different addresses.
+    let first_call: Vec<Vec<u8>> = (0..N_LAYERS as u8)
+        .map(|s| fake_qkv_concat(s, QKV_LEN))
+        .collect();
+    let second_call: Vec<Vec<u8>> = (0..N_LAYERS as u8)
+        .map(|s| fake_qkv_concat(s, QKV_LEN))
+        .collect();
+    for (a, b) in first_call.iter().zip(&second_call) {
+        assert_ne!(a.as_ptr(), b.as_ptr(), "precondition: distinct scratch");
+    }
+    let fp = fingerprint_of(&first_call, EPOCH);
+    assert_eq!(
+        fp,
+        fingerprint_of(&second_call, EPOCH),
+        "one model must keep one weight-set identity across calls, whatever \
+         address the fused-QKV scratch landed at"
+    );
+    // A third call after the first scratch set is freed and reallocated.
+    drop(first_call);
+    let third_call: Vec<Vec<u8>> = (0..N_LAYERS as u8)
+        .map(|s| fake_qkv_concat(s, QKV_LEN))
+        .collect();
+    assert_eq!(fp, fingerprint_of(&third_call, EPOCH));
+
+    // A different model must still miss.
+    // (a) Another load — epoch-composed handles differ — even when every host
+    //     slice is the very same memory (address reuse after a model drop).
+    assert_ne!(fp, fingerprint_of(&second_call, EPOCH + 1));
+    // (b) Other model-owned source tensors under identical (fixed) handles.
+    let other_model: Vec<FakeTernaryLayer> =
+        (0..N_LAYERS as u8).map(FakeTernaryLayer::new).collect();
+    let other_params: Vec<CudaFullForwardLayerParamsTernary<'_>> = other_model
+        .iter()
+        .zip(&second_call)
+        .enumerate()
+        .map(|(layer, (l, q))| l.params(q, EPOCH, layer as u64))
+        .collect();
+    assert_ne!(fp, fingerprint(&other_params));
+    // (c) A differently shaped Q‖K‖V.
+    let longer: Vec<Vec<u8>> = (0..N_LAYERS as u8)
+        .map(|s| fake_qkv_concat(s, QKV_LEN + 34))
+        .collect();
+    assert_ne!(fp, fingerprint_of(&longer, EPOCH));
+    // (d) A different depth.
+    let shallow: Vec<CudaFullForwardLayerParamsTernary<'_>> = model[..N_LAYERS - 1]
+        .iter()
+        .zip(&second_call)
+        .enumerate()
+        .map(|(layer, (l, q))| l.params(q, EPOCH, layer as u64))
+        .collect();
+    assert_ne!(fp, fingerprint(&shallow));
+
+    // The graph-slot key built downstream from one model's (stable) handle
+    // set is therefore replayable call after call, and a new epoch still
+    // forbids replay (F-M1).
+    let key = |model_epoch: u64| {
+        build_slot_key(
+            CudaQuantKind::Tq2G128,
+            model_epoch,
+            CudaGraphSlotKey::fingerprint_handles(&[1, 2, 3]),
+            9,
+            N_LAYERS,
+            4096,
+            32,
+            8,
+            128,
+            4096,
+            12288,
+        )
+    };
+    assert!(key(EPOCH).may_replay(&key(EPOCH)));
+    assert!(!key(EPOCH).may_replay(&key(EPOCH + 1)));
+}

@@ -90,7 +90,7 @@ feature; the default build is CPU-only Pure Rust.
 | `rag` | `serve --rag` (the `/rag/*` endpoints). | off |
 | `eval` | The `eval` subcommand. | off |
 | `metal` | Apple Silicon GPU backend (`--backend metal`, the Metal hybrid runner, the Metal vision tower, GPU image stages). | off |
-| `native-cuda` | NVIDIA CUDA backend (NVRTC kernels). This release's CUDA code was not exercised on CUDA hardware and is **unvalidated**; see the README's Known Limitations. | off |
+| `native-cuda` | NVIDIA CUDA backend (NVRTC kernels; Linux/Windows). Run on one GPU only: an RTX A4000 (CUDA 12.0, x86_64 Linux, 2026-10-07), where Bonsai-8B, Ternary-Bonsai-1.7B/8B and the `Q4_0`/`Q8_0`/K-quant/FP8 fixtures match the CPU token for token. Not run: the Bonsai 2 27B files (no CUDA hybrid forward), other GPU generations, aarch64 Linux, Windows, multi-GPU; see the README's Known Limitations and [`docs/models.md`](models.md). | off |
 | `hf-tokenizer` | The HuggingFace `tokenizers` backend, selectable with `--tokenizer-backend hf`. The Pure-Rust native tokenizer is always available and is what `auto` picks in a default build. | off |
 | `simd-avx2`, `simd-avx512`, `simd-neon` | Empty compatibility features: every CPU tier (scalar, AVX2, AVX-512, NEON) is always compiled in and chosen at run time by CPU feature detection, so these change nothing. | off |
 
@@ -235,7 +235,7 @@ error rather than a silently dropped flag.
 
 | Flag | Default | Help |
 |------|---------|------|
-| `--backend <B>` | `auto` | `auto` takes the best available — a GPU when this build has one and the host serves the model (for a hybrid `qwen35` model such as Bonsai 2, the Metal hybrid runner), else the best CPU SIMD tier. `cpu` forces the CPU tier, including for `--temperature 0`. `metal` demands the Metal GPU and fails with a typed non-zero error — never a silent CPU fallback — when this build or host cannot serve the model. A binary built without the `metal` feature has no GPU backend. |
+| `--backend <B>` | `auto` | `auto` takes the best available — a GPU when this build has one and the host serves the model (for a hybrid `qwen35` model such as Bonsai 2, the Metal hybrid runner), else the best CPU SIMD tier. `cpu` forces the CPU tier, including for `--temperature 0`. `metal` demands the Metal GPU and fails with a typed non-zero error — never a silent CPU fallback — when this build or host cannot serve the model. A `native-cuda` build (Linux/Windows) reaches the NVIDIA GPU through `auto`; there is no `--backend cuda` value. A binary built without `metal` or `native-cuda` has no GPU backend. |
 | `--rope-scaling <MODE>` | `auto` | `auto` honours the `<arch>.rope.scaling.*` keys the GGUF declares, as llama.cpp does (Bonsai-8B declares YaRN factor 4); `off` forces plain RoPE and reproduces OxiBonsai 0.2.3 and earlier; `on` requires the file to declare scaling and errors otherwise. |
 | `--ptq1-transcode` | off | Transcode every PTQ1_0 (1.75-bit) matrix to the lossless 2-bit PQ2_0 layout at load, in anonymous RAM (about 7.2 GB for the 27B) instead of mmapping the native file. A no-op, with a log line, for a file with no PTQ1_0 tensor. |
 | `--prefill-chunk <N>` | `512` for a `qwen35` hybrid; the model's own plan for a dense one | Prompt-ingestion chunk in tokens; at least 1. On the Metal hybrid runner the log reports the size actually in effect, which is smaller than asked when the KV window's memory budget cannot hold it. |
@@ -734,11 +734,22 @@ the source's architecture and tokenizer metadata are carried into the output.
 |------|---------|------|
 | `--input <PATH>` | *(required)* | Input GGUF. |
 | `--output <PATH>` | *(required)* | Destination file. |
-| `--format <FMT>` | `q1_0` | One of `f32`, `q1_0` (Q1_0_g128), `tq2_0_g128` (ternary), `fp8_e4m3`, `fp8_e5m2`, `q4_0`, `q8_0`, `q2_k`, `q3_k`, `q4_k`, `q5_k`, `q6_k`, `q8_k`. Anything else fails fast with no file written. |
+| `--format <FMT>` | `q1_0` | One of `f32`, `q1_0` (Q1_0_g128), `tq2_0_g128` (ternary), `fp8_e4m3`, `fp8_e5m2`, `q4_0`, `q8_0`, `q2_k`, `q3_k`, `q4_k`, `q5_k`, `q6_k`, `q8_k`. Anything else fails fast with no file written. `token_embd.weight`, `output_norm.weight` and the LM head `output.weight` always stay F32 (`ExportConfig::default_fp32_exceptions`). |
 | `--force` | off | Skip the up-front memory guard. It estimates whether dequantising the single largest tensor to f32 fits in this machine's available RAM (a conservative 8 GiB when that cannot be determined) and fails fast with a clear message instead of the OS OOM killer. |
 
 ```bash
 oxibonsai quantize --input models/model-f16.gguf --output models/model-q1_0.gguf --format q1_0
+```
+
+Because the LM head stays F32, a `quantize`-made `Q4_0` / `Q8_0` / K-quant / FP8 file
+never reaches the model-level CUDA prefill and decode branches of those formats, which
+are selected by the LM head's type. To build a fixture with a
+quantized head (for CUDA testing), use the example
+`crates/oxibonsai-model/examples/quantize_full_head.rs` from an F32/F16 source:
+
+```bash
+cargo run --release -p oxibonsai-model --example quantize_full_head -- \
+    models/tb17-f32.gguf models/tb17h-q4_0.gguf q4_0
 ```
 
 ---
@@ -766,7 +777,7 @@ Convert a HuggingFace safetensors model, or an ONNX `MatMulNBits` model, to GGUF
 |------|---------|------|
 | `--from <PATH>` | *(required)* | Directory holding `model.safetensors` (or shards) and `config.json`; with `--onnx`, the ONNX model file instead. |
 | `--to <PATH>` | *(required)* | Output GGUF path. |
-| `--quant <FMT>` | `tq2_0_g128` | `tq2_0_g128` (ternary {-1, 0, +1}, group 128), `q1_0_g128` (1-bit sign + FP16 group scale), `pq2_0` (PrismML 2-bit ternary, ggml id 142), `ptq1_0` (PrismML 1.75-bit ternary, id 143) or `q2_0_g64` (mainline group-64 Q2_0). Anything else is rejected before any work is done. |
+| `--quant <FMT>` | `tq2_0_g128` | `tq2_0_g128` (ternary {-1, 0, +1}, group 128, OxiBonsai's native `qs`-first layout under ggml id 42 — the one `run`/`chat`/`serve` execute), `q1_0_g128` (1-bit sign + FP16 group scale), `pq2_0` (the same ternary data in PrismML's `d`-first layout, ggml id 142, readable by the PrismML llama.cpp fork; this build cannot run a `qwen3` model stored that way), `ptq1_0` (PrismML 1.75-bit ternary, id 143) or `q2_0_g64` (mainline group-64 Q2_0). Anything else is rejected before any work is done. |
 | `--onnx` | off | Treat `--from` as an ONNX model (`MatMulNBits`, bits=2) and use the ONNX-to-GGUF converter. |
 | `--allow-unmapped` | off | Proceed, with a warning per tensor, when the checkpoint holds tensors the converter cannot map onto a GGUF name; they are dropped from the output. Without it such a checkpoint fails loudly. |
 

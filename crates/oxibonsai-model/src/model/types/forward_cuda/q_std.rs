@@ -7,13 +7,36 @@
 //! positions the device cache does not hold
 //! ([`super::cuda_split_prefill_allowed_with_readback`]).
 //!
-//! **Compile-blind**: no CUDA hardware has run these entry points.
+//! Run on hardware (RTX A4000, CUDA 12.0, 2026-10-07): CUDA-P11 passed on
+//! real Q4_0 / Q8_0 weights (`crates/oxibonsai-model/tests/cuda_p11_q_std_kv_readback.rs`).
 
 use oxibonsai_kernels::gpu_backend::cuda_full_layer::KvReadback;
 
 use super::super::q1_slots::SlotNamespace;
 use super::super::{BonsaiModel, OutputWeight};
 use super::byte_helpers::{blocks_q4_0_as_bytes, blocks_q8_0_as_bytes};
+
+/// Process-wide number of Q4_0/Q8_0 CUDA batch prefills that completed on the
+/// device and stored their K/V read-back into the host cache (finding **F6**);
+/// read through [`BonsaiModel::cuda_q_std_prefill_count`].
+static CUDA_Q_STD_PREFILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl BonsaiModel<'_> {
+    /// Process-wide number of Q4_0/Q8_0 CUDA batch prefills — the
+    /// `forward_prefill` entry point, not the verify one — that ran on the
+    /// device **and** stored their K/V read-back into the host cache (finding
+    /// **F6**). Monotonic, never reset, and counted over every model in the
+    /// process.
+    ///
+    /// Observability only: nothing reads it to make a decision. A silent
+    /// fallback of `forward_prefill` to a host-KV path leaves the same host
+    /// K/V behind as the batch prefill does, so a caller that must know which
+    /// path answered (the CUDA-P11 hardware harness) compares this count
+    /// around the call.
+    pub fn cuda_q_std_prefill_count() -> u64 {
+        CUDA_Q_STD_PREFILLS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
 
 impl<'a> BonsaiModel<'a> {
     /// Convert a Q4_0 block slice to raw bytes (zero-copy, file-level fn below).
@@ -160,6 +183,7 @@ impl<'a> BonsaiModel<'a> {
         }
         let (logits, readback) = self.run_cuda_prefill_q_std(token_ids, pos_start, q4_0)?;
         self.store_cuda_kv_readback(&readback, pos_start, token_ids.len())?;
+        CUDA_Q_STD_PREFILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(logits)
     }
 

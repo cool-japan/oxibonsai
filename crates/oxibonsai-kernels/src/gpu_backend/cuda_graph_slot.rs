@@ -18,8 +18,10 @@
 //! captured graph must therefore be keyed on [`CudaGraphSlotKey`]: replay only
 //! when the caller's key equals the stored key, else drop the holder (freeing
 //! the exec) and re-capture. The type is platform-independent so its equality
-//! contract is tested on every host; the CUDA replay path consuming it is
-//! **UNVALIDATED on hardware** (compile-checked only).
+//! contract is tested on every host; the CUDA replay path consuming it ran on
+//! hardware (RTX A4000, CUDA 12.0, 2026-10-07): F-M1 loaded Bonsai-8B,
+//! Ternary-Bonsai-8B, then Bonsai-8B again in one process and re-captured the
+//! graph on every swap, each GPU run equal to its CPU reference.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -83,12 +85,13 @@ impl CudaGraphSlotKey {
     /// - Handles from `cuda_graph::functions::alloc_handle_id` are globally
     ///   unique, so the fingerprint alone separates two uploads — including two
     ///   same-shape finetunes.
-    /// - The CUDA **decode** paths do not use that counter. They derive ids from
-    ///   the layer index (`oxibonsai-model`'s `forward_cuda/ternary.rs`:
-    ///   `6_000_000 + layer * 10`, and the Q1 twin), so two ternary models of
-    ///   equal depth produce byte-identical handle sets and therefore the same
-    ///   fingerprint. There, [`CudaGraphSlotKey::model_epoch`] — freshly minted
-    ///   for every uploaded weight set — is what tells the two models apart.
+    /// - The CUDA **decode** paths do not use that counter. `oxibonsai-model`
+    ///   composes their ids from the layer index over the model's
+    ///   `cuda_model_epoch` (`SlotNamespace`: `TAG | epoch << 24 | local`), so
+    ///   two loaded models never share a handle set. A caller that passes fixed
+    ///   per-layer ids instead would make two models of equal depth produce the
+    ///   same fingerprint; there, [`CudaGraphSlotKey::model_epoch`] — freshly
+    ///   minted for every uploaded weight set — is what tells them apart.
     ///
     /// Both fields are in the key precisely so neither has to be sufficient
     /// alone.
@@ -168,8 +171,9 @@ pub const UNATTRIBUTED_CUDA_MODEL_EPOCH: u64 = 0;
 /// in one process leaked every uploaded weight (~2 GB for an 8B) for the life of
 /// the process. The bookkeeping is a plain map with no CUDA dependency, so it
 /// lives here and is unit-tested on every host; the cache eviction it drives is
-/// in the `cfg`-gated `cuda_graph::cudagraph_global_group` and is **UNVALIDATED
-/// on hardware**.
+/// in the `cfg`-gated `cuda_graph::cudagraph_global_group`. On hardware (RTX
+/// A4000, CUDA 12.0, 2026-10-07) F-M3 was observed only partially: nothing was
+/// evicted while in use, and release on drop was not observable in-process.
 #[derive(Debug, Default)]
 pub struct EpochWeightRegistry {
     by_epoch: std::collections::HashMap<u64, Vec<u64>>,

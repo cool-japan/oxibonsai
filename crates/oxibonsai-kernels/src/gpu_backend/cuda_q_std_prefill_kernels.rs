@@ -337,9 +337,14 @@ extern "C" __global__ void gemv_q4_0_pf(
         #pragma unroll 16
         for (unsigned int nb = 0u; nb < 16u; ++nb) {
             const unsigned int byte = bptr[2u + nb];
+            /* lo-hi split (ggml dequantize_row_q4_0): lower nibble → element nb,
+               upper nibble → element nb+16 — NOT the even/odd interleave
+               (xbase[2*nb], xbase[2*nb+1]) this kernel used to read, which
+               permuted every block's weights against the activation and made
+               the Q4_0 batch-prefill LM head emit wrong logits. */
             const float w0 = (float)((int)(byte & 0x0Fu) - 8);
             const float w1 = (float)((int)((byte >> 4u) & 0x0Fu) - 8);
-            bsum += w0 * xbase[nb * 2u] + w1 * xbase[nb * 2u + 1u];
+            bsum += w0 * xbase[nb] + w1 * xbase[nb + 16u];
         }
         acc += scale * bsum;
     }

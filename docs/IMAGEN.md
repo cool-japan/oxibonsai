@@ -317,14 +317,17 @@ every stage stays at cosine ≥ 0.999 parity with the MLX reference.
 
 | Platform | Backend | Steps | Time / image |
 | --- | --- | --- | --- |
-| NVIDIA A4000-class | CUDA | 4 | ≈ 31.7 s (measured in an earlier release; **not re-measured** — this release's CUDA code is unvalidated) |
+| NVIDIA RTX A4000 | CUDA, `OXI_TE_GPU=1` | 4 | ≈ 38 s (0.2.4, 2026-10-07: text encoder 18.3 s + DiT 11.9 s + VAE 6.5 s) |
+| NVIDIA RTX A4000 | CUDA, text encoder on the CPU (default) | 4 | ≈ 697 s on that run's saturated 8-core host CPU (text encoder ≈ 670 s; DiT 18.3 s, VAE 6.5 s) |
 | Apple Silicon (M3-class) | Metal (default-on GPU) | 4 | ≈ 52–62 s |
 
-The CUDA path reached ≈ 31.7 s (≈ **3.2×** faster than the initial ≈ 101 s) in
-that earlier release after the GPU-offload work: a ~6× DiT GEMM speedup, a ~6.3×
-warp-cooperative flash-attention, and a ~59× stage-0 context-embedder (ported
-CPU→GPU), all at cosine ≥ 0.999. The Metal figure is the full image with the
-default-on GPU path.
+The CUDA rows come from one RTX A4000 (CUDA 12.0, x86_64 Linux): that smoke render
+reproduced a prior render at PSNR 76-78 dB (max abs diff 1/255, no pixel off by more
+than 8); it was not a golden-parity run against the MLX reference. An earlier release
+reported ≈ 31.7 s on an A4000-class GPU (≈ **3.2×** faster than the initial ≈ 101 s)
+after the GPU-offload work: a ~6× DiT GEMM speedup, a ~6.3× warp-cooperative
+flash-attention, and a ~59× stage-0 context-embedder (ported CPU→GPU); that figure was
+not re-measured. The Metal figure is the full image with the default-on GPU path.
 
 ---
 

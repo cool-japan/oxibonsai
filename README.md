@@ -6,7 +6,7 @@
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.89%2B-orange.svg)](https://www.rust-lang.org)
 
-OxiBonsai is a zero-FFI, zero-C/C++ inference engine for PrismML's sub-2-bit Bonsai family: the **1-bit** line (Q1\_0\_g128), the **ternary** line (TQ2\_0\_g128) and the **Bonsai 2 27B** hybrid model (PTQ1\_0 / PQ2\_0 / group-64 Q2\_0), plus the Bonsai-Image text-to-image model. It runs on CPU (SIMD) and Apple Silicon (Metal) without depending on llama.cpp, BLAS, or any C/Fortran runtime; an NVIDIA (CUDA) backend exists but is **unvalidated in this release** (see [Known Limitations](#known-limitations)). Built on the COOLJAPAN ecosystem, it delivers sovereign AI inference in Pure Rust.
+OxiBonsai is a zero-FFI, zero-C/C++ inference engine for PrismML's sub-2-bit Bonsai family: the **1-bit** line (Q1\_0\_g128), the **ternary** line (TQ2\_0\_g128) and the **Bonsai 2 27B** hybrid model (PTQ1\_0 / PQ2\_0 / group-64 Q2\_0), plus the Bonsai-Image text-to-image model. It runs on CPU (SIMD) and Apple Silicon (Metal) without depending on llama.cpp, BLAS, or any C/Fortran runtime; an NVIDIA (CUDA, `native-cuda`) backend has been validated on one GPU, an RTX A4000, for the 1-bit and ternary models (scope and gaps in [Known Limitations](#known-limitations)). Built on the COOLJAPAN ecosystem, it delivers sovereign AI inference in Pure Rust.
 
 To our knowledge, OxiBonsai is the first pure-Rust — C/C++/Fortran-free, zero-FFI — inference engine for the Bonsai 1-bit/ternary model family, and the first to bring its FLUX.2-Klein text-to-image (Bonsai-Image) to pure Rust, built entirely on the COOLJAPAN ecosystem.
 
@@ -66,10 +66,10 @@ Native quantization families, each with dedicated dequant / GEMV / full-forward 
 | AVX-512 | x86-64 | 512-bit | `simd-avx512` |
 | NEON | AArch64 | 128-bit | `simd-neon` |
 | **Metal** | Apple Silicon | GPU, fused full-forward (dense and hybrid runner) | `metal` |
-| **CUDA (native)** | NVIDIA GPU | GPU, NVRTC kernels — **unvalidated in this release** | `native-cuda` |
+| **CUDA (native)** | NVIDIA GPU | GPU, NVRTC kernels — validated on one RTX A4000 (CUDA 12.0); no Bonsai 2 27B forward | `native-cuda` |
 | **CUDA (scirs2)** | NVIDIA GPU | CPU SIMD fallback † | `cuda` |
 
-> † **The `cuda` (scirs2-core) tier runs on CPU, not GPU.** scirs2-core retired its cudarc-based CUDA backend in 0.6.x, so `is_accelerated()` always returns `false` for this tier and the dispatcher transparently falls back to CPU SIMD — output is correct, just not GPU-accelerated. Use `native-cuda` for NVIDIA GPU acceleration, and expect to validate it yourself: the CUDA backend (including the Bonsai 2 hybrid kernels, the keyed graph slot and the fallback launcher) was written and reviewed on a host with no NVIDIA hardware, so it has been compiled but never run. A `CudaBackend` / `MetalBackend` stub no longer exists; the `cuda` feature is the scirs2 abstraction tier, not an NVIDIA build.
+> † **The `cuda` (scirs2-core) tier runs on CPU, not GPU.** scirs2-core retired its cudarc-based CUDA backend in 0.6.x, so `is_accelerated()` always returns `false` for this tier and the dispatcher transparently falls back to CPU SIMD — output is correct, just not GPU-accelerated. Use `native-cuda` for NVIDIA GPU acceleration. It has been run on one NVIDIA RTX A4000 (Ampere, compute capability 8.6), CUDA 12.0, x86_64 Linux, on 2026-10-07: CPU↔CUDA parity for Bonsai-8B, Ternary-Bonsai-1.7B/8B and Q4_0 / Q8_0 / K-quant / FP8 test fixtures. Other GPU generations, aarch64 Linux, Windows and multi-GPU hosts have not been run, and the Bonsai 2 hybrid kernels have no CUDA forward pass. A `CudaBackend` / `MetalBackend` stub no longer exists; the `cuda` feature is the scirs2 abstraction tier, not an NVIDIA build.
 
 Auto-detection via `KernelDispatcher::auto_detect()` selects the best CPU tier at runtime. GPU backends are opt-in at build time (`--features metal` / `native-cuda`) and chosen per run with `--backend auto|cpu|metal` (`auto`, the default, picks the best tier for the build and host).
 
@@ -338,7 +338,9 @@ oxibonsai repl   --seed 42 --steps 4 --width 512 --height 512
 oxibonsai convert \
   --from <unpacked-safetensors-dir> \
   --to models/my-model.gguf \
-  --quant tq2_0_g128        # or q1_0_g128, pq2_0, ptq1_0, q2_0_g64
+  --quant tq2_0_g128        # default: native TQ2_0_g128 (id 42); also q1_0_g128, ptq1_0, q2_0_g64
+# --quant pq2_0 writes PrismML PQ2_0 (id 142) for the PrismML llama.cpp fork;
+# a qwen3 model converted that way does not load in 0.2.4 (no PQ2_0 LM-head path)
 
 # Convert ONNX → GGUF (MatMulNBits bits=2, e.g. onnx-community/Ternary-Bonsai-1.7B-ONNX)
 oxibonsai convert --onnx \
@@ -367,7 +369,7 @@ Each CLI script:
 # 1-bit flow (Bonsai-8B)
 ./scripts/cli.sh                 # CPU SIMD
 ./scripts/cli.sh metal           # Metal GPU (macOS)
-./scripts/cli.sh cuda            # CUDA GPU  (Linux/Windows; unvalidated in this release)
+./scripts/cli.sh cuda            # CUDA GPU  (Linux/Windows; validated on Linux x86_64, RTX A4000)
 
 # Ternary flow — fetch + convert once, then run as many times as you like
 ./scripts/download_ternary.sh 1.7b
@@ -379,7 +381,7 @@ Each CLI script:
 
 ## Measured Throughput
 
-All numbers are from an Apple M3 with 24 GB. The host was under background load (load average 6–22) during most of these runs, so they are ranges, not single best figures, and they move with load. "Fused full-forward" = single GPU command buffer per token.
+Rows marked CUDA are from one NVIDIA RTX A4000 (Ampere, compute capability 8.6, default 140 W clocks, CUDA 12.0, driver 550.144, Xeon Gold 5315Y host, quiet box, id-42 ternary files), measured on 2026-10-07; every other row is from an Apple M3 with 24 GB. The M3 host was under background load (load average 6–22) during most of these runs, so they are ranges, not single best figures, and they move with load. "Fused full-forward" = single GPU command buffer per token.
 
 | Model | Backend | What | Result |
 |-------|---------|------|-------:|
@@ -394,9 +396,12 @@ All numbers are from an Apple M3 with 24 GB. The host was under background load 
 | Bonsai-8B           | Metal | fused prefill vs sequential decode, 256 tokens | 8.05–8.2× faster per token (4096 tokens: 27.5–29.4 s vs 304–322 s) |
 | Dense models | Metal | 2000-token embedding | 3.3 s (1.7B), 13 s (8B models) |
 | Bonsai 2 27B | Metal | 256 × 192 image prompt end to end | 14 s (78 s on the CPU path) |
-| Ternary-Bonsai-1.7B | **CUDA** (fused TQ2) | decode | ~21.9 tok/s — measured in an earlier release on NVIDIA hardware, **not re-measured**; this release's CUDA code is unvalidated |
+| Ternary-Bonsai-1.7B | **CUDA** (fused TQ2), RTX A4000 | greedy decode, 256 tokens after a 16-token warm-up (`oxibonsai benchmark`) | 44.4 tok/s |
+| Ternary-Bonsai-1.7B | CUDA, RTX A4000 | `scripts/cli_ternary.sh cuda` (sampled, temperature 0.7 / top-p 0.9, 100 tokens, prefill included) | 39.6 tok/s (an earlier release: ~21.9 tok/s, measured the same way on other NVIDIA hardware) |
+| Ternary-Bonsai-8B   | CUDA (fused TQ2), RTX A4000 | greedy decode, 256 tokens after a 16-token warm-up (`oxibonsai benchmark`) | 10.8 tok/s |
+| Bonsai-8B           | CUDA (fused Q1), RTX A4000 | greedy decode, 256 tokens after a 16-token warm-up (`oxibonsai benchmark`) | 20.6 tok/s |
 
-The 27B decode bar the release was held to is 5 tok/s, and both formats cleared it. The Bonsai-8B 4096-token "before" figure was measured on a 512-token prompt because the pre-fix 4096-token arm did not finish within 900 s. Numbers come from `scripts/bench_ternary.sh`, `scripts/cli_ternary.sh` and the release-gate legs. Engine-pool replicas do **not** multiply GPU throughput: 8 concurrent requests on the real 1.7B served 52.2 / 54.2 / 54.5 tok/s aggregate with pools of 1 / 2 / 3 replicas (weights stay 457 MB resident for all three), so replicas buy isolation and latency fairness, not throughput.
+The 27B decode bar the release was held to is 5 tok/s, and both formats cleared it. The Bonsai-8B 4096-token "before" figure was measured on a 512-token prompt because the pre-fix 4096-token arm did not finish within 900 s. Numbers come from `scripts/bench_ternary.sh`, `scripts/cli_ternary.sh` and the release-gate legs; the CUDA greedy rows from `oxibonsai benchmark --tokens 256 --warmup 16 --temperature 0 --seed 42`. Q4_0 / Q8_0 / K-quant / FP8 decode on CUDA is PCIe-bound and can be slower than the CPU (see [Known Limitations](#known-limitations)). Engine-pool replicas do **not** multiply GPU throughput: 8 concurrent requests on the real 1.7B served 52.2 / 54.2 / 54.5 tok/s aggregate with pools of 1 / 2 / 3 replicas (weights stay 457 MB resident for all three), so replicas buy isolation and latency fairness, not throughput.
 
 Sampled decode (the default `temperature 0.7`, `top_k 40`) reads the full logit row on the host, which costs a little more per token than greedy's 4-byte GPU argmax readback: on the real Ternary-Bonsai-1.7B, in one process (release build, load average about 12), 62.2 tok/s greedy against 53.1 tok/s default-sampled (0.85x). `real_model_default_sampled_decode_keeps_pace_with_greedy` repeats that measurement and requires at least 0.6x. A GPU top-k candidate route exists (`InferenceEngine::set_sampled_topk(SampledTopKConfig::gpu_candidates())`, a library opt-in with byte-identical output) but is off by default, because its selection kernel costs about 25 ms per token at a 151 669-token vocabulary: 22.2 tok/s (0.33x) in the same measurement.
 
@@ -439,7 +444,7 @@ oxibonsai/
 │   │                          tiled, parallel), Gated-DeltaNet, FWHT, M-RoPE + GPU backends:
 │   │                            gpu_backend/metal_*       (Metal graph, fused full-forward,
 │   │                                                       hybrid runner, vision tower)
-│   │                            gpu_backend/cuda_*        (native NVRTC kernels; unvalidated)
+│   │                            gpu_backend/cuda_*        (native NVRTC kernels; validated on one RTX A4000)
 │   │                            gpu_backend/scirs2_backend (scirs2-core CUDA/Metal)
 │   ├── oxibonsai-tokenizer/   Pure Rust BPE tokenizer, GGUF vocabulary, Jinja chat templates
 │   ├── oxibonsai-model/       Dense Qwen3 + hybrid Qwen3.5 forward passes (GQA, SwiGLU, RoPE,
@@ -492,7 +497,7 @@ cargo run -p oxibonsai-eval --example eval_mmlu
 ## COOLJAPAN Ecosystem
 
 ```
-OxiBonsai (Pure Rust sub-2-bit LLM inference — CPU + Metal, CUDA unvalidated)
+OxiBonsai (Pure Rust sub-2-bit LLM inference — CPU, Metal, CUDA)
   ├── SciRS2   (scirs2-core 0.6.x — GPU abstraction tier, SIMD helpers)
   ├── OxiArc   (oxiarc-deflate 0.4.x — DEFLATE for the PNG encoder/decoder)
   ├── OxiHTTP  (oxihttp 0.2.x, with the Pure-Rust OxiTLS stack — downloads)
@@ -534,7 +539,7 @@ All **default-feature** dependencies are Pure Rust — zero C/C++/Fortran, zero 
 
 \* Phase 6 items marked complete are implemented and tested, but several are standalone building blocks not yet wired into the default inference path, or are honestly-labeled simulations rather than the literal capability their name suggests — see [Known Limitations](#known-limitations) immediately below for the itemized, current-reality breakdown.
 
-† Phase 12 and the CUDA work in 0.2.4 were written without NVIDIA hardware and have not been run in this release; see [Known Limitations](#known-limitations).
+† Phase 12 and the 0.2.4 CUDA work were run on one RTX A4000 (CUDA 12.0) for this release, except the Bonsai 2 hybrid kernels; [Known Limitations](#known-limitations) lists what was not run.
 
 ## Known Limitations
 
@@ -542,7 +547,8 @@ Everything below is implemented, tested, and either self-documented in its own m
 
 **Acceleration & scaling**
 
-- **CUDA is unvalidated in this release.** The native CUDA backend — the Bonsai 2 hybrid kernels, the keyed graph slot, the fallback launcher, `device_count()`, weight-cache eviction, and the fused gate‖up GEMV in the sliding-window and stats forwards — compiles and passes an approximate source-syntax check (the kernel sources are parsed as C++ with the CUDA builtins stubbed, not compiled by `nvcc`, on a host without the CUDA toolkit), but nothing in it has been run on NVIDIA hardware. The CPU↔CUDA parity checklist is open in `TODO.md`. (The earlier "cap-of-8" batch-column bug is fixed: the 30 CUDA prefill kernels chunk correctly.)
+- **CUDA is validated on one GPU only.** On one NVIDIA RTX A4000 (Ampere, compute capability 8.6), CUDA 12.0, driver 550.144, x86_64 Ubuntu 22.04 (2026-10-07): the kernel sources compiled under `nvcc` (31/31, before the `gemv_q4_0_pf` fix); 168 kernel tests pass; 48-token greedy output is byte-identical to the CPU for Bonsai-8B, Ternary-Bonsai-1.7B/8B (id-42 files), and Q4_0 / Q8_0 / six K-quant / two FP8 fixtures derived from Ternary-Bonsai-1.7B with a quantized LM head; checklist items CUDA-P11, P14, P15 and P18 and the keyed graph slot pass on real weights; the image pipeline's CUDA arm reproduced a prior render at PSNR 76–78 dB (not a repository golden). **Not run:** the Bonsai 2 27B files and hybrid kernels (CUDA-P01–P10; there is no CUDA `qwen35` forward), the fused gate‖up GEMV in the sliding-window and stats forwards (P16/P17), Turing/Pascal GPUs, aarch64 Linux, Windows and multi-GPU hosts. The full `scripts/ci.sh --release` and `release-gate.sh --require-cuda` runs on the CUDA host are pending, and the macOS release gate still checks CUDA kernel syntax approximately (no `nvcc` there; an explicit waiver). The remaining open checklist items are in `TODO.md`. (The earlier "cap-of-8" batch-column bug is fixed: the CUDA prefill kernels chunk correctly.)
+- **CUDA limits measured on the A4000.** Q4_0 / Q8_0 / K-quant / FP8 decode uploads each weight matrix on every GEMV (correct but PCIe-bound; a Q8_0 fixture decodes at 3.8–4.0 tok/s on CUDA against 6.2 on the AVX-512 CPU); the Q1 batch prefill is 0.6–0.8x the per-token path; K-quant / FP8 warm-up takes 3–10 s; Ternary-Bonsai-8B holds 5739 MiB of VRAM for a 2081 MiB file. `oxibonsai quantize` keeps the LM head in F32, so its output never takes the CUDA quantized-LM-head paths. A library engine built with a CPU-tier dispatcher still runs FP8 linears on the GPU (`--backend cpu` is unaffected). With a Q1/ternary model the batch prefill keeps the K/V on the device and the per-token path (≤ 16 tokens) reads the host cache, so a following 2–16-token window is refused (`GPU_FALLBACK_REQUIRES_CACHE_REBUILD`); both chunk planners (the engine's, behind the server's 512-token windows, and the model's, behind `--prefill-chunk N` and the default 4096-token plan) fold such a tail into the previous window when the chunk exceeds 16 tokens, so only `--prefill-chunk 2`–`16` or a library caller driving `forward_prefill` with its own windows can hit it (fold verified on the CPU; the CUDA re-run is pending). Run one Q1 model per process: the Q1 weight-cache fingerprint hashes host addresses only. Details in the [changelog](CHANGELOG.md).
 - **`cuda` (scirs2-core) tier is a CPU fallback, not GPU acceleration.** `is_accelerated()` always returns `false` for it because scirs2-core retired its cudarc-based backend in 0.6.x; the dispatcher silently falls back to CPU SIMD. Output is correct — there is no garbage-token risk — it is simply not GPU-accelerated. Use `native-cuda` for NVIDIA throughput.
 - **"True multi-GPU inference" is a rayon CPU simulation of NCCL-style collectives**, not real inter-GPU communication. `multi_gpu.rs`'s types are named `SimulatedDeviceMesh` / `SimulatedCollectives` for that reason, and are not wired into any actual multi-device dispatch path.
 - **"Distributed serving" is an in-memory routing topology, not a networked serving layer.** `distributed.rs` implements consistent-hash-ring request routing and a node registry entirely in-process; its own doc comment states "no actual TCP connections are made."
@@ -551,7 +557,7 @@ Everything below is implemented, tested, and either self-documented in its own m
 **GPU platform coverage**
 
 - **Metal has full Q4_0/Q8_0/K-quant (Q2_K–Q8_K) and FP8 batch-prefill coverage.** Metal GEMV kernels + host dispatch exist for all 8 standard/K-quant formats, and the model-layer `Linear*::forward()` implementations try Metal first before falling back to CPU on any error. Metal FP8 batch prefill is a hybrid design: the heavy linear projections run as batched FP8 GEMMs on the GPU, while q/k-norm, RoPE, attention, and the K/V store stay on the CPU against the same cache per-token decode reads (so it avoids the split-KV-cache bug class by construction). The K-quant GEMV kernels (Metal and CUDA) were *wrong* before 0.2.4 and are now ggml-exact; see the [changelog](CHANGELOG.md).
-- **FP8 CUDA batch prefill is intentionally disabled-by-default (KV-cache-handoff bug fixed 2026-07-20).** The FP8 batch-prefill path wrote the prompt K/V into its own private GPU KV cache, separate from the CPU cache per-token CUDA decode reads — the same bug class found and fixed for Q1/ternary and disabled-by-default for Q4_0/Q8_0/K-quant. It carries the identical split-cache guard: FP8 CUDA batch prefill returns early so `forward_prefill` falls back to the bit-correct sequential per-token path, plus a context-length guard that turns an over-long prompt into a clean `SequenceTooLong` instead of a panic. **Practical impact: none for correctness**; the cost is that FP8 CUDA prompt prefill runs the sequential per-token path. Setting `OXIBONSAI_FORCE_CUDA_SPLIT_PREFILL=1` re-enables the fused (decode-incorrect) path for throughput microbenchmarks only. Tracked in `TODO.md`.
+- **CUDA batch prefill coverage.** Q1, ternary, Q4_0 and Q8_0 prompts of more than 16 tokens at position 0 take the CUDA batch prefill; for Q4_0/Q8_0 it reads the prompt K/V back into the host cache that per-token decode reads (validated as CUDA-P11 on an RTX A4000). Q4_0/Q8_0 prefills at position > 0, and every K-quant or FP8 prefill, take the bit-correct sequential per-token CUDA path: the K-quant and FP8 batch-prefill entry points write a GPU-private KV cache with no read-back (the KV-cache-handoff bug class fixed 2026-07-20), so they refuse by construction, and a context-length guard turns an over-long FP8 prompt into a clean `SequenceTooLong` instead of a panic. **Practical impact: none for correctness**; the cost is that K-quant and FP8 CUDA prompt prefill runs the sequential per-token path. `OXIBONSAI_FORCE_CUDA_SPLIT_PREFILL` is no longer honoured: setting it logs one error and changes nothing. Tracked in `TODO.md`.
 
 **Building blocks implemented and tested, but experimental or not wired into the default forward path**
 

@@ -452,19 +452,16 @@ fn convert_hf_to_gguf_q1_0_g128_and_tq2_0_g128_agree_on_norm_tensors() {
             .tensor_type,
         GgufTensorType::Q1_0_g128
     );
-    // Group-128 ternary is now written as PrismML `PQ2_0` (ggml id **142**,
-    // `d` first), not as the legacy qs-first reuse of id 42. Renumbering
-    // alone would not have been enough — the block struct order had to change
-    // too, since 42-at-34-bytes is a layout no other ggml consumer can read
-    // (core-gguf-02).
-    assert_eq!(
-        gguf_tq2
-            .tensors
-            .require("blk.0.attn_q.weight")
-            .expect("tq2 attn_q present")
-            .tensor_type,
-        GgufTensorType::PQ2_0
-    );
+    // `tq2_0_g128` is written in the runtime-native qs-first layout under
+    // ggml id 42 — the one `run`/`chat`/`serve` execute. The llama.cpp-
+    // readable `d`-first id 142 (core-gguf-02) is opt-in via `pq2_0`; see
+    // `tq2_0_g128_converts_to_native_id_42_and_loads` below.
+    let tq2_attn_q = gguf_tq2
+        .tensors
+        .require("blk.0.attn_q.weight")
+        .expect("tq2 attn_q present");
+    assert_eq!(tq2_attn_q.tensor_type, GgufTensorType::TQ2_0_g128);
+    assert_eq!(tq2_attn_q.tensor_type.wire_id(), 42);
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -662,6 +659,178 @@ fn pq2_0_blocks_are_scale_first() {
     assert_eq!(
         plus_two, 0,
         "a ternary tensor must contain no 0b11 codes; {plus_two} found"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Re-serialise the synthetic model with extra tensors appended (each given
+/// as `(hf_name, data, hf_shape)`), keeping every existing tensor unchanged.
+fn add_tensors_to_synthetic_model(dir: &Path, extra: &[(&str, Vec<f32>, Vec<usize>)]) {
+    let raw = std::fs::read(dir.join("model.safetensors")).expect("read model.safetensors");
+    let parsed = safetensors::SafeTensors::deserialize(&raw).expect("parse model.safetensors");
+
+    let extra_bytes: Vec<(&str, Vec<u8>, Vec<usize>)> = extra
+        .iter()
+        .map(|(name, data, shape)| {
+            let (bytes, shape) = f32_view(data, shape.clone());
+            (*name, bytes, shape)
+        })
+        .collect();
+
+    let mut tensors: HashMap<String, TensorView<'_>> = HashMap::new();
+    for name in parsed.names() {
+        let view = parsed.tensor(name).expect("existing tensor");
+        tensors.insert(name.to_string(), view);
+    }
+    for (name, bytes, shape) in &extra_bytes {
+        tensors.insert(
+            (*name).to_string(),
+            TensorView::new(Dtype::F32, shape.clone(), bytes).expect("extra view"),
+        );
+    }
+
+    safetensors::serialize_to_file(&tensors, None, &dir.join("model.safetensors"))
+        .expect("rewrite model.safetensors");
+}
+
+/// Regression (0.2.4 release blocker): `convert --quant tq2_0_g128` — what
+/// `scripts/download_ternary.sh` runs for the gen-1 Ternary-Bonsai
+/// 1.7B/4B/8B checkpoints — must write the runtime-native qs-first layout
+/// under ggml id 42 (`general.file_type` 41), and the result must load and
+/// run through the production model loader.
+///
+/// For a while `tq2_0_g128` was mapped to PrismML `PQ2_0` (id 142, `d`
+/// first). The runtime decodes that per layer but has no `PQ2_0`
+/// output-projection wrapper, so every freshly converted Ternary-Bonsai GGUF
+/// failed `oxibonsai run` with "no output-projection Linear* kernel
+/// wrapper". The ternary payload of the two spellings is identical — each
+/// `tq2_0_g128` block is the `pq2_0` block rotated left by two bytes — and
+/// that is asserted here as well, so the llama.cpp-readable `pq2_0` output
+/// cannot drift away from the native one.
+#[test]
+fn tq2_0_g128_converts_to_native_id_42_and_loads() {
+    use oxibonsai_kernels::dispatch::{KernelDispatcher, KernelTier};
+    use oxibonsai_model::model::BonsaiModel;
+
+    let dir = unique_temp_dir("hf_tq2_native");
+    write_synthetic_hf_model(&dir);
+    write_synthetic_tokenizer(&dir);
+    // The production qwen3 block loader requires the per-head Q/K RMSNorm
+    // gains, which the minimal fixture leaves out (2 heads → head_dim 64).
+    let head_dim = HIDDEN / 2;
+    add_tensors_to_synthetic_model(
+        &dir,
+        &[
+            (
+                "model.layers.0.self_attn.q_norm.weight",
+                pattern(12, head_dim),
+                vec![head_dim],
+            ),
+            (
+                "model.layers.0.self_attn.k_norm.weight",
+                pattern(13, head_dim),
+                vec![head_dim],
+            ),
+        ],
+    );
+
+    let out_tq2 = dir.join("out_tq2.gguf");
+    let out_pq2 = dir.join("out_pq2.gguf");
+    let stats = oxibonsai_model::convert::convert_hf_to_gguf(&dir, &out_tq2, "tq2_0_g128")
+        .expect("tq2_0_g128 convert");
+    oxibonsai_model::convert::convert_hf_to_gguf(&dir, &out_pq2, "pq2_0").expect("pq2_0 convert");
+
+    let bytes_tq2 = std::fs::read(&out_tq2).expect("read tq2 output");
+    let bytes_pq2 = std::fs::read(&out_pq2).expect("read pq2 output");
+    assert_eq!(
+        bytes_tq2.len(),
+        bytes_pq2.len(),
+        "both layouts are 34 bytes per 128 weights"
+    );
+    let gguf_tq2 = GgufFile::parse(&bytes_tq2).expect("parse tq2 output");
+    let gguf_pq2 = GgufFile::parse(&bytes_pq2).expect("parse pq2 output");
+
+    // ── (a) On disk: ggml id 42, `general.file_type` 41. ──────────────────
+    assert_eq!(
+        gguf_tq2.metadata.get_u32("general.file_type").ok(),
+        Some(41),
+        "PrismML MOSTLY_Q2_0, not MOSTLY_PQ2_0 (141)"
+    );
+    assert_eq!(
+        gguf_pq2.metadata.get_u32("general.file_type").ok(),
+        Some(141)
+    );
+    assert_eq!(
+        gguf_tq2.metadata.get_string("oxibonsai.quant_format").ok(),
+        Some("TQ2_0_G128")
+    );
+
+    const TERNARY_TENSORS: [&str; 9] = [
+        "token_embd.weight",
+        "output.weight",
+        "blk.0.attn_q.weight",
+        "blk.0.attn_k.weight",
+        "blk.0.attn_v.weight",
+        "blk.0.attn_output.weight",
+        "blk.0.ffn_gate.weight",
+        "blk.0.ffn_up.weight",
+        "blk.0.ffn_down.weight",
+    ];
+    assert_eq!(stats.n_ternary, TERNARY_TENSORS.len());
+    for name in TERNARY_TENSORS {
+        let info = gguf_tq2.tensors.require(name).expect("tq2 tensor present");
+        assert_eq!(info.tensor_type, GgufTensorType::TQ2_0_g128, "{name}");
+        assert_eq!(info.tensor_type.wire_id(), 42, "{name}");
+        let pq2_info = gguf_pq2.tensors.require(name).expect("pq2 tensor present");
+        assert_eq!(pq2_info.tensor_type, GgufTensorType::PQ2_0, "{name}");
+
+        let t = gguf_tq2.tensor_data(name).expect("tq2 data");
+        let p = gguf_pq2.tensor_data(name).expect("pq2 data");
+        assert_eq!(t.len(), p.len(), "{name}");
+        let (t_blocks, t_tail) = t.as_chunks::<34>();
+        let (p_blocks, p_tail) = p.as_chunks::<34>();
+        assert!(
+            !t_blocks.is_empty() && t_tail.is_empty() && p_tail.is_empty(),
+            "{name}: {} bytes is not a whole number of 34-byte blocks",
+            t.len()
+        );
+        for (i, (tb, pb)) in t_blocks.iter().zip(p_blocks).enumerate() {
+            assert_eq!(&tb[..32], &pb[2..], "{name} block {i}: codes must match");
+            assert_eq!(&tb[32..], &pb[..2], "{name} block {i}: scale must match");
+        }
+        // qs first, `d` last: the scale is the block's final two bytes.
+        let scale = half::f16::from_bits(u16::from_le_bytes([t[32], t[33]])).to_f32();
+        assert!(
+            scale.is_finite() && scale > 0.0,
+            "{name}: TQ2_0_g128 block must end with a positive f16 scale, read {scale}"
+        );
+    }
+    for name in [
+        "output_norm.weight",
+        "blk.0.attn_norm.weight",
+        "blk.0.ffn_norm.weight",
+        "blk.0.attn_q_norm.weight",
+        "blk.0.attn_k_norm.weight",
+    ] {
+        assert_eq!(
+            gguf_tq2.tensor_data(name).expect("tq2 norm"),
+            gguf_pq2.tensor_data(name).expect("pq2 norm"),
+            "{name} must be byte-identical across the two ternary spellings"
+        );
+    }
+
+    // ── (b) It loads and runs through the production loader. ──────────────
+    let mut model = BonsaiModel::from_gguf(&gguf_tq2, 512)
+        .unwrap_or_else(|e| panic!("a tq2_0_g128 conversion must load, got: {e}"));
+    let kernel = KernelDispatcher::with_tier(KernelTier::Reference);
+    let logits = model
+        .forward(0, 0, &kernel)
+        .expect("forward pass through the TQ2_0_g128 blocks and LM head");
+    assert_eq!(logits.len(), VOCAB);
+    assert!(
+        logits.iter().all(|v| v.is_finite()),
+        "every logit must be finite"
     );
 
     std::fs::remove_dir_all(&dir).ok();

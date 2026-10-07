@@ -5,7 +5,7 @@ pub mod types;
 
 // Re-export all types
 #[cfg(any(
-    feature = "metal",
+    all(feature = "metal", target_os = "macos"),
     all(
         feature = "native-cuda",
         any(target_os = "linux", target_os = "windows")

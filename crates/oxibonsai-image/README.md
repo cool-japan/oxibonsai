@@ -183,13 +183,20 @@ For the full step-by-step walkthrough see [`docs/IMAGEN.md`](../../docs/IMAGEN.m
 ## Performance
 
 Measured at 512×512, 4 Euler steps, FP32 accumulate throughout (no TF32/FP16-MAC
-shortcuts, preserving cosine ≥ 0.999 parity):
+shortcuts, preserving cosine ≥ 0.999 parity on the paths validated against the MLX
+reference):
 
 | Platform | Backend | Time / image |
 |----------|---------|-------------|
 | Apple Silicon (M3-class) | Metal (default-on GPU) | ≈ 52–62 s |
-| NVIDIA A4000-class | CUDA | ≈ 31.7 s |
+| NVIDIA RTX A4000 | CUDA, `OXI_TE_GPU=1` | ≈ 38 s (0.2.4, 2026-10-07; text encoder 18.3 s, DiT 11.9 s, VAE 6.5 s) |
 | Any | CPU only (Rayon + NEON) | ≈ 10–15 min |
+
+The CUDA row is one smoke render on one RTX A4000 (CUDA 12.0, x86_64 Linux); it
+reproduced a prior render at PSNR 76-78 dB (max abs diff 1/255) and is not a
+golden-parity run. With the text encoder on the CPU (the default) the same run took
+≈ 697 s on a saturated 8-core host. An earlier release reported ≈ 31.7 s on an
+A4000-class GPU; that figure was not re-measured.
 
 GPU acceleration is composed of three independently validated kernels: v10 TQ2
 ternary GEMM (≈3.8× over v9), joint flash-attention (≈5.47× over CPU, simdgroup

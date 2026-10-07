@@ -140,8 +140,9 @@ pub use gpu_backend::{
     any(target_os = "linux", target_os = "windows")
 ))]
 pub use gpu_backend::{
-    cuda_gemv_fp8_e4m3, cuda_gemv_fp8_e5m2, cuda_gemv_q4_0, cuda_gemv_q8_0, try_cuda_ffn,
-    try_cuda_full_forward, try_cuda_full_forward_ternary,
+    cuda_gemv_fp8_e4m3, cuda_gemv_fp8_e5m2, cuda_gemv_q4_0, cuda_gemv_q8_0,
+    cuda_prefill_gate_up_swiglu_q_std, cuda_prefill_gemm_q_std, cuda_prefill_gemv_q_std,
+    try_cuda_ffn, try_cuda_full_forward, try_cuda_full_forward_ternary,
     try_cuda_full_forward_ternary_with_gpu_lm_head, try_cuda_full_forward_with_gpu_lm_head,
     try_cuda_full_layer, try_cuda_prefill, try_cuda_prefill_q_std, try_cuda_prefill_ternary,
     try_cuda_qkv, CudaCachedLayerWeights, CudaFullForwardLayerParams,

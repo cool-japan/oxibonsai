@@ -7,7 +7,7 @@ Q1_0_g128 (1-bit), TQ2_0_g128 (ternary) and Bonsai 2 (PQ2_0 / PTQ1_0 / group-64 
 Implements the full compute stack for sub-2-bit inference: scalar
 reference kernels, SIMD-accelerated tiers (AVX2+FMA, AVX-512, NEON), tiled
 cache-blocked GEMM, parallel Rayon dispatch, and production GPU backends
-(Metal fused full-forward and the hybrid runner, native CUDA via NVRTC — unvalidated on hardware in this release — plus scirs2-core backend).
+(Metal fused full-forward and the hybrid runner, native CUDA via NVRTC — run on one RTX A4000 (CUDA 12.0, x86_64 Linux) in this release; the Bonsai 2 hybrid kernels have no CUDA forward and were not run, apart from a partial PQ2_0 GEMV check (CUDA-P09) — plus scirs2-core backend).
 
 Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 
@@ -27,7 +27,7 @@ Part of the [OxiBonsai](https://github.com/cool-japan/oxibonsai) project.
 - `OneBitKernel` and `TernaryKernel` traits unified through `KernelDispatcher`
 - GPU backend trait (`GpuBackendTrait`) with three concrete paths:
   - **Metal**: fused full-forward TQ2 path (single command buffer) — ~50 tok/s on 1.7B ternary (~13× speedup); standalone GEMV kernels for Q4_0/Q8_0 and K-quant (Q2_K–Q8_K), dispatched per layer by `oxibonsai-model`'s `Linear*::forward()` before it falls back to CPU
-  - **Native CUDA**: NVRTC-compiled kernels with CUDA Graph execution (multi-encoding pass); prefill path with dedicated attention kernels for KV-cache population; per-position GEMV kernels also cover Q4_0/Q8_0, K-quant, and FP8 — batched-prefill kernels exist for these formats too, but are not called by default (split-KV-cache gap, same class as the Q1/ternary cap-of-8 issue in the TODO), so the sequential per-position path runs instead
+  - **Native CUDA**: NVRTC-compiled kernels with CUDA Graph execution (multi-encoding pass); prefill path with dedicated attention kernels for KV-cache population; per-position GEMV kernels also cover Q4_0/Q8_0, K-quant, and FP8 — batched-prefill kernels exist for these formats; the Q4_0/Q8_0 batch prefill runs for prompts of more than 16 tokens at position 0, with a K/V read-back into the host cache (CUDA-P11, RTX A4000), while K-quant and FP8 prefill stay on the sequential per-position path. The Q4_0/Q8_0/K-quant/FP8 decode GEMVs upload the weight matrix on every call, so they can be slower than an AVX-512 CPU
   - **scirs2-core backend**: portable CUDA/Metal via `scirs2-core::gpu`
 
 ## SIMD Tiers

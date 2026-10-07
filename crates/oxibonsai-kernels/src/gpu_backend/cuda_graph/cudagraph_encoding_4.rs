@@ -16,8 +16,11 @@
 //! weight buffer that is not exactly `n_rows * (k / 128) * 34` bytes — as
 //! [`CudaGraphError::InvalidDimensions`] before any launch.
 //!
-//! **CUDA is unvalidated**: no CUDA hardware has run the launches below, so
-//! every one is compile-checked only.
+//! Hardware status (RTX A4000, CUDA 12.0, 2026-10-07): the `TQ2_0_g128` GEMV
+//! passed CUDA-P18 (every real projection of Ternary-Bonsai-1.7B
+//! and 8B, cos 1.0). The `PQ2_0` GEMV is CUDA-P09 **partial**: 450 GEMVs on
+//! real `PQ2_0` weights matched the CPU, but those files hold no `+2` codes,
+//! so the `0b11 -> +2.0` decode is not yet run on CUDA hardware.
 
 use cudarc::driver::{CudaFunction, CudaSlice, LaunchConfig, PushKernelArg};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -474,7 +477,10 @@ impl CudaGraph {
     /// As [`Self::encode_gemv_tq2_cached`] — including the refusal of a
     /// cached buffer that is not exactly `n_rows * (k / 128) * 34` bytes.
     ///
-    /// **CUDA is unvalidated**: no CUDA hardware has run this GEMV.
+    /// Hardware status (RTX A4000, CUDA 12.0, 2026-10-07): CUDA-P09
+    /// **partial** — 450 GEMVs on real `PQ2_0` weights matched the CPU
+    /// `gemv_pq2_0` (cos 1.0), but those files hold no `+2` codes, so the
+    /// `0b11 -> +2.0` decode is not yet run on CUDA hardware.
     pub fn encode_gemv_pq2_cached(
         &self,
         weight_id: u64,

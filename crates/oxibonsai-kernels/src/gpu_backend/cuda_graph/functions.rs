@@ -2,8 +2,10 @@
 //!
 //! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
 
-//! **UNVALIDATED on hardware.** This project has no CUDA device, so every
-//! CUDA path in this module is compile-checked only (see `scripts/check_cuda.sh`).
+//! Run on hardware (RTX A4000, CUDA 12.0, 2026-10-07): the eager NVRTC
+//! compile through the PTX artifact cache and `CudaGraph::global()`
+//! initialisation (Step 3a) and this module's kernel tests (Step 3c).
+//! `scripts/check_cuda.sh` stays the syntax gate on hosts without nvcc.
 
 use cudarc::nvrtc::compile_ptx;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};

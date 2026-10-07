@@ -281,11 +281,12 @@ pub struct InferenceEngine<'a> {
     /// Prefill chunk size, or `None` (default) for a single batched prefill
     /// call.
     ///
-    /// `Some(n)` splits a prompt into `n`-token prefill calls so an armed
-    /// [`CancellationToken`] is observed *during* a long prefill rather than
-    /// only after it. Left `None` by default so the shipping prefill path —
-    /// including its batched GPU kernels — stays byte-for-byte the one the
-    /// determinism gates measure.
+    /// `Some(n)` splits a prompt into `n`-token prefill calls (a short final
+    /// window folded into the one before it, see [`plan_prefill_chunks`]) so
+    /// an armed [`CancellationToken`] is observed *during* a long prefill
+    /// rather than only after it. Left `None` by default so the shipping
+    /// prefill path — including its batched GPU kernels — stays byte-for-byte
+    /// the one the determinism gates measure.
     prefill_chunk_tokens: Option<usize>,
     /// Whether this engine's model decodes through the fused Metal graph
     /// (`MET-M1`), decided from the GGUF's quantization layout at load time.
@@ -996,10 +997,13 @@ impl<'a> InferenceEngine<'a> {
             // (`init_prefill_modules`) and pre-allocate the prefill KV cache,
             // single-token attention buffers, and activation buffers.
             // We use 17 tokens so the CUDA batch prefill code path is exercised
-            // (prompts ≤ 16 tokens use the fast decode-graph path instead).
+            // (prompts of at most `PREFILL_PER_TOKEN_MAX_TOKENS` = 16 tokens use
+            // the fast decode-graph path instead).
             // This ensures all one-time batch-prefill setup costs are paid before
             // the benchmark timer, covering longer prompts without a cold-start penalty.
-            let _ = model.forward_prefill(&[0u32; 17], 0, &kernel);
+            const WARMUP_PREFILL_TOKENS: usize =
+                oxibonsai_model::chunked_prefill::PREFILL_PER_TOKEN_MAX_TOKENS + 1;
+            let _ = model.forward_prefill(&[0u32; WARMUP_PREFILL_TOKENS], 0, &kernel);
             tracing::info!("CUDA warmup complete");
         }
 
@@ -1399,11 +1403,21 @@ impl<'a> InferenceEngine<'a> {
         self.prefill_chunk_tokens
     }
 
-    /// Split prefill into chunks of at most `tokens` so an armed
+    /// Split prefill into chunks of `tokens` so an armed
     /// [`CancellationToken`] is observed *during* a long prompt ingest.
     ///
     /// `None` (the default) keeps the single-call prefill the determinism
-    /// gates measure. `Some(0)` is treated as `None`.
+    /// gates measure. `Some(0)` is treated as `None`. When `tokens` exceeds
+    /// [`PREFILL_PER_TOKEN_MAX_TOKENS`](oxibonsai_model::chunked_prefill::PREFILL_PER_TOKEN_MAX_TOKENS)
+    /// (16), a final chunk of at most 16 tokens is folded into the one
+    /// before it, so the last call can hold up to `tokens + 16` tokens and a
+    /// prompt of at most `tokens + 16` tokens runs in one call: a GPU-tier
+    /// dense model would otherwise run that short tail on its per-token
+    /// path, which native CUDA refuses for a Q1 or ternary model after a
+    /// batched chunk (F-3,
+    /// [`prefill_chunk_windows`](oxibonsai_model::chunked_prefill::prefill_chunk_windows)).
+    /// The model applies the same rule to its own chunk size
+    /// (`BonsaiModel::set_prefill_chunk_tokens`).
     ///
     /// Intended for a server that also arms a cancellation token: a 2.5 k
     /// prompt can spend tens of seconds in prefill, during which a
@@ -1660,8 +1674,10 @@ impl<'a> InferenceEngine<'a> {
     /// Returns `Ok(None)` when cancellation was observed before the prompt
     /// was fully ingested (no logits exist yet, so the caller returns an
     /// empty completion). With [`prefill_chunk_tokens`](Self::prefill_chunk_tokens)
-    /// unset — the default — this is exactly the single
-    /// `forward_prefill(prompt, 0, kernel)` call it replaces.
+    /// unset — the default — or at least the prompt length, this is exactly
+    /// the single `forward_prefill(prompt, 0, kernel)` call it replaces;
+    /// otherwise the prompt is prefilled in the windows
+    /// [`plan_prefill_chunks`] cuts, each at its own start position.
     pub(crate) fn prefill_for_generate(
         &mut self,
         prompt_tokens: &[u32],
@@ -1672,26 +1688,25 @@ impl<'a> InferenceEngine<'a> {
             return Ok(None);
         }
 
-        let chunk = self
-            .prefill_chunk_tokens
-            .filter(|&n| n > 0 && n < prompt_tokens.len());
+        let windows =
+            plan_prefill_chunks(prompt_tokens.len(), self.prefill_chunk_tokens.unwrap_or(0));
 
-        let logits = match chunk {
-            None => self.prefill_logits(prompt_tokens, 0)?,
-            Some(chunk) => {
-                let mut last = Vec::new();
-                for (i, window) in prompt_tokens.chunks(chunk).enumerate() {
-                    if self.is_cancelled() {
-                        tracing::debug!(
-                            chunk_index = i,
-                            "cancelled during chunked prefill; abandoning the prompt"
-                        );
-                        return Ok(None);
-                    }
-                    last = self.prefill_logits(window, i * chunk)?;
+        let logits = if windows.len() == 1 {
+            self.prefill_logits(prompt_tokens, 0)?
+        } else {
+            let mut last = Vec::new();
+            for (i, window) in windows.into_iter().enumerate() {
+                if self.is_cancelled() {
+                    tracing::debug!(
+                        chunk_index = i,
+                        "cancelled during chunked prefill; abandoning the prompt"
+                    );
+                    return Ok(None);
                 }
-                last
+                let pos_start = window.start;
+                last = self.prefill_logits(&prompt_tokens[window], pos_start)?;
             }
+            last
         };
 
         if let Some(m) = &self.metrics {
@@ -1719,6 +1734,29 @@ impl<'a> InferenceEngine<'a> {
     pub fn session_count(&self) -> u64 {
         self.stats.requests_completed()
     }
+}
+
+/// Cut a `prompt_len`-token prompt into the contiguous windows
+/// [`InferenceEngine::prefill_for_generate`] prefills one call each.
+///
+/// This is the model crate's own planner,
+/// [`oxibonsai_model::chunked_prefill::prefill_chunk_windows`]: the windows
+/// of `prompt.chunks(chunk)`, except that when `chunk` exceeds
+/// [`PREFILL_PER_TOKEN_MAX_TOKENS`](oxibonsai_model::chunked_prefill::PREFILL_PER_TOKEN_MAX_TOKENS)
+/// (16) a final window of 1..=16 tokens is merged into the window
+/// before it, which then holds at most `chunk + 16` tokens. A GPU-tier dense
+/// model runs a window of at most that many tokens on its per-token path,
+/// which reads the host KV cache, so after a window the CUDA batch prefill
+/// served (whose K/V stays in the device cache) a Q1 or ternary model
+/// refuses a 2..=16-token tail with `GpuFallbackRequiresCacheRebuild` (a
+/// 513..=528-token prompt under the servers' 512-token chunk, F-3). With
+/// `chunk <= 16` the plan is exactly `chunks(chunk)`.
+///
+/// `chunk == 0` or `chunk >= prompt_len` gives the single window
+/// `0..prompt_len` (for an empty prompt too, so the model reports its own
+/// empty-prompt error exactly as the unchunked call does).
+fn plan_prefill_chunks(prompt_len: usize, chunk: usize) -> Vec<std::ops::Range<usize>> {
+    oxibonsai_model::chunked_prefill::prefill_chunk_windows(prompt_len, chunk)
 }
 
 // The generation entry points (`batch_generate`, `generate`,

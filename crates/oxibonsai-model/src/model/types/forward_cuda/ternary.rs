@@ -5,14 +5,37 @@ use super::super::{BonsaiModel, OutputWeight};
 use crate::block::blocks_as_bytes_ternary;
 
 impl<'a> BonsaiModel<'a> {
-    /// Build per-layer ternary QKV byte concatenations for the CUDA ternary path.
+    /// Get or build this model's cached per-layer ternary Q‖K‖V byte
+    /// concatenations for the CUDA ternary path (the ternary twin of the Q1
+    /// path's `get_or_build_cuda_qkv_cache`).
     ///
-    /// Each layer's Q, K, V TQ2 block bytes are concatenated in that order.
-    /// Built fresh on each call (no caching needed — the GPU weight cache handles
-    /// upload deduplication via handle IDs).
-    pub(super) fn build_cuda_ternary_qkv_concats(
+    /// Each layer's Q, K, V TQ2 block bytes are concatenated in that order,
+    /// **once per model**: the first call builds and stores them in
+    /// `cuda_ternary_qkv_cache`, every later call (every decode token, every
+    /// prefill chunk) returns the same allocation.
+    ///
+    /// This used to be rebuilt on every call (~6.7 MB per layer, ~240 MB per
+    /// token for `Ternary-Bonsai-8B`), and the kernels' weight-set fingerprint
+    /// hashed the concatenation's heap address. On a streaming worker thread
+    /// (`oxibonsai run`) `malloc` put it somewhere else on every call, so every
+    /// decode token evicted, re-uploaded (1.85 GB) and re-captured the whole
+    /// cached CUDA weight set. The fingerprint no longer hashes that address
+    /// (`oxibonsai-kernels`' `ternary_model_weights_fingerprint`); caching here
+    /// also makes the address stable — the invariant the Q1 path always had —
+    /// and drops the per-token allocation and copy.
+    ///
+    /// Kept separate from the Q1 `cuda_qkv_cache` so a Q1 and a ternary layer
+    /// set can never be handed each other's bytes.
+    pub(super) fn get_or_build_cuda_ternary_qkv_cache(
         &self,
-    ) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
+    ) -> Result<std::sync::Arc<Vec<Vec<u8>>>, Box<dyn std::error::Error>> {
+        let mut guard = self
+            .cuda_ternary_qkv_cache
+            .lock()
+            .map_err(|e| format!("cuda_ternary_qkv_cache lock: {e}"))?;
+        if let Some(ref cache) = *guard {
+            return Ok(std::sync::Arc::clone(cache));
+        }
         let n_layers = self.blocks.len();
         let mut qkv_concats: Vec<Vec<u8>> = Vec::with_capacity(n_layers);
         for block in &self.blocks {
@@ -37,7 +60,9 @@ impl<'a> BonsaiModel<'a> {
             concat.extend_from_slice(v_bytes);
             qkv_concats.push(concat);
         }
-        Ok(qkv_concats)
+        let arc = std::sync::Arc::new(qkv_concats);
+        *guard = Some(std::sync::Arc::clone(&arc));
+        Ok(arc)
     }
 
     /// This model's CUDA ternary slot namespace: the composition over its
@@ -182,7 +207,7 @@ impl<'a> BonsaiModel<'a> {
         let lm_head_bytes = blocks_as_bytes_ternary(lm_head_ternary.blocks());
         let lm_head_out_features = lm_head_ternary.out_features();
 
-        let qkv_concats = self.build_cuda_ternary_qkv_concats()?;
+        let qkv_concats = self.get_or_build_cuda_ternary_qkv_cache()?;
         let layer_params = self.build_cuda_ternary_layer_params(&qkv_concats)?;
 
         let mut logits = vec![0.0f32; lm_head_out_features];
@@ -260,7 +285,7 @@ impl<'a> BonsaiModel<'a> {
         let lm_head_bytes = blocks_as_bytes_ternary(lm_head_ternary.blocks());
         let lm_head_out_features = lm_head_ternary.out_features();
 
-        let qkv_concats = self.build_cuda_ternary_qkv_concats()?;
+        let qkv_concats = self.get_or_build_cuda_ternary_qkv_cache()?;
         let layer_params = self.build_cuda_ternary_layer_params(&qkv_concats)?;
 
         let mut token_ids_out: Vec<u32> = Vec::with_capacity(batch_size);
@@ -305,5 +330,118 @@ impl<'a> BonsaiModel<'a> {
             token_ids_out.push(greedy_id);
         }
         Ok(token_ids_out)
+    }
+}
+
+/// Host-only: none of these touch a CUDA device (building the concatenation
+/// and the layer parameters is pure host work, and `BonsaiModel`'s CUDA
+/// `Drop` returns early when no CUDA context was ever opened).
+#[cfg(test)]
+mod tests {
+    use super::super::super::prefill_cpu::tests::{ternary_fixture, tiny_config};
+    use super::super::super::BonsaiModel;
+    use crate::block::blocks_as_bytes_ternary;
+    use std::sync::Arc;
+
+    /// Ternary decode thrash regression, model half (`oxibonsai run` on
+    /// `Ternary-Bonsai-8B`: every decode token re-uploaded the 1.85 GB weight
+    /// set and re-captured the CUDA graph). The Q‖K‖V concatenation the CUDA
+    /// ternary path hands the kernels must be built once per model, so every
+    /// call sees the same buffers at the same addresses under the same
+    /// epoch-composed handles — while another load of the same file gets its
+    /// own buffers and handles, so a model swap still rebuilds (F-M1/F-M3).
+    #[test]
+    fn ternary_qkv_cache_is_built_once_and_address_stable() {
+        let model = ternary_fixture(tiny_config(3));
+        let first = model
+            .get_or_build_cuda_ternary_qkv_cache()
+            .expect("ternary model builds its Q‖K‖V cache");
+        let second = model
+            .get_or_build_cuda_ternary_qkv_cache()
+            .expect("second call hits the cache");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the concatenation must be built once per model, not per call"
+        );
+        assert_eq!(first.len(), model.blocks.len());
+
+        // Content: each layer's Q, K, V block bytes, in that order.
+        for (block, concat) in model.blocks.iter().zip(first.iter()) {
+            let q = blocks_as_bytes_ternary(block.attn_q_blocks_ternary().expect("ternary q"));
+            let k = blocks_as_bytes_ternary(block.attn_k_blocks_ternary().expect("ternary k"));
+            let v = blocks_as_bytes_ternary(block.attn_v_blocks_ternary().expect("ternary v"));
+            assert_eq!(concat.len(), q.len() + k.len() + v.len());
+            assert_eq!(&concat[..q.len()], q);
+            assert_eq!(&concat[q.len()..q.len() + k.len()], k);
+            assert_eq!(&concat[q.len() + k.len()..], v);
+        }
+
+        // Two "decode tokens": identical weight-set identity.
+        let call_a = model
+            .build_cuda_ternary_layer_params(&first)
+            .expect("layer params, call a");
+        let call_b = model
+            .build_cuda_ternary_layer_params(&second)
+            .expect("layer params, call b");
+        assert_eq!(call_a.len(), call_b.len());
+        for (a, b) in call_a.iter().zip(&call_b) {
+            assert_eq!(a.fused_qkv_bytes.as_ptr(), b.fused_qkv_bytes.as_ptr());
+            assert_eq!(a.fused_qkv_bytes.len(), b.fused_qkv_bytes.len());
+            assert_eq!(
+                [
+                    a.fused_qkv_handle,
+                    a.attn_proj_handle,
+                    a.gate_up_handle,
+                    a.down_handle
+                ],
+                [
+                    b.fused_qkv_handle,
+                    b.attn_proj_handle,
+                    b.gate_up_handle,
+                    b.down_handle
+                ]
+            );
+            assert_eq!(
+                [
+                    a.attn_norm_handle,
+                    a.q_norm_handle,
+                    a.k_norm_handle,
+                    a.ffn_norm_handle
+                ],
+                [
+                    b.attn_norm_handle,
+                    b.q_norm_handle,
+                    b.k_norm_handle,
+                    b.ffn_norm_handle
+                ]
+            );
+        }
+
+        // Another load: its own buffers and its own handle namespace.
+        let other = ternary_fixture(tiny_config(3));
+        let other_cache = other
+            .get_or_build_cuda_ternary_qkv_cache()
+            .expect("second model builds its own cache");
+        assert!(!Arc::ptr_eq(&first, &other_cache));
+        let other_params = other
+            .build_cuda_ternary_layer_params(&other_cache)
+            .expect("layer params, other model");
+        for (a, o) in call_a.iter().zip(&other_params) {
+            assert_ne!(a.fused_qkv_handle, o.fused_qkv_handle);
+            assert_ne!(a.attn_norm_handle, o.attn_norm_handle);
+        }
+    }
+
+    /// A non-ternary model is refused, and the refusal is not cached: the
+    /// slot stays empty rather than holding a partial concatenation.
+    #[test]
+    fn ternary_qkv_cache_refuses_a_q1_model_without_caching() {
+        let model = BonsaiModel::new_for_testing_with_blocks(tiny_config(2));
+        assert!(model.get_or_build_cuda_ternary_qkv_cache().is_err());
+        assert!(model
+            .cuda_ternary_qkv_cache
+            .lock()
+            .expect("cache lock")
+            .is_none());
     }
 }

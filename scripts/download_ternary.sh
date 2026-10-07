@@ -10,6 +10,11 @@
 # 8b/4b/1.7b: PrismML publishes the original Ternary Bonsai models as
 # *unpacked safetensors* — this downloads the shards and runs
 # `oxibonsai convert --quant tq2_0_g128` locally to produce the GGUF.
+# `tq2_0_g128` writes OxiBonsai's native group-128 ternary layout (`qs`
+# first, ggml type id 42, general.file_type 41) — the one `oxibonsai run`
+# executes; `--quant pq2_0` would write the same ternary data as PrismML
+# PQ2_0 (id 142, `d` first), which llama.cpp reads but this release cannot
+# run for these qwen3 models.
 #
 # 27b[-ptq1_0|-pq2_0|-q2_0|-all]: PrismML's newer Bonsai 2 27B release
 # (2026-09-17) ships as pre-quantized GGUF directly — three language-model

@@ -1279,11 +1279,14 @@ pub(crate) enum Commands {
         to: String,
 
         /// Quantization format: "tq2_0_g128" (default, ternary
-        /// {-1,0,+1}, group 128), "q1_0_g128" (1-bit sign + FP16 group
-        /// scale), "pq2_0" (PrismML 2-bit ternary, ggml id 142),
-        /// "ptq1_0" (PrismML 1.75-bit ternary, ggml id 143) or "q2_0_g64"
-        /// (mainline group-64 Q2_0). Any other value is rejected with an
-        /// error before any work is done.
+        /// {-1,0,+1}, group 128, OxiBonsai's native qs-first layout under
+        /// ggml id 42 — the one `run`/`chat`/`serve` execute),
+        /// "q1_0_g128" (1-bit sign + FP16 group scale), "pq2_0" (the same
+        /// ternary data in PrismML's d-first layout, ggml id 142, readable
+        /// by the PrismML llama.cpp fork; this build cannot run a qwen3
+        /// model stored that way), "ptq1_0" (PrismML 1.75-bit ternary, ggml
+        /// id 143) or "q2_0_g64" (mainline group-64 Q2_0). Any other value
+        /// is rejected with an error before any work is done.
         #[arg(long, default_value = "tq2_0_g128")]
         quant: String,
 

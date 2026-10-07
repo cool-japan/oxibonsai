@@ -8,7 +8,7 @@ use oxibonsai_kernels::traits::OneBitKernel;
 use std::time::Instant;
 
 #[cfg(any(
-    feature = "metal",
+    all(feature = "metal", target_os = "macos"),
     all(
         feature = "native-cuda",
         any(target_os = "linux", target_os = "windows")
@@ -184,8 +184,9 @@ fn cuda_tq2_soa_len_bytes(total_rows: usize, k: usize) -> Option<usize> {
 /// The upload registers under `model_epoch` — the block's namespace epoch,
 /// i.e. its model's `cuda_model_epoch` — so the model's drop releases it.
 ///
-/// **Compile-blind**: this host has no CUDA. Type-checked against the real API
-/// by cross-compiling to `x86_64-unknown-linux-gnu`; never executed.
+/// Not yet run on CUDA hardware by a dedicated test: no hardware test
+/// targeted this per-block wrapper. The TQ2 GEMV it launches passed CUDA-P18 on the real fused
+/// Q‖K‖V and gate‖up shapes (RTX A4000, CUDA 12.0, 2026-10-07).
 #[cfg(all(
     feature = "native-cuda",
     not(all(feature = "metal", target_os = "macos")),

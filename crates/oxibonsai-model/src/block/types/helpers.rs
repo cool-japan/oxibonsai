@@ -200,8 +200,8 @@ impl<'a> TransformerBlock<'a> {
     /// share one buffer per norm, and no norm slot can equal the final-norm
     /// slot (they used to: this path keyed layer 0's attention norm on
     /// `2_000_000`, the literal the full-forward path used for the final
-    /// norm, in the same `f32` cache). **Compile-blind** (no CUDA device on
-    /// the development host).
+    /// norm, in the same `f32` cache). Not yet run on CUDA hardware by a
+    /// dedicated test: no hardware test targeted this per-block path.
     #[cfg(all(
         feature = "native-cuda",
         not(all(feature = "metal", target_os = "macos")),

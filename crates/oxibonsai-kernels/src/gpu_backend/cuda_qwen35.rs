@@ -3,8 +3,10 @@
 //! [`super::kernel_sources::cuda_qwen35_kernels`], and transcodes `PTQ1_0`
 //! (ggml 143) weights into the existing ternary GEMV's SoA layout.
 //!
-//! **CUDA is UNVALIDATED.** No CUDA hardware ran any of the launches below:
-//! every one is transcribed from the CPU/Metal reference
+//! **Not yet run on CUDA hardware.** The one CUDA validation run so far (RTX
+//! A4000, CUDA 12.0, 2026-10-07) had no Bonsai 2 27B files, so none of the
+//! launches below ran (CUDA-P01..P08, P10): every one is transcribed from the
+//! CPU/Metal reference
 //! (`oxibonsai_model::hybrid::metal`, `kernel_sources::qwen35`) and is
 //! compile-checked only (`cargo check --target x86_64-unknown-linux-gnu
 //! --features native-cuda`) plus `scripts/check_cuda.sh`'s kernel-source

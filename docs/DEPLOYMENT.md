@@ -724,8 +724,10 @@ ignored without an error — check spelling against it.
       `OXIBONSAI_LOG_LEVEL` set as appropriate for the binary.
 - [ ] No stray `.env` in the working directory of the `oxibonsai` binary or any
       parent of it (it is loaded silently; see [Security notes](#security-notes)).
-- [ ] A GPU build (`--features metal`) only on a host that has been validated for it;
-      a `native-cuda` build is **unvalidated in this release**.
+- [ ] A GPU build (`--features metal` or `native-cuda`) only on a host that has been
+      validated for it; `native-cuda` has been run on one RTX A4000 only (Ampere,
+      compute capability 8.6, CUDA 12.0, x86_64 Linux, 2026-10-07), and not on other GPU
+      generations, aarch64 Linux, Windows or multi-GPU hosts.
 - [ ] `--allow-image-url-fetch` left off unless clients must send images by URL;
       when on, the allowlist names only the intranet hosts that need it.
 
@@ -744,6 +746,24 @@ ignored without an error — check spelling against it.
   capability (text-to-image on the real Bonsai-Image weights) is not required by
   any gate flag and self-skips on a host without those weights; the image
   pipeline is covered by its own parity tests and examples, not by the gate.
+- **CUDA, as measured on one RTX A4000 (CUDA 12.0, x86_64 Linux, 2026-10-07).**
+  The `Q4_0` / `Q8_0` / K-quant / FP8 CUDA decode uploads each weight matrix on every
+  GEMV (correct, but PCIe-bound: a `Q8_0` fixture decoded at 3.8-4.0 tok/s on the GPU
+  against 6.2 tok/s on the AVX-512 CPU). The Q1 batch prefill ran at 0.6-0.8x the
+  per-token CUDA path on that GPU. A K-quant or FP8 model's CUDA warm-up runs a
+  17-token sequential prefill (3-10 s at load). The 8B ternary model held 5739
+  MiB of VRAM for a 2081 MiB file. FP8 linears keep the dispatcher chosen at load,
+  so an engine forced to the reference kernel tier still runs the CUDA FP8 GEMV
+  (`--backend cpu` is unaffected).
+  With a Q1 or ternary model, a 2-16-token prefill window after a device-KV batch
+  chunk is refused (`GPU_FALLBACK_REQUIRES_CACHE_REBUILD`); `run`, `chat` and `serve`
+  never emit one unless `--prefill-chunk` is 2-16 (both chunk planners fold such a
+  tail into the previous window when the chunk exceeds 16 tokens, as of 0.2.4;
+  verified on the CPU, CUDA re-run pending), but a library caller that drives
+  `forward_prefill` with its own windows can.
+- **`oxibonsai quantize` keeps the LM head F32**, so its `Q4_0` / `Q8_0` / K-quant /
+  FP8 output never reaches the CUDA branches of those formats; see
+  [`docs/CLI.md`](CLI.md#quantize).
 
 ---
 
@@ -761,7 +781,7 @@ elsewhere; it is a reference, weaker than `scripts/ci.sh`, and nothing runs it.
 |--------|--------------|
 | `scripts/ci.sh` | The single local gate. 21 stages, in order: `fmt`, `build-default`, `build-all-features`, `facade-image`, `facade-metal`, `facade-server-metal-image`, `clippy-all-features`, `clippy-default` (both `-D warnings`), `nextest-all-features`, `nextest-default`, `doctests`, `docs-build`, `docs-strict` (rustdoc `-D warnings`), `deny`, `pure-rust`, `cuda-syntax`, `wasm-tokenizer`, `llvm-cov`, `tmp-hardcode-advisory`, `real-model-legacy`, `real-model-bonsai2`. `--list` names the stages, `--only <stage>` runs one (refused together with `--release`, except `--only cuda-syntax`, whose run ends labelled as a partial run), `--release` makes a missing tool fail the run instead of skipping, `--accept-approximate-cuda-syntax` (only with `--release`, for a host without the CUDA toolkit) lets `cuda-syntax` pass on an approximate check and says so in the Summary, `--with-models` runs the last two real-model stages. |
 | `scripts/preflight.sh` | A fast pre-push subset. `--install-hook` installs it as the git pre-push hook (`--uninstall-hook` removes it). |
-| `scripts/release-gate.sh` | `ci.sh --release` plus the hardware-capability check and the real-model legs, strictly one binary at a time. Stage 0 builds the `--all-features` release CLI once and exports `OXIBONSAI_CLI_BIN` for every later stage (a value already in the environment is overridden). The real-model legs — legacy dense parity, dense embeddings, the M-18 prefill chunk sweep, speculative equals plain greedy, Metal hidden-prefill parity, the Bonsai 2 27B gates, CPU vision and Metal vision — are each required by name in the capability report, which is rotated per run so earlier evidence cannot satisfy a later run. Flags: `--require-cuda`, `--accept-approximate-cuda-syntax` (for a host without the CUDA toolkit, see the checklist below; refused together with `--require-cuda`), `--skip-legacy-models`, `--skip-bonsai2-models`, `--skip-bonsai2-metal`, `--skip-bonsai2-vision` (each skip and the CUDA waiver must be stated in the release notes), `--self-test` (262 offline scenarios against stand-in tools). |
+| `scripts/release-gate.sh` | `ci.sh --release` plus the hardware-capability check and the real-model legs, strictly one binary at a time. Stage 0 builds the `--all-features` release CLI once and exports `OXIBONSAI_CLI_BIN` for every later stage (a value already in the environment is overridden). The real-model legs — legacy dense parity, dense embeddings, the M-18 prefill chunk sweep, speculative equals plain greedy, Metal hidden-prefill parity, the Bonsai 2 27B gates, CPU vision and Metal vision — are each required by name in the capability report, which is rotated per run so earlier evidence cannot satisfy a later run. Flags: `--require-cuda`, `--accept-approximate-cuda-syntax` (for a host without the CUDA toolkit, see the checklist below; refused together with `--require-cuda`), `--skip-legacy-models`, `--skip-bonsai2-models`, `--skip-bonsai2-metal`, `--skip-bonsai2-vision` (each skip and the CUDA waiver must be stated in the release notes), `--self-test` (262 offline scenarios against stand-in tools on macOS; 243 on Linux, where a Darwin-only block is skipped). |
 | `scripts/publish.sh` | Publishes the crates in dependency order. **Dry-run by default** (`--for-real` publishes); it always runs `release-gate.sh` first, and has no `--skip-ci`. The dry run is one `cargo publish --workspace --exclude oxibonsai-testkit --dry-run --allow-dirty` — every crate packaged and verified against its siblings' local packages, since a crate-by-crate dry run cannot resolve a sibling at a version that is not on crates.io yet; the real publish goes crate by crate. It forwards `--require-cuda` and `--accept-approximate-cuda-syntax` to the gate only when you pass them. |
 
 Two caveats about what the stages prove. `cuda-syntax` is an **approximate** check:
@@ -837,8 +857,11 @@ before running it.
    --no-default-features`, which fails on any warning in a workspace crate (an unused
    import on that target, for instance).
 6. [ ] `--require-cuda` only on a host with a CUDA device. Without one the CUDA
-   parity checklist in `TODO.md` stays open and the release notes say the CUDA backend
-   is unvalidated. **On a release host without the CUDA toolkit (every macOS host) the
+   parity checklist in `TODO.md` stays open and the release notes state the CUDA
+   evidence that does exist and its scope (for 0.2.4: a separate Linux run on one RTX
+   A4000 on 2026-10-07, which covered the CUDA parity harnesses and the dev-profile
+   all-features nextest stage, but not this gate end to end; `ci.sh --release` /
+   `release-gate.sh --require-cuda` on a CUDA host is still pending). **On a release host without the CUDA toolkit (every macOS host) the
    `cuda-syntax` stage can never get its `nvcc` pass, so the owner must pass
    `--accept-approximate-cuda-syntax` explicitly**, to `./scripts/release-gate.sh` and
    again to `./scripts/publish.sh` (which re-runs the gate and forwards the flag only
@@ -847,7 +870,8 @@ before running it.
    kernel syntax was checked approximately (no nvcc)`, and its capability report
    carries a `cuda-syntax` record marked `"waived":"approximate-accepted"`. **The
    release notes must state that the CUDA backend's kernels were syntax-checked
-   approximately and are not hardware-validated.** The flag is refused together with
+   approximately and are not hardware-validated** by that run (name any separate
+   hardware run, as above). The flag is refused together with
    `--require-cuda` (a release that requires CUDA evidence must run on a host with the
    toolkit), never waives a syntax error, and cannot waive a host with no C++ compiler
    at all, where nothing was checked. Without the flag the default stays fail-closed.

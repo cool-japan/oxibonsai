@@ -23,7 +23,7 @@ use rayon::prelude::*;
 /// # Safety
 /// `BlockQ1_0G128` is `#[repr(C)]` with a well-defined 18-byte layout.
 #[cfg(any(
-    feature = "metal",
+    all(feature = "metal", target_os = "macos"),
     all(
         feature = "native-cuda",
         any(target_os = "linux", target_os = "windows")

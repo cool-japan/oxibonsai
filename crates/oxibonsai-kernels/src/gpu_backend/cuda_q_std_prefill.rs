@@ -328,7 +328,7 @@ fn acquire_q_std_logits(graph: &CudaGraph, n: usize) -> Result<QStdLogitsGuard, 
 /// # Safety
 /// All slices must be valid device pointers on `graph.stream_arc()`.
 #[allow(clippy::too_many_arguments)]
-unsafe fn launch_gemm_q4_0(
+pub(super) unsafe fn launch_gemm_q4_0(
     graph: &CudaGraph,
     mods: &CudaQStdPrefillModules,
     d_blocks: &CudaSlice<u8>,
@@ -363,7 +363,7 @@ unsafe fn launch_gemm_q4_0(
 /// # Safety
 /// All slices must be valid device pointers on `graph.stream_arc()`.
 #[allow(clippy::too_many_arguments)]
-unsafe fn launch_fused_gate_up_swiglu_q4_0(
+pub(super) unsafe fn launch_fused_gate_up_swiglu_q4_0(
     graph: &CudaGraph,
     mods: &CudaQStdPrefillModules,
     d_blocks: &CudaSlice<u8>,
@@ -400,7 +400,7 @@ unsafe fn launch_fused_gate_up_swiglu_q4_0(
 /// # Safety
 /// All slices must be valid device pointers on `graph.stream_arc()`.
 #[allow(clippy::too_many_arguments)]
-unsafe fn launch_gemv_q4_0_pf(
+pub(super) unsafe fn launch_gemv_q4_0_pf(
     graph: &CudaGraph,
     mods: &CudaQStdPrefillModules,
     d_blocks: &CudaSlice<u8>,
@@ -433,7 +433,7 @@ unsafe fn launch_gemv_q4_0_pf(
 /// # Safety
 /// All slices must be valid device pointers on `graph.stream_arc()`.
 #[allow(clippy::too_many_arguments)]
-unsafe fn launch_gemm_q8_0(
+pub(super) unsafe fn launch_gemm_q8_0(
     graph: &CudaGraph,
     mods: &CudaQStdPrefillModules,
     d_blocks: &CudaSlice<u8>,
@@ -468,7 +468,7 @@ unsafe fn launch_gemm_q8_0(
 /// # Safety
 /// All slices must be valid device pointers on `graph.stream_arc()`.
 #[allow(clippy::too_many_arguments)]
-unsafe fn launch_fused_gate_up_swiglu_q8_0(
+pub(super) unsafe fn launch_fused_gate_up_swiglu_q8_0(
     graph: &CudaGraph,
     mods: &CudaQStdPrefillModules,
     d_blocks: &CudaSlice<u8>,
@@ -505,7 +505,7 @@ unsafe fn launch_fused_gate_up_swiglu_q8_0(
 /// # Safety
 /// All slices must be valid device pointers on `graph.stream_arc()`.
 #[allow(clippy::too_many_arguments)]
-unsafe fn launch_gemv_q8_0_pf(
+pub(super) unsafe fn launch_gemv_q8_0_pf(
     graph: &CudaGraph,
     mods: &CudaQStdPrefillModules,
     d_blocks: &CudaSlice<u8>,
@@ -923,7 +923,9 @@ unsafe fn encode_q_std_prefill_layer(
 ///   its decode attends over the host `KvCache`, so the model side writes
 ///   this into that host cache. Left untouched when the call fails.
 ///
-/// **CUDA is unvalidated**: no CUDA hardware has run this entry point.
+/// Run on hardware (RTX A4000, CUDA 12.0, 2026-10-07): CUDA-P11 passed on
+/// real Q4_0 / Q8_0 weights (K/V read-back and last-token logits against the
+/// sequential path, cos 1.000000; 8/8 greedy tokens).
 #[allow(clippy::too_many_arguments)]
 pub fn try_cuda_prefill_q_std(
     hidden_batch: &[f32],
@@ -1238,6 +1240,45 @@ pub fn try_cuda_prefill_q_std(
 mod tests {
     use super::*;
     use crate::gpu_backend::cuda_q_std_prefill_kernels::CUDA_Q_STD_PREFILL_KERNELS_SRC;
+
+    /// The body of `extern "C" __global__ void {name}(` in the prefill source,
+    /// up to the next kernel.
+    fn kernel_body(name: &str) -> &'static str {
+        let src = CUDA_Q_STD_PREFILL_KERNELS_SRC;
+        let start = src
+            .find(&format!("void {name}("))
+            .unwrap_or_else(|| panic!("kernel {name} not in the prefill source"));
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("extern \"C\" __global__")
+            .map_or(rest.len(), |e| e + 1);
+        &rest[..end]
+    }
+
+    /// Every Q4_0 prefill kernel pairs byte `nb`'s low / high nibble with
+    /// elements `nb` / `nb + 16` (ggml's lo-hi split, as `BlockQ4_0::dequant`
+    /// and the decode kernel do), never with `2nb` / `2nb + 1`. CPU-only guard
+    /// for the `gemv_q4_0_pf` fix; the numerics are checked on hardware by
+    /// `tests/cuda_q_std_gemv_real_weights.rs`.
+    #[test]
+    fn test_q4_0_prefill_kernels_use_the_lo_hi_nibble_split() {
+        for name in [
+            "gemm_q4_0",
+            "gemm_q4_0_residual",
+            "fused_gate_up_swiglu_gemm_q4_0",
+            "gemv_q4_0_pf",
+        ] {
+            let body = kernel_body(name);
+            assert!(
+                !body.contains("nb * 2u"),
+                "{name} reads Q4_0 nibbles as an even/odd interleave"
+            );
+            assert!(
+                body.contains("xbase[nb + 16u]"),
+                "{name} does not pair the high nibble with element nb + 16"
+            );
+        }
+    }
 
     /// Verify the kernel source contains `gemm_q4_0`.
     #[test]
