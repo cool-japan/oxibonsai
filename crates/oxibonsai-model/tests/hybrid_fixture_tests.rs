@@ -215,8 +215,8 @@ fn hybrid_fixture_dequant_reproduces_planned_values_for_every_quant_format() {
             let mut got = vec![0.0f32; expected.len()];
             match quant {
                 TensorType::F32 => {
-                    for (i, chunk) in raw.chunks_exact(4).enumerate() {
-                        got[i] = f32::from_le_bytes(chunk.try_into().expect("4 bytes"));
+                    for (i, chunk) in raw.as_chunks::<4>().0.iter().enumerate() {
+                        got[i] = f32::from_le_bytes(*chunk);
                     }
                 }
                 TensorType::PQ2_0 => {
@@ -306,8 +306,10 @@ fn hybrid_fixture_plain_f32_tensors_round_trip_regardless_of_quant_choice() {
             .unwrap_or_else(|_| panic!("{name} present"));
         let expected = fixture.planned_values(name).expect("planned values");
         let got: Vec<f32> = raw
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().expect("4 bytes")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         assert_eq!(got, expected, "{name}: plain F32 round trip must be exact");
     }
@@ -339,8 +341,10 @@ fn hybrid_fixture_bf16_tensors_round_trip_and_are_never_folded() {
             .unwrap_or_else(|_| panic!("{name} present"));
         let expected = fixture.planned_values(name).expect("planned values");
         let got: Vec<f32> = raw
-            .chunks_exact(2)
-            .map(|c| oxibonsai_core::bf16::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| oxibonsai_core::bf16::bf16_to_f32(u16::from_le_bytes(*c)))
             .collect();
         assert_eq!(got, expected, "{name}: bf16 round trip must be exact");
         assert!(

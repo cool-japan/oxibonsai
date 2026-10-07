@@ -1366,16 +1366,16 @@ pub(crate) fn dequantize_gguf_tensor(
         GgufTensorType::F32 => {
             let count = data.len() / 4;
             let mut out = vec![0.0f32; count];
-            for (i, chunk) in data.chunks_exact(4).enumerate() {
-                out[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            for (i, chunk) in data.as_chunks::<4>().0.iter().enumerate() {
+                out[i] = f32::from_le_bytes(*chunk);
             }
             out
         }
         GgufTensorType::F16 => {
             let count = data.len() / 2;
             let mut out = vec![0.0f32; count];
-            for (i, chunk) in data.chunks_exact(2).enumerate() {
-                out[i] = f16_bits_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
+            for (i, chunk) in data.as_chunks::<2>().0.iter().enumerate() {
+                out[i] = f16_bits_to_f32(u16::from_le_bytes(*chunk));
             }
             out
         }

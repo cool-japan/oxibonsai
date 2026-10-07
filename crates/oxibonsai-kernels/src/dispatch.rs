@@ -30,10 +30,10 @@ use crate::error::KernelResult;
 use crate::gemm;
 use crate::gemv;
 use crate::tier::TierReason;
-use crate::traits::{Fp8Kernel, OneBitKernel, TernaryKernel};
+use crate::traits::{OneBitKernel, TernaryKernel};
 use crate::weight_cache::GpuWeightHandle;
 use oxibonsai_core::tensor::BlockQ1_0G128;
-use oxibonsai_core::{BlockFP8E4M3, BlockFP8E5M2, BlockTQ2_0_g128};
+use oxibonsai_core::BlockTQ2_0_g128;
 #[cfg(feature = "gpu")]
 use std::sync::Arc;
 
@@ -455,8 +455,8 @@ impl KernelDispatcher {
     /// on certain platforms.
     ///
     /// `pub(crate)` (not private) so the sibling dispatch-split files
-    /// (`dispatch_std_quant.rs`, `dispatch_prism.rs`) can call it from their
-    /// own `cpu_*_fallback` methods.
+    /// (`dispatch_std_quant.rs`, `dispatch_prism.rs`, `dispatch_fp8.rs`) can
+    /// call it from their own K-17 fallback routing.
     #[cfg(feature = "gpu")]
     pub(crate) fn cpu_tier() -> KernelTier {
         #[cfg(target_arch = "x86_64")]
@@ -1208,294 +1208,10 @@ impl TernaryKernel for KernelDispatcher {
     }
 }
 
-// Compile-time size checks: BlockFP8E4M3/E5M2 must be exactly BLOCK_FP8_BYTES (34).
-// This ensures the raw-pointer cast in the CUDA GPU dispatch is sound.
-const _: () =
-    assert!(std::mem::size_of::<oxibonsai_core::BlockFP8E4M3>() == oxibonsai_core::BLOCK_FP8_BYTES);
-const _: () =
-    assert!(std::mem::size_of::<oxibonsai_core::BlockFP8E5M2>() == oxibonsai_core::BLOCK_FP8_BYTES);
-
-impl Fp8Kernel for KernelDispatcher {
-    /// Dequantize FP8 E4M3FN blocks — tier-aware SIMD dispatch.
-    fn dequant_fp8_e4m3(&self, blocks: &[BlockFP8E4M3], output: &mut [f32]) -> KernelResult<()> {
-        match self.tier {
-            #[cfg(target_arch = "x86_64")]
-            KernelTier::Avx512 => unsafe {
-                crate::simd_fp8_avx512::dequant_fp8_e4m3_avx512(blocks, output)
-            },
-            #[cfg(target_arch = "x86_64")]
-            KernelTier::Avx2 => unsafe {
-                crate::simd_fp8_avx2::dequant_fp8_e4m3_avx2(blocks, output)
-            },
-            #[cfg(target_arch = "aarch64")]
-            KernelTier::Neon => unsafe {
-                crate::simd_fp8_neon::dequant_fp8_e4m3_neon(blocks, output)
-            },
-            _ => crate::dequant_fp8::dequant_fp8_e4m3(blocks, output),
-        }
-    }
-
-    /// Dequantize FP8 E5M2 blocks — tier-aware SIMD dispatch.
-    fn dequant_fp8_e5m2(&self, blocks: &[BlockFP8E5M2], output: &mut [f32]) -> KernelResult<()> {
-        match self.tier {
-            #[cfg(target_arch = "x86_64")]
-            KernelTier::Avx512 => unsafe {
-                crate::simd_fp8_avx512::dequant_fp8_e5m2_avx512(blocks, output)
-            },
-            #[cfg(target_arch = "x86_64")]
-            KernelTier::Avx2 => unsafe {
-                crate::simd_fp8_avx2::dequant_fp8_e5m2_avx2(blocks, output)
-            },
-            #[cfg(target_arch = "aarch64")]
-            KernelTier::Neon => unsafe {
-                crate::simd_fp8_neon::dequant_fp8_e5m2_neon(blocks, output)
-            },
-            _ => crate::dequant_fp8::dequant_fp8_e5m2(blocks, output),
-        }
-    }
-
-    /// FP8 E4M3FN GEMV — tier-aware SIMD dispatch with optional GPU acceleration.
-    ///
-    /// Dispatch priority on the `KernelTier::Gpu` path:
-    /// 1. Metal (macOS + `metal` feature) — `metal_gemv_fp8_e4m3`.
-    /// 2. CUDA (Linux/Windows + `native-cuda` feature) — `cuda_gemv_fp8_e4m3`.
-    /// 3. CPU SIMD fallback (AVX-512 / AVX2 / NEON / scalar).
-    ///
-    /// The raw-byte cast of `blocks` to `*const u8` is sound because
-    /// `BlockFP8E4M3` is `#[repr(C)]` with size `BLOCK_FP8_BYTES = 34`.
-    fn gemv_fp8_e4m3(
-        &self,
-        blocks: &[BlockFP8E4M3],
-        input: &[f32],
-        output: &mut [f32],
-        n_rows: usize,
-        k: usize,
-    ) -> KernelResult<()> {
-        // GPU dispatch via Metal — macOS only, `metal` feature.
-        #[cfg(all(feature = "metal", target_os = "macos"))]
-        {
-            // SAFETY: BlockFP8E4M3 is repr(C) with size BLOCK_FP8_BYTES (= 34).
-            let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    blocks.as_ptr().cast::<u8>(),
-                    blocks.len() * oxibonsai_core::BLOCK_FP8_BYTES,
-                )
-            };
-            match crate::gpu_backend::metal_gemv_fp8_e4m3(bytes, input, output, n_rows, k) {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    // No Metal device or compile failure: fall through to CPU SIMD path.
-                    let msg = e.to_string();
-                    if !msg.contains("no Metal-capable GPU device") {
-                        tracing::warn!(
-                            error = %e,
-                            "Metal FP8 E4M3 GEMV failed, falling back to CPU SIMD"
-                        );
-                    }
-                }
-            }
-        }
-
-        // GPU dispatch via CUDA NVRTC — Linux/Windows only, native-cuda feature.
-        #[cfg(all(
-            feature = "native-cuda",
-            any(target_os = "linux", target_os = "windows")
-        ))]
-        {
-            // SAFETY: BlockFP8E4M3 is repr(C) with size BLOCK_FP8_BYTES (= 34),
-            // validated by the compile-time assert above.  The slice lifetime is
-            // tied to `blocks` which outlives this call.
-            let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    blocks.as_ptr().cast::<u8>(),
-                    blocks.len() * oxibonsai_core::BLOCK_FP8_BYTES,
-                )
-            };
-            match crate::gpu_backend::cuda_gemv_fp8_e4m3(bytes, input, output, n_rows, k) {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    // No CUDA device — fall through to CPU SIMD path silently.
-                    // Any other error is logged at warn level and we fall through.
-                    let msg = e.to_string();
-                    if !msg.contains("no CUDA device") {
-                        tracing::warn!(
-                            error = %e,
-                            "CUDA FP8 E4M3 GEMV failed, falling back to CPU SIMD"
-                        );
-                    }
-                }
-            }
-        }
-
-        match self.tier {
-            #[cfg(target_arch = "x86_64")]
-            KernelTier::Avx512 => unsafe {
-                crate::simd_fp8_avx512::gemv_fp8_e4m3_avx512(blocks, input, output, n_rows, k)
-            },
-            #[cfg(target_arch = "x86_64")]
-            KernelTier::Avx2 => unsafe {
-                crate::simd_fp8_avx2::gemv_fp8_e4m3_avx2(blocks, input, output, n_rows, k)
-            },
-            #[cfg(target_arch = "aarch64")]
-            KernelTier::Neon => unsafe {
-                crate::simd_fp8_neon::gemv_fp8_e4m3_neon(blocks, input, output, n_rows, k)
-            },
-            _ => crate::gemv_fp8::gemv_fp8_e4m3(blocks, input, output, n_rows, k),
-        }
-    }
-
-    /// FP8 E5M2 GEMV — tier-aware SIMD dispatch with optional GPU acceleration.
-    ///
-    /// Mirrors [`gemv_fp8_e4m3`](Self::gemv_fp8_e4m3): Metal → CUDA → CPU SIMD.
-    /// The raw-byte cast is sound because `BlockFP8E5M2` is `#[repr(C)]` with
-    /// size `BLOCK_FP8_BYTES = 34`.
-    fn gemv_fp8_e5m2(
-        &self,
-        blocks: &[BlockFP8E5M2],
-        input: &[f32],
-        output: &mut [f32],
-        n_rows: usize,
-        k: usize,
-    ) -> KernelResult<()> {
-        // GPU dispatch via Metal — macOS only, `metal` feature.
-        #[cfg(all(feature = "metal", target_os = "macos"))]
-        {
-            // SAFETY: BlockFP8E5M2 is repr(C) with size BLOCK_FP8_BYTES (= 34).
-            let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    blocks.as_ptr().cast::<u8>(),
-                    blocks.len() * oxibonsai_core::BLOCK_FP8_BYTES,
-                )
-            };
-            match crate::gpu_backend::metal_gemv_fp8_e5m2(bytes, input, output, n_rows, k) {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    let msg = e.to_string();
-                    if !msg.contains("no Metal-capable GPU device") {
-                        tracing::warn!(
-                            error = %e,
-                            "Metal FP8 E5M2 GEMV failed, falling back to CPU SIMD"
-                        );
-                    }
-                }
-            }
-        }
-
-        // GPU dispatch via CUDA NVRTC — Linux/Windows only, native-cuda feature.
-        #[cfg(all(
-            feature = "native-cuda",
-            any(target_os = "linux", target_os = "windows")
-        ))]
-        {
-            // SAFETY: BlockFP8E5M2 is repr(C) with size BLOCK_FP8_BYTES (= 34),
-            // validated by the compile-time assert above.
-            let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    blocks.as_ptr().cast::<u8>(),
-                    blocks.len() * oxibonsai_core::BLOCK_FP8_BYTES,
-                )
-            };
-            match crate::gpu_backend::cuda_gemv_fp8_e5m2(bytes, input, output, n_rows, k) {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    let msg = e.to_string();
-                    if !msg.contains("no CUDA device") {
-                        tracing::warn!(
-                            error = %e,
-                            "CUDA FP8 E5M2 GEMV failed, falling back to CPU SIMD"
-                        );
-                    }
-                }
-            }
-        }
-
-        match self.tier {
-            #[cfg(target_arch = "x86_64")]
-            KernelTier::Avx512 => unsafe {
-                crate::simd_fp8_avx512::gemv_fp8_e5m2_avx512(blocks, input, output, n_rows, k)
-            },
-            #[cfg(target_arch = "x86_64")]
-            KernelTier::Avx2 => unsafe {
-                crate::simd_fp8_avx2::gemv_fp8_e5m2_avx2(blocks, input, output, n_rows, k)
-            },
-            #[cfg(target_arch = "aarch64")]
-            KernelTier::Neon => unsafe {
-                crate::simd_fp8_neon::gemv_fp8_e5m2_neon(blocks, input, output, n_rows, k)
-            },
-            _ => crate::gemv_fp8::gemv_fp8_e5m2(blocks, input, output, n_rows, k),
-        }
-    }
-
-    /// FP8 E4M3FN GEMM — tier-aware SIMD dispatch.
-    fn gemm_fp8_e4m3(
-        &self,
-        blocks: &[BlockFP8E4M3],
-        inputs: &[f32],
-        outputs: &mut [f32],
-        n_rows: usize,
-        k: usize,
-        batch: usize,
-    ) -> KernelResult<()> {
-        match self.tier {
-            #[cfg(target_arch = "x86_64")]
-            KernelTier::Avx512 => unsafe {
-                crate::simd_fp8_avx512::gemm_fp8_e4m3_avx512(
-                    blocks, inputs, outputs, n_rows, k, batch,
-                )
-            },
-            #[cfg(target_arch = "x86_64")]
-            KernelTier::Avx2 => unsafe {
-                crate::simd_fp8_avx2::gemm_fp8_e4m3_avx2(blocks, inputs, outputs, n_rows, k, batch)
-            },
-            #[cfg(target_arch = "aarch64")]
-            KernelTier::Neon => unsafe {
-                crate::simd_fp8_neon::gemm_fp8_e4m3_neon(blocks, inputs, outputs, n_rows, k, batch)
-            },
-            _ => crate::gemm_fp8::gemm_fp8_e4m3(blocks, inputs, outputs, n_rows, k, batch),
-        }
-    }
-
-    /// FP8 E5M2 GEMM — tier-aware SIMD dispatch.
-    fn gemm_fp8_e5m2(
-        &self,
-        blocks: &[BlockFP8E5M2],
-        inputs: &[f32],
-        outputs: &mut [f32],
-        n_rows: usize,
-        k: usize,
-        batch: usize,
-    ) -> KernelResult<()> {
-        match self.tier {
-            #[cfg(target_arch = "x86_64")]
-            KernelTier::Avx512 => unsafe {
-                crate::simd_fp8_avx512::gemm_fp8_e5m2_avx512(
-                    blocks, inputs, outputs, n_rows, k, batch,
-                )
-            },
-            #[cfg(target_arch = "x86_64")]
-            KernelTier::Avx2 => unsafe {
-                crate::simd_fp8_avx2::gemm_fp8_e5m2_avx2(blocks, inputs, outputs, n_rows, k, batch)
-            },
-            #[cfg(target_arch = "aarch64")]
-            KernelTier::Neon => unsafe {
-                crate::simd_fp8_neon::gemm_fp8_e5m2_neon(blocks, inputs, outputs, n_rows, k, batch)
-            },
-            _ => crate::gemm_fp8::gemm_fp8_e5m2(blocks, inputs, outputs, n_rows, k, batch),
-        }
-    }
-
-    fn name_fp8(&self) -> &'static str {
-        match self.tier {
-            #[cfg(target_arch = "x86_64")]
-            KernelTier::Avx512 => "fp8_avx512",
-            #[cfg(target_arch = "x86_64")]
-            KernelTier::Avx2 => "fp8_avx2",
-            #[cfg(target_arch = "aarch64")]
-            KernelTier::Neon => "fp8_neon",
-            _ => "fp8_reference",
-        }
-    }
-}
+// `impl Fp8Kernel for KernelDispatcher` (FP8 E4M3FN/E5M2 dequant, GEMV and
+// GEMM), the `BLOCK_FP8_BYTES` layout asserts its GPU byte view relies on,
+// the `KernelTier::Gpu`-only Metal/CUDA GEMV attempt and the K-17 CPU-SIMD
+// routing now live in `dispatch_fp8.rs` — see that module's doc comment.
 
 // `impl StandardQuantKernel for KernelDispatcher` (Q4_0, Q8_0, and the six
 // K-quant formats), its Metal `quant_gpu_bytes`/`warn_metal_gemv_fallback`
@@ -1504,9 +1220,11 @@ impl Fp8Kernel for KernelDispatcher {
 
 #[cfg(all(test, feature = "gpu"))]
 thread_local! {
-    /// Records which CPU tier a `cpu_gemv_*_fallback` (this file's Q1_0/
-    /// ternary fallbacks, plus `dispatch_std_quant.rs`'s Q4_0/Q8_0/K-quant
-    /// ones and `dispatch_prism.rs`'s prism ones) most recently routed onto,
+    /// Records which CPU tier a `KernelTier::Gpu` dispatcher's K-17 fallback
+    /// most recently routed onto — `dispatch_std_quant.rs`'s Q4_0/Q8_0/K-quant
+    /// `cpu_gemv_*_fallback`s, `dispatch_prism.rs`'s `prism_tier` and
+    /// `dispatch_fp8.rs`'s `fp8_cpu_tier` (FP8 dequant, GEMM, and every GEMV
+    /// the GPU did not serve) record it —
     /// so a K-17 regression test can observe the *routing decision* directly
     /// instead of only the numeric result — the scalar/AVX2/AVX-512/NEON
     /// kernels are numerically equivalent (mod float rounding), so comparing

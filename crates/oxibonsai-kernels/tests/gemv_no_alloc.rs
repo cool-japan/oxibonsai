@@ -75,6 +75,13 @@
 //! trusted; a silently broken counter would make every "zero" downstream
 //! meaningless.
 //!
+//! One precondition is made deterministic rather than left to scheduling:
+//! [`warm_kquant_scratch_on_every_rayon_thread`] warms the K-quant drivers'
+//! per-thread scratch row on *every* Rayon pool thread before anything is
+//! measured, because a single warm-up call per path cannot guarantee that
+//! every worker took part in one (that function's doc gives the failure rate
+//! it closed).
+//!
 //! Axis 2 is still process-wide, so this file deliberately contains a single
 //! `#[test]`: a concurrently running test in the same binary could trip the
 //! size guard with a large allocation of its own. (Each `tests/*.rs` file is
@@ -694,6 +701,51 @@ fn build_paths(
     paths
 }
 
+/// Warm every Rayon pool thread's K-quant row scratch before anything is
+/// measured.
+///
+/// `gemv_q4k` / `gemv_q6k` / `gemv_q8k` (on every non-AArch64 target) borrow
+/// a per-OS-thread scratch row — `parallel.rs`'s `KQUANT_ROW_SCRATCH` — that
+/// grows to `in_features` the first time a thread uses it. One warm-up call
+/// per path ([`warm_then_measure`]) cannot warm it on every pool thread:
+/// which threads a `[parallel]` call's rows land on is decided by Rayon's
+/// work stealing, so a worker that sat out every K-quant warm-up call first
+/// touches its scratch inside a *measured* call — a one-time `K * 4` =
+/// 32 KiB growth that axis 2 rightly reports. On an 8-core x86-64 host it
+/// showed up in 12 of 40 runs of the tree as it stood — `gemv_q4k
+/// [parallel]` in 8 of them, `gemv_q6k` in 3, `gemv_q8k` in 2 (one run had
+/// two) — on top of the FP8 offenders all 40 of those runs also had, and it
+/// still failed 1 run in 40 once only the FP8 gate was fixed. With this
+/// warm-up as well, 60 of 60 runs passed, then 80 of 80 with several running
+/// concurrently.
+///
+/// [`rayon::broadcast`] runs one sequential-shape call of each K-quant GEMV
+/// on *every* pool thread, so the scratch is warm wherever the measured rows
+/// land. That makes this file's premise — "once the thread-local scratch is
+/// warm" — deterministic rather than a matter of scheduling luck. It is not
+/// an allocation budget: a per-call allocation (the historical
+/// `vec![0.0f32; in_features]`, or one `Vec` per Rayon split) still happens
+/// on every measured call, warm or not, and still fails both axes.
+fn warm_kquant_scratch_on_every_rayon_thread() {
+    // One row is below every tuned threshold, so each call takes the
+    // sequential branch on whichever pool thread `broadcast` runs it, which
+    // grows *that* thread's scratch to `K`.
+    const ROWS: usize = 1;
+    let input = input_vec(K, 0xA11C);
+    let q4k = q4k_blocks(ROWS * (K / 256), 0x4B4B);
+    let q6k = q6k_blocks(ROWS * (K / 256), 0x6B6B);
+    let q8k = q8k_blocks(ROWS * (K / 256), 0x8B8B);
+    rayon::broadcast(|_| {
+        let mut out = [0.0f32; ROWS];
+        oxibonsai_kernels::gemv_q4k(&q4k, &input, &mut out, ROWS, K)
+            .expect("warm-up gemv_q4k must succeed");
+        oxibonsai_kernels::gemv_q6k(&q6k, &input, &mut out, ROWS, K)
+            .expect("warm-up gemv_q6k must succeed");
+        oxibonsai_kernels::gemv_q8k(&q8k, &input, &mut out, ROWS, K)
+            .expect("warm-up gemv_q8k must succeed");
+    });
+}
+
 /// Warm every path once, then measure the second call of each.
 fn warm_then_measure(paths: &mut [Path]) -> Vec<(String, Measurement)> {
     for (_, call) in paths.iter_mut() {
@@ -754,6 +806,10 @@ fn gemv_call_paths_do_not_allocate_after_warmup() {
         "fixture assumption: n_rows={sequential_rows} must be below par_gemv_min_rows ({})",
         thresholds.par_gemv_min_rows
     );
+
+    // Per-thread scratch must be warm on every pool thread, not only on the
+    // ones `warm_then_measure`'s single warm-up call happened to use.
+    warm_kquant_scratch_on_every_rayon_thread();
 
     let cpu = Arc::new(KernelDispatcher::with_tier(cpu_kernel_tier()));
     let auto = Arc::new(KernelDispatcher::auto_detect());

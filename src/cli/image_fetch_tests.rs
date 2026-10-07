@@ -9,9 +9,10 @@ use super::transfer::{dialled_is_vetted, redirect_target, FetchError};
 use super::*;
 
 use std::collections::VecDeque;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener};
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use oxibonsai_model::vision::remote::{RemoteUrlRefusal, MAX_REMOTE_IMAGE_URL_BYTES};
 use oxibonsai_model::vision::{load_image_bytes, load_image_source, ImageSourcePolicy};
@@ -98,12 +99,37 @@ fn stub_fetcher(
 
 const V4_LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const V6_LOOPBACK: IpAddr = IpAddr::V6(Ipv6Addr::LOCALHOST);
+/// A second IPv4 loopback address: where [`same_port_pair`] puts its second
+/// listener on a host without an IPv6 loopback.
+const V4_SECOND_LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+/// Spellings of [`V4_SECOND_LOOPBACK`] that
+/// [`every_spelling_of_a_refused_literal_is_refused_before_any_connection`]
+/// appends to its list: the `inet_aton` forms the policy reads an IPv4
+/// literal in, and the IPv4-mapped forms. Each is refused on every host —
+/// the IPv4 ones as loopback (the rule covers all of `127.0.0.0/8`), the
+/// IPv4-mapped ones as IPv4-mapped.
+const V4_SECOND_LOOPBACK_SPELLINGS: [&str; 12] = [
+    "127.0.0.2",
+    "127.0.0.2.",
+    "2130706434",
+    "0x7f.0.0.2",
+    "0X7F.0.0.2",
+    "0x7f000002",
+    "0177.0.0.2",
+    "017700000002",
+    "127.2",
+    "127.0.2",
+    "[::ffff:127.0.0.2]",
+    "[::FFFF:7F00:2]",
+];
 
 /// The test stand-in for the public internet: `127.0.0.1` counts as a
-/// public address, everything else is classified by the real policy. Only
-/// the DNS-rebinding test uses it — a real public address cannot be dialled
-/// hermetically, and the test is about which address is dialled, not about
-/// the classes.
+/// public address, everything else is classified by the real policy — so
+/// the second loopback address of [`same_port_pair`] (`::1`, or `127.0.0.2`)
+/// is refused as loopback here exactly as under [`classify_address`]. Only
+/// the DNS-rebinding and mixed-answer tests use it — a real public address
+/// cannot be dialled hermetically, and those tests are about which address
+/// is dialled, not about the classes.
 fn loopback_v4_is_public(address: IpAddr) -> Option<AddressClass> {
     if address == V4_LOOPBACK {
         None
@@ -112,16 +138,306 @@ fn loopback_v4_is_public(address: IpAddr) -> Option<AddressClass> {
     }
 }
 
-/// Two listeners on the same port, one per loopback family.
-fn same_port_pair() -> (TcpListener, TcpListener) {
-    for _ in 0..64 {
-        let v4 = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1");
-        let port = v4.local_addr().expect("address").port();
-        if let Ok(v6) = TcpListener::bind((Ipv6Addr::LOCALHOST, port)) {
-            return (v4, v6);
+/// `EAFNOSUPPORT` ("address family not supported") on this target: what a
+/// bind fails with when the kernel has no such address family at all (IPv6
+/// compiled out, or booted with `ipv6.disable=1`). `std` reports it as an
+/// uncategorised [`io::ErrorKind`], so it is matched by its number, which
+/// differs per target. The numbers are the `libc` crate's: one for most
+/// Linux targets, another for the BSDs and Apple's systems (which SPARC
+/// Linux keeps, after SunOS), a third for illumos and Solaris (which MIPS
+/// Linux keeps, after IRIX); on Windows, whose sockets report WinSock's
+/// codes, it is `WSAEAFNOSUPPORT`. `None` on any other target: a bind
+/// failing with it there is not recognised, and panics like any other
+/// unexplained bind error ([`bind_outcome`]).
+const EAFNOSUPPORT: Option<i32> = if cfg!(target_os = "windows") {
+    Some(10_047)
+} else if cfg!(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    all(
+        target_os = "linux",
+        any(target_arch = "sparc", target_arch = "sparc64")
+    )
+)) {
+    Some(47)
+} else if cfg!(any(
+    target_os = "illumos",
+    target_os = "solaris",
+    all(
+        target_os = "linux",
+        any(
+            target_arch = "mips",
+            target_arch = "mips64",
+            target_arch = "mips32r6",
+            target_arch = "mips64r6"
+        )
+    )
+)) {
+    Some(124)
+} else if cfg!(any(target_os = "linux", target_os = "android")) {
+    Some(97)
+} else {
+    None
+};
+
+/// Whether `error`, from binding a listener, is one the helpers below read
+/// as "this host lacks the address": `AddrNotAvailable` (no interface has
+/// it — `::1` with IPv6 disabled on the loopback interface, `127.0.0.2`
+/// where the loopback answers only for `127.0.0.1`) or [`EAFNOSUPPORT`] (no
+/// such address family). No other error is: running out of descriptors or
+/// memory, a permission refused or a port taken says nothing about the
+/// address.
+fn lacks_address(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::AddrNotAvailable
+        || EAFNOSUPPORT.is_some_and(|code| error.raw_os_error() == Some(code))
+}
+
+/// What binding a listener on a socket address came to ([`bind_outcome`]).
+#[derive(Debug)]
+enum Bound {
+    /// It bound.
+    Listener(TcpListener),
+    /// It failed with an error [`lacks_address`] accepts: why, as a
+    /// capability report names it.
+    Missing(String),
+    /// It failed with `AddrInUse`: the port is taken on that address.
+    PortTaken(io::Error),
+}
+
+/// Bind a listener on `at`, read by [`bind_outcome`].
+fn bind_on(at: SocketAddr) -> Bound {
+    bind_outcome(at, TcpListener::bind(at))
+}
+
+/// How [`bind_on`] reads the result of binding a listener on `at` — apart
+/// from the bind itself, so that errors no hermetic bind produces are tested
+/// too.
+///
+/// # Panics
+///
+/// On an error that is neither accepted by [`lacks_address`] nor
+/// `AddrInUse`, naming it: reading it as a missing address would quietly
+/// turn a policy check into a weaker run.
+fn bind_outcome(at: SocketAddr, result: io::Result<TcpListener>) -> Bound {
+    match result {
+        Ok(listener) => Bound::Listener(listener),
+        Err(error) if lacks_address(&error) => {
+            Bound::Missing(format!("binding {at} failed: {error}"))
+        }
+        Err(error) if error.kind() == io::ErrorKind::AddrInUse => Bound::PortTaken(error),
+        Err(error) => panic!(
+            "binding {at} failed, and not because this host lacks {}: {error:?}",
+            bracketed(at.ip())
+        ),
+    }
+}
+
+/// Whether this host binds a listener on `address`: `Ok` when one bound on
+/// port 0, `Err` with why not when the bind failed with an error
+/// [`lacks_address`] accepts.
+///
+/// # Panics
+///
+/// On any other bind error ([`bind_outcome`]) — `AddrInUse` included, which
+/// on port 0, where the kernel picks the port, means that no port was left,
+/// not that the address is missing.
+fn probe_bind(address: IpAddr) -> Result<(), String> {
+    let at = SocketAddr::new(address, 0);
+    match bind_on(at) {
+        Bound::Listener(_) => Ok(()),
+        Bound::Missing(why) => Err(why),
+        Bound::PortTaken(error) => panic!("binding {at} failed: no port was left: {error:?}"),
+    }
+}
+
+/// [`probe_bind`] of `address`, once per process: the verdict is kept in
+/// `verdict` for every later test, on the assumption that the host's
+/// addresses do not change while the tests run. A probe that panics keeps
+/// nothing, so every test that asks fails the same loud way.
+fn probed_once(address: IpAddr, verdict: &OnceLock<Result<(), String>>) -> Result<(), String> {
+    verdict.get_or_init(|| probe_bind(address)).clone()
+}
+
+/// [`probe_bind`] of `::1`, the IPv6 loopback, once per process.
+fn probe_ipv6_loopback() -> Result<(), String> {
+    static VERDICT: OnceLock<Result<(), String>> = OnceLock::new();
+    probed_once(V6_LOOPBACK, &VERDICT)
+}
+
+/// [`probe_bind`] of `127.0.0.2`, a second IPv4 loopback address, once per
+/// process (Linux answers for all of `127.0.0.0/8` on `lo`; macOS, by
+/// default, only for `127.0.0.1`).
+fn probe_second_v4_loopback() -> Result<(), String> {
+    static VERDICT: OnceLock<Result<(), String>> = OnceLock::new();
+    probed_once(V4_SECOND_LOOPBACK, &VERDICT)
+}
+
+/// An address [`same_port_pair_in`] can put its second listener on.
+struct SecondLoopbackCandidate {
+    /// The address.
+    address: IpAddr,
+    /// Whether this host binds it at all: `Err` with why not
+    /// ([`probe_bind`]).
+    probe: fn() -> Result<(), String>,
+    /// What a host must have for it to bind, as a capability report names
+    /// it.
+    capability: &'static str,
+}
+
+impl SecondLoopbackCandidate {
+    /// How a capability report names it: `IPv6 loopback ([::1])`.
+    fn named(&self) -> String {
+        format!("{} ({})", self.capability, bracketed(self.address))
+    }
+}
+
+/// Where [`same_port_pair`] puts its second listener, in order of
+/// preference.
+const SECOND_LOOPBACKS: [SecondLoopbackCandidate; 2] = [
+    SecondLoopbackCandidate {
+        address: V6_LOOPBACK,
+        probe: probe_ipv6_loopback,
+        capability: "IPv6 loopback",
+    },
+    SecondLoopbackCandidate {
+        address: V4_SECOND_LOOPBACK,
+        probe: probe_second_v4_loopback,
+        capability: "second IPv4 loopback address",
+    },
+];
+
+/// A second loopback listener on the port of a `127.0.0.1` one (see
+/// [`same_port_pair`]): a dial of `address` on that port is counted, so
+/// "never dialled" is checked as no connection.
+struct SecondLoopback {
+    /// Bound to `address`, on the `127.0.0.1` listener's port.
+    listener: TcpListener,
+    /// `::1` — the other loopback family — or, on a host without an IPv6
+    /// loopback, `127.0.0.2`.
+    address: IpAddr,
+}
+
+impl SecondLoopback {
+    /// Serve `script` on it: the server, and the socket address it listens
+    /// on as the assertions name it (`[::1]:<port>`, `127.0.0.2:<port>`).
+    fn serve(
+        self,
+        script: impl Fn(&str) -> Reply + Send + Sync + 'static,
+    ) -> (TestServer, SocketAddr) {
+        let at = self.listener.local_addr().expect("address");
+        (TestServer::on(self.listener, script), at)
+    }
+}
+
+/// A `127.0.0.1` listener and a second loopback listener on the same port —
+/// `[::1]`, the other loopback family, on a host with an IPv6 loopback, and
+/// `127.0.0.2` on a host without one — so that "a second address on the
+/// same port is never dialled" is checked wherever either binds: the first
+/// of [`SECOND_LOOPBACKS`] that binds, as [`same_port_pair_in`] picks it.
+fn same_port_pair(test: &str) -> (TcpListener, Option<SecondLoopback>) {
+    same_port_pair_in(&SECOND_LOOPBACKS, test)
+}
+
+/// A `127.0.0.1` listener and a listener on the first of `candidates`, in
+/// order, that binds on the same port.
+///
+/// A candidate is passed over when its probe, or its bind on the
+/// `127.0.0.1` listener's port ([`same_port_on`]), fails with an error
+/// [`lacks_address`] accepts; any other bind error panics
+/// ([`bind_outcome`]). Each candidate passed over on the way to one that
+/// binds gets a `NOTE (capability)` line naming `test`, the listener used
+/// instead and the bind error, so that a downgrade is visible under
+/// `--nocapture`. When none binds (or there is none), the second listener
+/// is `None`, after one `SKIPPED (capability)` line naming `test` and each
+/// candidate's bind error, beside a fresh `127.0.0.1` listener: the test
+/// then runs every `127.0.0.1` check and skips only those of the second
+/// listener.
+fn same_port_pair_in(
+    candidates: &[SecondLoopbackCandidate],
+    test: &str,
+) -> (TcpListener, Option<SecondLoopback>) {
+    let mut passed_over = Vec::new();
+    for candidate in candidates {
+        match (candidate.probe)().and_then(|()| same_port_on(candidate.address)) {
+            Ok((v4, listener)) => {
+                let at = listener.local_addr().expect("address");
+                for (named, why) in &passed_over {
+                    eprintln!(
+                        "NOTE (capability): {test}: {named} is not bindable on this host; \
+                         using {at} as the second listener ({why})"
+                    );
+                }
+                let address = candidate.address;
+                return (v4, Some(SecondLoopback { listener, address }));
+            }
+            Err(why) => passed_over.push((candidate.named(), why)),
         }
     }
-    panic!("no port is free on both 127.0.0.1 and [::1]");
+    let why = if passed_over.is_empty() {
+        "there is no address to try".to_string()
+    } else {
+        passed_over
+            .iter()
+            .map(|(named, why)| format!("{named}: {why}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    eprintln!(
+        "SKIPPED (capability): {test}: no second loopback listener can share the 127.0.0.1 \
+         listener's port ({why}); only its never-dialled checks are skipped, every 127.0.0.1 \
+         check still runs"
+    );
+    (
+        TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1"),
+        None,
+    )
+}
+
+/// A `127.0.0.1` listener and an `address` listener on the same port, tried
+/// on at most 64 ports: a fresh one each time binding `address` fails with
+/// `AddrInUse` (that port is taken there), and a panic when all 64 are.
+/// `Err` with why when the bind fails with an error [`lacks_address`]
+/// accepts; any other bind error panics ([`bind_outcome`]).
+fn same_port_on(address: IpAddr) -> Result<(TcpListener, TcpListener), String> {
+    let mut tries = 0;
+    loop {
+        tries += 1;
+        let v4 = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1");
+        let port = v4.local_addr().expect("address").port();
+        match bind_on(SocketAddr::new(address, port)) {
+            Bound::Listener(second) => return Ok((v4, second)),
+            Bound::Missing(why) => return Err(why),
+            Bound::PortTaken(error) if tries == 64 => panic!(
+                "no port is free on both 127.0.0.1 and {} in 64 tries; the last: {error}",
+                bracketed(address)
+            ),
+            Bound::PortTaken(_) => {}
+        }
+    }
+}
+
+/// `address` as a URL's authority writes it: an IPv6 address bracketed.
+fn bracketed(address: IpAddr) -> String {
+    match address {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => format!("[{v6}]"),
+    }
+}
+
+/// The address a rebinding or mixed answer names beside `127.0.0.1`: the
+/// second listener's, so that a dial of it would be counted — or, on a host
+/// that binds no second loopback address, `::1`, which nothing listens on
+/// there. Every one of them is refused as loopback, under the real policy
+/// and under [`loopback_v4_is_public`] alike.
+fn second_answer(second: Option<&SecondLoopback>) -> IpAddr {
+    second.map_or(V6_LOOPBACK, |second| second.address)
 }
 
 fn code(result: Result<Vec<u8>, ImageInputError>) -> String {
@@ -260,13 +576,46 @@ fn a_url_the_syntax_rules_refuse_opens_nothing() {
 // ── S3: the address policy on every spelling of a literal ────────────────
 
 /// Every spelling of a loopback (or other refused) address is refused
-/// before any connection or resolution — on both loopback families.
+/// before any connection or resolution. Each is checked by its error code
+/// (one the policy let through would be dialled, or resolved, instead of
+/// refused), and the stub resolver must never be asked. The listeners on the
+/// one port every URL names count what reaches them, which must be nothing:
+///
+/// * `127.0.0.1` counts a dial of any spelling of `127.0.0.1`: the IPv4
+///   ones, and the IPv4-mapped `[::ffff:127.0.0.1]` and `[::FFFF:7F00:1]`,
+///   which an `AF_INET6` socket would carry to it over IPv4 whether or not
+///   the host has `::1`.
+/// * The second listener of [`same_port_pair`] counts a dial of its own
+///   address. On a host with an IPv6 loopback that is `[::1]`, which only
+///   `[::1]` and `[0:0:0:0:0:0:0:1]` denote; on a host without one it is
+///   `127.0.0.2`, which every spelling appended from
+///   [`V4_SECOND_LOOPBACK_SPELLINGS`] denotes (checked first, through the
+///   URL parser) — so there the second listener is a sentinel too, not a
+///   bystander.
+///
+/// The other IPv6 spellings — IPv4-compatible, zoned link-local, unique
+/// local — denote addresses nothing here listens on, and the error code
+/// alone checks them; so it does the `::1` spellings beside a `127.0.0.2`
+/// second listener, and the `127.0.0.2` ones beside `[::1]`. On every host,
+/// the IPv4 spellings of `127.0.0.2` hold the loopback rule to all of
+/// `127.0.0.0/8`, not just to `127.0.0.1`.
 #[test]
 fn every_spelling_of_a_refused_literal_is_refused_before_any_connection() {
-    let (v4, v6) = same_port_pair();
+    let (v4, second) =
+        same_port_pair("every_spelling_of_a_refused_literal_is_refused_before_any_connection");
     let port = v4.local_addr().expect("address").port();
+    for host in V4_SECOND_LOOPBACK_SPELLINGS {
+        let url = format!("http://{host}:{port}/img.png");
+        let parsed =
+            parse_remote_image_url(&url).unwrap_or_else(|refusal| panic!("{url}: {refusal}"));
+        assert_eq!(
+            parsed.host().ip().map(|address| address.to_canonical()),
+            Some(V4_SECOND_LOOPBACK),
+            "{host} denotes 127.0.0.2"
+        );
+    }
     let v4 = TestServer::on(v4, |_| Reply::Ok(Vec::new()));
-    let v6 = TestServer::on(v6, |_| Reply::Ok(Vec::new()));
+    let second = second.map(|second| second.serve(|_| Reply::Ok(Vec::new())));
     let lookup = StubLookup::answering(Vec::new());
     let fetcher = stub_fetcher(5_000, &[], &lookup, classify_address);
     for host in [
@@ -294,14 +643,19 @@ fn every_spelling_of_a_refused_literal_is_refused_before_any_connection() {
         "169.254.169.254",
         "10.0.0.1",
         "[fd00::1]",
-    ] {
+    ]
+    .into_iter()
+    .chain(V4_SECOND_LOOPBACK_SPELLINGS)
+    {
         let url = format!("http://{host}:{port}/img.png");
         let error = fetcher.fetch(&url, 1 << 20).expect_err(&url);
         assert_eq!(error.code(), "image_url_refused", "{url}: {error}");
     }
     std::thread::sleep(Duration::from_millis(50));
     assert_eq!(v4.accepts(), 0, "nothing reached 127.0.0.1:{port}");
-    assert_eq!(v6.accepts(), 0, "nothing reached [::1]:{port}");
+    if let Some((second, at)) = &second {
+        assert_eq!(second.accepts(), 0, "nothing reached {at}");
+    }
     assert_eq!(
         lookup.calls(),
         0,
@@ -352,15 +706,21 @@ fn a_name_that_resolves_to_a_refused_address_is_refused_without_disclosing_it() 
 /// fetch dials the vetted address, the name is resolved exactly once, and
 /// the second answer — which a "resolve, check, let the client resolve
 /// again" design would have dialled — is never connected to. The next fetch
-/// gets the loopback answer, and refuses it.
+/// gets the loopback answer, and refuses it. The loopback answer is the
+/// address of the second listener of [`same_port_pair`] (`::1`, or
+/// `127.0.0.2` on a host without an IPv6 loopback), on the port the vetted
+/// address serves, so a dial of it would be counted; on a host that binds
+/// neither, the answer stays `::1` and only the never-dialled checks are
+/// skipped.
 #[test]
 fn the_addresses_vetted_are_the_addresses_dialled() {
-    let (v4, v6) = same_port_pair();
+    let (v4, second) = same_port_pair("the_addresses_vetted_are_the_addresses_dialled");
     let port = v4.local_addr().expect("address").port();
     let body = png();
     let v4 = TestServer::on(v4, move |_| Reply::Ok(body.clone()));
-    let v6 = TestServer::on(v6, |_| Reply::Ok(b"the rebound target".to_vec()));
-    let lookup = StubLookup::answering(vec![vec![V4_LOOPBACK], vec![V6_LOOPBACK]]);
+    let rebound = second_answer(second.as_ref());
+    let second = second.map(|second| second.serve(|_| Reply::Ok(b"the rebound target".to_vec())));
+    let lookup = StubLookup::answering(vec![vec![V4_LOOPBACK], vec![rebound]]);
     let fetcher = stub_fetcher(5_000, &[], &lookup, loopback_v4_is_public);
     let url = format!("http://rebind.example:{port}/img.png");
     let bytes = fetcher
@@ -369,7 +729,13 @@ fn the_addresses_vetted_are_the_addresses_dialled() {
     assert_eq!(bytes, png());
     assert_eq!(lookup.calls(), 1, "one resolution per connection");
     assert_eq!(v4.accepts(), 1);
-    assert_eq!(v6.accepts(), 0, "the rebound address is never dialled");
+    if let Some((second, at)) = &second {
+        assert_eq!(
+            second.accepts(),
+            0,
+            "the rebound address {at} is never dialled"
+        );
+    }
 
     let error = fetcher
         .fetch(&url, 1 << 20)
@@ -377,22 +743,34 @@ fn the_addresses_vetted_are_the_addresses_dialled() {
     assert_eq!(error.code(), "image_url_refused", "{error}");
     assert_eq!(lookup.calls(), 2);
     std::thread::sleep(Duration::from_millis(50));
-    assert_eq!(v6.accepts(), 0, "still never dialled");
+    if let Some((second, at)) = &second {
+        assert_eq!(
+            second.accepts(),
+            0,
+            "the rebound address {at} is still never dialled"
+        );
+    }
 }
 
 /// An answer that mixes a public and a refused address is refused whole —
 /// no "try the next record" — under the stand-in classification and under
 /// the real one (where the public address is never dialled either: the
-/// refusal comes before any connection).
+/// refusal comes before any connection). The refused address of the first
+/// answer is that of the second listener of [`same_port_pair`] (`::1`, or
+/// `127.0.0.2` on a host without an IPv6 loopback), on the port of the
+/// `127.0.0.1` listener, so a dial of either would be counted; on a host
+/// that binds neither, the answer keeps `::1` and only the second
+/// listener's check is skipped.
 #[test]
 fn a_mixed_public_and_private_answer_is_refused_whole() {
-    let (v4, v6) = same_port_pair();
+    let (v4, second) = same_port_pair("a_mixed_public_and_private_answer_is_refused_whole");
     let port = v4.local_addr().expect("address").port();
     let v4 = TestServer::on(v4, |_| Reply::Ok(Vec::new()));
-    let v6 = TestServer::on(v6, |_| Reply::Ok(Vec::new()));
+    let private = second_answer(second.as_ref());
+    let second = second.map(|second| second.serve(|_| Reply::Ok(Vec::new())));
     let url = format!("http://mixed.example:{port}/img.png");
 
-    let lookup = StubLookup::answering(vec![vec![V4_LOOPBACK, V6_LOOPBACK]]);
+    let lookup = StubLookup::answering(vec![vec![V4_LOOPBACK, private]]);
     let error = stub_fetcher(5_000, &[], &lookup, loopback_v4_is_public)
         .fetch(&url, 1 << 20)
         .expect_err("refused");
@@ -411,7 +789,9 @@ fn a_mixed_public_and_private_answer_is_refused_whole() {
     );
     std::thread::sleep(Duration::from_millis(50));
     assert_eq!(v4.accepts(), 0);
-    assert_eq!(v6.accepts(), 0);
+    if let Some((second, at)) = &second {
+        assert_eq!(second.accepts(), 0, "nothing reached {at}");
+    }
 }
 
 // ── S5: redirects ────────────────────────────────────────────────────────
@@ -1247,4 +1627,122 @@ fn preflight_needs_no_network_and_no_thread() {
     assert!(allowed.worker.get().is_none(), "no thread was started");
     std::thread::sleep(Duration::from_millis(50));
     assert_eq!(server.accepts(), 0);
+}
+
+// ── The second listener of `same_port_pair` ─────────────────────────────
+
+/// TEST-NET-1 (RFC 5737), documentation only and on no interface: binding a
+/// listener on it fails with `AddrNotAvailable`, which [`lacks_address`]
+/// accepts — on a host that lets a process bind only addresses it has
+/// (on Linux, `net.ipv4.ip_nonlocal_bind` unset).
+const NOT_LOCAL_V4: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+
+/// The IPv6 documentation prefix (RFC 3849), on no interface either:
+/// binding it fails with `AddrNotAvailable` where the host has IPv6, and
+/// with [`EAFNOSUPPORT`] where its kernel has none (on Linux,
+/// `net.ipv6.ip_nonlocal_bind` unset).
+const NOT_LOCAL_V6: IpAddr = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+
+/// Assert that `listener` is a live `127.0.0.1` listener: it accepts a
+/// connection to its address, from the client that made it.
+fn assert_live_v4_listener(listener: &TcpListener) {
+    let at = listener.local_addr().expect("address");
+    assert_eq!(at.ip(), V4_LOOPBACK, "a 127.0.0.1 listener: {at}");
+    let client = TcpStream::connect(at).expect("connect to the 127.0.0.1 listener");
+    let (_, peer) = listener.accept().expect("the 127.0.0.1 listener accepts");
+    assert_eq!(peer, client.local_addr().expect("address"), "{at}");
+}
+
+/// Only `AddrNotAvailable` and `EAFNOSUPPORT` read as a missing address and
+/// only `AddrInUse` as a taken port; running out of descriptors or memory, a
+/// permission refused or anything else reads as neither.
+#[test]
+fn only_a_missing_address_or_family_reads_as_a_missing_address() {
+    let mut missing = vec![io::Error::from(io::ErrorKind::AddrNotAvailable)];
+    missing.extend(EAFNOSUPPORT.map(io::Error::from_raw_os_error));
+    for error in &missing {
+        assert!(lacks_address(error), "{error:?}");
+    }
+    for error in [
+        io::Error::from(io::ErrorKind::AddrInUse),
+        io::Error::from(io::ErrorKind::PermissionDenied),
+        io::Error::from(io::ErrorKind::OutOfMemory),
+        // EMFILE, "too many open files", on every Unix.
+        io::Error::from_raw_os_error(24),
+        io::Error::other("an unexplained failure"),
+    ] {
+        assert!(!lacks_address(&error), "{error:?}");
+    }
+
+    let at = SocketAddr::new(V6_LOOPBACK, 4_242);
+    for error in missing {
+        match bind_outcome(at, Err(error)) {
+            Bound::Missing(why) => {
+                assert!(why.starts_with("binding [::1]:4242 failed: "), "{why}");
+            }
+            other => panic!("not read as a missing address: {other:?}"),
+        }
+    }
+    let taken = bind_outcome(at, Err(io::Error::from(io::ErrorKind::AddrInUse)));
+    assert!(matches!(taken, Bound::PortTaken(_)), "{taken:?}");
+}
+
+/// A bind error that is neither a missing address nor a taken port is loud:
+/// it panics, naming the error, instead of passing a candidate over.
+#[test]
+#[should_panic(expected = "binding [::1]:0 failed, and not because this host lacks [::1]")]
+fn an_unexplained_bind_error_panics() {
+    bind_outcome(
+        SocketAddr::new(V6_LOOPBACK, 0),
+        Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+    );
+}
+
+/// Candidates the host lacks are passed over without a panic: each probe
+/// reads its bind failure as a missing address, the second listener is
+/// `None` — after a `SKIPPED (capability)` line naming both, the outcome
+/// this test expects — and the `127.0.0.1` listener handed back is live.
+#[test]
+fn second_addresses_the_host_lacks_are_passed_over_without_a_panic() {
+    let candidates = [
+        SecondLoopbackCandidate {
+            address: NOT_LOCAL_V4,
+            probe: || probe_bind(NOT_LOCAL_V4),
+            capability: "TEST-NET-1 address",
+        },
+        SecondLoopbackCandidate {
+            address: NOT_LOCAL_V6,
+            probe: || probe_bind(NOT_LOCAL_V6),
+            capability: "IPv6 documentation address",
+        },
+    ];
+    for candidate in &candidates {
+        let probed = (candidate.probe)();
+        let failed = format!("binding {} failed: ", SocketAddr::new(candidate.address, 0));
+        assert!(
+            probed.as_ref().is_err_and(|why| why.starts_with(&failed)),
+            "{} is on no interface, so binding it must fail as a missing address (a host that \
+             lets a process bind addresses it does not have cannot run this test): {probed:?}",
+            candidate.named()
+        );
+    }
+    let (v4, second) = same_port_pair_in(
+        &candidates,
+        "second_addresses_the_host_lacks_are_passed_over_without_a_panic (an expected skip)",
+    );
+    assert!(second.is_none(), "an address the host lacks was bound");
+    assert_live_v4_listener(&v4);
+}
+
+/// No candidate at all: the second listener is `None` — after a `SKIPPED
+/// (capability)` line, the outcome this test expects — and the `127.0.0.1`
+/// listener handed back is live.
+#[test]
+fn an_empty_candidate_list_gives_no_second_listener_without_a_panic() {
+    let (v4, second) = same_port_pair_in(
+        &[],
+        "an_empty_candidate_list_gives_no_second_listener_without_a_panic (an expected skip)",
+    );
+    assert!(second.is_none(), "no candidate, yet a second listener");
+    assert_live_v4_listener(&v4);
 }

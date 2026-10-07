@@ -640,13 +640,15 @@ fn quant_gpu_bytes<'a, T>(
     Some(bytes)
 }
 
-/// Log a one-line warning when a Metal GEMV falls back to the CPU scalar path,
-/// suppressing the benign "no Metal-capable GPU device" case.
+/// Log a one-line warning when a Metal GEMV fails and the call falls back to
+/// the CPU (K-17: the best CPU SIMD tier for Q4_0/Q8_0, the single shared CPU
+/// kernel for each K-quant format), suppressing the benign "no Metal-capable
+/// GPU device" case.
 #[cfg(all(feature = "metal", target_os = "macos"))]
 fn warn_metal_gemv_fallback(format: &str, e: &crate::gpu_backend::MetalGraphError) {
     let msg = e.to_string();
     if !msg.contains("no Metal-capable GPU device") {
-        tracing::warn!(error = %e, "Metal {format} GEMV failed, falling back to CPU scalar");
+        tracing::warn!(error = %e, "Metal {format} GEMV failed, falling back to the CPU kernel");
     }
 }
 

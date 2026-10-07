@@ -47,7 +47,7 @@ fn encode_q1_0_g128(values: &[f32]) -> BonsaiResult<Vec<u8>> {
         });
     }
     let mut out = Vec::with_capacity(values.len() / 128 * 18);
-    for chunk in values.chunks_exact(128) {
+    for chunk in values.as_chunks::<128>().0 {
         out.extend_from_slice(&f16::from_f32(1.0).to_le_bytes());
         let mut qs = [0u8; 16];
         for (i, &v) in chunk.iter().enumerate() {

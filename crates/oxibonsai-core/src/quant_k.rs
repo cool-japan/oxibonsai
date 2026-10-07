@@ -798,8 +798,7 @@ impl BlockQ3K {
             }
 
             let mut sc_bytes = [0u8; 12];
-            let d;
-            if max_scale != 0.0 {
+            let d = if max_scale != 0.0 {
                 let iscale = -32.0f32 / max_scale;
                 for j in 0..(QK_K / 16) {
                     let mut l = nearest_int(iscale * scales[j]) as i8;
@@ -812,10 +811,10 @@ impl BlockQ3K {
                     l >>= 4;
                     sc_bytes[j % 4 + 8] |= (l as u8) << (2 * (j / 4));
                 }
-                d = f16::from_f32(1.0 / iscale);
+                f16::from_f32(1.0 / iscale)
             } else {
-                d = f16::from_f32(0.0);
-            }
+                f16::from_f32(0.0)
+            };
 
             for j in 0..(QK_K / 16) {
                 let low = if j < 8 {

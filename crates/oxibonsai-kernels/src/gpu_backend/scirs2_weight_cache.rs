@@ -64,18 +64,15 @@ pub(super) fn content_fingerprint(bytes: &[u8]) -> (u64, u64) {
     let len = bytes.len() as u64;
     let mut lo = K0 ^ len;
     let mut hi = K1.wrapping_add(len.rotate_left(17));
-    let mut words = bytes.chunks_exact(8);
-    for chunk in &mut words {
-        let mut word = [0u8; 8];
-        word.copy_from_slice(chunk);
-        let w = u64::from_le_bytes(word);
+    let (words, rest) = bytes.as_chunks::<8>();
+    for chunk in words {
+        let w = u64::from_le_bytes(*chunk);
         lo = (lo ^ w).wrapping_mul(K2).rotate_left(31);
         hi = hi
             .wrapping_add(w.rotate_left(23))
             .wrapping_mul(K3)
             .rotate_left(29);
     }
-    let rest = words.remainder();
     if !rest.is_empty() {
         let mut word = [0u8; 8];
         word[..rest.len()].copy_from_slice(rest);

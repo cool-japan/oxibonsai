@@ -1759,7 +1759,7 @@ mod tests {
         let mut row = vec![0.0f32; shape.hidden];
         table.row(3, shape.hidden, &mut row).expect("row 3");
         assert_eq!(shape.hidden % QK1_0_G128, 0);
-        for (block_index, block) in row.chunks_exact(QK1_0_G128).enumerate() {
+        for (block_index, block) in row.as_chunks::<QK1_0_G128>().0.iter().enumerate() {
             let scale = block[0].abs();
             assert!(scale > 0.0, "block {block_index} decoded to all zeros");
             for (j, value) in block.iter().enumerate() {

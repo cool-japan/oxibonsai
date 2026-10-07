@@ -485,7 +485,7 @@ mod tests {
     /// from the alphabet that can build a marker (349,524 inputs).
     #[test]
     fn no_output_ever_contains_a_marker_opener() {
-        const ALPHABET: [u8; 4] = [b'<', b'|', b'>', b'a'];
+        const ALPHABET: [u8; 4] = *b"<|>a";
         let mut buf = Vec::with_capacity(9);
         fn recurse(buf: &mut Vec<u8>, depth: usize, alphabet: &[u8; 4]) {
             if depth == 0 {

@@ -174,8 +174,10 @@ impl VaeSafetensors {
                         raw.len()
                     )));
                 }
-                raw.chunks_exact(2)
-                    .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                raw.as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| bf16_to_f32(u16::from_le_bytes(*c)))
                     .collect::<Vec<f32>>()
             }
             Dtype::F32 => {
@@ -185,8 +187,10 @@ impl VaeSafetensors {
                         raw.len()
                     )));
                 }
-                raw.chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                raw.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
                     .collect::<Vec<f32>>()
             }
             other => {

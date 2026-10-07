@@ -675,10 +675,28 @@ fn softplus_neon(input: &[f32], output: &mut [f32]) {
 // ═════════════════════════════════════════════════════════════════
 //  x86_64 AVX2+FMA implementations
 //
-//  Matching `simd_float_ops.rs`'s existing (accepted) AVX2 convention:
-//  no vectorized transcendental polynomial on this tier, only on NEON —
-//  `exp`/`ln` run per-lane through a stack buffer, exactly like
-//  `silu_avx2`/`swiglu_avx2`/`softmax_avx2` already do in that file.
+//  This module's own AVX2 kernels have no vectorized transcendental
+//  polynomial: the `exp` in `sigmoid_avx2`, `sigmoid_mul_avx2` and
+//  `rms_norm_gated_avx2`, and the `exp`/`ln` in `softplus_avx2`, run per
+//  lane through an 8-element stack buffer on libm (`f32::exp`/`f32::ln`) —
+//  self-consistent by design, not on the polynomial. Body and tail compute
+//  every value the same way: a 1-7 element tail calls the same
+//  `sigmoid_scalar_elem`/`silu_scalar_elem`/`softplus_scalar_elem`
+//  expression the body applies lane by lane, and the multiplies around it
+//  run in the body's order — `rms_norm_gated_avx2`'s tail is
+//  `((input * inv_rms) * weight) * silu(gate)`, the body's
+//  `(inp * inv_rms) * w` then `* silu_g` — so a value's output does not
+//  depend on where in the buffer it lands. Pinned by
+//  `tests::rms_norm_gated_body_and_tail_agree_bitwise_for_uniform_input` and
+//  `tests::sigmoid_sigmoid_mul_and_softplus_are_bit_identical_regardless_of_offset_and_length`.
+//
+//  `simd_float_ops.rs` no longer shares that convention. It now has the
+//  x86_64 twins of the NEON cores this module imports on aarch64 —
+//  `exp_avx2_f32x8` and `silu_core_avx2_f32x8`, both `pub(crate)` — and its
+//  `silu_avx2`/`swiglu_avx2`/`softmax_avx2` run a padded tail through them
+//  instead of falling back to libm. The kernels below do not use those
+//  twins: the `use` of the NEON pair at the top of this file is
+//  aarch64-only.
 // ═════════════════════════════════════════════════════════════════
 
 /// # Safety
@@ -795,8 +813,13 @@ unsafe fn rms_norm_gated_avx2(
             i += 8;
         }
     }
+    // Tail: the body's operation order (K-M3) — `(input * inv_rms) * weight`,
+    // then `* silu(gate)`, where `silu_scalar_elem` is the same libm-based
+    // `g * (1 / (1 + exp(-g)))` the body applies lane by lane. The previous
+    // `((weight * input) * inv_rms) * silu` rounded differently, so the last
+    // 1-7 elements of a call could differ by an ulp from the body.
     for j in i..n {
-        output[j] = weight[j] * input[j] * inv_rms * silu_scalar_elem(gate[j]);
+        output[j] = ((input[j] * inv_rms) * weight[j]) * silu_scalar_elem(gate[j]);
     }
 }
 
@@ -1055,6 +1078,115 @@ mod tests {
         let gate = vec![1.0; 8];
         let mut output = vec![0.0; 4];
         assert!(rms_norm_gated_simd(&input, &weight, &gate, &mut output, EPS).is_err());
+    }
+
+    // ── K-M3: body/tail bit-identity ────────────────────────────
+
+    /// `(input value, weight, gate, eps)` probes for `rms_norm_gated_simd`.
+    const RMS_NORM_GATED_PROBES: [(f32, f32, f32, f32); 6] = [
+        (0.37, 0.913, -2.5, 1e-5),
+        (-1.3, 1.7, 0.734, 1e-6),
+        (2.75, -0.45, 3.0, 1e-5),
+        (1.0e-3, 3.1, -0.001, 1e-6),
+        (17.0, 0.0125, 12.25, 1e-5),
+        (-0.731, 1.234_5, -16.799_11, 0.0),
+    ];
+
+    /// With a uniform `input` every element shares one `inv_rms` (weight and
+    /// gate never enter it), so one `(weight, gate)` pair must give one
+    /// output bit pattern at every position of every length 1..=24 — the
+    /// 8-lane AVX2 body and its scalar tail, the 4-lane NEON body and its
+    /// padded tail: with uniform weights and gates (`output[0]` vs
+    /// `output[len - 1]`), and with the probe pair among other weights and
+    /// gates (NaN/`-inf` gates included, which must not leak). Before the fix
+    /// the AVX2 tail computed `((weight * input) * inv_rms) * silu(gate)`
+    /// against the body's `((input * inv_rms) * weight) * silu(gate)`.
+    #[test]
+    fn rms_norm_gated_body_and_tail_agree_bitwise_for_uniform_input() {
+        let neighbours: [(f32, f32); 3] =
+            [(0.5, 1.0), (-3.75, f32::NAN), (11.0, f32::NEG_INFINITY)];
+        for (x, w, g, eps) in RMS_NORM_GATED_PROBES {
+            for len in 1..=24usize {
+                let input = vec![x; len];
+                let uniform_weight = vec![w; len];
+                let uniform_gate = vec![g; len];
+                let mut output = vec![f32::NAN; len];
+                rms_norm_gated_simd(&input, &uniform_weight, &uniform_gate, &mut output, eps)
+                    .expect("valid");
+                let reference = output[0];
+                assert_eq!(
+                    reference.to_bits(),
+                    output[len - 1].to_bits(),
+                    "rms_norm_gated len={len} x={x} w={w} g={g} eps={eps}: output[0] = \
+                     {reference:e} (body) but output[{}] = {:e} (tail)",
+                    len - 1,
+                    output[len - 1]
+                );
+                for (neighbour_weight, neighbour_gate) in neighbours {
+                    for pos in 0..len {
+                        let mut weight = vec![neighbour_weight; len];
+                        let mut gate = vec![neighbour_gate; len];
+                        weight[pos] = w;
+                        gate[pos] = g;
+                        rms_norm_gated_simd(&input, &weight, &gate, &mut output, eps)
+                            .expect("valid");
+                        assert_eq!(
+                            output[pos].to_bits(),
+                            reference.to_bits(),
+                            "rms_norm_gated len={len} pos={pos} x={x} w={w} g={g} eps={eps} \
+                             (neighbours w={neighbour_weight}, g={neighbour_gate}) = {:e}, \
+                             expected {reference:e}",
+                            output[pos]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `sigmoid_simd`, `sigmoid_mul_simd` and `softplus_simd` give one value
+    /// the same output bits wherever it lands: on AVX2 the body applies the
+    /// same libm-based `*_scalar_elem` expression lane by lane that the tail
+    /// applies element by element (self-consistent by design, not on the
+    /// polynomial); on NEON body and padded tail share one vector core.
+    #[test]
+    fn sigmoid_sigmoid_mul_and_softplus_are_bit_identical_regardless_of_offset_and_length() {
+        const PROBES: [f32; 8] = [0.734, -2.5, 5.0, -0.001, 19.999, 20.5, -30.0, -88.5];
+        const MULTIPLIER: f32 = -1.375;
+        const NEIGHBOURS: [f32; 3] = [0.1, f32::NAN, f32::INFINITY];
+        for x in PROBES {
+            let mut reference: Option<[u32; 3]> = None;
+            for neighbour in NEIGHBOURS {
+                for len in 1..=24usize {
+                    for pos in 0..len {
+                        let mut input = vec![neighbour; len];
+                        let mut multiplier = vec![neighbour; len];
+                        input[pos] = x;
+                        multiplier[pos] = MULTIPLIER;
+                        let mut sig = vec![f32::NAN; len];
+                        let mut sig_mul = vec![f32::NAN; len];
+                        let mut soft = vec![f32::NAN; len];
+                        sigmoid_simd(&input, &mut sig).expect("valid");
+                        sigmoid_mul_simd(&multiplier, &input, &mut sig_mul).expect("valid");
+                        softplus_simd(&input, &mut soft).expect("valid");
+                        let got = [
+                            sig[pos].to_bits(),
+                            sig_mul[pos].to_bits(),
+                            soft[pos].to_bits(),
+                        ];
+                        match reference {
+                            None => reference = Some(got),
+                            Some(r) => assert_eq!(
+                                got, r,
+                                "[sigmoid, sigmoid_mul, softplus]({x}) at len={len} pos={pos} \
+                                 (neighbours {neighbour}) = {got:#010x?}, expected bit-identical \
+                                 to the first observation {r:#010x?}"
+                            ),
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // ── sigmoid / sigmoid_mul ───────────────────────────────────

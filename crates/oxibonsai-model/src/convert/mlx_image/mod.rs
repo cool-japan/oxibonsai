@@ -345,16 +345,20 @@ fn parse_err(from_path: &Path, e: &safetensors::SafeTensorError) -> MlxImageImpo
 /// [`pack_quantized_module`].
 fn u32_from_le_bytes(bytes: &[u8]) -> Vec<u32> {
     bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
         .collect()
 }
 
 /// Decode a little-endian `u16` (bf16/f16 bit-pattern) buffer from raw bytes.
 fn u16_from_le_bytes(bytes: &[u8]) -> Vec<u16> {
     bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect()
 }
 

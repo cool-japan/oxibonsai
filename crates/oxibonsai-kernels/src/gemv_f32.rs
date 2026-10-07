@@ -417,18 +417,23 @@ pub fn gemv_f32(
 mod tests {
     use super::*;
 
-    /// The exact pre-hoist `lm_head.rs` body, reproduced here so the hoist's
+    /// The pre-hoist `lm_head.rs` body, reproduced here so the hoist's
     /// bit-exactness is asserted against the original code rather than
-    /// against a re-derivation of it. Kept byte-for-byte identical to what
-    /// `crates/oxibonsai-model/src/model/types/lm_head.rs` carried before
-    /// this module existed.
+    /// against a re-derivation of it. The arithmetic is kept identical to
+    /// what `crates/oxibonsai-model/src/model/types/lm_head.rs` carried before
+    /// this module existed: eight independent accumulators fed one 8-wide
+    /// chunk at a time, the accumulators summed in index order, then the
+    /// sub-chunk tail added element by element. Only the chunking is spelled
+    /// differently (`as_chunks::<8>()` instead of `chunks_exact(8)`, per
+    /// `clippy::chunks_exact_to_as_chunks`): it yields the same chunks in the
+    /// same order and the same remainder slice.
     fn pre_hoist_dot(a: &[f32], b: &[f32]) -> f32 {
         let n = a.len().min(b.len());
         let (a, b) = (&a[..n], &b[..n]);
         let mut acc = [0.0f32; 8];
-        let mut a_chunks = a.chunks_exact(8);
-        let mut b_chunks = b.chunks_exact(8);
-        for (x, y) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
+        let (a_chunks, a_remainder) = a.as_chunks::<8>();
+        let (b_chunks, b_remainder) = b.as_chunks::<8>();
+        for (x, y) in a_chunks.iter().zip(b_chunks.iter()) {
             for ((slot, &xv), &yv) in acc.iter_mut().zip(x.iter()).zip(y.iter()) {
                 *slot += xv * yv;
             }
@@ -437,7 +442,7 @@ mod tests {
         for slot in acc {
             sum += slot;
         }
-        for (&xv, &yv) in a_chunks.remainder().iter().zip(b_chunks.remainder().iter()) {
+        for (&xv, &yv) in a_remainder.iter().zip(b_remainder.iter()) {
             sum += xv * yv;
         }
         sum
@@ -597,9 +602,7 @@ mod tests {
                     *slot = f32::NAN;
                 }
             }
-            flat.chunks_exact(LANES)
-                .map(|c| std::array::from_fn(|l| c[l]))
-                .collect()
+            flat.as_chunks::<LANES>().0.to_vec()
         }
         fn check<const MR: usize, const NR: usize>(count: usize, special: bool) {
             let a: Vec<Vec<[f32; LANES]>> = (0..MR)

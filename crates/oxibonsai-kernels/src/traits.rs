@@ -262,8 +262,14 @@ pub trait TernaryKernel: Send + Sync {
 /// scale. The dequantized weight at slot `i` in block `b` is:
 /// `d_b × fp8_decode(qs_b[i])`.
 ///
-/// All tiers initially route to the scalar reference implementation. SIMD
-/// specializations are a follow-on Slice.
+/// [`crate::KernelDispatcher`] implements it per tier (`dispatch_fp8.rs`):
+/// every CPU tier runs its own kernels — the scalar reference on `Reference`,
+/// and the AVX2, AVX-512 and NEON specializations (`simd_fp8_avx2`,
+/// `simd_fp8_avx512`, `simd_fp8_neon`) on `Avx2`, `Avx512` and `Neon`. Only
+/// the `Gpu` tier tries a GPU kernel, and only for GEMV — the Metal or CUDA
+/// one the build carries, if any — falling back to the best CPU SIMD tier
+/// whenever that does not produce the result; its dequantization and GEMM
+/// run on that CPU SIMD tier directly.
 pub trait Fp8Kernel: Send + Sync {
     /// Dequantize FP8 E4M3FN blocks to FP32 values.
     ///

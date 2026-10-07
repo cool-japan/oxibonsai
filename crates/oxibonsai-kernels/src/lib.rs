@@ -166,6 +166,7 @@ pub mod dequant_fp8;
 pub mod dequant_prism;
 pub mod dequant_ternary;
 pub mod dispatch;
+pub mod dispatch_fp8;
 pub mod dispatch_int8;
 pub mod dispatch_log;
 pub mod dispatch_prism;

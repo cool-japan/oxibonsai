@@ -614,7 +614,7 @@ fn legacy_1_7b_decode_path_is_unchanged() {
     let mut out = vec![0.0f32; n_blocks * 128];
     BlockTQ2_0_g128::dequant(blocks, &mut out).expect("dequant");
     // Every decoded value is one of {-d, 0, +d} for its block's scale.
-    for (b, chunk) in out.chunks_exact(128).enumerate() {
+    for (b, chunk) in out.as_chunks::<128>().0.iter().enumerate() {
         let d = blocks[b].d.to_f32();
         assert!(d.is_finite() && d >= 0.0, "block {b} scale {d}");
         for &v in chunk {

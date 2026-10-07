@@ -300,10 +300,8 @@ impl Sha256 {
         tail.extend_from_slice(&bit_len.to_be_bytes());
         debug_assert_eq!(tail.len() % 64, 0);
 
-        for chunk in tail.chunks_exact(64) {
-            let mut block = [0u8; 64];
-            block.copy_from_slice(chunk);
-            Self::compress(&mut self.state, &block);
+        for block in tail.as_chunks::<64>().0 {
+            Self::compress(&mut self.state, block);
         }
 
         let mut out = [0u8; 32];

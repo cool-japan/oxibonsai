@@ -18,15 +18,27 @@
 //!   cargo bench --features bench,metal --bench metal_pool_scaling
 //! ```
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, Criterion};
+
+// Everything below is only used by the measuring path, which exists on macOS
+// with the `metal` feature (the `mod pool` and `bench_pool_scaling` arms below
+// carry the same predicate). Everywhere else the bench just prints why it
+// measured nothing, so these must not be declared there or they are unused.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+use criterion::{BenchmarkId, Throughput};
+#[cfg(all(feature = "metal", target_os = "macos"))]
 use std::sync::Arc;
+#[cfg(all(feature = "metal", target_os = "macos"))]
 use std::time::Duration;
 
 /// Concurrent requests per measured batch.
+#[cfg(all(feature = "metal", target_os = "macos"))]
 const REQUESTS: usize = 8;
 /// Tokens generated per request.
+#[cfg(all(feature = "metal", target_os = "macos"))]
 const MAX_TOKENS: usize = 24;
 /// Context each replica is built with.
+#[cfg(all(feature = "metal", target_os = "macos"))]
 const MAX_SEQ: usize = 256;
 
 #[cfg(all(feature = "metal", target_os = "macos"))]

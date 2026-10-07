@@ -183,16 +183,22 @@ pub fn bytes_to_f32(
 ) -> Result<Vec<f32>, OnnxImportError> {
     match data_type {
         dtype_code::FLOAT32 => Ok(bytes
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect()),
         dtype_code::FLOAT16 => Ok(bytes
-            .chunks_exact(2)
-            .map(|b| half::f16::from_le_bytes([b[0], b[1]]).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| half::f16::from_le_bytes(*b).to_f32())
             .collect()),
         dtype_code::BFLOAT16 => Ok(bytes
-            .chunks_exact(2)
-            .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| half::bf16::from_le_bytes(*b).to_f32())
             .collect()),
         other => Err(OnnxImportError::UnsupportedDtype {
             tensor: tensor_name.to_string(),

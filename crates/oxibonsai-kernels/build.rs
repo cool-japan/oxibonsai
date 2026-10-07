@@ -32,6 +32,13 @@ fn main() {
     // lint stays quiet (required on current Rust); only *set* it on nightly.
     detect_nightly_aarch64_prefetch();
 
+    // `fp8_gpu_gemv`: one name for "this build carries an FP8 GPU GEMV
+    // kernel" (Metal on macOS with `metal`, CUDA on Linux/Windows with
+    // `native-cuda`), the predicate `src/dispatch_fp8.rs` gates its GPU GEMV
+    // path and its tests on. Declared unconditionally like the alias above;
+    // set only when the predicate holds for the target being built.
+    emit_fp8_gpu_gemv_cfg();
+
     let out_dir = match std::env::var("OUT_DIR") {
         Ok(d) => d,
         Err(_) => return,
@@ -100,6 +107,39 @@ fn detect_nightly_aarch64_prefetch() {
 
     if is_nightly {
         println!("cargo:rustc-cfg=nightly_aarch64_prefetch");
+    }
+}
+
+/// Emit the `fp8_gpu_gemv` cfg alias: set exactly when this build carries an
+/// FP8 GPU GEMV kernel for a `KernelTier::Gpu` dispatcher to try — Metal
+/// (`metal_gemv_fp8_*`) on macOS with the `metal` feature, or CUDA
+/// (`cuda_gemv_fp8_*`) on Linux/Windows with `native-cuda`, which is how the
+/// `gpu_backend` modules defining those kernels are gated.
+///
+/// `src/dispatch_fp8.rs` used to spell that predicate out at every site
+/// needing it (its `FP8_GPU_GEMV_COMPILED` constant, both
+/// `Fp8Kernel::gemv_fp8_*` call sites, its private `gpu` module, its tests);
+/// it now writes `#[cfg(fp8_gpu_gemv)]` / `cfg!(fp8_gpu_gemv)`, so the copies
+/// cannot drift apart. Code inside that path that differs per backend still
+/// tests `all(feature = "metal", target_os = "macos")` or
+/// `all(feature = "native-cuda", any(target_os = "linux", target_os =
+/// "windows"))` itself.
+///
+/// Decided from `CARGO_FEATURE_METAL` / `CARGO_FEATURE_NATIVE_CUDA` and
+/// `CARGO_CFG_TARGET_OS`, which describe the crate being compiled — not from
+/// `cfg!(target_os = ...)`, which in a build script names the *host* — so a
+/// cross build gets its target's answer. Like `nightly_aarch64_prefetch`, the
+/// cfg is declared through `rustc-check-cfg` unconditionally, so
+/// `unexpected_cfgs` stays quiet in every build that does not set it.
+fn emit_fp8_gpu_gemv_cfg() {
+    println!("cargo:rustc-check-cfg=cfg(fp8_gpu_gemv)");
+
+    let feature_on = |name: &str| std::env::var_os(format!("CARGO_FEATURE_{name}")).is_some();
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let metal = feature_on("METAL") && target_os == "macos";
+    let cuda = feature_on("NATIVE_CUDA") && matches!(target_os.as_str(), "linux" | "windows");
+    if metal || cuda {
+        println!("cargo:rustc-cfg=fp8_gpu_gemv");
     }
 }
 

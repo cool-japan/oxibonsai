@@ -71,8 +71,10 @@ fn read_npy(path: &Path) -> Result<Npy, String> {
         return Err(format!("{}: payload not f32-aligned", path.display()));
     }
     let raw: Vec<f32> = payload
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect();
     let numel: usize = shape.iter().product();
     if raw.len() < numel {

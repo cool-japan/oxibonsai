@@ -273,7 +273,7 @@ pub fn pack_q1_0_g128(weights: &[f32]) -> Result<Vec<BlockQ1_0G128>, FixtureErro
         });
     }
     let mut blocks = Vec::with_capacity(weights.len() / QK1_0_G128);
-    for group in weights.chunks_exact(QK1_0_G128) {
+    for group in weights.as_chunks::<QK1_0_G128>().0 {
         let mean_abs = group.iter().map(|w| w.abs()).sum::<f32>() / group.len() as f32;
         let scale = if mean_abs > 0.0 { mean_abs } else { 1.0 };
         let mut qs = [0u8; QK1_0_G128 / 8];

@@ -128,8 +128,10 @@ impl<'a> Bf16Tensor<'a> {
         }
         Some(
             self.bytes
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes(*c))
                 .collect(),
         )
     }
@@ -137,8 +139,10 @@ impl<'a> Bf16Tensor<'a> {
     /// Decode the tensor to an owned `Vec<f32>` (row-major, logical order).
     pub fn to_f32_vec(&self) -> Vec<f32> {
         self.bytes
-            .chunks_exact(2)
-            .map(|c| bf16::from_le_bytes([c[0], c[1]]).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| bf16::from_le_bytes(*c).to_f32())
             .collect()
     }
 }

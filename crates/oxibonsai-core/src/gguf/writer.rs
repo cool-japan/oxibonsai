@@ -1129,8 +1129,10 @@ mod tests {
 
         // And decode to f32 to confirm the values survive.
         let decoded: Vec<f32> = read_back
-            .chunks_exact(2)
-            .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| half::bf16::from_le_bytes(*c).to_f32())
             .collect();
         assert_eq!(decoded, vec![1.0, -1.0, 0.0, 0.5, -0.0625, 2000.0]);
     }

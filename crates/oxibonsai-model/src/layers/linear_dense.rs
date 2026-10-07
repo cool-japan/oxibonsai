@@ -182,16 +182,22 @@ impl<'a> LinearDense<'a> {
         let mut weights = Vec::with_capacity(n);
         match tensor_type {
             GgufTensorType::F32 => weights.extend(
-                data.chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+                data.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c)),
             ),
             GgufTensorType::F16 => weights.extend(
-                data.chunks_exact(2)
-                    .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32()),
+                data.as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| half::f16::from_bits(u16::from_le_bytes(*c)).to_f32()),
             ),
             _ => weights.extend(
-                data.chunks_exact(2)
-                    .map(|c| oxibonsai_core::bf16::bf16_to_f32(u16::from_le_bytes([c[0], c[1]]))),
+                data.as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| oxibonsai_core::bf16::bf16_to_f32(u16::from_le_bytes(*c))),
             ),
         }
         LinearDense::with_source_type(

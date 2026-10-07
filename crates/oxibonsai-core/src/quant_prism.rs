@@ -198,7 +198,7 @@ impl BlockPQ2_0 {
     pub fn quantize(input: &[f32]) -> BonsaiResult<Vec<Self>> {
         require_multiple(input.len(), QK_PQ2_0, "PQ2_0")?;
         let mut blocks = Vec::with_capacity(input.len() / QK_PQ2_0);
-        for chunk in input.chunks_exact(QK_PQ2_0) {
+        for chunk in input.as_chunks::<QK_PQ2_0>().0 {
             let mut qs = [0u8; 32];
             let d = quantize_two_bit_body(chunk, &mut qs);
             blocks.push(Self { d, qs });
@@ -275,7 +275,7 @@ impl BlockQ2_0G64 {
     pub fn quantize(input: &[f32]) -> BonsaiResult<Vec<Self>> {
         require_multiple(input.len(), QK_Q2_0_G64, "Q2_0_g64")?;
         let mut blocks = Vec::with_capacity(input.len() / QK_Q2_0_G64);
-        for chunk in input.chunks_exact(QK_Q2_0_G64) {
+        for chunk in input.as_chunks::<QK_Q2_0_G64>().0 {
             let mut qs = [0u8; 16];
             let d = quantize_two_bit_body(chunk, &mut qs);
             blocks.push(Self { d, qs });
@@ -415,7 +415,7 @@ impl BlockPTQ1_0 {
     pub fn quantize(input: &[f32]) -> BonsaiResult<Vec<Self>> {
         require_multiple(input.len(), QK_PTQ1_0, "PTQ1_0")?;
         let mut blocks = Vec::with_capacity(input.len() / QK_PTQ1_0);
-        for chunk in input.chunks_exact(QK_PTQ1_0) {
+        for chunk in input.as_chunks::<QK_PTQ1_0>().0 {
             let mut amax = 0.0f32;
             for &v in chunk {
                 let a = v.abs();

@@ -153,8 +153,10 @@ impl BlockQ1_0G128 {
                 actual: data.len(),
             });
         }
-        data.chunks_exact(BLOCK_SIZE_BYTES)
-            .map(Self::from_bytes_copied)
+        data.as_chunks::<BLOCK_SIZE_BYTES>()
+            .0
+            .iter()
+            .map(|block| Self::from_bytes_copied(block))
             .collect()
     }
 

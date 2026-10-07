@@ -621,8 +621,8 @@ mod tests {
             let name = format!("blk.{layer}.ssm_a");
             let data = file.tensor_data(&name).expect("ssm_a tensor data");
             assert_eq!(data.len(), N_V_HEADS * 4, "ssm_a: {name} byte length");
-            for chunk in data.chunks_exact(4) {
-                let v = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            for chunk in data.as_chunks::<4>().0 {
+                let v = f32::from_le_bytes(*chunk);
                 assert!(v < 0.0, "{name}: element {v} is not negative");
             }
         }

@@ -305,8 +305,10 @@ fn convert_hf_to_gguf_q1_0_g128_end_to_end() {
         );
         let data = gguf.tensor_data(norm_name).expect("norm tensor data");
         let recovered: Vec<f32> = data
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         let original = match norm_name {
             "output_norm.weight" => pattern(2, HIDDEN),
@@ -794,8 +796,10 @@ fn a_non_block_aligned_tensor_lands_in_f32_and_the_rest_is_quantized() {
     // The F32 tensor must round-trip exactly, not through a padded encoding.
     let data = gguf.tensor_data("blk.0.odd.weight").expect("odd data");
     let recovered: Vec<f32> = data
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect();
     assert_eq!(recovered, weights(520, 2));
 }

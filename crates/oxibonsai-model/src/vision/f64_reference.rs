@@ -226,20 +226,20 @@ impl RawTensor<'_> {
         match self.ty {
             GgufTensorType::F32 => {
                 let bytes = fetch(r * n * 4, n * 4)?;
-                for (o, c) in out.iter_mut().zip(bytes.chunks_exact(4)) {
-                    *o = f64::from(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+                for (o, c) in out.iter_mut().zip(bytes.as_chunks::<4>().0.iter()) {
+                    *o = f64::from(f32::from_le_bytes(*c));
                 }
             }
             GgufTensorType::F16 => {
                 let bytes = fetch(r * n * 2, n * 2)?;
-                for (o, c) in out.iter_mut().zip(bytes.chunks_exact(2)) {
-                    *o = half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f64();
+                for (o, c) in out.iter_mut().zip(bytes.as_chunks::<2>().0.iter()) {
+                    *o = half::f16::from_bits(u16::from_le_bytes(*c)).to_f64();
                 }
             }
             GgufTensorType::BF16 => {
                 let bytes = fetch(r * n * 2, n * 2)?;
-                for (o, c) in out.iter_mut().zip(bytes.chunks_exact(2)) {
-                    let bits = u32::from(u16::from_le_bytes([c[0], c[1]])) << 16;
+                for (o, c) in out.iter_mut().zip(bytes.as_chunks::<2>().0.iter()) {
+                    let bits = u32::from(u16::from_le_bytes(*c)) << 16;
                     *o = f64::from(f32::from_bits(bits));
                 }
             }
@@ -252,7 +252,7 @@ impl RawTensor<'_> {
                 }
                 let blocks = n / QK;
                 let bytes = fetch(r * blocks * BYTES, blocks * BYTES)?;
-                for (b, block) in bytes.chunks_exact(BYTES).enumerate() {
+                for (b, block) in bytes.as_chunks::<BYTES>().0.iter().enumerate() {
                     let d = half::f16::from_bits(u16::from_le_bytes([block[0], block[1]])).to_f64();
                     for (j, &q) in block[2..].iter().enumerate() {
                         out[b * QK + j] = d * f64::from(q as i8);
@@ -340,16 +340,16 @@ pub fn linear(x: &[f64], n: usize, w: &RawTensor<'_>, bias: Option<&[f64]>) -> R
 /// A four-accumulator `f64` dot product.
 fn dot(a: &[f64], b: &[f64]) -> f64 {
     let mut acc = [0.0f64; 4];
-    let mut ca = a.chunks_exact(4);
-    let mut cb = b.chunks_exact(4);
-    for (x, y) in (&mut ca).zip(&mut cb) {
+    let (ca, a_remainder) = a.as_chunks::<4>();
+    let (cb, b_remainder) = b.as_chunks::<4>();
+    for (x, y) in ca.iter().zip(cb.iter()) {
         acc[0] += x[0] * y[0];
         acc[1] += x[1] * y[1];
         acc[2] += x[2] * y[2];
         acc[3] += x[3] * y[3];
     }
     let mut sum = (acc[0] + acc[1]) + (acc[2] + acc[3]);
-    for (x, y) in ca.remainder().iter().zip(cb.remainder()) {
+    for (x, y) in a_remainder.iter().zip(b_remainder) {
         sum += x * y;
     }
     sum

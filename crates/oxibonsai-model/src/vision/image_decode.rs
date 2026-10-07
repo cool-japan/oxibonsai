@@ -724,7 +724,7 @@ pub fn decode_png_within(
                 if data.is_empty() || data.len() % 3 != 0 || data.len() > 3 * 256 {
                     return Err(malformed_png(format!("PLTE of {} bytes", data.len())));
                 }
-                palette = data.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+                palette = data.as_chunks::<3>().0.to_vec();
             }
             b"IDAT" => {
                 if header.is_none() {
@@ -959,7 +959,9 @@ fn decode_jpeg_inner(
         jpeg_decoder::PixelFormat::RGB24 => pixels,
         jpeg_decoder::PixelFormat::L8 => pixels.iter().flat_map(|&v| [v, v, v]).collect(),
         jpeg_decoder::PixelFormat::CMYK32 => pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .flat_map(|px| {
                 // The decoder returns true CMYK (it undoes Adobe's inverted
                 // storage; for YCCK, R'G'B' plus 255 - K). `stb_image`

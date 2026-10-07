@@ -82,8 +82,10 @@ fn read_npy(path: &Path) -> Result<Npy, String> {
             return Err(format!("{}: payload short", path.display()));
         }
         let data: Vec<f32> = payload[..numel * 4]
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         return Ok(Npy { data, shape });
     }
@@ -107,13 +109,17 @@ fn read_npy_int(path: &Path) -> Result<Vec<i64>, String> {
     let payload = &bytes[data_start..];
     if header.contains("'<i4'") {
         Ok(payload
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i64)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c) as i64)
             .collect())
     } else if header.contains("'<i8'") {
         Ok(payload
-            .chunks_exact(8)
-            .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| i64::from_le_bytes(*c))
             .collect())
     } else {
         Err(format!("{}: not an int npy: {header}", path.display()))

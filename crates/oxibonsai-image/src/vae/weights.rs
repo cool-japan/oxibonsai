@@ -224,8 +224,10 @@ pub fn read_npy_f32(path: &Path) -> VaeResult<Tensor> {
         )));
     }
     let raw: Vec<f32> = payload[..numel * 4]
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect();
     let data = if fortran && shape.len() > 1 {
         fortran_to_c(&raw, &shape)

@@ -266,7 +266,7 @@ pub fn quantize_q1_0_g128_with(weights: &[f32], rule: ScaleRule) -> Result<Vec<u
     let num_blocks = weights.len() / GROUP_SIZE;
     let mut out = Vec::with_capacity(num_blocks * BLOCK_BYTES);
 
-    for chunk in weights.chunks_exact(GROUP_SIZE) {
+    for chunk in weights.as_chunks::<GROUP_SIZE>().0 {
         let block = quantize_group_with(chunk, rule);
         out.extend_from_slice(&block);
     }
@@ -289,10 +289,7 @@ pub fn dequantize_q1_0_g128(data: &[u8]) -> Result<Vec<f32>, QuantizeError> {
     let num_blocks = data.len() / BLOCK_BYTES;
     let mut out = Vec::with_capacity(num_blocks * GROUP_SIZE);
 
-    for chunk in data.chunks_exact(BLOCK_BYTES) {
-        let block: &[u8; BLOCK_BYTES] = chunk
-            .try_into()
-            .expect("chunks_exact guarantees correct length");
+    for block in data.as_chunks::<BLOCK_BYTES>().0 {
         let decoded = dequantize_block(block);
         out.extend_from_slice(&decoded);
     }
@@ -771,16 +768,22 @@ pub fn dequant_source_bytes(dtype: SourceDtype, bytes: &[u8]) -> Result<Vec<f32>
     }
     let out = match dtype {
         SourceDtype::F32 => bytes
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect(),
         SourceDtype::F16 => bytes
-            .chunks_exact(2)
-            .map(|b| f16::from_le_bytes([b[0], b[1]]).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| f16::from_le_bytes(*b).to_f32())
             .collect(),
         SourceDtype::BF16 => bytes
-            .chunks_exact(2)
-            .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| half::bf16::from_le_bytes(*b).to_f32())
             .collect(),
     };
     Ok(out)

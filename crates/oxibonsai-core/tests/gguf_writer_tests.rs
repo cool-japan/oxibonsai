@@ -105,8 +105,10 @@ fn test_gguf_writer_tensor_roundtrip() {
 
     // Re-interpret the bytes as f32 and verify values.
     let recovered: Vec<f32> = tensor_data
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes(b.try_into().expect("slice")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
         .collect();
     assert_eq!(recovered, weights);
 }

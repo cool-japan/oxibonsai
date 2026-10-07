@@ -362,9 +362,7 @@ impl ExpertBuffer {
         for slot in &mut self.slots {
             slot.clear();
         }
-        for c in &mut self.counts {
-            *c = 0;
-        }
+        self.counts.fill(0);
         self.overflow_count = 0;
     }
 }

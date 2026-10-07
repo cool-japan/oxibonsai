@@ -201,8 +201,10 @@ fn dequant_ternary(raw: &[u8]) -> Result<Vec<f32>, Box<dyn Error>> {
 /// rather than this example's former inline copy of the identical
 /// bit-manipulation.
 fn decode_bf16(raw: &[u8]) -> Vec<f32> {
-    raw.chunks_exact(2)
-        .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+    raw.as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| bf16_to_f32(u16::from_le_bytes(*c)))
         .collect()
 }
 
