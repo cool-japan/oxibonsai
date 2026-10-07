@@ -91,6 +91,10 @@ pub mod encode_q1;
 // Milestone 2: CUDA ternary full-forward path (placeholder).
 pub mod encode_ternary;
 
+// The identity rule shared by the Q1 and ternary cached weight sets.
+mod weight_identity;
+use weight_identity::{weight_set_fingerprint, LayerWeightIdentity};
+
 // =============================================================================
 // Compiled CUDA attention modules
 // =============================================================================
@@ -535,18 +539,20 @@ struct CudaFullLayerState {
 
     /// Cache for FP32 norm weights (separate from the Q1 u8 weight cache).
     f32_weight_cache: Mutex<HashMap<u64, Arc<CudaSlice<f32>>>>,
-    /// Cached GPU model weights for the ternary (TQ2) decode path, paired with a
-    /// content fingerprint of the source weight bytes — rebuilt only when the
-    /// model changes.  Validated by BOTH the fingerprint AND the layer count so a
+    /// Cached GPU model weights for the ternary (TQ2) decode path, paired with an
+    /// identity fingerprint of the weight set (`weight_identity`) — rebuilt only
+    /// when the model changes.  Validated by BOTH the fingerprint AND the layer count so a
     /// same-depth ternary model swap rebuilds rather than silently reusing another
     /// model's uploaded GPU buffers (see
     /// `encode_ternary::get_or_build_ternary_model_weights`).
     cached_model_weights: Mutex<Option<(u64, CudaCachedModelWeights)>>,
-    /// Cached GPU model weights for the Q1 decode path, paired with a content
-    /// fingerprint of the source weight bytes.  Distinct slot from
-    /// `cached_model_weights` so Q1 and TQ2 can never alias, and the fingerprint
-    /// guards against returning a *different* same-depth model's uploaded buffers
-    /// (e.g. two same-`n_layers` finetunes) — see `get_or_build_model_weights`.
+    /// Cached GPU model weights for the Q1 decode path, paired with an identity
+    /// fingerprint of the weight set (`weight_identity`, the ternary slot's
+    /// rule).  Distinct slot from `cached_model_weights` so Q1 and TQ2 can never
+    /// alias, and the fingerprint guards against returning a *different*
+    /// same-depth model's uploaded buffers (two same-`n_layers` finetunes, or a
+    /// reload whose host slices reuse a dropped model's addresses) — see
+    /// `get_or_build_model_weights`.
     cached_q1_model_weights: Mutex<Option<(u64, CudaCachedModelWeights)>>,
     /// Captured CUDA driver graph for replaying the N-layer pipeline, **keyed**
     /// on the model it was captured for (finding **F-M1**).
@@ -814,64 +820,29 @@ pub(super) fn release_f32_weights(handles: &[u64]) -> Result<(usize, usize), Cud
 // Per-process model weight cache
 // =============================================================================
 
-/// Cheap content-and-identity fingerprint of a Q1 model's whole weight set.
+/// Identity fingerprint of a Q1 model's whole weight set: the value the cached
+/// GPU weight set (`cached_q1_model_weights`) is validated against on every
+/// decode token. It applies the ternary cache's rule ([`weight_identity`],
+/// shared with [`encode_ternary::ternary_model_weights_fingerprint`]): per
+/// layer, every handle id, base address + length of every model-owned source
+/// slice, and the length only of the fused Q‖K‖V buffer.
 ///
-/// Combines each layer's weight/norm source-slice base pointer + length into an
-/// FNV-1a hash.  The pointers are stable for the lifetime of a loaded model
-/// (they reference the model's owned / mmap'd bytes or its cached QKV concats)
-/// and differ across concurrently-loaded models, so a same-`n_layers` model swap
-/// (e.g. two same-depth finetunes) produces a different fingerprint.  Cost is
-/// O(n_layers) with a tiny constant, cheap enough to run on every decode token.
+/// The handle ids are what separate two loads. `oxibonsai-model`
+/// (`forward_cuda/q1.rs`) composes the norm slots, and the weight fallbacks,
+/// over the model's `cuda_model_epoch` (`SlotNamespace`), and takes the fused
+/// weights' ids from the upload-handle counter when the block was uploaded at
+/// load; neither ever repeats. This fingerprint used to hash the source
+/// slices' addresses and lengths only, so a same-depth Q1 model loaded after
+/// another was dropped could match the stale entry, and be decoded with the
+/// dropped model's device weights, whenever the allocator handed it every one
+/// of the freed addresses. Its handles now differ, so it rebuilds.
 ///
-/// Residual edge case (accepted for this defense-in-depth check): if one model is
-/// dropped and a different one is loaded that happens to reuse the *exact* same
-/// base addresses and lengths for every layer, the fingerprints collide.  This is
-/// effectively impossible in practice and only matters in a (currently
-/// unsupported) multi-model-per-process configuration.
+/// The fused Q‖K‖V buffer is the model's cached concatenation
+/// (`cuda_qkv_cache`): its address is stable for one model, but it is an
+/// allocator artefact rather than an identity, so, as on the ternary path,
+/// only its length is mixed.
 fn model_weights_fingerprint(layer_params: &[CudaFullForwardLayerParams<'_>]) -> u64 {
-    let mut h = 0xcbf29ce484222325u64; // FNV-1a offset basis
-    let mut mix = |v: u64| {
-        h ^= v;
-        h = h.wrapping_mul(0x100000001b3);
-    };
-    mix(layer_params.len() as u64);
-    for lp in layer_params {
-        let parts: [(u64, u64); 7] = [
-            (
-                lp.attn_norm_bytes.as_ptr() as usize as u64,
-                lp.attn_norm_bytes.len() as u64,
-            ),
-            (
-                lp.fused_qkv_bytes.as_ptr() as usize as u64,
-                lp.fused_qkv_bytes.len() as u64,
-            ),
-            (
-                lp.attn_proj_bytes.as_ptr() as usize as u64,
-                lp.attn_proj_bytes.len() as u64,
-            ),
-            (
-                lp.gate_bytes.as_ptr() as usize as u64,
-                lp.gate_bytes.len() as u64,
-            ),
-            (
-                lp.up_bytes.as_ptr() as usize as u64,
-                lp.up_bytes.len() as u64,
-            ),
-            (
-                lp.down_bytes.as_ptr() as usize as u64,
-                lp.down_bytes.len() as u64,
-            ),
-            (
-                lp.ffn_norm_bytes.as_ptr() as usize as u64,
-                lp.ffn_norm_bytes.len() as u64,
-            ),
-        ];
-        for (ptr, len) in parts {
-            mix(ptr);
-            mix(len);
-        }
-    }
-    h
+    weight_set_fingerprint(layer_params.iter().map(LayerWeightIdentity::from))
 }
 
 /// Build (or return the already-cached) GPU weight handles for all transformer layers.
@@ -884,8 +855,9 @@ fn model_weights_fingerprint(layer_params: &[CudaFullForwardLayerParams<'_>]) ->
 /// `try_cuda_full_forward` behaviour of doing 288+ `HashMap` lookups + mutex
 /// acquisitions every token.
 ///
-/// The cache is validated by BOTH the layer count and a content fingerprint
-/// ([`model_weights_fingerprint`]) so a same-depth model swap rebuilds rather than
+/// The cache is validated by BOTH the layer count and an identity fingerprint
+/// ([`model_weights_fingerprint`]) so a same-depth model swap (including a reload
+/// whose host slices land on a dropped model's addresses) rebuilds rather than
 /// silently reusing another model's uploaded GPU buffers.  It uses a Q1-only slot
 /// (`cached_q1_model_weights`), disjoint from the ternary slot, so Q1 and TQ2
 /// weight sets can never alias even at equal `n_layers`.

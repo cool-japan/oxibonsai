@@ -1021,7 +1021,7 @@ impl GpuBackendTrait for Scirs2BackendHandle {
 /// backend (`MET-M1`), returning the number of buffers freed.
 ///
 /// The single seam `InferenceEngine`'s `Drop` goes through: it resolves the
-/// backend via [`KernelDispatcher::gpu_backend`](crate::KernelDispatcher::gpu_backend)
+/// backend via `KernelDispatcher::gpu_backend` (a GPU-feature-gated accessor)
 /// — `None` on every CPU tier, in which case nothing was uploaded under the
 /// engine's epoch and there is nothing to do — and never touches any other
 /// epoch, unlike the process-wide `Scirs2Backend::clear_weight_cache`, which

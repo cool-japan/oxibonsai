@@ -19,7 +19,7 @@
 //!
 //! Every CUDA construct specific to the `qwen35` hybrid layer, the Hadamard
 //! transform, `PTQ1_0` or `PQ2_0` lives in this module or in
-//! [`super::super::cuda_qwen35`] (the host-side wiring).
+//! `crate::gpu_backend::cuda_qwen35` (the host-side wiring, `native-cuda` only).
 //!
 //! # Scope
 //!
@@ -36,7 +36,7 @@
 //! a 256-wide head.
 //! `PTQ1_0` (ggml 143) is **not** a device kernel here: like `PQ2_0`, its
 //! ternary codes are losslessly representable in the existing 2-bit SoA
-//! layout, so [`super::super::cuda_qwen35`] transcodes it once at weight-load
+//! layout, so `crate::gpu_backend::cuda_qwen35` transcodes it once at weight-load
 //! time and the proven `gemv_tq2_g128_v1` kernel
 //! (`crate::gpu_backend::cuda_kernels`) serves it — no new GEMV kernel, no
 //! new decode table to get wrong on-device.

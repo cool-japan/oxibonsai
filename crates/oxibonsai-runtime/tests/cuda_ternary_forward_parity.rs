@@ -16,13 +16,41 @@
 //! Both cases below always exist (this file carries no `native-cuda`/
 //! `target_os` gate of its own) and self-skip, recording the miss under
 //! [`Capability::CudaHardware`], on a build with no CUDA target or no
-//! accessible device; the real comparison lives in [`cuda_impl`] and compiles
+//! accessible device, and when no usable model file is found (see "The model
+//! file" below); the real comparison lives in [`cuda_impl`] and compiles
 //! only with `--features native-cuda` on Linux/Windows. Neither branch ever
 //! writes `executed: true` from file presence alone — only after a genuine
-//! device probe *and* the comparison it names has passed. Run for real with:
+//! device probe *and* the comparison it names has passed. Run for real (with
+//! a `TQ2_0_g128` file, see below) with:
 //!   OXI_MODEL=/abs/path/Ternary-Bonsai-8B.gguf \
 //!     cargo test -p oxibonsai-runtime --features native-cuda \
 //!     --test cuda_ternary_forward_parity
+//!
+//! # The model file
+//!
+//! `OXI_MODEL`, when set and non-empty, names the file, which is used as
+//! given. Otherwise the testkit fallback (`$OXIBONSAI_MODELS_DIR`, else
+//! `<workspace>/models`) is searched for `Ternary-Bonsai-8B.gguf` and then,
+//! when that file is absent or stored as `PQ2_0`, for
+//! `Ternary-Bonsai-8B-tq2_0_g128.gguf` (the two names the F-M1 harness
+//! `cuda_graph_slot_two_models.rs` looks for). The chosen path is printed.
+//!
+//! The chosen file's stored format is probed before anything loads it: its
+//! LM-head tensor type (`output.weight`, else `token_embd.weight`, the
+//! loader's own rule) is read from the GGUF header through a memory map.
+//! Since 3c9993a, `oxibonsai convert --quant tq2_0_g128` (what
+//! `scripts/download_ternary.sh` runs) writes `TQ2_0_g128` (ggml id 42);
+//! pre-release 0.2.4 builds before that commit wrote PrismML `PQ2_0` (id
+//! 142) instead, which the `qwen3` runtime cannot load:
+//! `BonsaiModel::from_gguf` refuses a `PQ2_0` LM head, for which no
+//! output-projection wrapper exists. On such a file both cases self-skip
+//! with a `skip:` line that names the file and says how to get an id-42 one
+//! (re-convert it with the 0.2.4 converter, or point `OXI_MODEL` /
+//! `OXIBONSAI_MODELS_DIR` at an id-42 file), and record `executed: false`.
+//! Unlike the P14/P15 and F-M1 harnesses, this test never re-encodes a
+//! `PQ2_0` file. A file that cannot be opened self-skips as well; one that
+//! does not parse as GGUF fails the test, as loading it would. Every other
+//! stored type goes to the loader as before.
 
 // Only the non-CUDA arm's `#[test]` bodies call these directly (the CUDA arm
 // calls through `cuda_impl`, which imports its own copy) — gated the same
@@ -50,17 +78,27 @@ const REAL_TERNARY_DECODE_LOGIT_DELTA: &str =
     any(target_os = "linux", target_os = "windows")
 ))]
 mod cuda_impl {
+    use std::path::{Path, PathBuf};
     use std::time::Instant;
 
-    use oxibonsai_core::gguf::reader::GgufFile;
+    use oxibonsai_core::gguf::reader::{mmap_gguf_file, GgufFile};
+    use oxibonsai_core::gguf::types::GgufTensorType;
     use oxibonsai_kernels::dispatch::{KernelDispatcher, KernelTier};
     use oxibonsai_kernels::CudaGraph;
     use oxibonsai_model::model::BonsaiModel;
     use oxibonsai_runtime::engine::InferenceEngine;
     use oxibonsai_runtime::sampling::SamplingParams;
     use oxibonsai_testkit::capability::{record_executed_timed, record_skipped, Capability};
+    use oxibonsai_testkit::workspace::{find_model, models_dir};
 
     const MAX_SEQ: usize = 512;
+    /// The ternary GGUF the testkit fallback looks for first when `OXI_MODEL`
+    /// is unset.
+    const TERNARY_FILE: &str = "Ternary-Bonsai-8B.gguf";
+    /// The id-42 (`TQ2_0_g128`) file's name, looked for when `OXI_MODEL` is
+    /// unset and [`TERNARY_FILE`] is absent or stored as `PQ2_0` (the F-M1
+    /// harness's `TQ2_FILE_NATIVE`).
+    const TERNARY_FILE_NATIVE: &str = "Ternary-Bonsai-8B-tq2_0_g128.gguf";
 
     fn greedy_params() -> SamplingParams {
         SamplingParams {
@@ -88,21 +126,107 @@ mod cuda_impl {
         CudaGraph::global().is_ok()
     }
 
-    /// `OXI_MODEL`, or the real ternary GGUF resolved through the testkit
-    /// `models/`/`$OXIBONSAI_MODELS_DIR` fallback, read into memory.
-    fn read_model() -> Option<Vec<u8>> {
-        let path = std::env::var("OXI_MODEL")
+    /// The format probe: the stored GGUF type of the LM head of the file at
+    /// `path`, read before anything loads the file — `output.weight`, or
+    /// `token_embd.weight` for a tied model (the loader's own rule), `None`
+    /// when the file has neither. The file is memory-mapped and only its
+    /// header is parsed, so probing a multi-GB GGUF stays cheap. `Err` when
+    /// the file cannot be opened or mapped (a skip, as an unreadable file
+    /// always was); a file that does not parse as GGUF panics, as [`run`]
+    /// would on it.
+    fn lm_head_type(path: &Path) -> Result<Option<GgufTensorType>, String> {
+        let mmap = mmap_gguf_file(path).map_err(|e| format!("cannot read {path:?}: {e}"))?;
+        let gguf = GgufFile::parse(&mmap)
+            .unwrap_or_else(|e| panic!("cuda_ternary_forward_parity: parse {path:?}: {e}"));
+        Ok(gguf
+            .tensors
+            .get("output.weight")
+            .or_else(|| gguf.tensors.get("token_embd.weight"))
+            .map(|info| info.tensor_type))
+    }
+
+    /// The stored LM-head type, as the chosen-path line prints it.
+    fn lm_head_label(head: Option<GgufTensorType>) -> String {
+        match head {
+            Some(t) => format!("LM head stored as {t}, ggml id {}", t.wire_id()),
+            None => "no output.weight or token_embd.weight tensor".to_owned(),
+        }
+    }
+
+    /// The `skip:` reason for a file whose LM head is stored as `PQ2_0`.
+    fn pq2_0_skip_reason(path: &Path) -> String {
+        format!(
+            "{path:?} is stored as PQ2_0 (ggml id 142), which the qwen3 runtime cannot load \
+             (BonsaiModel::from_gguf refuses a PQ2_0 LM head); re-convert it with the 0.2.4 \
+             converter (`oxibonsai convert --quant tq2_0_g128` at or after 3c9993a writes \
+             TQ2_0_g128, ggml id 42), or point OXI_MODEL / OXIBONSAI_MODELS_DIR at an id-42 \
+             file such as {TERNARY_FILE_NATIVE}"
+        )
+    }
+
+    /// The ternary GGUF to drive, chosen and probed with [`lm_head_type`]
+    /// before anything loads it (module docs, "The model file"); the chosen
+    /// path is printed. `OXI_MODEL` is used as given; without it,
+    /// [`TERNARY_FILE_NATIVE`] is tried when [`TERNARY_FILE`] is absent or
+    /// stored as `PQ2_0`. `Err` carries the reason for the caller's `skip:`
+    /// line: no file found, a file that cannot be opened, or a chosen file
+    /// stored as `PQ2_0` (ggml id 142), which the `qwen3` runtime cannot
+    /// load and this test does not re-encode.
+    fn resolve_model(test: &str) -> Result<PathBuf, String> {
+        if let Some(path) = std::env::var("OXI_MODEL")
             .ok()
             .filter(|v| !v.is_empty())
-            .map(std::path::PathBuf::from)
-            .or_else(|| oxibonsai_testkit::workspace::find_model("Ternary-Bonsai-8B.gguf"))?;
-        match std::fs::read(&path) {
-            Ok(b) => Some(b),
-            Err(e) => {
-                eprintln!("cuda_ternary_forward_parity: cannot read {path:?}: {e}");
-                None
+            .map(PathBuf::from)
+        {
+            let head = lm_head_type(&path)?;
+            if head == Some(GgufTensorType::PQ2_0) {
+                return Err(pq2_0_skip_reason(&path));
             }
+            eprintln!(
+                "{test}: model {path:?} (OXI_MODEL; {})",
+                lm_head_label(head)
+            );
+            return Ok(path);
         }
+        let plain = find_model(TERNARY_FILE);
+        if let Some(path) = &plain {
+            let head = lm_head_type(path)?;
+            if head != Some(GgufTensorType::PQ2_0) {
+                eprintln!("{test}: model {path:?} ({})", lm_head_label(head));
+                return Ok(path.clone());
+            }
+            eprintln!(
+                "{test}: {path:?} is stored as PQ2_0 (ggml id 142), which the qwen3 runtime \
+                 cannot load; looking for {TERNARY_FILE_NATIVE} instead"
+            );
+        }
+        let Some(native) = find_model(TERNARY_FILE_NATIVE) else {
+            return Err(match plain {
+                Some(path) => format!(
+                    "{} (no {TERNARY_FILE_NATIVE} under {:?} to fall back to)",
+                    pq2_0_skip_reason(&path),
+                    models_dir()
+                ),
+                None => format!(
+                    "set OXI_MODEL or OXIBONSAI_MODELS_DIR to a real ternary GGUF (neither \
+                     {TERNARY_FILE} nor {TERNARY_FILE_NATIVE} found under {:?})",
+                    models_dir()
+                ),
+            });
+        };
+        let head = lm_head_type(&native)?;
+        if head == Some(GgufTensorType::PQ2_0) {
+            return Err(pq2_0_skip_reason(&native));
+        }
+        eprintln!("{test}: model {native:?} ({})", lm_head_label(head));
+        Ok(native)
+    }
+
+    /// The file [`resolve_model`] chose, read into memory; `Err` carries the
+    /// reason for the caller's `skip:` line.
+    fn read_model(test: &str) -> Result<Vec<u8>, String> {
+        let path = resolve_model(test)?;
+        std::fs::read(&path).map_err(|e| format!("cannot read {path:?}: {e}"))
     }
 
     /// Greedy CPU-reference vs CUDA-Gpu output must match on the real ternary
@@ -115,13 +239,13 @@ mod cuda_impl {
             record_skipped(Capability::CudaHardware, test);
             return;
         }
-        let Some(gguf) = read_model() else {
-            eprintln!(
-                "skip: {test} — set OXI_MODEL or OXIBONSAI_MODELS_DIR to a real ternary GGUF \
-                 (e.g. Ternary-Bonsai-8B.gguf)"
-            );
-            record_skipped(Capability::CudaHardware, test);
-            return;
+        let gguf = match read_model(test) {
+            Ok(bytes) => bytes,
+            Err(why) => {
+                eprintln!("skip: {test} — {why}");
+                record_skipped(Capability::CudaHardware, test);
+                return;
+            }
         };
         let start = Instant::now();
         let plen: usize = std::env::var("OXI_PROMPT_LEN")
@@ -155,13 +279,13 @@ mod cuda_impl {
             record_skipped(Capability::CudaHardware, test);
             return;
         }
-        let Some(gguf) = read_model() else {
-            eprintln!(
-                "skip: {test} — set OXI_MODEL or OXIBONSAI_MODELS_DIR to a real ternary GGUF \
-                 (e.g. Ternary-Bonsai-8B.gguf)"
-            );
-            record_skipped(Capability::CudaHardware, test);
-            return;
+        let gguf = match read_model(test) {
+            Ok(bytes) => bytes,
+            Err(why) => {
+                eprintln!("skip: {test} — {why}");
+                record_skipped(Capability::CudaHardware, test);
+                return;
+            }
         };
         let start = Instant::now();
         let plen: usize = std::env::var("OXI_PROMPT_LEN")

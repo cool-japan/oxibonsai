@@ -380,7 +380,7 @@ impl KernelDispatcher {
     ///
     /// # Tier behaviour
     ///
-    /// Every tier — including [`KernelTier::Gpu`] — currently executes
+    /// Every tier — including `KernelTier::Gpu` — currently executes
     /// [`crate::gemv_f32::gemv_f32`], whose eight-lane accumulator structure
     /// (two 128-bit vectors, written with NEON / SSE intrinsics where the
     /// target has them) already covers the CPU tiers without a per-tier body.
@@ -425,7 +425,7 @@ impl KernelDispatcher {
     ///
     /// # Tier behaviour
     ///
-    /// Every tier — including [`KernelTier::Gpu`] — runs the same CPU kernel:
+    /// Every tier — including `KernelTier::Gpu` — runs the same CPU kernel:
     /// the dispatcher does not route a dense FP32 GEMM to any GPU backend (nor
     /// does [`Self::gemv_f32`] route its GEMV), so the GPU tier does not
     /// degrade to anything else here. When such a route lands, this method is

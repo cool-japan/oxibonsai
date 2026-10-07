@@ -752,14 +752,15 @@ ignored without an error — check spelling against it.
   against 6.2 tok/s on the AVX-512 CPU). The Q1 batch prefill ran at 0.6-0.8x the
   per-token CUDA path on that GPU. A K-quant or FP8 model's CUDA warm-up runs a
   17-token sequential prefill (3-10 s at load). The 8B ternary model held 5739
-  MiB of VRAM for a 2081 MiB file. FP8 linears keep the dispatcher chosen at load,
-  so an engine forced to the reference kernel tier still runs the CUDA FP8 GEMV
-  (`--backend cpu` is unaffected).
+  MiB of VRAM for a 2081 MiB file. FP8, `Q4_0`, `Q8_0` and K-quant linears decide at
+  load whether they may use the GPU, so an engine forced to the reference kernel tier
+  around a model loaded outside `--backend cpu` still runs their CUDA GEMVs
+  (`--backend cpu` runs none of them on the GPU).
   With a Q1 or ternary model, a 2-16-token prefill window after a device-KV batch
   chunk is refused (`GPU_FALLBACK_REQUIRES_CACHE_REBUILD`); `run`, `chat` and `serve`
   never emit one unless `--prefill-chunk` is 2-16 (both chunk planners fold such a
   tail into the previous window when the chunk exceeds 16 tokens, as of 0.2.4;
-  verified on the CPU, CUDA re-run pending), but a library caller that drives
+  verified on the CPU and on the RTX A4000 by the P14/P15 harness's `chunk=120` arm), but a library caller that drives
   `forward_prefill` with its own windows can.
 - **`oxibonsai quantize` keeps the LM head F32**, so its `Q4_0` / `Q8_0` / K-quant /
   FP8 output never reaches the CUDA branches of those formats; see
@@ -861,7 +862,7 @@ before running it.
    evidence that does exist and its scope (for 0.2.4: a separate Linux run on one RTX
    A4000 on 2026-10-07, which covered the CUDA parity harnesses and the dev-profile
    all-features nextest stage, but not this gate end to end; `ci.sh --release` /
-   `release-gate.sh --require-cuda` on a CUDA host is still pending). **On a release host without the CUDA toolkit (every macOS host) the
+   `release-gate.sh --require-cuda --skip-bonsai2-models` passed on the RTX A4000 host on 2026-10-07 at 7eaf006 with no waiver). **On a release host without the CUDA toolkit (every macOS host) the
    `cuda-syntax` stage can never get its `nvcc` pass, so the owner must pass
    `--accept-approximate-cuda-syntax` explicitly**, to `./scripts/release-gate.sh` and
    again to `./scripts/publish.sh` (which re-runs the gate and forwards the flag only

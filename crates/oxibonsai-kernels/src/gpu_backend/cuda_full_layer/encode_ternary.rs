@@ -333,50 +333,14 @@ pub unsafe fn encode_layer_into_ternary(
 ///   thread). Address reuse could equally make two different buffers compare
 ///   equal, so the address never was a usable identity in either direction.
 ///
+/// The rule is shared with the Q1 cache's [`super::model_weights_fingerprint`]
+/// ([`super::weight_identity`]), so the two weight caches cannot drift apart.
 /// Cost is O(n_layers) with a tiny constant, cheap enough to run on every
 /// decode token.
 pub(super) fn ternary_model_weights_fingerprint(
     layer_params: &[CudaFullForwardLayerParamsTernary<'_>],
 ) -> u64 {
-    fn slice_identity<T>(s: &[T]) -> (u64, u64) {
-        (s.as_ptr() as usize as u64, s.len() as u64)
-    }
-    let mut h = 0xcbf29ce484222325u64; // FNV-1a offset basis
-    let mut mix = |v: u64| {
-        h ^= v;
-        h = h.wrapping_mul(0x100000001b3);
-    };
-    mix(layer_params.len() as u64);
-    for lp in layer_params {
-        let handles: [u64; 8] = [
-            lp.attn_norm_handle,
-            lp.fused_qkv_handle,
-            lp.q_norm_handle,
-            lp.k_norm_handle,
-            lp.attn_proj_handle,
-            lp.ffn_norm_handle,
-            lp.gate_up_handle,
-            lp.down_handle,
-        ];
-        for handle in handles {
-            mix(handle);
-        }
-        let owned: [(u64, u64); 6] = [
-            slice_identity(lp.attn_norm_bytes),
-            slice_identity(lp.attn_proj_bytes),
-            slice_identity(lp.gate_bytes),
-            slice_identity(lp.up_bytes),
-            slice_identity(lp.down_bytes),
-            slice_identity(lp.ffn_norm_bytes),
-        ];
-        for (ptr, len) in owned {
-            mix(ptr);
-            mix(len);
-        }
-        // Deliberately the length only — see the doc comment.
-        mix(lp.fused_qkv_bytes.len() as u64);
-    }
-    h
+    super::weight_set_fingerprint(layer_params.iter().map(super::LayerWeightIdentity::from))
 }
 
 /// Build (or return cached) GPU weight handles for all ternary transformer layers.

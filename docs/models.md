@@ -36,9 +36,9 @@ at PSNR 76-78 dB (max abs diff 1/255); that is not a golden-parity run. Not run 
 the Bonsai 2 / 27B files (the hybrid kernels have no CUDA forward pass), other GPU
 generations, aarch64 Linux, Windows and multi-GPU hosts. The CUDA `Q4_0`/`Q8_0`/K-quant/FP8
 decode uploads each weight matrix on every GEMV, so it can be slower than an AVX-512 CPU.
-That Linux run covered the dev-profile all-features nextest stage, not the full
-`scripts/ci.sh --release` / `scripts/release-gate.sh --require-cuda` gate, which is still
-pending; the macOS release gate checks the CUDA kernel syntax approximately (no `nvcc`,
+On that Linux host the full `scripts/ci.sh --release` and
+`scripts/release-gate.sh --require-cuda --skip-bonsai2-models` gate passed on 2026-10-07 at
+7eaf006 with no waiver; the macOS release gate checks the CUDA kernel syntax approximately (no `nvcc`,
 an explicit waiver). The `cuda` (scirs2) feature is a CPU fallback, not a GPU build;
 use `native-cuda` for the NVIDIA path.
 

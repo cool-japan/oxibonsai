@@ -8,20 +8,16 @@
 //! - `forward()` — single-vector GEMV.
 //! - `forward_batch()` — batched GEMM (sequential over batch dimension).
 //! - Accessors: `out_features()`, `in_features()`, `blocks()`.
+//!
+//! Where a layer may run its GEMV is decided once, at construction (see the
+//! `linear_quant_gate` module): a layer constructed while a
+//! `CpuOnlyBackendScope` is active (the engine's `Backend::Cpu`) never tries
+//! the CUDA kernels and runs on a CPU-tier dispatcher.
 
 use oxibonsai_core::{BlockQ5K, BlockQ6K};
 use oxibonsai_kernels::traits::StandardQuantKernel;
-use oxibonsai_kernels::KernelDispatcher;
 
 use crate::error::{ModelError, ModelResult};
-
-/// Process-wide [`KernelDispatcher`], detected once instead of once per
-/// `forward` call. See `linear_kquant_full.rs`'s sibling function of the
-/// same name for the full rationale.
-fn kquant_kernel_dispatcher() -> &'static KernelDispatcher {
-    static DISPATCHER: std::sync::OnceLock<KernelDispatcher> = std::sync::OnceLock::new();
-    DISPATCHER.get_or_init(KernelDispatcher::auto_detect)
-}
 
 // ---------------------------------------------------------------------------
 // Compile-time size assertions (documenting the SAFETY invariants used in the
@@ -57,6 +53,9 @@ pub struct LinearQ5K<'a> {
     out_features: usize,
     /// Number of input features (columns), must be a multiple of 256.
     in_features: usize,
+    /// Whether the layer was constructed under `CpuOnlyBackendScope`: such a
+    /// layer never tries the CUDA GEMV and runs on a CPU-tier dispatcher.
+    cpu_only: bool,
 }
 
 impl<'a> LinearQ5K<'a> {
@@ -94,6 +93,7 @@ impl<'a> LinearQ5K<'a> {
             blocks,
             out_features,
             in_features,
+            cpu_only: super::linear_quant_gate::cpu_only_at_load(),
         })
     }
 
@@ -117,10 +117,12 @@ impl<'a> LinearQ5K<'a> {
     /// - `input`:  FP32 vector of length `in_features`.
     /// - `output`: FP32 vector of length `out_features`.
     ///
-    /// When the `native-cuda` feature is enabled and a CUDA device is present
-    /// the NVRTC Q5_K GEMV kernel is tried first; any failure other than
-    /// "no CUDA device" is logged as a warning. Otherwise (or on that
-    /// fallback), the call routes through [`KernelDispatcher::gemv_q5k`],
+    /// When the `native-cuda` feature is enabled, a CUDA device is present and
+    /// the layer was not constructed under `CpuOnlyBackendScope` (the engine's
+    /// `Backend::Cpu`), the NVRTC Q5_K GEMV kernel is tried first; any failure
+    /// other than "no CUDA device" is logged as a warning. Otherwise (or on that
+    /// fallback), the call routes through
+    /// [`KernelDispatcher::gemv_q5k`](oxibonsai_kernels::KernelDispatcher::gemv_q5k),
     /// which is the Metal-vs-CPU tier policy this type
     /// used to bypass entirely by calling `metal_gemv_q5k` inline — the
     /// exact gap that let a broken Metal kernel silently produce
@@ -130,7 +132,7 @@ impl<'a> LinearQ5K<'a> {
             feature = "native-cuda",
             any(target_os = "linux", target_os = "windows")
         ))]
-        if oxibonsai_kernels::CudaGraph::global().is_ok() {
+        if !self.cpu_only && oxibonsai_kernels::CudaGraph::global().is_ok() {
             // SAFETY: BlockQ5K is #[repr(C)] with size BLOCK_Q5K_BYTES (= 176).
             // The compile-time assert above guarantees this layout.
             let raw = unsafe {
@@ -139,6 +141,7 @@ impl<'a> LinearQ5K<'a> {
                     self.blocks.len() * oxibonsai_core::BLOCK_Q5K_BYTES,
                 )
             };
+            super::linear_quant_gate::note_cuda_gemv_call();
             match oxibonsai_kernels::cuda_gemv_q5k(
                 raw,
                 input,
@@ -158,7 +161,7 @@ impl<'a> LinearQ5K<'a> {
                 }
             }
         }
-        kquant_kernel_dispatcher()
+        super::linear_quant_gate::kquant_dispatcher(self.cpu_only)
             .gemv_q5k(
                 self.blocks,
                 input,
@@ -201,6 +204,9 @@ pub struct LinearQ6K<'a> {
     out_features: usize,
     /// Number of input features (columns), must be a multiple of 256.
     in_features: usize,
+    /// Whether the layer was constructed under `CpuOnlyBackendScope`: such a
+    /// layer never tries the CUDA GEMV and runs on a CPU-tier dispatcher.
+    cpu_only: bool,
 }
 
 impl<'a> LinearQ6K<'a> {
@@ -238,6 +244,7 @@ impl<'a> LinearQ6K<'a> {
             blocks,
             out_features,
             in_features,
+            cpu_only: super::linear_quant_gate::cpu_only_at_load(),
         })
     }
 
@@ -261,17 +268,19 @@ impl<'a> LinearQ6K<'a> {
     /// - `input`:  FP32 vector of length `in_features`.
     /// - `output`: FP32 vector of length `out_features`.
     ///
-    /// When the `native-cuda` feature is enabled and a CUDA device is present
-    /// the NVRTC Q6_K GEMV kernel is tried first; any failure other than
-    /// "no CUDA device" is logged as a warning. Otherwise (or on that
-    /// fallback), the call routes through [`KernelDispatcher::gemv_q6k`] —
+    /// When the `native-cuda` feature is enabled, a CUDA device is present and
+    /// the layer was not constructed under `CpuOnlyBackendScope` (the engine's
+    /// `Backend::Cpu`), the NVRTC Q6_K GEMV kernel is tried first; any failure
+    /// other than "no CUDA device" is logged as a warning. Otherwise (or on that
+    /// fallback), the call routes through
+    /// [`KernelDispatcher::gemv_q6k`](oxibonsai_kernels::KernelDispatcher::gemv_q6k) —
     /// see [`LinearQ5K::forward`]'s doc comment for why.
     pub fn forward(&self, input: &[f32], output: &mut [f32]) -> ModelResult<()> {
         #[cfg(all(
             feature = "native-cuda",
             any(target_os = "linux", target_os = "windows")
         ))]
-        if oxibonsai_kernels::CudaGraph::global().is_ok() {
+        if !self.cpu_only && oxibonsai_kernels::CudaGraph::global().is_ok() {
             // SAFETY: BlockQ6K is #[repr(C)] with size BLOCK_Q6K_BYTES (= 210).
             // The compile-time assert above guarantees this layout.
             let raw = unsafe {
@@ -280,6 +289,7 @@ impl<'a> LinearQ6K<'a> {
                     self.blocks.len() * oxibonsai_core::BLOCK_Q6K_BYTES,
                 )
             };
+            super::linear_quant_gate::note_cuda_gemv_call();
             match oxibonsai_kernels::cuda_gemv_q6k(
                 raw,
                 input,
@@ -299,7 +309,7 @@ impl<'a> LinearQ6K<'a> {
                 }
             }
         }
-        kquant_kernel_dispatcher()
+        super::linear_quant_gate::kquant_dispatcher(self.cpu_only)
             .gemv_q6k(
                 self.blocks,
                 input,

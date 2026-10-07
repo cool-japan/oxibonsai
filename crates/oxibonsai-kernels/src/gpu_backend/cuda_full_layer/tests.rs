@@ -366,3 +366,375 @@ fn ternary_weight_fingerprint_ignores_qkv_scratch_address() {
     assert!(key(EPOCH).may_replay(&key(EPOCH)));
     assert!(!key(EPOCH).may_replay(&key(EPOCH + 1)));
 }
+
+/// Model-owned source tensors of one fake Q1 layer (18-byte `Q1_0_g128`
+/// blocks) — what `oxibonsai-model` borrows from its owned / mmap'd weights,
+/// and whose addresses are therefore stable for the life of a model.
+struct FakeQ1Layer {
+    attn_norm: Vec<f32>,
+    q_norm: Vec<f32>,
+    k_norm: Vec<f32>,
+    ffn_norm: Vec<f32>,
+    attn_proj: Vec<u8>,
+    gate: Vec<u8>,
+    up: Vec<u8>,
+    down: Vec<u8>,
+}
+
+/// Where a fake Q1 layer's four weight handle ids come from: the two sources
+/// `oxibonsai-model`'s `build_cuda_layer_params` draws them from.
+#[derive(Clone, Copy)]
+enum Q1WeightIds {
+    /// The block was uploaded at load, so its fused weights carry ids from the
+    /// process-wide upload-handle counter, layer `l` taking `first + 4 * l ..`.
+    Uploaded(u64),
+    /// Not uploaded: the weight-fallback slots composed over the epoch.
+    Fallback,
+}
+
+impl FakeQ1Layer {
+    fn new(seed: u8) -> Self {
+        Self {
+            attn_norm: vec![f32::from(seed) + 1.0; 64],
+            q_norm: vec![f32::from(seed) + 2.0; 16],
+            k_norm: vec![f32::from(seed) + 3.0; 16],
+            ffn_norm: vec![f32::from(seed) + 4.0; 64],
+            attn_proj: vec![seed; 18 * 4],
+            gate: vec![seed.wrapping_add(1); 18 * 8],
+            up: vec![seed.wrapping_add(2); 18 * 8],
+            down: vec![seed.wrapping_add(3); 18 * 4],
+        }
+    }
+
+    /// One layer's parameters, laid out like `oxibonsai-model`'s
+    /// `build_cuda_layer_params`: norm handles `+0..3` composed over
+    /// `handle_epoch` (the model's `cuda_model_epoch` in the real caller),
+    /// weight handles per `ids`, Q‖K‖V from the model's cached `qkv`
+    /// concatenation.
+    fn params<'a>(
+        &'a self,
+        qkv: &'a [u8],
+        handle_epoch: u64,
+        layer: u64,
+        ids: Q1WeightIds,
+    ) -> CudaFullForwardLayerParams<'a> {
+        let norm_base = (handle_epoch << 24) | (1_000_000 + layer * 10);
+        let weight_base = match ids {
+            Q1WeightIds::Uploaded(first) => first + layer * 4,
+            Q1WeightIds::Fallback => (handle_epoch << 24) | (4_000_000 + layer * 4),
+        };
+        CudaFullForwardLayerParams {
+            attn_norm_handle: norm_base,
+            attn_norm_bytes: &self.attn_norm,
+            fused_qkv_handle: weight_base,
+            fused_qkv_bytes: qkv,
+            q_norm_handle: norm_base + 1,
+            q_norm_bytes: &self.q_norm,
+            k_norm_handle: norm_base + 2,
+            k_norm_bytes: &self.k_norm,
+            attn_proj_handle: weight_base + 1,
+            attn_proj_bytes: &self.attn_proj,
+            ffn_norm_handle: norm_base + 3,
+            ffn_norm_bytes: &self.ffn_norm,
+            gate_up_handle: weight_base + 2,
+            gate_bytes: &self.gate,
+            up_bytes: &self.up,
+            down_handle: weight_base + 3,
+            down_bytes: &self.down,
+        }
+    }
+}
+
+/// Every layer's parameters for a fake Q1 model.
+fn fake_q1_params<'a>(
+    model: &'a [FakeQ1Layer],
+    qkv: &'a [Vec<u8>],
+    handle_epoch: u64,
+    ids: Q1WeightIds,
+) -> Vec<CudaFullForwardLayerParams<'a>> {
+    model
+        .iter()
+        .zip(qkv)
+        .enumerate()
+        .map(|(layer, (l, q))| l.params(q, handle_epoch, layer as u64, ids))
+        .collect()
+}
+
+const Q1_TEST_LAYERS: usize = 3;
+const Q1_TEST_QKV_LEN: usize = 18 * 12;
+const Q1_TEST_EPOCH: u64 = 7;
+
+fn fake_q1_model() -> (Vec<FakeQ1Layer>, Vec<Vec<u8>>) {
+    let model = (0..Q1_TEST_LAYERS as u8).map(FakeQ1Layer::new).collect();
+    let qkv = (0..Q1_TEST_LAYERS as u8)
+        .map(|s| fake_qkv_concat(s, Q1_TEST_QKV_LEN))
+        .collect();
+    (model, qkv)
+}
+
+/// Q1 reload regression: the Q1 cached-weight-set fingerprint used to hash
+/// the host slices' addresses and lengths only, so a same-depth Q1 model
+/// loaded after another was dropped matched the stale entry whenever the
+/// allocator handed it every freed address — and was decoded with the dropped
+/// model's device weights. Like the ternary fingerprint, it now mixes the
+/// handle ids, which differ for every load whatever the addresses.
+///
+/// Every host slice below is literally the same memory for both "loads", the
+/// worst case of address reuse; only the handle ids differ, exactly as for a
+/// real reload. Fails with the old address-only fingerprint.
+///
+/// Pure host logic: no CUDA device is touched.
+#[test]
+fn q1_weight_fingerprint_separates_reloads_that_reuse_host_addresses() {
+    use super::model_weights_fingerprint as fingerprint;
+
+    let (model, qkv) = fake_q1_model();
+    let first_load = fake_q1_params(&model, &qkv, Q1_TEST_EPOCH, Q1WeightIds::Fallback);
+    let reload = fake_q1_params(&model, &qkv, Q1_TEST_EPOCH + 1, Q1WeightIds::Fallback);
+    // Precondition: the two loads differ in nothing but their handle ids.
+    for (a, b) in first_load.iter().zip(&reload) {
+        let slices = |lp: &CudaFullForwardLayerParams<'_>| {
+            [
+                (
+                    lp.attn_norm_bytes.as_ptr() as usize,
+                    lp.attn_norm_bytes.len(),
+                ),
+                (
+                    lp.fused_qkv_bytes.as_ptr() as usize,
+                    lp.fused_qkv_bytes.len(),
+                ),
+                (lp.q_norm_bytes.as_ptr() as usize, lp.q_norm_bytes.len()),
+                (lp.k_norm_bytes.as_ptr() as usize, lp.k_norm_bytes.len()),
+                (
+                    lp.attn_proj_bytes.as_ptr() as usize,
+                    lp.attn_proj_bytes.len(),
+                ),
+                (lp.ffn_norm_bytes.as_ptr() as usize, lp.ffn_norm_bytes.len()),
+                (lp.gate_bytes.as_ptr() as usize, lp.gate_bytes.len()),
+                (lp.up_bytes.as_ptr() as usize, lp.up_bytes.len()),
+                (lp.down_bytes.as_ptr() as usize, lp.down_bytes.len()),
+            ]
+        };
+        assert_eq!(slices(a), slices(b), "precondition: same host memory");
+        assert_ne!(a.attn_norm_handle, b.attn_norm_handle);
+    }
+    // (a) Weight-fallback slots: every handle is composed over the new epoch.
+    assert_ne!(
+        fingerprint(&first_load),
+        fingerprint(&reload),
+        "a reload at the very same host addresses must not hit the previous \
+         model's cached Q1 weight set"
+    );
+    // (b) Blocks uploaded at load: fresh upload ids and a fresh norm epoch.
+    let fp_uploaded = fingerprint(&fake_q1_params(
+        &model,
+        &qkv,
+        Q1_TEST_EPOCH,
+        Q1WeightIds::Uploaded(100),
+    ));
+    assert_ne!(
+        fp_uploaded,
+        fingerprint(&fake_q1_params(
+            &model,
+            &qkv,
+            Q1_TEST_EPOCH + 1,
+            Q1WeightIds::Uploaded(200),
+        ))
+    );
+    // Each handle source separates two loads on its own: the norm slots' epoch
+    // alone, and the upload ids alone.
+    assert_ne!(
+        fp_uploaded,
+        fingerprint(&fake_q1_params(
+            &model,
+            &qkv,
+            Q1_TEST_EPOCH + 1,
+            Q1WeightIds::Uploaded(100),
+        ))
+    );
+    assert_ne!(
+        fp_uploaded,
+        fingerprint(&fake_q1_params(
+            &model,
+            &qkv,
+            Q1_TEST_EPOCH,
+            Q1WeightIds::Uploaded(200),
+        ))
+    );
+}
+
+/// One Q1 model keeps one weight-set identity: identical inputs give the same
+/// fingerprint call after call (a miss would evict, re-upload and re-capture
+/// on every token), and, as on the ternary path, the Q‖K‖V buffer counts by
+/// its length only, so its address does not matter.
+///
+/// Pure host logic: no CUDA device is touched.
+#[test]
+fn q1_weight_fingerprint_is_stable_for_one_model() {
+    use super::model_weights_fingerprint as fingerprint;
+
+    let (model, qkv) = fake_q1_model();
+    for ids in [Q1WeightIds::Fallback, Q1WeightIds::Uploaded(100)] {
+        let params = fake_q1_params(&model, &qkv, Q1_TEST_EPOCH, ids);
+        let fp = fingerprint(&params);
+        assert_eq!(fp, fingerprint(&params), "same inputs, same fingerprint");
+        assert_eq!(
+            fp,
+            fingerprint(&fake_q1_params(&model, &qkv, Q1_TEST_EPOCH, ids)),
+            "a rebuilt parameter set over the same model must still hit"
+        );
+        // Another Q‖K‖V buffer of the same length, alive at the same time and
+        // so at another address.
+        let other_qkv: Vec<Vec<u8>> = (0..Q1_TEST_LAYERS as u8)
+            .map(|s| fake_qkv_concat(s, Q1_TEST_QKV_LEN))
+            .collect();
+        for (a, b) in qkv.iter().zip(&other_qkv) {
+            assert_ne!(a.as_ptr(), b.as_ptr(), "precondition: distinct buffers");
+        }
+        assert_eq!(
+            fp,
+            fingerprint(&fake_q1_params(&model, &other_qkv, Q1_TEST_EPOCH, ids))
+        );
+    }
+}
+
+/// Under identical handle ids (a caller passing fixed rather than per-load
+/// ids), the model-owned slices still separate two weight sets: moving any
+/// one of them changes the fingerprint, as does a differently shaped Q‖K‖V or
+/// another depth.
+///
+/// Pure host logic: no CUDA device is touched.
+#[test]
+fn q1_weight_fingerprint_follows_owned_slices_qkv_length_and_depth() {
+    use super::model_weights_fingerprint as fingerprint;
+
+    let (model, qkv) = fake_q1_model();
+    let ids = Q1WeightIds::Fallback;
+    let fp = fingerprint(&fake_q1_params(&model, &qkv, Q1_TEST_EPOCH, ids));
+
+    // Same lengths and contents as layer 1, at other addresses.
+    let moved = FakeQ1Layer::new(1);
+    assert_ne!(moved.attn_proj.as_ptr(), model[1].attn_proj.as_ptr());
+    for slot in 0..6 {
+        let mut params = fake_q1_params(&model, &qkv, Q1_TEST_EPOCH, ids);
+        let lp = &mut params[1];
+        match slot {
+            0 => lp.attn_norm_bytes = &moved.attn_norm,
+            1 => lp.attn_proj_bytes = &moved.attn_proj,
+            2 => lp.gate_bytes = &moved.gate,
+            3 => lp.up_bytes = &moved.up,
+            4 => lp.down_bytes = &moved.down,
+            _ => lp.ffn_norm_bytes = &moved.ffn_norm,
+        }
+        assert_ne!(
+            fp,
+            fingerprint(&params),
+            "moving model-owned slice {slot} of layer 1 must change the fingerprint"
+        );
+    }
+    // A whole other model under the same (fixed) handles.
+    let (other_model, _) = fake_q1_model();
+    assert_ne!(
+        fp,
+        fingerprint(&fake_q1_params(&other_model, &qkv, Q1_TEST_EPOCH, ids))
+    );
+    // A differently shaped Q‖K‖V.
+    let longer: Vec<Vec<u8>> = (0..Q1_TEST_LAYERS as u8)
+        .map(|s| fake_qkv_concat(s, Q1_TEST_QKV_LEN + 18))
+        .collect();
+    assert_ne!(
+        fp,
+        fingerprint(&fake_q1_params(&model, &longer, Q1_TEST_EPOCH, ids))
+    );
+    // A different depth.
+    assert_ne!(
+        fp,
+        fingerprint(&fake_q1_params(
+            &model[..Q1_TEST_LAYERS - 1],
+            &qkv,
+            Q1_TEST_EPOCH,
+            ids
+        ))
+    );
+}
+
+/// The weight-set fingerprint is order-sensitive, like
+/// `CudaGraphSlotKey::fingerprint_handles`: the same layers in another order,
+/// or two handles trading roles, describe another upload and must not hit.
+///
+/// Pure host logic: no CUDA device is touched.
+#[test]
+fn q1_weight_fingerprint_is_order_sensitive() {
+    use super::model_weights_fingerprint as fingerprint;
+
+    let (model, qkv) = fake_q1_model();
+    let ids = Q1WeightIds::Uploaded(100);
+    let fp = fingerprint(&fake_q1_params(&model, &qkv, Q1_TEST_EPOCH, ids));
+
+    let mut reversed = fake_q1_params(&model, &qkv, Q1_TEST_EPOCH, ids);
+    reversed.reverse();
+    assert_ne!(fp, fingerprint(&reversed), "layer order must matter");
+
+    let mut swapped_norms = fake_q1_params(&model, &qkv, Q1_TEST_EPOCH, ids);
+    let lp = &mut swapped_norms[0];
+    std::mem::swap(&mut lp.attn_norm_handle, &mut lp.ffn_norm_handle);
+    assert_ne!(fp, fingerprint(&swapped_norms), "handle roles must matter");
+
+    let mut swapped_weights = fake_q1_params(&model, &qkv, Q1_TEST_EPOCH, ids);
+    let lp = &mut swapped_weights[2];
+    std::mem::swap(&mut lp.gate_up_handle, &mut lp.down_handle);
+    assert_ne!(
+        fp,
+        fingerprint(&swapped_weights),
+        "handle roles must matter"
+    );
+}
+
+/// The Q1 and ternary caches judge a weight set by one rule
+/// (`weight_identity`): the same field values give the same fingerprint on
+/// both paths, so a fix to one can no longer leave the other behind. (Their
+/// cache slots are disjoint and the graph key carries the quant family, so
+/// equal values across families alias nothing.)
+///
+/// Pure host logic: no CUDA device is touched.
+#[test]
+fn q1_and_ternary_weight_fingerprints_share_one_rule() {
+    use super::encode_ternary::ternary_model_weights_fingerprint;
+
+    let model: Vec<FakeTernaryLayer> = (0..3u8).map(FakeTernaryLayer::new).collect();
+    let qkv: Vec<Vec<u8>> = (0..3u8).map(|s| fake_qkv_concat(s, 34 * 12)).collect();
+    for epoch in [Q1_TEST_EPOCH, Q1_TEST_EPOCH + 1] {
+        let ternary: Vec<CudaFullForwardLayerParamsTernary<'_>> = model
+            .iter()
+            .zip(&qkv)
+            .enumerate()
+            .map(|(layer, (l, q))| l.params(q, epoch, layer as u64))
+            .collect();
+        let q1: Vec<CudaFullForwardLayerParams<'_>> = ternary
+            .iter()
+            .map(|t| CudaFullForwardLayerParams {
+                attn_norm_handle: t.attn_norm_handle,
+                attn_norm_bytes: t.attn_norm_bytes,
+                fused_qkv_handle: t.fused_qkv_handle,
+                fused_qkv_bytes: t.fused_qkv_bytes,
+                q_norm_handle: t.q_norm_handle,
+                q_norm_bytes: t.q_norm_bytes,
+                k_norm_handle: t.k_norm_handle,
+                k_norm_bytes: t.k_norm_bytes,
+                attn_proj_handle: t.attn_proj_handle,
+                attn_proj_bytes: t.attn_proj_bytes,
+                ffn_norm_handle: t.ffn_norm_handle,
+                ffn_norm_bytes: t.ffn_norm_bytes,
+                gate_up_handle: t.gate_up_handle,
+                gate_bytes: t.gate_bytes,
+                up_bytes: t.up_bytes,
+                down_handle: t.down_handle,
+                down_bytes: t.down_bytes,
+            })
+            .collect();
+        assert_eq!(
+            model_weights_fingerprint(&q1),
+            ternary_model_weights_fingerprint(&ternary)
+        );
+    }
+}

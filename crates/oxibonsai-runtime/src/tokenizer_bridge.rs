@@ -123,7 +123,8 @@ pub struct AddedTokenInfo {
 /// the server needs (notably `get_added_tokens_decoder`, which drives
 /// `server::sanitize::SpecialTokenGuard`) with one signature that is valid in
 /// every feature configuration.  Callers that need the *whole* HuggingFace
-/// tokenizer can still reach it through [`TokenizerBridge::hf`].
+/// tokenizer can still reach it through `TokenizerBridge::hf` (available with
+/// the `hf-tokenizer` feature).
 pub struct TokenizerVocabView<'a> {
     bridge: &'a TokenizerBridge,
 }

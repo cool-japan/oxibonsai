@@ -871,8 +871,15 @@ impl<'a> InferenceEngine<'a> {
                 .then(oxibonsai_kernels::gpu_backend::CpuOnlyBackendScope::enter);
             BonsaiModel::from_gguf_with_embd(gguf, max_seq_len, token_embd)?
         };
-        let mut engine =
-            Self::from_model_with_gpu_warmup(model, kernel, sampling_params, seed, eos, route)?;
+        let mut engine = Self::from_model_with_gpu_warmup(
+            model,
+            kernel,
+            sampling_params,
+            seed,
+            eos,
+            route,
+            backend,
+        )?;
         engine.backend = backend;
         Ok(engine)
     }
@@ -884,6 +891,9 @@ impl<'a> InferenceEngine<'a> {
     ///
     /// Factored out so the (substantial) GPU/CUDA warmup logic has exactly one
     /// implementation regardless of how `token_embd` was obtained.
+    ///
+    /// `backend` is the executor the model was loaded for; an explicit
+    /// [`Backend::Cpu`] skips the CUDA warm-up, which has nothing to warm.
     fn from_model_with_gpu_warmup(
         mut model: BonsaiModel<'a>,
         kernel: KernelDispatcher,
@@ -891,6 +901,7 @@ impl<'a> InferenceEngine<'a> {
         seed: u64,
         eos: EosTokenSet,
         route: FusedMetalRoute,
+        backend: Backend,
     ) -> RuntimeResult<Self> {
         // `MET-M1`: every GPU weight upload this engine makes is attributed to
         // its own epoch, so `Drop` can release exactly this engine's
@@ -984,12 +995,19 @@ impl<'a> InferenceEngine<'a> {
         // Both warmup K/V cache writes are at positions that real inference
         // overwrites immediately (K/V is written before attention reads it).
         // The CUDA KV cache is separate from the CPU-side `model.kv_cache`.
+        //
+        // An explicit `Backend::Cpu` skips both passes: its dispatcher is a
+        // CPU tier, so none of the CUDA paths above is reachable, and the
+        // model was constructed under `CpuOnlyBackendScope`, so its layers
+        // never call a CUDA GEMV either. The passes would only spend seconds
+        // of CPU decode at load. Every other backend warms up exactly as
+        // before.
         #[cfg(all(
             feature = "native-cuda",
             not(all(feature = "metal", target_os = "macos")),
             any(target_os = "linux", target_os = "windows")
         ))]
-        {
+        if backend != Backend::Cpu {
             tracing::info!("CUDA warmup: pre-capturing driver graph + prefill modules");
             // Step 1: capture the 36-layer decode CUDA driver graph.
             let _ = model.forward(0, 0, &kernel);
@@ -1006,6 +1024,13 @@ impl<'a> InferenceEngine<'a> {
             let _ = model.forward_prefill(&[0u32; WARMUP_PREFILL_TOKENS], 0, &kernel);
             tracing::info!("CUDA warmup complete");
         }
+        // Only the CUDA warm-up above reads `backend`.
+        #[cfg(not(all(
+            feature = "native-cuda",
+            not(all(feature = "metal", target_os = "macos")),
+            any(target_os = "linux", target_os = "windows")
+        )))]
+        let _ = backend;
 
         let sampler = Sampler::new(sampling_params, seed);
 
