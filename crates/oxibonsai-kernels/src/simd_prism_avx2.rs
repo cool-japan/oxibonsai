@@ -1,7 +1,7 @@
 //! AVX2-accelerated dequant / GEMV / GEMM for the PrismML Bonsai 2 formats:
 //! `PQ2_0`, mainline `Q2_0_g64`, and `PTQ1_0`.
 //!
-//! Structural mirror of [`crate::simd_prism_neon`] — every helper here has a
+//! Structural mirror of `simd_prism_neon` (aarch64 only) — every helper here has a
 //! same-named-in-spirit NEON counterpart performing the identical arithmetic
 //! (same widen -> multiply -> mask -> multiply -> shift -> narrow order for
 //! the `PTQ1_0` trit decode), so the two files can be reviewed line-for-line

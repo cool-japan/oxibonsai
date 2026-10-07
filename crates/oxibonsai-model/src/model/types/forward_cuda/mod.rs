@@ -218,9 +218,9 @@ impl BonsaiModel<'_> {
 /// weight-fallback slot composed over this model's epoch, from all three
 /// CUDA caches — plus the ternary, Q4_0/Q8_0 and K-quant layouts of the same
 /// namespace
-/// ([`SlotNamespace::cuda_ternary_keys`](super::q1_slots::SlotNamespace::cuda_ternary_keys),
-/// [`SlotNamespace::cuda_std_quant_keys`](super::q1_slots::SlotNamespace::cuda_std_quant_keys),
-/// [`SlotNamespace::cuda_k_quant_keys`](super::q1_slots::SlotNamespace::cuda_k_quant_keys)).
+/// (`SlotNamespace::cuda_ternary_keys`,
+/// `SlotNamespace::cuda_std_quant_keys`,
+/// `SlotNamespace::cuda_k_quant_keys`).
 /// Those slots are unique to this model (no other model can compose them),
 /// so evicting them can only ever free this model's buffers; without it,
 /// per-load slots would leak one copy of the norms and LM head per

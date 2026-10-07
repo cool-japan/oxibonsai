@@ -258,7 +258,7 @@ impl CudaGraph {
     /// Mirrors [`Self::get_or_upload_weight_tq2_soa`], but for `PQ2_0`'s
     /// **d-first** 34-byte AoS block (`{ d: f16, qs: [u8; 32] }`, the mirror
     /// image of `TQ2_0_g128`'s qs-first layout — see
-    /// [`reformat_pq2_aos_bytes_to_soa`]) and the `gemv_pq2_g128_v1` kernel,
+    /// `reformat_pq2_aos_bytes_to_soa`) and the `gemv_pq2_g128_v1` kernel,
     /// which differs from `gemv_tq2_g128_v1` only in its decode table
     /// (`0b11 -> +2.0` instead of `0.0`).
     ///
@@ -325,7 +325,7 @@ impl CudaGraph {
     /// Upload typed `PQ2_0` blocks in SoA layout under `handle_id`,
     /// replacing any buffer already cached there — the `PQ2_0` twin of
     /// [`Self::upload_weight_tq2_soa`] (finding **F16**), reformatted by
-    /// [`reformat_pq2_blocks_to_soa`] for the `gemv_pq2_g128_v1` kernel.
+    /// `reformat_pq2_blocks_to_soa` for the `gemv_pq2_g128_v1` kernel.
     ///
     /// **Unattributed**: never freed by
     /// [`Self::release_model_epoch`](super::cudagraph_type::CudaGraph::release_model_epoch)
@@ -466,7 +466,7 @@ impl CudaGraph {
     ///
     /// Mirrors [`Self::encode_gemv_tq2_cached`] exactly (including its own
     /// process-wide reusable input/output buffer pool,
-    /// [`pq2_gemv_state`]), swapping the kernel and the pool so a `PQ2_0`
+    /// `pq2_gemv_state`), swapping the kernel and the pool so a `PQ2_0`
     /// GEMV never contends with a concurrent `TQ2_0_g128` one over the same
     /// buffers.
     ///

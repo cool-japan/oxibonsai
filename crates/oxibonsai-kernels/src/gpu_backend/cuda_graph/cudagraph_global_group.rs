@@ -244,7 +244,7 @@ impl CudaGraph {
     /// which for cache-owned weights is this removal.
     ///
     /// The third cache is `cuda_full_layer`'s own FP32 norm cache, which is a
-    /// separate map from [`Self::f32_weight_cache`] and holds every norm weight
+    /// separate map from `f32_weight_cache` and holds every norm weight
     /// the full-forward decode paths upload. Missing it would make
     /// [`Self::release_model_epoch`] report releases it did not perform and
     /// leave the norms resident for the life of the process.

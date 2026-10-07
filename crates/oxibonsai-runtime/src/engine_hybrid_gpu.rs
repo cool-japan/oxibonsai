@@ -6,7 +6,7 @@
 //! # Backend choice
 //!
 //! [`hybrid_backend_plan`] decides, for a hybrid model already bound on the
-//! CPU, whether a [`HybridMetalRunner`](oxibonsai_model::hybrid::metal::HybridMetalRunner)
+//! CPU, whether a `HybridMetalRunner` (`oxibonsai_model::hybrid::metal`, Metal builds)
 //! can serve it on this host: a Metal build, a Metal device (probed
 //! explicitly — "no device" is `MetalGraphError::DeviceNotFound` and nothing
 //! else), a geometry and weight formats the kernels serve

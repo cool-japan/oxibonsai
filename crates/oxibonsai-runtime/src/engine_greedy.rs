@@ -7,7 +7,7 @@
 //!
 //! ## The decoding contract (`RT-24`, and the CPU-vs-Metal divergence)
 //!
-//! [`InferenceEngine::generate_greedy_gpu`] used to be pure argmax: it never
+//! `InferenceEngine::generate_greedy_gpu` (Metal builds) used to be pure argmax: it never
 //! consulted `self.sampler`, so a caller that had configured
 //! `repetition_penalty: 1.1` (as `SamplingParams::default()` and the CLI both
 //! did at the time) got *penalised* greedy on the CPU path and
@@ -43,7 +43,7 @@
 //! this module's routing depends on, for the full trace; it is `true`, so
 //! every entry point in this module that can reach `forward_greedy_gpu` —
 //! [`InferenceEngine::greedy_gpu_eligible`]'s four routed callers *and*
-//! [`InferenceEngine::generate_greedy_gpu`]'s own direct, unconditional
+//! `InferenceEngine::generate_greedy_gpu`'s own direct, unconditional
 //! entry point (the CLI's `--temperature 0` fast path, which does not go
 //! through `greedy_gpu_eligible` at all) — may take the GPU-argmax fast
 //! path, and when a model is not fused for Metal decode (or a Metal
@@ -412,7 +412,7 @@ impl<'a> InferenceEngine<'a> {
     /// stage applied before the argmax.
     ///
     /// The penalised arm of the decoding contract, shared by
-    /// [`Self::generate_greedy_gpu`] and available to any caller that must
+    /// `generate_greedy_gpu` (Metal builds) and available to any caller that must
     /// decode greedily while honouring penalties. Penalties are applied by
     /// [`Sampler::sample_with_history`](crate::sampling::Sampler::sample_with_history)
     /// — the *same* function the CPU streaming path uses — with the sampler

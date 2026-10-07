@@ -28,7 +28,7 @@
 //! so a GPU failure can never break a forward pass (no `unwrap`/`expect`/`panic!`).
 //!
 //! That fallback used to be completely silent (RAG-EVAL-IMG-18) on the Metal
-//! sibling ([`crate::gpu`]) before it was fixed there; every function below
+//! sibling (`crate::gpu` (Metal builds)) before it was fixed there; every function below
 //! now gets the same one-time-latch treatment (an `AtomicBool` per function,
 //! `tracing::warn!` naming the op and the underlying error the first time it
 //! fails, silent thereafter for the life of the process). Unlike

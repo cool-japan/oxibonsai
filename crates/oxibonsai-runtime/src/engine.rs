@@ -23,7 +23,7 @@
 //!   (the GPU argmax kernels break ties toward the first index, like the
 //!   CPU samplers — see that constant's doc comment for how that is
 //!   verified and how to close the gate if a regression is found).
-//!   [`InferenceEngine::generate_greedy_gpu`] is a separate, *direct* entry
+//!   `InferenceEngine::generate_greedy_gpu` (Metal builds) is a separate, *direct* entry
 //!   point that does not go through `greedy_gpu_eligible` — it checks the
 //!   same gate and the same penalty condition itself. Either way, when
 //!   penalties are configured, or the tie-break gate is closed, the call

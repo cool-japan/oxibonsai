@@ -153,7 +153,7 @@ impl CudaKvCache {
     /// bindings are still `constant uint&`).
     ///
     /// The arithmetic itself lives in
-    /// [`cuda_kv_layer_offset_elements`](super::cuda_device_negotiation::cuda_kv_layer_offset_elements)
+    /// [`cuda_kv_layer_offset_elements`]
     /// so it is unit-tested on hosts that cannot compile this module.
     #[inline]
     pub fn layer_offset_elements(&self, layer_idx: usize) -> u64 {

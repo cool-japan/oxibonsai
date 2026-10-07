@@ -332,7 +332,7 @@ fn terminator_ids_from_vocab(gguf: &GgufFile<'_>) -> Vec<u32> {
 ///
 /// [`InferenceEngine::greedy_gpu_eligible`](crate::engine::InferenceEngine::greedy_gpu_eligible)
 /// ANDs this in, and
-/// [`InferenceEngine::generate_greedy_gpu`](crate::engine::InferenceEngine::generate_greedy_gpu)
+/// `InferenceEngine::generate_greedy_gpu` (Metal builds)
 /// — the CLI's direct, unconditional `--temperature 0` fast path, which does
 /// not go through `greedy_gpu_eligible` at all — checks it too. Now that this
 /// is `true`, every path in this crate that reaches the GPU argmax kernel

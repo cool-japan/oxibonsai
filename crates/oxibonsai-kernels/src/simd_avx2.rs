@@ -623,7 +623,7 @@ pub unsafe fn gemm_1bit_g128_avx2_prefetch(
 /// Decodes 2-bit ternary codes (4 per byte, 32 bytes per block = 128 weights)
 /// and scales by the block's FP16 scale factor.
 ///
-/// Decode is routed through the single shared [`decode_2bytes_avx2_to_f32x8`]
+/// Decode is routed through the single shared `decode_2bytes_avx2_to_f32x8`
 /// helper (K-01), which calls [`oxibonsai_core::ternary_code_to_i8`] per
 /// lane rather than re-deriving the map with SIMD arithmetic — this is what
 /// makes it impossible for this tier to drift from the reference decode.
@@ -675,7 +675,7 @@ pub unsafe fn dequant_tq2_0_g128_avx2(
 /// AVX2-accelerated GEMV for TQ2\_0\_g128-quantized weight matrices.
 ///
 /// Computes `output[row] = dot(weight_row, input)` for each row.
-/// Decode is routed through the single shared [`decode_2bytes_avx2_to_f32x8`]
+/// Decode is routed through the single shared `decode_2bytes_avx2_to_f32x8`
 /// helper (K-01), which calls [`oxibonsai_core::ternary_code_to_i8`] per
 /// lane rather than re-deriving the map with SIMD arithmetic — this is what
 /// makes it impossible for this tier to drift from the reference decode.
@@ -757,7 +757,7 @@ pub unsafe fn gemv_tq2_0_g128_avx2(
 /// Computes `output[m, n] = sum_k(weight[n, k] * input[m, k])` for each (m, n) pair.
 /// Iterates over batch dimension `m`, using per-row GEMV logic with pure SIMD decode.
 ///
-/// Decode is routed through the single shared [`decode_2bytes_avx2_to_f32x8`]
+/// Decode is routed through the single shared `decode_2bytes_avx2_to_f32x8`
 /// helper (K-01), which calls [`oxibonsai_core::ternary_code_to_i8`] per
 /// lane rather than re-deriving the map with SIMD arithmetic — this is what
 /// makes it impossible for this tier to drift from the reference decode.

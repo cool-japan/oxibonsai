@@ -826,7 +826,7 @@ pub unsafe fn gemv_1bit_g128_avx512_prefetch(
 /// AVX-512 iteration (4 bytes → 16 lanes).
 ///
 /// Decode is routed through the single shared
-/// [`decode_4bytes_avx512_to_f32x16`] helper (K-01), which calls
+/// `decode_4bytes_avx512_to_f32x16` helper (K-01), which calls
 /// [`oxibonsai_core::ternary_code_to_i8`] per lane rather than re-deriving
 /// the map with SIMD arithmetic — this is what makes it impossible for this
 /// tier to drift from the reference decode.
@@ -884,7 +884,7 @@ pub unsafe fn dequant_tq2_0_g128_avx512(
 /// helper) and accumulates with `_mm512_fmadd_ps`.
 ///
 /// Decode is routed through the single shared
-/// [`decode_4bytes_avx512_to_f32x16`] helper (K-01) — see the dequant
+/// `decode_4bytes_avx512_to_f32x16` helper (K-01) — see the dequant
 /// function above for why.
 ///
 /// # Safety
@@ -967,7 +967,7 @@ pub unsafe fn gemv_tq2_0_g128_avx512(
 /// Iterates over batch dimension `m`, using per-row GEMV logic.
 ///
 /// Decode is routed through the single shared
-/// [`decode_4bytes_avx512_to_f32x16`] helper (K-01) — see the dequant
+/// `decode_4bytes_avx512_to_f32x16` helper (K-01) — see the dequant
 /// function above for why.
 ///
 /// # Safety

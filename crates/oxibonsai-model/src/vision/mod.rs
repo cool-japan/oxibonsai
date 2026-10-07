@@ -68,7 +68,7 @@
 //!
 //! # Two executors
 //!
-//! [`VisionTower`] runs on the CPU; [`metal::VisionTowerMetal`] runs the
+//! [`VisionTower`] runs on the CPU; `metal::VisionTowerMetal` (Metal builds) runs the
 //! same graph on the Metal GPU (with the matrices in the file's own `Q8_0`
 //! / `F16` storage, read exactly). A caller that
 //! serves both holds a [`VisionEncoder`], whose surface is the CPU tower's

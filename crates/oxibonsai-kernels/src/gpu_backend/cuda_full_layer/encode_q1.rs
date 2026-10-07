@@ -511,7 +511,7 @@ unsafe fn encode_layer_device(
 /// first model's weight pointers.
 ///
 /// `model_epoch` and `weight_fingerprint` come from
-/// [`get_or_build_model_weights`]; they also attribute the uploaded weights for
+/// `get_or_build_model_weights`; they also attribute the uploaded weights for
 /// `CudaGraph::release_model_epoch` (finding F-M3).
 ///
 /// Returns the final hidden state (post-norm if `final_norm_weight` provided).
