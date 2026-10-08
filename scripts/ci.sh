@@ -633,7 +633,8 @@ run_optional_stage "wasm-tokenizer" "$WASM_PRESENT" \
 #     directory as the real-model directory and fail when it holds no `.gguf`
 #     (`validate_and_run_agree_on_every_real_model`);
 #   - no test reaches a model past that variable: every lookup goes through
-#     `oxibonsai_testkit::workspace::{models_dir, find_model}` or reads
+#     `oxibonsai_testkit::workspace::{models_dir, find_model, find_model_as_named}`
+#     or reads
 #     OXIBONSAI_MODELS_DIR itself before it falls back to the workspace's
 #     `models/`. A test that built a model path from its crate's compile-time
 #     `CARGO_MANIFEST_DIR` alone would be out of reach of every variable and

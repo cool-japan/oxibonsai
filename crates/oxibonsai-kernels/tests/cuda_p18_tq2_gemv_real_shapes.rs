@@ -18,8 +18,10 @@
 //! `scripts/download_ternary.sh` runs) writes every projection, the LM head
 //! and the embedding as **`TQ2_0_g128`** (ggml id 42, `qs` first); `--quant
 //! pq2_0` writes PrismML **`PQ2_0`** (ggml id 142, `d` first). Files converted
-//! before 3c9993a — such as the current `models/Ternary-Bonsai-{1.7B,8B}.gguf`
-//! — carry `PQ2_0` (id 142); the `*-tq2_0_g128.gguf` re-encodes carry id 42.
+//! by a pre-release 0.2.4 build before 3c9993a — such as
+//! `models/Ternary-Bonsai-{1.7B,8B}.gguf` on the CUDA validation host — carry
+//! `PQ2_0` (id 142); the `*-tq2_0_g128.gguf` re-encodes carry id 42, as does a
+//! 0.2.3 file that was never reconverted.
 //! The harness accepts both:
 //!
 //! - a `TQ2_0_g128` tensor runs the **TQ2 leg** on its own bytes;

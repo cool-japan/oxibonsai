@@ -2,11 +2,12 @@
 //!
 //! These layers implement the full `forward` / `forward_batch` interface
 //! using the scalar GEMV kernels from `oxibonsai-kernels`.  When the
-//! `native-cuda` feature is enabled and a CUDA device is available, `forward`
-//! dispatches to the NVRTC GEMV kernels; on failure it falls back to the
-//! scalar CPU path. A layer constructed while a `CpuOnlyBackendScope` is
-//! active (the engine's `Backend::Cpu`) never tries them: that decision is
-//! taken once, at construction (see the `linear_quant_gate` module).
+//! `native-cuda` feature is enabled and a CUDA device is available (or the
+//! `metal` feature on macOS and a Metal device), `forward` dispatches to the
+//! GPU GEMV kernels; on failure it falls back to the scalar CPU path. A layer
+//! constructed while a `CpuOnlyBackendScope` is active (the engine's
+//! `Backend::Cpu`) never tries them on either backend: that decision is taken
+//! once, at construction (see the `linear_quant_gate` module).
 //!
 //! # Layout
 //!
@@ -61,13 +62,17 @@ pub struct LinearQ4_0<'a> {
     blocks: &'a [BlockQ4_0],
     out_features: usize,
     in_features: usize,
-    /// Whether `forward` may try the CUDA GEMV, decided at construction:
-    /// `false` for a layer constructed under `CpuOnlyBackendScope`.
-    #[cfg(all(
-        feature = "native-cuda",
-        any(target_os = "linux", target_os = "windows")
+    /// Whether `forward` may try the GPU GEMV (CUDA or Metal), decided at
+    /// construction: `false` for a layer constructed under
+    /// `CpuOnlyBackendScope`.
+    #[cfg(any(
+        all(
+            feature = "native-cuda",
+            any(target_os = "linux", target_os = "windows")
+        ),
+        all(feature = "metal", target_os = "macos")
     ))]
-    cuda_gemv: bool,
+    gpu_gemv: bool,
 }
 
 impl<'a> LinearQ4_0<'a> {
@@ -102,11 +107,14 @@ impl<'a> LinearQ4_0<'a> {
             blocks,
             out_features,
             in_features,
-            #[cfg(all(
-                feature = "native-cuda",
-                any(target_os = "linux", target_os = "windows")
+            #[cfg(any(
+                all(
+                    feature = "native-cuda",
+                    any(target_os = "linux", target_os = "windows")
+                ),
+                all(feature = "metal", target_os = "macos")
             ))]
-            cuda_gemv: super::linear_quant_gate::cuda_gemv_allowed_at_load(),
+            gpu_gemv: super::linear_quant_gate::gpu_gemv_allowed_at_load(),
         })
     }
 
@@ -135,13 +143,14 @@ impl<'a> LinearQ4_0<'a> {
     /// `Backend::Cpu`), the NVRTC Q4_0 GEMV kernel is tried first; any failure
     /// other than "no CUDA device" is logged as a warning and the CPU scalar path runs
     /// instead. When the `metal` feature is enabled on macOS instead, the
-    /// Metal Q4_0 GEMV kernel is tried first with the same fallback contract.
+    /// Metal Q4_0 GEMV kernel is tried first under the same construction-time
+    /// decision and with the same fallback contract.
     pub fn forward(&self, input: &[f32], output: &mut [f32]) -> ModelResult<()> {
         #[cfg(all(
             feature = "native-cuda",
             any(target_os = "linux", target_os = "windows")
         ))]
-        if self.cuda_gemv && oxibonsai_kernels::CudaGraph::global().is_ok() {
+        if self.gpu_gemv && oxibonsai_kernels::CudaGraph::global().is_ok() {
             // SAFETY: BlockQ4_0 is #[repr(C)] with size BLOCK_Q4_0_BYTES (= 18).
             // The compile-time assert above and the one in oxibonsai_core::quant_std
             // both guarantee this layout.
@@ -172,7 +181,7 @@ impl<'a> LinearQ4_0<'a> {
             }
         }
         #[cfg(all(feature = "metal", target_os = "macos"))]
-        {
+        if self.gpu_gemv {
             // SAFETY: BlockQ4_0 is #[repr(C)] with size BLOCK_Q4_0_BYTES (= 18).
             // The compile-time assert above and the one in oxibonsai_core::quant_std
             // both guarantee this layout.
@@ -182,6 +191,7 @@ impl<'a> LinearQ4_0<'a> {
                     self.blocks.len() * oxibonsai_core::BLOCK_Q4_0_BYTES,
                 )
             };
+            super::linear_quant_gate::note_metal_gemv_call();
             match oxibonsai_kernels::metal_gemv_q4_0(
                 raw,
                 input,
@@ -233,13 +243,17 @@ pub struct LinearQ8_0<'a> {
     blocks: &'a [BlockQ8_0],
     out_features: usize,
     in_features: usize,
-    /// Whether `forward` may try the CUDA GEMV, decided at construction:
-    /// `false` for a layer constructed under `CpuOnlyBackendScope`.
-    #[cfg(all(
-        feature = "native-cuda",
-        any(target_os = "linux", target_os = "windows")
+    /// Whether `forward` may try the GPU GEMV (CUDA or Metal), decided at
+    /// construction: `false` for a layer constructed under
+    /// `CpuOnlyBackendScope`.
+    #[cfg(any(
+        all(
+            feature = "native-cuda",
+            any(target_os = "linux", target_os = "windows")
+        ),
+        all(feature = "metal", target_os = "macos")
     ))]
-    cuda_gemv: bool,
+    gpu_gemv: bool,
 }
 
 impl<'a> LinearQ8_0<'a> {
@@ -274,11 +288,14 @@ impl<'a> LinearQ8_0<'a> {
             blocks,
             out_features,
             in_features,
-            #[cfg(all(
-                feature = "native-cuda",
-                any(target_os = "linux", target_os = "windows")
+            #[cfg(any(
+                all(
+                    feature = "native-cuda",
+                    any(target_os = "linux", target_os = "windows")
+                ),
+                all(feature = "metal", target_os = "macos")
             ))]
-            cuda_gemv: super::linear_quant_gate::cuda_gemv_allowed_at_load(),
+            gpu_gemv: super::linear_quant_gate::gpu_gemv_allowed_at_load(),
         })
     }
 
@@ -307,13 +324,14 @@ impl<'a> LinearQ8_0<'a> {
     /// `Backend::Cpu`), the NVRTC Q8_0 GEMV kernel is tried first; any failure
     /// other than "no CUDA device" is logged as a warning and the CPU scalar path runs
     /// instead. When the `metal` feature is enabled on macOS instead, the
-    /// Metal Q8_0 GEMV kernel is tried first with the same fallback contract.
+    /// Metal Q8_0 GEMV kernel is tried first under the same construction-time
+    /// decision and with the same fallback contract.
     pub fn forward(&self, input: &[f32], output: &mut [f32]) -> ModelResult<()> {
         #[cfg(all(
             feature = "native-cuda",
             any(target_os = "linux", target_os = "windows")
         ))]
-        if self.cuda_gemv && oxibonsai_kernels::CudaGraph::global().is_ok() {
+        if self.gpu_gemv && oxibonsai_kernels::CudaGraph::global().is_ok() {
             // SAFETY: BlockQ8_0 is #[repr(C)] with size BLOCK_Q8_0_BYTES (= 34).
             // The compile-time assert above and the one in oxibonsai_core::quant_std
             // both guarantee this layout.
@@ -344,7 +362,7 @@ impl<'a> LinearQ8_0<'a> {
             }
         }
         #[cfg(all(feature = "metal", target_os = "macos"))]
-        {
+        if self.gpu_gemv {
             // SAFETY: BlockQ8_0 is #[repr(C)] with size BLOCK_Q8_0_BYTES (= 34).
             // The compile-time assert above and the one in oxibonsai_core::quant_std
             // both guarantee this layout.
@@ -354,6 +372,7 @@ impl<'a> LinearQ8_0<'a> {
                     self.blocks.len() * oxibonsai_core::BLOCK_Q8_0_BYTES,
                 )
             };
+            super::linear_quant_gate::note_metal_gemv_call();
             match oxibonsai_kernels::metal_gemv_q8_0(
                 raw,
                 input,

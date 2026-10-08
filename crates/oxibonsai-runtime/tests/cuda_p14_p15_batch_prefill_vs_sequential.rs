@@ -109,19 +109,21 @@
 //! the file's LM-head tensor type, because that type alone picks the
 //! dispatch branch. Since 3c9993a, `oxibonsai convert --quant tq2_0_g128`
 //! (the `scripts/download_ternary.sh` path) writes TQ2_0_g128 (ggml id 42),
-//! which loads as is. Files converted before 3c9993a carry PQ2_0 (id 142),
-//! as the current `models/Ternary-Bonsai-8B.gguf` does; the harness accepts
-//! both. `BonsaiModel` refuses a PQ2_0 LM head, so for P15 such a file is
+//! which loads as is. Files converted by a pre-release 0.2.4 build before
+//! 3c9993a carry PQ2_0 (id 142), as `models/Ternary-Bonsai-8B.gguf` on the
+//! CUDA validation host does (a checkout that never reconverted its 0.2.3
+//! file holds id 42); the harness accepts both. `BonsaiModel` refuses a
+//! PQ2_0 LM head, so for P15 such a file is
 //! re-encoded as TQ2_0_g128 in `std::env::temp_dir()` and deleted
 //! afterwards. The re-encode is lossless for ternary blocks, and a tensor
 //! with any `+2` code (`0b11`) fails the test instead. An
 //! `OXIBONSAI_MODELS_DIR` farm whose `Ternary-Bonsai-8B.gguf` links to
 //! `Ternary-Bonsai-8B-tq2_0_g128.gguf` avoids the re-encode. The testkit's
-//! `find_model` now returns that `-tq2_0_g128` re-encode itself when the
-//! plain file is `PQ2_0` and the re-encode sits beside it, so this re-encode
-//! branch only runs on a checkout without that sibling. Any other
-//! LM-head mismatch self-skips with the reason and records
-//! `executed: false`.
+//! `find_model` returns that `-tq2_0_g128` re-encode itself when the plain
+//! file is `PQ2_0` and a non-empty id-42 re-encode sits beside it, so this
+//! re-encode branch runs only when the plain file is `PQ2_0` and no such
+//! re-encode sits beside it. Any other LM-head mismatch self-skips with the
+//! reason and records `executed: false`.
 
 #![cfg(all(
     feature = "native-cuda",

@@ -755,7 +755,7 @@ ignored without an error — check spelling against it.
   MiB of VRAM for a 2081 MiB file. FP8, `Q4_0`, `Q8_0` and K-quant linears decide at
   load whether they may use the GPU, so an engine forced to the reference kernel tier
   around a model loaded outside `--backend cpu` still runs their CUDA GEMVs
-  (`--backend cpu` runs none of them on the GPU).
+  (`--backend cpu` runs none of them on CUDA, nor on Metal).
   With a Q1 or ternary model, a 2-16-token prefill window after a device-KV batch
   chunk is refused (`GPU_FALLBACK_REQUIRES_CACHE_REBUILD`); `run`, `chat` and `serve`
   never emit one unless `--prefill-chunk` is 2-16 (both chunk planners fold such a
@@ -815,7 +815,7 @@ those tests run for hours and their timing assertions measure the instrumentatio
 stage writes its capability records to `target/coverage-capability-report.json`, never
 to the release manifest `target/capability-report.json`, and fails if the release
 manifest changes while it runs. A new real-model test must find its file through
-`oxibonsai_testkit::workspace::{models_dir, find_model}` (or `OXIBONSAI_MODELS_DIR`),
+`oxibonsai_testkit::workspace::{models_dir, find_model, find_model_as_named}` (or `OXIBONSAI_MODELS_DIR`),
 never through a compile-time path alone, or this stage would open it. It needs both
 `cargo-llvm-cov` and `cargo-nextest`, and writes one profile file per test process
 under `target/llvm-cov-target` (about 10 000 files and 22 GB for the whole workspace on
@@ -859,10 +859,12 @@ before running it.
    import on that target, for instance).
 6. [ ] `--require-cuda` only on a host with a CUDA device. Without one the CUDA
    parity checklist in `TODO.md` stays open and the release notes state the CUDA
-   evidence that does exist and its scope (for 0.2.4: a separate Linux run on one RTX
-   A4000 on 2026-10-07, which covered the CUDA parity harnesses and the dev-profile
-   all-features nextest stage, but not this gate end to end; `ci.sh --release` /
-   `release-gate.sh --require-cuda --skip-bonsai2-models` passed on the RTX A4000 host on 2026-10-07 at 7eaf006 with no waiver). **On a release host without the CUDA toolkit (every macOS host) the
+   evidence that does exist and its scope (for 0.2.4: on one RTX A4000 on
+   2026-10-07, at 7eaf006, `ci.sh --release` and `release-gate.sh --require-cuda
+   --skip-bonsai2-models` passed with no waiver, and the CUDA parity harnesses ran on
+   the same host; that gate requires only the `cuda` capability on Linux — its
+   real-model legs are macOS-only and did not run there, and `--skip-bonsai2-models`
+   means no Bonsai 2 27B evidence from that host). **On a release host without the CUDA toolkit (every macOS host) the
    `cuda-syntax` stage can never get its `nvcc` pass, so the owner must pass
    `--accept-approximate-cuda-syntax` explicitly**, to `./scripts/release-gate.sh` and
    again to `./scripts/publish.sh` (which re-runs the gate and forwards the flag only

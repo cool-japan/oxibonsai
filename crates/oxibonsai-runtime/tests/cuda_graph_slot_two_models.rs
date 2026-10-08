@@ -89,11 +89,12 @@
 //! loader then resolves id 42 by its data sniff as `TQ2_0_g128`, so both the
 //! CPU reference and the GPU run use the real Ternary-Bonsai-8B weights in the
 //! format the slot's consumer takes. A file already stored as `TQ2_0_g128` is
-//! used as is. The testkit's `find_model` now returns the
+//! used as is. The testkit's `find_model` returns the
 //! `Ternary-Bonsai-8B-tq2_0_g128.gguf` re-encode itself when
-//! `Ternary-Bonsai-8B.gguf` is `PQ2_0` and the re-encode sits beside it, so
-//! the in-memory re-encode branch only runs on a checkout without that
-//! sibling.
+//! `Ternary-Bonsai-8B.gguf` is `PQ2_0` and a non-empty id-42 re-encode sits
+//! beside it, so the in-memory re-encode branch runs only when
+//! `Ternary-Bonsai-8B.gguf` is `PQ2_0` and no such re-encode sits beside it
+//! (the second name is still tried on its own when the first is absent).
 //!
 //! The first model's GPU-vs-CPU agreement is printed but is not part of the
 //! verdict: it is the subject of `cuda_cross_backend_determinism_tests` /

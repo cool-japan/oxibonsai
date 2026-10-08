@@ -38,7 +38,9 @@ generations, aarch64 Linux, Windows and multi-GPU hosts. The CUDA `Q4_0`/`Q8_0`/
 decode uploads each weight matrix on every GEMV, so it can be slower than an AVX-512 CPU.
 On that Linux host the full `scripts/ci.sh --release` and
 `scripts/release-gate.sh --require-cuda --skip-bonsai2-models` gate passed on 2026-10-07 at
-7eaf006 with no waiver; the macOS release gate checks the CUDA kernel syntax approximately (no `nvcc`,
+7eaf006 with no waiver (requiring only the `cuda` capability there: the real-model legs are
+macOS-only and did not run, and `--skip-bonsai2-models` means no Bonsai 2 27B evidence from
+that host); the macOS release gate checks the CUDA kernel syntax approximately (no `nvcc`,
 an explicit waiver). The `cuda` (scirs2) feature is a CPU fallback, not a GPU build;
 use `native-cuda` for the NVIDIA path.
 
