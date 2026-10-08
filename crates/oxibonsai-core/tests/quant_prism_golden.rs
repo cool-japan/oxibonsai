@@ -32,6 +32,7 @@ use oxibonsai_core::quant_ternary::{
     sniff_sample_byte_cap, sniff_two_bit_layout, BlockTQ2_0_g128, TwoBitLayout,
     SNIFF_DEFAULT_BLOCKS,
 };
+use oxibonsai_testkit::workspace::find_model;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Deterministic pseudo-random source (no dev-dependency, no binary fixture)
@@ -371,6 +372,11 @@ fn claimed_block_count_guards_reject_a_mis_typed_tensor() {
 // id-42 resolution on the real models (skipped when absent)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Where the real models are looked for (skip messages only). The files
+/// themselves are located with [`find_model`], which returns the id-42
+/// `<name>-tq2_0_g128.gguf` re-encode in place of a legacy-named ternary file
+/// stored as `PQ2_0` (ggml id 142), so these checks see the qs-first bytes
+/// they were written for.
 fn models_dir() -> PathBuf {
     oxibonsai_testkit::workspace::models_dir()
 }
@@ -413,15 +419,31 @@ const REAL_FILES: &[(&str, Option<GgufTensorType>, LegacyVersionTag)] = &[
     ),
 ];
 
+/// The `general.quantization_version` spelling a real file must carry: its
+/// [`REAL_FILES`] entry's, except for a file OxiBonsai's 0.2.4 writer wrote.
+/// Up to 0.2.3 that writer stored the string `"TQ2_0_G128"` there; since
+/// core-gguf-02 it stores the spec's `u32 2` and moves the label to
+/// `oxibonsai.quant_format` (`docs/models.md`, "ggml type id 42: three
+/// layouts under one id"). A file carrying that key — a 0.2.4 conversion, or
+/// the id-42 re-encode [`find_model`] returns in place of a `PQ2_0` file —
+/// must spell the version numerically; a file without it must still carry
+/// the entry's spelling.
+fn expected_version_tag(gguf: &GgufFile<'_>, entry: LegacyVersionTag) -> LegacyVersionTag {
+    if gguf.metadata.get("oxibonsai.quant_format").is_some() {
+        LegacyVersionTag::Numeric
+    } else {
+        entry
+    }
+}
+
 #[test]
 fn id_42_resolves_correctly_on_every_real_model_present() {
     let dir = models_dir();
     let mut checked = 0usize;
     for (file, expect, expect_tag) in REAL_FILES {
-        let path = dir.join(file);
-        if !path.exists() {
+        let Some(path) = find_model(file) else {
             continue;
-        }
+        };
         let mmap = mmap_gguf_file(&path).expect("mmap");
         let gguf = GgufFile::parse(&mmap).expect("parse");
         let infos: Vec<_> = gguf
@@ -433,7 +455,7 @@ fn id_42_resolves_correctly_on_every_real_model_present() {
         let qver = gguf.metadata.get("general.quantization_version");
         assert_eq!(
             LegacyVersionTag::from_value(qver),
-            *expect_tag,
+            expected_version_tag(&gguf, *expect_tag),
             "{file}: quantization_version spelling"
         );
 
@@ -506,11 +528,13 @@ fn id_42_resolves_correctly_on_every_real_model_present() {
 /// Resolution must never be attempted without evidence, even for a real file.
 #[test]
 fn a_no_extent_call_errors_on_a_real_model() {
-    let path = models_dir().join("Ternary-Bonsai-1.7B.gguf");
-    if !path.exists() {
-        eprintln!("skipping: {} not present", path.display());
+    let Some(path) = find_model("Ternary-Bonsai-1.7B.gguf") else {
+        eprintln!(
+            "skipping: {} not present",
+            models_dir().join("Ternary-Bonsai-1.7B.gguf").display()
+        );
         return;
-    }
+    };
     let mmap = mmap_gguf_file(&path).expect("mmap");
     let gguf = GgufFile::parse(&mmap).expect("parse");
     let infos: Vec<_> = gguf
@@ -537,10 +561,9 @@ fn sniff_verdicts_match_the_probe_on_real_models() {
     ];
     let mut checked = 0usize;
     for (file, expect) in cases {
-        let path = dir.join(file);
-        if !path.exists() {
+        let Some(path) = find_model(file) else {
             continue;
-        }
+        };
         let mmap = mmap_gguf_file(&path).expect("mmap");
         let gguf = GgufFile::parse(&mmap).expect("parse");
         let name = gguf
@@ -571,11 +594,13 @@ fn sniff_verdicts_match_the_probe_on_real_models() {
 /// sniff that moved the 1.7B would land here.
 #[test]
 fn legacy_1_7b_decode_path_is_unchanged() {
-    let path = models_dir().join("Ternary-Bonsai-1.7B.gguf");
-    if !path.exists() {
-        eprintln!("skipping: {} not present", path.display());
+    let Some(path) = find_model("Ternary-Bonsai-1.7B.gguf") else {
+        eprintln!(
+            "skipping: {} not present",
+            models_dir().join("Ternary-Bonsai-1.7B.gguf").display()
+        );
         return;
-    }
+    };
     let mmap = mmap_gguf_file(&path).expect("mmap");
     let gguf = GgufFile::parse(&mmap).expect("parse");
 

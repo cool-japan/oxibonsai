@@ -34,6 +34,10 @@
 //! when that file is absent or stored as `PQ2_0`, for
 //! `Ternary-Bonsai-8B-tq2_0_g128.gguf` (the two names the F-M1 harness
 //! `cuda_graph_slot_two_models.rs` looks for). The chosen path is printed.
+//! The testkit's `find_model` now returns that `-tq2_0_g128` re-encode itself
+//! when `Ternary-Bonsai-8B.gguf` is `PQ2_0` and the re-encode sits beside it,
+//! so the fallback to the second name only runs on a checkout without that
+//! sibling.
 //!
 //! The chosen file's stored format is probed before anything loads it: its
 //! LM-head tensor type (`output.weight`, else `token_embd.weight`, the

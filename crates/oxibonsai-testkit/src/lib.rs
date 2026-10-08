@@ -23,7 +23,9 @@
 //! - [`golden`] — golden-vector comparison helpers (`max_abs_diff`,
 //!   `cosine_similarity`, `assert_allclose`) for parity tests.
 //! - [`workspace`] — resolving this workspace's root and its (gitignored,
-//!   often-absent-in-a-worktree) `models/` directory robustly.
+//!   often-absent-in-a-worktree) `models/` directory robustly, and a model
+//!   file in it — preferring the id-42 `<name>-tq2_0_g128.gguf` re-encode
+//!   kept beside a ternary GGUF stored as `PQ2_0` under its legacy name.
 //! - [`parity`] — the cross-tier per-step logit/token comparison a
 //!   real-model greedy parity gate needs (token chain first, then a
 //!   bit-exact or relative-bound numeric check), generic over the caller's
@@ -803,8 +805,36 @@ pub mod golden {
 /// main tree a worktree was created from): only `$OXIBONSAI_MODELS_DIR`, set
 /// by whatever created the environment, can point here at anything outside
 /// this workspace's own `models/` directory.
+///
+/// # A `PQ2_0` file under a legacy ternary name
+///
+/// A pre-release 0.2.4 `oxibonsai convert --quant tq2_0_g128` wrote PrismML
+/// `PQ2_0` (ggml id 142, `d` first) instead of the native `TQ2_0_g128`
+/// (ggml id 42, `qs` first), so a checkout can hold, say,
+/// `Ternary-Bonsai-8B.gguf` stored as `PQ2_0`. The `qwen3` runtime cannot
+/// load that file (`BonsaiModel::from_gguf` has no `PQ2_0` LM-head
+/// wrapper), and its blocks decode as garbage when read as `TQ2_0_g128`.
+/// The file's lossless id-42 re-encode can be kept beside it as
+/// `Ternary-Bonsai-8B-tq2_0_g128.gguf`
+/// ([`TQ2_0_G128_SIBLING_SUFFIX`](workspace::TQ2_0_G128_SIBLING_SUFFIX));
+/// [`find_model`](workspace::find_model) then returns the re-encode for the
+/// plain name, after [`gguf_lm_head_type`](workspace::gguf_lm_head_type) has
+/// read both files' stored formats from their headers, so a real-model test
+/// that looks a legacy name up runs on the id-42 weights instead of failing
+/// on the `PQ2_0` ones. Without such a sibling nothing changes. A harness
+/// that handles `PQ2_0` itself looks the file up under its exact name with
+/// [`find_model_as_named`](workspace::find_model_as_named) instead.
 pub mod workspace {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    use oxibonsai_core::gguf::reader::{mmap_gguf_file, GgufFile};
+    use oxibonsai_core::GgufTensorType;
+
+    /// File-name suffix of the lossless id-42 (`TQ2_0_g128`) re-encode of a
+    /// ternary GGUF, kept beside the file it re-encodes:
+    /// `Ternary-Bonsai-8B.gguf` → `Ternary-Bonsai-8B-tq2_0_g128.gguf`. See
+    /// [`find_model`].
+    pub const TQ2_0_G128_SIBLING_SUFFIX: &str = "-tq2_0_g128.gguf";
 
     /// The workspace root, resolved from this crate's own (fixed at compile
     /// time) `CARGO_MANIFEST_DIR`: every workspace member lives exactly two
@@ -835,13 +865,115 @@ pub mod workspace {
     /// non-empty file — `None` otherwise (including the common "gitignored,
     /// absent in a fresh worktree" case), so callers can self-skip on
     /// `None` rather than opening a zero-byte placeholder.
+    ///
+    /// One rule refines this for GGUF files (module docs, "A `PQ2_0` file
+    /// under a legacy ternary name"). When `filename` ends with `.gguf` but
+    /// not with [`TQ2_0_G128_SIBLING_SUFFIX`], the plain file exists, its
+    /// LM head ([`gguf_lm_head_type`]) is stored as `PQ2_0` (ggml id 142),
+    /// and the sibling `<stem>-tq2_0_g128.gguf` exists, is non-empty and has
+    /// its LM head stored as `TQ2_0_g128` (ggml id 42), the sibling is
+    /// returned instead and one note naming both files goes to stderr.
+    /// Every other case keeps the plain path: no sibling (then neither file
+    /// is opened), a probe that fails or finds another type, a non-GGUF name
+    /// such as `tokenizer.json`, or a name that already is the re-encode's.
+    /// A sibling alone is never found under the plain name: `None` still
+    /// means "the plain file is not there". [`find_model_as_named`] is the
+    /// same lookup without this rule.
     #[must_use]
     pub fn find_model(filename: &str) -> Option<PathBuf> {
-        let path = models_dir().join(filename);
-        match std::fs::metadata(&path) {
-            Ok(meta) if meta.is_file() && meta.len() > 0 => Some(path),
-            _ => None,
+        let dir = models_dir();
+        let path = dir.join(filename);
+        if !is_non_empty_file(&path) {
+            return None;
         }
+        if let Some(sibling) = id_42_reencode_of_pq2_0_file(&dir, filename, &path) {
+            eprintln!(
+                "find_model: {} is stored as PQ2_0 (ggml id 142), which the qwen3 runtime \
+                 cannot load; using {}",
+                path.display(),
+                sibling.display()
+            );
+            return Some(sibling);
+        }
+        Some(path)
+    }
+
+    /// `models_dir().join(filename)` if that path exists and is a non-empty
+    /// file, `None` otherwise: [`find_model`] without its redirect. Nothing
+    /// is probed or opened, so a ternary GGUF stored as `PQ2_0` under a
+    /// legacy name comes back under that name even when its
+    /// `<stem>-tq2_0_g128.gguf` re-encode sits beside it. This is for a
+    /// harness that handles `PQ2_0` itself and wants the file under that
+    /// exact name, such as `cuda_p18_tq2_gemv_real_shapes`, whose PQ2 leg
+    /// runs only on `PQ2_0` bytes; every other caller should use
+    /// [`find_model`].
+    #[must_use]
+    pub fn find_model_as_named(filename: &str) -> Option<PathBuf> {
+        let path = models_dir().join(filename);
+        is_non_empty_file(&path).then_some(path)
+    }
+
+    /// The stored GGUF type of the LM head of the GGUF file at `path`, as
+    /// [`lm_head_type`] picks it, read from the header alone: the file is
+    /// memory-mapped ([`mmap_gguf_file`]) and only its metadata and tensor
+    /// table are parsed, never its tensor data, so probing a multi-GB model
+    /// stays cheap. `None` when the file cannot be opened or mapped, does
+    /// not parse as GGUF, or has no candidate tensor.
+    ///
+    /// The ambiguous ggml id 42 reports [`GgufTensorType::TQ2_0_g128`], the
+    /// header-only reading [`GgufTensorType::from_id`] gives it; which of the
+    /// three id-42 layouts a file really holds can only be settled from its
+    /// tensor bytes (`oxibonsai_core::gguf::quant_resolve`).
+    #[must_use]
+    pub fn gguf_lm_head_type(path: &Path) -> Option<GgufTensorType> {
+        let mmap = mmap_gguf_file(path).ok()?;
+        let gguf = GgufFile::parse(&mmap).ok()?;
+        lm_head_type(&gguf)
+    }
+
+    /// The stored type of a parsed GGUF's LM head: `output.weight`, else
+    /// `token_embd.weight` (a tied model — the loader's own rule), else the
+    /// first two-dimensional quantized tensor in data-offset order, so a
+    /// file with neither name still reports the format its weights are
+    /// stored in. `None` when there is no such tensor.
+    #[must_use]
+    pub fn lm_head_type(gguf: &GgufFile<'_>) -> Option<GgufTensorType> {
+        ["output.weight", "token_embd.weight"]
+            .into_iter()
+            .find_map(|name| gguf.tensors.get(name))
+            .or_else(|| {
+                gguf.tensors
+                    .sorted_by_offset()
+                    .into_iter()
+                    .find(|info| info.n_dims() == 2 && info.tensor_type.block_size() > 1)
+            })
+            .map(|info| info.tensor_type)
+    }
+
+    /// Whether `path` is an existing, non-empty file (a symlink counts as
+    /// its target).
+    fn is_non_empty_file(path: &Path) -> bool {
+        std::fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() > 0)
+    }
+
+    /// The sibling [`find_model`] returns in place of `plain`
+    /// (`dir.join(filename)`, already known to be a non-empty file) when its
+    /// rule applies, `None` otherwise. The sibling's presence is checked
+    /// first, so a plain file without one is never opened; the plain file's
+    /// header is probed before the sibling's.
+    fn id_42_reencode_of_pq2_0_file(dir: &Path, filename: &str, plain: &Path) -> Option<PathBuf> {
+        if filename.ends_with(TQ2_0_G128_SIBLING_SUFFIX) {
+            return None;
+        }
+        let stem = filename.strip_suffix(".gguf")?;
+        let sibling = dir.join(format!("{stem}{TQ2_0_G128_SIBLING_SUFFIX}"));
+        if !is_non_empty_file(&sibling)
+            || gguf_lm_head_type(plain) != Some(GgufTensorType::PQ2_0)
+            || gguf_lm_head_type(&sibling) != Some(GgufTensorType::TQ2_0_g128)
+        {
+            return None;
+        }
+        Some(sibling)
     }
 
     #[cfg(test)]
@@ -849,9 +981,68 @@ pub mod workspace {
         use super::*;
         use std::sync::Mutex;
 
-        /// Guards this module's two env-mutating tests against each other
+        use crate::gguf_fixture::{FixtureQuant, GgufFixtureBuilder};
+        use crate::temp_path::{unique_path, TempFile};
+
+        /// Guards this module's env-mutating tests against each other
         /// (independent of `capability`'s own lock: different env vars).
         static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+        /// GGUF-order shape (`ne0` first) of every fixture weight: two rows of
+        /// 128 weights, i.e. two 34-byte blocks in either two-bit format.
+        const SHAPE: &[u64] = &[128, 2];
+
+        /// A tiny GGUF holding `tensors` — `(name, GGUF-order shape, format)`
+        /// filled with deterministic weights — written in the given order,
+        /// so their data offsets ascend in that order.
+        fn tiny_gguf(tensors: &[(&str, &[u64], FixtureQuant)]) -> Vec<u8> {
+            let mut builder = GgufFixtureBuilder::new();
+            builder.metadata_str("general.architecture", "qwen3");
+            for (seed, (name, shape, quant)) in (1u64..).zip(tensors) {
+                builder
+                    .tensor(name, shape, *quant, seed)
+                    .expect("add a fixture tensor");
+            }
+            builder.build().expect("build the fixture GGUF")
+        }
+
+        /// A GGUF whose LM head, `output.weight`, is stored as `quant`.
+        fn lm_head_gguf(quant: FixtureQuant) -> Vec<u8> {
+            tiny_gguf(&[("output.weight", SHAPE, quant)])
+        }
+
+        /// `OXIBONSAI_MODELS_DIR` pointed at a fresh directory under
+        /// `std::env::temp_dir()` for one test. On drop the variable is
+        /// removed and the directory deleted with everything in it, so a
+        /// failing assertion cleans up too. Create it while holding
+        /// [`ENV_LOCK`], and declare it after the lock guard so it drops
+        /// first.
+        struct TempModelsDir {
+            dir: PathBuf,
+        }
+
+        impl TempModelsDir {
+            fn new(tag: &str) -> Self {
+                let dir = unique_path(tag, "");
+                std::fs::create_dir_all(&dir).expect("create the temporary models directory");
+                std::env::set_var("OXIBONSAI_MODELS_DIR", &dir);
+                Self { dir }
+            }
+
+            /// Writes `bytes` to `<dir>/<name>` and returns that path.
+            fn write(&self, name: &str, bytes: &[u8]) -> PathBuf {
+                let path = self.dir.join(name);
+                std::fs::write(&path, bytes).expect("write a fixture file");
+                path
+            }
+        }
+
+        impl Drop for TempModelsDir {
+            fn drop(&mut self) {
+                std::env::remove_var("OXIBONSAI_MODELS_DIR");
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
 
         #[test]
         fn root_contains_this_crates_own_cargo_toml_two_levels_up() {
@@ -903,6 +1094,149 @@ pub mod workspace {
                 "find_model must locate an existing non-empty file"
             );
             std::env::remove_var("OXIBONSAI_MODELS_DIR");
+        }
+
+        #[test]
+        fn gguf_lm_head_type_reads_output_then_token_embd_then_the_first_2d_quantized_tensor() {
+            let probe = |bytes: &[u8]| {
+                let file = TempFile::write("lm-head-probe", ".gguf", bytes)
+                    .expect("write the probed file");
+                gguf_lm_head_type(file.path())
+            };
+            // `output.weight` decides, whatever precedes it.
+            assert_eq!(
+                probe(&tiny_gguf(&[
+                    ("blk.0.attn_q.weight", SHAPE, FixtureQuant::Q8_0),
+                    ("token_embd.weight", SHAPE, FixtureQuant::TQ2_0_g128),
+                    ("output.weight", SHAPE, FixtureQuant::PQ2_0),
+                ])),
+                Some(GgufTensorType::PQ2_0)
+            );
+            // A tied model: `token_embd.weight`.
+            assert_eq!(
+                probe(&tiny_gguf(&[
+                    ("blk.0.attn_q.weight", SHAPE, FixtureQuant::Q8_0),
+                    ("token_embd.weight", SHAPE, FixtureQuant::PQ2_0),
+                ])),
+                Some(GgufTensorType::PQ2_0)
+            );
+            // Neither name: the first 2-D quantized tensor in offset order,
+            // past a 1-D and an unquantized 2-D one.
+            assert_eq!(
+                probe(&tiny_gguf(&[
+                    ("blk.0.attn_norm.weight", &[128], FixtureQuant::F32),
+                    ("blk.0.dense.weight", SHAPE, FixtureQuant::F32),
+                    ("blk.0.attn_q.weight", SHAPE, FixtureQuant::TQ2_0_g128),
+                    ("blk.0.attn_k.weight", SHAPE, FixtureQuant::PQ2_0),
+                ])),
+                Some(GgufTensorType::TQ2_0_g128)
+            );
+            // No candidate, not a GGUF, no file at all.
+            assert_eq!(
+                probe(&tiny_gguf(&[(
+                    "output_norm.weight",
+                    &[128],
+                    FixtureQuant::F32
+                )])),
+                None
+            );
+            assert_eq!(probe(b"{\"model\": \"not a GGUF\"}"), None);
+            assert_eq!(
+                gguf_lm_head_type(&unique_path("lm-head-probe-missing", ".gguf")),
+                None
+            );
+        }
+
+        #[test]
+        fn find_model_prefers_the_id_42_reencode_beside_a_pq2_0_file() {
+            let _guard = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let models = TempModelsDir::new("find-model-reencode");
+            let plain = models.write("Fake.gguf", &lm_head_gguf(FixtureQuant::PQ2_0));
+            let sibling = models.write(
+                "Fake-tq2_0_g128.gguf",
+                &lm_head_gguf(FixtureQuant::TQ2_0_g128),
+            );
+            assert_eq!(gguf_lm_head_type(&plain), Some(GgufTensorType::PQ2_0));
+            assert_eq!(
+                gguf_lm_head_type(&sibling),
+                Some(GgufTensorType::TQ2_0_g128)
+            );
+
+            // The PQ2_0 file's name resolves to its id-42 re-encode...
+            assert_eq!(find_model("Fake.gguf"), Some(sibling.clone()));
+            // ...the re-encode's own name to itself...
+            assert_eq!(find_model("Fake-tq2_0_g128.gguf"), Some(sibling.clone()));
+            // ...a non-GGUF name is left alone, even one holding PQ2_0 bytes
+            // with a `<stem>-tq2_0_g128.gguf` beside it...
+            let json = models.write("Fake.json", &lm_head_gguf(FixtureQuant::PQ2_0));
+            assert_eq!(find_model("Fake.json"), Some(json));
+            // ...an id-42 plain file is returned as is, sibling or not...
+            let native = models.write("Native.gguf", &lm_head_gguf(FixtureQuant::TQ2_0_g128));
+            models.write(
+                "Native-tq2_0_g128.gguf",
+                &lm_head_gguf(FixtureQuant::TQ2_0_g128),
+            );
+            assert_eq!(find_model("Native.gguf"), Some(native));
+            // ...and the PQ2_0 file itself once its re-encode is gone.
+            std::fs::remove_file(&sibling).expect("remove the re-encode");
+            assert_eq!(find_model("Fake.gguf"), Some(plain));
+        }
+
+        #[test]
+        fn find_model_keeps_the_plain_file_when_the_reencode_is_unusable() {
+            let _guard = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let models = TempModelsDir::new("find-model-unusable");
+            let pq2 = lm_head_gguf(FixtureQuant::PQ2_0);
+            let tq2 = lm_head_gguf(FixtureQuant::TQ2_0_g128);
+            // An empty placeholder where the re-encode would be...
+            let empty = models.write("Empty.gguf", &pq2);
+            models.write("Empty-tq2_0_g128.gguf", &[]);
+            assert_eq!(find_model("Empty.gguf"), Some(empty));
+            // ...a "re-encode" that is itself stored as PQ2_0...
+            let twice = models.write("Twice.gguf", &pq2);
+            models.write("Twice-tq2_0_g128.gguf", &pq2);
+            assert_eq!(find_model("Twice.gguf"), Some(twice));
+            // ...a "re-encode" that is not a GGUF...
+            let junk = models.write("Junk.gguf", &pq2);
+            models.write("Junk-tq2_0_g128.gguf", b"not a GGUF file");
+            assert_eq!(find_model("Junk.gguf"), Some(junk));
+            // ...and a plain file whose header does not parse all keep the
+            // plain path.
+            let broken = models.write("Broken.gguf", b"GGUF, but not a valid header");
+            models.write("Broken-tq2_0_g128.gguf", &tq2);
+            assert_eq!(find_model("Broken.gguf"), Some(broken));
+            // A re-encode alone is not found under the plain name.
+            let orphan = models.write("Orphan-tq2_0_g128.gguf", &tq2);
+            assert_eq!(find_model("Orphan.gguf"), None);
+            assert_eq!(find_model("Orphan-tq2_0_g128.gguf"), Some(orphan));
+        }
+
+        #[test]
+        fn find_model_as_named_returns_the_exact_name_without_probing() {
+            let _guard = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let models = TempModelsDir::new("find-model-as-named");
+            let plain = models.write("Fake.gguf", &lm_head_gguf(FixtureQuant::PQ2_0));
+            let sibling = models.write(
+                "Fake-tq2_0_g128.gguf",
+                &lm_head_gguf(FixtureQuant::TQ2_0_g128),
+            );
+            // Where `find_model` redirects, the exact-name lookup does not.
+            assert_eq!(find_model("Fake.gguf"), Some(sibling.clone()));
+            assert_eq!(find_model_as_named("Fake.gguf"), Some(plain));
+            assert_eq!(find_model_as_named("Fake-tq2_0_g128.gguf"), Some(sibling));
+            // The same existence contract: missing or empty is `None`...
+            models.write("Empty.gguf", &[]);
+            assert_eq!(find_model_as_named("Empty.gguf"), None);
+            assert_eq!(find_model_as_named("Missing.gguf"), None);
+            // ...and the bytes are never looked at.
+            let not_gguf = models.write("Notes.gguf", b"not a GGUF file");
+            assert_eq!(find_model_as_named("Notes.gguf"), Some(not_gguf));
         }
     }
 }

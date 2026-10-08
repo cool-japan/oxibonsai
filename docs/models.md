@@ -45,6 +45,10 @@ use `native-cuda` for the NVIDIA path.
 `oxibonsai convert --quant pq2_0` writes PrismML `PQ2_0` (id 142) for the PrismML
 llama.cpp fork; a `qwen3` model in that layout does not load in this release. The
 default `--quant tq2_0_g128` writes the native id-42 layout the runtime executes.
+A ternary file that a pre-release 0.2.4 build wrote as `PQ2_0` under its plain name can
+keep its id-42 re-encode beside it as `<name>-tq2_0_g128.gguf` (for example
+`Ternary-Bonsai-8B-tq2_0_g128.gguf`); the test suite's model resolver
+(`oxibonsai_testkit::workspace::find_model`) then prefers that file.
 
 ## Bonsai 2 and the 27B family (`qwen35` hybrid)
 

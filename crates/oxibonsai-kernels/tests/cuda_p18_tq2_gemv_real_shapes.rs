@@ -35,6 +35,14 @@
 //!   and CPU PQ2 outputs of a transcoded tensor are also checked against each
 //!   other.
 //!
+//! The file is looked up with `oxibonsai_testkit::workspace::find_model_as_named`,
+//! which deliberately bypasses the redirect `find_model` applies (`find_model`
+//! returns the `<name>-tq2_0_g128.gguf` re-encode in place of a `PQ2_0` file
+//! stored under the plain name when that re-encode sits beside it). P18
+//! therefore reads the file under its exact name: on a checkout that keeps
+//! both, it runs the PQ2 leg on the plain `PQ2_0` file and the TQ2 leg on its
+//! transcode, rather than only the TQ2 leg on the re-encode.
+//!
 //! # The TQ2 leg (P18 proper), per layer
 //!
 //! 1. **Per-matrix** (`q`, `k`, `v`, `o`, `gate`, `up`, `down`): blocks
@@ -90,8 +98,8 @@
 //! mismatch) panics with the full list once the walk has ended, so the PQ2
 //! legs still report; no capability is recorded for a failed run. Each model
 //! self-skips (recording `cuda-hardware`, `executed: false`) only when no CUDA
-//! device answers `CudaGraph::global()` or `find_model` does not locate its
-//! GGUF. Run with:
+//! device answers `CudaGraph::global()` or `find_model_as_named` does not
+//! locate its GGUF. Run with:
 //!
 //! ```text
 //! cargo test --release -p oxibonsai-kernels --features native-cuda \
@@ -118,7 +126,7 @@ use oxibonsai_kernels::{CudaGraph, CudaGraphError};
 use oxibonsai_testkit::capability::{record_executed_timed, record_skipped, Capability};
 use oxibonsai_testkit::gguf_fixture::deterministic_weights;
 use oxibonsai_testkit::parity::gpu_serial;
-use oxibonsai_testkit::workspace::find_model;
+use oxibonsai_testkit::workspace::find_model_as_named;
 
 /// The checklist's acceptance floor, per GEMV.
 const COS_FLOOR: f64 = 0.999;
@@ -867,7 +875,7 @@ fn run_p18(file: &str, model_base: u64, test: &str) {
             return;
         }
     };
-    let Some(path) = find_model(file) else {
+    let Some(path) = find_model_as_named(file) else {
         println!("skip: {test} — {file} not found under models/ (or $OXIBONSAI_MODELS_DIR)");
         record_skipped(Capability::CudaHardware, test);
         return;

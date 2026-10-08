@@ -116,7 +116,10 @@
 //! afterwards. The re-encode is lossless for ternary blocks, and a tensor
 //! with any `+2` code (`0b11`) fails the test instead. An
 //! `OXIBONSAI_MODELS_DIR` farm whose `Ternary-Bonsai-8B.gguf` links to
-//! `Ternary-Bonsai-8B-tq2_0_g128.gguf` avoids the re-encode. Any other
+//! `Ternary-Bonsai-8B-tq2_0_g128.gguf` avoids the re-encode. The testkit's
+//! `find_model` now returns that `-tq2_0_g128` re-encode itself when the
+//! plain file is `PQ2_0` and the re-encode sits beside it, so this re-encode
+//! branch only runs on a checkout without that sibling. Any other
 //! LM-head mismatch self-skips with the reason and records
 //! `executed: false`.
 
