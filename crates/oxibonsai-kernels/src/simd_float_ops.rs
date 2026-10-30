@@ -55,11 +55,15 @@ pub fn softmax_simd(values: &mut [f32]) {
 
 /// RMS normalization: `output[i] = weight[i] * input[i] / rms(input)`
 /// where `rms(x) = sqrt(mean(x²) + eps)`.
+///
+/// # Panics
+///
+/// Panics if `weight.len() != input.len()` or `output.len() < input.len()`.
 #[inline]
 pub fn rms_norm_simd(input: &[f32], weight: &[f32], output: &mut [f32], eps: f32) {
     let n = input.len();
-    debug_assert_eq!(n, weight.len());
-    debug_assert!(output.len() >= n);
+    assert_eq!(n, weight.len());
+    assert!(output.len() >= n);
 
     #[cfg(target_arch = "aarch64")]
     {
@@ -84,10 +88,14 @@ pub fn rms_norm_simd(input: &[f32], weight: &[f32], output: &mut [f32], eps: f32
 // ─── SiLU element-wise ───────────────────────────────────────────
 
 /// Element-wise SiLU (Swish): `output[i] = input[i] / (1 + exp(-input[i]))`.
+///
+/// # Panics
+///
+/// Panics if `output.len() < input.len()`.
 #[inline]
 pub fn silu_simd(input: &[f32], output: &mut [f32]) {
     let n = input.len();
-    debug_assert!(output.len() >= n);
+    assert!(output.len() >= n);
 
     #[cfg(target_arch = "aarch64")]
     {
@@ -112,11 +120,15 @@ pub fn silu_simd(input: &[f32], output: &mut [f32]) {
 // ─── SwiGLU ──────────────────────────────────────────────────────
 
 /// SwiGLU: `output[i] = silu(gate[i]) * up[i]`.
+///
+/// # Panics
+///
+/// Panics if `up.len() != gate.len()` or `output.len() < gate.len()`.
 #[inline]
 pub fn swiglu_simd(gate: &[f32], up: &[f32], output: &mut [f32]) {
     let n = gate.len();
-    debug_assert_eq!(n, up.len());
-    debug_assert!(output.len() >= n);
+    assert_eq!(n, up.len());
+    assert!(output.len() >= n);
 
     #[cfg(target_arch = "aarch64")]
     {
@@ -150,13 +162,17 @@ pub fn swiglu_simd(gate: &[f32], up: &[f32], output: &mut [f32]) {
 /// ```
 ///
 /// `cos_table` and `sin_table` must each have length `half_dim`.
+///
+/// # Panics
+///
+/// Panics if either table has a different length or `output.len() < input.len()`.
 #[inline]
 pub fn rope_apply_simd(input: &[f32], output: &mut [f32], cos_table: &[f32], sin_table: &[f32]) {
     let head_dim = input.len();
     let half_dim = head_dim / 2;
-    debug_assert_eq!(cos_table.len(), half_dim);
-    debug_assert_eq!(sin_table.len(), half_dim);
-    debug_assert!(output.len() >= head_dim);
+    assert_eq!(cos_table.len(), half_dim);
+    assert_eq!(sin_table.len(), half_dim);
+    assert!(output.len() >= head_dim);
 
     #[cfg(target_arch = "aarch64")]
     {
@@ -777,6 +793,74 @@ mod tests {
     use super::*;
 
     const EPS: f32 = 1e-5;
+
+    fn assert_panics_without_writing(len: usize, operation: impl FnOnce(&mut [f32])) {
+        let mut output = vec![42.0; len];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            operation(&mut output);
+        }));
+        assert!(result.is_err());
+        assert_eq!(output, vec![42.0; len]);
+    }
+
+    #[test]
+    fn rms_norm_rejects_invalid_lengths_before_writing() {
+        for n in [1, 4, 8, 9] {
+            let input = vec![1.0; n];
+            for weight_len in [n - 1, n + 1] {
+                assert_panics_without_writing(n, |output| {
+                    rms_norm_simd(&input, &vec![1.0; weight_len], output, 1e-6);
+                });
+            }
+            assert_panics_without_writing(n - 1, |output| {
+                rms_norm_simd(&input, &input, output, 1e-6);
+            });
+        }
+    }
+
+    #[test]
+    fn silu_rejects_invalid_lengths_before_writing() {
+        for n in [1, 4, 8, 9] {
+            assert_panics_without_writing(n - 1, |output| {
+                silu_simd(&vec![1.0; n], output);
+            });
+        }
+    }
+
+    #[test]
+    fn swiglu_rejects_invalid_lengths_before_writing() {
+        for n in [1, 4, 8, 9] {
+            let gate = vec![1.0; n];
+            for up_len in [n - 1, n + 1] {
+                assert_panics_without_writing(n, |output| {
+                    swiglu_simd(&gate, &vec![1.0; up_len], output);
+                });
+            }
+            assert_panics_without_writing(n - 1, |output| {
+                swiglu_simd(&gate, &gate, output);
+            });
+        }
+    }
+
+    #[test]
+    fn rope_rejects_invalid_lengths_before_writing() {
+        for half_dim in [1, 4, 8, 9] {
+            let input = vec![1.0; 2 * half_dim];
+            let table = vec![1.0; half_dim];
+            for table_len in [half_dim - 1, half_dim + 1] {
+                let invalid_table = vec![1.0; table_len];
+                assert_panics_without_writing(input.len(), |output| {
+                    rope_apply_simd(&input, output, &invalid_table, &table);
+                });
+                assert_panics_without_writing(input.len(), |output| {
+                    rope_apply_simd(&input, output, &table, &invalid_table);
+                });
+            }
+            assert_panics_without_writing(input.len() - 1, |output| {
+                rope_apply_simd(&input, output, &table, &table);
+            });
+        }
+    }
 
     // ── helpers ──────────────────────────────────────────────────
 
