@@ -99,7 +99,8 @@ pub struct RateLimitConfig {
     pub rps: f64,
     /// Burst capacity: maximum tokens a client can accumulate (default: 20.0).
     pub burst: f64,
-    /// Maximum number of tracked clients before LRU eviction (default: 10_000).
+    /// Maximum number of tracked clients (default: 10_000).
+    /// New clients are denied when full after stale entries are removed; zero denies all clients.
     pub max_clients: usize,
     /// Evict clients that have been inactive for longer than this duration (default: 300 s).
     pub client_ttl: Duration,
@@ -257,6 +258,11 @@ impl RateLimiter {
             let ttl = self.config.client_ttl;
             let now = Instant::now();
             clients.retain(|_, (_, last_seen)| now.duration_since(*last_seen) < ttl);
+            if clients.len() >= self.config.max_clients && !clients.contains_key(client_id) {
+                return RateLimitDecision::Deny {
+                    retry_after_ms: 1000,
+                };
+            }
         }
 
         let bucket = clients.entry(client_id.to_owned()).or_insert_with(|| {
@@ -618,6 +624,55 @@ mod tests {
         assert_eq!(limiter.active_clients(), 2);
         limiter.reset_client("alpha");
         assert_eq!(limiter.active_clients(), 1);
+    }
+
+    #[test]
+    fn test_rate_limiter_client_cap_preserves_existing_buckets() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            rps: 0.0,
+            burst: 2.0,
+            max_clients: 2,
+            ..Default::default()
+        });
+        assert!(limiter.check_and_consume("alpha").is_allowed());
+        assert!(limiter.check_and_consume("beta").is_allowed());
+
+        for id in 0..100 {
+            assert!(!limiter.check_and_consume(&format!("new-{id}")).is_allowed());
+            assert_eq!(limiter.active_clients(), 2);
+        }
+
+        assert!(limiter.check_and_consume("alpha").is_allowed());
+        assert!(limiter.check_and_consume("beta").is_allowed());
+        assert!(!limiter.check_and_consume("alpha").is_allowed());
+        assert!(!limiter.check_and_consume("beta").is_allowed());
+        assert_eq!(limiter.active_clients(), 2);
+    }
+
+    #[test]
+    fn test_rate_limiter_client_cap_reclaims_stale_entries() {
+        let ttl = Duration::from_secs(60);
+        let limiter = RateLimiter::new(RateLimitConfig {
+            max_clients: 1,
+            client_ttl: ttl,
+            ..Default::default()
+        });
+        assert!(limiter.check_and_consume("stale").is_allowed());
+        limiter.clients.lock().unwrap().get_mut("stale").unwrap().1 = Instant::now() - ttl;
+
+        assert!(limiter.check_and_consume("new").is_allowed());
+        assert_eq!(limiter.active_clients(), 1);
+        assert!(limiter.clients.lock().unwrap().contains_key("new"));
+    }
+
+    #[test]
+    fn test_rate_limiter_zero_client_cap_denies_without_tracking() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            max_clients: 0,
+            ..Default::default()
+        });
+        assert!(!limiter.check_and_consume("alpha").is_allowed());
+        assert_eq!(limiter.active_clients(), 0);
     }
 
     #[test]
