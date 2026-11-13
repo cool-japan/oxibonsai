@@ -583,7 +583,7 @@ Everything below is implemented, tested, and either self-documented in its own m
 
 ## Sponsorship
 
-OxiBonsai is developed and maintained by **COOLJAPAN OU (Team Kitasan)**.
+OxiBonsai is developed and maintained by **COOLJAPAN OU (Team KitaSan)**.
 
 The COOLJAPAN Ecosystem represents one of the largest Pure Rust scientific computing efforts in existence — spanning 40+ projects, 500+ crates, and millions of lines of Rust code across scientific computing, machine learning, quantum computing, geospatial analysis, legal technology, multimedia processing, and more. Every line is written and maintained by a small dedicated team committed to a C/Fortran-free future for scientific software.
 
